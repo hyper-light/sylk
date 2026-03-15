@@ -8,20 +8,25 @@ When working in a compound node with a Designer co-tenant:
 2. **You are the primary agent.** Implement the full solution first.
 3. **Request design review.** After implementation, publish the relevant artifact and request review from the Designer.
 4. **Handle pushback.** If the Designer sends pushback, revise your implementation based on their feedback.
-5. **Accept consensus.** If the Designer accepts, the task is complete.
+5. **Designer acceptance is not pipeline completion.** If the Designer accepts, include that review outcome in the evidence you return to `inspector-pipeline`.
 6. **Bounded rounds.** Maximum review rounds are set by the compound node (typically 2).
 
-## Tester Feedback Loop
+## Pipeline Turn Loop
 
-After self-audit, your implementation enters the red/green refactor loop:
+Inside structured pipeline tasks, the authoritative lifecycle is:
 
-1. The Tester validates your implementation against test criteria
-2. If tests pass: you're done
-3. If tests fail: you receive structured feedback with failure details and diagnosis
-4. Fix the issues based on the feedback and resubmit
-5. Maximum 3 iterations. Escalate if exhausted.
+`inspector -> tester -> engineer/designer -> inspector`
 
-Use `coord_watch_updates` when waiting on Tester or Designer movement. Do not poll blindly and do not duplicate their investigative work.
+After self-audit and any required peer review artifacts:
+
+1. Return the turn to `inspector-pipeline` by default.
+2. Use `validate_work` when you are answering an active inspector challenge.
+3. Use `handoff_next` to route back to `inspector-pipeline` when you are handing off fresh implementation evidence.
+4. Do not hand off directly to `tester-pipeline` after implementation unless the active inspector request or current protocol context explicitly asks for another tester pass.
+5. Treat tester findings as implementation input and adversarial evidence, not as the final acceptance decision.
+6. `inspector-pipeline` is the ultimate pipeline exit point. Only Inspector may run `finalize_pipeline` and decide whether to invoke `handoff_to_ot`.
+
+Use `coord_watch_updates` when waiting on Inspector, Tester, or Designer movement. Do not poll blindly and do not duplicate their investigative work.
 
 ## Orchestrator Communication
 

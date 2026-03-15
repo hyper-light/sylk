@@ -34,7 +34,7 @@ func TestTokenCounterAccumulatesAcrossStreamsAndRestarts(t *testing.T) {
 	}
 }
 
-func TestTokenCounterPrefersHigherLiveStreamTotalsOverLaggingBusTotals(t *testing.T) {
+func TestTokenCounterAddsBackgroundBusTotalsToStreamedSessionTotals(t *testing.T) {
 	app := newResizeTestApp(t)
 	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 120, Height: 32}); cmd != nil {
 		t.Fatalf("initial resize command = %v, want nil", cmd)
@@ -42,18 +42,83 @@ func TestTokenCounterPrefersHigherLiveStreamTotalsOverLaggingBusTotals(t *testin
 
 	app.totalPromptTokens = 80
 	app.totalCompletionTokens = 35
-	app.busInputTokens = 40
-	app.busOutputTokens = 10
-	app.updateTokenDisplay()
+	_, _ = app.Update(msg.TokenUsageMsg{
+		AgentID:         "guardian",
+		InputTokens:     40,
+		OutputTokens:    10,
+		CacheReadTokens: 0,
+	})
+	if got := app.statusBar.View(); !strings.Contains(got, "↓120/↑45") {
+		t.Fatalf("status bar with background bus totals = %q, want summed totals", got)
+	}
+}
 
-	if got := app.statusBar.View(); !strings.Contains(got, "↓80/↑35") {
-		t.Fatalf("status bar with lagging bus totals = %q, want live stream totals", got)
+func TestTokenCounterPreservesSessionTotalsAcrossAgentTransitionsSharingCorrelation(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 120, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
 	}
 
-	app.busInputTokens = 120
-	app.busOutputTokens = 60
-	app.updateTokenDisplay()
-	if got := app.statusBar.View(); !strings.Contains(got, "↓120/↑60") {
-		t.Fatalf("status bar with higher bus totals = %q, want higher totals reflected", got)
+	sharedCID := "corr-shared"
+	architectText := strings.Repeat("a", 200) // ~50 tokens with fallback counter.
+
+	_, _ = app.Update(msg.StreamStartMsg{
+		CorrelationID: sharedCID,
+		AgentID:       "architect",
+		AgentType:     "architect",
+	})
+	_, _ = app.Update(msg.StreamChunkMsg{
+		CorrelationID: sharedCID,
+		Text:          architectText,
+		InputTokens:   100,
+	})
+	if got := app.statusBar.View(); !strings.Contains(got, "↓100/↑50") {
+		t.Fatalf("status bar after architect stream = %q, want architect totals", got)
+	}
+
+	_, _ = app.Update(msg.StreamStartMsg{
+		CorrelationID: sharedCID,
+		AgentID:       "engineer",
+		AgentType:     "engineer",
+	})
+	_, _ = app.Update(msg.StreamCompleteMsg{
+		CorrelationID: sharedCID,
+		AgentID:       "engineer",
+		AgentType:     "engineer",
+		InputTokens:   20,
+		OutputTokens:  5,
+	})
+
+	if got := app.statusBar.View(); !strings.Contains(got, "↓120/↑55") {
+		t.Fatalf("status bar after shared-correlation agent transition = %q, want cumulative totals preserved", got)
+	}
+}
+
+func TestTokenCounterDoesNotDoubleCountBusUsageForActiveStream(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 120, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	_, _ = app.Update(msg.StreamStartMsg{
+		CorrelationID: "corr-live",
+		AgentID:       "architect",
+		AgentType:     "architect",
+	})
+	_, _ = app.Update(msg.TokenUsageMsg{
+		AgentID:      "architect",
+		InputTokens:  50,
+		OutputTokens: 20,
+	})
+	_, _ = app.Update(msg.StreamCompleteMsg{
+		CorrelationID: "corr-live",
+		AgentID:       "architect",
+		AgentType:     "architect",
+		InputTokens:   50,
+		OutputTokens:  20,
+	})
+
+	if got := app.statusBar.View(); !strings.Contains(got, "↓50/↑20") {
+		t.Fatalf("status bar after overlapping stream+bus usage = %q, want no double count", got)
 	}
 }

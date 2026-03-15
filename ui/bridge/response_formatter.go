@@ -9,6 +9,16 @@ import (
 )
 
 func formatStructuredPayload(agentID string, payload any) (string, bool) {
+	payload = unwrapPipelineTurnPayload(payload)
+	if text, ok := formatResponseTextPayload(payload); ok {
+		return text, true
+	}
+	if text, ok := formatInspectorStagePayload(payload); ok {
+		return text, true
+	}
+	if text, ok := formatTesterStagePayload(payload); ok {
+		return text, true
+	}
 	if text, ok := formatConversationResult(payload); ok {
 		return text, true
 	}
@@ -30,6 +40,22 @@ func formatStructuredPayload(agentID string, payload any) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+type responseTexter interface {
+	ResponseText() string
+}
+
+func formatResponseTextPayload(payload any) (string, bool) {
+	rt, ok := payload.(responseTexter)
+	if !ok || rt == nil {
+		return "", false
+	}
+	text := strings.TrimSpace(rt.ResponseText())
+	if text == "" {
+		return "", false
+	}
+	return text, true
 }
 
 // formatConversationResult extracts the Response field from a ConversationResult
@@ -74,6 +100,24 @@ func unwrapResponseEnvelope(payload any) any {
 		return payload
 	}
 	return envelope["Data"]
+}
+
+func unwrapPipelineTurnPayload(payload any) any {
+	values, ok := toMap(payload)
+	if !ok {
+		return payload
+	}
+	if result, ok := values["result"]; ok {
+		if _, hasAction := values["action"]; hasAction || values["processed"] != nil {
+			return result
+		}
+	}
+	if result, ok := values["Result"]; ok {
+		if _, hasAction := values["Action"]; hasAction || values["Processed"] != nil {
+			return result
+		}
+	}
+	return payload
 }
 
 func looksLikeResponseEnvelope(values map[string]any) bool {
@@ -381,6 +425,155 @@ func formatAnswerPayload(payload any) (string, bool) {
 	return answer, true
 }
 
+func formatTesterStagePayload(payload any) (string, bool) {
+	values, ok := toMap(payload)
+	if !ok || !looksLikeTesterStageResult(values) {
+		return "", false
+	}
+	lines := make([]string, 0, 3)
+	created := stringSliceFromKey(values, "CreatedFiles")
+	if len(created) == 0 {
+		created = stringSliceFromKey(values, "created_files")
+	}
+	if len(created) > 0 {
+		lines = append(lines, fmt.Sprintf("Created test artifacts: %s.", strings.Join(created, ", ")))
+	}
+	suite := mapFromKey(values, "SuiteResult")
+	if suite == nil {
+		suite = mapFromKey(values, "suite_result")
+	}
+	if suite != nil {
+		total := intFromKey(suite, "total_tests")
+		if total == 0 {
+			total = intFromKey(suite, "TotalTests")
+		}
+		passed := firstIntValue(suite, "passed", "Passed")
+		failed := firstIntValue(suite, "failed", "Failed")
+		skipped := firstIntValue(suite, "skipped", "Skipped")
+		errors := firstIntValue(suite, "errors", "Errors")
+		if total == 0 {
+			total = passed + failed + skipped + errors
+		}
+		if total > 0 {
+			lines = append(lines, fmt.Sprintf(
+				"Latest test run: %d passed, %d failed, %d skipped, %d errors out of %d.",
+				passed, failed, skipped, errors, total,
+			))
+		} else if name := strings.TrimSpace(firstStringValue(suite, "name", "Name")); name != "" {
+			lines = append(lines, fmt.Sprintf("Executed test suite %q.", name))
+		}
+	}
+	plan := mapFromKey(values, "Plan")
+	if plan == nil {
+		plan = mapFromKey(values, "plan")
+	}
+	if len(lines) == 0 && plan != nil {
+		if rationale := strings.TrimSpace(firstStringValue(plan, "rationale", "Rationale")); rationale != "" {
+			lines = append(lines, fmt.Sprintf("Prepared a test plan: %s.", rationale))
+		} else {
+			lines = append(lines, "Prepared a concrete test plan.")
+		}
+	}
+	if len(lines) == 0 {
+		return "", false
+	}
+	return strings.Join(lines, "\n"), true
+}
+
+func formatInspectorStagePayload(payload any) (string, bool) {
+	values, ok := toMap(payload)
+	if !ok || !looksLikeInspectorStageResult(values) {
+		return "", false
+	}
+
+	lines := make([]string, 0, 2)
+	criteria := mapFromKey(values, "Criteria")
+	if criteria == nil {
+		criteria = mapFromKey(values, "criteria")
+	}
+	if criteria != nil {
+		successCriteria := sliceFromKey(criteria, "success_criteria")
+		if len(successCriteria) == 0 {
+			successCriteria = sliceFromKey(criteria, "SuccessCriteria")
+		}
+		qualityGates := sliceFromKey(criteria, "quality_gates")
+		if len(qualityGates) == 0 {
+			qualityGates = sliceFromKey(criteria, "QualityGates")
+		}
+		constraints := sliceFromKey(criteria, "constraints")
+		if len(constraints) == 0 {
+			constraints = sliceFromKey(criteria, "Constraints")
+		}
+		lines = append(lines, fmt.Sprintf(
+			"Defined criteria contract: %d success criteria, %d quality gates, %d constraints.",
+			len(successCriteria),
+			len(qualityGates),
+			len(constraints),
+		))
+	}
+
+	result := mapFromKey(values, "Result")
+	if result == nil {
+		result = mapFromKey(values, "result")
+	}
+	if result != nil {
+		status := "failed"
+		if boolFromKey(result, "passed") || boolFromKey(result, "Passed") {
+			status = "passed"
+		}
+		criteriaMet := sliceFromKey(result, "criteria_met")
+		if len(criteriaMet) == 0 {
+			criteriaMet = sliceFromKey(result, "CriteriaMet")
+		}
+		criteriaFailed := sliceFromKey(result, "criteria_failed")
+		if len(criteriaFailed) == 0 {
+			criteriaFailed = sliceFromKey(result, "CriteriaFailed")
+		}
+		issues := sliceFromKey(result, "issues")
+		if len(issues) == 0 {
+			issues = sliceFromKey(result, "Issues")
+		}
+		loopCount := firstIntValue(result, "loop_count", "LoopCount")
+		lines = append(lines, fmt.Sprintf(
+			"Latest validation %s: %d criteria met, %d failed, %d issues, %d feedback loops.",
+			status,
+			len(criteriaMet),
+			len(criteriaFailed),
+			len(issues),
+			loopCount,
+		))
+	}
+
+	if len(lines) == 0 {
+		return "", false
+	}
+	return strings.Join(lines, "\n"), true
+}
+
+func looksLikeTesterStageResult(values map[string]any) bool {
+	if values == nil {
+		return false
+	}
+	_, hasPlan := values["Plan"]
+	_, hasPlanJSON := values["plan"]
+	_, hasCreated := values["CreatedFiles"]
+	_, hasCreatedJSON := values["created_files"]
+	_, hasSuite := values["SuiteResult"]
+	_, hasSuiteJSON := values["suite_result"]
+	return hasPlan || hasPlanJSON || hasCreated || hasCreatedJSON || hasSuite || hasSuiteJSON
+}
+
+func looksLikeInspectorStageResult(values map[string]any) bool {
+	if values == nil {
+		return false
+	}
+	_, hasCriteria := values["Criteria"]
+	_, hasCriteriaJSON := values["criteria"]
+	_, hasResult := values["Result"]
+	_, hasResultJSON := values["result"]
+	return hasCriteria || hasCriteriaJSON || hasResult || hasResultJSON
+}
+
 func formatGenericMapSummary(payload any) (string, bool) {
 	values, ok := toMap(payload)
 	if !ok || len(values) == 0 {
@@ -402,6 +595,24 @@ func formatGenericMapSummary(payload any) (string, bool) {
 	}
 	sort.Strings(lines)
 	return strings.Join(lines, "\n"), true
+}
+
+func firstIntValue(values map[string]any, keys ...string) int {
+	for _, key := range keys {
+		if value := intFromKey(values, key); value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func firstStringValue(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(stringFromKey(values, key)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func scalarString(value any) (string, bool) {

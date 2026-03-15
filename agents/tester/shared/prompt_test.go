@@ -22,6 +22,7 @@ func TestPipelineTesterSystemPromptForWorkerAndContract_UsesTaskModePrompt(t *te
 		"# THE PIPELINE TESTER",
 		"Use them as the source of workflow truth.",
 		"## Core Testing Principles",
+		"`handoff_next` is the only transport step.",
 		"Test Categories:",
 		"## SAFETY CONSTRAINTS AND RULES",
 	} {

@@ -520,6 +520,7 @@ func (g *GoogleProvider) processCodeAssistSSE(
 	textDelta := &providerDeltaEmitter{}
 	thoughtDelta := &providerDeltaEmitter{}
 	toolCallsSeen := make(map[googleToolCallKey]bool)
+	var rawContent *googleSerializableContent
 
 	var totalTextLen, totalThoughtLen int
 	var sseEventCount, unwrapErrors, parseErrors int
@@ -561,6 +562,10 @@ func (g *GoogleProvider) processCodeAssistSSE(
 				"vertex_preview": googleTracePreview(string(vertexRaw), 300),
 			})
 			continue
+		}
+
+		if raw := extractVertexRawContent(vResp); raw != nil {
+			rawContent = raw
 		}
 
 		text, thought := extractVertexStreamParts(vResp)
@@ -641,13 +646,13 @@ func (g *GoogleProvider) processCodeAssistSSE(
 	}
 
 	googleTrace("code_assist_sse", "stream_complete", map[string]any{
-		"sse_event_count":    sseEventCount,
-		"total_text_len":     totalTextLen,
-		"total_thought_len":  totalThoughtLen,
-		"unwrap_errors":      unwrapErrors,
-		"parse_errors":       parseErrors,
-		"stop_reason":        string(stopReason),
-		"total_input_tokens": totalInputTokens,
+		"sse_event_count":     sseEventCount,
+		"total_text_len":      totalTextLen,
+		"total_thought_len":   totalThoughtLen,
+		"unwrap_errors":       unwrapErrors,
+		"parse_errors":        parseErrors,
+		"stop_reason":         string(stopReason),
+		"total_input_tokens":  totalInputTokens,
 		"total_output_tokens": totalOutputTokens,
 	})
 
@@ -662,7 +667,8 @@ func (g *GoogleProvider) processCodeAssistSSE(
 			ReasoningTokens: totalReasoningTokens,
 			CacheReadTokens: totalCacheReadTokens,
 		},
-		Timestamp: time.Now(),
+		ProviderData: googleRawProviderData(rawContent),
+		Timestamp:    time.Now(),
 	})
 }
 

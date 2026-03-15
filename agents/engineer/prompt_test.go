@@ -95,3 +95,27 @@ func TestEngineerSystemPromptForContract_OmitsStaticImplementationProtocol(t *te
 		}
 	}
 }
+
+func TestEngineerSystemCollabPrompt_RoutesImplementationBackToInspector(t *testing.T) {
+	required := []string{
+		"`inspector-pipeline`",
+		"`inspector -> tester -> engineer/designer -> inspector`",
+		"Do not hand off directly to `tester-pipeline` after implementation",
+		"Only Inspector may run `finalize_pipeline` and decide whether to invoke `handoff_to_ot`.",
+	}
+	for _, want := range required {
+		if !strings.Contains(EngineerSystemCollabPrompt, want) {
+			t.Fatalf("collaboration prompt missing %q", want)
+		}
+	}
+
+	disallowed := []string{
+		"If tests pass: you're done",
+		"the task is complete.",
+	}
+	for _, text := range disallowed {
+		if strings.Contains(EngineerSystemCollabPrompt, text) {
+			t.Fatalf("collaboration prompt still contains stale terminal guidance %q", text)
+		}
+	}
+}

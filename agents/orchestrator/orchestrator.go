@@ -22,7 +22,6 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/pipeline/coordination"
-	"github.com/adalundhe/sylk/core/pipeline/tdd"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
@@ -96,7 +95,6 @@ type Orchestrator struct {
 	// Task router for DAG→container dispatch
 	taskRouter   *TaskRouter
 	dispatchGate *dispatchHoldGate
-	pipelineMgr  *tdd.PipelineManager
 
 	// Per-session VFS infrastructure (maps sessionID → SessionVFS).
 	sessionVFS   map[string]*versioning.SessionVFS
@@ -410,16 +408,6 @@ func (o *Orchestrator) SetTaskRouter(router *TaskRouter) {
 	o.taskRouter = router
 }
 
-// SetPipelineManager wires the real pipeline loop runtime used for worker DAG nodes.
-func (o *Orchestrator) SetPipelineManager(pm *tdd.PipelineManager) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.pipelineMgr = pm
-	if pm != nil {
-		pm.SetOnEvent(o.handleManagedPipelineEvent)
-	}
-}
-
 // SetActivator installs the on-demand agent activator, threading it to the
 // DAG bridge so BusNodeDispatchers can activate cold agents before dispatch.
 func (o *Orchestrator) SetActivator(a guide.PodActivator) {
@@ -429,7 +417,7 @@ func (o *Orchestrator) SetActivator(a guide.PodActivator) {
 }
 
 // SetRegistrar installs the pipeline registrar, threading it to the DAG
-// bridge so PipelinePods can register activated agents with the Guide.
+// bridge so task-scoped AgentPods can register activated agents with the Guide.
 func (o *Orchestrator) SetRegistrar(fn PipelineRegistrar) {
 	if o.dagBridge != nil {
 		o.dagBridge.SetRegistrar(fn)
@@ -443,7 +431,7 @@ func (o *Orchestrator) SetRegistrar(fn PipelineRegistrar) {
 }
 
 // SetScribeFactory installs the Scribe factory, threading it to the DAG
-// bridge so PipelinePods can create Scribe sidecars for pipeline agents.
+// bridge so task-scoped AgentPods can create Scribe sidecars for pipeline agents.
 func (o *Orchestrator) SetScribeFactory(f shared.ScribeFactory) {
 	if o.dagBridge != nil {
 		o.dagBridge.SetScribeFactory(f)
@@ -2309,16 +2297,30 @@ func extractPipelineUpdate(data map[string]any) *PipelineUpdate {
 	u.AgentID, _ = data["agent_id"].(string)
 	u.AgentType, _ = data["agent_type"].(string)
 	u.Status, _ = data["status"].(string)
+	u.Stage, _ = data["stage"].(string)
 	if p, ok := data["progress"].(float64); ok {
 		u.Progress = p
+	} else if p, ok := data["progress"].(int); ok {
+		u.Progress = float64(p)
 	}
 	u.Message, _ = data["message"].(string)
 	u.Output = data["output"]
 	u.Error, _ = data["error"].(string)
 	if a, ok := data["attempt"].(float64); ok {
 		u.Attempt = int(a)
+	} else if a, ok := data["attempt"].(int); ok {
+		u.Attempt = a
 	}
-	u.Timestamp = time.Now()
+	if ts, ok := data["timestamp"].(time.Time); ok {
+		u.Timestamp = ts
+	} else if raw, ok := data["timestamp"].(string); ok {
+		if parsed, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+			u.Timestamp = parsed
+		}
+	}
+	if u.Timestamp.IsZero() {
+		u.Timestamp = time.Now()
+	}
 	if u.Status == "" {
 		return nil
 	}
@@ -2339,10 +2341,7 @@ func convertTaskCompleteToNodeResult(task *TaskRecord) *dag.NodeResult {
 }
 
 func convertTaskFailedToNodeResult(task *TaskRecord) *dag.NodeResult {
-	var resultErr error
-	if task.Error != "" {
-		resultErr = fmt.Errorf("%s", task.Error)
-	}
+	resultErr := dagNodeError(firstNonEmpty(strings.TrimSpace(task.Error), "task failed without error details"))
 	return &dag.NodeResult{
 		NodeID:  task.ID,
 		State:   dag.NodeStateFailed,
@@ -2356,7 +2355,7 @@ func convertPipelineToNodeResult(update *PipelineUpdate) *dag.NodeResult {
 	var resultErr error
 	if update.Status == "failed" || update.Status == "timed_out" {
 		state = dag.NodeStateFailed
-		resultErr = fmt.Errorf("%s", update.Error)
+		resultErr = dagNodeError(firstNonEmpty(strings.TrimSpace(update.Error), strings.TrimSpace(update.Message), "pipeline task failed without error details"))
 	} else if update.Status == "cancelled" {
 		state = dag.NodeStateCancelled
 	}
@@ -2368,6 +2367,14 @@ func convertPipelineToNodeResult(update *PipelineUpdate) *dag.NodeResult {
 		Error:   resultErr,
 		EndTime: update.Timestamp,
 	}
+}
+
+func dagNodeError(text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	return fmt.Errorf("%s", text)
 }
 
 // =============================================================================

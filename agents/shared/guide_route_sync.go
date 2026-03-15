@@ -13,6 +13,7 @@ type GuideRouteSyncRequest struct {
 	Bus           guide.EventBus
 	ResponseTopic string
 	Request       *guide.RouteRequest
+	OnMessage     func(*guide.Message)
 }
 
 // RequestGuideRouteSync publishes a Guide route request and waits for the
@@ -40,6 +41,9 @@ func RequestGuideRouteSync(ctx context.Context, cfg GuideRouteSyncRequest) (*gui
 	sub, err := cfg.Bus.Subscribe(cfg.ResponseTopic, func(msg *guide.Message) error {
 		if msg == nil || msg.CorrelationID != req.CorrelationID {
 			return nil
+		}
+		if cfg.OnMessage != nil {
+			cfg.OnMessage(msg)
 		}
 		switch msg.Type {
 		case guide.MessageTypeResponse, guide.MessageTypeError:

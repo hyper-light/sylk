@@ -36,7 +36,7 @@ func DefaultDAGBridgeConfig() DAGBridgeConfig {
 	return DAGBridgeConfig{
 		MaxConcurrentDAGs:    4,
 		DefaultNodeTimeout:   5 * time.Minute,
-		DefaultRetries:       3,
+		DefaultRetries:       0,
 		MaxConcurrencyPerDAG: 8,
 	}
 }
@@ -266,9 +266,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	scribeFactory := b.scribeFactory
 	b.mu.RUnlock()
 
-	taskDefs := collectPipelineTaskPods(d)
-	managedTaskIDs := collectManagedPipelineTaskIDs(d)
-	taskPodDefs := filterPipelineTaskPodDefs(taskDefs, managedTaskIDs)
+	taskPodDefs := collectPipelineTaskPods(d)
 	b.logTrace("dag_execute_task_pods_build_begin", agentlog.EventRegistryEvent, map[string]any{
 		"dag_id":          d.ID(),
 		"task_pod_count":  len(taskPodDefs),
@@ -286,11 +284,6 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		"dag_id":          d.ID(),
 		"task_pod_count":  len(taskPods),
 		"task_pod_traces": tracePipelineTaskPodDefs(taskPodDefs),
-	})
-	advertiseTaskPods(taskPods, indexPipelineTaskPodDefs(taskPodDefs), d.ID(), b.logTrace)
-	b.logTrace("dag_execute_task_pods_advertised", agentlog.EventRegistryEvent, map[string]any{
-		"dag_id":         d.ID(),
-		"task_pod_count": len(taskPods),
 	})
 
 	// 3b. Create BusNodeDispatcher with node-aware task-pod activation.
@@ -455,7 +448,7 @@ func (b *DAGBridge) buildTaskPods(
 	taskPods := make(map[string]*shared.AgentPod, len(taskDefs))
 	for _, taskDef := range taskDefs {
 		b.logTrace("task_pod_build_begin", agentlog.EventRegistryEvent, tracePipelineTaskPodDef(taskDef))
-		managed, specs, err := buildTaskManagedPod(taskDef, sessionID, runtime, specReg, svfs, logger, b.eventLogger, b.agentID)
+		taskPod, err := buildTaskAgentPod(taskDef, sessionID, runtime, specReg, registrar, logger, scribeFactory, svfs, b.eventLogger, b.activityPub, b.agentID)
 		if err != nil {
 			b.logTrace("task_pod_build_failed", agentlog.EventError, mergeTraceMaps(tracePipelineTaskPodDef(taskDef), map[string]any{
 				"error": err.Error(),
@@ -463,18 +456,6 @@ func (b *DAGBridge) buildTaskPods(
 			releaseTaskPods(taskPods)
 			return nil, err
 		}
-		managed.SetSpecs(specs)
-
-		taskPod := NewPipelinePod(PipelinePodConfig{
-			PodID:         taskDef.TaskID,
-			SessionID:     sessionID,
-			Registrar:     registrar,
-			ActivityPub:   b.activityPub,
-			Logger:        logger,
-			ScribeFactory: scribeFactory,
-			EventLogger:   b.eventLogger,
-			Managed:       managed,
-		})
 		taskPods[taskDef.TaskID] = taskPod
 		b.logTrace("task_pod_build_ready", agentlog.EventRegistryEvent, mergeTraceMaps(tracePipelineTaskPodDef(taskDef), map[string]any{
 			"member_types": append([]string(nil), PipelineAgentTypes[:]...),
@@ -522,41 +503,6 @@ func collectPipelineTaskPods(d *dag.DAG) []pipelineTaskPodDef {
 	return result
 }
 
-func collectManagedPipelineTaskIDs(d *dag.DAG) map[string]struct{} {
-	if d == nil {
-		return nil
-	}
-	managed := make(map[string]struct{})
-	for _, node := range d.Nodes() {
-		if !isManagedPipelineTaskNode(node) {
-			continue
-		}
-		taskID, _ := dispatchTaskIdentity(node)
-		if taskID == "" {
-			continue
-		}
-		managed[taskID] = struct{}{}
-	}
-	if len(managed) == 0 {
-		return nil
-	}
-	return managed
-}
-
-func filterPipelineTaskPodDefs(defs []pipelineTaskPodDef, exclude map[string]struct{}) []pipelineTaskPodDef {
-	if len(defs) == 0 || len(exclude) == 0 {
-		return defs
-	}
-	filtered := make([]pipelineTaskPodDef, 0, len(defs))
-	for _, def := range defs {
-		if _, skip := exclude[def.TaskID]; skip {
-			continue
-		}
-		filtered = append(filtered, def)
-	}
-	return filtered
-}
-
 func isPipelineTaskNode(node *dag.Node) bool {
 	if node == nil {
 		return false
@@ -567,24 +513,6 @@ func isPipelineTaskNode(node *dag.Node) bool {
 	default:
 		return false
 	}
-}
-
-func isManagedPipelineTaskNode(node *dag.Node) bool {
-	if node == nil {
-		return false
-	}
-	switch strings.TrimSpace(node.AgentType()) {
-	case "engineer", "designer":
-	default:
-		return false
-	}
-	stage := ""
-	if ctx := node.Context(); ctx != nil {
-		if raw, ok := ctx["pipeline_stage"].(string); ok {
-			stage = strings.TrimSpace(raw)
-		}
-	}
-	return stage == "" || stage == string(StageExecute)
 }
 
 func extractAffectedFiles(ctx map[string]any) []string {
@@ -641,16 +569,19 @@ func appendUniqueStrings(dst []string, values ...string) []string {
 	return dst
 }
 
-func buildTaskManagedPod(
+func buildTaskAgentPod(
 	task pipelineTaskPodDef,
 	sessionID string,
 	runtime container.ContainerRuntime,
 	specReg *container.AgentSpecRegistry,
-	svfs *versioning.SessionVFS,
+	registrar PipelineRegistrar,
 	logger *slog.Logger,
+	scribeFactory shared.ScribeFactory,
+	svfs *versioning.SessionVFS,
 	eventLogger *agentlog.SessionEventLogger,
+	activityPub events.ActivityPublisher,
 	agentID string,
-) (*containerpod.ManagedPod, []container.ContainerSpec, error) {
+) (*shared.AgentPod, error) {
 	policy := &containerpod.PodPolicy{
 		PodID:       task.TaskID,
 		PodType:     containerpod.PodTypePipeline,
@@ -682,19 +613,11 @@ func buildTaskManagedPod(
 		},
 	})
 
-	managed := containerpod.NewManagedPod(containerpod.ManagedPodConfig{
-		ID:            task.TaskID,
-		Policy:        policy,
-		Runtime:       runtime,
-		Logger:        logger,
-		VolumeManager: volumeManager,
-	})
-
 	specs := make([]container.ContainerSpec, 0, len(PipelineAgentTypes))
 	for _, agentType := range PipelineAgentTypes {
 		spec, err := specReg.SpecForAgent(agentType)
 		if err != nil {
-			return nil, nil, fmt.Errorf("task pod %s: spec for %s: %w", task.TaskID, agentType, err)
+			return nil, fmt.Errorf("task pod %s: spec for %s: %w", task.TaskID, agentType, err)
 		}
 		spec.Name = TaskScopedRoutingName(task.TaskSlug, task.TaskID, agentType)
 		workerAgentID := PipelineWorkerAgentID(task.TaskID, agentType)
@@ -709,17 +632,33 @@ func buildTaskManagedPod(
 		specs = append(specs, spec)
 	}
 
-	return managed, specs, nil
+	return shared.NewAgentPod(shared.AgentPodConfig{
+		PodID:     task.TaskID,
+		SessionID: sessionID,
+		Registrar: func(ctx context.Context, agentType string) error {
+			if registrar == nil {
+				return nil
+			}
+			return registrar(ctx, task.TaskID, agentType)
+		},
+		ActivityPub:            activityPub,
+		RegistrationVisibility: events.VisibilitySystem,
+		Logger:                 logger,
+		MemberTypes:            PipelineAgentTypes[:],
+		DisplayNames:           PipelineAgentDisplayNames,
+		EventLogger:            eventLogger,
+		ScribeFactory:          scribeFactory,
+		Policy:                 policy,
+		Runtime:                runtime,
+		VolumeManager:          volumeManager,
+		Specs:                  specs,
+	}), nil
 }
 
 func releaseTaskPods(taskPods map[string]*shared.AgentPod) {
 	for _, pod := range taskPods {
 		if pod == nil {
 			continue
-		}
-		if managed := pod.ManagedPod(); managed != nil {
-			_ = managed.Demote(context.Background(), containerpod.TierCold)
-			managed.Release()
 		}
 		pod.Release()
 	}

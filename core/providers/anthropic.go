@@ -846,6 +846,8 @@ func (p *AnthropicProvider) convertMessages(messages []Message, usePromptCache b
 			lastUserHasText = true
 
 		case RoleAssistant:
+			safeMetadata := sanitizeProviderMetadataForHistory(msg.Metadata)
+			safeToolCalls := SanitizeToolCallsForHistory(msg.ToolCalls)
 			if strings.TrimSpace(msg.Content) == "" && len(msg.ToolCalls) == 0 {
 				continue
 			}
@@ -853,7 +855,7 @@ func (p *AnthropicProvider) convertMessages(messages []Message, usePromptCache b
 			// or disk), reconstruct SDK params to retain thinking blocks with
 			// opaque signatures. Uses decodeAnthropicBlocks to handle both
 			// in-memory []anthropicContentBlock and deserialized []any forms.
-			if v, ok := msg.Metadata[anthropicRawContentKey]; ok {
+			if v, ok := safeMetadata[anthropicRawContentKey]; ok {
 				if blocks := decodeAnthropicBlocks(v); len(blocks) > 0 {
 					params := make([]anthropic.ContentBlockParamUnion, len(blocks))
 					for i := range blocks {
@@ -863,12 +865,12 @@ func (p *AnthropicProvider) convertMessages(messages []Message, usePromptCache b
 					continue
 				}
 			}
-			if len(msg.ToolCalls) > 0 {
-				blocks := make([]anthropic.ContentBlockParamUnion, 0, len(msg.ToolCalls)+1)
+			if len(safeToolCalls) > 0 {
+				blocks := make([]anthropic.ContentBlockParamUnion, 0, len(safeToolCalls)+1)
 				if msg.Content != "" {
 					blocks = append(blocks, anthropic.NewTextBlock(msg.Content))
 				}
-				for _, tc := range msg.ToolCalls {
+				for _, tc := range safeToolCalls {
 					blocks = append(blocks, anthropic.ContentBlockParamUnion{
 						OfToolUse: &anthropic.ToolUseBlockParam{
 							ID:    normalizeToolCallID(tc.ID),

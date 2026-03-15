@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -540,6 +541,116 @@ func TestTaskRouter_DeliverResponse_MirrorStreamAddsTaskMetadataWhenMissing(t *t
 	case <-time.After(2 * time.Second):
 		t.Fatal("pipeline update was not published")
 	}
+}
+
+func TestTaskRouter_DeliverResponse_MirrorsUntrackedProtocolStreamAndRecordsActivity(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	activityCh := make(chan struct {
+		dagID  string
+		nodeID string
+	}, 1)
+	router := NewTaskRouter(TaskRouterConfig{
+		Bus:       bus,
+		Scope:     scope,
+		AgentID:   "orchestrator",
+		SessionID: "test-session",
+		OnNodeActivity: func(dagID, nodeID string) {
+			select {
+			case activityCh <- struct {
+				dagID  string
+				nodeID string
+			}{dagID: dagID, nodeID: nodeID}:
+			default:
+			}
+		},
+	})
+
+	tuiCh := make(chan *guide.StreamResponse, 1)
+	tuiSub, err := bus.SubscribeAsync(guide.TopicResponses("tui", "tui"), func(msg *guide.Message) error {
+		if stream, ok := msg.GetStreamResponse(); ok {
+			tuiCh <- stream
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer tuiSub.Unsubscribe()
+
+	streamMsg := &guide.Message{
+		ID:            "stream-protocol-1",
+		CorrelationID: "pipe_protocol_1",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "pipe_protocol_1",
+			RespondingAgentID: PipelineWorkerAgentID("task-1", agentshared.PipelineAgentTester),
+			TargetAgentID:     "orchestrator",
+			Metadata: map[string]any{
+				"pipeline_task": true,
+				"dag_id":        "dag-1",
+				"node_id":       "node-1",
+				"task_id":       "task-1",
+				"task_slug":     "hello-cli",
+				"task_name":     "Hello CLI",
+				"agent_type":    agentshared.PipelineAgentTester,
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Running tests"},
+			},
+		},
+		SourceAgentID: PipelineWorkerAgentID("task-1", agentshared.PipelineAgentTester),
+		TargetAgentID: "orchestrator",
+		Timestamp:     time.Now(),
+	}
+
+	assert.True(t, router.DeliverResponse(streamMsg))
+
+	select {
+	case activity := <-activityCh:
+		assert.Equal(t, "dag-1", activity.dagID)
+		assert.Equal(t, "node-1", activity.nodeID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected node activity refresh from protocol stream")
+	}
+
+	select {
+	case mirrored := <-tuiCh:
+		require.NotNil(t, mirrored)
+		assert.Equal(t, "tui", mirrored.TargetAgentID)
+		assert.Equal(t, agentshared.PipelineAgentTester, mirrored.Metadata["agent_type"])
+		assert.Equal(t, "task-1", mirrored.Metadata["task_id"])
+		assert.Equal(t, "hello-cli", mirrored.Metadata["task_slug"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected protocol stream to be mirrored to the TUI response topic")
+	}
+}
+
+func TestTaskRouter_DeliverResponse_ConsumesUntrackedProtocolTerminal(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+
+	resp := &guide.RouteResponse{
+		CorrelationID:     "pipe_protocol_2",
+		Success:           true,
+		RespondingAgentID: PipelineWorkerAgentID("task-1", agentshared.PipelineAgentTester),
+		Data: &agentshared.PipelineTurnResponse{
+			Action: &agentshared.PipelineTurnAction{
+				Type:         agentshared.PipelineProtocolActionValidate,
+				AgentType:    agentshared.PipelineAgentTester,
+				ChallengeID:  "challenge-1",
+				TargetAgents: []string{agentshared.PipelineAgentInspector},
+			},
+		},
+	}
+	msg := guide.NewResponseMessage("", resp)
+	msg.CorrelationID = resp.CorrelationID
+
+	assert.True(t, router.DeliverResponse(msg))
 }
 
 func TestTaskRouter_ErrorMessagePublishesFailure(t *testing.T) {

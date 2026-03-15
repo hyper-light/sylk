@@ -1,65 +1,120 @@
 package orchestrator
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
-	"github.com/adalundhe/sylk/core/pipeline/tdd"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 )
 
-func TestHandleManagedPipelineEvent_PublishesRunningUpdate(t *testing.T) {
+func TestRouteProtocolPipelineTask_SeedsInspectorAndPublishesRunningUpdate(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	t.Cleanup(func() { _ = bus.Close() })
 
-	updates := make(chan *PipelineUpdate, 1)
-	sub, err := bus.SubscribeAsync("pipeline.update.engineer", func(msg *guide.Message) error {
-		update, ok := msg.Payload.(*PipelineUpdate)
-		if !ok {
-			if data, dataOK := msg.Payload.(map[string]any); dataOK {
-				update = extractPipelineUpdate(data)
-			}
+	scope := testScope()
+	router := testRouter(bus, scope)
+	task := testTask()
+	task.TargetAgentID = pipelineWorkerTargetAgentID(task.TaskID, task.AgentType)
+	task.Context = map[string]any{
+		"task_slug": "hello-cli",
+		"task_name": "Hello CLI",
+		"co_agents": []any{"designer"},
+	}
+
+	reqCh := make(chan *guide.RouteRequest, 1)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
 		}
-		if update != nil {
-			updates <- update
+		select {
+		case reqCh <- req:
+		default:
 		}
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("subscribe: %v", err)
+		t.Fatalf("subscribe guide requests: %v", err)
 	}
-	defer sub.Unsubscribe()
+	defer reqSub.Unsubscribe()
 
-	o := &Orchestrator{
-		config: Config{AgentID: "orchestrator"},
-		bus:    bus,
-	}
-
-	o.handleManagedPipelineEvent(tdd.PipelineEvent{
-		TaskID:     "task_1",
-		DAGID:      "dag-1",
-		DAGNodeID:  "task_1",
-		WorkerType: tdd.WorkerEngineer,
-		NewStatus:  tdd.StatusActive,
-		Stage:      string(StageInspect),
-		Message:    "inspector evaluating the task",
-		LoopCount:  1,
-		Timestamp:  time.Now(),
+	updateCh := make(chan *PipelineUpdate, 1)
+	updateSub, err := bus.SubscribeAsync("pipeline.update."+agentshared.PipelineAgentInspector, func(msg *guide.Message) error {
+		update, ok := msg.Payload.(*PipelineUpdate)
+		if !ok || update == nil {
+			return nil
+		}
+		select {
+		case updateCh <- update:
+		default:
+		}
+		return nil
 	})
+	if err != nil {
+		t.Fatalf("subscribe pipeline updates: %v", err)
+	}
+	defer updateSub.Unsubscribe()
+
+	if err := router.RouteWithLifecycle(task, nil); err != nil {
+		t.Fatalf("RouteWithLifecycle: %v", err)
+	}
+
+	var req *guide.RouteRequest
+	select {
+	case req = <-reqCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for guide route request")
+	}
+	if req.SourceAgentID != "orchestrator" {
+		t.Fatalf("source_agent_id = %q, want orchestrator", req.SourceAgentID)
+	}
+	if req.SourceAgentName != "orchestrator" {
+		t.Fatalf("source_agent_name = %q, want orchestrator", req.SourceAgentName)
+	}
+	if req.Metadata["pipeline_task"] != true {
+		t.Fatalf("pipeline_task metadata = %#v, want true", req.Metadata["pipeline_task"])
+	}
+	if req.TargetAgentID != pipelineWorkerTargetAgentID(task.TaskID, agentshared.PipelineAgentInspector) {
+		t.Fatalf("target_agent_id = %q", req.TargetAgentID)
+	}
+
+	var seeded agentshared.PipelineTaskInput
+	if err := json.Unmarshal([]byte(req.Input), &seeded); err != nil {
+		t.Fatalf("decode seeded pipeline task: %v", err)
+	}
+	if seeded.AgentType != agentshared.PipelineAgentInspector {
+		t.Fatalf("seeded agent_type = %q, want %q", seeded.AgentType, agentshared.PipelineAgentInspector)
+	}
+	if stage, _ := seeded.Context["pipeline_stage"].(string); stage != string(StageInspect) {
+		t.Fatalf("pipeline_stage = %q, want %q", stage, StageInspect)
+	}
+	if workerType, _ := seeded.Context["agent_type"].(string); workerType != "engineer" {
+		t.Fatalf("context agent_type = %q, want engineer", workerType)
+	}
+
+	snapshot, err := agentshared.PipelineProtocolSnapshotFromTask(&seeded)
+	if err != nil {
+		t.Fatalf("PipelineProtocolSnapshotFromTask: %v", err)
+	}
+	if snapshot == nil {
+		t.Fatal("expected protocol snapshot in seeded task")
+	}
+	if snapshot.CurrentRequest != initialProtocolPipelineRequest {
+		t.Fatalf("current_request = %q, want %q", snapshot.CurrentRequest, initialProtocolPipelineRequest)
+	}
+	if len(snapshot.ActiveAgents) != 1 || snapshot.ActiveAgents[0] != agentshared.PipelineAgentInspector {
+		t.Fatalf("active_agents = %#v, want inspector", snapshot.ActiveAgents)
+	}
+	if len(snapshot.Roster) != 4 {
+		t.Fatalf("roster length = %d, want 4", len(snapshot.Roster))
+	}
 
 	select {
-	case update := <-updates:
-		if update.NodeID != "task_1" {
-			t.Fatalf("node_id = %q, want task_1", update.NodeID)
-		}
-		if update.DAGID != "dag-1" {
-			t.Fatalf("dag_id = %q, want dag-1", update.DAGID)
-		}
-		if update.TaskID != "task_1" {
-			t.Fatalf("task_id = %q, want task_1", update.TaskID)
-		}
-		if update.AgentType != "engineer" {
-			t.Fatalf("agent_type = %q, want engineer", update.AgentType)
+	case update := <-updateCh:
+		if update.AgentType != agentshared.PipelineAgentInspector {
+			t.Fatalf("agent_type = %q, want %q", update.AgentType, agentshared.PipelineAgentInspector)
 		}
 		if update.Stage != string(StageInspect) {
 			t.Fatalf("stage = %q, want %q", update.Stage, StageInspect)
@@ -67,57 +122,39 @@ func TestHandleManagedPipelineEvent_PublishesRunningUpdate(t *testing.T) {
 		if update.Status != "running" {
 			t.Fatalf("status = %q, want running", update.Status)
 		}
-		if update.Message != "inspector evaluating the task" {
-			t.Fatalf("message = %q, want %q", update.Message, "inspector evaluating the task")
-		}
-		if update.Attempt != 1 {
-			t.Fatalf("attempt = %d, want 1", update.Attempt)
+		if update.Message != initialProtocolPipelineRequest {
+			t.Fatalf("message = %q, want %q", update.Message, initialProtocolPipelineRequest)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for managed pipeline update")
+		t.Fatal("timed out waiting for initial protocol pipeline update")
 	}
 }
 
-func TestHandleManagedPipelineEvent_SkipsTerminalEvent(t *testing.T) {
-	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
-	t.Cleanup(func() { _ = bus.Close() })
-
-	updates := make(chan *PipelineUpdate, 1)
-	sub, err := bus.SubscribeAsync("pipeline.update.engineer", func(msg *guide.Message) error {
-		update, ok := msg.Payload.(*PipelineUpdate)
-		if !ok {
-			if data, dataOK := msg.Payload.(map[string]any); dataOK {
-				update = extractPipelineUpdate(data)
-			}
-		}
-		if update != nil {
-			updates <- update
-		}
-		return nil
+func TestExtractPipelineUpdate_ParsesStageAttemptAndTimestampFromMap(t *testing.T) {
+	now := time.Now().UTC().Round(0)
+	update := extractPipelineUpdate(map[string]any{
+		"dag_id":     "dag-1",
+		"node_id":    "node-1",
+		"task_id":    "task-1",
+		"agent_id":   "worker-1",
+		"agent_type": "tester-pipeline",
+		"status":     "running",
+		"stage":      "test",
+		"progress":   0.4,
+		"message":    "testing current state",
+		"attempt":    2,
+		"timestamp":  now.Format(time.RFC3339Nano),
 	})
-	if err != nil {
-		t.Fatalf("subscribe: %v", err)
+	if update == nil {
+		t.Fatal("expected pipeline update")
 	}
-	defer sub.Unsubscribe()
-
-	o := &Orchestrator{
-		config: Config{AgentID: "orchestrator"},
-		bus:    bus,
+	if update.Stage != "test" {
+		t.Fatalf("stage = %q, want test", update.Stage)
 	}
-
-	o.handleManagedPipelineEvent(tdd.PipelineEvent{
-		TaskID:     "task_1",
-		DAGID:      "dag-1",
-		DAGNodeID:  "task_1",
-		WorkerType: tdd.WorkerEngineer,
-		NewStatus:  tdd.StatusCompleted,
-		LoopCount:  1,
-		Timestamp:  time.Now(),
-	})
-
-	select {
-	case update := <-updates:
-		t.Fatalf("unexpected update published for terminal event: %#v", update)
-	case <-time.After(200 * time.Millisecond):
+	if update.Attempt != 2 {
+		t.Fatalf("attempt = %d, want 2", update.Attempt)
+	}
+	if !update.Timestamp.Equal(now) {
+		t.Fatalf("timestamp = %s, want %s", update.Timestamp.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 	}
 }

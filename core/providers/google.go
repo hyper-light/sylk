@@ -1335,6 +1335,7 @@ func (g *GoogleProvider) streamWithHandlerOnce(ctx context.Context, req *Request
 	var totalInputTokens, totalOutputTokens, totalReasoningTokens, totalCacheReadTokens int
 	var emittedEarlyUsage bool
 	var stopReason StopReason
+	var rawContent *googleSerializableContent
 	toolCallsSeen := map[googleToolCallKey]bool{}
 	textDelta := &providerDeltaEmitter{}
 	thoughtDelta := &providerDeltaEmitter{}
@@ -1351,6 +1352,10 @@ func (g *GoogleProvider) streamWithHandlerOnce(ctx context.Context, req *Request
 		}
 
 		chunkIndex++
+
+		if raw := extractGoogleRawContent(resp); raw != nil {
+			rawContent = raw
+		}
 
 		text, thought := extractGoogleStreamTextAndThought(resp)
 		if text := textDelta.Delta(text); text != "" {
@@ -1444,7 +1449,8 @@ func (g *GoogleProvider) streamWithHandlerOnce(ctx context.Context, req *Request
 			ReasoningTokens: totalReasoningTokens,
 			CacheReadTokens: totalCacheReadTokens,
 		},
-		Timestamp: time.Now(),
+		ProviderData: googleRawProviderData(rawContent),
+		Timestamp:    time.Now(),
 	})
 }
 
@@ -1920,6 +1926,13 @@ func (g *GoogleProvider) convertSafetySettings() []*genai.SafetySetting {
 // is required when replaying multi-turn tool-call conversations with
 // thinking mode enabled.
 const googleRawContentKey = "google_raw_content"
+
+func googleRawProviderData(raw *googleSerializableContent) map[string]any {
+	if raw == nil {
+		return nil
+	}
+	return map[string]any{googleRawContentKey: raw}
+}
 
 // googleSerializableContent is a JSON-safe snapshot of genai.Content that
 // survives serialization boundaries (WAL replay, session persistence).

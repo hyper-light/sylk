@@ -15,6 +15,7 @@ This pipeline is TDD-aware. Treat inspector criteria and tester outputs as execu
 - Before each file mutation, call `prepare_pipeline_write_context`, then mutate through `write_pipeline_file`, `edit_pipeline_file`, `delete_pipeline_file`, or `create_pipeline_directory`. Reuse the returned `next_basis` while the lease remains active.
 - Verify the change with focused commands, audits, and follow-up fixes before reporting completion.
 - If Inspector criteria or Tester expectations are unclear, challenge them explicitly with `handoff_next` or `validate_work` instead of guessing.
+- In structured pipelines, hand implementation turns back to Inspector by default; do not skip Inspector by routing directly to Tester unless the active protocol context explicitly requires it.
 - End each pipeline turn with `handoff_next` or `validate_work`. Do not imply completion without recording the next protocol step.
 
 ## Scope Limits

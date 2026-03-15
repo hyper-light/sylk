@@ -395,12 +395,7 @@ func (r *GuideResponder) applyToolCallsTracked(
 		return 0, false
 	}
 
-	req.Messages = append(req.Messages, providers.Message{
-		Role:      providers.RoleAssistant,
-		Content:   strings.TrimSpace(resp.Content),
-		ToolCalls: resp.ToolCalls,
-		Metadata:  resp.ProviderMetadata,
-	})
+	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
 	rerouted := false

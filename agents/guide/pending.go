@@ -1,6 +1,7 @@
 package guide
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,9 @@ type PendingStore struct {
 
 	// Pending requests by correlation ID
 	pending map[string]*PendingRequest
+
+	// Index by parent correlation for request-tree traversal.
+	byParent map[string]map[string]struct{}
 
 	// Index by source agent for cleanup
 	bySource map[string]map[string]struct{}
@@ -58,6 +62,7 @@ func NewPendingStore(cfg PendingStoreConfig) *PendingStore {
 
 	return &PendingStore{
 		pending:        make(map[string]*PendingRequest),
+		byParent:       make(map[string]map[string]struct{}),
 		bySource:       make(map[string]map[string]struct{}),
 		byTarget:       make(map[string]map[string]struct{}),
 		bySession:      make(map[string]map[string]struct{}),
@@ -96,6 +101,13 @@ func (ps *PendingStore) Add(req *RouteRequest, classification *RouteResult, targ
 	// Store by correlation ID
 	ps.pending[corrID] = pending
 
+	if parentID := strings.TrimSpace(req.ParentCorrelationID); parentID != "" {
+		if ps.byParent[parentID] == nil {
+			ps.byParent[parentID] = make(map[string]struct{})
+		}
+		ps.byParent[parentID][corrID] = struct{}{}
+	}
+
 	// Index by source
 	if ps.bySource[req.SourceAgentID] == nil {
 		ps.bySource[req.SourceAgentID] = make(map[string]struct{})
@@ -125,6 +137,15 @@ func (ps *PendingStore) Set(correlationID string, pending *PendingRequest) {
 	defer ps.mu.Unlock()
 
 	ps.pending[correlationID] = pending
+
+	if pending.Request != nil {
+		if parentID := strings.TrimSpace(pending.Request.ParentCorrelationID); parentID != "" {
+			if ps.byParent[parentID] == nil {
+				ps.byParent[parentID] = make(map[string]struct{})
+			}
+			ps.byParent[parentID][correlationID] = struct{}{}
+		}
+	}
 
 	if pending.SourceAgentID != "" {
 		if ps.bySource[pending.SourceAgentID] == nil {
@@ -175,6 +196,17 @@ func (ps *PendingStore) Remove(correlationID string) *PendingRequest {
 		}
 	}
 
+	if pending.Request != nil {
+		if parentID := strings.TrimSpace(pending.Request.ParentCorrelationID); parentID != "" {
+			if parentIdx := ps.byParent[parentID]; parentIdx != nil {
+				delete(parentIdx, correlationID)
+				if len(parentIdx) == 0 {
+					delete(ps.byParent, parentID)
+				}
+			}
+		}
+	}
+
 	// Remove from target index
 	if targetIdx := ps.byTarget[pending.TargetAgentID]; targetIdx != nil {
 		delete(targetIdx, correlationID)
@@ -219,6 +251,25 @@ func (ps *PendingStore) GetByTarget(targetAgentID string) []*PendingRequest {
 	defer ps.mu.RUnlock()
 
 	corrIDs := ps.byTarget[targetAgentID]
+	if corrIDs == nil {
+		return nil
+	}
+
+	result := make([]*PendingRequest, 0, len(corrIDs))
+	for corrID := range corrIDs {
+		if pending := ps.pending[corrID]; pending != nil {
+			result = append(result, pending)
+		}
+	}
+	return result
+}
+
+// GetByParent returns all pending child requests for a parent correlation ID.
+func (ps *PendingStore) GetByParent(parentCorrelationID string) []*PendingRequest {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	corrIDs := ps.byParent[strings.TrimSpace(parentCorrelationID)]
 	if corrIDs == nil {
 		return nil
 	}

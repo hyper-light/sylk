@@ -36,7 +36,6 @@ import (
 	"github.com/adalundhe/sylk/core/llm"
 	"github.com/adalundhe/sylk/core/lsp"
 	"github.com/adalundhe/sylk/core/oauth"
-	"github.com/adalundhe/sylk/core/pipeline/tdd"
 	"github.com/adalundhe/sylk/core/pipeline/variants"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/search/git"
@@ -330,8 +329,7 @@ type Deps struct {
 	GitBus            *git.GitBus
 	SafetyGuard       *git.SafetyGuard
 
-	// Pipeline system — optional, nil when no pipeline subsystem is active.
-	PipelineManager *tdd.PipelineManager
+	// Pipeline system — optional, nil when no pipeline/variant subsystem is active.
 	VariantRegistry variants.Registry
 
 	// SeedAgents pre-populates the agent panel with known agents at startup.
@@ -716,6 +714,15 @@ type AppModel struct {
 	totalCacheWriteTokens int
 	totalReasoningTokens  int
 
+	// Bus token counters that cannot be attributed to an active stream.
+	// These cover background or non-streamed LLM work without double-counting
+	// the streamed requests already folded into total* above.
+	backgroundPromptTokens     int
+	backgroundCompletionTokens int
+	backgroundCacheReadTokens  int
+	backgroundCacheWriteTokens int
+	backgroundReasoningTokens  int
+
 	// Bus-sourced token counters: accumulated from TokenUsageMsg which
 	// captures ALL agent LLM calls (guide, engineer, architect, etc.).
 	busInputTokens      int
@@ -1097,13 +1104,10 @@ func (m *AppModel) initializeGitPanels(th *theme.Theme, cfg Config) {
 }
 
 func (m *AppModel) initializePipelineBridge(deps Deps) {
-	if deps.PipelineManager == nil && deps.VariantRegistry == nil {
+	if deps.GuideBus == nil && deps.VariantRegistry == nil {
 		return
 	}
 	m.pipelineBridge = bridge.NewPipelineBridge("tui.pipeline", deps.GuideBus, deps.VariantRegistry, deps.Scope)
-	if deps.PipelineManager != nil {
-		deps.PipelineManager.SetOnEvent(m.pipelineBridge.OnPipelineEvent)
-	}
 }
 
 var (
@@ -2390,13 +2394,15 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 		if typed.Model != "" && canonicalID != "" {
 			m.agentContextModels[canonicalID] = typed.Model
 		}
+		if !m.tokenUsageOverlapsActiveStream(typed.CorrelationID, canonicalID) {
+			m.backgroundPromptTokens += typed.InputTokens
+			m.backgroundCompletionTokens += typed.OutputTokens
+			m.backgroundCacheReadTokens += typed.CacheReadTokens
+			m.backgroundCacheWriteTokens += typed.CacheWriteTokens
+			m.backgroundReasoningTokens += typed.ReasoningTokens
+		}
 		if typed.InputTokens > 0 {
-			if typed.CorrelationID != "" {
-				if state, ok := m.streamUsage[typed.CorrelationID]; ok {
-					state.InputTokens = typed.InputTokens
-					m.streamUsage[typed.CorrelationID] = state
-				}
-			}
+			m.recordStreamInputTokens(typed.CorrelationID, canonicalID, typed.InputTokens)
 			if canonicalID != "" {
 				m.setAgentContextUsage(canonicalID, typed.InputTokens)
 			}
@@ -6271,7 +6277,6 @@ func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea
 	uiDebugFileLog().Info("AppModel: STREAM_COMPLETE_SHOULD_RENDER",
 		"correlation_id", done.CorrelationID,
 		"should_render", shouldRender)
-	delete(m.interruptedCorrelations, done.CorrelationID)
 	m.applyRealStreamUsage(done)
 	m.finalizeStreamUsage(done.CorrelationID, true, "")
 	m.markQueueEntryByCorrelation(done.CorrelationID, true)
@@ -6351,7 +6356,6 @@ func (m *AppModel) handleStreamErrorTelemetry(streamErr msg.StreamErrorMsg) tea.
 		return nil
 	}
 	m.clearRecordedStream(streamErr.CorrelationID)
-	delete(m.interruptedCorrelations, streamErr.CorrelationID)
 	m.finalizeStreamUsage(streamErr.CorrelationID, false, summary)
 	m.markQueueEntryByCorrelation(streamErr.CorrelationID, false)
 	// Resolve the responding agent before unregistering the stream (which
@@ -6383,12 +6387,23 @@ func (m *AppModel) trackStreamStart(start msg.StreamStartMsg) {
 	if correlationID == "" {
 		return
 	}
+	logicalPipelineID := logicalStreamPipelineID(start.PipelineID, start.TaskID)
+	canonicalAgentID := canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
+	startIdentity := normalizeAgentID(firstNonEmpty(canonicalAgentID, start.AgentType, start.AgentID))
 	entry, ok := m.streamUsage[correlationID]
 	if !ok {
 		entry = streamUsageEntry{StartedAt: time.Now()}
+	} else {
+		existingIdentity := normalizeAgentID(firstNonEmpty(entry.AgentID, entry.AgentType))
+		if existingIdentity != "" && startIdentity != "" && existingIdentity != startIdentity {
+			// A shared correlation can move across agents during reroute or
+			// orchestration. Reset per-stream counters so the next agent's
+			// authoritative usage does not replace the prior agent's already
+			// accumulated session totals.
+			entry = streamUsageEntry{StartedAt: time.Now()}
+		}
 	}
-	logicalPipelineID := logicalStreamPipelineID(start.PipelineID, start.TaskID)
-	entry.AgentID = canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
+	entry.AgentID = canonicalAgentID
 	entry.AgentType = strings.TrimSpace(start.AgentType)
 	entry.AgentName = strings.TrimSpace(start.AgentName)
 	entry.PipelineID = logicalPipelineID
@@ -6588,6 +6603,56 @@ func (m *AppModel) discardStreamUsage(correlationID string) {
 	}
 }
 
+func (m *AppModel) tokenUsageOverlapsActiveStream(correlationID, canonicalAgentID string) bool {
+	if correlationID = strings.TrimSpace(correlationID); correlationID != "" {
+		if _, ok := m.streamUsage[correlationID]; ok {
+			return true
+		}
+	}
+	canonicalAgentID = normalizeAgentID(canonicalAgentID)
+	if canonicalAgentID == "" {
+		return false
+	}
+	return m.activeStreamForAgent(canonicalAgentID) != nil
+}
+
+func (m *AppModel) recordStreamInputTokens(correlationID, canonicalAgentID string, inputTokens int) {
+	if inputTokens <= 0 {
+		return
+	}
+	if correlationID = strings.TrimSpace(correlationID); correlationID != "" {
+		if state, ok := m.streamUsage[correlationID]; ok {
+			state.InputTokens = inputTokens
+			m.streamUsage[correlationID] = state
+		}
+		return
+	}
+
+	canonicalAgentID = normalizeAgentID(canonicalAgentID)
+	if canonicalAgentID == "" {
+		return
+	}
+
+	latestCID := ""
+	var latestStart time.Time
+	for cid, state := range m.streamUsage {
+		if normalizeAgentID(state.AgentID) != canonicalAgentID {
+			continue
+		}
+		if latestCID == "" || state.StartedAt.After(latestStart) {
+			latestCID = cid
+			latestStart = state.StartedAt
+		}
+	}
+	if latestCID == "" {
+		return
+	}
+
+	state := m.streamUsage[latestCID]
+	state.InputTokens = inputTokens
+	m.streamUsage[latestCID] = state
+}
+
 // applyEarlyInputTokens applies real input tokens as soon as the provider
 // reports them (at stream start), avoiding the need to wait for completion.
 func (m *AppModel) applyEarlyInputTokens(correlationID string, inputTokens int) {
@@ -6651,10 +6716,10 @@ func (m *AppModel) updateTokenDisplay() {
 		return
 	}
 	m.statusBar.SetTokens(
-		max(m.totalPromptTokens, m.busInputTokens),
-		max(m.totalCompletionTokens, m.busOutputTokens),
-		max(m.totalCacheReadTokens, m.busCacheReadTokens),
-		max(m.totalReasoningTokens, m.busReasoningTokens),
+		m.totalPromptTokens+m.backgroundPromptTokens,
+		m.totalCompletionTokens+m.backgroundCompletionTokens,
+		m.totalCacheReadTokens+m.backgroundCacheReadTokens,
+		m.totalReasoningTokens+m.backgroundReasoningTokens,
 	)
 }
 
@@ -6801,7 +6866,6 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 	// Guard interrupted correlations — drop guide responses for dead requests.
 	if r.CorrelationID != "" {
 		if _, interrupted := m.interruptedCorrelations[r.CorrelationID]; interrupted {
-			delete(m.interruptedCorrelations, r.CorrelationID)
 			return nil
 		}
 	}
@@ -6842,22 +6906,29 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 	streamTaskID := ""
 	streamTaskName := ""
 	streamTaskSlug := ""
+	entryAgentID := strings.TrimSpace(r.AgentID)
+	entryAgentType := ""
 	if streamEntry != nil {
+		entryAgentID = firstNonEmpty(streamEntry.AgentID, entryAgentID)
+		entryAgentType = strings.TrimSpace(streamEntry.AgentType)
 		streamTaskID = strings.TrimSpace(streamEntry.TaskID)
 		streamTaskName = strings.TrimSpace(streamEntry.TaskName)
 		streamTaskSlug = strings.TrimSpace(streamEntry.TaskSlug)
 	}
-	agentDisplay := r.AgentID
-	if r.AgentName != "" {
-		agentDisplay = r.AgentName
+	if entryAgentType == "" {
+		var resolvedID string
+		resolvedID, _, entryAgentType = m.resolveAgentIdentity(entryAgentID, r.AgentName)
+		if entryAgentID == "" {
+			entryAgentID = resolvedID
+		}
 	}
 	entry := &chat.ChatEntry{
 		ID:            uuid.New().String(),
 		Timestamp:     time.Now(),
 		CorrelationID: r.CorrelationID,
 		Source:        source,
-		AgentType:     agentDisplay,
-		AgentID:       r.AgentID,
+		AgentType:     entryAgentType,
+		AgentID:       entryAgentID,
 		TaskID:        streamTaskID,
 		TaskName:      streamTaskName,
 		TaskSlug:      streamTaskSlug,

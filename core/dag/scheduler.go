@@ -198,8 +198,11 @@ func (s *Scheduler) runExecution(ctx context.Context, dag *DAG, dispatcher NodeD
 		finishData["nodes_succeeded"] = result.NodesSucceeded
 		finishData["nodes_failed"] = result.NodesFailed
 		finishData["nodes_skipped"] = result.NodesSkipped
+		if result.Error != nil {
+			finishData["error"] = result.Error.Error()
+		}
 	}
-	if err != nil {
+	if err != nil && result == nil {
 		finishData["error"] = err.Error()
 	}
 	s.emitEvent(&Event{
@@ -235,13 +238,16 @@ func (s *Scheduler) emitExecutionFailure(dag *DAG, result *DAGResult, err error)
 	if err == nil {
 		return
 	}
-	if result == nil {
+	// Executor.Execute already emits the terminal DAG event whenever a result is
+	// available. Only synthesize a failure event when execution aborted before a
+	// terminal result could be produced.
+	if result != nil {
 		return
 	}
 	s.emitEvent(&Event{
 		Type:      EventDAGFailed,
 		DAGID:     dag.ID(),
-		Timestamp: result.EndTime,
+		Timestamp: time.Now(),
 		Data: map[string]any{
 			"error": err.Error(),
 		},

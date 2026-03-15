@@ -47,7 +47,6 @@ import (
 	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/core/knowledge/query"
 	"github.com/adalundhe/sylk/core/oauth"
-	"github.com/adalundhe/sylk/core/pipeline/tdd"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/search/git"
@@ -203,12 +202,11 @@ type bootstrapPhase2 struct {
 }
 
 type bootstrapPhase3 struct {
-	guide           *guide.Guide
-	orch            *orchestrator.Orchestrator
-	pipelineManager *tdd.PipelineManager
-	activationCtrl  *activation.ActivationController
-	activator       guide.PodActivator
-	scribeFactory   agentShared.ScribeFactory
+	guide          *guide.Guide
+	orch           *orchestrator.Orchestrator
+	activationCtrl *activation.ActivationController
+	activator      guide.PodActivator
+	scribeFactory  agentShared.ScribeFactory
 }
 
 type bootstrapPhase4 struct {
@@ -731,10 +729,9 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 	}
 
 	phase3 := bootstrapPhase3{
-		guide:           g,
-		orch:            orch,
-		pipelineManager: buildPipelineManager(phase1, g),
-		activationCtrl:  phase2.actResult.ctrl,
+		guide:          g,
+		orch:           orch,
+		activationCtrl: phase2.actResult.ctrl,
 	}
 	if phase3.activationCtrl != nil {
 		phase1.actCtrlRef.Store(phase3.activationCtrl)
@@ -793,7 +790,6 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 		AgentID:   orch.AgentID(),
 		SessionID: "default",
 	}))
-	orch.SetPipelineManager(phase3.pipelineManager)
 	if phase3.activator != nil {
 		orch.SetActivator(phase3.activator)
 	}
@@ -830,121 +826,6 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 
 	slog.Info("bootstrap phase 3 complete", "elapsed", time.Since(phase3Start))
 	return phase3, nil
-}
-
-func buildPipelineManager(phase1 *bootstrapPhase1, g *guide.Guide) *tdd.PipelineManager {
-	if phase1 == nil || g == nil {
-		return nil
-	}
-
-	inspectorCfg := inspectorShared.DefaultPipelineInspectorConfig()
-	inspectorCfg.Model = "claude-opus-4-6"
-
-	testerCfg := shared.DefaultPipelineTesterConfig()
-	testerCfg.Model = effectiveModelForCurrentAuth(phase1.authRegistry, testerCfg.Model)
-
-	engineerCfg := engineer.Config{ActivityPub: phase1.activityPub}
-	engineerCfg.EngineerConfig.Model = effectiveModelForCurrentAuth(phase1.authRegistry, engineer.DefaultModel)
-
-	designerCfg := designer.Config{ActivityPub: phase1.activityPub}
-	designerCfg.DesignerConfig.Model = string(providers.Gemini31Pro)
-
-	registerManagedPipelineAgent := func(router guide.AgentRouter, start func(guide.EventBus) error) error {
-		if router == nil || start == nil {
-			return fmt.Errorf("managed pipeline agent is not routable")
-		}
-		if err := start(phase1.guideBus); err != nil {
-			return err
-		}
-		seedRouterKnownAgents(g, router)
-		return registerRoutingInfoWithGuide(g, managedPipelineRoutingInfo(router.GetRoutingInfo()))
-	}
-
-	factory := tdd.NewAgentFactory(tdd.AgentFactoryConfig{
-		InspectorConfig: inspectorCfg,
-		TesterConfig:    testerCfg,
-		EngineerConfig:  engineerCfg,
-		DesignerConfig:  designerCfg,
-		InspectorFactory: func(ctx context.Context, cfg inspectorShared.PipelineInspectorConfig) (*inspectorPipeline.PipelineInspector, error) {
-			wrapped, err := createSwapProvider(ctx, cfg.Model, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway, gateway.PriorityValidation)
-			if err != nil {
-				return nil, fmt.Errorf("pipeline inspector provider: %w", err)
-			}
-			pi, err := inspectorPipeline.New(cfg, wrapped)
-			if err != nil {
-				return nil, err
-			}
-			pi.SetActivityPublisher(phase1.activityPub)
-			if err := registerManagedPipelineAgent(pi, pi.Start); err != nil {
-				_ = pi.Close()
-				return nil, err
-			}
-			return pi, nil
-		},
-		TesterFactory: func(ctx context.Context, cfg shared.PipelineTesterConfig) (*pipelinetester.PipelineTester, error) {
-			wrapped, err := createSwapProvider(ctx, cfg.Model, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway, gateway.PriorityValidation)
-			if err != nil {
-				return nil, fmt.Errorf("pipeline tester provider: %w", err)
-			}
-			pt, err := pipelinetester.New(cfg, wrapped)
-			if err != nil {
-				return nil, err
-			}
-			pt.SetActivityPublisher(phase1.activityPub)
-			if err := registerManagedPipelineAgent(pt, pt.Start); err != nil {
-				_ = pt.Close()
-				return nil, err
-			}
-			return pt, nil
-		},
-		EngineerFactory: func(ctx context.Context, cfg engineer.Config) (*engineer.Engineer, error) {
-			model := cfg.EngineerConfig.Model
-			if model == "" {
-				model = effectiveModelForCurrentAuth(phase1.authRegistry, engineer.DefaultModel)
-				cfg.EngineerConfig.Model = model
-			}
-			wrapped, err := createSwapProvider(ctx, model, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway, gateway.PriorityExecution)
-			if err != nil {
-				return nil, fmt.Errorf("pipeline engineer provider: %w", err)
-			}
-			eng, err := engineer.New(cfg, wrapped)
-			if err != nil {
-				return nil, err
-			}
-			if err := registerManagedPipelineAgent(eng, eng.Start); err != nil {
-				_ = eng.Close()
-				return nil, err
-			}
-			return eng, nil
-		},
-		DesignerFactory: func(ctx context.Context, cfg designer.Config) (*designer.Designer, error) {
-			model := cfg.DesignerConfig.Model
-			if model == "" {
-				model = string(providers.Gemini31Pro)
-				cfg.DesignerConfig.Model = model
-			}
-			wrapped, err := createSwapProvider(ctx, model, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway, gateway.PriorityExecution)
-			if err != nil {
-				return nil, fmt.Errorf("pipeline designer provider: %w", err)
-			}
-			des, err := designer.New(cfg, wrapped)
-			if err != nil {
-				return nil, err
-			}
-			if err := registerManagedPipelineAgent(des, des.Start); err != nil {
-				_ = des.Close()
-				return nil, err
-			}
-			return des, nil
-		},
-		Logger: slog.Default(),
-	})
-
-	return tdd.NewPipelineManager(tdd.PipelineManagerConfig{
-		ActivityPub:     phase1.activityPub,
-		UnregisterAgent: g.Unregister,
-		Logger:          slog.Default(),
-	}, factory, nil)
 }
 
 func schedulePhase4Task(
@@ -1289,9 +1170,6 @@ func buildBootstrapCleanup(
 				errs = append(errs, stopErr)
 			}
 		}
-		if phase3.pipelineManager != nil {
-			phase3.pipelineManager.CloseAll()
-		}
 		if phase3.activationCtrl != nil {
 			if err := phase3.activationCtrl.Shutdown(shutdownCtx); err != nil {
 				errs = append(errs, err)
@@ -1347,7 +1225,6 @@ func buildBootstrapDeps(
 		GitWatcher:         phase2.gitRes.watcher,
 		GitBus:             phase2.gitRes.bus,
 		SafetyGuard:        phase2.gitRes.guard,
-		PipelineManager:    phase3.pipelineManager,
 		SeedAgents:         phase4.seeds,
 		ModelSwap:          phase4.modelSwapper,
 		ModelSave: func(agentType, provider, modelID string) {
@@ -2426,36 +2303,6 @@ func registerRoutingInfoWithGuide(g *guide.Guide, info *guide.AgentRoutingInfo) 
 	// readyAgents keyed by info.ID, not by agentType.
 	g.MarkAgentReady(info.ID)
 	return nil
-}
-
-func managedPipelineRoutingInfo(info *guide.AgentRoutingInfo) *guide.AgentRoutingInfo {
-	if info == nil || !isManagedPipelineRoutingType(info.Type) {
-		return info
-	}
-	cloned := *info
-	cloned.Name = strings.TrimSpace(info.ID)
-	if cloned.Name == "" {
-		cloned.Name = strings.TrimSpace(info.Name)
-	}
-	cloned.Aliases = nil
-	cloned.ActionShortcuts = nil
-	cloned.Triggers = guide.AgentTriggers{}
-	if info.Registration != nil {
-		reg := *info.Registration
-		reg.Name = cloned.Name
-		reg.Aliases = nil
-		cloned.Registration = &reg
-	}
-	return &cloned
-}
-
-func isManagedPipelineRoutingType(agentType string) bool {
-	switch strings.TrimSpace(agentType) {
-	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
-		return true
-	default:
-		return false
-	}
 }
 
 type guideKnownAgentSeeder interface {

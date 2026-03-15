@@ -107,7 +107,7 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 				req.Messages = append(req.Messages, providers.Message{
 					Role: providers.RoleUser,
 					Content: err.Error() +
-						"\nUse the pipeline protocol now. If you are still evaluating a peer response, call process_validation first and then select the next handoff.",
+						"\nUse the pipeline protocol now. If you are still evaluating a peer response, call process_validation first and then use challenge_agent, handoff_next, finalize_pipeline, or handoff_to_ot.",
 				})
 				continue
 			}
@@ -152,10 +152,13 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 			return "", fmt.Errorf("pipeline inspector repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted := pi.applyToolCalls(ctx, req, resp, surface)
+		errCount, controlErr := pi.applyToolCalls(ctx, req, resp, surface)
 		pi.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
-		if rerouted {
-			return "", skills.ErrRerouteRequested
+		if controlErr != nil {
+			return "", controlErr
+		}
+		if agentShared.PipelineTurnTerminated(ctx) {
+			return "", nil
 		}
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= 2 {
@@ -181,16 +184,11 @@ func (pi *PipelineInspector) applyToolCalls(
 	req *providers.Request,
 	resp *providers.Response,
 	surface toolruntime.Surface,
-) (int, bool) {
-	req.Messages = append(req.Messages, providers.Message{
-		Role:      providers.RoleAssistant,
-		Content:   strings.TrimSpace(resp.Content),
-		ToolCalls: resp.ToolCalls,
-		Metadata:  resp.ProviderMetadata,
-	})
+) (int, error) {
+	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
-	rerouted := false
+	var controlErr error
 	for _, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
@@ -203,10 +201,11 @@ func (pi *PipelineInspector) applyToolCalls(
 		}
 		isError := false
 		if err != nil {
-			if errors.Is(err, skills.ErrRerouteRequested) {
-				rerouted = true
+			switch {
+			case errors.Is(err, skills.ErrRerouteRequested):
+				controlErr = skills.ErrRerouteRequested
 				result = `{"rerouted": true}`
-			} else {
+			default:
 				result = shared.ToolErrorPayload(err)
 				isError = true
 				errCount++
@@ -232,11 +231,11 @@ func (pi *PipelineInspector) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
-		if rerouted {
+		if controlErr != nil || agentShared.PipelineTurnTerminated(ctx) {
 			break
 		}
 	}
-	return errCount, rerouted
+	return errCount, controlErr
 }
 
 func (pi *PipelineInspector) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {

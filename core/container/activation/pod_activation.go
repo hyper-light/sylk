@@ -22,7 +22,7 @@ var PipelineAgentTypes = []string{"engineer", "designer", "inspector-pipeline", 
 //
 // Returns:
 //   - policies: for the ActivationController
-//   - podPolicies: for ManagedPod construction (richer metadata)
+//   - podPolicies: for AgentPod runtime construction (richer metadata)
 //   - agentToPod: mapping for ControllerPodActivator.RegisterMapping
 func PodActivationPolicies(descriptors []handoff.AgentDescriptor) (
 	policies []*ActivationPolicy,

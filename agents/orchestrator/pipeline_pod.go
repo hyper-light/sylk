@@ -2,36 +2,13 @@ package orchestrator
 
 import (
 	"context"
-	"log/slog"
 
-	"github.com/adalundhe/sylk/agents/guide"
-	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/container/pod"
 	"github.com/adalundhe/sylk/core/dag"
-	"github.com/adalundhe/sylk/core/events"
 )
 
 // PipelineRegistrar registers an activated agent with the Guide's routing
 // layer. It is called once per unique agent type per pipeline.
 type PipelineRegistrar func(ctx context.Context, podID, agentType string) error
-
-// PipelinePodConfig groups the dependencies for creating a pipeline pod.
-type PipelinePodConfig struct {
-	DAGID         string
-	PodID         string
-	SessionID     string
-	Activator     guide.PodActivator
-	Registrar     PipelineRegistrar
-	ActivityPub   events.ActivityPublisher
-	Logger        *slog.Logger
-	ScribeFactory shared.ScribeFactory
-	EventLogger   *agentlog.SessionEventLogger
-
-	// Managed is an optional ManagedPod for pod-level lifecycle.
-	// When set, guard operations delegate to ManagedPod.
-	Managed *pod.ManagedPod
-}
 
 // PipelineAgentTypes are the four agent types every pipeline requires.
 var PipelineAgentTypes = [4]string{
@@ -58,34 +35,6 @@ var PipelineAgentDisplayNames = map[string]string{
 	"designer":           "Designer",
 	"inspector-pipeline": "Inspector",
 	"tester-pipeline":    "Tester",
-}
-
-// NewPipelinePod creates an AgentPod configured for pipeline use.
-// This is a thin wrapper for backward compatibility.
-func NewPipelinePod(cfg PipelinePodConfig) *shared.AgentPod {
-	podID := cfg.PodID
-	if podID == "" {
-		podID = cfg.DAGID
-	}
-	return shared.NewAgentPod(shared.AgentPodConfig{
-		PodID:     podID,
-		SessionID: cfg.SessionID,
-		Activator: cfg.Activator,
-		Managed:   cfg.Managed,
-		Registrar: func(ctx context.Context, agentType string) error {
-			if cfg.Registrar == nil {
-				return nil
-			}
-			return cfg.Registrar(ctx, podID, agentType)
-		},
-		ActivityPub:            cfg.ActivityPub,
-		RegistrationVisibility: events.VisibilitySystem,
-		Logger:                 cfg.Logger,
-		MemberTypes:            PipelineAgentTypes[:],
-		DisplayNames:           PipelineAgentDisplayNames,
-		EventLogger:            cfg.EventLogger,
-		ScribeFactory:          cfg.ScribeFactory,
-	})
 }
 
 // NodeAgentTypes extracts the agent types needed by a DAG node.

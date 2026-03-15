@@ -8,12 +8,45 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
 )
 
 // --- test helpers ---
+
+type testPipelineAgentPodConfig struct {
+	DAGID         string
+	PodID         string
+	SessionID     string
+	Activator     guide.PodActivator
+	Registrar     PipelineRegistrar
+	ActivityPub   events.ActivityPublisher
+	ScribeFactory shared.ScribeFactory
+}
+
+func newTestPipelineAgentPod(cfg testPipelineAgentPodConfig) *shared.AgentPod {
+	podID := cfg.PodID
+	if podID == "" {
+		podID = cfg.DAGID
+	}
+	return shared.NewAgentPod(shared.AgentPodConfig{
+		PodID:     podID,
+		SessionID: cfg.SessionID,
+		Activator: cfg.Activator,
+		Registrar: func(ctx context.Context, agentType string) error {
+			if cfg.Registrar == nil {
+				return nil
+			}
+			return cfg.Registrar(ctx, podID, agentType)
+		},
+		ActivityPub:   cfg.ActivityPub,
+		MemberTypes:   PipelineAgentTypes[:],
+		DisplayNames:  PipelineAgentDisplayNames,
+		ScribeFactory: cfg.ScribeFactory,
+	})
+}
 
 // trackingActivator records HoldPodActive calls and returns configurable
 // release functions and errors.
@@ -121,7 +154,7 @@ func TestPipelinePod_HoldForNode_SingleAgent(t *testing.T) {
 	act := &trackingActivator{}
 	reg := &trackingRegistrar{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 		Registrar: reg.register,
@@ -140,8 +173,8 @@ func TestPipelinePod_HoldForNode_SingleAgent(t *testing.T) {
 	if got := act.holdCount(); got != 1 {
 		t.Errorf("expected 1 HoldPodActive call, got %d", got)
 	}
-	if got := reg.callCount(); got != 1 {
-		t.Errorf("expected 1 registrar call, got %d", got)
+	if got := reg.callCount(); got != len(PipelineAgentTypes) {
+		t.Errorf("expected %d registrar calls, got %d", len(PipelineAgentTypes), got)
 	}
 	if got := pod.ActiveGuardCount(); got != 1 {
 		t.Errorf("expected 1 active guard, got %d", got)
@@ -152,7 +185,7 @@ func TestPipelinePod_HoldForNode_WithCoAgents(t *testing.T) {
 	act := &trackingActivator{}
 	reg := &trackingRegistrar{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 		Registrar: reg.register,
@@ -173,8 +206,8 @@ func TestPipelinePod_HoldForNode_WithCoAgents(t *testing.T) {
 	if got := act.holdCount(); got != 3 {
 		t.Errorf("expected 3 HoldPodActive calls, got %d: %v", got, act.calledTypes())
 	}
-	if got := reg.callCount(); got != 3 {
-		t.Errorf("expected 3 registrar calls, got %d", got)
+	if got := reg.callCount(); got != len(PipelineAgentTypes) {
+		t.Errorf("expected %d registrar calls, got %d", len(PipelineAgentTypes), got)
 	}
 }
 
@@ -182,7 +215,7 @@ func TestPipelinePod_HoldForNode_RegistrarDedup(t *testing.T) {
 	act := &trackingActivator{}
 	reg := &trackingRegistrar{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 		Registrar: reg.register,
@@ -204,9 +237,9 @@ func TestPipelinePod_HoldForNode_RegistrarDedup(t *testing.T) {
 	if got := act.holdCount(); got != 2 {
 		t.Errorf("expected 2 HoldPodActive calls, got %d", got)
 	}
-	// Registrar is deduped — only called once for "engineer".
-	if got := reg.callCount(); got != 1 {
-		t.Errorf("expected 1 registrar call (deduped), got %d: %v", got, reg.calledTypes())
+	// Registrar is deduped for the full pipeline roster across nodes.
+	if got := reg.callCount(); got != len(PipelineAgentTypes) {
+		t.Errorf("expected %d registrar calls (deduped roster), got %d: %v", len(PipelineAgentTypes), got, reg.calledTypes())
 	}
 	if got := pod.ActiveGuardCount(); got != 2 {
 		t.Errorf("expected 2 active guards, got %d", got)
@@ -216,7 +249,7 @@ func TestPipelinePod_HoldForNode_RegistrarDedup(t *testing.T) {
 func TestPipelinePod_ReleaseForNode(t *testing.T) {
 	act := &trackingActivator{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 	})
@@ -251,7 +284,7 @@ func TestPipelinePod_HoldForNode_ActivationFailureRollback(t *testing.T) {
 	act := &trackingActivator{failOn: "designer"}
 	reg := &trackingRegistrar{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 		Registrar: reg.register,
@@ -282,7 +315,7 @@ func TestPipelinePod_HoldForNode_RegistrarFailureRollback(t *testing.T) {
 	act := &trackingActivator{}
 	reg := &trackingRegistrar{failOn: "designer"}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 		Registrar: reg.register,
@@ -309,7 +342,7 @@ func TestPipelinePod_HoldForNode_RegistrarFailureRollback(t *testing.T) {
 func TestPipelinePod_Release_AllRemainingGuards(t *testing.T) {
 	act := &trackingActivator{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 	})
@@ -338,7 +371,7 @@ func TestPipelinePod_Release_AllRemainingGuards(t *testing.T) {
 func TestPipelinePod_Release_Idempotent(t *testing.T) {
 	act := &trackingActivator{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 	})
@@ -364,7 +397,7 @@ func TestPipelinePod_Release_Idempotent(t *testing.T) {
 func TestPipelinePod_Release_ConcurrentSafe(t *testing.T) {
 	act := &trackingActivator{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 	})
@@ -398,7 +431,7 @@ func TestPipelinePod_Release_ConcurrentSafe(t *testing.T) {
 func TestPipelinePod_HoldAfterRelease_Rejected(t *testing.T) {
 	act := &trackingActivator{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 	})
@@ -418,7 +451,7 @@ func TestPipelinePod_HoldAfterRelease_Rejected(t *testing.T) {
 }
 
 func TestPipelinePod_NilActivator(t *testing.T) {
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID: "dag-1",
 		// Activator is nil — should be a no-op
 	})
@@ -437,7 +470,7 @@ func TestPipelinePod_NilActivator(t *testing.T) {
 func TestPipelinePod_NilRegistrar(t *testing.T) {
 	act := &trackingActivator{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 		// Registrar is nil — should not panic
@@ -464,7 +497,7 @@ func TestPipelinePod_RegisteredAgentTypes(t *testing.T) {
 	act := &trackingActivator{}
 	reg := &trackingRegistrar{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 		Registrar: reg.register,
@@ -487,13 +520,13 @@ func TestPipelinePod_RegisteredAgentTypes(t *testing.T) {
 		seen[typ] = struct{}{}
 	}
 
-	for _, expected := range []string{"engineer", "designer"} {
+	for _, expected := range PipelineAgentTypes {
 		if _, ok := seen[expected]; !ok {
 			t.Errorf("missing registered type %q in %v", expected, registered)
 		}
 	}
-	if len(registered) != 2 {
-		t.Errorf("expected 2 registered types, got %d: %v", len(registered), registered)
+	if len(registered) != len(PipelineAgentTypes) {
+		t.Errorf("expected %d registered types, got %d: %v", len(PipelineAgentTypes), len(registered), registered)
 	}
 
 	pod.Release()
@@ -502,7 +535,7 @@ func TestPipelinePod_RegisteredAgentTypes(t *testing.T) {
 func TestPipelinePod_ActiveNodeIDs(t *testing.T) {
 	act := &trackingActivator{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 	})
@@ -581,7 +614,7 @@ func TestCollectAgentTypes_EmptyDAG(t *testing.T) {
 // --- PipelinePod sub-node tracking tests ---
 
 func TestPipelinePod_RegisterSubNode(t *testing.T) {
-	pod := NewPipelinePod(PipelinePodConfig{DAGID: "dag-1"})
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{DAGID: "dag-1"})
 
 	pod.RegisterSubNode("n1:inspect", "n1", "inspect", "inspector-pipeline")
 	pod.RegisterSubNode("n1:execute", "n1", "execute", "engineer")
@@ -606,7 +639,7 @@ func TestPipelinePod_RegisterSubNode(t *testing.T) {
 }
 
 func TestPipelinePod_RecordSubNodeACK(t *testing.T) {
-	pod := NewPipelinePod(PipelinePodConfig{DAGID: "dag-1"})
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{DAGID: "dag-1"})
 	pod.RegisterSubNode("n1:execute", "n1", "execute", "engineer")
 
 	ackedAt := time.Now()
@@ -625,14 +658,14 @@ func TestPipelinePod_RecordSubNodeACK(t *testing.T) {
 }
 
 func TestPipelinePod_GetSubNode_Unknown(t *testing.T) {
-	pod := NewPipelinePod(PipelinePodConfig{DAGID: "dag-1"})
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{DAGID: "dag-1"})
 	if meta := pod.GetSubNode("nonexistent"); meta != nil {
 		t.Errorf("expected nil for unknown sub-node, got %+v", meta)
 	}
 }
 
 func TestPipelinePod_RecordSubNodeACK_Unknown(t *testing.T) {
-	pod := NewPipelinePod(PipelinePodConfig{DAGID: "dag-1"})
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{DAGID: "dag-1"})
 	// Should not panic for unknown sub-node.
 	pod.RecordSubNodeACK("nonexistent", "agent-1", time.Now())
 }
@@ -664,7 +697,7 @@ func TestPipelinePod_PreActivate_PublishesRegisteredEvents(t *testing.T) {
 	reg := &trackingRegistrar{}
 	pub := &trackingActivityPub{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:       "dag-1",
 		SessionID:   "sess-1",
 		Activator:   act,

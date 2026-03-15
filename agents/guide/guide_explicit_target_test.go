@@ -94,6 +94,43 @@ func TestGuideRoute_ExplicitTargetAndFollowupContinuity(t *testing.T) {
 	}
 }
 
+func TestGuideResolveReadyAgentID_TaskScopedPipelineNameUsesRegisteredWorker(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	defer func() { _ = bus.Close() }()
+
+	g, err := NewWithClassifier(NewRuleClassifierClient(), Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "session-task-scoped-pipeline",
+	})
+	if err != nil {
+		t.Fatalf("new guide: %v", err)
+	}
+
+	err = g.Register(&AgentRoutingInfo{
+		ID:    "tester-worker-1",
+		Type:  "tester-pipeline",
+		Name:  "task_1-tester-pipeline",
+		PodID: "task_1",
+		Registration: &AgentRegistration{
+			ID:   "tester-worker-1",
+			Name: "task_1-tester-pipeline",
+			Capabilities: AgentCapabilities{
+				Intents: []Intent{IntentCheck, IntentHelp},
+				Domains: []Domain{DomainCode, DomainTasks},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("register tester pipeline worker: %v", err)
+	}
+	g.MarkAgentReady("tester-worker-1")
+
+	if got := g.resolveReadyAgentID("task_1-tester-pipeline"); got != "tester-worker-1" {
+		t.Fatalf("resolveReadyAgentID(task-scoped name) = %q, want tester-worker-1", got)
+	}
+}
+
 func TestGuideRoute_ExplicitGuideTargetRetainsConversationContinuity(t *testing.T) {
 	bus := NewChannelBus(DefaultChannelBusConfig())
 	defer func() { _ = bus.Close() }()

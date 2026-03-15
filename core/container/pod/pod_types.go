@@ -1,5 +1,13 @@
 package pod
 
+import "errors"
+
+var (
+	ErrPodReleased  = errors.New("pod has been released")
+	ErrPodNotHot    = errors.New("pod is not at TierHot")
+	ErrUnknownAgent = errors.New("unknown agent type in pod")
+)
+
 // PodID uniquely identifies a managed pod.
 type PodID = string
 

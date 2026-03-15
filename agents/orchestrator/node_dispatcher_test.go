@@ -14,7 +14,7 @@ func TestActivateAgents_WithPod(t *testing.T) {
 	act := &trackingActivator{}
 	reg := &trackingRegistrar{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 		Registrar: reg.register,
@@ -35,8 +35,8 @@ func TestActivateAgents_WithPod(t *testing.T) {
 	if got := act.holdCount(); got != 1 {
 		t.Errorf("expected 1 HoldPodActive call, got %d", got)
 	}
-	if got := reg.callCount(); got != 1 {
-		t.Errorf("expected 1 registrar call, got %d", got)
+	if got := reg.callCount(); got != len(PipelineAgentTypes) {
+		t.Errorf("expected %d registrar calls, got %d", len(PipelineAgentTypes), got)
 	}
 	if got := pod.ActiveGuardCount(); got != 1 {
 		t.Errorf("expected 1 active guard in pod, got %d", got)
@@ -47,7 +47,7 @@ func TestActivateAgents_WithPod_CoAgents(t *testing.T) {
 	act := &trackingActivator{}
 	reg := &trackingRegistrar{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 		Registrar: reg.register,
@@ -70,15 +70,15 @@ func TestActivateAgents_WithPod_CoAgents(t *testing.T) {
 	if got := act.holdCount(); got != 3 {
 		t.Errorf("expected 3 HoldPodActive calls, got %d: %v", got, act.calledTypes())
 	}
-	if got := reg.callCount(); got != 3 {
-		t.Errorf("expected 3 registrar calls, got %d", got)
+	if got := reg.callCount(); got != len(PipelineAgentTypes) {
+		t.Errorf("expected %d registrar calls, got %d", len(PipelineAgentTypes), got)
 	}
 }
 
 func TestActivateAgents_WithPod_GuardReleasedOnNodeComplete(t *testing.T) {
 	act := &trackingActivator{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 	})
@@ -115,7 +115,7 @@ func TestActivateAgents_WithPod_FailureIsolation(t *testing.T) {
 	act := &trackingActivator{failOn: "designer"}
 	reg := &trackingRegistrar{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 		Registrar: reg.register,
@@ -147,7 +147,7 @@ func TestActivateAgents_WithPod_FailureIsolation(t *testing.T) {
 func TestReleaseAllGuards_DelegatesToPod(t *testing.T) {
 	act := &trackingActivator{}
 
-	pod := NewPipelinePod(PipelinePodConfig{
+	pod := newTestPipelineAgentPod(testPipelineAgentPodConfig{
 		DAGID:     "dag-1",
 		Activator: act,
 	})

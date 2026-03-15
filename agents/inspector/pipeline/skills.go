@@ -82,6 +82,13 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	for _, skill := range agentShared.PipelineProtocolSkills(agentShared.PipelineProtocolSkillConfig{
 		AgentType:   func() string { return "inspector-pipeline" },
 		InspectorOT: true,
+		Route: agentShared.PipelineProtocolRouteConfig{
+			BusProvider: func() guide.EventBus { return pi.bus },
+			SessionID:   func() string { return pi.config.SessionID },
+			PublishReroute: func(ctx context.Context, toAgentID, reason, newCorrelationID string) {
+				agentShared.PublishPipelineHandoffReroute(pi.bus, pi.channels, ctx, "inspector-pipeline", toAgentID, reason, newCorrelationID)
+			},
+		},
 	}) {
 		pi.skills.Register(skill)
 	}

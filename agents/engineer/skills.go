@@ -76,6 +76,13 @@ func (e *Engineer) registerCoreSkills() {
 	}
 	for _, skill := range shared.PipelineProtocolSkills(shared.PipelineProtocolSkillConfig{
 		AgentType: func() string { return "engineer" },
+		Route: shared.PipelineProtocolRouteConfig{
+			BusProvider: func() guide.EventBus { return e.bus },
+			SessionID:   func() string { return e.config.SessionID },
+			PublishReroute: func(ctx context.Context, toAgentID, reason, newCorrelationID string) {
+				shared.PublishPipelineHandoffReroute(e.bus, e.channels, ctx, "engineer", toAgentID, reason, newCorrelationID)
+			},
+		},
 	}) {
 		e.skills.Register(skill)
 	}

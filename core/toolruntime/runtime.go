@@ -467,17 +467,27 @@ func (r *Runtime) executePolicy(ctx context.Context, name string, input map[stri
 		if err != nil {
 			return nil, err
 		}
-		return value.(*skills.Result), nil
+		return coerceSkillsResult(name, policy.Execution, value)
 	case ExecutionModeLocalWorker, ExecutionModeGuardian:
 		value, err := r.worker.Do(ctx, name, run)
 		if err != nil {
 			return nil, err
 		}
-		result, _ := value.(*skills.Result)
-		return result, nil
+		return coerceSkillsResult(name, policy.Execution, value)
 	default:
 		return nil, fmt.Errorf("unsupported execution mode %q for tool %q", policy.Execution, name)
 	}
+}
+
+func coerceSkillsResult(toolName string, mode ExecutionMode, value any) (*skills.Result, error) {
+	result, ok := value.(*skills.Result)
+	if !ok {
+		return nil, fmt.Errorf("tool %q returned invalid runtime result type %T in %q mode", toolName, value, mode)
+	}
+	if result == nil {
+		return nil, fmt.Errorf("tool %q returned nil runtime result in %q mode", toolName, mode)
+	}
+	return result, nil
 }
 
 func (r *Runtime) invokeLocal(ctx context.Context, name string, input map[string]any) (*skills.Result, error) {

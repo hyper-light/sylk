@@ -3,22 +3,14 @@ package orchestrator
 import (
 	"strings"
 
-	"github.com/google/uuid"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 )
-
-var pipelineWorkerIdentityNamespace = uuid.MustParse("7f5e9e9d-2b65-4ce3-9c8d-1d43d6d9b7a2")
 
 // PipelineWorkerAgentID returns the stable short worker ID used for a
 // task-scoped pipeline worker. The task identity and worker role remain
 // separate from the worker's actual agent ID.
 func PipelineWorkerAgentID(taskID, agentType string) string {
-	taskID = sanitizePipelineIdentityPart(taskID)
-	agentType = sanitizePipelineIdentityPart(agentType)
-	if taskID == "" || agentType == "" {
-		return ""
-	}
-	sum := uuid.NewSHA1(pipelineWorkerIdentityNamespace, []byte(taskID+":"+agentType))
-	return sum.String()[:8]
+	return agentshared.PipelineWorkerAgentID(taskID, agentType)
 }
 
 // TaskScopedAgentID is the deprecated compatibility alias for the real
@@ -28,8 +20,8 @@ func TaskScopedAgentID(taskID, agentType string) string {
 }
 
 // TaskScopedRoutingName returns a human-readable but unique routing name for a
-// task-scoped worker. It intentionally avoids the bare agent type so task
-// workers do not collide with the canonical conversational singleton.
+// task-scoped worker. The task identity is kept first so explicit pipeline
+// handoffs can address the already-registered pod member directly.
 func TaskScopedRoutingName(taskSlug, taskID, agentType string) string {
 	base := sanitizePipelineIdentityPart(taskSlug)
 	if base == "" {
@@ -42,7 +34,7 @@ func TaskScopedRoutingName(taskSlug, taskID, agentType string) string {
 	if agentType == "" {
 		return base
 	}
-	return agentType + "-" + base
+	return base + "-" + agentType
 }
 
 func sanitizePipelineIdentityPart(value string) string {

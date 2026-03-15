@@ -467,6 +467,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		"active_streams", len(m.streams),
 		"thinking_idx", m.thinkingIdx)
 	now := time.Now()
+	streamAgentType := streamEntryAgentType(start)
 
 	if slot, ok := m.streams[cid]; ok && slot.accumulator != nil {
 		m.refreshExistingStreamSlot(slot, start)
@@ -478,7 +479,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		idx := m.thinkingIdx
 		slot := &streamSlot{
 			accumulator: NewStreamAccumulator(idx),
-			agentID:     start.AgentID,
+			agentID:     streamAgentType,
 			thinkingIdx: idx,
 			renderState: &streamRenderState{},
 		}
@@ -496,7 +497,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		Timestamp:      now,
 		CorrelationID:  cid,
 		Source:         SourceAgent,
-		AgentType:      start.AgentID,
+		AgentType:      streamAgentType,
 		AgentID:        start.AgentID,
 		TaskID:         strings.TrimSpace(start.TaskID),
 		TaskName:       strings.TrimSpace(start.TaskName),
@@ -506,7 +507,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		Height:         -1,
 		Streaming:      true,
 		ThinkingText:   spinnerFrames[0] + "  0.0s",
-		ThinkingStatus: thinkingMessagesForAgent(start.AgentID)[0],
+		ThinkingStatus: thinkingMessagesForAgent(streamAgentType)[0],
 	}
 	willEvict := m.history.Full()
 	m.history.Push(entry)
@@ -519,7 +520,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 	idx := m.history.Len() - 1
 	slot := &streamSlot{
 		accumulator: NewStreamAccumulator(idx),
-		agentID:     start.AgentID,
+		agentID:     streamAgentType,
 		thinkingIdx: idx,
 		renderState: &streamRenderState{},
 	}
@@ -1523,7 +1524,7 @@ func (m *Model) refreshExistingStreamSlot(slot *streamSlot, start msg.StreamStar
 	if slot == nil || slot.accumulator == nil {
 		return
 	}
-	slot.agentID = start.AgentID
+	slot.agentID = streamEntryAgentType(start)
 	m.updateStreamEntryMetadata(slot.accumulator.EntryIndex(), start)
 	if !shouldResetStreamSlot(slot) {
 		m.viewDirty = true
@@ -1729,8 +1730,10 @@ func (m *Model) updateStreamEntryMetadata(idx int, start msg.StreamStartMsg) {
 		physical := m.history.logicalToPhysical(idx)
 		entry := &m.history.entries[physical]
 		if start.AgentID != "" {
-			entry.AgentType = start.AgentID
 			entry.AgentID = start.AgentID
+		}
+		if agentType := streamEntryAgentType(start); agentType != "" {
+			entry.AgentType = agentType
 		}
 		entry.CorrelationID = start.CorrelationID
 		entry.SessionID = start.SessionID
@@ -1742,6 +1745,13 @@ func (m *Model) updateStreamEntryMetadata(idx int, start msg.StreamStartMsg) {
 		entry.Height = -1
 	}
 	m.history.mu.Unlock()
+}
+
+func streamEntryAgentType(start msg.StreamStartMsg) string {
+	if agentType := strings.TrimSpace(start.AgentType); agentType != "" {
+		return agentType
+	}
+	return strings.TrimSpace(start.AgentID)
 }
 
 // composeSlotContent returns the full entry content for a stream slot by

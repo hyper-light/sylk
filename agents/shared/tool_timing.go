@@ -3,11 +3,13 @@ package shared
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/skills"
 )
 
 // ToolCallPhase distinguishes start from completion events.
@@ -88,24 +90,50 @@ func TimedToolCall(
 	})
 
 	result, err := execute()
+	output, success, errorMsg := toolCallCompletionOutcome(result, err)
 
 	event := ToolCallEvent{
 		Phase:       ToolCallComplete,
 		ToolName:    call.Name,
 		ArgsSummary: summary,
 		FullArgs:    fullArgs,
-		Output:      TruncateOutput(result, maxOutputBytes),
+		Output:      TruncateOutput(output, maxOutputBytes),
 		AgentID:     agentID,
 		StartedAt:   start,
 		Duration:    time.Since(start),
-		Success:     err == nil,
-	}
-	if err != nil {
-		event.ErrorMsg = err.Error()
+		Success:     success,
+		ErrorMsg:    errorMsg,
 	}
 	EmitToolCall(ctx, event)
 
 	return result, err
+}
+
+func toolCallCompletionOutcome(result string, err error) (string, bool, string) {
+	if err == nil {
+		return result, true, ""
+	}
+	if payload, ok := toolCallControlPayload(err); ok {
+		if strings.TrimSpace(result) == "" {
+			result = payload
+		}
+		return result, true, ""
+	}
+	return result, false, err.Error()
+}
+
+func toolCallControlPayload(err error) (string, bool) {
+	switch {
+	case errors.Is(err, skills.ErrRerouteRequested):
+		return `{"rerouted":true}`, true
+	case errors.Is(err, skills.ErrDelegatedRequested):
+		if payload, marshalErr := skills.MarshalDelegatedPayload(err); marshalErr == nil && strings.TrimSpace(payload) != "" {
+			return payload, true
+		}
+		return `{"delegated":true}`, true
+	default:
+		return "", false
+	}
 }
 
 // PrettyPrintArgs formats JSON args with indentation for the expanded view.

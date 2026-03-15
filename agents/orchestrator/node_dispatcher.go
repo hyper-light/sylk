@@ -29,9 +29,9 @@ type ACKResult struct {
 // BusNodeDispatcher implements dag.NodeDispatcher by routing node execution
 // to pipeline agents via the EventBus with a two-phase ACK protocol.
 //
-// Per-node activation: each dispatched node atomically activates its agent
-// (HoldPodActive), registers it with the Guide, and acquires a demotion guard
-// via the PipelinePod. Guards are released on node completion or DAG cleanup.
+// Per-node activation: each dispatched node atomically activates its agent,
+// registers it with the Guide, and acquires a demotion guard via the AgentPod.
+// Guards are released on node completion or DAG cleanup.
 //
 // When the pod is nil, the dispatcher falls back to EnsurePodActive on the
 // activator (best-effort activation without demotion guards).
@@ -395,7 +395,7 @@ func (d *BusNodeDispatcher) extractACKResult(msg *guide.Message) *ACKResult {
 }
 
 // activateAgents ensures the target agent and co-agents are active before
-// dispatch. Uses the PipelinePod (preferred) for per-node demotion guards
+// dispatch. Uses the AgentPod (preferred) for per-node demotion guards
 // with full observability, falling back to EnsurePodActive when no pod is
 // available.
 func (d *BusNodeDispatcher) activateAgents(ctx context.Context, node *dag.Node) error {

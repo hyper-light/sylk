@@ -1,14 +1,10 @@
 package pipeline
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
-	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
-	agentShared "github.com/adalundhe/sylk/agents/shared"
 )
 
 type InspectionStageResult struct {
@@ -16,86 +12,37 @@ type InspectionStageResult struct {
 	Result   *shared.InspectorResult
 }
 
-// InspectTask runs the inspector directly against a pipeline task and returns
-// the current criteria snapshot for that task.
-func (pi *PipelineInspector) InspectTask(ctx context.Context, task *agentShared.PipelineTaskInput) (*shared.InspectorCriteria, error) {
-	stage, err := pi.RunTask(ctx, task)
-	if err != nil {
-		return nil, err
-	}
-	return stage.Criteria, nil
-}
-
-// RunTask drives the inspector through its normal task handler and returns the
-// resulting criteria and validation snapshot for the task.
-func (pi *PipelineInspector) RunTask(ctx context.Context, task *agentShared.PipelineTaskInput) (*InspectionStageResult, error) {
-	if task == nil {
-		return nil, fmt.Errorf("task is required")
-	}
-	if pi.getProvider() == nil {
-		pi.seedCriteriaFromTask(task)
-		contract := agentShared.BuildTaskExecutionContract(task)
-		if contract != nil && contract.HasImplementationEvidence {
-			if _, err := pi.ValidateAgainstCriteria(
-				ctx,
-				strings.TrimSpace(task.TaskID),
-				affectedPathsFromTask(task),
-				agentShared.PipelineWorkerType(task),
-			); err != nil {
-				return nil, err
-			}
-		}
-		return pi.stageSnapshot(task.TaskID)
+// ResponseText implements the Guide response text contract so inspector stage
+// snapshots render as short summaries instead of raw JSON.
+func (r *InspectionStageResult) ResponseText() string {
+	if r == nil {
+		return ""
 	}
 
-	payload, err := json.Marshal(task)
-	if err != nil {
-		return nil, fmt.Errorf("encode pipeline task: %w", err)
+	lines := make([]string, 0, 2)
+	if r.Criteria != nil {
+		lines = append(lines, fmt.Sprintf(
+			"Defined criteria contract: %d success criteria, %d quality gates, %d constraints.",
+			len(r.Criteria.SuccessCriteria),
+			len(r.Criteria.QualityGates),
+			len(r.Criteria.Constraints),
+		))
 	}
-
-	sessionID := strings.TrimSpace(task.SessionID)
-	if pi.bus != nil && pi.running {
-		msg, err := agentShared.RequestGuideRouteSync(ctx, agentShared.GuideRouteSyncRequest{
-			Bus:           pi.bus,
-			ResponseTopic: guide.TopicResponses("tui", "tui"),
-			Request: &guide.RouteRequest{
-				Input:           string(payload),
-				TargetAgentID:   pi.id,
-				ExplicitTarget:  true,
-				SourceAgentID:   "tui",
-				SourceAgentName: "pipeline",
-				SessionID:       sessionID,
-				Metadata: map[string]any{
-					"task_id":   strings.TrimSpace(task.TaskID),
-					"task_slug": stringValue(task.Context, "task_slug"),
-					"task_name": stringValue(task.Context, "task_name"),
-				},
-			},
-		})
-		if err != nil {
-			return nil, err
+	if r.Result != nil {
+		status := "failed"
+		if r.Result.Passed {
+			status = "passed"
 		}
-		if errText, ok := msg.GetError(); ok && strings.TrimSpace(errText) != "" {
-			return nil, fmt.Errorf("%s", errText)
-		}
-		if resp, ok := msg.GetRouteResponse(); ok && resp != nil && !resp.Success {
-			return nil, fmt.Errorf("%s", resp.Error)
-		}
-	} else {
-		_, err = pi.Handle(ctx, &guide.ForwardedRequest{
-			Input:     string(payload),
-			SessionID: sessionID,
-			Metadata: map[string]any{
-				"task_id":   strings.TrimSpace(task.TaskID),
-				"task_slug": stringValue(task.Context, "task_slug"),
-			},
-		})
-		if err != nil {
-			return nil, err
-		}
+		lines = append(lines, fmt.Sprintf(
+			"Latest validation %s: %d criteria met, %d failed, %d issues, %d feedback loops.",
+			status,
+			len(r.Result.CriteriaMet),
+			len(r.Result.CriteriaFailed),
+			len(r.Result.Issues),
+			r.Result.LoopCount,
+		))
 	}
-
-	return pi.stageSnapshot(task.TaskID)
+	return strings.Join(lines, "\n")
 }
 
 func (pi *PipelineInspector) stageSnapshot(taskID string) (*InspectionStageResult, error) {

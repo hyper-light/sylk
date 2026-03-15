@@ -352,6 +352,19 @@ func TestExecute_PanickingWorkerToolReturnsError(t *testing.T) {
 	}
 }
 
+func TestCoerceSkillsResult_ReturnsErrorForUnexpectedType(t *testing.T) {
+	result, err := coerceSkillsResult("route_plan_acceptance", ExecutionModeLocal, map[string]any{"status": "pending"})
+	if err == nil {
+		t.Fatal("expected invalid runtime result type error")
+	}
+	if result != nil {
+		t.Fatalf("result = %#v, want nil", result)
+	}
+	if !strings.Contains(err.Error(), `tool "route_plan_acceptance" returned invalid runtime result type`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestExecute_DisallowsInactiveToolEvenIfManifestAllowsIt(t *testing.T) {
 	registry := skills.NewRegistry()
 	mustRegisterSkill(t, registry, newRuntimeTestSkill("hidden_tool", "Hidden tool"))

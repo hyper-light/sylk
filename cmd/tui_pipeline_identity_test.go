@@ -67,8 +67,8 @@ func TestApplyHandoffCreationContext_MapsFactoryMetadataToContainerContext(t *te
 	}
 }
 
-func TestManagedPipelineRoutingInfo_StripsAmbiguousGlobalAliases(t *testing.T) {
-	info := managedPipelineRoutingInfo(&guide.AgentRoutingInfo{
+func TestTaskScopedWorkerRoutingInfo_StripsAmbiguousGlobalAliases(t *testing.T) {
+	info := taskScopedWorkerRoutingInfo(&guide.AgentRoutingInfo{
 		ID:      "worker-1234",
 		Type:    "inspector-pipeline",
 		Name:    "inspector-pipeline",
@@ -84,12 +84,15 @@ func TestManagedPipelineRoutingInfo_StripsAmbiguousGlobalAliases(t *testing.T) {
 			Name:    "inspector-pipeline",
 			Aliases: []string{"pipeline-inspector", "task-validator"},
 		},
-	})
+	}, "task-7", "inspector-pipeline")
 	if info == nil {
-		t.Fatal("managedPipelineRoutingInfo() returned nil")
+		t.Fatal("taskScopedWorkerRoutingInfo() returned nil")
 	}
-	if info.Name != "worker-1234" {
-		t.Fatalf("Name = %q, want worker-1234", info.Name)
+	if info.Name != "task-7-inspector-pipeline" {
+		t.Fatalf("Name = %q, want %q", info.Name, "task-7-inspector-pipeline")
+	}
+	if info.PodID != "task-7" {
+		t.Fatalf("PodID = %q, want task-7", info.PodID)
 	}
 	if len(info.Aliases) != 0 {
 		t.Fatalf("Aliases = %v, want empty", info.Aliases)
@@ -103,8 +106,8 @@ func TestManagedPipelineRoutingInfo_StripsAmbiguousGlobalAliases(t *testing.T) {
 	if info.Registration == nil {
 		t.Fatal("Registration = nil")
 	}
-	if info.Registration.Name != "worker-1234" {
-		t.Fatalf("Registration.Name = %q, want worker-1234", info.Registration.Name)
+	if info.Registration.Name != "task-7-inspector-pipeline" {
+		t.Fatalf("Registration.Name = %q, want %q", info.Registration.Name, "task-7-inspector-pipeline")
 	}
 	if len(info.Registration.Aliases) != 0 {
 		t.Fatalf("Registration.Aliases = %v, want empty", info.Registration.Aliases)

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	coordination "github.com/adalundhe/sylk/core/pipeline/coordination"
 )
@@ -142,6 +143,13 @@ func (d *taskDispatchContext) event() *busEvent {
 }
 
 func (d *taskDispatchContext) pipelineTask(sessionID string) *PipelineTask {
+	contextData := d.nodeCtx
+	if len(d.coAgents) > 0 {
+		if contextData == nil {
+			contextData = make(map[string]any)
+		}
+		contextData["co_agents"] = append([]string(nil), d.coAgents...)
+	}
 	return &PipelineTask{
 		NodeID:        d.nodeID,
 		DAGID:         d.dagID,
@@ -149,7 +157,7 @@ func (d *taskDispatchContext) pipelineTask(sessionID string) *PipelineTask {
 		AgentType:     d.agentType,
 		TargetAgentID: firstNonEmpty(d.targetID, pipelineWorkerTargetAgentID(d.pipelineTaskID, d.agentType)),
 		Prompt:        d.prompt,
-		Context:       d.nodeCtx,
+		Context:       contextData,
 		ParentResults: d.parentResults,
 		SessionID:     sessionID,
 	}
@@ -182,9 +190,17 @@ func (o *Orchestrator) registerTaskDispatch(dispatch *taskDispatchContext) *Task
 }
 
 func (o *Orchestrator) publishTaskDispatchPipelineState(dispatch *taskDispatchContext) string {
-	pipelineStatus := pipelinePhaseStatus(dispatch.pipelineStage)
+	stage := strings.TrimSpace(dispatch.pipelineStage)
+	if pipelineProtocolEligible(dispatch) {
+		stage = string(StageInspect)
+	}
+	pipelineStatus := pipelinePhaseStatus(stage)
 	if dispatch.pipelineTaskID != "" && pipelineStatus != "" {
-		publishTaskPipelineState(o.bus, o.config.AgentID, dispatch.pipelineTaskID, dispatch.pipelineTaskSlug, pipelineStatus, dispatch.agentType)
+		workerType := dispatch.agentType
+		if pipelineProtocolEligible(dispatch) {
+			workerType = agentshared.PipelineAgentInspector
+		}
+		publishTaskPipelineState(o.bus, o.config.AgentID, dispatch.pipelineTaskID, dispatch.pipelineTaskSlug, pipelineStatus, workerType)
 	}
 	return string(pipelineStatus)
 }
@@ -244,7 +260,14 @@ func (o *Orchestrator) publishTaskDispatchAgents(dispatch *taskDispatchContext, 
 	if dispatch.nodeID == "" || dispatch.agentType == "" {
 		return
 	}
-	if o.pipelineMgr != nil && managedPipelineEligible(dispatch) {
+	if pipelineProtocolEligible(dispatch) {
+		o.publishPipelineAgentActivity(agentshared.PipelineAgentInspector, dispatch.pipelineTaskID, dispatch.nodeID, dispatch.pipelineTaskSlug, pipelineStatus)
+		for _, pipelineType := range PipelinePanelAgentTypes {
+			if pipelineType == agentshared.PipelineAgentInspector {
+				continue
+			}
+			o.publishPipelineAgentRegistration(pipelineType, dispatch.pipelineTaskID, dispatch.pipelineTaskSlug, pipelineStatus)
+		}
 		return
 	}
 
@@ -266,7 +289,7 @@ func (o *Orchestrator) publishTaskDispatchAgents(dispatch *taskDispatchContext, 
 }
 
 func (o *Orchestrator) routeTaskDispatch(router *TaskRouter, dispatch *taskDispatchContext) {
-	if router == nil || dispatch.nodeID == "" {
+	if dispatch.nodeID == "" || router == nil {
 		o.logTrace("task_dispatch_route_skipped", agentlog.EventTaskDispatched, map[string]any{
 			"dag_id":     dispatch.dagID,
 			"node_id":    dispatch.nodeID,
@@ -318,12 +341,6 @@ func (o *Orchestrator) routeTaskDispatch(router *TaskRouter, dispatch *taskDispa
 }
 
 func (o *Orchestrator) routeDispatchedPipelineTask(router *TaskRouter, dispatch *taskDispatchContext, done <-chan struct{}) error {
-	o.mu.RLock()
-	managerConfigured := o.pipelineMgr != nil
-	o.mu.RUnlock()
-	if managerConfigured && managedPipelineEligible(dispatch) {
-		return o.routeManagedPipelineDispatch(dispatch, done)
-	}
 	return router.RouteWithLifecycle(dispatch.pipelineTask(o.config.SessionID), done)
 }
 

@@ -1,12 +1,15 @@
 package shared
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/adalundhe/sylk/core/versioning"
 )
+
+type pipelineTaskContextKey struct{}
 
 // PipelineTaskInput is the shared wire shape used by orchestrator pipeline
 // dispatches. It is intentionally duplicated here so pipeline workers can
@@ -21,6 +24,21 @@ type PipelineTaskInput struct {
 	Context       map[string]any `json:"context,omitempty"`
 	ParentResults map[string]any `json:"parent_results,omitempty"`
 	SessionID     string         `json:"session_id"`
+}
+
+func WithPipelineTask(ctx context.Context, task *PipelineTaskInput) context.Context {
+	if ctx == nil || task == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, pipelineTaskContextKey{}, task)
+}
+
+func PipelineTaskFromContext(ctx context.Context) *PipelineTaskInput {
+	if ctx == nil {
+		return nil
+	}
+	task, _ := ctx.Value(pipelineTaskContextKey{}).(*PipelineTaskInput)
+	return task
 }
 
 // DecodePipelineTaskInput parses a JSON-encoded orchestrator pipeline task.
@@ -137,11 +155,15 @@ func BuildPipelineSystemContext(task *PipelineTaskInput) string {
 		writeListSection(&b, "Pending Validation", summarizePipelineValidation(protocol["pending_validation"]))
 		writeListSection(&b, "Recent Protocol Events", summarizePipelineProtocolEvents(protocol["recent_events"]))
 		b.WriteString("\nProtocol Rules:\n")
-		b.WriteString("- Inspector is the only pipeline entrypoint and the only agent allowed to hand off accepted work to OT.\n")
+		b.WriteString("- Inspector is the only pipeline entrypoint and the ultimate pipeline exit point; only Inspector may accept work and hand off to OT.\n")
+		b.WriteString("- The authoritative loop is inspector -> tester -> engineer/designer -> inspector unless the active challenge explicitly says otherwise.\n")
 		b.WriteString("- Any pipeline agent may challenge any other pipeline agent.\n")
-		b.WriteString("- End each turn with handoff_next, validate_work, or handoff_to_ot (inspector only).\n")
+		b.WriteString("- End each turn with challenge_agent, handoff_next, validate_work, finalize_pipeline, or handoff_to_ot (inspector only).\n")
 		b.WriteString("- Process another agent's validation response before deciding the next handoff.\n")
+		b.WriteString("- Engineer and Designer should hand completed implementation turns back to Inspector instead of routing directly to Tester by default.\n")
 		b.WriteString("- Engineer and Designer should treat tests as executable specification and challenge unclear criteria or coverage.\n")
+		b.WriteString("- Each time Engineer or Designer hands work back, Inspector should invoke finalize_pipeline to run the audit cycle.\n")
+		b.WriteString("- If the finalize_pipeline audit passes and tester evidence confirms the required tests are implemented and passing, Inspector should invoke handoff_to_ot.\n")
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -154,6 +176,8 @@ func ComposePipelineTaskUserPrompt(task *PipelineTaskInput) string {
 	}
 
 	var b strings.Builder
+	currentRequest := PipelineCurrentRequest(task)
+	originalPrompt := strings.TrimSpace(task.Prompt)
 	b.WriteString("## Pipeline Task\n\n")
 	fmt.Fprintf(&b, "Task ID: %s\n", task.TaskID)
 	if slug, _ := task.Context["task_slug"].(string); slug != "" {
@@ -163,9 +187,16 @@ func ComposePipelineTaskUserPrompt(task *PipelineTaskInput) string {
 	if stage, _ := task.Context["pipeline_stage"].(string); stage != "" {
 		fmt.Fprintf(&b, "Stage: %s\n", stage)
 	}
-	b.WriteString("\n### Assignment\n")
-	b.WriteString(strings.TrimSpace(task.Prompt))
-	b.WriteString("\n")
+	if currentRequest != "" {
+		b.WriteString("\n### Current Turn Request\n")
+		b.WriteString(currentRequest)
+		b.WriteString("\n")
+	}
+	if originalPrompt != "" && originalPrompt != currentRequest {
+		b.WriteString("\n### Original Task Objective\n")
+		b.WriteString(originalPrompt)
+		b.WriteString("\n")
+	}
 
 	writeListSection(&b, "Affected Files", extractAffectedPaths(task.Context))
 	writeListSection(&b, "Workspace Read Set", decodeWorkspacePaths(task.Context, "read_set"))
@@ -203,6 +234,18 @@ func ComposePipelineTaskUserPrompt(task *PipelineTaskInput) string {
 	}
 
 	return strings.TrimSpace(b.String())
+}
+
+func PipelineCurrentRequest(task *PipelineTaskInput) string {
+	if task == nil {
+		return ""
+	}
+	if snapshot, err := PipelineProtocolSnapshotFromTask(task); err == nil && snapshot != nil {
+		if current := strings.TrimSpace(snapshot.CurrentRequest); current != "" {
+			return current
+		}
+	}
+	return strings.TrimSpace(task.Prompt)
 }
 
 // PipelineWorkerType returns the task's primary implementation worker type.

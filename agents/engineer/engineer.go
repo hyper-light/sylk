@@ -547,13 +547,24 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 
 	// Wire tool call emitter for inline visualization.
 	emitter := shared.NewToolCallEmitter(e.bus, e.channels, e.id, fwd.CorrelationID, fwd.SourceAgentID)
+	metaString := func(key string) string {
+		if fwd.Metadata == nil {
+			return ""
+		}
+		value, _ := fwd.Metadata[key].(string)
+		return strings.TrimSpace(value)
+	}
 	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = shared.WithStreamContextMetadata(ctx, map[string]any{
-		"agent_type":  "engineer",
-		"agent_name":  "Engineer",
-		"pipeline_id": e.pipelineID,
-		"task_id":     e.pipelineID,
-		"task_slug":   e.pipelineSlug,
+		"pipeline_task": true,
+		"agent_type":    "engineer",
+		"agent_name":    "Engineer",
+		"pipeline_id":   e.pipelineID,
+		"task_id":       e.pipelineID,
+		"task_slug":     e.pipelineSlug,
+		"task_name":     metaString("task_name"),
+		"dag_id":        metaString("dag_id"),
+		"node_id":       metaString("node_id"),
 	})
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
@@ -620,7 +631,11 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		return e.bus.Publish(e.channels.Errors, errMsg)
 	}
 
-	resp.Data = result
+	respData := result
+	if shared.DecodePipelineTaskInput(fwd.Input) != nil {
+		respData = shared.BuildPipelineTurnResponse(ctx, result)
+	}
+	resp.Data = respData
 	shared.PublishStreamComplete(e.bus, e.channels, ctx, e.id, "", usageAcc.Total())
 	e.publishActivity(events.EventTypeAgentAction, "Implementation task completed")
 
@@ -781,6 +796,7 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (_ *Enginee
 	if req == nil {
 		return nil, fmt.Errorf("request cannot be nil")
 	}
+	ctx = shared.WithPipelineTaskProtocolState(ctx, req.PipelineTask)
 
 	startTime := time.Now()
 	e.setStatus(AgentStatusBusy)
@@ -871,6 +887,9 @@ func (e *Engineer) validateTaskScope(_ context.Context, req *EngineerRequest) er
 }
 
 func (e *Engineer) failureResponse(req *EngineerRequest, err error, _ time.Time) (*EngineerResponse, error) {
+	if req != nil && req.PipelineTask != nil && err != nil {
+		shared.PublishPipelineTaskTerminalErrorUpdate(e.bus, e.id, req.PipelineTask, err, shared.PipelineTaskAttempt(req.PipelineTask))
+	}
 	return &EngineerResponse{
 		ID:        uuid.New().String(),
 		RequestID: req.ID,

@@ -188,6 +188,8 @@ func (pt *PipelineTester) registerCoreSkills() {
 	pt.skills.Register(prepareTestHarnessSkill(pt))
 	pt.skills.Register(analyzeRiskSkill(pt))
 	pt.skills.Register(planTestsSkill(pt))
+	pt.skills.Register(researchTestToolInstallSkill(pt))
+	pt.skills.Register(installTestToolingSkill(pt))
 	pt.skills.Register(writeTestSkill(pt))
 	pt.skills.Register(runTestSuiteSkill(pt))
 	pt.skills.Register(shared.DiagnoseFailureSkill(pt.diagEngine))
@@ -223,6 +225,13 @@ func (pt *PipelineTester) registerCoreSkills() {
 	}
 	for _, skill := range agentshared.PipelineProtocolSkills(agentshared.PipelineProtocolSkillConfig{
 		AgentType: func() string { return "tester-pipeline" },
+		Route: agentshared.PipelineProtocolRouteConfig{
+			BusProvider: func() guide.EventBus { return pt.bus },
+			SessionID:   func() string { return pt.config.SessionID },
+			PublishReroute: func(ctx context.Context, toAgentID, reason, newCorrelationID string) {
+				agentshared.PublishPipelineHandoffReroute(pt.bus, pt.channels, ctx, "tester-pipeline", toAgentID, reason, newCorrelationID)
+			},
+		},
 	}) {
 		pt.skills.Register(skill)
 	}
@@ -420,11 +429,15 @@ func (pt *PipelineTester) unsubRegistry() error {
 
 // Handle processes a forwarded request through the LLM tool loop.
 func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	task := agentshared.DecodePipelineTaskInput(fwd.Input)
 	if pt.getProvider() == nil {
+		if task != nil {
+			agentshared.PublishPipelineTaskFailureUpdate(pt.bus, pt.id, task, "pipeline tester: no LLM provider configured", agentshared.PipelineTaskAttempt(task))
+		}
 		return nil, fmt.Errorf("pipeline tester: no LLM provider configured")
 	}
 
-	task := agentshared.DecodePipelineTaskInput(fwd.Input)
+	ctx = agentshared.WithPipelineTaskProtocolState(ctx, task)
 	prevRuntime := pt.swapTaskRuntime(task)
 	defer pt.restoreTaskRuntime(prevRuntime)
 	userMessage := fwd.Input
@@ -475,6 +488,9 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		return pt.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {
+		if task != nil {
+			agentshared.PublishPipelineTaskTerminalErrorUpdate(pt.bus, pt.id, task, err, agentshared.PipelineTaskAttempt(task))
+		}
 		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
@@ -544,11 +560,15 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	ctx := reqCtx
 	ctx = agentshared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithStreamContextMetadata(ctx, map[string]any{
-		"agent_type":  "tester-pipeline",
-		"agent_name":  "Tester",
-		"pipeline_id": pt.pipelineID,
-		"task_id":     pt.pipelineID,
-		"task_slug":   pt.pipelineSlug,
+		"pipeline_task": true,
+		"agent_type":    "tester-pipeline",
+		"agent_name":    "Tester",
+		"pipeline_id":   pt.pipelineID,
+		"task_id":       pt.pipelineID,
+		"task_slug":     pt.pipelineSlug,
+		"task_name":     pt.pipelineName,
+		"dag_id":        taskContextString(fwd.Metadata, "dag_id"),
+		"node_id":       taskContextString(fwd.Metadata, "node_id"),
 	})
 	ctx, usageAcc := agentshared.WithUsageAccumulator(ctx)
 	ctx = agentshared.WithSteeringLedger(ctx, ledger)
@@ -613,7 +633,15 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 		return pt.bus.Publish(pt.channels.Errors, errMsg)
 	}
 
-	resp.Data = result
+	respData := result
+	if task := agentshared.DecodePipelineTaskInput(fwd.Input); task != nil {
+		respData = &TaskStageResult{
+			Plan:         pt.planSnapshot(),
+			CreatedFiles: pt.createdArtifacts(),
+			SuiteResult:  pt.lastSuiteSnapshot(),
+		}
+	}
+	resp.Data = agentshared.BuildPipelineTurnResponse(ctx, respData)
 	agentshared.PublishStreamComplete(pt.bus, pt.channels, ctx, pt.id, "", usageAcc.Total())
 	pt.publishActivity(events.EventTypeAgentAction, "Validation task completed")
 

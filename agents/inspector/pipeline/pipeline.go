@@ -430,6 +430,7 @@ func inspectorContractSynthesisMode(contract *agentShared.TaskExecutionContract,
 func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	// Decode structured pipeline task from orchestrator dispatch.
 	task := decodePipelineTask(fwd.Input)
+	ctx = agentShared.WithPipelineTaskProtocolState(ctx, task)
 
 	// Only try static/conversational replies for non-pipeline inputs.
 	// Pipeline task JSON contains keywords like "state" that would falsely
@@ -496,6 +497,9 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 		return pi.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {
+		if task != nil {
+			agentShared.PublishPipelineTaskTerminalErrorUpdate(pi.bus, pi.id, task, err, agentShared.PipelineTaskAttempt(task))
+		}
 		return nil, fmt.Errorf("pipeline inspector tool loop: %w", err)
 	}
 
@@ -558,11 +562,15 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	ctx := reqCtx
 	ctx = agentShared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentShared.WithStreamContextMetadata(ctx, map[string]any{
-		"agent_type":  "inspector-pipeline",
-		"agent_name":  "Inspector",
-		"pipeline_id": pi.pipelineID,
-		"task_id":     pi.pipelineID,
-		"task_slug":   pi.pipelineSlug,
+		"pipeline_task": true,
+		"agent_type":    "inspector-pipeline",
+		"agent_name":    "Inspector",
+		"pipeline_id":   pi.pipelineID,
+		"task_id":       pi.pipelineID,
+		"task_slug":     pi.pipelineSlug,
+		"task_name":     pi.pipelineName,
+		"dag_id":        stringValue(fwd.Metadata, "dag_id"),
+		"node_id":       stringValue(fwd.Metadata, "node_id"),
 	})
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	startTime := time.Now()
@@ -622,10 +630,16 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	shared.PublishStreamComplete(pi.bus, pi.channels, ctx, pi.id, "", usageAcc.Total())
 	pi.publishActivity(events.EventTypeAgentAction, "Inspection task completed")
 
+	respData := result
+	if task := decodePipelineTask(fwd.Input); task != nil {
+		if snapshot, snapErr := pi.stageSnapshot(task.TaskID); snapErr == nil {
+			respData = snapshot
+		}
+	}
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             true,
-		Data:                result,
+		Data:                agentShared.BuildPipelineTurnResponse(ctx, respData),
 		RespondingAgentID:   pi.id,
 		RespondingAgentName: "Inspector Pipeline",
 		ProcessingTime:      time.Since(startTime),

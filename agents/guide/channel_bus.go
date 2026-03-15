@@ -2,6 +2,7 @@ package guide
 
 import (
 	"errors"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -348,8 +349,8 @@ type channelSubscription struct {
 	async      bool
 	active     atomic.Bool
 	closed     atomic.Bool
-	mu         sync.Mutex   // guards queue
-	queue      []*Message   // append-only from publishers, batch-drained by consumer
+	mu         sync.Mutex    // guards queue
+	queue      []*Message    // append-only from publishers, batch-drained by consumer
 	notify     chan struct{} // cap-1 signal: "queue has messages"
 	done       chan struct{} // closed on unsubscribe/bus-close to wake consumer
 	topicShard *topicSubscriptions
@@ -469,7 +470,11 @@ func (s *channelSubscription) handleMessage(msg *Message) {
 
 func (s *channelSubscription) recoverPanic() {
 	if r := recover(); r != nil {
-		_ = r
+		DebugFileLog().Error("channel bus subscription panic",
+			"topic", s.topic,
+			"async", s.async,
+			"panic", r,
+			"stack", string(debug.Stack()))
 	}
 }
 

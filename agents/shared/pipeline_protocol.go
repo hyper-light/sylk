@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/google/uuid"
 )
 
 const (
@@ -16,6 +19,10 @@ const (
 	PipelineAgentEngineer  = "engineer"
 	PipelineAgentDesigner  = "designer"
 )
+
+const maxPipelineProtocolEventHistory = 8
+
+const finalizePipelineVerificationReference = "finalize_pipeline_verification"
 
 type PipelineTurnMode string
 
@@ -75,6 +82,8 @@ type PipelineValidationRecord struct {
 	RespondingAgent       string   `json:"responding_agent"`
 	Status                string   `json:"status"`
 	Summary               string   `json:"summary"`
+	ChallengeRequest      string   `json:"challenge_request,omitempty"`
+	ChallengeReferences   []string `json:"challenge_references,omitempty"`
 	EvidenceRefs          []string `json:"evidence_refs,omitempty"`
 	MissingInputs         []string `json:"missing_inputs,omitempty"`
 	RecommendedNextAgents []string `json:"recommended_next_agents,omitempty"`
@@ -122,6 +131,38 @@ type PipelineValidationProcessing struct {
 	NextTargets []string
 }
 
+type PipelineTurnResponse struct {
+	Result    any                            `json:"result,omitempty"`
+	Action    *PipelineTurnAction            `json:"action,omitempty"`
+	Processed []PipelineValidationProcessing `json:"processed,omitempty"`
+}
+
+type pipelineResponseTexter interface {
+	ResponseText() string
+}
+
+// ResponseText lets Guide/UI use the inner user-facing result text when a
+// pipeline turn response is carried as a structured envelope.
+func (r *PipelineTurnResponse) ResponseText() string {
+	if r == nil || r.Result == nil {
+		return ""
+	}
+	if text, ok := r.Result.(string); ok {
+		return strings.TrimSpace(text)
+	}
+	if rt, ok := r.Result.(pipelineResponseTexter); ok {
+		return strings.TrimSpace(rt.ResponseText())
+	}
+	return ""
+}
+
+type PipelineProtocolRouteConfig struct {
+	Bus            guide.EventBus
+	BusProvider    func() guide.EventBus
+	SessionID      func() string
+	PublishReroute func(context.Context, string, string, string)
+}
+
 type PipelineProtocolState struct {
 	mu             sync.RWMutex
 	snapshot       *PipelineProtocolSnapshot
@@ -132,6 +173,7 @@ type PipelineProtocolState struct {
 type PipelineProtocolSkillConfig struct {
 	AgentType   func() string
 	InspectorOT bool
+	Route       PipelineProtocolRouteConfig
 }
 
 type pipelineProtocolStateKey struct{}
@@ -153,6 +195,37 @@ func PipelineProtocolStateFromContext(ctx context.Context) *PipelineProtocolStat
 
 func NewPipelineProtocolState(snapshot *PipelineProtocolSnapshot) *PipelineProtocolState {
 	return &PipelineProtocolState{snapshot: clonePipelineProtocolSnapshot(snapshot)}
+}
+
+func WithPipelineTaskProtocolState(ctx context.Context, task *PipelineTaskInput) context.Context {
+	ctx = WithPipelineTask(ctx, task)
+	if ctx == nil || task == nil || PipelineProtocolStateFromContext(ctx) != nil {
+		return ctx
+	}
+	snapshot, err := PipelineProtocolSnapshotFromTask(task)
+	if err != nil || snapshot == nil {
+		return ctx
+	}
+	return WithPipelineProtocolState(ctx, NewPipelineProtocolState(snapshot))
+}
+
+func PipelineProtocolSnapshotFromTask(task *PipelineTaskInput) (*PipelineProtocolSnapshot, error) {
+	if task == nil || len(task.Context) == 0 {
+		return nil, nil
+	}
+	raw, ok := task.Context["pipeline_protocol"]
+	if !ok || raw == nil {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
+	var snapshot PipelineProtocolSnapshot
+	if err := json.Unmarshal(encoded, &snapshot); err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
 }
 
 func (s *PipelineProtocolState) Snapshot() *PipelineProtocolSnapshot {
@@ -221,6 +294,59 @@ func PipelineProtocolSnapshotMap(snapshot *PipelineProtocolSnapshot) map[string]
 	return out
 }
 
+func BuildPipelineTurnResponse(ctx context.Context, result any) any {
+	state := PipelineProtocolStateFromContext(ctx)
+	if state == nil {
+		return result
+	}
+	return &PipelineTurnResponse{
+		Result:    result,
+		Action:    state.TerminalAction(),
+		Processed: state.ProcessedValidations(),
+	}
+}
+
+func DecodePipelineTurnResponse(data any) (*PipelineTurnResponse, error) {
+	switch typed := data.(type) {
+	case nil:
+		return nil, fmt.Errorf("pipeline turn response is required")
+	case *PipelineTurnResponse:
+		return typed, nil
+	case PipelineTurnResponse:
+		copy := typed
+		return &copy, nil
+	default:
+		encoded, err := json.Marshal(data)
+		if err != nil {
+			return nil, err
+		}
+		var response PipelineTurnResponse
+		if err := json.Unmarshal(encoded, &response); err != nil {
+			return nil, err
+		}
+		return &response, nil
+	}
+}
+
+func ApplyPipelineTurnResponse(ctx context.Context, response *PipelineTurnResponse) error {
+	if response == nil {
+		return nil
+	}
+	state := PipelineProtocolStateFromContext(ctx)
+	if state == nil {
+		return nil
+	}
+	if response.Action != nil {
+		if err := state.setTerminalAction(response.Action); err != nil {
+			return err
+		}
+	}
+	for _, entry := range response.Processed {
+		state.addProcessedValidation(entry)
+	}
+	return nil
+}
+
 func ValidatePipelineProtocolCompletion(ctx context.Context, role string) error {
 	state := PipelineProtocolStateFromContext(ctx)
 	if state == nil {
@@ -231,21 +357,55 @@ func ValidatePipelineProtocolCompletion(ctx context.Context, role string) error 
 	}
 	role = normalizePipelineAgentType(role)
 	if role == PipelineAgentInspector {
-		return fmt.Errorf("Before ending this pipeline turn, use `handoff_next`, `validate_work`, or `handoff_to_ot` to record the next protocol step.")
+		return fmt.Errorf("Before ending this pipeline turn, use `challenge_agent`, `handoff_next`, `validate_work`, `finalize_pipeline`, or `handoff_to_ot` to record the next protocol step.")
 	}
-	return fmt.Errorf("Before ending this pipeline turn, use `handoff_next` or `validate_work` to record the next protocol step.")
+	return fmt.Errorf("Before ending this pipeline turn, use `challenge_agent`, `handoff_next`, or `validate_work` to record the next protocol step.")
 }
 
 func PipelineProtocolSkills(cfg PipelineProtocolSkillConfig) []*skills.Skill {
 	out := []*skills.Skill{
+		pipelineChallengeAgentSkill(cfg),
 		pipelineHandoffNextSkill(cfg),
 		pipelineValidateWorkSkill(cfg),
 		pipelineProcessValidationSkill(cfg),
 	}
 	if cfg.InspectorOT {
-		out = append(out, pipelineHandoffOTSkill(cfg))
+		out = append(out, pipelineFinalizePipelineSkill(cfg), pipelineHandoffOTSkill(cfg))
 	}
 	return out
+}
+
+type pipelineTurnSelectionParams struct {
+	TargetAgents   []string `json:"target_agents"`
+	Mode           string   `json:"mode"`
+	Reason         string   `json:"reason"`
+	Request        string   `json:"request"`
+	RequiredOutput []string `json:"required_output"`
+	References     []string `json:"references"`
+}
+
+func pipelineChallengeAgentSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
+	return skills.NewSkill("challenge_agent").
+		Description("Issue a concrete challenge to the next pipeline agent or cohort and transfer ownership until they respond.").
+		Domain("pipeline").
+		Keywords("challenge", "peer review", "validation", "pipeline", "route").
+		Priority(100).
+		Usage("Use when another pipeline agent must validate, clarify, test, inspect, or produce work before you can continue.").
+		Satisfies("Creates an explicit pipeline challenge and routes it to the challenged agent or cohort.").
+		ArrayParam("target_agents", "Canonical target agents: inspector, tester, engineer, designer, inspector-pipeline, or tester-pipeline", "string", true).
+		EnumParam("mode", "single or cohort", []string{string(PipelineTurnModeSingle), string(PipelineTurnModeCohort)}, false).
+		StringParam("reason", "Why this challenge is necessary now", true).
+		StringParam("request", "The concrete challenge, assignment, or question for the target agent(s)", true).
+		ArrayParam("required_output", "What the target agent must return or validate", "string", false).
+		ArrayParam("references", "Relevant files, artifacts, tests, or criteria to inspect", "string", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params pipelineTurnSelectionParams
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			return issuePipelineTurnSelection(ctx, cfg, params)
+		}).
+		Build()
 }
 
 func pipelineHandoffNextSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
@@ -263,61 +423,98 @@ func pipelineHandoffNextSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 		ArrayParam("required_output", "What the target agent must return or validate", "string", false).
 		ArrayParam("references", "Relevant files, artifacts, tests, or criteria to inspect", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				TargetAgents   []string `json:"target_agents"`
-				Mode           string   `json:"mode"`
-				Reason         string   `json:"reason"`
-				Request        string   `json:"request"`
-				RequiredOutput []string `json:"required_output"`
-				References     []string `json:"references"`
-			}
+			var params pipelineTurnSelectionParams
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			targets, err := normalizePipelineTargets(params.TargetAgents)
-			if err != nil {
-				return nil, err
-			}
-			state := PipelineProtocolStateFromContext(ctx)
-			if state == nil {
-				return nil, fmt.Errorf("pipeline protocol state not available")
-			}
-			snapshot := state.Snapshot()
-			if err := validatePipelineTargets(snapshot, targets); err != nil {
-				return nil, err
-			}
-			mode := normalizePipelineTurnMode(params.Mode, len(targets))
-			if mode == PipelineTurnModeCohort && len(targets) < 2 {
-				return nil, fmt.Errorf("cohort handoff requires at least two target agents")
-			}
-			agentType := pipelineProtocolAgentType(ctx, cfg)
-			action := &PipelineTurnAction{
-				Type:           PipelineProtocolActionHandoff,
-				AgentType:      agentType,
-				TargetAgents:   targets,
-				Mode:           mode,
-				Reason:         strings.TrimSpace(params.Reason),
-				Request:        strings.TrimSpace(params.Request),
-				RequiredOutput: normalizeStringList(params.RequiredOutput),
-				References:     normalizeStringList(params.References),
-			}
-			if action.Reason == "" {
-				return nil, fmt.Errorf("reason is required")
-			}
-			if action.Request == "" {
-				return nil, fmt.Errorf("request is required")
-			}
-			if err := state.setTerminalAction(action); err != nil {
-				return nil, err
-			}
-			return map[string]any{
-				"selected":      true,
-				"agent_type":    agentType,
-				"target_agents": append([]string(nil), targets...),
-				"mode":          string(mode),
-			}, nil
+			return issuePipelineTurnSelection(ctx, cfg, params)
 		}).
 		Build()
+}
+
+func issuePipelineTurnSelection(ctx context.Context, cfg PipelineProtocolSkillConfig, params pipelineTurnSelectionParams) (map[string]any, error) {
+	targets, err := normalizePipelineTargets(params.TargetAgents)
+	if err != nil {
+		return nil, err
+	}
+	state := PipelineProtocolStateFromContext(ctx)
+	if state == nil {
+		return nil, fmt.Errorf("pipeline protocol state not available")
+	}
+	snapshot := state.Snapshot()
+	if err := validatePipelineTargets(snapshot, targets); err != nil {
+		return nil, err
+	}
+	mode := normalizePipelineTurnMode(params.Mode, len(targets))
+	if mode == PipelineTurnModeCohort && len(targets) < 2 {
+		return nil, fmt.Errorf("cohort handoff requires at least two target agents")
+	}
+	agentType := pipelineProtocolAgentType(ctx, cfg)
+	action := &PipelineTurnAction{
+		Type:           PipelineProtocolActionHandoff,
+		AgentType:      agentType,
+		TargetAgents:   targets,
+		Mode:           mode,
+		Reason:         strings.TrimSpace(params.Reason),
+		Request:        strings.TrimSpace(params.Request),
+		RequiredOutput: normalizeStringList(params.RequiredOutput),
+		References:     normalizeStringList(params.References),
+	}
+	if action.Reason == "" {
+		return nil, fmt.Errorf("reason is required")
+	}
+	if action.Request == "" {
+		return nil, fmt.Errorf("request is required")
+	}
+	if task := PipelineTaskFromContext(ctx); task != nil {
+		action.ChallengeID = nextPipelineChallengeID(task)
+	}
+	if task := PipelineTaskFromContext(ctx); task != nil {
+		if !pipelineProtocolRouteEnabled(ctx, cfg) {
+			return nil, fmt.Errorf("pipeline handoff requires active stream routing context")
+		}
+		dispatch, err := dispatchPipelineHandoffSelection(ctx, cfg, state, task, action)
+		if err != nil {
+			return nil, err
+		}
+		if err := state.setTerminalAction(action); err != nil {
+			return nil, err
+		}
+		return pipelineTurnSelectionResult(agentType, action, dispatch), nil
+	}
+	if err := state.setTerminalAction(action); err != nil {
+		return nil, err
+	}
+	return pipelineTurnSelectionResult(agentType, action, nil), nil
+}
+
+type pipelineDispatchSelection struct {
+	CorrelationIDs []string
+	TargetAgentIDs []string
+}
+
+func pipelineTurnSelectionResult(agentType string, action *PipelineTurnAction, dispatch *pipelineDispatchSelection) map[string]any {
+	result := map[string]any{
+		"selected":      true,
+		"agent_type":    agentType,
+		"target_agents": append([]string(nil), action.TargetAgents...),
+		"mode":          string(action.Mode),
+	}
+	if strings.TrimSpace(action.ChallengeID) != "" {
+		result["challenge_id"] = strings.TrimSpace(action.ChallengeID)
+	}
+	if dispatch != nil && len(dispatch.TargetAgentIDs) > 0 {
+		result["forwarded"] = true
+		result["correlation_ids"] = append([]string(nil), dispatch.CorrelationIDs...)
+		result["target_agent_ids"] = append([]string(nil), dispatch.TargetAgentIDs...)
+		if len(dispatch.CorrelationIDs) == 1 {
+			result["correlation_id"] = strings.TrimSpace(dispatch.CorrelationIDs[0])
+		}
+		if len(dispatch.TargetAgentIDs) == 1 {
+			result["target_agent_id"] = strings.TrimSpace(dispatch.TargetAgentIDs[0])
+		}
+	}
+	return result
 }
 
 func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
@@ -390,9 +587,42 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 				RespondingAgent:       pipelineProtocolAgentType(ctx, cfg),
 				Status:                status,
 				Summary:               summary,
+				ChallengeRequest:      strings.TrimSpace(challenge.Request),
+				ChallengeReferences:   normalizeStringList(challenge.References),
 				EvidenceRefs:          normalizeStringList(params.EvidenceRefs),
 				MissingInputs:         normalizeStringList(params.MissingInputs),
 				RecommendedNextAgents: normalizeStringList(params.RecommendedNextAgents),
+			}
+			if task := PipelineTaskFromContext(ctx); task != nil {
+				if !pipelineProtocolRouteEnabled(ctx, cfg) {
+					return nil, fmt.Errorf("pipeline validation return requires active stream routing context")
+				}
+				nextTask, err := buildPipelineValidationTask(state, task, record)
+				if err != nil {
+					return nil, err
+				}
+				correlationID, err := dispatchPipelineProtocolTask(ctx, cfg, nextTask, record.Summary)
+				if err != nil {
+					return nil, err
+				}
+				if err := state.setTerminalAction(&PipelineTurnAction{
+					Type:        PipelineProtocolActionValidate,
+					AgentType:   record.RespondingAgent,
+					ChallengeID: challenge.ID,
+					Validation:  record,
+				}); err != nil {
+					return nil, err
+				}
+				return map[string]any{
+					"validated":        true,
+					"challenge_id":     record.ChallengeID,
+					"requesting_agent": record.RequestingAgent,
+					"responding_agent": record.RespondingAgent,
+					"status":           record.Status,
+					"forwarded":        true,
+					"correlation_id":   correlationID,
+					"target_agent_id":  strings.TrimSpace(nextTask.TargetAgentID),
+				}, nil
 			}
 			if err := state.setTerminalAction(&PipelineTurnAction{
 				Type:        PipelineProtocolActionValidate,
@@ -483,13 +713,105 @@ func pipelineProcessValidationSkill(cfg PipelineProtocolSkillConfig) *skills.Ski
 		Build()
 }
 
+func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
+	return skills.NewSkill("finalize_pipeline").
+		Description("Run the recurring inspector audit cycle that gates OT handoff. Inspector only.").
+		Domain("pipeline").
+		Keywords("audit", "challenge", "review", "finalize", "pipeline").
+		Priority(100).
+		Usage("Invoke this every time Engineer or Designer hands work back to you. It should run the inspector audit cycle by challenging Tester to audit the engineer/designer implementation for correctness, robustness, performance, scope discipline, and production quality, and to judge whether the test surface adds real value instead of noisy or low-quality coverage. If Tester has already returned a passing audit for this cycle, use that result to decide whether to call `handoff_to_ot`. If any challenge response indicates the criteria or quality bar are not met, initiate another cycle instead of handing off to OT.").
+		Satisfies("Issues or recognizes the tester-backed audit that gates OT handoff and tells the inspector whether the pipeline is ready for `handoff_to_ot`.").
+		StringParam("summary", "Why the pipeline is ready for OT merge", true).
+		ArrayParam("evidence_refs", "Criteria, tests, artifacts, and files supporting acceptance", "string", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Summary      string   `json:"summary"`
+				EvidenceRefs []string `json:"evidence_refs"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			agentType := pipelineProtocolAgentType(ctx, cfg)
+			if agentType != PipelineAgentInspector {
+				return nil, fmt.Errorf("finalize_pipeline is only permitted for the pipeline inspector")
+			}
+			summary := strings.TrimSpace(params.Summary)
+			if summary == "" {
+				return nil, fmt.Errorf("summary is required")
+			}
+			state := PipelineProtocolStateFromContext(ctx)
+			if state == nil {
+				return nil, fmt.Errorf("pipeline protocol state not available")
+			}
+			snapshot := state.Snapshot()
+			evidenceRefs := normalizeStringList(params.EvidenceRefs)
+			if record, ok := finalizePipelineValidationReady(snapshot); ok {
+				return map[string]any{
+					"finalize_pipeline": true,
+					"ready_for_ot":      true,
+					"agent_type":        agentType,
+					"challenge_id":      strings.TrimSpace(record.ChallengeID),
+					"evidence_refs":     normalizeStringList(append(append([]string(nil), evidenceRefs...), record.EvidenceRefs...)),
+				}, nil
+			}
+			if finalizePipelineChallengePending(snapshot) {
+				return map[string]any{
+					"finalize_pipeline":      false,
+					"verification_requested": true,
+					"agent_type":             agentType,
+					"challenge_id":           strings.TrimSpace(snapshot.PendingChallenge.ID),
+				}, nil
+			}
+
+			action := &PipelineTurnAction{
+				Type:         PipelineProtocolActionHandoff,
+				AgentType:    agentType,
+				TargetAgents: []string{PipelineAgentTester},
+				Mode:         PipelineTurnModeSingle,
+				Reason:       "Run the inspector audit cycle before OT handoff.",
+				Request:      "Audit the Engineer and Designer outputs as quality production code, not excessive or agentic slop. Verify correctness, robustness, performance, scope discipline, and production quality, and penalize unrelated code, premature abstraction, or verbosity. Also verify that all required tests are implemented and passing and that the tests add real value rather than noisy or low-quality surface area.",
+				RequiredOutput: []string{
+					"State whether all required tests are implemented and passing.",
+					"Audit the engineer/designer implementation for correctness, robustness, performance, scope discipline, and production quality.",
+					"Call out any excessive code, premature abstraction, verbosity, low-value tests, or agentic slop that should force another cycle.",
+				},
+				References: append([]string{finalizePipelineVerificationReference}, evidenceRefs...),
+			}
+			if task := PipelineTaskFromContext(ctx); task != nil {
+				action.ChallengeID = nextPipelineChallengeID(task)
+				if !pipelineProtocolRouteEnabled(ctx, cfg) {
+					return nil, fmt.Errorf("pipeline handoff requires active stream routing context")
+				}
+				dispatch, err := dispatchPipelineHandoffSelection(ctx, cfg, state, task, action)
+				if err != nil {
+					return nil, err
+				}
+				if err := state.setTerminalAction(action); err != nil {
+					return nil, err
+				}
+				result := pipelineTurnSelectionResult(agentType, action, dispatch)
+				result["finalize_pipeline"] = false
+				result["verification_requested"] = true
+				return result, nil
+			}
+			if err := state.setTerminalAction(action); err != nil {
+				return nil, err
+			}
+			result := pipelineTurnSelectionResult(agentType, action, nil)
+			result["finalize_pipeline"] = false
+			result["verification_requested"] = true
+			return result, nil
+		}).
+		Build()
+}
+
 func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 	return skills.NewSkill("handoff_to_ot").
 		Description("Finalize an accepted pipeline and hand the result to Operational Transform for merge. Inspector only.").
 		Domain("pipeline").
 		Keywords("ot", "merge", "accept", "finalize", "pipeline").
 		Priority(100).
-		Usage("Use only after the inspector has validated that testing and implementation criteria are satisfied and the pipeline should terminate successfully.").
+		Usage("Use only after the inspector has decided the latest `finalize_pipeline` audit cycle passed and the pipeline should terminate successfully.").
 		Satisfies("Marks the pipeline as accepted and ready for OT merge.").
 		StringParam("summary", "Why the pipeline is ready for OT merge", true).
 		ArrayParam("evidence_refs", "Criteria, tests, artifacts, and files supporting acceptance", "string", false).
@@ -513,18 +835,32 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 			if state == nil {
 				return nil, fmt.Errorf("pipeline protocol state not available")
 			}
+			evidenceRefs := normalizeStringList(params.EvidenceRefs)
 			if err := state.setTerminalAction(&PipelineTurnAction{
 				Type:         PipelineProtocolActionOT,
 				AgentType:    agentType,
 				Summary:      summary,
-				EvidenceRefs: normalizeStringList(params.EvidenceRefs),
+				EvidenceRefs: evidenceRefs,
 			}); err != nil {
 				return nil, err
+			}
+			if task := PipelineTaskFromContext(ctx); task != nil {
+				PublishPipelineTaskSuccessUpdate(
+					cfg.Route.eventBus(),
+					agentType,
+					task,
+					summary,
+					map[string]any{
+						"summary":       summary,
+						"evidence_refs": evidenceRefs,
+					},
+					PipelineTaskAttempt(task),
+				)
 			}
 			return map[string]any{
 				"handoff_to_ot": true,
 				"agent_type":    agentType,
-				"evidence_refs": normalizeStringList(params.EvidenceRefs),
+				"evidence_refs": evidenceRefs,
 			}, nil
 		}).
 		Build()
@@ -636,6 +972,456 @@ func normalizeStringList(values []string) []string {
 	return out
 }
 
+func pipelineProtocolRouteEnabled(ctx context.Context, cfg PipelineProtocolSkillConfig) bool {
+	if _, ok := StreamMetadataFromContext(ctx); !ok {
+		return false
+	}
+	return cfg.Route.eventBus() != nil
+}
+
+func PipelineTurnTerminalAction(ctx context.Context) *PipelineTurnAction {
+	state := PipelineProtocolStateFromContext(ctx)
+	if state == nil {
+		return nil
+	}
+	return state.TerminalAction()
+}
+
+func PipelineTurnTerminated(ctx context.Context) bool {
+	return PipelineTurnTerminalAction(ctx) != nil
+}
+
+func (c PipelineProtocolRouteConfig) eventBus() guide.EventBus {
+	if c.BusProvider != nil {
+		if bus := c.BusProvider(); bus != nil {
+			return bus
+		}
+	}
+	return c.Bus
+}
+
+func (c PipelineProtocolRouteConfig) sessionID(task *PipelineTaskInput) string {
+	if c.SessionID != nil {
+		if sessionID := strings.TrimSpace(c.SessionID()); sessionID != "" {
+			return sessionID
+		}
+	}
+	if task != nil {
+		return strings.TrimSpace(task.SessionID)
+	}
+	return ""
+}
+
+func dispatchPipelineProtocolTask(ctx context.Context, cfg PipelineProtocolSkillConfig, task *PipelineTaskInput, reason string) (string, error) {
+	if task == nil {
+		return "", fmt.Errorf("pipeline task is required")
+	}
+	stream, ok := StreamMetadataFromContext(ctx)
+	if !ok || strings.TrimSpace(stream.CorrelationID) == "" || strings.TrimSpace(stream.SourceAgentID) == "" {
+		return "", fmt.Errorf("pipeline handoff requires active stream context")
+	}
+	bus := cfg.Route.eventBus()
+	if bus == nil {
+		return "", fmt.Errorf("pipeline protocol route bus is not configured")
+	}
+	targetAgentID := firstNonEmpty(strings.TrimSpace(task.TargetAgentID), pipelineProtocolTargetAgentID(task.TaskID, task.AgentType))
+	if targetAgentID == "" {
+		return "", fmt.Errorf("pipeline target agent is unavailable for %s", task.AgentType)
+	}
+	task.TargetAgentID = targetAgentID
+	payload, err := json.Marshal(task)
+	if err != nil {
+		return "", fmt.Errorf("encode pipeline task: %w", err)
+	}
+	correlationID := "pipe_" + uuid.NewString()[:12]
+	req := &guide.RouteRequest{
+		CorrelationID:       correlationID,
+		ParentCorrelationID: strings.TrimSpace(stream.CorrelationID),
+		Input:               string(payload),
+		TargetAgentID:       targetAgentID,
+		ExplicitTarget:      true,
+		SourceAgentID:       strings.TrimSpace(stream.SourceAgentID),
+		SourceAgentName:     strings.TrimSpace(stream.SourceAgentID),
+		SessionID:           cfg.Route.sessionID(task),
+		Timestamp:           time.Now(),
+		Metadata:            pipelineRouteMetadata(task),
+	}
+	if err := bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage("", req)); err != nil {
+		return "", fmt.Errorf("publish pipeline handoff: %w", err)
+	}
+	PublishPipelineTaskRunningUpdate(
+		bus,
+		pipelineProtocolAgentType(ctx, cfg),
+		task,
+		firstNonEmpty(pipelineProtocolCurrentRequest(task), strings.TrimSpace(reason)),
+		PipelineTaskAttempt(task),
+	)
+	if cfg.Route.PublishReroute != nil {
+		cfg.Route.PublishReroute(ctx, strings.TrimSpace(task.AgentType), strings.TrimSpace(reason), correlationID)
+	}
+	return correlationID, nil
+}
+
+func dispatchPipelineHandoffSelection(
+	ctx context.Context,
+	cfg PipelineProtocolSkillConfig,
+	state *PipelineProtocolState,
+	task *PipelineTaskInput,
+	action *PipelineTurnAction,
+) (*pipelineDispatchSelection, error) {
+	if state == nil {
+		return nil, fmt.Errorf("pipeline protocol state not available")
+	}
+	tasks, err := buildPipelineHandoffTasks(state, task, action)
+	if err != nil {
+		return nil, err
+	}
+	dispatch := &pipelineDispatchSelection{
+		CorrelationIDs: make([]string, 0, len(tasks)),
+		TargetAgentIDs: make([]string, 0, len(tasks)),
+	}
+	for _, nextTask := range tasks {
+		correlationID, err := dispatchPipelineProtocolTask(ctx, cfg, nextTask, action.Request)
+		if err != nil {
+			return nil, err
+		}
+		dispatch.CorrelationIDs = append(dispatch.CorrelationIDs, correlationID)
+		dispatch.TargetAgentIDs = append(dispatch.TargetAgentIDs, strings.TrimSpace(nextTask.TargetAgentID))
+	}
+	return dispatch, nil
+}
+
+func PublishPipelineHandoffReroute(
+	bus guide.EventBus,
+	channels *guide.AgentChannels,
+	ctx context.Context,
+	fromAgentID string,
+	toAgentID string,
+	reason string,
+	newCorrelationID string,
+) {
+	if bus == nil || channels == nil {
+		return
+	}
+	stream, ok := StreamMetadataFromContext(ctx)
+	if !ok || strings.TrimSpace(stream.CorrelationID) == "" || strings.TrimSpace(newCorrelationID) == "" {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "pipeline handoff"
+	}
+	PublishStreamEvent(bus, channels, ctx, strings.TrimSpace(fromAgentID), &guide.StreamEvent{
+		Type: guide.StreamEventReroute,
+		Data: map[string]string{
+			"from_agent":              strings.TrimSpace(fromAgentID),
+			"to_agent":                strings.TrimSpace(toAgentID),
+			"reason":                  reason,
+			"original_correlation_id": strings.TrimSpace(stream.CorrelationID),
+			"new_correlation_id":      strings.TrimSpace(newCorrelationID),
+		},
+		Timestamp: time.Now(),
+	})
+}
+
+func buildPipelineHandoffTasks(state *PipelineProtocolState, task *PipelineTaskInput, action *PipelineTurnAction) ([]*PipelineTaskInput, error) {
+	if state == nil {
+		return nil, fmt.Errorf("pipeline protocol state not available")
+	}
+	if task == nil {
+		return nil, fmt.Errorf("pipeline task not available")
+	}
+	if action == nil || len(action.TargetAgents) == 0 {
+		return nil, fmt.Errorf("pipeline handoff requires at least one target agent")
+	}
+	snapshot := buildHandoffSnapshot(state, task, action)
+	stage := pipelineStageForAgents(action.TargetAgents)
+	nextTasks := make([]*PipelineTaskInput, 0, len(action.TargetAgents))
+	for _, rawTarget := range action.TargetAgents {
+		targetAgent := normalizePipelineAgentType(rawTarget)
+		next := clonePipelineTaskInput(task)
+		next.AgentType = targetAgent
+		next.TargetAgentID = pipelineProtocolTargetAgentID(next.TaskID, targetAgent)
+		if next.Context == nil {
+			next.Context = map[string]any{}
+		}
+		next.Context["pipeline_stage"] = stage
+		next.Context["pipeline_protocol"] = PipelineProtocolSnapshotMap(snapshot)
+		nextTasks = append(nextTasks, next)
+	}
+	return nextTasks, nil
+}
+
+func buildPipelineValidationTask(state *PipelineProtocolState, task *PipelineTaskInput, record *PipelineValidationRecord) (*PipelineTaskInput, error) {
+	if state == nil {
+		return nil, fmt.Errorf("pipeline protocol state not available")
+	}
+	if task == nil {
+		return nil, fmt.Errorf("pipeline task not available")
+	}
+	if record == nil {
+		return nil, fmt.Errorf("pipeline validation record is required")
+	}
+	next := clonePipelineTaskInput(task)
+	requestingAgent := normalizePipelineAgentType(record.RequestingAgent)
+	next.AgentType = requestingAgent
+	next.TargetAgentID = pipelineProtocolTargetAgentID(next.TaskID, requestingAgent)
+	if next.Context == nil {
+		next.Context = map[string]any{}
+	}
+	next.Context["pipeline_stage"] = pipelineStageForAgents([]string{requestingAgent})
+	next.Context["pipeline_protocol"] = PipelineProtocolSnapshotMap(buildValidationSnapshot(state, record))
+	return next, nil
+}
+
+func buildHandoffSnapshot(state *PipelineProtocolState, task *PipelineTaskInput, action *PipelineTurnAction) *PipelineProtocolSnapshot {
+	snapshot := materializePipelineProtocolSnapshot(state)
+	if snapshot == nil {
+		snapshot = &PipelineProtocolSnapshot{}
+	}
+	snapshot.ActiveAgents = append([]string(nil), action.TargetAgents...)
+	snapshot.RequestedBy = action.AgentType
+	snapshot.Mode = string(action.Mode)
+	snapshot.CurrentRequest = strings.TrimSpace(action.Request)
+	snapshot.PendingValidation = nil
+	snapshot.PendingChallenge = &PipelineProtocolChallenge{
+		ID:              firstNonEmpty(strings.TrimSpace(action.ChallengeID), nextPipelineChallengeID(task)),
+		RequestingAgent: action.AgentType,
+		TargetAgents:    append([]string(nil), action.TargetAgents...),
+		Mode:            string(action.Mode),
+		Reason:          strings.TrimSpace(action.Reason),
+		Request:         strings.TrimSpace(action.Request),
+		RequiredOutput:  append([]string(nil), action.RequiredOutput...),
+		References:      append([]string(nil), action.References...),
+	}
+	appendPipelineProtocolEvent(snapshot, PipelineProtocolEvent{
+		Type:      string(action.Type),
+		AgentType: action.AgentType,
+		Targets:   append([]string(nil), action.TargetAgents...),
+		Summary:   strings.TrimSpace(action.Request),
+	})
+	return snapshot
+}
+
+func buildValidationSnapshot(state *PipelineProtocolState, record *PipelineValidationRecord) *PipelineProtocolSnapshot {
+	snapshot := materializePipelineProtocolSnapshot(state)
+	if snapshot == nil {
+		snapshot = &PipelineProtocolSnapshot{}
+	}
+	snapshot.ActiveAgents = []string{normalizePipelineAgentType(record.RequestingAgent)}
+	snapshot.RequestedBy = normalizePipelineAgentType(record.RespondingAgent)
+	snapshot.Mode = string(PipelineTurnModeSingle)
+	snapshot.CurrentRequest = fmt.Sprintf(
+		"Process validation response for challenge %s and decide the next handoff.",
+		strings.TrimSpace(record.ChallengeID),
+	)
+	snapshot.PendingChallenge = nil
+	snapshot.PendingValidation = cloneValidationRecord(record)
+	appendPipelineProtocolEvent(snapshot, PipelineProtocolEvent{
+		Type:      string(PipelineProtocolActionValidate),
+		AgentType: record.RespondingAgent,
+		Targets:   []string{record.RequestingAgent},
+		Summary:   strings.TrimSpace(record.Summary),
+	})
+	return snapshot
+}
+
+func pipelineProtocolCurrentRequest(task *PipelineTaskInput) string {
+	snapshot, err := PipelineProtocolSnapshotFromTask(task)
+	if err != nil || snapshot == nil {
+		return ""
+	}
+	return strings.TrimSpace(snapshot.CurrentRequest)
+}
+
+func materializePipelineProtocolSnapshot(state *PipelineProtocolState) *PipelineProtocolSnapshot {
+	if state == nil {
+		return nil
+	}
+	snapshot := clonePipelineProtocolSnapshot(state.Snapshot())
+	if snapshot == nil {
+		return nil
+	}
+	for _, entry := range state.ProcessedValidations() {
+		appendPipelineProtocolEvent(snapshot, PipelineProtocolEvent{
+			Type:      "process_validation",
+			AgentType: entry.AgentType,
+			Targets:   append([]string(nil), entry.NextTargets...),
+			Summary:   strings.TrimSpace(entry.Summary),
+		})
+		if snapshot.PendingValidation != nil && strings.TrimSpace(snapshot.PendingValidation.ChallengeID) == strings.TrimSpace(entry.ChallengeID) {
+			snapshot.PendingValidation = nil
+		}
+	}
+	return snapshot
+}
+
+func appendPipelineProtocolEvent(snapshot *PipelineProtocolSnapshot, evt PipelineProtocolEvent) {
+	if snapshot == nil {
+		return
+	}
+	snapshot.RecentEvents = append(snapshot.RecentEvents, evt)
+	if len(snapshot.RecentEvents) <= maxPipelineProtocolEventHistory {
+		return
+	}
+	snapshot.RecentEvents = append([]PipelineProtocolEvent(nil), snapshot.RecentEvents[len(snapshot.RecentEvents)-maxPipelineProtocolEventHistory:]...)
+}
+
+func nextPipelineChallengeID(task *PipelineTaskInput) string {
+	base := "pipeline"
+	if task != nil && strings.TrimSpace(task.TaskID) != "" {
+		base = strings.TrimSpace(task.TaskID)
+	}
+	return fmt.Sprintf("%s-challenge-%s", base, uuid.NewString()[:8])
+}
+
+func pipelineRouteMetadata(task *PipelineTaskInput) map[string]any {
+	if task == nil {
+		return nil
+	}
+	metadata := map[string]any{
+		"pipeline_task": true,
+		"task_id":       strings.TrimSpace(task.TaskID),
+		"task_slug":     pipelineTaskContextString(task.Context, "task_slug"),
+		"task_name":     pipelineTaskContextString(task.Context, "task_name"),
+		"agent_type":    strings.TrimSpace(task.AgentType),
+	}
+	if dagID := strings.TrimSpace(task.DAGID); dagID != "" {
+		metadata["dag_id"] = dagID
+	}
+	if nodeID := strings.TrimSpace(task.NodeID); nodeID != "" {
+		metadata["node_id"] = nodeID
+	}
+	return metadata
+}
+
+func pipelineProtocolTargetAgentID(taskID, agentType string) string {
+	taskID = strings.TrimSpace(taskID)
+	agentType = strings.TrimSpace(normalizePipelineAgentType(agentType))
+	if taskID == "" {
+		return agentType
+	}
+	switch agentType {
+	case PipelineAgentInspector, PipelineAgentTester, PipelineAgentEngineer, PipelineAgentDesigner:
+		if workerAgentID := PipelineWorkerAgentID(taskID, agentType); workerAgentID != "" {
+			return workerAgentID
+		}
+		return agentType
+	default:
+		return agentType
+	}
+}
+
+func pipelineStageForAgents(agentTypes []string) string {
+	for _, agentType := range agentTypes {
+		switch normalizePipelineAgentType(agentType) {
+		case PipelineAgentInspector:
+			return "inspect"
+		case PipelineAgentTester:
+			return "test"
+		case PipelineAgentEngineer, PipelineAgentDesigner:
+			return "execute"
+		}
+	}
+	return "inspect"
+}
+
+func pipelineTaskContextString(ctx map[string]any, key string) string {
+	if ctx == nil {
+		return ""
+	}
+	value, _ := ctx[key].(string)
+	return strings.TrimSpace(value)
+}
+
+func clonePipelineTaskInput(task *PipelineTaskInput) *PipelineTaskInput {
+	if task == nil {
+		return nil
+	}
+	out := *task
+	if task.Context != nil {
+		out.Context = make(map[string]any, len(task.Context))
+		for key, value := range task.Context {
+			out.Context[key] = value
+		}
+	}
+	if task.ParentResults != nil {
+		out.ParentResults = make(map[string]any, len(task.ParentResults))
+		for key, value := range task.ParentResults {
+			out.ParentResults[key] = value
+		}
+	}
+	return &out
+}
+
+func cloneValidationRecord(record *PipelineValidationRecord) *PipelineValidationRecord {
+	if record == nil {
+		return nil
+	}
+	out := *record
+	out.ChallengeReferences = append([]string(nil), record.ChallengeReferences...)
+	out.EvidenceRefs = append([]string(nil), record.EvidenceRefs...)
+	out.MissingInputs = append([]string(nil), record.MissingInputs...)
+	out.RecommendedNextAgents = append([]string(nil), record.RecommendedNextAgents...)
+	return &out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func finalizePipelineValidationReady(snapshot *PipelineProtocolSnapshot) (*PipelineValidationRecord, bool) {
+	if snapshot == nil || snapshot.PendingValidation == nil {
+		return nil, false
+	}
+	record := snapshot.PendingValidation
+	if normalizePipelineAgentType(record.RequestingAgent) != PipelineAgentInspector {
+		return nil, false
+	}
+	if normalizePipelineAgentType(record.RespondingAgent) != PipelineAgentTester {
+		return nil, false
+	}
+	if strings.TrimSpace(record.Status) != string(PipelineValidationPassed) {
+		return nil, false
+	}
+	if !containsNormalizedString(record.ChallengeReferences, finalizePipelineVerificationReference) {
+		return nil, false
+	}
+	return cloneValidationRecord(record), true
+}
+
+func finalizePipelineChallengePending(snapshot *PipelineProtocolSnapshot) bool {
+	if snapshot == nil || snapshot.PendingChallenge == nil {
+		return false
+	}
+	challenge := snapshot.PendingChallenge
+	if normalizePipelineAgentType(challenge.RequestingAgent) != PipelineAgentInspector {
+		return false
+	}
+	if len(challenge.TargetAgents) != 1 || normalizePipelineAgentType(challenge.TargetAgents[0]) != PipelineAgentTester {
+		return false
+	}
+	return containsNormalizedString(challenge.References, finalizePipelineVerificationReference)
+}
+
+func containsNormalizedString(values []string, want string) bool {
+	want = strings.TrimSpace(want)
+	if want == "" {
+		return false
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == want {
+			return true
+		}
+	}
+	return false
+}
+
 func isPipelineValidationStatus(value string) bool {
 	switch strings.TrimSpace(value) {
 	case string(PipelineValidationPassed),
@@ -680,6 +1466,7 @@ func clonePipelineProtocolSnapshot(snapshot *PipelineProtocolSnapshot) *Pipeline
 	}
 	if snapshot.PendingValidation != nil {
 		record := *snapshot.PendingValidation
+		record.ChallengeReferences = append([]string(nil), snapshot.PendingValidation.ChallengeReferences...)
 		record.EvidenceRefs = append([]string(nil), snapshot.PendingValidation.EvidenceRefs...)
 		record.MissingInputs = append([]string(nil), snapshot.PendingValidation.MissingInputs...)
 		record.RecommendedNextAgents = append([]string(nil), snapshot.PendingValidation.RecommendedNextAgents...)
@@ -699,6 +1486,7 @@ func clonePipelineTurnAction(action *PipelineTurnAction) *PipelineTurnAction {
 	out.EvidenceRefs = append([]string(nil), action.EvidenceRefs...)
 	if action.Validation != nil {
 		record := *action.Validation
+		record.ChallengeReferences = append([]string(nil), action.Validation.ChallengeReferences...)
 		record.EvidenceRefs = append([]string(nil), action.Validation.EvidenceRefs...)
 		record.MissingInputs = append([]string(nil), action.Validation.MissingInputs...)
 		record.RecommendedNextAgents = append([]string(nil), action.Validation.RecommendedNextAgents...)

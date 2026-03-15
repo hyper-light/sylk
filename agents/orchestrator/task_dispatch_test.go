@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/adalundhe/sylk/agents/guide"
-	"github.com/adalundhe/sylk/core/pipeline/tdd"
+	coreevents "github.com/adalundhe/sylk/core/events"
 )
 
 func TestParseTaskDispatchMessageCanonicalizesPipelineContext(t *testing.T) {
@@ -67,12 +67,11 @@ func TestParseTaskDispatchMessageCanonicalizesPipelineContext(t *testing.T) {
 	}
 }
 
-func TestPublishTaskDispatchAgents_SkipsManagedPipelineDispatch(t *testing.T) {
+func TestPublishTaskDispatchAgents_BootstrapsInspectorFirstForPipelineDispatch(t *testing.T) {
 	pub := &trackingActivityPub{}
 	o := &Orchestrator{
 		config:                  Config{SessionID: "session-1"},
 		activityPub:             pub,
-		pipelineMgr:             &tdd.PipelineManager{},
 		pipelinePanelState:      make(map[string]pipelinePanelSnapshot),
 		pipelinePanelRegistered: make(map[string]struct{}),
 	}
@@ -85,8 +84,15 @@ func TestPublishTaskDispatchAgents_SkipsManagedPipelineDispatch(t *testing.T) {
 		pipelineStage:    string(StageExecute),
 	}, "executing")
 
-	if got := len(pub.collected()); got != 0 {
-		t.Fatalf("expected no published activity for managed pipeline dispatch, got %d events", got)
+	published := pub.collected()
+	if len(published) != len(PipelinePanelAgentTypes) {
+		t.Fatalf("expected %d pipeline panel events, got %d", len(PipelinePanelAgentTypes), len(published))
+	}
+	if published[0].AgentID != "task_1:inspector-pipeline" {
+		t.Fatalf("first event agent = %q, want inspector bootstrap", published[0].AgentID)
+	}
+	if published[0].EventType != coreevents.EventTypeAgentAction {
+		t.Fatalf("first event type = %q, want %q", published[0].EventType, coreevents.EventTypeAgentAction)
 	}
 }
 

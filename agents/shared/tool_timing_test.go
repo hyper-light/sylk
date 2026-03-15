@@ -2,10 +2,12 @@ package shared
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/skills"
 )
 
 func TestWithToolCallEmitter_RoundTrip(t *testing.T) {
@@ -98,6 +100,65 @@ func TestTimedToolCall_Error(t *testing.T) {
 	}
 	if complete.ErrorMsg == "" {
 		t.Error("expected non-empty error_msg")
+	}
+}
+
+func TestTimedToolCall_PipelineHandoffIsControlOutcome(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+
+	call := providers.ToolCall{ID: "4", Name: "handoff_next", Arguments: `{"target_agents":["tester"]}`}
+	result, err := TimedToolCall(ctx, "inspector-pipeline", call, func() (string, error) {
+		return `{"forwarded":true,"target_agent_id":"task_1-tester-pipeline"}`, nil
+	})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if result != `{"forwarded":true,"target_agent_id":"task_1-tester-pipeline"}` {
+		t.Fatalf("result = %q", result)
+	}
+
+	complete := events[1]
+	if !complete.Success {
+		t.Fatal("expected handoff result to be marked successful")
+	}
+	if complete.ErrorMsg != "" {
+		t.Fatalf("expected empty error_msg, got %q", complete.ErrorMsg)
+	}
+	if complete.Output != `{"forwarded":true,"target_agent_id":"task_1-tester-pipeline"}` {
+		t.Fatalf("output = %q", complete.Output)
+	}
+}
+
+func TestTimedToolCall_RerouteIsControlOutcome(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+
+	call := providers.ToolCall{ID: "5", Name: "reroute_request", Arguments: `{"suggested_target":"guide"}`}
+	_, err := TimedToolCall(ctx, "engineer", call, func() (string, error) {
+		return "", skills.ErrRerouteRequested
+	})
+
+	if !errors.Is(err, skills.ErrRerouteRequested) {
+		t.Fatalf("expected ErrRerouteRequested, got %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+
+	complete := events[1]
+	if !complete.Success {
+		t.Fatal("expected reroute control outcome to be marked successful")
+	}
+	if complete.ErrorMsg != "" {
+		t.Fatalf("expected empty error_msg, got %q", complete.ErrorMsg)
+	}
+	if complete.Output != `{"rerouted":true}` {
+		t.Fatalf("output = %q, want rerouted payload", complete.Output)
 	}
 }
 

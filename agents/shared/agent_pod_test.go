@@ -126,6 +126,29 @@ func managedPodTestRuntime() *container.DefaultRuntime {
 	})
 }
 
+func managedPodTestPolicy(podID string, members []string, podType containerpod.PodType) *containerpod.PodPolicy {
+	return &containerpod.PodPolicy{
+		PodID:       podID,
+		PodType:     podType,
+		MemberTypes: members,
+		IdleToWarm:  30 * time.Second,
+		IdleToCool:  5 * time.Minute,
+		IdleToCold:  30 * time.Minute,
+	}
+}
+
+func managedPodTestSpecs(members []string) []container.ContainerSpec {
+	specs := make([]container.ContainerSpec, len(members))
+	for i, member := range members {
+		specs[i] = container.ContainerSpec{
+			Name:      member,
+			AgentType: member,
+			Resources: container.ResourceSpec{GoroutineLimit: 2},
+		}
+	}
+	return specs
+}
+
 func (s *mockScribe) Start() error {
 	s.started.Store(true)
 	return nil
@@ -177,42 +200,164 @@ func TestAgentPod_HoldForNode_SingleAgent(t *testing.T) {
 	pod.Release()
 }
 
-func TestAgentPod_HoldForNode_LazilyPromotesManagedPod(t *testing.T) {
+func TestAgentPod_HoldForNode_LazilyPromotesRuntime(t *testing.T) {
 	rt := managedPodTestRuntime()
 	members := []string{"engineer"}
-	managed := containerpod.NewManagedPod(containerpod.ManagedPodConfig{
-		ID: "task-1",
+	reg := &podTrackingRegistrar{}
+	pod := NewAgentPod(AgentPodConfig{
+		PodID: "task-1",
 		Policy: &containerpod.PodPolicy{
 			PodID:       "task-1",
 			PodType:     containerpod.PodTypePipeline,
 			MemberTypes: members,
 		},
 		Runtime: rt,
-	})
-	managed.SetSpecs([]container.ContainerSpec{{
-		Name:      "engineer",
-		AgentType: "engineer",
-		Resources: container.ResourceSpec{GoroutineLimit: 2},
-	}})
-
-	reg := &podTrackingRegistrar{}
-	pod := NewAgentPod(AgentPodConfig{
-		PodID:     "task-1",
-		Managed:   managed,
+		Specs: []container.ContainerSpec{{
+			Name:      "engineer",
+			AgentType: "engineer",
+			Resources: container.ResourceSpec{GoroutineLimit: 2},
+		}},
 		Registrar: reg.register,
 	})
 
-	if managed.LoadTier() != containerpod.TierCold {
-		t.Fatalf("initial tier = %v, want cold", managed.LoadTier())
+	if pod.LoadTier() != containerpod.TierCold {
+		t.Fatalf("initial tier = %v, want cold", pod.LoadTier())
 	}
 	if err := pod.HoldForNode(context.Background(), "n1", []string{"engineer"}); err != nil {
 		t.Fatalf("HoldForNode: %v", err)
 	}
-	if managed.LoadTier() != containerpod.TierHot {
-		t.Fatalf("tier after HoldForNode = %v, want hot", managed.LoadTier())
+	if pod.LoadTier() != containerpod.TierHot {
+		t.Fatalf("tier after HoldForNode = %v, want hot", pod.LoadTier())
 	}
-	if managed.ContainerCount() != 1 {
-		t.Fatalf("container count = %d, want 1", managed.ContainerCount())
+	if pod.ContainerCount() != 1 {
+		t.Fatalf("container count = %d, want 1", pod.ContainerCount())
+	}
+}
+
+func TestAgentPod_PromoteFromCold(t *testing.T) {
+	rt := managedPodTestRuntime()
+	members := []string{"engineer", "designer"}
+	pod := NewAgentPod(AgentPodConfig{
+		PodID:   "test-pod",
+		Policy:  managedPodTestPolicy("test-pod", members, containerpod.PodTypePipeline),
+		Runtime: rt,
+		Specs:   managedPodTestSpecs(members),
+	})
+
+	if pod.LoadTier() != containerpod.TierCold {
+		t.Fatalf("expected TierCold, got %v", pod.LoadTier())
+	}
+	if err := pod.Promote(context.Background(), nil); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	if pod.LoadTier() != containerpod.TierHot {
+		t.Fatalf("expected TierHot after promote, got %v", pod.LoadTier())
+	}
+	if pod.ContainerCount() != 2 {
+		t.Fatalf("expected 2 containers, got %d", pod.ContainerCount())
+	}
+	if pod.ContainerFor("engineer") == nil {
+		t.Fatal("expected engineer container")
+	}
+	if pod.ContainerFor("designer") == nil {
+		t.Fatal("expected designer container")
+	}
+	snap := pod.Metrics().Snapshot()
+	if snap.ColdStarts != 1 {
+		t.Fatalf("cold starts = %d, want 1", snap.ColdStarts)
+	}
+	if snap.PromotionsTotal != 1 {
+		t.Fatalf("promotions = %d, want 1", snap.PromotionsTotal)
+	}
+}
+
+func TestAgentPod_ConcurrentPromote_CoalescesColdStart(t *testing.T) {
+	var created atomic.Int32
+	budget := concurrency.NewGoroutineBudget(new(atomic.Int32))
+	reg := container.NewContainerRegistry()
+	rt := container.NewDefaultRuntime(container.DefaultRuntimeConfig{
+		Budget:   budget,
+		Registry: reg,
+		CreateAgent: func(_ context.Context, agentType string) (container.ContainerAgent, error) {
+			created.Add(1)
+			time.Sleep(10 * time.Millisecond)
+			return &managedPodTestAgent{id: agentType + "-1", agentType: agentType}, nil
+		},
+	})
+
+	members := []string{"engineer", "designer", "inspector-pipeline", "tester-pipeline"}
+	pod := NewAgentPod(AgentPodConfig{
+		PodID:   "coalesce-test",
+		Policy:  managedPodTestPolicy("coalesce-test", members, containerpod.PodTypePipeline),
+		Runtime: rt,
+		Specs:   managedPodTestSpecs(members),
+	})
+
+	start := make(chan struct{})
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errCh <- pod.Promote(context.Background(), nil)
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("Promote: %v", err)
+		}
+	}
+
+	if got := created.Load(); got != int32(len(members)) {
+		t.Fatalf("created agents = %d, want %d", got, len(members))
+	}
+	if pod.LoadTier() != containerpod.TierHot {
+		t.Fatalf("expected TierHot, got %v", pod.LoadTier())
+	}
+	if pod.ContainerCount() != len(members) {
+		t.Fatalf("expected %d containers, got %d", len(members), pod.ContainerCount())
+	}
+	snap := pod.Metrics().Snapshot()
+	if snap.ColdStarts != 1 {
+		t.Fatalf("cold starts = %d, want 1", snap.ColdStarts)
+	}
+	if snap.HotHits != 1 {
+		t.Fatalf("hot hits = %d, want 1", snap.HotHits)
+	}
+}
+
+func TestAgentPod_DemoteHotToCold(t *testing.T) {
+	rt := managedPodTestRuntime()
+	members := []string{"engineer"}
+	pod := NewAgentPod(AgentPodConfig{
+		PodID:   "full-demo",
+		Policy:  managedPodTestPolicy("full-demo", members, containerpod.PodTypePipeline),
+		Runtime: rt,
+		Specs:   managedPodTestSpecs(members),
+	})
+
+	if err := pod.Promote(context.Background(), nil); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	if err := pod.Demote(context.Background(), containerpod.TierCold); err != nil {
+		t.Fatalf("Demote: %v", err)
+	}
+	if pod.LoadTier() != containerpod.TierCold {
+		t.Fatalf("expected TierCold, got %v", pod.LoadTier())
+	}
+	if pod.ContainerCount() != 0 {
+		t.Fatalf("expected 0 containers after demotion, got %d", pod.ContainerCount())
+	}
+	snap := pod.Metrics().Snapshot()
+	if snap.DemotionsToWarm != 1 || snap.DemotionsToCool != 1 || snap.DemotionsToCold != 1 {
+		t.Fatalf("unexpected demotion metrics: %+v", snap)
 	}
 }
 

@@ -78,17 +78,10 @@ func (e *Executor) Execute(ctx context.Context, dag *DAG, dispatcher NodeDispatc
 
 	result := e.executeLayers()
 	e.emitCompletionEvent(dag, result)
-	return result, executionError(result)
-}
-
-func executionError(result *DAGResult) error {
-	if result == nil {
-		return nil
-	}
-	if result.Error == nil {
-		return nil
-	}
-	return result.Error
+	// Terminal DAG outcomes are represented in result.State/result.Error.
+	// The returned error is reserved for setup faults where no valid result
+	// could be produced.
+	return result, nil
 }
 
 func (e *Executor) validateExecution(dag *DAG) error {
@@ -531,6 +524,20 @@ func (e *Executor) resolveNodeRetries(node *Node) int {
 }
 
 func (e *Executor) handleDispatchResult(result *NodeResult, err error) (bool, error) {
+	if result != nil && result.State == NodeStateCancelled {
+		e.cancelled.Store(true)
+		if e.cancel != nil {
+			e.cancel()
+		}
+		return true, nil
+	}
+	if errors.Is(err, ErrDAGCancelled) {
+		e.cancelled.Store(true)
+		if e.cancel != nil {
+			e.cancel()
+		}
+		return true, nil
+	}
 	if isDispatchSuccess(result, err) {
 		return true, nil
 	}
@@ -702,15 +709,26 @@ func (e *Executor) recordNodeResult(node *Node, result *NodeResult) {
 }
 
 func (e *Executor) emitNodeResultEvent(node *Node, result *NodeResult) {
+	data := map[string]any{
+		"duration": result.Duration,
+	}
+	if errText := nodeResultErrorText(result); errText != "" {
+		data["error"] = errText
+	}
 	e.emitEvent(&Event{
 		Type:      nodeResultEventType(result.State),
 		DAGID:     e.dag.ID(),
 		NodeID:    node.ID(),
 		Timestamp: time.Now(),
-		Data: map[string]any{
-			"duration": result.Duration,
-		},
+		Data:      data,
 	})
+}
+
+func nodeResultErrorText(result *NodeResult) string {
+	if result == nil || result.Error == nil {
+		return ""
+	}
+	return result.Error.Error()
 }
 
 var nodeStateToEventType = map[NodeState]EventType{

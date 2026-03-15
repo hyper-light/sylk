@@ -2,20 +2,17 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
-	inspectorpipeline "github.com/adalundhe/sylk/agents/inspector/pipeline"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/pipeline/taskstate"
-	"github.com/adalundhe/sylk/core/pipeline/tdd"
 )
 
-const managedPipelinePollInterval = 15 * time.Second
-
-func managedPipelineEligible(dispatch *taskDispatchContext) bool {
+func pipelineProtocolEligible(dispatch *taskDispatchContext) bool {
 	if dispatch == nil {
 		return false
 	}
@@ -32,328 +29,228 @@ func managedPipelineEligible(dispatch *taskDispatchContext) bool {
 	}
 }
 
-func (o *Orchestrator) routeManagedPipelineDispatch(dispatch *taskDispatchContext, done <-chan struct{}) error {
-	o.mu.RLock()
-	manager := o.pipelineMgr
-	o.mu.RUnlock()
-	if manager == nil {
-		return fmt.Errorf("pipeline manager not configured")
+func protocolPipelineTaskEligible(task *PipelineTask) bool {
+	if task == nil {
+		return false
 	}
-	if o.scope == nil {
-		return fmt.Errorf("orchestrator scope not configured")
+	switch strings.TrimSpace(task.AgentType) {
+	case "engineer", "designer":
+	default:
+		return false
 	}
-
-	return o.scope.Go("route-managed-"+dispatch.nodeID, 0, func(routeCtx context.Context) error {
-		cfg, err := o.buildManagedPipelineConfig(dispatch)
-		if err != nil {
-			o.publishManagedPipelineFailure(dispatch, err)
-			return nil
-		}
-
-		pipelineID, err := manager.Create(routeCtx, cfg)
-		if err != nil {
-			o.publishManagedPipelineFailure(dispatch, fmt.Errorf("create pipeline: %w", err))
-			return nil
-		}
-		defer manager.Release(pipelineID)
-		if err := manager.Start(routeCtx, pipelineID); err != nil {
-			o.publishManagedPipelineFailure(dispatch, fmt.Errorf("start pipeline: %w", err))
-			return nil
-		}
-		for _, agentType := range PipelinePanelAgentTypes {
-			o.publishPipelineAgentRegistration(agentType, dispatch.pipelineTaskID, dispatch.pipelineTaskSlug, "")
-		}
-
-		ticker := time.NewTicker(managedPipelinePollInterval)
-		defer ticker.Stop()
-
-		for {
-			result, err := manager.GetResult(pipelineID)
-			if err != nil {
-				o.publishManagedPipelineFailure(dispatch, fmt.Errorf("query pipeline result: %w", err))
-				return nil
-			}
-			if result != nil && tdd.IsTerminalStatus(result.Status) {
-				if update := managedPipelineUpdateFromResult(dispatch, result); update != nil {
-					publishPipelineUpdateMessage(o.bus, o.config.AgentID, update)
-				}
-				return nil
-			}
-
-			select {
-			case <-routeCtx.Done():
-				_ = manager.Cancel(context.Background(), pipelineID)
-				return nil
-			case <-done:
-				_ = manager.Cancel(context.Background(), pipelineID)
-				return nil
-			case <-ticker.C:
-				o.recordDispatchActivity(dispatch.dagID, dispatch.nodeID)
-			}
-		}
-	})
+	expectedTarget := pipelineWorkerTargetAgentID(task.TaskID, task.AgentType)
+	if strings.TrimSpace(task.TargetAgentID) != expectedTarget {
+		return false
+	}
+	switch strings.TrimSpace(taskContextString(task.Context, "pipeline_stage")) {
+	case "", string(StageExecute):
+		return true
+	default:
+		return false
+	}
 }
 
-func (o *Orchestrator) buildManagedPipelineConfig(dispatch *taskDispatchContext) (tdd.PipelineConfig, error) {
-	task := dispatch.pipelineTask(o.config.SessionID)
-	decodedTask := &agentshared.PipelineTaskInput{
-		NodeID:        task.NodeID,
-		DAGID:         task.DAGID,
-		TaskID:        task.TaskID,
-		AgentType:     task.AgentType,
-		TargetAgentID: task.TargetAgentID,
-		Prompt:        task.Prompt,
-		Context:       task.Context,
-		ParentResults: task.ParentResults,
-		SessionID:     task.SessionID,
+func (r *TaskRouter) routeProtocolPipelineTask(task *PipelineTask, _ <-chan struct{}) error {
+	if r == nil {
+		return fmt.Errorf("task router is not configured")
+	}
+	if r.bus == nil {
+		return fmt.Errorf("task router bus is not configured")
+	}
+	if task == nil {
+		return fmt.Errorf("pipeline task is required")
 	}
 
-	workerType, ok := managedWorkerType(dispatch.agentType)
-	if !ok {
-		return tdd.PipelineConfig{}, fmt.Errorf("unsupported managed worker type %q", dispatch.agentType)
+	initialTask, err := buildInitialProtocolPipelineTask(task)
+	if err != nil {
+		publishProtocolPipelineFailure(r.bus, r.agentID, task, err)
+		return nil
+	}
+	payload, err := json.Marshal(initialTask)
+	if err != nil {
+		publishProtocolPipelineFailure(r.bus, r.agentID, task, fmt.Errorf("encode protocol pipeline task: %w", err))
+		return nil
 	}
 
-	var (
-		svfs       = o.GetSessionVFS(task.SessionID)
-		workingDir string
-	)
-	if svfs != nil {
-		workingDir = svfs.WorkingDir()
+	req := &guide.RouteRequest{
+		CorrelationID:   "pipe_" + generateMessageID(),
+		Input:           string(payload),
+		TargetAgentID:   strings.TrimSpace(initialTask.TargetAgentID),
+		ExplicitTarget:  true,
+		SourceAgentID:   r.agentID,
+		SourceAgentName: "orchestrator",
+		SessionID:       strings.TrimSpace(initialTask.SessionID),
+		Timestamp:       time.Now().UTC(),
+		Metadata:        protocolPipelineRouteMetadata(initialTask),
+	}
+	msg := guide.NewRequestMessage(generateMessageID(), req)
+	msg.Metadata = map[string]any{
+		"pipeline_task": true,
+		"dag_id":        task.DAGID,
+		"node_id":       task.NodeID,
+		"task_id":       task.TaskID,
+	}
+	if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+		publishProtocolPipelineFailure(r.bus, r.agentID, task, fmt.Errorf("publish protocol pipeline request: %w", err))
+		return nil
 	}
 
-	return tdd.PipelineConfig{
-		TaskID:          dispatch.pipelineTaskID,
-		TaskSlug:        dispatch.pipelineTaskSlug,
-		SessionID:       task.SessionID,
-		DAGID:           dispatch.dagID,
-		DAGNodeID:       dispatch.nodeID,
-		WorkerType:      workerType,
-		InitialCriteria: inspectorpipeline.CompileCriteriaFromTask(decodedTask),
-		TaskPrompt:      task.Prompt,
-		CoWorkerTypes:   managedCoWorkerTypes(dispatch.coAgents),
-		AgentPrompts:    managedAgentPrompts(dispatch.nodeCtx),
-		SessionVFS:      svfs,
-		WorkingDir:      workingDir,
-		Files:           extractAffectedFiles(dispatch.nodeCtx),
+	publishPipelineUpdateMessage(r.bus, r.agentID, &PipelineUpdate{
+		DAGID:     task.DAGID,
+		NodeID:    task.NodeID,
+		TaskID:    task.TaskID,
+		AgentID:   strings.TrimSpace(initialTask.TargetAgentID),
+		AgentType: agentshared.PipelineAgentInspector,
+		Status:    "running",
+		Stage:     string(StageInspect),
+		Progress:  0.15,
+		Message:   initialProtocolPipelineRequest,
+		Attempt:   0,
+		Timestamp: time.Now().UTC(),
+	})
+	if r.onNodeActivity != nil {
+		r.onNodeActivity(task.DAGID, task.NodeID)
+	}
+	return nil
+}
+
+const initialProtocolPipelineRequest = "Inspect the task, define or refine the criteria, and decide who should act next."
+
+func buildInitialProtocolPipelineTask(task *PipelineTask) (*agentshared.PipelineTaskInput, error) {
+	if task == nil {
+		return nil, fmt.Errorf("pipeline task is required")
+	}
+	workerType := strings.TrimSpace(task.AgentType)
+	switch workerType {
+	case agentshared.PipelineAgentEngineer, agentshared.PipelineAgentDesigner:
+	default:
+		return nil, fmt.Errorf("unsupported pipeline worker type %q", task.AgentType)
+	}
+
+	ctx := clonePipelineTaskContext(task.Context)
+	if ctx == nil {
+		ctx = map[string]any{}
+	}
+	ctx["agent_type"] = workerType
+	ctx["pipeline_stage"] = string(StageInspect)
+	ctx["pipeline_protocol"] = agentshared.PipelineProtocolSnapshotMap(initialProtocolSnapshot(task))
+
+	return &agentshared.PipelineTaskInput{
+		NodeID:        strings.TrimSpace(task.NodeID),
+		DAGID:         strings.TrimSpace(task.DAGID),
+		TaskID:        strings.TrimSpace(task.TaskID),
+		AgentType:     agentshared.PipelineAgentInspector,
+		TargetAgentID: pipelineWorkerTargetAgentID(task.TaskID, agentshared.PipelineAgentInspector),
+		Prompt:        strings.TrimSpace(task.Prompt),
+		Context:       ctx,
+		ParentResults: clonePipelineParentResults(task.ParentResults),
+		SessionID:     strings.TrimSpace(task.SessionID),
 	}, nil
 }
 
-func managedWorkerType(agentType string) (tdd.WorkerType, bool) {
-	switch strings.TrimSpace(agentType) {
-	case "engineer":
-		return tdd.WorkerEngineer, true
-	case "designer":
-		return tdd.WorkerDesigner, true
-	default:
-		return "", false
+func initialProtocolSnapshot(task *PipelineTask) *agentshared.PipelineProtocolSnapshot {
+	return &agentshared.PipelineProtocolSnapshot{
+		Roster:         initialProtocolRoster(task),
+		ActiveAgents:   []string{agentshared.PipelineAgentInspector},
+		RequestedBy:    agentshared.PipelineAgentInspector,
+		Mode:           string(agentshared.PipelineTurnModeSingle),
+		CurrentRequest: initialProtocolPipelineRequest,
 	}
 }
 
-func managedCoWorkerTypes(agentTypes []string) []tdd.WorkerType {
-	result := make([]tdd.WorkerType, 0, len(agentTypes))
-	seen := make(map[tdd.WorkerType]struct{}, len(agentTypes))
-	for _, agentType := range agentTypes {
-		wt, ok := managedWorkerType(agentType)
-		if !ok {
-			continue
-		}
-		if _, exists := seen[wt]; exists {
-			continue
-		}
-		seen[wt] = struct{}{}
-		result = append(result, wt)
+func initialProtocolRoster(task *PipelineTask) []agentshared.PipelineProtocolAgent {
+	roster := []agentshared.PipelineProtocolAgent{
+		{AgentType: agentshared.PipelineAgentInspector, Role: "entrypoint and final acceptance"},
+		{AgentType: agentshared.PipelineAgentTester, Role: "test authoring and execution"},
 	}
-	return result
+	seen := map[string]struct{}{
+		agentshared.PipelineAgentInspector: {},
+		agentshared.PipelineAgentTester:    {},
+	}
+
+	appendAgent := func(agentType, role string) {
+		agentType = strings.TrimSpace(agentType)
+		if agentType == "" {
+			return
+		}
+		if _, ok := seen[agentType]; ok {
+			return
+		}
+		seen[agentType] = struct{}{}
+		roster = append(roster, agentshared.PipelineProtocolAgent{
+			AgentType: agentType,
+			Role:      role,
+		})
+	}
+
+	appendAgent(strings.TrimSpace(task.AgentType), "implementation")
+	for _, agentType := range decodeDispatchAgentTypes(task.Context["co_agents"]) {
+		appendAgent(agentType, "execute cohort peer")
+	}
+	return roster
 }
 
-func managedAgentPrompts(ctx map[string]any) map[tdd.WorkerType]string {
-	if ctx == nil {
+func protocolPipelineRouteMetadata(task *agentshared.PipelineTaskInput) map[string]any {
+	if task == nil {
 		return nil
 	}
-	raw, ok := ctx["agent_prompts"]
-	if !ok || raw == nil {
-		return nil
+	metadata := map[string]any{
+		"pipeline_task": true,
+		"task_id":       strings.TrimSpace(task.TaskID),
+		"task_slug":     taskContextString(task.Context, "task_slug"),
+		"task_name":     taskContextString(task.Context, "task_name"),
+		"agent_type":    strings.TrimSpace(task.AgentType),
 	}
-	result := map[tdd.WorkerType]string{}
-	switch typed := raw.(type) {
-	case map[string]string:
-		for agentType, prompt := range typed {
-			wt, ok := managedWorkerType(agentType)
-			if !ok || strings.TrimSpace(prompt) == "" {
-				continue
-			}
-			result[wt] = strings.TrimSpace(prompt)
-		}
-	case map[string]any:
-		for agentType, value := range typed {
-			prompt, _ := value.(string)
-			wt, ok := managedWorkerType(agentType)
-			if !ok || strings.TrimSpace(prompt) == "" {
-				continue
-			}
-			result[wt] = strings.TrimSpace(prompt)
-		}
+	if dagID := strings.TrimSpace(task.DAGID); dagID != "" {
+		metadata["dag_id"] = dagID
 	}
-	if len(result) == 0 {
-		return nil
+	if nodeID := strings.TrimSpace(task.NodeID); nodeID != "" {
+		metadata["node_id"] = nodeID
 	}
-	return result
+	if ackTopic := taskContextString(task.Context, "ack_topic"); ackTopic != "" {
+		metadata["ack_topic"] = ackTopic
+	}
+	return metadata
 }
 
-func (o *Orchestrator) handleManagedPipelineEvent(evt tdd.PipelineEvent) {
-	if o == nil || strings.TrimSpace(evt.DAGNodeID) == "" || tdd.IsTerminalStatus(evt.NewStatus) {
+func clonePipelineTaskContext(ctx map[string]any) map[string]any {
+	if len(ctx) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(ctx))
+	for key, value := range ctx {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func clonePipelineParentResults(results map[string]any) map[string]any {
+	if len(results) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(results))
+	for key, value := range results {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func publishProtocolPipelineFailure(bus guide.EventBus, sourceAgentID string, task *PipelineTask, err error) {
+	if task == nil || err == nil {
 		return
 	}
-	update := managedPipelineUpdateFromEvent(evt)
-	if update == nil {
-		return
-	}
-	publishPipelineUpdateMessage(o.bus, o.config.AgentID, update)
-	o.recordDispatchActivity(update.DAGID, update.NodeID)
-}
-
-func managedPipelineUpdateFromResult(dispatch *taskDispatchContext, result *tdd.PipelineResult) *PipelineUpdate {
-	if dispatch == nil || result == nil {
-		return nil
-	}
-
-	stage, progress, message := managedPipelineProgressForStatus(result.Status, result.Error)
-	status := "running"
-	errorText := ""
-	output := any(nil)
-
-	switch result.Status {
-	case tdd.StatusCompleted:
-		status = "succeeded"
-		progress = 1
-		output = managedPipelineOutput(result)
-	case tdd.StatusFailed:
-		status = "failed"
-		progress = 1
-		errorText = strings.TrimSpace(result.Error)
-		message = firstNonEmpty(message, errorText, "pipeline failed")
-	case tdd.StatusCancelled:
-		status = "cancelled"
-		progress = 1
-		message = firstNonEmpty(message, "pipeline cancelled")
-	}
-
-	return &PipelineUpdate{
-		DAGID:     dispatch.dagID,
-		NodeID:    dispatch.nodeID,
-		TaskID:    dispatch.pipelineTaskID,
-		AgentID:   pipelineWorkerTargetAgentID(dispatch.pipelineTaskID, dispatch.agentType),
-		AgentType: dispatch.agentType,
-		Status:    status,
-		Stage:     stage,
-		Progress:  progress,
-		Message:   message,
-		Output:    output,
-		Error:     errorText,
-		Attempt:   result.LoopCount,
-		Timestamp: time.Now(),
-	}
-}
-
-func managedPipelineUpdateFromEvent(evt tdd.PipelineEvent) *PipelineUpdate {
-	stage, progress, message := managedPipelineProgressForEvent(evt)
-	if strings.TrimSpace(stage) == "" {
-		return nil
-	}
-	return &PipelineUpdate{
-		DAGID:     evt.DAGID,
-		NodeID:    evt.DAGNodeID,
-		TaskID:    evt.TaskID,
-		AgentID:   pipelineWorkerTargetAgentID(evt.TaskID, string(evt.WorkerType)),
-		AgentType: string(evt.WorkerType),
-		Status:    "running",
-		Stage:     stage,
-		Progress:  progress,
-		Message:   firstNonEmpty(strings.TrimSpace(evt.Message), message),
-		Attempt:   evt.LoopCount,
-		Timestamp: evt.Timestamp,
-	}
-}
-
-func managedPipelineProgressForStatus(status tdd.PipelineStatus, errorText string) (string, float64, string) {
-	switch status {
-	case tdd.StatusPending:
-		return "", 0, "pipeline queued"
-	case tdd.StatusActive:
-		return "", 0, ""
-	case tdd.StatusCompleted:
-		return string(StageExecute), 1, "pipeline completed"
-	case tdd.StatusFailed:
-		return string(StageExecute), 1, firstNonEmpty(strings.TrimSpace(errorText), "pipeline failed")
-	case tdd.StatusCancelled:
-		return string(StageExecute), 1, "pipeline cancelled"
-	default:
-		return "", 0, ""
-	}
-}
-
-func managedPipelineProgressForEvent(evt tdd.PipelineEvent) (string, float64, string) {
-	switch strings.TrimSpace(evt.Stage) {
-	case string(StageInspect):
-		return string(StageInspect), 0.15, "inspecting current state"
-	case string(StageTest):
-		return string(StageTest), 0.4, "testing current state"
-	case string(StageExecute):
-		return string(StageExecute), 0.7, "executing implementation"
-	default:
-		return "", 0, ""
-	}
-}
-
-func managedPipelineOutput(result *tdd.PipelineResult) map[string]any {
-	output := map[string]any{
-		"loop_count": result.LoopCount,
-	}
-	if result.WorkerOutput != nil && result.WorkerOutput.TaskResult != nil {
-		output["worker_output"] = result.WorkerOutput.TaskResult.Output
-		output["files_changed"] = append([]string(nil), result.WorkerOutput.ChangedFiles...)
-	}
-	if result.InspectorResult != nil {
-		output["inspector_passed"] = result.InspectorResult.Passed
-		output["inspector_issues"] = len(result.InspectorResult.Issues)
-	}
-	if result.TesterResult != nil {
-		output["tester_passed"] = result.TesterResult.Success
-	}
-	if len(result.CoWorkerOutputs) > 0 {
-		coWorkerOutputs := make([]map[string]any, 0, len(result.CoWorkerOutputs))
-		for _, co := range result.CoWorkerOutputs {
-			if co == nil || co.TaskResult == nil {
-				continue
-			}
-			coWorkerOutputs = append(coWorkerOutputs, map[string]any{
-				"worker_type":   string(co.WorkerType),
-				"output":        co.TaskResult.Output,
-				"files_changed": append([]string(nil), co.ChangedFiles...),
-			})
-		}
-		if len(coWorkerOutputs) > 0 {
-			output["co_worker_outputs"] = coWorkerOutputs
-		}
-	}
-	return output
-}
-
-func (o *Orchestrator) publishManagedPipelineFailure(dispatch *taskDispatchContext, err error) {
-	if dispatch == nil || err == nil {
-		return
-	}
-	publishPipelineUpdateMessage(o.bus, o.config.AgentID, &PipelineUpdate{
-		DAGID:     dispatch.dagID,
-		NodeID:    dispatch.nodeID,
-		TaskID:    dispatch.pipelineTaskID,
-		AgentID:   pipelineWorkerTargetAgentID(dispatch.pipelineTaskID, dispatch.agentType),
-		AgentType: dispatch.agentType,
+	publishPipelineUpdateMessage(bus, sourceAgentID, &PipelineUpdate{
+		DAGID:     task.DAGID,
+		NodeID:    task.NodeID,
+		TaskID:    task.TaskID,
+		AgentID:   pipelineWorkerTargetAgentID(task.TaskID, agentshared.PipelineAgentInspector),
+		AgentType: agentshared.PipelineAgentInspector,
 		Status:    "failed",
+		Stage:     string(StageInspect),
 		Progress:  1,
 		Message:   err.Error(),
 		Error:     err.Error(),
-		Timestamp: time.Now(),
+		Timestamp: time.Now().UTC(),
 	})
 }
 
@@ -366,7 +263,7 @@ func publishPipelineUpdateMessage(bus guide.EventBus, sourceAgentID string, upda
 		Type:          guide.MessageTypePipelineUpdate,
 		SourceAgentID: sourceAgentID,
 		Payload:       update,
-		Timestamp:     time.Now(),
+		Timestamp:     time.Now().UTC(),
 	}
 	_ = bus.Publish("pipeline.update."+update.AgentType, msg)
 }
@@ -401,7 +298,7 @@ func pipelineTaskStateForUpdate(status, stage string) taskstate.Status {
 }
 
 func (o *Orchestrator) finalizePipelineUpdate(update *PipelineUpdate) {
-	if update == nil || strings.TrimSpace(update.TaskID) == "" || !isImplementationPipelineWorker(update.AgentType) {
+	if update == nil || strings.TrimSpace(update.TaskID) == "" || !isPipelineCommitAgent(update.AgentType) {
 		return
 	}
 
@@ -427,9 +324,9 @@ func (o *Orchestrator) finalizePipelineUpdate(update *PipelineUpdate) {
 	}
 }
 
-func isImplementationPipelineWorker(agentType string) bool {
+func isPipelineCommitAgent(agentType string) bool {
 	switch strings.TrimSpace(agentType) {
-	case "engineer", "designer":
+	case "engineer", "designer", agentshared.PipelineAgentInspector:
 		return true
 	default:
 		return false

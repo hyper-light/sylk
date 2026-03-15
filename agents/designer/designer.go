@@ -472,13 +472,24 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	defer d.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
 
 	emitter := shared.NewToolCallEmitter(d.bus, d.channels, d.id, fwd.CorrelationID, fwd.SourceAgentID)
+	metaString := func(key string) string {
+		if fwd.Metadata == nil {
+			return ""
+		}
+		value, _ := fwd.Metadata[key].(string)
+		return strings.TrimSpace(value)
+	}
 	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = shared.WithStreamContextMetadata(ctx, map[string]any{
-		"agent_type":  "designer",
-		"agent_name":  "Designer",
-		"pipeline_id": d.pipelineID,
-		"task_id":     d.pipelineID,
-		"task_slug":   d.pipelineSlug,
+		"pipeline_task": true,
+		"agent_type":    "designer",
+		"agent_name":    "Designer",
+		"pipeline_id":   d.pipelineID,
+		"task_id":       d.pipelineID,
+		"task_slug":     d.pipelineSlug,
+		"task_name":     metaString("task_name"),
+		"dag_id":        metaString("dag_id"),
+		"node_id":       metaString("node_id"),
 	})
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
@@ -542,7 +553,11 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		return d.bus.Publish(d.channels.Errors, errMsg)
 	}
 
-	resp.Data = result
+	respData := result
+	if shared.DecodePipelineTaskInput(fwd.Input) != nil {
+		respData = shared.BuildPipelineTurnResponse(ctx, result)
+	}
+	resp.Data = respData
 	shared.PublishStreamComplete(d.bus, d.channels, ctx, d.id, "", usageAcc.Total())
 	d.publishActivity(events.EventTypeAgentAction, "Design task completed")
 
@@ -617,6 +632,7 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 
 	userMessage := fwd.Input
 	task := shared.DecodePipelineTaskInput(fwd.Input)
+	ctx = shared.WithPipelineTaskProtocolState(ctx, task)
 	contract := (*shared.TaskExecutionContract)(nil)
 	if task != nil {
 		contract = shared.BuildTaskExecutionContract(task)
@@ -663,6 +679,9 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 		return d.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {
+		if task != nil {
+			shared.PublishPipelineTaskTerminalErrorUpdate(d.bus, d.id, task, err, shared.PipelineTaskAttempt(task))
+		}
 		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",

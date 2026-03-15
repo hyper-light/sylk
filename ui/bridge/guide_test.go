@@ -194,6 +194,65 @@ func TestToGuideMsg_HumanizesPendingPayload(t *testing.T) {
 	}
 }
 
+func TestToGuideMsg_HumanizesTesterStagePayload(t *testing.T) {
+	resp := &guide.RouteResponse{
+		CorrelationID:       "corr-tester-stage",
+		RespondingAgentID:   "tester-pipeline",
+		RespondingAgentName: "Pipeline Tester",
+		Success:             true,
+		Data: map[string]any{
+			"CreatedFiles": []any{"tests/test_cli.py"},
+			"SuiteResult": map[string]any{
+				"total_tests": 1,
+				"passed":      0,
+				"failed":      1,
+				"skipped":     0,
+				"errors":      0,
+			},
+		},
+	}
+
+	msg := toGuideMsg(resp)
+	if !strings.Contains(msg.Content, "Created test artifacts: tests/test_cli.py.") {
+		t.Fatalf("expected created files summary, got %q", msg.Content)
+	}
+	if !strings.Contains(msg.Content, "Latest test run: 0 passed, 1 failed, 0 skipped, 0 errors out of 1.") {
+		t.Fatalf("expected suite summary, got %q", msg.Content)
+	}
+}
+
+func TestToGuideMsg_HumanizesInspectorStagePayload(t *testing.T) {
+	resp := &guide.RouteResponse{
+		CorrelationID:       "corr-inspector-stage",
+		RespondingAgentID:   "inspector-pipeline",
+		RespondingAgentName: "Pipeline Inspector",
+		Success:             true,
+		Data: map[string]any{
+			"Criteria": map[string]any{
+				"success_criteria": []any{
+					map[string]any{"id": "SC-01"},
+					map[string]any{"id": "SC-02"},
+				},
+				"quality_gates": []any{
+					map[string]any{"name": "coverage"},
+				},
+				"constraints": []any{
+					map[string]any{"type": "dependency"},
+					map[string]any{"type": "architecture"},
+				},
+			},
+		},
+	}
+
+	msg := toGuideMsg(resp)
+	if strings.Contains(msg.Content, "\"success_criteria\"") || strings.Contains(msg.Content, "\"quality_gates\"") {
+		t.Fatalf("expected humanized inspector payload, got raw JSON %q", msg.Content)
+	}
+	if !strings.Contains(msg.Content, "Defined criteria contract: 2 success criteria, 1 quality gates, 2 constraints.") {
+		t.Fatalf("expected criteria summary, got %q", msg.Content)
+	}
+}
+
 func TestGuideBridgeDispatchStream_CompleteEmitsChunkFromStructuredPayload(t *testing.T) {
 	b := NewGuideBridge(nil, nil, "session-1")
 	program := &recordingProgram{}
@@ -232,6 +291,97 @@ func TestGuideBridgeDispatchStream_CompleteEmitsChunkFromStructuredPayload(t *te
 	}
 	if !strings.Contains(complete.AuthoritativeText, "I drafted a concrete plan for oauth.") {
 		t.Fatalf("expected authoritative text with plan summary, got %q", complete.AuthoritativeText)
+	}
+}
+
+func TestGuideBridgeDispatchStream_CompleteHumanizesPipelineTesterEnvelope(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatchStream(&guide.StreamResponse{
+		CorrelationID:     "corr-tester-stream",
+		RespondingAgentID: "tester-pipeline",
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventComplete,
+			Data: map[string]any{
+				"result": map[string]any{
+					"created_files": []any{"tests/test_cli.py"},
+					"suite_result": map[string]any{
+						"total_tests": 1,
+						"passed":      0,
+						"failed":      1,
+						"skipped":     0,
+						"errors":      0,
+					},
+				},
+				"action": map[string]any{
+					"type": "validate",
+				},
+			},
+		},
+	}, program)
+
+	if len(program.messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(program.messages))
+	}
+	complete, ok := program.messages[0].(uimsg.StreamCompleteMsg)
+	if !ok {
+		t.Fatalf("expected StreamCompleteMsg, got %T", program.messages[0])
+	}
+	if strings.Contains(complete.AuthoritativeText, "\"created_files\"") || strings.Contains(complete.AuthoritativeText, "\"suite_result\"") {
+		t.Fatalf("expected humanized tester payload, got raw JSON %q", complete.AuthoritativeText)
+	}
+	if !strings.Contains(complete.AuthoritativeText, "Created test artifacts: tests/test_cli.py.") {
+		t.Fatalf("expected created files summary, got %q", complete.AuthoritativeText)
+	}
+}
+
+func TestGuideBridgeDispatchStream_CompleteHumanizesPipelineInspectorEnvelope(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatchStream(&guide.StreamResponse{
+		CorrelationID:     "corr-inspector-stream",
+		RespondingAgentID: "inspector-pipeline",
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventComplete,
+			Data: map[string]any{
+				"result": map[string]any{
+					"Criteria": map[string]any{
+						"success_criteria": []any{
+							map[string]any{"id": "SC-01"},
+							map[string]any{"id": "SC-02"},
+							map[string]any{"id": "SC-03"},
+						},
+						"quality_gates": []any{
+							map[string]any{"name": "blocking_issues"},
+							map[string]any{"name": "coverage"},
+						},
+						"constraints": []any{
+							map[string]any{"type": "dependency"},
+						},
+					},
+					"Result": nil,
+				},
+				"action": map[string]any{
+					"type": "handoff",
+				},
+			},
+		},
+	}, program)
+
+	if len(program.messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(program.messages))
+	}
+	complete, ok := program.messages[0].(uimsg.StreamCompleteMsg)
+	if !ok {
+		t.Fatalf("expected StreamCompleteMsg, got %T", program.messages[0])
+	}
+	if strings.Contains(complete.AuthoritativeText, "\"Criteria\"") || strings.Contains(complete.AuthoritativeText, "\"success_criteria\"") {
+		t.Fatalf("expected humanized inspector payload, got raw JSON %q", complete.AuthoritativeText)
+	}
+	if !strings.Contains(complete.AuthoritativeText, "Defined criteria contract: 3 success criteria, 2 quality gates, 1 constraints.") {
+		t.Fatalf("expected criteria summary, got %q", complete.AuthoritativeText)
 	}
 }
 

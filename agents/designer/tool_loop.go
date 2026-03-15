@@ -121,7 +121,7 @@ func (d *Designer) executeToolLoopWithSurface(
 				req.Messages = append(req.Messages, providers.Message{
 					Role: providers.RoleUser,
 					Content: err.Error() +
-						"\nIf the design criteria or tests are unclear, challenge Inspector or Tester explicitly before ending the turn.",
+						"\nIf the design criteria or tests are unclear, use challenge_agent against Inspector or Tester before ending the turn.",
 				})
 				continue
 			}
@@ -166,7 +166,7 @@ func (d *Designer) executeToolLoopWithSurface(
 			return "", fmt.Errorf("designer repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted := d.applyToolCalls(ctx, req, resp, surface)
+		errCount, controlErr := d.applyToolCalls(ctx, req, resp, surface)
 
 		d.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 
@@ -176,13 +176,16 @@ func (d *Designer) executeToolLoopWithSurface(
 				&agentlog.DesignPayload{Phase: "iteration", DurNs: time.Since(turnStart).Nanoseconds()})
 		}
 
-		if rerouted {
+		if controlErr != nil {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventDesignGenerated,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
 					&agentlog.DesignPayload{Phase: "rerouted"})
 			}
-			return "", skills.ErrRerouteRequested
+			return "", controlErr
+		}
+		if shared.PipelineTurnTerminated(ctx) {
+			return "", nil
 		}
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= shared.MaxConsecutiveToolErrors {
@@ -210,16 +213,11 @@ func (d *Designer) applyToolCalls(
 	req *providers.Request,
 	resp *providers.Response,
 	surface toolruntime.Surface,
-) (int, bool) {
-	req.Messages = append(req.Messages, providers.Message{
-		Role:      providers.RoleAssistant,
-		Content:   strings.TrimSpace(resp.Content),
-		ToolCalls: resp.ToolCalls,
-		Metadata:  resp.ProviderMetadata,
-	})
+) (int, error) {
+	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
-	rerouted := false
+	var controlErr error
 	for _, call := range resp.ToolCalls {
 		if ctx.Err() != nil {
 			break
@@ -235,10 +233,11 @@ func (d *Designer) applyToolCalls(
 		}
 		isError := false
 		if err != nil {
-			if errors.Is(err, skills.ErrRerouteRequested) {
-				rerouted = true
+			switch {
+			case errors.Is(err, skills.ErrRerouteRequested):
+				controlErr = skills.ErrRerouteRequested
 				result = `{"rerouted": true}`
-			} else {
+			default:
 				result = shared.ToolErrorPayload(err)
 				isError = true
 				errCount++
@@ -264,11 +263,11 @@ func (d *Designer) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
-		if rerouted {
+		if controlErr != nil || shared.PipelineTurnTerminated(ctx) {
 			break
 		}
 	}
-	return errCount, rerouted
+	return errCount, controlErr
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.

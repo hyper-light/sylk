@@ -9,9 +9,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester"
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/purevfs"
 	coretest "github.com/adalundhe/sylk/core/test"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -20,6 +22,12 @@ import (
 type stubExecutionBroker struct {
 	caps purevfs.ExecutionCapabilities
 	run  func(context.Context, purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error)
+}
+
+type allowAllCommandGate struct{}
+
+func (allowAllCommandGate) Authorize(_ context.Context, _ commandapproval.Request) (commandapproval.Evaluation, error) {
+	return commandapproval.Evaluation{Decision: commandapproval.DecisionAllow}, nil
 }
 
 func (s stubExecutionBroker) Capabilities(context.Context) (purevfs.ExecutionCapabilities, error) {
@@ -232,6 +240,8 @@ func TestPipelineTesterVisibleSkills_IncludeHarnessAndReportingTools(t *testing.
 	for _, want := range []string{
 		"detect_test_harness",
 		"prepare_test_harness",
+		"research_test_tool_install",
+		"install_test_tooling",
 		"prepare_pipeline_write_context",
 		"write_pipeline_file",
 		"list_pipeline_changes",
@@ -246,6 +256,124 @@ func TestPipelineTesterVisibleSkills_IncludeHarnessAndReportingTools(t *testing.
 		if !containsName(pipelineTesterVisibleSkillNames(), want) {
 			t.Fatalf("visible skills missing %q", want)
 		}
+	}
+}
+
+func TestParseTestToolInstallPlan_ExtractsFencedJSON(t *testing.T) {
+	raw := "Here is the plan:\n```json\n{\"summary\":\"Install pytest\",\"missing_tool\":\"pytest\",\"steps\":[{\"command\":\"python -m pip install pytest\",\"reason\":\"provide the requested test runner\"}]}\n```"
+
+	plan, err := parseTestToolInstallPlan(raw)
+	if err != nil {
+		t.Fatalf("parseTestToolInstallPlan: %v", err)
+	}
+	if plan.MissingTool != "pytest" {
+		t.Fatalf("missing tool = %q, want pytest", plan.MissingTool)
+	}
+	if len(plan.Steps) != 1 || plan.Steps[0].Command != "python -m pip install pytest" {
+		t.Fatalf("steps = %+v", plan.Steps)
+	}
+}
+
+func TestInstallTestTooling_ExecutesApprovedSteps(t *testing.T) {
+	pt, baseCtx, _ := newGoPipelineTesterWithVFS(t)
+	var argv [][]string
+	pt.SetExecutionBroker(stubExecutionBroker{
+		caps: purevfs.StrictBrokerCapabilities(),
+		run: func(_ context.Context, req purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error) {
+			argv = append(argv, append([]string(nil), req.Argv...))
+			return &purevfs.BrokerRunResult{ExitCode: 0, Stdout: []byte("ok")}, nil
+		},
+	})
+	ctx := commandapproval.WithGate(baseCtx, allowAllCommandGate{})
+
+	result, err := pt.installTestTooling(ctx, &testToolInstallPlan{
+		Summary:           "Install pytest for the Python test harness",
+		MissingTool:       "pytest",
+		ValidationCommand: "pytest --version",
+		Steps: []testToolInstallStep{
+			{Command: "python -m pip install pytest", Reason: "install the test runner"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("installTestTooling: %v", err)
+	}
+	if len(argv) != 2 {
+		t.Fatalf("expected 2 commands (install + validation), got %d", len(argv))
+	}
+	if got := argv[0][len(argv[0])-1]; got != "python -m pip install pytest" {
+		t.Fatalf("install argv = %v, want shell command", argv[0])
+	}
+	if got := argv[1][len(argv[1])-1]; got != "pytest --version" {
+		t.Fatalf("validation argv = %v, want shell command", argv[1])
+	}
+	if installed, _ := result["installed"].(bool); !installed {
+		t.Fatalf("result installed = %v, want true", result["installed"])
+	}
+}
+
+func TestInstallTestTooling_RejectsUnsafeCommands(t *testing.T) {
+	pt, ctx, _ := newGoPipelineTesterWithVFS(t)
+
+	_, err := pt.installTestTooling(ctx, &testToolInstallPlan{
+		Summary: "Install pytest",
+		Steps: []testToolInstallStep{
+			{Command: "python -m pip install pytest && echo hacked"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected unsafe shell syntax error")
+	}
+	if !strings.Contains(err.Error(), "unsupported shell syntax") {
+		t.Fatalf("error = %v, want unsupported shell syntax", err)
+	}
+}
+
+func TestResearchTestToolInstall_UsesAcademicRouteAndParsesPlan(t *testing.T) {
+	pt, ctx, _ := newGoPipelineTesterWithVFS(t)
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	pt.bus = bus
+	pt.channels = guide.NewAgentChannels("tester-pipeline", pt.id)
+
+	sub, err := bus.Subscribe(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.TargetAgentID != "academic" {
+			return nil
+		}
+		if !strings.Contains(req.Input, "pytest") {
+			t.Fatalf("academic prompt missing failure context: %s", req.Input)
+		}
+		resp := &guide.RouteResponse{
+			CorrelationID:       req.CorrelationID,
+			Success:             true,
+			RespondingAgentID:   "academic-1",
+			RespondingAgentName: "Academic",
+			Data: map[string]any{
+				"type":    "recall",
+				"content": "{\"summary\":\"Install pytest\",\"missing_tool\":\"pytest\",\"steps\":[{\"command\":\"python -m pip install pytest\",\"reason\":\"provide pytest\"}]}",
+			},
+		}
+		return bus.Publish(pt.channels.Responses, &guide.Message{
+			ID:            "resp-1",
+			CorrelationID: req.CorrelationID,
+			Type:          guide.MessageTypeResponse,
+			SourceAgentID: "academic-1",
+			Payload:       resp,
+		})
+	})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	plan, err := pt.researchTestToolInstall(ctx, "pytest", "pytest: command not found", "pytest", "pytest", []string{"pkg/service/service.go"}, "Add service tests", "engineer")
+	if err != nil {
+		t.Fatalf("researchTestToolInstall: %v", err)
+	}
+	if plan.MissingTool != "pytest" {
+		t.Fatalf("missing tool = %q, want pytest", plan.MissingTool)
+	}
+	if len(plan.Steps) != 1 || plan.Steps[0].Command != "python -m pip install pytest" {
+		t.Fatalf("steps = %+v", plan.Steps)
 	}
 }
 

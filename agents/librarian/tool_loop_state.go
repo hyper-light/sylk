@@ -200,12 +200,7 @@ func (s *toolLoopState) handleDuplicateToolCalls(resp *providers.Response) bool 
 			lm.AgentID, lm.SessionID, lm.CorrID, "warn",
 			&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s (forcing synthesis)", sig.Name)})
 	}
-	s.req.Messages = append(s.req.Messages, providers.Message{
-		Role:      providers.RoleAssistant,
-		Content:   resp.Content,
-		ToolCalls: resp.ToolCalls,
-		Metadata:  resp.ProviderMetadata,
-	})
+	s.req.Messages = append(s.req.Messages, providers.ToolLoopAssistantMessage(resp))
 	for _, call := range resp.ToolCalls {
 		s.req.Messages = append(s.req.Messages, providers.Message{
 			Role:       providers.RoleTool,

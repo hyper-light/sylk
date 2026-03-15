@@ -156,6 +156,31 @@ func TestConcurrentStreamThinkingAnimatesSecondaryPipelineEntry(t *testing.T) {
 	}
 }
 
+func TestStreamStartUsesAgentTypeForPipelineBadge(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "c1",
+		AgentID:       "a8c45a7f",
+		AgentType:     "tester-pipeline",
+		TaskName:      "Implement Cli Module",
+		TaskSlug:      "implement-cli-module",
+	})
+	m = comp.(*Model)
+
+	last := m.history.Last()
+	if last == nil {
+		t.Fatal("expected streaming entry")
+	}
+	if last.AgentType != "tester-pipeline" {
+		t.Fatalf("AgentType = %q, want tester-pipeline", last.AgentType)
+	}
+	if got := badgeLabel(last); got != "Implement Cli Module: Tester" {
+		t.Fatalf("badgeLabel = %q, want %q", got, "Implement Cli Module: Tester")
+	}
+}
+
 func TestDuplicateStartDoesNotResetProgressOnlyStreamSlot(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 

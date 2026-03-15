@@ -124,7 +124,7 @@ func (e *Engineer) executeToolLoopWithSurface(
 				req.Messages = append(req.Messages, providers.Message{
 					Role: providers.RoleUser,
 					Content: err.Error() +
-						"\nIf you need clarification from Inspector or Tester, hand off or challenge them explicitly instead of concluding silently.",
+						"\nIf you need clarification from Inspector or Tester, use challenge_agent or handoff_next explicitly instead of concluding silently.",
 				})
 				continue
 			}
@@ -169,10 +169,13 @@ func (e *Engineer) executeToolLoopWithSurface(
 			return "", fmt.Errorf("engineer repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted := e.applyToolCalls(ctx, req, resp, surface)
+		errCount, controlErr := e.applyToolCalls(ctx, req, resp, surface)
 		e.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
-		if rerouted {
-			return "", skills.ErrRerouteRequested
+		if controlErr != nil {
+			return "", controlErr
+		}
+		if shared.PipelineTurnTerminated(ctx) {
+			return "", nil
 		}
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= shared.MaxConsecutiveToolErrors {
@@ -199,16 +202,11 @@ func (e *Engineer) applyToolCalls(
 	req *providers.Request,
 	resp *providers.Response,
 	surface toolruntime.Surface,
-) (int, bool) {
-	req.Messages = append(req.Messages, providers.Message{
-		Role:      providers.RoleAssistant,
-		Content:   strings.TrimSpace(resp.Content),
-		ToolCalls: resp.ToolCalls,
-		Metadata:  resp.ProviderMetadata,
-	})
+) (int, error) {
+	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
-	rerouted := false
+	var controlErr error
 	for _, call := range resp.ToolCalls {
 		if ctx.Err() != nil {
 			break
@@ -224,10 +222,11 @@ func (e *Engineer) applyToolCalls(
 		}
 		isError := false
 		if err != nil {
-			if errors.Is(err, skills.ErrRerouteRequested) {
-				rerouted = true
+			switch {
+			case errors.Is(err, skills.ErrRerouteRequested):
+				controlErr = skills.ErrRerouteRequested
 				result = `{"rerouted": true}`
-			} else {
+			default:
 				result = shared.ToolErrorPayload(err)
 				isError = true
 				errCount++
@@ -254,11 +253,11 @@ func (e *Engineer) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
-		if rerouted {
+		if controlErr != nil || shared.PipelineTurnTerminated(ctx) {
 			break
 		}
 	}
-	return errCount, rerouted
+	return errCount, controlErr
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.

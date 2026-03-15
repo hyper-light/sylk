@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/google/uuid"
@@ -105,6 +106,10 @@ func (r *TaskRouter) Route(task *PipelineTask) error {
 // preventing goroutine leaks under FailurePolicyContinue.
 // A nil done channel blocks forever in select — correct for the non-lifecycle case.
 func (r *TaskRouter) RouteWithLifecycle(task *PipelineTask, done <-chan struct{}) error {
+	if protocolPipelineTaskEligible(task) {
+		return r.routeProtocolPipelineTask(task, done)
+	}
+
 	corrID := "pipe_" + uuid.NewString()[:12]
 	waitCh := r.registerPending(corrID, task)
 	r.logTrace("task_router_pending_registered", "debug", agentlog.EventTaskDispatched, corrID, routeTraceData(task))
@@ -188,7 +193,10 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 		return false
 	}
 	if msg.Type == guide.MessageTypeStream {
-		return r.mirrorStreamToUser(msg)
+		if r.mirrorStreamToUser(msg) {
+			return true
+		}
+		return r.mirrorProtocolStreamToUser(msg)
 	}
 	if !isTerminalRouteMessage(msg) {
 		return false
@@ -198,6 +206,9 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 	pr := r.pending[msg.CorrelationID]
 	if pr == nil || pr.closed {
 		r.pendingMu.Unlock()
+		if r.consumeProtocolTerminal(msg) {
+			return true
+		}
 		if pr == nil {
 			r.logger.Warn("response has no pending route", "correlation_id", msg.CorrelationID)
 			r.logTrace("task_router_response_unmatched", "warn", agentlog.EventError, msg.CorrelationID, map[string]any{
@@ -291,6 +302,86 @@ func (r *TaskRouter) mirrorStreamToUser(msg *guide.Message) bool {
 	return true
 }
 
+func (r *TaskRouter) mirrorProtocolStreamToUser(msg *guide.Message) bool {
+	if msg == nil || msg.CorrelationID == "" {
+		return false
+	}
+	stream, ok := msg.GetStreamResponse()
+	if !ok || stream == nil || stream.Event == nil {
+		return false
+	}
+	task := protocolTaskFromStreamMetadata(stream)
+	if task == nil {
+		return false
+	}
+	if r.onNodeActivity != nil {
+		r.onNodeActivity(task.DAGID, task.NodeID)
+	}
+	if r.streamMirrorTargetID == "" || r.bus == nil {
+		return true
+	}
+
+	mirrored := &guide.StreamResponse{
+		CorrelationID:       stream.CorrelationID,
+		RespondingAgentID:   firstNonEmpty(stream.RespondingAgentID, routeTargetAgentID(task)),
+		RespondingAgentName: firstNonEmpty(stream.RespondingAgentName, task.AgentType),
+		TargetAgentID:       r.streamMirrorTargetID,
+		Metadata:            enrichMirroredStreamMetadata(task, cloneMetadata(stream.Metadata)),
+		Event:               cloneStreamEvent(stream.Event),
+	}
+	mirroredMsg := &guide.Message{
+		ID:            generateMessageID(),
+		CorrelationID: mirrored.CorrelationID,
+		Type:          guide.MessageTypeStream,
+		Payload:       mirrored,
+		SourceAgentID: mirrored.RespondingAgentID,
+		TargetAgentID: r.streamMirrorTargetID,
+		Timestamp:     time.Now(),
+	}
+	if err := r.bus.Publish(guide.TopicResponses(r.streamMirrorTargetID, r.streamMirrorTargetID), mirroredMsg); err != nil {
+		r.logger.Warn("mirror protocol pipeline stream to user", "correlation_id", msg.CorrelationID, "error", err)
+		r.logTrace("task_router_protocol_stream_mirror_failed", "warn", agentlog.EventError, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+			"mirror_target":   r.streamMirrorTargetID,
+			"source_agent_id": msg.SourceAgentID,
+			"error":           err.Error(),
+		}))
+		return true
+	}
+	r.logTrace("task_router_protocol_stream_mirrored", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+		"mirror_target":   r.streamMirrorTargetID,
+		"source_agent_id": msg.SourceAgentID,
+	}))
+	return true
+}
+
+func protocolTaskFromStreamMetadata(stream *guide.StreamResponse) *PipelineTask {
+	if stream == nil || !metadataBool(stream.Metadata, "pipeline_task") {
+		return nil
+	}
+	taskID := metadataString(stream.Metadata, "task_id")
+	dagID := metadataString(stream.Metadata, "dag_id")
+	nodeID := metadataString(stream.Metadata, "node_id")
+	agentType := metadataString(stream.Metadata, "agent_type")
+	if taskID == "" || dagID == "" || nodeID == "" || agentType == "" {
+		return nil
+	}
+	ctx := map[string]any{}
+	if taskSlug := metadataString(stream.Metadata, "task_slug"); taskSlug != "" {
+		ctx["task_slug"] = taskSlug
+	}
+	if taskName := metadataString(stream.Metadata, "task_name"); taskName != "" {
+		ctx["task_name"] = taskName
+	}
+	return &PipelineTask{
+		NodeID:        nodeID,
+		DAGID:         dagID,
+		TaskID:        taskID,
+		AgentType:     agentType,
+		TargetAgentID: firstNonEmpty(strings.TrimSpace(stream.RespondingAgentID), pipelineWorkerTargetAgentID(taskID, agentType)),
+		Context:       ctx,
+	}
+}
+
 func enrichMirroredStreamMetadata(task *PipelineTask, metadata map[string]any) map[string]any {
 	if task == nil {
 		return metadata
@@ -326,6 +417,28 @@ func taskContextString(ctx map[string]any, key string) string {
 	}
 	value, _ := ctx[key].(string)
 	return strings.TrimSpace(value)
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, _ := metadata[key].(string)
+	return strings.TrimSpace(value)
+}
+
+func metadataBool(metadata map[string]any, key string) bool {
+	if metadata == nil {
+		return false
+	}
+	switch value := metadata[key].(type) {
+	case bool:
+		return value
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "true")
+	default:
+		return false
+	}
 }
 
 func cloneMetadata(metadata map[string]any) map[string]any {
@@ -404,6 +517,30 @@ func isTerminalRouteMessage(msg *guide.Message) bool {
 	default:
 		return false
 	}
+}
+
+func (r *TaskRouter) consumeProtocolTerminal(msg *guide.Message) bool {
+	resp, ok := msg.GetRouteResponse()
+	if !ok || resp == nil || !resp.Success {
+		return false
+	}
+	turnResp, err := agentshared.DecodePipelineTurnResponse(resp.Data)
+	if err != nil || turnResp == nil {
+		return false
+	}
+	if turnResp.Action == nil && len(turnResp.Processed) == 0 {
+		return false
+	}
+	actionType := ""
+	if turnResp.Action != nil {
+		actionType = string(turnResp.Action.Type)
+	}
+	r.logTrace("task_router_protocol_terminal_consumed", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, map[string]any{
+		"source_agent_id": msg.SourceAgentID,
+		"target_agent_id": msg.TargetAgentID,
+		"action_type":     actionType,
+	})
+	return true
 }
 
 // CancelAllPending cancels all in-flight pipeline routes by publishing a

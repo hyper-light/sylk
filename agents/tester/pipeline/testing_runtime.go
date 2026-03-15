@@ -86,6 +86,7 @@ func (pt *PipelineTester) swapTaskRuntime(task *agentshared.PipelineTaskInput) t
 	}
 	pt.currentTask = task
 	pt.lastSuiteResult = nil
+	pt.diagnoses = make(map[string]*testershared.DiagnosisReport)
 	return prev
 }
 

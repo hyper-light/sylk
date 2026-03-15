@@ -1,13 +1,9 @@
 package pipeline
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
-	"github.com/adalundhe/sylk/agents/guide"
-	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester"
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
 )
@@ -18,100 +14,43 @@ type TaskStageResult struct {
 	SuiteResult  *tester.TestSuiteResult
 }
 
-// TestTask runs the tester against a structured pipeline task and returns the
-// stage snapshot the executor should use to decide whether execute work is
-// still needed.
-func (pt *PipelineTester) TestTask(ctx context.Context, task *agentshared.PipelineTaskInput) (*TaskStageResult, error) {
-	if task == nil {
-		return nil, fmt.Errorf("task is required")
+// ResponseText implements the Guide response text contract so internal tester
+// stage snapshots do not leak to users as raw JSON.
+func (r *TaskStageResult) ResponseText() string {
+	if r == nil {
+		return ""
 	}
 
-	if pt.getProvider() == nil {
-		return pt.testTaskWithoutProvider(ctx, task)
+	lines := make([]string, 0, 3)
+	if len(r.CreatedFiles) > 0 {
+		lines = append(lines, fmt.Sprintf("Created test artifacts: %s.", strings.Join(r.CreatedFiles, ", ")))
 	}
-
-	payload, err := json.Marshal(task)
-	if err != nil {
-		return nil, fmt.Errorf("encode pipeline task: %w", err)
-	}
-
-	sessionID := strings.TrimSpace(task.SessionID)
-	if pt.bus != nil && pt.running {
-		msg, err := agentshared.RequestGuideRouteSync(ctx, agentshared.GuideRouteSyncRequest{
-			Bus:           pt.bus,
-			ResponseTopic: guide.TopicResponses("tui", "tui"),
-			Request: &guide.RouteRequest{
-				Input:           string(payload),
-				TargetAgentID:   pt.id,
-				ExplicitTarget:  true,
-				SourceAgentID:   "tui",
-				SourceAgentName: "pipeline",
-				SessionID:       sessionID,
-				Metadata: map[string]any{
-					"task_id":   strings.TrimSpace(task.TaskID),
-					"task_slug": taskContextString(task.Context, "task_slug"),
-					"task_name": taskContextString(task.Context, "task_name"),
-				},
-			},
-		})
-		if err != nil {
-			return nil, err
+	if r.SuiteResult != nil {
+		total := r.SuiteResult.TotalTests
+		if total <= 0 {
+			total = r.SuiteResult.Passed + r.SuiteResult.Failed + r.SuiteResult.Skipped + r.SuiteResult.Errors
 		}
-		if errText, ok := msg.GetError(); ok && strings.TrimSpace(errText) != "" {
-			return nil, fmt.Errorf("%s", errText)
-		}
-		if resp, ok := msg.GetRouteResponse(); ok && resp != nil && !resp.Success {
-			return nil, fmt.Errorf("%s", resp.Error)
-		}
-	} else {
-		_, err = pt.Handle(ctx, &guide.ForwardedRequest{
-			Input:     string(payload),
-			SessionID: sessionID,
-			Metadata: map[string]any{
-				"task_id":   strings.TrimSpace(task.TaskID),
-				"task_slug": taskContextString(task.Context, "task_slug"),
-			},
-		})
-		if err != nil {
-			return nil, err
+		switch {
+		case total > 0:
+			lines = append(lines, fmt.Sprintf(
+				"Latest test run: %d passed, %d failed, %d skipped, %d errors out of %d.",
+				r.SuiteResult.Passed,
+				r.SuiteResult.Failed,
+				r.SuiteResult.Skipped,
+				r.SuiteResult.Errors,
+				total,
+			))
+		case strings.TrimSpace(r.SuiteResult.Name) != "":
+			lines = append(lines, fmt.Sprintf("Executed test suite %q.", strings.TrimSpace(r.SuiteResult.Name)))
 		}
 	}
-
-	return &TaskStageResult{
-		Plan:         pt.planSnapshot(),
-		CreatedFiles: pt.createdArtifacts(),
-		SuiteResult:  pt.lastSuiteSnapshot(),
-	}, nil
-}
-
-func (pt *PipelineTester) testTaskWithoutProvider(ctx context.Context, task *agentshared.PipelineTaskInput) (*TaskStageResult, error) {
-	contract := agentshared.BuildTaskExecutionContract(task)
-	req := &tester.TesterRequest{
-		TaskID:     strings.TrimSpace(task.TaskID),
-		TaskPrompt: strings.TrimSpace(task.Prompt),
-		Files:      taskContextFiles(task),
-		WorkerType: agentshared.PipelineWorkerType(task),
+	if len(lines) == 0 && r.Plan != nil && strings.TrimSpace(r.Plan.Rationale) != "" {
+		lines = append(lines, fmt.Sprintf("Prepared a test plan: %s.", strings.TrimSpace(r.Plan.Rationale)))
 	}
-	if contract != nil && contract.HasImplementationEvidence {
-		req.Intent = tester.IntentRunTests
-	} else {
-		req.Intent = tester.IntentCreateTests
+	if len(lines) == 0 && r.Plan != nil {
+		lines = append(lines, "Prepared a concrete test plan.")
 	}
-
-	resp, err := pt.HandleRequest(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	result := &TaskStageResult{
-		Plan:         pt.planSnapshot(),
-		CreatedFiles: pt.createdArtifacts(),
-		SuiteResult:  pt.lastSuiteSnapshot(),
-	}
-	if result.SuiteResult == nil && resp != nil {
-		result.SuiteResult = resp.SuiteResult
-	}
-	return result, nil
+	return strings.Join(lines, "\n")
 }
 
 func taskContextString(ctx map[string]any, key string) string {

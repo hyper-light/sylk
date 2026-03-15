@@ -7,20 +7,26 @@ import (
 
 	"github.com/adalundhe/sylk/core/events"
 	agentpkg "github.com/adalundhe/sylk/ui/agent"
+	chatpkg "github.com/adalundhe/sylk/ui/chat"
 	"github.com/adalundhe/sylk/ui/msg"
+	statuspkg "github.com/adalundhe/sylk/ui/status"
 	"github.com/adalundhe/sylk/ui/theme"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 func newStreamTelemetryModel() *AppModel {
+	th := theme.DefaultDark()
 	return &AppModel{
-		agentContextTokens: make(map[string]int),
-		agentContextModels: make(map[string]string),
-		streamUsage:        make(map[string]streamUsageEntry),
-		streamedResponses:  make(map[string]streamedResponseState),
-		activeStreams:      make(map[string]*activeStreamEntry),
-		reroutedStreamCIDs: make(map[string]time.Time),
-		agentPanel:         agentpkg.New(theme.DefaultDark()),
+		agentContextTokens:      make(map[string]int),
+		agentContextModels:      make(map[string]string),
+		streamUsage:             make(map[string]streamUsageEntry),
+		streamedResponses:       make(map[string]streamedResponseState),
+		activeStreams:           make(map[string]*activeStreamEntry),
+		reroutedStreamCIDs:      make(map[string]time.Time),
+		interruptedCorrelations: make(map[string]struct{}),
+		agentPanel:              agentpkg.New(th),
+		chat:                    chatpkg.New(th, 32),
+		statusBar:               statuspkg.New(th, nil),
 	}
 }
 
@@ -82,6 +88,49 @@ func TestStreamTelemetry_UsesLatestPerTurnInputTokensForPipelineTester(t *testin
 	}
 
 	m.finalizeStreamUsage("corr-tester", true, "")
+	if got := m.agentContextTokens[canonicalID]; got != 210000 {
+		t.Fatalf("finalized agentContextTokens[%q] = %d, want 210000", canonicalID, got)
+	}
+	if got := m.agentPanel.ContextUsageOf(canonicalID); got < 0.77 || got > 0.78 {
+		t.Fatalf("panel context usage = %.4f, want about 0.7721", got)
+	}
+}
+
+func TestStreamTelemetry_TokenUsageWithoutCorrelationPreservesPipelineEngineerOccupancy(t *testing.T) {
+	m := newStreamTelemetryModel()
+	canonicalID := "task_auth_checkout:engineer"
+	m.agentPanel.SeedAgent(canonicalID, "engineer", "Engineer", nil, "", "")
+
+	start := msg.StreamStartMsg{
+		CorrelationID: "corr-engineer",
+		AgentID:       "runtime-engineer",
+		AgentType:     "engineer",
+		AgentName:     "Engineer",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+	}
+	m.trackStreamStart(start)
+
+	model, _ := m.Update(msg.TokenUsageMsg{
+		AgentID:     canonicalID,
+		Model:       "gpt-5.4-pro",
+		InputTokens: 210000,
+	})
+	m = model.(*AppModel)
+
+	if got := m.streamUsage["corr-engineer"].InputTokens; got != 210000 {
+		t.Fatalf("streamUsage input tokens = %d, want 210000", got)
+	}
+
+	m.applyRealStreamUsage(msg.StreamCompleteMsg{
+		CorrelationID: "corr-engineer",
+		InputTokens:   540000,
+	})
+	if got := m.streamUsage["corr-engineer"].InputTokens; got != 210000 {
+		t.Fatalf("streamUsage input tokens after complete = %d, want preserved 210000", got)
+	}
+
+	m.finalizeStreamUsage("corr-engineer", true, "")
 	if got := m.agentContextTokens[canonicalID]; got != 210000 {
 		t.Fatalf("finalized agentContextTokens[%q] = %d, want 210000", canonicalID, got)
 	}
@@ -357,6 +406,87 @@ func TestStreamTelemetry_RegisterStreamReplacesOlderPipelineWorkerStream(t *test
 	}
 	if entry.AgentID != "task_auth_checkout:engineer" {
 		t.Fatalf("entry.AgentID = %q, want task_auth_checkout:engineer", entry.AgentID)
+	}
+}
+
+func TestHandleGuideResponse_PreservesSemanticPipelineAgentLabel(t *testing.T) {
+	m := newStreamTelemetryModel()
+	m.chat.SetSize(80, 20)
+
+	start := msg.StreamStartMsg{
+		CorrelationID: "corr-response",
+		AgentID:       "dc484039",
+		AgentType:     "designer",
+		AgentName:     "Designer",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth checkout",
+		TaskSlug:      "auth-checkout",
+	}
+	m.trackStreamStart(start)
+	m.registerStream(start)
+
+	if cmd := m.handleGuideResponse(msg.GuideResponseMsg{
+		CorrelationID: "corr-response",
+		AgentID:       "dc484039",
+		AgentName:     "Designer",
+		Content:       "Finished the design pass.",
+	}); cmd != nil {
+		_ = cmd()
+	}
+
+	view := m.chat.View()
+	if !strings.Contains(view, "Auth Checkout: Designer") {
+		t.Fatalf("expected semantic badge in chat view, got:\n%s", view)
+	}
+	if strings.Contains(view, "dc484039") {
+		t.Fatalf("expected runtime ID to be hidden from chat badge, got:\n%s", view)
+	}
+}
+
+func TestInterruptedCorrelationRemainsBlockedAfterTerminalEvents(t *testing.T) {
+	m := newStreamTelemetryModel()
+	m.interruptedCorrelations["corr-interrupted"] = struct{}{}
+
+	if cmd := m.handleStreamCompleteTelemetry(msg.StreamCompleteMsg{
+		CorrelationID:     "corr-interrupted",
+		AuthoritativeText: "stale completion",
+	}); cmd != nil {
+		_ = cmd()
+	}
+	if _, ok := m.interruptedCorrelations["corr-interrupted"]; !ok {
+		t.Fatal("expected interrupted correlation tombstone to survive stream completion")
+	}
+
+	if cmd := m.handleGuideResponse(msg.GuideResponseMsg{
+		CorrelationID: "corr-interrupted",
+		Content:       "stale final response",
+	}); cmd != nil {
+		_ = cmd()
+	}
+	if _, ok := m.interruptedCorrelations["corr-interrupted"]; !ok {
+		t.Fatal("expected interrupted correlation tombstone to survive guide response")
+	}
+
+	if cmd := m.handleStreamErrorTelemetry(msg.StreamErrorMsg{
+		CorrelationID: "corr-interrupted",
+	}); cmd != nil {
+		_ = cmd()
+	}
+	if _, ok := m.interruptedCorrelations["corr-interrupted"]; !ok {
+		t.Fatal("expected interrupted correlation tombstone to survive stream error")
+	}
+
+	if cmd := m.handleStreamReroute(msg.StreamRerouteMsg{
+		OriginalCorrelationID: "corr-interrupted",
+		CorrelationID:         "corr-resurrected",
+		FromAgentID:           "inspector-pipeline",
+		ToAgentID:             "tester-pipeline",
+	}); cmd != nil {
+		_ = cmd()
+	}
+	if _, ok := m.activeStreams["corr-resurrected"]; ok {
+		t.Fatal("expected reroute for interrupted correlation to be dropped")
 	}
 }
 

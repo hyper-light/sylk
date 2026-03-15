@@ -156,10 +156,10 @@ func planTestsSkill(pt *PipelineTester) *skills.Skill {
 		Domain("testing").
 		Keywords("plan", "test plan", "failure hypothesis", "strategy").
 		Priority(95).
-		Usage("Use after risk analysis to turn the defect surface into concrete, purposeful test cases. The resulting plan should make the next write or execution step clear.").
+		Usage("Use after risk analysis to turn the defect surface into concrete, purposeful test cases. The resulting plan should make the next write_test step clear.").
 		Requirement("Prefer to run after analyze_risk or provide equivalent risk areas in the input.").
-		Satisfies("Produces the tester plan artifact and defines the concrete cases that write_test should materialize.").
-		Avoid("Do not substitute the plan for actual test writing when the requested deliverable still requires test artifacts.").
+		Satisfies("Produces the tester plan artifact and defines the concrete cases that write_test should materialize before suite execution and reporting.").
+		Avoid("Do not treat the plan as completion. A terminal tester handoff still requires write_test, run_test_suite, and report_to_engineer or report_to_designer before handoff_next.").
 		ArrayParam("files", "Source files that need test coverage", "string", false).
 		StringParam("task_spec", "Task brief and acceptance criteria", false).
 		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
@@ -203,8 +203,8 @@ func writeTestSkill(pt *PipelineTester) *skills.Skill {
 		Priority(94).
 		Usage("Use to materialize executable tests after you know the intended case. Prepare the output path with prepare_pipeline_write_context first, pass the basis in, and reuse next_basis for follow-up writes to the same file.").
 		Requirement("Provide a concrete test_case, executable content, and a matching pipeline write basis for the target output file.").
-		Satisfies("Creates real test artifacts and advances the authoring deliverable for the task.").
-		Avoid("Do not use for placeholders, TODOs, skipped tests, or speculative writes detached from the requested behavior.").
+		Satisfies("Creates real test artifacts and advances the authoring deliverable for the task. After writing, run_test_suite should gather execution evidence before terminal reporting.").
+		Avoid("Do not use for placeholders, TODOs, skipped tests, or speculative writes detached from the requested behavior. write_test alone is not a terminal handoff step.").
 		ObjectParam("test_case", "Structured planned test case metadata", testCaseProps, true).
 		StringParam("target_file", "Source file under test", true).
 		StringParam("output_file", "Destination test file path", false).
@@ -268,9 +268,9 @@ func runTestSuiteSkill(pt *PipelineTester) *skills.Skill {
 		Domain("testing").
 		Keywords("run", "test", "suite", "race", "execute").
 		Priority(92).
-		Usage("Use when the task requires execution evidence or when you need a concrete failing signal to diagnose. Target the most relevant packages, files, or tests instead of running blindly.").
-		Satisfies("Produces suite execution evidence and the raw failure signal needed for diagnose_failure.").
-		Avoid("Do not use as a substitute for write_test when the task still requires new test artifacts.").
+		Usage("Use after write_test when the task requires execution evidence or when you need a concrete failing signal to diagnose. Target the most relevant packages, files, or tests instead of running blindly.").
+		Satisfies("Produces suite execution evidence and the raw failure signal needed for diagnose_failure and for the final report_to_engineer or report_to_designer artifact.").
+		Avoid("Do not use as a substitute for write_test when the task still requires new test artifacts, and do not stop here when the turn still requires terminal reporting plus handoff_next.").
 		ArrayParam("packages", "Package patterns to test", "string", false).
 		ArrayParam("files", "Source or test files to focus on", "string", false).
 		ArrayParam("test_names", "Specific tests to run", "string", false).

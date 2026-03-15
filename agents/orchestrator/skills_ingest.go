@@ -606,7 +606,7 @@ func buildDAGFromHandoff(h *architect.PlanHandoff) (*dag.DAG, error) {
 			FailurePolicy:  dag.FailurePolicyContinue,
 			MaxConcurrency: constraintConcurrency(h.Constraints),
 			DefaultTimeout: constraintTimeout(h.Constraints),
-			DefaultRetries: 3,
+			DefaultRetries: 0,
 			RetryBackoff:   time.Second,
 		}
 		builder = builder.WithPolicy(policy)

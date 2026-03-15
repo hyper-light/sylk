@@ -6,11 +6,13 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/container/pod"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -86,10 +88,13 @@ type AgentPodConfig struct {
 	// ScribeFactory creates Scribes for each member type. Nil = no Scribes.
 	ScribeFactory ScribeFactory
 
-	// Managed is the underlying ManagedPod for tier lifecycle and guard
-	// tracking. When set, guard operations delegate to ManagedPod. When
-	// nil, guards delegate to the PodActivator directly (legacy path).
-	Managed *pod.ManagedPod
+	// Direct pod lifecycle configuration. When Runtime is set, AgentPod owns
+	// tier transitions, member containers, mounted volumes, and request guard
+	// bookkeeping directly.
+	Policy        *pod.PodPolicy
+	Runtime       container.ContainerRuntime
+	VolumeManager *pod.VolumeManager
+	Specs         []container.ContainerSpec
 }
 
 // PodGuardEntry tracks the demotion guards held for a single node.
@@ -112,18 +117,13 @@ type SubNodeMeta struct {
 // guards are tracked.
 const preActivateNodeID = "__pre_activate__"
 
-// AgentPod is a universal container for managing agent demotion guards,
-// registration, and Scribe sidecars. It supersedes PipelinePod: pipeline
-// agents and global agents both use AgentPod — only member composition differs.
-//
-// When Managed is set, guard operations delegate to the ManagedPod for
-// pod-level tier lifecycle and resource tracking. When nil, the legacy
-// path delegates directly to the PodActivator.
+// AgentPod is the single pod abstraction for both global and task-scoped
+// agents. It owns registration, guard bookkeeping, optional direct runtime
+// lifecycle, and Scribe sidecars.
 type AgentPod struct {
 	podID        string
 	sessionID    string
 	activator    guide.PodActivator
-	managed      *pod.ManagedPod
 	registrar    PodRegistrar
 	activityPub  events.ActivityPublisher
 	regVis       events.EventVisibility
@@ -150,6 +150,20 @@ type AgentPod struct {
 	scribeFactory ScribeFactory
 	scribesMu     sync.RWMutex
 	scribes       map[string]Scribe
+
+	// Direct lifecycle/runtime state.
+	policy       *pod.PodPolicy
+	runtime      container.ContainerRuntime
+	volumes      *pod.VolumeManager
+	lifecycleMu  sync.Mutex
+	tier         atomic.Int32
+	containers   map[string]*container.Container
+	lastActive   atomic.Int64
+	activeReqs   atomic.Int64
+	metrics      pod.PodMetrics
+	specsMu      sync.RWMutex
+	specs        []container.ContainerSpec
+	containersMu sync.RWMutex
 }
 
 type registrationFuture struct {
@@ -163,11 +177,10 @@ func NewAgentPod(cfg AgentPodConfig) *AgentPod {
 	if regVis == 0 {
 		regVis = events.VisibilityUser
 	}
-	return &AgentPod{
+	agentPod := &AgentPod{
 		podID:         cfg.PodID,
 		sessionID:     cfg.SessionID,
 		activator:     cfg.Activator,
-		managed:       cfg.Managed,
 		registrar:     cfg.Registrar,
 		activityPub:   cfg.ActivityPub,
 		regVis:        regVis,
@@ -181,30 +194,35 @@ func NewAgentPod(cfg AgentPodConfig) *AgentPod {
 		registering:   make(map[string]*registrationFuture),
 		scribes:       make(map[string]Scribe),
 		scribeFactory: cfg.ScribeFactory,
+		policy:        cfg.Policy,
+		runtime:       cfg.Runtime,
+		volumes:       cfg.VolumeManager,
+		containers:    make(map[string]*container.Container),
 	}
-}
-
-// ManagedPod returns the underlying ManagedPod, or nil if not set.
-func (p *AgentPod) ManagedPod() *pod.ManagedPod {
-	return p.managed
+	agentPod.tier.Store(pod.TierCold)
+	agentPod.touchActivity()
+	if len(cfg.Specs) > 0 {
+		agentPod.SetSpecs(cfg.Specs)
+	}
+	return agentPod
 }
 
 // FileAccessFor returns the mounted file access for the given member type when
-// this pod is backed by a managed pod with mounted volumes.
+// this pod is backed by mounted volumes.
 func (p *AgentPod) FileAccessFor(agentType string) versioning.FileAccess {
-	if p == nil || p.managed == nil {
+	if p == nil || p.volumes == nil {
 		return nil
 	}
-	return p.managed.FileAccessFor(agentType)
+	return p.volumes.FileAccessFor(agentType)
 }
 
 // WorkspaceViewsFor returns the layered workspace view access for the given
-// member type when this pod is backed by a managed pod with mounted volumes.
+// member type when this pod is backed by mounted volumes.
 func (p *AgentPod) WorkspaceViewsFor(agentType string) versioning.WorkspaceViewAccess {
-	if p == nil || p.managed == nil {
+	if p == nil || p.volumes == nil {
 		return nil
 	}
-	return p.managed.WorkspaceViewsFor(agentType)
+	return p.volumes.WorkspaceViewsFor(agentType)
 }
 
 // PreActivate activates and registers all member types upfront so they
@@ -230,7 +248,7 @@ func (p *AgentPod) AdvertiseMembers() {
 }
 
 func (p *AgentPod) preActivate(ctx context.Context, strict bool) error {
-	if p.activator == nil && p.managed == nil {
+	if p.activator == nil && p.runtime == nil {
 		return nil
 	}
 
@@ -238,7 +256,7 @@ func (p *AgentPod) preActivate(ctx context.Context, strict bool) error {
 		"pod_id":       p.podID,
 		"strict":       strict,
 		"member_types": append([]string(nil), p.memberTypes...),
-		"managed":      p.managed != nil,
+		"managed":      p.runtime != nil,
 	})
 
 	releases := make([]func(), 0, len(p.memberTypes))
@@ -262,7 +280,6 @@ func (p *AgentPod) preActivate(ctx context.Context, strict bool) error {
 		}
 		releases = append(releases, release)
 		activated = append(activated, agentType)
-		p.publishActivity(agentType)
 		p.logActivation(preActivateNodeID, agentType)
 	}
 
@@ -336,11 +353,27 @@ func releaseAll(releases []func()) {
 // acquires demotion guards, and registers each unique agent type with
 // the Guide. On failure, all guards acquired for this node are released.
 func (p *AgentPod) HoldForNode(ctx context.Context, nodeID string, agentTypes []string) error {
-	if p.activator == nil && p.managed == nil {
+	if p.activator == nil && p.runtime == nil {
 		return nil
 	}
 
 	releases := make([]func(), 0, len(agentTypes))
+	registerTypes := append([]string(nil), agentTypes...)
+	for _, memberType := range p.memberTypes {
+		if memberType == "" {
+			continue
+		}
+		found := false
+		for _, agentType := range registerTypes {
+			if agentType == memberType {
+				found = true
+				break
+			}
+		}
+		if !found {
+			registerTypes = append(registerTypes, memberType)
+		}
+	}
 
 	for _, agentType := range agentTypes {
 		release, err := p.acquireGuard(ctx, agentType)
@@ -352,7 +385,8 @@ func (p *AgentPod) HoldForNode(ctx context.Context, nodeID string, agentTypes []
 				p.podID, agentType, nodeID, err)
 		}
 		releases = append(releases, release)
-
+	}
+	for _, agentType := range registerTypes {
 		if err := p.registerOnce(ctx, agentType); err != nil {
 			for _, r := range releases {
 				r()
@@ -360,7 +394,8 @@ func (p *AgentPod) HoldForNode(ctx context.Context, nodeID string, agentTypes []
 			return fmt.Errorf("agent pod %s: register %s for node %s: %w",
 				p.podID, agentType, nodeID, err)
 		}
-
+	}
+	for _, agentType := range agentTypes {
 		p.logActivation(nodeID, agentType)
 	}
 
@@ -412,6 +447,10 @@ func (p *AgentPod) ReleaseForNode(nodeID string) {
 // Release releases all outstanding demotion guards and stops all Scribes.
 // Safe for concurrent and repeated calls — only the first call acts.
 func (p *AgentPod) Release() {
+	if p.runtime != nil {
+		_ = p.Demote(context.Background(), pod.TierCold)
+	}
+
 	p.guardsMu.Lock()
 	if p.released {
 		p.guardsMu.Unlock()
@@ -481,16 +520,16 @@ func (p *AgentPod) RegisteredAgentTypes() []string {
 }
 
 // acquireGuard acquires a demotion guard for the given agent type.
-// When ManagedPod is set, delegates to it for pod-level tracking.
-// Otherwise falls back to the PodActivator.
+// When a direct runtime is configured, it promotes the pod if needed and
+// returns a request guard. Otherwise it falls back to the PodActivator.
 func (p *AgentPod) acquireGuard(ctx context.Context, agentType string) (func(), error) {
-	if p.managed != nil {
-		if p.managed.LoadTier() != pod.TierHot {
-			if err := p.managed.Promote(ctx, nil); err != nil {
+	if p.runtime != nil {
+		if p.LoadTier() != pod.TierHot {
+			if err := p.Promote(ctx, nil); err != nil {
 				return nil, err
 			}
 		}
-		return p.managed.AcquireRequestGuard(), nil
+		return p.AcquireRequestGuard(), nil
 	}
 	if p.activator != nil {
 		return p.activator.HoldPodActive(ctx, p.activator.PodForAgent(agentType))
@@ -543,6 +582,7 @@ func (p *AgentPod) registerOnce(ctx context.Context, agentType string) error {
 		return err
 	}
 	p.logTrace("agent_pod_member_register_done", "debug", agentlog.EventRegistryEvent, "", p.memberTraceData(agentType))
+	p.publishActivity(agentType)
 	return nil
 }
 
@@ -600,10 +640,10 @@ func (p *AgentPod) memberTraceData(agentType string) map[string]any {
 	data := map[string]any{
 		"pod_id":     p.podID,
 		"agent_type": agentType,
-		"managed":    p.managed != nil,
+		"managed":    p.runtime != nil,
 	}
-	if p.managed != nil {
-		data["managed_tier"] = int32(p.managed.LoadTier())
+	if p.runtime != nil {
+		data["managed_tier"] = int32(p.LoadTier())
 	}
 	return data
 }

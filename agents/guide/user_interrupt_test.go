@@ -166,3 +166,206 @@ func TestGuide_UserInterrupt_SessionScopeCancelsAllPendingInSession(t *testing.T
 		}
 	}, 2*time.Second, 10*time.Millisecond)
 }
+
+func TestGuide_UserInterrupt_CancelsPendingDescendants(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	defer func() { _ = bus.Close() }()
+
+	g, err := NewWithClassifier(&MockClassifierClient{DefaultTarget: "architect"}, Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "test-session",
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, g.Start(ctx))
+	defer func() { _ = g.Stop() }()
+
+	actionCh := make(chan *ActionRequest, 8)
+	subArchitect, err := bus.SubscribeAsync(TopicRequests("architect", "architect"), func(m *Message) error {
+		req, ok := m.GetActionRequest()
+		if ok && req != nil {
+			actionCh <- req
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer func() { _ = subArchitect.Unsubscribe() }()
+
+	subLibrarian, err := bus.SubscribeAsync(TopicRequests("librarian", "librarian"), func(m *Message) error {
+		req, ok := m.GetActionRequest()
+		if ok && req != nil {
+			actionCh <- req
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer func() { _ = subLibrarian.Unsubscribe() }()
+
+	root := &RouteRequest{
+		CorrelationID: "corr-root",
+		SourceAgentID: "tui",
+		SessionID:     "session-tree",
+		Timestamp:     time.Now(),
+	}
+	child := &RouteRequest{
+		CorrelationID:       "corr-child",
+		ParentCorrelationID: "corr-root",
+		SourceAgentID:       "inspector-pipeline",
+		SessionID:           "session-tree",
+		Timestamp:           time.Now(),
+	}
+	grandchild := &RouteRequest{
+		CorrelationID:       "corr-grandchild",
+		ParentCorrelationID: "corr-child",
+		SourceAgentID:       "tester-pipeline",
+		SessionID:           "session-tree",
+		Timestamp:           time.Now(),
+	}
+	g.pending.Add(root, &RouteResult{TargetAgent: TargetArchitect, Confidence: 0.99}, "architect")
+	g.pending.Add(child, &RouteResult{TargetAgent: TargetLibrarian, Confidence: 0.99}, "librarian")
+	g.pending.Add(grandchild, &RouteResult{TargetAgent: TargetArchitect, Confidence: 0.99}, "architect")
+
+	interrupt := &UserInterruptRequest{
+		CorrelationID: "corr-root",
+		SourceAgentID: "tui",
+		Reason:        "esc",
+		Timestamp:     time.Now(),
+	}
+	require.NoError(t, bus.Publish(TopicGuideRequests, NewUserInterruptMessage("", interrupt)))
+
+	require.Eventually(t, func() bool {
+		return g.GetPending("corr-root") == nil &&
+			g.GetPending("corr-child") == nil &&
+			g.GetPending("corr-grandchild") == nil
+	}, time.Second, 10*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		seen := map[string]bool{}
+		for {
+			select {
+			case req := <-actionCh:
+				if req == nil || req.Action != "cancel" {
+					continue
+				}
+				seen[req.CorrelationID] = true
+				if seen["corr-root"] && seen["corr-child"] && seen["corr-grandchild"] {
+					return true
+				}
+			default:
+				return false
+			}
+		}
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
+func TestGuide_UserInterrupt_DropsLateChildRouteRequestForInterruptedParent(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	defer func() { _ = bus.Close() }()
+
+	g, err := NewWithClassifier(&MockClassifierClient{DefaultTarget: "architect"}, Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "test-session",
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, g.Start(ctx))
+	defer func() { _ = g.Stop() }()
+
+	forwardedCh := make(chan *ForwardedRequest, 1)
+	sub, err := bus.SubscribeAsync(TopicRequests("architect", "architect"), func(m *Message) error {
+		fwd, ok := m.GetForwardedRequest()
+		if ok && fwd != nil {
+			forwardedCh <- fwd
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer func() { _ = sub.Unsubscribe() }()
+
+	interrupt := &UserInterruptRequest{
+		CorrelationID: "corr-parent",
+		SourceAgentID: "tui",
+		Reason:        "esc",
+		Timestamp:     time.Now(),
+	}
+	require.NoError(t, bus.Publish(TopicGuideRequests, NewUserInterruptMessage("", interrupt)))
+
+	childReq := &RouteRequest{
+		CorrelationID:       "corr-child",
+		ParentCorrelationID: "corr-parent",
+		SourceAgentID:       "inspector-pipeline",
+		TargetAgentID:       "architect",
+		ExplicitTarget:      true,
+		Input:               "late child handoff",
+		SessionID:           "test-session",
+		Timestamp:           time.Now(),
+	}
+	require.NoError(t, bus.Publish(TopicGuideRequests, NewRequestMessage("", childReq)))
+
+	select {
+	case forwarded := <-forwardedCh:
+		t.Fatalf("expected interrupted child request to be dropped, got forward %#v", forwarded)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if pending := g.GetPending("corr-child"); pending != nil {
+		t.Fatalf("expected no pending child request, got %#v", pending)
+	}
+}
+
+func TestGuide_UserInterrupt_DropsLateRerouteForInterruptedCorrelation(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	defer func() { _ = bus.Close() }()
+
+	g, err := NewWithClassifier(&MockClassifierClient{DefaultTarget: "architect"}, Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "test-session",
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, g.Start(ctx))
+	defer func() { _ = g.Stop() }()
+
+	forwardedCh := make(chan *ForwardedRequest, 1)
+	sub, err := bus.SubscribeAsync(TopicRequests("librarian", "librarian"), func(m *Message) error {
+		fwd, ok := m.GetForwardedRequest()
+		if ok && fwd != nil {
+			forwardedCh <- fwd
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer func() { _ = sub.Unsubscribe() }()
+
+	interrupt := &UserInterruptRequest{
+		CorrelationID: "corr-reroute",
+		SourceAgentID: "tui",
+		Reason:        "esc",
+		Timestamp:     time.Now(),
+	}
+	require.NoError(t, bus.Publish(TopicGuideRequests, NewUserInterruptMessage("", interrupt)))
+
+	reroute := &RerouteRequest{
+		OriginalCorrelationID: "corr-reroute",
+		OriginalInput:         "late reroute",
+		SourceAgentID:         "architect",
+		SuggestedTarget:       "librarian",
+		SessionID:             "test-session",
+	}
+	require.NoError(t, bus.Publish(TopicGuideRequests, NewRerouteMessage("", reroute)))
+
+	select {
+	case forwarded := <-forwardedCh:
+		t.Fatalf("expected interrupted reroute to be dropped, got forward %#v", forwarded)
+	case <-time.After(150 * time.Millisecond):
+	}
+}

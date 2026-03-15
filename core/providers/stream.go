@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -248,6 +249,7 @@ func streamViaHandler(ctx context.Context, provider StreamHandlerProvider, req *
 	chunks := make(chan *StreamChunk, 100)
 	go func() {
 		defer close(chunks)
+		defer recoverStreamChunkPanic(chunks)
 		var errorSent bool
 		err := provider.StreamWithHandler(ctx, req, func(chunk *StreamChunk) error {
 			if chunk.Type == ChunkTypeError {
@@ -331,6 +333,21 @@ func recoverStreamPanic(errs chan<- error) {
 		case errs <- err:
 		default:
 			// Error channel full or closed, panic was still recovered
+		}
+	}
+}
+
+func recoverStreamChunkPanic(chunks chan<- *StreamChunk) {
+	if r := recover(); r != nil {
+		errChunk := &StreamChunk{
+			Type:      ChunkTypeError,
+			Text:      fmt.Sprintf("panic in stream: %v\n%s", r, string(debug.Stack())),
+			Timestamp: time.Now(),
+		}
+		select {
+		case chunks <- errChunk:
+		default:
+			// Channel is full or receiver is gone; panic is still recovered.
 		}
 	}
 }

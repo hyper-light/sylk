@@ -91,6 +91,8 @@ func (m *HealthMonitor) checkHealthStatus() {
 
 // runChecks performs all health checks under m.mu and produces a HealthCheckResult.
 func (m *HealthMonitor) runChecks() *HealthCheckResult {
+	taskTimeouts := m.snapshotTaskTimeouts()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -102,13 +104,56 @@ func (m *HealthMonitor) runChecks() *HealthCheckResult {
 
 	for agentID, metrics := range m.agents {
 		m.checkHeartbeatTimeout(agentID, metrics, now)
-		m.checkTaskTimeout(agentID, metrics, now)
+		m.checkTaskTimeout(agentID, metrics, now, taskTimeouts)
 		m.checkErrorRate(agentID, metrics, now)
 		m.checkTransientStorm(agentID, metrics, now)
 		m.updateHealthLevel(metrics)
 	}
 
 	return m.buildCheckResultLocked(now, priorAlertIDs, priorLevels)
+}
+
+type healthTaskTimeoutSnapshot struct {
+	ID             string
+	AssignedAgent  string
+	StageAgent     string
+	Status         TaskStatus
+	PipelineStage  string
+	StartedAt      *time.Time
+	StageStartedAt *time.Time
+}
+
+func (m *HealthMonitor) snapshotTaskTimeouts() []healthTaskTimeoutSnapshot {
+	if m == nil || m.orchestrator == nil || m.orchestrator.state == nil {
+		return nil
+	}
+
+	m.orchestrator.mu.RLock()
+	defer m.orchestrator.mu.RUnlock()
+
+	snapshots := make([]healthTaskTimeoutSnapshot, 0, len(m.orchestrator.state.Tasks))
+	for _, task := range m.orchestrator.state.Tasks {
+		if task == nil {
+			continue
+		}
+		snapshot := healthTaskTimeoutSnapshot{
+			ID:            task.ID,
+			AssignedAgent: task.AssignedAgentID,
+			StageAgent:    task.StageAgentID,
+			Status:        task.Status,
+			PipelineStage: task.PipelineStage,
+		}
+		if task.StartedAt != nil {
+			startedAt := *task.StartedAt
+			snapshot.StartedAt = &startedAt
+		}
+		if task.StageStartedAt != nil {
+			stageStartedAt := *task.StageStartedAt
+			snapshot.StageStartedAt = &stageStartedAt
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	return snapshots
 }
 
 // snapshotAlertIDsLocked captures the set of alert IDs before checks run.
@@ -223,13 +268,9 @@ func (m *HealthMonitor) checkHeartbeatTimeout(agentID string, metrics *AgentHeal
 	}
 }
 
-func (m *HealthMonitor) checkTaskTimeout(agentID string, metrics *AgentHealthMetrics, now time.Time) {
-	if m.orchestrator == nil || m.orchestrator.state == nil {
-		return
-	}
-
-	for _, task := range m.orchestrator.state.Tasks {
-		if task.AssignedAgentID != agentID && task.StageAgentID != agentID {
+func (m *HealthMonitor) checkTaskTimeout(agentID string, metrics *AgentHealthMetrics, now time.Time, tasks []healthTaskTimeoutSnapshot) {
+	for _, task := range tasks {
+		if task.AssignedAgent != agentID && task.StageAgent != agentID {
 			continue
 		}
 		if task.Status.IsTerminal() {

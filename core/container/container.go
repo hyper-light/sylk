@@ -67,12 +67,12 @@ type Container struct {
 
 // ContainerConfig provides construction parameters for a Container.
 type ContainerConfig struct {
-	ID        ContainerID
-	Spec      ContainerSpec
-	Scope     *concurrency.GoroutineScope
-	SecCtx    *csecurity.SecurityContext
-	Agent     ContainerAgent
-	PodID     PodID
+	ID     ContainerID
+	Spec   ContainerSpec
+	Scope  *concurrency.GoroutineScope
+	SecCtx *csecurity.SecurityContext
+	Agent  ContainerAgent
+	PodID  PodID
 }
 
 // NewContainer creates a container in the Created state. The container
@@ -240,7 +240,7 @@ func (c *Container) PodID() PodID {
 	return c.podID
 }
 
-// SetPodID sets the owning pod's ID. Used by ManagedPod during container adoption.
+// SetPodID sets the owning pod's ID. Used by AgentPod during container adoption.
 func (c *Container) SetPodID(id PodID) {
 	c.podID = id
 }

@@ -33,6 +33,10 @@ type mockDispatcher struct {
 	executionTime time.Duration
 }
 
+type cancelledDispatcher struct {
+	calls atomic.Int32
+}
+
 func newMockDispatcher() *mockDispatcher {
 	return &mockDispatcher{
 		executed:   make([]string, 0),
@@ -110,6 +114,15 @@ func (d *mockDispatcher) getExecuted() []string {
 	result := make([]string, len(d.executed))
 	copy(result, d.executed)
 	return result
+}
+
+func (d *cancelledDispatcher) Dispatch(ctx context.Context, node *dag.Node, parentResults map[string]*dag.NodeResult) (*dag.NodeResult, error) {
+	d.calls.Add(1)
+	return &dag.NodeResult{
+		NodeID:  node.ID(),
+		State:   dag.NodeStateCancelled,
+		EndTime: time.Now(),
+	}, nil
 }
 
 func TestNode_New(t *testing.T) {
@@ -423,7 +436,7 @@ func TestExecutor_FailFast(t *testing.T) {
 	executor := dag.NewExecutor(d.Policy(), nil)
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
-	require.Error(t, err)
+	require.NoError(t, err)
 	// DAG should fail or be cancelled (fail fast cancels remaining)
 	assert.True(t, result.State == dag.DAGStateFailed || result.State == dag.DAGStateCancelled,
 		"Expected DAG to fail or be cancelled, got %s", result.State)
@@ -448,7 +461,7 @@ func TestExecutor_ContinueOnFailure(t *testing.T) {
 	executor := dag.NewExecutor(d.Policy(), nil)
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
-	require.Error(t, err)
+	require.NoError(t, err)
 	// DAG should fail (at least one node failed)
 	assert.Equal(t, dag.DAGStateFailed, result.State)
 	// The failed node and its blocked dependent should both count as failed.
@@ -488,7 +501,7 @@ func TestExecutor_BlockedNodeEmitsFailedEvent(t *testing.T) {
 
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
-	require.Error(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, dag.DAGStateFailed, result.State)
 	assert.Equal(t, dag.NodeStateBlocked, result.NodeResults["node-2"].State)
 
@@ -502,6 +515,40 @@ func TestExecutor_BlockedNodeEmitsFailedEvent(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 2, failedEvents)
+}
+
+func TestExecutor_NodeFailedEventIncludesError(t *testing.T) {
+	d, _ := dag.NewBuilder("node-failure-error").
+		WithPolicy(dag.ExecutionPolicy{
+			FailurePolicy:  dag.FailurePolicyFailFast,
+			MaxConcurrency: 1,
+		}).
+		AddNode(dag.NodeConfig{ID: "node-1"}).
+		Build()
+
+	dispatcher := newMockDispatcher()
+	dispatcher.setFail("node-1")
+
+	executor := dag.NewExecutor(d.Policy(), nil)
+
+	var failedEvent *dag.Event
+	var mu sync.Mutex
+	executor.Subscribe(func(e *dag.Event) {
+		if e == nil || e.Type != dag.EventNodeFailed || e.NodeID != "node-1" {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		failedEvent = e
+	})
+
+	_, err := executor.Execute(context.Background(), d, dispatcher)
+	require.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotNil(t, failedEvent)
+	assert.Equal(t, "mock failure", failedEvent.Data["error"])
 }
 
 func TestExecutor_Cancel(t *testing.T) {
@@ -712,6 +759,75 @@ func TestScheduler_ConcurrentDAGs(t *testing.T) {
 	assert.Equal(t, int32(5), atomic.LoadInt32(&completed))
 }
 
+func TestScheduler_Submit_EmitsSingleDAGFailedEvent(t *testing.T) {
+	scheduler := dag.NewScheduler(dag.DefaultSchedulerConfig(), nil)
+	defer scheduler.Close()
+
+	d, _ := dag.NewBuilder("scheduler-failure").
+		WithPolicy(dag.ExecutionPolicy{
+			FailurePolicy:  dag.FailurePolicyFailFast,
+			MaxConcurrency: 1,
+		}).
+		AddNode(dag.NodeConfig{ID: "node-1"}).
+		Build()
+
+	dispatcher := newMockDispatcher()
+	dispatcher.setFail("node-1")
+
+	var failedEvents atomic.Int32
+	finished := make(chan struct{})
+	unsub := scheduler.Subscribe(func(e *dag.Event) {
+		if e == nil {
+			return
+		}
+		if e.Type == dag.EventDAGFailed {
+			failedEvents.Add(1)
+		}
+		if e.Type == dag.EventExecutionRunFinished {
+			select {
+			case <-finished:
+			default:
+				close(finished)
+			}
+		}
+	})
+	defer unsub()
+
+	_, err := scheduler.Submit(context.Background(), d, dispatcher)
+	require.NoError(t, err)
+
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for scheduler run to finish")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	assert.Equal(t, int32(1), failedEvents.Load())
+}
+
+func TestScheduler_SubmitAndWait_ReturnsFailedResultWithoutError(t *testing.T) {
+	scheduler := dag.NewScheduler(dag.DefaultSchedulerConfig(), nil)
+	defer scheduler.Close()
+
+	d, _ := dag.NewBuilder("submit-and-wait-failure").
+		WithPolicy(dag.ExecutionPolicy{
+			FailurePolicy:  dag.FailurePolicyFailFast,
+			MaxConcurrency: 1,
+		}).
+		AddNode(dag.NodeConfig{ID: "node-1"}).
+		Build()
+
+	dispatcher := newMockDispatcher()
+	dispatcher.setFail("node-1")
+
+	result, err := scheduler.SubmitAndWait(context.Background(), d, dispatcher)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, dag.DAGStateFailed, result.State)
+	require.Error(t, result.Error)
+}
+
 func TestExecutor_RetryBackoff(t *testing.T) {
 	d, _ := dag.NewBuilder("retry").
 		WithPolicy(dag.ExecutionPolicy{
@@ -734,6 +850,28 @@ func TestExecutor_RetryBackoff(t *testing.T) {
 	assert.Equal(t, int32(3), dispatcher.callCount("node-1"))
 }
 
+func TestExecutor_CancelledResultDoesNotRetryAndCancelsDAG(t *testing.T) {
+	d, _ := dag.NewBuilder("cancelled-result").
+		WithPolicy(dag.ExecutionPolicy{
+			FailurePolicy:  dag.FailurePolicyFailFast,
+			MaxConcurrency: 1,
+			DefaultRetries: 2,
+			RetryBackoff:   20 * time.Millisecond,
+		}).
+		AddNode(dag.NodeConfig{ID: "node-1"}).
+		Build()
+
+	dispatcher := &cancelledDispatcher{}
+
+	executor := dag.NewExecutor(d.Policy(), nil)
+	result, err := executor.Execute(context.Background(), d, dispatcher)
+
+	require.NoError(t, err)
+	assert.Equal(t, dag.DAGStateCancelled, result.State)
+	require.ErrorIs(t, result.Error, dag.ErrDAGCancelled)
+	assert.Equal(t, int32(1), dispatcher.calls.Load())
+}
+
 func TestExecutor_Timeout(t *testing.T) {
 	d, _ := dag.NewBuilder("timeout").
 		WithPolicy(dag.ExecutionPolicy{
@@ -750,7 +888,7 @@ func TestExecutor_Timeout(t *testing.T) {
 	executor := dag.NewExecutor(d.Policy(), nil)
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
-	require.Error(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, dag.DAGStateFailed, result.State)
 	assert.GreaterOrEqual(t, result.NodesFailed, 1)
 }
@@ -974,8 +1112,9 @@ func TestExecutor_Execute_DoesNotHangOnNodeLaunchError(t *testing.T) {
 		t.Fatal("executor hung after node launch rejection")
 	}
 
-	require.ErrorIs(t, err, concurrency.ErrScopeShutdown)
+	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.Equal(t, dag.DAGStateFailed, result.State)
 	assert.Equal(t, 1, result.NodesFailed)
+	require.ErrorIs(t, result.Error, concurrency.ErrScopeShutdown)
 }

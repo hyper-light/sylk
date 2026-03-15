@@ -8,7 +8,6 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/pipeline/taskstate"
-	"github.com/adalundhe/sylk/core/pipeline/tdd"
 	"github.com/adalundhe/sylk/core/pipeline/variants"
 	"github.com/adalundhe/sylk/ui/msg"
 )
@@ -27,7 +26,6 @@ type PipelineBridge struct {
 	scope           *concurrency.GoroutineScope
 	bus             guide.EventBus
 	variantRegistry variants.Registry
-	pipelineCh      chan tdd.PipelineEvent
 	taskStateCh     chan taskstate.Event
 	variantCh       chan variants.VariantEvent
 	dropped         atomic.Int64
@@ -50,20 +48,9 @@ func NewPipelineBridge(
 		bus:             bus,
 		scope:           scope,
 		variantRegistry: variantRegistry,
-		pipelineCh:      make(chan tdd.PipelineEvent, pipelineEventBuffer),
 		taskStateCh:     make(chan taskstate.Event, pipelineEventBuffer),
 		variantCh:       make(chan variants.VariantEvent, variantEventBuffer),
 		done:            make(chan struct{}),
-	}
-}
-
-// OnPipelineEvent enqueues a pipeline status change. Non-blocking; drops on
-// backpressure and increments the drop counter.
-func (b *PipelineBridge) OnPipelineEvent(evt tdd.PipelineEvent) {
-	select {
-	case b.pipelineCh <- evt:
-	default:
-		b.dropped.Add(1)
 	}
 }
 
@@ -149,8 +136,6 @@ func (b *PipelineBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 				return err
 			}
 			select {
-			case evt := <-b.pipelineCh:
-				program.Send(toPipelineStateMsg(evt))
 			case evt := <-b.taskStateCh:
 				program.Send(toTaskPipelineStateMsg(evt))
 			case evt := <-b.variantCh:
@@ -175,28 +160,6 @@ func toTaskPipelineStateMsg(evt taskstate.Event) msg.PipelineStateMsg {
 		LoopCount:  evt.LoopCount,
 		MaxLoops:   evt.MaxLoops,
 		Timestamp:  evt.Timestamp,
-	}
-}
-
-// toPipelineStateMsg converts a core PipelineEvent to a UI message.
-func toPipelineStateMsg(evt tdd.PipelineEvent) msg.PipelineStateMsg {
-	pipelineID := evt.TaskID
-	if pipelineID == "" {
-		pipelineID = evt.PipelineID
-	}
-	if pipelineID == "" {
-		pipelineID = evt.RuntimePipelineID
-	}
-	return msg.PipelineStateMsg{
-		PipelineID:        pipelineID,
-		RuntimePipelineID: evt.RuntimePipelineID,
-		TaskID:            firstNonEmpty(evt.TaskID, pipelineID),
-		TaskLabel:         evt.TaskSlug,
-		Status:            string(evt.NewStatus),
-		LoopCount:         evt.LoopCount,
-		MaxLoops:          evt.MaxLoops,
-		WorkerType:        string(evt.WorkerType),
-		Timestamp:         evt.Timestamp,
 	}
 }
 

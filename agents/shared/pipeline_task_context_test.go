@@ -95,10 +95,37 @@ func TestBuildPipelineSystemContext_IncludesPipelineProtocol(t *testing.T) {
 		"Active Agents",
 		"Pending Challenge",
 		"Pending Validation",
-		"Inspector is the only pipeline entrypoint",
+		"Inspector is the only pipeline entrypoint and the ultimate pipeline exit point",
+		"The authoritative loop is inspector -> tester -> engineer/designer -> inspector",
+		"Engineer and Designer should hand completed implementation turns back to Inspector",
+		"Inspector should invoke finalize_pipeline to run the audit cycle",
+		"Inspector should invoke handoff_to_ot",
 	} {
 		if !strings.Contains(contextText, want) {
 			t.Fatalf("context missing %q\n%s", want, contextText)
 		}
+	}
+}
+
+func TestComposePipelineTaskUserPrompt_PrioritizesCurrentTurnRequest(t *testing.T) {
+	task := &PipelineTaskInput{
+		TaskID:    "task-cli",
+		AgentType: "tester-pipeline",
+		Prompt:    "Implement the CLI module and package entrypoint.",
+		Context: map[string]any{
+			"pipeline_stage": "test",
+			"pipeline_protocol": map[string]any{
+				"current_request": "Author the red-phase tests for the CLI contract.",
+				"requested_by":    "inspector-pipeline",
+			},
+		},
+	}
+
+	prompt := ComposePipelineTaskUserPrompt(task)
+	if !strings.Contains(prompt, "### Current Turn Request\nAuthor the red-phase tests for the CLI contract.") {
+		t.Fatalf("prompt missing current turn request:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "### Original Task Objective\nImplement the CLI module and package entrypoint.") {
+		t.Fatalf("prompt missing original task objective:\n%s", prompt)
 	}
 }

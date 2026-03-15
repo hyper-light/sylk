@@ -75,6 +75,10 @@ const defaultGuideRequestTimeout = 120 * time.Second
 // reroutes add a second hop (hops=2). Anything beyond 3 is pathological.
 const maxRouteHops = 3
 
+// interruptedCorrelationTTL bounds the lifetime of cancellation tombstones.
+// Correlation IDs are unique, so this is only for memory hygiene.
+const interruptedCorrelationTTL = 15 * time.Minute
+
 // =============================================================================
 // Guide Agent
 // =============================================================================
@@ -211,6 +215,9 @@ type Guide struct {
 	requestCancelMu sync.Mutex
 	requestCancels  map[string]context.CancelFunc
 
+	interruptedMu           sync.Mutex
+	interruptedCorrelations map[string]time.Time
+
 	responseMsgMu        sync.Mutex
 	responseMessagesSeen map[string]time.Time
 	completedPendingMu   sync.Mutex
@@ -334,36 +341,37 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 	selfResponder := resolveGuideSelfResponder(cfg, nil, "", nil)
 
 	guide := &Guide{
-		router:               router,
-		config:               cfg,
-		bus:                  cfg.Bus,
-		activityPub:          cfg.ActivityPub,
-		agentSubs:            NewStringMap[*agentSubscriptions](DefaultShardCount),
-		agentChannels:        NewStringMap[*AgentChannels](DefaultShardCount),
-		readyAgents:          NewStringMap[bool](DefaultShardCount),
-		typeIndex:            NewStringMap[string](DefaultShardCount),
-		podIndex:             NewStringMap[string](DefaultShardCount),
-		registry:             registry,
-		routing:              routing,
-		triggers:             NewTriggerDetector(routing),
-		pending:              NewPendingStore(pendingCfg),
-		routeCache:           NewRouteCache(cacheCfg),
-		circuits:             circuits,
-		health:               health,
-		dlq:                  dlq,
-		pendingCleanup:       pendingCleanup,
-		observer:             NewConsultationObserver(cfg.Bus, cfg.SessionID),
-		skills:               skillsRegistry,
-		skillLoader:          nil,
-		hooks:                hookRegistry,
-		selfResponder:        selfResponder,
-		sessionID:            cfg.SessionID,
-		agentID:              agentID,
-		workspaceViews:       authority.RestrictWorkspaceViews("guide", cfg.WorkspaceViews),
-		requestCancels:       make(map[string]context.CancelFunc),
-		responseMessagesSeen: make(map[string]time.Time),
-		completedPendings:    make(map[string]completedPendingRoute),
-		streamReroutes:       make(map[string]string),
+		router:                  router,
+		config:                  cfg,
+		bus:                     cfg.Bus,
+		activityPub:             cfg.ActivityPub,
+		agentSubs:               NewStringMap[*agentSubscriptions](DefaultShardCount),
+		agentChannels:           NewStringMap[*AgentChannels](DefaultShardCount),
+		readyAgents:             NewStringMap[bool](DefaultShardCount),
+		typeIndex:               NewStringMap[string](DefaultShardCount),
+		podIndex:                NewStringMap[string](DefaultShardCount),
+		registry:                registry,
+		routing:                 routing,
+		triggers:                NewTriggerDetector(routing),
+		pending:                 NewPendingStore(pendingCfg),
+		routeCache:              NewRouteCache(cacheCfg),
+		circuits:                circuits,
+		health:                  health,
+		dlq:                     dlq,
+		pendingCleanup:          pendingCleanup,
+		observer:                NewConsultationObserver(cfg.Bus, cfg.SessionID),
+		skills:                  skillsRegistry,
+		skillLoader:             nil,
+		hooks:                   hookRegistry,
+		selfResponder:           selfResponder,
+		sessionID:               cfg.SessionID,
+		agentID:                 agentID,
+		workspaceViews:          authority.RestrictWorkspaceViews("guide", cfg.WorkspaceViews),
+		requestCancels:          make(map[string]context.CancelFunc),
+		interruptedCorrelations: make(map[string]time.Time),
+		responseMessagesSeen:    make(map[string]time.Time),
+		completedPendings:       make(map[string]completedPendingRoute),
+		streamReroutes:          make(map[string]string),
 	}
 
 	if err := guide.initializeSkills(loaderCfg); err != nil {
@@ -501,37 +509,38 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 	selfResponder := resolveGuideSelfResponder(cfg, nil, "", nil)
 
 	guide := &Guide{
-		router:               router,
-		config:               cfg,
-		bus:                  cfg.Bus,
-		activityPub:          cfg.ActivityPub,
-		agentSubs:            NewStringMap[*agentSubscriptions](DefaultShardCount),
-		agentChannels:        NewStringMap[*AgentChannels](DefaultShardCount),
-		readyAgents:          NewStringMap[bool](DefaultShardCount),
-		typeIndex:            NewStringMap[string](DefaultShardCount),
-		podIndex:             NewStringMap[string](DefaultShardCount),
-		registry:             registry,
-		routing:              routing,
-		triggers:             NewTriggerDetector(routing),
-		pending:              NewPendingStore(pendingCfg),
-		routeCache:           NewRouteCache(cacheCfg),
-		circuits:             circuits,
-		health:               health,
-		dlq:                  dlq,
-		pendingCleanup:       pendingCleanup,
-		observer:             NewConsultationObserver(cfg.Bus, cfg.SessionID),
-		skills:               skillsRegistry,
-		skillLoader:          nil,
-		hooks:                hookRegistry,
-		selfResponder:        selfResponder,
-		googleConfig:         cfg.GoogleConfig,
-		sessionID:            cfg.SessionID,
-		agentID:              agentID,
-		workspaceViews:       authority.RestrictWorkspaceViews("guide", cfg.WorkspaceViews),
-		requestCancels:       make(map[string]context.CancelFunc),
-		responseMessagesSeen: make(map[string]time.Time),
-		completedPendings:    make(map[string]completedPendingRoute),
-		streamReroutes:       make(map[string]string),
+		router:                  router,
+		config:                  cfg,
+		bus:                     cfg.Bus,
+		activityPub:             cfg.ActivityPub,
+		agentSubs:               NewStringMap[*agentSubscriptions](DefaultShardCount),
+		agentChannels:           NewStringMap[*AgentChannels](DefaultShardCount),
+		readyAgents:             NewStringMap[bool](DefaultShardCount),
+		typeIndex:               NewStringMap[string](DefaultShardCount),
+		podIndex:                NewStringMap[string](DefaultShardCount),
+		registry:                registry,
+		routing:                 routing,
+		triggers:                NewTriggerDetector(routing),
+		pending:                 NewPendingStore(pendingCfg),
+		routeCache:              NewRouteCache(cacheCfg),
+		circuits:                circuits,
+		health:                  health,
+		dlq:                     dlq,
+		pendingCleanup:          pendingCleanup,
+		observer:                NewConsultationObserver(cfg.Bus, cfg.SessionID),
+		skills:                  skillsRegistry,
+		skillLoader:             nil,
+		hooks:                   hookRegistry,
+		selfResponder:           selfResponder,
+		googleConfig:            cfg.GoogleConfig,
+		sessionID:               cfg.SessionID,
+		agentID:                 agentID,
+		workspaceViews:          authority.RestrictWorkspaceViews("guide", cfg.WorkspaceViews),
+		requestCancels:          make(map[string]context.CancelFunc),
+		interruptedCorrelations: make(map[string]time.Time),
+		responseMessagesSeen:    make(map[string]time.Time),
+		completedPendings:       make(map[string]completedPendingRoute),
+		streamReroutes:          make(map[string]string),
 	}
 
 	if err := guide.initializeSkills(loaderCfg); err != nil {
@@ -605,38 +614,39 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 	selfResponder := resolveGuideSelfResponder(cfg, provider, model, nil)
 
 	guide := &Guide{
-		router:         router,
-		config:         cfg,
-		bus:            cfg.Bus,
-		activityPub:    cfg.ActivityPub,
-		eventLogger:    guideEventLogger,
-		agentSubs:      NewStringMap[*agentSubscriptions](DefaultShardCount),
-		agentChannels:  NewStringMap[*AgentChannels](DefaultShardCount),
-		readyAgents:    NewStringMap[bool](DefaultShardCount),
-		typeIndex:      NewStringMap[string](DefaultShardCount),
-		podIndex:       NewStringMap[string](DefaultShardCount),
-		registry:       registry,
-		routing:        routing,
-		triggers:       NewTriggerDetector(routing),
-		pending:        NewPendingStore(pendingCfg),
-		routeCache:     NewRouteCache(cacheCfg),
-		circuits:       circuits,
-		health:         health,
-		dlq:            dlq,
-		pendingCleanup: pendingCleanup,
-		observer:       NewConsultationObserver(cfg.Bus, cfg.SessionID),
-		skills:         skillsRegistry,
-		skillLoader:    nil,
-		hooks:          hookRegistry,
-		selfResponder:  selfResponder,
-		googleConfig:   cfg.GoogleConfig,
-		provider:       provider,
-		activeModel:    model,
-		sessionID:      cfg.SessionID,
-		agentID:        agentID,
-		workspaceViews: authority.RestrictWorkspaceViews("guide", cfg.WorkspaceViews),
-		requestCancels: make(map[string]context.CancelFunc),
-		streamReroutes: make(map[string]string),
+		router:                  router,
+		config:                  cfg,
+		bus:                     cfg.Bus,
+		activityPub:             cfg.ActivityPub,
+		eventLogger:             guideEventLogger,
+		agentSubs:               NewStringMap[*agentSubscriptions](DefaultShardCount),
+		agentChannels:           NewStringMap[*AgentChannels](DefaultShardCount),
+		readyAgents:             NewStringMap[bool](DefaultShardCount),
+		typeIndex:               NewStringMap[string](DefaultShardCount),
+		podIndex:                NewStringMap[string](DefaultShardCount),
+		registry:                registry,
+		routing:                 routing,
+		triggers:                NewTriggerDetector(routing),
+		pending:                 NewPendingStore(pendingCfg),
+		routeCache:              NewRouteCache(cacheCfg),
+		circuits:                circuits,
+		health:                  health,
+		dlq:                     dlq,
+		pendingCleanup:          pendingCleanup,
+		observer:                NewConsultationObserver(cfg.Bus, cfg.SessionID),
+		skills:                  skillsRegistry,
+		skillLoader:             nil,
+		hooks:                   hookRegistry,
+		selfResponder:           selfResponder,
+		googleConfig:            cfg.GoogleConfig,
+		provider:                provider,
+		activeModel:             model,
+		sessionID:               cfg.SessionID,
+		agentID:                 agentID,
+		workspaceViews:          authority.RestrictWorkspaceViews("guide", cfg.WorkspaceViews),
+		requestCancels:          make(map[string]context.CancelFunc),
+		interruptedCorrelations: make(map[string]time.Time),
+		streamReroutes:          make(map[string]string),
 	}
 
 	if err := guide.initializeSkills(loaderCfg); err != nil {
@@ -2855,6 +2865,13 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 		"hops", req.Hops)
 	correlationID := routeCorrelationID(msg, req)
 	req.CorrelationID = correlationID
+	if g.requestInterrupted(req) {
+		guideFileLog().Info("guide: dropping interrupted route request",
+			"correlation_id", req.CorrelationID,
+			"parent_correlation_id", req.ParentCorrelationID,
+			"source_agent", req.SourceAgentID)
+		return nil
+	}
 
 	// Lazily bind the event logger to the session directory on first request.
 	if req.SessionID != "" && g.eventLogger != nil && !g.eventLogger.IsBound() {
@@ -2908,6 +2925,14 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 		guideFileLog().Info("DEBUG: route_error", "correlation_id", correlationID, "error", err)
 		return g.publishRouteError(correlationID, req.SourceAgentID, err)
 	}
+	if g.requestInterrupted(req) {
+		guideFileLog().Info("guide: dropping resolved request after interrupt",
+			"correlation_id", req.CorrelationID,
+			"resolved_correlation_id", forwarded.CorrelationID,
+			"parent_correlation_id", req.ParentCorrelationID)
+		g.discardInterruptedPending(forwarded.CorrelationID)
+		return nil
+	}
 	pending := g.pending.Get(forwarded.CorrelationID)
 	if pending == nil {
 		return fmt.Errorf("no pending request found for correlation ID: %s", forwarded.CorrelationID)
@@ -2950,10 +2975,11 @@ func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
 
 	// Build a fresh RouteRequest from the reroute payload.
 	req := &RouteRequest{
-		Input:         reroute.OriginalInput,
-		SourceAgentID: reroute.SourceAgentID,
-		SessionID:     reroute.SessionID,
-		Timestamp:     msg.Timestamp,
+		Input:               reroute.OriginalInput,
+		SourceAgentID:       reroute.SourceAgentID,
+		ParentCorrelationID: strings.TrimSpace(reroute.OriginalCorrelationID),
+		SessionID:           reroute.SessionID,
+		Timestamp:           msg.Timestamp,
 	}
 
 	// If the source agent suggested a target, try that first.
@@ -2964,6 +2990,13 @@ func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
 	g.ensureRequestDefaults(req)
 	correlationID := generateMessageID()
 	req.CorrelationID = correlationID
+	if g.requestInterrupted(req) || g.isInterruptedCorrelation(msg.CorrelationID) {
+		guideFileLog().Info("guide: dropping reroute for interrupted request",
+			"original_correlation_id", reroute.OriginalCorrelationID,
+			"new_correlation_id", correlationID,
+			"source_agent", reroute.SourceAgentID)
+		return nil
+	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, defaultGuideRequestTimeout)
 	g.registerRequestCancel(correlationID, cancel)
@@ -2984,6 +3017,13 @@ func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
 			return nil
 		}
 		return g.publishRouteError(correlationID, req.SourceAgentID, err)
+	}
+	if g.requestInterrupted(req) {
+		guideFileLog().Info("guide: dropping resolved reroute after interrupt",
+			"original_correlation_id", reroute.OriginalCorrelationID,
+			"new_correlation_id", forwarded.CorrelationID)
+		g.discardInterruptedPending(forwarded.CorrelationID)
+		return nil
 	}
 
 	// Publish reroute notification for UI.
@@ -3936,6 +3976,107 @@ func (g *Guide) cancelRequestContext(correlationID string) bool {
 	return true
 }
 
+func (g *Guide) markInterruptedCorrelation(correlationID string) {
+	if g == nil {
+		return
+	}
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	now := time.Now()
+	g.interruptedMu.Lock()
+	g.pruneInterruptedCorrelationsLocked(now)
+	g.interruptedCorrelations[correlationID] = now
+	g.interruptedMu.Unlock()
+}
+
+func (g *Guide) isInterruptedCorrelation(correlationID string) bool {
+	if g == nil {
+		return false
+	}
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return false
+	}
+	now := time.Now()
+	g.interruptedMu.Lock()
+	g.pruneInterruptedCorrelationsLocked(now)
+	_, ok := g.interruptedCorrelations[correlationID]
+	g.interruptedMu.Unlock()
+	return ok
+}
+
+func (g *Guide) pruneInterruptedCorrelationsLocked(now time.Time) {
+	for correlationID, seenAt := range g.interruptedCorrelations {
+		if now.Sub(seenAt) > interruptedCorrelationTTL {
+			delete(g.interruptedCorrelations, correlationID)
+		}
+	}
+}
+
+func (g *Guide) requestInterrupted(req *RouteRequest) bool {
+	if req == nil {
+		return false
+	}
+	return g.isInterruptedCorrelation(req.CorrelationID) || g.isInterruptedCorrelation(req.ParentCorrelationID)
+}
+
+func (g *Guide) discardInterruptedPending(correlationID string) {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	g.markInterruptedCorrelation(correlationID)
+	g.cancelRequestContext(correlationID)
+	pending := g.pending.Remove(correlationID)
+	g.reclaimRequestEpoch(correlationID, pending)
+	if g.streams != nil {
+		g.streams.CloseStream(correlationID)
+	}
+}
+
+func (g *Guide) interruptCorrelationTree(req *UserInterruptRequest, rootCorrelationID string) {
+	rootCorrelationID = strings.TrimSpace(rootCorrelationID)
+	if g == nil || g.pending == nil || rootCorrelationID == "" {
+		return
+	}
+
+	queue := []string{rootCorrelationID}
+	visited := make(map[string]struct{}, 4)
+	for len(queue) > 0 {
+		correlationID := strings.TrimSpace(queue[0])
+		queue = queue[1:]
+		if correlationID == "" {
+			continue
+		}
+		if _, ok := visited[correlationID]; ok {
+			continue
+		}
+		visited[correlationID] = struct{}{}
+
+		children := g.pending.GetByParent(correlationID)
+		g.markInterruptedCorrelation(correlationID)
+		g.cancelRequestContext(correlationID)
+		pending := g.pending.Remove(correlationID)
+		if pending != nil || correlationID == rootCorrelationID {
+			g.reclaimRequestEpoch(correlationID, pending)
+		}
+		if pending != nil {
+			g.forwardUserInterruptToTarget(req, pending)
+		}
+		if g.streams != nil {
+			g.streams.CloseStream(correlationID)
+		}
+		for _, child := range children {
+			if child == nil {
+				continue
+			}
+			queue = append(queue, strings.TrimSpace(child.CorrelationID))
+		}
+	}
+}
+
 func (g *Guide) handleUserInterruptMessage(msg *Message) error {
 	req, correlationID := g.interruptRequestFromMessage(msg)
 	if req != nil && req.Scope == UserInterruptScopeSession && strings.TrimSpace(req.SessionID) != "" {
@@ -3945,18 +4086,7 @@ func (g *Guide) handleUserInterruptMessage(msg *Message) error {
 	if correlationID == "" {
 		return nil
 	}
-	g.cancelRequestContext(correlationID)
-	pending := g.pending.Remove(correlationID)
-	// Epoch-based reclamation: sweep all state tagged with this
-	// correlation epoch. Prevents stale fast-path routing, ghost
-	// streams, and orphaned request contexts.
-	g.reclaimRequestEpoch(correlationID, pending)
-	if pending != nil {
-		g.forwardUserInterruptToTarget(req, pending)
-	}
-	if g.streams != nil {
-		g.streams.CloseStream(correlationID)
-	}
+	g.interruptCorrelationTree(req, correlationID)
 	return nil
 }
 
@@ -3978,16 +4108,7 @@ func (g *Guide) handleSessionInterrupt(req *UserInterruptRequest) {
 		if correlationID == "" {
 			continue
 		}
-		g.cancelRequestContext(correlationID)
-		pending := g.pending.Remove(correlationID)
-		if pending == nil {
-			continue
-		}
-		g.reclaimRequestEpoch(correlationID, pending)
-		g.forwardUserInterruptToTarget(req, pending)
-		if g.streams != nil {
-			g.streams.CloseStream(correlationID)
-		}
+		g.interruptCorrelationTree(req, correlationID)
 	}
 
 	if g.conversation != nil {
