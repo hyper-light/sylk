@@ -20,6 +20,15 @@ func TestPipelineInspectorSystemPromptForContract_OmitsValidationProtocolPreImpl
 			t.Fatalf("pre-implementation prompt unexpectedly contains %q", blocked)
 		}
 	}
+	for _, want := range []string{
+		"# Workspace Layers",
+		"Pipeline VFS: task-scoped unmerged in-progress work for the active pipeline.",
+		"`run_command` and `run_shell_script` execute against that same layered workspace view",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("pre-implementation prompt missing %q", want)
+		}
+	}
 }
 
 func TestPipelineInspectorSystemPromptForContract_IncludesValidationProtocolWithImplementationEvidence(t *testing.T) {
@@ -37,6 +46,9 @@ func TestPipelineInspectorSystemPromptForContract_IncludesValidationProtocolWith
 		"Each time Engineer or Designer hands work back to you, invoke `finalize_pipeline` to run the inspector audit cycle and challenge Tester.",
 		"If the `finalize_pipeline` audit passes and tester evidence confirms the required tests are implemented and passing, you must immediately invoke `handoff_to_ot` and stop looping.",
 		"Use `handoff_to_ot` only when you are satisfied that the latest `finalize_pipeline` audit cycle passed and the pipeline should terminate successfully, and do not start another audit cycle once `finalize_pipeline` reports readiness for OT.",
+		"# Workspace Layers",
+		"Pipeline VFS: task-scoped unmerged in-progress work for the active pipeline.",
+		"`run_command` and `run_shell_script` execute against that same layered workspace view",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("implementation-validation prompt missing %q", want)

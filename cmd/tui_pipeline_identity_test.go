@@ -88,14 +88,14 @@ func TestTaskScopedWorkerRoutingInfo_StripsAmbiguousGlobalAliases(t *testing.T) 
 	if info == nil {
 		t.Fatal("taskScopedWorkerRoutingInfo() returned nil")
 	}
-	if info.Name != "task-7-inspector-pipeline" {
-		t.Fatalf("Name = %q, want %q", info.Name, "task-7-inspector-pipeline")
+	if info.Name != "inspector-pipeline" {
+		t.Fatalf("Name = %q, want %q", info.Name, "inspector-pipeline")
 	}
 	if info.PodID != "task-7" {
 		t.Fatalf("PodID = %q, want task-7", info.PodID)
 	}
-	if len(info.Aliases) != 0 {
-		t.Fatalf("Aliases = %v, want empty", info.Aliases)
+	if len(info.Aliases) != 1 || info.Aliases[0] != "task-7-inspector-pipeline" {
+		t.Fatalf("Aliases = %v, want [task-7-inspector-pipeline]", info.Aliases)
 	}
 	if len(info.ActionShortcuts) != 0 {
 		t.Fatalf("ActionShortcuts = %v, want empty", info.ActionShortcuts)
@@ -106,10 +106,10 @@ func TestTaskScopedWorkerRoutingInfo_StripsAmbiguousGlobalAliases(t *testing.T) 
 	if info.Registration == nil {
 		t.Fatal("Registration = nil")
 	}
-	if info.Registration.Name != "task-7-inspector-pipeline" {
-		t.Fatalf("Registration.Name = %q, want %q", info.Registration.Name, "task-7-inspector-pipeline")
+	if info.Registration.Name != "inspector-pipeline" {
+		t.Fatalf("Registration.Name = %q, want %q", info.Registration.Name, "inspector-pipeline")
 	}
-	if len(info.Registration.Aliases) != 0 {
-		t.Fatalf("Registration.Aliases = %v, want empty", info.Registration.Aliases)
+	if len(info.Registration.Aliases) != 1 || info.Registration.Aliases[0] != "task-7-inspector-pipeline" {
+		t.Fatalf("Registration.Aliases = %v, want [task-7-inspector-pipeline]", info.Registration.Aliases)
 	}
 }

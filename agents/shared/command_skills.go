@@ -60,7 +60,7 @@ type runShellScriptParams struct {
 
 func NewRunCommandSkill(cfg CommandSkillConfig) *skills.Skill {
 	return skills.NewSkill("run_command").
-		Description("Execute exactly one plain shell command. Pre-approved commands run directly; other commands are routed through Guardian approval.").
+		Description("Execute exactly one plain shell command against the agent's current workspace view. Pre-approved commands run directly; other commands are routed through Guardian approval.").
 		Domain("code").
 		Keywords("run", "execute", "command", "shell", "verify").
 		Priority(80).
@@ -69,6 +69,7 @@ func NewRunCommandSkill(cfg CommandSkillConfig) *skills.Skill {
 		Satisfies("Produces concrete execution evidence for validation, diagnosis, and reporting.").
 		Avoid("Do not chain setup steps, use cd, or pack multiple logical operations into one call.").
 		BestPractice("Use working_dir instead of prefixing the command with cd.").
+		BestPractice("When strict execution is available, this command reads the same disk/global/pipeline workspace view the agent is operating on; it is not limited to already-committed files on disk.").
 		BestPractice("If the task needs &&, ||, ;, pipes, redirection, shell variables, or multi-line shell, use run_shell_script instead.").
 		StringParam("command", "Single command to execute", true).
 		StringParam("working_dir", "Working directory for command execution", false).
@@ -85,7 +86,7 @@ func NewRunCommandSkill(cfg CommandSkillConfig) *skills.Skill {
 
 func NewRunShellScriptSkill(cfg CommandSkillConfig) *skills.Skill {
 	return skills.NewSkill("run_shell_script").
-		Description("Execute a shell script or compound shell command when the task requires chaining, pipes, redirection, shell variables, or multi-line shell.").
+		Description("Execute a shell script or compound shell command against the agent's current workspace view when the task requires chaining, pipes, redirection, shell variables, or multi-line shell.").
 		Domain("code").
 		Keywords("run", "shell", "script", "compound", "pipe", "redirect").
 		Priority(78).
@@ -94,6 +95,7 @@ func NewRunShellScriptSkill(cfg CommandSkillConfig) *skills.Skill {
 		Satisfies("Provides controlled execution for compound shell workflows that need exact user approval semantics.").
 		Avoid("Do not use run_shell_script for simple commands that fit in run_command, and do not use it as a shortcut around write tools.").
 		BestPractice("Keep the script minimal and purpose-built for the current task.").
+		BestPractice("When strict execution is available, the script runs against the same disk/global/pipeline workspace view the agent is operating on, including VFS-backed files that are not committed to disk yet.").
 		BestPractice("This tool uses exact-command approval only; broad pre-approval does not apply.").
 		StringParam("script", "Shell script or compound shell command to execute", true).
 		StringParam("working_dir", "Working directory for script execution", false).

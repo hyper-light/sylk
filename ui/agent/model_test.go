@@ -863,6 +863,51 @@ func TestModel_ViewHeightStaysFixedAsPipelinesAreAdded(t *testing.T) {
 	}
 }
 
+func TestModel_ViewPinsFooterToBottomWhenPipelinesOverflow(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(32, 8)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "guide", "guide")
+	pushAgentActivity(model, "librarian", "librarian")
+
+	for _, slug := range []string{"auth-checkout", "payment-retry", "cli-packaging", "search-tuning"} {
+		pipelineID := "task_" + strings.ReplaceAll(slug, "-", "_")
+		model.Update(msg.PipelineStateMsg{
+			PipelineID: pipelineID,
+			TaskID:     pipelineID,
+			TaskLabel:  slug,
+			Status:     "executing",
+			LoopCount:  1,
+			MaxLoops:   4,
+		})
+		_, _ = model.Update(msg.ActivityEventMsg{
+			Event: &events.ActivityEvent{
+				ID:        "evt_" + pipelineID,
+				EventType: events.EventTypeAgentRegistered,
+				Timestamp: time.Now(),
+				AgentID:   pipelineID + ":engineer",
+				Data: map[string]any{
+					"agent_name":  "Engineer",
+					"agent_type":  "engineer",
+					"pipeline_id": pipelineID,
+					"task_id":     pipelineID,
+					"task_slug":   slug,
+				},
+			},
+		})
+	}
+
+	lines := strings.Split(stripANSI(model.View()), "\n")
+	if len(lines) != 8 {
+		t.Fatalf("rendered lines = %d, want 8", len(lines))
+	}
+	footerLine := footerLineIndex(lines)
+	if footerLine != len(lines)-1 {
+		t.Fatalf("footer line = %d, want %d in overflow view:\n%s", footerLine, len(lines)-1, strings.Join(lines, "\n"))
+	}
+}
+
 func TestModel_PipelineOverflowKeepsKnowledgeVisible(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 12)
@@ -957,6 +1002,61 @@ func TestModel_ScrollDownMovesOnlyPipelineViewport(t *testing.T) {
 	}
 	if model.pipelineScroll <= scrollBefore {
 		t.Fatalf("pipelineScroll = %d, want > %d", model.pipelineScroll, scrollBefore)
+	}
+}
+
+func TestModel_ScrollingOverflowingPipelinesKeepsFooterPinned(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(32, 8)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "guide", "guide")
+	pushAgentActivity(model, "librarian", "librarian")
+
+	for _, slug := range []string{"auth-checkout", "payment-retry", "cli-packaging", "search-tuning"} {
+		pipelineID := "task_" + strings.ReplaceAll(slug, "-", "_")
+		model.Update(msg.PipelineStateMsg{
+			PipelineID: pipelineID,
+			TaskID:     pipelineID,
+			TaskLabel:  slug,
+			Status:     "executing",
+			LoopCount:  1,
+			MaxLoops:   4,
+		})
+		_, _ = model.Update(msg.ActivityEventMsg{
+			Event: &events.ActivityEvent{
+				ID:        "evt_scroll_" + pipelineID,
+				EventType: events.EventTypeAgentRegistered,
+				Timestamp: time.Now(),
+				AgentID:   pipelineID + ":engineer",
+				Data: map[string]any{
+					"agent_name":  "Engineer",
+					"agent_type":  "engineer",
+					"pipeline_id": pipelineID,
+					"task_id":     pipelineID,
+					"task_slug":   slug,
+				},
+			},
+		})
+	}
+
+	seenLastPipeline := false
+	for range 16 {
+		lines := strings.Split(stripANSI(model.View()), "\n")
+		if footerLine := footerLineIndex(lines); footerLine != len(lines)-1 {
+			t.Fatalf("footer line = %d, want %d while scrolling:\n%s", footerLine, len(lines)-1, strings.Join(lines, "\n"))
+		}
+		if strings.Contains(strings.Join(lines, "\n"), "search-tuning") {
+			seenLastPipeline = true
+			break
+		}
+		if !model.ScrollDown() {
+			break
+		}
+	}
+
+	if !seenLastPipeline {
+		t.Fatalf("expected to scroll the last pipeline into view, final scroll=%d", model.pipelineScroll)
 	}
 }
 
@@ -1231,6 +1331,15 @@ var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 func stripANSI(s string) string {
 	return ansiPattern.ReplaceAllString(s, "")
+}
+
+func footerLineIndex(lines []string) int {
+	for i, line := range lines {
+		if strings.Contains(line, "╰") {
+			return i
+		}
+	}
+	return -1
 }
 
 func TestModel_PipelineActivityUsesCanonicalPipelineRowID(t *testing.T) {

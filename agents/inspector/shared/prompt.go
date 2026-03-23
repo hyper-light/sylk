@@ -38,7 +38,11 @@ func PipelineInspectorSystemPrompt() string {
 	return pipelineSystem + promptSeparator +
 		pipelineProtocol + promptSeparator +
 		InspectorSkillsPolicy + promptSeparator +
-		InspectorGuardrails
+		InspectorGuardrails + promptSeparator +
+		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
+			DefaultView:     versioning.WorkspaceViewPipeline,
+			IncludePipeline: true,
+		})
 }
 
 // PipelineInspectorSystemPromptForContract omits the implementation-validation
@@ -49,7 +53,12 @@ func PipelineInspectorSystemPromptForContract(contract *agentshared.TaskExecutio
 	if contract == nil || !contract.PreImplementation {
 		parts = append(parts, pipelineProtocol)
 	}
-	parts = append(parts, InspectorSkillsPolicy, InspectorGuardrails)
+	parts = append(parts, InspectorSkillsPolicy, InspectorGuardrails,
+		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
+			DefaultView:     versioning.WorkspaceViewPipeline,
+			IncludePipeline: true,
+		}),
+	)
 	return joinNonEmpty(parts, promptSeparator)
 }
 

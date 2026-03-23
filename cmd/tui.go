@@ -2346,15 +2346,22 @@ func taskScopedWorkerRoutingInfo(info *guide.AgentRoutingInfo, podID, agentType 
 		return nil
 	}
 	cloned := *info
+	taskAlias := orchestrator.TaskScopedRoutingName("", podID, agentType)
 	cloned.PodID = podID
-	cloned.Name = orchestrator.TaskScopedRoutingName("", podID, agentType)
+	cloned.Name = strings.TrimSpace(info.Name)
 	cloned.Aliases = nil
+	if taskAlias != "" && taskAlias != cloned.Name {
+		cloned.Aliases = []string{taskAlias}
+	}
 	cloned.ActionShortcuts = nil
 	cloned.Triggers = guide.AgentTriggers{}
 	if info.Registration != nil {
 		reg := *info.Registration
-		reg.Name = cloned.Name
+		reg.Name = strings.TrimSpace(info.Registration.Name)
 		reg.Aliases = nil
+		if taskAlias != "" && taskAlias != reg.Name {
+			reg.Aliases = []string{taskAlias}
+		}
 		cloned.Registration = &reg
 	}
 	return &cloned

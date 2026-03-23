@@ -2407,11 +2407,11 @@ func (m *Model) renderListView() string {
 
 func (m *Model) renderFlatListView(elapsed time.Duration, anim AnimState) string {
 	contentHeight := m.height
-	rowBudget := contentHeight
+	rowBudget := max(contentHeight-m.listFooterHeight(contentHeight), 0)
 	m.resetLineRowMap()
 	lines := make([]string, 0, min(len(m.rows)*2, contentHeight))
 	var consumedLines int
-	lastContentIdx := -1
+	lastVisibleIdx := -1
 	start, end := m.visibleListWindow(rowBudget)
 
 	for i := start; i < end; i++ {
@@ -2427,12 +2427,12 @@ func (m *Model) renderFlatListView(elapsed time.Duration, anim AnimState) string
 			break
 		}
 		consumedLines += appended
-		if isContent {
-			lastContentIdx = i
+		if isContent || appended > 0 {
+			lastVisibleIdx = i
 		}
 	}
 
-	lines = m.finalizeListLines(lines, contentHeight, lastContentIdx, elapsed)
+	lines = m.finalizeListLines(lines, contentHeight, lastVisibleIdx, elapsed)
 	return strings.Join(lines, "\n")
 }
 
@@ -2442,7 +2442,7 @@ func (m *Model) renderSectionedListView(elapsed time.Duration, anim AnimState) s
 		return ""
 	}
 
-	contentBudget := contentHeight
+	contentBudget := max(contentHeight-m.listFooterHeight(contentHeight), 0)
 	preEnd, preludeStart, bodyStart, ok := m.pipelineSectionLayout()
 	if !ok {
 		return m.renderFlatListView(elapsed, anim)
@@ -2453,18 +2453,19 @@ func (m *Model) renderSectionedListView(elapsed time.Duration, anim AnimState) s
 	preVisible := m.compactPrePipelineRows(preEnd, max(contentBudget-pipelineReserve, 0))
 	m.resetLineRowMap()
 	lines := make([]string, 0, min(len(m.rows)+1, contentHeight))
-	lastContentIdx := -1
+	lastVisibleIdx := -1
 
 	for _, rowIdx := range preVisible {
 		line, renderOK, isContent := m.renderListRow(m.rows[rowIdx], rowIdx, elapsed, anim)
 		if !renderOK {
 			continue
 		}
-		if m.appendRenderedRowLines(&lines, line, rowIdx, contentHeight-len(lines)) == 0 {
+		appended := m.appendRenderedRowLines(&lines, line, rowIdx, contentHeight-len(lines))
+		if appended == 0 {
 			break
 		}
-		if isContent {
-			lastContentIdx = rowIdx
+		if isContent || appended > 0 {
+			lastVisibleIdx = rowIdx
 		}
 	}
 
@@ -2479,8 +2480,8 @@ func (m *Model) renderSectionedListView(elapsed time.Duration, anim AnimState) s
 			break
 		}
 		remainingHeight -= appended
-		if isContent {
-			lastContentIdx = rowIdx
+		if isContent || appended > 0 {
+			lastVisibleIdx = rowIdx
 		}
 	}
 
@@ -2514,8 +2515,8 @@ func (m *Model) renderSectionedListView(elapsed time.Duration, anim AnimState) s
 					break
 				}
 				remainingHeight -= appended
-				if isContent {
-					lastContentIdx = rowIdx
+				if isContent || appended > 0 {
+					lastVisibleIdx = rowIdx
 				}
 				if remainingHeight <= 0 {
 					break
@@ -2533,14 +2534,14 @@ func (m *Model) renderSectionedListView(elapsed time.Duration, anim AnimState) s
 					break
 				}
 				remainingHeight -= appended
-				if isContent {
-					lastContentIdx = rowIdx
+				if isContent || appended > 0 {
+					lastVisibleIdx = rowIdx
 				}
 			}
 		}
 	}
 
-	lines = m.finalizeListLines(lines, contentHeight, lastContentIdx, elapsed)
+	lines = m.finalizeListLines(lines, contentHeight, lastVisibleIdx, elapsed)
 	return strings.Join(lines, "\n")
 }
 
@@ -2835,11 +2836,7 @@ func (m *Model) pipelineViewportLayout() (pipelineViewportLayout, bool) {
 	}
 	preludeCount := pipelineBodyStart - preludeStart
 	contentHeight := max(m.height, 0)
-	footerHeight := 0
-	if contentHeight > 1 {
-		footerHeight = 1
-	}
-	contentBudget := max(contentHeight-footerHeight, 0)
+	contentBudget := max(contentHeight-m.listFooterHeight(contentHeight), 0)
 	preVisible := m.compactPrePipelineRows(preEnd, max(contentBudget-m.pipelineReserve(contentBudget, preludeCount, bodyCount), 0))
 	remaining := max(contentBudget-len(preVisible), 0)
 	preludeVisible := min(preludeCount, remaining)
@@ -3241,6 +3238,13 @@ func padToHeight(s string, targetHeight int) string {
 		lines = append(lines, make([]string, targetHeight-len(lines))...)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (m *Model) listFooterHeight(contentHeight int) int {
+	if contentHeight <= 1 || len(m.rows) == 0 {
+		return 0
+	}
+	return 1
 }
 
 // clampIndex constrains an index to [0, count-1].

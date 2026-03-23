@@ -110,11 +110,17 @@ func TestGuideResolveReadyAgentID_TaskScopedPipelineNameUsesRegisteredWorker(t *
 	err = g.Register(&AgentRoutingInfo{
 		ID:    "tester-worker-1",
 		Type:  "tester-pipeline",
-		Name:  "task_1-tester-pipeline",
+		Name:  "tester-pipeline",
+		Aliases: []string{
+			"task_1-tester-pipeline",
+		},
 		PodID: "task_1",
 		Registration: &AgentRegistration{
 			ID:   "tester-worker-1",
-			Name: "task_1-tester-pipeline",
+			Name: "tester-pipeline",
+			Aliases: []string{
+				"task_1-tester-pipeline",
+			},
 			Capabilities: AgentCapabilities{
 				Intents: []Intent{IntentCheck, IntentHelp},
 				Domains: []Domain{DomainCode, DomainTasks},

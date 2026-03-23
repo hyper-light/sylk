@@ -59,3 +59,20 @@ func TestBuildTaskWorkspaceRuntimeContext_IncludesSummarySections(t *testing.T) 
 		}
 	}
 }
+
+func TestBuildWorkspaceViewContext_ExplainsBrokeredCommandAccessToVFS(t *testing.T) {
+	got := BuildWorkspaceViewContext(WorkspacePromptOptions{
+		DefaultView:     versioning.WorkspaceViewPipeline,
+		IncludePipeline: true,
+	})
+
+	for _, needle := range []string{
+		"Default read/write tools for this agent operate on the `pipeline` view unless a tool explicitly says otherwise.",
+		"`run_command` and `run_shell_script` execute against that same layered workspace view",
+		"they can read VFS-backed files before those changes are committed to disk",
+	} {
+		if !strings.Contains(got, needle) {
+			t.Fatalf("expected workspace context to contain %q\n%s", needle, got)
+		}
+	}
+}
