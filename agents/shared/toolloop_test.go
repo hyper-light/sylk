@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/providers"
@@ -89,10 +90,37 @@ func TestToolErrorPayload_NonNilError(t *testing.T) {
 	}
 }
 
+func TestToolErrorPayload_IncludesRecoveryForSingleCommandViolation(t *testing.T) {
+	got := ToolErrorPayload(errors.New("run_command only accepts one plain command (detected &&)"))
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("payload is not valid JSON: %v", err)
+	}
+	if parsed["error_kind"] != "single_command_only" {
+		t.Fatalf("error_kind = %v, want %q", parsed["error_kind"], "single_command_only")
+	}
+	recovery, ok := parsed["recovery"].([]any)
+	if !ok || len(recovery) == 0 {
+		t.Fatalf("expected recovery guidance, got %#v", parsed["recovery"])
+	}
+}
+
 func TestToolErrorPayload_NilError(t *testing.T) {
 	got := ToolErrorPayload(nil)
 	if got != "" {
 		t.Fatalf("expected empty string for nil error, got %q", got)
+	}
+}
+
+func TestAppendToolRecoveryMessage_DeduplicatesHints(t *testing.T) {
+	req := &providers.Request{}
+	AppendToolRecoveryMessage(req, []string{"adapt", "adapt", "", "switch tools"})
+	if len(req.Messages) != 1 {
+		t.Fatalf("expected 1 appended message, got %d", len(req.Messages))
+	}
+	content := req.Messages[0].Content
+	if !strings.Contains(content, "adapt") || !strings.Contains(content, "switch tools") {
+		t.Fatalf("unexpected recovery message content: %q", content)
 	}
 }
 

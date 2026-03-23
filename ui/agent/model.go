@@ -211,13 +211,19 @@ func (m *Model) agentSortKey(id string) int {
 func resolveAgentCategory(agentType, pipelineID string) string {
 	agentType = strings.TrimSpace(agentType)
 	pipelineID = strings.TrimSpace(pipelineID)
-	if pipelineID != "" {
-		switch agentType {
-		case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
-			return "pipeline"
-		}
+	if pipelineID != "" && isPipelineAgentType(agentType) {
+		return "pipeline"
 	}
 	return agentCategoryByType[agentType]
+}
+
+func isPipelineAgentType(agentType string) bool {
+	switch strings.TrimSpace(agentType) {
+	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+		return true
+	default:
+		return false
+	}
 }
 
 func canonicalPipelineAgentID(agentType, pipelineID string) string {
@@ -249,6 +255,25 @@ func parseTaskScopedPipelineAgentID(agentID string) (taskID, agentType string, o
 	default:
 		return "", "", false
 	}
+}
+
+func parseCanonicalPipelinePanelAgentID(agentID string) (pipelineID, agentType string, ok bool) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return "", "", false
+	}
+	for _, candidateType := range []string{"inspector-pipeline", "tester-pipeline", "engineer", "designer"} {
+		suffix := ":" + candidateType
+		if !strings.HasSuffix(agentID, suffix) {
+			continue
+		}
+		pipelineID = strings.TrimSpace(strings.TrimSuffix(agentID, suffix))
+		if pipelineID == "" {
+			return "", "", false
+		}
+		return pipelineID, candidateType, true
+	}
+	return "", "", false
 }
 
 func canonicalStreamAgentID(agentID, agentType, pipelineID, taskID string) string {
@@ -406,6 +431,14 @@ type Model struct {
 	idleDecorBucket     int64                     // Quantized idle shimmer phase to avoid redundant repaints.
 }
 
+type pipelineViewportLayout struct {
+	bodyStart      int
+	viewportHeight int
+	rowHeights     []int
+	rowOffsets     []int
+	totalLines     int
+}
+
 // Verify interface compliance at compile time.
 var (
 	_ component.Focusable = (*Model)(nil)
@@ -547,6 +580,9 @@ func (m *Model) SetSize(width, height int) {
 func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 	rawAgentID := strings.TrimSpace(ev.Event.AgentID)
 	agentID := m.canonicalizeAgentID(rawAgentID, ev)
+	if m.shouldIgnoreAmbiguousPipelineActivity(rawAgentID, ev) {
+		return nil
+	}
 	vis := ev.Event.Visibility
 	eventDebugLog().Info("agent_panel: activity",
 		"agent_id", rawAgentID,
@@ -592,6 +628,11 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 	m.pushAgentEvent(agentID, ev)
 
 	return nil
+}
+
+func (m *Model) shouldIgnoreAmbiguousPipelineActivity(rawAgentID string, ev msg.ActivityEventMsg) bool {
+	agentType, pipelineID := m.inferActivityAgentIdentity(rawAgentID, ev)
+	return isPipelineAgentType(agentType) && strings.TrimSpace(pipelineID) == ""
 }
 
 // handleStreamProgress updates an agent's status and task summary from a
@@ -650,10 +691,8 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 }
 
 func (m *Model) canonicalizeAgentID(agentID string, ev msg.ActivityEventMsg) string {
-	if panelID := canonicalPipelineAgentID(
-		extractString(ev.Event.Data, "agent_type"),
-		extractPipelineID(ev.Event.Data),
-	); panelID != "" {
+	agentType, pipelineID := m.inferActivityAgentIdentity(agentID, ev)
+	if panelID := canonicalPipelineAgentID(agentType, pipelineID); panelID != "" {
 		return panelID
 	}
 	return m.resolveAgentID(agentID)
@@ -696,12 +735,26 @@ func (m *Model) rememberAgentAliases(canonicalID, rawAgentID string, ev msg.Acti
 			agent.RoutingID = canonicalID
 		}
 	}
-	if rawAgentID != "" {
+	if rawAgentID != "" && shouldRememberRawAgentAlias(rawAgentID) {
 		m.aliases[rawAgentID] = canonicalID
 	}
 	if runtimeID := extractString(ev.Event.Data, "runtime_agent_id"); runtimeID != "" {
 		m.aliases[runtimeID] = canonicalID
 	}
+}
+
+func shouldRememberRawAgentAlias(rawAgentID string) bool {
+	rawAgentID = strings.TrimSpace(rawAgentID)
+	if rawAgentID == "" {
+		return false
+	}
+	if _, _, ok := parseTaskScopedPipelineAgentID(rawAgentID); ok {
+		return true
+	}
+	if _, _, ok := parseCanonicalPipelinePanelAgentID(rawAgentID); ok {
+		return true
+	}
+	return !isPipelineAgentType(rawAgentID)
 }
 
 func (m *Model) rehomeDuplicateAgentRows(canonicalID string, ev msg.ActivityEventMsg) {
@@ -740,14 +793,13 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 		return agentID
 	}
 
-	agentType := extractString(ev.Event.Data, "agent_type")
+	agentType, pipelineID := m.inferActivityAgentIdentity(agentID, ev)
 
 	// Standalone and knowledge agents are singleton rows per type. Pipeline
 	// agents are singleton rows per (type, pipeline_id). Find any existing
 	// matching entry and re-key it to the new UUID. This covers:
 	//  1. Seeded placeholder (ID == AgentType) promoted on first activation.
 	//  2. Re-activation after demotion: old UUID entry promoted to new UUID.
-	pipelineID := extractPipelineID(ev.Event.Data)
 	category := resolveAgentCategory(agentType, pipelineID)
 	if category != "pipeline" {
 		pipelineID = ""
@@ -809,24 +861,22 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 		pl, ok := m.pipelines[pipelineID]
 		if !ok {
 			taskID := extractPipelineTaskID(ev.Event.Data)
-			taskLabel := extractString(ev.Event.Data, "task_slug")
 			if taskID == "" {
 				taskID = pipelineID
-			}
-			if taskLabel == "" {
-				taskLabel = taskID
-			}
-			if taskLabel == "" {
-				taskLabel = pipelineShortID(pipelineID)
 			}
 			status := pipelineStatusFromEvent(ev.Event.Data)
 			if status == "" {
 				status = "pending"
 			}
 			pl = &PipelineState{
-				ID:        pipelineID,
-				TaskID:    taskID,
-				TaskLabel: taskLabel,
+				ID:     pipelineID,
+				TaskID: taskID,
+				TaskLabel: preferredPipelineTaskLabel(
+					"",
+					pipelineTaskLabelFromEvent(ev.Event.Data),
+					taskID,
+					pipelineID,
+				),
 				Status:    status,
 				CreatedAt: time.Now(),
 			}
@@ -838,12 +888,18 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 			if pl.TaskID == "" {
 				pl.TaskID = extractPipelineTaskID(ev.Event.Data)
 			}
-			if pl.TaskLabel == "" {
-				pl.TaskLabel = extractString(ev.Event.Data, "task_slug")
-				if pl.TaskLabel == "" {
-					pl.TaskLabel = pl.TaskID
-				}
-			}
+			pl.TaskLabel = preferredPipelineTaskLabel(
+				pl.TaskLabel,
+				pipelineTaskLabelFromEvent(ev.Event.Data),
+				pl.TaskID,
+				pipelineID,
+			)
+			pl.TaskLabel = preferredPipelineTaskLabel(
+				pl.TaskLabel,
+				fallbackPipelineTaskLabel(pl.TaskID, pipelineID),
+				pl.TaskID,
+				pipelineID,
+			)
 			if !slices.Contains(pl.Members, agentID) {
 				pl.Members = append(pl.Members, agentID)
 			}
@@ -857,8 +913,7 @@ func (m *Model) reconcileExistingAgent(agent *AgentState, ev msg.ActivityEventMs
 	if agent == nil {
 		return
 	}
-	agentType := extractString(ev.Event.Data, "agent_type")
-	pipelineID := extractPipelineID(ev.Event.Data)
+	agentType, pipelineID := m.inferActivityAgentIdentity(agent.ID, ev)
 	if agentType != "" {
 		agent.AgentType = agentType
 	}
@@ -965,24 +1020,22 @@ func (m *Model) ensurePipelineMembership(agentID, pipelineID string, ev msg.Acti
 	pl, ok := m.pipelines[pipelineID]
 	if !ok {
 		taskID := extractPipelineTaskID(ev.Event.Data)
-		taskLabel := extractString(ev.Event.Data, "task_slug")
 		if taskID == "" {
 			taskID = pipelineID
-		}
-		if taskLabel == "" {
-			taskLabel = taskID
-		}
-		if taskLabel == "" {
-			taskLabel = pipelineShortID(pipelineID)
 		}
 		status := pipelineStatusFromEvent(ev.Event.Data)
 		if status == "" {
 			status = "pending"
 		}
 		pl = &PipelineState{
-			ID:        pipelineID,
-			TaskID:    taskID,
-			TaskLabel: taskLabel,
+			ID:     pipelineID,
+			TaskID: taskID,
+			TaskLabel: preferredPipelineTaskLabel(
+				"",
+				pipelineTaskLabelFromEvent(ev.Event.Data),
+				taskID,
+				pipelineID,
+			),
 			Status:    status,
 			CreatedAt: time.Now(),
 		}
@@ -993,12 +1046,18 @@ func (m *Model) ensurePipelineMembership(agentID, pipelineID string, ev msg.Acti
 	if pl.TaskID == "" {
 		pl.TaskID = extractPipelineTaskID(ev.Event.Data)
 	}
-	if pl.TaskLabel == "" {
-		pl.TaskLabel = extractString(ev.Event.Data, "task_slug")
-		if pl.TaskLabel == "" {
-			pl.TaskLabel = pl.TaskID
-		}
-	}
+	pl.TaskLabel = preferredPipelineTaskLabel(
+		pl.TaskLabel,
+		pipelineTaskLabelFromEvent(ev.Event.Data),
+		pl.TaskID,
+		pipelineID,
+	)
+	pl.TaskLabel = preferredPipelineTaskLabel(
+		pl.TaskLabel,
+		fallbackPipelineTaskLabel(pl.TaskID, pipelineID),
+		pl.TaskID,
+		pipelineID,
+	)
 	if !slices.Contains(pl.Members, agentID) {
 		pl.Members = append(pl.Members, agentID)
 	}
@@ -1179,6 +1238,86 @@ func (m *Model) findPipelineAgent(agentType, pipelineID string) *AgentState {
 	return nil
 }
 
+func (m *Model) uniquePipelineAgentForType(agentType string) *AgentState {
+	agentType = strings.TrimSpace(agentType)
+	if agentType == "" {
+		return nil
+	}
+	var match *AgentState
+	for _, agent := range m.agents {
+		if agent == nil || agent.AgentType != agentType || strings.TrimSpace(agent.PipelineID) == "" {
+			continue
+		}
+		if match != nil && match.PipelineID != agent.PipelineID {
+			return nil
+		}
+		match = agent
+	}
+	return match
+}
+
+func (m *Model) uniqueKnownPipelineID() string {
+	pipelineID := ""
+	for _, candidateID := range m.pipelineOrder {
+		candidateID = strings.TrimSpace(candidateID)
+		if candidateID == "" || m.pipelines[candidateID] == nil {
+			continue
+		}
+		if pipelineID != "" && pipelineID != candidateID {
+			return ""
+		}
+		pipelineID = candidateID
+	}
+	return pipelineID
+}
+
+func (m *Model) inferActivityAgentIdentity(rawAgentID string, ev msg.ActivityEventMsg) (agentType, pipelineID string) {
+	agentType = extractString(ev.Event.Data, "agent_type")
+	pipelineID = extractPipelineID(ev.Event.Data)
+	rawAgentID = strings.TrimSpace(rawAgentID)
+
+	if scopedPipelineID, scopedAgentType, ok := parseTaskScopedPipelineAgentID(rawAgentID); ok {
+		if pipelineID == "" {
+			pipelineID = scopedPipelineID
+		}
+		if agentType == "" {
+			agentType = scopedAgentType
+		}
+	}
+	if canonicalPipelineID, canonicalAgentType, ok := parseCanonicalPipelinePanelAgentID(rawAgentID); ok {
+		if pipelineID == "" {
+			pipelineID = canonicalPipelineID
+		}
+		if agentType == "" {
+			agentType = canonicalAgentType
+		}
+	}
+
+	if resolvedID := m.resolveAgentID(rawAgentID); resolvedID != "" {
+		if existing := m.agents[resolvedID]; existing != nil {
+			if agentType == "" {
+				agentType = existing.AgentType
+			}
+			if pipelineID == "" {
+				pipelineID = strings.TrimSpace(existing.PipelineID)
+			}
+		}
+	}
+
+	if agentType == "" && isPipelineAgentType(rawAgentID) {
+		agentType = rawAgentID
+	}
+	if pipelineID == "" && isPipelineAgentType(agentType) {
+		if existing := m.uniquePipelineAgentForType(agentType); existing != nil {
+			pipelineID = strings.TrimSpace(existing.PipelineID)
+		} else {
+			pipelineID = m.uniqueKnownPipelineID()
+		}
+	}
+
+	return strings.TrimSpace(agentType), strings.TrimSpace(pipelineID)
+}
+
 // AgentTypeOf returns the agent type for a given canonical ID.
 // Returns "" when the ID is not known to the panel.
 func (m *Model) AgentTypeOf(agentID string) string {
@@ -1340,6 +1479,13 @@ func (m *Model) handlePipelineState(ps msg.PipelineStateMsg) tea.Cmd {
 	}
 	if ps.TaskLabel != "" {
 		pl.TaskLabel = ps.TaskLabel
+	} else {
+		pl.TaskLabel = preferredPipelineTaskLabel(
+			pl.TaskLabel,
+			fallbackPipelineTaskLabel(pl.TaskID, canonicalID),
+			pl.TaskID,
+			canonicalID,
+		)
 	}
 	applyPipelineStateUpdate(pl, ps)
 	m.rowsDirty = true
@@ -1415,9 +1561,12 @@ func (m *Model) mergePipelineState(dst, src *PipelineState) {
 	if dst.TaskID == "" {
 		dst.TaskID = src.TaskID
 	}
-	if dst.TaskLabel == "" {
-		dst.TaskLabel = src.TaskLabel
-	}
+	dst.TaskLabel = preferredPipelineTaskLabel(
+		dst.TaskLabel,
+		src.TaskLabel,
+		firstNonEmptyTrimmed(dst.TaskID, src.TaskID),
+		firstNonEmptyTrimmed(dst.ID, src.ID),
+	)
 	if dst.Status == "" {
 		dst.Status = src.Status
 	}
@@ -1854,6 +2003,9 @@ func appendUniqueAgentID(ids []string, agentID string) []string {
 func (m *Model) variantsForPipeline(pipelineID string) []*VariantState {
 	var result []*VariantState
 	for _, v := range m.variants {
+		if v == nil {
+			continue
+		}
 		if v.PipelineID == pipelineID {
 			result = append(result, v)
 		}
@@ -2333,24 +2485,57 @@ func (m *Model) renderSectionedListView(elapsed time.Duration, anim AnimState) s
 	}
 
 	if remainingHeight > 0 && bodyCount > 0 {
-		m.clampPipelineScroll(bodyCount, remainingHeight)
-		start, end := m.visiblePipelineWindow(bodyCount, remainingHeight)
-		for localIdx := start; localIdx < end; localIdx++ {
-			rowIdx := bodyStart + localIdx
-			line, renderOK, isContent := m.renderListRow(m.rows[rowIdx], rowIdx, elapsed, anim)
-			if !renderOK {
-				continue
+		layout, layoutOK := m.buildPipelineViewportLayout(bodyStart, bodyCount, remainingHeight)
+		if layoutOK {
+			m.clampPipelineScroll(layout)
+			startLine, endLine := m.visiblePipelineWindow(layout)
+			for localIdx, rowHeight := range layout.rowHeights {
+				rowStart := layout.rowOffsets[localIdx]
+				rowEnd := rowStart + rowHeight
+				if rowEnd <= startLine {
+					continue
+				}
+				if rowStart >= endLine {
+					break
+				}
+				rowIdx := layout.bodyStart + localIdx
+				line, renderOK, isContent := m.renderListRow(m.rows[rowIdx], rowIdx, elapsed, anim)
+				if !renderOK {
+					continue
+				}
+				rowLines := strings.Split(line, "\n")
+				sliceStart := max(startLine-rowStart, 0)
+				sliceEnd := min(endLine-rowStart, len(rowLines))
+				if sliceStart >= sliceEnd {
+					continue
+				}
+				appended := m.appendRenderedLineSlice(&lines, rowLines[sliceStart:sliceEnd], rowIdx, remainingHeight)
+				if appended == 0 {
+					break
+				}
+				remainingHeight -= appended
+				if isContent {
+					lastContentIdx = rowIdx
+				}
+				if remainingHeight <= 0 {
+					break
+				}
 			}
-			appended := m.appendRenderedRowLines(&lines, line, rowIdx, remainingHeight)
-			if appended == 0 {
-				break
-			}
-			remainingHeight -= appended
-			if isContent {
-				lastContentIdx = rowIdx
-			}
-			if remainingHeight <= 0 {
-				break
+		} else {
+			for localIdx := 0; localIdx < bodyCount && remainingHeight > 0; localIdx++ {
+				rowIdx := bodyStart + localIdx
+				line, renderOK, isContent := m.renderListRow(m.rows[rowIdx], rowIdx, elapsed, anim)
+				if !renderOK {
+					continue
+				}
+				appended := m.appendRenderedRowLines(&lines, line, rowIdx, remainingHeight)
+				if appended == 0 {
+					break
+				}
+				remainingHeight -= appended
+				if isContent {
+					lastContentIdx = rowIdx
+				}
 			}
 		}
 	}
@@ -2370,7 +2555,7 @@ func (m *Model) renderListRow(row listRow, rowIndex int, elapsed time.Duration, 
 	case rowSpacer:
 		return renderSpacer(activeColor, m.theme), true, false
 	case rowAgent:
-		agent, ok := m.agents[row.ID]
+		agent, ok := m.agentState(row.ID)
 		if !ok {
 			return "", false, false
 		}
@@ -2378,14 +2563,14 @@ func (m *Model) renderListRow(row listRow, rowIndex int, elapsed time.Duration, 
 		prefix := renderTreePrefix(pipelinePrefix, activeColor, m.theme)
 		return RenderCard(*agent, m.width, m.theme, selected, engaged, prefix, anim), true, true
 	case rowPipeline:
-		pl := m.pipelines[row.ID]
-		if pl == nil {
+		pl, ok := m.pipelineState(row.ID)
+		if !ok {
 			return "", false, false
 		}
 		return renderPipelineRow(pl, m.width, elapsed, m.gradient, m.theme, selected, activeColor, anim, m.collapsedPipelines[row.ID]), true, true
 	case rowVariant:
-		v := m.variants[row.ID]
-		if v == nil {
+		v, ok := m.variantState(row.ID)
+		if !ok {
 			return "", false, false
 		}
 		return renderVariantRow(v, m.width, m.theme, selected, activeColor, anim), true, true
@@ -2423,6 +2608,21 @@ func (m *Model) appendRenderedRowLines(lines *[]string, rendered string, rowIdx,
 	rowLines := strings.Split(rendered, "\n")
 	if len(rowLines) > budget {
 		return 0
+	}
+	for _, rowLine := range rowLines {
+		lineIdx := len(*lines)
+		*lines = append(*lines, rowLine)
+		m.recordRenderedRow(lineIdx, rowIdx)
+	}
+	return len(rowLines)
+}
+
+func (m *Model) appendRenderedLineSlice(lines *[]string, rowLines []string, rowIdx, budget int) int {
+	if budget <= 0 || len(rowLines) == 0 {
+		return 0
+	}
+	if len(rowLines) > budget {
+		rowLines = rowLines[:budget]
 	}
 	for _, rowLine := range rowLines {
 		lineIdx := len(*lines)
@@ -2550,12 +2750,50 @@ func (m *Model) compactPrePipelineRows(preEnd, budget int) []int {
 	return rows
 }
 
-func (m *Model) clampPipelineScroll(totalRows, viewportHeight int) {
-	if viewportHeight <= 0 {
+func (m *Model) buildPipelineViewportLayout(bodyStart, bodyCount, viewportHeight int) (pipelineViewportLayout, bool) {
+	if bodyCount <= 0 || viewportHeight <= 0 {
+		return pipelineViewportLayout{
+			bodyStart:      bodyStart,
+			viewportHeight: max(viewportHeight, 0),
+		}, bodyCount > 0
+	}
+	layout := pipelineViewportLayout{
+		bodyStart:      bodyStart,
+		viewportHeight: viewportHeight,
+		rowHeights:     make([]int, 0, bodyCount),
+		rowOffsets:     make([]int, 0, bodyCount),
+	}
+	totalLines := 0
+	for localIdx := 0; localIdx < bodyCount; localIdx++ {
+		rowIdx := bodyStart + localIdx
+		layout.rowOffsets = append(layout.rowOffsets, totalLines)
+		rowHeight := m.listRowLineCount(m.rows[rowIdx], rowIdx)
+		layout.rowHeights = append(layout.rowHeights, rowHeight)
+		totalLines += rowHeight
+	}
+	layout.totalLines = totalLines
+	return layout, true
+}
+
+func (m *Model) listRowLineCount(row listRow, rowIdx int) int {
+	switch row.Kind {
+	case rowPipeline:
+		if pl, ok := m.pipelineState(row.ID); ok {
+			return max(pipelineRowLineCount(pl, m.width), 1)
+		}
+	case rowAgent:
+		selected := rowIdx == m.selected
+		return max(cardLineCount(selected), 1)
+	}
+	return 1
+}
+
+func (m *Model) clampPipelineScroll(layout pipelineViewportLayout) {
+	if layout.viewportHeight <= 0 {
 		m.pipelineScroll = 0
 		return
 	}
-	maxScroll := max(totalRows-viewportHeight, 0)
+	maxScroll := max(layout.totalLines-layout.viewportHeight, 0)
 	if m.pipelineScroll > maxScroll {
 		m.pipelineScroll = maxScroll
 	}
@@ -2564,41 +2802,36 @@ func (m *Model) clampPipelineScroll(totalRows, viewportHeight int) {
 	}
 }
 
-func (m *Model) visiblePipelineWindow(totalRows, viewportHeight int) (start, end int) {
-	if viewportHeight <= 0 || totalRows == 0 {
+func (m *Model) visiblePipelineWindow(layout pipelineViewportLayout) (start, end int) {
+	if layout.viewportHeight <= 0 || layout.totalLines == 0 {
 		return 0, 0
 	}
-	if totalRows <= viewportHeight {
+	if layout.totalLines <= layout.viewportHeight {
 		m.pipelineScroll = 0
-		return 0, totalRows
+		return 0, layout.totalLines
 	}
 
-	maxScroll := totalRows - viewportHeight
+	maxScroll := layout.totalLines - layout.viewportHeight
 	scroll := m.pipelineScroll
-	if !m.focused && scroll == 0 && m.shouldPreferPipelineViewport() {
-		scroll = maxScroll
-	}
 	if scroll < 0 {
 		scroll = 0
 	}
 	if scroll > maxScroll {
 		scroll = maxScroll
 	}
-	if m.focused || m.pipelineScroll != 0 {
-		m.pipelineScroll = scroll
-	}
-	return scroll, scroll + viewportHeight
+	m.pipelineScroll = scroll
+	return scroll, scroll + layout.viewportHeight
 }
 
-func (m *Model) pipelineViewportMetrics() (bodyStart, bodyCount, viewportHeight int, ok bool) {
+func (m *Model) pipelineViewportLayout() (pipelineViewportLayout, bool) {
 	m.ensureRows()
 	preEnd, preludeStart, pipelineBodyStart, found := m.pipelineSectionLayout()
 	if !found {
-		return 0, 0, 0, false
+		return pipelineViewportLayout{}, false
 	}
-	bodyCount = len(m.rows) - pipelineBodyStart
+	bodyCount := len(m.rows) - pipelineBodyStart
 	if bodyCount == 0 {
-		return pipelineBodyStart, 0, 0, true
+		return pipelineViewportLayout{bodyStart: pipelineBodyStart}, true
 	}
 	preludeCount := pipelineBodyStart - preludeStart
 	contentHeight := max(m.height, 0)
@@ -2610,8 +2843,8 @@ func (m *Model) pipelineViewportMetrics() (bodyStart, bodyCount, viewportHeight 
 	preVisible := m.compactPrePipelineRows(preEnd, max(contentBudget-m.pipelineReserve(contentBudget, preludeCount, bodyCount), 0))
 	remaining := max(contentBudget-len(preVisible), 0)
 	preludeVisible := min(preludeCount, remaining)
-	viewportHeight = max(remaining-preludeVisible, 0)
-	return pipelineBodyStart, bodyCount, viewportHeight, true
+	viewportHeight := max(remaining-preludeVisible, 0)
+	return m.buildPipelineViewportLayout(pipelineBodyStart, bodyCount, viewportHeight)
 }
 
 func (m *Model) rowIndexAtLine(line int) (int, bool) {
@@ -2646,32 +2879,34 @@ func (m *Model) HandleListClick(y int) tea.Cmd {
 }
 
 func (m *Model) ensureSelectedPipelineRowVisible() {
-	pipelineStart, bodyCount, viewportHeight, ok := m.pipelineViewportMetrics()
-	if !ok || viewportHeight <= 0 || bodyCount <= viewportHeight {
+	layout, ok := m.pipelineViewportLayout()
+	if !ok || layout.viewportHeight <= 0 || len(layout.rowHeights) == 0 {
 		return
 	}
-	if m.selected < pipelineStart {
+	if m.selected < layout.bodyStart {
 		return
 	}
-	localIdx := m.selected - pipelineStart
-	if localIdx < 0 || localIdx >= bodyCount {
+	localIdx := m.selected - layout.bodyStart
+	if localIdx < 0 || localIdx >= len(layout.rowHeights) {
 		return
 	}
-	if localIdx < m.pipelineScroll {
-		m.pipelineScroll = localIdx
+	rowStart := layout.rowOffsets[localIdx]
+	rowEnd := rowStart + layout.rowHeights[localIdx]
+	if rowStart < m.pipelineScroll {
+		m.pipelineScroll = rowStart
 		return
 	}
-	if localIdx >= m.pipelineScroll+viewportHeight {
-		m.pipelineScroll = localIdx - viewportHeight + 1
+	if rowEnd > m.pipelineScroll+layout.viewportHeight {
+		m.pipelineScroll = rowEnd - layout.viewportHeight
 	}
 }
 
 func (m *Model) scrollPipelineViewport(delta int) bool {
-	_, bodyCount, viewportHeight, ok := m.pipelineViewportMetrics()
-	if !ok || viewportHeight <= 0 || bodyCount <= viewportHeight || delta == 0 {
+	layout, ok := m.pipelineViewportLayout()
+	if !ok || layout.viewportHeight <= 0 || layout.totalLines <= layout.viewportHeight || delta == 0 {
 		return false
 	}
-	maxScroll := bodyCount - viewportHeight
+	maxScroll := layout.totalLines - layout.viewportHeight
 	next := m.pipelineScroll + delta
 	if next < 0 {
 		next = 0
@@ -2706,14 +2941,6 @@ func (m *Model) visibleListWindow(rowBudget int) (start, end int) {
 		return 0, total
 	}
 
-	if !m.focused && m.shouldPreferPipelineViewport() {
-		start = total - rowBudget
-		if start < 0 {
-			start = 0
-		}
-		return start, total
-	}
-
 	start = clampIndex(m.selected-rowBudget/2, total)
 	maxStart := total - rowBudget
 	if start > maxStart {
@@ -2727,26 +2954,6 @@ func (m *Model) visibleListWindow(rowBudget int) (start, end int) {
 		end = total
 	}
 	return start, end
-}
-
-func (m *Model) shouldPreferPipelineViewport() bool {
-	if len(m.pipelineOrder) == 0 {
-		return false
-	}
-	for _, pipelineID := range m.pipelineOrder {
-		if pl := m.pipelines[pipelineID]; pl != nil && !isTerminalPipelineStatus(pl.Status) {
-			return true
-		}
-	}
-	for _, agent := range m.agents {
-		if agent == nil || agent.PipelineID == "" {
-			continue
-		}
-		if isActiveStatus(agent.Status) || agent.Status == StatusWaiting {
-			return true
-		}
-	}
-	return false
 }
 
 // renderSectionHeader renders a section label. When activeColor is non-empty,
@@ -2818,16 +3025,16 @@ const expandedCardOverhead = selectedCardLines + expandedSeparatorLines
 // For pipelines/variants: detail view.
 func (m *Model) renderExpandedView() string {
 	// Check if expanded ID is a pipeline.
-	if pl, ok := m.pipelines[m.expanded]; ok {
+	if pl, ok := m.pipelineState(m.expanded); ok {
 		return renderExpandedPipeline(pl, m.width, m.height, m.theme)
 	}
 	// Check if expanded ID is a variant.
-	if v, ok := m.variants[m.expanded]; ok {
+	if v, ok := m.variantState(m.expanded); ok {
 		return renderExpandedVariant(v, m.width, m.height, m.theme)
 	}
 
 	// Default: agent expanded view.
-	agent, ok := m.agents[m.expanded]
+	agent, ok := m.agentState(m.expanded)
 	if !ok {
 		return ""
 	}
@@ -2863,7 +3070,7 @@ func (m *Model) renderEventDetailView() string {
 		return ""
 	}
 
-	agent, ok := m.agents[m.expanded]
+	agent, ok := m.agentState(m.expanded)
 	if !ok {
 		return ""
 	}
@@ -3007,7 +3214,7 @@ func (m *Model) PersistedModelFor(agentType string) string {
 // RevertModelID sets the agent's ModelID back to a previous value.
 // Used when a backend swap fails to undo the optimistic UI update.
 func (m *Model) RevertModelID(agentID, previousModelID string) {
-	agent, ok := m.agents[agentID]
+	agent, ok := m.agentState(agentID)
 	if !ok {
 		return
 	}
@@ -3018,24 +3225,60 @@ func (m *Model) RevertModelID(agentID, previousModelID string) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// padToHeight ensures s contains exactly targetHeight lines by appending empty lines.
+// padToHeight ensures s contains exactly targetHeight lines by clipping or appending empty lines.
 func padToHeight(s string, targetHeight int) string {
 	if targetHeight <= 0 {
-		return s
+		return ""
 	}
-	if s == "" {
-		return strings.Repeat("\n", max(targetHeight-1, 0))
+	lines := []string{""}
+	if s != "" {
+		lines = strings.Split(s, "\n")
 	}
-	current := strings.Count(s, "\n") + 1
-	if current < targetHeight {
-		s += strings.Repeat("\n", targetHeight-current)
+	switch {
+	case len(lines) > targetHeight:
+		lines = lines[:targetHeight]
+	case len(lines) < targetHeight:
+		lines = append(lines, make([]string, targetHeight-len(lines))...)
 	}
-	return s
+	return strings.Join(lines, "\n")
 }
 
 // clampIndex constrains an index to [0, count-1].
 func clampIndex(idx, count int) int {
 	return max(0, min(idx, count-1))
+}
+
+func (m *Model) agentState(agentID string) (*AgentState, bool) {
+	if m == nil || m.agents == nil {
+		return nil, false
+	}
+	agent, ok := m.agents[agentID]
+	if !ok || agent == nil {
+		return nil, false
+	}
+	return agent, true
+}
+
+func (m *Model) pipelineState(pipelineID string) (*PipelineState, bool) {
+	if m == nil || m.pipelines == nil {
+		return nil, false
+	}
+	pl, ok := m.pipelines[pipelineID]
+	if !ok || pl == nil {
+		return nil, false
+	}
+	return pl, true
+}
+
+func (m *Model) variantState(variantID string) (*VariantState, bool) {
+	if m == nil || m.variants == nil {
+		return nil, false
+	}
+	v, ok := m.variants[variantID]
+	if !ok || v == nil {
+		return nil, false
+	}
+	return v, true
 }
 
 // extractString safely extracts a string value from a map.
@@ -3056,6 +3299,57 @@ func extractString(data map[string]any, key string) string {
 
 func extractPipelineTaskID(data map[string]any) string {
 	return extractString(data, "task_id")
+}
+
+func firstNonEmptyTrimmed(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func pipelineTaskLabelFromEvent(data map[string]any) string {
+	return firstNonEmptyTrimmed(
+		extractString(data, "task_slug"),
+		extractString(data, "task_name"),
+	)
+}
+
+func fallbackPipelineTaskLabel(taskID, pipelineID string) string {
+	if taskID = strings.TrimSpace(taskID); taskID != "" {
+		return taskID
+	}
+	if pipelineID = strings.TrimSpace(pipelineID); pipelineID != "" {
+		return pipelineShortID(pipelineID)
+	}
+	return ""
+}
+
+func isWeakPipelineTaskLabel(label, taskID, pipelineID string) bool {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return true
+	}
+	if taskID = strings.TrimSpace(taskID); taskID != "" && label == taskID {
+		return true
+	}
+	if pipelineID = strings.TrimSpace(pipelineID); pipelineID != "" && label == pipelineShortID(pipelineID) {
+		return true
+	}
+	return false
+}
+
+func preferredPipelineTaskLabel(current, candidate, taskID, pipelineID string) string {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return strings.TrimSpace(current)
+	}
+	if isWeakPipelineTaskLabel(current, taskID, pipelineID) {
+		return candidate
+	}
+	return strings.TrimSpace(current)
 }
 
 func extractPipelineID(data map[string]any) string {

@@ -32,6 +32,8 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(shared.DetectRaceConditionsSkill(gi.toolRunner))
 	gi.skills.Register(shared.DetectDeadlocksSkill(gi.toolRunner))
 	gi.skills.Register(shared.DetectMemoryLeaksSkill(gi.toolRunner))
+	gi.skills.Register(runCommandSkill(gi))
+	gi.skills.Register(runShellScriptSkill(gi))
 	faFunc := func() shared.FileAccess { return gi.fileAccess }
 	gi.skills.Register(shared.ReadFileSkill(faFunc))
 	gi.skills.Register(shared.GlobSkill(faFunc))
@@ -57,6 +59,8 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(requestArchitectResearchSkill(gi))
 	gi.skills.Register(requestUserClarificationSkill(gi))
 	gi.skills.Register(escalateFindingsSkill(gi))
+	gi.skills.Register(researchDependencyInstallSkill(gi))
+	gi.skills.Register(installDependencyToolingSkill(gi))
 
 	// Diagnostics
 	gi.skills.Register(agentShared.NewSelfDiagnosticSkill(&globalInspectorDiag{gi: gi}))

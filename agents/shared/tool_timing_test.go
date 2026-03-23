@@ -192,6 +192,7 @@ func TestSummarizeToolArgs(t *testing.T) {
 		{"path key", "read_file", `{"file_path":"core/main.go","offset":1}`, "file_path=core/main.go"},
 		{"pattern key", "grep", `{"pattern":"StreamEvent"}`, "pattern=StreamEvent"},
 		{"command key", "run_command", `{"command":"go build ./..."}`, "command=go build ./..."},
+		{"script key", "run_shell_script", `{"script":"cd ui && pnpm test"}`, "script=cd ui && pnpm test"},
 		{"empty args", "test", `{}`, ""},
 		{"empty string", "test", "", ""},
 		{"invalid json", "test", "not json", ""},

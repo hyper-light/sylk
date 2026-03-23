@@ -1248,7 +1248,12 @@ func (g *Guide) observeStreamReroute(streamResp *StreamResponse) {
 	// Store the mapping. The pending for newCID may not exist yet (the
 	// route request hasn't arrived), so we store in the deferred map.
 	g.streamReroutesMu.Lock()
-	g.streamReroutes[newCID] = originalSource
+	streamReroutes := g.streamReroutes
+	if streamReroutes == nil {
+		streamReroutes = make(map[string]string)
+		g.streamReroutes = streamReroutes
+	}
+	streamReroutes[newCID] = originalSource
 	g.streamReroutesMu.Unlock()
 
 	// If the pending already exists, apply immediately.
@@ -1267,9 +1272,14 @@ func (g *Guide) applyDeferredStreamReroute(pending *PendingRequest) {
 		return
 	}
 	g.streamReroutesMu.Lock()
-	target, ok := g.streamReroutes[pending.CorrelationID]
+	streamReroutes := g.streamReroutes
+	if streamReroutes == nil {
+		g.streamReroutesMu.Unlock()
+		return
+	}
+	target, ok := streamReroutes[pending.CorrelationID]
 	if ok {
-		delete(g.streamReroutes, pending.CorrelationID)
+		delete(streamReroutes, pending.CorrelationID)
 	}
 	g.streamReroutesMu.Unlock()
 	if ok && target != "" {

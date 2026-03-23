@@ -95,15 +95,15 @@ func TestBadgeLabel_PrefersTaskMetadataOverRawPipelineIdentity(t *testing.T) {
 	}
 }
 
-func TestBadgeLabel_HumanizesLegacyTaskScopedPipelineWorkerID(t *testing.T) {
+func TestBadgeLabel_DropsNumericOnlyLegacyTaskScopedPipelinePrefix(t *testing.T) {
 	entry := &ChatEntry{
 		Source:    SourceAgent,
 		AgentType: "task_12__inspector-pipeline",
 		AgentID:   "task_12__inspector-pipeline",
 	}
 
-	if got := badgeLabel(entry); got != "12: Inspector" {
-		t.Fatalf("badgeLabel = %q, want %q", got, "12: Inspector")
+	if got := badgeLabel(entry); got != "Inspector" {
+		t.Fatalf("badgeLabel = %q, want %q", got, "Inspector")
 	}
 	if got := badgeAgentType(entry); got != "inspector-pipeline" {
 		t.Fatalf("badgeAgentType = %q, want %q", got, "inspector-pipeline")

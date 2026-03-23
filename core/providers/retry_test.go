@@ -243,3 +243,126 @@ func TestRetryStream_SucceedsFirstAttempt(t *testing.T) {
 		t.Fatalf("expected 1 call, got %d", calls)
 	}
 }
+
+func TestRetryAnthropicInternalServerGenerate_RetriesThreeTimes(t *testing.T) {
+	cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
+	ctx := context.Background()
+	var events []RetryEvent
+	ctx = WithRetryObserver(ctx, func(event RetryEvent) {
+		events = append(events, event)
+	})
+
+	calls := 0
+	resp, err := retryAnthropicInternalServerGenerate(ctx, cfg, func(_ context.Context) (*Response, error) {
+		calls++
+		if calls <= anthropicInternalServerMaxRetries {
+			return nil, &anthropic.Error{StatusCode: 500}
+		}
+		return &Response{Content: "ok"}, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.Content != "ok" {
+		t.Fatalf("unexpected response: %#v", resp)
+	}
+	if calls != anthropicInternalServerMaxRetries+1 {
+		t.Fatalf("expected %d calls, got %d", anthropicInternalServerMaxRetries+1, calls)
+	}
+	if len(events) != anthropicInternalServerMaxRetries {
+		t.Fatalf("expected %d retry events, got %d", anthropicInternalServerMaxRetries, len(events))
+	}
+	for i, event := range events {
+		if event.Attempt != i+1 {
+			t.Fatalf("event %d attempt = %d, want %d", i, event.Attempt, i+1)
+		}
+		if event.MaxAttempts != anthropicInternalServerMaxRetries {
+			t.Fatalf("event %d max attempts = %d, want %d", i, event.MaxAttempts, anthropicInternalServerMaxRetries)
+		}
+	}
+}
+
+func TestRetryAnthropicInternalServerGenerate_OnlyRetries500(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+	}{
+		{name: "429", status: 429},
+		{name: "503", status: 503},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
+			calls := 0
+			_, err := retryAnthropicInternalServerGenerate(context.Background(), cfg, func(_ context.Context) (*Response, error) {
+				calls++
+				return nil, &anthropic.Error{StatusCode: tt.status}
+			})
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if calls != 1 {
+				t.Fatalf("expected 1 call, got %d", calls)
+			}
+		})
+	}
+}
+
+func TestRetryAnthropicInternalServerStream_RetriesThreeTimes(t *testing.T) {
+	cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
+	ctx := context.Background()
+	var events []RetryEvent
+	ctx = WithRetryObserver(ctx, func(event RetryEvent) {
+		events = append(events, event)
+	})
+
+	calls := 0
+	err := retryAnthropicInternalServerStream(ctx, cfg, func(_ context.Context) error {
+		calls++
+		if calls <= anthropicInternalServerMaxRetries {
+			return &anthropic.Error{StatusCode: 500}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != anthropicInternalServerMaxRetries+1 {
+		t.Fatalf("expected %d calls, got %d", anthropicInternalServerMaxRetries+1, calls)
+	}
+	if len(events) != anthropicInternalServerMaxRetries {
+		t.Fatalf("expected %d retry events, got %d", anthropicInternalServerMaxRetries, len(events))
+	}
+}
+
+func TestRetryAwareHandler_MarksRetryResetAfterError(t *testing.T) {
+	var starts []*StreamChunk
+	handler := retryAwareHandler(func(chunk *StreamChunk) error {
+		if chunk != nil && chunk.Type == ChunkTypeStart {
+			copyChunk := *chunk
+			starts = append(starts, &copyChunk)
+		}
+		return nil
+	})
+
+	if err := handler(&StreamChunk{Type: ChunkTypeStart}); err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	if err := handler(&StreamChunk{Type: ChunkTypeError, Text: "boom"}); err != nil {
+		t.Fatalf("error chunk: %v", err)
+	}
+	if err := handler(&StreamChunk{Type: ChunkTypeStart}); err != nil {
+		t.Fatalf("second start: %v", err)
+	}
+
+	if len(starts) != 2 {
+		t.Fatalf("expected 2 starts, got %d", len(starts))
+	}
+	if starts[0].RetryReset {
+		t.Fatal("first start should not reset")
+	}
+	if !starts[1].RetryReset {
+		t.Fatal("second start should reset after retryable error")
+	}
+}

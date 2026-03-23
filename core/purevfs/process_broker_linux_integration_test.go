@@ -5,7 +5,9 @@ package purevfs_test
 import (
 	"context"
 	"io/fs"
+	"os"
 	"path"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -82,6 +84,68 @@ func TestDefaultExecutionBrokerLinuxRoundTrip(t *testing.T) {
 	}
 	if got := string(content); got != "created by broker" {
 		t.Fatalf("generated.txt = %q, want %q", got, "created by broker")
+	}
+}
+
+func TestDefaultExecutionBrokerLinuxRunsHostPathExecutableWithProjectedRuntimePath(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	broker := purevfs.DefaultExecutionBroker()
+	caps, err := broker.Capabilities(ctx)
+	if err != nil {
+		t.Fatalf("Capabilities: %v", err)
+	}
+	if !caps.ProcessBroker {
+		t.Skip("strict broker unavailable on this host")
+	}
+
+	hostBin := t.TempDir()
+	scriptPath := filepath.Join(hostBin, "demo-tool")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\ncat /workspace/hello.txt\nprintf 'created by host tool' > /workspace/generated.txt\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile demo-tool: %v", err)
+	}
+	t.Setenv("PATH", hostBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	workspace := newMemoryExecutionFS("/workspace", map[string]string{
+		"/workspace/hello.txt": "hello broker\n",
+	})
+	planner := purevfs.NewExecutionPlanner(nil, purevfs.StrictBrokerCapabilities())
+	plan, err := planner.Plan(purevfs.ExecutionRequest{
+		Mode:          purevfs.ExecutionModeStrictNoDisk,
+		Intent:        purevfs.ExecutionIntentRun,
+		Language:      "python",
+		WorkspaceRoot: "/workspace",
+		WorkingDir:    "/workspace",
+		Overlay:       true,
+	})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	result, err := broker.Run(ctx, purevfs.BrokerRunRequest{
+		Plan:      plan,
+		Argv:      []string{"demo-tool"},
+		Workspace: workspace,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "permission denied") || strings.Contains(strings.ToLower(err.Error()), "fuse") {
+			t.Skipf("strict broker unavailable in test sandbox: %v", err)
+		}
+		t.Fatalf("Run: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, stderr = %q", result.ExitCode, string(result.Stderr))
+	}
+	if got := string(result.Stdout); !strings.Contains(got, "hello broker") {
+		t.Fatalf("stdout = %q, want mounted workspace content", got)
+	}
+	content, err := workspace.ReadFile(ctx, "/workspace/generated.txt")
+	if err != nil {
+		t.Fatalf("ReadFile generated.txt: %v", err)
+	}
+	if got := string(content); got != "created by host tool" {
+		t.Fatalf("generated.txt = %q, want %q", got, "created by host tool")
 	}
 }
 

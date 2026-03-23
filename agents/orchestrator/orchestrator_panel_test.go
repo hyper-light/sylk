@@ -43,3 +43,20 @@ func TestPublishPipelineAgentRegistration_AdvertisesOncePerTaskAgent(t *testing.
 		t.Fatalf("event[2] pipeline_status = %v, want executing", got)
 	}
 }
+
+func TestPublishPipelineAgentEvents_IgnoreMissingPipelineIdentity(t *testing.T) {
+	pub := &trackingActivityPub{}
+	o := &Orchestrator{
+		config:                  Config{SessionID: "sess-1"},
+		activityPub:             pub,
+		pipelinePanelState:      make(map[string]pipelinePanelSnapshot),
+		pipelinePanelRegistered: make(map[string]struct{}),
+	}
+
+	o.publishPipelineAgentRegistration("designer", "", "auth-checkout", "creating_tests")
+	o.publishPipelineAgentActivity("designer", "", "task_1:test", "auth-checkout", "creating_tests")
+
+	if got := len(pub.collected()); got != 0 {
+		t.Fatalf("published %d events, want 0", got)
+	}
+}

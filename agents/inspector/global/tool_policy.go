@@ -20,12 +20,19 @@ func globalInspectorVisibleSkillNames() []string {
 		"workspace_grep",
 		"inspect_workspace_state",
 		"summarize_workspace_state",
+		"run_command",
+		"run_shell_script",
 		"audit_layer",
+		"research_dependency_install",
+		"install_dependency_tooling",
 	}
 }
 
 func globalInspectorMutatingSkillNames() []string {
 	return []string{
+		"run_command",
+		"run_shell_script",
+		"install_dependency_tooling",
 		"request_architect_research",
 		"request_user_clarification",
 		"escalate_findings",

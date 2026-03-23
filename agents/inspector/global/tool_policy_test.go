@@ -29,6 +29,24 @@ func TestGlobalInspectorMutatingSkillsExcludeWorkspaceMutation(t *testing.T) {
 	}
 }
 
+func TestGlobalInspectorVisibleSkillsIncludeDependencyInstallRemediation(t *testing.T) {
+	for _, want := range []string{
+		"research_dependency_install",
+		"install_dependency_tooling",
+		"run_command",
+		"run_shell_script",
+	} {
+		if !containsGlobalName(globalInspectorVisibleSkillNames(), want) {
+			t.Fatalf("global inspector visible skills missing %q", want)
+		}
+	}
+	for _, want := range []string{"install_dependency_tooling", "run_command", "run_shell_script"} {
+		if !containsGlobalName(globalInspectorMutatingSkillNames(), want) {
+			t.Fatalf("global inspector mutating skills missing %q", want)
+		}
+	}
+}
+
 func containsGlobalName(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

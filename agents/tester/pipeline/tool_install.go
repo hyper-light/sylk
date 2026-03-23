@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/purevfs"
@@ -14,19 +13,8 @@ import (
 	"github.com/adalundhe/sylk/core/versioning"
 )
 
-type testToolInstallStep struct {
-	Command string `json:"command"`
-	Reason  string `json:"reason,omitempty"`
-}
-
-type testToolInstallPlan struct {
-	Summary           string                `json:"summary"`
-	MissingTool       string                `json:"missing_tool,omitempty"`
-	Framework         string                `json:"framework,omitempty"`
-	ValidationCommand string                `json:"validation_command,omitempty"`
-	Notes             []string              `json:"notes,omitempty"`
-	Steps             []testToolInstallStep `json:"steps"`
-}
+type testToolInstallStep = agentshared.DependencyInstallStep
+type testToolInstallPlan = agentshared.DependencyInstallPlan
 
 func researchTestToolInstallSkill(pt *PipelineTester) *skills.Skill {
 	type params struct {
@@ -139,46 +127,6 @@ func (pt *PipelineTester) researchTestToolInstall(
 	if runCommand == "" && harness != nil {
 		runCommand = harness.RunCommand
 	}
-	prompt := pt.buildInstallResearchPrompt(ctx, missingTool, failure, frameworkID, runCommand, files, taskSpec, harness)
-	msg, err := agentshared.RequestGuideRouteSync(ctx, agentshared.GuideRouteSyncRequest{
-		Bus:           pt.bus,
-		ResponseTopic: pt.channels.Responses,
-		Request: &guide.RouteRequest{
-			Input:           prompt,
-			TargetAgentID:   "academic",
-			SourceAgentID:   pt.id,
-			SourceAgentName: "tester-pipeline",
-			SessionID:       versioning.SessionIDFromContext(ctx),
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("research install steps via Academic: %w", err)
-	}
-	content, err := extractAcademicContent(msg)
-	if err != nil {
-		return nil, err
-	}
-	plan, err := parseTestToolInstallPlan(content)
-	if err != nil {
-		return nil, fmt.Errorf("parse Academic install plan: %w", err)
-	}
-	if strings.TrimSpace(plan.MissingTool) == "" {
-		plan.MissingTool = strings.TrimSpace(missingTool)
-	}
-	if strings.TrimSpace(plan.Framework) == "" {
-		plan.Framework = strings.TrimSpace(frameworkID)
-	}
-	return plan, nil
-}
-
-func (pt *PipelineTester) buildInstallResearchPrompt(
-	ctx context.Context,
-	missingTool, failure, frameworkID, runCommand string,
-	files []string,
-	taskSpec string,
-	harness *testHarnessState,
-) string {
-	root := pt.workingDir()
 	signals := pt.projectInstallSignals(ctx)
 	if harness != nil {
 		signals = append(signals,
@@ -186,233 +134,41 @@ func (pt *PipelineTester) buildInstallResearchPrompt(
 			fmt.Sprintf("language=%s", harness.Language),
 		)
 	}
-	signalBlock := "(none)"
-	if len(signals) > 0 {
-		signalBlock = strings.Join(signals, "\n- ")
-		signalBlock = "- " + signalBlock
-	}
-	targetFiles := "(none)"
-	if len(files) > 0 {
-		targetFiles = strings.Join(files, "\n- ")
-		targetFiles = "- " + targetFiles
-	}
-	return strings.TrimSpace(fmt.Sprintf(
-		`You are helping the Pipeline Tester restore missing test tooling in a repository.
-
-Return JSON only. No prose outside the JSON.
-
-Schema:
-{
-  "summary": "short explanation",
-  "missing_tool": "tool name",
-  "framework": "framework id or name",
-  "validation_command": "optional single command",
-  "notes": ["optional caveat"],
-  "steps": [
-    {
-      "command": "single install command",
-      "reason": "why this step is needed"
-    }
-  ]
-}
-
-Hard requirements:
-- Each step command must be exactly one command.
-- Do not use pipes, &&, ||, ;, redirection, subshells, or multi-line shell.
-- Prefer the package manager already implied by the repository files.
-- Prefer workspace-local or project-scoped installation when possible.
-- Keep the plan minimal.
-
-Repository root: %s
-Detected framework: %s
-Expected run command: %s
-Missing tool hint: %s
-Failure output:
-%s
-
-Relevant task files:
-%s
-
-Relevant project signals:
-%s
-
-Task specification:
-%s
-`,
-		root,
-		strings.TrimSpace(frameworkID),
-		strings.TrimSpace(runCommand),
-		strings.TrimSpace(missingTool),
-		strings.TrimSpace(failure),
-		targetFiles,
-		signalBlock,
-		strings.TrimSpace(taskSpec),
-	))
+	return agentshared.ResearchDependencyInstallPlan(ctx, agentshared.DependencyInstallResearchRequest{
+		Bus:             pt.bus,
+		ResponseTopic:   pt.channels.Responses,
+		SourceAgentID:   pt.id,
+		SourceAgentName: "tester-pipeline",
+		SessionID:       versioning.SessionIDFromContext(ctx),
+		RepositoryRoot:  pt.workingDir(),
+		FrameworkID:     frameworkID,
+		RunCommand:      runCommand,
+		MissingTool:     missingTool,
+		Failure:         failure,
+		TaskSpec:        taskSpec,
+		Files:           append([]string(nil), files...),
+		ProjectSignals:  signals,
+	})
 }
 
 func (pt *PipelineTester) projectInstallSignals(ctx context.Context) []string {
-	candidates := []string{
-		"package.json",
-		"pnpm-lock.yaml",
-		"yarn.lock",
-		"package-lock.json",
-		"bun.lockb",
-		"bun.lock",
-		"pyproject.toml",
-		"requirements.txt",
-		"requirements-dev.txt",
-		"setup.cfg",
-		"setup.py",
-		"Pipfile",
-		"Pipfile.lock",
-		"poetry.lock",
-		"go.mod",
-		"Cargo.toml",
-		"Gemfile",
-		"composer.json",
-		"phpunit.xml",
-		"pom.xml",
-		"build.gradle",
-		"build.gradle.kts",
-		"gradlew",
-		"gradlew.bat",
-	}
-	signals := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		exists, err := pt.fileExists(ctx, candidate)
-		if err != nil || !exists {
-			continue
-		}
-		signals = append(signals, candidate)
-	}
-	return signals
-}
-
-func extractAcademicContent(msg *guide.Message) (string, error) {
-	if msg == nil {
-		return "", fmt.Errorf("academic response is missing")
-	}
-	resp, ok := msg.GetRouteResponse()
-	if !ok || resp == nil {
-		if errText, ok := msg.GetError(); ok {
-			return "", fmt.Errorf("%s", strings.TrimSpace(errText))
-		}
-		return "", fmt.Errorf("academic response payload is unsupported")
-	}
-	if !resp.Success {
-		return "", fmt.Errorf("%s", strings.TrimSpace(resp.Error))
-	}
-	if content := extractAcademicResponseContent(resp.Data); strings.TrimSpace(content) != "" {
-		return content, nil
-	}
-	return "", fmt.Errorf("academic response did not include install-plan content")
-}
-
-func extractAcademicResponseContent(data any) string {
-	switch typed := data.(type) {
-	case map[string]any:
-		content, _ := typed["content"].(string)
-		return strings.TrimSpace(content)
-	case string:
-		return strings.TrimSpace(typed)
-	default:
-		raw, err := json.Marshal(data)
-		if err != nil {
-			return ""
-		}
-		var payload map[string]any
-		if err := json.Unmarshal(raw, &payload); err != nil {
-			return ""
-		}
-		content, _ := payload["content"].(string)
-		return strings.TrimSpace(content)
-	}
+	return agentshared.ProjectInstallSignals(ctx, pt.fileAccess, pt.workingDir())
 }
 
 func parseTestToolInstallPlan(raw string) (*testToolInstallPlan, error) {
-	candidates := []string{
-		strings.TrimSpace(raw),
-		extractFencedJSON(raw),
-		extractJSONObject(raw),
-	}
-	for _, candidate := range candidates {
-		if strings.TrimSpace(candidate) == "" {
-			continue
-		}
-		var plan testToolInstallPlan
-		if err := json.Unmarshal([]byte(candidate), &plan); err != nil {
-			continue
-		}
-		if err := validateTestToolInstallPlan(&plan); err != nil {
-			return nil, err
-		}
-		return &plan, nil
-	}
-	return nil, fmt.Errorf("academic response did not contain valid install-plan JSON")
-}
-
-func extractFencedJSON(raw string) string {
-	start := strings.Index(raw, "```json")
-	if start == -1 {
-		start = strings.Index(raw, "```")
-		if start == -1 {
-			return ""
-		}
-		start += len("```")
-	} else {
-		start += len("```json")
-	}
-	end := strings.Index(raw[start:], "```")
-	if end == -1 {
-		return ""
-	}
-	return strings.TrimSpace(raw[start : start+end])
-}
-
-func extractJSONObject(raw string) string {
-	start := strings.Index(raw, "{")
-	end := strings.LastIndex(raw, "}")
-	if start == -1 || end == -1 || end < start {
-		return ""
-	}
-	return strings.TrimSpace(raw[start : end+1])
+	return agentshared.ParseDependencyInstallPlan(raw)
 }
 
 func validateTestToolInstallPlan(plan *testToolInstallPlan) error {
-	if plan == nil {
-		return fmt.Errorf("install plan is required")
-	}
-	if len(plan.Steps) == 0 {
-		return fmt.Errorf("install plan must contain at least one step")
-	}
-	for idx, step := range plan.Steps {
-		command := strings.TrimSpace(step.Command)
-		if command == "" {
-			return fmt.Errorf("install step %d is missing a command", idx+1)
-		}
-		if testerCommandHasUnsafeShellSyntax(command) {
-			return fmt.Errorf("install step %d command uses unsupported shell syntax", idx+1)
-		}
-	}
-	if strings.TrimSpace(plan.ValidationCommand) != "" && testerCommandHasUnsafeShellSyntax(plan.ValidationCommand) {
-		return fmt.Errorf("validation_command uses unsupported shell syntax")
-	}
-	if strings.TrimSpace(plan.Summary) == "" {
-		plan.Summary = "Install missing test tooling"
-	}
-	return nil
+	return agentshared.ValidateDependencyInstallPlan(plan)
 }
 
 func testerCommandHasUnsafeShellSyntax(command string) bool {
-	if strings.ContainsRune(command, '\n') || strings.ContainsRune(command, '\r') || strings.ContainsRune(command, 0) {
-		return true
-	}
-	for _, fragment := range []string{"&&", "||", ";", "|", "`", "$(", "${", ">", "<"} {
-		if strings.Contains(command, fragment) {
-			return true
-		}
-	}
-	return false
+	return agentshared.DependencyCommandHasUnsafeShellSyntax(command)
+}
+
+func formatTestToolInstallPlan(plan *testToolInstallPlan) string {
+	return agentshared.FormatDependencyInstallPlan(plan)
 }
 
 func (pt *PipelineTester) installTestTooling(ctx context.Context, plan *testToolInstallPlan) (map[string]any, error) {
@@ -466,14 +222,6 @@ func (pt *PipelineTester) installTestTooling(ctx context.Context, plan *testTool
 		}
 	}
 	return result, nil
-}
-
-func formatTestToolInstallPlan(plan *testToolInstallPlan) string {
-	lines := []string{strings.TrimSpace(plan.Summary)}
-	for idx, step := range plan.Steps {
-		lines = append(lines, fmt.Sprintf("%d. %s", idx+1, strings.TrimSpace(step.Command)))
-	}
-	return strings.Join(lines, "\n")
 }
 
 func (pt *PipelineTester) runInstallCommand(

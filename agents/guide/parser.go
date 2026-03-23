@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // =============================================================================
@@ -19,6 +20,8 @@ import (
 //   - @<action> <query>           - Action shortcut (registered by agents)
 //   - @<agent>:<intent>:<domain>  - Full DSL with explicit intent/domain
 type Parser struct {
+	mu sync.RWMutex
+
 	prefix string
 
 	// Compiled patterns
@@ -146,8 +149,20 @@ func NewParserWithRouting(prefix string, routing *RoutingAggregator) *Parser {
 
 // SetRouting sets the routing aggregator (for dynamic shortcut updates)
 func (p *Parser) SetRouting(routing *RoutingAggregator) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	p.routing = routing
-	// Refresh agent shortcuts
+	baseShortcuts := map[string]string{
+		"guide": "guide",
+		"g":     "guide",
+	}
+	for alias := range p.agentShortcuts {
+		delete(p.agentShortcuts, alias)
+	}
+	for alias, agentID := range baseShortcuts {
+		p.agentShortcuts[alias] = agentID
+	}
 	if routing != nil {
 		for alias, agentID := range routing.GetAllAliases() {
 			p.agentShortcuts[alias] = agentID
@@ -365,7 +380,9 @@ func (p *Parser) resolveFullDSL(input string, agentStr string, intentStr string,
 }
 
 func (p *Parser) resolveFullDSLAgent(input string, agentStr string) (string, error) {
+	p.mu.RLock()
 	agent, ok := p.agentShortcuts[agentStr]
+	p.mu.RUnlock()
 	if ok {
 		return agent, nil
 	}
@@ -380,7 +397,9 @@ func (p *Parser) resolveFullDSLAgent(input string, agentStr string) (string, err
 }
 
 func (p *Parser) resolveFullDSLIntent(input string, agentStr string, intentStr string) (Intent, error) {
+	p.mu.RLock()
 	intent, ok := p.intentShortcuts[intentStr]
+	p.mu.RUnlock()
 	if ok {
 		return intent, nil
 	}
@@ -395,7 +414,9 @@ func (p *Parser) resolveFullDSLIntent(input string, agentStr string, intentStr s
 }
 
 func (p *Parser) resolveFullDSLDomain(input string, agentStr string, intentStr string, domainStr string) (Domain, error) {
+	p.mu.RLock()
 	domain, ok := p.domainShortcuts[domainStr]
+	p.mu.RUnlock()
 	if ok {
 		return domain, nil
 	}
@@ -440,13 +461,17 @@ func (p *Parser) resolveAgent(agent string) string {
 	agent = strings.ToLower(agent)
 
 	// First check local shortcuts
+	p.mu.RLock()
 	if resolved, ok := p.agentShortcuts[agent]; ok {
+		p.mu.RUnlock()
 		return resolved
 	}
+	routing := p.routing
+	p.mu.RUnlock()
 
 	// Then check routing aggregator
-	if p.routing != nil {
-		if resolved, ok := p.routing.ResolveAgent(agent); ok {
+	if routing != nil {
+		if resolved, ok := routing.ResolveAgent(agent); ok {
 			return resolved
 		}
 	}
@@ -456,10 +481,14 @@ func (p *Parser) resolveAgent(agent string) string {
 
 // resolveActionShortcut resolves an action to its shortcut details and agent ID
 func (p *Parser) resolveActionShortcut(action string) (*ActionShortcut, string, bool) {
-	if p.routing == nil {
+	p.mu.RLock()
+	routing := p.routing
+	p.mu.RUnlock()
+
+	if routing == nil {
 		return nil, "", false
 	}
-	return p.routing.GetActionShortcut(action)
+	return routing.GetActionShortcut(action)
 }
 
 // parseParams parses key=value parameters

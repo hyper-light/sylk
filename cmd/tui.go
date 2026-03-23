@@ -145,6 +145,10 @@ type hydrateResult struct{ hydrated *providers.HydratedGoogleAuth }
 
 type modelSwapperFunc func(ctx context.Context, agentType, modelID string) error
 
+type modelSwapActivator interface {
+	EnsureActive(ctx context.Context, agentType string) (*container.Container, error)
+}
+
 type bootstrapPhase1 struct {
 	ctx         context.Context
 	projectRoot string
@@ -510,7 +514,11 @@ func startDaemonContainerBootstrap(
 
 func startActivationControllerBootstrap(phase1 *bootstrapPhase1, ch chan<- activationCtrlResult) {
 	go func() {
-		activationPolicies := activation.AgentActivationPolicies(phase1.descriptors.All())
+		activationPolicies, err := activation.AgentActivationPolicies(phase1.descriptors.All())
+		if err != nil {
+			ch <- activationCtrlResult{err: err}
+			return
+		}
 		storageDir, err := activationStorageDir()
 		if err != nil {
 			ch <- activationCtrlResult{err: err}
@@ -777,8 +785,15 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 	}
 	g.SetServiceRegistry(phase1.serviceReg)
 	g.SetProviderWrapper(phase1.googleGateway.Wrapper(gateway.PriorityUserInteractive))
-	g.SetAgentRegistrar(func(ctx context.Context, targetAgentID, podID, agentType string) {
-		_ = registerActivatedAgentWithGuide(ctx, g, phase1.containerReg, targetAgentID, podID, agentType)
+	g.SetAgentRegistrar(func(agentType string) {
+		containers := phase1.containerReg.ListByType(agentType)
+		if len(containers) == 0 {
+			return
+		}
+		agent := containers[0].Agent()
+		if router, ok := agent.(guide.AgentRouter); ok {
+			_ = registerAgentWithGuide(g, router, agentType)
+		}
 	})
 
 	orch.SetProviderRefresher(func(refreshCtx context.Context, authMethod string) {
@@ -990,7 +1005,7 @@ func startBootstrapPhase4(
 	phase4 := &bootstrapPhase4{
 		seeds:        seeds,
 		modelStore:   modelStore,
-		modelSwapper: buildModelSwapper(phase1.containerReg, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway),
+		modelSwapper: buildModelSwapper(phase1.containerReg, phase3.activationCtrl, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway),
 		phase4Done:   make(chan struct{}),
 	}
 
@@ -2265,33 +2280,6 @@ func registerAgentWithGuide(g *guide.Guide, router guide.AgentRouter, _ string) 
 	return registerRoutingInfoWithGuide(g, router.GetRoutingInfo())
 }
 
-func registerActivatedAgentWithGuide(
-	_ context.Context,
-	g *guide.Guide,
-	reg *container.ContainerRegistry,
-	_ string,
-	podID string,
-	agentType string,
-) error {
-	if g == nil || reg == nil {
-		return nil
-	}
-	containerRef := findRegisteredPodContainer(reg, podID, agentType)
-	if containerRef == nil {
-		return nil
-	}
-	router, ok := containerRef.Agent().(guide.AgentRouter)
-	if !ok {
-		return nil
-	}
-	seedRouterKnownAgents(g, router)
-	info := router.GetRoutingInfo()
-	if isTaskScopedPipelineWorker(podID, agentType) {
-		info = taskScopedWorkerRoutingInfo(info, podID, agentType)
-	}
-	return registerRoutingInfoWithGuide(g, info)
-}
-
 func registerRoutingInfoWithGuide(g *guide.Guide, info *guide.AgentRoutingInfo) error {
 	if g == nil || info == nil {
 		return nil
@@ -2374,8 +2362,12 @@ func taskScopedWorkerRoutingInfo(info *guide.AgentRoutingInfo, podID, agentType 
 
 func pipelineWorkerAgentID(ctx context.Context, agentType string) string {
 	if spec, ok := container.CreationSpecFromContext(ctx); ok {
-		if specID := strings.TrimSpace(spec.Labels["pipeline_worker_id"]); specID != "" {
-			return specID
+		if spec.Labels != nil {
+			if specID, labelOK := spec.Labels["pipeline_worker_id"]; labelOK {
+				if specID = strings.TrimSpace(specID); specID != "" {
+					return specID
+				}
+			}
 		}
 	}
 	podID, ok := container.CreationPodIDFromContext(ctx)
@@ -2526,25 +2518,89 @@ var agentSwapPriority = map[string]gateway.RequestPriority{
 // Provider creation is centralized here because cmd/tui.go owns all gateways.
 func buildModelSwapper(
 	containerReg *container.ContainerRegistry,
+	activator modelSwapActivator,
 	authRegistry *credentials.AuthRegistry,
 	googleGw, anthropicGw, openaiGw *gateway.ProviderGateway,
 ) func(ctx context.Context, agentType, modelID string) error {
 	return func(ctx context.Context, agentType, modelID string) error {
+		swappableContainer, err := resolveModelSwapContainer(ctx, containerReg, activator, agentType)
+		if err != nil {
+			return err
+		}
 		modelID = effectiveModelForCurrentAuth(authRegistry, modelID)
-		priority := agentSwapPriority[agentType]
+		priority, ok := agentSwapPriority[agentType]
+		if !ok {
+			return fmt.Errorf("no model swap priority configured for agent type %q", agentType)
+		}
 		provider, err := createSwapProvider(ctx, modelID, authRegistry, googleGw, anthropicGw, openaiGw, priority)
 		if err != nil {
 			return fmt.Errorf("model swap provider for %s: %w", agentType, err)
 		}
-		for _, c := range containerReg.ListByType(agentType) {
-			swappable, ok := c.Agent().(container.ModelSwappable)
-			if !ok {
-				continue
-			}
-			return swappable.SwapModel(ctx, modelID, provider)
+		swappable, ok := swappableContainer.Agent().(container.ModelSwappable)
+		if !ok {
+			return fmt.Errorf("container %q for type %q does not implement ModelSwappable", swappableContainer.ID(), agentType)
 		}
-		return fmt.Errorf("no ModelSwappable agent found for type %q", agentType)
+		return swappable.SwapModel(ctx, modelID, provider)
 	}
+}
+
+func resolveModelSwapContainer(
+	ctx context.Context,
+	containerReg *container.ContainerRegistry,
+	activator modelSwapActivator,
+	agentType string,
+) (*container.Container, error) {
+	if architectModelSwapRequiresLiveActivation(agentType) && activator != nil {
+		ctr, err := activator.EnsureActive(ctx, agentType)
+		if err != nil {
+			return nil, fmt.Errorf("activate %s for model swap: %w", agentType, err)
+		}
+		if ctr != nil {
+			if _, ok := ctr.Agent().(container.ModelSwappable); ok {
+				return ctr, nil
+			}
+		}
+	}
+	if ctr := firstRunningSwappableContainerForType(containerReg, agentType); ctr != nil {
+		return ctr, nil
+	}
+	if ctr := firstSwappableContainerForType(containerReg, agentType); ctr != nil {
+		return ctr, nil
+	}
+	if architectModelSwapRequiresLiveActivation(agentType) && activator != nil {
+		if _, err := activator.EnsureActive(ctx, agentType); err != nil {
+			return nil, fmt.Errorf("activate %s for model swap: %w", agentType, err)
+		}
+		if ctr := firstSwappableContainerForType(containerReg, agentType); ctr != nil {
+			return ctr, nil
+		}
+	}
+	return nil, fmt.Errorf("no ModelSwappable agent found for type %q", agentType)
+}
+
+func architectModelSwapRequiresLiveActivation(agentType string) bool {
+	return agentType == "architect"
+}
+
+func firstRunningSwappableContainerForType(containerReg *container.ContainerRegistry, agentType string) *container.Container {
+	for _, c := range containerReg.ListByType(agentType) {
+		if !c.IsRunning() {
+			continue
+		}
+		if _, ok := c.Agent().(container.ModelSwappable); ok {
+			return c
+		}
+	}
+	return nil
+}
+
+func firstSwappableContainerForType(containerReg *container.ContainerRegistry, agentType string) *container.Container {
+	for _, c := range containerReg.ListByType(agentType) {
+		if _, ok := c.Agent().(container.ModelSwappable); ok {
+			return c
+		}
+	}
+	return nil
 }
 
 // buildProviderRefresher returns a ProviderRefresher for the given priority

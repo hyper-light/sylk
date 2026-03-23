@@ -189,6 +189,7 @@ func (pt *PipelineTester) applyToolCalls(
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
+	recoveryHints := make([]string, 0, 1)
 	var controlErr error
 	for _, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
@@ -210,6 +211,9 @@ func (pt *PipelineTester) applyToolCalls(
 				result = shared.ToolErrorPayload(err)
 				isError = true
 				errCount++
+				if hint := shared.ToolRecoveryHint(call.Name, err); hint != "" {
+					recoveryHints = append(recoveryHints, hint)
+				}
 				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 					shared.LogAgentEvent(lm.EventLogger, agentlog.EventSkillFailed,
 						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
@@ -236,6 +240,7 @@ func (pt *PipelineTester) applyToolCalls(
 			break
 		}
 	}
+	shared.AppendToolRecoveryMessage(req, recoveryHints)
 	return errCount, controlErr
 }
 

@@ -4,21 +4,24 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
-func (o *Orchestrator) commitTaskDraft(ctx context.Context, task *TaskRecord) error {
+func (o *Orchestrator) commitTaskDraft(ctx context.Context, task *TaskRecord) (versioning.SemanticVersion, bool, error) {
 	if task == nil || strings.TrimSpace(task.SessionID) == "" {
-		return nil
+		return versioning.SemanticVersion{}, false, nil
 	}
 	svfs := o.GetSessionVFS(task.SessionID)
 	if svfs == nil || !svfs.HasPipeline(task.ID) {
-		return nil
+		return versioning.SemanticVersion{}, false, nil
 	}
-	if _, err := svfs.CommitPipeline(ctx, task.ID); err != nil {
+	ver, err := svfs.CommitPipeline(ctx, task.ID)
+	if err != nil {
 		_, _ = svfs.RollbackPipelineIfTracked(task.ID)
-		return fmt.Errorf("commit task draft %s: %w", task.ID, err)
+		return versioning.SemanticVersion{}, true, fmt.Errorf("commit task draft %s: %w", task.ID, err)
 	}
-	return nil
+	return ver, true, nil
 }
 
 func (o *Orchestrator) rollbackTaskDraft(task *TaskRecord) error {

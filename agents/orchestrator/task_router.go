@@ -224,6 +224,9 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 		return pr != nil
 	}
 	r.pendingMu.Unlock()
+	if r.onNodeActivity != nil && pr.task != nil {
+		r.onNodeActivity(pr.task.DAGID, pr.task.NodeID)
+	}
 
 	select {
 	case pr.ch <- msg:
@@ -481,7 +484,8 @@ func (r *TaskRouter) handleRouteResponse(task *PipelineTask, msg *guide.Message)
 	if msg.Type == guide.MessageTypeError {
 		errText, ok := msg.GetError()
 		if !ok || errText == "" {
-			errText = fmt.Sprintf("route error for node %s", task.NodeID)
+			source := firstNonEmpty(strings.TrimSpace(msg.SourceAgentID), strings.TrimSpace(task.AgentType), "unknown agent")
+			errText = fmt.Sprintf("route error from %s for node %s", source, task.NodeID)
 		}
 		r.logTrace("task_router_terminal_error", "error", agentlog.EventError, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
 			"error": errText,
@@ -492,14 +496,25 @@ func (r *TaskRouter) handleRouteResponse(task *PipelineTask, msg *guide.Message)
 	resp, ok := msg.GetRouteResponse()
 	if !ok || resp == nil {
 		r.logTrace("task_router_terminal_invalid", "error", agentlog.EventError, msg.CorrelationID, routeTraceData(task))
-		r.publishFailure(task, fmt.Errorf("invalid route response for node %s", task.NodeID))
+		source := firstNonEmpty(strings.TrimSpace(msg.SourceAgentID), strings.TrimSpace(task.AgentType), "unknown agent")
+		r.publishFailure(task, fmt.Errorf("invalid route response from %s for node %s", source, task.NodeID))
 		return
 	}
 	if !resp.Success {
+		errText := strings.TrimSpace(resp.Error)
+		if errText == "" {
+			source := firstNonEmpty(
+				strings.TrimSpace(resp.RespondingAgentName),
+				strings.TrimSpace(resp.RespondingAgentID),
+				strings.TrimSpace(task.AgentType),
+				"unknown agent",
+			)
+			errText = fmt.Sprintf("%s returned an unsuccessful route response for node %s without error details", source, task.NodeID)
+		}
 		r.logTrace("task_router_terminal_failed", "error", agentlog.EventError, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
-			"error": resp.Error,
+			"error": errText,
 		}))
-		r.publishFailure(task, fmt.Errorf("%s", resp.Error))
+		r.publishFailure(task, fmt.Errorf("%s", errText))
 		return
 	}
 

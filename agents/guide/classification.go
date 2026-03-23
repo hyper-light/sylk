@@ -171,6 +171,7 @@ func NewClassifierWithAPIKey(apiKey string, config RouterConfig) *Classifier {
 	if apiKey != "" {
 		opts = append(opts, option.WithAPIKey(apiKey))
 	}
+	opts = append(opts, option.WithMaxRetries(0))
 	client := anthropic.NewClient(opts...)
 
 	return &Classifier{

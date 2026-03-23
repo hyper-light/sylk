@@ -17,6 +17,7 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -58,21 +59,23 @@ type Designer struct {
 	tools         *toolruntime.Runtime
 	toolDefsDirty bool
 
-	bus         guide.EventBus
-	channels    *guide.AgentChannels
-	requestSub  guide.Subscription
-	responseSub guide.Subscription
-	registrySub guide.Subscription
-	running     bool
-	knownAgents map[string]*guide.AgentAnnouncement
+	bus           guide.EventBus
+	channels      *guide.AgentChannels
+	requestSub    guide.Subscription
+	responseSub   guide.Subscription
+	registrySub   guide.Subscription
+	running       bool
+	knownAgentsMu sync.RWMutex
+	knownAgents   map[string]*guide.AgentAnnouncement
 
 	consultations []Consultation
 	consultMu     sync.RWMutex
 	pendingMu     sync.Mutex
 	pendingBus    map[string]chan *guide.Message
 
-	fileAccess     versioning.FileAccess
-	workspaceViews versioning.WorkspaceViewAccess
+	fileAccess      versioning.FileAccess
+	workspaceViews  versioning.WorkspaceViewAccess
+	executionBroker purevfs.ExecutionBroker
 
 	// Request-scoped context lifecycle (mirrors architect/engineer pattern).
 	runCtx         context.Context
@@ -144,6 +147,7 @@ func New(cfg Config, provider designerProvider) (*Designer, error) {
 		pendingBus:        make(map[string]chan *guide.Message),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
+		executionBroker:   purevfs.DefaultExecutionBroker(),
 	}
 
 	d.steering.InitLazy("designer", nil)
@@ -723,6 +727,9 @@ func (d *Designer) handleRegistryAnnouncement(msg *guide.Message) error {
 		return nil
 	}
 
+	d.knownAgentsMu.Lock()
+	defer d.knownAgentsMu.Unlock()
+
 	switch msg.Type {
 	case guide.MessageTypeAgentRegistered:
 		d.knownAgents[ann.AgentID] = ann
@@ -744,6 +751,8 @@ func (d *Designer) handleRegistryAnnouncement(msg *guide.Message) error {
 }
 
 func (d *Designer) GetKnownAgents() map[string]*guide.AgentAnnouncement {
+	d.knownAgentsMu.RLock()
+	defer d.knownAgentsMu.RUnlock()
 	result := make(map[string]*guide.AgentAnnouncement, len(d.knownAgents))
 	for k, v := range d.knownAgents {
 		result[k] = v
@@ -980,6 +989,11 @@ func (d *Designer) SetFileAccess(fa versioning.FileAccess) {
 // SetWorkspaceViews injects explicit disk/global/pipeline read access.
 func (d *Designer) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
 	d.workspaceViews = authority.RestrictWorkspaceViews("designer", views)
+}
+
+// SetExecutionBroker overrides the strict execution broker.
+func (d *Designer) SetExecutionBroker(broker purevfs.ExecutionBroker) {
+	d.executionBroker = broker
 }
 
 // Terminate gracefully shuts down the designer agent.

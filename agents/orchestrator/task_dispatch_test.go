@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"testing"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	coreevents "github.com/adalundhe/sylk/core/events"
@@ -115,5 +116,37 @@ func TestPublishTaskDispatchAgents_PublishesForUnmanagedDispatch(t *testing.T) {
 
 	if got := len(pub.collected()); got == 0 {
 		t.Fatal("expected activity events for unmanaged dispatch")
+	}
+}
+
+func TestPublishTaskDispatchAgents_GlobalDispatchDoesNotRegisterPipelineGhosts(t *testing.T) {
+	pub := &trackingActivityPub{}
+	o := &Orchestrator{
+		config:                  Config{SessionID: "session-1"},
+		activityPub:             pub,
+		pipelinePanelState:      make(map[string]pipelinePanelSnapshot),
+		pipelinePanelRegistered: make(map[string]struct{}),
+	}
+
+	o.publishTaskDispatchAgents(&taskDispatchContext{
+		taskID:    "task-global-review",
+		taskSlug:  "global-review",
+		nodeID:    "node-review",
+		agentType: "tester",
+		coAgents:  []string{"inspector"},
+		now:       time.Now(),
+	}, "")
+
+	collected := pub.collected()
+	if len(collected) != 2 {
+		t.Fatalf("published %d events, want 2", len(collected))
+	}
+	for _, evt := range collected {
+		if evt.AgentID != "tester" && evt.AgentID != "inspector" {
+			t.Fatalf("unexpected global dispatch activity agent_id %q", evt.AgentID)
+		}
+		if evt.Data["source"] != "orchestrator_task_dispatch" {
+			t.Fatalf("source = %v, want orchestrator_task_dispatch", evt.Data["source"])
+		}
 	}
 }

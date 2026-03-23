@@ -1719,10 +1719,33 @@ func (e *providerDeltaEmitter) Delta(text string) string {
 func (g *GoogleProvider) convertMessages(messages []Message) []*genai.Content {
 	result := make([]*genai.Content, 0, len(messages))
 
-	for _, msg := range messages {
+	for i := 0; i < len(messages); i++ {
+		msg := messages[i]
 		switch msg.Role {
 		case RoleSystem:
 			// System messages handled via SystemInstruction in config
+			continue
+		case RoleTool:
+			// Gemini expects the function responses for a model tool-call turn
+			// to arrive as a single subsequent user turn containing one
+			// FunctionResponse part per FunctionCall part from that turn.
+			content := &genai.Content{Role: "user"}
+			for ; i < len(messages) && messages[i].Role == RoleTool; i++ {
+				toolMsg := messages[i]
+				name := resolveGoogleFunctionResponseName(toolMsg.ToolName, toolMsg.ToolCallID)
+				responseMap := buildGoogleFunctionResponse(toolMsg.Content, toolMsg.IsError)
+				content.Parts = append(content.Parts, &genai.Part{
+					FunctionResponse: &genai.FunctionResponse{
+						ID:       toolMsg.ToolCallID,
+						Name:     name,
+						Response: responseMap,
+					},
+				})
+			}
+			i-- // account for the outer loop increment
+			if len(content.Parts) > 0 {
+				result = append(result, content)
+			}
 			continue
 		case RoleAssistant:
 			// When raw model content is available (with thought signatures),
@@ -1739,30 +1762,10 @@ func (g *GoogleProvider) convertMessages(messages []Message) []*genai.Content {
 			content.Role = "user"
 		case RoleAssistant:
 			content.Role = "model"
-		case RoleTool:
-			// Vertex AI / Code Assist REST API accepts only "user" and "model".
-			// Function responses are carried as FunctionResponse parts inside a
-			// "user" content block — not a separate "function" role.
-			content.Role = "user"
 		}
 
-		// Tool messages carry their content inside the FunctionResponse part,
-		// so skip adding a redundant text part for them.
-		if msg.Role != RoleTool && msg.Content != "" {
+		if msg.Content != "" {
 			content.Parts = append(content.Parts, genai.NewPartFromText(msg.Content))
-		}
-
-		// Add tool results (function responses)
-		if msg.Role == RoleTool {
-			name := resolveGoogleFunctionResponseName(msg.ToolName, msg.ToolCallID)
-			responseMap := buildGoogleFunctionResponse(msg.Content, msg.IsError)
-			content.Parts = append(content.Parts, &genai.Part{
-				FunctionResponse: &genai.FunctionResponse{
-					ID:       msg.ToolCallID,
-					Name:     name,
-					Response: responseMap,
-				},
-			})
 		}
 
 		// Add function calls from assistant
@@ -1955,10 +1958,17 @@ type googleSerializablePartItem struct {
 	FunctionCallArgs map[string]any `json:"fc_args,omitempty"`
 }
 
+func (sp googleSerializablePartItem) hasReplayData() bool {
+	return strings.TrimSpace(sp.Text) != "" || strings.TrimSpace(sp.FunctionCallName) != ""
+}
+
 // toGenaiContent reconstructs a *genai.Content from the serializable snapshot.
 func (sc googleSerializableContent) toGenaiContent() *genai.Content {
 	content := &genai.Content{Role: sc.Role}
 	for _, sp := range sc.Parts {
+		if !sp.hasReplayData() {
+			continue
+		}
 		part := &genai.Part{
 			Text:             sp.Text,
 			Thought:          sp.Thought,
@@ -1972,6 +1982,9 @@ func (sc googleSerializableContent) toGenaiContent() *genai.Content {
 			}
 		}
 		content.Parts = append(content.Parts, part)
+	}
+	if len(content.Parts) == 0 {
+		return nil
 	}
 	return content
 }
@@ -2022,6 +2035,9 @@ func snapshotGenaiContent(c *genai.Content) googleSerializableContent {
 			sp.FunctionCallID = part.FunctionCall.ID
 			sp.FunctionCallName = part.FunctionCall.Name
 			sp.FunctionCallArgs = part.FunctionCall.Args
+		}
+		if !sp.hasReplayData() {
+			continue
 		}
 		sc.Parts = append(sc.Parts, sp)
 	}

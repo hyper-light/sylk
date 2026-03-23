@@ -421,7 +421,9 @@ func (e *Executor) executeNodeScoped(wg *sync.WaitGroup, node *Node, errState *l
 	wg.Add(1)
 	atomic.AddInt32(&e.nodesRunning, 1)
 
-	err := e.scope.Go("dag.executor.node", e.resolveNodeTimeout(node), func(ctx context.Context) error {
+	timeout := e.resolveNodeTimeout(node)
+
+	err := e.scope.Go("dag.executor.node", e.scopeNodeTimeout(timeout), func(ctx context.Context) error {
 		defer wg.Done()
 		defer atomic.AddInt32(&e.nodesRunning, -1)
 		defer e.releaseLayerSlot()
@@ -509,8 +511,18 @@ func (e *Executor) waitRetryBackoff(node *Node) error {
 
 func (e *Executor) resolveNodeTimeout(node *Node) time.Duration {
 	timeout := node.Timeout()
+	if timeout == NoTimeout {
+		return NoTimeout
+	}
 	if timeout == 0 {
 		return e.policy.DefaultTimeout
+	}
+	return timeout
+}
+
+func (e *Executor) scopeNodeTimeout(timeout time.Duration) time.Duration {
+	if timeout == NoTimeout {
+		return 0
 	}
 	return timeout
 }
@@ -589,7 +601,10 @@ func (e *Executor) dispatchNode(node *Node, parentResults map[string]*NodeResult
 	}
 
 	result, err := e.dispatcher.Dispatch(ctx, node, parentResults)
-	if ctx.Err() == context.DeadlineExceeded {
+	if err == nil {
+		return result, nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) || (result == nil && ctx.Err() == context.DeadlineExceeded) {
 		return failedDispatchResult(nodeID, ErrNodeTimeout, time.Since(node.StartTime())), ErrNodeTimeout
 	}
 
@@ -664,7 +679,7 @@ func (e *Executor) markNodeStarted(node *Node, nodeID string) {
 }
 
 func (e *Executor) nodeContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	if timeout <= 0 {
+	if timeout <= 0 || timeout == NoTimeout {
 		return e.ctx, func() {}
 	}
 	return context.WithTimeout(e.ctx, timeout)

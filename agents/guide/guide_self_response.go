@@ -265,6 +265,9 @@ func (r *GuideResponder) streamTurn(
 		if chunk != nil {
 			sawChunks = true
 		}
+		if chunk != nil && chunk.Type == providers.ChunkTypeStart && chunk.RetryReset {
+			streamErr = nil
+		}
 		collector.Add(chunk)
 		if chunk != nil && chunk.Type == providers.ChunkTypeError {
 			streamErr = fmt.Errorf("stream error: %s", chunk.Text)

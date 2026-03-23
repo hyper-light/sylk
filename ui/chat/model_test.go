@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
 )
@@ -222,6 +223,36 @@ func TestDuplicateStartDoesNotResetProgressOnlyStreamSlot(t *testing.T) {
 	}
 	if after.ThinkingText != beforeText {
 		t.Fatalf("thinking text = %q, want %q", after.ThinkingText, beforeText)
+	}
+}
+
+func TestHandleActivity_AllowsChatVisibleSuccessEvents(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+
+	comp, _ := m.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt-1",
+			EventType: events.EventTypeSuccess,
+			Timestamp: time.Now(),
+			AgentID:   "orchestrator",
+			Content:   "Operational transform merged task auth-checkout into the global VFS.",
+			Data: map[string]any{
+				"chat_visible": true,
+				"agent_type":   "orchestrator",
+			},
+		},
+	})
+	m = comp.(*Model)
+
+	last := m.history.Last()
+	if last == nil {
+		t.Fatal("expected chat entry for chat-visible success event")
+	}
+	if last.Source != SourceSystem {
+		t.Fatalf("source = %v, want %v", last.Source, SourceSystem)
+	}
+	if !strings.Contains(last.Content, "Operational transform merged") {
+		t.Fatalf("content = %q, want merge message", last.Content)
 	}
 }
 

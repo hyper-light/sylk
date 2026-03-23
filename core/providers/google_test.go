@@ -95,6 +95,103 @@ func TestGoogleConvertMessages_RestoresThoughtSignatureFromRawProviderData(t *te
 	}
 }
 
+func TestGoogleConvertMessages_SkipsReplayPartsWithoutData(t *testing.T) {
+	g := &GoogleProvider{}
+	raw := &googleSerializableContent{
+		Role: "model",
+		Parts: []googleSerializablePartItem{
+			{
+				Thought:          true,
+				ThoughtSignature: []byte("sig-only"),
+			},
+			{
+				FunctionCallID:   "fc_1",
+				FunctionCallName: "default_api:clarify",
+				FunctionCallArgs: map[string]any{"question": "Need more detail?"},
+			},
+		},
+	}
+
+	contents := g.convertMessages([]Message{{
+		Role:     RoleAssistant,
+		Content:  "ignored once raw content exists",
+		Metadata: googleRawProviderData(raw),
+	}})
+
+	if len(contents) != 1 {
+		t.Fatalf("got %d contents, want 1", len(contents))
+	}
+	if len(contents[0].Parts) != 1 {
+		t.Fatalf("got %d parts, want 1", len(contents[0].Parts))
+	}
+	if contents[0].Parts[0].FunctionCall == nil {
+		t.Fatal("expected surviving part to be a function call")
+	}
+	if contents[0].Parts[0].FunctionCall.Name != "default_api:clarify" {
+		t.Fatalf("function call name = %q, want %q", contents[0].Parts[0].FunctionCall.Name, "default_api:clarify")
+	}
+}
+
+func TestGoogleConvertMessages_GroupsConsecutiveToolResponsesIntoSingleUserTurn(t *testing.T) {
+	g := &GoogleProvider{}
+
+	contents := g.convertMessages([]Message{
+		{
+			Role: RoleAssistant,
+			ToolCalls: []ToolCall{
+				{ID: "tool_1", Name: "search_code", Arguments: `{"query":"alpha"}`},
+				{ID: "tool_2", Name: "read_file", Arguments: `{"path":"main.go"}`},
+			},
+		},
+		{
+			Role:       RoleTool,
+			ToolCallID: "tool_1",
+			ToolName:   "search_code",
+			Content:    `{"matches":1}`,
+		},
+		{
+			Role:       RoleTool,
+			ToolCallID: "tool_2",
+			ToolName:   "read_file",
+			Content:    `{"content":"package main"}`,
+		},
+	})
+
+	if len(contents) != 2 {
+		t.Fatalf("got %d contents, want 2", len(contents))
+	}
+	if contents[0].Role != "model" {
+		t.Fatalf("assistant role = %q, want model", contents[0].Role)
+	}
+	if len(contents[0].Parts) != 2 {
+		t.Fatalf("assistant parts = %d, want 2", len(contents[0].Parts))
+	}
+	if contents[1].Role != "user" {
+		t.Fatalf("tool response role = %q, want user", contents[1].Role)
+	}
+	if len(contents[1].Parts) != 2 {
+		t.Fatalf("tool response parts = %d, want 2", len(contents[1].Parts))
+	}
+	for i, want := range []struct {
+		id   string
+		name string
+	}{
+		{id: "tool_1", name: "search_code"},
+		{id: "tool_2", name: "read_file"},
+	} {
+		part := contents[1].Parts[i]
+		if part.FunctionResponse == nil {
+			t.Fatalf("tool response part %d missing function response", i)
+		}
+		if part.FunctionResponse.ID != want.id {
+			t.Fatalf("tool response id %d = %q, want %q", i, part.FunctionResponse.ID, want.id)
+		}
+		if part.FunctionResponse.Name != want.name {
+			t.Fatalf("tool response name %d = %q, want %q", i, part.FunctionResponse.Name, want.name)
+		}
+	}
+}
+
 func TestExtractGoogleRawContent_PreservesThoughtSignatureForReplay(t *testing.T) {
 	raw := extractGoogleRawContent(&genai.GenerateContentResponse{
 		Candidates: []*genai.Candidate{{
@@ -133,6 +230,38 @@ func TestExtractGoogleRawContent_PreservesThoughtSignatureForReplay(t *testing.T
 	}
 	if restored.Parts[1].FunctionCall == nil || restored.Parts[1].FunctionCall.Name != "default_api:clarify" {
 		t.Fatal("expected restored function call")
+	}
+}
+
+func TestExtractGoogleRawContent_SkipsPartsWithoutReplayData(t *testing.T) {
+	raw := extractGoogleRawContent(&genai.GenerateContentResponse{
+		Candidates: []*genai.Candidate{{
+			Content: &genai.Content{
+				Role: "model",
+				Parts: []*genai.Part{
+					{
+						Thought:          true,
+						ThoughtSignature: []byte("sig-only"),
+					},
+					{
+						FunctionCall: &genai.FunctionCall{
+							ID:   "fc_google",
+							Name: "default_api:clarify",
+							Args: map[string]any{"question": "Clarify scope"},
+						},
+					},
+				},
+			},
+		}},
+	})
+	if raw == nil {
+		t.Fatal("expected raw content")
+	}
+	if len(raw.Parts) != 1 {
+		t.Fatalf("got %d raw parts, want 1", len(raw.Parts))
+	}
+	if raw.Parts[0].FunctionCallName != "default_api:clarify" {
+		t.Fatalf("function call name = %q, want %q", raw.Parts[0].FunctionCallName, "default_api:clarify")
 	}
 }
 

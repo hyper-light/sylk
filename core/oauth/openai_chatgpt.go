@@ -596,9 +596,6 @@ func (s *openAIAuthService) executeSingleflightRefresh(
 }
 
 func (s *openAIAuthService) handleSingleflightRefreshError(err error, persist bool) error {
-	if IsInvalidGrant(err) && persist {
-		_ = s.store.Delete()
-	}
 	return err
 }
 

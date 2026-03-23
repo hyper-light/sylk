@@ -62,3 +62,10 @@ When Engineer sends integration suggestions:
 - Accept if it improves maintainability without compromising UX
 - Propose alternatives if the suggestion would degrade accessibility or visual quality
 - Always acknowledge and respond — never ignore integration feedback
+
+### Pipeline Challenge Discipline
+
+When the current task is a structured pipeline task:
+- Your first `challenge_agent` call to Tester, Engineer, or Inspector is allowed
+- Re-challenge Tester or Engineer only after that target changed pipeline VFS state since your previous challenge to that target
+- Re-challenge Inspector only after Inspector answered your previous challenge and you then changed pipeline VFS state yourself based on that answer

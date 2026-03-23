@@ -56,6 +56,7 @@ func TestDefaultEngineerSystemPrompt_UsesCurrentSkillNames(t *testing.T) {
 		"`consult`",
 		"`audit`",
 		"`run_command`",
+		"`run_shell_script`",
 	}
 	for _, marker := range required {
 		if !strings.Contains(DefaultEngineerSystemPrompt, marker) {
@@ -102,6 +103,8 @@ func TestEngineerSystemCollabPrompt_RoutesImplementationBackToInspector(t *testi
 		"`inspector -> tester -> engineer/designer -> inspector`",
 		"Do not hand off directly to `tester-pipeline` after implementation",
 		"Only Inspector may run `finalize_pipeline` and decide whether to invoke `handoff_to_ot`.",
+		"Your first `challenge_agent` call to Tester, Designer, or Inspector is allowed.",
+		"Re-challenge Inspector only after Inspector answered your previous challenge and you then changed pipeline VFS state yourself based on that answer.",
 	}
 	for _, want := range required {
 		if !strings.Contains(EngineerSystemCollabPrompt, want) {

@@ -136,6 +136,63 @@ func TestModel_DisplayOrder(t *testing.T) {
 	}
 }
 
+func TestModel_RenderListRow_SkipsNilStateEntries(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(48, 10)
+
+	model.agents["ghost-agent"] = nil
+	model.pipelines["ghost-pipeline"] = nil
+	model.variants["ghost-variant"] = nil
+
+	if got, ok, _ := model.renderListRow(listRow{Kind: rowAgent, ID: "ghost-agent"}, 0, 0, AnimState{}); ok || got != "" {
+		t.Fatalf("rowAgent render = %q, ok=%v, want empty,false", got, ok)
+	}
+	if got, ok, _ := model.renderListRow(listRow{Kind: rowPipeline, ID: "ghost-pipeline"}, 0, 0, AnimState{}); ok || got != "" {
+		t.Fatalf("rowPipeline render = %q, ok=%v, want empty,false", got, ok)
+	}
+	if got, ok, _ := model.renderListRow(listRow{Kind: rowVariant, ID: "ghost-variant"}, 0, 0, AnimState{}); ok || got != "" {
+		t.Fatalf("rowVariant render = %q, ok=%v, want empty,false", got, ok)
+	}
+}
+
+func TestModel_VariantsForPipeline_SkipsNilEntries(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.variants["ghost-variant"] = nil
+	model.variants["real-variant"] = &VariantState{ID: "real-variant", PipelineID: "task_1"}
+
+	variants := model.variantsForPipeline("task_1")
+	if len(variants) != 1 {
+		t.Fatalf("variantsForPipeline() len = %d, want 1", len(variants))
+	}
+	if variants[0] == nil || variants[0].ID != "real-variant" {
+		t.Fatalf("variantsForPipeline()[0] = %#v, want real-variant", variants[0])
+	}
+}
+
+func TestModel_RenderExpandedView_IgnoresNilExpandedEntries(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(48, 10)
+	model.view = viewExpanded
+
+	model.expanded = "ghost-pipeline"
+	model.pipelines["ghost-pipeline"] = nil
+	if got := model.renderExpandedView(); got != "" {
+		t.Fatalf("renderExpandedView() for nil pipeline = %q, want empty", got)
+	}
+
+	model.expanded = "ghost-variant"
+	model.variants["ghost-variant"] = nil
+	if got := model.renderExpandedView(); got != "" {
+		t.Fatalf("renderExpandedView() for nil variant = %q, want empty", got)
+	}
+
+	model.expanded = "ghost-agent"
+	model.agents["ghost-agent"] = nil
+	if got := model.renderExpandedView(); got != "" {
+		t.Fatalf("renderExpandedView() for nil agent = %q, want empty", got)
+	}
+}
+
 func TestModel_MoveSelectionSkipsSections(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)
@@ -207,8 +264,8 @@ func TestModel_PipelineStateAllowsLaterTaskSlugPromotion(t *testing.T) {
 	if pl == nil {
 		t.Fatal("expected pipeline state")
 	}
-	if pl.TaskLabel != "" {
-		t.Fatalf("pipeline TaskLabel = %q, want empty", pl.TaskLabel)
+	if pl.TaskLabel != "task_auth_checkout" {
+		t.Fatalf("pipeline TaskLabel = %q, want task_auth_checkout", pl.TaskLabel)
 	}
 
 	_, _ = model.Update(msg.ActivityEventMsg{
@@ -223,6 +280,56 @@ func TestModel_PipelineStateAllowsLaterTaskSlugPromotion(t *testing.T) {
 				"agent_type":  "engineer",
 				"pipeline_id": "task_auth_checkout",
 				"task_id":     "task_auth_checkout",
+				"task_slug":   "auth-checkout",
+			},
+		},
+	})
+
+	if pl.TaskLabel != "auth-checkout" {
+		t.Fatalf("pipeline TaskLabel = %q, want auth-checkout", pl.TaskLabel)
+	}
+}
+
+func TestModel_PipelineActivityAllowsLaterTaskSlugPromotionAfterTaskIDFallback(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_eng_fallback",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "eng-1",
+			Content:   "engineer registered",
+			Data: map[string]any{
+				"agent_name":  "Engineer",
+				"agent_type":  "engineer",
+				"pipeline_id": "task_1",
+				"task_id":     "task_1",
+			},
+		},
+	})
+
+	pl := model.pipelines["task_1"]
+	if pl == nil {
+		t.Fatal("expected pipeline state")
+	}
+	if pl.TaskLabel != "task_1" {
+		t.Fatalf("pipeline TaskLabel = %q, want task_1", pl.TaskLabel)
+	}
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_slug_upgrade",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "task_1:inspector-pipeline",
+			Content:   "inspecting",
+			Data: map[string]any{
+				"agent_name":  "Inspector",
+				"agent_type":  "inspector-pipeline",
+				"pipeline_id": "task_1",
+				"task_id":     "task_1",
 				"task_slug":   "auth-checkout",
 			},
 		},
@@ -717,7 +824,7 @@ func TestModel_ViewPinsFooterToBottomWhenContentIsSparse(t *testing.T) {
 	}
 }
 
-func TestModel_ViewFooterMovesDownAsPipelinesAreAdded(t *testing.T) {
+func TestModel_ViewHeightStaysFixedAsPipelinesAreAdded(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 14)
 	model.SetFocused(true)
@@ -731,18 +838,13 @@ func TestModel_ViewFooterMovesDownAsPipelinesAreAdded(t *testing.T) {
 		Status:     "executing",
 	})
 
-	footerLine := func(view string) int {
-		for i, line := range strings.Split(stripANSI(view), "\n") {
-			if strings.Contains(line, "╰") {
-				return i
-			}
-		}
-		return -1
+	lineCount := func(view string) int {
+		return len(strings.Split(stripANSI(view), "\n"))
 	}
 
-	before := footerLine(model.View())
-	if before < 0 {
-		t.Fatal("expected footer before adding pipelines")
+	before := lineCount(model.View())
+	if before != 14 {
+		t.Fatalf("view line count before adding pipelines = %d, want 14", before)
 	}
 
 	for _, slug := range []string{"payment-retry", "cli-packaging"} {
@@ -755,9 +857,9 @@ func TestModel_ViewFooterMovesDownAsPipelinesAreAdded(t *testing.T) {
 		})
 	}
 
-	after := footerLine(model.View())
-	if after <= before {
-		t.Fatalf("expected footer to move down as pipelines were added: before=%d after=%d", before, after)
+	after := lineCount(model.View())
+	if after != 14 {
+		t.Fatalf("view line count after adding pipelines = %d, want 14", after)
 	}
 }
 
@@ -980,6 +1082,94 @@ func TestModel_ViewKeepsCriticalSectionsPinnedWhenUnfocused(t *testing.T) {
 	}
 }
 
+func TestModel_ViewDoesNotAutoFollowActivePipelinesWhenUnfocused(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(32, 8)
+	model.SetFocused(false)
+
+	for _, slug := range []string{"pipeline-a", "pipeline-b", "pipeline-c", "pipeline-d"} {
+		pipelineID := "task_" + strings.ReplaceAll(slug, "-", "_")
+		model.Update(msg.PipelineStateMsg{
+			PipelineID: pipelineID,
+			TaskID:     pipelineID,
+			TaskLabel:  slug,
+			Status:     "executing",
+			LoopCount:  1,
+			MaxLoops:   4,
+		})
+		_, _ = model.Update(msg.ActivityEventMsg{
+			Event: &events.ActivityEvent{
+				ID:        "evt_" + pipelineID,
+				EventType: events.EventTypeAgentRegistered,
+				Timestamp: time.Now(),
+				AgentID:   pipelineID + ":engineer",
+				Data: map[string]any{
+					"agent_name":  "Engineer",
+					"agent_type":  "engineer",
+					"pipeline_id": pipelineID,
+					"task_id":     pipelineID,
+					"task_slug":   slug,
+				},
+			},
+		})
+	}
+
+	view := stripANSI(model.View())
+	if !strings.Contains(view, "pipeline-a") {
+		t.Fatalf("expected unfocused view to preserve the top of the pipeline list, got %q", view)
+	}
+	if model.pipelineScroll != 0 {
+		t.Fatalf("pipelineScroll = %d, want 0", model.pipelineScroll)
+	}
+}
+
+func TestModel_PipelineViewportLayoutCountsWrappedHeaderLines(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(26, 8)
+	model.SetFocused(true)
+
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_auth_checkout",
+		TaskID:     "task_auth_checkout",
+		TaskLabel:  "auth-checkout-extremely-long-title",
+		Status:     "executing",
+		LoopCount:  3,
+		MaxLoops:   12,
+	})
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_wrapped_pipeline",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "task_auth_checkout:engineer",
+			Data: map[string]any{
+				"agent_name":  "Engineer",
+				"agent_type":  "engineer",
+				"pipeline_id": "task_auth_checkout",
+				"task_id":     "task_auth_checkout",
+				"task_slug":   "auth-checkout-extremely-long-title",
+			},
+		},
+	})
+
+	layout, ok := model.pipelineViewportLayout()
+	if !ok {
+		t.Fatal("expected pipeline viewport layout")
+	}
+	if len(layout.rowHeights) < 2 {
+		t.Fatalf("rowHeights len = %d, want at least 2", len(layout.rowHeights))
+	}
+	if layout.rowHeights[0] != 2 {
+		t.Fatalf("pipeline header height = %d, want 2", layout.rowHeights[0])
+	}
+	if layout.rowHeights[1] != 1 {
+		t.Fatalf("pipeline member height = %d, want 1", layout.rowHeights[1])
+	}
+	if layout.totalLines < 3 {
+		t.Fatalf("totalLines = %d, want at least 3", layout.totalLines)
+	}
+}
+
 func TestModel_HandleListClickTogglesPipelineHeader(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 12)
@@ -1176,8 +1366,8 @@ func TestModel_PipelineMetadataRehomesEarlierBadRuntimeRow(t *testing.T) {
 		},
 	})
 
-	if model.agents["designer"] == nil {
-		t.Fatal("expected initial bad runtime row")
+	if model.agents["designer"] != nil {
+		t.Fatal("unexpected ambiguous global designer row")
 	}
 
 	_, _ = model.Update(msg.ActivityEventMsg{
@@ -1198,10 +1388,128 @@ func TestModel_PipelineMetadataRehomesEarlierBadRuntimeRow(t *testing.T) {
 	})
 
 	if _, exists := model.agents["designer"]; exists {
-		t.Fatal("bad runtime row was not rehomed")
+		t.Fatal("unexpected ambiguous global designer row after fixup")
 	}
 	if model.agents["task_auth_checkout:designer"] == nil {
 		t.Fatal("expected canonical pipeline row after rehome")
+	}
+}
+
+func TestModel_PipelineWorkerFallbackAvoidsGlobalDuplicatesAfterEngineerFailure(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_auth_checkout",
+		TaskID:     "task_auth_checkout",
+		TaskLabel:  "auth-checkout",
+		Status:     "executing",
+	})
+
+	for _, agentType := range []string{"engineer", "inspector-pipeline", "tester-pipeline"} {
+		_, _ = model.Update(msg.ActivityEventMsg{
+			Event: &events.ActivityEvent{
+				ID:        "seed_" + agentType,
+				EventType: events.EventTypeAgentRegistered,
+				Timestamp: time.Now(),
+				AgentID:   "task_auth_checkout:" + agentType,
+				Content:   "Pipeline agent registered",
+				Data: map[string]any{
+					"agent_name":  agentType,
+					"agent_type":  agentType,
+					"pipeline_id": "task_auth_checkout",
+					"task_id":     "task_auth_checkout",
+					"task_slug":   "auth-checkout",
+				},
+			},
+		})
+	}
+
+	for _, tc := range []struct {
+		agentType string
+		eventType events.EventType
+		content   string
+	}{
+		{agentType: "engineer", eventType: events.EventTypeAgentError, content: "Task failed: tool calls failed 2 consecutive turns"},
+		{agentType: "inspector-pipeline", eventType: events.EventTypeAgentRegistered, content: "Pipeline agent registered"},
+		{agentType: "tester-pipeline", eventType: events.EventTypeAgentRegistered, content: "Pipeline agent registered"},
+	} {
+		_, _ = model.Update(msg.ActivityEventMsg{
+			Event: &events.ActivityEvent{
+				ID:        "fallback_" + tc.agentType,
+				EventType: tc.eventType,
+				Timestamp: time.Now(),
+				AgentID:   tc.agentType,
+				Content:   tc.content,
+				Data:      map[string]any{},
+			},
+		})
+	}
+
+	if got := len(model.agents); got != 3 {
+		t.Fatalf("agent count = %d, want 3", got)
+	}
+	for _, agentID := range []string{"engineer", "inspector-pipeline", "tester-pipeline"} {
+		if model.agents[agentID] != nil {
+			t.Fatalf("unexpected global fallback row %q", agentID)
+		}
+	}
+	for _, agentType := range []string{"engineer", "inspector-pipeline", "tester-pipeline"} {
+		canonicalID := "task_auth_checkout:" + agentType
+		agent := model.agents[canonicalID]
+		if agent == nil {
+			t.Fatalf("expected canonical pipeline row %q", canonicalID)
+		}
+		if agent.PipelineID != "task_auth_checkout" {
+			t.Fatalf("%s PipelineID = %q, want task_auth_checkout", canonicalID, agent.PipelineID)
+		}
+	}
+
+	model.ensureRows()
+	for _, row := range model.rows {
+		if row.Kind == rowSection && row.Label == "global" {
+			t.Fatal("did not expect a global section after fallback pipeline worker events")
+		}
+	}
+}
+
+func TestModel_DropsAmbiguousPipelineActivityWithoutCreatingGlobalGhost(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_auth_checkout",
+		TaskID:     "task_auth_checkout",
+		TaskLabel:  "auth-checkout",
+		Status:     "executing",
+	})
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_auth_profile",
+		TaskID:     "task_auth_profile",
+		TaskLabel:  "auth-profile",
+		Status:     "executing",
+	})
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "ambiguous_engineer",
+			EventType: events.EventTypeAgentError,
+			Timestamp: time.Now(),
+			AgentID:   "engineer",
+			Content:   "Task failed: tool calls failed 2 consecutive turns",
+			Data: map[string]any{
+				"agent_type": "engineer",
+			},
+		},
+	})
+
+	if model.agents["engineer"] != nil {
+		t.Fatal("unexpected global engineer ghost row")
+	}
+	if got := len(model.agents); got != 0 {
+		t.Fatalf("agent count = %d, want 0", got)
 	}
 }
 

@@ -42,6 +42,12 @@ func TestRunCommandRejectsShellControlOperators(t *testing.T) {
 	}
 }
 
+func TestRunCommandAllowsQuotedOperatorText(t *testing.T) {
+	if commandHasUnsafeShellSyntax(`python -c "print('a && b')"`) {
+		t.Fatal("expected quoted operator text to remain valid")
+	}
+}
+
 func TestRunCommandRejectsPipelineVFSWritesWithoutStrictBroker(t *testing.T) {
 	root := t.TempDir()
 

@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
+	"github.com/openai/openai-go/packages/param"
 	"github.com/openai/openai-go/responses"
 	"github.com/openai/openai-go/shared"
 )
@@ -539,9 +540,7 @@ func (p *OpenAIProvider) refreshAndPersistChatGPTAuth(
 }
 
 func (p *OpenAIProvider) handleChatGPTRefreshError(ctx context.Context, err error) error {
-	if oauth.IsInvalidGrant(err) {
-		_ = p.authService.Delete(ctx)
-	}
+	_ = ctx
 	return fmt.Errorf("refresh chatgpt auth: %w", err)
 }
 
@@ -1951,7 +1950,7 @@ func (p *OpenAIProvider) convertResponseTools(tools []Tool) []responses.ToolUnio
 	for _, tool := range tools {
 		switch tool.ResolvedKind() {
 		case ToolKindNativeWebSearch:
-			result = append(result, openAIWebSearchToolParam(tool))
+			result = append(result, openAIWebSearchToolParam(tool, p.config.AuthMode))
 		default:
 			params := sanitizeSchemaIterative(tool.Parameters)
 			// Only enable strict mode when the schema is strict-compatible:
@@ -1973,7 +1972,10 @@ func (p *OpenAIProvider) convertResponseTools(tools []Tool) []responses.ToolUnio
 	return result
 }
 
-func openAIWebSearchToolParam(tool Tool) responses.ToolUnionParam {
+func openAIWebSearchToolParam(tool Tool, authMode string) responses.ToolUnionParam {
+	if authMode == openAIAuthModeChatGPT {
+		return openAIChatGPTWebSearchToolParam(tool)
+	}
 	param := responses.WebSearchToolParam{
 		Type: responses.WebSearchToolTypeWebSearchPreview2025_03_11,
 	}
@@ -1986,6 +1988,21 @@ func openAIWebSearchToolParam(tool Tool) responses.ToolUnionParam {
 		}
 	}
 	return responses.ToolUnionParam{OfWebSearchPreview: &param}
+}
+
+func openAIChatGPTWebSearchToolParam(tool Tool) responses.ToolUnionParam {
+	raw := map[string]any{
+		"type": "web_search",
+	}
+	if tool.WebSearch != nil {
+		if size := resolveOpenAIWebSearchContextSize(tool.WebSearch.SearchContextSize); size != "" {
+			raw["search_context_size"] = string(size)
+		}
+		if location := openAIWebSearchUserLocationMap(tool.WebSearch.UserLocation); len(location) > 0 {
+			raw["user_location"] = location
+		}
+	}
+	return param.Override[responses.ToolUnionParam](raw)
 }
 
 func resolveOpenAIWebSearchContextSize(size WebSearchContextSize) responses.WebSearchToolSearchContextSize {
@@ -2025,6 +2042,29 @@ func openAIWebSearchUserLocation(location *WebSearchUserLocation) *responses.Web
 		param.Timezone = openai.String(timezone)
 	}
 	return param
+}
+
+func openAIWebSearchUserLocationMap(location *WebSearchUserLocation) map[string]any {
+	if location == nil {
+		return nil
+	}
+	result := map[string]any{}
+	if city := strings.TrimSpace(location.City); city != "" {
+		result["city"] = city
+	}
+	if country := strings.TrimSpace(location.Country); country != "" {
+		result["country"] = country
+	}
+	if region := strings.TrimSpace(location.Region); region != "" {
+		result["region"] = region
+	}
+	if timezone := strings.TrimSpace(location.Timezone); timezone != "" {
+		result["timezone"] = timezone
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 // isStrictCompatible returns true when the JSON schema is compatible with

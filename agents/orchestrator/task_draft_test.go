@@ -37,8 +37,15 @@ func TestCommitTaskDraft_MergesTaskPipelineIntoGlobalDraft(t *testing.T) {
 	o.SetSessionVFS("sess-1", svfs)
 
 	task := &TaskRecord{ID: "task-1", SessionID: "sess-1"}
-	if err := o.commitTaskDraft(context.Background(), task); err != nil {
+	version, hadDraft, err := o.commitTaskDraft(context.Background(), task)
+	if err != nil {
 		t.Fatalf("commitTaskDraft: %v", err)
+	}
+	if !hadDraft {
+		t.Fatal("expected tracked draft to be merged")
+	}
+	if version.IsZero() {
+		t.Fatal("expected non-zero global VFS version after merge")
 	}
 
 	content, err := svfs.GlobalVFS().Read(context.Background(), target)

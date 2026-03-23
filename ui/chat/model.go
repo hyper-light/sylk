@@ -432,7 +432,7 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 		}
 		return nil
 	}
-	if chatSuppressedEvents[ev.Event.EventType.String()] {
+	if shouldSuppressActivity(ev) {
 		return nil
 	}
 	entry := &ChatEntry{
@@ -451,6 +451,16 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 	}
 	m.PushEntry(entry)
 	return nil
+}
+
+func shouldSuppressActivity(ev msg.ActivityEventMsg) bool {
+	if ev.Event == nil {
+		return true
+	}
+	if activityBoolData(ev, "chat_visible") {
+		return false
+	}
+	return chatSuppressedEvents[ev.Event.EventType.String()]
 }
 
 // handleStreamStart begins accumulation. If a thinking placeholder exists,
@@ -1879,4 +1889,16 @@ func activityStringData(ev msg.ActivityEventMsg, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(s)
+}
+
+func activityBoolData(ev msg.ActivityEventMsg, key string) bool {
+	if ev.Event == nil || ev.Event.Data == nil {
+		return false
+	}
+	value, ok := ev.Event.Data[key]
+	if !ok {
+		return false
+	}
+	typed, ok := value.(bool)
+	return ok && typed
 }

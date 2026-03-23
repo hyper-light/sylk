@@ -82,19 +82,20 @@ func (g *Guardian) evaluateCommandApproval(ctx context.Context, req *commandappr
 
 func (g *Guardian) commandApprovalProposal(req commandapproval.Request, analysis commandapproval.Analysis) *commandapproval.Proposal {
 	return &commandapproval.Proposal{
-		AgentID:       req.AgentID,
-		AgentType:     req.AgentType,
-		ToolName:      req.ToolName,
-		Command:       req.Command,
-		WorkingDir:    req.WorkingDir,
-		WorkspaceRoot: req.WorkspaceRoot,
-		TemplateKey:   analysis.TemplateKey,
-		PersistKey:    analysis.PersistKey,
-		PersistLabel:  analysis.PersistLabel,
-		RuleLabel:     analysis.RuleLabel,
-		Summary:       analysis.Summary,
-		Risk:          analysis.Risk,
-		Timestamp:     time.Now(),
+		AgentID:        req.AgentID,
+		AgentType:      req.AgentType,
+		ToolName:       req.ToolName,
+		Command:        req.Command,
+		WorkingDir:     req.WorkingDir,
+		WorkspaceRoot:  req.WorkspaceRoot,
+		TemplateKey:    analysis.TemplateKey,
+		PersistKey:     analysis.PersistKey,
+		PersistLabel:   analysis.PersistLabel,
+		RuleLabel:      analysis.RuleLabel,
+		Summary:        analysis.Summary,
+		Risk:           analysis.Risk,
+		Timestamp:      time.Now(),
+		ApprovalPolicy: analysis.ApprovalPolicy,
 	}
 }
 

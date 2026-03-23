@@ -20,6 +20,7 @@ import (
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -60,13 +61,14 @@ type GlobalTester struct {
 	toolDefsDirty bool
 
 	// Bus (standard agent pattern).
-	bus         guide.EventBus
-	channels    *guide.AgentChannels
-	requestSub  guide.Subscription
-	responseSub guide.Subscription
-	registrySub guide.Subscription
-	running     bool
-	knownAgents map[string]*guide.AgentAnnouncement
+	bus           guide.EventBus
+	channels      *guide.AgentChannels
+	requestSub    guide.Subscription
+	responseSub   guide.Subscription
+	registrySub   guide.Subscription
+	running       bool
+	knownAgentsMu sync.RWMutex
+	knownAgents   map[string]*guide.AgentAnnouncement
 
 	// Handoff integration.
 	handoffBridge *handoff.HandoffBridge
@@ -75,8 +77,9 @@ type GlobalTester struct {
 	agentPod *agentshared.AgentPod
 
 	// File access (injected per-session at runtime).
-	fileAccess     versioning.FileAccess
-	workspaceViews versioning.WorkspaceViewAccess
+	fileAccess      versioning.FileAccess
+	workspaceViews  versioning.WorkspaceViewAccess
+	executionBroker purevfs.ExecutionBroker
 
 	// Request lifecycle.
 	runCtx    context.Context
@@ -109,6 +112,7 @@ func New(cfg shared.GlobalTesterConfig, provider providers.ProviderAdapter) (*Gl
 		diagEngine:        shared.NewDiagnosisEngine(),
 		steering:          agentshared.NewSteeringManager(),
 		requestSerializer: agentshared.NewRequestSerializer(),
+		executionBroker:   purevfs.DefaultExecutionBroker(),
 	}
 
 	gt.steering.InitLazy("tester", cfg.ActivityPub)
@@ -265,11 +269,15 @@ func (gt *GlobalTester) registerCoreSkills() {
 
 	// Shared skills.
 	gt.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return gt.fileAccess }))
+	gt.skills.Register(runCommandSkill(gt))
+	gt.skills.Register(runShellScriptSkill(gt))
 	gt.skills.Register(shared.AnalyzeRiskSkill())
 	gt.skills.Register(shared.PlanTestsSkill())
 	gt.skills.Register(writeTestSkill(gt))
 	gt.skills.Register(shared.RunTestSuiteSkill())
 	gt.skills.Register(shared.DiagnoseFailureSkill(gt.diagEngine))
+	gt.skills.Register(researchTestToolInstallSkill(gt))
+	gt.skills.Register(installTestToolingSkill(gt))
 	gt.skills.Register(shared.NewTesterReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
 	gt.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
 	gt.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
@@ -619,6 +627,9 @@ func (gt *GlobalTester) handleRegistryAnnouncement(msg *guide.Message) error {
 		return nil
 	}
 
+	gt.knownAgentsMu.Lock()
+	defer gt.knownAgentsMu.Unlock()
+
 	action := "registered"
 	switch msg.Type {
 	case guide.MessageTypeAgentRegistered:
@@ -744,6 +755,11 @@ func (gt *GlobalTester) SetFileAccess(fa versioning.FileAccess) {
 // SetWorkspaceViews injects explicit disk/global/pipeline read access.
 func (gt *GlobalTester) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
 	gt.workspaceViews = authority.RestrictWorkspaceViews("tester", views)
+}
+
+// SetExecutionBroker overrides the strict execution broker.
+func (gt *GlobalTester) SetExecutionBroker(broker purevfs.ExecutionBroker) {
+	gt.executionBroker = broker
 }
 
 // ExtractArchivableState returns state for handoff persistence.

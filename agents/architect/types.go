@@ -436,7 +436,8 @@ type AgentExecutionContract struct {
 // TaskExample provides a concrete code or pattern example for the task.
 type TaskExample struct {
 	Label       string // Short description of what the example shows
-	Code        string // Code snippet or pattern
+	Language    string // Code fence info string (e.g. "go", "sh", "json", "mermaid")
+	Code        string // Code snippet or pattern; stored without surrounding backticks
 	Explanation string // Why this example is relevant
 }
 

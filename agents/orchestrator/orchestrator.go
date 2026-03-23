@@ -1288,7 +1288,12 @@ func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 	}
 	o.mu.Unlock()
 
-	mergeErr := o.commitTaskDraft(context.Background(), task)
+	mergeVersion, hadDraft, mergeErr := o.commitTaskDraft(context.Background(), task)
+	if mergeErr != nil {
+		o.publishTaskDraftMergeFailure(task, mergeErr)
+	} else if hadDraft {
+		o.publishTaskDraftMergeSuccess(task, mergeVersion)
+	}
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -1849,7 +1854,7 @@ func (o *Orchestrator) publishActivity(eventType events.EventType, content strin
 // publishPipelineAgentActivity publishes an activity event for a pipeline
 // agent so the TUI's ensureAgent creates a pipeline-scoped panel entry.
 func (o *Orchestrator) publishPipelineAgentActivity(agentType, pipelineID, nodeID, taskSlug, pipelineStatus string) {
-	if o.activityPub == nil {
+	if o.activityPub == nil || strings.TrimSpace(pipelineID) == "" || !isPipelinePanelAgentType(agentType) {
 		return
 	}
 	panelAgentID := pipelinePanelAgentID(pipelineID, agentType)
@@ -1886,7 +1891,7 @@ func (o *Orchestrator) publishPipelineAgentActivity(agentType, pipelineID, nodeI
 // pipeline agent that is present but not yet dispatched. Uses
 // EventTypeAgentRegistered so the TUI shows the agent as waiting (not active).
 func (o *Orchestrator) publishPipelineAgentRegistration(agentType, pipelineID, taskSlug, pipelineStatus string) {
-	if o.activityPub == nil {
+	if o.activityPub == nil || strings.TrimSpace(pipelineID) == "" || !isPipelinePanelAgentType(agentType) {
 		return
 	}
 	panelAgentID := pipelinePanelAgentID(pipelineID, agentType)
@@ -1968,9 +1973,13 @@ func (o *Orchestrator) publishActivityWithVisibility(eventType events.EventType,
 // via the activity event bus, giving the UI visibility into backoff waits.
 func (o *Orchestrator) retryObserver() providers.RetryObserver {
 	return func(event providers.RetryEvent) {
+		detail := providers.FriendlyErrorMessage(event.Err)
+		if detail == "" {
+			detail = "Transient provider error"
+		}
 		o.publishActivity(events.EventTypeAgentError,
-			fmt.Sprintf("Rate limited, retrying (%d/%d) after %s",
-				event.Attempt, event.MaxAttempts, event.Delay.Round(time.Second)))
+			fmt.Sprintf("%s — retrying (%d/%d) after %s",
+				detail, event.Attempt, event.MaxAttempts, event.Delay.Round(time.Second)))
 	}
 }
 
@@ -2098,6 +2107,9 @@ func (o *Orchestrator) handleLayerDecisionResponse(msg *guide.Message) error {
 	}
 
 	decision := parseDecisionKind(decisionStr)
+	if decision == dag.DecisionRetry {
+		o.dagBridge.ResetPendingTaskPods(dagID)
+	}
 	o.dagBridge.ResolveDecision(dagID, decision)
 	return nil
 }

@@ -17,6 +17,7 @@ type cachedAgentMetadata struct {
 	AgentName  string
 	PipelineID string
 	TaskID     string
+	TaskName   string
 	TaskSlug   string
 }
 
@@ -83,6 +84,9 @@ func (p *MetadataCachingPublisher) PublishActivity(event *ActivityEvent) {
 	if meta.TaskID != "" && extractMetadataString(cloned.Data, "task_id") == "" {
 		cloned.Data["task_id"] = meta.TaskID
 	}
+	if meta.TaskName != "" && extractMetadataString(cloned.Data, "task_name") == "" {
+		cloned.Data["task_name"] = meta.TaskName
+	}
 	if meta.TaskSlug != "" && extractMetadataString(cloned.Data, "task_slug") == "" {
 		cloned.Data["task_slug"] = meta.TaskSlug
 	}
@@ -105,6 +109,7 @@ func (p *MetadataCachingPublisher) resolveMetadata(agentID string, data map[stri
 		AgentName:  extractMetadataString(data, "agent_name"),
 		PipelineID: logicalPipelineID(extractMetadataString(data, "pipeline_id"), taskID),
 		TaskID:     taskID,
+		TaskName:   extractMetadataString(data, "task_name"),
 		TaskSlug:   extractMetadataString(data, "task_slug"),
 	}
 
@@ -130,6 +135,9 @@ func (p *MetadataCachingPublisher) resolveMetadata(agentID string, data map[stri
 			}
 			if meta.TaskID == "" {
 				meta.TaskID = cached.TaskID
+			}
+			if meta.TaskName == "" {
+				meta.TaskName = cached.TaskName
 			}
 			if meta.TaskSlug == "" {
 				meta.TaskSlug = cached.TaskSlug
@@ -160,6 +168,7 @@ func (p *MetadataCachingPublisher) rememberMetadata(rawID string, event *Activit
 		AgentName:  extractMetadataString(data, "agent_name"),
 		PipelineID: logicalPipelineID(extractMetadataString(data, "pipeline_id"), extractMetadataString(data, "task_id")),
 		TaskID:     extractMetadataString(data, "task_id"),
+		TaskName:   extractMetadataString(data, "task_name"),
 		TaskSlug:   extractMetadataString(data, "task_slug"),
 	}
 	if meta.PanelID == "" && rawID == "" {

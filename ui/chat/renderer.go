@@ -234,11 +234,7 @@ func badgeAgentType(entry *ChatEntry) string {
 }
 
 func pipelineBadgeLabel(entry *ChatEntry) (string, bool) {
-	taskLabel := humanizePipelineTaskLabel(firstNonEmpty(
-		strings.TrimSpace(entry.TaskName),
-		strings.TrimSpace(entry.TaskSlug),
-		strings.TrimSpace(entry.TaskID),
-	))
+	taskLabel := pipelineBadgeTaskLabel(entry)
 	if taskLabel != "" {
 		agentLabel := humanizePipelineAgentLabel(badgeAgentType(entry))
 		if agentLabel == "" {
@@ -269,8 +265,11 @@ func pipelineBadgeLabel(entry *ChatEntry) (string, bool) {
 		return "", false
 	}
 
-	parsedTaskLabel := humanizePipelineTaskLabel(taskPart)
+	parsedTaskLabel := humanizePipelineTaskIDLabel(taskPart)
 	if parsedTaskLabel == "" {
+		if agentLabel != "" {
+			return agentLabel, true
+		}
 		return "", false
 	}
 	if agentLabel == "" {
@@ -280,6 +279,19 @@ func pipelineBadgeLabel(entry *ChatEntry) (string, bool) {
 		return parsedTaskLabel, true
 	}
 	return parsedTaskLabel + ": " + agentLabel, true
+}
+
+func pipelineBadgeTaskLabel(entry *ChatEntry) string {
+	if entry == nil {
+		return ""
+	}
+	if label := humanizePipelineTaskLabel(strings.TrimSpace(entry.TaskName)); label != "" {
+		return label
+	}
+	if label := humanizePipelineTaskLabel(strings.TrimSpace(entry.TaskSlug)); label != "" {
+		return label
+	}
+	return humanizePipelineTaskIDLabel(strings.TrimSpace(entry.TaskID))
 }
 
 func firstNonEmpty(values ...string) string {
@@ -311,6 +323,38 @@ func humanizePipelineTaskLabel(task string) string {
 	task = strings.ReplaceAll(task, "-", " ")
 	task = strings.ReplaceAll(task, "_", " ")
 	return titleWords(task)
+}
+
+func humanizePipelineTaskIDLabel(taskID string) string {
+	label := humanizePipelineTaskLabel(taskID)
+	if isWeakPipelineTaskIDLabel(taskID, label) {
+		return ""
+	}
+	return label
+}
+
+func isWeakPipelineTaskIDLabel(taskID, label string) bool {
+	taskID = strings.ToLower(strings.TrimSpace(taskID))
+	label = strings.TrimSpace(label)
+	if taskID == "" || label == "" {
+		return false
+	}
+	if !strings.HasPrefix(taskID, "task_") && !strings.HasPrefix(taskID, "task-") {
+		return false
+	}
+	return digitsOnly(label)
+}
+
+func digitsOnly(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func humanizePipelineAgentLabel(agent string) string {

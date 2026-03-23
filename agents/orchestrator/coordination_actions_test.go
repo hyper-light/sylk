@@ -109,3 +109,63 @@ func TestHandleCoordinationAction_RequestReviewSkipsRedundantPipelineWake(t *tes
 		t.Fatalf("expected successful coordination response, got %#v", bus.msgs[0])
 	}
 }
+
+func TestHandleCoordinationAction_RequestReviewPublishesGlobalReviewerWakeActivity(t *testing.T) {
+	ctx := context.Background()
+	svc := newCoordinationTestService(t)
+	bus := &coordinationActionTestBus{}
+	pub := &trackingActivityPub{}
+	o := &Orchestrator{
+		bus:          bus,
+		coordination: svc,
+		activityPub:  pub,
+		knownAgents:  map[string]*guide.AgentAnnouncement{},
+		config:       Config{AgentID: "orchestrator", SessionID: "sess-1"},
+	}
+
+	artifact, err := svc.PublishArtifact(ctx, coordination.Actor{AgentID: "eng-1", AgentType: "engineer"}, coordination.PublishArtifactInput{
+		TaskID:    "task-11",
+		TaskName:  "Global review follow-up",
+		Kind:      "implementation_summary",
+		Summary:   "Ready for global inspector audit",
+		ScopeKind: coordination.ScopeKindImplementation,
+		ScopeKey:  "src/service.go",
+		Payload: map[string]any{
+			"file": "src/service.go",
+		},
+		Evidence: []coordination.EvidenceRef{{Kind: "file", Value: "src/service.go"}},
+	})
+	if err != nil {
+		t.Fatalf("PublishArtifact: %v", err)
+	}
+
+	handled, err := o.handleCoordinationAction(ctx, &guide.ActionRequest{
+		CorrelationID:   "coord-2",
+		SourceAgentID:   "engineer-task-11",
+		SourceAgentName: "engineer",
+		Action:          coordination.ActionRequestReview,
+		Data: map[string]any{
+			"task_id":       "task-11",
+			"artifact_id":   artifact.ID,
+			"reviewer_type": "inspector",
+			"summary":       "Audit the merged implementation",
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleCoordinationAction() error = %v", err)
+	}
+	if !handled {
+		t.Fatal("expected action to be handled")
+	}
+
+	collected := pub.collected()
+	if len(collected) != 1 {
+		t.Fatalf("published %d activity events, want 1", len(collected))
+	}
+	if collected[0].AgentID != "inspector" {
+		t.Fatalf("activity agent_id = %q, want inspector", collected[0].AgentID)
+	}
+	if collected[0].Data["source"] != "coordination_review_wakeup" {
+		t.Fatalf("activity source = %v, want coordination_review_wakeup", collected[0].Data["source"])
+	}
+}

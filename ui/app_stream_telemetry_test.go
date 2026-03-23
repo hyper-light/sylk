@@ -444,6 +444,38 @@ func TestHandleGuideResponse_PreservesSemanticPipelineAgentLabel(t *testing.T) {
 	}
 }
 
+func TestStreamTelemetry_PublishedStreamActivitiesCarryTaskName(t *testing.T) {
+	m := newStreamTelemetryModel()
+	collector := events.NewTestActivityCollector()
+	m.deps.ActivityPub = collector
+
+	start := msg.StreamStartMsg{
+		CorrelationID: "corr-task-name",
+		AgentID:       "runtime-engineer",
+		AgentType:     "engineer",
+		AgentName:     "Engineer",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth checkout",
+		TaskSlug:      "auth-checkout",
+	}
+	m.trackStreamStart(start)
+	m.registerStream(start)
+
+	m.publishStreamStartActivity(start)
+	m.publishStreamActivity(start.CorrelationID, true, "")
+
+	published := collector.Events()
+	if len(published) != 2 {
+		t.Fatalf("published event count = %d, want 2", len(published))
+	}
+	for i, event := range published {
+		if got := activityDataString(event.Data, "task_name"); got != "Auth checkout" {
+			t.Fatalf("event %d task_name = %q, want Auth checkout", i, got)
+		}
+	}
+}
+
 func TestInterruptedCorrelationRemainsBlockedAfterTerminalEvents(t *testing.T) {
 	m := newStreamTelemetryModel()
 	m.interruptedCorrelations["corr-interrupted"] = struct{}{}

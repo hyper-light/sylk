@@ -35,6 +35,7 @@ func (e *Engineer) registerCoreSkills() {
 	// File operations
 	e.skills.Register(readFileSkill(e))
 	e.skills.Register(runCommandSkill(e))
+	e.skills.Register(runShellScriptSkill(e))
 	e.skills.Register(globSkill(e))
 	e.skills.Register(grepSkill(e))
 	e.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
@@ -57,6 +58,8 @@ func (e *Engineer) registerCoreSkills() {
 
 	// Consultation
 	e.skills.Register(consultSkill(e))
+	e.skills.Register(researchDependencyInstallSkill(e))
+	e.skills.Register(installDependencyToolingSkill(e))
 
 	for _, skill := range shared.CoordinationSkills(shared.CoordinationSkillConfig{
 		Client: shared.CoordinationClient{
@@ -442,106 +445,42 @@ func readFileSkill(e *Engineer) *skills.Skill {
 		Build()
 }
 
-// =============================================================================
-// run_command - Execute shell command
-// =============================================================================
-
-type runCommandParams struct {
-	Command    string `json:"command"`
-	WorkingDir string `json:"working_dir,omitempty"`
-	TimeoutMs  int    `json:"timeout_ms,omitempty"`
+func runCommandSkill(e *Engineer) *skills.Skill {
+	return shared.NewRunCommandSkill(engineerCommandSkillConfig(e))
 }
 
-func runCommandSkill(e *Engineer) *skills.Skill {
-	return skills.NewSkill("run_command").
-		Description("Execute a shell command. Pre-approved commands run directly; other commands are routed through Guardian approval.").
-		Domain("code").
-		Keywords("run", "execute", "command", "shell", "bash").
-		Priority(80).
-		Usage("Use to verify implementation behavior, run project tests, or invoke project tooling after you know the exact single command you need.").
-		Requirement("Each invocation must contain exactly one command. Do not use shell control operators, pipes, redirection, or subshell syntax.").
-		Satisfies("Produces concrete execution evidence for implementation validation and reporting.").
-		Avoid("Do not pack multiple logical steps into one call or use it as a substitute for reading the code and task contract first.").
-		StringParam("command", "Command to execute", true).
-		StringParam("working_dir", "Working directory for command execution", false).
-		IntParam("timeout_ms", "Command timeout in milliseconds (default: 30000)", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params runCommandParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
+func runShellScriptSkill(e *Engineer) *skills.Skill {
+	return shared.NewRunShellScriptSkill(engineerCommandSkillConfig(e))
+}
 
-			if params.Command == "" {
-				return nil, fmt.Errorf("command is required")
-			}
-
-			if !e.config.EngineerConfig.EnableCommands {
-				return nil, fmt.Errorf("command execution is disabled")
-			}
-
-			if commandHasUnsafeShellSyntax(params.Command) {
-				return nil, fmt.Errorf("shell control operators are not allowed in run_command")
-			}
-
-			// Check blocklist
-			if isCommandBlocked(params.Command, e.config.EngineerConfig.ApprovedCommands) {
-				return nil, fmt.Errorf("command is blocked: %s", params.Command)
-			}
-
-			if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), commandapproval.Request{
-				Command:       params.Command,
-				WorkingDir:    params.WorkingDir,
-				WorkspaceRoot: e.effectiveWorkingDirectory(),
-				ToolName:      "run_command",
-				AgentID:       e.id,
-				AgentType:     "engineer",
-				SessionID:     versioning.SessionIDFromContext(ctx),
-			}); err != nil {
-				return nil, err
-			}
-
-			execCtx, err := e.commandExecutionContext(ctx, params.WorkingDir)
+func engineerCommandSkillConfig(e *Engineer) shared.CommandSkillConfig {
+	return shared.CommandSkillConfig{
+		AgentType:       "engineer",
+		AgentID:         func() string { return e.id },
+		SessionID:       func() string { return e.config.SessionID },
+		CommandsEnabled: func() bool { return e.config.EngineerConfig.EnableCommands },
+		WorkspaceRoot:   e.effectiveWorkingDirectory,
+		DefaultTimeout:  func() time.Duration { return e.config.EngineerConfig.CommandTimeout },
+		PrepareExecution: func(ctx context.Context, workingDir string) (shared.CommandExecContext, error) {
+			execCtx, err := e.commandExecutionContext(ctx, workingDir)
 			if err != nil {
-				return nil, fmt.Errorf("prepare execution workspace: %w", err)
+				return shared.CommandExecContext{}, err
 			}
-			defer execCtx.cleanup()
-
-			timeout := time.Duration(params.TimeoutMs) * time.Millisecond
-			if timeout <= 0 {
-				timeout = e.config.EngineerConfig.CommandTimeout
-			}
-
-			ctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-
-			startTime := time.Now()
-			if e.executionBroker == nil {
-				return nil, purevfs.ErrStrictExecutionUnavailable
-			}
-			runResult, err := e.executionBroker.Run(ctx, purevfs.BrokerRunRequest{
-				Plan:      execCtx.plan,
-				Argv:      purevfs.ShellCommandArgv(params.Command),
-				Workspace: e.executionWorkspace(true),
-			})
-			if err != nil {
-				return nil, fmt.Errorf("failed to execute command: %w", err)
-			}
-			duration := time.Since(startTime)
-			return &CommandExecution{
-				Command:           params.Command,
-				ExitCode:          runResult.ExitCode,
-				Stdout:            string(runResult.Stdout),
-				Stderr:            string(runResult.Stderr),
-				Duration:          duration,
-				StartTime:         startTime,
-				WorkingDir:        execCtx.workDir,
-				ExecutionMode:     string(execCtx.plan.Mode),
-				ExecutionStrategy: string(execCtx.plan.Strategy),
-				Materialized:      execCtx.plan.RequiresMaterialize,
-				Truncated:         runResult.StdoutTruncated || runResult.StderrTruncated,
+			return shared.CommandExecContext{
+				WorkDir: execCtx.workDir,
+				Plan:    execCtx.plan,
 			}, nil
-		}).
-		Build()
+		},
+		ExecutionBroker:      func() purevfs.ExecutionBroker { return e.executionBroker },
+		ExecutionWorkspace:   e.executionWorkspace,
+		AllowWorkspaceWrites: true,
+		PreAuthorizeCheck: func(command, _ string) error {
+			if isCommandBlocked(command, e.config.EngineerConfig.ApprovedCommands) {
+				return fmt.Errorf("command is blocked: %s", command)
+			}
+			return nil
+		},
+	}
 }
 
 func isCommandApproved(command string, approved ApprovedCommandPatterns) bool {
@@ -565,15 +504,8 @@ func isCommandBlocked(command string, approved ApprovedCommandPatterns) bool {
 }
 
 func commandHasUnsafeShellSyntax(command string) bool {
-	if strings.ContainsRune(command, '\n') || strings.ContainsRune(command, '\r') || strings.ContainsRune(command, 0) {
-		return true
-	}
-	for _, fragment := range []string{"&&", "||", ";", "|", "`", "$(", "${", ">", "<"} {
-		if strings.Contains(command, fragment) {
-			return true
-		}
-	}
-	return false
+	_, unsafe := shared.DetectShellControlOperator(command)
+	return unsafe
 }
 
 // =============================================================================

@@ -72,6 +72,41 @@ func TestMetadataCachingPublisher_ReusesCachedPipelineMetadata(t *testing.T) {
 	}
 }
 
+func TestMetadataCachingPublisher_ReusesCachedTaskName(t *testing.T) {
+	collector := NewTestActivityCollector()
+	pub := NewMetadataCachingPublisher(collector, map[string]AgentIdentityMetadata{
+		"designer": {AgentType: "designer", AgentName: "Designer"},
+	})
+
+	pub.PublishActivity(&ActivityEvent{
+		AgentID: "designer",
+		Data: map[string]any{
+			"agent_type":  "designer",
+			"agent_name":  "Designer",
+			"pipeline_id": "task_auth_checkout",
+			"task_id":     "task_auth_checkout",
+			"task_name":   "Auth checkout",
+			"task_slug":   "auth-checkout",
+		},
+	})
+
+	pub.PublishActivity(&ActivityEvent{
+		AgentID: "designer",
+		Data: map[string]any{
+			"model": "claude-opus-4-6",
+		},
+	})
+
+	events := collector.Events()
+	if len(events) != 2 {
+		t.Fatalf("event count = %d, want 2", len(events))
+	}
+
+	if got := extractMetadataString(events[1].Data, "task_name"); got != "Auth checkout" {
+		t.Fatalf("task_name = %q, want Auth checkout", got)
+	}
+}
+
 func TestMetadataCachingPublisher_AppliesKnownAgentDefaults(t *testing.T) {
 	collector := NewTestActivityCollector()
 	pub := NewMetadataCachingPublisher(collector, map[string]AgentIdentityMetadata{

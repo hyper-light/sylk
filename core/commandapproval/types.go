@@ -40,14 +40,22 @@ const (
 	MatchSourceInteractive  MatchSource = "interactive"
 )
 
+type ApprovalPolicy string
+
+const (
+	ApprovalPolicyDefault ApprovalPolicy = "default"
+	ApprovalPolicyExact   ApprovalPolicy = "exact"
+)
+
 type Request struct {
-	Command       string `json:"command"`
-	WorkingDir    string `json:"working_dir,omitempty"`
-	WorkspaceRoot string `json:"workspace_root,omitempty"`
-	ToolName      string `json:"tool_name,omitempty"`
-	AgentID       string `json:"agent_id,omitempty"`
-	AgentType     string `json:"agent_type,omitempty"`
-	SessionID     string `json:"session_id,omitempty"`
+	Command        string         `json:"command"`
+	WorkingDir     string         `json:"working_dir,omitempty"`
+	WorkspaceRoot  string         `json:"workspace_root,omitempty"`
+	ToolName       string         `json:"tool_name,omitempty"`
+	AgentID        string         `json:"agent_id,omitempty"`
+	AgentType      string         `json:"agent_type,omitempty"`
+	SessionID      string         `json:"session_id,omitempty"`
+	ApprovalPolicy ApprovalPolicy `json:"approval_policy,omitempty"`
 }
 
 type PathArg struct {
@@ -57,25 +65,26 @@ type PathArg struct {
 }
 
 type Analysis struct {
-	RawCommand       string    `json:"raw_command"`
-	Normalized       string    `json:"normalized"`
-	Tokens           []string  `json:"tokens,omitempty"`
-	Program          string    `json:"program"`
-	Verb             string    `json:"verb,omitempty"`
-	WorkingDir       string    `json:"working_dir,omitempty"`
-	WorkingDirScope  PathScope `json:"working_dir_scope"`
-	WorkingDirZone   string    `json:"working_dir_zone,omitempty"`
-	PathArgs         []PathArg `json:"path_args,omitempty"`
-	Flags            []string  `json:"flags,omitempty"`
-	TemplateKey      string    `json:"template_key"`
-	ExactKey         string    `json:"exact_key"`
-	PersistKey       string    `json:"persist_key"`
-	PersistLabel     string    `json:"persist_label"`
-	RuleLabel        string    `json:"rule_label"`
-	Summary          string    `json:"summary"`
-	Risk             string    `json:"risk"`
-	OutsideWorkspace bool      `json:"outside_workspace"`
-	Mutating         bool      `json:"mutating"`
+	RawCommand       string         `json:"raw_command"`
+	Normalized       string         `json:"normalized"`
+	Tokens           []string       `json:"tokens,omitempty"`
+	Program          string         `json:"program"`
+	Verb             string         `json:"verb,omitempty"`
+	WorkingDir       string         `json:"working_dir,omitempty"`
+	WorkingDirScope  PathScope      `json:"working_dir_scope"`
+	WorkingDirZone   string         `json:"working_dir_zone,omitempty"`
+	PathArgs         []PathArg      `json:"path_args,omitempty"`
+	Flags            []string       `json:"flags,omitempty"`
+	TemplateKey      string         `json:"template_key"`
+	ExactKey         string         `json:"exact_key"`
+	PersistKey       string         `json:"persist_key"`
+	PersistLabel     string         `json:"persist_label"`
+	RuleLabel        string         `json:"rule_label"`
+	Summary          string         `json:"summary"`
+	Risk             string         `json:"risk"`
+	OutsideWorkspace bool           `json:"outside_workspace"`
+	Mutating         bool           `json:"mutating"`
+	ApprovalPolicy   ApprovalPolicy `json:"approval_policy,omitempty"`
 }
 
 type Rule struct {
@@ -95,21 +104,22 @@ type Evaluation struct {
 }
 
 type Proposal struct {
-	CorrelationID string    `json:"correlation_id"`
-	TargetAgentID string    `json:"target_agent_id"`
-	AgentID       string    `json:"agent_id,omitempty"`
-	AgentType     string    `json:"agent_type,omitempty"`
-	ToolName      string    `json:"tool_name,omitempty"`
-	Command       string    `json:"command"`
-	WorkingDir    string    `json:"working_dir,omitempty"`
-	WorkspaceRoot string    `json:"workspace_root,omitempty"`
-	TemplateKey   string    `json:"template_key"`
-	PersistKey    string    `json:"persist_key"`
-	PersistLabel  string    `json:"persist_label"`
-	RuleLabel     string    `json:"rule_label"`
-	Summary       string    `json:"summary"`
-	Risk          string    `json:"risk"`
-	Timestamp     time.Time `json:"timestamp"`
+	CorrelationID  string         `json:"correlation_id"`
+	TargetAgentID  string         `json:"target_agent_id"`
+	AgentID        string         `json:"agent_id,omitempty"`
+	AgentType      string         `json:"agent_type,omitempty"`
+	ToolName       string         `json:"tool_name,omitempty"`
+	Command        string         `json:"command"`
+	WorkingDir     string         `json:"working_dir,omitempty"`
+	WorkspaceRoot  string         `json:"workspace_root,omitempty"`
+	TemplateKey    string         `json:"template_key"`
+	PersistKey     string         `json:"persist_key"`
+	PersistLabel   string         `json:"persist_label"`
+	RuleLabel      string         `json:"rule_label"`
+	Summary        string         `json:"summary"`
+	Risk           string         `json:"risk"`
+	Timestamp      time.Time      `json:"timestamp"`
+	ApprovalPolicy ApprovalPolicy `json:"approval_policy,omitempty"`
 }
 
 type Gate interface {

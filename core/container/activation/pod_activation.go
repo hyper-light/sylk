@@ -28,6 +28,7 @@ func PodActivationPolicies(descriptors []handoff.AgentDescriptor) (
 	policies []*ActivationPolicy,
 	podPolicies []*pod.PodPolicy,
 	agentToPod map[string]string,
+	err error,
 ) {
 	agentToPod = make(map[string]string, len(descriptors))
 	pipelineMembers := make([]string, 0, 4)
@@ -44,18 +45,24 @@ func PodActivationPolicies(descriptors []handoff.AgentDescriptor) (
 		podID := desc.AgentType // singleton/daemon pods use agent type as ID
 		agentToPod[desc.AgentType] = podID
 
-		pp := singletonPodPolicy(desc)
+		pp, policyErr := singletonPodPolicy(desc)
+		if policyErr != nil {
+			return nil, nil, nil, policyErr
+		}
 		podPolicies = append(podPolicies, pp)
 		policies = append(policies, toActivationPolicy(pp))
 	}
 
 	if seenPipeline {
-		pp := pipelinePodPolicy(pipelineMembers)
+		pp, policyErr := pipelinePodPolicy(pipelineMembers)
+		if policyErr != nil {
+			return nil, nil, nil, policyErr
+		}
 		podPolicies = append(podPolicies, pp)
 		policies = append(policies, toActivationPolicy(pp))
 	}
 
-	return policies, podPolicies, agentToPod
+	return policies, podPolicies, agentToPod, nil
 }
 
 // toActivationPolicy converts a PodPolicy to an ActivationPolicy.
@@ -77,8 +84,8 @@ func toActivationPolicy(pp *pod.PodPolicy) *ActivationPolicy {
 }
 
 // singletonPodPolicy generates a PodPolicy for a single-agent pod.
-func singletonPodPolicy(desc handoff.AgentDescriptor) *pod.PodPolicy {
-	if daemonAgentTypes[desc.AgentType] {
+func singletonPodPolicy(desc handoff.AgentDescriptor) (*pod.PodPolicy, error) {
+	if isDaemonAgentType(desc.AgentType) {
 		return &pod.PodPolicy{
 			PodID:            desc.AgentType,
 			PodType:          pod.PodTypeDaemon,
@@ -87,10 +94,13 @@ func singletonPodPolicy(desc handoff.AgentDescriptor) *pod.PodPolicy {
 			MinTier:          TierHot,
 			IsDaemon:         true,
 			PreWarmOnStartup: true,
-		}
+		}, nil
 	}
 
-	defaults := scaledDefaults(desc.Category)
+	defaults, err := scaledDefaults(desc.Category)
+	if err != nil {
+		return nil, err
+	}
 	pp := &pod.PodPolicy{
 		PodID:       desc.AgentType,
 		PodType:     pod.PodTypeSingleton,
@@ -101,17 +111,20 @@ func singletonPodPolicy(desc handoff.AgentDescriptor) *pod.PodPolicy {
 		IdleToCold:  defaults.IdleToCold,
 	}
 
-	if preWarmAgentTypes[desc.AgentType] {
+	if shouldPreWarmAgentType(desc.AgentType) {
 		pp.PreWarmOnStartup = true
 	}
 
-	return pp
+	return pp, nil
 }
 
 // pipelinePodPolicy generates a PodPolicy for the pipeline pod.
 // Pipeline agents use halved idle thresholds (cheap to recreate).
-func pipelinePodPolicy(memberTypes []string) *pod.PodPolicy {
-	defaults := scaledDefaults(handoff.CategoryPipeline)
+func pipelinePodPolicy(memberTypes []string) (*pod.PodPolicy, error) {
+	defaults, err := scaledDefaults(handoff.CategoryPipeline)
+	if err != nil {
+		return nil, err
+	}
 	return &pod.PodPolicy{
 		PodID:       pipelinePodID,
 		PodType:     pod.PodTypePipeline,
@@ -120,7 +133,7 @@ func pipelinePodPolicy(memberTypes []string) *pod.PodPolicy {
 		IdleToWarm:  defaults.IdleToWarm,
 		IdleToCool:  defaults.IdleToCool,
 		IdleToCold:  defaults.IdleToCold,
-	}
+	}, nil
 }
 
 // isPipelineAgent returns true if the agent type belongs in the pipeline pod.

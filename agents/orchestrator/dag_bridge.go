@@ -56,21 +56,23 @@ type DAGBridgeDeps struct {
 
 // ActiveDAGMeta is bridge-level metadata for a running DAG.
 type ActiveDAGMeta struct {
-	PlanID     string
-	SessionID  string
-	Revision   int
-	Dispatcher *BusNodeDispatcher
-	Pod        *shared.AgentPod
-	TaskPods   map[string]*shared.AgentPod
-	CancelFunc context.CancelFunc
-	Unsub      func()
-	StartedAt  time.Time
+	PlanID         string
+	SessionID      string
+	Revision       int
+	Dispatcher     *BusNodeDispatcher
+	Pod            *shared.AgentPod
+	TaskPods       map[string]*shared.AgentPod
+	TaskPodFactory func(taskID string) (*shared.AgentPod, error)
+	CancelFunc     context.CancelFunc
+	Unsub          func()
+	StartedAt      time.Time
 
 	// SubNodeMap maps expanded sub-node IDs to their original parent
 	// node IDs. Populated during pipeline expansion.
-	SubNodeMap   map[string]string // subNodeID → parentNodeID
-	SubNodeTasks map[string]taskPipelineRef
-	TaskLabels   map[string]string
+	SubNodeMap           map[string]string // subNodeID → parentNodeID
+	SubNodeTasks         map[string]taskPipelineRef
+	TaskLabels           map[string]string
+	ResetPendingTaskPods map[string]struct{}
 }
 
 // DAGBridge wires the dag.Scheduler into the orchestrator's bus/WAL/store/buffers.
@@ -225,6 +227,12 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		"expanded_layers":   d.LayerCount(),
 		"expanded_subnodes": len(subNodeMap),
 	})
+	if disabled := disableProtocolPipelineNodeTimeouts(d); disabled > 0 {
+		b.logTrace("dag_execute_protocol_no_timeout", agentlog.EventRegistryEvent, map[string]any{
+			"dag_id":                  d.ID(),
+			"protocol_nodes_disabled": disabled,
+		})
+	}
 
 	// 1. WAL: LogDAGStart
 	dagJSON, _ := d.MarshalJSON()
@@ -267,6 +275,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	b.mu.RUnlock()
 
 	taskPodDefs := collectPipelineTaskPods(d)
+	taskPodDefsByID := indexPipelineTaskPodDefs(taskPodDefs)
 	b.logTrace("dag_execute_task_pods_build_begin", agentlog.EventRegistryEvent, map[string]any{
 		"dag_id":          d.ID(),
 		"task_pod_count":  len(taskPodDefs),
@@ -288,6 +297,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 
 	// 3b. Create BusNodeDispatcher with node-aware task-pod activation.
 	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, activator, nil)
+	dispatcher.activityGrace = b.config.DefaultNodeTimeout
 	dispatcher.SetEventLogger(b.eventLogger)
 	dispatcher.SetDispatchPermitWaiter(waitDispatchPermit)
 	dispatcher.SetPodResolver(func(node *dag.Node) *shared.AgentPod {
@@ -316,15 +326,27 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	dagCtx, dagCancel := context.WithCancel(context.WithoutCancel(ctx))
 	b.mu.Lock()
 	b.activeDAGs[d.ID()] = &ActiveDAGMeta{
-		PlanID:       planID,
-		SessionID:    sessionID,
-		Dispatcher:   dispatcher,
-		TaskPods:     taskPods,
-		CancelFunc:   dagCancel,
-		StartedAt:    time.Now(),
-		SubNodeMap:   subNodeMap,
-		SubNodeTasks: make(map[string]taskPipelineRef, len(subNodeMap)),
-		TaskLabels:   make(map[string]string, len(taskPods)),
+		PlanID:     planID,
+		SessionID:  sessionID,
+		Dispatcher: dispatcher,
+		TaskPods:   taskPods,
+		TaskPodFactory: func(taskID string) (*shared.AgentPod, error) {
+			def, ok := taskPodDefsByID[taskID]
+			if !ok {
+				return nil, fmt.Errorf("task pod %s: unknown task", taskID)
+			}
+			svfs := sessionVFS(sessionID)
+			if svfs == nil {
+				return nil, fmt.Errorf("dag bridge: session VFS not configured for session %s", sessionID)
+			}
+			return buildTaskAgentPod(def, sessionID, runtime, specReg, registrar, logger, scribeFactory, svfs, b.eventLogger, b.activityPub, b.agentID)
+		},
+		CancelFunc:           dagCancel,
+		StartedAt:            time.Now(),
+		SubNodeMap:           subNodeMap,
+		SubNodeTasks:         make(map[string]taskPipelineRef, len(subNodeMap)),
+		TaskLabels:           make(map[string]string, len(taskPods)),
+		ResetPendingTaskPods: make(map[string]struct{}),
 	}
 	b.mu.Unlock()
 
@@ -513,6 +535,32 @@ func isPipelineTaskNode(node *dag.Node) bool {
 	default:
 		return false
 	}
+}
+
+func disableProtocolPipelineNodeTimeouts(d *dag.DAG) int {
+	if d == nil {
+		return 0
+	}
+	disabled := 0
+	for _, node := range d.Nodes() {
+		if !protocolPipelineNodeEligible(node) {
+			continue
+		}
+		if node.Timeout() != 0 {
+			continue
+		}
+		node.SetTimeout(dag.NoTimeout)
+		disabled++
+	}
+	return disabled
+}
+
+func protocolPipelineNodeEligible(node *dag.Node) bool {
+	if node == nil {
+		return false
+	}
+	return protocolPipelineWorkerEligible(node.AgentType()) &&
+		protocolPipelineStageEligible(taskContextString(node.Context(), "pipeline_stage"))
 }
 
 func extractAffectedFiles(ctx map[string]any) []string {
@@ -865,11 +913,27 @@ func (b *DAGBridge) GetDispatcherForDAG(dagID string) *BusNodeDispatcher {
 
 // RecordDispatchActivity refreshes the liveness lease for a dispatched node.
 func (b *DAGBridge) RecordDispatchActivity(dagID, nodeID string) {
-	dispatcher := b.GetDispatcherForDAG(strings.TrimSpace(dagID))
-	if dispatcher == nil {
+	dagID = strings.TrimSpace(dagID)
+	nodeID = strings.TrimSpace(nodeID)
+	if dagID == "" || nodeID == "" {
 		return
 	}
+
+	b.mu.RLock()
+	meta, ok := b.activeDAGs[dagID]
+	b.mu.RUnlock()
+	if !ok || meta == nil || meta.Dispatcher == nil {
+		return
+	}
+
+	dispatcher := meta.Dispatcher
 	dispatcher.RecordActivity(nodeID)
+	if parentID, isSubNode := ParentNodeID(nodeID); isSubNode {
+		parentID = strings.TrimSpace(parentID)
+		if parentID != "" && parentID != nodeID {
+			dispatcher.RecordActivity(parentID)
+		}
+	}
 }
 
 // NotifyNodeComplete resolves a pending node dispatch. For sub-nodes from
@@ -1050,6 +1114,8 @@ func (b *DAGBridge) dagEventForwarder(dagID, planID string) dag.EventHandler {
 			}
 			b.journal.LogNodeResult(dagID, event.NodeID, "failed", errMsg)
 			b.updateProgressFromScheduler(dagID)
+			b.publishFailedTaskPipelineState(dagID, event.NodeID)
+			b.markTaskPodResetPending(dagID, event.NodeID)
 			shared.LogAgentEvent(el, agentlog.EventNodeFailed,
 				b.agentID, b.sessionID, "", "error",
 				&agentlog.DAGPayload{DAGID: dagID, NodeID: event.NodeID, State: "failed", Err: errMsg})
@@ -1112,18 +1178,33 @@ func intFromEventData(data map[string]any, key string) int {
 func (b *DAGBridge) publishCompletedTaskPipelineState(dagID, nodeID string) {
 	b.mu.RLock()
 	meta := b.activeDAGs[dagID]
-	b.mu.RUnlock()
 	if meta == nil {
+		b.mu.RUnlock()
 		return
 	}
 	ref, ok := meta.SubNodeTasks[nodeID]
+	bus := b.bus
+	b.mu.RUnlock()
 	if !ok || strings.TrimSpace(ref.Stage) != string(StageExecute) {
 		return
 	}
+	publishTaskPipelineState(bus, b.agentID, ref.TaskID, ref.TaskLabel, taskstate.StatusCompleted, ref.AgentType)
+}
+
+func (b *DAGBridge) publishFailedTaskPipelineState(dagID, nodeID string) {
 	b.mu.RLock()
+	meta := b.activeDAGs[dagID]
+	if meta == nil {
+		b.mu.RUnlock()
+		return
+	}
+	ref, ok := meta.SubNodeTasks[nodeID]
 	bus := b.bus
 	b.mu.RUnlock()
-	publishTaskPipelineState(bus, b.agentID, ref.TaskID, ref.TaskLabel, taskstate.StatusCompleted, ref.AgentType)
+	if !ok || strings.TrimSpace(ref.TaskID) == "" {
+		return
+	}
+	publishTaskPipelineState(bus, b.agentID, ref.TaskID, ref.TaskLabel, taskstate.StatusFailed, ref.AgentType)
 }
 
 func (b *DAGBridge) publishCancelledTaskPipelineStates(dagID string) {
@@ -1139,6 +1220,89 @@ func (b *DAGBridge) publishCancelledTaskPipelineStates(dagID string) {
 	for taskID, taskLabel := range meta.TaskLabels {
 		publishTaskPipelineState(bus, b.agentID, taskID, taskLabel, taskstate.StatusCancelled, "")
 	}
+}
+
+func (b *DAGBridge) markTaskPodResetPending(dagID, nodeID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	meta := b.activeDAGs[dagID]
+	if meta == nil {
+		return
+	}
+	ref, ok := meta.SubNodeTasks[nodeID]
+	if !ok || strings.TrimSpace(ref.TaskID) == "" {
+		return
+	}
+	if meta.ResetPendingTaskPods == nil {
+		meta.ResetPendingTaskPods = make(map[string]struct{})
+	}
+	meta.ResetPendingTaskPods[ref.TaskID] = struct{}{}
+}
+
+func (b *DAGBridge) ResetPendingTaskPods(dagID string) {
+	b.mu.RLock()
+	meta := b.activeDAGs[dagID]
+	if meta == nil {
+		b.mu.RUnlock()
+		return
+	}
+	taskIDs := make([]string, 0, len(meta.ResetPendingTaskPods))
+	for taskID := range meta.ResetPendingTaskPods {
+		taskIDs = append(taskIDs, taskID)
+	}
+	b.mu.RUnlock()
+	slices.Sort(taskIDs)
+	for _, taskID := range taskIDs {
+		if err := b.resetTaskPod(dagID, taskID); err != nil {
+			b.logTrace("task_pod_reset_failed", agentlog.EventError, map[string]any{
+				"dag_id":  dagID,
+				"task_id": taskID,
+				"error":   err.Error(),
+			})
+		}
+	}
+}
+
+func (b *DAGBridge) resetTaskPod(dagID, taskID string) error {
+	b.mu.RLock()
+	meta := b.activeDAGs[dagID]
+	bus := b.bus
+	b.mu.RUnlock()
+	if meta == nil {
+		return nil
+	}
+	factory := meta.TaskPodFactory
+	if factory == nil {
+		return fmt.Errorf("task pod %s: factory is not configured", taskID)
+	}
+	newPod, err := factory(taskID)
+	if err != nil {
+		return err
+	}
+
+	b.mu.Lock()
+	meta = b.activeDAGs[dagID]
+	if meta == nil {
+		b.mu.Unlock()
+		newPod.Release()
+		return nil
+	}
+	if _, pending := meta.ResetPendingTaskPods[taskID]; !pending {
+		b.mu.Unlock()
+		newPod.Release()
+		return nil
+	}
+	oldPod := meta.TaskPods[taskID]
+	taskLabel := meta.TaskLabels[taskID]
+	meta.TaskPods[taskID] = newPod
+	delete(meta.ResetPendingTaskPods, taskID)
+	b.mu.Unlock()
+
+	if oldPod != nil {
+		oldPod.Release()
+	}
+	publishTaskPipelineState(bus, b.agentID, taskID, taskLabel, taskstate.StatusPending, "")
+	return nil
 }
 
 func (b *DAGBridge) updateProgressFromScheduler(dagID string) {
@@ -1227,6 +1391,47 @@ func (b *DAGBridge) publishActivity(eventType events.EventType, content string) 
 	evt.Data["agent_type"] = "orchestrator"
 	evt.Data["agent_name"] = "Orchestrator"
 	b.activityPub.PublishActivity(evt)
+}
+
+func blockingDecisionActivityContent(dagID string, layerIdx int, failures []dag.FailedNodeSummary) string {
+	base := fmt.Sprintf("DAG %s layer %d has blocking failures", dagID, layerIdx)
+	summary := summarizeBlockingFailures(failures)
+	if summary == "" {
+		return base + " — awaiting decision"
+	}
+	return fmt.Sprintf("%s: %s — awaiting decision", base, summary)
+}
+
+func summarizeBlockingFailures(failures []dag.FailedNodeSummary) string {
+	if len(failures) == 0 {
+		return ""
+	}
+	const maxSummaries = 2
+	parts := make([]string, 0, min(len(failures), maxSummaries+1))
+	for _, failure := range failures[:min(len(failures), maxSummaries)] {
+		parts = append(parts, blockingFailureSummary(failure))
+	}
+	if extra := len(failures) - min(len(failures), maxSummaries); extra > 0 {
+		parts = append(parts, fmt.Sprintf("%d more failure(s)", extra))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func blockingFailureSummary(failure dag.FailedNodeSummary) string {
+	label := firstNonEmpty(
+		strings.Join(strings.Fields(strings.TrimSpace(failure.NodeName)), " "),
+		strings.Join(strings.Fields(strings.TrimSpace(failure.NodeID)), " "),
+		strings.Join(strings.Fields(strings.TrimSpace(failure.AgentType)), " "),
+		"unknown node",
+	)
+	if agentType := strings.Join(strings.Fields(strings.TrimSpace(failure.AgentType)), " "); agentType != "" && !strings.EqualFold(agentType, label) {
+		label = fmt.Sprintf("%s [%s]", label, agentType)
+	}
+	errText := strings.Join(strings.Fields(strings.TrimSpace(failure.Error)), " ")
+	if errText == "" {
+		errText = "failed without error details"
+	}
+	return fmt.Sprintf("%s: %s", label, truncateForDisplay(errText, 160))
 }
 
 func subNodeMapKeys(m map[string]string) []string {
@@ -1344,8 +1549,7 @@ func (b *DAGBridge) onBlockingDecisionRequired(req dag.LayerDecisionRequest) {
 	}
 	bus.Publish("dag.decision", msg)
 
-	b.publishActivity(events.EventTypeAgentError,
-		fmt.Sprintf("DAG %s layer %d has blocking failures — awaiting decision", req.DAGID, req.LayerIdx))
+	b.publishActivity(events.EventTypeAgentError, blockingDecisionActivityContent(req.DAGID, req.LayerIdx, req.FailedNodes))
 }
 
 // ResolveDecision delivers a user decision to the waiting gate for a DAG.

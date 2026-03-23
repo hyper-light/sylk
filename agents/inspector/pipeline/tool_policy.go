@@ -18,8 +18,12 @@ func pipelineInspectorVisibleSkillNames() []string {
 		"workspace_grep",
 		"inspect_workspace_state",
 		"summarize_workspace_state",
+		"run_command",
+		"run_shell_script",
 		"define_criteria",
 		"get_validation_status",
+		"research_dependency_install",
+		"install_dependency_tooling",
 		"challenge_agent",
 		"handoff_next",
 		"validate_work",
@@ -38,9 +42,12 @@ func pipelineInspectorVisibleSkillNames() []string {
 
 func pipelineInspectorMutatingSkillNames() []string {
 	return []string{
+		"run_command",
+		"run_shell_script",
 		"define_criteria",
 		"request_correction",
 		"request_override",
+		"install_dependency_tooling",
 		"challenge_agent",
 		"handoff_next",
 		"validate_work",

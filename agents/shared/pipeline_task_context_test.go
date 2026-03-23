@@ -63,6 +63,11 @@ func TestBuildPipelineSystemContext_IncludesPipelineProtocol(t *testing.T) {
 				"mode":            "single",
 				"current_request": "Implement the change against the authored tests.",
 				"active_agents":   []any{"engineer"},
+				"audit_lock": map[string]any{
+					"owner_agent": "inspector-pipeline",
+					"phase":       "finalize_pipeline",
+					"reason":      "Inspector is conducting terminal audit review.",
+				},
 				"roster": []any{
 					map[string]any{"agent_type": "inspector-pipeline", "role": "entrypoint"},
 					map[string]any{"agent_type": "tester-pipeline", "role": "testing"},
@@ -93,13 +98,18 @@ func TestBuildPipelineSystemContext_IncludesPipelineProtocol(t *testing.T) {
 		"## Pipeline Protocol",
 		"Pipeline Members",
 		"Active Agents",
+		"Audit Lock",
 		"Pending Challenge",
 		"Pending Validation",
 		"Inspector is the only pipeline entrypoint and the ultimate pipeline exit point",
 		"The authoritative loop is inspector -> tester -> engineer/designer -> inspector",
+		"A first challenge on a directed pipeline-agent pair is allowed.",
+		"Repeated challenges require new pipeline VFS evidence on the directed pair",
 		"Engineer and Designer should hand completed implementation turns back to Inspector",
 		"Inspector should invoke finalize_pipeline to run the audit cycle",
-		"Inspector should invoke handoff_to_ot",
+		"Inspector must immediately invoke handoff_to_ot instead of starting another audit loop",
+		"Challenges to Inspector are refused while this lock is active.",
+		"stop work until Inspector challenges you directly or your preceding agent hands off to you",
 	} {
 		if !strings.Contains(contextText, want) {
 			t.Fatalf("context missing %q\n%s", want, contextText)

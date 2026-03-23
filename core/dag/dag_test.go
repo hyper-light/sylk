@@ -37,6 +37,8 @@ type cancelledDispatcher struct {
 	calls atomic.Int32
 }
 
+type lateSuccessAfterDeadlineDispatcher struct{}
+
 func newMockDispatcher() *mockDispatcher {
 	return &mockDispatcher{
 		executed:   make([]string, 0),
@@ -121,6 +123,16 @@ func (d *cancelledDispatcher) Dispatch(ctx context.Context, node *dag.Node, pare
 	return &dag.NodeResult{
 		NodeID:  node.ID(),
 		State:   dag.NodeStateCancelled,
+		EndTime: time.Now(),
+	}, nil
+}
+
+func (d *lateSuccessAfterDeadlineDispatcher) Dispatch(ctx context.Context, node *dag.Node, parentResults map[string]*dag.NodeResult) (*dag.NodeResult, error) {
+	<-ctx.Done()
+	return &dag.NodeResult{
+		NodeID:  node.ID(),
+		State:   dag.NodeStateSucceeded,
+		Output:  "success",
 		EndTime: time.Now(),
 	}, nil
 }
@@ -417,6 +429,23 @@ func TestExecutor_LayeredDAG(t *testing.T) {
 	assert.True(t, layer1Idx > layer0aIdx)
 	assert.True(t, layer1Idx > layer0bIdx)
 	assert.True(t, layer2Idx > layer1Idx)
+}
+
+func TestExecutor_AcceptsSuccessfulLateDispatchResult(t *testing.T) {
+	d, _ := dag.NewBuilder("late-success").
+		AddNode(dag.NodeConfig{ID: "node-1", Timeout: 20 * time.Millisecond}).
+		Build()
+
+	dispatcher := &lateSuccessAfterDeadlineDispatcher{}
+	executor := dag.NewExecutor(dag.DefaultExecutionPolicy(), nil)
+
+	result, err := executor.Execute(context.Background(), d, dispatcher)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, dag.DAGStateSucceeded, result.State)
+	assert.Equal(t, 1, result.NodesSucceeded)
+	assert.Equal(t, 0, result.NodesFailed)
 }
 
 func TestExecutor_FailFast(t *testing.T) {
@@ -891,6 +920,29 @@ func TestExecutor_Timeout(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, dag.DAGStateFailed, result.State)
 	assert.GreaterOrEqual(t, result.NodesFailed, 1)
+}
+
+func TestExecutor_NoTimeoutDisablesFixedNodeDeadline(t *testing.T) {
+	d, _ := dag.NewBuilder("no-timeout").
+		WithPolicy(dag.ExecutionPolicy{
+			FailurePolicy:  dag.FailurePolicyFailFast,
+			MaxConcurrency: 1,
+			DefaultTimeout: 30 * time.Millisecond,
+		}).
+		AddNode(dag.NodeConfig{ID: "slow", Timeout: dag.NoTimeout}).
+		Build()
+
+	dispatcher := newMockDispatcher()
+	dispatcher.executionTime = 100 * time.Millisecond
+
+	executor := dag.NewExecutor(d.Policy(), nil)
+	result, err := executor.Execute(context.Background(), d, dispatcher)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, dag.DAGStateSucceeded, result.State)
+	assert.Equal(t, 1, result.NodesSucceeded)
+	assert.Equal(t, 0, result.NodesFailed)
 }
 
 func TestExecutor_ConcurrentCancel(t *testing.T) {

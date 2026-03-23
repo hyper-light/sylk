@@ -16,33 +16,35 @@ func pipelineProtocolEligible(dispatch *taskDispatchContext) bool {
 	if dispatch == nil {
 		return false
 	}
-	switch strings.TrimSpace(dispatch.agentType) {
-	case "engineer", "designer":
-	default:
-		return false
-	}
-	switch strings.TrimSpace(dispatch.pipelineStage) {
-	case "", string(StageExecute):
-		return true
-	default:
-		return false
-	}
+	return protocolPipelineWorkerEligible(dispatch.agentType) &&
+		protocolPipelineStageEligible(dispatch.pipelineStage)
 }
 
 func protocolPipelineTaskEligible(task *PipelineTask) bool {
 	if task == nil {
 		return false
 	}
-	switch strings.TrimSpace(task.AgentType) {
-	case "engineer", "designer":
-	default:
+	if !protocolPipelineWorkerEligible(task.AgentType) {
 		return false
 	}
 	expectedTarget := pipelineWorkerTargetAgentID(task.TaskID, task.AgentType)
 	if strings.TrimSpace(task.TargetAgentID) != expectedTarget {
 		return false
 	}
-	switch strings.TrimSpace(taskContextString(task.Context, "pipeline_stage")) {
+	return protocolPipelineStageEligible(taskContextString(task.Context, "pipeline_stage"))
+}
+
+func protocolPipelineWorkerEligible(agentType string) bool {
+	switch strings.TrimSpace(agentType) {
+	case agentshared.PipelineAgentEngineer, agentshared.PipelineAgentDesigner:
+		return true
+	default:
+		return false
+	}
+}
+
+func protocolPipelineStageEligible(stage string) bool {
+	switch strings.TrimSpace(stage) {
 	case "", string(StageExecute):
 		return true
 	default:
@@ -309,11 +311,15 @@ func (o *Orchestrator) finalizePipelineUpdate(update *PipelineUpdate) {
 
 	switch update.Status {
 	case "succeeded":
-		if err := o.commitTaskDraft(context.Background(), task); err != nil {
+		mergeVersion, hadDraft, err := o.commitTaskDraft(context.Background(), task)
+		if err != nil {
+			o.publishTaskDraftMergeFailure(task, err)
 			update.Status = "failed"
 			update.Error = err.Error()
 			update.Message = firstNonEmpty(update.Message, "draft merge failed")
 			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", taskstate.StatusFailed, update.AgentType)
+		} else if hadDraft {
+			o.publishTaskDraftMergeSuccess(task, mergeVersion)
 		}
 	case "failed", "timed_out", "cancelled":
 		_ = o.rollbackTaskDraft(task)

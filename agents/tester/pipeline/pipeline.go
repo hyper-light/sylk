@@ -69,15 +69,16 @@ type PipelineTester struct {
 	toolDefsDirty bool
 
 	// Bus (standard agent pattern).
-	bus         guide.EventBus
-	channels    *guide.AgentChannels
-	requestSub  guide.Subscription
-	responseSub guide.Subscription
-	registrySub guide.Subscription
-	running     bool
-	knownAgents map[string]*guide.AgentAnnouncement
-	pendingMu   sync.Mutex
-	pendingBus  map[string]chan *guide.Message
+	bus           guide.EventBus
+	channels      *guide.AgentChannels
+	requestSub    guide.Subscription
+	responseSub   guide.Subscription
+	registrySub   guide.Subscription
+	running       bool
+	knownAgentsMu sync.RWMutex
+	knownAgents   map[string]*guide.AgentAnnouncement
+	pendingMu     sync.Mutex
+	pendingBus    map[string]chan *guide.Message
 
 	// Worker type for design-aware prompt selection.
 	workerType string
@@ -184,6 +185,8 @@ func (pt *PipelineTester) registerCoreSkills() {
 	}
 
 	pt.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return pt.fileAccess }))
+	pt.skills.Register(runCommandSkill(pt))
+	pt.skills.Register(runShellScriptSkill(pt))
 	pt.skills.Register(detectTestHarnessSkill(pt))
 	pt.skills.Register(prepareTestHarnessSkill(pt))
 	pt.skills.Register(analyzeRiskSkill(pt))
@@ -664,6 +667,9 @@ func (pt *PipelineTester) handleRegistryAnnouncement(msg *guide.Message) error {
 	if !ok {
 		return nil
 	}
+
+	pt.knownAgentsMu.Lock()
+	defer pt.knownAgentsMu.Unlock()
 
 	action := "registered"
 	switch msg.Type {

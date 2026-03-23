@@ -61,3 +61,58 @@ func TestPublishTaskPipelineState(t *testing.T) {
 		t.Fatal("timed out waiting for task pipeline state")
 	}
 }
+
+func TestPublishFailedTaskPipelineState(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	gotCh := make(chan *taskstate.Event, 1)
+	sub, err := bus.SubscribeAsync(taskstate.Topic, func(msg *guide.Message) error {
+		evt, ok := msg.Payload.(*taskstate.Event)
+		if !ok {
+			t.Fatalf("payload type = %T, want *taskstate.Event", msg.Payload)
+		}
+		gotCh <- evt
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("SubscribeAsync: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	bridge := NewDAGBridge(DefaultDAGBridgeConfig(), DAGBridgeDeps{
+		SessionID: "session-1",
+		AgentID:   "orchestrator",
+	})
+	bridge.SetBus(bus)
+	bridge.activeDAGs["dag-1"] = &ActiveDAGMeta{
+		SubNodeTasks: map[string]taskPipelineRef{
+			"task_1:execute": {
+				TaskID:    "task_1",
+				TaskLabel: "auth-checkout",
+				Stage:     string(StageExecute),
+				AgentType: "engineer",
+			},
+		},
+	}
+
+	bridge.publishFailedTaskPipelineState("dag-1", "task_1:execute")
+
+	select {
+	case evt := <-gotCh:
+		if evt.PipelineID != "task_1" {
+			t.Fatalf("PipelineID = %q, want task_1", evt.PipelineID)
+		}
+		if evt.TaskLabel != "auth-checkout" {
+			t.Fatalf("TaskLabel = %q, want auth-checkout", evt.TaskLabel)
+		}
+		if evt.Status != taskstate.StatusFailed {
+			t.Fatalf("Status = %q, want failed", evt.Status)
+		}
+		if evt.WorkerType != "engineer" {
+			t.Fatalf("WorkerType = %q, want engineer", evt.WorkerType)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for failed task pipeline state")
+	}
+}

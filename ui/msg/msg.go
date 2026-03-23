@@ -634,6 +634,14 @@ type PlanFileTarget struct {
 	Reason    string
 }
 
+// PlanTaskExample is a compact code, usage, or diagram example attached to a task.
+type PlanTaskExample struct {
+	Label       string
+	Language    string
+	Code        string
+	Explanation string
+}
+
 // PlanTaskSnapshot is a point-in-time view of a single task.
 type PlanTaskSnapshot struct {
 	ID            string
@@ -652,6 +660,7 @@ type PlanTaskSnapshot struct {
 	AffectedFiles       []PlanFileTarget
 	ImplementationGuide string
 	Guidelines          []string
+	Examples            []PlanTaskExample
 }
 
 // PlanViewToggleMsg requests toggling the plan viewer panel visibility.
@@ -741,6 +750,14 @@ type LayerDecisionMsg struct {
 	LayerIdx    int
 	FailedNodes []LayerFailedNode
 }
+
+type LayerDecisionCommitMsg struct {
+	DAGID    string
+	LayerIdx int
+	Decision string
+}
+
+type LayerDecisionResolvedMsg struct{}
 
 // LayerFailedNode describes a single failed node in a layer decision.
 type LayerFailedNode struct {

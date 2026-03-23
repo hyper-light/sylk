@@ -1,6 +1,7 @@
 package activation
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/adalundhe/sylk/core/handoff"
@@ -38,12 +39,16 @@ var categoryDivisor = map[handoff.AgentCategory]int{
 // AgentActivationPolicies generates per-agent-type activation policies
 // from agent descriptors. Policy parameters are derived from each
 // descriptor's category and usage patterns — no magic numbers.
-func AgentActivationPolicies(descriptors []handoff.AgentDescriptor) []*ActivationPolicy {
+func AgentActivationPolicies(descriptors []handoff.AgentDescriptor) ([]*ActivationPolicy, error) {
 	policies := make([]*ActivationPolicy, len(descriptors))
 	for i, desc := range descriptors {
-		policies[i] = policyForDescriptor(desc)
+		policy, err := policyForDescriptor(desc)
+		if err != nil {
+			return nil, err
+		}
+		policies[i] = policy
 	}
-	return policies
+	return policies, nil
 }
 
 // preWarmAgentTypes lists agent types that should be activated at startup.
@@ -60,34 +65,53 @@ var preWarmAgentTypes = map[string]bool{
 // Daemon agents get DaemonPolicy; knowledge agents and the architect get
 // PreWarmOnStartup; all others get DefaultPolicy with category-scaled idle
 // thresholds.
-func policyForDescriptor(desc handoff.AgentDescriptor) *ActivationPolicy {
-	if daemonAgentTypes[desc.AgentType] {
+func policyForDescriptor(desc handoff.AgentDescriptor) (*ActivationPolicy, error) {
+	if isDaemonAgentType(desc.AgentType) {
 		p := DaemonPolicy(desc.AgentType)
 		p.PreWarmOnStartup = true
-		return p
+		return p, nil
 	}
 
-	defaults := scaledDefaults(desc.Category)
+	defaults, err := scaledDefaults(desc.Category)
+	if err != nil {
+		return nil, fmt.Errorf("activation policy defaults for %q: %w", desc.AgentType, err)
+	}
 	policy := DefaultPolicy(desc.AgentType, defaults)
 
-	if preWarmAgentTypes[desc.AgentType] {
+	if shouldPreWarmAgentType(desc.AgentType) {
 		policy.PreWarmOnStartup = true
 	}
 
-	return policy
+	return policy, nil
 }
 
 // scaledDefaults returns PolicyDefaults with idle thresholds adjusted by the
 // category's cost scale factor. Knowledge agents (scale 2, divisor 1) get 2×
 // longer thresholds. Pipeline agents (scale 1, divisor 2) get thresholds halved.
-func scaledDefaults(category handoff.AgentCategory) PolicyDefaults {
+func scaledDefaults(category handoff.AgentCategory) (PolicyDefaults, error) {
 	base := DefaultPolicyDefaults()
-	scale := categoryCostScale[category]
-	divisor := categoryDivisor[category]
+	scale, ok := categoryCostScale[category]
+	if !ok {
+		return PolicyDefaults{}, fmt.Errorf("missing activation cost scale for category %q", category.String())
+	}
+	divisor, ok := categoryDivisor[category]
+	if !ok {
+		return PolicyDefaults{}, fmt.Errorf("missing activation divisor for category %q", category.String())
+	}
 
 	return PolicyDefaults{
 		IdleToWarm: base.IdleToWarm * time.Duration(scale) / time.Duration(divisor),
 		IdleToCool: base.IdleToCool * time.Duration(scale) / time.Duration(divisor),
 		IdleToCold: base.IdleToCold * time.Duration(scale) / time.Duration(divisor),
-	}
+	}, nil
+}
+
+func isDaemonAgentType(agentType string) bool {
+	daemon, ok := daemonAgentTypes[agentType]
+	return ok && daemon
+}
+
+func shouldPreWarmAgentType(agentType string) bool {
+	preWarm, ok := preWarmAgentTypes[agentType]
+	return ok && preWarm
 }

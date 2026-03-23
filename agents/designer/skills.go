@@ -25,9 +25,13 @@ func (d *Designer) registerCoreSkills() {
 	}
 
 	d.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return d.fileAccess }))
+	d.skills.Register(runCommandSkill(d))
+	d.skills.Register(runShellScriptSkill(d))
 	d.skills.Register(componentSearchSkill(d))
 	d.skills.Register(componentCreateSkill(d))
 	d.skills.Register(componentModifySkill(d))
+	d.skills.Register(researchDependencyInstallSkill(d))
+	d.skills.Register(installDependencyToolingSkill(d))
 	d.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
 	d.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
 	d.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))

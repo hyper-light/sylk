@@ -247,6 +247,8 @@ func TestPipelineTesterVisibleSkills_IncludeHarnessAndReportingTools(t *testing.
 		"list_pipeline_changes",
 		"write_test",
 		"run_test_suite",
+		"run_command",
+		"run_shell_script",
 		"handoff_next",
 		"validate_work",
 		"process_validation",

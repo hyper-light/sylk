@@ -3,9 +3,11 @@ package architect
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/events"
@@ -453,6 +455,12 @@ func buildPlanSnapshotData(plan *DesignPlan) map[string]any {
 		if t.ImplementationGuide != "" {
 			task["ImplementationGuide"] = t.ImplementationGuide
 		}
+		if len(t.Guidelines) > 0 {
+			task["Guidelines"] = t.Guidelines
+		}
+		if len(t.Examples) > 0 {
+			task["Examples"] = t.Examples
+		}
 		if len(t.AffectedFiles) > 0 {
 			task["AffectedFiles"] = t.AffectedFiles
 		}
@@ -530,28 +538,425 @@ func formatPlanForChat(plan *DesignPlan) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("### Plan\n\n**Tasks:**\n")
-	for i, task := range plan.Tasks {
+	b.WriteString("### Plan\n\n")
+	b.WriteString("**Status:** ")
+	b.WriteString(plan.Status.String())
+	b.WriteString("\n\n")
+	b.WriteString("#### Tasks\n\n")
+
+	taskByID := make(map[string]*AtomicTask, len(plan.Tasks))
+	for _, task := range plan.Tasks {
 		if task == nil {
 			continue
 		}
-		line := fmt.Sprintf("%d. **%s** (%s)", i+1, task.Name, task.AgentType)
-		if len(task.Dependencies) > 0 {
-			line += fmt.Sprintf(" \u2192 after %s", strings.Join(task.Dependencies, ", "))
+		taskByID[task.ID] = task
+	}
+
+	taskNum := 1
+	if plan.Workflow != nil && len(plan.Workflow.ExecutionLayers) > 1 {
+		for layerIdx, layer := range plan.Workflow.ExecutionLayers {
+			b.WriteString("##### Layer ")
+			b.WriteString(strconv.Itoa(layerIdx + 1))
+			b.WriteString("\n\n")
+			for _, id := range layer {
+				task := taskByID[id]
+				if task == nil {
+					continue
+				}
+				writePlanMarkdownTask(&b, task, taskNum)
+				taskNum++
+			}
 		}
-		b.WriteString(line + "\n")
-		if desc := strings.TrimSpace(task.Description); desc != "" {
-			b.WriteString("   " + truncateString(desc, 120) + "\n")
+		for _, task := range plan.Tasks {
+			if task == nil || taskInExecutionLayers(task.ID, plan.Workflow.ExecutionLayers) {
+				continue
+			}
+			writePlanMarkdownTask(&b, task, taskNum)
+			taskNum++
+		}
+	} else {
+		for _, task := range plan.Tasks {
+			if task == nil {
+				continue
+			}
+			writePlanMarkdownTask(&b, task, taskNum)
+			taskNum++
 		}
 	}
+
 	layers := 0
 	if plan.Workflow != nil {
 		layers = len(plan.Workflow.ExecutionLayers)
 	}
 	if layers > 1 {
-		b.WriteString(fmt.Sprintf("\n**Execution:** %d layers, %d tasks\n", layers, len(plan.Tasks)))
+		b.WriteString(fmt.Sprintf("\n#### Execution\n\n%d layers, %d tasks\n", layers, len(plan.Tasks)))
 	} else {
-		b.WriteString(fmt.Sprintf("\n**Execution:** %d tasks\n", len(plan.Tasks)))
+		b.WriteString(fmt.Sprintf("\n#### Execution\n\n%d tasks\n", len(plan.Tasks)))
 	}
 	return b.String()
+}
+
+func writePlanMarkdownTask(b *strings.Builder, task *AtomicTask, num int) {
+	if task == nil {
+		return
+	}
+	b.WriteString(strconv.Itoa(num))
+	b.WriteString(". **")
+	b.WriteString(firstNonEmptyPlanMarkdown(task.Name, task.ID, "Untitled task"))
+	b.WriteString("**")
+	if agent := strings.TrimSpace(task.AgentType); agent != "" {
+		b.WriteString(" `")
+		b.WriteString(agent)
+		b.WriteString("`")
+	}
+	b.WriteString(" ")
+	b.WriteString(planMarkdownStatusIcon(task.Status.String()))
+	b.WriteString(" ")
+	b.WriteString(task.Status.String())
+	b.WriteByte('\n')
+
+	indent := strings.Repeat(" ", len(strconv.Itoa(num))+2)
+
+	if desc := normalizePlanMarkdownBlock(task.Description); desc != "" {
+		b.WriteByte('\n')
+		writeIndentedPlanMarkdownBlock(b, indent, desc)
+		b.WriteByte('\n')
+	}
+	if len(task.Dependencies) > 0 {
+		b.WriteByte('\n')
+		writeIndentedPlanMarkdownBlock(b, indent, "**Depends On:** "+inlineCodeList(task.Dependencies))
+		b.WriteByte('\n')
+	}
+	if len(task.AcceptanceCriteria) > 0 {
+		b.WriteByte('\n')
+		writeIndentedPlanMarkdownBlock(b, indent, "**Acceptance Criteria**")
+		b.WriteByte('\n')
+		writePlanMarkdownCriteria(b, indent, task.AcceptanceCriteria)
+	}
+	if len(task.AffectedFiles) > 0 {
+		b.WriteByte('\n')
+		writeIndentedPlanMarkdownBlock(b, indent, "**Affected Files**")
+		b.WriteByte('\n')
+		for _, file := range task.AffectedFiles {
+			line := "- `" + strings.TrimSpace(file.Path) + "`"
+			if op := strings.TrimSpace(file.Operation); op != "" {
+				line += " (" + op + ")"
+			}
+			if reason := strings.TrimSpace(file.Reason); reason != "" {
+				line += ": " + reason
+			}
+			writeIndentedPlanMarkdownBlock(b, indent, line)
+		}
+		b.WriteByte('\n')
+	}
+	if guide := normalizePlanMarkdownBlock(task.ImplementationGuide); guide != "" {
+		b.WriteByte('\n')
+		writeIndentedPlanMarkdownBlock(b, indent, "**Implementation Guide**")
+		b.WriteByte('\n')
+		b.WriteByte('\n')
+		writeIndentedPlanMarkdownBlock(b, indent, guide)
+		b.WriteByte('\n')
+	}
+	if len(task.Examples) > 0 {
+		b.WriteByte('\n')
+		writeIndentedPlanMarkdownBlock(b, indent, "**Examples**")
+		b.WriteByte('\n')
+		for i, example := range task.Examples {
+			writePlanMarkdownExample(b, indent, example)
+			if i < len(task.Examples)-1 {
+				b.WriteByte('\n')
+			}
+		}
+	}
+	if len(task.Guidelines) > 0 {
+		b.WriteByte('\n')
+		writeIndentedPlanMarkdownBlock(b, indent, "**Guidelines**")
+		b.WriteByte('\n')
+		for _, guideline := range task.Guidelines {
+			if strings.TrimSpace(guideline) == "" {
+				continue
+			}
+			writeIndentedPlanMarkdownBlock(b, indent, "- "+strings.TrimSpace(guideline))
+		}
+		b.WriteByte('\n')
+	}
+	if task.Result != nil && strings.TrimSpace(task.Result.Error) != "" {
+		b.WriteByte('\n')
+		writeIndentedPlanMarkdownBlock(b, indent, "> "+strings.TrimSpace(task.Result.Error))
+		b.WriteByte('\n')
+	}
+	b.WriteByte('\n')
+}
+
+func writePlanMarkdownCriteria(b *strings.Builder, indent string, criteria []AcceptanceCriterion) {
+	priorities := []string{"must", "should", "could"}
+	grouped := map[string][]AcceptanceCriterion{}
+	for _, criterion := range criteria {
+		grouped[normalizePlanMarkdownPriority(criterion.Priority)] = append(grouped[normalizePlanMarkdownPriority(criterion.Priority)], criterion)
+	}
+	for _, priority := range priorities {
+		group := grouped[priority]
+		if len(group) == 0 {
+			continue
+		}
+		writeIndentedPlanMarkdownBlock(b, indent, "**"+planMarkdownPriorityHeading(priority)+"**")
+		for _, criterion := range group {
+			line := "- [" + priority + "] Given " + strings.TrimSpace(criterion.Given) +
+				" / When " + strings.TrimSpace(criterion.When) +
+				" / Then " + strings.TrimSpace(criterion.Then)
+			writeIndentedPlanMarkdownBlock(b, indent, line)
+		}
+		b.WriteByte('\n')
+	}
+}
+
+func writePlanMarkdownExample(b *strings.Builder, indent string, example TaskExample) {
+	example = normalizePlanMarkdownExample(example)
+	if example.Label != "" {
+		writeIndentedPlanMarkdownBlock(b, indent, "*"+example.Label+"*")
+	}
+	if example.Code != "" {
+		fence := "```"
+		if example.Language != "" {
+			fence += example.Language
+		}
+		writeIndentedPlanMarkdownBlock(b, indent, fence)
+		writeIndentedPlanMarkdownBlock(b, indent, example.Code)
+		writeIndentedPlanMarkdownBlock(b, indent, "```")
+	}
+	if explanation := normalizePlanMarkdownBlock(example.Explanation); explanation != "" {
+		writeIndentedPlanMarkdownBlock(b, indent, explanation)
+	}
+}
+
+func writeIndentedPlanMarkdownBlock(b *strings.Builder, indent, text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			b.WriteByte('\n')
+			continue
+		}
+		b.WriteString(indent)
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+}
+
+func normalizePlanMarkdownBlock(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	normalized := make([]string, 0, len(lines))
+	inFence := false
+	for _, line := range lines {
+		trimmed := strings.TrimRight(line, " \t")
+		if strings.HasPrefix(strings.TrimSpace(trimmed), "```") {
+			inFence = !inFence
+			normalized = append(normalized, strings.TrimSpace(trimmed))
+			continue
+		}
+		if inFence {
+			normalized = append(normalized, trimmed)
+			continue
+		}
+		normalized = append(normalized, rewritePlanMarkdownStepLine(trimmed))
+	}
+	return strings.TrimSpace(strings.Join(normalized, "\n"))
+}
+
+func rewritePlanMarkdownStepLine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return ""
+	}
+	if number, rest, ok := parsePlanMarkdownStepPrefix(trimmed); ok {
+		return strconv.Itoa(number) + ". " + rest
+	}
+	if number, rest, ok := parsePlanMarkdownParenPrefix(trimmed); ok {
+		return strconv.Itoa(number) + ". " + rest
+	}
+	return trimmed
+}
+
+func parsePlanMarkdownStepPrefix(line string) (int, string, bool) {
+	lower := strings.ToLower(line)
+	if !strings.HasPrefix(lower, "step ") {
+		return 0, "", false
+	}
+	i := len("step ")
+	start := i
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		i++
+	}
+	if i == start || i >= len(line) || line[i] != ':' {
+		return 0, "", false
+	}
+	number, err := strconv.Atoi(line[start:i])
+	if err != nil {
+		return 0, "", false
+	}
+	rest := strings.TrimSpace(line[i+1:])
+	if rest == "" {
+		return 0, "", false
+	}
+	return number, rest, true
+}
+
+func parsePlanMarkdownParenPrefix(line string) (int, string, bool) {
+	i := 0
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		i++
+	}
+	if i == 0 || i >= len(line) || line[i] != ')' {
+		return 0, "", false
+	}
+	number, err := strconv.Atoi(line[:i])
+	if err != nil {
+		return 0, "", false
+	}
+	rest := strings.TrimSpace(line[i+1:])
+	if rest == "" {
+		return 0, "", false
+	}
+	return number, rest, true
+}
+
+func normalizePlanMarkdownPriority(priority string) string {
+	switch strings.ToLower(strings.TrimSpace(priority)) {
+	case "must", "should", "could":
+		return strings.ToLower(strings.TrimSpace(priority))
+	default:
+		return "must"
+	}
+}
+
+func planMarkdownPriorityHeading(priority string) string {
+	switch priority {
+	case "must":
+		return "Must"
+	case "should":
+		return "Should"
+	case "could":
+		return "Could"
+	default:
+		return "Criteria"
+	}
+}
+
+func normalizePlanMarkdownExample(example TaskExample) TaskExample {
+	code, detectedLanguage := trimPlanMarkdownExampleFence(example.Code)
+	example.Label = strings.TrimSpace(example.Label)
+	example.Language = normalizePlanMarkdownLanguage(firstNonEmptyPlanMarkdown(example.Language, detectedLanguage, ""))
+	example.Code = strings.TrimSpace(code)
+	example.Explanation = strings.TrimSpace(example.Explanation)
+	if example.Language == "" {
+		example.Language = inferPlanMarkdownLanguage(example.Code)
+	}
+	return example
+}
+
+func trimPlanMarkdownExampleFence(code string) (string, string) {
+	trimmed := strings.TrimSpace(code)
+	if !strings.HasPrefix(trimmed, "```") {
+		return trimmed, ""
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) < 2 {
+		return strings.TrimPrefix(trimmed, "```"), ""
+	}
+	first := strings.TrimSpace(lines[0])
+	last := strings.TrimSpace(lines[len(lines)-1])
+	if last != "```" {
+		return trimmed, ""
+	}
+	language := strings.TrimSpace(strings.TrimPrefix(first, "```"))
+	body := strings.Join(lines[1:len(lines)-1], "\n")
+	return strings.Trim(body, "\n"), language
+}
+
+func normalizePlanMarkdownLanguage(language string) string {
+	language = strings.ToLower(strings.TrimSpace(language))
+	if language == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range language {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || strings.ContainsRune("+-_#", r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func inferPlanMarkdownLanguage(code string) string {
+	for _, line := range strings.Split(code, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "flowchart ") ||
+			strings.HasPrefix(lower, "graph ") ||
+			strings.HasPrefix(lower, "sequencediagram") ||
+			strings.HasPrefix(lower, "statediagram") {
+			return "mermaid"
+		}
+		break
+	}
+	return ""
+}
+
+func planMarkdownStatusIcon(status string) string {
+	switch status {
+	case "pending":
+		return "○"
+	case "queued", "running":
+		return "◉"
+	case "completed":
+		return "✓"
+	case "failed":
+		return "✕"
+	case "blocked":
+		return "◌"
+	case "skipped":
+		return "─"
+	default:
+		return "○"
+	}
+}
+
+func inlineCodeList(values []string) string {
+	items := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			items = append(items, "`"+trimmed+"`")
+		}
+	}
+	return strings.Join(items, ", ")
+}
+
+func taskInExecutionLayers(taskID string, layers [][]string) bool {
+	for _, layer := range layers {
+		for _, id := range layer {
+			if id == taskID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func firstNonEmptyPlanMarkdown(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/redact"
 )
@@ -39,6 +40,7 @@ type GuideBridge struct {
 	dropped      atomic.Int64
 	done         chan struct{}
 	subscription guide.Subscription
+	decisionSub  guide.Subscription
 	sessionID    string
 	stopOnce     sync.Once
 }
@@ -65,6 +67,13 @@ func (b *GuideBridge) Start(program TeaProgram) error {
 		return err
 	}
 	b.subscription = sub
+	decisionSub, err := b.bus.Subscribe("dag.decision", b.onMessage)
+	if err != nil {
+		_ = b.subscription.Unsubscribe()
+		b.subscription = nil
+		return err
+	}
+	b.decisionSub = decisionSub
 	return b.scope.Go(guideBridgeName, guideDrainTimeout, b.drainFunc(program))
 }
 
@@ -73,6 +82,9 @@ func (b *GuideBridge) Stop() {
 	b.stopOnce.Do(func() {
 		if b.subscription != nil {
 			_ = b.subscription.Unsubscribe()
+		}
+		if b.decisionSub != nil {
+			_ = b.decisionSub.Unsubscribe()
 		}
 		close(b.done)
 	})
@@ -129,6 +141,10 @@ func (b *GuideBridge) dispatch(busMsg *guide.Message, program TeaProgram) {
 		program.Send(msg.CommandApprovalRequestMsg{Proposal: proposal})
 		return
 	}
+	if decision, ok := decodeLayerDecisionRequest(busMsg); ok {
+		program.Send(*decision)
+		return
+	}
 	if resp, ok := busMsg.GetRouteResponse(); ok {
 		program.Send(toGuideMsg(resp))
 		return
@@ -169,6 +185,79 @@ func decodeCommandApprovalProposal(busMsg *guide.Message) (*commandapproval.Prop
 		return nil, false
 	}
 	return &proposal, true
+}
+
+func decodeLayerDecisionRequest(busMsg *guide.Message) (*msg.LayerDecisionMsg, bool) {
+	if busMsg == nil || busMsg.Type != guide.MessageTypeLayerDecision || busMsg.Payload == nil {
+		return nil, false
+	}
+	data, ok := busMsg.Payload.(map[string]any)
+	if !ok {
+		raw, err := json.Marshal(busMsg.Payload)
+		if err != nil {
+			return nil, false
+		}
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return nil, false
+		}
+	}
+	dagID, _ := data["dag_id"].(string)
+	layerIdx, _ := toInt(data["layer_idx"])
+	if strings.TrimSpace(dagID) == "" {
+		return nil, false
+	}
+	result := &msg.LayerDecisionMsg{
+		DAGID:    dagID,
+		LayerIdx: layerIdx,
+	}
+	if rawNodes, ok := data["failed_nodes"].([]any); ok {
+		result.FailedNodes = append(result.FailedNodes, decodeLayerFailedNodes(rawNodes)...)
+	}
+	return result, true
+}
+
+func decodeLayerFailedNodes(raw []any) []msg.LayerFailedNode {
+	nodes := make([]msg.LayerFailedNode, 0, len(raw))
+	for _, entry := range raw {
+		nodeMap, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		node := msg.LayerFailedNode{}
+		node.NodeID, _ = nodeMap["NodeID"].(string)
+		if node.NodeID == "" {
+			node.NodeID, _ = nodeMap["node_id"].(string)
+		}
+		node.NodeName, _ = nodeMap["NodeName"].(string)
+		if node.NodeName == "" {
+			node.NodeName, _ = nodeMap["node_name"].(string)
+		}
+		node.AgentType, _ = nodeMap["AgentType"].(string)
+		if node.AgentType == "" {
+			node.AgentType, _ = nodeMap["agent_type"].(string)
+		}
+		node.Error, _ = nodeMap["Error"].(string)
+		if node.Error == "" {
+			node.Error, _ = nodeMap["error"].(string)
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes
+}
+
+func toInt(v any) (int, bool) {
+	switch typed := v.(type) {
+	case int:
+		return typed, true
+	case int32:
+		return int(typed), true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	default:
+		return 0, false
+	}
 }
 
 // dispatchStream converts a StreamResponse into the matching stream tea message.
@@ -219,7 +308,7 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 		status, _ := stream.Event.Data.(guide.RetryStatus)
 		errText := ""
 		if status.Err != nil {
-			errText = summarizeRetryError(status.Err.Error())
+			errText = providers.FriendlyErrorMessage(status.Err)
 		}
 		program.Send(msg.RetryStatusMsg{
 			SessionID:     sid,
@@ -493,27 +582,6 @@ func extractStreamError(event *guide.StreamEvent) error {
 	return guideError("stream error")
 }
 
-// summarizeRetryError extracts a human-readable one-liner from a raw provider
-// error. For JSON error bodies (common with Google/OpenAI APIs), it extracts
-// the nested "message" field. Falls back to the prefix before any JSON body.
-func summarizeRetryError(raw string) string {
-	if idx := strings.Index(raw, "{"); idx >= 0 {
-		var envelope struct {
-			Error struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if json.Unmarshal([]byte(raw[idx:]), &envelope) == nil && envelope.Error.Message != "" {
-			return envelope.Error.Message
-		}
-	}
-	// Strip JSON body if present but unparseable.
-	if idx := strings.Index(raw, "{"); idx > 0 {
-		return strings.TrimSpace(raw[:idx])
-	}
-	return raw
-}
-
 // toGuideMsg converts a RouteResponse into a GuideResponseMsg.
 func toGuideMsg(resp *guide.RouteResponse) msg.GuideResponseMsg {
 	m := msg.GuideResponseMsg{
@@ -716,6 +784,24 @@ func parsePlanTaskSnapshot(data map[string]any) msg.PlanTaskSnapshot {
 				When:     stringFromKey(criterionMap, "When"),
 				Then:     stringFromKey(criterionMap, "Then"),
 				Priority: stringFromKey(criterionMap, "Priority"),
+			})
+		}
+	}
+
+	// Parse examples.
+	rawExamples := sliceFromKey(data, "Examples")
+	if len(rawExamples) > 0 {
+		snap.Examples = make([]msg.PlanTaskExample, 0, len(rawExamples))
+		for _, raw := range rawExamples {
+			exampleMap, ok := toMap(raw)
+			if !ok {
+				continue
+			}
+			snap.Examples = append(snap.Examples, msg.PlanTaskExample{
+				Label:       stringFromKey(exampleMap, "Label"),
+				Language:    stringFromKey(exampleMap, "Language"),
+				Code:        stringFromKey(exampleMap, "Code"),
+				Explanation: stringFromKey(exampleMap, "Explanation"),
 			})
 		}
 	}

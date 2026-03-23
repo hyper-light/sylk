@@ -190,6 +190,9 @@ func (g *Guardian) streamToolLoopTurn(
 
 	var streamErr error
 	for chunk := range chunks {
+		if chunk != nil && chunk.Type == providers.ChunkTypeStart && chunk.RetryReset {
+			streamErr = nil
+		}
 		collector.Add(chunk)
 		if chunk.Type == providers.ChunkTypeError {
 			streamErr = fmt.Errorf("stream error: %s", chunk.Text)

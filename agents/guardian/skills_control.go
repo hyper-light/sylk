@@ -54,7 +54,7 @@ func (g *Guardian) evaluateToolExecutionControl(
 	if strings.TrimSpace(req.AgentID) == "" || strings.TrimSpace(req.CorrelationID) == "" || strings.TrimSpace(req.CapabilityScope) == "" {
 		return nil, fmt.Errorf("guardian tool control request is missing invocation identity")
 	}
-	if trimmedSource := strings.TrimSpace(sourceAgentID); trimmedSource != "" && req.AgentID != trimmedSource {
+	if trimmedSource := strings.TrimSpace(sourceAgentID); trimmedSource != "" && !g.matchesToolControlRequester(trimmedSource, req.AgentID) {
 		return nil, fmt.Errorf("guardian tool control source mismatch: %q != %q", req.AgentID, trimmedSource)
 	}
 	if req.Policy.Execution != toolruntime.ExecutionModeGuardian {
@@ -75,4 +75,34 @@ func (g *Guardian) evaluateToolExecutionControl(
 		Reason:            "guardian-approved deterministic control-plane grant",
 		ExpiresAt:         time.Now().Add(30 * time.Second),
 	}, nil
+}
+
+func (g *Guardian) matchesToolControlRequester(sourceAgentID, requester string) bool {
+	sourceAgentID = strings.TrimSpace(sourceAgentID)
+	requester = strings.TrimSpace(requester)
+	if sourceAgentID == "" || requester == "" {
+		return false
+	}
+	if sourceAgentID == requester {
+		return true
+	}
+	if g == nil {
+		return false
+	}
+
+	g.knownMu.RLock()
+	ann, ok := g.knownAgents[sourceAgentID]
+	g.knownMu.RUnlock()
+	if !ok || ann == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(ann.AgentType), requester) {
+		return true
+	}
+	for _, alias := range ann.Aliases {
+		if strings.EqualFold(strings.TrimSpace(alias), requester) {
+			return true
+		}
+	}
+	return false
 }

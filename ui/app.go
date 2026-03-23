@@ -388,6 +388,13 @@ type commandApprovalState struct {
 	returnInput bool
 }
 
+type layerDecisionState struct {
+	request     *msg.LayerDecisionMsg
+	selected    int
+	activated   int
+	returnFocus component.FocusID
+}
+
 type commandApprovalHitbox struct {
 	option int
 	y      int
@@ -405,6 +412,12 @@ var commandApprovalOptions = []commandApprovalOption{
 	{label: "Allow Always", hint: "save allow rule", decision: "allow_always"},
 	{label: "Deny Once", hint: "block this run", decision: "deny_once"},
 	{label: "Deny Always", hint: "save deny rule", decision: "deny_always"},
+}
+
+var layerDecisionOptions = []commandApprovalOption{
+	{label: "Retry Layer", hint: "rerun failed nodes", decision: "retry"},
+	{label: "Skip Layer", hint: "continue past failures", decision: "skip"},
+	{label: "Abort DAG", hint: "cancel this workflow", decision: "abort"},
 }
 
 // AppModel is the root Bubble Tea model that composes all TUI components.
@@ -608,6 +621,8 @@ type AppModel struct {
 	pendingClosePrompt bool
 	commandApproval    *commandApprovalState
 	commandApprovalQ   []*commandapproval.Proposal
+	layerDecision      *layerDecisionState
+	layerDecisionQ     []*msg.LayerDecisionMsg
 	// pendingPaneClose is non-zero when the save prompt is for a pane close
 	// operation. The value is the PaneID being closed.
 	pendingPaneClose pane.PaneID
@@ -2354,6 +2369,17 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 		m.resolveCommandApproval()
 		return nil
 	}),
+	reflect.TypeFor[msg.LayerDecisionMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.LayerDecisionMsg) tea.Cmd {
+		m.handleLayerDecisionRequest(typed)
+		return nil
+	}),
+	reflect.TypeFor[msg.LayerDecisionCommitMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.LayerDecisionCommitMsg) tea.Cmd {
+		return m.commitLayerDecision(typed)
+	}),
+	reflect.TypeFor[msg.LayerDecisionResolvedMsg](): appMsgCmdRoute(func(m *AppModel, _ msg.LayerDecisionResolvedMsg) tea.Cmd {
+		m.resolveLayerDecision()
+		return nil
+	}),
 	reflect.TypeFor[msg.RetryStatusMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.RetryStatusMsg) tea.Cmd {
 		if typed.CorrelationID != "" {
 			if _, interrupted := m.interruptedCorrelations[typed.CorrelationID]; interrupted {
@@ -2821,6 +2847,12 @@ var appKeyDispatchRoutes = []appKeyDispatchRoute{
 		func(m *AppModel, _ tea.KeyMsg, _ string) bool { return m.commandApproval != nil },
 		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
 			return m.handleCommandApprovalKey(key)
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, _ string) bool { return m.layerDecision != nil },
+		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			return m.handleLayerDecisionKey(key)
 		},
 	),
 	keyPredicateRoute(
@@ -6742,6 +6774,7 @@ func (m *AppModel) streamIdentityForCorrelation(correlationID string) (string, s
 		agentType  string
 		pipelineID string
 		taskID     string
+		taskName   string
 		taskSlug   string
 		runtimeID  string
 	)
@@ -6751,6 +6784,7 @@ func (m *AppModel) streamIdentityForCorrelation(correlationID string) (string, s
 		agentType = entry.AgentType
 		pipelineID = entry.PipelineID
 		taskID = entry.TaskID
+		taskName = entry.TaskName
 		taskSlug = entry.TaskSlug
 	}
 	if usage, ok := m.streamUsage[strings.TrimSpace(correlationID)]; ok {
@@ -6759,6 +6793,7 @@ func (m *AppModel) streamIdentityForCorrelation(correlationID string) (string, s
 		agentType = firstNonEmpty(agentType, usage.AgentType)
 		pipelineID = firstNonEmpty(pipelineID, usage.PipelineID)
 		taskID = firstNonEmpty(taskID, usage.TaskID)
+		taskName = firstNonEmpty(taskName, usage.TaskName)
 		taskSlug = firstNonEmpty(taskSlug, usage.TaskSlug)
 	}
 	pipelineID = logicalStreamPipelineID(pipelineID, taskID)
@@ -6786,6 +6821,9 @@ func (m *AppModel) streamIdentityForCorrelation(correlationID string) (string, s
 	}
 	if taskID = strings.TrimSpace(taskID); taskID != "" {
 		data["task_id"] = taskID
+	}
+	if taskName = strings.TrimSpace(taskName); taskName != "" {
+		data["task_name"] = taskName
 	}
 	if taskSlug = strings.TrimSpace(taskSlug); taskSlug != "" {
 		data["task_slug"] = taskSlug
@@ -6844,6 +6882,9 @@ func (m *AppModel) publishStreamStartActivity(start msg.StreamStartMsg) {
 	}
 	if taskID := strings.TrimSpace(start.TaskID); taskID != "" {
 		data["task_id"] = taskID
+	}
+	if taskName := strings.TrimSpace(start.TaskName); taskName != "" {
+		data["task_name"] = taskName
 	}
 	if taskSlug := strings.TrimSpace(start.TaskSlug); taskSlug != "" {
 		data["task_slug"] = taskSlug
@@ -10970,7 +11011,7 @@ func (m *AppModel) handleCommandApprovalRequest(request msg.CommandApprovalReque
 	if request.Proposal == nil {
 		return
 	}
-	if m.commandApproval != nil {
+	if m.commandApproval != nil || m.layerDecision != nil {
 		m.commandApprovalQ = append(m.commandApprovalQ, request.Proposal)
 		return
 	}
@@ -10998,6 +11039,22 @@ func (m *AppModel) resolveCommandApproval() {
 		m.commandApprovalQ = m.commandApprovalQ[1:]
 		m.commandApproval = &commandApprovalState{
 			proposal:    next,
+			selected:    0,
+			activated:   -1,
+			returnFocus: restore,
+		}
+		m.focus.SetFocus(component.FocusInput)
+		m.syncFocusState()
+		m.recalcLayout()
+		m.markSlotDirty(compositor.SlotInput)
+		m.viewDirty = true
+		return
+	}
+	if len(m.layerDecisionQ) > 0 {
+		next := m.layerDecisionQ[0]
+		m.layerDecisionQ = m.layerDecisionQ[1:]
+		m.layerDecision = &layerDecisionState{
+			request:     next,
 			selected:    0,
 			activated:   -1,
 			returnFocus: restore,
@@ -11100,6 +11157,136 @@ func (m *AppModel) commitCommandApproval(commit msg.CommandApprovalCommitMsg) te
 	return func() tea.Msg {
 		return msg.CommandApprovalResolvedMsg{}
 	}
+}
+
+func (m *AppModel) handleLayerDecisionRequest(request msg.LayerDecisionMsg) {
+	if m.layerDecision != nil || m.commandApproval != nil {
+		reqCopy := request
+		m.layerDecisionQ = append(m.layerDecisionQ, &reqCopy)
+		return
+	}
+	reqCopy := request
+	m.layerDecision = &layerDecisionState{
+		request:     &reqCopy,
+		selected:    0,
+		activated:   -1,
+		returnFocus: m.focus.Current(),
+	}
+	m.focus.SetFocus(component.FocusInput)
+	m.syncFocusState()
+	m.recalcLayout()
+	m.markSlotDirty(compositor.SlotInput)
+	m.viewDirty = true
+}
+
+func (m *AppModel) resolveLayerDecision() {
+	if m.layerDecision == nil {
+		return
+	}
+	restore := m.layerDecision.returnFocus
+	m.layerDecision = nil
+	if len(m.layerDecisionQ) > 0 {
+		next := m.layerDecisionQ[0]
+		m.layerDecisionQ = m.layerDecisionQ[1:]
+		m.layerDecision = &layerDecisionState{
+			request:     next,
+			selected:    0,
+			activated:   -1,
+			returnFocus: restore,
+		}
+		m.focus.SetFocus(component.FocusInput)
+		m.syncFocusState()
+		m.recalcLayout()
+		m.markSlotDirty(compositor.SlotInput)
+		m.viewDirty = true
+		return
+	}
+	if len(m.commandApprovalQ) > 0 {
+		next := m.commandApprovalQ[0]
+		m.commandApprovalQ = m.commandApprovalQ[1:]
+		m.commandApproval = &commandApprovalState{
+			proposal:    next,
+			selected:    0,
+			activated:   -1,
+			returnFocus: restore,
+		}
+		m.focus.SetFocus(component.FocusInput)
+		m.syncFocusState()
+		m.recalcLayout()
+		m.markSlotDirty(compositor.SlotInput)
+		m.viewDirty = true
+		return
+	}
+	if restore != component.FocusID(0) {
+		m.focus.SetFocus(restore)
+		m.syncFocusState()
+	}
+	m.recalcLayout()
+	m.markSlotDirty(compositor.SlotInput)
+	m.viewDirty = true
+}
+
+func (m *AppModel) handleLayerDecisionKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.layerDecision == nil {
+		return m, nil
+	}
+	switch key.String() {
+	case "up", "shift+tab":
+		m.layerDecision.selected = wrappedIndex(m.layerDecision.selected-1, len(layerDecisionOptions))
+		m.layerDecision.activated = -1
+		m.markSlotDirty(compositor.SlotInput)
+		m.viewDirty = true
+		return m, nil
+	case "down", "tab":
+		m.layerDecision.selected = wrappedIndex(m.layerDecision.selected+1, len(layerDecisionOptions))
+		m.layerDecision.activated = -1
+		m.markSlotDirty(compositor.SlotInput)
+		m.viewDirty = true
+		return m, nil
+	case "enter", " ":
+		return m, m.activateLayerDecisionOption(m.layerDecision.selected)
+	case "esc":
+		return m, m.activateLayerDecisionOption(2)
+	default:
+		return m, nil
+	}
+}
+
+func (m *AppModel) activateLayerDecisionOption(index int) tea.Cmd {
+	if m.layerDecision == nil || m.layerDecision.request == nil || index < 0 || index >= len(layerDecisionOptions) {
+		return nil
+	}
+	m.layerDecision.selected = index
+	m.layerDecision.activated = index
+	m.markSlotDirty(compositor.SlotInput)
+	m.viewDirty = true
+	option := layerDecisionOptions[index]
+	request := m.layerDecision.request
+	return tea.Tick(75*time.Millisecond, func(time.Time) tea.Msg {
+		return msg.LayerDecisionCommitMsg{
+			DAGID:    request.DAGID,
+			LayerIdx: request.LayerIdx,
+			Decision: option.decision,
+		}
+	})
+}
+
+func (m *AppModel) commitLayerDecision(commit msg.LayerDecisionCommitMsg) tea.Cmd {
+	if strings.TrimSpace(commit.DAGID) == "" || m.deps.GuideBus == nil {
+		return func() tea.Msg { return msg.LayerDecisionResolvedMsg{} }
+	}
+	_ = m.deps.GuideBus.Publish("dag.decision.response", &guide.Message{
+		ID:            uuid.New().String(),
+		Type:          guide.MessageTypeLayerDecisionResponse,
+		SourceAgentID: "tui",
+		Payload: map[string]any{
+			"dag_id":    commit.DAGID,
+			"layer_idx": commit.LayerIdx,
+			"decision":  commit.Decision,
+		},
+		Timestamp: time.Now(),
+	})
+	return func() tea.Msg { return msg.LayerDecisionResolvedMsg{} }
 }
 
 // closeCurrentTab closes the current tab and switches to an adjacent one.
@@ -11339,6 +11526,7 @@ var appMouseHandlers = []appMouseHandler{
 	(*AppModel).handleCommitTreeHoverMouse,
 	(*AppModel).handleSelectorHoverMouse,
 	(*AppModel).handleCommandApprovalMouse,
+	(*AppModel).handleLayerDecisionMouse,
 	(*AppModel).handleInputWheelMouse,
 	(*AppModel).handleMouseButtonMouse,
 }
@@ -11604,8 +11792,59 @@ func (m *AppModel) commandApprovalOptionAt(contentX, contentY int) (int, bool) {
 	return 0, false
 }
 
+func (m *AppModel) handleLayerDecisionMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if m.layerDecision == nil {
+		return nil, false
+	}
+	inputTop := m.height - m.prevInputH - statusBarHeight
+	if mouse.Y < inputTop || mouse.Y >= inputTop+m.prevInputH {
+		return nil, false
+	}
+	contentX := mouse.X - 1
+	contentY := mouse.Y - inputTop - 1
+	if contentX < 0 {
+		return nil, true
+	}
+	switch mouse.Action {
+	case tea.MouseActionMotion:
+		if idx, ok := m.layerDecisionOptionAt(contentX, contentY); ok {
+			m.layerDecision.selected = idx
+			m.layerDecision.activated = -1
+			m.markSlotDirty(compositor.SlotInput)
+			m.viewDirty = true
+		}
+		return nil, true
+	case tea.MouseActionPress:
+		if mouse.Button == tea.MouseButtonLeft {
+			if idx, ok := m.layerDecisionOptionAt(contentX, contentY); ok {
+				return m.activateLayerDecisionOption(idx), true
+			}
+		}
+		return nil, true
+	default:
+		return nil, true
+	}
+}
+
+func (m *AppModel) layerDecisionOptionAt(contentX, contentY int) (int, bool) {
+	if m.layerDecision == nil || contentX < 0 || contentY < 0 {
+		return 0, false
+	}
+	layout := m.layerDecisionLayout(max(m.width-2, 1))
+	for _, hitbox := range layout.hitboxes {
+		if contentY != hitbox.y {
+			continue
+		}
+		if contentX < hitbox.x0 || contentX >= hitbox.x1 {
+			continue
+		}
+		return hitbox.option, true
+	}
+	return 0, false
+}
+
 func (m *AppModel) handleInputWheelMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
-	if m.commandApproval != nil {
+	if m.commandApproval != nil || m.layerDecision != nil {
 		return nil, false
 	}
 	if m.focus.Current() != component.FocusInput || !m.input.CanScroll() {
@@ -11816,6 +12055,16 @@ func (m *AppModel) handleInputPanelPress(mouse tea.MouseMsg) bool {
 		contentY := mouse.Y - (m.height - m.prevInputH - statusBarHeight) - 1
 		if idx, ok := m.commandApprovalOptionAt(contentX, contentY); ok {
 			m.commandApproval.selected = idx
+			m.markSlotDirty(compositor.SlotInput)
+			m.viewDirty = true
+		}
+		return true
+	}
+	if m.layerDecision != nil {
+		contentX := mouse.X - 1
+		contentY := mouse.Y - (m.height - m.prevInputH - statusBarHeight) - 1
+		if idx, ok := m.layerDecisionOptionAt(contentX, contentY); ok {
+			m.layerDecision.selected = idx
 			m.markSlotDirty(compositor.SlotInput)
 			m.viewDirty = true
 		}
@@ -13958,6 +14207,9 @@ func (m *AppModel) inputHeight() int {
 	if m.commandApproval != nil {
 		return m.commandApprovalHeight()
 	}
+	if m.layerDecision != nil {
+		return m.layerDecisionHeight()
+	}
 	visualLines := m.input.VisualLineCount()
 	maxLines := m.inputMaxVisualLines()
 	lines := clampInt(visualLines, inputMinContentLines, maxLines)
@@ -13981,6 +14233,18 @@ func (m *AppModel) commandApprovalHeight() int {
 	return min(bodyLines+inputBorderSize, max(maxH, inputBorderSize))
 }
 
+func (m *AppModel) layerDecisionHeight() int {
+	bodyLines := len(m.layerDecisionLayout(max(m.width-2, 1)).lines)
+	if bodyLines < 1 {
+		bodyLines = 1
+	}
+	maxH := m.height - statusBarHeight - mainMinContentHeight
+	if maxH < inputBorderSize {
+		maxH = inputBorderSize
+	}
+	return min(bodyLines+inputBorderSize, max(maxH, inputBorderSize))
+}
+
 func (m *AppModel) renderCommandApprovalView() string {
 	th := m.config.Theme()
 	contentWidth := max(m.width-2, 1)
@@ -13993,6 +14257,20 @@ func (m *AppModel) renderCommandApprovalView() string {
 		style = th.InputFocused
 	}
 	return enforceLineCountToHeight(style.Width(contentWidth).Render(body), m.commandApprovalHeight())
+}
+
+func (m *AppModel) renderLayerDecisionView() string {
+	th := m.config.Theme()
+	contentWidth := max(m.width-2, 1)
+	body := strings.Join(m.layerDecisionLayout(contentWidth).lines, "\n")
+	if m.focus.Current() == component.FocusInput && th.ActiveBorderRender != nil {
+		return enforceLineCountToHeight(th.ActiveBorderRender(body, contentWidth, max(m.layerDecisionHeight()-inputBorderSize, 1), m.layerDecisionHeight()), m.layerDecisionHeight())
+	}
+	style := th.InputBorder
+	if m.focus.Current() == component.FocusInput {
+		style = th.InputFocused
+	}
+	return enforceLineCountToHeight(style.Width(contentWidth).Render(body), m.layerDecisionHeight())
 }
 
 func (m *AppModel) commandApprovalLayout(width int) commandApprovalViewLayout {
@@ -14024,10 +14302,158 @@ func (m *AppModel) commandApprovalLayout(width int) commandApprovalViewLayout {
 	return layout
 }
 
+func (m *AppModel) layerDecisionLayout(width int) commandApprovalViewLayout {
+	if width <= 0 {
+		width = 1
+	}
+	if m.layerDecision == nil || m.layerDecision.request == nil {
+		return commandApprovalViewLayout{lines: []string{""}}
+	}
+	req := m.layerDecision.request
+	th := m.config.Theme()
+	titleLines := markdownpkg.RenderMarkdown(
+		fmt.Sprintf("**DAG %s layer %d has blocking failures.**", req.DAGID, req.LayerIdx),
+		width,
+		th,
+	)
+	if len(titleLines) == 0 {
+		titleLines = []string{""}
+	}
+	layout := commandApprovalViewLayout{lines: append([]string(nil), titleLines...)}
+	optionLines := make([][]string, len(layerDecisionOptions))
+	optionHitboxes := make([][]commandApprovalHitbox, len(layerDecisionOptions))
+	optionLineCount := 0
+	for idx, option := range layerDecisionOptions {
+		renderedLines, hitboxes := m.renderLayerDecisionOption(idx, option, width)
+		optionLines[idx] = renderedLines
+		optionHitboxes[idx] = hitboxes
+		optionLineCount += len(renderedLines)
+	}
+	maxBodyLines := max(m.height-statusBarHeight-mainMinContentHeight-inputBorderSize, 1)
+	failureBudget := maxBodyLines - len(layout.lines) - optionLineCount
+	if failureBudget > 0 {
+		layout.lines = append(layout.lines, renderLayerDecisionFailures(req.FailedNodes, width, failureBudget, th)...)
+	}
+	for idx := range layerDecisionOptions {
+		baseY := len(layout.lines)
+		layout.lines = append(layout.lines, optionLines[idx]...)
+		for _, hitbox := range optionHitboxes[idx] {
+			hitbox.y += baseY
+			layout.hitboxes = append(layout.hitboxes, hitbox)
+		}
+	}
+	return layout
+}
+
 func (m *AppModel) renderCommandApprovalOption(index int, option commandApprovalOption, width int) ([]string, []commandApprovalHitbox) {
 	th := m.config.Theme()
+	selected := m.commandApproval != nil && m.commandApproval.selected == index
+	activated := m.commandApproval != nil && m.commandApproval.activated == index
+	renderedLines := renderCommandApprovalOptionLines(option, width, th, selected, activated)
+	hitboxes := make([]commandApprovalHitbox, 0, len(renderedLines))
+	for i, line := range renderedLines {
+		stripped := ansi.Strip(line)
+		visibleW := lipgloss.Width(stripped)
+		hitboxes = append(hitboxes, commandApprovalHitbox{
+			option: index,
+			y:      i,
+			x0:     0,
+			x1:     visibleW,
+		})
+	}
+	return renderedLines, hitboxes
+}
+
+type styledApprovalToken struct {
+	text  string
+	style lipgloss.Style
+}
+
+func renderCommandApprovalOptionLines(
+	option commandApprovalOption,
+	width int,
+	th *theme.Theme,
+	selected bool,
+	activated bool,
+) []string {
+	if width <= 0 {
+		width = 40
+	}
+
+	palette := th.Palette
+	bulletStyle := lipgloss.NewStyle().Foreground(palette.Accent)
+	labelStyle := lipgloss.NewStyle().Foreground(palette.Foreground)
+	hintStyle := lipgloss.NewStyle().Foreground(palette.Subtext)
+	if selected {
+		bulletStyle = bulletStyle.Foreground(palette.Secondary)
+		labelStyle = labelStyle.Foreground(palette.Secondary)
+		hintStyle = hintStyle.Foreground(palette.Primary)
+	}
+	if activated {
+		bulletStyle = bulletStyle.Bold(true)
+		labelStyle = labelStyle.Bold(true)
+		hintStyle = hintStyle.Bold(true)
+	}
+
+	tokens := []styledApprovalToken{{text: "•", style: bulletStyle}}
+	for _, token := range strings.Fields(strings.TrimSpace(option.label)) {
+		tokens = append(tokens, styledApprovalToken{text: token, style: labelStyle})
+	}
+	if hint := strings.TrimSpace(option.hint); hint != "" {
+		for _, token := range strings.Fields("(" + hint + ")") {
+			tokens = append(tokens, styledApprovalToken{text: token, style: hintStyle})
+		}
+	}
+	return wrapStyledApprovalTokens(tokens, width)
+}
+
+func wrapStyledApprovalTokens(tokens []styledApprovalToken, width int) []string {
+	if len(tokens) == 0 {
+		return []string{""}
+	}
+	lines := make([]string, 0, 1)
+	current := make([]styledApprovalToken, 0, len(tokens))
+	currentWidth := 0
+	flush := func() {
+		if len(current) == 0 {
+			return
+		}
+		parts := make([]string, 0, len(current))
+		for _, token := range current {
+			parts = append(parts, token.style.Render(token.text))
+		}
+		lines = append(lines, strings.Join(parts, " "))
+		current = current[:0]
+		currentWidth = 0
+	}
+	for _, token := range tokens {
+		tokenWidth := lipgloss.Width(token.text)
+		if len(current) == 0 {
+			current = append(current, token)
+			currentWidth = tokenWidth
+			continue
+		}
+		nextWidth := currentWidth + 1 + tokenWidth
+		if nextWidth > width {
+			flush()
+			current = append(current, token)
+			currentWidth = tokenWidth
+			continue
+		}
+		current = append(current, token)
+		currentWidth = nextWidth
+	}
+	flush()
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
+}
+
+func (m *AppModel) renderLayerDecisionOption(index int, option commandApprovalOption, width int) ([]string, []commandApprovalHitbox) {
+	th := m.config.Theme()
 	renderTheme := th
-	if m.commandApproval != nil && m.commandApproval.selected == index {
+	if m.layerDecision != nil && m.layerDecision.selected == index {
 		selectedTheme := *th
 		selectedPalette := th.Palette
 		selectedPalette.Foreground = th.Palette.Secondary
@@ -14035,7 +14461,7 @@ func (m *AppModel) renderCommandApprovalOption(index int, option commandApproval
 		renderTheme = &selectedTheme
 	}
 	style := lipgloss.NewStyle()
-	if m.commandApproval != nil && m.commandApproval.activated == index {
+	if m.layerDecision != nil && m.layerDecision.activated == index {
 		style = style.Bold(true)
 	}
 	renderedLines := markdownpkg.RenderMarkdown(commandApprovalOptionMarkdown(option), width, renderTheme)
@@ -14074,7 +14500,7 @@ func commandApprovalOptionMarkdown(option commandApprovalOption) string {
 	if hint == "" {
 		return "- " + option.label
 	}
-	return "- " + option.label + " " + hint
+	return "- " + option.label + " (" + hint + ")"
 }
 
 func commandApprovalRequesterName(proposal *commandapproval.Proposal) string {
@@ -14103,6 +14529,54 @@ func commandApprovalRequesterName(proposal *commandapproval.Proposal) string {
 		return "Agent"
 	}
 	return strings.Join(words, " ")
+}
+
+func renderLayerDecisionFailures(failures []msg.LayerFailedNode, width, maxLines int, th *theme.Theme) []string {
+	if maxLines <= 0 || len(failures) == 0 {
+		return nil
+	}
+	lines := make([]string, 0, min(maxLines, len(failures)))
+	for i, failure := range failures {
+		rendered := markdownpkg.RenderMarkdown("- "+layerDecisionFailureSummary(failure), width, th)
+		if len(lines)+len(rendered) > maxLines {
+			omitted := len(failures) - i
+			return appendLayerDecisionOverflow(lines, omitted, width, maxLines, th)
+		}
+		lines = append(lines, rendered...)
+	}
+	return lines
+}
+
+func appendLayerDecisionOverflow(lines []string, omitted, width, maxLines int, th *theme.Theme) []string {
+	if omitted <= 0 || maxLines <= 0 {
+		return lines
+	}
+	notice := markdownpkg.RenderMarkdown(fmt.Sprintf("_%d more blocking failure(s) omitted._", omitted), width, th)
+	if len(notice) > maxLines {
+		return notice[:maxLines]
+	}
+	if len(lines)+len(notice) > maxLines {
+		lines = lines[:max(0, maxLines-len(notice))]
+	}
+	return append(lines, notice...)
+}
+
+func layerDecisionFailureSummary(failure msg.LayerFailedNode) string {
+	name := strings.TrimSpace(failure.NodeName)
+	if name == "" {
+		name = strings.TrimSpace(failure.NodeID)
+	}
+	if name == "" {
+		name = "unknown node"
+	}
+	if agentType := strings.TrimSpace(failure.AgentType); agentType != "" {
+		name += " [" + agentType + "]"
+	}
+	errText := strings.TrimSpace(failure.Error)
+	if errText == "" {
+		errText = "failed with no error details"
+	}
+	return name + ": " + errText
 }
 
 func enforceLineCountToHeight(s string, n int) string {
@@ -14892,7 +15366,7 @@ func (m *AppModel) handleInputHeightTransition() bool {
 	if newInputH == m.prevInputH {
 		return false
 	}
-	if m.commandApproval != nil {
+	if m.commandApproval != nil || m.layerDecision != nil {
 		m.recalcLayout()
 	} else if newInputH > m.prevInputH && m.comp.AllMainSlotsCached() {
 		m.handleInputGrowth(newInputH)
@@ -15104,10 +15578,13 @@ func (m *AppModel) renderDirtySlots() {
 }
 
 func (m *AppModel) inputPanelView() string {
-	if m.commandApproval == nil {
-		return m.input.View(m.cursorVisible)
+	if m.commandApproval != nil {
+		return m.renderCommandApprovalView()
 	}
-	return m.renderCommandApprovalView()
+	if m.layerDecision != nil {
+		return m.renderLayerDecisionView()
+	}
+	return m.input.View(m.cursorVisible)
 }
 
 func (m *AppModel) renderCacheableSlot(id compositor.SlotID, th *theme.Theme) string {
@@ -15629,40 +16106,72 @@ func (m *AppModel) renderLeftPanel(th *theme.Theme) string {
 
 	sessionsFocused := m.focus.IsFocused(component.FocusSessionPanel)
 	agentsFocused := m.focus.IsFocused(component.FocusAgentPanel)
+	sections := m.leftPanelSections
+	if sections.sessionRect.H <= 0 || sections.agentsRect.H <= 0 {
+		sections = computeLeftPanelSections(leftW, leftH, m.agentPanel.SelectorLineCount(), m.sessionPanel.PreferredHeight(max(leftH-panelBorderSize-leftPanelOverhead, 1)))
+	}
 
+	sel := m.agentPanel.RenderSelectorLine()
+	selLines := m.agentPanel.SelectorLineCount()
+	return composeLeftPanelContent(
+		innerW,
+		innerH,
+		sections,
+		m.sessionPanel.View(),
+		m.agentPanel.View(),
+		sessionsFocused,
+		agentsFocused,
+		sel,
+		selLines,
+		th,
+	)
+}
+
+func composeLeftPanelContent(
+	innerW, innerH int,
+	sections leftPanelSections,
+	sessionContent, agentContent string,
+	sessionsFocused, agentsFocused bool,
+	selector string,
+	selectorLines int,
+	th *theme.Theme,
+) string {
 	dividerStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
 	divider := lipgloss.NewStyle().PaddingTop(1).Render(
 		dividerStyle.Render(strings.Repeat("─", innerW)),
 	)
 
+	sessionBody := padLeftPanelBody(sessionContent, max(sections.sessionRect.H, 0))
+	agentBody := padLeftPanelBody(agentContent, max(sections.agentsRect.H, 0))
 	body := strings.Join([]string{
 		sectionHeader("Sessions", innerW, sessionsFocused, th),
-		m.sessionPanel.View(),
+		sessionBody,
 		divider,
 		sectionHeader("Agents", innerW, agentsFocused, th),
-		m.agentPanel.View(),
+		agentBody,
 	}, "\n")
 
-	sel := m.agentPanel.RenderSelectorLine()
-	selLines := m.agentPanel.SelectorLineCount()
-	bodyTarget := innerH - selLines
+	bodyTarget := innerH - selectorLines
 	body = padLeftPanelBody(body, bodyTarget)
-	return body + "\n" + sel
+	return body + "\n" + selector
 }
 
-// padLeftPanelBody pads s to exactly targetLines lines by appending empty lines.
+// padLeftPanelBody pads or clips s to exactly targetLines lines.
 func padLeftPanelBody(s string, targetLines int) string {
 	if targetLines <= 0 {
-		return s
+		return ""
 	}
-	if s == "" {
-		return strings.Repeat("\n", max(targetLines-1, 0))
+	lines := []string{""}
+	if s != "" {
+		lines = strings.Split(s, "\n")
 	}
-	current := strings.Count(s, "\n") + 1
-	if current < targetLines {
-		s += strings.Repeat("\n", targetLines-current)
+	switch {
+	case len(lines) > targetLines:
+		lines = lines[:targetLines]
+	case len(lines) < targetLines:
+		lines = append(lines, make([]string, targetLines-len(lines))...)
 	}
-	return s
+	return strings.Join(lines, "\n")
 }
 
 // sectionHeader renders a label followed by a trailing line.

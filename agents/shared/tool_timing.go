@@ -31,7 +31,7 @@ const maxOutputBytes = 512
 
 // priorityArgKeys are extracted first for compact summaries, in order.
 var priorityArgKeys = [...]string{
-	"path", "file_path", "pattern", "query", "command", "url",
+	"path", "file_path", "pattern", "query", "command", "script", "url",
 	"name", "content", "message",
 }
 

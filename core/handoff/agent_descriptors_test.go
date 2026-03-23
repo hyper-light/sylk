@@ -71,6 +71,21 @@ func TestDescriptorRegistry_Categories(t *testing.T) {
 	}
 }
 
+func TestDescriptorRegistry_ArchitectUsesOpus46(t *testing.T) {
+	r := NewDescriptorRegistry()
+
+	desc, ok := r.Get("architect")
+	if !ok {
+		t.Fatal("missing descriptor for architect")
+	}
+	if desc.ModelID != "claude-opus-4-6" {
+		t.Fatalf("architect ModelID = %q, want %q", desc.ModelID, "claude-opus-4-6")
+	}
+	if desc.ContextWindow != contextWindow200K {
+		t.Fatalf("architect ContextWindow = %d, want %d", desc.ContextWindow, contextWindow200K)
+	}
+}
+
 func TestDescriptorRegistry_Register(t *testing.T) {
 	r := NewDescriptorRegistry()
 

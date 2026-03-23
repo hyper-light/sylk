@@ -145,6 +145,9 @@ func TestValidateTaskExecutionCall_InspectorAllowsValidationToolsButBlocksMutati
 	if !strings.Contains(err.Error(), "must not implement or mutate") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	if err := ValidateTaskExecutionCall(ctx, "inspector-pipeline", "install_dependency_tooling", map[string]any{"summary": "Install tooling"}); err != nil {
+		t.Fatalf("install_dependency_tooling blocked by runtime gate: %v", err)
+	}
 }
 
 func TestValidateTaskExecutionCall_EngineerAllowsReleaseAndReviewResolutionWithoutRuntimeGate(t *testing.T) {

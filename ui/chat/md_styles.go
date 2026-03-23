@@ -8,22 +8,25 @@ import (
 // chatMdStyles holds all lipgloss styles used by the markdown renderer.
 // Constructed once per render call from the theme and base message style.
 type chatMdStyles struct {
-	text        lipgloss.Style    // Base prose (inherited from ChatSource).
-	code        lipgloss.Style    // Inline code spans.
-	bold        lipgloss.Style    // **bold**
-	italic      lipgloss.Style    // *italic*
-	boldItalic  lipgloss.Style    // ***bold italic***
-	link        lipgloss.Style    // [text](url)
-	strike      lipgloss.Style    // ~~strikethrough~~
-	heading     [6]lipgloss.Style // H1–H6
-	h1Rule      lipgloss.Style    // ═ underline for H1
-	h2Rule      lipgloss.Style    // ─ underline for H2
-	bullet      lipgloss.Style    // List bullet/number
-	quoteBar    lipgloss.Style    // │ bar
-	quoteTx     lipgloss.Style    // Blockquote text
-	sep         lipgloss.Style    // Thematic break ─
-	tableHeader lipgloss.Style    // Header row cells
-	tableBorder lipgloss.Style    // Table separators │ ─
+	text           lipgloss.Style    // Base prose (inherited from ChatSource).
+	code           lipgloss.Style    // Inline code spans.
+	bold           lipgloss.Style    // **bold**
+	italic         lipgloss.Style    // *italic*
+	boldItalic     lipgloss.Style    // ***bold italic***
+	link           lipgloss.Style    // [text](url)
+	strike         lipgloss.Style    // ~~strikethrough~~
+	heading        [6]lipgloss.Style // H1–H6
+	h1Rule         lipgloss.Style    // ═ underline for H1
+	h2Rule         lipgloss.Style    // ─ underline for H2
+	bullet         lipgloss.Style    // List bullet/number
+	priorityMust   lipgloss.Style    // [must]
+	priorityShould lipgloss.Style    // [should]
+	priorityCould  lipgloss.Style    // [could]
+	quoteBar       lipgloss.Style    // │ bar
+	quoteTx        lipgloss.Style    // Blockquote text
+	sep            lipgloss.Style    // Thematic break ─
+	tableHeader    lipgloss.Style    // Header row cells
+	tableBorder    lipgloss.Style    // Table separators │ ─
 }
 
 // newChatMdStyles constructs markdown styles from a theme and the base
@@ -70,6 +73,24 @@ func newChatMdStyles(th *theme.Theme, base lipgloss.Style) *chatMdStyles {
 		bullet: lipgloss.NewStyle().
 			Foreground(p.Primary),
 
+		priorityMust: lipgloss.NewStyle().
+			Foreground(p.Background).
+			Background(p.Error).
+			Bold(true).
+			Padding(0, 1),
+
+		priorityShould: lipgloss.NewStyle().
+			Foreground(p.Background).
+			Background(p.Warning).
+			Bold(true).
+			Padding(0, 1),
+
+		priorityCould: lipgloss.NewStyle().
+			Foreground(p.Background).
+			Background(p.Info).
+			Bold(true).
+			Padding(0, 1),
+
 		quoteBar: lipgloss.NewStyle().
 			Foreground(p.Border),
 
@@ -91,12 +112,12 @@ func newChatMdStyles(th *theme.Theme, base lipgloss.Style) *chatMdStyles {
 	// Heading styles: H1 is primary+bold, H2 is secondary+bold,
 	// H3–H6 progressively dimmer.
 	headingColors := [6]lipgloss.Color{
-		p.Primary,   // H1
-		p.Secondary, // H2
-		p.Accent,    // H3
+		p.Primary,    // H1
+		p.Secondary,  // H2
+		p.Accent,     // H3
 		p.Foreground, // H4
-		p.Subtext,   // H5
-		p.Muted,     // H6
+		p.Subtext,    // H5
+		p.Muted,      // H6
 	}
 	for i := range 6 {
 		s.heading[i] = lipgloss.NewStyle().

@@ -2,6 +2,7 @@ package commandapproval
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -32,6 +33,17 @@ func TestAnalyze_GeneralizesWorkspaceMkdir(t *testing.T) {
 	}
 	if first.OutsideWorkspace {
 		t.Fatal("expected inside-workspace mkdir to remain inside workspace")
+	}
+}
+
+func TestSplitCommand_PreservesQuotedWhitespace(t *testing.T) {
+	tokens, err := SplitCommand(`python -c "print('hello world')"`)
+	if err != nil {
+		t.Fatalf("SplitCommand(): %v", err)
+	}
+	want := []string{"python", "-c", "print('hello world')"}
+	if !reflect.DeepEqual(tokens, want) {
+		t.Fatalf("tokens = %#v, want %#v", tokens, want)
 	}
 }
 
@@ -89,6 +101,26 @@ func TestAnalyze_UsesExactPersistRuleForNonGeneralizedCommands(t *testing.T) {
 	}
 }
 
+func TestAnalyze_ExactApprovalPolicyUsesExactRuleKeysOnly(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "workspace", "repo")
+	analysis, err := Analyze(Request{
+		Command:        "echo one && echo two",
+		WorkspaceRoot:  root,
+		ToolName:       "run_shell_script",
+		ApprovalPolicy: ApprovalPolicyExact,
+	})
+	if err != nil {
+		t.Fatalf("Analyze(): %v", err)
+	}
+	if analysis.PersistKey != analysis.ExactKey {
+		t.Fatalf("persist key = %q, want exact key %q", analysis.PersistKey, analysis.ExactKey)
+	}
+	keys := analysis.ruleLookupKeys()
+	if len(keys) != 1 || keys[0] != analysis.ExactKey {
+		t.Fatalf("ruleLookupKeys() = %#v, want only exact key %q", keys, analysis.ExactKey)
+	}
+}
+
 func TestAnalyze_ScopesOutsideRulesByZone(t *testing.T) {
 	root := filepath.Join(string(filepath.Separator), "workspace", "repo")
 	parentA, err := Analyze(Request{
@@ -141,6 +173,21 @@ func TestEvaluator_DefaultPolicy(t *testing.T) {
 	}
 	if prompt.Decision != DecisionPrompt {
 		t.Fatalf("decision = %s, want prompt", prompt.Decision)
+	}
+}
+
+func TestEvaluator_ExactApprovalPolicySkipsBuiltinAllow(t *testing.T) {
+	evaluator := NewEvaluator(nil)
+	eval, err := evaluator.Evaluate(Request{
+		Command:        "go test ./...",
+		WorkspaceRoot:  "/workspace/repo",
+		ApprovalPolicy: ApprovalPolicyExact,
+	})
+	if err != nil {
+		t.Fatalf("Evaluate(): %v", err)
+	}
+	if eval.Decision != DecisionPrompt {
+		t.Fatalf("decision = %s, want prompt", eval.Decision)
 	}
 }
 

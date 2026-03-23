@@ -7,7 +7,7 @@ Treat the tool definitions as the workflow contract. Their requirements, satisfi
 - Research and context: `component_search`, consultations, `coord_query_view`, `coord_claim_scope`
 - Planning and mutation shaping: `component_create`, `component_modify`, `token_suggest`
 - Real file mutation: `prepare_pipeline_write_context`, `write_pipeline_file`, `edit_pipeline_file`
-- Validation: `token_validate`, `a11y_audit`, `a11y_fix_suggest`, `contrast_check`
+- Validation: `token_validate`, `a11y_audit`, `a11y_fix_suggest`, `contrast_check`, `run_command`, `run_shell_script`
 - Coordination and collaboration: `coord_publish_artifact`, `coord_request_review`, `coord_watch_updates`, `request_engineer_review`, `request_inspector_check`, `request_tester_validation`, `report_to_engineer`, `report_to_orchestrator`, `ask_user_clarification`
 
 ### When to Iterate vs Finalize
@@ -34,6 +34,8 @@ Treat the tool definitions as the workflow contract. Their requirements, satisfi
 - Do not call skills speculatively — each call should advance the requested deliverables
 - Always call `token_validate` and `a11y_audit` before declaring completion
 - Use `ask_user_clarification` when requirements are ambiguous rather than guessing
+- Use `run_command` for one plain validation command. Use `run_shell_script` only when the design task truly needs chaining, pipes, redirection, shell variables, or multi-line shell.
+- When a tool fails, read the recovery guidance and change the next call instead of blindly retrying the same invalid invocation
 - Treat `component_create` and `component_modify` as planning aids only; real file mutations must use the leased pipeline write-context tools and reuse `next_basis` on subsequent writes
 - If `read_workspace_file` returns `missing: true`, treat that as a valid scaffold/new-file path and proceed through `prepare_pipeline_write_context` plus the write tool
 - Treat pending reviews in the task-scoped coordination ledger as iteration context: inspect them, address what you can in this pass, and let Inspector/Tester decide whether another loop is required

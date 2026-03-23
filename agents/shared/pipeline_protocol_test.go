@@ -252,11 +252,17 @@ func TestPipelineProtocolSkills_HandoffNextPublishesGuideRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PipelineProtocolSnapshotFromTask: %v", err)
 	}
-	if snapshot == nil || snapshot.PendingChallenge == nil {
-		t.Fatalf("pending challenge = %#v, want value", snapshot)
+	if snapshot == nil {
+		t.Fatalf("snapshot = %#v, want value", snapshot)
 	}
-	if snapshot.PendingChallenge.RequestingAgent != PipelineAgentInspector {
-		t.Fatalf("requesting_agent = %q, want %q", snapshot.PendingChallenge.RequestingAgent, PipelineAgentInspector)
+	if snapshot.PendingChallenge != nil {
+		t.Fatalf("pending challenge = %#v, want nil for handoff_next", snapshot.PendingChallenge)
+	}
+	if snapshot.RequestedBy != PipelineAgentInspector {
+		t.Fatalf("requested_by = %q, want %q", snapshot.RequestedBy, PipelineAgentInspector)
+	}
+	if snapshot.CurrentRequest != "Author the failing tests for the agreed contract." {
+		t.Fatalf("current_request = %q", snapshot.CurrentRequest)
 	}
 	if len(snapshot.ActiveAgents) != 1 || snapshot.ActiveAgents[0] != PipelineAgentTester {
 		t.Fatalf("active_agents = %#v, want tester", snapshot.ActiveAgents)
@@ -408,6 +414,214 @@ func TestPipelineProtocolSkills_ChallengeAgentPublishesGuideRoute(t *testing.T) 
 	}
 	if reroute["new_correlation_id"] != req.CorrelationID {
 		t.Fatalf("new_correlation_id = %q, want %q", reroute["new_correlation_id"], req.CorrelationID)
+	}
+}
+
+func TestBuildPipelineHandoffTasks_HandoffNextClearsPendingChallenge(t *testing.T) {
+	state := NewPipelineProtocolState(&PipelineProtocolSnapshot{
+		Roster: []PipelineProtocolAgent{
+			{AgentType: PipelineAgentInspector},
+			{AgentType: PipelineAgentTester},
+			{AgentType: PipelineAgentEngineer},
+		},
+		ActiveAgents: []string{PipelineAgentTester},
+		RequestedBy:  PipelineAgentInspector,
+		PendingChallenge: &PipelineProtocolChallenge{
+			ID:              "challenge-red-phase",
+			RequestingAgent: PipelineAgentInspector,
+			TargetAgents:    []string{PipelineAgentTester},
+			Request:         "Define the failing test surface and route execution.",
+		},
+	})
+	task := &PipelineTaskInput{
+		TaskID:    "task-auth",
+		AgentType: PipelineAgentTester,
+		Context:   map[string]any{},
+	}
+	action := &PipelineTurnAction{
+		Type:             PipelineProtocolActionHandoff,
+		AgentType:        PipelineAgentTester,
+		TargetAgents:     []string{PipelineAgentEngineer},
+		Mode:             PipelineTurnModeSingle,
+		Reason:           "Implementation should proceed against the red tests.",
+		Request:          "Implement the auth fix and satisfy the failing test.",
+		CreatesChallenge: false,
+	}
+
+	tasks, err := buildPipelineHandoffTasks(state, task, action)
+	if err != nil {
+		t.Fatalf("buildPipelineHandoffTasks error = %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("task count = %d, want 1", len(tasks))
+	}
+
+	snapshot, err := PipelineProtocolSnapshotFromTask(tasks[0])
+	if err != nil {
+		t.Fatalf("PipelineProtocolSnapshotFromTask: %v", err)
+	}
+	if snapshot == nil {
+		t.Fatalf("snapshot = %#v, want value", snapshot)
+	}
+	if snapshot.PendingChallenge != nil {
+		t.Fatalf("pending challenge = %#v, want nil", snapshot.PendingChallenge)
+	}
+	if snapshot.RequestedBy != PipelineAgentTester {
+		t.Fatalf("requested_by = %q, want %q", snapshot.RequestedBy, PipelineAgentTester)
+	}
+}
+
+func TestBuildPipelineHandoffTasks_ChallengeAgentCreatesPendingChallenge(t *testing.T) {
+	state := NewPipelineProtocolState(&PipelineProtocolSnapshot{
+		Roster: []PipelineProtocolAgent{
+			{AgentType: PipelineAgentInspector},
+			{AgentType: PipelineAgentTester},
+			{AgentType: PipelineAgentEngineer},
+		},
+		ActiveAgents: []string{PipelineAgentTester},
+	})
+	task := &PipelineTaskInput{
+		TaskID:    "task-auth",
+		AgentType: PipelineAgentTester,
+		Context:   map[string]any{},
+	}
+	action := &PipelineTurnAction{
+		Type:             PipelineProtocolActionHandoff,
+		AgentType:        PipelineAgentTester,
+		TargetAgents:     []string{PipelineAgentEngineer},
+		Mode:             PipelineTurnModeSingle,
+		Reason:           "Tester is explicitly requesting another engineer pass.",
+		Request:          "Adjust the implementation for the missing edge case.",
+		CreatesChallenge: true,
+		ChallengeID:      "challenge-tester",
+	}
+
+	tasks, err := buildPipelineHandoffTasks(state, task, action)
+	if err != nil {
+		t.Fatalf("buildPipelineHandoffTasks error = %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("task count = %d, want 1", len(tasks))
+	}
+
+	snapshot, err := PipelineProtocolSnapshotFromTask(tasks[0])
+	if err != nil {
+		t.Fatalf("PipelineProtocolSnapshotFromTask: %v", err)
+	}
+	if snapshot == nil || snapshot.PendingChallenge == nil {
+		t.Fatalf("pending challenge = %#v, want value", snapshot)
+	}
+	if snapshot.PendingChallenge.RequestingAgent != PipelineAgentTester {
+		t.Fatalf("requesting_agent = %q, want %q", snapshot.PendingChallenge.RequestingAgent, PipelineAgentTester)
+	}
+}
+
+func TestBuildPipelineHandoffTasks_CompactsProtocolSnapshotForTaskPayload(t *testing.T) {
+	state := NewPipelineProtocolState(&PipelineProtocolSnapshot{
+		Roster: []PipelineProtocolAgent{
+			{AgentType: PipelineAgentInspector},
+			{AgentType: PipelineAgentTester},
+			{AgentType: PipelineAgentEngineer},
+		},
+		ActiveAgents: []string{PipelineAgentInspector},
+	})
+	task := &PipelineTaskInput{
+		TaskID:    "task-compact",
+		AgentType: PipelineAgentInspector,
+		Context:   map[string]any{},
+	}
+	longReason := strings.Repeat("reason ", 200)
+	longRequest := strings.Repeat("request ", 400)
+	action := &PipelineTurnAction{
+		Type:             PipelineProtocolActionHandoff,
+		AgentType:        PipelineAgentInspector,
+		TargetAgents:     []string{PipelineAgentTester},
+		Mode:             PipelineTurnModeSingle,
+		Reason:           longReason,
+		Request:          longRequest,
+		CreatesChallenge: true,
+		ChallengeID:      "challenge-compact",
+	}
+
+	tasks, err := buildPipelineHandoffTasks(state, task, action)
+	if err != nil {
+		t.Fatalf("buildPipelineHandoffTasks error = %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("task count = %d, want 1", len(tasks))
+	}
+
+	snapshot, err := PipelineProtocolSnapshotFromTask(tasks[0])
+	if err != nil {
+		t.Fatalf("PipelineProtocolSnapshotFromTask: %v", err)
+	}
+	if snapshot == nil || snapshot.PendingChallenge == nil {
+		t.Fatalf("snapshot = %#v, want pending challenge", snapshot)
+	}
+	if got := len(snapshot.CurrentRequest); got > maxPipelineProtocolRequestLen {
+		t.Fatalf("current_request len = %d, want <= %d", got, maxPipelineProtocolRequestLen)
+	}
+	if got := len(snapshot.PendingChallenge.Reason); got > maxPipelineProtocolReasonLen {
+		t.Fatalf("challenge reason len = %d, want <= %d", got, maxPipelineProtocolReasonLen)
+	}
+	if got := len(snapshot.PendingChallenge.Request); got > maxPipelineProtocolRequestLen {
+		t.Fatalf("challenge request len = %d, want <= %d", got, maxPipelineProtocolRequestLen)
+	}
+	if len(snapshot.RecentEvents) == 0 {
+		t.Fatal("expected recent protocol event")
+	}
+	if got := len(snapshot.RecentEvents[len(snapshot.RecentEvents)-1].Summary); got > maxPipelineProtocolEventSummaryLen {
+		t.Fatalf("recent event summary len = %d, want <= %d", got, maxPipelineProtocolEventSummaryLen)
+	}
+}
+
+func TestBuildPipelineValidationTask_CompactsValidationSummaryForTaskPayload(t *testing.T) {
+	state := NewPipelineProtocolState(&PipelineProtocolSnapshot{
+		Roster: []PipelineProtocolAgent{
+			{AgentType: PipelineAgentInspector},
+			{AgentType: PipelineAgentTester},
+		},
+		ActiveAgents: []string{PipelineAgentTester},
+	})
+	task := &PipelineTaskInput{
+		TaskID:    "task-validate-compact",
+		AgentType: PipelineAgentTester,
+		Context:   map[string]any{},
+	}
+	record := &PipelineValidationRecord{
+		ChallengeID:         "challenge-1",
+		RequestingAgent:     PipelineAgentInspector,
+		RespondingAgent:     PipelineAgentTester,
+		Status:              string(PipelineValidationPassed),
+		Summary:             strings.Repeat("summary ", 400),
+		ChallengeRequest:    strings.Repeat("request ", 300),
+		ChallengeReferences: []string{strings.Repeat("ref", 120)},
+		EvidenceRefs:        []string{strings.Repeat("evidence", 80)},
+	}
+
+	next, err := buildPipelineValidationTask(state, task, record)
+	if err != nil {
+		t.Fatalf("buildPipelineValidationTask error = %v", err)
+	}
+
+	snapshot, err := PipelineProtocolSnapshotFromTask(next)
+	if err != nil {
+		t.Fatalf("PipelineProtocolSnapshotFromTask: %v", err)
+	}
+	if snapshot == nil || snapshot.PendingValidation == nil {
+		t.Fatalf("snapshot = %#v, want pending validation", snapshot)
+	}
+	if got := len(snapshot.PendingValidation.Summary); got > maxPipelineProtocolSummaryLen {
+		t.Fatalf("validation summary len = %d, want <= %d", got, maxPipelineProtocolSummaryLen)
+	}
+	if got := len(snapshot.PendingValidation.ChallengeRequest); got > maxPipelineProtocolRequestLen {
+		t.Fatalf("challenge request len = %d, want <= %d", got, maxPipelineProtocolRequestLen)
+	}
+	if len(snapshot.PendingValidation.ChallengeReferences) != 1 || len(snapshot.PendingValidation.ChallengeReferences[0]) > maxPipelineProtocolReferenceLen {
+		t.Fatalf("challenge references = %#v, want compact values", snapshot.PendingValidation.ChallengeReferences)
+	}
+	if len(snapshot.PendingValidation.EvidenceRefs) != 1 || len(snapshot.PendingValidation.EvidenceRefs[0]) > maxPipelineProtocolReferenceLen {
+		t.Fatalf("evidence refs = %#v, want compact values", snapshot.PendingValidation.EvidenceRefs)
 	}
 }
 
@@ -698,6 +912,15 @@ func TestPipelineProtocolSkills_FinalizePipelineChallengesTester(t *testing.T) {
 	if snapshot == nil || snapshot.PendingChallenge == nil {
 		t.Fatalf("pending challenge = %#v, want value", snapshot)
 	}
+	if snapshot.AuditLock == nil {
+		t.Fatalf("audit_lock = %#v, want value", snapshot.AuditLock)
+	}
+	if snapshot.AuditLock.OwnerAgent != PipelineAgentInspector {
+		t.Fatalf("audit_lock.owner_agent = %q, want %q", snapshot.AuditLock.OwnerAgent, PipelineAgentInspector)
+	}
+	if snapshot.AuditLock.Phase != PipelineAuditPhaseFinalizing {
+		t.Fatalf("audit_lock.phase = %q, want %q", snapshot.AuditLock.Phase, PipelineAuditPhaseFinalizing)
+	}
 	if !containsNormalizedString(snapshot.PendingChallenge.References, finalizePipelineVerificationReference) {
 		t.Fatalf("challenge references = %#v, want finalize marker", snapshot.PendingChallenge.References)
 	}
@@ -719,6 +942,117 @@ func TestPipelineProtocolSkills_FinalizePipelineChallengesTester(t *testing.T) {
 	}
 	if update["status"] != "running" {
 		t.Fatalf("status = %#v, want running", update["status"])
+	}
+}
+
+func TestPipelineProtocolSkills_ChallengeAgentToInspectorRefusedDuringAuditLock(t *testing.T) {
+	task := &PipelineTaskInput{
+		TaskID:    "task-audit-lock",
+		AgentType: PipelineAgentTester,
+		Prompt:    "Challenge inspector during audit lock.",
+		Context: map[string]any{
+			"pipeline_stage": "test",
+			"pipeline_protocol": PipelineProtocolSnapshotMap(&PipelineProtocolSnapshot{
+				Roster: []PipelineProtocolAgent{
+					{AgentType: PipelineAgentInspector},
+					{AgentType: PipelineAgentTester},
+					{AgentType: PipelineAgentEngineer},
+				},
+				ActiveAgents:   []string{PipelineAgentTester},
+				RequestedBy:    PipelineAgentInspector,
+				CurrentRequest: "Audit the implementation and return validation evidence.",
+				AuditLock: &PipelineAuditLock{
+					OwnerAgent: PipelineAgentInspector,
+					Phase:      PipelineAuditPhaseFinalizing,
+					Reason:     "Inspector is conducting terminal audit review.",
+				},
+			}),
+		},
+	}
+	ctx := WithPipelineTaskProtocolState(context.Background(), task)
+	ctx = WithTaskExecutionContract(ctx, &TaskExecutionContract{RuntimeAgentType: PipelineAgentTester})
+
+	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
+		AgentType: func() string { return PipelineAgentTester },
+	})
+
+	result, err := callSkill(t, ctx, skills, "challenge_agent", map[string]any{
+		"target_agents": []string{"inspector"},
+		"reason":        "Need clarification before continuing.",
+		"request":       "Clarify whether the flaky case is in scope.",
+	})
+	if err != nil {
+		t.Fatalf("challenge_agent error = %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	if resultMap == nil || resultMap["refused"] != true {
+		t.Fatalf("challenge_agent result = %#v, want refused=true", result)
+	}
+	if resultMap["refused_by"] != PipelineAgentInspector {
+		t.Fatalf("refused_by = %#v, want %q", resultMap["refused_by"], PipelineAgentInspector)
+	}
+	if resultMap["audit_phase"] != PipelineAuditPhaseFinalizing {
+		t.Fatalf("audit_phase = %#v, want %q", resultMap["audit_phase"], PipelineAuditPhaseFinalizing)
+	}
+	if resultMap["must_wait"] != true {
+		t.Fatalf("must_wait = %#v, want true", resultMap["must_wait"])
+	}
+
+	state := PipelineProtocolStateFromContext(ctx)
+	if state == nil {
+		t.Fatal("pipeline protocol state missing from context")
+	}
+	action := state.TerminalAction()
+	if action == nil || action.Type != PipelineProtocolActionRefusal {
+		t.Fatalf("terminal action = %#v, want refusal", action)
+	}
+}
+
+func TestBuildPipelineHandoffTasks_PreservesAuditLockAcrossWorkerHandoff(t *testing.T) {
+	state := NewPipelineProtocolState(&PipelineProtocolSnapshot{
+		Roster: []PipelineProtocolAgent{
+			{AgentType: PipelineAgentInspector},
+			{AgentType: PipelineAgentTester},
+			{AgentType: PipelineAgentEngineer},
+		},
+		ActiveAgents: []string{PipelineAgentTester},
+		AuditLock: &PipelineAuditLock{
+			OwnerAgent: PipelineAgentInspector,
+			Phase:      PipelineAuditPhaseFinalizing,
+			Reason:     "Inspector is conducting terminal audit review.",
+		},
+	})
+	task := &PipelineTaskInput{
+		TaskID:    "task-auth",
+		AgentType: PipelineAgentTester,
+		Context:   map[string]any{},
+	}
+	action := &PipelineTurnAction{
+		Type:         PipelineProtocolActionHandoff,
+		AgentType:    PipelineAgentTester,
+		TargetAgents: []string{PipelineAgentEngineer},
+		Mode:         PipelineTurnModeSingle,
+		Reason:       "Need an implementation follow-up before the tester can complete the audit evidence.",
+		Request:      "Address the failing edge case under audit.",
+	}
+
+	tasks, err := buildPipelineHandoffTasks(state, task, action)
+	if err != nil {
+		t.Fatalf("buildPipelineHandoffTasks error = %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("task count = %d, want 1", len(tasks))
+	}
+
+	snapshot, err := PipelineProtocolSnapshotFromTask(tasks[0])
+	if err != nil {
+		t.Fatalf("PipelineProtocolSnapshotFromTask: %v", err)
+	}
+	if snapshot == nil || snapshot.AuditLock == nil {
+		t.Fatalf("audit_lock = %#v, want value", snapshot)
+	}
+	if snapshot.AuditLock.Phase != PipelineAuditPhaseFinalizing {
+		t.Fatalf("audit_lock.phase = %q, want %q", snapshot.AuditLock.Phase, PipelineAuditPhaseFinalizing)
 	}
 }
 
@@ -796,6 +1130,12 @@ func TestPipelineProtocolSkills_FinalizePipelineSignalsReadinessAndHandoffToOTPu
 	}
 	if resultMap["finalize_pipeline"] != true {
 		t.Fatalf("finalize_pipeline result = %#v, want finalize_pipeline=true after passing tester audit", result)
+	}
+	if resultMap["must_handoff_to_ot"] != true {
+		t.Fatalf("finalize_pipeline result = %#v, want must_handoff_to_ot=true", result)
+	}
+	if resultMap["next_required_action"] != "handoff_to_ot" {
+		t.Fatalf("finalize_pipeline result = %#v, want next_required_action=handoff_to_ot", result)
 	}
 
 	state := PipelineProtocolStateFromContext(ctx)

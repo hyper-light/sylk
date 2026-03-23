@@ -136,6 +136,12 @@ type ExecutionPolicy struct {
 	RetryBackoff time.Duration
 }
 
+// NoTimeout disables the fixed per-node execution deadline.
+//
+// A node using NoTimeout still participates in DAG cancellation; it simply
+// opts out of the generic node timeout window.
+const NoTimeout time.Duration = -1
+
 // DefaultExecutionPolicy returns sensible defaults
 func DefaultExecutionPolicy() ExecutionPolicy {
 	return ExecutionPolicy{

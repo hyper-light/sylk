@@ -22,6 +22,8 @@ func TestEngineerBuildToolDefinitions_IncludeDiscoveryAndQualityTools(t *testing
 		"search_skills",
 		"discover_project_tools",
 		"discover_code_patterns",
+		"research_dependency_install",
+		"install_dependency_tooling",
 		"lsp",
 		"format",
 		"lint",

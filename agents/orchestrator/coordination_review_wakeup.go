@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/pipeline/coordination"
 )
 
@@ -37,6 +38,17 @@ func (o *Orchestrator) publishReviewWakeBestEffort(ctx context.Context, review *
 		})
 		return
 	}
+	o.publishStandaloneAgentActivity(
+		review.ReviewerType,
+		fmt.Sprintf("Pending coordination review for task %s", strings.TrimSpace(review.TaskID)),
+		events.VisibilityAgent,
+		map[string]any{
+			"task_id":     strings.TrimSpace(review.TaskID),
+			"review_id":   strings.TrimSpace(review.ID),
+			"artifact_id": strings.TrimSpace(review.ArtifactID),
+			"source":      "coordination_review_wakeup",
+		},
+	)
 	o.logTrace("coordination_review_wakeup_published", agentlog.EventTaskDispatched, map[string]any{
 		"task_id":         strings.TrimSpace(review.TaskID),
 		"review_id":       strings.TrimSpace(review.ID),
@@ -91,12 +103,12 @@ func reviewWakeMessage(task *PipelineTask, review *coordination.Review, sourceAg
 		SessionID:       task.SessionID,
 		Timestamp:       time.Now(),
 		Metadata: map[string]any{
-			"task_id":                   task.TaskID,
-			"dag_id":                    task.DAGID,
-			"node_id":                   task.NodeID,
-			"agent_type":                task.AgentType,
-			"review_id":                 strings.TrimSpace(review.ID),
-			"artifact_id":               strings.TrimSpace(review.ArtifactID),
+			"task_id":                    task.TaskID,
+			"dag_id":                     task.DAGID,
+			"node_id":                    task.NodeID,
+			"agent_type":                 task.AgentType,
+			"review_id":                  strings.TrimSpace(review.ID),
+			"artifact_id":                strings.TrimSpace(review.ArtifactID),
 			"coordination_review_wakeup": true,
 		},
 	}
@@ -145,10 +157,10 @@ func reviewWakeContextData(
 	artifact *coordination.Artifact,
 ) map[string]any {
 	contextData := map[string]any{
-		"pipeline_stage":   "review",
-		"agent_type":       strings.TrimSpace(review.ReviewerType),
-		"task_name":        firstNonEmptyTaskName(viewResult.View.TaskName),
-		"review_request":   review,
+		"pipeline_stage":    "review",
+		"agent_type":        strings.TrimSpace(review.ReviewerType),
+		"task_name":         firstNonEmptyTaskName(viewResult.View.TaskName),
+		"review_request":    review,
 		"coordination_view": viewResult.View,
 	}
 	if viewResult.Packet != nil {

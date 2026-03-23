@@ -213,6 +213,9 @@ func validateAnthropicOAuthConfig(config *AnthropicConfig) error {
 func buildAnthropicClientOptions(config AnthropicConfig) []option.RequestOption {
 	opts := []option.RequestOption{
 		buildAnthropicAuthOption(config),
+		// Provider-level retry logic is the single retry authority so we can
+		// enforce 500-only retries and emit accurate retry telemetry.
+		option.WithMaxRetries(0),
 	}
 	if config.BaseURL != "" {
 		opts = append(opts, option.WithBaseURL(config.BaseURL))
@@ -406,7 +409,7 @@ func (p *AnthropicProvider) Generate(ctx context.Context, req *Request) (*Respon
 }
 
 func (p *AnthropicProvider) generateWithRetry(ctx context.Context, req *Request) (*Response, error) {
-	return retryGenerate(ctx, p.config.BaseConfig, func(ctx context.Context) (*Response, error) {
+	return retryAnthropicInternalServerGenerate(ctx, p.config.BaseConfig, func(ctx context.Context) (*Response, error) {
 		return p.generateOnce(ctx, req)
 	})
 }
@@ -435,7 +438,7 @@ func (p *AnthropicProvider) StreamWithHandler(ctx context.Context, req *Request,
 }
 
 func (p *AnthropicProvider) streamWithRetry(ctx context.Context, req *Request, handler StreamHandler) error {
-	return retryStream(ctx, p.config.BaseConfig, func(ctx context.Context) error {
+	return retryAnthropicInternalServerStream(ctx, p.config.BaseConfig, func(ctx context.Context) error {
 		return p.streamWithHandlerOnce(ctx, req, handler)
 	})
 }

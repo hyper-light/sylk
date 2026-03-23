@@ -70,15 +70,14 @@ var _ dag.NodeDispatcher = (*BusNodeDispatcher)(nil)
 // no demotion guards). Both may be nil for test scenarios.
 func NewBusNodeDispatcher(bus guide.EventBus, agentID, sessionID, dagID string, buffers *BufferRegistry, activator guide.PodActivator, pod *shared.AgentPod) *BusNodeDispatcher {
 	return &BusNodeDispatcher{
-		bus:           bus,
-		agentID:       agentID,
-		sessionID:     sessionID,
-		dagID:         dagID,
-		buffers:       buffers,
-		activator:     activator,
-		pod:           pod,
-		ackTimeout:    defaultACKTimeout,
-		activityGrace: time.Minute,
+		bus:        bus,
+		agentID:    agentID,
+		sessionID:  sessionID,
+		dagID:      dagID,
+		buffers:    buffers,
+		activator:  activator,
+		pod:        pod,
+		ackTimeout: defaultACKTimeout,
 	}
 }
 
@@ -128,6 +127,7 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	ch := make(chan *dag.NodeResult, 1)
 	done := make(chan struct{})
 	ackCh := make(chan *ACKResult, 1)
+	activityWindow := d.nodeActivityWindow(ctx)
 	d.pending.Store(node.ID(), ch)
 	d.dispatchDone.Store(node.ID(), done)
 	d.ackWaiters.Store(node.ID(), ackCh)
@@ -190,42 +190,40 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 		"ack_agent_type": ack.AgentType,
 	})
 
-	// Phase 2: Wait for result. Once a node is acked, recent activity keeps the
-	// lease alive so an active worker is not duplicated solely due to the
-	// original dispatch deadline elapsing.
-	for {
-		select {
-		case result := <-ch:
-			if result != nil {
-				d.logNodeTrace(node, "dispatch_result_received", agentlog.EventNodeCompleted, map[string]any{
-					"result_state": result.State.String(),
-				})
-			}
-			return result, nil
-		case <-ctx.Done():
-			if !d.hasRecentActivity(node.ID()) {
-				d.logNodeTrace(node, "dispatch_context_done", agentlog.EventError, map[string]any{
-					"error": ctx.Err().Error(),
-				})
-				return nil, ctx.Err()
-			}
-			d.logNodeTrace(node, "dispatch_context_lease_extended", agentlog.EventTaskDispatched, map[string]any{
-				"error":             ctx.Err().Error(),
-				"activity_grace_ms": d.activityGrace.Milliseconds(),
-			})
-			if result := d.waitForActivityOrResult(ch, node.ID(), node); result != nil {
-				return result, nil
-			}
-			d.logNodeTrace(node, "dispatch_context_done", agentlog.EventError, map[string]any{
-				"error": ctx.Err().Error(),
-			})
-			return nil, ctx.Err()
-		}
-	}
+	// Phase 2: Wait for result while enforcing an inactivity lease. Pipeline
+	// activity keeps the node alive; silence expires it even when the context
+	// itself has no deadline.
+	return d.waitForNodeResult(ctx, ch, node, activityWindow)
 }
 
-func (d *BusNodeDispatcher) waitForActivityOrResult(ch <-chan *dag.NodeResult, nodeID string, node *dag.Node) *dag.NodeResult {
-	ticker := time.NewTicker(max(d.activityGrace/2, time.Second))
+func (d *BusNodeDispatcher) nodeActivityWindow(ctx context.Context) time.Duration {
+	activityWindow := d.activityGrace
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 {
+			if remaining > activityWindow {
+				activityWindow = remaining
+			}
+		}
+	}
+	if activityWindow > 0 {
+		return activityWindow
+	}
+	return time.Minute
+}
+
+func (d *BusNodeDispatcher) waitForNodeResult(
+	ctx context.Context,
+	ch <-chan *dag.NodeResult,
+	node *dag.Node,
+	activityWindow time.Duration,
+) (*dag.NodeResult, error) {
+	nodeID := ""
+	if node != nil {
+		nodeID = node.ID()
+	}
+	ctxDone := ctx.Done()
+	deadlineExtended := false
+	ticker := time.NewTicker(activityPollEvery(activityWindow))
 	defer ticker.Stop()
 
 	for {
@@ -236,13 +234,51 @@ func (d *BusNodeDispatcher) waitForActivityOrResult(ch <-chan *dag.NodeResult, n
 					"result_state": result.State.String(),
 				})
 			}
-			return result
+			return result, nil
 		case <-ticker.C:
-			if !d.hasRecentActivity(nodeID) {
-				return nil
+			if d.hasRecentActivityWithin(nodeID, activityWindow) {
+				continue
+			}
+			d.logNodeTrace(node, "dispatch_inactivity_timeout", agentlog.EventError, map[string]any{
+				"activity_grace_ms": activityWindow.Milliseconds(),
+			})
+			return nil, context.DeadlineExceeded
+		case <-ctxDone:
+			if err := ctx.Err(); err != nil {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					d.logNodeTrace(node, "dispatch_context_done", agentlog.EventError, map[string]any{
+						"error": err.Error(),
+					})
+					return nil, err
+				}
+				if !d.hasRecentActivityWithin(nodeID, activityWindow) {
+					d.logNodeTrace(node, "dispatch_context_done", agentlog.EventError, map[string]any{
+						"error": err.Error(),
+					})
+					return nil, err
+				}
+				if !deadlineExtended {
+					d.logNodeTrace(node, "dispatch_context_lease_extended", agentlog.EventTaskDispatched, map[string]any{
+						"error":             err.Error(),
+						"activity_grace_ms": activityWindow.Milliseconds(),
+					})
+					deadlineExtended = true
+				}
+				ctxDone = nil
 			}
 		}
 	}
+}
+
+func activityPollEvery(activityWindow time.Duration) time.Duration {
+	tickEvery := activityWindow / 2
+	if tickEvery <= 0 {
+		tickEvery = time.Second
+	}
+	if tickEvery > time.Second {
+		tickEvery = time.Second
+	}
+	return tickEvery
 }
 
 func (d *BusNodeDispatcher) RecordActivity(nodeID string) {
@@ -254,6 +290,13 @@ func (d *BusNodeDispatcher) RecordActivity(nodeID string) {
 }
 
 func (d *BusNodeDispatcher) hasRecentActivity(nodeID string) bool {
+	return d.hasRecentActivityWithin(nodeID, d.activityGrace)
+}
+
+func (d *BusNodeDispatcher) hasRecentActivityWithin(nodeID string, activityWindow time.Duration) bool {
+	if activityWindow <= 0 {
+		activityWindow = time.Minute
+	}
 	val, ok := d.lastActivity.Load(strings.TrimSpace(nodeID))
 	if !ok {
 		return false
@@ -262,7 +305,7 @@ func (d *BusNodeDispatcher) hasRecentActivity(nodeID string) bool {
 	if !ok {
 		return false
 	}
-	return time.Since(ts) <= d.activityGrace
+	return time.Since(ts) <= activityWindow
 }
 
 // dispatchAndWaitACK publishes the task dispatch and waits for ACK.

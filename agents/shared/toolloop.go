@@ -2,10 +2,13 @@ package shared
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/purevfs"
 )
 
 // MaxConsecutiveToolErrors is the threshold of consecutive all-error tool-call
@@ -53,13 +56,24 @@ func ToolErrorPayload(err error) string {
 	if err == nil {
 		return ""
 	}
-	payload, marshalErr := json.Marshal(map[string]any{
+	detail := toolErrorDetail(err)
+	payload := map[string]any{
 		"error": strings.TrimSpace(err.Error()),
-	})
+	}
+	if detail.Kind != "" {
+		payload["error_kind"] = detail.Kind
+	}
+	if len(detail.Recovery) > 0 {
+		payload["recovery"] = append([]string(nil), detail.Recovery...)
+	}
+	if detail.Retryable {
+		payload["retryable"] = true
+	}
+	payloadJSON, marshalErr := json.Marshal(payload)
 	if marshalErr != nil {
 		return `{"error":"tool execution failed"}`
 	}
-	return string(payload)
+	return string(payloadJSON)
 }
 
 // CoerceMap converts an arbitrary value to map[string]any via JSON round-trip.
@@ -274,4 +288,101 @@ func UpdateToolErrors(current, errCount, totalCalls int) int {
 		return current + 1
 	}
 	return 0
+}
+
+type toolErrorDetailPayload struct {
+	Kind      string
+	Retryable bool
+	Recovery  []string
+}
+
+func toolErrorDetail(err error) toolErrorDetailPayload {
+	if err == nil {
+		return toolErrorDetailPayload{}
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(message, "only accepts one plain command"),
+		strings.Contains(message, "shell control operators are not allowed in run_command"):
+		return toolErrorDetailPayload{
+			Kind: "single_command_only",
+			Recovery: []string{
+				"Use working_dir instead of cd when you only need a different directory",
+				"Split chained work into separate run_command calls",
+				"Use run_shell_script for &&, ||, ;, pipes, redirection, shell variables, or multi-line shell",
+			},
+		}
+	case strings.Contains(message, staleWriteBasisMarker),
+		strings.Contains(message, basisPathMismatchMarker):
+		return toolErrorDetailPayload{
+			Kind:      "stale_write_basis",
+			Retryable: true,
+			Recovery: []string{
+				"Rerun the matching prepare write-context tool for the target path",
+				"Retry the write/edit/delete call with the refreshed basis instead of repeating the stale invocation",
+			},
+		}
+	case errors.Is(err, purevfs.ErrStrictExecutionUnavailable):
+		return toolErrorDetailPayload{
+			Kind: "strict_execution_unavailable",
+			Recovery: []string{
+				"Use a simpler command, a dedicated higher-level tool, or a workspace mode that supports strict broker execution",
+			},
+		}
+	case errors.Is(err, commandapproval.ErrApprovalRequired):
+		return toolErrorDetailPayload{
+			Kind: "approval_required",
+			Recovery: []string{
+				"Wait for Guardian approval or choose a less sensitive command that fits the pre-approved path",
+			},
+		}
+	default:
+		return toolErrorDetailPayload{}
+	}
+}
+
+func ToolRecoveryHint(toolName string, err error) string {
+	detail := toolErrorDetail(err)
+	if len(detail.Recovery) == 0 {
+		return ""
+	}
+	toolName = strings.TrimSpace(toolName)
+	prefix := "Adapt after the failed tool call"
+	if toolName != "" {
+		prefix = "Adapt after the failed " + toolName + " call"
+	}
+	return prefix + ": " + strings.Join(detail.Recovery, "; ") + ". Do not repeat the same invalid invocation."
+}
+
+func AppendToolRecoveryMessage(req *providers.Request, hints []string) {
+	if req == nil || len(hints) == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(hints))
+	unique := make([]string, 0, len(hints))
+	for _, hint := range hints {
+		hint = strings.TrimSpace(hint)
+		if hint == "" {
+			continue
+		}
+		if _, ok := seen[hint]; ok {
+			continue
+		}
+		seen[hint] = struct{}{}
+		unique = append(unique, hint)
+	}
+	if len(unique) == 0 {
+		return
+	}
+	var builder strings.Builder
+	builder.WriteString("Tool recovery guidance:\n")
+	for _, hint := range unique {
+		builder.WriteString("- ")
+		builder.WriteString(hint)
+		builder.WriteString("\n")
+	}
+	req.Messages = append(req.Messages, providers.Message{
+		Role:    providers.RoleUser,
+		Content: strings.TrimSpace(builder.String()),
+	})
 }

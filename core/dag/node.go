@@ -139,6 +139,13 @@ func (n *Node) Timeout() time.Duration {
 	return n.timeout
 }
 
+// SetTimeout updates the node timeout.
+func (n *Node) SetTimeout(timeout time.Duration) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.timeout = timeout
+}
+
 // Retries returns the maximum retry count
 func (n *Node) Retries() int {
 	n.mu.RLock()

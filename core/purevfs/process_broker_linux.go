@@ -367,7 +367,7 @@ func linuxSandboxArgs(req BrokerRunRequest, mountRoot string) []string {
 func linuxProjectionBinds(plan ExecutionPlan, mountRoot string) []string {
 	builder := newLinuxBindBuilder()
 	for _, mount := range plan.Mounts {
-		if mount.Kind == MountToolchain {
+		if !linuxProjectedMountAvailable(mount) {
 			continue
 		}
 		src := mountedExecPath(mountRoot, mount.VirtualPath)
@@ -430,17 +430,39 @@ func linuxMountReadOnly(mount MountSpec) bool {
 
 func linuxExecutionEnv(plan ExecutionPlan, extra map[string]string) []string {
 	env := baseExecutionEnv()
-	for key, value := range plan.Env {
-		env[key] = value
-	}
-	for key, value := range extra {
-		env[key] = value
-	}
+	mergeLinuxExecutionEnv(env, plan.Env)
+	mergeLinuxExecutionEnv(env, extra)
 	out := make([]string, 0, len(env))
 	for key, value := range env {
 		out = append(out, key+"="+value)
 	}
 	return out
+}
+
+func mergeLinuxExecutionEnv(dst map[string]string, values map[string]string) {
+	for key, value := range values {
+		if isPathListKey(key) {
+			dst[key] = mergeExecutionPathList(dst[key], value)
+			continue
+		}
+		dst[key] = value
+	}
+}
+
+func linuxProjectedMountAvailable(mount MountSpec) bool {
+	if mount.Kind != MountToolchain {
+		return true
+	}
+	path := strings.TrimSpace(mount.BackingPath)
+	if path == "" {
+		return false
+	}
+	if filepath.IsAbs(path) {
+		info, err := os.Stat(path)
+		return err == nil && !info.IsDir()
+	}
+	_, err := exec.LookPath(path)
+	return err == nil
 }
 
 type linuxBindBuilder struct {

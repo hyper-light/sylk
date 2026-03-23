@@ -1,11 +1,13 @@
 package bridge
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/commandapproval"
+	"github.com/adalundhe/sylk/core/providers"
 	uimsg "github.com/adalundhe/sylk/ui/msg"
 )
 
@@ -66,6 +68,42 @@ func TestGuideBridgeDispatch_ForwardsCommandApprovalProposal(t *testing.T) {
 	}
 	if request.Proposal == nil || request.Proposal.Command != proposal.Command {
 		t.Fatalf("expected proposal command %q, got %#v", proposal.Command, request.Proposal)
+	}
+}
+
+func TestGuideBridgeDispatch_ForwardsLayerDecisionRequest(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatch(&guide.Message{
+		CorrelationID: "decision-1",
+		Type:          guide.MessageTypeLayerDecision,
+		Payload: map[string]any{
+			"dag_id":    "dag-1",
+			"layer_idx": 2,
+			"failed_nodes": []any{
+				map[string]any{
+					"node_id":    "node-1",
+					"node_name":  "tester-pipeline",
+					"agent_type": "tester-pipeline",
+					"error":      "tests failed",
+				},
+			},
+		},
+	}, program)
+
+	if len(program.messages) != 1 {
+		t.Fatalf("expected 1 forwarded message, got %d", len(program.messages))
+	}
+	request, ok := program.messages[0].(uimsg.LayerDecisionMsg)
+	if !ok {
+		t.Fatalf("expected LayerDecisionMsg, got %T", program.messages[0])
+	}
+	if request.DAGID != "dag-1" || request.LayerIdx != 2 {
+		t.Fatalf("unexpected layer decision payload: %#v", request)
+	}
+	if len(request.FailedNodes) != 1 || request.FailedNodes[0].Error != "tests failed" {
+		t.Fatalf("unexpected failed node payload: %#v", request.FailedNodes)
 	}
 }
 
@@ -218,6 +256,33 @@ func TestToGuideMsg_HumanizesTesterStagePayload(t *testing.T) {
 	}
 	if !strings.Contains(msg.Content, "Latest test run: 0 passed, 1 failed, 0 skipped, 0 errors out of 1.") {
 		t.Fatalf("expected suite summary, got %q", msg.Content)
+	}
+}
+
+func TestParsePlanTaskSnapshot_ParsesExamplesAndGuidelines(t *testing.T) {
+	snap := parsePlanTaskSnapshot(map[string]any{
+		"ID":                  "task-1",
+		"Name":                "Create CLI",
+		"ImplementationGuide": "Step 1: add the command.",
+		"Guidelines":          []any{"Follow existing CLI naming."},
+		"Examples": []any{
+			map[string]any{
+				"Label":       "CLI usage",
+				"Language":    "sh",
+				"Code":        "sylk plan approve --plan-id plan_123",
+				"Explanation": "Shows the approval entrypoint.",
+			},
+		},
+	})
+
+	if len(snap.Guidelines) != 1 || snap.Guidelines[0] != "Follow existing CLI naming." {
+		t.Fatalf("unexpected guidelines: %#v", snap.Guidelines)
+	}
+	if len(snap.Examples) != 1 {
+		t.Fatalf("expected 1 parsed example, got %d", len(snap.Examples))
+	}
+	if snap.Examples[0].Language != "sh" {
+		t.Fatalf("example language = %q, want sh", snap.Examples[0].Language)
 	}
 }
 
@@ -474,7 +539,7 @@ func TestGuideBridgeDispatchStream_PreservesPipelineMetadata(t *testing.T) {
 	}
 }
 
-func TestSummarizeRetryError_ExtractsJSONMessage(t *testing.T) {
+func TestFriendlyRetryError_ExtractsJSONMessage(t *testing.T) {
 	raw := `google code assist generate: code assist generate HTTP 429: {
   "error": {
     "code": 429,
@@ -493,27 +558,27 @@ func TestSummarizeRetryError_ExtractsJSONMessage(t *testing.T) {
     ]
   }
 }`
-	got := summarizeRetryError(raw)
+	got := providers.FriendlyErrorMessage(errors.New(raw))
 	want := "You have exhausted your capacity on this model. Your quota will reset after 55s."
 	if got != want {
-		t.Fatalf("summarizeRetryError:\n  got:  %q\n  want: %q", got, want)
+		t.Fatalf("FriendlyErrorMessage:\n  got:  %q\n  want: %q", got, want)
 	}
 }
 
-func TestSummarizeRetryError_FallsBackToPrefix(t *testing.T) {
+func TestFriendlyRetryError_FallsBackToPrefix(t *testing.T) {
 	raw := `provider error HTTP 502: {invalid json`
-	got := summarizeRetryError(raw)
-	want := "provider error HTTP 502:"
+	got := providers.FriendlyErrorMessage(errors.New(raw))
+	want := raw
 	if got != want {
-		t.Fatalf("summarizeRetryError:\n  got:  %q\n  want: %q", got, want)
+		t.Fatalf("FriendlyErrorMessage:\n  got:  %q\n  want: %q", got, want)
 	}
 }
 
-func TestSummarizeRetryError_PlainError(t *testing.T) {
+func TestFriendlyRetryError_PlainError(t *testing.T) {
 	raw := "connection timeout after 30s"
-	got := summarizeRetryError(raw)
+	got := providers.FriendlyErrorMessage(errors.New(raw))
 	if got != raw {
-		t.Fatalf("summarizeRetryError:\n  got:  %q\n  want: %q", got, raw)
+		t.Fatalf("FriendlyErrorMessage:\n  got:  %q\n  want: %q", got, raw)
 	}
 }
 

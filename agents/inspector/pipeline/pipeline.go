@@ -61,13 +61,14 @@ type PipelineInspector struct {
 	toolDefsDirty bool
 
 	// Bus (standard agent pattern).
-	bus         guide.EventBus
-	channels    *guide.AgentChannels
-	requestSub  guide.Subscription
-	responseSub guide.Subscription
-	registrySub guide.Subscription
-	running     bool
-	knownAgents map[string]*guide.AgentAnnouncement
+	bus           guide.EventBus
+	channels      *guide.AgentChannels
+	requestSub    guide.Subscription
+	responseSub   guide.Subscription
+	registrySub   guide.Subscription
+	running       bool
+	knownAgentsMu sync.RWMutex
+	knownAgents   map[string]*guide.AgentAnnouncement
 
 	// Sync RPC (for feedback loop).
 	pendingMu  sync.Mutex
@@ -661,6 +662,9 @@ func (pi *PipelineInspector) handleRegistryAnnouncement(msg *guide.Message) erro
 	if !ok {
 		return nil
 	}
+
+	pi.knownAgentsMu.Lock()
+	defer pi.knownAgentsMu.Unlock()
 
 	switch msg.Type {
 	case guide.MessageTypeAgentRegistered:

@@ -211,30 +211,7 @@ const (
 )
 
 // CommandExecution records the details of a shell command execution.
-type CommandExecution struct {
-	// Command is the full command that was executed.
-	Command string `json:"command"`
-	// ExitCode is the process exit code (0 typically means success).
-	ExitCode int `json:"exit_code"`
-	// Stdout contains the standard output from the command.
-	Stdout string `json:"stdout,omitempty"`
-	// Stderr contains the standard error output from the command.
-	Stderr string `json:"stderr,omitempty"`
-	// Duration is how long the command took to execute.
-	Duration time.Duration `json:"duration"`
-	// StartTime is when the command started executing.
-	StartTime time.Time `json:"start_time"`
-	// WorkingDir is the directory the command was executed in.
-	WorkingDir string `json:"working_dir"`
-	// ExecutionMode records the execution isolation mode selected by the planner.
-	ExecutionMode string `json:"execution_mode,omitempty"`
-	// ExecutionStrategy records the backend strategy selected by the planner.
-	ExecutionStrategy string `json:"execution_strategy,omitempty"`
-	// Materialized reports whether compatibility workspace materialization was used.
-	Materialized bool `json:"materialized,omitempty"`
-	// Truncated reports whether command output was clipped by broker limits.
-	Truncated bool `json:"truncated,omitempty"`
-}
+type CommandExecution = shared.CommandExecution
 
 // MemoryThreshold defines context window usage thresholds for the Engineer.
 type MemoryThreshold struct {

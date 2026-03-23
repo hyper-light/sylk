@@ -56,3 +56,22 @@ func TestHostProjectedExecutionArgvTranslatesShellCommandPaths(t *testing.T) {
 		t.Fatalf("shell command %q missing translated temp path %q", argv[2], tempPath)
 	}
 }
+
+func TestHostProjectedExecutionArgvFallsBackToHostPathWhenToolchainPathIsProjected(t *testing.T) {
+	hostBin := t.TempDir()
+	binaryPath := filepath.Join(hostBin, "demo-tool")
+	if err := os.WriteFile(binaryPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("PATH", hostBin)
+
+	argv, err := hostProjectedExecutionArgv(ExecutionPlan{
+		Env: map[string]string{"PATH": executionToolchainRoot},
+	}, nil, t.TempDir(), []string{"demo-tool"})
+	if err != nil {
+		t.Fatalf("hostProjectedExecutionArgv: %v", err)
+	}
+	if argv[0] != binaryPath {
+		t.Fatalf("argv[0] = %q, want %q", argv[0], binaryPath)
+	}
+}

@@ -679,7 +679,22 @@ func buildNodePrompt(ht *architect.HandoffTask) string {
 	if len(ht.Examples) > 0 {
 		b.WriteString("\n\n## Examples\n")
 		for _, ex := range ht.Examples {
-			fmt.Fprintf(&b, "### %s\n```\n%s\n```\n%s\n\n", ex.Label, ex.Code, ex.Explanation)
+			if strings.TrimSpace(ex.Label) != "" {
+				fmt.Fprintf(&b, "### %s\n", strings.TrimSpace(ex.Label))
+			}
+			fence := "```"
+			if lang := strings.TrimSpace(ex.Language); lang != "" {
+				fence += lang
+			}
+			b.WriteString(fence)
+			b.WriteString("\n")
+			b.WriteString(strings.TrimSpace(ex.Code))
+			b.WriteString("\n```\n")
+			if explanation := strings.TrimSpace(ex.Explanation); explanation != "" {
+				b.WriteString(explanation)
+				b.WriteString("\n")
+			}
+			b.WriteString("\n")
 		}
 	}
 

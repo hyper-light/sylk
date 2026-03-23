@@ -189,3 +189,94 @@ func TestCompleteWithWatchdog_DoesNotReplayAfterPartialStream(t *testing.T) {
 		t.Fatalf("unexpected partial response: %#v", resp)
 	}
 }
+
+type retryResetStreamingWatchdogProvider struct{}
+
+func (p *retryResetStreamingWatchdogProvider) Complete(_ context.Context, _ *providers.Request) (*providers.Response, error) {
+	return &providers.Response{Content: "should-not-run"}, nil
+}
+
+func (p *retryResetStreamingWatchdogProvider) Stream(_ context.Context, _ *providers.Request) (<-chan *providers.StreamChunk, error) {
+	ch := make(chan *providers.StreamChunk, 5)
+	ch <- &providers.StreamChunk{Type: providers.ChunkTypeStart}
+	ch <- &providers.StreamChunk{Type: providers.ChunkTypeError, Text: "retry me"}
+	ch <- &providers.StreamChunk{Type: providers.ChunkTypeStart, RetryReset: true}
+	ch <- &providers.StreamChunk{Type: providers.ChunkTypeText, Text: "recovered"}
+	ch <- &providers.StreamChunk{Type: providers.ChunkTypeEnd}
+	close(ch)
+	return ch, nil
+}
+
+func TestCompleteWithWatchdog_ClearsErrorOnRetryReset(t *testing.T) {
+	ctx := WithProgressPublisher(context.Background(), &ProgressPublisher{
+		SourceAgentID: "tui",
+	})
+
+	resp, err := CompleteWithWatchdog(ctx, &retryResetStreamingWatchdogProvider{}, &providers.Request{Model: "gpt-5.4-pro"}, AgentDisplayName("engineer"))
+	if err != nil {
+		t.Fatalf("CompleteWithWatchdog: %v", err)
+	}
+	if resp == nil || resp.Content != "recovered" {
+		t.Fatalf("unexpected response: %#v", resp)
+	}
+}
+
+func TestWithProgressPublisher_PublishesRetryStatus(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	channels := guide.NewAgentChannels("engineer", "engineer")
+	streams := make(chan *guide.StreamResponse, 4)
+	sub, err := bus.SubscribeAsync(channels.Responses, func(msg *guide.Message) error {
+		if stream, ok := msg.GetStreamResponse(); ok && stream != nil {
+			streams <- stream
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	ctx := WithProgressPublisher(context.Background(), &ProgressPublisher{
+		Bus:           bus,
+		Channels:      channels,
+		AgentID:       "engineer",
+		CorrelationID: "corr-retry",
+		SourceAgentID: "tui",
+	})
+
+	obs := providers.RetryObserverFromContext(ctx)
+	if obs == nil {
+		t.Fatal("expected retry observer")
+	}
+	obs(providers.RetryEvent{
+		Attempt:     2,
+		MaxAttempts: 3,
+		Delay:       2 * time.Second,
+		Err:         context.DeadlineExceeded,
+	})
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case stream := <-streams:
+			if stream == nil || stream.Event == nil || stream.Event.Type != guide.StreamEventRetry {
+				continue
+			}
+			status, ok := stream.Event.Data.(guide.RetryStatus)
+			if !ok {
+				t.Fatalf("retry status type = %T", stream.Event.Data)
+			}
+			if status.Attempt != 2 || status.MaxAttempts != 3 || status.Delay != 2*time.Second {
+				t.Fatalf("unexpected retry status: %#v", status)
+			}
+			if status.Err == nil || status.Err.Error() != context.DeadlineExceeded.Error() {
+				t.Fatalf("unexpected retry error: %v", status.Err)
+			}
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for retry status")
+		}
+	}
+}

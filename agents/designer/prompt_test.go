@@ -15,6 +15,8 @@ func TestDesignerSystemPromptForContract_UsesTaskModePrompt(t *testing.T) {
 	for _, want := range []string{
 		"# THE DESIGNER",
 		"Use them as the source of workflow truth.",
+		"Your first `challenge_agent` call to Tester, Engineer, or Inspector is allowed.",
+		"Re-challenge Inspector only after Inspector answered your prior challenge and you then changed pipeline VFS state yourself based on that answer.",
 		"## Completion Standards",
 		"## COLLABORATION PROTOCOL",
 		"## SAFETY CONSTRAINTS AND RULES",

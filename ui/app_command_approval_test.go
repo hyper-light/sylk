@@ -45,7 +45,7 @@ func TestCommandApprovalLayout_MinimalPrompt(t *testing.T) {
 	if len(layout.lines) < 3 || strings.TrimSpace(ansi.Strip(layout.lines[1])) != "" || strings.TrimSpace(ansi.Strip(layout.lines[2])) == "" {
 		t.Fatalf("approval prompt should keep a single spacer line above the command block:\n%s", joined)
 	}
-	if !strings.Contains(joined, "• Allow Once this run") {
+	if !strings.Contains(joined, "• Allow Once (this run)") {
 		t.Fatalf("approval prompt missing markdown bullet item:\n%s", joined)
 	}
 }

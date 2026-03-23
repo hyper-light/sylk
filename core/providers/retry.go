@@ -111,6 +111,64 @@ func retryStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) e
 	return lastErr
 }
 
+const anthropicInternalServerMaxRetries = 3
+
+// retryAnthropicInternalServerGenerate retries Anthropic generate calls only
+// for HTTP 500 internal server errors. MaxRetries here is a retry budget, not
+// a total-attempt budget: 3 means the initial request plus up to 3 retries.
+func retryAnthropicInternalServerGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Context) (*Response, error)) (*Response, error) {
+	var lastErr error
+	for retry := 0; ; retry++ {
+		resp, err := fn(ctx)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !shouldRetryAnthropicInternalServerCall(ctx, err, retry) {
+			break
+		}
+		delay := serverGuidedDelay(err, retry, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
+		notifyRetryObserver(ctx, RetryEvent{
+			Attempt:     retry + 1,
+			MaxAttempts: anthropicInternalServerMaxRetries,
+			Err:         err,
+			Delay:       delay,
+		})
+		if err := waitRetryDelay(ctx, delay); err != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+// retryAnthropicInternalServerStream retries Anthropic stream calls only for
+// HTTP 500 internal server errors. MaxRetries here is a retry budget, not a
+// total-attempt budget: 3 means the initial request plus up to 3 retries.
+func retryAnthropicInternalServerStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) error) error {
+	var lastErr error
+	for retry := 0; ; retry++ {
+		err := fn(ctx)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !shouldRetryAnthropicInternalServerCall(ctx, err, retry) {
+			break
+		}
+		delay := serverGuidedDelay(err, retry, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
+		notifyRetryObserver(ctx, RetryEvent{
+			Attempt:     retry + 1,
+			MaxAttempts: anthropicInternalServerMaxRetries,
+			Err:         err,
+			Delay:       delay,
+		})
+		if err := waitRetryDelay(ctx, delay); err != nil {
+			return err
+		}
+	}
+	return lastErr
+}
+
 // serverGuidedDelay returns the retry delay for an attempt, honoring the
 // server's Retry-After when available. The delay is max(exponential backoff,
 // server hint), ensuring we never undercut the server's guidance. This makes
@@ -127,23 +185,24 @@ func serverGuidedDelay(err error, attempt int, baseDelay, maxDelay time.Duration
 
 // retryAwareHandler wraps a StreamHandler so that when a provider retry
 // replays the stream, the replayed ChunkTypeStart chunk has RetryReset=true.
-// Consumers can check this flag to discard prior partial content accumulated
-// from the failed attempt.
+// Consumers can check this flag to discard prior partial content and prior
+// terminal error state accumulated from the failed attempt.
 //
 // A retry is distinguished from a secondary start event (e.g. early usage)
-// by whether content chunks (text, thought, tool) were seen since the last
-// start. Only a start that follows content is a retry.
+// by whether the prior attempt emitted any content or terminal error since
+// the last start. That lets callers recover cleanly even when a provider
+// fails before emitting user-visible content.
 func retryAwareHandler(handler StreamHandler) StreamHandler {
-	var hasContent bool
+	var sawAttemptOutput bool
 	return func(chunk *StreamChunk) error {
 		switch chunk.Type {
 		case ChunkTypeStart:
-			if hasContent {
+			if sawAttemptOutput {
 				chunk.RetryReset = true
 			}
-			hasContent = false
-		case ChunkTypeText, ChunkTypeThought, ChunkTypeToolStart, ChunkTypeToolDelta:
-			hasContent = true
+			sawAttemptOutput = false
+		case ChunkTypeText, ChunkTypeThought, ChunkTypeToolStart, ChunkTypeToolDelta, ChunkTypeToolEnd, ChunkTypeError:
+			sawAttemptOutput = true
 		}
 		return handler(chunk)
 	}
@@ -169,6 +228,19 @@ func shouldRetryProviderCall(ctx context.Context, err error, attempt int, maxAtt
 	return isRetryableError(err)
 }
 
+func shouldRetryAnthropicInternalServerCall(ctx context.Context, err error, retry int) bool {
+	if retry >= anthropicInternalServerMaxRetries {
+		return false
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return isAnthropicInternalServerError(err)
+}
+
 // isRetryableError returns true for transient errors using typed error
 // inspection. Cascade: ProviderError (already-classified) → anthropic.Error
 // (SDK typed) → net.Error (network transient) → false.
@@ -187,6 +259,21 @@ func isRetryableError(err error) bool {
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return netErr.Timeout()
+	}
+	return false
+}
+
+func isAnthropicInternalServerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pe *ProviderError
+	if errors.As(err, &pe) {
+		return pe.StatusCode == http.StatusInternalServerError
+	}
+	var anthropicErr *anthropic.Error
+	if errors.As(err, &anthropicErr) {
+		return anthropicErr.StatusCode == http.StatusInternalServerError
 	}
 	return false
 }

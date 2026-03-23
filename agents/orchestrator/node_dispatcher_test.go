@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -336,6 +337,278 @@ func TestAcknowledge_UnblocksDispatchWithoutAgentAckTopic(t *testing.T) {
 		State:  dag.NodeStateSucceeded,
 		Output: "ok",
 	})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("dispatch returned error: %v", err)
+	case result := <-resultCh:
+		if result == nil || result.State != dag.NodeStateSucceeded {
+			t.Fatalf("result = %#v, want succeeded", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dispatch result")
+	}
+}
+
+func TestDispatch_KeepsWaitingWhileActivityContinuesAfterDeadline(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	dispatcher := NewBusNodeDispatcher(bus, "orch", "sess", "dag-1", nil, nil, nil)
+	dispatcher.activityGrace = 120 * time.Millisecond
+
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "task_1",
+		AgentType: "engineer",
+		Prompt:    "implement",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	resultCh := make(chan *dag.NodeResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := dispatcher.Dispatch(ctx, node, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- result
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for dispatcher.DispatchDone(node.ID()) == nil {
+		select {
+		case <-deadline:
+			t.Fatal("dispatch did not start")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	if ok := dispatcher.Acknowledge(node.ID(), &ACKResult{
+		AgentID:   "engineer-1",
+		AgentType: "engineer",
+		AckedAt:   time.Now(),
+	}); !ok {
+		t.Fatal("expected synthetic ACK to be accepted")
+	}
+
+	stopActivity := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(40 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopActivity:
+				return
+			case <-ticker.C:
+				dispatcher.RecordActivity(node.ID())
+			}
+		}
+	}()
+
+	time.Sleep(2 * dispatcher.activityGrace)
+	dispatcher.OnNodeComplete(node.ID(), &dag.NodeResult{
+		NodeID: node.ID(),
+		State:  dag.NodeStateSucceeded,
+		Output: "ok",
+	})
+	close(stopActivity)
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("dispatch returned error: %v", err)
+	case result := <-resultCh:
+		if result == nil || result.State != dag.NodeStateSucceeded {
+			t.Fatalf("result = %#v, want succeeded", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dispatch result")
+	}
+}
+
+func TestDispatch_UsesNodeTimeoutAsSlidingActivityWindow(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	dispatcher := NewBusNodeDispatcher(bus, "orch", "sess", "dag-1", nil, nil, nil)
+	dispatcher.activityGrace = 30 * time.Millisecond
+
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "task_1",
+		AgentType: "engineer",
+		Prompt:    "implement",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+
+	resultCh := make(chan *dag.NodeResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := dispatcher.Dispatch(ctx, node, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- result
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for dispatcher.DispatchDone(node.ID()) == nil {
+		select {
+		case <-deadline:
+			t.Fatal("dispatch did not start")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	if ok := dispatcher.Acknowledge(node.ID(), &ACKResult{
+		AgentID:   "engineer-1",
+		AgentType: "engineer",
+		AckedAt:   time.Now(),
+	}); !ok {
+		t.Fatal("expected synthetic ACK to be accepted")
+	}
+
+	time.Sleep(90 * time.Millisecond)
+	dispatcher.RecordActivity(node.ID())
+
+	time.Sleep(70 * time.Millisecond)
+	dispatcher.OnNodeComplete(node.ID(), &dag.NodeResult{
+		NodeID: node.ID(),
+		State:  dag.NodeStateSucceeded,
+		Output: "ok",
+	})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("dispatch returned error: %v", err)
+	case result := <-resultCh:
+		if result == nil || result.State != dag.NodeStateSucceeded {
+			t.Fatalf("result = %#v, want succeeded", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dispatch result")
+	}
+}
+
+func TestDispatch_NoDeadlineTimesOutOnInactivity(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	dispatcher := NewBusNodeDispatcher(bus, "orch", "sess", "dag-1", nil, nil, nil)
+	dispatcher.activityGrace = 80 * time.Millisecond
+
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "task_1",
+		AgentType: "engineer",
+		Prompt:    "implement",
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := dispatcher.Dispatch(context.Background(), node, nil)
+		errCh <- err
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for dispatcher.DispatchDone(node.ID()) == nil {
+		select {
+		case <-deadline:
+			t.Fatal("dispatch did not start")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	if ok := dispatcher.Acknowledge(node.ID(), &ACKResult{
+		AgentID:   "engineer-1",
+		AgentType: "engineer",
+		AckedAt:   time.Now(),
+	}); !ok {
+		t.Fatal("expected synthetic ACK to be accepted")
+	}
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected inactivity timeout error")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for inactivity timeout")
+	}
+}
+
+func TestDispatch_NoDeadlineKeepsWaitingWhileActivityContinues(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	dispatcher := NewBusNodeDispatcher(bus, "orch", "sess", "dag-1", nil, nil, nil)
+	dispatcher.activityGrace = 80 * time.Millisecond
+
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "task_1",
+		AgentType: "engineer",
+		Prompt:    "implement",
+	})
+
+	resultCh := make(chan *dag.NodeResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := dispatcher.Dispatch(context.Background(), node, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- result
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for dispatcher.DispatchDone(node.ID()) == nil {
+		select {
+		case <-deadline:
+			t.Fatal("dispatch did not start")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	if ok := dispatcher.Acknowledge(node.ID(), &ACKResult{
+		AgentID:   "engineer-1",
+		AgentType: "engineer",
+		AckedAt:   time.Now(),
+	}); !ok {
+		t.Fatal("expected synthetic ACK to be accepted")
+	}
+
+	stopActivity := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopActivity:
+				return
+			case <-ticker.C:
+				dispatcher.RecordActivity(node.ID())
+			}
+		}
+	}()
+
+	time.Sleep(2 * dispatcher.activityGrace)
+	dispatcher.OnNodeComplete(node.ID(), &dag.NodeResult{
+		NodeID: node.ID(),
+		State:  dag.NodeStateSucceeded,
+		Output: "ok",
+	})
+	close(stopActivity)
 
 	select {
 	case err := <-errCh:

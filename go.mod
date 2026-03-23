@@ -5,6 +5,7 @@ go 1.25.0
 replace github.com/charmbracelet/bubbletea => ./third_party/bubbletea
 
 require (
+	bazil.org/fuse v0.0.0-20230120002735-62a210ff1fd5
 	github.com/anthropics/anthropic-sdk-go v1.26.0
 	github.com/arnodel/golua v0.1.2
 	github.com/blevesearch/bleve/v2 v2.5.7
@@ -34,11 +35,11 @@ require (
 	github.com/uptrace/bun/dialect/sqlitedialect v1.2.18
 	github.com/uptrace/bun/driver/sqliteshim v1.2.18
 	github.com/viterin/vek v0.4.3
+	github.com/winfsp/cgofuse v1.6.0
 	github.com/yuin/goldmark v1.7.16
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.19.0
 	golang.org/x/sys v0.41.0
-	golang.org/x/term v0.40.0
 	golang.org/x/tools v0.42.0
 	gonum.org/v1/gonum v0.17.0
 	google.golang.org/genai v1.47.0
@@ -47,7 +48,6 @@ require (
 )
 
 require (
-	bazil.org/fuse v0.0.0-20230120002735-62a210ff1fd5 // indirect
 	cloud.google.com/go v0.116.0 // indirect
 	cloud.google.com/go/auth v0.9.3 // indirect
 	cloud.google.com/go/compute/metadata v0.5.0 // indirect
@@ -123,7 +123,6 @@ require (
 	github.com/viterin/partial v1.1.0 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
-	github.com/winfsp/cgofuse v1.6.0 // indirect
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	go.etcd.io/bbolt v1.4.0 // indirect

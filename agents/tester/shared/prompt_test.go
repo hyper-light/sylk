@@ -22,6 +22,8 @@ func TestPipelineTesterSystemPromptForWorkerAndContract_UsesTaskModePrompt(t *te
 		"# THE PIPELINE TESTER",
 		"Use them as the source of workflow truth.",
 		"## Core Testing Principles",
+		"Your first `challenge_agent` call to Engineer, Designer, or Inspector is allowed.",
+		"Re-challenge Inspector only after Inspector answered your prior challenge and you then changed pipeline VFS state yourself based on that answer.",
 		"`handoff_next` is the only transport step.",
 		"Test Categories:",
 		"## SAFETY CONSTRAINTS AND RULES",

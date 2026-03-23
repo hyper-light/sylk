@@ -149,6 +149,7 @@ func (gt *GlobalTester) applyToolCalls(
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
+	recoveryHints := make([]string, 0, 1)
 	rerouted := false
 	for _, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
@@ -169,6 +170,9 @@ func (gt *GlobalTester) applyToolCalls(
 				result = agentshared.ToolErrorPayload(err)
 				isError = true
 				errCount++
+				if hint := agentshared.ToolRecoveryHint(call.Name, err); hint != "" {
+					recoveryHints = append(recoveryHints, hint)
+				}
 				if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 					agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventSkillFailed,
 						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
@@ -195,6 +199,7 @@ func (gt *GlobalTester) applyToolCalls(
 			break
 		}
 	}
+	agentshared.AppendToolRecoveryMessage(req, recoveryHints)
 	return errCount, rerouted
 }
 

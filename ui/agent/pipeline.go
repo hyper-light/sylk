@@ -129,6 +129,19 @@ func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad
 	return fmt.Sprintf("%s%s %s %s %s", prefix, name, statusLabel, bar, loopLabel)
 }
 
+func pipelineRowLineCount(pl *PipelineState, width int) int {
+	if pl == nil {
+		return 0
+	}
+	taskLabel := truncate(pipelineDisplayLabel(pl), 24)
+	statusText := truncate(pl.Status, 12)
+	loopText := formatPipelineCounterLabel(pl.Status, pl.LoopCount, pl.MaxLoops)
+	if shouldWrapPipelineRow(width, pipelineHeaderPrefix(false), taskLabel, statusText, loopText) {
+		return 2
+	}
+	return 1
+}
+
 func pipelineHeaderPrefix(collapsed bool) string {
 	marker := "\u2500" // ─
 	if collapsed {
@@ -365,6 +378,9 @@ func renderVariantRow(v *VariantState, width int, th *theme.Theme, selected bool
 
 // renderExpandedPipeline renders the detail view for a pipeline.
 func renderExpandedPipeline(pl *PipelineState, width, height int, th *theme.Theme) string {
+	if pl == nil {
+		return ""
+	}
 	labelStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	valueStyle := lipgloss.NewStyle().Foreground(th.Palette.Foreground)
 
@@ -389,6 +405,9 @@ func renderExpandedPipeline(pl *PipelineState, width, height int, th *theme.Them
 
 // renderExpandedVariant renders the detail view for a variant.
 func renderExpandedVariant(v *VariantState, width, height int, th *theme.Theme) string {
+	if v == nil {
+		return ""
+	}
 	labelStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	valueStyle := lipgloss.NewStyle().Foreground(th.Palette.Foreground)
 

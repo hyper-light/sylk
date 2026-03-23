@@ -275,7 +275,7 @@ func renderHTMLBlock(n *ast.HTMLBlock, ctx *blockContext) {
 	for i := range n.Lines().Len() {
 		seg := n.Lines().At(i)
 		line := strings.TrimRight(string(ctx.source[seg.Start:seg.Stop]), "\n\r")
-		ctx.lines = append(ctx.lines, wrapRuns(splitTextIntoRuns(line, ctx.styles.text), ctx.width)...)
+		ctx.lines = append(ctx.lines, wrapRuns(splitTextIntoRuns(line, ctx.styles.text, ctx.styles), ctx.width)...)
 	}
 	ctx.lines = append(ctx.lines, "")
 }

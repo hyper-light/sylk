@@ -9,6 +9,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/events"
 	coordination "github.com/adalundhe/sylk/core/pipeline/coordination"
 )
 
@@ -258,6 +259,35 @@ func (o *Orchestrator) addTaskDispatchPrecedents(dispatch *taskDispatchContext, 
 
 func (o *Orchestrator) publishTaskDispatchAgents(dispatch *taskDispatchContext, pipelineStatus string) {
 	if dispatch.nodeID == "" || dispatch.agentType == "" {
+		return
+	}
+	if strings.TrimSpace(dispatch.pipelineTaskID) == "" {
+		dispatched := make(map[string]struct{}, len(dispatch.coAgents)+1)
+		publishGlobalDispatch := func(agentType string) {
+			agentType = strings.TrimSpace(agentType)
+			if agentType == "" {
+				return
+			}
+			if _, seen := dispatched[agentType]; seen {
+				return
+			}
+			dispatched[agentType] = struct{}{}
+			o.publishStandaloneAgentActivity(
+				agentType,
+				fmt.Sprintf("Processing task dispatch: %s", dispatch.nodeID),
+				events.VisibilityAgent,
+				map[string]any{
+					"task_id":   strings.TrimSpace(dispatch.taskID),
+					"task_slug": strings.TrimSpace(dispatch.taskSlug),
+					"node_id":   strings.TrimSpace(dispatch.nodeID),
+					"source":    "orchestrator_task_dispatch",
+				},
+			)
+		}
+		publishGlobalDispatch(dispatch.agentType)
+		for _, coType := range dispatch.coAgents {
+			publishGlobalDispatch(coType)
+		}
 		return
 	}
 	if pipelineProtocolEligible(dispatch) {

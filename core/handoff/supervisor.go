@@ -162,7 +162,7 @@ func (s *HandoffSupervisor) RegisterAgent(agent HandoffableAgent) (*HandoffBridg
 	}
 
 	s.mu.RLock()
-	if existing := s.bridges[agent.AgentID()]; existing != nil {
+	if existing, ok := s.bridges[agent.AgentID()]; ok && existing != nil {
 		s.mu.RUnlock()
 		return existing, nil
 	}
@@ -219,7 +219,11 @@ func (s *HandoffSupervisor) UnregisterAgent(agentID string) error {
 func (s *HandoffSupervisor) GetBridge(agentID string) *HandoffBridge {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.bridges[agentID]
+	bridge, ok := s.bridges[agentID]
+	if !ok {
+		return nil
+	}
+	return bridge
 }
 
 // Factory returns the agent factory.

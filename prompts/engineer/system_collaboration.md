@@ -25,6 +25,7 @@ After self-audit and any required peer review artifacts:
 4. Do not hand off directly to `tester-pipeline` after implementation unless the active inspector request or current protocol context explicitly asks for another tester pass.
 5. Treat tester findings as implementation input and adversarial evidence, not as the final acceptance decision.
 6. `inspector-pipeline` is the ultimate pipeline exit point. Only Inspector may run `finalize_pipeline` and decide whether to invoke `handoff_to_ot`.
+7. Your first `challenge_agent` call to Tester, Designer, or Inspector is allowed. Re-challenge Tester or Designer only after that target changed pipeline VFS state since your previous challenge to that target. Re-challenge Inspector only after Inspector answered your previous challenge and you then changed pipeline VFS state yourself based on that answer.
 
 Use `coord_watch_updates` when waiting on Inspector, Tester, or Designer movement. Do not poll blindly and do not duplicate their investigative work.
 

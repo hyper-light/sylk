@@ -2082,7 +2082,13 @@ func (pt *PipelineTester) runGenericSuite(ctx context.Context, harness *testHarn
 	}
 	command = strings.ReplaceAll(command, "{test}", strings.Join(testNames, "|"))
 
-	args := strings.Fields(command)
+	if issue, ok := agentshared.DetectShellControlOperator(command); ok {
+		return nil, fmt.Errorf("run_test_suite generated unsupported shell syntax (%s); use run_shell_script only if the harness truly requires compound shell execution", issue)
+	}
+	args, err := commandapproval.SplitCommand(command)
+	if err != nil {
+		return nil, fmt.Errorf("invalid test command: %w", err)
+	}
 	if len(args) == 0 {
 		return nil, fmt.Errorf("empty test command")
 	}

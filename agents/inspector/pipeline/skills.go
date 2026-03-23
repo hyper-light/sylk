@@ -32,6 +32,8 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	pi.skills.Register(shared.DetectRaceConditionsSkill(pi.toolRunner))
 	pi.skills.Register(shared.DetectDeadlocksSkill(pi.toolRunner))
 	pi.skills.Register(shared.DetectMemoryLeaksSkill(pi.toolRunner))
+	pi.skills.Register(runCommandSkill(pi))
+	pi.skills.Register(runShellScriptSkill(pi))
 	faFunc := func() shared.FileAccess { return pi.fileAccess }
 	pi.skills.Register(shared.ReadFileSkill(faFunc))
 	pi.skills.Register(shared.GlobSkill(faFunc))
@@ -62,6 +64,8 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	pi.skills.Register(requestCorrectionSkill(pi))
 	pi.skills.Register(requestOverrideSkill(pi))
 	pi.skills.Register(getValidationStatusSkill(pi))
+	pi.skills.Register(researchDependencyInstallSkill(pi))
+	pi.skills.Register(installDependencyToolingSkill(pi))
 
 	for _, skill := range agentShared.CoordinationSkills(agentShared.CoordinationSkillConfig{
 		Client: agentShared.CoordinationClient{

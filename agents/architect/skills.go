@@ -227,6 +227,8 @@ func planSkill(a *Architect) *skills.Skill {
 		StringParam("plan_id", "Plan identifier for protocol-driven operations (analyze, design, generate_tasks, revise)", false).
 		StringParam("reason", "Reason for revision (for revise)", false).
 		ObjectParam("updates", "Optional update payload (for revise)", map[string]*skills.Property{}, false).
+		BestPractice("For action=generate_tasks, prefer short markdown-ready examples when they materially reduce ambiguity. Use example languages like sh, json, go, ts, or mermaid, and do not include surrounding triple backticks in the example code field.").
+		BestPractice("Use compact mermaid flow or sequence diagrams when task sequencing, ownership, or data flow is easier to understand visually than in prose.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params planInput
 			if err := json.Unmarshal(input, &params); err != nil {

@@ -69,13 +69,14 @@ type Engineer struct {
 	pipelineName string
 
 	// Event bus integration
-	bus         guide.EventBus
-	channels    *guide.AgentChannels
-	requestSub  guide.Subscription
-	responseSub guide.Subscription
-	registrySub guide.Subscription
-	running     bool
-	knownAgents map[string]*guide.AgentAnnouncement
+	bus           guide.EventBus
+	channels      *guide.AgentChannels
+	requestSub    guide.Subscription
+	responseSub   guide.Subscription
+	registrySub   guide.Subscription
+	running       bool
+	knownAgentsMu sync.RWMutex
+	knownAgents   map[string]*guide.AgentAnnouncement
 
 	// Consultation tracking
 	consultations []Consultation
@@ -758,6 +759,9 @@ func (e *Engineer) handleRegistryAnnouncement(msg *guide.Message) error {
 		return nil
 	}
 
+	e.knownAgentsMu.Lock()
+	defer e.knownAgentsMu.Unlock()
+
 	switch msg.Type {
 	case guide.MessageTypeAgentRegistered:
 		e.knownAgents[ann.AgentID] = ann
@@ -780,6 +784,8 @@ func (e *Engineer) handleRegistryAnnouncement(msg *guide.Message) error {
 
 // GetKnownAgents returns all agents the engineer knows about
 func (e *Engineer) GetKnownAgents() map[string]*guide.AgentAnnouncement {
+	e.knownAgentsMu.RLock()
+	defer e.knownAgentsMu.RUnlock()
 	result := make(map[string]*guide.AgentAnnouncement, len(e.knownAgents))
 	for k, v := range e.knownAgents {
 		result[k] = v
@@ -901,6 +907,8 @@ func (e *Engineer) failureResponse(req *EngineerRequest, err error, _ time.Time)
 
 // isTesterAvailable checks if any known agent has a tester type.
 func (e *Engineer) isTesterAvailable() bool {
+	e.knownAgentsMu.RLock()
+	defer e.knownAgentsMu.RUnlock()
 	for _, ann := range e.knownAgents {
 		if ann.AgentType == "tester" || ann.AgentType == "tester-pipeline" {
 			return true

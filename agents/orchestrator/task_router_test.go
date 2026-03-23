@@ -207,6 +207,68 @@ func TestTaskRouter_SuccessResponse(t *testing.T) {
 	}
 }
 
+func TestTaskRouter_DeliverResponse_RecordsNodeActivityForTerminalResponse(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	activityCh := make(chan struct {
+		dagID  string
+		nodeID string
+	}, 1)
+	router := NewTaskRouter(TaskRouterConfig{
+		Bus:       bus,
+		Scope:     scope,
+		AgentID:   "orchestrator",
+		SessionID: "test-session",
+		OnNodeActivity: func(dagID, nodeID string) {
+			activityCh <- struct {
+				dagID  string
+				nodeID string
+			}{dagID: dagID, nodeID: nodeID}
+		},
+	})
+	task := testTask()
+
+	guideCh := make(chan string, 1)
+	guideSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		if req, ok := msg.GetRouteRequest(); ok {
+			guideCh <- req.CorrelationID
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer guideSub.Unsubscribe()
+
+	err = router.Route(task)
+	require.NoError(t, err)
+
+	var corrID string
+	select {
+	case corrID = <-guideCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no guide request intercepted")
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:     corrID,
+		Success:           true,
+		Data:              "task output",
+		RespondingAgentID: "engineer",
+	}
+	respMsg := guide.NewResponseMessage("", resp)
+	respMsg.CorrelationID = corrID
+	require.True(t, router.DeliverResponse(respMsg))
+
+	select {
+	case activity := <-activityCh:
+		assert.Equal(t, task.DAGID, activity.dagID)
+		assert.Equal(t, task.NodeID, activity.nodeID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal response did not record node activity")
+	}
+}
+
 func TestTaskRouter_ReconcilesLateTerminalResponseAfterDone(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
@@ -741,5 +803,111 @@ func TestTaskRouter_ScopeContextCancellation(t *testing.T) {
 		assert.Contains(t, update.Error, "context")
 	case <-time.After(2 * time.Second):
 		t.Fatal("cancellation failure was not published")
+	}
+}
+
+func TestTaskRouter_FailedRouteResponseWithoutErrorUsesFallback(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+	task := testTask()
+
+	updateCh := make(chan *PipelineUpdate, 1)
+	sub, err := bus.SubscribeAsync("pipeline.update.engineer", func(msg *guide.Message) error {
+		if update, ok := msg.Payload.(*PipelineUpdate); ok {
+			updateCh <- update
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	guideCh := make(chan string, 1)
+	guideSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		if req, ok := msg.GetRouteRequest(); ok {
+			guideCh <- req.CorrelationID
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer guideSub.Unsubscribe()
+
+	require.NoError(t, router.Route(task))
+
+	var corrID string
+	select {
+	case corrID = <-guideCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no guide request intercepted")
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:       corrID,
+		Success:             false,
+		RespondingAgentID:   "engineer-worker",
+		RespondingAgentName: "Engineer",
+	}
+	respMsg := guide.NewResponseMessage("", resp)
+	respMsg.CorrelationID = corrID
+	require.True(t, router.DeliverResponse(respMsg))
+
+	select {
+	case update := <-updateCh:
+		require.Equal(t, "failed", update.Status)
+		require.Equal(t, "Engineer returned an unsuccessful route response for node node-1 without error details", update.Error)
+	case <-time.After(2 * time.Second):
+		t.Fatal("failure update was not published")
+	}
+}
+
+func TestTaskRouter_ErrorMessageWithoutPayloadUsesSourceFallback(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+	task := testTask()
+
+	updateCh := make(chan *PipelineUpdate, 1)
+	sub, err := bus.SubscribeAsync("pipeline.update.engineer", func(msg *guide.Message) error {
+		if update, ok := msg.Payload.(*PipelineUpdate); ok {
+			updateCh <- update
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	guideCh := make(chan string, 1)
+	guideSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		if req, ok := msg.GetRouteRequest(); ok {
+			guideCh <- req.CorrelationID
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer guideSub.Unsubscribe()
+
+	require.NoError(t, router.Route(task))
+
+	var corrID string
+	select {
+	case corrID = <-guideCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no guide request intercepted")
+	}
+
+	errMsg := guide.NewErrorMessage("", corrID, "engineer-worker", "")
+	errMsg.CorrelationID = corrID
+	require.True(t, router.DeliverResponse(errMsg))
+
+	select {
+	case update := <-updateCh:
+		require.Equal(t, "failed", update.Status)
+		require.Equal(t, "route error from engineer-worker for node node-1", update.Error)
+	case <-time.After(2 * time.Second):
+		t.Fatal("failure update was not published")
 	}
 }

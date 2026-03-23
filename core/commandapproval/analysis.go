@@ -57,7 +57,7 @@ func (e *Evaluator) Evaluate(req Request) (Evaluation, error) {
 			Analysis: analysis,
 		}, nil
 	}
-	if matchesPatternSet(defaultAllowPatterns(), analysis.Normalized) {
+	if analysis.ApprovalPolicy != ApprovalPolicyExact && matchesPatternSet(defaultAllowPatterns(), analysis.Normalized) {
 		return Evaluation{
 			Decision: DecisionAllow,
 			Source:   MatchSourceBuiltinAllow,
@@ -92,7 +92,8 @@ func Analyze(req Request) (Analysis, error) {
 	if command == "" {
 		return Analysis{}, fmt.Errorf("command is required")
 	}
-	tokens, err := splitCommand(command)
+	policy := normalizeApprovalPolicy(req.ApprovalPolicy)
+	tokens, err := SplitCommand(command)
 	if err != nil {
 		return Analysis{}, err
 	}
@@ -126,7 +127,11 @@ func Analyze(req Request) (Analysis, error) {
 	}
 	templateKey := strings.Join(templateParts, "|")
 	exactKey := "exact:" + hashCommand(strings.Join([]string{strings.Join(tokens, " "), req.WorkingDir}, "\n"))
-	persistKey, persistLabel := derivePersistRule(program, verb, templateKey, exactKey, workingDirScope, workingDirZone, paths)
+	exactLabel := "this exact command"
+	if strings.TrimSpace(req.ToolName) == "run_shell_script" {
+		exactLabel = "this exact shell script"
+	}
+	persistKey, persistLabel := derivePersistRule(policy, exactLabel, program, verb, templateKey, exactKey, workingDirScope, workingDirZone, paths)
 	return Analysis{
 		RawCommand:       command,
 		Normalized:       strings.Join(tokens, " "),
@@ -143,14 +148,15 @@ func Analyze(req Request) (Analysis, error) {
 		PersistKey:       persistKey,
 		PersistLabel:     persistLabel,
 		RuleLabel:        buildRuleLabel(program, verb, outside),
-		Summary:          buildSummary(program, verb, outside),
-		Risk:             buildRisk(program, verb, outside),
+		Summary:          buildSummary(program, verb, outside, policy),
+		Risk:             buildRisk(program, verb, outside, policy),
 		OutsideWorkspace: outside,
 		Mutating:         isMutating(program, verb),
+		ApprovalPolicy:   policy,
 	}, nil
 }
 
-func splitCommand(command string) ([]string, error) {
+func SplitCommand(command string) ([]string, error) {
 	var (
 		tokens  []string
 		current strings.Builder
@@ -189,6 +195,15 @@ func splitCommand(command string) ([]string, error) {
 	}
 	flush()
 	return tokens, nil
+}
+
+func normalizeApprovalPolicy(policy ApprovalPolicy) ApprovalPolicy {
+	switch policy {
+	case ApprovalPolicyExact:
+		return ApprovalPolicyExact
+	default:
+		return ApprovalPolicyDefault
+	}
 }
 
 func deriveVerb(tokens []string) (string, int) {
@@ -462,7 +477,13 @@ func buildRuleLabel(program, verb string, outside bool) string {
 	return firstNonEmpty(compactCommandName(program, verb), program) + " inside workspace"
 }
 
-func buildSummary(program, verb string, outside bool) string {
+func buildSummary(program, verb string, outside bool, policy ApprovalPolicy) string {
+	if policy == ApprovalPolicyExact {
+		if outside {
+			return "This shell script requires explicit approval because it runs outside the project workspace"
+		}
+		return "This shell script requires explicit approval because compound shell execution is never pre-approved"
+	}
 	name := firstNonEmpty(compactCommandName(program, verb), program)
 	if outside {
 		return name + " requires approval because it runs outside the project workspace"
@@ -470,7 +491,13 @@ func buildSummary(program, verb string, outside bool) string {
 	return name + " requires approval because it is not pre-approved"
 }
 
-func buildRisk(program, verb string, outside bool) string {
+func buildRisk(program, verb string, outside bool, policy ApprovalPolicy) string {
+	if policy == ApprovalPolicyExact {
+		if outside {
+			return "This shell script runs in or targets a location outside the project workspace."
+		}
+		return "This shell script can use chaining, pipes, redirection, or shell expansion and therefore is never pre-approved automatically."
+	}
 	if outside {
 		return "This command runs in or targets a location outside the project workspace."
 	}
@@ -491,11 +518,16 @@ func compactCommandName(program, verb string) string {
 }
 
 func derivePersistRule(
+	policy ApprovalPolicy,
+	exactLabel string,
 	program, verb, templateKey, exactKey string,
 	workingDirScope PathScope,
 	workingDirZone string,
 	paths []PathArg,
 ) (string, string) {
+	if policy == ApprovalPolicyExact {
+		return exactKey, firstNonEmpty(exactLabel, "this exact command")
+	}
 	name := firstNonEmpty(compactCommandName(program, verb), program)
 	if canGeneralizeWorkspaceRule(program, verb, workingDirScope, paths) {
 		return templateKey, name + " inside workspace"
@@ -595,6 +627,9 @@ func (a Analysis) ruleLookupKeys() []string {
 		keys = append(keys, value)
 	}
 	appendKey(a.ExactKey)
+	if a.ApprovalPolicy == ApprovalPolicyExact {
+		return keys
+	}
 	appendKey(a.PersistKey)
 	appendKey(a.TemplateKey)
 	return keys

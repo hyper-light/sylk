@@ -1048,17 +1048,25 @@ func (b *HandoffBridge) decorateHandoffData(data map[string]any) map[string]any 
 	payload["agent_type"] = b.agent.AgentType()
 	payload["agent_name"] = handoffAgentDisplayName(b.agent.AgentType())
 	if state := b.agent.ExtractArchivableState(); state != nil {
-		if pipelineID := strings.TrimSpace(state.State["pipeline_id"]); pipelineID != "" {
-			payload["pipeline_id"] = pipelineID
-			if _, exists := payload["task_id"]; !exists {
-				payload["task_id"] = pipelineID
+		if state.State != nil {
+			if pipelineID, ok := state.State["pipeline_id"]; ok {
+				if pipelineID = strings.TrimSpace(pipelineID); pipelineID != "" {
+					payload["pipeline_id"] = pipelineID
+					if _, exists := payload["task_id"]; !exists {
+						payload["task_id"] = pipelineID
+					}
+				}
 			}
-		}
-		if taskID := strings.TrimSpace(state.State["task_id"]); taskID != "" {
-			payload["task_id"] = taskID
-		}
-		if taskSlug := strings.TrimSpace(state.State["task_slug"]); taskSlug != "" {
-			payload["task_slug"] = taskSlug
+			if taskID, ok := state.State["task_id"]; ok {
+				if taskID = strings.TrimSpace(taskID); taskID != "" {
+					payload["task_id"] = taskID
+				}
+			}
+			if taskSlug, ok := state.State["task_slug"]; ok {
+				if taskSlug = strings.TrimSpace(taskSlug); taskSlug != "" {
+					payload["task_slug"] = taskSlug
+				}
+			}
 		}
 	}
 	return payload

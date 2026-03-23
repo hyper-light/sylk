@@ -1,5 +1,7 @@
 package guide
 
+import "sync"
+
 // =============================================================================
 // Agent Routing Interface
 // =============================================================================
@@ -88,6 +90,8 @@ type AgentTriggers struct {
 
 // RoutingAggregator collects routing info from multiple agents
 type RoutingAggregator struct {
+	mu sync.RWMutex
+
 	// Maps agent name/alias to agent ID
 	aliasIndex map[string]string
 
@@ -117,6 +121,9 @@ func (ra *RoutingAggregator) RegisterAgent(info *AgentRoutingInfo) {
 		return
 	}
 
+	ra.mu.Lock()
+	defer ra.mu.Unlock()
+
 	// Store routing info
 	ra.routingInfo[info.ID] = info
 
@@ -138,6 +145,9 @@ func (ra *RoutingAggregator) RegisterAgent(info *AgentRoutingInfo) {
 
 // UnregisterAgent removes an agent's routing information
 func (ra *RoutingAggregator) UnregisterAgent(id string) {
+	ra.mu.Lock()
+	defer ra.mu.Unlock()
+
 	info, ok := ra.routingInfo[id]
 	if !ok {
 		return
@@ -164,18 +174,27 @@ func (ra *RoutingAggregator) UnregisterAgent(id string) {
 
 // ResolveAgent resolves an agent name or alias to the full agent ID
 func (ra *RoutingAggregator) ResolveAgent(nameOrAlias string) (string, bool) {
+	ra.mu.RLock()
+	defer ra.mu.RUnlock()
+
 	id, ok := ra.aliasIndex[nameOrAlias]
 	return id, ok
 }
 
 // ResolveAction resolves an action shortcut to agent ID
 func (ra *RoutingAggregator) ResolveAction(action string) (string, bool) {
+	ra.mu.RLock()
+	defer ra.mu.RUnlock()
+
 	id, ok := ra.actionIndex[action]
 	return id, ok
 }
 
 // GetActionShortcut returns the action shortcut details for an action
 func (ra *RoutingAggregator) GetActionShortcut(action string) (*ActionShortcut, string, bool) {
+	ra.mu.RLock()
+	defer ra.mu.RUnlock()
+
 	agentID, ok := ra.actionIndex[action]
 	if !ok {
 		return nil, "", false
@@ -197,6 +216,9 @@ func (ra *RoutingAggregator) GetActionShortcut(action string) (*ActionShortcut, 
 
 // GetAllAliases returns all registered aliases with their agent IDs
 func (ra *RoutingAggregator) GetAllAliases() map[string]string {
+	ra.mu.RLock()
+	defer ra.mu.RUnlock()
+
 	result := make(map[string]string, len(ra.aliasIndex))
 	for alias, id := range ra.aliasIndex {
 		result[alias] = id
@@ -206,6 +228,9 @@ func (ra *RoutingAggregator) GetAllAliases() map[string]string {
 
 // GetAllActions returns all registered action shortcuts
 func (ra *RoutingAggregator) GetAllActions() map[string]string {
+	ra.mu.RLock()
+	defer ra.mu.RUnlock()
+
 	result := make(map[string]string, len(ra.actionIndex))
 	for action, id := range ra.actionIndex {
 		result[action] = id
@@ -215,11 +240,17 @@ func (ra *RoutingAggregator) GetAllActions() map[string]string {
 
 // GetAgentTriggers returns triggers for a specific agent
 func (ra *RoutingAggregator) GetAgentTriggers(agentID string) *AgentTriggers {
+	ra.mu.RLock()
+	defer ra.mu.RUnlock()
+
 	return ra.triggersByAgent[agentID]
 }
 
 // GetAllStrongTriggers returns all strong triggers from all agents
 func (ra *RoutingAggregator) GetAllStrongTriggers() map[string][]string {
+	ra.mu.RLock()
+	defer ra.mu.RUnlock()
+
 	result := make(map[string][]string)
 	for id, triggers := range ra.triggersByAgent {
 		if triggers != nil && len(triggers.StrongTriggers) > 0 {
@@ -231,11 +262,17 @@ func (ra *RoutingAggregator) GetAllStrongTriggers() map[string][]string {
 
 // GetRoutingInfo returns routing info for a specific agent
 func (ra *RoutingAggregator) GetRoutingInfo(agentID string) *AgentRoutingInfo {
+	ra.mu.RLock()
+	defer ra.mu.RUnlock()
+
 	return ra.routingInfo[agentID]
 }
 
 // GetAllRoutingInfo returns all registered routing info
 func (ra *RoutingAggregator) GetAllRoutingInfo() []*AgentRoutingInfo {
+	ra.mu.RLock()
+	defer ra.mu.RUnlock()
+
 	result := make([]*AgentRoutingInfo, 0, len(ra.routingInfo))
 	for _, info := range ra.routingInfo {
 		result = append(result, info)

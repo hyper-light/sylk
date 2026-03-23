@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/container/pod"
+	"github.com/adalundhe/sylk/core/handoff"
 )
 
 func TestDefaultPolicy(t *testing.T) {
@@ -125,5 +126,16 @@ func TestPolicyDefaults_Derivation(t *testing.T) {
 	// IdleToCold should be 6× IdleToCool.
 	if defaults.IdleToCold != defaults.IdleToCool*6 {
 		t.Fatalf("expected IdleToCold = 6×IdleToCool, got %v", defaults.IdleToCold)
+	}
+}
+
+func TestAgentActivationPolicies_UnknownCategoryReturnsError(t *testing.T) {
+	descriptors := []handoff.AgentDescriptor{
+		{AgentType: "mystery", Category: handoff.AgentCategory(99)},
+	}
+
+	_, err := AgentActivationPolicies(descriptors)
+	if err == nil {
+		t.Fatal("expected error for unknown category")
 	}
 }

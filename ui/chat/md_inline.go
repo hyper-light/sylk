@@ -33,9 +33,9 @@ func collectInlineRuns(node ast.Node, source []byte, style lipgloss.Style, style
 func inlineNodeRuns(node ast.Node, source []byte, inherited lipgloss.Style, styles *chatMdStyles) []styledRun {
 	switch n := node.(type) {
 	case *ast.Text:
-		return textRuns(n, source, inherited)
+		return textRuns(n, source, inherited, styles)
 	case *ast.String:
-		return splitTextIntoRuns(string(n.Value), inherited)
+		return splitTextIntoRuns(string(n.Value), inherited, styles)
 	case *ast.Emphasis:
 		return emphasisRuns(n, source, inherited, styles)
 	case *ast.CodeSpan:
@@ -51,7 +51,7 @@ func inlineNodeRuns(node ast.Node, source []byte, inherited lipgloss.Style, styl
 	case *east.TaskCheckBox:
 		return taskCheckBoxRuns(n, styles)
 	case *ast.RawHTML:
-		return rawHTMLRuns(n, source, inherited)
+		return rawHTMLRuns(n, source, inherited, styles)
 	default:
 		// Unknown inline — recurse children with inherited style.
 		return collectInlineRuns(node, source, inherited, styles)
@@ -59,10 +59,10 @@ func inlineNodeRuns(node ast.Node, source []byte, inherited lipgloss.Style, styl
 }
 
 // textRuns handles ast.Text nodes, splitting into word + space runs.
-func textRuns(n *ast.Text, source []byte, style lipgloss.Style) []styledRun {
+func textRuns(n *ast.Text, source []byte, style lipgloss.Style, styles *chatMdStyles) []styledRun {
 	seg := n.Segment
 	raw := string(source[seg.Start:seg.Stop])
-	runs := splitTextIntoRuns(raw, style)
+	runs := splitTextIntoRuns(raw, style, styles)
 	// SoftLineBreak → treat as a space.
 	if n.SoftLineBreak() {
 		runs = append(runs, styledRun{
@@ -84,7 +84,7 @@ func textRuns(n *ast.Text, source []byte, style lipgloss.Style) []styledRun {
 }
 
 // splitTextIntoRuns breaks text into word runs and trailing-space runs.
-func splitTextIntoRuns(text string, style lipgloss.Style) []styledRun {
+func splitTextIntoRuns(text string, style lipgloss.Style, styles *chatMdStyles) []styledRun {
 	if text == "" {
 		return nil
 	}
@@ -113,6 +113,17 @@ func splitTextIntoRuns(text string, style lipgloss.Style) []styledRun {
 			j++
 		}
 		word := text[i:j]
+		if badgeStyle, ok := priorityBadgeStyle(word, styles); ok {
+			rendered := badgeStyle.Render(word)
+			runs = append(runs, styledRun{
+				text:     word,
+				rendered: rendered,
+				width:    lipgloss.Width(rendered),
+				atomic:   true,
+			})
+			i = j
+			continue
+		}
 		runs = append(runs, styledRun{
 			text:     word,
 			rendered: style.Render(word),
@@ -236,13 +247,29 @@ func taskCheckBoxRuns(n *east.TaskCheckBox, styles *chatMdStyles) []styledRun {
 }
 
 // rawHTMLRuns renders inline HTML as plain text.
-func rawHTMLRuns(n *ast.RawHTML, source []byte, style lipgloss.Style) []styledRun {
+func rawHTMLRuns(n *ast.RawHTML, source []byte, style lipgloss.Style, styles *chatMdStyles) []styledRun {
 	var b strings.Builder
 	for i := range n.Segments.Len() {
 		seg := n.Segments.At(i)
 		b.Write(source[seg.Start:seg.Stop])
 	}
-	return splitTextIntoRuns(b.String(), style)
+	return splitTextIntoRuns(b.String(), style, styles)
+}
+
+func priorityBadgeStyle(token string, styles *chatMdStyles) (lipgloss.Style, bool) {
+	if styles == nil {
+		return lipgloss.Style{}, false
+	}
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "[must]":
+		return styles.priorityMust, true
+	case "[should]":
+		return styles.priorityShould, true
+	case "[could]":
+		return styles.priorityCould, true
+	default:
+		return lipgloss.Style{}, false
+	}
 }
 
 // extractPlainText recursively extracts visible text from an inline AST node.

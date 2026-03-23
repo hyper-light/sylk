@@ -1363,6 +1363,7 @@ type acceptanceCriterionPayload struct {
 
 type taskExamplePayload struct {
 	Label       string `json:"label"`
+	Language    string `json:"language,omitempty"`
 	Code        string `json:"code"`
 	Explanation string `json:"explanation"`
 }
@@ -1575,10 +1576,15 @@ func toTaskExamples(payloads []taskExamplePayload) []TaskExample {
 	}
 	examples := make([]TaskExample, 0, len(payloads))
 	for _, p := range payloads {
+		code, detectedLanguage := trimExampleFence(p.Code)
 		ex := TaskExample{
 			Label:       strings.TrimSpace(p.Label),
-			Code:        strings.TrimSpace(p.Code),
+			Language:    normalizeExampleLanguage(firstNonEmpty(strings.TrimSpace(p.Language), detectedLanguage)),
+			Code:        strings.TrimSpace(code),
 			Explanation: strings.TrimSpace(p.Explanation),
+		}
+		if ex.Language == "" {
+			ex.Language = inferExampleLanguage(ex.Code)
 		}
 		if ex.Code == "" && ex.Label == "" {
 			continue
@@ -1586,6 +1592,57 @@ func toTaskExamples(payloads []taskExamplePayload) []TaskExample {
 		examples = append(examples, ex)
 	}
 	return examples
+}
+
+func trimExampleFence(code string) (string, string) {
+	trimmed := strings.TrimSpace(code)
+	if !strings.HasPrefix(trimmed, "```") {
+		return trimmed, ""
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) < 2 {
+		return strings.TrimPrefix(trimmed, "```"), ""
+	}
+	first := strings.TrimSpace(lines[0])
+	last := strings.TrimSpace(lines[len(lines)-1])
+	if last != "```" {
+		return trimmed, ""
+	}
+	language := strings.TrimSpace(strings.TrimPrefix(first, "```"))
+	body := strings.Join(lines[1:len(lines)-1], "\n")
+	return strings.Trim(body, "\n"), language
+}
+
+func normalizeExampleLanguage(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range raw {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || strings.ContainsRune("+-_#", r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func inferExampleLanguage(code string) string {
+	for _, line := range strings.Split(code, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "flowchart ") ||
+			strings.HasPrefix(lower, "graph ") ||
+			strings.HasPrefix(lower, "sequencediagram") ||
+			strings.HasPrefix(lower, "statediagram") {
+			return "mermaid"
+		}
+		break
+	}
+	return ""
 }
 
 func toTaskFileTargets(payloads []taskFileTargetPayload) []TaskFileTarget {
@@ -1825,7 +1882,8 @@ Return JSON only, exactly:
       "examples": [
         {
           "label": "What the example demonstrates",
-          "code": "func Example() { ... }",
+          "language": "go|ts|tsx|sh|json|yaml|sql|mermaid|text",
+          "code": "Short markdown-ready snippet or diagram with NO surrounding backticks",
           "explanation": "Why this pattern applies"
         }
       ],
@@ -1902,7 +1960,11 @@ Hard limits:
 - execution_contracts are REQUIRED for every task. Include explicit contracts for inspector-pipeline, tester-pipeline, the primary implementation agent, and every co-agent.
 - guidelines: 1-4 items per task
 - test_requirements: 1-4 items per task
-- examples: 0-2 per task (include for non-trivial tasks)
+- examples: 0-2 per task
+  Prefer 1 concise example for non-trivial tasks.
+  Use language for every example with code.
+  Examples may be code snippets, CLI/API usage blocks, JSON payloads, or compact mermaid flow/sequence diagrams.
+  Never include surrounding triple backticks inside examples.code.
 - risk_factors: 0-3 per task
 - success_criteria: 2-4 items per task
 - co_agents: omit for single-agent tasks. When a task involves BOTH visual/UX concerns AND implementation logic, split responsibilities:

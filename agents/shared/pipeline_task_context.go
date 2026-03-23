@@ -151,19 +151,22 @@ func BuildPipelineSystemContext(task *PipelineTaskInput) string {
 		writeLabeledScalar(&b, "Requested By", protocol["requested_by"])
 		writeLabeledScalar(&b, "Turn Mode", protocol["mode"])
 		writeLabeledScalar(&b, "Current Request", protocol["current_request"])
+		writeListSection(&b, "Audit Lock", summarizePipelineAuditLock(protocol["audit_lock"]))
 		writeListSection(&b, "Pending Challenge", summarizePipelineChallenge(protocol["pending_challenge"]))
 		writeListSection(&b, "Pending Validation", summarizePipelineValidation(protocol["pending_validation"]))
 		writeListSection(&b, "Recent Protocol Events", summarizePipelineProtocolEvents(protocol["recent_events"]))
 		b.WriteString("\nProtocol Rules:\n")
 		b.WriteString("- Inspector is the only pipeline entrypoint and the ultimate pipeline exit point; only Inspector may accept work and hand off to OT.\n")
 		b.WriteString("- The authoritative loop is inspector -> tester -> engineer/designer -> inspector unless the active challenge explicitly says otherwise.\n")
-		b.WriteString("- Any pipeline agent may challenge any other pipeline agent.\n")
+		b.WriteString("- A first challenge on a directed pipeline-agent pair is allowed.\n")
+		b.WriteString("- Repeated challenges require new pipeline VFS evidence on the directed pair: Inspector may re-challenge Tester, Engineer, or Designer only after that target changed VFS since Inspector's previous challenge to that target; Tester, Engineer, and Designer may re-challenge each other only after the target changed VFS since the challenger's previous challenge; Tester, Engineer, and Designer may re-challenge Inspector only after the challenger changed VFS in response to Inspector's previous answer.\n")
 		b.WriteString("- End each turn with challenge_agent, handoff_next, validate_work, finalize_pipeline, or handoff_to_ot (inspector only).\n")
 		b.WriteString("- Process another agent's validation response before deciding the next handoff.\n")
 		b.WriteString("- Engineer and Designer should hand completed implementation turns back to Inspector instead of routing directly to Tester by default.\n")
 		b.WriteString("- Engineer and Designer should treat tests as executable specification and challenge unclear criteria or coverage.\n")
 		b.WriteString("- Each time Engineer or Designer hands work back, Inspector should invoke finalize_pipeline to run the audit cycle.\n")
-		b.WriteString("- If the finalize_pipeline audit passes and tester evidence confirms the required tests are implemented and passing, Inspector should invoke handoff_to_ot.\n")
+		b.WriteString("- If the finalize_pipeline audit passes and tester evidence confirms the required tests are implemented and passing, Inspector must immediately invoke handoff_to_ot instead of starting another audit loop.\n")
+		b.WriteString("- While Inspector audit lock is active, challenges to Inspector are refused. If refused, stop work until Inspector challenges you directly or your preceding agent hands off to you.\n")
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -221,6 +224,7 @@ func ComposePipelineTaskUserPrompt(task *PipelineTaskInput) string {
 		writeLabeledScalar(&b, "Requested By", protocol["requested_by"])
 		writeLabeledScalar(&b, "Turn Mode", protocol["mode"])
 		writeLabeledScalar(&b, "Current Request", protocol["current_request"])
+		writeListSection(&b, "Audit Lock", summarizePipelineAuditLock(protocol["audit_lock"]))
 		writeListSection(&b, "Pending Challenge", summarizePipelineChallenge(protocol["pending_challenge"]))
 		writeListSection(&b, "Pending Validation", summarizePipelineValidation(protocol["pending_validation"]))
 		writeListSection(&b, "Recent Protocol Events", summarizePipelineProtocolEvents(protocol["recent_events"]))
@@ -349,6 +353,25 @@ func summarizePipelineChallenge(value any) []string {
 	if required := decodeAnyStringList(item["required_output"]); len(required) > 0 {
 		out = append(out, "Required Output: "+strings.Join(required, "; "))
 	}
+	return out
+}
+
+func summarizePipelineAuditLock(value any) []string {
+	item, _ := value.(map[string]any)
+	if len(item) == 0 {
+		return nil
+	}
+	out := make([]string, 0, 4)
+	if ownerAgent, _ := item["owner_agent"].(string); strings.TrimSpace(ownerAgent) != "" {
+		out = append(out, "Owner: "+strings.TrimSpace(ownerAgent))
+	}
+	if phase, _ := item["phase"].(string); strings.TrimSpace(phase) != "" {
+		out = append(out, "Phase: "+strings.TrimSpace(phase))
+	}
+	if reason, _ := item["reason"].(string); strings.TrimSpace(reason) != "" {
+		out = append(out, "Reason: "+strings.TrimSpace(reason))
+	}
+	out = append(out, "Challenges to Inspector are refused while this lock is active.")
 	return out
 }
 

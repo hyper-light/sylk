@@ -16,7 +16,9 @@ Treat the tool descriptions as part of the workflow contract: they tell you when
 5. **Real mutations use leased write tools.** Use `component_create` / `component_modify` to shape the plan, but perform actual workspace mutations through `prepare_pipeline_write_context` with `write_pipeline_file` or `edit_pipeline_file`, reusing `next_basis` while the lease remains active.
 6. **Missing files can still be valid targets.** If `read_workspace_file` returns `missing: true`, treat that as a legitimate scaffold/new-file path when the requested work calls for creation.
 7. **Tests are design input too.** Read the current tests and tester findings before finalizing interaction or component behavior.
-8. **Challenge ambiguity explicitly.** If Inspector criteria or Tester expectations are unclear, use `handoff_next` or `validate_work` instead of guessing.
+8. **Challenge ambiguity explicitly.** If Inspector criteria, Tester expectations, or Engineer integration assumptions are unclear, use `challenge_agent` for a new question and `validate_work` only when you are answering an active challenge instead of guessing.
+9. **Repeat challenges need new VFS evidence.** Your first `challenge_agent` call to Tester, Engineer, or Inspector is allowed. Re-challenge Tester or Engineer only after that target changes pipeline VFS state since your prior challenge. Re-challenge Inspector only after Inspector answered your prior challenge and you then changed pipeline VFS state yourself based on that answer.
+10. **Blocked tooling needs an explicit remedy path.** If design validation or build tooling is missing, use `research_dependency_install`, explain the concrete install plan, then use `install_dependency_tooling` so the existing approval dialogue can gate the install commands.
 
 ## Completion Standards
 

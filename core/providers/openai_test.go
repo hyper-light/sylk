@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -400,6 +401,7 @@ func TestOpenAIProviderBuildResponseParams_IncludesNativeWebSearchTool(t *testin
 				Model:     "gpt-5.4-pro",
 				MaxTokens: 1024,
 			},
+			AuthMode: openAIAuthModeAPIKey,
 		},
 	}
 
@@ -444,6 +446,62 @@ func TestOpenAIProviderBuildResponseParams_IncludesNativeWebSearchTool(t *testin
 	}
 	if first["type"] != "web_search_preview_2025_03_11" {
 		t.Fatalf("expected native web search tool type, got %#v", first["type"])
+	}
+	if first["search_context_size"] != "high" {
+		t.Fatalf("expected high search context size, got %#v", first["search_context_size"])
+	}
+	userLocation, ok := first["user_location"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected user_location object, got %#v", first["user_location"])
+	}
+	if userLocation["country"] != "US" {
+		t.Fatalf("expected country US, got %#v", userLocation["country"])
+	}
+	if userLocation["timezone"] != "America/Chicago" {
+		t.Fatalf("expected timezone America/Chicago, got %#v", userLocation["timezone"])
+	}
+}
+
+func TestOpenAIProviderBuildResponseParams_ChatGPTUsesCanonicalWebSearchTool(t *testing.T) {
+	p := &OpenAIProvider{
+		config: OpenAIConfig{
+			BaseConfig: BaseConfig{
+				Model:     "gpt-5.4-pro",
+				MaxTokens: 1024,
+			},
+			AuthMode: openAIAuthModeChatGPT,
+		},
+	}
+
+	params := p.buildResponseParams(&Request{
+		Messages: []Message{{Role: RoleUser, Content: "research Go error handling"}},
+		Tools: []Tool{
+			{
+				Kind: ToolKindNativeWebSearch,
+				Name: "web_search",
+				WebSearch: &WebSearchOptions{
+					SearchContextSize: WebSearchContextSizeHigh,
+					UserLocation: &WebSearchUserLocation{
+						Country:  "US",
+						Timezone: "America/Chicago",
+					},
+				},
+			},
+		},
+	})
+
+	body := marshalResponseNewParams(t, params)
+	tools, ok := body["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("expected 1 tool in marshaled params, got %#v", body["tools"])
+	}
+
+	first, ok := tools[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected first tool object, got %#v", tools[0])
+	}
+	if first["type"] != "web_search" {
+		t.Fatalf("expected canonical chatgpt web search tool type, got %#v", first["type"])
 	}
 	if first["search_context_size"] != "high" {
 		t.Fatalf("expected high search context size, got %#v", first["search_context_size"])
@@ -645,8 +703,11 @@ type mockAuthService struct {
 	completeAuth   *oauth.OpenAIChatGPTAuth
 	completeErr    error
 	completeDelay  time.Duration
+	refreshAuth    *oauth.OpenAIChatGPTAuth
+	refreshErr     error
 	saveErr        error
 	saveCalls      int
+	deleteCalls    int32
 }
 
 func (m *mockAuthService) BeginDeviceAuth(context.Context) (*oauth.DeviceCodeChallenge, error) {
@@ -671,6 +732,12 @@ func (m *mockAuthService) CompleteDeviceAuth(ctx context.Context, _ *oauth.Devic
 }
 
 func (m *mockAuthService) Refresh(context.Context, *oauth.OpenAIChatGPTAuth) (*oauth.OpenAIChatGPTAuth, error) {
+	if m.refreshErr != nil {
+		return nil, m.refreshErr
+	}
+	if m.refreshAuth != nil {
+		return m.refreshAuth, nil
+	}
 	return nil, errors.New("not implemented")
 }
 
@@ -688,7 +755,8 @@ func (m *mockAuthService) Load(context.Context) (*oauth.OpenAIChatGPTAuth, error
 }
 
 func (m *mockAuthService) Delete(context.Context) error {
-	return errors.New("not implemented")
+	atomic.AddInt32(&m.deleteCalls, 1)
+	return nil
 }
 
 func TestOpenAIProviderStartChatGPTDeviceAuth_ReturnsChallengeImmediately(t *testing.T) {
@@ -778,6 +846,37 @@ func TestHydrateOpenAIConfig_ChatGPTFromAuthService(t *testing.T) {
 	}
 	if cfg.ChatGPTAccountID != "org_123" {
 		t.Fatalf("expected ChatGPTAccountID from auth service, got %q", cfg.ChatGPTAccountID)
+	}
+}
+
+func TestOpenAIProviderRefreshChatGPTAuth_InvalidGrantPreservesAuthStore(t *testing.T) {
+	authSvc := &mockAuthService{
+		auth: &oauth.OpenAIChatGPTAuth{
+			AuthMode:         "chatgpt",
+			AccessToken:      "existing_access",
+			RefreshToken:     "existing_refresh",
+			ChatGPTAccountID: "org_existing",
+		},
+		refreshErr: errors.New("invalid_grant"),
+	}
+	provider, err := NewOpenAIProviderWithAuthService(context.Background(), OpenAIConfig{
+		BaseConfig: BaseConfig{
+			Model:     "gpt-5.4-pro",
+			MaxTokens: 1024,
+		},
+		AuthMode:           openAIAuthModeChatGPT,
+		AllowUnknownModels: true,
+	}, authSvc)
+	if err != nil {
+		t.Fatalf("NewOpenAIProviderWithAuthService() error: %v", err)
+	}
+
+	err = provider.refreshChatGPTAuth(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "invalid_grant") {
+		t.Fatalf("refreshChatGPTAuth() error = %v, want invalid_grant", err)
+	}
+	if got := atomic.LoadInt32(&authSvc.deleteCalls); got != 0 {
+		t.Fatalf("Delete() calls = %d, want 0", got)
 	}
 }
 

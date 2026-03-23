@@ -20,7 +20,10 @@ func TestPodActivationPolicies_GroupsPipeline(t *testing.T) {
 		{AgentType: "tester", Category: handoff.CategoryStandalone},
 	}
 
-	policies, podPolicies, agentToPod := PodActivationPolicies(descriptors)
+	policies, podPolicies, agentToPod, err := PodActivationPolicies(descriptors)
+	if err != nil {
+		t.Fatalf("PodActivationPolicies() error = %v", err)
+	}
 
 	// Should have: guide, orchestrator, architect, inspector, tester (5 singletons) + 1 pipeline = 6
 	if len(policies) != 6 {
@@ -102,7 +105,10 @@ func TestPodActivationPolicies_NoPipelineAgents(t *testing.T) {
 		{AgentType: "architect", Category: handoff.CategoryKnowledge},
 	}
 
-	policies, _, agentToPod := PodActivationPolicies(descriptors)
+	policies, _, agentToPod, err := PodActivationPolicies(descriptors)
+	if err != nil {
+		t.Fatalf("PodActivationPolicies() error = %v", err)
+	}
 
 	// Should have: guide + architect = 2 (no pipeline pod).
 	if len(policies) != 2 {
@@ -113,9 +119,20 @@ func TestPodActivationPolicies_NoPipelineAgents(t *testing.T) {
 	}
 }
 
+func TestPodActivationPolicies_UnknownCategoryReturnsError(t *testing.T) {
+	descriptors := []handoff.AgentDescriptor{
+		{AgentType: "mystery", Category: handoff.AgentCategory(99)},
+	}
+
+	_, _, _, err := PodActivationPolicies(descriptors)
+	if err == nil {
+		t.Fatal("expected error for unknown category")
+	}
+}
+
 func TestPodPolicyScanPeriod(t *testing.T) {
 	podPolicies := []*pod.PodPolicy{
-		{PodID: "guide", IsDaemon: true}, // skipped
+		{PodID: "guide", IsDaemon: true},                 // skipped
 		{PodID: "architect", IdleToWarm: 30_000_000_000}, // 30s → scan at 5s
 	}
 

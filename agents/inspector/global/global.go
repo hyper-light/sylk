@@ -55,13 +55,14 @@ type GlobalInspector struct {
 	toolDefsDirty bool
 
 	// Bus (standard agent pattern).
-	bus         guide.EventBus
-	channels    *guide.AgentChannels
-	requestSub  guide.Subscription
-	responseSub guide.Subscription
-	registrySub guide.Subscription
-	running     bool
-	knownAgents map[string]*guide.AgentAnnouncement
+	bus           guide.EventBus
+	channels      *guide.AgentChannels
+	requestSub    guide.Subscription
+	responseSub   guide.Subscription
+	registrySub   guide.Subscription
+	running       bool
+	knownAgentsMu sync.RWMutex
+	knownAgents   map[string]*guide.AgentAnnouncement
 
 	// Sync RPC (for architect escalation).
 	pendingMu  sync.Mutex
@@ -561,6 +562,9 @@ func (gi *GlobalInspector) handleRegistryAnnouncement(msg *guide.Message) error 
 	if !ok {
 		return nil
 	}
+
+	gi.knownAgentsMu.Lock()
+	defer gi.knownAgentsMu.Unlock()
 
 	switch msg.Type {
 	case guide.MessageTypeAgentRegistered:

@@ -71,7 +71,17 @@ type progressPublisherKey struct{}
 
 // WithProgressPublisher attaches a ProgressPublisher to a context.
 func WithProgressPublisher(ctx context.Context, pp *ProgressPublisher) context.Context {
-	return context.WithValue(ctx, progressPublisherKey{}, pp)
+	if pp == nil {
+		return ctx
+	}
+	ctx = context.WithValue(ctx, progressPublisherKey{}, pp)
+	existing := providers.RetryObserverFromContext(ctx)
+	return providers.WithRetryObserver(ctx, func(event providers.RetryEvent) {
+		pp.PublishRetry(event)
+		if existing != nil {
+			existing(event)
+		}
+	})
 }
 
 // ProgressPublisherFromContext retrieves the ProgressPublisher from context.
@@ -162,6 +172,41 @@ func (pp *ProgressPublisher) PublishStart() {
 	}
 	msg := &guide.Message{
 		ID:            fmt.Sprintf("start_%s_%s", pp.AgentID, uuid.New().String()[:8]),
+		CorrelationID: pp.CorrelationID,
+		Type:          guide.MessageTypeStream,
+		Payload:       stream,
+		SourceAgentID: pp.AgentID,
+		TargetAgentID: pp.SourceAgentID,
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityNormal,
+	}
+	_ = pp.Bus.Publish(pp.Channels.Responses, msg)
+}
+
+func (pp *ProgressPublisher) PublishRetry(status providers.RetryEvent) {
+	if pp == nil || pp.Bus == nil || pp.Channels == nil {
+		return
+	}
+	event := &guide.StreamEvent{
+		Type: guide.StreamEventRetry,
+		Data: guide.RetryStatus{
+			Attempt:     status.Attempt,
+			MaxAttempts: status.MaxAttempts,
+			Delay:       status.Delay,
+			Err:         status.Err,
+		},
+		Timestamp: time.Now(),
+	}
+	stream := &guide.StreamResponse{
+		CorrelationID:     pp.CorrelationID,
+		RespondingAgentID: pp.AgentID,
+		TargetAgentID:     pp.SourceAgentID,
+		Event:             event,
+	}
+	msg := &guide.Message{
+		ID:            fmt.Sprintf("retry_%s_%s", pp.AgentID, uuid.New().String()[:8]),
 		CorrelationID: pp.CorrelationID,
 		Type:          guide.MessageTypeStream,
 		Payload:       stream,
@@ -297,6 +342,9 @@ func completeStreamingWithWatchdog(
 	for chunk := range chunks {
 		if chunk != nil {
 			sawChunks = true
+		}
+		if chunk != nil && chunk.Type == providers.ChunkTypeStart && chunk.RetryReset {
+			streamErr = nil
 		}
 		collector.Add(chunk)
 		if chunk != nil && chunk.Type == providers.ChunkTypeError {

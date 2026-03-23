@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -40,8 +41,24 @@ var (
 // Writes to ~/.sylk/logs/ui_events.log.
 func DebugFileLog() *slog.Logger { return guideFileLog() }
 
+func shouldWriteGuideDebugLogToSharedFile() bool {
+	return shouldWriteGuideDebugLogToSharedFileForProcess(os.Args[0])
+}
+
+func shouldWriteGuideDebugLogToSharedFileForProcess(argv0 string) bool {
+	name := filepath.Base(strings.TrimSpace(argv0))
+	if name == "" || name == "." {
+		return true
+	}
+	return !strings.HasSuffix(name, ".test")
+}
+
 func guideFileLog() *slog.Logger {
 	guideDebugLogOnce.Do(func() {
+		if !shouldWriteGuideDebugLogToSharedFile() {
+			guideDebugLog = slog.New(slog.NewTextHandler(io.Discard, logging.HandlerOptions(slog.LevelInfo)))
+			return
+		}
 		home, _ := os.UserHomeDir()
 		dir := filepath.Join(home, ".sylk", "logs")
 		os.MkdirAll(dir, 0755)
@@ -144,10 +161,6 @@ type Guide struct {
 	// type names for the activation controller, which indexes by type.
 	typeIndex *ShardedMap[string, string]
 
-	// podIndex maps concrete agent IDs back to their owning pod ID when the
-	// worker lives in a task-scoped or otherwise non-singleton pod.
-	podIndex *ShardedMap[string, string]
-
 	// Resilience components
 	circuits       *CircuitBreakerRegistry
 	health         *HealthMonitor
@@ -181,7 +194,7 @@ type Guide struct {
 	// register the agent's routing info (capabilities, intents, channels)
 	// with the Guide. Bridges the container→guide registration gap for
 	// agents that weren't pre-activated during bootstrap.
-	agentRegistrar func(ctx context.Context, targetAgentID, podID, agentType string)
+	agentRegistrar func(agentType string)
 
 	// Service registry for health-aware routing. When set, isAgentHealthy
 	// uses healthy endpoints from the registry instead of the local
@@ -349,7 +362,6 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		agentChannels:           NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:             NewStringMap[bool](DefaultShardCount),
 		typeIndex:               NewStringMap[string](DefaultShardCount),
-		podIndex:                NewStringMap[string](DefaultShardCount),
 		registry:                registry,
 		routing:                 routing,
 		triggers:                NewTriggerDetector(routing),
@@ -517,7 +529,6 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		agentChannels:           NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:             NewStringMap[bool](DefaultShardCount),
 		typeIndex:               NewStringMap[string](DefaultShardCount),
-		podIndex:                NewStringMap[string](DefaultShardCount),
 		registry:                registry,
 		routing:                 routing,
 		triggers:                NewTriggerDetector(routing),
@@ -563,6 +574,7 @@ func NewWithAPIKey(apiKey string, cfg Config) (*Guide, error) {
 	if apiKey != "" {
 		opts = append(opts, option.WithAPIKey(apiKey))
 	}
+	opts = append(opts, option.WithMaxRetries(0))
 	client := anthropic.NewClient(opts...)
 
 	return New(&client, cfg)
@@ -623,7 +635,6 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 		agentChannels:           NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:             NewStringMap[bool](DefaultShardCount),
 		typeIndex:               NewStringMap[string](DefaultShardCount),
-		podIndex:                NewStringMap[string](DefaultShardCount),
 		registry:                registry,
 		routing:                 routing,
 		triggers:                NewTriggerDetector(routing),
@@ -646,6 +657,8 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 		workspaceViews:          authority.RestrictWorkspaceViews("guide", cfg.WorkspaceViews),
 		requestCancels:          make(map[string]context.CancelFunc),
 		interruptedCorrelations: make(map[string]time.Time),
+		responseMessagesSeen:    make(map[string]time.Time),
+		completedPendings:       make(map[string]completedPendingRoute),
 		streamReroutes:          make(map[string]string),
 	}
 
@@ -703,6 +716,9 @@ func (g *Guide) responseTrackingTTL() time.Duration {
 }
 
 func (g *Guide) markResponseMessageSeen(messageID string) bool {
+	if g == nil {
+		return false
+	}
 	messageID = strings.TrimSpace(messageID)
 	if messageID == "" {
 		return false
@@ -711,15 +727,20 @@ func (g *Guide) markResponseMessageSeen(messageID string) bool {
 	ttl := g.responseTrackingTTL()
 	g.responseMsgMu.Lock()
 	defer g.responseMsgMu.Unlock()
-	if seenAt, ok := g.responseMessagesSeen[messageID]; ok && now.Sub(seenAt) <= ttl {
+	seen := g.responseMessagesSeen
+	if seen == nil {
+		seen = make(map[string]time.Time)
+		g.responseMessagesSeen = seen
+	}
+	if seenAt, ok := seen[messageID]; ok && now.Sub(seenAt) <= ttl {
 		return true
 	}
-	for id, seenAt := range g.responseMessagesSeen {
+	for id, seenAt := range seen {
 		if now.Sub(seenAt) > ttl {
-			delete(g.responseMessagesSeen, id)
+			delete(seen, id)
 		}
 	}
-	g.responseMessagesSeen[messageID] = now
+	seen[messageID] = now
 	return false
 }
 
@@ -731,12 +752,17 @@ func (g *Guide) rememberCompletedPending(pending *PendingRequest) {
 	ttl := g.responseTrackingTTL()
 	g.completedPendingMu.Lock()
 	defer g.completedPendingMu.Unlock()
-	for correlationID, entry := range g.completedPendings {
+	completed := g.completedPendings
+	if completed == nil {
+		completed = make(map[string]completedPendingRoute)
+		g.completedPendings = completed
+	}
+	for correlationID, entry := range completed {
 		if now.Sub(entry.seenAt) > ttl {
-			delete(g.completedPendings, correlationID)
+			delete(completed, correlationID)
 		}
 	}
-	g.completedPendings[pending.CorrelationID] = completedPendingRoute{
+	completed[pending.CorrelationID] = completedPendingRoute{
 		pending: pending,
 		seenAt:  now,
 	}
@@ -751,12 +777,16 @@ func (g *Guide) completedPending(correlationID string) *PendingRequest {
 	ttl := g.responseTrackingTTL()
 	g.completedPendingMu.Lock()
 	defer g.completedPendingMu.Unlock()
-	entry, ok := g.completedPendings[correlationID]
+	completed := g.completedPendings
+	if completed == nil {
+		return nil
+	}
+	entry, ok := completed[correlationID]
 	if !ok {
 		return nil
 	}
 	if now.Sub(entry.seenAt) > ttl {
-		delete(g.completedPendings, correlationID)
+		delete(completed, correlationID)
 		return nil
 	}
 	return entry.pending
@@ -768,7 +798,12 @@ func (g *Guide) forgetCompletedPending(correlationID string) {
 		return
 	}
 	g.completedPendingMu.Lock()
-	delete(g.completedPendings, correlationID)
+	completed := g.completedPendings
+	if completed == nil {
+		g.completedPendingMu.Unlock()
+		return
+	}
+	delete(completed, correlationID)
 	g.completedPendingMu.Unlock()
 }
 
@@ -887,7 +922,6 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 	}
 
 	if request.TargetAgentID != "" {
-		g.seedExplicitTargetActivationMapping(request)
 		resolvedTarget, err := g.ensureExplicitTargetReady(ctx, request.TargetAgentID)
 		if err != nil && request.ExplicitTarget {
 			return nil, "", fmt.Errorf("cannot route to @%s: %w", request.TargetAgentID, err)
@@ -1348,48 +1382,6 @@ func (g *Guide) resolveAgentDisplayName(agentID string) string {
 	return agentID
 }
 
-func (g *Guide) seedExplicitTargetActivationMapping(request *RouteRequest) {
-	if g == nil || request == nil {
-		return
-	}
-	targetAgentID := strings.TrimSpace(request.TargetAgentID)
-	if targetAgentID == "" || g.resolveAgent(targetAgentID) != nil {
-		return
-	}
-	taskID := strings.TrimSpace(stringMapString(request.Metadata, "task_id"))
-	agentType := strings.TrimSpace(stringMapString(request.Metadata, "agent_type"))
-	if !isTaskScopedPipelineWorkerType(agentType) || taskID == "" {
-		return
-	}
-	if g.typeIndex != nil {
-		g.typeIndex.Set(targetAgentID, agentType)
-	}
-	if g.podIndex != nil {
-		g.podIndex.Set(targetAgentID, taskID)
-	}
-}
-
-func isTaskScopedPipelineWorkerType(agentType string) bool {
-	switch strings.TrimSpace(agentType) {
-	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
-		return true
-	default:
-		return false
-	}
-}
-
-func stringMapString(values map[string]any, key string) string {
-	if len(values) == 0 {
-		return ""
-	}
-	raw, ok := values[key]
-	if !ok {
-		return ""
-	}
-	text, _ := raw.(string)
-	return text
-}
-
 // resolveReadyAgentID returns a registered, ready agent ID for the given
 // UUID/name/type reference. This prefers the direct ID when it is ready, and
 // otherwise falls back to the current ready registration for the same agent
@@ -1436,16 +1428,6 @@ func (g *Guide) resolveActivationType(idOrName string) string {
 // to resolve the pod. Returns the agent type itself when no activator
 // is set or no mapping exists (singleton pods).
 func (g *Guide) resolvePodID(idOrName string) string {
-	if g != nil && g.podIndex != nil {
-		if podID, ok := g.podIndex.Get(idOrName); ok && strings.TrimSpace(podID) != "" {
-			return podID
-		}
-	}
-	if g != nil {
-		if info := g.routing.GetRoutingInfo(idOrName); info != nil && strings.TrimSpace(info.PodID) != "" {
-			return strings.TrimSpace(info.PodID)
-		}
-	}
 	agentType := g.resolveActivationType(idOrName)
 	if g.activator != nil {
 		return g.activator.PodForAgent(agentType)
@@ -1498,7 +1480,7 @@ func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID str
 			"elapsed_ms", time.Since(activateStart).Milliseconds())
 	}
 	if g.agentRegistrar != nil {
-		g.agentRegistrar(ctx, targetAgentID, podID, g.resolveActivationType(targetAgentID))
+		g.agentRegistrar(g.resolveActivationType(targetAgentID))
 	}
 
 	if resolved := g.resolveReadyAgentID(targetAgentID); resolved != "" {
@@ -1673,6 +1655,49 @@ type classificationTuple struct {
 	target string
 }
 
+func cloneRouteResult(result *RouteResult) *RouteResult {
+	if result == nil {
+		return nil
+	}
+	cloned := *result
+	if result.Entities != nil {
+		entities := *result.Entities
+		if len(result.Entities.FilePaths) > 0 {
+			entities.FilePaths = append([]string(nil), result.Entities.FilePaths...)
+		}
+		if len(result.Entities.Data) > 0 {
+			entities.Data = make(map[string]any, len(result.Entities.Data))
+			for key, value := range result.Entities.Data {
+				entities.Data[key] = value
+			}
+		}
+		cloned.Entities = &entities
+	}
+	if len(result.SubResults) > 0 {
+		cloned.SubResults = make([]*RouteResult, 0, len(result.SubResults))
+		for _, sub := range result.SubResults {
+			cloned.SubResults = append(cloned.SubResults, cloneRouteResult(sub))
+		}
+	}
+	if len(result.PhaseMetadata) > 0 {
+		cloned.PhaseMetadata = make(map[string]any, len(result.PhaseMetadata))
+		for key, value := range result.PhaseMetadata {
+			cloned.PhaseMetadata[key] = value
+		}
+	}
+	if result.CrossDomain != nil {
+		crossDomain := *result.CrossDomain
+		if len(result.CrossDomain.SubTasks) > 0 {
+			crossDomain.SubTasks = make([]*RouteResult, 0, len(result.CrossDomain.SubTasks))
+			for _, sub := range result.CrossDomain.SubTasks {
+				crossDomain.SubTasks = append(crossDomain.SubTasks, cloneRouteResult(sub))
+			}
+		}
+		cloned.CrossDomain = &crossDomain
+	}
+	return &cloned
+}
+
 func (g *Guide) classifyWithSingleflight(
 	ctx context.Context,
 	request *RouteRequest,
@@ -1693,7 +1718,7 @@ func (g *Guide) classifyWithSingleflight(
 	if !ok || tuple == nil {
 		return nil, "", fmt.Errorf("invalid classification result")
 	}
-	return tuple.result, tuple.target, nil
+	return cloneRouteResult(tuple.result), tuple.target, nil
 }
 
 func (g *Guide) classifyByMode(
@@ -2335,10 +2360,6 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 	if info.Type != "" {
 		g.typeIndex.Set(info.ID, info.Type)
 	}
-	if trimmedPodID := strings.TrimSpace(info.PodID); trimmedPodID != "" && g.podIndex != nil {
-		g.podIndex.Set(info.ID, trimmedPodID)
-	}
-
 	// Register capabilities/constraints with registry
 	if info.Registration != nil {
 		g.registry.Register(info.Registration)
@@ -2438,9 +2459,6 @@ func (g *Guide) PreRegister(info *AgentRoutingInfo) error {
 	g.routing.RegisterAgent(info)
 	if info.Type != "" {
 		g.typeIndex.Set(info.ID, info.Type)
-	}
-	if trimmedPodID := strings.TrimSpace(info.PodID); trimmedPodID != "" && g.podIndex != nil {
-		g.podIndex.Set(info.ID, trimmedPodID)
 	}
 	if info.Registration != nil {
 		g.registry.Register(info.Registration)
@@ -4344,7 +4362,7 @@ func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *Forward
 	// Skip when the resolved agent already has active bus subscriptions —
 	// re-registration is only needed when activation created a fresh agent.
 	if g.agentRegistrar != nil {
-		g.agentRegistrar(g.processingContext(), targetAgentID, podID, activationType)
+		g.agentRegistrar(activationType)
 	}
 
 	// Re-resolve — cold start may create a fresh registration ID.
@@ -4840,7 +4858,7 @@ func (g *Guide) SetActivator(a PodActivator) {
 // register the agent's routing info with the Guide. This bridges the gap
 // between container activation (which only marks readiness) and Guide
 // registration (which provides capabilities, intents, and channels).
-func (g *Guide) SetAgentRegistrar(registrar func(ctx context.Context, targetAgentID, podID, agentType string)) {
+func (g *Guide) SetAgentRegistrar(registrar func(agentType string)) {
 	g.agentRegistrar = registrar
 }
 
