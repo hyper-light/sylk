@@ -17,6 +17,7 @@ const (
 	metadataCacheAffinityKey     = "llm_cache_affinity"
 	metadataThoughtVisibilityKey = "llm_thought_visibility"
 	metadataEmitThoughtsKey      = "llm_emit_thoughts"
+	anthropicMinThinkingBudget   = 1024
 )
 
 type ProviderFamily string
@@ -230,11 +231,20 @@ func thinkingBudgetFor(provider ProviderFamily, stage StageProfile, maxTokens in
 	case DeliberationLow:
 		return 0, true
 	case DeliberationMedium:
-		return clampThinkingBudget(max(maxTokens/4, 1024), maxTokens), true
+		if budget := clampThinkingBudget(max(maxTokens/4, anthropicMinThinkingBudget), maxTokens); budget > 0 {
+			return budget, true
+		}
+		return 0, false
 	case DeliberationHigh:
-		return clampThinkingBudget(max(maxTokens/2, 2048), maxTokens), true
+		if budget := clampThinkingBudget(max(maxTokens/2, 2048), maxTokens); budget > 0 {
+			return budget, true
+		}
+		return 0, false
 	case DeliberationMax:
-		return clampThinkingBudget(max((maxTokens*3)/4, 4096), maxTokens), true
+		if budget := clampThinkingBudget(max((maxTokens*3)/4, 4096), maxTokens); budget > 0 {
+			return budget, true
+		}
+		return 0, false
 	default:
 		return 0, false
 	}
@@ -244,8 +254,17 @@ func clampThinkingBudget(budget int, maxTokens int) int {
 	if budget < 0 {
 		return 0
 	}
+	if maxTokens <= anthropicMinThinkingBudget {
+		return 0
+	}
+	if budget > 0 && budget < anthropicMinThinkingBudget {
+		budget = anthropicMinThinkingBudget
+	}
 	if budget >= maxTokens {
 		return maxTokens - 1
+	}
+	if budget > 0 && budget < anthropicMinThinkingBudget {
+		return 0
 	}
 	return budget
 }

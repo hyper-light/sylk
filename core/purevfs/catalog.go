@@ -565,7 +565,7 @@ func pythonProfile() RuntimeProfile {
 			StaticEnv: map[string]string{
 				"PYTHONNOUSERSITE": "1",
 			},
-			Toolchains:  []string{"python", "python3", "pip", "pytest"},
+			Toolchains:  []string{"python", "python3", "pip", "pip3", "pytest"},
 			ManifestRO:  []string{"pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "tox.ini"},
 			CacheBucket: "python",
 		},

@@ -209,7 +209,9 @@ func (pi *PipelineInspector) applyToolCalls(
 			default:
 				result = shared.ToolErrorPayload(err)
 				isError = true
-				errCount++
+				if agentShared.ToolErrorCountsTowardAbort(err) {
+					errCount++
+				}
 				if hint := agentShared.ToolRecoveryHint(call.Name, err); hint != "" {
 					recoveryHints = append(recoveryHints, hint)
 				}

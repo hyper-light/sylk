@@ -290,6 +290,13 @@ func UpdateToolErrors(current, errCount, totalCalls int) int {
 	return 0
 }
 
+func ToolErrorCountsTowardAbort(err error) bool {
+	if err == nil {
+		return false
+	}
+	return !errors.Is(err, commandapproval.ErrApprovalDenied)
+}
+
 type toolErrorDetailPayload struct {
 	Kind      string
 	Retryable bool
@@ -334,6 +341,15 @@ func toolErrorDetail(err error) toolErrorDetailPayload {
 			Kind: "approval_required",
 			Recovery: []string{
 				"Wait for Guardian approval or choose a less sensitive command that fits the pre-approved path",
+			},
+		}
+	case errors.Is(err, commandapproval.ErrApprovalDenied):
+		return toolErrorDetailPayload{
+			Kind: "approval_denied",
+			Recovery: []string{
+				"The user denied this command, so do not retry the same invocation",
+				"Choose a different safe approach or a less sensitive command if one exists",
+				"If the task is blocked on the user's preference, explain the blockage and ask what they want to do instead",
 			},
 		}
 	default:

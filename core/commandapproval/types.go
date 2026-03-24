@@ -55,6 +55,10 @@ type Request struct {
 	AgentID        string         `json:"agent_id,omitempty"`
 	AgentType      string         `json:"agent_type,omitempty"`
 	SessionID      string         `json:"session_id,omitempty"`
+	DAGID          string         `json:"dag_id,omitempty"`
+	NodeID         string         `json:"node_id,omitempty"`
+	TaskID         string         `json:"task_id,omitempty"`
+	PipelineID     string         `json:"pipeline_id,omitempty"`
 	ApprovalPolicy ApprovalPolicy `json:"approval_policy,omitempty"`
 }
 
@@ -108,6 +112,11 @@ type Proposal struct {
 	TargetAgentID  string         `json:"target_agent_id"`
 	AgentID        string         `json:"agent_id,omitempty"`
 	AgentType      string         `json:"agent_type,omitempty"`
+	SessionID      string         `json:"session_id,omitempty"`
+	DAGID          string         `json:"dag_id,omitempty"`
+	NodeID         string         `json:"node_id,omitempty"`
+	TaskID         string         `json:"task_id,omitempty"`
+	PipelineID     string         `json:"pipeline_id,omitempty"`
 	ToolName       string         `json:"tool_name,omitempty"`
 	Command        string         `json:"command"`
 	WorkingDir     string         `json:"working_dir,omitempty"`

@@ -78,7 +78,8 @@ func (e *Engineer) registerCoreSkills() {
 		e.skills.Register(skill)
 	}
 	for _, skill := range shared.PipelineProtocolSkills(shared.PipelineProtocolSkillConfig{
-		AgentType: func() string { return "engineer" },
+		AgentType:      func() string { return "engineer" },
+		WorkspaceViews: func() versioning.WorkspaceViewAccess { return e.workspaceViews },
 		Route: shared.PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return e.bus },
 			SessionID:   func() string { return e.config.SessionID },
@@ -740,12 +741,14 @@ func (e *Engineer) runGoplsCommand(ctx context.Context, workDir, subcommand, arg
 }
 
 func (e *Engineer) runToolInDir(ctx context.Context, dir string, allowWorkspaceWrite bool, bin string, args ...string) (string, error) {
-	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), commandapproval.Request{
+	authReq := commandapproval.Request{
 		Command:       strings.Join(append([]string{bin}, args...), " "),
 		WorkingDir:    dir,
 		WorkspaceRoot: e.effectiveWorkingDirectory(),
 		ToolName:      bin,
-	}); err != nil {
+	}
+	shared.PopulateCommandApprovalScope(ctx, &authReq)
+	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq); err != nil {
 		return "", err
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 20*time.Second)

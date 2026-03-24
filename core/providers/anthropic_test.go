@@ -67,6 +67,54 @@ func TestAnthropicBuildParams_IncludesNativeWebSearchTool(t *testing.T) {
 	}
 }
 
+func TestAnthropicBuildParams_DisablesThinkingWhenMaxTokensTooSmall(t *testing.T) {
+	p := &AnthropicProvider{
+		config: AnthropicConfig{
+			BaseConfig: BaseConfig{
+				Model:     "claude-sonnet-4-6",
+				MaxTokens: 512,
+			},
+		},
+	}
+
+	params := p.buildParams(&Request{
+		Messages:       []Message{{Role: RoleUser, Content: "hello"}},
+		MaxTokens:      512,
+		ThinkingBudget: 256,
+	})
+
+	body := marshalAnthropicParams(t, params)
+	if thinking, ok := body["thinking"]; ok && thinking != nil {
+		t.Fatalf("thinking = %#v, want omitted/disabled for too-small max tokens", thinking)
+	}
+}
+
+func TestAnthropicBuildParams_ClampsThinkingBudgetToMinimum(t *testing.T) {
+	p := &AnthropicProvider{
+		config: AnthropicConfig{
+			BaseConfig: BaseConfig{
+				Model:     "claude-sonnet-4-6",
+				MaxTokens: 2048,
+			},
+		},
+	}
+
+	params := p.buildParams(&Request{
+		Messages:       []Message{{Role: RoleUser, Content: "hello"}},
+		MaxTokens:      2048,
+		ThinkingBudget: 128,
+	})
+
+	body := marshalAnthropicParams(t, params)
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("thinking = %#v, want object", body["thinking"])
+	}
+	if got := thinking["budget_tokens"]; got != float64(1024) {
+		t.Fatalf("thinking.budget_tokens = %#v, want 1024", got)
+	}
+}
+
 func marshalAnthropicParams(t *testing.T, params any) map[string]any {
 	t.Helper()
 

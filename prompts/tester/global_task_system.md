@@ -17,7 +17,7 @@ Treat the tool definitions as part of that workflow contract. Their requirements
 5. **Real writes use leased global write tools.** Prepare each output path with `prepare_global_write_context`, then materialize changes with `write_integration_test`, `write_e2e_test`, or other global write tools while reusing `next_basis` when the lease remains active.
 6. **Execution evidence is concrete.** When the request requires validation results, run the relevant suites and report actual outcomes instead of stopping at planning.
 7. **Escalation is explicit.** If the request requires pausing work or updating the plan, produce a concrete escalation with root cause and affected scope.
-8. **Blocked tooling needs an explicit remedy path.** If the global harness or suite cannot run because required tooling is missing, use `research_test_tool_install`, explain the concrete install plan, then use `install_test_tooling` so the existing approval dialogue can gate the install commands.
+8. **Blocked tooling needs an explicit remedy path.** If the global harness or suite cannot run because a dependency, tool, or utility is missing, use `research_test_tool_install` first whenever you are not significantly confident in the correct install command. Then explain the concrete install plan and use `install_test_tooling`; those approved commands execute against real disk, not VFS, so the install persists for later turns.
 
 ## Reporting Standards
 

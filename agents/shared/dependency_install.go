@@ -109,6 +109,9 @@ Schema:
 Hard requirements:
 - Each step command must be exactly one command.
 - Do not use pipes, &&, ||, ;, redirection, subshells, or multi-line shell.
+- Do not create ad-hoc virtual environments or activation steps such as 'python -m venv', 'python3 -m venv', 'virtualenv', 'uv venv', 'source .venv/bin/activate', or '.venv/bin/...'.
+- Do not install tooling into temporary scratch locations such as '/tmp'; choose the repository package manager or interpreter-coupled package installation instead.
+- When Python package installation is needed, prefer 'python -m pip ...' or 'python3 -m pip ...' over bare 'pip' or 'pip3'.
 - Prefer the package manager already implied by the repository files.
 - Prefer workspace-local or project-scoped installation when possible.
 - Keep the plan minimal.
@@ -242,17 +245,60 @@ func ValidateDependencyInstallPlan(plan *DependencyInstallPlan) error {
 		if command == "" {
 			return fmt.Errorf("install step %d is missing a command", idx+1)
 		}
+		if DependencyCommandCreatesAdHocVirtualenv(command) {
+			return fmt.Errorf("install step %d command creates an ad-hoc virtual environment; prefer the repository package manager or python -m pip", idx+1)
+		}
+		if DependencyCommandUsesLocalVenvExecutable(command) {
+			return fmt.Errorf("install step %d command depends on a local virtualenv executable; prefer the repository package manager or python -m pip", idx+1)
+		}
 		if DependencyCommandHasUnsafeShellSyntax(command) {
 			return fmt.Errorf("install step %d command uses unsupported shell syntax", idx+1)
 		}
 	}
-	if strings.TrimSpace(plan.ValidationCommand) != "" && DependencyCommandHasUnsafeShellSyntax(plan.ValidationCommand) {
-		return fmt.Errorf("validation_command uses unsupported shell syntax")
+	if validationCommand := strings.TrimSpace(plan.ValidationCommand); validationCommand != "" {
+		switch {
+		case DependencyCommandCreatesAdHocVirtualenv(validationCommand):
+			return fmt.Errorf("validation_command creates an ad-hoc virtual environment; prefer the repository package manager or python -m pip")
+		case DependencyCommandUsesLocalVenvExecutable(validationCommand):
+			return fmt.Errorf("validation_command depends on a local virtualenv executable; prefer the repository package manager or python -m pip")
+		case DependencyCommandHasUnsafeShellSyntax(validationCommand):
+			return fmt.Errorf("validation_command uses unsupported shell syntax")
+		}
 	}
 	if strings.TrimSpace(plan.Summary) == "" {
 		plan.Summary = "Install missing project tooling"
 	}
 	return nil
+}
+
+func DependencyCommandCreatesAdHocVirtualenv(command string) bool {
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) == 0 {
+		return false
+	}
+	base := strings.ToLower(filepath.Base(fields[0]))
+	switch base {
+	case "virtualenv":
+		return true
+	case "uv":
+		return len(fields) >= 2 && strings.EqualFold(fields[1], "venv")
+	case "python", "python3":
+		return len(fields) >= 3 && fields[1] == "-m" && (strings.EqualFold(fields[2], "venv") || strings.EqualFold(fields[2], "virtualenv"))
+	default:
+		return false
+	}
+}
+
+func DependencyCommandUsesLocalVenvExecutable(command string) bool {
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) == 0 {
+		return false
+	}
+	exe := strings.ToLower(filepath.ToSlash(fields[0]))
+	return strings.HasPrefix(exe, ".venv/") ||
+		strings.Contains(exe, "/.venv/") ||
+		strings.HasPrefix(exe, "venv/") ||
+		strings.Contains(exe, "/venv/")
 }
 
 func DependencyCommandHasUnsafeShellSyntax(command string) bool {

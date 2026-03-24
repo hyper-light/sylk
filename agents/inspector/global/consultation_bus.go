@@ -2,10 +2,14 @@ package global
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -45,20 +49,42 @@ func (gi *GlobalInspector) deliverPendingMessage(msg *guide.Message) {
 	}
 }
 
-func (gi *GlobalInspector) requestRouteSync(ctx context.Context, target, payload string) (*guide.Message, error) {
+func (gi *GlobalInspector) requestRouteSync(
+	ctx context.Context,
+	target string,
+	payload any,
+	metadata map[string]any,
+) (*guide.Message, error) {
 	if gi.bus == nil {
 		return nil, fmt.Errorf("bus not available")
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil, fmt.Errorf("target agent is required")
+	}
+	encoded, err := encodeConsultationPayload(payload)
+	if err != nil {
+		return nil, err
 	}
 
 	correlationID := fmt.Sprintf("gi_corr_%s", uuid.New().String()[:8])
 	waitCh := gi.registerPendingWait(correlationID)
 	defer gi.clearPendingWait(correlationID)
 
+	sessionID := strings.TrimSpace(versioning.SessionIDFromContext(ctx))
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(gi.config.SessionID)
+	}
 	req := &guide.RouteRequest{
-		Input:           payload,
+		Input:           encoded,
 		SourceAgentID:   gi.id,
 		SourceAgentName: "inspector",
+		TargetAgentID:   target,
+		ExplicitTarget:  true,
 		CorrelationID:   correlationID,
+		SessionID:       sessionID,
+		Timestamp:       time.Now().UTC(),
+		Metadata:        metadata,
 	}
 	msg := guide.NewRequestMessage(gi.generateMessageID(), req)
 	msg.CorrelationID = correlationID
@@ -68,7 +94,7 @@ func (gi *GlobalInspector) requestRouteSync(ctx context.Context, target, payload
 	}
 
 	var response *guide.Message
-	err := shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
+	err = shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
 		AttemptTimeout: routeSyncTimeout,
 		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
 		OnRefresh: func(info shared.ContextLeaseRefresh) {
@@ -93,4 +119,19 @@ func (gi *GlobalInspector) requestRouteSync(ctx context.Context, target, payload
 		return nil, shared.WrapLeaseTimeoutError("escalation request", routeSyncTimeout, err)
 	}
 	return response, nil
+}
+
+func encodeConsultationPayload(payload any) (string, error) {
+	switch typed := payload.(type) {
+	case string:
+		return typed, nil
+	case []byte:
+		return string(typed), nil
+	default:
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return "", fmt.Errorf("marshal consultation payload: %w", err)
+		}
+		return string(raw), nil
+	}
 }

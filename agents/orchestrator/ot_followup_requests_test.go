@@ -1,0 +1,225 @@
+package orchestrator
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/adalundhe/sylk/agents/guide"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/versioning"
+)
+
+func TestBuildOTGlobalFollowupRequest_UsesDirectPrompt(t *testing.T) {
+	o := &Orchestrator{
+		config: Config{AgentID: "orchestrator", SessionID: "sess-1"},
+	}
+	task := &TaskRecord{
+		ID:          "task-7",
+		Name:        "Checkout Recovery",
+		Description: "Harden checkout recovery flow.",
+		SessionID:   "sess-1",
+		Metadata: map[string]any{
+			"affected_files": []string{"pkg/checkout/recovery.go", "pkg/checkout/recovery_test.go"},
+		},
+	}
+	update := &PipelineUpdate{
+		NodeID:    "task-7",
+		TaskID:    "task-7",
+		AgentType: agentshared.PipelineAgentInspector,
+		Status:    "succeeded",
+		Output: map[string]any{
+			"summary":       "Pipeline passed final audit and is ready for merge.",
+			"evidence_refs": []any{"artifact:tester", "file:pkg/checkout/recovery.go"},
+		},
+		Timestamp: time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC),
+	}
+
+	req := o.buildOTGlobalFollowupRequest(task, update, "inspector", versioning.SemanticVersion{}, false)
+	if req == nil {
+		t.Fatal("buildOTGlobalFollowupRequest returned nil")
+	}
+	if !req.ExplicitTarget {
+		t.Fatal("expected explicit target request")
+	}
+	if req.FireAndForget {
+		t.Fatal("expected visible OT follow-up request, not fire-and-forget")
+	}
+	if req.TargetAgentID != "inspector" {
+		t.Fatalf("target_agent_id = %q, want inspector", req.TargetAgentID)
+	}
+	if !strings.Contains(req.Input, "Global inspector follow-up is required") {
+		t.Fatalf("input = %q, want global inspector follow-up prompt", req.Input)
+	}
+	if strings.Contains(req.Input, "\"task_id\"") {
+		t.Fatalf("input = %q, want prompt text instead of pipeline JSON envelope", req.Input)
+	}
+	if req.Metadata["ot_handoff_followup"] != true {
+		t.Fatalf("metadata ot_handoff_followup = %#v, want true", req.Metadata["ot_handoff_followup"])
+	}
+	if req.Metadata["agent_type"] != "inspector" {
+		t.Fatalf("metadata agent_type = %#v, want inspector", req.Metadata["agent_type"])
+	}
+}
+
+func TestBuildOTGlobalFollowupRequest_FallsBackToStateSession(t *testing.T) {
+	o := &Orchestrator{
+		state:  NewState("sess-state"),
+		config: Config{AgentID: "orchestrator"},
+	}
+	task := &TaskRecord{ID: "task-8"}
+	update := &PipelineUpdate{
+		TaskID:    "task-8",
+		AgentType: agentshared.PipelineAgentInspector,
+		Status:    "succeeded",
+		Timestamp: time.Date(2026, 3, 23, 12, 5, 0, 0, time.UTC),
+	}
+
+	req := o.buildOTGlobalFollowupRequest(task, update, "tester", versioning.SemanticVersion{}, false)
+	if req == nil {
+		t.Fatal("buildOTGlobalFollowupRequest returned nil")
+	}
+	if req.SessionID != "sess-state" {
+		t.Fatalf("session_id = %q, want sess-state", req.SessionID)
+	}
+}
+
+func TestFinalizePipelineUpdate_InspectorSuccessPublishesGlobalFollowups(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	t.Cleanup(func() { _ = bus.Close() })
+
+	reqCh := make(chan *guide.RouteRequest, 4)
+	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		if req.Metadata["ot_handoff_followup"] != true {
+			return nil
+		}
+		select {
+		case reqCh <- req:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	o := &Orchestrator{
+		bus:   bus,
+		state: NewState("sess-1"),
+		config: Config{
+			AgentID:   "orchestrator",
+			SessionID: "sess-1",
+		},
+	}
+	o.state.Tasks["task-9"] = &TaskRecord{
+		ID:          "task-9",
+		Name:        "Session Recovery",
+		Description: "Ensure session recovery survives transient failures.",
+		SessionID:   "sess-1",
+		Metadata: map[string]any{
+			"affected_files":      []string{"pkg/session/recovery.go"},
+			"acceptance_criteria": []string{"Recovered sessions preserve auth state."},
+			"test_requirements":   []string{"Run regression coverage for session recovery."},
+		},
+	}
+
+	o.finalizePipelineUpdate(&PipelineUpdate{
+		DAGID:     "dag-1",
+		NodeID:    "task-9",
+		TaskID:    "task-9",
+		AgentType: agentshared.PipelineAgentInspector,
+		Status:    "succeeded",
+		Output: map[string]any{
+			"summary":       "Inspector accepted the completed pipeline.",
+			"evidence_refs": []any{"artifact:tester", "artifact:inspector"},
+		},
+		Timestamp: time.Date(2026, 3, 23, 12, 30, 0, 0, time.UTC),
+	})
+
+	collected := make(map[string]*guide.RouteRequest, 2)
+	timeout := time.After(2 * time.Second)
+	for len(collected) < 2 {
+		select {
+		case req := <-reqCh:
+			collected[req.TargetAgentID] = req
+		case <-timeout:
+			t.Fatalf("timed out waiting for OT follow-up requests, collected=%v", mapsKeys(collected))
+		}
+	}
+
+	inspectorReq := collected["inspector"]
+	if inspectorReq == nil {
+		t.Fatal("missing global inspector follow-up request")
+	}
+	if !strings.Contains(inspectorReq.Input, "Operational Transform has accepted this completed pipeline") {
+		t.Fatalf("inspector input = %q, want OT merged-state prompt", inspectorReq.Input)
+	}
+	testerReq := collected["tester"]
+	if testerReq == nil {
+		t.Fatal("missing global tester follow-up request")
+	}
+	if !strings.Contains(testerReq.Input, "Global tester follow-up is required") {
+		t.Fatalf("tester input = %q, want tester follow-up prompt", testerReq.Input)
+	}
+}
+
+func mapsKeys(values map[string]*guide.RouteRequest) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func TestFinalizePipelineUpdate_NonInspectorSuccessDoesNotPublishGlobalFollowups(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	t.Cleanup(func() { _ = bus.Close() })
+
+	reqCh := make(chan *guide.RouteRequest, 1)
+	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		if req.Metadata["ot_handoff_followup"] != true {
+			return nil
+		}
+		select {
+		case reqCh <- req:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	o := &Orchestrator{
+		bus:   bus,
+		state: NewState("sess-1"),
+		config: Config{
+			AgentID:   "orchestrator",
+			SessionID: "sess-1",
+		},
+	}
+	o.state.Tasks["task-11"] = &TaskRecord{ID: "task-11", SessionID: "sess-1"}
+
+	o.finalizePipelineUpdate(&PipelineUpdate{
+		TaskID:    "task-11",
+		NodeID:    "task-11",
+		AgentType: "engineer",
+		Status:    "succeeded",
+	})
+
+	select {
+	case req := <-reqCh:
+		t.Fatalf("unexpected OT global follow-up request: %#v", req)
+	case <-time.After(150 * time.Millisecond):
+	}
+}

@@ -3,6 +3,7 @@ package container
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestResourceQuota_FitsWhenUnderLimit(t *testing.T) {
@@ -75,10 +76,11 @@ func TestResourceQuota_ReleaseFreesSpace(t *testing.T) {
 
 func TestResourceQuota_Usage(t *testing.T) {
 	q := NewResourceQuota(ResourceQuotaConfig{
-		GoroutineLimit:     100,
-		ContextWindowLimit: 50000,
-		VFSQuotaLimit:      1024,
-		ContainerLimit:     10,
+		GoroutineLimit:       100,
+		ContextWindowRequest: 40000,
+		ContextWindowLimit:   50000,
+		VFSQuotaLimit:        1024,
+		ContainerLimit:       10,
 	})
 
 	spec := &ContainerSpec{
@@ -94,8 +96,14 @@ func TestResourceQuota_Usage(t *testing.T) {
 	if usage.GoroutineUsed != 5 {
 		t.Fatalf("expected 5 goroutines used, got %d", usage.GoroutineUsed)
 	}
-	if usage.ContextWindowUsed != 1000 {
-		t.Fatalf("expected 1000 context window used, got %d", usage.ContextWindowUsed)
+	if usage.ContextWindowUsed != 0 {
+		t.Fatalf("expected container reserve to not charge context window, got %d", usage.ContextWindowUsed)
+	}
+	if usage.ContextWindowRequest != 40000 {
+		t.Fatalf("expected context request 40000, got %d", usage.ContextWindowRequest)
+	}
+	if usage.ContextHardCapacity != 50000 {
+		t.Fatalf("expected hard capacity 50000, got %d", usage.ContextHardCapacity)
 	}
 	if usage.VFSUsed != 256 {
 		t.Fatalf("expected 256 vfs used, got %d", usage.VFSUsed)
@@ -153,6 +161,171 @@ func TestLimitRange_WithinBounds(t *testing.T) {
 	}
 	if err := lr.CheckContainerLimits(spec); err != nil {
 		t.Fatalf("should be within bounds: %v", err)
+	}
+}
+
+func TestResourceQuota_ContextLeaseTracksLiveUsage(t *testing.T) {
+	q := NewResourceQuota(ResourceQuotaConfig{
+		ContextWindowRequest:   1000,
+		ContextWindowLimit:     4000,
+		ContextLeaseMin:        30 * time.Millisecond,
+		ContextReleaseHalfLife: 20 * time.Millisecond,
+		ContextShortWindow:     20 * time.Millisecond,
+		ContextLongWindow:      80 * time.Millisecond,
+		ContextAdmissionTick:   5 * time.Millisecond,
+	})
+
+	lease, err := q.AcquireContextLease(t.Context(), ContextLeaseRequest{
+		ClaimID:         "agent-1",
+		AgentType:       "engineer",
+		RequestTokens:   1000,
+		HardLimitTokens: 2000,
+		PromptBytes:     200,
+	})
+	if err != nil {
+		t.Fatalf("AcquireContextLease: %v", err)
+	}
+	defer lease.Release()
+
+	if got := q.Usage().ContextWindowUsed; got <= 0 {
+		t.Fatalf("expected provisional context usage after admission, got %d", got)
+	}
+
+	q.ObserveContextUsage(ContextUsageObservation{
+		AgentID:     "agent-1",
+		AgentType:   "engineer",
+		InputTokens: 1200,
+		ObservedAt:  time.Now(),
+	})
+	if got := q.Usage().ContextWindowUsed; got < 1200 {
+		t.Fatalf("expected live usage to reflect observed tokens, got %d", got)
+	}
+
+	lease.Release()
+	if got := q.Usage().ContextWindowUsed; got <= 0 {
+		t.Fatalf("expected release tail to preserve short-lived claim, got %d", got)
+	}
+
+	time.Sleep(140 * time.Millisecond)
+	if got := q.Usage().ContextWindowUsed; got != 0 {
+		t.Fatalf("expected released claim to decay to zero, got %d", got)
+	}
+}
+
+func TestResourceQuota_ContextAliasBindingTransfersUsage(t *testing.T) {
+	q := NewResourceQuota(ResourceQuotaConfig{
+		ContextWindowRequest:   800,
+		ContextWindowLimit:     4000,
+		ContextLeaseMin:        30 * time.Millisecond,
+		ContextReleaseHalfLife: 20 * time.Millisecond,
+		ContextShortWindow:     20 * time.Millisecond,
+		ContextLongWindow:      80 * time.Millisecond,
+		ContextAdmissionTick:   5 * time.Millisecond,
+	})
+
+	lease, err := q.AcquireContextLease(t.Context(), ContextLeaseRequest{
+		ClaimID:         "node-1",
+		AgentType:       "tester-pipeline",
+		RequestTokens:   800,
+		HardLimitTokens: 1600,
+	})
+	if err != nil {
+		t.Fatalf("AcquireContextLease(node-1): %v", err)
+	}
+	lease.BindAlias("worker-1")
+
+	q.ObserveContextUsage(ContextUsageObservation{
+		AgentID:     "worker-1",
+		AgentType:   "tester-pipeline",
+		InputTokens: 900,
+		ObservedAt:  time.Now(),
+	})
+	if got := q.Usage().ContextWindowUsed; got < 900 {
+		t.Fatalf("expected alias-bound usage to update live claim, got %d", got)
+	}
+
+	lease.Release()
+
+	nextLease, err := q.AcquireContextLease(t.Context(), ContextLeaseRequest{
+		ClaimID:         "node-2",
+		AgentType:       "tester-pipeline",
+		RequestTokens:   800,
+		HardLimitTokens: 1600,
+	})
+	if err != nil {
+		t.Fatalf("AcquireContextLease(node-2): %v", err)
+	}
+	defer nextLease.Release()
+	nextLease.BindAlias("worker-1")
+
+	q.ObserveContextUsage(ContextUsageObservation{
+		AgentID:     "worker-1",
+		AgentType:   "tester-pipeline",
+		InputTokens: 950,
+		ObservedAt:  time.Now(),
+	})
+	if got := q.Usage().ContextWindowUsed; got < 950 {
+		t.Fatalf("expected rebound usage on re-bound alias, got %d", got)
+	}
+}
+
+func TestResourceQuota_ContextAdmissionWaitsForRelease(t *testing.T) {
+	q := NewResourceQuota(ResourceQuotaConfig{
+		ContextWindowRequest:   1000,
+		ContextWindowLimit:     1700,
+		ContextLeaseMin:        20 * time.Millisecond,
+		ContextReleaseHalfLife: 8 * time.Millisecond,
+		ContextShortWindow:     20 * time.Millisecond,
+		ContextLongWindow:      80 * time.Millisecond,
+		ContextAdmissionTick:   5 * time.Millisecond,
+	})
+
+	first, err := q.AcquireContextLease(t.Context(), ContextLeaseRequest{
+		ClaimID:         "node-a",
+		AgentType:       "engineer",
+		RequestTokens:   1000,
+		HardLimitTokens: 1700,
+	})
+	if err != nil {
+		t.Fatalf("AcquireContextLease(node-a): %v", err)
+	}
+	defer first.Release()
+
+	acquired := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		lease, err := q.AcquireContextLease(t.Context(), ContextLeaseRequest{
+			ClaimID:         "node-b",
+			AgentType:       "engineer",
+			RequestTokens:   1000,
+			HardLimitTokens: 1700,
+		})
+		if err != nil {
+			errCh <- err
+			return
+		}
+		lease.Release()
+		close(acquired)
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatal("second lease should have waited under pressure")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	first.Release()
+
+	select {
+	case <-acquired:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("second lease did not acquire after release")
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("AcquireContextLease(node-b): %v", err)
+	default:
 	}
 }
 

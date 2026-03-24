@@ -384,6 +384,7 @@ type commandApprovalState struct {
 	proposal    *commandapproval.Proposal
 	selected    int
 	activated   int
+	codeScroll  int
 	returnFocus component.FocusID
 	returnInput bool
 }
@@ -403,8 +404,13 @@ type commandApprovalHitbox struct {
 }
 
 type commandApprovalViewLayout struct {
-	lines    []string
-	hitboxes []commandApprovalHitbox
+	lines            []string
+	hitboxes         []commandApprovalHitbox
+	codeStartY       int
+	codeEndY         int
+	codeTotalLines   int
+	codeVisibleLines int
+	codeScroll       int
 }
 
 var commandApprovalOptions = []commandApprovalOption{
@@ -6224,9 +6230,14 @@ func (m *AppModel) reloadEditorFromDisk(path string) tea.Cmd {
 
 func (m *AppModel) handleStreamStartTelemetry(start msg.StreamStartMsg) tea.Cmd {
 	// Guard interrupted correlations BEFORE any side effects (registration,
-	// agent promotion, flash updates). This prevents stale state leakage
-	// from events that arrive after an interrupt.
-	if !m.shouldRenderStreamEvent(start.CorrelationID) {
+	// agent promotion, flash updates). StreamStart must be allowed to
+	// bootstrap a brand-new correlation even while another stream is active;
+	// follow-up events will be gated by the active-stream registry.
+	correlationID := strings.TrimSpace(start.CorrelationID)
+	if correlationID == "" {
+		return nil
+	}
+	if _, interrupted := m.interruptedCorrelations[correlationID]; interrupted {
 		return nil
 	}
 	start, _ = m.prepareStreamStart(start)
@@ -11754,9 +11765,27 @@ func (m *AppModel) handleCommandApprovalMouse(mouse tea.MouseMsg) (tea.Cmd, bool
 	if contentX < 0 {
 		return nil, true
 	}
+	layout := m.commandApprovalLayout(max(m.width-2, 1))
+	if isWheelEvent(mouse) {
+		if !layout.commandApprovalCodeContains(contentX, contentY) {
+			return nil, true
+		}
+		delta := 0
+		switch mouse.Button {
+		case tea.MouseButtonWheelUp:
+			delta = -1
+		case tea.MouseButtonWheelDown:
+			delta = 1
+		}
+		if m.scrollCommandApprovalCode(layout, delta) {
+			m.markSlotDirty(compositor.SlotInput)
+			m.viewDirty = true
+		}
+		return nil, true
+	}
 	switch mouse.Action {
 	case tea.MouseActionMotion:
-		if idx, ok := m.commandApprovalOptionAt(contentX, contentY); ok {
+		if idx, ok := layout.optionAt(contentX, contentY); ok {
 			m.commandApproval.selected = idx
 			m.commandApproval.activated = -1
 			m.markSlotDirty(compositor.SlotInput)
@@ -11765,7 +11794,7 @@ func (m *AppModel) handleCommandApprovalMouse(mouse tea.MouseMsg) (tea.Cmd, bool
 		return nil, true
 	case tea.MouseActionPress:
 		if mouse.Button == tea.MouseButtonLeft {
-			if idx, ok := m.commandApprovalOptionAt(contentX, contentY); ok {
+			if idx, ok := layout.optionAt(contentX, contentY); ok {
 				return m.activateCommandApprovalOption(idx), true
 			}
 		}
@@ -11780,16 +11809,7 @@ func (m *AppModel) commandApprovalOptionAt(contentX, contentY int) (int, bool) {
 		return 0, false
 	}
 	layout := m.commandApprovalLayout(max(m.width-2, 1))
-	for _, hitbox := range layout.hitboxes {
-		if contentY != hitbox.y {
-			continue
-		}
-		if contentX < hitbox.x0 || contentX >= hitbox.x1 {
-			continue
-		}
-		return hitbox.option, true
-	}
-	return 0, false
+	return layout.optionAt(contentX, contentY)
 }
 
 func (m *AppModel) handleLayerDecisionMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
@@ -14149,6 +14169,11 @@ const inputMinContentLines = 1
 // Derived from: border (2) + minimum 3 content rows for context.
 const mainMinContentHeight = panelBorderSize + 3
 
+// commandApprovalMaxVisibleCodeLines keeps approval previews compact enough to
+// preserve the prompt header and all actions while still showing some code
+// before the user scrolls.
+const commandApprovalMaxVisibleCodeLines = 8
+
 // panelBorderSize is the space consumed by a rounded border on each axis.
 // Derived from: 1 char per side × 2 sides = 2.
 const panelBorderSize = 2
@@ -14283,23 +14308,95 @@ func (m *AppModel) commandApprovalLayout(width int) commandApprovalViewLayout {
 	proposal := m.commandApproval.proposal
 	th := m.config.Theme()
 	promptStyle := lipgloss.NewStyle().Foreground(th.Palette.Secondary).Bold(true)
-	lines := []string{
-		promptStyle.Render(commandApprovalRequesterName(proposal) + " wants approval for:"),
-		"",
+	layout := commandApprovalViewLayout{
+		lines:      []string{},
+		codeStartY: -1,
+		codeEndY:   -1,
 	}
-	lines = append(lines, renderCommandApprovalCodeBlock(strings.TrimSpace(proposal.Command), width, th)...)
-	lines = append(lines, "")
-	layout := commandApprovalViewLayout{lines: lines}
+	layout.lines = append(layout.lines,
+		promptStyle.Render(commandApprovalRequesterName(proposal)+" wants approval for:"),
+		"",
+	)
+	optionLines := make([][]string, len(commandApprovalOptions))
+	optionHitboxes := make([][]commandApprovalHitbox, len(commandApprovalOptions))
+	optionLineCount := 0
 	for idx, option := range commandApprovalOptions {
 		renderedLines, hitboxes := m.renderCommandApprovalOption(idx, option, width)
+		optionLines[idx] = renderedLines
+		optionHitboxes[idx] = hitboxes
+		optionLineCount += len(renderedLines)
+	}
+	codeLines := renderCommandApprovalCodeBlock(strings.TrimSpace(proposal.Command), width, th)
+	maxBodyLines := max(m.height-statusBarHeight-mainMinContentHeight-inputBorderSize, 1)
+	availableForCode := max(maxBodyLines-len(layout.lines)-optionLineCount, 0)
+	codeSpacerLines := 0
+	if availableForCode > 1 && len(codeLines) > 0 {
+		codeSpacerLines = 1
+	}
+	codeBudget := min(max(availableForCode-codeSpacerLines, 0), commandApprovalMaxVisibleCodeLines)
+	visibleCodeLines, appliedScroll := visibleCommandApprovalCodeLines(codeLines, codeBudget, m.commandApproval.codeScroll)
+	layout.codeTotalLines = len(codeLines)
+	layout.codeVisibleLines = len(visibleCodeLines)
+	layout.codeScroll = appliedScroll
+	if len(visibleCodeLines) > 0 {
+		layout.codeStartY = len(layout.lines)
+		layout.lines = append(layout.lines, visibleCodeLines...)
+		layout.codeEndY = len(layout.lines)
+		if codeSpacerLines > 0 {
+			layout.lines = append(layout.lines, "")
+		}
+	}
+	for idx := range commandApprovalOptions {
 		baseY := len(layout.lines)
-		layout.lines = append(layout.lines, renderedLines...)
-		for _, hitbox := range hitboxes {
+		layout.lines = append(layout.lines, optionLines[idx]...)
+		for _, hitbox := range optionHitboxes[idx] {
 			hitbox.y += baseY
 			layout.hitboxes = append(layout.hitboxes, hitbox)
 		}
 	}
 	return layout
+}
+
+func visibleCommandApprovalCodeLines(lines []string, budget, scroll int) ([]string, int) {
+	if budget <= 0 || len(lines) == 0 {
+		return nil, 0
+	}
+	if len(lines) <= budget {
+		return append([]string(nil), lines...), 0
+	}
+	maxScroll := len(lines) - budget
+	appliedScroll := clampInt(scroll, 0, maxScroll)
+	return append([]string(nil), lines[appliedScroll:appliedScroll+budget]...), appliedScroll
+}
+
+func (l commandApprovalViewLayout) optionAt(contentX, contentY int) (int, bool) {
+	for _, hitbox := range l.hitboxes {
+		if contentY != hitbox.y {
+			continue
+		}
+		if contentX < hitbox.x0 || contentX >= hitbox.x1 {
+			continue
+		}
+		return hitbox.option, true
+	}
+	return 0, false
+}
+
+func (l commandApprovalViewLayout) commandApprovalCodeContains(contentX, contentY int) bool {
+	return contentX >= 0 && contentY >= l.codeStartY && contentY < l.codeEndY
+}
+
+func (m *AppModel) scrollCommandApprovalCode(layout commandApprovalViewLayout, delta int) bool {
+	if m.commandApproval == nil || delta == 0 || layout.codeVisibleLines <= 0 || layout.codeTotalLines <= layout.codeVisibleLines {
+		return false
+	}
+	maxScroll := layout.codeTotalLines - layout.codeVisibleLines
+	next := clampInt(layout.codeScroll+delta, 0, maxScroll)
+	if next == m.commandApproval.codeScroll {
+		return false
+	}
+	m.commandApproval.codeScroll = next
+	return true
 }
 
 func (m *AppModel) layerDecisionLayout(width int) commandApprovalViewLayout {

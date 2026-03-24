@@ -29,6 +29,9 @@ func (o *Orchestrator) handleControlPlaneForward(ctx context.Context, fwd *guide
 	case agentshared.ControlPlaneKindValidationVerdict:
 		result, err := o.handleValidationVerdictForward(ctx, fwd)
 		return result, true, err
+	case agentshared.ControlPlaneKindCommandApprovalHold:
+		result, err := o.handleCommandApprovalHoldForward(ctx, fwd)
+		return result, true, err
 	case agentshared.ControlPlaneKindPlanHandoffStatus:
 		result, err := o.handlePlanHandoffStatusForward(ctx, fwd)
 		return result, true, err

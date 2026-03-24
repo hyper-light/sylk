@@ -30,7 +30,7 @@ func RunGoSec(ctx context.Context, runner *ToolRunner, paths []string) []Validat
 	}
 
 	args := []string{"-fmt=json", "-quiet"}
-	args = append(args, paths...)
+	args = append(args, normalizeGoPackageExecutionTargets(runner, paths)...)
 
 	result, err := runner.Exec(ctx, "gosec", args...)
 	if err != nil {
@@ -50,7 +50,7 @@ func RunGoSec(ctx context.Context, runner *ToolRunner, paths []string) []Validat
 		issues = append(issues, ValidationIssue{
 			ID:       fmt.Sprintf("sec_%d", idx),
 			Severity: mapGoSecSeverity(sec.Severity),
-			File:     sec.File,
+			File:     normalizeToolReportedPath(runner, sec.File),
 			Line:     lineNum,
 			Column:   colNum,
 			Message:  sec.Details,

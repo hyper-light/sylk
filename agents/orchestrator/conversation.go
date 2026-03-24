@@ -122,17 +122,12 @@ func (o *Orchestrator) executeConversationLLM(ctx context.Context, cr orchestrat
 	}, nil
 }
 
-// respondToIngestion returns a deterministic ack immediately (unblocking the
-// architect's routeSyncTimeout) and then generates a richer LLM summary
-// asynchronously, pushing it to the TUI via a notification once the
-// architect's stream has completed.
-//
-// Split into immediate + deferred:
-//  1. Immediate: deterministic ack returned via RouteResponse (~1s). The
-//     architect's tool loop includes this text in its own stream to the TUI.
-//  2. Deferred: LLM summary generated in a tracked goroutine. By the time
-//     the LLM responds (10-30s), the architect's stream has completed, so
-//     the notification push won't corrupt the TUI's single accumulator.
+// respondToIngestion returns a deterministic ack immediately so the architect
+// can continue without waiting on a second summarization pass. Fresh handoffs
+// may already have streamed a pre-kickoff receipt summary from the ingest path;
+// this method supplies the matching deterministic route result. We avoid a
+// deferred notification summary here because a late out-of-band push can land
+// after execution has already started, producing confusing chat ordering.
 func (o *Orchestrator) respondToIngestion(
 	ctx context.Context,
 	req *guide.ForwardedRequest,
@@ -142,33 +137,23 @@ func (o *Orchestrator) respondToIngestion(
 
 	preAck := buildDeterministicIngestionAck(ingestionResult)
 
-	// Publish stream chunk so the architect's sync waiter sees activity.
-	o.publishStreamChunk(ctx, preAck)
-
-	// Snapshot provider under lock — SetProvider may write concurrently.
-	o.mu.RLock()
-	provider := o.provider
-	o.mu.RUnlock()
-
-	// Spawn async LLM summary if a provider is available. The goroutine is
-	// tracked via o.scope so it participates in graceful shutdown.
-	if provider != nil {
-		planJSON := req.Input
-		o.scope.Go("ingestion-summary", ingestionLLMTimeout+5*time.Second, func(scopeCtx context.Context) error {
-			result, err := o.generateIngestionSummary(scopeCtx, planJSON, ingestionResult)
-			if err != nil {
-				o.logWarnMsg("respondToIngestion: async LLM summary failed", "error", err)
-				return nil // Non-fatal — the deterministic ack already reached the user.
-			}
-			o.logInfo("respondToIngestion: async LLM summary generated",
-				"response_len", len(result.Response))
-			o.publishNotificationPush(result.Response)
-			return nil
-		})
+	// Fresh handoffs stream a receipt summary before kickoff from the ingest
+	// path itself. Duplicate/non-execution paths still need a visible chunk.
+	if !ingestionReceiptAlreadyStreamed(ingestionResult) {
+		o.publishStreamChunk(ctx, preAck)
 	}
 
 	// Return the deterministic ack immediately — unblocks the architect.
 	return &ConversationResult{Response: preAck, Intent: "ingestion_ack"}, nil
+}
+
+func ingestionReceiptAlreadyStreamed(ingestionResult any) bool {
+	resultMap, ok := ingestionResult.(map[string]any)
+	if !ok {
+		return false
+	}
+	streamed, _ := resultMap["receipt_streamed"].(bool)
+	return streamed
 }
 
 // generateIngestionSummary calls the LLM with the plan details and ingestion

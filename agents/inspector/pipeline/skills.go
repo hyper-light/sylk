@@ -84,8 +84,9 @@ func (pi *PipelineInspector) registerCoreSkills() {
 		pi.skills.Register(skill)
 	}
 	for _, skill := range agentShared.PipelineProtocolSkills(agentShared.PipelineProtocolSkillConfig{
-		AgentType:   func() string { return "inspector-pipeline" },
-		InspectorOT: true,
+		AgentType:      func() string { return "inspector-pipeline" },
+		InspectorOT:    true,
+		WorkspaceViews: func() versioning.WorkspaceViewAccess { return pi.workspaceViews },
 		Route: agentShared.PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return pi.bus },
 			SessionID:   func() string { return pi.config.SessionID },

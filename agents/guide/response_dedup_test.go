@@ -78,6 +78,22 @@ func setPendingRoute(g *Guide, correlationID string) {
 	})
 }
 
+func setPendingRouteWithMetadata(g *Guide, correlationID string, metadata map[string]any) {
+	g.pending.Set(correlationID, &PendingRequest{
+		CorrelationID: correlationID,
+		SourceAgentID: "tui",
+		TargetAgentID: "academic",
+		Request: &RouteRequest{
+			CorrelationID: correlationID,
+			SessionID:     "test-session",
+			SourceAgentID: "tui",
+			Metadata:      metadata,
+		},
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(DefaultPendingStoreConfig().DefaultTimeout),
+	})
+}
+
 func TestHandleResponseMessage_DeduplicatesByBusMessageID(t *testing.T) {
 	g, out := newResponseTestGuide(t)
 	setPendingRoute(g, "corr-start")
@@ -235,6 +251,70 @@ func TestHandleResponseMessage_InitializesTrackingMapsWhenNil(t *testing.T) {
 
 	if err := g.handleResponseMessage(completeMsg); err != nil {
 		t.Fatalf("handle late complete with nil-initialized tracking maps: %v", err)
+	}
+}
+
+func TestHandleResponseMessage_IgnoresGuideRelayedRouteResponses(t *testing.T) {
+	g, out := newResponseTestGuide(t)
+	setPendingRouteWithMetadata(g, "corr-relayed-response", map[string]any{
+		"pipeline_task": true,
+		"task_id":       "task-1",
+		"dag_id":        "dag-1",
+		"node_id":       "node-1",
+		"agent_type":    "inspector-pipeline",
+	})
+
+	respMsg := &Message{
+		ID:            "msg-original-route-response",
+		CorrelationID: "corr-relayed-response",
+		Type:          MessageTypeResponse,
+		SourceAgentID: "guardian",
+		Payload: &RouteResponse{
+			CorrelationID:       "corr-relayed-response",
+			Success:             true,
+			RespondingAgentID:   "guardian",
+			RespondingAgentName: "Guardian",
+			Data:                "approved",
+		},
+	}
+
+	if err := g.handleResponseMessage(respMsg); err != nil {
+		t.Fatalf("handle original route response: %v", err)
+	}
+
+	var forwarded *Message
+	select {
+	case forwarded = <-out:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for forwarded relayed route response")
+	}
+	if forwarded == nil {
+		t.Fatal("forwarded relayed route response is nil")
+	}
+	if got := forwarded.TargetAgentID; got != "tui" {
+		t.Fatalf("forwarded target_agent_id = %q, want tui", got)
+	}
+	if forwarded.Metadata == nil {
+		t.Fatal("forwarded relayed route response should carry metadata")
+	}
+	if _, ok := forwarded.Metadata["_guide_relayed"]; !ok {
+		t.Fatal("forwarded relayed route response should be marked as _guide_relayed")
+	}
+	if got := forwarded.Metadata["task_id"]; got != "task-1" {
+		t.Fatalf("forwarded task_id metadata = %#v, want task-1", got)
+	}
+	if got := forwarded.Metadata["agent_type"]; got != "inspector-pipeline" {
+		t.Fatalf("forwarded agent_type metadata = %#v, want inspector-pipeline", got)
+	}
+
+	if err := g.handleResponseMessage(forwarded); err != nil {
+		t.Fatalf("handle relayed route response: %v", err)
+	}
+
+	select {
+	case extra := <-out:
+		t.Fatalf("unexpected duplicate forwarded route response: %+v", extra)
+	case <-time.After(150 * time.Millisecond):
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -105,6 +106,21 @@ func TestToolErrorPayload_IncludesRecoveryForSingleCommandViolation(t *testing.T
 	}
 }
 
+func TestToolErrorPayload_IncludesRecoveryForApprovalDenied(t *testing.T) {
+	got := ToolErrorPayload(fmt.Errorf("%w: user denied this command", commandapproval.ErrApprovalDenied))
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("payload is not valid JSON: %v", err)
+	}
+	if parsed["error_kind"] != "approval_denied" {
+		t.Fatalf("error_kind = %v, want %q", parsed["error_kind"], "approval_denied")
+	}
+	recovery, ok := parsed["recovery"].([]any)
+	if !ok || len(recovery) == 0 {
+		t.Fatalf("expected recovery guidance, got %#v", parsed["recovery"])
+	}
+}
+
 func TestToolErrorPayload_NilError(t *testing.T) {
 	got := ToolErrorPayload(nil)
 	if got != "" {
@@ -121,6 +137,15 @@ func TestAppendToolRecoveryMessage_DeduplicatesHints(t *testing.T) {
 	content := req.Messages[0].Content
 	if !strings.Contains(content, "adapt") || !strings.Contains(content, "switch tools") {
 		t.Fatalf("unexpected recovery message content: %q", content)
+	}
+}
+
+func TestToolErrorCountsTowardAbort_DoesNotCountApprovalDenied(t *testing.T) {
+	if ToolErrorCountsTowardAbort(fmt.Errorf("%w: user denied this command", commandapproval.ErrApprovalDenied)) {
+		t.Fatal("expected approval denial to be non-fatal for consecutive abort accounting")
+	}
+	if !ToolErrorCountsTowardAbort(errors.New("boom")) {
+		t.Fatal("expected generic tool error to count toward abort accounting")
 	}
 }
 

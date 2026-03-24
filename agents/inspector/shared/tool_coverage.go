@@ -23,20 +23,21 @@ func RunCoverage(ctx context.Context, runner *ToolRunner, paths []string, thresh
 
 	coverFile := filepath.Join(runner.LogicalTempDir(), "sylk_cover.out")
 	command := "go test -coverprofile=" + coverFile + " -count=1"
-	if len(paths) == 0 {
+	targets := normalizeGoPackageExecutionTargets(runner, paths)
+	if len(targets) == 0 {
 		command += " ./..."
 	} else {
-		command += " " + strings.Join(paths, " ")
+		command += " " + strings.Join(targets, " ")
 	}
 	command += " && go tool cover -func=" + coverFile
 	testResult, err := runner.ExecShell(ctx, command)
 	if err != nil {
 		return executionFailureIssues("coverage", err)
 	}
-	return parseCoverageOutput(string(testResult.Stdout), threshold)
+	return parseCoverageOutput(runner, string(testResult.Stdout), threshold)
 }
 
-func parseCoverageOutput(output string, threshold float64) []ValidationIssue {
+func parseCoverageOutput(runner *ToolRunner, output string, threshold float64) []ValidationIssue {
 	lines := strings.Split(output, "\n")
 	var issues []ValidationIssue
 	idx := 0
@@ -62,6 +63,7 @@ func parseCoverageOutput(output string, threshold float64) []ValidationIssue {
 		if percent < threshold {
 			fileLoc := fields[0]
 			file, lineNum, _, _, _ := ParseGoToolLine(fileLoc + ": below threshold")
+			file = normalizeToolReportedPath(runner, file)
 
 			funcName := ""
 			if len(fields) >= 2 {

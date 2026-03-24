@@ -314,6 +314,12 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 		}
 		return o.dispatchGate.wait(ctx, sessionID, dagID)
 	})
+	o.dagBridge.SetExecutionHoldChecker(func(sessionID, dagID, nodeID string) bool {
+		if o.dispatchGate == nil {
+			return false
+		}
+		return o.dispatchGate.isHeld(sessionID, dagID)
+	})
 
 	return nil
 }
@@ -447,6 +453,13 @@ func (o *Orchestrator) SetTaskPodInfra(
 ) {
 	if o.dagBridge != nil {
 		o.dagBridge.SetTaskPodInfra(runtime, specReg, sessionVFS)
+	}
+}
+
+// SetContextQuota threads the live session token budget into DAG dispatch.
+func (o *Orchestrator) SetContextQuota(quota *container.ResourceQuota) {
+	if o.dagBridge != nil {
+		o.dagBridge.SetContextQuota(quota)
 	}
 }
 

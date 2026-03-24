@@ -169,7 +169,9 @@ func (gt *GlobalTester) applyToolCalls(
 			} else {
 				result = agentshared.ToolErrorPayload(err)
 				isError = true
-				errCount++
+				if agentshared.ToolErrorCountsTowardAbort(err) {
+					errCount++
+				}
 				if hint := agentshared.ToolRecoveryHint(call.Name, err); hint != "" {
 					recoveryHints = append(recoveryHints, hint)
 				}

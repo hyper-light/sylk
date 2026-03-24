@@ -97,6 +97,7 @@ type planHandoffIngestAttempt struct {
 	preflight    *guardianPlanPreflight
 	dag          *dag.DAG
 	dagID        string
+	receiptText  string
 }
 
 func (o *Orchestrator) preparePlanHandoffIngest(
@@ -167,6 +168,7 @@ func (a *planHandoffIngestAttempt) ingest(ctx context.Context) error {
 	if err := a.prepareExecution(ctx); err != nil {
 		return err
 	}
+	a.publishReceiptSummary(ctx)
 	if err := a.submitExecution(ctx); err != nil {
 		return err
 	}
@@ -201,6 +203,17 @@ func (a *planHandoffIngestAttempt) submitExecution(ctx context.Context) error {
 	a.dagID = dagID
 	a.recordSubmitted()
 	return nil
+}
+
+func (a *planHandoffIngestAttempt) publishReceiptSummary(ctx context.Context) {
+	if a == nil || a.orchestrator == nil {
+		return
+	}
+	a.receiptText = buildPreKickoffIngestionReceipt(a.handoff)
+	if strings.TrimSpace(a.receiptText) == "" {
+		return
+	}
+	a.orchestrator.publishStreamChunk(ctx, a.receiptText)
 }
 
 func (a *planHandoffIngestAttempt) fail(stage, message string, cause error) error {
@@ -311,18 +324,39 @@ func (a *planHandoffIngestAttempt) publishIngestedEvent() {
 
 func (a *planHandoffIngestAttempt) result() map[string]any {
 	return map[string]any{
-		"ingested":       true,
-		"duplicate":      false,
-		"receipt_id":     receiptIDOf(a.receipt),
-		"receipt_status": receiptStatusOf(a.receipt),
-		"plan_id":        a.handoff.PlanID,
-		"dag_id":         a.dagID,
-		"workflow_id":    a.workflowID,
-		"task_count":     len(a.handoff.Tasks),
-		"layer_count":    len(a.handoff.ExecutionLayers),
-		"guardian_gate":  a.preflight.summaryPayload(),
-		"guardian_clean": a.preflight.Clean(),
+		"ingested":         true,
+		"duplicate":        false,
+		"receipt_id":       receiptIDOf(a.receipt),
+		"receipt_status":   receiptStatusOf(a.receipt),
+		"receipt_streamed": strings.TrimSpace(a.receiptText) != "",
+		"plan_id":          a.handoff.PlanID,
+		"dag_id":           a.dagID,
+		"workflow_id":      a.workflowID,
+		"task_count":       len(a.handoff.Tasks),
+		"layer_count":      len(a.handoff.ExecutionLayers),
+		"guardian_gate":    a.preflight.summaryPayload(),
+		"guardian_clean":   a.preflight.Clean(),
 	}
+}
+
+func buildPreKickoffIngestionReceipt(h *architect.PlanHandoff) string {
+	if h == nil {
+		return ""
+	}
+	planID := strings.TrimSpace(h.PlanID)
+	taskCount := len(h.Tasks)
+	layerCount := len(h.ExecutionLayers)
+	query := strings.TrimSpace(h.Query)
+	if query == "" {
+		return fmt.Sprintf(
+			"Received plan %s. Prepared %d tasks across %d layers. Starting execution next.",
+			planID, taskCount, layerCount,
+		)
+	}
+	return fmt.Sprintf(
+		"Received plan %s for %s. Prepared %d tasks across %d layers. Starting execution next.",
+		planID, query, taskCount, layerCount,
+	)
 }
 
 func receiptIDOf(receipt *PlanHandoffReceiptRecord) string {
@@ -370,6 +404,8 @@ func (o *Orchestrator) createWorkflowAndTasks(h *architect.PlanHandoff, wfID str
 
 	now := time.Now()
 	taskIDs := make([]string, 0, len(h.Tasks))
+	planSnapshot := buildGlobalInspectorPlanSnapshot(h)
+	planFilePath := strings.TrimSpace(h.PlanFile)
 
 	for _, ht := range h.Tasks {
 		taskIDs = append(taskIDs, ht.ID)
@@ -388,10 +424,13 @@ func (o *Orchestrator) createWorkflowAndTasks(h *architect.PlanHandoff, wfID str
 				"task_slug":            ht.Slug,
 				"complexity":           ht.Complexity,
 				"estimated_tokens":     ht.EstimatedTokens,
+				"plan_id":              h.PlanID,
+				"plan_file_path":       planFilePath,
 				"success_criteria":     ht.SuccessCriteria,
 				"acceptance_criteria":  ht.AcceptanceCriteria,
 				"guidelines":           ht.Guidelines,
 				"implementation_guide": ht.ImplementationGuide,
+				"task_criteria_snapshot": buildGlobalInspectorTaskCriteriaSnapshot(ht),
 				"affected_files":       ht.AffectedFiles,
 				"test_requirements":    ht.TestRequirements,
 				"risk_factors":         ht.RiskFactors,
@@ -417,6 +456,8 @@ func (o *Orchestrator) createWorkflowAndTasks(h *architect.PlanHandoff, wfID str
 		SessionID:   h.SessionID,
 		Metadata: map[string]any{
 			"plan_id":          h.PlanID,
+			"plan_file_path":   planFilePath,
+			workflowPlanSnapshotKey: planSnapshot,
 			"revision":         h.Revision,
 			"trigger":          h.Trigger,
 			"total_tokens":     h.TotalTokens,

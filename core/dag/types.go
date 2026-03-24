@@ -17,6 +17,8 @@ const (
 	NodeStatePending NodeState = iota
 	// NodeStateQueued indicates the node is queued for execution
 	NodeStateQueued
+	// NodeStateWaitingBudget indicates the node is deferred pending context budget.
+	NodeStateWaitingBudget
 	// NodeStateDispatched indicates the bus message is published, awaiting agent ACK
 	NodeStateDispatched
 	// NodeStateAcked indicates the agent acknowledged receipt, execution starting
@@ -47,16 +49,17 @@ type nodeStateStringMap map[NodeState]string
 
 func nodeStateStrings() nodeStateStringMap {
 	return nodeStateStringMap{
-		NodeStatePending:    "pending",
-		NodeStateQueued:     "queued",
-		NodeStateDispatched: "dispatched",
-		NodeStateAcked:      "acked",
-		NodeStateRunning:    "running",
-		NodeStateSucceeded:  "succeeded",
-		NodeStateFailed:     "failed",
-		NodeStateBlocked:    "blocked",
-		NodeStateSkipped:    "skipped",
-		NodeStateCancelled:  "cancelled",
+		NodeStatePending:       "pending",
+		NodeStateQueued:        "queued",
+		NodeStateWaitingBudget: "waiting_budget",
+		NodeStateDispatched:    "dispatched",
+		NodeStateAcked:         "acked",
+		NodeStateRunning:       "running",
+		NodeStateSucceeded:     "succeeded",
+		NodeStateFailed:        "failed",
+		NodeStateBlocked:       "blocked",
+		NodeStateSkipped:       "skipped",
+		NodeStateCancelled:     "cancelled",
 	}
 }
 
@@ -373,6 +376,7 @@ const (
 	EventLayerStarted
 	EventLayerCompleted
 	EventNodeQueued
+	EventNodeBudgetDeferred
 	EventNodeDispatched
 	EventNodeAcked
 	EventNodeStarted
@@ -403,6 +407,7 @@ func eventTypeStrings() eventTypeStringMap {
 		EventLayerStarted:         "layer_started",
 		EventLayerCompleted:       "layer_completed",
 		EventNodeQueued:           "node_queued",
+		EventNodeBudgetDeferred:   "node_budget_deferred",
 		EventNodeDispatched:       "node_dispatched",
 		EventNodeAcked:            "node_acked",
 		EventNodeStarted:          "node_started",
@@ -484,4 +489,33 @@ var (
 
 	// ErrDispatchNotAcked indicates the target agent did not acknowledge dispatch
 	ErrDispatchNotAcked = errors.New("dispatch not acknowledged")
+
+	// ErrNodeBudgetDeferred indicates dispatch was deferred pending budget.
+	ErrNodeBudgetDeferred = errors.New("node dispatch deferred pending budget")
 )
+
+// NodeDeferredError carries scheduler-directed deferral metadata.
+type NodeDeferredError struct {
+	Reason     string
+	RetryAfter time.Duration
+}
+
+func (e *NodeDeferredError) Error() string {
+	if e == nil {
+		return ErrNodeBudgetDeferred.Error()
+	}
+	switch {
+	case e.Reason != "" && e.RetryAfter > 0:
+		return e.Reason
+	case e.RetryAfter > 0:
+		return "node dispatch deferred pending budget"
+	case e.Reason != "":
+		return e.Reason
+	default:
+		return ErrNodeBudgetDeferred.Error()
+	}
+}
+
+func (e *NodeDeferredError) Unwrap() error {
+	return ErrNodeBudgetDeferred
+}

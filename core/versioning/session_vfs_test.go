@@ -143,6 +143,31 @@ func TestSessionVFS_NewDiskFileAccess(t *testing.T) {
 	}
 }
 
+func TestSessionVFS_NewDiskFileAccessReadsLiveDiskState(t *testing.T) {
+	dir := t.TempDir()
+	svfs, err := NewSessionVFS(SessionVFSConfig{
+		SessionID:  "test-session",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	defer svfs.Close()
+
+	target := filepath.Join(dir, "live.txt")
+	if err := os.WriteFile(target, []byte("live"), 0644); err != nil {
+		t.Fatalf("write live disk file: %v", err)
+	}
+
+	content, err := svfs.NewDiskFileAccess(true).ReadFile(context.Background(), "live.txt")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if got := string(content); got != "live" {
+		t.Fatalf("disk content = %q, want %q", got, "live")
+	}
+}
+
 func TestSessionVFS_NewGlobalFileAccess(t *testing.T) {
 	dir := t.TempDir()
 	svfs, err := NewSessionVFS(SessionVFSConfig{

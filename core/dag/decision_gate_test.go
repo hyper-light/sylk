@@ -9,7 +9,6 @@ import (
 
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestDecisionGate_NoFailures(t *testing.T) {
@@ -57,9 +56,12 @@ func TestDecisionGate_NonBlocking(t *testing.T) {
 func TestDecisionGate_BlockingRetry(t *testing.T) {
 	d := buildLinearDAG(t)
 
-	var reqReceived dag.LayerDecisionRequest
+	reqCh := make(chan dag.LayerDecisionRequest, 1)
 	onDecisionReq := func(req dag.LayerDecisionRequest) {
-		reqReceived = req
+		select {
+		case reqCh <- req:
+		default:
+		}
 	}
 
 	gate := dag.NewDecisionGate(d, nil, onDecisionReq)
@@ -77,10 +79,12 @@ func TestDecisionGate_BlockingRetry(t *testing.T) {
 		gateErr = gateFunc(context.Background(), d.ID(), 0, results)
 	}()
 
-	// Wait for the decision request callback
-	require.Eventually(t, func() bool {
-		return reqReceived.DAGID != ""
-	}, time.Second, 10*time.Millisecond)
+	var reqReceived dag.LayerDecisionRequest
+	select {
+	case reqReceived = <-reqCh:
+	case <-time.After(time.Second):
+		t.Fatal("decision request was not received")
+	}
 
 	assert.Equal(t, dag.FailureClassBlocking, reqReceived.Class)
 	assert.Len(t, reqReceived.FailedNodes, 1)

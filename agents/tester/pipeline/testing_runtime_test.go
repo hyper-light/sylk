@@ -277,36 +277,23 @@ func TestParseTestToolInstallPlan_ExtractsFencedJSON(t *testing.T) {
 }
 
 func TestInstallTestTooling_ExecutesApprovedSteps(t *testing.T) {
-	pt, baseCtx, _ := newGoPipelineTesterWithVFS(t)
-	var argv [][]string
-	pt.SetExecutionBroker(stubExecutionBroker{
-		caps: purevfs.StrictBrokerCapabilities(),
-		run: func(_ context.Context, req purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error) {
-			argv = append(argv, append([]string(nil), req.Argv...))
-			return &purevfs.BrokerRunResult{ExitCode: 0, Stdout: []byte("ok")}, nil
-		},
-	})
+	pt, baseCtx, fa := newGoPipelineTesterWithVFS(t)
 	ctx := commandapproval.WithGate(baseCtx, allowAllCommandGate{})
+	markerPath := filepath.Join(fa.WorkingDir(), ".install-marker")
 
 	result, err := pt.installTestTooling(ctx, &testToolInstallPlan{
 		Summary:           "Install pytest for the Python test harness",
 		MissingTool:       "pytest",
-		ValidationCommand: "pytest --version",
+		ValidationCommand: "test -f .install-marker",
 		Steps: []testToolInstallStep{
-			{Command: "python -m pip install pytest", Reason: "install the test runner"},
+			{Command: "touch .install-marker", Reason: "create a disk marker so the install path can be validated"},
 		},
 	})
 	if err != nil {
 		t.Fatalf("installTestTooling: %v", err)
 	}
-	if len(argv) != 2 {
-		t.Fatalf("expected 2 commands (install + validation), got %d", len(argv))
-	}
-	if got := argv[0][len(argv[0])-1]; got != "python -m pip install pytest" {
-		t.Fatalf("install argv = %v, want shell command", argv[0])
-	}
-	if got := argv[1][len(argv[1])-1]; got != "pytest --version" {
-		t.Fatalf("validation argv = %v, want shell command", argv[1])
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("install marker not persisted to disk at %s: %v", markerPath, err)
 	}
 	if installed, _ := result["installed"].(bool); !installed {
 		t.Fatalf("result installed = %v, want true", result["installed"])

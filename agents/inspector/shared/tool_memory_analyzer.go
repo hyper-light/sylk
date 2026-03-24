@@ -13,17 +13,17 @@ func RunMemoryAnalyzer(ctx context.Context, runner *ToolRunner, paths []string) 
 	}
 
 	args := []string{"build", "-gcflags=-m -m"}
-	args = append(args, paths...)
+	args = append(args, normalizeGoPackageExecutionTargets(runner, paths)...)
 
 	result, err := runner.Exec(ctx, "go", args...)
 	if err != nil {
 		return executionFailureIssues("escape-analysis", err)
 	}
 
-	return parseEscapeAnalysis(string(result.Stderr))
+	return parseEscapeAnalysis(runner, string(result.Stderr))
 }
 
-func parseEscapeAnalysis(stderr string) []ValidationIssue {
+func parseEscapeAnalysis(runner *ToolRunner, stderr string) []ValidationIssue {
 	lines := strings.Split(stderr, "\n")
 	var issues []ValidationIssue
 	idx := 0
@@ -48,7 +48,7 @@ func parseEscapeAnalysis(stderr string) []ValidationIssue {
 		issues = append(issues, ValidationIssue{
 			ID:       fmt.Sprintf("mem_%d", idx),
 			Severity: sev,
-			File:     file,
+			File:     normalizeToolReportedPath(runner, file),
 			Line:     lineNum,
 			Column:   col,
 			Message:  msg,

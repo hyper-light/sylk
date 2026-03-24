@@ -689,6 +689,129 @@ func TestTaskRouter_DeliverResponse_MirrorsUntrackedProtocolStreamAndRecordsActi
 	}
 }
 
+func TestTaskRouter_PublishUserVisibleRoute_MirrorsGlobalFollowupToTUI(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+
+	reqCh := make(chan *guide.RouteRequest, 1)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		select {
+		case reqCh <- req:
+		default:
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer reqSub.Unsubscribe()
+
+	tuiStreamCh := make(chan *guide.StreamResponse, 1)
+	tuiRespCh := make(chan *guide.RouteResponse, 1)
+	tuiSub, err := bus.SubscribeAsync(guide.TopicResponses("tui", "tui"), func(msg *guide.Message) error {
+		if stream, ok := msg.GetStreamResponse(); ok && stream != nil {
+			select {
+			case tuiStreamCh <- stream:
+			default:
+			}
+		}
+		if resp, ok := msg.GetRouteResponse(); ok && resp != nil {
+			select {
+			case tuiRespCh <- resp:
+			default:
+			}
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer tuiSub.Unsubscribe()
+
+	req := &guide.RouteRequest{
+		CorrelationID:   "ot_followup_1",
+		Input:           "Audit the merged task result.",
+		TargetAgentID:   "inspector",
+		ExplicitTarget:  true,
+		SourceAgentID:   "orchestrator",
+		SourceAgentName: "orchestrator",
+		SessionID:       "test-session",
+		Metadata: map[string]any{
+			"agent_type":          "inspector",
+			"task_id":             "task-1",
+			"task_name":           "Hello CLI",
+			"task_slug":           "hello-cli",
+			"ot_handoff_followup": true,
+		},
+		Timestamp: time.Now(),
+	}
+	require.NoError(t, router.PublishUserVisibleRoute(req))
+
+	select {
+	case published := <-reqCh:
+		require.NotNil(t, published)
+		assert.Equal(t, req.CorrelationID, published.CorrelationID)
+		assert.Equal(t, "inspector", published.TargetAgentID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected user-visible guide request to be published")
+	}
+
+	streamMsg := &guide.Message{
+		ID:            "stream-visible-1",
+		CorrelationID: req.CorrelationID,
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     req.CorrelationID,
+			RespondingAgentID: "inspector",
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Auditing merged result"},
+			},
+		},
+		SourceAgentID: "inspector",
+		TargetAgentID: "orchestrator",
+		Timestamp:     time.Now(),
+	}
+	require.True(t, router.DeliverResponse(streamMsg))
+
+	select {
+	case mirrored := <-tuiStreamCh:
+		require.NotNil(t, mirrored)
+		assert.Equal(t, "tui", mirrored.TargetAgentID)
+		assert.Equal(t, "inspector", mirrored.RespondingAgentID)
+		assert.Equal(t, "inspector", mirrored.Metadata["agent_type"])
+		assert.Equal(t, "task-1", mirrored.Metadata["task_id"])
+		assert.Equal(t, "Hello CLI", mirrored.Metadata["task_name"])
+		assert.Equal(t, "hello-cli", mirrored.Metadata["task_slug"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected mirrored visible stream on the TUI response topic")
+	}
+
+	respMsg := guide.NewResponseMessage("", &guide.RouteResponse{
+		CorrelationID:       req.CorrelationID,
+		Success:             true,
+		Data:                "Global inspector audit complete.",
+		RespondingAgentID:   "inspector",
+		RespondingAgentName: "Inspector",
+	})
+	respMsg.CorrelationID = req.CorrelationID
+	require.True(t, router.DeliverResponse(respMsg))
+
+	select {
+	case mirrored := <-tuiRespCh:
+		require.NotNil(t, mirrored)
+		assert.Equal(t, req.CorrelationID, mirrored.CorrelationID)
+		assert.True(t, mirrored.Success)
+		assert.Equal(t, "Global inspector audit complete.", mirrored.Data)
+		assert.Equal(t, "inspector", mirrored.RespondingAgentID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected mirrored visible terminal response on the TUI response topic")
+	}
+}
+
 func TestTaskRouter_DeliverResponse_ConsumesUntrackedProtocolTerminal(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
@@ -713,6 +836,68 @@ func TestTaskRouter_DeliverResponse_ConsumesUntrackedProtocolTerminal(t *testing
 	msg.CorrelationID = resp.CorrelationID
 
 	assert.True(t, router.DeliverResponse(msg))
+}
+
+func TestTaskRouter_DeliverResponse_ReconcilesUntrackedProtocolTerminalOT(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+
+	updateCh := make(chan *PipelineUpdate, 1)
+	sub, err := bus.SubscribeAsync("pipeline.update."+agentshared.PipelineAgentInspector, func(msg *guide.Message) error {
+		if update, ok := msg.Payload.(*PipelineUpdate); ok {
+			updateCh <- update
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	resp := &guide.RouteResponse{
+		CorrelationID:     "pipe_protocol_ot",
+		Success:           true,
+		RespondingAgentID: PipelineWorkerAgentID("task-1", agentshared.PipelineAgentInspector),
+		Data: &agentshared.PipelineTurnResponse{
+			Action: &agentshared.PipelineTurnAction{
+				Type:         agentshared.PipelineProtocolActionOT,
+				AgentType:    agentshared.PipelineAgentInspector,
+				Summary:      "Pipeline accepted and ready for OT merge.",
+				EvidenceRefs: []string{"artifact:verification"},
+			},
+			Result: map[string]any{"snapshot": "final"},
+		},
+	}
+	msg := guide.NewResponseMessage("", resp)
+	msg.CorrelationID = resp.CorrelationID
+	msg.Metadata = map[string]any{
+		"pipeline_task": true,
+		"dag_id":        "dag-1",
+		"node_id":       "task-1",
+		"task_id":       "task-1",
+		"task_slug":     "task-one",
+		"task_name":     "Task One",
+		"agent_type":    agentshared.PipelineAgentInspector,
+	}
+
+	assert.True(t, router.DeliverResponse(msg))
+
+	select {
+	case update := <-updateCh:
+		require.NotNil(t, update)
+		assert.Equal(t, "dag-1", update.DAGID)
+		assert.Equal(t, "task-1", update.TaskID)
+		assert.Equal(t, agentshared.PipelineAgentInspector, update.AgentType)
+		assert.Equal(t, "succeeded", update.Status)
+		assert.Equal(t, string(StageInspect), update.Stage)
+		assert.Equal(t, "Pipeline accepted and ready for OT merge.", update.Message)
+		output, ok := update.Output.(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "Pipeline accepted and ready for OT merge.", output["summary"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected recovered protocol terminal update")
+	}
 }
 
 func TestTaskRouter_ErrorMessagePublishesFailure(t *testing.T) {

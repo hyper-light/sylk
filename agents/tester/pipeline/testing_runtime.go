@@ -1968,7 +1968,7 @@ func (pt *PipelineTester) runGoTestSuite(ctx context.Context, harness *testHarne
 		patterns = []string{"./..."}
 	}
 	args = append(args, patterns...)
-	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), commandapproval.Request{
+	authReq := commandapproval.Request{
 		Command:       "go " + strings.Join(args, " "),
 		WorkingDir:    workDir,
 		WorkspaceRoot: pt.workingDir(),
@@ -1976,7 +1976,9 @@ func (pt *PipelineTester) runGoTestSuite(ctx context.Context, harness *testHarne
 		AgentID:       pt.id,
 		AgentType:     "tester-pipeline",
 		SessionID:     versioning.SessionIDFromContext(ctx),
-	}); err != nil {
+	}
+	agentshared.PopulateCommandApprovalScope(ctx, &authReq)
+	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq); err != nil {
 		return nil, err
 	}
 
@@ -2092,7 +2094,7 @@ func (pt *PipelineTester) runGenericSuite(ctx context.Context, harness *testHarn
 	if len(args) == 0 {
 		return nil, fmt.Errorf("empty test command")
 	}
-	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), commandapproval.Request{
+	authReq := commandapproval.Request{
 		Command:       command,
 		WorkingDir:    workDir,
 		WorkspaceRoot: pt.workingDir(),
@@ -2100,7 +2102,9 @@ func (pt *PipelineTester) runGenericSuite(ctx context.Context, harness *testHarn
 		AgentID:       pt.id,
 		AgentType:     "tester-pipeline",
 		SessionID:     versioning.SessionIDFromContext(ctx),
-	}); err != nil {
+	}
+	agentshared.PopulateCommandApprovalScope(ctx, &authReq)
+	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq); err != nil {
 		return nil, err
 	}
 	cmdCtx := ctx

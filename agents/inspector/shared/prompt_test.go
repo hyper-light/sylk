@@ -24,6 +24,11 @@ func TestPipelineInspectorSystemPromptForContract_OmitsValidationProtocolPreImpl
 		"# Workspace Layers",
 		"Pipeline VFS: task-scoped unmerged in-progress work for the active pipeline.",
 		"`run_command` and `run_shell_script` execute against that same layered workspace view",
+		"Never describe a command failure as a sandbox, bwrap, chdir, project-directory, VFS, or `working_dir` limitation unless the tool output explicitly reports that condition",
+		"Treat virtualenv bootstrap or `.venv` execution failures as install-strategy/tooling problems, not sandbox or workspace-visibility proof",
+		"Never translate a missing interpreter, executable, module, or dependency error into a claim that the runner cannot see workspace files unless the tool output explicitly reports a missing workspace path",
+		"Always quote or summarize the exact execution-tool error or stderr before explaining why a command failed",
+		"Always treat `command not found`, `execvp`, and similar missing-executable errors as tooling-availability failures, not file-visibility failures, unless the tool output separately reports a missing workspace path",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("pre-implementation prompt missing %q", want)
@@ -49,6 +54,11 @@ func TestPipelineInspectorSystemPromptForContract_IncludesValidationProtocolWith
 		"# Workspace Layers",
 		"Pipeline VFS: task-scoped unmerged in-progress work for the active pipeline.",
 		"`run_command` and `run_shell_script` execute against that same layered workspace view",
+		"Never describe a command failure as a sandbox, bwrap, chdir, project-directory, VFS, or `working_dir` limitation unless the tool output explicitly reports that condition",
+		"Treat virtualenv bootstrap or `.venv` execution failures as install-strategy/tooling problems, not sandbox or workspace-visibility proof",
+		"Never translate a missing interpreter, executable, module, or dependency error into a claim that the runner cannot see workspace files unless the tool output explicitly reports a missing workspace path",
+		"Always quote or summarize the exact execution-tool error or stderr before explaining why a command failed",
+		"Always treat `command not found`, `execvp`, and similar missing-executable errors as tooling-availability failures, not file-visibility failures, unless the tool output separately reports a missing workspace path",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("implementation-validation prompt missing %q", want)

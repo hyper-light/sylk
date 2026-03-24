@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -86,7 +87,7 @@ func (r *ToolRunner) ExecShell(ctx context.Context, command string) (*ExecResult
 
 func (r *ToolRunner) exec(ctx context.Context, command string, argv []string) (*ExecResult, error) {
 	workspaceRoot := r.currentWorkingDir()
-	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), commandapproval.Request{
+	authReq := commandapproval.Request{
 		Command:       command,
 		WorkingDir:    workspaceRoot,
 		WorkspaceRoot: workspaceRoot,
@@ -94,7 +95,9 @@ func (r *ToolRunner) exec(ctx context.Context, command string, argv []string) (*
 		AgentID:       r.agentID,
 		AgentType:     r.agentType,
 		SessionID:     r.currentSessionID(ctx),
-	}); err != nil {
+	}
+	agentshared.PopulateCommandApprovalScope(ctx, &authReq)
+	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq); err != nil {
 		return nil, err
 	}
 	if r.requireBroker {
@@ -265,9 +268,10 @@ func (r *ToolRunner) Available(binary string) bool {
 	return found
 }
 
-// WorkingDir returns the runner's configured working directory.
+// WorkingDir returns the runner's effective working directory.
+// When FileAccess is present this tracks the injected VFS-backed workspace root.
 func (r *ToolRunner) WorkingDir() string {
-	return r.workingDir
+	return r.currentWorkingDir()
 }
 
 func (r *ToolRunner) LogicalTempDir() string {

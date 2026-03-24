@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/google/uuid"
 )
@@ -51,9 +52,13 @@ type BusNodeDispatcher struct {
 	ackWaiters         sync.Map // nodeID → chan *ACKResult
 	nodePods           sync.Map // nodeID → *shared.AgentPod
 	waitDispatchPermit func(context.Context, string, string) error
+	isExecutionHeld    func(string, string, string) bool
 	eventLogger        *agentlog.SessionEventLogger
 	lastActivity       sync.Map // nodeID → time.Time
 	activityGrace      time.Duration
+	contextQuota       *container.ResourceQuota
+	specRegistry       *container.AgentSpecRegistry
+	contextLeases      sync.Map // nodeID → *container.ContextLease
 
 	// onACK is called when an agent ACKs a node dispatch. Optional.
 	onACK func(nodeID string, ack *ACKResult)
@@ -92,6 +97,12 @@ func (d *BusNodeDispatcher) SetDispatchPermitWaiter(fn func(context.Context, str
 	d.waitDispatchPermit = fn
 }
 
+// SetExecutionHoldChecker installs a callback used to determine whether a
+// node belongs to a DAG currently paused by an execution hold.
+func (d *BusNodeDispatcher) SetExecutionHoldChecker(fn func(sessionID, dagID, nodeID string) bool) {
+	d.isExecutionHeld = fn
+}
+
 // SetACKCallback registers a function called on every successful ACK.
 func (d *BusNodeDispatcher) SetACKCallback(fn func(nodeID string, ack *ACKResult)) {
 	d.onACK = fn
@@ -100,6 +111,12 @@ func (d *BusNodeDispatcher) SetACKCallback(fn func(nodeID string, ack *ACKResult
 // SetEventLogger installs the session JSONL logger for dispatch traces.
 func (d *BusNodeDispatcher) SetEventLogger(el *agentlog.SessionEventLogger) {
 	d.eventLogger = el
+}
+
+// SetContextBudget installs the adaptive live-context budget controller.
+func (d *BusNodeDispatcher) SetContextBudget(quota *container.ResourceQuota, specRegistry *container.AgentSpecRegistry) {
+	d.contextQuota = quota
+	d.specRegistry = specRegistry
 }
 
 // SetPodResolver installs a node-aware pod resolver. When present, it
@@ -139,6 +156,14 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	defer d.dispatchDone.Delete(node.ID())
 	defer d.ackWaiters.Delete(node.ID())
 	defer close(done)
+	defer d.releaseContextLease(node.ID())
+
+	if err := d.acquireContextLease(ctx, node); err != nil {
+		d.logNodeTrace(node, "dispatch_context_lease_failed", agentlog.EventError, map[string]any{
+			"error": err.Error(),
+		})
+		return nil, err
+	}
 
 	// Activate target agent if demoted/cold.
 	d.logNodeTrace(node, "dispatch_activate_begin", agentlog.EventTaskDispatched, nil)
@@ -178,6 +203,9 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	defer d.ackResults.Delete(node.ID())
 	d.RecordActivity(node.ID())
 	defer d.lastActivity.Delete(node.ID())
+	if ack.AgentID != "" {
+		d.bindContextLeaseAlias(node.ID(), ack.AgentID)
+	}
 
 	// Transition node to Acked — visible to health monitor and WAL.
 	node.SetState(dag.NodeStateAcked)
@@ -223,6 +251,7 @@ func (d *BusNodeDispatcher) waitForNodeResult(
 	}
 	ctxDone := ctx.Done()
 	deadlineExtended := false
+	holdShielded := false
 	ticker := time.NewTicker(activityPollEvery(activityWindow))
 	defer ticker.Stop()
 
@@ -237,6 +266,17 @@ func (d *BusNodeDispatcher) waitForNodeResult(
 			return result, nil
 		case <-ticker.C:
 			if d.hasRecentActivityWithin(nodeID, activityWindow) {
+				holdShielded = false
+				continue
+			}
+			if d.executionHoldActive(nodeID) {
+				if !holdShielded {
+					d.logNodeTrace(node, "dispatch_inactivity_shielded", agentlog.EventTaskDispatched, map[string]any{
+						"activity_grace_ms": activityWindow.Milliseconds(),
+					})
+					holdShielded = true
+				}
+				d.RecordActivity(nodeID)
 				continue
 			}
 			d.logNodeTrace(node, "dispatch_inactivity_timeout", agentlog.EventError, map[string]any{
@@ -250,6 +290,18 @@ func (d *BusNodeDispatcher) waitForNodeResult(
 						"error": err.Error(),
 					})
 					return nil, err
+				}
+				if d.executionHoldActive(nodeID) {
+					if !deadlineExtended {
+						d.logNodeTrace(node, "dispatch_context_deadline_shielded", agentlog.EventTaskDispatched, map[string]any{
+							"error":             err.Error(),
+							"activity_grace_ms": activityWindow.Milliseconds(),
+						})
+					}
+					d.RecordActivity(nodeID)
+					deadlineExtended = true
+					ctxDone = nil
+					continue
 				}
 				if !d.hasRecentActivityWithin(nodeID, activityWindow) {
 					d.logNodeTrace(node, "dispatch_context_done", agentlog.EventError, map[string]any{
@@ -268,6 +320,13 @@ func (d *BusNodeDispatcher) waitForNodeResult(
 			}
 		}
 	}
+}
+
+func (d *BusNodeDispatcher) executionHoldActive(nodeID string) bool {
+	if d == nil || d.isExecutionHeld == nil {
+		return false
+	}
+	return d.isExecutionHeld(d.sessionID, d.dagID, strings.TrimSpace(nodeID))
 }
 
 func activityPollEvery(activityWindow time.Duration) time.Duration {
@@ -481,6 +540,95 @@ func (d *BusNodeDispatcher) ReleaseGuard(nodeID string) {
 	}
 }
 
+func (d *BusNodeDispatcher) acquireContextLease(ctx context.Context, node *dag.Node) error {
+	if d.contextQuota == nil || node == nil {
+		return nil
+	}
+	req := d.contextLeaseRequestForNode(node)
+	lease, err := d.contextQuota.TryAcquireContextLease(req)
+	if err != nil {
+		var deferred *container.ContextBudgetDeferredError
+		if errors.As(err, &deferred) {
+			return &dag.NodeDeferredError{
+				Reason:     deferred.Error(),
+				RetryAfter: deferred.RetryAfter,
+			}
+		}
+		return err
+	}
+	if lease != nil {
+		d.contextLeases.Store(node.ID(), lease)
+	}
+	return nil
+}
+
+// WaitForBudget lets the DAG executor pause until quota pressure changes or
+// the suggested retry window elapses.
+func (d *BusNodeDispatcher) WaitForBudget(ctx context.Context, retryAt time.Time) error {
+	waitFor := time.Until(retryAt)
+	if waitFor <= 0 {
+		return nil
+	}
+	if d.contextQuota == nil {
+		timer := time.NewTimer(waitFor)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		}
+	}
+	return d.contextQuota.WaitForContextBudget(ctx, waitFor)
+}
+
+func (d *BusNodeDispatcher) bindContextLeaseAlias(nodeID, alias string) {
+	val, ok := d.contextLeases.Load(strings.TrimSpace(nodeID))
+	if !ok {
+		return
+	}
+	lease, _ := val.(*container.ContextLease)
+	if lease == nil {
+		return
+	}
+	lease.BindAlias(alias)
+}
+
+func (d *BusNodeDispatcher) releaseContextLease(nodeID string) {
+	val, ok := d.contextLeases.LoadAndDelete(strings.TrimSpace(nodeID))
+	if !ok {
+		return
+	}
+	lease, _ := val.(*container.ContextLease)
+	if lease != nil {
+		lease.Release()
+	}
+}
+
+func (d *BusNodeDispatcher) contextLeaseRequestForNode(node *dag.Node) container.ContextLeaseRequest {
+	req := container.ContextLeaseRequest{
+		ClaimID:         strings.TrimSpace(node.ID()),
+		AgentType:       strings.TrimSpace(node.AgentType()),
+		PromptBytes:     len(node.Prompt()),
+		DependencyCount: len(node.Dependencies()),
+		CoAgentCount:    len(node.CoAgents()),
+	}
+	if ctx := node.Context(); ctx != nil {
+		req.ContextFieldCount = len(ctx)
+	}
+
+	if d.specRegistry != nil {
+		if spec, err := d.specRegistry.SpecForAgent(node.AgentType()); err == nil {
+			req.RequestTokens = int64(spec.Resources.ContextWindowRequest)
+			req.HardLimitTokens = int64(spec.Resources.ContextWindowLimit)
+		}
+	}
+	if req.RequestTokens <= 0 && req.HardLimitTokens > 0 {
+		req.RequestTokens = req.HardLimitTokens * 3 / 4
+	}
+	return req
+}
+
 // ReleaseAllGuards releases all outstanding demotion guards via the pod.
 // Called during DAG cleanup to free guards for nodes that didn't complete
 // normally. No-op when the pod is nil.
@@ -587,6 +735,7 @@ func (d *BusNodeDispatcher) DispatchDone(nodeID string) <-chan struct{} {
 // OnNodeComplete is called by the orchestrator when a pipeline agent responds.
 // It releases the node's demotion guard and resolves the pending dispatch.
 func (d *BusNodeDispatcher) OnNodeComplete(nodeID string, result *dag.NodeResult) {
+	d.releaseContextLease(nodeID)
 	d.ReleaseGuard(nodeID)
 
 	val, ok := d.pending.Load(nodeID)

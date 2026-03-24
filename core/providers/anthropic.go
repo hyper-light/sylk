@@ -60,6 +60,7 @@ const (
 	Opus46            AnthropicModel = "claude-opus-4-6"
 	SonnetLongContext AnthropicModel = "claude-sonnet-4-6"
 	Haiku             AnthropicModel = "claude-haiku-4-5-20251001"
+	minAnthropicThinkingBudget   = 1024
 )
 
 // Supported Anthropic models
@@ -774,12 +775,9 @@ func (p *AnthropicProvider) resolveThinkingConfig(requestBudget int, maxTokens i
 		adaptive := anthropic.NewThinkingConfigAdaptiveParam()
 		return anthropic.ThinkingConfigParamUnion{OfAdaptive: &adaptive}
 	}
-	budget := resolveThinkingBudget(requestBudget, p.config.ThinkingBudget)
+	budget := normalizeAnthropicThinkingBudget(resolveThinkingBudget(requestBudget, p.config.ThinkingBudget), maxTokens)
 	if budget <= 0 {
 		return anthropic.ThinkingConfigParamUnion{}
-	}
-	if budget >= maxTokens {
-		budget = maxTokens - 1
 	}
 	return anthropic.ThinkingConfigParamOfEnabled(int64(budget))
 }
@@ -791,6 +789,25 @@ func resolveThinkingBudget(requestBudget int, configBudget int) int {
 		return requestBudget
 	}
 	return configBudget
+}
+
+func normalizeAnthropicThinkingBudget(budget int, maxTokens int) int {
+	if budget <= 0 {
+		return 0
+	}
+	if maxTokens <= minAnthropicThinkingBudget {
+		return 0
+	}
+	if budget < minAnthropicThinkingBudget {
+		budget = minAnthropicThinkingBudget
+	}
+	if budget >= maxTokens {
+		budget = maxTokens - 1
+	}
+	if budget < minAnthropicThinkingBudget {
+		return 0
+	}
+	return budget
 }
 
 // isAnthropicThinkingEnabled returns true when the thinking config union has

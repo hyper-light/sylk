@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -62,49 +62,25 @@ func researchTestToolInstallSkill(gt *GlobalTester) *skills.Skill {
 }
 
 func installTestToolingSkill(gt *GlobalTester) *skills.Skill {
-	stepProps := map[string]*skills.Property{
-		"command": {Type: "string", Description: "Single install command to run. No pipes, chaining, or shell control operators."},
-		"reason":  {Type: "string", Description: "Why the step is needed."},
-	}
-	type params struct {
-		Summary           string                `json:"summary"`
-		MissingTool       string                `json:"missing_tool,omitempty"`
-		Framework         string                `json:"framework,omitempty"`
-		ValidationCommand string                `json:"validation_command,omitempty"`
-		Notes             []string              `json:"notes,omitempty"`
-		Steps             []testToolInstallStep `json:"steps"`
-	}
-
-	return skills.NewSkill("install_test_tooling").
-		Description("Execute an approved global test-tool installation plan step-by-step using the existing command-approval dialogue.").
-		Domain("testing").
-		Keywords("install", "tooling", "dependency", "pytest", "playwright", "approval").
-		Priority(89).
-		Usage("Use after research_test_tool_install once you have a concrete plan to show the user. The install commands will go through the existing allow once / allow always / deny once / deny always approval dialogue.").
-		Requirement("Provide a concrete summary and a list of single install commands. Each step must be one command without chaining or shell control operators.").
-		Satisfies("Installs missing global test tooling, captures command output, and optionally validates that the toolchain is now runnable.").
-		Avoid("Do not use for speculative dependency changes or for arbitrary shell work unrelated to restoring the global test toolchain.").
-		StringParam("summary", "Short explanation of the install plan.", true).
-		StringParam("missing_tool", "Missing tool this plan remedies.", false).
-		StringParam("framework", "Framework or ecosystem context for the install plan.", false).
-		StringParam("validation_command", "Optional non-mutating command to verify the install succeeded.", false).
-		ArrayParam("notes", "Important caveats or assumptions.", "string", false).
-		ArrayObjectParam("steps", "Concrete single-command install steps to execute after approval.", stepProps, []string{"command"}, true).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var p params
-			if err := json.Unmarshal(input, &p); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			return gt.installTestTooling(ctx, &testToolInstallPlan{
-				Summary:           p.Summary,
-				MissingTool:       p.MissingTool,
-				Framework:         p.Framework,
-				ValidationCommand: p.ValidationCommand,
-				Notes:             append([]string(nil), p.Notes...),
-				Steps:             append([]testToolInstallStep(nil), p.Steps...),
-			})
-		}).
-		Build()
+	return agentshared.NewDependencyInstallExecutionSkill(agentshared.DependencyInstallSkillConfig{
+		SkillName:     "install_test_tooling",
+		Description:   "Execute an approved global test-tool installation plan step-by-step using the existing command-approval dialogue.",
+		Domain:        "testing",
+		Keywords:      []string{"install", "tooling", "dependency", "pytest", "playwright", "approval"},
+		Priority:      89,
+		Usage:         "Use after research_test_tool_install once you have a concrete plan to show the user. Each command goes through the existing approval dialogue and executes against the real disk workspace.",
+		Requirement:   "Provide a concrete summary and a list of single install commands. Each step must be one command without chaining or shell control operators.",
+		Satisfies:     "Installs missing global test tooling to disk, captures command output, and optionally validates that the toolchain is now runnable.",
+		Avoid:         "Do not use for speculative dependency changes or for arbitrary shell work unrelated to restoring the global test toolchain.",
+		ResearchSkill: "research_test_tool_install",
+		AgentType:     "tester",
+		AgentID:       func() string { return gt.id },
+		SessionID:     func() string { return gt.config.SessionID },
+		WorkingDir:    gt.workingDir,
+		DefaultTimeout: func() time.Duration {
+			return gt.config.DefaultTimeout
+		},
+	})
 }
 
 func (gt *GlobalTester) researchTestToolInstall(
@@ -134,55 +110,15 @@ func (gt *GlobalTester) researchTestToolInstall(
 }
 
 func (gt *GlobalTester) installTestTooling(ctx context.Context, plan *testToolInstallPlan) (map[string]any, error) {
-	if err := agentshared.ValidateDependencyInstallPlan(plan); err != nil {
-		return nil, err
-	}
-	execCtx, err := gt.commandExecutionContext(ctx, "")
-	if err != nil {
-		return nil, err
-	}
-	if pp := agentshared.ProgressPublisherFromContext(ctx); pp != nil {
-		pp.PublishChunk(agentshared.FormatDependencyInstallPlan(plan))
-	}
-
-	stepResults := make([]map[string]any, 0, len(plan.Steps))
-	for _, step := range plan.Steps {
-		runResult, err := gt.runInstallCommand(ctx, execCtx, step.Command)
-		if err != nil {
-			return nil, err
-		}
-		stepResults = append(stepResults, map[string]any{
-			"command":   step.Command,
-			"reason":    step.Reason,
-			"exit_code": runResult.ExitCode,
-			"stdout":    string(runResult.Stdout),
-			"stderr":    string(runResult.Stderr),
-			"truncated": runResult.StdoutTruncated || runResult.StderrTruncated,
-		})
-	}
-
-	result := map[string]any{
-		"installed":    true,
-		"summary":      plan.Summary,
-		"missing_tool": plan.MissingTool,
-		"framework":    plan.Framework,
-		"step_count":   len(plan.Steps),
-		"steps":        stepResults,
-	}
-	if strings.TrimSpace(plan.ValidationCommand) != "" {
-		validationResult, err := gt.runInstallCommand(ctx, execCtx, plan.ValidationCommand)
-		if err != nil {
-			return nil, err
-		}
-		result["validation"] = map[string]any{
-			"command":   plan.ValidationCommand,
-			"exit_code": validationResult.ExitCode,
-			"stdout":    string(validationResult.Stdout),
-			"stderr":    string(validationResult.Stderr),
-			"truncated": validationResult.StdoutTruncated || validationResult.StderrTruncated,
-		}
-	}
-	return result, nil
+	return agentshared.ExecuteDependencyInstallPlan(ctx, agentshared.DependencyInstallSkillConfig{
+		SkillName:      "install_test_tooling",
+		ResearchSkill:  "research_test_tool_install",
+		AgentType:      "tester",
+		AgentID:        func() string { return gt.id },
+		SessionID:      func() string { return gt.config.SessionID },
+		WorkingDir:     gt.workingDir,
+		DefaultTimeout: func() time.Duration { return gt.config.DefaultTimeout },
+	}, plan)
 }
 
 func (gt *GlobalTester) workingDir() string {
@@ -270,47 +206,4 @@ func globalTesterOverlayState(fa versioning.FileAccess) (bool, bool) {
 		}
 	}
 	return true, hasDeletes
-}
-
-func (gt *GlobalTester) runInstallCommand(
-	ctx context.Context,
-	execCtx globalTesterCommandExecContext,
-	command string,
-) (*purevfs.BrokerRunResult, error) {
-	if agentshared.DependencyCommandHasUnsafeShellSyntax(command) {
-		return nil, fmt.Errorf("shell control operators are not allowed in install_test_tooling")
-	}
-	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), commandapproval.Request{
-		Command:       command,
-		WorkingDir:    execCtx.workDir,
-		WorkspaceRoot: gt.workingDir(),
-		ToolName:      "install_test_tooling",
-		AgentID:       gt.id,
-		AgentType:     "tester",
-		SessionID:     versioning.SessionIDFromContext(ctx),
-	}); err != nil {
-		return nil, err
-	}
-	if gt.executionBroker == nil {
-		return nil, purevfs.ErrStrictExecutionUnavailable
-	}
-	runResult, err := gt.executionBroker.Run(ctx, purevfs.BrokerRunRequest{
-		Plan:      execCtx.plan,
-		Argv:      purevfs.ShellCommandArgv(command),
-		Workspace: gt.executionWorkspace(true),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute command: %w", err)
-	}
-	if runResult.ExitCode != 0 {
-		stderr := strings.TrimSpace(string(runResult.Stderr))
-		if stderr == "" {
-			stderr = strings.TrimSpace(string(runResult.Stdout))
-		}
-		if stderr == "" {
-			stderr = fmt.Sprintf("command exited with code %d", runResult.ExitCode)
-		}
-		return nil, fmt.Errorf("%s: %s", command, stderr)
-	}
-	return runResult, nil
 }

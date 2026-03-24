@@ -381,6 +381,12 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	phase1.serviceReg = network.NewServiceRegistry()
 	phase1.specReg = container.NewAgentSpecRegistry(phase1.descriptors)
 	phase1.quota = container.NewResourceQuota(quotaFromSpecs(phase1.specReg))
+	phase1.quota.SetContextArchetypeMatcher(activation.NewActivationPredictor(activation.PredictorConfig{}))
+	if observer := agentShared.NewContextBudgetObserver("tui.context_budget", phase1.guideBus, phase1.quota); observer != nil {
+		if err := observer.Start(); err != nil {
+			slog.Warn("failed to start context budget observer", "error", err)
+		}
+	}
 
 	creatorReg := container.NewAgentCreatorRegistry()
 	phase1.creatorReg = creatorReg
@@ -826,6 +832,7 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 	orch.SetTaskPodInfra(phase1.runtime, phase1.specReg, func(sessionID string) *versioning.SessionVFS {
 		return orch.EnsureSessionVFS(sessionID, phase1.projectRoot)
 	})
+	orch.SetContextQuota(phase1.quota)
 
 	phase3.scribeFactory = buildScribeFactory(
 		phase1.ctx,
@@ -1903,11 +1910,13 @@ func quotaFromSpecs(specReg *container.AgentSpecRegistry) container.ResourceQuot
 	agentCount := int64(len(all))
 
 	var (
-		totalGoroutines    int64
-		totalContextWindow int64
-		restartableCount   int64 // agents that may restart (concurrent old+new overlap)
-		maxGoroutineLimit  int64 // largest single-agent goroutine budget (incl overhead)
-		maxContextWindow   int64 // largest single-agent context window
+		totalGoroutines     int64
+		totalContextRequest int64
+		totalContextWindow  int64
+		restartableCount    int64 // agents that may restart (concurrent old+new overlap)
+		maxGoroutineLimit   int64 // largest single-agent goroutine budget (incl overhead)
+		maxContextRequest   int64 // largest single-agent request window
+		maxContextWindow    int64 // largest single-agent context window
 	)
 
 	for _, d := range all {
@@ -1918,13 +1927,18 @@ func quotaFromSpecs(specReg *container.AgentSpecRegistry) container.ResourceQuot
 
 		overhead := runtimeOverhead(spec)
 		goroutines := spec.Resources.GoroutineLimit + overhead
+		ctxRequest := int64(spec.Resources.ContextWindowRequest)
 		ctxWindow := int64(spec.Resources.ContextWindowLimit)
 
 		totalGoroutines += goroutines
+		totalContextRequest += ctxRequest
 		totalContextWindow += ctxWindow
 
 		if goroutines > maxGoroutineLimit {
 			maxGoroutineLimit = goroutines
+		}
+		if ctxRequest > maxContextRequest {
+			maxContextRequest = ctxRequest
 		}
 		if ctxWindow > maxContextWindow {
 			maxContextWindow = ctxWindow
@@ -1948,9 +1962,10 @@ func quotaFromSpecs(specReg *container.AgentSpecRegistry) container.ResourceQuot
 	contextHeadroom := maxContextWindow
 
 	return container.ResourceQuotaConfig{
-		GoroutineLimit:     totalGoroutines + restartGoroutineHeadroom,
-		ContextWindowLimit: totalContextWindow + contextHeadroom,
-		ContainerLimit:     agentCount + restartableCount,
+		GoroutineLimit:       totalGoroutines + restartGoroutineHeadroom,
+		ContextWindowRequest: totalContextRequest + maxContextRequest,
+		ContextWindowLimit:   totalContextWindow + contextHeadroom,
+		ContainerLimit:       agentCount + restartableCount,
 	}
 }
 

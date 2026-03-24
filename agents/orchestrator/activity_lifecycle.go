@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -33,7 +34,7 @@ func (o *Orchestrator) publishStandaloneAgentActivity(
 	if agentType == "" || content == "" || isPipelinePanelAgentType(agentType) {
 		return
 	}
-	evt := events.NewActivityEvent(events.EventTypeAgentAction, o.config.SessionID, content)
+	evt := events.NewActivityEvent(events.EventTypeAgentAction, firstNonEmpty(strings.TrimSpace(o.config.SessionID), orchestratorStateSessionID(o)), content)
 	evt.AgentID = agentType
 	evt.Visibility = visibility
 	evt.Data["agent_type"] = agentType
@@ -45,7 +46,7 @@ func (o *Orchestrator) publishStandaloneAgentActivity(
 }
 
 func (o *Orchestrator) publishTaskDraftMergeSuccess(task *TaskRecord, version versioning.SemanticVersion) {
-	if o == nil || o.activityPub == nil || task == nil {
+	if o == nil || task == nil {
 		return
 	}
 	label := strings.TrimSpace(firstNonEmpty(task.Name, task.ID))
@@ -54,7 +55,7 @@ func (o *Orchestrator) publishTaskDraftMergeSuccess(task *TaskRecord, version ve
 	}
 	evt := events.NewActivityEvent(
 		events.EventTypeSuccess,
-		o.config.SessionID,
+		firstNonEmpty(strings.TrimSpace(task.SessionID), strings.TrimSpace(o.config.SessionID), orchestratorStateSessionID(o)),
 		fmt.Sprintf("Operational transform merged %s into the global VFS at version %s.", label, version.String()),
 	)
 	evt.AgentID = o.config.AgentID
@@ -67,12 +68,14 @@ func (o *Orchestrator) publishTaskDraftMergeSuccess(task *TaskRecord, version ve
 		evt.Data["task_name"] = name
 	}
 	evt.Data["global_vfs_version"] = version.String()
-	evt.Data["chat_visible"] = true
-	o.activityPub.PublishActivity(evt)
+	if o.activityPub != nil {
+		o.activityPub.PublishActivity(evt)
+	}
+	o.publishUserVisibleSystemResponse(evt.Content)
 }
 
 func (o *Orchestrator) publishTaskDraftMergeFailure(task *TaskRecord, err error) {
-	if o == nil || o.activityPub == nil || task == nil || err == nil {
+	if o == nil || task == nil || err == nil {
 		return
 	}
 	label := strings.TrimSpace(firstNonEmpty(task.Name, task.ID))
@@ -81,7 +84,7 @@ func (o *Orchestrator) publishTaskDraftMergeFailure(task *TaskRecord, err error)
 	}
 	evt := events.NewActivityEvent(
 		events.EventTypeFailure,
-		o.config.SessionID,
+		firstNonEmpty(strings.TrimSpace(task.SessionID), strings.TrimSpace(o.config.SessionID), orchestratorStateSessionID(o)),
 		fmt.Sprintf("Operational transform failed while merging %s into the global VFS: %s", label, err.Error()),
 	)
 	evt.AgentID = o.config.AgentID
@@ -93,5 +96,53 @@ func (o *Orchestrator) publishTaskDraftMergeFailure(task *TaskRecord, err error)
 	if name := strings.TrimSpace(task.Name); name != "" {
 		evt.Data["task_name"] = name
 	}
-	o.activityPub.PublishActivity(evt)
+	if o.activityPub != nil {
+		o.activityPub.PublishActivity(evt)
+	}
+	o.publishUserVisibleSystemError(evt.Content)
+}
+
+func (o *Orchestrator) publishTaskDraftMergeStarted(task *TaskRecord) {
+	if o == nil || task == nil {
+		return
+	}
+	label := strings.TrimSpace(firstNonEmpty(task.Name, task.ID))
+	if label == "" {
+		label = "task"
+	}
+	o.publishUserVisibleSystemResponse(
+		fmt.Sprintf("Operational transform received the accepted pipeline handoff for %s and is applying it to the global VFS.", label),
+	)
+}
+
+func (o *Orchestrator) publishUserVisibleSystemResponse(content string) {
+	o.publishUserVisibleSystemRouteResponse(content, "")
+}
+
+func (o *Orchestrator) publishUserVisibleSystemError(content string) {
+	o.publishUserVisibleSystemRouteResponse("", content)
+}
+
+func (o *Orchestrator) publishUserVisibleSystemRouteResponse(content, errText string) {
+	if o == nil || o.bus == nil {
+		return
+	}
+	content = strings.TrimSpace(content)
+	errText = strings.TrimSpace(errText)
+	if content == "" && errText == "" {
+		return
+	}
+	resp := &guide.RouteResponse{
+		CorrelationID:       "system_" + generateMessageID(),
+		Success:             errText == "",
+		RespondingAgentID:   strings.TrimSpace(o.config.AgentID),
+		RespondingAgentName: "Orchestrator",
+		Data:                content,
+		Error:               errText,
+	}
+	msg := guide.NewResponseMessage(generateMessageID(), resp)
+	msg.TargetAgentID = "tui"
+	if err := o.bus.Publish(guide.TopicResponses("tui", "tui"), msg); err != nil {
+		o.logWarnMsg("publish user-visible orchestrator response", "error", err)
+	}
 }

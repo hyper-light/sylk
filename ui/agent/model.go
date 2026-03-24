@@ -1666,21 +1666,27 @@ func (m *Model) AdvanceDecor(now time.Time) bool {
 	if m == nil {
 		return false
 	}
+	hasActiveAgents := m.HasActiveAgent()
 	if m.selector.flash > 0 {
-		if m.HasActiveAgent() {
+		if hasActiveAgents {
 			m.AdvanceDotFrame()
 		} else {
 			m.DecrementSelectorFlash()
 		}
 		return true
 	}
+	hasActivePipelines := false
 	for _, pl := range m.pipelines {
 		if !isTerminalPipelineStatus(pl.Status) {
-			return true
+			hasActivePipelines = true
+			break
 		}
 	}
-	if m.HasActiveAgent() {
+	if hasActiveAgents {
 		m.AdvanceDotFrame()
+		return true
+	}
+	if hasActivePipelines {
 		return true
 	}
 	if len(m.agents) == 0 {

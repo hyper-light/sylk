@@ -39,6 +39,11 @@ type cancelledDispatcher struct {
 
 type lateSuccessAfterDeadlineDispatcher struct{}
 
+type budgetDeferredDispatcher struct {
+	calls     atomic.Int32
+	waitCalls atomic.Int32
+}
+
 func newMockDispatcher() *mockDispatcher {
 	return &mockDispatcher{
 		executed:   make([]string, 0),
@@ -135,6 +140,26 @@ func (d *lateSuccessAfterDeadlineDispatcher) Dispatch(ctx context.Context, node 
 		Output:  "success",
 		EndTime: time.Now(),
 	}, nil
+}
+
+func (d *budgetDeferredDispatcher) Dispatch(ctx context.Context, node *dag.Node, parentResults map[string]*dag.NodeResult) (*dag.NodeResult, error) {
+	if d.calls.Add(1) == 1 {
+		return nil, &dag.NodeDeferredError{
+			Reason:     "context budget deferred",
+			RetryAfter: time.Hour,
+		}
+	}
+	return &dag.NodeResult{
+		NodeID:  node.ID(),
+		State:   dag.NodeStateSucceeded,
+		Output:  "success",
+		EndTime: time.Now(),
+	}, nil
+}
+
+func (d *budgetDeferredDispatcher) WaitForBudget(ctx context.Context, retryAt time.Time) error {
+	d.waitCalls.Add(1)
+	return nil
 }
 
 func TestNode_New(t *testing.T) {
@@ -922,6 +947,39 @@ func TestExecutor_Timeout(t *testing.T) {
 	assert.GreaterOrEqual(t, result.NodesFailed, 1)
 }
 
+func TestExecutor_BudgetDeferredNodeRequeuesAndSucceeds(t *testing.T) {
+	d, _ := dag.NewBuilder("budget-deferred").
+		WithPolicy(dag.ExecutionPolicy{
+			FailurePolicy:  dag.FailurePolicyFailFast,
+			MaxConcurrency: 1,
+			RetryBackoff:   10 * time.Millisecond,
+		}).
+		AddNode(dag.NodeConfig{ID: "node-1"}).
+		Build()
+
+	dispatcher := &budgetDeferredDispatcher{}
+	executor := dag.NewExecutor(d.Policy(), nil)
+
+	var events []dag.EventType
+	executor.Subscribe(func(event *dag.Event) {
+		if event.NodeID == "node-1" {
+			events = append(events, event.Type)
+		}
+	})
+
+	start := time.Now()
+	result, err := executor.Execute(context.Background(), d, dispatcher)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, dag.DAGStateSucceeded, result.State)
+	assert.Equal(t, int32(2), dispatcher.calls.Load())
+	assert.Equal(t, int32(1), dispatcher.waitCalls.Load())
+	assert.Less(t, time.Since(start), 500*time.Millisecond)
+	assert.Contains(t, events, dag.EventNodeBudgetDeferred)
+	assert.Equal(t, dag.NodeStateSucceeded, result.NodeResults["node-1"].State)
+}
+
 func TestExecutor_NoTimeoutDisablesFixedNodeDeadline(t *testing.T) {
 	d, _ := dag.NewBuilder("no-timeout").
 		WithPolicy(dag.ExecutionPolicy{
@@ -985,6 +1043,7 @@ func TestNodeState_String(t *testing.T) {
 	}{
 		{dag.NodeStatePending, "pending"},
 		{dag.NodeStateQueued, "queued"},
+		{dag.NodeStateWaitingBudget, "waiting_budget"},
 		{dag.NodeStateRunning, "running"},
 		{dag.NodeStateSucceeded, "succeeded"},
 		{dag.NodeStateFailed, "failed"},
@@ -1032,6 +1091,7 @@ func TestEventType_String(t *testing.T) {
 		{dag.EventDAGStarted, "dag_started"},
 		{dag.EventDAGCompleted, "dag_completed"},
 		{dag.EventDAGFailed, "dag_failed"},
+		{dag.EventNodeBudgetDeferred, "node_budget_deferred"},
 		{dag.EventNodeStarted, "node_started"},
 		{dag.EventNodeCompleted, "node_completed"},
 		{dag.EventNodeFailed, "node_failed"},

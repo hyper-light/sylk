@@ -58,6 +58,9 @@ type TaskRouter struct {
 
 	pendingMu sync.Mutex
 	pending   map[string]*pendingRoute // correlationID → pending
+
+	visibleMu sync.Mutex
+	visible   map[string]*visibleRoute // correlationID → mirrored user-visible route
 }
 
 // pendingRoute tracks a dispatched task awaiting a Guide-routed response.
@@ -65,6 +68,11 @@ type pendingRoute struct {
 	task   *PipelineTask
 	ch     chan *guide.Message
 	closed bool // set by CancelAllPending before closing ch
+}
+
+type visibleRoute struct {
+	agentType string
+	metadata  map[string]any
 }
 
 // NewTaskRouter creates a TaskRouter that routes tasks through the Guide.
@@ -83,6 +91,7 @@ func NewTaskRouter(cfg TaskRouterConfig) *TaskRouter {
 		eventLogger:          cfg.EventLogger,
 		onNodeActivity:       cfg.OnNodeActivity,
 		pending:              make(map[string]*pendingRoute),
+		visible:              make(map[string]*visibleRoute),
 	}
 }
 
@@ -184,6 +193,36 @@ func (r *TaskRouter) RouteWithLifecycle(task *PipelineTask, done <-chan struct{}
 	})
 }
 
+// PublishUserVisibleRoute publishes a direct Guide route request and mirrors the
+// resulting stream/terminal responses onto the TUI response topic so the chat
+// panel sees the full conversation.
+func (r *TaskRouter) PublishUserVisibleRoute(req *guide.RouteRequest) error {
+	if r == nil {
+		return fmt.Errorf("task router is not configured")
+	}
+	if r.bus == nil {
+		return fmt.Errorf("task router bus is not configured")
+	}
+	if req == nil {
+		return fmt.Errorf("route request is required")
+	}
+
+	corrID := strings.TrimSpace(req.CorrelationID)
+	if corrID == "" {
+		corrID = "route_" + generateMessageID()
+		req.CorrelationID = corrID
+	}
+	r.trackVisibleRoute(corrID, visibleRouteFromRequest(req))
+
+	msg := guide.NewRequestMessage(generateMessageID(), req)
+	msg.Metadata = cloneMetadata(req.Metadata)
+	if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+		r.clearVisibleRoute(corrID)
+		return err
+	}
+	return nil
+}
+
 // DeliverResponse is called by the Orchestrator's response handler when a
 // message arrives on response.orchestrator.orchestrator. If the correlationID
 // matches a pending pipeline route, the message is forwarded to the waiting
@@ -196,6 +235,9 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 		if r.mirrorStreamToUser(msg) {
 			return true
 		}
+		if r.mirrorVisibleRouteStreamToUser(msg) {
+			return true
+		}
 		return r.mirrorProtocolStreamToUser(msg)
 	}
 	if !isTerminalRouteMessage(msg) {
@@ -206,6 +248,9 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 	pr := r.pending[msg.CorrelationID]
 	if pr == nil || pr.closed {
 		r.pendingMu.Unlock()
+		if r.mirrorVisibleRouteTerminalToUser(msg) {
+			return true
+		}
 		if r.consumeProtocolTerminal(msg) {
 			return true
 		}
@@ -246,6 +291,80 @@ func defaultStreamMirrorTarget(target string) string {
 		return "tui"
 	}
 	return target
+}
+
+func (r *TaskRouter) trackVisibleRoute(corrID string, route *visibleRoute) {
+	if r == nil || strings.TrimSpace(corrID) == "" || route == nil {
+		return
+	}
+	r.visibleMu.Lock()
+	r.visible[corrID] = route
+	r.visibleMu.Unlock()
+}
+
+func (r *TaskRouter) visibleRoute(corrID string) *visibleRoute {
+	if r == nil || strings.TrimSpace(corrID) == "" {
+		return nil
+	}
+	r.visibleMu.Lock()
+	defer r.visibleMu.Unlock()
+	route := r.visible[corrID]
+	if route == nil {
+		return nil
+	}
+	cloned := &visibleRoute{
+		agentType: route.agentType,
+		metadata:  cloneMetadata(route.metadata),
+	}
+	return cloned
+}
+
+func (r *TaskRouter) clearVisibleRoute(corrID string) {
+	if r == nil || strings.TrimSpace(corrID) == "" {
+		return
+	}
+	r.visibleMu.Lock()
+	delete(r.visible, corrID)
+	r.visibleMu.Unlock()
+}
+
+func visibleRouteFromRequest(req *guide.RouteRequest) *visibleRoute {
+	if req == nil {
+		return nil
+	}
+	metadata := cloneMetadata(req.Metadata)
+	if metadata == nil {
+		metadata = make(map[string]any, 4)
+	}
+	agentType := metadataString(metadata, "agent_type")
+	if agentType == "" {
+		agentType = strings.TrimSpace(req.TargetAgentID)
+		if agentType != "" {
+			metadata["agent_type"] = agentType
+		}
+	}
+	return &visibleRoute{
+		agentType: agentType,
+		metadata:  metadata,
+	}
+}
+
+func enrichVisibleRouteMetadata(route *visibleRoute, metadata map[string]any) map[string]any {
+	if route == nil {
+		return metadata
+	}
+	if metadata == nil {
+		metadata = make(map[string]any, len(route.metadata)+1)
+	}
+	for key, value := range route.metadata {
+		if _, exists := metadata[key]; !exists {
+			metadata[key] = value
+		}
+	}
+	if _, ok := metadata["agent_type"]; !ok && strings.TrimSpace(route.agentType) != "" {
+		metadata["agent_type"] = strings.TrimSpace(route.agentType)
+	}
+	return metadata
 }
 
 func (r *TaskRouter) mirrorStreamToUser(msg *guide.Message) bool {
@@ -305,6 +424,57 @@ func (r *TaskRouter) mirrorStreamToUser(msg *guide.Message) bool {
 	return true
 }
 
+func (r *TaskRouter) mirrorVisibleRouteStreamToUser(msg *guide.Message) bool {
+	if msg == nil || msg.CorrelationID == "" {
+		return false
+	}
+	stream, ok := msg.GetStreamResponse()
+	if !ok || stream == nil || stream.Event == nil {
+		return false
+	}
+	route := r.visibleRoute(msg.CorrelationID)
+	if route == nil {
+		return false
+	}
+	if r.streamMirrorTargetID == "" || r.bus == nil {
+		return true
+	}
+
+	mirrored := &guide.StreamResponse{
+		CorrelationID:       stream.CorrelationID,
+		RespondingAgentID:   firstNonEmpty(stream.RespondingAgentID, msg.SourceAgentID, strings.TrimSpace(route.agentType)),
+		RespondingAgentName: firstNonEmpty(stream.RespondingAgentName, agentshared.AgentDisplayName(route.agentType)),
+		TargetAgentID:       r.streamMirrorTargetID,
+		Metadata:            enrichVisibleRouteMetadata(route, cloneMetadata(stream.Metadata)),
+		Event:               cloneStreamEvent(stream.Event),
+	}
+	mirroredMsg := &guide.Message{
+		ID:            generateMessageID(),
+		CorrelationID: mirrored.CorrelationID,
+		Type:          guide.MessageTypeStream,
+		Payload:       mirrored,
+		SourceAgentID: mirrored.RespondingAgentID,
+		TargetAgentID: r.streamMirrorTargetID,
+		Timestamp:     time.Now(),
+	}
+	if err := r.bus.Publish(guide.TopicResponses(r.streamMirrorTargetID, r.streamMirrorTargetID), mirroredMsg); err != nil {
+		r.logger.Warn("mirror visible route stream to user", "correlation_id", msg.CorrelationID, "error", err)
+		r.logTrace("task_router_visible_stream_mirror_failed", "warn", agentlog.EventError, msg.CorrelationID, map[string]any{
+			"mirror_target":   r.streamMirrorTargetID,
+			"source_agent_id": msg.SourceAgentID,
+			"agent_type":      route.agentType,
+			"error":           err.Error(),
+		})
+		return true
+	}
+	r.logTrace("task_router_visible_stream_mirrored", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, map[string]any{
+		"mirror_target":   r.streamMirrorTargetID,
+		"source_agent_id": msg.SourceAgentID,
+		"agent_type":      route.agentType,
+	})
+	return true
+}
+
 func (r *TaskRouter) mirrorProtocolStreamToUser(msg *guide.Message) bool {
 	if msg == nil || msg.CorrelationID == "" {
 		return false
@@ -357,6 +527,71 @@ func (r *TaskRouter) mirrorProtocolStreamToUser(msg *guide.Message) bool {
 	return true
 }
 
+func (r *TaskRouter) mirrorVisibleRouteTerminalToUser(msg *guide.Message) bool {
+	if msg == nil || msg.CorrelationID == "" {
+		return false
+	}
+	route := r.visibleRoute(msg.CorrelationID)
+	if route == nil {
+		return false
+	}
+	defer r.clearVisibleRoute(msg.CorrelationID)
+	if r.streamMirrorTargetID == "" || r.bus == nil {
+		return true
+	}
+
+	resp := mirroredVisibleRouteResponse(msg, route)
+	if resp == nil {
+		return false
+	}
+	mirrored := guide.NewResponseMessage(generateMessageID(), resp)
+	mirrored.TargetAgentID = r.streamMirrorTargetID
+	if err := r.bus.Publish(guide.TopicResponses(r.streamMirrorTargetID, r.streamMirrorTargetID), mirrored); err != nil {
+		r.logger.Warn("mirror visible route terminal to user", "correlation_id", msg.CorrelationID, "error", err)
+		r.logTrace("task_router_visible_terminal_mirror_failed", "warn", agentlog.EventError, msg.CorrelationID, map[string]any{
+			"mirror_target":   r.streamMirrorTargetID,
+			"source_agent_id": msg.SourceAgentID,
+			"agent_type":      route.agentType,
+			"error":           err.Error(),
+		})
+		return true
+	}
+	r.logTrace("task_router_visible_terminal_mirrored", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, map[string]any{
+		"mirror_target":   r.streamMirrorTargetID,
+		"source_agent_id": msg.SourceAgentID,
+		"agent_type":      route.agentType,
+		"success":         resp.Success,
+	})
+	return true
+}
+
+func mirroredVisibleRouteResponse(msg *guide.Message, route *visibleRoute) *guide.RouteResponse {
+	if msg == nil {
+		return nil
+	}
+	if resp, ok := msg.GetRouteResponse(); ok && resp != nil {
+		return &guide.RouteResponse{
+			CorrelationID:       resp.CorrelationID,
+			Success:             resp.Success,
+			Data:                resp.Data,
+			Error:               resp.Error,
+			RespondingAgentID:   firstNonEmpty(resp.RespondingAgentID, msg.SourceAgentID, strings.TrimSpace(route.agentType)),
+			RespondingAgentName: firstNonEmpty(resp.RespondingAgentName, agentshared.AgentDisplayName(route.agentType)),
+			ProcessingTime:      resp.ProcessingTime,
+		}
+	}
+	if errText, ok := msg.GetError(); ok {
+		return &guide.RouteResponse{
+			CorrelationID:       msg.CorrelationID,
+			Success:             false,
+			Error:               errText,
+			RespondingAgentID:   firstNonEmpty(msg.SourceAgentID, strings.TrimSpace(route.agentType)),
+			RespondingAgentName: agentshared.AgentDisplayName(route.agentType),
+		}
+	}
+	return nil
+}
+
 func protocolTaskFromStreamMetadata(stream *guide.StreamResponse) *PipelineTask {
 	if stream == nil || !metadataBool(stream.Metadata, "pipeline_task") {
 		return nil
@@ -383,6 +618,82 @@ func protocolTaskFromStreamMetadata(stream *guide.StreamResponse) *PipelineTask 
 		TargetAgentID: firstNonEmpty(strings.TrimSpace(stream.RespondingAgentID), pipelineWorkerTargetAgentID(taskID, agentType)),
 		Context:       ctx,
 	}
+}
+
+func protocolTaskFromResponseMetadata(msg *guide.Message) *PipelineTask {
+	if msg == nil || !metadataBool(msg.Metadata, "pipeline_task") {
+		return nil
+	}
+	taskID := metadataString(msg.Metadata, "task_id")
+	agentType := metadataString(msg.Metadata, "agent_type")
+	if taskID == "" || agentType == "" {
+		return nil
+	}
+	ctx := map[string]any{}
+	if stage := metadataString(msg.Metadata, "pipeline_stage"); stage != "" {
+		ctx["pipeline_stage"] = stage
+	} else if stage := protocolStageForAgentType(agentType); stage != "" {
+		ctx["pipeline_stage"] = stage
+	}
+	if taskSlug := metadataString(msg.Metadata, "task_slug"); taskSlug != "" {
+		ctx["task_slug"] = taskSlug
+	}
+	if taskName := metadataString(msg.Metadata, "task_name"); taskName != "" {
+		ctx["task_name"] = taskName
+	}
+	return &PipelineTask{
+		NodeID:        firstNonEmpty(metadataString(msg.Metadata, "node_id"), taskID),
+		DAGID:         metadataString(msg.Metadata, "dag_id"),
+		TaskID:        taskID,
+		AgentType:     agentType,
+		TargetAgentID: pipelineWorkerTargetAgentID(taskID, agentType),
+		Context:       ctx,
+	}
+}
+
+func protocolStageForAgentType(agentType string) string {
+	switch strings.TrimSpace(agentType) {
+	case agentshared.PipelineAgentInspector:
+		return string(StageInspect)
+	case agentshared.PipelineAgentTester:
+		return string(StageTest)
+	case agentshared.PipelineAgentEngineer, agentshared.PipelineAgentDesigner:
+		return string(StageExecute)
+	default:
+		return ""
+	}
+}
+
+func protocolTaskStage(task *PipelineTask) string {
+	if task == nil {
+		return ""
+	}
+	if stage := taskContextString(task.Context, "pipeline_stage"); stage != "" {
+		return stage
+	}
+	return protocolStageForAgentType(task.AgentType)
+}
+
+func protocolTerminalOutput(turnResp *agentshared.PipelineTurnResponse) any {
+	if turnResp == nil {
+		return nil
+	}
+	if turnResp.Action != nil && turnResp.Action.Type == agentshared.PipelineProtocolActionOT {
+		output := map[string]any{}
+		if summary := strings.TrimSpace(turnResp.Action.Summary); summary != "" {
+			output["summary"] = summary
+		}
+		if refs := append([]string(nil), turnResp.Action.EvidenceRefs...); len(refs) > 0 {
+			output["evidence_refs"] = refs
+		}
+		if turnResp.Result != nil {
+			output["protocol_result"] = turnResp.Result
+		}
+		if len(output) > 0 {
+			return output
+		}
+	}
+	return turnResp.Result
 }
 
 func enrichMirroredStreamMetadata(task *PipelineTask, metadata map[string]any) map[string]any {
@@ -536,8 +847,36 @@ func isTerminalRouteMessage(msg *guide.Message) bool {
 
 func (r *TaskRouter) consumeProtocolTerminal(msg *guide.Message) bool {
 	resp, ok := msg.GetRouteResponse()
-	if !ok || resp == nil || !resp.Success {
+	if !ok || resp == nil {
 		return false
+	}
+	task := protocolTaskFromResponseMetadata(msg)
+	if !resp.Success {
+		if task == nil {
+			return false
+		}
+		errText := strings.TrimSpace(resp.Error)
+		if errText == "" {
+			errText = "protocol pipeline route returned unsuccessful response"
+		}
+		publishPipelineUpdateMessage(r.bus, r.agentID, &PipelineUpdate{
+			DAGID:     task.DAGID,
+			NodeID:    task.NodeID,
+			TaskID:    task.TaskID,
+			AgentID:   routeTargetAgentID(task),
+			AgentType: task.AgentType,
+			Status:    "failed",
+			Stage:     protocolTaskStage(task),
+			Progress:  1,
+			Message:   errText,
+			Error:     errText,
+			Timestamp: time.Now().UTC(),
+		})
+		r.logTrace("task_router_protocol_terminal_failed_recovered", "warn", agentlog.EventError, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+			"source_agent_id": msg.SourceAgentID,
+			"error":           errText,
+		}))
+		return true
 	}
 	turnResp, err := agentshared.DecodePipelineTurnResponse(resp.Data)
 	if err != nil || turnResp == nil {
@@ -549,6 +888,25 @@ func (r *TaskRouter) consumeProtocolTerminal(msg *guide.Message) bool {
 	actionType := ""
 	if turnResp.Action != nil {
 		actionType = string(turnResp.Action.Type)
+	}
+	if turnResp.Action != nil && turnResp.Action.Type == agentshared.PipelineProtocolActionOT && task != nil {
+		publishPipelineUpdateMessage(r.bus, r.agentID, &PipelineUpdate{
+			DAGID:     task.DAGID,
+			NodeID:    task.NodeID,
+			TaskID:    task.TaskID,
+			AgentID:   routeTargetAgentID(task),
+			AgentType: task.AgentType,
+			Status:    "succeeded",
+			Stage:     protocolTaskStage(task),
+			Progress:  1,
+			Message:   strings.TrimSpace(turnResp.Action.Summary),
+			Output:    protocolTerminalOutput(turnResp),
+			Timestamp: time.Now().UTC(),
+		})
+		r.logTrace("task_router_protocol_terminal_reconciled", "info", agentlog.EventPipelineStateChange, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+			"source_agent_id": msg.SourceAgentID,
+			"action_type":     actionType,
+		}))
 	}
 	r.logTrace("task_router_protocol_terminal_consumed", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, map[string]any{
 		"source_agent_id": msg.SourceAgentID,

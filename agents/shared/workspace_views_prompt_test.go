@@ -28,6 +28,18 @@ func TestBuildTaskWorkspaceRuntimeContext_IncludesSummarySections(t *testing.T) 
 	if err := svfs.GlobalVFS().Write(ctx, target, []byte("global")); err != nil {
 		t.Fatalf("seed global: %v", err)
 	}
+	pipe, err := svfs.BeginPipeline(versioning.BeginPipelineConfig{
+		PipelineID: "task-1",
+		SessionID:  "sess-1",
+		WorkingDir: dir,
+		Files:      []string{"hello.txt"},
+	})
+	if err != nil {
+		t.Fatalf("begin pipeline: %v", err)
+	}
+	if err := pipe.Write(ctx, target, []byte("pipeline")); err != nil {
+		t.Fatalf("seed pipeline: %v", err)
+	}
 
 	views := versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
 		DefaultView:       versioning.WorkspaceViewPipeline,
@@ -53,6 +65,8 @@ func TestBuildTaskWorkspaceRuntimeContext_IncludesSummarySections(t *testing.T) 
 		"Paths Considered",
 		"Views Available",
 		"Global Changed vs Disk",
+		"Path Reconciliation Alerts",
+		"active pipeline view shadows live disk",
 	} {
 		if !strings.Contains(got, needle) {
 			t.Fatalf("expected runtime workspace context to contain %q\n%s", needle, got)
@@ -70,6 +84,7 @@ func TestBuildWorkspaceViewContext_ExplainsBrokeredCommandAccessToVFS(t *testing
 		"Default read/write tools for this agent operate on the `pipeline` view unless a tool explicitly says otherwise.",
 		"`run_command` and `run_shell_script` execute against that same layered workspace view",
 		"they can read VFS-backed files before those changes are committed to disk",
+		"reconcile that path before recreating work or issuing another validation loop",
 	} {
 		if !strings.Contains(got, needle) {
 			t.Fatalf("expected workspace context to contain %q\n%s", needle, got)

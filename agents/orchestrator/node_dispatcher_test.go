@@ -3,11 +3,14 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/dag"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/google/uuid"
 )
 
@@ -109,6 +112,136 @@ func TestActivateAgents_WithPod_GuardReleasedOnNodeComplete(t *testing.T) {
 	}
 	if got := pod.ActiveGuardCount(); got != 0 {
 		t.Errorf("expected 0 active guards after OnNodeComplete, got %d", got)
+	}
+}
+
+func TestOnNodeComplete_ReleasesContextLease(t *testing.T) {
+	quota := container.NewResourceQuota(container.ResourceQuotaConfig{
+		ContextWindowRequest:   800,
+		ContextWindowLimit:     4000,
+		ContextLeaseMin:        20 * time.Millisecond,
+		ContextReleaseHalfLife: 10 * time.Millisecond,
+		ContextShortWindow:     20 * time.Millisecond,
+		ContextLongWindow:      80 * time.Millisecond,
+		ContextAdmissionTick:   5 * time.Millisecond,
+	})
+	lease, err := quota.AcquireContextLease(context.Background(), container.ContextLeaseRequest{
+		ClaimID:         "n1",
+		AgentType:       "engineer",
+		RequestTokens:   800,
+		HardLimitTokens: 1600,
+	})
+	if err != nil {
+		t.Fatalf("AcquireContextLease: %v", err)
+	}
+
+	d := NewBusNodeDispatcher(nil, "orch", "sess", "dag1", nil, nil, nil)
+	d.contextLeases.Store("n1", lease)
+
+	if got := quota.Usage().ContextWindowUsed; got <= 0 {
+		t.Fatalf("expected active context usage before completion, got %d", got)
+	}
+
+	d.OnNodeComplete("n1", &dag.NodeResult{State: dag.NodeStateSucceeded})
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := quota.Usage().ContextWindowUsed; got == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	t.Fatalf("expected context lease release on node completion, got %d", quota.Usage().ContextWindowUsed)
+}
+
+func TestAcquireContextLease_DefersWhenBudgetUnavailable(t *testing.T) {
+	quota := container.NewResourceQuota(container.ResourceQuotaConfig{
+		ContextWindowRequest:   1000,
+		ContextWindowLimit:     1700,
+		ContextLeaseMin:        20 * time.Millisecond,
+		ContextReleaseHalfLife: 8 * time.Millisecond,
+		ContextShortWindow:     20 * time.Millisecond,
+		ContextLongWindow:      80 * time.Millisecond,
+		ContextAdmissionTick:   5 * time.Millisecond,
+	})
+	first, err := quota.AcquireContextLease(context.Background(), container.ContextLeaseRequest{
+		ClaimID:         "node-a",
+		AgentType:       "budget-test",
+		RequestTokens:   1000,
+		HardLimitTokens: 1700,
+	})
+	if err != nil {
+		t.Fatalf("AcquireContextLease(node-a): %v", err)
+	}
+	defer first.Release()
+
+	descriptors := handoff.NewDescriptorRegistry()
+	descriptors.Register(handoff.AgentDescriptor{
+		AgentType:     "budget-test",
+		ModelID:       "test-model",
+		ContextWindow: 1000,
+		Category:      handoff.CategoryPipeline,
+	})
+
+	d := NewBusNodeDispatcher(nil, "orch", "sess", "dag1", nil, nil, nil)
+	d.SetContextBudget(quota, container.NewAgentSpecRegistry(descriptors))
+
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "node-b",
+		AgentType: "budget-test",
+		Prompt:    "run budgeted work",
+	})
+
+	err = d.acquireContextLease(context.Background(), node)
+	var deferred *dag.NodeDeferredError
+	if !errors.As(err, &deferred) {
+		t.Fatalf("expected NodeDeferredError, got %v", err)
+	}
+	if deferred.RetryAfter <= 0 {
+		t.Fatalf("expected positive retry delay, got %v", deferred.RetryAfter)
+	}
+}
+
+func TestWaitForBudget_UnblocksOnQuotaSignal(t *testing.T) {
+	quota := container.NewResourceQuota(container.ResourceQuotaConfig{
+		ContextWindowRequest:   1000,
+		ContextWindowLimit:     1700,
+		ContextLeaseMin:        20 * time.Millisecond,
+		ContextReleaseHalfLife: 8 * time.Millisecond,
+		ContextShortWindow:     20 * time.Millisecond,
+		ContextLongWindow:      80 * time.Millisecond,
+		ContextAdmissionTick:   5 * time.Millisecond,
+	})
+	first, err := quota.AcquireContextLease(context.Background(), container.ContextLeaseRequest{
+		ClaimID:         "node-a",
+		AgentType:       "engineer",
+		RequestTokens:   1000,
+		HardLimitTokens: 1700,
+	})
+	if err != nil {
+		t.Fatalf("AcquireContextLease(node-a): %v", err)
+	}
+	defer first.Release()
+
+	d := NewBusNodeDispatcher(nil, "orch", "sess", "dag1", nil, nil, nil)
+	d.SetContextBudget(quota, nil)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- d.WaitForBudget(context.Background(), time.Now().Add(time.Second))
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	first.Release()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitForBudget: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("WaitForBudget did not unblock after quota signal")
 	}
 }
 
@@ -619,5 +752,68 @@ func TestDispatch_NoDeadlineKeepsWaitingWhileActivityContinues(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for dispatch result")
+	}
+}
+
+func TestDispatch_NoDeadlineShieldsInactivityWhileExecutionHoldActive(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	dispatcher := NewBusNodeDispatcher(bus, "orch", "sess", "dag-1", nil, nil, nil)
+	dispatcher.activityGrace = 80 * time.Millisecond
+	var held atomic.Bool
+	held.Store(true)
+	dispatcher.SetExecutionHoldChecker(func(sessionID, dagID, nodeID string) bool {
+		return sessionID == "sess" && dagID == "dag-1" && held.Load()
+	})
+
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "task_1",
+		AgentType: "engineer",
+		Prompt:    "implement",
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := dispatcher.Dispatch(context.Background(), node, nil)
+		errCh <- err
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for dispatcher.DispatchDone(node.ID()) == nil {
+		select {
+		case <-deadline:
+			t.Fatal("dispatch did not start")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	if ok := dispatcher.Acknowledge(node.ID(), &ACKResult{
+		AgentID:   "engineer-1",
+		AgentType: "engineer",
+		AckedAt:   time.Now(),
+	}); !ok {
+		t.Fatal("expected synthetic ACK to be accepted")
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("dispatch returned during active hold: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	held.Store(false)
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected inactivity timeout error after hold resolved")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for inactivity timeout after hold resolved")
 	}
 }

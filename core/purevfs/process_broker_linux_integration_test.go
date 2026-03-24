@@ -149,6 +149,58 @@ func TestDefaultExecutionBrokerLinuxRunsHostPathExecutableWithProjectedRuntimePa
 	}
 }
 
+func TestDefaultExecutionBrokerLinuxHonorsWorkingDirInsideProjectedWorkspace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	broker := purevfs.DefaultExecutionBroker()
+	caps, err := broker.Capabilities(ctx)
+	if err != nil {
+		t.Fatalf("Capabilities: %v", err)
+	}
+	if !caps.ProcessBroker {
+		t.Skip("strict broker unavailable on this host")
+	}
+
+	workspace := newMemoryExecutionFS("/workspace/project", map[string]string{
+		"/workspace/project/subdir/hello.txt": "hello from subdir\n",
+	})
+	planner := purevfs.NewExecutionPlanner(nil, purevfs.StrictBrokerCapabilities())
+	plan, err := planner.Plan(purevfs.ExecutionRequest{
+		Mode:          purevfs.ExecutionModeStrictNoDisk,
+		Intent:        purevfs.ExecutionIntentCommand,
+		Language:      "generic",
+		WorkspaceRoot: "/workspace/project",
+		WorkingDir:    "subdir",
+		Overlay:       true,
+	})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	result, err := broker.Run(ctx, purevfs.BrokerRunRequest{
+		Plan:      plan,
+		Argv:      purevfs.ShellCommandArgv("pwd && cat hello.txt"),
+		Workspace: workspace,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "permission denied") || strings.Contains(strings.ToLower(err.Error()), "fuse") {
+			t.Skipf("strict broker unavailable in test sandbox: %v", err)
+		}
+		t.Fatalf("Run: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, stderr = %q", result.ExitCode, string(result.Stderr))
+	}
+	stdout := string(result.Stdout)
+	if !strings.Contains(stdout, "/workspace/project/subdir") {
+		t.Fatalf("stdout = %q, want working directory path", stdout)
+	}
+	if !strings.Contains(stdout, "hello from subdir") {
+		t.Fatalf("stdout = %q, want file content from working_dir", stdout)
+	}
+}
+
 func newMemoryExecutionFS(root string, files map[string]string) *memoryExecutionFS {
 	fs := &memoryExecutionFS{
 		root:  root,

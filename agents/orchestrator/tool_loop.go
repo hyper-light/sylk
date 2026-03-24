@@ -125,7 +125,9 @@ func (o *Orchestrator) applyToolCalls(
 			} else {
 				result = shared.ToolErrorPayload(err)
 				isError = true
-				errCount++
+				if shared.ToolErrorCountsTowardAbort(err) {
+					errCount++
+				}
 			}
 		}
 		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && !isError {

@@ -16,17 +16,17 @@ func RunRaceDetector(ctx context.Context, runner *ToolRunner, paths []string) []
 	}
 
 	args := []string{"test", "-race", "-count=1", "-timeout=60s"}
-	args = append(args, paths...)
+	args = append(args, normalizeGoPackageExecutionTargets(runner, paths)...)
 
 	result, err := runner.Exec(ctx, "go", args...)
 	if err != nil {
 		return executionFailureIssues("race-detector", err)
 	}
 
-	return parseRaceOutput(string(result.Stderr))
+	return parseRaceOutput(runner, string(result.Stderr))
 }
 
-func parseRaceOutput(stderr string) []ValidationIssue {
+func parseRaceOutput(runner *ToolRunner, stderr string) []ValidationIssue {
 	if !strings.Contains(stderr, raceBlockMarker) {
 		return nil
 	}
@@ -42,7 +42,7 @@ func parseRaceOutput(stderr string) []ValidationIssue {
 		}
 
 		// Extract file locations from the race block
-		file, lineNum := extractRaceLocation(block)
+		file, lineNum := extractRaceLocation(runner, block)
 		issues = append(issues, ValidationIssue{
 			ID:       fmt.Sprintf("race_%d", idx),
 			Severity: Critical,
@@ -57,7 +57,7 @@ func parseRaceOutput(stderr string) []ValidationIssue {
 	return DeduplicateIssues(issues)
 }
 
-func extractRaceLocation(block string) (string, int) {
+func extractRaceLocation(runner *ToolRunner, block string) (string, int) {
 	lines := strings.Split(block, "\n")
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -65,7 +65,7 @@ func extractRaceLocation(block string) (string, int) {
 		if strings.Contains(trimmed, ".go:") && !strings.HasPrefix(trimmed, "goroutine") {
 			file, lineNum, _, _, ok := ParseGoToolLine(trimmed)
 			if ok {
-				return file, lineNum
+				return normalizeToolReportedPath(runner, file), lineNum
 			}
 			// Try splitting on space for the address suffix
 			parts := strings.Fields(trimmed)
@@ -73,7 +73,7 @@ func extractRaceLocation(block string) (string, int) {
 				fileLine := parts[0]
 				f, l, _, _, ok := ParseGoToolLine(fileLine + ": race")
 				if ok {
-					return f, l
+					return normalizeToolReportedPath(runner, f), l
 				}
 			}
 		}

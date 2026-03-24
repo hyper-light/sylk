@@ -1827,6 +1827,27 @@ func TestModel_AdvanceDecorCoalescesIdlePhase(t *testing.T) {
 	}
 }
 
+func TestModel_AdvanceDecorKeepsActiveDotsAnimatingWhilePipelinesRun(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	pushAgentActivity(model, "architect", "architect")
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_auth_checkout",
+		TaskID:     "task_auth_checkout",
+		TaskLabel:  "auth-checkout",
+		Status:     "executing",
+	})
+
+	before := model.dotFrame
+	if !model.AdvanceDecor(model.shimmerStart.Add(100 * time.Millisecond)) {
+		t.Fatal("AdvanceDecor() = false with an active agent and active pipeline")
+	}
+	if model.dotFrame == before {
+		t.Fatalf("dotFrame = %d, want it to advance beyond %d while pipelines are active", model.dotFrame, before)
+	}
+}
+
 func TestModel_SeedAgent(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)

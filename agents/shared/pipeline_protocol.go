@@ -2,6 +2,8 @@ package shared
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -107,10 +110,12 @@ type PipelineValidationRecord struct {
 }
 
 type PipelineProtocolEvent struct {
-	Type      string   `json:"type"`
-	AgentType string   `json:"agent_type"`
-	Targets   []string `json:"targets,omitempty"`
-	Summary   string   `json:"summary"`
+	Type                 string   `json:"type"`
+	AgentType            string   `json:"agent_type"`
+	Targets              []string `json:"targets,omitempty"`
+	Summary              string   `json:"summary"`
+	CreatesChallenge     bool     `json:"creates_challenge,omitempty"`
+	WorkspaceFingerprint string   `json:"workspace_fingerprint,omitempty"`
 }
 
 type PipelineAuditLock struct {
@@ -133,20 +138,21 @@ type PipelineProtocolSnapshot struct {
 }
 
 type PipelineTurnAction struct {
-	Type             PipelineProtocolActionType
-	AgentType        string
-	CreatesChallenge bool
-	AuditLockPhase   string
-	TargetAgents     []string
-	Mode             PipelineTurnMode
-	Reason           string
-	Request          string
-	RequiredOutput   []string
-	References       []string
-	ChallengeID      string
-	Validation       *PipelineValidationRecord
-	Summary          string
-	EvidenceRefs     []string
+	Type                 PipelineProtocolActionType
+	AgentType            string
+	CreatesChallenge     bool
+	AuditLockPhase       string
+	TargetAgents         []string
+	Mode                 PipelineTurnMode
+	Reason               string
+	Request              string
+	RequiredOutput       []string
+	References           []string
+	ChallengeID          string
+	Validation           *PipelineValidationRecord
+	Summary              string
+	EvidenceRefs         []string
+	WorkspaceFingerprint string
 }
 
 type PipelineValidationProcessing struct {
@@ -155,6 +161,7 @@ type PipelineValidationProcessing struct {
 	Decision    PipelineValidationDecision
 	Summary     string
 	NextTargets []string
+	Validation  *PipelineValidationRecord `json:"validation,omitempty"`
 }
 
 type PipelineTurnResponse struct {
@@ -194,12 +201,15 @@ type PipelineProtocolState struct {
 	snapshot       *PipelineProtocolSnapshot
 	terminalAction *PipelineTurnAction
 	processed      []PipelineValidationProcessing
+	requiredAction PipelineProtocolActionType
+	requiredReason string
 }
 
 type PipelineProtocolSkillConfig struct {
-	AgentType   func() string
-	InspectorOT bool
-	Route       PipelineProtocolRouteConfig
+	AgentType      func() string
+	InspectorOT    bool
+	WorkspaceViews func() versioning.WorkspaceViewAccess
+	Route          PipelineProtocolRouteConfig
 }
 
 type pipelineProtocolStateKey struct{}
@@ -279,8 +289,19 @@ func (s *PipelineProtocolState) ProcessedValidations() []PipelineValidationProce
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]PipelineValidationProcessing, len(s.processed))
-	copy(out, s.processed)
+	for i, entry := range s.processed {
+		out[i] = clonePipelineValidationProcessing(entry)
+	}
 	return out
+}
+
+func (s *PipelineProtocolState) RequiredAction() (PipelineProtocolActionType, string) {
+	if s == nil {
+		return "", ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.requiredAction, strings.TrimSpace(s.requiredReason)
 }
 
 func (s *PipelineProtocolState) setTerminalAction(action *PipelineTurnAction) error {
@@ -289,10 +310,17 @@ func (s *PipelineProtocolState) setTerminalAction(action *PipelineTurnAction) er
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.requiredAction != "" && action.Type != s.requiredAction {
+		return fmt.Errorf("%s", requiredPipelineActionMessageLocked(s.requiredAction, s.requiredReason))
+	}
 	if s.terminalAction != nil {
 		return fmt.Errorf("pipeline turn already selected %s", s.terminalAction.Type)
 	}
 	s.terminalAction = clonePipelineTurnAction(action)
+	if s.requiredAction != "" && action.Type == s.requiredAction {
+		s.requiredAction = ""
+		s.requiredReason = ""
+	}
 	return nil
 }
 
@@ -302,7 +330,37 @@ func (s *PipelineProtocolState) addProcessedValidation(entry PipelineValidationP
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.processed = append(s.processed, entry)
+	s.processed = append(s.processed, clonePipelineValidationProcessing(entry))
+}
+
+func (s *PipelineProtocolState) requireTerminalAction(action PipelineProtocolActionType, reason string) {
+	if s == nil || strings.TrimSpace(string(action)) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requiredAction = action
+	s.requiredReason = strings.TrimSpace(reason)
+}
+
+func requiredPipelineActionMessage(action PipelineProtocolActionType, reason string) string {
+	required := strings.TrimSpace(string(action))
+	if required == string(PipelineProtocolActionOT) {
+		message := "Before ending this pipeline turn, `finalize_pipeline` already determined the pipeline is ready for OT, so you must invoke `handoff_to_ot` now. Do not summarize the handoff, start another audit loop, choose a different terminal action, or continue with other queued work or other pipelines first."
+		if strings.TrimSpace(reason) != "" {
+			return message + " " + strings.TrimSpace(reason)
+		}
+		return message
+	}
+	message := fmt.Sprintf("Before ending this pipeline turn, you must invoke `%s` now.", required)
+	if strings.TrimSpace(reason) != "" {
+		return message + " " + strings.TrimSpace(reason)
+	}
+	return message
+}
+
+func requiredPipelineActionMessageLocked(action PipelineProtocolActionType, reason string) string {
+	return requiredPipelineActionMessage(action, reason)
 }
 
 func PipelineProtocolSnapshotMap(snapshot *PipelineProtocolSnapshot) map[string]any {
@@ -381,6 +439,12 @@ func ValidatePipelineProtocolCompletion(ctx context.Context, role string) error 
 	state := PipelineProtocolStateFromContext(ctx)
 	if state == nil {
 		return nil
+	}
+	if required, reason := state.RequiredAction(); required != "" {
+		action := state.TerminalAction()
+		if action == nil || action.Type != required {
+			return fmt.Errorf("%s", requiredPipelineActionMessage(required, reason))
+		}
 	}
 	if state.TerminalAction() != nil {
 		return nil
@@ -500,7 +564,7 @@ func issuePipelineTurnSelection(
 			}
 			return map[string]any{
 				"refused":           true,
-				"refused_by":        PipelineAgentInspector,
+				"refused_by":        firstNonEmpty(strings.TrimSpace(refusal.RefusedBy), PipelineAgentInspector),
 				"agent_type":        agentType,
 				"audit_phase":       refusal.AuditPhase,
 				"reason":            refusal.Reason,
@@ -509,16 +573,40 @@ func issuePipelineTurnSelection(
 			}, nil
 		}
 	}
+	var challengeEvidence *pipelineChallengeEvidence
+	if createsChallenge {
+		challengeEvidence = resolvePipelineChallengeEvidence(ctx, cfg)
+		if refusal := pipelineRepeatedChallengeRefusal(snapshot, agentType, targets, challengeEvidence); refusal != nil {
+			action := &PipelineTurnAction{
+				Type:         PipelineProtocolActionRefusal,
+				AgentType:    agentType,
+				TargetAgents: []string{PipelineAgentInspector},
+				Summary:      refusal.Reason,
+			}
+			if err := state.setTerminalAction(action); err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"refused":           true,
+				"refused_by":        firstNonEmpty(strings.TrimSpace(refusal.RefusedBy), "pipeline-protocol"),
+				"agent_type":        agentType,
+				"reason":            refusal.Reason,
+				"must_wait":         true,
+				"resume_conditions": append([]string(nil), refusal.ResumeConditions...),
+			}, nil
+		}
+	}
 	action := &PipelineTurnAction{
-		Type:             PipelineProtocolActionHandoff,
-		AgentType:        agentType,
-		CreatesChallenge: createsChallenge,
-		TargetAgents:     targets,
-		Mode:             mode,
-		Reason:           strings.TrimSpace(params.Reason),
-		Request:          strings.TrimSpace(params.Request),
-		RequiredOutput:   normalizeStringList(params.RequiredOutput),
-		References:       normalizeStringList(params.References),
+		Type:                 PipelineProtocolActionHandoff,
+		AgentType:            agentType,
+		CreatesChallenge:     createsChallenge,
+		TargetAgents:         targets,
+		Mode:                 mode,
+		Reason:               strings.TrimSpace(params.Reason),
+		Request:              strings.TrimSpace(params.Request),
+		RequiredOutput:       normalizeStringList(params.RequiredOutput),
+		References:           normalizeStringList(params.References),
+		WorkspaceFingerprint: pipelineChallengeFingerprint(challengeEvidence),
 	}
 	if action.Reason == "" {
 		return nil, fmt.Errorf("reason is required")
@@ -562,6 +650,9 @@ func pipelineTurnSelectionResult(agentType string, action *PipelineTurnAction, d
 	}
 	if strings.TrimSpace(action.ChallengeID) != "" {
 		result["challenge_id"] = strings.TrimSpace(action.ChallengeID)
+	}
+	if strings.TrimSpace(action.WorkspaceFingerprint) != "" {
+		result["workspace_fingerprint"] = strings.TrimSpace(action.WorkspaceFingerprint)
 	}
 	if dispatch != nil && len(dispatch.TargetAgentIDs) > 0 {
 		result["forwarded"] = true
@@ -762,6 +853,7 @@ func pipelineProcessValidationSkill(cfg PipelineProtocolSkillConfig) *skills.Ski
 				Decision:    decision,
 				Summary:     summary,
 				NextTargets: normalizeStringList(params.NextTargets),
+				Validation:  cloneValidationRecord(pending),
 			})
 			return map[string]any{
 				"processed":    true,
@@ -780,6 +872,7 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 		Keywords("audit", "challenge", "review", "finalize", "pipeline").
 		Priority(100).
 		Usage("Invoke this every time Engineer or Designer hands work back to you. It should run the inspector audit cycle by challenging Tester to audit the engineer/designer implementation for correctness, robustness, performance, scope discipline, and production quality, and to judge whether the test surface adds real value instead of noisy or low-quality coverage. If Tester has already returned a passing audit for this cycle and the criteria are met, this tool means the pipeline is ready for OT and you must immediately call `handoff_to_ot` instead of starting another audit loop or issuing another handoff. If any challenge response indicates the criteria or quality bar are not met, initiate another cycle instead of handing off to OT.").
+		Requirement("If this tool returns `ready_for_ot: true` or `must_handoff_to_ot: true`, your next terminal protocol action in this turn must be `handoff_to_ot`. Do not end the turn, summarize the handoff, pick another terminal action, or continue with other queued work or other pipelines first. This completed pipeline takes priority until `handoff_to_ot` is invoked.").
 		Satisfies("Issues or recognizes the tester-backed audit that gates OT handoff, and when the audit passes it requires the inspector to call `handoff_to_ot` next.").
 		StringParam("summary", "Why the pipeline is ready for OT merge", true).
 		ArrayParam("evidence_refs", "Criteria, tests, artifacts, and files supporting acceptance", "string", false).
@@ -805,15 +898,19 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 			}
 			snapshot := state.Snapshot()
 			evidenceRefs := normalizeStringList(params.EvidenceRefs)
-			if record, ok := finalizePipelineValidationReady(snapshot); ok {
+			if record, ok := finalizePipelineValidationReady(snapshot, state.ProcessedValidations()); ok {
+				state.requireTerminalAction(PipelineProtocolActionOT, "The audit already passed; `handoff_to_ot` is the only valid way to end this inspector turn.")
 				return map[string]any{
-					"finalize_pipeline":    true,
-					"ready_for_ot":         true,
-					"must_handoff_to_ot":   true,
-					"next_required_action": "handoff_to_ot",
-					"agent_type":           agentType,
-					"challenge_id":         strings.TrimSpace(record.ChallengeID),
-					"evidence_refs":        normalizeStringList(append(append([]string(nil), evidenceRefs...), record.EvidenceRefs...)),
+					"finalize_pipeline":         true,
+					"ready_for_ot":              true,
+					"must_handoff_to_ot":        true,
+					"must_invoke_now":           "handoff_to_ot",
+					"required_next_action":      "handoff_to_ot",
+					"required_next_action_only": true,
+					"next_required_action":      "handoff_to_ot",
+					"agent_type":                agentType,
+					"challenge_id":              strings.TrimSpace(record.ChallengeID),
+					"evidence_refs":             normalizeStringList(append(append([]string(nil), evidenceRefs...), record.EvidenceRefs...)),
 				}, nil
 			}
 			if finalizePipelineChallengePending(snapshot) {
@@ -876,6 +973,7 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 		Keywords("ot", "merge", "accept", "finalize", "pipeline").
 		Priority(100).
 		Usage("Use immediately after `finalize_pipeline` reports `ready_for_ot: true` / `must_handoff_to_ot: true`, or when the inspector has otherwise already determined the latest audit cycle passed and the pipeline should terminate successfully.").
+		Requirement("When `finalize_pipeline` says the pipeline is ready for OT, invoke this immediately as the next terminal protocol action. Do not narrate the handoff instead of calling the tool, and do not continue with other queued work or other pipelines before invoking it.").
 		Satisfies("Marks the pipeline as accepted and ready for OT merge, including the required terminal step after a passing `finalize_pipeline` result.").
 		StringParam("summary", "Why the pipeline is ready for OT merge", true).
 		ArrayParam("evidence_refs", "Criteria, tests, artifacts, and files supporting acceptance", "string", false).
@@ -908,7 +1006,7 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 			}); err != nil {
 				return nil, err
 			}
-			if task := PipelineTaskFromContext(ctx); task != nil {
+			if task := pipelineTerminalUpdateTask(ctx, cfg); task != nil {
 				PublishPipelineTaskSuccessUpdate(
 					cfg.Route.eventBus(),
 					agentType,
@@ -1263,18 +1361,25 @@ func buildHandoffSnapshot(state *PipelineProtocolState, task *PipelineTaskInput,
 		}
 	}
 	appendPipelineProtocolEvent(snapshot, PipelineProtocolEvent{
-		Type:      string(action.Type),
-		AgentType: action.AgentType,
-		Targets:   append([]string(nil), action.TargetAgents...),
-		Summary:   firstNonEmpty(strings.TrimSpace(action.Request), strings.TrimSpace(action.Summary)),
+		Type:                 string(action.Type),
+		AgentType:            action.AgentType,
+		Targets:              append([]string(nil), action.TargetAgents...),
+		Summary:              firstNonEmpty(strings.TrimSpace(action.Request), strings.TrimSpace(action.Summary)),
+		CreatesChallenge:     action.CreatesChallenge,
+		WorkspaceFingerprint: strings.TrimSpace(action.WorkspaceFingerprint),
 	})
 	return snapshot
 }
 
 type pipelineChallengeRefusal struct {
+	RefusedBy        string
 	AuditPhase       string
 	Reason           string
 	ResumeConditions []string
+}
+
+type pipelineChallengeEvidence struct {
+	Fingerprint string
 }
 
 func pipelineAuditChallengeRefusal(snapshot *PipelineProtocolSnapshot, requestingAgent string, targets []string) *pipelineChallengeRefusal {
@@ -1300,10 +1405,108 @@ func pipelineAuditChallengeRefusal(snapshot *PipelineProtocolSnapshot, requestin
 		phase,
 	)
 	return &pipelineChallengeRefusal{
+		RefusedBy:        PipelineAgentInspector,
 		AuditPhase:       phase,
 		Reason:           reason,
 		ResumeConditions: auditRefusalResumeConditions(requestingAgent),
 	}
+}
+
+func pipelineRepeatedChallengeRefusal(
+	snapshot *PipelineProtocolSnapshot,
+	requestingAgent string,
+	targets []string,
+	evidence *pipelineChallengeEvidence,
+) *pipelineChallengeRefusal {
+	currentFingerprint := pipelineChallengeFingerprint(evidence)
+	if snapshot == nil || currentFingerprint == "" {
+		return nil
+	}
+	previousFingerprint := recentChallengeFingerprint(snapshot.RecentEvents, requestingAgent, targets)
+	if previousFingerprint == "" || previousFingerprint != currentFingerprint {
+		return nil
+	}
+	targetLabel := strings.Join(normalizeStringList(targets), ", ")
+	if strings.TrimSpace(targetLabel) == "" {
+		targetLabel = "the same target"
+	}
+	return &pipelineChallengeRefusal{
+		RefusedBy: "pipeline-protocol",
+		Reason: fmt.Sprintf(
+			"Repeated challenge to %s requires fresh workspace evidence, but the live task workspace state has not changed since the previous challenge on this directed pair.",
+			targetLabel,
+		),
+		ResumeConditions: []string{
+			fmt.Sprintf("Wait for the task workspace state to change before challenging %s again.", targetLabel),
+			"Use `inspect_workspace_state` or `summarize_workspace_state` to reconcile live disk, global, and pipeline state before retrying.",
+		},
+	}
+}
+
+func resolvePipelineChallengeEvidence(ctx context.Context, cfg PipelineProtocolSkillConfig) *pipelineChallengeEvidence {
+	task := PipelineTaskFromContext(ctx)
+	if task == nil || cfg.WorkspaceViews == nil {
+		return nil
+	}
+	views := cfg.WorkspaceViews()
+	if views == nil {
+		return nil
+	}
+	paths := collectTaskWorkspacePaths(task)
+	if len(paths) == 0 {
+		return nil
+	}
+	summary, err := views.SummarizePaths(ctx, paths, strings.TrimSpace(task.TaskID))
+	if err != nil || summary == nil {
+		return nil
+	}
+	payload, err := json.Marshal(summary)
+	if err != nil || len(payload) == 0 {
+		return nil
+	}
+	sum := sha256.Sum256(payload)
+	return &pipelineChallengeEvidence{Fingerprint: hex.EncodeToString(sum[:])}
+}
+
+func pipelineChallengeFingerprint(evidence *pipelineChallengeEvidence) string {
+	if evidence == nil {
+		return ""
+	}
+	return strings.TrimSpace(evidence.Fingerprint)
+}
+
+func recentChallengeFingerprint(events []PipelineProtocolEvent, requestingAgent string, targets []string) string {
+	requestingAgent = normalizePipelineAgentType(requestingAgent)
+	targetKey := pipelineProtocolTargetKey(targets)
+	if requestingAgent == "" || targetKey == "" {
+		return ""
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		if !event.CreatesChallenge {
+			continue
+		}
+		if normalizePipelineAgentType(event.AgentType) != requestingAgent {
+			continue
+		}
+		if pipelineProtocolTargetKey(event.Targets) != targetKey {
+			continue
+		}
+		return strings.TrimSpace(event.WorkspaceFingerprint)
+	}
+	return ""
+}
+
+func pipelineProtocolTargetKey(values []string) string {
+	targets := normalizeStringList(values)
+	for i, target := range targets {
+		targets[i] = normalizePipelineAgentType(target)
+	}
+	targets = normalizeStringList(targets)
+	if len(targets) == 0 {
+		return ""
+	}
+	return strings.Join(targets, "|")
 }
 
 func auditRefusalResumeConditions(agentType string) []string {
@@ -1545,6 +1748,45 @@ func pipelineProtocolTargetAgentID(taskID, agentType string) string {
 	}
 }
 
+func pipelineTerminalUpdateTask(ctx context.Context, cfg PipelineProtocolSkillConfig) *PipelineTaskInput {
+	if task := PipelineTaskFromContext(ctx); task != nil {
+		return task
+	}
+	stream, ok := StreamMetadataFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	agentType := pipelineProtocolAgentType(ctx, cfg)
+	taskID := firstNonEmpty(
+		pipelineTaskMetadataString(stream.Metadata, "task_id"),
+		pipelineTaskMetadataString(stream.Metadata, "pipeline_id"),
+	)
+	if taskID == "" || agentType == "" {
+		return nil
+	}
+	contextData := map[string]any{
+		"pipeline_stage": firstNonEmpty(
+			pipelineTaskMetadataString(stream.Metadata, "pipeline_stage"),
+			pipelineStageForAgents([]string{agentType}),
+		),
+	}
+	if taskSlug := pipelineTaskMetadataString(stream.Metadata, "task_slug"); taskSlug != "" {
+		contextData["task_slug"] = taskSlug
+	}
+	if taskName := pipelineTaskMetadataString(stream.Metadata, "task_name"); taskName != "" {
+		contextData["task_name"] = taskName
+	}
+	return &PipelineTaskInput{
+		NodeID:        firstNonEmpty(pipelineTaskMetadataString(stream.Metadata, "node_id"), taskID),
+		DAGID:         pipelineTaskMetadataString(stream.Metadata, "dag_id"),
+		TaskID:        taskID,
+		AgentType:     agentType,
+		TargetAgentID: pipelineProtocolTargetAgentID(taskID, agentType),
+		SessionID:     cfg.Route.sessionID(nil),
+		Context:       contextData,
+	}
+}
+
 func pipelineStageForAgents(agentTypes []string) string {
 	for _, agentType := range agentTypes {
 		switch normalizePipelineAgentType(agentType) {
@@ -1565,6 +1807,18 @@ func pipelineTaskContextString(ctx map[string]any, key string) string {
 	}
 	value, _ := ctx[key].(string)
 	return strings.TrimSpace(value)
+}
+
+func pipelineTaskMetadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	switch value := metadata[key].(type) {
+	case string:
+		return strings.TrimSpace(value)
+	default:
+		return ""
+	}
 }
 
 func clonePipelineTaskInput(task *PipelineTaskInput) *PipelineTaskInput {
@@ -1599,6 +1853,12 @@ func cloneValidationRecord(record *PipelineValidationRecord) *PipelineValidation
 	return &out
 }
 
+func clonePipelineValidationProcessing(entry PipelineValidationProcessing) PipelineValidationProcessing {
+	entry.NextTargets = append([]string(nil), entry.NextTargets...)
+	entry.Validation = cloneValidationRecord(entry.Validation)
+	return entry
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if trimmed := strings.TrimSpace(value); trimmed != "" {
@@ -1608,21 +1868,37 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func finalizePipelineValidationReady(snapshot *PipelineProtocolSnapshot) (*PipelineValidationRecord, bool) {
-	if snapshot == nil || snapshot.PendingValidation == nil {
+func finalizePipelineValidationReady(snapshot *PipelineProtocolSnapshot, processed []PipelineValidationProcessing) (*PipelineValidationRecord, bool) {
+	if record, ok := classifyFinalizePipelineValidation(snapshot.PendingValidation); ok {
+		return record, true
+	}
+	for i := len(processed) - 1; i >= 0; i-- {
+		record, relevant := classifyFinalizePipelineValidation(processed[i].Validation)
+		if !relevant {
+			continue
+		}
+		if processed[i].Decision != PipelineValidationDecisionAccept {
+			return nil, false
+		}
+		return record, true
+	}
+	return nil, false
+}
+
+func classifyFinalizePipelineValidation(record *PipelineValidationRecord) (*PipelineValidationRecord, bool) {
+	if record == nil {
 		return nil, false
 	}
-	record := snapshot.PendingValidation
 	if normalizePipelineAgentType(record.RequestingAgent) != PipelineAgentInspector {
 		return nil, false
 	}
 	if normalizePipelineAgentType(record.RespondingAgent) != PipelineAgentTester {
 		return nil, false
 	}
-	if strings.TrimSpace(record.Status) != string(PipelineValidationPassed) {
+	if !containsNormalizedString(record.ChallengeReferences, finalizePipelineVerificationReference) {
 		return nil, false
 	}
-	if !containsNormalizedString(record.ChallengeReferences, finalizePipelineVerificationReference) {
+	if strings.TrimSpace(record.Status) != string(PipelineValidationPassed) {
 		return nil, false
 	}
 	return cloneValidationRecord(record), true
@@ -1689,7 +1965,11 @@ func clonePipelineProtocolSnapshot(snapshot *PipelineProtocolSnapshot) *Pipeline
 	out := *snapshot
 	out.Roster = append([]PipelineProtocolAgent(nil), snapshot.Roster...)
 	out.ActiveAgents = append([]string(nil), snapshot.ActiveAgents...)
-	out.RecentEvents = append([]PipelineProtocolEvent(nil), snapshot.RecentEvents...)
+	out.RecentEvents = make([]PipelineProtocolEvent, len(snapshot.RecentEvents))
+	for i, evt := range snapshot.RecentEvents {
+		out.RecentEvents[i] = evt
+		out.RecentEvents[i].Targets = append([]string(nil), evt.Targets...)
+	}
 	out.AuditLock = clonePipelineAuditLock(snapshot.AuditLock)
 	if snapshot.PendingChallenge != nil {
 		challenge := *snapshot.PendingChallenge

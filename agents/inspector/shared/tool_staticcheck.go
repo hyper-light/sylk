@@ -30,7 +30,7 @@ func RunStaticcheck(ctx context.Context, runner *ToolRunner, paths []string) []V
 	}
 
 	args := []string{"-f", "json"}
-	args = append(args, paths...)
+	args = append(args, normalizeGoPackageExecutionTargets(runner, paths)...)
 
 	result, err := runner.Exec(ctx, "staticcheck", args...)
 	if err != nil {
@@ -54,7 +54,7 @@ func RunStaticcheck(ctx context.Context, runner *ToolRunner, paths []string) []V
 		issues = append(issues, ValidationIssue{
 			ID:       fmt.Sprintf("sc_%d", idx),
 			Severity: mapStaticcheckSeverity(diag.Code),
-			File:     diag.Location.File,
+			File:     normalizeToolReportedPath(runner, diag.Location.File),
 			Line:     diag.Location.Line,
 			Column:   diag.Location.Column,
 			Message:  diag.Message,

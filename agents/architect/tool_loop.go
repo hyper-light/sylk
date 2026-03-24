@@ -375,7 +375,9 @@ func (a *Architect) applyToolCalls(
 			} else {
 				result = shared.ToolErrorPayload(err)
 				isError = true
-				errCount++
+				if shared.ToolErrorCountsTowardAbort(err) {
+					errCount++
+				}
 				a.logWarn("applyToolCalls: tool error",
 					"tool_name", call.Name,
 					"err", err)

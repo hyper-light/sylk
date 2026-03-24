@@ -3,6 +3,8 @@ package activation
 import (
 	"testing"
 	"time"
+
+	"github.com/adalundhe/sylk/core/container"
 )
 
 // testPredictorConfig returns the default config for test assertions.
@@ -163,4 +165,25 @@ func TestCircularBuffer_EarlyStop(t *testing.T) {
 	if count != 3 {
 		t.Fatalf("expected 3 iterations, got %d", count)
 	}
+}
+
+func TestPredictor_MatchContextArchetypes(t *testing.T) {
+	p := NewActivationPredictor(PredictorConfig{})
+
+	features := []float32{0.96, 0.86, 0.68, 0.24, 0.58, 1.32, 0.52, 1.18, 0.84}
+	matches := p.MatchContextArchetypes(features, "tester-pipeline", 2)
+	if len(matches) == 0 {
+		t.Fatal("expected archetype matches")
+	}
+	if matches[0].Name != "tester_bursty_validation" {
+		t.Fatalf("top match = %q, want tester_bursty_validation", matches[0].Name)
+	}
+	if matches[0].Score <= 0 {
+		t.Fatalf("expected positive match score, got %f", matches[0].Score)
+	}
+	if matches[0].BurstRatio <= 1.0 || matches[0].HeadroomMultiplier <= 1.0 {
+		t.Fatalf("unexpected operating envelope: %+v", matches[0])
+	}
+
+	var _ container.ContextArchetypeMatcher = p
 }

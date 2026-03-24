@@ -48,6 +48,33 @@ func TestFormatGoogleError_WrapsAPIErrorAndExtractsRetryAfter(t *testing.T) {
 	}
 }
 
+func TestFormatGoogleError_PrefersLongerMessageResetOverQuotaDefault(t *testing.T) {
+	original := genai.APIError{
+		Code:    429,
+		Status:  "RESOURCE_EXHAUSTED",
+		Message: "You have exhausted your capacity on this model. Your quota will reset after 53s.",
+		Details: []map[string]any{
+			{
+				"@type":  "type.googleapis.com/google.rpc.ErrorInfo",
+				"reason": "RATE_LIMIT_EXCEEDED",
+				"domain": "googleapis.com",
+			},
+		},
+	}
+
+	wrapped := formatGoogleError("generate", original)
+	var providerErr *ProviderError
+	if !errors.As(wrapped, &providerErr) {
+		t.Fatalf("expected ProviderError, got %T", wrapped)
+	}
+	if providerErr.RetryAfter != 53*time.Second {
+		t.Fatalf("expected retry-after 53s, got %v", providerErr.RetryAfter)
+	}
+	if !providerErr.Retryable {
+		t.Fatal("expected rate limit to remain retryable")
+	}
+}
+
 func TestGoogleRetryAfterFromDetails_NestedValue(t *testing.T) {
 	details := []map[string]any{
 		{
@@ -426,6 +453,18 @@ func TestCodeAssistHTTPError_MessageFallback(t *testing.T) {
 	}
 	if pe.RetryAfter != 30*time.Second {
 		t.Fatalf("expected 30s from message fallback, got %v", pe.RetryAfter)
+	}
+}
+
+func TestCodeAssistHTTPError_PrefersLongerMessageResetOverQuotaDefault(t *testing.T) {
+	body := []byte(`{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after 53s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"RATE_LIMIT_EXCEEDED","domain":"googleapis.com"}]}}`)
+
+	pe := codeAssistHTTPError("stream", 429, body)
+	if !pe.Retryable {
+		t.Fatal("expected retryable rate limit")
+	}
+	if pe.RetryAfter != 53*time.Second {
+		t.Fatalf("expected 53s from message hint, got %v", pe.RetryAfter)
 	}
 }
 

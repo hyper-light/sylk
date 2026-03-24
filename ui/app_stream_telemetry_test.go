@@ -547,6 +547,59 @@ func TestStreamProgressTelemetryBootstrapsChatEntry(t *testing.T) {
 	}
 }
 
+func TestStreamStartTelemetry_AllowsConcurrentNotificationStyleStream(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-architect",
+		AgentID:       "architect",
+		AgentType:     "architect",
+		AgentName:     "Architect",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "notif-1",
+		AgentID:       "architect",
+		AgentType:     "architect",
+		AgentName:     "Architect",
+	})
+	app = model.(*AppModel)
+
+	if _, ok := app.activeStreams["notif-1"]; !ok {
+		t.Fatal("expected notification-style stream to register while another stream is active")
+	}
+
+	model, _ = app.Update(msg.StreamChunkMsg{
+		SessionID:     "s1",
+		CorrelationID: "notif-1",
+		Text:          "Plan dispatched to the orchestrator.",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:         "s1",
+		CorrelationID:     "notif-1",
+		AgentID:           "architect",
+		AgentType:         "architect",
+		AgentName:         "Architect",
+		AuthoritativeText: "Plan dispatched to the orchestrator.",
+	})
+	app = model.(*AppModel)
+
+	if _, ok := app.activeStreams["notif-1"]; ok {
+		t.Fatal("expected notification-style stream to be finalized")
+	}
+	if view := app.chat.View(); !strings.Contains(view, "Plan dispatched to the orchestrator.") {
+		t.Fatalf("expected notification-style completion text in chat view, got %q", view)
+	}
+}
+
 func TestStreamRerouteBootstrapsChatEntry(t *testing.T) {
 	app := newResizeTestApp(t)
 	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {

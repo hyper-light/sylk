@@ -863,6 +863,9 @@ func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedReq
 	corrID := g.resolveCorrelationID(request)
 	if !request.FireAndForget {
 		corrID = g.pending.Add(request, classification, targetAgentID)
+		if pending := g.pending.Get(corrID); pending != nil {
+			g.applyDeferredStreamReroute(pending)
+		}
 	}
 
 	forwarded := g.buildForwardedRequest(request, classification, corrID)
@@ -2952,18 +2955,30 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 		return nil
 	}
 	pending := g.pending.Get(forwarded.CorrelationID)
-	if pending == nil {
+	resolvedTarget := strings.TrimSpace(forwarded.TargetAgentID)
+	resolvedSource := strings.TrimSpace(forwarded.SourceAgentID)
+	if pending != nil {
+		if target := strings.TrimSpace(pending.TargetAgentID); target != "" {
+			resolvedTarget = target
+		}
+		if source := strings.TrimSpace(pending.SourceAgentID); source != "" {
+			resolvedSource = source
+		}
+	} else if !forwarded.FireAndForget {
 		return fmt.Errorf("no pending request found for correlation ID: %s", forwarded.CorrelationID)
 	}
-	guideFileLog().Info("DEBUG: route_resolved", "correlation_id", correlationID, "target", pending.TargetAgentID, "is_guide", g.isGuideTarget(pending.TargetAgentID))
-	if g.isGuideTarget(pending.TargetAgentID) {
+	guideFileLog().Info("DEBUG: route_resolved", "correlation_id", correlationID, "target", resolvedTarget, "is_guide", g.isGuideTarget(resolvedTarget))
+	if g.isGuideTarget(resolvedTarget) {
+		if pending == nil {
+			return fmt.Errorf("fire-and-forget guide-target requests require explicit handling: %s", forwarded.CorrelationID)
+		}
 		return g.respondToGuideRequest(reqCtx, pending, req)
 	}
 	if !req.ExplicitTarget {
-		g.publishActivity(events.EventTypeAgentAction, vis, "Routing to "+pending.TargetAgentID)
+		g.publishActivity(events.EventTypeAgentAction, vis, "Routing to "+resolvedTarget)
 	}
-	g.publishRouteHandoffProgress(forwarded.CorrelationID, pending.SourceAgentID, pending.TargetAgentID, vis)
-	err = g.publishForwardedRequest(pending.TargetAgentID, forwarded, msg.ReplyTo)
+	g.publishRouteHandoffProgress(forwarded.CorrelationID, resolvedSource, resolvedTarget, vis)
+	err = g.publishForwardedRequest(resolvedTarget, forwarded, msg.ReplyTo)
 
 	// Reset Guide status to idle after forwarding. The Guide's role is
 	// finished once the request is dispatched — the target agent takes over.
@@ -3144,7 +3159,7 @@ func (g *Guide) respondToGuideRequest(ctx context.Context, pending *PendingReque
 		if handleErr != nil {
 			return nil
 		}
-		publishErr := g.publishResponseToSource(resolved.SourceAgentID, resp)
+		publishErr := g.publishResponseToSource(resolved.SourceAgentID, resp, pending)
 		return publishErr
 	}
 
@@ -3203,7 +3218,7 @@ func (g *Guide) respondToGuideRequest(ctx context.Context, pending *PendingReque
 	if handleErr != nil {
 		return nil
 	}
-	publishErr := g.publishResponseToSource(resolved.SourceAgentID, resp)
+	publishErr := g.publishResponseToSource(resolved.SourceAgentID, resp, pending)
 	return publishErr
 }
 
@@ -3785,6 +3800,15 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 
 	switch msg.Type {
 	case MessageTypeResponse:
+		// Relay guard: messages already forwarded by the Guide back to the
+		// source agent must not be re-processed by the Guide's own response
+		// subscription for that source topic.
+		if msg.Metadata != nil {
+			if _, relayed := msg.Metadata["_guide_relayed"]; relayed {
+				return nil
+			}
+		}
+
 		resp, ok := msg.GetRouteResponse()
 		if !ok {
 			return fmt.Errorf("invalid response payload")
@@ -3799,7 +3823,7 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 			resp.RespondingAgentName = g.resolveAgentDisplayName(resp.RespondingAgentID)
 		}
 
-		return g.publishResponseToSource(pending.SourceAgentID, resp)
+		return g.publishResponseToSource(pending.SourceAgentID, resp, pending)
 	case MessageTypeStream:
 		// Relay guard: messages already relayed by the Guide carry a marker.
 		// Processing them again creates a self-loop when the target's
@@ -4397,9 +4421,22 @@ func (g *Guide) forwardMessage(targetAgentID string, forwarded *ForwardedRequest
 	return fwdMsg
 }
 
-func (g *Guide) publishResponseToSource(sourceAgentID string, resp *RouteResponse) error {
+func (g *Guide) publishResponseToSource(sourceAgentID string, resp *RouteResponse, pending *PendingRequest) error {
 	respMsg := NewResponseMessage(generateMessageID(), resp)
+	respMsg.TargetAgentID = sourceAgentID
+	respMsg.Metadata = relayResponseMetadata(pending)
 	return g.bus.Publish(g.agentResponseTopic(sourceAgentID), respMsg)
+}
+
+func relayResponseMetadata(pending *PendingRequest) map[string]any {
+	metadata := map[string]any{"_guide_relayed": true}
+	if pending == nil || pending.Request == nil || len(pending.Request.Metadata) == 0 {
+		return metadata
+	}
+	for key, value := range pending.Request.Metadata {
+		metadata[key] = value
+	}
+	return metadata
 }
 
 func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse) error {

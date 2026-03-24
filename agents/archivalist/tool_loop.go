@@ -146,7 +146,9 @@ func (a *Archivalist) applyToolCalls(
 			} else {
 				result = shared.ToolErrorPayload(err)
 				isError = true
-				errCount++
+				if shared.ToolErrorCountsTowardAbort(err) {
+					errCount++
+				}
 
 				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 					shared.LogAgentEvent(lm.EventLogger, agentlog.EventSkillFailed,

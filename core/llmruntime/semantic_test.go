@@ -65,6 +65,19 @@ func TestCompileStageAnthropicPlanningProtocol(t *testing.T) {
 	}
 }
 
+func TestCompileStageAnthropicSkipsThinkingWhenMaxTokensTooSmall(t *testing.T) {
+	profile := CompileStage(ResolveAgentStageProfile("architect", "planning_protocol"), ApplyOptions{
+		Model:     "claude-sonnet-4-6",
+		MaxTokens: 512,
+		AgentID:   "architect",
+		SessionID: "sess-1",
+	})
+
+	if profile.ThinkingBudget != nil {
+		t.Fatalf("ThinkingBudget = %#v, want nil for too-small max tokens", profile.ThinkingBudget)
+	}
+}
+
 func TestApplyStageGoogleDesignerAddsPromptDirectives(t *testing.T) {
 	req := &providers.Request{
 		SystemPrompt: "designer",

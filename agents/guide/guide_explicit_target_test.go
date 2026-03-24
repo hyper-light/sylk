@@ -94,6 +94,145 @@ func TestGuideRoute_ExplicitTargetAndFollowupContinuity(t *testing.T) {
 	}
 }
 
+func TestGuideRoute_AppliesDeferredStreamRerouteToNewPending(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	defer func() { _ = bus.Close() }()
+
+	g, err := NewWithClassifier(NewRuleClassifierClient(), Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "session-reroute",
+	})
+	if err != nil {
+		t.Fatalf("new guide: %v", err)
+	}
+
+	err = g.Register(&AgentRoutingInfo{
+		ID:   "orchestrator",
+		Type: "orchestrator",
+		Name: "orchestrator",
+		Registration: &AgentRegistration{
+			ID:   "orchestrator",
+			Name: "orchestrator",
+			Capabilities: AgentCapabilities{
+				Intents: []Intent{IntentExecute, IntentHelp},
+				Domains: []Domain{DomainTasks, DomainGeneral},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("register orchestrator: %v", err)
+	}
+
+	g.streamReroutes = map[string]string{
+		"corr-orchestrator": "tui",
+	}
+
+	req := &RouteRequest{
+		CorrelationID:  "corr-orchestrator",
+		Input:          "dispatch this plan",
+		SourceAgentID:  "architect",
+		TargetAgentID:  "orchestrator",
+		ExplicitTarget: true,
+		SessionID:      "session-reroute",
+		Timestamp:      time.Now(),
+	}
+
+	forwarded, err := g.Route(context.Background(), req)
+	if err != nil {
+		t.Fatalf("route explicit orchestrator: %v", err)
+	}
+	if forwarded.CorrelationID != "corr-orchestrator" {
+		t.Fatalf("forwarded correlation = %q, want corr-orchestrator", forwarded.CorrelationID)
+	}
+
+	pending := g.GetPending("corr-orchestrator")
+	if pending == nil {
+		t.Fatal("expected pending request for rerouted orchestrator correlation")
+	}
+	if pending.StreamTargetOverride != "tui" {
+		t.Fatalf("pending.StreamTargetOverride = %q, want tui", pending.StreamTargetOverride)
+	}
+	if _, ok := g.streamReroutes["corr-orchestrator"]; ok {
+		t.Fatal("expected deferred reroute entry to be consumed after pending creation")
+	}
+}
+
+func TestGuideHandleRouteRequestMessage_FireAndForgetExplicitTargetStillForwards(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	defer func() { _ = bus.Close() }()
+
+	g, err := NewWithClassifier(NewRuleClassifierClient(), Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "session-fire-and-forget",
+	})
+	if err != nil {
+		t.Fatalf("new guide: %v", err)
+	}
+
+	err = g.Register(&AgentRoutingInfo{
+		ID:   "tester",
+		Type: "tester",
+		Name: "tester",
+		Registration: &AgentRegistration{
+			ID:   "tester",
+			Name: "tester",
+			Capabilities: AgentCapabilities{
+				Intents: []Intent{IntentCheck, IntentHelp},
+				Domains: []Domain{DomainTesting, DomainGeneral},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("register tester: %v", err)
+	}
+
+	forwardedCh := make(chan *ForwardedRequest, 1)
+	sub, err := bus.SubscribeAsync(g.agentRequestTopic("tester"), func(msg *Message) error {
+		fwd, ok := msg.GetForwardedRequest()
+		if !ok || fwd == nil {
+			return nil
+		}
+		select {
+		case forwardedCh <- fwd:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe tester request topic: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	req := &RouteRequest{
+		CorrelationID:  "corr-fire-and-forget",
+		Input:          "Validate the merged result.",
+		SourceAgentID:  "orchestrator",
+		TargetAgentID:  "tester",
+		ExplicitTarget: true,
+		FireAndForget:  true,
+		SessionID:      "session-fire-and-forget",
+		Timestamp:      time.Now(),
+	}
+
+	if err := g.handleRouteRequestMessage(context.Background(), NewRequestMessage("msg-fire-and-forget", req)); err != nil {
+		t.Fatalf("handleRouteRequestMessage returned error: %v", err)
+	}
+
+	select {
+	case forwarded := <-forwardedCh:
+		if forwarded.TargetAgentID != "tester" {
+			t.Fatalf("forwarded target = %q, want tester", forwarded.TargetAgentID)
+		}
+		if !forwarded.FireAndForget {
+			t.Fatal("expected forwarded request to remain fire-and-forget")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for forwarded fire-and-forget request")
+	}
+}
+
 func TestGuideResolveReadyAgentID_TaskScopedPipelineNameUsesRegisteredWorker(t *testing.T) {
 	bus := NewChannelBus(DefaultChannelBusConfig())
 	defer func() { _ = bus.Close() }()
@@ -108,9 +247,9 @@ func TestGuideResolveReadyAgentID_TaskScopedPipelineNameUsesRegisteredWorker(t *
 	}
 
 	err = g.Register(&AgentRoutingInfo{
-		ID:    "tester-worker-1",
-		Type:  "tester-pipeline",
-		Name:  "tester-pipeline",
+		ID:   "tester-worker-1",
+		Type: "tester-pipeline",
+		Name: "tester-pipeline",
 		Aliases: []string{
 			"task_1-tester-pipeline",
 		},

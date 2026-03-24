@@ -212,18 +212,28 @@ func buildGoogleProviderError(operation string, err error) error {
 		}
 	}
 
-	// Fall back to generic retry-after extraction when classification didn't
-	// provide a delay (non-429 errors, or 429 without structured details).
-	if providerErr.RetryAfter == 0 {
-		if retryAfter, ok := googleRetryAfter(apiErr); ok {
-			providerErr.RetryAfter = retryAfter
-		}
+	// Merge any explicit retry-after hint from structured RetryInfo or the human
+	// message text. Google frequently emits a coarse rate-limit classification
+	// alongside a more precise "quota will reset after 53s" message; keep the
+	// most conservative delay so we never undercut the server's guidance.
+	if retryAfter, ok := googleRetryAfter(apiErr); ok {
+		providerErr.RetryAfter = maxRetryAfter(providerErr.RetryAfter, retryAfter)
 	}
 
 	// Detect context window overflow from the error message.
 	parseContextTooLarge(msg, providerErr)
 
 	return providerErr
+}
+
+func maxRetryAfter(current time.Duration, candidates ...time.Duration) time.Duration {
+	best := current
+	for _, candidate := range candidates {
+		if candidate > best {
+			best = candidate
+		}
+	}
+	return best
 }
 
 func formatGoogleErrorDetails(details []map[string]any) string {

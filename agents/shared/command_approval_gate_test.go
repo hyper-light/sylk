@@ -2,6 +2,7 @@ package shared
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -185,5 +186,73 @@ func TestGuardianCommandGateAuthorize_RefreshesWaitLeaseWithoutRepublish(t *test
 	case req := <-requestCh:
 		t.Fatalf("unexpected republished approval request: %#v", req)
 	default:
+	}
+}
+
+func TestGuardianCommandGateAuthorize_WrapsDeniedResponse(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	requestCh := make(chan *guide.RouteRequest, 1)
+	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		select {
+		case requestCh <- req:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	gate := NewGuardianCommandGate(GuardianCommandGateConfig{
+		BusProvider:            func() guide.EventBus { return bus },
+		SourceAgentID:          func() string { return "agent-1" },
+		SourceAgentType:        "engineer",
+		ApprovalRequestTimeout: 2 * time.Second,
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, authErr := gate.Authorize(context.Background(), commandapproval.Request{
+			Command:  "python -m pytest",
+			ToolName: "run_command",
+		})
+		errCh <- authErr
+	}()
+
+	var routeReq *guide.RouteRequest
+	select {
+	case routeReq = <-requestCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for approval request")
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:       routeReq.CorrelationID,
+		Success:             true,
+		RespondingAgentID:   "guardian",
+		RespondingAgentName: "guardian",
+		Data: commandapproval.Evaluation{
+			Decision: commandapproval.DecisionDeny,
+			Reason:   "user denied this command",
+		},
+	}
+	if err := bus.Publish(guide.TopicResponses("engineer", "agent-1"), guide.NewResponseMessage("resp-msg", resp)); err != nil {
+		t.Fatalf("publish deny response: %v", err)
+	}
+
+	select {
+	case authErr := <-errCh:
+		if !errors.Is(authErr, commandapproval.ErrApprovalDenied) {
+			t.Fatalf("expected ErrApprovalDenied, got %v", authErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for denied approval result")
 	}
 }

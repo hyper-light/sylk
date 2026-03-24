@@ -31,7 +31,7 @@ func RunGolangCILint(ctx context.Context, runner *ToolRunner, paths []string) []
 	}
 
 	args := []string{"run", "--out-format", "json"}
-	args = append(args, paths...)
+	args = append(args, normalizeGoPackageExecutionTargets(runner, paths)...)
 
 	result, err := runner.Exec(ctx, "golangci-lint", args...)
 	if err != nil {
@@ -48,7 +48,7 @@ func RunGolangCILint(ctx context.Context, runner *ToolRunner, paths []string) []
 		issues = append(issues, ValidationIssue{
 			ID:       fmt.Sprintf("lint_%d", idx),
 			Severity: mapGolangCILintSeverity(lint.Severity),
-			File:     lint.Pos.Filename,
+			File:     normalizeToolReportedPath(runner, lint.Pos.Filename),
 			Line:     lint.Pos.Line,
 			Column:   lint.Pos.Column,
 			Message:  lint.Text,

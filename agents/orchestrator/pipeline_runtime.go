@@ -10,6 +10,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/pipeline/taskstate"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func pipelineProtocolEligible(dispatch *taskDispatchContext) bool {
@@ -309,9 +310,18 @@ func (o *Orchestrator) finalizePipelineUpdate(update *PipelineUpdate) {
 		return
 	}
 
+	var (
+		mergeVersion versioning.SemanticVersion
+		hadDraft     bool
+	)
+
 	switch update.Status {
 	case "succeeded":
-		mergeVersion, hadDraft, err := o.commitTaskDraft(context.Background(), task)
+		if strings.TrimSpace(update.AgentType) == agentshared.PipelineAgentInspector {
+			o.publishTaskDraftMergeStarted(task)
+		}
+		var err error
+		mergeVersion, hadDraft, err = o.commitTaskDraft(context.Background(), task)
 		if err != nil {
 			o.publishTaskDraftMergeFailure(task, err)
 			update.Status = "failed"
@@ -323,6 +333,10 @@ func (o *Orchestrator) finalizePipelineUpdate(update *PipelineUpdate) {
 		}
 	case "failed", "timed_out", "cancelled":
 		_ = o.rollbackTaskDraft(task)
+	}
+
+	if update.Status == "succeeded" && strings.TrimSpace(update.AgentType) == agentshared.PipelineAgentInspector {
+		o.publishOTGlobalFollowupRequestsBestEffort(context.Background(), task, update, mergeVersion, hadDraft)
 	}
 
 	if o.coordination != nil {

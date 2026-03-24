@@ -16,6 +16,10 @@ var analysisLanguageByExtension = map[string]string{
 	".pyi": "python",
 }
 
+var goFileExtensions = map[string]struct{}{
+	".go": {},
+}
+
 func detectAnalysisLanguage(ctx context.Context, runner *ToolRunner, paths []string) string {
 	scores := scoreLanguageTargets(normalizeAnalysisTargets(paths))
 	if language := highestScoredLanguage(scores); language != "" {
@@ -57,6 +61,139 @@ func normalizeAnalysisTargets(paths []string) []string {
 		return []string{"."}
 	}
 	return targets
+}
+
+func normalizeGoPackageExecutionTargets(runner *ToolRunner, paths []string) []string {
+	targets := normalizeAnalysisTargets(paths)
+	if len(paths) == 0 {
+		targets = []string{"./..."}
+	}
+	root := strings.TrimSpace(runner.currentWorkingDir())
+	normalized := make([]string, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		clean := normalizeGoPackageExecutionTarget(root, target)
+		if clean == "" {
+			continue
+		}
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		normalized = append(normalized, clean)
+	}
+	if len(normalized) == 0 {
+		return []string{"./..."}
+	}
+	return normalized
+}
+
+func normalizeGoFileExecutionTargets(
+	ctx context.Context,
+	runner *ToolRunner,
+	paths []string,
+) ([]string, error) {
+	files, err := collectAnalysisFiles(ctx, runner, paths, goFileExtensions)
+	if err != nil {
+		return nil, err
+	}
+	normalized := make([]string, 0, len(files))
+	seen := make(map[string]struct{}, len(files))
+	root := strings.TrimSpace(runner.currentWorkingDir())
+	for _, file := range files {
+		clean := normalizeWorkspaceFileTarget(root, file)
+		if clean == "" {
+			continue
+		}
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		normalized = append(normalized, clean)
+	}
+	return normalized, nil
+}
+
+func normalizeGoPackageExecutionTarget(root string, target string) string {
+	target = strings.TrimSpace(target)
+	switch target {
+	case "", "...", "./...":
+		return "./..."
+	}
+	wildcard := strings.HasSuffix(target, string(filepath.Separator)+"...") || strings.HasSuffix(target, "/...")
+	if wildcard {
+		target = strings.TrimSuffix(target, string(filepath.Separator)+"...")
+		target = strings.TrimSuffix(target, "/...")
+		if strings.TrimSpace(target) == "" {
+			target = "."
+		}
+	}
+	if filepath.IsAbs(target) {
+		if rel, ok := workspaceRelativePath(root, target); ok {
+			target = rel
+		} else {
+			target = filepath.Clean(target)
+		}
+	} else {
+		target = filepath.Clean(target)
+	}
+	if target == "" || target == "." {
+		if wildcard {
+			return "./..."
+		}
+		return "."
+	}
+	if filepath.IsAbs(target) {
+		if wildcard {
+			return target + "/..."
+		}
+		return target
+	}
+	if strings.HasPrefix(target, ".."+string(filepath.Separator)) || target == ".." {
+		if wildcard {
+			return target + "/..."
+		}
+		return target
+	}
+	if wildcard {
+		return "./" + strings.TrimPrefix(filepath.ToSlash(target), "./") + "/..."
+	}
+	return "./" + strings.TrimPrefix(filepath.ToSlash(target), "./")
+}
+
+func normalizeWorkspaceFileTarget(root string, target string) string {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return ""
+	}
+	clean := filepath.Clean(target)
+	if filepath.IsAbs(clean) {
+		if rel, ok := workspaceRelativePath(root, clean); ok {
+			return filepath.Clean(rel)
+		}
+		return clean
+	}
+	return filepath.Clean(clean)
+}
+
+func normalizeToolReportedPath(runner *ToolRunner, target string) string {
+	return normalizeWorkspaceFileTarget(runner.currentWorkingDir(), target)
+}
+
+func workspaceRelativePath(root string, target string) (string, bool) {
+	root = strings.TrimSpace(root)
+	if root == "" || !filepath.IsAbs(target) {
+		return "", false
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return "", false
+	}
+	rel = filepath.Clean(rel)
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return rel, true
 }
 
 func collectAnalysisFiles(

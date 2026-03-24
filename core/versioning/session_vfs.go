@@ -388,9 +388,6 @@ func (s *SessionVFS) SessionID() SessionID { return s.sessionID }
 
 // NewDiskFileAccess creates a DiskFileAccess for agents that bypass VFS.
 func (s *SessionVFS) NewDiskFileAccess(readOnly bool) FileAccess {
-	if s.baseFS != nil {
-		return NewBaseFSFileAccess(s.baseFS, s.workingDir)
-	}
 	return NewDiskFileAccess(s.workingDir, readOnly)
 }
 

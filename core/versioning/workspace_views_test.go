@@ -2,6 +2,7 @@ package versioning
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -194,6 +195,41 @@ func TestSessionWorkspaceViews_InspectPathTreatsDirectoryAsDirectory(t *testing.
 	}
 	if state.Disk.Error != "" {
 		t.Fatalf("unexpected directory inspect error: %v", state.Disk.Error)
+	}
+}
+
+func TestSessionWorkspaceViews_DiskViewTracksLiveDiskWritesAfterSessionStart(t *testing.T) {
+	dir := t.TempDir()
+	svfs, err := NewSessionVFS(SessionVFSConfig{
+		SessionID:  "sess-1",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	defer svfs.Close()
+
+	target := filepath.Join(dir, "live.txt")
+	if err := os.WriteFile(target, []byte("live"), 0644); err != nil {
+		t.Fatalf("write live disk file: %v", err)
+	}
+
+	views := NewSessionWorkspaceViews(SessionWorkspaceViewsConfig{
+		DefaultView:  WorkspaceViewDisk,
+		Session:      svfs,
+		WorkingDir:   dir,
+		DiskFallback: NewDiskFileAccess(dir, true),
+	})
+
+	state, err := views.InspectPath(WithSessionID(context.Background(), "sess-1"), "live.txt", "")
+	if err != nil {
+		t.Fatalf("inspect path: %v", err)
+	}
+	if !state.Disk.Exists {
+		t.Fatal("expected live disk file to appear in disk view")
+	}
+	if state.Global != nil && state.Global.Available && state.Global.Exists {
+		t.Fatal("did not expect global snapshot to pick up live disk write automatically")
 	}
 }
 

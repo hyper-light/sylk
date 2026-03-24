@@ -67,7 +67,8 @@ func (d *Designer) registerCoreSkills() {
 		d.skills.Register(skill)
 	}
 	for _, skill := range shared.PipelineProtocolSkills(shared.PipelineProtocolSkillConfig{
-		AgentType: func() string { return "designer" },
+		AgentType:      func() string { return "designer" },
+		WorkspaceViews: func() versioning.WorkspaceViewAccess { return d.workspaceViews },
 		Route: shared.PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return d.bus },
 			SessionID:   func() string { return d.config.SessionID },

@@ -6,8 +6,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"path/filepath"
-	"strings"
 )
 
 // lockMethodNames are method names that acquire locks.
@@ -27,9 +25,9 @@ func RunDeadlockDetector(ctx context.Context, runner *ToolRunner, paths []string
 	var issues []ValidationIssue
 	idx := 0
 
-	goFiles, err := collectGoFiles(runner.WorkingDir(), paths)
+	goFiles, err := normalizeGoFileExecutionTargets(ctx, runner, paths)
 	if err != nil {
-		return nil
+		return executionFailureIssues("deadlock", err)
 	}
 
 	fset := token.NewFileSet()
@@ -40,7 +38,11 @@ func RunDeadlockDetector(ctx context.Context, runner *ToolRunner, paths []string
 		default:
 		}
 
-		f, err := parser.ParseFile(fset, file, nil, 0)
+		content, err := readAnalysisFile(ctx, runner, file)
+		if err != nil {
+			continue
+		}
+		f, err := parser.ParseFile(fset, file, content, 0)
 		if err != nil {
 			continue
 		}
@@ -165,29 +167,4 @@ func findNestedLocks(locks []lockAcquisition) []nestedLockPair {
 	}
 
 	return pairs
-}
-
-func collectGoFiles(workingDir string, paths []string) ([]string, error) {
-	if len(paths) == 0 {
-		paths = []string{"."}
-	}
-
-	var files []string
-	for _, p := range paths {
-		// Remove Go package patterns
-		p = strings.TrimSuffix(p, "/...")
-		if p == "." || p == "./" {
-			p = workingDir
-		} else if !filepath.IsAbs(p) {
-			p = filepath.Join(workingDir, p)
-		}
-
-		matches, err := filepath.Glob(filepath.Join(p, "*.go"))
-		if err != nil {
-			return nil, fmt.Errorf("glob %s: %w", p, err)
-		}
-		files = append(files, matches...)
-	}
-
-	return files, nil
 }

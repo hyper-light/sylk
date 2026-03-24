@@ -229,6 +229,78 @@ func TestHandleValidationVerdictForwardPassDoesNotReleaseActiveHold(t *testing.T
 	}
 }
 
+func TestHandleCommandApprovalHoldForwardPausesAndResumesDAG(t *testing.T) {
+	orch := &Orchestrator{
+		config:       Config{SessionID: "sess", AgentID: "orchestrator"},
+		running:      true,
+		dispatchGate: newDispatchHoldGate(),
+	}
+
+	beginPayload := &agentshared.CommandApprovalHoldRequest{
+		Action:     agentshared.CommandApprovalHoldBegin,
+		HoldID:     "approval_hold_1",
+		SessionID:  "sess",
+		DAGID:      "dag-1",
+		NodeID:     "task_1",
+		TaskID:     "task_1",
+		PipelineID: "task_1",
+	}
+	beginBody, err := encodeRouteSyncInput(beginPayload)
+	if err != nil {
+		t.Fatalf("marshal begin payload: %v", err)
+	}
+	beginFwd := &guide.ForwardedRequest{
+		Input:           beginBody,
+		SessionID:       "sess",
+		SourceAgentID:   "tester-1",
+		SourceAgentName: "tester-pipeline",
+		Metadata: map[string]any{
+			"control_plane_kind": agentshared.ControlPlaneKindCommandApprovalHold,
+		},
+	}
+
+	resultAny, err := orch.handleCommandApprovalHoldForward(context.Background(), beginFwd)
+	if err != nil {
+		t.Fatalf("begin approval hold: %v", err)
+	}
+	result, ok := resultAny.(*agentshared.CommandApprovalHoldResult)
+	if !ok {
+		t.Fatalf("begin result type = %T, want *CommandApprovalHoldResult", resultAny)
+	}
+	if result.State != "active" {
+		t.Fatalf("begin result state = %q, want active", result.State)
+	}
+	if !orch.dispatchGate.isHeld("sess", "dag-1") {
+		t.Fatal("expected dag hold to be active")
+	}
+
+	resolvePayload := &agentshared.CommandApprovalHoldRequest{
+		Action:    agentshared.CommandApprovalHoldResolve,
+		HoldID:    "approval_hold_1",
+		SessionID: "sess",
+		DAGID:     "dag-1",
+	}
+	resolveBody, err := encodeRouteSyncInput(resolvePayload)
+	if err != nil {
+		t.Fatalf("marshal resolve payload: %v", err)
+	}
+	resolveFwd := &guide.ForwardedRequest{
+		Input:           resolveBody,
+		SessionID:       "sess",
+		SourceAgentID:   "guardian",
+		SourceAgentName: "guardian",
+		Metadata: map[string]any{
+			"control_plane_kind": agentshared.ControlPlaneKindCommandApprovalHold,
+		},
+	}
+	if _, err := orch.handleCommandApprovalHoldForward(context.Background(), resolveFwd); err != nil {
+		t.Fatalf("resolve approval hold: %v", err)
+	}
+	if orch.dispatchGate.isHeld("sess", "dag-1") {
+		t.Fatal("expected dag hold to be resolved")
+	}
+}
+
 func TestHandlePlanHandoffReceiptResyncForwardPublishesUpdate(t *testing.T) {
 	store, err := OpenStore(DefaultStoreConfig(filepath.Join(t.TempDir(), "orchestrator.db")))
 	if err != nil {

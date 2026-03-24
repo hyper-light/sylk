@@ -13,7 +13,7 @@ func RunGoVet(ctx context.Context, runner *ToolRunner, paths []string) []Validat
 	}
 
 	args := []string{"vet"}
-	args = append(args, paths...)
+	args = append(args, normalizeGoPackageExecutionTargets(runner, paths)...)
 
 	result, err := runner.Exec(ctx, "go", args...)
 	if err != nil {
@@ -29,6 +29,7 @@ func RunGoVet(ctx context.Context, runner *ToolRunner, paths []string) []Validat
 		if !ok {
 			continue
 		}
+		file = normalizeToolReportedPath(runner, file)
 		issues = append(issues, ValidationIssue{
 			ID:       fmt.Sprintf("vet_%d", idx),
 			Severity: Critical,

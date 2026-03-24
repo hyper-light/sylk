@@ -166,6 +166,7 @@ func BuildPipelineSystemContext(task *PipelineTaskInput) string {
 		b.WriteString("- Engineer and Designer should treat tests as executable specification and challenge unclear criteria or coverage.\n")
 		b.WriteString("- Each time Engineer or Designer hands work back, Inspector should invoke finalize_pipeline to run the audit cycle.\n")
 		b.WriteString("- If the finalize_pipeline audit passes and tester evidence confirms the required tests are implemented and passing, Inspector must immediately invoke handoff_to_ot instead of starting another audit loop.\n")
+		b.WriteString("- Once a pipeline is ready for OT, that completed pipeline takes priority: Inspector must invoke handoff_to_ot before continuing with any other queued work, other pipelines, or other reviews.\n")
 		b.WriteString("- While Inspector audit lock is active, challenges to Inspector are refused. If refused, stop work until Inspector challenges you directly or your preceding agent hands off to you.\n")
 	}
 	return strings.TrimSpace(b.String())

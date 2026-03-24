@@ -227,7 +227,8 @@ func (pt *PipelineTester) registerCoreSkills() {
 		pt.skills.Register(skill)
 	}
 	for _, skill := range agentshared.PipelineProtocolSkills(agentshared.PipelineProtocolSkillConfig{
-		AgentType: func() string { return "tester-pipeline" },
+		AgentType:      func() string { return "tester-pipeline" },
+		WorkspaceViews: func() versioning.WorkspaceViewAccess { return pt.workspaceViews },
 		Route: agentshared.PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return pt.bus },
 			SessionID:   func() string { return pt.config.SessionID },

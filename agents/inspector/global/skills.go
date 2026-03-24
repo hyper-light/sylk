@@ -56,6 +56,10 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(validatePlanAdherenceSkill(gi))
 	gi.skills.Register(crossReferenceChangesSkill(gi))
 	gi.skills.Register(gradeLayerQualitySkill(gi))
+	gi.skills.Register(loadPlanContextSkill(gi))
+	gi.skills.Register(consultLibrarianStyleSkill(gi))
+	gi.skills.Register(consultAcademicApproachSkill(gi))
+	gi.skills.Register(consultArchivalistContextSkill(gi))
 	gi.skills.Register(requestArchitectResearchSkill(gi))
 	gi.skills.Register(requestUserClarificationSkill(gi))
 	gi.skills.Register(escalateFindingsSkill(gi))
@@ -92,13 +96,13 @@ func (d *globalInspectorDiag) AgentSpecificDiagnostics() map[string]any {
 
 func auditLayerSkill(gi *GlobalInspector) *skills.Skill {
 	return skills.NewSkill("audit_layer").
-		Description("Run comprehensive audit on a completed DAG layer.").
+		Description("Run an adversarial, whole-plan audit on a completed DAG layer.").
 		Domain("audit").
 		Keywords("audit", "layer", "dag").
 		Priority(100).
-		Usage("Use when a completed DAG layer needs a cross-file quality audit against the expected architectural intent.").
-		Requirement("Provide the DAG, layer, and any plan snapshot needed to judge adherence and cross-file coherence.").
-		Satisfies("Produces the layer-audit evidence that drives global inspection, gating, and escalation.").
+		Usage("Use when a completed DAG layer needs a hard, cross-file quality gate against the entire architect plan, the codebase's existing style, and the user's preserved intent.").
+		Requirement("Provide the DAG, layer, and the full architect plan snapshot when available. If the plan is missing or partial, call `load_plan_context` before concluding.").
+		Satisfies("Produces the whole-layer audit evidence that drives global inspection, blocking decisions, architect pushback, and escalation.").
 		Avoid("Do not use for narrow single-file inspection when a scoped pipeline inspector pass is the correct tool.").
 		StringParam("dag_id", "DAG identifier", true).
 		IntParam("layer_idx", "Layer index to audit", true).
@@ -143,13 +147,13 @@ func auditLayerSkill(gi *GlobalInspector) *skills.Skill {
 
 func validatePlanAdherenceSkill(_ *GlobalInspector) *skills.Skill {
 	return skills.NewSkill("validate_plan_adherence").
-		Description("Compare implementation against the architect's plan.").
+		Description("Compare implementation against the full architect plan, not just isolated task summaries.").
 		Domain("audit").
 		Keywords("plan", "adherence", "compliance").
 		Priority(100).
-		Usage("Use when the global audit needs to compare completed work against the architect's intended task set and sequencing.").
-		Requirement("Provide the plan snapshot and the concrete implemented task IDs so the comparison is fact-based.").
-		Satisfies("Produces plan-adherence evidence that can inform global grading and architect escalation.").
+		Usage("Use when the audit must prove whether the merged implementation really matches the architect's intended task set, sequencing, scope boundaries, and quality expectations.").
+		Requirement("Provide the full plan snapshot and the concrete implemented task IDs so adherence is judged against the actual plan, not reconstructed prose.").
+		Satisfies("Produces plan-adherence evidence that can justify blocking, architect pushback, or a direct challenge to the plan itself.").
 		Avoid("Do not guess adherence from prose summaries when the actual plan snapshot is available.").
 		StringParam("plan_snapshot", "Serialized plan to validate against", true).
 		ArrayParam("implemented_tasks", "List of implemented task IDs", "string", false).
@@ -180,11 +184,11 @@ func validatePlanAdherenceSkill(_ *GlobalInspector) *skills.Skill {
 
 func crossReferenceChangesSkill(gi *GlobalInspector) *skills.Skill {
 	return skills.NewSkill("cross_reference_changes").
-		Description("Detect cross-file issues: interface mismatches, import cycles, type inconsistencies, shared state races.").
+		Description("Detect cross-file issues such as interface mismatches, import cycles, type inconsistencies, shared state races, and style drift across the changed surface.").
 		Domain("audit").
 		Keywords("cross-file", "interface", "import", "type", "race").
 		Priority(95).
-		Usage("Use when multiple changed files need coherence checks across interfaces, imports, shared state, or broader architecture boundaries.").
+		Usage("Use when multiple changed files need coherence checks across interfaces, imports, shared state, architecture boundaries, or established repo conventions.").
 		Requirement("Provide the concrete file set so the analysis is tied to the actual changed surface.").
 		Satisfies("Produces cross-file architectural findings for the global audit and final escalation/reporting.").
 		Avoid("Do not limit yourself to one file at a time when the risk is in interactions between files.").
@@ -215,13 +219,13 @@ func crossReferenceChangesSkill(gi *GlobalInspector) *skills.Skill {
 
 func gradeLayerQualitySkill(_ *GlobalInspector) *skills.Skill {
 	return skills.NewSkill("grade_layer_quality").
-		Description("Produce an overall quality grade for a DAG layer.").
+		Description("Produce an overall quality grade for a DAG layer across correctness, robustness, performance, security, adherence, and code quality.").
 		Domain("audit").
 		Keywords("grade", "quality", "layer").
 		Priority(90).
-		Usage("Use after the relevant audit evidence exists and the layer is ready for a final global quality judgment.").
-		Requirement("Requires enough audit evidence to justify a grade across correctness, robustness, performance, security, and adherence.").
-		Satisfies("Produces the layer-grade result used in final audit summaries and escalation decisions.").
+		Usage("Use after the relevant audit evidence exists and the layer is ready for a final whole-plan quality judgment.").
+		Requirement("Requires enough audit evidence to justify a grade across correctness, robustness, performance, security, adherence, style fit, and overall implementation quality.").
+		Satisfies("Produces the quality-grade result used in final audit summaries, blocking decisions, and architect challenges.").
 		Avoid("Do not grade a layer before the core audit evidence has been gathered.").
 		StringParam("dag_id", "DAG identifier", true).
 		IntParam("layer_idx", "Layer index", true).
@@ -385,7 +389,9 @@ func requestArchitectResearchSkill(gi *GlobalInspector) *skills.Skill {
 					"source":      gi.id,
 				}
 				payloadJSON, _ := json.Marshal(payload)
-				_, _ = gi.requestRouteSync(ctx, "architect", string(payloadJSON))
+				_, _ = gi.requestRouteSync(ctx, "architect", string(payloadJSON), map[string]any{
+					"consultation_kind": "architect_research",
+				})
 			}
 
 			return map[string]any{
@@ -423,7 +429,9 @@ func requestUserClarificationSkill(gi *GlobalInspector) *skills.Skill {
 					"source":   gi.id,
 				}
 				payloadJSON, _ := json.Marshal(payload)
-				_, _ = gi.requestRouteSync(ctx, "guide", string(payloadJSON))
+				_, _ = gi.requestRouteSync(ctx, "guide", string(payloadJSON), map[string]any{
+					"clarification_request": true,
+				})
 			}
 
 			return map[string]any{

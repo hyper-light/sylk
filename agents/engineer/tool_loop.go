@@ -230,7 +230,9 @@ func (e *Engineer) applyToolCalls(
 			default:
 				result = shared.ToolErrorPayload(err)
 				isError = true
-				errCount++
+				if shared.ToolErrorCountsTowardAbort(err) {
+					errCount++
+				}
 				if hint := shared.ToolRecoveryHint(call.Name, err); hint != "" {
 					recoveryHints = append(recoveryHints, hint)
 				}

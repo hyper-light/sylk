@@ -70,6 +70,7 @@ func NewRunCommandSkill(cfg CommandSkillConfig) *skills.Skill {
 		Avoid("Do not chain setup steps, use cd, or pack multiple logical operations into one call.").
 		BestPractice("Use working_dir instead of prefixing the command with cd.").
 		BestPractice("When strict execution is available, this command reads the same disk/global/pipeline workspace view the agent is operating on; it is not limited to already-committed files on disk.").
+		BestPractice("working_dir may point at a directory from that active workspace view, including directories that currently exist only in VFS-backed task state.").
 		BestPractice("If the task needs &&, ||, ;, pipes, redirection, shell variables, or multi-line shell, use run_shell_script instead.").
 		StringParam("command", "Single command to execute", true).
 		StringParam("working_dir", "Working directory for command execution", false).
@@ -96,6 +97,7 @@ func NewRunShellScriptSkill(cfg CommandSkillConfig) *skills.Skill {
 		Avoid("Do not use run_shell_script for simple commands that fit in run_command, and do not use it as a shortcut around write tools.").
 		BestPractice("Keep the script minimal and purpose-built for the current task.").
 		BestPractice("When strict execution is available, the script runs against the same disk/global/pipeline workspace view the agent is operating on, including VFS-backed files that are not committed to disk yet.").
+		BestPractice("working_dir may point at a directory from that active workspace view, including directories that currently exist only in VFS-backed task state.").
 		BestPractice("This tool uses exact-command approval only; broad pre-approval does not apply.").
 		StringParam("script", "Shell script or compound shell command to execute", true).
 		StringParam("working_dir", "Working directory for script execution", false).
@@ -149,7 +151,7 @@ func executeCommandLike(
 	if cfg.AgentID != nil {
 		agentID = strings.TrimSpace(cfg.AgentID())
 	}
-	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), commandapproval.Request{
+	authReq := commandapproval.Request{
 		Command:        command,
 		WorkingDir:     workingDir,
 		WorkspaceRoot:  workspaceRoot,
@@ -158,7 +160,9 @@ func executeCommandLike(
 		AgentType:      strings.TrimSpace(cfg.AgentType),
 		SessionID:      sessionID,
 		ApprovalPolicy: policy,
-	}); err != nil {
+	}
+	PopulateCommandApprovalScope(ctx, &authReq)
+	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq); err != nil {
 		return nil, err
 	}
 	if cfg.PrepareExecution == nil {

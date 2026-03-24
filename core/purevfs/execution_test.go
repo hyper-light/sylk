@@ -114,6 +114,28 @@ func TestExecutionPlannerProjectsToolchainsIntoBrokerPath(t *testing.T) {
 	}
 }
 
+func TestExecutionPlannerPythonIncludesPip3Toolchain(t *testing.T) {
+	planner := NewExecutionPlanner(nil, StrictBrokerCapabilities())
+
+	plan, err := planner.Plan(ExecutionRequest{
+		Mode:          ExecutionModeStrictNoDisk,
+		Intent:        ExecutionIntentCommand,
+		Language:      "python",
+		WorkspaceRoot: "/workspace",
+	})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	want := path.Join(executionToolchainRoot, "pip3")
+	for _, mount := range plan.Mounts {
+		if mount.Kind == MountToolchain && mount.VirtualPath == want {
+			return
+		}
+	}
+	t.Fatalf("toolchain mount %q missing from %#v", want, plan.Mounts)
+}
+
 func TestTranslateExecutionEnvValueRewritesPathLists(t *testing.T) {
 	plan := ExecutionPlan{
 		Mounts: []MountSpec{

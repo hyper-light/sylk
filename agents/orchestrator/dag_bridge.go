@@ -88,9 +88,11 @@ type DAGBridge struct {
 	activator          guide.PodActivator
 	registrar          PipelineRegistrar
 	runtime            container.ContainerRuntime
+	quota              *container.ResourceQuota
 	specReg            *container.AgentSpecRegistry
 	sessionVFS         func(sessionID string) *versioning.SessionVFS
 	waitDispatchPermit func(ctx context.Context, sessionID, dagID string) error
+	isExecutionHeld    func(sessionID, dagID, nodeID string) bool
 	sessionID          string
 	agentID            string
 	logger             *slog.Logger
@@ -173,6 +175,13 @@ func (b *DAGBridge) SetTaskPodInfra(
 	b.sessionVFS = sessionVFS
 }
 
+// SetContextQuota wires the live session token budget used for node admission.
+func (b *DAGBridge) SetContextQuota(quota *container.ResourceQuota) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.quota = quota
+}
+
 // SetDispatchPermitWaiter installs a callback invoked before a node dispatch
 // is published onto the bus. Used by the orchestrator control plane to pause
 // new pipeline work while validation/remediation holds are active.
@@ -180,6 +189,14 @@ func (b *DAGBridge) SetDispatchPermitWaiter(fn func(ctx context.Context, session
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.waitDispatchPermit = fn
+}
+
+// SetExecutionHoldChecker installs a callback used to shield active nodes from
+// timeout cancellation while the orchestrator has paused a DAG.
+func (b *DAGBridge) SetExecutionHoldChecker(fn func(sessionID, dagID, nodeID string) bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.isExecutionHeld = fn
 }
 
 // SetLogger sets the structured logger for pipeline pod diagnostics.
@@ -265,9 +282,11 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	registrar := b.registrar
 	logger := b.logger
 	runtime := b.runtime
+	quota := b.quota
 	specReg := b.specReg
 	sessionVFS := b.sessionVFS
 	waitDispatchPermit := b.waitDispatchPermit
+	isExecutionHeld := b.isExecutionHeld
 	b.mu.RUnlock()
 
 	b.mu.RLock()
@@ -300,6 +319,8 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	dispatcher.activityGrace = b.config.DefaultNodeTimeout
 	dispatcher.SetEventLogger(b.eventLogger)
 	dispatcher.SetDispatchPermitWaiter(waitDispatchPermit)
+	dispatcher.SetExecutionHoldChecker(isExecutionHeld)
+	dispatcher.SetContextBudget(quota, specReg)
 	dispatcher.SetPodResolver(func(node *dag.Node) *shared.AgentPod {
 		if node == nil {
 			return nil

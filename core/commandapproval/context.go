@@ -7,6 +7,7 @@ import (
 )
 
 var ErrApprovalRequired = errors.New("command approval required")
+var ErrApprovalDenied = errors.New("command approval denied")
 
 type gateContextKey struct{}
 
@@ -40,7 +41,7 @@ func Authorize(ctx context.Context, evaluator *Evaluator, req Request) (Evaluati
 		return eval, fmt.Errorf("%w: %s", ErrApprovalRequired, eval.Analysis.Summary)
 	}
 	if eval.Decision == DecisionDeny {
-		return eval, fmt.Errorf("%s", eval.Reason)
+		return eval, fmt.Errorf("%w: %s", ErrApprovalDenied, eval.Reason)
 	}
 	return eval, nil
 }

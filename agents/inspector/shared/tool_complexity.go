@@ -25,15 +25,22 @@ func RunComplexity(ctx context.Context, runner *ToolRunner, paths []string, maxC
 
 	var issues []ValidationIssue
 	idx := 0
+	fileTargets, err := normalizeGoFileExecutionTargets(ctx, runner, paths)
+	if err != nil {
+		return executionFailureIssues("complexity", err)
+	}
+	if len(fileTargets) == 0 {
+		return nil
+	}
 
 	// Cyclomatic complexity
 	if runner.Available("gocyclo") {
-		args := append([]string{"-over", strconv.Itoa(maxCyclomatic)}, paths...)
+		args := append([]string{"-over", strconv.Itoa(maxCyclomatic)}, fileTargets...)
 		result, err := runner.Exec(ctx, "gocyclo", args...)
 		if err != nil {
 			issues = append(issues, executionFailureIssues("gocyclo", err)...)
 		} else {
-			for _, issue := range parseComplexityOutput(result.Stdout, "cyclomatic", maxCyclomatic, idx) {
+			for _, issue := range parseComplexityOutput(runner, result.Stdout, "cyclomatic", maxCyclomatic, idx) {
 				issues = append(issues, issue)
 				idx++
 			}
@@ -44,12 +51,12 @@ func RunComplexity(ctx context.Context, runner *ToolRunner, paths []string, maxC
 
 	// Cognitive complexity
 	if runner.Available("gocognit") {
-		args := append([]string{"-over", strconv.Itoa(maxCognitive)}, paths...)
+		args := append([]string{"-over", strconv.Itoa(maxCognitive)}, fileTargets...)
 		result, err := runner.Exec(ctx, "gocognit", args...)
 		if err != nil {
 			issues = append(issues, executionFailureIssues("gocognit", err)...)
 		} else {
-			for _, issue := range parseComplexityOutput(result.Stdout, "cognitive", maxCognitive, idx) {
+			for _, issue := range parseComplexityOutput(runner, result.Stdout, "cognitive", maxCognitive, idx) {
 				issues = append(issues, issue)
 				idx++
 			}
@@ -61,7 +68,7 @@ func RunComplexity(ctx context.Context, runner *ToolRunner, paths []string, maxC
 	return DeduplicateIssues(issues)
 }
 
-func parseComplexityOutput(output []byte, kind string, threshold, startIdx int) []ValidationIssue {
+func parseComplexityOutput(runner *ToolRunner, output []byte, kind string, threshold, startIdx int) []ValidationIssue {
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	var issues []ValidationIssue
 
@@ -96,7 +103,7 @@ func parseComplexityOutput(output []byte, kind string, threshold, startIdx int) 
 		issues = append(issues, ValidationIssue{
 			ID:       fmt.Sprintf("cx_%d", startIdx+i),
 			Severity: sev,
-			File:     file,
+			File:     normalizeToolReportedPath(runner, file),
 			Line:     lineNum,
 			Message:  fmt.Sprintf("%s complexity %d exceeds threshold %d in %s", kind, score, threshold, funcName),
 			RuleID:   kind + "-complexity",

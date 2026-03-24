@@ -177,10 +177,10 @@ func codeAssistHTTPError(operation string, statusCode int, body []byte) *Provide
 		}
 	}
 
-	// Fall back to message-based retry-after extraction.
-	if pe.RetryAfter == 0 {
-		pe.RetryAfter = codeAssistRetryAfterFromBody(bodyStr)
-	}
+	// Merge any explicit message/body reset hint with the structured quota
+	// classification. This preserves precise "reset after 53s" guidance instead
+	// of undercutting it with a generic 10s rate-limit default.
+	pe.RetryAfter = maxRetryAfter(pe.RetryAfter, codeAssistRetryAfterFromBody(bodyStr))
 
 	return pe
 }
@@ -189,7 +189,11 @@ func codeAssistHTTPError(operation string, statusCode int, body []byte) *Provide
 // JSON error response bodies that contain human-readable messages like
 // "Your quota will reset after 39s."
 func codeAssistRetryAfterFromBody(body string) time.Duration {
-	d, ok := googleRetryAfterFromMessage(body)
+	message := extractJSONMessage(body)
+	if message == "" {
+		message = body
+	}
+	d, ok := googleRetryAfterFromMessage(message)
 	if ok {
 		return d
 	}

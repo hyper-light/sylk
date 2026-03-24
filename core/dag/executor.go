@@ -15,6 +15,10 @@ type NodeDispatcher interface {
 	Dispatch(ctx context.Context, node *Node, parentResults map[string]*NodeResult) (*NodeResult, error)
 }
 
+type budgetRetryWaiter interface {
+	WaitForBudget(ctx context.Context, retryAt time.Time) error
+}
+
 type Executor struct {
 	mu sync.RWMutex
 
@@ -39,6 +43,7 @@ type Executor struct {
 
 	layerGate    LayerGate
 	layerRetries map[int]int
+	budgetRetry  map[string]time.Time
 
 	scope *concurrency.GoroutineScope
 }
@@ -54,6 +59,7 @@ func NewExecutor(policy ExecutionPolicy, scope *concurrency.GoroutineScope) *Exe
 	return &Executor{
 		policy:      policy,
 		nodeResults: make(map[string]*NodeResult),
+		budgetRetry: make(map[string]time.Time),
 		handlers:    make([]EventHandler, 0),
 		scope:       scope,
 	}
@@ -104,6 +110,7 @@ func (e *Executor) initializeExecution(ctx context.Context, dag *DAG, dispatcher
 	e.currentLayer = 0
 	e.startTime = time.Now()
 	e.nodeResults = make(map[string]*NodeResult)
+	e.budgetRetry = make(map[string]time.Time)
 	e.layerRetries = make(map[int]int)
 	e.dispatcher = dispatcher
 	e.cancelled.Store(false)
@@ -196,6 +203,9 @@ func (e *Executor) executeAndCheckLayer(layerIdx int, layer []string) layerOutco
 	if err != nil && e.policy.FailurePolicy == FailurePolicyFailFast {
 		return layerOutcomeStop
 	}
+	if deferred := e.handleBudgetDeferredLayer(layer); deferred != layerOutcomeContinue {
+		return deferred
+	}
 
 	return e.evaluateGateResult(layerIdx)
 }
@@ -223,13 +233,70 @@ func (e *Executor) checkLayerRetryBudget(layerIdx int) layerOutcome {
 	return layerOutcomeRetry
 }
 
+func (e *Executor) handleBudgetDeferredLayer(layer []string) layerOutcome {
+	nextRetry, hasDeferred := e.nextBudgetRetry(layer)
+	if !hasDeferred {
+		return layerOutcomeContinue
+	}
+	if err := e.waitForBudgetRetry(nextRetry); err != nil {
+		return layerOutcomeStop
+	}
+	return layerOutcomeRetry
+}
+
+func (e *Executor) nextBudgetRetry(layer []string) (time.Time, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	var (
+		next time.Time
+		ok   bool
+	)
+	for _, nodeID := range layer {
+		result, exists := e.nodeResults[nodeID]
+		if !exists || result == nil || result.State != NodeStateWaitingBudget {
+			continue
+		}
+		retryAt, hasRetry := e.budgetRetry[nodeID]
+		if !hasRetry {
+			retryAt = time.Now().Add(e.policy.RetryBackoff)
+		}
+		if !ok || retryAt.Before(next) {
+			next = retryAt
+			ok = true
+		}
+	}
+	return next, ok
+}
+
+func (e *Executor) waitUntil(deadline time.Time) error {
+	if deadline.IsZero() || !deadline.After(time.Now()) {
+		return nil
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-e.ctx.Done():
+		return e.ctx.Err()
+	}
+}
+
+func (e *Executor) waitForBudgetRetry(deadline time.Time) error {
+	if waiter, ok := e.dispatcher.(budgetRetryWaiter); ok {
+		return waiter.WaitForBudget(e.ctx, deadline)
+	}
+	return e.waitUntil(deadline)
+}
+
 func (e *Executor) resetLayerForRetry(layer []string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	for _, nodeID := range layer {
 		result, ok := e.nodeResults[nodeID]
-		if !ok || result.State != NodeStateFailed {
+		if !ok || (result.State != NodeStateFailed && result.State != NodeStateWaitingBudget) {
 			continue
 		}
 		node, exists := e.dag.GetNode(nodeID)
@@ -237,8 +304,11 @@ func (e *Executor) resetLayerForRetry(layer []string) {
 			continue
 		}
 		node.SetState(NodeStatePending)
-		node.ResetRetryCount()
+		if result.State == NodeStateFailed {
+			node.ResetRetryCount()
+		}
 		delete(e.nodeResults, nodeID)
+		delete(e.budgetRetry, nodeID)
 	}
 }
 
@@ -466,6 +536,10 @@ func (e *Executor) executeNodeWithRetry(node *Node, nodeID string, parentResults
 		}
 
 		result, err := e.dispatchNode(node, parentResults, timeout)
+		if deferred, retryAt := deferredDispatch(result, err); deferred {
+			e.recordBudgetRetry(nodeID, retryAt)
+			return result, nil
+		}
 		success, dispatchErr := e.handleDispatchResult(result, err)
 		lastErr = dispatchErr
 		if success {
@@ -507,6 +581,15 @@ func (e *Executor) waitRetryBackoff(node *Node) error {
 		e.markNodeCancelled(node)
 		return e.ctx.Err()
 	}
+}
+
+func (e *Executor) recordBudgetRetry(nodeID string, retryAt time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if retryAt.IsZero() || retryAt.Before(time.Now()) {
+		retryAt = time.Now().Add(e.policy.RetryBackoff)
+	}
+	e.budgetRetry[nodeID] = retryAt
 }
 
 func (e *Executor) resolveNodeTimeout(node *Node) time.Duration {
@@ -604,6 +687,10 @@ func (e *Executor) dispatchNode(node *Node, parentResults map[string]*NodeResult
 	if err == nil {
 		return result, nil
 	}
+	var deferredErr *NodeDeferredError
+	if errors.As(err, &deferredErr) {
+		return deferredDispatchResult(nodeID, deferredErr), deferredErr
+	}
 	if errors.Is(err, context.DeadlineExceeded) || (result == nil && ctx.Err() == context.DeadlineExceeded) {
 		return failedDispatchResult(nodeID, ErrNodeTimeout, time.Since(node.StartTime())), ErrNodeTimeout
 	}
@@ -698,6 +785,36 @@ func failedDispatchResult(nodeID string, err error, duration time.Duration) *Nod
 	return result
 }
 
+func deferredDispatch(result *NodeResult, err error) (bool, time.Time) {
+	var deferredErr *NodeDeferredError
+	if !errors.As(err, &deferredErr) {
+		return false, time.Time{}
+	}
+	if result != nil && result.State == NodeStateWaitingBudget {
+		if deferredErr.RetryAfter > 0 {
+			return true, time.Now().Add(deferredErr.RetryAfter)
+		}
+	}
+	if deferredErr.RetryAfter > 0 {
+		return true, time.Now().Add(deferredErr.RetryAfter)
+	}
+	return true, time.Now()
+}
+
+func deferredDispatchResult(nodeID string, deferred *NodeDeferredError) *NodeResult {
+	result := &NodeResult{
+		NodeID:   nodeID,
+		State:    NodeStateWaitingBudget,
+		Error:    deferred,
+		EndTime:  time.Now(),
+		Metadata: map[string]any{},
+	}
+	if deferred != nil && deferred.RetryAfter > 0 {
+		result.Metadata["retry_after_ms"] = deferred.RetryAfter.Milliseconds()
+	}
+	return result
+}
+
 func (e *Executor) getParentResults(node *Node) map[string]*NodeResult {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -730,6 +847,11 @@ func (e *Executor) emitNodeResultEvent(node *Node, result *NodeResult) {
 	if errText := nodeResultErrorText(result); errText != "" {
 		data["error"] = errText
 	}
+	if result != nil && result.Metadata != nil {
+		if retryAfter, ok := result.Metadata["retry_after_ms"]; ok {
+			data["retry_after_ms"] = retryAfter
+		}
+	}
 	e.emitEvent(&Event{
 		Type:      nodeResultEventType(result.State),
 		DAGID:     e.dag.ID(),
@@ -747,11 +869,12 @@ func nodeResultErrorText(result *NodeResult) string {
 }
 
 var nodeStateToEventType = map[NodeState]EventType{
-	NodeStateSucceeded: EventNodeCompleted,
-	NodeStateFailed:    EventNodeFailed,
-	NodeStateBlocked:   EventNodeFailed,
-	NodeStateSkipped:   EventNodeSkipped,
-	NodeStateCancelled: EventNodeCancelled,
+	NodeStateSucceeded:     EventNodeCompleted,
+	NodeStateFailed:        EventNodeFailed,
+	NodeStateBlocked:       EventNodeFailed,
+	NodeStateSkipped:       EventNodeSkipped,
+	NodeStateCancelled:     EventNodeCancelled,
+	NodeStateWaitingBudget: EventNodeBudgetDeferred,
 }
 
 func nodeResultEventType(state NodeState) EventType {
@@ -808,7 +931,7 @@ func (e *Executor) buildResult() *DAGResult {
 		e.tallyNodeResult(result, nodeResult)
 	}
 
-	e.applyResultState(result)
+	e.applyResultState(result, e.incompleteNodeCountLocked())
 	e.state = result.State
 	return result
 }
@@ -835,10 +958,15 @@ func (e *Executor) tallyNodeResult(result *DAGResult, nodeResult *NodeResult) {
 	}
 }
 
-func (e *Executor) applyResultState(result *DAGResult) {
-	if e.cancelled.Load() {
+func (e *Executor) applyResultState(result *DAGResult, incompleteNodes int) {
+	if e.cancelled.Load() || errors.Is(e.ctx.Err(), context.Canceled) {
 		result.State = DAGStateCancelled
 		result.Error = ErrDAGCancelled
+		return
+	}
+	if err := e.ctx.Err(); err != nil {
+		result.State = DAGStateFailed
+		result.Error = err
 		return
 	}
 	if result.NodesFailed > 0 {
@@ -846,7 +974,22 @@ func (e *Executor) applyResultState(result *DAGResult) {
 		result.Error = buildNodeFailureError(result.NodeResults)
 		return
 	}
+	if incompleteNodes > 0 {
+		result.State = DAGStateFailed
+		result.Error = fmt.Errorf("dag incomplete: %d nodes unfinished", incompleteNodes)
+		return
+	}
 	result.State = DAGStateSucceeded
+}
+
+func (e *Executor) incompleteNodeCountLocked() int {
+	count := 0
+	for _, node := range e.dag.Nodes() {
+		if !node.State().IsTerminal() {
+			count++
+		}
+	}
+	return count
 }
 
 func buildNodeFailureError(nodeResults map[string]*NodeResult) error {

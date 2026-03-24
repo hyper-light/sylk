@@ -3,12 +3,14 @@ package shared
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func TestPipelineProtocolSkills_RecordTurnActions(t *testing.T) {
@@ -67,6 +69,123 @@ func TestValidatePipelineProtocolCompletion_RequiresTurnAction(t *testing.T) {
 	ctx := WithPipelineProtocolState(context.Background(), NewPipelineProtocolState(&PipelineProtocolSnapshot{}))
 	if err := ValidatePipelineProtocolCompletion(ctx, PipelineAgentEngineer); err == nil {
 		t.Fatal("expected missing turn action to fail completion")
+	}
+}
+
+func TestFinalizePipeline_RequiresImmediateHandoffToOT(t *testing.T) {
+	snapshot := &PipelineProtocolSnapshot{
+		PendingValidation: &PipelineValidationRecord{
+			ChallengeID:         "challenge-ready",
+			RequestingAgent:     PipelineAgentInspector,
+			RespondingAgent:     PipelineAgentTester,
+			Status:              string(PipelineValidationPassed),
+			Summary:             "tester accepted the audit",
+			ChallengeReferences: []string{finalizePipelineVerificationReference},
+			EvidenceRefs:        []string{"artifact:tester"},
+		},
+	}
+	ctx := WithPipelineProtocolState(context.Background(), NewPipelineProtocolState(snapshot))
+	ctx = WithTaskExecutionContract(ctx, &TaskExecutionContract{RuntimeAgentType: PipelineAgentInspector})
+
+	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
+		AgentType:   func() string { return PipelineAgentInspector },
+		InspectorOT: true,
+	})
+
+	result, err := callSkill(t, ctx, skills, "finalize_pipeline", map[string]any{
+		"summary":       "all criteria passed",
+		"evidence_refs": []string{"artifact:inspector"},
+	})
+	if err != nil {
+		t.Fatalf("finalize_pipeline: %v", err)
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("finalize_pipeline result = %#v, want map", result)
+	}
+	if resultMap["must_handoff_to_ot"] != true {
+		t.Fatalf("finalize_pipeline result = %#v, want must_handoff_to_ot=true", result)
+	}
+	if resultMap["required_next_action"] != "handoff_to_ot" {
+		t.Fatalf("finalize_pipeline result = %#v, want required_next_action=handoff_to_ot", result)
+	}
+
+	if _, err := callSkill(t, ctx, skills, "handoff_next", map[string]any{
+		"target_agents": []string{"tester"},
+		"reason":        "try another audit anyway",
+		"request":       "this should be blocked",
+	}); err == nil || !strings.Contains(err.Error(), "must invoke `handoff_to_ot` now") {
+		t.Fatalf("handoff_next error = %v, want immediate handoff_to_ot requirement", err)
+	}
+
+	if err := ValidatePipelineProtocolCompletion(ctx, PipelineAgentInspector); err == nil || !strings.Contains(err.Error(), "must invoke `handoff_to_ot` now") {
+		t.Fatalf("ValidatePipelineProtocolCompletion error = %v, want immediate handoff_to_ot requirement", err)
+	}
+
+	runSkill(t, ctx, skills, "handoff_to_ot", map[string]any{
+		"summary":       "ready for OT merge",
+		"evidence_refs": []string{"artifact:inspector", "artifact:tester"},
+	})
+
+	if err := ValidatePipelineProtocolCompletion(ctx, PipelineAgentInspector); err != nil {
+		t.Fatalf("ValidatePipelineProtocolCompletion after handoff_to_ot = %v", err)
+	}
+}
+
+func TestFinalizePipeline_ReadyAfterAcceptedProcessValidation(t *testing.T) {
+	snapshot := &PipelineProtocolSnapshot{
+		PendingValidation: &PipelineValidationRecord{
+			ChallengeID:         "challenge-ready-processed",
+			RequestingAgent:     PipelineAgentInspector,
+			RespondingAgent:     PipelineAgentTester,
+			Status:              string(PipelineValidationPassed),
+			Summary:             "tester accepted the audit",
+			ChallengeReferences: []string{finalizePipelineVerificationReference},
+			EvidenceRefs:        []string{"artifact:tester"},
+		},
+	}
+	ctx := WithPipelineProtocolState(context.Background(), NewPipelineProtocolState(snapshot))
+	ctx = WithTaskExecutionContract(ctx, &TaskExecutionContract{RuntimeAgentType: PipelineAgentInspector})
+
+	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
+		AgentType:   func() string { return PipelineAgentInspector },
+		InspectorOT: true,
+	})
+
+	runSkill(t, ctx, skills, "process_validation", map[string]any{
+		"challenge_id": "challenge-ready-processed",
+		"decision":     "accept",
+		"summary":      "accepted the passing tester audit",
+	})
+
+	state := PipelineProtocolStateFromContext(ctx)
+	if state == nil {
+		t.Fatal("pipeline protocol state missing from context")
+	}
+	processed := state.ProcessedValidations()
+	if len(processed) != 1 || processed[0].Validation == nil {
+		t.Fatalf("processed validations = %#v, want accepted validation record", processed)
+	}
+
+	result, err := callSkill(t, ctx, skills, "finalize_pipeline", map[string]any{
+		"summary":       "all criteria passed",
+		"evidence_refs": []string{"artifact:inspector"},
+	})
+	if err != nil {
+		t.Fatalf("finalize_pipeline after process_validation: %v", err)
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("finalize_pipeline result = %#v, want map", result)
+	}
+	if resultMap["ready_for_ot"] != true {
+		t.Fatalf("finalize_pipeline result = %#v, want ready_for_ot=true", result)
+	}
+	if resultMap["must_handoff_to_ot"] != true {
+		t.Fatalf("finalize_pipeline result = %#v, want must_handoff_to_ot=true", result)
+	}
+	if resultMap["required_next_action"] != "handoff_to_ot" {
+		t.Fatalf("finalize_pipeline result = %#v, want required_next_action=handoff_to_ot", result)
 	}
 }
 
@@ -1008,6 +1127,158 @@ func TestPipelineProtocolSkills_ChallengeAgentToInspectorRefusedDuringAuditLock(
 	}
 }
 
+func TestPipelineProtocolSkills_ChallengeAgentRefusesRepeatedChallengeWithoutWorkspaceChange(t *testing.T) {
+	views := stubPipelineProtocolWorkspaceViews{
+		summary: &versioning.WorkspaceSummary{
+			DefaultView:   versioning.WorkspaceViewPipeline,
+			SourceOfTruth: versioning.WorkspaceViewDisk,
+			PipelineID:    "task-repeat",
+			Paths:         []string{"src/app.go"},
+			ViewsAvailable: []versioning.WorkspaceView{
+				versioning.WorkspaceViewDisk,
+				versioning.WorkspaceViewGlobal,
+				versioning.WorkspaceViewPipeline,
+			},
+			Entries: []versioning.WorkspacePathState{
+				{
+					Path:        "src/app.go",
+					DefaultView: versioning.WorkspaceViewPipeline,
+					Disk: versioning.WorkspaceLayerState{
+						View:        versioning.WorkspaceViewDisk,
+						Available:   true,
+						Exists:      true,
+						ContentHash: "disk-hash",
+					},
+					Global: &versioning.WorkspaceLayerState{
+						View:        versioning.WorkspaceViewGlobal,
+						Available:   true,
+						Exists:      true,
+						ContentHash: "global-hash",
+					},
+					Pipeline: &versioning.WorkspaceLayerState{
+						View:        versioning.WorkspaceViewPipeline,
+						Available:   true,
+						Exists:      true,
+						ContentHash: "pipeline-hash",
+					},
+					GlobalDiffersFromDisk:       true,
+					GlobalDiffKnown:             true,
+					PipelineDiffersFromDisk:     true,
+					PipelineDiffFromDiskKnown:   true,
+					PipelineDiffersFromGlobal:   true,
+					PipelineDiffFromGlobalKnown: true,
+				},
+			},
+		},
+	}
+	baseTask := &PipelineTaskInput{
+		TaskID:    "task-repeat",
+		AgentType: PipelineAgentInspector,
+		Context: map[string]any{
+			"pipeline_stage": "inspect",
+			"affected_files": []any{"src/app.go"},
+			"workspace": map[string]any{
+				"write_set": []any{"src/app.go"},
+			},
+		},
+	}
+	fingerprint := pipelineChallengeFingerprint(resolvePipelineChallengeEvidence(
+		WithPipelineTask(context.Background(), baseTask),
+		PipelineProtocolSkillConfig{
+			WorkspaceViews: func() versioning.WorkspaceViewAccess { return views },
+		},
+	))
+	if fingerprint == "" {
+		t.Fatal("expected workspace fingerprint")
+	}
+
+	task := &PipelineTaskInput{
+		TaskID:    baseTask.TaskID,
+		AgentType: baseTask.AgentType,
+		Context: map[string]any{
+			"pipeline_stage": "inspect",
+			"affected_files": []any{"src/app.go"},
+			"workspace": map[string]any{
+				"write_set": []any{"src/app.go"},
+			},
+			"pipeline_protocol": PipelineProtocolSnapshotMap(&PipelineProtocolSnapshot{
+				Roster: []PipelineProtocolAgent{
+					{AgentType: PipelineAgentInspector},
+					{AgentType: PipelineAgentTester},
+				},
+				ActiveAgents: []string{PipelineAgentInspector},
+				RecentEvents: []PipelineProtocolEvent{
+					{
+						Type:                 string(PipelineProtocolActionHandoff),
+						AgentType:            PipelineAgentInspector,
+						Targets:              []string{PipelineAgentTester},
+						Summary:              "Audit the implementation.",
+						CreatesChallenge:     true,
+						WorkspaceFingerprint: fingerprint,
+					},
+				},
+			}),
+		},
+	}
+	ctx := WithPipelineTaskProtocolState(context.Background(), task)
+	ctx = WithTaskExecutionContract(ctx, &TaskExecutionContract{RuntimeAgentType: PipelineAgentInspector})
+
+	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
+		AgentType:      func() string { return PipelineAgentInspector },
+		WorkspaceViews: func() versioning.WorkspaceViewAccess { return views },
+	})
+
+	result, err := callSkill(t, ctx, skills, "challenge_agent", map[string]any{
+		"target_agents": []string{"tester"},
+		"reason":        "Need another audit pass.",
+		"request":       "Audit the implementation again.",
+	})
+	if err != nil {
+		t.Fatalf("challenge_agent error = %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	if resultMap == nil || resultMap["refused"] != true {
+		t.Fatalf("challenge_agent result = %#v, want refused=true", result)
+	}
+	if resultMap["refused_by"] != "pipeline-protocol" {
+		t.Fatalf("refused_by = %#v, want pipeline-protocol", resultMap["refused_by"])
+	}
+	if resultMap["must_wait"] != true {
+		t.Fatalf("must_wait = %#v, want true", resultMap["must_wait"])
+	}
+	if !strings.Contains(fmt.Sprint(resultMap["reason"]), "fresh workspace evidence") {
+		t.Fatalf("reason = %#v, want fresh workspace evidence guidance", resultMap["reason"])
+	}
+}
+
+type stubPipelineProtocolWorkspaceViews struct {
+	summary *versioning.WorkspaceSummary
+}
+
+func (s stubPipelineProtocolWorkspaceViews) ReadFile(context.Context, versioning.WorkspaceView, string, string) ([]byte, error) {
+	return nil, nil
+}
+
+func (s stubPipelineProtocolWorkspaceViews) Glob(context.Context, versioning.WorkspaceView, string, string, []string, string) ([]string, error) {
+	return nil, nil
+}
+
+func (s stubPipelineProtocolWorkspaceViews) Grep(context.Context, versioning.WorkspaceView, string, string, string, int, int, string) ([]versioning.GrepMatch, error) {
+	return nil, nil
+}
+
+func (s stubPipelineProtocolWorkspaceViews) InspectPath(context.Context, string, string) (*versioning.WorkspacePathState, error) {
+	return nil, nil
+}
+
+func (s stubPipelineProtocolWorkspaceViews) SummarizePaths(context.Context, []string, string) (*versioning.WorkspaceSummary, error) {
+	return s.summary, nil
+}
+
+func (s stubPipelineProtocolWorkspaceViews) DefaultView() versioning.WorkspaceView {
+	return versioning.WorkspaceViewPipeline
+}
+
 func TestBuildPipelineHandoffTasks_PreservesAuditLockAcrossWorkerHandoff(t *testing.T) {
 	state := NewPipelineProtocolState(&PipelineProtocolSnapshot{
 		Roster: []PipelineProtocolAgent{
@@ -1171,6 +1442,69 @@ func TestPipelineProtocolSkills_FinalizePipelineSignalsReadinessAndHandoffToOTPu
 	}
 	if output["summary"] != "Criteria satisfied and pipeline is ready for merge." {
 		t.Fatalf("output.summary = %#v", output["summary"])
+	}
+}
+
+func TestPipelineProtocolSkills_HandoffToOTPublishesTerminalUpdateWithoutBoundPipelineTask(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	updateCh := make(chan map[string]any, 1)
+	updateSub, err := bus.SubscribeAsync("pipeline.update."+PipelineAgentInspector, func(msg *guide.Message) error {
+		payload := pipelineUpdatePayloadFromMessage(msg)
+		if payload == nil {
+			return nil
+		}
+		select {
+		case updateCh <- payload:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe pipeline updates: %v", err)
+	}
+	defer updateSub.Unsubscribe()
+
+	ctx := WithPipelineProtocolState(context.Background(), NewPipelineProtocolState(&PipelineProtocolSnapshot{}))
+	ctx = WithTaskExecutionContract(ctx, &TaskExecutionContract{
+		RuntimeAgentType: PipelineAgentInspector,
+		Stage:            "inspect",
+	})
+	ctx = WithStreamContext(ctx, "corr-fallback-ot", "orchestrator")
+	ctx = WithStreamContextMetadata(ctx, map[string]any{
+		"pipeline_task": true,
+		"dag_id":        "dag-fallback",
+		"node_id":       "task-fallback",
+		"task_id":       "task-fallback",
+		"task_slug":     "fallback-task",
+		"task_name":     "Fallback Task",
+		"agent_type":    PipelineAgentInspector,
+	})
+
+	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
+		AgentType:   func() string { return PipelineAgentInspector },
+		InspectorOT: true,
+		Route: PipelineProtocolRouteConfig{
+			BusProvider: func() guide.EventBus { return bus },
+			SessionID:   func() string { return "session-fallback" },
+		},
+	})
+
+	runSkill(t, ctx, skills, "handoff_to_ot", map[string]any{
+		"summary":       "Fallback OT handoff should still publish the terminal update.",
+		"evidence_refs": []string{"artifact:fallback"},
+	})
+
+	update := waitForPipelineUpdate(t, updateCh)
+	if update["status"] != "succeeded" {
+		t.Fatalf("status = %#v, want succeeded", update["status"])
+	}
+	if update["task_id"] != "task-fallback" {
+		t.Fatalf("task_id = %#v, want task-fallback", update["task_id"])
+	}
+	if update["message"] != "Fallback OT handoff should still publish the terminal update." {
+		t.Fatalf("message = %#v", update["message"])
 	}
 }
 

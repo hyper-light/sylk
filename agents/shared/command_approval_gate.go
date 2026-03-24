@@ -13,8 +13,6 @@ import (
 	"github.com/google/uuid"
 )
 
-const defaultCommandApprovalTimeout = 2 * time.Minute
-
 type GuardianCommandGateConfig struct {
 	BusProvider            func() guide.EventBus
 	SourceAgentID          func() string
@@ -112,24 +110,11 @@ func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval
 		return commandapproval.Evaluation{}, fmt.Errorf("publish command approval request: %w", err)
 	}
 
-	timeout := g.cfg.ApprovalRequestTimeout
-	if timeout <= 0 {
-		timeout = defaultCommandApprovalTimeout
-	}
 	var msg *guide.Message
-	err = RunWithContextLease(ctx, ContextLeaseConfig{
-		AttemptTimeout: timeout,
-		MaxRefreshes:   DefaultConsultationLeaseRefreshes,
-	}, func(waitCtx context.Context) error {
-		select {
-		case msg = <-waitCh:
-			return nil
-		case <-waitCtx.Done():
-			return waitCtx.Err()
-		}
-	})
-	if err != nil {
-		return commandapproval.Evaluation{}, WrapLeaseTimeoutError("command approval", timeout, err)
+	select {
+	case msg = <-waitCh:
+	case <-ctx.Done():
+		return commandapproval.Evaluation{}, ctx.Err()
 	}
 	return decodeCommandApprovalMessage(msg)
 }
@@ -164,7 +149,7 @@ func decodeCommandApprovalMessage(msg *guide.Message) (commandapproval.Evaluatio
 func decodeCommandApprovalEvaluation(data any) (commandapproval.Evaluation, error) {
 	if typed, ok := data.(commandapproval.Evaluation); ok {
 		if typed.Decision == commandapproval.DecisionDeny {
-			return typed, fmt.Errorf("%s", strings.TrimSpace(typed.Reason))
+			return typed, fmt.Errorf("%w: %s", commandapproval.ErrApprovalDenied, strings.TrimSpace(typed.Reason))
 		}
 		return typed, nil
 	}
@@ -177,7 +162,7 @@ func decodeCommandApprovalEvaluation(data any) (commandapproval.Evaluation, erro
 		return commandapproval.Evaluation{}, fmt.Errorf("decode command approval response: %w", err)
 	}
 	if eval.Decision == commandapproval.DecisionDeny {
-		return eval, fmt.Errorf("%s", strings.TrimSpace(eval.Reason))
+		return eval, fmt.Errorf("%w: %s", commandapproval.ErrApprovalDenied, strings.TrimSpace(eval.Reason))
 	}
 	return eval, nil
 }

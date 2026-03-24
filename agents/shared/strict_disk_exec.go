@@ -54,14 +54,16 @@ func CommandUnavailable(err error) bool {
 }
 
 func authorizeStrictDiskCommand(ctx context.Context, cfg StrictDiskExecConfig, binary string, args []string) error {
-	_, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), commandapproval.Request{
+	authReq := commandapproval.Request{
 		Command:       strings.Join(append([]string{binary}, args...), " "),
 		WorkingDir:    cfg.WorkingDir,
 		WorkspaceRoot: cfg.WorkingDir,
 		ToolName:      binary,
 		AgentID:       cfg.AgentID,
 		AgentType:     cfg.AgentType,
-	})
+	}
+	PopulateCommandApprovalScope(ctx, &authReq)
+	_, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq)
 	return err
 }
 
