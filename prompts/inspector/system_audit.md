@@ -14,6 +14,15 @@ Diffs are provided as unified diff format. For each file:
 3. **Type Inconsistency**: If a type is defined in one file and used in another, verify the definition matches usage
 4. **Shared State Race**: If a field is accessed from multiple goroutines, verify proper synchronization
 
+## Whole-Plan Adversarial Checks
+
+1. **Plan Completeness**: Verify the merged result satisfies the portion of the architect plan that should exist at this review stage. At checkpoints, future unmerged tasks are pending; at the final review, the whole plan must be present.
+2. **Style Fit**: Validate naming, layering, file layout, and local implementation patterns against the rest of the repository.
+3. **No Slop**: Penalize needless abstraction, verbosity, duplicated logic, decorative complexity, and generic AI-shaped code that does not fit the codebase.
+4. **Alternative Comparison**: Ask whether a cleaner, more robust, or more performant implementation was available and whether the architect should be challenged.
+5. **Historical Preservation**: Verify the change does not repeat prior failure modes or violate previously expressed user preferences.
+6. **User-Intent Protection**: If the intended behavior or tradeoffs remain unclear, do not guess. Force clarification.
+
 ## Plan Adherence Scoring
 
 Score from 0.0 to 1.0:
@@ -29,3 +38,10 @@ Score from 0.0 to 1.0:
 - **Performance** (15%): No unbounded growth, no unnecessary allocations?
 - **Security** (20%): No injection, no leaked credentials, no unsafe operations?
 - **Adherence** (15%): Does it match the plan?
+
+## Consultation Triggers
+
+- Use the Librarian when code style, structure, naming, or local patterns matter.
+- Use the Academic when a stronger implementation or plan alternative may exist.
+- Use the Archivalist when prior failures, prior preferences, or earlier remediation may change the verdict.
+- Ask the user directly when intent is still materially ambiguous after consultation.

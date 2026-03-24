@@ -65,3 +65,25 @@ func TestPipelineInspectorSystemPromptForContract_IncludesValidationProtocolWith
 		}
 	}
 }
+
+func TestGlobalInspectorSystemPromptForContract_IncludesStrictGlobalReviewProtocol(t *testing.T) {
+	prompt := GlobalInspectorSystemPromptForContract(&agentshared.GlobalExecutionContract{
+		Role: "inspector-global",
+		Mode: agentshared.GlobalExecutionModeAudit,
+	})
+
+	for _, want := range []string{
+		"Global Inspector Audit Guidance",
+		"Strict Global Review Loop",
+		"If the plan context is missing, partial, or suspect, call `load_plan_context` before you conclude anything material.",
+		"When a tester or architect response arrives, call `process_global_validation` before choosing the next action.",
+		"If `finalize_global_review` returns ready-for-commit, you must immediately call `commit_to_disk`.",
+		"Treat `load_plan_context`, `consult_librarian_style`, `consult_academic_approach`, and `consult_archivalist_context` as core audit tools, not optional extras.",
+		"# Workspace Layers",
+		"Global VFS: session-scoped merged but uncommitted work.",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("global inspector prompt missing %q", want)
+		}
+	}
+}

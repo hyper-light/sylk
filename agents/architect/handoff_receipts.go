@@ -346,29 +346,23 @@ func (a *Architect) promotePlanExecutingFromReceipt(
 	if !canApplyPlanHandoffReceipt(a, plan, receipt) {
 		return
 	}
-	if err := a.transitionPlanToExecutingFromReceipt(plan, receipt, correlationID); err != nil {
+	message := firstNonEmpty(pendingMessageForExecutingReceipt(receipt), "Plan dispatched to the orchestrator.")
+	if err := a.finalizePlanHandoffExecution(
+		plan,
+		nil,
+		correlationID,
+		marshalReceiptJSON(receipt),
+		message,
+		"",
+		"promoted from durable handoff receipt",
+	); err != nil {
 		a.logPlanHandoffReceiptTransitionFailure(plan, receipt, correlationID, err)
 		return
 	}
-	plan.Status = plan.SM().State()
-	plan.Epoch = plan.SM().Epoch()
-	plan.PendingWork = nil
-	plan.UpdatedAt = time.Now().UTC()
-	a.grantPlanExecutingLease(plan)
-	a.persistPlanStateBestEffort(plan, correlationID, "promoted from durable handoff receipt")
-	a.completeContinuationByCorrelationBestEffort(
-		correlationID,
-		plan.SessionID,
-		continuationStatusCompleted,
-		marshalReceiptJSON(receipt),
-		"",
-		"durable handoff receipt reached execution",
-	)
 }
 
-func (a *Architect) transitionPlanToExecutingFromReceipt(
+func (a *Architect) transitionPlanToExecutingFromHandoff(
 	plan *DesignPlan,
-	receipt *agentshared.PlanHandoffReceipt,
 	correlationID string,
 ) error {
 	state := plan.SM().State()
@@ -413,6 +407,69 @@ func marshalReceiptJSON(receipt *agentshared.PlanHandoffReceipt) string {
 	return string(responseJSON)
 }
 
+type continuationCompletionOutcome struct {
+	found     bool
+	completed bool
+}
+
+func (a *Architect) finalizePlanHandoffExecution(
+	plan *DesignPlan,
+	record *ArchitectContinuation,
+	correlationID string,
+	responseJSON string,
+	notification string,
+	riskSummary string,
+	persistReason string,
+) error {
+	if a == nil || plan == nil {
+		return nil
+	}
+	if err := a.transitionPlanToExecutingFromHandoff(plan, correlationID); err != nil {
+		return err
+	}
+	plan.Status = plan.SM().State()
+	plan.Epoch = plan.SM().Epoch()
+	plan.PendingWork = nil
+	plan.UpdatedAt = time.Now().UTC()
+	if summary := strings.TrimSpace(riskSummary); summary != "" {
+		plan.RiskSummary = append(plan.RiskSummary, summary)
+	}
+	a.grantPlanExecutingLease(plan)
+	if err := a.persistPlanState(plan); err != nil {
+		return err
+	}
+	outcome, err := a.completePlanHandoffContinuation(record, correlationID, plan.SessionID, responseJSON)
+	if err != nil {
+		return err
+	}
+	if outcome.completed || !outcome.found {
+		a.publishNotificationPush(notification)
+	}
+	return nil
+}
+
+func (a *Architect) completePlanHandoffContinuation(
+	record *ArchitectContinuation,
+	correlationID, sessionID string,
+	responseJSON string,
+) (continuationCompletionOutcome, error) {
+	if record != nil {
+		completed, err := a.controlStore.CompleteContinuationIfActive(record, continuationStatusCompleted, responseJSON, "")
+		if err != nil {
+			return continuationCompletionOutcome{found: true}, err
+		}
+		return continuationCompletionOutcome{found: true, completed: completed}, nil
+	}
+	return a.completeContinuationByCorrelation(
+		correlationID,
+		sessionID,
+		continuationStatusCompleted,
+		responseJSON,
+		"",
+		"plan handoff reached execution",
+	)
+}
+
 func pendingMessageForReceipt(receipt *agentshared.PlanHandoffReceipt) string {
 	if receipt == nil {
 		return "That plan is already being handed off to the orchestrator. I'll update you when it confirms ingestion."
@@ -434,21 +491,38 @@ func (a *Architect) completeContinuationByCorrelationBestEffort(
 	errorText string,
 	reason string,
 ) {
-	if !canCompleteContinuationByCorrelation(a, correlationID) {
+	_, err := a.completeContinuationByCorrelation(correlationID, sessionID, state, responseJSON, errorText, reason)
+	if err == nil {
 		return
+	}
+	a.logTrace("architect_continuation_lookup_failed", "error", sessionID, correlationID, agentlog.EventError, map[string]any{
+		"reason": reason,
+		"error":  err.Error(),
+	})
+}
+
+func (a *Architect) completeContinuationByCorrelation(
+	correlationID, sessionID string,
+	state continuationStatus,
+	responseJSON string,
+	errorText string,
+	reason string,
+) (continuationCompletionOutcome, error) {
+	if !canCompleteContinuationByCorrelation(a, correlationID) {
+		return continuationCompletionOutcome{}, nil
 	}
 	record, err := a.lookupContinuationByCorrelation(correlationID)
 	if err != nil {
-		a.logTrace("architect_continuation_lookup_failed", "error", sessionID, correlationID, agentlog.EventError, map[string]any{
-			"reason": reason,
-			"error":  err.Error(),
-		})
-		return
+		return continuationCompletionOutcome{}, err
 	}
 	if record == nil {
-		return
+		return continuationCompletionOutcome{}, nil
 	}
-	a.completeContinuationBestEffort(record, state, responseJSON, errorText, reason)
+	completed, err := a.controlStore.CompleteContinuationIfActive(record, state, responseJSON, errorText)
+	if err != nil {
+		return continuationCompletionOutcome{found: true}, err
+	}
+	return continuationCompletionOutcome{found: true, completed: completed}, nil
 }
 
 func canCompleteContinuationByCorrelation(a *Architect, correlationID string) bool {
@@ -522,7 +596,10 @@ func (a *Architect) recordPlanHandoffReceiptUpdateEvent(
 	if !canRecordPlanHandoffReceiptUpdateEvent(a, correlationID, update) {
 		return
 	}
-	record := a.planHandoffReceiptContinuation(correlationID)
+	record, err := a.lookupContinuationByCorrelation(correlationID)
+	if err != nil {
+		return
+	}
 	if record == nil {
 		return
 	}
@@ -575,7 +652,6 @@ func (a *Architect) applyFoundPlanHandoffReceiptUpdate(
 	}
 	if isExecutingPlanHandoffReceiptStatus(update.Receipt.Status) {
 		a.promotePlanExecutingFromReceipt(plan, update.Receipt, correlationID)
-		a.publishNotificationPush(firstNonEmpty(pendingMessageForExecutingReceipt(update.Receipt), "Plan dispatched to the orchestrator."))
 		return
 	}
 	if update.Receipt.Status == agentshared.PlanHandoffReceiptStatusFailed {
@@ -612,14 +688,6 @@ func canRecordPlanHandoffReceiptUpdateEvent(
 		return false
 	}
 	return correlationID != ""
-}
-
-func (a *Architect) planHandoffReceiptContinuation(correlationID string) *ArchitectContinuation {
-	record, err := a.controlStore.GetContinuationByResponseCorrelation(correlationID)
-	if err != nil {
-		return nil
-	}
-	return record
 }
 
 func receiptStatusFromReceiptUpdate(update *agentshared.PlanHandoffReceiptUpdate) string {

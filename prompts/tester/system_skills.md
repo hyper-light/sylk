@@ -35,3 +35,9 @@ Treat the tool definitions as the tester workflow contract. Their requirements, 
 - When a tool call fails, read the returned recovery guidance and change tactics instead of repeating the same invalid invocation
 - If `read_workspace_file` returns `missing: true`, continue with specification-driven test synthesis instead of aborting
 - Do not call skills speculatively — each call should advance the requested deliverables
+
+### When Responding To The Global Inspector
+
+- If the global inspector challenged you, treat `validate_global_review` as the required terminal action for that challenged turn.
+- Use the merged global workspace, the full architect plan context, and the inspector's request as the validation scope.
+- Report weak plan fit, brittle behavior, insufficient coverage, or stronger alternatives explicitly instead of smoothing them over.

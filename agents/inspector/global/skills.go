@@ -63,6 +63,16 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(requestArchitectResearchSkill(gi))
 	gi.skills.Register(requestUserClarificationSkill(gi))
 	gi.skills.Register(escalateFindingsSkill(gi))
+	for _, skill := range agentShared.NewGlobalReviewProtocolSkills(agentShared.GlobalReviewProtocolSkillConfig{
+		AgentType:      func() string { return "inspector" },
+		WorkspaceViews: func() versioning.WorkspaceViewAccess { return gi.workspaceViews },
+		Route: agentShared.GlobalReviewRouteConfig{
+			BusProvider: func() guide.EventBus { return gi.bus },
+			SessionID:   func() string { return gi.config.SessionID },
+		},
+	}) {
+		gi.skills.Register(skill)
+	}
 	gi.skills.Register(researchDependencyInstallSkill(gi))
 	gi.skills.Register(installDependencyToolingSkill(gi))
 

@@ -1180,6 +1180,9 @@ func (p *Panel) renderAPIKeyBody(innerW int, cursorVisible bool) []string {
 func renderWithCursor(display string, cursorPos, inputLen, maxW int, showCursor bool, cursorStyle lipgloss.Style) string {
 	runes := []rune(display)
 	n := len(runes)
+	if maxW < 1 {
+		maxW = 1
+	}
 
 	// Map cursor position proportionally when display is shorter than input
 	// (masked text compresses internal chars to dots).
@@ -1189,11 +1192,14 @@ func renderWithCursor(display string, cursorPos, inputLen, maxW int, showCursor 
 	}
 	displayPos = min(displayPos, n)
 
-	// Clamp to maxW.
+	// Keep a horizontal viewport anchored to the cursor when focused so callers
+	// can navigate long tokens without losing off-screen text.
 	if n > maxW {
-		runes = runes[:maxW]
-		n = maxW
-		displayPos = min(displayPos, n)
+		start := min(max(displayPos-maxW+1, 0), max(n-maxW, 0))
+		end := min(start+maxW, n)
+		runes = runes[start:end]
+		n = len(runes)
+		displayPos = min(max(displayPos-start, 0), n)
 	}
 
 	if !showCursor {
@@ -1252,19 +1258,19 @@ func (p *Panel) renderCopyIcon() string {
 	}
 }
 
-// renderCopyURLBtn renders the standalone [copy] button for the OAuth URL row.
+// renderCopyURLBtn renders the inline [copy] button for the OAuth URL row.
 func (p *Panel) renderCopyURLBtn() string {
 	pal := p.th.Palette
 	switch {
 	case p.btnFocus == focusCopyURL:
 		return lipgloss.NewStyle().Bold(true).Foreground(pal.Primary).
-			Render(copyIcon)
+			Render(" " + copyIcon)
 	case p.copyURLHover:
 		return lipgloss.NewStyle().Foreground(pal.Secondary).
-			Render(copyIcon)
+			Render(" " + copyIcon)
 	default:
 		return lipgloss.NewStyle().Foreground(pal.Muted).
-			Render(copyIcon)
+			Render(" " + copyIcon)
 	}
 }
 
@@ -1276,10 +1282,12 @@ func (p *Panel) hitTestDeviceCodeCopy(x int) bool {
 	return x >= copyStart && x < copyStart+copyIconWidth
 }
 
-// hitTestCopyURL reports whether x hits the [copy] button on the OAuth URL copy row.
+// hitTestCopyURL reports whether x hits the inline [copy] button on the OAuth URL row.
 func (p *Panel) hitTestCopyURL(x int) bool {
-	// Layout: pad(1) + "[copy]"(6).
-	return x >= 1 && x < 1+len(copyIcon)
+	fieldW := p.inputFieldWidth()
+	textW := max(fieldW-copyIconWidth, 10)
+	copyStart := 1 + textW
+	return x >= copyStart && x < copyStart+copyIconWidth
 }
 
 // doCopyDeviceCode writes the device code to the system clipboard.
@@ -1334,14 +1342,20 @@ func (p *Panel) renderOAuthBody(innerW int, cursorVisible bool) []string {
 	lines = append(lines, "")
 	lines = append(lines, statusLine)
 
-	// OAuth URL on its own wrapped line(s) with a copy button below.
+	// OAuth URL on a single fixed-width row with an inline copy button. Keep the
+	// URL contiguous and clipped rather than inserting newlines.
 	if p.oauthURL != "" {
+		fieldW := min(innerW-1, 60)
+		textW := max(fieldW-copyIconWidth, 10)
+		urlBox := lipgloss.NewStyle().
+			Width(textW).
+			MaxWidth(textW).
+			Render(truncate(p.oauthURL, textW))
+		compositeLine := pad + urlBox + p.renderCopyURLBtn()
+
 		lines = append(lines, "")
-		maxURLWidth := max(innerW*3/4, 20)
-		wrappedURL := wrapURL(p.oauthURL, maxURLWidth)
-		lines = append(lines, pad+infoStyle.Render(wrappedURL))
 		p.copyURLRowY = 2 + bodyVisibleRows(lines)
-		lines = append(lines, pad+p.renderCopyURLBtn())
+		lines = append(lines, infoStyle.Render(compositeLine))
 	}
 
 	// Device code line with clickable copy icon.
@@ -1436,21 +1450,4 @@ func truncate(s string, maxLen int) string {
 		runes = runes[:maxLen-1]
 	}
 	return string(runes) + "…"
-}
-
-// wrapURL character-wraps a URL to maxWidth. OAuth URLs have no word boundaries,
-// so simple rune-based splitting is the only sensible strategy.
-func wrapURL(rawURL string, maxWidth int) string {
-	runes := []rune(rawURL)
-	if len(runes) <= maxWidth {
-		return rawURL
-	}
-	var b strings.Builder
-	for i, r := range runes {
-		if i > 0 && i%maxWidth == 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
 }

@@ -330,7 +330,10 @@ func (s *anthropicAuthService) BeginAuth(ctx context.Context) (*AnthropicOAuthCh
 	if err != nil {
 		return nil, err
 	}
-	state := codeVerifier
+	state, err := randomOAuthString(32)
+	if err != nil {
+		return nil, fmt.Errorf("generate anthropic oauth state: %w", err)
+	}
 	redirectURL := anthropicRedirectURL()
 	authURL := s.authorizationURL(state, redirectURL, codeChallenge)
 	return &AnthropicOAuthChallenge{

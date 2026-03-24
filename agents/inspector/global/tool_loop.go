@@ -89,6 +89,20 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		agentShared.PublishIntermediateToolTurn(gi.bus, gi.channels, ctx, gi.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
+			if err := agentShared.ValidateGlobalReviewCompletion(ctx, "inspector"); err != nil {
+				gi.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: err.Error() +
+						"\nUse the strict global review protocol now. If a validation response arrived, call process_global_validation before deciding whether to challenge the tester, challenge the architect, finalize the review, or commit to disk.",
+				})
+				continue
+			}
 			gi.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventAuditCompleted,
@@ -113,6 +127,9 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 
 		errCount, rerouted := gi.applyToolCalls(ctx, req, resp)
 		gi.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		if agentShared.GlobalReviewTurnTerminated(ctx) {
+			return "", nil
+		}
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}

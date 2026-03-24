@@ -393,8 +393,27 @@ func (s *ArchitectControlStore) CompleteContinuation(
 	responseJSON string,
 	errText string,
 ) error {
+	_, err := s.completeContinuation(record, state, responseJSON, errText)
+	return err
+}
+
+func (s *ArchitectControlStore) CompleteContinuationIfActive(
+	record *ArchitectContinuation,
+	state continuationStatus,
+	responseJSON string,
+	errText string,
+) (bool, error) {
+	return s.completeContinuation(record, state, responseJSON, errText)
+}
+
+func (s *ArchitectControlStore) completeContinuation(
+	record *ArchitectContinuation,
+	state continuationStatus,
+	responseJSON string,
+	errText string,
+) (bool, error) {
 	if s == nil || s.db == nil || record == nil {
-		return nil
+		return false, nil
 	}
 
 	record.State = state
@@ -408,6 +427,7 @@ func (s *ArchitectControlStore) CompleteContinuation(
 	}
 	event := newArchitectContinuationEventRow(record.ID, string(state), note, responseJSON)
 
+	updated := false
 	if err := s.db.RunInWriteTx(context.Background(), func(ctx context.Context, tx bun.Tx) error {
 		res, err := tx.NewUpdate().
 			Model((*architectContinuationRow)(nil)).
@@ -429,12 +449,13 @@ func (s *ArchitectControlStore) CompleteContinuation(
 		if rowsAffected == 0 {
 			return nil
 		}
+		updated = true
 		return insertContinuationEvent(ctx, tx, event)
 	}); err != nil {
-		return fmt.Errorf("architect control store: complete continuation: %w", err)
+		return false, fmt.Errorf("architect control store: complete continuation: %w", err)
 	}
 
-	return nil
+	return updated, nil
 }
 
 func (s *ArchitectControlStore) appendContinuationEvent(

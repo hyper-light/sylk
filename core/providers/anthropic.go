@@ -57,10 +57,13 @@ type AnthropicProvider struct {
 type AnthropicModel string
 
 const (
-	Opus46            AnthropicModel = "claude-opus-4-6"
-	SonnetLongContext AnthropicModel = "claude-sonnet-4-6"
-	Haiku             AnthropicModel = "claude-haiku-4-5-20251001"
-	minAnthropicThinkingBudget   = 1024
+	Opus46                       AnthropicModel = "claude-opus-4-6"
+	SonnetLongContext            AnthropicModel = "claude-sonnet-4-6"
+	Haiku                        AnthropicModel = "claude-haiku-4-5-20251001"
+	minAnthropicThinkingBudget                  = 1024
+	anthropicOAuthToolPrefix                    = "mcp_"
+	anthropicOAuthSystemShim                    = "You are Claude Code, Anthropic's official CLI for Claude."
+	anthropicOAuthSystemBoundary                = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 )
 
 // Supported Anthropic models
@@ -211,6 +214,50 @@ func validateAnthropicOAuthConfig(config *AnthropicConfig) error {
 	return nil
 }
 
+func (p *AnthropicProvider) usesAnthropicOAuth() bool {
+	return strings.TrimSpace(p.config.AuthMode) == AnthropicAuthModeOAuth
+}
+
+func (p *AnthropicProvider) anthropicRequestOptions() []option.RequestOption {
+	if !p.usesAnthropicOAuth() {
+		return nil
+	}
+	return []option.RequestOption{option.WithQuery("beta", "true")}
+}
+
+func anthropicOAuthWireToolName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, anthropicOAuthToolPrefix) {
+		return trimmed
+	}
+	return anthropicOAuthToolPrefix + trimmed
+}
+
+func anthropicOAuthCanonicalToolName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return ""
+	}
+	return strings.TrimPrefix(trimmed, anthropicOAuthToolPrefix)
+}
+
+func (p *AnthropicProvider) outboundAnthropicToolName(name string) string {
+	if p.usesAnthropicOAuth() {
+		return anthropicOAuthWireToolName(name)
+	}
+	return name
+}
+
+func (p *AnthropicProvider) inboundAnthropicToolName(name string) string {
+	if p.usesAnthropicOAuth() {
+		return anthropicOAuthCanonicalToolName(name)
+	}
+	return name
+}
+
 func buildAnthropicClientOptions(config AnthropicConfig) []option.RequestOption {
 	opts := []option.RequestOption{
 		buildAnthropicAuthOption(config),
@@ -227,7 +274,11 @@ func buildAnthropicClientOptions(config AnthropicConfig) []option.RequestOption 
 		"claude-code-20250219",
 	}
 	if strings.TrimSpace(config.AuthMode) == AnthropicAuthModeOAuth {
-		betaOpts = append(betaOpts, "oauth-2025-04-20")
+		betaOpts = []string{
+			"oauth-2025-04-20",
+			string(anthropic.AnthropicBetaInterleavedThinking2025_05_14),
+			"fine-grained-tool-streaming-2025-05-14",
+		}
 		opts = append(opts, option.WithHeader("User-Agent", "claude-cli/2.1.2 (external, cli)"))
 	}
 	if isAnthropicLongContextModel(config.Model) {
@@ -417,7 +468,7 @@ func (p *AnthropicProvider) generateWithRetry(ctx context.Context, req *Request)
 
 func (p *AnthropicProvider) generateOnce(ctx context.Context, req *Request) (*Response, error) {
 	params := p.buildParams(req)
-	msg, err := p.getClient().Messages.New(ctx, params)
+	msg, err := p.getClient().Messages.New(ctx, params, p.anthropicRequestOptions()...)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic generate: %w", err)
 	}
@@ -463,7 +514,7 @@ func (p *AnthropicProvider) streamWithHandlerOnce(ctx context.Context, req *Requ
 		"param_model", string(params.Model),
 		"param_tools_count", len(params.Tools))
 
-	stream := p.getClient().Messages.NewStreaming(ctx, params)
+	stream := p.getClient().Messages.NewStreaming(ctx, params, p.anthropicRequestOptions()...)
 	defer stream.Close()
 
 	streamStart := time.Now()
@@ -568,7 +619,7 @@ func (p *AnthropicProvider) streamWithHandlerOnce(ctx context.Context, req *Requ
 		"tool_calls_seen", len(toolCallIDForIndex))
 
 	var providerData map[string]any
-	if raw := contentBlockTracker.build(); len(raw) > 0 {
+	if raw := contentBlockTracker.build(p.inboundAnthropicToolName); len(raw) > 0 {
 		providerData = map[string]any{anthropicRawContentKey: raw}
 	}
 
@@ -666,18 +717,15 @@ func (p *AnthropicProvider) buildParams(req *Request) anthropic.MessageNewParams
 		// XML tool-call markup as text instead.
 		systemPrompt = systemPrompt + "\n" + skills.ToPrompt(p.skills)
 	}
-
 	params := anthropic.MessageNewParams{
 		Model:     anthropic.Model(model),
 		MaxTokens: int64(maxTokens),
-		System: []anthropic.TextBlockParam{
-			{Text: systemPrompt},
-		},
-		Messages: p.convertMessages(req.Messages, p.requestUsesPromptCache(req)),
-		Tools:    p.convertTools(req.Tools, p.requestUsesPromptCache(req)),
+		System:    p.oauthSystemBlocks(systemPrompt),
+		Messages:  p.convertMessages(req.Messages, p.requestUsesPromptCache(req)),
+		Tools:     p.convertTools(req.Tools, p.requestUsesPromptCache(req)),
 	}
 
-	applyAnthropicToolChoice(&params, req.ToolChoice, req.DisableParallelToolUse)
+	applyAnthropicToolChoice(&params, req.ToolChoice, req.DisableParallelToolUse, p.outboundAnthropicToolName)
 
 	params.Thinking = p.resolveThinkingConfig(req.ThinkingBudget, maxTokens)
 	thinkingEnabled := isAnthropicThinkingEnabled(params.Thinking)
@@ -725,7 +773,12 @@ func (p *AnthropicProvider) buildParams(req *Request) anthropic.MessageNewParams
 // the Anthropic SDK's ToolChoiceUnionParam. Only applied when tools are present.
 // When disableParallel is true, the DisableParallelToolUse flag is set on the
 // chosen variant (auto, any, or tool).
-func applyAnthropicToolChoice(params *anthropic.MessageNewParams, choice string, disableParallel bool) {
+func applyAnthropicToolChoice(
+	params *anthropic.MessageNewParams,
+	choice string,
+	disableParallel bool,
+	toolNameTransform func(string) string,
+) {
 	if len(params.Tools) == 0 {
 		return
 	}
@@ -751,6 +804,9 @@ func applyAnthropicToolChoice(params *anthropic.MessageNewParams, choice string,
 		// Empty string — let the API default.
 	default:
 		// Treat any other value as a specific tool name.
+		if toolNameTransform != nil {
+			normalized = toolNameTransform(normalized)
+		}
 		tc := anthropic.ToolChoiceParamOfTool(normalized)
 		if disableParallel {
 			tc.OfTool.DisableParallelToolUse = anthropic.Bool(true)
@@ -766,6 +822,37 @@ func resolveSystemPrompt(requestPrompt string, configPrompt string) string {
 		return trimmed
 	}
 	return configPrompt
+}
+
+func (p *AnthropicProvider) oauthSystemBlocks(systemPrompt string) []anthropic.TextBlockParam {
+	if !p.usesAnthropicOAuth() {
+		return []anthropic.TextBlockParam{{Text: systemPrompt}}
+	}
+	blocks := []anthropic.TextBlockParam{{Text: anthropicOAuthSystemShim}}
+	dynamic := oauthSystemDynamicPrompt(systemPrompt)
+	if dynamic == "" {
+		return blocks
+	}
+	return append(blocks,
+		anthropic.TextBlockParam{Text: anthropicOAuthSystemBoundary},
+		anthropic.TextBlockParam{Text: dynamic},
+	)
+}
+
+func oauthSystemDynamicPrompt(systemPrompt string) string {
+	sanitized := strings.ReplaceAll(systemPrompt, "OpenCode", "Claude Code")
+	sanitized = strings.ReplaceAll(sanitized, "opencode", "claude code")
+	trimmed := strings.TrimSpace(sanitized)
+	if trimmed == "" {
+		return ""
+	}
+	if trimmed == anthropicOAuthSystemShim {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, anthropicOAuthSystemShim) {
+		return strings.TrimSpace(strings.TrimPrefix(trimmed, anthropicOAuthSystemShim))
+	}
+	return trimmed
 }
 
 // resolveThinkingConfig returns the thinking configuration for a request.
@@ -879,7 +966,7 @@ func (p *AnthropicProvider) convertMessages(messages []Message, usePromptCache b
 				if blocks := decodeAnthropicBlocks(v); len(blocks) > 0 {
 					params := make([]anthropic.ContentBlockParamUnion, len(blocks))
 					for i := range blocks {
-						params[i] = blocks[i].toParam()
+						params[i] = p.anthropicContentBlockToParam(&blocks[i])
 					}
 					result = append(result, anthropic.NewAssistantMessage(params...))
 					continue
@@ -894,7 +981,7 @@ func (p *AnthropicProvider) convertMessages(messages []Message, usePromptCache b
 					blocks = append(blocks, anthropic.ContentBlockParamUnion{
 						OfToolUse: &anthropic.ToolUseBlockParam{
 							ID:    normalizeToolCallID(tc.ID),
-							Name:  tc.Name,
+							Name:  p.outboundAnthropicToolName(tc.Name),
 							Input: json.RawMessage(tc.Arguments),
 						},
 					})
@@ -998,7 +1085,7 @@ func (p *AnthropicProvider) convertTools(tools []Tool, usePromptCache bool) []an
 			result = append(result, p.anthropicWebSearchTool(tool, lastTool))
 		default:
 			tp := &anthropic.ToolParam{
-				Name:        tool.Name,
+				Name:        p.outboundAnthropicToolName(tool.Name),
 				Description: anthropic.String(tool.Description),
 				InputSchema: buildAnthropicSchema(tool.Parameters),
 			}
@@ -1099,14 +1186,14 @@ func (p *AnthropicProvider) convertResponse(msg *anthropic.Message) *Response {
 			args, _ := b.Input.MarshalJSON()
 			toolCalls = append(toolCalls, ToolCall{
 				ID:        b.ID,
-				Name:      b.Name,
+				Name:      p.inboundAnthropicToolName(b.Name),
 				Arguments: string(args),
 			})
 		}
 	}
 
 	meta := map[string]any{"id": msg.ID}
-	if raw := extractAnthropicRawContent(msg); len(raw) > 0 {
+	if raw := extractAnthropicRawContent(msg, p.inboundAnthropicToolName); len(raw) > 0 {
 		meta[anthropicRawContentKey] = raw
 	}
 
@@ -1176,7 +1263,7 @@ func (p *AnthropicProvider) convertStreamEvent(event anthropic.MessageStreamEven
 				Type:  ChunkTypeToolStart,
 				ToolCall: &ToolCallChunk{
 					ID:   tb.ID,
-					Name: tb.Name,
+					Name: p.inboundAnthropicToolName(tb.Name),
 				},
 				Timestamp: time.Now(),
 			}
@@ -1223,18 +1310,23 @@ type anthropicContentBlock struct {
 	ToolInput string `json:"input,omitempty"`     // tool_use blocks (raw JSON string)
 }
 
-// toParam converts a serializable content block back into the SDK param type.
-func (b *anthropicContentBlock) toParam() anthropic.ContentBlockParamUnion {
+// anthropicContentBlockToParam converts a serializable content block back into
+// the SDK param type, applying any OAuth wire-format tool name transforms.
+func (p *AnthropicProvider) anthropicContentBlockToParam(b *anthropicContentBlock) anthropic.ContentBlockParamUnion {
 	switch b.Type {
 	case "thinking":
 		return anthropic.NewThinkingBlock(b.Signature, b.Thinking)
 	case "redacted_thinking":
 		return anthropic.NewRedactedThinkingBlock(b.Data)
 	case "tool_use":
+		toolName := b.ToolName
+		if p != nil {
+			toolName = p.outboundAnthropicToolName(toolName)
+		}
 		return anthropic.ContentBlockParamUnion{
 			OfToolUse: &anthropic.ToolUseBlockParam{
 				ID:    b.ToolID,
-				Name:  b.ToolName,
+				Name:  toolName,
 				Input: json.RawMessage(b.ToolInput),
 			},
 		}
@@ -1281,19 +1373,19 @@ func (t *contentBlockTracker) observe(event anthropic.MessageStreamEventUnion) {
 
 // build converts the accumulated content blocks into serializable form.
 // Returns nil when there are no content blocks.
-func (t *contentBlockTracker) build() []anthropicContentBlock {
-	return contentBlocksFromSDK(t.msg.Content)
+func (t *contentBlockTracker) build(toolNameTransform func(string) string) []anthropicContentBlock {
+	return contentBlocksFromSDK(t.msg.Content, toolNameTransform)
 }
 
 // extractAnthropicRawContent converts an Anthropic Message's content blocks
 // into serializable form for multi-turn replay. Used by the non-streaming path.
-func extractAnthropicRawContent(msg *anthropic.Message) []anthropicContentBlock {
-	return contentBlocksFromSDK(msg.Content)
+func extractAnthropicRawContent(msg *anthropic.Message, toolNameTransform func(string) string) []anthropicContentBlock {
+	return contentBlocksFromSDK(msg.Content, toolNameTransform)
 }
 
 // contentBlocksFromSDK converts SDK content block unions into the serializable
 // representation. Preserves block order for faithful multi-turn replay.
-func contentBlocksFromSDK(content []anthropic.ContentBlockUnion) []anthropicContentBlock {
+func contentBlocksFromSDK(content []anthropic.ContentBlockUnion, toolNameTransform func(string) string) []anthropicContentBlock {
 	if len(content) == 0 {
 		return nil
 	}
@@ -1318,10 +1410,14 @@ func contentBlocksFromSDK(content []anthropic.ContentBlockUnion) []anthropicCont
 			})
 		case anthropic.ToolUseBlock:
 			args, _ := b.Input.MarshalJSON()
+			toolName := b.Name
+			if toolNameTransform != nil {
+				toolName = toolNameTransform(toolName)
+			}
 			blocks = append(blocks, anthropicContentBlock{
 				Type:      "tool_use",
 				ToolID:    b.ID,
-				ToolName:  b.Name,
+				ToolName:  toolName,
 				ToolInput: string(args),
 			})
 		}

@@ -18,9 +18,11 @@ Treat the tool definitions as part of that workflow contract. Their requirements
 6. **Execution evidence is concrete.** When the request requires validation results, run the relevant suites and report actual outcomes instead of stopping at planning.
 7. **Escalation is explicit.** If the request requires pausing work or updating the plan, produce a concrete escalation with root cause and affected scope.
 8. **Blocked tooling needs an explicit remedy path.** If the global harness or suite cannot run because a dependency, tool, or utility is missing, use `research_test_tool_install` first whenever you are not significantly confident in the correct install command. Then explain the concrete install plan and use `install_test_tooling`; those approved commands execute against real disk, not VFS, so the install persists for later turns.
+9. **Global review challenges are strict.** When the global inspector challenges you, validate the merged state against the whole architect plan and return through `validate_global_review` rather than ending narratively.
 
 ## Reporting Standards
 
 - Distinguish clearly between authored tests, execution evidence, and diagnosis.
 - Do not silently absorb systemic failures; escalate them when the request or findings require it.
 - Summaries should highlight cross-pipeline interactions, shared risks, and uncovered gaps.
+- If the work is still fragile, incomplete, or materially weaker than better alternatives, say so explicitly in `validate_global_review` instead of soft-pedaling the verdict.

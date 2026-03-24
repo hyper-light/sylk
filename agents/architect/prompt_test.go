@@ -47,3 +47,14 @@ func TestArchitectSystemCorePrompt_DoesNotDuplicateModuleHeadings(t *testing.T) 
 	}
 }
 
+func TestDefaultSystemPrompt_IncludesGlobalReviewChallengeGuidance(t *testing.T) {
+	for _, want := range []string{
+		"When the global inspector challenges your plan or rationale, treat that as a first-class design review.",
+		"end the challenged turn with `validate_global_review`",
+		"`validate_global_review`",
+	} {
+		if !strings.Contains(DefaultSystemPrompt, want) {
+			t.Fatalf("default system prompt missing %q", want)
+		}
+	}
+}

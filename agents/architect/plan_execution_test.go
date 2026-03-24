@@ -966,6 +966,201 @@ func TestHandlePlanHandoffReceiptUpdate_PromotesExecutingPlan(t *testing.T) {
 	}
 }
 
+func TestApplyFoundPlanHandoffReceiptUpdate_PublishesExecutingNotificationWhileContinuationPending(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-update-pending",
+		SessionID: "sess1",
+		Query:     "build the feature",
+		Revision:  3,
+		Status:    PlanStatusReady,
+		CreatedAt: now,
+		UpdatedAt: now,
+		PendingWork: &PendingContinuation{
+			Kind:          string(continuationKindPlanHandoff),
+			Status:        string(continuationStatusPending),
+			TargetAgentID: "orch-1234",
+			CorrelationID: "corr-pending",
+			Message:       "handoff queued",
+		},
+	}
+	plan.sm = NewPlanStateMachine(plan.ID, plan.Status)
+
+	a := testArchitectWithControlStore(t, plan)
+	a.bus = guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	a.channels = guide.NewAgentChannels("architect", "architect")
+	notifications := make(chan string, 1)
+	sub, err := a.bus.Subscribe(a.channels.Responses, func(msg *guide.Message) error {
+		stream, ok := msg.GetStreamResponse()
+		if !ok || stream == nil || stream.Event == nil || stream.Event.Type != guide.StreamEventPush {
+			return nil
+		}
+		push, ok := stream.Event.Data.(*guide.AgentPush)
+		if !ok || push == nil {
+			return nil
+		}
+		notifications <- push.Content
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	record := &ArchitectContinuation{
+		ID:                    "cont-pending",
+		Kind:                  continuationKindPlanHandoff,
+		State:                 continuationStatusPending,
+		PlanID:                plan.ID,
+		SessionID:             plan.SessionID,
+		TargetAgentID:         "orch-1234",
+		ResponseCorrelationID: "corr-pending",
+		RequestJSON:           `{"plan_id":"plan-update-pending"}`,
+		CreatedAt:             now,
+		ExpiresAt:             now.Add(time.Minute),
+	}
+	if err := a.controlStore.PutContinuation(record); err != nil {
+		t.Fatalf("put continuation: %v", err)
+	}
+
+	a.applyFoundPlanHandoffReceiptUpdate(plan, "corr-pending", &agentshared.PlanHandoffReceiptUpdate{
+		SessionID:     plan.SessionID,
+		PlanID:        plan.ID,
+		Revision:      plan.Revision,
+		CorrelationID: "corr-pending",
+		Found:         true,
+		Receipt: &agentshared.PlanHandoffReceipt{
+			ReceiptID:   "handoff-pending",
+			SessionID:   plan.SessionID,
+			PlanID:      plan.ID,
+			Revision:    plan.Revision,
+			Status:      agentshared.PlanHandoffReceiptStatusRunning,
+			DAGID:       "dag-pending",
+			WorkflowID:  "wf_plan-update-pending",
+			SubmittedAt: now,
+			RunningAt:   now,
+		},
+		Reason: "running",
+	})
+
+	select {
+	case got := <-notifications:
+		want := "Plan dispatched to the orchestrator. DAG dag-pending is now running."
+		if got != want {
+			t.Fatalf("notification = %q, want %q", got, want)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected executing notification")
+	}
+}
+
+func TestPlanHandoffContinuationThenReceiptUpdate_PublishesExecutingNotificationOnce(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-update-completed",
+		SessionID: "sess1",
+		Query:     "build the feature",
+		Revision:  3,
+		Status:    PlanStatusOrchestrating,
+		CreatedAt: now,
+		UpdatedAt: now,
+		PendingWork: &PendingContinuation{
+			Kind:          string(continuationKindPlanHandoff),
+			Status:        string(continuationStatusPending),
+			TargetAgentID: "orch-1234",
+			CorrelationID: "corr-completed",
+			Message:       "handoff queued",
+		},
+	}
+	plan.sm = NewPlanStateMachine(plan.ID, plan.Status)
+
+	a := testArchitectWithControlStore(t, plan)
+	a.bus = guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	a.channels = guide.NewAgentChannels("architect", "architect")
+	notifications := make(chan string, 1)
+	sub, err := a.bus.Subscribe(a.channels.Responses, func(msg *guide.Message) error {
+		stream, ok := msg.GetStreamResponse()
+		if !ok || stream == nil || stream.Event == nil || stream.Event.Type != guide.StreamEventPush {
+			return nil
+		}
+		push, ok := stream.Event.Data.(*guide.AgentPush)
+		if !ok || push == nil {
+			return nil
+		}
+		notifications <- push.Content
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	record := &ArchitectContinuation{
+		ID:                    "cont-completed",
+		Kind:                  continuationKindPlanHandoff,
+		State:                 continuationStatusProcessing,
+		PlanID:                plan.ID,
+		SessionID:             plan.SessionID,
+		TargetAgentID:         "orch-1234",
+		ResponseCorrelationID: "corr-completed",
+		RequestJSON:           `{"plan_id":"plan-update-completed"}`,
+		CreatedAt:             now,
+		ExpiresAt:             now.Add(time.Minute),
+	}
+	if err := a.controlStore.PutContinuation(record); err != nil {
+		t.Fatalf("put continuation: %v", err)
+	}
+
+	msg := guide.NewResponseMessage("resp-completed", &guide.RouteResponse{
+		CorrelationID:       "corr-completed",
+		Success:             true,
+		RespondingAgentID:   "orch-1234",
+		RespondingAgentName: "orchestrator",
+		Data: map[string]any{
+			"response": "DAG dag-completed is now running.",
+		},
+	})
+	if err := a.handlePlanHandoffContinuation(msg, record); err != nil {
+		t.Fatalf("handlePlanHandoffContinuation: %v", err)
+	}
+
+	a.applyFoundPlanHandoffReceiptUpdate(plan, "corr-completed", &agentshared.PlanHandoffReceiptUpdate{
+		SessionID:     plan.SessionID,
+		PlanID:        plan.ID,
+		Revision:      plan.Revision,
+		CorrelationID: "corr-completed",
+		Found:         true,
+		Receipt: &agentshared.PlanHandoffReceipt{
+			ReceiptID:   "handoff-completed",
+			SessionID:   plan.SessionID,
+			PlanID:      plan.ID,
+			Revision:    plan.Revision,
+			Status:      agentshared.PlanHandoffReceiptStatusRunning,
+			DAGID:       "dag-completed",
+			WorkflowID:  "wf_plan-update-completed",
+			SubmittedAt: now,
+			RunningAt:   now,
+		},
+		Reason: "running",
+	})
+
+	select {
+	case got := <-notifications:
+		want := "Plan dispatched to the orchestrator. DAG dag-completed is now running."
+		if got != want {
+			t.Fatalf("notification = %q, want %q", got, want)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected initial executing notification")
+	}
+
+	select {
+	case got := <-notifications:
+		t.Fatalf("unexpected duplicate notification: %q", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 func TestRequestOpenPlanHandoffReceiptResyncs_PublishesRequests(t *testing.T) {
 	now := time.Now().UTC()
 	plan := &DesignPlan{

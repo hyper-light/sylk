@@ -302,6 +302,16 @@ func (gt *GlobalTester) registerCoreSkills() {
 	gt.skills.Register(reportToOrchestratorSkill(gt))
 	gt.skills.Register(reportToArchitectSkill(gt))
 	gt.skills.Register(escalateFailureSkill(gt))
+	for _, skill := range agentshared.NewGlobalReviewProtocolSkills(agentshared.GlobalReviewProtocolSkillConfig{
+		AgentType:      func() string { return "tester" },
+		WorkspaceViews: func() versioning.WorkspaceViewAccess { return gt.workspaceViews },
+		Route: agentshared.GlobalReviewRouteConfig{
+			BusProvider: func() guide.EventBus { return gt.bus },
+			SessionID:   func() string { return gt.config.SessionID },
+		},
+	}) {
+		gt.skills.Register(skill)
+	}
 
 	// Diagnostics
 	gt.skills.Register(agentshared.NewSelfDiagnosticSkill(&globalTesterDiag{gt: gt}))
@@ -463,6 +473,7 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 		return nil, fmt.Errorf("global tester: no LLM provider configured — authenticate with OpenAI to enable")
 	}
 
+	ctx = agentshared.WithGlobalReviewContext(ctx, fwd.Metadata)
 	contract := agentshared.BuildGlobalExecutionContract("tester-global", fwd.Intent, fwd.Input)
 	systemPrompt := shared.GlobalTesterSystemPromptForContract(contract)
 	systemPrompt = agentshared.AppendGlobalExecutionGuidance(systemPrompt, contract, "tester-global")
@@ -533,6 +544,7 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	startTime := time.Now()
 
 	ctx = withTesterStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = agentshared.WithStreamContextMetadata(ctx, fwd.Metadata)
 	ctx, usageAcc := withTesterUsageAccumulator(ctx)
 
 	// Create steering ledger for this request.

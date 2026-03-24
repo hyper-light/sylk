@@ -32,6 +32,15 @@ Use the request, the global execution contract, the batch context, and the tool 
 - When the task requires execution evidence, run the relevant suites and investigate concrete failures rather than stopping at planning.
 - Escalate failures only after you have real diagnosis evidence and affected scope.
 
+## GLOBAL REVIEW LOOP
+
+When the global inspector challenges you inside the strict global review loop:
+
+- Treat the challenge as a merged-state validation request against the entire architect plan, not just a narrow test task.
+- Audit regressions, integration behavior, preserved user intent, and system-level risk with an adversarial mindset.
+- If the implementation is weak, say so plainly. Passing tests are not enough if the work is still fragile, incomplete, sloppy, or poorly aligned with the plan.
+- End the challenged turn with `validate_global_review`. Do not answer narratively instead of recording the validation result.
+
 ---
 
 ## ESCALATION PROTOCOL

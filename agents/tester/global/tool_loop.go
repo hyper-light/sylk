@@ -94,6 +94,20 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 		gt.publishStreamChunk(ctx, agentshared.IntermediateToolTurnText(resp))
 
 		if len(resp.ToolCalls) == 0 {
+			if err := agentshared.ValidateGlobalReviewCompletion(ctx, "tester"); err != nil {
+				gt.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: err.Error() +
+						"\nUse the strict global review protocol now. Answer the active inspector challenge with validate_global_review instead of ending the turn narratively.",
+				})
+				continue
+			}
 			gt.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
 			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventSuiteCompleted,
@@ -118,6 +132,9 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 
 		errCount, rerouted := gt.applyToolCalls(ctx, req, resp)
 		gt.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		if agentshared.GlobalReviewTurnTerminated(ctx) {
+			return "", nil
+		}
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}

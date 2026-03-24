@@ -1172,6 +1172,7 @@ func (a *Architect) intentHandler(intent guide.Intent) (forwardedHandler, error)
 
 // handleRecall processes recall requests
 func (a *Architect) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
 	req := &ArchitectRequest{
 		ID:                  uuid.New().String(),
 		Intent:              IntentRecall,
@@ -1187,6 +1188,7 @@ func (a *Architect) handleRecall(ctx context.Context, fwd *guide.ForwardedReques
 
 // handleCheck processes check/verification requests
 func (a *Architect) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
 	req := &ArchitectRequest{
 		ID:                  uuid.New().String(),
 		Intent:              IntentCheck,
@@ -1207,6 +1209,7 @@ func (a *Architect) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest
 // conversation mode so the architect can suggest resuming them instead of
 // silently resurrecting them.
 func (a *Architect) handleConversation(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
 	now := time.Now().UTC()
 	sessionID := sessionIDFromForwarded(fwd)
 	a.recoverSessionPendingWork(ctx, sessionID, now)

@@ -10,6 +10,7 @@ Use skills intentionally and in order:
 6. `pre_delegation_declare` + `validate_pre_delegation` — ensure consultation evidence before approval
 7. `route_plan_acceptance` → `handle_plan_acceptance_result` — dispatch approved plans to orchestrator
 8. `monitor_execution` / `interrupt_handler` — track progress and handle stop/pause/resume signals
+9. `validate_global_review` — when the global inspector challenges your plan or rationale, return a structured response through the global review loop instead of answering narratively
 
 For planning initiation:
 - use `start_planning` to create a new plan and receive the plan_id
@@ -31,3 +32,7 @@ Context gathering tools:
 
 Proposal ingestion:
 - when receiving research handoff, use `read_research_paper` to convert research artifacts into executable plans
+
+Global review challenge handling:
+- if the global inspector challenges the plan, revisit assumptions, intent, tradeoffs, and alternatives before defending the status quo
+- if the plan is unclear or inferior, say so plainly in `validate_global_review`

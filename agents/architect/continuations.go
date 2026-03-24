@@ -638,52 +638,29 @@ func (a *Architect) handlePlanHandoffContinuation(
 		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, "plan not found", "plan handoff continuation lost plan")
 		return nil
 	}
-	a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, "plan handoff response received")
 	if !resp.Success || !isHandoffSuccess(msg) {
-		if plan.SM().State() == PlanStatusOrchestrating {
-			if transitionErr := plan.SM().TransitionTo(PlanStatusReady, plan); transitionErr == nil {
-				plan.Status = plan.SM().State()
-				plan.Epoch = plan.SM().Epoch()
-			}
-		}
-		plan.UpdatedAt = time.Now().UTC()
-		a.persistPlanStateBestEffort(plan, record.ResponseCorrelationID, "plan handoff failed; reverting to ready")
 		summary := strings.TrimSpace(resp.Error)
 		if summary == "" {
 			summary = summarizeAutoHandoffResponse(msg)
 		}
-		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, summary, "plan handoff unsuccessful")
+		a.recoverPlanHandoffForRetry(plan, record.ResponseCorrelationID, summary)
 		a.publishNotificationPush("I couldn't dispatch the plan to the orchestrator: " + summary)
 		return nil
 	}
-	if plan.SM().State() == PlanStatusOrchestrating {
-		if transitionErr := plan.SM().TransitionTo(PlanStatusExecuting, plan); transitionErr != nil {
-			a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, transitionErr.Error(), "plan transition to executing failed")
-			return transitionErr
-		}
-	}
-	plan.Status = plan.SM().State()
-	plan.Epoch = plan.SM().Epoch()
-	plan.UpdatedAt = time.Now().UTC()
-	if lm := a.planStore.LeaseManager(); lm != nil {
-		lm.GrantExecutingLease(plan, "orchestrator")
-	}
 	summary := summarizeAutoHandoffResponse(msg)
-	if strings.TrimSpace(summary) != "" {
-		plan.RiskSummary = append(plan.RiskSummary, summary)
-	}
-	if err := a.persistPlanState(plan); err != nil {
-		return err
-	}
-	if err := a.controlStore.CompleteContinuation(record, continuationStatusCompleted, respJSON, ""); err != nil {
-		return err
-	}
 	message := "Plan dispatched to the orchestrator."
 	if strings.TrimSpace(summary) != "" {
 		message = fmt.Sprintf("Plan dispatched to the orchestrator. %s", summary)
 	}
-	a.publishNotificationPush(message)
-	return nil
+	return a.finalizePlanHandoffExecution(
+		plan,
+		record,
+		record.ResponseCorrelationID,
+		respJSON,
+		message,
+		summary,
+		"promoted from handoff continuation",
+	)
 }
 
 func (a *Architect) handleAcademicRequirementsHandoffContinuation(

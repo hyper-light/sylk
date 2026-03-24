@@ -33,8 +33,14 @@ func TestAnthropicBeginAuthUsesCodeFlowRedirect(t *testing.T) {
 	if got := query.Get("code"); got != "true" {
 		t.Fatalf("code = %q, want true", got)
 	}
-	if got := query.Get("state"); got != challenge.CodeVerifier {
-		t.Fatalf("state = %q, want verifier", got)
+	if got := query.Get("state"); got != challenge.State {
+		t.Fatalf("state = %q, want %q", got, challenge.State)
+	}
+	if challenge.State == "" {
+		t.Fatal("expected non-empty state")
+	}
+	if challenge.State == challenge.CodeVerifier {
+		t.Fatal("expected state to differ from verifier")
 	}
 }
 
@@ -122,5 +128,25 @@ func TestAnthropicAuthService_Resolve_InvalidGrantPreservesStoredAuth(t *testing
 	}
 	if preserved.RefreshToken != "existing_refresh" {
 		t.Fatalf("stored refresh token = %q, want existing_refresh", preserved.RefreshToken)
+	}
+}
+
+func TestNewAnthropicAuthService_UsesReferenceOAuthDefaults(t *testing.T) {
+	service, ok := NewAnthropicAuthService(AnthropicAuthServiceConfig{}).(*anthropicAuthService)
+	if !ok {
+		t.Fatalf("service type = %T, want *anthropicAuthService", service)
+	}
+
+	if service.tokenURL != "https://console.anthropic.com/v1/oauth/token" {
+		t.Fatalf("token url = %q, want %q", service.tokenURL, "https://console.anthropic.com/v1/oauth/token")
+	}
+
+	wantScopes := []string{
+		"org:create_api_key",
+		"user:profile",
+		"user:inference",
+	}
+	if service.scopes != strings.Join(wantScopes, " ") {
+		t.Fatalf("scopes = %q, want %q", service.scopes, strings.Join(wantScopes, " "))
 	}
 }

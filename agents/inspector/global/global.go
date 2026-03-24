@@ -413,6 +413,7 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 		return shared.ConversationFallback(gi.getState()), nil
 	}
 
+	ctx = agentShared.WithGlobalReviewContext(ctx, fwd.Metadata)
 	contract := agentShared.BuildGlobalExecutionContract("inspector-global", fwd.Intent, fwd.Input)
 	systemPrompt := shared.GlobalInspectorSystemPromptForContract(contract)
 	systemPrompt = agentShared.AppendGlobalExecutionGuidance(systemPrompt, contract, "inspector-global")
@@ -481,6 +482,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 
 	ctx := reqCtx
 	ctx = shared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = agentShared.WithStreamContextMetadata(ctx, fwd.Metadata)
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	startTime := time.Now()
 

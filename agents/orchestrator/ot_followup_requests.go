@@ -8,11 +8,27 @@ import (
 
 	"github.com/adalundhe/sylk/agents/architect"
 	"github.com/adalundhe/sylk/agents/guide"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/versioning"
 )
 
 const otGlobalFollowupSource = "ot_global_followup"
+
+const (
+	globalReviewStageCheckpoint = "checkpoint"
+	globalReviewStageFinal      = "final"
+)
+
+type globalReviewProgress struct {
+	Stage            string
+	TotalTasks       int
+	CompletedTasks   int
+	FailedTasks      int
+	RemainingTasks   int
+	CompletedTaskIDs []string
+	RemainingTaskIDs []string
+}
 
 func (o *Orchestrator) publishOTGlobalFollowupRequestsBestEffort(
 	_ context.Context,
@@ -24,7 +40,7 @@ func (o *Orchestrator) publishOTGlobalFollowupRequestsBestEffort(
 	if o == nil || o.bus == nil || task == nil || update == nil {
 		return
 	}
-	for _, reviewerType := range []string{"inspector", "tester"} {
+	for _, reviewerType := range []string{"inspector"} {
 		req := o.buildOTGlobalFollowupRequest(task, update, reviewerType, mergeVersion, hadDraft)
 		if req == nil {
 			continue
@@ -66,9 +82,49 @@ func (o *Orchestrator) buildOTGlobalFollowupRequest(
 	if reviewerType == "inspector" {
 		planText, planFilePath = o.globalInspectorPlanContext(task)
 	}
+	progress := o.globalReviewProgress(task)
+	metadata := map[string]any{
+		"task_id":                     strings.TrimSpace(task.ID),
+		"task_name":                   strings.TrimSpace(task.Name),
+		"task_slug":                   strings.TrimSpace(stringMapValue(task.Metadata, "task_slug")),
+		"plan_id":                     strings.TrimSpace(stringMapValue(task.Metadata, "plan_id")),
+		"plan_file_path":              strings.TrimSpace(stringMapValue(task.Metadata, "plan_file_path")),
+		"agent_type":                  reviewerType,
+		"reviewer_type":               reviewerType,
+		"handoff_source":              otGlobalFollowupSource,
+		"pipeline_agent_type":         strings.TrimSpace(update.AgentType),
+		"pipeline_node_id":            strings.TrimSpace(update.NodeID),
+		"pipeline_task":               false,
+		"global_followup":             true,
+		"ot_handoff_followup":         true,
+		"global_vfs_version":          mergeVersionString(mergeVersion, hadDraft),
+		"affected_files":              taskAffectedPaths(task),
+		"acceptance_evidence":         updateEvidenceRefs(update),
+		"acceptance_summary":          strings.TrimSpace(updateSummary(update)),
+		"task_description":            strings.TrimSpace(task.Description),
+		"global_review_stage":         progress.Stage,
+		"workflow_total_tasks":        progress.TotalTasks,
+		"workflow_completed_tasks":    progress.CompletedTasks,
+		"workflow_failed_tasks":       progress.FailedTasks,
+		"workflow_remaining_tasks":    progress.RemainingTasks,
+		"workflow_completed_task_ids": progress.CompletedTaskIDs,
+		"workflow_remaining_task_ids": progress.RemainingTaskIDs,
+	}
+	if strings.TrimSpace(planText) != "" {
+		metadata[workflowPlanSnapshotKey] = strings.TrimSpace(planText)
+	}
+	if criteriaSnapshot := strings.TrimSpace(stringMapValue(task.Metadata, "task_criteria_snapshot")); criteriaSnapshot != "" {
+		metadata["task_criteria_snapshot"] = criteriaSnapshot
+	}
+	reviewID := strings.TrimSpace(fmt.Sprintf("global-review-%s", sanitizePipelineIdentityPart(task.ID)))
+	metadata = agentshared.GlobalReviewMetadata(metadata, &agentshared.GlobalReviewSnapshot{
+		ReviewID:       reviewID,
+		RequestedBy:    "orchestrator",
+		CurrentRequest: otGlobalReviewCurrentRequest(task, progress),
+	})
 	return &guide.RouteRequest{
 		CorrelationID:   otGlobalFollowupCorrelationID(task, reviewerType, update),
-		Input:           otGlobalFollowupPrompt(task, update, reviewerType, mergeVersion, hadDraft, planText, planFilePath),
+		Input:           otGlobalFollowupPrompt(task, update, reviewerType, mergeVersion, hadDraft, planText, planFilePath, progress),
 		TargetAgentID:   reviewerType,
 		ExplicitTarget:  true,
 		SourceAgentID:   o.config.AgentID,
@@ -76,26 +132,7 @@ func (o *Orchestrator) buildOTGlobalFollowupRequest(
 		FireAndForget:   false,
 		SessionID:       firstNonEmpty(strings.TrimSpace(task.SessionID), o.config.SessionID, orchestratorStateSessionID(o)),
 		Timestamp:       time.Now().UTC(),
-		Metadata: map[string]any{
-			"task_id":             strings.TrimSpace(task.ID),
-			"task_name":           strings.TrimSpace(task.Name),
-			"task_slug":           strings.TrimSpace(stringMapValue(task.Metadata, "task_slug")),
-			"plan_id":             strings.TrimSpace(stringMapValue(task.Metadata, "plan_id")),
-			"plan_file_path":      strings.TrimSpace(stringMapValue(task.Metadata, "plan_file_path")),
-			"agent_type":          reviewerType,
-			"reviewer_type":       reviewerType,
-			"handoff_source":      otGlobalFollowupSource,
-			"pipeline_agent_type": strings.TrimSpace(update.AgentType),
-			"pipeline_node_id":    strings.TrimSpace(update.NodeID),
-			"pipeline_task":       false,
-			"global_followup":     true,
-			"ot_handoff_followup": true,
-			"global_vfs_version":  mergeVersionString(mergeVersion, hadDraft),
-			"affected_files":      taskAffectedPaths(task),
-			"acceptance_evidence": updateEvidenceRefs(update),
-			"acceptance_summary":  strings.TrimSpace(updateSummary(update)),
-			"task_description":    strings.TrimSpace(task.Description),
-		},
+		Metadata:        metadata,
 	}
 }
 
@@ -130,12 +167,14 @@ func otGlobalFollowupPrompt(
 	hadDraft bool,
 	planText string,
 	planFilePath string,
+	progress globalReviewProgress,
 ) string {
 	taskLabel := firstNonEmpty(strings.TrimSpace(task.Name), strings.TrimSpace(task.ID), "this task")
 	lines := []string{
-		otGlobalFollowupLead(reviewerType, taskLabel),
+		otGlobalFollowupLead(reviewerType, taskLabel, progress),
 		"Operational Transform has accepted this completed pipeline. Work from the merged global state, not the pipeline draft.",
 	}
+	lines = append(lines, otGlobalFollowupStageLines(progress)...)
 	if description := strings.TrimSpace(task.Description); description != "" {
 		lines = append(lines, "Task description: "+description)
 	}
@@ -196,26 +235,115 @@ func otGlobalFollowupPrompt(
 			lines = append(lines, "- "+ref)
 		}
 	}
-	lines = append(lines, otGlobalFollowupDirective(reviewerType))
+	lines = append(lines, otGlobalFollowupDirective(reviewerType, progress))
 	return strings.Join(lines, "\n")
 }
 
-func otGlobalFollowupLead(reviewerType, taskLabel string) string {
+func otGlobalFollowupLead(reviewerType, taskLabel string, progress globalReviewProgress) string {
 	switch strings.TrimSpace(reviewerType) {
 	case "tester":
-		return fmt.Sprintf("Global tester follow-up is required for %s. Validate regressions, integration risk, and cross-pipeline behavior on the merged result.", taskLabel)
+		if progress.Stage == globalReviewStageFinal {
+			return fmt.Sprintf("Global tester follow-up is required for %s. Validate the final merged result for regressions, integration risk, and whole-plan completion.", taskLabel)
+		}
+		return fmt.Sprintf("Global tester follow-up is required for %s. Validate this merged checkpoint for regressions, integration risk, and whether the remaining plan can proceed safely.", taskLabel)
 	default:
-		return fmt.Sprintf("Global inspector follow-up is required for %s. Audit cross-file quality, correctness, and plan adherence on the merged result.", taskLabel)
+		if progress.Stage == globalReviewStageFinal {
+			return fmt.Sprintf("Global inspector follow-up is required for %s. Run the final whole-plan audit over the merged result.", taskLabel)
+		}
+		return fmt.Sprintf("Global inspector follow-up is required for %s. Run a progressive checkpoint audit over the merged result.", taskLabel)
 	}
 }
 
-func otGlobalFollowupDirective(reviewerType string) string {
+func otGlobalFollowupDirective(reviewerType string, progress globalReviewProgress) string {
 	switch strings.TrimSpace(reviewerType) {
 	case "tester":
-		return "Accept this as a direct orchestrator follow-up request. Build the needed global validation work from the merged state and continue through the normal tester workflow."
+		if progress.Stage == globalReviewStageFinal {
+			return "Accept this as a direct orchestrator follow-up request. Validate the final merged result against the whole plan and continue through the normal tester workflow."
+		}
+		return "Accept this as a direct orchestrator follow-up request. Validate the current merged checkpoint against the work that should exist now, and continue through the normal tester workflow without treating future unmerged tasks as defects."
 	default:
-		return "Accept this as a direct orchestrator follow-up request. Perform the needed global audit from the merged state and continue through the normal inspector workflow."
+		if progress.Stage == globalReviewStageFinal {
+			return "Accept this as a direct orchestrator follow-up request. Perform the final whole-plan audit from the merged state and continue through the normal inspector workflow."
+		}
+		return "Accept this as a direct orchestrator follow-up request. Perform a progressive checkpoint audit from the merged state: future planned work may remain pending, but current plan drift, regressions, slop, or design choices that endanger the remaining plan are defects."
 	}
+}
+
+func otGlobalReviewCurrentRequest(task *TaskRecord, progress globalReviewProgress) string {
+	taskLabel := firstNonEmpty(strings.TrimSpace(task.Name), strings.TrimSpace(task.ID), "this task")
+	if progress.Stage == globalReviewStageFinal {
+		return fmt.Sprintf("Run the final whole-plan global review for %s and decide the next strict global review action.", taskLabel)
+	}
+	return fmt.Sprintf("Run a progressive checkpoint global review for %s and decide the next strict global review action for the current merged state.", taskLabel)
+}
+
+func otGlobalFollowupStageLines(progress globalReviewProgress) []string {
+	lines := []string{
+		fmt.Sprintf("Review stage: %s", firstNonEmpty(strings.TrimSpace(progress.Stage), globalReviewStageCheckpoint)),
+	}
+	if progress.TotalTasks > 0 {
+		lines = append(lines, fmt.Sprintf("Workflow progress: %d/%d tasks completed, %d failed, %d remaining.", progress.CompletedTasks, progress.TotalTasks, progress.FailedTasks, progress.RemainingTasks))
+	}
+	if len(progress.CompletedTaskIDs) > 0 {
+		lines = append(lines, "Completed task IDs:")
+		for _, taskID := range progress.CompletedTaskIDs {
+			lines = append(lines, "- "+taskID)
+		}
+	}
+	if len(progress.RemainingTaskIDs) > 0 {
+		lines = append(lines, "Remaining task IDs:")
+		for _, taskID := range progress.RemainingTaskIDs {
+			lines = append(lines, "- "+taskID)
+		}
+	}
+	if progress.Stage == globalReviewStageFinal {
+		lines = append(lines, "This is the final whole-plan review. Missing planned work is a defect unless the plan was explicitly revised.")
+	} else {
+		lines = append(lines, "This is a progressive checkpoint review. Future planned work that has not been merged yet is pending, not missing. Judge whether the current merged state is correct, robust, stylistically sound, and on track for the remaining plan.")
+	}
+	return lines
+}
+
+func (o *Orchestrator) globalReviewProgress(task *TaskRecord) globalReviewProgress {
+	progress := globalReviewProgress{Stage: globalReviewStageCheckpoint}
+	if o == nil || task == nil {
+		return progress
+	}
+	workflowID := strings.TrimSpace(task.WorkflowID)
+	if workflowID == "" {
+		progress.Stage = globalReviewStageFinal
+		return progress
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	workflow := o.state.Workflows[workflowID]
+	if workflow == nil {
+		progress.Stage = globalReviewStageFinal
+		return progress
+	}
+	progress.TotalTasks = len(workflow.TaskIDs)
+	for _, taskID := range workflow.TaskIDs {
+		record := o.state.Tasks[taskID]
+		if record == nil {
+			progress.RemainingTasks++
+			progress.RemainingTaskIDs = append(progress.RemainingTaskIDs, taskID)
+			continue
+		}
+		switch record.Status {
+		case TaskStatusCompleted:
+			progress.CompletedTasks++
+			progress.CompletedTaskIDs = append(progress.CompletedTaskIDs, taskID)
+		case TaskStatusFailed, TaskStatusTimedOut, TaskStatusCancelled:
+			progress.FailedTasks++
+		default:
+			progress.RemainingTasks++
+			progress.RemainingTaskIDs = append(progress.RemainingTaskIDs, taskID)
+		}
+	}
+	if progress.TotalTasks == 0 || progress.RemainingTasks == 0 {
+		progress.Stage = globalReviewStageFinal
+	}
+	return progress
 }
 
 func otGlobalFollowupCorrelationID(task *TaskRecord, reviewerType string, update *PipelineUpdate) string {

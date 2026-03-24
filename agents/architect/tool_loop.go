@@ -198,6 +198,20 @@ func (a *Architect) executeToolLoop(
 			"tool_calls", len(resp.ToolCalls))
 
 		if len(resp.ToolCalls) == 0 {
+			if err := shared.ValidateGlobalReviewCompletion(ctx, "architect"); err != nil {
+				a.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: err.Error() +
+						"\nUse the strict global review protocol now. Answer the active inspector challenge with validate_global_review.",
+				})
+				continue
+			}
 			a.logDebug("tool_loop: COMPLETE_TEXT_ONLY",
 				"stage", stage,
 				"turn", turn,
@@ -274,6 +288,9 @@ func (a *Architect) executeToolLoop(
 			"rerouted", rerouted,
 			"messages_after", len(req.Messages))
 		a.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		if shared.GlobalReviewTurnTerminated(ctx) {
+			return "", nil
+		}
 		if rerouted {
 			a.logInfo("executeToolLoop: REROUTED",
 				"stage", stage,

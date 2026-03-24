@@ -56,3 +56,17 @@ func TestGlobalTesterSystemPromptForContract_UsesTaskModePrompt(t *testing.T) {
 		}
 	}
 }
+
+func TestGlobalTesterSystemPrompt_IncludesGlobalReviewLoopGuidance(t *testing.T) {
+	prompt := GlobalTesterSystemPrompt()
+	for _, want := range []string{
+		"## GLOBAL REVIEW LOOP",
+		"When the global inspector challenges you inside the strict global review loop:",
+		"End the challenged turn with `validate_global_review`.",
+		"### When Responding To The Global Inspector",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("global tester prompt missing %q", want)
+		}
+	}
+}

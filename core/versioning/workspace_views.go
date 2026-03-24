@@ -469,3 +469,18 @@ func uniqueWorkspacePaths(paths []string) []string {
 }
 
 var _ WorkspaceViewAccess = (*SessionWorkspaceViews)(nil)
+
+// SessionForWorkspaceViews resolves the backing SessionVFS when the provided
+// workspace view implementation is session-backed. Returns nil for non-session
+// view providers.
+func SessionForWorkspaceViews(ctx context.Context, views WorkspaceViewAccess) *SessionVFS {
+	if views == nil {
+		return nil
+	}
+	switch typed := views.(type) {
+	case *SessionWorkspaceViews:
+		return typed.resolveSession(ctx)
+	default:
+		return nil
+	}
+}

@@ -105,13 +105,14 @@ func GlobalInspectorSystemPrompt() string {
 // GlobalInspectorSystemPromptForContract composes the global inspector system
 // prompt for structured global task requests. When a global execution contract
 // is present, the runtime guidance becomes the source of workflow obligations,
-// so the static audit protocol is omitted.
+// but the strict global-review protocol still applies and must remain visible.
 func GlobalInspectorSystemPromptForContract(contract *agentshared.GlobalExecutionContract) string {
 	if contract == nil {
 		return GlobalInspectorSystemPrompt()
 	}
 	return joinNonEmpty([]string{
 		globalSystem,
+		globalProtocol,
 		globalAudit,
 		InspectorSkillsPolicy,
 		InspectorGuardrails,

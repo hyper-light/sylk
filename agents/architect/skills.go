@@ -28,6 +28,14 @@ func (a *Architect) registerCoreSkills() {
 	a.skills.Register(askUserQuestionSkill(a))
 	a.skills.Register(routeRequirementsResearchSkill(a))
 	a.skills.Register(readResearchPaperSkill(a))
+	for _, skill := range shared.NewGlobalReviewProtocolSkills(shared.GlobalReviewProtocolSkillConfig{
+		AgentType: func() string { return "architect" },
+		Route: shared.GlobalReviewRouteConfig{
+			BusProvider: func() guide.EventBus { return a.bus },
+		},
+	}) {
+		a.skills.Register(skill)
+	}
 	a.skills.Register(shared.NewSelfDiagnosticSkill(&architectDiag{a: a}))
 	a.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "architect",
