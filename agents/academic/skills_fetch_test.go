@@ -53,3 +53,31 @@ func TestFetchFailureResult_NonApprovalReturnsStructuredFailure(t *testing.T) {
 		t.Fatalf("error = %v, want blocked message", result["error"])
 	}
 }
+
+func TestNormalizeGroundSourceTool_AutoDetectsDocumentURLs(t *testing.T) {
+	toolName, err := normalizeGroundSourceTool("https://example.com/spec.pdf", "auto")
+	if err != nil {
+		t.Fatalf("normalizeGroundSourceTool() error = %v", err)
+	}
+	if toolName != "fetch_document" {
+		t.Fatalf("toolName = %q, want fetch_document", toolName)
+	}
+}
+
+func TestAppendFetchPersistenceFields_ExposesAsyncPersistenceMetadata(t *testing.T) {
+	result := map[string]any{}
+	appendFetchPersistenceFields(result, &fetch.FetchResponse{
+		IngestStatus: fetch.IngestStatusQueued,
+		IngestJobID:  "ingest_123",
+		Ingested:     false,
+	})
+	if result["persistence_status"] != string(fetch.IngestStatusQueued) {
+		t.Fatalf("persistence_status = %v, want %q", result["persistence_status"], fetch.IngestStatusQueued)
+	}
+	if result["persistence_job_id"] != "ingest_123" {
+		t.Fatalf("persistence_job_id = %v, want ingest_123", result["persistence_job_id"])
+	}
+	if result["ingested"] != false {
+		t.Fatalf("ingested = %v, want false", result["ingested"])
+	}
+}

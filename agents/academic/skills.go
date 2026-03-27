@@ -178,9 +178,11 @@ type researchTopicParams struct {
 
 func researchTopicSkill(a *Academic) *skills.Skill {
 	return skills.NewSkill("research_topic").
-		Description("Research a technical topic comprehensively, consulting Librarian for codebase context.").
+		Description("Research a technical topic comprehensively, consulting Librarian for codebase context and preferring grounded evidence over intuition.").
 		Domain("research").
 		Keywords("research", "investigate", "study", "learn").
+		Usage("Use for open-ended technical research that should end in a cited, codebase-aware answer rather than a quick intuition dump.").
+		BestPractice("When performance, reliability, cost, scale, adoption, or security claims materially affect the answer, support them with grounded statistics or say explicitly that only qualitative evidence is available.").
 		Priority(100).
 		StringParam("topic", "The technical topic to research", true).
 		StringParam("context", "Additional context for the research", false).
@@ -213,9 +215,10 @@ type findBestPracticesParams struct {
 
 func findBestPracticesSkill(a *Academic) *skills.Skill {
 	return skills.NewSkill("find_best_practices").
-		Description("Find established best practices for a technology, validated against codebase patterns.").
+		Description("Find established best practices for a technology, validated against codebase patterns and backed by verifiable sources.").
 		Domain("research").
 		Keywords("best practice", "convention", "standard", "guideline").
+		BestPractice("Prefer standards, official documentation, peer-reviewed work, and maintainers' guidance over trend pieces or anecdotal blog posts.").
 		Priority(90).
 		StringParam("technology", "The technology to find best practices for", true).
 		StringParam("domain", "Specific domain within the technology", false).
@@ -251,9 +254,11 @@ type compareApproachesParams struct {
 
 func compareApproachesSkill(a *Academic) *skills.Skill {
 	return skills.NewSkill("compare_approaches").
-		Description("Compare different technical approaches with applicability analysis for the codebase.").
+		Description("Compare different technical approaches with applicability analysis for the codebase and evidence-backed tradeoffs.").
 		Domain("research").
 		Keywords("compare", "versus", "vs", "alternative", "option").
+		BestPractice("When the ranking hinges on performance, reliability, cost, scale, or adoption, support the comparison with grounded statistics or explain why only qualitative evidence is available.").
+		BestPractice("Prefer primary benchmarks, standards, papers, and official telemetry over secondary summaries when comparing numeric claims.").
 		Priority(85).
 		StringParam("topic", "The topic being compared", true).
 		ArrayParam("approaches", "List of approaches to compare", "string", true).
@@ -331,9 +336,11 @@ type recommendSolutionParams struct {
 
 func recommendSolutionSkill(a *Academic) *skills.Skill {
 	return skills.NewSkill("recommend_solution").
-		Description("Recommend a solution with full applicability analysis. ALWAYS consults Librarian.").
+		Description("Recommend a solution with full applicability analysis, grounded evidence, and Librarian validation. ALWAYS consults Librarian.").
 		Domain("research").
 		Keywords("recommend", "suggest", "solution", "solve").
+		BestPractice("Back material claims about performance, reliability, cost, security impact, scale, or adoption with grounded statistics, studies, standards, or official operational data whenever credible evidence exists.").
+		BestPractice("If the evidence for a recommendation is mixed, indirect, or mostly qualitative, say so plainly instead of overstating confidence.").
 		Priority(95).
 		StringParam("problem", "The problem to solve", true).
 		ArrayParam("constraints", "Constraints to consider", "string", false).

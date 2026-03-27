@@ -15,6 +15,7 @@ import (
 
 func (a *Academic) registerFetchSkills() {
 	a.skills.Register(webSearchSkill())
+	a.skills.Register(groundSourceSkill(a))
 	a.skills.Register(webFetchSkill(a))
 	a.skills.Register(fetchDocumentSkill(a))
 	a.skills.Register(crawlLinksSkill(a))
@@ -33,6 +34,8 @@ func webSearchSkill() *skills.Skill {
 		Example("Search official Go and PostgreSQL sources before recommending connection-pooling practices.").
 		Example("Search for standards, RFCs, vendor docs, and academic papers when the URL is not already known.").
 		BestPractice("Prefer official documentation, standards bodies, project maintainers, and primary-source papers over secondary commentary.").
+		BestPractice("Any URL discovered through web_search that you plan to cite or surface to the user must be grounded with ground_source or an equivalent fetch skill first.").
+		BestPractice("When the answer depends on performance, reliability, cost, scale, security impact, or adoption numbers, search for primary empirical sources such as official benchmarks, standards, incident reports, papers, or vendor telemetry instead of summary blogs.").
 		BestPractice("After discovery, fetch the selected source with web_fetch or fetch_document before relying on specific details.").
 		Priority(95).
 		TokenEstimate(220).
@@ -45,6 +48,44 @@ func webSearchSkill() *skills.Skill {
 		Build()
 }
 
+func groundSourceSkill(a *Academic) *skills.Skill {
+	return skills.NewSkill("ground_source").
+		Description(
+			"Ground a promising public source discovered via web_search. "+
+				"Fetch the source through the secure pipeline, return grounded content immediately, "+
+				"and queue background persistence into the knowledge graph and document store when configured.",
+		).
+		Domain("research").
+		Keywords("ground", "source", "fetch", "ingest", "document", "page", "evidence").
+		Priority(92).
+		TokenEstimate(550).
+		StringParam("url", "The promising source URL to ground", true).
+		StringParam("reason", "Why this source looks promising enough to ground", true).
+		EnumParam("expected_type", "Expected source type", []string{"auto", "page", "document"}, false).
+		Usage("Use immediately after web_search when a result looks promising enough to inspect directly before relying on it or citing it in the response.").
+		BestPractice("Prefer ground_source over repeating similar web_search queries once you already have a promising candidate URL.").
+		BestPractice("Ground the source before quoting statistics, benchmarks, percentages, or study conclusions from it.").
+		BestPractice("When a number materially affects the recommendation, capture its publication date and sample, workload, or measurement context from the grounded source when available.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				URL          string `json:"url"`
+				Reason       string `json:"reason"`
+				ExpectedType string `json:"expected_type"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if strings.TrimSpace(params.URL) == "" {
+				return nil, fmt.Errorf("url is required")
+			}
+			if strings.TrimSpace(params.Reason) == "" {
+				return nil, fmt.Errorf("reason is required")
+			}
+			return a.executeGroundSource(ctx, params.URL, params.Reason, params.ExpectedType)
+		}).
+		Build()
+}
+
 // webFetchSkill fetches a URL through the secure pipeline and returns
 // the extracted text content. All content passes through SecurityContext,
 // FetchPolicy, ConsentGate, quarantine, and Guardian inspection.
@@ -52,12 +93,15 @@ func webFetchSkill(a *Academic) *skills.Skill {
 	return skills.NewSkill("web_fetch").
 		Description(
 			"Fetch a web page or document URL through the secure pipeline. "+
-				"Content is quarantined and inspected by Guardian before ingestion. "+
+				"Content is quarantined and inspected by Guardian before use. "+
 				"User consent is required unless the domain is pre-approved. "+
-				"Returns extracted text content and provenance metadata.",
+				"Returns grounded text content immediately and queues background persistence when ingestion is configured.",
 		).
 		Domain("research").
 		Keywords("fetch", "download", "url", "web", "page", "http").
+		Usage("Use when you already know the URL for a specific page, benchmark, report, or documentation page that must be inspected before relying on its claims.").
+		BestPractice("Do not quote benchmark numbers, percentages, or performance claims from a page until you have fetched and inspected it through the secure pipeline.").
+		BestPractice("For numeric claims, note the publication date and benchmark or study context so the recommendation does not overgeneralize stale or narrow results.").
 		Priority(90).
 		TokenEstimate(500).
 		StringParam("url", "The URL to fetch", true).
@@ -87,13 +131,15 @@ func webFetchSkill(a *Academic) *skills.Skill {
 func fetchDocumentSkill(a *Academic) *skills.Skill {
 	return skills.NewSkill("fetch_document").
 		Description(
-			"Fetch a document (PDF, HTML, Markdown, plain text) and ingest it into "+
+			"Fetch a document (PDF, HTML, Markdown, plain text) through the secure pipeline and queue persistence into "+
 				"the knowledge graph when ingestion is configured. Content is security-scanned, extracted to text, "+
-				"and, when enabled, chunked, embedded, and indexed. Returns extracted text preview and "+
-				"ingestion statistics.",
+				"and immediately returned as grounded evidence while persistence continues in the background.",
 		).
 		Domain("research").
 		Keywords("document", "pdf", "paper", "article", "ingest", "fetch").
+		Usage("Use for papers, PDFs, benchmark reports, standards, or long-form studies when the evidence depends on exact methodology, statistics, or formal guidance.").
+		BestPractice("Prefer fetch_document for academic papers, official benchmark reports, standards, and incident studies that contain data you expect to cite.").
+		BestPractice("Before repeating study results, verify the date, sample size, workload or experimental setup, and major caveats from the grounded document when available.").
 		Priority(85).
 		TokenEstimate(600).
 		StringParam("url", "The document URL to fetch and ingest", true).
@@ -126,8 +172,8 @@ func crawlLinksSkill(a *Academic) *skills.Skill {
 		Description(
 			"Fetch a web page and extract its links. Optionally follow and fetch "+
 				"linked pages (bounded to max_depth=1, max_links=5). Each followed "+
-				"link passes through the full security pipeline. Returns extracted "+
-				"text from the root page and summaries of linked pages.",
+				"link passes through the full security pipeline. Returns grounded "+
+				"text from the root page and summaries of linked pages while background persistence continues when available.",
 		).
 		Domain("research").
 		Keywords("crawl", "links", "follow", "browse", "explore", "site").
@@ -167,92 +213,58 @@ func crawlLinksSkill(a *Academic) *skills.Skill {
 // executeFetch runs a single URL through the fetch pipeline and returns
 // extracted text content with provenance.
 func (a *Academic) executeFetch(ctx context.Context, url, reason string) (any, error) {
-	if a.fetchPipeline == nil {
-		return nil, fmt.Errorf("external fetch is not configured")
+	resp, err := a.executeFetchPipeline(ctx, "web_fetch", url, reason)
+	if err != nil {
+		return nil, err
 	}
-
-	resp := a.fetchPipeline.Execute(ctx, &fetch.FetchRequest{
-		URL:         url,
-		ToolName:    "web_fetch",
-		SourceAgent: "academic",
-		Reason:      reason,
-		SessionID:   firstNonEmptyFetchSessionID(ctx, a.config.SessionID),
-	})
 
 	if !resp.Success {
 		return fetchFailureResult("web_fetch", resp)
 	}
 
-	result := map[string]any{
-		"success":  true,
-		"url":      resp.URL,
-		"verdict":  resp.Verdict.String(),
-		"duration": resp.Duration.String(),
-	}
-	if resp.ExtractionError != "" {
-		result["extraction_error"] = resp.ExtractionError
-	}
-	if resp.Extracted != nil {
-		result["content"] = truncateStr(resp.Extracted.Text, 12000)
-		result["word_count"] = resp.Extracted.WordCount
-		if resp.Extracted.Title != "" {
-			result["title"] = resp.Extracted.Title
-		}
-		if resp.Extracted.Language != "" {
-			result["language"] = resp.Extracted.Language
-		}
-		result["content_truncated"] = len(resp.Extracted.Text) > 12000
-	}
-	if resp.Provenance != nil {
-		result["content_hash"] = resp.Provenance.ContentHash
-		result["fetched_at"] = resp.Provenance.FetchedAt.Format(time.RFC3339)
-		result["ingested"] = resp.Ingested
-	}
+	result := buildGroundedFetchResult(resp, "content", 12000)
+	result["grounding_tool"] = "web_fetch"
 	return result, nil
 }
 
 // executeFetchDocument fetches a document URL and returns extracted text
 // preview alongside ingestion statistics.
 func (a *Academic) executeFetchDocument(ctx context.Context, url, reason string) (any, error) {
-	if a.fetchPipeline == nil {
-		return nil, fmt.Errorf("external fetch is not configured")
+	resp, err := a.executeFetchPipeline(ctx, "fetch_document", url, reason)
+	if err != nil {
+		return nil, err
 	}
-
-	resp := a.fetchPipeline.Execute(ctx, &fetch.FetchRequest{
-		URL:         url,
-		ToolName:    "fetch_document",
-		SourceAgent: "academic",
-		Reason:      reason,
-		SessionID:   firstNonEmptyFetchSessionID(ctx, a.config.SessionID),
-	})
 
 	if !resp.Success {
 		return fetchFailureResult("fetch_document", resp)
 	}
 
-	result := map[string]any{
-		"success":  true,
-		"url":      resp.URL,
-		"verdict":  resp.Verdict.String(),
-		"duration": resp.Duration.String(),
+	result := buildGroundedFetchResult(resp, "text_preview", 16000)
+	result["grounding_tool"] = "fetch_document"
+	return result, nil
+}
+
+func (a *Academic) executeGroundSource(ctx context.Context, url, reason, expectedType string) (any, error) {
+	toolName, err := normalizeGroundSourceTool(url, expectedType)
+	if err != nil {
+		return nil, err
 	}
-	if resp.ExtractionError != "" {
-		result["extraction_error"] = resp.ExtractionError
+	resp, err := a.executeFetchPipeline(ctx, toolName, url, reason)
+	if err != nil {
+		return nil, err
 	}
-	if resp.Extracted != nil {
-		result["text_preview"] = truncateStr(resp.Extracted.Text, 16000)
-		result["word_count"] = resp.Extracted.WordCount
-		if resp.Extracted.Title != "" {
-			result["title"] = resp.Extracted.Title
-		}
-		result["preview_truncated"] = len(resp.Extracted.Text) > 16000
+	if !resp.Success {
+		return fetchFailureResult("ground_source", resp)
 	}
-	if resp.Provenance != nil {
-		result["content_hash"] = resp.Provenance.ContentHash
-		result["fetched_at"] = resp.Provenance.FetchedAt.Format(time.RFC3339)
-		result["finding_count"] = resp.Provenance.FindingCount
-		result["ingested"] = resp.Ingested
+	contentKey := "content"
+	contentLimit := 12000
+	if toolName == "fetch_document" {
+		contentKey = "text_preview"
+		contentLimit = 16000
 	}
+	result := buildGroundedFetchResult(resp, contentKey, contentLimit)
+	result["grounding_tool"] = toolName
+	result["expected_type"] = normalizeGroundSourceType(expectedType)
 	return result, nil
 }
 
@@ -263,25 +275,14 @@ func (a *Academic) executeCrawl(
 	followLinks bool,
 	maxLinks int,
 ) (any, error) {
-	if a.fetchPipeline == nil {
-		return nil, fmt.Errorf("external fetch is not configured")
-	}
-
 	// Fetch the root page.
-	rootResp := a.fetchPipeline.Execute(ctx, &fetch.FetchRequest{
-		URL:         url,
-		ToolName:    "crawl_links",
-		SourceAgent: "academic",
-		Reason:      reason,
-		SessionID:   firstNonEmptyFetchSessionID(ctx, a.config.SessionID),
-	})
-
-	result := map[string]any{
-		"url":      url,
-		"success":  rootResp.Success,
-		"verdict":  rootResp.Verdict.String(),
-		"duration": rootResp.Duration.String(),
+	rootResp, err := a.executeFetchPipeline(ctx, "crawl_links", url, reason)
+	if err != nil {
+		return nil, err
 	}
+
+	result := buildGroundedFetchResult(rootResp, "content", 12000)
+	result["grounding_tool"] = "crawl_links"
 
 	if !rootResp.Success {
 		if _, err := fetchFailureResult("crawl_links", rootResp); err != nil {
@@ -292,21 +293,6 @@ func (a *Academic) executeCrawl(
 			result["findings"] = formatFindings(rootResp.Findings)
 		}
 		return result, nil
-	}
-
-	if rootResp.Provenance != nil {
-		result["content_hash"] = rootResp.Provenance.ContentHash
-		result["ingested"] = rootResp.Ingested
-	}
-	if rootResp.ExtractionError != "" {
-		result["extraction_error"] = rootResp.ExtractionError
-	}
-	if rootResp.Extracted != nil {
-		result["content"] = truncateStr(rootResp.Extracted.Text, 12000)
-		result["word_count"] = rootResp.Extracted.WordCount
-		if rootResp.Extracted.Title != "" {
-			result["title"] = rootResp.Extracted.Title
-		}
 	}
 
 	if !followLinks {
@@ -326,13 +312,10 @@ func (a *Academic) executeCrawl(
 		if ctx.Err() != nil {
 			break
 		}
-		linkResp := a.fetchPipeline.Execute(ctx, &fetch.FetchRequest{
-			URL:         link,
-			ToolName:    "crawl_links",
-			SourceAgent: "academic",
-			Reason:      fmt.Sprintf("following link from %s: %s", url, reason),
-			SessionID:   firstNonEmptyFetchSessionID(ctx, a.config.SessionID),
-		})
+		linkResp, err := a.executeFetchPipeline(ctx, "crawl_links", link, fmt.Sprintf("following link from %s: %s", url, reason))
+		if err != nil {
+			return nil, err
+		}
 		entry := map[string]any{
 			"url":     link,
 			"success": linkResp.Success,
@@ -347,6 +330,7 @@ func (a *Academic) executeCrawl(
 			entry["content_preview"] = truncateStr(linkResp.Extracted.Text, 4000)
 			entry["word_count"] = linkResp.Extracted.WordCount
 		}
+		appendFetchPersistenceFields(entry, linkResp)
 		linkedResults = append(linkedResults, entry)
 	}
 
@@ -389,6 +373,134 @@ func truncateStr(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+func (a *Academic) executeFetchPipeline(ctx context.Context, toolName, url, reason string) (*fetch.FetchResponse, error) {
+	if a.fetchPipeline == nil {
+		return nil, fmt.Errorf("external fetch is not configured")
+	}
+	return a.fetchPipeline.Execute(ctx, &fetch.FetchRequest{
+		URL:         url,
+		ToolName:    toolName,
+		SourceAgent: "academic",
+		Reason:      reason,
+		SessionID:   firstNonEmptyFetchSessionID(ctx, a.config.SessionID),
+		AsyncIngest: true,
+	}), nil
+}
+
+func buildGroundedFetchResult(resp *fetch.FetchResponse, contentKey string, maxLen int) map[string]any {
+	result := map[string]any{
+		"success":  resp != nil && resp.Success,
+		"grounded": resp != nil && resp.Success,
+	}
+	if resp == nil {
+		return result
+	}
+	result["url"] = resp.URL
+	result["verdict"] = resp.Verdict.String()
+	result["duration"] = resp.Duration.String()
+	result["source_type"] = string(sourceTypeFromURL(resp.URL))
+	if resp.ExtractionError != "" {
+		result["extraction_error"] = resp.ExtractionError
+	}
+	if resp.Extracted != nil {
+		result[contentKey] = truncateStr(resp.Extracted.Text, maxLen)
+		result["word_count"] = resp.Extracted.WordCount
+		if resp.Extracted.Title != "" {
+			result["title"] = resp.Extracted.Title
+		}
+		if resp.Extracted.Language != "" {
+			result["language"] = resp.Extracted.Language
+		}
+		result[fetchTruncatedField(contentKey)] = len(resp.Extracted.Text) > maxLen
+	}
+	if resp.Provenance != nil {
+		result["content_hash"] = resp.Provenance.ContentHash
+		result["fetched_at"] = resp.Provenance.FetchedAt.Format(time.RFC3339)
+		result["finding_count"] = resp.Provenance.FindingCount
+	}
+	appendFetchPersistenceFields(result, resp)
+	return result
+}
+
+func fetchTruncatedField(contentKey string) string {
+	switch strings.TrimSpace(contentKey) {
+	case "text_preview":
+		return "preview_truncated"
+	default:
+		return "content_truncated"
+	}
+}
+
+func appendFetchPersistenceFields(result map[string]any, resp *fetch.FetchResponse) {
+	if result == nil || resp == nil {
+		return
+	}
+	result["ingested"] = resp.Ingested
+	if resp.IngestStatus != "" {
+		result["persistence_status"] = string(resp.IngestStatus)
+	}
+	if trimmed := strings.TrimSpace(resp.IngestJobID); trimmed != "" {
+		result["persistence_job_id"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(resp.IngestError); trimmed != "" {
+		result["persistence_error"] = trimmed
+	}
+}
+
+func normalizeGroundSourceTool(rawURL, expectedType string) (string, error) {
+	switch normalizeGroundSourceType(expectedType) {
+	case "page":
+		return "web_fetch", nil
+	case "document":
+		return "fetch_document", nil
+	case "auto":
+		if looksLikeDocumentURL(rawURL) {
+			return "fetch_document", nil
+		}
+		return "web_fetch", nil
+	default:
+		return "", fmt.Errorf("expected_type must be auto, page, or document")
+	}
+}
+
+func normalizeGroundSourceType(expectedType string) string {
+	switch strings.ToLower(strings.TrimSpace(expectedType)) {
+	case "", "auto":
+		return "auto"
+	case "page":
+		return "page"
+	case "document":
+		return "document"
+	default:
+		return strings.ToLower(strings.TrimSpace(expectedType))
+	}
+}
+
+func looksLikeDocumentURL(rawURL string) bool {
+	lowered := strings.ToLower(strings.TrimSpace(rawURL))
+	switch {
+	case strings.HasSuffix(lowered, ".pdf"),
+		strings.HasSuffix(lowered, ".md"),
+		strings.HasSuffix(lowered, ".markdown"),
+		strings.HasSuffix(lowered, ".txt"),
+		strings.HasSuffix(lowered, ".rst"),
+		strings.HasSuffix(lowered, ".rtf"),
+		strings.HasSuffix(lowered, ".doc"),
+		strings.HasSuffix(lowered, ".docx"),
+		strings.HasSuffix(lowered, ".ppt"),
+		strings.HasSuffix(lowered, ".pptx"),
+		strings.HasSuffix(lowered, ".xls"),
+		strings.HasSuffix(lowered, ".xlsx"),
+		strings.HasSuffix(lowered, ".csv"),
+		strings.Contains(lowered, "/pdf"),
+		strings.Contains(lowered, "download"),
+		strings.Contains(lowered, "arxiv.org/pdf/"):
+		return true
+	default:
+		return false
+	}
 }
 
 func firstNonEmptyFetchSessionID(ctx context.Context, fallback string) string {

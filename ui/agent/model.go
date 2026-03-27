@@ -240,6 +240,15 @@ func canonicalPipelineAgentID(agentType, pipelineID string) string {
 	return pipelineID + ":" + agentType
 }
 
+func isInternalSidecarAgent(agentID, agentType string) bool {
+	agentID = strings.TrimSpace(agentID)
+	agentType = strings.TrimSpace(agentType)
+	if agentType == "scribe" || strings.HasPrefix(agentType, "scribe-") {
+		return true
+	}
+	return strings.HasPrefix(agentID, "scribe-")
+}
+
 func parseTaskScopedPipelineAgentID(agentID string) (taskID, agentType string, ok bool) {
 	agentID = strings.TrimSpace(agentID)
 	if agentID == "" {
@@ -594,6 +603,9 @@ func (m *Model) SetSize(width, height int) {
 // handleActivity processes an activity event to update agent state.
 func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 	rawAgentID := strings.TrimSpace(ev.Event.AgentID)
+	if agentType, _ := m.inferActivityAgentIdentity(rawAgentID, ev); isInternalSidecarAgent(rawAgentID, agentType) {
+		return nil
+	}
 	agentID := m.canonicalizeAgentID(rawAgentID, ev)
 	if m.shouldIgnoreAmbiguousPipelineActivity(rawAgentID, ev) {
 		return nil
@@ -656,6 +668,9 @@ func (m *Model) shouldIgnoreAmbiguousPipelineActivity(rawAgentID string, ev msg.
 // the agent panel cards alongside the chat panel's thinking placeholder.
 func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	candidateID := canonicalStreamAgentID(progress.AgentID, progress.AgentType, progress.PipelineID, progress.TaskID)
+	if isInternalSidecarAgent(candidateID, progress.AgentType) || isInternalSidecarAgent(progress.AgentID, progress.AgentType) {
+		return nil
+	}
 	agentID := m.resolveAgentID(candidateID)
 	vis := progress.Visibility
 	eventDebugLog().Info("agent_panel: stream_progress",
@@ -714,6 +729,9 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 
 func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 	candidateID := canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
+	if isInternalSidecarAgent(candidateID, start.AgentType) || isInternalSidecarAgent(start.AgentID, start.AgentType) {
+		return nil
+	}
 	agentID := m.resolveAgentID(candidateID)
 	if agentID == "" {
 		agentID = m.ensureAgentForLiveEvent(candidateID, start.AgentID, start.AgentType, start.AgentName, start.PipelineID, start.TaskID, start.TaskName, start.TaskSlug)
@@ -746,6 +764,9 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 // when a stream finishes. This is the normal completion counterpart to
 // handleStreamProgress (which sets StatusThinking on progress events).
 func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
+	if isInternalSidecarAgent(done.AgentID, done.AgentType) {
+		return nil
+	}
 	agentID := m.resolveAgentID(canonicalStreamAgentID(done.AgentID, done.AgentType, done.PipelineID, done.TaskID))
 	if agentID == "" {
 		return nil
@@ -767,6 +788,9 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 
 func (m *Model) handleToolCallEvent(event msg.ToolCallEventMsg) tea.Cmd {
 	candidateID := canonicalStreamAgentID(event.AgentID, event.AgentType, event.PipelineID, event.TaskID)
+	if isInternalSidecarAgent(candidateID, event.AgentType) || isInternalSidecarAgent(event.AgentID, event.AgentType) {
+		return nil
+	}
 	agentID := m.resolveAgentID(strings.TrimSpace(candidateID))
 	if agentID == "" {
 		agentID = m.ensureAgentForLiveEvent(candidateID, event.AgentID, event.AgentType, event.AgentName, event.PipelineID, event.TaskID, event.TaskName, event.TaskSlug)
@@ -852,6 +876,13 @@ func (m *Model) handleToolCallEvent(event msg.ToolCallEventMsg) tea.Cmd {
 func (m *Model) ensureAgentForLiveEvent(panelID, rawAgentID, agentType, agentName, pipelineID, taskID, taskName, taskSlug string) string {
 	panelID = strings.TrimSpace(panelID)
 	rawAgentID = strings.TrimSpace(rawAgentID)
+	identity := panelID
+	if identity == "" {
+		identity = rawAgentID
+	}
+	if isInternalSidecarAgent(identity, agentType) {
+		return ""
+	}
 	if panelID == "" {
 		panelID = rawAgentID
 	}
@@ -1003,6 +1034,9 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 	}
 
 	agentType, pipelineID := m.inferActivityAgentIdentity(agentID, ev)
+	if isInternalSidecarAgent(agentID, agentType) {
+		return ""
+	}
 
 	// Standalone and knowledge agents are singleton rows per type. Pipeline
 	// agents are singleton rows per (type, pipeline_id). Find any existing
@@ -2372,6 +2406,9 @@ func (m *Model) SelectByID(agentID string) bool {
 // persistedProviderID is stored alongside the model; when empty, derived from modelID.
 // No-op if the agent already exists.
 func (m *Model) SeedAgent(id, agentType, name string, supportedModels []ModelEntry, persistedModelID, persistedProviderID string) {
+	if isInternalSidecarAgent(id, agentType) {
+		return
+	}
 	if _, exists := m.agents[id]; exists {
 		return
 	}

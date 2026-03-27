@@ -141,6 +141,26 @@ func TestAcademicBuildToolDefinitionsIncludesNativeWebSearch(t *testing.T) {
 	t.Fatal("expected academic tools to include web_search")
 }
 
+func TestAcademicBuildToolDefinitionsIncludesGroundSource(t *testing.T) {
+	a, err := New(Config{ID: "academic-custom"}, nil)
+	if err != nil {
+		t.Fatalf("new academic: %v", err)
+	}
+
+	tools := a.buildToolDefinitions()
+	for _, tool := range tools {
+		if tool.Name != "ground_source" {
+			continue
+		}
+		if got, want := tool.ResolvedKind(), providers.ToolKindFunction; got != want {
+			t.Fatalf("ground_source tool kind = %q, want %q", got, want)
+		}
+		return
+	}
+
+	t.Fatal("expected academic tools to include ground_source")
+}
+
 func TestAcademicExecuteToolCallRejectsProviderNativeWebSearch(t *testing.T) {
 	a, err := New(Config{ID: "academic-custom"}, nil)
 	if err != nil {

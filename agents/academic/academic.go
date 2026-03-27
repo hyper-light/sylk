@@ -749,6 +749,10 @@ func (a *Academic) intentHandler(intent guide.Intent) (forwardedHandler, error) 
 }
 
 func (a *Academic) handleConversation(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	ctx = a.withRequestResearchExecutionState(ctx, fwd)
+	if contract := academicCompletionContractForForwardedRequest(fwd); contract != nil {
+		ctx = WithAcademicCompletionContract(ctx, contract)
+	}
 	query := strings.TrimSpace(fwd.Input)
 	if query == "" {
 		return &ConversationResult{
@@ -878,10 +882,16 @@ func academicExternalResearchDisciplinePrompt() string {
 	return strings.TrimSpace(
 		"Use an explicit research workflow. " +
 			"1. Plan: identify the concrete sub-questions that must be answered. " +
-			"2. Retrieve: use `web_search` to discover authoritative candidates for each sub-question and follow only the most relevant second-order leads. " +
-			"3. Ground: when a result looks promising, inspect the source itself with `web_fetch`, `fetch_document`, or a bounded `crawl_links` call before relying on specifics. " +
-			"4. Synthesize: stop only when more searching is unlikely to materially change the conclusion. " +
-			"Do not answer from memory alone when source-backed or current evidence matters, and do not keep issuing broad `web_search` calls once you have promising sources that should be fetched or ingested. " +
+			"2. Search: use `web_search` to discover authoritative candidates for each sub-question and keep searching only while you are still surfacing materially better, more relevant, well-sourced leads. " +
+			"3. Ground: once a candidate looks promising, stop broad searching and call `ground_source` to inspect it directly through the secure fetch pipeline. Use `web_fetch`, `fetch_document`, or one bounded `crawl_links` follow-up only when you already know the exact fetch action you need. `ground_source` returns grounded content immediately; background persistence to the knowledge graph and document store usually does not need to block synthesis. " +
+			"Any URL discovered through `web_search` that you want to cite, quote, or include in a sources list must be grounded first with `ground_source` or an equivalent fetch skill; never present an ungrounded search hit as a reference. " +
+			"4. Consult: use Librarian or Archivalist only when codebase fit or historical precedent materially changes the answer, and do not repeat the same consultation question to the same agent in one run. " +
+			"5. Synthesize: stop only when more searching is unlikely to materially change the conclusion. " +
+			"For recommendation, comparison, and design questions, investigate multiple credible options or counterexamples before choosing one. Do not stop after the first plausible answer unless the space is genuinely trivial. " +
+			"Do not answer from memory alone when source-backed or current evidence matters, and do not keep issuing broad `web_search` calls once you have promising sources that should be grounded. " +
+			"For claims about performance, latency, throughput, reliability, security impact, cost, scale, adoption, or comparative advantage, prefer primary empirical evidence and grounded quantitative data whenever feasible. " +
+			"Do not repeat benchmark numbers, percentages, or study findings unless you have inspected the source itself with `ground_source`, `web_fetch`, or `fetch_document`, and when the numbers matter, note the date, study or workload context, and major measurement caveats if available. " +
+			"If strong quantitative evidence is unavailable, say the evidence is qualitative, limited, or stale instead of implying false precision. " +
 			"Consult the Librarian before finalizing any recommendation so the result matches the codebase reality.",
 	)
 }
@@ -896,6 +906,11 @@ func academicForwardedResearchPrompt(fwd *guide.ForwardedRequest) string {
 
 	var b strings.Builder
 	b.WriteString("This research will inform Architect planning. Prefer durable, cited output over transient prose.\n")
+	b.WriteString("When `web_search` surfaces a promising source, call `ground_source` before relying on specifics. Do not keep searching instead of grounding.\n")
+	b.WriteString("Any link surfaced via `web_search` that you plan to cite, quote, or list as a source must be grounded first. Do not hand Architect raw search hits as references.\n")
+	b.WriteString("For recommendation or design-space questions, research multiple credible options before settling on one, then explain why the preferred option beats the strongest alternative.\n")
+	b.WriteString("When the recommendation depends on performance, cost, reliability, security impact, scale, or adoption, back it with grounded statistics, benchmark context, standards, or study results whenever credible data exists. If the evidence is only qualitative, limited, or stale, say that plainly.\n")
+	b.WriteString("Do not cite benchmark numbers, percentages, or study conclusions without grounding the source first and noting the date and measurement context when they materially affect the decision.\n")
 	b.WriteString("If you gather enough evidence to produce a reusable artifact, use `author_research_paper` so Architect receives structured research instead of only a chat answer.\n")
 	b.WriteString("Use `clone_via_librarian` or `crawl_links` when they materially improve source quality or implementation fit.\n")
 	b.WriteString("You may consult the Librarian for codebase fit and the Archivalist for historical precedent, but do not repeat the same consultation question to the same agent in one run.")
@@ -931,7 +946,11 @@ func (a *Academic) withRequestResearchExecutionState(ctx context.Context, fwd *g
 	if sessionID == "" {
 		sessionID = versioningSessionIDOrDefault(ctx, a.config.SessionID)
 	}
-	return WithAcademicResearchExecutionState(ctx, newAcademicResearchExecutionState(sessionID))
+	state := newAcademicResearchExecutionState(sessionID)
+	if academicForwardedSourceMatches(fwd, "architect") {
+		state.setResearchPaperRequired(true)
+	}
+	return WithAcademicResearchExecutionState(ctx, state)
 }
 
 func academicConversationHandoffPrompt(handoff *academicConversationHandoff) string {
@@ -1046,7 +1065,7 @@ func (a *Academic) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest)
 		"The user wants to fetch or download external content. "+
 			"If the request involves a git repository, use clone_via_librarian to have the Librarian clone it into the searchable package store. "+
 			"If the request involves a web page or document and you do not already know the URL, use web_search first. "+
-			"Once you know the URL, use web_fetch or fetch_document. "+
+			"Once you know the URL, prefer ground_source unless you already know you specifically need web_fetch or fetch_document. "+
 			"Provide a clear summary of what was fetched.\n\n%s",
 		fwd.Input,
 	)
@@ -1486,7 +1505,7 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 	researchPrompt := fmt.Sprintf(
 		"Research the following topic thoroughly. Use your tools to consult "+
 			"the Librarian for codebase context and validate findings. "+
-			"Use web_search to discover external sources when you do not already know the right URLs, then fetch primary sources before relying on specifics.\n\n"+
+			"Use web_search to discover external sources when you do not already know the right URLs, then ground promising sources with ground_source before relying on specifics.\n\n"+
 			"Topic: %s", query.Query,
 	)
 	if contract := AcademicCompletionContractFromContext(ctx); contract != nil {

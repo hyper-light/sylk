@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/adalundhe/sylk/core/providers"
 )
 
 func TestConsultSkill_ExecuteResearchRejectsDuplicateQuestion(t *testing.T) {
@@ -29,5 +31,48 @@ func TestConsultSkill_ExecuteResearchRejectsDuplicateQuestion(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "forbids repeating") {
 		t.Fatalf("duplicate consult error = %v, want research-run duplicate guard", err)
+	}
+}
+
+func TestAcademicResearchExecutionState_FinalizationBlockRequiresGroundingAfterSearch(t *testing.T) {
+	state := newAcademicResearchExecutionState("sess-exec")
+	state.observeNativeSearchCall(context.Background(), providers.NativeWebSearchCall{
+		ID:    "search-1",
+		Query: "python cli library recommendation",
+	})
+
+	reminder, _ := state.finalizationBlock()
+	if !strings.Contains(reminder, "`ground_source`") {
+		t.Fatalf("finalization reminder = %q, want ground_source guidance", reminder)
+	}
+}
+
+func TestAcademicResearchExecutionState_FinalizationBlockFlagsRepeatedSearchWithoutGrounding(t *testing.T) {
+	state := newAcademicResearchExecutionState("sess-exec")
+	state.observeNativeSearchCall(context.Background(), providers.NativeWebSearchCall{
+		ID:    "search-1",
+		Query: "python cli library recommendation",
+	})
+	state.observeNativeSearchCall(context.Background(), providers.NativeWebSearchCall{
+		ID:    "search-2",
+		Query: "python cli library recommendation",
+	})
+
+	reminder, fields := state.finalizationBlock()
+	if !strings.Contains(reminder, "Stop repeating the same search path") {
+		t.Fatalf("finalization reminder = %q, want repeated search warning", reminder)
+	}
+	if got := fields["repeated_search_count"]; got == nil {
+		t.Fatalf("expected repeated_search_count field, got %#v", fields)
+	}
+}
+
+func TestAcademicResearchExecutionState_FinalizationBlockRequiresPaperWhenRequested(t *testing.T) {
+	state := newAcademicResearchExecutionState("sess-exec")
+	state.setResearchPaperRequired(true)
+
+	reminder, _ := state.finalizationBlock()
+	if !strings.Contains(reminder, "`author_research_paper`") {
+		t.Fatalf("finalization reminder = %q, want author_research_paper guidance", reminder)
 	}
 }

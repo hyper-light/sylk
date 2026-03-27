@@ -30,14 +30,20 @@ type architectResearchProtocolParams struct {
 }
 
 type academicResearchExecutionState struct {
-	mu                sync.RWMutex
-	sessionID         string
-	consultAttempts   map[string]struct{}
-	sources           []researchExecutionSource
-	sourceIDsByURL    map[string]string
-	librarianEvidence *shared.ConsultationEvidence
-	archivalEvidence  *shared.ConsultationEvidence
-	paperOutput       map[string]any
+	mu                 sync.RWMutex
+	sessionID          string
+	consultAttempts    map[string]struct{}
+	searchAttempts     map[string]researchExecutionSearch
+	observedSearches   map[string]struct{}
+	sources            []researchExecutionSource
+	sourceIDsByURL     map[string]string
+	librarianEvidence  *shared.ConsultationEvidence
+	archivalEvidence   *shared.ConsultationEvidence
+	paperOutput        map[string]any
+	sawNativeSearch    bool
+	sawDiscoverySearch bool
+	repeatedSearch     *researchExecutionSearch
+	requirePaper       bool
 }
 
 type academicResearchExecutionStateKey struct{}
@@ -50,8 +56,21 @@ type researchExecutionSource struct {
 	ContentHash string
 	WordCount   int
 	Ingested    bool
+	Grounded    bool
+	Persisted   bool
+	Persistence string
+	JobID       string
 	Type        SourceType
 	Quality     float64
+}
+
+type researchExecutionSearch struct {
+	Fingerprint           string
+	Query                 string
+	URL                   string
+	Count                 int
+	GroundedSourceCount   int
+	RepeatedWithoutGround bool
 }
 
 func WithAcademicResearchExecutionState(ctx context.Context, state *academicResearchExecutionState) context.Context {
@@ -71,10 +90,21 @@ func academicResearchExecutionStateFromContext(ctx context.Context) *academicRes
 
 func newAcademicResearchExecutionState(sessionID string) *academicResearchExecutionState {
 	return &academicResearchExecutionState{
-		sessionID:       strings.TrimSpace(sessionID),
-		consultAttempts: make(map[string]struct{}),
-		sourceIDsByURL:  make(map[string]string),
+		sessionID:        strings.TrimSpace(sessionID),
+		consultAttempts:  make(map[string]struct{}),
+		searchAttempts:   make(map[string]researchExecutionSearch),
+		observedSearches: make(map[string]struct{}),
+		sourceIDsByURL:   make(map[string]string),
 	}
+}
+
+func (s *academicResearchExecutionState) setResearchPaperRequired(required bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requirePaper = required
 }
 
 func (s *academicResearchExecutionState) recordConsultAttempt(target, query, scope string) error {
@@ -103,25 +133,99 @@ func normalizedAcademicConsultFingerprint(target, query, scope string) string {
 	return fingerprint
 }
 
-func (s *academicResearchExecutionState) observeToolResult(a *Academic, call providers.ToolCall, result string, isError bool) {
+func (s *academicResearchExecutionState) observeToolResult(ctx context.Context, a *Academic, call providers.ToolCall, result string, isError bool) {
 	if s == nil || a == nil || isError {
 		return
 	}
 	switch strings.TrimSpace(call.Name) {
-	case "web_fetch", "fetch_document", "crawl_links":
-		s.recordFetchResult(a, result)
+	case "ground_source", "web_fetch", "fetch_document", "crawl_links":
+		s.recordFetchResult(ctx, a, result)
 	case "consult", "clone_via_librarian":
-		s.recordConsultationResult(call, result)
+		s.recordConsultationResult(ctx, call, result)
 	case "author_research_paper":
-		s.recordPaperOutput(result)
+		s.recordPaperOutput(ctx, result)
 	default:
 		if strings.HasPrefix(strings.TrimSpace(call.Name), "consult_") {
-			s.recordConsultationResult(call, result)
+			s.recordConsultationResult(ctx, call, result)
 		}
 	}
 }
 
-func (s *academicResearchExecutionState) recordFetchResult(a *Academic, result string) {
+func (s *academicResearchExecutionState) observeProviderResponse(ctx context.Context, resp *providers.Response) {
+	if s == nil || resp == nil {
+		return
+	}
+	for _, call := range providers.DecodeNativeWebSearchCalls(resp.ProviderMetadata) {
+		s.observeNativeSearchCall(ctx, call)
+	}
+}
+
+func (s *academicResearchExecutionState) observeNativeSearchCall(ctx context.Context, call providers.NativeWebSearchCall) {
+	if s == nil {
+		return
+	}
+	query := strings.TrimSpace(call.Query)
+	action := strings.TrimSpace(call.Action)
+	rawURL := strings.TrimSpace(call.URL)
+	if query == "" && action == "" && rawURL == "" {
+		return
+	}
+
+	fingerprint, _ := normalizeSearchQuery(firstNonEmpty(query, action+" "+rawURL))
+	if fingerprint == "" {
+		fingerprint = strings.ToLower(strings.TrimSpace(action + " " + rawURL))
+	}
+	if fingerprint == "" {
+		return
+	}
+
+	s.mu.Lock()
+	searchKey := strings.TrimSpace(call.ID)
+	if searchKey == "" {
+		searchKey = call.ArgumentsJSON()
+	}
+	if _, seen := s.observedSearches[searchKey]; seen {
+		s.mu.Unlock()
+		return
+	}
+	s.observedSearches[searchKey] = struct{}{}
+	groundedCount := len(s.sources)
+	attempt := s.searchAttempts[fingerprint]
+	attempt.Fingerprint = fingerprint
+	if attempt.Query == "" {
+		attempt.Query = query
+	}
+	if attempt.URL == "" {
+		attempt.URL = rawURL
+	}
+	if attempt.Count > 0 && groundedCount <= attempt.GroundedSourceCount {
+		attempt.RepeatedWithoutGround = true
+		copyAttempt := attempt
+		copyAttempt.Count++
+		copyAttempt.GroundedSourceCount = groundedCount
+		s.repeatedSearch = &copyAttempt
+	}
+	attempt.Count++
+	attempt.GroundedSourceCount = groundedCount
+	s.searchAttempts[fingerprint] = attempt
+	s.sawNativeSearch = true
+	if strings.EqualFold(action, "search") || (query != "" && rawURL == "") {
+		s.sawDiscoverySearch = true
+	}
+	s.mu.Unlock()
+
+	academicLogResearchStateEvent(ctx, "native_search_observed", map[string]any{
+		"query":                   query,
+		"action":                  action,
+		"url":                     rawURL,
+		"search_fingerprint":      fingerprint,
+		"search_count":            attempt.Count,
+		"grounded_source_count":   groundedCount,
+		"repeated_without_ground": attempt.RepeatedWithoutGround,
+	})
+}
+
+func (s *academicResearchExecutionState) recordFetchResult(ctx context.Context, a *Academic, result string) {
 	payload := parseResearchJSONPayload(result)
 	if !payloadSuccess(payload) {
 		return
@@ -148,14 +252,19 @@ func (s *academicResearchExecutionState) recordFetchResult(a *Academic, result s
 		URL:         rawURL,
 		Title:       title,
 		Description: truncateStr(strings.TrimSpace(summary), 280),
-		IngestedAt:  time.Now().UTC(),
 		UpdatedAt:   time.Now().UTC(),
 		TokenCount:  intValue(payload["word_count"]),
 		Quality:     sourceQualityFromPayload(rawURL, payload),
 		Metadata: map[string]any{
-			"ingested":     boolValue(payload["ingested"]),
-			"content_hash": stringValue(payload["content_hash"]),
+			"grounded":           boolValue(payload["grounded"]),
+			"ingested":           boolValue(payload["ingested"]),
+			"content_hash":       stringValue(payload["content_hash"]),
+			"persistence_status": stringValue(payload["persistence_status"]),
+			"persistence_job_id": stringValue(payload["persistence_job_id"]),
 		},
+	}
+	if boolValue(payload["ingested"]) {
+		source.IngestedAt = time.Now().UTC()
 	}
 	a.upsertResearchSource(source)
 
@@ -169,7 +278,18 @@ func (s *academicResearchExecutionState) recordFetchResult(a *Academic, result s
 				s.sources[i].ContentHash = stringValue(payload["content_hash"])
 				s.sources[i].WordCount = intValue(payload["word_count"])
 				s.sources[i].Ingested = boolValue(payload["ingested"])
+				s.sources[i].Grounded = boolValue(payload["grounded"])
+				s.sources[i].Persisted = boolValue(payload["ingested"])
+				s.sources[i].Persistence = stringValue(payload["persistence_status"])
+				s.sources[i].JobID = stringValue(payload["persistence_job_id"])
 				s.sources[i].Quality = source.Quality
+				academicLogResearchStateEvent(ctx, "grounded_source_updated", map[string]any{
+					"url":                rawURL,
+					"title":              title,
+					"ingested":           boolValue(payload["ingested"]),
+					"persistence_status": stringValue(payload["persistence_status"]),
+					"persistence_job_id": stringValue(payload["persistence_job_id"]),
+				})
 				return
 			}
 		}
@@ -183,12 +303,25 @@ func (s *academicResearchExecutionState) recordFetchResult(a *Academic, result s
 		ContentHash: stringValue(payload["content_hash"]),
 		WordCount:   intValue(payload["word_count"]),
 		Ingested:    boolValue(payload["ingested"]),
+		Grounded:    boolValue(payload["grounded"]),
+		Persisted:   boolValue(payload["ingested"]),
+		Persistence: stringValue(payload["persistence_status"]),
+		JobID:       stringValue(payload["persistence_job_id"]),
 		Type:        source.Type,
 		Quality:     source.Quality,
 	})
+	academicLogResearchStateEvent(ctx, "grounded_source_recorded", map[string]any{
+		"url":                rawURL,
+		"title":              title,
+		"word_count":         intValue(payload["word_count"]),
+		"ingested":           boolValue(payload["ingested"]),
+		"persistence_status": stringValue(payload["persistence_status"]),
+		"persistence_job_id": stringValue(payload["persistence_job_id"]),
+		"source_type":        source.Type,
+	})
 }
 
-func (s *academicResearchExecutionState) recordConsultationResult(call providers.ToolCall, result string) {
+func (s *academicResearchExecutionState) recordConsultationResult(ctx context.Context, call providers.ToolCall, result string) {
 	payload := parseResearchJSONPayload(result)
 	if !payloadSuccess(payload) {
 		return
@@ -217,9 +350,14 @@ func (s *academicResearchExecutionState) recordConsultationResult(call providers
 	case "archivalist":
 		s.archivalEvidence = evidence
 	}
+	academicLogResearchStateEvent(ctx, "consultation_recorded", map[string]any{
+		"target": target,
+		"query":  query,
+		"scope":  scope,
+	})
 }
 
-func (s *academicResearchExecutionState) recordPaperOutput(result string) {
+func (s *academicResearchExecutionState) recordPaperOutput(ctx context.Context, result string) {
 	payload := parseResearchJSONPayload(result)
 	if len(payload) == 0 {
 		return
@@ -227,6 +365,11 @@ func (s *academicResearchExecutionState) recordPaperOutput(result string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.paperOutput = cloneStringAnyMap(payload)
+	academicLogResearchStateEvent(ctx, "research_paper_recorded", map[string]any{
+		"paper_id":   stringValue(payload["paper_id"]),
+		"paper_path": stringValue(payload["paper_path"]),
+		"title":      stringValue(payload["title"]),
+	})
 }
 
 func (s *academicResearchExecutionState) builtPaperOutput() map[string]any {
@@ -286,6 +429,39 @@ func (s *academicResearchExecutionState) consultedAgents() []string {
 
 func (s *academicResearchExecutionState) hasGroundedSources() bool {
 	return len(s.sourceIDs()) > 0
+}
+
+func (s *academicResearchExecutionState) finalizationBlock() (string, map[string]any) {
+	if s == nil {
+		return "", nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	reasons := make([]string, 0, 2)
+	fields := map[string]any{
+		"saw_native_search":    s.sawNativeSearch,
+		"saw_discovery_search": s.sawDiscoverySearch,
+		"grounded_sources":     len(s.sources),
+		"paper_required":       s.requirePaper,
+		"paper_recorded":       len(s.paperOutput) > 0,
+	}
+
+	if s.sawDiscoverySearch && len(s.sources) == 0 {
+		reasons = append(reasons, "You already used `web_search`, but you have not grounded any promising source yet. Pick the strongest candidate URL and call `ground_source`, `web_fetch`, `fetch_document`, or one bounded `crawl_links` follow-up before finalizing.")
+	}
+	if s.repeatedSearch != nil && s.repeatedSearch.RepeatedWithoutGround {
+		fields["repeated_search_query"] = s.repeatedSearch.Query
+		fields["repeated_search_count"] = s.repeatedSearch.Count
+		reasons = append(reasons, fmt.Sprintf("Stop repeating the same search path for %q without grounding a source. Ground one promising result before searching again.", strings.TrimSpace(s.repeatedSearch.Query)))
+	}
+	if s.requirePaper && len(s.paperOutput) == 0 {
+		reasons = append(reasons, "This Architect-facing research consult cannot end yet. You must invoke `author_research_paper` once the evidence is ready, then return.")
+	}
+	if len(reasons) == 0 {
+		return "", nil
+	}
+	return strings.Join(reasons, " "), fields
 }
 
 func (s *academicResearchExecutionState) buildResearchResult(params *authorResearchPaperParams) (*ResearchResult, error) {
@@ -775,6 +951,28 @@ func academicLogArchitectResearchRouting(ctx context.Context, fwd *guide.Forward
 			"intent":            string(fwd.Intent),
 			"query":             strings.TrimSpace(params.Query),
 		},
+	)
+}
+
+func academicLogResearchStateEvent(ctx context.Context, decision string, fields map[string]any) {
+	meta := shared.LogMetaFromContext(ctx)
+	if meta.EventLogger == nil {
+		return
+	}
+	payload := map[string]any{
+		"decision": strings.TrimSpace(decision),
+	}
+	for key, value := range fields {
+		payload[key] = value
+	}
+	shared.LogAgentEvent(
+		meta.EventLogger,
+		agentlog.EventResearchQuery,
+		meta.AgentID,
+		meta.SessionID,
+		meta.CorrID,
+		"debug",
+		payload,
 	)
 }
 

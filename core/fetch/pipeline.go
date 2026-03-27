@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/core/container/security"
+	"github.com/google/uuid"
 )
 
 // InspectFunc is called by the pipeline to have the Guardian inspect
@@ -30,6 +33,8 @@ type Pipeline struct {
 	inspect    InspectFunc
 	ingest     IngestFunc
 	logger     *slog.Logger
+	ingestMu   sync.RWMutex
+	ingestJobs map[string]*IngestJob
 }
 
 // PipelineConfig configures the fetch pipeline.
@@ -59,7 +64,29 @@ func NewPipeline(cfg PipelineConfig) *Pipeline {
 		inspect:    cfg.Inspect,
 		ingest:     cfg.Ingest,
 		logger:     logger,
+		ingestJobs: make(map[string]*IngestJob),
 	}
+}
+
+type IngestStatus string
+
+const (
+	IngestStatusUnavailable IngestStatus = "unavailable"
+	IngestStatusQueued      IngestStatus = "queued"
+	IngestStatusRunning     IngestStatus = "running"
+	IngestStatusCompleted   IngestStatus = "completed"
+	IngestStatusFailed      IngestStatus = "failed"
+)
+
+type IngestJob struct {
+	ID          string       `json:"id"`
+	URL         string       `json:"url"`
+	ContentHash string       `json:"content_hash,omitempty"`
+	Status      IngestStatus `json:"status"`
+	Error       string       `json:"error,omitempty"`
+	QueuedAt    time.Time    `json:"queued_at"`
+	StartedAt   time.Time    `json:"started_at,omitempty"`
+	CompletedAt time.Time    `json:"completed_at,omitempty"`
 }
 
 // FetchRequest describes what to fetch and why.
@@ -70,6 +97,7 @@ type FetchRequest struct {
 	Reason      string                    // Human-readable reason for the fetch
 	SessionID   string                    // Session context
 	SecurityCtx *security.SecurityContext // Capability check
+	AsyncIngest bool                      // Queue persistence instead of blocking on it
 }
 
 // FetchResponse carries the outcome of a pipeline execution.
@@ -80,6 +108,9 @@ type FetchResponse struct {
 	Findings        []InspectionFinding `json:"findings,omitempty"`
 	Provenance      *Provenance         `json:"provenance,omitempty"`
 	Ingested        bool                `json:"ingested"`
+	IngestStatus    IngestStatus        `json:"ingest_status,omitempty"`
+	IngestJobID     string              `json:"ingest_job_id,omitempty"`
+	IngestError     string              `json:"ingest_error,omitempty"`
 	Extracted       *ExtractResult      `json:"extracted,omitempty"`
 	ExtractionError string              `json:"extraction_error,omitempty"`
 	ApprovalDenied  bool                `json:"approval_denied,omitempty"`
@@ -215,7 +246,6 @@ func (p *Pipeline) Execute(ctx context.Context, req *FetchRequest) *FetchRespons
 			InspectionID: entry.ID,
 			Verdict:      "clean",
 			FindingCount: len(findings),
-			IngestedAt:   time.Now(),
 			SourceAgent:  req.SourceAgent,
 			ApprovedBy:   approvedByFromConsent(consentID),
 		}
@@ -227,19 +257,35 @@ func (p *Pipeline) Execute(ctx context.Context, req *FetchRequest) *FetchRespons
 			resp.Extracted = extracted
 		}
 
-		if p.ingest != nil {
-			if err := p.ingest(ctx, released, provenance, extracted); err != nil {
+		switch {
+		case p.ingest == nil:
+			resp.IngestStatus = IngestStatusUnavailable
+		case req.AsyncIngest:
+			jobID := p.enqueueAsyncIngest(ctx, released, provenance, extracted)
+			resp.IngestStatus = IngestStatusQueued
+			resp.IngestJobID = jobID
+		default:
+			syncProvenance := cloneProvenance(provenance)
+			syncProvenance.IngestedAt = time.Now()
+			if err := p.ingest(ctx, released, syncProvenance, extracted); err != nil {
+				resp.IngestStatus = IngestStatusFailed
+				resp.IngestError = err.Error()
 				resp.Error = fmt.Sprintf("ingestion failed: %v", err)
 				return resp
 			}
 			resp.Ingested = true
+			resp.IngestStatus = IngestStatusCompleted
+			provenance.IngestedAt = syncProvenance.IngestedAt
 		}
 
 		resp.Success = true
 		resp.Provenance = provenance
-		p.logger.Info("content ingested",
-			"url", req.URL, "size", fetchResult.BytesRead,
-			"domain", policyResult.Domain)
+		p.logger.Info("content grounded",
+			"url", req.URL,
+			"size", fetchResult.BytesRead,
+			"domain", policyResult.Domain,
+			"ingest_status", resp.IngestStatus,
+			"ingest_job_id", resp.IngestJobID)
 		return resp
 	}
 
@@ -290,4 +336,104 @@ func approvedByFromConsent(consentID string) string {
 		return "auto"
 	}
 	return "user"
+}
+
+func (p *Pipeline) enqueueAsyncIngest(ctx context.Context, entry *QuarantineEntry, provenance *Provenance, extracted *ExtractResult) string {
+	job := &IngestJob{
+		ID:          "ingest_" + uuid.NewString()[:8],
+		URL:         entry.URL,
+		ContentHash: provenance.ContentHash,
+		Status:      IngestStatusQueued,
+		QueuedAt:    time.Now(),
+	}
+	p.setIngestJob(job)
+
+	go p.runAsyncIngest(ctx, job.ID, entry, cloneProvenance(provenance), extracted)
+	return job.ID
+}
+
+func (p *Pipeline) runAsyncIngest(ctx context.Context, jobID string, entry *QuarantineEntry, provenance *Provenance, extracted *ExtractResult) {
+	job := p.updateIngestJob(jobID, func(job *IngestJob) {
+		job.Status = IngestStatusRunning
+		job.StartedAt = time.Now()
+	})
+	if job == nil {
+		return
+	}
+
+	base := ctx
+	if base == nil {
+		base = context.Background()
+	}
+	ingestCtx, cancel := context.WithTimeout(context.WithoutCancel(base), 2*time.Minute)
+	defer cancel()
+
+	provenance.IngestedAt = time.Now()
+	if err := p.ingest(ingestCtx, entry, provenance, extracted); err != nil {
+		p.updateIngestJob(jobID, func(job *IngestJob) {
+			job.Status = IngestStatusFailed
+			job.Error = err.Error()
+			job.CompletedAt = time.Now()
+		})
+		p.logger.Warn("async content ingest failed",
+			"url", entry.URL,
+			"job_id", jobID,
+			"error", err)
+		return
+	}
+
+	p.updateIngestJob(jobID, func(job *IngestJob) {
+		job.Status = IngestStatusCompleted
+		job.CompletedAt = time.Now()
+	})
+	p.logger.Info("async content ingest completed",
+		"url", entry.URL,
+		"job_id", jobID)
+}
+
+func (p *Pipeline) GetIngestJob(id string) (*IngestJob, bool) {
+	if p == nil || strings.TrimSpace(id) == "" {
+		return nil, false
+	}
+	p.ingestMu.RLock()
+	defer p.ingestMu.RUnlock()
+	job, ok := p.ingestJobs[id]
+	if !ok || job == nil {
+		return nil, false
+	}
+	clone := *job
+	return &clone, true
+}
+
+func (p *Pipeline) setIngestJob(job *IngestJob) {
+	if p == nil || job == nil {
+		return
+	}
+	p.ingestMu.Lock()
+	defer p.ingestMu.Unlock()
+	clone := *job
+	p.ingestJobs[job.ID] = &clone
+}
+
+func (p *Pipeline) updateIngestJob(id string, fn func(*IngestJob)) *IngestJob {
+	if p == nil || strings.TrimSpace(id) == "" || fn == nil {
+		return nil
+	}
+	p.ingestMu.Lock()
+	defer p.ingestMu.Unlock()
+	job, ok := p.ingestJobs[id]
+	if !ok || job == nil {
+		return nil
+	}
+	fn(job)
+	clone := *job
+	return &clone
+}
+
+func cloneProvenance(provenance *Provenance) *Provenance {
+	if provenance == nil {
+		return nil
+	}
+	clone := *provenance
+	return &clone
 }

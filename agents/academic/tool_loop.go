@@ -57,8 +57,8 @@ func (a *Academic) executeToolLoopWithDiscipline(
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: "no LLM provider configured"})
 		}
-			return "", fmt.Errorf("academic: no LLM provider configured")
-		}
+		return "", fmt.Errorf("academic: no LLM provider configured")
+	}
 	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 		shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationStarted,
 			lm.AgentID, lm.SessionID, lm.CorrID, "info",
@@ -99,68 +99,83 @@ func (a *Academic) executeToolLoopWithDiscipline(
 				return "", err
 			}
 			continue
-			}
-			// ── END STEERING ──
+		}
+		// ── END STEERING ──
 
-			if a.toolDefsDirty {
-				baseTools = a.buildToolDefinitionsWithSurface(surface)
-				a.toolDefsDirty = false
-			}
-			req.Tools = append([]providers.Tool(nil), baseTools...)
+		if a.toolDefsDirty {
+			baseTools = a.buildToolDefinitionsWithSurface(surface)
+			a.toolDefsDirty = false
+		}
+		req.Tools = append([]providers.Tool(nil), baseTools...)
 
-			// ── CONTEXT BUDGET ──
-			if err := shared.ApplyContextBudget(ctx, turn, maxRuns, req); err != nil {
-				return "", err
-			}
+		// ── CONTEXT BUDGET ──
+		if err := shared.ApplyContextBudget(ctx, turn, maxRuns, req); err != nil {
+			return "", err
+		}
 
-			turnStart := time.Now()
-			resp, streamed, err := a.completeLLMTurn(ctx, p, req)
-			if err != nil {
-				if ctx.Err() != nil {
-					return "", ctx.Err()
-				}
-				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-					shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+		turnStart := time.Now()
+		resp, streamed, err := a.completeLLMTurn(ctx, p, req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
 					&agentlog.ErrorPayload{Error: fmt.Sprintf("llm: %v", err)})
 			}
 			return "", fmt.Errorf("academic llm: %w", err)
 		}
 
-			if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
-				gov.Calibrate(ctx, resp, req.Messages)
-			}
-			shared.AccumulateUsage(ctx, &resp.Usage)
-			if !streamed {
-				shared.PublishIntermediateToolTurn(a.bus, a.channels, ctx, a.id, resp)
-			}
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
+			gov.Calibrate(ctx, resp, req.Messages)
+		}
+		shared.AccumulateUsage(ctx, &resp.Usage)
+		if !streamed {
+			shared.PublishIntermediateToolTurn(a.bus, a.channels, ctx, a.id, resp)
+		}
+		if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
+			execState.observeProviderResponse(ctx, resp)
+		}
 
-			if len(resp.ToolCalls) == 0 {
-				a.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
-				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-					shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
-						lm.AgentID, lm.SessionID, lm.CorrID, "info",
-						&agentlog.GenerationPayload{Phase: "completed", ToolRuns: turn})
+		if len(resp.ToolCalls) == 0 {
+			if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
+				if reminder, fields := execState.finalizationBlock(); reminder != "" {
+					fields["content_preview"] = truncateStr(strings.TrimSpace(resp.Content), 200)
+					academicLogResearchStateEvent(ctx, "finalization_blocked", fields)
+					req.Messages = append(req.Messages, providers.Message{
+						Role:    providers.RoleUser,
+						Content: reminder,
+					})
+					a.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
+					continue
 				}
+			}
+			a.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.GenerationPayload{Phase: "completed", ToolRuns: turn})
+			}
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-			if err := surface.ValidateBatch(a.toolInvocationsWithSurface(ctx, resp.ToolCalls, surface)); err != nil {
-				return "", err
-			}
+		if err := surface.ValidateBatch(a.toolInvocationsWithSurface(ctx, resp.ToolCalls, surface)); err != nil {
+			return "", err
+		}
 
-			if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen, req.Messages); dup {
+		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen, req.Messages); dup {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
-						&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s", sig.Name)})
-				}
-				return "", fmt.Errorf("academic repeated tool call: %s", sig.Name)
+					lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s", sig.Name)})
 			}
+			return "", fmt.Errorf("academic repeated tool call: %s", sig.Name)
+		}
 
-			errCount, rerouted, delegated, delegatedMessage := a.applyToolCalls(ctx, req, resp, surface)
-			a.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
-			if rerouted {
+		errCount, rerouted, delegated, delegatedMessage := a.applyToolCalls(ctx, req, resp, surface)
+		a.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
 		if delegated {
@@ -270,7 +285,7 @@ func (a *Academic) applyToolCalls(
 		})
 		if !isDelegated {
 			if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
-				execState.observeToolResult(a, call, result, isError)
+				execState.observeToolResult(ctx, a, call, result, isError)
 			}
 			if tracker := searchEvidenceTrackerFromContext(ctx); tracker != nil {
 				tracker.observeToolResult(call, result, isError)
@@ -511,14 +526,28 @@ func (a *Academic) streamLLMTurn(
 		a.publishThoughtProgress(ctx, thought)
 	}
 	resp := collector.Response()
+	if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
+		execState.observeProviderResponse(ctx, resp)
+	}
 	if resp != nil && len(resp.ToolCalls) > 0 {
 		shared.PublishIntermediateToolTurn(a.bus, a.channels, ctx, a.id, resp)
 		return resp, nil
 	}
 	if resp != nil {
 		if text := bufferedText.String(); strings.TrimSpace(text) != "" {
-			streamedText = true
-			shared.PublishStreamChunk(a.bus, a.channels, ctx, a.id, text)
+			if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
+				if reminder, fields := execState.finalizationBlock(); reminder != "" {
+					fields["streamed_text_suppressed"] = true
+					fields["content_preview"] = truncateStr(strings.TrimSpace(text), 200)
+					academicLogResearchStateEvent(ctx, "finalization_blocked", fields)
+				} else {
+					streamedText = true
+					shared.PublishStreamChunk(a.bus, a.channels, ctx, a.id, text)
+				}
+			} else {
+				streamedText = true
+				shared.PublishStreamChunk(a.bus, a.channels, ctx, a.id, text)
+			}
 		}
 	}
 	if tracker := searchEvidenceTrackerFromContext(ctx); tracker != nil && (resp == nil || strings.TrimSpace(resp.Content) == "") {

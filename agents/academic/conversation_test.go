@@ -22,6 +22,21 @@ func (p *conversationModeProvider) Complete(_ context.Context, req *providers.Re
 	}, nil
 }
 
+type conversationSearchOnlyProvider struct{}
+
+func (p *conversationSearchOnlyProvider) Complete(_ context.Context, req *providers.Request) (*providers.Response, error) {
+	_ = req
+	return &providers.Response{
+		Content: "Typer is the best choice.",
+		Model:   "gpt-5.4-pro",
+		ProviderMetadata: map[string]any{
+			providers.ProviderMetadataNativeWebSearchCallsKey: []providers.NativeWebSearchCall{
+				{ID: "ws_1", Provider: "openai", Action: "search", Query: "best python cli libraries 2025"},
+			},
+		},
+	}, nil
+}
+
 func TestAcademicProcessForwardedRequest_UserFacingUsesConversationMode(t *testing.T) {
 	a, err := New(Config{ID: "academic"}, &conversationModeProvider{})
 	if err != nil {
@@ -54,7 +69,7 @@ func TestAcademicProcessForwardedRequest_AgentConsultUsesWorkerMode(t *testing.T
 	}
 
 	result, err := a.processForwardedRequest(context.Background(), &guide.ForwardedRequest{
-		SourceAgentID: "architect",
+		SourceAgentID: "engineer",
 		Intent:        guide.IntentRecall,
 		Input:         "Research Python packaging guidance.",
 	})
@@ -75,10 +90,10 @@ func TestAcademicProcessForwardedRequest_AgentConsultUsesWorkerMode(t *testing.T
 	for _, needle := range []string{
 		"Use an explicit research workflow.",
 		"use `web_search` to discover authoritative candidates",
-		"`web_fetch`, `fetch_document`, or a bounded `crawl_links` call",
+		"call `ground_source` to inspect it directly",
+		"`web_fetch`, `fetch_document`, or one bounded `crawl_links`",
+		"investigate multiple credible options or counterexamples",
 		"Consult the Librarian",
-		"Architect planning",
-		"`author_research_paper`",
 	} {
 		if !strings.Contains(prompt, needle) {
 			t.Fatalf("worker recall prompt missing %q:\n%s", needle, prompt)
@@ -90,40 +105,39 @@ func TestAcademicProcessForwardedRequest_AgentConsultUsesWorkerMode(t *testing.T
 }
 
 func TestAcademicProcessForwardedRequest_ArchitectConsultExposesResearchPaperTool(t *testing.T) {
-	provider := &conversationModeProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{ID: "academic"}, &conversationModeProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
 
-	result, err := a.processForwardedRequest(context.Background(), &guide.ForwardedRequest{
+	fwd := &guide.ForwardedRequest{
 		SourceAgentID: "architect",
 		Intent:        guide.IntentRecall,
 		Input:         "Research Python packaging guidance.",
-	})
-	if err != nil {
-		t.Fatalf("processForwardedRequest: %v", err)
 	}
-	if _, ok := result.(map[string]any); !ok {
-		t.Fatalf("result type = %T, want map[string]any", result)
+	ctx := a.withRequestResearchExecutionState(context.Background(), fwd)
+	state := academicResearchExecutionStateFromContext(ctx)
+	if state == nil || !state.requirePaper {
+		t.Fatalf("expected architect request to require author_research_paper, state=%#v", state)
 	}
-	if provider.lastReq == nil {
-		t.Fatal("expected provider request to be captured")
-	}
+	prompt := buildAcademicRecallPrompt(fwd)
+	surface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
+	a.prepareSkillsForInput(prompt)
 
 	foundPaper := false
-	for _, tool := range provider.lastReq.Tools {
+	for _, tool := range a.buildToolDefinitionsWithSurface(surface) {
 		if tool.Name == "author_research_paper" {
 			foundPaper = true
 			break
 		}
 	}
 	if !foundPaper {
-		t.Fatalf("expected architect consult surface to include author_research_paper, got %#v", provider.lastReq.Tools)
+		t.Fatalf("expected architect consult surface to include author_research_paper")
 	}
 
-	prompt := provider.lastReq.Messages[0].Content
 	for _, needle := range []string{
+		"call `ground_source` before relying on specifics",
+		"research multiple credible options before settling on one",
 		"Prefer durable, cited output",
 		"`author_research_paper`",
 		"`clone_via_librarian`",
@@ -136,37 +150,35 @@ func TestAcademicProcessForwardedRequest_ArchitectConsultExposesResearchPaperToo
 }
 
 func TestAcademicProcessForwardedRequest_CustomArchitectIDExposesResearchPaperTool(t *testing.T) {
-	provider := &conversationModeProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{ID: "academic"}, &conversationModeProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
 
-	result, err := a.processForwardedRequest(context.Background(), &guide.ForwardedRequest{
+	fwd := &guide.ForwardedRequest{
 		SourceAgentID:   "architect-primary",
 		SourceAgentName: "Architect",
 		Intent:          guide.IntentRecall,
 		Input:           "Research Python packaging guidance.",
-	})
-	if err != nil {
-		t.Fatalf("processForwardedRequest: %v", err)
 	}
-	if _, ok := result.(map[string]any); !ok {
-		t.Fatalf("result type = %T, want map[string]any", result)
+	ctx := a.withRequestResearchExecutionState(context.Background(), fwd)
+	state := academicResearchExecutionStateFromContext(ctx)
+	if state == nil || !state.requirePaper {
+		t.Fatalf("expected custom architect request to require author_research_paper, state=%#v", state)
 	}
-	if provider.lastReq == nil {
-		t.Fatal("expected provider request to be captured")
-	}
+	prompt := buildAcademicRecallPrompt(fwd)
+	surface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
+	a.prepareSkillsForInput(prompt)
 
 	foundPaper := false
-	for _, tool := range provider.lastReq.Tools {
+	for _, tool := range a.buildToolDefinitionsWithSurface(surface) {
 		if tool.Name == "author_research_paper" {
 			foundPaper = true
 			break
 		}
 	}
 	if !foundPaper {
-		t.Fatalf("expected author_research_paper for custom architect id, got %#v", provider.lastReq.Tools)
+		t.Fatal("expected author_research_paper for custom architect id")
 	}
 }
 
@@ -231,12 +243,32 @@ func TestAcademicProcessForwardedRequest_UserFacingConversationPromptEncouragesW
 	systemPrompt := provider.lastReq.SystemPrompt
 	for _, needle := range []string{
 		"use `web_search` to discover authoritative candidates",
-		"`web_fetch`, `fetch_document`, or a bounded `crawl_links` call",
+		"call `ground_source` to inspect it directly",
+		"investigate multiple credible options or counterexamples",
 		"Do not answer from memory alone",
 		"Consult the Librarian",
 	} {
 		if !strings.Contains(systemPrompt, needle) {
 			t.Fatalf("conversation system prompt missing %q:\n%s", needle, systemPrompt)
 		}
+	}
+}
+
+func TestAcademicProcessForwardedRequest_UserFacingSearchOnlyConversationDoesNotFinalize(t *testing.T) {
+	a, err := New(Config{ID: "academic", MaxToolRuns: 1}, &conversationSearchOnlyProvider{})
+	if err != nil {
+		t.Fatalf("new academic: %v", err)
+	}
+
+	_, err = a.processForwardedRequest(context.Background(), &guide.ForwardedRequest{
+		SourceAgentID: "tui",
+		Intent:        guide.IntentRecall,
+		Input:         "What is the best Python CLI library today?",
+	})
+	if err == nil {
+		t.Fatal("expected search-only conversation to be blocked from finalizing")
+	}
+	if !strings.Contains(err.Error(), "exhausted tool-call loop") {
+		t.Fatalf("error = %v, want exhaustion from grounding reminder loop", err)
 	}
 }

@@ -2825,6 +2825,49 @@ func TestModel_RegisteredTransition(t *testing.T) {
 	}
 }
 
+func TestModel_IgnoresScribeRegistrationActivity(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_reg_scribe",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "scribe-guardian-1234",
+			Content:   "Agent registered: scribe-guardian",
+			Data: map[string]any{
+				"agent_name": "Guardian Scribe",
+				"agent_type": "scribe-guardian",
+			},
+		},
+	})
+
+	if got := len(model.agents); got != 0 {
+		t.Fatalf("agents count = %d, want 0", got)
+	}
+}
+
+func TestModel_IgnoresScribeToolCallStream(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		SessionID:     "session-1",
+		CorrelationID: "corr-scribe-tool",
+		AgentID:       "scribe-guardian-1234",
+		AgentType:     "scribe-guardian",
+		AgentName:     "Guardian Scribe",
+		ToolCallKey:   "tc-scribe-1",
+		ToolName:      "approval_guardian",
+		Phase:         0,
+	})
+
+	if got := len(model.agents); got != 0 {
+		t.Fatalf("agents count = %d, want 0", got)
+	}
+}
+
 func TestModel_HandoffActivityUpdatesStatusAndContextUsage(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)

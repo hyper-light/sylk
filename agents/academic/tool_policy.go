@@ -9,6 +9,7 @@ func academicVisibleSkillNames() []string {
 	return []string{
 		"consult",
 		"web_search",
+		"ground_source",
 		"web_fetch",
 		"fetch_document",
 	}
