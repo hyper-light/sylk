@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/google/uuid"
@@ -168,6 +169,7 @@ func (o *Orchestrator) publishStreamEvent(ctx context.Context, event *guide.Stre
 		CorrelationID:     metadata.CorrelationID,
 		RespondingAgentID: o.config.AgentID,
 		TargetAgentID:     metadata.SourceAgentID,
+		Metadata:          shared.MergeStreamMetadata(shared.StreamResponseMetadataFromContext(ctx), nil),
 		Event:             event,
 	}
 	msg := &guide.Message{

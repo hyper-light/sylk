@@ -27,7 +27,7 @@ func testArchitectWithStore(t *testing.T, plans ...*DesignPlan) *Architect {
 	return &Architect{
 		planStore:   store,
 		logger:      slog.Default(),
-		pendingBus:  make(map[string]chan *guide.Message),
+		pendingBus:  make(map[string]*agentshared.PendingSyncWait),
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 	}
 }
@@ -376,6 +376,43 @@ func TestHandleConversation_ClearsExpiredPendingWorkAndCarriesReadyPlanIntoPlann
 	}
 	if !strings.Contains(planner.lastRequest.PlanSummary, "Wire the endpoint") {
 		t.Fatalf("plan_summary = %q, want task summary from ready plan", planner.lastRequest.PlanSummary)
+	}
+}
+
+func TestHandleCheck_UsesConversationPathForRecoveredReadyPlan(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-ready-check-followup",
+		SessionID: "sess-check-followup",
+		Query:     "build the feature",
+		Status:    PlanStatusReady,
+		UpdatedAt: now,
+		Tasks: []*AtomicTask{
+			{Name: "Wire the endpoint", AgentType: "engineer", Description: "Implement the initial HTTP surface."},
+		},
+	}
+	a := testArchitectWithStore(t, plan)
+	planner := &captureConversationPlanner{response: "planner saw the recovered plan"}
+	a.config.EnableLLM = true
+	a.planner = planner
+
+	result, err := a.handleCheck(context.Background(), &guide.ForwardedRequest{
+		Input:     "can you remind me what we planned?",
+		SessionID: plan.SessionID,
+		Intent:    guide.IntentCheck,
+	})
+	if err != nil {
+		t.Fatalf("handleCheck error = %v", err)
+	}
+	conv := unwrapConversationResult(t, result)
+	if conv.Response != "planner saw the recovered plan" {
+		t.Fatalf("response = %q, want planner response", conv.Response)
+	}
+	if planner.lastRequest.Mode != plannerConversationModeExistingReady {
+		t.Fatalf("mode = %q, want %q", planner.lastRequest.Mode, plannerConversationModeExistingReady)
+	}
+	if planner.lastRequest.PlanID != plan.ID {
+		t.Fatalf("plan_id = %q, want %q", planner.lastRequest.PlanID, plan.ID)
 	}
 }
 

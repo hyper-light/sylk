@@ -11,6 +11,7 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/knowledge/query"
+	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -519,8 +520,39 @@ func knowledgeSearchSkill(l *Librarian) *skills.Skill {
 
 			l.mu.Lock()
 			ks := l.knowledgeStore
+			backend := l.knowledgeBackend
 			l.mu.Unlock()
 
+			if backend != nil {
+				result, err := backend.Search(ctx, &search.SearchRequest{
+					Query: params.Query,
+					Limit: params.Limit,
+				})
+				if err == nil {
+					entries := make([]map[string]any, 0, len(result.Hits))
+					for _, hit := range result.Hits {
+						entries = append(entries, map[string]any{
+							"id":              hit.ID,
+							"path":            hit.Path,
+							"content":         hit.Content,
+							"score":           hit.Score,
+							"document_type":   hit.Document.Type,
+							"primary_node_id": hit.PrimaryNodeID,
+							"primary_type":    hit.PrimaryNodeType,
+							"domain":          hit.Domain,
+							"symbols":         hit.Symbols,
+							"related_paths":   hit.RelatedPaths,
+							"related_symbols": hit.RelatedSymbols,
+						})
+					}
+					return map[string]any{
+						"results":      entries,
+						"count":        len(entries),
+						"query":        params.Query,
+						"head_version": result.HeadVersion,
+					}, nil
+				}
+			}
 			if ks == nil {
 				return nil, fmt.Errorf("knowledge store not available (indexing may still be in progress)")
 			}

@@ -72,7 +72,7 @@ type PipelineInspector struct {
 
 	// Sync RPC (for feedback loop).
 	pendingMu  sync.Mutex
-	pendingBus map[string]chan *guide.Message
+	pendingBus map[string]*agentShared.PendingSyncWait
 
 	// State.
 	criteria  map[string]*shared.InspectorCriteria
@@ -119,7 +119,7 @@ func New(cfg shared.PipelineInspectorConfig, provider providers.ProviderAdapter)
 		logger:            slog.Default().With("agent", "inspector-pipeline"),
 		provider:          provider,
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
-		pendingBus:        make(map[string]chan *guide.Message),
+		pendingBus:        make(map[string]*agentShared.PendingSyncWait),
 		criteria:          make(map[string]*shared.InspectorCriteria),
 		taskFiles:         make(map[string][]string),
 		results:           make(map[string]*shared.InspectorResult),
@@ -417,7 +417,9 @@ func stageInstructions(contract *agentShared.TaskExecutionContract, stage string
 			"Use the task contract and the relevant tool definitions as the workflow source of truth. Missing implementation is expected evidence at this stage. Record pending validation with `get_validation_status` and publish the reusable handoff artifact once the criteria and scope are clear.\n"
 	}
 	return "### Instructions\n\n" +
-		"Implementation evidence exists. Use the task contract and tool definitions to validate against criteria, gather the necessary quality evidence, grade the implementation, and publish reusable findings.\n"
+		"Implementation evidence exists. Prefer a single tester-backed audit cycle over broad local re-auditing.\n" +
+		"If Engineer or Designer just handed work back and no tester audit is already pending, call `finalize_pipeline` to issue or recognize the single audit cycle.\n" +
+		"Do not fan out into repeated audit or grading passes on unchanged workspace state. Use additional local validation tools only when a specific concrete gap remains that the current tester response or protocol state does not already answer.\n"
 }
 
 func inspectorContractSynthesisMode(contract *agentShared.TaskExecutionContract, stage string) bool {
@@ -561,8 +563,7 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	defer cancel()
 
 	ctx := reqCtx
-	ctx = agentShared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
-	ctx = agentShared.WithStreamContextMetadata(ctx, map[string]any{
+	ctx = agentShared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, agentShared.MergeStreamMetadata(fwd.Metadata, map[string]any{
 		"pipeline_task": true,
 		"agent_type":    "inspector-pipeline",
 		"agent_name":    "Inspector",
@@ -572,7 +573,7 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 		"task_name":     pi.pipelineName,
 		"dag_id":        stringValue(fwd.Metadata, "dag_id"),
 		"node_id":       stringValue(fwd.Metadata, "node_id"),
-	})
+	}))
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	startTime := time.Now()
 

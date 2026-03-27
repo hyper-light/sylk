@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -138,6 +139,7 @@ func (gt *GlobalTester) publishStreamEvent(ctx context.Context, event *guide.Str
 		CorrelationID:     metadata.CorrelationID,
 		RespondingAgentID: gt.id,
 		TargetAgentID:     metadata.SourceAgentID,
+		Metadata:          agentshared.MergeStreamMetadata(agentshared.StreamResponseMetadataFromContext(ctx), nil),
 		Event:             event,
 	}
 	msg := &guide.Message{

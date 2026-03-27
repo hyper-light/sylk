@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -28,6 +29,451 @@ func TestWithToolCallEmitter_RoundTrip(t *testing.T) {
 func TestEmitToolCall_NilEmitter(t *testing.T) {
 	// Must not panic with a bare context.
 	EmitToolCall(context.Background(), ToolCallEvent{ToolName: "test"})
+}
+
+func TestEmitToolCall_AttachesStreamMetadata(t *testing.T) {
+	var received []ToolCallEvent
+	ctx := WithStreamContext(context.Background(), "corr-tool-meta", "tui")
+	ctx = WithStreamContextMetadata(ctx, map[string]any{
+		"agent_type":    "engineer",
+		"pipeline_task": true,
+		"task_id":       "task-1",
+	})
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { received = append(received, ev) })
+
+	EmitToolCall(ctx, ToolCallEvent{ToolName: "read_file", Phase: ToolCallStart})
+
+	if len(received) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(received))
+	}
+	if got, ok := received[0].StreamMetadata["task_id"].(string); !ok || got != "task-1" {
+		t.Fatalf("stream metadata task_id = %#v, want task-1", received[0].StreamMetadata["task_id"])
+	}
+	if got, ok := received[0].StreamMetadata["agent_type"].(string); !ok || got != "engineer" {
+		t.Fatalf("stream metadata agent_type = %#v, want engineer", received[0].StreamMetadata["agent_type"])
+	}
+}
+
+func TestEmitToolCall_NormalizesPartialInterAgentConsultStartMetadata(t *testing.T) {
+	var received []ToolCallEvent
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { received = append(received, ev) })
+
+	EmitToolCall(ctx, ToolCallEvent{
+		ToolName: "consult",
+		Phase:    ToolCallStart,
+		FullArgs: `{"mode":"single","target":"academic","query":"Assess the approach."}`,
+		InterAgent: &InterAgentToolEvent{
+			Kind:   InterAgentToolEventKindConsult,
+			Status: InterAgentToolEventStatusPending,
+		},
+	})
+
+	if len(received) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(received))
+	}
+	if received[0].InterAgent == nil {
+		t.Fatal("expected normalized inter-agent metadata")
+	}
+	if got := received[0].InterAgent.AgentTypes; len(got) != 1 || got[0] != "academic" {
+		t.Fatalf("agent_types = %#v, want [academic]", got)
+	}
+	if got := received[0].InterAgent.Summary; got != "Assess the approach." {
+		t.Fatalf("summary = %q, want %q", got, "Assess the approach.")
+	}
+}
+
+func TestObserveProviderToolCallChunk_PreAnnouncesWithoutDuplicateTimedStart(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithStreamContext(context.Background(), "corr-provider-tool", "tui")
+	ctx = WithStreamContextMetadata(ctx, map[string]any{
+		"agent_type": "engineer",
+		"task_id":    "task-1",
+	})
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { events = append(events, ev) })
+
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolStart,
+		ToolCall: &providers.ToolCallChunk{
+			ID:   "call-1",
+			Name: "read_file",
+		},
+	})
+	if len(events) != 1 {
+		t.Fatalf("expected immediate pre-announced start on tool_start, got %d events", len(events))
+	}
+	if events[0].Phase != ToolCallStart {
+		t.Fatalf("pre-announced phase = %d, want start", events[0].Phase)
+	}
+	if events[0].ArgsSummary != "" {
+		t.Fatalf("initial args summary = %q, want empty before args delta arrives", events[0].ArgsSummary)
+	}
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolDelta,
+		ToolCall: &providers.ToolCallChunk{
+			ID:             "call-1",
+			ArgumentsDelta: `{"path":"README.md"`,
+		},
+	})
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolEnd,
+		ToolCall: &providers.ToolCallChunk{
+			ID:             "call-1",
+			ArgumentsDelta: `}`,
+		},
+	})
+
+	if len(events) != 1 {
+		t.Fatalf("expected 1 pre-announced event, got %d", len(events))
+	}
+
+	call := providers.ToolCall{
+		ID:        "call-1",
+		Name:      "read_file",
+		Arguments: `{"path":"README.md"}`,
+	}
+	result, err := TimedToolCall(ctx, "engineer", call, func() (string, error) {
+		return "ok", nil
+	})
+	if err != nil {
+		t.Fatalf("TimedToolCall: %v", err)
+	}
+	if result != "ok" {
+		t.Fatalf("result = %q, want ok", result)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected start + complete with no duplicate start, got %d events", len(events))
+	}
+	if events[1].Phase != ToolCallComplete {
+		t.Fatalf("completion phase = %d, want complete", events[1].Phase)
+	}
+	if !events[1].Success {
+		t.Fatal("expected completion success=true")
+	}
+	if events[1].StartedAt != events[0].StartedAt {
+		t.Fatalf("completion started_at = %v, want preannounced %v", events[1].StartedAt, events[0].StartedAt)
+	}
+	if events[1].Duration < 0 {
+		t.Fatalf("completion duration = %v, want non-negative", events[1].Duration)
+	}
+	if got, ok := events[1].StreamMetadata["task_id"].(string); !ok || got != "task-1" {
+		t.Fatalf("completion task_id = %#v, want task-1", events[1].StreamMetadata["task_id"])
+	}
+}
+
+func TestObserveProviderToolCallChunk_AnnouncesStartOnToolStartWhenIDIsKnown(t *testing.T) {
+	var events []ToolCallEvent
+	startedAt := time.Now().Add(-150 * time.Millisecond)
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type:      providers.ChunkTypeToolStart,
+		Timestamp: startedAt,
+		ToolCall: &providers.ToolCallChunk{
+			ID:   "call-immediate",
+			Name: "web_fetch",
+		},
+	})
+
+	if len(events) != 1 {
+		t.Fatalf("expected immediate start event on tool_start, got %d events", len(events))
+	}
+	if events[0].Phase != ToolCallStart {
+		t.Fatalf("phase = %d, want start", events[0].Phase)
+	}
+	if got, want := events[0].ToolCallKey, "id:call-immediate"; got != want {
+		t.Fatalf("tool_call_key = %q, want %q", got, want)
+	}
+	if got, want := events[0].StartedAt, startedAt; !got.Equal(want) {
+		t.Fatalf("started_at = %v, want %v", got, want)
+	}
+
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolEnd,
+		ToolCall: &providers.ToolCallChunk{
+			ID: "call-immediate",
+		},
+	})
+
+	if len(events) != 1 {
+		t.Fatalf("tool_end should not duplicate start event, got %d events", len(events))
+	}
+}
+
+func TestObserveProviderToolCallChunk_GenericConsultWaitsForResolvableArgsBeforePreannounce(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolStart,
+		ToolCall: &providers.ToolCallChunk{
+			ID:   "call-consult",
+			Name: "consult",
+		},
+	})
+	if len(events) != 0 {
+		t.Fatalf("expected generic consult tool_start without args to stay hidden, got %d events", len(events))
+	}
+
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolDelta,
+		ToolCall: &providers.ToolCallChunk{
+			ID:             "call-consult",
+			ArgumentsDelta: `{"target":"librarian","query":"Find relevant patterns."}`,
+		},
+	})
+	if len(events) != 1 {
+		t.Fatalf("expected consult start once args resolved, got %d events", len(events))
+	}
+	if events[0].Phase != ToolCallStart {
+		t.Fatalf("phase = %d, want start", events[0].Phase)
+	}
+	if events[0].InterAgent == nil {
+		t.Fatal("expected inter-agent consult metadata on resolved start event")
+	}
+	if got := events[0].InterAgent.AgentTypes; len(got) != 1 || got[0] != "librarian" {
+		t.Fatalf("agent_types = %#v, want [librarian]", got)
+	}
+	if got := events[0].InterAgent.Summary; got != "Find relevant patterns." {
+		t.Fatalf("summary = %q, want Find relevant patterns.", got)
+	}
+
+	call := providers.ToolCall{
+		ID:        "call-consult",
+		Name:      "consult",
+		Arguments: `{"target":"librarian","query":"Find relevant patterns."}`,
+	}
+	if _, err := TimedToolCall(ctx, "academic", call, func() (string, error) {
+		return `{"success":true}`, nil
+	}); err != nil {
+		t.Fatalf("TimedToolCall: %v", err)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("expected start + completion, got %d events", len(events))
+	}
+	if events[1].Phase != ToolCallComplete {
+		t.Fatalf("completion phase = %d, want complete", events[1].Phase)
+	}
+	if events[1].InterAgent == nil {
+		t.Fatal("expected inter-agent consult metadata on completion event")
+	}
+}
+
+func TestObserveProviderToolCallChunk_GenericConsultCanPreannounceAtToolEndWhenArgsArriveLate(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolStart,
+		ToolCall: &providers.ToolCallChunk{
+			ID:   "call-consult-end",
+			Name: "consult",
+		},
+	})
+	if len(events) != 0 {
+		t.Fatalf("expected generic consult tool_start without args to stay hidden, got %d events", len(events))
+	}
+
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolEnd,
+		ToolCall: &providers.ToolCallChunk{
+			ID:             "call-consult-end",
+			ArgumentsDelta: `{"target":"librarian","query":"Inspect repo conventions."}`,
+		},
+	})
+	if len(events) != 1 {
+		t.Fatalf("expected consult start at tool_end once args resolved, got %d events", len(events))
+	}
+	if events[0].Phase != ToolCallStart {
+		t.Fatalf("phase = %d, want start", events[0].Phase)
+	}
+	if events[0].InterAgent == nil {
+		t.Fatal("expected inter-agent consult metadata on tool_end start event")
+	}
+	if got := events[0].InterAgent.AgentTypes; len(got) != 1 || got[0] != "librarian" {
+		t.Fatalf("agent_types = %#v, want [librarian]", got)
+	}
+	if got := events[0].InterAgent.Summary; got != "Inspect repo conventions." {
+		t.Fatalf("summary = %q, want Inspect repo conventions.", got)
+	}
+}
+
+func TestObserveProviderToolCallChunk_NoIDCanonicalizesArgsForCompletionMatch(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolStart,
+		ToolCall: &providers.ToolCallChunk{
+			Name: "read_file",
+		},
+	})
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolDelta,
+		ToolCall: &providers.ToolCallChunk{
+			Name:           "read_file",
+			ArgumentsDelta: `{"path":"README.md","line":1`,
+		},
+	})
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolEnd,
+		ToolCall: &providers.ToolCallChunk{
+			Name:           "read_file",
+			ArgumentsDelta: `}`,
+		},
+	})
+
+	call := providers.ToolCall{
+		Name:      "read_file",
+		Arguments: "{\n  \"line\": 1,\n  \"path\": \"README.md\"\n}",
+	}
+	if _, err := TimedToolCall(ctx, "engineer", call, func() (string, error) {
+		return "ok", nil
+	}); err != nil {
+		t.Fatalf("TimedToolCall: %v", err)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("expected pre-announced start plus completion, got %d events", len(events))
+	}
+	if events[0].Phase != ToolCallStart || events[1].Phase != ToolCallComplete {
+		t.Fatalf("unexpected phases: %#v", events)
+	}
+	if events[0].ToolCallKey != events[1].ToolCallKey {
+		t.Fatalf("tool call keys differ: start=%q complete=%q", events[0].ToolCallKey, events[1].ToolCallKey)
+	}
+}
+
+func TestTimedToolCall_PreannouncedCompletionPreservesStartTime(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolStart,
+		ToolCall: &providers.ToolCallChunk{
+			ID:   "call-pre",
+			Name: "consult_academic_approach",
+		},
+	})
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolDelta,
+		ToolCall: &providers.ToolCallChunk{
+			ID:             "call-pre",
+			ArgumentsDelta: `{"question":"Is there a cleaner approach?"}`,
+		},
+	})
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolEnd,
+		ToolCall: &providers.ToolCallChunk{
+			ID: "call-pre",
+		},
+	})
+	if len(events) != 1 {
+		t.Fatalf("expected one preannounced event, got %d", len(events))
+	}
+
+	time.Sleep(15 * time.Millisecond)
+
+	call := providers.ToolCall{
+		ID:        "call-pre",
+		Name:      "consult_academic_approach",
+		Arguments: `{"question":"Is there a cleaner approach?"}`,
+	}
+	if _, err := TimedToolCall(ctx, "architect", call, func() (string, error) {
+		time.Sleep(10 * time.Millisecond)
+		return `{"consulted":true}`, nil
+	}); err != nil {
+		t.Fatalf("TimedToolCall: %v", err)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("expected start + completion, got %d events", len(events))
+	}
+	if got, want := events[1].StartedAt, events[0].StartedAt; !got.Equal(want) {
+		t.Fatalf("completion started_at = %v, want %v", got, want)
+	}
+	if events[1].Duration < 20*time.Millisecond {
+		t.Fatalf("completion duration = %v, want >= 20ms from preannounced start", events[1].Duration)
+	}
+}
+
+func TestObserveProviderToolCallChunk_NativeWebSearchCompletesAtToolEndWithoutDuplicateFallback(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+	startedAt := time.Now().Add(-250 * time.Millisecond)
+	completedAt := startedAt.Add(250 * time.Millisecond)
+
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type:      providers.ChunkTypeToolStart,
+		Timestamp: startedAt,
+		ToolCall: &providers.ToolCallChunk{
+			ID:   "native-1",
+			Name: "web_search",
+		},
+	})
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type:      providers.ChunkTypeToolDelta,
+		Timestamp: startedAt.Add(100 * time.Millisecond),
+		ToolCall: &providers.ToolCallChunk{
+			ID:             "native-1",
+			ArgumentsDelta: `{"query":"python packaging pep 621","action":"search"}`,
+		},
+	})
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type:      providers.ChunkTypeToolEnd,
+		Timestamp: completedAt,
+		ToolCall: &providers.ToolCallChunk{
+			ID: "native-1",
+		},
+	})
+	if len(events) != 2 {
+		t.Fatalf("expected start + completion at tool end, got %d events", len(events))
+	}
+	if events[0].Phase != ToolCallStart || events[1].Phase != ToolCallComplete {
+		t.Fatalf("unexpected phases: %#v", events)
+	}
+	if got, want := events[1].StartedAt, events[0].StartedAt; !got.Equal(want) {
+		t.Fatalf("completion started_at = %v, want %v", got, want)
+	}
+	if events[0].StartedAt != startedAt {
+		t.Fatalf("start started_at = %v, want %v", events[0].StartedAt, startedAt)
+	}
+	if events[1].Duration != 250*time.Millisecond {
+		t.Fatalf("completion duration = %v, want 250ms", events[1].Duration)
+	}
+
+	time.Sleep(15 * time.Millisecond)
+
+	CompleteProviderNativeToolCall(ctx, "academic", providers.ToolCall{
+		ID:        "native-1",
+		Name:      "web_search",
+		Arguments: `{"query":"python packaging pep 621","action":"search"}`,
+	}, "search complete")
+
+	if len(events) != 2 {
+		t.Fatalf("expected fallback completion to be suppressed after streamed completion, got %d events", len(events))
+	}
+}
+
+func TestEmitToolCall_SuppressesLateEventsAfterStreamComplete(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithStreamContext(context.Background(), "corr-complete", "tui")
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { events = append(events, ev) })
+
+	if !publishWithStreamLifecycle(ctx, guide.StreamEventComplete, func() {}) {
+		t.Fatal("expected stream complete lifecycle transition to succeed")
+	}
+
+	EmitToolCall(ctx, ToolCallEvent{
+		ToolCallKey: "ws_late",
+		Phase:       ToolCallStart,
+		ToolName:    "web_search",
+		FullArgs:    `{"query":"late"}`,
+	})
+
+	if len(events) != 0 {
+		t.Fatalf("expected no late tool-call events after stream completion, got %#v", events)
+	}
 }
 
 func TestTimedToolCall_Success(t *testing.T) {

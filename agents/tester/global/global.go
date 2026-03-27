@@ -544,7 +544,7 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	startTime := time.Now()
 
 	ctx = withTesterStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
-	ctx = agentshared.WithStreamContextMetadata(ctx, fwd.Metadata)
+	ctx = agentshared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	ctx, usageAcc := withTesterUsageAccumulator(ctx)
 
 	// Create steering ledger for this request.

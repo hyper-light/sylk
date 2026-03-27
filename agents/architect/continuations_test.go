@@ -76,7 +76,7 @@ func testArchitectWithControlStore(t *testing.T, plan *DesignPlan) *Architect {
 		planStore:    store,
 		controlStore: controlStore,
 		steering:     shared.NewSteeringManager(),
-		pendingBus:   make(map[string]chan *guide.Message),
+		pendingBus:   make(map[string]*shared.PendingSyncWait),
 		knownAgents:  make(map[string]*guide.AgentAnnouncement),
 	}
 }

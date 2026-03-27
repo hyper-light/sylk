@@ -402,14 +402,16 @@ func (r *planningProtocolRunner) run() error {
 const protocolPhaseInstructions = `You drive the planning protocol by invoking skills. Execute these phases in order:
 
 1. **Analyze**: Invoke plan with action=analyze, plan_id, and the user's query.
-2. **Consult**: Invoke consult with mode=pre_planning and plan_id.
+2. **Consult**: Invoke consult with mode=pre_planning and plan_id. This phase consolidates and refreshes the consultation evidence you should already have gathered during discussion; it is not the first moment to begin obvious evidence gathering.
 3. **Clarify** (conditional): Review the analysis results. If the request is still
    broadly vague or underspecified and needs exploratory clarification or
    requirements-shaping before you can plan responsibly, invoke
    route_requirements_research and STOP. Use ask_user_question only for one or
    two narrow, concrete decisions that the user can answer directly. If the
    blocker is codebase evidence or historical implementation context, use
-   consult with the Librarian or Archivalist instead of handing the user away.
+   consult with the Librarian or Archivalist instead of handing the user away. If the
+   blocker is architecture quality, correctness, performance, testing, infrastructure,
+   deployment, or tradeoffs, consult the Academic instead of guessing.
    If requirements are clear, proceed to Design.
 4. **Design**: Invoke plan with action=design and plan_id.
 5. **Generate**: Invoke plan with action=generate_tasks and plan_id.
@@ -425,6 +427,8 @@ const protocolPhaseInstructions = `You drive the planning protocol by invoking s
    Do NOT invoke route_plan_acceptance — wait for the user to respond.
 
 Always pass plan_id to plan and consult skills. Do not skip phases 1, 2, 4, or 5.
+During conversation before this protocol begins, you should already have used consultation
+skills to gather evidence as the user revealed new material constraints or direction.
 
 Exception — auto-approve (when approval_required is false):
 Skip the approval cue in step 6. Instead, after the brief assessment, invoke
@@ -462,8 +466,8 @@ func (a *Architect) buildProtocolSystemPrompt() string {
 	return strings.Join(nonEmptyPlannerSections(modules), "\n\n---\n\n")
 }
 
-// extractLibrarianPatterns builds CodebasePatterns from the consultation
-// evidence already collected by enforceConsultationGate.
+// extractLibrarianPatterns builds CodebasePatterns from any librarian
+// consultation evidence already attached to the plan.
 func extractLibrarianPatterns(plan *DesignPlan) *CodebasePatterns {
 	if plan == nil || plan.Consultations == nil {
 		return emptyCodebasePatterns()

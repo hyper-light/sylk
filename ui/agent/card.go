@@ -7,6 +7,7 @@ import (
 
 	"github.com/adalundhe/sylk/ui/theme"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // statusIcons maps AgentStatus to its display glyph from theme/icons.go.
@@ -30,9 +31,6 @@ const unselectedIndicator = " "
 // Derived from: len(selectedIndicator) + 1 space.
 const cardPadding = 2
 
-// iconWidth is the column width of the agent dot glyph.
-const iconWidth = 1
-
 // contextBarWidth is the fixed width for the context usage percentage.
 // Derived from: 3 digits + "%" = 4 characters.
 const contextBarWidth = 4
@@ -46,16 +44,16 @@ const unselectedCardLines = 1
 // dotAnimFrameCount is the local alias for theme.DotAnimFrameCount.
 const dotAnimFrameCount = theme.DotAnimFrameCount
 
-
 // AnimState carries per-frame animation parameters through the render pipeline.
 // Constructed once per frame in the Model and passed to each RenderCard call.
 type AnimState struct {
-	DotFrame       int
-	Elapsed        time.Duration
-	HasActive      bool            // Any agent actively working (gates dot animation).
-	Ripple         bool            // Active agents present (gates ripple text).
-	RippleGrad     *theme.Gradient // ThinkingGradient — used for active (non-selected) agents.
+	DotFrame        int
+	Elapsed         time.Duration
+	HasActive       bool            // Any agent actively working (gates dot animation).
+	Ripple          bool            // Active agents present (gates ripple text).
+	RippleGrad      *theme.Gradient // ThinkingGradient — used for active (non-selected) agents.
 	HolographicGrad *theme.Gradient // GroupGradient — used for the selected active agent.
+	NerdFonts       bool
 }
 
 // RenderCard renders a single-line agent card with an optional tree prefix.
@@ -87,32 +85,25 @@ func renderCompactCard(agent AgentState, width int, th *theme.Theme, engaged boo
 // renderCardLine renders the one-line card layout with configurable selection styling.
 // The prefix is prepended and its visual width is deducted from the available space.
 func renderCardLine(agent AgentState, width int, th *theme.Theme, selected, engaged bool, prefix string, anim AnimState) string {
-	prefixW := lipgloss.Width(prefix)
-	innerWidth := width - prefixW
-
-	icon := agentStatusDot(agent.Status, selected, th, anim)
+	rawIcon := resolveAgentIconGlyph(agent, anim)
+	icon := agentStatusDot(agent, rawIcon, selected, th, anim)
 	indicator := selectIndicator(selected, th)
 
-	// Use plain name width for layout (ANSI-safe via lipgloss.Width).
 	nameLen := lipgloss.Width(agent.Name)
 	name := renderAgentName(agent.Name, selected, engaged, agent.Status, anim, th)
-
 	contextPct := formatContextPct(agent.ContextUsage)
-
-	// Calculate available space for the task summary.
-	// Layout: [indicator space] [icon space] [name space] [summary] [ context%]
-	// Fixed overhead: cardPadding + iconWidth + space(1) + space(1) + contextBarWidth + space(1)
-	separators := 3 // spaces between icon/name, name/summary, summary/context
-	fixedWidth := cardPadding + iconWidth + nameLen + separators + contextBarWidth
-	summaryWidth := innerWidth - fixedWidth
-
-	summary := renderAgentSummary(agent.TaskSummary, summaryWidth, selected, agent.Status, nameLen, anim, th)
-
 	contextStyle := contextPctStyle(agent.ContextUsage, th)
 	contextStr := contextStyle.Render(contextPct)
 
-	return fmt.Sprintf("%s%s %s %s %s %s",
-		prefix, indicator, icon, name, summary, contextStr)
+	// Reserve the rightmost percentage column from the rendered left segment so
+	// minor glyph-width differences do not shift the context suffix horizontally.
+	leftBase := fmt.Sprintf("%s%s %s %s ", prefix, indicator, icon, name)
+	leftWidth := max(width-contextBarWidth-1, 0)
+	summaryWidth := max(leftWidth-displayWidth(leftBase, anim.NerdFonts), 0)
+
+	summary := renderAgentSummary(agent.TaskSummary, summaryWidth, selected, agent.Status, nameLen, anim, th)
+	leftPart := padRightDisplay(leftBase+summary, leftWidth, anim.NerdFonts)
+	return leftPart + " " + contextStr
 }
 
 // renderSelectedCard renders a two-line card for the selected agent.
@@ -153,19 +144,20 @@ func resolveStatusColor(status AgentStatus, th *theme.Theme) lipgloss.Color {
 // Active agents get an animated origami-bloom glyph; gradient color only when
 // the agent panel is focused (Ripple). Otherwise the animated glyph uses the
 // static status color. Inactive agents get static icons.
-func agentStatusDot(status AgentStatus, selected bool, th *theme.Theme, anim AnimState) string {
-	if isActiveStatus(status) && anim.HasActive {
-		icon := theme.DotAnimFrames[anim.DotFrame%dotAnimFrameCount]
+func agentStatusDot(agent AgentState, icon string, selected bool, th *theme.Theme, anim AnimState) string {
+	if icon == "" {
+		icon = resolveStaticIcon(agent.Status)
+	}
+	if isActiveStatus(agent.Status) && anim.HasActive {
 		if anim.Ripple && anim.RippleGrad != nil {
 			return theme.RenderGradientGlyph(icon, anim.RippleGrad, anim.Elapsed)
 		}
-		return lipgloss.NewStyle().Foreground(resolveStatusColor(status, th)).Render(icon)
+		return lipgloss.NewStyle().Foreground(resolveStatusColor(agent.Status, th)).Render(icon)
 	}
-	icon := resolveStaticIcon(status)
 	if selected {
 		return th.AgentActive.Render(icon)
 	}
-	return lipgloss.NewStyle().Foreground(resolveStatusColor(status, th)).Render(icon)
+	return lipgloss.NewStyle().Foreground(resolveStatusColor(agent.Status, th)).Render(icon)
 }
 
 // agentNameStyle returns the style for an agent name.
@@ -265,17 +257,32 @@ func truncate(s string, maxWidth int) string {
 	if lipgloss.Width(s) <= maxWidth {
 		return s
 	}
-	// Reserve 1 char for ellipsis.
-	ellipsis := "\u2026"
-	for i := range s {
-		if lipgloss.Width(s[:i]+ellipsis) > maxWidth {
-			if i == 0 {
-				return ellipsis[:min(len(ellipsis), maxWidth)]
-			}
-			return s[:i-1] + ellipsis
-		}
+	return truncateDisplayWidth(s, maxWidth, "\u2026")
+}
+
+func truncateDisplayWidth(s string, maxWidth int, suffix string) string {
+	if maxWidth <= 0 {
+		return ""
 	}
-	return s
+	if lipgloss.Width(s) <= maxWidth {
+		return s
+	}
+	suffixWidth := lipgloss.Width(suffix)
+	if suffixWidth >= maxWidth {
+		return suffix
+	}
+	var out strings.Builder
+	for _, r := range s {
+		next := out.String() + string(r)
+		if lipgloss.Width(next)+suffixWidth > maxWidth {
+			break
+		}
+		out.WriteRune(r)
+	}
+	if out.Len() == 0 {
+		return suffix
+	}
+	return out.String() + suffix
 }
 
 // flattenToLine collapses newlines and consecutive whitespace into a
@@ -305,4 +312,17 @@ func padRight(s string, targetWidth int) string {
 		return s
 	}
 	return s + strings.Repeat(" ", targetWidth-current)
+}
+
+func padRightDisplay(s string, targetWidth int, nerdFonts bool) string {
+	current := displayWidth(s, nerdFonts)
+	if current >= targetWidth {
+		return s
+	}
+	return s + strings.Repeat(" ", targetWidth-current)
+}
+
+func displayWidth(s string, nerdFonts bool) int {
+	_ = nerdFonts
+	return ansi.StringWidth(s)
 }

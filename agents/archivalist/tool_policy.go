@@ -7,15 +7,28 @@ import (
 
 func archivalistVisibleSkillNames() []string {
 	return []string{
-		"store",
-		"query",
-		"briefing",
+		ToolGetBriefing,
+		ToolQueryPatterns,
+		ToolQueryFailures,
+		ToolQueryContext,
+		ToolQueryFileState,
+		ToolRecordPattern,
+		ToolRecordFailure,
+		ToolUpdateFileState,
+		ToolDeclareIntent,
+		ToolCompleteIntent,
+		ToolGetConflicts,
 	}
 }
 
 func archivalistMutatingSkillNames() []string {
 	return []string{
 		"store",
+		ToolRecordPattern,
+		ToolRecordFailure,
+		ToolUpdateFileState,
+		ToolDeclareIntent,
+		ToolCompleteIntent,
 		"store_research_paper",
 		"route_to",
 		"reply_to",

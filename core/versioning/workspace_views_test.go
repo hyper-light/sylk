@@ -73,6 +73,45 @@ func TestSessionWorkspaceViews_ReadAcrossDiskGlobalAndPipeline(t *testing.T) {
 	}
 }
 
+func TestSessionWorkspaceViews_UsesDefaultSessionIDForGlobalReads(t *testing.T) {
+	dir := t.TempDir()
+	svfs, err := NewSessionVFS(SessionVFSConfig{
+		SessionID:  "sess-1",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	defer svfs.Close()
+
+	target := filepath.Join(dir, "hello.txt")
+	ctx := WithSessionID(context.Background(), "sess-1")
+	if err := svfs.GlobalVFS().Write(ctx, target, []byte("global")); err != nil {
+		t.Fatalf("seed global: %v", err)
+	}
+
+	views := NewSessionWorkspaceViews(SessionWorkspaceViewsConfig{
+		DefaultView:      WorkspaceViewGlobal,
+		DefaultSessionID: "sess-1",
+		SessionLookup: func(sessionID string) *SessionVFS {
+			if sessionID == "sess-1" {
+				return svfs
+			}
+			return nil
+		},
+		WorkingDir:   dir,
+		DiskFallback: NewDiskFileAccess(dir, true),
+	})
+
+	content, err := views.ReadFile(context.Background(), WorkspaceViewGlobal, "hello.txt", "")
+	if err != nil {
+		t.Fatalf("ReadFile error = %v", err)
+	}
+	if string(content) != "global" {
+		t.Fatalf("global content = %q, want %q", content, "global")
+	}
+}
+
 func TestSessionWorkspaceViews_InspectPathShowsLayerDifferences(t *testing.T) {
 	dir := t.TempDir()
 	if err := NewDiskFileAccess(dir, false).WriteFile(context.Background(), "hello.txt", []byte("disk")); err != nil {

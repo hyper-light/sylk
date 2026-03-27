@@ -17,6 +17,8 @@ const (
 	metadataCacheAffinityKey     = "llm_cache_affinity"
 	metadataThoughtVisibilityKey = "llm_thought_visibility"
 	metadataEmitThoughtsKey      = "llm_emit_thoughts"
+	metadataAgentIDKey           = "agent_id"
+	metadataSessionIDKey         = "session_id"
 	anthropicMinThinkingBudget   = 1024
 )
 
@@ -124,7 +126,7 @@ func ApplyStage(req *providers.Request, stage StageProfile, opts ApplyOptions) {
 	}
 	Apply(req, CompileStage(stage, opts))
 	applyPromptDirectives(req, stage, opts.providerFamily())
-	stampStageMetadata(req, stage)
+	stampStageMetadata(req, stage, opts)
 }
 
 // CompileStage resolves a semantic stage profile into provider request fields.
@@ -361,12 +363,18 @@ func applyCacheAffinity(profile *Profile, affinity CacheAffinity, opts ApplyOpti
 	}
 }
 
-func stampStageMetadata(req *providers.Request, stage StageProfile) {
+func stampStageMetadata(req *providers.Request, stage StageProfile, opts ApplyOptions) {
 	if req == nil {
 		return
 	}
 	if req.Metadata == nil {
-		req.Metadata = make(map[string]any, 8)
+		req.Metadata = make(map[string]any, 10)
+	}
+	if agentID := strings.TrimSpace(opts.AgentID); agentID != "" {
+		req.Metadata[metadataAgentIDKey] = agentID
+	}
+	if sessionID := strings.TrimSpace(opts.SessionID); sessionID != "" {
+		req.Metadata[metadataSessionIDKey] = sessionID
 	}
 	if stage.Name != "" {
 		req.Metadata[metadataStageKey] = stage.Name

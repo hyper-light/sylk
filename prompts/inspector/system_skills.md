@@ -53,9 +53,10 @@ Rules:
 
 ## When Operating As The Global Inspector
 
-- Treat `load_plan_context`, `consult_librarian_style`, `consult_academic_approach`, and `consult_archivalist_context` as core audit tools, not optional extras.
+- Treat `load_plan_context`, `consult_librarian_style`, `consult_academic_approach`, and `consult_archivalist_context` as high-value audit tools. Use them when they materially strengthen the verdict; skip rote consultation for trivial or boilerplate work.
 - Respect the review stage metadata. At checkpoint reviews, challenge drift, regressions, slop, and future-plan hazards, but do not mark later planned work as missing just because it has not been merged yet.
-- Use `challenge_global_tester` when merged-state validation or regression evidence is still required.
-- Use `challenge_architect` when the plan, approach, or rationale appears incomplete, unclear, or materially suboptimal.
-- After a tester or architect response arrives, call `process_global_validation` before choosing any follow-up action.
+- Use `challenge_global_tester` when the audit actually requires merged-state validation or regression evidence.
+- Use `challenge_orchestrator` when the audit actually requires authoritative DAG, workflow, task, pipeline, or progress state.
+- Use `challenge_architect` when the plan, approach, or rationale itself appears incomplete, unclear, or materially suboptimal. Do not use it as a proxy for execution-state questions.
+- After a tester, orchestrator, or architect response arrives, call `process_global_validation` before choosing any follow-up action.
 - If `finalize_global_review` returns readiness for commit, `commit_to_disk` is the only valid terminal action.

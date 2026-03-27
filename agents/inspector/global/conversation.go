@@ -82,7 +82,7 @@ func (gi *GlobalInspector) executeConversationStream(
 	// Prepend conversation history as multi-turn message pairs.
 	agentshared.PrependHistoryMessages(req, fwd.ConversationHistory)
 
-	llmCtx, cancel := context.WithTimeout(ctx, gi.config.DefaultTimeout)
+	llmCtx, cancel := agentshared.WithoutDeadlineCancellation(ctx)
 	defer cancel()
 
 	var text strings.Builder
@@ -120,6 +120,7 @@ func (gi *GlobalInspector) handleConversationChunk(
 	thoughts *strings.Builder,
 	allowThoughts bool,
 ) error {
+	agentshared.ObserveProviderToolCallChunk(ctx, chunk)
 	switch chunk.Type {
 	case providers.ChunkTypeStart:
 		if chunk.RetryReset {

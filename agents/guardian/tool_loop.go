@@ -170,6 +170,7 @@ func (g *Guardian) streamToolLoopTurn(
 	correlationID := shared.LogMetaFromContext(ctx).CorrID
 	emitter := shared.NewThoughtEmitter(llmruntime.EmitsThoughts(req))
 	collector := providers.NewStreamCollector(func(chunk *providers.StreamChunk) {
+		shared.ObserveProviderToolCallChunk(ctx, chunk)
 		switch chunk.Type {
 		case providers.ChunkTypeStart:
 			if chunk.RetryReset {
@@ -224,8 +225,9 @@ func (g *Guardian) applyToolCalls(
 		callStart := time.Now()
 		var execResult toolruntime.ExecutionResult
 		var execErr error
-		result, err := shared.TimedToolCall(ctx, "guardian", call, func() (string, error) {
-			execResult, execErr = g.executeToolCall(ctx, call)
+		execCtx := shared.WithActiveToolCall(ctx, call)
+		result, err := shared.TimedToolCall(execCtx, "guardian", call, func() (string, error) {
+			execResult, execErr = g.executeToolCall(execCtx, call)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {

@@ -30,8 +30,7 @@ func setupManagerTestRepo(t *testing.T) (string, func()) {
 
 	// Initialize git repo
 	runManagerGit(t, tmpDir, "init")
-	runManagerGit(t, tmpDir, "config", "user.email", "test@example.com")
-	runManagerGit(t, tmpDir, "config", "user.name", "Test User")
+	configureGitTestRepo(t, tmpDir, runManagerGit)
 
 	return tmpDir, cleanup
 }

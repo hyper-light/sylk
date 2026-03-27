@@ -10,6 +10,7 @@ import (
 	"unicode"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/providers"
@@ -147,20 +148,21 @@ type streamProgressSpec struct {
 	Current int
 	Total   int
 	Message string
+	UIState events.AgentUIState
 }
 
 var planStatusProgress = map[PlanStatus]streamProgressSpec{
-	PlanStatusPending:       {Current: 0, Total: 6, Message: "Framing the plan..."},
-	PlanStatusAnalyzing:     {Current: 1, Total: 6, Message: "Analyzing requirements..."},
-	PlanStatusConsulting:    {Current: 2, Total: 6, Message: "Consulting available knowledge agents..."},
-	PlanStatusClarifying:    {Current: 2, Total: 6, Message: "Waiting for clarification..."},
-	PlanStatusDesigning:     {Current: 3, Total: 6, Message: "Designing architecture options..."},
-	PlanStatusGenerating:    {Current: 4, Total: 6, Message: "Generating an actionable task breakdown..."},
-	PlanStatusOrchestrating: {Current: 5, Total: 6, Message: "Assembling workflow and dependencies..."},
-	PlanStatusReady:         {Current: 6, Total: 6, Message: "Plan is ready for your review."},
-	PlanStatusExecuting:     {Current: 6, Total: 6, Message: "Handing off to orchestration..."},
-	PlanStatusCompleted:     {Current: 6, Total: 6, Message: "Planning complete."},
-	PlanStatusFailed:        {Current: 6, Total: 6, Message: "Planning failed."},
+	PlanStatusPending:       {Current: 0, Total: 6, Message: "Framing the plan...", UIState: events.AgentUIStatePlanning},
+	PlanStatusAnalyzing:     {Current: 1, Total: 6, Message: "Analyzing requirements...", UIState: events.AgentUIStatePlanning},
+	PlanStatusConsulting:    {Current: 2, Total: 6, Message: "Consulting available knowledge agents...", UIState: events.AgentUIStatePlanning},
+	PlanStatusClarifying:    {Current: 2, Total: 6, Message: "Waiting for clarification...", UIState: events.AgentUIStatePlanning},
+	PlanStatusDesigning:     {Current: 3, Total: 6, Message: "Designing architecture options...", UIState: events.AgentUIStatePlanning},
+	PlanStatusGenerating:    {Current: 4, Total: 6, Message: "Generating an actionable task breakdown...", UIState: events.AgentUIStatePlanning},
+	PlanStatusOrchestrating: {Current: 5, Total: 6, Message: "Assembling workflow and dependencies...", UIState: events.AgentUIStatePlanning},
+	PlanStatusReady:         {Current: 6, Total: 6, Message: "Plan is ready for your review.", UIState: events.AgentUIStatePlanning},
+	PlanStatusExecuting:     {Current: 6, Total: 6, Message: "Handing off to orchestration...", UIState: events.AgentUIStatePlanAccepted},
+	PlanStatusCompleted:     {Current: 6, Total: 6, Message: "Planning complete.", UIState: events.AgentUIStatePlanAccepted},
+	PlanStatusFailed:        {Current: 6, Total: 6, Message: "Planning failed.", UIState: events.AgentUIStatePlanFailed},
 }
 
 func activityEventTypeForPlanStatus(status PlanStatus) events.EventType {
@@ -238,6 +240,7 @@ func (a *Architect) publishPlanStreamProgress(ctx context.Context, status PlanSt
 			Total:   spec.Total,
 			Percent: progressPercent(spec.Current, spec.Total),
 			Message: spec.Message,
+			UIState: spec.UIState,
 		},
 		Timestamp: time.Now(),
 	})
@@ -252,6 +255,7 @@ func (a *Architect) publishPlanThought(ctx context.Context, stage string, though
 		Type: guide.StreamEventProgress,
 		Data: &guide.ProgressData{
 			Message: message,
+			UIState: events.AgentUIStatePlanning,
 		},
 		Timestamp: time.Now(),
 	})
@@ -507,6 +511,7 @@ func (a *Architect) publishPlanStreamEvent(ctx context.Context, event *guide.Str
 		CorrelationID:     metadata.CorrelationID,
 		RespondingAgentID: a.id,
 		TargetAgentID:     metadata.SourceAgentID,
+		Metadata:          shared.MergeStreamMetadata(shared.StreamResponseMetadataFromContext(ctx), nil),
 		Event:             event,
 	}
 	msg := &guide.Message{

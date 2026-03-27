@@ -350,8 +350,9 @@ func (a *Architect) applyToolCalls(
 		callStart := time.Now()
 		var execResult toolruntime.ExecutionResult
 		var execErr error
-		result, err := shared.TimedToolCall(ctx, "architect", call, func() (string, error) {
-			execResult, execErr = a.executeToolCall(ctx, call)
+		execCtx := shared.WithActiveToolCall(ctx, call)
+		result, err := shared.TimedToolCall(execCtx, "architect", call, func() (string, error) {
+			execResult, execErr = a.executeToolCall(execCtx, call)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {
@@ -527,7 +528,7 @@ func (a *Architect) recordTurn(
 	turn, toolCalls, errCount int,
 	turnStart time.Time,
 ) {
-	if a.handoffBridge == nil {
+	if a.handoffBridge == nil || !shared.AutomaticHandoffEnabled(ctx) {
 		return
 	}
 

@@ -13,7 +13,7 @@ Treat each skill description as part of the implementation protocol. The tool de
 
 ### Workspace Mutation (Priority 90)
 - `write_pipeline_file` — Create or overwrite a pipeline file using a prepared basis
-- `edit_pipeline_file` — Apply targeted edits using a prepared basis
+- `edit_pipeline_file` — Apply exact search/replace edits using a prepared basis; every edit item must include `old_text` and `new_text`
 - `delete_pipeline_file` — Delete a pipeline file using a prepared basis
 - `create_pipeline_directory` — Create a pipeline directory using a prepared basis
 
@@ -47,15 +47,16 @@ Treat each skill description as part of the implementation protocol. The tool de
 1. **Read before writing.** Always read a file before editing it.
 2. **Prepare every mutation path first.** Call `prepare_pipeline_write_context` before the first write, edit, delete, or directory creation for a path.
 3. **Reuse `next_basis` while the lease is active.** Feed the returned `next_basis` from `write_pipeline_file` or `edit_pipeline_file` into the next mutation on that same path.
-4. **Treat missing workspace reads as creation signals.** If `read_workspace_file` returns `missing: true`, continue by preparing and creating the file instead of aborting.
-5. **Use LSP for navigation.** Goto definition and find references before modifying unfamiliar code.
-6. **Format after changes.** Run format check/apply after modifying source files.
-7. **Lint after changes.** Run lint to catch issues before reporting completion.
-8. **Consult before implementing.** Ask domain experts for context, not after the fact.
-9. **Audit before completion.** Self-audit code quality before reporting confidence.
-10. **One concern per tool call.** Keep tool calls focused and atomic.
-11. **Coordinate before overlap.** Claim shared scope before editing overlapping areas and watch for peer updates when blocked.
-12. **Choose the right command tool.** Use `run_command` for one plain command. Use `working_dir` instead of `cd`. Switch to `run_shell_script` only when you truly need chaining, pipes, redirection, shell variables, or multi-line shell.
-13. **Adapt after tool failures.** Read tool error payloads carefully, change strategy on the next turn, and do not repeat the same invalid command call without a concrete adjustment.
-14. **Treat pending reviews as iteration context.** If the coordination ledger for this task shows pending reviews for Engineer, inspect the review context, address what you can in this pass, and let Inspector/Tester determine whether another loop is required.
-15. **Use the dependency-remediation path when tooling is missing.** If implementation or validation is blocked by a missing dependency, tool, or utility, call `research_dependency_install` first whenever you are not significantly confident in the correct install command. Then explain the concrete plan and use `install_dependency_tooling`; those approved commands execute against real disk, not VFS, so the install persists for later turns.
+4. **Use `edit_pipeline_file` only for precise replacements.** Read the file first, copy the exact current `old_text` for each edit, and use `write_pipeline_file` instead when the change is effectively a full rewrite.
+5. **Treat missing workspace reads as creation signals.** If `read_workspace_file` returns `missing: true`, continue by preparing and creating the file instead of aborting.
+6. **Use LSP for navigation.** Goto definition and find references before modifying unfamiliar code.
+7. **Format after changes.** Run format check/apply after modifying source files.
+8. **Lint after changes.** Run lint to catch issues before reporting completion.
+9. **Consult before implementing.** Ask domain experts for context, not after the fact.
+10. **Audit before completion.** Self-audit code quality before reporting confidence.
+11. **One concern per tool call.** Keep tool calls focused and atomic.
+12. **Coordinate before overlap.** Claim shared scope before editing overlapping areas and watch for peer updates when blocked.
+13. **Choose the right command tool.** Use `run_command` for one plain command. Use `working_dir` instead of `cd`. Switch to `run_shell_script` only when you truly need chaining, pipes, redirection, shell variables, or multi-line shell.
+14. **Adapt after tool failures.** Read tool error payloads carefully, change strategy on the next turn, and do not repeat the same invalid command call without a concrete adjustment.
+15. **Treat pending reviews as iteration context.** If the coordination ledger for this task shows pending reviews for Engineer, inspect the review context, address what you can in this pass, and let Inspector/Tester determine whether another loop is required.
+16. **Use the dependency-remediation path when tooling is missing.** If implementation or validation is blocked by a missing dependency, tool, or utility, call `research_dependency_install` first whenever you are not significantly confident in the correct install command. Then explain the concrete plan and use `install_dependency_tooling`; those approved commands execute against real disk, not VFS, so the install persists for later turns.

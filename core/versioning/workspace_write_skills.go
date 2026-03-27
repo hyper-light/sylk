@@ -417,8 +417,9 @@ func newEditFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWrite
 		Satisfies(editFileOutcome(scope)).
 		Avoid(editFileAvoid(scope)).
 		BestPractice(sharedWriteToolBestPractice()).
+		BestPractice(editFileBestPractice(scope)).
 		StringParam("path", "File path to edit inside the allowed workspace layer", true).
-		ArrayParam("edits", "Search/replace edits to apply", "object", true).
+		ArrayObjectParam("edits", editFileEditsDescription(scope), editFileProperties(), []string{"old_text", "new_text"}, true).
 		ObjectParam("basis", "Write basis returned by the matching prepare_*_write_context skill.", workspaceWriteBasisProperties(), true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params editFileWithBasisInput
@@ -650,16 +651,16 @@ func writeFileAvoid(scope WorkspaceWriteScope) string {
 
 func editFileUsage(scope WorkspaceWriteScope) string {
 	if scope == WorkspaceWriteScopePipeline {
-		return "Use when you know the specific search/replace edits needed for an existing pipeline file and want a narrower mutation than a full rewrite."
+		return "Use when you know the exact current text to replace inside an existing pipeline file and want a narrower mutation than a full rewrite."
 	}
-	return "Use when you know the specific search/replace edits needed for an existing global file and want a narrower mutation than a full rewrite."
+	return "Use when you know the exact current text to replace inside an existing global file and want a narrower mutation than a full rewrite."
 }
 
 func editFileRequirement(scope WorkspaceWriteScope) string {
 	if scope == WorkspaceWriteScopePipeline {
-		return "Requires a fresh or still-leased basis from prepare_pipeline_write_context for the same target path."
+		return "Requires a fresh or still-leased basis from prepare_pipeline_write_context for the same target path. Each edit item must include exact old_text from the current file plus the desired new_text."
 	}
-	return "Requires a fresh or still-leased basis from prepare_global_write_context for the same target path."
+	return "Requires a fresh or still-leased basis from prepare_global_write_context for the same target path. Each edit item must include exact old_text from the current file plus the desired new_text."
 }
 
 func editFileOutcome(scope WorkspaceWriteScope) string {
@@ -671,9 +672,9 @@ func editFileOutcome(scope WorkspaceWriteScope) string {
 
 func editFileAvoid(scope WorkspaceWriteScope) string {
 	if scope == WorkspaceWriteScopePipeline {
-		return "Do not use for brand-new files or when you cannot describe the desired edits precisely."
+		return "Do not use for brand-new files, broad rewrites, or cases where you cannot supply exact old_text for each change; use write_pipeline_file instead."
 	}
-	return "Do not use for brand-new files or when you cannot describe the desired edits precisely."
+	return "Do not use for brand-new files, broad rewrites, or cases where you cannot supply exact old_text for each change; use write_global_file instead."
 }
 
 func deleteFileUsage(scope WorkspaceWriteScope) string {
@@ -741,9 +742,36 @@ func writeFileDescription(scope WorkspaceWriteScope) string {
 
 func editFileDescription(scope WorkspaceWriteScope) string {
 	if scope == WorkspaceWriteScopePipeline {
-		return "Apply search/replace edits inside the pipeline VFS only. Requires a fresh or still-leased basis from prepare_pipeline_write_context and returns a refreshed next_basis on success."
+		return "Apply precise search/replace edits inside the pipeline VFS only. Each edit item must include exact old_text and new_text. Requires a fresh or still-leased basis from prepare_pipeline_write_context and returns a refreshed next_basis on success."
 	}
-	return "Apply search/replace edits inside the global VFS only. Requires a fresh or still-leased basis from prepare_global_write_context and returns a refreshed next_basis on success."
+	return "Apply precise search/replace edits inside the global VFS only. Each edit item must include exact old_text and new_text. Requires a fresh or still-leased basis from prepare_global_write_context and returns a refreshed next_basis on success."
+}
+
+func editFileBestPractice(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Read the current pipeline file first, copy the exact old_text you intend to replace, and switch to write_pipeline_file instead of edit_pipeline_file when the change is effectively a full rewrite."
+	}
+	return "Read the current global file first, copy the exact old_text you intend to replace, and switch to write_global_file instead of edit_global_file when the change is effectively a full rewrite."
+}
+
+func editFileEditsDescription(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Search/replace edits to apply. Every item must include exact old_text from the current pipeline file and the replacement new_text."
+	}
+	return "Search/replace edits to apply. Every item must include exact old_text from the current global file and the replacement new_text."
+}
+
+func editFileProperties() map[string]*skills.Property {
+	return map[string]*skills.Property{
+		"old_text": {
+			Type:        "string",
+			Description: "Exact current text to find in the file before replacement. Required for every edit.",
+		},
+		"new_text": {
+			Type:        "string",
+			Description: "Replacement text for the matched old_text. Use an empty string to delete the matched text.",
+		},
+	}
 }
 
 func deleteFileDescription(scope WorkspaceWriteScope) string {
@@ -1466,7 +1494,7 @@ func normalizeFileEdits(inputs []FileEditInput) ([]FileEdit, error) {
 	edits := make([]FileEdit, 0, len(inputs))
 	for i, edit := range inputs {
 		if strings.TrimSpace(edit.OldText) == "" {
-			return nil, fmt.Errorf("edit %d: old_text is required", i)
+			return nil, fmt.Errorf("edit %d: old_text is required; edit tools only support precise search/replace edits, so read the current file and include the exact text to replace or use the matching write_* tool for a broader rewrite", i)
 		}
 		edits = append(edits, FileEdit{
 			OldText: edit.OldText,

@@ -41,6 +41,18 @@ func createTestGitRepo(t *testing.T) string {
 		t.Fatalf("failed to configure git name: %v", err)
 	}
 
+	cmd = exec.Command("git", "config", "commit.gpgsign", "false")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to disable commit signing: %v", err)
+	}
+
+	cmd = exec.Command("git", "config", "tag.gpgsign", "false")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to disable tag signing: %v", err)
+	}
+
 	return dir
 }
 
@@ -989,6 +1001,9 @@ func TestGitHookWatcher_InstallHooks_SpecialCharactersInPath(t *testing.T) {
 		t.Fatalf("failed to init git repo: %v", err)
 	}
 
+	exec.Command("git", "-C", repoPath, "config", "commit.gpgsign", "false").Run()
+	exec.Command("git", "-C", repoPath, "config", "tag.gpgsign", "false").Run()
+
 	config := GitHookConfig{
 		RepoPath:  repoPath,
 		HookTypes: []string{"post-commit"},
@@ -1048,6 +1063,8 @@ func BenchmarkGitHookWatcher_InstallHooks(b *testing.B) {
 		if err := cmd.Run(); err != nil {
 			b.Fatalf("failed to init git repo: %v", err)
 		}
+		exec.Command("git", "-C", dir, "config", "commit.gpgsign", "false").Run()
+		exec.Command("git", "-C", dir, "config", "tag.gpgsign", "false").Run()
 		b.StartTimer()
 
 		config := GitHookConfig{
@@ -1073,6 +1090,8 @@ func BenchmarkGitHookWatcher_ParseHookEvent(b *testing.B) {
 	if err := cmd.Run(); err != nil {
 		b.Fatalf("failed to init git repo: %v", err)
 	}
+	exec.Command("git", "-C", dir, "config", "commit.gpgsign", "false").Run()
+	exec.Command("git", "-C", dir, "config", "tag.gpgsign", "false").Run()
 
 	// Configure git and create a commit
 	exec.Command("git", "-C", dir, "config", "user.email", "test@example.com").Run()

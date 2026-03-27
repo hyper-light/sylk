@@ -65,6 +65,7 @@ func NewPipeline(cfg PipelineConfig) *Pipeline {
 // FetchRequest describes what to fetch and why.
 type FetchRequest struct {
 	URL         string                    // Target URL
+	ToolName    string                    // Fetch tool invoking the pipeline
 	SourceAgent string                    // Agent requesting the fetch
 	Reason      string                    // Human-readable reason for the fetch
 	SessionID   string                    // Session context
@@ -81,6 +82,7 @@ type FetchResponse struct {
 	Ingested        bool                `json:"ingested"`
 	Extracted       *ExtractResult      `json:"extracted,omitempty"`
 	ExtractionError string              `json:"extraction_error,omitempty"`
+	ApprovalDenied  bool                `json:"approval_denied,omitempty"`
 	Error           string              `json:"error,omitempty"`
 	Duration        time.Duration       `json:"duration"`
 }
@@ -126,6 +128,7 @@ func (p *Pipeline) Execute(ctx context.Context, req *FetchRequest) *FetchRespons
 	case ConsentGranted:
 		consentID = "auto"
 	case ConsentDenied, ConsentRevoked:
+		resp.ApprovalDenied = true
 		resp.Error = "fetch denied: user consent revoked for domain " + policyResult.Domain
 		return resp
 	case ConsentRequired:
@@ -133,6 +136,7 @@ func (p *Pipeline) Execute(ctx context.Context, req *FetchRequest) *FetchRespons
 			ID:             "fp_" + policyResult.Domain + "_" + fmt.Sprintf("%d", time.Now().UnixMilli()),
 			URL:            req.URL,
 			Domain:         policyResult.Domain,
+			ToolName:       req.ToolName,
 			SourceAgent:    req.SourceAgent,
 			Reason:         req.Reason,
 			RiskAssessment: "policy: passed",
@@ -144,6 +148,7 @@ func (p *Pipeline) Execute(ctx context.Context, req *FetchRequest) *FetchRespons
 			return resp
 		}
 		if !consentResult.Granted {
+			resp.ApprovalDenied = true
 			resp.Error = "fetch denied by user: " + consentResult.Reason
 			return resp
 		}

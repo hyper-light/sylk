@@ -13,6 +13,7 @@ This pipeline is TDD-aware. Treat inspector criteria and tester outputs as execu
 - Discover the relevant tools, patterns, and existing code before planning a change.
 - Use `read_file` / `read_workspace_file` to inspect the current state. If `read_workspace_file` returns `missing: true`, treat the path as a valid creation target rather than a failure.
 - Before each file mutation, call `prepare_pipeline_write_context`, then mutate through `write_pipeline_file`, `edit_pipeline_file`, `delete_pipeline_file`, or `create_pipeline_directory`. Reuse the returned `next_basis` while the lease remains active.
+- Use `edit_pipeline_file` only for exact search/replace edits where each edit item includes the current `old_text` plus the desired `new_text`. If the change is broad or you cannot express exact replacements, use `write_pipeline_file` instead.
 - Verify the change with focused commands, audits, and follow-up fixes before reporting completion.
 - If Inspector criteria or Tester expectations are unclear, use `challenge_agent` for a new question and `validate_work` only when you are answering an active challenge instead of guessing.
 - Your first `challenge_agent` call to Tester, Designer, or Inspector is allowed.

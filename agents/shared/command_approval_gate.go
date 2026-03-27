@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/commandapproval"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
@@ -25,6 +26,8 @@ type GuardianCommandGateConfig struct {
 type GuardianCommandGate struct {
 	cfg GuardianCommandGateConfig
 }
+
+var guardianApprovalKeepaliveInterval = 10 * time.Second
 
 func NewGuardianCommandGate(cfg GuardianCommandGateConfig) *GuardianCommandGate {
 	return &GuardianCommandGate{cfg: cfg}
@@ -91,6 +94,14 @@ func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval
 			targetAgentID = resolved
 		}
 	}
+	branchCtx, branch := beginGuardianApprovalBranch(ctx, targetAgentID, req)
+	if strings.TrimSpace(branch.branch.ParentCorrelationID) == "" {
+		branchCtx, branch = BeginAutoInterAgentRouteBranch(ctx, targetAgentID, payload, map[string]any{
+			"direct_skill": "command_execution_control",
+			"tool_name":    req.ToolName,
+			"summary":      req.Command,
+		})
+	}
 	routeReq := &guide.RouteRequest{
 		CorrelationID: correlationID,
 		Input:         string(payload),
@@ -101,22 +112,121 @@ func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval
 		TargetAgentID: targetAgentID,
 		SessionID:     req.SessionID,
 		Timestamp:     time.Now(),
-		Metadata: map[string]any{
+		Metadata: branch.ApplyMetadata(branchCtx, map[string]any{
 			"direct_skill": "command_execution_control",
 			"tool_name":    req.ToolName,
-		},
+		}),
 	}
-	if err := bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage("", routeReq)); err != nil {
+	if routeReq.ParentCorrelationID == "" {
+		if stream, ok := StreamMetadataFromContext(branchCtx); ok {
+			routeReq.ParentCorrelationID = stream.CorrelationID
+		}
+	}
+	routeReq.Metadata = RouteMetadataWithInterAgentBranch(branchCtx, routeReq.Metadata)
+	requestMsg := guide.NewRequestMessage("", routeReq).WithReplyTo(responseTopic)
+	if err := bus.Publish(guide.TopicGuideRequests, requestMsg); err != nil {
+		branch.Complete(branchCtx, "", "", err)
 		return commandapproval.Evaluation{}, fmt.Errorf("publish command approval request: %w", err)
 	}
 
-	var msg *guide.Message
-	select {
-	case msg = <-waitCh:
-	case <-ctx.Done():
-		return commandapproval.Evaluation{}, ctx.Err()
+	publishGuardianApprovalKeepalive(branchCtx, req)
+	interval := guardianApprovalKeepaliveInterval
+	if interval <= 0 {
+		interval = 10 * time.Second
 	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var msg *guide.Message
+	for msg == nil {
+		select {
+		case msg = <-waitCh:
+		case <-ticker.C:
+			publishGuardianApprovalKeepalive(branchCtx, req)
+		case <-ctx.Done():
+			branch.Complete(branchCtx, "", "", ctx.Err())
+			return commandapproval.Evaluation{}, ctx.Err()
+		}
+	}
+	publishGuardianApprovalResolvedProgress(branchCtx, req)
+	branch.CompleteFromMessage(branchCtx, msg, nil)
 	return decodeCommandApprovalMessage(msg)
+}
+
+func beginGuardianApprovalBranch(
+	ctx context.Context,
+	targetAgentID string,
+	req commandapproval.Request,
+) (context.Context, InterAgentBranchHandle) {
+	branchCtx, branch := BeginAutoInterAgentRouteBranch(ctx, targetAgentID, nil, nil)
+	if strings.TrimSpace(branch.branch.ParentCorrelationID) != "" {
+		return branchCtx, branch
+	}
+	summary := guardianApprovalBranchSummary(req)
+	return BeginInterAgentBranch(ctx, InterAgentBranchSpec{
+		Kind:          InterAgentToolEventKindApproval,
+		ToolName:      "approval_guardian",
+		AgentTypes:    []string{firstNonEmptyApprovalTarget(targetAgentID)},
+		Summary:       summary,
+		SuccessStatus: InterAgentToolEventStatusDone,
+		Args: map[string]any{
+			"target":    firstNonEmptyApprovalTarget(targetAgentID),
+			"tool_name": strings.TrimSpace(req.ToolName),
+			"command":   strings.TrimSpace(req.Command),
+			"domain":    strings.TrimSpace(req.Domain),
+			"summary":   summary,
+		},
+	})
+}
+
+func guardianApprovalBranchSummary(req commandapproval.Request) string {
+	switch {
+	case strings.TrimSpace(req.Domain) != "":
+		return "Requesting Guardian approval for " + strings.TrimSpace(req.Domain)
+	case strings.TrimSpace(req.ToolName) != "":
+		return "Requesting Guardian approval for " + strings.TrimSpace(req.ToolName)
+	case strings.TrimSpace(req.Command) != "":
+		return "Requesting Guardian approval"
+	default:
+		return "Requesting Guardian approval"
+	}
+}
+
+func firstNonEmptyApprovalTarget(value string) string {
+	if trimmed := strings.TrimSpace(value); trimmed != "" {
+		return trimmed
+	}
+	return "guardian"
+}
+
+func publishGuardianApprovalKeepalive(ctx context.Context, req commandapproval.Request) {
+	pp := ProgressPublisherFromContext(ctx)
+	if pp == nil {
+		return
+	}
+	message := "Waiting for Guardian approval"
+	switch {
+	case strings.TrimSpace(req.Domain) != "":
+		message += " for " + strings.TrimSpace(req.Domain)
+	case strings.TrimSpace(req.ToolName) != "":
+		message += " for " + strings.TrimSpace(req.ToolName)
+	}
+	pp.PublishState(events.AgentUIStateValidating, message)
+}
+
+func publishGuardianApprovalResolvedProgress(ctx context.Context, req commandapproval.Request) {
+	pp := ProgressPublisherFromContext(ctx)
+	if pp == nil {
+		return
+	}
+	message := "Guardian approval received"
+	switch {
+	case strings.TrimSpace(req.Domain) != "":
+		message += " for " + strings.TrimSpace(req.Domain)
+	case strings.TrimSpace(req.ToolName) != "":
+		message += " for " + strings.TrimSpace(req.ToolName)
+	}
+	pp.Publish(message)
 }
 
 func isCommandApprovalTerminalMessage(msg *guide.Message, correlationID string) bool {

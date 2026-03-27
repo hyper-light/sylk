@@ -178,11 +178,11 @@ type planInput struct {
 
 func planSkill(a *Architect) *skills.Skill {
 	return skills.NewSkill("plan").
-		Description("Plan operations for analyzing requirements, designing architecture, generating tasks, estimating complexity, and revising plans.\n\n"+
+		Description("Plan operations for synthesizing discussion and consultation evidence into requirements, architecture, tasks, estimates, and revisions.\n\n"+
 			"Actions:\n"+
-			"- analyze: Analyze project requirements (params: query [required], scope, goals, constraints)\n"+
-			"- design: Design system architecture (params: requirements [required], patterns)\n"+
-			"- generate_tasks: Generate atomic tasks from architecture (params: architecture [required], max_tasks_per_agent, allow_parallel)\n"+
+			"- analyze: Synthesize project requirements from the user discussion, existing evidence, and known constraints (params: query [required], scope, goals, constraints)\n"+
+			"- design: Synthesize system architecture from requirements and consultation evidence (params: requirements [required], patterns)\n"+
+			"- generate_tasks: Synthesize atomic tasks from architecture (params: architecture [required], max_tasks_per_agent, allow_parallel)\n"+
 			"- estimate: Estimate task complexity and token usage (params: description [required], context)\n"+
 			"- revise: Revise an existing plan (params: plan_id, reason [required], updates)").
 		Domain("planning").
@@ -235,6 +235,9 @@ func planSkill(a *Architect) *skills.Skill {
 		StringParam("plan_id", "Plan identifier for protocol-driven operations (analyze, design, generate_tasks, revise)", false).
 		StringParam("reason", "Reason for revision (for revise)", false).
 		ObjectParam("updates", "Optional update payload (for revise)", map[string]*skills.Property{}, false).
+		Usage("Use this skill to formalize and synthesize what the architect has already learned from the user discussion and consultations. The goal is a high-quality planning artifact, not a replacement for live discovery. If material evidence is still missing, perform the targeted consultation first or immediately after the relevant planning step instead of guessing.").
+		BestPractice("For action=analyze, synthesize the whole conversation and consultation evidence into the query and inputs — do not treat analyze as the first moment to discover obvious requirements.").
+		BestPractice("For action=design and action=generate_tasks, preserve the current output shape while grounding the result in the strongest evidence already gathered. Additional targeted research is still allowed when a real gap remains.").
 		BestPractice("For action=generate_tasks, prefer short markdown-ready examples when they materially reduce ambiguity. Use example languages like sh, json, go, ts, or mermaid, and do not include surrounding triple backticks in the example code field.").
 		BestPractice("Use compact mermaid flow or sequence diagrams when task sequencing, ownership, or data flow is easier to understand visually than in prose.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -415,7 +418,7 @@ func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInpu
 		plan.RiskSummary = append(plan.RiskSummary, "declaration validation warning: "+dErr.Error())
 	}
 	plan.Declarations = append(plan.Declarations, declaration)
-	a.publishDeclaration(declaration, plan.SessionID)
+	a.publishDeclaration(ctx, declaration, plan.SessionID)
 	if err := a.advancePlan(ctx, plan, PlanStatusReady, nil); err != nil {
 		return nil, err
 	}
@@ -448,10 +451,12 @@ func handlePlanSkillRevise(a *Architect, _ context.Context, p *planInput) (any, 
 	}
 	updated := a.applyPlanRevision(plan, p.Reason, p.Updates)
 	return map[string]any{
-		"plan_id":  updated.ID,
-		"revision": updated.Revision,
-		"status":   updated.Status.String(),
-		"updated":  updated.UpdatedAt,
+		"plan_id":          updated.ID,
+		"revision":         updated.Revision,
+		"artifact_version": updated.ArtifactVersion.String(),
+		"plan_file":        updated.PlanFile,
+		"status":           updated.Status.String(),
+		"updated":          updated.UpdatedAt,
 	}, nil
 }
 

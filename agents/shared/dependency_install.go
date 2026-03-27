@@ -46,17 +46,37 @@ func ResearchDependencyInstallPlan(ctx context.Context, req DependencyInstallRes
 	if req.Bus == nil || strings.TrimSpace(req.ResponseTopic) == "" {
 		return nil, fmt.Errorf("dependency install research bus is unavailable")
 	}
-	msg, err := RequestGuideRouteSync(ctx, GuideRouteSyncRequest{
+	prompt := BuildDependencyInstallResearchPrompt(req)
+	summary := firstNonEmpty(
+		strings.TrimSpace(req.MissingTool),
+		strings.TrimSpace(req.FrameworkID),
+		"dependency install plan",
+	)
+	branchCtx, branch := BeginInterAgentBranch(ctx, InterAgentBranchSpec{
+		Kind:       InterAgentToolEventKindConsult,
+		ToolName:   "consult_academic_dependency_install",
+		AgentTypes: []string{"academic"},
+		Summary:    "research install plan for " + summary,
+		Args: map[string]any{
+			"target":       "academic",
+			"query":        prompt,
+			"missing_tool": strings.TrimSpace(req.MissingTool),
+			"framework":    strings.TrimSpace(req.FrameworkID),
+		},
+	})
+	msg, err := RequestGuideRouteSync(branchCtx, GuideRouteSyncRequest{
 		Bus:           req.Bus,
 		ResponseTopic: req.ResponseTopic,
 		Request: &guide.RouteRequest{
-			Input:           BuildDependencyInstallResearchPrompt(req),
+			Input:           prompt,
 			TargetAgentID:   "academic",
 			SourceAgentID:   strings.TrimSpace(req.SourceAgentID),
 			SourceAgentName: strings.TrimSpace(req.SourceAgentName),
 			SessionID:       strings.TrimSpace(req.SessionID),
+			Metadata:        branch.ApplyMetadata(branchCtx, nil),
 		},
 	})
+	branch.CompleteFromMessage(branchCtx, msg, err)
 	if err != nil {
 		return nil, fmt.Errorf("research install steps via Academic: %w", err)
 	}

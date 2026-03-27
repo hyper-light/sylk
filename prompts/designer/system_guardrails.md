@@ -30,6 +30,6 @@
 
 12. **Always respect prefers-reduced-motion.** All transitions and animations MUST have reduced-motion alternatives.
 
-13. **All file mutations must use leased pipeline write contexts.** `component_create` and `component_modify` do not materialize files; call `prepare_pipeline_write_context` before `write_pipeline_file` or `edit_pipeline_file`, and reuse `next_basis` while it remains active.
+13. **All file mutations must use leased pipeline write contexts.** `component_create` and `component_modify` do not materialize files; call `prepare_pipeline_write_context` before `write_pipeline_file` or `edit_pipeline_file`, reuse `next_basis` while it remains active, and only use `edit_pipeline_file` when you can supply exact `old_text` for each replacement.
 
 14. **Treat task-scoped pending reviews as feedback, not a runtime gate.** If Designer is the reviewer in the coordination ledger, inspect the review context, address it when appropriate, and allow Inspector/Tester to decide whether another loop is required.

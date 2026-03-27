@@ -2,6 +2,7 @@ package commandapproval
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -47,11 +48,22 @@ const (
 	ApprovalPolicyExact   ApprovalPolicy = "exact"
 )
 
+func IsFetchToolName(toolName string) bool {
+	switch strings.TrimSpace(toolName) {
+	case "web_fetch", "fetch_document", "crawl_links":
+		return true
+	default:
+		return false
+	}
+}
+
 type Request struct {
 	Command        string         `json:"command"`
 	WorkingDir     string         `json:"working_dir,omitempty"`
 	WorkspaceRoot  string         `json:"workspace_root,omitempty"`
 	ToolName       string         `json:"tool_name,omitempty"`
+	Domain         string         `json:"domain,omitempty"`
+	Justification  string         `json:"justification,omitempty"`
 	AgentID        string         `json:"agent_id,omitempty"`
 	AgentType      string         `json:"agent_type,omitempty"`
 	SessionID      string         `json:"session_id,omitempty"`
@@ -100,11 +112,12 @@ type Rule struct {
 }
 
 type Evaluation struct {
-	Decision Decision    `json:"decision"`
-	Source   MatchSource `json:"source"`
-	Reason   string      `json:"reason,omitempty"`
-	Analysis Analysis    `json:"analysis"`
-	Rule     *Rule       `json:"rule,omitempty"`
+	Decision     Decision    `json:"decision"`
+	Source       MatchSource `json:"source"`
+	Reason       string      `json:"reason,omitempty"`
+	UserDecision string      `json:"user_decision,omitempty"`
+	Analysis     Analysis    `json:"analysis"`
+	Rule         *Rule       `json:"rule,omitempty"`
 }
 
 type Proposal struct {
@@ -119,6 +132,8 @@ type Proposal struct {
 	PipelineID     string         `json:"pipeline_id,omitempty"`
 	ToolName       string         `json:"tool_name,omitempty"`
 	Command        string         `json:"command"`
+	Domain         string         `json:"domain,omitempty"`
+	Justification  string         `json:"justification,omitempty"`
 	WorkingDir     string         `json:"working_dir,omitempty"`
 	WorkspaceRoot  string         `json:"workspace_root,omitempty"`
 	TemplateKey    string         `json:"template_key"`
@@ -129,6 +144,13 @@ type Proposal struct {
 	Risk           string         `json:"risk"`
 	Timestamp      time.Time      `json:"timestamp"`
 	ApprovalPolicy ApprovalPolicy `json:"approval_policy,omitempty"`
+}
+
+func (p *Proposal) IsFetchApproval() bool {
+	if p == nil {
+		return false
+	}
+	return IsFetchToolName(p.ToolName)
 }
 
 type Gate interface {

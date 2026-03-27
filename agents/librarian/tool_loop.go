@@ -101,8 +101,9 @@ func (l *Librarian) applyToolCalls(
 		}
 		var execResult toolruntime.ExecutionResult
 		var execErr error
-		result, err := shared.TimedToolCall(ctx, "librarian", call, func() (string, error) {
-			execResult, execErr = l.executeToolCall(ctx, call)
+		execCtx := shared.WithActiveToolCall(ctx, call)
+		result, err := shared.TimedToolCall(execCtx, "librarian", call, func() (string, error) {
+			execResult, execErr = l.executeToolCall(execCtx, call)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {

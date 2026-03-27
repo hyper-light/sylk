@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -391,6 +392,9 @@ func (s *PlanStore) persistSnapshot(plan *DesignPlan) error {
 	if plan == nil || strings.TrimSpace(plan.ID) == "" {
 		return nil
 	}
+	if err := ensurePlanArtifactMetadata(s.baseDir, plan); err != nil {
+		return err
+	}
 	encoded, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
 		return err
@@ -399,8 +403,7 @@ func (s *PlanStore) persistSnapshot(plan *DesignPlan) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	trimmedID := strings.TrimSpace(plan.ID)
-	finalPath := filepath.Join(dir, trimmedID+".json")
+	finalPath := versionedPlanSnapshotPath(s.baseDir, plan.SessionID, plan.ID, plan.ArtifactVersion)
 	tmpPath := finalPath + ".tmp"
 	if err := os.WriteFile(tmpPath, encoded, 0o644); err != nil {
 		return err
@@ -438,6 +441,7 @@ func (s *PlanStore) restoreFromDisk() error {
 	cutoff := time.Now().Add(-restoreMaxAge)
 	restored := 0
 	skipped := 0
+	bestByID := map[string]*DesignPlan{}
 	for _, sessionEntry := range sessionEntries {
 		if !sessionEntry.IsDir() {
 			continue
@@ -457,43 +461,77 @@ func (s *PlanStore) restoreFromDisk() error {
 				continue
 			}
 			path := filepath.Join(planDir, entry.Name())
-			if ok, restoreErr := s.restorePlanFromFile(path, cutoff); restoreErr != nil {
+			plan, ok, restoreErr := s.restorePlanFromFile(path, cutoff)
+			if restoreErr != nil {
 				s.logger.Warn("failed to restore plan", "path", path, "error", restoreErr)
 				continue
-			} else if ok {
-				restored++
-			} else {
+			}
+			if !ok || plan == nil {
 				skipped++
+				continue
+			}
+			current, exists := bestByID[plan.ID]
+			if !exists || preferRestoredPlan(plan, current) {
+				bestByID[plan.ID] = plan
 			}
 		}
+	}
+	restoredIDs := make([]string, 0, len(bestByID))
+	for planID := range bestByID {
+		restoredIDs = append(restoredIDs, planID)
+	}
+	sort.Strings(restoredIDs)
+	for _, planID := range restoredIDs {
+		plan := bestByID[planID]
+		s.mu.Lock()
+		s.plans[plan.ID] = plan
+		s.mu.Unlock()
+		restored++
 	}
 	s.logger.Info("plan store: restore complete",
 		"sessions_dir", sessionsDir, "restored", restored, "skipped", skipped)
 	return nil
 }
 
-func (s *PlanStore) restorePlanFromFile(path string, cutoff time.Time) (bool, error) {
+func preferRestoredPlan(candidate, current *DesignPlan) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil {
+		return true
+	}
+	if cmp := candidate.ArtifactVersion.Compare(current.ArtifactVersion); cmp != 0 {
+		return cmp > 0
+	}
+	return candidate.UpdatedAt.After(current.UpdatedAt)
+}
+
+func (s *PlanStore) restorePlanFromFile(path string, cutoff time.Time) (*DesignPlan, bool, error) {
 	payload, err := os.ReadFile(path)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	var plan DesignPlan
 	if err := json.Unmarshal(payload, &plan); err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if strings.TrimSpace(plan.ID) == "" {
-		return false, fmt.Errorf("restored plan missing id")
+		return nil, false, fmt.Errorf("restored plan missing id")
+	}
+	plan.ArtifactVersion = normalizedPlanArtifactVersion(&plan)
+	if err := ensurePlanArtifactMetadata(s.baseDir, &plan); err != nil {
+		return nil, false, err
 	}
 	// Skip terminal-state plans only. Ready and Executing are restored —
 	// the architect may be demoted while waiting for approval or execution.
 	switch plan.Status {
 	case PlanStatusFailed, PlanStatusCompleted, PlanStatusSuperseded:
 		_ = os.Remove(path)
-		return false, nil
+		return nil, false, nil
 	}
 	if plan.UpdatedAt.Before(cutoff) {
 		_ = os.Remove(path)
-		return false, nil
+		return nil, false, nil
 	}
 	plan.sm = NewPlanStateMachineWithEpoch(plan.ID, plan.Status, plan.Epoch)
 	s.logger.Info("plan store: restored plan",
@@ -501,20 +539,31 @@ func (s *PlanStore) restorePlanFromFile(path string, cutoff time.Time) (bool, er
 		"status", plan.Status.String(),
 		"query", truncateString(plan.Query, 80),
 		"tasks", len(plan.Tasks),
+		"artifact_version", plan.ArtifactVersion.String(),
 		"created_at", plan.CreatedAt.String())
-	s.mu.Lock()
-	s.plans[plan.ID] = &plan
-	s.mu.Unlock()
-	return true, nil
+	return &plan, true, nil
 }
 
 // RemoveDiskFile removes the on-disk plan file for eviction.
 func (s *PlanStore) RemoveDiskFile(planID, sessionID string) {
 	dir := s.PlanDir(sessionID)
-	path := filepath.Join(dir, strings.TrimSpace(planID)+".json")
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		s.logger.Warn("plan store: failed to remove disk file",
-			"path", path, "error", err)
+	patterns := []string{
+		filepath.Join(dir, strings.TrimSpace(planID)+".json"),
+		filepath.Join(dir, strings.TrimSpace(planID)+"_v*.json"),
+	}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			s.logger.Warn("plan store: failed to expand disk file pattern",
+				"pattern", pattern, "error", err)
+			continue
+		}
+		for _, path := range matches {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				s.logger.Warn("plan store: failed to remove disk file",
+					"path", path, "error", err)
+			}
+		}
 	}
 }
 

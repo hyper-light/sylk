@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -315,6 +316,94 @@ func TestHandleResponseMessage_IgnoresGuideRelayedRouteResponses(t *testing.T) {
 	case extra := <-out:
 		t.Fatalf("unexpected duplicate forwarded route response: %+v", extra)
 	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestHandleResponseMessage_RestoresPendingMetadataOnRelayedStream(t *testing.T) {
+	g, out := newResponseTestGuide(t)
+	setPendingRouteWithMetadata(g, "corr-relayed-stream", map[string]any{
+		"chat_nested_branch":          true,
+		"chat_parent_correlation_id":  "corr-parent",
+		"chat_parent_tool_call_key":   "consult-1",
+		"chat_inter_agent_kind":       "consult",
+		"chat_inter_agent_thread_key": "thread-1",
+		"agent_type":                  "librarian",
+		"task_id":                     "task-1",
+	})
+
+	msg := &Message{
+		ID:            "msg-relayed-stream-start",
+		CorrelationID: "corr-relayed-stream",
+		Type:          MessageTypeStream,
+		SourceAgentID: "librarian",
+		Payload: &StreamResponse{
+			CorrelationID:     "corr-relayed-stream",
+			RespondingAgentID: "librarian",
+			Event: &StreamEvent{
+				Type:      StreamEventStart,
+				Timestamp: time.Now(),
+			},
+		},
+	}
+
+	if err := g.handleResponseMessage(msg); err != nil {
+		t.Fatalf("handleResponseMessage: %v", err)
+	}
+
+	select {
+	case forwarded := <-out:
+		stream, ok := forwarded.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatalf("unexpected forwarded message: %+v", forwarded)
+		}
+		if got := stream.Metadata["chat_parent_correlation_id"]; got != "corr-parent" {
+			t.Fatalf("parent correlation metadata = %#v, want corr-parent", got)
+		}
+		if got := stream.Metadata["chat_parent_tool_call_key"]; got != "consult-1" {
+			t.Fatalf("parent tool call metadata = %#v, want consult-1", got)
+		}
+		if got := stream.Metadata["chat_inter_agent_kind"]; got != "consult" {
+			t.Fatalf("inter-agent kind metadata = %#v, want consult", got)
+		}
+		if got := stream.Metadata["agent_type"]; got != "librarian" {
+			t.Fatalf("agent_type metadata = %#v, want librarian", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for relayed stream start")
+	}
+}
+
+func TestPublishRouteHandoffProgress_AttachesPendingMetadata(t *testing.T) {
+	g, out := newResponseTestGuide(t)
+	setPendingRouteWithMetadata(g, "corr-handoff", map[string]any{
+		"chat_nested_branch":         true,
+		"chat_parent_correlation_id": "corr-parent",
+		"chat_parent_tool_call_key":  "consult-1",
+		"chat_inter_agent_kind":      "consult",
+	})
+
+	g.publishRouteHandoffProgress("corr-handoff", "tui", "librarian", events.VisibilityAgent)
+
+	select {
+	case forwarded := <-out:
+		stream, ok := forwarded.GetStreamResponse()
+		if !ok || stream == nil || stream.Event == nil {
+			t.Fatalf("unexpected forwarded message: %+v", forwarded)
+		}
+		if stream.Event.Type != StreamEventProgress {
+			t.Fatalf("forwarded event type = %q, want progress", stream.Event.Type)
+		}
+		if stream.RespondingAgentID != "librarian" {
+			t.Fatalf("responding agent = %q, want librarian", stream.RespondingAgentID)
+		}
+		if got := stream.Metadata["chat_parent_correlation_id"]; got != "corr-parent" {
+			t.Fatalf("parent correlation metadata = %#v, want corr-parent", got)
+		}
+		if got := stream.Metadata["chat_parent_tool_call_key"]; got != "consult-1" {
+			t.Fatalf("parent tool call metadata = %#v, want consult-1", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for relayed handoff progress")
 	}
 }
 

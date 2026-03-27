@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -61,11 +62,12 @@ func (g *Guardian) publishStreamStart(ctx context.Context, correlationID string)
 	if g.bus == nil {
 		return
 	}
+	metadata := shared.StreamResponseMetadataFromContext(ctx)
 	event := &guide.StreamEvent{
 		Type: guide.StreamEventStart,
 		Data: map[string]any{"agent": "guardian"},
 	}
-	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, event))
+	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, metadata, event))
 }
 
 // publishStreamChunk emits a text chunk during streaming.
@@ -73,11 +75,12 @@ func (g *Guardian) publishStreamChunk(ctx context.Context, correlationID string,
 	if g.bus == nil || text == "" {
 		return
 	}
+	metadata := shared.StreamResponseMetadataFromContext(ctx)
 	event := &guide.StreamEvent{
 		Type: guide.StreamEventData,
 		Text: text,
 	}
-	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, event))
+	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, metadata, event))
 }
 
 // publishStreamComplete emits the final stream complete event.
@@ -85,18 +88,20 @@ func (g *Guardian) publishStreamComplete(ctx context.Context, correlationID stri
 	if g.bus == nil {
 		return
 	}
+	metadata := shared.StreamResponseMetadataFromContext(ctx)
 	event := &guide.StreamEvent{
 		Type:  guide.StreamEventComplete,
 		Text:  strings.TrimSpace(text),
 		Usage: usage,
 	}
-	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, event))
+	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, metadata, event))
 }
 
 func (g *Guardian) publishThoughtProgress(ctx context.Context, correlationID string, thought string) {
 	if g.bus == nil {
 		return
 	}
+	metadata := shared.StreamResponseMetadataFromContext(ctx)
 	thought = strings.TrimSpace(thought)
 	if thought == "" {
 		return
@@ -111,5 +116,5 @@ func (g *Guardian) publishThoughtProgress(ctx context.Context, correlationID str
 		},
 		Timestamp: time.Now(),
 	}
-	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, event))
+	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, metadata, event))
 }

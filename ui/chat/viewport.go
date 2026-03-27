@@ -2,6 +2,7 @@ package chat
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -13,9 +14,23 @@ import (
 // Region 0 always spans the entire entry (the "full message" view).
 // Regions 1..N correspond to individual code blocks within the entry.
 type selectionRegion struct {
-	start int // First line (inclusive, entry-relative).
-	end   int // Last line (exclusive, entry-relative).
+	start            int // First line (inclusive, entry-relative).
+	end              int // Last line (exclusive, entry-relative).
+	kind             selectionRegionKind
+	toolCallIndex    int
+	childIndex       int
+	childToolCallIdx int
 }
+
+type selectionRegionKind int
+
+const (
+	selectionRegionEntry selectionRegionKind = iota
+	selectionRegionToolCall
+	selectionRegionToolCallOverflow
+	selectionRegionChildToolCall
+	selectionRegionCodeBlock
+)
 
 // edgeFlashDuration is how long an edge flash persists.
 // Roughly matches the prior 63×16ms tick timing (~1.0s).
@@ -47,6 +62,8 @@ type Viewport struct {
 	codeCache          *codeBlockCache
 	hIdx               heightIndex                // Cached prefix-sum of entry heights.
 	streamStates       map[int]*streamRenderState // Entry index → render state for active streams.
+	frameToggleTargets []*toggleTarget            // Per-visible-line toggle targets from last rendered frame.
+	frameCopyTargets   []*CopyTarget              // Per-visible-line copy targets from last rendered frame.
 }
 
 // NewViewport creates a Viewport bound to the given History.
@@ -75,6 +92,8 @@ func (vp *Viewport) Reset() {
 	vp.codeCache.Clear()
 	vp.hIdx = heightIndex{}
 	clear(vp.streamStates)
+	vp.frameToggleTargets = nil
+	vp.frameCopyTargets = nil
 }
 
 // chatLeftPadding is the horizontal breathing room applied at the left edge of
@@ -409,11 +428,249 @@ func entryRegions(entry *ChatEntry) []selectionRegion {
 	if entry.Height <= 0 {
 		return nil
 	}
-	regions := []selectionRegion{{start: 0, end: entry.Height}}
-	for _, cr := range entry.CodeRegions {
-		regions = append(regions, selectionRegion{start: cr.Start, end: cr.End})
+	regions := []selectionRegion{{
+		start:            0,
+		end:              entry.Height,
+		kind:             selectionRegionEntry,
+		toolCallIndex:    -1,
+		childIndex:       -1,
+		childToolCallIdx: -1,
+	}}
+	for _, tr := range entry.ToolCallRegions {
+		regions = append(regions, selectionRegion{
+			start:            tr.Start,
+			end:              min(tr.Start+1, tr.End),
+			kind:             selectionRegionToolCall,
+			toolCallIndex:    tr.RecordIdx,
+			childIndex:       -1,
+			childToolCallIdx: -1,
+		})
+		for _, sr := range tr.Subregions {
+			kind := selectionRegionChildToolCall
+			if sr.Kind == ToolCallSubregionOverflow {
+				kind = selectionRegionToolCallOverflow
+			}
+			regions = append(regions, selectionRegion{
+				start:            sr.Start,
+				end:              sr.End,
+				kind:             kind,
+				toolCallIndex:    tr.RecordIdx,
+				childIndex:       sr.ChildIndex,
+				childToolCallIdx: sr.ChildToolCallIdx,
+			})
+		}
 	}
+	for _, cr := range entry.CodeRegions {
+		regions = append(regions, selectionRegion{
+			start:            cr.Start,
+			end:              cr.End,
+			kind:             selectionRegionCodeBlock,
+			toolCallIndex:    -1,
+			childIndex:       -1,
+			childToolCallIdx: -1,
+		})
+	}
+	sort.SliceStable(regions[1:], func(i, j int) bool {
+		left := regions[i+1]
+		right := regions[j+1]
+		if left.start != right.start {
+			return left.start < right.start
+		}
+		if left.end != right.end {
+			return left.end < right.end
+		}
+		return left.kind < right.kind
+	})
 	return regions
+}
+
+type toggleTargetKind int
+
+const (
+	toggleTargetToolCall toggleTargetKind = iota
+	toggleTargetOverflow
+	toggleTargetChildToolCall
+)
+
+type toggleTarget struct {
+	entryID             string
+	entryIndex          int
+	kind                toggleTargetKind
+	toolCallIndex       int
+	childIndex          int
+	childToolCallIdx    int
+	toolCallKey         string
+	toolCallName        string
+	toolCallArgsID      string
+	childID             string
+	childToolCallKey    string
+	childToolCallName   string
+	childToolCallArgsID string
+}
+
+func cloneToggleTarget(target *toggleTarget) *toggleTarget {
+	if target == nil {
+		return nil
+	}
+	cloned := *target
+	return &cloned
+}
+
+func cloneToggleTargets(targets []*toggleTarget) []*toggleTarget {
+	if len(targets) == 0 {
+		return nil
+	}
+	cloned := make([]*toggleTarget, len(targets))
+	for i := range targets {
+		cloned[i] = cloneToggleTarget(targets[i])
+	}
+	return cloned
+}
+
+func cloneCopyTarget(target *CopyTarget) *CopyTarget {
+	if target == nil {
+		return nil
+	}
+	cloned := *target
+	return &cloned
+}
+
+func cloneCopyTargets(targets []*CopyTarget) []*CopyTarget {
+	if len(targets) == 0 {
+		return nil
+	}
+	cloned := make([]*CopyTarget, len(targets))
+	for i := range targets {
+		cloned[i] = cloneCopyTarget(targets[i])
+	}
+	return cloned
+}
+
+func buildToolCallToggleTarget(entry *ChatEntry, entryIndex, toolCallIndex int, record ToolCallRecord) *toggleTarget {
+	return &toggleTarget{
+		entryID:        strings.TrimSpace(entry.ID),
+		entryIndex:     entryIndex,
+		kind:           toggleTargetToolCall,
+		toolCallIndex:  toolCallIndex,
+		toolCallKey:    strings.TrimSpace(record.ToolCallKey),
+		toolCallName:   strings.TrimSpace(record.ToolName),
+		toolCallArgsID: toolCallArgumentsIdentity(record.FullArgs, record.ArgsSummary),
+	}
+}
+
+func buildOverflowToggleTarget(
+	entry *ChatEntry,
+	entryIndex, toolCallIndex, childIndex int,
+	record ToolCallRecord,
+	child *InterAgentChildActivity,
+) *toggleTarget {
+	target := buildToolCallToggleTarget(entry, entryIndex, toolCallIndex, record)
+	if target != nil {
+		target.kind = toggleTargetOverflow
+		target.childIndex = childIndex
+		if child != nil {
+			target.childID = strings.TrimSpace(child.CorrelationID)
+		}
+	}
+	return target
+}
+
+func buildChildToolCallToggleTarget(
+	entry *ChatEntry,
+	entryIndex, toolCallIndex int,
+	record ToolCallRecord,
+	childIndex int,
+	child InterAgentChildActivity,
+	childToolCallIdx int,
+	childTool ToolCallRecord,
+) *toggleTarget {
+	target := buildToolCallToggleTarget(entry, entryIndex, toolCallIndex, record)
+	if target == nil {
+		return nil
+	}
+	target.kind = toggleTargetChildToolCall
+	target.childIndex = childIndex
+	target.childToolCallIdx = childToolCallIdx
+	target.childID = strings.TrimSpace(child.CorrelationID)
+	target.childToolCallKey = strings.TrimSpace(childTool.ToolCallKey)
+	target.childToolCallName = strings.TrimSpace(childTool.ToolName)
+	target.childToolCallArgsID = toolCallArgumentsIdentity(childTool.FullArgs, childTool.ArgsSummary)
+	return target
+}
+
+func (vp *Viewport) ToggleTargetAtViewLine(y int) *toggleTarget {
+	total := vp.history.Len()
+	if total == 0 || y < 0 || y >= vp.viewHeight {
+		return nil
+	}
+	totalLines := vp.totalLines()
+	end := max(totalLines-vp.scrollOff, 0)
+	start := max(end-vp.viewHeight, 0)
+	absLine := start + y
+	entryIdx, lineInEntry := vp.entryAtAbsLine(absLine)
+	if entryIdx < 0 {
+		return nil
+	}
+	vp.entryHeight(entryIdx)
+	entry := vp.history.Get(entryIdx)
+	if entry == nil {
+		return nil
+	}
+	return vp.resolveToggleTarget(entryIdx, entry, lineInEntry)
+}
+
+func (vp *Viewport) FrameToggleTargetAtViewLine(y int) *toggleTarget {
+	if y < 0 || y >= len(vp.frameToggleTargets) {
+		return nil
+	}
+	return cloneToggleTarget(vp.frameToggleTargets[y])
+}
+
+func (vp *Viewport) FrameCopyTargetAtViewLine(y int) *CopyTarget {
+	if y < 0 || y >= len(vp.frameCopyTargets) {
+		return nil
+	}
+	return cloneCopyTarget(vp.frameCopyTargets[y])
+}
+
+func (vp *Viewport) resolveToggleTarget(entryIdx int, entry *ChatEntry, lineInEntry int) *toggleTarget {
+	if entry == nil {
+		return nil
+	}
+	for _, tr := range entry.ToolCallRegions {
+		if tr.RecordIdx < 0 || tr.RecordIdx >= len(entry.ToolCalls) {
+			continue
+		}
+		record := entry.ToolCalls[tr.RecordIdx]
+		for _, sr := range tr.Subregions {
+			if lineInEntry >= sr.Start && lineInEntry < sr.End {
+				switch sr.Kind {
+				case ToolCallSubregionOverflow:
+					if record.InterAgent == nil || sr.ChildIndex < 0 || sr.ChildIndex >= len(record.InterAgent.Children) {
+						continue
+					}
+					child := record.InterAgent.Children[sr.ChildIndex]
+					return buildOverflowToggleTarget(entry, entryIdx, tr.RecordIdx, sr.ChildIndex, record, &child)
+				case ToolCallSubregionChildTool:
+					if record.InterAgent == nil || sr.ChildIndex < 0 || sr.ChildIndex >= len(record.InterAgent.Children) {
+						continue
+					}
+					child := record.InterAgent.Children[sr.ChildIndex]
+					if sr.ChildToolCallIdx < 0 || sr.ChildToolCallIdx >= len(child.ToolCalls) {
+						continue
+					}
+					return buildChildToolCallToggleTarget(entry, entryIdx, tr.RecordIdx, record, sr.ChildIndex, child, sr.ChildToolCallIdx, child.ToolCalls[sr.ChildToolCallIdx])
+				}
+			}
+		}
+		if lineInEntry >= tr.Start && lineInEntry < tr.End {
+			if record.InterAgent != nil && lineInEntry > tr.Start {
+				continue
+			}
+			return buildToolCallToggleTarget(entry, entryIdx, tr.RecordIdx, record)
+		}
+	}
+	return nil
 }
 
 // OnNewEntry should be called when a new entry is pushed to History.
@@ -440,12 +697,14 @@ func (vp *Viewport) Following() bool {
 func (vp *Viewport) View() string {
 	total := vp.history.Len()
 	if total == 0 || vp.viewHeight <= 0 || vp.viewWidth <= 0 {
+		vp.clearFrameTargets()
 		return ""
 	}
 
-	lines := vp.collectVisibleLines(total)
+	lines, toggleTargets, copyTargets := vp.collectVisibleFrame(total)
 	lines = vp.applyEdgeFlash(lines)
-	return vp.formatOutput(lines)
+	lines, toggleTargets, copyTargets = applyBounceShiftFrame(lines, toggleTargets, copyTargets, vp.bounceOffset, vp.viewHeight)
+	return vp.formatOutput(lines, toggleTargets, copyTargets)
 }
 
 // applyEdgeFlash overlays a directional wrap indicator at the bottom-right
@@ -616,7 +875,7 @@ func (hi *heightIndex) findEntryAtLine(absLine int) int {
 // collectVisibleLines renders only the entries overlapping the viewport
 // window defined by scrollOff and viewHeight, clipping partial entries
 // at the boundaries.
-func (vp *Viewport) collectVisibleLines(total int) []string {
+func (vp *Viewport) collectVisibleFrame(total int) ([]string, []*toggleTarget, []*CopyTarget) {
 	vp.buildHeightIndex()
 	totalLines := vp.hIdx.cumulative[vp.hIdx.entryCount]
 
@@ -624,7 +883,7 @@ func (vp *Viewport) collectVisibleLines(total int) []string {
 	start := max(end-vp.viewHeight, 0)
 
 	if totalLines == 0 || start >= end {
-		return nil
+		return nil, nil, nil
 	}
 
 	firstEntry := vp.hIdx.findEntryAtLine(start)
@@ -637,8 +896,14 @@ func (vp *Viewport) collectVisibleLines(total int) []string {
 	}
 
 	visible := make([]string, 0, end-start)
+	toggleTargets := make([]*toggleTarget, 0, end-start)
+	copyTargets := make([]*CopyTarget, 0, end-start)
 	for i := firstEntry; i <= lastEntry; i++ {
 		entryLines := vp.renderEntry(i)
+		entry := vp.history.Get(i)
+		if entry == nil {
+			continue
+		}
 		entryStart := vp.hIdx.cumulative[i]
 		entryEnd := vp.hIdx.cumulative[i+1]
 
@@ -647,11 +912,20 @@ func (vp *Viewport) collectVisibleLines(total int) []string {
 		lineTo := min(end-entryStart, entryEnd-entryStart)
 		if lineFrom < lineTo && lineFrom < len(entryLines) {
 			lineTo = min(lineTo, len(entryLines))
-			visible = append(visible, entryLines[lineFrom:lineTo]...)
+			for lineInEntry := lineFrom; lineInEntry < lineTo; lineInEntry++ {
+				visible = append(visible, entryLines[lineInEntry])
+				toggleTargets = append(toggleTargets, vp.resolveToggleTarget(i, entry, lineInEntry))
+				copyTarget := vp.resolveCopyTarget(entry, entry.Height, lineInEntry)
+				if copyTarget != nil {
+					copyTarget = cloneCopyTarget(copyTarget)
+					copyTarget.EntryIndex = i
+				}
+				copyTargets = append(copyTargets, copyTarget)
+			}
 		}
 	}
 
-	return visible
+	return visible, toggleTargets, copyTargets
 }
 
 // invalidateAllEntryHeights clears the render cache for all entries,
@@ -704,13 +978,13 @@ func (vp *Viewport) renderEntry(index int) []string {
 	// Use incremental streaming render for any active streaming entry.
 	if state, ok := vp.streamStates[index]; ok && state != nil {
 		rendered, regions := renderStreamingEntryFull(entry, vp.viewWidth, vp.theme, vp.codeCache, state)
-		vp.cacheRendered(index, rendered, regions)
+		vp.cacheRendered(index, rendered, regions, entry.ToolCallRegions)
 		lines = rendered
 	} else if entry.RenderedLines != nil && entry.Height >= 0 {
 		lines = entry.RenderedLines
 	} else {
 		rendered, regions := RenderEntry(entry, vp.viewWidth, vp.theme, vp.codeCache)
-		vp.cacheRendered(index, rendered, regions)
+		vp.cacheRendered(index, rendered, regions, entry.ToolCallRegions)
 		lines = rendered
 	}
 
@@ -878,8 +1152,9 @@ func thinkingSummaryLines(entry *ChatEntry) int {
 	return 0
 }
 
-// cacheRendered stores rendered lines and code regions back into the History entry.
-func (vp *Viewport) cacheRendered(index int, lines []string, regions []CodeRegion) {
+// cacheRendered stores rendered lines, code regions, and tool-call regions
+// back into the History entry.
+func (vp *Viewport) cacheRendered(index int, lines []string, regions []CodeRegion, toolRegions []ToolCallRegion) {
 	vp.history.mu.Lock()
 	defer vp.history.mu.Unlock()
 
@@ -889,7 +1164,13 @@ func (vp *Viewport) cacheRendered(index int, lines []string, regions []CodeRegio
 	physical := vp.history.logicalToPhysical(index)
 	vp.history.entries[physical].RenderedLines = lines
 	vp.history.entries[physical].CodeRegions = regions
+	vp.history.entries[physical].ToolCallRegions = toolRegions
 	vp.history.entries[physical].Height = len(lines)
+}
+
+func (vp *Viewport) clearFrameTargets() {
+	vp.frameToggleTargets = nil
+	vp.frameCopyTargets = nil
 }
 
 // SetBounceOffset updates the visual bounce displacement for rendering.
@@ -899,17 +1180,25 @@ func (vp *Viewport) SetBounceOffset(offset int) {
 
 // formatOutput applies the bounce offset, trims or pads the collected lines
 // to exactly viewHeight, applies horizontal padding, and joins with newlines.
-func (vp *Viewport) formatOutput(lines []string) string {
-	lines = applyBounceShift(lines, vp.bounceOffset, vp.viewHeight)
-
+func (vp *Viewport) formatOutput(lines []string, toggleTargets []*toggleTarget, copyTargets []*CopyTarget) string {
 	if len(lines) > vp.viewHeight {
 		lines = lines[:vp.viewHeight]
+		toggleTargets = toggleTargets[:min(len(toggleTargets), vp.viewHeight)]
+		copyTargets = copyTargets[:min(len(copyTargets), vp.viewHeight)]
 	}
 
 	// Pad with empty lines at the bottom if fewer than viewHeight.
 	for len(lines) < vp.viewHeight {
 		lines = append(lines, "")
 	}
+	for len(toggleTargets) < vp.viewHeight {
+		toggleTargets = append(toggleTargets, nil)
+	}
+	for len(copyTargets) < vp.viewHeight {
+		copyTargets = append(copyTargets, nil)
+	}
+	vp.frameToggleTargets = cloneToggleTargets(toggleTargets)
+	vp.frameCopyTargets = cloneCopyTargets(copyTargets)
 
 	// Apply a 1-space left padding and clamp the rendered content to the
 	// viewport budget so terminal soft-wrap never corrupts the panel border.
@@ -922,6 +1211,33 @@ func (vp *Viewport) formatOutput(lines []string) string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+func applyBounceShiftFrame(
+	lines []string,
+	toggleTargets []*toggleTarget,
+	copyTargets []*CopyTarget,
+	offset, viewHeight int,
+) ([]string, []*toggleTarget, []*CopyTarget) {
+	if offset == 0 || viewHeight <= 0 {
+		return lines, toggleTargets, copyTargets
+	}
+
+	absOffset := offset
+	if absOffset < 0 {
+		absOffset = -absOffset
+	}
+	absOffset = min(absOffset, viewHeight)
+
+	if offset > 0 {
+		shift := min(absOffset, len(lines))
+		return lines[shift:], toggleTargets[shift:], copyTargets[shift:]
+	}
+
+	padLines := make([]string, absOffset, absOffset+len(lines))
+	padToggles := make([]*toggleTarget, absOffset, absOffset+len(toggleTargets))
+	padCopies := make([]*CopyTarget, absOffset, absOffset+len(copyTargets))
+	return append(padLines, lines...), append(padToggles, toggleTargets...), append(padCopies, copyTargets...)
 }
 
 // applyBounceShift shifts the entire content block by the bounce offset,
@@ -1002,13 +1318,13 @@ func (vp *Viewport) entryHeight(index int) int {
 	// to get an accurate height consistent with renderEntry().
 	if state, ok := vp.streamStates[index]; ok && state != nil {
 		rendered, regions := renderStreamingEntryFull(entry, vp.viewWidth, vp.theme, vp.codeCache, state)
-		vp.cacheRendered(index, rendered, regions)
+		vp.cacheRendered(index, rendered, regions, entry.ToolCallRegions)
 		return len(rendered)
 	}
 	if entry.Height >= 0 {
 		return entry.Height
 	}
 	rendered, regions := RenderEntry(entry, vp.viewWidth, vp.theme, vp.codeCache)
-	vp.cacheRendered(index, rendered, regions)
+	vp.cacheRendered(index, rendered, regions, entry.ToolCallRegions)
 	return len(rendered)
 }

@@ -241,6 +241,10 @@ type ArchitectHandoff struct {
 	PlanningSummary string `json:"planning_summary"`
 	// RecommendedOptionID points at the preferred option.
 	RecommendedOptionID string `json:"recommended_option_id,omitempty"`
+	// PrototypeSketch is the condensed proof-of-concept shape for planning.
+	PrototypeSketch string `json:"prototype_sketch,omitempty"`
+	// SystemDesignNotes captures the main design implications to preserve in planning.
+	SystemDesignNotes []string `json:"system_design_notes,omitempty"`
 	// RequiredDecisions lists unresolved planning decisions.
 	RequiredDecisions []string `json:"required_decisions,omitempty"`
 	// SuggestedTasks lists likely initial planning tasks.
@@ -282,6 +286,12 @@ type AcademicResearchPaper struct {
 	SourcesCited []Source `json:"sources_cited"`
 	// OptionMatrix captures the main candidate architectures.
 	OptionMatrix []ArchitectureOption `json:"option_matrix,omitempty"`
+	// DecisionRationale explains why the preferred option wins.
+	DecisionRationale string `json:"decision_rationale,omitempty"`
+	// PrototypeExamples captures proof-of-concept or implementation-shape examples.
+	PrototypeExamples []string `json:"prototype_examples,omitempty"`
+	// SystemDesignImplications captures boundaries and architecture consequences.
+	SystemDesignImplications []string `json:"system_design_implications,omitempty"`
 	// RejectedOptions lists rejected approaches and why they were dropped.
 	RejectedOptions []string `json:"rejected_options,omitempty"`
 	// TradeOffs captures important design trade-offs surfaced by the research.

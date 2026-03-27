@@ -2,6 +2,7 @@ package shared
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -23,27 +24,48 @@ func PublishToolCallStreamEvent(
 	if bus == nil || channels == nil {
 		return
 	}
+	event.InterAgent = NormalizeInterAgentToolEventForEmit(
+		event.ToolName,
+		event.FullArgs,
+		event.Output,
+		event.Phase,
+		event.Success,
+		event.ErrorMsg,
+		event.InterAgent,
+	)
 
 	streamEvent := &guide.StreamEvent{
 		Type: guide.StreamEventToolCall,
 		Data: map[string]any{
-			"tool_name":    event.ToolName,
-			"args_summary": event.ArgsSummary,
-			"full_args":    event.FullArgs,
-			"output":       event.Output,
-			"error_msg":    event.ErrorMsg,
-			"phase":        int(event.Phase),
-			"started_at":   event.StartedAt.Format(time.RFC3339Nano),
-			"duration":     event.Duration.String(),
-			"success":      event.Success,
+			"tool_call_key": event.ToolCallKey,
+			"tool_name":     event.ToolName,
+			"args_summary":  event.ArgsSummary,
+			"full_args":     event.FullArgs,
+			"output":        event.Output,
+			"error_msg":     event.ErrorMsg,
+			"phase":         int(event.Phase),
+			"started_at":    event.StartedAt.Format(time.RFC3339Nano),
+			"duration":      event.Duration.String(),
+			"success":       event.Success,
 		},
 		Timestamp: time.Now(),
+	}
+	if event.InterAgent != nil {
+		streamEvent.Data.(map[string]any)["inter_agent"] = map[string]any{
+			"kind":          strings.TrimSpace(event.InterAgent.Kind),
+			"agent_types":   append([]string(nil), event.InterAgent.AgentTypes...),
+			"summary":       strings.TrimSpace(event.InterAgent.Summary),
+			"thread_key":    strings.TrimSpace(event.InterAgent.ThreadKey),
+			"status":        strings.TrimSpace(event.InterAgent.Status),
+			"update_origin": event.InterAgent.UpdateOrigin,
+		}
 	}
 
 	stream := &guide.StreamResponse{
 		CorrelationID:     correlationID,
 		RespondingAgentID: agentID,
 		TargetAgentID:     sourceAgentID,
+		Metadata:          cloneStreamMetadata(event.StreamMetadata),
 		Event:             streamEvent,
 	}
 

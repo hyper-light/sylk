@@ -60,3 +60,45 @@ func TestStreamAccumulator_EmptyThinking(t *testing.T) {
 		t.Fatalf("Thinking = %q, want empty", resp.Thinking)
 	}
 }
+
+func TestStreamAccumulator_NativeWebSearchDoesNotBecomeExecutableToolCall(t *testing.T) {
+	acc := NewStreamAccumulator()
+
+	acc.Add(&StreamChunk{Type: ChunkTypeStart, Timestamp: time.Now()})
+	acc.Add(&StreamChunk{
+		Type: ChunkTypeToolStart,
+		ToolCall: &ToolCallChunk{
+			ID:   "ws_1",
+			Name: "web_search",
+			Kind: ToolKindNativeWebSearch,
+		},
+		Timestamp: time.Now(),
+	})
+	acc.Add(&StreamChunk{
+		Type: ChunkTypeToolDelta,
+		ToolCall: &ToolCallChunk{
+			ID:             "ws_1",
+			Kind:           ToolKindNativeWebSearch,
+			ArgumentsDelta: `{"query":"python packaging pep 621","action":"search"}`,
+		},
+		Timestamp: time.Now(),
+	})
+	acc.Add(&StreamChunk{
+		Type:       ChunkTypeEnd,
+		Usage:      &Usage{OutputTokens: 5},
+		StopReason: StopReasonEndTurn,
+		Timestamp:  time.Now(),
+	})
+
+	resp := acc.Response()
+	if len(resp.ToolCalls) != 0 {
+		t.Fatalf("tool calls = %#v, want no executable tool calls", resp.ToolCalls)
+	}
+	calls := DecodeNativeWebSearchCalls(resp.ProviderMetadata)
+	if len(calls) != 1 {
+		t.Fatalf("native search call count = %d, want 1", len(calls))
+	}
+	if calls[0].Query != "python packaging pep 621" {
+		t.Fatalf("query = %q, want %q", calls[0].Query, "python packaging pep 621")
+	}
+}

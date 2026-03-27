@@ -37,24 +37,31 @@ type skillInvocationEntry struct {
 
 // tryDirectSkillInvocation checks whether the input matches a skill-invocation
 // prefix. On match it strips the prefix, validates the JSON payload, invokes
-// the registered skill, and returns the skill's data. Returns (nil, false) when
-// the input does not match any prefix or when invocation fails.
-func (g *Guide) tryDirectSkillInvocation(ctx context.Context, input string) (any, bool) {
+// the registered skill, and returns the skill's data. matched reports whether
+// the prefix was recognized. When matched is true, err carries validation or
+// invocation failures so callers do not silently fall back to freeform LLM
+// handling for explicit control payloads.
+func (g *Guide) tryDirectSkillInvocation(ctx context.Context, input string) (data any, matched bool, err error) {
 	for _, entry := range skillInvocationPrefixes {
 		if !strings.HasPrefix(input, entry.Prefix) {
 			continue
 		}
+		matched = true
 		rawJSON := json.RawMessage(input[len(entry.Prefix):])
 		if !json.Valid(rawJSON) {
-			return nil, false
+			return nil, true, fmt.Errorf("invalid %s payload: expected JSON", entry.SkillName)
 		}
 		result := g.skills.Invoke(ctx, entry.SkillName, rawJSON)
 		if !result.Success {
-			return nil, false
+			msg := strings.TrimSpace(result.Error)
+			if msg == "" {
+				msg = fmt.Sprintf("%s invocation failed", entry.SkillName)
+			}
+			return nil, true, fmt.Errorf("%s", msg)
 		}
-		return result.Data, true
+		return result.Data, true, nil
 	}
-	return nil, false
+	return nil, false, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +107,9 @@ const (
 // evaluatePlanAcceptance calls the LLM with structured output to classify the
 // user's response as accept / modify / reject.
 func (g *Guide) evaluatePlanAcceptance(ctx context.Context, input planAcceptanceInput) (map[string]any, error) {
+	if data, ok := deterministicPlanAcceptance(input); ok {
+		return data, nil
+	}
 	systemPrompt := loadPlanAcceptancePrompt()
 	if systemPrompt == "" {
 		systemPrompt = defaultPlanAcceptanceSystemPrompt
@@ -132,6 +142,31 @@ func (g *Guide) evaluatePlanAcceptance(ctx context.Context, input planAcceptance
 	return parsePlanAcceptanceResponse(resp.Content, input)
 }
 
+func deterministicPlanAcceptance(input planAcceptanceInput) (map[string]any, bool) {
+	switch {
+	case isPlanAcceptanceApprovalSignal(input.UserResponse):
+		return map[string]any{
+			"plan":          input.Plan,
+			"user_response": input.UserResponse,
+			"plan_id":       input.PlanID,
+			"plan_name":     input.PlanName,
+			"result":        "accept",
+			"modifications": []string{},
+		}, true
+	case isPlanAcceptanceRejectSignal(input.UserResponse):
+		return map[string]any{
+			"plan":          input.Plan,
+			"user_response": input.UserResponse,
+			"plan_id":       input.PlanID,
+			"plan_name":     input.PlanName,
+			"result":        "reject",
+			"modifications": []string{},
+		}, true
+	default:
+		return nil, false
+	}
+}
+
 // defaultPlanAcceptanceSystemPrompt is used when the SKILL.md file is
 // unavailable (e.g. binary builds without embedded assets).
 const defaultPlanAcceptanceSystemPrompt = `Evaluate whether a user approved or rejected a plan proposed by the architect.
@@ -142,6 +177,64 @@ Classify the user's response as:
 - reject: negative intent indicating the plan should not proceed (rejections may also contain modifications)
 
 Return JSON with "result" (accept/modify/reject) and "modifications" (array of adjustment notes, empty for pure accept).`
+
+var planAcceptanceApprovalPhrases = []string{
+	"looks good", "go ahead", "ship it", "do it", "kick it off",
+	"run it", "start it", "go for it", "let's go", "fire it off",
+	"lgtm", "approved", "proceed", "execute", "confirm",
+	"yes", "yep", "yeah", "yup",
+}
+
+var planAcceptanceApprovalDisqualifiers = []string{
+	"but ", "except", "change", "modify", "update", "instead",
+	"swap", "move", "add ", "remove", "however", "although",
+	"before that", "first ", "wait", "hold on", "actually",
+	"what about", "what if", "how about", "can you", "could you",
+	"question", "why ", "?",
+}
+
+var planAcceptanceRejectPhrases = []string{
+	"do not proceed", "don't proceed", "dont proceed",
+	"do not do this", "don't do this", "dont do this",
+	"not approved", "not acceptable", "bad idea",
+	"wrong direction", "scrap this", "drop this plan",
+	"hold off", "not yet", "stop this", "cancel this",
+}
+
+func isPlanAcceptanceApprovalSignal(input string) bool {
+	lower := strings.ToLower(strings.TrimSpace(input))
+	if lower == "" {
+		return false
+	}
+	for _, qualifier := range planAcceptanceApprovalDisqualifiers {
+		if strings.Contains(lower, qualifier) {
+			return false
+		}
+	}
+	for _, phrase := range planAcceptanceApprovalPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPlanAcceptanceRejectSignal(input string) bool {
+	lower := strings.ToLower(strings.TrimSpace(input))
+	if lower == "" {
+		return false
+	}
+	switch lower {
+	case "no", "nope", "nah", "reject", "decline", "cancel":
+		return true
+	}
+	for _, phrase := range planAcceptanceRejectPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
 
 // ---------------------------------------------------------------------------
 // Prompt construction

@@ -19,7 +19,9 @@ import (
 	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/core/knowledge/memory"
 	"github.com/adalundhe/sylk/core/knowledge/query"
+	"github.com/adalundhe/sylk/core/knowledgeruntime"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -30,6 +32,10 @@ import (
 // Satisfied by *providers.AnthropicProvider and *gateway.GatewayProvider.
 type archivalistProvider interface {
 	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
+}
+
+type committedKnowledgeSearcher interface {
+	Search(ctx context.Context, req *search.SearchRequest) (*knowledgeruntime.CommittedSearchResult, error)
 }
 
 // Archivalist is the main agent for managing AI-generated content and conversation memory
@@ -69,8 +75,12 @@ type Archivalist struct {
 	memory      *MemoryManager
 	toolHandler *ToolHandler
 
+	workIntentsMu sync.RWMutex
+	workIntents   []*WorkIntent
+
 	// Knowledge subsystems
 	knowledgeStore    *knowledge.KnowledgeStore
+	knowledgeBackend  committedKnowledgeSearcher
 	queryCoordinator  *query.HybridQueryCoordinator
 	memoryScorer      *memory.MemoryWeightedScorer
 	hybridMemory      *memory.HybridQueryWithMemory
@@ -284,6 +294,7 @@ func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
 		hooks:             hookRegistry,
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
+		workIntents:       make([]*WorkIntent, 0),
 		workspaceViews:    authority.RestrictWorkspaceViews("archivalist", cfg.WorkspaceViews),
 	}
 
@@ -635,7 +646,11 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	a.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
 	shared.LogIncomingRequest(a.steering.EventLogger(), fwd, a.id)
 	shared.EmitDispatchACK(a.bus, fwd.Metadata, a.id, "archivalist", fwd.CorrelationID)
-	a.publishActivity(events.EventTypeAgentAction, "Processing archivalist request")
+	if archivalistPublishesUserActivity(fwd) {
+		a.publishActivity(events.EventTypeAgentAction, "Processing archivalist request")
+	} else {
+		a.publishSystemEvent(events.EventTypeAgentAction, "Processing archivalist request")
+	}
 
 	if a.config.RequestGuard != nil {
 		release := a.config.RequestGuard()
@@ -657,7 +672,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 
 	emitter := shared.NewToolCallEmitter(a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
-	ctx = shared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = shared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
@@ -667,7 +682,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		SessionID:   fwd.SessionID,
 	})
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
-	gov := shared.NewContextGovernor(a.config.Model, a.config.MaxOutputTokens, 0)
+	gov := shared.NewContextGovernor(a.CurrentModel(), a.config.MaxOutputTokens, 0)
 	if a.handoffBridge != nil {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
 			return a.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
@@ -693,7 +708,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
 		RespondingAgentID:   a.id,
-		RespondingAgentName: "archivalist",
+		RespondingAgentName: "Archivalist",
 		ProcessingTime:      time.Since(startTime),
 	}
 
@@ -788,12 +803,70 @@ func (a *Archivalist) publishSystemEvent(eventType events.EventType, content str
 // When LLM is enabled and a provider is available, builds a providers.Request
 // and runs the tool loop. Falls back to direct intent-dispatch otherwise.
 func (a *Archivalist) processForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	if result, ok, err := a.maybeHandleBriefingRequest(fwd); ok {
+		return result, err
+	}
 	if result, ok, err := a.maybeHandleCoordinationPrecedentQuery(ctx, fwd); ok {
 		return result, err
+	}
+	if archivalistBypassesLLM(fwd) {
+		return a.processDeterministicForwardedRequest(ctx, fwd)
 	}
 	if a.config.EnableLLM && a.getProvider() != nil {
 		return a.processViaLLM(ctx, fwd)
 	}
+	return a.processDeterministicForwardedRequest(ctx, fwd)
+}
+
+func (a *Archivalist) maybeHandleBriefingRequest(fwd *guide.ForwardedRequest) (any, bool, error) {
+	if fwd == nil || len(fwd.Metadata) == 0 {
+		return nil, false, nil
+	}
+	requestType, _ := fwd.Metadata["request_type"].(string)
+	toolName, _ := fwd.Metadata["tool_name"].(string)
+	if !strings.EqualFold(strings.TrimSpace(requestType), "briefing") && strings.TrimSpace(toolName) != ToolGetBriefing {
+		return nil, false, nil
+	}
+
+	format, _ := fwd.Metadata["brief_format"].(string)
+	tier, _ := fwd.Metadata["brief_tier"].(string)
+	if strings.EqualFold(strings.TrimSpace(format), "context_brief") {
+		agentType, _ := fwd.Metadata["agent_type"].(string)
+		contextSize := intFromAnyMap(fwd.Metadata, "context_size")
+		turnNumber := intFromAnyMap(fwd.Metadata, "turn_number")
+		return a.buildContextBrief(agentType, contextSize, turnNumber), true, nil
+	}
+
+	data, err := a.getBriefingToolData(tier)
+	if err != nil {
+		return nil, true, err
+	}
+	return data, true, nil
+}
+
+func archivalistBypassesLLM(fwd *guide.ForwardedRequest) bool {
+	if fwd == nil {
+		return false
+	}
+	switch fwd.Intent {
+	case guide.IntentStore, guide.IntentDeclare, guide.IntentComplete:
+		return true
+	default:
+		return false
+	}
+}
+
+func archivalistPublishesUserActivity(fwd *guide.ForwardedRequest) bool {
+	if fwd == nil {
+		return true
+	}
+	if !fwd.FireAndForget {
+		return true
+	}
+	return !archivalistBypassesLLM(fwd)
+}
+
+func (a *Archivalist) processDeterministicForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	handler, err := a.intentHandler(fwd.Intent)
 	if err != nil {
 		return nil, err
@@ -872,7 +945,7 @@ func (a *Archivalist) processViaLLM(ctx context.Context, fwd *guide.ForwardedReq
 		SystemPrompt: a.config.SystemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: fwd.Input}},
 		Tools:        a.buildToolDefinitions(),
-		Model:        a.config.Model,
+		Model:        a.CurrentModel(),
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
 	a.applyConversationRuntimeProfile(llmReq)
@@ -959,7 +1032,7 @@ func ensureQueryLimit(query *ArchiveQuery, fallback int) {
 func (a *Archivalist) handleStore(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	metadata := normalizeCrossAgentMetadata(fwd.Metadata, fwd.SourceAgentID, fwd.SourceAgentName)
 	entry := &Entry{
-		Content:  fwd.Input,
+		Content:  archivalistStoreContent(fwd),
 		Source:   extractEntrySourceModel(metadata),
 		Metadata: metadata,
 	}
@@ -979,6 +1052,23 @@ func (a *Archivalist) handleStore(ctx context.Context, fwd *guide.ForwardedReque
 	}
 
 	return a.StoreEntry(ctx, entry), nil
+}
+
+func archivalistStoreContent(fwd *guide.ForwardedRequest) string {
+	if fwd == nil {
+		return ""
+	}
+	if fwd.Entities != nil {
+		if fwd.Entities.Data != nil {
+			if content, ok := fwd.Entities.Data["content"].(string); ok && strings.TrimSpace(content) != "" {
+				return content
+			}
+		}
+		if strings.TrimSpace(fwd.Entities.Query) != "" {
+			return strings.TrimSpace(fwd.Entities.Query)
+		}
+	}
+	return fwd.Input
 }
 
 // handleCheck processes check (verification) requests
@@ -1244,6 +1334,7 @@ func (a *Archivalist) Query(ctx context.Context, query ArchiveQuery) ([]*Entry, 
 	entries, err := a.store.Query(a.expandQueryForBoundedInfluence(queryValue))
 	if err == nil {
 		entries = a.applyBoundedCrossAgentInfluence(queryValue, entries)
+		entries = a.mergeCommittedKnowledgeRecall(ctx, queryValue, entries)
 	}
 	hookErr := a.runPostQueryHooks(ctx, queryData, entries, err)
 	if hookErr != nil && err == nil {
@@ -1297,6 +1388,82 @@ func (a *Archivalist) runPostQueryHooks(ctx context.Context, queryData *skills.Q
 	}
 	_, _, hookErr := a.hooks.ExecutePostQueryHooks(ctx, queryData)
 	return hookErr
+}
+
+func (a *Archivalist) mergeCommittedKnowledgeRecall(ctx context.Context, query ArchiveQuery, archiveEntries []*Entry) []*Entry {
+	knowledgeEntries := a.collectKnowledgeRecallEntries(ctx, query)
+	if len(knowledgeEntries) == 0 {
+		return archiveEntries
+	}
+	limit := query.Limit
+	if limit <= 0 {
+		limit = len(knowledgeEntries) + len(archiveEntries)
+	}
+	return interleaveRecallEntries(knowledgeEntries, archiveEntries, limit)
+}
+
+func knowledgeEntryCategory(docType search.DocumentType) Category {
+	switch docType {
+	case search.DocTypeSourceCode, search.DocTypeConfig:
+		return CategoryCodebaseMap
+	case search.DocTypeWebFetch, search.DocTypeMarkdown, search.DocTypeNote:
+		return CategoryInsight
+	default:
+		return CategoryGeneral
+	}
+}
+
+func committedKnowledgeExcerpt(queryText, content string, limit int) string {
+	content = strings.TrimSpace(content)
+	if limit <= 0 || len(content) <= limit {
+		return content
+	}
+	queryText = strings.TrimSpace(strings.ToLower(queryText))
+	if queryText == "" {
+		return content[:limit] + "..."
+	}
+	lower := strings.ToLower(content)
+	idx := strings.Index(lower, queryText)
+	if idx < 0 {
+		return content[:limit] + "..."
+	}
+	start := idx - limit/3
+	if start < 0 {
+		start = 0
+	}
+	end := start + limit
+	if end > len(content) {
+		end = len(content)
+		start = max(0, end-limit)
+	}
+	prefix := ""
+	suffix := ""
+	if start > 0 {
+		prefix = "..."
+	}
+	if end < len(content) {
+		suffix = "..."
+	}
+	return prefix + content[start:end] + suffix
+}
+
+func interleaveRecallEntries(primary, secondary []*Entry, limit int) []*Entry {
+	if limit <= 0 {
+		limit = len(primary) + len(secondary)
+	}
+	out := make([]*Entry, 0, min(limit, len(primary)+len(secondary)))
+	for i := 0; len(out) < limit && (i < len(primary) || i < len(secondary)); i++ {
+		if i < len(primary) {
+			out = append(out, primary[i])
+			if len(out) == limit {
+				break
+			}
+		}
+		if i < len(secondary) {
+			out = append(out, secondary[i])
+		}
+	}
+	return out
 }
 
 // QueryByCategory retrieves entries in a specific category
@@ -1430,6 +1597,9 @@ func (a *Archivalist) GetCurrentSession() *Session {
 }
 
 func (a *Archivalist) GetDefaultSession() string {
+	if a == nil || a.store == nil {
+		return a.defaultSessionID
+	}
 	if a.defaultSessionID == "" {
 		if current := a.store.GetCurrentSession(); current != nil {
 			return current.ID
@@ -1650,7 +1820,232 @@ func (a *Archivalist) GetResumeState() *ResumeState {
 
 // GetAgentBriefing returns everything an agent needs to continue work
 func (a *Archivalist) GetAgentBriefing() *AgentBriefing {
-	return a.agentContext.GetAgentBriefing()
+	briefing := a.agentContext.GetAgentBriefing()
+	if briefing == nil {
+		return nil
+	}
+	briefing.DeclaredIntents = a.ActiveWorkIntents()
+	return briefing
+}
+
+func (a *Archivalist) buildContextBrief(agentType string, contextSize, turnNumber int) *handoff.ContextBrief {
+	briefing := a.GetAgentBriefing()
+	now := time.Now()
+	result := &handoff.ContextBrief{
+		GeneratedAt: now,
+		ContextSize: contextSize,
+		TurnNumber:  turnNumber,
+	}
+	if briefing == nil {
+		result.TaskSummary = "No archived handoff context is available yet."
+		result.KeyDecisions = "No prior decisions recorded."
+		result.ActiveState = "No active state recorded."
+		result.NextSteps = "Rebuild context from the live conversation."
+		result.Blockers = "none"
+		return result
+	}
+
+	resume := briefing.ResumeState
+	if resume != nil {
+		taskParts := make([]string, 0, 4)
+		if task := strings.TrimSpace(resume.CurrentTask); task != "" {
+			taskParts = append(taskParts, task)
+		}
+		if step := strings.TrimSpace(resume.CurrentStep); step != "" {
+			taskParts = append(taskParts, "Current step: "+step)
+		}
+		if completed := len(resume.CompletedSteps); completed > 0 {
+			taskParts = append(taskParts, fmt.Sprintf("%d completed step(s)", completed))
+		}
+		if len(taskParts) > 0 {
+			result.TaskSummary = strings.Join(taskParts, ". ")
+		}
+		if next := summarizeStrings(resume.NextSteps, 3); next != "" {
+			result.NextSteps = next
+		}
+		if blockers := summarizeStrings(resume.Blockers, 3); blockers != "" {
+			result.Blockers = blockers
+		}
+	}
+	if result.TaskSummary == "" {
+		if trimmed := strings.TrimSpace(agentType); trimmed != "" {
+			result.TaskSummary = fmt.Sprintf("Continue %s work using the archived session context.", trimmed)
+		} else {
+			result.TaskSummary = "Continue work using the archived session context."
+		}
+	}
+	if result.NextSteps == "" {
+		result.NextSteps = "Inspect the archived briefing and resume the highest-priority unfinished work."
+	}
+	if result.Blockers == "" {
+		result.Blockers = "none"
+	}
+
+	keyDecisionParts := make([]string, 0, 2)
+	if patterns := summarizePatternHeadlines(briefing.Patterns, 3); patterns != "" {
+		keyDecisionParts = append(keyDecisionParts, "Patterns: "+patterns)
+	}
+	if failures := summarizeFailureHeadlines(briefing.RecentFailures, 2); failures != "" {
+		keyDecisionParts = append(keyDecisionParts, "Failures: "+failures)
+	}
+	if len(keyDecisionParts) == 0 {
+		result.KeyDecisions = "No major archived decisions or lessons are recorded yet."
+	} else {
+		result.KeyDecisions = strings.Join(keyDecisionParts, " ")
+	}
+
+	activeStateParts := make([]string, 0, 3)
+	if files := summarizeFilePaths(briefing.ModifiedFiles, 4); files != "" {
+		activeStateParts = append(activeStateParts, "Modified files: "+files)
+	}
+	if intents := summarizeWorkIntentHeadlines(briefing.DeclaredIntents, 2); intents != "" {
+		activeStateParts = append(activeStateParts, "Declared intents: "+intents)
+	}
+	if wants := summarizeIntentHeadlines(briefing.UserWants, 2); wants != "" {
+		activeStateParts = append(activeStateParts, "User wants: "+wants)
+	}
+	if len(activeStateParts) == 0 {
+		result.ActiveState = "No modified files or active intents recorded."
+	} else {
+		result.ActiveState = strings.Join(activeStateParts, " ")
+	}
+
+	return result
+}
+
+func summarizeStrings(values []string, limit int) string {
+	items := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		items = append(items, trimmed)
+		if len(items) >= limit {
+			break
+		}
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	return strings.Join(items, "; ")
+}
+
+func summarizePatternHeadlines(patterns []*Pattern, limit int) string {
+	items := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		if pattern == nil {
+			continue
+		}
+		headline := strings.TrimSpace(pattern.Pattern)
+		if headline == "" {
+			headline = strings.TrimSpace(pattern.Category)
+		}
+		if headline == "" {
+			continue
+		}
+		items = append(items, headline)
+		if len(items) >= limit {
+			break
+		}
+	}
+	return summarizeStrings(items, limit)
+}
+
+func summarizeFailureHeadlines(failures []*Failure, limit int) string {
+	items := make([]string, 0, len(failures))
+	for _, failure := range failures {
+		if failure == nil {
+			continue
+		}
+		headline := strings.TrimSpace(failure.Resolution)
+		if headline == "" {
+			headline = strings.TrimSpace(failure.Reason)
+		}
+		if headline == "" {
+			continue
+		}
+		items = append(items, headline)
+		if len(items) >= limit {
+			break
+		}
+	}
+	return summarizeStrings(items, limit)
+}
+
+func summarizeFilePaths(files []*FileState, limit int) string {
+	items := make([]string, 0, len(files))
+	for _, file := range files {
+		if file == nil {
+			continue
+		}
+		path := strings.TrimSpace(file.Path)
+		if path == "" {
+			continue
+		}
+		items = append(items, path)
+		if len(items) >= limit {
+			break
+		}
+	}
+	return summarizeStrings(items, limit)
+}
+
+func summarizeWorkIntentHeadlines(intents []*WorkIntent, limit int) string {
+	items := make([]string, 0, len(intents))
+	for _, intent := range intents {
+		if intent == nil {
+			continue
+		}
+		headline := strings.TrimSpace(intent.Description)
+		if headline == "" {
+			headline = strings.TrimSpace(intent.Type)
+		}
+		if headline == "" {
+			continue
+		}
+		items = append(items, headline)
+		if len(items) >= limit {
+			break
+		}
+	}
+	return summarizeStrings(items, limit)
+}
+
+func summarizeIntentHeadlines(intents []*Intent, limit int) string {
+	items := make([]string, 0, len(intents))
+	for _, intent := range intents {
+		if intent == nil {
+			continue
+		}
+		headline := strings.TrimSpace(intent.Content)
+		if headline == "" {
+			headline = strings.TrimSpace(string(intent.Type))
+		}
+		if headline == "" {
+			continue
+		}
+		items = append(items, headline)
+		if len(items) >= limit {
+			break
+		}
+	}
+	return summarizeStrings(items, limit)
+}
+
+func intFromAnyMap(data map[string]any, key string) int {
+	switch value := data[key].(type) {
+	case int:
+		return value
+	case int32:
+		return int(value)
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	default:
+		return 0
+	}
 }
 
 // =============================================================================
@@ -2013,7 +2408,7 @@ func firstBriefingBlocker(blockers []string) string {
 }
 
 func (a *Archivalist) getStandardBriefing() Response {
-	briefing := a.agentContext.GetAgentBriefing()
+	briefing := a.GetAgentBriefing()
 	return Response{
 		Status:  StatusOK,
 		Version: a.registry.GetVersion(),
@@ -2022,7 +2417,7 @@ func (a *Archivalist) getStandardBriefing() Response {
 }
 
 func (a *Archivalist) getFullBriefing() Response {
-	briefing := a.agentContext.GetAgentBriefing()
+	briefing := a.GetAgentBriefing()
 	snapshot := a.GetSnapshot(context.Background())
 
 	fullBriefing := map[string]any{
@@ -2255,7 +2650,7 @@ func readResumeScope(a *Archivalist, key string, limit int) any {
 }
 
 func readAllScope(a *Archivalist, key string, limit int) any {
-	return a.agentContext.GetAgentBriefing()
+	return a.GetAgentBriefing()
 }
 
 func scopeToEventType(scope Scope, isNew bool) EventType {
@@ -2638,6 +3033,14 @@ func (a *Archivalist) SetKnowledgeStore(ks *knowledge.KnowledgeStore) {
 	defer a.runMu.Unlock()
 	a.knowledgeStore = ks
 	a.queryCoordinator = ks.Coordinator()
+}
+
+// SetKnowledgeBackend wires the archivalist to the committed-global retrieval
+// backend used for repository head search and fetched-document recall.
+func (a *Archivalist) SetKnowledgeBackend(backend committedKnowledgeSearcher) {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	a.knowledgeBackend = backend
 }
 
 // SetWorkspaceViews injects explicit disk/global/pipeline read access.

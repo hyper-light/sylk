@@ -254,22 +254,17 @@ func ReadFileSkill(getFA FileAccessFunc) *skills.Skill {
 				return nil, fmt.Errorf("path is required")
 			}
 
-			var data []byte
-			var err error
-			if fa := getFA(); fa != nil {
-				data, err = fa.ReadFile(ctx, params.Path)
+			var fa versioning.FileAccess
+			if resolved := getFA(); resolved != nil {
+				fa = resolved
 			} else {
-				data, err = os.ReadFile(params.Path)
+				fa = versioning.NewDiskFileAccess("", true)
 			}
+			result, err := versioning.ReadFileToolResult(ctx, fa, params.Path, 0, 0)
 			if err != nil {
 				return nil, fmt.Errorf("read %s: %w", params.Path, err)
 			}
-
-			return map[string]any{
-				"path":    params.Path,
-				"content": string(data),
-				"size":    len(data),
-			}, nil
+			return result, nil
 		}).
 		Build()
 }

@@ -409,10 +409,11 @@ func (rs *ResponseStream) SendProgress(current, total int, message string) bool 
 
 // ProgressData contains progress information
 type ProgressData struct {
-	Current int     `json:"current"`
-	Total   int     `json:"total"`
-	Percent float64 `json:"percent"`
-	Message string  `json:"message,omitempty"`
+	Current int                 `json:"current"`
+	Total   int                 `json:"total"`
+	Percent float64             `json:"percent"`
+	Message string              `json:"message,omitempty"`
+	UIState events.AgentUIState `json:"ui_state,omitempty"`
 }
 
 // SendHeartbeat sends a keep-alive heartbeat

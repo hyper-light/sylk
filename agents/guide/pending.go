@@ -98,6 +98,12 @@ func (ps *PendingStore) Add(req *RouteRequest, classification *RouteResult, targ
 		ExpiresAt:       now.Add(ps.defaultTimeout),
 	}
 
+	if parentID := strings.TrimSpace(req.ParentCorrelationID); parentID != "" && !metadataPreservesSourceStreamTarget(req.Metadata) {
+		if parent := ps.pending[parentID]; parent != nil {
+			pending.StreamTargetOverride = inheritedPendingStreamTarget(parent)
+		}
+	}
+
 	// Store by correlation ID
 	ps.pending[corrID] = pending
 
@@ -127,6 +133,16 @@ func (ps *PendingStore) Add(req *RouteRequest, classification *RouteResult, targ
 	}
 
 	return corrID
+}
+
+func inheritedPendingStreamTarget(pending *PendingRequest) string {
+	if pending == nil {
+		return ""
+	}
+	if target := strings.TrimSpace(pending.StreamTargetOverride); target != "" {
+		return target
+	}
+	return strings.TrimSpace(pending.SourceAgentID)
 }
 
 // Set stores a pre-built PendingRequest by its CorrelationID.

@@ -391,6 +391,7 @@ func requestArchitectResearchSkill(gi *GlobalInspector) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
+			response := ""
 			if gi.bus != nil {
 				payload := map[string]any{
 					"type":        "architect_research",
@@ -399,15 +400,36 @@ func requestArchitectResearchSkill(gi *GlobalInspector) *skills.Skill {
 					"source":      gi.id,
 				}
 				payloadJSON, _ := json.Marshal(payload)
-				_, _ = gi.requestRouteSync(ctx, "architect", string(payloadJSON), map[string]any{
+				branchCtx, branch := agentShared.BeginInterAgentBranch(ctx, agentShared.InterAgentBranchSpec{
+					Kind:       agentShared.InterAgentToolEventKindConsult,
+					ToolName:   "request_architect_research",
+					AgentTypes: []string{"architect"},
+					Summary:    params.Description,
+					Args: map[string]any{
+						"target":      "architect",
+						"description": params.Description,
+						"context":     params.Context,
+					},
+				})
+				metadata := branch.ApplyMetadata(branchCtx, map[string]any{
 					"consultation_kind": "architect_research",
 				})
+				msg, err := gi.requestRouteSync(branchCtx, "architect", string(payloadJSON), metadata)
+				branch.CompleteFromMessage(branchCtx, msg, err)
+				if err != nil {
+					return nil, err
+				}
+				response, err = extractConsultationResponse(msg)
+				if err != nil {
+					return nil, err
+				}
 			}
 
 			return map[string]any{
 				"requested":   true,
 				"target":      "architect",
 				"description": params.Description,
+				"response":    response,
 			}, nil
 		}).
 		Build()

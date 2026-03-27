@@ -12,7 +12,8 @@ Use this guidance when you are actively driving or closing a pipeline turn.
 - When implementation evidence exists, run only the validation tools that materially increase certainty for this task.
 - In each inspector review cycle after Engineer, Designer, or Tester hands work back, push Engineer and Designer on correctness, robustness, performance, and production quality; penalize excessive code, premature abstraction, verbosity, and agentic slop.
 - In each inspector review cycle after Engineer, Designer, or Tester hands work back, push Tester to justify the value of the tests it added; penalize noisy or low-signal testing surface that does not materially increase confidence.
-- Use `validate_criteria` and `grade_task_quality` to judge the current state, but keep the lifecycle agentic: decide whether to loop again or accept.
+- Prefer a single tester-backed audit cycle over broad local re-auditing. Use `finalize_pipeline` as the default audit path after Engineer or Designer hands work back.
+- Use `validate_criteria` and `grade_task_quality` only when a specific unresolved gap remains that the current tester response or protocol state does not already answer.
 - Each time Engineer or Designer hands work back to you, invoke `finalize_pipeline` to run the inspector audit cycle and challenge Tester.
 - If the `finalize_pipeline` audit passes and tester evidence confirms the required tests are implemented and passing, you must immediately invoke `handoff_to_ot` and stop looping.
 - Use `handoff_to_ot` only when you are satisfied that the latest `finalize_pipeline` audit cycle passed and the pipeline should terminate successfully, and do not start another audit cycle once `finalize_pipeline` reports readiness for OT.

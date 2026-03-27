@@ -9,6 +9,7 @@ import (
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
+	"github.com/adalundhe/sylk/core/skills"
 )
 
 // MaxConsecutiveToolErrors is the threshold of consecutive all-error tool-call
@@ -295,6 +296,68 @@ func ToolErrorCountsTowardAbort(err error) bool {
 		return false
 	}
 	return !errors.Is(err, commandapproval.ErrApprovalDenied)
+}
+
+func WrapApprovalDenied(toolName string, err error) error {
+	if err == nil || !errors.Is(err, commandapproval.ErrApprovalDenied) || errors.Is(err, skills.ErrDelegatedRequested) {
+		return err
+	}
+	return ApprovalDeniedDelegatedError(toolName, approvalDeniedReason(err))
+}
+
+func ApprovalDeniedDelegatedError(toolName, reason string) error {
+	message := approvalDeniedUserMessage(toolName)
+	payload := map[string]any{
+		"status":       "approval_denied",
+		"tool_name":    strings.TrimSpace(toolName),
+		"user_message": message,
+	}
+	if trimmed := strings.TrimSpace(reason); trimmed != "" {
+		payload["reason"] = trimmed
+	}
+	return skills.NewDelegatedError(payload, message)
+}
+
+func DelegatedToolMessage(output string, err error) string {
+	if message := ToolOutputUserMessage(output); message != "" {
+		return message
+	}
+	return strings.TrimSpace(skills.DelegatedMessage(err))
+}
+
+func ToolOutputUserMessage(output string) string {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return ""
+	}
+	var payload any
+	if err := json.Unmarshal([]byte(output), &payload); err == nil {
+		if summary := SummarizeInterAgentPayload(payload); summary != "" {
+			return summary
+		}
+	}
+	return output
+}
+
+func approvalDeniedUserMessage(toolName string) string {
+	target := strings.TrimSpace(toolName)
+	if target == "" {
+		return "The user denied approval for this operation. What would you like me to do next or instead?"
+	}
+	return fmt.Sprintf("The user denied approval for %s. What would you like me to do next or instead?", target)
+}
+
+func approvalDeniedReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	reason := strings.TrimSpace(err.Error())
+	lowered := strings.ToLower(reason)
+	const marker = "command approval denied:"
+	if idx := strings.Index(lowered, marker); idx >= 0 {
+		return strings.TrimSpace(reason[idx+len(marker):])
+	}
+	return reason
 }
 
 type toolErrorDetailPayload struct {

@@ -1773,8 +1773,9 @@ func (pt *PipelineTester) runDeterministicToolCall(
 		Name:      name,
 		Arguments: string(arguments),
 	}
-	return agentshared.TimedToolCall(ctx, "tester-pipeline", call, func() (string, error) {
-		execResult, execErr := pt.executeToolCall(ctx, call)
+	execCtx := agentshared.WithActiveToolCall(ctx, call)
+	return agentshared.TimedToolCall(execCtx, "tester-pipeline", call, func() (string, error) {
+		execResult, execErr := pt.executeToolCall(execCtx, call)
 		if execErr != nil {
 			return "", execErr
 		}
@@ -1979,7 +1980,7 @@ func (pt *PipelineTester) runGoTestSuite(ctx context.Context, harness *testHarne
 	}
 	agentshared.PopulateCommandApprovalScope(ctx, &authReq)
 	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq); err != nil {
-		return nil, err
+		return nil, agentshared.WrapApprovalDenied(authReq.ToolName, err)
 	}
 
 	cmdCtx := ctx
@@ -2105,7 +2106,7 @@ func (pt *PipelineTester) runGenericSuite(ctx context.Context, harness *testHarn
 	}
 	agentshared.PopulateCommandApprovalScope(ctx, &authReq)
 	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq); err != nil {
-		return nil, err
+		return nil, agentshared.WrapApprovalDenied(authReq.ToolName, err)
 	}
 	cmdCtx := ctx
 	if timeoutSeconds > 0 {

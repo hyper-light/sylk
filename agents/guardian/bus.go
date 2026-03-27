@@ -33,7 +33,7 @@ func newProposalMessage(correlationID string, proposal *GitMutationProposal) *gu
 }
 
 // newStreamMessage creates a stream event message for the Guide.
-func newStreamMessage(correlationID, agentID string, event *guide.StreamEvent) *guide.Message {
+func newStreamMessage(correlationID, agentID string, metadata map[string]any, event *guide.StreamEvent) *guide.Message {
 	return &guide.Message{
 		ID:            uuid.New().String(),
 		CorrelationID: correlationID,
@@ -42,6 +42,7 @@ func newStreamMessage(correlationID, agentID string, event *guide.StreamEvent) *
 		Payload: &guide.StreamResponse{
 			CorrelationID:     correlationID,
 			RespondingAgentID: agentID,
+			Metadata:          metadata,
 			Event:             event,
 		},
 		Timestamp: time.Now(),

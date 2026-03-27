@@ -83,7 +83,7 @@ type Architect struct {
 	knownAgentsMu sync.RWMutex
 	planModesMu   sync.RWMutex
 	pendingMu     sync.Mutex
-	pendingBus    map[string]chan *guide.Message
+	pendingBus    map[string]*shared.PendingSyncWait
 	inFlightMu    sync.Mutex
 	inFlight      map[string]context.CancelFunc
 
@@ -259,10 +259,23 @@ func (a *Architect) logDebug(msg string, args ...any) {
 }
 
 func (a *Architect) publishActivity(eventType events.EventType, content string) {
-	a.publishActivityWithVisibility(eventType, events.VisibilityUser, content)
+	a.publishActivityStateWithVisibility(eventType, events.VisibilityUser, content, events.AgentUIStateNone)
 }
 
 func (a *Architect) publishActivityWithVisibility(eventType events.EventType, visibility events.EventVisibility, content string) {
+	a.publishActivityStateWithVisibility(eventType, visibility, content, events.AgentUIStateNone)
+}
+
+func (a *Architect) publishActivityState(eventType events.EventType, content string, state events.AgentUIState) {
+	a.publishActivityStateWithVisibility(eventType, events.VisibilityUser, content, state)
+}
+
+func (a *Architect) publishActivityStateWithVisibility(
+	eventType events.EventType,
+	visibility events.EventVisibility,
+	content string,
+	state events.AgentUIState,
+) {
 	if a.activityPub == nil {
 		return
 	}
@@ -271,6 +284,7 @@ func (a *Architect) publishActivityWithVisibility(eventType events.EventType, vi
 	evt.Visibility = visibility
 	evt.Data["agent_type"] = "architect"
 	evt.Data["agent_name"] = "Architect"
+	events.SetAgentUIState(evt, state)
 	a.activityPub.PublishActivity(evt)
 }
 
@@ -357,7 +371,7 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 		ownsControlStore:  ownedControlStore,
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		planModes:         make(map[string]*PlanModeState),
-		pendingBus:        make(map[string]chan *guide.Message),
+		pendingBus:        make(map[string]*shared.PendingSyncWait),
 		inFlight:          make(map[string]context.CancelFunc),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
@@ -825,6 +839,7 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	})
 	reqCtx = withRouteHops(reqCtx, fwd.Hops)
 	reqCtx = withArchitectStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
+	reqCtx = shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	reqCtx, usageAcc := withArchitectUsageAccumulator(reqCtx)
 	reqCtx = withArchitectEarlyUsageEmitter(reqCtx, func(inputTokens int) {
 		a.publishPlanStreamEarlyUsage(reqCtx, inputTokens)
@@ -843,8 +858,9 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 		AgentID:     a.id,
 		SessionID:   fwd.SessionID,
 	})
+	reqCtx = shared.WithAutomaticHandoffEnabled(reqCtx, shared.AutomaticHandoffAllowedForForwardedRequest(fwd))
 	gov := shared.NewContextGovernor(a.config.Model, a.config.MaxOutputTokens, 0)
-	if a.handoffBridge != nil {
+	if a.handoffBridge != nil && shared.AutomaticHandoffEnabled(reqCtx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
 			return a.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
 		}
@@ -1172,6 +1188,9 @@ func (a *Architect) intentHandler(intent guide.Intent) (forwardedHandler, error)
 
 // handleRecall processes recall requests
 func (a *Architect) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	if a.shouldRouteExistingReadyPlanFollowupToConversation(fwd, time.Now().UTC()) {
+		return a.handleConversation(ctx, fwd)
+	}
 	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
 	req := &ArchitectRequest{
 		ID:                  uuid.New().String(),
@@ -1188,6 +1207,9 @@ func (a *Architect) handleRecall(ctx context.Context, fwd *guide.ForwardedReques
 
 // handleCheck processes check/verification requests
 func (a *Architect) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	if a.shouldRouteExistingReadyPlanFollowupToConversation(fwd, time.Now().UTC()) {
+		return a.handleConversation(ctx, fwd)
+	}
 	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
 	req := &ArchitectRequest{
 		ID:                  uuid.New().String(),
@@ -1200,6 +1222,19 @@ func (a *Architect) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest
 	}
 
 	return a.Handle(ctx, req)
+}
+
+func (a *Architect) shouldRouteExistingReadyPlanFollowupToConversation(
+	fwd *guide.ForwardedRequest,
+	now time.Time,
+) bool {
+	if a == nil || fwd == nil {
+		return false
+	}
+	if plan := a.resolveReadyPlanFromMetadata(fwd.Metadata, now); plan != nil {
+		return true
+	}
+	return a.resolveRecoverableReadyPlanForConversation(sessionIDFromForwarded(fwd), now) != nil
 }
 
 // handleConversation processes conversational requests from the event bus.

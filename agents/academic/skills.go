@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -101,7 +102,7 @@ func cloneViaLibrarianSkill(a *Academic) *skills.Skill {
 			}
 
 			cloneQuery := fmt.Sprintf("Clone repository %s for analysis: %s", params.URL, params.Reason)
-			evidence, err := a.requestConsultation(ctx, "librarian", cloneQuery, "", a.config.SessionID)
+			evidence, err := a.requestConsultation(ctx, "librarian", cloneQuery, "", "")
 			if err != nil {
 				return map[string]any{
 					"success": false,
@@ -150,7 +151,13 @@ func consultSkill(a *Academic) *skills.Skill {
 			if params.Query == "" {
 				return nil, fmt.Errorf("query is required")
 			}
-			evidence, err := a.requestConsultation(ctx, params.Target, params.Query, params.Scope, a.config.SessionID)
+			if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
+				if err := execState.recordConsultAttempt(params.Target, params.Query, params.Scope); err != nil {
+					academicLogDuplicateConsultationBlocked(ctx, params.Target, params.Query, params.Scope)
+					return nil, err
+				}
+			}
+			evidence, err := a.requestConsultation(ctx, params.Target, params.Query, params.Scope, "")
 			if err != nil {
 				return nil, err
 			}
@@ -497,7 +504,7 @@ func (a *Academic) SendToLibrarian(_ context.Context, message string) error {
 	req := &guide.RouteRequest{
 		CorrelationID: uuid.New().String(),
 		Input:         message,
-		SourceAgentID: "academic",
+		SourceAgentID: strings.TrimSpace(a.id),
 		TargetAgentID: "librarian",
 		FireAndForget: true,
 		Timestamp:     time.Now(),

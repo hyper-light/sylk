@@ -2,8 +2,11 @@ package cmd
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/adalundhe/sylk/agents/archivalist"
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -72,5 +75,36 @@ func TestResolvePersistedModelForCurrentAuth_OnlyOpenAIChangesForChatGPT(t *test
 	}
 	if got := resolvePersistedModelForCurrentAuth("claude-opus-4-6", "anthropic", reg); got != "claude-opus-4-6" {
 		t.Fatalf("resolvePersistedModelForCurrentAuth(anthropic) = %q, want claude-opus-4-6", got)
+	}
+}
+
+func TestOnDemandConfiguredModel_UsesPersistedLibrarianModel(t *testing.T) {
+	root := t.TempDir()
+	cfgDir := filepath.Join(root, ".sylk")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	configPath := filepath.Join(cfgDir, "config.yaml")
+	config := "agents:\n  librarian:\n    provider: anthropic\n    model: claude-sonnet-4-6\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	deps := onDemandAgentCreatorDeps{projectRoot: root}
+	if got := deps.configuredModel("librarian", "gemini-3.1-pro-preview"); got != "claude-sonnet-4-6" {
+		t.Fatalf("configuredModel(librarian) = %q, want claude-sonnet-4-6", got)
+	}
+}
+
+func TestBuildOnDemandArchivalistConfig_EnablesConsultationRuntime(t *testing.T) {
+	cfg := buildOnDemandArchivalistConfig(onDemandAgentCreatorDeps{}, "archivalist", archivalist.ModelSonnet45)
+	if !cfg.EnableLLM {
+		t.Fatal("expected archivalist LLM mode enabled")
+	}
+	if !cfg.EnableArchive || !cfg.EnableRAG || !cfg.EnableKnowledgeGraph {
+		t.Fatalf("expected archive-backed retrieval enabled, got archive=%v rag=%v graph=%v", cfg.EnableArchive, cfg.EnableRAG, cfg.EnableKnowledgeGraph)
+	}
+	if !cfg.EnableHybridQuery || !cfg.EnableACTR {
+		t.Fatalf("expected hybrid retrieval and ACT-R enabled, got hybrid=%v actr=%v", cfg.EnableHybridQuery, cfg.EnableACTR)
 	}
 }

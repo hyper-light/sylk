@@ -13,14 +13,17 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/fetch"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/redact"
 )
 
 const (
-	guideBridgeName = "bridge.guide"
-	guideBufferSize = 256
+	guideBridgeName         = "bridge.guide"
+	guideBufferSize         = 256
+	guidePriorityBufferSize = 256
 	// Zero uses the scope's max lifetime; guide bridge is long-lived for the UI session.
 	guideDrainTimeout = 0
 
@@ -36,6 +39,7 @@ const (
 type GuideBridge struct {
 	bus          guide.EventBus
 	scope        *concurrency.GoroutineScope
+	priority     chan *guide.Message
 	buffer       chan *guide.Message
 	dropped      atomic.Int64
 	done         chan struct{}
@@ -51,6 +55,7 @@ func NewGuideBridge(bus guide.EventBus, scope *concurrency.GoroutineScope, sessi
 	return &GuideBridge{
 		bus:       bus,
 		scope:     scope,
+		priority:  make(chan *guide.Message, guidePriorityBufferSize),
 		buffer:    make(chan *guide.Message, guideBufferSize),
 		done:      make(chan struct{}),
 		sessionID: sessionID,
@@ -99,14 +104,23 @@ func (b *GuideBridge) DroppedCount() int64 { return b.dropped.Load() }
 // onMessage is the guide.MessageHandler called by the EventBus.
 // It enqueues the raw message into the bounded buffer for type dispatch.
 func (b *GuideBridge) onMessage(busMsg *guide.Message) error {
+	target := b.buffer
+	if isPriorityGuideMessage(busMsg) {
+		target = b.priority
+	}
 	select {
-	case b.buffer <- busMsg:
+	case target <- busMsg:
 	default:
 		b.dropped.Add(1)
 		if stream, ok := busMsg.GetStreamResponse(); ok && stream.Event != nil && stream.Event.Type == guide.StreamEventComplete {
 			bridgeEventDebugLog().Warn("GuideBridge: STREAM_COMPLETE_DROPPED",
 				"correlation_id", busMsg.CorrelationID,
-				"buffer_cap", cap(b.buffer),
+				"buffer_cap", cap(target),
+				"total_dropped", b.dropped.Load())
+		} else if busMsg != nil && busMsg.Type == guide.MessageTypeProposal {
+			bridgeEventDebugLog().Warn("GuideBridge: APPROVAL_PROPOSAL_DROPPED",
+				"correlation_id", busMsg.CorrelationID,
+				"buffer_cap", cap(target),
 				"total_dropped", b.dropped.Load())
 		}
 	}
@@ -120,15 +134,86 @@ func (b *GuideBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 			if stop, err := shouldStop(b.done, ctx); stop {
 				return err
 			}
-			select {
-			case busMsg := <-b.buffer:
+			if busMsg, ok := b.nextMessage(ctx); ok {
 				b.dispatch(busMsg, program)
-			case <-b.done:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
+				continue
 			}
+			return nil
 		}
+	}
+}
+
+func (b *GuideBridge) nextMessage(ctx context.Context) (*guide.Message, bool) {
+	select {
+	case busMsg := <-b.priority:
+		return busMsg, true
+	default:
+	}
+
+	select {
+	case busMsg := <-b.priority:
+		return busMsg, true
+	case busMsg := <-b.buffer:
+		return busMsg, true
+	case <-b.done:
+		return nil, false
+	case <-ctx.Done():
+		return nil, false
+	}
+}
+
+func isPriorityGuideMessage(busMsg *guide.Message) bool {
+	if busMsg == nil {
+		return false
+	}
+	switch busMsg.Type {
+	case guide.MessageTypeProposal, guide.MessageTypeLayerDecision, guide.MessageTypeResponse, guide.MessageTypeError:
+		return true
+	case guide.MessageTypeStream:
+		stream, ok := busMsg.GetStreamResponse()
+		if !ok || stream == nil || stream.Event == nil {
+			return false
+		}
+		switch stream.Event.Type {
+		case guide.StreamEventComplete, guide.StreamEventError:
+			return true
+		case guide.StreamEventStart, guide.StreamEventProgress:
+			return streamHasPriorityInterAgentBranch(stream)
+		case guide.StreamEventToolCall:
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+func streamHasPriorityInterAgentBranch(stream *guide.StreamResponse) bool {
+	return parseInterAgentBranchRef(stream) != nil
+}
+
+func streamHasPriorityInterAgentToolCall(stream *guide.StreamResponse) bool {
+	if stream == nil || stream.Event == nil {
+		return false
+	}
+	if streamHasPriorityInterAgentBranch(stream) {
+		return true
+	}
+	data, ok := stream.Event.Data.(map[string]any)
+	if !ok || len(data) == 0 {
+		return false
+	}
+	meta, ok := data["inter_agent"].(map[string]any)
+	if !ok || len(meta) == 0 {
+		return false
+	}
+	kind, _ := meta["kind"].(string)
+	switch strings.TrimSpace(kind) {
+	case "consult", "challenge", "approval", "store":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -146,7 +231,7 @@ func (b *GuideBridge) dispatch(busMsg *guide.Message, program TeaProgram) {
 		return
 	}
 	if resp, ok := busMsg.GetRouteResponse(); ok {
-		program.Send(toGuideMsg(resp))
+		program.Send(toGuideMsg(resp, busMsg.Metadata))
 		return
 	}
 	if stream, ok := busMsg.GetStreamResponse(); ok {
@@ -158,6 +243,7 @@ func (b *GuideBridge) dispatch(busMsg *guide.Message, program TeaProgram) {
 			SessionID:     b.sessionID,
 			CorrelationID: busMsg.CorrelationID,
 			Err:           guideError(redact.Text(errText)),
+			BranchRef:     parseInterAgentBranchRefFromMetadata(busMsg.Metadata),
 		})
 	}
 }
@@ -167,24 +253,127 @@ func decodeCommandApprovalProposal(busMsg *guide.Message) (*commandapproval.Prop
 		return nil, false
 	}
 	if typed, ok := busMsg.Payload.(*commandapproval.Proposal); ok && typed != nil {
-		return typed, true
+		return normalizeDecodedCommandApprovalProposal(*typed, nil, busMsg)
 	}
 	if typed, ok := busMsg.Payload.(commandapproval.Proposal); ok {
-		proposal := typed
-		return &proposal, true
+		return normalizeDecodedCommandApprovalProposal(typed, nil, busMsg)
+	}
+	if typed, ok := busMsg.Payload.(*fetch.FetchProposal); ok && typed != nil {
+		return proposalFromFetchApproval(*typed, busMsg)
+	}
+	if typed, ok := busMsg.Payload.(fetch.FetchProposal); ok {
+		return proposalFromFetchApproval(typed, busMsg)
 	}
 	raw, err := json.Marshal(busMsg.Payload)
 	if err != nil {
 		return nil, false
 	}
 	var proposal commandapproval.Proposal
-	if err := json.Unmarshal(raw, &proposal); err != nil {
-		return nil, false
+	_ = json.Unmarshal(raw, &proposal)
+	var payload map[string]any
+	_ = json.Unmarshal(raw, &payload)
+	if normalized, ok := normalizeDecodedCommandApprovalProposal(proposal, payload, busMsg); ok {
+		return normalized, true
 	}
-	if strings.TrimSpace(proposal.CorrelationID) == "" || strings.TrimSpace(proposal.Command) == "" {
+	var fetchProposal fetch.FetchProposal
+	if err := json.Unmarshal(raw, &fetchProposal); err == nil {
+		return proposalFromFetchApproval(fetchProposal, busMsg)
+	}
+	return nil, false
+}
+
+func normalizeDecodedCommandApprovalProposal(
+	proposal commandapproval.Proposal,
+	payload map[string]any,
+	busMsg *guide.Message,
+) (*commandapproval.Proposal, bool) {
+	if payload != nil {
+		hasFetchURL := strings.TrimSpace(stringMapValue(payload, "url")) != ""
+		proposal.Command = firstNonEmptyBridgeValue(proposal.Command, stringMapValue(payload, "command"), stringMapValue(payload, "url"))
+		proposal.ToolName = firstNonEmptyBridgeValue(proposal.ToolName, stringMapValue(payload, "tool_name"))
+		if hasFetchURL && strings.TrimSpace(proposal.ToolName) == "" {
+			proposal.ToolName = "web_fetch"
+		}
+		proposal.Domain = firstNonEmptyBridgeValue(proposal.Domain, stringMapValue(payload, "domain"))
+		proposal.Justification = firstNonEmptyBridgeValue(proposal.Justification, stringMapValue(payload, "justification"), stringMapValue(payload, "reason"))
+		proposal.AgentID = firstNonEmptyBridgeValue(proposal.AgentID, stringMapValue(payload, "agent_id"))
+		proposal.AgentType = firstNonEmptyBridgeValue(proposal.AgentType, stringMapValue(payload, "agent_type"), stringMapValue(payload, "source_agent"))
+		proposal.Summary = firstNonEmptyBridgeValue(proposal.Summary, stringMapValue(payload, "summary"))
+		proposal.Risk = firstNonEmptyBridgeValue(proposal.Risk, stringMapValue(payload, "risk"), stringMapValue(payload, "risk_assessment"))
+	}
+	proposal.CorrelationID = firstNonEmptyBridgeValue(proposal.CorrelationID, correlationIDFromBusMessage(busMsg))
+	proposal.TargetAgentID = firstNonEmptyBridgeValue(proposal.TargetAgentID, sourceAgentIDFromBusMessage(busMsg))
+	if proposal.Timestamp.IsZero() && busMsg != nil && !busMsg.Timestamp.IsZero() {
+		proposal.Timestamp = busMsg.Timestamp
+	}
+	if proposal.IsFetchApproval() && proposal.ApprovalPolicy == "" {
+		proposal.ApprovalPolicy = commandapproval.ApprovalPolicyExact
+	}
+	if strings.TrimSpace(proposal.CorrelationID) == "" || strings.TrimSpace(proposal.Command) == "" || strings.TrimSpace(proposal.TargetAgentID) == "" {
 		return nil, false
 	}
 	return &proposal, true
+}
+
+func proposalFromFetchApproval(fetchProposal fetch.FetchProposal, busMsg *guide.Message) (*commandapproval.Proposal, bool) {
+	proposal := commandapproval.Proposal{
+		CorrelationID:  firstNonEmptyBridgeValue(fetchProposal.CorrelationID, correlationIDFromBusMessage(busMsg)),
+		TargetAgentID:  sourceAgentIDFromBusMessage(busMsg),
+		AgentType:      strings.TrimSpace(fetchProposal.SourceAgent),
+		ToolName:       firstNonEmptyBridgeValue(fetchProposal.ToolName, "web_fetch"),
+		Command:        strings.TrimSpace(fetchProposal.URL),
+		Domain:         strings.TrimSpace(fetchProposal.Domain),
+		Justification:  strings.TrimSpace(fetchProposal.Reason),
+		Summary:        strings.TrimSpace(fetchProposal.Reason),
+		Risk:           strings.TrimSpace(fetchProposal.RiskAssessment),
+		Timestamp:      fetchProposal.Timestamp,
+		ApprovalPolicy: commandapproval.ApprovalPolicyExact,
+	}
+	if proposal.Timestamp.IsZero() && busMsg != nil && !busMsg.Timestamp.IsZero() {
+		proposal.Timestamp = busMsg.Timestamp
+	}
+	if strings.TrimSpace(proposal.CorrelationID) == "" || strings.TrimSpace(proposal.Command) == "" || strings.TrimSpace(proposal.TargetAgentID) == "" {
+		return nil, false
+	}
+	return &proposal, true
+}
+
+func stringMapValue(values map[string]any, key string) string {
+	if values == nil {
+		return ""
+	}
+	value, ok := values[key]
+	if !ok {
+		return ""
+	}
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(text)
+}
+
+func correlationIDFromBusMessage(busMsg *guide.Message) string {
+	if busMsg == nil {
+		return ""
+	}
+	return strings.TrimSpace(busMsg.CorrelationID)
+}
+
+func sourceAgentIDFromBusMessage(busMsg *guide.Message) string {
+	if busMsg == nil {
+		return ""
+	}
+	return strings.TrimSpace(busMsg.SourceAgentID)
+}
+
+func firstNonEmptyBridgeValue(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func decodeLayerDecisionRequest(busMsg *guide.Message) (*msg.LayerDecisionMsg, bool) {
@@ -303,7 +492,12 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 		bridgeEventDebugLog().Info("GuideBridge: STREAM_COMPLETE_SENT",
 			"correlation_id", cid)
 	case guide.StreamEventError:
-		program.Send(msg.StreamErrorMsg{SessionID: sid, CorrelationID: cid, Err: redact.Error(extractStreamError(stream.Event))})
+		program.Send(msg.StreamErrorMsg{
+			SessionID:     sid,
+			CorrelationID: cid,
+			Err:           redact.Error(extractStreamError(stream.Event)),
+			BranchRef:     parseInterAgentBranchRef(stream),
+		})
 	case guide.StreamEventRetry:
 		status, _ := stream.Event.Data.(guide.RetryStatus)
 		errText := ""
@@ -321,7 +515,7 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 	case guide.StreamEventReroute:
 		program.Send(parseStreamRerouteMsg(sid, cid, stream.Event))
 	case guide.StreamEventToolCall:
-		program.Send(parseToolCallEventMsg(sid, cid, stream.RespondingAgentID, stream.Event))
+		program.Send(parseToolCallEventMsg(sid, cid, stream))
 	}
 }
 
@@ -334,12 +528,13 @@ func parseStreamStartMsg(sessionID, correlationID string, stream *guide.StreamRe
 		return result
 	}
 	result.AgentID = strings.TrimSpace(stream.RespondingAgentID)
-	result.AgentName = strings.TrimSpace(stream.RespondingAgentName)
+	result.AgentName = streamAgentName(stream)
 	result.AgentType = streamMetadataString(stream, "agent_type")
 	result.PipelineID = streamMetadataString(stream, "pipeline_id")
 	result.TaskID = streamMetadataString(stream, "task_id")
 	result.TaskName = streamMetadataString(stream, "task_name")
 	result.TaskSlug = streamMetadataString(stream, "task_slug")
+	result.BranchRef = parseInterAgentBranchRef(stream)
 	return result
 }
 
@@ -362,12 +557,23 @@ func parseStreamRerouteMsg(sessionID, correlationID string, event *guide.StreamE
 	return result
 }
 
-func parseToolCallEventMsg(sessionID, correlationID, agentID string, event *guide.StreamEvent) msg.ToolCallEventMsg {
+func parseToolCallEventMsg(sessionID, correlationID string, stream *guide.StreamResponse) msg.ToolCallEventMsg {
 	result := msg.ToolCallEventMsg{
 		SessionID:     sessionID,
 		CorrelationID: correlationID,
-		AgentID:       agentID,
 	}
+	if stream == nil {
+		return result
+	}
+	result.AgentID = strings.TrimSpace(stream.RespondingAgentID)
+	result.AgentName = streamAgentName(stream)
+	result.AgentType = streamMetadataString(stream, "agent_type")
+	result.PipelineID = streamMetadataString(stream, "pipeline_id")
+	result.TaskID = streamMetadataString(stream, "task_id")
+	result.TaskName = streamMetadataString(stream, "task_name")
+	result.TaskSlug = streamMetadataString(stream, "task_slug")
+	result.BranchRef = parseInterAgentBranchRef(stream)
+	event := stream.Event
 	if event == nil || event.Data == nil {
 		return result
 	}
@@ -377,6 +583,9 @@ func parseToolCallEventMsg(sessionID, correlationID, agentID string, event *guid
 	}
 	if v, ok := data["tool_name"].(string); ok {
 		result.ToolName = v
+	}
+	if v, ok := data["tool_call_key"].(string); ok {
+		result.ToolCallKey = strings.TrimSpace(v)
 	}
 	if v, ok := data["args_summary"].(string); ok {
 		result.ArgsSummary = v
@@ -407,6 +616,37 @@ func parseToolCallEventMsg(sessionID, correlationID, agentID string, event *guid
 	if v, ok := data["duration"].(string); ok {
 		if d, err := time.ParseDuration(v); err == nil {
 			result.Duration = d
+		}
+	}
+	if meta, ok := data["inter_agent"].(map[string]any); ok {
+		parsed := &msg.InterAgentToolEventMsg{}
+		if v, ok := meta["kind"].(string); ok {
+			parsed.Kind = strings.TrimSpace(v)
+		}
+		if v, ok := meta["summary"].(string); ok {
+			parsed.Summary = strings.TrimSpace(v)
+		}
+		if v, ok := meta["thread_key"].(string); ok {
+			parsed.ThreadKey = strings.TrimSpace(v)
+		}
+		if v, ok := meta["status"].(string); ok {
+			parsed.Status = strings.TrimSpace(v)
+		}
+		if v, ok := meta["update_origin"].(bool); ok {
+			parsed.UpdateOrigin = v
+		}
+		switch typed := meta["agent_types"].(type) {
+		case []string:
+			parsed.AgentTypes = append(parsed.AgentTypes, typed...)
+		case []any:
+			for _, item := range typed {
+				if text, ok := item.(string); ok && strings.TrimSpace(text) != "" {
+					parsed.AgentTypes = append(parsed.AgentTypes, strings.TrimSpace(text))
+				}
+			}
+		}
+		if parsed.Kind != "" {
+			result.InterAgent = parsed
 		}
 	}
 	return result
@@ -449,7 +689,7 @@ func toStreamProgressMsg(sessionID, correlationID string, stream *guide.StreamRe
 	if stream != nil {
 		event = stream.Event
 		agentID = strings.TrimSpace(stream.RespondingAgentID)
-		agentName = strings.TrimSpace(stream.RespondingAgentName)
+		agentName = streamAgentName(stream)
 	}
 	progress := parseProgressData(event)
 	m := msg.StreamProgressMsg{
@@ -465,6 +705,8 @@ func toStreamProgressMsg(sessionID, correlationID string, stream *guide.StreamRe
 		Current:       progress.Current,
 		Total:         progress.Total,
 		Message:       redact.Text(strings.TrimSpace(progress.Message)),
+		UIState:       events.NormalizeAgentUIState(progress.UIState),
+		BranchRef:     parseInterAgentBranchRef(stream),
 	}
 	if event != nil {
 		m.Visibility = event.Visibility
@@ -481,28 +723,109 @@ func parseStreamCompleteMsg(sessionID, correlationID string, stream *guide.Strea
 		return result
 	}
 	result.AgentID = strings.TrimSpace(stream.RespondingAgentID)
-	result.AgentName = strings.TrimSpace(stream.RespondingAgentName)
+	result.AgentName = streamAgentName(stream)
 	result.AgentType = streamMetadataString(stream, "agent_type")
 	result.PipelineID = streamMetadataString(stream, "pipeline_id")
 	result.TaskID = streamMetadataString(stream, "task_id")
 	result.TaskName = streamMetadataString(stream, "task_name")
 	result.TaskSlug = streamMetadataString(stream, "task_slug")
+	result.BranchRef = parseInterAgentBranchRef(stream)
 	if stream.Event != nil {
 		result.Result = stream.Event.Data
 	}
 	return result
 }
 
+const (
+	streamMetadataNestedBranch      = "chat_nested_branch"
+	streamMetadataParentCorrelation = "chat_parent_correlation_id"
+	streamMetadataParentToolCallKey = "chat_parent_tool_call_key"
+	streamMetadataInterAgentThread  = "chat_inter_agent_thread_key"
+	streamMetadataInterAgentKind    = "chat_inter_agent_kind"
+)
+
 func streamMetadataString(stream *guide.StreamResponse, key string) string {
 	if stream == nil || len(stream.Metadata) == 0 {
 		return ""
 	}
-	value, ok := stream.Metadata[key]
+	return metadataString(stream.Metadata, key)
+}
+
+func streamAgentName(stream *guide.StreamResponse) string {
+	if stream == nil {
+		return ""
+	}
+	return firstNonEmpty(
+		strings.TrimSpace(stream.RespondingAgentName),
+		streamMetadataString(stream, "agent_name"),
+	)
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	value, ok := metadata[key]
 	if !ok {
 		return ""
 	}
 	text, _ := value.(string)
 	return strings.TrimSpace(text)
+}
+
+func parseInterAgentBranchRef(stream *guide.StreamResponse) *msg.InterAgentBranchRefMsg {
+	if stream == nil {
+		return nil
+	}
+	return parseInterAgentBranchRefFromMetadata(stream.Metadata)
+}
+
+func parseInterAgentBranchRefFromMetadata(metadata map[string]any) *msg.InterAgentBranchRefMsg {
+	if len(metadata) == 0 {
+		return nil
+	}
+	nested := metadataBool(metadata, streamMetadataNestedBranch)
+	if !nested {
+		return nil
+	}
+	parentCorrelationID := metadataString(metadata, streamMetadataParentCorrelation)
+	if strings.TrimSpace(parentCorrelationID) == "" {
+		return nil
+	}
+	parentToolCallKey := metadataString(metadata, streamMetadataParentToolCallKey)
+	threadKey := metadataString(metadata, streamMetadataInterAgentThread)
+	kind := metadataString(metadata, streamMetadataInterAgentKind)
+	switch strings.TrimSpace(kind) {
+	case "consult", "challenge", "approval", "store":
+	default:
+		return nil
+	}
+	return &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: strings.TrimSpace(parentCorrelationID),
+		ParentToolCallKey:   strings.TrimSpace(parentToolCallKey),
+		ThreadKey:           strings.TrimSpace(threadKey),
+		Kind:                strings.TrimSpace(kind),
+	}
+}
+
+func metadataBool(metadata map[string]any, key string) bool {
+	if len(metadata) == 0 {
+		return false
+	}
+	value, ok := metadata[key]
+	if !ok {
+		return false
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		switch strings.TrimSpace(strings.ToLower(typed)) {
+		case "1", "true", "yes", "on":
+			return true
+		}
+	}
+	return false
 }
 
 func parseProgressData(event *guide.StreamEvent) guide.ProgressData {
@@ -520,6 +843,7 @@ func parseProgressData(event *guide.StreamEvent) guide.ProgressData {
 			Current: parseProgressInt(data["current"]),
 			Total:   parseProgressInt(data["total"]),
 			Message: parseProgressString(data["message"]),
+			UIState: events.AgentUIStateFromData(data),
 		}
 	}
 	return guide.ProgressData{}
@@ -583,11 +907,13 @@ func extractStreamError(event *guide.StreamEvent) error {
 }
 
 // toGuideMsg converts a RouteResponse into a GuideResponseMsg.
-func toGuideMsg(resp *guide.RouteResponse) msg.GuideResponseMsg {
+func toGuideMsg(resp *guide.RouteResponse, metadata map[string]any) msg.GuideResponseMsg {
 	m := msg.GuideResponseMsg{
 		CorrelationID: resp.CorrelationID,
 		AgentID:       resp.RespondingAgentID,
-		AgentName:     resp.RespondingAgentName,
+		AgentName:     firstNonEmpty(resp.RespondingAgentName, metadataString(metadata, "agent_name")),
+		AgentType:     metadataString(metadata, "agent_type"),
+		BranchRef:     parseInterAgentBranchRefFromMetadata(metadata),
 	}
 	if resp.Success {
 		m.Content = redact.Text(routeResponseContent(resp))

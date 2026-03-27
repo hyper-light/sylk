@@ -9,7 +9,7 @@ import (
 	"github.com/adalundhe/sylk/core/versioning"
 )
 
-func TestDAGBridgeCompositeGate_FlushesGlobalDraftToDisk(t *testing.T) {
+func TestDAGBridgeCompositeGate_DoesNotFlushGlobalDraftToDisk(t *testing.T) {
 	dir := t.TempDir()
 	svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
 		SessionID:       "sess-1",
@@ -42,14 +42,12 @@ func TestDAGBridgeCompositeGate_FlushesGlobalDraftToDisk(t *testing.T) {
 		t.Fatalf("compositeGate: %v", err)
 	}
 
-	content, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
+	if _, err := os.ReadFile(target); err == nil {
+		t.Fatal("expected draft file to remain out of disk until explicit commit")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("ReadFile error = %v, want not exists", err)
 	}
-	if string(content) != "draft" {
-		t.Fatalf("content = %q, want %q", string(content), "draft")
-	}
-	if pending := svfs.DiskFlusher().PendingChanges(); len(pending) != 0 {
-		t.Fatalf("expected no pending draft changes after flush, got %d", len(pending))
+	if pending := svfs.DiskFlusher().PendingChanges(); len(pending) == 0 {
+		t.Fatal("expected pending draft changes to remain until explicit commit")
 	}
 }

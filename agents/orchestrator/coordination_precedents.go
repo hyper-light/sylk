@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/pipeline/coordination"
 )
 
@@ -35,16 +36,32 @@ func (o *Orchestrator) queryCoordinationPrecedents(
 	queryCtx, cancel := context.WithTimeout(ctx, coordinationPrecedentTimeout)
 	defer cancel()
 
-	respMsg, err := o.requestRouteSync(queryCtx, "archivalist",
-		fmt.Sprintf("Find historical coordination precedents for %s", firstNonEmpty(taskName, taskSlug)),
-		map[string]any{
+	query := fmt.Sprintf("Find historical coordination precedents for %s", firstNonEmpty(taskName, taskSlug))
+	branchCtx, branch := shared.BeginInterAgentBranch(queryCtx, shared.InterAgentBranchSpec{
+		Kind:       shared.InterAgentToolEventKindConsult,
+		ToolName:   "consult_archivalist",
+		AgentTypes: []string{"archivalist"},
+		Summary:    query,
+		Args: map[string]any{
+			"target":      "archivalist",
+			"query":       query,
+			"task_name":   taskName,
+			"task_slug":   taskSlug,
+			"worker_type": workerType,
+			"limit":       coordinationPrecedentLimit,
+		},
+	})
+	respMsg, err := o.requestRouteSync(branchCtx, "archivalist",
+		query,
+		branch.ApplyMetadata(branchCtx, map[string]any{
 			"coordination_precedent_query": true,
 			"task_name":                    taskName,
 			"task_slug":                    taskSlug,
 			"worker_type":                  workerType,
 			"limit":                        coordinationPrecedentLimit,
-		},
+		}),
 	)
+	branch.CompleteFromMessage(branchCtx, respMsg, err)
 	if err != nil {
 		return nil, err
 	}

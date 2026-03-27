@@ -2,6 +2,7 @@ package providers
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -112,6 +113,11 @@ type AnthropicConfig struct {
 	// PromptCacheTTL controls the cache duration for prompt caching.
 	// Requires EnableCaching. Values >= 1h use extended cache TTL.
 	PromptCacheTTL time.Duration `json:"prompt_cache_ttl" yaml:"prompt_cache_ttl"`
+
+	// HTTPClient overrides the underlying HTTP client used by the SDK.
+	// It is excluded from config serialization and mainly supports tests
+	// or advanced transport customization.
+	HTTPClient *http.Client `json:"-" yaml:"-"`
 }
 
 const (

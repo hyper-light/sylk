@@ -31,23 +31,92 @@ type CodeRegion struct {
 
 // ToolCallRecord tracks a single tool invocation for inline display.
 type ToolCallRecord struct {
-	ToolName    string
-	ArgsSummary string // Compact one-liner (from SummarizeToolArgs).
-	FullArgs    string // Pretty-printed JSON (for expanded view).
-	Output      string // Truncated tool output (max 512 chars).
-	ErrorMsg    string // Error message on failure.
-	StartedAt   time.Time
-	Duration    time.Duration
-	Success     bool
-	Completed   bool
-	Expanded    bool // Toggle state for expand/collapse.
+	ToolCallKey         string
+	ToolName            string
+	ArgsSummary         string // Compact one-liner (from SummarizeToolArgs).
+	FullArgs            string // Pretty-printed JSON (for expanded view).
+	Output              string // Truncated tool output (max 512 chars).
+	ErrorMsg            string // Error message on failure.
+	StartedAt           time.Time
+	Duration            time.Duration
+	Success             bool
+	Completed           bool
+	SyntheticCompletion bool
+	Expanded            bool // Toggle state for expand/collapse.
+
+	// InterAgent renders a compact tree row for consultations, challenges,
+	// responses, and validations instead of the generic tool-call block.
+	InterAgent *InterAgentTool
+}
+
+type ToolCallSubregionKind string
+
+const (
+	ToolCallSubregionOverflow  ToolCallSubregionKind = "overflow"
+	ToolCallSubregionChildTool ToolCallSubregionKind = "child_tool"
+)
+
+type ToolCallSubregion struct {
+	Start            int
+	End              int
+	Kind             ToolCallSubregionKind
+	ChildIndex       int
+	ChildToolCallIdx int
+}
+
+type InterAgentToolKind string
+
+const (
+	InterAgentToolConsult   InterAgentToolKind = "consult"
+	InterAgentToolChallenge InterAgentToolKind = "challenge"
+	InterAgentToolApproval  InterAgentToolKind = "approval"
+	InterAgentToolStore     InterAgentToolKind = "store"
+)
+
+type InterAgentToolStatus string
+
+const (
+	InterAgentToolPending InterAgentToolStatus = "pending"
+	InterAgentToolDone    InterAgentToolStatus = "done"
+	InterAgentToolFailed  InterAgentToolStatus = "failed"
+)
+
+// InterAgentChildActivity captures nested child-agent activity that should
+// render beneath an inter-agent consult/challenge/approval branch instead of as a
+// top-level chat entry.
+type InterAgentChildActivity struct {
+	CorrelationID     string
+	AgentID           string
+	AgentType         string
+	ThinkingText      string
+	ThinkingStatus    string
+	ThinkingColor     string
+	ToolCalls         []ToolCallRecord
+	ToolCallsExpanded bool
+	ResultSummary     string
+	Completed         bool
+	Failed            bool
+}
+
+// InterAgentTool describes a single-line inter-agent exchange shown beneath
+// the active thinking block. AgentTypes are rendered in their normal colors.
+// Children capture the nested work performed by the consulted/challenged
+// agent so that the parent agent remains the sole top-level chat entry.
+type InterAgentTool struct {
+	Kind       InterAgentToolKind
+	ThreadKey  string
+	AgentTypes []string
+	Summary    string
+	Status     InterAgentToolStatus
+	Children   []InterAgentChildActivity
 }
 
 // ToolCallRegion describes a tool call block's position within rendered lines.
 type ToolCallRegion struct {
-	Start     int // First rendered line (inclusive).
-	End       int // Last rendered line (exclusive).
-	RecordIdx int // Index into ChatEntry.ToolCalls.
+	Start      int // First rendered line (inclusive).
+	End        int // Last rendered line (exclusive).
+	RecordIdx  int // Index into ChatEntry.ToolCalls.
+	Subregions []ToolCallSubregion
 }
 
 // ChatEntry represents a single message in the chat history.

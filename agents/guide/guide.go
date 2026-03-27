@@ -861,7 +861,7 @@ func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedReq
 	g.applyPendingPlanMetadata(request.SessionID, classification)
 
 	corrID := g.resolveCorrelationID(request)
-	if !request.FireAndForget {
+	if !request.FireAndForget || metadataHasNestedInterAgentBranch(request.Metadata) {
 		corrID = g.pending.Add(request, classification, targetAgentID)
 		if pending := g.pending.Get(corrID); pending != nil {
 			g.applyDeferredStreamReroute(pending)
@@ -917,7 +917,14 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 	// and no explicit target was specified, skip LLM classification entirely.
 	// Suppressed when a plan is pending — the classifier must see plan context
 	// to disambiguate bare affirmatives from general follow-ups.
-	if !request.ExplicitTarget && request.TargetAgentID == "" && g.conversation.PendingPlan(request.SessionID) == nil {
+	//
+	// Deterministic DSL/direct-communication routes must bypass conversation
+	// stickiness entirely. Otherwise child archivalist/history writes like
+	// @archivalist:store:history{...} get remapped back onto the active
+	// conversation agent and spin in self-loops.
+	if !request.ExplicitTarget && request.TargetAgentID == "" &&
+		(g.router == nil || !g.router.IsDSL(request.Input)) &&
+		g.conversation.PendingPlan(request.SessionID) == nil {
 		if result, target, ok := g.tryConversationFastPath(ctx, request); ok {
 			guideFileLog().Info("DEBUG: resolve_classification_fastpath_hit", "target", target, "elapsed_ms", time.Since(classStart).Milliseconds())
 			return result, target, nil
@@ -2176,22 +2183,24 @@ func (g *Guide) persistCorrectionToArchivalist(correction CorrectionRecord) {
 	if g == nil || g.bus == nil || !g.running {
 		return
 	}
-	forwarded := &ForwardedRequest{
-		CorrelationID:        generateMessageID(),
-		Input:                "store guide route correction",
-		Intent:               IntentStore,
-		Domain:               DomainHistory,
-		Entities:             &ExtractedEntities{Data: map[string]any{"event_type": "guide_route_correction", "correction": correction}},
-		SourceAgentID:        g.agentID,
-		SourceAgentName:      g.agentID,
-		SessionID:            g.sessionID,
-		TargetAgentID:        "archivalist",
-		FireAndForget:        true,
-		Confidence:           1.0,
-		ClassificationMethod: "system",
+	input, err := ArchivalistStoreRouteInput("store guide route correction")
+	if err != nil {
+		return
 	}
-	msg := NewForwardMessage(generateMessageID(), forwarded)
-	go func() { _ = g.bus.Publish(g.agentRequestTopic("archivalist"), msg) }()
+	req := &RouteRequest{
+		CorrelationID:   generateMessageID(),
+		Input:           input,
+		SourceAgentID:   g.agentID,
+		SourceAgentName: g.agentID,
+		SessionID:       g.sessionID,
+		FireAndForget:   true,
+		Timestamp:       time.Now(),
+		Metadata: map[string]any{
+			"event_type": "guide_route_correction",
+			"correction": correction,
+		},
+	}
+	go func() { _ = g.bus.Publish(TopicGuideRequests, NewRequestMessage(generateMessageID(), req)) }()
 }
 
 // IsDSL checks if input is a structured DSL command
@@ -2918,18 +2927,18 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 
 	vis := classifyRequestVisibility(req)
 
-	// Wire classification progress only when the Guide performs LLM
-	// classification. Explicit targets bypass the classifier entirely —
-	// emitting Guide-attributed progress here falsely sets the Guide to
-	// StatusThinking in the agent panel.
-	if !req.ExplicitTarget {
+	// Wire classification progress only when the Guide actually performs
+	// classification. Explicit targets and deterministic DSL/protocol routes
+	// bypass the classifier entirely; emitting Guide-attributed progress here
+	// falsely implies there is unresolved classifier work.
+	if g.shouldPublishClassificationProgress(req) {
 		reqCtx = withClassificationProgress(reqCtx, func(message string) {
-			g.publishGuideStreamProgress(correlationID, req.SourceAgentID, message, vis)
+			g.publishGuideStreamProgressState(correlationID, req.SourceAgentID, message, vis, events.AgentUIStateClassifying)
 		})
 	}
 
 	// Only emit classification activity when the Guide actually classifies.
-	if !req.ExplicitTarget {
+	if g.shouldPublishClassificationProgress(req) {
 		g.publishActivity(events.EventTypeAgentDecision, vis, "Classifying request...")
 	}
 	routeStart := time.Now()
@@ -3041,7 +3050,7 @@ func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
 
 	vis := classifyRequestVisibility(req)
 	reqCtx = withClassificationProgress(reqCtx, func(message string) {
-		g.publishGuideStreamProgress(correlationID, req.SourceAgentID, message, vis)
+		g.publishGuideStreamProgressState(correlationID, req.SourceAgentID, message, vis, events.AgentUIStateClassifying)
 	})
 
 	forwarded, err := g.routeWithRetry(reqCtx, req, correlationID, req.SourceAgentID, vis)
@@ -3095,6 +3104,7 @@ func (g *Guide) publishRerouteEvent(correlationID, sourceAgentID string, reroute
 		CorrelationID:     correlationID,
 		RespondingAgentID: "guide",
 		TargetAgentID:     sourceAgentID,
+		Metadata:          g.mergedStreamRelayMetadata(correlationID, nil),
 		Event:             event,
 	}
 	msg := &Message{
@@ -3147,13 +3157,18 @@ func (g *Guide) respondToGuideRequest(ctx context.Context, pending *PendingReque
 	// Direct skill invocation for structured requests (e.g. plan acceptance).
 	// The architect sends "evaluate-plan-acceptance: {json}" — intercept here
 	// so the skill handler returns map[string]any instead of an LLM string.
-	if data, ok := g.tryDirectSkillInvocation(ctx, req.Input); ok {
+	if data, matched, err := g.tryDirectSkillInvocation(ctx, req.Input); matched {
 		resp := &RouteResponse{
 			CorrelationID:       pending.CorrelationID,
 			RespondingAgentID:   g.agentID,
 			RespondingAgentName: "Guide",
-			Success:             true,
-			Data:                data,
+		}
+		if err != nil {
+			resp.Success = false
+			resp.Error = err.Error()
+		} else {
+			resp.Success = true
+			resp.Data = data
 		}
 		resolved, handleErr := g.HandleResponse(ctx, resp)
 		if handleErr != nil {
@@ -3165,10 +3180,13 @@ func (g *Guide) respondToGuideRequest(ctx context.Context, pending *PendingReque
 
 	g.publishGuideStreamStart(pending.CorrelationID, pending.SourceAgentID)
 	ctx = withGuideThoughtEmitter(ctx, func(thought string) {
-		g.publishGuideStreamProgress(pending.CorrelationID, pending.SourceAgentID, thought, events.VisibilityUser)
+		g.publishGuideStreamProgressState(pending.CorrelationID, pending.SourceAgentID, thought, events.VisibilityUser, events.AgentUIStateThinking)
 	})
 	ctx = withGuideEarlyUsageEmitter(ctx, func(inputTokens int) {
 		g.publishGuideStreamEarlyUsage(pending.CorrelationID, pending.SourceAgentID, inputTokens)
+	})
+	ctx = withGuideToolCallEmitter(ctx, func(event guideToolCallEvent) {
+		g.publishGuideToolCallEvent(pending.CorrelationID, pending.SourceAgentID, event)
 	})
 	ctx = providers.WithRetryObserver(ctx, func(event providers.RetryEvent) {
 		g.publishRetryStatus(pending.CorrelationID, pending.SourceAgentID, RetryStatus{
@@ -3563,14 +3581,21 @@ func (g *Guide) loadedGuideSkillNames() []string {
 }
 
 func (g *Guide) routeWithRetry(ctx context.Context, req *RouteRequest, correlationID, sourceAgentID string, visibility events.EventVisibility) (*ForwardedRequest, error) {
-	// Skip classification progress for explicit targets — the Guide is not
-	// doing LLM classification, just routing directly. Emitting progress
-	// here falsely sets the Guide to StatusThinking in the agent panel.
-	if !req.ExplicitTarget {
-		g.publishGuideStreamProgress(correlationID, sourceAgentID, "Classifying request...", visibility)
+	if g.shouldPublishClassificationProgress(req) {
+		g.publishGuideStreamProgressState(correlationID, sourceAgentID, "Classifying request...", visibility, events.AgentUIStateClassifying)
 	}
 	result, err := g.Route(ctx, req)
 	return result, err
+}
+
+func (g *Guide) shouldPublishClassificationProgress(req *RouteRequest) bool {
+	if req == nil || req.ExplicitTarget {
+		return false
+	}
+	if g == nil || g.router == nil {
+		return true
+	}
+	return !g.router.IsDSL(req.Input)
 }
 
 func (g *Guide) publishRetryStatus(correlationID, sourceAgentID string, status RetryStatus) {
@@ -3586,6 +3611,7 @@ func (g *Guide) publishRetryStatus(correlationID, sourceAgentID string, status R
 		CorrelationID:     correlationID,
 		RespondingAgentID: g.agentID,
 		TargetAgentID:     sourceAgentID,
+		Metadata:          g.mergedStreamRelayMetadata(correlationID, nil),
 		Event:             event,
 	}
 	busMsg := &Message{
@@ -3618,15 +3644,50 @@ func (g *Guide) publishGuideStreamChunk(correlationID, sourceAgentID, text strin
 	g.publishGuideStreamEvent(correlationID, sourceAgentID, event)
 }
 
+func (g *Guide) publishGuideToolCallEvent(correlationID, sourceAgentID string, tool guideToolCallEvent) {
+	if strings.TrimSpace(tool.ToolName) == "" {
+		return
+	}
+	event := &StreamEvent{
+		Type: StreamEventToolCall,
+		Data: map[string]any{
+			"tool_call_key": tool.ToolCallKey,
+			"tool_name":     tool.ToolName,
+			"args_summary":  tool.ArgsSummary,
+			"full_args":     tool.FullArgs,
+			"output":        tool.Output,
+			"error_msg":     tool.ErrorMsg,
+			"phase":         tool.Phase,
+			"started_at":    tool.StartedAt.Format(time.RFC3339Nano),
+			"duration":      tool.Duration.String(),
+			"success":       tool.Success,
+		},
+		Timestamp: time.Now(),
+	}
+	g.publishGuideStreamEvent(correlationID, sourceAgentID, event)
+}
+
 func (g *Guide) publishGuideStreamProgress(correlationID, sourceAgentID, message string, visibility events.EventVisibility) {
+	g.publishGuideStreamProgressState(correlationID, sourceAgentID, message, visibility, events.AgentUIStateThinking)
+}
+
+func (g *Guide) publishGuideStreamProgressState(
+	correlationID,
+	sourceAgentID,
+	message string,
+	visibility events.EventVisibility,
+	state events.AgentUIState,
+) {
 	message = strings.TrimSpace(message)
-	if message == "" {
+	state = events.NormalizeAgentUIState(state)
+	if message == "" && state == events.AgentUIStateNone {
 		return
 	}
 	event := &StreamEvent{
 		Type: StreamEventProgress,
 		Data: &ProgressData{
 			Message: message,
+			UIState: state,
 		},
 		Visibility: visibility,
 		Timestamp:  time.Now(),
@@ -3672,7 +3733,7 @@ func (g *Guide) publishRouteHandoffProgress(correlationID, sourceAgentID, target
 	// without overriding the per-agent rotating messages.
 	event := &StreamEvent{
 		Type:       StreamEventProgress,
-		Data:       &ProgressData{},
+		Data:       &ProgressData{UIState: events.AgentUIStateRouting},
 		Visibility: visibility,
 		Timestamp:  time.Now(),
 	}
@@ -3731,6 +3792,7 @@ func (g *Guide) publishStreamEventForResponder(correlationID, sourceAgentID, res
 		CorrelationID:     correlationID,
 		RespondingAgentID: responderID,
 		TargetAgentID:     sourceAgentID,
+		Metadata:          g.mergedStreamRelayMetadata(correlationID, nil),
 		Event:             event,
 	}
 	msg := &Message{
@@ -3873,6 +3935,9 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 		}
 		publishErr := g.publishStreamToSource(streamTarget, streamResp)
 		if streamResp.Event != nil && streamResp.Event.Type == StreamEventComplete {
+			if pending.Request != nil && pending.Request.FireAndForget {
+				g.pending.Remove(streamResp.CorrelationID)
+			}
 			g.forgetCompletedPending(streamResp.CorrelationID)
 			if g.streams != nil {
 				g.streams.CloseStream(streamResp.CorrelationID)
@@ -4295,7 +4360,7 @@ func (g *Guide) handleErrorMessage(msg *Message) error {
 		return nil
 	}
 
-	return g.publishErrorToSource(pending.SourceAgentID, msg.CorrelationID, msg.SourceAgentID, errStr)
+	return g.publishErrorToSource(pending.SourceAgentID, msg.CorrelationID, msg.SourceAgentID, errStr, pending)
 }
 
 func (g *Guide) setRunContext(_ context.Context) {
@@ -4439,7 +4504,61 @@ func relayResponseMetadata(pending *PendingRequest) map[string]any {
 	return metadata
 }
 
+func cloneMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func mergeMetadata(base, overlay map[string]any) map[string]any {
+	if len(base) == 0 && len(overlay) == 0 {
+		return nil
+	}
+	merged := cloneMetadata(base)
+	if merged == nil {
+		merged = make(map[string]any, len(overlay))
+	}
+	for key, value := range overlay {
+		merged[key] = value
+	}
+	return merged
+}
+
+func (g *Guide) pendingForCorrelation(correlationID string) *PendingRequest {
+	if g == nil {
+		return nil
+	}
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return nil
+	}
+	if pending := g.pending.Get(correlationID); pending != nil {
+		return pending
+	}
+	return g.completedPending(correlationID)
+}
+
+func streamRelayMetadata(pending *PendingRequest) map[string]any {
+	if pending == nil || pending.Request == nil {
+		return nil
+	}
+	return cloneMetadata(pending.Request.Metadata)
+}
+
+func (g *Guide) mergedStreamRelayMetadata(correlationID string, current map[string]any) map[string]any {
+	base := streamRelayMetadata(g.pendingForCorrelation(correlationID))
+	return mergeMetadata(base, current)
+}
+
 func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse) error {
+	if resp != nil {
+		resp.Metadata = g.mergedStreamRelayMetadata(resp.CorrelationID, resp.Metadata)
+	}
 	msg := &Message{
 		ID:            generateMessageID(),
 		CorrelationID: resp.CorrelationID,
@@ -4465,8 +4584,9 @@ func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse
 	return err
 }
 
-func (g *Guide) publishErrorToSource(sourceAgentID string, correlationID string, sourceAgent string, errStr string) error {
+func (g *Guide) publishErrorToSource(sourceAgentID string, correlationID string, sourceAgent string, errStr string, pending *PendingRequest) error {
 	errMsg := NewErrorMessage(generateMessageID(), correlationID, sourceAgent, errStr)
+	errMsg.Metadata = relayResponseMetadata(pending)
 	return g.bus.Publish(g.agentResponseTopic(sourceAgentID), errMsg)
 }
 

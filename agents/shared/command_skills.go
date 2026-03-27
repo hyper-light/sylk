@@ -163,7 +163,7 @@ func executeCommandLike(
 	}
 	PopulateCommandApprovalScope(ctx, &authReq)
 	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq); err != nil {
-		return nil, err
+		return nil, WrapApprovalDenied(toolName, err)
 	}
 	if cfg.PrepareExecution == nil {
 		return nil, fmt.Errorf("command execution is unavailable")

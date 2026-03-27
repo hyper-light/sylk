@@ -66,7 +66,7 @@ type GlobalInspector struct {
 
 	// Sync RPC (for architect escalation).
 	pendingMu  sync.Mutex
-	pendingBus map[string]chan *guide.Message
+	pendingBus map[string]*pendingWait
 
 	// Audit state.
 	diffStore *AuditDiffStore
@@ -115,7 +115,7 @@ func New(cfg shared.GlobalInspectorConfig, provider providers.ProviderAdapter) (
 		logger:            slog.Default().With("agent", "inspector"),
 		provider:          ip,
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
-		pendingBus:        make(map[string]chan *guide.Message),
+		pendingBus:        make(map[string]*pendingWait),
 		diffStore:         NewAuditDiffStore(cfg.MaxAge),
 		steering:          agentShared.NewSteeringManager(),
 		requestSerializer: agentShared.NewRequestSerializer(),
@@ -481,8 +481,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 	defer cancel()
 
 	ctx := reqCtx
-	ctx = shared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
-	ctx = agentShared.WithStreamContextMetadata(ctx, fwd.Metadata)
+	ctx = agentShared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	startTime := time.Now()
 

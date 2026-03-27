@@ -150,6 +150,48 @@ func TestViewportShowsFollowingEntryAfterWrappedToolOutput(t *testing.T) {
 	}
 }
 
+func TestViewportHeightStableWithMultilineToolArgs(t *testing.T) {
+	history := NewHistory(4)
+	history.Push(&ChatEntry{
+		ID:        "tool-entry",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "engineer",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "write_file",
+				ArgsSummary: "path=README.md\ncontent=line one",
+				FullArgs:    "{\n  \"path\": \"README.md\",\n  \"content\": \"line one\\nline two\"\n}",
+				Output:      "ok",
+				StartedAt:   time.Now().Add(-time.Second),
+				Duration:    time.Second,
+				Success:     true,
+				Completed:   true,
+				Expanded:    true,
+			},
+		},
+	})
+	history.Push(&ChatEntry{
+		ID:        "following-entry",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "inspector",
+		Content:   "The following entry should remain visible within the fixed viewport height.",
+	})
+
+	vp := NewViewport(history, theme.DefaultDark())
+	vp.SetSize(34, 7)
+
+	view := vp.View()
+	lines := strings.Split(view, "\n")
+	if len(lines) != 7 {
+		t.Fatalf("visible line count = %d, want 7; view=%q", len(lines), view)
+	}
+	if !strings.Contains(view, "following entry") {
+		t.Fatalf("viewport did not include following entry within fixed height: %q", view)
+	}
+}
+
 func TestViewportUsesFullInnerWidthWithoutPrematureWrap(t *testing.T) {
 	history := NewHistory(2)
 	history.Push(&ChatEntry{
@@ -173,6 +215,113 @@ func TestViewportUsesFullInnerWidthWithoutPrematureWrap(t *testing.T) {
 		if got := lipgloss.Width(line); got > 32 {
 			t.Fatalf("viewport line %d width = %d, want <= 32: %q", i, got, line)
 		}
+	}
+}
+
+func TestViewportEntryHeightIncludesThinkingInterAgentRows(t *testing.T) {
+	history := NewHistory(2)
+	history.Push(&ChatEntry{
+		ID:             "inspector-thinking",
+		Timestamp:      time.Now(),
+		Source:         SourceAgent,
+		AgentType:      "inspector",
+		Streaming:      true,
+		ThinkingText:   "⠋  0.8s",
+		ThinkingStatus: "waiting: final inspector validation",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:  "challenge_architect",
+				StartedAt: time.Now().Add(-300 * time.Millisecond),
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolChallenge,
+					AgentTypes: []string{"architect"},
+					Summary:    "testing scope is too weak for this checkpoint and likely needs revision",
+					Status:     InterAgentToolPending,
+				},
+			},
+		},
+	})
+
+	vp := NewViewport(history, theme.DefaultDark())
+	vp.SetSize(72, 8)
+
+	lines := vp.renderEntry(0)
+	if got := vp.entryHeight(0); got != len(lines) {
+		t.Fatalf("entryHeight = %d, want %d rendered lines", got, len(lines))
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "architect") {
+		t.Fatalf("viewport render missing inter-agent row: %q", joined)
+	}
+	if !strings.Contains(joined, "waiting: final inspector validation") {
+		t.Fatalf("viewport render missing status line: %q", joined)
+	}
+}
+
+func TestViewportEntryHeightIncludesNestedInterAgentChildLines(t *testing.T) {
+	history := NewHistory(3)
+	history.Push(&ChatEntry{
+		ID:        "architect-nested",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_academic_approach",
+				ToolCallKey: "consult-1",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Comparing harness options",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-academic",
+							AgentType:     "academic",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "read_file",
+									ArgsSummary: "path=ui/chat/model.go",
+									StartedAt:   time.Now().Add(-90 * time.Millisecond),
+									Duration:    90 * time.Millisecond,
+									Completed:   true,
+									Success:     true,
+								},
+								{
+									ToolName:    "rg",
+									ArgsSummary: "\"tool_call_key\"",
+									StartedAt:   time.Now().Add(-80 * time.Millisecond),
+									Duration:    80 * time.Millisecond,
+									Completed:   true,
+									Success:     true,
+								},
+							},
+							ResultSummary: "A table-driven harness would be cleaner and easier to extend.",
+							Completed:     true,
+						},
+					},
+				},
+			},
+		},
+	})
+	history.Push(&ChatEntry{
+		ID:        "tail-entry",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		Content:   "Tail entry still visible after nested branch height is counted correctly.",
+	})
+
+	vp := NewViewport(history, theme.DefaultDark())
+	vp.SetSize(76, 8)
+
+	lines := vp.renderEntry(0)
+	if got := vp.entryHeight(0); got != len(lines) {
+		t.Fatalf("entryHeight = %d, want %d rendered lines", got, len(lines))
+	}
+	view := vp.View()
+	if !strings.Contains(view, "Tail entry still visible") {
+		t.Fatalf("expected later entry to remain visible after nested branch render, got %q", view)
 	}
 }
 

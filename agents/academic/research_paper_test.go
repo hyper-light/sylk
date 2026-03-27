@@ -94,6 +94,18 @@ func TestBuildResearchPaperAndArtifact(t *testing.T) {
 	if paper.ArchitectHandoff == nil || strings.TrimSpace(paper.ArchitectHandoff.PlanningSummary) == "" {
 		t.Fatal("expected architect handoff summary to be populated")
 	}
+	if len(paper.PrototypeExamples) == 0 {
+		t.Fatal("expected prototype examples to be populated")
+	}
+	if len(paper.SystemDesignImplications) == 0 {
+		t.Fatal("expected system design implications to be populated")
+	}
+	if strings.TrimSpace(paper.DecisionRationale) == "" {
+		t.Fatal("expected decision rationale to be populated")
+	}
+	if strings.TrimSpace(paper.ArchitectHandoff.PrototypeSketch) == "" {
+		t.Fatal("expected architect handoff prototype sketch to be populated")
+	}
 	if paper.CodebaseApplicability == nil || strings.TrimSpace(paper.CodebaseApplicability.Summary) == "" {
 		t.Fatal("expected codebase applicability summary to be populated")
 	}
@@ -113,12 +125,20 @@ func TestBuildResearchPaperAndArtifact(t *testing.T) {
 	for _, needle := range []string{
 		"# Research Proposal: Distributed Cache",
 		"## Key Findings",
+		"## Decision Rationale",
+		"## Prototype / Proof Of Concept",
+		"## Architecture / System Design Implications",
 		"## Architect Handoff Summary",
+		"## Prototype Sketch",
+		"## System Design Notes",
 		"cache-aside",
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("artifact missing %q\n%s", needle, text)
 		}
+	}
+	if !strings.Contains(paper.ArchitectHandoff.PlanningSummary, "Adopt cache-aside") {
+		t.Fatalf("expected architect handoff summary to mention recommended option, got %q", paper.ArchitectHandoff.PlanningSummary)
 	}
 }
 
@@ -161,5 +181,74 @@ func TestAuthorResearchPaperStoresByDefaultWithoutBus(t *testing.T) {
 	warnings, _ := out["warnings"].([]string)
 	if len(warnings) == 0 {
 		t.Fatal("expected warnings when archivalist bus is unavailable")
+	}
+}
+
+func TestAuthorResearchPaper_UsesExecuteResearchStateWithoutRerunningResearch(t *testing.T) {
+	a, err := New(Config{SessionID: "sess-exec-paper"}, nil)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	if err := a.steering.BindSession(sessionDir, "sess-exec-paper"); err != nil {
+		t.Fatalf("BindSession() error = %v", err)
+	}
+
+	a.upsertResearchSource(&Source{
+		ID:          "src-exec-1",
+		Type:        SourceTypeDocumentation,
+		URL:         "https://example.com/oauth",
+		Title:       "OAuth Deployment Guide",
+		Description: "Use a dedicated token validation boundary and rotate keys safely.",
+		IngestedAt:  time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+		TokenCount:  3200,
+		Quality:     0.9,
+	})
+
+	state := newAcademicResearchExecutionState("sess-exec-paper")
+	state.sources = append(state.sources, researchExecutionSource{
+		ID:       "src-exec-1",
+		URL:      "https://example.com/oauth",
+		Title:    "OAuth Deployment Guide",
+		Summary:  "Use a dedicated token validation boundary and rotate keys safely.",
+		Ingested: true,
+		Type:     SourceTypeDocumentation,
+		Quality:  0.9,
+	})
+	state.sourceIDsByURL["https://example.com/oauth"] = "src-exec-1"
+	state.librarianEvidence = &shared.ConsultationEvidence{
+		Success: true,
+		Data:    map[string]any{"summary": "The repo already centralizes auth decisions in one boundary."},
+	}
+	state.archivalEvidence = &shared.ConsultationEvidence{
+		Success: true,
+		Data:    map[string]any{"summary": "Prior outages came from token parsing scattered across services."},
+	}
+
+	ctx := WithAcademicResearchExecutionState(context.Background(), state)
+	out, err := a.authorResearchPaper(ctx, &authorResearchPaperParams{
+		Topic:           "oauth token validation",
+		Context:         "Architect needs a planning-ready recommendation.",
+		ResearchSummary: "Centralize token validation behind one boundary and prove the migration with a narrow prototype.",
+		KeyFindings: []string{
+			"Primary guidance favors a dedicated token-validation boundary with clear ownership.",
+			"Repository fit is strongest where auth policy stays behind one reusable interface.",
+		},
+		Recommendations: []string{
+			"Adopt a dedicated auth boundary and migrate callers behind it incrementally.",
+		},
+		StoreInArchivalist: false,
+	})
+	if err != nil {
+		t.Fatalf("authorResearchPaper() error = %v", err)
+	}
+	if strings.TrimSpace(out["paper_path"].(string)) == "" {
+		t.Fatalf("paper_path missing from output: %#v", out)
+	}
+	if strings.TrimSpace(out["summary"].(string)) == "" {
+		t.Fatalf("summary missing from output: %#v", out)
 	}
 }

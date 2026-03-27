@@ -356,6 +356,12 @@ func TestPipelineProtocolSkills_HandoffNextPublishesGuideRoute(t *testing.T) {
 	if req.TargetAgentID != PipelineWorkerAgentID("task-async", PipelineAgentTester) {
 		t.Fatalf("target_agent_id = %q", req.TargetAgentID)
 	}
+	if req.Metadata["chat_nested_branch"] == true {
+		t.Fatalf("handoff_next should not stamp nested chat branch metadata: %#v", req.Metadata)
+	}
+	if got, _ := req.Metadata["chat_parent_correlation_id"].(string); strings.TrimSpace(got) != "" {
+		t.Fatalf("handoff_next parent branch metadata = %q, want empty", got)
+	}
 
 	var nextTask PipelineTaskInput
 	if err := json.Unmarshal([]byte(req.Input), &nextTask); err != nil {
@@ -859,6 +865,9 @@ func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
 	if req.ParentCorrelationID != "corr-tester" {
 		t.Fatalf("parent_correlation_id = %q, want corr-tester", req.ParentCorrelationID)
 	}
+	if req.Metadata["chat_nested_branch"] == true {
+		t.Fatalf("validate_work should not stamp nested chat branch metadata: %#v", req.Metadata)
+	}
 	if req.TargetAgentID != PipelineWorkerAgentID("task-validate", PipelineAgentInspector) {
 		t.Fatalf("target_agent_id = %q", req.TargetAgentID)
 	}
@@ -1018,6 +1027,9 @@ func TestPipelineProtocolSkills_FinalizePipelineChallengesTester(t *testing.T) {
 	req := waitForRouteRequest(t, routeCh)
 	if req.TargetAgentID != PipelineWorkerAgentID("task-finalize-gate", PipelineAgentTester) {
 		t.Fatalf("target_agent_id = %q", req.TargetAgentID)
+	}
+	if req.Metadata["chat_nested_branch"] == true {
+		t.Fatalf("finalize_pipeline should not stamp nested chat branch metadata: %#v", req.Metadata)
 	}
 
 	var nextTask PipelineTaskInput
@@ -1239,6 +1251,95 @@ func TestPipelineProtocolSkills_ChallengeAgentRefusesRepeatedChallengeWithoutWor
 	resultMap, _ := result.(map[string]any)
 	if resultMap == nil || resultMap["refused"] != true {
 		t.Fatalf("challenge_agent result = %#v, want refused=true", result)
+	}
+	if resultMap["refused_by"] != "pipeline-protocol" {
+		t.Fatalf("refused_by = %#v, want pipeline-protocol", resultMap["refused_by"])
+	}
+	if resultMap["must_wait"] != true {
+		t.Fatalf("must_wait = %#v, want true", resultMap["must_wait"])
+	}
+	if !strings.Contains(fmt.Sprint(resultMap["reason"]), "fresh workspace evidence") {
+		t.Fatalf("reason = %#v, want fresh workspace evidence guidance", resultMap["reason"])
+	}
+}
+
+func TestPipelineProtocolSkills_FinalizePipelineRefusesRepeatedAuditWithoutWorkspaceChange(t *testing.T) {
+	views := stubPipelineProtocolWorkspaceViews{
+		summary: &versioning.WorkspaceSummary{
+			DefaultView:          versioning.WorkspaceViewPipeline,
+			SourceOfTruth:        versioning.WorkspaceViewPipeline,
+			PipelineID:           "task-repeat-finalize",
+			Paths:                []string{"src/app.go"},
+			PipelineChangedPaths: []string{"src/app.go"},
+		},
+	}
+	baseTask := &PipelineTaskInput{
+		TaskID:    "task-repeat-finalize",
+		AgentType: PipelineAgentInspector,
+		Context: map[string]any{
+			"pipeline_stage": "inspect",
+			"affected_files": []any{"src/app.go"},
+			"workspace": map[string]any{
+				"write_set": []any{"src/app.go"},
+			},
+		},
+	}
+	fingerprint := pipelineChallengeFingerprint(resolvePipelineChallengeEvidence(
+		WithPipelineTask(context.Background(), baseTask),
+		PipelineProtocolSkillConfig{
+			WorkspaceViews: func() versioning.WorkspaceViewAccess { return views },
+		},
+	))
+	if fingerprint == "" {
+		t.Fatal("expected workspace fingerprint")
+	}
+
+	task := &PipelineTaskInput{
+		TaskID:    baseTask.TaskID,
+		AgentType: baseTask.AgentType,
+		Context: map[string]any{
+			"pipeline_stage": "inspect",
+			"affected_files": []any{"src/app.go"},
+			"workspace": map[string]any{
+				"write_set": []any{"src/app.go"},
+			},
+			"pipeline_protocol": PipelineProtocolSnapshotMap(&PipelineProtocolSnapshot{
+				Roster: []PipelineProtocolAgent{
+					{AgentType: PipelineAgentInspector},
+					{AgentType: PipelineAgentTester},
+				},
+				ActiveAgents: []string{PipelineAgentInspector},
+				RecentEvents: []PipelineProtocolEvent{
+					{
+						Type:                 string(PipelineProtocolActionHandoff),
+						AgentType:            PipelineAgentInspector,
+						Targets:              []string{PipelineAgentTester},
+						Summary:              "Audit the implementation.",
+						CreatesChallenge:     true,
+						WorkspaceFingerprint: fingerprint,
+					},
+				},
+			}),
+		},
+	}
+	ctx := WithPipelineTaskProtocolState(context.Background(), task)
+	ctx = WithTaskExecutionContract(ctx, &TaskExecutionContract{RuntimeAgentType: PipelineAgentInspector})
+
+	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
+		AgentType:      func() string { return PipelineAgentInspector },
+		InspectorOT:    true,
+		WorkspaceViews: func() versioning.WorkspaceViewAccess { return views },
+	})
+
+	result, err := callSkill(t, ctx, skills, "finalize_pipeline", map[string]any{
+		"summary": "Run the audit again.",
+	})
+	if err != nil {
+		t.Fatalf("finalize_pipeline error = %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	if resultMap == nil || resultMap["refused"] != true {
+		t.Fatalf("finalize_pipeline result = %#v, want refused=true", result)
 	}
 	if resultMap["refused_by"] != "pipeline-protocol" {
 		t.Fatalf("refused_by = %#v, want pipeline-protocol", resultMap["refused_by"])

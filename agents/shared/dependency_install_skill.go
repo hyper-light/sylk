@@ -200,7 +200,7 @@ func runDependencyInstallCommand(ctx context.Context, cfg DependencyInstallSkill
 	}
 	PopulateCommandApprovalScope(ctx, &authReq)
 	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq); err != nil {
-		return nil, err
+		return nil, WrapApprovalDenied(strings.TrimSpace(req.ToolName), err)
 	}
 
 	runner := cfg.ExecuteCommand

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 )
 
 type consultationTestBus struct {
@@ -50,7 +51,7 @@ func (b *consultationTestBus) publishCount() int {
 	return b.publishes
 }
 
-func TestEngineerRequestConsultSync_RefreshesWaitLeaseWithoutRepublish(t *testing.T) {
+func TestEngineerRequestConsultSync_UsesStreamActivityWithoutRepublish(t *testing.T) {
 	prevTimeout := routeSyncTimeout
 	routeSyncTimeout = 20 * time.Millisecond
 	defer func() { routeSyncTimeout = prevTimeout }()
@@ -58,13 +59,22 @@ func TestEngineerRequestConsultSync_RefreshesWaitLeaseWithoutRepublish(t *testin
 	e := &Engineer{
 		id:              "eng-1234",
 		running:         true,
-		pendingConsults: make(map[string]chan *guide.Message),
+		pendingConsults: make(map[string]*shared.PendingSyncWait),
 	}
 
 	bus := &consultationTestBus{}
 	bus.onPublish = func(req *guide.RouteRequest) {
 		go func(correlationID string) {
-			time.Sleep(25 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
+			e.deliverConsultResponse(&guide.Message{
+				CorrelationID: correlationID,
+				Type:          guide.MessageTypeStream,
+				Payload: &guide.StreamResponse{
+					CorrelationID: correlationID,
+					Event:         &guide.StreamEvent{Type: guide.StreamEventProgress},
+				},
+			})
+			time.Sleep(15 * time.Millisecond)
 			e.deliverConsultResponse(guide.NewResponseMessage("", &guide.RouteResponse{
 				CorrelationID: correlationID,
 				Success:       true,

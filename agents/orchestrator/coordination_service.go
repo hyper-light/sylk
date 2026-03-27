@@ -430,6 +430,34 @@ func (s *CoordinationService) QueryView(
 	return result, nil
 }
 
+func (s *CoordinationService) GetCachedQueryView(
+	input coordination.QueryViewInput,
+) (*coordination.QueryViewResult, bool, error) {
+	if s == nil || strings.TrimSpace(input.TaskID) == "" {
+		return nil, false, nil
+	}
+
+	viewKey := s.viewCacheKey(input.TaskID, input.IncludeDrafts)
+	val, ok := s.cache.Get(viewKey)
+	if !ok {
+		return nil, false, nil
+	}
+	cached, castOK := val.(*coordination.TaskView)
+	if !castOK || cached == nil {
+		return nil, false, nil
+	}
+
+	result := &coordination.QueryViewResult{View: *cached}
+	if strings.TrimSpace(input.WorkerType) != "" {
+		packet, err := s.buildWorkerPacket(input.TaskID, input.TaskName, strings.TrimSpace(input.WorkerType), cached)
+		if err != nil {
+			return nil, false, err
+		}
+		result.Packet = packet
+	}
+	return result, true, nil
+}
+
 func (s *CoordinationService) WatchUpdates(
 	ctx context.Context,
 	input coordination.WatchUpdatesInput,

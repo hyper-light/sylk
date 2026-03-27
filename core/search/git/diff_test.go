@@ -23,8 +23,7 @@ func setupDiffTestRepo(t *testing.T) (string, func()) {
 
 	// Initialize git repo
 	runDiffGit(t, tmpDir, "init")
-	runDiffGit(t, tmpDir, "config", "user.email", "test@example.com")
-	runDiffGit(t, tmpDir, "config", "user.name", "Test User")
+	configureGitTestRepo(t, tmpDir, runDiffGit)
 
 	return tmpDir, cleanup
 }

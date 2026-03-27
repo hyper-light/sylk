@@ -20,13 +20,14 @@ import (
 func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
 	seen := make(map[shared.ToolCallSignature]int, gi.config.MaxToolRuns)
 	consecutiveErrors := 0
+	requiredActionGraceTurns := 0
 
 	p := gi.getProvider()
 	if p == nil {
 		return "", fmt.Errorf("global inspector: no LLM provider configured")
 	}
 
-	for turn := 0; turn <= gi.config.MaxToolRuns; turn++ {
+	for turn := 0; turn <= gi.config.MaxToolRuns+requiredActionGraceTurns; turn++ {
 		if gi.toolDefsDirty {
 			req.Tools = gi.buildToolDefinitions()
 			gi.toolDefsDirty = false
@@ -99,8 +100,9 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 				req.Messages = append(req.Messages, providers.Message{
 					Role: providers.RoleUser,
 					Content: err.Error() +
-						"\nUse the strict global review protocol now. If a validation response arrived, call process_global_validation before deciding whether to challenge the tester, challenge the architect, finalize the review, or commit to disk.",
+						"\nUse the strict global review protocol now. If a validation response arrived, call process_global_validation before deciding whether to challenge the tester, challenge the orchestrator, challenge the architect, finalize the review, or commit to disk.",
 				})
+				requiredActionGraceTurns = agentShared.ExtendRequiredProtocolGrace(ctx, requiredActionGraceTurns)
 				continue
 			}
 			gi.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
@@ -133,6 +135,7 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
+		requiredActionGraceTurns = agentShared.ExtendRequiredProtocolGrace(ctx, requiredActionGraceTurns)
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= 2 {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -165,8 +168,9 @@ func (gi *GlobalInspector) applyToolCalls(
 	for _, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
-		result, err := agentShared.TimedToolCall(ctx, "inspector", call, func() (string, error) {
-			execResult, execErr = gi.executeToolCall(ctx, call)
+		execCtx := agentShared.WithActiveToolCall(ctx, call)
+		result, err := agentShared.TimedToolCall(execCtx, "inspector", call, func() (string, error) {
+			execResult, execErr = gi.executeToolCall(execCtx, call)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {

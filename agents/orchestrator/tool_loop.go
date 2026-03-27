@@ -110,8 +110,9 @@ func (o *Orchestrator) applyToolCalls(
 		o.publishActivity(events.EventTypeToolResult, call.Name)
 		var execResult toolruntime.ExecutionResult
 		var execErr error
-		result, err := shared.TimedToolCall(ctx, "orchestrator", call, func() (string, error) {
-			execResult, execErr = o.executeToolCall(ctx, call)
+		execCtx := shared.WithActiveToolCall(ctx, call)
+		result, err := shared.TimedToolCall(execCtx, "orchestrator", call, func() (string, error) {
+			execResult, execErr = o.executeToolCall(execCtx, call)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {

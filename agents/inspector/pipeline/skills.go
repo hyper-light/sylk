@@ -73,9 +73,11 @@ func (pi *PipelineInspector) registerCoreSkills() {
 			SourceAgentID:   func() string { return pi.id },
 			SourceAgentType: func() string { return "inspector-pipeline" },
 			SessionID:       func() string { return pi.config.SessionID },
-			RegisterPending: pi.registerPendingWait,
-			ClearPending:    pi.clearPendingWait,
-			Timeout:         routeSyncTimeout,
+			RegisterPending: func(correlationID string) <-chan *guide.Message {
+				return pi.registerPendingWait(correlationID).Response
+			},
+			ClearPending: pi.clearPendingWait,
+			Timeout:      routeSyncTimeout,
 		},
 		CurrentTaskID:   func() string { return pi.pipelineID },
 		CurrentTaskName: func() string { return firstNonEmptyCoordinationName(pi.pipelineName, pi.pipelineSlug) },

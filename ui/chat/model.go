@@ -1,10 +1,12 @@
 package chat
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/msg"
@@ -25,6 +27,8 @@ const thinkingFrameInterval = 100 * time.Millisecond
 // thinkingProgressMinInterval limits immediate UI updates from progress messages.
 // Decor ticks still animate every 100ms; this only dampens bursty progress input.
 const thinkingProgressMinInterval = 250 * time.Millisecond
+
+const deferredParentCompletionStatus = "Waiting for child work to finish..."
 
 // spinnerFrames is a Braille dot animation sequence (matches status/spinner.go).
 var spinnerFrames = [...]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -215,19 +219,36 @@ type streamSlot struct {
 	planID          string             // Plan ID embedded in this stream, if any.
 	planMarkdown    string             // Rendered plan markdown for this stream.
 	planOffset      int                // Accumulator content length when plan was injected.
+	deferCompletion bool               // Stream text is done, but child inter-agent work is still settling.
+}
+
+// nestedStreamSlot tracks a child agent stream that belongs to an inter-agent
+// consult/challenge branch owned by a parent chat entry.
+type nestedStreamSlot struct {
+	correlationID   string
+	branchRef       msg.InterAgentBranchRefMsg
+	thinkingStart   time.Time
+	retryText       string
+	lastProgressSet time.Time
+	content         strings.Builder
+	activity        InterAgentChildActivity
+	terminalSeen    bool
+	terminalFailed  bool
+	done            bool
 }
 
 // Model is the Bubble Tea model for the chat panel.
 // It displays a scrollable history of chat entries with virtual scrolling,
 // supports LLM streaming, and handles keyboard navigation.
 type Model struct {
-	history  *History
-	viewport *Viewport
-	streams  map[string]*streamSlot // key = correlationID; nil slots cleaned on complete.
-	theme    *theme.Theme
-	width    int
-	height   int
-	focused  bool
+	history       *History
+	viewport      *Viewport
+	streams       map[string]*streamSlot // key = correlationID; nil slots cleaned on complete.
+	nestedStreams map[string]*nestedStreamSlot
+	theme         *theme.Theme
+	width         int
+	height        int
+	focused       bool
 
 	// Transient highlight for copy feedback.
 	highlightID    string
@@ -248,6 +269,10 @@ type Model struct {
 	// Render throttle: chunks buffer at full speed, but the history entry
 	// is only synced (and viewDirty set) on DecorTick or StreamComplete.
 	streamRenderPending bool
+
+	// Completed entries with pending inter-agent rows still need spinner ticks
+	// while a consultation/challenge is awaiting a later response.
+	pendingInterAgent map[int]struct{}
 
 	// Steering animation: pending entries shimmer with holographic color until acknowledged.
 	steeringPending  []steeringPendingEntry
@@ -277,14 +302,16 @@ func New(th *theme.Theme, historyCapacity int) *Model {
 	h := NewHistory(historyCapacity)
 	vp := NewViewport(h, th)
 	return &Model{
-		history:          h,
-		viewport:         vp,
-		streams:          make(map[string]*streamSlot),
-		theme:            th,
-		thinkingIdx:      -1,
-		planEntryIdx:     -1,
-		thinkingGradient: th.Palette.ThinkingGradient(),
-		steeringGradient: th.Palette.GroupGradient(),
+		history:           h,
+		viewport:          vp,
+		streams:           make(map[string]*streamSlot),
+		nestedStreams:     make(map[string]*nestedStreamSlot),
+		theme:             th,
+		thinkingIdx:       -1,
+		planEntryIdx:      -1,
+		pendingInterAgent: make(map[int]struct{}),
+		thinkingGradient:  th.Palette.ThinkingGradient(),
+		steeringGradient:  th.Palette.GroupGradient(),
 	}
 }
 
@@ -467,6 +494,16 @@ func shouldSuppressActivity(ev msg.ActivityEventMsg) bool {
 // it is reused; otherwise a new entry is pushed. Multiple concurrent streams
 // are tracked in the streams map keyed by correlationID.
 func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
+	if start.BranchRef == nil {
+		if slot := m.nestedStream(start.CorrelationID); slot != nil {
+			ref := slot.branchRef
+			start.BranchRef = &ref
+		}
+	}
+	if start.BranchRef != nil {
+		m.handleNestedStreamStart(start)
+		return nil
+	}
 	cid := start.CorrelationID
 	if m.streams == nil {
 		m.streams = make(map[string]*streamSlot)
@@ -550,6 +587,9 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 // Thinking resolves at StreamComplete (which sets ThinkingElapsed for the
 // collapsed summary) or StreamError.
 func (m *Model) handleStreamChunk(chunk msg.StreamChunkMsg) tea.Cmd {
+	if m.handleNestedStreamChunk(chunk) {
+		return nil
+	}
 	slot, ok := m.streams[chunk.CorrelationID]
 	if !ok || slot.accumulator == nil {
 		chatDebugLog().Warn("chat.handleStreamChunk: NO_SLOT — chunk dropped",
@@ -564,6 +604,16 @@ func (m *Model) handleStreamChunk(chunk msg.StreamChunkMsg) tea.Cmd {
 }
 
 func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
+	if progress.Visibility == events.VisibilitySystem {
+		return nil
+	}
+	if progress.BranchRef != nil {
+		m.handleNestedStreamProgress(progress)
+		return nil
+	}
+	if m.handleNestedStreamProgress(progress) {
+		return nil
+	}
 	message := sanitizeThinkingMessage(progress.Message)
 	if slot := m.streamSlot(progress.CorrelationID); slot != nil {
 		m.updateSlotThinkingAgent(slot, progress.AgentID)
@@ -591,6 +641,13 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 
 // handleStreamComplete finalizes a single streaming entry by correlationID.
 func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
+	if done.BranchRef != nil {
+		m.handleNestedStreamComplete(done)
+		return nil
+	}
+	if m.handleNestedStreamComplete(done) {
+		return nil
+	}
 	cid := done.CorrelationID
 	chatDebugLog().Info("chat.handleStreamComplete: ENTRY",
 		"correlation_id", cid,
@@ -607,28 +664,25 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 		return nil
 	}
 
-	// Remove this slot's stream state from the viewport.
-	m.viewport.RemoveStreamState(slot.accumulator.EntryIndex())
-
-	m.resolveSlotThinkingEntry(slot)
-
 	if done.AuthoritativeText != "" {
 		slot.accumulator.Replace(done.AuthoritativeText)
 		slot.planOffset = 0
 	}
 	slot.accumulator.Complete()
-	m.finalizeSlotStream(slot)
-	delete(m.streams, cid)
-
-	// When all streams are done, clear remaining render state.
-	if len(m.streams) == 0 {
-		m.streamRenderPending = false
-	}
 
 	// Acknowledge any pending steering entries for this correlation.
 	if len(m.steeringPending) > 0 && cid != "" {
 		m.acknowledgeSteering(cid)
 	}
+
+	if m.deferSlotCompletionIfPending(slot) {
+		chatDebugLog().Info("chat.handleStreamComplete: DEFERRED",
+			"correlation_id", cid,
+			"entry_index", slot.accumulator.EntryIndex())
+		return nil
+	}
+
+	m.finalizeCompletedStreamSlot(cid, slot, true, "")
 
 	chatDebugLog().Info("chat.handleStreamComplete: DONE",
 		"correlation_id", cid,
@@ -638,14 +692,17 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 
 // handleStreamError adds an error entry and cleans up the accumulator.
 func (m *Model) handleStreamError(errMsg msg.StreamErrorMsg) tea.Cmd {
+	if errMsg.BranchRef != nil {
+		m.handleNestedStreamError(errMsg)
+		return nil
+	}
+	if m.handleNestedStreamError(errMsg) {
+		return nil
+	}
 	m.streamRenderPending = false
 	// Clean up the specific slot if it exists.
 	if slot, ok := m.streams[errMsg.CorrelationID]; ok && slot.accumulator != nil {
-		m.viewport.RemoveStreamState(slot.accumulator.EntryIndex())
-		m.resolveSlotThinkingEntry(slot)
-		slot.accumulator.Complete()
-		m.finalizeSlotStream(slot)
-		delete(m.streams, errMsg.CorrelationID)
+		m.finalizeCompletedStreamSlot(errMsg.CorrelationID, slot, false, formatErrorForChat(errMsg.Err))
 	}
 	// If all streams are gone, clear global viewport stream state.
 	if len(m.streams) == 0 {
@@ -735,8 +792,24 @@ func formatRetryDelay(d time.Duration) string {
 // updating the matching streaming entry's ToolCalls list. Matches by
 // correlationID first, then falls back to the thinking placeholder.
 func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
+	if ev.BranchRef != nil {
+		m.handleNestedToolCallEvent(ev)
+		return nil
+	}
+	if m.handleNestedToolCallEvent(ev) {
+		return nil
+	}
 	idx := m.streamingIndexForCorrelation(ev.CorrelationID)
 	if idx < 0 {
+		return nil
+	}
+
+	current := m.history.Get(idx)
+	currentAgentType := ""
+	if current != nil {
+		currentAgentType = badgeAgentType(current)
+	}
+	if m.handleInterAgentToolCallEvent(idx, currentAgentType, ev) {
 		return nil
 	}
 
@@ -744,34 +817,119 @@ func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
 		switch ev.Phase {
 		case 0: // ToolCallStart
 			e.ToolCalls = append(e.ToolCalls, ToolCallRecord{
+				ToolCallKey: ev.ToolCallKey,
 				ToolName:    ev.ToolName,
 				ArgsSummary: ev.ArgsSummary,
 				FullArgs:    ev.FullArgs,
 				StartedAt:   ev.StartedAt,
 			})
 		case 1: // ToolCallComplete
-			// Find the last incomplete record with the same tool name.
+			// Find the last incomplete record for this tool call. Prefer the
+			// stable per-call key; fall back to the historical tool-name match
+			// for older events that predate the key.
 			for i := len(e.ToolCalls) - 1; i >= 0; i-- {
-				if e.ToolCalls[i].ToolName == ev.ToolName && !e.ToolCalls[i].Completed {
-					e.ToolCalls[i].Duration = ev.Duration
-					e.ToolCalls[i].Success = ev.Success
-					e.ToolCalls[i].Completed = true
-					e.ToolCalls[i].Output = ev.Output
-					e.ToolCalls[i].ErrorMsg = ev.ErrorMsg
-					if !ev.Success {
-						e.ToolCalls[i].Expanded = true // Auto-expand failures.
-					}
-					break
+				if !toolCallRecordCanAcceptCompletion(e.ToolCalls[i]) {
+					continue
 				}
+				if !toolCallRecordMatchesEvent(e.ToolCalls[i], ev) {
+					continue
+				}
+				if e.ToolCalls[i].StartedAt.IsZero() {
+					e.ToolCalls[i].StartedAt = ev.StartedAt
+				}
+				e.ToolCalls[i].Duration = ev.Duration
+				e.ToolCalls[i].Success = ev.Success
+				e.ToolCalls[i].Completed = true
+				e.ToolCalls[i].SyntheticCompletion = false
+				e.ToolCalls[i].Output = ev.Output
+				e.ToolCalls[i].ErrorMsg = ev.ErrorMsg
+				if strings.TrimSpace(e.ToolCalls[i].ToolCallKey) == "" {
+					e.ToolCalls[i].ToolCallKey = strings.TrimSpace(ev.ToolCallKey)
+				}
+				if shouldBackfillToolCallArgs(e.ToolCalls[i].FullArgs, ev.FullArgs) {
+					e.ToolCalls[i].FullArgs = ev.FullArgs
+				}
+				if shouldBackfillToolCallArgs(e.ToolCalls[i].ArgsSummary, ev.ArgsSummary) {
+					e.ToolCalls[i].ArgsSummary = ev.ArgsSummary
+				}
+				if !ev.Success {
+					e.ToolCalls[i].Expanded = true // Auto-expand failures.
+				}
+				break
 			}
 		}
-		// Invalidate render cache.
-		e.RenderedLines = nil
-		e.CodeRegions = nil
-		e.ToolCallRegions = nil
-		e.Height = -1
+		invalidateChatEntryRender(e)
 	})
 	return nil
+}
+
+func toolCallRecordMatchesEvent(record ToolCallRecord, ev msg.ToolCallEventMsg) bool {
+	recordName := strings.TrimSpace(record.ToolName)
+	eventName := strings.TrimSpace(ev.ToolName)
+	if recordName != "" && eventName != "" && recordName != eventName {
+		return false
+	}
+	recordKey := strings.TrimSpace(record.ToolCallKey)
+	eventKey := strings.TrimSpace(ev.ToolCallKey)
+	if recordKey != "" && eventKey != "" {
+		if recordKey == eventKey {
+			return true
+		}
+		return toolCallArgumentsMatch(record, ev)
+	}
+	if toolCallArgumentsMatch(record, ev) {
+		return true
+	}
+	return recordName != "" && recordName == eventName
+}
+
+func toolCallRecordCanAcceptCompletion(record ToolCallRecord) bool {
+	return !record.Completed || record.SyntheticCompletion
+}
+
+func toolCallArgumentsMatch(record ToolCallRecord, ev msg.ToolCallEventMsg) bool {
+	recordArgs := toolCallArgumentsIdentity(record.FullArgs, record.ArgsSummary)
+	eventArgs := toolCallArgumentsIdentity(ev.FullArgs, ev.ArgsSummary)
+	if recordArgs == "" || eventArgs == "" {
+		return false
+	}
+	return recordArgs == eventArgs
+}
+
+func toolCallArgumentsIdentity(fullArgs, argsSummary string) string {
+	if normalized := normalizeToolCallArgumentsText(fullArgs); normalized != "" {
+		return "args:" + normalized
+	}
+	if normalized := normalizeToolCallArgumentsText(argsSummary); normalized != "" {
+		return "summary:" + normalized
+	}
+	return ""
+}
+
+func normalizeToolCallArgumentsText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(text), &parsed); err == nil {
+		if normalized, marshalErr := json.Marshal(parsed); marshalErr == nil {
+			return string(normalized)
+		}
+	}
+	return strings.Join(strings.Fields(text), " ")
+}
+
+func shouldBackfillToolCallArgs(current, incoming string) bool {
+	current = strings.TrimSpace(current)
+	incoming = strings.TrimSpace(incoming)
+	if incoming == "" || incoming == "{}" {
+		return false
+	}
+	if current == "" || current == "{}" {
+		return true
+	}
+	return false
 }
 
 // streamingIndexForCorrelation returns the history index for a specific
@@ -781,11 +939,11 @@ func (m *Model) streamingIndexForCorrelation(correlationID string) int {
 	if slot, ok := m.streams[correlationID]; ok && slot.accumulator != nil {
 		return slot.accumulator.EntryIndex()
 	}
-	if m.thinkingIdx >= 0 {
-		return m.thinkingIdx
-	}
 	if idx := m.historyIndexForCorrelation(correlationID); idx >= 0 {
 		return idx
+	}
+	if m.thinkingIdx >= 0 && len(m.streams) == 0 {
+		return m.thinkingIdx
 	}
 	return -1
 }
@@ -809,11 +967,24 @@ func (m *Model) historyIndexForCorrelation(correlationID string) int {
 // activeStreamingIndices returns the history indices of entries currently
 // receiving streaming content or tool-call activity.
 func (m *Model) activeStreamingIndices() []int {
-	indices := make([]int, 0, len(m.streams)+1)
+	seen := make(map[int]struct{}, len(m.streams)+len(m.pendingInterAgent)+1)
+	indices := make([]int, 0, len(m.streams)+len(m.pendingInterAgent)+1)
 	for _, slot := range m.streams {
 		if slot.accumulator != nil {
-			indices = append(indices, slot.accumulator.EntryIndex())
+			idx := slot.accumulator.EntryIndex()
+			if _, ok := seen[idx]; ok {
+				continue
+			}
+			seen[idx] = struct{}{}
+			indices = append(indices, idx)
 		}
+	}
+	for idx := range m.pendingInterAgent {
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		indices = append(indices, idx)
 	}
 	if len(indices) == 0 && m.thinkingIdx >= 0 {
 		indices = append(indices, m.thinkingIdx)
@@ -825,7 +996,7 @@ func (m *Model) invalidateEntryToolCalls(idx int) bool {
 	hasActive := false
 	m.history.UpdateAt(idx, func(e *ChatEntry) {
 		for i := range e.ToolCalls {
-			if !e.ToolCalls[i].Completed {
+			if toolCallHasActiveVisual(e.ToolCalls[i]) {
 				hasActive = true
 				break
 			}
@@ -833,10 +1004,7 @@ func (m *Model) invalidateEntryToolCalls(idx int) bool {
 		if !hasActive {
 			return
 		}
-		e.RenderedLines = nil
-		e.CodeRegions = nil
-		e.ToolCallRegions = nil
-		e.Height = -1
+		invalidateChatEntryRender(e)
 	})
 	return hasActive
 }
@@ -866,6 +1034,10 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 		m.viewport.ToBottom()
 	case "esc":
 		m.viewport.ClearSelection()
+	case " ", "space":
+		if m.ToggleSelected() {
+			m.viewDirty = true
+		}
 	}
 	return nil
 }
@@ -974,6 +1146,14 @@ func (m *Model) PushEntry(entry *ChatEntry) {
 		if m.planEntryIdx >= 0 {
 			m.planEntryIdx--
 		}
+		nextPending := make(map[int]struct{}, len(m.pendingInterAgent))
+		for idx := range m.pendingInterAgent {
+			idx--
+			if idx >= 0 {
+				nextPending[idx] = struct{}{}
+			}
+		}
+		m.pendingInterAgent = nextPending
 		for _, slot := range m.streams {
 			if slot.accumulator != nil {
 				slot.accumulator.AdjustIndex(-1)
@@ -987,6 +1167,811 @@ func (m *Model) PushEntry(entry *ChatEntry) {
 	m.viewDirty = true
 }
 
+func (m *Model) handleInterAgentToolCallEvent(idx int, currentAgentType string, ev msg.ToolCallEventMsg) bool {
+	switch ev.Phase {
+	case 0:
+		if isInterAgentResponseTool(ev.ToolName) {
+			return true
+		}
+		record, ok := buildInterAgentStartRecord(ev)
+		if !ok {
+			return false
+		}
+		record.StartedAt = ev.StartedAt
+		m.history.UpdateAt(idx, func(e *ChatEntry) {
+			e.ToolCalls = append(e.ToolCalls, record)
+			invalidateChatEntryRender(e)
+		})
+		m.syncPendingInterAgentEntry(idx)
+		m.syncAllNestedInterAgentStreams()
+		return true
+	case 1:
+		if m.completeLocalInterAgentToolRecord(idx, currentAgentType, ev) {
+			m.syncPendingInterAgentEntry(idx)
+			m.syncAllNestedInterAgentStreams()
+			return true
+		}
+		if m.applyInterAgentOriginUpdate(ev, currentAgentType) {
+			m.syncAllNestedInterAgentStreams()
+			return true
+		}
+		record, ok := buildInterAgentCompletionFallback(ev, currentAgentType)
+		if !ok {
+			return false
+		}
+		m.history.UpdateAt(idx, func(e *ChatEntry) {
+			e.ToolCalls = append(e.ToolCalls, record)
+			invalidateChatEntryRender(e)
+		})
+		m.syncPendingInterAgentEntry(idx)
+		m.syncAllNestedInterAgentStreams()
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Model) completeLocalInterAgentToolRecord(idx int, currentAgentType string, ev msg.ToolCallEventMsg) bool {
+	matched := false
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		for i := len(e.ToolCalls) - 1; i >= 0; i-- {
+			if !toolCallRecordCanAcceptCompletion(e.ToolCalls[i]) {
+				continue
+			}
+			if !toolCallRecordMatchesEvent(e.ToolCalls[i], ev) {
+				continue
+			}
+			if !updateInterAgentCompletion(&e.ToolCalls[i], ev) {
+				return
+			}
+			invalidateChatEntryRender(e)
+			matched = true
+			return
+		}
+	})
+	return matched
+}
+
+func (m *Model) applyInterAgentOriginUpdate(ev msg.ToolCallEventMsg, currentAgentType string) bool {
+	row, ok := interAgentOriginUpdate(ev, currentAgentType)
+	if !ok || row == nil || strings.TrimSpace(row.ThreadKey) == "" {
+		return false
+	}
+	entryIdx, recordIdx, found := m.findInterAgentThread(row.ThreadKey)
+	if !found {
+		return false
+	}
+	m.history.UpdateAt(entryIdx, func(e *ChatEntry) {
+		if recordIdx < 0 || recordIdx >= len(e.ToolCalls) || e.ToolCalls[recordIdx].InterAgent == nil {
+			return
+		}
+		e.ToolCalls[recordIdx].InterAgent.AgentTypes = append([]string(nil), row.AgentTypes...)
+		e.ToolCalls[recordIdx].InterAgent.Summary = row.Summary
+		e.ToolCalls[recordIdx].InterAgent.Status = row.Status
+		e.ToolCalls[recordIdx].InterAgent.ThreadKey = row.ThreadKey
+		e.ToolCalls[recordIdx].Success = row.Status != InterAgentToolFailed
+		e.ToolCalls[recordIdx].Completed = true
+		invalidateChatEntryRender(e)
+	})
+	m.syncPendingInterAgentEntry(entryIdx)
+	return true
+}
+
+func (m *Model) findInterAgentThread(threadKey string) (int, int, bool) {
+	threadKey = strings.TrimSpace(threadKey)
+	if threadKey == "" {
+		return -1, -1, false
+	}
+	for idx := m.history.Len() - 1; idx >= 0; idx-- {
+		entry := m.history.Get(idx)
+		if entry == nil {
+			continue
+		}
+		for recordIdx := len(entry.ToolCalls) - 1; recordIdx >= 0; recordIdx-- {
+			row := entry.ToolCalls[recordIdx].InterAgent
+			if row == nil {
+				continue
+			}
+			if strings.TrimSpace(row.ThreadKey) == threadKey {
+				return idx, recordIdx, true
+			}
+		}
+	}
+	return -1, -1, false
+}
+
+func (m *Model) syncPendingInterAgentEntry(idx int) {
+	if idx < 0 {
+		return
+	}
+	entry := m.history.Get(idx)
+	if entry == nil || !entryHasPendingInterAgentToolCalls(entry) {
+		delete(m.pendingInterAgent, idx)
+		m.finalizeDeferredStreamSlotsForEntry(idx)
+		return
+	}
+	m.pendingInterAgent[idx] = struct{}{}
+}
+
+func (m *Model) deferSlotCompletionIfPending(slot *streamSlot) bool {
+	if slot == nil || slot.accumulator == nil {
+		return false
+	}
+	if !shouldDeferEntryCompletion(m.history.Get(slot.accumulator.EntryIndex())) {
+		return false
+	}
+	slot.deferCompletion = true
+	slot.retryText = deferredParentCompletionStatus
+	slot.lastProgressSet = time.Time{}
+	m.setSlotThinkingTextNow(slot, deferredParentCompletionStatus)
+	m.syncSlotToEntry(slot)
+	if slot.renderState == nil {
+		slot.renderState = &streamRenderState{}
+	}
+	m.viewport.AddStreamState(slot.accumulator.EntryIndex(), slot.renderState)
+	m.viewDirty = true
+	return true
+}
+
+func (m *Model) finalizeDeferredStreamSlotsForEntry(idx int) {
+	if idx < 0 {
+		return
+	}
+	keys := make([]string, 0, 1)
+	for correlationID, slot := range m.streams {
+		if slot == nil || !slot.deferCompletion || slot.accumulator == nil {
+			continue
+		}
+		if slot.accumulator.EntryIndex() != idx {
+			continue
+		}
+		keys = append(keys, correlationID)
+	}
+	for _, correlationID := range keys {
+		slot := m.streams[correlationID]
+		if slot == nil || !slot.deferCompletion || slot.accumulator == nil {
+			continue
+		}
+		if shouldDeferEntryCompletion(m.history.Get(slot.accumulator.EntryIndex())) {
+			continue
+		}
+		m.finalizeCompletedStreamSlot(correlationID, slot, true, "")
+	}
+}
+
+func (m *Model) handleNestedStreamStart(start msg.StreamStartMsg) {
+	slot := m.ensureNestedStreamSlot(start.CorrelationID, start.BranchRef)
+	if slot == nil {
+		return
+	}
+	now := time.Now()
+	if start.AgentID != "" {
+		slot.activity.AgentID = strings.TrimSpace(start.AgentID)
+	}
+	if agentType := streamEntryAgentType(start); agentType != "" {
+		slot.activity.AgentType = agentType
+	}
+	slot.terminalSeen = false
+	slot.terminalFailed = false
+	if slot.done {
+		slot.content.Reset()
+		slot.done = false
+		slot.activity.ToolCalls = nil
+		slot.activity.ResultSummary = ""
+		slot.activity.Completed = false
+		slot.activity.Failed = false
+	}
+	slot.thinkingStart = now
+	slot.retryText = ""
+	slot.lastProgressSet = time.Time{}
+	m.renderNestedStreamThinking(slot, now)
+	m.syncPendingNestedStream(slot)
+}
+
+func (m *Model) handleNestedStreamChunk(chunk msg.StreamChunkMsg) bool {
+	slot := m.nestedStream(chunk.CorrelationID)
+	if slot == nil {
+		return false
+	}
+	slot.content.WriteString(chunk.Text)
+	return true
+}
+
+func (m *Model) handleNestedStreamProgress(progress msg.StreamProgressMsg) bool {
+	slot := m.nestedStream(progress.CorrelationID)
+	if slot == nil && progress.BranchRef != nil {
+		slot = m.ensureNestedStreamSlot(progress.CorrelationID, progress.BranchRef)
+	}
+	if slot == nil {
+		return false
+	}
+	if progress.AgentID != "" {
+		slot.activity.AgentID = strings.TrimSpace(progress.AgentID)
+	}
+	if agentType := streamEntryAgentType(msg.StreamStartMsg{
+		AgentID:   progress.AgentID,
+		AgentType: progress.AgentType,
+	}); agentType != "" {
+		slot.activity.AgentType = agentType
+	}
+	message := sanitizeThinkingMessage(progress.Message)
+	if message == "" &&
+		slot.thinkingStart.IsZero() &&
+		strings.TrimSpace(slot.activity.ThinkingText) == "" &&
+		strings.TrimSpace(slot.activity.ThinkingStatus) == "" &&
+		len(slot.activity.ToolCalls) == 0 &&
+		strings.TrimSpace(slot.activity.ResultSummary) == "" {
+		return true
+	}
+	if message != "" {
+		slot.retryText = message
+	}
+	if slot.thinkingStart.IsZero() {
+		slot.thinkingStart = time.Now()
+	}
+	now := time.Now()
+	if slot.lastProgressSet.IsZero() || now.Sub(slot.lastProgressSet) >= thinkingProgressMinInterval {
+		slot.lastProgressSet = now
+		m.renderNestedStreamThinking(slot, now)
+		m.syncPendingNestedStream(slot)
+	}
+	return true
+}
+
+func (m *Model) handleNestedStreamComplete(done msg.StreamCompleteMsg) bool {
+	slot := m.nestedStream(done.CorrelationID)
+	if slot == nil && done.BranchRef != nil {
+		slot = m.ensureNestedStreamSlot(done.CorrelationID, done.BranchRef)
+	}
+	if slot == nil {
+		return false
+	}
+	if done.AgentID != "" {
+		slot.activity.AgentID = strings.TrimSpace(done.AgentID)
+	}
+	if agentType := streamEntryAgentType(msg.StreamStartMsg{
+		AgentID:   done.AgentID,
+		AgentType: done.AgentType,
+	}); agentType != "" {
+		slot.activity.AgentType = agentType
+	}
+	summary := summarizeNestedStreamText(firstNonEmptyString(
+		done.AuthoritativeText,
+		slot.content.String(),
+	))
+	slot.activity.ResultSummary = summary
+	slot.activity.ThinkingText = ""
+	slot.activity.ThinkingStatus = ""
+	slot.activity.ThinkingColor = ""
+	slot.thinkingStart = time.Time{}
+	slot.retryText = ""
+	slot.lastProgressSet = time.Time{}
+	slot.terminalSeen = true
+	slot.terminalFailed = false
+	finalizeNestedStreamToolCallsOnTerminal(slot.activity.ToolCalls, time.Now(), true, summary)
+	m.finalizeNestedStreamSlotIfReady(slot, time.Now())
+	m.syncPendingNestedStream(slot)
+	return true
+}
+
+func (m *Model) handleNestedStreamError(errMsg msg.StreamErrorMsg) bool {
+	slot := m.nestedStream(errMsg.CorrelationID)
+	if slot == nil && errMsg.BranchRef != nil {
+		slot = m.ensureNestedStreamSlot(errMsg.CorrelationID, errMsg.BranchRef)
+	}
+	if slot == nil {
+		return false
+	}
+	slot.activity.ResultSummary = summarizeNestedStreamText(formatErrorForChat(errMsg.Err))
+	slot.activity.ThinkingText = ""
+	slot.activity.ThinkingStatus = ""
+	slot.activity.ThinkingColor = ""
+	slot.thinkingStart = time.Time{}
+	slot.retryText = ""
+	slot.lastProgressSet = time.Time{}
+	slot.terminalSeen = true
+	slot.terminalFailed = true
+	finalizeNestedStreamToolCallsOnTerminal(slot.activity.ToolCalls, time.Now(), false, slot.activity.ResultSummary)
+	m.finalizeNestedStreamSlotIfReady(slot, time.Now())
+	m.syncPendingNestedStream(slot)
+	return true
+}
+
+func (m *Model) handleNestedToolCallEvent(ev msg.ToolCallEventMsg) bool {
+	slot := m.nestedStream(ev.CorrelationID)
+	if slot == nil && ev.BranchRef != nil {
+		slot = m.ensureNestedStreamSlot(ev.CorrelationID, ev.BranchRef)
+	}
+	if slot == nil {
+		return false
+	}
+	if ev.AgentID != "" {
+		slot.activity.AgentID = strings.TrimSpace(ev.AgentID)
+		if strings.TrimSpace(slot.activity.AgentType) == "" {
+			slot.activity.AgentType = strings.TrimSpace(ev.AgentID)
+		}
+	}
+	currentAgentType := nestedActivityAgentType(&slot.activity)
+	if handleInterAgentToolCallInList(&slot.activity.ToolCalls, currentAgentType, ev) {
+		m.syncPendingNestedStream(slot)
+		return true
+	}
+
+	switch ev.Phase {
+	case 0:
+		slot.activity.ToolCalls = append(slot.activity.ToolCalls, ToolCallRecord{
+			ToolCallKey: ev.ToolCallKey,
+			ToolName:    ev.ToolName,
+			ArgsSummary: ev.ArgsSummary,
+			FullArgs:    ev.FullArgs,
+			StartedAt:   ev.StartedAt,
+		})
+	case 1:
+		for i := len(slot.activity.ToolCalls) - 1; i >= 0; i-- {
+			if !toolCallRecordCanAcceptCompletion(slot.activity.ToolCalls[i]) {
+				continue
+			}
+			if !toolCallRecordMatchesEvent(slot.activity.ToolCalls[i], ev) {
+				continue
+			}
+			if slot.activity.ToolCalls[i].StartedAt.IsZero() {
+				slot.activity.ToolCalls[i].StartedAt = ev.StartedAt
+			}
+			slot.activity.ToolCalls[i].Duration = ev.Duration
+			slot.activity.ToolCalls[i].Success = ev.Success
+			slot.activity.ToolCalls[i].Completed = true
+			slot.activity.ToolCalls[i].SyntheticCompletion = false
+			slot.activity.ToolCalls[i].Output = ev.Output
+			slot.activity.ToolCalls[i].ErrorMsg = ev.ErrorMsg
+			if strings.TrimSpace(slot.activity.ToolCalls[i].ToolCallKey) == "" {
+				slot.activity.ToolCalls[i].ToolCallKey = strings.TrimSpace(ev.ToolCallKey)
+			}
+			if !ev.Success {
+				slot.activity.ToolCalls[i].Expanded = true
+			}
+			break
+		}
+	}
+	m.finalizeNestedStreamSlotIfReady(slot, time.Now())
+	m.syncPendingNestedStream(slot)
+	return true
+}
+
+func (m *Model) finalizeNestedStreamSlotIfReady(slot *nestedStreamSlot, doneAt time.Time) {
+	if slot == nil || !slot.terminalSeen || slot.done {
+		return
+	}
+	for i := range slot.activity.ToolCalls {
+		if toolCallHasActiveVisual(slot.activity.ToolCalls[i]) {
+			return
+		}
+	}
+	finalizeToolCallsSynthetic(slot.activity.ToolCalls, doneAt, !slot.terminalFailed, slot.activity.ResultSummary)
+	slot.activity.Completed = true
+	slot.activity.Failed = slot.terminalFailed
+	slot.done = true
+}
+
+func (m *Model) nestedStream(correlationID string) *nestedStreamSlot {
+	if strings.TrimSpace(correlationID) == "" {
+		return nil
+	}
+	if m.nestedStreams == nil {
+		return nil
+	}
+	return m.nestedStreams[correlationID]
+}
+
+func (m *Model) ensureNestedStreamSlot(correlationID string, ref *msg.InterAgentBranchRefMsg) *nestedStreamSlot {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" || ref == nil {
+		return nil
+	}
+	if m.nestedStreams == nil {
+		m.nestedStreams = make(map[string]*nestedStreamSlot)
+	}
+	if slot, ok := m.nestedStreams[correlationID]; ok {
+		slot.branchRef = *ref
+		if slot.activity.CorrelationID == "" {
+			slot.activity.CorrelationID = correlationID
+		}
+		return slot
+	}
+	slot := &nestedStreamSlot{
+		correlationID: correlationID,
+		branchRef:     *ref,
+		activity: InterAgentChildActivity{
+			CorrelationID: correlationID,
+		},
+	}
+	m.nestedStreams[correlationID] = slot
+	return slot
+}
+
+func (m *Model) syncPendingNestedStream(slot *nestedStreamSlot) bool {
+	if slot == nil {
+		return false
+	}
+	synced := m.updateInterAgentBranch(slot.branchRef, func(row *InterAgentTool) {
+		upsertInterAgentChildActivity(row, slot.activity)
+	})
+	if synced {
+		m.syncPendingInterAgentIndices()
+		m.viewDirty = true
+		if slot.done {
+			delete(m.nestedStreams, slot.correlationID)
+		}
+	}
+	return synced
+}
+
+func (m *Model) syncAllNestedInterAgentStreams() {
+	for _, slot := range m.nestedStreams {
+		m.syncPendingNestedStream(slot)
+	}
+}
+
+func (m *Model) syncPendingInterAgentIndices() {
+	for idx := 0; idx < m.history.Len(); idx++ {
+		m.syncPendingInterAgentEntry(idx)
+	}
+}
+
+func (m *Model) tickNestedStreamThinking(now time.Time) bool {
+	updated := false
+	for _, slot := range m.nestedStreams {
+		if slot == nil || slot.done {
+			continue
+		}
+		if m.renderNestedStreamThinking(slot, now) {
+			if m.syncPendingNestedStream(slot) {
+				updated = true
+			}
+		}
+	}
+	return updated
+}
+
+func (m *Model) renderNestedStreamThinking(slot *nestedStreamSlot, now time.Time) bool {
+	if slot == nil {
+		return false
+	}
+	if slot.thinkingStart.IsZero() {
+		return false
+	}
+	if strings.TrimSpace(slot.retryText) == "" {
+		if slot.activity.ThinkingText == "" && slot.activity.ThinkingStatus == "" && slot.activity.ThinkingColor == "" {
+			return false
+		}
+		slot.activity.ThinkingText = ""
+		slot.activity.ThinkingStatus = ""
+		slot.activity.ThinkingColor = ""
+		return true
+	}
+	elapsed := thinkingElapsed(slot.thinkingStart, now)
+	text := fmt.Sprintf("%s  %.1fs", spinnerFrames[thinkingFrameAt(elapsed)], elapsed.Seconds())
+	status := thinkingStatusFor(nestedActivityAgentType(&slot.activity), slot.retryText, elapsed)
+	color := m.thinkingColorFor(elapsed)
+	if slot.activity.ThinkingText == text &&
+		slot.activity.ThinkingStatus == status &&
+		slot.activity.ThinkingColor == color {
+		return false
+	}
+	slot.activity.ThinkingText = text
+	slot.activity.ThinkingStatus = status
+	slot.activity.ThinkingColor = color
+	return true
+}
+
+func nestedActivityAgentType(activity *InterAgentChildActivity) string {
+	if activity == nil {
+		return ""
+	}
+	if agentType := strings.TrimSpace(activity.AgentType); agentType != "" {
+		return agentType
+	}
+	return strings.TrimSpace(activity.AgentID)
+}
+
+func summarizeNestedStreamText(text string) string {
+	return normalizeInlineText(text)
+}
+
+func (m *Model) updateInterAgentBranch(ref msg.InterAgentBranchRefMsg, fn func(*InterAgentTool)) bool {
+	parentCorrelationID := strings.TrimSpace(ref.ParentCorrelationID)
+	parentToolCallKey := strings.TrimSpace(ref.ParentToolCallKey)
+	threadKey := strings.TrimSpace(ref.ThreadKey)
+	kind := strings.TrimSpace(ref.Kind)
+	if parentCorrelationID == "" {
+		return false
+	}
+	found := false
+	for idx := m.history.Len() - 1; idx >= 0 && !found; idx-- {
+		m.history.UpdateAt(idx, func(entry *ChatEntry) {
+			if found || entry == nil {
+				return
+			}
+			if updateInterAgentBranchInToolCalls(entry.CorrelationID, &entry.ToolCalls, parentCorrelationID, parentToolCallKey, threadKey, kind, fn) {
+				invalidateChatEntryRender(entry)
+				found = true
+			}
+		})
+	}
+	return found
+}
+
+func updateInterAgentBranchInToolCalls(
+	ownerCorrelationID string,
+	calls *[]ToolCallRecord,
+	parentCorrelationID, parentToolCallKey, threadKey string,
+	kind string,
+	fn func(*InterAgentTool),
+) bool {
+	if calls == nil {
+		return false
+	}
+	ownerCorrelationID = strings.TrimSpace(ownerCorrelationID)
+	parentCorrelationID = strings.TrimSpace(parentCorrelationID)
+	parentToolCallKey = strings.TrimSpace(parentToolCallKey)
+	threadKey = strings.TrimSpace(threadKey)
+	kind = strings.TrimSpace(kind)
+	for i := range *calls {
+		record := &(*calls)[i]
+		row := record.InterAgent
+		if row == nil {
+			continue
+		}
+		if ownerCorrelationID == parentCorrelationID &&
+			parentToolCallKey != "" &&
+			strings.TrimSpace(record.ToolCallKey) == parentToolCallKey {
+			fn(row)
+			return true
+		}
+		if threadKey != "" && strings.TrimSpace(row.ThreadKey) == threadKey {
+			fn(row)
+			return true
+		}
+		for childIdx := range row.Children {
+			child := &row.Children[childIdx]
+			if updateInterAgentBranchInToolCalls(child.CorrelationID, &child.ToolCalls, parentCorrelationID, parentToolCallKey, threadKey, kind, fn) {
+				return true
+			}
+		}
+	}
+	if ownerCorrelationID == parentCorrelationID && parentToolCallKey == "" && threadKey == "" {
+		var candidate *InterAgentTool
+		for i := range *calls {
+			row := (*calls)[i].InterAgent
+			if row == nil {
+				continue
+			}
+			if kind != "" && strings.TrimSpace(string(row.Kind)) != kind {
+				continue
+			}
+			if candidate != nil {
+				return false
+			}
+			candidate = row
+		}
+		if candidate != nil {
+			fn(candidate)
+			return true
+		}
+	}
+	return false
+}
+
+func upsertInterAgentChildActivity(row *InterAgentTool, activity InterAgentChildActivity) {
+	if row == nil {
+		return
+	}
+	cloned := cloneInterAgentChildActivity(activity)
+	childCorrelationID := strings.TrimSpace(cloned.CorrelationID)
+	if childCorrelationID != "" {
+		for i := range row.Children {
+			if strings.TrimSpace(row.Children[i].CorrelationID) == childCorrelationID {
+				preserveInterAgentChildUIState(&cloned, row.Children[i])
+				row.Children[i] = cloned
+				return
+			}
+		}
+	}
+	row.Children = append(row.Children, cloned)
+}
+
+func preserveInterAgentChildUIState(next *InterAgentChildActivity, prev InterAgentChildActivity) {
+	if next == nil {
+		return
+	}
+	if prev.ToolCallsExpanded {
+		next.ToolCallsExpanded = true
+	}
+	preserveToolCallSliceUIState(next.ToolCalls, prev.ToolCalls)
+}
+
+func preserveToolCallSliceUIState(next []ToolCallRecord, prev []ToolCallRecord) {
+	if len(next) == 0 || len(prev) == 0 {
+		return
+	}
+	used := make([]bool, len(prev))
+	for i := range next {
+		match := -1
+		for j := 0; j < len(prev); j++ {
+			if used[j] {
+				continue
+			}
+			if !toolCallRecordsShareIdentity(next[i], prev[j]) {
+				continue
+			}
+			match = j
+			break
+		}
+		if match < 0 {
+			continue
+		}
+		used[match] = true
+		preserveToolCallUIState(&next[i], prev[match])
+	}
+}
+
+func preserveToolCallUIState(next *ToolCallRecord, prev ToolCallRecord) {
+	if next == nil {
+		return
+	}
+	if prev.Expanded {
+		next.Expanded = true
+	}
+	if next.InterAgent == nil || prev.InterAgent == nil {
+		return
+	}
+	preserveInterAgentChildrenUIState(next.InterAgent.Children, prev.InterAgent.Children)
+}
+
+func preserveInterAgentChildrenUIState(next []InterAgentChildActivity, prev []InterAgentChildActivity) {
+	if len(next) == 0 || len(prev) == 0 {
+		return
+	}
+	byCorrelation := make(map[string]InterAgentChildActivity, len(prev))
+	for i := range prev {
+		correlationID := strings.TrimSpace(prev[i].CorrelationID)
+		if correlationID == "" {
+			continue
+		}
+		byCorrelation[correlationID] = prev[i]
+	}
+	for i := range next {
+		correlationID := strings.TrimSpace(next[i].CorrelationID)
+		if correlationID == "" {
+			continue
+		}
+		if prevChild, ok := byCorrelation[correlationID]; ok {
+			preserveInterAgentChildUIState(&next[i], prevChild)
+		}
+	}
+}
+
+func toolCallRecordsShareIdentity(left, right ToolCallRecord) bool {
+	leftKey := strings.TrimSpace(left.ToolCallKey)
+	rightKey := strings.TrimSpace(right.ToolCallKey)
+	if leftKey != "" && rightKey != "" && leftKey == rightKey {
+		return true
+	}
+	leftArgs := toolCallArgumentsIdentity(left.FullArgs, left.ArgsSummary)
+	rightArgs := toolCallArgumentsIdentity(right.FullArgs, right.ArgsSummary)
+	if leftArgs != "" && rightArgs != "" {
+		if leftArgs != rightArgs {
+			return false
+		}
+		leftName := strings.TrimSpace(left.ToolName)
+		rightName := strings.TrimSpace(right.ToolName)
+		return leftName == "" || rightName == "" || leftName == rightName
+	}
+	leftName := strings.TrimSpace(left.ToolName)
+	rightName := strings.TrimSpace(right.ToolName)
+	return leftName != "" && leftName == rightName
+}
+
+func cloneInterAgentChildActivity(activity InterAgentChildActivity) InterAgentChildActivity {
+	out := activity
+	out.ToolCalls = cloneToolCallRecords(activity.ToolCalls)
+	return out
+}
+
+func cloneToolCallRecords(in []ToolCallRecord) []ToolCallRecord {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]ToolCallRecord, len(in))
+	for i := range in {
+		out[i] = in[i]
+		if in[i].InterAgent != nil {
+			row := *in[i].InterAgent
+			row.AgentTypes = append([]string(nil), in[i].InterAgent.AgentTypes...)
+			row.Children = cloneInterAgentChildren(in[i].InterAgent.Children)
+			out[i].InterAgent = &row
+		}
+	}
+	return out
+}
+
+func cloneInterAgentChildren(in []InterAgentChildActivity) []InterAgentChildActivity {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]InterAgentChildActivity, len(in))
+	for i := range in {
+		out[i] = cloneInterAgentChildActivity(in[i])
+	}
+	return out
+}
+
+func handleInterAgentToolCallInList(calls *[]ToolCallRecord, currentAgentType string, ev msg.ToolCallEventMsg) bool {
+	if calls == nil {
+		return false
+	}
+	switch ev.Phase {
+	case 0:
+		if isInterAgentResponseTool(ev.ToolName) {
+			return true
+		}
+		record, ok := buildInterAgentStartRecord(ev)
+		if !ok {
+			return false
+		}
+		record.StartedAt = ev.StartedAt
+		*calls = append(*calls, record)
+		return true
+	case 1:
+		for i := len(*calls) - 1; i >= 0; i-- {
+			if !toolCallRecordCanAcceptCompletion((*calls)[i]) {
+				continue
+			}
+			if !toolCallRecordMatchesEvent((*calls)[i], ev) {
+				continue
+			}
+			if updateInterAgentCompletion(&(*calls)[i], ev) {
+				return true
+			}
+		}
+		row, ok := interAgentOriginUpdate(ev, currentAgentType)
+		if ok && row != nil && strings.TrimSpace(row.ThreadKey) != "" {
+			for i := len(*calls) - 1; i >= 0; i-- {
+				if (*calls)[i].InterAgent == nil {
+					continue
+				}
+				if strings.TrimSpace((*calls)[i].InterAgent.ThreadKey) != strings.TrimSpace(row.ThreadKey) {
+					continue
+				}
+				(*calls)[i].InterAgent.AgentTypes = append([]string(nil), row.AgentTypes...)
+				(*calls)[i].InterAgent.Summary = row.Summary
+				(*calls)[i].InterAgent.Status = row.Status
+				(*calls)[i].InterAgent.ThreadKey = row.ThreadKey
+				(*calls)[i].Success = row.Status != InterAgentToolFailed
+				(*calls)[i].Completed = true
+				return true
+			}
+		}
+		record, ok := buildInterAgentCompletionFallback(ev, currentAgentType)
+		if !ok {
+			return false
+		}
+		*calls = append(*calls, record)
+		return true
+	default:
+		return false
+	}
+}
+
+func invalidateChatEntryRender(e *ChatEntry) {
+	if e == nil {
+		return
+	}
+	e.RenderedLines = nil
+	e.CodeRegions = nil
+	e.ToolCallRegions = nil
+	e.Height = -1
+}
+
 // Clear discards all chat entries and resets the viewport to its initial state.
 // Active streams and thinking indicators are cancelled.
 func (m *Model) Clear() {
@@ -994,6 +1979,7 @@ func (m *Model) Clear() {
 	m.clearThinkingState()
 	m.clearSteeringState()
 	clear(m.streams)
+	clear(m.nestedStreams)
 	m.streamRenderPending = false
 	m.planEntryIdx = -1
 	m.planID = ""
@@ -1083,6 +2069,8 @@ func (m *Model) HasActiveAnimation() bool {
 	now := time.Now()
 	return m.thinkingIdx >= 0 ||
 		len(m.streams) > 0 ||
+		len(m.nestedStreams) > 0 ||
+		len(m.pendingInterAgent) > 0 ||
 		len(m.steeringPending) > 0 ||
 		!m.highlightUntil.IsZero() ||
 		m.viewport.HasEdgeFlash(now)
@@ -1098,6 +2086,358 @@ func (m *Model) EntryAtViewLine(y int) *ChatEntry {
 // describing what content to copy and what line range to highlight.
 func (m *Model) CopyTargetAtViewLine(y int) *CopyTarget {
 	return m.viewport.CopyTargetAtViewLine(y)
+}
+
+// CopyTargetAtRenderedViewLine resolves a viewport-relative line using the
+// last rendered frame snapshot, falling back to live resolution when needed.
+func (m *Model) CopyTargetAtRenderedViewLine(y int) *CopyTarget {
+	if target := m.viewport.FrameCopyTargetAtViewLine(y); target != nil {
+		return target
+	}
+	return m.CopyTargetAtViewLine(y)
+}
+
+// ToggleAtViewLine toggles the expandable tool or child inter-agent row at the
+// given viewport-relative line. Returns true when a toggle was applied.
+func (m *Model) ToggleAtViewLine(y int) bool {
+	target := m.viewport.ToggleTargetAtViewLine(y)
+	return m.applyToggleTarget(target)
+}
+
+// ToggleAtRenderedViewLine toggles the item that occupied the given
+// viewport-relative line in the last rendered frame snapshot, falling back to
+// live resolution if no frame target is available.
+func (m *Model) ToggleAtRenderedViewLine(y int) bool {
+	target := m.viewport.FrameToggleTargetAtViewLine(y)
+	if target == nil {
+		target = m.viewport.ToggleTargetAtViewLine(y)
+	}
+	return m.applyToggleTarget(target)
+}
+
+func (m *Model) applyToggleTarget(target *toggleTarget) bool {
+	if target == nil {
+		return false
+	}
+	if !m.toggleTarget(target) {
+		return false
+	}
+	m.reselectAfterToggle(target)
+	m.viewDirty = true
+	return true
+}
+
+// ToggleSelected toggles the currently selected expandable region, if any.
+func (m *Model) ToggleSelected() bool {
+	if m.viewport.selectedIndex < 0 {
+		return false
+	}
+	regions := m.viewport.regions(m.viewport.selectedIndex)
+	if m.viewport.selectedRegion < 0 || m.viewport.selectedRegion >= len(regions) {
+		return false
+	}
+	region := regions[m.viewport.selectedRegion]
+	target := targetForSelectionRegion(m.viewport.selectedIndex, region)
+	if target == nil {
+		return false
+	}
+	if !m.toggleTarget(target) {
+		return false
+	}
+	m.reselectAfterToggle(target)
+	m.viewDirty = true
+	return true
+}
+
+func targetForSelectionRegion(entryIndex int, region selectionRegion) *toggleTarget {
+	switch region.kind {
+	case selectionRegionToolCall:
+		return &toggleTarget{
+			entryIndex:    entryIndex,
+			kind:          toggleTargetToolCall,
+			toolCallIndex: region.toolCallIndex,
+		}
+	case selectionRegionToolCallOverflow:
+		return &toggleTarget{
+			entryIndex:    entryIndex,
+			kind:          toggleTargetOverflow,
+			toolCallIndex: region.toolCallIndex,
+			childIndex:    region.childIndex,
+		}
+	case selectionRegionChildToolCall:
+		return &toggleTarget{
+			entryIndex:       entryIndex,
+			kind:             toggleTargetChildToolCall,
+			toolCallIndex:    region.toolCallIndex,
+			childIndex:       region.childIndex,
+			childToolCallIdx: region.childToolCallIdx,
+		}
+	default:
+		return nil
+	}
+}
+
+func (m *Model) resolveToggleEntryIndex(target *toggleTarget) int {
+	if target == nil {
+		return -1
+	}
+	if target.entryIndex >= 0 {
+		if entry := m.history.Get(target.entryIndex); entry != nil {
+			if strings.TrimSpace(target.entryID) == "" || strings.TrimSpace(entry.ID) == strings.TrimSpace(target.entryID) {
+				return target.entryIndex
+			}
+		}
+	}
+	if entryID := strings.TrimSpace(target.entryID); entryID != "" {
+		for idx := m.history.Len() - 1; idx >= 0; idx-- {
+			entry := m.history.Get(idx)
+			if entry != nil && strings.TrimSpace(entry.ID) == entryID {
+				return idx
+			}
+		}
+	}
+	return target.entryIndex
+}
+
+func resolveToolCallTargetIndex(target *toggleTarget, calls []ToolCallRecord) int {
+	if target == nil || len(calls) == 0 {
+		return -1
+	}
+	if idx := target.toolCallIndex; idx >= 0 && idx < len(calls) && toggleTargetMatchesToolCall(target, calls[idx], false) {
+		return idx
+	}
+	for idx := range calls {
+		if toggleTargetMatchesToolCall(target, calls[idx], false) {
+			return idx
+		}
+	}
+	if idx := target.toolCallIndex; idx >= 0 && idx < len(calls) {
+		return idx
+	}
+	return -1
+}
+
+func resolveChildTargetIndex(target *toggleTarget, children []InterAgentChildActivity) int {
+	if target == nil || len(children) == 0 {
+		return -1
+	}
+	childID := strings.TrimSpace(target.childID)
+	if childID != "" {
+		for idx := range children {
+			if strings.TrimSpace(children[idx].CorrelationID) == childID {
+				return idx
+			}
+		}
+	}
+	if idx := target.childIndex; idx >= 0 && idx < len(children) {
+		return idx
+	}
+	return -1
+}
+
+func resolveChildToolCallTargetIndex(target *toggleTarget, calls []ToolCallRecord) int {
+	if target == nil || len(calls) == 0 {
+		return -1
+	}
+	if idx := target.childToolCallIdx; idx >= 0 && idx < len(calls) && toggleTargetMatchesToolCall(target, calls[idx], true) {
+		return idx
+	}
+	for idx := range calls {
+		if toggleTargetMatchesToolCall(target, calls[idx], true) {
+			return idx
+		}
+	}
+	if idx := target.childToolCallIdx; idx >= 0 && idx < len(calls) {
+		return idx
+	}
+	return -1
+}
+
+func toggleTargetMatchesToolCall(target *toggleTarget, record ToolCallRecord, child bool) bool {
+	if target == nil {
+		return false
+	}
+	key := strings.TrimSpace(target.toolCallKey)
+	name := strings.TrimSpace(target.toolCallName)
+	argsID := strings.TrimSpace(target.toolCallArgsID)
+	if child {
+		key = strings.TrimSpace(target.childToolCallKey)
+		name = strings.TrimSpace(target.childToolCallName)
+		argsID = strings.TrimSpace(target.childToolCallArgsID)
+	}
+	if key != "" && strings.TrimSpace(record.ToolCallKey) == key {
+		return true
+	}
+	recordArgsID := toolCallArgumentsIdentity(record.FullArgs, record.ArgsSummary)
+	if argsID != "" && recordArgsID == argsID {
+		return name == "" || strings.TrimSpace(record.ToolName) == name
+	}
+	if key == "" && argsID == "" && name != "" && strings.TrimSpace(record.ToolName) == name {
+		return true
+	}
+	return false
+}
+
+func (m *Model) toggleTarget(target *toggleTarget) bool {
+	entryIndex := m.resolveToggleEntryIndex(target)
+	if entryIndex < 0 {
+		return false
+	}
+	toggled := false
+	m.history.UpdateAt(entryIndex, func(e *ChatEntry) {
+		toolCallIndex := resolveToolCallTargetIndex(target, e.ToolCalls)
+		if toolCallIndex < 0 || toolCallIndex >= len(e.ToolCalls) {
+			return
+		}
+		record := &e.ToolCalls[toolCallIndex]
+		target.entryIndex = entryIndex
+		target.entryID = strings.TrimSpace(e.ID)
+		target.toolCallIndex = toolCallIndex
+		target.toolCallKey = strings.TrimSpace(record.ToolCallKey)
+		target.toolCallName = strings.TrimSpace(record.ToolName)
+		target.toolCallArgsID = toolCallArgumentsIdentity(record.FullArgs, record.ArgsSummary)
+		switch target.kind {
+		case toggleTargetToolCall:
+			record.Expanded = !record.Expanded
+			toggled = true
+		case toggleTargetOverflow:
+			if record.InterAgent == nil {
+				return
+			}
+			childIndex := resolveChildTargetIndex(target, record.InterAgent.Children)
+			if childIndex < 0 || childIndex >= len(record.InterAgent.Children) {
+				return
+			}
+			child := &record.InterAgent.Children[childIndex]
+			target.childIndex = childIndex
+			target.childID = strings.TrimSpace(child.CorrelationID)
+			child.ToolCallsExpanded = !child.ToolCallsExpanded
+			toggled = true
+		case toggleTargetChildToolCall:
+			if record.InterAgent == nil {
+				return
+			}
+			childIndex := resolveChildTargetIndex(target, record.InterAgent.Children)
+			if childIndex < 0 || childIndex >= len(record.InterAgent.Children) {
+				return
+			}
+			child := &record.InterAgent.Children[childIndex]
+			childToolCallIdx := resolveChildToolCallTargetIndex(target, child.ToolCalls)
+			if childToolCallIdx < 0 || childToolCallIdx >= len(child.ToolCalls) {
+				return
+			}
+			target.childIndex = childIndex
+			target.childID = strings.TrimSpace(child.CorrelationID)
+			target.childToolCallIdx = childToolCallIdx
+			target.childToolCallKey = strings.TrimSpace(child.ToolCalls[childToolCallIdx].ToolCallKey)
+			target.childToolCallName = strings.TrimSpace(child.ToolCalls[childToolCallIdx].ToolName)
+			target.childToolCallArgsID = toolCallArgumentsIdentity(child.ToolCalls[childToolCallIdx].FullArgs, child.ToolCalls[childToolCallIdx].ArgsSummary)
+			child.ToolCalls[childToolCallIdx].Expanded = !child.ToolCalls[childToolCallIdx].Expanded
+			toggled = true
+		}
+		if toggled {
+			invalidateChatEntryRender(e)
+		}
+	})
+	return toggled
+}
+
+func (m *Model) reselectAfterToggle(target *toggleTarget) {
+	if target == nil {
+		return
+	}
+	entryIndex := m.resolveToggleEntryIndex(target)
+	if entryIndex < 0 {
+		return
+	}
+	regions := m.viewport.regions(entryIndex)
+	for idx, region := range regions {
+		candidate := targetForSelectionRegion(entryIndex, region)
+		if candidate == nil {
+			continue
+		}
+		if resolved := m.resolveToggleEntryIndex(candidate); resolved != entryIndex {
+			continue
+		}
+		if toggleTargetsReferToSameItem(candidate, target) {
+			m.viewport.selectEntry(entryIndex, idx)
+			return
+		}
+	}
+	if target.kind == toggleTargetOverflow {
+		for idx, region := range regions {
+			if region.kind == selectionRegionChildToolCall && region.childIndex == target.childIndex {
+				m.viewport.selectEntry(entryIndex, idx)
+				return
+			}
+		}
+	}
+}
+
+func toggleTargetsReferToSameItem(left, right *toggleTarget) bool {
+	if left == nil || right == nil || left.kind != right.kind {
+		return false
+	}
+	switch left.kind {
+	case toggleTargetToolCall:
+		return sameToolCallToggleTarget(left, right)
+	case toggleTargetOverflow:
+		if !sameToolCallToggleTarget(left, right) {
+			return false
+		}
+		leftChildID := strings.TrimSpace(left.childID)
+		rightChildID := strings.TrimSpace(right.childID)
+		if leftChildID != "" && rightChildID != "" {
+			return leftChildID == rightChildID
+		}
+		return left.childIndex == right.childIndex
+	case toggleTargetChildToolCall:
+		if !sameToolCallToggleTarget(left, right) {
+			return false
+		}
+		leftChildID := strings.TrimSpace(left.childID)
+		rightChildID := strings.TrimSpace(right.childID)
+		if leftChildID != "" && rightChildID != "" {
+			if leftChildID != rightChildID {
+				return false
+			}
+		} else if left.childIndex != right.childIndex {
+			return false
+		}
+		leftChildToolKey := strings.TrimSpace(left.childToolCallKey)
+		rightChildToolKey := strings.TrimSpace(right.childToolCallKey)
+		if leftChildToolKey != "" && rightChildToolKey != "" {
+			return leftChildToolKey == rightChildToolKey
+		}
+		leftChildToolArgsID := strings.TrimSpace(left.childToolCallArgsID)
+		rightChildToolArgsID := strings.TrimSpace(right.childToolCallArgsID)
+		if leftChildToolArgsID != "" && rightChildToolArgsID != "" {
+			return leftChildToolArgsID == rightChildToolArgsID &&
+				(strings.TrimSpace(left.childToolCallName) == "" ||
+					strings.TrimSpace(right.childToolCallName) == "" ||
+					strings.TrimSpace(left.childToolCallName) == strings.TrimSpace(right.childToolCallName))
+		}
+		return left.childToolCallIdx == right.childToolCallIdx
+	default:
+		return false
+	}
+}
+
+func sameToolCallToggleTarget(left, right *toggleTarget) bool {
+	leftKey := strings.TrimSpace(left.toolCallKey)
+	rightKey := strings.TrimSpace(right.toolCallKey)
+	if leftKey != "" && rightKey != "" {
+		return leftKey == rightKey
+	}
+	leftArgsID := strings.TrimSpace(left.toolCallArgsID)
+	rightArgsID := strings.TrimSpace(right.toolCallArgsID)
+	if leftArgsID != "" && rightArgsID != "" {
+		return leftArgsID == rightArgsID &&
+			(strings.TrimSpace(left.toolCallName) == "" ||
+				strings.TrimSpace(right.toolCallName) == "" ||
+				strings.TrimSpace(left.toolCallName) == strings.TrimSpace(right.toolCallName))
+	}
+	return left.toolCallIndex == right.toolCallIndex
 }
 
 // SetHighlight marks an entry for transient visual highlight (copy feedback).
@@ -1201,6 +2541,9 @@ func (m *Model) tickThinking(now time.Time) {
 			updated = true
 		}
 	}
+	if m.tickNestedStreamThinking(now) {
+		updated = true
+	}
 	if updated {
 		m.viewDirty = true
 	}
@@ -1275,6 +2618,7 @@ func (m *Model) FinishThinking(entry *ChatEntry) {
 	if idx >= 0 && idx < m.history.count {
 		physical := m.history.logicalToPhysical(idx)
 		e := &m.history.entries[physical]
+		finalizeToolCallsSynthetic(e.ToolCalls, time.Now(), true, "")
 		e.CorrelationID = entry.CorrelationID
 		e.Content = entry.Content
 		e.Source = entry.Source
@@ -1331,6 +2675,24 @@ func (m *Model) clearThinkingState() {
 	m.thinkingStart = time.Time{}
 	m.retryText = ""
 	m.lastProgressSet = time.Time{}
+}
+
+// HasPendingCorrelation reports whether the chat model still has an active or
+// deferred stream slot for correlationID. App-level routing uses this to keep
+// late terminal messages attached to the existing chat entry instead of
+// creating a separate completed response entry.
+func (m *Model) HasPendingCorrelation(correlationID string) bool {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return false
+	}
+	if _, ok := m.streams[correlationID]; ok {
+		return true
+	}
+	if slot, ok := m.nestedStreams[correlationID]; ok && slot != nil && !slot.done {
+		return true
+	}
+	return false
 }
 
 func (m *Model) updateThinkingAgent(agentID string) {
@@ -1582,6 +2944,7 @@ func (m *Model) startSlotThinkingAnimation(now time.Time, slot *streamSlot) {
 	slot.thinkingStart = now
 	slot.retryText = ""
 	slot.lastProgressSet = time.Time{}
+	slot.deferCompletion = false
 }
 
 func (m *Model) streamSlot(correlationID string) *streamSlot {
@@ -1820,6 +3183,87 @@ func (m *Model) finalizeSlotStream(slot *streamSlot) {
 		m.planID = slot.planID
 	}
 	m.history.mu.Unlock()
+}
+
+func (m *Model) finalizeCompletedStreamSlot(correlationID string, slot *streamSlot, success bool, errorMsg string) {
+	if slot == nil || slot.accumulator == nil {
+		return
+	}
+	m.viewport.RemoveStreamState(slot.accumulator.EntryIndex())
+	m.resolveSlotThinkingEntry(slot)
+	m.finalizeSlotToolCalls(slot, success, errorMsg)
+	slot.accumulator.Complete()
+	slot.deferCompletion = false
+	m.finalizeSlotStream(slot)
+	delete(m.streams, correlationID)
+	if len(m.streams) == 0 {
+		m.streamRenderPending = false
+	}
+}
+
+func (m *Model) finalizeSlotToolCalls(slot *streamSlot, success bool, errorMsg string) {
+	if slot == nil || slot.accumulator == nil {
+		return
+	}
+	idx := slot.accumulator.EntryIndex()
+	doneAt := time.Now()
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		finalizeToolCallsSynthetic(e.ToolCalls, doneAt, success, errorMsg)
+		invalidateChatEntryRender(e)
+	})
+}
+
+func finalizeToolCallsSynthetic(calls []ToolCallRecord, doneAt time.Time, success bool, errorMsg string) {
+	for i := range calls {
+		finalizeToolCallRecordSynthetic(&calls[i], doneAt, success, errorMsg)
+	}
+}
+
+func finalizeNestedStreamToolCallsOnTerminal(calls []ToolCallRecord, doneAt time.Time, success bool, errorMsg string) {
+	for i := range calls {
+		if allowNestedToolCompletionAfterStreamTerminal(calls[i]) {
+			continue
+		}
+		finalizeToolCallRecordSynthetic(&calls[i], doneAt, success, errorMsg)
+	}
+}
+
+func allowNestedToolCompletionAfterStreamTerminal(record ToolCallRecord) bool {
+	switch strings.TrimSpace(record.ToolName) {
+	case "web_search":
+		return !record.Completed
+	default:
+		return false
+	}
+}
+
+func finalizeToolCallRecordSynthetic(record *ToolCallRecord, doneAt time.Time, success bool, errorMsg string) {
+	if record == nil || record.Completed {
+		return
+	}
+	record.Duration = syntheticToolCallDuration(record.StartedAt, doneAt)
+	record.Success = success
+	record.Completed = true
+	record.SyntheticCompletion = true
+	if !success && strings.TrimSpace(record.ErrorMsg) == "" {
+		record.ErrorMsg = strings.TrimSpace(errorMsg)
+	}
+	if record.InterAgent != nil {
+		if record.InterAgent.Status == InterAgentToolPending {
+			if success {
+				record.InterAgent.Status = InterAgentToolDone
+			} else {
+				record.InterAgent.Status = InterAgentToolFailed
+			}
+		}
+	}
+}
+
+func syntheticToolCallDuration(startedAt, doneAt time.Time) time.Duration {
+	if startedAt.IsZero() || doneAt.Before(startedAt) {
+		return 0
+	}
+	return doneAt.Sub(startedAt)
 }
 
 // adjustStreamSlotIndices decrements all stream slot indices after a history

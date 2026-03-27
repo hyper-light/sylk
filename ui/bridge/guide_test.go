@@ -1,12 +1,16 @@
 package bridge
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/commandapproval"
+	"github.com/adalundhe/sylk/core/fetch"
 	"github.com/adalundhe/sylk/core/providers"
 	uimsg "github.com/adalundhe/sylk/ui/msg"
 )
@@ -56,6 +60,7 @@ func TestGuideBridgeDispatch_ForwardsCommandApprovalProposal(t *testing.T) {
 	b.dispatch(&guide.Message{
 		CorrelationID: "approval-1",
 		Type:          guide.MessageTypeProposal,
+		SourceAgentID: "guardian",
 		Payload:       proposal,
 	}, program)
 
@@ -68,6 +73,387 @@ func TestGuideBridgeDispatch_ForwardsCommandApprovalProposal(t *testing.T) {
 	}
 	if request.Proposal == nil || request.Proposal.Command != proposal.Command {
 		t.Fatalf("expected proposal command %q, got %#v", proposal.Command, request.Proposal)
+	}
+}
+
+func TestGuideBridgeDispatch_ForwardsFetchApprovalProposal(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatch(&guide.Message{
+		CorrelationID: "approval-fetch-1",
+		Type:          guide.MessageTypeProposal,
+		SourceAgentID: "guardian",
+		Timestamp:     time.Now(),
+		Payload: &fetch.FetchProposal{
+			URL:            "https://web.dev/articles/lcp",
+			Domain:         "web.dev",
+			ToolName:       "web_fetch",
+			SourceAgent:    "academic",
+			Reason:         "verify the official performance guidance",
+			RiskAssessment: "external content requires explicit approval",
+		},
+	}, program)
+
+	if len(program.messages) != 1 {
+		t.Fatalf("expected 1 forwarded message, got %d", len(program.messages))
+	}
+	request, ok := program.messages[0].(uimsg.CommandApprovalRequestMsg)
+	if !ok {
+		t.Fatalf("expected CommandApprovalRequestMsg, got %T", program.messages[0])
+	}
+	if request.Proposal == nil {
+		t.Fatal("expected fetch proposal")
+	}
+	if request.Proposal.TargetAgentID != "guardian" {
+		t.Fatalf("target agent id = %q, want guardian", request.Proposal.TargetAgentID)
+	}
+	if request.Proposal.CorrelationID != "approval-fetch-1" {
+		t.Fatalf("correlation id = %q, want approval-fetch-1", request.Proposal.CorrelationID)
+	}
+	if request.Proposal.AgentType != "academic" {
+		t.Fatalf("agent type = %q, want academic", request.Proposal.AgentType)
+	}
+	if request.Proposal.Command != "https://web.dev/articles/lcp" {
+		t.Fatalf("command = %q, want fetch url", request.Proposal.Command)
+	}
+	if request.Proposal.ToolName != "web_fetch" {
+		t.Fatalf("tool name = %q, want web_fetch", request.Proposal.ToolName)
+	}
+	if !request.Proposal.IsFetchApproval() {
+		t.Fatalf("expected fetch approval proposal, got %#v", request.Proposal)
+	}
+}
+
+func TestGuideBridgeDispatch_ForwardsFetchApprovalMapPayload(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatch(&guide.Message{
+		CorrelationID: "approval-fetch-map",
+		Type:          guide.MessageTypeProposal,
+		SourceAgentID: "guardian",
+		Payload: map[string]any{
+			"url":             "https://docs.python.org/3/library/pathlib.html",
+			"domain":          "docs.python.org",
+			"source_agent":    "tester",
+			"reason":          "confirm the documented pathlib behavior",
+			"risk_assessment": "external content requires approval",
+		},
+	}, program)
+
+	if len(program.messages) != 1 {
+		t.Fatalf("expected 1 forwarded message, got %d", len(program.messages))
+	}
+	request, ok := program.messages[0].(uimsg.CommandApprovalRequestMsg)
+	if !ok {
+		t.Fatalf("expected CommandApprovalRequestMsg, got %T", program.messages[0])
+	}
+	if request.Proposal == nil {
+		t.Fatal("expected fetch proposal")
+	}
+	if request.Proposal.ToolName != "web_fetch" {
+		t.Fatalf("tool name = %q, want default web_fetch", request.Proposal.ToolName)
+	}
+	if request.Proposal.Command != "https://docs.python.org/3/library/pathlib.html" {
+		t.Fatalf("command = %q, want fetch url", request.Proposal.Command)
+	}
+	if request.Proposal.TargetAgentID != "guardian" {
+		t.Fatalf("target agent id = %q, want guardian", request.Proposal.TargetAgentID)
+	}
+	if request.Proposal.AgentType != "tester" {
+		t.Fatalf("agent type = %q, want tester", request.Proposal.AgentType)
+	}
+	if !request.Proposal.IsFetchApproval() {
+		t.Fatalf("expected fetch approval proposal, got %#v", request.Proposal)
+	}
+}
+
+func TestGuideBridgePriorityQueue_ApprovalProposalSurvivesStreamFlood(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+
+	for i := 0; i < cap(b.buffer); i++ {
+		if err := b.onMessage(&guide.Message{
+			ID:            fmt.Sprintf("stream-%d", i),
+			CorrelationID: fmt.Sprintf("corr-stream-%d", i),
+			Type:          guide.MessageTypeStream,
+			Payload: &guide.StreamResponse{
+				CorrelationID: fmt.Sprintf("corr-stream-%d", i),
+				Event: &guide.StreamEvent{
+					Type: guide.StreamEventProgress,
+					Text: "busy",
+				},
+			},
+		}); err != nil {
+			t.Fatalf("enqueue stream flood event %d: %v", i, err)
+		}
+	}
+
+	proposal := &commandapproval.Proposal{
+		CorrelationID: "approval-1",
+		Command:       "curl https://example.com",
+	}
+	if err := b.onMessage(&guide.Message{
+		CorrelationID: proposal.CorrelationID,
+		Type:          guide.MessageTypeProposal,
+		Payload:       proposal,
+	}); err != nil {
+		t.Fatalf("enqueue approval proposal: %v", err)
+	}
+
+	got, ok := b.nextMessage(context.Background())
+	if !ok {
+		t.Fatal("expected queued approval proposal")
+	}
+	if got == nil || got.Type != guide.MessageTypeProposal {
+		t.Fatalf("first dequeued message = %#v, want approval proposal", got)
+	}
+}
+
+func TestGuideBridgePriorityQueue_StreamCompleteSurvivesStreamFlood(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+
+	for i := 0; i < cap(b.buffer); i++ {
+		if err := b.onMessage(&guide.Message{
+			ID:            fmt.Sprintf("data-%d", i),
+			CorrelationID: fmt.Sprintf("corr-data-%d", i),
+			Type:          guide.MessageTypeStream,
+			Payload: &guide.StreamResponse{
+				CorrelationID: fmt.Sprintf("corr-data-%d", i),
+				Event: &guide.StreamEvent{
+					Type: guide.StreamEventData,
+					Text: "chunk",
+				},
+			},
+		}); err != nil {
+			t.Fatalf("enqueue stream data %d: %v", i, err)
+		}
+	}
+
+	if err := b.onMessage(&guide.Message{
+		CorrelationID: "corr-terminal",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID: "corr-terminal",
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventComplete,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("enqueue stream complete: %v", err)
+	}
+
+	got, ok := b.nextMessage(context.Background())
+	if !ok {
+		t.Fatal("expected queued terminal event")
+	}
+	stream, streamOK := got.GetStreamResponse()
+	if !streamOK || stream == nil || stream.Event == nil || stream.Event.Type != guide.StreamEventComplete {
+		t.Fatalf("first dequeued message = %#v, want stream complete", got)
+	}
+}
+
+func TestGuideBridgePriorityQueue_InterAgentToolCallSurvivesStreamFlood(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+
+	for i := 0; i < cap(b.buffer); i++ {
+		if err := b.onMessage(&guide.Message{
+			ID:            fmt.Sprintf("progress-%d", i),
+			CorrelationID: fmt.Sprintf("corr-progress-%d", i),
+			Type:          guide.MessageTypeStream,
+			Payload: &guide.StreamResponse{
+				CorrelationID: fmt.Sprintf("corr-progress-%d", i),
+				Event: &guide.StreamEvent{
+					Type: guide.StreamEventProgress,
+					Data: &guide.ProgressData{Message: "busy"},
+				},
+			},
+		}); err != nil {
+			t.Fatalf("enqueue stream progress %d: %v", i, err)
+		}
+	}
+
+	if err := b.onMessage(&guide.Message{
+		CorrelationID: "corr-inter-agent-tool",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID: "corr-inter-agent-tool",
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventToolCall,
+				Data: map[string]any{
+					"tool_call_key": "consult-lib-1",
+					"tool_name":     "consult_librarian",
+					"phase":         0,
+					"inter_agent": map[string]any{
+						"kind":        "consult",
+						"agent_types": []string{"librarian"},
+						"status":      "pending",
+					},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("enqueue inter-agent tool call: %v", err)
+	}
+
+	got, ok := b.nextMessage(context.Background())
+	if !ok {
+		t.Fatal("expected queued inter-agent tool call")
+	}
+	stream, streamOK := got.GetStreamResponse()
+	if !streamOK || stream == nil || stream.Event == nil || stream.Event.Type != guide.StreamEventToolCall {
+		t.Fatalf("first dequeued message = %#v, want inter-agent tool call", got)
+	}
+}
+
+func TestGuideBridgePriorityQueue_GenericToolCallSurvivesStreamFlood(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+
+	for i := 0; i < cap(b.buffer); i++ {
+		if err := b.onMessage(&guide.Message{
+			ID:            fmt.Sprintf("progress-generic-%d", i),
+			CorrelationID: fmt.Sprintf("corr-progress-generic-%d", i),
+			Type:          guide.MessageTypeStream,
+			Payload: &guide.StreamResponse{
+				CorrelationID: fmt.Sprintf("corr-progress-generic-%d", i),
+				Event: &guide.StreamEvent{
+					Type: guide.StreamEventProgress,
+					Data: &guide.ProgressData{Message: "busy"},
+				},
+			},
+		}); err != nil {
+			t.Fatalf("enqueue stream progress %d: %v", i, err)
+		}
+	}
+
+	if err := b.onMessage(&guide.Message{
+		CorrelationID: "corr-generic-tool",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID: "corr-generic-tool",
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventToolCall,
+				Data: map[string]any{
+					"tool_call_key": "read-1",
+					"tool_name":     "read_file",
+					"phase":         0,
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("enqueue generic tool call: %v", err)
+	}
+
+	got, ok := b.nextMessage(context.Background())
+	if !ok {
+		t.Fatal("expected queued generic tool call")
+	}
+	stream, streamOK := got.GetStreamResponse()
+	if !streamOK || stream == nil || stream.Event == nil || stream.Event.Type != guide.StreamEventToolCall {
+		t.Fatalf("first dequeued message = %#v, want generic tool call", got)
+	}
+}
+
+func TestGuideBridgePriorityQueue_ApprovalToolCallSurvivesStreamFlood(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+
+	for i := 0; i < cap(b.buffer); i++ {
+		if err := b.onMessage(&guide.Message{
+			ID:            fmt.Sprintf("progress-approval-%d", i),
+			CorrelationID: fmt.Sprintf("corr-progress-approval-%d", i),
+			Type:          guide.MessageTypeStream,
+			Payload: &guide.StreamResponse{
+				CorrelationID: fmt.Sprintf("corr-progress-approval-%d", i),
+				Event: &guide.StreamEvent{
+					Type: guide.StreamEventProgress,
+					Data: &guide.ProgressData{Message: "busy"},
+				},
+			},
+		}); err != nil {
+			t.Fatalf("enqueue stream progress %d: %v", i, err)
+		}
+	}
+
+	if err := b.onMessage(&guide.Message{
+		CorrelationID: "corr-inter-agent-approval-tool",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID: "corr-inter-agent-approval-tool",
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventToolCall,
+				Data: map[string]any{
+					"tool_call_key": "approval-guardian-1",
+					"tool_name":     "approval_guardian",
+					"phase":         0,
+					"inter_agent": map[string]any{
+						"kind":        "approval",
+						"agent_types": []string{"guardian"},
+						"status":      "pending",
+					},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("enqueue inter-agent approval tool call: %v", err)
+	}
+
+	got, ok := b.nextMessage(context.Background())
+	if !ok {
+		t.Fatal("expected queued inter-agent approval tool call")
+	}
+	stream, streamOK := got.GetStreamResponse()
+	if !streamOK || stream == nil || stream.Event == nil || stream.Event.Type != guide.StreamEventToolCall {
+		t.Fatalf("first dequeued message = %#v, want inter-agent approval tool call", got)
+	}
+}
+
+func TestGuideBridgePriorityQueue_NestedBranchProgressSurvivesStreamFlood(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+
+	for i := 0; i < cap(b.buffer); i++ {
+		if err := b.onMessage(&guide.Message{
+			ID:            fmt.Sprintf("data-%d", i),
+			CorrelationID: fmt.Sprintf("corr-data-%d", i),
+			Type:          guide.MessageTypeStream,
+			Payload: &guide.StreamResponse{
+				CorrelationID: fmt.Sprintf("corr-data-%d", i),
+				Event: &guide.StreamEvent{
+					Type: guide.StreamEventData,
+					Text: "chunk",
+				},
+			},
+		}); err != nil {
+			t.Fatalf("enqueue stream data %d: %v", i, err)
+		}
+	}
+
+	if err := b.onMessage(&guide.Message{
+		CorrelationID: "corr-nested-progress",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID: "corr-nested-progress",
+			Metadata: map[string]any{
+				"chat_nested_branch":         true,
+				"chat_parent_correlation_id": "corr-academic",
+				"chat_parent_tool_call_key":  "consult-1",
+				"chat_inter_agent_kind":      "consult",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Searching project history."},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("enqueue nested branch progress: %v", err)
+	}
+
+	got, ok := b.nextMessage(context.Background())
+	if !ok {
+		t.Fatal("expected queued nested branch progress")
+	}
+	stream, streamOK := got.GetStreamResponse()
+	if !streamOK || stream == nil || stream.Event == nil || stream.Event.Type != guide.StreamEventProgress {
+		t.Fatalf("first dequeued message = %#v, want nested branch progress", got)
 	}
 }
 
@@ -119,7 +505,7 @@ func TestToGuideMsg_HumanizesStructuredPayload(t *testing.T) {
 		},
 	}
 
-	msg := toGuideMsg(resp)
+	msg := toGuideMsg(resp, nil)
 	if msg.Content == "" {
 		t.Fatal("expected non-empty content for structured payload")
 	}
@@ -159,7 +545,7 @@ func TestToGuideMsg_HumanizesArchitectPlanEnvelope(t *testing.T) {
 		},
 	}
 
-	msg := toGuideMsg(resp)
+	msg := toGuideMsg(resp, nil)
 	if !strings.Contains(msg.Content, "I drafted a concrete plan for oauth.") {
 		t.Fatalf("expected architect summary, got %q", msg.Content)
 	}
@@ -191,7 +577,7 @@ func TestToGuideMsg_HumanizesArchitectClarificationEnvelope(t *testing.T) {
 		},
 	}
 
-	msg := toGuideMsg(resp)
+	msg := toGuideMsg(resp, nil)
 	if msg.Content != "I recommend starting with Google and Entra for phase 1 enterprise SSO." {
 		t.Fatalf("expected explicit user response, got %q", msg.Content)
 	}
@@ -209,7 +595,7 @@ func TestToGuideMsg_HumanizesAgentRegistryPayload(t *testing.T) {
 		},
 	}
 
-	msg := toGuideMsg(resp)
+	msg := toGuideMsg(resp, nil)
 	if msg.Content != "Registered agents (2): architect, guide" {
 		t.Fatalf("content = %q", msg.Content)
 	}
@@ -226,9 +612,87 @@ func TestToGuideMsg_HumanizesPendingPayload(t *testing.T) {
 		},
 	}
 
-	msg := toGuideMsg(resp)
+	msg := toGuideMsg(resp, nil)
 	if msg.Content != "Guide pending requests: 3." {
 		t.Fatalf("content = %q", msg.Content)
+	}
+}
+
+func TestToGuideMsg_PreservesInterAgentBranchMetadata(t *testing.T) {
+	resp := &guide.RouteResponse{
+		CorrelationID:       "corr-nested",
+		RespondingAgentID:   "librarian",
+		RespondingAgentName: "Librarian",
+		Success:             true,
+		Data:                "Found a prior pattern.",
+	}
+
+	msg := toGuideMsg(resp, map[string]any{
+		"agent_type":                  "librarian",
+		"chat_nested_branch":          true,
+		"chat_parent_correlation_id":  "corr-parent",
+		"chat_parent_tool_call_key":   "consult-1",
+		"chat_inter_agent_kind":       "consult",
+		"chat_inter_agent_thread_key": "",
+	})
+	if msg.AgentType != "librarian" {
+		t.Fatalf("AgentType = %q, want librarian", msg.AgentType)
+	}
+	if msg.BranchRef == nil {
+		t.Fatal("expected branch metadata to be preserved on guide response")
+	}
+	if msg.BranchRef.ParentCorrelationID != "corr-parent" || msg.BranchRef.ParentToolCallKey != "consult-1" {
+		t.Fatalf("unexpected branch ref: %+v", msg.BranchRef)
+	}
+}
+
+func TestParseInterAgentBranchRefFromMetadata_AcceptsStringifiedNestedFlag(t *testing.T) {
+	ref := parseInterAgentBranchRefFromMetadata(map[string]any{
+		"chat_nested_branch":          "true",
+		"chat_parent_correlation_id":  "corr-parent",
+		"chat_parent_tool_call_key":   "",
+		"chat_inter_agent_kind":       "consult",
+		"chat_inter_agent_thread_key": "thread-1",
+	})
+	if ref == nil {
+		t.Fatal("expected stringified nested flag to parse into a branch ref")
+	}
+	if ref.ParentCorrelationID != "corr-parent" {
+		t.Fatalf("parent correlation id = %q, want corr-parent", ref.ParentCorrelationID)
+	}
+	if ref.ThreadKey != "thread-1" {
+		t.Fatalf("thread key = %q, want thread-1", ref.ThreadKey)
+	}
+	if ref.Kind != "consult" {
+		t.Fatalf("kind = %q, want consult", ref.Kind)
+	}
+}
+
+func TestToGuideMsg_PreservesApprovalBranchMetadata(t *testing.T) {
+	resp := &guide.RouteResponse{
+		CorrelationID:       "corr-approval",
+		RespondingAgentID:   "guardian",
+		RespondingAgentName: "Guardian",
+		Success:             true,
+		Data:                map[string]any{"approved": true},
+	}
+
+	msg := toGuideMsg(resp, map[string]any{
+		"agent_type":                  "guardian",
+		"chat_nested_branch":          true,
+		"chat_parent_correlation_id":  "corr-parent",
+		"chat_parent_tool_call_key":   "approval-1",
+		"chat_inter_agent_kind":       "approval",
+		"chat_inter_agent_thread_key": "",
+	})
+	if msg.BranchRef == nil {
+		t.Fatal("expected approval branch metadata to be preserved on guide response")
+	}
+	if msg.BranchRef.Kind != "approval" {
+		t.Fatalf("branch kind = %q, want approval", msg.BranchRef.Kind)
+	}
+	if msg.BranchRef.ParentCorrelationID != "corr-parent" || msg.BranchRef.ParentToolCallKey != "approval-1" {
+		t.Fatalf("unexpected branch ref: %+v", msg.BranchRef)
 	}
 }
 
@@ -250,7 +714,7 @@ func TestToGuideMsg_HumanizesTesterStagePayload(t *testing.T) {
 		},
 	}
 
-	msg := toGuideMsg(resp)
+	msg := toGuideMsg(resp, nil)
 	if !strings.Contains(msg.Content, "Created test artifacts: tests/test_cli.py.") {
 		t.Fatalf("expected created files summary, got %q", msg.Content)
 	}
@@ -309,7 +773,7 @@ func TestToGuideMsg_HumanizesInspectorStagePayload(t *testing.T) {
 		},
 	}
 
-	msg := toGuideMsg(resp)
+	msg := toGuideMsg(resp, nil)
 	if strings.Contains(msg.Content, "\"success_criteria\"") || strings.Contains(msg.Content, "\"quality_gates\"") {
 		t.Fatalf("expected humanized inspector payload, got raw JSON %q", msg.Content)
 	}
@@ -356,6 +820,47 @@ func TestGuideBridgeDispatchStream_CompleteEmitsChunkFromStructuredPayload(t *te
 	}
 	if !strings.Contains(complete.AuthoritativeText, "I drafted a concrete plan for oauth.") {
 		t.Fatalf("expected authoritative text with plan summary, got %q", complete.AuthoritativeText)
+	}
+}
+
+func TestParseStreamMessages_PreferMetadataAgentName(t *testing.T) {
+	stream := &guide.StreamResponse{
+		CorrelationID:     "corr-pipeline-agent-name",
+		RespondingAgentID: "8a7d3b2c",
+		Metadata: map[string]any{
+			"agent_name":  "Pipeline Inspector",
+			"agent_type":  "inspector-pipeline",
+			"pipeline_id": "task_auth_checkout",
+			"task_id":     "task_auth_checkout",
+		},
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventProgress,
+			Data: &guide.ProgressData{Message: "Inspecting criteria."},
+		},
+	}
+
+	start := parseStreamStartMsg("session-1", "corr-pipeline-agent-name", stream)
+	if start.AgentName != "Pipeline Inspector" {
+		t.Fatalf("start.AgentName = %q, want Pipeline Inspector", start.AgentName)
+	}
+	if start.AgentType != "inspector-pipeline" {
+		t.Fatalf("start.AgentType = %q, want inspector-pipeline", start.AgentType)
+	}
+
+	progress := toStreamProgressMsg("session-1", "corr-pipeline-agent-name", stream)
+	if progress.AgentName != "Pipeline Inspector" {
+		t.Fatalf("progress.AgentName = %q, want Pipeline Inspector", progress.AgentName)
+	}
+	if progress.AgentType != "inspector-pipeline" {
+		t.Fatalf("progress.AgentType = %q, want inspector-pipeline", progress.AgentType)
+	}
+
+	complete := parseStreamCompleteMsg("session-1", "corr-pipeline-agent-name", stream)
+	if complete.AgentName != "Pipeline Inspector" {
+		t.Fatalf("complete.AgentName = %q, want Pipeline Inspector", complete.AgentName)
+	}
+	if complete.AgentType != "inspector-pipeline" {
+		t.Fatalf("complete.AgentType = %q, want inspector-pipeline", complete.AgentType)
 	}
 }
 
@@ -631,5 +1136,20 @@ func TestFormatConversationResult_MissingIntent(t *testing.T) {
 	_, ok := formatConversationResult(payload)
 	if ok {
 		t.Fatal("expected formatConversationResult to return false when intent is missing")
+	}
+}
+
+func TestFormatAnswerPayload_ContentField(t *testing.T) {
+	payload := map[string]any{
+		"type":    "recall",
+		"content": "Use a Go API with a thin React frontend.",
+	}
+
+	text, ok := formatAnswerPayload(payload)
+	if !ok {
+		t.Fatal("expected formatAnswerPayload to succeed for content field")
+	}
+	if text != "Use a Go API with a thin React frontend." {
+		t.Fatalf("text = %q", text)
 	}
 }

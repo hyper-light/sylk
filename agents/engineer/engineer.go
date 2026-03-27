@@ -84,7 +84,7 @@ type Engineer struct {
 
 	// Synchronous consultation bus
 	pendingMu       sync.Mutex
-	pendingConsults map[string]chan *guide.Message
+	pendingConsults map[string]*shared.PendingSyncWait
 
 	// Handoff bridge
 	handoffBridge *handoff.HandoffBridge
@@ -170,7 +170,7 @@ func New(cfg Config, provider engineerProvider) (*Engineer, error) {
 		activityPub:     cfg.ActivityPub,
 		knownAgents:     make(map[string]*guide.AgentAnnouncement),
 		failures:        make(map[string]*FailureRecord),
-		pendingConsults: make(map[string]chan *guide.Message),
+		pendingConsults: make(map[string]*shared.PendingSyncWait),
 		refactorConfig:  shared.DefaultRefactorLoopConfig(),
 		state: &EngineerState{
 			ID:        engineerID,
@@ -555,8 +555,7 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		value, _ := fwd.Metadata[key].(string)
 		return strings.TrimSpace(value)
 	}
-	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
-	ctx = shared.WithStreamContextMetadata(ctx, map[string]any{
+	ctx := shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, shared.MergeStreamMetadata(fwd.Metadata, map[string]any{
 		"pipeline_task": true,
 		"agent_type":    "engineer",
 		"agent_name":    "Engineer",
@@ -566,7 +565,7 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		"task_name":     metaString("task_name"),
 		"dag_id":        metaString("dag_id"),
 		"node_id":       metaString("node_id"),
-	})
+	}))
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/search/codebase"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 // ---------------------------------------------------------------------------
@@ -43,11 +43,12 @@ func readFileSkill(l *Librarian) *skills.Skill {
 			if strings.TrimSpace(params.Path) == "" {
 				return nil, fmt.Errorf("path is required")
 			}
-			content, err := os.ReadFile(resolvePath(l.config.WorkingDirectory, params.Path))
+			fa := versioning.NewDiskFileAccess(l.config.WorkingDirectory, true)
+			result, err := versioning.ReadFileToolResult(ctx, fa, params.Path, params.Offset, params.Limit)
 			if err != nil {
 				return nil, err
 			}
-			return sliceFileContent(params.Path, string(content), params.Offset, params.Limit), nil
+			return result, nil
 		}).
 		Build()
 }

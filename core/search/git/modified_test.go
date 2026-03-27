@@ -30,8 +30,7 @@ func setupModifiedTestRepo(t *testing.T) (string, func()) {
 
 	// Initialize git repo
 	runGitCmd(t, tmpDir, "init")
-	runGitCmd(t, tmpDir, "config", "user.email", "test@example.com")
-	runGitCmd(t, tmpDir, "config", "user.name", "Test User")
+	configureGitTestRepo(t, tmpDir, runGitCmd)
 
 	return tmpDir, cleanup
 }

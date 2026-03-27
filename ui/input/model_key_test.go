@@ -41,6 +41,48 @@ func TestActionSelUpAtTopRowSelectsToLineStart(t *testing.T) {
 	}
 }
 
+func TestActionSelDownOnSingleLineSelectsToLineEnd(t *testing.T) {
+	m := New(theme.DefaultDark(), 8)
+	m.SetSize(40, 4)
+	m.SetText("hello")
+	m.ClickAt(2, 0)
+
+	if cmd := actionSelDown(m); cmd != nil {
+		t.Fatalf("unexpected command for shift+down selection action: %v", cmd)
+	}
+
+	if m.cursorRow != 0 || m.cursorCol != 5 {
+		t.Fatalf("cursor = (%d,%d), want (0,5)", m.cursorRow, m.cursorCol)
+	}
+	if !m.HasSelection() {
+		t.Fatal("expected selection to be active")
+	}
+	if got := m.SelectedText(); got != "llo" {
+		t.Fatalf("SelectedText() = %q, want %q", got, "llo")
+	}
+}
+
+func TestActionSelDownOnLastLineSelectsToLineEnd(t *testing.T) {
+	m := New(theme.DefaultDark(), 8)
+	m.SetSize(40, 4)
+	m.SetText("hello\nworld")
+	m.ClickAt(2, 1)
+
+	if cmd := actionSelDown(m); cmd != nil {
+		t.Fatalf("unexpected command for shift+down selection action: %v", cmd)
+	}
+
+	if m.cursorRow != 1 || m.cursorCol != 5 {
+		t.Fatalf("cursor = (%d,%d), want (1,5)", m.cursorRow, m.cursorCol)
+	}
+	if !m.HasSelection() {
+		t.Fatal("expected selection to be active")
+	}
+	if got := m.SelectedText(); got != "rld" {
+		t.Fatalf("SelectedText() = %q, want %q", got, "rld")
+	}
+}
+
 func TestExtendSelectionToStartsSelectionFromCurrentCursor(t *testing.T) {
 	m := New(theme.DefaultDark(), 8)
 	m.SetSize(40, 4)

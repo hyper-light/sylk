@@ -54,6 +54,10 @@ type AnthropicProvider struct {
 	authService oauth.AnthropicAuthService
 }
 
+func (p *AnthropicProvider) SupportsNativeWebSearchEvidence() bool {
+	return p != nil
+}
+
 type AnthropicModel string
 
 const (
@@ -267,6 +271,9 @@ func buildAnthropicClientOptions(config AnthropicConfig) []option.RequestOption 
 	}
 	if config.BaseURL != "" {
 		opts = append(opts, option.WithBaseURL(config.BaseURL))
+	}
+	if config.HTTPClient != nil {
+		opts = append(opts, option.WithHTTPClient(config.HTTPClient))
 	}
 	betaOpts := []string{
 		string(anthropic.AnthropicBetaInterleavedThinking2025_05_14),
@@ -1175,6 +1182,7 @@ func (p *AnthropicProvider) convertResponse(msg *anthropic.Message) *Response {
 	var content string
 	var thinking strings.Builder
 	var toolCalls []ToolCall
+	var nativeSearchCalls []NativeWebSearchCall
 
 	for _, block := range msg.Content {
 		switch b := block.AsAny().(type) {
@@ -1189,12 +1197,19 @@ func (p *AnthropicProvider) convertResponse(msg *anthropic.Message) *Response {
 				Name:      p.inboundAnthropicToolName(b.Name),
 				Arguments: string(args),
 			})
+		case anthropic.ServerToolUseBlock:
+			if native := anthropicServerToolUseToNativeWebSearch(b); native != nil {
+				nativeSearchCalls = append(nativeSearchCalls, *native)
+			}
 		}
 	}
 
 	meta := map[string]any{"id": msg.ID}
 	if raw := extractAnthropicRawContent(msg, p.inboundAnthropicToolName); len(raw) > 0 {
 		meta[anthropicRawContentKey] = raw
+	}
+	if len(nativeSearchCalls) > 0 {
+		meta[ProviderMetadataNativeWebSearchCallsKey] = nativeSearchCalls
 	}
 
 	return &Response{
@@ -1268,6 +1283,23 @@ func (p *AnthropicProvider) convertStreamEvent(event anthropic.MessageStreamEven
 				Timestamp: time.Now(),
 			}
 		}
+		if ev.ContentBlock.Type == "server_tool_use" {
+			tb := ev.ContentBlock.AsAny().(anthropic.ServerToolUseBlock)
+			if native := anthropicServerToolUseToNativeWebSearch(tb); native != nil {
+				toolCallIDForIndex[ev.Index] = tb.ID
+				return &StreamChunk{
+					Index: index,
+					Type:  ChunkTypeToolStart,
+					ToolCall: &ToolCallChunk{
+						ID:             tb.ID,
+						Name:           "web_search",
+						Kind:           ToolKindNativeWebSearch,
+						ArgumentsDelta: native.ArgumentsJSON(),
+					},
+					Timestamp: time.Now(),
+				}
+			}
+		}
 
 	case anthropic.ContentBlockStopEvent:
 		toolID := toolCallIDForIndex[ev.Index]
@@ -1285,6 +1317,38 @@ func (p *AnthropicProvider) convertStreamEvent(event anthropic.MessageStreamEven
 	}
 
 	return nil
+}
+
+func anthropicServerToolUseToNativeWebSearch(block anthropic.ServerToolUseBlock) *NativeWebSearchCall {
+	if string(block.Name) != "web_search" {
+		return nil
+	}
+	call := &NativeWebSearchCall{
+		ID:       block.ID,
+		Provider: "anthropic",
+		Action:   "search",
+	}
+	switch input := block.Input.(type) {
+	case map[string]any:
+		if query, ok := input["query"].(string); ok {
+			call.Query = strings.TrimSpace(query)
+		}
+	case []byte:
+		var decoded map[string]any
+		if err := json.Unmarshal(input, &decoded); err == nil {
+			if query, ok := decoded["query"].(string); ok {
+				call.Query = strings.TrimSpace(query)
+			}
+		}
+	case string:
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(input), &decoded); err == nil {
+			if query, ok := decoded["query"].(string); ok {
+				call.Query = strings.TrimSpace(query)
+			}
+		}
+	}
+	return call
 }
 
 // anthropicRawContentKey is the ProviderMetadata key for serialized content

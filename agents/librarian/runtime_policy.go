@@ -1,16 +1,18 @@
 package librarian
 
 import (
+	"strings"
+
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
-func (l *Librarian) applyConversationRuntimeProfile(req *providers.Request) {
+func (l *Librarian) applyConversationRuntimeProfile(req *providers.Request, sessionID string) {
 	llmruntime.ApplyStage(req, l.conversationStageProfile(), llmruntime.ApplyOptions{
 		Model:     librarianRuntimeModel(req, l.CurrentModel()),
 		MaxTokens: req.MaxTokens,
-		AgentID:   "librarian",
-		SessionID: l.config.SessionID,
+		AgentID:   strings.TrimSpace(l.id),
+		SessionID: librarianRuntimeSessionID(req, sessionID, l.config.SessionID),
 	})
 }
 
@@ -31,4 +33,16 @@ func librarianRuntimeModel(req *providers.Request, fallback string) string {
 		return req.Model
 	}
 	return fallback
+}
+
+func librarianRuntimeSessionID(req *providers.Request, sessionID, fallback string) string {
+	if trimmed := strings.TrimSpace(sessionID); trimmed != "" {
+		return trimmed
+	}
+	if req != nil && req.Metadata != nil {
+		if trimmed, _ := req.Metadata["session_id"].(string); strings.TrimSpace(trimmed) != "" {
+			return strings.TrimSpace(trimmed)
+		}
+	}
+	return strings.TrimSpace(fallback)
 }

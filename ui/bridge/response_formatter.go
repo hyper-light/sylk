@@ -418,11 +418,13 @@ func formatAnswerPayload(payload any) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	answer := strings.TrimSpace(stringFromKey(values, "answer"))
-	if answer == "" {
-		return "", false
+	for _, key := range []string{"answer", "content"} {
+		answer := strings.TrimSpace(stringFromKey(values, key))
+		if answer != "" {
+			return answer, true
+		}
 	}
-	return answer, true
+	return "", false
 }
 
 func formatTesterStagePayload(payload any) (string, bool) {

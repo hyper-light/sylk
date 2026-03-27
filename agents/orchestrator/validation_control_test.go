@@ -27,7 +27,7 @@ func TestHandleValidationVerdictForwardCreatesHoldAndRemediationCase(t *testing.
 		store:        store,
 		bus:          bus,
 		running:      true,
-		pendingBus:   make(map[string]chan *guide.Message),
+		pendingBus:   make(map[string]*agentshared.PendingSyncWait),
 		dispatchGate: newDispatchHoldGate(),
 		channels:     guide.NewAgentChannels("orchestrator", "orch-1234"),
 		knownAgents: map[string]*guide.AgentAnnouncement{
@@ -319,7 +319,7 @@ func TestHandlePlanHandoffReceiptResyncForwardPublishesUpdate(t *testing.T) {
 		store:      store,
 		bus:        bus,
 		running:    true,
-		pendingBus: make(map[string]chan *guide.Message),
+		pendingBus: make(map[string]*agentshared.PendingSyncWait),
 		channels:   guide.NewAgentChannels("orchestrator", "orch-1234"),
 	}
 

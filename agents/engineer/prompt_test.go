@@ -78,6 +78,20 @@ func TestDefaultEngineerSystemPrompt_UsesCurrentSkillNames(t *testing.T) {
 	}
 }
 
+func TestDefaultEngineerSystemPrompt_IncludesExactEditContract(t *testing.T) {
+	required := []string{
+		"`edit_pipeline_file`",
+		"`old_text`",
+		"`new_text`",
+		"use `write_pipeline_file` instead",
+	}
+	for _, want := range required {
+		if !strings.Contains(DefaultEngineerSystemPrompt, want) {
+			t.Fatalf("expected default engineer prompt to contain %q", want)
+		}
+	}
+}
+
 func TestEngineerSystemPromptForContract_OmitsStaticImplementationProtocol(t *testing.T) {
 	prompt := EngineerSystemPromptForContract(&shared.TaskExecutionContract{TaskID: "task_1"})
 	if strings.Contains(prompt, "# Engineer Agent — Implementation Guidance") {

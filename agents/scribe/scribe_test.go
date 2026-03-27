@@ -189,10 +189,10 @@ func TestScribe_Feed_ProcessesAndForwards(t *testing.T) {
 	}
 
 	s.Feed(shared.ScribeFeed{
-		UserRequest:   "build feature X",
-		AgentResponse: "built feature X",
-		CorrelationID: "corr-1",
-		Timestamp:     time.Now(),
+		UserRequest:         "build feature X",
+		AgentResponse:       "built feature X",
+		ParentCorrelationID: "corr-1",
+		Timestamp:           time.Now(),
 	})
 
 	// Wait for async feed processing.
@@ -212,9 +212,34 @@ func TestScribe_Feed_ProcessesAndForwards(t *testing.T) {
 		t.Fatalf("expected 1 bus publish, got %d", bus.publishCount())
 	}
 
-	expectedTopic := guide.TopicRequests("archivalist", "archivalist")
+	expectedTopic := guide.TopicGuideRequests
 	if got := bus.lastTopic(); got != expectedTopic {
 		t.Errorf("expected topic %q, got %q", expectedTopic, got)
+	}
+	req, ok := bus.published[len(bus.published)-1].GetRouteRequest()
+	if !ok || req == nil {
+		t.Fatalf("expected published guide route request, got %#v", bus.published[len(bus.published)-1])
+	}
+	if req.SourceAgentID != s.id {
+		t.Fatalf("source_agent_id = %q, want %q", req.SourceAgentID, s.id)
+	}
+	if !req.FireAndForget {
+		t.Fatal("expected fire-and-forget archivalist store route")
+	}
+	if req.CorrelationID == "corr-1" {
+		t.Fatal("scribe reused parent correlation for archivalist store request")
+	}
+	if req.ParentCorrelationID != "corr-1" {
+		t.Fatalf("parent_correlation_id = %q, want %q", req.ParentCorrelationID, "corr-1")
+	}
+	if !strings.HasPrefix(req.Input, "@archivalist:store:history") {
+		t.Fatalf("input = %q, want archivalist store DSL", req.Input)
+	}
+	if got, _ := req.Metadata["chat_nested_branch"].(bool); !got {
+		t.Fatalf("chat_nested_branch = %#v, want true", req.Metadata["chat_nested_branch"])
+	}
+	if got, _ := req.Metadata["chat_inter_agent_kind"].(string); got != shared.InterAgentToolEventKindStore {
+		t.Fatalf("chat_inter_agent_kind = %q, want %q", got, shared.InterAgentToolEventKindStore)
 	}
 
 	if err := s.Stop(); err != nil {
@@ -311,10 +336,10 @@ func TestScribe_Feed_DropsWhenBufferFull(t *testing.T) {
 	// Fill the buffer (feedBufferSize = 32).
 	for range feedBufferSize + 5 {
 		s.Feed(shared.ScribeFeed{
-			UserRequest:   "req",
-			AgentResponse: "resp",
-			CorrelationID: "c",
-			Timestamp:     time.Now(),
+			UserRequest:         "req",
+			AgentResponse:       "resp",
+			ParentCorrelationID: "c",
+			Timestamp:           time.Now(),
 		})
 	}
 

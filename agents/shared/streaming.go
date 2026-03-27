@@ -14,6 +14,14 @@ import (
 
 const streamedTextMetadataKey = "shared_streamed_text"
 
+const (
+	streamMetadataNestedBranch      = "chat_nested_branch"
+	streamMetadataParentCorrelation = "chat_parent_correlation_id"
+	streamMetadataParentToolCallKey = "chat_parent_tool_call_key"
+	streamMetadataInterAgentThread  = "chat_inter_agent_thread_key"
+	streamMetadataInterAgentKind    = "chat_inter_agent_kind"
+)
+
 // StreamContext carries streaming correlation data through context.
 type StreamContext struct {
 	CorrelationID string
@@ -21,10 +29,27 @@ type StreamContext struct {
 	Metadata      map[string]any
 }
 
+// InterAgentBranchMetadata identifies a nested child stream that belongs to
+// an inter-agent consult/challenge branch owned by a parent chat entry.
+type InterAgentBranchMetadata struct {
+	ParentCorrelationID string
+	ParentToolCallKey   string
+	ThreadKey           string
+	Kind                string
+}
+
 type streamContextKey struct{}
+type streamLifecycleKey struct{}
+
+type streamLifecycleState struct {
+	mu              sync.Mutex
+	terminalStarted bool
+	completed       bool
+}
 
 // WithStreamContext attaches streaming metadata to a context.
 func WithStreamContext(ctx context.Context, correlationID, sourceAgentID string) context.Context {
+	ctx = withStreamLifecycle(ctx)
 	return context.WithValue(ctx, streamContextKey{}, StreamContext{
 		CorrelationID: correlationID,
 		SourceAgentID: sourceAgentID,
@@ -49,6 +74,25 @@ func WithStreamContextMetadata(ctx context.Context, metadata map[string]any) con
 	return context.WithValue(ctx, streamContextKey{}, current)
 }
 
+// WithForwardedStreamContext attaches stream routing identity for a forwarded
+// request and merges parent-correlation metadata needed by the chat UI.
+func WithForwardedStreamContext(
+	ctx context.Context,
+	correlationID, sourceAgentID, parentCorrelationID string,
+	metadata map[string]any,
+) context.Context {
+	ctx = WithStreamContext(ctx, correlationID, sourceAgentID)
+	merged := cloneStreamMetadata(metadata)
+	parentCorrelationID = strings.TrimSpace(parentCorrelationID)
+	if parentCorrelationID != "" {
+		if merged == nil {
+			merged = make(map[string]any, 1)
+		}
+		merged[streamMetadataParentCorrelation] = parentCorrelationID
+	}
+	return WithStreamContextMetadata(ctx, merged)
+}
+
 // StreamMetadataFromContext extracts streaming metadata from a context.
 func StreamMetadataFromContext(ctx context.Context) (StreamContext, bool) {
 	metadata, ok := ctx.Value(streamContextKey{}).(StreamContext)
@@ -56,6 +100,65 @@ func StreamMetadataFromContext(ctx context.Context) (StreamContext, bool) {
 		return StreamContext{}, false
 	}
 	return metadata, true
+}
+
+func withStreamLifecycle(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if existing, _ := ctx.Value(streamLifecycleKey{}).(*streamLifecycleState); existing != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, streamLifecycleKey{}, &streamLifecycleState{})
+}
+
+func streamLifecycleFromContext(ctx context.Context) *streamLifecycleState {
+	if ctx == nil {
+		return nil
+	}
+	lifecycle, _ := ctx.Value(streamLifecycleKey{}).(*streamLifecycleState)
+	return lifecycle
+}
+
+func publishWithStreamLifecycle(ctx context.Context, eventType guide.StreamEventType, publish func()) bool {
+	return publishWithLifecycleState(streamLifecycleFromContext(ctx), eventType, publish)
+}
+
+func publishWithLifecycleState(lifecycle *streamLifecycleState, eventType guide.StreamEventType, publish func()) bool {
+	if publish == nil {
+		return false
+	}
+	if lifecycle == nil {
+		publish()
+		return true
+	}
+
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+
+	switch eventType {
+	case guide.StreamEventComplete:
+		if lifecycle.completed {
+			return false
+		}
+		lifecycle.terminalStarted = true
+		lifecycle.completed = true
+		publish()
+		return true
+	case guide.StreamEventError:
+		if lifecycle.completed {
+			return false
+		}
+		lifecycle.terminalStarted = true
+		publish()
+		return true
+	default:
+		if lifecycle.terminalStarted {
+			return false
+		}
+		publish()
+		return true
+	}
 }
 
 // UsageAccumulator tracks token usage across multiple LLM calls.
@@ -142,7 +245,9 @@ func PublishStreamEvent(
 		Timestamp:     time.Now(),
 	}
 
-	_ = bus.Publish(channels.Responses, msg)
+	publishWithStreamLifecycle(ctx, event.Type, func() {
+		_ = bus.Publish(channels.Responses, msg)
+	})
 }
 
 func cloneStreamMetadata(metadata map[string]any) map[string]any {
@@ -152,6 +257,99 @@ func cloneStreamMetadata(metadata map[string]any) map[string]any {
 	cloned := make(map[string]any, len(metadata))
 	for key, value := range metadata {
 		cloned[key] = value
+	}
+	return cloned
+}
+
+// StreamResponseMetadataFromContext returns a cloned copy of the current
+// stream metadata so custom publishers can attach the same branch and routing
+// identity as the shared stream helpers.
+func StreamResponseMetadataFromContext(ctx context.Context) map[string]any {
+	stream, ok := StreamMetadataFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	return cloneStreamMetadata(stream.Metadata)
+}
+
+// MergeStreamMetadata clones base and overlays values from extra.
+func MergeStreamMetadata(base, extra map[string]any) map[string]any {
+	if len(base) == 0 && len(extra) == 0 {
+		return nil
+	}
+	merged := cloneStreamMetadata(base)
+	if merged == nil {
+		merged = make(map[string]any, len(extra))
+	}
+	for key, value := range extra {
+		merged[key] = value
+	}
+	return merged
+}
+
+// RouteMetadataWithInterAgentBranch stamps nested-branch metadata onto a
+// child route request when it originates from an active consult/challenge tool.
+func RouteMetadataWithInterAgentBranch(ctx context.Context, metadata map[string]any) map[string]any {
+	stream, ok := StreamMetadataFromContext(ctx)
+	if !ok || strings.TrimSpace(stream.CorrelationID) == "" {
+		return metadata
+	}
+	active, ok := ActiveToolCallFromContext(ctx)
+	if !ok || active.InterAgent == nil {
+		return metadata
+	}
+	return applyInterAgentBranchMetadata(metadata, InterAgentBranchMetadata{
+		ParentCorrelationID: strings.TrimSpace(stream.CorrelationID),
+		ParentToolCallKey:   strings.TrimSpace(active.ToolCallKey),
+		ThreadKey:           strings.TrimSpace(active.InterAgent.ThreadKey),
+		Kind:                strings.TrimSpace(active.InterAgent.Kind),
+	})
+}
+
+// RouteMetadataWithExplicitInterAgentBranch stamps a specific branch identity
+// onto a route request for challenge validation/process flows.
+func RouteMetadataWithExplicitInterAgentBranch(
+	ctx context.Context,
+	metadata map[string]any,
+	branch InterAgentBranchMetadata,
+) map[string]any {
+	stream, ok := StreamMetadataFromContext(ctx)
+	if ok && strings.TrimSpace(stream.CorrelationID) != "" && strings.TrimSpace(branch.ParentCorrelationID) == "" {
+		branch.ParentCorrelationID = strings.TrimSpace(stream.CorrelationID)
+	}
+	if active, ok := ActiveToolCallFromContext(ctx); ok {
+		if strings.TrimSpace(branch.ParentToolCallKey) == "" {
+			branch.ParentToolCallKey = strings.TrimSpace(active.ToolCallKey)
+		}
+		if strings.TrimSpace(branch.Kind) == "" && active.InterAgent != nil {
+			branch.Kind = strings.TrimSpace(active.InterAgent.Kind)
+		}
+	}
+	return applyInterAgentBranchMetadata(metadata, branch)
+}
+
+func applyInterAgentBranchMetadata(metadata map[string]any, branch InterAgentBranchMetadata) map[string]any {
+	branch.ParentCorrelationID = strings.TrimSpace(branch.ParentCorrelationID)
+	branch.ParentToolCallKey = strings.TrimSpace(branch.ParentToolCallKey)
+	branch.ThreadKey = strings.TrimSpace(branch.ThreadKey)
+	branch.Kind = strings.TrimSpace(branch.Kind)
+	if branch.ParentCorrelationID == "" || !isNestedInterAgentKind(branch.Kind) {
+		return metadata
+	}
+	cloned := cloneStreamMetadata(metadata)
+	if cloned == nil {
+		cloned = make(map[string]any, 4)
+	}
+	cloned[streamMetadataNestedBranch] = true
+	cloned[streamMetadataParentCorrelation] = branch.ParentCorrelationID
+	if branch.ParentToolCallKey != "" {
+		cloned[streamMetadataParentToolCallKey] = branch.ParentToolCallKey
+	}
+	if branch.ThreadKey != "" {
+		cloned[streamMetadataInterAgentThread] = branch.ThreadKey
+	}
+	if branch.Kind != "" {
+		cloned[streamMetadataInterAgentKind] = branch.Kind
 	}
 	return cloned
 }

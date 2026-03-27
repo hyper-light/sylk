@@ -98,7 +98,7 @@ func (r *ToolRunner) exec(ctx context.Context, command string, argv []string) (*
 	}
 	agentshared.PopulateCommandApprovalScope(ctx, &authReq)
 	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq); err != nil {
-		return nil, err
+		return nil, agentshared.WrapApprovalDenied(authReq.ToolName, err)
 	}
 	if r.requireBroker {
 		return r.execBrokered(ctx, argv)

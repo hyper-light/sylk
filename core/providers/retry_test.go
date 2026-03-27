@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -164,6 +165,11 @@ func TestIsRetryableError_TypedErrors(t *testing.T) {
 			retryable: false,
 		},
 		{
+			name:      "unexpected eof",
+			err:       io.ErrUnexpectedEOF,
+			retryable: true,
+		},
+		{
 			name:      "nil error",
 			err:       nil,
 			retryable: false,
@@ -309,6 +315,36 @@ func TestRetryAnthropicInternalServerGenerate_OnlyRetries500(t *testing.T) {
 	}
 }
 
+func TestRetryAnthropicInternalServerGenerate_RetriesUnexpectedEOF(t *testing.T) {
+	cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
+	ctx := context.Background()
+	var events []RetryEvent
+	ctx = WithRetryObserver(ctx, func(event RetryEvent) {
+		events = append(events, event)
+	})
+
+	calls := 0
+	resp, err := retryAnthropicInternalServerGenerate(ctx, cfg, func(_ context.Context) (*Response, error) {
+		calls++
+		if calls <= anthropicInternalServerMaxRetries {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return &Response{Content: "ok"}, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.Content != "ok" {
+		t.Fatalf("unexpected response: %#v", resp)
+	}
+	if calls != anthropicInternalServerMaxRetries+1 {
+		t.Fatalf("expected %d calls, got %d", anthropicInternalServerMaxRetries+1, calls)
+	}
+	if len(events) != anthropicInternalServerMaxRetries {
+		t.Fatalf("expected %d retry events, got %d", anthropicInternalServerMaxRetries, len(events))
+	}
+}
+
 func TestRetryAnthropicInternalServerStream_RetriesThreeTimes(t *testing.T) {
 	cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
 	ctx := context.Background()
@@ -322,6 +358,33 @@ func TestRetryAnthropicInternalServerStream_RetriesThreeTimes(t *testing.T) {
 		calls++
 		if calls <= anthropicInternalServerMaxRetries {
 			return &anthropic.Error{StatusCode: 500}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != anthropicInternalServerMaxRetries+1 {
+		t.Fatalf("expected %d calls, got %d", anthropicInternalServerMaxRetries+1, calls)
+	}
+	if len(events) != anthropicInternalServerMaxRetries {
+		t.Fatalf("expected %d retry events, got %d", anthropicInternalServerMaxRetries, len(events))
+	}
+}
+
+func TestRetryAnthropicInternalServerStream_RetriesUnexpectedEOF(t *testing.T) {
+	cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
+	ctx := context.Background()
+	var events []RetryEvent
+	ctx = WithRetryObserver(ctx, func(event RetryEvent) {
+		events = append(events, event)
+	})
+
+	calls := 0
+	err := retryAnthropicInternalServerStream(ctx, cfg, func(_ context.Context) error {
+		calls++
+		if calls <= anthropicInternalServerMaxRetries {
+			return io.ErrUnexpectedEOF
 		}
 		return nil
 	})

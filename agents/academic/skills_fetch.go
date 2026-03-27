@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/fetch"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func (a *Academic) registerFetchSkills() {
@@ -170,24 +173,14 @@ func (a *Academic) executeFetch(ctx context.Context, url, reason string) (any, e
 
 	resp := a.fetchPipeline.Execute(ctx, &fetch.FetchRequest{
 		URL:         url,
+		ToolName:    "web_fetch",
 		SourceAgent: "academic",
 		Reason:      reason,
-		SessionID:   a.config.SessionID,
+		SessionID:   firstNonEmptyFetchSessionID(ctx, a.config.SessionID),
 	})
 
 	if !resp.Success {
-		result := map[string]any{
-			"success":  false,
-			"url":      resp.URL,
-			"error":    resp.Error,
-			"verdict":  resp.Verdict.String(),
-			"duration": resp.Duration.String(),
-		}
-		if len(resp.Findings) > 0 {
-			result["findings_count"] = len(resp.Findings)
-			result["findings"] = formatFindings(resp.Findings)
-		}
-		return result, nil
+		return fetchFailureResult("web_fetch", resp)
 	}
 
 	result := map[string]any{
@@ -227,24 +220,14 @@ func (a *Academic) executeFetchDocument(ctx context.Context, url, reason string)
 
 	resp := a.fetchPipeline.Execute(ctx, &fetch.FetchRequest{
 		URL:         url,
+		ToolName:    "fetch_document",
 		SourceAgent: "academic",
 		Reason:      reason,
-		SessionID:   a.config.SessionID,
+		SessionID:   firstNonEmptyFetchSessionID(ctx, a.config.SessionID),
 	})
 
 	if !resp.Success {
-		result := map[string]any{
-			"success":  false,
-			"url":      resp.URL,
-			"error":    resp.Error,
-			"verdict":  resp.Verdict.String(),
-			"duration": resp.Duration.String(),
-		}
-		if len(resp.Findings) > 0 {
-			result["findings_count"] = len(resp.Findings)
-			result["findings"] = formatFindings(resp.Findings)
-		}
-		return result, nil
+		return fetchFailureResult("fetch_document", resp)
 	}
 
 	result := map[string]any{
@@ -287,9 +270,10 @@ func (a *Academic) executeCrawl(
 	// Fetch the root page.
 	rootResp := a.fetchPipeline.Execute(ctx, &fetch.FetchRequest{
 		URL:         url,
+		ToolName:    "crawl_links",
 		SourceAgent: "academic",
 		Reason:      reason,
-		SessionID:   a.config.SessionID,
+		SessionID:   firstNonEmptyFetchSessionID(ctx, a.config.SessionID),
 	})
 
 	result := map[string]any{
@@ -300,6 +284,9 @@ func (a *Academic) executeCrawl(
 	}
 
 	if !rootResp.Success {
+		if _, err := fetchFailureResult("crawl_links", rootResp); err != nil {
+			return nil, err
+		}
 		result["error"] = rootResp.Error
 		if len(rootResp.Findings) > 0 {
 			result["findings"] = formatFindings(rootResp.Findings)
@@ -341,9 +328,10 @@ func (a *Academic) executeCrawl(
 		}
 		linkResp := a.fetchPipeline.Execute(ctx, &fetch.FetchRequest{
 			URL:         link,
+			ToolName:    "crawl_links",
 			SourceAgent: "academic",
 			Reason:      fmt.Sprintf("following link from %s: %s", url, reason),
-			SessionID:   a.config.SessionID,
+			SessionID:   firstNonEmptyFetchSessionID(ctx, a.config.SessionID),
 		})
 		entry := map[string]any{
 			"url":     link,
@@ -351,6 +339,9 @@ func (a *Academic) executeCrawl(
 			"verdict": linkResp.Verdict.String(),
 		}
 		if !linkResp.Success {
+			if _, err := fetchFailureResult("crawl_links", linkResp); err != nil {
+				return nil, err
+			}
 			entry["error"] = linkResp.Error
 		} else if linkResp.Extracted != nil {
 			entry["content_preview"] = truncateStr(linkResp.Extracted.Text, 4000)
@@ -398,4 +389,31 @@ func truncateStr(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+func firstNonEmptyFetchSessionID(ctx context.Context, fallback string) string {
+	if trimmed := versioning.SessionIDFromContext(ctx); trimmed != "" {
+		return trimmed
+	}
+	return fallback
+}
+
+func fetchFailureResult(toolName string, resp *fetch.FetchResponse) (any, error) {
+	if resp != nil && resp.ApprovalDenied {
+		return nil, shared.ApprovalDeniedDelegatedError(toolName, strings.TrimSpace(resp.Error))
+	}
+	result := map[string]any{
+		"success": false,
+	}
+	if resp != nil {
+		result["url"] = resp.URL
+		result["error"] = resp.Error
+		result["verdict"] = resp.Verdict.String()
+		result["duration"] = resp.Duration.String()
+		if len(resp.Findings) > 0 {
+			result["findings_count"] = len(resp.Findings)
+			result["findings"] = formatFindings(resp.Findings)
+		}
+	}
+	return result, nil
 }

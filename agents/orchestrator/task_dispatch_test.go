@@ -1,11 +1,15 @@
 package orchestrator
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/dag"
 	coreevents "github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/pipeline/coordination"
 )
 
 func TestParseTaskDispatchMessageCanonicalizesPipelineContext(t *testing.T) {
@@ -65,6 +69,80 @@ func TestParseTaskDispatchMessageCanonicalizesPipelineContext(t *testing.T) {
 	}
 	if len(dispatch.coAgents) != 2 {
 		t.Fatalf("coAgents = %v, want 2 entries", dispatch.coAgents)
+	}
+}
+
+func TestParseTaskDispatchMessage_UsesMessageSessionID(t *testing.T) {
+	msg := &guide.Message{
+		Metadata: map[string]any{
+			"session_id": "sess-meta",
+		},
+		Payload: map[string]any{
+			"task_id":    "task-1",
+			"node_id":    "node-1",
+			"dag_id":     "dag-1",
+			"agent_type": "engineer",
+			"prompt":     "ship it",
+		},
+	}
+
+	dispatch, ok := parseTaskDispatchMessage(msg)
+	if !ok {
+		t.Fatal("expected dispatch payload to parse")
+	}
+	if dispatch.sessionID != "sess-meta" {
+		t.Fatalf("sessionID = %q, want %q", dispatch.sessionID, "sess-meta")
+	}
+}
+
+func TestRegisterTaskDispatch_PreservesExistingTaskSessionAndMetadata(t *testing.T) {
+	now := time.Now()
+	o := &Orchestrator{
+		config: Config{SessionID: ""},
+		state:  NewState("sess-state"),
+	}
+	o.state.Tasks["task-1"] = &TaskRecord{
+		ID:          "task-1",
+		WorkflowID:  "wf-1",
+		Name:        "Keep metadata",
+		Description: "Preserve the planned task context.",
+		Status:      TaskStatusPending,
+		CreatedAt:   now.Add(-time.Minute),
+		SessionID:   "sess-existing",
+		Metadata: map[string]any{
+			"plan_id": "plan-123",
+		},
+	}
+
+	router := o.registerTaskDispatch(&taskDispatchContext{
+		taskID:     "task-1",
+		workflowID: "wf-1",
+		name:       "Keep metadata",
+		agentType:  "engineer",
+		agentID:    "eng-1",
+		dagID:      "dag-1",
+		nodeID:     "node-1",
+		now:        now,
+	})
+	if router != o.taskRouter {
+		t.Fatalf("router = %#v, want %v", router, o.taskRouter)
+	}
+
+	task := o.state.Tasks["task-1"]
+	if task == nil {
+		t.Fatal("expected task record to remain present")
+	}
+	if task.SessionID != "sess-existing" {
+		t.Fatalf("session_id = %q, want %q", task.SessionID, "sess-existing")
+	}
+	if task.Metadata["plan_id"] != "plan-123" {
+		t.Fatalf("plan_id = %#v, want %q", task.Metadata["plan_id"], "plan-123")
+	}
+	if task.Description != "Preserve the planned task context." {
+		t.Fatalf("description = %q, want preserved description", task.Description)
+	}
+	if task.Status != TaskStatusRunning {
+		t.Fatalf("status = %q, want %q", task.Status, TaskStatusRunning)
 	}
 }
 
@@ -148,5 +226,279 @@ func TestPublishTaskDispatchAgents_GlobalDispatchDoesNotRegisterPipelineGhosts(t
 		if evt.Data["source"] != "orchestrator_task_dispatch" {
 			t.Fatalf("source = %v, want orchestrator_task_dispatch", evt.Data["source"])
 		}
+	}
+}
+
+func TestEnrichTaskDispatchCoordination_UsesCachedPrecedentsInline(t *testing.T) {
+	svc := newCoordinationTestService(t)
+	if _, err := svc.QueryView(context.Background(), coordination.QueryViewInput{
+		TaskID:     "task-1",
+		TaskName:   "Hello CLI",
+		WorkerType: "engineer",
+	}); err != nil {
+		t.Fatalf("QueryView: %v", err)
+	}
+	svc.cache.Wait()
+	svc.StoreCachedPrecedents("Hello CLI", "hello-cli", "engineer", []coordination.PrecedentSummary{
+		{ID: "prec-1", Summary: "Prefer small argparse entrypoints."},
+	})
+	svc.cache.Wait()
+
+	o := &Orchestrator{
+		config:       Config{ArchivalistEnabled: true},
+		coordination: svc,
+	}
+	dispatch := &taskDispatchContext{
+		pipelineTaskID:   "task-1",
+		pipelineTaskSlug: "hello-cli",
+		precedentTask:    "Hello CLI",
+		agentType:        "engineer",
+		nodeCtx:          map[string]any{},
+	}
+
+	o.enrichTaskDispatchCoordination(dispatch)
+
+	packet, ok := dispatch.nodeCtx["coordination_packet"].(*coordination.WorkerPacket)
+	if !ok || packet == nil {
+		t.Fatalf("coordination_packet = %#v, want worker packet", dispatch.nodeCtx["coordination_packet"])
+	}
+	if len(packet.HistoricalPrecedents) != 1 {
+		t.Fatalf("historical_precedents = %d, want 1", len(packet.HistoricalPrecedents))
+	}
+	if packet.HistoricalPrecedents[0].ID != "prec-1" {
+		t.Fatalf("precedent id = %q, want prec-1", packet.HistoricalPrecedents[0].ID)
+	}
+}
+
+func TestHandleTaskDispatch_DoesNotBlockPipelineRouteOnPrecedentLookup(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	t.Cleanup(func() { _ = bus.Close() })
+
+	scope := testScope()
+	t.Cleanup(func() {
+		_ = scope.Shutdown(100*time.Millisecond, 250*time.Millisecond)
+	})
+
+	reqCh := make(chan *guide.RouteRequest, 8)
+	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		select {
+		case reqCh <- req:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	o := &Orchestrator{
+		config: Config{
+			AgentID:            "orchestrator",
+			SessionID:          "session-1",
+			ArchivalistEnabled: true,
+		},
+		state:                   NewState("session-1"),
+		bus:                     bus,
+		running:                 true,
+		scope:                   scope,
+		taskRouter:              testRouter(bus, scope),
+		coordination:            newCoordinationTestService(t),
+		pendingBus:              make(map[string]*agentshared.PendingSyncWait),
+		pipelinePanelState:      make(map[string]pipelinePanelSnapshot),
+		pipelinePanelRegistered: make(map[string]struct{}),
+		runCtx:                  context.Background(),
+	}
+
+	msg := &guide.Message{
+		Metadata: map[string]any{
+			"session_id": "session-1",
+		},
+		Payload: map[string]any{
+			"name":       "Implement CLI module",
+			"node_id":    "task_1",
+			"dag_id":     "dag-1",
+			"agent_id":   "engineer",
+			"agent_type": "engineer",
+			"prompt":     "Build the CLI entrypoint.",
+			"context": map[string]any{
+				"task_id":        "task-1",
+				"task_slug":      "hello-cli",
+				"task_name":      "Hello CLI",
+				"pipeline_stage": string(StageExecute),
+			},
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- o.handleTaskDispatch(msg)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handleTaskDispatch: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("handleTaskDispatch blocked on precedent lookup")
+	}
+
+	deadline := time.After(500 * time.Millisecond)
+	target := pipelineWorkerTargetAgentID("task-1", agentshared.PipelineAgentInspector)
+	for {
+		select {
+		case req := <-reqCh:
+			if req.TargetAgentID == target {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for inspector route request %q", target)
+		}
+	}
+}
+
+type delayingEventBus struct {
+	guide.EventBus
+	delayTopic string
+	delay      time.Duration
+}
+
+func (b *delayingEventBus) Publish(topic string, msg *guide.Message) error {
+	if topic == b.delayTopic && b.delay > 0 {
+		time.Sleep(b.delay)
+	}
+	return b.EventBus.Publish(topic, msg)
+}
+
+func TestHandleTaskDispatch_AcknowledgesBeforeRoutePublishCompletes(t *testing.T) {
+	baseBus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	t.Cleanup(func() { _ = baseBus.Close() })
+	bus := &delayingEventBus{
+		EventBus:   baseBus,
+		delayTopic: guide.TopicGuideRequests,
+		delay:      300 * time.Millisecond,
+	}
+
+	scope := testScope()
+	t.Cleanup(func() {
+		_ = scope.Shutdown(100*time.Millisecond, 250*time.Millisecond)
+	})
+
+	dispatcher := NewBusNodeDispatcher(bus, "orchestrator", "session-1", "dag-1", nil, nil, nil)
+	o := &Orchestrator{
+		config: Config{
+			AgentID:   "orchestrator",
+			SessionID: "session-1",
+		},
+		state:                   NewState("session-1"),
+		bus:                     bus,
+		running:                 true,
+		scope:                   scope,
+		taskRouter:              testRouter(bus, scope),
+		dagBridge:               &DAGBridge{activeDAGs: map[string]*ActiveDAGMeta{"dag-1": {Dispatcher: dispatcher}}},
+		pendingBus:              make(map[string]*agentshared.PendingSyncWait),
+		pipelinePanelState:      make(map[string]pipelinePanelSnapshot),
+		pipelinePanelRegistered: make(map[string]struct{}),
+		runCtx:                  context.Background(),
+	}
+
+	taskSub, err := bus.SubscribeAsync("tasks.dispatch", o.handleTaskDispatch)
+	if err != nil {
+		t.Fatalf("subscribe tasks.dispatch: %v", err)
+	}
+	defer taskSub.Unsubscribe()
+
+	reqCh := make(chan *guide.RouteRequest, 2)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		select {
+		case reqCh <- req:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide.requests: %v", err)
+	}
+	defer reqSub.Unsubscribe()
+
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "task_1",
+		AgentType: "engineer",
+		Prompt:    "Build the CLI entrypoint.",
+		Context: map[string]any{
+			"task_id":        "task-1",
+			"task_slug":      "hello-cli",
+			"task_name":      "Hello CLI",
+			"pipeline_stage": string(StageExecute),
+		},
+	})
+
+	resultCh := make(chan *dag.NodeResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, dispatchErr := dispatcher.Dispatch(context.Background(), node, nil)
+		if dispatchErr != nil {
+			errCh <- dispatchErr
+			return
+		}
+		resultCh <- result
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for dispatcher.DispatchDone(node.ID()) == nil {
+		select {
+		case <-deadline:
+			t.Fatal("dispatch did not start")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	ackDeadline := time.After(150 * time.Millisecond)
+	for dispatcher.GetACKResult(node.ID()) == nil {
+		select {
+		case err := <-errCh:
+			t.Fatalf("dispatch returned error before ack: %v", err)
+		case <-ackDeadline:
+			t.Fatal("dispatch ack did not arrive before delayed route publish")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	select {
+	case req := <-reqCh:
+		target := pipelineWorkerTargetAgentID("task-1", agentshared.PipelineAgentInspector)
+		if req.TargetAgentID != target {
+			t.Fatalf("target_agent_id = %q, want %q", req.TargetAgentID, target)
+		}
+	case <-time.After(600 * time.Millisecond):
+		t.Fatal("timed out waiting for delayed inspector route request")
+	}
+
+	dispatcher.OnNodeComplete(node.ID(), &dag.NodeResult{
+		NodeID: node.ID(),
+		State:  dag.NodeStateSucceeded,
+		Output: "ok",
+	})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("dispatch returned error: %v", err)
+	case result := <-resultCh:
+		if result == nil || result.State != dag.NodeStateSucceeded {
+			t.Fatalf("result = %#v, want succeeded", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dispatch result")
 	}
 }

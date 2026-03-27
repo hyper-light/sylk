@@ -2,6 +2,7 @@ package guide
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -102,26 +103,49 @@ func (c *ConsultationObserver) logToArchivalist(msg *Message) {
 		}
 	}
 
-	// Emit a fire-and-forget logging event to the Archivalist
-	logReq := &RouteRequest{
-		CorrelationID: generateMessageID(),
-		Input:         "Log direct consultation: " + consReq.Query,
-		SourceAgentID: "guide",
-		TargetAgentID: "archivalist",
-		FireAndForget: true,
-		SessionID:     c.sessionID,
-		Timestamp:     time.Now(),
+	input, err := ArchivalistStoreRouteInput("Log direct consultation: " + consReq.Query)
+	if err != nil {
+		return
 	}
+	req := &RouteRequest{
+		CorrelationID:       generateMessageID(),
+		ParentCorrelationID: msg.CorrelationID,
+		Input:               input,
+		SourceAgentID:       firstNonEmptyConsultationSource(consReq.FromAgent),
+		SourceAgentName:     firstNonEmptyConsultationSource(consReq.FromAgent),
+		FireAndForget:       true,
+		SessionID:           c.sessionID,
+		Timestamp:           time.Now(),
+		Metadata: map[string]any{
+			"event_type": "direct_consultation",
+			"from_agent": consReq.FromAgent,
+			"to_agent":   consReq.ToAgent,
+			"query":      consReq.Query,
+		},
+	}
+	if len(msg.Metadata) > 0 {
+		req.Metadata = mergeRouteMetadata(msg.Metadata, req.Metadata)
+	}
+	_ = c.bus.Publish(TopicGuideRequests, NewRequestMessage(generateMessageID(), req))
+}
 
-	fwdMsg := NewForwardMessage(generateMessageID(), &ForwardedRequest{
-		CorrelationID: logReq.CorrelationID,
-		Input:         logReq.Input,
-		Intent:        IntentStore,
-		Domain:        DomainHistory,
-		SourceAgentID: "guide",
-		SessionID:     c.sessionID,
-		FireAndForget: true,
-	})
+func firstNonEmptyConsultationSource(source string) string {
+	if source = strings.TrimSpace(source); source != "" {
+		return source
+	}
+	return "guide"
+}
 
-	_ = c.bus.Publish(TopicRequests("archivalist", "archivalist"), fwdMsg)
+func mergeRouteMetadata(base map[string]any, overlay map[string]any) map[string]any {
+	if len(base) == 0 && len(overlay) == 0 {
+		return nil
+	}
+	merged := make(map[string]any, len(base)+len(overlay))
+	for key, value := range base {
+		merged[key] = value
+	}
+	for key, value := range overlay {
+		merged[key] = value
+	}
+	return merged
 }

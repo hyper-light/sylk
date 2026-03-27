@@ -69,6 +69,9 @@ func TestBuildOTGlobalFollowupRequest_UsesDirectPrompt(t *testing.T) {
 	if req.Metadata["global_review_stage"] != globalReviewStageFinal {
 		t.Fatalf("metadata global_review_stage = %#v, want %q", req.Metadata["global_review_stage"], globalReviewStageFinal)
 	}
+	if !req.Timestamp.Equal(update.Timestamp.UTC()) {
+		t.Fatalf("timestamp = %v, want %v", req.Timestamp, update.Timestamp.UTC())
+	}
 }
 
 func TestBuildOTGlobalFollowupRequest_CheckpointReviewMetadata(t *testing.T) {
@@ -122,6 +125,15 @@ func TestBuildOTGlobalFollowupRequest_CheckpointReviewMetadata(t *testing.T) {
 	if !strings.Contains(req.Input, "Future planned work that has not been merged yet is pending, not missing.") {
 		t.Fatalf("input = %q, want pending-not-missing guidance", req.Input)
 	}
+	if !strings.Contains(req.Input, "Do not branch into other completed pipelines in this turn") {
+		t.Fatalf("input = %q, want single-pipeline queue guidance", req.Input)
+	}
+	if strings.Contains(req.Input, "Completed task IDs:") {
+		t.Fatalf("input = %q, should not enumerate completed task IDs", req.Input)
+	}
+	if strings.Contains(req.Input, "Remaining task IDs:") {
+		t.Fatalf("input = %q, should not enumerate remaining task IDs", req.Input)
+	}
 }
 
 func TestBuildOTGlobalFollowupRequest_FallsBackToStateSession(t *testing.T) {
@@ -143,6 +155,33 @@ func TestBuildOTGlobalFollowupRequest_FallsBackToStateSession(t *testing.T) {
 	}
 	if req.SessionID != "sess-state" {
 		t.Fatalf("session_id = %q, want sess-state", req.SessionID)
+	}
+}
+
+func TestBuildOTGlobalFollowupRequest_UsesTaskMetadataSessionID(t *testing.T) {
+	o := &Orchestrator{
+		state:  NewState("sess-state"),
+		config: Config{AgentID: "orchestrator"},
+	}
+	task := &TaskRecord{
+		ID: "task-8",
+		Metadata: map[string]any{
+			"session_id": "sess-meta",
+		},
+	}
+	update := &PipelineUpdate{
+		TaskID:    "task-8",
+		AgentType: agentshared.PipelineAgentInspector,
+		Status:    "succeeded",
+		Timestamp: time.Date(2026, 3, 23, 12, 5, 0, 0, time.UTC),
+	}
+
+	req := o.buildOTGlobalFollowupRequest(task, update, "tester", versioning.SemanticVersion{}, false)
+	if req == nil {
+		t.Fatal("buildOTGlobalFollowupRequest returned nil")
+	}
+	if req.SessionID != "sess-meta" {
+		t.Fatalf("session_id = %q, want sess-meta", req.SessionID)
 	}
 }
 

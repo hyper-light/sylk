@@ -51,6 +51,40 @@ func TestCommandApprovalLayout_MinimalPrompt(t *testing.T) {
 	}
 }
 
+func TestCommandApprovalLayout_FetchPromptUsesFetchLanguage(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 90, Height: 28}); cmd != nil {
+		t.Fatalf("handleResize() command = %v, want nil", cmd)
+	}
+
+	app.commandApproval = &commandApprovalState{
+		proposal: &commandapproval.Proposal{
+			AgentType: "academic",
+			ToolName:  "web_fetch",
+			Command:   "https://example.com/specs/latest",
+			Domain:    "example.com",
+		},
+		selected:  0,
+		activated: -1,
+	}
+
+	layout := app.commandApprovalLayout(60)
+	joined := ansi.Strip(strings.Join(layout.lines, "\n"))
+
+	if !strings.Contains(joined, "Academic wants approval to fetch:") {
+		t.Fatalf("fetch approval prompt missing fetch line:\n%s", joined)
+	}
+	if !strings.Contains(joined, "https://example.com/specs/latest") {
+		t.Fatalf("fetch approval prompt missing URL:\n%s", joined)
+	}
+	if !strings.Contains(joined, "• Allow Once (this fetch)") {
+		t.Fatalf("fetch approval prompt missing fetch option text:\n%s", joined)
+	}
+	if !strings.Contains(joined, "• Allow Always (save exact URL rule)") {
+		t.Fatalf("fetch approval prompt missing exact-url option text:\n%s", joined)
+	}
+}
+
 func TestCommandApprovalOptionAt_UsesTightHitboxes(t *testing.T) {
 	app := newResizeTestApp(t)
 	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 90, Height: 28}); cmd != nil {

@@ -103,6 +103,14 @@ func initGitRepo(t *testing.T, dir string) {
 	cmd = exec.Command("git", "config", "user.name", "Test User")
 	cmd.Dir = dir
 	cmd.Run()
+
+	cmd = exec.Command("git", "config", "commit.gpgsign", "false")
+	cmd.Dir = dir
+	cmd.Run()
+
+	cmd = exec.Command("git", "config", "tag.gpgsign", "false")
+	cmd.Dir = dir
+	cmd.Run()
 }
 
 // gitAdd adds files to git index.

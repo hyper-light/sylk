@@ -171,8 +171,9 @@ func (gt *GlobalTester) applyToolCalls(
 	for _, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
-		result, err := agentshared.TimedToolCall(ctx, "tester", call, func() (string, error) {
-			execResult, execErr = gt.executeToolCall(ctx, call)
+		execCtx := agentshared.WithActiveToolCall(ctx, call)
+		result, err := agentshared.TimedToolCall(execCtx, "tester", call, func() (string, error) {
+			execResult, execErr = gt.executeToolCall(execCtx, call)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {

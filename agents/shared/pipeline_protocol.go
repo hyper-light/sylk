@@ -921,6 +921,26 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 					"challenge_id":           strings.TrimSpace(snapshot.PendingChallenge.ID),
 				}, nil
 			}
+			challengeEvidence := resolvePipelineChallengeEvidence(ctx, cfg)
+			if refusal := pipelineRepeatedChallengeRefusal(snapshot, agentType, []string{PipelineAgentTester}, challengeEvidence); refusal != nil {
+				if err := state.setTerminalAction(&PipelineTurnAction{
+					Type:         PipelineProtocolActionRefusal,
+					AgentType:    agentType,
+					TargetAgents: []string{PipelineAgentTester},
+					Summary:      refusal.Reason,
+				}); err != nil {
+					return nil, err
+				}
+				return map[string]any{
+					"finalize_pipeline": false,
+					"refused":           true,
+					"refused_by":        firstNonEmpty(strings.TrimSpace(refusal.RefusedBy), "pipeline-protocol"),
+					"agent_type":        agentType,
+					"reason":            refusal.Reason,
+					"must_wait":         true,
+					"resume_conditions": append([]string(nil), refusal.ResumeConditions...),
+				}, nil
+			}
 
 			action := &PipelineTurnAction{
 				Type:             PipelineProtocolActionHandoff,
@@ -936,7 +956,8 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 					"Audit the engineer/designer implementation for correctness, robustness, performance, scope discipline, and production quality.",
 					"Call out any excessive code, premature abstraction, verbosity, low-value tests, or agentic slop that should force another cycle.",
 				},
-				References: append([]string{finalizePipelineVerificationReference}, evidenceRefs...),
+				References:           append([]string{finalizePipelineVerificationReference}, evidenceRefs...),
+				WorkspaceFingerprint: pipelineChallengeFingerprint(challengeEvidence),
 			}
 			if task := PipelineTaskFromContext(ctx); task != nil {
 				action.ChallengeID = nextPipelineChallengeID(task)
@@ -1208,6 +1229,11 @@ func dispatchPipelineProtocolTask(ctx context.Context, cfg PipelineProtocolSkill
 		Timestamp:           time.Now(),
 		Metadata:            pipelineRouteMetadata(task),
 	}
+	// Pipeline protocol routing transfers turn ownership to the next agent.
+	// Preserve lineage via ParentCorrelationID, but do not stamp nested chat
+	// branch metadata onto the routed child request or the UI will render the
+	// destination worker as a child of the source worker instead of the new
+	// top-level owner of the pipeline turn.
 	if err := bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage("", req)); err != nil {
 		return "", fmt.Errorf("publish pipeline handoff: %w", err)
 	}
@@ -1709,6 +1735,34 @@ func nextPipelineChallengeID(task *PipelineTaskInput) string {
 		base = strings.TrimSpace(task.TaskID)
 	}
 	return fmt.Sprintf("%s-challenge-%s", base, uuid.NewString()[:8])
+}
+
+func pipelineChallengeID(task *PipelineTaskInput) string {
+	if task == nil {
+		return ""
+	}
+	snapshot, err := PipelineProtocolSnapshotFromTask(task)
+	if err != nil || snapshot == nil {
+		return ""
+	}
+	if snapshot.PendingValidation != nil {
+		if challengeID := strings.TrimSpace(snapshot.PendingValidation.ChallengeID); challengeID != "" {
+			return challengeID
+		}
+	}
+	if snapshot.PendingChallenge != nil {
+		if challengeID := strings.TrimSpace(snapshot.PendingChallenge.ID); challengeID != "" {
+			return challengeID
+		}
+	}
+	return ""
+}
+
+func pipelineChallengeThreadKey(task *PipelineTaskInput) string {
+	if challengeID := pipelineChallengeID(task); challengeID != "" {
+		return pipelineThreadPrefix + challengeID
+	}
+	return ""
 }
 
 func pipelineRouteMetadata(task *PipelineTaskInput) map[string]any {

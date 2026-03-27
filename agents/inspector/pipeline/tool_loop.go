@@ -30,11 +30,12 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 ) (string, error) {
 	seen := make(map[shared.ToolCallSignature]int, pi.config.MaxToolRuns)
 	consecutiveErrors := 0
+	requiredActionGraceTurns := 0
 	if surface == nil {
 		surface = pi.toolRuntime()
 	}
 
-	for turn := 0; turn <= pi.config.MaxToolRuns; turn++ {
+	for turn := 0; turn <= pi.config.MaxToolRuns+requiredActionGraceTurns; turn++ {
 		if pi.toolDefsDirty {
 			req.Tools = pi.buildToolDefinitionsWithSurface(surface)
 			pi.toolDefsDirty = false
@@ -109,6 +110,7 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 					Content: err.Error() +
 						"\nUse the pipeline protocol now. If you are still evaluating a peer response, call process_validation first and then use challenge_agent, handoff_next, finalize_pipeline, or handoff_to_ot.",
 				})
+				requiredActionGraceTurns = agentShared.ExtendRequiredProtocolGrace(ctx, requiredActionGraceTurns)
 				continue
 			}
 			if err := agentShared.ValidateTaskExecutionCompletion(ctx, "inspector-pipeline"); err != nil {
@@ -160,6 +162,7 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 		if agentShared.PipelineTurnTerminated(ctx) {
 			return "", nil
 		}
+		requiredActionGraceTurns = agentShared.ExtendRequiredProtocolGrace(ctx, requiredActionGraceTurns)
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= 2 {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -193,8 +196,9 @@ func (pi *PipelineInspector) applyToolCalls(
 	for _, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
-		result, err := agentShared.TimedToolCall(ctx, "inspector-pipeline", call, func() (string, error) {
-			execResult, execErr = pi.executeToolCallWithSurface(ctx, call, surface)
+		execCtx := agentShared.WithActiveToolCall(ctx, call)
+		result, err := agentShared.TimedToolCall(execCtx, "inspector-pipeline", call, func() (string, error) {
+			execResult, execErr = pi.executeToolCallWithSurface(execCtx, call, surface)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {

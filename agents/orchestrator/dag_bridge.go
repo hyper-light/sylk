@@ -1530,7 +1530,7 @@ func (b *DAGBridge) compositeGate() dag.LayerGate {
 				return err
 			}
 		}
-		return b.flushLayerDraftToDisk(ctx, dagID, layerIdx)
+		return nil
 	}
 }
 

@@ -2,6 +2,7 @@ package authority
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/versioning"
@@ -55,5 +56,48 @@ func TestRestrictFileAccessBlocksPipelineDiskWrites(t *testing.T) {
 	}
 	if !restricted.IsReadOnly() {
 		t.Fatal("pipeline agent disk fallback should be read-only")
+	}
+}
+
+func TestRestrictWorkspaceViews_PreservesSessionResolution(t *testing.T) {
+	root := t.TempDir()
+	svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
+		SessionID:  "sess-1",
+		WorkingDir: root,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	defer svfs.Close()
+
+	target := filepath.Join(root, "hello.txt")
+	ctx := versioning.WithSessionID(context.Background(), "sess-1")
+	if err := svfs.GlobalVFS().Write(ctx, target, []byte("global")); err != nil {
+		t.Fatalf("seed global: %v", err)
+	}
+
+	views := versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+		DefaultView:      versioning.WorkspaceViewGlobal,
+		DefaultSessionID: "sess-1",
+		SessionLookup: func(sessionID string) *versioning.SessionVFS {
+			if sessionID == "sess-1" {
+				return svfs
+			}
+			return nil
+		},
+		WorkingDir:   root,
+		DiskFallback: versioning.NewDiskFileAccess(root, true),
+	})
+	restricted := RestrictWorkspaceViews("inspector", views)
+
+	if resolved := versioning.SessionForWorkspaceViews(ctx, restricted); resolved != svfs {
+		t.Fatalf("resolved session = %v, want %v", resolved, svfs)
+	}
+	content, err := restricted.ReadFile(ctx, versioning.WorkspaceViewGlobal, "hello.txt", "")
+	if err != nil {
+		t.Fatalf("ReadFile error = %v", err)
+	}
+	if string(content) != "global" {
+		t.Fatalf("global content = %q, want %q", content, "global")
 	}
 }

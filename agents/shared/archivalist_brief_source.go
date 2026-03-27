@@ -8,8 +8,10 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/handoff"
-	"github.com/google/uuid"
+	"github.com/adalundhe/sylk/core/versioning"
 )
+
+const archivalistBriefToolName = "archivalist_get_briefing"
 
 // ArchivalistBriefSource requests handoff briefs from the Archivalist via
 // bus. The Archivalist has accumulated Scribe commentary and can produce
@@ -31,65 +33,39 @@ func NewArchivalistBriefSource(bus guide.EventBus) *ArchivalistBriefSource {
 // RequestBrief sends a briefing request to the Archivalist and waits for
 // the response within the configured timeout.
 func (a *ArchivalistBriefSource) RequestBrief(ctx context.Context, agentType string, contextSize, turnNumber int) (*handoff.ContextBrief, error) {
-	correlationID := uuid.New().String()
-	responseTopic := fmt.Sprintf("brief.response.%s", correlationID)
-
-	// Subscribe for the response before publishing the request.
-	responseCh := make(chan *handoff.ContextBrief, 1)
-	sub, err := a.bus.Subscribe(responseTopic, func(msg *guide.Message) error {
-		brief := a.parseBriefResponse(msg)
-		if brief != nil {
-			select {
-			case responseCh <- brief:
-			default:
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("subscribe brief response: %w", err)
-	}
-	defer sub.Unsubscribe()
-
-	// Build and publish the briefing request.
-	fwd := &guide.ForwardedRequest{
-		CorrelationID: correlationID,
-		SourceAgentID: "brief-requester",
-		Input: fmt.Sprintf(
-			`Generate a handoff brief for agent type %q. Context size: %d tokens, turn number: %d. `+
-				`Return JSON with fields: task_summary, key_decisions, active_state, next_steps, blockers.`,
-			agentType, contextSize, turnNumber,
-		),
-		Intent:        guide.IntentRecall,
-		FireAndForget: false,
+	req := &guide.RouteRequest{
+		SourceAgentID:   "brief-requester",
+		SourceAgentName: "brief-requester",
+		TargetAgentID:   "archivalist",
+		ExplicitTarget:  true,
+		Input:           fmt.Sprintf(`%s {"tier":"standard"}`, archivalistBriefToolName),
 		Metadata: map[string]any{
 			"request_type": "briefing",
+			"tool_name":    archivalistBriefToolName,
+			"brief_tier":   "standard",
+			"brief_format": "context_brief",
 			"agent_type":   agentType,
 			"context_size": contextSize,
 			"turn_number":  turnNumber,
 		},
 	}
-
-	msg := guide.NewForwardMessage(
-		fmt.Sprintf("brief_req_%s", correlationID[:8]),
-		fwd,
-	)
-	msg.ReplyTo = &guide.ReplyTo{Topic: responseTopic}
-
-	if err := a.bus.Publish(guide.TopicRequests("archivalist", "archivalist"), msg); err != nil {
-		return nil, fmt.Errorf("publish brief request: %w", err)
+	if sessionID := versioning.SessionIDFromContext(ctx); sessionID != "" {
+		req.SessionID = sessionID
 	}
 
-	// Wait for response with timeout.
-	deadline, cancel := context.WithTimeout(ctx, a.timeout)
-	defer cancel()
-
-	select {
-	case brief := <-responseCh:
+	msg, err := RequestGuideRouteSync(ctx, GuideRouteSyncRequest{
+		Bus:               a.bus,
+		ResponseTopic:     guide.TopicResponses("brief-requester", "brief-requester"),
+		Request:           req,
+		InactivityTimeout: a.timeout,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if brief := a.parseBriefResponse(msg); brief != nil {
 		return brief, nil
-	case <-deadline.Done():
-		return nil, fmt.Errorf("brief request timed out after %s", a.timeout)
 	}
+	return nil, fmt.Errorf("brief request returned empty response")
 }
 
 // parseBriefResponse extracts a ContextBrief from the bus response message.
@@ -107,16 +83,75 @@ func (a *ArchivalistBriefSource) parseBriefResponse(msg *guide.Message) *handoff
 		return nil
 	}
 
-	dataStr, ok := resp.Data.(string)
-	if !ok {
+	switch data := resp.Data.(type) {
+	case *handoff.ContextBrief:
+		return data
+	case handoff.ContextBrief:
+		brief := data
+		return &brief
+	case map[string]any:
+		return mapToContextBrief(data)
+	case string:
+		var brief handoff.ContextBrief
+		if err := json.Unmarshal([]byte(data), &brief); err != nil {
+			brief.TaskSummary = data
+			brief.GeneratedAt = time.Now()
+		}
+		return &brief
+	}
+	return nil
+}
+
+func mapToContextBrief(data map[string]any) *handoff.ContextBrief {
+	if len(data) == 0 {
 		return nil
 	}
-
-	var brief handoff.ContextBrief
-	if err := json.Unmarshal([]byte(dataStr), &brief); err != nil {
-		brief.TaskSummary = dataStr
+	brief := &handoff.ContextBrief{
+		TaskSummary:  stringFromMap(data, "task_summary"),
+		KeyDecisions: stringFromMap(data, "key_decisions"),
+		ActiveState:  stringFromMap(data, "active_state"),
+		NextSteps:    stringFromMap(data, "next_steps"),
+		Blockers:     stringFromMap(data, "blockers"),
+		ContextSize:  intFromMap(data, "context_size"),
+		TurnNumber:   intFromMap(data, "turn_number"),
+	}
+	if generatedAt := timeFromMap(data, "generated_at"); !generatedAt.IsZero() {
+		brief.GeneratedAt = generatedAt
+	}
+	if brief.GeneratedAt.IsZero() {
 		brief.GeneratedAt = time.Now()
 	}
+	if brief.TaskSummary == "" && brief.KeyDecisions == "" && brief.ActiveState == "" && brief.NextSteps == "" && brief.Blockers == "" {
+		return nil
+	}
+	return brief
+}
 
-	return &brief
+func stringFromMap(data map[string]any, key string) string {
+	value, _ := data[key].(string)
+	return value
+}
+
+func intFromMap(data map[string]any, key string) int {
+	switch value := data[key].(type) {
+	case int:
+		return value
+	case float64:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
+func timeFromMap(data map[string]any, key string) time.Time {
+	switch value := data[key].(type) {
+	case time.Time:
+		return value
+	case string:
+		parsed, err := time.Parse(time.RFC3339Nano, value)
+		if err == nil {
+			return parsed
+		}
+	}
+	return time.Time{}
 }

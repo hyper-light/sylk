@@ -45,41 +45,11 @@ func NewReadFileSkillFunc(getFA FileAccessProvider) *skills.Skill {
 				return nil, err
 			}
 
-			content, err := fa.ReadFile(ctx, params.Path)
+			result, err := ReadFileToolResult(ctx, fa, params.Path, params.Offset, params.Limit)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read file: %w", err)
 			}
-
-			lines := strings.Split(string(content), "\n")
-			offset := max(0, params.Offset)
-			if offset >= len(lines) {
-				return map[string]any{
-					"path":        params.Path,
-					"content":     "",
-					"total_lines": len(lines),
-					"offset":      offset,
-					"truncated":   false,
-				}, nil
-			}
-
-			limit := params.Limit
-			if limit <= 0 {
-				limit = 1000
-			}
-			endLine := offset + limit
-			truncated := endLine < len(lines)
-			if endLine > len(lines) {
-				endLine = len(lines)
-			}
-
-			return map[string]any{
-				"path":        params.Path,
-				"content":     strings.Join(lines[offset:endLine], "\n"),
-				"total_lines": len(lines),
-				"offset":      offset,
-				"limit":       limit,
-				"truncated":   truncated,
-			}, nil
+			return result, nil
 		}).
 		Build()
 }
@@ -148,12 +118,21 @@ func NewEditFileSkill(fa FileAccess) *skills.Skill {
 // NewEditFileSkillFunc creates an edit_file skill backed by a late-bound FileAccess.
 func NewEditFileSkillFunc(getFA FileAccessProvider) *skills.Skill {
 	return skills.NewSkill("edit_file").
-		Description("Edit specific sections of a file using search and replace. Each edit specifies old text to find and new text to replace it with.").
+		Description("Edit specific sections of a file using precise search and replace. Each edit must specify exact old_text to find and new_text to replace it with.").
 		Domain("filesystem").
 		Keywords("edit", "modify", "replace", "change", "update").
 		Priority(90).
 		StringParam("path", "Path to the file to edit (relative to working directory)", true).
-		ArrayParam("edits", "List of edits to apply, each with old_text and new_text", "object", true).
+		ArrayObjectParam("edits", "List of search/replace edits to apply. Every item must include exact old_text and new_text.", map[string]*skills.Property{
+			"old_text": {
+				Type:        "string",
+				Description: "Exact current text to find in the file before replacement. Required for every edit.",
+			},
+			"new_text": {
+				Type:        "string",
+				Description: "Replacement text for the matched old_text. Use an empty string to delete the matched text.",
+			},
+		}, []string{"old_text", "new_text"}, true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				Path  string `json:"path"`
@@ -171,6 +150,15 @@ func NewEditFileSkillFunc(getFA FileAccessProvider) *skills.Skill {
 			if len(params.Edits) == 0 {
 				return nil, fmt.Errorf("at least one edit is required")
 			}
+
+			edits := make([]FileEdit, len(params.Edits))
+			for i, e := range params.Edits {
+				if e.OldText == "" {
+					return nil, fmt.Errorf("edit %d: old_text is required; edit_file only supports precise search/replace edits, so read the current file and include the exact text to replace or use write_file for a broader rewrite", i)
+				}
+				edits[i] = FileEdit{OldText: e.OldText, NewText: e.NewText}
+			}
+
 			fa, err := resolveSkillFileAccess(getFA)
 			if err != nil {
 				return nil, err
@@ -185,14 +173,6 @@ func NewEditFileSkillFunc(getFA FileAccessProvider) *skills.Skill {
 				return nil, fmt.Errorf("failed to read file: %w", err)
 			}
 			oldLines := strings.Split(string(oldContent), "\n")
-
-			edits := make([]FileEdit, len(params.Edits))
-			for i, e := range params.Edits {
-				if e.OldText == "" {
-					return nil, fmt.Errorf("edit %d: old_text is required", i)
-				}
-				edits[i] = FileEdit{OldText: e.OldText, NewText: e.NewText}
-			}
 
 			if err := fa.EditFile(ctx, params.Path, edits); err != nil {
 				return nil, err

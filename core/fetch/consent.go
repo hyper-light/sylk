@@ -12,33 +12,34 @@ import (
 type ConsentDecision int
 
 const (
-	ConsentRequired  ConsentDecision = iota // Must ask the user
-	ConsentGranted                          // Auto-approved by session config or prior consent
-	ConsentDenied                           // Explicitly denied by user or config
-	ConsentRevoked                          // Was granted, then revoked
+	ConsentRequired ConsentDecision = iota // Must ask the user
+	ConsentGranted                         // Auto-approved by session config or prior consent
+	ConsentDenied                          // Explicitly denied by user or config
+	ConsentRevoked                         // Was granted, then revoked
 )
 
 // FetchProposal describes a pending fetch for user approval.
 type FetchProposal struct {
-	ID              string         `json:"id"`
-	URL             string         `json:"url"`
-	Domain          string         `json:"domain"`
-	ContentType     string         `json:"content_type"`     // Predicted or detected
-	EstimatedBytes  int64          `json:"estimated_bytes"`   // 0 if unknown
-	SourceAgent     string         `json:"source_agent"`
-	Reason          string         `json:"reason"`
-	RiskAssessment  string         `json:"risk_assessment"`  // From policy evaluation
-	CorrelationID   string         `json:"correlation_id"`
-	Timestamp       time.Time      `json:"timestamp"`
-	Metadata        map[string]any `json:"metadata,omitempty"`
+	ID             string         `json:"id"`
+	URL            string         `json:"url"`
+	Domain         string         `json:"domain"`
+	ToolName       string         `json:"tool_name,omitempty"`
+	ContentType    string         `json:"content_type"`    // Predicted or detected
+	EstimatedBytes int64          `json:"estimated_bytes"` // 0 if unknown
+	SourceAgent    string         `json:"source_agent"`
+	Reason         string         `json:"reason"`
+	RiskAssessment string         `json:"risk_assessment"` // From policy evaluation
+	CorrelationID  string         `json:"correlation_id"`
+	Timestamp      time.Time      `json:"timestamp"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
 }
 
 // ConsentResult carries the user's decision.
 type ConsentResult struct {
-	Granted      bool   `json:"granted"`
-	Reason       string `json:"reason,omitempty"`
-	GrantScope   string `json:"grant_scope,omitempty"` // "once", "domain", "session"
-	GrantDomain  string `json:"grant_domain,omitempty"`
+	Granted     bool   `json:"granted"`
+	Reason      string `json:"reason,omitempty"`
+	GrantScope  string `json:"grant_scope,omitempty"` // "once", "domain", "session"
+	GrantDomain string `json:"grant_domain,omitempty"`
 }
 
 // ConsentCallback is invoked to request user approval. Implementations
@@ -50,7 +51,7 @@ type ConsentCallback func(ctx context.Context, proposal *FetchProposal) (*Consen
 // auto-approval via configuration.
 type ConsentGate struct {
 	mu             sync.RWMutex
-	autoApprove    map[string]struct{} // Domain patterns auto-approved by config
+	autoApprove    map[string]struct{}   // Domain patterns auto-approved by config
 	sessionGrants  map[string]grantEntry // Domain → grant info
 	callback       ConsentCallback
 	consentTimeout time.Duration

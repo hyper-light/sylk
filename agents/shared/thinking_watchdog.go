@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/providers"
@@ -65,6 +66,8 @@ type ProgressPublisher struct {
 	AgentID       string
 	CorrelationID string
 	SourceAgentID string
+	Metadata      map[string]any
+	lifecycle     *streamLifecycleState
 }
 
 type progressPublisherKey struct{}
@@ -74,6 +77,11 @@ func WithProgressPublisher(ctx context.Context, pp *ProgressPublisher) context.C
 	if pp == nil {
 		return ctx
 	}
+	ctx = withStreamLifecycle(ctx)
+	if stream, ok := StreamMetadataFromContext(ctx); ok {
+		pp.Metadata = MergeStreamMetadata(stream.Metadata, pp.Metadata)
+	}
+	pp.lifecycle = streamLifecycleFromContext(ctx)
 	ctx = context.WithValue(ctx, progressPublisherKey{}, pp)
 	existing := providers.RetryObserverFromContext(ctx)
 	return providers.WithRetryObserver(ctx, func(event providers.RetryEvent) {
@@ -95,101 +103,50 @@ func ProgressPublisherFromContext(ctx context.Context) *ProgressPublisher {
 
 // Publish sends a progress message to the UI via the bus.
 func (pp *ProgressPublisher) Publish(message string) {
+	pp.PublishState(events.AgentUIStateNone, message)
+}
+
+// PublishState sends a progress message with an explicit UI state.
+func (pp *ProgressPublisher) PublishState(state events.AgentUIState, message string) {
 	if pp == nil || pp.Bus == nil || pp.Channels == nil {
 		return
 	}
-	event := &guide.StreamEvent{
+	pp.publishEvent(&guide.StreamEvent{
 		Type: guide.StreamEventProgress,
 		Data: &guide.ProgressData{
 			Message: message,
+			UIState: events.NormalizeAgentUIState(state),
 		},
 		Timestamp: time.Now(),
-	}
-	stream := &guide.StreamResponse{
-		CorrelationID:     pp.CorrelationID,
-		RespondingAgentID: pp.AgentID,
-		TargetAgentID:     pp.SourceAgentID,
-		Event:             event,
-	}
-	msg := &guide.Message{
-		ID:            fmt.Sprintf("think_%s_%s", pp.AgentID, uuid.New().String()[:8]),
-		CorrelationID: pp.CorrelationID,
-		Type:          guide.MessageTypeStream,
-		Payload:       stream,
-		SourceAgentID: pp.AgentID,
-		TargetAgentID: pp.SourceAgentID,
-		Timestamp:     time.Now(),
-		Status:        messaging.StatusQueued,
-		Attempt:       1,
-		Priority:      messaging.PriorityNormal,
-	}
-	_ = pp.Bus.Publish(pp.Channels.Responses, msg)
+	})
 }
 
 func (pp *ProgressPublisher) PublishChunk(text string) {
 	if pp == nil || pp.Bus == nil || pp.Channels == nil || strings.TrimSpace(text) == "" {
 		return
 	}
-	event := &guide.StreamEvent{
+	pp.publishEvent(&guide.StreamEvent{
 		Type:      guide.StreamEventData,
 		Text:      text,
 		Timestamp: time.Now(),
-	}
-	stream := &guide.StreamResponse{
-		CorrelationID:     pp.CorrelationID,
-		RespondingAgentID: pp.AgentID,
-		TargetAgentID:     pp.SourceAgentID,
-		Event:             event,
-	}
-	msg := &guide.Message{
-		ID:            fmt.Sprintf("chunk_%s_%s", pp.AgentID, uuid.New().String()[:8]),
-		CorrelationID: pp.CorrelationID,
-		Type:          guide.MessageTypeStream,
-		Payload:       stream,
-		SourceAgentID: pp.AgentID,
-		TargetAgentID: pp.SourceAgentID,
-		Timestamp:     time.Now(),
-		Status:        messaging.StatusQueued,
-		Attempt:       1,
-		Priority:      messaging.PriorityNormal,
-	}
-	_ = pp.Bus.Publish(pp.Channels.Responses, msg)
+	})
 }
 
 func (pp *ProgressPublisher) PublishStart() {
 	if pp == nil || pp.Bus == nil || pp.Channels == nil {
 		return
 	}
-	event := &guide.StreamEvent{
+	pp.publishEvent(&guide.StreamEvent{
 		Type:      guide.StreamEventStart,
 		Timestamp: time.Now(),
-	}
-	stream := &guide.StreamResponse{
-		CorrelationID:     pp.CorrelationID,
-		RespondingAgentID: pp.AgentID,
-		TargetAgentID:     pp.SourceAgentID,
-		Event:             event,
-	}
-	msg := &guide.Message{
-		ID:            fmt.Sprintf("start_%s_%s", pp.AgentID, uuid.New().String()[:8]),
-		CorrelationID: pp.CorrelationID,
-		Type:          guide.MessageTypeStream,
-		Payload:       stream,
-		SourceAgentID: pp.AgentID,
-		TargetAgentID: pp.SourceAgentID,
-		Timestamp:     time.Now(),
-		Status:        messaging.StatusQueued,
-		Attempt:       1,
-		Priority:      messaging.PriorityNormal,
-	}
-	_ = pp.Bus.Publish(pp.Channels.Responses, msg)
+	})
 }
 
 func (pp *ProgressPublisher) PublishRetry(status providers.RetryEvent) {
 	if pp == nil || pp.Bus == nil || pp.Channels == nil {
 		return
 	}
-	event := &guide.StreamEvent{
+	pp.publishEvent(&guide.StreamEvent{
 		Type: guide.StreamEventRetry,
 		Data: guide.RetryStatus{
 			Attempt:     status.Attempt,
@@ -198,11 +155,18 @@ func (pp *ProgressPublisher) PublishRetry(status providers.RetryEvent) {
 			Err:         status.Err,
 		},
 		Timestamp: time.Now(),
+	})
+}
+
+func (pp *ProgressPublisher) publishEvent(event *guide.StreamEvent) {
+	if pp == nil || pp.Bus == nil || pp.Channels == nil || event == nil {
+		return
 	}
 	stream := &guide.StreamResponse{
 		CorrelationID:     pp.CorrelationID,
 		RespondingAgentID: pp.AgentID,
 		TargetAgentID:     pp.SourceAgentID,
+		Metadata:          MergeStreamMetadata(pp.Metadata, nil),
 		Event:             event,
 	}
 	msg := &guide.Message{
@@ -217,7 +181,9 @@ func (pp *ProgressPublisher) PublishRetry(status providers.RetryEvent) {
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
 	}
-	_ = pp.Bus.Publish(pp.Channels.Responses, msg)
+	publishWithLifecycleState(pp.lifecycle, event.Type, func() {
+		_ = pp.Bus.Publish(pp.Channels.Responses, msg)
+	})
 }
 
 // CompleteWithWatchdog wraps a provider Complete call with a TTFT watchdog.
@@ -305,6 +271,7 @@ func completeStreamingWithWatchdog(
 		if chunk == nil {
 			return
 		}
+		ObserveProviderToolCallChunk(ctx, chunk)
 		switch chunk.Type {
 		case providers.ChunkTypeStart:
 			if chunk.RetryReset && pp != nil {

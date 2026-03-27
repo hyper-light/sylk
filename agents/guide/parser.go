@@ -442,13 +442,20 @@ func (p *Parser) applyFullDSLData(cmd *DSLCommand, input string, dataStr string)
 		return nil
 	}
 
-	data, err := p.parseData(dataStr)
+	dataPayload := strings.TrimSpace(dataStr)
+	if dataPayload != "" && !strings.HasPrefix(dataPayload, "{") {
+		// fullDSLPattern captures the object contents without the outer braces,
+		// so restore them before JSON normalization/parsing.
+		dataPayload = "{" + dataPayload + "}"
+	}
+
+	data, err := p.parseData(dataPayload)
 	if err != nil {
 		return &DSLParseError{
 			Input:    input,
 			Position: strings.Index(input, "{"),
 			Expected: "valid JSON object",
-			Got:      dataStr,
+			Got:      dataPayload,
 			Message:  "invalid JSON data: " + err.Error(),
 		}
 	}

@@ -299,6 +299,23 @@ func (ac *AgentContext) GetPatternByID(id string) (*Pattern, bool) {
 	return p, ok
 }
 
+// UpdatePattern updates a stored pattern in place and returns a copy of the
+// updated record.
+func (ac *AgentContext) UpdatePattern(id string, update func(*Pattern)) *Pattern {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+
+	pattern, ok := ac.patterns[id]
+	if !ok || pattern == nil {
+		return nil
+	}
+	if update != nil {
+		update(pattern)
+	}
+	cloned := *pattern
+	return &cloned
+}
+
 // GetPatternsByCategory retrieves patterns by category
 func (ac *AgentContext) GetPatternsByCategory(category string) []*Pattern {
 	ac.mu.RLock()
@@ -607,4 +624,5 @@ type AgentBriefing struct {
 	UserWants      []*Intent     `json:"user_wants"`
 	UserRejects    []*Intent     `json:"user_rejects"`
 	Patterns       []*Pattern    `json:"patterns"`
+	DeclaredIntents []*WorkIntent `json:"declared_intents,omitempty"`
 }

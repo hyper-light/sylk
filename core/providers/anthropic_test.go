@@ -4,13 +4,34 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func newTestHTTPClient(fn roundTripFunc) *http.Client {
+	return &http.Client{Transport: fn}
+}
+
+func jsonResponse(status int, body string, req *http.Request) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body:    io.NopCloser(strings.NewReader(body)),
+		Request: req,
+	}
+}
 
 func TestAnthropicBuildParams_IncludesNativeWebSearchTool(t *testing.T) {
 	p := &AnthropicProvider{
@@ -196,16 +217,12 @@ func TestAnthropicProviderGenerate_Retries500ForAPIKeyAndOAuth(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			attempts := 0
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			client := newTestHTTPClient(func(r *http.Request) (*http.Response, error) {
 				attempts++
-				w.Header().Set("Content-Type", "application/json")
 				if attempts <= anthropicInternalServerMaxRetries {
-					w.WriteHeader(http.StatusInternalServerError)
-					_, _ = w.Write([]byte(`{"type":"error","error":{"type":"api_error","message":"internal server error"},"request_id":"req_test"}`))
-					return
+					return jsonResponse(http.StatusInternalServerError, `{"type":"error","error":{"type":"api_error","message":"internal server error"},"request_id":"req_test"}`, r), nil
 				}
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{
+				return jsonResponse(http.StatusOK, `{
 					"id":"msg_test",
 					"type":"message",
 					"role":"assistant",
@@ -213,9 +230,8 @@ func TestAnthropicProviderGenerate_Retries500ForAPIKeyAndOAuth(t *testing.T) {
 					"content":[{"type":"text","text":"ok"}],
 					"stop_reason":"end_turn",
 					"usage":{"input_tokens":1,"output_tokens":1}
-				}`))
-			}))
-			defer server.Close()
+				}`, r), nil
+			})
 
 			cfg := AnthropicConfig{
 				BaseConfig: BaseConfig{
@@ -226,8 +242,8 @@ func TestAnthropicProviderGenerate_Retries500ForAPIKeyAndOAuth(t *testing.T) {
 					RetryBaseDelay: time.Millisecond,
 					RetryMaxDelay:  10 * time.Millisecond,
 				},
-				AuthMode: tt.authMode,
-				BaseURL:  server.URL,
+				AuthMode:   tt.authMode,
+				HTTPClient: client,
 			}
 
 			ctx := contextWithRetryRecorder(t)
@@ -276,13 +292,10 @@ func TestAnthropicProviderGenerate_DoesNotRetryNon500(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			attempts := 0
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			client := newTestHTTPClient(func(r *http.Request) (*http.Response, error) {
 				attempts++
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(tt.status)
-				_, _ = w.Write([]byte(`{"type":"error","error":{"type":"api_error","message":"request failed"},"request_id":"req_test"}`))
-			}))
-			defer server.Close()
+				return jsonResponse(tt.status, `{"type":"error","error":{"type":"api_error","message":"request failed"},"request_id":"req_test"}`, r), nil
+			})
 
 			cfg := AnthropicConfig{
 				BaseConfig: BaseConfig{
@@ -293,8 +306,8 @@ func TestAnthropicProviderGenerate_DoesNotRetryNon500(t *testing.T) {
 					RetryBaseDelay: time.Millisecond,
 					RetryMaxDelay:  10 * time.Millisecond,
 				},
-				AuthMode: AnthropicAuthModeAPIKey,
-				BaseURL:  server.URL,
+				AuthMode:   AnthropicAuthModeAPIKey,
+				HTTPClient: client,
 			}
 
 			ctx := contextWithRetryRecorder(t)
@@ -326,14 +339,12 @@ func TestAnthropicProviderGenerate_OAuthSendsRequiredHeadersOnMessages(t *testin
 	var gotQueryBeta string
 	var gotUserAgent string
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := newTestHTTPClient(func(r *http.Request) (*http.Response, error) {
 		gotAuthorization = r.Header.Get("Authorization")
 		gotBetaHeader = r.Header.Get("anthropic-beta")
 		gotQueryBeta = r.URL.Query().Get("beta")
 		gotUserAgent = r.Header.Get("User-Agent")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{
+		return jsonResponse(http.StatusOK, `{
 			"id":"msg_test",
 			"type":"message",
 			"role":"assistant",
@@ -341,9 +352,8 @@ func TestAnthropicProviderGenerate_OAuthSendsRequiredHeadersOnMessages(t *testin
 			"content":[{"type":"text","text":"ok"}],
 			"stop_reason":"end_turn",
 			"usage":{"input_tokens":1,"output_tokens":1}
-		}`))
-	}))
-	defer server.Close()
+		}`, r), nil
+	})
 
 	cfg := AnthropicConfig{
 		BaseConfig: BaseConfig{
@@ -352,8 +362,8 @@ func TestAnthropicProviderGenerate_OAuthSendsRequiredHeadersOnMessages(t *testin
 			MaxTokens: 64,
 			Timeout:   time.Second,
 		},
-		AuthMode: AnthropicAuthModeOAuth,
-		BaseURL:  server.URL,
+		AuthMode:   AnthropicAuthModeOAuth,
+		HTTPClient: client,
 	}
 
 	p, err := NewAnthropicProviderWithAuthService(context.Background(), cfg, nil)
@@ -405,15 +415,13 @@ func TestAnthropicProviderGenerate_APIKeyDoesNotUseOAuthRequestShims(t *testing.
 	var gotQueryBeta string
 	var gotUserAgent string
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := newTestHTTPClient(func(r *http.Request) (*http.Response, error) {
 		gotAuthorization = r.Header.Get("Authorization")
 		gotAPIKey = r.Header.Get("X-Api-Key")
 		gotBetaHeader = r.Header.Get("anthropic-beta")
 		gotQueryBeta = r.URL.Query().Get("beta")
 		gotUserAgent = r.Header.Get("User-Agent")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{
+		return jsonResponse(http.StatusOK, `{
 			"id":"msg_test",
 			"type":"message",
 			"role":"assistant",
@@ -421,9 +429,8 @@ func TestAnthropicProviderGenerate_APIKeyDoesNotUseOAuthRequestShims(t *testing.
 			"content":[{"type":"text","text":"ok"}],
 			"stop_reason":"end_turn",
 			"usage":{"input_tokens":1,"output_tokens":1}
-		}`))
-	}))
-	defer server.Close()
+		}`, r), nil
+	})
 
 	cfg := AnthropicConfig{
 		BaseConfig: BaseConfig{
@@ -432,8 +439,8 @@ func TestAnthropicProviderGenerate_APIKeyDoesNotUseOAuthRequestShims(t *testing.
 			MaxTokens: 64,
 			Timeout:   time.Second,
 		},
-		AuthMode: AnthropicAuthModeAPIKey,
-		BaseURL:  server.URL,
+		AuthMode:   AnthropicAuthModeAPIKey,
+		HTTPClient: client,
 	}
 
 	p, err := NewAnthropicProviderWithAuthService(context.Background(), cfg, nil)

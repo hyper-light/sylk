@@ -846,6 +846,10 @@ func (g *Guide) applyConversationFlow(
 	if g == nil || g.conversation == nil || request == nil {
 		return classification, targetAgentID
 	}
+	if g.router != nil && g.router.IsDSL(request.Input) {
+		g.observeRoutedConversationTarget(request, classification, targetAgentID)
+		return classification, targetAgentID
+	}
 	if updated, updatedTarget, ok := g.applyWorkPreference(ctx, request, classification, targetAgentID); ok {
 		g.observeRoutedConversationTarget(request, updated, updatedTarget)
 		return updated, updatedTarget

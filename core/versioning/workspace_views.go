@@ -29,6 +29,14 @@ type WorkspaceViewAccess interface {
 	DefaultView() WorkspaceView
 }
 
+type sessionWorkspaceViewResolver interface {
+	ResolveSession(ctx context.Context) *SessionVFS
+}
+
+type workspaceViewDelegate interface {
+	WorkspaceViewsDelegate() WorkspaceViewAccess
+}
+
 // WorkspacePathState summarizes a single path across the available workspace
 // layers so agents can reason about committed disk state versus in-flight
 // overlay state explicitly.
@@ -470,17 +478,28 @@ func uniqueWorkspacePaths(paths []string) []string {
 
 var _ WorkspaceViewAccess = (*SessionWorkspaceViews)(nil)
 
+func (s *SessionWorkspaceViews) ResolveSession(ctx context.Context) *SessionVFS {
+	return s.resolveSession(ctx)
+}
+
 // SessionForWorkspaceViews resolves the backing SessionVFS when the provided
 // workspace view implementation is session-backed. Returns nil for non-session
 // view providers.
 func SessionForWorkspaceViews(ctx context.Context, views WorkspaceViewAccess) *SessionVFS {
-	if views == nil {
-		return nil
+	current := views
+	for current != nil {
+		if resolver, ok := current.(sessionWorkspaceViewResolver); ok {
+			return resolver.ResolveSession(ctx)
+		}
+		delegate, ok := current.(workspaceViewDelegate)
+		if !ok {
+			return nil
+		}
+		next := delegate.WorkspaceViewsDelegate()
+		if next == current {
+			return nil
+		}
+		current = next
 	}
-	switch typed := views.(type) {
-	case *SessionWorkspaceViews:
-		return typed.resolveSession(ctx)
-	default:
-		return nil
-	}
+	return nil
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -67,7 +68,7 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 		}
 
 		turnStart := time.Now()
-		resp, err := shared.CompleteWithWatchdog(ctx, p, req, shared.AgentDisplayName("archivalist"))
+		resp, streamed, err := a.completeLLMTurn(ctx, p, req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return "", ctx.Err()
@@ -79,7 +80,9 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
 		shared.AccumulateUsage(ctx, &resp.Usage)
-		shared.PublishIntermediateToolTurn(a.bus, a.channels, ctx, a.id, resp)
+		if !streamed {
+			shared.PublishIntermediateToolTurn(a.bus, a.channels, ctx, a.id, resp)
+		}
 
 		toolCalls := len(resp.ToolCalls)
 		if toolCalls == 0 && a.handoffBridge != nil {
@@ -111,6 +114,104 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 	return "", fmt.Errorf("archivalist exhausted tool-call loop")
 }
 
+type archivalistStreamingProvider interface {
+	archivalistProvider
+	Stream(ctx context.Context, req *providers.Request) (<-chan *providers.StreamChunk, error)
+}
+
+func (a *Archivalist) completeLLMTurn(
+	ctx context.Context,
+	p archivalistProvider,
+	req *providers.Request,
+) (*providers.Response, bool, error) {
+	if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
+		llmruntime.PromoteForUserFacingTurn(req, pp.SourceAgentID, llmruntime.ThoughtVisibilitySummary)
+	}
+	if sp, ok := p.(archivalistStreamingProvider); ok {
+		resp, err := a.streamLLMTurn(ctx, sp, req)
+		return resp, true, err
+	}
+	resp, err := shared.CompleteWithWatchdog(ctx, p, req, shared.AgentDisplayName("archivalist"))
+	return resp, false, err
+}
+
+func (a *Archivalist) streamLLMTurn(
+	ctx context.Context,
+	p archivalistStreamingProvider,
+	req *providers.Request,
+) (*providers.Response, error) {
+	chunks, err := p.Stream(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	cancelWatchdog := shared.StartThinkingWatchdog(ctx, req, shared.AgentDisplayName("archivalist"))
+	defer cancelWatchdog()
+
+	var (
+		streamErr         error
+		firstVisibleChunk bool
+		streamedText      bool
+	)
+	pp := shared.ProgressPublisherFromContext(ctx)
+	emitter := shared.NewThoughtEmitter(llmruntime.EmitsThoughts(req))
+
+	collector := providers.NewStreamCollector(func(chunk *providers.StreamChunk) {
+		if chunk == nil {
+			return
+		}
+		shared.ObserveProviderToolCallChunk(ctx, chunk)
+		switch chunk.Type {
+		case providers.ChunkTypeText:
+			if chunk.Text == "" {
+				return
+			}
+			if !firstVisibleChunk {
+				cancelWatchdog()
+				firstVisibleChunk = true
+			}
+			streamedText = true
+			shared.PublishStreamChunk(a.bus, a.channels, ctx, a.id, chunk.Text)
+		case providers.ChunkTypeThought:
+			if chunk.Text == "" {
+				return
+			}
+			if !firstVisibleChunk {
+				cancelWatchdog()
+				firstVisibleChunk = true
+			}
+			if pp != nil {
+				if thought := emitter.AddDelta(chunk.Text); thought != "" {
+					pp.Publish(thought)
+				}
+			}
+		}
+	})
+
+	for chunk := range chunks {
+		if chunk != nil && chunk.Type == providers.ChunkTypeStart && chunk.RetryReset {
+			streamErr = nil
+		}
+		collector.Add(chunk)
+		if chunk != nil && chunk.Type == providers.ChunkTypeError {
+			streamErr = fmt.Errorf("stream error: %s", chunk.Text)
+		}
+	}
+	if pp != nil {
+		if thought := emitter.Flush(); thought != "" {
+			pp.Publish(thought)
+		}
+	}
+	if streamErr != nil {
+		return collector.Response(), streamErr
+	}
+	resp := collector.Response()
+	if pp != nil && resp != nil && streamedText {
+		shared.MarkResponseStreamedText(resp)
+	}
+	return resp, nil
+}
+
 // applyToolCalls appends the assistant message and tool results to the request.
 func (a *Archivalist) applyToolCalls(
 	ctx context.Context,
@@ -130,8 +231,9 @@ func (a *Archivalist) applyToolCalls(
 
 		var execResult toolruntime.ExecutionResult
 		var execErr error
-		result, err := shared.TimedToolCall(ctx, "archivalist", call, func() (string, error) {
-			execResult, execErr = a.executeToolCall(ctx, call)
+		execCtx := shared.WithActiveToolCall(ctx, call)
+		result, err := shared.TimedToolCall(execCtx, "archivalist", call, func() (string, error) {
+			execResult, execErr = a.executeToolCall(execCtx, call)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {

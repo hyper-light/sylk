@@ -702,6 +702,7 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 	startTime := time.Now()
 	reqCtx, cancel := context.WithCancel(ctx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	g.registerInFlight(fwd.CorrelationID, cancel)
 	g.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer g.clearInFlight(fwd.CorrelationID)
@@ -732,8 +733,11 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 		g.bus, g.channels, g.id, fwd.CorrelationID, fwd.SourceAgentID,
 	))
 
-	// Publish stream start.
-	g.publishStreamStart(reqCtx, fwd.CorrelationID)
+	skillName := guardianDirectSkillName(fwd)
+	publishStream := guardianDirectSkillPublishesStream(skillName)
+	if publishStream {
+		g.publishStreamStart(reqCtx, fwd.CorrelationID)
+	}
 
 	// Execute either a deterministic direct skill or the conversation loop.
 	var (
@@ -742,7 +746,7 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 		usage      *guide.StreamUsage
 		err        error
 	)
-	if skillName := guardianDirectSkillName(fwd); skillName != "" {
+	if skillName != "" {
 		reqCtx = withGuardianDirectSourceAgentID(reqCtx, fwd.SourceAgentID)
 		result, streamText, err = g.executeDirectSkill(reqCtx, skillName, fwd.Input)
 	} else {
@@ -772,10 +776,14 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
 		resp.Error = err.Error()
-		g.publishStreamComplete(reqCtx, fwd.CorrelationID, resp.Error, nil)
+		if publishStream {
+			g.publishStreamComplete(reqCtx, fwd.CorrelationID, resp.Error, nil)
+		}
 	} else {
 		resp.Data = result
-		g.publishStreamComplete(reqCtx, fwd.CorrelationID, streamText, usage)
+		if publishStream {
+			g.publishStreamComplete(reqCtx, fwd.CorrelationID, streamText, usage)
+		}
 	}
 
 	if g.agentPod != nil {
@@ -801,6 +809,15 @@ func (g *Guardian) executeDirectSkill(ctx context.Context, name string, input st
 		return nil, "", fmt.Errorf("guardian direct skill %q: %s", name, result.Error)
 	}
 	return result.Data, formatGuardianDirectSkillOutput(result.Data), nil
+}
+
+func guardianDirectSkillPublishesStream(name string) bool {
+	switch strings.TrimSpace(name) {
+	case "tool_execution_control", "command_execution_control":
+		return false
+	default:
+		return true
+	}
 }
 
 func formatGuardianDirectSkillOutput(data any) string {
@@ -1077,18 +1094,39 @@ func (g *Guardian) clearInFlight(correlationID string) {
 // ---------------------------------------------------------------------------
 
 func (g *Guardian) publishActivity(eventType events.EventType, content string) {
-	g.publishActivityWithVisibility(eventType, events.VisibilityUser, content)
+	g.publishActivityStateWithVisibility(context.Background(), eventType, events.VisibilityUser, content, events.AgentUIStateNone)
 }
 
 func (g *Guardian) publishActivityWithVisibility(eventType events.EventType, visibility events.EventVisibility, content string) {
+	g.publishActivityStateWithVisibility(context.Background(), eventType, visibility, content, events.AgentUIStateNone)
+}
+
+func (g *Guardian) publishActivityState(ctx context.Context, eventType events.EventType, content string, state events.AgentUIState) {
+	g.publishActivityStateWithVisibility(ctx, eventType, events.VisibilityUser, content, state)
+}
+
+func (g *Guardian) publishActivityStateWithVisibility(
+	ctx context.Context,
+	eventType events.EventType,
+	visibility events.EventVisibility,
+	content string,
+	state events.AgentUIState,
+) {
 	if g.activityPub == nil {
 		return
 	}
-	evt := events.NewActivityEvent(eventType, "default", content)
+	logMeta := shared.LogMetaFromContext(ctx)
+	sessionID := strings.TrimSpace(logMeta.SessionID)
+	if sessionID == "" {
+		sessionID = "default"
+	}
+	evt := events.NewActivityEvent(eventType, sessionID, content)
 	evt.AgentID = g.AgentID()
+	evt.CorrelationID = strings.TrimSpace(logMeta.CorrID)
 	evt.Visibility = visibility
 	evt.Data["agent_type"] = "guardian"
 	evt.Data["agent_name"] = "Guardian"
+	events.SetAgentUIState(evt, state)
 	g.activityPub.PublishActivity(evt)
 }
 

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 // ---------------------------------------------------------------------------
@@ -39,12 +40,12 @@ func readFileSkill(g *Guardian) *skills.Skill {
 			if strings.TrimSpace(params.Path) == "" {
 				return nil, fmt.Errorf("path is required")
 			}
-			resolved := resolveGuardianPath(g, params.Path)
-			content, err := os.ReadFile(resolved)
+			fa := versioning.NewDiskFileAccess(resolveGuardianRoot(g, ""), true)
+			result, err := versioning.ReadFileToolResult(ctx, fa, params.Path, params.Offset, params.Limit)
 			if err != nil {
 				return nil, err
 			}
-			return sliceContent(params.Path, string(content), params.Offset, params.Limit), nil
+			return result, nil
 		}).
 		Build()
 }

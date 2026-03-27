@@ -19,6 +19,7 @@ import (
 
 const (
 	defaultGuideResponseTimeout = 90 * time.Second
+	guideMaxToolOutputBytes     = 512
 )
 
 var guideResponseBaseSystemPrompt = prompts.MustLoad("guide", "self_response")
@@ -43,9 +44,24 @@ type GuideResponder struct {
 
 type guideThoughtEmitter func(string)
 type guideEarlyUsageEmitter func(inputTokens int)
+type guideToolCallEmitter func(guideToolCallEvent)
 
 type guideThoughtEmitterKey struct{}
 type guideEarlyUsageEmitterKey struct{}
+type guideToolCallEmitterKey struct{}
+
+type guideToolCallEvent struct {
+	ToolCallKey string
+	ToolName    string
+	ArgsSummary string
+	FullArgs    string
+	Output      string
+	ErrorMsg    string
+	Phase       int
+	StartedAt   time.Time
+	Duration    time.Duration
+	Success     bool
+}
 
 const guideStreamedTextMetadataKey = "guide_streamed_text"
 
@@ -403,6 +419,18 @@ func (r *GuideResponder) applyToolCallsTracked(
 	errCount := 0
 	rerouted := false
 	for _, call := range resp.ToolCalls {
+		toolCallKey := guideToolCallKey(call)
+		summary := summarizeGuideToolArgs(call.Arguments)
+		fullArgs := prettyPrintGuideArgs(call.Arguments)
+		start := time.Now()
+		emitGuideToolCall(ctx, guideToolCallEvent{
+			ToolCallKey: toolCallKey,
+			ToolName:    call.Name,
+			ArgsSummary: summary,
+			FullArgs:    fullArgs,
+			Phase:       0,
+			StartedAt:   start,
+		})
 		result, err := executeGuideToolCall(ctx, call, r.toolInvoker)
 		isError := false
 		if err != nil {
@@ -415,6 +443,22 @@ func (r *GuideResponder) applyToolCallsTracked(
 				errCount++
 			}
 		}
+		errorMsg := ""
+		if isError && err != nil {
+			errorMsg = err.Error()
+		}
+		emitGuideToolCall(ctx, guideToolCallEvent{
+			ToolCallKey: toolCallKey,
+			ToolName:    call.Name,
+			ArgsSummary: summary,
+			FullArgs:    fullArgs,
+			Output:      truncateGuideToolOutput(result, guideMaxToolOutputBytes),
+			ErrorMsg:    errorMsg,
+			Phase:       1,
+			StartedAt:   start,
+			Duration:    time.Since(start),
+			Success:     !isError,
+		})
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,
@@ -448,6 +492,113 @@ func guideToolErrorPayload(err error) string {
 		return `{"error":"tool execution failed"}`
 	}
 	return string(payload)
+}
+
+func summarizeGuideToolArgs(rawJSON string) string {
+	rawJSON = strings.TrimSpace(rawJSON)
+	if rawJSON == "" || rawJSON == "{}" {
+		return ""
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(rawJSON), &parsed); err != nil {
+		return ""
+	}
+	for _, key := range []string{"path", "file_path", "pattern", "query", "command", "script", "url", "name", "content", "message"} {
+		if value, ok := parsed[key]; ok {
+			if rendered := stringifyGuideArgValue(value); rendered != "" {
+				return truncateGuideArgSummary(key + "=" + rendered)
+			}
+		}
+	}
+	for key, value := range parsed {
+		if rendered := stringifyGuideArgValue(value); rendered != "" {
+			return truncateGuideArgSummary(key + "=" + rendered)
+		}
+	}
+	return ""
+}
+
+func stringifyGuideArgValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case float64:
+		if typed == float64(int64(typed)) {
+			return fmt.Sprintf("%d", int64(typed))
+		}
+		return fmt.Sprintf("%g", typed)
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	default:
+		return ""
+	}
+}
+
+func truncateGuideArgSummary(summary string) string {
+	const maxLen = 60
+	if len([]rune(summary)) <= maxLen {
+		return summary
+	}
+	runes := []rune(summary)
+	return string(runes[:maxLen-3]) + "..."
+}
+
+func prettyPrintGuideArgs(rawJSON string) string {
+	rawJSON = strings.TrimSpace(rawJSON)
+	if rawJSON == "" || rawJSON == "{}" {
+		return rawJSON
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(rawJSON), &parsed); err != nil {
+		return rawJSON
+	}
+	formatted, err := json.MarshalIndent(parsed, "", "  ")
+	if err != nil {
+		return rawJSON
+	}
+	return string(formatted)
+}
+
+func guideToolCallKey(call providers.ToolCall) string {
+	if id := strings.TrimSpace(call.ID); id != "" {
+		return "id:" + id
+	}
+	name := strings.TrimSpace(call.Name)
+	if name == "" {
+		return ""
+	}
+	return "sig:" + name + "\x00" + normalizeGuideToolArguments(call.Arguments)
+}
+
+func normalizeGuideToolArguments(arguments string) string {
+	arguments = strings.TrimSpace(arguments)
+	if arguments == "" {
+		return ""
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(arguments), &parsed); err == nil {
+		if normalized, marshalErr := json.Marshal(parsed); marshalErr == nil {
+			return string(normalized)
+		}
+	}
+	return strings.Join(strings.Fields(arguments), " ")
+}
+
+func truncateGuideToolOutput(output string, maxBytes int) string {
+	if len(output) <= maxBytes {
+		return output
+	}
+	if maxBytes <= 3 {
+		return "..."
+	}
+	cut := maxBytes - 3
+	for cut > 0 && cut < len(output) && output[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return output[:cut] + "..."
 }
 
 func estimateGuidePromptInputTokens(req *providers.Request) int {
@@ -507,6 +658,13 @@ func withGuideEarlyUsageEmitter(ctx context.Context, emit guideEarlyUsageEmitter
 	return context.WithValue(ctx, guideEarlyUsageEmitterKey{}, emit)
 }
 
+func withGuideToolCallEmitter(ctx context.Context, emit guideToolCallEmitter) context.Context {
+	if emit == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, guideToolCallEmitterKey{}, emit)
+}
+
 func emitGuideThought(ctx context.Context, text string) {
 	if ctx == nil {
 		return
@@ -520,6 +678,17 @@ func emitGuideThought(ctx context.Context, text string) {
 		return
 	}
 	emit(trimmed)
+}
+
+func emitGuideToolCall(ctx context.Context, event guideToolCallEvent) {
+	if ctx == nil {
+		return
+	}
+	emit, ok := ctx.Value(guideToolCallEmitterKey{}).(guideToolCallEmitter)
+	if !ok || emit == nil {
+		return
+	}
+	emit(event)
 }
 
 func emitGuideEarlyUsage(ctx context.Context, inputTokens int) {

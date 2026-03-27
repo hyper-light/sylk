@@ -214,8 +214,9 @@ func (e *Engineer) applyToolCalls(
 		}
 		var execResult toolruntime.ExecutionResult
 		var execErr error
-		result, err := shared.TimedToolCall(ctx, "engineer", call, func() (string, error) {
-			execResult, execErr = e.executeToolCallWithSurface(ctx, call, surface)
+		execCtx := shared.WithActiveToolCall(ctx, call)
+		result, err := shared.TimedToolCall(execCtx, "engineer", call, func() (string, error) {
+			execResult, execErr = e.executeToolCallWithSurface(execCtx, call, surface)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {

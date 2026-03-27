@@ -6,12 +6,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
+
+var architectSnapshotVersionPattern = regexp.MustCompile(`_v(\d+)\.(\d+)\.json$`)
 
 func loadPlanContextSkill(gi *GlobalInspector) *skills.Skill {
 	return skills.NewSkill("load_plan_context").
@@ -184,7 +189,19 @@ func consultArchivalistContextSkill(gi *GlobalInspector) *skills.Skill {
 }
 
 func (gi *GlobalInspector) consultAgent(ctx context.Context, target, prompt string, metadata map[string]any) (string, error) {
-	msg, err := gi.requestRouteSync(ctx, target, strings.TrimSpace(prompt), metadata)
+	prompt = strings.TrimSpace(prompt)
+	branchCtx, branch := agentShared.BeginInterAgentBranch(ctx, agentShared.InterAgentBranchSpec{
+		Kind:       agentShared.InterAgentToolEventKindConsult,
+		ToolName:   "consult_" + strings.ReplaceAll(strings.TrimSpace(target), "-", "_"),
+		AgentTypes: []string{target},
+		Summary:    prompt,
+		Args: map[string]any{
+			"target": target,
+			"query":  prompt,
+		},
+	})
+	msg, err := gi.requestRouteSync(branchCtx, target, prompt, branch.ApplyMetadata(branchCtx, metadata))
+	branch.CompleteFromMessage(branchCtx, msg, err)
 	if err != nil {
 		return "", err
 	}
@@ -358,7 +375,44 @@ func architectSnapshotJSONPath(sessionID, planID string) string {
 	if planID == "" {
 		return ""
 	}
-	return filepath.Join(".sylk", "sessions", sessionID, "agents", "architect", "plans", planID+".json")
+	baseDir := filepath.Join(".sylk", "sessions", sessionID, "agents", "architect", "plans")
+	matches, err := filepath.Glob(filepath.Join(baseDir, planID+"_v*.json"))
+	if err == nil {
+		var (
+			bestPath    string
+			bestVersion versioning.SemanticVersion
+		)
+		for _, match := range matches {
+			ver, ok := parseArchitectSnapshotVersion(match)
+			if !ok {
+				continue
+			}
+			if bestPath == "" || ver.Compare(bestVersion) > 0 {
+				bestPath = match
+				bestVersion = ver
+			}
+		}
+		if bestPath != "" {
+			return bestPath
+		}
+	}
+	return filepath.Join(baseDir, planID+".json")
+}
+
+func parseArchitectSnapshotVersion(path string) (versioning.SemanticVersion, bool) {
+	match := architectSnapshotVersionPattern.FindStringSubmatch(strings.TrimSpace(path))
+	if len(match) != 3 {
+		return versioning.SemanticVersion{}, false
+	}
+	major, err := strconv.ParseUint(match[1], 10, 32)
+	if err != nil {
+		return versioning.SemanticVersion{}, false
+	}
+	minor, err := strconv.ParseUint(match[2], 10, 32)
+	if err != nil {
+		return versioning.SemanticVersion{}, false
+	}
+	return versioning.SemanticVersion{Major: uint32(major), Minor: uint32(minor)}, true
 }
 
 func validPlanContextPath(path string) bool {

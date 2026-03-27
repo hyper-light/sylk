@@ -20,6 +20,7 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/fetch"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
@@ -32,6 +33,10 @@ const (
 	DefaultModel       = "gpt-5.4-pro"
 	DefaultMaxToolRuns = 32
 )
+
+const academicChildProgressMessage = "Researching external sources and codebase fit."
+
+var academicChildProgressKeepaliveInterval = 30 * time.Second
 
 // academicProvider is the minimal interface the Academic needs from its LLM.
 // Satisfied by *providers.AnthropicProvider.
@@ -86,7 +91,7 @@ type Academic struct {
 
 	// Synchronous consultation bus (Librarian responses).
 	pendingMu       sync.Mutex
-	pendingConsults map[string]chan *guide.Message
+	pendingConsults map[string]*shared.PendingSyncWait
 
 	// Research state
 	mu            sync.RWMutex
@@ -103,6 +108,20 @@ type Academic struct {
 
 	// Handoff integration
 	handoffBridge *handoff.HandoffBridge
+}
+
+// routeHopsKey carries the incoming ForwardedRequest's hop count through the
+// Academic request context so child consult RouteRequests preserve the full
+// routing chain just like Architect.
+type routeHopsKey struct{}
+
+func withRouteHops(ctx context.Context, hops int) context.Context {
+	return context.WithValue(ctx, routeHopsKey{}, hops)
+}
+
+func routeHopsFromContext(ctx context.Context) int {
+	hops, _ := ctx.Value(routeHopsKey{}).(int)
+	return hops
 }
 
 // Config holds configuration for the Academic agent.
@@ -131,14 +150,17 @@ type Config struct {
 	SessionID string
 
 	// Research configuration
-	MaxSources          int           // Max sources to consult per query (default: 10)
-	CacheExpiry         time.Duration // How long to cache results (default: 30m)
-	LibrarianTimeout    time.Duration // Timeout for Librarian consultation (default: 30s)
-	RequireLibrarian    bool          // Require Librarian validation (default: true)
-	MemoryThreshold     MemoryThreshold
-	DefaultConfidence   ConfidenceLevel
-	MinApplicability    float64 // Minimum applicability score to include (default: 0.3)
-	OutcomeHistoryLimit int     // Max outcomes to track (default: 1000)
+	MaxSources                  int           // Max sources to consult per query (default: 10)
+	CacheExpiry                 time.Duration // How long to cache results (default: 30m)
+	LibrarianTimeout            time.Duration // Timeout for Librarian consultation (default: 30s)
+	RequireLibrarian            bool          // Require Librarian validation (default: true)
+	DisableSearchDiscipline     bool          // When true, allows Academic to answer without an observed native web search.
+	SearchDisciplineMaxAttempts int           // Extra reminder turns before failing a required-search request (default: 2)
+	MaxNativeWebSearchCalls     int           // Maximum provider-native web_search calls allowed in a single Academic turn (default: 6)
+	MemoryThreshold             MemoryThreshold
+	DefaultConfidence           ConfidenceLevel
+	MinApplicability            float64 // Minimum applicability score to include (default: 0.3)
+	OutcomeHistoryLimit         int     // Max outcomes to track (default: 1000)
 
 	// Logger
 	Logger *slog.Logger
@@ -180,7 +202,7 @@ func New(cfg Config, provider academicProvider) (*Academic, error) {
 		skills:            skillsRegistry,
 		hooks:             hookRegistry,
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
-		pendingConsults:   make(map[string]chan *guide.Message),
+		pendingConsults:   make(map[string]*shared.PendingSyncWait),
 		researchCache:     make(map[string]*ResearchResult),
 		sourceIndex:       make(map[string]*Source),
 		outcomeHistory:    NewOutcomeHistory(cfg.OutcomeHistoryLimit),
@@ -237,6 +259,12 @@ func applyConfigDefaults(cfg Config) Config {
 	}
 	if cfg.LibrarianTimeout == 0 {
 		cfg.LibrarianTimeout = 30 * time.Second
+	}
+	if cfg.SearchDisciplineMaxAttempts <= 0 {
+		cfg.SearchDisciplineMaxAttempts = 2
+	}
+	if cfg.MaxNativeWebSearchCalls <= 0 {
+		cfg.MaxNativeWebSearchCalls = 6
 	}
 	if cfg.MemoryThreshold.CheckpointThreshold == 0 {
 		cfg.MemoryThreshold = DefaultMemoryThreshold()
@@ -480,7 +508,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	shared.LogIncomingRequest(a.steering.EventLogger(), fwd, "academic")
 
 	shared.EmitDispatchACK(a.bus, fwd.Metadata, "academic", "academic", fwd.CorrelationID)
-	a.publishActivity(events.EventTypeAgentAction, "Processing research request")
+	a.publishActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentAction, "Processing research request")
 
 	if a.config.RequestGuard != nil {
 		release := a.config.RequestGuard()
@@ -508,7 +536,15 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		SourceAgentType: "academic",
 		SourceAgentName: "Academic",
 	})
-	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
+	reqCtx = withRouteHops(reqCtx, fwd.Hops)
+	ctx := shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
+	ctx = shared.WithStreamContextMetadata(ctx, shared.MergeStreamMetadata(
+		shared.StreamResponseMetadataFromContext(ctx),
+		map[string]any{
+			"agent_type": "academic",
+			"agent_name": "Academic",
+		},
+	))
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
@@ -518,9 +554,10 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		AgentID:     "academic",
 		SessionID:   fwd.SessionID,
 	})
+	ctx = shared.WithAutomaticHandoffEnabled(ctx, shared.AutomaticHandoffAllowedForForwardedRequest(fwd))
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	gov := shared.NewContextGovernor(a.config.Model, a.config.MaxOutputTokens, 0)
-	if a.handoffBridge != nil {
+	if a.handoffBridge != nil && shared.AutomaticHandoffEnabled(ctx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
 			return a.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
 		}
@@ -533,6 +570,8 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	if !fwd.FireAndForget {
 		shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
 	}
+	stopProgressKeepalive := a.startChildProgressKeepalive(ctx, fwd)
+	defer stopProgressKeepalive()
 
 	result, err := a.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, "academic", fwd.SessionID, time.Since(startTime), err)
@@ -560,7 +599,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		shared.PublishStreamError(a.bus, a.channels, ctx, a.id, err)
 		shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
 		resp.Error = err.Error()
-		a.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Research failed: %s", err.Error()))
+		a.publishActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentError, fmt.Sprintf("Research failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
 			generateMessageID(),
 			fwd.CorrelationID,
@@ -572,7 +611,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 
 	resp.Data = result
 	shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
-	a.publishActivity(events.EventTypeSuccess, "Research task completed")
+	a.publishActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeSuccess, "Research task completed")
 
 	respMsg := guide.NewResponseMessage(generateMessageID(), resp)
 	return a.bus.Publish(a.channels.Responses, respMsg)
@@ -580,6 +619,44 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 
 func generateMessageID() string {
 	return fmt.Sprintf("academic_msg_%s", uuid.New().String()[:8])
+}
+
+func (a *Academic) startChildProgressKeepalive(ctx context.Context, fwd *guide.ForwardedRequest) func() {
+	if fwd == nil || fwd.FireAndForget || llmruntime.IsUserFacingSource(fwd.SourceAgentID) {
+		return func() {}
+	}
+	pp := shared.ProgressPublisherFromContext(ctx)
+	if pp == nil {
+		return func() {}
+	}
+
+	pp.PublishState(events.AgentUIStateSearching, academicChildProgressMessage)
+
+	interval := academicChildProgressKeepaliveInterval
+	if interval <= 0 {
+		return func() {}
+	}
+
+	stop := make(chan struct{})
+	var once sync.Once
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				pp.PublishState(events.AgentUIStateSearching, "")
+			}
+		}
+	}()
+
+	return func() {
+		once.Do(func() { close(stop) })
+	}
 }
 
 func (a *Academic) registerRequestCancel(correlationID string, cancel context.CancelFunc) {
@@ -681,12 +758,7 @@ func (a *Academic) handleConversation(ctx context.Context, fwd *guide.ForwardedR
 	}
 
 	handoff := academicConversationHandoffFromForwarded(fwd)
-	toolSurface := toolruntime.Surface(a.toolRuntime())
-	if handoff != nil && a.toolRuntime() != nil {
-		if view, err := a.toolRuntime().RequestView("reroute_request"); err == nil {
-			toolSurface = view
-		}
-	}
+	toolSurface := a.requestToolSurfaceForForwardedRequest(fwd, academicConversationExtraTools(handoff)...)
 	a.prepareSkillsForInput(query)
 	llmReq := &providers.Request{
 		SystemPrompt: buildAcademicConversationSystemPrompt(a.config.SystemPrompt, handoff),
@@ -695,7 +767,7 @@ func (a *Academic) handleConversation(ctx context.Context, fwd *guide.ForwardedR
 		Model:        a.config.Model,
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
-	a.applyLLMRuntimeProfile(llmReq, "conversation")
+	a.applyLLMRuntimeProfile(ctx, llmReq, "conversation")
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
@@ -751,6 +823,7 @@ func buildAcademicConversationSystemPrompt(base string, handoff *academicConvers
 	sections := []string{
 		strings.TrimSpace(base),
 		strings.TrimSpace(AcademicConversationPrompt),
+		strings.TrimSpace(academicExternalResearchDisciplinePrompt()),
 	}
 	if handoff != nil {
 		sections = append(sections, academicConversationHandoffPrompt(handoff))
@@ -762,6 +835,103 @@ func buildAcademicConversationSystemPrompt(base string, handoff *academicConvers
 		}
 	}
 	return strings.Join(filtered, "\n\n---\n\n")
+}
+
+func academicConversationExtraTools(handoff *academicConversationHandoff) []string {
+	if handoff == nil {
+		return nil
+	}
+	return []string{"reroute_request"}
+}
+
+func buildAcademicRecallPrompt(fwd *guide.ForwardedRequest) string {
+	if fwd == nil {
+		return academicExternalResearchDisciplinePrompt()
+	}
+	request := strings.TrimSpace(fwd.Input)
+	if request == "" {
+		return academicExternalResearchDisciplinePrompt()
+	}
+
+	var b strings.Builder
+	b.WriteString("Research the following request using evidence-backed external sources and codebase validation.\n")
+	if fwd.Domain != "" && fwd.Domain != guide.DomainUnknown {
+		b.WriteString("Domain: ")
+		b.WriteString(string(fwd.Domain))
+		b.WriteString("\n")
+	}
+	if contract := academicCompletionContractForForwardedRequest(fwd); contract != nil {
+		b.WriteString(contract.guidancePrompt())
+		b.WriteString("\n")
+	}
+	b.WriteString(academicExternalResearchDisciplinePrompt())
+	if extra := academicForwardedResearchPrompt(fwd); extra != "" {
+		b.WriteString("\n\n")
+		b.WriteString(extra)
+	}
+	b.WriteString("\n\nRequest:\n")
+	b.WriteString(request)
+	return b.String()
+}
+
+func academicExternalResearchDisciplinePrompt() string {
+	return strings.TrimSpace(
+		"Use an explicit research workflow. " +
+			"1. Plan: identify the concrete sub-questions that must be answered. " +
+			"2. Retrieve: use `web_search` to discover authoritative candidates for each sub-question and follow only the most relevant second-order leads. " +
+			"3. Ground: when a result looks promising, inspect the source itself with `web_fetch`, `fetch_document`, or a bounded `crawl_links` call before relying on specifics. " +
+			"4. Synthesize: stop only when more searching is unlikely to materially change the conclusion. " +
+			"Do not answer from memory alone when source-backed or current evidence matters, and do not keep issuing broad `web_search` calls once you have promising sources that should be fetched or ingested. " +
+			"Consult the Librarian before finalizing any recommendation so the result matches the codebase reality.",
+	)
+}
+
+func academicForwardedResearchPrompt(fwd *guide.ForwardedRequest) string {
+	if fwd == nil || academicConversationHandoffFromForwarded(fwd) != nil {
+		return ""
+	}
+	if !academicForwardedSourceMatches(fwd, "architect") {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("This research will inform Architect planning. Prefer durable, cited output over transient prose.\n")
+	b.WriteString("If you gather enough evidence to produce a reusable artifact, use `author_research_paper` so Architect receives structured research instead of only a chat answer.\n")
+	b.WriteString("Use `clone_via_librarian` or `crawl_links` when they materially improve source quality or implementation fit.\n")
+	b.WriteString("You may consult the Librarian for codebase fit and the Archivalist for historical precedent, but do not repeat the same consultation question to the same agent in one run.")
+	return strings.TrimSpace(b.String())
+}
+
+func academicForwardedResearchExtraTools(fwd *guide.ForwardedRequest) []string {
+	if fwd == nil || academicConversationHandoffFromForwarded(fwd) != nil {
+		return nil
+	}
+	if !academicForwardedSourceMatches(fwd, "architect") {
+		return nil
+	}
+	switch fwd.Intent {
+	case guide.IntentRecall, guide.IntentCheck, guide.IntentFetch:
+		return []string{"author_research_paper", "clone_via_librarian", "crawl_links"}
+	default:
+		return nil
+	}
+}
+
+func (a *Academic) withRequestResearchExecutionState(ctx context.Context, fwd *guide.ForwardedRequest) context.Context {
+	if ctx == nil || fwd == nil {
+		return ctx
+	}
+	if academicConversationHandoffFromForwarded(fwd) != nil {
+		return ctx
+	}
+	if academicResearchExecutionStateFromContext(ctx) != nil {
+		return ctx
+	}
+	sessionID := strings.TrimSpace(fwd.SessionID)
+	if sessionID == "" {
+		sessionID = versioningSessionIDOrDefault(ctx, a.config.SessionID)
+	}
+	return WithAcademicResearchExecutionState(ctx, newAcademicResearchExecutionState(sessionID))
 }
 
 func academicConversationHandoffPrompt(handoff *academicConversationHandoff) string {
@@ -871,6 +1041,7 @@ func trimAndFilterStrings(values []string) []string {
 // handleFetch processes fetch requests. For repository clones, delegates to the
 // Librarian via bus consultation. For web URLs, uses the fetch pipeline directly.
 func (a *Academic) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	ctx = a.withRequestResearchExecutionState(ctx, fwd)
 	fetchPrompt := fmt.Sprintf(
 		"The user wants to fetch or download external content. "+
 			"If the request involves a git repository, use clone_via_librarian to have the Librarian clone it into the searchable package store. "+
@@ -879,22 +1050,29 @@ func (a *Academic) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest)
 			"Provide a clear summary of what was fetched.\n\n%s",
 		fwd.Input,
 	)
+	if contract := academicCompletionContractForForwardedRequest(fwd); contract != nil {
+		fetchPrompt = contract.guidancePrompt() + "\n\n" + fetchPrompt
+	}
+	if extra := academicForwardedResearchPrompt(fwd); extra != "" {
+		fetchPrompt = extra + "\n\n" + fetchPrompt
+	}
 
+	surface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
 	a.prepareSkillsForInput(fetchPrompt)
 	llmReq := &providers.Request{
 		SystemPrompt: a.config.SystemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: fetchPrompt}},
-		Tools:        a.buildToolDefinitions(),
+		Tools:        a.buildToolDefinitionsWithSurface(surface),
 		Model:        a.config.Model,
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
-	a.applyLLMRuntimeProfile(llmReq, "fetch")
+	a.applyLLMRuntimeProfile(ctx, llmReq, "fetch")
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return a.executeToolLoop(ctx, llmReq, ledger, a.toolRuntime())
+		return a.executeToolLoop(ctx, llmReq, ledger, surface)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("fetch failed: %w", err)
@@ -908,23 +1086,29 @@ func (a *Academic) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest)
 
 // handleRecall processes recall (query) requests using the LLM tool loop.
 func (a *Academic) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	ctx = a.withRequestResearchExecutionState(ctx, fwd)
+	recallPrompt := buildAcademicRecallPrompt(fwd)
 	systemPrompt := a.config.SystemPrompt
 
-	a.prepareSkillsForInput(fwd.Input)
+	surface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
+	if contract := academicCompletionContractForForwardedRequest(fwd); contract != nil {
+		ctx = WithAcademicCompletionContract(ctx, contract)
+	}
+	a.prepareSkillsForInput(recallPrompt)
 	llmReq := &providers.Request{
 		SystemPrompt: systemPrompt,
-		Messages:     []providers.Message{{Role: providers.RoleUser, Content: fwd.Input}},
-		Tools:        a.buildToolDefinitions(),
+		Messages:     []providers.Message{{Role: providers.RoleUser, Content: recallPrompt}},
+		Tools:        a.buildToolDefinitionsWithSurface(surface),
 		Model:        a.config.Model,
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
-	a.applyLLMRuntimeProfile(llmReq, "recall")
+	a.applyLLMRuntimeProfile(ctx, llmReq, "recall")
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return a.executeToolLoop(ctx, llmReq, ledger, a.toolRuntime())
+		return a.executeToolLoop(ctx, llmReq, ledger, surface)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("research recall failed: %w", err)
@@ -938,28 +1122,37 @@ func (a *Academic) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest
 
 // handleCheck processes check (verification) requests using the LLM tool loop.
 func (a *Academic) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	ctx = a.withRequestResearchExecutionState(ctx, fwd)
 	checkPrompt := fmt.Sprintf(
 		"Verify the following claim against your knowledge of best practices, "+
 			"research, and technical standards. Use web_search when fresh external sources are needed, and use your tools to consult the "+
 			"Librarian for codebase context. Provide a structured assessment:\n\n%s",
 		fwd.Input,
 	)
+	if contract := academicCompletionContractForForwardedRequest(fwd); contract != nil {
+		checkPrompt = contract.guidancePrompt() + "\n\n" + checkPrompt
+		ctx = WithAcademicCompletionContract(ctx, contract)
+	}
+	if extra := academicForwardedResearchPrompt(fwd); extra != "" {
+		checkPrompt = extra + "\n\n" + checkPrompt
+	}
 
+	surface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
 	a.prepareSkillsForInput(checkPrompt)
 	llmReq := &providers.Request{
 		SystemPrompt: a.config.SystemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: checkPrompt}},
-		Tools:        a.buildToolDefinitions(),
+		Tools:        a.buildToolDefinitionsWithSurface(surface),
 		Model:        a.config.Model,
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
-	a.applyLLMRuntimeProfile(llmReq, "check")
+	a.applyLLMRuntimeProfile(ctx, llmReq, "check")
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return a.executeToolLoop(ctx, llmReq, ledger, a.toolRuntime())
+		return a.executeToolLoop(ctx, llmReq, ledger, surface)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("research check failed: %w", err)
@@ -985,15 +1178,24 @@ func (a *Academic) handleHelp(_ context.Context, _ *guide.ForwardedRequest) (any
 // Synchronous Consultation (Bus-based)
 // =============================================================================
 
-// routeSyncTimeout bounds how long the academic waits for a bus response.
+// routeSyncTimeout overrides the default target-aware consultation timeout in
+// tests. When left at the shared default, Academic uses the target-aware
+// consultation timeout policy.
 var routeSyncTimeout = shared.DefaultConsultationTimeout
 
-func (a *Academic) registerPendingConsult(correlationID string) <-chan *guide.Message {
-	ch := make(chan *guide.Message, 1)
+func academicConsultationTimeout(target string) time.Duration {
+	if routeSyncTimeout != shared.DefaultConsultationTimeout {
+		return routeSyncTimeout
+	}
+	return shared.ConsultationInactivityTimeout(target)
+}
+
+func (a *Academic) registerPendingConsult(correlationID string) *shared.PendingSyncWait {
+	wait := shared.NewPendingSyncWait()
 	a.pendingMu.Lock()
-	a.pendingConsults[correlationID] = ch
+	a.pendingConsults[correlationID] = wait
 	a.pendingMu.Unlock()
-	return ch
+	return wait
 }
 
 func (a *Academic) clearPendingConsult(correlationID string) {
@@ -1002,24 +1204,39 @@ func (a *Academic) clearPendingConsult(correlationID string) {
 	a.pendingMu.Unlock()
 }
 
-// deliverConsultResponse delivers terminal messages (response or error) to
-// synchronous waiters. Stream events are filtered out.
+// deliverConsultResponse delivers terminal messages and stream activity to
+// synchronous waiters.
 func (a *Academic) deliverConsultResponse(msg *guide.Message) {
 	if msg == nil || msg.CorrelationID == "" {
 		return
 	}
-	if msg.Type != guide.MessageTypeResponse && msg.Type != guide.MessageTypeError {
-		return
-	}
-	a.pendingMu.Lock()
-	ch := a.pendingConsults[msg.CorrelationID]
-	a.pendingMu.Unlock()
-	if ch == nil {
-		return
-	}
-	select {
-	case ch <- msg:
+	switch msg.Type {
+	case guide.MessageTypeResponse, guide.MessageTypeError:
+		a.pendingMu.Lock()
+		wait := a.pendingConsults[msg.CorrelationID]
+		a.pendingMu.Unlock()
+		if wait == nil {
+			return
+		}
+		select {
+		case wait.Response <- msg:
+		default:
+		}
+	case guide.MessageTypeStream:
+		for _, correlationID := range shared.PendingSyncActivityCorrelations(msg) {
+			a.pendingMu.Lock()
+			wait := a.pendingConsults[correlationID]
+			a.pendingMu.Unlock()
+			if wait == nil {
+				continue
+			}
+			select {
+			case wait.Activity <- struct{}{}:
+			default:
+			}
+		}
 	default:
+		return
 	}
 }
 
@@ -1030,7 +1247,7 @@ func (a *Academic) publishConsultRequest(req *guide.RouteRequest) error {
 	if req.CorrelationID == "" {
 		req.CorrelationID = "corr_" + uuid.NewString()
 	}
-	req.SourceAgentID = "academic"
+	req.SourceAgentID = strings.TrimSpace(a.id)
 	req.SourceAgentName = "academic"
 	if req.Timestamp.IsZero() {
 		req.Timestamp = time.Now()
@@ -1048,46 +1265,46 @@ func (a *Academic) requestConsultSync(ctx context.Context, req *guide.RouteReque
 	if req == nil {
 		return nil, fmt.Errorf("route request is required")
 	}
+	waitCtx, release := shared.WithoutDeadlineCancellation(ctx)
+	defer release()
+
+	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, req.TargetAgentID, req.Input, req.Metadata)
+	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
 	if req.CorrelationID == "" {
 		req.CorrelationID = "corr_" + uuid.NewString()
 	}
+	if req.ParentCorrelationID == "" {
+		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+			req.ParentCorrelationID = stream.CorrelationID
+		}
+	}
+	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
+	if req.TargetAgentID != "" {
+		req.ExplicitTarget = true
+	}
+	if req.Hops == 0 {
+		req.Hops = routeHopsFromContext(branchCtx)
+	}
 
-	waitCh := a.registerPendingConsult(req.CorrelationID)
+	wait := a.registerPendingConsult(req.CorrelationID)
 	defer a.clearPendingConsult(req.CorrelationID)
 
 	if err := a.publishConsultRequest(req); err != nil {
+		branch.Complete(branchCtx, "", "", err)
 		return nil, err
 	}
 
-	var response *guide.Message
-	err := shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
-		AttemptTimeout: routeSyncTimeout,
-		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
-		OnRefresh: func(info shared.ContextLeaseRefresh) {
-			if a.logger != nil {
-				a.logger.Info("consultation wait lease refreshed",
-					"target", req.TargetAgentID,
-					"correlation_id", req.CorrelationID,
-					"refresh_count", info.RefreshCount,
-					"attempt_timeout", info.AttemptTimeout.String(),
-					"error", info.Error)
-			}
-		},
-	}, func(waitCtx context.Context) error {
-		select {
-		case <-waitCtx.Done():
-			return waitCtx.Err()
-		case response = <-waitCh:
-			return nil
-		}
-	})
+	response, err := shared.WaitForPendingSyncResponse(
+		branchCtx,
+		fmt.Sprintf("consultation to %q", req.TargetAgentID),
+		academicConsultationTimeout(req.TargetAgentID),
+		wait,
+	)
 	if err != nil {
-		return nil, shared.WrapLeaseTimeoutError(
-			fmt.Sprintf("consultation to %q", req.TargetAgentID),
-			routeSyncTimeout,
-			err,
-		)
+		branch.Complete(branchCtx, "", "", err)
+		return nil, err
 	}
+	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }
 
@@ -1097,12 +1314,32 @@ func (a *Academic) requestConsultation(
 	ctx context.Context,
 	target, query, scope, sessionID string,
 ) (*shared.ConsultationEvidence, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		sessionID = versioning.SessionIDFromContext(ctx)
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(a.config.SessionID)
+	}
 	req := &guide.RouteRequest{
 		Input:         query,
 		TargetAgentID: target,
 		SessionID:     sessionID,
 	}
-	response, err := a.requestConsultSync(ctx, req)
+	branchCtx, branch := shared.BeginInterAgentBranch(ctx, shared.InterAgentBranchSpec{
+		Kind:       shared.InterAgentToolEventKindConsult,
+		ToolName:   "consult_" + strings.ReplaceAll(strings.TrimSpace(target), "-", "_"),
+		AgentTypes: []string{target},
+		Summary:    query,
+		Args: map[string]any{
+			"target": target,
+			"query":  query,
+			"scope":  scope,
+		},
+	})
+	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
+	response, err := a.requestConsultSync(branchCtx, req)
+	branch.CompleteFromMessage(branchCtx, response, err)
 	if err != nil {
 		return failedConsultEvidence(target, query, scope, req.CorrelationID, err), err
 	}
@@ -1213,7 +1450,7 @@ func (a *Academic) PublishRequest(req *guide.RouteRequest) error {
 		return fmt.Errorf("academic is not running")
 	}
 
-	req.SourceAgentID = "academic"
+	req.SourceAgentID = strings.TrimSpace(a.id)
 	req.SourceAgentName = "academic"
 
 	msg := guide.NewRequestMessage(generateMessageID(), req)
@@ -1226,6 +1463,18 @@ func (a *Academic) PublishRequest(req *guide.RouteRequest) error {
 
 // Research performs research on a topic via the LLM tool loop.
 func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*ResearchResult, error) {
+	if contract := AcademicCompletionContractFromContext(ctx); contract == nil {
+		if derived := academicCompletionContractForResearchQuery(query); derived != nil {
+			ctx = WithAcademicCompletionContract(ctx, derived)
+		}
+	}
+	if academicResearchExecutionStateFromContext(ctx) == nil {
+		sessionID := strings.TrimSpace(a.config.SessionID)
+		if query != nil && strings.TrimSpace(query.SessionID) != "" {
+			sessionID = strings.TrimSpace(query.SessionID)
+		}
+		ctx = WithAcademicResearchExecutionState(ctx, newAcademicResearchExecutionState(versioningSessionIDOrDefault(ctx, sessionID)))
+	}
 	// Check cache first
 	cacheKey := a.cacheKey(query)
 	if cached := a.getCached(cacheKey); cached != nil {
@@ -1240,6 +1489,9 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 			"Use web_search to discover external sources when you do not already know the right URLs, then fetch primary sources before relying on specifics.\n\n"+
 			"Topic: %s", query.Query,
 	)
+	if contract := AcademicCompletionContractFromContext(ctx); contract != nil {
+		researchPrompt = contract.guidancePrompt() + "\n\n" + researchPrompt
+	}
 	if query.Domain != "" {
 		researchPrompt += fmt.Sprintf("\nDomain: %s", query.Domain)
 	}
@@ -1255,7 +1507,7 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 		Model:        a.config.Model,
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
-	a.applyLLMRuntimeProfile(llmReq, "research")
+	a.applyLLMRuntimeProfile(ctx, llmReq, "research")
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
@@ -1293,15 +1545,80 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 // publishActivity emits a user-visible activity event so the UI agent panel
 // tracks this academic's lifecycle.
 func (a *Academic) publishActivity(eventType events.EventType, content string) {
+	a.publishActivityForSession(a.config.SessionID, eventType, content)
+}
+
+func (a *Academic) publishActivityForSession(sessionID string, eventType events.EventType, content string) {
+	a.publishActivityForRequest(sessionID, "", eventType, content)
+}
+
+func (a *Academic) publishActivityForRequest(sessionID, correlationID string, eventType events.EventType, content string) {
 	if a.activityPub == nil {
 		return
 	}
-	evt := events.NewActivityEvent(eventType, a.config.SessionID, content)
-	evt.AgentID = "academic"
+	evt := events.NewActivityEvent(eventType, strings.TrimSpace(sessionID), content)
+	evt.CorrelationID = strings.TrimSpace(correlationID)
+	evt.AgentID = a.id
 	evt.Visibility = events.VisibilityUser
 	evt.Data["agent_type"] = "academic"
 	evt.Data["agent_name"] = "Academic"
 	a.activityPub.PublishActivity(evt)
+}
+
+func (a *Academic) requestToolSurfaceForForwardedRequest(fwd *guide.ForwardedRequest, extraTools ...string) toolruntime.Surface {
+	base := a.toolRuntime()
+	if base == nil {
+		return nil
+	}
+	requestTools := make([]string, 0, len(extraTools))
+	requestTools = append(requestTools, extraTools...)
+	if len(requestTools) == 0 {
+		return base
+	}
+	view, err := base.RequestView(requestTools...)
+	if err != nil {
+		return base
+	}
+	return view
+}
+
+func academicForwardedSourceMatches(fwd *guide.ForwardedRequest, target string) bool {
+	if fwd == nil {
+		return false
+	}
+	target = strings.ToLower(strings.TrimSpace(target))
+	if target == "" {
+		return false
+	}
+	candidates := []string{
+		metadataTrimmedString(fwd.Metadata, "source_agent_type"),
+		metadataTrimmedString(fwd.Metadata, "source_agent_name"),
+		metadataTrimmedString(fwd.Metadata, "source_agent_id"),
+		fwd.SourceAgentName,
+		fwd.SourceAgentID,
+	}
+	for _, candidate := range candidates {
+		if academicAgentIdentityMatches(candidate, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func academicAgentIdentityMatches(candidate string, target string) bool {
+	candidate = strings.ToLower(strings.TrimSpace(candidate))
+	if candidate == "" || target == "" {
+		return false
+	}
+	if candidate == target {
+		return true
+	}
+	for _, sep := range []string{"-", "_", ":", "/"} {
+		if strings.HasPrefix(candidate, target+sep) {
+			return true
+		}
+	}
+	return false
 }
 
 // =============================================================================

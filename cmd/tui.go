@@ -46,6 +46,7 @@ import (
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/core/knowledge/query"
+	"github.com/adalundhe/sylk/core/knowledgeruntime"
 	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
@@ -149,6 +150,8 @@ type modelSwapActivator interface {
 	EnsureActive(ctx context.Context, agentType string) (*container.Container, error)
 }
 
+var errNoSwappableContainer = errors.New("no model-swappable agent found")
+
 type bootstrapPhase1 struct {
 	ctx         context.Context
 	projectRoot string
@@ -186,8 +189,9 @@ type bootstrapPhase1 struct {
 	actCtrlRef  atomic.Pointer[activation.ActivationController]
 	gitSubsRef  atomic.Pointer[gitBootResult]
 
-	planStore      *architect.PlanStore
-	knowledgeStore *knowledge.KnowledgeStore
+	planStore        *architect.PlanStore
+	knowledgeStore   *knowledge.KnowledgeStore
+	knowledgeBackend *knowledgeruntime.CommittedKnowledgeBackend
 
 	guideRef      atomic.Pointer[guide.Guide]
 	guardianRef   atomic.Pointer[guardian.Guardian]
@@ -462,6 +466,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		&busReadinessPublisher{bus: phase1.guideBus},
 		slog.Default(),
 	)
+	phase1.knowledgeBackend = knowledgeruntime.NewCommittedKnowledgeBackend(projectRoot, slog.Default())
 
 	registerAgentCreators(
 		creatorReg,
@@ -479,6 +484,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		&phase1.gitSubsRef,
 		phase1.planStore,
 		phase1.knowledgeStore,
+		phase1.knowledgeBackend,
 		phase1.daemonCtrl,
 		&phase1.guideRef,
 		&phase1.guardianRef,
@@ -1131,24 +1137,22 @@ func startBootstrapPhase4(
 				slog.Warn("knowledge boot failed (non-critical)", "error", out.err)
 				return nil
 			}
-			var (
-				bleveSearcher *query.BleveSearcher
-				bleveCloser   io.Closer
-			)
-			if bgIdx := out.result.BackgroundIndexer; bgIdx != nil && bgIdx.BleveStore() != nil {
-				store := bgIdx.BleveStore()
-				adapter := &globalBleveAdapter{store: store}
-				bleveSearcher = query.NewBleveSearcher(adapter)
-				bleveCloser = &bleveStoreCloser{store: store}
-			} else {
-				var buildErr error
-				bleveSearcher, bleveCloser, buildErr = buildBleveSearcher(phase1.projectRoot)
-				if buildErr != nil {
-					slog.Warn("knowledge bleve open failed (non-critical)", "error", buildErr)
-					return nil
-				}
+			backend := phase1.knowledgeBackend
+			if backend == nil {
+				slog.Warn("knowledge backend unavailable (non-critical)")
+				return nil
 			}
-			phase1.knowledgeStore.PromotePartial(bleveSearcher, out.result.BackgroundIndexer, bleveCloser)
+			var refreshErr error
+			if bgIdx := out.result.BackgroundIndexer; bgIdx != nil && bgIdx.BleveStore() != nil {
+				refreshErr = backend.RefreshWithBleveStore(bgCtx, bgIdx.BleveStore())
+			} else {
+				refreshErr = backend.RefreshFromDisk(bgCtx)
+			}
+			if refreshErr != nil {
+				slog.Warn("knowledge backend refresh failed (non-critical)", "error", refreshErr)
+				return nil
+			}
+			phase1.knowledgeStore.PromotePartial(query.NewBleveSearcher(backend), out.result.BackgroundIndexer, backend)
 			return nil
 		}
 	})
@@ -1164,6 +1168,11 @@ func startBootstrapPhase4(
 		select {
 		case <-bgWaiter.Ready():
 			phase1.knowledgeStore.PromoteFull()
+			if backend := phase1.knowledgeBackend; backend != nil {
+				if err := backend.AdoptOwnedBleve(bgCtx); err != nil {
+					slog.Warn("knowledge backend adopt-owned-bleve failed (non-critical)", "error", err)
+				}
+			}
 		case <-bgCtx.Done():
 		}
 		return nil
@@ -1216,6 +1225,11 @@ func buildBootstrapCleanup(
 		}
 		if err := phase1.knowledgeStore.Close(); err != nil {
 			errs = append(errs, err)
+		}
+		if phase1.knowledgeBackend != nil {
+			if err := phase1.knowledgeBackend.Close(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		phase1.googleGateway.Stop()
 		phase1.anthropicGateway.Stop()
@@ -1340,6 +1354,7 @@ func registerAgentCreators(
 	gitSubsRef *atomic.Pointer[gitBootResult],
 	planStore *architect.PlanStore,
 	knowledgeStore *knowledge.KnowledgeStore,
+	knowledgeBackend *knowledgeruntime.CommittedKnowledgeBackend,
 	daemonCtrl *daemon.DaemonSetController,
 	guideRef *atomic.Pointer[guide.Guide],
 	guardianRef *atomic.Pointer[guardian.Guardian],
@@ -1405,26 +1420,37 @@ func registerAgentCreators(
 	})
 
 	// On-demand agents — created lazily by the ActivationController.
-	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, authRegistry, actCtrlRef, knowledgeStore, guardianRef, orchRef, quarantineRef)
+	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, authRegistry, actCtrlRef, knowledgeStore, knowledgeBackend, guardianRef, orchRef, quarantineRef)
 }
 
 // registerOnDemandAgentCreators registers factories for knowledge and pipeline agents.
 // These are created lazily by the ActivationController when the Guide routes to them.
 type onDemandAgentCreatorDeps struct {
-	reg            *container.AgentCreatorRegistry
-	ids            *container.AgentIdentityRegistry
-	bus            guide.EventBus
-	actPub         events.ActivityPublisher
-	projectRoot    string
-	googleGw       *gateway.ProviderGateway
-	anthropicGw    *gateway.ProviderGateway
-	openaiGw       *gateway.ProviderGateway
-	authRegistry   *credentials.AuthRegistry
-	actCtrlRef     *atomic.Pointer[activation.ActivationController]
-	knowledgeStore *knowledge.KnowledgeStore
-	guardianRef    *atomic.Pointer[guardian.Guardian]
-	orchRef        *atomic.Pointer[orchestrator.Orchestrator]
-	quarantineRef  *atomic.Pointer[fetch.QuarantineBuffer]
+	reg              *container.AgentCreatorRegistry
+	ids              *container.AgentIdentityRegistry
+	bus              guide.EventBus
+	actPub           events.ActivityPublisher
+	projectRoot      string
+	googleGw         *gateway.ProviderGateway
+	anthropicGw      *gateway.ProviderGateway
+	openaiGw         *gateway.ProviderGateway
+	authRegistry     *credentials.AuthRegistry
+	actCtrlRef       *atomic.Pointer[activation.ActivationController]
+	knowledgeStore   *knowledge.KnowledgeStore
+	knowledgeBackend *knowledgeruntime.CommittedKnowledgeBackend
+	guardianRef      *atomic.Pointer[guardian.Guardian]
+	orchRef          *atomic.Pointer[orchestrator.Orchestrator]
+	quarantineRef    *atomic.Pointer[fetch.QuarantineBuffer]
+}
+
+func (d onDemandAgentCreatorDeps) configuredModel(agentType, fallback string) string {
+	fallback = strings.TrimSpace(fallback)
+	store := agentpkg.NewAgentModelStore(filepath.Join(d.projectRoot, ".sylk", "config.yaml"))
+	entry := store.EntryFor(agentType)
+	if entry.Model == "" {
+		return effectiveModelForCurrentAuth(d.authRegistry, fallback)
+	}
+	return resolvePersistedModelForCurrentAuth(entry.Model, entry.Provider, d.authRegistry)
 }
 
 func (d onDemandAgentCreatorDeps) sessionLookup(sessionID string) *versioning.SessionVFS {
@@ -1434,16 +1460,27 @@ func (d onDemandAgentCreatorDeps) sessionLookup(sessionID string) *versioning.Se
 	return nil
 }
 
+func (d onDemandAgentCreatorDeps) defaultSessionID() string {
+	if orch := d.orchRef.Load(); orch != nil {
+		return orch.SessionID()
+	}
+	return "default"
+}
+
 func (d onDemandAgentCreatorDeps) workspaceViews(defaultView versioning.WorkspaceView) *versioning.SessionWorkspaceViews {
 	return versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
-		DefaultView:   defaultView,
-		WorkingDir:    d.projectRoot,
-		SessionLookup: d.sessionLookup,
-		DiskFallback:  versioning.NewDiskFileAccess(d.projectRoot, true),
+		DefaultView:      defaultView,
+		DefaultSessionID: d.defaultSessionID(),
+		WorkingDir:       d.projectRoot,
+		SessionLookup:    d.sessionLookup,
+		DiskFallback:     versioning.NewDiskFileAccess(d.projectRoot, true),
 	})
 }
 
 func (d onDemandAgentCreatorDeps) requestGuard(agentName string) func() func() {
+	if d.actCtrlRef == nil {
+		return nil
+	}
 	if ac := d.actCtrlRef.Load(); ac != nil {
 		return func() func() {
 			return ac.AcquireRequestGuard(agentName)
@@ -1464,25 +1501,27 @@ func registerOnDemandAgentCreators(
 	authRegistry *credentials.AuthRegistry,
 	actCtrlRef *atomic.Pointer[activation.ActivationController],
 	knowledgeStore *knowledge.KnowledgeStore,
+	knowledgeBackend *knowledgeruntime.CommittedKnowledgeBackend,
 	guardianRef *atomic.Pointer[guardian.Guardian],
 	orchRef *atomic.Pointer[orchestrator.Orchestrator],
 	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
 ) {
 	deps := onDemandAgentCreatorDeps{
-		reg:            reg,
-		ids:            ids,
-		bus:            bus,
-		actPub:         actPub,
-		projectRoot:    projectRoot,
-		googleGw:       googleGw,
-		anthropicGw:    anthropicGw,
-		openaiGw:       openaiGw,
-		authRegistry:   authRegistry,
-		actCtrlRef:     actCtrlRef,
-		knowledgeStore: knowledgeStore,
-		guardianRef:    guardianRef,
-		orchRef:        orchRef,
-		quarantineRef:  quarantineRef,
+		reg:              reg,
+		ids:              ids,
+		bus:              bus,
+		actPub:           actPub,
+		projectRoot:      projectRoot,
+		googleGw:         googleGw,
+		anthropicGw:      anthropicGw,
+		openaiGw:         openaiGw,
+		authRegistry:     authRegistry,
+		actCtrlRef:       actCtrlRef,
+		knowledgeStore:   knowledgeStore,
+		knowledgeBackend: knowledgeBackend,
+		guardianRef:      guardianRef,
+		orchRef:          orchRef,
+		quarantineRef:    quarantineRef,
 	}
 	registerOnDemandKnowledgeAgentCreators(deps)
 	registerOnDemandQualityAgentCreators(deps)
@@ -1498,7 +1537,7 @@ func registerOnDemandKnowledgeAgentCreators(deps onDemandAgentCreatorDeps) {
 func registerLibrarianAgentCreator(deps onDemandAgentCreatorDeps) {
 	librarianID, _ := deps.ids.Get("librarian")
 	deps.reg.Register("librarian", func(ctx context.Context) (container.ContainerAgent, error) {
-		model := librarian.DefaultLibrarianModel
+		model := deps.configuredModel("librarian", librarian.DefaultLibrarianModel)
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("librarian provider: %w", err)
@@ -1511,6 +1550,8 @@ func registerLibrarianAgentCreator(deps onDemandAgentCreatorDeps) {
 			AnthropicAPIKey:  providers.ResolveAnthropicAPIKey(""),
 			ActivityPub:      deps.actPub,
 			WorkingDirectory: deps.projectRoot,
+			SearchSystem:     librarian.NewCommittedKnowledgeSearchSystem(deps.knowledgeBackend),
+			KnowledgeBackend: deps.knowledgeBackend,
 		}
 		if guard := deps.requestGuard("librarian"); guard != nil {
 			libCfg.RequestGuard = guard
@@ -1532,27 +1573,20 @@ func registerLibrarianAgentCreator(deps onDemandAgentCreatorDeps) {
 func registerArchivalistAgentCreator(deps onDemandAgentCreatorDeps) {
 	archivalistID, _ := deps.ids.Get("archivalist")
 	deps.reg.Register("archivalist", func(ctx context.Context) (container.ContainerAgent, error) {
-		model := archivalist.ModelSonnet45
+		model := deps.configuredModel("archivalist", archivalist.ModelSonnet45)
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("archivalist provider: %w", err)
 		}
 
-		archCfg := archivalist.Config{
-			ID:                archivalistID,
-			ActivityPub:       deps.actPub,
-			EnableHybridQuery: true,
-			EnableACTR:        true,
-		}
-		if guard := deps.requestGuard("archivalist"); guard != nil {
-			archCfg.RequestGuard = guard
-		}
+		archCfg := buildOnDemandArchivalistConfig(deps, archivalistID, model)
 		a, err := archivalist.New(ctx, archCfg)
 		if err != nil {
 			return nil, err
 		}
 		a.SetProvider(wrapped)
 		a.SetKnowledgeStore(deps.knowledgeStore)
+		a.SetKnowledgeBackend(deps.knowledgeBackend)
 		if startErr := a.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
@@ -1560,10 +1594,28 @@ func registerArchivalistAgentCreator(deps onDemandAgentCreatorDeps) {
 	})
 }
 
+func buildOnDemandArchivalistConfig(deps onDemandAgentCreatorDeps, agentID, model string) archivalist.Config {
+	archCfg := archivalist.Config{
+		ID:                   agentID,
+		Model:                model,
+		ActivityPub:          deps.actPub,
+		EnableLLM:            true,
+		EnableArchive:        true,
+		EnableRAG:            true,
+		EnableKnowledgeGraph: true,
+		EnableHybridQuery:    true,
+		EnableACTR:           true,
+	}
+	if guard := deps.requestGuard("archivalist"); guard != nil {
+		archCfg.RequestGuard = guard
+	}
+	return archCfg
+}
+
 func registerAcademicAgentCreator(deps onDemandAgentCreatorDeps) {
 	academicID, _ := deps.ids.Get("academic")
 	deps.reg.Register("academic", func(ctx context.Context) (container.ContainerAgent, error) {
-		model := effectiveModelForCurrentAuth(deps.authRegistry, academic.DefaultModel)
+		model := deps.configuredModel("academic", academic.DefaultModel)
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("academic provider: %w", err)
@@ -1581,7 +1633,7 @@ func registerAcademicAgentCreator(deps onDemandAgentCreatorDeps) {
 			return nil, err
 		}
 		a.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution))
-		a.SetFetchPipeline(buildAcademicFetchPipeline(deps.projectRoot, deps.guardianRef, deps.quarantineRef))
+		a.SetFetchPipeline(buildAcademicFetchPipeline(deps.projectRoot, deps.guardianRef, deps.quarantineRef, deps.knowledgeBackend))
 		if startErr := a.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
@@ -1599,13 +1651,14 @@ func registerOnDemandQualityAgentCreators(deps onDemandAgentCreatorDeps) {
 func registerGlobalInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 	inspectorID, _ := deps.ids.Get("inspector")
 	deps.reg.Register("inspector", func(ctx context.Context) (container.ContainerAgent, error) {
-		model := "claude-opus-4-6"
+		model := deps.configuredModel("inspector", "claude-opus-4-6")
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("global inspector provider: %w", err)
 		}
 		gi, err := inspectorGlobal.New(inspectorShared.GlobalInspectorConfig{
 			AgentID:     inspectorID,
+			SessionID:   deps.defaultSessionID(),
 			Model:       model,
 			ActivityPub: deps.actPub,
 		}, wrapped)
@@ -1633,7 +1686,7 @@ func registerPipelineInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 		if workerID := pipelineWorkerAgentID(ctx, "inspector-pipeline"); workerID != "" {
 			agentID = workerID
 		}
-		model := "claude-opus-4-6"
+		model := deps.configuredModel("inspector-pipeline", "claude-opus-4-6")
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline inspector provider: %w", err)
@@ -1653,7 +1706,7 @@ func registerPipelineInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 func registerGlobalTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 	testerID, _ := deps.ids.Get("tester")
 	deps.reg.Register("tester", func(ctx context.Context) (container.ContainerAgent, error) {
-		model := effectiveModelForCurrentAuth(deps.authRegistry, "gpt-5.4-pro")
+		model := deps.configuredModel("tester", "gpt-5.4-pro")
 		var wrapped providers.Provider
 		if provider, provErr := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation); provErr != nil {
 			slog.Warn("tester: provider unavailable, LLM features disabled", "error", provErr)
@@ -1662,6 +1715,7 @@ func registerGlobalTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 		}
 		gt, err := globaltester.New(shared.GlobalTesterConfig{
 			AgentID:     testerID,
+			SessionID:   deps.defaultSessionID(),
 			Model:       model,
 			ActivityPub: deps.actPub,
 		}, wrapped)
@@ -1689,7 +1743,7 @@ func registerPipelineTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 		if workerID := pipelineWorkerAgentID(ctx, "tester-pipeline"); workerID != "" {
 			agentID = workerID
 		}
-		model := effectiveModelForCurrentAuth(deps.authRegistry, "gpt-5.4-pro")
+		model := deps.configuredModel("tester-pipeline", "gpt-5.4-pro")
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline tester provider: %w", err)
@@ -1718,7 +1772,7 @@ func registerEngineerAgentCreator(deps onDemandAgentCreatorDeps) {
 		if workerID := pipelineWorkerAgentID(ctx, "engineer"); workerID != "" {
 			agentID = workerID
 		}
-		model := effectiveModelForCurrentAuth(deps.authRegistry, "gpt-5.4-pro")
+		model := deps.configuredModel("engineer", "gpt-5.4-pro")
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("engineer provider: %w", err)
@@ -1747,7 +1801,7 @@ func registerDesignerAgentCreator(deps onDemandAgentCreatorDeps) {
 		if workerID := pipelineWorkerAgentID(ctx, "designer"); workerID != "" {
 			agentID = workerID
 		}
-		model := string(providers.Gemini31Pro)
+		model := deps.configuredModel("designer", string(providers.Gemini31Pro))
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("designer provider: %w", err)
@@ -2220,26 +2274,10 @@ func buildAcademicFetchPipeline(
 	_ string,
 	guardianRef *atomic.Pointer[guardian.Guardian],
 	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
+	knowledgeBackend *knowledgeruntime.CommittedKnowledgeBackend,
 ) *fetch.Pipeline {
-	autoApprove := make([]string, 0, len(security.DefaultSafeDomains()))
-	for domain := range security.DefaultSafeDomains() {
-		autoApprove = append(autoApprove, domain)
-	}
-
 	policy := fetch.NewFetchPolicy(fetch.DefaultPolicyConfig())
-	consent := fetch.NewConsentGate(fetch.ConsentGateConfig{
-		AutoApproveDomains: autoApprove,
-		Callback: func(_ context.Context, proposal *fetch.FetchProposal) (*fetch.ConsentResult, error) {
-			domain := ""
-			if proposal != nil {
-				domain = proposal.Domain
-			}
-			return &fetch.ConsentResult{
-				Granted: false,
-				Reason:  fmt.Sprintf("interactive fetch consent is not configured for %q; only pre-approved documentation and package domains are allowed", domain),
-			}, nil
-		},
-	})
+	consent := newAcademicFetchConsentGate()
 
 	quarantine := (*fetch.QuarantineBuffer)(nil)
 	if quarantineRef != nil {
@@ -2269,6 +2307,12 @@ func buildAcademicFetchPipeline(
 				return fetch.VerdictBlocked, nil, fmt.Errorf("guardian inspection is unavailable")
 			}
 			return grd.InspectQuarantinedContent(ctx, entry)
+		},
+		Ingest: func(ctx context.Context, entry *fetch.QuarantineEntry, provenance *fetch.Provenance, extracted *fetch.ExtractResult) error {
+			if knowledgeBackend == nil {
+				return fmt.Errorf("committed knowledge backend is unavailable")
+			}
+			return knowledgeBackend.IngestFetchedDocument(ctx, entry, provenance, extracted)
 		},
 		Logger: slog.Default(),
 	})
@@ -2547,6 +2591,9 @@ func buildModelSwapper(
 	return func(ctx context.Context, agentType, modelID string) error {
 		swappableContainer, err := resolveModelSwapContainer(ctx, containerReg, activator, agentType)
 		if err != nil {
+			if errors.Is(err, errNoSwappableContainer) && !architectModelSwapRequiresLiveActivation(agentType) {
+				return nil
+			}
 			return err
 		}
 		modelID = effectiveModelForCurrentAuth(authRegistry, modelID)
@@ -2597,7 +2644,7 @@ func resolveModelSwapContainer(
 			return ctr, nil
 		}
 	}
-	return nil, fmt.Errorf("no ModelSwappable agent found for type %q", agentType)
+	return nil, fmt.Errorf("%w for type %q", errNoSwappableContainer, agentType)
 }
 
 func architectModelSwapRequiresLiveActivation(agentType string) bool {
@@ -2884,6 +2931,7 @@ func bootstrapOrchestrator(ctx context.Context, agentID string, bus guide.EventB
 
 	cfg := orchestrator.DefaultConfig()
 	cfg.AgentID = agentID
+	cfg.SessionID = "default"
 	cfg.EnableLLM = true
 	if provErr == nil && provider != nil {
 		cfg.GoogleConfig = &googleCfg
@@ -2903,10 +2951,11 @@ func bootstrapOrchestrator(ctx context.Context, agentID string, bus guide.EventB
 		return nil, err
 	}
 	orch.SetWorkspaceViews(versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
-		DefaultView:   versioning.WorkspaceViewGlobal,
-		WorkingDir:    projectRoot,
-		SessionLookup: orch.GetSessionVFS,
-		DiskFallback:  versioning.NewDiskFileAccess(projectRoot, true),
+		DefaultView:      versioning.WorkspaceViewGlobal,
+		DefaultSessionID: cfg.SessionID,
+		WorkingDir:       projectRoot,
+		SessionLookup:    orch.GetSessionVFS,
+		DiskFallback:     versioning.NewDiskFileAccess(projectRoot, true),
 	}))
 	if err := orch.Start(bus); err != nil {
 		return nil, err

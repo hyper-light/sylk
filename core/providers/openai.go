@@ -34,6 +34,10 @@ type OpenAIProvider struct {
 	authService oauth.OpenAIAuthService
 }
 
+func (p *OpenAIProvider) SupportsNativeWebSearchEvidence() bool {
+	return p != nil
+}
+
 type OpenAIDeviceAuthSession struct {
 	Challenge *oauth.DeviceCodeChallenge
 	Results   <-chan OpenAIDeviceAuthResult
@@ -1089,6 +1093,9 @@ func newOpenAIResponseStreamRunner(
 		runner.handleFunctionCallArgumentsDoneEvent,
 		runner.handleOutputItemAddedEvent,
 		runner.handleOutputItemDoneEvent,
+		runner.handleWebSearchCallInProgressEvent,
+		runner.handleWebSearchCallSearchingEvent,
+		runner.handleWebSearchCallCompletedEvent,
 		runner.handleCompletedEvent,
 		runner.handleFailedEvent,
 		runner.handleIncompleteEvent,
@@ -1345,12 +1352,21 @@ func (r *openAIResponseStreamRunner) handleOutputItemAddedEvent(event any) error
 	if !ok {
 		return nil
 	}
-	if !isFunctionCallOutputItem(ev.Item.Type) {
+	switch {
+	case isFunctionCallOutputItem(ev.Item.Type):
+		toolCall := r.ensureToolCallState(ev.Item.ID, ev.OutputIndex)
+		applyToolCallNameChunk(toolCall, ev.Item.Name)
+		return r.emitToolStart(r.chunkIndex, toolCall)
+	case isWebSearchOutputItem(ev.Item.Type):
+		webSearch := ev.Item.AsWebSearchCall()
+		toolCall := r.ensureToolCallState(webSearch.ID, ev.OutputIndex)
+		toolCall.Kind = ToolKindNativeWebSearch
+		applyToolCallNameChunk(toolCall, "web_search")
+		applyToolCallArguments(toolCall, openAIWebSearchCallToNative(webSearch).ArgumentsJSON())
+		return r.emitToolStart(r.chunkIndex, toolCall)
+	default:
 		return nil
 	}
-	toolCall := r.ensureToolCallState(ev.Item.ID, ev.OutputIndex)
-	applyToolCallNameChunk(toolCall, ev.Item.Name)
-	return r.emitToolStart(r.chunkIndex, toolCall)
 }
 
 func (r *openAIResponseStreamRunner) handleOutputItemDoneEvent(event any) error {
@@ -1358,12 +1374,54 @@ func (r *openAIResponseStreamRunner) handleOutputItemDoneEvent(event any) error 
 	if !ok {
 		return nil
 	}
-	if !isFunctionCallOutputItem(ev.Item.Type) {
+	switch {
+	case isFunctionCallOutputItem(ev.Item.Type):
+		toolCall := r.ensureToolCallState(ev.Item.ID, ev.OutputIndex)
+		applyToolCallNameChunk(toolCall, ev.Item.Name)
+		applyToolCallArguments(toolCall, ev.Item.Arguments)
+		return r.emitToolEnd(r.chunkIndex, toolCall)
+	case isWebSearchOutputItem(ev.Item.Type):
+		webSearch := ev.Item.AsWebSearchCall()
+		toolCall := r.ensureToolCallState(webSearch.ID, ev.OutputIndex)
+		toolCall.Kind = ToolKindNativeWebSearch
+		applyToolCallNameChunk(toolCall, "web_search")
+		applyToolCallArguments(toolCall, openAIWebSearchCallToNative(webSearch).ArgumentsJSON())
+		return r.emitToolEnd(r.chunkIndex, toolCall)
+	default:
 		return nil
 	}
-	toolCall := r.ensureToolCallState(ev.Item.ID, ev.OutputIndex)
-	applyToolCallNameChunk(toolCall, ev.Item.Name)
-	applyToolCallArguments(toolCall, ev.Item.Arguments)
+}
+
+func (r *openAIResponseStreamRunner) handleWebSearchCallInProgressEvent(event any) error {
+	ev, ok := event.(responses.ResponseWebSearchCallInProgressEvent)
+	if !ok {
+		return nil
+	}
+	toolCall := r.ensureToolCallState(ev.ItemID, ev.OutputIndex)
+	toolCall.Kind = ToolKindNativeWebSearch
+	applyToolCallNameChunk(toolCall, "web_search")
+	return r.emitToolStart(r.chunkIndex, toolCall)
+}
+
+func (r *openAIResponseStreamRunner) handleWebSearchCallSearchingEvent(event any) error {
+	ev, ok := event.(responses.ResponseWebSearchCallSearchingEvent)
+	if !ok {
+		return nil
+	}
+	toolCall := r.ensureToolCallState(ev.ItemID, ev.OutputIndex)
+	toolCall.Kind = ToolKindNativeWebSearch
+	applyToolCallNameChunk(toolCall, "web_search")
+	return r.emitToolStart(r.chunkIndex, toolCall)
+}
+
+func (r *openAIResponseStreamRunner) handleWebSearchCallCompletedEvent(event any) error {
+	ev, ok := event.(responses.ResponseWebSearchCallCompletedEvent)
+	if !ok {
+		return nil
+	}
+	toolCall := r.ensureToolCallState(ev.ItemID, ev.OutputIndex)
+	toolCall.Kind = ToolKindNativeWebSearch
+	applyToolCallNameChunk(toolCall, "web_search")
 	return r.emitToolEnd(r.chunkIndex, toolCall)
 }
 
@@ -1419,6 +1477,10 @@ func (r *openAIResponseStreamRunner) handleResponseErrorEvent(event any) error {
 
 func isFunctionCallOutputItem(itemType string) bool {
 	return itemType == "function_call"
+}
+
+func isWebSearchOutputItem(itemType string) bool {
+	return itemType == "web_search_call"
 }
 
 func (r *openAIResponseStreamRunner) ensureToolCallState(id string, outputIndex int64) *streamToolCallState {
@@ -2145,6 +2207,9 @@ func (p *OpenAIProvider) convertResponse(result *responses.Response) *Response {
 	if items := extractOpenAIReasoningItems(result); len(items) > 0 {
 		metadata["reasoning_items"] = items
 	}
+	if searchCalls := extractOpenAIWebSearchCalls(result); len(searchCalls) > 0 {
+		metadata[ProviderMetadataNativeWebSearchCallsKey] = searchCalls
+	}
 
 	response := &Response{
 		Content:          result.OutputText(),
@@ -2305,6 +2370,41 @@ func (p *OpenAIProvider) extractToolCalls(result responses.Response) []ToolCall 
 		}
 	}
 	return toolCalls
+}
+
+func extractOpenAIWebSearchCalls(result *responses.Response) []NativeWebSearchCall {
+	if result == nil {
+		return nil
+	}
+	var calls []NativeWebSearchCall
+	for _, item := range result.Output {
+		if item.Type != "web_search_call" {
+			continue
+		}
+		calls = append(calls, openAIWebSearchCallToNative(item.AsWebSearchCall()))
+	}
+	return calls
+}
+
+func openAIWebSearchCallToNative(item responses.ResponseFunctionWebSearch) NativeWebSearchCall {
+	call := NativeWebSearchCall{
+		ID:       item.ID,
+		Provider: "openai",
+		Status:   string(item.Status),
+	}
+	switch action := item.Action.AsAny().(type) {
+	case responses.ResponseFunctionWebSearchActionSearch:
+		call.Action = "search"
+		call.Query = action.Query
+	case responses.ResponseFunctionWebSearchActionOpenPage:
+		call.Action = "open_page"
+		call.URL = action.URL
+	case responses.ResponseFunctionWebSearchActionFind:
+		call.Action = "find"
+		call.URL = action.URL
+		call.Pattern = action.Pattern
+	}
+	return call
 }
 
 func normalizeOpenAIModel(model string) string {

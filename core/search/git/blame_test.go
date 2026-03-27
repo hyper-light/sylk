@@ -24,8 +24,7 @@ func setupBlameTestRepo(t *testing.T) (string, func()) {
 
 	// Initialize git repo
 	runBlameGit(t, tmpDir, "init")
-	runBlameGit(t, tmpDir, "config", "user.email", "test@example.com")
-	runBlameGit(t, tmpDir, "config", "user.name", "Test User")
+	configureGitTestRepo(t, tmpDir, runBlameGit)
 
 	return tmpDir, cleanup
 }

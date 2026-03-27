@@ -420,6 +420,13 @@ var commandApprovalOptions = []commandApprovalOption{
 	{label: "Deny Always", hint: "save deny rule", decision: "deny_always"},
 }
 
+var fetchApprovalOptions = []commandApprovalOption{
+	{label: "Allow Once", hint: "this fetch", decision: "allow_once"},
+	{label: "Allow Always", hint: "save exact URL rule", decision: "allow_always"},
+	{label: "Deny Once", hint: "block this fetch", decision: "deny_once"},
+	{label: "Deny Always", hint: "block this exact URL", decision: "deny_always"},
+}
+
 var layerDecisionOptions = []commandApprovalOption{
 	{label: "Retry Layer", hint: "rerun failed nodes", decision: "retry"},
 	{label: "Skip Layer", hint: "continue past failures", decision: "skip"},
@@ -717,6 +724,7 @@ type AppModel struct {
 	streamUsage             map[string]streamUsageEntry
 	streamedResponses       map[string]streamedResponseState
 	activeStreams           map[string]*activeStreamEntry // key = correlationID
+	nestedStreams           map[string]*activeStreamEntry // key = correlationID; visible child consult/challenge streams only
 	reroutedStreamCIDs      map[string]time.Time          // Recently rerouted source streams allowed to emit terminal cleanup events.
 	interruptedCorrelations map[string]struct{}           // Correlation IDs killed by interrupt.
 	engagedAgentID          string                        // Sticky agent the user is conversing with.
@@ -788,6 +796,7 @@ type activeStreamEntry struct {
 	TaskName      string
 	TaskSlug      string
 	SteeringPace  string // "auto", "step", "paused" — tracks current pace for UI display.
+	BranchRef     *msg.InterAgentBranchRefMsg
 	StartedAt     time.Time
 }
 
@@ -999,6 +1008,7 @@ func newAppModel(
 		streamUsage:            make(map[string]streamUsageEntry),
 		streamedResponses:      make(map[string]streamedResponseState),
 		activeStreams:          make(map[string]*activeStreamEntry),
+		nestedStreams:          make(map[string]*activeStreamEntry),
 		reroutedStreamCIDs:     make(map[string]time.Time),
 		oauthSessions:          newOAuthSessionManager(),
 		focusGradient:          th.Palette.IdleFocusRingGradient(),
@@ -1070,6 +1080,7 @@ func (m *AppModel) initializeNerdFonts(deps Deps) {
 	}
 	m.fileTree.SetNerdFonts(m.nerdFontsDetected)
 	m.statusBar.SetNerdFonts(m.nerdFontsDetected)
+	m.agentPanel.SetNerdFonts(m.nerdFontsDetected)
 }
 
 func (m *AppModel) initializeAuthStatus(deps Deps) {
@@ -2400,7 +2411,7 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 				return nil
 			}
 		}
-		return m.propagate(typed)
+		return m.handleToolCallTelemetry(typed)
 	}),
 	reflect.TypeFor[msg.ActivityEventMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.ActivityEventMsg) tea.Cmd {
 		if typed.Event != nil && typed.Event.CorrelationID != "" {
@@ -4350,17 +4361,23 @@ func (m *AppModel) interruptActiveRoute(reason string) tea.Cmd {
 	if correlationID == "" {
 		return nil
 	}
+	targets := m.interruptTargetsForCorrelation(correlationID)
+	if len(targets) == 0 {
+		return nil
+	}
 
 	m.chat.MuteThinking("")
 	m.chat.AbortStream()
 	if m.interruptedCorrelations == nil {
 		m.interruptedCorrelations = make(map[string]struct{})
 	}
-	m.interruptedCorrelations[correlationID] = struct{}{}
+	for _, target := range targets {
+		m.interruptedCorrelations[target.CorrelationID] = struct{}{}
+		m.finalizeStreamUsage(target.CorrelationID, false, "interrupted")
+		m.markQueueEntryByCorrelation(target.CorrelationID, false)
+		m.unregisterStream(target.CorrelationID)
+	}
 	m.pushInterruptedChatMessage(agentID)
-	m.finalizeStreamUsage(correlationID, false, "interrupted")
-	m.markQueueEntryByCorrelation(correlationID, false)
-	m.unregisterStream(correlationID)
 	m.agentPanel.DemoteAllActive()
 	if m.statusBar != nil {
 		m.statusBar.SetTokenPhase(status.PhaseIdle)
@@ -4378,18 +4395,21 @@ func (m *AppModel) interruptActiveRoute(reason string) tea.Cmd {
 	}
 
 	interruptReq := &guide.UserInterruptRequest{
-		CorrelationID: correlationID,
 		SourceAgentID: sourceAgentTUI,
 		Reason:        strings.TrimSpace(reason),
-		Timestamp:     time.Now(),
 	}
-	busMsg := guide.NewUserInterruptMessage("", interruptReq)
 	return func() tea.Msg {
-		if err := m.deps.GuideBus.Publish(guide.TopicGuideRequests, busMsg); err != nil {
-			return msg.StreamErrorMsg{
-				SessionID:     m.resolveRouteSessionID(""),
-				CorrelationID: correlationID,
-				Err:           err,
+		sessionID := m.resolveRouteSessionID("")
+		for _, target := range targets {
+			req := *interruptReq
+			req.CorrelationID = target.CorrelationID
+			req.Timestamp = time.Now()
+			if err := m.deps.GuideBus.Publish(guide.TopicGuideRequests, guide.NewUserInterruptMessage("", &req)); err != nil {
+				return msg.StreamErrorMsg{
+					SessionID:     sessionID,
+					CorrelationID: target.CorrelationID,
+					Err:           err,
+				}
 			}
 		}
 		return nil
@@ -4401,10 +4421,7 @@ func (m *AppModel) interruptActiveRoute(reason string) tea.Cmd {
 // request so every agent receives a cancel action.
 func (m *AppModel) interruptAllActiveRoutes(reason string) tea.Cmd {
 	// Collect all active stream entries.
-	targets := make([]activeStreamEntry, 0, len(m.activeStreams))
-	for _, entry := range m.activeStreams {
-		targets = append(targets, *entry)
-	}
+	targets := m.allVisibleStreamEntries()
 
 	if len(targets) > 0 {
 		// UI cleanup — same as interruptActiveRoute but for all visible streams.
@@ -4739,10 +4756,36 @@ func cloneActiveStreamEntry(entry *activeStreamEntry) *activeStreamEntry {
 		return nil
 	}
 	cloned := *entry
+	cloned.BranchRef = cloneInterAgentBranchRef(entry.BranchRef)
 	return &cloned
 }
 
+func cloneInterAgentBranchRef(ref *msg.InterAgentBranchRefMsg) *msg.InterAgentBranchRefMsg {
+	if ref == nil {
+		return nil
+	}
+	cloned := *ref
+	return &cloned
+}
+
+func (m *AppModel) effectiveStreamBranchRef(correlationID string, ref *msg.InterAgentBranchRefMsg) *msg.InterAgentBranchRefMsg {
+	if ref != nil {
+		return cloneInterAgentBranchRef(ref)
+	}
+	if existing := m.streamEntryForCorrelation(correlationID); existing != nil && existing.BranchRef != nil {
+		return cloneInterAgentBranchRef(existing.BranchRef)
+	}
+	return nil
+}
+
 func (m *AppModel) registerStream(start msg.StreamStartMsg) bool {
+	if start.BranchRef != nil {
+		return m.registerNestedStream(start)
+	}
+	return m.registerPrimaryStream(start)
+}
+
+func (m *AppModel) registerPrimaryStream(start msg.StreamStartMsg) bool {
 	correlationID := strings.TrimSpace(start.CorrelationID)
 	if correlationID == "" {
 		return false
@@ -4753,28 +4796,63 @@ func (m *AppModel) registerStream(start msg.StreamStartMsg) bool {
 	logicalPipelineID := logicalStreamPipelineID(start.PipelineID, start.TaskID)
 	canonicalAgentID := canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
 	if existing, exists := m.activeStreams[correlationID]; exists {
-		existing.AgentID = firstNonEmpty(canonicalAgentID, existing.AgentID)
-		existing.AgentType = firstNonEmpty(start.AgentType, existing.AgentType)
-		existing.AgentName = firstNonEmpty(start.AgentName, existing.AgentName)
-		existing.PipelineID = firstNonEmpty(logicalPipelineID, existing.PipelineID)
-		existing.TaskID = firstNonEmpty(start.TaskID, existing.TaskID)
-		existing.TaskName = firstNonEmpty(start.TaskName, existing.TaskName)
-		existing.TaskSlug = firstNonEmpty(start.TaskSlug, existing.TaskSlug)
+		updateStreamEntry(existing, start, canonicalAgentID, logicalPipelineID)
 		return false
 	}
 	m.replaceActivePipelineWorkerStream(correlationID, canonicalAgentID)
-	m.activeStreams[correlationID] = &activeStreamEntry{
-		CorrelationID: correlationID,
-		AgentID:       canonicalAgentID,
+	delete(m.nestedStreams, correlationID)
+	m.activeStreams[correlationID] = newStreamEntry(start, canonicalAgentID, logicalPipelineID)
+	return true
+}
+
+func (m *AppModel) registerNestedStream(start msg.StreamStartMsg) bool {
+	correlationID := strings.TrimSpace(start.CorrelationID)
+	if correlationID == "" {
+		return false
+	}
+	if m.nestedStreams == nil {
+		m.nestedStreams = make(map[string]*activeStreamEntry)
+	}
+	logicalPipelineID := logicalStreamPipelineID(start.PipelineID, start.TaskID)
+	canonicalAgentID := canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
+	if existing, exists := m.nestedStreams[correlationID]; exists {
+		updateStreamEntry(existing, start, canonicalAgentID, logicalPipelineID)
+		return false
+	}
+	delete(m.activeStreams, correlationID)
+	m.nestedStreams[correlationID] = newStreamEntry(start, canonicalAgentID, logicalPipelineID)
+	return true
+}
+
+func newStreamEntry(start msg.StreamStartMsg, canonicalAgentID, logicalPipelineID string) *activeStreamEntry {
+	return &activeStreamEntry{
+		CorrelationID: strings.TrimSpace(start.CorrelationID),
+		AgentID:       strings.TrimSpace(canonicalAgentID),
 		AgentType:     strings.TrimSpace(start.AgentType),
 		AgentName:     strings.TrimSpace(start.AgentName),
-		PipelineID:    logicalPipelineID,
+		PipelineID:    strings.TrimSpace(logicalPipelineID),
 		TaskID:        strings.TrimSpace(start.TaskID),
 		TaskName:      strings.TrimSpace(start.TaskName),
 		TaskSlug:      strings.TrimSpace(start.TaskSlug),
+		BranchRef:     cloneInterAgentBranchRef(start.BranchRef),
 		StartedAt:     time.Now(),
 	}
-	return true
+}
+
+func updateStreamEntry(entry *activeStreamEntry, start msg.StreamStartMsg, canonicalAgentID, logicalPipelineID string) {
+	if entry == nil {
+		return
+	}
+	entry.AgentID = firstNonEmpty(strings.TrimSpace(canonicalAgentID), entry.AgentID)
+	entry.AgentType = firstNonEmpty(strings.TrimSpace(start.AgentType), entry.AgentType)
+	entry.AgentName = firstNonEmpty(strings.TrimSpace(start.AgentName), entry.AgentName)
+	entry.PipelineID = firstNonEmpty(strings.TrimSpace(logicalPipelineID), entry.PipelineID)
+	entry.TaskID = firstNonEmpty(strings.TrimSpace(start.TaskID), entry.TaskID)
+	entry.TaskName = firstNonEmpty(strings.TrimSpace(start.TaskName), entry.TaskName)
+	entry.TaskSlug = firstNonEmpty(strings.TrimSpace(start.TaskSlug), entry.TaskSlug)
+	if start.BranchRef != nil {
+		entry.BranchRef = cloneInterAgentBranchRef(start.BranchRef)
+	}
 }
 
 func (m *AppModel) replaceActivePipelineWorkerStream(correlationID, canonicalAgentID string) {
@@ -4805,11 +4883,10 @@ func (m *AppModel) shouldRenderStreamEvent(correlationID string) bool {
 	if _, interrupted := m.interruptedCorrelations[correlationID]; interrupted {
 		return false
 	}
-	if len(m.activeStreams) == 0 {
+	if m.visibleStreamCount() == 0 {
 		return true
 	}
-	_, active := m.activeStreams[correlationID]
-	return active
+	return m.streamEntryForCorrelation(correlationID) != nil
 }
 
 // shouldRenderTerminalStreamEvent returns true when a completion should reach
@@ -4833,6 +4910,41 @@ func (m *AppModel) shouldRenderTerminalStreamEvent(correlationID string) bool {
 	now := time.Now()
 	m.pruneReroutedStreamCIDs(now)
 	_, ok := m.reroutedStreamCIDs[correlationID]
+	return ok
+}
+
+func (m *AppModel) shouldIgnoreLateStreamBootstrap(correlationID string) bool {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" || m.streamedResponses == nil {
+		return false
+	}
+	state, ok := m.streamedResponses[correlationID]
+	if !ok || !state.Completed {
+		return false
+	}
+	return m.streamEntryForCorrelation(correlationID) == nil
+}
+
+func (m *AppModel) shouldRenderToolCallTerminalEvent(correlationID string) bool {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return false
+	}
+	if m.shouldRenderTerminalStreamEvent(correlationID) {
+		return true
+	}
+	if _, interrupted := m.interruptedCorrelations[correlationID]; interrupted {
+		return false
+	}
+	return m.hasRecordedStreamCorrelation(correlationID)
+}
+
+func (m *AppModel) hasRecordedStreamCorrelation(correlationID string) bool {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" || m.streamedResponses == nil {
+		return false
+	}
+	_, ok := m.streamedResponses[correlationID]
 	return ok
 }
 
@@ -4869,20 +4981,125 @@ func (m *AppModel) pruneReroutedStreamCIDs(now time.Time) {
 
 // unregisterStream removes the given correlationID from the active set.
 func (m *AppModel) unregisterStream(correlationID string) {
-	delete(m.activeStreams, strings.TrimSpace(correlationID))
+	correlationID = strings.TrimSpace(correlationID)
+	delete(m.activeStreams, correlationID)
+	delete(m.nestedStreams, correlationID)
 }
 
 // activeStreamForAgent returns the active stream entry for the given agent,
 // or nil if the agent has no active stream.
 func (m *AppModel) activeStreamForAgent(agentID string) *activeStreamEntry {
+	return streamEntryForAgentMap(m.activeStreams, agentID, m.resolveConcreteTargetAgent(agentID))
+}
+
+func (m *AppModel) visibleStreamForAgent(agentID string) *activeStreamEntry {
+	if entry := streamEntryForAgentMap(m.activeStreams, agentID, m.resolveConcreteTargetAgent(agentID)); entry != nil {
+		return entry
+	}
+	return streamEntryForAgentMap(m.nestedStreams, agentID, m.resolveConcreteTargetAgent(agentID))
+}
+
+func streamEntryForAgentMap(streams map[string]*activeStreamEntry, agentID, resolvedAgentID string) *activeStreamEntry {
 	original := normalizeAgentID(agentID)
-	resolved := normalizeAgentID(m.resolveConcreteTargetAgent(agentID))
-	for _, entry := range m.activeStreams {
+	resolved := normalizeAgentID(resolvedAgentID)
+	for _, entry := range streams {
+		if entry == nil {
+			continue
+		}
 		if entry.AgentID == original || (resolved != "" && entry.AgentID == resolved) {
 			return entry
 		}
 	}
 	return nil
+}
+
+func (m *AppModel) streamEntryForCorrelation(correlationID string) *activeStreamEntry {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return nil
+	}
+	if entry, ok := m.activeStreams[correlationID]; ok && entry != nil {
+		return entry
+	}
+	if entry, ok := m.nestedStreams[correlationID]; ok && entry != nil {
+		return entry
+	}
+	return nil
+}
+
+func (m *AppModel) visibleStreamCount() int {
+	return len(m.activeStreams) + len(m.nestedStreams)
+}
+
+func (m *AppModel) allVisibleStreamEntries() []activeStreamEntry {
+	targets := make([]activeStreamEntry, 0, m.visibleStreamCount())
+	for _, entry := range m.activeStreams {
+		if entry != nil {
+			targets = append(targets, *entry)
+		}
+	}
+	for _, entry := range m.nestedStreams {
+		if entry != nil {
+			targets = append(targets, *entry)
+		}
+	}
+	return targets
+}
+
+func (m *AppModel) interruptTargetsForCorrelation(correlationID string) []activeStreamEntry {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return nil
+	}
+
+	seen := map[string]struct{}{}
+	queue := make([]string, 0, 4)
+	targets := make([]activeStreamEntry, 0, 4)
+	addTarget := func(entry *activeStreamEntry) {
+		if entry == nil {
+			return
+		}
+		cid := strings.TrimSpace(entry.CorrelationID)
+		if cid == "" {
+			return
+		}
+		if _, ok := seen[cid]; ok {
+			return
+		}
+		seen[cid] = struct{}{}
+		targets = append(targets, *entry)
+		queue = append(queue, cid)
+	}
+
+	if entry := m.streamEntryForCorrelation(correlationID); entry != nil {
+		addTarget(entry)
+	} else {
+		seen[correlationID] = struct{}{}
+		queue = append(queue, correlationID)
+	}
+
+	for len(queue) > 0 {
+		parentCID := queue[0]
+		queue = queue[1:]
+		for _, entry := range m.nestedStreams {
+			if entry == nil || entry.BranchRef == nil {
+				continue
+			}
+			if strings.TrimSpace(entry.BranchRef.ParentCorrelationID) != parentCID {
+				continue
+			}
+			addTarget(entry)
+		}
+	}
+
+	if len(targets) == 0 {
+		targets = append(targets, activeStreamEntry{
+			CorrelationID: correlationID,
+			AgentID:       m.streamAgentID(correlationID),
+		})
+	}
+
+	return targets
 }
 
 // hasActiveStreams reports whether any streams are currently active.
@@ -6240,6 +6457,10 @@ func (m *AppModel) handleStreamStartTelemetry(start msg.StreamStartMsg) tea.Cmd 
 	if _, interrupted := m.interruptedCorrelations[correlationID]; interrupted {
 		return nil
 	}
+	if m.shouldIgnoreLateStreamBootstrap(correlationID) {
+		return nil
+	}
+	start.BranchRef = m.effectiveStreamBranchRef(correlationID, start.BranchRef)
 	start, _ = m.prepareStreamStart(start)
 	return m.propagate(start)
 }
@@ -6249,15 +6470,17 @@ func (m *AppModel) prepareStreamStart(start msg.StreamStartMsg) (msg.StreamStart
 	m.recordStreamStart(start.CorrelationID)
 	m.trackStreamStart(start)
 	created := m.registerStream(start)
-	newAgent := normalizeAgentID(start.AgentID)
-	if newAgent != "" && newAgent != "guide" && m.agentPanel != nil {
-		m.agentPanel.DemoteAgent("guide")
-	}
-	if m.statusBar != nil && m.engagedAgentID != "" && newAgent != "" && newAgent != m.engagedAgentID && newAgent != "guide" {
-		m.statusBar.SetFlash(m.engagedAgentID + " -> " + newAgent)
-	}
-	if created {
-		m.publishStreamStartActivity(start)
+	if start.BranchRef == nil {
+		newAgent := normalizeAgentID(start.AgentID)
+		if newAgent != "" && newAgent != "guide" && m.agentPanel != nil {
+			m.agentPanel.DemoteAgent("guide")
+		}
+		if m.statusBar != nil && m.engagedAgentID != "" && newAgent != "" && newAgent != m.engagedAgentID && newAgent != "guide" {
+			m.statusBar.SetFlash(m.engagedAgentID + " -> " + newAgent)
+		}
+		if created {
+			m.publishStreamStartActivity(start)
+		}
 	}
 	if m.statusBar != nil {
 		m.statusBar.SetTokenPhase(status.PhaseOutput)
@@ -6285,7 +6508,11 @@ func (m *AppModel) handleStreamChunkTelemetry(chunk msg.StreamChunkMsg) tea.Cmd 
 }
 
 func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg) tea.Cmd {
+	if m.shouldIgnoreLateStreamBootstrap(progress.CorrelationID) {
+		return nil
+	}
 	progress.AgentID = canonicalStreamAgentID(progress.AgentID, progress.AgentType, progress.PipelineID, progress.TaskID)
+	progress.BranchRef = m.effectiveStreamBranchRef(progress.CorrelationID, progress.BranchRef)
 	start := msg.StreamStartMsg{
 		SessionID:     progress.SessionID,
 		CorrelationID: progress.CorrelationID,
@@ -6296,6 +6523,7 @@ func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg)
 		TaskID:        progress.TaskID,
 		TaskName:      progress.TaskName,
 		TaskSlug:      progress.TaskSlug,
+		BranchRef:     progress.BranchRef,
 	}
 	start, created := m.prepareStreamStart(start)
 	progress.Message = redactSecrets(progress.Message)
@@ -6308,8 +6536,57 @@ func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg)
 	return m.propagate(progress)
 }
 
+func (m *AppModel) handleToolCallTelemetry(ev msg.ToolCallEventMsg) tea.Cmd {
+	ev.AgentID = canonicalStreamAgentID(ev.AgentID, ev.AgentType, ev.PipelineID, ev.TaskID)
+	ev.BranchRef = m.effectiveStreamBranchRef(ev.CorrelationID, ev.BranchRef)
+
+	correlationID := strings.TrimSpace(ev.CorrelationID)
+	if correlationID != "" && m.hasRecordedStreamCorrelation(correlationID) && m.chat != nil && m.chat.HasPendingCorrelation(correlationID) {
+		return m.propagate(ev)
+	}
+	if correlationID != "" && ev.Phase == 1 && m.hasRecordedStreamCorrelation(correlationID) {
+		if m.shouldRenderToolCallTerminalEvent(correlationID) {
+			return m.propagate(ev)
+		}
+		return nil
+	}
+	if m.shouldIgnoreLateStreamBootstrap(correlationID) {
+		return nil
+	}
+	if correlationID != "" {
+		if _, rerouted := m.reroutedStreamCIDs[correlationID]; !rerouted {
+			start := msg.StreamStartMsg{
+				SessionID:     ev.SessionID,
+				CorrelationID: ev.CorrelationID,
+				AgentID:       ev.AgentID,
+				AgentType:     ev.AgentType,
+				AgentName:     ev.AgentName,
+				PipelineID:    ev.PipelineID,
+				TaskID:        ev.TaskID,
+				TaskName:      ev.TaskName,
+				TaskSlug:      ev.TaskSlug,
+				BranchRef:     ev.BranchRef,
+			}
+			start, created := m.prepareStreamStart(start)
+			if !m.shouldRenderStreamEvent(ev.CorrelationID) {
+				return nil
+			}
+			if created {
+				return tea.Batch(m.propagate(start), m.propagate(ev))
+			}
+			return m.propagate(ev)
+		}
+	}
+
+	if !m.shouldRenderTerminalStreamEvent(ev.CorrelationID) {
+		return nil
+	}
+	return m.propagate(ev)
+}
+
 func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea.Cmd {
 	done.AgentID = canonicalStreamAgentID(done.AgentID, done.AgentType, done.PipelineID, done.TaskID)
+	done.BranchRef = m.effectiveStreamBranchRef(done.CorrelationID, done.BranchRef)
 	uiDebugFileLog().Info("AppModel: STREAM_COMPLETE_RECEIVED",
 		"correlation_id", done.CorrelationID,
 		"agent_id", done.AgentID,
@@ -6317,15 +6594,17 @@ func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea
 		"authoritative_text_len", len(done.AuthoritativeText))
 	m.recordStreamComplete(done.CorrelationID)
 	shouldRender := m.shouldRenderTerminalStreamEvent(done.CorrelationID)
+	shouldPropagate := shouldRender || done.BranchRef != nil
 	uiDebugFileLog().Info("AppModel: STREAM_COMPLETE_SHOULD_RENDER",
 		"correlation_id", done.CorrelationID,
-		"should_render", shouldRender)
+		"should_render", shouldRender,
+		"should_propagate", shouldPropagate)
 	m.applyRealStreamUsage(done)
 	m.finalizeStreamUsage(done.CorrelationID, true, "")
 	m.markQueueEntryByCorrelation(done.CorrelationID, true)
 	m.unregisterStream(done.CorrelationID)
 	m.clearReroutedStreamCID(done.CorrelationID)
-	if !shouldRender {
+	if !shouldPropagate {
 		uiDebugFileLog().Warn("AppModel: STREAM_COMPLETE_NOT_RENDERED",
 			"correlation_id", done.CorrelationID)
 		m.statusBar.StopSpinner()
@@ -6389,6 +6668,7 @@ func isTerminalStreamError(err error) bool {
 
 func (m *AppModel) handleStreamErrorTelemetry(streamErr msg.StreamErrorMsg) tea.Cmd {
 	streamErr.Err = redactedError(streamErr.Err)
+	streamErr.BranchRef = m.effectiveStreamBranchRef(streamErr.CorrelationID, streamErr.BranchRef)
 	summary := ""
 	if streamErr.Err != nil {
 		summary = streamErr.Err.Error()
@@ -6543,7 +6823,7 @@ func (m *AppModel) streamAgentID(correlationID string) string {
 	if usage, ok := m.streamUsage[correlationID]; ok {
 		return normalizeAgentID(usage.AgentID)
 	}
-	if entry, ok := m.activeStreams[strings.TrimSpace(correlationID)]; ok {
+	if entry := m.streamEntryForCorrelation(correlationID); entry != nil {
 		return normalizeAgentID(entry.AgentID)
 	}
 	return guideAgentID
@@ -6656,7 +6936,7 @@ func (m *AppModel) tokenUsageOverlapsActiveStream(correlationID, canonicalAgentI
 	if canonicalAgentID == "" {
 		return false
 	}
-	return m.activeStreamForAgent(canonicalAgentID) != nil
+	return m.visibleStreamForAgent(canonicalAgentID) != nil
 }
 
 func (m *AppModel) recordStreamInputTokens(correlationID, canonicalAgentID string, inputTokens int) {
@@ -6789,7 +7069,7 @@ func (m *AppModel) streamIdentityForCorrelation(correlationID string) (string, s
 		taskSlug   string
 		runtimeID  string
 	)
-	if entry, ok := m.activeStreams[strings.TrimSpace(correlationID)]; ok && entry != nil {
+	if entry := m.streamEntryForCorrelation(correlationID); entry != nil {
 		agentID = entry.AgentID
 		agentName = entry.AgentName
 		agentType = entry.AgentType
@@ -6920,6 +7200,11 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 		if _, interrupted := m.interruptedCorrelations[r.CorrelationID]; interrupted {
 			return nil
 		}
+		// Route responses are terminal for the correlation even when they did not
+		// arrive through the stream transport. Record completion before any
+		// synthetic StreamComplete translation so late nested progress/start
+		// events cannot resurrect child chat spinners after approval finished.
+		m.recordStreamComplete(r.CorrelationID)
 	}
 	if r.Err == nil {
 		m.markSuccessfulRouteResponse(r.CorrelationID)
@@ -6943,7 +7228,9 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 		source = chat.SourceError
 		content = redactSecrets(r.Err.Error())
 	}
-	streamEntry := cloneActiveStreamEntry(m.activeStreams[strings.TrimSpace(r.CorrelationID)])
+	effectiveBranchRef := m.effectiveStreamBranchRef(r.CorrelationID, r.BranchRef)
+	hasPendingChatCorrelation := m.chat != nil && m.chat.HasPendingCorrelation(r.CorrelationID)
+	streamEntry := cloneActiveStreamEntry(m.streamEntryForCorrelation(r.CorrelationID))
 	m.unregisterStream(r.CorrelationID)
 	added := estimateGuideTokens(content)
 	contextAgentID := r.AgentID
@@ -6955,6 +7242,47 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 	m.updateTokenDisplay()
 	m.statusBar.SetTokenPhase(status.PhaseIdle)
 	m.publishResponseActivity(r, source, content, streamEntry)
+	if effectiveBranchRef != nil || hasPendingChatCorrelation {
+		entryAgentID := strings.TrimSpace(r.AgentID)
+		entryAgentType := strings.TrimSpace(r.AgentType)
+		if entryAgentType == "" {
+			resolvedID, _, resolvedType := m.resolveAgentIdentity(entryAgentID, r.AgentName)
+			if entryAgentID == "" {
+				entryAgentID = resolvedID
+			}
+			entryAgentType = resolvedType
+		}
+		var (
+			comp component.Component
+			cmd  tea.Cmd
+		)
+		if r.Err != nil {
+			uiDebugFileLog().Info("AppModel: ROUTE_RESPONSE_SYNTHETIC_STREAM_ERROR",
+				"correlation_id", r.CorrelationID,
+				"has_branch_ref", effectiveBranchRef != nil,
+				"has_pending_chat_correlation", hasPendingChatCorrelation)
+			comp, cmd = m.chat.Update(msg.StreamErrorMsg{
+				CorrelationID: r.CorrelationID,
+				Err:           r.Err,
+				BranchRef:     effectiveBranchRef,
+			})
+		} else {
+			uiDebugFileLog().Info("AppModel: ROUTE_RESPONSE_SYNTHETIC_STREAM_COMPLETE",
+				"correlation_id", r.CorrelationID,
+				"has_branch_ref", effectiveBranchRef != nil,
+				"has_pending_chat_correlation", hasPendingChatCorrelation,
+				"content_len", len(content))
+			comp, cmd = m.chat.Update(msg.StreamCompleteMsg{
+				CorrelationID:     r.CorrelationID,
+				AgentID:           entryAgentID,
+				AgentType:         entryAgentType,
+				AuthoritativeText: content,
+				BranchRef:         effectiveBranchRef,
+			})
+		}
+		m.chat = comp.(*chat.Model)
+		return cmd
+	}
 	streamTaskID := ""
 	streamTaskName := ""
 	streamTaskSlug := ""
@@ -11092,13 +11420,13 @@ func (m *AppModel) handleCommandApprovalKey(key tea.KeyMsg) (tea.Model, tea.Cmd)
 	}
 	switch key.String() {
 	case "up", "shift+tab":
-		m.commandApproval.selected = wrappedIndex(m.commandApproval.selected-1, len(commandApprovalOptions))
+		m.commandApproval.selected = wrappedIndex(m.commandApproval.selected-1, len(commandApprovalOptionsForProposal(m.commandApproval.proposal)))
 		m.commandApproval.activated = -1
 		m.markSlotDirty(compositor.SlotInput)
 		m.viewDirty = true
 		return m, nil
 	case "down", "tab":
-		m.commandApproval.selected = wrappedIndex(m.commandApproval.selected+1, len(commandApprovalOptions))
+		m.commandApproval.selected = wrappedIndex(m.commandApproval.selected+1, len(commandApprovalOptionsForProposal(m.commandApproval.proposal)))
 		m.commandApproval.activated = -1
 		m.markSlotDirty(compositor.SlotInput)
 		m.viewDirty = true
@@ -11124,14 +11452,18 @@ func wrappedIndex(index, size int) int {
 }
 
 func (m *AppModel) activateCommandApprovalOption(index int) tea.Cmd {
-	if m.commandApproval == nil || index < 0 || index >= len(commandApprovalOptions) {
+	options := commandApprovalOptionsForProposal(nil)
+	if m.commandApproval != nil {
+		options = commandApprovalOptionsForProposal(m.commandApproval.proposal)
+	}
+	if m.commandApproval == nil || index < 0 || index >= len(options) {
 		return nil
 	}
 	m.commandApproval.selected = index
 	m.commandApproval.activated = index
 	m.markSlotDirty(compositor.SlotInput)
 	m.viewDirty = true
-	option := commandApprovalOptions[index]
+	option := options[index]
 	proposal := m.commandApproval.proposal
 	return tea.Tick(75*time.Millisecond, func(time.Time) tea.Msg {
 		return msg.CommandApprovalCommitMsg{
@@ -12886,8 +13218,8 @@ func (m *AppModel) isChatVisible() bool {
 	return m.leftRing.current() == component.FocusChat
 }
 
-// handleChatClick copies the content of the chat entry at the clicked
-// position to the system clipboard.
+// handleChatClick toggles expandable chat rows or copies the clicked content
+// to the system clipboard.
 func (m *AppModel) handleChatClick(x, y int) tea.Cmd {
 	if !m.isChatVisible() {
 		return nil
@@ -12920,17 +13252,27 @@ func (m *AppModel) handleChatClick(x, y int) tea.Cmd {
 	}
 
 	viewportLine := y - viewportTop
-	target := m.chat.CopyTargetAtViewLine(viewportLine)
+	if m.chat.ToggleAtRenderedViewLine(viewportLine) {
+		m.markSlotDirty(m.chatSlot())
+		m.viewDirty = true
+		return nil
+	}
+	target := m.chat.CopyTargetAtRenderedViewLine(viewportLine)
 	if target == nil {
 		return nil
 	}
 
 	if err := m.clipboard.Set(target.Content); err != nil {
 		m.statusBar.SetFlash("Copy failed")
+		m.markSlotDirty(compositor.SlotStatus)
+		m.viewDirty = true
 		return nil
 	}
 	m.chat.SetHighlight(target.EntryID, target.EntryIndex, target.HighlightStart, target.HighlightEnd)
 	m.statusBar.SetFlash("Copied!")
+	m.markSlotDirty(m.chatSlot())
+	m.markSlotDirty(compositor.SlotStatus)
+	m.viewDirty = true
 	return nil
 }
 
@@ -14313,20 +14655,21 @@ func (m *AppModel) commandApprovalLayout(width int) commandApprovalViewLayout {
 		codeStartY: -1,
 		codeEndY:   -1,
 	}
+	options := commandApprovalOptionsForProposal(proposal)
 	layout.lines = append(layout.lines,
-		promptStyle.Render(commandApprovalRequesterName(proposal)+" wants approval for:"),
+		promptStyle.Render(commandApprovalPromptLine(proposal)),
 		"",
 	)
-	optionLines := make([][]string, len(commandApprovalOptions))
-	optionHitboxes := make([][]commandApprovalHitbox, len(commandApprovalOptions))
+	optionLines := make([][]string, len(options))
+	optionHitboxes := make([][]commandApprovalHitbox, len(options))
 	optionLineCount := 0
-	for idx, option := range commandApprovalOptions {
+	for idx, option := range options {
 		renderedLines, hitboxes := m.renderCommandApprovalOption(idx, option, width)
 		optionLines[idx] = renderedLines
 		optionHitboxes[idx] = hitboxes
 		optionLineCount += len(renderedLines)
 	}
-	codeLines := renderCommandApprovalCodeBlock(strings.TrimSpace(proposal.Command), width, th)
+	codeLines := renderCommandApprovalCodeBlock(proposal, width, th)
 	maxBodyLines := max(m.height-statusBarHeight-mainMinContentHeight-inputBorderSize, 1)
 	availableForCode := max(maxBodyLines-len(layout.lines)-optionLineCount, 0)
 	codeSpacerLines := 0
@@ -14346,7 +14689,7 @@ func (m *AppModel) commandApprovalLayout(width int) commandApprovalViewLayout {
 			layout.lines = append(layout.lines, "")
 		}
 	}
-	for idx := range commandApprovalOptions {
+	for idx := range options {
 		baseY := len(layout.lines)
 		layout.lines = append(layout.lines, optionLines[idx]...)
 		for _, hitbox := range optionHitboxes[idx] {
@@ -14549,24 +14892,13 @@ func wrapStyledApprovalTokens(tokens []styledApprovalToken, width int) []string 
 
 func (m *AppModel) renderLayerDecisionOption(index int, option commandApprovalOption, width int) ([]string, []commandApprovalHitbox) {
 	th := m.config.Theme()
-	renderTheme := th
-	if m.layerDecision != nil && m.layerDecision.selected == index {
-		selectedTheme := *th
-		selectedPalette := th.Palette
-		selectedPalette.Foreground = th.Palette.Secondary
-		selectedTheme.Palette = selectedPalette
-		renderTheme = &selectedTheme
-	}
-	style := lipgloss.NewStyle()
-	if m.layerDecision != nil && m.layerDecision.activated == index {
-		style = style.Bold(true)
-	}
-	renderedLines := markdownpkg.RenderMarkdown(commandApprovalOptionMarkdown(option), width, renderTheme)
+	selected := m.layerDecision != nil && m.layerDecision.selected == index
+	activated := m.layerDecision != nil && m.layerDecision.activated == index
+	renderedLines := renderLayerDecisionOptionLines(option, width, th, selected, activated)
 	hitboxes := make([]commandApprovalHitbox, 0, len(renderedLines))
 	for i, line := range renderedLines {
 		stripped := ansi.Strip(line)
 		visibleW := lipgloss.Width(stripped)
-		renderedLines[i] = style.Render(line)
 		hitboxes = append(hitboxes, commandApprovalHitbox{
 			option: index,
 			y:      i,
@@ -14577,8 +14909,52 @@ func (m *AppModel) renderLayerDecisionOption(index int, option commandApprovalOp
 	return renderedLines, hitboxes
 }
 
-func renderCommandApprovalCodeBlock(command string, width int, th *theme.Theme) []string {
-	rendered := markdownpkg.RenderMarkdown("```sh\n"+command+"\n```", width, th)
+func renderLayerDecisionOptionLines(
+	option commandApprovalOption,
+	width int,
+	th *theme.Theme,
+	selected bool,
+	activated bool,
+) []string {
+	if width <= 0 {
+		width = 40
+	}
+
+	palette := th.Palette
+	bulletStyle := lipgloss.NewStyle().Foreground(palette.Accent)
+	labelStyle := lipgloss.NewStyle().Foreground(palette.Foreground)
+	hintStyle := lipgloss.NewStyle().Foreground(palette.Subtext)
+	if selected {
+		bulletStyle = bulletStyle.Foreground(palette.Secondary)
+		labelStyle = labelStyle.Foreground(palette.Secondary)
+		hintStyle = hintStyle.Foreground(palette.Primary)
+	}
+	if activated {
+		bulletStyle = bulletStyle.Bold(true)
+		labelStyle = labelStyle.Bold(true)
+		hintStyle = hintStyle.Bold(true)
+	}
+
+	tokens := []styledApprovalToken{{text: "•", style: bulletStyle}}
+	for _, token := range strings.Fields(strings.TrimSpace(option.label)) {
+		tokens = append(tokens, styledApprovalToken{text: token, style: labelStyle})
+	}
+	for _, token := range strings.Fields(strings.TrimSpace(option.hint)) {
+		tokens = append(tokens, styledApprovalToken{text: token, style: hintStyle})
+	}
+	return wrapStyledApprovalTokens(tokens, width)
+}
+
+func renderCommandApprovalCodeBlock(proposal *commandapproval.Proposal, width int, th *theme.Theme) []string {
+	command := ""
+	if proposal != nil {
+		command = strings.TrimSpace(proposal.Command)
+	}
+	fenceLang := "sh"
+	if proposal != nil && proposal.IsFetchApproval() {
+		fenceLang = "text"
+	}
+	rendered := markdownpkg.RenderMarkdown("```"+fenceLang+"\n"+command+"\n```", width, th)
 	if len(rendered) >= 2 && commandApprovalMarkdownLineEmpty(rendered[0]) {
 		rendered = rendered[1:]
 	}
@@ -14598,6 +14974,21 @@ func commandApprovalOptionMarkdown(option commandApprovalOption) string {
 		return "- " + option.label
 	}
 	return "- " + option.label + " (" + hint + ")"
+}
+
+func commandApprovalOptionsForProposal(proposal *commandapproval.Proposal) []commandApprovalOption {
+	if proposal != nil && proposal.IsFetchApproval() {
+		return fetchApprovalOptions
+	}
+	return commandApprovalOptions
+}
+
+func commandApprovalPromptLine(proposal *commandapproval.Proposal) string {
+	requester := commandApprovalRequesterName(proposal)
+	if proposal != nil && proposal.IsFetchApproval() {
+		return requester + " wants approval to fetch:"
+	}
+	return requester + " wants approval for:"
 }
 
 func commandApprovalRequesterName(proposal *commandapproval.Proposal) string {

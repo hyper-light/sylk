@@ -10,4 +10,5 @@ Generate an agent briefing for handoff based on the current state:
 4. Patterns to follow
 5. Failures to avoid
 6. User intent constraints
-7. Open threads
+7. Active declared work intents and coordination risks
+8. Open threads

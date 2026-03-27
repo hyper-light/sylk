@@ -18,6 +18,24 @@ func TestDefaultConsultationTimeout_Value(t *testing.T) {
 	}
 }
 
+func TestConsultationInactivityTimeout_AcademicUsesResearchBudget(t *testing.T) {
+	tests := []struct {
+		target string
+		want   time.Duration
+	}{
+		{target: "academic", want: DefaultResearchConsultationTimeout},
+		{target: "task_1:academic", want: DefaultResearchConsultationTimeout},
+		{target: "librarian", want: DefaultConsultationTimeout},
+		{target: "", want: DefaultConsultationTimeout},
+	}
+
+	for _, tt := range tests {
+		if got := ConsultationInactivityTimeout(tt.target); got != tt.want {
+			t.Fatalf("ConsultationInactivityTimeout(%q) = %v, want %v", tt.target, got, tt.want)
+		}
+	}
+}
+
 // --- ConsultationEvidence JSON roundtrip ---
 
 func TestConsultationEvidence_JSONRoundtrip(t *testing.T) {

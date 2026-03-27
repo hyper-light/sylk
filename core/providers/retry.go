@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"errors"
+	"io"
 	"math"
 	"math/rand/v2"
 	"net"
@@ -114,8 +115,9 @@ func retryStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) e
 const anthropicInternalServerMaxRetries = 3
 
 // retryAnthropicInternalServerGenerate retries Anthropic generate calls only
-// for HTTP 500 internal server errors. MaxRetries here is a retry budget, not
-// a total-attempt budget: 3 means the initial request plus up to 3 retries.
+// for HTTP 500 internal server errors and transient transport failures like
+// unexpected EOF. MaxRetries here is a retry budget, not a total-attempt
+// budget: 3 means the initial request plus up to 3 retries.
 func retryAnthropicInternalServerGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Context) (*Response, error)) (*Response, error) {
 	var lastErr error
 	for retry := 0; ; retry++ {
@@ -142,8 +144,9 @@ func retryAnthropicInternalServerGenerate(ctx context.Context, cfg BaseConfig, f
 }
 
 // retryAnthropicInternalServerStream retries Anthropic stream calls only for
-// HTTP 500 internal server errors. MaxRetries here is a retry budget, not a
-// total-attempt budget: 3 means the initial request plus up to 3 retries.
+// HTTP 500 internal server errors and transient transport failures like
+// unexpected EOF. MaxRetries here is a retry budget, not a total-attempt
+// budget: 3 means the initial request plus up to 3 retries.
 func retryAnthropicInternalServerStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) error) error {
 	var lastErr error
 	for retry := 0; ; retry++ {
@@ -238,7 +241,7 @@ func shouldRetryAnthropicInternalServerCall(ctx context.Context, err error, retr
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	return isAnthropicInternalServerError(err)
+	return isAnthropicInternalServerError(err) || isRetryableTransportError(err)
 }
 
 // isRetryableError returns true for transient errors using typed error
@@ -260,7 +263,14 @@ func isRetryableError(err error) bool {
 	if errors.As(err, &netErr) {
 		return netErr.Timeout()
 	}
-	return false
+	return isRetryableTransportError(err)
+}
+
+func isRetryableTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func isAnthropicInternalServerError(err error) bool {

@@ -13,14 +13,20 @@ import (
 	"github.com/google/uuid"
 )
 
-const routeSyncTimeout = shared.DefaultConsultationTimeout
+type pendingWait struct {
+	response chan *guide.Message
+	activity chan struct{}
+}
 
-func (gi *GlobalInspector) registerPendingWait(correlationID string) <-chan *guide.Message {
-	ch := make(chan *guide.Message, 1)
+func (gi *GlobalInspector) registerPendingWait(correlationID string) *pendingWait {
+	wait := &pendingWait{
+		response: make(chan *guide.Message, 1),
+		activity: make(chan struct{}, 1),
+	}
 	gi.pendingMu.Lock()
-	gi.pendingBus[correlationID] = ch
+	gi.pendingBus[correlationID] = wait
 	gi.pendingMu.Unlock()
-	return ch
+	return wait
 }
 
 func (gi *GlobalInspector) clearPendingWait(correlationID string) {
@@ -33,19 +39,34 @@ func (gi *GlobalInspector) deliverPendingMessage(msg *guide.Message) {
 	if msg == nil {
 		return
 	}
-	if msg.Type != guide.MessageTypeResponse && msg.Type != guide.MessageTypeError {
-		return
-	}
 
-	gi.pendingMu.Lock()
-	ch, ok := gi.pendingBus[msg.CorrelationID]
-	gi.pendingMu.Unlock()
-
-	if ok {
+	switch msg.Type {
+	case guide.MessageTypeResponse, guide.MessageTypeError:
+		gi.pendingMu.Lock()
+		wait, ok := gi.pendingBus[msg.CorrelationID]
+		gi.pendingMu.Unlock()
+		if !ok || wait == nil {
+			return
+		}
 		select {
-		case ch <- msg:
+		case wait.response <- msg:
 		default:
 		}
+	case guide.MessageTypeStream:
+		for _, correlationID := range shared.PendingSyncActivityCorrelations(msg) {
+			gi.pendingMu.Lock()
+			activityWait := gi.pendingBus[correlationID]
+			gi.pendingMu.Unlock()
+			if activityWait == nil {
+				continue
+			}
+			select {
+			case activityWait.activity <- struct{}{}:
+			default:
+			}
+		}
+	default:
+		return
 	}
 }
 
@@ -62,16 +83,21 @@ func (gi *GlobalInspector) requestRouteSync(
 	if target == "" {
 		return nil, fmt.Errorf("target agent is required")
 	}
+	routeCtx, release := shared.WithoutDeadlineCancellation(ctx)
+	defer release()
+
 	encoded, err := encodeConsultationPayload(payload)
 	if err != nil {
 		return nil, err
 	}
+	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(routeCtx, target, encoded, metadata)
+	metadata = branch.ApplyMetadata(branchCtx, metadata)
 
 	correlationID := fmt.Sprintf("gi_corr_%s", uuid.New().String()[:8])
-	waitCh := gi.registerPendingWait(correlationID)
+	wait := gi.registerPendingWait(correlationID)
 	defer gi.clearPendingWait(correlationID)
 
-	sessionID := strings.TrimSpace(versioning.SessionIDFromContext(ctx))
+	sessionID := strings.TrimSpace(versioning.SessionIDFromContext(routeCtx))
 	if sessionID == "" {
 		sessionID = strings.TrimSpace(gi.config.SessionID)
 	}
@@ -86,39 +112,47 @@ func (gi *GlobalInspector) requestRouteSync(
 		Timestamp:       time.Now().UTC(),
 		Metadata:        metadata,
 	}
+	if req.ParentCorrelationID == "" {
+		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+			req.ParentCorrelationID = stream.CorrelationID
+		}
+	}
+	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
+	req.Metadata = guide.MetadataWithPreservedSourceStreamTarget(req.Metadata)
 	msg := guide.NewRequestMessage(gi.generateMessageID(), req)
 	msg.CorrelationID = correlationID
 
 	if err := gi.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
-		return nil, fmt.Errorf("publish escalation request: %w", err)
+		branch.Complete(branchCtx, "", "", err)
+		return nil, fmt.Errorf("publish consultation request: %w", err)
 	}
 
-	var response *guide.Message
-	err = shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
-		AttemptTimeout: routeSyncTimeout,
-		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
-		OnRefresh: func(info shared.ContextLeaseRefresh) {
-			if gi.logger != nil {
-				gi.logger.Info("escalation wait lease refreshed",
-					"target", target,
-					"correlation_id", correlationID,
-					"refresh_count", info.RefreshCount,
-					"attempt_timeout", info.AttemptTimeout.String(),
-					"error", info.Error)
-			}
-		},
-	}, func(waitCtx context.Context) error {
-		select {
-		case <-waitCtx.Done():
-			return waitCtx.Err()
-		case response = <-waitCh:
-			return nil
-		}
-	})
+	response, err := waitForPendingResponse(branchCtx, consultationWaitSubject(target), consultationInactivityTimeout(target), wait)
 	if err != nil {
-		return nil, shared.WrapLeaseTimeoutError("escalation request", routeSyncTimeout, err)
+		branch.Complete(branchCtx, "", "", err)
+		return nil, err
 	}
+	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
+}
+
+func consultationInactivityTimeout(target string) time.Duration {
+	return shared.ConsultationInactivityTimeout(target)
+}
+
+func consultationWaitSubject(target string) string {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "consultation request"
+	}
+	return fmt.Sprintf("consultation to %q", target)
+}
+
+func waitForPendingResponse(ctx context.Context, subject string, inactivityTimeout time.Duration, wait *pendingWait) (*guide.Message, error) {
+	return shared.WaitForPendingSyncResponse(ctx, subject, inactivityTimeout, &shared.PendingSyncWait{
+		Response: wait.response,
+		Activity: wait.activity,
+	})
 }
 
 func encodeConsultationPayload(payload any) (string, error) {

@@ -101,3 +101,23 @@ func TestApplyStageGoogleDesignerAddsPromptDirectives(t *testing.T) {
 		t.Fatalf("SystemPrompt missing tool policy directive: %q", req.SystemPrompt)
 	}
 }
+
+func TestApplyStageStampsAgentAndSessionMetadata(t *testing.T) {
+	req := &providers.Request{
+		MaxTokens: 2048,
+	}
+
+	ApplyStage(req, ResolveAgentStageProfile("academic", "conversation"), ApplyOptions{
+		Model:     "gpt-5.4-pro",
+		MaxTokens: req.MaxTokens,
+		AgentID:   "academic",
+		SessionID: "sess-ctx",
+	})
+
+	if got := req.Metadata["agent_id"]; got != "academic" {
+		t.Fatalf("Metadata[agent_id] = %#v, want academic", got)
+	}
+	if got := req.Metadata["session_id"]; got != "sess-ctx" {
+		t.Fatalf("Metadata[session_id] = %#v, want sess-ctx", got)
+	}
+}

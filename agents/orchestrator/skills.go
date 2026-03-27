@@ -47,6 +47,15 @@ func (o *Orchestrator) registerCoreSkills() {
 	// Plan ingestion and analysis skills
 	o.skills.Register(ingestPlanSkill(o))
 	o.skills.Register(analyzePlanSkill(o))
+	for _, skill := range shared.NewGlobalReviewProtocolSkills(shared.GlobalReviewProtocolSkillConfig{
+		AgentType: func() string { return "orchestrator" },
+		Route: shared.GlobalReviewRouteConfig{
+			BusProvider: func() guide.EventBus { return o.bus },
+			SessionID:   func() string { return o.SessionID() },
+		},
+	}) {
+		o.skills.Register(skill)
+	}
 
 	// Diagnostics
 	o.skills.Register(shared.NewSelfDiagnosticSkill(&orchestratorDiag{o: o}))
@@ -63,6 +72,7 @@ func orchestratorPinnedSkillNames() []string {
 	return []string{
 		"query_task", "query_workflow", "push_status",
 		"ingest_plan", "execute_dag",
+		"validate_global_review",
 		"escalate_to_architect",
 		"read_workspace_file", "inspect_workspace_state", "diff_workspace_file",
 	}
@@ -85,6 +95,7 @@ func orchestratorCoreSkillNames() []string {
 		"query_buffer", "query_pipeline_state",
 		"query_dag_status",
 		"ingest_plan", "analyze_plan",
+		"validate_global_review",
 		"self_diagnostic",
 	}
 }

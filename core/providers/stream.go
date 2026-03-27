@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"runtime/debug"
 	"strings"
@@ -42,9 +43,10 @@ const (
 )
 
 type ToolCallChunk struct {
-	ID             string `json:"id,omitempty"`
-	Name           string `json:"name,omitempty"`
-	ArgumentsDelta string `json:"arguments_delta,omitempty"`
+	ID             string   `json:"id,omitempty"`
+	Name           string   `json:"name,omitempty"`
+	Kind           ToolKind `json:"kind,omitempty"`
+	ArgumentsDelta string   `json:"arguments_delta,omitempty"`
 }
 
 type StreamAccumulator struct {
@@ -66,6 +68,7 @@ type StreamAccumulator struct {
 type accumulatedToolCall struct {
 	ID        string
 	Name      string
+	Kind      ToolKind
 	Arguments strings.Builder
 }
 
@@ -92,12 +95,16 @@ func (a *StreamAccumulator) Add(chunk *StreamChunk) {
 			a.toolCalls[chunk.ToolCall.ID] = &accumulatedToolCall{
 				ID:   chunk.ToolCall.ID,
 				Name: chunk.ToolCall.Name,
+				Kind: chunk.ToolCall.Kind,
 			}
 		}
 
 	case ChunkTypeToolDelta:
 		if chunk.ToolCall != nil {
 			if tc, ok := a.toolCalls[chunk.ToolCall.ID]; ok {
+				if tc.Kind == "" {
+					tc.Kind = chunk.ToolCall.Kind
+				}
 				tc.Arguments.WriteString(chunk.ToolCall.ArgumentsDelta)
 			}
 		}
@@ -142,7 +149,14 @@ func (a *StreamAccumulator) Response() *Response {
 	defer a.mu.Unlock()
 
 	var toolCalls []ToolCall
+	var nativeSearchCalls []NativeWebSearchCall
 	for _, tc := range a.toolCalls {
+		if tc.Kind == ToolKindNativeWebSearch {
+			if native := nativeWebSearchCallFromToolChunk(tc); native != nil {
+				nativeSearchCalls = append(nativeSearchCalls, *native)
+			}
+			continue
+		}
 		toolCalls = append(toolCalls, ToolCall{
 			ID:        tc.ID,
 			Name:      tc.Name,
@@ -157,6 +171,9 @@ func (a *StreamAccumulator) Response() *Response {
 	for k, v := range a.providerData {
 		meta[k] = v
 	}
+	if len(nativeSearchCalls) > 0 {
+		meta[ProviderMetadataNativeWebSearchCallsKey] = nativeSearchCalls
+	}
 
 	return &Response{
 		Content:          a.text.String(),
@@ -167,6 +184,37 @@ func (a *StreamAccumulator) Response() *Response {
 		ToolCalls:        toolCalls,
 		ProviderMetadata: meta,
 	}
+}
+
+func nativeWebSearchCallFromToolChunk(tc *accumulatedToolCall) *NativeWebSearchCall {
+	if tc == nil {
+		return nil
+	}
+	call := &NativeWebSearchCall{ID: tc.ID}
+	args := strings.TrimSpace(tc.Arguments.String())
+	if args == "" || args == "{}" {
+		return call
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(args), &payload); err != nil {
+		return call
+	}
+	if query, ok := payload["query"].(string); ok {
+		call.Query = strings.TrimSpace(query)
+	}
+	if action, ok := payload["action"].(string); ok {
+		call.Action = strings.TrimSpace(action)
+	}
+	if url, ok := payload["url"].(string); ok {
+		call.URL = strings.TrimSpace(url)
+	}
+	if pattern, ok := payload["pattern"].(string); ok {
+		call.Pattern = strings.TrimSpace(pattern)
+	}
+	if status, ok := payload["status"].(string); ok {
+		call.Status = strings.TrimSpace(status)
+	}
+	return call
 }
 
 func (a *StreamAccumulator) Text() string {

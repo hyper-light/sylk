@@ -5,6 +5,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/dag"
+	coreversioning "github.com/adalundhe/sylk/core/versioning"
 )
 
 // PlanStatusClarifying is outside the iota sequence (value 10) to avoid
@@ -126,6 +127,7 @@ type DesignPlan struct {
 	Query                  string
 	Status                 PlanStatus
 	Revision               int
+	ArtifactVersion        coreversioning.SemanticVersion
 	Error                  string
 	Requirements           *Requirements
 	CodebasePatterns       *CodebasePatterns

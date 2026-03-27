@@ -41,7 +41,7 @@ func TestPlanStore_UpsertAndGet(t *testing.T) {
 	}
 
 	// Verify disk persistence.
-	diskPath := filepath.Join(store.PlanDir("sess-1"), "plan-1.json")
+	diskPath := versionedPlanSnapshotPath(store.baseDir, "sess-1", "plan-1", normalizedPlanArtifactVersion(plan))
 	if _, err := os.Stat(diskPath); os.IsNotExist(err) {
 		t.Error("expected plan file on disk")
 	}
@@ -381,14 +381,20 @@ func TestPlanStore_RemoveDiskFile(t *testing.T) {
 	plan.sm = NewPlanStateMachine(plan.ID, PlanStatusPending)
 	_ = store.Upsert(plan)
 
-	diskPath := filepath.Join(store.PlanDir("sess-1"), "disk-rm.json")
-	if _, err := os.Stat(diskPath); os.IsNotExist(err) {
+	diskPathV10 := versionedPlanSnapshotPath(store.baseDir, "sess-1", "disk-rm", normalizedPlanArtifactVersion(plan))
+	if _, err := os.Stat(diskPathV10); os.IsNotExist(err) {
 		t.Fatal("expected file to exist before removal")
+	}
+	diskPathV11 := versionedPlanSnapshotPath(store.baseDir, "sess-1", "disk-rm", normalizedPlanArtifactVersion(&DesignPlan{Revision: 2}))
+	if err := os.WriteFile(diskPathV11, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write extra versioned snapshot: %v", err)
 	}
 
 	store.RemoveDiskFile("disk-rm", "sess-1")
 
-	if _, err := os.Stat(diskPath); !os.IsNotExist(err) {
-		t.Error("expected file to be removed")
+	for _, diskPath := range []string{diskPathV10, diskPathV11} {
+		if _, err := os.Stat(diskPath); !os.IsNotExist(err) {
+			t.Errorf("expected file to be removed: %s", diskPath)
+		}
 	}
 }

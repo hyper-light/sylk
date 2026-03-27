@@ -3,6 +3,7 @@ package engineer
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -10,16 +11,24 @@ import (
 	"github.com/google/uuid"
 )
 
-// routeSyncTimeout bounds how long the engineer waits for a bus response.
-// Uses the shared default rather than a local magic number.
+// routeSyncTimeout overrides the default target-aware consultation timeout in
+// tests. When left at the shared default, Engineer uses the target-aware
+// consultation timeout policy.
 var routeSyncTimeout = shared.DefaultConsultationTimeout
 
-func (e *Engineer) registerPendingConsult(correlationID string) <-chan *guide.Message {
-	ch := make(chan *guide.Message, 1)
+func engineerConsultationTimeout(target string) time.Duration {
+	if routeSyncTimeout != shared.DefaultConsultationTimeout {
+		return routeSyncTimeout
+	}
+	return shared.ConsultationInactivityTimeout(target)
+}
+
+func (e *Engineer) registerPendingConsult(correlationID string) *shared.PendingSyncWait {
+	wait := shared.NewPendingSyncWait()
 	e.pendingMu.Lock()
-	e.pendingConsults[correlationID] = ch
+	e.pendingConsults[correlationID] = wait
 	e.pendingMu.Unlock()
-	return ch
+	return wait
 }
 
 func (e *Engineer) clearPendingConsult(correlationID string) {
@@ -28,24 +37,39 @@ func (e *Engineer) clearPendingConsult(correlationID string) {
 	e.pendingMu.Unlock()
 }
 
-// deliverConsultResponse delivers terminal messages (response or error) to
-// synchronous waiters. Stream events are filtered out.
+// deliverConsultResponse delivers terminal messages and descendant stream
+// activity to synchronous consultation waiters.
 func (e *Engineer) deliverConsultResponse(msg *guide.Message) {
 	if msg == nil || msg.CorrelationID == "" {
 		return
 	}
-	if msg.Type != guide.MessageTypeResponse && msg.Type != guide.MessageTypeError {
-		return
-	}
-	e.pendingMu.Lock()
-	ch := e.pendingConsults[msg.CorrelationID]
-	e.pendingMu.Unlock()
-	if ch == nil {
-		return
-	}
-	select {
-	case ch <- msg:
+	switch msg.Type {
+	case guide.MessageTypeResponse, guide.MessageTypeError:
+		e.pendingMu.Lock()
+		wait := e.pendingConsults[msg.CorrelationID]
+		e.pendingMu.Unlock()
+		if wait == nil {
+			return
+		}
+		select {
+		case wait.Response <- msg:
+		default:
+		}
+	case guide.MessageTypeStream:
+		for _, correlationID := range shared.PendingSyncActivityCorrelations(msg) {
+			e.pendingMu.Lock()
+			wait := e.pendingConsults[correlationID]
+			e.pendingMu.Unlock()
+			if wait == nil {
+				continue
+			}
+			select {
+			case wait.Activity <- struct{}{}:
+			default:
+			}
+		}
 	default:
+		return
 	}
 }
 
@@ -74,46 +98,40 @@ func (e *Engineer) requestConsultSync(ctx context.Context, req *guide.RouteReque
 	if req == nil {
 		return nil, fmt.Errorf("route request is required")
 	}
+	waitCtx, release := shared.WithoutDeadlineCancellation(ctx)
+	defer release()
+
+	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, req.TargetAgentID, req.Input, req.Metadata)
+	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
 	if req.CorrelationID == "" {
 		req.CorrelationID = "corr_" + uuid.NewString()
 	}
+	if req.ParentCorrelationID == "" {
+		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+			req.ParentCorrelationID = stream.CorrelationID
+		}
+	}
+	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
 
-	waitCh := e.registerPendingConsult(req.CorrelationID)
+	wait := e.registerPendingConsult(req.CorrelationID)
 	defer e.clearPendingConsult(req.CorrelationID)
 
 	if err := e.publishConsultRequest(req); err != nil {
+		branch.Complete(branchCtx, "", "", err)
 		return nil, err
 	}
 
-	var response *guide.Message
-	err := shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
-		AttemptTimeout: routeSyncTimeout,
-		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
-		OnRefresh: func(info shared.ContextLeaseRefresh) {
-			if e.logger != nil {
-				e.logger.Info("consultation wait lease refreshed",
-					"target", req.TargetAgentID,
-					"correlation_id", req.CorrelationID,
-					"refresh_count", info.RefreshCount,
-					"attempt_timeout", info.AttemptTimeout.String(),
-					"error", info.Error)
-			}
-		},
-	}, func(waitCtx context.Context) error {
-		select {
-		case <-waitCtx.Done():
-			return waitCtx.Err()
-		case response = <-waitCh:
-			return nil
-		}
-	})
+	response, err := shared.WaitForPendingSyncResponse(
+		branchCtx,
+		fmt.Sprintf("consultation to %q", req.TargetAgentID),
+		engineerConsultationTimeout(req.TargetAgentID),
+		wait,
+	)
 	if err != nil {
-		return nil, shared.WrapLeaseTimeoutError(
-			fmt.Sprintf("consultation to %q", req.TargetAgentID),
-			routeSyncTimeout,
-			err,
-		)
+		branch.Complete(branchCtx, "", "", err)
+		return nil, err
 	}
+	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }
 
@@ -128,7 +146,20 @@ func (e *Engineer) requestConsultation(
 		TargetAgentID: target,
 		SessionID:     sessionID,
 	}
-	response, err := e.requestConsultSync(ctx, req)
+	branchCtx, branch := shared.BeginInterAgentBranch(ctx, shared.InterAgentBranchSpec{
+		Kind:       shared.InterAgentToolEventKindConsult,
+		ToolName:   "consult_" + strings.ReplaceAll(strings.TrimSpace(target), "-", "_"),
+		AgentTypes: []string{target},
+		Summary:    query,
+		Args: map[string]any{
+			"target": target,
+			"query":  query,
+			"scope":  scope,
+		},
+	})
+	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
+	response, err := e.requestConsultSync(branchCtx, req)
+	branch.CompleteFromMessage(branchCtx, response, err)
 	if err != nil {
 		return failedConsultEvidence(target, query, scope, req.CorrelationID, err), err
 	}

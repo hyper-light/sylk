@@ -16,6 +16,7 @@ import (
 type taskDispatchContext struct {
 	data map[string]any
 
+	sessionID  string
 	taskID     string
 	taskSlug   string
 	workflowID string
@@ -48,6 +49,7 @@ func parseTaskDispatchMessage(msg *guide.Message) (*taskDispatchContext, bool) {
 
 	dispatch := &taskDispatchContext{
 		data:          data,
+		sessionID:     firstNonEmpty(stringValue(data["session_id"]), stringMapValue(msg.Metadata, "session_id")),
 		taskID:        stringValue(data["task_id"]),
 		taskSlug:      stringValue(data["task_slug"]),
 		workflowID:    stringValue(data["workflow_id"]),
@@ -129,6 +131,16 @@ func (d *taskDispatchContext) taskRecord(sessionID string) *TaskRecord {
 	}
 }
 
+func (d *taskDispatchContext) effectiveSessionID(fallbacks ...string) string {
+	candidates := make([]string, 0, len(fallbacks)+1)
+	candidates = append(candidates, strings.TrimSpace(d.sessionID))
+	for _, fallback := range fallbacks {
+		candidates = append(candidates, strings.TrimSpace(fallback))
+	}
+	candidates = append(candidates, "default")
+	return firstNonEmpty(candidates...)
+}
+
 func (d *taskDispatchContext) event() *busEvent {
 	return &busEvent{
 		Topic:     "tasks.dispatch",
@@ -178,8 +190,15 @@ func (o *Orchestrator) registerTaskDispatch(dispatch *taskDispatchContext) *Task
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	o.state.Tasks[dispatch.taskID] = dispatch.taskRecord(o.config.SessionID)
-	o.healthMonitor.RecordTaskStart(dispatch.agentType, dispatch.taskID)
+	sessionID := dispatch.effectiveSessionID(o.SessionID())
+	if existing, ok := o.state.Tasks[dispatch.taskID]; ok && existing != nil {
+		o.applyTaskDispatch(existing, dispatch, sessionID)
+	} else {
+		o.state.Tasks[dispatch.taskID] = dispatch.taskRecord(sessionID)
+	}
+	if o.healthMonitor != nil {
+		o.healthMonitor.RecordTaskStart(dispatch.agentType, dispatch.taskID)
+	}
 
 	if dispatch.workflowID != "" {
 		if workflow, ok := o.state.Workflows[dispatch.workflowID]; ok {
@@ -188,6 +207,37 @@ func (o *Orchestrator) registerTaskDispatch(dispatch *taskDispatchContext) *Task
 	}
 
 	return o.taskRouter
+}
+
+func (o *Orchestrator) applyTaskDispatch(task *TaskRecord, dispatch *taskDispatchContext, sessionID string) {
+	if task == nil || dispatch == nil {
+		return
+	}
+	if strings.TrimSpace(task.ID) == "" {
+		task.ID = dispatch.taskID
+	}
+	if strings.TrimSpace(task.WorkflowID) == "" {
+		task.WorkflowID = dispatch.workflowID
+	}
+	if strings.TrimSpace(task.Name) == "" {
+		task.Name = dispatch.name
+	}
+	task.Status = dispatch.initialStatus()
+	task.AssignedAgentID = dispatch.agentID
+	if dispatch.agentID != "" {
+		task.AssignedAt = &dispatch.now
+	}
+	if task.CreatedAt.IsZero() {
+		task.CreatedAt = dispatch.now
+	}
+	task.StartedAt = &dispatch.now
+	task.SessionID = firstNonEmpty(strings.TrimSpace(task.SessionID), sessionID)
+	if dispatch.pipelineStage != "" {
+		task.PipelineStage = dispatch.pipelineStage
+	}
+	if dispatch.pipelineParentID != "" {
+		task.PipelineParentID = dispatch.pipelineParentID
+	}
 }
 
 func (o *Orchestrator) publishTaskDispatchPipelineState(dispatch *taskDispatchContext) string {
@@ -211,50 +261,87 @@ func (o *Orchestrator) enrichTaskDispatchCoordination(dispatch *taskDispatchCont
 		return
 	}
 
-	packet, err := o.coordination.QueryView(context.Background(), coordination.QueryViewInput{
+	packet, ok, err := o.coordination.GetCachedQueryView(coordination.QueryViewInput{
 		TaskID:     dispatch.pipelineTaskID,
 		TaskName:   dispatch.coordinationTask,
 		WorkerType: strings.TrimSpace(dispatch.agentType),
 	})
 	if err != nil {
-		o.logWarnMsg("build coordination packet", "task_id", dispatch.pipelineTaskID, "agent_type", dispatch.agentType, "error", err)
+		o.logWarnMsg("build cached coordination packet", "task_id", dispatch.pipelineTaskID, "agent_type", dispatch.agentType, "error", err)
 		return
 	}
-	if packet == nil {
+	if !ok || packet == nil {
 		return
-	}
-
-	if err := o.addTaskDispatchPrecedents(dispatch, packet); err != nil {
-		o.logWarnMsg("build coordination precedents", "task_id", dispatch.pipelineTaskID, "agent_type", dispatch.agentType, "error", err)
 	}
 
 	dispatch.nodeCtx["coordination_view"] = packet.View
 	if packet.Packet != nil {
+		o.addCachedTaskDispatchPrecedents(dispatch, packet.Packet)
 		dispatch.nodeCtx["coordination_packet"] = packet.Packet
 	}
 }
 
-func (o *Orchestrator) addTaskDispatchPrecedents(dispatch *taskDispatchContext, packet *coordination.QueryViewResult) error {
-	if packet.Packet == nil || !o.config.ArchivalistEnabled {
-		return nil
+func (o *Orchestrator) addCachedTaskDispatchPrecedents(dispatch *taskDispatchContext, packet *coordination.WorkerPacket) {
+	if o == nil || dispatch == nil || packet == nil || o.coordination == nil || !o.config.ArchivalistEnabled {
+		return
 	}
-
-	precedents, err := o.queryCoordinationPrecedents(
-		context.Background(),
+	precedents, ok := o.coordination.GetCachedPrecedents(
 		dispatch.precedentTask,
 		dispatch.pipelineTaskSlug,
 		strings.TrimSpace(dispatch.agentType),
 	)
-	if err != nil {
-		return err
+	if !ok {
+		return
 	}
-	if len(precedents) == 0 {
+	packet.HistoricalPrecedents = precedents
+	packet.Summary = buildWorkerSummary(strings.TrimSpace(dispatch.agentType), packet)
+}
+
+func (o *Orchestrator) warmTaskDispatchCoordination(dispatch *taskDispatchContext) {
+	if o == nil || dispatch == nil || o.coordination == nil || strings.TrimSpace(dispatch.pipelineTaskID) == "" {
+		return
+	}
+
+	taskID := strings.TrimSpace(dispatch.pipelineTaskID)
+	taskName := strings.TrimSpace(dispatch.coordinationTask)
+	taskSlug := strings.TrimSpace(dispatch.pipelineTaskSlug)
+	workerType := strings.TrimSpace(dispatch.agentType)
+
+	warm := func(ctx context.Context) error {
+		if _, err := o.coordination.QueryView(ctx, coordination.QueryViewInput{
+			TaskID:     taskID,
+			TaskName:   taskName,
+			WorkerType: workerType,
+		}); err != nil && ctx.Err() == nil {
+			o.logWarnMsg("warm coordination packet", "task_id", taskID, "agent_type", workerType, "error", err)
+		}
+		if _, err := o.queryCoordinationPrecedents(ctx, taskName, taskSlug, workerType); err != nil && ctx.Err() == nil {
+			o.logWarnMsg(
+				"warm coordination precedents",
+				"task_name", taskName,
+				"task_slug", taskSlug,
+				"agent_type", workerType,
+				"error", err,
+			)
+		}
 		return nil
 	}
 
-	packet.Packet.HistoricalPrecedents = precedents
-	packet.Packet.Summary = buildWorkerSummary(strings.TrimSpace(dispatch.agentType), packet.Packet)
-	return nil
+	if o.scope != nil {
+		if err := o.scope.Go("warm-task-dispatch-coordination", coordinationPrecedentTimeout+time.Second, warm); err == nil {
+			return
+		}
+	}
+
+	parentCtx := context.Background()
+	if o.runCtx != nil {
+		parentCtx = o.runCtx
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(parentCtx, coordinationPrecedentTimeout+time.Second)
+		defer cancel()
+		_ = warm(ctx)
+	}()
 }
 
 func (o *Orchestrator) publishTaskDispatchAgents(dispatch *taskDispatchContext, pipelineStatus string) {
@@ -364,14 +451,23 @@ func (o *Orchestrator) routeTaskDispatch(router *TaskRouter, dispatch *taskDispa
 		"task_slug":       dispatch.pipelineTaskSlug,
 		"target_agent_id": firstNonEmpty(dispatch.targetID, pipelineWorkerTargetAgentID(dispatch.pipelineTaskID, dispatch.agentType)),
 	})
-
-	if o.dagBridge != nil {
-		o.dagBridge.AcknowledgeDispatch(dispatch.dagID, dispatch.nodeID, dispatch.agentID, dispatch.agentType)
-	}
 }
 
 func (o *Orchestrator) routeDispatchedPipelineTask(router *TaskRouter, dispatch *taskDispatchContext, done <-chan struct{}) error {
-	return router.RouteWithLifecycle(dispatch.pipelineTask(o.config.SessionID), done)
+	return router.RouteWithLifecycle(dispatch.pipelineTask(dispatch.effectiveSessionID(o.SessionID())), done)
+}
+
+func (o *Orchestrator) acknowledgeTaskDispatch(router *TaskRouter, dispatch *taskDispatchContext) {
+	if o == nil || o.dagBridge == nil || dispatch == nil || router == nil || strings.TrimSpace(dispatch.nodeID) == "" {
+		return
+	}
+	o.dagBridge.AcknowledgeDispatch(dispatch.dagID, dispatch.nodeID, dispatch.agentID, dispatch.agentType)
+	o.logTrace("task_dispatch_acked", agentlog.EventNodeAcked, map[string]any{
+		"dag_id":     dispatch.dagID,
+		"node_id":    dispatch.nodeID,
+		"task_id":    dispatch.taskID,
+		"agent_type": dispatch.agentType,
+	})
 }
 
 func (o *Orchestrator) dispatchDoneChannel(dagID, nodeID string) <-chan struct{} {

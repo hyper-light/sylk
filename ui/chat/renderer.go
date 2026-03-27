@@ -69,20 +69,33 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme, cache *codeBlockC
 	bodyStyle := messageStyle(entry.Source, th)
 
 	// Phase 1: Thinking (streaming, no content yet).
-	// Capped at: header(1) + spinner(1) + status(≤thinkingStatusMaxLines) + spacer(1).
+	// Inline tool rows remain visible during thinking so the viewport height
+	// reflects active consultations/challenges instead of cutting them off.
 	if entry.Streaming && entry.Content == "" && entry.ThinkingText != "" {
 		color := th.Palette.Info
 		if entry.ThinkingColor != "" {
 			color = lipgloss.Color(entry.ThinkingColor)
 		}
 		animatedStyle := lipgloss.NewStyle().Foreground(color).Italic(true)
-		lines := make([]string, 0, 2+thinkingStatusMaxLines+1)
+		toolCallLines, toolCallRegions := renderToolCalls(entry.ToolCalls, width, th)
+		lines := make([]string, 0, 2+len(toolCallLines)+thinkingStatusMaxLines+1)
 		lines = append(lines, header)
+		lines = append(lines, toolCallLines...)
 		lines = append(lines, animatedStyle.Render(truncateToWidth(normalizeThinkingLine(entry.ThinkingText), width)))
 		if status := strings.TrimSpace(entry.ThinkingStatus); status != "" {
 			mdLines, _ := renderMarkdownContent(status, width, animatedStyle, th, nil)
 			lines = append(lines, capLines(mdLines, thinkingStatusMaxLines, width, animatedStyle)...)
 		}
+		tcOffset := headerLines
+		for i := range toolCallRegions {
+			toolCallRegions[i].Start += tcOffset
+			toolCallRegions[i].End += tcOffset
+			for j := range toolCallRegions[i].Subregions {
+				toolCallRegions[i].Subregions[j].Start += tcOffset
+				toolCallRegions[i].Subregions[j].End += tcOffset
+			}
+		}
+		entry.ToolCallRegions = toolCallRegions
 		lines = append(lines, "")
 		return lines, nil
 	}
@@ -136,6 +149,10 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme, cache *codeBlockC
 	for i := range toolCallRegions {
 		toolCallRegions[i].Start += tcOffset
 		toolCallRegions[i].End += tcOffset
+		for j := range toolCallRegions[i].Subregions {
+			toolCallRegions[i].Subregions[j].Start += tcOffset
+			toolCallRegions[i].Subregions[j].End += tcOffset
+		}
 	}
 	entry.ToolCallRegions = toolCallRegions
 
@@ -165,29 +182,40 @@ func capLines(lines []string, maxLines, _ int, style lipgloss.Style) []string {
 // truncateToWidth truncates plain text to fit within width visible columns,
 // appending "…" if truncated. For unstyled text only (no ANSI sequences).
 func truncateToWidth(text string, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	runes := []rune(text)
-	if len(runes) <= width {
-		return text
-	}
-	// Reserve 1 column for the ellipsis.
-	if width <= 1 {
-		return "…"
-	}
-	return string(runes[:width-1]) + "…"
+	return truncatePlainDisplayWidth(text, width, "…")
 }
 
 func normalizeThinkingLine(text string) string {
-	text = strings.ReplaceAll(text, "\r\n", " ")
-	text = strings.ReplaceAll(text, "\r", " ")
-	text = strings.ReplaceAll(text, "\n", " ")
-	text = strings.Join(strings.Fields(text), " ")
+	text = sanitizeThinkingMessage(text)
 	if text == "" {
 		return "Thinking..."
 	}
 	return text
+}
+
+func truncatePlainDisplayWidth(text string, width int, suffix string) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(text) <= width {
+		return text
+	}
+	suffixWidth := lipgloss.Width(suffix)
+	if suffixWidth >= width {
+		return suffix
+	}
+	var out strings.Builder
+	for _, r := range text {
+		next := out.String() + string(r)
+		if lipgloss.Width(next)+suffixWidth > width {
+			break
+		}
+		out.WriteRune(r)
+	}
+	if out.Len() == 0 {
+		return suffix
+	}
+	return out.String() + suffix
 }
 
 // renderBadge produces the styled icon + label string for the entry header.

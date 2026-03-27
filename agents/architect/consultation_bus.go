@@ -11,6 +11,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -36,19 +37,19 @@ func routeHopsFromContext(ctx context.Context) int {
 	return hops
 }
 
-func (a *Architect) registerPendingBusWait(correlationID string) <-chan *guide.Message {
-	ch := make(chan *guide.Message, 1)
+func (a *Architect) registerPendingBusWait(correlationID string) *shared.PendingSyncWait {
+	wait := shared.NewPendingSyncWait()
 	a.pendingMu.Lock()
 	if a.pendingBus == nil {
-		a.pendingBus = make(map[string]chan *guide.Message)
+		a.pendingBus = make(map[string]*shared.PendingSyncWait)
 	}
 	pendingCount := len(a.pendingBus)
-	a.pendingBus[correlationID] = ch
+	a.pendingBus[correlationID] = wait
 	a.pendingMu.Unlock()
 	a.logInfo("registerPendingBusWait: registered",
 		"correlation_id", correlationID,
 		"total_pending", pendingCount+1)
-	return ch
+	return wait
 }
 
 func (a *Architect) clearPendingBusWait(correlationID string) {
@@ -65,32 +66,49 @@ func (a *Architect) deliverPendingBusMessage(msg *guide.Message) {
 	if msg == nil || msg.CorrelationID == "" {
 		return
 	}
-	// Only deliver terminal messages (response or error) to synchronous
-	// waiters. Stream events (start, chunk, complete) arrive on the same
-	// channel via the Guide relay and must be filtered out — otherwise
-	// requestRouteSync returns a stream event instead of the real response.
-	if msg.Type != guide.MessageTypeResponse && msg.Type != guide.MessageTypeError {
-		a.logInfo("deliverPendingBusMessage: filtered non-terminal message",
-			"correlation_id", msg.CorrelationID,
-			"msg_type", string(msg.Type))
-		return
-	}
-	a.pendingMu.Lock()
-	ch := a.pendingBus[msg.CorrelationID]
-	a.pendingMu.Unlock()
-	if ch == nil {
-		a.logInfo("deliverPendingBusMessage: no waiter for correlation",
-			"correlation_id", msg.CorrelationID,
-			"msg_type", string(msg.Type))
-		return
-	}
-	select {
-	case ch <- msg:
-		a.logInfo("deliverPendingBusMessage: delivered",
-			"correlation_id", msg.CorrelationID,
-			"msg_type", string(msg.Type))
+	switch msg.Type {
+	case guide.MessageTypeResponse, guide.MessageTypeError:
+		a.pendingMu.Lock()
+		wait := a.pendingBus[msg.CorrelationID]
+		a.pendingMu.Unlock()
+		if wait == nil {
+			a.logInfo("deliverPendingBusMessage: no waiter for correlation",
+				"correlation_id", msg.CorrelationID,
+				"msg_type", string(msg.Type))
+			return
+		}
+		select {
+		case wait.Response <- msg:
+			a.logInfo("deliverPendingBusMessage: delivered",
+				"correlation_id", msg.CorrelationID,
+				"msg_type", string(msg.Type))
+		default:
+			a.logWarn("deliverPendingBusMessage: channel full, message dropped",
+				"correlation_id", msg.CorrelationID,
+				"msg_type", string(msg.Type))
+		}
+	case guide.MessageTypeStream:
+		delivered := false
+		for _, correlationID := range shared.PendingSyncActivityCorrelations(msg) {
+			a.pendingMu.Lock()
+			wait := a.pendingBus[correlationID]
+			a.pendingMu.Unlock()
+			if wait == nil {
+				continue
+			}
+			select {
+			case wait.Activity <- struct{}{}:
+			default:
+			}
+			delivered = true
+		}
+		if !delivered {
+			a.logInfo("deliverPendingBusMessage: filtered non-terminal message",
+				"correlation_id", msg.CorrelationID,
+				"msg_type", string(msg.Type))
+		}
 	default:
-		a.logWarn("deliverPendingBusMessage: channel full, message dropped",
+		a.logInfo("deliverPendingBusMessage: filtered non-terminal message",
 			"correlation_id", msg.CorrelationID,
 			"msg_type", string(msg.Type))
 	}
@@ -101,6 +119,10 @@ func (a *Architect) deliverPendingBusMessage(msg *guide.Message) {
 // window, the caller receives a timeout error rather than blocking forever.
 const routeSyncTimeout = 60 * time.Second
 
+func architectConsultationTimeout(target string) time.Duration {
+	return shared.ConsultationInactivityTimeout(target)
+}
+
 func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteRequest) (*guide.Message, error) {
 	if a.bus == nil || !a.running {
 		a.logWarn("requestRouteSync: bus unavailable",
@@ -110,9 +132,20 @@ func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteReques
 	if req == nil {
 		return nil, fmt.Errorf("route request is required")
 	}
+	waitCtx, release := shared.WithoutDeadlineCancellation(ctx)
+	defer release()
+
+	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, req.TargetAgentID, req.Input, req.Metadata)
+	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
 	req.CorrelationID = ensureCorrelationID(req.CorrelationID)
 	req.SourceAgentID = a.id
 	req.SourceAgentName = "architect"
+	if req.ParentCorrelationID == "" {
+		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+			req.ParentCorrelationID = stream.CorrelationID
+		}
+	}
+	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
 	req.Timestamp = time.Now()
 
 	// When a TargetAgentID is specified, mark the request as explicit so the
@@ -126,21 +159,22 @@ func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteReques
 	// Propagate the hop count from the incoming ForwardedRequest so the
 	// Guide's structural loop detection spans the full request chain.
 	if req.Hops == 0 {
-		req.Hops = routeHopsFromContext(ctx)
+		req.Hops = routeHopsFromContext(branchCtx)
 	}
 
 	a.logInfo("requestRouteSync: BLOCKING WAIT START",
 		"target", req.TargetAgentID,
 		"correlation_id", req.CorrelationID,
-		"timeout", routeSyncTimeout.String(),
+		"timeout", architectConsultationTimeout(req.TargetAgentID).String(),
 		"parent_ctx_deadline", contextDeadlineString(ctx),
 		"input_len", len(req.Input))
 
-	waitCh := a.registerPendingBusWait(req.CorrelationID)
+	wait := a.registerPendingBusWait(req.CorrelationID)
 	defer a.clearPendingBusWait(req.CorrelationID)
 
 	publishStart := time.Now()
 	if err := a.publishRouteRequest(req); err != nil {
+		branch.Complete(branchCtx, "", "", err)
 		a.logWarn("requestRouteSync: publish failed",
 			"target", req.TargetAgentID,
 			"correlation_id", req.CorrelationID,
@@ -152,40 +186,23 @@ func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteReques
 		"correlation_id", req.CorrelationID,
 		"publish_elapsed", time.Since(publishStart).String())
 
-	var response *guide.Message
 	blockStart := time.Now()
-	err := shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
-		AttemptTimeout: routeSyncTimeout,
-		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
-		OnRefresh: func(info shared.ContextLeaseRefresh) {
-			a.logInfo("requestRouteSync: lease refreshed",
-				"target", req.TargetAgentID,
-				"correlation_id", req.CorrelationID,
-				"refresh_count", info.RefreshCount,
-				"attempt_timeout", info.AttemptTimeout.String(),
-				"error", info.Error)
-		},
-	}, func(waitCtx context.Context) error {
-		select {
-		case <-waitCtx.Done():
-			return waitCtx.Err()
-		case response = <-waitCh:
-			return nil
-		}
-	})
+	response, err := shared.WaitForPendingSyncResponse(
+		branchCtx,
+		fmt.Sprintf("route request to %q", req.TargetAgentID),
+		architectConsultationTimeout(req.TargetAgentID),
+		wait,
+	)
 	if err != nil {
+		branch.Complete(branchCtx, "", "", err)
 		elapsed := time.Since(blockStart)
 		a.logWarn("requestRouteSync: TIMED OUT",
 			"target", req.TargetAgentID,
 			"correlation_id", req.CorrelationID,
 			"blocked_for", elapsed.String(),
-			"timeout", routeSyncTimeout.String(),
+			"timeout", architectConsultationTimeout(req.TargetAgentID).String(),
 			"ctx_err", err)
-		return nil, shared.WrapLeaseTimeoutError(
-			fmt.Sprintf("route request to %q", req.TargetAgentID),
-			routeSyncTimeout,
-			err,
-		)
+		return nil, err
 	}
 	elapsed := time.Since(blockStart)
 	a.logInfo("requestRouteSync: RESPONSE RECEIVED",
@@ -193,6 +210,7 @@ func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteReques
 		"correlation_id", req.CorrelationID,
 		"blocked_for", elapsed.String(),
 		"response_type", string(response.Type))
+	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }
 
@@ -225,6 +243,13 @@ func (a *Architect) requestConsultation(
 		"query", truncateString(query, 120),
 		"scope", scope,
 		"ctx_deadline", contextDeadlineString(ctx))
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		sessionID = normalizeSessionID(firstNonEmpty(
+			architectSessionIDFromContext(ctx),
+			versioning.SessionIDFromContext(ctx),
+		))
+	}
 	if !a.isAgentRegistered(target) {
 		a.logInfo("requestConsultation: skipped (agent not registered)",
 			"target", target)
@@ -235,13 +260,26 @@ func (a *Architect) requestConsultation(
 		TargetAgentID: target,
 		SessionID:     sessionID,
 	}
+	branchCtx, branch := shared.BeginInterAgentBranch(ctx, shared.InterAgentBranchSpec{
+		Kind:       shared.InterAgentToolEventKindConsult,
+		ToolName:   "consult_" + strings.ReplaceAll(strings.TrimSpace(target), "-", "_"),
+		AgentTypes: []string{target},
+		Summary:    query,
+		Args: map[string]any{
+			"target": target,
+			"query":  query,
+			"scope":  scope,
+		},
+	})
+	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
 	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventConsultationSent,
 		a.id, sessionID, "", "info",
 		&agentlog.ConsultPayload{Target: target})
 
 	consultStart := time.Now()
-	response, err := a.requestRouteSync(ctx, req)
+	response, err := a.requestRouteSync(branchCtx, req)
 	elapsed := time.Since(consultStart)
+	branch.CompleteFromMessage(branchCtx, response, err)
 
 	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventConsultationRecv,
 		a.id, sessionID, req.CorrelationID, "info",

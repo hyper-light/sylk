@@ -325,6 +325,10 @@ type restrictedWorkspaceViews struct {
 	delegate versioning.WorkspaceViewAccess
 }
 
+func (r restrictedWorkspaceViews) WorkspaceViewsDelegate() versioning.WorkspaceViewAccess {
+	return r.delegate
+}
+
 func (r restrictedWorkspaceViews) ReadFile(ctx context.Context, view versioning.WorkspaceView, path string, pipelineID string) ([]byte, error) {
 	if !r.profile.AllowsWorkspaceView(view) {
 		return nil, versioning.ErrPermissionDenied

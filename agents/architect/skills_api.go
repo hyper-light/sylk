@@ -437,6 +437,20 @@ func hasParam(params map[string]any, key string) bool {
 	return ok
 }
 
+func containsAny(text string, needles []string) bool {
+	text = strings.ToLower(text)
+	for _, needle := range needles {
+		needle = strings.ToLower(strings.TrimSpace(needle))
+		if needle == "" {
+			continue
+		}
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func uniqueDomains(domains []string) []string {
 	if len(domains) == 0 {
 		return nil

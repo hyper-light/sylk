@@ -9,16 +9,18 @@ import (
 	"github.com/google/uuid"
 )
 
-// routeSyncTimeout is the maximum wait time for a synchronous bus RPC.
+// routeSyncTimeout is the default wait budget used by other pipeline-inspector
+// code paths. Academic-targeted waits override this through the shared
+// consultation timeout helper at the actual blocking call site.
 const routeSyncTimeout = shared.DefaultConsultationTimeout
 
 // registerPendingWait creates a buffered channel for a correlation ID.
-func (pi *PipelineInspector) registerPendingWait(correlationID string) <-chan *guide.Message {
-	ch := make(chan *guide.Message, 1)
+func (pi *PipelineInspector) registerPendingWait(correlationID string) *shared.PendingSyncWait {
+	wait := shared.NewPendingSyncWait()
 	pi.pendingMu.Lock()
-	pi.pendingBus[correlationID] = ch
+	pi.pendingBus[correlationID] = wait
 	pi.pendingMu.Unlock()
-	return ch
+	return wait
 }
 
 // clearPendingWait removes a pending wait channel.
@@ -28,25 +30,39 @@ func (pi *PipelineInspector) clearPendingWait(correlationID string) {
 	pi.pendingMu.Unlock()
 }
 
-// deliverPendingMessage routes a response to a waiting channel.
+// deliverPendingMessage routes terminal responses and descendant child-stream
+// activity to synchronous waiters.
 func (pi *PipelineInspector) deliverPendingMessage(msg *guide.Message) {
 	if msg == nil {
 		return
 	}
-	// Only deliver terminal message types.
-	if msg.Type != guide.MessageTypeResponse && msg.Type != guide.MessageTypeError {
-		return
-	}
-
-	pi.pendingMu.Lock()
-	ch, ok := pi.pendingBus[msg.CorrelationID]
-	pi.pendingMu.Unlock()
-
-	if ok {
+	switch msg.Type {
+	case guide.MessageTypeResponse, guide.MessageTypeError:
+		pi.pendingMu.Lock()
+		wait, ok := pi.pendingBus[msg.CorrelationID]
+		pi.pendingMu.Unlock()
+		if !ok || wait == nil {
+			return
+		}
 		select {
-		case ch <- msg:
+		case wait.Response <- msg:
 		default:
 		}
+	case guide.MessageTypeStream:
+		for _, correlationID := range shared.PendingSyncActivityCorrelations(msg) {
+			pi.pendingMu.Lock()
+			wait := pi.pendingBus[correlationID]
+			pi.pendingMu.Unlock()
+			if wait == nil {
+				continue
+			}
+			select {
+			case wait.Activity <- struct{}{}:
+			default:
+			}
+		}
+	default:
+		return
 	}
 }
 
@@ -55,9 +71,13 @@ func (pi *PipelineInspector) requestRouteSync(ctx context.Context, target, paylo
 	if pi.bus == nil {
 		return nil, fmt.Errorf("bus not available")
 	}
+	waitCtx, release := shared.WithoutDeadlineCancellation(ctx)
+	defer release()
+
+	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, target, payload, nil)
 
 	correlationID := fmt.Sprintf("pi_corr_%s", uuid.New().String()[:8])
-	waitCh := pi.registerPendingWait(correlationID)
+	wait := pi.registerPendingWait(correlationID)
 	defer pi.clearPendingWait(correlationID)
 
 	req := &guide.RouteRequest{
@@ -66,37 +86,31 @@ func (pi *PipelineInspector) requestRouteSync(ctx context.Context, target, paylo
 		SourceAgentName: "inspector-pipeline",
 		CorrelationID:   correlationID,
 	}
+	if req.ParentCorrelationID == "" {
+		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+			req.ParentCorrelationID = stream.CorrelationID
+		}
+	}
+	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
+	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
 	msg := guide.NewRequestMessage(pi.generateMessageID(), req)
 	msg.CorrelationID = correlationID
 
 	if err := pi.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+		branch.Complete(branchCtx, "", "", err)
 		return nil, fmt.Errorf("publish correction request: %w", err)
 	}
 
-	var response *guide.Message
-	err := shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
-		AttemptTimeout: routeSyncTimeout,
-		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
-		OnRefresh: func(info shared.ContextLeaseRefresh) {
-			if pi.logger != nil {
-				pi.logger.Info("correction wait lease refreshed",
-					"target", target,
-					"correlation_id", correlationID,
-					"refresh_count", info.RefreshCount,
-					"attempt_timeout", info.AttemptTimeout.String(),
-					"error", info.Error)
-			}
-		},
-	}, func(waitCtx context.Context) error {
-		select {
-		case <-waitCtx.Done():
-			return waitCtx.Err()
-		case response = <-waitCh:
-			return nil
-		}
-	})
+	response, err := shared.WaitForPendingSyncResponse(
+		branchCtx,
+		"correction request",
+		shared.ConsultationInactivityTimeout(target),
+		wait,
+	)
 	if err != nil {
-		return nil, shared.WrapLeaseTimeoutError("correction request", routeSyncTimeout, err)
+		branch.Complete(branchCtx, "", "", err)
+		return nil, err
 	}
+	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }

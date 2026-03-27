@@ -345,3 +345,42 @@ func TestIsStaticGuideReply(t *testing.T) {
 		})
 	}
 }
+
+func TestGuideResponderApplyToolCallsTracked_EmitsStableToolCallKeys(t *testing.T) {
+	responder := &GuideResponder{
+		toolInvoker: func(_ context.Context, _ string, _ string) (string, error) {
+			return "ok", nil
+		},
+	}
+	req := &providers.Request{}
+	resp := &providers.Response{
+		ToolCalls: []providers.ToolCall{{
+			Name:      "read_file",
+			Arguments: "{\n  \"line\": 1,\n  \"path\": \"README.md\"\n}",
+		}},
+	}
+	var events []guideToolCallEvent
+	ctx := withGuideToolCallEmitter(context.Background(), func(ev guideToolCallEvent) {
+		events = append(events, ev)
+	})
+
+	errCount, rerouted := responder.applyToolCallsTracked(ctx, req, resp)
+	if errCount != 0 {
+		t.Fatalf("errCount = %d, want 0", errCount)
+	}
+	if rerouted {
+		t.Fatal("rerouted = true, want false")
+	}
+	if len(events) != 2 {
+		t.Fatalf("event count = %d, want 2", len(events))
+	}
+	if events[0].Phase != 0 || events[1].Phase != 1 {
+		t.Fatalf("unexpected phases: %#v", events)
+	}
+	if events[0].ToolCallKey == "" {
+		t.Fatal("expected non-empty start tool call key")
+	}
+	if events[0].ToolCallKey != events[1].ToolCallKey {
+		t.Fatalf("tool call keys differ: start=%q complete=%q", events[0].ToolCallKey, events[1].ToolCallKey)
+	}
+}

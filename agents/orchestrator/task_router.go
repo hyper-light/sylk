@@ -61,6 +61,10 @@ type TaskRouter struct {
 
 	visibleMu sync.Mutex
 	visible   map[string]*visibleRoute // correlationID → mirrored user-visible route
+
+	followupMu     sync.Mutex
+	followupActive map[string]string
+	followupQueued map[string][]*guide.RouteRequest
 }
 
 // pendingRoute tracks a dispatched task awaiting a Guide-routed response.
@@ -71,8 +75,10 @@ type pendingRoute struct {
 }
 
 type visibleRoute struct {
-	agentType string
-	metadata  map[string]any
+	agentType          string
+	targetAgentID      string
+	serializedFollowup bool
+	metadata           map[string]any
 }
 
 // NewTaskRouter creates a TaskRouter that routes tasks through the Guide.
@@ -92,6 +98,8 @@ func NewTaskRouter(cfg TaskRouterConfig) *TaskRouter {
 		onNodeActivity:       cfg.OnNodeActivity,
 		pending:              make(map[string]*pendingRoute),
 		visible:              make(map[string]*visibleRoute),
+		followupActive:       make(map[string]string),
+		followupQueued:       make(map[string][]*guide.RouteRequest),
 	}
 }
 
@@ -206,6 +214,16 @@ func (r *TaskRouter) PublishUserVisibleRoute(req *guide.RouteRequest) error {
 	if req == nil {
 		return fmt.Errorf("route request is required")
 	}
+	if routeRequiresSerializedFollowup(req) {
+		return r.publishSerializedFollowupRoute(req)
+	}
+	return r.publishVisibleRouteNow(req)
+}
+
+func (r *TaskRouter) publishVisibleRouteNow(req *guide.RouteRequest) error {
+	if r == nil || req == nil {
+		return fmt.Errorf("route request is required")
+	}
 
 	corrID := strings.TrimSpace(req.CorrelationID)
 	if corrID == "" {
@@ -218,6 +236,40 @@ func (r *TaskRouter) PublishUserVisibleRoute(req *guide.RouteRequest) error {
 	msg.Metadata = cloneMetadata(req.Metadata)
 	if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
 		r.clearVisibleRoute(corrID)
+		return err
+	}
+	return nil
+}
+
+func (r *TaskRouter) publishSerializedFollowupRoute(req *guide.RouteRequest) error {
+	if r == nil || req == nil {
+		return fmt.Errorf("route request is required")
+	}
+	corrID := strings.TrimSpace(req.CorrelationID)
+	if corrID == "" {
+		corrID = "route_" + generateMessageID()
+		req.CorrelationID = corrID
+	}
+	queueKey := visibleFollowupQueueKey(req)
+	if queueKey == "" {
+		return r.publishVisibleRouteNow(req)
+	}
+
+	r.followupMu.Lock()
+	if activeCorrID := strings.TrimSpace(r.followupActive[queueKey]); activeCorrID != "" {
+		r.followupQueued[queueKey] = insertQueuedFollowupRoute(r.followupQueued[queueKey], cloneRouteRequest(req))
+		r.followupMu.Unlock()
+		return nil
+	}
+	r.followupActive[queueKey] = corrID
+	r.followupMu.Unlock()
+
+	if err := r.publishVisibleRouteNow(req); err != nil {
+		r.followupMu.Lock()
+		if r.followupActive[queueKey] == corrID {
+			delete(r.followupActive, queueKey)
+		}
+		r.followupMu.Unlock()
 		return err
 	}
 	return nil
@@ -313,8 +365,10 @@ func (r *TaskRouter) visibleRoute(corrID string) *visibleRoute {
 		return nil
 	}
 	cloned := &visibleRoute{
-		agentType: route.agentType,
-		metadata:  cloneMetadata(route.metadata),
+		agentType:          route.agentType,
+		targetAgentID:      route.targetAgentID,
+		serializedFollowup: route.serializedFollowup,
+		metadata:           cloneMetadata(route.metadata),
 	}
 	return cloned
 }
@@ -344,8 +398,10 @@ func visibleRouteFromRequest(req *guide.RouteRequest) *visibleRoute {
 		}
 	}
 	return &visibleRoute{
-		agentType: agentType,
-		metadata:  metadata,
+		agentType:          agentType,
+		targetAgentID:      strings.TrimSpace(req.TargetAgentID),
+		serializedFollowup: routeRequiresSerializedFollowup(req),
+		metadata:           metadata,
 	}
 }
 
@@ -535,7 +591,10 @@ func (r *TaskRouter) mirrorVisibleRouteTerminalToUser(msg *guide.Message) bool {
 	if route == nil {
 		return false
 	}
-	defer r.clearVisibleRoute(msg.CorrelationID)
+	defer func() {
+		r.clearVisibleRoute(msg.CorrelationID)
+		r.advanceSerializedFollowupRoute(route, msg.CorrelationID)
+	}()
 	if r.streamMirrorTargetID == "" || r.bus == nil {
 		return true
 	}
@@ -563,6 +622,73 @@ func (r *TaskRouter) mirrorVisibleRouteTerminalToUser(msg *guide.Message) bool {
 		"success":         resp.Success,
 	})
 	return true
+}
+
+func routeRequiresSerializedFollowup(req *guide.RouteRequest) bool {
+	if req == nil || !metadataBool(req.Metadata, "ot_handoff_followup") {
+		return false
+	}
+	switch strings.TrimSpace(req.TargetAgentID) {
+	case "inspector", "tester":
+		return true
+	default:
+		return false
+	}
+}
+
+func visibleFollowupQueueKey(req *guide.RouteRequest) string {
+	if req == nil {
+		return ""
+	}
+	if !routeRequiresSerializedFollowup(req) {
+		return ""
+	}
+	return strings.TrimSpace(req.TargetAgentID)
+}
+
+func (r *TaskRouter) advanceSerializedFollowupRoute(route *visibleRoute, corrID string) {
+	if r == nil || route == nil || !route.serializedFollowup {
+		return
+	}
+	queueKey := firstNonEmpty(route.targetAgentID, route.agentType)
+	if queueKey == "" {
+		return
+	}
+
+	var next *guide.RouteRequest
+	r.followupMu.Lock()
+	if activeCorrID := strings.TrimSpace(r.followupActive[queueKey]); activeCorrID == corrID {
+		delete(r.followupActive, queueKey)
+	}
+	if strings.TrimSpace(r.followupActive[queueKey]) == "" {
+		pending := r.followupQueued[queueKey]
+		if len(pending) > 0 {
+			next = pending[0]
+			if len(pending) == 1 {
+				delete(r.followupQueued, queueKey)
+			} else {
+				r.followupQueued[queueKey] = append([]*guide.RouteRequest(nil), pending[1:]...)
+			}
+			r.followupActive[queueKey] = strings.TrimSpace(next.CorrelationID)
+		}
+	}
+	r.followupMu.Unlock()
+
+	if next == nil {
+		return
+	}
+	if err := r.publishVisibleRouteNow(next); err != nil {
+		r.followupMu.Lock()
+		if r.followupActive[queueKey] == strings.TrimSpace(next.CorrelationID) {
+			delete(r.followupActive, queueKey)
+		}
+		r.followupQueued[queueKey] = append([]*guide.RouteRequest{cloneRouteRequest(next)}, r.followupQueued[queueKey]...)
+		r.followupMu.Unlock()
+		r.logger.Warn("publish queued OT global follow-up route",
+			"correlation_id", next.CorrelationID,
+			"target_agent_id", next.TargetAgentID,
+			"error", err)
+	}
 }
 
 func mirroredVisibleRouteResponse(msg *guide.Message, route *visibleRoute) *guide.RouteResponse {
@@ -764,6 +890,48 @@ func cloneMetadata(metadata map[string]any) map[string]any {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+func cloneRouteRequest(req *guide.RouteRequest) *guide.RouteRequest {
+	if req == nil {
+		return nil
+	}
+	cloned := *req
+	cloned.Metadata = cloneMetadata(req.Metadata)
+	return &cloned
+}
+
+func insertQueuedFollowupRoute(queue []*guide.RouteRequest, req *guide.RouteRequest) []*guide.RouteRequest {
+	if req == nil {
+		return queue
+	}
+	for i, existing := range queue {
+		if followupRouteBefore(req, existing) {
+			queue = append(queue, nil)
+			copy(queue[i+1:], queue[i:])
+			queue[i] = req
+			return queue
+		}
+	}
+	return append(queue, req)
+}
+
+func followupRouteBefore(left, right *guide.RouteRequest) bool {
+	if left == nil {
+		return false
+	}
+	if right == nil {
+		return true
+	}
+	leftTime := left.Timestamp.UTC()
+	rightTime := right.Timestamp.UTC()
+	if leftTime.Before(rightTime) {
+		return true
+	}
+	if rightTime.Before(leftTime) {
+		return false
+	}
+	return strings.Compare(strings.TrimSpace(left.CorrelationID), strings.TrimSpace(right.CorrelationID)) < 0
 }
 
 func cloneStreamEvent(event *guide.StreamEvent) *guide.StreamEvent {

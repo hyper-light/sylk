@@ -17,6 +17,7 @@ func orchestratorMutatingSkillNames() []string {
 		"cancel_dag",
 		"modify_dag",
 		"ingest_plan",
+		"validate_global_review",
 	}
 }
 
@@ -24,9 +25,14 @@ func orchestratorVisibleSkillNames() []string {
 	return []string{
 		"query_task",
 		"query_workflow",
+		"query_dag_status",
+		"query_pipeline_state",
+		"query_buffer",
+		"generate_summary",
 		"push_status",
 		"ingest_plan",
 		"execute_dag",
+		"validate_global_review",
 		"escalate_to_architect",
 		"read_workspace_file",
 		"workspace_glob",

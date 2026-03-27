@@ -233,6 +233,791 @@ func TestRenderEntry_ToolCallLinesRespectViewportWidth(t *testing.T) {
 	}
 }
 
+func TestRenderEntry_InterAgentRowsUseTreeSpinnerAndEllipsis(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inspector-2",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "inspector",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:  "consult_academic_approach",
+				StartedAt: time.Now().Add(-250 * time.Millisecond),
+				Completed: true,
+				Success:   true,
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "A table-driven harness would be cleaner and easier to extend than the current approach.",
+					Status:     InterAgentToolDone,
+				},
+			},
+			{
+				ToolName:  "challenge_architect",
+				StartedAt: time.Now().Add(-350 * time.Millisecond),
+				Completed: true,
+				Success:   true,
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolChallenge,
+					AgentTypes: []string{"architect"},
+					Summary:    "The testing scope is too weak for this checkpoint and likely needs to be revised before final sign-off.",
+					Status:     InterAgentToolPending,
+				},
+			},
+		},
+	}
+
+	const width = 72
+	lines, _ := RenderEntry(entry, width, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "academic") {
+		t.Fatalf("rendered inter-agent rows missing academic label: %q", joined)
+	}
+	if !strings.Contains(joined, "architect") {
+		t.Fatalf("rendered inter-agent rows missing architect label: %q", joined)
+	}
+	if !strings.Contains(joined, "├─") || !strings.Contains(joined, "└─") {
+		t.Fatalf("expected tree connectors in inter-agent rows: %q", joined)
+	}
+	if !strings.Contains(joined, "...") {
+		t.Fatalf("expected ellipsis truncation in inter-agent rows: %q", joined)
+	}
+	if !containsAny(joined, interAgentSpinnerFrames[:]...) {
+		t.Fatalf("expected ring-segment spinner in inter-agent rows: %q", joined)
+	}
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got > width {
+			t.Fatalf("line %d width = %d, want <= %d: %q", i, got, width, line)
+		}
+	}
+}
+
+func TestRenderEntry_ThinkingEmojiStillFitsViewportWidth(t *testing.T) {
+	entry := &ChatEntry{
+		ID:           "archivalist-emoji",
+		Timestamp:    time.Now(),
+		Source:       SourceAgent,
+		AgentType:    "archivalist",
+		Streaming:    true,
+		ThinkingText: "Searching archival traces 📚 for prior failures and decisions.",
+	}
+
+	const width = 24
+	lines, _ := RenderEntry(entry, width, theme.DefaultDark(), nil)
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got > width {
+			t.Fatalf("line %d width = %d, want <= %d: %q", i, got, width, line)
+		}
+	}
+}
+
+func TestRenderEntry_ThinkingPhaseIncludesInterAgentRows(t *testing.T) {
+	entry := &ChatEntry{
+		ID:             "thinking-inter-agent",
+		Timestamp:      time.Now(),
+		Source:         SourceAgent,
+		AgentType:      "inspector",
+		Streaming:      true,
+		ThinkingText:   "⠋  0.5s",
+		ThinkingStatus: "waiting: final inspector validation",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:  "challenge_architect",
+				StartedAt: time.Now().Add(-250 * time.Millisecond),
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolChallenge,
+					AgentTypes: []string{"architect"},
+					Summary:    "testing scope is too weak for this checkpoint and likely needs revision",
+					Status:     InterAgentToolPending,
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 72, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "architect") {
+		t.Fatalf("thinking-phase render missing inter-agent row: %q", joined)
+	}
+	if !strings.Contains(joined, "waiting: final inspector validation") {
+		t.Fatalf("thinking-phase render missing status line: %q", joined)
+	}
+}
+
+func TestRenderEntry_OffsetsInterAgentSubregionsForLaterToolCalls(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inter-agent-subregion-offset",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		Content:   "Refining the patch plan.",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "read_file",
+				ArgsSummary: "ui/chat/tool_render.go",
+				FullArgs:    `{"path":"ui/chat/tool_render.go","start_line":1}`,
+				Output:      "ok",
+				StartedAt:   time.Now().Add(-time.Second),
+				Completed:   true,
+				Success:     true,
+			},
+			{
+				ToolName: "consult_academic_approach",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Comparing harness options",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-academic-offset",
+							AgentType:     "academic",
+							ToolCalls: []ToolCallRecord{
+								{ToolName: "read_file", ArgsSummary: "path=ui/chat/model.go", Completed: true, Success: true},
+								{ToolName: "grep", ArgsSummary: "\"tool_call_key\"", Completed: true, Success: true},
+								{ToolName: "sed", ArgsSummary: "ui/chat/model.go", Completed: true, Success: true},
+								{ToolName: "apply_patch", ArgsSummary: "ui/chat/model.go", Completed: true, Success: true},
+								{ToolName: "gofmt", ArgsSummary: "ui/chat/model.go", Completed: true, Success: true},
+							},
+							Completed: true,
+						},
+					},
+				},
+				Completed: true,
+				Success:   true,
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 88, theme.DefaultDark(), nil)
+	if len(entry.ToolCallRegions) < 2 {
+		t.Fatalf("expected two tool call regions, got %+v", entry.ToolCallRegions)
+	}
+	consultRegion := entry.ToolCallRegions[1]
+	if len(consultRegion.Subregions) == 0 {
+		t.Fatalf("expected inter-agent subregions for second tool call, got %+v", consultRegion)
+	}
+	overflow := consultRegion.Subregions[0]
+	if overflow.Kind != ToolCallSubregionOverflow {
+		t.Fatalf("expected first subregion to be overflow, got %+v", overflow)
+	}
+	if overflow.Start < consultRegion.Start || overflow.End > consultRegion.End {
+		t.Fatalf("overflow subregion %+v must stay within consult region %+v", overflow, consultRegion)
+	}
+	if overflow.Start >= len(lines) || !strings.Contains(lines[overflow.Start], "earlier events") {
+		t.Fatalf("expected overflow line at rendered index %d, got lines=%q", overflow.Start, strings.Join(lines, "\n"))
+	}
+}
+
+func TestRenderEntry_ThinkingPhaseRendersToolCallsAboveSpinner(t *testing.T) {
+	entry := &ChatEntry{
+		ID:             "thinking-tool-order",
+		Timestamp:      time.Now(),
+		Source:         SourceAgent,
+		AgentType:      "engineer",
+		Streaming:      true,
+		ThinkingText:   "⠋  0.5s",
+		ThinkingStatus: "waiting for tool completion",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "read_file",
+				ArgsSummary: "path=README.md",
+				StartedAt:   time.Now().Add(-250 * time.Millisecond),
+				Completed:   true,
+				Success:     true,
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 72, theme.DefaultDark(), nil)
+	var toolLineIdx, spinnerLineIdx int = -1, -1
+	for i, line := range lines {
+		if toolLineIdx == -1 && strings.Contains(line, "read_file") {
+			toolLineIdx = i
+		}
+		if spinnerLineIdx == -1 && strings.Contains(line, "0.5s") {
+			spinnerLineIdx = i
+		}
+	}
+	if toolLineIdx == -1 {
+		t.Fatalf("thinking-phase render missing tool row: %q", strings.Join(lines, "\n"))
+	}
+	if spinnerLineIdx == -1 {
+		t.Fatalf("thinking-phase render missing spinner row: %q", strings.Join(lines, "\n"))
+	}
+	if toolLineIdx >= spinnerLineIdx {
+		t.Fatalf("expected tool row above spinner, got tool line %d and spinner line %d: %q", toolLineIdx, spinnerLineIdx, strings.Join(lines, "\n"))
+	}
+}
+
+func TestRenderEntry_ThinkingPhaseClosesInterAgentTreeBeforeParentSpinner(t *testing.T) {
+	entry := &ChatEntry{
+		ID:             "thinking-tree-close",
+		Timestamp:      time.Now(),
+		Source:         SourceAgent,
+		AgentType:      "architect",
+		Streaming:      true,
+		ThinkingText:   "⠋  2.4s",
+		ThinkingStatus: "Refining the patch plan...",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_academic_approach",
+				ToolCallKey: "consult-1",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Comparing harness options",
+					Status:     InterAgentToolPending,
+				},
+			},
+			{
+				ToolName:    "consult",
+				ToolCallKey: "consult-2",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"guardian"},
+					Summary:    "Checking safety assumptions",
+					Status:     InterAgentToolPending,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-guardian",
+							AgentType:     "guardian",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "go_test",
+									ArgsSummary: "./ui/chat",
+									StartedAt:   time.Now().Add(-700 * time.Millisecond),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 72, theme.DefaultDark(), nil)
+	var guardianLine, spinnerLine int = -1, -1
+	for i, line := range lines {
+		if guardianLine == -1 && strings.Contains(line, "guardian") {
+			guardianLine = i
+		}
+		if spinnerLine == -1 && strings.Contains(line, "Refining the patch plan") {
+			spinnerLine = i
+		}
+	}
+	if guardianLine == -1 || spinnerLine == -1 {
+		t.Fatalf("expected guardian branch and parent spinner in render: %q", strings.Join(lines, "\n"))
+	}
+	if !strings.Contains(lines[guardianLine], "└─") {
+		t.Fatalf("expected last inter-agent branch to use terminal connector, got %q", lines[guardianLine])
+	}
+	if guardianLine >= spinnerLine {
+		t.Fatalf("expected inter-agent tree to render above parent spinner, got guardian line %d and spinner line %d", guardianLine, spinnerLine)
+	}
+}
+
+func TestRenderEntry_InterAgentRowsRenderNestedChildLines(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inter-agent-nested",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_academic_approach",
+				ToolCallKey: "consult-1",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Comparing harness options",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-academic",
+							AgentType:     "academic",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "read_file",
+									ArgsSummary: "path=ui/chat/model.go",
+									StartedAt:   time.Now().Add(-100 * time.Millisecond),
+									Duration:    100 * time.Millisecond,
+									Completed:   true,
+									Success:     true,
+								},
+							},
+							ResultSummary: "A table-driven harness would be cleaner and easier to extend.",
+							Completed:     true,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 76, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "academic") {
+		t.Fatalf("expected nested render to contain academic label: %q", joined)
+	}
+	if !strings.Contains(joined, "read_file") {
+		t.Fatalf("expected nested render to contain child tool call: %q", joined)
+	}
+	if !strings.Contains(joined, "A table-driven harness would be cleaner") {
+		t.Fatalf("expected nested render to contain child summary line: %q", joined)
+	}
+	if !strings.Contains(joined, "└─") {
+		t.Fatalf("expected nested child connector lines: %q", joined)
+	}
+}
+
+func TestRenderEntry_InterAgentRowsRenderNestedConsultChildAgents(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inter-agent-nested-consult-child",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_academic_approach",
+				ToolCallKey: "consult-1",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Compare UI pattern options",
+					Status:     InterAgentToolPending,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-academic",
+							AgentType:     "academic",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "consult",
+									ToolCallKey: "consult-lib-1",
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolConsult,
+										AgentTypes: []string{"librarian"},
+										Summary:    "Find relevant UI patterns",
+										Status:     InterAgentToolPending,
+										Children: []InterAgentChildActivity{
+											{
+												CorrelationID:   "child-librarian",
+												AgentType:       "librarian",
+												ThinkingStatus:  "Inspecting existing UI patterns.",
+												ThinkingText:    "⠋  0.2s",
+												ThinkingColor:   "#7dcfff",
+												ToolCalls:       nil,
+												ResultSummary:   "",
+												Completed:       false,
+												Failed:          false,
+												ToolCallsExpanded: false,
+											},
+										},
+									},
+									StartedAt: time.Now().Add(-200 * time.Millisecond),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 92, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "academic") {
+		t.Fatalf("expected nested render to contain academic label: %q", joined)
+	}
+	if !strings.Contains(joined, "librarian") {
+		t.Fatalf("expected nested render to contain librarian child label: %q", joined)
+	}
+	if !strings.Contains(joined, "Inspecting existing UI patterns.") {
+		t.Fatalf("expected nested render to contain librarian child progress: %q", joined)
+	}
+}
+
+func TestFormatToolDuration_SubMillisecondUsesLessThanOneMillisecond(t *testing.T) {
+	if got := formatToolDuration(750 * time.Microsecond); got != "<1ms" {
+		t.Fatalf("formatToolDuration(750µs) = %q, want <1ms", got)
+	}
+}
+
+func TestRenderEntry_InterAgentChildRowsRenderSubMillisecondDurations(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inter-agent-sub-ms-child",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_librarian_style",
+				ToolCallKey: "consult-1",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"librarian"},
+					Summary:    "Checking existing codebase patterns",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-librarian",
+							AgentType:     "librarian",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "read_file",
+									ArgsSummary: "path=README.md",
+									StartedAt:   time.Now().Add(-750 * time.Microsecond),
+									Duration:    750 * time.Microsecond,
+									Completed:   true,
+									Success:     true,
+								},
+							},
+							ResultSummary: "Found an existing project layout to follow.",
+							Completed:     true,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 76, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "<1ms") {
+		t.Fatalf("expected nested child tool row to render <1ms instead of 0ms: %q", joined)
+	}
+	if strings.Contains(joined, "0ms") {
+		t.Fatalf("unexpected 0ms duration in nested child tool row: %q", joined)
+	}
+}
+
+func TestRenderEntry_InterAgentRowsRenderSeparateChildSectionsPerAgent(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inter-agent-multi-child",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		Content:   "Refining the research plan.",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName: "consult_research_support",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"librarian", "archivalist"},
+					Summary:    "Gathering references and archived context",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-librarian",
+							AgentType:     "librarian",
+							ResultSummary: "Found the reference set for the migration notes.",
+							Completed:     true,
+							ToolCalls: []ToolCallRecord{
+								{ToolName: "search_library", ArgsSummary: "migration notes", Completed: true, Success: true},
+								{ToolName: "read_file", ArgsSummary: "docs/migration.md", Completed: true, Success: true},
+								{ToolName: "grep", ArgsSummary: "\"migration\"", Completed: true, Success: true},
+								{ToolName: "sed", ArgsSummary: "docs/migration.md", Completed: true, Success: true},
+								{ToolName: "write_notes", ArgsSummary: "migration references", Completed: true, Success: true},
+							},
+						},
+						{
+							CorrelationID: "child-archivalist",
+							AgentType:     "archivalist",
+							ResultSummary: "Recovered the prior archived plan snapshot.",
+							Completed:     true,
+							ToolCalls: []ToolCallRecord{
+								{ToolName: "list_archives", ArgsSummary: "project=sylk", Completed: true, Success: true},
+								{ToolName: "read_archive", ArgsSummary: "plan-v3", Completed: true, Success: true},
+								{ToolName: "grep", ArgsSummary: "\"handoff\"", Completed: true, Success: true},
+								{ToolName: "sed", ArgsSummary: "archive/plan-v3.md", Completed: true, Success: true},
+								{ToolName: "write_notes", ArgsSummary: "archived plan", Completed: true, Success: true},
+							},
+						},
+					},
+				},
+				Completed: true,
+				Success:   true,
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 88, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "Found the reference set") {
+		t.Fatalf("expected dedicated librarian child header/summary, got %q", joined)
+	}
+	if !strings.Contains(joined, "Recovered the prior archived plan snapshot") {
+		t.Fatalf("expected dedicated archivalist child header/summary, got %q", joined)
+	}
+	if strings.Contains(joined, "librarian, archivalist") {
+		t.Fatalf("expected aggregate target row to be omitted once child sections exist, got %q", joined)
+	}
+	if got := strings.Count(joined, "earlier events"); got != 2 {
+		t.Fatalf("expected one overflow row per child section, got %d in %q", got, joined)
+	}
+}
+
+func TestRenderEntry_InterAgentRowsRenderMissingTargetsAsIndependentBranches(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inter-agent-missing-target-branches",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		Content:   "Refining the research plan.",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName: "consult_research_support",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"librarian", "archivalist"},
+					Summary:    "Checking prior patterns",
+					Status:     InterAgentToolPending,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID:  "child-librarian-only",
+							AgentType:      "librarian",
+							ThinkingStatus: "Checking prior patterns",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 88, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "librarian - Checking prior patterns") {
+		t.Fatalf("expected librarian branch, got %q", joined)
+	}
+	if !strings.Contains(joined, "archivalist - Checking prior patterns") {
+		t.Fatalf("expected archivalist placeholder branch, got %q", joined)
+	}
+	if strings.Contains(joined, "librarian, archivalist") {
+		t.Fatalf("expected no aggregate combined branch, got %q", joined)
+	}
+}
+
+func TestRenderEntry_ToolCallLinesDoNotEmbedRawNewlines(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "tool-newlines",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "engineer",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "write_file\nunsafe",
+				ArgsSummary: "path=README.md\ncontent=hello",
+				FullArgs:    "{\n  \"path\": \"README.md\",\n  \"content\": \"hello\\nworld\"\n}",
+				Output:      "wrote file successfully",
+				StartedAt:   time.Now().Add(-time.Second),
+				Duration:    time.Second,
+				Success:     true,
+				Completed:   true,
+				Expanded:    true,
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 32, theme.DefaultDark(), nil)
+	for i, line := range lines {
+		if strings.Contains(line, "\n") || strings.Contains(line, "\r") {
+			t.Fatalf("line %d contains raw newline: %q", i, line)
+		}
+	}
+}
+
+func TestRenderEntry_CollapsedToolCallsStaySingleLineInChatPanel(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "tool-single-line",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "engineer",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "write_file",
+				ArgsSummary: "path=README.md\ncontent=line one that keeps going long enough to require truncation in a narrow viewport",
+				FullArgs:    "{\n  \"path\": \"README.md\",\n  \"content\": \"line one\\nline two\\nline three\"\n}",
+				Output:      "line one\nline two\nline three\nline four",
+				StartedAt:   time.Now().Add(-time.Second),
+				Duration:    time.Second,
+				Success:     true,
+				Completed:   true,
+			},
+		},
+	}
+
+	const width = 34
+	lines, _ := RenderEntry(entry, width, theme.DefaultDark(), nil)
+	if len(lines) != 4 {
+		t.Fatalf("rendered line count = %d, want 4 (header + single tool row + tool spacer + entry spacer): %q", len(lines), strings.Join(lines, "\n"))
+	}
+	if strings.TrimSpace(lines[2]) != "" {
+		t.Fatalf("expected tool spacer on line 2, got %q", lines[2])
+	}
+	if !strings.Contains(lines[1], "...") {
+		t.Fatalf("expected tool row to ellipsize long description, got %q", lines[1])
+	}
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got > width {
+			t.Fatalf("line %d width = %d, want <= %d: %q", i, got, width, line)
+		}
+	}
+}
+
+func TestRenderEntry_ExpandedToolCallsRenderDetailBlock(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "tool-expanded-detail",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "engineer",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "write_file",
+				ArgsSummary: "path=README.md",
+				FullArgs:    "{\n  \"path\": \"README.md\",\n  \"content\": \"line one\\nline two\\nline three\"\n}",
+				Output:      "line one\nline two\nline three\nline four",
+				StartedAt:   time.Now().Add(-time.Second),
+				Duration:    time.Second,
+				Success:     true,
+				Completed:   true,
+				Expanded:    true,
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 48, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "args - path=README.md") {
+		t.Fatalf("expected expanded tool render to include compact args detail, got %q", joined)
+	}
+	if !strings.Contains(joined, "output - line one line two") {
+		t.Fatalf("expected expanded tool render to include compact output detail, got %q", joined)
+	}
+	if len(lines) <= 4 {
+		t.Fatalf("expected expanded tool render to use more than a single tool row, got %q", joined)
+	}
+}
+
+func TestRenderEntry_ExpandedToolCallsAvoidRoutingNoiseAndRawPlanJSON(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "tool-expanded-structured",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:  "plan",
+				FullArgs:  `{"query":"Refine the plan around packaging support","session_id":"sess-1","plan":{"tasks":[{"id":"task_1","title":"Implement CLI"},{"id":"task_2","title":"Add pyproject"}]}}`,
+				Output:    `{"response":"Plan revised to add packaging support.","artifact_version":"v1.1","plan":{"tasks":[{"id":"task_1"}]}}`,
+				StartedAt: time.Now().Add(-time.Second),
+				Duration:  time.Second,
+				Success:   true,
+				Completed: true,
+				Expanded:  true,
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 72, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "args - query=Refine the plan around packaging support") {
+		t.Fatalf("expected expanded render to prefer the query summary, got %q", joined)
+	}
+	if !strings.Contains(joined, "output - response=Plan revised to add packaging support.") {
+		t.Fatalf("expected expanded render to prefer the response summary, got %q", joined)
+	}
+	if strings.Contains(joined, "session_id") {
+		t.Fatalf("expected expanded render to omit routing noise, got %q", joined)
+	}
+	if strings.Contains(joined, "\"tasks\"") || strings.Contains(joined, `"plan"`) {
+		t.Fatalf("expected expanded render to avoid raw plan JSON, got %q", joined)
+	}
+}
+
+func TestRenderEntry_ExpandedToolCallsAreStableAcrossRerenders(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "tool-expanded-stable",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:  "plan",
+				FullArgs:  `{"query":"Refine the plan around packaging support","session_id":"sess-1","plan":{"tasks":[{"id":"task_1"}]}}`,
+				Output:    `{"response":"Plan revised to add packaging support.","artifact_version":"v1.1"}`,
+				StartedAt: time.Now().Add(-time.Second),
+				Duration:  time.Second,
+				Success:   true,
+				Completed: true,
+				Expanded:  true,
+			},
+		},
+	}
+
+	first, _ := RenderEntry(entry, 72, theme.DefaultDark(), nil)
+	second, _ := RenderEntry(entry, 72, theme.DefaultDark(), nil)
+	if strings.Join(first, "\n") != strings.Join(second, "\n") {
+		t.Fatalf("expected expanded tool render to remain stable across rerenders\nfirst:\n%q\nsecond:\n%q", strings.Join(first, "\n"), strings.Join(second, "\n"))
+	}
+}
+
+func TestRenderEntry_NestedExpandedChildToolCallUsesCompactDetailRows(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "nested-child-tool-expanded",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName: "consult_academic_approach",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Comparing harness options",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-academic",
+							AgentType:     "academic",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "write_file",
+									ArgsSummary: "path=README.md",
+									FullArgs:    "{\n  \"path\": \"README.md\",\n  \"content\": \"line one\\nline two\\nline three\"\n}",
+									Output:      "{\n  \"ok\": true,\n  \"updated_lines\": 3,\n  \"path\": \"README.md\"\n}",
+									StartedAt:   time.Now().Add(-time.Second),
+									Duration:    time.Second,
+									Completed:   true,
+									Success:     true,
+									Expanded:    true,
+								},
+							},
+							Completed: true,
+						},
+					},
+				},
+				Completed: true,
+				Success:   true,
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 52, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "args - path=README.md") {
+		t.Fatalf("expected compact args detail row, got %q", joined)
+	}
+	if !strings.Contains(joined, "output - ok=true") {
+		t.Fatalf("expected compact output detail row, got %q", joined)
+	}
+	if strings.Contains(joined, "\"content\":") || strings.Contains(joined, "\"updated_lines\":") {
+		t.Fatalf("expected nested child expanded tool call to avoid raw JSON blocks, got %q", joined)
+	}
+	if len(lines) > 8 {
+		t.Fatalf("expected nested child expanded tool call to stay compact, got %d lines: %q", len(lines), joined)
+	}
+}
+
 func TestRenderEntry_LongPipelineHeaderRespectsViewportWidth(t *testing.T) {
 	entry := &ChatEntry{
 		ID:             "engineer-1",
@@ -281,4 +1066,99 @@ func TestRenderStreamingEntryFull_PipelineStatusFooterRespectsViewportWidth(t *t
 			t.Fatalf("line %d width = %d, want <= %d: %q", i, got, width, line)
 		}
 	}
+}
+
+func TestRenderEntry_KeepsParentContentVisibleWhileInterAgentChallengePending(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "architect-with-pending-challenge",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		Content:   "This should stay hidden until the challenge completes.",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:  "challenge_engineer",
+				StartedAt: time.Now().Add(-500 * time.Millisecond),
+				Completed: true,
+				Success:   true,
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolChallenge,
+					AgentTypes: []string{"engineer"},
+					Summary:    "Implement the accepted patch plan.",
+					Status:     InterAgentToolPending,
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 80, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "This should stay hidden until the challenge completes.") {
+		t.Fatalf("expected parent content to remain visible while challenge is pending, got %q", joined)
+	}
+	if !strings.Contains(joined, "Implement the accepted patch plan.") {
+		t.Fatalf("expected pending challenge row to remain visible, got %q", joined)
+	}
+
+	entry.ToolCalls[0].InterAgent.Status = InterAgentToolDone
+	lines, _ = RenderEntry(entry, 80, theme.DefaultDark(), nil)
+	joined = strings.Join(lines, "\n")
+	if !strings.Contains(joined, "This should stay hidden until the challenge completes.") {
+		t.Fatalf("expected parent content to appear after challenge completion, got %q", joined)
+	}
+}
+
+func TestRenderStreamingEntryFull_KeepsParentContentVisibleWhileInterAgentConsultPending(t *testing.T) {
+	entry := &ChatEntry{
+		ID:             "inspector-with-pending-consult",
+		Timestamp:      time.Now(),
+		Source:         SourceAgent,
+		AgentType:      "inspector",
+		Content:        "The final audit summary should wait for the consult result.",
+		Streaming:      true,
+		ThinkingText:   "Waiting on academic consult",
+		ThinkingStatus: "Researching the packaging guidance before finalizing the audit.",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:  "consult_academic_approach",
+				StartedAt: time.Now().Add(-400 * time.Millisecond),
+				Completed: true,
+				Success:   true,
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Compare current packaging guidance and cite the best sources.",
+					Status:     InterAgentToolPending,
+				},
+			},
+		},
+	}
+
+	lines, _ := renderStreamingEntryFull(entry, 88, theme.DefaultDark(), nil, &streamRenderState{})
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "The final audit summary should wait for the consult result.") {
+		t.Fatalf("expected parent streaming content to remain visible while consult is pending, got %q", joined)
+	}
+	if !strings.Contains(joined, "Compare current packaging guidance") {
+		t.Fatalf("expected consult row to remain visible, got %q", joined)
+	}
+	if !strings.Contains(joined, "Waiting on academic consult") {
+		t.Fatalf("expected streaming footer to remain visible, got %q", joined)
+	}
+
+	entry.ToolCalls[0].InterAgent.Status = InterAgentToolDone
+	lines, _ = renderStreamingEntryFull(entry, 88, theme.DefaultDark(), nil, &streamRenderState{})
+	joined = strings.Join(lines, "\n")
+	if !strings.Contains(joined, "The final audit summary should wait for the consult result.") {
+		t.Fatalf("expected parent streaming content to appear after consult completion, got %q", joined)
+	}
+}
+
+func containsAny(haystack string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(haystack, needle) {
+			return true
+		}
+	}
+	return false
 }

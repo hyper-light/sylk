@@ -194,8 +194,9 @@ func (pt *PipelineTester) applyToolCalls(
 	for _, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
-		result, err := shared.TimedToolCall(ctx, "tester-pipeline", call, func() (string, error) {
-			execResult, execErr = pt.executeToolCallWithSurface(ctx, call, surface)
+		execCtx := shared.WithActiveToolCall(ctx, call)
+		result, err := shared.TimedToolCall(execCtx, "tester-pipeline", call, func() (string, error) {
+			execResult, execErr = pt.executeToolCallWithSurface(execCtx, call, surface)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {

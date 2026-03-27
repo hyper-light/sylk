@@ -13,12 +13,12 @@ import (
 
 const orchestratorRouteSyncTimeout = 45 * time.Second
 
-func (o *Orchestrator) registerPendingWait(correlationID string) <-chan *guide.Message {
-	ch := make(chan *guide.Message, 1)
+func (o *Orchestrator) registerPendingWait(correlationID string) *shared.PendingSyncWait {
+	wait := shared.NewPendingSyncWait()
 	o.pendingMu.Lock()
-	o.pendingBus[correlationID] = ch
+	o.pendingBus[correlationID] = wait
 	o.pendingMu.Unlock()
-	return ch
+	return wait
 }
 
 func (o *Orchestrator) clearPendingWait(correlationID string) {
@@ -31,22 +31,39 @@ func (o *Orchestrator) deliverPendingMessage(msg *guide.Message) bool {
 	if msg == nil {
 		return false
 	}
-	if msg.Type != guide.MessageTypeResponse && msg.Type != guide.MessageTypeError {
-		return false
-	}
+	switch msg.Type {
+	case guide.MessageTypeResponse, guide.MessageTypeError:
+		o.pendingMu.Lock()
+		wait, ok := o.pendingBus[msg.CorrelationID]
+		o.pendingMu.Unlock()
+		if !ok || wait == nil {
+			return false
+		}
 
-	o.pendingMu.Lock()
-	ch, ok := o.pendingBus[msg.CorrelationID]
-	o.pendingMu.Unlock()
-	if !ok {
-		return false
-	}
-
-	select {
-	case ch <- msg:
+		select {
+		case wait.Response <- msg:
+		default:
+		}
+		return true
+	case guide.MessageTypeStream:
+		delivered := false
+		for _, correlationID := range shared.PendingSyncActivityCorrelations(msg) {
+			o.pendingMu.Lock()
+			wait := o.pendingBus[correlationID]
+			o.pendingMu.Unlock()
+			if wait == nil {
+				continue
+			}
+			select {
+			case wait.Activity <- struct{}{}:
+			default:
+			}
+			delivered = true
+		}
+		return delivered
 	default:
+		return false
 	}
-	return true
 }
 
 func (o *Orchestrator) requestRouteSync(
@@ -63,9 +80,14 @@ func (o *Orchestrator) requestRouteSync(
 	if err != nil {
 		return nil, err
 	}
+	waitCtx, release := shared.WithoutDeadlineCancellation(ctx)
+	defer release()
+
+	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, target, payload, metadata)
+	metadata = branch.ApplyMetadata(branchCtx, metadata)
 
 	correlationID := "orchestrator_corr_" + uuid.NewString()[:8]
-	waitCh := o.registerPendingWait(correlationID)
+	wait := o.registerPendingWait(correlationID)
 	defer o.clearPendingWait(correlationID)
 
 	req := &guide.RouteRequest{
@@ -79,40 +101,31 @@ func (o *Orchestrator) requestRouteSync(
 		Timestamp:       time.Now(),
 		Metadata:        metadata,
 	}
+	if req.ParentCorrelationID == "" {
+		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+			req.ParentCorrelationID = stream.CorrelationID
+		}
+	}
+	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
 	msg := guide.NewRequestMessage(generateMessageID(), req)
 	msg.CorrelationID = correlationID
 
 	if err := o.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+		branch.Complete(branchCtx, "", "", err)
 		return nil, fmt.Errorf("publish route request: %w", err)
 	}
 
-	var response *guide.Message
-	err = shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
-		AttemptTimeout: orchestratorRouteSyncTimeout,
-		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
-		OnRefresh: func(info shared.ContextLeaseRefresh) {
-			o.logInfo("orchestrator route wait lease refreshed",
-				"target", target,
-				"correlation_id", correlationID,
-				"refresh_count", info.RefreshCount,
-				"attempt_timeout", info.AttemptTimeout.String(),
-				"error", info.Error)
-		},
-	}, func(waitCtx context.Context) error {
-		select {
-		case <-waitCtx.Done():
-			return waitCtx.Err()
-		case response = <-waitCh:
-			return nil
-		}
-	})
+	response, err := shared.WaitForPendingSyncResponse(
+		branchCtx,
+		fmt.Sprintf("route request to %s", target),
+		orchestratorRouteSyncTimeout,
+		wait,
+	)
 	if err != nil {
-		return nil, shared.WrapLeaseTimeoutError(
-			fmt.Sprintf("route request to %s", target),
-			orchestratorRouteSyncTimeout,
-			err,
-		)
+		branch.Complete(branchCtx, "", "", err)
+		return nil, err
 	}
+	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }
 

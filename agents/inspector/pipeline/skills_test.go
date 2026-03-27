@@ -174,6 +174,23 @@ func TestStageInstructions_InspectAvoidsValidationAndGradingTools(t *testing.T) 
 	}
 }
 
+func TestStageInstructions_ImplementationPrefersSingleAuditCycle(t *testing.T) {
+	instructions := stageInstructions(&agentShared.TaskExecutionContract{
+		Stage:             "execute",
+		PreImplementation: false,
+	}, "execute")
+
+	for _, want := range []string{
+		"Prefer a single tester-backed audit cycle",
+		"`finalize_pipeline`",
+		"Do not fan out into repeated audit or grading passes on unchanged workspace state",
+	} {
+		if !strings.Contains(instructions, want) {
+			t.Fatalf("implementation stage instructions missing %q: %q", want, instructions)
+		}
+	}
+}
+
 func TestPipelineInspectorDefaultToolDefinitionsExcludeValidationAndGradeTools(t *testing.T) {
 	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
 	if err != nil {

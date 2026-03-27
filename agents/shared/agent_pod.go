@@ -51,10 +51,10 @@ type ScribeMessage struct {
 
 // ScribeFeed is a single turn's data from a parent agent.
 type ScribeFeed struct {
-	UserRequest   string
-	AgentResponse string
-	CorrelationID string
-	Timestamp     time.Time
+	UserRequest         string
+	AgentResponse       string
+	ParentCorrelationID string
+	Timestamp           time.Time
 }
 
 // Scribe is an interface for the per-agent summarization sidecar.
@@ -729,7 +729,7 @@ func (p *AgentPod) SubNodeCount() int {
 
 // FeedScribe feeds turn data to the Scribe for parentAgentType.
 // No-op if no Scribe exists for that type.
-func (p *AgentPod) FeedScribe(parentAgentType, userRequest, agentResponse, correlationID string) {
+func (p *AgentPod) FeedScribe(parentAgentType, userRequest, agentResponse, parentCorrelationID string) {
 	p.scribesMu.RLock()
 	s, ok := p.scribes[parentAgentType]
 	p.scribesMu.RUnlock()
@@ -738,10 +738,10 @@ func (p *AgentPod) FeedScribe(parentAgentType, userRequest, agentResponse, corre
 		return
 	}
 	s.Feed(ScribeFeed{
-		UserRequest:   userRequest,
-		AgentResponse: agentResponse,
-		CorrelationID: correlationID,
-		Timestamp:     time.Now(),
+		UserRequest:         userRequest,
+		AgentResponse:       agentResponse,
+		ParentCorrelationID: parentCorrelationID,
+		Timestamp:           time.Now(),
 	})
 }
 

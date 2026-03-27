@@ -64,7 +64,7 @@ func authorizeStrictDiskCommand(ctx context.Context, cfg StrictDiskExecConfig, b
 	}
 	PopulateCommandApprovalScope(ctx, &authReq)
 	_, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq)
-	return err
+	return WrapApprovalDenied(binary, err)
 }
 
 func strictDiskExecutionPlan(ctx context.Context, broker purevfs.ExecutionBroker, workingDir string) (purevfs.ExecutionPlan, error) {

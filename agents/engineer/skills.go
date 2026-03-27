@@ -67,9 +67,11 @@ func (e *Engineer) registerCoreSkills() {
 			SourceAgentID:   func() string { return e.id },
 			SourceAgentType: func() string { return "engineer" },
 			SessionID:       func() string { return e.config.SessionID },
-			RegisterPending: func(correlationID string) <-chan *guide.Message { return e.registerPendingConsult(correlationID) },
-			ClearPending:    e.clearPendingConsult,
-			Timeout:         routeSyncTimeout,
+			RegisterPending: func(correlationID string) <-chan *guide.Message {
+				return e.registerPendingConsult(correlationID).Response
+			},
+			ClearPending: e.clearPendingConsult,
+			Timeout:      routeSyncTimeout,
 		},
 		CurrentTaskID:   func() string { return e.pipelineID },
 		CurrentTaskName: func() string { return firstNonEmptyCoordinationName(e.pipelineName, e.pipelineSlug) },
@@ -397,51 +399,11 @@ func readFileSkill(e *Engineer) *skills.Skill {
 				return nil, fmt.Errorf("file access not configured")
 			}
 
-			content, err := e.fileAccess.ReadFile(ctx, params.Path)
+			result, err := versioning.ReadFileToolResult(ctx, e.fileAccess, params.Path, params.Offset, params.Limit)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read file: %w", err)
 			}
-
-			lines := strings.Split(string(content), "\n")
-
-			// Apply offset and limit
-			offset := params.Offset
-			if offset < 0 {
-				offset = 0
-			}
-			if offset >= len(lines) {
-				return map[string]any{
-					"path":        params.Path,
-					"content":     "",
-					"total_lines": len(lines),
-					"offset":      offset,
-					"truncated":   false,
-				}, nil
-			}
-
-			limit := params.Limit
-			if limit <= 0 {
-				limit = 1000
-			}
-
-			endLine := offset + limit
-			truncated := false
-			if endLine > len(lines) {
-				endLine = len(lines)
-			} else {
-				truncated = true
-			}
-
-			selectedLines := lines[offset:endLine]
-
-			return map[string]any{
-				"path":        params.Path,
-				"content":     strings.Join(selectedLines, "\n"),
-				"total_lines": len(lines),
-				"offset":      offset,
-				"limit":       limit,
-				"truncated":   truncated,
-			}, nil
+			return result, nil
 		}).
 		Build()
 }
@@ -749,7 +711,7 @@ func (e *Engineer) runToolInDir(ctx context.Context, dir string, allowWorkspaceW
 	}
 	shared.PopulateCommandApprovalScope(ctx, &authReq)
 	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq); err != nil {
-		return "", err
+		return "", shared.WrapApprovalDenied(bin, err)
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()

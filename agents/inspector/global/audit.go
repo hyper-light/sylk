@@ -18,7 +18,7 @@ import (
 func (gi *GlobalInspector) AuditLayer(ctx context.Context, req *shared.LayerAuditRequest) (*shared.AuditResult, error) {
 	startTime := time.Now()
 
-	auditCtx, cancel := context.WithTimeout(ctx, gi.config.AuditTimeout)
+	auditCtx, cancel := agentShared.WithoutDeadlineCancellation(ctx)
 	defer cancel()
 
 	lm := agentShared.LogMetaFromContext(ctx)

@@ -242,6 +242,8 @@ func buildPlannerConversationSystemPrompt(base string) string {
 	modules := []string{
 		ArchitectSystemCorePrompt,
 		ArchitectSystemProtocolPrompt,
+		ArchitectSystemConsultPrompt,
+		ArchitectSystemSkillsPrompt,
 		ArchitectSystemGuardrailsPrompt,
 		ArchitectConversationPrompt,
 	}
@@ -375,8 +377,21 @@ Planning flow:
    user first needs help shaping the problem, scope, constraints, or success criteria.
    Use ask_user_question only for one or two narrow decisions after the plan is already
    mostly understood.
+0a. During discussion before planning, use consult(mode=knowledge, target=librarian),
+    consult(mode=knowledge, target=archivalist), and consult(mode=knowledge, target=academic)
+    as new material information arrives. Do not wait until start_planning to gather obvious
+    codebase, historical, or Academic evidence. Consult the Librarian for codebase reality and
+    local patterns, the Archivalist for precedent and preserved preferences, and the Academic for
+    stronger alternatives, best practices, correctness, performance, testing, infrastructure, and
+    tradeoffs. For the first substantive implementation, planning, or architecture turn on a new
+    problem, default to consulting all three before you settle on your answer unless one is clearly
+    irrelevant or you already hold fresh evidence from that source. Treat the triad as your normal
+    discussion-time evidence base, not as a rare escalation path. When in doubt, consult rather
+    than assume. Not every turn needs all three, but you should refresh your evidence as the user's
+    constraints or direction materially change.
 1. When the user confirms they want to proceed with planning, invoke start_planning with a
-   comprehensive query synthesizing all gathered requirements.
+   comprehensive query synthesizing all gathered requirements and the consultation evidence you
+   accumulated during discussion.
 2. After start_planning returns, it gives you a plan_id and protocol instructions. Follow those
    instructions: invoke plan(analyze), consult(pre_planning), plan(design), plan(generate_tasks)
    in order, passing the plan_id to each.
@@ -412,6 +427,9 @@ Requirements:
 - If the conversation reveals that the problem is too underspecified to plan safely,
   hand the user to the Academic via route_requirements_research instead of pretending
   the missing requirements are already known.
+- If the conversation is concrete enough to keep discussing but still lacks codebase,
+  historical, or architectural evidence, stay in the Architect and consult the relevant
+  knowledge agents instead of waiting for the formal planning phase.
 - If the blocker is missing repository evidence or historical context inside this codebase,
   stay in the Architect and consult the Librarian or Archivalist instead of handing the
   user to the Academic.
@@ -519,6 +537,12 @@ Requirements:
 - Draw on your architectural expertise — be opinionated with clear reasoning.
 - For general conversation (no planning intent), engage naturally. If the conversation
   leads to a concrete task, ask if they'd like you to create a plan.
+- During substantive implementation, planning, or architecture discussion, reason as if you
+  are actively grounding your answer in Librarian, Archivalist, and Academic evidence unless
+  one is clearly irrelevant or already fresh. On the first substantive turn for a new problem,
+  the tool-enabled path would normally consult the full knowledge triad before settling on an answer.
+- Prefer answers that reflect codebase reality, historical precedent, and stronger architectural
+  alternatives instead of defaulting to generic advice.
 - Keep a natural, collaborative tone.
 - Do not use canned lead-ins or boilerplate.
 - Do not reference any tools or tool invocations.`
@@ -552,16 +576,25 @@ General rules:
 	}
 }
 
+var discussionConversationTools = []string{
+	"consult",
+	"ask_user_question",
+	"route_requirements_research",
+	"start_planning",
+}
+
 // toolsForConversationMode returns the allowed tool names for a given mode.
-// Feedback and ready modes restrict to acceptance-related tools, reducing the
-// tool set from ~10 to 3 so GPT models are less confused about which tool to call.
-// Converse and clarification modes return nil (all tools allowed).
+// Discussion-oriented modes use a narrow tool surface so the model focuses on
+// consultation, clarification, and planning entry instead of the full planning
+// and control catalog. Feedback/ready modes restrict to acceptance tools.
 func toolsForConversationMode(mode plannerConversationMode) []string {
 	switch mode {
+	case plannerConversationModeConverse, plannerConversationModeExistingReady, plannerConversationModeClarification:
+		return discussionConversationTools
 	case plannerConversationModeFeedback, plannerConversationModeReady:
 		return []string{"route_plan_acceptance", "ask_user_question"}
 	default:
-		return nil
+		return discussionConversationTools
 	}
 }
 

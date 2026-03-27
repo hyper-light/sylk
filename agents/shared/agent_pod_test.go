@@ -817,6 +817,11 @@ func TestAgentPod_ScribeLifecycle(t *testing.T) {
 	if engScribe.feedCount() != 1 {
 		t.Errorf("expected 1 feed to engineer scribe, got %d", engScribe.feedCount())
 	}
+	engScribe.feedMu.Lock()
+	if len(engScribe.feeds) != 1 || engScribe.feeds[0].ParentCorrelationID != "corr-1" {
+		t.Errorf("parent correlation = %+v, want corr-1", engScribe.feeds)
+	}
+	engScribe.feedMu.Unlock()
 
 	// Feed non-existent Scribe — should be no-op.
 	pod.FeedScribe("nonexistent", "a", "b", "c")

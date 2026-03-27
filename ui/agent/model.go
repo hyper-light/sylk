@@ -73,17 +73,22 @@ func (s AgentStatus) String() string {
 
 // AgentState holds the current state of a single agent.
 type AgentState struct {
-	ID           string
-	RoutingID    string
-	Name         string
-	AgentType    string
-	Category     string // "standalone", "pipeline", "knowledge" — resolved from agentCategoryByType.
-	PipelineID   string // Non-empty when the agent is a pipeline member.
-	Status       AgentStatus
-	TaskSummary  string
-	ContextUsage float64 // 0.0 to 1.0
-	ModelID      string  // Currently assigned model ID (e.g. "claude-opus-4-6").
-	ProviderID   string  // Provider for ModelID (e.g. "anthropic", "google", "openai").
+	ID                string
+	RoutingID         string
+	Name              string
+	AgentType         string
+	Category          string // "standalone", "pipeline", "knowledge" — resolved from agentCategoryByType.
+	PipelineID        string // Non-empty when the agent is a pipeline member.
+	Status            AgentStatus
+	ActivityState     events.AgentUIState
+	TaskSummary       string
+	ContextUsage      float64 // 0.0 to 1.0
+	ModelID           string  // Currently assigned model ID (e.g. "claude-opus-4-6").
+	ProviderID        string  // Provider for ModelID (e.g. "anthropic", "google", "openai").
+	toolSummaryPinned bool
+	pinnedToolCallKey string
+	activeCorrelationID string
+	lastTerminalCorrelationID string
 
 	// SupportedModels is the raw per-agent model list from the backend.
 	// When non-empty, it overrides the static provider-based model table and
@@ -405,6 +410,7 @@ type Model struct {
 	width     int
 	height    int
 	focused   bool
+	nerdFonts bool
 
 	dotFrame int // Current frame index for the filling-circle dot animation.
 
@@ -497,6 +503,11 @@ func (m *Model) SetOpenAIAuthMethod(method string) {
 	}
 }
 
+// SetNerdFonts toggles Nerd Font badge rendering for agent icons.
+func (m *Model) SetNerdFonts(detected bool) {
+	m.nerdFonts = detected
+}
+
 // ---------------------------------------------------------------------------
 // component.Component
 // ---------------------------------------------------------------------------
@@ -515,10 +526,14 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 		return m, m.handlePipelineState(typed)
 	case msg.VariantStateMsg:
 		return m, m.handleVariantState(typed)
+	case msg.StreamStartMsg:
+		return m, m.handleStreamStart(typed)
 	case msg.StreamProgressMsg:
 		return m, m.handleStreamProgress(typed)
 	case msg.StreamCompleteMsg:
 		return m, m.handleStreamComplete(typed)
+	case msg.ToolCallEventMsg:
+		return m, m.handleToolCallEvent(typed)
 	case tea.KeyMsg:
 		return m, m.handleKey(typed)
 	default:
@@ -640,7 +655,8 @@ func (m *Model) shouldIgnoreAmbiguousPipelineActivity(rawAgentID string, ev msg.
 // messages (e.g. "Analyzing requirements...", "Dispatching task 1/3...") in
 // the agent panel cards alongside the chat panel's thinking placeholder.
 func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
-	agentID := m.resolveAgentID(canonicalStreamAgentID(progress.AgentID, progress.AgentType, progress.PipelineID, progress.TaskID))
+	candidateID := canonicalStreamAgentID(progress.AgentID, progress.AgentType, progress.PipelineID, progress.TaskID)
+	agentID := m.resolveAgentID(candidateID)
 	vis := progress.Visibility
 	eventDebugLog().Info("agent_panel: stream_progress",
 		"agent_id", progress.AgentID,
@@ -651,7 +667,10 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 		"session_id", progress.SessionID,
 		"current", progress.Current,
 		"total", progress.Total)
-	if agentID == "" || strings.TrimSpace(progress.Message) == "" {
+	if agentID == "" {
+		agentID = m.ensureAgentForLiveEvent(candidateID, progress.AgentID, progress.AgentType, progress.AgentName, progress.PipelineID, progress.TaskID, progress.TaskName, progress.TaskSlug)
+	}
+	if agentID == "" {
 		return nil
 	}
 
@@ -662,14 +681,64 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 
 	agent := m.agents[agentID]
 	if agent == nil {
+		agentID = m.ensureAgentForLiveEvent(candidateID, progress.AgentID, progress.AgentType, progress.AgentName, progress.PipelineID, progress.TaskID, progress.TaskName, progress.TaskSlug)
+		agent = m.agents[agentID]
+		if agent == nil {
+			return nil
+		}
+	}
+	if shouldIgnoreStaleAgentCorrelation(agent, progress.CorrelationID) {
 		return nil
 	}
-	agent.Status = StatusThinking
-	agent.TaskSummary = progress.Message
+	next := *agent
+	next.Status = StatusThinking
+	next.ActivityState = inferUIStateFromStreamProgress(&next, progress)
+	applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
+		Source:        agentLifecycleSourceStreamProgress,
+		CorrelationID: progress.CorrelationID,
+		Status:        next.Status,
+		ActivityState: next.ActivityState,
+	})
+	if raw := strings.TrimSpace(progress.Message); raw != "" && !agent.toolSummaryPinned {
+		payload := compactAgentPanelPayload(raw)
+		if shouldApplyStructuredProgressSummary(agent.TaskSummary, payload) {
+			agent.TaskSummary = payload.summary
+		}
+	}
 	m.rowsDirty = true
 
 	// No auto-promotion for any visibility level.
 	// Status is already set to StatusThinking above — multiple agents can be active.
+	return nil
+}
+
+func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
+	candidateID := canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
+	agentID := m.resolveAgentID(candidateID)
+	if agentID == "" {
+		agentID = m.ensureAgentForLiveEvent(candidateID, start.AgentID, start.AgentType, start.AgentName, start.PipelineID, start.TaskID, start.TaskName, start.TaskSlug)
+	}
+	if agentID == "" {
+		return nil
+	}
+	agent := m.agents[agentID]
+	if agent == nil {
+		agentID = m.ensureAgentForLiveEvent(candidateID, start.AgentID, start.AgentType, start.AgentName, start.PipelineID, start.TaskID, start.TaskName, start.TaskSlug)
+		agent = m.agents[agentID]
+		if agent == nil {
+			return nil
+		}
+	}
+	if shouldIgnoreStaleAgentCorrelation(agent, start.CorrelationID) {
+		return nil
+	}
+	applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
+		Source:        agentLifecycleSourceStreamStart,
+		CorrelationID: start.CorrelationID,
+		Status:        StatusActing,
+		ActivityState: events.AgentUIStateResponding,
+	})
+	m.rowsDirty = true
 	return nil
 }
 
@@ -685,9 +754,149 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 	if !ok {
 		return nil
 	}
-	agent.Status = StatusIdle
+	applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
+		Source:        agentLifecycleSourceStreamComplete,
+		CorrelationID: done.CorrelationID,
+		Status:        StatusIdle,
+		ActivityState: events.AgentUIStateNone,
+	})
+	markAgentCorrelationTerminal(agent, done.CorrelationID)
 	m.rowsDirty = true
 	return nil
+}
+
+func (m *Model) handleToolCallEvent(event msg.ToolCallEventMsg) tea.Cmd {
+	candidateID := canonicalStreamAgentID(event.AgentID, event.AgentType, event.PipelineID, event.TaskID)
+	agentID := m.resolveAgentID(strings.TrimSpace(candidateID))
+	if agentID == "" {
+		agentID = m.ensureAgentForLiveEvent(candidateID, event.AgentID, event.AgentType, event.AgentName, event.PipelineID, event.TaskID, event.TaskName, event.TaskSlug)
+	}
+	if agentID == "" {
+		agentID = strings.TrimSpace(event.AgentID)
+	}
+	if agentID == "" {
+		return nil
+	}
+	agent := m.agents[agentID]
+	if agent == nil {
+		agentID = m.ensureAgentForLiveEvent(candidateID, event.AgentID, event.AgentType, event.AgentName, event.PipelineID, event.TaskID, event.TaskName, event.TaskSlug)
+		agent = m.agents[agentID]
+		if agent == nil {
+			return nil
+		}
+	}
+	switch event.Phase {
+	case 0:
+		if shouldIgnoreStaleAgentCorrelation(agent, event.CorrelationID) {
+			return nil
+		}
+		next := *agent
+		next.Status = StatusActing
+		next.ActivityState = inferUIStateFromToolStart(&next, event.ToolName, event.ArgsSummary)
+		applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
+			Source:        agentLifecycleSourceToolStart,
+			CorrelationID: event.CorrelationID,
+			Status:        next.Status,
+			ActivityState: next.ActivityState,
+		})
+		if summary := summarizeAgentPanelToolEvent(event); summary != "" {
+			agent.TaskSummary = summary
+			agent.toolSummaryPinned = true
+			agent.pinnedToolCallKey = strings.TrimSpace(event.ToolCallKey)
+		}
+	case 1:
+		if !agent.toolSummaryPinned || strings.TrimSpace(agent.pinnedToolCallKey) == "" || agent.pinnedToolCallKey == strings.TrimSpace(event.ToolCallKey) {
+			agent.toolSummaryPinned = false
+			agent.pinnedToolCallKey = ""
+		}
+		if !event.Success {
+			next := *agent
+			next.Status = StatusError
+			next.ActivityState = inferUIStateFromToolFailure(&next, event)
+			if !applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
+				Source:        agentLifecycleSourceToolComplete,
+				CorrelationID: event.CorrelationID,
+				Status:        next.Status,
+				ActivityState: next.ActivityState,
+			}) {
+				m.rowsDirty = true
+				return nil
+			}
+			if text := summarizeAgentPanelToolEvent(event); text != "" {
+				agent.TaskSummary = text
+			}
+		} else {
+			next := *agent
+			next.Status = StatusThinking
+			next.ActivityState = fallbackUIStateAfterToolSuccess(&next)
+			if !applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
+				Source:        agentLifecycleSourceToolComplete,
+				CorrelationID: event.CorrelationID,
+				Status:        next.Status,
+				ActivityState: next.ActivityState,
+			}) {
+				m.rowsDirty = true
+				return nil
+			}
+			if text := summarizeAgentPanelToolEvent(event); text != "" {
+				agent.TaskSummary = text
+			}
+		}
+	default:
+		return nil
+	}
+	m.rowsDirty = true
+	return nil
+}
+
+func (m *Model) ensureAgentForLiveEvent(panelID, rawAgentID, agentType, agentName, pipelineID, taskID, taskName, taskSlug string) string {
+	panelID = strings.TrimSpace(panelID)
+	rawAgentID = strings.TrimSpace(rawAgentID)
+	if panelID == "" {
+		panelID = rawAgentID
+	}
+	if panelID == "" {
+		return ""
+	}
+	if resolved := m.resolveAgentID(panelID); resolved != "" && m.agents[resolved] != nil {
+		return resolved
+	}
+
+	data := map[string]any{}
+	if trimmed := strings.TrimSpace(agentType); trimmed != "" {
+		data["agent_type"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(agentName); trimmed != "" {
+		data["agent_name"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(pipelineID); trimmed != "" {
+		data["pipeline_id"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(taskID); trimmed != "" {
+		data["task_id"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(taskName); trimmed != "" {
+		data["task_name"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(taskSlug); trimmed != "" {
+		data["task_slug"] = trimmed
+	}
+	if rawAgentID != "" && rawAgentID != panelID {
+		data["runtime_agent_id"] = rawAgentID
+	}
+
+	ev := msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   panelID,
+			Data:      data,
+			Visibility: events.VisibilityUser,
+		},
+	}
+	agentID := m.ensureAgent(panelID, ev)
+	m.rememberAgentAliases(agentID, rawAgentID, ev)
+	return agentID
 }
 
 func (m *Model) canonicalizeAgentID(agentID string, ev msg.ActivityEventMsg) string {
@@ -1173,6 +1382,10 @@ func (m *Model) absorbDuplicateAgent(srcID, dstID string) {
 	if dst.TaskSummary == "" {
 		dst.TaskSummary = src.TaskSummary
 	}
+	if !dst.toolSummaryPinned && src.toolSummaryPinned {
+		dst.toolSummaryPinned = true
+		dst.pinnedToolCallKey = src.pinnedToolCallKey
+	}
 	if dst.ContextUsage == 0 {
 		dst.ContextUsage = src.ContextUsage
 	}
@@ -1376,19 +1589,30 @@ func (m *Model) updateAgentStatus(agentID string, ev msg.ActivityEventMsg) {
 		return
 	}
 
+	next := *agent
 	if status, found := handoffActivityStatus(ev); found {
-		agent.Status = status
+		next.Status = status
 	} else if status, found := eventTypeToStatus[ev.Event.EventType]; found {
-		agent.Status = status
+		next.Status = status
 	}
-
+	next.ActivityState = inferUIStateFromActivity(&next, ev)
+	if isActiveStatus(next.Status) && shouldIgnoreStaleAgentCorrelation(agent, ev.Event.CorrelationID) {
+		return
+	}
+	applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
+		Source:        agentLifecycleSourceActivity,
+		CorrelationID: ev.Event.CorrelationID,
+		Status:        next.Status,
+		ActivityState: next.ActivityState,
+	})
+	trackAgentActivityCorrelation(agent, ev)
 	m.updateAgentMetadata(agent, ev)
 }
 
 // updateAgentMetadata extracts task summary and context usage from event data.
 func (m *Model) updateAgentMetadata(agent *AgentState, ev msg.ActivityEventMsg) {
-	if ev.Event.Content != "" {
-		agent.TaskSummary = ev.Event.Content
+	if summary := summarizeAgentPanelActivity(ev.Event); summary != "" && !agent.toolSummaryPinned {
+		agent.TaskSummary = summary
 	}
 
 	handoffState := extractString(ev.Event.Data, "handoff_state")
@@ -1630,9 +1854,11 @@ func (m *Model) HasActiveAgent() bool {
 // stream error makes active agents stale before a terminal event arrives.
 func (m *Model) DemoteAllActive() {
 	for _, agent := range m.agents {
-		if isActiveStatus(agent.Status) {
-			agent.Status = StatusIdle
-		}
+		applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
+			Source:        agentLifecycleSourceDemotion,
+			Status:        StatusIdle,
+			ActivityState: events.AgentUIStateNone,
+		})
 	}
 }
 
@@ -1645,8 +1871,14 @@ func (m *Model) DemoteAgent(agentID string) {
 	if !ok {
 		agent = m.findAgentByType(agentID)
 	}
-	if agent != nil && isActiveStatus(agent.Status) {
-		agent.Status = StatusIdle
+	if agent != nil {
+		if before := agent.Status; before != StatusIdle || agent.ActivityState != defaultUIStateForStatus(agent) {
+			applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
+				Source:        agentLifecycleSourceDemotion,
+				Status:        StatusIdle,
+				ActivityState: events.AgentUIStateNone,
+			})
+		}
 		m.rowsDirty = true
 	}
 }
@@ -2402,6 +2634,7 @@ func (m *Model) renderListView() string {
 		Ripple:          ripple,
 		RippleGrad:      m.rippleGradient,      // ThinkingGradient for active agents.
 		HolographicGrad: m.activeGroupGradient, // Full prismatic for selected active agent.
+		NerdFonts:       m.nerdFonts,
 	}
 
 	if m.pipelineSectionIndex() >= 0 {

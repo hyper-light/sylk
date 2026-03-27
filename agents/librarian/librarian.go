@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,7 +27,7 @@ import (
 
 // Default configuration values.
 const (
-	DefaultLibrarianModel    = "gemini-3.1-pro-preview"
+	DefaultLibrarianModel    = "claude-sonnet-4-6"
 	DefaultMaxToolRuns       = 32
 	DefaultMaxTokens         = 8192
 	DefaultMaxOutputTokens   = 8192
@@ -69,7 +70,8 @@ type Librarian struct {
 	activityPub events.ActivityPublisher
 
 	// Knowledge integration
-	knowledgeStore *knowledge.KnowledgeStore
+	knowledgeStore    *knowledge.KnowledgeStore
+	knowledgeBackend  committedKnowledgeSearcher
 
 	// Event bus integration
 	bus          guide.EventBus
@@ -128,6 +130,7 @@ type Config struct {
 
 	// Search configuration
 	SearchSystem SearchSystem // Optional: the search backend (nil when LLM is enabled)
+	KnowledgeBackend committedKnowledgeSearcher
 
 	// ActivityPub publishes activity events so the UI agent panel tracks
 	// this agent's lifecycle. Nil-safe (events silently dropped).
@@ -165,6 +168,7 @@ func New(cfg Config, provider ...LibrarianProvider) (*Librarian, error) {
 		activityPub:       cfg.ActivityPub,
 		domainFilter:      NewLibrarianDomainFilter(cfg.Logger),
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
+		knowledgeBackend:  cfg.KnowledgeBackend,
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
 		workspaceViews: authority.RestrictWorkspaceViews("librarian", versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
@@ -485,7 +489,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 	shared.LogIncomingRequest(l.steering.EventLogger(), fwd, l.id)
 
 	shared.EmitDispatchACK(l.bus, fwd.Metadata, l.id, "librarian", fwd.CorrelationID)
-	l.publishActivity(events.EventTypeAgentAction, "Processing search request")
+	l.publishActivityForSession(fwd.SessionID, events.EventTypeAgentAction, "Processing search request")
 
 	if l.config.RequestGuard != nil {
 		release := l.config.RequestGuard()
@@ -514,7 +518,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 
 	// Wire tool call emitter for inline visualization.
 	emitter := shared.NewToolCallEmitter(l.bus, l.channels, l.id, fwd.CorrelationID, fwd.SourceAgentID)
-	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx := shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
@@ -524,7 +528,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		AgentID:     l.id,
 		SessionID:   fwd.SessionID,
 	})
-	gov := shared.NewContextGovernor(l.config.Model, l.config.MaxTokens, 0)
+	gov := shared.NewContextGovernor(l.CurrentModel(), l.config.MaxTokens, 0)
 	if l.handoffBridge != nil {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
 			return l.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
@@ -565,7 +569,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		shared.PublishStreamError(l.bus, l.channels, ctx, l.id, err)
 		shared.PublishStreamComplete(l.bus, l.channels, ctx, l.id, "", usageAcc.Total())
 		resp.Error = err.Error()
-		l.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Search failed: %s", err.Error()))
+		l.publishActivityForSession(fwd.SessionID, events.EventTypeAgentError, fmt.Sprintf("Search failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
 			l.generateMessageID(),
 			fwd.CorrelationID,
@@ -577,7 +581,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 
 	resp.Data = result
 	shared.PublishStreamComplete(l.bus, l.channels, ctx, l.id, "", usageAcc.Total())
-	l.publishActivity(events.EventTypeSuccess, "Search task completed")
+	l.publishActivityForSession(fwd.SessionID, events.EventTypeSuccess, "Search task completed")
 
 	if l.agentPod != nil {
 		l.agentPod.FeedScribe("librarian", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
@@ -782,10 +786,14 @@ func (l *Librarian) handleToolingRequest(_ context.Context, req *LibrarianReques
 // publishActivity emits a user-visible activity event so the UI agent panel
 // tracks this librarian's lifecycle.
 func (l *Librarian) publishActivity(eventType events.EventType, content string) {
+	l.publishActivityForSession(l.config.SessionID, eventType, content)
+}
+
+func (l *Librarian) publishActivityForSession(sessionID string, eventType events.EventType, content string) {
 	if l.activityPub == nil {
 		return
 	}
-	evt := events.NewActivityEvent(eventType, l.config.SessionID, content)
+	evt := events.NewActivityEvent(eventType, strings.TrimSpace(sessionID), content)
 	evt.AgentID = l.id
 	evt.Visibility = events.VisibilityUser
 	evt.Data["agent_type"] = "librarian"

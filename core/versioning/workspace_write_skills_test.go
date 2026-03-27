@@ -198,6 +198,50 @@ func TestWritePipelineFileSkillAcceptsFreshBasis(t *testing.T) {
 	}
 }
 
+func TestEditPipelineFileSkillDeclaresRequiredEditFields(t *testing.T) {
+	skill := NewEditPipelineFileSkill(WorkspaceWriteSkillConfig{})
+	editsProp := skill.InputSchema.Properties["edits"]
+	if editsProp == nil {
+		t.Fatal("expected edits property on edit_pipeline_file schema")
+	}
+	if editsProp.Items == nil || editsProp.Items.Type != "object" {
+		t.Fatalf("edits item schema = %+v, want object items", editsProp.Items)
+	}
+	if editsProp.Items.Properties["old_text"] == nil {
+		t.Fatal("expected old_text property on edit items")
+	}
+	if editsProp.Items.Properties["new_text"] == nil {
+		t.Fatal("expected new_text property on edit items")
+	}
+	required := strings.Join(editsProp.Items.Required, ",")
+	if !strings.Contains(required, "old_text") || !strings.Contains(required, "new_text") {
+		t.Fatalf("required edit fields = %v, want old_text and new_text", editsProp.Items.Required)
+	}
+	if !strings.Contains(skill.Description, "old_text") {
+		t.Fatalf("description = %q, want old_text guidance", skill.Description)
+	}
+}
+
+func TestEditPipelineFileSkillRejectsMissingOldTextWithRecoveryGuidance(t *testing.T) {
+	skill := NewEditPipelineFileSkill(WorkspaceWriteSkillConfig{})
+	input, _ := json.Marshal(map[string]any{
+		"path": "hello.txt",
+		"edits": []map[string]string{
+			{"new_text": "replacement"},
+		},
+	})
+	_, err := skill.Handler(context.Background(), input)
+	if err == nil {
+		t.Fatal("expected missing old_text error")
+	}
+	if !strings.Contains(err.Error(), "old_text is required") {
+		t.Fatalf("error = %v, want old_text requirement", err)
+	}
+	if !strings.Contains(err.Error(), "write_* tool") {
+		t.Fatalf("error = %v, want rewrite guidance", err)
+	}
+}
+
 func TestCreatePipelineDirectorySkillRebindsChildFileBasis(t *testing.T) {
 	dir := t.TempDir()
 	svfs, views, ctx := newWorkspaceWriteSkillHarness(t, dir)

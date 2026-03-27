@@ -562,8 +562,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	defer pt.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
 
 	ctx := reqCtx
-	ctx = agentshared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
-	ctx = agentshared.WithStreamContextMetadata(ctx, map[string]any{
+	ctx = agentshared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, agentshared.MergeStreamMetadata(fwd.Metadata, map[string]any{
 		"pipeline_task": true,
 		"agent_type":    "tester-pipeline",
 		"agent_name":    "Tester",
@@ -573,7 +572,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 		"task_name":     pt.pipelineName,
 		"dag_id":        taskContextString(fwd.Metadata, "dag_id"),
 		"node_id":       taskContextString(fwd.Metadata, "node_id"),
-	})
+	}))
 	ctx, usageAcc := agentshared.WithUsageAccumulator(ctx)
 	ctx = agentshared.WithSteeringLedger(ctx, ledger)
 	ctx = agentshared.WithLogMeta(ctx, agentshared.LogMeta{

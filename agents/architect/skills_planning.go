@@ -13,8 +13,8 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/skills"
-	"github.com/adalundhe/sylk/core/storage"
 	"github.com/google/uuid"
 )
 
@@ -23,18 +23,17 @@ import (
 // ---------------------------------------------------------------------------
 
 type consultInput struct {
-	Mode            string `json:"mode"`
-	Target          string `json:"target,omitempty"`
-	Query           string `json:"query"`
-	Scope           string `json:"scope,omitempty"`
-	SessionID       string `json:"session_id,omitempty"`
-	IncludeAcademic bool   `json:"include_academic,omitempty"`
-	PlanID          string `json:"plan_id,omitempty"`
+	Mode      string `json:"mode"`
+	Target    string `json:"target,omitempty"`
+	Query     string `json:"query"`
+	Scope     string `json:"scope,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	PlanID    string `json:"plan_id,omitempty"`
 }
 
 var consultAllTargets = map[string]bool{
 	"librarian": true, "archivalist": true, "academic": true,
-	"engineer": true, "designer": true, "inspector": true, "tester": true,
+	"engineer": true, "designer": true, "inspector": true, "tester": true, "orchestrator": true,
 }
 
 var consultKnowledgeTargets = map[string]bool{
@@ -85,28 +84,18 @@ func consultSkill(a *Architect) *skills.Skill {
 					Consultations: map[string]*ConsultationEvidence{},
 				}
 			}
-			req := &ArchitectRequest{
-				ID:        uuid.NewString(),
-				Intent:    IntentPlan,
-				Query:     p.Query,
-				SessionID: p.SessionID,
-				Timestamp: time.Now(),
-				Params: map[string]any{
-					"include_academic": p.IncludeAcademic,
-					"scope":            p.Scope,
-				},
-			}
 			if hasPlan {
-				if consultationTargetsSatisfied(plan, req, a.config.ConsultationMaxAge) {
+				if consultationTargetsSatisfied(plan, a.config.ConsultationMaxAge) {
 					plan.CodebasePatterns = extractLibrarianPatterns(plan)
 					if err := a.persistPlanState(plan); err != nil {
 						return nil, err
 					}
 					return map[string]any{
-						"ready":         true,
-						"consultations": plan.Consultations,
-						"required":      mandatoryConsultationTargets(req),
-						"reused":        true,
+						"ready":                   true,
+						"consultations":           plan.Consultations,
+						"suggested_targets":       defaultDiscussionConsultationTargets(),
+						"stale_or_failed_targets": staleOrFailedConsultationTargets(plan.Consultations, a.config.ConsultationMaxAge),
+						"reused":                  true,
 					}, nil
 				}
 				if !hasReachedPlanPhase(plan.SM().State(), PlanStatusConsulting) {
@@ -115,9 +104,6 @@ func consultSkill(a *Architect) *skills.Skill {
 					}
 				}
 			}
-			if err := a.enforceConsultationGate(ctx, plan, req); err != nil {
-				return nil, err
-			}
 			if hasPlan {
 				plan.CodebasePatterns = extractLibrarianPatterns(plan)
 				if err := a.persistPlanState(plan); err != nil {
@@ -125,9 +111,11 @@ func consultSkill(a *Architect) *skills.Skill {
 				}
 			}
 			return map[string]any{
-				"ready":         true,
-				"consultations": plan.Consultations,
-				"required":      mandatoryConsultationTargets(req),
+				"ready":                   true,
+				"consultations":           plan.Consultations,
+				"suggested_targets":       defaultDiscussionConsultationTargets(),
+				"stale_or_failed_targets": staleOrFailedConsultationTargets(plan.Consultations, a.config.ConsultationMaxAge),
+				"message":                 "Synthesize the discussion-time consultation evidence, refresh only the material gaps, then move into design.",
 			}, nil
 		},
 		"knowledge": func(ctx context.Context, p *consultInput) (any, error) {
@@ -170,11 +158,11 @@ func consultSkill(a *Architect) *skills.Skill {
 	}
 
 	return skills.NewSkill("consult").
-		Description("Consult agents for evidence before or during planning.\n\n"+
+		Description("Consult agents for evidence during live discussion and during planning synthesis.\n\n"+
 			"Modes:\n"+
-			"- single: Consult one agent directly (params: target [required], query, scope, session_id)\n"+
-			"- pre_planning: Mandatory consultation gate before plan creation (params: query, scope, session_id, include_academic)\n"+
-			"- knowledge: Consult Librarian/Archivalist/Academic for evidence (params: target [required], query, scope)").
+			"- single: Consult one execution or coordination agent directly (params: target [required], query, scope, session_id)\n"+
+			"- pre_planning: Consolidate and refresh discussion-time consultation evidence before design (params: query, scope, session_id)\n"+
+			"- knowledge: Consult Librarian/Archivalist/Academic during discussion or planning for evidence (params: target [required], query, scope)").
 		Domain("consultation").
 		Keywords("consult", "before planning", "context", "evidence", "librarian",
 			"archivalist", "academic", "engineer", "designer", "inspector", "tester",
@@ -183,13 +171,16 @@ func consultSkill(a *Architect) *skills.Skill {
 		TokenEstimate(500).
 		EnumParam("mode", "Consultation mode", []string{"single", "pre_planning", "knowledge"}, true).
 		EnumParam("target", "Agent to consult", []string{
-			"librarian", "archivalist", "academic", "engineer", "designer", "inspector", "tester",
+			"librarian", "archivalist", "academic", "engineer", "designer", "inspector", "tester", "orchestrator",
 		}, false).
 		StringParam("query", "Question or topic to consult about", true).
 		StringParam("scope", "Scope to limit the search", false).
 		StringParam("session_id", "Session identifier", false).
-		BoolParam("include_academic", "Whether to require Academic consultation (pre_planning mode)", false).
 		StringParam("plan_id", "Plan identifier for protocol-driven consultation", false).
+		Usage("Use during conversation as new material information arrives, and again during planning to consolidate what you learned. Do not defer obvious codebase, historical, or Academic evidence gathering until formal plan creation. `consult(mode=pre_planning)` should synthesize and refresh the evidence already gathered during discussion, not begin from zero.").
+		BestPractice("On the first substantive turn for a new implementation, planning, or architecture problem, default to the full knowledge triad: Librarian + Archivalist + Academic, unless one source is clearly irrelevant or already fresh.").
+		BestPractice("During live discussion, consult the Librarian when codebase-fit or local-pattern questions emerge, the Archivalist when historical decisions or preferences matter, and the Academic when architecture quality, correctness, performance, testing, infrastructure, or tradeoffs materially affect the outcome.").
+		BestPractice("Do not wait for literal keywords like 'research' or 'benchmark' to consult the Academic. Use it whenever the conversation materially needs stronger alternatives, best practices, or external grounding.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params consultInput
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -234,7 +225,7 @@ func preDelegationDeclareSkill(a *Architect) *skills.Skill {
 		StringParam("failure_criteria", "Failure criteria for delegated task", true).
 		BoolParam("user_clarification_needed", "Whether unresolved ambiguity remains", false).
 		ArrayParam("challenges_raised", "Concerns raised during planning", "string", false).
-		Usage("Use after consultation is complete and before handing off to the Orchestrator. Creates a formal declaration recording the target agent, reasoning, required skills, expected outcome, and failure criteria. The declaration is validated against consultation evidence — missing or stale consultations will cause validation failure. Do NOT create declarations for tasks that lack clear success criteria.").
+		Usage("Use before handing off to the Orchestrator. Creates a formal declaration recording the target agent, reasoning, required skills, expected outcome, failure criteria, and any consultation evidence already gathered. The declaration validation checks any attached consultation evidence for freshness and success, but it is not a fixed consultation checklist. Do NOT create declarations for tasks that lack clear success criteria.").
 		Example(`{"plan_id": "plan_abc", "target_agent": "engineer", "reasoning": "Single-file change with clear scope", "required_skills": ["go", "websocket"], "expected_outcome": "WebSocket handler implemented and tests passing", "failure_criteria": "Compilation errors or test failures"}`).
 		BestPractice("Always specify both expected_outcome and failure_criteria — these are used by the Orchestrator to determine task success or failure.").
 		BestPractice("Set user_clarification_needed=true if any consultation raised unresolved ambiguity — the user will be prompted before delegation proceeds.").
@@ -252,7 +243,7 @@ func preDelegationDeclareSkill(a *Architect) *skills.Skill {
 				return nil, err
 			}
 			a.persistDeclaration(plan, declaration)
-			a.publishDeclaration(declaration, plan.SessionID)
+			a.publishDeclaration(ctx, declaration, plan.SessionID)
 			return declaration, nil
 		}).
 		Build()
@@ -351,11 +342,9 @@ func validateDeclarationConsultations(
 	declaration *PreDelegationDeclaration,
 	maxAge time.Duration,
 ) error {
-	required := []string{"librarian", "archivalist"}
-	for _, target := range required {
-		evidence := declaration.ConsultationChecks[target]
+	for target, evidence := range declaration.ConsultationChecks {
 		if evidence == nil {
-			return fmt.Errorf("missing consultation evidence for %s", target)
+			return fmt.Errorf("invalid consultation evidence for %s", target)
 		}
 		if !evidence.Success {
 			return fmt.Errorf("%s consultation failed: %s", target, evidence.Error)
@@ -380,21 +369,34 @@ func isConsultationFresh(evidence *ConsultationEvidence, maxAge time.Duration) b
 	return time.Since(evidence.ReceivedAt) <= maxAge
 }
 
-func consultationTargetsSatisfied(plan *DesignPlan, req *ArchitectRequest, maxAge time.Duration) bool {
+func consultationTargetsSatisfied(plan *DesignPlan, maxAge time.Duration) bool {
 	if plan == nil {
 		return false
 	}
-	required := mandatoryConsultationTargets(req)
-	if len(required) == 0 {
-		return true
-	}
-	for _, target := range required {
-		evidence := plan.Consultations[target]
+	for _, evidence := range plan.Consultations {
 		if evidence == nil || !evidence.Success || !isConsultationFresh(evidence, maxAge) {
 			return false
 		}
 	}
 	return true
+}
+
+func defaultDiscussionConsultationTargets() []string {
+	return []string{"librarian", "archivalist", "academic"}
+}
+
+func staleOrFailedConsultationTargets(consultations map[string]*ConsultationEvidence, maxAge time.Duration) []string {
+	if len(consultations) == 0 {
+		return nil
+	}
+	targets := make([]string, 0, len(consultations))
+	for target, evidence := range consultations {
+		if evidence == nil || !evidence.Success || !isConsultationFresh(evidence, maxAge) {
+			targets = append(targets, target)
+		}
+	}
+	sort.Strings(targets)
+	return targets
 }
 
 func (a *Architect) persistDeclaration(plan *DesignPlan, declaration *PreDelegationDeclaration) {
@@ -412,27 +414,48 @@ func (a *Architect) persistDeclaration(plan *DesignPlan, declaration *PreDelegat
 	}
 }
 
-func (a *Architect) publishDeclaration(declaration *PreDelegationDeclaration, sessionID string) {
+func (a *Architect) publishDeclaration(ctx context.Context, declaration *PreDelegationDeclaration, sessionID string) {
 	if declaration == nil || !a.running || a.bus == nil {
 		return
 	}
+	input, err := guide.ArchivalistStoreRouteInput("stored pre-delegation declaration")
+	if err != nil {
+		a.logWarn("failed to encode archivalist declaration route",
+			"declaration_id", declaration.ID,
+			"session_id", sessionID,
+			"error", err)
+		return
+	}
+	branchCtx, branch := shared.BeginArchivalistStoreBranch(ctx, "stored pre-delegation declaration", map[string]any{
+		"declaration_id": declaration.ID,
+		"session_id":     sessionID,
+	})
+	metadata := branch.ApplyMetadata(branchCtx, map[string]any{"declaration": declaration})
 	req := &guide.RouteRequest{
 		CorrelationID: "decl_" + uuid.NewString(),
-		Input:         "store pre-delegation declaration",
+		Input:         input,
 		SourceAgentID: a.id,
-		TargetAgentID: "archivalist",
 		FireAndForget: true,
 		SessionID:     sessionID,
 		Timestamp:     time.Now(),
+		Metadata:      metadata,
+	}
+	if req.ParentCorrelationID == "" {
+		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+			req.ParentCorrelationID = stream.CorrelationID
+		}
 	}
 	msg := guide.NewRequestMessage(a.generateMessageID(), req)
-	msg.Metadata = map[string]any{"declaration": declaration}
+	msg.Metadata = metadata
 	if err := a.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+		branch.Complete(branchCtx, "", "", err)
 		a.logWarn("failed to publish pre-delegation declaration",
 			"declaration_id", declaration.ID,
 			"session_id", sessionID,
 			"error", err)
+		return
 	}
+	branch.Complete(branchCtx, "stored pre-delegation declaration", "", nil)
 }
 
 type validatePreDelegationParams struct {
@@ -442,15 +465,15 @@ type validatePreDelegationParams struct {
 
 func validatePreDelegationSkill(a *Architect) *skills.Skill {
 	return skills.NewSkill("validate_pre_delegation").
-		Description("Validate a pre-delegation declaration against required consultation evidence.").
+		Description("Validate a pre-delegation declaration and sanity-check any attached consultation evidence.").
 		Domain("delegation").
 		Keywords("validate", "pre delegation", "declaration", "consultation").
 		Priority(95).
 		StringParam("plan_id", "Plan identifier", false).
 		StringParam("declaration_id", "Declaration identifier", false).
-		Usage("Use to validate an existing declaration's consultation evidence before proceeding with handoff. Returns valid=true if all required consultations (Librarian, Archivalist) are present, successful, and within the configured max age. Use this as a preflight check before `handoff_to_orchestrator`.").
+		Usage("Use to validate an existing declaration before proceeding with handoff. Returns valid=true when the declaration is structurally sound and any attached consultation evidence is successful and within the configured max age. This is not a fixed consultation checklist; gather the consultations that materially matter for the task before `handoff_to_orchestrator`.").
 		Example(`{"plan_id": "plan_abc", "declaration_id": "decl_xyz"}`).
-		BestPractice("If validation fails due to stale consultations, re-run `consult` with mode=pre_planning rather than creating a new declaration from scratch.").
+		BestPractice("If validation fails due to stale consultation evidence, refresh the material consultations and then re-run validation rather than creating a new declaration from scratch.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params validatePreDelegationParams
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -639,14 +662,41 @@ func (a *Architect) applyPlanRevision(plan *DesignPlan, reason string, updates m
 	if current == nil {
 		return plan
 	}
+	priorPlanFile := strings.TrimSpace(current.PlanFile)
+	nextVersion := normalizedPlanArtifactVersion(current).BumpMinor()
+	nextPlanFile := nextVersionedPlanMarkdownPath(a.config.WorkingDirectory, current, nextVersion)
+	if err := clonePlanMarkdownToVersion(strings.TrimSpace(current.PlanFile), nextPlanFile, current.Query, nextVersion); err != nil {
+		a.logger.Warn("failed to rotate revised plan markdown", "plan_id", current.ID, "error", err)
+	}
 	current.Revision++
+	current.ArtifactVersion = nextVersion
+	current.PlanFile = nextPlanFile
 	current.UpdatedAt = time.Now()
 	current.RiskSummary = append(current.RiskSummary, reason)
 	applyPlanUpdateFields(current, updates)
+	a.syncPlanModePlanFile(current.SessionID, priorPlanFile, nextPlanFile)
 	if err := a.planStore.Upsert(current); err != nil {
 		a.logger.Warn("failed to persist revised plan snapshot", "plan_id", current.ID, "error", err)
 	}
 	return current
+}
+
+func (a *Architect) syncPlanModePlanFile(sessionID, oldPath, newPath string) {
+	if a == nil || strings.TrimSpace(newPath) == "" {
+		return
+	}
+	normalized := normalizeSessionID(sessionID)
+	a.planModesMu.Lock()
+	defer a.planModesMu.Unlock()
+	mode := a.planModes[normalized]
+	if mode == nil {
+		return
+	}
+	if strings.TrimSpace(oldPath) != "" && !samePath(mode.PlanFile, oldPath) {
+		return
+	}
+	mode.PlanFile = newPath
+	mode.UpdatedAt = time.Now()
 }
 
 func applyPlanUpdateFields(plan *DesignPlan, updates map[string]any) {
@@ -968,7 +1018,7 @@ func (a *Architect) enterPlanMode(sessionID string, planFile string, taskDescrip
 	normalizedSession := normalizeSessionID(sessionID)
 	planID := uuid.NewString()
 	resolvedFile := resolvePlanFile(a.config.WorkingDirectory, normalizedSession, taskDescription, planID, planFile)
-	_ = ensurePlanFileExists(resolvedFile, taskDescription)
+	_ = ensurePlanMarkdownFileExists(resolvedFile, taskDescription, normalizedPlanArtifactVersion(&DesignPlan{Revision: 1}))
 	mode := &PlanModeState{
 		SessionID:        normalizedSession,
 		PlanID:           planID,
@@ -993,28 +1043,22 @@ func normalizeSessionID(sessionID string) string {
 
 func resolvePlanFile(workDir, sessionID, planName, planID, planFile string) string {
 	if strings.TrimSpace(planFile) != "" {
+		var candidate string
 		if filepath.IsAbs(planFile) {
-			return planFile
+			candidate = planFile
+		} else {
+			candidate = filepath.Join(workDir, planFile)
 		}
-		return filepath.Join(workDir, planFile)
+		return nextVersionedPlanMarkdownPath(workDir, &DesignPlan{
+			ID:              planID,
+			SessionID:       sessionID,
+			Query:           planName,
+			PlanFile:        candidate,
+			Revision:        1,
+			ArtifactVersion: normalizedPlanArtifactVersion(&DesignPlan{Revision: 1}),
+		}, normalizedPlanArtifactVersion(&DesignPlan{Revision: 1}))
 	}
-	if strings.TrimSpace(sessionID) == "" {
-		sessionID = "default"
-	}
-	planSlug := storage.Slug(planName)
-	fileName := fmt.Sprintf("%s_%s.md", planSlug, planID)
-	return filepath.Join(workDir, ".sylk", "sessions", sessionID, "plans", fileName)
-}
-
-func ensurePlanFileExists(path string, taskDescription string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	if _, err := os.Stat(path); err == nil {
-		return nil
-	}
-	content := fmt.Sprintf("# Plan\n\n## Task\n%s\n", taskDescription)
-	return os.WriteFile(path, []byte(content), 0644)
+	return defaultVersionedPlanMarkdownPath(workDir, sessionID, planName, planID, normalizedPlanArtifactVersion(&DesignPlan{Revision: 1}))
 }
 
 func writePlanFile(path string, content string, appendMode bool) error {
@@ -1373,11 +1417,14 @@ func (a *Architect) getPlanMode(sessionID string) (*PlanModeState, error) {
 }
 
 type readResearchPaperParams struct {
-	ResearchSlug string `json:"research_slug"`
-	PaperPath    string `json:"paper_path"`
-	Version      int    `json:"version,omitempty"`
-	Summary      string `json:"summary,omitempty"`
-	SessionID    string `json:"session_id,omitempty"`
+	ResearchSlug        string   `json:"research_slug"`
+	PaperPath           string   `json:"paper_path"`
+	Version             int      `json:"version,omitempty"`
+	Summary             string   `json:"summary,omitempty"`
+	RecommendedOptionID string   `json:"recommended_option_id,omitempty"`
+	PrototypeSketch     string   `json:"prototype_sketch,omitempty"`
+	SystemDesignNotes   []string `json:"system_design_notes,omitempty"`
+	SessionID           string   `json:"session_id,omitempty"`
 }
 
 func readResearchPaperSkill(a *Architect) *skills.Skill {
@@ -1390,6 +1437,9 @@ func readResearchPaperSkill(a *Architect) *skills.Skill {
 		StringParam("paper_path", "Path to research paper markdown", true).
 		IntParam("version", "Research version number", false).
 		StringParam("summary", "Optional proposal summary", false).
+		StringParam("recommended_option_id", "Optional preferred architecture option identifier", false).
+		StringParam("prototype_sketch", "Optional proof-of-concept sketch from the research paper", false).
+		ArrayParam("system_design_notes", "Optional system design implications carried from the research paper", "string", false).
 		StringParam("session_id", "Session identifier", false).
 		Usage("Use when the user provides a research paper or proposal that should be converted into an executable architecture plan. Reads the paper content, builds a planning query from it, and executes the full planning protocol (including Academic consultation). Do NOT use for short notes or feature requests — this is for substantial research artifacts.").
 		Example(`{"research_slug": "distributed-cache-v2", "paper_path": "docs/proposals/distributed_cache.md", "version": 1, "summary": "Proposes a two-tier caching layer with Redis L1 and disk L2"}`).
@@ -1452,7 +1502,33 @@ func buildResearchPlanningQuery(params *readResearchPaperParams, content string)
 	if summary == "" {
 		summary = truncateString(content, 600)
 	}
-	return fmt.Sprintf("Convert research proposal '%s' into execution plan. Summary: %s", slug, summary)
+	parts := []string{
+		fmt.Sprintf("Convert research proposal '%s' into execution plan.", slug),
+	}
+	if summary != "" {
+		parts = append(parts, "Summary: "+summary)
+	}
+	if optionID := strings.TrimSpace(params.RecommendedOptionID); optionID != "" {
+		parts = append(parts, "Recommended option: "+optionID)
+	}
+	if prototype := strings.TrimSpace(params.PrototypeSketch); prototype != "" {
+		parts = append(parts, "Prototype sketch: "+prototype)
+	}
+	if notes := filterNonEmptyStrings(params.SystemDesignNotes); len(notes) > 0 {
+		parts = append(parts, "System design notes: "+strings.Join(notes, "; "))
+	}
+	return strings.Join(parts, " ")
+}
+
+func filterNonEmptyStrings(items []string) []string {
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 // ---------------------------------------------------------------------------
@@ -1504,11 +1580,9 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 		TokenEstimate(300).
 		StringParam("query", "Synthesized planning query capturing all requirements, constraints, and scope gathered from the conversation", true).
 		StringParam("session_id", "Session identifier for plan tracking", false).
-		Usage("Invoke to create a new plan. Returns plan_id and protocol instructions. " +
-			"Then invoke the planning skills yourself using the returned plan_id: " +
-			"plan(analyze) → consult(pre_planning) → plan(design) → plan(generate_tasks). " +
-			"Do NOT wait — drive the protocol immediately after receiving the plan_id.").
-		BestPractice("Synthesize the full conversation context into the query — do not just repeat the user's last message.").
+		Usage("Invoke to create a new plan once the user discussion and consultation work have produced enough evidence to plan responsibly. Returns plan_id and protocol instructions. Then invoke the planning skills yourself using the returned plan_id: plan(analyze) → consult(pre_planning) → plan(design) → plan(generate_tasks). Do NOT wait — drive the protocol immediately after receiving the plan_id.").
+		BestPractice("Synthesize the full conversation context and the consultation evidence already gathered into the query — do not just repeat the user's last message.").
+		BestPractice("Do not treat start_planning as the first moment to gather obvious Librarian, Archivalist, or Academic evidence. Enter planning with a strong discussion-time evidence base, then use consult(pre_planning) to consolidate and refresh it.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params startPlanningInput
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -1579,10 +1653,10 @@ func startPlanningProtocolInstructions(autoApprove bool) string {
 	const base = "Drive the planning protocol using the plan_id above. " +
 		"Invoke these skills in order:\n" +
 		"1. plan(action=analyze, plan_id=<plan_id>, query=<the query>)\n" +
-		"2. consult(mode=pre_planning, plan_id=<plan_id>)\n" +
+		"2. consult(mode=pre_planning, plan_id=<plan_id>) — consolidate and refresh the consultation evidence already gathered during discussion.\n" +
 		"3. If the request is still broadly vague or underspecified, invoke route_requirements_research and STOP. " +
 		"Use ask_user_question only for one or two narrow decisions. If the blocker is codebase or history evidence, " +
-		"consult the Librarian or Archivalist instead.\n" +
+		"consult the Librarian or Archivalist instead. If the blocker is architectural quality, correctness, performance, testing, infrastructure, deployment, or tradeoffs, consult the Academic instead of guessing.\n" +
 		"4. plan(action=design, plan_id=<plan_id>)\n" +
 		"5. plan(action=generate_tasks, plan_id=<plan_id>) — auto-creates workflow and validates.\n" +
 		"6. The system renders the plan structure separately in the UI — the user already sees it.\n" +
@@ -2143,6 +2217,7 @@ func parseAcceptanceResultParams(input json.RawMessage) (*handlePlanAcceptanceRe
 // actOnAccept dispatches the plan to the orchestrator for execution.
 func (a *Architect) actOnAccept(ctx context.Context, plan *DesignPlan) (any, error) {
 	a.logInfo("actOnAccept: dispatching plan", "plan_id", plan.ID)
+	a.publishActivityState(events.EventTypeAgentAction, "Plan accepted for execution", events.AgentUIStatePlanAccepted)
 	architectDebugLog().Info("actOnAccept: ENTRY",
 		"plan_id", plan.ID,
 		"plan_status", plan.SM().State().String(),
@@ -2185,6 +2260,8 @@ func (a *Architect) actOnModify(
 		"action":           "modify",
 		"plan_id":          plan.ID,
 		"revision":         plan.Revision,
+		"artifact_version": plan.ArtifactVersion.String(),
+		"plan_file":        plan.PlanFile,
 		"modifications":    modifications,
 		"directive":        "re_approval_requested",
 		"awaiting_user":    true,
@@ -2203,6 +2280,7 @@ func (a *Architect) actOnReject(
 	a.logInfo("actOnReject: plan rejected",
 		"plan_id", plan.ID,
 		"modification_count", len(modifications))
+	a.publishActivityState(events.EventTypeAgentError, "Plan rejected", events.AgentUIStatePlanRejected)
 
 	reason := "plan rejected by user"
 	if len(modifications) > 0 {
@@ -2214,6 +2292,8 @@ func (a *Architect) actOnReject(
 		"action":           "reject",
 		"plan_id":          plan.ID,
 		"revision":         plan.Revision,
+		"artifact_version": plan.ArtifactVersion.String(),
+		"plan_file":        plan.PlanFile,
 		"modifications":    modifications,
 		"directive":        "clarification_requested",
 		"awaiting_user":    true,

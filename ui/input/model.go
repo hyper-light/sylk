@@ -647,6 +647,17 @@ func actionSelDown(m *Model) tea.Cmd {
 		m.clampCol()
 		m.skipHiddenDelimiters(1)
 		m.scrollIntoView()
+	} else {
+		m.ensureWrap()
+		_, segIdx := m.wrap.visualRowToSegment(vRow)
+		row, _ := m.wrap.visualToActual(vRow, 0)
+		span := m.wrap.segments[row][segIdx]
+		if vCol < span.End-span.Start {
+			m.cursorRow, m.cursorCol = m.visualToCursor(vRow, span.End-span.Start)
+			m.clampCol()
+			m.skipHiddenDelimiters(1)
+			m.scrollIntoView()
+		}
 	}
 	return nil
 }

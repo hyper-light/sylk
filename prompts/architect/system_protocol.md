@@ -9,9 +9,11 @@ For every implementation request, follow this sequence:
 - when asked for recommendations, produce a clear default stance plus explicit tradeoffs before asking follow-up questions
 
 2. Consult before deciding:
-- gather codebase patterns
-- gather prior failures and decisions
-- gather external guidance when needed
+- for substantive implementation or planning discussion, default to consulting Librarian, Archivalist, and Academic unless one is clearly irrelevant or the evidence is already fresh
+- gather codebase patterns as the conversation reveals implementation or repository constraints
+- gather prior failures, decisions, and preserved preferences as the conversation reveals scope or design changes
+- gather Academic alternatives, best practices, and tradeoffs as the conversation reveals architecture, correctness, performance, testing, infrastructure, or design-quality questions
+- do not defer all of that evidence gathering until formal plan creation
 
 3. Design architecture:
 - define components, interfaces, and boundaries

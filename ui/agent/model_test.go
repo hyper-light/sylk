@@ -1740,6 +1740,728 @@ func TestModel_StreamProgressCanonicalizesTaskScopedPipelineRuntimeIDs(t *testin
 	}
 }
 
+func TestModel_StreamProgressJSONUsesCompactSummary(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_stream_progress_json_inspector",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "task_1:inspector-pipeline",
+			Content:   "Pipeline agent registered",
+			Data: map[string]any{
+				"agent_name":  "Inspector",
+				"agent_type":  "inspector-pipeline",
+				"pipeline_id": "task_1",
+				"task_id":     "task_1",
+			},
+		},
+	})
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "task_1__inspector-pipeline",
+		AgentType:  "inspector-pipeline",
+		PipelineID: "task_1",
+		TaskID:     "task_1",
+		Message:    `{"Criteria":{"task_id":"task_1","success_criteria":[{"id":"SC-01"}]}}`,
+		Visibility: events.VisibilityUser,
+	})
+
+	agent := model.agents["task_1:inspector-pipeline"]
+	if agent == nil {
+		t.Fatal("expected pipeline inspector row")
+	}
+	if agent.TaskSummary != "Loaded validation criteria" {
+		t.Fatalf("task summary = %q, want %q", agent.TaskSummary, "Loaded validation criteria")
+	}
+}
+
+func TestModel_StreamProgressOpaqueJSONDoesNotOverrideExistingSummary(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_stream_progress_json_tester_registered",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "task_1:tester-pipeline",
+			Content:   "Pipeline agent registered",
+			Data: map[string]any{
+				"agent_name":  "Tester",
+				"agent_type":  "tester-pipeline",
+				"pipeline_id": "task_1",
+				"task_id":     "task_1",
+			},
+		},
+	})
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "task_1__tester-pipeline",
+		AgentType:  "tester-pipeline",
+		PipelineID: "task_1",
+		TaskID:     "task_1",
+		Message:    "Reviewing coordination state and prior task artifacts.",
+		Visibility: events.VisibilityUser,
+	})
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "task_1__tester-pipeline",
+		AgentType:  "tester-pipeline",
+		PipelineID: "task_1",
+		TaskID:     "task_1",
+		Message:    `{"agent_id":"3b37ab3e","response":"Good catch -- I am gated.","details":{"step":"check_inspector_gate"}}`,
+		Visibility: events.VisibilityUser,
+	})
+
+	agent := model.agents["task_1:tester-pipeline"]
+	if agent == nil {
+		t.Fatal("expected pipeline tester row")
+	}
+	if agent.TaskSummary != "Reviewing coordination state and prior task artifacts." {
+		t.Fatalf("task summary = %q, want existing informative summary", agent.TaskSummary)
+	}
+}
+
+func TestModel_StreamProgressIncompleteJSONDoesNotOverridePipelineInspectorSummary(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_stream_progress_json_inspector_registered",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "task_1:inspector-pipeline",
+			Content:   "Pipeline agent registered",
+			Data: map[string]any{
+				"agent_name":  "Inspector",
+				"agent_type":  "inspector-pipeline",
+				"pipeline_id": "task_1",
+				"task_id":     "task_1",
+			},
+		},
+	})
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "task_1:inspector-pipeline",
+		AgentType:  "inspector-pipeline",
+		PipelineID: "task_1",
+		TaskID:     "task_1",
+		Message:    "Inspecting the task contract, acceptance criteria, and workspace layers to derive concrete implementation failures.",
+		Visibility: events.VisibilityUser,
+	})
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "task_1__inspector-pipeline",
+		AgentType:  "inspector-pipeline",
+		PipelineID: "task_1",
+		TaskID:     "task_1",
+		Message:    `{"Criteria":{"task_id":"task_1"`,
+		Visibility: events.VisibilityUser,
+	})
+
+	agent := model.agents["task_1:inspector-pipeline"]
+	if agent == nil {
+		t.Fatal("expected pipeline inspector row")
+	}
+	if agent.TaskSummary != "Inspecting the task contract, acceptance criteria, and workspace layers to derive concrete implementation failures." {
+		t.Fatalf("task summary = %q, want existing informative summary", agent.TaskSummary)
+	}
+}
+
+func TestModel_LLMRequestMetadataDoesNotOverrideExistingSummary(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_tester_registered",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "task_1:tester-pipeline",
+			Content:   "Pipeline agent registered",
+			Data: map[string]any{
+				"agent_name":  "Tester",
+				"agent_type":  "tester-pipeline",
+				"pipeline_id": "task_1",
+				"task_id":     "task_1",
+			},
+		},
+	})
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "task_1__tester-pipeline",
+		AgentType:  "tester-pipeline",
+		PipelineID: "task_1",
+		TaskID:     "task_1",
+		Message:    "Reviewing coordination state and prior task artifacts.",
+		Visibility: events.VisibilityUser,
+	})
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_tester_llm_request",
+			EventType: events.EventTypeLLMRequest,
+			Timestamp: time.Now(),
+			AgentID:   "task_1:tester-pipeline",
+			Content:   "LLM request to gpt-5.4 with 0 tokens",
+			Data: map[string]any{
+				"agent_name":  "Tester",
+				"agent_type":  "tester-pipeline",
+				"pipeline_id": "task_1",
+				"task_id":     "task_1",
+				"model":       "gpt-5.4",
+			},
+		},
+	})
+
+	agent := model.agents["task_1:tester-pipeline"]
+	if agent == nil {
+		t.Fatal("expected pipeline tester row")
+	}
+	if agent.TaskSummary != "Reviewing coordination state and prior task artifacts." {
+		t.Fatalf("task summary = %q, want existing informative summary", agent.TaskSummary)
+	}
+}
+
+func TestModel_LLMBookkeepingDoesNotOverrideExistingSummary(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	agents := []struct {
+		id      string
+		typ     string
+		name    string
+		summary string
+		content string
+		event   events.EventType
+	}{
+		{
+			id:      "engineer",
+			typ:     "engineer",
+			name:    "Engineer",
+			summary: "Working through discover project tools.",
+			content: `{"id":"989f3fb0-bcf7-4876-bd45-0b2f377748a1","request_id":"981c803d-0991-49ca-8a65-d04d99acb6ac","success":true,"result":{"task_id":"8538d"}}`,
+			event:   events.EventTypeLLMResponse,
+		},
+		{
+			id:      "librarian",
+			typ:     "librarian",
+			name:    "Librarian",
+			summary: "Processing search request",
+			content: `{"content":"","type":"conversation"}`,
+			event:   events.EventTypeLLMResponse,
+		},
+		{
+			id:      "inspector",
+			typ:     "inspector",
+			name:    "Inspector",
+			summary: "Auditing merged implementation for regressions.",
+			content: "LLM response from gpt-5.4: 12053 input, 548 output tokens in 11.198039573s",
+			event:   events.EventTypeLLMResponse,
+		},
+		{
+			id:      "tester",
+			typ:     "tester",
+			name:    "Tester",
+			summary: "Reviewing coordination state and prior task artifacts.",
+			content: "active",
+			event:   events.EventTypeLLMRequest,
+		},
+	}
+
+	for _, tc := range agents {
+		model.SeedAgent(tc.id, tc.typ, tc.name, nil, "", "")
+		model.agents[tc.id].TaskSummary = tc.summary
+
+		_, _ = model.Update(msg.ActivityEventMsg{
+			Event: &events.ActivityEvent{
+				ID:        "evt_" + tc.id + "_bookkeeping",
+				EventType: tc.event,
+				Timestamp: time.Now(),
+				AgentID:   tc.id,
+				Content:   tc.content,
+				Data: map[string]any{
+					"agent_name": tc.name,
+					"agent_type": tc.typ,
+				},
+			},
+		})
+
+		if got := model.agents[tc.id].TaskSummary; got != tc.summary {
+			t.Fatalf("%s task summary = %q, want %q", tc.typ, got, tc.summary)
+		}
+	}
+}
+
+func TestModel_ActivityEventJSONContentUsesCompactSummary(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_pipeline_inspector",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "task_1:inspector-pipeline",
+			Content:   "Validating implementation quality",
+			Data: map[string]any{
+				"agent_name":  "Inspector",
+				"agent_type":  "inspector-pipeline",
+				"pipeline_id": "task_1",
+				"task_id":     "task_1",
+			},
+		},
+	})
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_pipeline_json",
+			EventType: events.EventTypeLLMResponse,
+			Timestamp: time.Now(),
+			AgentID:   "task_1:inspector-pipeline",
+			Content:   `{"Criteria":{"task_id":"task_1","success_criteria":[{"id":"SC-01"}]}}`,
+			Data: map[string]any{
+				"agent_name":  "Inspector",
+				"agent_type":  "inspector-pipeline",
+				"pipeline_id": "task_1",
+				"task_id":     "task_1",
+			},
+		},
+	})
+
+	agent := model.agents["task_1:inspector-pipeline"]
+	if agent == nil {
+		t.Fatal("expected pipeline inspector row")
+	}
+	if agent.TaskSummary != "Loaded validation criteria" {
+		t.Fatalf("task summary = %q, want %q", agent.TaskSummary, "Loaded validation criteria")
+	}
+}
+
+func TestModel_ToolCompletionJSONOutputUsesCompactSummary(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "inspector", "inspector")
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:     "inspector",
+		AgentType:   "inspector",
+		ToolCallKey: "tool_consult",
+		Phase:       1,
+		ToolName:    "consult",
+		Output:      `{"handoff_dispatched":true}`,
+		Success:     true,
+	})
+
+	agent := model.agents["inspector"]
+	if agent == nil {
+		t.Fatal("expected inspector row")
+	}
+	if agent.TaskSummary != "Handoff dispatched" {
+		t.Fatalf("task summary = %q, want %q", agent.TaskSummary, "Handoff dispatched")
+	}
+}
+
+func TestModel_ArchitectToolCompletionUsesTaskSummaryFromJSONOutput(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "architect", "architect")
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:     "architect",
+		AgentType:   "architect",
+		ToolCallKey: "tool_plan_generate_tasks",
+		Phase:       1,
+		ToolName:    "plan",
+		Output:      `{"layer_count":0,"next_action":"route_plan_acceptance","task_summary":"Draft the CLI task graph"}`,
+		Success:     true,
+	})
+
+	agent := model.agents["architect"]
+	if agent == nil {
+		t.Fatal("expected architect row")
+	}
+	if agent.TaskSummary != "Draft the CLI task graph" {
+		t.Fatalf("task summary = %q, want %q", agent.TaskSummary, "Draft the CLI task graph")
+	}
+}
+
+func TestModel_TesterToolCompletionUsesOutputFileFromJSONOutput(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "tester", "tester")
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:     "tester",
+		AgentType:   "tester",
+		ToolCallKey: "tool_write_test",
+		Phase:       1,
+		ToolName:    "write_test",
+		Output:      `{"output_file":"tests/test_cli.py","next_basis":"lease-2"}`,
+		Success:     true,
+	})
+
+	agent := model.agents["tester"]
+	if agent == nil {
+		t.Fatal("expected tester row")
+	}
+	if agent.TaskSummary != "tests/test_cli.py" {
+		t.Fatalf("task summary = %q, want %q", agent.TaskSummary, "tests/test_cli.py")
+	}
+}
+
+func TestModel_ToolStartUsesHumanSummaryAndPinsAgainstLaterActivity(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "inspector", "inspector")
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:     "inspector",
+		AgentType:   "inspector",
+		ToolCallKey: "tool_consult_academic",
+		Phase:       0,
+		ToolName:    "consult_academic_approach",
+		FullArgs:    `{"query":"cleaner or more robust approach?"}`,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "consult",
+			AgentTypes: []string{"academic"},
+			Summary:    "cleaner or more robust approach?",
+			Status:     "pending",
+		},
+	})
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "inspector",
+		AgentType:  "inspector",
+		Message:    `{"response":"opaque transport progress that should not replace the consult summary"}`,
+		Visibility: events.VisibilityUser,
+	})
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_inspector_activity_during_tool",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "inspector",
+			Content:   "Reviewing merged implementation for regressions.",
+			Data: map[string]any{
+				"agent_name": "Inspector",
+				"agent_type": "inspector",
+			},
+		},
+	})
+
+	agent := model.agents["inspector"]
+	if agent == nil {
+		t.Fatal("expected inspector row")
+	}
+	if agent.TaskSummary != "Consulting academic: cleaner or more robust approach?" {
+		t.Fatalf("task summary = %q, want %q", agent.TaskSummary, "Consulting academic: cleaner or more robust approach?")
+	}
+	if !agent.toolSummaryPinned {
+		t.Fatal("expected tool summary to remain pinned during active tool call")
+	}
+}
+
+func TestModel_ToolCompletionReleasesPinAndUsesHumanResponseSummary(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "inspector", "inspector")
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:     "inspector",
+		AgentType:   "inspector",
+		ToolCallKey: "tool_consult_academic",
+		Phase:       0,
+		ToolName:    "consult_academic_approach",
+		FullArgs:    `{"query":"cleaner or more robust approach?"}`,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "consult",
+			AgentTypes: []string{"academic"},
+			Summary:    "cleaner or more robust approach?",
+			Status:     "pending",
+		},
+	})
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:     "inspector",
+		AgentType:   "inspector",
+		ToolCallKey: "tool_consult_academic",
+		Phase:       1,
+		ToolName:    "consult_academic_approach",
+		Output:      `{"response":"table-driven harness would be cleaner and easier to extend"}`,
+		Success:     true,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "consult",
+			AgentTypes: []string{"academic"},
+			Summary:    "table-driven harness would be cleaner and easier to extend",
+			Status:     "done",
+		},
+	})
+
+	agent := model.agents["inspector"]
+	if agent == nil {
+		t.Fatal("expected inspector row")
+	}
+	if agent.TaskSummary != "Academic: table-driven harness would be cleaner and easier to extend" {
+		t.Fatalf("task summary = %q, want %q", agent.TaskSummary, "Academic: table-driven harness would be cleaner and easier to extend")
+	}
+	if agent.toolSummaryPinned {
+		t.Fatal("expected tool summary pin to be released after completion")
+	}
+}
+
+func TestModel_LateToolCompletionDoesNotOverrideTerminalAgentState(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_librarian_success",
+			EventType: events.EventTypeSuccess,
+			Timestamp: time.Now(),
+			AgentID:   "librarian",
+			Content:   "Search task completed",
+			Data: map[string]any{
+				"agent_name": "Librarian",
+				"agent_type": "librarian",
+			},
+		},
+	})
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:     "librarian",
+		AgentType:   "librarian",
+		ToolCallKey: "tool_search_complete_late",
+		Phase:       1,
+		ToolName:    "search_repo",
+		Success:     true,
+		Output:      `{"result":"found prior auth middleware patterns"}`,
+	})
+
+	agent := model.agents["librarian"]
+	if agent == nil {
+		t.Fatal("expected librarian row")
+	}
+	if agent.Status != StatusSuccess {
+		t.Fatalf("status after late tool completion = %v, want StatusSuccess", agent.Status)
+	}
+	if agent.TaskSummary != "Search task completed" {
+		t.Fatalf("task summary after late tool completion = %q, want %q", agent.TaskSummary, "Search task completed")
+	}
+}
+
+func TestModel_StreamCompleteKeepsSameCorrelationToolCompletionClosed(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "librarian", "librarian")
+
+	const corrID = "corr_librarian_consult"
+
+	_, _ = model.Update(msg.StreamStartMsg{
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+		CorrelationID: corrID,
+	})
+	_, _ = model.Update(msg.StreamCompleteMsg{
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+		CorrelationID: corrID,
+	})
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+		CorrelationID: corrID,
+		ToolCallKey:   "tool_late_read_file",
+		Phase:         1,
+		ToolName:      "read_file",
+		Success:       true,
+		Output:        `{"message":"directory preview returned"}`,
+	})
+
+	agent := model.agents["librarian"]
+	if agent == nil {
+		t.Fatal("expected librarian row")
+	}
+	if agent.Status != StatusIdle {
+		t.Fatalf("status after same-correlation late tool completion = %v, want StatusIdle", agent.Status)
+	}
+	if agent.ActivityState != events.AgentUIStateNone {
+		t.Fatalf("activity state after same-correlation late tool completion = %v, want %v", agent.ActivityState, events.AgentUIStateNone)
+	}
+	if agent.activeCorrelationID != "" {
+		t.Fatalf("active correlation after same-correlation late tool completion = %q, want empty", agent.activeCorrelationID)
+	}
+	if agent.lastTerminalCorrelationID != corrID {
+		t.Fatalf("last terminal correlation = %q, want %q", agent.lastTerminalCorrelationID, corrID)
+	}
+}
+
+func TestModel_SuccessActivityCanStillFollowStreamCompleteForSameCorrelation(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "librarian", "librarian")
+
+	const corrID = "corr_librarian_success"
+
+	_, _ = model.Update(msg.StreamStartMsg{
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+		CorrelationID: corrID,
+	})
+	_, _ = model.Update(msg.StreamCompleteMsg{
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+		CorrelationID: corrID,
+	})
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:            "evt_librarian_success_after_stream_complete",
+			EventType:     events.EventTypeSuccess,
+			Timestamp:     time.Now(),
+			AgentID:       "librarian",
+			CorrelationID: corrID,
+			Content:       "Search task completed",
+			Data: map[string]any{
+				"agent_name": "Librarian",
+				"agent_type": "librarian",
+			},
+		},
+	})
+
+	agent := model.agents["librarian"]
+	if agent == nil {
+		t.Fatal("expected librarian row")
+	}
+	if agent.Status != StatusSuccess {
+		t.Fatalf("status after same-correlation success activity = %v, want StatusSuccess", agent.Status)
+	}
+	if agent.TaskSummary != "Search task completed" {
+		t.Fatalf("task summary after same-correlation success activity = %q, want %q", agent.TaskSummary, "Search task completed")
+	}
+}
+
+func TestModel_ActiveActivityIgnoredAfterTerminalForSameCorrelation(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "guardian", "guardian")
+
+	const corrID = "corr_guardian_fetch_approval"
+
+	_, _ = model.Update(msg.StreamStartMsg{
+		AgentID:       "guardian",
+		AgentType:     "guardian",
+		AgentName:     "Guardian",
+		CorrelationID: corrID,
+	})
+	_, _ = model.Update(msg.StreamCompleteMsg{
+		AgentID:       "guardian",
+		AgentType:     "guardian",
+		AgentName:     "Guardian",
+		CorrelationID: corrID,
+	})
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:            "evt_guardian_fetch_allowed",
+			EventType:     events.EventTypeSuccess,
+			Timestamp:     time.Now(),
+			AgentID:       "guardian",
+			CorrelationID: corrID,
+			Content:       "Fetch approval allowed",
+			Data: map[string]any{
+				"agent_name": "Guardian",
+				"agent_type": "guardian",
+			},
+		},
+	})
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:            "evt_guardian_fetch_validating_late",
+			EventType:     events.EventTypeAgentAction,
+			Timestamp:     time.Now(),
+			AgentID:       "guardian",
+			CorrelationID: corrID,
+			Content:       "Validating fetch approval request",
+			Data: map[string]any{
+				"agent_name": "Guardian",
+				"agent_type": "guardian",
+			},
+		},
+	})
+
+	agent := model.agents["guardian"]
+	if agent == nil {
+		t.Fatal("expected guardian row")
+	}
+	if agent.Status != StatusSuccess {
+		t.Fatalf("status after stale same-correlation agent action = %v, want StatusSuccess", agent.Status)
+	}
+	if agent.ActivityState != events.AgentUIStateAllowed {
+		t.Fatalf("activity state after stale same-correlation agent action = %v, want %v", agent.ActivityState, events.AgentUIStateAllowed)
+	}
+	if agent.TaskSummary != "Fetch approval allowed" {
+		t.Fatalf("task summary after stale same-correlation agent action = %q, want %q", agent.TaskSummary, "Fetch approval allowed")
+	}
+}
+
+func TestModel_LibrarianConsultRequestJSONDoesNotRenderRawBlob(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "librarian", "librarian")
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_librarian_consult_json",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "librarian",
+			Content:   "Processing search request",
+			Data: map[string]any{
+				"agent_name": "Librarian",
+				"agent_type": "librarian",
+				"request":    `{"query":"find prior auth middleware patterns","limit":5}`,
+			},
+		},
+	})
+
+	agent := model.agents["librarian"]
+	if agent == nil {
+		t.Fatal("expected librarian row")
+	}
+	if agent.TaskSummary != "find prior auth middleware patterns" {
+		t.Fatalf("task summary = %q, want %q", agent.TaskSummary, "find prior auth middleware patterns")
+	}
+}
+
 func TestModel_HasActiveAgent(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)
@@ -2224,6 +2946,252 @@ func TestModel_GenericActivityDoesNotOverrideContextUsage(t *testing.T) {
 
 	if agent.ContextUsage != 0.18 {
 		t.Fatalf("context usage after generic activity = %.2f, want unchanged 0.18", agent.ContextUsage)
+	}
+}
+
+func TestModel_StreamStartSetsRespondingActivityState(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SeedAgent("guide", "guide", "Guide", nil, "", "")
+
+	_, _ = model.Update(msg.StreamStartMsg{
+		AgentID:    "guide",
+		AgentType:  "guide",
+		AgentName:  "Guide",
+		SessionID:  "sess-1",
+		TaskID:     "",
+		PipelineID: "",
+	})
+
+	agent := model.agents["guide"]
+	if agent == nil {
+		t.Fatal("expected guide agent")
+	}
+	if agent.Status != StatusActing {
+		t.Fatalf("status = %v, want StatusActing", agent.Status)
+	}
+	if agent.ActivityState != events.AgentUIStateResponding {
+		t.Fatalf("activity state = %q, want %q", agent.ActivityState, events.AgentUIStateResponding)
+	}
+}
+
+func TestModel_StreamProgressAllowsEmptyMessageForExplicitUIState(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SeedAgent("guide", "guide", "Guide", nil, "", "")
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "guide",
+		AgentType:  "guide",
+		UIState:    events.AgentUIStateRouting,
+		Visibility: events.VisibilityUser,
+	})
+
+	agent := model.agents["guide"]
+	if agent == nil {
+		t.Fatal("expected guide agent")
+	}
+	if agent.Status != StatusThinking {
+		t.Fatalf("status = %v, want StatusThinking", agent.Status)
+	}
+	if agent.ActivityState != events.AgentUIStateRouting {
+		t.Fatalf("activity state = %q, want %q", agent.ActivityState, events.AgentUIStateRouting)
+	}
+}
+
+func TestModel_StreamProgressPromotesKnowledgeAgentFromRuntimeID(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SeedAgent("academic", "academic", "Academic", nil, "", "")
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "academic-runtime-1",
+		AgentType:  "academic",
+		AgentName:  "Academic",
+		Message:    "Consulting Librarian about packaging guidance.",
+		Visibility: events.VisibilityUser,
+	})
+
+	agent := model.agents["academic-runtime-1"]
+	if agent == nil {
+		t.Fatal("expected promoted academic agent row")
+	}
+	if _, ok := model.agents["academic"]; ok {
+		t.Fatal("expected placeholder academic row to be promoted away")
+	}
+	if agent.Status != StatusThinking {
+		t.Fatalf("status = %v, want StatusThinking", agent.Status)
+	}
+	if agent.AgentType != "academic" {
+		t.Fatalf("agent type = %q, want academic", agent.AgentType)
+	}
+	if agent.ActivityState != events.AgentUIStateSearching {
+		t.Fatalf("activity state = %q, want %q", agent.ActivityState, events.AgentUIStateSearching)
+	}
+	if agent.TaskSummary != "Consulting Librarian about packaging guidance." {
+		t.Fatalf("task summary = %q, want progress summary", agent.TaskSummary)
+	}
+}
+
+func TestModel_ToolCallEventPromotesKnowledgeAgentFromRuntimeID(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SeedAgent("librarian", "librarian", "Librarian", nil, "", "")
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:     "librarian-runtime-1",
+		AgentType:   "librarian",
+		AgentName:   "Librarian",
+		Phase:       0,
+		ToolName:    "read_file",
+		ArgsSummary: "path=./pyproject.toml",
+	})
+
+	agent := model.agents["librarian-runtime-1"]
+	if agent == nil {
+		t.Fatal("expected promoted librarian agent row")
+	}
+	if _, ok := model.agents["librarian"]; ok {
+		t.Fatal("expected placeholder librarian row to be promoted away")
+	}
+	if agent.Status != StatusActing {
+		t.Fatalf("status = %v, want StatusActing", agent.Status)
+	}
+	if agent.AgentType != "librarian" {
+		t.Fatalf("agent type = %q, want librarian", agent.AgentType)
+	}
+	if agent.TaskSummary == "" {
+		t.Fatal("expected tool summary to be populated")
+	}
+}
+
+func TestModel_ToolCallEventTesterTransitions(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SeedAgent("tester", "tester", "Tester", nil, "", "")
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:     "tester",
+		Phase:       0,
+		ToolName:    "go_test",
+		ArgsSummary: "./...",
+	})
+
+	agent := model.agents["tester"]
+	if agent == nil {
+		t.Fatal("expected tester agent")
+	}
+	if agent.Status != StatusActing {
+		t.Fatalf("status after tool start = %v, want StatusActing", agent.Status)
+	}
+	if agent.ActivityState != events.AgentUIStateTestingRunning {
+		t.Fatalf("activity state after tool start = %q, want %q", agent.ActivityState, events.AgentUIStateTestingRunning)
+	}
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:   "tester",
+		Phase:     1,
+		ToolName:  "go_test",
+		Success:   true,
+		Output:    "ok",
+		StartedAt: time.Now(),
+	})
+
+	if agent.Status != StatusThinking {
+		t.Fatalf("status after tool success = %v, want StatusThinking", agent.Status)
+	}
+	if agent.ActivityState != events.AgentUIStateTestingPending {
+		t.Fatalf("activity state after tool success = %q, want %q", agent.ActivityState, events.AgentUIStateTestingPending)
+	}
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:   "tester",
+		Phase:     1,
+		ToolName:  "go_test",
+		Success:   false,
+		ErrorMsg:  "tests failed",
+		StartedAt: time.Now(),
+	})
+
+	if agent.Status != StatusError {
+		t.Fatalf("status after tool failure = %v, want StatusError", agent.Status)
+	}
+	if agent.ActivityState != events.AgentUIStateTestingFailed {
+		t.Fatalf("activity state after tool failure = %q, want %q", agent.ActivityState, events.AgentUIStateTestingFailed)
+	}
+}
+
+func TestModel_TesterNonTestToolStartStaysPending(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SeedAgent("tester", "tester", "Tester", nil, "", "")
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:     "tester",
+		Phase:       0,
+		ToolName:    "read_file",
+		ArgsSummary: "path=./foo_test.go",
+	})
+
+	agent := model.agents["tester"]
+	if agent == nil {
+		t.Fatal("expected tester agent")
+	}
+	if agent.ActivityState != events.AgentUIStateTestingPending {
+		t.Fatalf("activity state after non-test tool start = %q, want %q", agent.ActivityState, events.AgentUIStateTestingPending)
+	}
+}
+
+func TestModel_TesterProgressDefaultsToPending(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SeedAgent("tester", "tester", "Tester", nil, "", "")
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "tester",
+		AgentType:  "tester",
+		Message:    "Translating task into executable tests.",
+		Visibility: events.VisibilityUser,
+	})
+
+	agent := model.agents["tester"]
+	if agent == nil {
+		t.Fatal("expected tester agent")
+	}
+	if agent.ActivityState != events.AgentUIStateTestingPending {
+		t.Fatalf("activity state after tester progress = %q, want %q", agent.ActivityState, events.AgentUIStateTestingPending)
+	}
+}
+
+func TestRenderCard_UsesNerdFontActivityIcons(t *testing.T) {
+	th := theme.DefaultDark()
+	agent := AgentState{
+		ID:            "architect",
+		Name:          "Architect",
+		AgentType:     "architect",
+		Status:        StatusThinking,
+		ActivityState: events.AgentUIStateThinking,
+	}
+
+	card := RenderCard(agent, 60, th, false, false, "", AnimState{NerdFonts: true})
+	if !strings.Contains(card, "󰧑") {
+		t.Fatalf("card = %q, want nerd-font thinking icon", card)
+	}
+}
+
+func TestRenderCard_GuideClassifyingAnimationSequence(t *testing.T) {
+	th := theme.DefaultDark()
+	agent := AgentState{
+		ID:            "guide",
+		Name:          "Guide",
+		AgentType:     "guide",
+		Status:        StatusThinking,
+		ActivityState: events.AgentUIStateClassifying,
+	}
+
+	wants := []string{"󰵌", "󰵕", "󰵑"}
+	for frame, want := range wants {
+		card := RenderCard(agent, 60, th, false, false, "", AnimState{
+			NerdFonts: true,
+			DotFrame:  frame,
+			HasActive: true,
+		})
+		if !strings.Contains(card, want) {
+			t.Fatalf("frame %d card = %q, want icon %q", frame, card, want)
+		}
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 // ---------------------------------------------------------------------------
@@ -46,11 +47,12 @@ func readFileSkill(a *Architect) *skills.Skill {
 			if strings.TrimSpace(params.Path) == "" {
 				return nil, fmt.Errorf("path is required")
 			}
-			content, err := os.ReadFile(resolveArchitectPath(a.config.WorkingDirectory, params.Path))
+			fa := versioning.NewDiskFileAccess(a.config.WorkingDirectory, true)
+			result, err := versioning.ReadFileToolResult(ctx, fa, params.Path, params.Offset, params.Limit)
 			if err != nil {
 				return nil, err
 			}
-			return sliceFileContent(params.Path, string(content), params.Offset, params.Limit), nil
+			return result, nil
 		}).
 		Build()
 }

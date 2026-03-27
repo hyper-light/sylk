@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/core/knowledge/coldstart"
 	"github.com/adalundhe/sylk/core/knowledge/memory"
 	"github.com/adalundhe/sylk/core/knowledge/query"
+	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -250,16 +252,71 @@ func (a *Archivalist) knowledgeSearch(
 	applyMemory *bool,
 	filterRetrieval bool,
 ) (any, error) {
-	if a.queryCoordinator == nil {
+	snapshot := a.snapshotRecallKnowledge()
+	if snapshot.coord == nil && snapshot.backend == nil {
 		return nil, errQuerySubsystemUnavailable
 	}
-	hq := buildHybridQuery(text, domainStr, limit)
-	execResult, err := a.queryCoordinator.ExecuteWithMetrics(ctx, hq)
+	limit = clampLimit(limit, 10, 50)
+
+	var merged []map[string]any
+	indexByID := make(map[string]int)
+	metrics := map[string]any{}
+
+	if backend := snapshot.backend; backend != nil && strings.TrimSpace(text) != "" {
+		searchResult, err := backend.Search(ctx, &search.SearchRequest{
+			Query: text,
+			Limit: limit,
+		})
+		if err == nil {
+			metrics["head_version"] = searchResult.HeadVersion
+			metrics["total_hits"] = searchResult.TotalHits
+			metrics["search_time"] = searchResult.SearchTime.String()
+			for _, hit := range searchResult.Hits {
+				entry := map[string]any{
+					"id":              hit.ID,
+					"path":            hit.Path,
+					"content":         hit.Content,
+					"score":           hit.Score,
+					"document_type":   hit.Document.Type,
+					"primary_node_id": hit.PrimaryNodeID,
+					"primary_type":    hit.PrimaryNodeType,
+					"domain":          hit.Domain,
+					"symbols":         hit.Symbols,
+					"related_paths":   hit.RelatedPaths,
+					"related_symbols": hit.RelatedSymbols,
+					"source":          "committed_knowledge",
+				}
+				indexByID[hit.ID] = len(merged)
+				merged = append(merged, entry)
+			}
+		}
+	}
+	if snapshot.coord == nil {
+		return map[string]any{
+			"results": merged,
+			"metrics": metrics,
+		}, nil
+	}
+
+	hq, err := buildHybridQueryWithSemantic(ctx, snapshot.embedder, text, domainStr, limit)
 	if err != nil {
+		return nil, fmt.Errorf("build hybrid query: %w", err)
+	}
+	execResult, err := snapshot.coord.ExecuteWithMetrics(ctx, hq)
+	if err != nil && len(merged) == 0 {
 		return nil, fmt.Errorf("execute query: %w", err)
+	}
+	if execResult == nil {
+		return map[string]any{
+			"results": merged,
+			"metrics": metrics,
+		}, nil
 	}
 
 	results := execResult.Results
+	if execResult.Metrics != nil {
+		metrics["hybrid_metrics"] = execResult.Metrics
+	}
 
 	shouldApplyMemory := a.hybridMemory != nil
 	if applyMemory != nil {
@@ -276,9 +333,41 @@ func (a *Archivalist) knowledgeSearch(
 		}
 	}
 
+	for _, r := range results {
+		if idx, ok := indexByID[r.ID]; ok {
+			entry := merged[idx]
+			entry["score"] = maxFloat(anyFloat(entry["score"]), r.Score)
+			entry["hybrid_score"] = r.Score
+			entry["hybrid_source"] = r.Source.String()
+			entry["text_score"] = r.TextScore
+			entry["semantic_score"] = r.SemanticScore
+			entry["graph_score"] = r.GraphScore
+			entry["source"] = "committed_knowledge+hybrid"
+			continue
+		}
+		if strings.TrimSpace(r.Content) == "" {
+			continue
+		}
+		entry := map[string]any{
+			"id":             r.ID,
+			"content":        r.Content,
+			"score":          r.Score,
+			"source":         r.Source.String(),
+			"text_score":     r.TextScore,
+			"semantic_score": r.SemanticScore,
+			"graph_score":    r.GraphScore,
+		}
+		indexByID[r.ID] = len(merged)
+		merged = append(merged, entry)
+	}
+
+	sort.SliceStable(merged, func(i, j int) bool {
+		return anyFloat(merged[i]["score"]) > anyFloat(merged[j]["score"])
+	})
+
 	return map[string]any{
-		"results": results,
-		"metrics": execResult.Metrics,
+		"results": merged,
+		"metrics": metrics,
 	}, nil
 }
 
@@ -520,4 +609,19 @@ func clampLimit(v, defaultVal, maxVal int) int {
 		return maxVal
 	}
 	return v
+}
+
+func anyFloat(value any) float64 {
+	switch v := value.(type) {
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	default:
+		return 0
+	}
 }

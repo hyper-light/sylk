@@ -812,6 +812,160 @@ func TestTaskRouter_PublishUserVisibleRoute_MirrorsGlobalFollowupToTUI(t *testin
 	}
 }
 
+func TestTaskRouter_PublishUserVisibleRoute_QueuesOTFollowupsPerReviewer(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+
+	reqCh := make(chan *guide.RouteRequest, 4)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.Metadata["ot_handoff_followup"] != true {
+			return nil
+		}
+		reqCh <- req
+		return nil
+	})
+	require.NoError(t, err)
+	defer reqSub.Unsubscribe()
+
+	req1 := &guide.RouteRequest{
+		CorrelationID:   "ot_followup_a",
+		Input:           "Audit pipeline A.",
+		TargetAgentID:   "inspector",
+		ExplicitTarget:  true,
+		SourceAgentID:   "orchestrator",
+		SourceAgentName: "orchestrator",
+		SessionID:       "test-session",
+		Timestamp:       time.Date(2026, 3, 25, 15, 0, 0, 0, time.UTC),
+		Metadata: map[string]any{
+			"agent_type":          "inspector",
+			"task_id":             "task-a",
+			"ot_handoff_followup": true,
+		},
+	}
+	req2 := &guide.RouteRequest{
+		CorrelationID:   "ot_followup_b",
+		Input:           "Audit pipeline B.",
+		TargetAgentID:   "inspector",
+		ExplicitTarget:  true,
+		SourceAgentID:   "orchestrator",
+		SourceAgentName: "orchestrator",
+		SessionID:       "test-session",
+		Timestamp:       time.Date(2026, 3, 25, 15, 0, 1, 0, time.UTC),
+		Metadata: map[string]any{
+			"agent_type":          "inspector",
+			"task_id":             "task-b",
+			"ot_handoff_followup": true,
+		},
+	}
+
+	require.NoError(t, router.PublishUserVisibleRoute(req1))
+	require.NoError(t, router.PublishUserVisibleRoute(req2))
+
+	select {
+	case published := <-reqCh:
+		require.NotNil(t, published)
+		assert.Equal(t, req1.CorrelationID, published.CorrelationID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected first OT follow-up request to publish immediately")
+	}
+
+	select {
+	case published := <-reqCh:
+		t.Fatalf("queued OT follow-up published too early: %s", published.CorrelationID)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	resp1 := guide.NewResponseMessage("", &guide.RouteResponse{
+		CorrelationID:       req1.CorrelationID,
+		Success:             true,
+		RespondingAgentID:   "inspector",
+		RespondingAgentName: "Inspector",
+		Data:                "audit A complete",
+	})
+	resp1.CorrelationID = req1.CorrelationID
+	require.True(t, router.DeliverResponse(resp1))
+
+	select {
+	case published := <-reqCh:
+		require.NotNil(t, published)
+		assert.Equal(t, req2.CorrelationID, published.CorrelationID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected second OT follow-up request after first terminal response")
+	}
+}
+
+func TestTaskRouter_PublishUserVisibleRoute_OTFollowupsQueuePerTarget(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+
+	reqCh := make(chan *guide.RouteRequest, 4)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.Metadata["ot_handoff_followup"] != true {
+			return nil
+		}
+		reqCh <- req
+		return nil
+	})
+	require.NoError(t, err)
+	defer reqSub.Unsubscribe()
+
+	reqInspector := &guide.RouteRequest{
+		CorrelationID:   "ot_followup_inspector",
+		Input:           "Audit inspector queue.",
+		TargetAgentID:   "inspector",
+		ExplicitTarget:  true,
+		SourceAgentID:   "orchestrator",
+		SourceAgentName: "orchestrator",
+		SessionID:       "test-session",
+		Timestamp:       time.Date(2026, 3, 25, 15, 1, 0, 0, time.UTC),
+		Metadata: map[string]any{
+			"agent_type":          "inspector",
+			"task_id":             "task-i",
+			"ot_handoff_followup": true,
+		},
+	}
+	reqTester := &guide.RouteRequest{
+		CorrelationID:   "ot_followup_tester",
+		Input:           "Audit tester queue.",
+		TargetAgentID:   "tester",
+		ExplicitTarget:  true,
+		SourceAgentID:   "orchestrator",
+		SourceAgentName: "orchestrator",
+		SessionID:       "test-session",
+		Timestamp:       time.Date(2026, 3, 25, 15, 1, 1, 0, time.UTC),
+		Metadata: map[string]any{
+			"agent_type":          "tester",
+			"task_id":             "task-t",
+			"ot_handoff_followup": true,
+		},
+	}
+
+	require.NoError(t, router.PublishUserVisibleRoute(reqInspector))
+	require.NoError(t, router.PublishUserVisibleRoute(reqTester))
+
+	got := map[string]bool{}
+	timeout := time.After(2 * time.Second)
+	for len(got) < 2 {
+		select {
+		case published := <-reqCh:
+			got[published.CorrelationID] = true
+		case <-timeout:
+			t.Fatalf("timed out waiting for both reviewer queues to publish, got=%v", got)
+		}
+	}
+
+	assert.True(t, got[reqInspector.CorrelationID])
+	assert.True(t, got[reqTester.CorrelationID])
+}
+
 func TestTaskRouter_DeliverResponse_ConsumesUntrackedProtocolTerminal(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()

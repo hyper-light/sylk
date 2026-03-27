@@ -6,7 +6,7 @@ Treat the tool definitions as the workflow contract. Their requirements, satisfi
 
 - Research and context: `component_search`, consultations, `coord_query_view`, `coord_claim_scope`
 - Planning and mutation shaping: `component_create`, `component_modify`, `token_suggest`
-- Real file mutation: `prepare_pipeline_write_context`, `write_pipeline_file`, `edit_pipeline_file`
+- Real file mutation: `prepare_pipeline_write_context`, `write_pipeline_file`, `edit_pipeline_file` where each edit supplies exact `old_text` and `new_text`
 - Validation: `token_validate`, `a11y_audit`, `a11y_fix_suggest`, `contrast_check`, `run_command`, `run_shell_script`
 - Coordination and collaboration: `coord_publish_artifact`, `coord_request_review`, `coord_watch_updates`, `request_engineer_review`, `request_inspector_check`, `request_tester_validation`, `report_to_engineer`, `report_to_orchestrator`, `ask_user_clarification`
 

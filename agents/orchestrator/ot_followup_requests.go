@@ -130,8 +130,8 @@ func (o *Orchestrator) buildOTGlobalFollowupRequest(
 		SourceAgentID:   o.config.AgentID,
 		SourceAgentName: "orchestrator",
 		FireAndForget:   false,
-		SessionID:       firstNonEmpty(strings.TrimSpace(task.SessionID), o.config.SessionID, orchestratorStateSessionID(o)),
-		Timestamp:       time.Now().UTC(),
+		SessionID:       firstNonEmpty(strings.TrimSpace(task.SessionID), strings.TrimSpace(stringMapValue(task.Metadata, "session_id")), o.SessionID()),
+		Timestamp:       otGlobalFollowupTimestamp(update),
 		Metadata:        metadata,
 	}
 }
@@ -217,6 +217,7 @@ func otGlobalFollowupPrompt(
 		}
 		lines = append(lines,
 			"If the architect plan or criteria context appears incomplete, immediately call `load_plan_context` using the provided plan metadata before concluding.",
+			"This follow-up is scoped to the just-accepted pipeline only. Do not branch into other completed pipelines in this turn; additional completed pipelines, if any, will arrive as separate follow-ups in merge receipt order.",
 			"Consult `consult_librarian_style` to verify codebase style, naming, layering, and established local patterns.",
 			"Consult `consult_academic_approach` to challenge the current implementation and architect approach against stronger or more elegant alternatives.",
 			"Consult `consult_archivalist_context` to check past failure modes, preserved user preferences, and earlier remediation history before signing off.",
@@ -284,24 +285,19 @@ func otGlobalFollowupStageLines(progress globalReviewProgress) []string {
 	if progress.TotalTasks > 0 {
 		lines = append(lines, fmt.Sprintf("Workflow progress: %d/%d tasks completed, %d failed, %d remaining.", progress.CompletedTasks, progress.TotalTasks, progress.FailedTasks, progress.RemainingTasks))
 	}
-	if len(progress.CompletedTaskIDs) > 0 {
-		lines = append(lines, "Completed task IDs:")
-		for _, taskID := range progress.CompletedTaskIDs {
-			lines = append(lines, "- "+taskID)
-		}
-	}
-	if len(progress.RemainingTaskIDs) > 0 {
-		lines = append(lines, "Remaining task IDs:")
-		for _, taskID := range progress.RemainingTaskIDs {
-			lines = append(lines, "- "+taskID)
-		}
-	}
 	if progress.Stage == globalReviewStageFinal {
 		lines = append(lines, "This is the final whole-plan review. Missing planned work is a defect unless the plan was explicitly revised.")
 	} else {
 		lines = append(lines, "This is a progressive checkpoint review. Future planned work that has not been merged yet is pending, not missing. Judge whether the current merged state is correct, robust, stylistically sound, and on track for the remaining plan.")
 	}
 	return lines
+}
+
+func otGlobalFollowupTimestamp(update *PipelineUpdate) time.Time {
+	if update != nil && !update.Timestamp.IsZero() {
+		return update.Timestamp.UTC()
+	}
+	return time.Now().UTC()
 }
 
 func (o *Orchestrator) globalReviewProgress(task *TaskRecord) globalReviewProgress {

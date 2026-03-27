@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/commandapproval"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -37,6 +39,9 @@ func (g *Guardian) evaluateCommandApproval(ctx context.Context, req *commandappr
 	if req == nil {
 		return commandapproval.Evaluation{}, fmt.Errorf("command approval request is required")
 	}
+	if commandapproval.IsFetchToolName(req.ToolName) {
+		return g.evaluateFetchApproval(ctx, req)
+	}
 	evaluator := commandapproval.NewEvaluator(g.commandRules)
 	eval, err := evaluator.Evaluate(*req)
 	if err != nil {
@@ -44,11 +49,14 @@ func (g *Guardian) evaluateCommandApproval(ctx context.Context, req *commandappr
 	}
 	switch eval.Decision {
 	case commandapproval.DecisionAllow:
+		g.publishActivityState(ctx, events.EventTypeSuccess, "Command approval allowed", events.AgentUIStateAllowed)
 		return eval, nil
 	case commandapproval.DecisionDeny:
+		g.publishActivityState(ctx, events.EventTypeAgentError, "Command approval blocked", events.AgentUIStateBlocked)
 		return eval, nil
 	default:
 	}
+	g.publishActivityState(ctx, events.EventTypeAgentAction, "Validating command approval request", events.AgentUIStateValidating)
 
 	result, err := g.requestCommandApproval(ctx, g.commandApprovalProposal(*req, eval.Analysis))
 	if err != nil {
@@ -73,12 +81,16 @@ func (g *Guardian) evaluateCommandApproval(ctx context.Context, req *commandappr
 	if !result.Approved {
 		eval.Decision = commandapproval.DecisionDeny
 		eval.Source = commandapproval.MatchSourceInteractive
+		eval.UserDecision = string(result.Decision)
 		eval.Reason = firstNonEmptyApprovalReason(result.Reason, "command approval denied") + persistNote
+		g.publishActivityState(ctx, events.EventTypeAgentError, "Command approval blocked", events.AgentUIStateBlocked)
 		return eval, nil
 	}
 	eval.Decision = commandapproval.DecisionAllow
 	eval.Source = commandapproval.MatchSourceInteractive
+	eval.UserDecision = string(result.Decision)
 	eval.Reason = firstNonEmptyApprovalReason(result.Reason, "command approved by user") + persistNote
+	g.publishActivityState(ctx, events.EventTypeSuccess, "Command approval allowed", events.AgentUIStateAllowed)
 	return eval, nil
 }
 
@@ -93,6 +105,8 @@ func (g *Guardian) commandApprovalProposal(req commandapproval.Request, analysis
 		PipelineID:     req.PipelineID,
 		ToolName:       req.ToolName,
 		Command:        req.Command,
+		Domain:         req.Domain,
+		Justification:  req.Justification,
 		WorkingDir:     req.WorkingDir,
 		WorkspaceRoot:  req.WorkspaceRoot,
 		TemplateKey:    analysis.TemplateKey,
@@ -106,6 +120,137 @@ func (g *Guardian) commandApprovalProposal(req commandapproval.Request, analysis
 	}
 }
 
+func (g *Guardian) evaluateFetchApproval(ctx context.Context, req *commandapproval.Request) (commandapproval.Evaluation, error) {
+	if req == nil {
+		return commandapproval.Evaluation{}, fmt.Errorf("fetch approval request is required")
+	}
+	fetchURL := strings.TrimSpace(req.Command)
+	if fetchURL == "" {
+		return commandapproval.Evaluation{}, fmt.Errorf("fetch approval URL is required")
+	}
+	domain := normalizeFetchApprovalDomain(req.Domain, fetchURL)
+	if domain == "" {
+		return commandapproval.Evaluation{}, fmt.Errorf("fetch approval domain is required")
+	}
+
+	analysis := fetchApprovalAnalysis(fetchURL, domain, req)
+
+	if rule, ok := g.commandRules.Lookup(analysis.PersistKey); ok {
+		switch rule.Action {
+		case commandapproval.RuleActionAllow:
+			g.publishActivityState(ctx, events.EventTypeSuccess, "Fetch approval allowed", events.AgentUIStateAllowed)
+			return commandapproval.Evaluation{
+				Decision: commandapproval.DecisionAllow,
+				Source:   commandapproval.MatchSourceStoredAllow,
+				Reason:   firstNonEmptyApprovalReason(rule.Summary, "fetch allowed by saved approval rule"),
+				Analysis: analysis,
+				Rule:     &rule,
+			}, nil
+		case commandapproval.RuleActionDeny:
+			g.publishActivityState(ctx, events.EventTypeAgentError, "Fetch approval blocked", events.AgentUIStateBlocked)
+			return commandapproval.Evaluation{
+				Decision: commandapproval.DecisionDeny,
+				Source:   commandapproval.MatchSourceStoredDeny,
+				Reason:   firstNonEmptyApprovalReason(rule.Summary, "fetch denied by saved approval rule"),
+				Analysis: analysis,
+				Rule:     &rule,
+			}, nil
+		}
+	}
+	g.publishActivityState(ctx, events.EventTypeAgentAction, "Validating fetch approval request", events.AgentUIStateValidating)
+
+	result, err := g.requestCommandApproval(ctx, g.commandApprovalProposal(commandapproval.Request{
+		Command:       fetchURL,
+		ToolName:      firstNonEmptyApprovalValue(strings.TrimSpace(req.ToolName), "web_fetch"),
+		Domain:        domain,
+		Justification: strings.TrimSpace(req.Justification),
+		AgentID:       req.AgentID,
+		AgentType:     req.AgentType,
+		SessionID:     req.SessionID,
+		DAGID:         req.DAGID,
+		NodeID:        req.NodeID,
+		TaskID:        req.TaskID,
+		PipelineID:    req.PipelineID,
+	}, analysis))
+	if err != nil {
+		return commandapproval.Evaluation{}, err
+	}
+
+	persistNote := ""
+	if result.Decision == ApprovalAllowAlways || result.Decision == ApprovalDenyAlways {
+		action := commandapproval.RuleActionAllow
+		if result.Decision == ApprovalDenyAlways {
+			action = commandapproval.RuleActionDeny
+		}
+		if recordErr := g.commandRules.Record(commandapproval.Rule{
+			MatchKey:  analysis.PersistKey,
+			Action:    action,
+			RuleLabel: analysis.PersistLabel,
+			Summary:   analysis.Summary,
+			CreatedAt: time.Now().UTC(),
+		}); recordErr != nil {
+			persistNote = " Rule persistence failed: " + recordErr.Error()
+		}
+	}
+	if !result.Approved {
+		g.publishActivityState(ctx, events.EventTypeAgentError, "Fetch approval blocked", events.AgentUIStateBlocked)
+		return commandapproval.Evaluation{
+			Decision:     commandapproval.DecisionDeny,
+			Source:       commandapproval.MatchSourceInteractive,
+			Reason:       firstNonEmptyApprovalReason(result.Reason, "fetch approval denied") + persistNote,
+			UserDecision: string(result.Decision),
+			Analysis:     analysis,
+		}, nil
+	}
+
+	g.publishActivityState(ctx, events.EventTypeSuccess, "Fetch approval allowed", events.AgentUIStateAllowed)
+	return commandapproval.Evaluation{
+		Decision:     commandapproval.DecisionAllow,
+		Source:       commandapproval.MatchSourceInteractive,
+		Reason:       firstNonEmptyApprovalReason(result.Reason, "fetch approved by user") + persistNote,
+		UserDecision: string(result.Decision),
+		Analysis:     analysis,
+	}, nil
+}
+
+func fetchApprovalAnalysis(fetchURL, domain string, req *commandapproval.Request) commandapproval.Analysis {
+	summary := "Fetch content from " + domain
+	if justification := strings.TrimSpace(req.Justification); justification != "" {
+		summary += " for " + justification
+	}
+	persistKey := "fetch:domain:" + strings.ToLower(domain)
+	persistLabel := "fetch from " + domain
+	if req != nil && req.ApprovalPolicy == commandapproval.ApprovalPolicyExact {
+		persistKey = "fetch:url:" + fetchURL
+		persistLabel = "fetch " + fetchURL
+	}
+	return commandapproval.Analysis{
+		RawCommand:     fetchURL,
+		Normalized:     fetchURL,
+		Program:        "fetch",
+		Verb:           "fetch",
+		TemplateKey:    "fetch|domain=" + domain,
+		ExactKey:       "fetch:url:" + fetchURL,
+		PersistKey:     persistKey,
+		PersistLabel:   persistLabel,
+		RuleLabel:      "external fetch",
+		Summary:        summary,
+		Risk:           "Fetching external content from " + domain + " requires explicit user approval.",
+		ApprovalPolicy: commandapproval.ApprovalPolicyExact,
+	}
+}
+
+func normalizeFetchApprovalDomain(explicitDomain, fetchURL string) string {
+	if trimmed := strings.TrimSpace(explicitDomain); trimmed != "" {
+		return strings.ToLower(trimmed)
+	}
+	parsed, err := url.Parse(strings.TrimSpace(fetchURL))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+}
+
 func (g *Guardian) requestCommandApproval(ctx context.Context, proposal *commandapproval.Proposal) (ApprovalResult, error) {
 	if g == nil || g.bus == nil {
 		return ApprovalResult{}, fmt.Errorf("guardian bus is unavailable for command approval")
@@ -116,23 +261,6 @@ func (g *Guardian) requestCommandApproval(ctx context.Context, proposal *command
 	correlationID := uuid.New().String()
 	proposal.CorrelationID = correlationID
 	proposal.TargetAgentID = g.id
-	holdID, err := g.beginCommandApprovalHold(ctx, proposal)
-	if err != nil {
-		return ApprovalResult{}, err
-	}
-	if holdID != "" {
-		defer func() {
-			resolveCtx, cancel := context.WithTimeout(context.Background(), commandApprovalControlTimeout)
-			defer cancel()
-			if err := g.resolveCommandApprovalHold(resolveCtx, proposal, holdID); err != nil && g.logger != nil {
-				g.logger.Warn("command approval hold resolve failed",
-					"hold_id", holdID,
-					"session_id", proposal.SessionID,
-					"dag_id", proposal.DAGID,
-					"error", err)
-			}
-		}()
-	}
 
 	ch := make(chan ApprovalResult, 1)
 	g.pendingMu.Lock()
@@ -156,13 +284,68 @@ func (g *Guardian) requestCommandApproval(ctx context.Context, proposal *command
 		return ApprovalResult{}, fmt.Errorf("publish command approval proposal: %w", err)
 	}
 
-	var result ApprovalResult
-	select {
-	case result = <-ch:
-		return result, nil
-	case <-ctx.Done():
-		return ApprovalResult{}, ctx.Err()
+	holdCh := g.beginCommandApprovalHoldAsync(ctx, proposal)
+	var (
+		result      ApprovalResult
+		resultReady bool
+		hold        approvalHoldOutcome
+		holdReady   = holdCh == nil
+	)
+
+	for !resultReady || !holdReady {
+		select {
+		case result = <-ch:
+			resultReady = true
+		case hold = <-holdCh:
+			holdReady = true
+			holdCh = nil
+		case <-ctx.Done():
+			return ApprovalResult{}, ctx.Err()
+		}
 	}
+
+	if hold.err != nil {
+		return ApprovalResult{}, hold.err
+	}
+	if hold.holdID != "" {
+		defer func() {
+			resolveCtx, cancel := context.WithTimeout(context.Background(), commandApprovalControlTimeout)
+			defer cancel()
+			if err := g.resolveCommandApprovalHold(resolveCtx, proposal, hold.holdID); err != nil && g.logger != nil {
+				g.logger.Warn("command approval hold resolve failed",
+					"hold_id", hold.holdID,
+					"session_id", proposal.SessionID,
+					"dag_id", proposal.DAGID,
+					"error", err)
+			}
+		}()
+	}
+	return result, nil
+}
+
+type approvalHoldOutcome struct {
+	holdID string
+	err    error
+}
+
+func (g *Guardian) beginCommandApprovalHoldAsync(
+	ctx context.Context,
+	proposal *commandapproval.Proposal,
+) <-chan approvalHoldOutcome {
+	if proposal == nil {
+		return nil
+	}
+	sessionID := strings.TrimSpace(proposal.SessionID)
+	dagID := strings.TrimSpace(proposal.DAGID)
+	if sessionID == "" || dagID == "" {
+		return nil
+	}
+	ch := make(chan approvalHoldOutcome, 1)
+	go func() {
+		holdID, err := g.beginCommandApprovalHold(ctx, proposal)
+		ch <- approvalHoldOutcome{holdID: holdID, err: err}
+	}()
+	return ch
 }
 
 func firstNonEmptyApprovalReason(values ...string) string {
@@ -272,6 +455,10 @@ func (g *Guardian) requestCommandApprovalHold(ctx context.Context, req *shared.C
 	if err != nil {
 		return nil, fmt.Errorf("encode command approval hold request: %w", err)
 	}
+	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(ctx, "orchestrator", payload, map[string]any{
+		"control_plane_kind": shared.ControlPlaneKindCommandApprovalHold,
+		"summary":            req.Command,
+	})
 	routeReq := &guide.RouteRequest{
 		CorrelationID:   correlationID,
 		Input:           string(payload),
@@ -281,11 +468,18 @@ func (g *Guardian) requestCommandApprovalHold(ctx context.Context, req *shared.C
 		ExplicitTarget:  true,
 		SessionID:       strings.TrimSpace(req.SessionID),
 		Timestamp:       time.Now(),
-		Metadata: map[string]any{
+		Metadata: branch.ApplyMetadata(branchCtx, map[string]any{
 			"control_plane_kind": shared.ControlPlaneKindCommandApprovalHold,
-		},
+		}),
 	}
+	if routeReq.ParentCorrelationID == "" {
+		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+			routeReq.ParentCorrelationID = stream.CorrelationID
+		}
+	}
+	routeReq.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, routeReq.Metadata)
 	if err := g.bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage("", routeReq)); err != nil {
+		branch.Complete(branchCtx, "", "", err)
 		return nil, fmt.Errorf("publish command approval hold request: %w", err)
 	}
 
@@ -298,8 +492,10 @@ func (g *Guardian) requestCommandApprovalHold(ctx context.Context, req *shared.C
 
 	select {
 	case msg := <-waitCh:
+		branch.CompleteFromMessage(branchCtx, msg, nil)
 		return decodeCommandApprovalHoldMessage(msg)
 	case <-waitCtx.Done():
+		branch.Complete(branchCtx, "", "", waitCtx.Err())
 		return nil, fmt.Errorf("command approval hold request timed out: %w", waitCtx.Err())
 	}
 }

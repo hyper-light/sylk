@@ -12,6 +12,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/storage"
 	"github.com/google/uuid"
@@ -35,6 +36,9 @@ type authorResearchPaperParams struct {
 	OpenQuestions      []string `json:"open_questions,omitempty"`
 	RelatedTopics      []string `json:"related_topics,omitempty"`
 	ArchitectSummary   string   `json:"architect_summary,omitempty"`
+	ResearchSummary    string   `json:"research_summary,omitempty"`
+	KeyFindings        []string `json:"key_findings,omitempty"`
+	Recommendations    []string `json:"recommendations,omitempty"`
 	HandoffToArchitect bool     `json:"handoff_to_architect,omitempty"`
 	StoreInArchivalist bool     `json:"store_in_archivalist,omitempty"`
 }
@@ -56,6 +60,9 @@ func authorResearchPaperSkill(a *Academic) *skills.Skill {
 		ArrayParam("open_questions", "Unresolved questions to carry into planning", "string", false).
 		ArrayParam("related_topics", "Adjacent topics for future research", "string", false).
 		StringParam("architect_summary", "Optional planning-specific summary override", false).
+		StringParam("research_summary", "Optional grounded synthesis produced during the current research run", false).
+		ArrayParam("key_findings", "Optional grounded key findings gathered during the current research run", "string", false).
+		ArrayParam("recommendations", "Optional explicit recommendations gathered during the current research run", "string", false).
 		BoolParam("handoff_to_architect", "Dispatch the resulting proposal to the Architect", false).
 		BoolParam("store_in_archivalist", "Persist the proposal in the Archivalist", false).
 		Usage("Use when research should end in a reusable architectural proposal artifact rather than a transient answer. This skill writes a versioned markdown research paper under the active Sylk session, can persist it to the Archivalist for later retrieval, and can hand the paper to the Architect as a formal proposal input.").
@@ -85,34 +92,12 @@ func (a *Academic) authorResearchPaper(ctx context.Context, params *authorResear
 		sessionID = "default"
 	}
 
-	queryText := strings.TrimSpace(params.Topic)
-	if contextText := strings.TrimSpace(params.Context); contextText != "" {
-		queryText = fmt.Sprintf("%s\n\nContext:\n%s", queryText, contextText)
-	}
+	ctx = WithAcademicCompletionContract(ctx, academicCompletionContractForResearchPaper(params))
 
-	result, err := a.Research(ctx, &ResearchQuery{
-		Query:     queryText,
-		Intent:    IntentRecall,
-		SessionID: sessionID,
-	})
+	result, librarianEvidence, archivalEvidence, err := a.resolveResearchPaperInputs(ctx, params, sessionID)
 	if err != nil {
 		return nil, err
 	}
-
-	librarianEvidence := a.bestEffortConsultation(
-		ctx,
-		"librarian",
-		fmt.Sprintf("Assess codebase applicability and existing implementation patterns for: %s", params.Topic),
-		params.Context,
-		sessionID,
-	)
-	archivalEvidence := a.bestEffortConsultation(
-		ctx,
-		"archivalist",
-		fmt.Sprintf("Recall prior decisions, issues, and historical constraints relevant to: %s", params.Topic),
-		params.Context,
-		sessionID,
-	)
 
 	paper, err := a.buildResearchPaper(params, result, librarianEvidence, archivalEvidence, sessionID)
 	if err != nil {
@@ -150,6 +135,7 @@ func (a *Academic) authorResearchPaper(ctx context.Context, params *authorResear
 		"version":                 paper.Version,
 		"title":                   paper.Title,
 		"paper_path":              paper.PaperPath,
+		"summary":                 architectPlanningSummary(paper),
 		"stored_in_archivalist":   stored,
 		"handoff_to_architect":    handoffDispatched,
 		"recommended_option_id":   recommendedOptionID(paper),
@@ -158,6 +144,70 @@ func (a *Academic) authorResearchPaper(ctx context.Context, params *authorResear
 		"architect_handoff_ready": paper.ArchitectHandoff != nil,
 		"warnings":                warnings,
 	}, nil
+}
+
+func (a *Academic) resolveResearchPaperInputs(
+	ctx context.Context,
+	params *authorResearchPaperParams,
+	sessionID string,
+) (*ResearchResult, *shared.ConsultationEvidence, *shared.ConsultationEvidence, error) {
+	if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
+		result, err := execState.buildResearchResult(params)
+		if err == nil {
+			academicLogResearchPaperInputMode(ctx, "execution_state")
+			return result, execState.consultationEvidence("librarian"), execState.consultationEvidence("archivalist"), nil
+		}
+	}
+	academicLogResearchPaperInputMode(ctx, "fallback_research")
+
+	queryText := strings.TrimSpace(params.Topic)
+	if contextText := strings.TrimSpace(params.Context); contextText != "" {
+		queryText = fmt.Sprintf("%s\n\nContext:\n%s", queryText, contextText)
+	}
+
+	result, err := a.Research(ctx, &ResearchQuery{
+		Query:     queryText,
+		Intent:    IntentRecall,
+		SessionID: sessionID,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	librarianEvidence := a.bestEffortConsultation(
+		ctx,
+		"librarian",
+		fmt.Sprintf("Assess codebase applicability and existing implementation patterns for: %s", params.Topic),
+		params.Context,
+		sessionID,
+	)
+	archivalEvidence := a.bestEffortConsultation(
+		ctx,
+		"archivalist",
+		fmt.Sprintf("Recall prior decisions, issues, and historical constraints relevant to: %s", params.Topic),
+		params.Context,
+		sessionID,
+	)
+	return result, librarianEvidence, archivalEvidence, nil
+}
+
+func academicLogResearchPaperInputMode(ctx context.Context, mode string) {
+	meta := shared.LogMetaFromContext(ctx)
+	if meta.EventLogger == nil {
+		return
+	}
+	shared.LogAgentEvent(
+		meta.EventLogger,
+		agentlog.EventResearchQuery,
+		meta.AgentID,
+		meta.SessionID,
+		meta.CorrID,
+		"debug",
+		map[string]any{
+			"decision":   "research_paper_input_mode",
+			"input_mode": strings.TrimSpace(mode),
+		},
+	)
 }
 
 func (a *Academic) bestEffortConsultation(
@@ -210,38 +260,37 @@ func (a *Academic) buildResearchPaper(
 	}
 
 	options, rejected, recommendedID := buildOptionMatrix(result)
+	applicability := buildCodebaseApplicability(librarianEvidence)
+	decisionRationale := buildDecisionRationale(result, options, applicability, librarianEvidence, archivalEvidence, recommendedID)
+	prototypeExamples := buildPrototypeExamples(params, result, options, applicability, recommendedID)
+	systemDesignImplications := buildSystemDesignImplications(params, options, applicability, librarianEvidence, archivalEvidence, recommendedID)
 	architectSummary := strings.TrimSpace(params.ArchitectSummary)
-	if architectSummary == "" {
-		architectSummary = firstNonEmpty(
-			consultationSummary(librarianEvidence),
-			summarizeFindings(result.Findings),
-			params.Context,
-			params.Topic,
-		)
-	}
 
 	paper := &AcademicResearchPaper{
-		ID:               uuid.NewString(),
-		Timestamp:        time.Now().UTC(),
-		SessionID:        sessionID,
-		ContextUsage:     0,
-		ResearchSlug:     researchSlug,
-		Version:          version,
-		Title:            researchPaperTitle(params, researchSlug),
-		Abstract:         firstNonEmpty(summarizeFindings(result.Findings), params.Context, params.Topic),
-		ProblemFraming:   firstNonEmpty(strings.TrimSpace(params.Context), params.Topic),
-		Constraints:      toResearchConstraints(params.Constraints),
-		Invariants:       toResearchInvariants(params.Invariants),
-		TopicsResearched: mergeUnique([]string{params.Topic}, params.RelatedTopics),
-		KeyFindings:      append([]Finding(nil), result.Findings...),
-		SourcesCited:     a.collectPaperSources(result),
-		OptionMatrix:     options,
-		RejectedOptions:  rejected,
+		ID:                       uuid.NewString(),
+		Timestamp:                time.Now().UTC(),
+		SessionID:                sessionID,
+		ContextUsage:             0,
+		ResearchSlug:             researchSlug,
+		Version:                  version,
+		Title:                    researchPaperTitle(params, researchSlug),
+		Abstract:                 firstNonEmpty(summarizeFindings(result.Findings), params.Context, params.Topic),
+		ProblemFraming:           firstNonEmpty(strings.TrimSpace(params.Context), params.Topic),
+		Constraints:              toResearchConstraints(params.Constraints),
+		Invariants:               toResearchInvariants(params.Invariants),
+		TopicsResearched:         mergeUnique([]string{params.Topic}, params.RelatedTopics),
+		KeyFindings:              append([]Finding(nil), result.Findings...),
+		SourcesCited:             a.collectPaperSources(result),
+		OptionMatrix:             options,
+		DecisionRationale:        decisionRationale,
+		PrototypeExamples:        prototypeExamples,
+		SystemDesignImplications: systemDesignImplications,
+		RejectedOptions:          rejected,
 		TradeOffs: mergeUnique(
 			extractBullets(consultationSummary(librarianEvidence), 4),
 			extractBullets(consultationSummary(archivalEvidence), 4),
 		),
-		CodebaseApplicability: buildCodebaseApplicability(librarianEvidence),
+		CodebaseApplicability: applicability,
 		Recommendations:       recommendations,
 		MigrationConcerns:     extractBullets(consultationSummary(archivalEvidence), 4),
 		OperationalConcerns:   extractBullets(consultationSummary(librarianEvidence), 4),
@@ -253,14 +302,17 @@ func (a *Academic) buildResearchPaper(
 		ArchitectHandoff: &ArchitectHandoff{
 			PlanningSummary:     architectSummary,
 			RecommendedOptionID: recommendedID,
+			PrototypeSketch:     firstNonEmpty(prototypeExamples...),
+			SystemDesignNotes:   systemDesignImplications,
 			RequiredDecisions:   mergeUnique(params.OpenQuestions, rejected),
 			SuggestedTasks: mergeUnique(
 				recommendations,
-				requiredChanges(buildCodebaseApplicability(librarianEvidence)),
+				requiredChanges(applicability),
 			),
 			AcceptanceSignals: mergeUnique(
 				extractBullets(architectSummary, 3),
 				extractBullets(summarizeFindings(result.Findings), 3),
+				extractBullets(decisionRationale, 3),
 			),
 		},
 	}
@@ -272,7 +324,7 @@ func (a *Academic) buildResearchPaper(
 		paper.Abstract = params.Topic
 	}
 	if paper.ArchitectHandoff != nil && strings.TrimSpace(paper.ArchitectHandoff.PlanningSummary) == "" {
-		paper.ArchitectHandoff.PlanningSummary = paper.Abstract
+		paper.ArchitectHandoff.PlanningSummary = buildArchitectPlanningSummary(paper)
 	}
 
 	return paper, nil
@@ -413,6 +465,9 @@ func renderResearchPaperMarkdown(paper *AcademicResearchPaper) string {
 	writeInvariants(&b, paper.Invariants)
 	writeFindings(&b, paper.KeyFindings)
 	writeOptionMatrix(&b, paper.OptionMatrix)
+	writeSection(&b, "Decision Rationale", paper.DecisionRationale)
+	writeStringListSection(&b, "Prototype / Proof Of Concept", paper.PrototypeExamples)
+	writeStringListSection(&b, "Architecture / System Design Implications", paper.SystemDesignImplications)
 	writeStringListSection(&b, "Rejected Options", paper.RejectedOptions)
 	writeApplicability(&b, paper.CodebaseApplicability)
 	writeStringListSection(&b, "Recommendations", paper.Recommendations)
@@ -569,6 +624,8 @@ func writeArchitectHandoff(b *strings.Builder, handoff *ArchitectHandoff) {
 		return
 	}
 	writeSection(b, "Architect Handoff Summary", handoff.PlanningSummary)
+	writeSection(b, "Prototype Sketch", handoff.PrototypeSketch)
+	writeStringListSection(b, "System Design Notes", handoff.SystemDesignNotes)
 	writeStringListSection(b, "Required Decisions", handoff.RequiredDecisions)
 	writeStringListSection(b, "Suggested Tasks", handoff.SuggestedTasks)
 	writeStringListSection(b, "Acceptance Signals", handoff.AcceptanceSignals)
@@ -579,11 +636,14 @@ func (a *Academic) dispatchResearchPaperToArchitect(ctx context.Context, paper *
 		return fmt.Errorf("research paper is required")
 	}
 	payload := map[string]any{
-		"research_slug": paper.ResearchSlug,
-		"paper_path":    paper.PaperPath,
-		"version":       paper.Version,
-		"summary":       architectPlanningSummary(paper),
-		"session_id":    paper.SessionID,
+		"research_slug":         paper.ResearchSlug,
+		"paper_path":            paper.PaperPath,
+		"version":               paper.Version,
+		"summary":               architectPlanningSummary(paper),
+		"session_id":            paper.SessionID,
+		"recommended_option_id": recommendedOptionID(paper),
+		"prototype_sketch":      architectPrototypeSketch(paper),
+		"system_design_notes":   architectSystemDesignNotes(paper),
 	}
 	return a.publishActionRequest(ctx, "architect", architectProposalAction, payload, true)
 }
@@ -733,7 +793,7 @@ func architectPlanningSummary(paper *AcademicResearchPaper) string {
 	if paper.ArchitectHandoff != nil && strings.TrimSpace(paper.ArchitectHandoff.PlanningSummary) != "" {
 		return strings.TrimSpace(paper.ArchitectHandoff.PlanningSummary)
 	}
-	return firstNonEmpty(paper.Abstract, paper.ProblemFraming, paper.Title)
+	return buildArchitectPlanningSummary(paper)
 }
 
 func recommendedOptionID(paper *AcademicResearchPaper) string {
@@ -741,6 +801,20 @@ func recommendedOptionID(paper *AcademicResearchPaper) string {
 		return ""
 	}
 	return strings.TrimSpace(paper.ArchitectHandoff.RecommendedOptionID)
+}
+
+func architectPrototypeSketch(paper *AcademicResearchPaper) string {
+	if paper == nil || paper.ArchitectHandoff == nil {
+		return ""
+	}
+	return strings.TrimSpace(paper.ArchitectHandoff.PrototypeSketch)
+}
+
+func architectSystemDesignNotes(paper *AcademicResearchPaper) []string {
+	if paper == nil || paper.ArchitectHandoff == nil {
+		return nil
+	}
+	return append([]string(nil), paper.ArchitectHandoff.SystemDesignNotes...)
 }
 
 func normalizeResearchSlug(values ...string) string {
@@ -762,6 +836,180 @@ func researchPaperTitle(params *authorResearchPaperParams, researchSlug string) 
 		return title
 	}
 	return "Research Proposal: " + humanizeResearchSlug(researchSlug)
+}
+
+func buildDecisionRationale(
+	result *ResearchResult,
+	options []ArchitectureOption,
+	applicability *CodebaseApplicability,
+	librarianEvidence *shared.ConsultationEvidence,
+	archivalEvidence *shared.ConsultationEvidence,
+	recommendedID string,
+) string {
+	option := findArchitectureOption(options, recommendedID)
+	parts := make([]string, 0, 4)
+	if option != nil {
+		parts = append(parts, fmt.Sprintf(
+			"%s is the recommended direction because %s.",
+			firstNonEmpty(option.Name, "The leading option"),
+			firstNonEmpty(option.Summary, summarizeFindings(result.Findings), consultationSummary(librarianEvidence)),
+		))
+	}
+	if fit := firstNonEmpty(summaryOrBlank(applicability), consultationSummary(librarianEvidence)); fit != "" {
+		parts = append(parts, fmt.Sprintf("The strongest codebase-fit signal is %s.", fit))
+	}
+	if risk := firstNonEmpty(firstFrom(optionRisks(option)), firstFrom(extractBullets(consultationSummary(archivalEvidence), 2))); risk != "" {
+		parts = append(parts, fmt.Sprintf("The main tradeoff to manage is %s.", risk))
+	}
+	if result != nil && result.Confidence != "" {
+		parts = append(parts, fmt.Sprintf("Overall confidence is %s based on the available sources and repository evidence.", result.Confidence))
+	}
+	return strings.TrimSpace(strings.Join(filterNonEmpty(parts), " "))
+}
+
+func buildPrototypeExamples(
+	params *authorResearchPaperParams,
+	result *ResearchResult,
+	options []ArchitectureOption,
+	applicability *CodebaseApplicability,
+	recommendedID string,
+) []string {
+	option := findArchitectureOption(options, recommendedID)
+	topic := firstNonEmpty(params.Topic, "the recommended design")
+	examples := []string{
+		fmt.Sprintf("Prototype the recommended direction as a narrow vertical slice around %s, starting with %s.", topic, firstNonEmpty(optionSummary(option), "the smallest end-to-end flow that exercises the design")),
+	}
+	if constraint := firstNonEmpty(firstFrom(params.Constraints), firstFrom(requiredChanges(applicability))); constraint != "" {
+		examples = append(examples, fmt.Sprintf("Use the prototype to prove that the design can satisfy %s without broad refactoring.", constraint))
+	}
+	if invariant := firstNonEmpty(firstFrom(params.Invariants), firstFrom(params.OpenQuestions), summarizeFindings(resultFindings(result))); invariant != "" {
+		examples = append(examples, fmt.Sprintf("Instrument the prototype so it can validate %s before the architect expands it into a full plan.", invariant))
+	}
+	return filterNonEmpty(examples)
+}
+
+func buildSystemDesignImplications(
+	params *authorResearchPaperParams,
+	options []ArchitectureOption,
+	applicability *CodebaseApplicability,
+	librarianEvidence *shared.ConsultationEvidence,
+	archivalEvidence *shared.ConsultationEvidence,
+	recommendedID string,
+) []string {
+	option := findArchitectureOption(options, recommendedID)
+	items := make([]string, 0, 8)
+	if option != nil {
+		if summary := optionSummary(option); summary != "" {
+			items = append(items, "Preferred implementation shape: "+summary)
+		}
+		if fit := strings.TrimSpace(option.Fit); fit != "" {
+			items = append(items, "Primary architectural fit condition: "+fit)
+		}
+	}
+	for _, change := range takeFirst(requiredChanges(applicability), 2) {
+		items = append(items, "Codebase change to plan for: "+change)
+	}
+	if constraint := firstFrom(params.Constraints); constraint != "" {
+		items = append(items, "Constraint to preserve: "+constraint)
+	}
+	if invariant := firstFrom(params.Invariants); invariant != "" {
+		items = append(items, "Invariant to preserve: "+invariant)
+	}
+	if signal := firstFrom(extractBullets(consultationSummary(archivalEvidence), 2)); signal != "" {
+		items = append(items, "Historical risk signal: "+signal)
+	}
+	if repo := firstFrom(extractBullets(consultationSummary(librarianEvidence), 2)); repo != "" {
+		items = append(items, "Repository-shape implication: "+repo)
+	}
+	return mergeUnique(items)
+}
+
+func buildArchitectPlanningSummary(paper *AcademicResearchPaper) string {
+	if paper == nil {
+		return ""
+	}
+	parts := make([]string, 0, 5)
+	if option := findArchitectureOption(paper.OptionMatrix, recommendedOptionID(paper)); option != nil {
+		parts = append(parts, fmt.Sprintf(
+			"Recommended option: %s. %s.",
+			firstNonEmpty(option.Name, option.ID, "recommended direction"),
+			firstNonEmpty(option.Summary, paper.Abstract),
+		))
+	} else if summary := firstNonEmpty(paper.DecisionRationale, paper.Abstract); summary != "" {
+		parts = append(parts, summary)
+	}
+	if rationale := strings.TrimSpace(paper.DecisionRationale); rationale != "" {
+		parts = append(parts, rationale)
+	}
+	if prototype := firstNonEmpty(paper.PrototypeExamples...); prototype != "" {
+		parts = append(parts, "Prototype focus: "+prototype)
+	}
+	if implication := firstNonEmpty(paper.SystemDesignImplications...); implication != "" {
+		parts = append(parts, "Planning implication: "+implication)
+	}
+	return strings.TrimSpace(strings.Join(filterNonEmpty(parts), " "))
+}
+
+func findArchitectureOption(options []ArchitectureOption, optionID string) *ArchitectureOption {
+	optionID = strings.TrimSpace(optionID)
+	if optionID == "" {
+		if len(options) == 0 {
+			return nil
+		}
+		return &options[0]
+	}
+	for i := range options {
+		if strings.TrimSpace(options[i].ID) == optionID {
+			return &options[i]
+		}
+	}
+	if len(options) == 0 {
+		return nil
+	}
+	return &options[0]
+}
+
+func summaryOrBlank(applicability *CodebaseApplicability) string {
+	if applicability == nil {
+		return ""
+	}
+	return strings.TrimSpace(applicability.Summary)
+}
+
+func optionSummary(option *ArchitectureOption) string {
+	if option == nil {
+		return ""
+	}
+	return strings.TrimSpace(option.Summary)
+}
+
+func optionRisks(option *ArchitectureOption) []string {
+	if option == nil {
+		return nil
+	}
+	return append([]string(nil), option.Risks...)
+}
+
+func resultFindings(result *ResearchResult) []Finding {
+	if result == nil {
+		return nil
+	}
+	return result.Findings
+}
+
+func firstFrom(items []string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(items[0])
+}
+
+func takeFirst(items []string, limit int) []string {
+	items = filterNonEmpty(items)
+	if limit <= 0 || len(items) <= limit {
+		return items
+	}
+	return append([]string(nil), items[:limit]...)
 }
 
 func toResearchConstraints(items []string) []ResearchConstraint {

@@ -233,6 +233,208 @@ func TestGuideHandleRouteRequestMessage_FireAndForgetExplicitTargetStillForwards
 	}
 }
 
+func TestGuideHandleRouteRequestMessage_DSLStoreSkipsClassificationProgress(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	defer func() { _ = bus.Close() }()
+
+	g, err := NewWithClassifier(NewRuleClassifierClient(), Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "session-dsl-store",
+	})
+	if err != nil {
+		t.Fatalf("new guide: %v", err)
+	}
+
+	err = g.Register(&AgentRoutingInfo{
+		ID:   "archivalist",
+		Type: "archivalist",
+		Name: "archivalist",
+		Registration: &AgentRegistration{
+			ID:   "archivalist",
+			Name: "archivalist",
+			Capabilities: AgentCapabilities{
+				Intents: []Intent{IntentStore, IntentRecall, IntentCheck, IntentDeclare, IntentComplete, IntentHelp},
+				Domains: []Domain{DomainHistory, DomainPatterns, DomainDecisions, DomainLearnings, DomainFailures},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("register archivalist: %v", err)
+	}
+
+	responseCh := make(chan *StreamResponse, 8)
+	respSub, err := bus.SubscribeAsync(g.agentResponseTopic("architect"), func(msg *Message) error {
+		stream, ok := msg.GetStreamResponse()
+		if !ok || stream == nil {
+			return nil
+		}
+		select {
+		case responseCh <- stream:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe architect response topic: %v", err)
+	}
+	defer respSub.Unsubscribe()
+
+	forwardedCh := make(chan *ForwardedRequest, 1)
+	reqSub, err := bus.SubscribeAsync(g.agentRequestTopic("archivalist"), func(msg *Message) error {
+		fwd, ok := msg.GetForwardedRequest()
+		if !ok || fwd == nil {
+			return nil
+		}
+		select {
+		case forwardedCh <- fwd:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe archivalist request topic: %v", err)
+	}
+	defer reqSub.Unsubscribe()
+
+	req := &RouteRequest{
+		CorrelationID: "corr-dsl-store",
+		Input:         `@archivalist:store:history{"content":"stored pre-delegation declaration"}`,
+		SourceAgentID: "architect",
+		FireAndForget: true,
+		SessionID:     "session-dsl-store",
+		Timestamp:     time.Now(),
+		Metadata: map[string]any{
+			"chat_nested_branch":         true,
+			"chat_parent_correlation_id": "corr-parent-store",
+			"chat_parent_tool_call_key":  "store-1",
+			"chat_inter_agent_kind":      "store",
+		},
+	}
+
+	if err := g.handleRouteRequestMessage(context.Background(), NewRequestMessage("msg-dsl-store", req)); err != nil {
+		t.Fatalf("handleRouteRequestMessage returned error: %v", err)
+	}
+
+	select {
+	case forwarded := <-forwardedCh:
+		if forwarded.TargetAgentID != "archivalist" {
+			t.Fatalf("forwarded target = %q, want archivalist", forwarded.TargetAgentID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for forwarded archivalist request")
+	}
+
+	deadline := time.After(200 * time.Millisecond)
+	for {
+		select {
+		case stream := <-responseCh:
+			if stream == nil || stream.Event == nil || stream.Event.Type != StreamEventProgress {
+				continue
+			}
+			progress, _ := stream.Event.Data.(*ProgressData)
+			if progress != nil && progress.Message == "Classifying request..." {
+				t.Fatal("expected DSL store route to skip guide classification progress")
+			}
+		case <-deadline:
+			return
+		}
+	}
+}
+
+func TestGuideRoute_DSLBypassesConversationStickiness(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	defer func() { _ = bus.Close() }()
+
+	g, err := NewWithClassifier(NewRuleClassifierClient(), Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "session-dsl-stickiness",
+	})
+	if err != nil {
+		t.Fatalf("new guide: %v", err)
+	}
+
+	for _, info := range []*AgentRoutingInfo{
+		{
+			ID:   "librarian",
+			Type: "librarian",
+			Name: "librarian",
+			Registration: &AgentRegistration{
+				ID:   "librarian",
+				Name: "librarian",
+				Capabilities: AgentCapabilities{
+					Intents: []Intent{IntentFind, IntentSearch, IntentLocate, IntentFetch, IntentRecall, IntentCheck, IntentHelp},
+					Domains: []Domain{DomainCode, DomainPatterns, DomainGeneral},
+				},
+			},
+		},
+		{
+			ID:   "archivalist",
+			Type: "archivalist",
+			Name: "archivalist",
+			Registration: &AgentRegistration{
+				ID:   "archivalist",
+				Name: "archivalist",
+				Capabilities: AgentCapabilities{
+					Intents: []Intent{IntentStore, IntentRecall, IntentCheck, IntentDeclare, IntentComplete, IntentHelp},
+					Domains: []Domain{DomainHistory, DomainPatterns, DomainDecisions, DomainLearnings, DomainFailures},
+				},
+			},
+		},
+	} {
+		if err := g.Register(info); err != nil {
+			t.Fatalf("register %s: %v", info.ID, err)
+		}
+		g.MarkAgentReady(info.ID)
+	}
+
+	// Seed active-conversation state toward the librarian first.
+	first := &RouteRequest{
+		Input:          "Find existing Python CLI patterns",
+		SourceAgentID:  "architect",
+		TargetAgentID:  "librarian",
+		ExplicitTarget: true,
+		SessionID:      "session-dsl-stickiness",
+		Timestamp:      time.Now(),
+	}
+	forwarded, err := g.Route(context.Background(), first)
+	if err != nil {
+		t.Fatalf("route explicit librarian: %v", err)
+	}
+	if forwarded.TargetAgentID != "librarian" {
+		t.Fatalf("first target = %q, want librarian", forwarded.TargetAgentID)
+	}
+
+	storeInput, err := ArchivalistStoreRouteInput("store health check result")
+	if err != nil {
+		t.Fatalf("build archivalist store input: %v", err)
+	}
+
+	second := &RouteRequest{
+		Input:         storeInput,
+		SourceAgentID: "librarian",
+		SessionID:     "session-dsl-stickiness",
+		Timestamp:     time.Now(),
+	}
+	followed, err := g.Route(context.Background(), second)
+	if err != nil {
+		t.Fatalf("route archivalist DSL: %v", err)
+	}
+	if followed.TargetAgentID != "archivalist" {
+		t.Fatalf(
+			"dsl route target = %q, want archivalist (method=%q intent=%q domain=%q)",
+			followed.TargetAgentID,
+			followed.ClassificationMethod,
+			followed.Intent,
+			followed.Domain,
+		)
+	}
+	if followed.ClassificationMethod != "dsl" {
+		t.Fatalf("dsl route method = %q, want dsl", followed.ClassificationMethod)
+	}
+}
+
 func TestGuideResolveReadyAgentID_TaskScopedPipelineNameUsesRegisteredWorker(t *testing.T) {
 	bus := NewChannelBus(DefaultChannelBusConfig())
 	defer func() { _ = bus.Close() }()

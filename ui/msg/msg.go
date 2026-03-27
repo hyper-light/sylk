@@ -57,6 +57,7 @@ type StreamStartMsg struct {
 	TaskID        string
 	TaskName      string
 	TaskSlug      string
+	BranchRef     *InterAgentBranchRefMsg
 }
 
 // StreamChunkMsg carries a streaming text chunk from an LLM response.
@@ -81,7 +82,9 @@ type StreamProgressMsg struct {
 	Current       int
 	Total         int
 	Message       string
+	UIState       events.AgentUIState
 	Visibility    events.EventVisibility
+	BranchRef     *InterAgentBranchRefMsg
 }
 
 // StreamCompleteMsg signals the end of an LLM response stream.
@@ -108,6 +111,7 @@ type StreamCompleteMsg struct {
 	// When non-empty, the chat model replaces accumulated streaming content
 	// with this value to correct any dropped or reordered chunks.
 	AuthoritativeText string
+	BranchRef         *InterAgentBranchRefMsg
 }
 
 // StreamErrorMsg signals an error during streaming.
@@ -115,6 +119,7 @@ type StreamErrorMsg struct {
 	SessionID     string
 	CorrelationID string
 	Err           error
+	BranchRef     *InterAgentBranchRefMsg
 }
 
 // ---------------------------------------------------------------------------
@@ -126,8 +131,10 @@ type GuideResponseMsg struct {
 	CorrelationID string
 	AgentID       string
 	AgentName     string
+	AgentType     string
 	Content       string
 	Err           error
+	BranchRef     *InterAgentBranchRefMsg
 }
 
 type CommandApprovalRequestMsg struct {
@@ -771,6 +778,22 @@ type LayerFailedNode struct {
 // Tool call visualization
 // ---------------------------------------------------------------------------
 
+type InterAgentToolEventMsg struct {
+	Kind         string
+	AgentTypes   []string
+	Summary      string
+	ThreadKey    string
+	Status       string
+	UpdateOrigin bool
+}
+
+type InterAgentBranchRefMsg struct {
+	ParentCorrelationID string
+	ParentToolCallKey   string
+	ThreadKey           string
+	Kind                string
+}
+
 // ToolCallEventMsg carries a tool call start or completion event for inline
 // display in the chat panel. Dispatched from the GuideBridge when it receives
 // a StreamEventToolCall stream event.
@@ -778,6 +801,13 @@ type ToolCallEventMsg struct {
 	SessionID     string
 	CorrelationID string
 	AgentID       string
+	AgentType     string
+	AgentName     string
+	PipelineID    string
+	TaskID        string
+	TaskName      string
+	TaskSlug      string
+	ToolCallKey   string
 	Phase         int // 0 = start, 1 = complete.
 	ToolName      string
 	ArgsSummary   string
@@ -787,6 +817,8 @@ type ToolCallEventMsg struct {
 	StartedAt     time.Time
 	Duration      time.Duration
 	Success       bool
+	InterAgent    *InterAgentToolEventMsg
+	BranchRef     *InterAgentBranchRefMsg
 }
 
 // TimePressureMsg signals that an agent is approaching its operation deadline.

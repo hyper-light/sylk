@@ -105,7 +105,7 @@ type Orchestrator struct {
 
 	// Sync RPC (for Guardian preflight and other direct consultations).
 	pendingMu  sync.Mutex
-	pendingBus map[string]chan *guide.Message
+	pendingBus map[string]*shared.PendingSyncWait
 
 	// refreshProvider re-resolves the LLM provider on auth changes.
 	// Set via SetProviderRefresher from bootstrap. The authMethod parameter
@@ -160,6 +160,13 @@ func (o *Orchestrator) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
 	o.workspaceViews = authority.RestrictWorkspaceViews("orchestrator", views)
 }
 
+func (o *Orchestrator) SessionID() string {
+	if o == nil {
+		return "default"
+	}
+	return firstNonEmpty(strings.TrimSpace(o.config.SessionID), orchestratorStateSessionID(o), "default")
+}
+
 // New creates a new Orchestrator agent. The optional GoogleProvider enables
 // LLM-driven event analysis. When nil, the orchestrator runs in deterministic
 // fallback mode (critical events auto-escalate without model involvement).
@@ -188,7 +195,7 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 		logWAL:                  logCloser,
 		steering:                shared.NewSteeringManager(),
 		requestSerializer:       shared.NewRequestSerializer(),
-		pendingBus:              make(map[string]chan *guide.Message),
+		pendingBus:              make(map[string]*shared.PendingSyncWait),
 		dispatchGate:            newDispatchHoldGate(),
 		pipelinePanelState:      make(map[string]pipelinePanelSnapshot),
 		pipelinePanelRegistered: make(map[string]struct{}),
@@ -965,6 +972,7 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	// IntentHelp, so we cannot predicate streaming on the incoming intent.
 	// This mirrors the architect's handleForwardBusRequest pattern.
 	ctx = withOrchestratorStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = shared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	ctx, usageAcc := withOrchestratorUsageAccumulator(ctx)
 
 	toolEmitter := shared.NewToolCallEmitter(o.bus, o.channels, o.config.AgentID, fwd.CorrelationID, fwd.SourceAgentID)
@@ -1175,7 +1183,7 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 		"task_id":         dispatch.taskID,
 		"pipeline_status": pipelineStatus,
 	})
-	o.enrichTaskDispatchCoordination(dispatch)
+	o.acknowledgeTaskDispatch(router, dispatch)
 	o.pushEvent(dispatch.event())
 	o.publishTaskDispatchAgents(dispatch, pipelineStatus)
 	o.logTrace("task_dispatch_agents_published", agentlog.EventTaskDispatched, map[string]any{
@@ -1185,7 +1193,9 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 		"agent_type":      dispatch.agentType,
 		"pipeline_status": pipelineStatus,
 	})
+	o.enrichTaskDispatchCoordination(dispatch)
 	o.routeTaskDispatch(router, dispatch)
+	o.warmTaskDispatchCoordination(dispatch)
 	o.logTrace("task_dispatch_handled", agentlog.EventTaskDispatched, map[string]any{
 		"dag_id":     dispatch.dagID,
 		"node_id":    dispatch.nodeID,
@@ -1631,24 +1641,44 @@ func (o *Orchestrator) SubmitEventToArchivalist(ctx context.Context, event *Task
 	if o.bus == nil || !o.running {
 		return fmt.Errorf("orchestrator not running")
 	}
+	input, err := guide.ArchivalistStoreRouteInput(fmt.Sprintf("stored task event: %s", event.Type))
+	if err != nil {
+		return err
+	}
+	branchCtx, branch := shared.BeginArchivalistStoreBranch(ctx, "stored task event", map[string]any{
+		"event_type": event.Type,
+		"task_id":    event.TaskID,
+		"session_id": o.config.SessionID,
+	})
+	metadata := branch.ApplyMetadata(branchCtx, map[string]any{
+		"event_type": event.Type,
+		"event_data": event,
+	})
 
 	req := &guide.RouteRequest{
-		Input:           fmt.Sprintf("store task event: %s", event.Type),
+		Input:           input,
 		SourceAgentID:   o.config.AgentID,
 		SourceAgentName: "orchestrator",
-		TargetAgentID:   "archivalist",
 		FireAndForget:   true,
 		SessionID:       o.config.SessionID,
 		Timestamp:       time.Now(),
+		Metadata:        metadata,
+	}
+	if req.ParentCorrelationID == "" {
+		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+			req.ParentCorrelationID = stream.CorrelationID
+		}
 	}
 
 	msg := guide.NewRequestMessage(generateMessageID(), req)
-	msg.Metadata = map[string]any{
-		"event_type": event.Type,
-		"event_data": event,
-	}
+	msg.Metadata = metadata
 
-	return o.bus.Publish(guide.TopicGuideRequests, msg)
+	if err := o.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+		branch.Complete(branchCtx, "", "", err)
+		return err
+	}
+	branch.Complete(branchCtx, "stored task event", "", nil)
+	return nil
 }
 
 // QueryArchivalistForFailures queries Archivalist for failure patterns
@@ -2022,12 +2052,15 @@ func (o *Orchestrator) forwardHealthToArchivalist(result *HealthCheckResult) {
 	if o.bus == nil || !o.config.ArchivalistEnabled {
 		return
 	}
+	input, err := guide.ArchivalistStoreRouteInput("store health check result")
+	if err != nil {
+		return
+	}
 
 	req := &guide.RouteRequest{
-		Input:           "store health check result",
+		Input:           input,
 		SourceAgentID:   o.config.AgentID,
 		SourceAgentName: "orchestrator",
-		TargetAgentID:   "archivalist",
 		FireAndForget:   true,
 		SessionID:       o.config.SessionID,
 		Timestamp:       time.Now(),

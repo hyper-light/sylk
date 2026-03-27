@@ -192,7 +192,7 @@ func (s *Scribe) processFeed(ctx context.Context, feed shared.ScribeFeed) {
 		return
 	}
 
-	s.forwardToArchivalist(commentary, feed.CorrelationID)
+	s.forwardToArchivalist(ctx, commentary, feed)
 }
 
 func scribeSystemPrompt(parentAgentType string) string {
@@ -302,21 +302,49 @@ func (s *Scribe) generateCommentary(ctx context.Context) (string, error) {
 
 // forwardToArchivalist sends commentary to the Archivalist via bus
 // using fire-and-forget semantics.
-func (s *Scribe) forwardToArchivalist(commentary, correlationID string) {
-	msgID := fmt.Sprintf("scribe_%s_msg_%s", s.parentAgentType, uuid.New().String()[:8])
-	msg := guide.NewForwardMessage(msgID, &guide.ForwardedRequest{
-		CorrelationID: correlationID,
-		SourceAgentID: s.id,
-		Input:         commentary,
-		Intent:        guide.IntentStore,
-		Metadata: map[string]any{
-			"source_type":  "scribe",
-			"parent_agent": s.parentAgentType,
-			"scribe_id":    s.id,
-		},
-		FireAndForget: true,
+func (s *Scribe) forwardToArchivalist(ctx context.Context, commentary string, feed shared.ScribeFeed) {
+	input, err := guide.ArchivalistStoreRouteInput(commentary)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("scribe archivalist route encoding failed",
+				"parent", s.parentAgentType, "error", err)
+		}
+		return
+	}
+
+	parentCorrelationID := strings.TrimSpace(feed.ParentCorrelationID)
+	branchCtx := ctx
+	if parentCorrelationID != "" {
+		branchCtx = shared.WithStreamContext(branchCtx, parentCorrelationID, s.parentAgentType)
+	}
+	branchCtx, branch := shared.BeginArchivalistStoreBranch(branchCtx, "stored scribe commentary", map[string]any{
+		"parent_agent": s.parentAgentType,
 	})
-	_ = s.bus.Publish(guide.TopicRequests("archivalist", "archivalist"), msg)
+	metadata := branch.ApplyMetadata(branchCtx, map[string]any{
+		"source_type":  "scribe",
+		"parent_agent": s.parentAgentType,
+		"scribe_id":    s.id,
+	})
+
+	req := &guide.RouteRequest{
+		CorrelationID: "scribe_" + uuid.NewString(),
+		ParentCorrelationID: parentCorrelationID,
+		SourceAgentID: s.id,
+		Input:         input,
+		FireAndForget: true,
+		Timestamp:     time.Now(),
+		Metadata:      metadata,
+	}
+	msg := guide.NewRequestMessage(
+		fmt.Sprintf("scribe_%s_msg_%s", s.parentAgentType, uuid.New().String()[:8]),
+		req,
+	)
+	msg.Metadata = metadata
+	if err := s.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+		branch.Complete(branchCtx, "", "", err)
+		return
+	}
+	branch.Complete(branchCtx, "stored scribe commentary", "", nil)
 }
 
 // appendMessage adds a message to the ring buffer, evicting the oldest

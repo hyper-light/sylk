@@ -483,8 +483,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		value, _ := fwd.Metadata[key].(string)
 		return strings.TrimSpace(value)
 	}
-	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
-	ctx = shared.WithStreamContextMetadata(ctx, map[string]any{
+	ctx := shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, shared.MergeStreamMetadata(fwd.Metadata, map[string]any{
 		"pipeline_task": true,
 		"agent_type":    "designer",
 		"agent_name":    "Designer",
@@ -494,7 +493,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		"task_name":     metaString("task_name"),
 		"dag_id":        metaString("dag_id"),
 		"node_id":       metaString("node_id"),
-	})
+	}))
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)

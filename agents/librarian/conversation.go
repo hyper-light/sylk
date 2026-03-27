@@ -53,10 +53,10 @@ func (l *Librarian) buildLLMRequest(fwd *guide.ForwardedRequest) *providers.Requ
 		SystemPrompt: l.config.SystemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: fwd.Input}},
 		Tools:        l.buildToolDefinitions(),
-		Model:        l.config.Model,
+		Model:        l.CurrentModel(),
 		MaxTokens:    l.config.MaxTokens,
 	}
-	l.applyConversationRuntimeProfile(req)
+	l.applyConversationRuntimeProfile(req, fwd.SessionID)
 	return req
 }
 

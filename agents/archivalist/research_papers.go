@@ -306,7 +306,7 @@ func (a *Archivalist) publishActionSuccess(req *guide.ActionRequest, data any) e
 		Success:             true,
 		Data:                data,
 		RespondingAgentID:   a.id,
-		RespondingAgentName: "archivalist",
+		RespondingAgentName: "Archivalist",
 	}
 	msg := guide.NewResponseMessage(a.generateMessageID(), resp)
 	return a.bus.Publish(guide.TopicResponses(req.SourceAgentID, req.SourceAgentID), msg)
@@ -321,7 +321,7 @@ func (a *Archivalist) publishActionFailure(req *guide.ActionRequest, err error) 
 		Success:             false,
 		Error:               err.Error(),
 		RespondingAgentID:   a.id,
-		RespondingAgentName: "archivalist",
+		RespondingAgentName: "Archivalist",
 	}
 	msg := guide.NewResponseMessage(a.generateMessageID(), resp)
 	return a.bus.Publish(guide.TopicResponses(req.SourceAgentID, req.SourceAgentID), msg)

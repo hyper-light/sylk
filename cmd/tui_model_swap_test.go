@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/concurrency"
@@ -141,5 +142,21 @@ func TestBuildModelSwapper_ReturnsErrorWhenPriorityMissing(t *testing.T) {
 	err := swap(context.Background(), "custom", "claude-opus-4-6")
 	if err == nil {
 		t.Fatal("expected error for missing model swap priority")
+	}
+}
+
+func TestBuildModelSwapper_AllowsDeferredSwapForInactiveNonArchitect(t *testing.T) {
+	reg := container.NewContainerRegistry()
+	swap := buildModelSwapper(reg, nil, nil, nil, nil, nil)
+	if err := swap(context.Background(), "librarian", "claude-sonnet-4-6"); err != nil {
+		t.Fatalf("swap inactive librarian: %v", err)
+	}
+}
+
+func TestResolveModelSwapContainer_ReturnsSentinelForMissingNonArchitect(t *testing.T) {
+	reg := container.NewContainerRegistry()
+	_, err := resolveModelSwapContainer(context.Background(), reg, nil, "librarian")
+	if !errors.Is(err, errNoSwappableContainer) {
+		t.Fatalf("resolveModelSwapContainer() error = %v, want errNoSwappableContainer", err)
 	}
 }

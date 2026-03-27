@@ -31,6 +31,17 @@ func (a *Archivalist) registerCoreSkills() {
 	a.skills.Register(storeSkill(a))
 	a.skills.Register(querySkill(a))
 	a.skills.Register(briefingSkill(a))
+	a.skills.Register(getBriefingToolSkill(a))
+	a.skills.Register(queryPatternsToolSkill(a))
+	a.skills.Register(queryFailuresToolSkill(a))
+	a.skills.Register(queryContextToolSkill(a))
+	a.skills.Register(queryFileStateToolSkill(a))
+	a.skills.Register(recordPatternToolSkill(a))
+	a.skills.Register(recordFailureToolSkill(a))
+	a.skills.Register(updateFileStateToolSkill(a))
+	a.skills.Register(declareIntentToolSkill(a))
+	a.skills.Register(completeIntentToolSkill(a))
+	a.skills.Register(getConflictsToolSkill(a))
 	a.skills.Register(routeToSkill(a))
 	a.skills.Register(replyToSkill(a))
 	a.skills.Register(shared.NewSelfDiagnosticSkill(&archivalistDiag{a: a}))
@@ -42,12 +53,6 @@ func (a *Archivalist) registerCoreSkills() {
 		SessionID: func() string { return a.defaultSessionID },
 		Publish:   a.publishRerouteRequest,
 	}))
-
-	a.skills.Load("store")
-	a.skills.Load("query")
-	a.skills.Load("briefing")
-	a.skills.Load("route_to")
-	a.skills.Load("reply_to")
 }
 
 type archivalistDiag struct{ a *Archivalist }

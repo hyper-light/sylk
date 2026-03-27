@@ -256,6 +256,10 @@ func renderStreamingEntryFull(entry *ChatEntry, width int, th *theme.Theme, cach
 	for i := range toolCallRegions {
 		toolCallRegions[i].Start += tcOffset
 		toolCallRegions[i].End += tcOffset
+		for j := range toolCallRegions[i].Subregions {
+			toolCallRegions[i].Subregions[j].Start += tcOffset
+			toolCallRegions[i].Subregions[j].End += tcOffset
+		}
 	}
 	entry.ToolCallRegions = toolCallRegions
 

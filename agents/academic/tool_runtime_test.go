@@ -132,6 +132,9 @@ func TestAcademicBuildToolDefinitionsIncludesNativeWebSearch(t *testing.T) {
 		if tool.WebSearch == nil {
 			t.Fatal("web_search native config should be present")
 		}
+		if got, want := tool.WebSearch.MaxUses, 6; got != want {
+			t.Fatalf("web_search max uses = %d, want %d", got, want)
+		}
 		return
 	}
 

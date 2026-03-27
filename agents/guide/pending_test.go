@@ -52,6 +52,76 @@ func TestPendingStore_AddWithCorrelationID(t *testing.T) {
 	assert.Equal(t, "custom-corr-id", corrID)
 }
 
+func TestPendingStore_AddInheritsStreamTargetFromParentSource(t *testing.T) {
+	store := guide.NewPendingStore(guide.DefaultPendingStoreConfig())
+
+	parentID := store.Add(&guide.RouteRequest{
+		Input:         "root",
+		SourceAgentID: "tui",
+		CorrelationID: "corr-root",
+	}, nil, "architect")
+
+	childID := store.Add(&guide.RouteRequest{
+		Input:               "child",
+		SourceAgentID:       "architect",
+		CorrelationID:       "corr-child",
+		ParentCorrelationID: parentID,
+	}, nil, "academic")
+
+	child := store.Get(childID)
+	require.NotNil(t, child)
+	assert.Equal(t, "tui", child.StreamTargetOverride)
+}
+
+func TestPendingStore_AddInheritsStreamTargetOverrideFromParent(t *testing.T) {
+	store := guide.NewPendingStore(guide.DefaultPendingStoreConfig())
+
+	parentID := store.Add(&guide.RouteRequest{
+		Input:         "root",
+		SourceAgentID: "architect",
+		CorrelationID: "corr-root",
+	}, nil, "orchestrator")
+	parent := store.Get(parentID)
+	require.NotNil(t, parent)
+	parent.StreamTargetOverride = "tui"
+
+	childID := store.Add(&guide.RouteRequest{
+		Input:               "child",
+		SourceAgentID:       "orchestrator",
+		CorrelationID:       "corr-child",
+		ParentCorrelationID: parentID,
+	}, nil, "archivalist")
+
+	child := store.Get(childID)
+	require.NotNil(t, child)
+	assert.Equal(t, "tui", child.StreamTargetOverride)
+}
+
+func TestPendingStore_AddPreservesSourceStreamTargetWhenRequested(t *testing.T) {
+	store := guide.NewPendingStore(guide.DefaultPendingStoreConfig())
+
+	parentID := store.Add(&guide.RouteRequest{
+		Input:         "root",
+		SourceAgentID: "orchestrator",
+		CorrelationID: "corr-root",
+	}, nil, "inspector")
+	parent := store.Get(parentID)
+	require.NotNil(t, parent)
+	parent.StreamTargetOverride = "tui"
+
+	childID := store.Add(&guide.RouteRequest{
+		Input:               "child",
+		SourceAgentID:       "inspector",
+		CorrelationID:       "corr-child",
+		ParentCorrelationID: parentID,
+		Metadata:            guide.MetadataWithPreservedSourceStreamTarget(nil),
+	}, nil, "librarian")
+
+	child := store.Get(childID)
+	require.NotNil(t, child)
+	assert.Empty(t, child.StreamTargetOverride)
+}
+
 // TestPendingStore_Get tests retrieving pending requests
 func TestPendingStore_Get(t *testing.T) {
 	store := guide.NewPendingStore(guide.DefaultPendingStoreConfig())

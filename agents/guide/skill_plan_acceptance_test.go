@@ -244,10 +244,13 @@ func TestTryDirectSkillInvocation_PrefixMatch(t *testing.T) {
 
 	g := &Guide{skills: registry}
 	payload := `{"plan":"p","plan_id":"id","plan_name":"n","user_response":"yes"}`
-	data, ok := g.tryDirectSkillInvocation(context.Background(), "evaluate-plan-acceptance: "+payload)
+	data, ok, err := g.tryDirectSkillInvocation(context.Background(), "evaluate-plan-acceptance: "+payload)
 
 	if !ok {
 		t.Fatal("expected match")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 	m, ok := data.(map[string]any)
 	if !ok {
@@ -260,17 +263,23 @@ func TestTryDirectSkillInvocation_PrefixMatch(t *testing.T) {
 
 func TestTryDirectSkillInvocation_NoMatch(t *testing.T) {
 	g := &Guide{skills: skills.NewRegistry()}
-	_, ok := g.tryDirectSkillInvocation(context.Background(), "some random input")
+	_, ok, err := g.tryDirectSkillInvocation(context.Background(), "some random input")
 	if ok {
 		t.Fatal("expected no match")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
 func TestTryDirectSkillInvocation_InvalidJSON(t *testing.T) {
 	g := &Guide{skills: skills.NewRegistry()}
-	_, ok := g.tryDirectSkillInvocation(context.Background(), "evaluate-plan-acceptance: not-json")
-	if ok {
-		t.Fatal("expected no match for invalid JSON")
+	_, ok, err := g.tryDirectSkillInvocation(context.Background(), "evaluate-plan-acceptance: not-json")
+	if !ok {
+		t.Fatal("expected prefix match for invalid JSON")
+	}
+	if err == nil {
+		t.Fatal("expected error for invalid JSON")
 	}
 }
 
@@ -287,9 +296,56 @@ func TestTryDirectSkillInvocation_SkillError(t *testing.T) {
 
 	g := &Guide{skills: registry}
 	payload := `{"plan":"p","plan_id":"id","plan_name":"n","user_response":"yes"}`
-	_, ok := g.tryDirectSkillInvocation(context.Background(), "evaluate-plan-acceptance: "+payload)
-	if ok {
-		t.Fatal("expected no match when skill returns error")
+	_, ok, err := g.tryDirectSkillInvocation(context.Background(), "evaluate-plan-acceptance: "+payload)
+	if !ok {
+		t.Fatal("expected prefix match when skill returns error")
+	}
+	if err == nil {
+		t.Fatal("expected skill error")
+	}
+}
+
+func TestEvaluatePlanAcceptance_DeterministicApprovalWithoutProvider(t *testing.T) {
+	g := &Guide{}
+	got, err := g.evaluatePlanAcceptance(context.Background(), planAcceptanceInput{
+		Plan:         "step 1",
+		PlanID:       "plan-1",
+		PlanName:     "Test Plan",
+		UserResponse: "Kick it off!",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got["result"] != "accept" {
+		t.Fatalf("result = %v, want accept", got["result"])
+	}
+	mods, ok := got["modifications"].([]string)
+	if !ok {
+		t.Fatalf("modifications type = %T, want []string", got["modifications"])
+	}
+	if len(mods) != 0 {
+		t.Fatalf("modifications = %v, want empty", mods)
+	}
+}
+
+func TestTryDirectSkillInvocation_DeterministicApprovalUsesRegisteredSkillWithoutProvider(t *testing.T) {
+	g := &Guide{skills: skills.NewRegistry()}
+	g.skills.Register(evaluatePlanAcceptanceSkill(g))
+
+	payload := `{"plan":"p","plan_id":"id","plan_name":"n","user_response":"Kick it off!"}`
+	data, ok, err := g.tryDirectSkillInvocation(context.Background(), "evaluate-plan-acceptance: "+payload)
+	if !ok {
+		t.Fatal("expected direct-skill prefix match")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	m, ok := data.(map[string]any)
+	if !ok {
+		t.Fatalf("data type = %T, want map[string]any", data)
+	}
+	if m["result"] != "accept" {
+		t.Fatalf("result = %v, want accept", m["result"])
 	}
 }
 

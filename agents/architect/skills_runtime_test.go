@@ -40,7 +40,7 @@ func TestArchitect_SkillCount(t *testing.T) {
 	}
 }
 
-func TestArchitect_ConsultationGateWithoutBusStillResponds(t *testing.T) {
+func TestArchitect_PlanningWithoutBusStillResponds(t *testing.T) {
 	a := newTestArchitect(t, Config{})
 	req := &ArchitectRequest{
 		ID:        "req_gate",
@@ -557,6 +557,9 @@ func TestArchitect_PlanModeSkillDispatch(t *testing.T) {
 
 func newTestArchitect(t *testing.T, cfg Config) *Architect {
 	t.Helper()
+	if cfg.WorkingDirectory == "" {
+		cfg.WorkingDirectory = t.TempDir()
+	}
 	a, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("failed to create architect: %v", err)
