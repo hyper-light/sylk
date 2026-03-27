@@ -32,11 +32,19 @@ func webSearchSkill() *skills.Skill {
 		Keywords("search", "web", "internet", "google", "discover", "find sources", "documentation", "papers").
 		Usage("Use when you need to discover candidate sources on the public web before fetching them through Sylk's guarded fetch pipeline.").
 		Example("Search official Go and PostgreSQL sources before recommending connection-pooling practices.").
-		Example("Search for standards, RFCs, vendor docs, and academic papers when the URL is not already known.").
+		Example("Search for standards, RFCs, official docs, and academic papers when the URL is not already known.").
 		BestPractice("Prefer official documentation, standards bodies, project maintainers, and primary-source papers over secondary commentary.").
 		BestPractice("Any URL discovered through web_search that you plan to cite or surface to the user must be grounded with ground_source or an equivalent fetch skill first.").
-		BestPractice("When the answer depends on performance, reliability, cost, scale, security impact, or adoption numbers, search for primary empirical sources such as official benchmarks, standards, incident reports, papers, or vendor telemetry instead of summary blogs.").
+		BestPractice("When the answer depends on performance, reliability, cost, scale, security impact, or adoption numbers, search for primary empirical sources such as official benchmarks, standards, incident reports, papers, or official operational telemetry instead of summary blogs.").
 		BestPractice("After discovery, fetch the selected source with web_fetch or fetch_document before relying on specific details.").
+		Requirement("Do not stop at web_search if you intend to cite a discovered URL; ground it first with ground_source or an equivalent fetch skill.").
+		Requirement("If quantitative claims matter, keep searching until you find credible empirical or official evidence, or explicitly conclude that strong quantitative evidence is unavailable.").
+		Requirement("When relevant literature, benchmarks, or postmortems exist, surface them as candidates for deeper grounding instead of relying only on surface-level pages or summaries.").
+		Requirement("For material claims, do not stop after one promising source when corroborating grounded sources are available.").
+		Requirement("Look for sources that let you validate assumptions, inspect methodology, and identify bias or threats to validity instead of only finding affirmative evidence.").
+		Requirement("Assume every source you may cite later will need its own grounding step; search with that downstream rigor audit in mind.").
+		Avoid("Do not surface raw search hits, titles, or URLs as references before grounding them.").
+		Avoid("Do not treat popularity or SEO rank as evidence for a technical recommendation.").
 		Priority(95).
 		TokenEstimate(220).
 		ProviderTool(skills.ProviderTool{
@@ -66,6 +74,12 @@ func groundSourceSkill(a *Academic) *skills.Skill {
 		BestPractice("Prefer ground_source over repeating similar web_search queries once you already have a promising candidate URL.").
 		BestPractice("Ground the source before quoting statistics, benchmarks, percentages, or study conclusions from it.").
 		BestPractice("When a number materially affects the recommendation, capture its publication date and sample, workload, or measurement context from the grounded source when available.").
+		BestPractice("When grounding a paper, benchmark, or empirical study, extract the research question, method, key findings, and major limitations.").
+		BestPractice("Use grounded sources as part of a corroborated evidence set for important claims whenever multiple credible sources exist.").
+		BestPractice("Inspect whether the source reveals dataset quality, hidden assumptions, incentive misalignment, or threats to validity that should lower confidence.").
+		Requirement("Use this before citing, quoting, or recommending from a URL discovered through web_search.").
+		Requirement("Treat this as a per-link obligation: if the final answer cites three searched URLs, each of those URLs should have its own grounding step.").
+		Avoid("Do not assume a searched page is citeable just because its title or snippet looks authoritative.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				URL          string `json:"url"`
@@ -102,6 +116,8 @@ func webFetchSkill(a *Academic) *skills.Skill {
 		Usage("Use when you already know the URL for a specific page, benchmark, report, or documentation page that must be inspected before relying on its claims.").
 		BestPractice("Do not quote benchmark numbers, percentages, or performance claims from a page until you have fetched and inspected it through the secure pipeline.").
 		BestPractice("For numeric claims, note the publication date and benchmark or study context so the recommendation does not overgeneralize stale or narrow results.").
+		Requirement("Use this for exact URLs you plan to cite, quote, or rely on when ground_source is not the clearer entry point.").
+		Avoid("Do not cite a page from memory or from search snippets when you can fetch it directly.").
 		Priority(90).
 		TokenEstimate(500).
 		StringParam("url", "The URL to fetch", true).
@@ -140,6 +156,10 @@ func fetchDocumentSkill(a *Academic) *skills.Skill {
 		Usage("Use for papers, PDFs, benchmark reports, standards, or long-form studies when the evidence depends on exact methodology, statistics, or formal guidance.").
 		BestPractice("Prefer fetch_document for academic papers, official benchmark reports, standards, and incident studies that contain data you expect to cite.").
 		BestPractice("Before repeating study results, verify the date, sample size, workload or experimental setup, and major caveats from the grounded document when available.").
+		BestPractice("Digest the document into actionable findings, not just extracted text: summarize method, findings, relevance, and limitations.").
+		BestPractice("Call out dataset bias, threat models, assumptions, and threats to validity when the document's conclusions depend on them.").
+		Requirement("Use this before citing methodology-heavy papers, benchmark reports, or standards documents discovered through search.").
+		Avoid("Do not summarize a study's conclusion from abstracts, snippets, or third-party commentary when the source document itself is accessible.").
 		Priority(85).
 		TokenEstimate(600).
 		StringParam("url", "The document URL to fetch and ingest", true).

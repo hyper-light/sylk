@@ -183,6 +183,14 @@ func researchTopicSkill(a *Academic) *skills.Skill {
 		Keywords("research", "investigate", "study", "learn").
 		Usage("Use for open-ended technical research that should end in a cited, codebase-aware answer rather than a quick intuition dump.").
 		BestPractice("When performance, reliability, cost, scale, adoption, or security claims materially affect the answer, support them with grounded statistics or say explicitly that only qualitative evidence is available.").
+		BestPractice("When relevant literature, benchmarks, standards, or postmortems exist, digest the strongest ones and summarize method, findings, and limitations instead of only listing citations.").
+		BestPractice("Stress-test assumptions, inspect methodology, and call out dataset bias or threats to validity when they materially affect the conclusion.").
+		Requirement("For substantial research questions, synthesize evidence into a structured comparison, literature digest, or technical memo rather than a loose source roundup.").
+		Requirement("Do your own analysis on top of the sources: validate assumptions, challenge hypotheses, and note where the evidence is weak or biased.").
+		Requirement("Treat the answer as incomplete if it lacks the relevant structured artifact for the question, such as a comparison table, math walkthrough, algorithm sketch, or architecture or flow model.").
+		Requirement("Before finalizing, run a rigor audit across all relevant dimensions: per-link grounding, corroboration, counterevidence, math checks, methodology review, dataset quality, bias review, and threats to validity.").
+		Avoid("Do not stop at surface positioning, promotional framing, or shallow summaries when deeper evidence is obtainable.").
+		Avoid("Do not answer with a winner-plus-alternatives roundup followed by a source dump when the question requires deeper research synthesis.").
 		Priority(100).
 		StringParam("topic", "The technical topic to research", true).
 		StringParam("context", "Additional context for the research", false).
@@ -219,6 +227,8 @@ func findBestPracticesSkill(a *Academic) *skills.Skill {
 		Domain("research").
 		Keywords("best practice", "convention", "standard", "guideline").
 		BestPractice("Prefer standards, official documentation, peer-reviewed work, and maintainers' guidance over trend pieces or anecdotal blog posts.").
+		Requirement("When best-practice advice is contested or high impact, compare the strongest primary sources and call out where they disagree.").
+		Avoid("Do not present conventional wisdom as settled fact without identifying the evidence quality behind it.").
 		Priority(90).
 		StringParam("technology", "The technology to find best practices for", true).
 		StringParam("domain", "Specific domain within the technology", false).
@@ -259,6 +269,14 @@ func compareApproachesSkill(a *Academic) *skills.Skill {
 		Keywords("compare", "versus", "vs", "alternative", "option").
 		BestPractice("When the ranking hinges on performance, reliability, cost, scale, or adoption, support the comparison with grounded statistics or explain why only qualitative evidence is available.").
 		BestPractice("Prefer primary benchmarks, standards, papers, and official telemetry over secondary summaries when comparing numeric claims.").
+		BestPractice("Use a side-by-side comparison matrix and surface the strongest counterarguments against the leading option.").
+		BestPractice("Call out methodology limits, dataset bias, measurement caveats, and hidden assumptions that could change the ranking.").
+		Requirement("For substantial comparisons, evaluate the options against the criteria that actually drive the decision and summarize the result in a table or equivalently structured comparison.").
+		Requirement("Include the most decision-relevant evidence type for each major claim: measured data, official guidance, peer-reviewed research, or qualitative evidence.").
+		Requirement("Validate the assumptions behind the comparison and note where the evidence does not cleanly support the ranking.").
+		Requirement("Before finalizing, run a rigor audit over all relevant comparison dimensions: per-link grounding, corroboration, counterevidence, math checks, methodology quality, bias risks, and threats to validity.").
+		Avoid("Do not stop at surface positioning, shallow inventories, or summary-style prose when deeper tradeoff analysis is needed.").
+		Avoid("Do not reduce the comparison to a default winner, a few alternatives, and a bare source list.").
 		Priority(85).
 		StringParam("topic", "The topic being compared", true).
 		ArrayParam("approaches", "List of approaches to compare", "string", true).
@@ -341,6 +359,13 @@ func recommendSolutionSkill(a *Academic) *skills.Skill {
 		Keywords("recommend", "suggest", "solution", "solve").
 		BestPractice("Back material claims about performance, reliability, cost, security impact, scale, or adoption with grounded statistics, studies, standards, or official operational data whenever credible evidence exists.").
 		BestPractice("If the evidence for a recommendation is mixed, indirect, or mostly qualitative, say so plainly instead of overstating confidence.").
+		BestPractice("Include the strongest downside of the preferred option and explain why it still wins.").
+		BestPractice("Surface the key assumptions, methodology caveats, and bias risks that could invalidate the recommendation.").
+		Requirement("For substantial recommendations, justify the choice with explicit evidence categories and include a structured comparison or design sketch when it materially improves clarity.").
+		Requirement("Validate important assumptions and note where the supporting math, datasets, or empirical evidence is thin, biased, or contested.").
+		Requirement("Before finalizing, run a rigor audit over all relevant recommendation dimensions: per-link grounding, corroboration, alternatives, counterevidence, math checks, methodology quality, bias risks, and threats to validity.").
+		Avoid("Do not make the recommendation read like promotional copy or a generic roundup; make the tradeoffs concrete and evidence-backed.").
+		Avoid("Do not stop after naming a winner and a few alternatives when the decision needs comparative evidence synthesis.").
 		Priority(95).
 		StringParam("problem", "The problem to solve", true).
 		ArrayParam("constraints", "Constraints to consider", "string", false).

@@ -885,6 +885,9 @@ func academicExternalResearchDisciplinePrompt() string {
 			"2. Search: use `web_search` to discover authoritative candidates for each sub-question and keep searching only while you are still surfacing materially better, more relevant, well-sourced leads. " +
 			"3. Ground: once a candidate looks promising, stop broad searching and call `ground_source` to inspect it directly through the secure fetch pipeline. Use `web_fetch`, `fetch_document`, or one bounded `crawl_links` follow-up only when you already know the exact fetch action you need. `ground_source` returns grounded content immediately; background persistence to the knowledge graph and document store usually does not need to block synthesis. " +
 			"Any URL discovered through `web_search` that you want to cite, quote, or include in a sources list must be grounded first with `ground_source` or an equivalent fetch skill; never present an ungrounded search hit as a reference. " +
+			"Before finalizing an answer with citations, perform a source audit and remove any web-search-discovered URL that was not grounded. " +
+			"Before finalizing, enumerate the exact URLs you intend to cite. For each cited URL that came from `web_search`, call `ground_source` on that exact URL in the current run before citing it. Do not ground one page and then cite a different URL from the same site as if it were covered. " +
+			"Triangulate material claims across multiple grounded sources whenever feasible. If a conclusion rests on only one grounded source, say so explicitly and treat the confidence as lower unless that source is uniquely authoritative. " +
 			"4. Consult: use Librarian or Archivalist only when codebase fit or historical precedent materially changes the answer, and do not repeat the same consultation question to the same agent in one run. " +
 			"5. Synthesize: stop only when more searching is unlikely to materially change the conclusion. " +
 			"For recommendation, comparison, and design questions, investigate multiple credible options or counterexamples before choosing one. Do not stop after the first plausible answer unless the space is genuinely trivial. " +
@@ -892,6 +895,13 @@ func academicExternalResearchDisciplinePrompt() string {
 			"For claims about performance, latency, throughput, reliability, security impact, cost, scale, adoption, or comparative advantage, prefer primary empirical evidence and grounded quantitative data whenever feasible. " +
 			"Do not repeat benchmark numbers, percentages, or study findings unless you have inspected the source itself with `ground_source`, `web_fetch`, or `fetch_document`, and when the numbers matter, note the date, study or workload context, and major measurement caveats if available. " +
 			"If strong quantitative evidence is unavailable, say the evidence is qualitative, limited, or stale instead of implying false precision. " +
+			"For any material recommendation, ranking, or justification, identify whether the support comes from measured data, official guidance, peer-reviewed research, or only qualitative evidence. Do not justify decisions with vague claims like popular, fast, reliable, secure, scalable, or industry-standard unless the supporting evidence is named. " +
+			"When the question is a substantial comparison or architectural recommendation, build an explicit evaluation matrix across the criteria that actually matter, digest the strongest literature or empirical evidence, surface counterarguments, and include a table, architecture fragment, or flow sketch when that improves clarity. " +
+			"Perform your own technical analysis rather than only relaying source claims: validate assumptions and hypotheses against the evidence, sanity-check important math, inspect datasets and methodology when relevant, and call out bias, incentives, sampling problems, and threats to validity. " +
+			"Treat substantial externally sourced answers as incomplete unless they contain the relevant structured artifact for the question, such as a comparison table, math walkthrough, algorithm sketch, or architecture or flow model. " +
+			"Do not produce a shallow roundup that only recommends one option, lists alternatives, and appends sources. Replace that pattern with evidence synthesis, analysis, and explicit caveats. " +
+			"Before finalizing, run a rigor audit over all relevant dimensions: link-by-link grounding, corroboration, competing hypotheses, counterarguments, disconfirming evidence, math and unit checks, sample size and date checks, methodology review, dataset quality review, bias and incentive review, threats to validity, and the presence of the right structured artifact. If any relevant rigor check fails, do not finalize. " +
+			"Aim for the depth of a top-tier internal research memo rather than a high-level roundup or promotional summary. " +
 			"Consult the Librarian before finalizing any recommendation so the result matches the codebase reality.",
 	)
 }
@@ -908,9 +918,19 @@ func academicForwardedResearchPrompt(fwd *guide.ForwardedRequest) string {
 	b.WriteString("This research will inform Architect planning. Prefer durable, cited output over transient prose.\n")
 	b.WriteString("When `web_search` surfaces a promising source, call `ground_source` before relying on specifics. Do not keep searching instead of grounding.\n")
 	b.WriteString("Any link surfaced via `web_search` that you plan to cite, quote, or list as a source must be grounded first. Do not hand Architect raw search hits as references.\n")
+	b.WriteString("Before finalizing the response, audit the cited URLs and remove any searched link that was not grounded.\n")
+	b.WriteString("Before finalizing, enumerate the exact URLs you intend to cite. For each cited URL that came from `web_search`, call `ground_source` on that exact URL before citing it.\n")
+	b.WriteString("Corroborate important conclusions across multiple grounded sources whenever feasible. If a conclusion depends on one grounded source, say that plainly and lower the confidence unless the source is uniquely authoritative.\n")
 	b.WriteString("For recommendation or design-space questions, research multiple credible options before settling on one, then explain why the preferred option beats the strongest alternative.\n")
 	b.WriteString("When the recommendation depends on performance, cost, reliability, security impact, scale, or adoption, back it with grounded statistics, benchmark context, standards, or study results whenever credible data exists. If the evidence is only qualitative, limited, or stale, say that plainly.\n")
 	b.WriteString("Do not cite benchmark numbers, percentages, or study conclusions without grounding the source first and noting the date and measurement context when they materially affect the decision.\n")
+	b.WriteString("For every material recommendation or ranking, state whether the support comes from measured data, official guidance, peer-reviewed research, or only qualitative evidence.\n")
+	b.WriteString("When relevant literature, benchmarks, or empirical studies exist, digest them instead of just citing them, and use comparison tables or architecture and flow sketches when they materially improve the result.\n")
+	b.WriteString("Do your own technical analysis: validate assumptions, inspect methodology and dataset quality, sanity-check important math, and call out bias or threats to validity instead of only relaying source claims.\n")
+	b.WriteString("Treat the response as incomplete if it lacks the relevant structured artifact for the question, such as a comparison table, math walkthrough, algorithm sketch, or architecture or flow model.\n")
+	b.WriteString("Do not give Architect a shallow roundup that just recommends a winner, lists alternatives, and appends sources.\n")
+	b.WriteString("Before finalizing, run a rigor audit across all relevant dimensions: link-by-link grounding, corroboration, alternatives, counterevidence, math checks, methodology review, dataset quality, bias, threats to validity, and the right structured artifact. If any relevant check fails, keep researching or explicitly mark the result incomplete.\n")
+	b.WriteString("Write at the depth of a top-tier internal research memo, not a promotional or blog-style summary.\n")
 	b.WriteString("If you gather enough evidence to produce a reusable artifact, use `author_research_paper` so Architect receives structured research instead of only a chat answer.\n")
 	b.WriteString("Use `clone_via_librarian` or `crawl_links` when they materially improve source quality or implementation fit.\n")
 	b.WriteString("You may consult the Librarian for codebase fit and the Archivalist for historical precedent, but do not repeat the same consultation question to the same agent in one run.")

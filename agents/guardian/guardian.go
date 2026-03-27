@@ -812,19 +812,31 @@ func (g *Guardian) executeDirectSkill(ctx context.Context, name string, input st
 }
 
 func guardianDirectSkillPublishesStream(name string) bool {
-	switch strings.TrimSpace(name) {
-	case "tool_execution_control", "command_execution_control":
-		return false
-	default:
-		return true
-	}
+	return true
 }
 
 func formatGuardianDirectSkillOutput(data any) string {
 	if data == nil {
 		return ""
 	}
+	switch typed := data.(type) {
+	case commandapproval.Evaluation:
+		return formatGuardianApprovalEvaluation(typed)
+	case *commandapproval.Evaluation:
+		if typed != nil {
+			return formatGuardianApprovalEvaluation(*typed)
+		}
+	case toolruntime.GuardianControlGrant:
+		return formatGuardianControlGrant(typed)
+	case *toolruntime.GuardianControlGrant:
+		if typed != nil {
+			return formatGuardianControlGrant(*typed)
+		}
+	}
 	if payload, ok := data.(map[string]any); ok {
+		if text := formatGuardianDirectSkillOutputMap(payload); strings.TrimSpace(text) != "" {
+			return text
+		}
 		if message, _ := payload["user_message"].(string); strings.TrimSpace(message) != "" {
 			return strings.TrimSpace(message)
 		}
@@ -834,6 +846,60 @@ func formatGuardianDirectSkillOutput(data any) string {
 		return fmt.Sprintf("%v", data)
 	}
 	return string(bytes)
+}
+
+func formatGuardianApprovalEvaluation(eval commandapproval.Evaluation) string {
+	prefix := "Command approval"
+	if strings.EqualFold(strings.TrimSpace(eval.Analysis.Program), "fetch") ||
+		strings.HasPrefix(strings.TrimSpace(eval.Analysis.TemplateKey), "fetch|") {
+		prefix = "Fetch approval"
+	}
+	switch eval.Decision {
+	case commandapproval.DecisionAllow:
+		return prefix + " allowed"
+	case commandapproval.DecisionDeny:
+		return prefix + " blocked"
+	default:
+		return "Validating " + strings.ToLower(prefix) + " request"
+	}
+}
+
+func formatGuardianControlGrant(grant toolruntime.GuardianControlGrant) string {
+	if grant.Approved {
+		return "Tool execution allowed"
+	}
+	return "Tool execution blocked"
+}
+
+func formatGuardianDirectSkillOutputMap(payload map[string]any) string {
+	decision, _ := payload["decision"].(string)
+	decision = strings.TrimSpace(strings.ToLower(decision))
+	if decision != "" {
+		prefix := "Command approval"
+		if analysis, _ := payload["analysis"].(map[string]any); analysis != nil {
+			program, _ := analysis["program"].(string)
+			templateKey, _ := analysis["template_key"].(string)
+			if strings.EqualFold(strings.TrimSpace(program), "fetch") ||
+				strings.HasPrefix(strings.TrimSpace(templateKey), "fetch|") {
+				prefix = "Fetch approval"
+			}
+		}
+		switch decision {
+		case string(commandapproval.DecisionAllow):
+			return prefix + " allowed"
+		case string(commandapproval.DecisionDeny):
+			return prefix + " blocked"
+		default:
+			return "Validating " + strings.ToLower(prefix) + " request"
+		}
+	}
+	if approved, ok := payload["approved"].(bool); ok {
+		if approved {
+			return "Tool execution allowed"
+		}
+		return "Tool execution blocked"
+	}
+	return ""
 }
 
 func (g *Guardian) handleActionBusRequest(ctx context.Context, msg *guide.Message) error {
@@ -1181,15 +1247,25 @@ func (g *Guardian) InvokeSkill(ctx context.Context, name string, input json.RawM
 	if correlationID == "" {
 		correlationID = "invoke_" + uuid.NewString()
 	}
-	execResult, err := g.toolRuntime().ExecuteRaw(ctx, toolruntime.Invocation{
-		ToolCall: providers.ToolCall{
-			ID:        "invoke_" + uuid.NewString(),
-			Name:      name,
-			Arguments: raw,
-		},
-		AgentID:         g.toolRuntime().AgentID(),
-		CorrelationID:   correlationID,
-		CapabilityScope: g.toolRuntime().CapabilityScope(),
+	call := providers.ToolCall{
+		ID:        "invoke_" + uuid.NewString(),
+		Name:      name,
+		Arguments: raw,
+	}
+	execCtx := shared.WithActiveToolCall(ctx, call)
+	var execResult toolruntime.RawExecutionResult
+	_, err := shared.TimedToolCall(execCtx, "guardian", call, func() (string, error) {
+		var execErr error
+		execResult, execErr = g.toolRuntime().ExecuteRaw(execCtx, toolruntime.Invocation{
+			ToolCall:        call,
+			AgentID:         g.toolRuntime().AgentID(),
+			CorrelationID:   correlationID,
+			CapabilityScope: g.toolRuntime().CapabilityScope(),
+		})
+		if execErr != nil {
+			return "", execErr
+		}
+		return formatGuardianDirectSkillOutput(execResult.Data), nil
 	})
 	if err != nil {
 		return &skills.Result{SkillName: name, Success: false, Error: err.Error()}

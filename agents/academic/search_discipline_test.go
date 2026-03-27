@@ -19,10 +19,15 @@ func TestAcademicExternalResearchDisciplinePrompt_UsesExplicitResearchWorkflow(t
 		"`ground_source`",
 		"`web_fetch`, `fetch_document`, or one bounded `crawl_links`",
 		"must be grounded first with `ground_source` or an equivalent fetch skill",
+		"Triangulate material claims across multiple grounded sources whenever feasible",
 		"stop only when more searching is unlikely to materially change the conclusion",
 		"prefer primary empirical evidence and grounded quantitative data whenever feasible",
 		"Do not repeat benchmark numbers, percentages, or study findings unless you have inspected the source itself",
 		"say the evidence is qualitative, limited, or stale instead of implying false precision",
+		"Perform your own technical analysis rather than only relaying source claims",
+		"Treat substantial externally sourced answers as incomplete unless they contain the relevant structured artifact",
+		"Do not produce a shallow roundup that only recommends one option",
+		"run a rigor audit over all relevant dimensions",
 	} {
 		if !strings.Contains(prompt, needle) {
 			t.Fatalf("discipline prompt missing %q:\n%s", needle, prompt)
@@ -37,8 +42,13 @@ func TestAcademicForwardedResearchPrompt_ArchitectRequiresGroundedNumbers(t *tes
 	})
 	for _, needle := range []string{
 		"Any link surfaced via `web_search` that you plan to cite, quote, or list as a source must be grounded first.",
+		"Corroborate important conclusions across multiple grounded sources whenever feasible.",
 		"back it with grounded statistics, benchmark context, standards, or study results whenever credible data exists",
 		"Do not cite benchmark numbers, percentages, or study conclusions without grounding the source first",
+		"Do your own technical analysis: validate assumptions, inspect methodology and dataset quality",
+		"Treat the response as incomplete if it lacks the relevant structured artifact for the question",
+		"Do not give Architect a shallow roundup that just recommends a winner",
+		"run a rigor audit across all relevant dimensions",
 	} {
 		if !strings.Contains(prompt, needle) {
 			t.Fatalf("forwarded research prompt missing %q:\n%s", needle, prompt)
