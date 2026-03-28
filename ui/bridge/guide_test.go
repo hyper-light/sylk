@@ -668,6 +668,213 @@ func TestParseInterAgentBranchRefFromMetadata_AcceptsStringifiedNestedFlag(t *te
 	}
 }
 
+func TestParseToolCallEventMsg_UsesEventStreamMetadataFallbackForBranchRef(t *testing.T) {
+	stream := &guide.StreamResponse{
+		CorrelationID:     "corr-tool-fallback",
+		RespondingAgentID: "academic",
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventToolCall,
+			Data: map[string]any{
+				"tool_name":     "consult",
+				"tool_call_key": "consult-1",
+				"phase":         0,
+				"stream_metadata": map[string]any{
+					"agent_type":                  "academic",
+					"chat_nested_branch":          true,
+					"chat_parent_correlation_id":  "corr-parent",
+					"chat_parent_tool_call_key":   "consult-root-1",
+					"chat_inter_agent_kind":       "consult",
+					"chat_inter_agent_thread_key": "thread-1",
+				},
+			},
+		},
+	}
+
+	msg := parseToolCallEventMsg("session-1", "corr-tool-fallback", stream)
+	if msg.AgentType != "academic" {
+		t.Fatalf("AgentType = %q, want academic", msg.AgentType)
+	}
+	if msg.BranchRef == nil {
+		t.Fatal("expected branch ref from event stream_metadata fallback")
+	}
+	if msg.BranchRef.ParentCorrelationID != "corr-parent" || msg.BranchRef.ParentToolCallKey != "consult-root-1" {
+		t.Fatalf("unexpected branch ref: %+v", msg.BranchRef)
+	}
+	if msg.BranchRef.ThreadKey != "thread-1" {
+		t.Fatalf("thread key = %q, want thread-1", msg.BranchRef.ThreadKey)
+	}
+}
+
+func TestParseToolCallEventMsg_UsesEventMetadataFallbackForBranchRef(t *testing.T) {
+	stream := &guide.StreamResponse{
+		CorrelationID:     "corr-tool-metadata-fallback",
+		RespondingAgentID: "librarian",
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventToolCall,
+			Data: map[string]any{
+				"tool_name":     "web_search",
+				"tool_call_key": "ws_1",
+				"phase":         0,
+				"metadata": map[string]any{
+					"agent_type":                 "librarian",
+					"chat_nested_branch":         "true",
+					"chat_parent_correlation_id": "corr-parent",
+					"chat_parent_tool_call_key":  "consult-lib-1",
+					"chat_inter_agent_kind":      "consult",
+				},
+			},
+		},
+	}
+
+	msg := parseToolCallEventMsg("session-1", "corr-tool-metadata-fallback", stream)
+	if msg.AgentType != "librarian" {
+		t.Fatalf("AgentType = %q, want librarian", msg.AgentType)
+	}
+	if msg.BranchRef == nil {
+		t.Fatal("expected branch ref from event metadata fallback")
+	}
+	if msg.BranchRef.ParentCorrelationID != "corr-parent" || msg.BranchRef.ParentToolCallKey != "consult-lib-1" {
+		t.Fatalf("unexpected branch ref: %+v", msg.BranchRef)
+	}
+}
+
+func TestParseToolCallEventMsg_EventMetadataOverridesStaleStreamMetadata(t *testing.T) {
+	stream := &guide.StreamResponse{
+		CorrelationID:     "corr-tool-event-override",
+		RespondingAgentID: "academic",
+		Metadata: map[string]any{
+			"agent_type":                  "academic",
+			"chat_nested_branch":          true,
+			"chat_parent_correlation_id":  "corr-stale-parent",
+			"chat_parent_tool_call_key":   "consult-stale-1",
+			"chat_inter_agent_kind":       "consult",
+			"chat_inter_agent_thread_key": "thread-stale",
+		},
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventToolCall,
+			Data: map[string]any{
+				"tool_name":     "consult",
+				"tool_call_key": "consult-lib-1",
+				"phase":         0,
+				"stream_metadata": map[string]any{
+					"agent_type":                  "academic",
+					"chat_nested_branch":          true,
+					"chat_parent_correlation_id":  "corr-child-parent",
+					"chat_parent_tool_call_key":   "consult-child-1",
+					"chat_inter_agent_kind":       "consult",
+					"chat_inter_agent_thread_key": "thread-child",
+				},
+			},
+		},
+	}
+
+	msg := parseToolCallEventMsg("session-1", "corr-tool-event-override", stream)
+	if msg.BranchRef == nil {
+		t.Fatal("expected branch ref from event metadata override")
+	}
+	if msg.BranchRef.ParentCorrelationID != "corr-child-parent" || msg.BranchRef.ParentToolCallKey != "consult-child-1" {
+		t.Fatalf("unexpected branch ref: %+v", msg.BranchRef)
+	}
+	if msg.BranchRef.ThreadKey != "thread-child" {
+		t.Fatalf("thread key = %q, want thread-child", msg.BranchRef.ThreadKey)
+	}
+}
+
+func TestGuideBridgeDispatch_UsesEnvelopeMetadataForNestedStreamStart(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatch(&guide.Message{
+		CorrelationID: "corr-envelope-start",
+		Type:          guide.MessageTypeStream,
+		Metadata: map[string]any{
+			"agent_type":                  "academic",
+			"chat_nested_branch":          true,
+			"chat_parent_correlation_id":  "corr-parent",
+			"chat_parent_tool_call_key":   "consult-root-1",
+			"chat_inter_agent_kind":       "consult",
+			"chat_inter_agent_thread_key": "thread-1",
+		},
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "corr-envelope-start",
+			RespondingAgentID: "academic",
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventStart,
+			},
+		},
+	}, program)
+
+	if len(program.messages) != 1 {
+		t.Fatalf("expected 1 forwarded message, got %d", len(program.messages))
+	}
+	start, ok := program.messages[0].(uimsg.StreamStartMsg)
+	if !ok {
+		t.Fatalf("expected StreamStartMsg, got %T", program.messages[0])
+	}
+	if start.AgentType != "academic" {
+		t.Fatalf("AgentType = %q, want academic", start.AgentType)
+	}
+	if start.BranchRef == nil {
+		t.Fatal("expected branch ref from stream envelope metadata")
+	}
+	if start.BranchRef.ParentCorrelationID != "corr-parent" || start.BranchRef.ParentToolCallKey != "consult-root-1" {
+		t.Fatalf("unexpected branch ref: %+v", start.BranchRef)
+	}
+	if start.BranchRef.ThreadKey != "thread-1" {
+		t.Fatalf("thread key = %q, want thread-1", start.BranchRef.ThreadKey)
+	}
+}
+
+func TestGuideBridgeDispatch_UsesEnvelopeMetadataForNestedToolCall(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatch(&guide.Message{
+		CorrelationID: "corr-envelope-tool",
+		Type:          guide.MessageTypeStream,
+		Metadata: map[string]any{
+			"agent_type":                  "academic",
+			"chat_nested_branch":          true,
+			"chat_parent_correlation_id":  "corr-parent",
+			"chat_parent_tool_call_key":   "consult-root-1",
+			"chat_inter_agent_kind":       "consult",
+			"chat_inter_agent_thread_key": "thread-1",
+		},
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "corr-envelope-tool",
+			RespondingAgentID: "academic",
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventToolCall,
+				Data: map[string]any{
+					"tool_name":     "web_search",
+					"tool_call_key": "ws_1",
+					"phase":         0,
+				},
+			},
+		},
+	}, program)
+
+	if len(program.messages) != 1 {
+		t.Fatalf("expected 1 forwarded message, got %d", len(program.messages))
+	}
+	ev, ok := program.messages[0].(uimsg.ToolCallEventMsg)
+	if !ok {
+		t.Fatalf("expected ToolCallEventMsg, got %T", program.messages[0])
+	}
+	if ev.AgentType != "academic" {
+		t.Fatalf("AgentType = %q, want academic", ev.AgentType)
+	}
+	if ev.BranchRef == nil {
+		t.Fatal("expected branch ref from stream envelope metadata")
+	}
+	if ev.BranchRef.ParentCorrelationID != "corr-parent" || ev.BranchRef.ParentToolCallKey != "consult-root-1" {
+		t.Fatalf("unexpected branch ref: %+v", ev.BranchRef)
+	}
+	if ev.BranchRef.ThreadKey != "thread-1" {
+		t.Fatalf("thread key = %q, want thread-1", ev.BranchRef.ThreadKey)
+	}
+}
+
 func TestToGuideMsg_PreservesApprovalBranchMetadata(t *testing.T) {
 	resp := &guide.RouteResponse{
 		CorrelationID:       "corr-approval",

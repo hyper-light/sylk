@@ -3934,6 +3934,7 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 			streamResp.RespondingAgentName = g.resolveAgentDisplayName(pending.TargetAgentID)
 		}
 		publishErr := g.publishStreamToSource(streamTarget, streamResp)
+		mirrorErr := g.publishStreamActivityToRequester(pending, streamTarget, streamResp)
 		if streamResp.Event != nil && streamResp.Event.Type == StreamEventComplete {
 			if pending.Request != nil && pending.Request.FireAndForget {
 				g.pending.Remove(streamResp.CorrelationID)
@@ -3943,7 +3944,7 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 				g.streams.CloseStream(streamResp.CorrelationID)
 			}
 		}
-		return publishErr
+		return errors.Join(publishErr, mirrorErr)
 	default:
 		return nil
 	}
@@ -4555,8 +4556,19 @@ func (g *Guide) mergedStreamRelayMetadata(correlationID string, current map[stri
 	return mergeMetadata(base, current)
 }
 
+func cloneStreamResponse(resp *StreamResponse) *StreamResponse {
+	if resp == nil {
+		return nil
+	}
+	cloned := *resp
+	cloned.Metadata = cloneMetadata(resp.Metadata)
+	return &cloned
+}
+
 func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse) error {
+	resp = cloneStreamResponse(resp)
 	if resp != nil {
+		resp.TargetAgentID = sourceAgentID
 		resp.Metadata = g.mergedStreamRelayMetadata(resp.CorrelationID, resp.Metadata)
 	}
 	msg := &Message{
@@ -4582,6 +4594,17 @@ func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse
 			"publish_err", err)
 	}
 	return err
+}
+
+func (g *Guide) publishStreamActivityToRequester(pending *PendingRequest, primaryTarget string, resp *StreamResponse) error {
+	if pending == nil || resp == nil {
+		return nil
+	}
+	sourceAgentID := strings.TrimSpace(pending.SourceAgentID)
+	if sourceAgentID == "" || sourceAgentID == strings.TrimSpace(primaryTarget) {
+		return nil
+	}
+	return g.publishStreamToSource(sourceAgentID, resp)
 }
 
 func (g *Guide) publishErrorToSource(sourceAgentID string, correlationID string, sourceAgent string, errStr string, pending *PendingRequest) error {

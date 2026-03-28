@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/adalundhe/sylk/ui/theme"
 	"github.com/charmbracelet/lipgloss"
@@ -20,6 +21,8 @@ type selectionRegion struct {
 	toolCallIndex    int
 	childIndex       int
 	childToolCallIdx int
+	childPath        []int
+	interAgentPath   []int
 }
 
 type selectionRegionKind int
@@ -435,6 +438,8 @@ func entryRegions(entry *ChatEntry) []selectionRegion {
 		toolCallIndex:    -1,
 		childIndex:       -1,
 		childToolCallIdx: -1,
+		childPath:        nil,
+		interAgentPath:   nil,
 	}}
 	for _, tr := range entry.ToolCallRegions {
 		regions = append(regions, selectionRegion{
@@ -444,6 +449,8 @@ func entryRegions(entry *ChatEntry) []selectionRegion {
 			toolCallIndex:    tr.RecordIdx,
 			childIndex:       -1,
 			childToolCallIdx: -1,
+			childPath:        nil,
+			interAgentPath:   nil,
 		})
 		for _, sr := range tr.Subregions {
 			kind := selectionRegionChildToolCall
@@ -457,6 +464,8 @@ func entryRegions(entry *ChatEntry) []selectionRegion {
 				toolCallIndex:    tr.RecordIdx,
 				childIndex:       sr.ChildIndex,
 				childToolCallIdx: sr.ChildToolCallIdx,
+				childPath:        cloneIntSlice(sr.ChildPath),
+				interAgentPath:   cloneIntSlice(sr.InterAgentPath),
 			})
 		}
 	}
@@ -468,6 +477,8 @@ func entryRegions(entry *ChatEntry) []selectionRegion {
 			toolCallIndex:    -1,
 			childIndex:       -1,
 			childToolCallIdx: -1,
+			childPath:        nil,
+			interAgentPath:   nil,
 		})
 	}
 	sort.SliceStable(regions[1:], func(i, j int) bool {
@@ -499,6 +510,8 @@ type toggleTarget struct {
 	toolCallIndex       int
 	childIndex          int
 	childToolCallIdx    int
+	childPath           []int
+	interAgentPath      []int
 	toolCallKey         string
 	toolCallName        string
 	toolCallArgsID      string
@@ -513,7 +526,18 @@ func cloneToggleTarget(target *toggleTarget) *toggleTarget {
 		return nil
 	}
 	cloned := *target
+	cloned.childPath = cloneIntSlice(target.childPath)
+	cloned.interAgentPath = cloneIntSlice(target.interAgentPath)
 	return &cloned
+}
+
+func cloneIntSlice(in []int) []int {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]int, len(in))
+	copy(out, in)
+	return out
 }
 
 func cloneToggleTargets(targets []*toggleTarget) []*toggleTarget {
@@ -563,11 +587,15 @@ func buildOverflowToggleTarget(
 	entryIndex, toolCallIndex, childIndex int,
 	record ToolCallRecord,
 	child *InterAgentChildActivity,
+	childPath []int,
+	interAgentPath []int,
 ) *toggleTarget {
 	target := buildToolCallToggleTarget(entry, entryIndex, toolCallIndex, record)
 	if target != nil {
 		target.kind = toggleTargetOverflow
 		target.childIndex = childIndex
+		target.childPath = cloneIntSlice(childPath)
+		target.interAgentPath = cloneIntSlice(interAgentPath)
 		if child != nil {
 			target.childID = strings.TrimSpace(child.CorrelationID)
 		}
@@ -581,6 +609,8 @@ func buildChildToolCallToggleTarget(
 	record ToolCallRecord,
 	childIndex int,
 	child InterAgentChildActivity,
+	childPath []int,
+	interAgentPath []int,
 	childToolCallIdx int,
 	childTool ToolCallRecord,
 ) *toggleTarget {
@@ -591,11 +621,46 @@ func buildChildToolCallToggleTarget(
 	target.kind = toggleTargetChildToolCall
 	target.childIndex = childIndex
 	target.childToolCallIdx = childToolCallIdx
+	target.childPath = cloneIntSlice(childPath)
+	target.interAgentPath = cloneIntSlice(interAgentPath)
 	target.childID = strings.TrimSpace(child.CorrelationID)
 	target.childToolCallKey = strings.TrimSpace(childTool.ToolCallKey)
 	target.childToolCallName = strings.TrimSpace(childTool.ToolName)
 	target.childToolCallArgsID = toolCallArgumentsIdentity(childTool.FullArgs, childTool.ArgsSummary)
 	return target
+}
+
+func resolveInterAgentChildPath(row *InterAgentTool, childPath []int, interAgentPath []int) (int, *InterAgentChildActivity, bool) {
+	if row == nil {
+		return -1, nil, false
+	}
+	if len(childPath) == 0 {
+		return -1, nil, false
+	}
+	currentRow := row
+	var child *InterAgentChildActivity
+	for depth, childIndex := range childPath {
+		if childIndex < 0 || childIndex >= len(currentRow.Children) {
+			return -1, nil, false
+		}
+		child = &currentRow.Children[childIndex]
+		if depth == len(childPath)-1 {
+			return childIndex, child, true
+		}
+		if depth >= len(interAgentPath) {
+			return -1, nil, false
+		}
+		nextToolCallIdx := interAgentPath[depth]
+		if nextToolCallIdx < 0 || nextToolCallIdx >= len(child.ToolCalls) {
+			return -1, nil, false
+		}
+		next := child.ToolCalls[nextToolCallIdx].InterAgent
+		if next == nil {
+			return -1, nil, false
+		}
+		currentRow = next
+	}
+	return -1, nil, false
 }
 
 func (vp *Viewport) ToggleTargetAtViewLine(y int) *toggleTarget {
@@ -646,20 +711,26 @@ func (vp *Viewport) resolveToggleTarget(entryIdx int, entry *ChatEntry, lineInEn
 			if lineInEntry >= sr.Start && lineInEntry < sr.End {
 				switch sr.Kind {
 				case ToolCallSubregionOverflow:
-					if record.InterAgent == nil || sr.ChildIndex < 0 || sr.ChildIndex >= len(record.InterAgent.Children) {
+					if record.InterAgent == nil {
 						continue
 					}
-					child := record.InterAgent.Children[sr.ChildIndex]
-					return buildOverflowToggleTarget(entry, entryIdx, tr.RecordIdx, sr.ChildIndex, record, &child)
+					childIndex, child, ok := resolveInterAgentChildPath(record.InterAgent, sr.ChildPath, sr.InterAgentPath)
+					if !ok {
+						continue
+					}
+					return buildOverflowToggleTarget(entry, entryIdx, tr.RecordIdx, childIndex, record, child, sr.ChildPath, sr.InterAgentPath)
 				case ToolCallSubregionChildTool:
-					if record.InterAgent == nil || sr.ChildIndex < 0 || sr.ChildIndex >= len(record.InterAgent.Children) {
+					if record.InterAgent == nil {
 						continue
 					}
-					child := record.InterAgent.Children[sr.ChildIndex]
+					childIndex, child, ok := resolveInterAgentChildPath(record.InterAgent, sr.ChildPath, sr.InterAgentPath)
+					if !ok || child == nil {
+						continue
+					}
 					if sr.ChildToolCallIdx < 0 || sr.ChildToolCallIdx >= len(child.ToolCalls) {
 						continue
 					}
-					return buildChildToolCallToggleTarget(entry, entryIdx, tr.RecordIdx, record, sr.ChildIndex, child, sr.ChildToolCallIdx, child.ToolCalls[sr.ChildToolCallIdx])
+					return buildChildToolCallToggleTarget(entry, entryIdx, tr.RecordIdx, record, childIndex, *child, sr.ChildPath, sr.InterAgentPath, sr.ChildToolCallIdx, child.ToolCalls[sr.ChildToolCallIdx])
 				}
 			}
 		}
@@ -821,13 +892,46 @@ func overlayRight(line, badge string, viewWidth, badgeWidth int) string {
 // sequences to the given number of visible columns. An ANSI reset is
 // appended to close any open style sequences.
 func truncateVisible(s string, maxCols int) string {
-	runes := []rune(s)
-	for i := range runes {
-		if lipgloss.Width(string(runes[:i+1])) > maxCols {
-			return string(runes[:i]) + ansiReset
-		}
+	if maxCols <= 0 {
+		return ""
 	}
-	return s
+	var buf strings.Builder
+	visible := 0
+	i := 0
+	truncated := false
+	for i < len(s) {
+		if s[i] == '\x1b' {
+			j := i + 1
+			if j < len(s) && s[j] == '[' {
+				j++
+				for j < len(s) && !isCSITerminator(s[j]) {
+					j++
+				}
+				if j < len(s) {
+					j++
+				}
+			}
+			buf.WriteString(s[i:j])
+			i = j
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 0 {
+			break
+		}
+		nextVisible := visible + lipgloss.Width(string(r))
+		if nextVisible > maxCols {
+			truncated = true
+			break
+		}
+		buf.WriteString(s[i : i+size])
+		visible = nextVisible
+		i += size
+	}
+	if truncated {
+		buf.WriteString(ansiReset)
+	}
+	return buf.String()
 }
 
 // heightIndex is a prefix-sum index over entry heights for O(log n) lookups.

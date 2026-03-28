@@ -218,6 +218,22 @@ func TestViewportUsesFullInnerWidthWithoutPrematureWrap(t *testing.T) {
 	}
 }
 
+func TestTruncateVisible_PreservesCompleteCSISequences(t *testing.T) {
+	line := lipgloss.NewStyle().Foreground(lipgloss.Color("#7dcfff")).Render("└─ ") +
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1")).Bold(true).Render("web_search framework benchmarks methodology")
+
+	truncated := truncateVisible(line, 18)
+	if got := lipgloss.Width(truncated); got > 18 {
+		t.Fatalf("truncateVisible width = %d, want <= 18 for %q", got, truncated)
+	}
+	if !strings.HasSuffix(truncated, ansiReset) {
+		t.Fatalf("expected truncated styled line to end with ANSI reset, got %q", truncated)
+	}
+	if hasIncompleteCSISequence(truncated) {
+		t.Fatalf("truncateVisible returned incomplete CSI sequence: %q", truncated)
+	}
+}
+
 func TestViewportEntryHeightIncludesThinkingInterAgentRows(t *testing.T) {
 	history := NewHistory(2)
 	history.Push(&ChatEntry{
@@ -325,6 +341,151 @@ func TestViewportEntryHeightIncludesNestedInterAgentChildLines(t *testing.T) {
 	}
 }
 
+func TestViewportDeepNestedPendingInterAgentTreeKeepsFollowingEntryVisibleAcrossRerenders(t *testing.T) {
+	history := NewHistory(3)
+	history.Push(&ChatEntry{
+		ID:        "architect-deep-nested-pending",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_academic_approach",
+				ToolCallKey: "consult-academic-1",
+				StartedAt:   time.Now().Add(-700 * time.Millisecond),
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Compare evidence collection approaches",
+					Status:     InterAgentToolPending,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID:  "child-academic-deep-viewport",
+							AgentType:      "academic",
+							ThinkingStatus: "Delegating benchmark collection.",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "consult",
+									ToolCallKey: "consult-librarian-1",
+									StartedAt:   time.Now().Add(-500 * time.Millisecond),
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolConsult,
+										AgentTypes: []string{"librarian"},
+										Summary:    "Find benchmark and methodology sources",
+										Status:     InterAgentToolPending,
+										Children: []InterAgentChildActivity{
+											{
+												CorrelationID:  "child-librarian-deep-viewport",
+												AgentType:      "librarian",
+												ThinkingStatus: "Collecting benchmark sources and methodology notes.",
+												ThinkingText:   "⠋  0.5s",
+												ThinkingColor:  "#7dcfff",
+												ToolCalls: []ToolCallRecord{
+													{
+														ToolName:    "web_search",
+														ArgsSummary: "framework benchmarks methodology",
+														StartedAt:   time.Now().Add(-350 * time.Millisecond),
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	history.Push(&ChatEntry{
+		ID:        "tail-after-deep-nested",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		Content:   "Tail entry still visible below the deep nested pending consultation tree.",
+	})
+
+	vp := NewViewport(history, theme.DefaultDark())
+	vp.SetSize(96, 10)
+
+	for i := 0; i < 6; i++ {
+		view := vp.View()
+		if !strings.Contains(view, "Tail entry still visible below the deep nested pending consultation tree.") {
+			t.Fatalf("rerender %d dropped following entry from viewport: %q", i, view)
+		}
+	}
+}
+
+func TestViewportDeepNestedPendingInterAgentTreeStaysWithinPanelWidth(t *testing.T) {
+	history := NewHistory(2)
+	history.Push(&ChatEntry{
+		ID:        "architect-deep-nested-width",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_academic_approach",
+				ToolCallKey: "consult-academic-width",
+				StartedAt:   time.Now().Add(-600 * time.Millisecond),
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Compare evidence collection approaches",
+					Status:     InterAgentToolPending,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID:  "child-academic-width",
+							AgentType:      "academic",
+							ThinkingStatus: "Delegating benchmark collection.",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "consult",
+									ToolCallKey: "consult-librarian-width",
+									StartedAt:   time.Now().Add(-450 * time.Millisecond),
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolConsult,
+										AgentTypes: []string{"librarian"},
+										Summary:    "Find benchmark and methodology sources",
+										Status:     InterAgentToolPending,
+										Children: []InterAgentChildActivity{
+											{
+												CorrelationID:  "child-librarian-width",
+												AgentType:      "librarian",
+												ThinkingStatus: "Collecting benchmark sources and methodology notes.",
+												ThinkingText:   "⠋  0.5s",
+												ThinkingColor:  "#7dcfff",
+												ToolCalls: []ToolCallRecord{
+													{
+														ToolName:    "web_search",
+														ArgsSummary: "framework benchmarks methodology",
+														StartedAt:   time.Now().Add(-300 * time.Millisecond),
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	vp := NewViewport(history, theme.DefaultDark())
+	vp.SetSize(70, 10)
+
+	lines := strings.Split(vp.View(), "\n")
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got > 70 {
+			t.Fatalf("viewport line %d width = %d, want <= 70: %q", i, got, line)
+		}
+	}
+}
+
 func TestViewportActiveStreamViewStaysWithinPanelWidth(t *testing.T) {
 	history := NewHistory(2)
 	history.Push(&ChatEntry{
@@ -351,4 +512,25 @@ func TestViewportActiveStreamViewStaysWithinPanelWidth(t *testing.T) {
 			t.Fatalf("viewport line %d width = %d, want <= 32: %q", i, got, line)
 		}
 	}
+}
+
+func hasIncompleteCSISequence(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\x1b' {
+			continue
+		}
+		j := i + 1
+		if j >= len(s) || s[j] != '[' {
+			return true
+		}
+		j++
+		for j < len(s) && !isCSITerminator(s[j]) {
+			j++
+		}
+		if j >= len(s) {
+			return true
+		}
+		i = j
+	}
+	return false
 }

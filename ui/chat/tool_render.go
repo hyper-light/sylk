@@ -103,14 +103,13 @@ func renderToolCalls(calls []ToolCallRecord, width int, th *theme.Theme) ([]stri
 }
 
 type interAgentRenderedChildRow struct {
-	lines            []string
-	kind             ToolCallSubregionKind
-	childIndex       int
-	childToolCallIdx int
+	lines      []string
+	subregions []ToolCallSubregion
 }
 
 type interAgentRenderedChildSection struct {
 	childIndex int
+	childPath  []int
 	header     string
 	rows       []interAgentRenderedChildRow
 }
@@ -120,67 +119,38 @@ func renderInterAgentToolCall(calls []ToolCallRecord, idx, width int, th *theme.
 		return nil, nil
 	}
 	row := calls[idx].InterAgent
-	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	headerConnectorWidth := lipgloss.Width("├─ ")
-	childHeaderWidth := max(width-headerConnectorWidth, 0)
-	childRowWidth := max(width-lipgloss.Width("│  ")-headerConnectorWidth, 0)
-	childSections := renderInterAgentChildSections(row, childHeaderWidth, childRowWidth, th, grad)
-	if len(childSections) == 0 {
+	if !interAgentToolHasVisibleChildren(row) {
 		lines := []string{renderInterAgentHeadline(calls, idx, row, width, th)}
 		if calls[idx].Expanded {
 			lines = append(lines, renderInterAgentExpandedSummary(calls, idx, row, width, th)...)
 		}
 		return lines, nil
 	}
-	lines := make([]string, 0, len(childSections)*2)
-	var subregions []ToolCallSubregion
+
+	rootSummary := normalizeInlineText(row.Summary)
 	hasLater := hasLaterInterAgentCall(calls, idx)
-	for childIdx, child := range childSections {
-		headerConnector := "├─ "
-		sectionContinues := childIdx < len(childSections)-1 || hasLater
-		if !sectionContinues {
-			headerConnector = "└─ "
+	specs := orderedInterAgentChildren(row, nil, nil)
+	if len(specs) == 0 {
+		lines := []string{renderInterAgentHeadline(calls, idx, row, width, th)}
+		if calls[idx].Expanded {
+			lines = append(lines, renderInterAgentExpandedSummary(calls, idx, row, width, th)...)
 		}
-		if child.header != "" {
-			lines = append(lines, truncateStyledWithDots(mutedStyle.Render(headerConnector)+truncateStyledWithDots(child.header, childHeaderWidth), width))
-		}
-		if len(child.rows) == 0 {
-			continue
-		}
-		nestedStem := mutedStyle.Render("│  ")
-		if !sectionContinues {
-			nestedStem = mutedStyle.Render("   ")
-		}
-		for rowIdx, childRow := range child.rows {
-			rowConnector := "├─ "
-			if rowIdx == len(child.rows)-1 {
-				rowConnector = "└─ "
-			}
-			rowStart := len(lines)
-			firstPrefix := nestedStem + mutedStyle.Render(rowConnector)
-			contPrefix := nestedStem + mutedStyle.Render("│  ")
-			if rowIdx == len(child.rows)-1 {
-				contPrefix = nestedStem + mutedStyle.Render("   ")
-			}
-			for lineIdx, line := range childRow.lines {
-				prefix := firstPrefix
-				if lineIdx > 0 {
-					prefix = contPrefix
-				}
-				lines = append(lines, truncateStyledWithDots(prefix+truncateStyledWithDots(line, childRowWidth), width))
-			}
-			if childRow.kind != "" && len(childRow.lines) > 0 {
-				subregions = append(subregions, ToolCallSubregion{
-					Start:            rowStart,
-					End:              len(lines),
-					Kind:             childRow.kind,
-					ChildIndex:       child.childIndex,
-					ChildToolCallIdx: childRow.childToolCallIdx,
-				})
-			}
-		}
+		return lines, nil
 	}
-	return lines, subregions
+	stack := make([]interAgentNestedBlockItem, 0, len(specs))
+	for i := len(specs) - 1; i >= 0; i-- {
+		spec := specs[i]
+		stack = append(stack, interAgentNestedBlockItem{
+			kind:           interAgentNestedBlockItemChildHeader,
+			isLast:         i == len(specs)-1 && !hasLater,
+			childIndex:     spec.childIndex,
+			childPath:      cloneIntSlice(spec.childPath),
+			interAgentPath: nil,
+			child:          spec.child,
+			rootSummary:    rootSummary,
+		})
+	}
+	return renderInterAgentNestedBlock(stack, width, th, grad)
 }
 
 func renderInterAgentHeadline(calls []ToolCallRecord, idx int, row *InterAgentTool, width int, th *theme.Theme) string {
@@ -195,17 +165,13 @@ func renderInterAgentHeadline(calls []ToolCallRecord, idx int, row *InterAgentTo
 		treePrefix = "├─"
 	}
 
-	statusIcon, statusStyle := interAgentStatusGlyph(row.Status, th)
-	prefix := mutedStyle.Render(treePrefix+" ") + statusStyle.Render(statusIcon) + " "
-	labelBlock := renderInterAgentLabels(row.AgentTypes, th, mutedStyle)
-	linePrefix := prefix + labelBlock
-
+	linePrefix := mutedStyle.Render(treePrefix+" ") + renderInterAgentLabels(row.AgentTypes, th, mutedStyle)
 	summary := normalizeInlineText(row.Summary)
 	if summary != "" {
 		linePrefix += mutedStyle.Render(" - ") + summaryStyle.Render(truncatePlainWithDots(summary, max(width-lipgloss.Width(linePrefix+" - "), 0)))
 	}
 
-	return truncateStyledWithDots(linePrefix, width)
+	return composeSingleLineToolCall(linePrefix, renderNestedInterAgentToolCallRightPart(calls[idx], th), width)
 }
 
 func renderInterAgentExpandedSummary(calls []ToolCallRecord, idx int, row *InterAgentTool, width int, th *theme.Theme) []string {
@@ -251,21 +217,18 @@ func renderInterAgentChildSections(row *InterAgentTool, headerWidth, rowWidth in
 		}
 		header := renderInterAgentChildHeader(*child, headerWidth, th, rootSummary)
 		rows := make([]interAgentRenderedChildRow, 0, len(child.ToolCalls))
+		childPath := []int{childIndex}
 		for j := range child.ToolCalls {
-			if lines := renderInterAgentChildToolCall(child.ToolCalls[j], rowWidth, th, grad); len(lines) > 0 {
-				rows = append(rows, interAgentRenderedChildRow{
-					lines:            lines,
-					kind:             ToolCallSubregionChildTool,
-					childIndex:       childIndex,
-					childToolCallIdx: j,
-				})
+			row := renderInterAgentChildToolCall(child.ToolCalls[j], rowWidth, th, grad, childPath, nil, j)
+			if len(row.lines) > 0 {
+				rows = append(rows, row)
 			}
 		}
-		rows = capInterAgentChildRows(rows, rowWidth, th, child.ToolCallsExpanded, childIndex)
+		rows = capInterAgentChildRows(rows, rowWidth, th, child.ToolCallsExpanded, childPath, nil)
 		if header == "" && len(rows) == 0 {
 			continue
 		}
-		sections = append(sections, interAgentRenderedChildSection{childIndex: childIndex, header: header, rows: rows})
+		sections = append(sections, interAgentRenderedChildSection{childIndex: childIndex, childPath: cloneIntSlice(childPath), header: header, rows: rows})
 	}
 	for i := range row.Children {
 		if usedChildren[i] {
@@ -274,21 +237,18 @@ func renderInterAgentChildSections(row *InterAgentTool, headerWidth, rowWidth in
 		child := row.Children[i]
 		header := renderInterAgentChildHeader(child, headerWidth, th, rootSummary)
 		rows := make([]interAgentRenderedChildRow, 0, len(child.ToolCalls))
+		childPath := []int{i}
 		for j := range child.ToolCalls {
-			if lines := renderInterAgentChildToolCall(child.ToolCalls[j], rowWidth, th, grad); len(lines) > 0 {
-				rows = append(rows, interAgentRenderedChildRow{
-					lines:            lines,
-					kind:             ToolCallSubregionChildTool,
-					childIndex:       i,
-					childToolCallIdx: j,
-				})
+			rendered := renderInterAgentChildToolCall(child.ToolCalls[j], rowWidth, th, grad, childPath, nil, j)
+			if len(rendered.lines) > 0 {
+				rows = append(rows, rendered)
 			}
 		}
-		rows = capInterAgentChildRows(rows, rowWidth, th, child.ToolCallsExpanded, i)
+		rows = capInterAgentChildRows(rows, rowWidth, th, child.ToolCallsExpanded, childPath, nil)
 		if header == "" && len(rows) == 0 {
 			continue
 		}
-		sections = append(sections, interAgentRenderedChildSection{childIndex: i, header: header, rows: rows})
+		sections = append(sections, interAgentRenderedChildSection{childIndex: i, childPath: cloneIntSlice(childPath), header: header, rows: rows})
 	}
 	return sections
 }
@@ -337,31 +297,44 @@ func renderInterAgentChildHeader(child InterAgentChildActivity, width int, th *t
 	}
 	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	summaryStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	statusIcon, statusStyle := interAgentChildStatusGlyph(child, th)
 	label := renderInterAgentLabels([]string{nestedActivityAgentType(&child)}, th, mutedStyle)
-	left := statusStyle.Render(statusIcon) + " " + label
+	left := label
 	if summary := interAgentChildSummary(child, rootSummary); summary != "" {
 		left += mutedStyle.Render(" - ") + summaryStyle.Render(truncatePlainWithDots(summary, max(width-lipgloss.Width(left+" - "), 0)))
 	}
-	return truncateStyledWithDots(left, width)
+	return composeSingleLineToolCall(left, renderInterAgentChildRightPart(child, th), width)
 }
 
 func interAgentChildSummary(child InterAgentChildActivity, rootSummary string) string {
 	if !child.Completed {
-		summary := normalizeInlineText(strings.TrimSpace(strings.Join([]string{
-			normalizeInlineText(child.ThinkingStatus),
-			normalizeThinkingLine(child.ThinkingText),
-		}, " ")))
-		if summary == "Thinking..." {
-			return ""
+		root := normalizeInlineText(rootSummary)
+		status := normalizeInlineText(child.ThinkingStatus)
+		switch {
+		case root == "":
+			return status
+		case status == "" || status == root:
+			return root
+		default:
+			return normalizeInlineText(root + " / " + status)
 		}
-		return summary
 	}
 	summary := normalizeInlineText(child.ResultSummary)
 	if summary == "" || summary == rootSummary {
 		return ""
 	}
 	return summary
+}
+
+func renderInterAgentChildRightPart(child InterAgentChildActivity, th *theme.Theme) string {
+	statusIcon, statusStyle := interAgentChildStatusGlyph(child, th)
+	if child.Completed || child.Failed {
+		return statusStyle.Render(statusIcon)
+	}
+	statusText := strings.TrimSpace(child.ThinkingText)
+	if statusText == "" {
+		return statusStyle.Render(statusIcon)
+	}
+	return statusStyle.Render(statusText)
 }
 
 func interAgentChildStatusGlyph(child InterAgentChildActivity, th *theme.Theme) (string, lipgloss.Style) {
@@ -378,26 +351,31 @@ func interAgentChildStatusGlyph(child InterAgentChildActivity, th *theme.Theme) 
 	return interAgentSpinnerFrames[interAgentSpinnerIndex], lipgloss.NewStyle().Foreground(color)
 }
 
-func renderInterAgentChildToolCall(tc ToolCallRecord, width int, th *theme.Theme, grad *theme.Gradient) []string {
+func renderInterAgentChildToolCall(tc ToolCallRecord, width int, th *theme.Theme, grad *theme.Gradient, childPath []int, interAgentPath []int, childToolCallIdx int) interAgentRenderedChildRow {
 	if tc.InterAgent != nil {
-		if lines, _ := renderInterAgentToolCall([]ToolCallRecord{tc}, 0, width, th, grad); len(lines) > 0 {
-			return lines
-		}
-		if tc.Expanded {
-			return renderNestedInterAgentToolCallExpanded(tc, width, th)
-		}
-		if line := renderNestedInterAgentToolCall(tc, width, th); line != "" {
-			return []string{line}
-		}
-		return nil
+		return renderNestedInterAgentChildToolCallBlock(tc, width, th, grad, childPath, interAgentPath, childToolCallIdx)
 	}
+	var lines []string
 	if tc.Expanded {
-		return renderNestedChildToolCallExpanded(tc, width, th, grad)
+		lines = renderNestedChildToolCallExpanded(tc, width, th, grad)
+	} else if line := renderToolCallCollapsed(tc, width, th, grad); line != "" {
+		lines = []string{line}
 	}
-	if line := renderToolCallCollapsed(tc, width, th, grad); line != "" {
-		return []string{line}
+	if len(lines) == 0 {
+		return interAgentRenderedChildRow{}
 	}
-	return nil
+	return interAgentRenderedChildRow{
+		lines: lines,
+		subregions: []ToolCallSubregion{{
+			Start:            0,
+			End:              len(lines),
+			Kind:             ToolCallSubregionChildTool,
+			ChildIndex:       leafChildIndex(childPath),
+			ChildToolCallIdx: childToolCallIdx,
+			ChildPath:        cloneIntSlice(childPath),
+			InterAgentPath:   cloneIntSlice(interAgentPath),
+		}},
+	}
 }
 
 func renderNestedChildToolCallExpanded(tc ToolCallRecord, width int, th *theme.Theme, grad *theme.Gradient) []string {
@@ -431,24 +409,23 @@ func renderNestedChildToolCallExpanded(tc ToolCallRecord, width int, th *theme.T
 	rightPart := formatToolCallStatus(tc, th, grad) + formatToolCallDuration(tc)
 	lines := []string{composeSingleLineToolCall(header.String(), rightPart, width)}
 
-	prefix := mutedStyle.Render("│") + "   "
-	contentWidth := max(width-lipgloss.Width(prefix), 0)
+	contentWidth := width
 	if contentWidth <= 0 {
 		return lines
 	}
 
 	if argsLine := summarizeToolDetailInline(tc.ArgsSummary, tc.FullArgs, contentWidth-len("args - ")); argsLine != "" {
-		lines = append(lines, truncateStyledWithDots(prefix+mutedStyle.Render("args - "+argsLine), width))
+		lines = append(lines, truncateStyledWithDots(mutedStyle.Render("args - "+argsLine), width))
 	}
 	if tc.Completed {
 		switch {
 		case strings.TrimSpace(tc.ErrorMsg) != "":
 			if detail := summarizeToolDetailInline(tc.ErrorMsg, tc.ErrorMsg, contentWidth-len("error - ")); detail != "" {
-				lines = append(lines, truncateStyledWithDots(prefix+errStyle.Render("error - "+detail), width))
+				lines = append(lines, truncateStyledWithDots(errStyle.Render("error - "+detail), width))
 			}
 		case strings.TrimSpace(tc.Output) != "":
 			if detail := summarizeToolDetailInline(tc.Output, tc.Output, contentWidth-len("output - ")); detail != "" {
-				lines = append(lines, truncateStyledWithDots(prefix+mutedStyle.Render("output - "+detail), width))
+				lines = append(lines, truncateStyledWithDots(mutedStyle.Render("output - "+detail), width))
 			}
 		}
 	}
@@ -462,12 +439,11 @@ func renderNestedInterAgentToolCall(tc ToolCallRecord, width int, th *theme.Them
 	}
 	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	summaryStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	statusIcon, statusStyle := interAgentStatusGlyph(tc.InterAgent.Status, th)
-	left := statusStyle.Render(statusIcon) + " " + renderInterAgentLabels(tc.InterAgent.AgentTypes, th, mutedStyle)
+	left := renderInterAgentLabels(tc.InterAgent.AgentTypes, th, mutedStyle)
 	if summary := normalizeInlineText(tc.InterAgent.Summary); summary != "" {
-		left += mutedStyle.Render(" - ") + summaryStyle.Render(summary)
+		left += mutedStyle.Render(" - ") + summaryStyle.Render(truncatePlainWithDots(summary, max(width-lipgloss.Width(left+" - "), 0)))
 	}
-	return truncateStyledWithDots(left, width)
+	return composeSingleLineToolCall(left, renderNestedInterAgentToolCallRightPart(tc, th), width)
 }
 
 func renderNestedInterAgentToolCallExpanded(tc ToolCallRecord, width int, th *theme.Theme) []string {
@@ -479,18 +455,28 @@ func renderNestedInterAgentToolCallExpanded(tc ToolCallRecord, width int, th *th
 	if summary == "" {
 		return []string{headline}
 	}
-	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	detailStyle := lipgloss.NewStyle().Foreground(th.Palette.Subtle)
-	prefix := mutedStyle.Render("│") + "   "
-	contentWidth := max(width-lipgloss.Width(prefix), 0)
+	contentWidth := width
 	lines := []string{headline}
 	for _, line := range wrapLine(summary, contentWidth, detailStyle) {
-		lines = append(lines, truncateStyledWithDots(prefix+line, width))
+		lines = append(lines, truncateStyledWithDots(line, width))
 	}
 	return lines
 }
 
-func capInterAgentChildRows(rows []interAgentRenderedChildRow, width int, th *theme.Theme, expanded bool, childIndex int) []interAgentRenderedChildRow {
+func renderNestedInterAgentToolCallRightPart(tc ToolCallRecord, th *theme.Theme) string {
+	if tc.InterAgent == nil {
+		return ""
+	}
+	statusIcon, statusStyle := interAgentStatusGlyph(tc.InterAgent.Status, th)
+	duration := ""
+	if !tc.StartedAt.IsZero() || tc.Duration > 0 {
+		duration = " " + formatToolCallDuration(tc)
+	}
+	return statusStyle.Render(statusIcon + duration)
+}
+
+func capInterAgentChildRows(rows []interAgentRenderedChildRow, width int, th *theme.Theme, expanded bool, childPath []int, interAgentPath []int) []interAgentRenderedChildRow {
 	if expanded || len(rows) <= maxInterAgentChildLines {
 		return rows
 	}
@@ -498,12 +484,342 @@ func capInterAgentChildRows(rows []interAgentRenderedChildRow, width int, th *th
 	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	out := make([]interAgentRenderedChildRow, 0, maxInterAgentChildLines)
 	out = append(out, interAgentRenderedChildRow{
-		lines:      []string{truncateStyledWithDots(mutedStyle.Render(fmt.Sprintf("… %d earlier event%s", overflow, pluralSuffix(overflow))), width)},
-		kind:       ToolCallSubregionOverflow,
-		childIndex: childIndex,
+		lines: []string{truncateStyledWithDots(mutedStyle.Render(fmt.Sprintf("… %d earlier event%s", overflow, pluralSuffix(overflow))), width)},
+		subregions: []ToolCallSubregion{{
+			Start:          0,
+			End:            1,
+			Kind:           ToolCallSubregionOverflow,
+			ChildIndex:     leafChildIndex(childPath),
+			ChildPath:      cloneIntSlice(childPath),
+			InterAgentPath: cloneIntSlice(interAgentPath),
+		}},
 	})
 	out = append(out, rows[len(rows)-(maxInterAgentChildLines-1):]...)
 	return out
+}
+
+type interAgentOrderedChildSpec struct {
+	childIndex int
+	childPath  []int
+	child      InterAgentChildActivity
+}
+
+type interAgentNestedBlockItemKind int
+
+const (
+	interAgentNestedBlockItemRootTool interAgentNestedBlockItemKind = iota
+	interAgentNestedBlockItemChildHeader
+	interAgentNestedBlockItemOverflow
+	interAgentNestedBlockItemToolCall
+)
+
+type interAgentNestedBlockItem struct {
+	kind             interAgentNestedBlockItemKind
+	root             bool
+	isLast           bool
+	ancestors        []bool
+	childIndex       int
+	childPath        []int
+	interAgentPath   []int
+	child            InterAgentChildActivity
+	toolCall         ToolCallRecord
+	childToolCallIdx int
+	overflowCount    int
+	rootSummary      string
+	anchorToolCall   bool
+	anchorChildPath  []int
+	anchorInterPath  []int
+	anchorToolIdx    int
+}
+
+func cloneBoolSlice(in []bool) []bool {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]bool, len(in))
+	copy(out, in)
+	return out
+}
+
+func renderNestedInterAgentChildToolCallBlock(tc ToolCallRecord, width int, th *theme.Theme, grad *theme.Gradient, childPath []int, interAgentPath []int, childToolCallIdx int) interAgentRenderedChildRow {
+	if tc.InterAgent == nil || width <= 0 {
+		return interAgentRenderedChildRow{}
+	}
+	if !interAgentToolHasVisibleChildren(tc.InterAgent) {
+		lines := renderInterAgentNestedFallbackToolCall(tc, width, th, grad)
+		if len(lines) == 0 {
+			return interAgentRenderedChildRow{}
+		}
+		return interAgentRenderedChildRow{
+			lines: lines,
+			subregions: []ToolCallSubregion{{
+				Start:            0,
+				End:              len(lines),
+				Kind:             ToolCallSubregionChildTool,
+				ChildIndex:       leafChildIndex(childPath),
+				ChildToolCallIdx: childToolCallIdx,
+				ChildPath:        cloneIntSlice(childPath),
+				InterAgentPath:   cloneIntSlice(interAgentPath),
+			}},
+		}
+	}
+	nextInterAgentPath := append(cloneIntSlice(interAgentPath), childToolCallIdx)
+	specs := orderedInterAgentChildren(tc.InterAgent, childPath, nextInterAgentPath)
+	stack := make([]interAgentNestedBlockItem, 0, len(specs))
+	for i := len(specs) - 1; i >= 0; i-- {
+		spec := specs[i]
+		stack = append(stack, interAgentNestedBlockItem{
+			kind:            interAgentNestedBlockItemChildHeader,
+			isLast:          i == len(specs)-1,
+			childIndex:      spec.childIndex,
+			childPath:       cloneIntSlice(spec.childPath),
+			interAgentPath:  cloneIntSlice(nextInterAgentPath),
+			child:           spec.child,
+			rootSummary:     normalizeInlineText(tc.InterAgent.Summary),
+			anchorToolCall:  i == 0,
+			anchorChildPath: cloneIntSlice(childPath),
+			anchorInterPath: cloneIntSlice(interAgentPath),
+			anchorToolIdx:   childToolCallIdx,
+		})
+	}
+	lines, subregions := renderInterAgentNestedBlock(stack, width, th, grad)
+	return interAgentRenderedChildRow{lines: lines, subregions: subregions}
+}
+
+func orderedInterAgentChildren(row *InterAgentTool, parentChildPath []int, interAgentPath []int) []interAgentOrderedChildSpec {
+	if row == nil {
+		return nil
+	}
+	specs := make([]interAgentOrderedChildSpec, 0, max(len(row.Children), len(row.AgentTypes)))
+	usedChildren := make([]bool, len(row.Children))
+	for _, target := range normalizeAgentTypes(row.AgentTypes) {
+		childIndex, child := findInterAgentChildByAgentType(row.Children, usedChildren, target)
+		if child == nil {
+			placeholder := synthesizeInterAgentChildActivity(row, target)
+			specs = append(specs, interAgentOrderedChildSpec{
+				childIndex: -1,
+				childPath:  nil,
+				child:      placeholder,
+			})
+			continue
+		}
+		specs = append(specs, interAgentOrderedChildSpec{
+			childIndex: childIndex,
+			childPath:  append(cloneIntSlice(parentChildPath), childIndex),
+			child:      *child,
+		})
+	}
+	for i := range row.Children {
+		if usedChildren[i] {
+			continue
+		}
+		specs = append(specs, interAgentOrderedChildSpec{
+			childIndex: i,
+			childPath:  append(cloneIntSlice(parentChildPath), i),
+			child:      row.Children[i],
+		})
+	}
+	return specs
+}
+
+func interAgentToolHasVisibleChildren(row *InterAgentTool) bool {
+	return row != nil && (len(row.Children) > 0 || len(normalizeAgentTypes(row.AgentTypes)) > 0)
+}
+
+func renderInterAgentNestedFallbackToolCall(tc ToolCallRecord, width int, th *theme.Theme, grad *theme.Gradient) []string {
+	if tc.InterAgent == nil || width <= 0 {
+		return nil
+	}
+	if tc.Expanded {
+		return renderNestedInterAgentToolCallExpanded(tc, width, th)
+	}
+	if line := renderNestedInterAgentToolCall(tc, width, th); line != "" {
+		return []string{line}
+	}
+	return nil
+}
+
+func renderInterAgentNestedBlock(stack []interAgentNestedBlockItem, width int, th *theme.Theme, grad *theme.Gradient) ([]string, []ToolCallSubregion) {
+	if len(stack) == 0 || width <= 0 {
+		return nil, nil
+	}
+	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
+	blockLines := make([]string, 0, 8)
+	subregions := make([]ToolCallSubregion, 0, 4)
+	for len(stack) > 0 {
+		item := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		firstPrefix, detailMidPrefix, detailLastPrefix := interAgentNestedBlockPrefixes(item.root, item.ancestors, item.isLast, mutedStyle)
+		contentWidth := width
+		if !item.root {
+			contentWidth = max(width-lipgloss.Width(firstPrefix), 0)
+		}
+		switch item.kind {
+		case interAgentNestedBlockItemChildHeader:
+			header := renderInterAgentChildHeader(item.child, contentWidth, th, item.rootSummary)
+			if header != "" {
+				rowStart := len(blockLines)
+				appendInterAgentNestedBlockLines(&blockLines, []string{header}, width, firstPrefix, detailMidPrefix, detailLastPrefix)
+				if item.anchorToolCall {
+					subregions = append(subregions, ToolCallSubregion{
+						Start:            rowStart,
+						End:              len(blockLines),
+						Kind:             ToolCallSubregionChildTool,
+						ChildIndex:       leafChildIndex(item.anchorChildPath),
+						ChildToolCallIdx: item.anchorToolIdx,
+						ChildPath:        cloneIntSlice(item.anchorChildPath),
+						InterAgentPath:   cloneIntSlice(item.anchorInterPath),
+					})
+				}
+			}
+			if len(item.child.ToolCalls) == 0 {
+				continue
+			}
+			nextAncestors := append(cloneBoolSlice(item.ancestors), !item.isLast)
+			if item.child.ToolCallsExpanded || len(item.child.ToolCalls) <= maxInterAgentChildLines {
+				for i := len(item.child.ToolCalls) - 1; i >= 0; i-- {
+					stack = append(stack, interAgentNestedBlockItem{
+						kind:             interAgentNestedBlockItemToolCall,
+						isLast:           i == len(item.child.ToolCalls)-1,
+						ancestors:        cloneBoolSlice(nextAncestors),
+						childIndex:       item.childIndex,
+						childPath:        cloneIntSlice(item.childPath),
+						interAgentPath:   cloneIntSlice(item.interAgentPath),
+						toolCall:         item.child.ToolCalls[i],
+						childToolCallIdx: i,
+					})
+				}
+				continue
+			}
+			visibleStart := len(item.child.ToolCalls) - (maxInterAgentChildLines - 1)
+			for i := len(item.child.ToolCalls) - 1; i >= visibleStart; i-- {
+				stack = append(stack, interAgentNestedBlockItem{
+					kind:             interAgentNestedBlockItemToolCall,
+					isLast:           i == len(item.child.ToolCalls)-1,
+					ancestors:        cloneBoolSlice(nextAncestors),
+					childIndex:       item.childIndex,
+					childPath:        cloneIntSlice(item.childPath),
+					interAgentPath:   cloneIntSlice(item.interAgentPath),
+					toolCall:         item.child.ToolCalls[i],
+					childToolCallIdx: i,
+				})
+			}
+			stack = append(stack, interAgentNestedBlockItem{
+				kind:           interAgentNestedBlockItemOverflow,
+				isLast:         false,
+				ancestors:      cloneBoolSlice(nextAncestors),
+				childIndex:     item.childIndex,
+				childPath:      cloneIntSlice(item.childPath),
+				interAgentPath: cloneIntSlice(item.interAgentPath),
+				overflowCount:  visibleStart,
+			})
+		case interAgentNestedBlockItemToolCall:
+			if item.toolCall.InterAgent != nil && interAgentToolHasVisibleChildren(item.toolCall.InterAgent) {
+				nextInterAgentPath := append(cloneIntSlice(item.interAgentPath), item.childToolCallIdx)
+				specs := orderedInterAgentChildren(item.toolCall.InterAgent, item.childPath, nextInterAgentPath)
+				for i := len(specs) - 1; i >= 0; i-- {
+					spec := specs[i]
+					specIsLast := item.isLast && i == len(specs)-1
+					stack = append(stack, interAgentNestedBlockItem{
+						kind:            interAgentNestedBlockItemChildHeader,
+						isLast:          specIsLast,
+						ancestors:       cloneBoolSlice(item.ancestors),
+						childIndex:      spec.childIndex,
+						childPath:       cloneIntSlice(spec.childPath),
+						interAgentPath:  cloneIntSlice(nextInterAgentPath),
+						child:           spec.child,
+						rootSummary:     normalizeInlineText(item.toolCall.InterAgent.Summary),
+						anchorToolCall:  i == 0,
+						anchorChildPath: cloneIntSlice(item.childPath),
+						anchorInterPath: cloneIntSlice(item.interAgentPath),
+						anchorToolIdx:   item.childToolCallIdx,
+					})
+				}
+				continue
+			}
+			var rowLines []string
+			if item.toolCall.InterAgent != nil {
+				rowLines = renderInterAgentNestedFallbackToolCall(item.toolCall, contentWidth, th, grad)
+			} else if item.toolCall.Expanded {
+				rowLines = renderNestedChildToolCallExpanded(item.toolCall, contentWidth, th, grad)
+			} else if line := renderToolCallCollapsed(item.toolCall, contentWidth, th, grad); line != "" {
+				rowLines = []string{line}
+			}
+			if len(rowLines) == 0 {
+				continue
+			}
+			rowStart := len(blockLines)
+			appendInterAgentNestedBlockLines(&blockLines, rowLines, width, firstPrefix, detailMidPrefix, detailLastPrefix)
+			subregions = append(subregions, ToolCallSubregion{
+				Start:            rowStart,
+				End:              len(blockLines),
+				Kind:             ToolCallSubregionChildTool,
+				ChildIndex:       leafChildIndex(item.childPath),
+				ChildToolCallIdx: item.childToolCallIdx,
+				ChildPath:        cloneIntSlice(item.childPath),
+				InterAgentPath:   cloneIntSlice(item.interAgentPath),
+			})
+		case interAgentNestedBlockItemOverflow:
+			rowStart := len(blockLines)
+			line := truncateStyledWithDots(mutedStyle.Render(fmt.Sprintf("… %d earlier event%s", item.overflowCount, pluralSuffix(item.overflowCount))), contentWidth)
+			appendInterAgentNestedBlockLines(&blockLines, []string{line}, width, firstPrefix, detailMidPrefix, detailLastPrefix)
+			subregions = append(subregions, ToolCallSubregion{
+				Start:          rowStart,
+				End:            len(blockLines),
+				Kind:           ToolCallSubregionOverflow,
+				ChildIndex:     leafChildIndex(item.childPath),
+				ChildPath:      cloneIntSlice(item.childPath),
+				InterAgentPath: cloneIntSlice(item.interAgentPath),
+			})
+		}
+	}
+	return blockLines, subregions
+}
+
+func interAgentNestedBlockPrefixes(root bool, ancestors []bool, isLast bool, mutedStyle lipgloss.Style) (string, string, string) {
+	if root {
+		return "", "", ""
+	}
+	var stem strings.Builder
+	for _, continues := range ancestors {
+		if continues {
+			stem.WriteString(mutedStyle.Render("│  "))
+		} else {
+			stem.WriteString(mutedStyle.Render("   "))
+		}
+	}
+	first := stem.String() + mutedStyle.Render("├─ ")
+	detailMid := stem.String() + mutedStyle.Render("│  ") + mutedStyle.Render("│  ")
+	detailLast := stem.String() + mutedStyle.Render("│  ") + mutedStyle.Render("└─ ")
+	if isLast {
+		first = stem.String() + mutedStyle.Render("└─ ")
+		detailMid = stem.String() + mutedStyle.Render("   ") + mutedStyle.Render("│  ")
+		detailLast = stem.String() + mutedStyle.Render("   ") + mutedStyle.Render("└─ ")
+	}
+	return first, detailMid, detailLast
+}
+
+func appendInterAgentNestedBlockLines(out *[]string, block []string, width int, firstPrefix, detailMidPrefix, detailLastPrefix string) {
+	if len(block) == 0 {
+		return
+	}
+	for idx, line := range block {
+		prefix := firstPrefix
+		if idx > 0 {
+			prefix = detailMidPrefix
+			if idx == len(block)-1 {
+				prefix = detailLastPrefix
+			}
+		}
+		*out = append(*out, truncateStyledWithDots(prefix+truncateStyledWithDots(line, max(width-lipgloss.Width(prefix), 0)), width))
+	}
+}
+
+func leafChildIndex(childPath []int) int {
+	if len(childPath) == 0 {
+		return -1
+	}
+	return childPath[len(childPath)-1]
 }
 
 func pluralSuffix(n int) string {

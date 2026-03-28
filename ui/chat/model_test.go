@@ -1422,6 +1422,212 @@ func TestToggleAtRenderedViewLine_TargetsChildToolRowFromRenderedFrame(t *testin
 	}
 }
 
+func TestToggleAtViewLine_TargetsDeepNestedChildToolCall(t *testing.T) {
+	m := New(theme.DefaultDark(), 32)
+	m.SetSize(100, 20)
+	m.PushEntry(&ChatEntry{
+		ID:        "deep-child-tool-targets",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		Content:   "Refining the research plan.",
+		Height:    -1,
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName: "consult_academic_approach",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Compare evidence collection approaches",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-academic-deep-click",
+							AgentType:     "academic",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "consult",
+									ToolCallKey: "consult-librarian-deep-click",
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolConsult,
+										AgentTypes: []string{"librarian"},
+										Summary:    "Collect benchmark evidence",
+										Status:     InterAgentToolDone,
+										Children: []InterAgentChildActivity{
+											{
+												CorrelationID: "child-librarian-deep-click",
+												AgentType:     "librarian",
+												ToolCalls: []ToolCallRecord{
+													{
+														ToolName:    "read_file",
+														ArgsSummary: "path=docs/benchmarks.md",
+														FullArgs:    `{"path":"docs/benchmarks.md"}`,
+														StartedAt:   time.Now().Add(-time.Second),
+														Completed:   true,
+														Success:     true,
+													},
+												},
+												Completed: true,
+											},
+										},
+									},
+									Completed: true,
+									Success:   true,
+								},
+							},
+							Completed: true,
+						},
+					},
+				},
+				Completed: true,
+				Success:   true,
+			},
+		},
+	})
+
+	regions := m.viewport.regions(0)
+	deepLine := -1
+	for _, region := range regions {
+		if region.kind != selectionRegionChildToolCall {
+			continue
+		}
+		if len(region.childPath) == 2 && len(region.interAgentPath) == 1 && region.childPath[0] == 0 && region.childPath[1] == 0 && region.interAgentPath[0] == 0 {
+			deepLine = region.start
+			break
+		}
+	}
+	if deepLine < 0 {
+		t.Fatalf("expected deep nested child tool region, got %#v", regions)
+	}
+	target := m.viewport.ToggleTargetAtViewLine(deepLine)
+	if target == nil {
+		t.Fatal("expected deep nested child tool toggle target")
+	}
+	if got := target.childPath; len(got) != 2 || got[0] != 0 || got[1] != 0 {
+		t.Fatalf("toggle target childPath = %#v, want [0 0]", got)
+	}
+	if got := target.interAgentPath; len(got) != 1 || got[0] != 0 {
+		t.Fatalf("toggle target interAgentPath = %#v, want [0]", got)
+	}
+	if target.childToolCallName != "read_file" {
+		t.Fatalf("toggle target childToolCallName = %q, want read_file", target.childToolCallName)
+	}
+
+	if !m.ToggleAtViewLine(deepLine) {
+		t.Fatal("expected deep nested child tool row toggle to succeed")
+	}
+
+	entry := m.history.Last()
+	if entry == nil {
+		t.Fatal("expected entry after deep nested child toggle")
+	}
+	consult := entry.ToolCalls[0].InterAgent.Children[0].ToolCalls[0]
+	if consult.Expanded {
+		t.Fatalf("expected intermediate consult row to stay collapsed, got %+v", consult)
+	}
+	deepCalls := consult.InterAgent.Children[0].ToolCalls
+	if len(deepCalls) != 1 || !deepCalls[0].Expanded {
+		t.Fatalf("expected deep nested child tool row expanded, got %+v", deepCalls)
+	}
+}
+
+func TestKeyboardNavigationAndSpaceToggle_DeepNestedChildToolCall(t *testing.T) {
+	m := New(theme.DefaultDark(), 32)
+	m.SetSize(100, 20)
+	m.SetFocused(true)
+	m.PushEntry(&ChatEntry{
+		ID:        "deep-child-tool-space-toggle",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		Content:   "Refining the research plan.",
+		Height:    -1,
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName: "consult_academic_approach",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Compare evidence collection approaches",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-academic-deep-space",
+							AgentType:     "academic",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "consult",
+									ToolCallKey: "consult-librarian-deep-space",
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolConsult,
+										AgentTypes: []string{"librarian"},
+										Summary:    "Collect benchmark evidence",
+										Status:     InterAgentToolDone,
+										Children: []InterAgentChildActivity{
+											{
+												CorrelationID: "child-librarian-deep-space",
+												AgentType:     "librarian",
+												ToolCalls: []ToolCallRecord{
+													{
+														ToolName:    "read_file",
+														ArgsSummary: "path=docs/benchmarks.md",
+														FullArgs:    `{"path":"docs/benchmarks.md"}`,
+														StartedAt:   time.Now().Add(-time.Second),
+														Completed:   true,
+														Success:     true,
+													},
+												},
+												Completed: true,
+											},
+										},
+									},
+									Completed: true,
+									Success:   true,
+								},
+							},
+							Completed: true,
+						},
+					},
+				},
+				Completed: true,
+				Success:   true,
+			},
+		},
+	})
+
+	regions := m.viewport.regions(0)
+	selectedRegion := -1
+	for idx, region := range regions {
+		if region.kind != selectionRegionChildToolCall {
+			continue
+		}
+		if len(region.childPath) == 2 && len(region.interAgentPath) == 1 && region.childPath[0] == 0 && region.childPath[1] == 0 && region.interAgentPath[0] == 0 && region.childToolCallIdx == 0 {
+			selectedRegion = idx
+			break
+		}
+	}
+	if selectedRegion < 0 {
+		t.Fatalf("expected deep nested child tool selection region, got %#v", regions)
+	}
+	m.viewport.selectEntry(0, selectedRegion)
+
+	comp, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+	m = comp.(*Model)
+
+	entry := m.history.Last()
+	if entry == nil {
+		t.Fatal("expected entry after deep nested keyboard toggle")
+	}
+	consult := entry.ToolCalls[0].InterAgent.Children[0].ToolCalls[0]
+	if consult.Expanded {
+		t.Fatalf("expected intermediate consult row to stay collapsed after space toggle, got %+v", consult)
+	}
+	deepCalls := consult.InterAgent.Children[0].ToolCalls
+	if len(deepCalls) != 1 || !deepCalls[0].Expanded {
+		t.Fatalf("expected deep nested child tool row expanded after space toggle, got %+v", deepCalls)
+	}
+}
+
 func TestHandleToolCallEvent_MatchesInterAgentConsultCompletionByToolCallKey(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 	m.PushEntry(&ChatEntry{
@@ -2057,6 +2263,245 @@ func TestNestedChildInterAgentConsultStartAttachesImmediatelyWhenMetadataDropsTa
 	}
 }
 
+func TestNestedChildConsultRowsRemainVisibleAfterChildStreamEmitsText(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.SetSize(100, 24)
+	m.PushEntry(&ChatEntry{
+		ID:            "architect-origin-child-consult-after-text",
+		Timestamp:     time.Now(),
+		CorrelationID: "corr-parent-child-consult-after-text",
+		Source:        SourceAgent,
+		AgentType:     "architect",
+		Content:       "Architect draft text should stay hidden while the consult runs.",
+		Streaming:     true,
+		ThinkingText:  deferredParentCompletionStatus,
+		ThinkingStatus: deferredParentCompletionStatus,
+		Height:        -1,
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_academic_approach",
+				ToolCallKey: "consult-1",
+				StartedAt:   time.Now().Add(-500 * time.Millisecond),
+				Completed:   true,
+				Success:     true,
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Build the research evidence base.",
+					Status:     InterAgentToolDone,
+				},
+			},
+		},
+	})
+
+	parentBranch := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-child-consult-after-text",
+		ParentToolCallKey:   "consult-1",
+		Kind:                "consult",
+	}
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-academic-consult-after-text",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		BranchRef:     parentBranch,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamChunkMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-academic-consult-after-text",
+		Text:          "Initial academic draft text that should not leak into the parent entry.",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-academic-consult-after-text",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		ToolCallKey:   "consult-lib-1",
+		ToolName:      "consult",
+		FullArgs:      `{"target":"librarian","query":"Find benchmark and methodology sources."}`,
+		Phase:         0,
+		StartedAt:     time.Now().Add(-250 * time.Millisecond),
+		BranchRef:     parentBranch,
+	})
+	m = comp.(*Model)
+
+	librarianBranch := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-child-academic-consult-after-text",
+		ParentToolCallKey:   "consult-lib-1",
+		Kind:                "consult",
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-librarian-consult-after-text",
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		BranchRef:     librarianBranch,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-librarian-consult-after-text",
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		ToolCallKey:   "ws_1",
+		ToolName:      "web_search",
+		ArgsSummary:   "query=framework benchmark methodology",
+		FullArgs:      `{"query":"framework benchmark methodology"}`,
+		Phase:         0,
+		StartedAt:     time.Now().Add(-150 * time.Millisecond),
+		BranchRef:     librarianBranch,
+	})
+	m = comp.(*Model)
+
+	view := m.View()
+	if strings.Contains(view, "Architect draft text should stay hidden while the consult runs.") {
+		t.Fatalf("expected parent content to stay hidden while nested consult work is active, got %q", view)
+	}
+	for _, needle := range []string{
+		"academic",
+		"librarian",
+		"Find benchmark and methodology sources.",
+		"web_search",
+		"framework benchmark methodology",
+	} {
+		if !strings.Contains(view, needle) {
+			t.Fatalf("expected nested consult view to contain %q, got %q", needle, view)
+		}
+	}
+}
+
+func TestPrimaryChildSyncPreservesNestedGrandchildState(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.PushEntry(&ChatEntry{
+		ID:            "architect-origin-primary-child-merge",
+		Timestamp:     time.Now(),
+		CorrelationID: "corr-parent-primary-child-merge",
+		Source:        SourceAgent,
+		AgentType:     "architect",
+		Content:       "Refining the research plan.",
+		Height:        -1,
+	})
+
+	comp, _ := m.Update(msg.ToolCallEventMsg{
+		CorrelationID: "corr-parent-primary-child-merge",
+		ToolCallKey:   "consult-1",
+		ToolName:      "consult_academic_approach",
+		FullArgs:      `{"target":"academic","query":"Build the research evidence base."}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	m = comp.(*Model)
+
+	parentBranch := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-primary-child-merge",
+		ParentToolCallKey:   "consult-1",
+		Kind:                "consult",
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-academic-primary-child-merge",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		BranchRef:     parentBranch,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-academic-primary-child-merge",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		ToolCallKey:   "consult-lib-1",
+		ToolName:      "consult",
+		FullArgs:      `{"target":"librarian","query":"Find benchmark and methodology sources."}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+		BranchRef:     parentBranch,
+	})
+	m = comp.(*Model)
+
+	librarianBranch := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-child-academic-primary-child-merge",
+		ParentToolCallKey:   "consult-lib-1",
+		Kind:                "consult",
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-librarian-primary-child-merge",
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		BranchRef:     librarianBranch,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-librarian-primary-child-merge",
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		ToolCallKey:   "ws_1",
+		ToolName:      "web_search",
+		ArgsSummary:   "query=framework benchmark methodology",
+		FullArgs:      `{"query":"framework benchmark methodology"}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+		BranchRef:     librarianBranch,
+	})
+	m = comp.(*Model)
+
+	origin := findEntryByCorrelation(m, "corr-parent-primary-child-merge")
+	if origin == nil || len(origin.ToolCalls) != 1 || origin.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected parent consult row, got %+v", origin)
+	}
+	academic := origin.ToolCalls[0].InterAgent.Children[0]
+	consult := academic.ToolCalls[0].InterAgent
+	if consult == nil || len(consult.Children) != 1 {
+		t.Fatalf("expected nested librarian child before academic resync, got %+v", academic.ToolCalls)
+	}
+	if got := len(consult.Children[0].ToolCalls); got != 1 {
+		t.Fatalf("expected librarian child tool row before academic resync, got %+v", consult.Children[0].ToolCalls)
+	}
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-academic-primary-child-merge",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		Message:       "Refining the evidence synthesis.",
+		BranchRef:     parentBranch,
+	})
+	m = comp.(*Model)
+
+	origin = findEntryByCorrelation(m, "corr-parent-primary-child-merge")
+	if origin == nil || len(origin.ToolCalls) != 1 || origin.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected parent consult row after academic resync, got %+v", origin)
+	}
+	academic = origin.ToolCalls[0].InterAgent.Children[0]
+	if got := len(academic.ToolCalls); got != 1 {
+		t.Fatalf("expected academic child tool calls to survive resync, got %+v", academic.ToolCalls)
+	}
+	consult = academic.ToolCalls[0].InterAgent
+	if consult == nil || len(consult.Children) != 1 {
+		t.Fatalf("expected nested librarian child to survive academic resync, got %+v", academic.ToolCalls[0])
+	}
+	librarian := consult.Children[0]
+	if librarian.CorrelationID != "corr-child-librarian-primary-child-merge" {
+		t.Fatalf("librarian correlation = %q, want corr-child-librarian-primary-child-merge", librarian.CorrelationID)
+	}
+	if got := len(librarian.ToolCalls); got != 1 || librarian.ToolCalls[0].ToolName != "web_search" {
+		t.Fatalf("expected librarian child tool row to survive academic resync, got %+v", librarian.ToolCalls)
+	}
+}
+
 func TestNestedChildInterAgentConsultStartAttachesByParentCorrelationWhenToolKeyMissing(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 	m.PushEntry(&ChatEntry{
@@ -2173,6 +2618,252 @@ func TestNestedChildInterAgentConsultStartDoesNotAttachByParentCorrelationWhenCo
 	}
 	if findEntryByCorrelation(m, "corr-child-consult-ambiguous") != nil {
 		t.Fatal("expected ambiguous missing-key child stream to avoid a top-level entry")
+	}
+}
+
+func TestNestedChildInterAgentConsultStartAttachesByParentCorrelationWhenToolKeyIsStale(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.PushEntry(&ChatEntry{
+		ID:            "architect-origin-child-consult-stale-key",
+		Timestamp:     time.Now(),
+		CorrelationID: "corr-parent-child-consult-stale-key",
+		Source:        SourceAgent,
+		AgentType:     "architect",
+		Content:       "Refining the patch plan.",
+		Height:        -1,
+	})
+
+	comp, _ := m.Update(msg.ToolCallEventMsg{
+		CorrelationID: "corr-parent-child-consult-stale-key",
+		ToolCallKey:   "consult-1",
+		ToolName:      "consult_academic_approach",
+		FullArgs:      `{"target":"academic","query":"Compare harness options"}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	m = comp.(*Model)
+
+	branchRef := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-child-consult-stale-key",
+		ParentToolCallKey:   "consult-stale",
+		Kind:                "consult",
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-consult-stale-key",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		BranchRef:     branchRef,
+	})
+	m = comp.(*Model)
+
+	origin := findEntryByCorrelation(m, "corr-parent-child-consult-stale-key")
+	if origin == nil || len(origin.ToolCalls) != 1 || origin.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected parent consult row, got %+v", origin)
+	}
+	row := origin.ToolCalls[0].InterAgent
+	if len(row.Children) != 1 {
+		t.Fatalf("expected one nested child activity, got %+v", row.Children)
+	}
+	child := row.Children[0]
+	if child.CorrelationID != "corr-child-consult-stale-key" {
+		t.Fatalf("child correlation id = %q, want corr-child-consult-stale-key", child.CorrelationID)
+	}
+	if child.AgentType != "academic" {
+		t.Fatalf("child agent type = %q, want academic", child.AgentType)
+	}
+	if findEntryByCorrelation(m, "corr-child-consult-stale-key") != nil {
+		t.Fatal("expected stale-key child stream to remain nested, not top-level")
+	}
+}
+
+func TestNestedChildInterAgentConsultStartDoesNotAttachByParentCorrelationWhenStaleKeyIsAmbiguous(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.PushEntry(&ChatEntry{
+		ID:            "architect-origin-child-consult-stale-key-ambiguous",
+		Timestamp:     time.Now(),
+		CorrelationID: "corr-parent-child-consult-stale-key-ambiguous",
+		Source:        SourceAgent,
+		AgentType:     "architect",
+		Content:       "Refining the patch plan.",
+		Height:        -1,
+	})
+
+	comp, _ := m.Update(msg.ToolCallEventMsg{
+		CorrelationID: "corr-parent-child-consult-stale-key-ambiguous",
+		ToolCallKey:   "consult-1",
+		ToolName:      "consult_academic_approach",
+		FullArgs:      `{"target":"academic","query":"Compare harness options"}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		CorrelationID: "corr-parent-child-consult-stale-key-ambiguous",
+		ToolCallKey:   "consult-2",
+		ToolName:      "consult_librarian_style",
+		FullArgs:      `{"target":"librarian","query":"Find related patterns"}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	m = comp.(*Model)
+
+	branchRef := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-child-consult-stale-key-ambiguous",
+		ParentToolCallKey:   "consult-stale",
+		Kind:                "consult",
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-consult-stale-key-ambiguous",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		BranchRef:     branchRef,
+	})
+	m = comp.(*Model)
+
+	origin := findEntryByCorrelation(m, "corr-parent-child-consult-stale-key-ambiguous")
+	if origin == nil || len(origin.ToolCalls) != 2 {
+		t.Fatalf("expected two parent consult rows, got %+v", origin)
+	}
+	for idx, record := range origin.ToolCalls {
+		if record.InterAgent == nil {
+			t.Fatalf("expected consult row %d to be inter-agent, got %+v", idx, record)
+		}
+		if got := len(record.InterAgent.Children); got != 0 {
+			t.Fatalf("consult row %d child count = %d, want 0 for ambiguous stale parent key", idx, got)
+		}
+	}
+	if findEntryByCorrelation(m, "corr-child-consult-stale-key-ambiguous") != nil {
+		t.Fatal("expected ambiguous stale-key child stream to avoid a top-level entry")
+	}
+}
+
+func TestNestedGrandchildGuardianCompletionAttachesToImmediateApprovalBranch(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.PushEntry(&ChatEntry{
+		ID:            "architect-origin-grandchild-guardian",
+		Timestamp:     time.Now(),
+		CorrelationID: "corr-parent-grandchild-guardian",
+		Source:        SourceAgent,
+		AgentType:     "architect",
+		Content:       "Refining the patch plan.",
+		Height:        -1,
+	})
+
+	comp, _ := m.Update(msg.ToolCallEventMsg{
+		CorrelationID: "corr-parent-grandchild-guardian",
+		ToolCallKey:   "consult-academic-1",
+		ToolName:      "consult",
+		FullArgs:      `{"target":"academic","query":"Research implementation options."}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "consult",
+			Status:     "pending",
+			AgentTypes: []string{"academic"},
+			Summary:    "Research implementation options.",
+		},
+	})
+	m = comp.(*Model)
+
+	parentBranch := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-grandchild-guardian",
+		ParentToolCallKey:   "consult-academic-1",
+		Kind:                "consult",
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-academic-grandchild-guardian",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		BranchRef:     parentBranch,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-academic-grandchild-guardian",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		ToolCallKey:   "approval-guardian-1",
+		ToolName:      "approval_guardian",
+		FullArgs:      `{"target":"guardian","tool_name":"web_fetch","domain":"example.com","summary":"Requesting Guardian approval for example.com"}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+		BranchRef:     parentBranch,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "approval",
+			Status:     "pending",
+			AgentTypes: []string{"guardian"},
+			Summary:    "Requesting Guardian approval for example.com",
+		},
+	})
+	m = comp.(*Model)
+
+	approvalBranch := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-child-academic-grandchild-guardian",
+		ParentToolCallKey:   "approval-guardian-1",
+		Kind:                "approval",
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-grandchild-guardian-approval",
+		AgentID:       "guardian",
+		AgentType:     "guardian",
+		BranchRef:     approvalBranch,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamCompleteMsg{
+		SessionID:         "s1",
+		CorrelationID:     "corr-grandchild-guardian-approval",
+		AgentID:           "guardian",
+		AgentType:         "guardian",
+		AuthoritativeText: "Fetch approval allowed",
+		BranchRef:         approvalBranch,
+	})
+	m = comp.(*Model)
+
+	origin := findEntryByCorrelation(m, "corr-parent-grandchild-guardian")
+	if origin == nil || len(origin.ToolCalls) != 1 || origin.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected parent consult row, got %+v", origin)
+	}
+	root := origin.ToolCalls[0].InterAgent
+	if len(root.Children) != 1 {
+		t.Fatalf("expected one academic child activity, got %+v", root.Children)
+	}
+	academic := root.Children[0]
+	if got := len(academic.ToolCalls); got != 1 {
+		t.Fatalf("academic child tool call count = %d, want 1", got)
+	}
+	approval := academic.ToolCalls[0].InterAgent
+	if approval == nil {
+		t.Fatalf("expected approval branch, got %+v", academic.ToolCalls[0])
+	}
+	if len(approval.Children) != 1 {
+		t.Fatalf("expected one guardian grandchild activity, got %+v", approval.Children)
+	}
+	guardian := approval.Children[0]
+	if guardian.CorrelationID != "corr-grandchild-guardian-approval" {
+		t.Fatalf("guardian correlation = %q, want corr-grandchild-guardian-approval", guardian.CorrelationID)
+	}
+	if guardian.AgentType != "guardian" {
+		t.Fatalf("guardian agent type = %q, want guardian", guardian.AgentType)
+	}
+	if !guardian.Completed {
+		t.Fatalf("expected guardian grandchild to be completed, got %+v", guardian)
+	}
+	if guardian.ResultSummary != "Fetch approval allowed" {
+		t.Fatalf("guardian result summary = %q, want %q", guardian.ResultSummary, "Fetch approval allowed")
+	}
+	if findEntryByCorrelation(m, "corr-grandchild-guardian-approval") != nil {
+		t.Fatal("expected guardian grandchild stream to remain nested, not top-level")
 	}
 }
 
@@ -2776,8 +3467,8 @@ func TestHandleStreamComplete_DefersParentCompletionUntilInterAgentChildrenSettl
 		t.Fatal("expected parent stream slot to stay alive until child work settles")
 	}
 	view := m.View()
-	if !strings.Contains(view, "Architect response is ready.") {
-		t.Fatalf("expected deferred parent content to remain visible in the chat view, got %q", view)
+	if strings.Contains(view, "Architect response is ready.") {
+		t.Fatalf("expected deferred parent content to stay hidden in the chat view, got %q", view)
 	}
 	if !strings.Contains(view, deferredParentCompletionStatus) {
 		t.Fatalf("expected deferred parent status footer in the chat view, got %q", view)
@@ -2807,6 +3498,113 @@ func TestHandleStreamComplete_DefersParentCompletionUntilInterAgentChildrenSettl
 	}
 	if _, ok := m.streams[entry.CorrelationID]; ok {
 		t.Fatal("expected deferred parent stream slot to be released once child work settles")
+	}
+}
+
+func TestHandleStreamComplete_DefersParentCompletionWhileNestedChildPendingWithoutVisibleSpinner(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.SetSize(96, 24)
+
+	entry := &ChatEntry{
+		ID:             "architect-parent-deferred-child-pending",
+		Timestamp:      time.Now(),
+		CorrelationID:  "corr-parent-deferred-child-pending",
+		Source:         SourceAgent,
+		AgentType:      "architect",
+		AgentID:        "architect",
+		Content:        "Architect response is ready.",
+		Streaming:      true,
+		ThinkingText:   "⠋  2.0s",
+		ThinkingStatus: "Drafting the final recommendation...",
+		Height:         -1,
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_academic_approach",
+				ToolCallKey: "consult-1",
+				Completed:   true,
+				Success:     true,
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Fetch official source material.",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "corr-child-academic-pending",
+							AgentType:     "academic",
+							Completed:     false,
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:  "approval_guardian",
+									Completed: true,
+									Success:   true,
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolApproval,
+										AgentTypes: []string{"guardian"},
+										Summary:    "Requesting Guardian approval for raw.githubusercontent.com",
+										Status:     InterAgentToolDone,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	m.PushEntry(entry)
+	idx := m.history.Len() - 1
+
+	slot := &streamSlot{
+		accumulator:   NewStreamAccumulator(idx),
+		agentID:       "architect",
+		thinkingIdx:   idx,
+		thinkingStart: time.Now().Add(-2 * time.Second),
+		renderState:   &streamRenderState{},
+	}
+	slot.accumulator.Replace(entry.Content)
+	m.streams = map[string]*streamSlot{
+		entry.CorrelationID: slot,
+	}
+	m.viewport.AddStreamState(idx, slot.renderState)
+	m.syncPendingInterAgentEntry(idx)
+
+	comp, _ := m.Update(msg.StreamCompleteMsg{
+		SessionID:         "s1",
+		CorrelationID:     entry.CorrelationID,
+		AgentID:           "architect",
+		AgentType:         "architect",
+		AuthoritativeText: entry.Content,
+	})
+	m = comp.(*Model)
+
+	deferred := findEntryByCorrelation(m, entry.CorrelationID)
+	if deferred == nil {
+		t.Fatal("expected deferred parent entry")
+	}
+	if !deferred.Streaming {
+		t.Fatalf("expected parent completion to remain deferred while child consult is still pending, got %+v", deferred)
+	}
+	if _, ok := m.streams[entry.CorrelationID]; !ok {
+		t.Fatal("expected parent stream slot to stay alive while nested child is pending")
+	}
+
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		child := &e.ToolCalls[0].InterAgent.Children[0]
+		child.Completed = true
+		invalidateChatEntryRender(e)
+	})
+	m.syncPendingInterAgentEntry(idx)
+
+	final := findEntryByCorrelation(m, entry.CorrelationID)
+	if final == nil {
+		t.Fatal("expected finalized parent entry")
+	}
+	if final.Streaming {
+		t.Fatalf("expected parent entry to finalize once child consult completes, got %+v", final)
+	}
+	if _, ok := m.streams[entry.CorrelationID]; ok {
+		t.Fatal("expected deferred parent stream slot to be released once child consult completes")
 	}
 }
 

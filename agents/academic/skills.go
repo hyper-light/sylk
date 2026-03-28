@@ -178,19 +178,29 @@ type researchTopicParams struct {
 
 func researchTopicSkill(a *Academic) *skills.Skill {
 	return skills.NewSkill("research_topic").
-		Description("Research a technical topic comprehensively, consulting Librarian for codebase context and preferring grounded evidence over intuition.").
+		Description("Research a topic comprehensively with explicit decision framing, evidence-class coverage, grounded synthesis, and Librarian validation when codebase fit matters.").
 		Domain("research").
 		Keywords("research", "investigate", "study", "learn").
 		Usage("Use for open-ended technical research that should end in a cited, codebase-aware answer rather than a quick intuition dump.").
+		BestPractice("Start by naming the decision frame: objective, governing criteria, relevant evidence classes, likely confounders, and what findings would weaken each major hypothesis.").
 		BestPractice("When performance, reliability, cost, scale, adoption, or security claims materially affect the answer, support them with grounded statistics or say explicitly that only qualitative evidence is available.").
+		BestPractice("When measurable criteria matter, surface the decision-relevant measurable criteria for this domain and quantify them when credible evidence exists instead of relying on adjectives.").
 		BestPractice("When relevant literature, benchmarks, standards, or postmortems exist, digest the strongest ones and summarize method, findings, and limitations instead of only listing citations.").
+		BestPractice("Actively look for counterevidence, strongest negative cases, failure modes, conflicting studies, lock-in, adoption barriers, or migration burden rather than only confirming a preferred conclusion.").
+		BestPractice("Treat self-authored, vendor-authored, or project-authored sources as capability evidence first. Use them to establish what an option claims to support, not to prove comparative superiority by themselves.").
 		BestPractice("Stress-test assumptions, inspect methodology, and call out dataset bias or threats to validity when they materially affect the conclusion.").
+		Requirement("For substantial research questions, map the relevant evidence classes for the domain and say which are strong, weak, or unavailable: primary or authoritative sources, empirical or observational evidence, counterevidence or failure cases, methodological or limitations evidence, implementation or operational burden, institutional or ecosystem context, and formal or academic or regulatory evidence.").
 		Requirement("For substantial research questions, synthesize evidence into a structured comparison, literature digest, or technical memo rather than a loose source roundup.").
 		Requirement("Do your own analysis on top of the sources: validate assumptions, challenge hypotheses, and note where the evidence is weak or biased.").
-		Requirement("Treat the answer as incomplete if it lacks the relevant structured artifact for the question, such as a comparison table, math walkthrough, algorithm sketch, or architecture or flow model.").
+		Requirement("Do not open a substantial externally sourced synthesis with a naked winner or default pick; make the decision frame and evidence quality legible before or alongside the recommendation.").
+		Requirement("Do not emit a Short Answer, shortlist, or compressed winner section before the evidence basis and comparison are established.").
+		Requirement("Treat the answer as incomplete if it lacks the relevant structured artifact for the question, such as an evidence table, comparison matrix, methodology digest, risk register, math walkthrough, algorithm sketch, or architecture or flow model.").
 		Requirement("Before finalizing, run a rigor audit across all relevant dimensions: per-link grounding, corroboration, counterevidence, math checks, methodology review, dataset quality, bias review, and threats to validity.").
+		Requirement("Calibrate confidence to evidence completeness: high confidence requires broad grounded support across the relevant evidence classes, explicit counterevidence review, and disclosed limitations.").
+		Requirement("If the relevant comparative evidence remains dominated by self-authored sources when independent validation matters, keep the conclusion provisional or explicitly inconclusive rather than collapsing to a clean recommendation.").
 		Avoid("Do not stop at surface positioning, promotional framing, or shallow summaries when deeper evidence is obtainable.").
 		Avoid("Do not answer with a winner-plus-alternatives roundup followed by a source dump when the question requires deeper research synthesis.").
+		Avoid("Do not use unsupported adjectives like best, strongest, safer, simpler, faster, mature, or standard in place of explicit criteria and evidence.").
 		Priority(100).
 		StringParam("topic", "The technical topic to research", true).
 		StringParam("context", "Additional context for the research", false).
@@ -264,19 +274,30 @@ type compareApproachesParams struct {
 
 func compareApproachesSkill(a *Academic) *skills.Skill {
 	return skills.NewSkill("compare_approaches").
-		Description("Compare different technical approaches with applicability analysis for the codebase and evidence-backed tradeoffs.").
+		Description("Compare approaches with explicit criteria, evidence-class coverage, applicability analysis, and evidence-backed tradeoffs.").
 		Domain("research").
 		Keywords("compare", "versus", "vs", "alternative", "option").
+		BestPractice("Define or infer the governing criteria before ranking options, and make the weighting or priority legible.").
 		BestPractice("When the ranking hinges on performance, reliability, cost, scale, or adoption, support the comparison with grounded statistics or explain why only qualitative evidence is available.").
+		BestPractice("When measurable criteria matter, quantify the decision-relevant metrics for this domain when credible evidence exists, and identify when the available numbers are stale, indirect, or not comparable.").
 		BestPractice("Prefer primary benchmarks, standards, papers, and official telemetry over secondary summaries when comparing numeric claims.").
+		BestPractice("Seek evidence across multiple relevant classes for each option, not only vendor positioning or one convenient source type.").
+		BestPractice("Treat self-authored, vendor-authored, or project-authored sources as capability evidence first rather than as standalone proof that one option beats another.").
 		BestPractice("Use a side-by-side comparison matrix and surface the strongest counterarguments against the leading option.").
 		BestPractice("Call out methodology limits, dataset bias, measurement caveats, and hidden assumptions that could change the ranking.").
 		Requirement("For substantial comparisons, evaluate the options against the criteria that actually drive the decision and summarize the result in a table or equivalently structured comparison.").
+		Requirement("For each major option, include the strongest supporting evidence, the strongest contrary evidence or failure mode, and any major unresolved uncertainty.").
+		Requirement("Map the relevant evidence classes for the domain and note which are strong, weak, or unavailable before you finalize the ranking.").
 		Requirement("Include the most decision-relevant evidence type for each major claim: measured data, official guidance, peer-reviewed research, or qualitative evidence.").
 		Requirement("Validate the assumptions behind the comparison and note where the evidence does not cleanly support the ranking.").
+		Requirement("Do not start a substantial comparison with a winner; make the criteria and evidence matrix legible before or alongside the ranking.").
+		Requirement("Do not emit a Short Answer, shortlist, or compressed winner section before the comparison evidence is established.").
 		Requirement("Before finalizing, run a rigor audit over all relevant comparison dimensions: per-link grounding, corroboration, counterevidence, math checks, methodology quality, bias risks, and threats to validity.").
+		Requirement("Only use high confidence when multiple relevant evidence classes align and the major counterarguments have been addressed explicitly.").
+		Requirement("If independent validation is relevant and the ranking still depends mainly on self-authored sources, mark it provisional or incomplete instead of presenting a clean winner.").
 		Avoid("Do not stop at surface positioning, shallow inventories, or summary-style prose when deeper tradeoff analysis is needed.").
 		Avoid("Do not reduce the comparison to a default winner, a few alternatives, and a bare source list.").
+		Avoid("Do not use unsupported adjectives like best, strongest, simpler, faster, safer, or mature without tying them to explicit criteria and grounded evidence.").
 		Priority(85).
 		StringParam("topic", "The topic being compared", true).
 		ArrayParam("approaches", "List of approaches to compare", "string", true).
@@ -354,18 +375,29 @@ type recommendSolutionParams struct {
 
 func recommendSolutionSkill(a *Academic) *skills.Skill {
 	return skills.NewSkill("recommend_solution").
-		Description("Recommend a solution with full applicability analysis, grounded evidence, and Librarian validation. ALWAYS consults Librarian.").
+		Description("Recommend a solution with explicit decision criteria, grounded evidence, applicability analysis, and Librarian validation. ALWAYS consults Librarian.").
 		Domain("research").
 		Keywords("recommend", "suggest", "solution", "solve").
+		BestPractice("Start from decision criteria and evidence quality, not brand preference, familiarity, or rhetorical certainty.").
 		BestPractice("Back material claims about performance, reliability, cost, security impact, scale, or adoption with grounded statistics, studies, standards, or official operational data whenever credible evidence exists.").
+		BestPractice("When measurable criteria matter, surface the decision-relevant metrics for this domain and quantify them when credible evidence exists; otherwise state plainly that the support is qualitative or incomplete.").
 		BestPractice("If the evidence for a recommendation is mixed, indirect, or mostly qualitative, say so plainly instead of overstating confidence.").
+		BestPractice("Research the strongest downside, failure mode, criticism, lock-in risk, migration burden, or conflicting evidence against the leading option before recommending it.").
+		BestPractice("Treat self-authored, vendor-authored, or project-authored sources as capability evidence first rather than as standalone proof that the preferred option is superior.").
 		BestPractice("Include the strongest downside of the preferred option and explain why it still wins.").
 		BestPractice("Surface the key assumptions, methodology caveats, and bias risks that could invalidate the recommendation.").
+		Requirement("For substantial recommendations, map the relevant evidence classes for this domain and disclose which are strong, weak, or unavailable: primary or authoritative sources, empirical or observational evidence, counterevidence or failure cases, methodological or limitations evidence, implementation or operational burden, institutional or ecosystem context, and formal or academic or regulatory evidence.").
 		Requirement("For substantial recommendations, justify the choice with explicit evidence categories and include a structured comparison or design sketch when it materially improves clarity.").
+		Requirement("Show why the preferred option beats the strongest alternative on the highest-weighted criteria, not just why it sounds good in isolation.").
 		Requirement("Validate important assumptions and note where the supporting math, datasets, or empirical evidence is thin, biased, or contested.").
+		Requirement("Do not open a substantial externally sourced recommendation with a naked default pick; make the decision frame and evidence quality legible before or alongside the recommendation.").
+		Requirement("Do not emit a Short Answer, shortlist, or compressed winner section before the evidence basis and strongest-alternative comparison are established.").
 		Requirement("Before finalizing, run a rigor audit over all relevant recommendation dimensions: per-link grounding, corroboration, alternatives, counterevidence, math checks, methodology quality, bias risks, and threats to validity.").
+		Requirement("Do not assign high confidence unless the recommendation is supported by broad grounded evidence across the relevant classes, counterevidence was examined, and important limitations are explicit.").
+		Requirement("If independent validation matters and the conclusion still relies mainly on self-authored sources, keep the recommendation provisional or explicitly inconclusive.").
 		Avoid("Do not make the recommendation read like promotional copy or a generic roundup; make the tradeoffs concrete and evidence-backed.").
 		Avoid("Do not stop after naming a winner and a few alternatives when the decision needs comparative evidence synthesis.").
+		Avoid("Do not use unsupported adjectives like best, strongest, safer, simpler, faster, mature, or standard without tying them to explicit criteria and grounded evidence.").
 		Priority(95).
 		StringParam("problem", "The problem to solve", true).
 		ArrayParam("constraints", "Constraints to consider", "string", false).

@@ -2210,6 +2210,9 @@ func (p *OpenAIProvider) convertResponse(result *responses.Response) *Response {
 	if searchCalls := extractOpenAIWebSearchCalls(result); len(searchCalls) > 0 {
 		metadata[ProviderMetadataNativeWebSearchCallsKey] = searchCalls
 	}
+	if searchResults := extractOpenAIWebSearchResults(result); len(searchResults) > 0 {
+		metadata[ProviderMetadataNativeWebSearchResultsKey] = searchResults
+	}
 
 	response := &Response{
 		Content:          result.OutputText(),
@@ -2386,6 +2389,42 @@ func extractOpenAIWebSearchCalls(result *responses.Response) []NativeWebSearchCa
 	return calls
 }
 
+func extractOpenAIWebSearchResults(result *responses.Response) []NativeWebSearchResult {
+	if result == nil {
+		return nil
+	}
+	var results []NativeWebSearchResult
+	for _, item := range result.Output {
+		switch item.Type {
+		case "web_search_call":
+			if selected, ok := openAIWebSearchCallToNativeResult(item.AsWebSearchCall()); ok {
+				results = appendMergedNativeWebSearchResult(results, selected)
+			}
+		case "message":
+			message := item.AsMessage()
+			for _, content := range message.Content {
+				if content.Type != "output_text" {
+					continue
+				}
+				text := content.AsOutputText()
+				for _, annotation := range text.Annotations {
+					citation, ok := annotation.AsAny().(responses.ResponseOutputTextAnnotationURLCitation)
+					if !ok {
+						continue
+					}
+					results = appendMergedNativeWebSearchResult(results, NativeWebSearchResult{
+						Provider: "openai",
+						Source:   "url_citation",
+						URL:      strings.TrimSpace(citation.URL),
+						Title:    strings.TrimSpace(citation.Title),
+					})
+				}
+			}
+		}
+	}
+	return results
+}
+
 func openAIWebSearchCallToNative(item responses.ResponseFunctionWebSearch) NativeWebSearchCall {
 	call := NativeWebSearchCall{
 		ID:       item.ID,
@@ -2405,6 +2444,66 @@ func openAIWebSearchCallToNative(item responses.ResponseFunctionWebSearch) Nativ
 		call.Pattern = action.Pattern
 	}
 	return call
+}
+
+func openAIWebSearchCallToNativeResult(item responses.ResponseFunctionWebSearch) (NativeWebSearchResult, bool) {
+	result := NativeWebSearchResult{
+		SearchID: item.ID,
+		Provider: "openai",
+	}
+	switch action := item.Action.AsAny().(type) {
+	case responses.ResponseFunctionWebSearchActionOpenPage:
+		result.Source = "open_page"
+		result.URL = strings.TrimSpace(action.URL)
+	case responses.ResponseFunctionWebSearchActionFind:
+		result.Source = "find_in_page"
+		result.URL = strings.TrimSpace(action.URL)
+	default:
+		return NativeWebSearchResult{}, false
+	}
+	return result, result.URL != ""
+}
+
+func appendMergedNativeWebSearchResult(results []NativeWebSearchResult, candidate NativeWebSearchResult) []NativeWebSearchResult {
+	candidate.URL = strings.TrimSpace(candidate.URL)
+	if candidate.URL == "" {
+		return results
+	}
+	for i := range results {
+		if strings.TrimSpace(results[i].URL) != candidate.URL {
+			continue
+		}
+		results[i] = mergeNativeWebSearchResult(results[i], candidate)
+		return results
+	}
+	return append(results, candidate)
+}
+
+func mergeNativeWebSearchResult(existing, incoming NativeWebSearchResult) NativeWebSearchResult {
+	if strings.TrimSpace(existing.SearchID) == "" {
+		existing.SearchID = incoming.SearchID
+	}
+	if strings.TrimSpace(existing.Provider) == "" {
+		existing.Provider = incoming.Provider
+	}
+	if strings.TrimSpace(existing.Source) == "" || strings.EqualFold(strings.TrimSpace(existing.Source), "url_citation") {
+		if strings.TrimSpace(incoming.Source) != "" {
+			existing.Source = incoming.Source
+		}
+	}
+	if strings.TrimSpace(existing.Query) == "" {
+		existing.Query = incoming.Query
+	}
+	if strings.TrimSpace(existing.Title) == "" {
+		existing.Title = incoming.Title
+	}
+	if strings.TrimSpace(existing.PageAge) == "" {
+		existing.PageAge = incoming.PageAge
+	}
+	if strings.TrimSpace(existing.URL) == "" {
+		existing.URL = incoming.URL
+	}
+	return existing
 }
 
 func normalizeOpenAIModel(model string) string {

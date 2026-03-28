@@ -3,6 +3,7 @@ package shared
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -342,6 +343,86 @@ func TestGuardianCommandGateAuthorize_WrapsDeniedResponse(t *testing.T) {
 	}
 }
 
+func TestGuardianCommandGateAuthorize_ResearchContinuationAllowsSynthesizeAsIsDecision(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	requestCh := make(chan *guide.RouteRequest, 1)
+	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		select {
+		case requestCh <- req:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	gate := NewGuardianCommandGate(GuardianCommandGateConfig{
+		BusProvider:            func() guide.EventBus { return bus },
+		SourceAgentID:          func() string { return "academic" },
+		SourceAgentType:        "academic",
+		ApprovalRequestTimeout: 2 * time.Second,
+	})
+
+	resultCh := make(chan commandapproval.Evaluation, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		eval, authErr := gate.Authorize(context.Background(), commandapproval.Request{
+			Kind:     commandapproval.ApprovalKindResearchContinuation,
+			Command:  "Topic: OAuth token validation",
+			ToolName: "author_research_paper",
+		})
+		if authErr != nil {
+			errCh <- authErr
+			return
+		}
+		resultCh <- eval
+	}()
+
+	var routeReq *guide.RouteRequest
+	select {
+	case routeReq = <-requestCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for approval request")
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:       routeReq.CorrelationID,
+		Success:             true,
+		RespondingAgentID:   "guardian",
+		RespondingAgentName: "guardian",
+		Data: commandapproval.Evaluation{
+			Decision:     commandapproval.DecisionDeny,
+			UserDecision: "synthesize_as_is",
+			Reason:       "user chose to synthesize current findings",
+		},
+	}
+	if err := bus.Publish(guide.TopicResponses("academic", "academic"), guide.NewResponseMessage("resp-msg", resp)); err != nil {
+		t.Fatalf("publish response: %v", err)
+	}
+
+	select {
+	case authErr := <-errCh:
+		t.Fatalf("Authorize returned error: %v", authErr)
+	case eval := <-resultCh:
+		if eval.Decision != commandapproval.DecisionDeny {
+			t.Fatalf("decision = %s, want %s", eval.Decision, commandapproval.DecisionDeny)
+		}
+		if eval.UserDecision != "synthesize_as_is" {
+			t.Fatalf("user decision = %q, want synthesize_as_is", eval.UserDecision)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for research continuation result")
+	}
+}
+
 func TestGuardianCommandGateAuthorize_SynthesizesApprovalBranchMetadataFromStreamContext(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
@@ -638,5 +719,100 @@ func TestGuardianCommandGateAuthorize_PublishesResolvedProgressAfterApproval(t *
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for approval result")
 		}
+	}
+}
+
+func TestGuardianCommandGateAuthorize_CreatesImmediateApprovalBranchWhenAlreadyNested(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	requestCh := make(chan *guide.RouteRequest, 1)
+	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		select {
+		case requestCh <- req:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	gate := NewGuardianCommandGate(GuardianCommandGateConfig{
+		BusProvider:            func() guide.EventBus { return bus },
+		SourceAgentID:          func() string { return "academic" },
+		SourceAgentType:        "academic",
+		ApprovalRequestTimeout: 2 * time.Second,
+	})
+
+	ctx := WithStreamContext(context.Background(), "corr-child-academic", "architect")
+	ctx = WithStreamContextMetadata(ctx, map[string]any{
+		streamMetadataNestedBranch:      true,
+		streamMetadataParentCorrelation: "corr-parent-architect",
+		streamMetadataParentToolCallKey: "consult-1",
+		streamMetadataInterAgentKind:    InterAgentToolEventKindConsult,
+	})
+	ctx = WithToolCallEmitter(ctx, func(ToolCallEvent) {})
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, authErr := gate.Authorize(ctx, commandapproval.Request{
+			Command:  "https://example.com/spec",
+			ToolName: "web_fetch",
+			Domain:   "example.com",
+		})
+		errCh <- authErr
+	}()
+
+	var routeReq *guide.RouteRequest
+	select {
+	case routeReq = <-requestCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for approval request")
+	}
+
+	if routeReq.Metadata == nil {
+		t.Fatal("expected approval route request metadata")
+	}
+	if got, _ := routeReq.Metadata[streamMetadataParentCorrelation].(string); got != "corr-child-academic" {
+		t.Fatalf("parent correlation = %q, want %q", got, "corr-child-academic")
+	}
+	if got, _ := routeReq.Metadata[streamMetadataInterAgentKind].(string); got != InterAgentToolEventKindApproval {
+		t.Fatalf("branch kind = %q, want %q", got, InterAgentToolEventKindApproval)
+	}
+	toolCallKey, _ := routeReq.Metadata[streamMetadataParentToolCallKey].(string)
+	if strings.TrimSpace(toolCallKey) == "" {
+		t.Fatal("expected immediate approval branch tool_call_key")
+	}
+	if toolCallKey == "consult-1" {
+		t.Fatalf("approval branch should not reuse ancestor consult tool call key %q", toolCallKey)
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:       routeReq.CorrelationID,
+		Success:             true,
+		RespondingAgentID:   "guardian",
+		RespondingAgentName: "guardian",
+		Data: commandapproval.Evaluation{
+			Decision: commandapproval.DecisionAllow,
+			Reason:   "approved by user",
+		},
+	}
+	if err := bus.Publish(guide.TopicResponses("academic", "academic"), guide.NewResponseMessage("resp-msg", resp)); err != nil {
+		t.Fatalf("publish approval response: %v", err)
+	}
+
+	select {
+	case authErr := <-errCh:
+		if authErr != nil {
+			t.Fatalf("Authorize returned error: %v", authErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for approval result")
 	}
 }

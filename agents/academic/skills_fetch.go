@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -25,25 +26,35 @@ func webSearchSkill() *skills.Skill {
 	return skills.NewSkill("web_search").
 		Description(
 			"Search the public web using the model provider's native search capability. "+
-				"Use this to discover authoritative sources when you do not already know the URL. "+
-				"After discovering a source, use web_fetch or fetch_document to retrieve it through the secure pipeline.",
+				"Use this to discover and inspect authoritative sources when you do not already know the URL. "+
+				"Native search may already open/read pages in-context, and Sylk may automatically secure-fetch surfaced exact URLs for local grounding and ingestion.",
 		).
 		Domain("research").
 		Keywords("search", "web", "internet", "google", "discover", "find sources", "documentation", "papers").
-		Usage("Use when you need to discover candidate sources on the public web before fetching them through Sylk's guarded fetch pipeline.").
+		Usage("Use when you need to discover candidate sources on the public web and do not already know the right URL. Native search may already inspect the strongest surfaced pages in-context, and Sylk may automatically ground high-quality exact URLs through the guarded fetch pipeline.").
 		Example("Search official Go and PostgreSQL sources before recommending connection-pooling practices.").
 		Example("Search for standards, RFCs, official docs, and academic papers when the URL is not already known.").
 		BestPractice("Prefer official documentation, standards bodies, project maintainers, and primary-source papers over secondary commentary.").
-		BestPractice("Any URL discovered through web_search that you plan to cite or surface to the user must be grounded with ground_source or an equivalent fetch skill first.").
+		BestPractice("Treat provider-native web_search as evidence gathering, not just a title/snippet lookup.").
+		BestPractice("If web_search surfaces a decisive exact URL that you plan to carry into the final answer, make sure that surfaced URL is one you are prepared to stand behind and that it goes through the secured fetch path if Sylk has not already grounded it.").
+		BestPractice("Search across the evidence classes that matter for the question, not only the most convenient class such as vendor docs or supportive commentary.").
 		BestPractice("When the answer depends on performance, reliability, cost, scale, security impact, or adoption numbers, search for primary empirical sources such as official benchmarks, standards, incident reports, papers, or official operational telemetry instead of summary blogs.").
-		BestPractice("After discovery, fetch the selected source with web_fetch or fetch_document before relying on specific details.").
-		Requirement("Do not stop at web_search if you intend to cite a discovered URL; ground it first with ground_source or an equivalent fetch skill.").
+		BestPractice("When measurable criteria matter, search for the decision-relevant measurable indicators for this domain rather than relying on generic claims or slogans.").
+		BestPractice("Treat vendor-authored or self-authored sources as capability evidence first, then search for independent corroboration if the conclusion depends on comparative claims.").
+		BestPractice("Do a negative pass: after finding promising support, search for criticisms, failure cases, conflicting evidence, lock-in, migration burden, or adoption barriers that could overturn the recommendation.").
+		BestPractice("When native web_search surfaces a clearly relevant, high-quality exact URL, expect Sylk to auto-ground it when appropriate instead of reflexively issuing a second fetch call.").
+		BestPractice("Use ground_source, web_fetch, fetch_document, or one bounded crawl_links follow-up when you already know the exact URL, need a particular fetch mode, or need to force grounding of an exact URL that has not yet gone through the secured fetch path.").
+		Requirement("Do not treat a bare web_search hit as citeable evidence. If a decisive surfaced exact URL carries the answer, that surfaced URL must go through the secured fetch path before citation if Sylk has not already done so.").
+		Requirement("If a strong candidate exact URL is already available and still has not gone through the secured fetch path, do not end the turn at discovery alone; ground that URL now.").
+		Requirement("For substantial questions, identify the relevant evidence classes for the domain and search across them until you know which are strong, weak, or unavailable.").
 		Requirement("If quantitative claims matter, keep searching until you find credible empirical or official evidence, or explicitly conclude that strong quantitative evidence is unavailable.").
 		Requirement("When relevant literature, benchmarks, or postmortems exist, surface them as candidates for deeper grounding instead of relying only on surface-level pages or summaries.").
 		Requirement("For material claims, do not stop after one promising source when corroborating grounded sources are available.").
 		Requirement("Look for sources that let you validate assumptions, inspect methodology, and identify bias or threats to validity instead of only finding affirmative evidence.").
-		Requirement("Assume every source you may cite later will need its own grounding step; search with that downstream rigor audit in mind.").
-		Avoid("Do not surface raw search hits, titles, or URLs as references before grounding them.").
+		Requirement("Do not stop after supportive evidence if contrary or limiting evidence is likely to exist; search for the strongest competing case too.").
+		Requirement("If the current support is dominated by self-authored sources and comparative claims matter, keep searching for independent validation or be prepared to mark the conclusion provisional.").
+		Requirement("Assume the decisive surfaced exact URL you carry forward may need its own secured fetch step if Sylk did not already ground it automatically, and do not imply that every intermediate searched URL received the same treatment.").
+		Avoid("Do not surface raw search hits, titles, or URLs as references before you have actually examined them and, when needed, grounded the exact URL through the secured fetch path.").
 		Avoid("Do not treat popularity or SEO rank as evidence for a technical recommendation.").
 		Priority(95).
 		TokenEstimate(220).
@@ -59,9 +70,10 @@ func webSearchSkill() *skills.Skill {
 func groundSourceSkill(a *Academic) *skills.Skill {
 	return skills.NewSkill("ground_source").
 		Description(
-			"Ground a promising public source discovered via web_search. "+
+			"Force the secured local grounding path for a promising public source URL discovered via web_search or already known. "+
 				"Fetch the source through the secure pipeline, return grounded content immediately, "+
-				"and queue background persistence into the knowledge graph and document store when configured.",
+				"and queue background persistence into the knowledge graph and document store when configured. "+
+				"A successful `web_fetch` or `fetch_document` call for the same exact URL is equally valid grounding for citation and synthesis.",
 		).
 		Domain("research").
 		Keywords("ground", "source", "fetch", "ingest", "document", "page", "evidence").
@@ -70,15 +82,22 @@ func groundSourceSkill(a *Academic) *skills.Skill {
 		StringParam("url", "The promising source URL to ground", true).
 		StringParam("reason", "Why this source looks promising enough to ground", true).
 		EnumParam("expected_type", "Expected source type", []string{"auto", "page", "document"}, false).
-		Usage("Use immediately after web_search when a result looks promising enough to inspect directly before relying on it or citing it in the response.").
+		Usage("Use when you already have an exact URL and want the runtime to choose the fetch mode automatically, or when a searched URL still needs the secured local grounding path before you rely on it or cite it.").
+		BestPractice("If an exact URL still needs local secured grounding, ground it immediately instead of doing another broad search first.").
+		BestPractice("Do not call this reflexively after every native web_search turn; native search may already have inspected the page and Sylk may already auto-ground surfaced high-quality exact URLs.").
 		BestPractice("Prefer ground_source over repeating similar web_search queries once you already have a promising candidate URL.").
+		BestPractice("For each grounded source, identify what evidence class it represents, what claims it can support, what claims it cannot support, and the strongest limitation or downside it reveals.").
+		BestPractice("Identify whether the source is self-authored, vendor-authored, independently reported, or otherwise interested, and adjust how much comparative weight it should carry.").
 		BestPractice("Ground the source before quoting statistics, benchmarks, percentages, or study conclusions from it.").
 		BestPractice("When a number materially affects the recommendation, capture its publication date and sample, workload, or measurement context from the grounded source when available.").
 		BestPractice("When grounding a paper, benchmark, or empirical study, extract the research question, method, key findings, and major limitations.").
 		BestPractice("Use grounded sources as part of a corroborated evidence set for important claims whenever multiple credible sources exist.").
 		BestPractice("Inspect whether the source reveals dataset quality, hidden assumptions, incentive misalignment, or threats to validity that should lower confidence.").
-		Requirement("Use this before citing, quoting, or recommending from a URL discovered through web_search.").
-		Requirement("Treat this as a per-link obligation: if the final answer cites three searched URLs, each of those URLs should have its own grounding step.").
+		Requirement("Use this when an exact URL discovered through web_search still needs the secured fetch path before citing, quoting, or recommending from it.").
+		Requirement("Before citing a grounded source for a material claim, know its date, scope, evidence basis or methodology, and key limitation when those factors materially affect the claim.").
+		Requirement("Treat this as the grounding tool for the decisive surfaced exact URL you are carrying into the answer, or for any other exact URL that still explicitly needs the secured fetch path.").
+		Requirement("Do not treat a grounded source as generic proof of superiority; determine whether it is primary evidence, official guidance, secondary commentary, or another evidence class and cite it accordingly.").
+		Requirement("If the source is self-authored or vendor-authored, treat it as capability evidence unless independently corroborated for the comparative claim at issue.").
 		Avoid("Do not assume a searched page is citeable just because its title or snippet looks authoritative.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
@@ -109,14 +128,20 @@ func webFetchSkill(a *Academic) *skills.Skill {
 			"Fetch a web page or document URL through the secure pipeline. "+
 				"Content is quarantined and inspected by Guardian before use. "+
 				"User consent is required unless the domain is pre-approved. "+
-				"Returns grounded text content immediately and queues background persistence when ingestion is configured.",
+				"Returns grounded text content immediately and queues background persistence when ingestion is configured. "+
+				"A successful call satisfies the per-link grounding obligation for that exact URL.",
 		).
 		Domain("research").
 		Keywords("fetch", "download", "url", "web", "page", "http").
-		Usage("Use when you already know the URL for a specific page, benchmark, report, or documentation page that must be inspected before relying on its claims.").
+		Usage("Use when you already know the exact URL for a specific page, benchmark, report, or documentation page and want to force page-style local grounding before relying on its claims.").
+		BestPractice("Use this when you already know the exact page URL, or when a surfaced URL still needs explicit page-style local grounding.").
+		BestPractice("If native web_search or Sylk already grounded the same exact URL, do not redundantly call web_fetch again unless you need to force this fetch mode or refresh the local fetch.").
+		BestPractice("Treat a successful web_fetch for an exact URL as already grounded for citation and synthesis; do not call ground_source again for the same URL unless you need a different fetch mode.").
 		BestPractice("Do not quote benchmark numbers, percentages, or performance claims from a page until you have fetched and inspected it through the secure pipeline.").
 		BestPractice("For numeric claims, note the publication date and benchmark or study context so the recommendation does not overgeneralize stale or narrow results.").
-		Requirement("Use this for exact URLs you plan to cite, quote, or rely on when ground_source is not the clearer entry point.").
+		BestPractice("Extract what kind of evidence the page actually provides, what it can and cannot support, and any obvious limitations or institutional incentives that affect trust.").
+		Requirement("Use this for exact URLs you plan to cite, quote, or rely on when you need explicit page-style local grounding and ground_source is not the clearer entry point.").
+		Requirement("A successful web_fetch satisfies the exact-URL grounding requirement for that URL.").
 		Avoid("Do not cite a page from memory or from search snippets when you can fetch it directly.").
 		Priority(90).
 		TokenEstimate(500).
@@ -149,16 +174,22 @@ func fetchDocumentSkill(a *Academic) *skills.Skill {
 		Description(
 			"Fetch a document (PDF, HTML, Markdown, plain text) through the secure pipeline and queue persistence into "+
 				"the knowledge graph when ingestion is configured. Content is security-scanned, extracted to text, "+
-				"and immediately returned as grounded evidence while persistence continues in the background.",
+				"and immediately returned as grounded evidence while persistence continues in the background. "+
+				"A successful call satisfies the per-link grounding obligation for that exact URL.",
 		).
 		Domain("research").
 		Keywords("document", "pdf", "paper", "article", "ingest", "fetch").
-		Usage("Use for papers, PDFs, benchmark reports, standards, or long-form studies when the evidence depends on exact methodology, statistics, or formal guidance.").
+		Usage("Use for papers, PDFs, benchmark reports, standards, or long-form studies when you already know the exact document URL and want to force document-style local grounding.").
+		BestPractice("Use this when you already know the exact document URL, or when a surfaced URL still needs explicit document-style local grounding.").
+		BestPractice("If native web_search or Sylk already grounded the same exact URL, do not redundantly call fetch_document again unless you need to force this fetch mode or refresh the local fetch.").
+		BestPractice("Treat a successful fetch_document for an exact URL as already grounded for citation and synthesis; do not call ground_source again for the same URL unless you need a different fetch mode.").
 		BestPractice("Prefer fetch_document for academic papers, official benchmark reports, standards, and incident studies that contain data you expect to cite.").
 		BestPractice("Before repeating study results, verify the date, sample size, workload or experimental setup, and major caveats from the grounded document when available.").
 		BestPractice("Digest the document into actionable findings, not just extracted text: summarize method, findings, relevance, and limitations.").
+		BestPractice("Make explicit what evidence class the document represents and whether it provides primary evidence, formal guidance, institutional policy, or secondary synthesis.").
 		BestPractice("Call out dataset bias, threat models, assumptions, and threats to validity when the document's conclusions depend on them.").
-		Requirement("Use this before citing methodology-heavy papers, benchmark reports, or standards documents discovered through search.").
+		Requirement("Use this when an exact methodology-heavy paper, benchmark report, or standards document still needs the secured fetch path before citation or synthesis.").
+		Requirement("A successful fetch_document satisfies the exact-URL grounding requirement for that URL.").
 		Avoid("Do not summarize a study's conclusion from abstracts, snippets, or third-party commentary when the source document itself is accessible.").
 		Priority(85).
 		TokenEstimate(600).
@@ -191,7 +222,7 @@ func crawlLinksSkill(a *Academic) *skills.Skill {
 	return skills.NewSkill("crawl_links").
 		Description(
 			"Fetch a web page and extract its links. Optionally follow and fetch "+
-				"linked pages (bounded to max_depth=1, max_links=5). Each followed "+
+				"linked pages (bounded to max_depth=1, max_links=10). Each followed "+
 				"link passes through the full security pipeline. Returns grounded "+
 				"text from the root page and summaries of linked pages while background persistence continues when available.",
 		).
@@ -319,9 +350,7 @@ func (a *Academic) executeCrawl(
 		return result, nil
 	}
 
-	// Extract links from the fetched content using the pipeline's extractor.
-	extractor := fetch.NewContentExtractor()
-	links := extractLinks(url, extractor)
+	links := extractLinks(url, rootResp.Extracted)
 
 	if len(links) > maxLinks {
 		links = links[:maxLinks]
@@ -359,16 +388,59 @@ func (a *Academic) executeCrawl(
 	return result, nil
 }
 
-// extractLinks is a placeholder that returns discovered links from a page.
-// In practice, this would parse the HTML content for <a href="..."> tags.
-// Since the pipeline ingests content (not returns it), we extract links
-// from the URL pattern instead. A full implementation would require
-// access to the raw content before ingestion.
-func extractLinks(_ string, _ *fetch.ContentExtractor) []string {
-	// Links are extracted during HTML content extraction by the pipeline's
-	// ingest function. For the crawl skill, we rely on the LLM to provide
-	// specific URLs from its analysis of the fetched content.
-	return nil
+func extractLinks(baseURL string, extracted *fetch.ExtractResult) []string {
+	if extracted == nil || len(extracted.Links) == 0 {
+		return nil
+	}
+
+	base, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return nil
+	}
+
+	baseNoFragment := *base
+	baseNoFragment.Fragment = ""
+	baseCanonical := baseNoFragment.String()
+
+	links := make([]string, 0, len(extracted.Links))
+	seen := make(map[string]struct{}, len(extracted.Links))
+	for _, rawLink := range extracted.Links {
+		rawLink = strings.TrimSpace(rawLink)
+		if rawLink == "" {
+			continue
+		}
+
+		ref, err := url.Parse(rawLink)
+		if err != nil {
+			continue
+		}
+		if ref.Scheme != "" {
+			scheme := strings.ToLower(ref.Scheme)
+			if scheme != "http" && scheme != "https" {
+				continue
+			}
+		}
+
+		resolved := base.ResolveReference(ref)
+		resolved.Fragment = ""
+
+		scheme := strings.ToLower(resolved.Scheme)
+		if scheme != "http" && scheme != "https" {
+			continue
+		}
+
+		normalized := resolved.String()
+		if normalized == "" || normalized == baseCanonical {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		links = append(links, normalized)
+	}
+
+	return links
 }
 
 func formatFindings(findings []fetch.InspectionFinding) []map[string]any {
@@ -411,8 +483,9 @@ func (a *Academic) executeFetchPipeline(ctx context.Context, toolName, url, reas
 
 func buildGroundedFetchResult(resp *fetch.FetchResponse, contentKey string, maxLen int) map[string]any {
 	result := map[string]any{
-		"success":  resp != nil && resp.Success,
-		"grounded": resp != nil && resp.Success,
+		"success":                      resp != nil && resp.Success,
+		"grounded":                     resp != nil && resp.Success,
+		"per_link_grounding_satisfied": resp != nil && resp.Success,
 	}
 	if resp == nil {
 		return result

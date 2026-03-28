@@ -128,6 +128,10 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme, cache *codeBlockC
 	toolCallLines, toolCallRegions := renderToolCalls(entry.ToolCalls, width, th)
 
 	contentLines, codeRegions := renderContent(entry.Content, width, bodyStyle, th, cache)
+	if entryHasPendingInterAgentToolCalls(entry) {
+		contentLines = nil
+		codeRegions = nil
+	}
 
 	// Pre-allocate: 1 header + summary + tool calls + content lines + 1 trailing spacer.
 	lines := make([]string, 0, 2+len(summaryLines)+len(toolCallLines)+len(contentLines))

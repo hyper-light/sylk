@@ -75,6 +75,19 @@ func (s *academicTurnState) setTerminalAction(action academicTurnActionType) err
 	return nil
 }
 
+func (s *academicTurnState) setRequiredReason(reason string) {
+	if s == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(reason)
+	if trimmed == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requiredReason = trimmed
+}
+
 func requiredAcademicActionMessage(action academicTurnActionType, reason string) string {
 	required := strings.TrimSpace(string(action))
 	message := fmt.Sprintf("Before ending this Academic research turn, you must invoke `%s`.", required)

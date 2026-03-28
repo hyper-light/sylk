@@ -48,6 +48,24 @@ const (
 	ApprovalPolicyExact   ApprovalPolicy = "exact"
 )
 
+type ApprovalKind string
+
+const (
+	ApprovalKindCommand              ApprovalKind = "command"
+	ApprovalKindResearchContinuation ApprovalKind = "research_continuation"
+)
+
+func normalizeApprovalKind(kind ApprovalKind) ApprovalKind {
+	switch strings.TrimSpace(string(kind)) {
+	case "", string(ApprovalKindCommand):
+		return ApprovalKindCommand
+	case string(ApprovalKindResearchContinuation):
+		return ApprovalKindResearchContinuation
+	default:
+		return ApprovalKind(strings.TrimSpace(string(kind)))
+	}
+}
+
 func IsFetchToolName(toolName string) bool {
 	switch strings.TrimSpace(toolName) {
 	case "web_fetch", "fetch_document", "crawl_links":
@@ -58,6 +76,7 @@ func IsFetchToolName(toolName string) bool {
 }
 
 type Request struct {
+	Kind           ApprovalKind   `json:"kind,omitempty"`
 	Command        string         `json:"command"`
 	WorkingDir     string         `json:"working_dir,omitempty"`
 	WorkspaceRoot  string         `json:"workspace_root,omitempty"`
@@ -121,6 +140,7 @@ type Evaluation struct {
 }
 
 type Proposal struct {
+	Kind           ApprovalKind   `json:"kind,omitempty"`
 	CorrelationID  string         `json:"correlation_id"`
 	TargetAgentID  string         `json:"target_agent_id"`
 	AgentID        string         `json:"agent_id,omitempty"`
@@ -151,6 +171,17 @@ func (p *Proposal) IsFetchApproval() bool {
 		return false
 	}
 	return IsFetchToolName(p.ToolName)
+}
+
+func (p *Proposal) IsResearchContinuation() bool {
+	if p == nil {
+		return false
+	}
+	return normalizeApprovalKind(p.Kind) == ApprovalKindResearchContinuation
+}
+
+func (r Request) IsResearchContinuation() bool {
+	return normalizeApprovalKind(r.Kind) == ApprovalKindResearchContinuation
 }
 
 type Gate interface {

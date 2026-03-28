@@ -629,6 +629,12 @@ func (p *AnthropicProvider) streamWithHandlerOnce(ctx context.Context, req *Requ
 	if raw := contentBlockTracker.build(p.inboundAnthropicToolName); len(raw) > 0 {
 		providerData = map[string]any{anthropicRawContentKey: raw}
 	}
+	if nativeSearchResults := extractAnthropicNativeWebSearchResults(contentBlockTracker.msg.Content); len(nativeSearchResults) > 0 {
+		if providerData == nil {
+			providerData = make(map[string]any, 1)
+		}
+		providerData[ProviderMetadataNativeWebSearchResultsKey] = nativeSearchResults
+	}
 
 	return handler(&StreamChunk{
 		Index:      chunkIndex + 1,
@@ -1211,6 +1217,9 @@ func (p *AnthropicProvider) convertResponse(msg *anthropic.Message) *Response {
 	if len(nativeSearchCalls) > 0 {
 		meta[ProviderMetadataNativeWebSearchCallsKey] = nativeSearchCalls
 	}
+	if nativeSearchResults := extractAnthropicNativeWebSearchResults(msg.Content); len(nativeSearchResults) > 0 {
+		meta[ProviderMetadataNativeWebSearchResultsKey] = nativeSearchResults
+	}
 
 	return &Response{
 		Content:    content,
@@ -1349,6 +1358,53 @@ func anthropicServerToolUseToNativeWebSearch(block anthropic.ServerToolUseBlock)
 		}
 	}
 	return call
+}
+
+func extractAnthropicNativeWebSearchResults(content []anthropic.ContentBlockUnion) []NativeWebSearchResult {
+	if len(content) == 0 {
+		return nil
+	}
+	queryByToolUseID := make(map[string]string)
+	for _, block := range content {
+		serverToolUse, ok := block.AsAny().(anthropic.ServerToolUseBlock)
+		if !ok {
+			continue
+		}
+		native := anthropicServerToolUseToNativeWebSearch(serverToolUse)
+		if native == nil {
+			continue
+		}
+		toolUseID := strings.TrimSpace(serverToolUse.ID)
+		if toolUseID == "" {
+			continue
+		}
+		queryByToolUseID[toolUseID] = strings.TrimSpace(native.Query)
+	}
+
+	var results []NativeWebSearchResult
+	for _, block := range content {
+		searchResultBlock, ok := block.AsAny().(anthropic.WebSearchToolResultBlock)
+		if !ok {
+			continue
+		}
+		var items []anthropic.WebSearchResultBlock
+		if err := json.Unmarshal([]byte(searchResultBlock.Content.RawJSON()), &items); err != nil {
+			continue
+		}
+		toolUseID := strings.TrimSpace(searchResultBlock.ToolUseID)
+		for _, item := range items {
+			results = appendMergedNativeWebSearchResult(results, NativeWebSearchResult{
+				SearchID: toolUseID,
+				Provider: "anthropic",
+				Source:   "search_result",
+				Query:    queryByToolUseID[toolUseID],
+				URL:      strings.TrimSpace(item.URL),
+				Title:    strings.TrimSpace(item.Title),
+				PageAge:  strings.TrimSpace(item.PageAge),
+			})
+		}
+	}
+	return results
 }
 
 // anthropicRawContentKey is the ProviderMetadata key for serialized content

@@ -235,6 +235,7 @@ func (b *GuideBridge) dispatch(busMsg *guide.Message, program TeaProgram) {
 		return
 	}
 	if stream, ok := busMsg.GetStreamResponse(); ok {
+		stream = streamWithEnvelopeMetadata(stream, busMsg.Metadata)
 		b.dispatchStream(stream, program)
 		return
 	}
@@ -745,10 +746,11 @@ const (
 )
 
 func streamMetadataString(stream *guide.StreamResponse, key string) string {
-	if stream == nil || len(stream.Metadata) == 0 {
+	metadata := effectiveStreamMetadata(stream)
+	if len(metadata) == 0 {
 		return ""
 	}
-	return metadataString(stream.Metadata, key)
+	return metadataString(metadata, key)
 }
 
 func streamAgentName(stream *guide.StreamResponse) string {
@@ -774,10 +776,72 @@ func metadataString(metadata map[string]any, key string) string {
 }
 
 func parseInterAgentBranchRef(stream *guide.StreamResponse) *msg.InterAgentBranchRefMsg {
+	return parseInterAgentBranchRefFromMetadata(effectiveStreamMetadata(stream))
+}
+
+func streamWithEnvelopeMetadata(stream *guide.StreamResponse, envelope map[string]any) *guide.StreamResponse {
+	if stream == nil || len(envelope) == 0 {
+		return stream
+	}
+	merged := cloneMetadataMap(envelope)
+	if streamMetadata := cloneMetadataMap(stream.Metadata); len(streamMetadata) > 0 {
+		if merged == nil {
+			merged = map[string]any{}
+		}
+		for key, value := range streamMetadata {
+			merged[key] = value
+		}
+	}
+	cloned := *stream
+	cloned.Metadata = merged
+	return &cloned
+}
+
+func effectiveStreamMetadata(stream *guide.StreamResponse) map[string]any {
 	if stream == nil {
 		return nil
 	}
-	return parseInterAgentBranchRefFromMetadata(stream.Metadata)
+	metadata := cloneMetadataMap(stream.Metadata)
+	if eventMetadata := streamEventMetadata(stream.Event); len(eventMetadata) > 0 {
+		if metadata == nil {
+			metadata = map[string]any{}
+		}
+		for key, value := range eventMetadata {
+			metadata[key] = value
+		}
+	}
+	return metadata
+}
+
+func streamEventMetadata(event *guide.StreamEvent) map[string]any {
+	if event == nil || event.Data == nil {
+		return nil
+	}
+	data, ok := event.Data.(map[string]any)
+	if !ok || len(data) == 0 {
+		return nil
+	}
+	for _, key := range []string{"stream_metadata", "metadata"} {
+		raw, ok := data[key]
+		if !ok {
+			continue
+		}
+		if nested, ok := raw.(map[string]any); ok && len(nested) > 0 {
+			return nested
+		}
+	}
+	return nil
+}
+
+func cloneMetadataMap(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func parseInterAgentBranchRefFromMetadata(metadata map[string]any) *msg.InterAgentBranchRefMsg {

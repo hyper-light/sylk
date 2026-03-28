@@ -427,6 +427,11 @@ var fetchApprovalOptions = []commandApprovalOption{
 	{label: "Deny Always", hint: "block this exact URL", decision: "deny_always"},
 }
 
+var researchContinuationApprovalOptions = []commandApprovalOption{
+	{label: "Continue Research", hint: "require grounded external sources", decision: "continue_research"},
+	{label: "Output Findings As-Is", hint: "synthesize current evidence", decision: "synthesize_as_is"},
+}
+
 var layerDecisionOptions = []commandApprovalOption{
 	{label: "Retry Layer", hint: "rerun failed nodes", decision: "retry"},
 	{label: "Skip Layer", hint: "continue past failures", decision: "skip"},
@@ -11434,7 +11439,7 @@ func (m *AppModel) handleCommandApprovalKey(key tea.KeyMsg) (tea.Model, tea.Cmd)
 	case "enter", " ":
 		return m, m.activateCommandApprovalOption(m.commandApproval.selected)
 	case "esc":
-		return m, m.activateCommandApprovalOption(2)
+		return m, m.activateCommandApprovalOption(commandApprovalCancelOptionIndex(m.commandApproval.proposal))
 	default:
 		return m, nil
 	}
@@ -11474,15 +11479,12 @@ func (m *AppModel) activateCommandApprovalOption(index int) tea.Cmd {
 }
 
 func (m *AppModel) commitCommandApproval(commit msg.CommandApprovalCommitMsg) tea.Cmd {
+	approved := commandApprovalDecisionApproved(commit.Proposal, commit.Decision)
 	payload := map[string]any{
 		"decision": commit.Decision,
-		"approved": strings.HasPrefix(commit.Decision, "allow_"),
+		"approved": approved,
 	}
-	reason := "denied by user"
-	if payload["approved"].(bool) {
-		reason = "approved by user"
-	}
-	payload["reason"] = reason
+	payload["reason"] = commandApprovalDecisionReason(commit.Proposal, commit.Decision, approved)
 	if commit.Proposal == nil || strings.TrimSpace(commit.Proposal.TargetAgentID) == "" || m.deps.GuideBus == nil {
 		return func() tea.Msg {
 			return msg.CommandApprovalResolvedMsg{}
@@ -14951,7 +14953,7 @@ func renderCommandApprovalCodeBlock(proposal *commandapproval.Proposal, width in
 		command = strings.TrimSpace(proposal.Command)
 	}
 	fenceLang := "sh"
-	if proposal != nil && proposal.IsFetchApproval() {
+	if proposal != nil && (proposal.IsFetchApproval() || proposal.IsResearchContinuation()) {
 		fenceLang = "text"
 	}
 	rendered := markdownpkg.RenderMarkdown("```"+fenceLang+"\n"+command+"\n```", width, th)
@@ -14977,18 +14979,63 @@ func commandApprovalOptionMarkdown(option commandApprovalOption) string {
 }
 
 func commandApprovalOptionsForProposal(proposal *commandapproval.Proposal) []commandApprovalOption {
+	if proposal != nil && proposal.IsResearchContinuation() {
+		return researchContinuationApprovalOptions
+	}
 	if proposal != nil && proposal.IsFetchApproval() {
 		return fetchApprovalOptions
 	}
 	return commandApprovalOptions
 }
 
+func commandApprovalCancelOptionIndex(proposal *commandapproval.Proposal) int {
+	options := commandApprovalOptionsForProposal(proposal)
+	if len(options) == 0 {
+		return 0
+	}
+	switch {
+	case proposal != nil && proposal.IsResearchContinuation():
+		return len(options) - 1
+	case len(options) > 2:
+		return 2
+	default:
+		return len(options) - 1
+	}
+}
+
 func commandApprovalPromptLine(proposal *commandapproval.Proposal) string {
 	requester := commandApprovalRequesterName(proposal)
+	if proposal != nil && proposal.IsResearchContinuation() {
+		return requester + " needs a research completion decision:"
+	}
 	if proposal != nil && proposal.IsFetchApproval() {
 		return requester + " wants approval to fetch:"
 	}
 	return requester + " wants approval for:"
+}
+
+func commandApprovalDecisionApproved(proposal *commandapproval.Proposal, decision string) bool {
+	decision = strings.TrimSpace(strings.ToLower(decision))
+	if proposal != nil && proposal.IsResearchContinuation() {
+		return decision == "continue_research"
+	}
+	return strings.HasPrefix(decision, "allow_")
+}
+
+func commandApprovalDecisionReason(proposal *commandapproval.Proposal, decision string, approved bool) string {
+	decision = strings.TrimSpace(strings.ToLower(decision))
+	if proposal != nil && proposal.IsResearchContinuation() {
+		switch decision {
+		case "continue_research":
+			return "continue research selected by user"
+		case "synthesize_as_is":
+			return "synthesize current findings selected by user"
+		}
+	}
+	if approved {
+		return "approved by user"
+	}
+	return "denied by user"
 }
 
 func commandApprovalRequesterName(proposal *commandapproval.Proposal) string {

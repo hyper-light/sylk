@@ -3,7 +3,9 @@ package academic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,8 @@ import (
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
+
+var errAcademicResearchPaperMissingGroundedSources = errors.New("the academic research run gathered no grounded sources for research paper synthesis")
 
 type architectResearchProtocolParams struct {
 	Query              string
@@ -35,6 +39,7 @@ type academicResearchExecutionState struct {
 	consultAttempts    map[string]struct{}
 	searchAttempts     map[string]researchExecutionSearch
 	observedSearches   map[string]struct{}
+	discoveredResults  map[string]researchExecutionDiscoveredResult
 	sources            []researchExecutionSource
 	sourceIDsByURL     map[string]string
 	librarianEvidence  *shared.ConsultationEvidence
@@ -73,6 +78,15 @@ type researchExecutionSearch struct {
 	RepeatedWithoutGround bool
 }
 
+type researchExecutionDiscoveredResult struct {
+	URL      string
+	Title    string
+	Query    string
+	Provider string
+	Source   string
+	PageAge  string
+}
+
 func WithAcademicResearchExecutionState(ctx context.Context, state *academicResearchExecutionState) context.Context {
 	if state == nil {
 		return ctx
@@ -90,11 +104,12 @@ func academicResearchExecutionStateFromContext(ctx context.Context) *academicRes
 
 func newAcademicResearchExecutionState(sessionID string) *academicResearchExecutionState {
 	return &academicResearchExecutionState{
-		sessionID:        strings.TrimSpace(sessionID),
-		consultAttempts:  make(map[string]struct{}),
-		searchAttempts:   make(map[string]researchExecutionSearch),
-		observedSearches: make(map[string]struct{}),
-		sourceIDsByURL:   make(map[string]string),
+		sessionID:         strings.TrimSpace(sessionID),
+		consultAttempts:   make(map[string]struct{}),
+		searchAttempts:    make(map[string]researchExecutionSearch),
+		observedSearches:  make(map[string]struct{}),
+		discoveredResults: make(map[string]researchExecutionDiscoveredResult),
+		sourceIDsByURL:    make(map[string]string),
 	}
 }
 
@@ -151,16 +166,19 @@ func (s *academicResearchExecutionState) observeToolResult(ctx context.Context, 
 	}
 }
 
-func (s *academicResearchExecutionState) observeProviderResponse(ctx context.Context, resp *providers.Response) {
+func (s *academicResearchExecutionState) observeProviderResponse(ctx context.Context, a *Academic, resp *providers.Response) {
 	if s == nil || resp == nil {
 		return
 	}
 	for _, call := range providers.DecodeNativeWebSearchCalls(resp.ProviderMetadata) {
-		s.observeNativeSearchCall(ctx, call)
+		s.observeNativeSearchCall(ctx, a, call)
+	}
+	for _, result := range providers.DecodeNativeWebSearchResults(resp.ProviderMetadata) {
+		s.observeNativeSearchResult(ctx, result)
 	}
 }
 
-func (s *academicResearchExecutionState) observeNativeSearchCall(ctx context.Context, call providers.NativeWebSearchCall) {
+func (s *academicResearchExecutionState) observeNativeSearchCall(ctx context.Context, a *Academic, call providers.NativeWebSearchCall) {
 	if s == nil {
 		return
 	}
@@ -171,7 +189,11 @@ func (s *academicResearchExecutionState) observeNativeSearchCall(ctx context.Con
 		return
 	}
 
-	fingerprint, _ := normalizeSearchQuery(firstNonEmpty(query, action+" "+rawURL))
+	fingerprintInput := firstNonEmpty(query, action+" "+rawURL)
+	if nativeWebSearchActionResultSource(action) != "" && rawURL != "" {
+		fingerprintInput = action + " " + rawURL
+	}
+	fingerprint, _ := normalizeSearchQuery(fingerprintInput)
 	if fingerprint == "" {
 		fingerprint = strings.ToLower(strings.TrimSpace(action + " " + rawURL))
 	}
@@ -189,7 +211,7 @@ func (s *academicResearchExecutionState) observeNativeSearchCall(ctx context.Con
 		return
 	}
 	s.observedSearches[searchKey] = struct{}{}
-	groundedCount := len(s.sources)
+	groundedCount := s.groundedSourceCountLocked()
 	attempt := s.searchAttempts[fingerprint]
 	attempt.Fingerprint = fingerprint
 	if attempt.Query == "" {
@@ -223,6 +245,79 @@ func (s *academicResearchExecutionState) observeNativeSearchCall(ctx context.Con
 		"grounded_source_count":   groundedCount,
 		"repeated_without_ground": attempt.RepeatedWithoutGround,
 	})
+
+	if source := nativeWebSearchActionResultSource(action); source != "" && rawURL != "" {
+		s.observeNativeSearchResult(ctx, providers.NativeWebSearchResult{
+			SearchID: searchKey,
+			Provider: strings.TrimSpace(call.Provider),
+			Source:   source,
+			Query:    query,
+			URL:      rawURL,
+		})
+	}
+}
+
+func (s *academicResearchExecutionState) observeNativeSearchResult(ctx context.Context, result providers.NativeWebSearchResult) {
+	if s == nil {
+		return
+	}
+	rawURL := strings.TrimSpace(result.URL)
+	if rawURL == "" {
+		return
+	}
+
+	discovered := researchExecutionDiscoveredResult{
+		URL:      rawURL,
+		Title:    strings.TrimSpace(result.Title),
+		Query:    strings.TrimSpace(result.Query),
+		Provider: strings.TrimSpace(result.Provider),
+		Source:   strings.TrimSpace(result.Source),
+		PageAge:  strings.TrimSpace(result.PageAge),
+	}
+
+	s.mu.Lock()
+	existing := s.discoveredResults[rawURL]
+	s.discoveredResults[rawURL] = mergeResearchExecutionDiscoveredResult(existing, discovered)
+	s.reserveSourceIDForURLLocked(rawURL)
+	grounded := s.hasGroundedURLLocked(rawURL)
+	s.sawNativeSearch = true
+	s.sawDiscoverySearch = true
+	discoveredCount := len(s.discoveredResults)
+	s.mu.Unlock()
+
+	academicLogResearchStateEvent(ctx, "native_search_result_observed", map[string]any{
+		"url":                     rawURL,
+		"title":                   discovered.Title,
+		"query":                   discovered.Query,
+		"provider":                discovered.Provider,
+		"source":                  discovered.Source,
+		"page_age":                discovered.PageAge,
+		"already_grounded":        grounded,
+		"discovered_result_count": discoveredCount,
+	})
+}
+
+func mergeResearchExecutionDiscoveredResult(existing, incoming researchExecutionDiscoveredResult) researchExecutionDiscoveredResult {
+	existing.URL = firstNonEmpty(existing.URL, incoming.URL)
+	existing.Title = firstNonEmpty(existing.Title, incoming.Title)
+	existing.Query = firstNonEmpty(existing.Query, incoming.Query)
+	existing.Provider = firstNonEmpty(existing.Provider, incoming.Provider)
+	existing.PageAge = firstNonEmpty(existing.PageAge, incoming.PageAge)
+	if strings.TrimSpace(existing.Source) == "" || strings.EqualFold(strings.TrimSpace(existing.Source), "url_citation") {
+		existing.Source = firstNonEmpty(incoming.Source, existing.Source)
+	}
+	return existing
+}
+
+func nativeWebSearchActionResultSource(action string) string {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "open_page":
+		return "open_page"
+	case "find_in_page":
+		return "find_in_page"
+	default:
+		return ""
+	}
 }
 
 func (s *academicResearchExecutionState) recordFetchResult(ctx context.Context, a *Academic, result string) {
@@ -245,58 +340,17 @@ func (s *academicResearchExecutionState) recordFetchResult(ctx context.Context, 
 		stringValue(payload["description"]),
 		title,
 	)
-	srcID := "src_" + uuid.NewString()
-	source := &Source{
-		ID:          srcID,
-		Type:        sourceTypeFromURL(rawURL),
-		URL:         rawURL,
-		Title:       title,
-		Description: truncateStr(strings.TrimSpace(summary), 280),
-		UpdatedAt:   time.Now().UTC(),
-		TokenCount:  intValue(payload["word_count"]),
-		Quality:     sourceQualityFromPayload(rawURL, payload),
-		Metadata: map[string]any{
-			"grounded":           boolValue(payload["grounded"]),
-			"ingested":           boolValue(payload["ingested"]),
-			"content_hash":       stringValue(payload["content_hash"]),
-			"persistence_status": stringValue(payload["persistence_status"]),
-			"persistence_job_id": stringValue(payload["persistence_job_id"]),
-		},
+	now := time.Now().UTC()
+	sourceType := sourceTypeFromURL(rawURL)
+	sourceQuality := sourceQualityFromPayload(rawURL, payload)
+	sourceMetadata := map[string]any{
+		"grounded":           boolValue(payload["grounded"]),
+		"ingested":           boolValue(payload["ingested"]),
+		"content_hash":       stringValue(payload["content_hash"]),
+		"persistence_status": stringValue(payload["persistence_status"]),
+		"persistence_job_id": stringValue(payload["persistence_job_id"]),
 	}
-	if boolValue(payload["ingested"]) {
-		source.IngestedAt = time.Now().UTC()
-	}
-	a.upsertResearchSource(source)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if existingID, exists := s.sourceIDsByURL[rawURL]; exists {
-		for i := range s.sources {
-			if s.sources[i].ID == existingID {
-				s.sources[i].Title = title
-				s.sources[i].Summary = truncateStr(strings.TrimSpace(summary), 500)
-				s.sources[i].ContentHash = stringValue(payload["content_hash"])
-				s.sources[i].WordCount = intValue(payload["word_count"])
-				s.sources[i].Ingested = boolValue(payload["ingested"])
-				s.sources[i].Grounded = boolValue(payload["grounded"])
-				s.sources[i].Persisted = boolValue(payload["ingested"])
-				s.sources[i].Persistence = stringValue(payload["persistence_status"])
-				s.sources[i].JobID = stringValue(payload["persistence_job_id"])
-				s.sources[i].Quality = source.Quality
-				academicLogResearchStateEvent(ctx, "grounded_source_updated", map[string]any{
-					"url":                rawURL,
-					"title":              title,
-					"ingested":           boolValue(payload["ingested"]),
-					"persistence_status": stringValue(payload["persistence_status"]),
-					"persistence_job_id": stringValue(payload["persistence_job_id"]),
-				})
-				return
-			}
-		}
-	}
-	s.sourceIDsByURL[rawURL] = srcID
-	s.sources = append(s.sources, researchExecutionSource{
-		ID:          srcID,
+	sourceRecord := researchExecutionSource{
 		URL:         rawURL,
 		Title:       title,
 		Summary:     truncateStr(strings.TrimSpace(summary), 500),
@@ -307,10 +361,51 @@ func (s *academicResearchExecutionState) recordFetchResult(ctx context.Context, 
 		Persisted:   boolValue(payload["ingested"]),
 		Persistence: stringValue(payload["persistence_status"]),
 		JobID:       stringValue(payload["persistence_job_id"]),
-		Type:        source.Type,
-		Quality:     source.Quality,
-	})
-	academicLogResearchStateEvent(ctx, "grounded_source_recorded", map[string]any{
+		Type:        sourceType,
+		Quality:     sourceQuality,
+	}
+	source := &Source{
+		Type:        sourceType,
+		URL:         rawURL,
+		Title:       title,
+		Description: truncateStr(strings.TrimSpace(summary), 280),
+		UpdatedAt:   now,
+		TokenCount:  intValue(payload["word_count"]),
+		Quality:     sourceQuality,
+		Metadata:    sourceMetadata,
+	}
+	if boolValue(payload["ingested"]) {
+		source.IngestedAt = now
+	}
+
+	s.mu.Lock()
+	effectiveID := s.reserveSourceIDForURLLocked(rawURL)
+	sourceRecord.ID = effectiveID
+	source.ID = effectiveID
+
+	updated := false
+	for i := range s.sources {
+		if s.sources[i].ID != effectiveID {
+			continue
+		}
+		s.sources[i] = sourceRecord
+		updated = true
+		break
+	}
+	if !updated {
+		s.sources = append(s.sources, sourceRecord)
+	}
+	s.mu.Unlock()
+
+	if a != nil {
+		a.upsertResearchSource(source)
+	}
+
+	eventName := "grounded_source_recorded"
+	if updated {
+		eventName = "grounded_source_updated"
+	}
+	academicLogResearchStateEvent(ctx, eventName, map[string]any{
 		"url":                rawURL,
 		"title":              title,
 		"word_count":         intValue(payload["word_count"]),
@@ -362,6 +457,10 @@ func (s *academicResearchExecutionState) recordPaperOutput(ctx context.Context, 
 	if len(payload) == 0 {
 		return
 	}
+	if strings.TrimSpace(stringValue(payload["paper_id"])) == "" &&
+		strings.TrimSpace(stringValue(payload["paper_path"])) == "" {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.paperOutput = cloneStringAnyMap(payload)
@@ -389,7 +488,7 @@ func (s *academicResearchExecutionState) sourceIDs() []string {
 	defer s.mu.RUnlock()
 	out := make([]string, 0, len(s.sources))
 	for _, source := range s.sources {
-		if strings.TrimSpace(source.ID) != "" {
+		if source.Grounded && strings.TrimSpace(source.ID) != "" {
 			out = append(out, source.ID)
 		}
 	}
@@ -404,7 +503,7 @@ func (s *academicResearchExecutionState) sourceURLs() []string {
 	defer s.mu.RUnlock()
 	out := make([]string, 0, len(s.sources))
 	for _, source := range s.sources {
-		if strings.TrimSpace(source.URL) != "" {
+		if source.Grounded && strings.TrimSpace(source.URL) != "" {
 			out = append(out, source.URL)
 		}
 	}
@@ -431,6 +530,228 @@ func (s *academicResearchExecutionState) hasGroundedSources() bool {
 	return len(s.sourceIDs()) > 0
 }
 
+func (s *academicResearchExecutionState) candidateGroundingURLs(limit int) []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.candidateGroundingURLsLocked(limit)
+}
+
+func (s *academicResearchExecutionState) candidateGroundingURLsLocked(limit int) []string {
+	seen := make(map[string]struct{}, len(s.discoveredResults))
+	urls := make([]string, 0, len(s.discoveredResults))
+	for _, discovered := range s.discoveredResults {
+		rawURL := strings.TrimSpace(discovered.URL)
+		if rawURL == "" {
+			continue
+		}
+		if s.hasGroundedURLLocked(rawURL) {
+			continue
+		}
+		if _, exists := seen[rawURL]; exists {
+			continue
+		}
+		seen[rawURL] = struct{}{}
+		urls = append(urls, rawURL)
+	}
+	sort.Strings(urls)
+	if limit > 0 && len(urls) > limit {
+		urls = urls[:limit]
+	}
+	return urls
+}
+
+func (s *academicResearchExecutionState) bestGroundingCandidate(excluded map[string]struct{}) (researchExecutionDiscoveredResult, bool) {
+	if s == nil {
+		return researchExecutionDiscoveredResult{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.bestGroundingCandidateLocked(excluded)
+}
+
+func (s *academicResearchExecutionState) bestGroundingCandidateLocked(excluded map[string]struct{}) (researchExecutionDiscoveredResult, bool) {
+	candidates := make([]researchExecutionDiscoveredResult, 0, len(s.discoveredResults))
+	for _, discovered := range s.discoveredResults {
+		rawURL := strings.TrimSpace(discovered.URL)
+		if rawURL == "" {
+			continue
+		}
+		if s.hasGroundedURLLocked(rawURL) {
+			continue
+		}
+		if excluded != nil {
+			if _, skip := excluded[rawURL]; skip {
+				continue
+			}
+		}
+		candidates = append(candidates, discovered)
+	}
+	if len(candidates) == 0 {
+		return researchExecutionDiscoveredResult{}, false
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		leftScore := discoveredGroundingCandidateScore(candidates[i])
+		rightScore := discoveredGroundingCandidateScore(candidates[j])
+		if leftScore != rightScore {
+			return leftScore > rightScore
+		}
+		return strings.TrimSpace(candidates[i].URL) < strings.TrimSpace(candidates[j].URL)
+	})
+	return candidates[0], true
+}
+
+func (s *academicResearchExecutionState) bestAutoFetchCandidate(excluded map[string]struct{}) (researchExecutionDiscoveredResult, bool) {
+	if s == nil {
+		return researchExecutionDiscoveredResult{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	candidates := make([]researchExecutionDiscoveredResult, 0, len(s.discoveredResults))
+	for _, discovered := range s.discoveredResults {
+		candidates = append(candidates, discovered)
+	}
+	return s.bestAutoFetchCandidateLocked(candidates, excluded)
+}
+
+func (s *academicResearchExecutionState) bestAutoFetchCandidateForResponse(
+	resp *providers.Response,
+	excluded map[string]struct{},
+) (researchExecutionDiscoveredResult, bool) {
+	if s == nil || resp == nil {
+		return researchExecutionDiscoveredResult{}, false
+	}
+	results := providers.DecodeNativeWebSearchResults(resp.ProviderMetadata)
+	candidates := make([]researchExecutionDiscoveredResult, 0, len(results)+2)
+	for _, result := range results {
+		candidates = append(candidates, researchExecutionDiscoveredResult{
+			URL:      strings.TrimSpace(result.URL),
+			Title:    strings.TrimSpace(result.Title),
+			Query:    strings.TrimSpace(result.Query),
+			Provider: strings.TrimSpace(result.Provider),
+			Source:   strings.TrimSpace(result.Source),
+			PageAge:  strings.TrimSpace(result.PageAge),
+		})
+	}
+	for _, call := range providers.DecodeNativeWebSearchCalls(resp.ProviderMetadata) {
+		source := nativeWebSearchActionResultSource(call.Action)
+		rawURL := strings.TrimSpace(call.URL)
+		if source == "" || rawURL == "" {
+			continue
+		}
+		candidates = append(candidates, researchExecutionDiscoveredResult{
+			URL:      rawURL,
+			Query:    strings.TrimSpace(call.Query),
+			Provider: strings.TrimSpace(call.Provider),
+			Source:   source,
+		})
+	}
+	if len(candidates) == 0 {
+		return researchExecutionDiscoveredResult{}, false
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.bestAutoFetchCandidateLocked(candidates, excluded)
+}
+
+func (s *academicResearchExecutionState) bestAutoFetchCandidateLocked(
+	candidates []researchExecutionDiscoveredResult,
+	excluded map[string]struct{},
+) (researchExecutionDiscoveredResult, bool) {
+	eligible := make([]researchExecutionDiscoveredResult, 0, len(candidates))
+	for _, candidate := range candidates {
+		rawURL := strings.TrimSpace(candidate.URL)
+		if rawURL == "" {
+			continue
+		}
+		if s.hasGroundedURLLocked(rawURL) {
+			continue
+		}
+		if excluded != nil {
+			if _, skip := excluded[rawURL]; skip {
+				continue
+			}
+		}
+		if !discoveredResultEligibleForImmediateFetch(candidate) {
+			continue
+		}
+		eligible = append(eligible, candidate)
+	}
+	if len(eligible) == 0 {
+		return researchExecutionDiscoveredResult{}, false
+	}
+	sort.SliceStable(eligible, func(i, j int) bool {
+		leftScore := discoveredGroundingCandidateScore(eligible[i])
+		rightScore := discoveredGroundingCandidateScore(eligible[j])
+		if leftScore != rightScore {
+			return leftScore > rightScore
+		}
+		return strings.TrimSpace(eligible[i].URL) < strings.TrimSpace(eligible[j].URL)
+	})
+	return eligible[0], true
+}
+
+func discoveredResultEligibleForImmediateFetch(result researchExecutionDiscoveredResult) bool {
+	rawURL := strings.TrimSpace(result.URL)
+	if rawURL == "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(result.Source)) {
+	case "open_page", "find_in_page":
+		return true
+	}
+	if strings.TrimSpace(result.Title) == "" {
+		return false
+	}
+	if looksLikeDocumentURL(rawURL) {
+		return true
+	}
+	switch sourceTypeFromURL(rawURL) {
+	case SourceTypeDocumentation, SourceTypePaper, SourceTypeRFC:
+		return true
+	default:
+		return false
+	}
+}
+
+func discoveredGroundingCandidateScore(result researchExecutionDiscoveredResult) int {
+	score := 0
+	switch strings.ToLower(strings.TrimSpace(result.Source)) {
+	case "open_page":
+		score += 50
+	case "find_in_page":
+		score += 45
+	case "search_result":
+		score += 35
+	case "url_citation":
+		score += 25
+	default:
+		score += 10
+	}
+	switch sourceTypeFromURL(result.URL) {
+	case SourceTypePaper, SourceTypeRFC, SourceTypeDocumentation:
+		score += 20
+	case SourceTypeGitHub:
+		score += 8
+	default:
+		score += 4
+	}
+	if looksLikeDocumentURL(result.URL) {
+		score += 5
+	}
+	if strings.TrimSpace(result.Title) != "" {
+		score += 2
+	}
+	if strings.TrimSpace(result.PageAge) != "" {
+		score++
+	}
+	return score
+}
+
 func (s *academicResearchExecutionState) finalizationBlock() (string, map[string]any) {
 	if s == nil {
 		return "", nil
@@ -439,16 +760,31 @@ func (s *academicResearchExecutionState) finalizationBlock() (string, map[string
 	defer s.mu.RUnlock()
 
 	reasons := make([]string, 0, 2)
+	groundedCount := s.groundedSourceCountLocked()
 	fields := map[string]any{
 		"saw_native_search":    s.sawNativeSearch,
 		"saw_discovery_search": s.sawDiscoverySearch,
-		"grounded_sources":     len(s.sources),
+		"grounded_sources":     groundedCount,
 		"paper_required":       s.requirePaper,
 		"paper_recorded":       len(s.paperOutput) > 0,
 	}
+	candidateURLs := s.candidateGroundingURLsLocked(3)
+	autoFetchCandidate, hasAutoFetchCandidate := s.bestAutoFetchCandidateLocked(s.discoveredResultsSliceLocked(), nil)
+	if candidateCount := len(s.candidateGroundingURLsLocked(0)); candidateCount > 0 {
+		fields["candidate_grounding_url_count"] = candidateCount
+		fields["candidate_grounding_urls"] = candidateURLs
+	}
+	if hasAutoFetchCandidate {
+		fields["auto_fetch_candidate_url"] = strings.TrimSpace(autoFetchCandidate.URL)
+		fields["auto_fetch_candidate_source"] = strings.TrimSpace(autoFetchCandidate.Source)
+	}
 
-	if s.sawDiscoverySearch && len(s.sources) == 0 {
-		reasons = append(reasons, "You already used `web_search`, but you have not grounded any promising source yet. Pick the strongest candidate URL and call `ground_source`, `web_fetch`, `fetch_document`, or one bounded `crawl_links` follow-up before finalizing.")
+	if hasAutoFetchCandidate && groundedCount == 0 {
+		reason := "You already used `web_search`, but you have not grounded any promising source yet. Pick the strongest candidate URL and call `ground_source`, `web_fetch`, `fetch_document`, or one bounded `crawl_links` follow-up before finalizing."
+		if len(candidateURLs) > 0 {
+			reason = fmt.Sprintf("%s Candidate URLs already surfaced in this run: %s.", reason, strings.Join(candidateURLs, ", "))
+		}
+		reasons = append(reasons, reason)
 	}
 	if s.repeatedSearch != nil && s.repeatedSearch.RepeatedWithoutGround {
 		fields["repeated_search_query"] = s.repeatedSearch.Query
@@ -464,13 +800,35 @@ func (s *academicResearchExecutionState) finalizationBlock() (string, map[string
 	return strings.Join(reasons, " "), fields
 }
 
+func (s *academicResearchExecutionState) discoveredResultsSliceLocked() []researchExecutionDiscoveredResult {
+	if s == nil {
+		return nil
+	}
+	results := make([]researchExecutionDiscoveredResult, 0, len(s.discoveredResults))
+	for _, discovered := range s.discoveredResults {
+		results = append(results, discovered)
+	}
+	return results
+}
+
+type researchResultBuildOptions struct {
+	AllowUngrounded bool
+}
+
 func (s *academicResearchExecutionState) buildResearchResult(params *authorResearchPaperParams) (*ResearchResult, error) {
+	return s.buildResearchResultWithOptions(params, researchResultBuildOptions{})
+}
+
+func (s *academicResearchExecutionState) buildResearchResultWithOptions(
+	params *authorResearchPaperParams,
+	opts researchResultBuildOptions,
+) (*ResearchResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("research execution state is required")
 	}
 	sourceIDs := s.sourceIDs()
-	if len(sourceIDs) == 0 {
-		return nil, fmt.Errorf("the academic research run gathered no grounded sources for research paper synthesis")
+	if len(sourceIDs) == 0 && !opts.AllowUngrounded {
+		return nil, errAcademicResearchPaperMissingGroundedSources
 	}
 	findings := make([]Finding, 0)
 	for _, item := range filterNonEmpty(params.KeyFindings) {
@@ -515,7 +873,7 @@ func (s *academicResearchExecutionState) buildResearchResult(params *authorResea
 		Findings:         findings,
 		Recommendations:  recommendations,
 		SourcesConsulted: append([]string(nil), sourceIDs...),
-		Confidence:       academicExecutionConfidenceLevel(s),
+		Confidence:       academicExecutionConfidenceLevelWithOptions(s, opts),
 		GeneratedAt:      time.Now().UTC(),
 	}, nil
 }
@@ -537,8 +895,18 @@ func (s *academicResearchExecutionState) consultationEvidence(target string) *sh
 }
 
 func academicExecutionConfidenceLevel(state *academicResearchExecutionState) ConfidenceLevel {
+	return academicExecutionConfidenceLevelWithOptions(state, researchResultBuildOptions{})
+}
+
+func academicExecutionConfidenceLevelWithOptions(state *academicResearchExecutionState, opts researchResultBuildOptions) ConfidenceLevel {
 	if state == nil {
+		if opts.AllowUngrounded {
+			return ConfidenceLevelLow
+		}
 		return ConfidenceLevelMedium
+	}
+	if opts.AllowUngrounded && len(state.sourceIDs()) == 0 {
+		return ConfidenceLevelLow
 	}
 	score := len(state.sourceIDs())
 	if state.consultationEvidence("librarian") != nil {
@@ -625,6 +993,51 @@ func sourceTypeFromURL(rawURL string) SourceType {
 	default:
 		return SourceTypeArticle
 	}
+}
+
+func (s *academicResearchExecutionState) hasGroundedURL(rawURL string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hasGroundedURLLocked(rawURL)
+}
+
+func (s *academicResearchExecutionState) hasGroundedURLLocked(rawURL string) bool {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return false
+	}
+	for _, source := range s.sources {
+		if source.Grounded && strings.TrimSpace(source.URL) == rawURL {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *academicResearchExecutionState) groundedSourceCountLocked() int {
+	count := 0
+	for _, source := range s.sources {
+		if source.Grounded {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *academicResearchExecutionState) reserveSourceIDForURLLocked(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	if existing := strings.TrimSpace(s.sourceIDsByURL[rawURL]); existing != "" {
+		return existing
+	}
+	effectiveID := "src_" + uuid.NewString()
+	s.sourceIDsByURL[rawURL] = effectiveID
+	return effectiveID
 }
 
 func sourceQualityFromPayload(rawURL string, payload map[string]any) float64 {
@@ -759,13 +1172,7 @@ func (a *Academic) runArchitectResearchProtocol(
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	text, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return a.executeToolLoopWithDiscipline(
-			ctx,
-			llmReq,
-			ledger,
-			surface,
-			requiredSearchDiscipline(a.config.SearchDisciplineMaxAttempts),
-		)
+		return a.executeToolLoop(ctx, llmReq, ledger, surface)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("architect research protocol: %w", err)
@@ -860,8 +1267,8 @@ func buildArchitectResearchProtocolPrompt(params *architectResearchProtocolParam
 		b.WriteString("\n\n")
 	}
 	b.WriteString("Protocol phases:\n")
-	b.WriteString("1. Gather research. If current public information, official docs, standards, research papers, expert articles, or precise source URLs matter, use `web_search` first. Keep searching only while you are still surfacing materially better, more relevant, well-sourced candidates.\n")
-	b.WriteString("2. Ground and ingest evidence. If a result looks promising, you must inspect the source itself before relying on it: use `web_fetch`, `fetch_document`, or one bounded `crawl_links` follow-up. For a high-relevance source you expect to cite heavily, prefer `fetch_document` so it is ingested into the knowledge graph and document store when available.\n")
+	b.WriteString("1. Gather research. If current public information, official docs, standards, research papers, expert articles, or precise source URLs matter, use `web_search` first. Keep searching only while you are still surfacing materially better, more relevant, well-sourced candidates. Provider-native `web_search` may already inspect pages in-context.\n")
+	b.WriteString("2. Ground and ingest evidence. If a result looks promising, make sure the source is actually examined before relying on it. Sylk may automatically secure-fetch clearly relevant, high-quality exact URLs surfaced by native `web_search`. Use `ground_source`, `web_fetch`, `fetch_document`, or one bounded `crawl_links` follow-up when you need exact-URL control, a specific fetch mode, or a secured fetch path that has not happened yet. For a high-relevance source you expect to cite heavily, prefer `fetch_document` so it is ingested into the knowledge graph and document store when available.\n")
 	b.WriteString("3. Consult supporting agents only when the evidence genuinely needs them. Consult the Librarian when codebase fit matters. Consult the Archivalist when historical precedent materially affects the answer. You may not repeat the same consultation question to the same agent in this run.\n")
 	b.WriteString("4. Synthesize. Once the evidence is sufficient, invoke `author_research_paper` and pass the research summary, key findings, recommendations, open questions, and any architect-facing planning notes needed by the Architect.\n\n")
 	b.WriteString("When you call `author_research_paper`:\n")

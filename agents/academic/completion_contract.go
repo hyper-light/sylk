@@ -41,6 +41,10 @@ type academicCompletionContract struct {
 	RequirePolishedOut bool
 }
 
+type academicEvidenceClassTracker interface {
+	hasEvidenceClass(class academicEvidenceClass) bool
+}
+
 type academicCompletionContractKey struct{}
 
 func WithAcademicCompletionContract(ctx context.Context, contract *academicCompletionContract) context.Context {
@@ -174,7 +178,7 @@ func (c *academicCompletionContract) guidancePrompt() string {
 	preferred := joinEvidenceLabels(c.PreferredEvidence)
 	objective := c.objectiveLabel()
 	return fmt.Sprintf(
-		"Research objective: %s. Work toward a conclusion that is grounded, codebase-aware, and polished. Required evidence classes before finalizing: %s. As relevant to the question, consider authoritative official docs, standards/specifications, research papers, expert articles, and reference repositories rather than assuming only one source type matters. Preferred evidence for this request: %s. If the evidence plateaus before the requirements can be fully satisfied, end with a polished inconclusive memo that states what you found, what evidence is still missing, why it matters, and the best next step.",
+		"Research objective: %s. Work toward a conclusion that is grounded, codebase-aware, and polished. Before choosing a winner, define the decision frame: what is being decided, which criteria matter most, which evidence classes are relevant, and what findings could overturn the conclusion. Do not collapse the answer into a short answer, shortlist, or clean winner before the evidence basis, strongest alternative, and strongest counterevidence are established. Treat self-authored, vendor-authored, or project-authored sources as capability evidence first rather than standalone proof of comparative superiority. Required evidence classes before finalizing: %s. As relevant to the question, consider authoritative or primary sources, empirical or observational evidence, counterevidence or failure cases, methodological or limitations evidence, institutional or ecosystem context, formal or academic or regulatory evidence, and implementation or operational evidence rather than assuming one source type is enough. Preferred evidence for this request: %s. Prefer substance over terseness: the target is a serious research memo, not a lightweight recommendation blurb. If independent validation is relevant and still missing, keep the conclusion provisional or explicitly inconclusive. If the evidence plateaus before the requirements can be fully satisfied, end with a polished inconclusive memo that states what you found, what evidence is still missing, why it matters, and the best next step.",
 		objective,
 		required,
 		preferred,
@@ -187,7 +191,7 @@ func (c *academicCompletionContract) objectiveLabel() string {
 	}
 	switch c.Objective {
 	case academicObjectiveCompareAlternatives:
-		return "compare alternatives and recommend the strongest option"
+		return "compare alternatives and determine whether one option is sufficiently supported"
 	case academicObjectiveVerifyClaim:
 		return "verify the claim against reliable evidence"
 	case academicObjectiveAssessFeasibility:
@@ -199,11 +203,11 @@ func (c *academicCompletionContract) objectiveLabel() string {
 	case academicObjectiveAnalyzeReferenceRepos:
 		return "analyze high-quality remote reference implementations"
 	default:
-		return "recommend the best-supported approach"
+		return "determine the best-supported approach or state that the evidence is insufficient"
 	}
 }
 
-func (c *academicCompletionContract) finalizationAllowed(tracker *searchEvidenceTracker, content string) bool {
+func (c *academicCompletionContract) finalizationAllowed(tracker academicEvidenceClassTracker, content string) bool {
 	if c == nil {
 		return true
 	}
@@ -216,7 +220,7 @@ func (c *academicCompletionContract) finalizationAllowed(tracker *searchEvidence
 	return c.looksLikePolishedInconclusive(content)
 }
 
-func (c *academicCompletionContract) finalizationReminder(tracker *searchEvidenceTracker) string {
+func (c *academicCompletionContract) finalizationReminder(tracker academicEvidenceClassTracker) string {
 	if c == nil {
 		return ""
 	}
@@ -234,7 +238,7 @@ func (c *academicCompletionContract) finalizationReminder(tracker *searchEvidenc
 	return base
 }
 
-func (c *academicCompletionContract) missingRequiredEvidence(tracker *searchEvidenceTracker) []academicEvidenceClass {
+func (c *academicCompletionContract) missingRequiredEvidence(tracker academicEvidenceClassTracker) []academicEvidenceClass {
 	if c == nil {
 		return nil
 	}
@@ -247,7 +251,7 @@ func (c *academicCompletionContract) missingRequiredEvidence(tracker *searchEvid
 	return dedupeEvidenceClasses(missing)
 }
 
-func (c *academicCompletionContract) missingPreferredEvidence(tracker *searchEvidenceTracker) []academicEvidenceClass {
+func (c *academicCompletionContract) missingPreferredEvidence(tracker academicEvidenceClassTracker) []academicEvidenceClass {
 	if c == nil {
 		return nil
 	}
@@ -260,7 +264,7 @@ func (c *academicCompletionContract) missingPreferredEvidence(tracker *searchEvi
 	return dedupeEvidenceClasses(missing)
 }
 
-func (c *academicCompletionContract) requiredEvidenceSatisfied(tracker *searchEvidenceTracker) bool {
+func (c *academicCompletionContract) requiredEvidenceSatisfied(tracker academicEvidenceClassTracker) bool {
 	return len(c.missingRequiredEvidence(tracker)) == 0
 }
 

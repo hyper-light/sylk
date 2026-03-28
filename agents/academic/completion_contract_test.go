@@ -1,6 +1,7 @@
 package academic
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -48,6 +49,32 @@ func TestAcademicCompletionContractForResearchQuery_CodebaseSpecificRecallRequir
 	}
 	if !containsEvidenceClass(contract.RequiredEvidence, academicEvidenceCodebaseFit) {
 		t.Fatalf("required evidence = %#v, want codebase fit for codebase-specific recall", contract.RequiredEvidence)
+	}
+}
+
+func TestAcademicCompletionContractGuidancePrompt_UsesEvidenceFrame(t *testing.T) {
+	contract := academicCompletionContractForResearchQuery(&ResearchQuery{
+		Query:  "Compare approaches for a decision with current external evidence.",
+		Intent: IntentRecall,
+	})
+	if contract == nil {
+		t.Fatal("expected completion contract")
+	}
+	prompt := contract.guidancePrompt()
+	for _, needle := range []string{
+		"Before choosing a winner, define the decision frame",
+		"Do not collapse the answer into a short answer, shortlist, or clean winner",
+		"Treat self-authored, vendor-authored, or project-authored sources as capability evidence first",
+		"which evidence classes are relevant",
+		"authoritative or primary sources",
+		"counterevidence or failure cases",
+		"implementation or operational evidence",
+		"Prefer substance over terseness: the target is a serious research memo, not a lightweight recommendation blurb.",
+		"keep the conclusion provisional or explicitly inconclusive",
+	} {
+		if !strings.Contains(prompt, needle) {
+			t.Fatalf("guidancePrompt missing %q:\n%s", needle, prompt)
+		}
 	}
 }
 

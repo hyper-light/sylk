@@ -62,6 +62,8 @@ type ToolCallSubregion struct {
 	Kind             ToolCallSubregionKind
 	ChildIndex       int
 	ChildToolCallIdx int
+	ChildPath        []int
+	InterAgentPath   []int
 }
 
 type InterAgentToolKind string

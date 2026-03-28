@@ -1665,6 +1665,126 @@ func TestHandleGuideResponse_TopLevelPendingChildWorkDefersCompletion(t *testing
 	}
 }
 
+func TestHandleGuideResponse_NestedConsultRowsRemainVisibleAfterChildStreamText(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 120, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	app.chat.PushEntry(&chatpkg.ChatEntry{
+		ID:             "architect-origin-nested-consult-after-text",
+		Timestamp:      time.Now(),
+		CorrelationID:  "corr-parent-nested-consult-after-text",
+		Source:         chatpkg.SourceAgent,
+		AgentType:      "architect",
+		Content:        "Architect draft text should stay hidden while the consult runs.",
+		Streaming:      true,
+		ThinkingText:   "Waiting for child work to finish...",
+		ThinkingStatus: "Waiting for child work to finish...",
+		Height:         -1,
+		ToolCalls: []chatpkg.ToolCallRecord{
+			{
+				ToolCallKey: "consult-academic-1",
+				ToolName:    "consult_academic_approach",
+				Completed:   true,
+				Success:     true,
+				InterAgent: &chatpkg.InterAgentTool{
+					Kind:       chatpkg.InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Build the research evidence base.",
+					Status:     chatpkg.InterAgentToolDone,
+				},
+			},
+		},
+	})
+
+	parentBranch := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-nested-consult-after-text",
+		ParentToolCallKey:   "consult-academic-1",
+		Kind:                "consult",
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-academic-after-text",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		AgentName:     "Academic",
+		BranchRef:     parentBranch,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamChunkMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-academic-after-text",
+		Text:          "Initial academic draft text that should remain nested.",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-academic-after-text",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		AgentName:     "Academic",
+		ToolCallKey:   "consult-lib-1",
+		ToolName:      "consult",
+		FullArgs:      `{"target":"librarian","query":"Find benchmark and methodology sources."}`,
+		Phase:         0,
+		StartedAt:     time.Now().Add(-250 * time.Millisecond),
+		BranchRef:     parentBranch,
+	})
+	app = model.(*AppModel)
+
+	librarianBranch := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-child-academic-after-text",
+		ParentToolCallKey:   "consult-lib-1",
+		Kind:                "consult",
+	}
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-librarian-after-text",
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+		BranchRef:     librarianBranch,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-librarian-after-text",
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+		ToolCallKey:   "ws_1",
+		ToolName:      "web_search",
+		ArgsSummary:   "query=framework benchmark methodology",
+		FullArgs:      `{"query":"framework benchmark methodology"}`,
+		Phase:         0,
+		StartedAt:     time.Now().Add(-150 * time.Millisecond),
+		BranchRef:     librarianBranch,
+	})
+	app = model.(*AppModel)
+
+	rendered := app.chat.View()
+	if strings.Contains(rendered, "Architect draft text should stay hidden while the consult runs.") {
+		t.Fatalf("expected parent draft text to stay hidden while nested consult work is active, got %q", rendered)
+	}
+	for _, needle := range []string{
+		"academic",
+		"librarian",
+		"Find benchmark and methodology sources.",
+		"web_search",
+		"framework benchmark methodology",
+	} {
+		if !strings.Contains(rendered, needle) {
+			t.Fatalf("expected nested consult chat render to contain %q, got %q", needle, rendered)
+		}
+	}
+}
+
 func findChatEntryByCorrelation(chat *chatpkg.Model, correlationID string) *chatpkg.ChatEntry {
 	if chat == nil {
 		return nil

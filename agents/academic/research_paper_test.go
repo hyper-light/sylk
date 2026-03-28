@@ -2,6 +2,9 @@ package academic
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,7 +12,33 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/commandapproval"
+	"github.com/adalundhe/sylk/core/fetch"
+	"github.com/adalundhe/sylk/core/providers"
 )
+
+type countingAcademicProvider struct {
+	calls int
+}
+
+func (p *countingAcademicProvider) Complete(_ context.Context, _ *providers.Request) (*providers.Response, error) {
+	p.calls++
+	return nil, fmt.Errorf("provider should not be called")
+}
+
+type staticResearchDecisionGate struct {
+	eval     commandapproval.Evaluation
+	err      error
+	requests []commandapproval.Request
+}
+
+func (g *staticResearchDecisionGate) Authorize(_ context.Context, req commandapproval.Request) (commandapproval.Evaluation, error) {
+	g.requests = append(g.requests, req)
+	if g.err != nil {
+		return commandapproval.Evaluation{}, g.err
+	}
+	return g.eval, nil
+}
 
 func TestBuildResearchPaperAndArtifact(t *testing.T) {
 	a, err := New(Config{SessionID: "sess-paper"}, nil)
@@ -214,6 +243,7 @@ func TestAuthorResearchPaper_UsesExecuteResearchStateWithoutRerunningResearch(t 
 		URL:      "https://example.com/oauth",
 		Title:    "OAuth Deployment Guide",
 		Summary:  "Use a dedicated token validation boundary and rotate keys safely.",
+		Grounded: true,
 		Ingested: true,
 		Type:     SourceTypeDocumentation,
 		Quality:  0.9,
@@ -250,5 +280,287 @@ func TestAuthorResearchPaper_UsesExecuteResearchStateWithoutRerunningResearch(t 
 	}
 	if strings.TrimSpace(out["summary"].(string)) == "" {
 		t.Fatalf("summary missing from output: %#v", out)
+	}
+}
+
+func TestResolveResearchPaperInputs_TerminalConsultationRequestsContinueResearchWhenNoGroundedSources(t *testing.T) {
+	provider := &countingAcademicProvider{}
+	a, err := New(Config{SessionID: "sess-terminal-paper"}, provider)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+
+	gate := &staticResearchDecisionGate{
+		eval: commandapproval.Evaluation{
+			Decision:     commandapproval.DecisionAllow,
+			UserDecision: researchDecisionContinue,
+		},
+	}
+	ctx := commandapproval.WithGate(context.Background(), gate)
+	ctx = WithAcademicTurnState(ctx, newAcademicTurnState(
+		academicTurnActionResearchPaper,
+		"Architect consultation must end at paper authoring.",
+	))
+	ctx = WithAcademicResearchExecutionState(ctx, newAcademicResearchExecutionState("sess-terminal-paper"))
+
+	resolution, err := a.resolveResearchPaperInputs(ctx, &authorResearchPaperParams{
+		Topic:   "oauth token validation",
+		Context: "Architect needs a planning-ready recommendation.",
+	}, "sess-terminal-paper")
+	if err != nil {
+		t.Fatalf("resolveResearchPaperInputs() error = %v", err)
+	}
+	if resolution == nil || strings.TrimSpace(resolution.continueResearchMessage) == "" {
+		t.Fatalf("expected continue-research resolution, got %#v", resolution)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("provider calls = %d, want 0", provider.calls)
+	}
+	if len(gate.requests) != 1 {
+		t.Fatalf("approval requests = %d, want 1", len(gate.requests))
+	}
+	if !gate.requests[0].IsResearchContinuation() {
+		t.Fatalf("approval kind = %q, want research continuation", gate.requests[0].Kind)
+	}
+}
+
+func TestResolveResearchPaperInputs_TerminalConsultationAutoGroundsDiscoveredURLs(t *testing.T) {
+	provider := &countingAcademicProvider{}
+	a, err := New(Config{SessionID: "sess-terminal-paper"}, provider)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+
+	policyCfg := fetch.DefaultPolicyConfig()
+	policyCfg.RequireTLS = false
+	pipeline := fetch.NewPipeline(fetch.PipelineConfig{
+		Policy:     fetch.NewFetchPolicy(policyCfg),
+		Consent:    fetch.NewConsentGate(fetch.ConsentGateConfig{AutoApproveDomains: []string{"*"}}),
+		Quarantine: fetch.NewQuarantineBuffer(8, 1024*1024),
+		Client: fetch.NewClient(fetch.ClientConfig{
+			MaxBytes:       1024 * 1024,
+			RequestTimeout: 5 * time.Second,
+			UserAgent:      "Sylk-Academic/1.0",
+			Transport: crawlRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.String() != "http://docs.safe.test/oauth" {
+					return &http.Response{
+						StatusCode: 404,
+						Status:     "404 Not Found",
+						Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+						Body:       io.NopCloser(strings.NewReader("missing")),
+						Request:    req,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: 200,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+					Body: io.NopCloser(strings.NewReader(
+						"<html><body><h1>OAuth deployment guidance</h1><p>Use a dedicated token validation boundary with clear ownership.</p></body></html>",
+					)),
+					Request: req,
+				}, nil
+			}),
+		}),
+		Extractor: fetch.NewContentExtractor(),
+		Inspect: func(context.Context, *fetch.QuarantineEntry) (fetch.QuarantineVerdict, []fetch.InspectionFinding, error) {
+			return fetch.VerdictClean, nil, nil
+		},
+	})
+	a.SetFetchPipeline(pipeline)
+
+	execState := newAcademicResearchExecutionState("sess-terminal-paper")
+	execState.observeNativeSearchCall(context.Background(), a, providers.NativeWebSearchCall{
+		ID:     "search-open-1",
+		Action: "open_page",
+		Query:  "oauth token validation boundary",
+		URL:    "http://docs.safe.test/oauth",
+	})
+
+	ctx := WithAcademicTurnState(context.Background(), newAcademicTurnState(
+		academicTurnActionResearchPaper,
+		"Architect consultation must end at paper authoring.",
+	))
+	ctx = WithAcademicResearchExecutionState(ctx, execState)
+
+	resolution, err := a.resolveResearchPaperInputs(ctx, &authorResearchPaperParams{
+		Topic:           "oauth token validation",
+		Context:         "Architect needs a planning-ready recommendation.",
+		ResearchSummary: "Centralize token validation behind one boundary.",
+	}, "sess-terminal-paper")
+	if err != nil {
+		t.Fatalf("resolveResearchPaperInputs() error = %v", err)
+	}
+	if resolution == nil {
+		t.Fatal("expected resolution")
+	}
+	result := resolution.result
+	librarianEvidence := resolution.librarianEvidence
+	archivalEvidence := resolution.archivalEvidence
+	if result == nil {
+		t.Fatal("expected research result")
+	}
+	if len(result.SourcesConsulted) == 0 {
+		t.Fatalf("SourcesConsulted = %#v, want grounded source IDs", result.SourcesConsulted)
+	}
+	if librarianEvidence != nil || archivalEvidence != nil {
+		t.Fatalf("unexpected consultation evidence: librarian=%#v archivalist=%#v", librarianEvidence, archivalEvidence)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("provider calls = %d, want 0", provider.calls)
+	}
+	if !execState.hasGroundedSources() {
+		t.Fatal("expected execution state to record grounded sources after auto-grounding")
+	}
+}
+
+func TestResolveResearchPaperInputs_TerminalConsultationAutoGroundsProviderSearchResults(t *testing.T) {
+	provider := &countingAcademicProvider{}
+	a, err := New(Config{SessionID: "sess-terminal-paper"}, provider)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+
+	policyCfg := fetch.DefaultPolicyConfig()
+	policyCfg.RequireTLS = false
+	pipeline := fetch.NewPipeline(fetch.PipelineConfig{
+		Policy:     fetch.NewFetchPolicy(policyCfg),
+		Consent:    fetch.NewConsentGate(fetch.ConsentGateConfig{AutoApproveDomains: []string{"*"}}),
+		Quarantine: fetch.NewQuarantineBuffer(8, 1024*1024),
+		Client: fetch.NewClient(fetch.ClientConfig{
+			MaxBytes:       1024 * 1024,
+			RequestTimeout: 5 * time.Second,
+			UserAgent:      "Sylk-Academic/1.0",
+			Transport: crawlRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.String() != "http://docs.safe.test/oauth" {
+					return &http.Response{
+						StatusCode: 404,
+						Status:     "404 Not Found",
+						Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+						Body:       io.NopCloser(strings.NewReader("missing")),
+						Request:    req,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: 200,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+					Body: io.NopCloser(strings.NewReader(
+						"<html><body><h1>OAuth deployment guidance</h1><p>Use a dedicated token validation boundary with clear ownership.</p></body></html>",
+					)),
+					Request: req,
+				}, nil
+			}),
+		}),
+		Extractor: fetch.NewContentExtractor(),
+		Inspect: func(context.Context, *fetch.QuarantineEntry) (fetch.QuarantineVerdict, []fetch.InspectionFinding, error) {
+			return fetch.VerdictClean, nil, nil
+		},
+	})
+	a.SetFetchPipeline(pipeline)
+
+	execState := newAcademicResearchExecutionState("sess-terminal-paper")
+	execState.observeProviderResponse(context.Background(), a, &providers.Response{
+		ProviderMetadata: map[string]any{
+			providers.ProviderMetadataNativeWebSearchCallsKey: []providers.NativeWebSearchCall{
+				{
+					ID:       "search-1",
+					Provider: "anthropic",
+					Action:   "search",
+					Query:    "oauth token validation boundary",
+				},
+			},
+			providers.ProviderMetadataNativeWebSearchResultsKey: []providers.NativeWebSearchResult{
+				{
+					SearchID: "search-1",
+					Provider: "anthropic",
+					Source:   "search_result",
+					Query:    "oauth token validation boundary",
+					URL:      "http://docs.safe.test/oauth",
+					Title:    "OAuth deployment guidance",
+					PageAge:  "3d",
+				},
+			},
+		},
+	})
+
+	ctx := WithAcademicTurnState(context.Background(), newAcademicTurnState(
+		academicTurnActionResearchPaper,
+		"Architect consultation must end at paper authoring.",
+	))
+	ctx = WithAcademicResearchExecutionState(ctx, execState)
+
+	resolution, err := a.resolveResearchPaperInputs(ctx, &authorResearchPaperParams{
+		Topic:           "oauth token validation",
+		Context:         "Architect needs a planning-ready recommendation.",
+		ResearchSummary: "Centralize token validation behind one boundary.",
+	}, "sess-terminal-paper")
+	if err != nil {
+		t.Fatalf("resolveResearchPaperInputs() error = %v", err)
+	}
+	if resolution == nil {
+		t.Fatal("expected resolution")
+	}
+	if resolution.result == nil {
+		t.Fatal("expected research result")
+	}
+	if len(resolution.result.SourcesConsulted) == 0 {
+		t.Fatalf("SourcesConsulted = %#v, want grounded source IDs", resolution.result.SourcesConsulted)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("provider calls = %d, want 0", provider.calls)
+	}
+	if !execState.hasGroundedSources() {
+		t.Fatal("expected execution state to record grounded sources after auto-grounding")
+	}
+}
+
+func TestResolveResearchPaperInputs_TerminalConsultationSynthesizesAsIsAtUserRequest(t *testing.T) {
+	provider := &countingAcademicProvider{}
+	a, err := New(Config{SessionID: "sess-terminal-paper"}, provider)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+
+	gate := &staticResearchDecisionGate{
+		eval: commandapproval.Evaluation{
+			Decision:     commandapproval.DecisionDeny,
+			UserDecision: researchDecisionAsIs,
+		},
+	}
+	ctx := commandapproval.WithGate(context.Background(), gate)
+	ctx = WithAcademicTurnState(ctx, newAcademicTurnState(
+		academicTurnActionResearchPaper,
+		"Architect consultation must end at paper authoring.",
+	))
+	ctx = WithAcademicResearchExecutionState(ctx, newAcademicResearchExecutionState("sess-terminal-paper"))
+
+	resolution, err := a.resolveResearchPaperInputs(ctx, &authorResearchPaperParams{
+		Topic:           "oauth token validation",
+		Context:         "Architect needs a planning-ready recommendation.",
+		ResearchSummary: "Centralize token validation behind one boundary.",
+		Recommendations: []string{"Introduce a dedicated auth boundary and migrate callers incrementally."},
+	}, "sess-terminal-paper")
+	if err != nil {
+		t.Fatalf("resolveResearchPaperInputs() error = %v", err)
+	}
+	if resolution == nil || resolution.result == nil {
+		t.Fatalf("expected synthesized resolution, got %#v", resolution)
+	}
+	if strings.TrimSpace(resolution.warning) == "" {
+		t.Fatalf("expected ungrounded synthesis warning, got %#v", resolution)
+	}
+	if len(resolution.result.SourcesConsulted) != 0 {
+		t.Fatalf("SourcesConsulted = %#v, want none", resolution.result.SourcesConsulted)
+	}
+	if resolution.result.Confidence != ConfidenceLevelLow {
+		t.Fatalf("confidence = %s, want %s", resolution.result.Confidence, ConfidenceLevelLow)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("provider calls = %d, want 0", provider.calls)
 	}
 }

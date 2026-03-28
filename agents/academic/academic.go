@@ -705,6 +705,9 @@ func (a *Academic) processForwardedRequest(ctx context.Context, fwd *guide.Forwa
 	if a.shouldHandleConversation(fwd) {
 		return a.handleConversation(ctx, fwd)
 	}
+	if a.shouldHandleChildConsultation(fwd) {
+		return a.handleConsultation(ctx, fwd)
+	}
 	handler, err := a.intentHandler(fwd.Intent)
 	if err != nil {
 		return nil, err
@@ -723,6 +726,24 @@ func (a *Academic) shouldHandleConversation(fwd *guide.ForwardedRequest) bool {
 	}
 	switch fwd.Intent {
 	case guide.IntentRecall, guide.IntentCheck, guide.IntentFetch, guide.IntentHelp, guide.IntentChat, guide.IntentUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *Academic) shouldHandleChildConsultation(fwd *guide.ForwardedRequest) bool {
+	if fwd == nil {
+		return false
+	}
+	if academicConversationHandoffFromForwarded(fwd) != nil {
+		return false
+	}
+	if strings.TrimSpace(strings.ToLower(fwd.SourceAgentID)) == "tui" {
+		return false
+	}
+	switch fwd.Intent {
+	case guide.IntentRecall, guide.IntentCheck, guide.IntentFetch, guide.IntentChat, guide.IntentUnknown:
 		return true
 	default:
 		return false
@@ -787,6 +808,41 @@ func (a *Academic) handleConversation(ctx context.Context, fwd *guide.ForwardedR
 	}, nil
 }
 
+func (a *Academic) handleConsultation(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	ctx = a.withConsultationTurnState(ctx, fwd)
+	query := strings.TrimSpace(fwd.Input)
+	if query == "" {
+		return &ConversationResult{
+			Response: "Tell me what you want researched or checked, and I’ll work through it.",
+			Intent:   fwd.Intent,
+		}, nil
+	}
+
+	toolSurface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
+	a.prepareSkillsForInput(query)
+	llmReq := &providers.Request{
+		SystemPrompt: buildAcademicConsultationSystemPrompt(a.config.SystemPrompt, fwd),
+		Messages:     []providers.Message{{Role: providers.RoleUser, Content: query}},
+		Tools:        a.buildToolDefinitionsWithSurface(toolSurface),
+		Model:        a.config.Model,
+		MaxTokens:    a.config.MaxOutputTokens,
+	}
+	a.applyLLMRuntimeProfile(ctx, llmReq, "conversation")
+	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
+
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		return a.executeToolLoop(ctx, llmReq, ledger, toolSurface)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("academic consultation failed: %w", err)
+	}
+	return &ConversationResult{
+		Response: result,
+		Intent:   fwd.Intent,
+	}, nil
+}
+
 type academicConversationHandoff struct {
 	Kind             string
 	From             string
@@ -841,11 +897,45 @@ func buildAcademicConversationSystemPrompt(base string, handoff *academicConvers
 	return strings.Join(filtered, "\n\n---\n\n")
 }
 
+func buildAcademicConsultationSystemPrompt(base string, fwd *guide.ForwardedRequest) string {
+	sections := []string{
+		strings.TrimSpace(base),
+		strings.TrimSpace(AcademicConversationPrompt),
+		strings.TrimSpace(academicExternalResearchDisciplinePrompt()),
+		strings.TrimSpace(academicConsultationPrompt(fwd)),
+	}
+	filtered := make([]string, 0, len(sections))
+	for _, section := range sections {
+		if section != "" {
+			filtered = append(filtered, section)
+		}
+	}
+	return strings.Join(filtered, "\n\n---\n\n")
+}
+
 func academicConversationExtraTools(handoff *academicConversationHandoff) []string {
 	if handoff == nil {
 		return nil
 	}
 	return []string{"reroute_request"}
+}
+
+func academicConsultationPrompt(fwd *guide.ForwardedRequest) string {
+	if fwd == nil {
+		return ""
+	}
+	sections := []string{
+		"You are handling a non-user-facing consultation for another agent. Stay in normal Academic mode: research, use tools when useful, and answer the requesting agent directly instead of switching into a rigid worker protocol.",
+	}
+	if academicForwardedSourceMatches(fwd, "architect") {
+		sections = append(sections,
+			"This consultation informs Architect planning. Produce a reusable deliverable rather than transient prose.",
+			"Before ending the consultation, invoke `author_research_paper` exactly once so the Architect receives a durable research artifact.",
+			"Once `author_research_paper` succeeds, end the consultation immediately. Do not make any further tool calls, fetches, or consultations after invoking it.",
+			"Use `clone_via_librarian` or `crawl_links` when they materially improve codebase fit or source quality.",
+		)
+	}
+	return strings.Join(sections, "\n")
 }
 
 func buildAcademicRecallPrompt(fwd *guide.ForwardedRequest) string {
@@ -882,25 +972,35 @@ func academicExternalResearchDisciplinePrompt() string {
 	return strings.TrimSpace(
 		"Use an explicit research workflow. " +
 			"1. Plan: identify the concrete sub-questions that must be answered. " +
-			"2. Search: use `web_search` to discover authoritative candidates for each sub-question and keep searching only while you are still surfacing materially better, more relevant, well-sourced leads. " +
-			"3. Ground: once a candidate looks promising, stop broad searching and call `ground_source` to inspect it directly through the secure fetch pipeline. Use `web_fetch`, `fetch_document`, or one bounded `crawl_links` follow-up only when you already know the exact fetch action you need. `ground_source` returns grounded content immediately; background persistence to the knowledge graph and document store usually does not need to block synthesis. " +
-			"Any URL discovered through `web_search` that you want to cite, quote, or include in a sources list must be grounded first with `ground_source` or an equivalent fetch skill; never present an ungrounded search hit as a reference. " +
-			"Before finalizing an answer with citations, perform a source audit and remove any web-search-discovered URL that was not grounded. " +
-			"Before finalizing, enumerate the exact URLs you intend to cite. For each cited URL that came from `web_search`, call `ground_source` on that exact URL in the current run before citing it. Do not ground one page and then cite a different URL from the same site as if it were covered. " +
+			"Before choosing a winner, define the decision frame: what is being decided, which criteria matter most, which evidence classes are relevant, what would falsify each major hypothesis, and which uncertainties could change the outcome. " +
+			"Identify the underlying domain or domains behind the request and build enough domain knowledge to reason inside them: map the core concepts, standard terminology, governing metrics, canonical source types, and what counts as strong evidence in that field. " +
+			"For unfamiliar, specialized, or cross-domain topics, research from the ground up before recommending anything: start with authoritative primers, survey papers, review articles, standards, textbooks, professional society guidance, analyst or institutional research, and then drill into primary studies, technical reports, benchmarks, and direct sources. " +
+			"Use early searches to learn the field itself, not just to collect candidate options. Expand the domain vocabulary, identify the canonical debates and failure modes, and learn how practitioners and researchers in that field evaluate claims. " +
+			"2. Search: use `web_search` to discover authoritative candidates for each sub-question and keep searching only while you are still surfacing materially better, more relevant, well-sourced leads. Provider-native `web_search` is not just a title/snippet lookup; it may search, open pages, and inspect source content in-context. " +
+			"3. Ground: once a candidate looks promising, stop broad searching and examine it. Sylk may automatically secure-fetch the decisive surfaced exact URL coming out of native `web_search` so it can be Guardian-inspected, ingested, and marked grounded. Do not reflexively call `ground_source` after every `web_search`. Use `ground_source`, `web_fetch`, `fetch_document`, or one bounded `crawl_links` follow-up when you already know the exact URL, need a specific fetch mode, need a bounded crawl, or need to force grounding of an exact URL that has not yet gone through the secured fetch path. When you do need an explicit fetch, use `ground_source` when you want the runtime to choose the fetch mode, `web_fetch` for exact web pages or documentation pages, `fetch_document` for PDFs, papers, benchmark reports, standards, or other methodology-heavy documents, and one bounded `crawl_links` follow-up when the authoritative page obviously fans out to a small set of official subpages you need. `ground_source` returns grounded content immediately; background persistence to the knowledge graph and document store usually does not need to block synthesis. " +
+			"Never present a bare search hit, title, snippet, or unexamined URL as a reference. Before finalizing an answer with citations, perform a source audit and confirm whether you are carrying forward a decisive surfaced exact URL from `web_search` that still needs the secured fetch path. " +
+			"Before finalizing, enumerate the exact URLs you intend to cite. Confirm which cited URL is the decisive surfaced exact URL coming out of `web_search`, and whether Sylk already secured-fetched that exact URL or whether you still need `ground_source`, `web_fetch`, or `fetch_document` before citing it. A successful `web_fetch` or `fetch_document` on the exact URL already satisfies that grounding obligation; do not redundantly call `ground_source` afterward for the same URL unless you need a different fetch mode. Do not imply that every intermediate searched URL also received an extra secured fetch. Do not examine or ground one page and then cite a different URL from the same site as if it were covered. " +
 			"Triangulate material claims across multiple grounded sources whenever feasible. If a conclusion rests on only one grounded source, say so explicitly and treat the confidence as lower unless that source is uniquely authoritative. " +
 			"4. Consult: use Librarian or Archivalist only when codebase fit or historical precedent materially changes the answer, and do not repeat the same consultation question to the same agent in one run. " +
 			"5. Synthesize: stop only when more searching is unlikely to materially change the conclusion. " +
 			"For recommendation, comparison, and design questions, investigate multiple credible options or counterexamples before choosing one. Do not stop after the first plausible answer unless the space is genuinely trivial. " +
 			"Do not answer from memory alone when source-backed or current evidence matters, and do not keep issuing broad `web_search` calls once you have promising sources that should be grounded. " +
+			"Choose the evidence classes that matter for the domain instead of assuming one source type is enough. Common classes include primary or authoritative sources, empirical or observational evidence, counterevidence or failure cases, methodological or limitations evidence, implementation or operational burden, institutional or ecosystem or market context, and formal or academic or regulatory or standards evidence. Not every class applies to every question, but every relevant class must be checked or explicitly marked unavailable. " +
+			"Actively research the strongest negative case: criticisms, failure modes, conflicting studies, lock-in, adoption barriers, migration burden, safety risks, or other reasons the leading option could fail in practice. " +
+			"Treat self-authored, vendor-authored, or project-authored material as capability evidence first. It can show what an option claims to support, but it does not by itself prove comparative superiority on speed, simplicity, quality, safety, maturity, or adoption. " +
+			"When comparative conclusions depend on claims made by the compared options themselves, seek independent corroboration or explicitly mark the conclusion as provisional and incomplete. " +
 			"For claims about performance, latency, throughput, reliability, security impact, cost, scale, adoption, or comparative advantage, prefer primary empirical evidence and grounded quantitative data whenever feasible. " +
-			"Do not repeat benchmark numbers, percentages, or study findings unless you have inspected the source itself with `ground_source`, `web_fetch`, or `fetch_document`, and when the numbers matter, note the date, study or workload context, and major measurement caveats if available. " +
+			"When measurable criteria matter, surface the decision-relevant measurable criteria for this domain and quantify them when credible evidence exists. " +
+			"Do not repeat benchmark numbers, percentages, or study findings unless you actually inspected the source itself in the current run, either through native `web_search` or through the secured fetch path. If the exact cited URL still needed the secured fetch path, ground it before quoting from it. When the numbers matter, note the date, study or workload context, and major measurement caveats if available. " +
 			"If strong quantitative evidence is unavailable, say the evidence is qualitative, limited, or stale instead of implying false precision. " +
-			"For any material recommendation, ranking, or justification, identify whether the support comes from measured data, official guidance, peer-reviewed research, or only qualitative evidence. Do not justify decisions with vague claims like popular, fast, reliable, secure, scalable, or industry-standard unless the supporting evidence is named. " +
-			"When the question is a substantial comparison or architectural recommendation, build an explicit evaluation matrix across the criteria that actually matter, digest the strongest literature or empirical evidence, surface counterarguments, and include a table, architecture fragment, or flow sketch when that improves clarity. " +
+			"For any material recommendation, ranking, or justification, identify whether the support comes from measured data, official guidance, peer-reviewed research, direct observation, standards or regulation, or only qualitative evidence. Do not justify decisions with vague claims like best, strongest, popular, fast, reliable, secure, scalable, industry-standard, simpler, or mature unless the supporting criteria and evidence are named. " +
+			"When relevant studies, papers, systematic reviews, meta-analyses, professional research, institutional reports, or other field-defining material exist, actively look for them rather than relying only on vendor docs, product pages, or commentary. " +
+			"When the question is a substantial comparison or architectural recommendation, build an explicit evaluation matrix across the criteria that actually matter, digest the strongest literature or empirical evidence, surface counterarguments, and include an evidence table, methodology digest, risk register, architecture fragment, or flow sketch when that improves clarity. " +
 			"Perform your own technical analysis rather than only relaying source claims: validate assumptions and hypotheses against the evidence, sanity-check important math, inspect datasets and methodology when relevant, and call out bias, incentives, sampling problems, and threats to validity. " +
-			"Treat substantial externally sourced answers as incomplete unless they contain the relevant structured artifact for the question, such as a comparison table, math walkthrough, algorithm sketch, or architecture or flow model. " +
+			"Treat substantial externally sourced answers as incomplete unless they contain the relevant structured artifact for the question, such as an evidence table, comparison matrix, methodology digest, risk register, math walkthrough, algorithm sketch, or architecture or flow model. " +
+			"Do not include a Short Answer, practical shortlist, or compressed winner section before the evidence and comparison are established. " +
 			"Do not produce a shallow roundup that only recommends one option, lists alternatives, and appends sources. Replace that pattern with evidence synthesis, analysis, and explicit caveats. " +
-			"Before finalizing, run a rigor audit over all relevant dimensions: link-by-link grounding, corroboration, competing hypotheses, counterarguments, disconfirming evidence, math and unit checks, sample size and date checks, methodology review, dataset quality review, bias and incentive review, threats to validity, and the presence of the right structured artifact. If any relevant rigor check fails, do not finalize. " +
+			"Before finalizing, run a rigor audit over all relevant dimensions: link-by-link source examination and grounding checks where still needed, corroboration, competing hypotheses, counterarguments, disconfirming evidence, math and unit checks, sample size and date checks, methodology review, dataset quality review, bias and incentive review, evidence-class coverage, confidence calibration, threats to validity, and the presence of the right structured artifact. If any relevant rigor check fails, do not finalize. " +
 			"Aim for the depth of a top-tier internal research memo rather than a high-level roundup or promotional summary. " +
 			"Consult the Librarian before finalizing any recommendation so the result matches the codebase reality.",
 	)
@@ -916,20 +1016,35 @@ func academicForwardedResearchPrompt(fwd *guide.ForwardedRequest) string {
 
 	var b strings.Builder
 	b.WriteString("This research will inform Architect planning. Prefer durable, cited output over transient prose.\n")
-	b.WriteString("When `web_search` surfaces a promising source, call `ground_source` before relying on specifics. Do not keep searching instead of grounding.\n")
-	b.WriteString("Any link surfaced via `web_search` that you plan to cite, quote, or list as a source must be grounded first. Do not hand Architect raw search hits as references.\n")
-	b.WriteString("Before finalizing the response, audit the cited URLs and remove any searched link that was not grounded.\n")
-	b.WriteString("Before finalizing, enumerate the exact URLs you intend to cite. For each cited URL that came from `web_search`, call `ground_source` on that exact URL before citing it.\n")
+	b.WriteString("Do not begin with a naked winner. First make the decision frame legible: what is being decided, which criteria matter most, which evidence classes are relevant, and how strong the evidence is.\n")
+	b.WriteString("Identify the underlying domain or domains behind the request and build enough domain knowledge to reason inside them: map the core concepts, standard terminology, governing metrics, canonical source types, and what counts as strong evidence in that field.\n")
+	b.WriteString("For unfamiliar, specialized, or cross-domain topics, research from the ground up before recommending anything: start with authoritative primers, survey papers, review articles, standards, textbooks, professional society guidance, analyst or institutional research, and then drill into primary studies, technical reports, benchmarks, and direct sources.\n")
+	b.WriteString("Use early searches to learn the field itself, not just to collect candidate options. Expand the domain vocabulary, identify the canonical debates and failure modes, and learn how practitioners and researchers in that field evaluate claims.\n")
+	b.WriteString("Provider-native `web_search` is not just a title/snippet lookup; it may search, open pages, and inspect source content in-context. When `web_search` surfaces a promising source, do not keep searching instead of examining it.\n")
+	b.WriteString("When native `web_search` surfaces a clearly relevant, high-quality exact URL that you are about to carry forward as the decisive surfaced source, Sylk may automatically secure-fetch that URL through the local pipeline so it can be Guardian-inspected, ingested, and marked grounded.\n")
+	b.WriteString("Do not reflexively call `ground_source`, `web_fetch`, or `fetch_document` after every `web_search`. Use explicit fetch tools when you already know the exact URL, need a specific fetch mode, need a bounded crawl, or need to force grounding of an exact URL that has not yet gone through the secured fetch path.\n")
+	b.WriteString("When you do need an explicit fetch, use `ground_source` when you want the runtime to choose the fetch mode, `web_fetch` for exact web pages or documentation pages, `fetch_document` for PDFs, papers, benchmark reports, standards, or other methodology-heavy documents, and one bounded `crawl_links` follow-up when the authoritative page obviously fans out to a small set of official subpages you need.\n")
+	b.WriteString("Never hand Architect a bare search hit, title, snippet, or unexamined URL as a reference.\n")
+	b.WriteString("Before finalizing the response, audit the cited URLs and confirm whether you are carrying forward a decisive surfaced exact URL from `web_search` that still needs the secured fetch path.\n")
+	b.WriteString("Before finalizing, enumerate the exact URLs you intend to cite. Confirm which cited URL is the decisive surfaced exact URL coming out of `web_search`, and whether Sylk already secured-fetched that exact URL or whether you still need `ground_source`, `web_fetch`, or `fetch_document` before citation. A successful `web_fetch` or `fetch_document` on the exact URL already satisfies that grounding obligation. Do not imply that every intermediate searched URL also received an extra secured fetch.\n")
 	b.WriteString("Corroborate important conclusions across multiple grounded sources whenever feasible. If a conclusion depends on one grounded source, say that plainly and lower the confidence unless the source is uniquely authoritative.\n")
+	b.WriteString("Map the relevant evidence classes for this domain and say which are strong, weak, or unavailable: primary or authoritative sources, empirical or observational evidence, counterevidence or failure cases, methodological or limitations evidence, implementation or operational burden, institutional or ecosystem or market context, and formal or academic or regulatory evidence.\n")
 	b.WriteString("For recommendation or design-space questions, research multiple credible options before settling on one, then explain why the preferred option beats the strongest alternative.\n")
+	b.WriteString("Research the strongest downside case too: criticisms, failure modes, conflicting evidence, lock-in, adoption barriers, migration burden, or other reasons the leading option could fail in practice.\n")
+	b.WriteString("Treat self-authored, vendor-authored, or project-authored material as capability evidence first. It can establish what an option claims to support, but it does not by itself prove comparative superiority on speed, simplicity, quality, safety, maturity, or adoption.\n")
+	b.WriteString("When comparative conclusions depend on claims made by the compared options themselves, seek independent corroboration or explicitly mark the conclusion as provisional and incomplete.\n")
 	b.WriteString("When the recommendation depends on performance, cost, reliability, security impact, scale, or adoption, back it with grounded statistics, benchmark context, standards, or study results whenever credible data exists. If the evidence is only qualitative, limited, or stale, say that plainly.\n")
-	b.WriteString("Do not cite benchmark numbers, percentages, or study conclusions without grounding the source first and noting the date and measurement context when they materially affect the decision.\n")
-	b.WriteString("For every material recommendation or ranking, state whether the support comes from measured data, official guidance, peer-reviewed research, or only qualitative evidence.\n")
-	b.WriteString("When relevant literature, benchmarks, or empirical studies exist, digest them instead of just citing them, and use comparison tables or architecture and flow sketches when they materially improve the result.\n")
+	b.WriteString("When measurable criteria matter, surface the decision-relevant metrics for this domain and quantify them when credible evidence exists.\n")
+	b.WriteString("Do not cite benchmark numbers, percentages, or study conclusions unless you actually inspected the source in the current run, and if the exact cited URL still needed the secured fetch path, made sure it went through that path first. Note the date and measurement context when they materially affect the decision.\n")
+	b.WriteString("For every material recommendation or ranking, state whether the support comes from measured data, official guidance, peer-reviewed research, direct observation, standards or regulation, or only qualitative evidence.\n")
+	b.WriteString("Do not use unsupported adjectives like best, strongest, safer, simpler, faster, mature, or standard unless you tie them to explicit criteria and grounded evidence.\n")
+	b.WriteString("When relevant studies, papers, systematic reviews, meta-analyses, professional research, institutional reports, or other field-defining material exist, actively look for them rather than relying only on vendor docs, product pages, or commentary.\n")
+	b.WriteString("When relevant literature, benchmarks, or empirical studies exist, digest them instead of just citing them, and use evidence tables, comparison matrices, methodology digests, risk registers, or architecture and flow sketches when they materially improve the result.\n")
 	b.WriteString("Do your own technical analysis: validate assumptions, inspect methodology and dataset quality, sanity-check important math, and call out bias or threats to validity instead of only relaying source claims.\n")
-	b.WriteString("Treat the response as incomplete if it lacks the relevant structured artifact for the question, such as a comparison table, math walkthrough, algorithm sketch, or architecture or flow model.\n")
+	b.WriteString("Treat the response as incomplete if it lacks the relevant structured artifact for the question, such as an evidence table, comparison matrix, methodology digest, risk register, math walkthrough, algorithm sketch, or architecture or flow model.\n")
+	b.WriteString("Do not include a Short Answer, practical shortlist, or compressed winner section before the evidence and comparison are established.\n")
 	b.WriteString("Do not give Architect a shallow roundup that just recommends a winner, lists alternatives, and appends sources.\n")
-	b.WriteString("Before finalizing, run a rigor audit across all relevant dimensions: link-by-link grounding, corroboration, alternatives, counterevidence, math checks, methodology review, dataset quality, bias, threats to validity, and the right structured artifact. If any relevant check fails, keep researching or explicitly mark the result incomplete.\n")
+	b.WriteString("Before finalizing, run a rigor audit across all relevant dimensions: link-by-link source examination and grounding checks where still needed, corroboration, alternatives, counterevidence, math checks, methodology review, dataset quality, bias, evidence-class coverage, confidence calibration, threats to validity, and the right structured artifact. If any relevant check fails, keep researching or explicitly mark the result incomplete.\n")
 	b.WriteString("Write at the depth of a top-tier internal research memo, not a promotional or blog-style summary.\n")
 	b.WriteString("If you gather enough evidence to produce a reusable artifact, use `author_research_paper` so Architect receives structured research instead of only a chat answer.\n")
 	b.WriteString("Use `clone_via_librarian` or `crawl_links` when they materially improve source quality or implementation fit.\n")
@@ -971,6 +1086,26 @@ func (a *Academic) withRequestResearchExecutionState(ctx context.Context, fwd *g
 		state.setResearchPaperRequired(true)
 	}
 	return WithAcademicResearchExecutionState(ctx, state)
+}
+
+func (a *Academic) withConsultationTurnState(ctx context.Context, fwd *guide.ForwardedRequest) context.Context {
+	if ctx == nil || fwd == nil {
+		return ctx
+	}
+	if academicConversationHandoffFromForwarded(fwd) != nil {
+		return ctx
+	}
+	if !academicForwardedSourceMatches(fwd, "architect") {
+		return ctx
+	}
+	ctx = a.withRequestResearchExecutionState(ctx, fwd)
+	if AcademicTurnStateFromContext(ctx) == nil {
+		ctx = WithAcademicTurnState(ctx, newAcademicTurnState(
+			academicTurnActionResearchPaper,
+			"This Architect consultation must terminate immediately after `author_research_paper` succeeds.",
+		))
+	}
+	return ctx
 }
 
 func academicConversationHandoffPrompt(handoff *academicConversationHandoff) string {
@@ -1085,7 +1220,7 @@ func (a *Academic) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest)
 		"The user wants to fetch or download external content. "+
 			"If the request involves a git repository, use clone_via_librarian to have the Librarian clone it into the searchable package store. "+
 			"If the request involves a web page or document and you do not already know the URL, use web_search first. "+
-			"Once you know the URL, prefer ground_source unless you already know you specifically need web_fetch or fetch_document. "+
+			"Once you know the exact URL, use the explicit fetch tool that fits the job: ground_source when you want Sylk to choose the fetch mode, web_fetch for exact pages, and fetch_document for exact documents. Native web_search may already inspect pages in-context, and Sylk may also auto-ground surfaced high-quality exact URLs. "+
 			"Provide a clear summary of what was fetched.\n\n%s",
 		fwd.Input,
 	)
@@ -1525,7 +1660,7 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 	researchPrompt := fmt.Sprintf(
 		"Research the following topic thoroughly. Use your tools to consult "+
 			"the Librarian for codebase context and validate findings. "+
-			"Use web_search to discover external sources when you do not already know the right URLs, then ground promising sources with ground_source before relying on specifics.\n\n"+
+			"Use web_search to discover external sources when you do not already know the right URLs. Native web_search may already inspect pages in-context, and Sylk may auto-ground surfaced high-quality exact URLs; use explicit fetch tools when you need exact-URL control or a secured fetch path that has not happened yet.\n\n"+
 			"Topic: %s", query.Query,
 	)
 	if contract := AcademicCompletionContractFromContext(ctx); contract != nil {

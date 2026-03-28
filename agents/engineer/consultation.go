@@ -112,7 +112,6 @@ func (e *Engineer) requestConsultSync(ctx context.Context, req *guide.RouteReque
 		}
 	}
 	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
-
 	wait := e.registerPendingConsult(req.CorrelationID)
 	defer e.clearPendingConsult(req.CorrelationID)
 

@@ -19,10 +19,11 @@ func NewContentExtractor() *ContentExtractor {
 
 // ExtractResult holds extracted text and metadata.
 type ExtractResult struct {
-	Text     string `json:"text"`
-	Title    string `json:"title,omitempty"`
-	Language string `json:"language,omitempty"` // For source code
-	WordCount int   `json:"word_count"`
+	Text      string   `json:"text"`
+	Title     string   `json:"title,omitempty"`
+	Language  string   `json:"language,omitempty"` // For source code
+	Links     []string `json:"links,omitempty"`
+	WordCount int      `json:"word_count"`
 }
 
 // Extract dispatches to the appropriate extractor based on content type.
@@ -65,6 +66,9 @@ func (e *ContentExtractor) extractHTML(content []byte) (*ExtractResult, error) {
 	// Remove HTML comments.
 	s = reHTMLComment.ReplaceAllString(s, " ")
 
+	// Extract links from visible anchor tags before stripping all markup.
+	links := extractHTMLLinks(s)
+
 	// Replace block-level tags with newlines for readability.
 	s = reBlockTags.ReplaceAllString(s, "\n")
 
@@ -83,6 +87,7 @@ func (e *ContentExtractor) extractHTML(content []byte) (*ExtractResult, error) {
 	return &ExtractResult{
 		Text:      s,
 		Title:     title,
+		Links:     links,
 		WordCount: countWords(s),
 	}, nil
 }
@@ -194,12 +199,13 @@ func extractParenText(s string) string {
 // =============================================================================
 
 var (
-	reScript = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>`)
-	reStyle  = regexp.MustCompile(`(?is)<style\b[^>]*>.*?</style>`)
+	reScript      = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>`)
+	reStyle       = regexp.MustCompile(`(?is)<style\b[^>]*>.*?</style>`)
 	reHTMLComment = regexp.MustCompile(`(?s)<!--.*?-->`)
 	reBlockTags   = regexp.MustCompile(`(?i)</(p|div|section|article|h[1-6]|li|tr|blockquote|pre)>`)
 	reBR          = regexp.MustCompile(`(?i)<br\s*/?>`)
 	reAllTags     = regexp.MustCompile(`<[^>]+>`)
+	reAnchorHref  = regexp.MustCompile("(?is)<a\\b[^>]*\\bhref\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s\"'<>`]+))")
 	reParenText   = regexp.MustCompile(`\([^)]*\)`)
 )
 
@@ -212,19 +218,47 @@ func extractHTMLTitle(html string) string {
 	return ""
 }
 
+func extractHTMLLinks(html string) []string {
+	matches := reAnchorHref.FindAllStringSubmatch(html, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	links := make([]string, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		href := ""
+		for i := 1; i < len(match); i++ {
+			if strings.TrimSpace(match[i]) != "" {
+				href = strings.TrimSpace(decodeHTMLEntities(match[i]))
+				break
+			}
+		}
+		if href == "" {
+			continue
+		}
+		if _, ok := seen[href]; ok {
+			continue
+		}
+		seen[href] = struct{}{}
+		links = append(links, href)
+	}
+	return links
+}
+
 var htmlEntities = map[string]string{
-	"&amp;":  "&",
-	"&lt;":   "<",
-	"&gt;":   ">",
-	"&quot;": "\"",
-	"&apos;": "'",
-	"&#39;":  "'",
-	"&nbsp;": " ",
-	"&mdash;": "—",
-	"&ndash;": "–",
+	"&amp;":    "&",
+	"&lt;":     "<",
+	"&gt;":     ">",
+	"&quot;":   "\"",
+	"&apos;":   "'",
+	"&#39;":    "'",
+	"&nbsp;":   " ",
+	"&mdash;":  "—",
+	"&ndash;":  "–",
 	"&hellip;": "…",
-	"&copy;": "©",
-	"&reg;":  "®",
+	"&copy;":   "©",
+	"&reg;":    "®",
 }
 
 func decodeHTMLEntities(s string) string {

@@ -59,6 +59,9 @@ func interAgentChildHasActiveVisual(child *InterAgentChildActivity) bool {
 	if child == nil {
 		return false
 	}
+	if !child.Completed {
+		return true
+	}
 	if strings.TrimSpace(child.ThinkingText) != "" || strings.TrimSpace(child.ThinkingStatus) != "" {
 		return true
 	}

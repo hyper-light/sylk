@@ -102,3 +102,40 @@ func TestStreamAccumulator_NativeWebSearchDoesNotBecomeExecutableToolCall(t *tes
 		t.Fatalf("query = %q, want %q", calls[0].Query, "python packaging pep 621")
 	}
 }
+
+func TestStreamAccumulator_PreservesNativeWebSearchResultsMetadata(t *testing.T) {
+	acc := NewStreamAccumulator()
+
+	acc.Add(&StreamChunk{Type: ChunkTypeStart, Timestamp: time.Now()})
+	acc.Add(&StreamChunk{
+		Type:       ChunkTypeEnd,
+		StopReason: StopReasonEndTurn,
+		Usage:      &Usage{OutputTokens: 1},
+		ProviderData: map[string]any{
+			ProviderMetadataNativeWebSearchResultsKey: []NativeWebSearchResult{
+				{
+					SearchID: "search_1",
+					Provider: "anthropic",
+					Source:   "search_result",
+					Query:    "python packaging pep 621",
+					URL:      "https://peps.python.org/pep-0621/",
+					Title:    "PEP 621",
+					PageAge:  "30d",
+				},
+			},
+		},
+		Timestamp: time.Now(),
+	})
+
+	resp := acc.Response()
+	results := DecodeNativeWebSearchResults(resp.ProviderMetadata)
+	if len(results) != 1 {
+		t.Fatalf("native search result count = %d, want 1", len(results))
+	}
+	if results[0].URL != "https://peps.python.org/pep-0621/" {
+		t.Fatalf("url = %q, want https://peps.python.org/pep-0621/", results[0].URL)
+	}
+	if results[0].Title != "PEP 621" {
+		t.Fatalf("title = %q, want PEP 621", results[0].Title)
+	}
+}

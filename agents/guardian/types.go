@@ -108,10 +108,12 @@ type GitMutationProposal struct {
 type ApprovalDecision string
 
 const (
-	ApprovalAllowOnce   ApprovalDecision = "allow_once"
-	ApprovalAllowAlways ApprovalDecision = "allow_always"
-	ApprovalDenyOnce    ApprovalDecision = "deny_once"
-	ApprovalDenyAlways  ApprovalDecision = "deny_always"
+	ApprovalAllowOnce        ApprovalDecision = "allow_once"
+	ApprovalAllowAlways      ApprovalDecision = "allow_always"
+	ApprovalDenyOnce         ApprovalDecision = "deny_once"
+	ApprovalDenyAlways       ApprovalDecision = "deny_always"
+	ApprovalContinueResearch ApprovalDecision = "continue_research"
+	ApprovalSynthesizeAsIs   ApprovalDecision = "synthesize_as_is"
 )
 
 // ApprovalResult carries the outcome of a user approval request.

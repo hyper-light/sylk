@@ -42,7 +42,8 @@ type Client struct {
 type ClientConfig struct {
 	MaxBytes       int64         // Max response body size (from policy)
 	RequestTimeout time.Duration // Per-request timeout (default: 30s)
-	UserAgent      string        // User-Agent header (default: "Sylk-Academic/1.0")
+	Transport      http.RoundTripper
+	UserAgent      string // User-Agent header (default: "Sylk-Academic/1.0")
 }
 
 // NewClient creates a fetch client.
@@ -59,7 +60,8 @@ func NewClient(cfg ClientConfig) *Client {
 
 	return &Client{
 		httpClient: &http.Client{
-			Timeout: cfg.RequestTimeout,
+			Timeout:   cfg.RequestTimeout,
+			Transport: cfg.Transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) >= 5 {
 					return fmt.Errorf("too many redirects (max 5)")

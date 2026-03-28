@@ -1715,50 +1715,115 @@ func updateInterAgentBranchInToolCalls(
 	parentToolCallKey = strings.TrimSpace(parentToolCallKey)
 	threadKey = strings.TrimSpace(threadKey)
 	kind = strings.TrimSpace(kind)
-	for i := range *calls {
-		record := &(*calls)[i]
+
+	refs := collectInterAgentRowBindingRefs(ownerCorrelationID, calls)
+	if len(refs) == 0 {
+		return false
+	}
+
+	if parentToolCallKey != "" {
+		for i := range refs {
+			if refs[i].ownerCorrelationID != parentCorrelationID {
+				continue
+			}
+			if refs[i].toolCallKey != parentToolCallKey {
+				continue
+			}
+			fn(refs[i].row)
+			return true
+		}
+	}
+
+	if threadKey != "" {
+		for i := range refs {
+			if refs[i].threadKey != threadKey {
+				continue
+			}
+			fn(refs[i].row)
+			return true
+		}
+	}
+
+	var fallbackCandidate *InterAgentTool
+	for i := range refs {
+		if refs[i].ownerCorrelationID != parentCorrelationID {
+			continue
+		}
+		if kind != "" && refs[i].kind != kind {
+			continue
+		}
+		if fallbackCandidate != nil {
+			return false
+		}
+		fallbackCandidate = refs[i].row
+	}
+	if fallbackCandidate == nil {
+		return false
+	}
+	fn(fallbackCandidate)
+	return true
+}
+
+type interAgentRowBindingRef struct {
+	ownerCorrelationID string
+	toolCallKey        string
+	threadKey          string
+	kind               string
+	row                *InterAgentTool
+}
+
+func collectInterAgentRowBindingRefs(ownerCorrelationID string, calls *[]ToolCallRecord) []interAgentRowBindingRef {
+	if calls == nil {
+		return nil
+	}
+
+	type interAgentRowBindingFrame struct {
+		ownerCorrelationID string
+		calls              *[]ToolCallRecord
+		index              int
+	}
+
+	stack := []interAgentRowBindingFrame{{
+		ownerCorrelationID: strings.TrimSpace(ownerCorrelationID),
+		calls:              calls,
+	}}
+	refs := make([]interAgentRowBindingRef, 0, len(*calls))
+
+	for len(stack) > 0 {
+		frameIdx := len(stack) - 1
+		frame := &stack[frameIdx]
+		if frame.calls == nil {
+			stack = stack[:frameIdx]
+			continue
+		}
+		if frame.index >= len(*frame.calls) {
+			stack = stack[:frameIdx]
+			continue
+		}
+
+		record := &(*frame.calls)[frame.index]
+		frame.index++
 		row := record.InterAgent
 		if row == nil {
 			continue
 		}
-		if ownerCorrelationID == parentCorrelationID &&
-			parentToolCallKey != "" &&
-			strings.TrimSpace(record.ToolCallKey) == parentToolCallKey {
-			fn(row)
-			return true
-		}
-		if threadKey != "" && strings.TrimSpace(row.ThreadKey) == threadKey {
-			fn(row)
-			return true
-		}
-		for childIdx := range row.Children {
+		refs = append(refs, interAgentRowBindingRef{
+			ownerCorrelationID: frame.ownerCorrelationID,
+			toolCallKey:        strings.TrimSpace(record.ToolCallKey),
+			threadKey:          strings.TrimSpace(row.ThreadKey),
+			kind:               strings.TrimSpace(string(row.Kind)),
+			row:                row,
+		})
+		for childIdx := len(row.Children) - 1; childIdx >= 0; childIdx-- {
 			child := &row.Children[childIdx]
-			if updateInterAgentBranchInToolCalls(child.CorrelationID, &child.ToolCalls, parentCorrelationID, parentToolCallKey, threadKey, kind, fn) {
-				return true
-			}
+			stack = append(stack, interAgentRowBindingFrame{
+				ownerCorrelationID: strings.TrimSpace(child.CorrelationID),
+				calls:              &child.ToolCalls,
+			})
 		}
 	}
-	if ownerCorrelationID == parentCorrelationID && parentToolCallKey == "" && threadKey == "" {
-		var candidate *InterAgentTool
-		for i := range *calls {
-			row := (*calls)[i].InterAgent
-			if row == nil {
-				continue
-			}
-			if kind != "" && strings.TrimSpace(string(row.Kind)) != kind {
-				continue
-			}
-			if candidate != nil {
-				return false
-			}
-			candidate = row
-		}
-		if candidate != nil {
-			fn(candidate)
-			return true
-		}
-	}
-	return false
+
+	return refs
 }
 
 func upsertInterAgentChildActivity(row *InterAgentTool, activity InterAgentChildActivity) {
@@ -1770,13 +1835,47 @@ func upsertInterAgentChildActivity(row *InterAgentTool, activity InterAgentChild
 	if childCorrelationID != "" {
 		for i := range row.Children {
 			if strings.TrimSpace(row.Children[i].CorrelationID) == childCorrelationID {
-				preserveInterAgentChildUIState(&cloned, row.Children[i])
-				row.Children[i] = cloned
+				row.Children[i] = mergeInterAgentChildActivity(row.Children[i], cloned)
 				return
 			}
 		}
 	}
 	row.Children = append(row.Children, cloned)
+}
+
+func mergeInterAgentChildActivity(prev, next InterAgentChildActivity) InterAgentChildActivity {
+	merged := cloneInterAgentChildActivity(prev)
+
+	if correlationID := strings.TrimSpace(next.CorrelationID); correlationID != "" {
+		merged.CorrelationID = correlationID
+	}
+	if agentID := strings.TrimSpace(next.AgentID); agentID != "" {
+		merged.AgentID = agentID
+	}
+	if agentType := strings.TrimSpace(next.AgentType); agentType != "" {
+		merged.AgentType = agentType
+	}
+
+	merged.ThinkingText = next.ThinkingText
+	merged.ThinkingStatus = next.ThinkingStatus
+	merged.ThinkingColor = next.ThinkingColor
+
+	if next.ResultSummary != "" || next.Completed || next.Failed {
+		merged.ResultSummary = next.ResultSummary
+	}
+
+	if next.Completed {
+		merged.Completed = true
+		merged.Failed = next.Failed
+	} else if !prev.Completed {
+		merged.Completed = false
+		merged.Failed = false
+	}
+
+	merged.ToolCallsExpanded = prev.ToolCallsExpanded || next.ToolCallsExpanded
+	merged.ToolCalls = mergeToolCallRecords(prev.ToolCalls, next.ToolCalls)
+	preserveInterAgentChildUIState(&merged, prev)
+	return merged
 }
 
 func preserveInterAgentChildUIState(next *InterAgentChildActivity, prev InterAgentChildActivity) {
@@ -1786,21 +1885,103 @@ func preserveInterAgentChildUIState(next *InterAgentChildActivity, prev InterAge
 	if prev.ToolCallsExpanded {
 		next.ToolCallsExpanded = true
 	}
-	preserveToolCallSliceUIState(next.ToolCalls, prev.ToolCalls)
+	preserveToolCallTreeUIState(next.ToolCalls, prev.ToolCalls)
 }
 
 func preserveToolCallSliceUIState(next []ToolCallRecord, prev []ToolCallRecord) {
-	if len(next) == 0 || len(prev) == 0 {
+	preserveToolCallTreeUIState(next, prev)
+}
+
+func preserveToolCallTreeUIState(nextRoot []ToolCallRecord, prevRoot []ToolCallRecord) {
+	if len(nextRoot) == 0 || len(prevRoot) == 0 {
 		return
 	}
-	used := make([]bool, len(prev))
-	for i := range next {
-		match := -1
-		for j := 0; j < len(prev); j++ {
-			if used[j] {
+	type toolCallUIPreserveFrame struct {
+		next []ToolCallRecord
+		prev []ToolCallRecord
+	}
+
+	stack := []toolCallUIPreserveFrame{{
+		next: nextRoot,
+		prev: prevRoot,
+	}}
+	for len(stack) > 0 {
+		frame := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if len(frame.next) == 0 || len(frame.prev) == 0 {
+			continue
+		}
+		used := make([]bool, len(frame.prev))
+		for i := range frame.next {
+			match := -1
+			for j := 0; j < len(frame.prev); j++ {
+				if used[j] {
+					continue
+				}
+				if !toolCallRecordsShareIdentity(frame.next[i], frame.prev[j]) {
+					continue
+				}
+				match = j
+				break
+			}
+			if match < 0 {
 				continue
 			}
-			if !toolCallRecordsShareIdentity(next[i], prev[j]) {
+			used[match] = true
+			if frame.prev[match].Expanded {
+				frame.next[i].Expanded = true
+			}
+			nextInterAgent := frame.next[i].InterAgent
+			prevInterAgent := frame.prev[match].InterAgent
+			if nextInterAgent == nil || prevInterAgent == nil || len(nextInterAgent.Children) == 0 || len(prevInterAgent.Children) == 0 {
+				continue
+			}
+			prevByCorrelation := make(map[string]int, len(prevInterAgent.Children))
+			for j := range prevInterAgent.Children {
+				correlationID := strings.TrimSpace(prevInterAgent.Children[j].CorrelationID)
+				if correlationID == "" {
+					continue
+				}
+				prevByCorrelation[correlationID] = j
+			}
+			for j := range nextInterAgent.Children {
+				correlationID := strings.TrimSpace(nextInterAgent.Children[j].CorrelationID)
+				if correlationID == "" {
+					continue
+				}
+				prevChildIdx, ok := prevByCorrelation[correlationID]
+				if !ok {
+					continue
+				}
+				if prevInterAgent.Children[prevChildIdx].ToolCallsExpanded {
+					nextInterAgent.Children[j].ToolCallsExpanded = true
+				}
+				stack = append(stack, toolCallUIPreserveFrame{
+					next: nextInterAgent.Children[j].ToolCalls,
+					prev: prevInterAgent.Children[prevChildIdx].ToolCalls,
+				})
+			}
+		}
+	}
+}
+
+func mergeToolCallRecords(prev, next []ToolCallRecord) []ToolCallRecord {
+	if len(prev) == 0 {
+		return cloneToolCallRecords(next)
+	}
+	if len(next) == 0 {
+		return cloneToolCallRecords(prev)
+	}
+
+	merged := cloneToolCallRecords(prev)
+	usedNext := make([]bool, len(next))
+	for i := range merged {
+		match := -1
+		for j := range next {
+			if usedNext[j] {
+				continue
+			}
+			if !toolCallRecordsShareIdentity(merged[i], next[j]) {
 				continue
 			}
 			match = j
@@ -1809,45 +1990,135 @@ func preserveToolCallSliceUIState(next []ToolCallRecord, prev []ToolCallRecord) 
 		if match < 0 {
 			continue
 		}
-		used[match] = true
-		preserveToolCallUIState(&next[i], prev[match])
-	}
-}
-
-func preserveToolCallUIState(next *ToolCallRecord, prev ToolCallRecord) {
-	if next == nil {
-		return
-	}
-	if prev.Expanded {
-		next.Expanded = true
-	}
-	if next.InterAgent == nil || prev.InterAgent == nil {
-		return
-	}
-	preserveInterAgentChildrenUIState(next.InterAgent.Children, prev.InterAgent.Children)
-}
-
-func preserveInterAgentChildrenUIState(next []InterAgentChildActivity, prev []InterAgentChildActivity) {
-	if len(next) == 0 || len(prev) == 0 {
-		return
-	}
-	byCorrelation := make(map[string]InterAgentChildActivity, len(prev))
-	for i := range prev {
-		correlationID := strings.TrimSpace(prev[i].CorrelationID)
-		if correlationID == "" {
-			continue
-		}
-		byCorrelation[correlationID] = prev[i]
+		usedNext[match] = true
+		mergeToolCallRecord(&merged[i], next[match])
 	}
 	for i := range next {
-		correlationID := strings.TrimSpace(next[i].CorrelationID)
-		if correlationID == "" {
+		if usedNext[i] {
 			continue
 		}
-		if prevChild, ok := byCorrelation[correlationID]; ok {
-			preserveInterAgentChildUIState(&next[i], prevChild)
-		}
+		merged = append(merged, cloneToolCallRecords(next[i:i+1])...)
 	}
+	return merged
+}
+
+func mergeToolCallRecord(prev *ToolCallRecord, next ToolCallRecord) {
+	if prev == nil {
+		return
+	}
+	if key := strings.TrimSpace(next.ToolCallKey); key != "" {
+		prev.ToolCallKey = key
+	}
+	if name := strings.TrimSpace(next.ToolName); name != "" {
+		prev.ToolName = name
+	}
+	if summary := strings.TrimSpace(next.ArgsSummary); summary != "" {
+		prev.ArgsSummary = next.ArgsSummary
+	}
+	if args := strings.TrimSpace(next.FullArgs); args != "" {
+		prev.FullArgs = next.FullArgs
+	}
+	if output := strings.TrimSpace(next.Output); output != "" || next.Completed {
+		prev.Output = next.Output
+	}
+	if errMsg := strings.TrimSpace(next.ErrorMsg); errMsg != "" || next.Completed {
+		prev.ErrorMsg = next.ErrorMsg
+	}
+	if !next.StartedAt.IsZero() {
+		prev.StartedAt = next.StartedAt
+	}
+	if next.Duration > 0 {
+		prev.Duration = next.Duration
+	}
+	if next.Completed {
+		prev.Completed = true
+		prev.Success = next.Success
+		prev.SyntheticCompletion = next.SyntheticCompletion
+	} else if !prev.Completed {
+		prev.Success = next.Success
+	}
+	if next.Expanded {
+		prev.Expanded = true
+	}
+	if next.InterAgent != nil {
+		if prev.InterAgent == nil {
+			row := *next.InterAgent
+			row.AgentTypes = append([]string(nil), next.InterAgent.AgentTypes...)
+			row.Children = cloneInterAgentChildren(next.InterAgent.Children)
+			prev.InterAgent = &row
+			return
+		}
+		mergeInterAgentTool(prev.InterAgent, *next.InterAgent)
+	}
+}
+
+func mergeInterAgentTool(prev *InterAgentTool, next InterAgentTool) {
+	if prev == nil {
+		return
+	}
+	if next.Kind != "" {
+		prev.Kind = next.Kind
+	}
+	if threadKey := strings.TrimSpace(next.ThreadKey); threadKey != "" {
+		prev.ThreadKey = threadKey
+	}
+	if len(next.AgentTypes) > 0 {
+		prev.AgentTypes = append([]string(nil), next.AgentTypes...)
+	}
+	if summary := strings.TrimSpace(next.Summary); summary != "" {
+		prev.Summary = summary
+	}
+	prev.Status = mergeInterAgentToolStatus(prev.Status, next.Status)
+	prev.Children = mergeInterAgentChildren(prev.Children, next.Children)
+}
+
+func mergeInterAgentToolStatus(prev, next InterAgentToolStatus) InterAgentToolStatus {
+	if strings.TrimSpace(string(next)) == "" {
+		return prev
+	}
+	if (prev == InterAgentToolDone || prev == InterAgentToolFailed) && next == InterAgentToolPending {
+		return prev
+	}
+	return next
+}
+
+func mergeInterAgentChildren(prev, next []InterAgentChildActivity) []InterAgentChildActivity {
+	if len(prev) == 0 {
+		return cloneInterAgentChildren(next)
+	}
+	if len(next) == 0 {
+		return cloneInterAgentChildren(prev)
+	}
+
+	merged := cloneInterAgentChildren(prev)
+	usedNext := make([]bool, len(next))
+	for i := range merged {
+		match := -1
+		prevCorrelationID := strings.TrimSpace(merged[i].CorrelationID)
+		for j := range next {
+			if usedNext[j] {
+				continue
+			}
+			nextCorrelationID := strings.TrimSpace(next[j].CorrelationID)
+			if prevCorrelationID == "" || nextCorrelationID == "" || prevCorrelationID != nextCorrelationID {
+				continue
+			}
+			match = j
+			break
+		}
+		if match < 0 {
+			continue
+		}
+		usedNext[match] = true
+		merged[i] = mergeInterAgentChildActivity(merged[i], next[match])
+	}
+	for i := range next {
+		if usedNext[i] {
+			continue
+		}
+		merged = append(merged, cloneInterAgentChildActivity(next[i]))
+	}
+	return merged
 }
 
 func toolCallRecordsShareIdentity(left, right ToolCallRecord) bool {
@@ -1882,15 +2153,7 @@ func cloneToolCallRecords(in []ToolCallRecord) []ToolCallRecord {
 		return nil
 	}
 	out := make([]ToolCallRecord, len(in))
-	for i := range in {
-		out[i] = in[i]
-		if in[i].InterAgent != nil {
-			row := *in[i].InterAgent
-			row.AgentTypes = append([]string(nil), in[i].InterAgent.AgentTypes...)
-			row.Children = cloneInterAgentChildren(in[i].InterAgent.Children)
-			out[i].InterAgent = &row
-		}
-	}
+	populateClonedInterAgentTree(toolCloneFrame{src: in, dst: out})
 	return out
 }
 
@@ -1899,10 +2162,61 @@ func cloneInterAgentChildren(in []InterAgentChildActivity) []InterAgentChildActi
 		return nil
 	}
 	out := make([]InterAgentChildActivity, len(in))
-	for i := range in {
-		out[i] = cloneInterAgentChildActivity(in[i])
-	}
+	populateClonedInterAgentTree(childCloneFrame{src: in, dst: out})
 	return out
+}
+
+type toolCloneFrame struct {
+	src []ToolCallRecord
+	dst []ToolCallRecord
+}
+
+type childCloneFrame struct {
+	src []InterAgentChildActivity
+	dst []InterAgentChildActivity
+}
+
+func populateClonedInterAgentTree(root any) {
+	stack := []any{root}
+	for len(stack) > 0 {
+		item := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		switch frame := item.(type) {
+		case toolCloneFrame:
+			for i := range frame.src {
+				frame.dst[i] = frame.src[i]
+				if frame.src[i].InterAgent == nil {
+					frame.dst[i].InterAgent = nil
+					continue
+				}
+				row := *frame.src[i].InterAgent
+				row.AgentTypes = append([]string(nil), frame.src[i].InterAgent.AgentTypes...)
+				if len(frame.src[i].InterAgent.Children) > 0 {
+					row.Children = make([]InterAgentChildActivity, len(frame.src[i].InterAgent.Children))
+					stack = append(stack, childCloneFrame{
+						src: frame.src[i].InterAgent.Children,
+						dst: row.Children,
+					})
+				} else {
+					row.Children = nil
+				}
+				frame.dst[i].InterAgent = &row
+			}
+		case childCloneFrame:
+			for i := range frame.src {
+				frame.dst[i] = frame.src[i]
+				if len(frame.src[i].ToolCalls) > 0 {
+					frame.dst[i].ToolCalls = make([]ToolCallRecord, len(frame.src[i].ToolCalls))
+					stack = append(stack, toolCloneFrame{
+						src: frame.src[i].ToolCalls,
+						dst: frame.dst[i].ToolCalls,
+					})
+				} else {
+					frame.dst[i].ToolCalls = nil
+				}
+			}
+		}
+	}
 }
 
 func handleInterAgentToolCallInList(calls *[]ToolCallRecord, currentAgentType string, ev msg.ToolCallEventMsg) bool {
@@ -2159,10 +2473,12 @@ func targetForSelectionRegion(entryIndex int, region selectionRegion) *toggleTar
 		}
 	case selectionRegionToolCallOverflow:
 		return &toggleTarget{
-			entryIndex:    entryIndex,
-			kind:          toggleTargetOverflow,
-			toolCallIndex: region.toolCallIndex,
-			childIndex:    region.childIndex,
+			entryIndex:     entryIndex,
+			kind:           toggleTargetOverflow,
+			toolCallIndex:  region.toolCallIndex,
+			childIndex:     region.childIndex,
+			childPath:      cloneIntSlice(region.childPath),
+			interAgentPath: cloneIntSlice(region.interAgentPath),
 		}
 	case selectionRegionChildToolCall:
 		return &toggleTarget{
@@ -2171,6 +2487,8 @@ func targetForSelectionRegion(entryIndex int, region selectionRegion) *toggleTar
 			toolCallIndex:    region.toolCallIndex,
 			childIndex:       region.childIndex,
 			childToolCallIdx: region.childToolCallIdx,
+			childPath:        cloneIntSlice(region.childPath),
+			interAgentPath:   cloneIntSlice(region.interAgentPath),
 		}
 	default:
 		return nil
@@ -2221,6 +2539,11 @@ func resolveChildTargetIndex(target *toggleTarget, children []InterAgentChildAct
 	if target == nil || len(children) == 0 {
 		return -1
 	}
+	if len(target.childPath) > 0 {
+		if idx := target.childPath[0]; idx >= 0 && idx < len(children) {
+			return idx
+		}
+	}
 	childID := strings.TrimSpace(target.childID)
 	if childID != "" {
 		for idx := range children {
@@ -2233,6 +2556,45 @@ func resolveChildTargetIndex(target *toggleTarget, children []InterAgentChildAct
 		return idx
 	}
 	return -1
+}
+
+func resolveInterAgentToggleChild(row *InterAgentTool, target *toggleTarget) (int, *InterAgentChildActivity, bool) {
+	if row == nil || target == nil {
+		return -1, nil, false
+	}
+	if len(target.childPath) == 0 {
+		childIndex := resolveChildTargetIndex(target, row.Children)
+		if childIndex < 0 || childIndex >= len(row.Children) {
+			return -1, nil, false
+		}
+		return childIndex, &row.Children[childIndex], true
+	}
+	currentRow := row
+	var child *InterAgentChildActivity
+	var childIndex int
+	for depth, pathIndex := range target.childPath {
+		if pathIndex < 0 || pathIndex >= len(currentRow.Children) {
+			return -1, nil, false
+		}
+		childIndex = pathIndex
+		child = &currentRow.Children[childIndex]
+		if depth == len(target.childPath)-1 {
+			return childIndex, child, true
+		}
+		if depth >= len(target.interAgentPath) {
+			return -1, nil, false
+		}
+		nextToolCallIdx := target.interAgentPath[depth]
+		if nextToolCallIdx < 0 || nextToolCallIdx >= len(child.ToolCalls) {
+			return -1, nil, false
+		}
+		next := child.ToolCalls[nextToolCallIdx].InterAgent
+		if next == nil {
+			return -1, nil, false
+		}
+		currentRow = next
+	}
+	return -1, nil, false
 }
 
 func resolveChildToolCallTargetIndex(target *toggleTarget, calls []ToolCallRecord) int {
@@ -2304,12 +2666,12 @@ func (m *Model) toggleTarget(target *toggleTarget) bool {
 			if record.InterAgent == nil {
 				return
 			}
-			childIndex := resolveChildTargetIndex(target, record.InterAgent.Children)
-			if childIndex < 0 || childIndex >= len(record.InterAgent.Children) {
+			childIndex, child, ok := resolveInterAgentToggleChild(record.InterAgent, target)
+			if !ok || child == nil {
 				return
 			}
-			child := &record.InterAgent.Children[childIndex]
 			target.childIndex = childIndex
+			target.childPath = cloneIntSlice(target.childPath)
 			target.childID = strings.TrimSpace(child.CorrelationID)
 			child.ToolCallsExpanded = !child.ToolCallsExpanded
 			toggled = true
@@ -2317,16 +2679,16 @@ func (m *Model) toggleTarget(target *toggleTarget) bool {
 			if record.InterAgent == nil {
 				return
 			}
-			childIndex := resolveChildTargetIndex(target, record.InterAgent.Children)
-			if childIndex < 0 || childIndex >= len(record.InterAgent.Children) {
+			childIndex, child, ok := resolveInterAgentToggleChild(record.InterAgent, target)
+			if !ok || child == nil {
 				return
 			}
-			child := &record.InterAgent.Children[childIndex]
 			childToolCallIdx := resolveChildToolCallTargetIndex(target, child.ToolCalls)
 			if childToolCallIdx < 0 || childToolCallIdx >= len(child.ToolCalls) {
 				return
 			}
 			target.childIndex = childIndex
+			target.childPath = cloneIntSlice(target.childPath)
 			target.childID = strings.TrimSpace(child.CorrelationID)
 			target.childToolCallIdx = childToolCallIdx
 			target.childToolCallKey = strings.TrimSpace(child.ToolCalls[childToolCallIdx].ToolCallKey)
@@ -2366,7 +2728,10 @@ func (m *Model) reselectAfterToggle(target *toggleTarget) {
 	}
 	if target.kind == toggleTargetOverflow {
 		for idx, region := range regions {
-			if region.kind == selectionRegionChildToolCall && region.childIndex == target.childIndex {
+			if region.kind == selectionRegionChildToolCall &&
+				region.childIndex == target.childIndex &&
+				intSlicesEqual(region.childPath, target.childPath) &&
+				intSlicesEqual(region.interAgentPath, target.interAgentPath) {
 				m.viewport.selectEntry(entryIndex, idx)
 				return
 			}
@@ -2385,6 +2750,9 @@ func toggleTargetsReferToSameItem(left, right *toggleTarget) bool {
 		if !sameToolCallToggleTarget(left, right) {
 			return false
 		}
+		if !intSlicesEqual(left.childPath, right.childPath) || !intSlicesEqual(left.interAgentPath, right.interAgentPath) {
+			return false
+		}
 		leftChildID := strings.TrimSpace(left.childID)
 		rightChildID := strings.TrimSpace(right.childID)
 		if leftChildID != "" && rightChildID != "" {
@@ -2393,6 +2761,9 @@ func toggleTargetsReferToSameItem(left, right *toggleTarget) bool {
 		return left.childIndex == right.childIndex
 	case toggleTargetChildToolCall:
 		if !sameToolCallToggleTarget(left, right) {
+			return false
+		}
+		if !intSlicesEqual(left.childPath, right.childPath) || !intSlicesEqual(left.interAgentPath, right.interAgentPath) {
 			return false
 		}
 		leftChildID := strings.TrimSpace(left.childID)
@@ -2438,6 +2809,18 @@ func sameToolCallToggleTarget(left, right *toggleTarget) bool {
 				strings.TrimSpace(left.toolCallName) == strings.TrimSpace(right.toolCallName))
 	}
 	return left.toolCallIndex == right.toolCallIndex
+}
+
+func intSlicesEqual(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // SetHighlight marks an entry for transient visual highlight (copy feedback).

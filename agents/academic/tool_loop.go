@@ -17,11 +17,144 @@ import (
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
-var (
-	errAcademicSearchGroundingRequested     = errors.New("academic discovery phase reached grounding threshold")
-	errAcademicSearchCorroborationRequested = errors.New("academic grounded evidence now needs corroboration")
-	errAcademicSearchSynthesisRequested     = errors.New("academic search plateau reached; synthesize from gathered evidence")
-)
+func academicAutoFetchReason(candidate researchExecutionDiscoveredResult) string {
+	title := strings.TrimSpace(candidate.Title)
+	query := strings.TrimSpace(candidate.Query)
+	switch {
+	case title != "" && query != "":
+		return fmt.Sprintf("Ground surfaced native web search result %q for %q before continuing synthesis.", title, query)
+	case title != "":
+		return fmt.Sprintf("Ground surfaced native web search result %q before continuing synthesis.", title)
+	case query != "":
+		return fmt.Sprintf("Ground surfaced native web search result for %q before continuing synthesis.", query)
+	default:
+		return "Ground surfaced native web search result before continuing synthesis."
+	}
+}
+
+func academicAutoFetchToolCall(candidate researchExecutionDiscoveredResult) (providers.ToolCall, error) {
+	toolName, err := normalizeGroundSourceTool(candidate.URL, "auto")
+	if err != nil {
+		return providers.ToolCall{}, err
+	}
+	arguments, err := json.Marshal(map[string]string{
+		"url":    strings.TrimSpace(candidate.URL),
+		"reason": academicAutoFetchReason(candidate),
+	})
+	if err != nil {
+		return providers.ToolCall{}, err
+	}
+	return providers.ToolCall{
+		ID:        fmt.Sprintf("auto_fetch_%d", time.Now().UnixNano()),
+		Name:      toolName,
+		Arguments: string(arguments),
+	}, nil
+}
+
+func academicHasExplicitGroundingToolCall(calls []providers.ToolCall) bool {
+	for _, call := range calls {
+		switch strings.TrimSpace(call.Name) {
+		case "ground_source", "web_fetch", "fetch_document", "crawl_links":
+			return true
+		}
+	}
+	return false
+}
+
+func mergeAcademicToolBatchOutcomes(primary, extra academicToolBatchOutcome) academicToolBatchOutcome {
+	primary.errCount += extra.errCount
+	if extra.rerouted {
+		primary.rerouted = true
+	}
+	if extra.delegated {
+		primary.delegated = true
+		if strings.TrimSpace(primary.delegatedMessage) == "" {
+			primary.delegatedMessage = strings.TrimSpace(extra.delegatedMessage)
+		}
+	}
+	if extra.terminal {
+		primary.terminal = true
+		if primary.terminalErr == nil {
+			primary.terminalErr = extra.terminalErr
+		}
+		if strings.TrimSpace(primary.terminalMessage) == "" {
+			primary.terminalMessage = strings.TrimSpace(extra.terminalMessage)
+		}
+	}
+	return primary
+}
+
+func (a *Academic) autoFetchCandidateForProviderResponse(
+	resp *providers.Response,
+	execState *academicResearchExecutionState,
+	attempted map[string]struct{},
+) (researchExecutionDiscoveredResult, bool) {
+	if execState == nil || resp == nil || academicHasExplicitGroundingToolCall(resp.ToolCalls) {
+		return researchExecutionDiscoveredResult{}, false
+	}
+	return execState.bestAutoFetchCandidateForResponse(resp, attempted)
+}
+
+func (a *Academic) executeAutoFetchCandidate(
+	ctx context.Context,
+	req *providers.Request,
+	surface toolruntime.Surface,
+	execState *academicResearchExecutionState,
+	candidate researchExecutionDiscoveredResult,
+	attempted map[string]struct{},
+) (academicToolBatchOutcome, bool, error) {
+	if execState == nil || strings.TrimSpace(candidate.URL) == "" {
+		return academicToolBatchOutcome{}, false, nil
+	}
+	if execState.hasGroundedURL(candidate.URL) {
+		return academicToolBatchOutcome{}, false, nil
+	}
+	call, err := academicAutoFetchToolCall(candidate)
+	if err != nil {
+		return academicToolBatchOutcome{}, false, err
+	}
+	if attempted != nil {
+		attempted[strings.TrimSpace(candidate.URL)] = struct{}{}
+	}
+	academicLogResearchStateEvent(ctx, "auto_fetch_started", map[string]any{
+		"url":      strings.TrimSpace(candidate.URL),
+		"title":    strings.TrimSpace(candidate.Title),
+		"query":    strings.TrimSpace(candidate.Query),
+		"provider": strings.TrimSpace(candidate.Provider),
+		"source":   strings.TrimSpace(candidate.Source),
+		"tool":     call.Name,
+	})
+	synthetic := &providers.Response{ToolCalls: []providers.ToolCall{call}}
+	shared.PublishIntermediateToolTurn(a.bus, a.channels, ctx, a.id, synthetic)
+	outcome := a.applyToolCalls(ctx, req, synthetic, surface)
+	academicLogResearchStateEvent(ctx, "auto_fetch_finished", map[string]any{
+		"url":         strings.TrimSpace(candidate.URL),
+		"tool":        call.Name,
+		"delegated":   outcome.delegated,
+		"rerouted":    outcome.rerouted,
+		"err_count":   outcome.errCount,
+		"terminal":    outcome.terminal,
+		"terminalErr": outcome.terminalErr != nil,
+	})
+	return outcome, true, nil
+}
+
+func (a *Academic) maybeAutoFetchDiscoveredSource(
+	ctx context.Context,
+	req *providers.Request,
+	surface toolruntime.Surface,
+	execState *academicResearchExecutionState,
+	attempted map[string]struct{},
+) (academicToolBatchOutcome, bool, error) {
+	if execState == nil || execState.hasGroundedSources() {
+		return academicToolBatchOutcome{}, false, nil
+	}
+	candidate, ok := execState.bestAutoFetchCandidate(attempted)
+	if !ok {
+		return academicToolBatchOutcome{}, false, nil
+	}
+	return a.executeAutoFetchCandidate(ctx, req, surface, execState, candidate, attempted)
+}
 
 // executeToolLoop runs the LLM tool-call loop: Complete → check ToolCalls →
 // execute → append results → repeat, bounded by config.MaxToolRuns.
@@ -32,18 +165,9 @@ func (a *Academic) executeToolLoop(
 	ledger *steering.SteeringLedger,
 	surface toolruntime.Surface,
 ) (string, error) {
-	return a.executeToolLoopWithDiscipline(ctx, req, ledger, surface, searchDiscipline{})
-}
-
-func (a *Academic) executeToolLoopWithDiscipline(
-	ctx context.Context,
-	req *providers.Request,
-	ledger *steering.SteeringLedger,
-	surface toolruntime.Surface,
-	_ searchDiscipline,
-) (string, error) {
 	maxRuns := a.config.MaxToolRuns
 	consecutiveErrors := 0
+	autoFetchAttempts := make(map[string]struct{})
 	seen := make(map[shared.ToolCallSignature]int, maxRuns)
 	baseTools := append([]providers.Tool(nil), req.Tools...)
 	if surface == nil {
@@ -134,12 +258,57 @@ func (a *Academic) executeToolLoopWithDiscipline(
 		if !streamed {
 			shared.PublishIntermediateToolTurn(a.bus, a.channels, ctx, a.id, resp)
 		}
-		if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
-			execState.observeProviderResponse(ctx, resp)
+		var (
+			execState                  = academicResearchExecutionStateFromContext(ctx)
+			responseAutoFetchCandidate researchExecutionDiscoveredResult
+		)
+		if execState != nil {
+			execState.observeProviderResponse(ctx, a, resp)
+			responseAutoFetchCandidate, _ = a.autoFetchCandidateForProviderResponse(resp, execState, autoFetchAttempts)
 		}
 
 		if len(resp.ToolCalls) == 0 {
-			if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
+			if execState != nil {
+				outcome, autoFetched, err := a.executeAutoFetchCandidate(ctx, req, surface, execState, responseAutoFetchCandidate, autoFetchAttempts)
+				if err != nil {
+					return "", err
+				}
+				if !autoFetched {
+					outcome, autoFetched, err = a.maybeAutoFetchDiscoveredSource(ctx, req, surface, execState, autoFetchAttempts)
+				}
+				if err != nil {
+					return "", err
+				}
+				if autoFetched {
+					a.recordTurn(ctx, req, resp, turn, 1, outcome.errCount, turnStart)
+					if outcome.terminalErr != nil {
+						return "", outcome.terminalErr
+					}
+					if outcome.terminal {
+						if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+							shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
+								lm.AgentID, lm.SessionID, lm.CorrID, "info",
+								&agentlog.GenerationPayload{Phase: "completed", ToolRuns: turn + 1})
+						}
+						return strings.TrimSpace(outcome.terminalMessage), nil
+					}
+					if outcome.rerouted {
+						return "", skills.ErrRerouteRequested
+					}
+					if outcome.delegated {
+						return strings.TrimSpace(outcome.delegatedMessage), nil
+					}
+					consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, outcome.errCount, 1)
+					if consecutiveErrors >= shared.MaxConsecutiveToolErrors {
+						if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+							shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+								lm.AgentID, lm.SessionID, lm.CorrID, "error",
+								&agentlog.ErrorPayload{Error: fmt.Sprintf("tool calls failed %d consecutive turns", consecutiveErrors)})
+						}
+						return "", fmt.Errorf("academic tool calls failed %d consecutive turns", consecutiveErrors)
+					}
+					continue
+				}
 				if reminder, fields := execState.finalizationBlock(); reminder != "" {
 					fields["content_preview"] = truncateStr(strings.TrimSpace(resp.Content), 200)
 					academicLogResearchStateEvent(ctx, "finalization_blocked", fields)
@@ -173,15 +342,43 @@ func (a *Academic) executeToolLoopWithDiscipline(
 			return "", fmt.Errorf("academic repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted, delegated, delegatedMessage := a.applyToolCalls(ctx, req, resp, surface)
-		a.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
-		if rerouted {
+		outcome := a.applyToolCalls(ctx, req, resp, surface)
+		autoFetchCount := 0
+		if execState != nil && !outcome.terminal && !outcome.rerouted && !outcome.delegated {
+			autoFetchOutcome, autoFetched, err := a.executeAutoFetchCandidate(ctx, req, surface, execState, responseAutoFetchCandidate, autoFetchAttempts)
+			if err != nil {
+				return "", err
+			}
+			if !autoFetched {
+				autoFetchOutcome, autoFetched, err = a.maybeAutoFetchDiscoveredSource(ctx, req, surface, execState, autoFetchAttempts)
+				if err != nil {
+					return "", err
+				}
+			}
+			if autoFetched {
+				autoFetchCount = 1
+				outcome = mergeAcademicToolBatchOutcomes(outcome, autoFetchOutcome)
+			}
+		}
+		a.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls)+autoFetchCount, outcome.errCount, turnStart)
+		if outcome.terminalErr != nil {
+			return "", outcome.terminalErr
+		}
+		if outcome.terminal {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.GenerationPayload{Phase: "completed", ToolRuns: turn + 1})
+			}
+			return strings.TrimSpace(outcome.terminalMessage), nil
+		}
+		if outcome.rerouted {
 			return "", skills.ErrRerouteRequested
 		}
-		if delegated {
-			return strings.TrimSpace(delegatedMessage), nil
+		if outcome.delegated {
+			return strings.TrimSpace(outcome.delegatedMessage), nil
 		}
-		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
+		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, outcome.errCount, len(resp.ToolCalls)+autoFetchCount)
 		if consecutiveErrors >= shared.MaxConsecutiveToolErrors {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -200,21 +397,28 @@ func (a *Academic) executeToolLoopWithDiscipline(
 	return "", fmt.Errorf("academic exhausted tool-call loop")
 }
 
+type academicToolBatchOutcome struct {
+	errCount         int
+	rerouted         bool
+	delegated        bool
+	delegatedMessage string
+	terminal         bool
+	terminalMessage  string
+	terminalErr      error
+}
+
 // applyToolCalls appends the assistant message and tool results to the request.
 func (a *Academic) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
 	surface toolruntime.Surface,
-) (int, bool, bool, string) {
+) academicToolBatchOutcome {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	loadedBefore := len(a.skills.GetLoaded())
 
-	errCount := 0
-	rerouted := false
-	delegated := false
-	delegatedMessage := ""
+	outcome := academicToolBatchOutcome{}
 	for _, call := range resp.ToolCalls {
 		if ctx.Err() != nil {
 			break
@@ -233,20 +437,20 @@ func (a *Academic) applyToolCalls(
 		isDelegated := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
-				rerouted = true
+				outcome.rerouted = true
 				result = `{"rerouted": true}`
 			} else if errors.Is(err, skills.ErrDelegatedRequested) {
-				delegated = true
+				outcome.delegated = true
 				isDelegated = true
-				delegatedMessage = shared.DelegatedToolMessage(result, err)
-				if delegatedMessage == "" {
-					delegatedMessage = strings.TrimSpace(result)
+				outcome.delegatedMessage = shared.DelegatedToolMessage(result, err)
+				if outcome.delegatedMessage == "" {
+					outcome.delegatedMessage = strings.TrimSpace(result)
 				}
 			} else {
 				result = shared.ToolErrorPayload(err)
 				isError = true
 				if shared.ToolErrorCountsTowardAbort(err) {
-					errCount++
+					outcome.errCount++
 				}
 				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 					shared.LogAgentEvent(lm.EventLogger, agentlog.EventSkillFailed,
@@ -262,13 +466,13 @@ func (a *Academic) applyToolCalls(
 				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError && !isDelegated})
 		}
 		if !isError && call.Name == "author_research_paper" {
-			if state := AcademicTurnStateFromContext(ctx); state != nil {
+			if state := AcademicTurnStateFromContext(ctx); state != nil && !academicToolCallRequestsContinueResearch(call.Name, result) {
 				action := academicTurnActionType(call.Name)
 				if err := state.setTerminalAction(action); err != nil {
 					isError = true
 					result = shared.ToolErrorPayload(err)
 					if shared.ToolErrorCountsTowardAbort(err) {
-						errCount++
+						outcome.errCount++
 					}
 				}
 			}
@@ -287,11 +491,20 @@ func (a *Academic) applyToolCalls(
 			if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
 				execState.observeToolResult(ctx, a, call, result, isError)
 			}
-			if tracker := searchEvidenceTrackerFromContext(ctx); tracker != nil {
-				tracker.observeToolResult(call, result, isError)
-			}
 		}
-		if rerouted || delegated {
+		if academicToolCallRequestsContinueResearch(call.Name, result) {
+			break
+		}
+		if academicShouldTerminateAfterToolCall(ctx, call.Name, result) {
+			outcome.terminal = true
+			if isError {
+				outcome.terminalErr = academicTerminalToolError(call.Name, err, result)
+			} else {
+				outcome.terminalMessage = academicTerminalToolMessage(call.Name, result)
+			}
+			break
+		}
+		if outcome.rerouted || outcome.delegated {
 			break
 		}
 	}
@@ -300,7 +513,70 @@ func (a *Academic) applyToolCalls(
 		a.toolDefsDirty = true
 	}
 
-	return errCount, rerouted, delegated, delegatedMessage
+	return outcome
+}
+
+func academicShouldTerminateAfterToolCall(ctx context.Context, toolName string, result string) bool {
+	state := AcademicTurnStateFromContext(ctx)
+	if state == nil {
+		return false
+	}
+	if academicToolCallRequestsContinueResearch(toolName, result) {
+		return false
+	}
+	requiredAction, _ := state.RequiredAction()
+	if requiredAction == "" {
+		return false
+	}
+	return strings.TrimSpace(toolName) == string(requiredAction)
+}
+
+func academicToolCallRequestsContinueResearch(toolName string, result string) bool {
+	if strings.TrimSpace(toolName) != "author_research_paper" {
+		return false
+	}
+	payload := parseResearchJSONPayload(result)
+	if len(payload) == 0 {
+		return false
+	}
+	continueResearch, _ := payload["continue_research"].(bool)
+	return continueResearch
+}
+
+func academicTerminalToolError(toolName string, execErr error, payload string) error {
+	toolName = strings.TrimSpace(toolName)
+	if execErr != nil {
+		return execErr
+	}
+	if payload = strings.TrimSpace(payload); payload != "" {
+		return fmt.Errorf("%s", payload)
+	}
+	if toolName == "" {
+		return fmt.Errorf("terminal academic tool failed")
+	}
+	return fmt.Errorf("terminal academic tool %q failed", toolName)
+}
+
+func academicTerminalToolMessage(toolName, payload string) string {
+	if strings.TrimSpace(toolName) != "author_research_paper" {
+		return strings.TrimSpace(payload)
+	}
+	fields := parseResearchJSONPayload(payload)
+	if summary := strings.TrimSpace(stringValue(fields["summary"])); summary != "" {
+		return summary
+	}
+	title := strings.TrimSpace(stringValue(fields["title"]))
+	paperPath := strings.TrimSpace(stringValue(fields["paper_path"]))
+	switch {
+	case title != "" && paperPath != "":
+		return fmt.Sprintf("Research paper completed: %s (%s).", title, paperPath)
+	case title != "":
+		return fmt.Sprintf("Research paper completed: %s.", title)
+	case paperPath != "":
+		return fmt.Sprintf("Research paper completed and saved to %s.", paperPath)
+	default:
+		return "Research paper completed."
+	}
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.
@@ -470,16 +746,6 @@ func (a *Academic) streamLLMTurn(
 		if chunk == nil {
 			return
 		}
-		if tracker := searchEvidenceTrackerFromContext(ctx); tracker != nil {
-			tracker.observeStreamChunk(chunk)
-			if tracker.runawayError() != nil {
-				cancelStream()
-				return
-			}
-			if tracker.suppressStreamChunk(chunk) {
-				return
-			}
-		}
 		shared.ObserveProviderToolCallChunk(ctx, chunk)
 		switch chunk.Type {
 		case providers.ChunkTypeStart:
@@ -515,9 +781,6 @@ func (a *Academic) streamLLMTurn(
 			streamErr = nil
 		}
 		collector.Add(chunk)
-		if tracker := searchEvidenceTrackerFromContext(ctx); tracker != nil && tracker.runawayError() != nil {
-			return nil, tracker.runawayError()
-		}
 		if chunk != nil && chunk.Type == providers.ChunkTypeError {
 			streamErr = fmt.Errorf("stream error: %s", chunk.Text)
 		}
@@ -527,7 +790,7 @@ func (a *Academic) streamLLMTurn(
 	}
 	resp := collector.Response()
 	if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
-		execState.observeProviderResponse(ctx, resp)
+		execState.observeProviderResponse(ctx, a, resp)
 	}
 	if resp != nil && len(resp.ToolCalls) > 0 {
 		shared.PublishIntermediateToolTurn(a.bus, a.channels, ctx, a.id, resp)
@@ -550,19 +813,6 @@ func (a *Academic) streamLLMTurn(
 			}
 		}
 	}
-	if tracker := searchEvidenceTrackerFromContext(ctx); tracker != nil && (resp == nil || strings.TrimSpace(resp.Content) == "") {
-		switch tracker.currentPhase() {
-		case researchPhaseGround:
-			return nil, errAcademicSearchGroundingRequested
-		case researchPhaseCorroborate:
-			return nil, errAcademicSearchCorroborationRequested
-		case researchPhaseSynthesize:
-			return nil, errAcademicSearchSynthesisRequested
-		}
-	}
-	if tracker := searchEvidenceTrackerFromContext(ctx); tracker != nil && tracker.runawayError() != nil {
-		return nil, tracker.runawayError()
-	}
 	if streamErr != nil {
 		return nil, streamErr
 	}
@@ -570,62 +820,6 @@ func (a *Academic) streamLLMTurn(
 		shared.MarkResponseStreamedText(resp)
 	}
 	return resp, nil
-}
-
-func isAcademicPhaseAdvanceError(err error) bool {
-	return errors.Is(err, errAcademicSearchGroundingRequested) ||
-		errors.Is(err, errAcademicSearchCorroborationRequested) ||
-		errors.Is(err, errAcademicSearchSynthesisRequested)
-}
-
-func academicSearchPhaseFailure(phase researchPhase) error {
-	switch phase {
-	case researchPhaseGround:
-		return fmt.Errorf("academic research discovered candidate sources but never grounded the answer with `web_fetch`, `fetch_document`, or equivalent source ingestion")
-	case researchPhaseCorroborate:
-		return fmt.Errorf("academic research grounded one source but never corroborated or resolved the remaining ambiguity before answering")
-	case researchPhaseSynthesize:
-		return fmt.Errorf("academic research did not converge to a final synthesis after gathering grounded evidence")
-	default:
-		return fmt.Errorf("academic research did not converge to an answer after search-backed evidence gathering")
-	}
-}
-
-func academicRepeatedToolCallReminder(toolName string, phase researchPhase, scores researchProgressScores) string {
-	toolName = strings.TrimSpace(toolName)
-	if toolName == "" {
-		toolName = "the same tool batch"
-	}
-	return fmt.Sprintf(
-		"Do not repeat the same tool batch again (stuck on `%s`). %s",
-		toolName,
-		researchPhaseReminderMessage(phase, scores),
-	)
-}
-
-func academicRepeatedToolCallFailure(toolName string, tracker *searchEvidenceTracker) error {
-	toolName = strings.TrimSpace(toolName)
-	if tracker == nil {
-		return fmt.Errorf("academic repeated tool call: %s", toolName)
-	}
-	phaseFailure := academicLoopExhaustionError(tracker, searchDiscipline{})
-	if toolName == "" {
-		return phaseFailure
-	}
-	return fmt.Errorf("%s (repeated tool batch: %s)", phaseFailure.Error(), toolName)
-}
-
-func academicLoopExhaustionError(tracker *searchEvidenceTracker, discipline searchDiscipline) error {
-	if tracker == nil {
-		return fmt.Errorf("academic exhausted tool-call loop")
-	}
-	if err := tracker.runawayError(); err != nil {
-		return err
-	}
-	if discipline.RequireWebSearch && !tracker.sawSearch {
-		return searchDisciplineFailure()
-	}
-	return academicSearchPhaseFailure(tracker.currentPhase())
 }
 
 func (a *Academic) publishThoughtProgress(ctx context.Context, thought string) {

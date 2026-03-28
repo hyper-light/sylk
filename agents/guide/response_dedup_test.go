@@ -95,6 +95,23 @@ func setPendingRouteWithMetadata(g *Guide, correlationID string, metadata map[st
 	})
 }
 
+func setPendingRouteWithOverride(g *Guide, correlationID, sourceAgentID, targetAgentID, streamTarget string, metadata map[string]any) {
+	g.pending.Set(correlationID, &PendingRequest{
+		CorrelationID:        correlationID,
+		SourceAgentID:        sourceAgentID,
+		TargetAgentID:        targetAgentID,
+		StreamTargetOverride: streamTarget,
+		Request: &RouteRequest{
+			CorrelationID: correlationID,
+			SessionID:     "test-session",
+			SourceAgentID: sourceAgentID,
+			Metadata:      metadata,
+		},
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(DefaultPendingStoreConfig().DefaultTimeout),
+	})
+}
+
 func TestHandleResponseMessage_DeduplicatesByBusMessageID(t *testing.T) {
 	g, out := newResponseTestGuide(t)
 	setPendingRoute(g, "corr-start")
@@ -436,6 +453,100 @@ func TestObserveStreamReroute_InitializesDeferredMapWhenNil(t *testing.T) {
 	}
 	if _, ok := g.streamReroutes["corr-reroute-new"]; ok {
 		t.Fatal("deferred stream reroute should be consumed after apply")
+	}
+}
+
+func TestHandleResponseMessage_MirrorsRelayedStreamActivityToRequesterWhenReroutedToTUI(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	t.Cleanup(func() {
+		_ = bus.Close()
+	})
+
+	tuiOut := make(chan *Message, 1)
+	tuiSub, err := bus.Subscribe(TopicResponses("tui", "tui"), func(msg *Message) error {
+		tuiOut <- msg
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe tui responses: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = tuiSub.Unsubscribe()
+	})
+
+	academicOut := make(chan *Message, 1)
+	academicSub, err := bus.Subscribe(TopicResponses("academic", "academic"), func(msg *Message) error {
+		academicOut <- msg
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe academic responses: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = academicSub.Unsubscribe()
+	})
+
+	g := &Guide{
+		bus:                  bus,
+		pending:              NewPendingStore(DefaultPendingStoreConfig()),
+		streams:              newGuideStreamManager(nil),
+		agentChannels:        NewStringMap[*AgentChannels](DefaultShardCount),
+		sessionID:            "test-session",
+		responseMessagesSeen: make(map[string]time.Time),
+		completedPendings:    make(map[string]completedPendingRoute),
+	}
+	setPendingRouteWithOverride(g, "corr-mirror", "academic", "librarian", "tui", map[string]any{
+		"chat_nested_branch":         true,
+		"chat_parent_correlation_id": "corr-parent",
+		"chat_parent_tool_call_key":  "consult-1",
+		"chat_inter_agent_kind":      "consult",
+	})
+
+	msg := &Message{
+		ID:            "msg-mirror-progress",
+		CorrelationID: "corr-mirror",
+		Type:          MessageTypeStream,
+		SourceAgentID: "librarian",
+		Payload: &StreamResponse{
+			CorrelationID:     "corr-mirror",
+			RespondingAgentID: "librarian",
+			Event: &StreamEvent{
+				Type: StreamEventProgress,
+				Data: &ProgressData{Message: "Searching codebase"},
+			},
+		},
+	}
+	if err := g.handleResponseMessage(msg); err != nil {
+		t.Fatalf("handleResponseMessage: %v", err)
+	}
+
+	select {
+	case forwarded := <-tuiOut:
+		stream, ok := forwarded.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatalf("unexpected tui message: %+v", forwarded)
+		}
+		if stream.TargetAgentID != "tui" {
+			t.Fatalf("tui target agent = %q, want tui", stream.TargetAgentID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for tui relayed stream")
+	}
+
+	select {
+	case mirrored := <-academicOut:
+		stream, ok := mirrored.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatalf("unexpected academic message: %+v", mirrored)
+		}
+		if stream.TargetAgentID != "academic" {
+			t.Fatalf("academic target agent = %q, want academic", stream.TargetAgentID)
+		}
+		if stream.CorrelationID != "corr-mirror" {
+			t.Fatalf("academic correlation_id = %q, want corr-mirror", stream.CorrelationID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for mirrored academic stream")
 	}
 }
 

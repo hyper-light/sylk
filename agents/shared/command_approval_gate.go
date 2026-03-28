@@ -150,7 +150,7 @@ func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval
 	}
 	publishGuardianApprovalResolvedProgress(branchCtx, req)
 	branch.CompleteFromMessage(branchCtx, msg, nil)
-	return decodeCommandApprovalMessage(msg)
+	return decodeCommandApprovalMessage(msg, req)
 }
 
 func beginGuardianApprovalBranch(
@@ -158,10 +158,6 @@ func beginGuardianApprovalBranch(
 	targetAgentID string,
 	req commandapproval.Request,
 ) (context.Context, InterAgentBranchHandle) {
-	branchCtx, branch := BeginAutoInterAgentRouteBranch(ctx, targetAgentID, nil, nil)
-	if strings.TrimSpace(branch.branch.ParentCorrelationID) != "" {
-		return branchCtx, branch
-	}
 	summary := guardianApprovalBranchSummary(req)
 	return BeginInterAgentBranch(ctx, InterAgentBranchSpec{
 		Kind:          InterAgentToolEventKindApproval,
@@ -180,6 +176,9 @@ func beginGuardianApprovalBranch(
 }
 
 func guardianApprovalBranchSummary(req commandapproval.Request) string {
+	if req.IsResearchContinuation() {
+		return "Requesting research-completion decision from Guardian"
+	}
 	switch {
 	case strings.TrimSpace(req.Domain) != "":
 		return "Requesting Guardian approval for " + strings.TrimSpace(req.Domain)
@@ -204,6 +203,10 @@ func publishGuardianApprovalKeepalive(ctx context.Context, req commandapproval.R
 	if pp == nil {
 		return
 	}
+	if req.IsResearchContinuation() {
+		pp.PublishState(events.AgentUIStateValidating, "Waiting for user decision on Academic research completion")
+		return
+	}
 	message := "Waiting for Guardian approval"
 	switch {
 	case strings.TrimSpace(req.Domain) != "":
@@ -217,6 +220,10 @@ func publishGuardianApprovalKeepalive(ctx context.Context, req commandapproval.R
 func publishGuardianApprovalResolvedProgress(ctx context.Context, req commandapproval.Request) {
 	pp := ProgressPublisherFromContext(ctx)
 	if pp == nil {
+		return
+	}
+	if req.IsResearchContinuation() {
+		pp.Publish("Academic research completion decision received")
 		return
 	}
 	message := "Guardian approval received"
@@ -240,7 +247,7 @@ func isCommandApprovalTerminalMessage(msg *guide.Message, correlationID string) 
 	return ok
 }
 
-func decodeCommandApprovalMessage(msg *guide.Message) (commandapproval.Evaluation, error) {
+func decodeCommandApprovalMessage(msg *guide.Message, req commandapproval.Request) (commandapproval.Evaluation, error) {
 	if msg == nil {
 		return commandapproval.Evaluation{}, fmt.Errorf("command approval response is missing")
 	}
@@ -248,7 +255,7 @@ func decodeCommandApprovalMessage(msg *guide.Message) (commandapproval.Evaluatio
 		if !resp.Success {
 			return commandapproval.Evaluation{}, fmt.Errorf("%s", strings.TrimSpace(resp.Error))
 		}
-		return decodeCommandApprovalEvaluation(resp.Data)
+		return decodeCommandApprovalEvaluation(resp.Data, req)
 	}
 	if errText, ok := msg.GetError(); ok {
 		return commandapproval.Evaluation{}, fmt.Errorf("%s", strings.TrimSpace(errText))
@@ -256,9 +263,9 @@ func decodeCommandApprovalMessage(msg *guide.Message) (commandapproval.Evaluatio
 	return commandapproval.Evaluation{}, fmt.Errorf("unsupported command approval response payload")
 }
 
-func decodeCommandApprovalEvaluation(data any) (commandapproval.Evaluation, error) {
+func decodeCommandApprovalEvaluation(data any, req commandapproval.Request) (commandapproval.Evaluation, error) {
 	if typed, ok := data.(commandapproval.Evaluation); ok {
-		if typed.Decision == commandapproval.DecisionDeny {
+		if commandApprovalEvaluationShouldError(req, typed) {
 			return typed, fmt.Errorf("%w: %s", commandapproval.ErrApprovalDenied, strings.TrimSpace(typed.Reason))
 		}
 		return typed, nil
@@ -271,8 +278,15 @@ func decodeCommandApprovalEvaluation(data any) (commandapproval.Evaluation, erro
 	if err := json.Unmarshal(raw, &eval); err != nil {
 		return commandapproval.Evaluation{}, fmt.Errorf("decode command approval response: %w", err)
 	}
-	if eval.Decision == commandapproval.DecisionDeny {
+	if commandApprovalEvaluationShouldError(req, eval) {
 		return eval, fmt.Errorf("%w: %s", commandapproval.ErrApprovalDenied, strings.TrimSpace(eval.Reason))
 	}
 	return eval, nil
+}
+
+func commandApprovalEvaluationShouldError(req commandapproval.Request, eval commandapproval.Evaluation) bool {
+	if eval.Decision != commandapproval.DecisionDeny {
+		return false
+	}
+	return !req.IsResearchContinuation()
 }

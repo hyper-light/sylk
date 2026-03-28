@@ -39,6 +39,9 @@ func (g *Guardian) evaluateCommandApproval(ctx context.Context, req *commandappr
 	if req == nil {
 		return commandapproval.Evaluation{}, fmt.Errorf("command approval request is required")
 	}
+	if req.IsResearchContinuation() {
+		return g.evaluateResearchContinuationApproval(ctx, req)
+	}
 	if commandapproval.IsFetchToolName(req.ToolName) {
 		return g.evaluateFetchApproval(ctx, req)
 	}
@@ -96,6 +99,7 @@ func (g *Guardian) evaluateCommandApproval(ctx context.Context, req *commandappr
 
 func (g *Guardian) commandApprovalProposal(req commandapproval.Request, analysis commandapproval.Analysis) *commandapproval.Proposal {
 	return &commandapproval.Proposal{
+		Kind:           req.Kind,
 		AgentID:        req.AgentID,
 		AgentType:      req.AgentType,
 		SessionID:      req.SessionID,
@@ -117,6 +121,61 @@ func (g *Guardian) commandApprovalProposal(req commandapproval.Request, analysis
 		Risk:           analysis.Risk,
 		Timestamp:      time.Now(),
 		ApprovalPolicy: analysis.ApprovalPolicy,
+	}
+}
+
+func (g *Guardian) evaluateResearchContinuationApproval(ctx context.Context, req *commandapproval.Request) (commandapproval.Evaluation, error) {
+	if req == nil {
+		return commandapproval.Evaluation{}, fmt.Errorf("research continuation request is required")
+	}
+	analysis := researchContinuationApprovalAnalysis(req)
+	g.publishActivityState(ctx, events.EventTypeAgentAction, "Validating research completion decision", events.AgentUIStateValidating)
+	result, err := g.requestCommandApproval(ctx, g.commandApprovalProposal(*req, analysis))
+	if err != nil {
+		return commandapproval.Evaluation{}, err
+	}
+	switch result.Decision {
+	case ApprovalContinueResearch:
+		g.publishActivityState(ctx, events.EventTypeSuccess, "Research continuation selected", events.AgentUIStateAllowed)
+		return commandapproval.Evaluation{
+			Decision:     commandapproval.DecisionAllow,
+			Source:       commandapproval.MatchSourceInteractive,
+			Reason:       firstNonEmptyApprovalReason(result.Reason, "user chose to continue research"),
+			UserDecision: string(result.Decision),
+			Analysis:     analysis,
+		}, nil
+	case ApprovalSynthesizeAsIs:
+		g.publishActivityState(ctx, events.EventTypeSuccess, "Synthesize-as-is selected", events.AgentUIStateAllowed)
+		return commandapproval.Evaluation{
+			Decision:     commandapproval.DecisionDeny,
+			Source:       commandapproval.MatchSourceInteractive,
+			Reason:       firstNonEmptyApprovalReason(result.Reason, "user chose to synthesize the current findings as-is"),
+			UserDecision: string(result.Decision),
+			Analysis:     analysis,
+		}, nil
+	default:
+		return commandapproval.Evaluation{}, fmt.Errorf("unsupported research continuation decision %q", strings.TrimSpace(string(result.Decision)))
+	}
+}
+
+func researchContinuationApprovalAnalysis(req *commandapproval.Request) commandapproval.Analysis {
+	topic := strings.TrimSpace(req.Command)
+	if topic == "" {
+		topic = "Academic research completion"
+	}
+	return commandapproval.Analysis{
+		RawCommand:     topic,
+		Normalized:     topic,
+		Program:        "research_completion",
+		Verb:           "decide",
+		TemplateKey:    "research_completion|author_research_paper",
+		ExactKey:       "research_completion:author_research_paper",
+		PersistKey:     "",
+		PersistLabel:   "",
+		RuleLabel:      "academic research completion",
+		Summary:        "Choose whether Academic should continue external research or synthesize the current findings as-is.",
+		Risk:           "Finalizing without grounded external sources can weaken the resulting research artifact.",
+		ApprovalPolicy: commandapproval.ApprovalPolicyExact,
 	}
 }
 

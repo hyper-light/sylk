@@ -601,15 +601,15 @@ func TestRenderEntry_InterAgentRowsRenderNestedConsultChildAgents(t *testing.T) 
 										Status:     InterAgentToolPending,
 										Children: []InterAgentChildActivity{
 											{
-												CorrelationID:   "child-librarian",
-												AgentType:       "librarian",
-												ThinkingStatus:  "Inspecting existing UI patterns.",
-												ThinkingText:    "⠋  0.2s",
-												ThinkingColor:   "#7dcfff",
-												ToolCalls:       nil,
-												ResultSummary:   "",
-												Completed:       false,
-												Failed:          false,
+												CorrelationID:     "child-librarian",
+												AgentType:         "librarian",
+												ThinkingStatus:    "Inspecting existing UI patterns.",
+												ThinkingText:      "⠋  0.2s",
+												ThinkingColor:     "#7dcfff",
+												ToolCalls:         nil,
+												ResultSummary:     "",
+												Completed:         false,
+												Failed:            false,
 												ToolCallsExpanded: false,
 											},
 										},
@@ -634,6 +634,124 @@ func TestRenderEntry_InterAgentRowsRenderNestedConsultChildAgents(t *testing.T) 
 	}
 	if !strings.Contains(joined, "Inspecting existing UI patterns.") {
 		t.Fatalf("expected nested render to contain librarian child progress: %q", joined)
+	}
+}
+
+func TestRenderEntry_InterAgentChildRowsKeepActiveTimerVisibleUnderLongSummary(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inter-agent-child-timer-visible",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_academic_approach",
+				ToolCallKey: "consult-1",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Compare UI pattern options",
+					Status:     InterAgentToolPending,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID:  "child-academic",
+							AgentType:      "academic",
+							ThinkingStatus: "Evaluating a very long description of the current research direction that would normally crowd out the timer on the same line.",
+							ThinkingText:   "⠋  12.3s",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 84, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "⠋  12.3s") {
+		t.Fatalf("expected child row to preserve the active timer on the right, got %q", joined)
+	}
+}
+
+func TestRenderEntry_InterAgentRowsRenderDeepNestedTreeWithoutDuplicateBranchMarkers(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inter-agent-deep-nested-tree",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_academic_approach",
+				ToolCallKey: "consult-academic-1",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Compare landing-page framework options",
+					Status:     InterAgentToolPending,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-academic",
+							AgentType:     "academic",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "consult",
+									ToolCallKey: "consult-librarian-1",
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolConsult,
+										AgentTypes: []string{"librarian"},
+										Summary:    "Collect grounded framework evidence",
+										Status:     InterAgentToolPending,
+										Children: []InterAgentChildActivity{
+											{
+												CorrelationID: "child-librarian",
+												AgentType:     "librarian",
+												ToolCalls: []ToolCallRecord{
+													{
+														ToolName:    "read_file",
+														ArgsSummary: "path=docs/framework-benchmarks.md",
+														StartedAt:   time.Now().Add(-250 * time.Millisecond),
+													},
+												},
+												ThinkingStatus: "Collecting benchmark notes.",
+											},
+										},
+									},
+									StartedAt: time.Now().Add(-350 * time.Millisecond),
+								},
+							},
+							ThinkingStatus: "Delegating evidence collection.",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 96, theme.DefaultDark(), nil)
+	academicLine := -1
+	librarianLine := -1
+	readFileLine := -1
+	for idx, line := range lines {
+		switch {
+		case strings.Contains(line, "academic"):
+			academicLine = idx
+		case strings.Contains(line, "librarian"):
+			librarianLine = idx
+		case strings.Contains(line, "read_file"):
+			readFileLine = idx
+		}
+	}
+	if academicLine < 0 || librarianLine < 0 || readFileLine < 0 {
+		t.Fatalf("expected academic, librarian, and read_file lines in deep nested render, got %q", strings.Join(lines, "\n"))
+	}
+	if !(academicLine < librarianLine && librarianLine < readFileLine) {
+		t.Fatalf("expected deep nested lines in academic -> librarian -> read_file order, got %q", strings.Join(lines, "\n"))
+	}
+	for _, idx := range []int{librarianLine, readFileLine} {
+		line := lines[idx]
+		branches := strings.Count(line, "└─") + strings.Count(line, "├─")
+		if branches != 1 {
+			t.Fatalf("expected exactly one branch marker on nested line %q, got %d", line, branches)
+		}
 	}
 }
 
@@ -1004,6 +1122,15 @@ func TestRenderEntry_NestedExpandedChildToolCallUsesCompactDetailRows(t *testing
 
 	lines, _ := RenderEntry(entry, 52, theme.DefaultDark(), nil)
 	joined := strings.Join(lines, "\n")
+	var argsLine, outputLine string
+	for _, line := range lines {
+		switch {
+		case strings.Contains(line, "args - path=README.md"):
+			argsLine = line
+		case strings.Contains(line, "output - ok=true"):
+			outputLine = line
+		}
+	}
 	if !strings.Contains(joined, "args - path=README.md") {
 		t.Fatalf("expected compact args detail row, got %q", joined)
 	}
@@ -1013,8 +1140,94 @@ func TestRenderEntry_NestedExpandedChildToolCallUsesCompactDetailRows(t *testing
 	if strings.Contains(joined, "\"content\":") || strings.Contains(joined, "\"updated_lines\":") {
 		t.Fatalf("expected nested child expanded tool call to avoid raw JSON blocks, got %q", joined)
 	}
+	if strings.Contains(joined, "│   args -") || strings.Contains(joined, "│   output -") {
+		t.Fatalf("expected nested child expanded detail rows to avoid extra inner branch stems, got %q", joined)
+	}
+	if argsLine == "" || strings.Count(argsLine, "│") < 1 {
+		t.Fatalf("expected args detail line to keep a continuation stem, got %q", argsLine)
+	}
+	if outputLine == "" || !strings.Contains(outputLine, "└─") {
+		t.Fatalf("expected final expanded detail line to terminate with a curved connector, got %q", outputLine)
+	}
 	if len(lines) > 8 {
 		t.Fatalf("expected nested child expanded tool call to stay compact, got %d lines: %q", len(lines), joined)
+	}
+}
+
+func TestRenderEntry_NestedExpandedChildToolCallDetailsUseContinuationAndTerminalConnectorsAtDepth(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "nested-child-tool-expanded-ancestor-branches",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName: "consult_research_support",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic", "archivalist"},
+					Summary:    "Compare evidence sources",
+					Status:     InterAgentToolPending,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-academic",
+							AgentType:     "academic",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "write_file",
+									ArgsSummary: "path=README.md",
+									FullArgs:    "{\n  \"path\": \"README.md\",\n  \"content\": \"line one\\nline two\\nline three\"\n}",
+									Output:      "{\n  \"ok\": true,\n  \"updated_lines\": 3,\n  \"path\": \"README.md\"\n}",
+									StartedAt:   time.Now().Add(-time.Second),
+									Duration:    time.Second,
+									Completed:   true,
+									Success:     true,
+									Expanded:    true,
+								},
+								{
+									ToolName:    "grep",
+									ArgsSummary: "\"comparison matrix\"",
+									StartedAt:   time.Now().Add(-500 * time.Millisecond),
+								},
+							},
+							ThinkingStatus: "Evaluating comparison structure.",
+						},
+						{
+							CorrelationID:  "child-archivalist",
+							AgentType:      "archivalist",
+							ThinkingStatus: "Checking archived notes.",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 72, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	var argsLine, outputLine string
+	for _, line := range lines {
+		switch {
+		case strings.Contains(line, "args - path=README.md"):
+			argsLine = line
+		case strings.Contains(line, "output - ok=true"):
+			outputLine = line
+		}
+	}
+	if argsLine == "" || outputLine == "" {
+		t.Fatalf("expected expanded child detail lines, got %q", joined)
+	}
+	if got := strings.Count(argsLine, "│"); got != 3 {
+		t.Fatalf("expected args detail to keep architect, academic, and write_file continuation stems, got %d in %q", got, argsLine)
+	}
+	if got := strings.Count(outputLine, "│"); got != 2 {
+		t.Fatalf("expected terminal output detail to keep only ancestor stems, got %d in %q", got, outputLine)
+	}
+	if !strings.Contains(outputLine, "└─") {
+		t.Fatalf("expected terminal output detail to use a curved connector, got %q", outputLine)
+	}
+	if !strings.Contains(joined, "grep") || !strings.Contains(joined, "archivalist") {
+		t.Fatalf("expected sibling tool row and sibling child branch to remain visible, got %q", joined)
 	}
 }
 
@@ -1093,8 +1306,8 @@ func TestRenderEntry_KeepsParentContentVisibleWhileInterAgentChallengePending(t 
 
 	lines, _ := RenderEntry(entry, 80, theme.DefaultDark(), nil)
 	joined := strings.Join(lines, "\n")
-	if !strings.Contains(joined, "This should stay hidden until the challenge completes.") {
-		t.Fatalf("expected parent content to remain visible while challenge is pending, got %q", joined)
+	if strings.Contains(joined, "This should stay hidden until the challenge completes.") {
+		t.Fatalf("expected parent content to stay hidden while challenge is pending, got %q", joined)
 	}
 	if !strings.Contains(joined, "Implement the accepted patch plan.") {
 		t.Fatalf("expected pending challenge row to remain visible, got %q", joined)
@@ -1136,8 +1349,8 @@ func TestRenderStreamingEntryFull_KeepsParentContentVisibleWhileInterAgentConsul
 
 	lines, _ := renderStreamingEntryFull(entry, 88, theme.DefaultDark(), nil, &streamRenderState{})
 	joined := strings.Join(lines, "\n")
-	if !strings.Contains(joined, "The final audit summary should wait for the consult result.") {
-		t.Fatalf("expected parent streaming content to remain visible while consult is pending, got %q", joined)
+	if strings.Contains(joined, "The final audit summary should wait for the consult result.") {
+		t.Fatalf("expected parent streaming content to stay hidden while consult is pending, got %q", joined)
 	}
 	if !strings.Contains(joined, "Compare current packaging guidance") {
 		t.Fatalf("expected consult row to remain visible, got %q", joined)
@@ -1154,6 +1367,153 @@ func TestRenderStreamingEntryFull_KeepsParentContentVisibleWhileInterAgentConsul
 	}
 }
 
+func TestRenderStreamingEntryFull_HidesParentContentWhileNestedChildPendingAfterApproval(t *testing.T) {
+	entry := &ChatEntry{
+		ID:             "architect-with-pending-academic-after-approval",
+		Timestamp:      time.Now(),
+		Source:         SourceAgent,
+		AgentType:      "architect",
+		Content:        "The architect should not speak yet.",
+		Streaming:      true,
+		ThinkingText:   deferredParentCompletionStatus,
+		ThinkingStatus: deferredParentCompletionStatus,
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:  "consult_academic_approach",
+				StartedAt: time.Now().Add(-400 * time.Millisecond),
+				Completed: true,
+				Success:   true,
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Fetch and analyze the official source.",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "corr-child-academic-after-approval",
+							AgentType:     "academic",
+							Completed:     false,
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:  "approval_guardian",
+									Completed: true,
+									Success:   true,
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolApproval,
+										AgentTypes: []string{"guardian"},
+										Summary:    "Requesting Guardian approval for raw.githubusercontent.com",
+										Status:     InterAgentToolDone,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lines, _ := renderStreamingEntryFull(entry, 88, theme.DefaultDark(), nil, &streamRenderState{})
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "The architect should not speak yet.") {
+		t.Fatalf("expected parent streaming content to stay hidden while academic child remains pending, got %q", joined)
+	}
+	if !strings.Contains(joined, "academic") || !strings.Contains(joined, "guardian") {
+		t.Fatalf("expected nested academic and guardian rows to remain visible, got %q", joined)
+	}
+	if !strings.Contains(joined, deferredParentCompletionStatus) {
+		t.Fatalf("expected deferred parent footer to remain visible, got %q", joined)
+	}
+
+	entry.ToolCalls[0].InterAgent.Children[0].Completed = true
+	lines, _ = renderStreamingEntryFull(entry, 88, theme.DefaultDark(), nil, &streamRenderState{})
+	joined = strings.Join(lines, "\n")
+	if !strings.Contains(joined, "The architect should not speak yet.") {
+		t.Fatalf("expected parent streaming content to appear after academic child completion, got %q", joined)
+	}
+}
+
+func TestRenderStreamingEntryFull_KeepsNestedConsultedAgentAndToolRowsVisibleWhileParentContentHidden(t *testing.T) {
+	entry := &ChatEntry{
+		ID:             "architect-with-nested-consulted-agent-tools",
+		Timestamp:      time.Now(),
+		Source:         SourceAgent,
+		AgentType:      "architect",
+		Content:        "The architect has draft text that must stay hidden until research settles.",
+		Streaming:      true,
+		ThinkingText:   deferredParentCompletionStatus,
+		ThinkingStatus: deferredParentCompletionStatus,
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:  "consult_academic_approach",
+				StartedAt: time.Now().Add(-400 * time.Millisecond),
+				Completed: true,
+				Success:   true,
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Establish the strongest evidence base.",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID:  "corr-child-academic-with-nested-consult",
+							AgentType:      "academic",
+							Completed:      false,
+							ThinkingStatus: "Reviewing the initial evidence frame.",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "consult",
+									ToolCallKey: "consult-lib-1",
+									StartedAt:   time.Now().Add(-250 * time.Millisecond),
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolConsult,
+										AgentTypes: []string{"librarian"},
+										Summary:    "Collect benchmark and methodology sources.",
+										Status:     InterAgentToolPending,
+										Children: []InterAgentChildActivity{
+											{
+												CorrelationID:  "corr-child-librarian-with-tool",
+												AgentType:      "librarian",
+												Completed:      false,
+												ThinkingStatus: "Collecting benchmark evidence.",
+												ToolCalls: []ToolCallRecord{
+													{
+														ToolName:    "web_search",
+														ArgsSummary: "framework benchmark methodology",
+														StartedAt:   time.Now().Add(-150 * time.Millisecond),
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lines, _ := renderStreamingEntryFull(entry, 100, theme.DefaultDark(), nil, &streamRenderState{})
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "The architect has draft text that must stay hidden until research settles.") {
+		t.Fatalf("expected parent streaming content to stay hidden while nested consult work is active, got %q", joined)
+	}
+	for _, needle := range []string{
+		"academic",
+		"librarian",
+		"Collect benchmark and methodology sources.",
+		"web_search",
+		"framework benchmark methodology",
+		deferredParentCompletionStatus,
+	} {
+		if !strings.Contains(joined, needle) {
+			t.Fatalf("expected streaming nested consult render to contain %q, got %q", needle, joined)
+		}
+	}
+}
+
 func containsAny(haystack string, needles ...string) bool {
 	for _, needle := range needles {
 		if strings.Contains(haystack, needle) {
@@ -1161,4 +1521,214 @@ func containsAny(haystack string, needles ...string) bool {
 		}
 	}
 	return false
+}
+
+func TestRenderEntry_InterAgentRowsRenderSiblingNestedConsultAgentsAsSiblings(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "academic-nested-consults-siblings",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_academic_approach",
+				ToolCallKey: "consult-academic-1",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Build evidence plan",
+					Status:     InterAgentToolPending,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID:  "child-academic",
+							AgentType:      "academic",
+							ThinkingStatus: "Evaluating evidence",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "consult",
+									ToolCallKey: "consult-librarian-1",
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolConsult,
+										AgentTypes: []string{"librarian"},
+										Summary:    "Collect framework benchmarks",
+										Status:     InterAgentToolPending,
+									},
+									StartedAt: time.Now().Add(-200 * time.Millisecond),
+								},
+								{
+									ToolName:    "consult",
+									ToolCallKey: "consult-archivalist-1",
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolConsult,
+										AgentTypes: []string{"archivalist"},
+										Summary:    "Look for historical comparisons",
+										Status:     InterAgentToolPending,
+									},
+									StartedAt: time.Now().Add(-100 * time.Millisecond),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 96, theme.DefaultDark(), nil)
+	var academicLine, librarianLine, archivalistLine string
+	for _, line := range lines {
+		stripped := stripANSITest(line)
+		switch {
+		case strings.Contains(stripped, "academic"):
+			academicLine = stripped
+		case strings.Contains(stripped, "librarian"):
+			librarianLine = stripped
+		case strings.Contains(stripped, "archivalist"):
+			archivalistLine = stripped
+		}
+	}
+	if academicLine == "" || librarianLine == "" || archivalistLine == "" {
+		t.Fatalf("expected academic, librarian, and archivalist rows, got %q", strings.Join(lines, "\n"))
+	}
+	if !strings.HasPrefix(strings.TrimLeft(academicLine, " "), "└─ academic") {
+		t.Fatalf("expected academic to remain the terminal child of architect, got %q", academicLine)
+	}
+	if !strings.HasPrefix(strings.TrimLeft(librarianLine, " "), "├─ librarian") {
+		t.Fatalf("expected librarian to render as a sibling row under academic, got %q", librarianLine)
+	}
+	if !strings.HasPrefix(strings.TrimLeft(archivalistLine, " "), "└─ archivalist") {
+		t.Fatalf("expected archivalist to render as the terminal sibling under academic, got %q", archivalistLine)
+	}
+}
+
+func TestRenderEntry_InterAgentRowsRenderSiblingNestedConsultAgentsWithOwnToolCalls(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "academic-nested-consults-sibling-toolcalls",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "consult_academic_approach",
+				ToolCallKey: "consult-academic-1",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Build evidence plan",
+					Status:     InterAgentToolPending,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID:  "child-academic",
+							AgentType:      "academic",
+							ThinkingStatus: "Evaluating evidence",
+							ToolCalls: []ToolCallRecord{
+								{
+									ToolName:    "consult",
+									ToolCallKey: "consult-librarian-1",
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolConsult,
+										AgentTypes: []string{"librarian"},
+										Summary:    "Collect framework benchmarks",
+										Status:     InterAgentToolPending,
+										Children: []InterAgentChildActivity{
+											{
+												CorrelationID: "child-librarian",
+												AgentType:     "librarian",
+												ToolCalls: []ToolCallRecord{
+													{
+														ToolName:    "web_search",
+														ArgsSummary: "framework benchmarks",
+														StartedAt:   time.Now().Add(-200 * time.Millisecond),
+													},
+												},
+											},
+										},
+									},
+									StartedAt: time.Now().Add(-300 * time.Millisecond),
+								},
+								{
+									ToolName:    "consult",
+									ToolCallKey: "consult-archivalist-1",
+									InterAgent: &InterAgentTool{
+										Kind:       InterAgentToolConsult,
+										AgentTypes: []string{"archivalist"},
+										Summary:    "Look for historical comparisons",
+										Status:     InterAgentToolPending,
+										Children: []InterAgentChildActivity{
+											{
+												CorrelationID: "child-archivalist",
+												AgentType:     "archivalist",
+												ToolCalls: []ToolCallRecord{
+													{
+														ToolName:    "search_archive",
+														ArgsSummary: "prior comparisons",
+														StartedAt:   time.Now().Add(-100 * time.Millisecond),
+													},
+												},
+											},
+										},
+									},
+									StartedAt: time.Now().Add(-150 * time.Millisecond),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 100, theme.DefaultDark(), nil)
+	var librarianLine, webSearchLine, archivalistLine, searchArchiveLine string
+	for _, line := range lines {
+		stripped := stripANSITest(line)
+		switch {
+		case strings.Contains(stripped, "librarian"):
+			librarianLine = stripped
+		case strings.Contains(stripped, "web_search"):
+			webSearchLine = stripped
+		case strings.Contains(stripped, "archivalist"):
+			archivalistLine = stripped
+		case strings.Contains(stripped, "search_archive"):
+			searchArchiveLine = stripped
+		}
+	}
+	if librarianLine == "" || webSearchLine == "" || archivalistLine == "" || searchArchiveLine == "" {
+		t.Fatalf("expected nested sibling consult rows and tool calls, got %q", strings.Join(lines, "\n"))
+	}
+	if !strings.HasPrefix(strings.TrimLeft(librarianLine, " "), "├─ librarian") {
+		t.Fatalf("expected librarian consult row to be a sibling under academic, got %q", librarianLine)
+	}
+	if !strings.HasPrefix(strings.TrimLeft(webSearchLine, " "), "│  └─ ") || !strings.Contains(webSearchLine, "web_search") {
+		t.Fatalf("expected librarian child tool call to keep the sibling stem, got %q", webSearchLine)
+	}
+	if !strings.HasPrefix(strings.TrimLeft(archivalistLine, " "), "└─ archivalist") {
+		t.Fatalf("expected archivalist consult row to terminate the sibling set, got %q", archivalistLine)
+	}
+	if !strings.HasPrefix(strings.TrimLeft(searchArchiveLine, " "), "└─ ") || !strings.Contains(searchArchiveLine, "search_archive") {
+		t.Fatalf("expected archivalist child tool call to terminate without a dangling sibling stem, got %q", searchArchiveLine)
+	}
+}
+
+func stripANSITest(s string) string {
+	var out strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == '\x1b' {
+			j := i + 1
+			if j < len(s) && s[j] == '[' {
+				j++
+				for j < len(s) && !isCSITerminator(s[j]) {
+					j++
+				}
+				if j < len(s) {
+					j++
+				}
+			}
+			i = j
+			continue
+		}
+		out.WriteByte(s[i])
+		i++
+	}
+	return out.String()
 }
