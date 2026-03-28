@@ -879,8 +879,11 @@ func TestToggleAtViewLine_ExpandsEarlierEventsOverflow(t *testing.T) {
 	if m.viewport.selectedRegion < 0 || m.viewport.selectedRegion >= len(regions) {
 		t.Fatalf("selected region = %d, want valid region", m.viewport.selectedRegion)
 	}
-	if regions[m.viewport.selectedRegion].kind != selectionRegionChildToolCall {
-		t.Fatalf("selected region kind = %v, want child tool call after overflow expansion", regions[m.viewport.selectedRegion].kind)
+	if regions[m.viewport.selectedRegion].kind != selectionRegionToolCallOverflow {
+		t.Fatalf("selected region kind = %v, want overflow control after overflow expansion", regions[m.viewport.selectedRegion].kind)
+	}
+	if got := len(findRenderedLines(t, m.View(), "hide")); got != 1 {
+		t.Fatalf("expected expanded child branch to keep a single hide control row, got %d", got)
 	}
 }
 
@@ -1037,8 +1040,8 @@ func TestToggleAtRenderedViewLine_TargetsEarlierEventsOverflowFromRenderedFrame(
 	m.viewDirty = true
 
 	liveTarget := m.viewport.ToggleTargetAtViewLine(overflowLine)
-	if liveTarget != nil && liveTarget.kind == toggleTargetOverflow {
-		t.Fatalf("expected live line %d to shift away from overflow target after mutation, got %+v", overflowLine, liveTarget)
+	if liveTarget == nil || liveTarget.kind != toggleTargetOverflow {
+		t.Fatalf("expected live line %d to remain on overflow control after mutation, got %+v", overflowLine, liveTarget)
 	}
 
 	if !m.ToggleAtRenderedViewLine(overflowLine) {
@@ -1121,8 +1124,11 @@ func TestToggleAtViewLine_ExpandsOnlyTargetedChildOverflow(t *testing.T) {
 	if children[1].ToolCallsExpanded {
 		t.Fatalf("expected second child overflow to remain collapsed, got %+v", children)
 	}
+	if got := len(findRenderedLines(t, m.View(), "hide")); got != 1 {
+		t.Fatalf("expected expanded first child to render one hide control row, got %d", got)
+	}
 	if got := len(findRenderedLines(t, m.View(), "earlier events")); got != 1 {
-		t.Fatalf("expected one remaining overflow row after expanding first child, got %d", got)
+		t.Fatalf("expected second child to keep one remaining earlier-events control row, got %d", got)
 	}
 }
 
@@ -2267,16 +2273,16 @@ func TestNestedChildConsultRowsRemainVisibleAfterChildStreamEmitsText(t *testing
 	m := New(theme.DefaultDark(), 16)
 	m.SetSize(100, 24)
 	m.PushEntry(&ChatEntry{
-		ID:            "architect-origin-child-consult-after-text",
-		Timestamp:     time.Now(),
-		CorrelationID: "corr-parent-child-consult-after-text",
-		Source:        SourceAgent,
-		AgentType:     "architect",
-		Content:       "Architect draft text should stay hidden while the consult runs.",
-		Streaming:     true,
-		ThinkingText:  deferredParentCompletionStatus,
+		ID:             "architect-origin-child-consult-after-text",
+		Timestamp:      time.Now(),
+		CorrelationID:  "corr-parent-child-consult-after-text",
+		Source:         SourceAgent,
+		AgentType:      "architect",
+		Content:        "Architect draft text should stay hidden while the consult runs.",
+		Streaming:      true,
+		ThinkingText:   deferredParentCompletionStatus,
 		ThinkingStatus: deferredParentCompletionStatus,
-		Height:        -1,
+		Height:         -1,
 		ToolCalls: []ToolCallRecord{
 			{
 				ToolName:    "consult_academic_approach",

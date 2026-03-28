@@ -114,21 +114,25 @@ func consultAcademicApproachSkill(gi *GlobalInspector) *skills.Skill {
 		StringParam("question", "Alternative-implementation or tradeoff question", true).
 		StringParam("current_approach", "Current implementation or plan approach being evaluated", false).
 		StringParam("context", "Optional surrounding context", false).
+		EnumParam("depth", "Research depth for the Academic consultation", agentShared.ResearchDepthEnumValues(), false).
 		ArrayParam("files", "Relevant files or packages", "string", false).
+		BestPractice("Use `minimal` or `quick` for a fast challenge to a local implementation choice, `standard` for normal audit-time tradeoff checking, `deep` when the audit hinges on stronger alternatives or deeper correctness/performance reasoning, and `comprehensive` when the review needs a reusable research-grade challenge to the overall approach.").
+		BestPractice("Do not escalate to `comprehensive` just because the code is large. Escalate when the risk, architectural reach, or decision cost is high enough that broader corroboration could change the verdict.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				Question        string   `json:"question"`
 				CurrentApproach string   `json:"current_approach"`
 				Context         string   `json:"context"`
+				Depth           string   `json:"depth"`
 				Files           []string `json:"files"`
 			}
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			content, err := gi.consultAgent(ctx, "academic", buildAcademicConsultationPrompt(params.Question, params.CurrentApproach, params.Context, params.Files), map[string]any{
+			content, err := gi.consultAgent(ctx, "academic", buildAcademicConsultationPrompt(params.Question, params.CurrentApproach, params.Context, params.Files), agentShared.ConsultationMetadataWithResearchDepth(map[string]any{
 				"consultation_kind": "academic_approach",
 				"files":             params.Files,
-			})
+			}, params.Depth))
 			if err != nil {
 				return nil, err
 			}

@@ -27,6 +27,7 @@ type consultInput struct {
 	Target    string `json:"target,omitempty"`
 	Query     string `json:"query"`
 	Scope     string `json:"scope,omitempty"`
+	Depth     string `json:"depth,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
 	PlanID    string `json:"plan_id,omitempty"`
 }
@@ -57,7 +58,14 @@ func consultSkill(a *Architect) *skills.Skill {
 					"message": fmt.Sprintf("agent %q is not registered; skip or choose a different target", p.Target),
 				}, nil
 			}
-			evidence, err := a.requestConsultation(ctx, p.Target, p.Query, p.Scope, p.SessionID)
+			evidence, err := a.requestConsultationWithMetadata(
+				ctx,
+				p.Target,
+				p.Query,
+				p.Scope,
+				p.SessionID,
+				shared.ConsultationMetadataWithResearchDepth(nil, p.Depth),
+			)
 			if err != nil {
 				return nil, err
 			}
@@ -138,7 +146,14 @@ func consultSkill(a *Architect) *skills.Skill {
 					"message": fmt.Sprintf("agent %q is not registered; skip or choose a different target", p.Target),
 				}, nil
 			}
-			evidence, err := a.requestConsultation(ctx, p.Target, p.Query, p.Scope, "")
+			evidence, err := a.requestConsultationWithMetadata(
+				ctx,
+				p.Target,
+				p.Query,
+				p.Scope,
+				"",
+				shared.ConsultationMetadataWithResearchDepth(nil, p.Depth),
+			)
 			if err != nil {
 				return map[string]any{
 					"target": p.Target,
@@ -175,12 +190,15 @@ func consultSkill(a *Architect) *skills.Skill {
 		}, false).
 		StringParam("query", "Question or topic to consult about", true).
 		StringParam("scope", "Scope to limit the search", false).
+		EnumParam("depth", "Research depth for Academic consultations", shared.ResearchDepthEnumValues(), false).
 		StringParam("session_id", "Session identifier", false).
 		StringParam("plan_id", "Plan identifier for protocol-driven consultation", false).
 		Usage("Use during conversation as new material information arrives, and again during planning to consolidate what you learned. Do not defer obvious codebase, historical, or Academic evidence gathering until formal plan creation. `consult(mode=pre_planning)` should synthesize and refresh the evidence already gathered during discussion, not begin from zero.").
 		BestPractice("On the first substantive turn for a new implementation, planning, or architecture problem, default to the full knowledge triad: Librarian + Archivalist + Academic, unless one source is clearly irrelevant or already fresh.").
 		BestPractice("During live discussion, consult the Librarian when codebase-fit or local-pattern questions emerge, the Archivalist when historical decisions or preferences matter, and the Academic when architecture quality, correctness, performance, testing, infrastructure, or tradeoffs materially affect the outcome.").
 		BestPractice("Do not wait for literal keywords like 'research' or 'benchmark' to consult the Academic. Use it whenever the conversation materially needs stronger alternatives, best practices, or external grounding.").
+		BestPractice("When consulting Academic, set depth intentionally: `minimal` for a fast plausibility check, `quick` for a narrow evidence-backed recommendation, `standard` for the default planning consult, `deep` for architectural decisions that need stronger corroboration, and `comprehensive` for high-stakes planning work or reusable research artifacts.").
+		BestPractice("Do not ask for `comprehensive` depth by default. Use it when the planning decision is materially expensive, irreversible, externally dependent, or likely to be reused as a formal research input.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params consultInput
 			if err := json.Unmarshal(input, &params); err != nil {

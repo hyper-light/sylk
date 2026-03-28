@@ -14,7 +14,6 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/storage"
 	"github.com/google/uuid"
@@ -25,8 +24,6 @@ const (
 	archivalistStorePaperAction = "store_research_paper"
 	defaultPaperVersion         = 1
 	maxAutoGroundPaperSources   = 3
-	researchDecisionContinue    = "continue_research"
-	researchDecisionAsIs        = "synthesize_as_is"
 )
 
 type authorResearchPaperParams struct {
@@ -49,11 +46,10 @@ type authorResearchPaperParams struct {
 }
 
 type researchPaperInputResolution struct {
-	result                  *ResearchResult
-	librarianEvidence       *shared.ConsultationEvidence
-	archivalEvidence        *shared.ConsultationEvidence
-	warning                 string
-	continueResearchMessage string
+	result            *ResearchResult
+	librarianEvidence *shared.ConsultationEvidence
+	archivalEvidence  *shared.ConsultationEvidence
+	warning           string
 }
 
 func authorResearchPaperSkill(a *Academic) *skills.Skill {
@@ -113,13 +109,6 @@ func (a *Academic) authorResearchPaper(ctx context.Context, params *authorResear
 	}
 	if resolution == nil {
 		return nil, fmt.Errorf("research paper input resolution is required")
-	}
-	if strings.TrimSpace(resolution.continueResearchMessage) != "" {
-		return map[string]any{
-			"continue_research": true,
-			"summary":           "Continue research before final paper synthesis.",
-			"user_message":      strings.TrimSpace(resolution.continueResearchMessage),
-		}, nil
 	}
 
 	paper, err := a.buildResearchPaper(
@@ -191,17 +180,8 @@ func (a *Academic) resolveResearchPaperInputs(
 		allowUngrounded := false
 		if academicMustSynthesizeCurrentRun(ctx) && !execState.hasGroundedSources() {
 			if err := a.autoGroundDiscoveredResearchPaperSources(ctx, params, execState); err != nil {
-				decisionMessage, synthesizeAsIs, decisionErr := a.resolveResearchPaperEvidenceGap(ctx, params, execState, err)
-				if decisionErr != nil {
-					return nil, fmt.Errorf(
-						"`author_research_paper` is terminal for this Academic consultation and must synthesize only from evidence already gathered in the current run: %w",
-						decisionErr,
-					)
-				}
-				if !synthesizeAsIs {
-					return &researchPaperInputResolution{
-						continueResearchMessage: decisionMessage,
-					}, nil
+				if errors.Is(err, skills.ErrDelegatedRequested) || errors.Is(err, skills.ErrRerouteRequested) {
+					return nil, err
 				}
 				allowUngrounded = true
 			}
@@ -318,124 +298,11 @@ func (a *Academic) autoGroundDiscoveredResearchPaperSources(
 	return fmt.Errorf("automatic grounding failed for discovered sources: %s", strings.Join(failures, "; "))
 }
 
-func (a *Academic) resolveResearchPaperEvidenceGap(
-	ctx context.Context,
-	params *authorResearchPaperParams,
-	execState *academicResearchExecutionState,
-	autoGroundErr error,
-) (string, bool, error) {
-	decision, err := a.requestResearchPaperContinuationDecision(ctx, params, execState, autoGroundErr)
-	if err != nil {
-		return "", false, err
-	}
-	switch decision {
-	case researchDecisionContinue:
-		message := academicResearchContinuationMessage(params)
-		if state := AcademicTurnStateFromContext(ctx); state != nil {
-			state.setRequiredReason(message)
-		}
-		if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
-			pp.Publish("User requested continued research with grounded external sources before final synthesis.")
-		}
-		return message, false, nil
-	case researchDecisionAsIs:
-		if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
-			pp.Publish("User requested research paper synthesis from the current gathered material.")
-		}
-		return "", true, nil
-	default:
-		return "", false, fmt.Errorf("unsupported research completion decision %q", strings.TrimSpace(decision))
-	}
-}
-
-func (a *Academic) requestResearchPaperContinuationDecision(
-	ctx context.Context,
-	params *authorResearchPaperParams,
-	execState *academicResearchExecutionState,
-	autoGroundErr error,
-) (string, error) {
-	if commandapproval.GateFromContext(ctx) == nil {
-		return "", fmt.Errorf("research completion approval flow is not configured")
-	}
-	req := commandapproval.Request{
-		Kind:          commandapproval.ApprovalKindResearchContinuation,
-		Command:       academicResearchContinuationPreview(params, execState, autoGroundErr),
-		ToolName:      "author_research_paper",
-		Justification: "Academic cannot complete the Architect research paper without more grounded external evidence.",
-	}
-	shared.PopulateCommandApprovalScope(ctx, &req)
-	eval, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), req)
-	if err != nil {
-		return "", err
-	}
-	if choice := strings.TrimSpace(eval.UserDecision); choice != "" {
-		return choice, nil
-	}
-	switch eval.Decision {
-	case commandapproval.DecisionAllow:
-		return researchDecisionContinue, nil
-	case commandapproval.DecisionDeny:
-		return researchDecisionAsIs, nil
-	default:
-		return "", fmt.Errorf("research completion decision was not resolved")
-	}
-}
-
-func academicResearchContinuationPreview(
-	params *authorResearchPaperParams,
-	execState *academicResearchExecutionState,
-	autoGroundErr error,
-) string {
-	lines := []string{
-		"Academic invoked `author_research_paper` before grounding external sources.",
-		"",
-		"Choose one:",
-		"- Continue research: require grounded external sources, keep researching, then retry `author_research_paper`.",
-		"- Output findings as-is: synthesize the current gathered material without grounded external sources.",
-	}
-	if topic := strings.TrimSpace(topicForResearchContinuation(params)); topic != "" {
-		lines = append([]string{"Topic: " + topic, ""}, lines...)
-	}
-	if execState != nil {
-		lines = append(lines,
-			"",
-			fmt.Sprintf("Grounded sources: %d", len(execState.sourceIDs())),
-			fmt.Sprintf("Discovered URLs pending grounding: %d", len(execState.candidateGroundingURLs(0))),
-		)
-		if consulted := execState.consultedAgents(); len(consulted) > 0 {
-			lines = append(lines, "Consulted agents: "+strings.Join(consulted, ", "))
-		}
-	}
-	if autoGroundErr != nil {
-		lines = append(lines, "", "Why synthesis is blocked now:", strings.TrimSpace(autoGroundErr.Error()))
-	}
-	return strings.TrimSpace(strings.Join(lines, "\n"))
-}
-
-func topicForResearchContinuation(params *authorResearchPaperParams) string {
-	if params == nil {
-		return ""
-	}
-	return firstNonEmpty(
-		strings.TrimSpace(params.Topic),
-		strings.TrimSpace(params.Title),
-		strings.TrimSpace(params.Context),
-	)
-}
-
-func academicResearchContinuationMessage(params *authorResearchPaperParams) string {
-	topic := topicForResearchContinuation(params)
-	if topic == "" {
-		topic = "the requested topic"
-	}
-	return "The user chose to continue research. Gather grounded external sources for " + topic + " before invoking `author_research_paper` again. Do not synthesize the final paper from ungrounded material on the next attempt."
-}
-
 func researchPaperWarningForUngroundedSynthesis(allowUngrounded bool) string {
 	if !allowUngrounded {
 		return ""
 	}
-	return "Synthesized the research paper from the current gathered material at user request without grounded external sources."
+	return "Synthesized the research paper from the current gathered material without grounded external sources."
 }
 
 func academicPaperGroundingReason(params *authorResearchPaperParams, rawURL string) string {

@@ -175,7 +175,7 @@ func TestRegisterAdaptiveRetrievalSkills_AllSkills(t *testing.T) {
 
 	registry := skills.NewRegistry()
 	deps := &AdaptiveRetrievalDependencies{
-		Universal:    &RetrievalDependencies{},
+		Universal:    &RetrievalDependencies{Forest: &mockForestService{}},
 		Librarian:    &LibrarianDependencies{},
 		Archivalist:  &ArchivalistDependencies{},
 		Academic:     &AcademicDependencies{},
@@ -241,7 +241,8 @@ func TestRegisterSkillsForAgent_Engineer(t *testing.T) {
 
 	registry := skills.NewRegistry()
 	deps := &AdaptiveRetrievalDependencies{
-		Universal: &RetrievalDependencies{},
+		Universal: &RetrievalDependencies{Forest: &mockForestService{}},
+		Pipeline:  &PipelineDependencies{},
 	}
 
 	err := RegisterSkillsForAgent(registry, "engineer", deps)
@@ -249,9 +250,127 @@ func TestRegisterSkillsForAgent_Engineer(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	// Engineer is not a knowledge agent, no universal skills
-	if registry.Get("retrieve_context") != nil {
-		t.Error("engineer should not have universal skills")
+	if registry.Get("retrieve_context") == nil {
+		t.Error("engineer should receive universal skills")
+	}
+	if registry.Get("engineer_forest_select_implementation_branch") == nil {
+		t.Error("engineer should receive role-specific forest skills")
+	}
+	if registry.Get("pipeline_get_implementation_context") == nil {
+		t.Error("engineer should receive pipeline skills")
+	}
+}
+
+func TestRegisterSkillsForAgent_Guardian(t *testing.T) {
+	t.Parallel()
+
+	registry := skills.NewRegistry()
+	deps := &AdaptiveRetrievalDependencies{
+		Universal: &RetrievalDependencies{Forest: &mockForestService{}},
+	}
+
+	err := RegisterSkillsForAgent(registry, "guardian", deps)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if registry.Get("forest_recall") == nil {
+		t.Error("guardian should receive forest recall skills")
+	}
+	if registry.Get("guardian_forest_evaluate_scope_risk") == nil {
+		t.Error("guardian should receive role-specific forest governance skills")
+	}
+}
+
+func TestRegisterSkillsForAgent_Scribe(t *testing.T) {
+	t.Parallel()
+
+	registry := skills.NewRegistry()
+	deps := &AdaptiveRetrievalDependencies{
+		Universal: &RetrievalDependencies{Forest: &mockForestService{}},
+	}
+
+	err := RegisterSkillsForAgent(registry, "scribe-engineer", deps)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if registry.Get("forest_predict_next_branches") == nil {
+		t.Error("scribe agents should receive universal forest skills")
+	}
+	if registry.Get("scribe_forest_get_capture_targets") == nil {
+		t.Error("scribe agents should receive scribe-specific forest skills")
+	}
+}
+
+func TestRegisterSkillsForAgent_Architect(t *testing.T) {
+	t.Parallel()
+
+	registry := skills.NewRegistry()
+	deps := &AdaptiveRetrievalDependencies{
+		Universal: &RetrievalDependencies{Forest: &mockForestService{}},
+	}
+
+	err := RegisterSkillsForAgent(registry, "architect", deps)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if registry.Get("forest_resolve_intent") == nil {
+		t.Error("architect should receive universal forest skills")
+	}
+	if registry.Get("architect_forest_get_plan_precedents") == nil {
+		t.Error("architect should receive architect-specific forest skills")
+	}
+}
+
+func TestRegisterSkillsForAgent_Inspector(t *testing.T) {
+	t.Parallel()
+
+	registry := skills.NewRegistry()
+	deps := &AdaptiveRetrievalDependencies{
+		Universal: &RetrievalDependencies{Forest: &mockForestService{}},
+		Pipeline:  &PipelineDependencies{},
+	}
+
+	err := RegisterSkillsForAgent(registry, "inspector", deps)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if registry.Get("forest_recall") == nil {
+		t.Error("inspector should receive universal forest skills")
+	}
+	if registry.Get("inspector_forest_get_validation_targets") == nil {
+		t.Error("inspector should receive inspector-specific forest skills")
+	}
+	if registry.Get("pipeline_get_inspection_findings") == nil {
+		t.Error("inspector should receive pipeline skills")
+	}
+}
+
+func TestRegisterSkillsForAgent_Tester(t *testing.T) {
+	t.Parallel()
+
+	registry := skills.NewRegistry()
+	deps := &AdaptiveRetrievalDependencies{
+		Universal: &RetrievalDependencies{Forest: &mockForestService{}},
+		Pipeline:  &PipelineDependencies{},
+	}
+
+	err := RegisterSkillsForAgent(registry, "tester", deps)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if registry.Get("forest_predict_next_branches") == nil {
+		t.Error("tester should receive universal forest skills")
+	}
+	if registry.Get("tester_forest_get_test_targets") == nil {
+		t.Error("tester should receive tester-specific forest skills")
+	}
+	if registry.Get("pipeline_get_test_results") == nil {
+		t.Error("tester should receive pipeline skills")
 	}
 }
 
@@ -288,12 +407,15 @@ func TestIsKnowledgeAgent(t *testing.T) {
 		{"librarian", true},
 		{"archivalist", true},
 		{"academic", true},
+		{"architect", true},
 		{"guide", true},
 		{"orchestrator", true},
-		{"engineer", false},
-		{"designer", false},
-		{"inspector", false},
-		{"tester", false},
+		{"engineer", true},
+		{"designer", true},
+		{"guardian", true},
+		{"inspector", true},
+		{"tester", true},
+		{"scribe-engineer", true},
 		{"unknown", false},
 	}
 
@@ -313,7 +435,19 @@ func TestIsKnowledgeAgent(t *testing.T) {
 func TestKnowledgeAgents(t *testing.T) {
 	t.Parallel()
 
-	expected := []string{"librarian", "archivalist", "academic", "guide", "orchestrator"}
+	expected := []string{
+		"librarian",
+		"archivalist",
+		"academic",
+		"architect",
+		"guide",
+		"orchestrator",
+		"engineer",
+		"designer",
+		"guardian",
+		"inspector",
+		"tester",
+	}
 	if len(KnowledgeAgents) != len(expected) {
 		t.Errorf("KnowledgeAgents length = %d, want %d",
 			len(KnowledgeAgents), len(expected))
@@ -408,10 +542,7 @@ func TestGetAllAdaptiveRetrievalSkillNames(t *testing.T) {
 
 	names := GetAllAdaptiveRetrievalSkillNames()
 
-	// Should have 21 skills total:
-	// 3 universal + 3 librarian + 3 archivalist + 3 academic +
-	// 3 guide + 3 orchestrator + 3 pipeline
-	expected := 21
+	expected := 25 + len(roleForestSkillNames())
 	if len(names) != expected {
 		t.Errorf("GetAllAdaptiveRetrievalSkillNames() returned %d names, want %d",
 			len(names), expected)
@@ -435,9 +566,11 @@ func TestIsAdaptiveRetrievalSkill(t *testing.T) {
 		expected bool
 	}{
 		{"retrieve_context", true},
+		{"forest_recall", true},
 		{"librarian_search_codebase", true},
 		{"archivalist_search_sessions", true},
 		{"academic_search_research", true},
+		{"architect_forest_get_plan_precedents", true},
 		{"guide_get_onboarding", true},
 		{"orchestrator_get_workflow_state", true},
 		{"pipeline_get_implementation_context", true},
@@ -466,29 +599,35 @@ func TestAgentTypeConstants(t *testing.T) {
 	t.Parallel()
 
 	expectedConstants := map[string]string{
-		"AgentTypeLibrarian":   "librarian",
-		"AgentTypeArchivalist": "archivalist",
-		"AgentTypeAcademic":    "academic",
-		"AgentTypeGuide":       "guide",
+		"AgentTypeLibrarian":    "librarian",
+		"AgentTypeArchivalist":  "archivalist",
+		"AgentTypeAcademic":     "academic",
+		"AgentTypeArchitect":    "architect",
+		"AgentTypeGuide":        "guide",
 		"AgentTypeOrchestrator": "orchestrator",
-		"AgentTypePipeline":    "pipeline",
-		"AgentTypeEngineer":    "engineer",
-		"AgentTypeDesigner":    "designer",
-		"AgentTypeInspector":   "inspector",
-		"AgentTypeTester":      "tester",
+		"AgentTypePipeline":     "pipeline",
+		"AgentTypeEngineer":     "engineer",
+		"AgentTypeDesigner":     "designer",
+		"AgentTypeGuardian":     "guardian",
+		"AgentTypeScribe":       "scribe",
+		"AgentTypeInspector":    "inspector",
+		"AgentTypeTester":       "tester",
 	}
 
 	actualValues := map[string]string{
-		"AgentTypeLibrarian":   AgentTypeLibrarian,
-		"AgentTypeArchivalist": AgentTypeArchivalist,
-		"AgentTypeAcademic":    AgentTypeAcademic,
-		"AgentTypeGuide":       AgentTypeGuide,
+		"AgentTypeLibrarian":    AgentTypeLibrarian,
+		"AgentTypeArchivalist":  AgentTypeArchivalist,
+		"AgentTypeAcademic":     AgentTypeAcademic,
+		"AgentTypeArchitect":    AgentTypeArchitect,
+		"AgentTypeGuide":        AgentTypeGuide,
 		"AgentTypeOrchestrator": AgentTypeOrchestrator,
-		"AgentTypePipeline":    AgentTypePipeline,
-		"AgentTypeEngineer":    AgentTypeEngineer,
-		"AgentTypeDesigner":    AgentTypeDesigner,
-		"AgentTypeInspector":   AgentTypeInspector,
-		"AgentTypeTester":      AgentTypeTester,
+		"AgentTypePipeline":     AgentTypePipeline,
+		"AgentTypeEngineer":     AgentTypeEngineer,
+		"AgentTypeDesigner":     AgentTypeDesigner,
+		"AgentTypeGuardian":     AgentTypeGuardian,
+		"AgentTypeScribe":       AgentTypeScribe,
+		"AgentTypeInspector":    AgentTypeInspector,
+		"AgentTypeTester":       AgentTypeTester,
 	}
 
 	for name, expected := range expectedConstants {

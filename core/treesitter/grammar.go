@@ -16,7 +16,7 @@ import (
 
 	"github.com/ebitengine/purego"
 
-	sitter "github.com/adalundhe/sylk/third_party/go_tree_sitter"
+	sitter "github.com/tree-sitter/go-tree-sitter"
 )
 
 var validGrammarName = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)

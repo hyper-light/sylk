@@ -238,6 +238,17 @@ func (a *Architect) requestConsultation(
 	scope string,
 	sessionID string,
 ) (*ConsultationEvidence, error) {
+	return a.requestConsultationWithMetadata(ctx, target, query, scope, sessionID, nil)
+}
+
+func (a *Architect) requestConsultationWithMetadata(
+	ctx context.Context,
+	target string,
+	query string,
+	scope string,
+	sessionID string,
+	metadata map[string]any,
+) (*ConsultationEvidence, error) {
 	a.logInfo("requestConsultation: entry",
 		"target", target,
 		"query", truncateString(query, 120),
@@ -259,7 +270,9 @@ func (a *Architect) requestConsultation(
 		Input:         query,
 		TargetAgentID: target,
 		SessionID:     sessionID,
+		Metadata:      shared.CloneMetadataMap(metadata),
 	}
+	researchDepth := shared.ConsultationResearchDepth(req.Metadata)
 	branchCtx, branch := shared.BeginInterAgentBranch(ctx, shared.InterAgentBranchSpec{
 		Kind:       shared.InterAgentToolEventKindConsult,
 		ToolName:   "consult_" + strings.ReplaceAll(strings.TrimSpace(target), "-", "_"),
@@ -269,6 +282,7 @@ func (a *Architect) requestConsultation(
 			"target": target,
 			"query":  query,
 			"scope":  scope,
+			"depth":  string(researchDepth),
 		},
 	})
 	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)

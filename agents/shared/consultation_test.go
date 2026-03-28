@@ -36,6 +36,32 @@ func TestConsultationInactivityTimeout_AcademicUsesResearchBudget(t *testing.T) 
 	}
 }
 
+func TestConsultationMetadataWithResearchDepth(t *testing.T) {
+	base := map[string]any{"existing": "value"}
+	metadata := ConsultationMetadataWithResearchDepth(base, " deep ")
+	if got := metadata["existing"]; got != "value" {
+		t.Fatalf("existing metadata = %#v, want value", got)
+	}
+	if got := metadata[ConsultationMetadataResearchDepthKey]; got != "deep" {
+		t.Fatalf("research_depth = %#v, want deep", got)
+	}
+	if _, ok := base[ConsultationMetadataResearchDepthKey]; ok {
+		t.Fatalf("base metadata mutated: %#v", base)
+	}
+	if got := ConsultationResearchDepth(metadata); got != ResearchDepthDeep {
+		t.Fatalf("ConsultationResearchDepth() = %q, want %q", got, ResearchDepthDeep)
+	}
+}
+
+func TestEffectiveResearchDepthDefaultsToStandard(t *testing.T) {
+	if got := EffectiveResearchDepth(""); got != ResearchDepthStandard {
+		t.Fatalf("EffectiveResearchDepth(\"\") = %q, want %q", got, ResearchDepthStandard)
+	}
+	if got := EffectiveResearchDepth("unknown"); got != ResearchDepthStandard {
+		t.Fatalf("EffectiveResearchDepth(\"unknown\") = %q, want %q", got, ResearchDepthStandard)
+	}
+}
+
 // --- ConsultationEvidence JSON roundtrip ---
 
 func TestConsultationEvidence_JSONRoundtrip(t *testing.T) {

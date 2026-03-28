@@ -36,7 +36,6 @@ go.work.sum
 
 lib/
 k8s_bench
-third_party/
 # Sylk knowledge graph data (user data, not source)
 .sylk/**/*
 .sylk

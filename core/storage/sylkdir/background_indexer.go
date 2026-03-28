@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/search"
 )
 
@@ -56,6 +57,19 @@ func NewBackgroundIndexer(
 	supersededIDs []string,
 	onComplete func() error,
 ) *BackgroundIndexer {
+	return NewBackgroundIndexerWithScope(nil, store, docs, supersededIDs, onComplete)
+}
+
+// NewBackgroundIndexerWithScope creates an indexer whose worker is tracked by
+// the provided GoroutineScope when available. This lets callers tie background
+// indexing to a broader lifecycle, such as TUI shutdown.
+func NewBackgroundIndexerWithScope(
+	scope *concurrency.GoroutineScope,
+	store *GlobalVersionBleveStore,
+	docs []*VersionDocument,
+	supersededIDs []string,
+	onComplete func() error,
+) *BackgroundIndexer {
 	docMap := make(map[string]*VersionDocument, len(docs))
 	docIDs := make([]string, 0, len(docs))
 	for _, d := range docs {
@@ -77,23 +91,36 @@ func NewBackgroundIndexer(
 	}
 
 	bi.wg.Add(1)
-	go bi.worker()
+	if scope != nil {
+		if err := scope.Go("knowledge-background-indexer", 0, bi.scopedWorker); err == nil {
+			return bi
+		}
+	}
+	go bi.worker(nil)
 
 	return bi
+}
+
+func (bi *BackgroundIndexer) scopedWorker(ctx context.Context) error {
+	bi.worker(ctx)
+	return nil
 }
 
 // worker is the single background goroutine. It deletes superseded docs,
 // then indexes all docs in ceil(total/NumCPU) batches. Each batch is
 // immediately searchable after Scorch commits it.
-func (bi *BackgroundIndexer) worker() {
+func (bi *BackgroundIndexer) worker(scopeCtx context.Context) {
 	defer bi.wg.Done()
 	defer close(bi.ready)
+
+	ctx, stop := bi.runContext(scopeCtx)
+	defer stop()
 
 	if bi.store == nil {
 		return
 	}
 
-	bi.deleteSuperseded()
+	bi.deleteSuperseded(ctx)
 
 	if len(bi.docIDs) == 0 {
 		bi.invokeOnComplete()
@@ -102,24 +129,39 @@ func (bi *BackgroundIndexer) worker() {
 
 	batchSize := max(1, (len(bi.docIDs)+runtime.NumCPU()-1)/runtime.NumCPU())
 	for start := 0; start < len(bi.docIDs); start += batchSize {
-		if bi.ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return
 		}
 		end := min(start+batchSize, len(bi.docIDs))
-		bi.indexBatch(bi.docIDs[start:end])
+		bi.indexBatch(ctx, bi.docIDs[start:end])
 	}
 
 	bi.invokeOnComplete()
 }
 
+func (bi *BackgroundIndexer) runContext(scopeCtx context.Context) (context.Context, func()) {
+	if scopeCtx == nil {
+		return bi.ctx, func() {}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopScope := context.AfterFunc(scopeCtx, cancel)
+	stopLocal := context.AfterFunc(bi.ctx, cancel)
+	return ctx, func() {
+		stopScope()
+		stopLocal()
+		cancel()
+	}
+}
+
 // indexBatch claims and indexes a slice of doc IDs. Docs already claimed
 // by PromoteDocs are skipped (deduplication via sync.Map LoadOrStore).
-func (bi *BackgroundIndexer) indexBatch(ids []string) {
-	toIndex := bi.claimDocs(bi.ctx, ids)
+func (bi *BackgroundIndexer) indexBatch(ctx context.Context, ids []string) {
+	toIndex := bi.claimDocs(ctx, ids)
 	if len(toIndex) == 0 {
 		return
 	}
-	if err := bi.store.IndexBatch(bi.ctx, toIndex); err != nil {
+	if err := bi.store.IndexBatch(ctx, toIndex); err != nil {
 		bi.logBgIndex(agentlog.EventBgIndexBatch, "warn", &agentlog.BgIndexPayload{
 			Phase: "batch_error",
 		})
@@ -150,7 +192,7 @@ func (bi *BackgroundIndexer) claimDocs(ctx context.Context, ids []string) []*sea
 }
 
 // deleteSuperseded removes superseded doc IDs from the global Bleve.
-func (bi *BackgroundIndexer) deleteSuperseded() {
+func (bi *BackgroundIndexer) deleteSuperseded(ctx context.Context) {
 	if len(bi.supersededIDs) == 0 {
 		return
 	}
@@ -163,10 +205,10 @@ func (bi *BackgroundIndexer) deleteSuperseded() {
 		return
 	}
 	for _, id := range bi.supersededIDs {
-		if bi.ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return
 		}
-		_ = mgr.Delete(context.Background(), id)
+		_ = mgr.Delete(ctx, id)
 	}
 }
 

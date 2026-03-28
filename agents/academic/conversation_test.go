@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -102,6 +103,35 @@ func TestAcademicProcessForwardedRequest_AgentConsultUsesConsultationMode(t *tes
 	}
 }
 
+func TestAcademicProcessForwardedRequest_AgentConsultQuickDepthAdjustsPromptAndRuntime(t *testing.T) {
+	provider := &conversationModeProvider{}
+	a, err := New(Config{ID: "academic"}, provider)
+	if err != nil {
+		t.Fatalf("new academic: %v", err)
+	}
+
+	_, err = a.processForwardedRequest(context.Background(), &guide.ForwardedRequest{
+		SourceAgentID: "engineer",
+		Intent:        guide.IntentRecall,
+		Input:         "Research Python packaging guidance.",
+		Metadata: map[string]any{
+			shared.ConsultationMetadataResearchDepthKey: "quick",
+		},
+	})
+	if err != nil {
+		t.Fatalf("processForwardedRequest: %v", err)
+	}
+	if provider.lastReq == nil {
+		t.Fatal("expected provider request to be captured")
+	}
+	if !strings.Contains(provider.lastReq.SystemPrompt, "Research depth: quick.") {
+		t.Fatalf("consultation system prompt missing quick-depth guidance:\n%s", provider.lastReq.SystemPrompt)
+	}
+	if got := provider.lastReq.Metadata["llm_deliberation"]; got != "low" {
+		t.Fatalf("Metadata[llm_deliberation] = %#v, want low", got)
+	}
+}
+
 func TestAcademicProcessForwardedRequest_ArchitectConsultExposesResearchPaperTool(t *testing.T) {
 	provider := &conversationModeProvider{}
 	a, err := New(Config{ID: "academic"}, provider)
@@ -116,7 +146,7 @@ func TestAcademicProcessForwardedRequest_ArchitectConsultExposesResearchPaperToo
 	}
 	toolSurface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
 	req := &providers.Request{
-		SystemPrompt: buildAcademicConsultationSystemPrompt(a.config.SystemPrompt, fwd),
+		SystemPrompt: buildAcademicConsultationSystemPrompt(a.config.SystemPrompt, fwd, shared.ResearchDepthUnset),
 		Tools:        a.buildToolDefinitionsWithSurface(toolSurface),
 	}
 
@@ -161,7 +191,7 @@ func TestAcademicProcessForwardedRequest_CustomArchitectIDExposesResearchPaperTo
 	}
 	toolSurface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
 	req := &providers.Request{
-		SystemPrompt: buildAcademicConsultationSystemPrompt(a.config.SystemPrompt, fwd),
+		SystemPrompt: buildAcademicConsultationSystemPrompt(a.config.SystemPrompt, fwd, shared.ResearchDepthUnset),
 		Tools:        a.buildToolDefinitionsWithSurface(toolSurface),
 	}
 

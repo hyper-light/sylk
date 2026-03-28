@@ -23,6 +23,7 @@ func (l *Librarian) registerCoreSkills() {
 		l.skills.Register(findPatternSkill(l))
 		l.skills.Register(locateSymbolSkill(l))
 	}
+	l.skills.Register(consultSkill(l))
 	l.skills.Register(assessHealthSkill(l))
 	l.skills.Register(queryStructureSkill(l))
 	l.skills.Register(repoBriefSkill(l))

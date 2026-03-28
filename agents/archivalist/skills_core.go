@@ -44,6 +44,7 @@ func (a *Archivalist) registerCoreSkills() {
 	a.skills.Register(getConflictsToolSkill(a))
 	a.skills.Register(routeToSkill(a))
 	a.skills.Register(replyToSkill(a))
+	a.skills.Register(consultSkill(a))
 	a.skills.Register(shared.NewSelfDiagnosticSkill(&archivalistDiag{a: a}))
 	if a.logIngest != nil {
 		a.skills.Register(queryAgentLogsSkill(a.logIngest))

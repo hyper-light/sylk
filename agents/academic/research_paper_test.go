@@ -2,6 +2,7 @@ package academic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,9 +13,9 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/fetch"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/skills"
 )
 
 type countingAcademicProvider struct {
@@ -24,20 +25,6 @@ type countingAcademicProvider struct {
 func (p *countingAcademicProvider) Complete(_ context.Context, _ *providers.Request) (*providers.Response, error) {
 	p.calls++
 	return nil, fmt.Errorf("provider should not be called")
-}
-
-type staticResearchDecisionGate struct {
-	eval     commandapproval.Evaluation
-	err      error
-	requests []commandapproval.Request
-}
-
-func (g *staticResearchDecisionGate) Authorize(_ context.Context, req commandapproval.Request) (commandapproval.Evaluation, error) {
-	g.requests = append(g.requests, req)
-	if g.err != nil {
-		return commandapproval.Evaluation{}, g.err
-	}
-	return g.eval, nil
 }
 
 func TestBuildResearchPaperAndArtifact(t *testing.T) {
@@ -283,48 +270,6 @@ func TestAuthorResearchPaper_UsesExecuteResearchStateWithoutRerunningResearch(t 
 	}
 }
 
-func TestResolveResearchPaperInputs_TerminalConsultationRequestsContinueResearchWhenNoGroundedSources(t *testing.T) {
-	provider := &countingAcademicProvider{}
-	a, err := New(Config{SessionID: "sess-terminal-paper"}, provider)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() { _ = a.Close() })
-
-	gate := &staticResearchDecisionGate{
-		eval: commandapproval.Evaluation{
-			Decision:     commandapproval.DecisionAllow,
-			UserDecision: researchDecisionContinue,
-		},
-	}
-	ctx := commandapproval.WithGate(context.Background(), gate)
-	ctx = WithAcademicTurnState(ctx, newAcademicTurnState(
-		academicTurnActionResearchPaper,
-		"Architect consultation must end at paper authoring.",
-	))
-	ctx = WithAcademicResearchExecutionState(ctx, newAcademicResearchExecutionState("sess-terminal-paper"))
-
-	resolution, err := a.resolveResearchPaperInputs(ctx, &authorResearchPaperParams{
-		Topic:   "oauth token validation",
-		Context: "Architect needs a planning-ready recommendation.",
-	}, "sess-terminal-paper")
-	if err != nil {
-		t.Fatalf("resolveResearchPaperInputs() error = %v", err)
-	}
-	if resolution == nil || strings.TrimSpace(resolution.continueResearchMessage) == "" {
-		t.Fatalf("expected continue-research resolution, got %#v", resolution)
-	}
-	if provider.calls != 0 {
-		t.Fatalf("provider calls = %d, want 0", provider.calls)
-	}
-	if len(gate.requests) != 1 {
-		t.Fatalf("approval requests = %d, want 1", len(gate.requests))
-	}
-	if !gate.requests[0].IsResearchContinuation() {
-		t.Fatalf("approval kind = %q, want research continuation", gate.requests[0].Kind)
-	}
-}
-
 func TestResolveResearchPaperInputs_TerminalConsultationAutoGroundsDiscoveredURLs(t *testing.T) {
 	provider := &countingAcademicProvider{}
 	a, err := New(Config{SessionID: "sess-terminal-paper"}, provider)
@@ -518,7 +463,7 @@ func TestResolveResearchPaperInputs_TerminalConsultationAutoGroundsProviderSearc
 	}
 }
 
-func TestResolveResearchPaperInputs_TerminalConsultationSynthesizesAsIsAtUserRequest(t *testing.T) {
+func TestResolveResearchPaperInputs_TerminalConsultationApprovalDeniedAutoGroundReturnsDelegatedError(t *testing.T) {
 	provider := &countingAcademicProvider{}
 	a, err := New(Config{SessionID: "sess-terminal-paper"}, provider)
 	if err != nil {
@@ -526,14 +471,57 @@ func TestResolveResearchPaperInputs_TerminalConsultationSynthesizesAsIsAtUserReq
 	}
 	t.Cleanup(func() { _ = a.Close() })
 
-	gate := &staticResearchDecisionGate{
-		eval: commandapproval.Evaluation{
-			Decision:     commandapproval.DecisionDeny,
-			UserDecision: researchDecisionAsIs,
+	policyCfg := fetch.DefaultPolicyConfig()
+	policyCfg.RequireTLS = false
+	pipeline := fetch.NewPipeline(fetch.PipelineConfig{
+		Policy: fetch.NewFetchPolicy(policyCfg),
+		Consent: fetch.NewConsentGate(fetch.ConsentGateConfig{
+			Callback: func(context.Context, *fetch.FetchProposal) (*fetch.ConsentResult, error) {
+				return &fetch.ConsentResult{Granted: false, Reason: "not now"}, nil
+			},
+		}),
+	})
+	a.SetFetchPipeline(pipeline)
+
+	execState := newAcademicResearchExecutionState("sess-terminal-paper")
+	execState.observeProviderResponse(context.Background(), a, &providers.Response{
+		ProviderMetadata: map[string]any{
+			providers.ProviderMetadataNativeWebSearchResultsKey: []providers.NativeWebSearchResult{
+				{
+					Provider: "anthropic",
+					Source:   "search_result",
+					Query:    "oauth token validation boundary",
+					URL:      "http://docs.safe.test/oauth",
+					Title:    "OAuth deployment guidance",
+				},
+			},
 		},
+	})
+	ctx := WithAcademicTurnState(context.Background(), newAcademicTurnState(
+		academicTurnActionResearchPaper,
+		"Architect consultation must end at paper authoring.",
+	))
+	ctx = WithAcademicResearchExecutionState(ctx, execState)
+
+	_, err = a.resolveResearchPaperInputs(ctx, &authorResearchPaperParams{
+		Topic:           "oauth token validation",
+		Context:         "Architect needs a planning-ready recommendation.",
+		ResearchSummary: "Centralize token validation behind one boundary.",
+	}, "sess-terminal-paper")
+	if !errors.Is(err, skills.ErrDelegatedRequested) {
+		t.Fatalf("resolveResearchPaperInputs() error = %v, want delegated fetch approval error", err)
 	}
-	ctx := commandapproval.WithGate(context.Background(), gate)
-	ctx = WithAcademicTurnState(ctx, newAcademicTurnState(
+}
+
+func TestResolveResearchPaperInputs_TerminalConsultationSynthesizesAsIsWhenAutoGroundFails(t *testing.T) {
+	provider := &countingAcademicProvider{}
+	a, err := New(Config{SessionID: "sess-terminal-paper"}, provider)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+
+	ctx := WithAcademicTurnState(context.Background(), newAcademicTurnState(
 		academicTurnActionResearchPaper,
 		"Architect consultation must end at paper authoring.",
 	))

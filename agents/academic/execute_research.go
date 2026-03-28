@@ -786,7 +786,7 @@ func (s *academicResearchExecutionState) finalizationBlock() (string, map[string
 		}
 		reasons = append(reasons, reason)
 	}
-	if s.repeatedSearch != nil && s.repeatedSearch.RepeatedWithoutGround {
+	if s.repeatedSearch != nil && s.repeatedSearch.RepeatedWithoutGround && groundedCount <= s.repeatedSearch.GroundedSourceCount {
 		fields["repeated_search_query"] = s.repeatedSearch.Query
 		fields["repeated_search_count"] = s.repeatedSearch.Count
 		reasons = append(reasons, fmt.Sprintf("Stop repeating the same search path for %q without grounding a source. Ground one promising result before searching again.", strings.TrimSpace(s.repeatedSearch.Query)))

@@ -204,7 +204,7 @@ func researchTopicSkill(a *Academic) *skills.Skill {
 		Priority(100).
 		StringParam("topic", "The technical topic to research", true).
 		StringParam("context", "Additional context for the research", false).
-		EnumParam("depth", "Research depth level", []string{"quick", "standard", "comprehensive"}, false).
+		EnumParam("depth", "Research depth level", shared.ResearchDepthEnumValues(), false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params researchTopicParams
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -214,6 +214,7 @@ func researchTopicSkill(a *Academic) *skills.Skill {
 			query := &ResearchQuery{
 				Query:  params.Topic,
 				Intent: IntentRecall,
+				Depth:  params.Depth,
 			}
 
 			if params.Context != "" {

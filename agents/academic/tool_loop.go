@@ -165,7 +165,7 @@ func (a *Academic) executeToolLoop(
 	ledger *steering.SteeringLedger,
 	surface toolruntime.Surface,
 ) (string, error) {
-	maxRuns := a.config.MaxToolRuns
+	maxRuns := academicMaxToolRunsForContext(ctx, a.config.MaxToolRuns)
 	consecutiveErrors := 0
 	autoFetchAttempts := make(map[string]struct{})
 	seen := make(map[shared.ToolCallSignature]int, maxRuns)
@@ -466,7 +466,7 @@ func (a *Academic) applyToolCalls(
 				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError && !isDelegated})
 		}
 		if !isError && call.Name == "author_research_paper" {
-			if state := AcademicTurnStateFromContext(ctx); state != nil && !academicToolCallRequestsContinueResearch(call.Name, result) {
+			if state := AcademicTurnStateFromContext(ctx); state != nil {
 				action := academicTurnActionType(call.Name)
 				if err := state.setTerminalAction(action); err != nil {
 					isError = true
@@ -492,9 +492,6 @@ func (a *Academic) applyToolCalls(
 				execState.observeToolResult(ctx, a, call, result, isError)
 			}
 		}
-		if academicToolCallRequestsContinueResearch(call.Name, result) {
-			break
-		}
 		if academicShouldTerminateAfterToolCall(ctx, call.Name, result) {
 			outcome.terminal = true
 			if isError {
@@ -516,12 +513,9 @@ func (a *Academic) applyToolCalls(
 	return outcome
 }
 
-func academicShouldTerminateAfterToolCall(ctx context.Context, toolName string, result string) bool {
+func academicShouldTerminateAfterToolCall(ctx context.Context, toolName string, _ string) bool {
 	state := AcademicTurnStateFromContext(ctx)
 	if state == nil {
-		return false
-	}
-	if academicToolCallRequestsContinueResearch(toolName, result) {
 		return false
 	}
 	requiredAction, _ := state.RequiredAction()
@@ -529,18 +523,6 @@ func academicShouldTerminateAfterToolCall(ctx context.Context, toolName string, 
 		return false
 	}
 	return strings.TrimSpace(toolName) == string(requiredAction)
-}
-
-func academicToolCallRequestsContinueResearch(toolName string, result string) bool {
-	if strings.TrimSpace(toolName) != "author_research_paper" {
-		return false
-	}
-	payload := parseResearchJSONPayload(result)
-	if len(payload) == 0 {
-		return false
-	}
-	continueResearch, _ := payload["continue_research"].(bool)
-	return continueResearch
 }
 
 func academicTerminalToolError(toolName string, execErr error, payload string) error {

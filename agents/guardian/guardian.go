@@ -849,22 +849,6 @@ func formatGuardianDirectSkillOutput(data any) string {
 }
 
 func formatGuardianApprovalEvaluation(eval commandapproval.Evaluation) string {
-	if guardianApprovalAnalysisIsResearchContinuation(eval.Analysis) {
-		switch strings.TrimSpace(strings.ToLower(eval.UserDecision)) {
-		case string(ApprovalContinueResearch):
-			return "Continuing research"
-		case string(ApprovalSynthesizeAsIs):
-			return "Synthesizing findings as-is"
-		}
-		switch eval.Decision {
-		case commandapproval.DecisionAllow:
-			return "Continuing research"
-		case commandapproval.DecisionDeny:
-			return "Synthesizing findings as-is"
-		default:
-			return "Validating research completion decision"
-		}
-	}
 	prefix := "Command approval"
 	if strings.EqualFold(strings.TrimSpace(eval.Analysis.Program), "fetch") ||
 		strings.HasPrefix(strings.TrimSpace(eval.Analysis.TemplateKey), "fetch|") {
@@ -891,16 +875,6 @@ func formatGuardianDirectSkillOutputMap(payload map[string]any) string {
 	decision, _ := payload["decision"].(string)
 	decision = strings.TrimSpace(strings.ToLower(decision))
 	if decision != "" {
-		if analysis, _ := payload["analysis"].(map[string]any); guardianApprovalAnalysisMapIsResearchContinuation(analysis) {
-			switch decision {
-			case string(ApprovalContinueResearch), string(commandapproval.DecisionAllow):
-				return "Continuing research"
-			case string(ApprovalSynthesizeAsIs), string(commandapproval.DecisionDeny):
-				return "Synthesizing findings as-is"
-			default:
-				return "Validating research completion decision"
-			}
-		}
 		prefix := "Command approval"
 		if analysis, _ := payload["analysis"].(map[string]any); analysis != nil {
 			program, _ := analysis["program"].(string)
@@ -926,21 +900,6 @@ func formatGuardianDirectSkillOutputMap(payload map[string]any) string {
 		return "Tool execution blocked"
 	}
 	return ""
-}
-
-func guardianApprovalAnalysisIsResearchContinuation(analysis commandapproval.Analysis) bool {
-	return strings.EqualFold(strings.TrimSpace(analysis.Program), "research_completion") ||
-		strings.HasPrefix(strings.TrimSpace(analysis.TemplateKey), "research_completion|")
-}
-
-func guardianApprovalAnalysisMapIsResearchContinuation(analysis map[string]any) bool {
-	if analysis == nil {
-		return false
-	}
-	program, _ := analysis["program"].(string)
-	templateKey, _ := analysis["template_key"].(string)
-	return strings.EqualFold(strings.TrimSpace(program), "research_completion") ||
-		strings.HasPrefix(strings.TrimSpace(templateKey), "research_completion|")
 }
 
 func (g *Guardian) handleActionBusRequest(ctx context.Context, msg *guide.Message) error {

@@ -51,16 +51,13 @@ const (
 type ApprovalKind string
 
 const (
-	ApprovalKindCommand              ApprovalKind = "command"
-	ApprovalKindResearchContinuation ApprovalKind = "research_continuation"
+	ApprovalKindCommand ApprovalKind = "command"
 )
 
 func normalizeApprovalKind(kind ApprovalKind) ApprovalKind {
 	switch strings.TrimSpace(string(kind)) {
 	case "", string(ApprovalKindCommand):
 		return ApprovalKindCommand
-	case string(ApprovalKindResearchContinuation):
-		return ApprovalKindResearchContinuation
 	default:
 		return ApprovalKind(strings.TrimSpace(string(kind)))
 	}
@@ -171,17 +168,6 @@ func (p *Proposal) IsFetchApproval() bool {
 		return false
 	}
 	return IsFetchToolName(p.ToolName)
-}
-
-func (p *Proposal) IsResearchContinuation() bool {
-	if p == nil {
-		return false
-	}
-	return normalizeApprovalKind(p.Kind) == ApprovalKindResearchContinuation
-}
-
-func (r Request) IsResearchContinuation() bool {
-	return normalizeApprovalKind(r.Kind) == ApprovalKindResearchContinuation
 }
 
 type Gate interface {

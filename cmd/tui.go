@@ -871,6 +871,36 @@ func schedulePhase4Task(
 	})
 }
 
+func waitForBootBleveReady(ctx context.Context, store *knowledge.KnowledgeStore) error {
+	if store == nil {
+		return nil
+	}
+	if err := store.WaitForPartial(ctx); err != nil {
+		return nil
+	}
+	bgWaiter := store.BackgroundWaiter()
+	if bgWaiter == nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		store.PromoteFull()
+		return nil
+	}
+
+	select {
+	case <-bgWaiter.Ready():
+		if ctx.Err() != nil {
+			return nil
+		}
+		// Full promotion is the only user-visible transition needed here.
+		// Reopening/adopting a fresh owned Bleve store during shutdown can block
+		// on repository-sized I/O, so cleanup relies on backend.Close instead.
+		store.PromoteFull()
+	case <-ctx.Done():
+	}
+	return nil
+}
+
 func schedulePhase4Activation(
 	phase1 *bootstrapPhase1,
 	phase3 bootstrapPhase3,
@@ -1115,67 +1145,36 @@ func startBootstrapPhase4(
 		return nil
 	})
 	schedulePhase4Task(phase1.scope, "phase4-knowledge-boot", 0, &phase4Remaining, phase4Finish, func(bgCtx context.Context) error {
-		type bootOut struct {
-			result *boot.PipelineResult
-			err    error
-		}
-		ch := make(chan bootOut, 1)
-		go func() {
-			result, err := boot.BootWithConfig(bgCtx, boot.PipelineConfig{
-				ProjectRoot: phase1.projectRoot,
-				Logger:      phase4.bootLogger,
-				OnProgress:  phase1.knowledgeStore.NotifyProgress,
-			})
-			ch <- bootOut{result: result, err: err}
-		}()
-
-		select {
-		case <-bgCtx.Done():
-			return nil
-		case out := <-ch:
-			if out.err != nil {
-				slog.Warn("knowledge boot failed (non-critical)", "error", out.err)
-				return nil
-			}
-			backend := phase1.knowledgeBackend
-			if backend == nil {
-				slog.Warn("knowledge backend unavailable (non-critical)")
-				return nil
-			}
-			var refreshErr error
-			if bgIdx := out.result.BackgroundIndexer; bgIdx != nil && bgIdx.BleveStore() != nil {
-				refreshErr = backend.RefreshWithBleveStore(bgCtx, bgIdx.BleveStore())
-			} else {
-				refreshErr = backend.RefreshFromDisk(bgCtx)
-			}
-			if refreshErr != nil {
-				slog.Warn("knowledge backend refresh failed (non-critical)", "error", refreshErr)
-				return nil
-			}
-			phase1.knowledgeStore.PromotePartial(query.NewBleveSearcher(backend), out.result.BackgroundIndexer, backend)
+		result, err := boot.BootWithConfig(bgCtx, boot.PipelineConfig{
+			ProjectRoot: phase1.projectRoot,
+			Logger:      phase4.bootLogger,
+			OnProgress:  phase1.knowledgeStore.NotifyProgress,
+			Scope:       phase1.scope,
+		})
+		if err != nil {
+			slog.Warn("knowledge boot failed (non-critical)", "error", err)
 			return nil
 		}
+		backend := phase1.knowledgeBackend
+		if backend == nil {
+			slog.Warn("knowledge backend unavailable (non-critical)")
+			return nil
+		}
+		var refreshErr error
+		if bgIdx := result.BackgroundIndexer; bgIdx != nil && bgIdx.BleveStore() != nil {
+			refreshErr = backend.RefreshWithBleveStore(bgCtx, bgIdx.BleveStore())
+		} else {
+			refreshErr = backend.RefreshFromDisk(bgCtx)
+		}
+		if refreshErr != nil {
+			slog.Warn("knowledge backend refresh failed (non-critical)", "error", refreshErr)
+			return nil
+		}
+		phase1.knowledgeStore.PromotePartial(query.NewBleveSearcher(backend), result.BackgroundIndexer, backend)
+		return nil
 	})
 	schedulePhase4Task(phase1.scope, "phase4-bleve-ready", 0, &phase4Remaining, phase4Finish, func(bgCtx context.Context) error {
-		if err := phase1.knowledgeStore.WaitForPartial(bgCtx); err != nil {
-			return nil
-		}
-		bgWaiter := phase1.knowledgeStore.BackgroundWaiter()
-		if bgWaiter == nil {
-			phase1.knowledgeStore.PromoteFull()
-			return nil
-		}
-		select {
-		case <-bgWaiter.Ready():
-			phase1.knowledgeStore.PromoteFull()
-			if backend := phase1.knowledgeBackend; backend != nil {
-				if err := backend.AdoptOwnedBleve(bgCtx); err != nil {
-					slog.Warn("knowledge backend adopt-owned-bleve failed (non-critical)", "error", err)
-				}
-			}
-		case <-bgCtx.Done():
-		}
-		return nil
+		return waitForBootBleveReady(bgCtx, phase1.knowledgeStore)
 	})
 
 	return phase4, nil

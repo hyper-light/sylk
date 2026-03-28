@@ -753,6 +753,7 @@ func TestResearchQueryJSONMarshaling(t *testing.T) {
 				Domain:         DomainPatterns,
 				MaxSources:     10,
 				LanguageFilter: "Go",
+				Depth:          "comprehensive",
 				SessionID:      "session-001",
 			},
 		},
@@ -807,6 +808,9 @@ func TestResearchQueryJSONMarshaling(t *testing.T) {
 			}
 			if got.LanguageFilter != tt.query.LanguageFilter {
 				t.Errorf("LanguageFilter = %v, want %v", got.LanguageFilter, tt.query.LanguageFilter)
+			}
+			if got.Depth != tt.query.Depth {
+				t.Errorf("Depth = %v, want %v", got.Depth, tt.query.Depth)
 			}
 			if got.SessionID != tt.query.SessionID {
 				t.Errorf("SessionID = %v, want %v", got.SessionID, tt.query.SessionID)

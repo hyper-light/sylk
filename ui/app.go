@@ -427,11 +427,6 @@ var fetchApprovalOptions = []commandApprovalOption{
 	{label: "Deny Always", hint: "block this exact URL", decision: "deny_always"},
 }
 
-var researchContinuationApprovalOptions = []commandApprovalOption{
-	{label: "Continue Research", hint: "require grounded external sources", decision: "continue_research"},
-	{label: "Output Findings As-Is", hint: "synthesize current evidence", decision: "synthesize_as_is"},
-}
-
 var layerDecisionOptions = []commandApprovalOption{
 	{label: "Retry Layer", hint: "rerun failed nodes", decision: "retry"},
 	{label: "Skip Layer", hint: "continue past failures", decision: "skip"},
@@ -14953,7 +14948,7 @@ func renderCommandApprovalCodeBlock(proposal *commandapproval.Proposal, width in
 		command = strings.TrimSpace(proposal.Command)
 	}
 	fenceLang := "sh"
-	if proposal != nil && (proposal.IsFetchApproval() || proposal.IsResearchContinuation()) {
+	if proposal != nil && proposal.IsFetchApproval() {
 		fenceLang = "text"
 	}
 	rendered := markdownpkg.RenderMarkdown("```"+fenceLang+"\n"+command+"\n```", width, th)
@@ -14979,9 +14974,6 @@ func commandApprovalOptionMarkdown(option commandApprovalOption) string {
 }
 
 func commandApprovalOptionsForProposal(proposal *commandapproval.Proposal) []commandApprovalOption {
-	if proposal != nil && proposal.IsResearchContinuation() {
-		return researchContinuationApprovalOptions
-	}
 	if proposal != nil && proposal.IsFetchApproval() {
 		return fetchApprovalOptions
 	}
@@ -14994,8 +14986,6 @@ func commandApprovalCancelOptionIndex(proposal *commandapproval.Proposal) int {
 		return 0
 	}
 	switch {
-	case proposal != nil && proposal.IsResearchContinuation():
-		return len(options) - 1
 	case len(options) > 2:
 		return 2
 	default:
@@ -15005,9 +14995,6 @@ func commandApprovalCancelOptionIndex(proposal *commandapproval.Proposal) int {
 
 func commandApprovalPromptLine(proposal *commandapproval.Proposal) string {
 	requester := commandApprovalRequesterName(proposal)
-	if proposal != nil && proposal.IsResearchContinuation() {
-		return requester + " needs a research completion decision:"
-	}
 	if proposal != nil && proposal.IsFetchApproval() {
 		return requester + " wants approval to fetch:"
 	}
@@ -15016,22 +15003,10 @@ func commandApprovalPromptLine(proposal *commandapproval.Proposal) string {
 
 func commandApprovalDecisionApproved(proposal *commandapproval.Proposal, decision string) bool {
 	decision = strings.TrimSpace(strings.ToLower(decision))
-	if proposal != nil && proposal.IsResearchContinuation() {
-		return decision == "continue_research"
-	}
 	return strings.HasPrefix(decision, "allow_")
 }
 
 func commandApprovalDecisionReason(proposal *commandapproval.Proposal, decision string, approved bool) string {
-	decision = strings.TrimSpace(strings.ToLower(decision))
-	if proposal != nil && proposal.IsResearchContinuation() {
-		switch decision {
-		case "continue_research":
-			return "continue research selected by user"
-		case "synthesize_as_is":
-			return "synthesize current findings selected by user"
-		}
-	}
 	if approved {
 		return "approved by user"
 	}

@@ -140,11 +140,21 @@ func (e *Engineer) requestConsultation(
 	ctx context.Context,
 	target, query, scope, sessionID string,
 ) (*shared.ConsultationEvidence, error) {
+	return e.requestConsultationWithMetadata(ctx, target, query, scope, sessionID, nil)
+}
+
+func (e *Engineer) requestConsultationWithMetadata(
+	ctx context.Context,
+	target, query, scope, sessionID string,
+	metadata map[string]any,
+) (*shared.ConsultationEvidence, error) {
 	req := &guide.RouteRequest{
 		Input:         query,
 		TargetAgentID: target,
 		SessionID:     sessionID,
+		Metadata:      shared.CloneMetadataMap(metadata),
 	}
+	researchDepth := shared.ConsultationResearchDepth(req.Metadata)
 	branchCtx, branch := shared.BeginInterAgentBranch(ctx, shared.InterAgentBranchSpec{
 		Kind:       shared.InterAgentToolEventKindConsult,
 		ToolName:   "consult_" + strings.ReplaceAll(strings.TrimSpace(target), "-", "_"),
@@ -154,6 +164,7 @@ func (e *Engineer) requestConsultation(
 			"target": target,
 			"query":  query,
 			"scope":  scope,
+			"depth":  string(researchDepth),
 		},
 	})
 	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)

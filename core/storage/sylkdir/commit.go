@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/search/bleve"
 	"golang.org/x/sync/errgroup"
@@ -43,6 +44,10 @@ type CommitConfig struct {
 	// either waiting on it or letting it run asynchronously.
 	// When false (default), inline indexing runs as before.
 	DeferBleveIndexing bool
+
+	// Scope optionally tracks deferred background indexing so callers can tie
+	// it to a larger lifecycle, such as TUI shutdown.
+	Scope *concurrency.GoroutineScope
 
 	// Logger is the structured event logger for commit phases. Nil-safe.
 	Logger *agentlog.BootEventLogger
@@ -376,7 +381,8 @@ func CommitToGlobal(ctx context.Context, cfg CommitConfig) (*CommitResult, error
 
 	// After publication: finalize derived Bleve state.
 	if cfg.DeferBleveIndexing {
-		bgIndexer = NewBackgroundIndexer(
+		bgIndexer = NewBackgroundIndexerWithScope(
+			cfg.Scope,
 			cfg.GlobalBleveStore,
 			docs,
 			storeResult.supersededDocIDs,

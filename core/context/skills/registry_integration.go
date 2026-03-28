@@ -14,16 +14,19 @@ import (
 // =============================================================================
 
 const (
-	AgentTypeLibrarian   = "librarian"
-	AgentTypeArchivalist = "archivalist"
-	AgentTypeAcademic    = "academic"
-	AgentTypeGuide       = "guide"
+	AgentTypeLibrarian    = "librarian"
+	AgentTypeArchivalist  = "archivalist"
+	AgentTypeAcademic     = "academic"
+	AgentTypeArchitect    = "architect"
+	AgentTypeGuide        = "guide"
 	AgentTypeOrchestrator = "orchestrator"
-	AgentTypePipeline    = "pipeline"
-	AgentTypeEngineer    = "engineer"
-	AgentTypeDesigner    = "designer"
-	AgentTypeInspector   = "inspector"
-	AgentTypeTester      = "tester"
+	AgentTypePipeline     = "pipeline"
+	AgentTypeEngineer     = "engineer"
+	AgentTypeDesigner     = "designer"
+	AgentTypeGuardian     = "guardian"
+	AgentTypeScribe       = "scribe"
+	AgentTypeInspector    = "inspector"
+	AgentTypeTester       = "tester"
 )
 
 // KnowledgeAgents are agents that use universal retrieval skills.
@@ -31,8 +34,14 @@ var KnowledgeAgents = []string{
 	AgentTypeLibrarian,
 	AgentTypeArchivalist,
 	AgentTypeAcademic,
+	AgentTypeArchitect,
 	AgentTypeGuide,
 	AgentTypeOrchestrator,
+	AgentTypeEngineer,
+	AgentTypeDesigner,
+	AgentTypeGuardian,
+	AgentTypeInspector,
+	AgentTypeTester,
 }
 
 // =============================================================================
@@ -46,12 +55,12 @@ type AdaptiveRetrievalDependencies struct {
 	Universal *RetrievalDependencies
 
 	// Agent-specific dependencies
-	Librarian   *LibrarianDependencies
-	Archivalist *ArchivalistDependencies
-	Academic    *AcademicDependencies
-	Guide       *GuideDependencies
+	Librarian    *LibrarianDependencies
+	Archivalist  *ArchivalistDependencies
+	Academic     *AcademicDependencies
+	Guide        *GuideDependencies
 	Orchestrator *OrchestratorDependencies
-	Pipeline    *PipelineDependencies
+	Pipeline     *PipelineDependencies
 }
 
 // =============================================================================
@@ -67,10 +76,17 @@ func RegisterAdaptiveRetrievalSkills(
 	if registry == nil {
 		return fmt.Errorf("registry is required")
 	}
+	if deps == nil {
+		deps = &AdaptiveRetrievalDependencies{}
+	}
 
 	// Register universal skills (available to all knowledge agents)
 	if err := registerUniversalSkillsIntegration(registry, deps.Universal); err != nil {
 		return fmt.Errorf("failed to register universal skills: %w", err)
+	}
+
+	if err := RegisterRoleForestSkills(registry, deps.Universal); err != nil {
+		return fmt.Errorf("failed to register role-specific forest skills: %w", err)
 	}
 
 	// Register agent-specific skills
@@ -95,6 +111,10 @@ func registerAgentSpecificSkillsIntegration(
 	registry *skills.Registry,
 	deps *AdaptiveRetrievalDependencies,
 ) error {
+	if deps == nil {
+		return nil
+	}
+
 	// Register Librarian skills
 	if err := registerLibrarianIfProvidedIntegration(registry, deps.Librarian); err != nil {
 		return err
@@ -202,6 +222,9 @@ func RegisterSkillsForAgent(
 	if registry == nil {
 		return fmt.Errorf("registry is required")
 	}
+	if deps == nil {
+		deps = &AdaptiveRetrievalDependencies{}
+	}
 
 	normalizedType := strings.ToLower(agentType)
 
@@ -213,11 +236,17 @@ func RegisterSkillsForAgent(
 	}
 
 	// Register agent-specific skills
-	return registerAgentTypeSkillsIntegration(registry, normalizedType, deps)
+	if err := registerAgentTypeSkillsIntegration(registry, normalizedType, deps); err != nil {
+		return err
+	}
+	return registerRoleForestSkillsForAgentIntegration(registry, normalizedType, deps.Universal)
 }
 
 // IsKnowledgeAgent checks if an agent type is a knowledge agent.
 func IsKnowledgeAgent(agentType string) bool {
+	if strings.HasPrefix(agentType, AgentTypeScribe) {
+		return true
+	}
 	for _, ka := range KnowledgeAgents {
 		if ka == agentType {
 			return true
@@ -242,10 +271,10 @@ func registerAgentTypeSkillsIntegration(
 		return registerGuideIfProvidedIntegration(registry, deps.Guide)
 	case AgentTypeOrchestrator:
 		return registerOrchestratorIfProvidedIntegration(registry, deps.Orchestrator)
-	case AgentTypePipeline:
+	case AgentTypePipeline, AgentTypeEngineer, AgentTypeDesigner, AgentTypeInspector, AgentTypeTester:
 		return registerPipelineIfProvidedIntegration(registry, deps.Pipeline)
 	default:
-		// Other agent types (engineer, designer, etc.) don't get specific skills
+		// Other agent types rely on universal skills and role-specific forest wrappers.
 		return nil
 	}
 }
@@ -265,9 +294,13 @@ func LoadAllAdaptiveRetrievalSkills(registry *skills.Registry) {
 	registry.LoadDomain("librarian")
 	registry.LoadDomain("archivalist")
 	registry.LoadDomain("academic")
+	registry.LoadDomain("architect")
 	registry.LoadDomain("guide")
 	registry.LoadDomain("orchestrator")
 	registry.LoadDomain("pipeline")
+	for _, domain := range roleForestDomains() {
+		registry.LoadDomain(domain)
+	}
 }
 
 // =============================================================================
@@ -286,6 +319,10 @@ func GetSkillsForAgent(
 	// All knowledge agents get universal skills
 	if IsKnowledgeAgent(normalizedType) {
 		result = append(result, registry.GetByDomain(RetrievalDomain)...)
+	}
+
+	for _, domain := range supplementalDomainsForAgent(normalizedType) {
+		result = append(result, registry.GetByDomain(domain)...)
 	}
 
 	// Get agent-specific skills
@@ -316,11 +353,15 @@ func DeduplicateSkills(skillList []*skills.Skill) []*skills.Skill {
 
 // GetAllAdaptiveRetrievalSkillNames returns the names of all AR skills.
 func GetAllAdaptiveRetrievalSkillNames() []string {
-	return []string{
+	names := []string{
 		// Universal skills
 		"retrieve_context",
 		"search_history",
 		"promote_to_hot",
+		"forest_resolve_intent",
+		"forest_recall",
+		"forest_predict_next_branches",
+		"forest_record_outcome",
 
 		// Librarian skills
 		"librarian_search_codebase",
@@ -352,6 +393,8 @@ func GetAllAdaptiveRetrievalSkillNames() []string {
 		"pipeline_get_test_results",
 		"pipeline_get_inspection_findings",
 	}
+	names = append(names, roleForestSkillNames()...)
+	return names
 }
 
 // IsAdaptiveRetrievalSkill checks if a skill name is an AR skill.

@@ -161,6 +161,8 @@ type ResearchQuery struct {
 	MaxSources int `json:"max_sources,omitempty"`
 	// LanguageFilter limits results to specific languages.
 	LanguageFilter string `json:"language_filter,omitempty"`
+	// Depth controls how deeply Academic should research before answering.
+	Depth string `json:"depth,omitempty"`
 	// SessionID is the requesting session.
 	SessionID string `json:"session_id,omitempty"`
 }

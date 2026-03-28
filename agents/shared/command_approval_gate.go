@@ -176,9 +176,6 @@ func beginGuardianApprovalBranch(
 }
 
 func guardianApprovalBranchSummary(req commandapproval.Request) string {
-	if req.IsResearchContinuation() {
-		return "Requesting research-completion decision from Guardian"
-	}
 	switch {
 	case strings.TrimSpace(req.Domain) != "":
 		return "Requesting Guardian approval for " + strings.TrimSpace(req.Domain)
@@ -203,10 +200,6 @@ func publishGuardianApprovalKeepalive(ctx context.Context, req commandapproval.R
 	if pp == nil {
 		return
 	}
-	if req.IsResearchContinuation() {
-		pp.PublishState(events.AgentUIStateValidating, "Waiting for user decision on Academic research completion")
-		return
-	}
 	message := "Waiting for Guardian approval"
 	switch {
 	case strings.TrimSpace(req.Domain) != "":
@@ -220,10 +213,6 @@ func publishGuardianApprovalKeepalive(ctx context.Context, req commandapproval.R
 func publishGuardianApprovalResolvedProgress(ctx context.Context, req commandapproval.Request) {
 	pp := ProgressPublisherFromContext(ctx)
 	if pp == nil {
-		return
-	}
-	if req.IsResearchContinuation() {
-		pp.Publish("Academic research completion decision received")
 		return
 	}
 	message := "Guardian approval received"
@@ -284,9 +273,6 @@ func decodeCommandApprovalEvaluation(data any, req commandapproval.Request) (com
 	return eval, nil
 }
 
-func commandApprovalEvaluationShouldError(req commandapproval.Request, eval commandapproval.Evaluation) bool {
-	if eval.Decision != commandapproval.DecisionDeny {
-		return false
-	}
-	return !req.IsResearchContinuation()
+func commandApprovalEvaluationShouldError(_ commandapproval.Request, eval commandapproval.Evaluation) bool {
+	return eval.Decision == commandapproval.DecisionDeny
 }

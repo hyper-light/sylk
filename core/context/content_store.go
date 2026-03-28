@@ -31,6 +31,7 @@ type ContentStoreConfig struct {
 	GoroutineBudget  *concurrency.GoroutineBudget
 	FileHandleBudget *resources.FileHandleBudget
 	Logger           *slog.Logger
+	Observer         ContentIndexObserver
 }
 
 // DefaultContentStoreConfig returns sensible defaults.
@@ -53,10 +54,16 @@ type UniversalContentStore struct {
 	goroutineBudget  *concurrency.GoroutineBudget
 	fileHandleBudget *resources.FileHandleBudget
 	logger           *slog.Logger
+	observer         ContentIndexObserver
 	mu               sync.RWMutex
 	closed           bool
 	wg               sync.WaitGroup
 	cancelFunc       context.CancelFunc
+}
+
+// ContentIndexObserver receives callbacks after content is durably stored.
+type ContentIndexObserver interface {
+	OnContentIndexed(ctx context.Context, entry *ContentEntry) error
 }
 
 var (
@@ -79,6 +86,7 @@ func NewUniversalContentStore(cfg ContentStoreConfig) (*UniversalContentStore, e
 		goroutineBudget:  cfg.GoroutineBudget,
 		fileHandleBudget: cfg.FileHandleBudget,
 		logger:           normalizeLogger(cfg.Logger),
+		observer:         cfg.Observer,
 	}
 
 	if err := store.initBleveIndex(cfg.BlevePath); err != nil {
@@ -301,7 +309,10 @@ func (s *UniversalContentStore) queueForVectorIndex(entry *ContentEntry) error {
 }
 
 func (s *UniversalContentStore) indexSync(entry *ContentEntry) error {
-	return s.storeEntryInDB(entry)
+	if err := s.storeEntryInDB(entry); err != nil {
+		return err
+	}
+	return s.notifyObserver(entry)
 }
 
 func (s *UniversalContentStore) indexWorker(ctx context.Context) {
@@ -330,7 +341,18 @@ func (s *UniversalContentStore) processNextEntry(ctx context.Context) bool {
 func (s *UniversalContentStore) storeEntryWithLogging(entry *ContentEntry) {
 	if err := s.storeEntryInDB(entry); err != nil {
 		s.logger.Warn("store entry failed", "id", entry.ID, "error", err)
+		return
 	}
+	if err := s.notifyObserver(entry); err != nil {
+		s.logger.Warn("content observer failed", "id", entry.ID, "error", err)
+	}
+}
+
+func (s *UniversalContentStore) notifyObserver(entry *ContentEntry) error {
+	if s.observer == nil {
+		return nil
+	}
+	return s.observer.OnContentIndexed(context.Background(), entry.Clone())
 }
 
 func (s *UniversalContentStore) storeEntryInDB(entry *ContentEntry) error {
@@ -339,7 +361,7 @@ func (s *UniversalContentStore) storeEntryInDB(entry *ContentEntry) error {
 	keywords, _ := json.Marshal(entry.Keywords)
 	entities, _ := json.Marshal(entry.Entities)
 	relatedFiles, _ := json.Marshal(entry.RelatedFiles)
-	metadata, _ := json.Marshal(entry.Metadata)
+	metadata, _ := json.Marshal(entry.EffectiveMetadata())
 
 	_, err := db.Exec(`
 		INSERT OR REPLACE INTO content_entries
@@ -650,6 +672,7 @@ func (s *UniversalContentStore) scanEntry(rows *sql.Rows) (*ContentEntry, error)
 	entry.ParentID = parentID.String
 
 	s.parseJSONFields(&entry, keywords, entities, relatedFiles, metadata)
+	entry.HydrateForestMetadata()
 
 	return &entry, nil
 }

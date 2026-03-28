@@ -12,6 +12,7 @@ func archivalistVisibleSkillNames() []string {
 		ToolQueryFailures,
 		ToolQueryContext,
 		ToolQueryFileState,
+		"consult",
 		ToolRecordPattern,
 		ToolRecordFailure,
 		ToolUpdateFileState,

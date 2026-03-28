@@ -10,7 +10,8 @@ import (
 )
 
 func (a *Academic) applyLLMRuntimeProfile(ctx context.Context, req *providers.Request, stage string) {
-	llmruntime.ApplyStage(req, a.llmStageProfile(stage), llmruntime.ApplyOptions{
+	profile := academicApplyResearchDepthStageProfile(a.llmStageProfile(stage), AcademicResearchDepthFromContext(ctx))
+	llmruntime.ApplyStage(req, profile, llmruntime.ApplyOptions{
 		Model:     academicRuntimeModel(req, a.CurrentModel()),
 		MaxTokens: req.MaxTokens,
 		AgentID:   strings.TrimSpace(a.id),

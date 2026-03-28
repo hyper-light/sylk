@@ -702,6 +702,7 @@ func (a *Academic) handleActionMessage(msg *guide.Message) error {
 
 // processForwardedRequest handles the actual request processing.
 func (a *Academic) processForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	ctx = WithAcademicResearchDepth(ctx, academicResearchDepthFromForwarded(fwd))
 	if a.shouldHandleConversation(fwd) {
 		return a.handleConversation(ctx, fwd)
 	}
@@ -786,7 +787,7 @@ func (a *Academic) handleConversation(ctx context.Context, fwd *guide.ForwardedR
 	toolSurface := a.requestToolSurfaceForForwardedRequest(fwd, academicConversationExtraTools(handoff)...)
 	a.prepareSkillsForInput(query)
 	llmReq := &providers.Request{
-		SystemPrompt: buildAcademicConversationSystemPrompt(a.config.SystemPrompt, handoff),
+		SystemPrompt: buildAcademicConversationSystemPrompt(a.config.SystemPrompt, handoff, AcademicResearchDepthFromContext(ctx)),
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: query}},
 		Tools:        a.buildToolDefinitionsWithSurface(toolSurface),
 		Model:        a.config.Model,
@@ -821,7 +822,7 @@ func (a *Academic) handleConsultation(ctx context.Context, fwd *guide.ForwardedR
 	toolSurface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
 	a.prepareSkillsForInput(query)
 	llmReq := &providers.Request{
-		SystemPrompt: buildAcademicConsultationSystemPrompt(a.config.SystemPrompt, fwd),
+		SystemPrompt: buildAcademicConsultationSystemPrompt(a.config.SystemPrompt, fwd, AcademicResearchDepthFromContext(ctx)),
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: query}},
 		Tools:        a.buildToolDefinitionsWithSurface(toolSurface),
 		Model:        a.config.Model,
@@ -879,11 +880,12 @@ func academicConversationHandoffFromForwarded(fwd *guide.ForwardedRequest) *acad
 	return handoff
 }
 
-func buildAcademicConversationSystemPrompt(base string, handoff *academicConversationHandoff) string {
+func buildAcademicConversationSystemPrompt(base string, handoff *academicConversationHandoff, depth shared.ResearchDepth) string {
 	sections := []string{
 		strings.TrimSpace(base),
 		strings.TrimSpace(AcademicConversationPrompt),
 		strings.TrimSpace(academicExternalResearchDisciplinePrompt()),
+		strings.TrimSpace(academicResearchDepthPrompt(depth)),
 	}
 	if handoff != nil {
 		sections = append(sections, academicConversationHandoffPrompt(handoff))
@@ -897,11 +899,12 @@ func buildAcademicConversationSystemPrompt(base string, handoff *academicConvers
 	return strings.Join(filtered, "\n\n---\n\n")
 }
 
-func buildAcademicConsultationSystemPrompt(base string, fwd *guide.ForwardedRequest) string {
+func buildAcademicConsultationSystemPrompt(base string, fwd *guide.ForwardedRequest, depth shared.ResearchDepth) string {
 	sections := []string{
 		strings.TrimSpace(base),
 		strings.TrimSpace(AcademicConversationPrompt),
 		strings.TrimSpace(academicExternalResearchDisciplinePrompt()),
+		strings.TrimSpace(academicResearchDepthPrompt(depth)),
 		strings.TrimSpace(academicConsultationPrompt(fwd)),
 	}
 	filtered := make([]string, 0, len(sections))
@@ -959,6 +962,10 @@ func buildAcademicRecallPrompt(fwd *guide.ForwardedRequest) string {
 		b.WriteString("\n")
 	}
 	b.WriteString(academicExternalResearchDisciplinePrompt())
+	if depthPrompt := strings.TrimSpace(academicResearchDepthPrompt(academicResearchDepthFromForwarded(fwd))); depthPrompt != "" {
+		b.WriteString("\n\n")
+		b.WriteString(depthPrompt)
+	}
 	if extra := academicForwardedResearchPrompt(fwd); extra != "" {
 		b.WriteString("\n\n")
 		b.WriteString(extra)
@@ -1227,6 +1234,9 @@ func (a *Academic) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest)
 	if contract := academicCompletionContractForForwardedRequest(fwd); contract != nil {
 		fetchPrompt = contract.guidancePrompt() + "\n\n" + fetchPrompt
 	}
+	if depthPrompt := strings.TrimSpace(academicResearchDepthPrompt(AcademicResearchDepthFromContext(ctx))); depthPrompt != "" {
+		fetchPrompt = depthPrompt + "\n\n" + fetchPrompt
+	}
 	if extra := academicForwardedResearchPrompt(fwd); extra != "" {
 		fetchPrompt = extra + "\n\n" + fetchPrompt
 	}
@@ -1306,6 +1316,9 @@ func (a *Academic) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest)
 	if contract := academicCompletionContractForForwardedRequest(fwd); contract != nil {
 		checkPrompt = contract.guidancePrompt() + "\n\n" + checkPrompt
 		ctx = WithAcademicCompletionContract(ctx, contract)
+	}
+	if depthPrompt := strings.TrimSpace(academicResearchDepthPrompt(AcademicResearchDepthFromContext(ctx))); depthPrompt != "" {
+		checkPrompt = depthPrompt + "\n\n" + checkPrompt
 	}
 	if extra := academicForwardedResearchPrompt(fwd); extra != "" {
 		checkPrompt = extra + "\n\n" + checkPrompt
@@ -1637,6 +1650,7 @@ func (a *Academic) PublishRequest(req *guide.RouteRequest) error {
 
 // Research performs research on a topic via the LLM tool loop.
 func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*ResearchResult, error) {
+	ctx = WithAcademicResearchDepth(ctx, academicResearchDepthFromQuery(query))
 	if contract := AcademicCompletionContractFromContext(ctx); contract == nil {
 		if derived := academicCompletionContractForResearchQuery(query); derived != nil {
 			ctx = WithAcademicCompletionContract(ctx, derived)
@@ -1671,6 +1685,9 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 	}
 	if query.LanguageFilter != "" {
 		researchPrompt += fmt.Sprintf("\nLanguage: %s", query.LanguageFilter)
+	}
+	if depthPrompt := strings.TrimSpace(academicResearchDepthPrompt(AcademicResearchDepthFromContext(ctx))); depthPrompt != "" {
+		researchPrompt += "\n" + depthPrompt
 	}
 
 	a.prepareSkillsForInput(researchPrompt)
@@ -1800,7 +1817,7 @@ func academicAgentIdentityMatches(candidate string, target string) bool {
 // =============================================================================
 
 func (a *Academic) cacheKey(query *ResearchQuery) string {
-	return fmt.Sprintf("%s:%s:%s", query.Query, query.Domain, query.LanguageFilter)
+	return fmt.Sprintf("%s:%s:%s:%s", query.Query, query.Domain, query.LanguageFilter, shared.EffectiveResearchDepth(query.Depth))
 }
 
 func (a *Academic) getCached(key string) *ResearchResult {

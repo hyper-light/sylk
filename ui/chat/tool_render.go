@@ -525,6 +525,7 @@ type interAgentNestedBlockItem struct {
 	toolCall         ToolCallRecord
 	childToolCallIdx int
 	overflowCount    int
+	overflowExpanded bool
 	rootSummary      string
 	anchorToolCall   bool
 	anchorChildPath  []int
@@ -676,7 +677,7 @@ func renderInterAgentNestedBlock(stack []interAgentNestedBlockItem, width int, t
 				continue
 			}
 			nextAncestors := append(cloneBoolSlice(item.ancestors), !item.isLast)
-			if item.child.ToolCallsExpanded || len(item.child.ToolCalls) <= maxInterAgentChildLines {
+			if len(item.child.ToolCalls) <= maxInterAgentChildLines {
 				for i := len(item.child.ToolCalls) - 1; i >= 0; i-- {
 					stack = append(stack, interAgentNestedBlockItem{
 						kind:             interAgentNestedBlockItemToolCall,
@@ -692,7 +693,11 @@ func renderInterAgentNestedBlock(stack []interAgentNestedBlockItem, width int, t
 				continue
 			}
 			visibleStart := len(item.child.ToolCalls) - (maxInterAgentChildLines - 1)
-			for i := len(item.child.ToolCalls) - 1; i >= visibleStart; i-- {
+			renderStart := visibleStart
+			if item.child.ToolCallsExpanded {
+				renderStart = 0
+			}
+			for i := len(item.child.ToolCalls) - 1; i >= renderStart; i-- {
 				stack = append(stack, interAgentNestedBlockItem{
 					kind:             interAgentNestedBlockItemToolCall,
 					isLast:           i == len(item.child.ToolCalls)-1,
@@ -705,13 +710,14 @@ func renderInterAgentNestedBlock(stack []interAgentNestedBlockItem, width int, t
 				})
 			}
 			stack = append(stack, interAgentNestedBlockItem{
-				kind:           interAgentNestedBlockItemOverflow,
-				isLast:         false,
-				ancestors:      cloneBoolSlice(nextAncestors),
-				childIndex:     item.childIndex,
-				childPath:      cloneIntSlice(item.childPath),
-				interAgentPath: cloneIntSlice(item.interAgentPath),
-				overflowCount:  visibleStart,
+				kind:             interAgentNestedBlockItemOverflow,
+				isLast:           false,
+				ancestors:        cloneBoolSlice(nextAncestors),
+				childIndex:       item.childIndex,
+				childPath:        cloneIntSlice(item.childPath),
+				interAgentPath:   cloneIntSlice(item.interAgentPath),
+				overflowCount:    visibleStart,
+				overflowExpanded: item.child.ToolCallsExpanded,
 			})
 		case interAgentNestedBlockItemToolCall:
 			if item.toolCall.InterAgent != nil && interAgentToolHasVisibleChildren(item.toolCall.InterAgent) {
@@ -761,8 +767,9 @@ func renderInterAgentNestedBlock(stack []interAgentNestedBlockItem, width int, t
 			})
 		case interAgentNestedBlockItemOverflow:
 			rowStart := len(blockLines)
-			line := truncateStyledWithDots(mutedStyle.Render(fmt.Sprintf("… %d earlier event%s", item.overflowCount, pluralSuffix(item.overflowCount))), contentWidth)
-			appendInterAgentNestedBlockLines(&blockLines, []string{line}, width, firstPrefix, detailMidPrefix, detailLastPrefix)
+			label := renderInterAgentOverflowControlLabel(item.overflowCount, item.overflowExpanded, th)
+			prefix := interAgentOverflowControlPrefix(item.root, item.ancestors, mutedStyle)
+			blockLines = append(blockLines, truncateStyledWithDots(prefix+truncateStyledWithDots(label, max(width-lipgloss.Width(prefix), 0)), width))
 			subregions = append(subregions, ToolCallSubregion{
 				Start:          rowStart,
 				End:            len(blockLines),
@@ -774,6 +781,13 @@ func renderInterAgentNestedBlock(stack []interAgentNestedBlockItem, width int, t
 		}
 	}
 	return blockLines, subregions
+}
+
+func renderInterAgentOverflowControlLabel(hiddenCount int, expanded bool, th *theme.Theme) string {
+	if expanded {
+		return lipgloss.NewStyle().Foreground(th.Palette.Muted).Render("▾ hide")
+	}
+	return lipgloss.NewStyle().Foreground(th.Palette.Muted).Render(fmt.Sprintf("▸ Show %d earlier event%s", hiddenCount, pluralSuffix(hiddenCount)))
 }
 
 func interAgentNestedBlockPrefixes(root bool, ancestors []bool, isLast bool, mutedStyle lipgloss.Style) (string, string, string) {
@@ -797,6 +811,21 @@ func interAgentNestedBlockPrefixes(root bool, ancestors []bool, isLast bool, mut
 		detailLast = stem.String() + mutedStyle.Render("   ") + mutedStyle.Render("└─ ")
 	}
 	return first, detailMid, detailLast
+}
+
+func interAgentOverflowControlPrefix(root bool, ancestors []bool, mutedStyle lipgloss.Style) string {
+	if root {
+		return ""
+	}
+	var stem strings.Builder
+	for _, continues := range ancestors {
+		if continues {
+			stem.WriteString(mutedStyle.Render("│  "))
+		} else {
+			stem.WriteString(mutedStyle.Render("   "))
+		}
+	}
+	return stem.String() + mutedStyle.Render("╰─ ")
 }
 
 func appendInterAgentNestedBlockLines(out *[]string, block []string, width int, firstPrefix, detailMidPrefix, detailLastPrefix string) {

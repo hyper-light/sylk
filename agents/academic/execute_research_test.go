@@ -67,6 +67,32 @@ func TestAcademicResearchExecutionState_FinalizationBlockFlagsRepeatedSearchWith
 	}
 }
 
+func TestAcademicResearchExecutionState_FinalizationBlockClearsRepeatedSearchAfterGrounding(t *testing.T) {
+	a, err := New(Config{ID: "academic"}, nil)
+	if err != nil {
+		t.Fatalf("new academic: %v", err)
+	}
+
+	state := newAcademicResearchExecutionState("sess-exec")
+	state.observeNativeSearchCall(context.Background(), nil, providers.NativeWebSearchCall{
+		ID:    "search-1",
+		Query: "python cli library recommendation",
+	})
+	state.observeNativeSearchCall(context.Background(), nil, providers.NativeWebSearchCall{
+		ID:    "search-2",
+		Query: "python cli library recommendation",
+	})
+	state.recordFetchResult(context.Background(), a, `{"success":true,"url":"https://docs.example.com/cli","title":"CLI Guide","content":"Use a dedicated CLI framework boundary.","word_count":400,"grounded":true,"ingested":true}`)
+
+	reminder, fields := state.finalizationBlock()
+	if strings.Contains(reminder, "Stop repeating the same search path") {
+		t.Fatalf("finalization reminder = %q, did not want stale repeated-search block after grounding", reminder)
+	}
+	if got := fields["repeated_search_query"]; got != nil {
+		t.Fatalf("repeated_search_query = %#v, want cleared after grounding", got)
+	}
+}
+
 func TestAcademicResearchExecutionState_FinalizationBlockRequiresPaperWhenRequested(t *testing.T) {
 	state := newAcademicResearchExecutionState("sess-exec")
 	state.setResearchPaperRequired(true)

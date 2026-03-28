@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/ingestion"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/embedder"
@@ -28,6 +29,7 @@ type PipelineConfig struct {
 	ForceTier    *embedder.ModelTier
 	OnProgress   func(phase string, current, total int64)
 	Logger       *agentlog.BootEventLogger
+	Scope        *concurrency.GoroutineScope
 }
 
 func (c *PipelineConfig) withDefaults() *PipelineConfig {
@@ -480,6 +482,7 @@ func (p *Pipeline) commitToGlobal(
 		GlobalBleveStore:   bleveStore,
 		CommitWAL:          commitWAL,
 		DeferBleveIndexing: true,
+		Scope:              p.config.Scope,
 		Logger:             p.logger,
 	}
 	if changes == nil {

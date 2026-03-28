@@ -85,37 +85,6 @@ func TestCommandApprovalLayout_FetchPromptUsesFetchLanguage(t *testing.T) {
 	}
 }
 
-func TestCommandApprovalLayout_ResearchContinuationUsesDecisionLanguage(t *testing.T) {
-	app := newResizeTestApp(t)
-	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 90, Height: 28}); cmd != nil {
-		t.Fatalf("handleResize() command = %v, want nil", cmd)
-	}
-
-	app.commandApproval = &commandApprovalState{
-		proposal: &commandapproval.Proposal{
-			Kind:      commandapproval.ApprovalKindResearchContinuation,
-			AgentType: "academic",
-			ToolName:  "author_research_paper",
-			Command:   "Topic: OAuth token validation\n\nAcademic invoked `author_research_paper` before grounding external sources.",
-		},
-		selected:  0,
-		activated: -1,
-	}
-
-	layout := app.commandApprovalLayout(60)
-	joined := ansi.Strip(strings.Join(layout.lines, "\n"))
-
-	if !strings.Contains(joined, "Academic needs a research completion decision:") {
-		t.Fatalf("research continuation prompt missing decision line:\n%s", joined)
-	}
-	if !strings.Contains(joined, "• Continue Research (require grounded external sources)") {
-		t.Fatalf("research continuation prompt missing continue option:\n%s", joined)
-	}
-	if !strings.Contains(joined, "• Output Findings As-Is (synthesize current evidence)") {
-		t.Fatalf("research continuation prompt missing synthesize option:\n%s", joined)
-	}
-}
-
 func TestCommandApprovalOptionAt_UsesTightHitboxes(t *testing.T) {
 	app := newResizeTestApp(t)
 	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 90, Height: 28}); cmd != nil {

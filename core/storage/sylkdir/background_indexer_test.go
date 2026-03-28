@@ -2,10 +2,12 @@ package sylkdir
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -166,6 +168,50 @@ func TestBackgroundIndexer_ReadyChannel(t *testing.T) {
 
 	indexed, _ := bi.Progress()
 	assert.Equal(t, int64(1), indexed)
+}
+
+func TestBackgroundIndexer_WithScopeTracksWorker(t *testing.T) {
+	gvbs := setupBgIndexerEnv(t)
+
+	scope := concurrency.NewGoroutineScope(context.Background(), "bg-indexer-test", nil)
+	scope.SetMaxLifetime(time.Minute)
+	t.Cleanup(func() {
+		_ = scope.Shutdown(100*time.Millisecond, time.Second)
+	})
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+
+	bi := NewBackgroundIndexerWithScope(scope, gvbs, nil, nil, func() error {
+		close(started)
+		<-release
+		return nil
+	})
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		bi.Close()
+	})
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background indexer did not reach onComplete")
+	}
+
+	assert.Equal(t, 1, scope.WorkerCount(), "background indexer should be tracked by scope")
+
+	releaseOnce.Do(func() { close(release) })
+
+	select {
+	case <-bi.Ready():
+	case <-time.After(2 * time.Second):
+		t.Fatal("background indexer did not finish after release")
+	}
+
+	assert.Eventually(t, func() bool {
+		return scope.WorkerCount() == 0
+	}, time.Second, 10*time.Millisecond, "background indexer worker should be removed from scope")
 }
 
 func TestBackgroundIndexer_NilStore(t *testing.T) {

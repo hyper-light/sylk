@@ -9,6 +9,7 @@ func librarianVisibleSkillNames() []string {
 	return []string{
 		"search_codebase",
 		"find_pattern",
+		"consult",
 		"find_symbol",
 		"read_file",
 		"glob",

@@ -165,15 +165,19 @@ func consultSkill(e *Engineer) *skills.Skill {
 		EnumParam("target", "Agent to consult", []string{"librarian", "archivalist", "academic"}, true).
 		StringParam("query", "Consultation question", true).
 		StringParam("scope", "Scope for consultation", false).
+		EnumParam("depth", "Research depth for Academic consultations", shared.ResearchDepthEnumValues(), false).
 		StringParam("session_id", "Session identifier", false).
 		Usage("Use to gather evidence from domain experts. Consultation is synchronous — you will receive the result before proceeding.").
 		Example(`{"target": "librarian", "query": "What patterns exist for error handling in this codebase?", "scope": "backend"}`).
 		BestPractice("Consult before implementing, not after. Results are cached — do not re-consult the same agent for the same query.").
+		BestPractice("When consulting Academic, choose depth deliberately: `minimal` for a fast sanity check, `quick` for a narrow evidence-backed answer, `standard` for normal tradeoff analysis, `deep` for decision-critical design or correctness work, and `comprehensive` for high-stakes or reusable research artifacts.").
+		BestPractice("Do not ask Academic for `comprehensive` depth on routine implementation questions; reserve it for questions where broader corroboration or a durable memo materially changes the outcome.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				Target    string `json:"target"`
 				Query     string `json:"query"`
 				Scope     string `json:"scope"`
+				Depth     string `json:"depth"`
 				SessionID string `json:"session_id"`
 			}
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -189,7 +193,14 @@ func consultSkill(e *Engineer) *skills.Skill {
 			if sessionID == "" {
 				sessionID = e.config.SessionID
 			}
-			evidence, err := e.requestConsultation(ctx, params.Target, params.Query, params.Scope, sessionID)
+			evidence, err := e.requestConsultationWithMetadata(
+				ctx,
+				params.Target,
+				params.Query,
+				params.Scope,
+				sessionID,
+				shared.ConsultationMetadataWithResearchDepth(nil, params.Depth),
+			)
 			if err != nil {
 				return nil, err
 			}

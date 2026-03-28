@@ -875,6 +875,114 @@ func TestRenderEntry_InterAgentRowsRenderSeparateChildSectionsPerAgent(t *testin
 	}
 }
 
+func TestRenderEntry_InterAgentRowsRenderOverflowControlRowWithSpecialConnector(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inter-agent-overflow-control-collapsed",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName: "consult_research_support",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Gathering references",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "child-academic-overflow-control",
+							AgentType:     "academic",
+							Completed:     true,
+							ToolCalls: []ToolCallRecord{
+								{ToolName: "read_file", ArgsSummary: "one", Completed: true, Success: true},
+								{ToolName: "grep", ArgsSummary: "two", Completed: true, Success: true},
+								{ToolName: "sed", ArgsSummary: "three", Completed: true, Success: true},
+								{ToolName: "apply_patch", ArgsSummary: "four", Completed: true, Success: true},
+								{ToolName: "gofmt", ArgsSummary: "five", Completed: true, Success: true},
+							},
+						},
+					},
+				},
+				Completed: true,
+				Success:   true,
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 88, theme.DefaultDark(), nil)
+	found := ""
+	for _, line := range lines {
+		stripped := stripANSITest(line)
+		if strings.Contains(stripped, "Show 2 earlier events") {
+			found = stripped
+			break
+		}
+	}
+	if found == "" {
+		t.Fatalf("expected collapsed overflow control row, got %q", strings.Join(lines, "\n"))
+	}
+	if !strings.Contains(found, "╰─ ▸ Show 2 earlier events") {
+		t.Fatalf("expected collapsed overflow control to use special connector and icon, got %q", found)
+	}
+}
+
+func TestRenderEntry_InterAgentRowsRenderExpandedOverflowControlAsHide(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inter-agent-overflow-control-expanded",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "architect",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName: "consult_research_support",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Gathering references",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID:     "child-academic-overflow-hide",
+							AgentType:         "academic",
+							Completed:         true,
+							ToolCallsExpanded: true,
+							ToolCalls: []ToolCallRecord{
+								{ToolName: "read_file", ArgsSummary: "one", Completed: true, Success: true},
+								{ToolName: "grep", ArgsSummary: "two", Completed: true, Success: true},
+								{ToolName: "sed", ArgsSummary: "three", Completed: true, Success: true},
+								{ToolName: "apply_patch", ArgsSummary: "four", Completed: true, Success: true},
+								{ToolName: "gofmt", ArgsSummary: "five", Completed: true, Success: true},
+							},
+						},
+					},
+				},
+				Completed: true,
+				Success:   true,
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 88, theme.DefaultDark(), nil)
+	found := ""
+	for _, line := range lines {
+		stripped := stripANSITest(line)
+		if strings.Contains(stripped, "hide") {
+			found = stripped
+			break
+		}
+	}
+	if found == "" {
+		t.Fatalf("expected expanded hide control row, got %q", strings.Join(lines, "\n"))
+	}
+	if !strings.Contains(found, "╰─ ▾ hide") {
+		t.Fatalf("expected expanded overflow control to use special connector and hide label, got %q", found)
+	}
+	if strings.Contains(stripANSITest(strings.Join(lines, "\n")), "earlier events") {
+		t.Fatalf("expected expanded branch to replace earlier-events label with hide, got %q", strings.Join(lines, "\n"))
+	}
+}
+
 func TestRenderEntry_InterAgentRowsRenderMissingTargetsAsIndependentBranches(t *testing.T) {
 	entry := &ChatEntry{
 		ID:        "inter-agent-missing-target-branches",
