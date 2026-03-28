@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -1232,7 +1233,7 @@ func readWorkspaceDiffContent(
 	if err == nil {
 		return content, true, nil
 	}
-	if err == ErrFileNotFound {
+	if errors.Is(err, ErrFileNotFound) || os.IsNotExist(err) {
 		return nil, false, nil
 	}
 	return nil, false, err

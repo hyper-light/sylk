@@ -32,6 +32,16 @@ func newStreamTelemetryModel() *AppModel {
 	}
 }
 
+func registerPipelineWorkerRow(m *AppModel, start msg.StreamStartMsg) {
+	if m == nil || m.agentPanel == nil {
+		return
+	}
+	model, _ := m.agentPanel.Update(start)
+	if updated, ok := model.(*agentpkg.Model); ok {
+		m.agentPanel = updated
+	}
+}
+
 func TestStreamTelemetry_FinalizeUpdatesAgentContext(t *testing.T) {
 	m := newStreamTelemetryModel()
 
@@ -59,6 +69,7 @@ func TestStreamTelemetry_UsesLatestPerTurnInputTokensForPipelineTester(t *testin
 		PipelineID:    "task_auth_checkout",
 		TaskID:        "task_auth_checkout",
 	}
+	registerPipelineWorkerRow(m, start)
 	m.trackStreamStart(start)
 
 	model, _ := m.Update(msg.TokenUsageMsg{
@@ -100,8 +111,8 @@ func TestStreamTelemetry_UsesLatestPerTurnInputTokensForPipelineTester(t *testin
 
 func TestStreamTelemetry_TokenUsageWithoutCorrelationPreservesPipelineEngineerOccupancy(t *testing.T) {
 	m := newStreamTelemetryModel()
-	canonicalID := "task_auth_checkout:engineer"
-	m.agentPanel.SeedAgent(canonicalID, "engineer", "Engineer", nil, "", "")
+	logicalID := "task_auth_checkout:engineer"
+	m.agentPanel.SeedAgent(logicalID, "engineer", "Engineer", nil, "", "")
 
 	start := msg.StreamStartMsg{
 		CorrelationID: "corr-engineer",
@@ -111,10 +122,11 @@ func TestStreamTelemetry_TokenUsageWithoutCorrelationPreservesPipelineEngineerOc
 		PipelineID:    "task_auth_checkout",
 		TaskID:        "task_auth_checkout",
 	}
+	registerPipelineWorkerRow(m, start)
 	m.trackStreamStart(start)
 
 	model, _ := m.Update(msg.TokenUsageMsg{
-		AgentID:     canonicalID,
+		AgentID:     logicalID,
 		Model:       "gpt-5.4-pro",
 		InputTokens: 210000,
 	})
@@ -133,6 +145,7 @@ func TestStreamTelemetry_TokenUsageWithoutCorrelationPreservesPipelineEngineerOc
 	}
 
 	m.finalizeStreamUsage("corr-engineer", true, "")
+	canonicalID := "task_auth_checkout:engineer"
 	if got := m.agentContextTokens[canonicalID]; got != 210000 {
 		t.Fatalf("finalized agentContextTokens[%q] = %d, want 210000", canonicalID, got)
 	}
@@ -154,6 +167,7 @@ func TestStreamTelemetry_TokenUsageOverridesStalePanelContext(t *testing.T) {
 		PipelineID:    "task_auth_checkout",
 		TaskID:        "task_auth_checkout",
 	}
+	registerPipelineWorkerRow(m, start)
 	m.trackStreamStart(start)
 
 	model, _ := m.Update(msg.TokenUsageMsg{

@@ -510,16 +510,13 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 		AgentID: gi.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
 
-	if !fwd.FireAndForget {
+	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
+	if publishStreamLifecycle {
 		shared.PublishStreamStart(gi.bus, gi.channels, ctx, gi.id)
 	}
 
 	result, err := gi.Handle(ctx, fwd)
 	agentShared.LogResponse(gi.steering.EventLogger(), fwd.CorrelationID, gi.id, fwd.SessionID, time.Since(startTime), err)
-
-	if fwd.FireAndForget {
-		return nil
-	}
 
 	if err != nil {
 		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -527,8 +524,13 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
-		shared.PublishStreamError(gi.bus, gi.channels, ctx, gi.id, err)
-		shared.PublishStreamComplete(gi.bus, gi.channels, ctx, gi.id, "", usageAcc.Total())
+		if publishStreamLifecycle {
+			shared.PublishStreamError(gi.bus, gi.channels, ctx, gi.id, err)
+			shared.PublishStreamComplete(gi.bus, gi.channels, ctx, gi.id, "", usageAcc.Total())
+		}
+		if fwd.FireAndForget {
+			return nil
+		}
 		errMsg := guide.NewErrorMessage(gi.generateMessageID(), fwd.CorrelationID, gi.id, err.Error())
 		return gi.bus.Publish(gi.channels.Errors, errMsg)
 	}
@@ -536,7 +538,12 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 	// For streamed conversations, include the authoritative text in the
 	// completion event so the chat model can correct dropped/reordered chunks.
 	completeText := extractInspectorUserResponse(result)
-	shared.PublishStreamComplete(gi.bus, gi.channels, ctx, gi.id, completeText, usageAcc.Total())
+	if publishStreamLifecycle {
+		shared.PublishStreamComplete(gi.bus, gi.channels, ctx, gi.id, completeText, usageAcc.Total())
+	}
+	if fwd.FireAndForget {
+		return nil
+	}
 
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,

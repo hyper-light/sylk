@@ -106,8 +106,8 @@ func TestRequestGuideRouteSyncInheritsParentCorrelationWithoutSynthesizingNested
 		if req.ParentCorrelationID != "corr-parent" {
 			t.Fatalf("parent_correlation_id = %q, want %q", req.ParentCorrelationID, "corr-parent")
 		}
-		if got, _ := req.Metadata["chat_preserve_source_stream_target"].(bool); !got {
-			t.Fatalf("chat_preserve_source_stream_target = %#v, want true", req.Metadata["chat_preserve_source_stream_target"])
+		if _, preserved := req.Metadata["chat_preserve_source_stream_target"]; preserved {
+			t.Fatalf("chat_preserve_source_stream_target = %#v, want absent", req.Metadata["chat_preserve_source_stream_target"])
 		}
 		if _, ok := req.Metadata[streamMetadataNestedBranch]; ok {
 			t.Fatalf("chat_nested_branch = %#v, want absent", req.Metadata[streamMetadataNestedBranch])
@@ -166,8 +166,8 @@ func TestRequestGuideRouteSyncPreservesExplicitNestedBranchMetadata(t *testing.T
 
 	select {
 	case req := <-requests:
-		if got, _ := req.Metadata["chat_preserve_source_stream_target"].(bool); !got {
-			t.Fatalf("chat_preserve_source_stream_target = %#v, want true", req.Metadata["chat_preserve_source_stream_target"])
+		if _, preserved := req.Metadata["chat_preserve_source_stream_target"]; preserved {
+			t.Fatalf("chat_preserve_source_stream_target = %#v, want absent", req.Metadata["chat_preserve_source_stream_target"])
 		}
 		if got, _ := req.Metadata[streamMetadataNestedBranch].(bool); !got {
 			t.Fatalf("chat_nested_branch = %#v, want true", req.Metadata[streamMetadataNestedBranch])

@@ -424,6 +424,10 @@ const protocolPhaseInstructions = `You drive the planning protocol by invoking s
    Sound like a principal engineer, not a workflow bot.
    End by inviting the user to approve or request changes. Use your own natural phrasing —
    do NOT use a scripted template. Vary your wording each time.
+   Frame it as plan review, not execution kickoff. Do NOT imply that implementation
+   is already starting or that their reply will immediately start work in this turn.
+   Avoid phrases like "kick it off", "start building", "start implementing",
+   "get started", or "ship it".
    Do NOT invoke route_plan_acceptance — wait for the user to respond.
 
 Always pass plan_id to plan and consult skills. Do not skip phases 1, 2, 4, or 5.

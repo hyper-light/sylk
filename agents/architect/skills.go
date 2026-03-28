@@ -682,5 +682,9 @@ func generateTasksNextAction(autoApprove bool) string {
 	}
 	return base + " Then invite the user to approve or request changes — " +
 		"use your own natural phrasing, not a scripted template. " +
+		"Frame it as plan review, not execution kickoff. Do NOT imply that " +
+		"implementation is already starting or that their reply will immediately " +
+		"start work in this turn. Avoid phrases like \"kick it off\", " +
+		"\"start building\", \"start implementing\", \"get started\", or \"ship it\". " +
 		"Do NOT invoke route_plan_acceptance — wait for the user's response."
 }

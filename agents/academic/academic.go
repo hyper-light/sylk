@@ -567,7 +567,8 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		Bus: a.bus, Channels: a.channels,
 		AgentID: a.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
-	if !fwd.FireAndForget {
+	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
+	if publishStreamLifecycle {
 		shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
 	}
 	stopProgressKeepalive := a.startChildProgressKeepalive(ctx, fwd)
@@ -576,29 +577,19 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	result, err := a.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, "academic", fwd.SessionID, time.Since(startTime), err)
 
-	// Don't respond if fire-and-forget
-	if fwd.FireAndForget {
-		return nil
-	}
-
-	// Build response
-	resp := &guide.RouteResponse{
-		CorrelationID:       fwd.CorrelationID,
-		Success:             err == nil,
-		RespondingAgentID:   a.id,
-		RespondingAgentName: "Academic",
-		ProcessingTime:      time.Since(startTime),
-	}
-
 	if err != nil {
 		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
-		shared.PublishStreamError(a.bus, a.channels, ctx, a.id, err)
-		shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
-		resp.Error = err.Error()
+		if publishStreamLifecycle {
+			shared.PublishStreamError(a.bus, a.channels, ctx, a.id, err)
+			shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
+		}
+		if fwd.FireAndForget {
+			return nil
+		}
 		a.publishActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentError, fmt.Sprintf("Research failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
 			generateMessageID(),
@@ -609,8 +600,21 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		return a.bus.Publish(a.channels.Errors, errMsg)
 	}
 
-	resp.Data = result
-	shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
+	if publishStreamLifecycle {
+		shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
+	}
+	if fwd.FireAndForget {
+		return nil
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:       fwd.CorrelationID,
+		Success:             true,
+		RespondingAgentID:   a.id,
+		RespondingAgentName: "Academic",
+		ProcessingTime:      time.Since(startTime),
+		Data:                result,
+	}
 	a.publishActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeSuccess, "Research task completed")
 
 	respMsg := guide.NewResponseMessage(generateMessageID(), resp)

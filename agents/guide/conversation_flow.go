@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/adalundhe/sylk/core/llmruntime"
 )
 
 const (
@@ -687,7 +689,23 @@ func isConversationAgent(agentID string) bool {
 	if isGuideTargetID(agentID) {
 		return false
 	}
+	if isInternalSidecarAgentValue(agentID) {
+		return false
+	}
 	return !isUnknownOrEmptyTarget(agentID)
+}
+
+func requestOwnsConversationFlow(request *RouteRequest) bool {
+	if request == nil {
+		return false
+	}
+	if request.FireAndForget || metadataHasNestedInterAgentBranch(request.Metadata) {
+		return false
+	}
+	if llmruntime.IsUserFacingSource(request.SourceAgentID) {
+		return true
+	}
+	return metadataBoolean(request.Metadata, "user_facing_handoff")
 }
 
 func routeResultIntent(result *RouteResult) Intent {
@@ -773,11 +791,17 @@ func (g *Guide) observeUserConversationSignal(request *RouteRequest) {
 	if g == nil || g.conversation == nil || request == nil {
 		return
 	}
+	if !requestOwnsConversationFlow(request) {
+		return
+	}
 	g.conversation.ObserveUserInput(request.SessionID, request.Input)
 }
 
 func (g *Guide) observeRoutedConversationTarget(request *RouteRequest, classification *RouteResult, targetAgentID string) {
 	if g == nil || g.conversation == nil || request == nil {
+		return
+	}
+	if !requestOwnsConversationFlow(request) {
 		return
 	}
 	g.conversation.ObserveRoutedRequest(request.SessionID, targetAgentID)
@@ -844,6 +868,9 @@ func (g *Guide) applyConversationFlow(
 	targetAgentID string,
 ) (*RouteResult, string) {
 	if g == nil || g.conversation == nil || request == nil {
+		return classification, targetAgentID
+	}
+	if !requestOwnsConversationFlow(request) {
 		return classification, targetAgentID
 	}
 	if g.router != nil && g.router.IsDSL(request.Input) {

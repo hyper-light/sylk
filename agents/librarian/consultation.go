@@ -29,8 +29,9 @@ func consultSkill(l *Librarian) *skills.Skill {
 		StringParam("scope", "Optional scope for the consultation", false).
 		EnumParam("depth", "Research depth for Academic consultations", shared.ResearchDepthEnumValues(), false).
 		StringParam("session_id", "Session identifier", false).
-		Usage("Use when Librarian needs outside evidence or historical context that the local codebase alone cannot provide. Consultation is synchronous — you receive the result before proceeding.").
-		BestPractice("When consulting Academic, choose depth deliberately: `minimal` for a fast plausibility check, `quick` for a narrow evidence-backed answer, `standard` for the default research consult, `deep` for broader corroboration on important design choices, and `comprehensive` for high-stakes or reusable research artifacts.").
+		Usage("Use when Librarian needs outside evidence or historical context that the local codebase alone cannot provide. Prefer targeted follow-up consults as the missing question changes. Consultation is synchronous — you receive the result before proceeding.").
+		BestPractice("Consult only for the missing external or historical question, not the whole problem statement. Prefer repeated targeted consults over one broad request.").
+		BestPractice("When consulting Academic, re-evaluate depth each time: `minimal` for a fast plausibility check, `quick` for a narrow evidence-backed answer, `standard` for the default research consult, `deep` for broader corroboration on important design choices, and `comprehensive` for high-stakes or reusable research artifacts.").
 		BestPractice("Do not request `comprehensive` depth for ordinary codebase-fit checks; reserve it for questions where stronger external evidence could materially change the conclusion.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {

@@ -70,8 +70,8 @@ type Librarian struct {
 	activityPub events.ActivityPublisher
 
 	// Knowledge integration
-	knowledgeStore    *knowledge.KnowledgeStore
-	knowledgeBackend  committedKnowledgeSearcher
+	knowledgeStore   *knowledge.KnowledgeStore
+	knowledgeBackend committedKnowledgeSearcher
 
 	// Event bus integration
 	bus          guide.EventBus
@@ -129,7 +129,7 @@ type Config struct {
 	MaxOutputTokens int    // Optional, uses DefaultMaxOutputTokens if 0
 
 	// Search configuration
-	SearchSystem SearchSystem // Optional: the search backend (nil when LLM is enabled)
+	SearchSystem     SearchSystem // Optional: the search backend (nil when LLM is enabled)
 	KnowledgeBackend committedKnowledgeSearcher
 
 	// ActivityPub publishes activity events so the UI agent panel tracks
@@ -539,26 +539,13 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		Bus: l.bus, Channels: l.channels,
 		AgentID: l.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
-	if !fwd.FireAndForget {
+	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
+	if publishStreamLifecycle {
 		shared.PublishStreamStart(l.bus, l.channels, ctx, l.id)
 	}
 
 	result, err := l.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(l.steering.EventLogger(), fwd.CorrelationID, l.id, fwd.SessionID, time.Since(startTime), err)
-
-	// Don't respond if fire-and-forget
-	if fwd.FireAndForget {
-		return nil
-	}
-
-	// Build response
-	resp := &guide.RouteResponse{
-		CorrelationID:       fwd.CorrelationID,
-		Success:             err == nil,
-		RespondingAgentID:   l.id,
-		RespondingAgentName: "Librarian",
-		ProcessingTime:      time.Since(startTime),
-	}
 
 	if err != nil {
 		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -566,9 +553,13 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
-		shared.PublishStreamError(l.bus, l.channels, ctx, l.id, err)
-		shared.PublishStreamComplete(l.bus, l.channels, ctx, l.id, "", usageAcc.Total())
-		resp.Error = err.Error()
+		if publishStreamLifecycle {
+			shared.PublishStreamError(l.bus, l.channels, ctx, l.id, err)
+			shared.PublishStreamComplete(l.bus, l.channels, ctx, l.id, "", usageAcc.Total())
+		}
+		if fwd.FireAndForget {
+			return nil
+		}
 		l.publishActivityForSession(fwd.SessionID, events.EventTypeAgentError, fmt.Sprintf("Search failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
 			l.generateMessageID(),
@@ -579,8 +570,21 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		return l.bus.Publish(l.channels.Errors, errMsg)
 	}
 
-	resp.Data = result
-	shared.PublishStreamComplete(l.bus, l.channels, ctx, l.id, "", usageAcc.Total())
+	if publishStreamLifecycle {
+		shared.PublishStreamComplete(l.bus, l.channels, ctx, l.id, "", usageAcc.Total())
+	}
+	if fwd.FireAndForget {
+		return nil
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:       fwd.CorrelationID,
+		Success:             true,
+		RespondingAgentID:   l.id,
+		RespondingAgentName: "Librarian",
+		ProcessingTime:      time.Since(startTime),
+		Data:                result,
+	}
 	l.publishActivityForSession(fwd.SessionID, events.EventTypeSuccess, "Search task completed")
 
 	if l.agentPod != nil {

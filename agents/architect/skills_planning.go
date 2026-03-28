@@ -193,11 +193,11 @@ func consultSkill(a *Architect) *skills.Skill {
 		EnumParam("depth", "Research depth for Academic consultations", shared.ResearchDepthEnumValues(), false).
 		StringParam("session_id", "Session identifier", false).
 		StringParam("plan_id", "Plan identifier for protocol-driven consultation", false).
-		Usage("Use during conversation as new material information arrives, and again during planning to consolidate what you learned. Do not defer obvious codebase, historical, or Academic evidence gathering until formal plan creation. `consult(mode=pre_planning)` should synthesize and refresh the evidence already gathered during discussion, not begin from zero.").
-		BestPractice("On the first substantive turn for a new implementation, planning, or architecture problem, default to the full knowledge triad: Librarian + Archivalist + Academic, unless one source is clearly irrelevant or already fresh.").
+		Usage("Use during conversation as new material information arrives, and again during planning to consolidate what you learned. Prefer repeated targeted consults over one broad consult. Do not defer obvious codebase, historical, or Academic evidence gathering until formal plan creation. `consult(mode=pre_planning)` should synthesize and refresh the evidence already gathered during discussion, not begin from zero.").
+		BestPractice("On the first substantive turn for a new implementation, planning, or architecture problem, start with the most relevant knowledge agent and the narrowest question that can materially reduce the next uncertainty. Add other knowledge agents only as concrete unresolved questions remain.").
 		BestPractice("During live discussion, consult the Librarian when codebase-fit or local-pattern questions emerge, the Archivalist when historical decisions or preferences matter, and the Academic when architecture quality, correctness, performance, testing, infrastructure, or tradeoffs materially affect the outcome.").
 		BestPractice("Do not wait for literal keywords like 'research' or 'benchmark' to consult the Academic. Use it whenever the conversation materially needs stronger alternatives, best practices, or external grounding.").
-		BestPractice("When consulting Academic, set depth intentionally: `minimal` for a fast plausibility check, `quick` for a narrow evidence-backed recommendation, `standard` for the default planning consult, `deep` for architectural decisions that need stronger corroboration, and `comprehensive` for high-stakes planning work or reusable research artifacts.").
+		BestPractice("Re-evaluate Academic depth every time the question changes. Use `minimal` or `quick` for narrow validation, `standard` for ordinary planning tradeoffs, `deep` for decision-critical architectural questions, and `comprehensive` only when broader corroboration could materially change a high-stakes or reusable conclusion.").
 		BestPractice("Do not ask for `comprehensive` depth by default. Use it when the planning decision is materially expensive, irreversible, externally dependent, or likely to be reused as a formal research input.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params consultInput
@@ -1688,6 +1688,10 @@ func startPlanningProtocolInstructions(autoApprove bool) string {
 	}
 	return base + "\n" +
 		"   Invite the user to approve or request changes — use natural phrasing, not a template.\n" +
+		"   Frame it as plan review, not execution kickoff. Do NOT imply that implementation\n" +
+		"   is already starting or that their reply will immediately start work in this turn.\n" +
+		"   Avoid phrases like \"kick it off\", \"start building\", \"start implementing\",\n" +
+		"   \"get started\", or \"ship it\".\n" +
 		"   Do NOT invoke route_plan_acceptance — wait for the user's response."
 }
 

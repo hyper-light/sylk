@@ -1679,11 +1679,10 @@ func registerGlobalInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 }
 
 func registerPipelineInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
-	pipelineInspectorID, _ := deps.ids.Get("inspector-pipeline")
 	deps.reg.Register("inspector-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
-		agentID := pipelineInspectorID
-		if workerID := pipelineWorkerAgentID(ctx, "inspector-pipeline"); workerID != "" {
-			agentID = workerID
+		agentID, err := requirePipelineWorkerAgentID(ctx, "inspector-pipeline")
+		if err != nil {
+			return nil, err
 		}
 		model := deps.configuredModel("inspector-pipeline", "claude-opus-4-6")
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation)
@@ -1736,11 +1735,10 @@ func registerGlobalTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 }
 
 func registerPipelineTesterAgentCreator(deps onDemandAgentCreatorDeps) {
-	pipelineTesterID, _ := deps.ids.Get("tester-pipeline")
 	deps.reg.Register("tester-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
-		agentID := pipelineTesterID
-		if workerID := pipelineWorkerAgentID(ctx, "tester-pipeline"); workerID != "" {
-			agentID = workerID
+		agentID, err := requirePipelineWorkerAgentID(ctx, "tester-pipeline")
+		if err != nil {
+			return nil, err
 		}
 		model := deps.configuredModel("tester-pipeline", "gpt-5.4-pro")
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation)
@@ -2440,6 +2438,14 @@ func pipelineWorkerAgentID(ctx context.Context, agentType string) string {
 		return ""
 	}
 	return orchestrator.PipelineWorkerAgentID(string(podID), agentType)
+}
+
+func requirePipelineWorkerAgentID(ctx context.Context, agentType string) (string, error) {
+	agentType = strings.TrimSpace(agentType)
+	if workerID := pipelineWorkerAgentID(ctx, agentType); workerID != "" {
+		return workerID, nil
+	}
+	return "", fmt.Errorf("%s requires task-scoped pipeline creation context", agentType)
 }
 
 // preRegisterAgentRouting pre-registers static routing metadata for all

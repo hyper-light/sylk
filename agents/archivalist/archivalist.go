@@ -693,36 +693,42 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		Bus: a.bus, Channels: a.channels,
 		AgentID: a.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
-	if !fwd.FireAndForget {
+	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
+	if publishStreamLifecycle {
 		shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
 	}
 
 	result, err := a.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, a.id, fwd.SessionID, time.Since(startTime), err)
 
+	if err != nil {
+		if publishStreamLifecycle {
+			shared.PublishStreamError(a.bus, a.channels, ctx, a.id, err)
+			shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
+		}
+		if fwd.FireAndForget {
+			return nil
+		}
+		a.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Request failed: %s", err.Error()))
+		errMsg := guide.NewErrorMessage(a.generateMessageID(), fwd.CorrelationID, a.id, err.Error())
+		return a.bus.Publish(a.channels.Errors, errMsg)
+	}
+
+	if publishStreamLifecycle {
+		shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
+	}
 	if fwd.FireAndForget {
 		return nil
 	}
 
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
-		Success:             err == nil,
+		Success:             true,
 		RespondingAgentID:   a.id,
 		RespondingAgentName: "Archivalist",
 		ProcessingTime:      time.Since(startTime),
+		Data:                result,
 	}
-
-	if err != nil {
-		shared.PublishStreamError(a.bus, a.channels, ctx, a.id, err)
-		shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
-		resp.Error = err.Error()
-		a.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Request failed: %s", err.Error()))
-		errMsg := guide.NewErrorMessage(a.generateMessageID(), fwd.CorrelationID, a.id, err.Error())
-		return a.bus.Publish(a.channels.Errors, errMsg)
-	}
-
-	resp.Data = result
-	shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
 	a.publishActivity(events.EventTypeSuccess, "Request completed")
 
 	respMsg := guide.NewResponseMessage(a.generateMessageID(), resp)

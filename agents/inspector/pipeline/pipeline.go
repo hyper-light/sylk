@@ -419,6 +419,7 @@ func stageInstructions(contract *agentShared.TaskExecutionContract, stage string
 	return "### Instructions\n\n" +
 		"Implementation evidence exists. Prefer a single tester-backed audit cycle over broad local re-auditing.\n" +
 		"If Engineer or Designer just handed work back and no tester audit is already pending, call `finalize_pipeline` to issue or recognize the single audit cycle.\n" +
+		"If `finalize_pipeline` reports `ready_for_ot: true` or `must_handoff_to_ot: true`, immediately call `handoff_to_ot` as the next tool call. Do not answer in prose first.\n" +
 		"Do not fan out into repeated audit or grading passes on unchanged workspace state. Use additional local validation tools only when a specific concrete gap remains that the current tester response or protocol state does not already answer.\n"
 }
 
@@ -602,7 +603,8 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 		AgentID: pi.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
 
-	if !fwd.FireAndForget {
+	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
+	if publishStreamLifecycle {
 		shared.PublishStreamStart(pi.bus, pi.channels, ctx, pi.id)
 		if pp := agentShared.ProgressPublisherFromContext(ctx); pp != nil {
 			pp.Publish("Inspecting the task contract, acceptance criteria, and workspace layers to derive concrete implementation failures.")
@@ -612,24 +614,30 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	result, err := pi.Handle(ctx, fwd)
 	agentShared.LogResponse(pi.steering.EventLogger(), fwd.CorrelationID, pi.id, fwd.SessionID, time.Since(startTime), err)
 
-	if fwd.FireAndForget {
-		return nil
-	}
-
 	if err != nil {
 		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
-		shared.PublishStreamError(pi.bus, pi.channels, ctx, pi.id, err)
-		shared.PublishStreamComplete(pi.bus, pi.channels, ctx, pi.id, "", usageAcc.Total())
+		if publishStreamLifecycle {
+			shared.PublishStreamError(pi.bus, pi.channels, ctx, pi.id, err)
+			shared.PublishStreamComplete(pi.bus, pi.channels, ctx, pi.id, "", usageAcc.Total())
+		}
+		if fwd.FireAndForget {
+			return nil
+		}
 		pi.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(pi.generateMessageID(), fwd.CorrelationID, pi.id, err.Error())
 		return pi.bus.Publish(pi.channels.Errors, errMsg)
 	}
 
-	shared.PublishStreamComplete(pi.bus, pi.channels, ctx, pi.id, "", usageAcc.Total())
+	if publishStreamLifecycle {
+		shared.PublishStreamComplete(pi.bus, pi.channels, ctx, pi.id, "", usageAcc.Total())
+	}
+	if fwd.FireAndForget {
+		return nil
+	}
 	pi.publishActivity(events.EventTypeAgentAction, "Inspection task completed")
 
 	respData := result

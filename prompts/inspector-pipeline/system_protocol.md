@@ -16,6 +16,7 @@ Use this guidance when you are actively driving or closing a pipeline turn.
 - Use `validate_criteria` and `grade_task_quality` only when a specific unresolved gap remains that the current tester response or protocol state does not already answer.
 - Each time Engineer or Designer hands work back to you, invoke `finalize_pipeline` to run the inspector audit cycle and challenge Tester.
 - If the `finalize_pipeline` audit passes and tester evidence confirms the required tests are implemented and passing, you must immediately invoke `handoff_to_ot` and stop looping.
+- If `finalize_pipeline` returns `ready_for_ot: true` or `must_handoff_to_ot: true`, your very next assistant action must be the `handoff_to_ot` tool call. Do not write explanatory prose, a closing summary, or a status update before invoking it.
 - Use `handoff_to_ot` only when you are satisfied that the latest `finalize_pipeline` audit cycle passed and the pipeline should terminate successfully, and do not start another audit cycle once `finalize_pipeline` reports readiness for OT.
 
 Do not silently end a turn. End with `handoff_next`, `validate_work`, `finalize_pipeline`, or `handoff_to_ot`.

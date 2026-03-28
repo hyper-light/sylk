@@ -588,7 +588,8 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		Bus: e.bus, Channels: e.channels,
 		AgentID: e.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
-	if !fwd.FireAndForget {
+	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
+	if publishStreamLifecycle {
 		shared.PublishStreamStart(e.bus, e.channels, ctx, e.id)
 		if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
 			pp.Publish("Reviewing task criteria, active test failures, and task-local workspace before implementing changes.")
@@ -598,29 +599,19 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	result, err := e.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(e.steering.EventLogger(), fwd.CorrelationID, e.id, fwd.SessionID, time.Since(startTime), err)
 
-	// Don't respond if fire-and-forget
-	if fwd.FireAndForget {
-		return nil
-	}
-
-	// Build response
-	resp := &guide.RouteResponse{
-		CorrelationID:       fwd.CorrelationID,
-		Success:             err == nil,
-		RespondingAgentID:   e.id,
-		RespondingAgentName: "Engineer",
-		ProcessingTime:      time.Since(startTime),
-	}
-
 	if err != nil {
 		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
-		shared.PublishStreamError(e.bus, e.channels, ctx, e.id, err)
-		shared.PublishStreamComplete(e.bus, e.channels, ctx, e.id, "", usageAcc.Total())
-		resp.Error = err.Error()
+		if publishStreamLifecycle {
+			shared.PublishStreamError(e.bus, e.channels, ctx, e.id, err)
+			shared.PublishStreamComplete(e.bus, e.channels, ctx, e.id, "", usageAcc.Total())
+		}
+		if fwd.FireAndForget {
+			return nil
+		}
 		e.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
 			e.generateMessageID(),
@@ -635,8 +626,21 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	if shared.DecodePipelineTaskInput(fwd.Input) != nil {
 		respData = shared.BuildPipelineTurnResponse(ctx, result)
 	}
-	resp.Data = respData
-	shared.PublishStreamComplete(e.bus, e.channels, ctx, e.id, "", usageAcc.Total())
+	if publishStreamLifecycle {
+		shared.PublishStreamComplete(e.bus, e.channels, ctx, e.id, "", usageAcc.Total())
+	}
+	if fwd.FireAndForget {
+		return nil
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:       fwd.CorrelationID,
+		Success:             true,
+		RespondingAgentID:   e.id,
+		RespondingAgentName: "Engineer",
+		ProcessingTime:      time.Since(startTime),
+		Data:                respData,
+	}
 	e.publishActivity(events.EventTypeAgentAction, "Implementation task completed")
 
 	respMsg := guide.NewResponseMessage(e.generateMessageID(), resp)

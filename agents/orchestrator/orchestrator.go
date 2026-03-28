@@ -1000,7 +1000,8 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 		AgentID: o.config.AgentID, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
 
-	if !fwd.FireAndForget {
+	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
+	if publishStreamLifecycle {
 		o.logInfo("handleBusRequest: publishing StreamStart",
 			"correlation_id", fwd.CorrelationID)
 		o.publishStreamStart(ctx)
@@ -1015,22 +1016,22 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 		"has_error", err != nil,
 		"duration", time.Since(startTime))
 
-	if fwd.FireAndForget {
-		return nil
-	}
-
-	resp := &guide.RouteResponse{
-		CorrelationID:       fwd.CorrelationID,
-		Success:             err == nil,
-		RespondingAgentID:   o.config.AgentID,
-		RespondingAgentName: "Orchestrator",
-		ProcessingTime:      time.Since(startTime),
-	}
-
 	if err != nil {
-		o.publishStreamError(ctx, err)
-		o.publishStreamComplete(ctx, "", usageAcc.Total())
-		resp.Error = err.Error()
+		if publishStreamLifecycle {
+			o.publishStreamError(ctx, err)
+			o.publishStreamComplete(ctx, "", usageAcc.Total())
+		}
+		if fwd.FireAndForget {
+			return nil
+		}
+		resp := &guide.RouteResponse{
+			CorrelationID:       fwd.CorrelationID,
+			Success:             false,
+			RespondingAgentID:   o.config.AgentID,
+			RespondingAgentName: "Orchestrator",
+			ProcessingTime:      time.Since(startTime),
+			Error:               err.Error(),
+		}
 		// Publish to BOTH error and response channels. The response channel
 		// is what the Guide relays to the source agent's synchronous waiter;
 		// the error channel is for observability/logging subscribers.
@@ -1045,20 +1046,31 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 		return o.bus.Publish(o.channels.Errors, errMsg)
 	}
 
-	resp.Data = result
-
 	// Conversation text is already streamed via chunks — send complete with
 	// empty text so the bridge doesn't duplicate content.
 	completeText := extractOrchestratorUserResponse(result)
 	if isStreamedOrchestratorConversation(result) {
 		completeText = ""
 	}
-	o.publishStreamComplete(ctx, completeText, usageAcc.Total())
+	if publishStreamLifecycle {
+		o.publishStreamComplete(ctx, completeText, usageAcc.Total())
+	}
+	if fwd.FireAndForget {
+		return nil
+	}
 
 	if o.agentPod != nil {
 		o.agentPod.FeedScribe("orchestrator", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
 	}
 
+	resp := &guide.RouteResponse{
+		CorrelationID:       fwd.CorrelationID,
+		Success:             true,
+		RespondingAgentID:   o.config.AgentID,
+		RespondingAgentName: "Orchestrator",
+		ProcessingTime:      time.Since(startTime),
+		Data:                result,
+	}
 	respMsg := guide.NewResponseMessage(generateMessageID(), resp)
 	return o.bus.Publish(o.channels.Responses, respMsg)
 }

@@ -491,6 +491,41 @@ func TestDiffWorkspaceFileSkillReturnsRenderedDiff(t *testing.T) {
 	}
 }
 
+func TestDiffWorkspaceFileSkill_MissingBaseViewDoesNotFail(t *testing.T) {
+	dir := t.TempDir()
+	svfs, views, ctx := newWorkspaceWriteSkillHarness(t, dir)
+	defer svfs.Close()
+
+	if err := svfs.NewGlobalFileAccess(false).WriteFile(ctx, "new_file.txt", []byte("global only")); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	skill := NewDiffWorkspaceFileSkill(func() WorkspaceViewAccess { return views }, nil, NewMyersDiffer(1))
+	input, _ := json.Marshal(map[string]any{
+		"path":        "new_file.txt",
+		"base_view":   "disk",
+		"target_view": "global",
+	})
+	result, err := skill.Handler(ctx, input)
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+
+	diff := result.(WorkspaceFileDiff)
+	if diff.BaseExists {
+		t.Fatal("expected missing disk base view for new file")
+	}
+	if !diff.TargetExists {
+		t.Fatal("expected global target view to exist for new file")
+	}
+	if diff.Identical {
+		t.Fatal("expected new file diff to be non-identical")
+	}
+	if !strings.Contains(diff.Rendered, "+++ global:new_file.txt") {
+		t.Fatalf("rendered diff missing global header: %q", diff.Rendered)
+	}
+}
+
 func newWorkspaceWriteSkillHarness(t *testing.T, dir string) (*SessionVFS, *SessionWorkspaceViews, context.Context) {
 	t.Helper()
 	svfs, err := NewSessionVFS(SessionVFSConfig{

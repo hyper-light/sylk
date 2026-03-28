@@ -294,7 +294,7 @@ func TestSelectorDisabledForSingleModel(t *testing.T) {
 	m.SetFocused(true)
 
 	// A seeded agent with one supported model should keep selector mode disabled.
-	m.SeedAgent("single", "engineer", "Engineer", []ModelEntry{
+	m.SeedAgent("task_single:engineer", "engineer", "Engineer", []ModelEntry{
 		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
 	}, "", "")
 
@@ -329,9 +329,9 @@ func TestDefaultModelForAgentType(t *testing.T) {
 
 func TestSeedAgentSetsModelID(t *testing.T) {
 	m := New(theme.DefaultDark())
-	m.SeedAgent("eng-1", "engineer", "Engineer", nil, "", "")
+	m.SeedAgent("task_eng_1:engineer", "engineer", "Engineer", nil, "", "")
 
-	agent := m.agents["eng-1"]
+	agent := m.agents["task_eng_1:engineer"]
 	if agent == nil {
 		t.Fatal("seeded agent not found")
 	}
@@ -349,9 +349,9 @@ func TestSeedAgentWithSupportedModels(t *testing.T) {
 		{ID: "custom-v2", DisplayName: "Custom V2"},
 		{ID: "custom-v1", DisplayName: "Custom V1"},
 	}
-	m.SeedAgent("eng-1", "engineer", "Engineer", customModels, "", "")
+	m.SeedAgent("task_eng_1:engineer", "engineer", "Engineer", customModels, "", "")
 
-	agent := m.agents["eng-1"]
+	agent := m.agents["task_eng_1:engineer"]
 	if agent == nil {
 		t.Fatal("seeded agent not found")
 	}
@@ -376,9 +376,9 @@ func TestSeedAgentWithSupportedModels(t *testing.T) {
 func TestSeedAgentWithPersistedModel(t *testing.T) {
 	m := New(theme.DefaultDark())
 	// Seed engineer with a persisted model+provider that exists in the static table.
-	m.SeedAgent("eng-1", "engineer", "Engineer", nil, "gpt-5.4-pro", "openai")
+	m.SeedAgent("task_eng_1:engineer", "engineer", "Engineer", nil, "gpt-5.4-pro", "openai")
 
-	agent := m.agents["eng-1"]
+	agent := m.agents["task_eng_1:engineer"]
 	if agent == nil {
 		t.Fatal("seeded agent not found")
 	}
@@ -395,9 +395,9 @@ func TestSeedAgentWithPersistedModel(t *testing.T) {
 func TestSeedAgentWithChatGPTAuthUsesVisibleOpenAIModel(t *testing.T) {
 	m := New(theme.DefaultDark())
 	m.SetOpenAIAuthMethod("chatgpt")
-	m.SeedAgent("eng-1", "engineer", "Engineer", nil, "gpt-5.4-pro", "openai")
+	m.SeedAgent("task_eng_1:engineer", "engineer", "Engineer", nil, "gpt-5.4-pro", "openai")
 
-	agent := m.agents["eng-1"]
+	agent := m.agents["task_eng_1:engineer"]
 	if agent == nil {
 		t.Fatal("seeded agent not found")
 	}
@@ -427,9 +427,9 @@ func TestSeedAgentWithPersistedProviderDerived(t *testing.T) {
 func TestSeedAgentWithInvalidPersistedModel(t *testing.T) {
 	m := New(theme.DefaultDark())
 	// Seed engineer with a persisted model NOT in the model list.
-	m.SeedAgent("eng-1", "engineer", "Engineer", nil, "nonexistent-model", "")
+	m.SeedAgent("task_eng_1:engineer", "engineer", "Engineer", nil, "nonexistent-model", "")
 
-	agent := m.agents["eng-1"]
+	agent := m.agents["task_eng_1:engineer"]
 	if agent == nil {
 		t.Fatal("seeded agent not found")
 	}

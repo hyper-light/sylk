@@ -73,21 +73,21 @@ func (s AgentStatus) String() string {
 
 // AgentState holds the current state of a single agent.
 type AgentState struct {
-	ID                string
-	RoutingID         string
-	Name              string
-	AgentType         string
-	Category          string // "standalone", "pipeline", "knowledge" — resolved from agentCategoryByType.
-	PipelineID        string // Non-empty when the agent is a pipeline member.
-	Status            AgentStatus
-	ActivityState     events.AgentUIState
-	TaskSummary       string
-	ContextUsage      float64 // 0.0 to 1.0
-	ModelID           string  // Currently assigned model ID (e.g. "claude-opus-4-6").
-	ProviderID        string  // Provider for ModelID (e.g. "anthropic", "google", "openai").
-	toolSummaryPinned bool
-	pinnedToolCallKey string
-	activeCorrelationID string
+	ID                        string
+	RoutingID                 string
+	Name                      string
+	AgentType                 string
+	Category                  string // "standalone", "pipeline", "knowledge" — resolved from agentCategoryByType.
+	PipelineID                string // Non-empty when the agent is a pipeline member.
+	Status                    AgentStatus
+	ActivityState             events.AgentUIState
+	TaskSummary               string
+	ContextUsage              float64 // 0.0 to 1.0
+	ModelID                   string  // Currently assigned model ID (e.g. "claude-opus-4-6").
+	ProviderID                string  // Provider for ModelID (e.g. "anthropic", "google", "openai").
+	toolSummaryPinned         bool
+	pinnedToolCallKey         string
+	activeCorrelationID       string
 	lastTerminalCorrelationID string
 
 	// SupportedModels is the raw per-agent model list from the backend.
@@ -231,6 +231,28 @@ func isPipelineAgentType(agentType string) bool {
 	}
 }
 
+func inferSeedPipelineIdentity(agentID, agentType string) (resolvedAgentType, pipelineID string) {
+	agentID = strings.TrimSpace(agentID)
+	agentType = strings.TrimSpace(agentType)
+	if scopedPipelineID, scopedAgentType, ok := parseTaskScopedPipelineAgentID(agentID); ok {
+		if pipelineID == "" {
+			pipelineID = scopedPipelineID
+		}
+		if agentType == "" {
+			agentType = scopedAgentType
+		}
+	}
+	if canonicalPipelineID, canonicalAgentType, ok := parseCanonicalPipelinePanelAgentID(agentID); ok {
+		if pipelineID == "" {
+			pipelineID = canonicalPipelineID
+		}
+		if agentType == "" {
+			agentType = canonicalAgentType
+		}
+	}
+	return agentType, strings.TrimSpace(pipelineID)
+}
+
 func canonicalPipelineAgentID(agentType, pipelineID string) string {
 	agentType = strings.TrimSpace(agentType)
 	pipelineID = strings.TrimSpace(pipelineID)
@@ -241,12 +263,12 @@ func canonicalPipelineAgentID(agentType, pipelineID string) string {
 }
 
 func isInternalSidecarAgent(agentID, agentType string) bool {
-	agentID = strings.TrimSpace(agentID)
-	agentType = strings.TrimSpace(agentType)
+	agentID = strings.ToLower(strings.TrimSpace(agentID))
+	agentType = strings.ToLower(strings.TrimSpace(agentType))
 	if agentType == "scribe" || strings.HasPrefix(agentType, "scribe-") {
 		return true
 	}
-	return strings.HasPrefix(agentID, "scribe-")
+	return agentID == "scribe" || strings.HasPrefix(agentID, "scribe-")
 }
 
 func parseTaskScopedPipelineAgentID(agentID string) (taskID, agentType string, ok bool) {
@@ -918,10 +940,10 @@ func (m *Model) ensureAgentForLiveEvent(panelID, rawAgentID, agentType, agentNam
 
 	ev := msg.ActivityEventMsg{
 		Event: &events.ActivityEvent{
-			EventType: events.EventTypeAgentAction,
-			Timestamp: time.Now(),
-			AgentID:   panelID,
-			Data:      data,
+			EventType:  events.EventTypeAgentAction,
+			Timestamp:  time.Now(),
+			AgentID:    panelID,
+			Data:       data,
 			Visibility: events.VisibilityUser,
 		},
 	}
@@ -931,11 +953,12 @@ func (m *Model) ensureAgentForLiveEvent(panelID, rawAgentID, agentType, agentNam
 }
 
 func (m *Model) canonicalizeAgentID(agentID string, ev msg.ActivityEventMsg) string {
-	agentType, pipelineID := m.inferActivityAgentIdentity(agentID, ev)
+	candidateID := firstNonEmptyTrimmed(extractString(ev.Event.Data, "runtime_agent_id"), agentID)
+	agentType, pipelineID := m.inferActivityAgentIdentity(candidateID, ev)
 	if panelID := canonicalPipelineAgentID(agentType, pipelineID); panelID != "" {
-		return panelID
+		return m.resolveAgentID(panelID)
 	}
-	return m.resolveAgentID(agentID)
+	return m.resolveAgentID(candidateID)
 }
 
 func (m *Model) resolveAgentID(agentID string) string {
@@ -1024,7 +1047,9 @@ func (m *Model) rehomeDuplicateAgentRows(canonicalID string, ev msg.ActivityEven
 
 // ensureAgent creates an agent entry if it does not exist, respecting the bound.
 // For standalone agents (one-per-type), re-keys the existing entry to the new
-// UUID instead of creating a duplicate. This handles two cases:
+// UUID instead of creating a duplicate. Pipeline workers stay anchored to their
+// stable task-scoped panel row and only update routing metadata when a concrete
+// runtime worker ID is observed. This handles two cases:
 //  1. Seeded placeholder (ID == AgentType) promoted on first activation.
 //  2. Re-activation after demotion: old UUID entry promoted to new UUID.
 func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
@@ -1037,10 +1062,15 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 	if isInternalSidecarAgent(agentID, agentType) {
 		return ""
 	}
+	if isPipelineAgentType(agentType) && strings.TrimSpace(pipelineID) == "" {
+		return ""
+	}
 
 	// Standalone and knowledge agents are singleton rows per type. Pipeline
-	// agents are singleton rows per (type, pipeline_id). Find any existing
-	// matching entry and re-key it to the new UUID. This covers:
+	// rows are singleton per (type, pipeline_id). Standalone placeholders are
+	// re-keyed on first activation; pipeline rows stay stable and only refresh
+	// their routing metadata when a concrete runtime worker ID is observed.
+	// This covers:
 	//  1. Seeded placeholder (ID == AgentType) promoted on first activation.
 	//  2. Re-activation after demotion: old UUID entry promoted to new UUID.
 	category := resolveAgentCategory(agentType, pipelineID)
@@ -1056,6 +1086,10 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 			existing = m.findAgentByType(agentType)
 		}
 		if existing != nil {
+			if category == "pipeline" {
+				m.reconcileExistingAgent(existing, ev)
+				return existing.ID
+			}
 			return m.promoteSeededAgent(existing, agentID, ev)
 		}
 	}
@@ -1157,6 +1191,9 @@ func (m *Model) reconcileExistingAgent(agent *AgentState, ev msg.ActivityEventMs
 		return
 	}
 	agentType, pipelineID := m.inferActivityAgentIdentity(agent.ID, ev)
+	if isPipelineAgentType(agentType) && strings.TrimSpace(pipelineID) == "" {
+		return
+	}
 	if agentType != "" {
 		agent.AgentType = agentType
 	}
@@ -1253,6 +1290,69 @@ func (m *Model) promoteSeededAgent(placeholder *AgentState, realID string, ev ms
 	m.reconcileExistingAgent(placeholder, ev)
 	m.rowsDirty = true
 	return realID
+}
+
+func (m *Model) rekeyAgentState(oldID, newID string) {
+	oldID = strings.TrimSpace(oldID)
+	newID = strings.TrimSpace(newID)
+	if oldID == "" || newID == "" || oldID == newID {
+		return
+	}
+	agent := m.agents[oldID]
+	if agent == nil {
+		return
+	}
+
+	agent.ID = newID
+	delete(m.agents, oldID)
+	m.agents[newID] = agent
+
+	stream := m.streams[oldID]
+	delete(m.streams, oldID)
+	if stream == nil {
+		stream = NewAgentEventStream()
+	}
+	m.streams[newID] = stream
+
+	for i, id := range m.order {
+		if id == oldID {
+			m.order[i] = newID
+			break
+		}
+	}
+
+	if m.engagedID == oldID {
+		m.engagedID = newID
+	}
+	if m.expanded == oldID {
+		m.expanded = newID
+	}
+
+	for alias, target := range m.aliases {
+		if target == oldID {
+			m.aliases[alias] = newID
+		}
+	}
+	delete(m.aliases, oldID)
+	m.aliases[newID] = newID
+
+	for pipelineID, pl := range m.pipelines {
+		if pl == nil {
+			continue
+		}
+		replaced := false
+		for i, id := range pl.Members {
+			if id == oldID {
+				pl.Members[i] = newID
+				replaced = true
+			}
+		}
+		if replaced {
+			m.dedupePipelineMembers(pipelineID)
+		}
+	}
+
+	m.rowsDirty = true
 }
 
 func (m *Model) ensurePipelineMembership(agentID, pipelineID string, ev msg.ActivityEventMsg) {
@@ -1388,6 +1488,9 @@ func isPlaceholderAgentID(agentID, agentType, pipelineID string) bool {
 	pipelineID = strings.TrimSpace(pipelineID)
 	if agentID == "" {
 		return false
+	}
+	if _, _, ok := parseTaskScopedPipelineAgentID(agentID); ok {
+		return true
 	}
 	if agentType != "" && agentID == agentType {
 		return true
@@ -1650,16 +1753,14 @@ func (m *Model) updateAgentMetadata(agent *AgentState, ev msg.ActivityEventMsg) 
 	}
 
 	handoffState := extractString(ev.Event.Data, "handoff_state")
+	// Panel context usage is the active LLM context-window occupancy. Handoff
+	// bridge context_usage describes handoff readiness/utilization, which is a
+	// different metric and should not overwrite the displayed context-window %.
 	if handoffState == "completed" {
 		agent.ContextUsage = 0
 	}
 	if tokens, ok := extractInt(ev.Event.Data, "context_tokens"); ok && tokens == 0 {
 		agent.ContextUsage = 0
-	}
-	if handoffState != "" {
-		if usage, ok := extractFloat(ev.Event.Data, "context_usage"); ok {
-			agent.ContextUsage = usage
-		}
 	}
 }
 
@@ -1798,10 +1899,25 @@ func (m *Model) rehomePipelineState(sourceID, targetID string) {
 		}
 	}
 
-	for _, agent := range m.agents {
-		if agent != nil && agent.PipelineID == sourceID {
-			agent.PipelineID = targetID
+	agentIDs := make([]string, 0, len(m.agents))
+	for agentID := range m.agents {
+		agentIDs = append(agentIDs, agentID)
+	}
+	for _, agentID := range agentIDs {
+		agent := m.agents[agentID]
+		if agent == nil || agent.PipelineID != sourceID {
+			continue
 		}
+		agent.PipelineID = targetID
+		canonicalAgentID := canonicalPipelineAgentID(agent.AgentType, targetID)
+		if canonicalAgentID == "" || agent.ID == canonicalAgentID {
+			continue
+		}
+		if existing := m.agents[canonicalAgentID]; existing != nil && existing != agent {
+			m.absorbDuplicateAgent(agent.ID, canonicalAgentID)
+			continue
+		}
+		m.rekeyAgentState(agent.ID, canonicalAgentID)
 	}
 	for _, variant := range m.variants {
 		if variant != nil && variant.PipelineID == sourceID {
@@ -2192,6 +2308,9 @@ func (m *Model) rebuildRows() {
 		if agent == nil {
 			continue
 		}
+		if isPipelineAgentType(agent.AgentType) && strings.TrimSpace(agent.PipelineID) == "" {
+			continue
+		}
 		if agent.PipelineID != "" {
 			if _, ok := pipelineMembers[agent.PipelineID]; ok {
 				pipelineMembers[agent.PipelineID] = appendUniqueAgentID(pipelineMembers[agent.PipelineID], agentID)
@@ -2409,10 +2528,15 @@ func (m *Model) SeedAgent(id, agentType, name string, supportedModels []ModelEnt
 	if isInternalSidecarAgent(id, agentType) {
 		return
 	}
+	id = strings.TrimSpace(id)
+	agentType, pipelineID := inferSeedPipelineIdentity(id, agentType)
+	if isPipelineAgentType(agentType) && pipelineID == "" {
+		return
+	}
 	if _, exists := m.agents[id]; exists {
 		return
 	}
-	category := agentCategoryByType[agentType]
+	category := resolveAgentCategory(agentType, pipelineID)
 	models := m.visibleModelEntries(agentType, supportedModels)
 	modelID := m.resolveAgentModelID(models, "")
 	if persistedModelID != "" {
@@ -2424,9 +2548,11 @@ func (m *Model) SeedAgent(id, agentType, name string, supportedModels []ModelEnt
 	}
 	agent := &AgentState{
 		ID:              id,
+		RoutingID:       defaultRoutingAgentID(id, agentType, pipelineID),
 		Name:            name,
 		AgentType:       agentType,
 		Category:        category,
+		PipelineID:      pipelineID,
 		Status:          StatusIdle,
 		ModelID:         modelID,
 		ProviderID:      providerID,
@@ -2435,6 +2561,23 @@ func (m *Model) SeedAgent(id, agentType, name string, supportedModels []ModelEnt
 	m.agents[id] = agent
 	m.streams[id] = NewAgentEventStream()
 	m.order = append(m.order, id)
+	if pipelineID != "" {
+		pl, ok := m.pipelines[pipelineID]
+		if !ok {
+			pl = &PipelineState{
+				ID:        pipelineID,
+				TaskID:    pipelineID,
+				TaskLabel: fallbackPipelineTaskLabel(pipelineID, pipelineID),
+				Status:    "pending",
+				CreatedAt: time.Now(),
+			}
+			m.pipelines[pipelineID] = pl
+			m.pipelineOrder = append(m.pipelineOrder, pipelineID)
+		}
+		if !slices.Contains(pl.Members, id) {
+			pl.Members = append(pl.Members, id)
+		}
+	}
 	m.rowsDirty = true
 }
 

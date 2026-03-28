@@ -32,6 +32,25 @@ func TestPipelineWorkerAgentID_FallsBackToStablePipelineWorkerID(t *testing.T) {
 	}
 }
 
+func TestRequirePipelineWorkerAgentID_RequiresTaskScopedContext(t *testing.T) {
+	if _, err := requirePipelineWorkerAgentID(context.Background(), "tester-pipeline"); err == nil {
+		t.Fatal("expected requirePipelineWorkerAgentID() to reject missing task-scoped context")
+	}
+}
+
+func TestRequirePipelineWorkerAgentID_UsesTaskScopedIdentity(t *testing.T) {
+	ctx := container.WithCreationContext(context.Background(), container.ContainerSpec{}, container.PodID("task-7"))
+
+	got, err := requirePipelineWorkerAgentID(ctx, "tester-pipeline")
+	if err != nil {
+		t.Fatalf("requirePipelineWorkerAgentID() error = %v", err)
+	}
+	want := orchestrator.PipelineWorkerAgentID("task-7", "tester-pipeline")
+	if got != want {
+		t.Fatalf("requirePipelineWorkerAgentID() = %q, want %q", got, want)
+	}
+}
+
 func TestApplyHandoffCreationContext_MapsFactoryMetadataToContainerContext(t *testing.T) {
 	ctx := handoff.WithFactoryCreationMetadata(context.Background(), handoff.FactoryCreationMetadata{
 		AgentType: "tester-pipeline",

@@ -46,7 +46,6 @@ func RequestGuideRouteSync(ctx context.Context, cfg GuideRouteSyncRequest) (*gui
 		}
 	}
 	req.Metadata = RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
-	req.Metadata = guide.MetadataWithPreservedSourceStreamTarget(req.Metadata)
 	if req.Timestamp.IsZero() {
 		req.Timestamp = time.Now()
 	}

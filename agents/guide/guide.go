@@ -2363,6 +2363,9 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 	if info == nil {
 		return fmt.Errorf("routing info is nil")
 	}
+	if isInternalSidecarRoutingInfo(info) {
+		return nil
+	}
 
 	// Register with routing aggregator (aliases, actions, triggers)
 	g.routing.RegisterAgent(info)
@@ -2467,6 +2470,9 @@ func (g *Guide) subscribeToAgentChannels(agentID string, channels *AgentChannels
 func (g *Guide) PreRegister(info *AgentRoutingInfo) error {
 	if info == nil {
 		return fmt.Errorf("routing info is nil")
+	}
+	if isInternalSidecarRoutingInfo(info) {
+		return nil
 	}
 	g.routing.RegisterAgent(info)
 	if info.Type != "" {

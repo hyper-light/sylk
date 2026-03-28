@@ -4651,6 +4651,43 @@ func parseTaskScopedPipelineAgentID(agentID string) (taskID, agentType string, o
 	}
 }
 
+func parseCanonicalPipelinePanelAgentID(agentID string) (pipelineID, agentType string, ok bool) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return "", "", false
+	}
+	for _, candidateType := range []string{"inspector-pipeline", "tester-pipeline", "engineer", "designer"} {
+		suffix := ":" + candidateType
+		if !strings.HasSuffix(agentID, suffix) {
+			continue
+		}
+		pipelineID = strings.TrimSpace(strings.TrimSuffix(agentID, suffix))
+		if pipelineID == "" {
+			return "", "", false
+		}
+		return pipelineID, candidateType, true
+	}
+	return "", "", false
+}
+
+func isPipelineWorkerType(agentType string) bool {
+	switch strings.TrimSpace(agentType) {
+	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+		return true
+	default:
+		return false
+	}
+}
+
+func canonicalPipelineWorkerPlaceholderID(agentType, pipelineID string) string {
+	agentType = strings.TrimSpace(agentType)
+	pipelineID = strings.TrimSpace(pipelineID)
+	if !isPipelineWorkerType(agentType) || pipelineID == "" {
+		return ""
+	}
+	return pipelineID + ":" + agentType
+}
+
 func streamPanelAgentID(agentID, agentType, pipelineID string) string {
 	if scopedTaskID, scopedAgentType, ok := parseTaskScopedPipelineAgentID(agentID); ok {
 		if strings.TrimSpace(pipelineID) == "" {
@@ -4660,19 +4697,64 @@ func streamPanelAgentID(agentID, agentType, pipelineID string) string {
 			agentType = scopedAgentType
 		}
 	}
+	if canonicalPipelineID, canonicalAgentType, ok := parseCanonicalPipelinePanelAgentID(agentID); ok {
+		if strings.TrimSpace(pipelineID) == "" {
+			pipelineID = canonicalPipelineID
+		}
+		if strings.TrimSpace(agentType) == "" {
+			agentType = canonicalAgentType
+		}
+	}
 	agentType = strings.TrimSpace(agentType)
 	pipelineID = strings.TrimSpace(pipelineID)
-	if pipelineID != "" {
-		switch agentType {
-		case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
-			return pipelineID + ":" + agentType
-		}
+	if placeholder := canonicalPipelineWorkerPlaceholderID(agentType, pipelineID); placeholder != "" {
+		return placeholder
 	}
 	return normalizeAgentID(firstNonEmpty(agentID, agentType))
 }
 
 func canonicalStreamAgentID(agentID, agentType, pipelineID, taskID string) string {
 	return streamPanelAgentID(agentID, agentType, logicalStreamPipelineID(pipelineID, taskID))
+}
+
+func effectiveCanonicalStreamAgentID(entry *activeStreamEntry, agentID, agentType, pipelineID, taskID string) string {
+	effectiveType := firstNonEmpty(strings.TrimSpace(agentType), strings.TrimSpace(entryAgentType(entry)))
+	effectivePipelineID := firstNonEmpty(
+		logicalStreamPipelineID(pipelineID, taskID),
+		logicalStreamPipelineID(entryPipelineID(entry), entryTaskID(entry)),
+	)
+	if placeholder := canonicalPipelineWorkerPlaceholderID(effectiveType, effectivePipelineID); placeholder != "" {
+		return placeholder
+	}
+	canonicalID := canonicalStreamAgentID(agentID, agentType, pipelineID, taskID)
+	if strings.TrimSpace(canonicalID) != "" {
+		return canonicalID
+	}
+	if entry != nil {
+		return strings.TrimSpace(entry.AgentID)
+	}
+	return canonicalID
+}
+
+func entryAgentType(entry *activeStreamEntry) string {
+	if entry == nil {
+		return ""
+	}
+	return entry.AgentType
+}
+
+func entryPipelineID(entry *activeStreamEntry) string {
+	if entry == nil {
+		return ""
+	}
+	return entry.PipelineID
+}
+
+func entryTaskID(entry *activeStreamEntry) string {
+	if entry == nil {
+		return ""
+	}
+	return entry.TaskID
 }
 
 func firstNonEmpty(values ...string) string {
@@ -4723,15 +4805,16 @@ func canonicalActivityAgentID(ev *events.ActivityEvent) string {
 	if ev == nil {
 		return ""
 	}
+	rawAgentID := firstNonEmpty(activityDataString(ev.Data, "runtime_agent_id"), ev.AgentID)
 	agentType := activityDataString(ev.Data, "agent_type")
 	pipelineID := logicalStreamPipelineID(
 		activityDataString(ev.Data, "pipeline_id"),
 		activityDataString(ev.Data, "task_id"),
 	)
-	if canonical := streamPanelAgentID(ev.AgentID, agentType, pipelineID); canonical != "" {
+	if canonical := streamPanelAgentID(rawAgentID, agentType, pipelineID); canonical != "" {
 		return canonical
 	}
-	return normalizeAgentID(firstNonEmpty(ev.AgentID, agentType))
+	return normalizeAgentID(firstNonEmpty(rawAgentID, agentType))
 }
 
 func (m *AppModel) applyActivityTelemetry(activity msg.ActivityEventMsg) {
@@ -6511,7 +6594,13 @@ func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg)
 	if m.shouldIgnoreLateStreamBootstrap(progress.CorrelationID) {
 		return nil
 	}
-	progress.AgentID = canonicalStreamAgentID(progress.AgentID, progress.AgentType, progress.PipelineID, progress.TaskID)
+	progress.AgentID = effectiveCanonicalStreamAgentID(
+		m.streamEntryForCorrelation(progress.CorrelationID),
+		progress.AgentID,
+		progress.AgentType,
+		progress.PipelineID,
+		progress.TaskID,
+	)
 	progress.BranchRef = m.effectiveStreamBranchRef(progress.CorrelationID, progress.BranchRef)
 	start := msg.StreamStartMsg{
 		SessionID:     progress.SessionID,
@@ -6537,7 +6626,13 @@ func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg)
 }
 
 func (m *AppModel) handleToolCallTelemetry(ev msg.ToolCallEventMsg) tea.Cmd {
-	ev.AgentID = canonicalStreamAgentID(ev.AgentID, ev.AgentType, ev.PipelineID, ev.TaskID)
+	ev.AgentID = effectiveCanonicalStreamAgentID(
+		m.streamEntryForCorrelation(ev.CorrelationID),
+		ev.AgentID,
+		ev.AgentType,
+		ev.PipelineID,
+		ev.TaskID,
+	)
 	ev.BranchRef = m.effectiveStreamBranchRef(ev.CorrelationID, ev.BranchRef)
 
 	correlationID := strings.TrimSpace(ev.CorrelationID)
@@ -6585,7 +6680,13 @@ func (m *AppModel) handleToolCallTelemetry(ev msg.ToolCallEventMsg) tea.Cmd {
 }
 
 func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea.Cmd {
-	done.AgentID = canonicalStreamAgentID(done.AgentID, done.AgentType, done.PipelineID, done.TaskID)
+	done.AgentID = effectiveCanonicalStreamAgentID(
+		m.streamEntryForCorrelation(done.CorrelationID),
+		done.AgentID,
+		done.AgentType,
+		done.PipelineID,
+		done.TaskID,
+	)
 	done.BranchRef = m.effectiveStreamBranchRef(done.CorrelationID, done.BranchRef)
 	uiDebugFileLog().Info("AppModel: STREAM_COMPLETE_RECEIVED",
 		"correlation_id", done.CorrelationID,

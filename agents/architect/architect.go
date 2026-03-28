@@ -878,7 +878,8 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	a.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer a.clearInFlight(fwd.CorrelationID)
 	defer cancel()
-	if !fwd.FireAndForget {
+	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
+	if publishStreamLifecycle {
 		a.publishPlanStreamStart(reqCtx)
 	}
 	a.logInfo("handleForwardBusRequest: calling processForwardedRequest",
@@ -892,46 +893,47 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 		"has_result", result != nil,
 		"err", err)
 
-	// Don't respond if fire-and-forget
-	if fwd.FireAndForget {
-		a.logInfo("handleForwardBusRequest: fire-and-forget, not responding",
-			"correlation_id", fwd.CorrelationID)
-		return nil
-	}
-
-	// Build response
-	resp := &guide.RouteResponse{
-		CorrelationID:       fwd.CorrelationID,
-		Success:             err == nil,
-		RespondingAgentID:   a.id,
-		RespondingAgentName: "architect",
-		ProcessingTime:      time.Since(startTime),
-	}
-
 	if err != nil {
 		if a.isInterruptError(err) {
-			// Publish a stream complete FIRST so the TUI receives
-			// StreamCompleteMsg and clears the activeRoute before the
-			// GuideResponseMsg arrives. Without this, the stale
-			// activeRoute causes subsequent messages to be enqueued
-			// without a thinking indicator. Using StreamComplete
-			// (rather than StreamError) means:
-			//  1. For user Ctrl+C: shouldRenderStreamEvent returns
-			//     false (CID in interruptedCorrelations) so no
-			//     duplicate display.
-			//  2. For system interrupts: the thinking entry resolves
-			//     cleanly with the interrupted text.
-			//  3. The subsequent GuideResponseMsg error is suppressed
-			//     by shouldSuppressErrorAfterSuccess.
-			a.publishPlanStreamComplete(reqCtx, "(interrupted)", usageAcc.Total(), nil)
+			if publishStreamLifecycle {
+				// Publish a stream complete FIRST so the TUI receives
+				// StreamCompleteMsg and clears the activeRoute before the
+				// GuideResponseMsg arrives. Without this, the stale
+				// activeRoute causes subsequent messages to be enqueued
+				// without a thinking indicator. Using StreamComplete
+				// (rather than StreamError) means:
+				//  1. For user Ctrl+C: shouldRenderStreamEvent returns
+				//     false (CID in interruptedCorrelations) so no
+				//     duplicate display.
+				//  2. For system interrupts: the thinking entry resolves
+				//     cleanly with the interrupted text.
+				//  3. The subsequent GuideResponseMsg error is suppressed
+				//     by shouldSuppressErrorAfterSuccess.
+				a.publishPlanStreamComplete(reqCtx, "(interrupted)", usageAcc.Total(), nil)
+			}
+			if fwd.FireAndForget {
+				a.logInfo("handleForwardBusRequest: fire-and-forget interrupted",
+					"correlation_id", fwd.CorrelationID)
+				return nil
+			}
 			// Then publish a minimal response so the Guide records
 			// something in conversation history rather than leaving
 			// an empty agent reply that causes context loss.
 			a.publishInterruptResponse(fwd)
 			return nil
 		}
-		a.publishPlanStreamError(reqCtx, err)
-		resp.Error = err.Error()
+		if publishStreamLifecycle {
+			a.publishPlanStreamError(reqCtx, err)
+			if fwd.FireAndForget {
+				a.publishPlanStreamComplete(reqCtx, "", usageAcc.Total(), nil)
+			}
+		}
+		if fwd.FireAndForget {
+			a.logInfo("handleForwardBusRequest: fire-and-forget failed",
+				"correlation_id", fwd.CorrelationID,
+				"error", err)
+			return nil
+		}
 		// Publish to error channel
 		errMsg := guide.NewErrorMessage(
 			a.generateMessageID(),
@@ -941,8 +943,6 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 		)
 		return a.bus.Publish(a.channels.Errors, errMsg)
 	}
-
-	resp.Data = result
 
 	// Handoff reroute events are emitted INSIDE dispatchPlanExecution (and
 	// stepAutoHandoff when AutoApprove is enabled) — before the synchronous
@@ -961,12 +961,27 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 		"directive_phase", directivePhaseStr(directive),
 		"directive_agent", directiveAgentStr(directive),
 		"complete_text_len", len(completeText))
-	a.publishPlanStreamComplete(reqCtx, completeText, usageAcc.Total(), directive)
+	if publishStreamLifecycle {
+		a.publishPlanStreamComplete(reqCtx, completeText, usageAcc.Total(), directive)
+	}
+	if fwd.FireAndForget {
+		a.logInfo("handleForwardBusRequest: fire-and-forget completed",
+			"correlation_id", fwd.CorrelationID)
+		return nil
+	}
 
 	if a.agentPod != nil {
 		a.agentPod.FeedScribe("architect", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
 	}
 
+	resp := &guide.RouteResponse{
+		CorrelationID:       fwd.CorrelationID,
+		Success:             true,
+		RespondingAgentID:   a.id,
+		RespondingAgentName: "architect",
+		ProcessingTime:      time.Since(startTime),
+		Data:                result,
+	}
 	// Publish response to own response channel
 	respMsg := guide.NewResponseMessage(a.generateMessageID(), resp)
 	return a.bus.Publish(a.channels.Responses, respMsg)

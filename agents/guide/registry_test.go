@@ -192,6 +192,39 @@ func TestRegistry_FindBestMatch(t *testing.T) {
 	// May be nil or match based on implementation
 }
 
+func TestRegistry_IgnoresSidecarRegistrations(t *testing.T) {
+	registry := guide.NewRegistry()
+
+	registry.Register(&guide.AgentRegistration{
+		ID:   "scribe-architect-1234",
+		Name: "scribe-architect",
+		Capabilities: guide.AgentCapabilities{
+			Priority: 999,
+		},
+		Priority: 999,
+	})
+	registry.Register(&guide.AgentRegistration{
+		ID:   "architect",
+		Name: "architect",
+		Capabilities: guide.AgentCapabilities{
+			Intents: []guide.Intent{guide.IntentPlan, guide.IntentHelp},
+			Domains: []guide.Domain{guide.DomainDesign, guide.DomainTasks},
+		},
+		Priority: 90,
+	})
+
+	assert.Nil(t, registry.Get("scribe-architect-1234"))
+	assert.Nil(t, registry.GetByName("scribe-architect"))
+
+	best := registry.FindBestMatch(&guide.RouteResult{
+		Intent: guide.IntentPlan,
+		Domain: guide.DomainDesign,
+	})
+	require.NotNil(t, best)
+	assert.Equal(t, "architect", best.ID)
+	assert.Len(t, registry.GetAll(), 1)
+}
+
 // TestRegistry_NewRegistryWithDefaults tests default registry
 func TestRegistry_NewRegistryWithDefaults(t *testing.T) {
 	registry := guide.NewRegistryWithDefaults()

@@ -94,6 +94,186 @@ func TestGuideRoute_ExplicitTargetAndFollowupContinuity(t *testing.T) {
 	}
 }
 
+func TestGuideRoute_ExplicitGuideFollowupDoesNotRemapToSidecar(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	defer func() { _ = bus.Close() }()
+
+	g, err := NewWithClassifier(NewRuleClassifierClient(), Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "session-sidecar",
+	})
+	if err != nil {
+		t.Fatalf("new guide: %v", err)
+	}
+
+	err = g.Register(&AgentRoutingInfo{
+		ID:   "architect",
+		Type: "architect",
+		Name: "architect",
+		Registration: &AgentRegistration{
+			ID:   "architect",
+			Name: "architect",
+			Capabilities: AgentCapabilities{
+				Intents: []Intent{IntentPlan, IntentDesign, IntentCheck, IntentHelp},
+				Domains: []Domain{DomainDesign, DomainTasks},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("register architect: %v", err)
+	}
+
+	if err := g.Register(&AgentRoutingInfo{
+		ID:   "scribe-architect-deadbeef",
+		Type: "scribe-architect",
+		Name: "scribe-architect",
+		Registration: &AgentRegistration{
+			ID:   "scribe-architect-deadbeef",
+			Name: "scribe-architect",
+			Capabilities: AgentCapabilities{
+				Priority: 999,
+			},
+			Priority: 999,
+		},
+	}); err != nil {
+		t.Fatalf("register sidecar: %v", err)
+	}
+
+	first := &RouteRequest{
+		Input:         "Design a migration plan",
+		SourceAgentID: "tui",
+		TargetAgentID: "architect",
+		SessionID:     "session-sidecar",
+		Timestamp:     time.Now(),
+	}
+	forwarded, err := g.Route(context.Background(), first)
+	if err != nil {
+		t.Fatalf("route explicit architect: %v", err)
+	}
+	if forwarded.TargetAgentID != "architect" {
+		t.Fatalf("explicit route target = %q, want architect", forwarded.TargetAgentID)
+	}
+
+	g.conversation.ObserveRoutedRequest("session-sidecar", "scribe-architect")
+
+	followup := &RouteRequest{
+		Input:         "Use the guide to continue planning",
+		SourceAgentID: "tui",
+		TargetAgentID: "guide",
+		SessionID:     "session-sidecar",
+		Timestamp:     time.Now(),
+	}
+	followed, err := g.Route(context.Background(), followup)
+	if err != nil {
+		t.Fatalf("route follow-up: %v", err)
+	}
+	if followed.TargetAgentID != "architect" {
+		t.Fatalf("follow-up target = %q, want architect", followed.TargetAgentID)
+	}
+	if g.resolveAgent("scribe-architect-deadbeef") != nil {
+		t.Fatal("expected sidecar registration to be ignored by guide")
+	}
+}
+
+func TestGuideRoute_NestedConsultDoesNotStealConversationStickiness(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	defer func() { _ = bus.Close() }()
+
+	g, err := NewWithClassifier(NewRuleClassifierClient(), Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "session-nested",
+	})
+	if err != nil {
+		t.Fatalf("new guide: %v", err)
+	}
+
+	for _, info := range []*AgentRoutingInfo{
+		{
+			ID:   "architect",
+			Type: "architect",
+			Name: "architect",
+			Registration: &AgentRegistration{
+				ID:   "architect",
+				Name: "architect",
+				Capabilities: AgentCapabilities{
+					Intents: []Intent{IntentPlan, IntentDesign, IntentCheck, IntentHelp},
+					Domains: []Domain{DomainDesign, DomainTasks},
+				},
+			},
+		},
+		{
+			ID:   "librarian",
+			Type: "librarian",
+			Name: "librarian",
+			Registration: &AgentRegistration{
+				ID:   "librarian",
+				Name: "librarian",
+				Capabilities: AgentCapabilities{
+					Intents: []Intent{IntentFind, IntentSearch, IntentHelp},
+					Domains: []Domain{DomainCode, DomainFiles, DomainLocal},
+				},
+			},
+		},
+	} {
+		if err := g.Register(info); err != nil {
+			t.Fatalf("register %s: %v", info.Name, err)
+		}
+	}
+
+	first := &RouteRequest{
+		Input:         "Design a migration plan",
+		SourceAgentID: "tui",
+		TargetAgentID: "architect",
+		SessionID:     "session-nested",
+		Timestamp:     time.Now(),
+	}
+	forwarded, err := g.Route(context.Background(), first)
+	if err != nil {
+		t.Fatalf("route explicit architect: %v", err)
+	}
+	if forwarded.TargetAgentID != "architect" {
+		t.Fatalf("explicit route target = %q, want architect", forwarded.TargetAgentID)
+	}
+
+	nested := &RouteRequest{
+		Input:         "Check repository conventions for this plan",
+		SourceAgentID: "architect",
+		TargetAgentID: "librarian",
+		SessionID:     "session-nested",
+		Timestamp:     time.Now(),
+		Metadata: map[string]any{
+			"chat_nested_branch":         true,
+			"chat_parent_correlation_id": "corr-parent",
+			"chat_parent_tool_call_key":  "consult-1",
+			"chat_inter_agent_kind":      "consult",
+		},
+	}
+	nestedForwarded, err := g.Route(context.Background(), nested)
+	if err != nil {
+		t.Fatalf("route nested consult: %v", err)
+	}
+	if nestedForwarded.TargetAgentID != "librarian" {
+		t.Fatalf("nested route target = %q, want librarian", nestedForwarded.TargetAgentID)
+	}
+
+	followup := &RouteRequest{
+		Input:         "Continue the planning through the guide",
+		SourceAgentID: "tui",
+		TargetAgentID: "guide",
+		SessionID:     "session-nested",
+		Timestamp:     time.Now(),
+	}
+	followed, err := g.Route(context.Background(), followup)
+	if err != nil {
+		t.Fatalf("route follow-up: %v", err)
+	}
+	if followed.TargetAgentID != "architect" {
+		t.Fatalf("follow-up target = %q, want architect", followed.TargetAgentID)
+	}
+}
+
 func TestGuideRoute_AppliesDeferredStreamRerouteToNewPending(t *testing.T) {
 	bus := NewChannelBus(DefaultChannelBusConfig())
 	defer func() { _ = bus.Close() }()

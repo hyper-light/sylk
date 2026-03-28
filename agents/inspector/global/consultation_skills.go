@@ -107,7 +107,7 @@ func consultAcademicApproachSkill(gi *GlobalInspector) *skills.Skill {
 		Domain("audit").
 		Keywords("academic", "alternative", "approach", "performance", "correctness", "tradeoff").
 		Priority(95).
-		Usage("Use proactively when a better implementation, cleaner design, or stronger overall approach may exist. This is the main tool for challenging the current solution or even the architect's plan.").
+		Usage("Use proactively when a better implementation, cleaner design, or stronger overall approach may exist. Prefer targeted challenges to the next material concern rather than a single broad review request. This is the main tool for challenging the current solution or even the architect's plan.").
 		Requirement("Provide the current approach, the concrete concern, and enough context for the Academic to compare alternatives.").
 		Satisfies("Adds principled comparative evidence about whether the current implementation and overall approach are actually the best available fit.").
 		Avoid("Do not accept an implementation as 'good enough' without comparison when a stronger alternative is plausible.").
@@ -116,7 +116,8 @@ func consultAcademicApproachSkill(gi *GlobalInspector) *skills.Skill {
 		StringParam("context", "Optional surrounding context", false).
 		EnumParam("depth", "Research depth for the Academic consultation", agentShared.ResearchDepthEnumValues(), false).
 		ArrayParam("files", "Relevant files or packages", "string", false).
-		BestPractice("Use `minimal` or `quick` for a fast challenge to a local implementation choice, `standard` for normal audit-time tradeoff checking, `deep` when the audit hinges on stronger alternatives or deeper correctness/performance reasoning, and `comprehensive` when the review needs a reusable research-grade challenge to the overall approach.").
+		BestPractice("Ask one concrete challenge question at a time. Re-consult when the audit focus changes, the prior answer exposes a new concern, or the implementation evidence shifts materially.").
+		BestPractice("Use `minimal` or `quick` for a fast challenge to a local implementation choice, `standard` for normal audit-time tradeoff checking, `deep` when the audit hinges on stronger alternatives or deeper correctness/performance reasoning, and `comprehensive` when the review needs a reusable research-grade challenge to the overall approach. Re-evaluate that depth each time the audit question changes.").
 		BestPractice("Do not escalate to `comprehensive` just because the code is large. Escalate when the risk, architectural reach, or decision cost is high enough that broader corroboration could change the verdict.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {

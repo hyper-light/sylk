@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,15 +16,21 @@ import (
 )
 
 type scriptedPipelineProvider struct {
-	mu        sync.Mutex
-	responses []*providers.Response
-	calls     int
+	mu             sync.Mutex
+	responses      []*providers.Response
+	requestInspect map[int]func(*providers.Request) error
+	calls          int
 }
 
-func (p *scriptedPipelineProvider) Complete(_ context.Context, _ *providers.Request) (*providers.Response, error) {
+func (p *scriptedPipelineProvider) Complete(_ context.Context, req *providers.Request) (*providers.Response, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if inspect := p.requestInspect[p.calls]; inspect != nil {
+		if err := inspect(req); err != nil {
+			return nil, err
+		}
+	}
 	if p.calls >= len(p.responses) {
 		return nil, fmt.Errorf("unexpected provider call %d", p.calls+1)
 	}
@@ -166,5 +173,111 @@ func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToOT(t *testing.T) {
 
 	if provider.calls != 3 {
 		t.Fatalf("provider calls = %d, want 3", provider.calls)
+	}
+}
+
+func TestHandle_PromptsImmediateHandoffToOTAfterFinalizePipelineReady(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	provider := &scriptedPipelineProvider{
+		responses: []*providers.Response{
+			{
+				ToolCalls: []providers.ToolCall{{
+					ID:   "tool-finalize",
+					Name: "finalize_pipeline",
+					Arguments: `{
+						"summary":"Tester-backed audit passed.",
+						"evidence_refs":["artifact:inspector"]
+					}`,
+				}},
+			},
+			{
+				ToolCalls: []providers.ToolCall{{
+					ID:   "tool-ot",
+					Name: "handoff_to_ot",
+					Arguments: `{
+						"summary":"Ready for OT merge.",
+						"evidence_refs":["artifact:inspector","artifact:tester"]
+					}`,
+				}},
+			},
+		},
+		requestInspect: map[int]func(*providers.Request) error{
+			1: func(req *providers.Request) error {
+				if req == nil {
+					return fmt.Errorf("request is nil")
+				}
+				for i := len(req.Messages) - 1; i >= 0; i-- {
+					msg := req.Messages[i]
+					if msg.Role != providers.RoleUser {
+						continue
+					}
+					if strings.Contains(msg.Content, "Your very next tool call in this turn must be `handoff_to_ot`") {
+						return nil
+					}
+					return fmt.Errorf("latest user follow-up = %q, want immediate handoff_to_ot instruction", msg.Content)
+				}
+				return fmt.Errorf("no user follow-up message found before second provider call")
+			},
+		},
+	}
+
+	pi, err := New(inspectorshared.PipelineInspectorConfig{
+		AgentID:        "inspector-pipeline",
+		SessionID:      "sess-2",
+		MaxToolRuns:    1,
+		DefaultTimeout: 5 * time.Second,
+	}, nil)
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = pi.Close()
+	})
+	pi.SetProvider(provider)
+	pi.bus = bus
+	pi.state.CurrentTaskID = "task-2"
+
+	task := &agentShared.PipelineTaskInput{
+		NodeID:        "task-2",
+		DAGID:         "dag-2",
+		TaskID:        "task-2",
+		AgentType:     agentShared.PipelineAgentInspector,
+		TargetAgentID: "inspector-pipeline",
+		Prompt:        "Audit the completed task.",
+		Context: map[string]any{
+			"pipeline_stage": "execute",
+			"pipeline_protocol": agentShared.PipelineProtocolSnapshotMap(&agentShared.PipelineProtocolSnapshot{
+				PendingValidation: &agentShared.PipelineValidationRecord{
+					ChallengeID:         "challenge-ready-2",
+					RequestingAgent:     agentShared.PipelineAgentInspector,
+					RespondingAgent:     agentShared.PipelineAgentTester,
+					Status:              string(agentShared.PipelineValidationPassed),
+					Summary:             "tester accepted the audit",
+					ChallengeReferences: []string{"finalize_pipeline_verification"},
+					EvidenceRefs:        []string{"artifact:tester"},
+				},
+			}),
+		},
+		SessionID: "sess-2",
+	}
+	input, err := json.Marshal(task)
+	if err != nil {
+		t.Fatalf("Marshal(task): %v", err)
+	}
+
+	if _, err := pi.Handle(context.Background(), &guide.ForwardedRequest{
+		CorrelationID: "pipe-test-2",
+		Input:         string(input),
+		SourceAgentID: "orchestrator",
+		TargetAgentID: "inspector-pipeline",
+		SessionID:     "sess-2",
+	}); err != nil {
+		t.Fatalf("Handle(): %v", err)
+	}
+
+	if provider.calls != 2 {
+		t.Fatalf("provider calls = %d, want 2", provider.calls)
 	}
 }

@@ -2,7 +2,7 @@
 
 Use skills intentionally and in order:
 
-1. During substantive discussion before planning, default to `consult` (mode=knowledge, target=librarian/archivalist/academic) as new material information arrives; only skip a target when it is clearly irrelevant or its evidence is already fresh
+1. During substantive discussion before planning, use `consult` (mode=knowledge, target=...) continuously as new material information arrives, starting with the most relevant knowledge agent and adding others only when a concrete unresolved question remains
 2. `start_planning` — create the formal plan only after the discussion has produced a strong enough evidence base
 3. `plan` (action=analyze) — synthesize the conversation, consultations, constraints, and user intent into explicit requirements
 4. `consult` (mode=pre_planning) — consolidate existing consultation evidence, refresh stale evidence if needed, and identify any remaining gaps before design
@@ -21,13 +21,14 @@ For planning initiation:
 - use `ask_user_question` when critical ambiguities would lead to a wrong plan
 
 During discussion before planning:
-- for the first substantive implementation, planning, or architecture turn on a new problem, default to consulting the full knowledge triad: Librarian + Archivalist + Academic
-- treat that triad consultation as the normal starting move for serious discussion, not as an escalation you wait to justify
-- continue consulting the triad whenever the user materially changes scope, constraints, preferences, stack, quality bar, or direction
+- for the first substantive implementation, planning, or architecture turn on a new problem, start with the most relevant knowledge agent and the narrowest question that can materially reduce the next uncertainty
+- prefer repeated targeted consults over a single broad omnibus consult
+- continue consulting throughout the conversation whenever the user materially changes scope, constraints, preferences, stack, quality bar, or direction
 - consult the Librarian when the user reveals codebase-fit, implementation-shape, or local-pattern concerns
 - consult the Archivalist when the user reveals prior preferences, prior failure modes, historical context, or continuity concerns
 - consult the Academic when the user reveals architecture, correctness, performance, testing, infrastructure, deployment, or tradeoff questions
-- only skip one of the three when it is clearly irrelevant to the current turn or you already have fresh evidence from that source
+- only add another knowledge agent when that agent can answer a concrete unresolved question or refresh evidence that has gone stale
+- re-evaluate Academic depth each time you consult: begin with `minimal` or `quick` for narrow validation, escalate to `standard`, `deep`, or `comprehensive` only when broader corroboration could materially change the decision
 - do not wait for keywords like "research" or "benchmark" to consult the Academic
 - do not defer obvious evidence gathering until `start_planning`
 

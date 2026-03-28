@@ -62,7 +62,7 @@ func TestWaitForPendingResponse_TimesOutAfterSilence(t *testing.T) {
 	}
 }
 
-func TestRequestRouteSync_PreservesChildSourceStreamTarget(t *testing.T) {
+func TestRequestRouteSync_DoesNotPreserveChildSourceStreamTarget(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
@@ -124,9 +124,8 @@ func TestRequestRouteSync_PreservesChildSourceStreamTarget(t *testing.T) {
 		if req.ParentCorrelationID != "corr-parent" {
 			t.Fatalf("parent_correlation_id = %q, want %q", req.ParentCorrelationID, "corr-parent")
 		}
-		value, ok := req.Metadata["chat_preserve_source_stream_target"].(bool)
-		if !ok || !value {
-			t.Fatalf("chat_preserve_source_stream_target = %#v, want true", req.Metadata["chat_preserve_source_stream_target"])
+		if _, preserved := req.Metadata["chat_preserve_source_stream_target"]; preserved {
+			t.Fatalf("chat_preserve_source_stream_target = %#v, want absent", req.Metadata["chat_preserve_source_stream_target"])
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for routed request")

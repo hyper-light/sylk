@@ -341,6 +341,11 @@ Requirements:
   - If true: ask the user whether to refine or proceed. End by inviting the user
     to approve or request changes. Use your own natural phrasing — do NOT use a
     scripted template or repeat the same wording each time.
+    Make it explicit that they are reviewing the plan, not starting implementation
+    in this turn.
+    Do NOT imply that work is already beginning or will begin immediately if they
+    reply. Avoid phrases like "kick it off", "start building", "start implementing",
+    "get started", or "ship it".
     Do NOT use robotic phrasing like "Do you approve this plan?" or "Please confirm."
     Do NOT automatically invoke route_plan_acceptance, you must receive a response from
     the user.
@@ -383,11 +388,12 @@ Planning flow:
     codebase, historical, or Academic evidence. Consult the Librarian for codebase reality and
     local patterns, the Archivalist for precedent and preserved preferences, and the Academic for
     stronger alternatives, best practices, correctness, performance, testing, infrastructure, and
-    tradeoffs. For the first substantive implementation, planning, or architecture turn on a new
-    problem, default to consulting all three before you settle on your answer unless one is clearly
-    irrelevant or you already hold fresh evidence from that source. Treat the triad as your normal
-    discussion-time evidence base, not as a rare escalation path. When in doubt, consult rather
-    than assume. Not every turn needs all three, but you should refresh your evidence as the user's
+    tradeoffs. On the first substantive implementation, planning, or architecture turn on a new
+    problem, start with the most relevant knowledge agent and the narrowest question that can
+    materially reduce the next uncertainty. Prefer repeated targeted consults over one broad
+    omnibus consult. Re-evaluate Academic depth as the user's constraints evolve and your own
+    understanding improves: begin with minimal/quick for narrow validation, and escalate only when
+    broader corroboration could materially change the decision. Continue consulting as the user's
     constraints or direction materially change.
 1. When the user confirms they want to proceed with planning, invoke start_planning with a
    comprehensive query synthesizing all gathered requirements and the consultation evidence you
@@ -403,6 +409,10 @@ Planning flow:
    - Sound like a principal engineer, not a workflow bot.
 4. Invite the user to approve or request changes. Use your own natural phrasing —
    do NOT use a scripted template or repeat the same wording each time.
+   Frame it as plan review, not execution kickoff. Do NOT imply that implementation
+   is already starting or that their reply will immediately start work in this turn.
+   Avoid phrases like "kick it off", "start building", "start implementing",
+   "get started", or "ship it".
    Do NOT invoke route_plan_acceptance — wait for the user's next message.
 
 CRITICAL — Affirmative detection:
@@ -497,6 +507,11 @@ Requirements:
   - If true: ask the user whether to refine or proceed. End by inviting the user
     to approve or request changes. Use your own natural phrasing — do NOT use a
     scripted template or repeat the same wording each time.
+    Make it explicit that they are reviewing the plan, not starting implementation
+    in this turn.
+    Do NOT imply that work is already beginning or will begin immediately if they
+    reply. Avoid phrases like "kick it off", "start building", "start implementing",
+    "get started", or "ship it".
     Do NOT use robotic phrasing like "Do you approve this plan?" or "Please confirm."
   - If false: state that the plan is ready and will proceed.
 - Do not use canned lead-ins or protocol labels.
@@ -538,9 +553,11 @@ Requirements:
 - For general conversation (no planning intent), engage naturally. If the conversation
   leads to a concrete task, ask if they'd like you to create a plan.
 - During substantive implementation, planning, or architecture discussion, reason as if you
-  are actively grounding your answer in Librarian, Archivalist, and Academic evidence unless
-  one is clearly irrelevant or already fresh. On the first substantive turn for a new problem,
-  the tool-enabled path would normally consult the full knowledge triad before settling on an answer.
+  are actively grounding your answer in Librarian, Archivalist, and Academic evidence, using the
+  subset most relevant to the current unresolved question. On the first substantive turn for a new
+  problem, the tool-enabled path would normally start with the most relevant knowledge agent and
+  then continue with targeted follow-up consultations as the uncertainty narrows or the user adds
+  new constraints.
 - Prefer answers that reflect codebase reality, historical precedent, and stronger architectural
   alternatives instead of defaulting to generic advice.
 - Keep a natural, collaborative tone.
@@ -583,18 +600,28 @@ var discussionConversationTools = []string{
 	"start_planning",
 }
 
+var planningConversationTools = []string{
+	"consult",
+	"ask_user_question",
+	"route_requirements_research",
+	"start_planning",
+	"plan",
+	"route_plan_acceptance",
+}
+
 // toolsForConversationMode returns the allowed tool names for a given mode.
-// Discussion-oriented modes use a narrow tool surface so the model focuses on
-// consultation, clarification, and planning entry instead of the full planning
-// and control catalog. Feedback/ready modes restrict to acceptance tools.
+// Conversation modes that can enter or resume planning must include the tools
+// needed to finish the planning protocol in the same turn after start_planning
+// or a recovered ready-plan acceptance decision. Feedback/ready modes restrict
+// to acceptance tools.
 func toolsForConversationMode(mode plannerConversationMode) []string {
 	switch mode {
 	case plannerConversationModeConverse, plannerConversationModeExistingReady, plannerConversationModeClarification:
-		return discussionConversationTools
+		return planningConversationTools
 	case plannerConversationModeFeedback, plannerConversationModeReady:
 		return []string{"route_plan_acceptance", "ask_user_question"}
 	default:
-		return discussionConversationTools
+		return planningConversationTools
 	}
 }
 

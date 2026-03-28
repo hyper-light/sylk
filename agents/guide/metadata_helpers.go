@@ -49,11 +49,26 @@ func metadataHasNestedInterAgentBranch(metadata map[string]any) bool {
 		return false
 	}
 	switch strings.TrimSpace(strings.ToLower(metadataStringValue(metadata, metadataInterAgentKind))) {
-	case "consult", "challenge", "store":
+	case "consult", "challenge", "approval", "store":
 		return true
 	default:
 		return false
 	}
+}
+
+// ShouldPublishForwardedStreamLifecycle reports whether a forwarded request
+// should emit stream lifecycle events. Regular requests always should.
+// Fire-and-forget requests only should when they carry nested inter-agent
+// branch metadata, so parent chat branches can render child activity and
+// settle when the child completes.
+func ShouldPublishForwardedStreamLifecycle(req *ForwardedRequest) bool {
+	if req == nil {
+		return false
+	}
+	if !req.FireAndForget {
+		return true
+	}
+	return metadataHasNestedInterAgentBranch(req.Metadata)
 }
 
 func metadataBoolean(metadata map[string]any, key string) bool {

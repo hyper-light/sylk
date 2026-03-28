@@ -29,8 +29,9 @@ func consultSkill(a *Archivalist) *skills.Skill {
 		StringParam("scope", "Optional scope for the consultation", false).
 		EnumParam("depth", "Research depth for Academic consultations", shared.ResearchDepthEnumValues(), false).
 		StringParam("session_id", "Session identifier", false).
-		Usage("Use when Archivalist needs current codebase reality or external research that memory and history alone cannot resolve. Consultation is synchronous — you receive the result before proceeding.").
-		BestPractice("When consulting Academic, choose depth deliberately: `minimal` for a fast plausibility check, `quick` for a narrow evidence-backed answer, `standard` for the default research consult, `deep` for broader corroboration on important design or policy questions, and `comprehensive` for high-stakes or reusable research artifacts.").
+		Usage("Use when Archivalist needs current codebase reality or external research that memory and history alone cannot resolve. Prefer targeted follow-up consults as the unresolved question changes. Consultation is synchronous — you receive the result before proceeding.").
+		BestPractice("Consult only for the missing current-state or external question, not the whole problem statement. Prefer repeated targeted consults over one broad request.").
+		BestPractice("When consulting Academic, re-evaluate depth each time: `minimal` for a fast plausibility check, `quick` for a narrow evidence-backed answer, `standard` for the default research consult, `deep` for broader corroboration on important design or policy questions, and `comprehensive` for high-stakes or reusable research artifacts.").
 		BestPractice("Use `standard` as the default for Academic. Escalate to `deep` or `comprehensive` only when broader external evidence could materially change what history should preserve or recommend.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {

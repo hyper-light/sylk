@@ -129,9 +129,9 @@ func TestModel_HandlePipelineState_RehomesRuntimePipelinePlaceholder(t *testing.
 		t.Fatalf("loop state = %d/%d, want 2/5", pl.LoopCount, pl.MaxLoops)
 	}
 
-	agent := model.agents["runtime-pipeline-123:engineer"]
+	agent := model.agents["task_auth_checkout:engineer"]
 	if agent == nil {
-		t.Fatal("expected runtime-keyed pipeline agent row to remain present")
+		t.Fatal("expected canonical engineer pipeline row to remain present")
 	}
 	if agent.PipelineID != "task_auth_checkout" {
 		t.Fatalf("agent PipelineID = %q, want task_auth_checkout", agent.PipelineID)

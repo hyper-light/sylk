@@ -167,10 +167,11 @@ func consultSkill(e *Engineer) *skills.Skill {
 		StringParam("scope", "Scope for consultation", false).
 		EnumParam("depth", "Research depth for Academic consultations", shared.ResearchDepthEnumValues(), false).
 		StringParam("session_id", "Session identifier", false).
-		Usage("Use to gather evidence from domain experts. Consultation is synchronous — you will receive the result before proceeding.").
+		Usage("Use to gather evidence from domain experts whenever the next implementation decision is blocked by missing repository, historical, or external context. Consultation is synchronous — you will receive the result before proceeding.").
 		Example(`{"target": "librarian", "query": "What patterns exist for error handling in this codebase?", "scope": "backend"}`).
-		BestPractice("Consult before implementing, not after. Results are cached — do not re-consult the same agent for the same query.").
-		BestPractice("When consulting Academic, choose depth deliberately: `minimal` for a fast sanity check, `quick` for a narrow evidence-backed answer, `standard` for normal tradeoff analysis, `deep` for decision-critical design or correctness work, and `comprehensive` for high-stakes or reusable research artifacts.").
+		BestPractice("Consult before implementing, and re-consult as implementation uncovers new uncertainty. Results are cached — do not repeat the same broad query, but do issue a follow-up consult when the unresolved question, evidence, or candidate approach materially changes.").
+		BestPractice("Prefer repeated targeted consults over one large review request. Ask one concrete blocking question at a time.").
+		BestPractice("When consulting Academic, re-evaluate depth each time: use `minimal` or `quick` for narrow validation, `standard` for ordinary tradeoff analysis, `deep` for decision-critical design or correctness work, and `comprehensive` for high-stakes or reusable research artifacts.").
 		BestPractice("Do not ask Academic for `comprehensive` depth on routine implementation questions; reserve it for questions where broader corroboration or a durable memo materially changes the outcome.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {

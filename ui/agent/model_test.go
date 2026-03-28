@@ -3,6 +3,7 @@ package agent
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1622,6 +1623,28 @@ func TestModel_DropsAmbiguousPipelineActivityWithoutCreatingGlobalGhost(t *testi
 	}
 }
 
+func TestModel_DropsAmbiguousPipelineStreamProgressWithoutCreatingGhost(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:       "engineer",
+		AgentType:     "engineer",
+		AgentName:     "Engineer",
+		Message:       "Applying patch",
+		Visibility:    events.VisibilityUser,
+		CorrelationID: "corr-1",
+	})
+
+	if model.agents["engineer"] != nil {
+		t.Fatal("unexpected global engineer ghost row from stream progress")
+	}
+	if got := len(model.agents); got != 0 {
+		t.Fatalf("agent count = %d, want 0", got)
+	}
+}
+
 func TestModel_StreamProgressResolvesRuntimeAliasToPipelineRow(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)
@@ -1940,7 +1963,7 @@ func TestModel_LLMBookkeepingDoesNotOverrideExistingSummary(t *testing.T) {
 		event   events.EventType
 	}{
 		{
-			id:      "engineer",
+			id:      "task_8538d:engineer",
 			typ:     "engineer",
 			name:    "Engineer",
 			summary: "Working through discover project tools.",
@@ -1977,6 +2000,15 @@ func TestModel_LLMBookkeepingDoesNotOverrideExistingSummary(t *testing.T) {
 		model.SeedAgent(tc.id, tc.typ, tc.name, nil, "", "")
 		model.agents[tc.id].TaskSummary = tc.summary
 
+		data := map[string]any{
+			"agent_name": tc.name,
+			"agent_type": tc.typ,
+		}
+		if pipelineID, _, ok := parseCanonicalPipelinePanelAgentID(tc.id); ok {
+			data["pipeline_id"] = pipelineID
+			data["task_id"] = pipelineID
+		}
+
 		_, _ = model.Update(msg.ActivityEventMsg{
 			Event: &events.ActivityEvent{
 				ID:        "evt_" + tc.id + "_bookkeeping",
@@ -1984,10 +2016,7 @@ func TestModel_LLMBookkeepingDoesNotOverrideExistingSummary(t *testing.T) {
 				Timestamp: time.Now(),
 				AgentID:   tc.id,
 				Content:   tc.content,
-				Data: map[string]any{
-					"agent_name": tc.name,
-					"agent_type": tc.typ,
-				},
+				Data:      data,
 			},
 		})
 
@@ -2615,6 +2644,54 @@ func TestModel_SeedAgent(t *testing.T) {
 	}
 }
 
+func TestModel_SeedAgent_RejectsPipelineWorkerWithoutPipelineID(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	model.SeedAgent("engineer", "engineer", "Engineer", nil, "", "")
+	model.SeedAgent("inspector-pipeline", "inspector-pipeline", "Inspector", nil, "", "")
+
+	if got := len(model.agents); got != 0 {
+		t.Fatalf("agents count = %d, want 0", got)
+	}
+	model.ensureRows()
+	for _, row := range model.rows {
+		if row.Kind == rowSection && row.Label == "global" {
+			t.Fatal("unexpected global section for orphan pipeline workers")
+		}
+	}
+}
+
+func TestModel_SeedAgent_CanonicalPipelineWorkerSeedsPipelineMembership(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	model.SeedAgent("task_auth_checkout:engineer", "engineer", "Engineer", nil, "", "")
+
+	agent := model.agents["task_auth_checkout:engineer"]
+	if agent == nil {
+		t.Fatal("expected canonical pipeline engineer row")
+	}
+	if agent.PipelineID != "task_auth_checkout" {
+		t.Fatalf("pipeline id = %q, want task_auth_checkout", agent.PipelineID)
+	}
+	pl := model.pipelines["task_auth_checkout"]
+	if pl == nil {
+		t.Fatal("expected seeded pipeline container")
+	}
+	if !slices.Contains(pl.Members, "task_auth_checkout:engineer") {
+		t.Fatalf("pipeline members = %#v, want canonical engineer row", pl.Members)
+	}
+	model.ensureRows()
+	for _, row := range model.rows {
+		if row.Kind == rowSection && row.Label == "global" {
+			t.Fatal("unexpected global section for seeded canonical pipeline worker")
+		}
+	}
+}
+
 func TestModel_SeedAgent_PromotePlaceholder(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)
@@ -2848,6 +2925,47 @@ func TestModel_IgnoresScribeRegistrationActivity(t *testing.T) {
 	}
 }
 
+func TestModel_IgnoresRawScribeLLMActivity(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:         "evt_llm_req_scribe",
+			EventType:  events.EventTypeLLMRequest,
+			Timestamp:  time.Now(),
+			AgentID:    "scribe",
+			Visibility: events.VisibilityUser,
+			Content:    "LLM request to gemini-3-flash-preview with 0 tokens",
+			Data: map[string]any{
+				"agent_name": "Scribe",
+			},
+		},
+	})
+
+	if got := len(model.agents); got != 0 {
+		t.Fatalf("agents count after request = %d, want 0", got)
+	}
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:         "evt_llm_resp_scribe",
+			EventType:  events.EventTypeLLMResponse,
+			Timestamp:  time.Now(),
+			AgentID:    "scribe",
+			Visibility: events.VisibilityUser,
+			Content:    "LLM response from gemini-3-flash-preview",
+			Data: map[string]any{
+				"agent_name": "Scribe",
+			},
+		},
+	})
+
+	if got := len(model.agents); got != 0 {
+		t.Fatalf("agents count after response = %d, want 0", got)
+	}
+}
+
 func TestModel_IgnoresScribeToolCallStream(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)
@@ -2868,7 +2986,7 @@ func TestModel_IgnoresScribeToolCallStream(t *testing.T) {
 	}
 }
 
-func TestModel_HandoffActivityUpdatesStatusAndContextUsage(t *testing.T) {
+func TestModel_HandoffActivityUpdatesStatusWithoutOverwritingContextUsage(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)
 
@@ -2892,6 +3010,7 @@ func TestModel_HandoffActivityUpdatesStatusAndContextUsage(t *testing.T) {
 	if agent == nil {
 		t.Fatal("expected pipeline tester row to be created")
 	}
+	agent.ContextUsage = 0.18
 
 	_, _ = model.Update(msg.ActivityEventMsg{
 		Event: &events.ActivityEvent{
@@ -2914,8 +3033,8 @@ func TestModel_HandoffActivityUpdatesStatusAndContextUsage(t *testing.T) {
 	if agent.Status != StatusHandoff {
 		t.Fatalf("status after handoff trigger = %v, want StatusHandoff", agent.Status)
 	}
-	if agent.ContextUsage != 0.91 {
-		t.Fatalf("context usage after handoff trigger = %.2f, want 0.91", agent.ContextUsage)
+	if agent.ContextUsage != 0.18 {
+		t.Fatalf("context usage after handoff trigger = %.2f, want preserved 0.18", agent.ContextUsage)
 	}
 
 	_, _ = model.Update(msg.ActivityEventMsg{

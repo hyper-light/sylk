@@ -38,6 +38,92 @@ func TestProcessForwardedRequest_StoreBypassesLLMAndUsesStructuredContent(t *tes
 	}
 }
 
+func TestHandleBusRequest_NestedFireAndForgetStorePublishesStreamLifecycle(t *testing.T) {
+	a := newTestArchivalist(t)
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	t.Cleanup(func() { _ = bus.Close() })
+	a.bus = bus
+	a.channels = guide.NewAgentChannels("archivalist", a.id)
+	a.runCtx = context.Background()
+	a.running = true
+
+	streamCh := make(chan *guide.StreamResponse, 4)
+	responseCh := make(chan *guide.RouteResponse, 1)
+	sub, err := a.bus.Subscribe(a.channels.Responses, func(msg *guide.Message) error {
+		if msg == nil || msg.CorrelationID != "corr-nested-store" {
+			return nil
+		}
+		if stream, ok := msg.GetStreamResponse(); ok && stream != nil {
+			select {
+			case streamCh <- stream:
+			default:
+			}
+		}
+		if resp, ok := msg.GetRouteResponse(); ok && resp != nil {
+			select {
+			case responseCh <- resp:
+			default:
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe responses: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	err = a.handleBusRequest(guide.NewForwardMessage("msg-nested-store", &guide.ForwardedRequest{
+		CorrelationID: "corr-nested-store",
+		Input:         "@archivalist:store:history{\"content\":\"stored child event\"}",
+		Intent:        guide.IntentStore,
+		Domain:        guide.DomainHistory,
+		Entities: &guide.ExtractedEntities{
+			Data: map[string]any{"content": "stored child event"},
+		},
+		SourceAgentID: "architect",
+		FireAndForget: true,
+		SessionID:     "sess-nested-store",
+		Metadata: map[string]any{
+			"chat_nested_branch":          true,
+			"chat_parent_correlation_id":  "corr-parent-store",
+			"chat_parent_tool_call_key":   "store-1",
+			"chat_inter_agent_kind":       "store",
+			"chat_inter_agent_thread_key": "",
+			"event_type":                  "child_store",
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleBusRequest returned error: %v", err)
+	}
+
+	var sawStart, sawComplete bool
+	deadline := time.After(2 * time.Second)
+	for !sawStart || !sawComplete {
+		select {
+		case resp := <-responseCh:
+			t.Fatalf("unexpected route response for nested fire-and-forget store: %+v", resp)
+		case stream := <-streamCh:
+			if stream == nil || stream.Event == nil {
+				continue
+			}
+			if got, _ := stream.Metadata["chat_nested_branch"].(bool); !got {
+				t.Fatalf("chat_nested_branch = %#v, want true", stream.Metadata["chat_nested_branch"])
+			}
+			if got, _ := stream.Metadata["chat_inter_agent_kind"].(string); got != "store" {
+				t.Fatalf("chat_inter_agent_kind = %q, want store", got)
+			}
+			switch stream.Event.Type {
+			case guide.StreamEventStart:
+				sawStart = true
+			case guide.StreamEventComplete:
+				sawComplete = true
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for nested fire-and-forget stream lifecycle (start=%v complete=%v)", sawStart, sawComplete)
+		}
+	}
+}
+
 func TestProcessForwardedRequest_DeclareAndCompleteBypassLLM(t *testing.T) {
 	a := newTestArchivalist(t)
 	provider := NewMockProvider()

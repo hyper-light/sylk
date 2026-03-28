@@ -30,6 +30,9 @@ func NewRegistry() *Registry {
 
 // Register adds or updates an agent registration
 func (r *Registry) Register(registration *AgentRegistration) {
+	if isInternalSidecarRegistration(registration) {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -73,7 +76,11 @@ func (r *Registry) Get(id string) *AgentRegistration {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	return r.agents[id]
+	agent := r.agents[id]
+	if isInternalSidecarRegistration(agent) {
+		return nil
+	}
+	return agent
 }
 
 // GetByName retrieves an agent by name or alias
@@ -82,7 +89,11 @@ func (r *Registry) GetByName(name string) *AgentRegistration {
 	defer r.mu.RUnlock()
 
 	if id, ok := r.nameIndex[strings.ToLower(name)]; ok {
-		return r.agents[id]
+		agent := r.agents[id]
+		if isInternalSidecarRegistration(agent) {
+			return nil
+		}
+		return agent
 	}
 	return nil
 }
@@ -96,6 +107,9 @@ func (r *Registry) FindBestMatch(result *RouteResult) *AgentRegistration {
 	bestScore := 0
 
 	for _, agent := range r.agents {
+		if isInternalSidecarRegistration(agent) {
+			continue
+		}
 		score := agent.MatchScore(result)
 		if score > bestScore {
 			bestScore = score
@@ -113,6 +127,9 @@ func (r *Registry) GetAll() []*AgentRegistration {
 
 	result := make([]*AgentRegistration, 0, len(r.agents))
 	for _, agent := range r.agents {
+		if isInternalSidecarRegistration(agent) {
+			continue
+		}
 		result = append(result, agent)
 	}
 	return result

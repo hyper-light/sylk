@@ -118,7 +118,6 @@ func (gi *GlobalInspector) requestRouteSync(
 		}
 	}
 	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
-	req.Metadata = guide.MetadataWithPreservedSourceStreamTarget(req.Metadata)
 	msg := guide.NewRequestMessage(gi.generateMessageID(), req)
 	msg.CorrelationID = correlationID
 

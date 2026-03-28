@@ -196,6 +196,7 @@ func (pi *PipelineInspector) applyToolCalls(
 	for _, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
+		hadRequiredFollowup := agentShared.PendingRequiredProtocolAction(ctx)
 		execCtx := agentShared.WithActiveToolCall(ctx, call)
 		result, err := agentShared.TimedToolCall(execCtx, "inspector-pipeline", call, func() (string, error) {
 			execResult, execErr = pi.executeToolCallWithSurface(execCtx, call, surface)
@@ -241,12 +242,35 @@ func (pi *PipelineInspector) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
+		if prompt := pipelineImmediateFollowupPrompt(ctx, call.Name, hadRequiredFollowup, isError); prompt != "" {
+			req.Messages = append(req.Messages, providers.Message{
+				Role:    providers.RoleUser,
+				Content: prompt,
+			})
+		}
 		if controlErr != nil || agentShared.PipelineTurnTerminated(ctx) {
 			break
 		}
 	}
 	agentShared.AppendToolRecoveryMessage(req, recoveryHints)
 	return errCount, controlErr
+}
+
+func pipelineImmediateFollowupPrompt(ctx context.Context, toolName string, hadRequiredFollowup, isError bool) string {
+	if isError || hadRequiredFollowup || strings.TrimSpace(toolName) != "finalize_pipeline" {
+		return ""
+	}
+	state := agentShared.PipelineProtocolStateFromContext(ctx)
+	if state == nil || state.TerminalAction() != nil {
+		return ""
+	}
+	required, _ := state.RequiredAction()
+	if required != agentShared.PipelineProtocolActionOT {
+		return ""
+	}
+	return "The previous `finalize_pipeline` call already determined that the pipeline is ready for OT. " +
+		"Your very next tool call in this turn must be `handoff_to_ot`. " +
+		"Do not write explanatory prose, a closing summary, or a status update first."
 }
 
 func (pi *PipelineInspector) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {

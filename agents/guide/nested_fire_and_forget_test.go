@@ -114,3 +114,31 @@ func TestGuideHandleResponseMessage_StreamCompleteRemovesNestedFireAndForgetPend
 		t.Fatalf("expected nested fire-and-forget pending to be removed on stream complete, got %+v", pending)
 	}
 }
+
+func TestShouldPublishForwardedStreamLifecycle_NestedFireAndForget(t *testing.T) {
+	req := &ForwardedRequest{
+		FireAndForget: true,
+		Metadata: map[string]any{
+			"chat_nested_branch":          true,
+			"chat_parent_correlation_id":  "corr-parent",
+			"chat_parent_tool_call_key":   "store-1",
+			"chat_inter_agent_kind":       "store",
+			"chat_inter_agent_thread_key": "",
+		},
+	}
+	if !ShouldPublishForwardedStreamLifecycle(req) {
+		t.Fatal("expected nested fire-and-forget forwarded request to publish stream lifecycle")
+	}
+}
+
+func TestShouldPublishForwardedStreamLifecycle_PlainFireAndForget(t *testing.T) {
+	req := &ForwardedRequest{
+		FireAndForget: true,
+		Metadata: map[string]any{
+			"note": "background work",
+		},
+	}
+	if ShouldPublishForwardedStreamLifecycle(req) {
+		t.Fatal("expected plain fire-and-forget forwarded request to stay stream-silent")
+	}
+}
