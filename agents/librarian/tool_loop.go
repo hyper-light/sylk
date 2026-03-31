@@ -27,7 +27,11 @@ import (
 // call" abort and the "exceeded tool-call limit" abort by giving the LLM
 // data-driven signals to synthesize an answer.
 func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
-	loop := newToolLoopState(l, ctx, req, ledger)
+	return l.executeToolLoopWithBundle(ctx, req, ledger, nil)
+}
+
+func (l *Librarian) executeToolLoopWithBundle(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger, bundle *librarianToolBundle) (string, error) {
+	loop := newToolLoopState(l, ctx, req, ledger, bundle)
 	provider, err := loop.provider()
 	if err != nil {
 		return "", err
@@ -88,10 +92,11 @@ func (l *Librarian) applyToolCalls(
 	resp *providers.Response,
 	turn int,
 	searchLedger *SearchLedger,
+	bundle *librarianToolBundle,
 ) (int, bool) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
-	loadedBefore := len(l.skills.GetLoaded())
+	loadedBefore := len(l.loadedSkills(bundle))
 
 	errCount := 0
 	rerouted := false
@@ -103,11 +108,11 @@ func (l *Librarian) applyToolCalls(
 		var execErr error
 		execCtx := shared.WithActiveToolCall(ctx, call)
 		result, err := shared.TimedToolCall(execCtx, "librarian", call, func() (string, error) {
-			execResult, execErr = l.executeToolCall(execCtx, call)
+			execResult, execErr = l.executeToolCallWithBundle(execCtx, call, bundle)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {
-			l.toolDefsDirty = true
+			l.markToolDefsDirty(bundle)
 		}
 		isError := false
 		if err != nil {
@@ -154,8 +159,8 @@ func (l *Librarian) applyToolCalls(
 		}
 	}
 
-	if len(l.skills.GetLoaded()) > loadedBefore {
-		l.toolDefsDirty = true
+	if len(l.loadedSkills(bundle)) > loadedBefore {
+		l.markToolDefsDirty(bundle)
 	}
 
 	return errCount, rerouted
@@ -163,6 +168,13 @@ func (l *Librarian) applyToolCalls(
 
 // executeToolCall invokes a skill by name with JSON arguments.
 func (l *Librarian) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
+	return l.executeToolCallWithBundle(ctx, call, nil)
+}
+
+func (l *Librarian) executeToolCallWithBundle(ctx context.Context, call providers.ToolCall, bundle *librarianToolBundle) (toolruntime.ExecutionResult, error) {
+	if bundle != nil {
+		return bundle.executeToolCall(ctx, l.id, call)
+	}
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
@@ -199,6 +211,13 @@ func (l *Librarian) prepareSkillsForInput(input string) {
 
 // buildToolDefinitions converts loaded skills to provider Tool format.
 func (l *Librarian) buildToolDefinitions() []providers.Tool {
+	return l.buildToolDefinitionsWithBundle(nil)
+}
+
+func (l *Librarian) buildToolDefinitionsWithBundle(bundle *librarianToolBundle) []providers.Tool {
+	if bundle != nil {
+		return bundle.buildToolDefinitions()
+	}
 	l.toolRuntime().SyncActiveFromLoaded()
 	return l.toolRuntime().BuildToolDefinitions()
 }
@@ -208,6 +227,13 @@ func (l *Librarian) toolRuntime() *toolruntime.Runtime {
 }
 
 func (l *Librarian) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	return l.toolInvocationsWithBundle(ctx, calls, nil)
+}
+
+func (l *Librarian) toolInvocationsWithBundle(ctx context.Context, calls []providers.ToolCall, bundle *librarianToolBundle) []toolruntime.Invocation {
+	if bundle != nil {
+		return bundle.toolInvocations(ctx, l.id, calls)
+	}
 	if len(calls) == 0 {
 		return nil
 	}
@@ -226,6 +252,24 @@ func (l *Librarian) toolInvocations(ctx context.Context, calls []providers.ToolC
 		})
 	}
 	return invocations
+}
+
+func (l *Librarian) loadedSkills(bundle *librarianToolBundle) []*skills.Skill {
+	if bundle != nil && bundle.skills != nil {
+		return bundle.skills.GetLoaded()
+	}
+	if l.skills == nil {
+		return nil
+	}
+	return l.skills.GetLoaded()
+}
+
+func (l *Librarian) markToolDefsDirty(bundle *librarianToolBundle) {
+	if bundle != nil {
+		bundle.toolDefsDirty = true
+		return
+	}
+	l.toolDefsDirty = true
 }
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.

@@ -121,18 +121,18 @@ func renderInterAgentToolCall(calls []ToolCallRecord, idx, width int, th *theme.
 	row := calls[idx].InterAgent
 	if !interAgentToolHasVisibleChildren(row) {
 		lines := []string{renderInterAgentHeadline(calls, idx, row, width, th)}
-		if calls[idx].Expanded {
+		if calls[idx].Expanded || interAgentShouldShowErrorDetail(calls[idx], row) {
 			lines = append(lines, renderInterAgentExpandedSummary(calls, idx, row, width, th)...)
 		}
 		return lines, nil
 	}
 
-	rootSummary := normalizeInlineText(row.Summary)
+	rootSummary := interAgentDisplaySummary(calls[idx], row)
 	hasLater := hasLaterInterAgentCall(calls, idx)
 	specs := orderedInterAgentChildren(row, nil, nil)
 	if len(specs) == 0 {
 		lines := []string{renderInterAgentHeadline(calls, idx, row, width, th)}
-		if calls[idx].Expanded {
+		if calls[idx].Expanded || interAgentShouldShowErrorDetail(calls[idx], row) {
 			lines = append(lines, renderInterAgentExpandedSummary(calls, idx, row, width, th)...)
 		}
 		return lines, nil
@@ -166,7 +166,7 @@ func renderInterAgentHeadline(calls []ToolCallRecord, idx int, row *InterAgentTo
 	}
 
 	linePrefix := mutedStyle.Render(treePrefix+" ") + renderInterAgentLabels(row.AgentTypes, th, mutedStyle)
-	summary := normalizeInlineText(row.Summary)
+	summary := interAgentDisplaySummary(calls[idx], row)
 	if summary != "" {
 		linePrefix += mutedStyle.Render(" - ") + summaryStyle.Render(truncatePlainWithDots(summary, max(width-lipgloss.Width(linePrefix+" - "), 0)))
 	}
@@ -178,7 +178,7 @@ func renderInterAgentExpandedSummary(calls []ToolCallRecord, idx int, row *Inter
 	if row == nil || width <= 0 {
 		return nil
 	}
-	summary := normalizeInlineText(row.Summary)
+	summary := interAgentDisplaySummary(calls[idx], row)
 	if summary == "" {
 		return nil
 	}
@@ -199,6 +199,25 @@ func renderInterAgentExpandedSummary(calls []ToolCallRecord, idx int, row *Inter
 		out = append(out, truncateStyledWithDots(prefix+line, width))
 	}
 	return out
+}
+
+func interAgentDisplaySummary(record ToolCallRecord, row *InterAgentTool) string {
+	if row == nil {
+		return ""
+	}
+	if row.Status == InterAgentToolFailed {
+		if errText := normalizeInlineText(record.ErrorMsg); errText != "" {
+			return errText
+		}
+	}
+	return normalizeInlineText(row.Summary)
+}
+
+func interAgentShouldShowErrorDetail(record ToolCallRecord, row *InterAgentTool) bool {
+	if row == nil || row.Status != InterAgentToolFailed {
+		return false
+	}
+	return normalizeInlineText(record.ErrorMsg) != ""
 }
 
 func renderInterAgentChildSections(row *InterAgentTool, headerWidth, rowWidth int, th *theme.Theme, grad *theme.Gradient) []interAgentRenderedChildSection {
@@ -306,6 +325,11 @@ func renderInterAgentChildHeader(child InterAgentChildActivity, width int, th *t
 }
 
 func interAgentChildSummary(child InterAgentChildActivity, rootSummary string) string {
+	if child.Failed {
+		if root := normalizeInlineText(rootSummary); root != "" {
+			return root
+		}
+	}
 	if !child.Completed {
 		root := normalizeInlineText(rootSummary)
 		status := normalizeInlineText(child.ThinkingStatus)
@@ -576,7 +600,7 @@ func renderNestedInterAgentChildToolCallBlock(tc ToolCallRecord, width int, th *
 			childPath:       cloneIntSlice(spec.childPath),
 			interAgentPath:  cloneIntSlice(nextInterAgentPath),
 			child:           spec.child,
-			rootSummary:     normalizeInlineText(tc.InterAgent.Summary),
+			rootSummary:     interAgentDisplaySummary(tc, tc.InterAgent),
 			anchorToolCall:  i == 0,
 			anchorChildPath: cloneIntSlice(childPath),
 			anchorInterPath: cloneIntSlice(interAgentPath),
@@ -734,7 +758,7 @@ func renderInterAgentNestedBlock(stack []interAgentNestedBlockItem, width int, t
 						childPath:       cloneIntSlice(spec.childPath),
 						interAgentPath:  cloneIntSlice(nextInterAgentPath),
 						child:           spec.child,
-						rootSummary:     normalizeInlineText(item.toolCall.InterAgent.Summary),
+						rootSummary:     interAgentDisplaySummary(item.toolCall, item.toolCall.InterAgent),
 						anchorToolCall:  i == 0,
 						anchorChildPath: cloneIntSlice(item.childPath),
 						anchorInterPath: cloneIntSlice(item.interAgentPath),

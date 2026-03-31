@@ -144,7 +144,7 @@ func TestAcademicProcessForwardedRequest_ArchitectConsultExposesResearchPaperToo
 		Intent:        guide.IntentRecall,
 		Input:         "Research Python packaging guidance.",
 	}
-	toolSurface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
+	toolSurface := a.requestToolSurfaceForForwardedRequest(context.Background(), fwd, academicForwardedResearchExtraTools(fwd)...)
 	req := &providers.Request{
 		SystemPrompt: buildAcademicConsultationSystemPrompt(a.config.SystemPrompt, fwd, shared.ResearchDepthUnset),
 		Tools:        a.buildToolDefinitionsWithSurface(toolSurface),
@@ -189,7 +189,7 @@ func TestAcademicProcessForwardedRequest_CustomArchitectIDExposesResearchPaperTo
 		Intent:          guide.IntentRecall,
 		Input:           "Research Python packaging guidance.",
 	}
-	toolSurface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
+	toolSurface := a.requestToolSurfaceForForwardedRequest(context.Background(), fwd, academicForwardedResearchExtraTools(fwd)...)
 	req := &providers.Request{
 		SystemPrompt: buildAcademicConsultationSystemPrompt(a.config.SystemPrompt, fwd, shared.ResearchDepthUnset),
 		Tools:        a.buildToolDefinitionsWithSurface(toolSurface),

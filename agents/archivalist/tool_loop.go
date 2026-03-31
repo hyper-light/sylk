@@ -21,6 +21,10 @@ const defaultMaxToolRuns = 32
 // executeToolLoop runs the LLM tool-call loop with steering checkpoints.
 // Complete → check ToolCalls → execute → append results → repeat.
 func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
+	return a.executeToolLoopWithBundle(ctx, req, ledger, nil)
+}
+
+func (a *Archivalist) executeToolLoopWithBundle(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger, bundle *archivalistToolBundle) (string, error) {
 	maxRuns := defaultMaxToolRuns
 	consecutiveErrors := 0
 
@@ -57,7 +61,12 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 			continue
 		}
 
-		if a.toolDefsDirty {
+		if bundle != nil {
+			if bundle.toolDefsDirty {
+				req.Tools = a.buildToolDefinitionsWithBundle(bundle)
+				bundle.toolDefsDirty = false
+			}
+		} else if a.toolDefsDirty {
 			req.Tools = a.buildToolDefinitions()
 			a.toolDefsDirty = false
 		}
@@ -93,11 +102,11 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-		if err := a.toolRuntime().ValidateBatch(a.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+		if err := a.toolRuntimeForBundle(bundle).ValidateBatch(a.toolInvocationsWithBundle(ctx, resp.ToolCalls, bundle)); err != nil {
 			return "", err
 		}
 
-		errCount, rerouted := a.applyToolCalls(ctx, req, resp)
+		errCount, rerouted := a.applyToolCalls(ctx, req, resp, bundle)
 		if a.handoffBridge != nil {
 			a.handoffBridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
 		}
@@ -217,10 +226,11 @@ func (a *Archivalist) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
+	bundle *archivalistToolBundle,
 ) (int, bool) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
-	loadedBefore := len(a.skills.GetLoaded())
+	loadedBefore := len(a.loadedSkills(bundle))
 
 	errCount := 0
 	rerouted := false
@@ -233,11 +243,11 @@ func (a *Archivalist) applyToolCalls(
 		var execErr error
 		execCtx := shared.WithActiveToolCall(ctx, call)
 		result, err := shared.TimedToolCall(execCtx, "archivalist", call, func() (string, error) {
-			execResult, execErr = a.executeToolCall(execCtx, call)
+			execResult, execErr = a.executeToolCall(execCtx, call, bundle)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {
-			a.toolDefsDirty = true
+			a.markToolDefsDirty(bundle)
 		}
 
 		isError := false
@@ -277,14 +287,17 @@ func (a *Archivalist) applyToolCalls(
 		})
 	}
 
-	if len(a.skills.GetLoaded()) > loadedBefore {
-		a.toolDefsDirty = true
+	if len(a.loadedSkills(bundle)) > loadedBefore {
+		a.markToolDefsDirty(bundle)
 	}
 
 	return errCount, rerouted
 }
 
-func (a *Archivalist) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
+func (a *Archivalist) executeToolCall(ctx context.Context, call providers.ToolCall, bundle *archivalistToolBundle) (toolruntime.ExecutionResult, error) {
+	if bundle != nil {
+		return bundle.executeToolCall(ctx, a.id, call)
+	}
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
@@ -321,6 +334,13 @@ func (a *Archivalist) prepareSkillsForInput(input string) {
 
 // buildToolDefinitions converts loaded skills to provider Tool format.
 func (a *Archivalist) buildToolDefinitions() []providers.Tool {
+	return a.buildToolDefinitionsWithBundle(nil)
+}
+
+func (a *Archivalist) buildToolDefinitionsWithBundle(bundle *archivalistToolBundle) []providers.Tool {
+	if bundle != nil {
+		return bundle.buildToolDefinitions()
+	}
 	a.toolRuntime().SyncActiveFromLoaded()
 	return a.toolRuntime().BuildToolDefinitions()
 }
@@ -330,6 +350,13 @@ func (a *Archivalist) toolRuntime() *toolruntime.Runtime {
 }
 
 func (a *Archivalist) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	return a.toolInvocationsWithBundle(ctx, calls, nil)
+}
+
+func (a *Archivalist) toolInvocationsWithBundle(ctx context.Context, calls []providers.ToolCall, bundle *archivalistToolBundle) []toolruntime.Invocation {
+	if bundle != nil {
+		return bundle.toolInvocations(ctx, a.id, calls)
+	}
 	if len(calls) == 0 {
 		return nil
 	}
@@ -348,6 +375,31 @@ func (a *Archivalist) toolInvocations(ctx context.Context, calls []providers.Too
 		})
 	}
 	return invocations
+}
+
+func (a *Archivalist) toolRuntimeForBundle(bundle *archivalistToolBundle) toolruntime.Surface {
+	if bundle != nil && bundle.runtime != nil {
+		return bundle.runtime
+	}
+	return a.toolRuntime()
+}
+
+func (a *Archivalist) loadedSkills(bundle *archivalistToolBundle) []*skills.Skill {
+	if bundle != nil && bundle.skills != nil {
+		return bundle.skills.GetLoaded()
+	}
+	if a.skills == nil {
+		return nil
+	}
+	return a.skills.GetLoaded()
+}
+
+func (a *Archivalist) markToolDefsDirty(bundle *archivalistToolBundle) {
+	if bundle != nil {
+		bundle.toolDefsDirty = true
+		return
+	}
+	a.toolDefsDirty = true
 }
 
 // getProvider returns the current LLM provider, guarded by runMu.

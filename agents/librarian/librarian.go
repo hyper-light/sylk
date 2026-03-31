@@ -2,6 +2,7 @@ package librarian
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -34,6 +35,8 @@ const (
 	DefaultLLMRequestTimeout = 60 * time.Second
 	DefaultLLMRetryMax       = 3
 	DefaultPromptCacheTTL    = 1 * time.Hour
+	DefaultReplicaCount      = 6
+	DefaultReplicaBacklog    = 24
 )
 
 // LibrarianProvider is the minimal interface the Librarian needs from its LLM.
@@ -92,9 +95,9 @@ type Librarian struct {
 	// Steering ledger management.
 	steering *shared.SteeringManager
 
-	// Request serialization: ensures at most one forwarded request
-	// executes at a time.
-	requestSerializer *shared.RequestSerializer
+	// Request admission for forwarded work. Knowledge agents can serve multiple
+	// forwarded consultations concurrently via isolated per-request replicas.
+	requestPool *shared.RequestReplicaPool
 
 	// Agent pod for Scribe feed and cross-agent coordination.
 	agentPod *shared.AgentPod
@@ -145,6 +148,16 @@ type Config struct {
 
 	// Logging
 	Logger *slog.Logger // Optional, uses slog.Default() if nil
+
+	// Forwarded-request replica admission. These bound concurrent consults and
+	// the waiting backlog so knowledge-agent overload degrades gracefully
+	// instead of silently timing out upstream callers.
+	MaxConcurrentForwarded int
+	MaxQueuedForwarded     int
+
+	// ContextQuota exposes global runtime pressure so autoscaling can stop
+	// scaling up when aggregate context or goroutine headroom is exhausted.
+	ContextQuota *container.ResourceQuota
 }
 
 // New creates a new Librarian agent with optional LLM provider.
@@ -162,15 +175,14 @@ func New(cfg Config, provider ...LibrarianProvider) (*Librarian, error) {
 	}
 
 	l := &Librarian{
-		id:                librarianID,
-		config:            cfg,
-		logger:            cfg.Logger,
-		activityPub:       cfg.ActivityPub,
-		domainFilter:      NewLibrarianDomainFilter(cfg.Logger),
-		knownAgents:       make(map[string]*guide.AgentAnnouncement),
-		knowledgeBackend:  cfg.KnowledgeBackend,
-		steering:          shared.NewSteeringManager(),
-		requestSerializer: shared.NewRequestSerializer(),
+		id:               librarianID,
+		config:           cfg,
+		logger:           cfg.Logger,
+		activityPub:      cfg.ActivityPub,
+		domainFilter:     NewLibrarianDomainFilter(cfg.Logger),
+		knownAgents:      make(map[string]*guide.AgentAnnouncement),
+		knowledgeBackend: cfg.KnowledgeBackend,
+		steering:         shared.NewSteeringManager(),
 		workspaceViews: authority.RestrictWorkspaceViews("librarian", versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
 			DefaultView:      versioning.WorkspaceViewDisk,
 			DefaultSessionID: cfg.SessionID,
@@ -178,6 +190,14 @@ func New(cfg Config, provider ...LibrarianProvider) (*Librarian, error) {
 			DiskFallback:     versioning.NewDiskFileAccess(cfg.WorkingDirectory, true),
 		})),
 	}
+	l.requestPool = shared.NewAutoscalingRequestReplicaPool(shared.RequestReplicaPoolConfig{
+		Name:              "librarian",
+		HardMaxActive:     cfg.MaxConcurrentForwarded,
+		HardMaxQueued:     cfg.MaxQueuedForwarded,
+		CurrentModel:      l.CurrentModel,
+		ProviderTelemetry: l.currentProviderAutoscaleSnapshot,
+		ContextQuota:      cfg.ContextQuota,
+	})
 
 	if cfg.SearchSystem != nil {
 		l.searchHandler = NewSearchHandler(cfg.SearchSystem)
@@ -264,6 +284,9 @@ func (l *Librarian) Close() error {
 		l.tools = nil
 	}
 	l.Stop()
+	if l.requestPool != nil {
+		l.requestPool.Close()
+	}
 	if l.cloneStore != nil {
 		l.cloneStore.Close()
 	}
@@ -336,6 +359,10 @@ func (l *Librarian) CurrentModel() string {
 		return l.config.Model
 	}
 	return DefaultLibrarianModel
+}
+
+func (l *Librarian) currentProviderAutoscaleSnapshot() shared.RequestReplicaProviderSnapshot {
+	return shared.RequestReplicaProviderSnapshotFromProvider(l.getProvider())
 }
 
 // SupportedModels implements container.ModelSwappable.
@@ -475,11 +502,6 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		return nil // Ignore non-forward messages
 	}
 
-	if !l.requestSerializer.Acquire(l.runCtx) {
-		return nil // parent context done, agent shutting down
-	}
-	defer l.requestSerializer.Release()
-
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
@@ -489,14 +511,6 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 	shared.LogIncomingRequest(l.steering.EventLogger(), fwd, l.id)
 
 	shared.EmitDispatchACK(l.bus, fwd.Metadata, l.id, "librarian", fwd.CorrelationID)
-	l.publishActivityForSession(fwd.SessionID, events.EventTypeAgentAction, "Processing search request")
-
-	if l.config.RequestGuard != nil {
-		release := l.config.RequestGuard()
-		defer release()
-	}
-
-	// Process the request with a cancellable request-scoped context.
 	reqCtx, cancel := context.WithCancel(l.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
 	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
@@ -540,11 +554,79 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		AgentID: l.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
 	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
-	if publishStreamLifecycle {
-		shared.PublishStreamStart(l.bus, l.channels, ctx, l.id)
+	streamStarted := false
+	var stopQueueKeepalive func()
+	lease, acquireErr := l.requestPool.Acquire(reqCtx, shared.RequestReplicaAcquireOptions{
+		SourceKey:         shared.RequestReplicaSourceKeyForForwardedRequest(fwd),
+		Priority:          shared.RequestReplicaPriorityForForwardedRequest(fwd),
+		PromptBytes:       shared.RequestReplicaPromptBytesForForwardedRequest(fwd),
+		ContextFieldCount: shared.RequestReplicaContextFieldCount(fwd),
+		OnQueued: func(snapshot shared.RequestReplicaPoolSnapshot, queuePosition int) {
+			if publishStreamLifecycle && !streamStarted {
+				shared.PublishStreamStart(l.bus, l.channels, ctx, l.id)
+				streamStarted = true
+			}
+			l.publishReplicaActivityForSession(fwd.SessionID, events.EventTypeAgentAction, "Waiting for an available search replica", snapshot)
+			if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
+				pp.PublishState(events.AgentUIStateSearching, shared.KnowledgeQueueProgressMessage("librarian", snapshot, queuePosition))
+			}
+			stopQueueKeepalive = l.startQueueKeepalive(ctx, queuePosition)
+		},
+		OnGranted: func(snapshot shared.RequestReplicaPoolSnapshot, _ bool) {
+			if stopQueueKeepalive != nil {
+				stopQueueKeepalive()
+				stopQueueKeepalive = nil
+			}
+			if publishStreamLifecycle && !streamStarted {
+				shared.PublishStreamStart(l.bus, l.channels, ctx, l.id)
+				streamStarted = true
+			}
+			l.publishReplicaActivityForSession(fwd.SessionID, events.EventTypeAgentAction, "Processing search request", snapshot)
+		},
+	})
+	if stopQueueKeepalive != nil {
+		defer stopQueueKeepalive()
+	}
+	if acquireErr != nil {
+		if errors.Is(acquireErr, context.Canceled) || errors.Is(acquireErr, context.DeadlineExceeded) {
+			return nil
+		}
+		if fwd.FireAndForget {
+			return nil
+		}
+		var busyErr *shared.AgentBusyError
+		if errors.As(acquireErr, &busyErr) {
+			resp := &guide.RouteResponse{
+				CorrelationID:       fwd.CorrelationID,
+				Success:             false,
+				Data:                shared.BusyRouteResponseData("librarian", busyErr.Snapshot, busyErr.Error()),
+				Error:               busyErr.Error(),
+				RespondingAgentID:   l.id,
+				RespondingAgentName: "Librarian",
+			}
+			return l.bus.Publish(l.channels.Responses, guide.NewResponseMessage(l.generateMessageID(), resp))
+		}
+		return acquireErr
 	}
 
-	result, err := l.processForwardedRequest(ctx, fwd)
+	if l.config.RequestGuard != nil {
+		release := l.config.RequestGuard()
+		defer release()
+	}
+
+	bundle, err := l.newForwardedToolBundle()
+	if err != nil {
+		lease.Release()
+		return err
+	}
+	defer bundle.Close()
+
+	result, err := l.processForwardedRequest(ctx, fwd, bundle)
+	snapshot := lease.ReleaseWithObservation(shared.RequestReplicaObservation{
+		Duration:    time.Since(startTime),
+		TotalTokens: shared.TotalUsageTokens(usageAcc.Total()),
+		Successful:  err == nil,
+	})
 	shared.LogResponse(l.steering.EventLogger(), fwd.CorrelationID, l.id, fwd.SessionID, time.Since(startTime), err)
 
 	if err != nil {
@@ -560,7 +642,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		if fwd.FireAndForget {
 			return nil
 		}
-		l.publishActivityForSession(fwd.SessionID, events.EventTypeAgentError, fmt.Sprintf("Search failed: %s", err.Error()))
+		l.publishReplicaActivityForSession(fwd.SessionID, events.EventTypeAgentError, fmt.Sprintf("Search failed: %s", err.Error()), snapshot)
 		errMsg := guide.NewErrorMessage(
 			l.generateMessageID(),
 			fwd.CorrelationID,
@@ -585,7 +667,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		ProcessingTime:      time.Since(startTime),
 		Data:                result,
 	}
-	l.publishActivityForSession(fwd.SessionID, events.EventTypeSuccess, "Search task completed")
+	l.publishReplicaActivityForSession(fwd.SessionID, events.EventTypeSuccess, "Search task completed", snapshot)
 
 	if l.agentPod != nil {
 		l.agentPod.FeedScribe("librarian", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)

@@ -344,6 +344,39 @@ func TestRenderEntry_ThinkingPhaseIncludesInterAgentRows(t *testing.T) {
 	}
 }
 
+func TestRenderEntry_FailedInterAgentRowShowsConcreteError(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inter-agent-failure",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "inspector",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:  "consult_academic_approach",
+				StartedAt: time.Now().Add(-250 * time.Millisecond),
+				Completed: true,
+				Success:   false,
+				ErrorMsg:  "academic consultation failed: provider unavailable",
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Assess whether the current approach is sound.",
+					Status:     InterAgentToolFailed,
+				},
+			},
+		},
+	}
+
+	lines, _ := RenderEntry(entry, 96, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "academic") {
+		t.Fatalf("rendered row missing academic label: %q", joined)
+	}
+	if !strings.Contains(joined, "provider unavailable") {
+		t.Fatalf("rendered row missing concrete error: %q", joined)
+	}
+}
+
 func TestRenderEntry_OffsetsInterAgentSubregionsForLaterToolCalls(t *testing.T) {
 	entry := &ChatEntry{
 		ID:        "inter-agent-subregion-offset",

@@ -169,9 +169,12 @@ func (e *Engineer) executeToolLoopWithSurface(
 			return "", fmt.Errorf("engineer repeated tool call: %s", sig.Name)
 		}
 
-		errCount, controlErr := e.applyToolCalls(ctx, req, resp, surface)
+		errCount, controlErr, delegatedMessage := e.applyToolCalls(ctx, req, resp, surface)
 		e.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if controlErr != nil {
+			if errors.Is(controlErr, skills.ErrDelegatedRequested) {
+				return strings.TrimSpace(delegatedMessage), nil
+			}
 			return "", controlErr
 		}
 		if shared.PipelineTurnTerminated(ctx) {
@@ -202,12 +205,13 @@ func (e *Engineer) applyToolCalls(
 	req *providers.Request,
 	resp *providers.Response,
 	surface toolruntime.Surface,
-) (int, error) {
+) (int, error, string) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
 	recoveryHints := make([]string, 0, 1)
 	var controlErr error
+	delegatedMessage := ""
 	for _, call := range resp.ToolCalls {
 		if ctx.Err() != nil {
 			break
@@ -228,6 +232,9 @@ func (e *Engineer) applyToolCalls(
 			case errors.Is(err, skills.ErrRerouteRequested):
 				controlErr = skills.ErrRerouteRequested
 				result = `{"rerouted": true}`
+			case errors.Is(err, skills.ErrDelegatedRequested):
+				controlErr = err
+				delegatedMessage = shared.DelegatedToolMessage(result, err)
 			default:
 				result = shared.ToolErrorPayload(err)
 				isError = true
@@ -265,7 +272,7 @@ func (e *Engineer) applyToolCalls(
 		}
 	}
 	shared.AppendToolRecoveryMessage(req, recoveryHints)
-	return errCount, controlErr
+	return errCount, controlErr, delegatedMessage
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.

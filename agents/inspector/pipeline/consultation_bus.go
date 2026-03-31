@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
@@ -75,16 +76,12 @@ func (pi *PipelineInspector) requestRouteSync(ctx context.Context, target, paylo
 	defer release()
 
 	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, target, payload, nil)
-
-	correlationID := fmt.Sprintf("pi_corr_%s", uuid.New().String()[:8])
-	wait := pi.registerPendingWait(correlationID)
-	defer pi.clearPendingWait(correlationID)
-
 	req := &guide.RouteRequest{
 		Input:           payload,
 		SourceAgentID:   pi.id,
 		SourceAgentName: "inspector-pipeline",
-		CorrelationID:   correlationID,
+		TargetAgentID:   target,
+		ExplicitTarget:  strings.TrimSpace(target) != "",
 	}
 	if req.ParentCorrelationID == "" {
 		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
@@ -93,20 +90,32 @@ func (pi *PipelineInspector) requestRouteSync(ctx context.Context, target, paylo
 	}
 	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
 	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
-	msg := guide.NewRequestMessage(pi.generateMessageID(), req)
-	msg.CorrelationID = correlationID
+	response, err := shared.RetryBusyRouteRequest(branchCtx, target, shared.DefaultBusyRetryPolicy(target), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+		req.CorrelationID = fmt.Sprintf("pi_corr_%s", uuid.New().String()[:8])
+		wait := pi.registerPendingWait(req.CorrelationID)
+		defer pi.clearPendingWait(req.CorrelationID)
 
-	if err := pi.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
-		branch.Complete(branchCtx, "", "", err)
-		return nil, fmt.Errorf("publish correction request: %w", err)
-	}
+		msg := guide.NewRequestMessage(pi.generateMessageID(), req)
+		msg.CorrelationID = req.CorrelationID
 
-	response, err := shared.WaitForPendingSyncResponse(
-		branchCtx,
-		"correction request",
-		shared.ConsultationInactivityTimeout(target),
-		wait,
-	)
+		if err := pi.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+			return nil, fmt.Errorf("publish correction request: %w", err)
+		}
+
+		response, err := shared.WaitForPendingSyncResponse(
+			attemptCtx,
+			"correction request",
+			shared.ConsultationInactivityTimeout(target),
+			wait,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if busyErr, ok := shared.BusyRouteResponseMessage(response, target); ok {
+			return nil, busyErr
+		}
+		return response, nil
+	})
 	if err != nil {
 		branch.Complete(branchCtx, "", "", err)
 		return nil, err

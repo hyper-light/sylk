@@ -5,6 +5,7 @@ package academic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -30,8 +31,10 @@ import (
 
 // Default configuration values.
 const (
-	DefaultModel       = "gpt-5.4-pro"
-	DefaultMaxToolRuns = 32
+	DefaultModel          = "gpt-5.4-pro"
+	DefaultMaxToolRuns    = 32
+	DefaultReplicaCount   = 4
+	DefaultReplicaBacklog = 16
 )
 
 const academicChildProgressMessage = "Researching external sources and codebase fit."
@@ -85,9 +88,8 @@ type Academic struct {
 	// Steering ledger management.
 	steering *shared.SteeringManager
 
-	// Request serialization: ensures at most one forwarded request
-	// executes at a time.
-	requestSerializer *shared.RequestSerializer
+	// Forwarded-request admission for bounded parallel knowledge replicas.
+	requestPool *shared.RequestReplicaPool
 
 	// Synchronous consultation bus (Librarian responses).
 	pendingMu       sync.Mutex
@@ -168,6 +170,14 @@ type Config struct {
 	// WorkspaceViews provides explicit disk/global/pipeline read access for
 	// codebase-aware research grounding.
 	WorkspaceViews versioning.WorkspaceViewAccess
+
+	// Forwarded-request admission controls for bounded replica concurrency.
+	MaxConcurrentForwarded int
+	MaxQueuedForwarded     int
+
+	// ContextQuota exposes aggregate runtime pressure so autoscaling can
+	// respect system headroom without user configuration.
+	ContextQuota *container.ResourceQuota
 }
 
 // New creates a new Academic agent with the given LLM provider.
@@ -193,23 +203,30 @@ func New(cfg Config, provider academicProvider) (*Academic, error) {
 	skillsRegistry := skills.NewRegistry()
 
 	a := &Academic{
-		id:                academicID,
-		config:            cfg,
-		domainFilter:      NewAcademicDomainFilter(logger),
-		logger:            logger,
-		provider:          provider,
-		activityPub:       cfg.ActivityPub,
-		skills:            skillsRegistry,
-		hooks:             hookRegistry,
-		knownAgents:       make(map[string]*guide.AgentAnnouncement),
-		pendingConsults:   make(map[string]*shared.PendingSyncWait),
-		researchCache:     make(map[string]*ResearchResult),
-		sourceIndex:       make(map[string]*Source),
-		outcomeHistory:    NewOutcomeHistory(cfg.OutcomeHistoryLimit),
-		steering:          shared.NewSteeringManager(),
-		requestSerializer: shared.NewRequestSerializer(),
-		workspaceViews:    authority.RestrictWorkspaceViews("academic", cfg.WorkspaceViews),
+		id:              academicID,
+		config:          cfg,
+		domainFilter:    NewAcademicDomainFilter(logger),
+		logger:          logger,
+		provider:        provider,
+		activityPub:     cfg.ActivityPub,
+		skills:          skillsRegistry,
+		hooks:           hookRegistry,
+		knownAgents:     make(map[string]*guide.AgentAnnouncement),
+		pendingConsults: make(map[string]*shared.PendingSyncWait),
+		researchCache:   make(map[string]*ResearchResult),
+		sourceIndex:     make(map[string]*Source),
+		outcomeHistory:  NewOutcomeHistory(cfg.OutcomeHistoryLimit),
+		steering:        shared.NewSteeringManager(),
+		workspaceViews:  authority.RestrictWorkspaceViews("academic", cfg.WorkspaceViews),
 	}
+	a.requestPool = shared.NewAutoscalingRequestReplicaPool(shared.RequestReplicaPoolConfig{
+		Name:              "academic",
+		HardMaxActive:     cfg.MaxConcurrentForwarded,
+		HardMaxQueued:     cfg.MaxQueuedForwarded,
+		CurrentModel:      a.CurrentModel,
+		ProviderTelemetry: a.currentProviderAutoscaleSnapshot,
+		ContextQuota:      cfg.ContextQuota,
+	})
 
 	a.steering.InitLazy("academic", cfg.ActivityPub)
 
@@ -291,6 +308,9 @@ func (a *Academic) Close() error {
 		a.tools = nil
 	}
 	a.Stop()
+	if a.requestPool != nil {
+		a.requestPool.Close()
+	}
 	return nil
 }
 
@@ -360,6 +380,10 @@ func (a *Academic) CurrentModel() string {
 		return a.config.Model
 	}
 	return DefaultModel
+}
+
+func (a *Academic) currentProviderAutoscaleSnapshot() shared.RequestReplicaProviderSnapshot {
+	return shared.RequestReplicaProviderSnapshotFromProvider(a.getProvider())
 }
 
 // SupportedModels implements container.ModelSwappable.
@@ -494,11 +518,6 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		return nil // Ignore non-forward messages
 	}
 
-	if !a.requestSerializer.Acquire(a.runCtx) {
-		return nil // parent context done, agent shutting down
-	}
-	defer a.requestSerializer.Release()
-
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
@@ -517,6 +536,13 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 
 	// Process the request with a cancellable request-scoped context.
 	reqCtx, cancel := context.WithCancel(a.runCtx)
+	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
+		BusProvider:     func() guide.EventBus { return a.bus },
+		SourceAgentID:   func() string { return a.id },
+		SourceAgentType: "academic",
+		SourceAgentName: "Academic",
+	})
 	a.registerRequestCancel(fwd.CorrelationID, cancel)
 	a.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer a.clearRequestCancel(fwd.CorrelationID)
@@ -530,12 +556,6 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 
 	// Wire tool call emitter for inline visualization.
 	emitter := shared.NewToolCallEmitter(a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID)
-	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
-		BusProvider:     func() guide.EventBus { return a.bus },
-		SourceAgentID:   func() string { return a.id },
-		SourceAgentType: "academic",
-		SourceAgentName: "Academic",
-	})
 	reqCtx = withRouteHops(reqCtx, fwd.Hops)
 	ctx := shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	ctx = shared.WithStreamContextMetadata(ctx, shared.MergeStreamMetadata(
@@ -555,7 +575,6 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		SessionID:   fwd.SessionID,
 	})
 	ctx = shared.WithAutomaticHandoffEnabled(ctx, shared.AutomaticHandoffAllowedForForwardedRequest(fwd))
-	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	gov := shared.NewContextGovernor(a.config.Model, a.config.MaxOutputTokens, 0)
 	if a.handoffBridge != nil && shared.AutomaticHandoffEnabled(ctx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
@@ -568,13 +587,78 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		AgentID: a.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
 	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
-	if publishStreamLifecycle {
-		shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
+	streamStarted := false
+	var stopQueueKeepalive func()
+	lease, acquireErr := a.requestPool.Acquire(reqCtx, shared.RequestReplicaAcquireOptions{
+		SourceKey:         shared.RequestReplicaSourceKeyForForwardedRequest(fwd),
+		Priority:          shared.RequestReplicaPriorityForForwardedRequest(fwd),
+		PromptBytes:       shared.RequestReplicaPromptBytesForForwardedRequest(fwd),
+		ContextFieldCount: shared.RequestReplicaContextFieldCount(fwd),
+		OnQueued: func(snapshot shared.RequestReplicaPoolSnapshot, queuePosition int) {
+			if publishStreamLifecycle && !streamStarted {
+				shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
+				streamStarted = true
+			}
+			a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentAction, "Waiting for an available research replica", snapshot)
+			if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
+				pp.PublishState(events.AgentUIStateSearching, shared.KnowledgeQueueProgressMessage("academic", snapshot, queuePosition))
+			}
+			stopQueueKeepalive = a.startQueueKeepalive(ctx, queuePosition)
+		},
+		OnGranted: func(snapshot shared.RequestReplicaPoolSnapshot, _ bool) {
+			if stopQueueKeepalive != nil {
+				stopQueueKeepalive()
+				stopQueueKeepalive = nil
+			}
+			if publishStreamLifecycle && !streamStarted {
+				shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
+				streamStarted = true
+			}
+			a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentAction, "Processing research request", snapshot)
+		},
+	})
+	if stopQueueKeepalive != nil {
+		defer stopQueueKeepalive()
 	}
+	if acquireErr != nil {
+		if errors.Is(acquireErr, context.Canceled) || errors.Is(acquireErr, context.DeadlineExceeded) {
+			return nil
+		}
+		if fwd.FireAndForget {
+			return nil
+		}
+		var busyErr *shared.AgentBusyError
+		if errors.As(acquireErr, &busyErr) {
+			resp := &guide.RouteResponse{
+				CorrelationID:       fwd.CorrelationID,
+				Success:             false,
+				Data:                shared.BusyRouteResponseData("academic", busyErr.Snapshot, busyErr.Error()),
+				Error:               busyErr.Error(),
+				RespondingAgentID:   a.id,
+				RespondingAgentName: "Academic",
+			}
+			return a.bus.Publish(a.channels.Responses, guide.NewResponseMessage(generateMessageID(), resp))
+		}
+		return acquireErr
+	}
+
+	bundle, err := a.newForwardedToolBundle()
+	if err != nil {
+		lease.Release()
+		return err
+	}
+	defer bundle.Close()
+
+	ctx = withAcademicToolBundle(ctx, bundle)
 	stopProgressKeepalive := a.startChildProgressKeepalive(ctx, fwd)
 	defer stopProgressKeepalive()
 
 	result, err := a.processForwardedRequest(ctx, fwd)
+	snapshot := lease.ReleaseWithObservation(shared.RequestReplicaObservation{
+		Duration:    time.Since(startTime),
+		TotalTokens: shared.TotalUsageTokens(usageAcc.Total()),
+		Successful:  err == nil,
+	})
 	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, "academic", fwd.SessionID, time.Since(startTime), err)
 
 	if err != nil {
@@ -590,7 +674,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		if fwd.FireAndForget {
 			return nil
 		}
-		a.publishActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentError, fmt.Sprintf("Research failed: %s", err.Error()))
+		a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentError, fmt.Sprintf("Research failed: %s", err.Error()), snapshot)
 		errMsg := guide.NewErrorMessage(
 			generateMessageID(),
 			fwd.CorrelationID,
@@ -615,7 +699,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		ProcessingTime:      time.Since(startTime),
 		Data:                result,
 	}
-	a.publishActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeSuccess, "Research task completed")
+	a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeSuccess, "Research task completed", snapshot)
 
 	respMsg := guide.NewResponseMessage(generateMessageID(), resp)
 	return a.bus.Publish(a.channels.Responses, respMsg)
@@ -788,8 +872,8 @@ func (a *Academic) handleConversation(ctx context.Context, fwd *guide.ForwardedR
 	}
 
 	handoff := academicConversationHandoffFromForwarded(fwd)
-	toolSurface := a.requestToolSurfaceForForwardedRequest(fwd, academicConversationExtraTools(handoff)...)
-	a.prepareSkillsForInput(query)
+	toolSurface := a.requestToolSurfaceForForwardedRequest(ctx, fwd, academicConversationExtraTools(handoff)...)
+	academicPrepareSkillsForInput(a, ctx, query)
 	llmReq := &providers.Request{
 		SystemPrompt: buildAcademicConversationSystemPrompt(a.config.SystemPrompt, handoff, AcademicResearchDepthFromContext(ctx)),
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: query}},
@@ -823,8 +907,8 @@ func (a *Academic) handleConsultation(ctx context.Context, fwd *guide.ForwardedR
 		}, nil
 	}
 
-	toolSurface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
-	a.prepareSkillsForInput(query)
+	toolSurface := a.requestToolSurfaceForForwardedRequest(ctx, fwd, academicForwardedResearchExtraTools(fwd)...)
+	academicPrepareSkillsForInput(a, ctx, query)
 	llmReq := &providers.Request{
 		SystemPrompt: buildAcademicConsultationSystemPrompt(a.config.SystemPrompt, fwd, AcademicResearchDepthFromContext(ctx)),
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: query}},
@@ -1245,8 +1329,8 @@ func (a *Academic) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest)
 		fetchPrompt = extra + "\n\n" + fetchPrompt
 	}
 
-	surface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
-	a.prepareSkillsForInput(fetchPrompt)
+	surface := a.requestToolSurfaceForForwardedRequest(ctx, fwd, academicForwardedResearchExtraTools(fwd)...)
+	academicPrepareSkillsForInput(a, ctx, fetchPrompt)
 	llmReq := &providers.Request{
 		SystemPrompt: a.config.SystemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: fetchPrompt}},
@@ -1278,11 +1362,11 @@ func (a *Academic) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest
 	recallPrompt := buildAcademicRecallPrompt(fwd)
 	systemPrompt := a.config.SystemPrompt
 
-	surface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
+	surface := a.requestToolSurfaceForForwardedRequest(ctx, fwd, academicForwardedResearchExtraTools(fwd)...)
 	if contract := academicCompletionContractForForwardedRequest(fwd); contract != nil {
 		ctx = WithAcademicCompletionContract(ctx, contract)
 	}
-	a.prepareSkillsForInput(recallPrompt)
+	academicPrepareSkillsForInput(a, ctx, recallPrompt)
 	llmReq := &providers.Request{
 		SystemPrompt: systemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: recallPrompt}},
@@ -1328,8 +1412,8 @@ func (a *Academic) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest)
 		checkPrompt = extra + "\n\n" + checkPrompt
 	}
 
-	surface := a.requestToolSurfaceForForwardedRequest(fwd, academicForwardedResearchExtraTools(fwd)...)
-	a.prepareSkillsForInput(checkPrompt)
+	surface := a.requestToolSurfaceForForwardedRequest(ctx, fwd, academicForwardedResearchExtraTools(fwd)...)
+	academicPrepareSkillsForInput(a, ctx, checkPrompt)
 	llmReq := &providers.Request{
 		SystemPrompt: a.config.SystemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: checkPrompt}},
@@ -1461,9 +1545,6 @@ func (a *Academic) requestConsultSync(ctx context.Context, req *guide.RouteReque
 
 	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, req.TargetAgentID, req.Input, req.Metadata)
 	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
-	if req.CorrelationID == "" {
-		req.CorrelationID = "corr_" + uuid.NewString()
-	}
 	if req.ParentCorrelationID == "" {
 		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
 			req.ParentCorrelationID = stream.CorrelationID
@@ -1476,21 +1557,29 @@ func (a *Academic) requestConsultSync(ctx context.Context, req *guide.RouteReque
 	if req.Hops == 0 {
 		req.Hops = routeHopsFromContext(branchCtx)
 	}
+	response, err := shared.RetryBusyRouteRequest(branchCtx, req.TargetAgentID, shared.DefaultBusyRetryPolicy(req.TargetAgentID), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+		req.CorrelationID = "corr_" + uuid.NewString()
+		wait := a.registerPendingConsult(req.CorrelationID)
+		defer a.clearPendingConsult(req.CorrelationID)
 
-	wait := a.registerPendingConsult(req.CorrelationID)
-	defer a.clearPendingConsult(req.CorrelationID)
+		if err := a.publishConsultRequest(req); err != nil {
+			return nil, err
+		}
 
-	if err := a.publishConsultRequest(req); err != nil {
-		branch.Complete(branchCtx, "", "", err)
-		return nil, err
-	}
-
-	response, err := shared.WaitForPendingSyncResponse(
-		branchCtx,
-		fmt.Sprintf("consultation to %q", req.TargetAgentID),
-		academicConsultationTimeout(req.TargetAgentID),
-		wait,
-	)
+		response, err := shared.WaitForPendingSyncResponse(
+			attemptCtx,
+			fmt.Sprintf("consultation to %q", req.TargetAgentID),
+			academicConsultationTimeout(req.TargetAgentID),
+			wait,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if busyErr, ok := shared.BusyRouteResponseMessage(response, req.TargetAgentID); ok {
+			return nil, busyErr
+		}
+		return response, nil
+	})
 	if err != nil {
 		branch.Complete(branchCtx, "", "", err)
 		return nil, err
@@ -1532,6 +1621,9 @@ func (a *Academic) requestConsultation(
 	response, err := a.requestConsultSync(branchCtx, req)
 	branch.CompleteFromMessage(branchCtx, response, err)
 	if err != nil {
+		if shared.IsAgentBusyError(err) {
+			return failedConsultEvidence(target, query, scope, req.CorrelationID, err), shared.ConsultationBusyDelegatedError(target, err)
+		}
 		return failedConsultEvidence(target, query, scope, req.CorrelationID, err), err
 	}
 	return buildConsultEvidence(target, query, scope, req.CorrelationID, response), nil
@@ -1760,7 +1852,10 @@ func (a *Academic) publishActivityForRequest(sessionID, correlationID string, ev
 	a.activityPub.PublishActivity(evt)
 }
 
-func (a *Academic) requestToolSurfaceForForwardedRequest(fwd *guide.ForwardedRequest, extraTools ...string) toolruntime.Surface {
+func (a *Academic) requestToolSurfaceForForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest, extraTools ...string) toolruntime.Surface {
+	if bundle := academicToolBundleFromContext(ctx); bundle != nil {
+		return bundle.requestSurface(extraTools...)
+	}
 	base := a.toolRuntime()
 	if base == nil {
 		return nil

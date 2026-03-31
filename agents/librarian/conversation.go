@@ -15,22 +15,22 @@ import (
 // processForwardedRequest handles the actual request processing.
 // When LLM is enabled, builds a providers.Request and runs the tool loop.
 // Falls back to direct intent-dispatch when LLM is disabled.
-func (l *Librarian) processForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+func (l *Librarian) processForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest, bundle *librarianToolBundle) (any, error) {
 	if l.config.EnableLLM && l.getProvider() != nil {
-		return l.processViaLLM(ctx, fwd)
+		return l.processViaLLM(ctx, fwd, bundle)
 	}
 	return l.processViaIntentDispatch(ctx, fwd)
 }
 
 // processViaLLM builds an LLM request with tools and runs the tool loop.
-func (l *Librarian) processViaLLM(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	llmReq := l.buildLLMRequest(fwd)
+func (l *Librarian) processViaLLM(ctx context.Context, fwd *guide.ForwardedRequest, bundle *librarianToolBundle) (any, error) {
+	llmReq := l.buildLLMRequestWithBundle(fwd, bundle)
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return l.executeToolLoop(ctx, llmReq, ledger)
+		return l.executeToolLoopWithBundle(ctx, llmReq, ledger, bundle)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("librarian search failed: %w", err)
@@ -48,11 +48,19 @@ func (l *Librarian) processViaLLM(ctx context.Context, fwd *guide.ForwardedReque
 
 // buildLLMRequest constructs a providers.Request for the tool loop.
 func (l *Librarian) buildLLMRequest(fwd *guide.ForwardedRequest) *providers.Request {
-	l.prepareSkillsForInput(fwd.Input)
+	return l.buildLLMRequestWithBundle(fwd, nil)
+}
+
+func (l *Librarian) buildLLMRequestWithBundle(fwd *guide.ForwardedRequest, bundle *librarianToolBundle) *providers.Request {
+	if bundle != nil {
+		bundle.prepareSkillsForInput(fwd.Input)
+	} else {
+		l.prepareSkillsForInput(fwd.Input)
+	}
 	req := &providers.Request{
 		SystemPrompt: l.config.SystemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: fwd.Input}},
-		Tools:        l.buildToolDefinitions(),
+		Tools:        l.buildToolDefinitionsWithBundle(bundle),
 		Model:        l.CurrentModel(),
 		MaxTokens:    l.config.MaxTokens,
 	}

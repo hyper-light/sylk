@@ -8,7 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	shared "github.com/adalundhe/sylk/agents/inspector/shared"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 )
 
 func TestArchitectSnapshotJSONPath_PrefersLatestVersionedSnapshot(t *testing.T) {
@@ -98,4 +100,70 @@ func containsAll(s string, parts ...string) bool {
 		}
 	}
 	return true
+}
+
+func TestConsultAgent_FailedAcademicConsultMarksInterAgentBranchFailed(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	gi := &GlobalInspector{
+		id:         "inspector-id",
+		bus:        bus,
+		channels:   guide.NewAgentChannels("inspector", "inspector-id"),
+		pendingBus: make(map[string]*pendingWait),
+		config:     shared.GlobalInspectorConfig{SessionID: "sess-1"},
+	}
+
+	respSub, err := bus.SubscribeAsync(gi.channels.Responses, gi.handleBusResponse)
+	if err != nil {
+		t.Fatalf("subscribe inspector responses: %v", err)
+	}
+	defer respSub.Unsubscribe()
+
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		return bus.Publish(gi.channels.Responses, guide.NewResponseMessage("resp", &guide.RouteResponse{
+			CorrelationID:     req.CorrelationID,
+			Success:           false,
+			RespondingAgentID: "academic",
+			Error:             "academic consultation failed: provider unavailable",
+		}))
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer reqSub.Unsubscribe()
+
+	var events []agentshared.ToolCallEvent
+	ctx := agentshared.WithStreamContext(context.Background(), "corr-parent", "inspector")
+	ctx = agentshared.WithToolCallEmitter(ctx, func(ev agentshared.ToolCallEvent) {
+		events = append(events, ev)
+	})
+
+	_, err = gi.consultAgent(ctx, "academic", "Assess whether the current approach is sound.", nil)
+	if err == nil {
+		t.Fatal("expected consultAgent error")
+	}
+	if !strings.Contains(err.Error(), "provider unavailable") {
+		t.Fatalf("error = %v, want provider-unavailable detail", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("emitted events = %d, want 2", len(events))
+	}
+	complete := events[1]
+	if complete.Success {
+		t.Fatal("expected failed consult completion")
+	}
+	if complete.ErrorMsg != "academic consultation failed: provider unavailable" {
+		t.Fatalf("completion error = %q", complete.ErrorMsg)
+	}
+	if complete.InterAgent == nil {
+		t.Fatal("expected inter-agent metadata on completion")
+	}
+	if complete.InterAgent.Status != agentshared.InterAgentToolEventStatusFailed {
+		t.Fatalf("status = %q, want %q", complete.InterAgent.Status, agentshared.InterAgentToolEventStatusFailed)
+	}
 }

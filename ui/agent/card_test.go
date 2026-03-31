@@ -110,3 +110,28 @@ func TestRenderCard_EmojiSummaryStillFitsWidth(t *testing.T) {
 		t.Fatalf("card display width = %d, want %d for %q", got, width, stripANSI(card))
 	}
 }
+
+func TestRenderCard_KnowledgeReplicaSuffixPreservesWidth(t *testing.T) {
+	th := theme.DefaultDark()
+	width := 56
+	agent := AgentState{
+		ID:             "academic",
+		Name:           "Academic",
+		AgentType:      "academic",
+		Category:       "knowledge",
+		Status:         StatusThinking,
+		TaskSummary:    "Synthesizing corroborated sources for a live consult backlog.",
+		ContextUsage:   0.41,
+		ActiveReplicas: 3,
+		QueuedRequests: 2,
+	}
+
+	card := RenderCard(agent, width, th, false, false, "", AnimState{})
+	plain := stripANSI(card)
+	if !strings.Contains(plain, "Academic x3 q2") {
+		t.Fatalf("card = %q, want knowledge replica suffix", plain)
+	}
+	if got := displayWidth(card, false); got != width {
+		t.Fatalf("card display width = %d, want %d for %q", got, width, plain)
+	}
+}

@@ -199,7 +199,7 @@ func TestViewportUsesFullInnerWidthWithoutPrematureWrap(t *testing.T) {
 		Timestamp: time.Now(),
 		Source:    SourceAgent,
 		AgentType: "engineer",
-		Content:   strings.Repeat("x", 31),
+		Content:   strings.Repeat("x", 30),
 	})
 
 	vp := NewViewport(history, theme.DefaultDark())
@@ -215,6 +215,29 @@ func TestViewportUsesFullInnerWidthWithoutPrematureWrap(t *testing.T) {
 		if got := lipgloss.Width(line); got > 32 {
 			t.Fatalf("viewport line %d width = %d, want <= 32: %q", i, got, line)
 		}
+	}
+}
+
+func TestViewportReservesRightPaddingInRenderWidth(t *testing.T) {
+	history := NewHistory(2)
+	history.Push(&ChatEntry{
+		ID:        "engineer",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "engineer",
+		Content:   strings.Repeat("x", 31),
+	})
+
+	vp := NewViewport(history, theme.DefaultDark())
+	vp.SetSize(32, 4)
+
+	if got, want := vp.viewWidth, 30; got != want {
+		t.Fatalf("viewport content width = %d, want %d after symmetric padding", got, want)
+	}
+
+	lines := vp.renderEntry(0)
+	if len(lines) != 4 {
+		t.Fatalf("rendered line count = %d, want 4 (header + 2 content lines + spacer): %q", len(lines), strings.Join(lines, "\n"))
 	}
 }
 

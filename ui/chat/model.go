@@ -346,6 +346,9 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	case msg.StreamErrorMsg:
 		m.viewDirty = true
 		return m, m.handleStreamError(typed)
+	case msg.StreamRerouteMsg:
+		m.viewDirty = true
+		return m, m.handleStreamReroute(typed)
 	case msg.RetryStatusMsg:
 		m.viewDirty = true
 		return m, m.handleRetryStatus(typed)
@@ -688,6 +691,62 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 		"correlation_id", cid,
 		"remaining_streams", len(m.streams))
 	return nil
+}
+
+func (m *Model) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
+	original := strings.TrimSpace(reroute.OriginalCorrelationID)
+	if original == "" {
+		return nil
+	}
+	slot := m.streamSlot(original)
+	if slot == nil {
+		return nil
+	}
+	entryIdx := -1
+	if slot.accumulator != nil {
+		entryIdx = slot.accumulator.EntryIndex()
+	}
+	if entryIdx >= 0 {
+		m.history.UpdateAt(entryIdx, func(e *ChatEntry) {
+			if settlePipelineChallengeRowsForReroute(e) {
+				invalidateChatEntryRender(e)
+			}
+		})
+		delete(m.pendingInterAgent, entryIdx)
+	}
+	slot.deferCompletion = false
+	m.resolveSlotThinkingEntry(slot)
+	if entryIdx >= 0 {
+		m.history.UpdateAt(entryIdx, func(e *ChatEntry) {
+			invalidateChatEntryRender(e)
+		})
+	}
+	m.viewDirty = true
+	return nil
+}
+
+func settlePipelineChallengeRowsForReroute(entry *ChatEntry) bool {
+	if entry == nil {
+		return false
+	}
+	changed := false
+	for i := range entry.ToolCalls {
+		record := &entry.ToolCalls[i]
+		if record.InterAgent == nil || record.InterAgent.Kind != InterAgentToolChallenge {
+			continue
+		}
+		if record.InterAgent.Status != InterAgentToolPending {
+			continue
+		}
+		if !strings.HasPrefix(strings.TrimSpace(record.InterAgent.ThreadKey), pipelineThreadPrefix) {
+			continue
+		}
+		record.InterAgent.Status = InterAgentToolDone
+		record.Completed = true
+		record.Success = true
+		changed = true
+	}
+	return changed
 }
 
 // handleStreamError adds an error entry and cleans up the accumulator.

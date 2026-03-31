@@ -205,6 +205,76 @@ func TestAcademicExecuteToolLoop_DelegatedFetchReturnsUserMessage(t *testing.T) 
 	}
 }
 
+type failedConsultThenAnswerProvider struct {
+	calls int
+}
+
+func (p *failedConsultThenAnswerProvider) Complete(_ context.Context, _ *providers.Request) (*providers.Response, error) {
+	p.calls++
+	if p.calls == 1 {
+		return &providers.Response{
+			Model: "gpt-5.4-pro",
+			ToolCalls: []providers.ToolCall{{
+				ID:        "consult_1",
+				Name:      "consult",
+				Arguments: `{"target":"librarian","query":"What patterns exist for packaging configuration?"}`,
+			}},
+		}, nil
+	}
+	return &providers.Response{
+		Content: "I could not reach Librarian, so I’m proceeding with direct research and provisional guidance.",
+		Model:   "gpt-5.4-pro",
+	}, nil
+}
+
+func TestAcademicExecuteToolLoop_ConsultFailureReturnsStructuredToolResultAndContinues(t *testing.T) {
+	provider := &failedConsultThenAnswerProvider{}
+	a, err := New(Config{ID: "academic"}, provider)
+	if err != nil {
+		t.Fatalf("new academic: %v", err)
+	}
+
+	req := &providers.Request{
+		Messages: []providers.Message{{Role: providers.RoleUser, Content: "Research packaging configuration guidance."}},
+		Model:    "gpt-5.4-pro",
+	}
+
+	content, err := a.executeToolLoop(context.Background(), req, nil, nil)
+	if err != nil {
+		t.Fatalf("executeToolLoop: %v", err)
+	}
+	if provider.calls != 2 {
+		t.Fatalf("provider calls = %d, want 2", provider.calls)
+	}
+	if !strings.Contains(content, "proceeding with direct research") {
+		t.Fatalf("content = %q, want final provider answer after consult failure", content)
+	}
+
+	var toolMsg *providers.Message
+	for i := range req.Messages {
+		msg := &req.Messages[i]
+		if msg.Role == providers.RoleTool && msg.ToolName == "consult" {
+			toolMsg = msg
+			break
+		}
+	}
+	if toolMsg == nil {
+		t.Fatal("expected consult tool message to be appended")
+	}
+	if toolMsg.IsError {
+		t.Fatalf("consult tool message should not be marked as error: %#v", toolMsg)
+	}
+	if !strings.Contains(toolMsg.Content, `"success":false`) {
+		t.Fatalf("consult tool message = %q, want structured failure payload", toolMsg.Content)
+	}
+	if !strings.Contains(toolMsg.Content, `"status":"failed"`) {
+		t.Fatalf("consult tool message = %q, want failed status", toolMsg.Content)
+	}
+	if !strings.Contains(toolMsg.Content, `"error":"academic bus is unavailable"`) {
+		t.Fatalf("consult tool message = %q, want bus-unavailable error", toolMsg.Content)
+	}
+}
+
 type surfacedSearchResultProvider struct {
 	calls int
 }

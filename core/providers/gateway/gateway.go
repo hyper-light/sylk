@@ -118,6 +118,16 @@ func (g *ProviderGateway) Metrics() MetricsSnapshot {
 	return g.metrics.Snapshot()
 }
 
+// CapacitySnapshot returns the gateway's current static admission limits.
+func (g *ProviderGateway) CapacitySnapshot() CapacitySnapshot {
+	return CapacitySnapshot{
+		Name:                  g.config.Name,
+		MaxConcurrentRequests: g.config.MaxConcurrentRequests,
+		MaxQueueSize:          g.config.MaxQueueSize,
+		MaxWaitTime:           g.config.MaxWaitTime,
+	}
+}
+
 // Stop closes the gateway, signaling all queued waiters.
 func (g *ProviderGateway) Stop() {
 	if g.closed.Swap(true) {

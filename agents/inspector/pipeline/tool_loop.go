@@ -154,9 +154,12 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 			return "", fmt.Errorf("pipeline inspector repeated tool call: %s", sig.Name)
 		}
 
-		errCount, controlErr := pi.applyToolCalls(ctx, req, resp, surface)
+		errCount, controlErr, delegatedMessage := pi.applyToolCalls(ctx, req, resp, surface)
 		pi.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if controlErr != nil {
+			if errors.Is(controlErr, skills.ErrDelegatedRequested) {
+				return strings.TrimSpace(delegatedMessage), nil
+			}
 			return "", controlErr
 		}
 		if agentShared.PipelineTurnTerminated(ctx) {
@@ -187,12 +190,13 @@ func (pi *PipelineInspector) applyToolCalls(
 	req *providers.Request,
 	resp *providers.Response,
 	surface toolruntime.Surface,
-) (int, error) {
+) (int, error, string) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
 	recoveryHints := make([]string, 0, 1)
 	var controlErr error
+	delegatedMessage := ""
 	for _, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
@@ -211,6 +215,9 @@ func (pi *PipelineInspector) applyToolCalls(
 			case errors.Is(err, skills.ErrRerouteRequested):
 				controlErr = skills.ErrRerouteRequested
 				result = `{"rerouted": true}`
+			case errors.Is(err, skills.ErrDelegatedRequested):
+				controlErr = err
+				delegatedMessage = agentShared.DelegatedToolMessage(result, err)
 			default:
 				result = shared.ToolErrorPayload(err)
 				isError = true
@@ -253,7 +260,7 @@ func (pi *PipelineInspector) applyToolCalls(
 		}
 	}
 	agentShared.AppendToolRecoveryMessage(req, recoveryHints)
-	return errCount, controlErr
+	return errCount, controlErr, delegatedMessage
 }
 
 func pipelineImmediateFollowupPrompt(ctx context.Context, toolName string, hadRequiredFollowup, isError bool) string {

@@ -19,6 +19,7 @@ func TestModelsForAgent(t *testing.T) {
 		{"designer", 2},
 		{"inspector", 2},
 		{"tester", 2},
+		{"tester-pipeline", 2},
 		{"orchestrator", 2},
 		{"architect", 2},
 		{"librarian", 2},
@@ -307,13 +308,14 @@ func TestSelectorDisabledForSingleModel(t *testing.T) {
 
 func TestDefaultModelForAgentType(t *testing.T) {
 	cases := map[string]string{
-		"guide":        "gemini-3.1-pro-preview",
-		"engineer":     "gpt-5.4-pro",
-		"designer":     "gemini-3.1-pro-preview",
-		"inspector":    "gpt-5.4-pro",
-		"tester":       "gpt-5.4-pro",
-		"orchestrator": "gemini-3.1-pro-preview",
-		"architect":    "claude-opus-4-6",
+		"guide":           "gemini-3.1-pro-preview",
+		"engineer":        "gpt-5.4-pro",
+		"designer":        "gemini-3.1-pro-preview",
+		"inspector":       "gpt-5.4-pro",
+		"tester":          "gpt-5.4-pro",
+		"tester-pipeline": "gpt-5.4-pro",
+		"orchestrator":    "gemini-3.1-pro-preview",
+		"architect":       "claude-opus-4-6",
 	}
 	for agentType, want := range cases {
 		got := DefaultModelForAgentType(agentType)
@@ -332,6 +334,22 @@ func TestSeedAgentSetsModelID(t *testing.T) {
 	m.SeedAgent("task_eng_1:engineer", "engineer", "Engineer", nil, "", "")
 
 	agent := m.agents["task_eng_1:engineer"]
+	if agent == nil {
+		t.Fatal("seeded agent not found")
+	}
+	if agent.ModelID != "gpt-5.4-pro" {
+		t.Errorf("seeded agent ModelID = %q, want gpt-5.4-pro", agent.ModelID)
+	}
+	if agent.ProviderID != "openai" {
+		t.Errorf("seeded agent ProviderID = %q, want openai", agent.ProviderID)
+	}
+}
+
+func TestSeedPipelineTesterSetsModelID(t *testing.T) {
+	m := New(theme.DefaultDark())
+	m.SeedAgent("task_test_1:tester-pipeline", "tester-pipeline", "Pipeline Tester", nil, "", "")
+
+	agent := m.agents["task_test_1:tester-pipeline"]
 	if agent == nil {
 		t.Fatal("seeded agent not found")
 	}

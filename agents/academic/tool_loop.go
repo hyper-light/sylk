@@ -173,6 +173,7 @@ func (a *Academic) executeToolLoop(
 	if surface == nil {
 		surface = a.toolRuntime()
 	}
+	bundle := academicToolBundleFromContext(ctx)
 
 	p := a.getProvider()
 	if p == nil {
@@ -226,7 +227,12 @@ func (a *Academic) executeToolLoop(
 		}
 		// ── END STEERING ──
 
-		if a.toolDefsDirty {
+		if bundle != nil {
+			if bundle.toolDefsDirty {
+				baseTools = academicBuildToolDefinitionsWithBundle(a, bundle, surface)
+				bundle.toolDefsDirty = false
+			}
+		} else if a.toolDefsDirty {
 			baseTools = a.buildToolDefinitionsWithSurface(surface)
 			a.toolDefsDirty = false
 		}
@@ -416,7 +422,7 @@ func (a *Academic) applyToolCalls(
 ) academicToolBatchOutcome {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
-	loadedBefore := len(a.skills.GetLoaded())
+	loadedBefore := len(academicLoadedSkills(a, academicToolBundleFromContext(ctx)))
 
 	outcome := academicToolBatchOutcome{}
 	for _, call := range resp.ToolCalls {
@@ -431,7 +437,7 @@ func (a *Academic) applyToolCalls(
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {
-			a.toolDefsDirty = true
+			academicMarkToolDefsDirty(a, academicToolBundleFromContext(ctx))
 		}
 		isError := false
 		isDelegated := false
@@ -506,11 +512,38 @@ func (a *Academic) applyToolCalls(
 		}
 	}
 
-	if len(a.skills.GetLoaded()) > loadedBefore {
-		a.toolDefsDirty = true
+	if len(academicLoadedSkills(a, academicToolBundleFromContext(ctx))) > loadedBefore {
+		academicMarkToolDefsDirty(a, academicToolBundleFromContext(ctx))
 	}
 
 	return outcome
+}
+
+func academicBuildToolDefinitionsWithBundle(a *Academic, bundle *academicToolBundle, surface toolruntime.Surface) []providers.Tool {
+	if bundle != nil {
+		return bundle.buildToolDefinitionsWithSurface(surface)
+	}
+	return a.buildToolDefinitionsWithSurface(surface)
+}
+
+func academicLoadedSkills(a *Academic, bundle *academicToolBundle) []*skills.Skill {
+	if bundle != nil {
+		return bundle.loadedSkills()
+	}
+	if a == nil || a.skills == nil {
+		return nil
+	}
+	return a.skills.GetLoaded()
+}
+
+func academicMarkToolDefsDirty(a *Academic, bundle *academicToolBundle) {
+	if bundle != nil {
+		bundle.toolDefsDirty = true
+		return
+	}
+	if a != nil {
+		a.toolDefsDirty = true
+	}
 }
 
 func academicShouldTerminateAfterToolCall(ctx context.Context, toolName string, _ string) bool {

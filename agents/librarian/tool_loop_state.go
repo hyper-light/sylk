@@ -15,6 +15,7 @@ import (
 
 type toolLoopState struct {
 	librarian *Librarian
+	bundle    *librarianToolBundle
 	ctx       context.Context
 	req       *providers.Request
 	ledger    *steering.SteeringLedger
@@ -30,10 +31,12 @@ func newToolLoopState(
 	ctx context.Context,
 	req *providers.Request,
 	ledger *steering.SteeringLedger,
+	bundle *librarianToolBundle,
 ) *toolLoopState {
 	maxRuns := l.config.MaxToolRuns
 	return &toolLoopState{
 		librarian:    l,
+		bundle:       bundle,
 		ctx:          ctx,
 		req:          req,
 		ledger:       ledger,
@@ -80,10 +83,15 @@ func (s *toolLoopState) prepareTurn(turn int) (int, bool, error) {
 		return turn, true, nil
 	}
 
-	if s.librarian.toolDefsDirty {
-		s.req.Tools = s.librarian.buildToolDefinitions()
-		s.librarian.toolDefsDirty = false
-	}
+		if s.bundle != nil {
+			if s.bundle.toolDefsDirty {
+				s.req.Tools = s.librarian.buildToolDefinitionsWithBundle(s.bundle)
+				s.bundle.toolDefsDirty = false
+			}
+		} else if s.librarian.toolDefsDirty {
+			s.req.Tools = s.librarian.buildToolDefinitions()
+			s.librarian.toolDefsDirty = false
+		}
 	if s.searchLedger.IsSaturated() {
 		s.req.Tools = nil
 		if lm := shared.LogMetaFromContext(s.ctx); lm.EventLogger != nil {
@@ -158,7 +166,7 @@ func (s *toolLoopState) finishTurn(resp *providers.Response, turn int, turnStart
 	if turn == s.maxRuns {
 		return s.handleToolLimit(resp, turn, turnStart)
 	}
-	if err := s.librarian.toolRuntime().ValidateBatch(s.librarian.toolInvocations(s.ctx, resp.ToolCalls)); err != nil {
+	if err := s.validateToolBatch(resp.ToolCalls); err != nil {
 		return "", false, err
 	}
 	return s.executeToolCalls(resp, turn, turnStart)
@@ -234,7 +242,7 @@ func (s *toolLoopState) handleToolLimit(resp *providers.Response, turn int, turn
 }
 
 func (s *toolLoopState) executeToolCalls(resp *providers.Response, turn int, turnStart time.Time) (string, bool, error) {
-	errCount, rerouted := s.librarian.applyToolCalls(s.ctx, s.req, resp, turn, s.searchLedger)
+	errCount, rerouted := s.librarian.applyToolCalls(s.ctx, s.req, resp, turn, s.searchLedger, s.bundle)
 	s.librarian.recordTurn(s.ctx, s.req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 	if rerouted {
 		return "", true, skills.ErrRerouteRequested
@@ -251,6 +259,13 @@ func (s *toolLoopState) executeToolCalls(resp *providers.Response, turn int, tur
 			&agentlog.ErrorPayload{Error: fmt.Sprintf("tool calls failed %d consecutive turns", s.consecutiveErrors)})
 	}
 	return "", true, fmt.Errorf("librarian tool calls failed %d consecutive turns", s.consecutiveErrors)
+}
+
+func (s *toolLoopState) validateToolBatch(calls []providers.ToolCall) error {
+	if s.bundle != nil && s.bundle.runtime != nil {
+		return s.bundle.runtime.ValidateBatch(s.librarian.toolInvocationsWithBundle(s.ctx, calls, s.bundle))
+	}
+	return s.librarian.toolRuntime().ValidateBatch(s.librarian.toolInvocations(s.ctx, calls))
 }
 
 func (s *toolLoopState) exhaustedError() error {

@@ -130,13 +130,16 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 			return "", fmt.Errorf("global tester repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted := gt.applyToolCalls(ctx, req, resp)
+		errCount, rerouted, delegated, delegatedMessage := gt.applyToolCalls(ctx, req, resp)
 		gt.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if agentshared.GlobalReviewTurnTerminated(ctx) {
 			return "", nil
 		}
 		if rerouted {
 			return "", skills.ErrRerouteRequested
+		}
+		if delegated {
+			return strings.TrimSpace(delegatedMessage), nil
 		}
 		consecutiveErrors = agentshared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= 2 {
@@ -162,12 +165,14 @@ func (gt *GlobalTester) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
-) (int, bool) {
+) (int, bool, bool, string) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
 	recoveryHints := make([]string, 0, 1)
 	rerouted := false
+	delegated := false
+	delegatedMessage := ""
 	for _, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
@@ -184,6 +189,9 @@ func (gt *GlobalTester) applyToolCalls(
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
+			} else if errors.Is(err, skills.ErrDelegatedRequested) {
+				delegated = true
+				delegatedMessage = agentshared.DelegatedToolMessage(result, err)
 			} else {
 				result = agentshared.ToolErrorPayload(err)
 				isError = true
@@ -215,12 +223,12 @@ func (gt *GlobalTester) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
-		if rerouted {
+		if rerouted || delegated {
 			break
 		}
 	}
 	agentshared.AppendToolRecoveryMessage(req, recoveryHints)
-	return errCount, rerouted
+	return errCount, rerouted, delegated, delegatedMessage
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.

@@ -85,20 +85,13 @@ func (o *Orchestrator) requestRouteSync(
 
 	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, target, payload, metadata)
 	metadata = branch.ApplyMetadata(branchCtx, metadata)
-
-	correlationID := "orchestrator_corr_" + uuid.NewString()[:8]
-	wait := o.registerPendingWait(correlationID)
-	defer o.clearPendingWait(correlationID)
-
 	req := &guide.RouteRequest{
 		Input:           payload,
 		SourceAgentID:   o.config.AgentID,
 		SourceAgentName: "orchestrator",
 		TargetAgentID:   target,
 		ExplicitTarget:  true,
-		CorrelationID:   correlationID,
 		SessionID:       o.config.SessionID,
-		Timestamp:       time.Now(),
 		Metadata:        metadata,
 	}
 	if req.ParentCorrelationID == "" {
@@ -107,20 +100,34 @@ func (o *Orchestrator) requestRouteSync(
 		}
 	}
 	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
-	msg := guide.NewRequestMessage(generateMessageID(), req)
-	msg.CorrelationID = correlationID
 
-	if err := o.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
-		branch.Complete(branchCtx, "", "", err)
-		return nil, fmt.Errorf("publish route request: %w", err)
-	}
+	response, err := shared.RetryBusyRouteRequest(branchCtx, target, shared.DefaultBusyRetryPolicy(target), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+		req.CorrelationID = "orchestrator_corr_" + uuid.NewString()[:8]
+		req.Timestamp = time.Now()
+		wait := o.registerPendingWait(req.CorrelationID)
+		defer o.clearPendingWait(req.CorrelationID)
 
-	response, err := shared.WaitForPendingSyncResponse(
-		branchCtx,
-		fmt.Sprintf("route request to %s", target),
-		orchestratorRouteSyncTimeout,
-		wait,
-	)
+		msg := guide.NewRequestMessage(generateMessageID(), req)
+		msg.CorrelationID = req.CorrelationID
+
+		if err := o.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+			return nil, fmt.Errorf("publish route request: %w", err)
+		}
+
+		response, err := shared.WaitForPendingSyncResponse(
+			attemptCtx,
+			fmt.Sprintf("route request to %s", target),
+			orchestratorRouteSyncTimeout,
+			wait,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if busyErr, ok := shared.BusyRouteResponseMessage(response, target); ok {
+			return nil, busyErr
+		}
+		return response, nil
+	})
 	if err != nil {
 		branch.Complete(branchCtx, "", "", err)
 		return nil, err

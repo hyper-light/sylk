@@ -85,6 +85,10 @@ type AgentState struct {
 	ContextUsage              float64 // 0.0 to 1.0
 	ModelID                   string  // Currently assigned model ID (e.g. "claude-opus-4-6").
 	ProviderID                string  // Provider for ModelID (e.g. "anthropic", "google", "openai").
+	ActiveReplicas            int
+	MaxReplicas               int
+	QueuedRequests            int
+	MaxQueuedRequests         int
 	toolSummaryPinned         bool
 	pinnedToolCallKey         string
 	activeCorrelationID       string
@@ -797,6 +801,12 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 	if !ok {
 		return nil
 	}
+	consumeKnowledgeReplicaOnStreamComplete(agent)
+	if knowledgeAgentHasPendingReplicaLoad(agent) {
+		markAgentCorrelationTerminal(agent, done.CorrelationID)
+		m.rowsDirty = true
+		return nil
+	}
 	applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
 		Source:        agentLifecycleSourceStreamComplete,
 		CorrelationID: done.CorrelationID,
@@ -806,6 +816,15 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 	markAgentCorrelationTerminal(agent, done.CorrelationID)
 	m.rowsDirty = true
 	return nil
+}
+
+func consumeKnowledgeReplicaOnStreamComplete(agent *AgentState) {
+	if agent == nil || agent.Category != "knowledge" {
+		return
+	}
+	if agent.ActiveReplicas > 0 {
+		agent.ActiveReplicas--
+	}
 }
 
 func (m *Model) handleToolCallEvent(event msg.ToolCallEventMsg) tea.Cmd {
@@ -1090,8 +1109,16 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 				m.reconcileExistingAgent(existing, ev)
 				return existing.ID
 			}
+			if category == "knowledge" {
+				m.reconcileExistingAgent(existing, ev)
+				return existing.ID
+			}
 			return m.promoteSeededAgent(existing, agentID, ev)
 		}
+	}
+
+	if category == "knowledge" && strings.TrimSpace(agentType) != "" {
+		agentID = strings.TrimSpace(agentType)
 	}
 
 	agentName := extractString(ev.Event.Data, "agent_name")
@@ -1526,6 +1553,18 @@ func (m *Model) absorbDuplicateAgent(srcID, dstID string) {
 	if dst.ContextUsage == 0 {
 		dst.ContextUsage = src.ContextUsage
 	}
+	if dst.ActiveReplicas == 0 {
+		dst.ActiveReplicas = src.ActiveReplicas
+	}
+	if dst.MaxReplicas == 0 {
+		dst.MaxReplicas = src.MaxReplicas
+	}
+	if dst.QueuedRequests == 0 {
+		dst.QueuedRequests = src.QueuedRequests
+	}
+	if dst.MaxQueuedRequests == 0 {
+		dst.MaxQueuedRequests = src.MaxQueuedRequests
+	}
 	if dst.Status == StatusIdle && src.Status != StatusIdle {
 		dst.Status = src.Status
 	}
@@ -1733,6 +1772,12 @@ func (m *Model) updateAgentStatus(agentID string, ev msg.ActivityEventMsg) {
 		next.Status = status
 	}
 	next.ActivityState = inferUIStateFromActivity(&next, ev)
+	if active, queued, ok := extractReplicaLoad(ev.Event.Data); ok && (active > 0 || queued > 0) {
+		next.Status = StatusThinking
+		if next.ActivityState == events.AgentUIStateNone {
+			next.ActivityState = events.AgentUIStateSearching
+		}
+	}
 	if isActiveStatus(next.Status) && shouldIgnoreStaleAgentCorrelation(agent, ev.Event.CorrelationID) {
 		return
 	}
@@ -1751,6 +1796,12 @@ func (m *Model) updateAgentMetadata(agent *AgentState, ev msg.ActivityEventMsg) 
 	if summary := summarizeAgentPanelActivity(ev.Event); summary != "" && !agent.toolSummaryPinned {
 		agent.TaskSummary = summary
 	}
+	if active, queued, ok := extractReplicaLoad(ev.Event.Data); ok {
+		agent.ActiveReplicas = active
+		agent.QueuedRequests = queued
+		agent.MaxReplicas, _ = extractInt(ev.Event.Data, "max_replicas")
+		agent.MaxQueuedRequests, _ = extractInt(ev.Event.Data, "max_queued_requests")
+	}
 
 	handoffState := extractString(ev.Event.Data, "handoff_state")
 	// Panel context usage is the active LLM context-window occupancy. Handoff
@@ -1762,6 +1813,22 @@ func (m *Model) updateAgentMetadata(agent *AgentState, ev msg.ActivityEventMsg) 
 	if tokens, ok := extractInt(ev.Event.Data, "context_tokens"); ok && tokens == 0 {
 		agent.ContextUsage = 0
 	}
+}
+
+func extractReplicaLoad(data map[string]any) (int, int, bool) {
+	active, activeOK := extractInt(data, "active_replicas")
+	queued, queuedOK := extractInt(data, "queued_requests")
+	if !activeOK && !queuedOK {
+		return 0, 0, false
+	}
+	return active, queued, true
+}
+
+func knowledgeAgentHasPendingReplicaLoad(agent *AgentState) bool {
+	if agent == nil || agent.Category != "knowledge" {
+		return false
+	}
+	return agent.ActiveReplicas > 0 || agent.QueuedRequests > 0
 }
 
 func handoffActivityStatus(ev msg.ActivityEventMsg) (AgentStatus, bool) {

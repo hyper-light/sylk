@@ -2,6 +2,7 @@ package archivalist
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -34,6 +35,11 @@ type archivalistProvider interface {
 	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
 }
 
+const (
+	defaultReplicaCount   = 4
+	defaultReplicaBacklog = 16
+)
+
 type committedKnowledgeSearcher interface {
 	Search(ctx context.Context, req *search.SearchRequest) (*knowledgeruntime.CommittedSearchResult, error)
 }
@@ -52,12 +58,12 @@ type Archivalist struct {
 	client   *Client
 
 	// Containerization
-	runMu             sync.RWMutex
-	runCtx            context.Context
-	runCancel         context.CancelFunc
-	steering          *shared.SteeringManager
-	requestSerializer *shared.RequestSerializer
-	activityPub       events.ActivityPublisher
+	runMu       sync.RWMutex
+	runCtx      context.Context
+	runCancel   context.CancelFunc
+	steering    *shared.SteeringManager
+	requestPool *shared.RequestReplicaPool
+	activityPub events.ActivityPublisher
 
 	// Request lifecycle
 	requestMu      sync.Mutex
@@ -153,12 +159,17 @@ type Config struct {
 	TokenThreshold int    // Token threshold for archiving, defaults to 750K
 
 	// Feature flags
-	EnableLLM            bool // Enable LLM-driven conversation path (tool loop)
-	EnableArchive        bool // Enable SQLite archive (L2 storage)
-	EnableRAG            bool // Enable RAG components (query cache, embeddings, synthesis)
-	EnableACTR           bool // Enable ACT-R memory scoring
-	EnableHybridQuery    bool // Enable HybridQueryCoordinator
-	EnableKnowledgeGraph bool // Enable knowledge graph traversal
+	EnableLLM         bool // Enable LLM-driven conversation path (tool loop)
+	EnableArchive     bool // Enable SQLite archive (L2 storage)
+	EnableRAG         bool // Enable RAG components (query cache, embeddings, synthesis)
+	EnableACTR        bool // Enable ACT-R memory scoring
+	EnableHybridQuery bool // Enable HybridQueryCoordinator
+
+	// Forwarded-request admission controls for bounded knowledge replicas.
+	MaxConcurrentForwarded int
+	MaxQueuedForwarded     int
+	ContextQuota           *container.ResourceQuota
+	EnableKnowledgeGraph   bool // Enable knowledge graph traversal
 
 	// Concurrency configuration
 	MaxEvents           int           // Max events in event log (default: 10000)
@@ -276,27 +287,34 @@ func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
 	hookRegistry := skills.NewHookRegistry()
 
 	a := &Archivalist{
-		id:                agentID,
-		store:             c.store,
-		archive:           c.archive,
-		agentContext:      c.agentContext,
-		config:            cfg,
-		logger:            cfg.Logger,
-		activityPub:       cfg.ActivityPub,
-		registry:          c.registry,
-		eventLog:          c.eventLog,
-		conflictDetector:  c.conflictDetector,
-		conflictHistory:   c.conflictHistory,
-		knownAgents:       make(map[string]*guide.AgentAnnouncement),
-		pendingBus:        make(map[string]chan *guide.Message),
-		requestCancels:    make(map[string]context.CancelFunc),
-		skills:            skillsRegistry,
-		hooks:             hookRegistry,
-		steering:          shared.NewSteeringManager(),
-		requestSerializer: shared.NewRequestSerializer(),
-		workIntents:       make([]*WorkIntent, 0),
-		workspaceViews:    authority.RestrictWorkspaceViews("archivalist", cfg.WorkspaceViews),
+		id:               agentID,
+		store:            c.store,
+		archive:          c.archive,
+		agentContext:     c.agentContext,
+		config:           cfg,
+		logger:           cfg.Logger,
+		activityPub:      cfg.ActivityPub,
+		registry:         c.registry,
+		eventLog:         c.eventLog,
+		conflictDetector: c.conflictDetector,
+		conflictHistory:  c.conflictHistory,
+		knownAgents:      make(map[string]*guide.AgentAnnouncement),
+		pendingBus:       make(map[string]chan *guide.Message),
+		requestCancels:   make(map[string]context.CancelFunc),
+		skills:           skillsRegistry,
+		hooks:            hookRegistry,
+		steering:         shared.NewSteeringManager(),
+		workIntents:      make([]*WorkIntent, 0),
+		workspaceViews:   authority.RestrictWorkspaceViews("archivalist", cfg.WorkspaceViews),
 	}
+	a.requestPool = shared.NewAutoscalingRequestReplicaPool(shared.RequestReplicaPoolConfig{
+		Name:              "archivalist",
+		HardMaxActive:     cfg.MaxConcurrentForwarded,
+		HardMaxQueued:     cfg.MaxQueuedForwarded,
+		CurrentModel:      a.CurrentModel,
+		ProviderTelemetry: a.currentProviderAutoscaleSnapshot,
+		ContextQuota:      cfg.ContextQuota,
+	})
 
 	a.steering.InitLazy("archivalist", cfg.ActivityPub)
 
@@ -425,6 +443,9 @@ func (a *Archivalist) Close() error {
 	}
 	// Stop event bus subscriptions first
 	a.Stop()
+	if a.requestPool != nil {
+		a.requestPool.Close()
+	}
 
 	// Close knowledge subsystems
 	if a.queryCoordinator != nil {
@@ -633,11 +654,6 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		return nil
 	}
 
-	if !a.requestSerializer.Acquire(a.runCtx) {
-		return nil // parent context done, agent shutting down
-	}
-	defer a.requestSerializer.Release()
-
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
@@ -659,6 +675,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 
 	// Request-scoped cancellable context.
 	reqCtx, cancel := context.WithCancel(a.runCtx)
+	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
 	a.registerRequestCancel(fwd.CorrelationID, cancel)
 	a.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer a.clearRequestCancel(fwd.CorrelationID)
@@ -681,7 +698,6 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		AgentID:     a.id,
 		SessionID:   fwd.SessionID,
 	})
-	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	gov := shared.NewContextGovernor(a.CurrentModel(), a.config.MaxOutputTokens, 0)
 	if a.handoffBridge != nil {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
@@ -694,11 +710,74 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		AgentID: a.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
 	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
-	if publishStreamLifecycle {
-		shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
+	streamStarted := false
+	var stopQueueKeepalive func()
+	lease, acquireErr := a.requestPool.Acquire(reqCtx, shared.RequestReplicaAcquireOptions{
+		SourceKey:         shared.RequestReplicaSourceKeyForForwardedRequest(fwd),
+		Priority:          shared.RequestReplicaPriorityForForwardedRequest(fwd),
+		PromptBytes:       shared.RequestReplicaPromptBytesForForwardedRequest(fwd),
+		ContextFieldCount: shared.RequestReplicaContextFieldCount(fwd),
+		OnQueued: func(snapshot shared.RequestReplicaPoolSnapshot, queuePosition int) {
+			if publishStreamLifecycle && !streamStarted {
+				shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
+				streamStarted = true
+			}
+			a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentAction, "Waiting for an available archival replica", snapshot)
+			if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
+				pp.PublishState(events.AgentUIStateSearching, shared.KnowledgeQueueProgressMessage("archivalist", snapshot, queuePosition))
+			}
+			stopQueueKeepalive = a.startQueueKeepalive(ctx, queuePosition)
+		},
+		OnGranted: func(snapshot shared.RequestReplicaPoolSnapshot, _ bool) {
+			if stopQueueKeepalive != nil {
+				stopQueueKeepalive()
+				stopQueueKeepalive = nil
+			}
+			if publishStreamLifecycle && !streamStarted {
+				shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
+				streamStarted = true
+			}
+			a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentAction, "Processing archivalist request", snapshot)
+		},
+	})
+	if stopQueueKeepalive != nil {
+		defer stopQueueKeepalive()
+	}
+	if acquireErr != nil {
+		if errors.Is(acquireErr, context.Canceled) || errors.Is(acquireErr, context.DeadlineExceeded) {
+			return nil
+		}
+		if fwd.FireAndForget {
+			return nil
+		}
+		var busyErr *shared.AgentBusyError
+		if errors.As(acquireErr, &busyErr) {
+			resp := &guide.RouteResponse{
+				CorrelationID:       fwd.CorrelationID,
+				Success:             false,
+				Data:                shared.BusyRouteResponseData("archivalist", busyErr.Snapshot, busyErr.Error()),
+				Error:               busyErr.Error(),
+				RespondingAgentID:   a.id,
+				RespondingAgentName: "Archivalist",
+			}
+			return a.bus.Publish(a.channels.Responses, guide.NewResponseMessage(a.generateMessageID(), resp))
+		}
+		return acquireErr
 	}
 
-	result, err := a.processForwardedRequest(ctx, fwd)
+	bundle, err := a.newForwardedToolBundle()
+	if err != nil {
+		lease.Release()
+		return err
+	}
+	defer bundle.Close()
+
+	result, err := a.processForwardedRequestWithBundle(ctx, fwd, bundle)
+	snapshot := lease.ReleaseWithObservation(shared.RequestReplicaObservation{
+		Duration:    time.Since(startTime),
+		TotalTokens: shared.TotalUsageTokens(usageAcc.Total()),
+		Successful:  err == nil,
+	})
 	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, a.id, fwd.SessionID, time.Since(startTime), err)
 
 	if err != nil {
@@ -709,7 +788,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		if fwd.FireAndForget {
 			return nil
 		}
-		a.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Request failed: %s", err.Error()))
+		a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentError, fmt.Sprintf("Request failed: %s", err.Error()), snapshot)
 		errMsg := guide.NewErrorMessage(a.generateMessageID(), fwd.CorrelationID, a.id, err.Error())
 		return a.bus.Publish(a.channels.Errors, errMsg)
 	}
@@ -729,7 +808,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		ProcessingTime:      time.Since(startTime),
 		Data:                result,
 	}
-	a.publishActivity(events.EventTypeSuccess, "Request completed")
+	a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeSuccess, "Request completed", snapshot)
 
 	respMsg := guide.NewResponseMessage(a.generateMessageID(), resp)
 	return a.bus.Publish(a.channels.Responses, respMsg)
@@ -809,6 +888,10 @@ func (a *Archivalist) publishSystemEvent(eventType events.EventType, content str
 // When LLM is enabled and a provider is available, builds a providers.Request
 // and runs the tool loop. Falls back to direct intent-dispatch otherwise.
 func (a *Archivalist) processForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	return a.processForwardedRequestWithBundle(ctx, fwd, nil)
+}
+
+func (a *Archivalist) processForwardedRequestWithBundle(ctx context.Context, fwd *guide.ForwardedRequest, bundle *archivalistToolBundle) (any, error) {
 	if result, ok, err := a.maybeHandleBriefingRequest(fwd); ok {
 		return result, err
 	}
@@ -819,7 +902,7 @@ func (a *Archivalist) processForwardedRequest(ctx context.Context, fwd *guide.Fo
 		return a.processDeterministicForwardedRequest(ctx, fwd)
 	}
 	if a.config.EnableLLM && a.getProvider() != nil {
-		return a.processViaLLM(ctx, fwd)
+		return a.processViaLLM(ctx, fwd, bundle)
 	}
 	return a.processDeterministicForwardedRequest(ctx, fwd)
 }
@@ -945,12 +1028,16 @@ func (a *Archivalist) maybeHandleCoordinationPrecedentQuery(ctx context.Context,
 }
 
 // processViaLLM builds an LLM request with tools and runs the tool loop.
-func (a *Archivalist) processViaLLM(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	a.prepareSkillsForInput(fwd.Input)
+func (a *Archivalist) processViaLLM(ctx context.Context, fwd *guide.ForwardedRequest, bundle *archivalistToolBundle) (any, error) {
+	if bundle != nil {
+		bundle.prepareSkillsForInput(fwd.Input)
+	} else {
+		a.prepareSkillsForInput(fwd.Input)
+	}
 	llmReq := &providers.Request{
 		SystemPrompt: a.config.SystemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: fwd.Input}},
-		Tools:        a.buildToolDefinitions(),
+		Tools:        a.buildToolDefinitionsWithBundle(bundle),
 		Model:        a.CurrentModel(),
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
@@ -960,7 +1047,7 @@ func (a *Archivalist) processViaLLM(ctx context.Context, fwd *guide.ForwardedReq
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return a.executeToolLoop(ctx, llmReq, ledger)
+		return a.executeToolLoopWithBundle(ctx, llmReq, ledger, bundle)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("archivalist failed: %w", err)
@@ -3074,6 +3161,13 @@ func (a *Archivalist) CurrentModel() string {
 	a.runMu.RLock()
 	defer a.runMu.RUnlock()
 	return a.config.Model
+}
+
+func (a *Archivalist) currentProviderAutoscaleSnapshot() shared.RequestReplicaProviderSnapshot {
+	a.runMu.RLock()
+	provider := a.provider
+	a.runMu.RUnlock()
+	return shared.RequestReplicaProviderSnapshotFromProvider(provider)
 }
 
 // SupportedModels implements container.ModelSwappable.

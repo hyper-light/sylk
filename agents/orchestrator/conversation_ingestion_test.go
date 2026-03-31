@@ -15,7 +15,7 @@ func TestBuildPreKickoffIngestionReceipt_IncludesQueryAndCounts(t *testing.T) {
 	}
 
 	got := buildPreKickoffIngestionReceipt(handoff)
-	want := "Received plan plan-123 for build a tiny hello world cli. Prepared 2 tasks across 2 layers. Starting execution next."
+	want := "Received plan `plan-123`\n\n- Goal: build a tiny hello world cli\n- Execution: 2 tasks across 2 layers\n\nStarting execution next."
 	if got != want {
 		t.Fatalf("buildPreKickoffIngestionReceipt() = %q, want %q", got, want)
 	}
@@ -29,7 +29,7 @@ func TestBuildPreKickoffIngestionReceipt_FallsBackWithoutQuery(t *testing.T) {
 	}
 
 	got := buildPreKickoffIngestionReceipt(handoff)
-	want := "Received plan plan-456. Prepared 1 tasks across 1 layers. Starting execution next."
+	want := "Received plan `plan-456`\n\n- Execution: 1 task across 1 layer\n\nStarting execution next."
 	if got != want {
 		t.Fatalf("buildPreKickoffIngestionReceipt() = %q, want %q", got, want)
 	}

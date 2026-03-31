@@ -5331,7 +5331,11 @@ func (m *AppModel) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
 	if reroute.FromAgentID != "" {
 		m.statusBar.SetFlash(reroute.FromAgentID + " -> " + reroute.ToAgentID)
 	}
-	return startCmd
+	rerouteCmd := m.propagate(reroute)
+	if startCmd != nil {
+		return tea.Batch(rerouteCmd, startCmd)
+	}
+	return rerouteCmd
 }
 
 func (m *AppModel) resolveInterruptTarget() (string, string) {
@@ -17484,11 +17488,13 @@ func (m *AppModel) agentContextTokenLimit(agentID string) int {
 		return guideMaxContextTokens
 	}
 	modelID := ""
-	if m.agentPanel != nil {
-		modelID = strings.TrimSpace(m.agentPanel.ModelIDOf(normalized))
+	if observed := strings.TrimSpace(m.agentContextModels[normalized]); observed != "" {
+		modelID = observed
 	}
-	if modelID == "" {
-		modelID = strings.TrimSpace(m.agentContextModels[normalized])
+	if m.agentPanel != nil {
+		if modelID == "" {
+			modelID = strings.TrimSpace(m.agentPanel.ModelIDOf(normalized))
+		}
 	}
 	if modelID == "" {
 		return defaultAgentMaxContextTokens

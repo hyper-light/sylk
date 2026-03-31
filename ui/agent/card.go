@@ -89,8 +89,9 @@ func renderCardLine(agent AgentState, width int, th *theme.Theme, selected, enga
 	icon := agentStatusDot(agent, rawIcon, selected, th, anim)
 	indicator := selectIndicator(selected, th)
 
-	nameLen := lipgloss.Width(agent.Name)
-	name := renderAgentName(agent.Name, selected, engaged, agent.Status, anim, th)
+	displayName := agentDisplayName(agent)
+	nameLen := lipgloss.Width(displayName)
+	name := renderAgentName(displayName, selected, engaged, agent.Status, anim, th)
 	contextPct := formatContextPct(agent.ContextUsage)
 	contextStyle := contextPctStyle(agent.ContextUsage, th)
 	contextStr := contextStyle.Render(contextPct)
@@ -104,6 +105,35 @@ func renderCardLine(agent AgentState, width int, th *theme.Theme, selected, enga
 	summary := renderAgentSummary(agent.TaskSummary, summaryWidth, selected, agent.Status, nameLen, anim, th)
 	leftPart := padRightDisplay(leftBase+summary, leftWidth, anim.NerdFonts)
 	return leftPart + " " + contextStr
+}
+
+func agentDisplayName(agent AgentState) string {
+	name := strings.TrimSpace(agent.Name)
+	if name == "" {
+		name = strings.TrimSpace(agent.AgentType)
+	}
+	suffix := knowledgeReplicaSuffix(agent)
+	if suffix == "" {
+		return name
+	}
+	if name == "" {
+		return suffix
+	}
+	return name + " " + suffix
+}
+
+func knowledgeReplicaSuffix(agent AgentState) string {
+	if agent.Category != "knowledge" {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if agent.ActiveReplicas > 1 {
+		parts = append(parts, fmt.Sprintf("x%d", agent.ActiveReplicas))
+	}
+	if agent.QueuedRequests > 0 {
+		parts = append(parts, fmt.Sprintf("q%d", agent.QueuedRequests))
+	}
+	return strings.Join(parts, " ")
 }
 
 // renderSelectedCard renders a two-line card for the selected agent.

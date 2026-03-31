@@ -81,10 +81,13 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 			return "", fmt.Errorf("orchestrator repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted := o.applyToolCalls(ctx, req, resp)
+		errCount, rerouted, delegated, delegatedMessage := o.applyToolCalls(ctx, req, resp)
 		o.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
+		}
+		if delegated {
+			return strings.TrimSpace(delegatedMessage), nil
 		}
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= 2 {
@@ -101,11 +104,13 @@ func (o *Orchestrator) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
-) (int, bool) {
+) (int, bool, bool, string) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
 	rerouted := false
+	delegated := false
+	delegatedMessage := ""
 	for _, call := range resp.ToolCalls {
 		o.publishActivity(events.EventTypeToolResult, call.Name)
 		var execResult toolruntime.ExecutionResult
@@ -123,6 +128,9 @@ func (o *Orchestrator) applyToolCalls(
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
+			} else if errors.Is(err, skills.ErrDelegatedRequested) {
+				delegated = true
+				delegatedMessage = shared.DelegatedToolMessage(result, err)
 			} else {
 				result = shared.ToolErrorPayload(err)
 				isError = true
@@ -141,11 +149,11 @@ func (o *Orchestrator) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
-		if rerouted {
+		if rerouted || delegated {
 			break
 		}
 	}
-	return errCount, rerouted
+	return errCount, rerouted, delegated, delegatedMessage
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.

@@ -99,17 +99,19 @@ func (vp *Viewport) Reset() {
 	vp.frameCopyTargets = nil
 }
 
-// chatLeftPadding is the horizontal breathing room applied at the left edge of
-// the chat viewport. The rendered content should use the remaining width so the
-// panel consumes the full inner width without soft-wrapping the border.
+// chatLeftPadding and chatRightPadding are the horizontal breathing room
+// applied at the chat viewport edges. The rendered content should use the
+// remaining width so the panel consumes the full inner width without
+// soft-wrapping the border.
 const chatLeftPadding = 1
+const chatRightPadding = 1
 
 // SetSize updates the viewport dimensions. When viewWidth changes,
 // all entry render caches are invalidated (rendered at wrong width).
 func (vp *Viewport) SetSize(width, height int) {
 	oldHeight := vp.viewHeight
 	oldWidth := vp.viewWidth
-	newWidth := max(width-chatLeftPadding, 0)
+	newWidth := max(width-chatLeftPadding-chatRightPadding, 0)
 	if newWidth != vp.viewWidth {
 		vp.invalidateAllEntryHeights()
 		vp.codeCache.Clear()
@@ -1304,14 +1306,14 @@ func (vp *Viewport) formatOutput(lines []string, toggleTargets []*toggleTarget, 
 	vp.frameToggleTargets = cloneToggleTargets(toggleTargets)
 	vp.frameCopyTargets = cloneCopyTargets(copyTargets)
 
-	// Apply a 1-space left padding and clamp the rendered content to the
+	// Apply symmetric horizontal padding and clamp the rendered content to the
 	// viewport budget so terminal soft-wrap never corrupts the panel border.
 	for i, line := range lines {
 		line = truncateVisible(line, vp.viewWidth)
 		if pad := max(vp.viewWidth-lipgloss.Width(line), 0); pad > 0 {
 			line += strings.Repeat(" ", pad)
 		}
-		lines[i] = strings.Repeat(" ", chatLeftPadding) + line
+		lines[i] = strings.Repeat(" ", chatLeftPadding) + line + strings.Repeat(" ", chatRightPadding)
 	}
 
 	return strings.Join(lines, "\n")

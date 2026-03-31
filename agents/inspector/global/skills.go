@@ -415,11 +415,12 @@ func requestArchitectResearchSkill(gi *GlobalInspector) *skills.Skill {
 					"consultation_kind": "architect_research",
 				})
 				msg, err := gi.requestRouteSync(branchCtx, "architect", string(payloadJSON), metadata)
-				branch.CompleteFromMessage(branchCtx, msg, err)
 				if err != nil {
+					branch.CompleteFromMessage(branchCtx, msg, err)
 					return nil, err
 				}
 				response, err = extractConsultationResponse(msg)
+				branch.CompleteFromMessage(branchCtx, msg, err)
 				if err != nil {
 					return nil, err
 				}

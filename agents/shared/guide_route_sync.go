@@ -37,83 +37,89 @@ func RequestGuideRouteSync(ctx context.Context, cfg GuideRouteSyncRequest) (*gui
 
 	branchCtx, branch := BeginAutoInterAgentRouteBranch(waitCtx, req.TargetAgentID, req.Input, req.Metadata)
 	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
-	if req.CorrelationID == "" {
-		req.CorrelationID = "route_" + uuid.NewString()[:12]
-	}
 	if req.ParentCorrelationID == "" {
 		if stream, ok := StreamMetadataFromContext(branchCtx); ok {
 			req.ParentCorrelationID = stream.CorrelationID
 		}
 	}
 	req.Metadata = RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
-	if req.Timestamp.IsZero() {
-		req.Timestamp = time.Now()
-	}
+	response, err := RetryBusyRouteRequest(branchCtx, req.TargetAgentID, DefaultBusyRetryPolicy(req.TargetAgentID), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+		attemptReq := req
+		attemptReq.CorrelationID = "route_" + uuid.NewString()[:12]
+		attemptReq.Timestamp = time.Now()
 
-	wait := NewPendingSyncWait()
-	sub, err := cfg.Bus.Subscribe(cfg.ResponseTopic, func(msg *guide.Message) error {
-		if msg == nil {
-			return nil
-		}
-		switch msg.Type {
-		case guide.MessageTypeResponse, guide.MessageTypeError:
-			if msg.CorrelationID != req.CorrelationID {
+		wait := NewPendingSyncWait()
+		sub, err := cfg.Bus.Subscribe(cfg.ResponseTopic, func(msg *guide.Message) error {
+			if msg == nil {
 				return nil
 			}
-			if cfg.OnMessage != nil {
-				cfg.OnMessage(msg)
-			}
-			select {
-			case wait.Response <- msg:
-			default:
-			}
-		case guide.MessageTypeStream:
-			relevant := false
-			for _, correlationID := range PendingSyncActivityCorrelations(msg) {
-				if correlationID == req.CorrelationID {
-					relevant = true
-					break
+			switch msg.Type {
+			case guide.MessageTypeResponse, guide.MessageTypeError:
+				if msg.CorrelationID != attemptReq.CorrelationID {
+					return nil
 				}
-			}
-			if !relevant {
+				if cfg.OnMessage != nil {
+					cfg.OnMessage(msg)
+				}
+				select {
+				case wait.Response <- msg:
+				default:
+				}
+			case guide.MessageTypeStream:
+				relevant := false
+				for _, correlationID := range PendingSyncActivityCorrelations(msg) {
+					if correlationID == attemptReq.CorrelationID {
+						relevant = true
+						break
+					}
+				}
+				if !relevant {
+					return nil
+				}
+				if cfg.OnMessage != nil {
+					cfg.OnMessage(msg)
+				}
+				select {
+				case wait.Activity <- struct{}{}:
+				default:
+				}
+			default:
 				return nil
 			}
-			if cfg.OnMessage != nil {
-				cfg.OnMessage(msg)
-			}
-			select {
-			case wait.Activity <- struct{}{}:
-			default:
-			}
-		default:
 			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("subscribe %s: %w", cfg.ResponseTopic, err)
 		}
-		return nil
+		defer sub.Unsubscribe()
+
+		msg := guide.NewRequestMessage("route_req_"+uuid.NewString()[:8], &attemptReq)
+		if err := cfg.Bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+			return nil, fmt.Errorf("publish guide route request: %w", err)
+		}
+
+		response, err := WaitForPendingSyncResponse(
+			attemptCtx,
+			fmt.Sprintf("guide route to %q", attemptReq.TargetAgentID),
+			inactivityTimeoutOrDefault(cfg.InactivityTimeout, attemptReq.TargetAgentID),
+			wait,
+		)
+		if err != nil {
+			cancelGuideRouteRequest(cfg.Bus, &attemptReq, err)
+			return nil, err
+		}
+		if response == nil {
+			return nil, fmt.Errorf("guide route %s returned empty response", attemptReq.CorrelationID)
+		}
+		if busyErr, ok := BusyRouteResponseMessage(response, attemptReq.TargetAgentID); ok {
+			return nil, busyErr
+		}
+		req.CorrelationID = attemptReq.CorrelationID
+		return response, nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("subscribe %s: %w", cfg.ResponseTopic, err)
-	}
-	defer sub.Unsubscribe()
-
-	msg := guide.NewRequestMessage("route_req_"+uuid.NewString()[:8], &req)
-	if err := cfg.Bus.Publish(guide.TopicGuideRequests, msg); err != nil {
-		branch.Complete(branchCtx, "", "", err)
-		return nil, fmt.Errorf("publish guide route request: %w", err)
-	}
-
-	response, err := WaitForPendingSyncResponse(
-		branchCtx,
-		fmt.Sprintf("guide route to %q", req.TargetAgentID),
-		inactivityTimeoutOrDefault(cfg.InactivityTimeout, req.TargetAgentID),
-		wait,
-	)
-	if err != nil {
-		cancelGuideRouteRequest(cfg.Bus, &req, err)
 		branch.Complete(branchCtx, "", "", err)
 		return nil, err
-	}
-	if response == nil {
-		return nil, fmt.Errorf("guide route %s returned empty response", req.CorrelationID)
 	}
 	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil

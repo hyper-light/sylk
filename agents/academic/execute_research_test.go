@@ -9,7 +9,7 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 )
 
-func TestConsultSkill_ExecuteResearchRejectsDuplicateQuestion(t *testing.T) {
+func TestConsultSkill_ExecuteResearchReturnsStructuredFailureForDuplicateQuestion(t *testing.T) {
 	a, err := New(Config{ID: "academic"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
@@ -25,12 +25,25 @@ func TestConsultSkill_ExecuteResearchRejectsDuplicateQuestion(t *testing.T) {
 		t.Fatal("consult skill not registered")
 	}
 
-	_, err = skill.Handler(ctx, json.RawMessage(`{"target":"librarian","query":"How does Sylk already structure auth?","scope":""}`))
-	if err == nil {
-		t.Fatal("expected duplicate consultation to be rejected")
+	result, err := skill.Handler(ctx, json.RawMessage(`{"target":"librarian","query":"How does Sylk already structure auth?","scope":""}`))
+	if err != nil {
+		t.Fatalf("expected duplicate consultation to return structured failure, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "forbids repeating") {
-		t.Fatalf("duplicate consult error = %v, want research-run duplicate guard", err)
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map[string]any", result)
+	}
+	if got := payload["success"]; got != false {
+		t.Fatalf("success = %#v, want false", got)
+	}
+	if got := payload["status"]; got != "failed" {
+		t.Fatalf("status = %#v, want failed", got)
+	}
+	if got := payload["target"]; got != "librarian" {
+		t.Fatalf("target = %#v, want librarian", got)
+	}
+	if got := payload["error"]; !strings.Contains(stringValue(got), "forbids repeating") {
+		t.Fatalf("error = %#v, want duplicate consultation guidance", got)
 	}
 }
 

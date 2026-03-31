@@ -206,11 +206,16 @@ func (gi *GlobalInspector) consultAgent(ctx context.Context, target, prompt stri
 		},
 	})
 	msg, err := gi.requestRouteSync(branchCtx, target, prompt, branch.ApplyMetadata(branchCtx, metadata))
+	if err != nil {
+		branch.CompleteFromMessage(branchCtx, msg, err)
+		return "", err
+	}
+	content, err := extractConsultationResponse(msg)
 	branch.CompleteFromMessage(branchCtx, msg, err)
 	if err != nil {
 		return "", err
 	}
-	return extractConsultationResponse(msg)
+	return content, nil
 }
 
 func buildLibrarianConsultationPrompt(question, context string, files []string) string {

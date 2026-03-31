@@ -75,6 +75,9 @@ func isTerminalLifecycleState(agent *AgentState) bool {
 	if agent == nil {
 		return false
 	}
+	if knowledgeAgentHasPendingReplicaLoad(agent) {
+		return false
+	}
 	switch agent.Status {
 	case StatusSuccess, StatusError, StatusWaiting:
 		return true

@@ -705,6 +705,80 @@ func TestHandleToolCallEvent_UnknownCorrelationDoesNotAttachToDifferentActiveStr
 	}
 }
 
+func TestStreamReroute_ClearsDeferredChildWaitWithoutConsumingSourceSlot(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+	})
+	m = comp.(*Model)
+
+	startedAt := time.Now().Add(-50 * time.Millisecond)
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target_agents":["tester-pipeline"],"request":"Run the pipeline audit."}`,
+		Phase:         0,
+		StartedAt:     startedAt,
+	})
+	m = comp.(*Model)
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target_agents":["tester-pipeline"],"request":"Run the pipeline audit."}`,
+		Output:        `{"selected":true,"target_agents":["tester-pipeline"],"challenge_id":"pipeline-review-1"}`,
+		Phase:         1,
+		StartedAt:     startedAt,
+		Duration:      50 * time.Millisecond,
+		Success:       true,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamRerouteMsg{
+		SessionID:             "s1",
+		OriginalCorrelationID: "corr-inspector",
+		CorrelationID:         "corr-tester",
+		FromAgentID:           "inspector-pipeline",
+		ToAgentID:             "tester-pipeline",
+	})
+	m = comp.(*Model)
+
+	if _, ok := m.streams["corr-inspector"]; !ok {
+		t.Fatal("expected rerouted source stream slot to remain available for terminal completion")
+	}
+	entry := findEntryByCorrelation(m, "corr-inspector")
+	if entry == nil {
+		t.Fatal("expected inspector entry to remain in history")
+	}
+	if strings.TrimSpace(entry.ThinkingStatus) != "" {
+		t.Fatalf("expected rerouted source thinking status to clear, got %q", entry.ThinkingStatus)
+	}
+	if strings.TrimSpace(entry.ThinkingText) != "" {
+		t.Fatalf("expected rerouted source thinking text to clear, got %q", entry.ThinkingText)
+	}
+	if idx := m.historyIndexForCorrelation("corr-inspector"); idx >= 0 {
+		if _, pending := m.pendingInterAgent[idx]; pending {
+			t.Fatal("expected rerouted source entry to stop counting as pending child work")
+		}
+	}
+	if len(entry.ToolCalls) != 1 || entry.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected rerouted source to retain a single inter-agent row, got %+v", entry.ToolCalls)
+	}
+	if status := entry.ToolCalls[0].InterAgent.Status; status != InterAgentToolDone {
+		t.Fatalf("expected pipeline challenge row to settle on reroute, got %q", status)
+	}
+	if view := m.View(); strings.Contains(view, deferredParentCompletionStatus) {
+		t.Fatalf("unexpected deferred child-wait status after reroute: %q", view)
+	}
+}
+
 func TestHandleToolCallEvent_ConsultationCompletesAsInterAgentRow(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 	m.PushEntry(&ChatEntry{

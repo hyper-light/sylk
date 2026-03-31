@@ -146,12 +146,6 @@ func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteReques
 		}
 	}
 	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
-	req.Timestamp = time.Now()
-
-	// When a TargetAgentID is specified, mark the request as explicit so the
-	// Guide routes directly instead of reclassifying the input. Without this,
-	// plan handoff payloads (which look like planning requests) get routed
-	// back to the architect, creating an infinite dispatch loop (OOM).
 	if req.TargetAgentID != "" {
 		req.ExplicitTarget = true
 	}
@@ -162,54 +156,65 @@ func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteReques
 		req.Hops = routeHopsFromContext(branchCtx)
 	}
 
-	a.logInfo("requestRouteSync: BLOCKING WAIT START",
-		"target", req.TargetAgentID,
-		"correlation_id", req.CorrelationID,
-		"timeout", architectConsultationTimeout(req.TargetAgentID).String(),
-		"parent_ctx_deadline", contextDeadlineString(ctx),
-		"input_len", len(req.Input))
+	response, err := shared.RetryBusyRouteRequest(branchCtx, req.TargetAgentID, shared.DefaultBusyRetryPolicy(req.TargetAgentID), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+		req.CorrelationID = ensureCorrelationID("")
+		req.Timestamp = time.Now()
 
-	wait := a.registerPendingBusWait(req.CorrelationID)
-	defer a.clearPendingBusWait(req.CorrelationID)
-
-	publishStart := time.Now()
-	if err := a.publishRouteRequest(req); err != nil {
-		branch.Complete(branchCtx, "", "", err)
-		a.logWarn("requestRouteSync: publish failed",
+		a.logInfo("requestRouteSync: BLOCKING WAIT START",
 			"target", req.TargetAgentID,
 			"correlation_id", req.CorrelationID,
-			"err", err)
-		return nil, err
-	}
-	a.logInfo("requestRouteSync: published, now waiting",
-		"target", req.TargetAgentID,
-		"correlation_id", req.CorrelationID,
-		"publish_elapsed", time.Since(publishStart).String())
+			"timeout", architectConsultationTimeout(req.TargetAgentID).String(),
+			"parent_ctx_deadline", contextDeadlineString(ctx),
+			"input_len", len(req.Input))
 
-	blockStart := time.Now()
-	response, err := shared.WaitForPendingSyncResponse(
-		branchCtx,
-		fmt.Sprintf("route request to %q", req.TargetAgentID),
-		architectConsultationTimeout(req.TargetAgentID),
-		wait,
-	)
-	if err != nil {
-		branch.Complete(branchCtx, "", "", err)
+		wait := a.registerPendingBusWait(req.CorrelationID)
+		defer a.clearPendingBusWait(req.CorrelationID)
+
+		publishStart := time.Now()
+		if err := a.publishRouteRequest(req); err != nil {
+			a.logWarn("requestRouteSync: publish failed",
+				"target", req.TargetAgentID,
+				"correlation_id", req.CorrelationID,
+				"err", err)
+			return nil, err
+		}
+		a.logInfo("requestRouteSync: published, now waiting",
+			"target", req.TargetAgentID,
+			"correlation_id", req.CorrelationID,
+			"publish_elapsed", time.Since(publishStart).String())
+
+		blockStart := time.Now()
+		response, err := shared.WaitForPendingSyncResponse(
+			attemptCtx,
+			fmt.Sprintf("route request to %q", req.TargetAgentID),
+			architectConsultationTimeout(req.TargetAgentID),
+			wait,
+		)
+		if err != nil {
+			elapsed := time.Since(blockStart)
+			a.logWarn("requestRouteSync: TIMED OUT",
+				"target", req.TargetAgentID,
+				"correlation_id", req.CorrelationID,
+				"blocked_for", elapsed.String(),
+				"timeout", architectConsultationTimeout(req.TargetAgentID).String(),
+				"ctx_err", err)
+			return nil, err
+		}
+		if busyErr, ok := shared.BusyRouteResponseMessage(response, req.TargetAgentID); ok {
+			return nil, busyErr
+		}
 		elapsed := time.Since(blockStart)
-		a.logWarn("requestRouteSync: TIMED OUT",
+		a.logInfo("requestRouteSync: RESPONSE RECEIVED",
 			"target", req.TargetAgentID,
 			"correlation_id", req.CorrelationID,
 			"blocked_for", elapsed.String(),
-			"timeout", architectConsultationTimeout(req.TargetAgentID).String(),
-			"ctx_err", err)
+			"response_type", string(response.Type))
+		return response, nil
+	})
+	if err != nil {
+		branch.Complete(branchCtx, "", "", err)
 		return nil, err
 	}
-	elapsed := time.Since(blockStart)
-	a.logInfo("requestRouteSync: RESPONSE RECEIVED",
-		"target", req.TargetAgentID,
-		"correlation_id", req.CorrelationID,
-		"blocked_for", elapsed.String(),
-		"response_type", string(response.Type))
 	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }
@@ -300,6 +305,9 @@ func (a *Architect) requestConsultationWithMetadata(
 		&agentlog.ConsultPayload{Target: target, Success: err == nil, DurNs: elapsed.Nanoseconds()})
 
 	if err != nil {
+		if shared.IsAgentBusyError(err) {
+			return failedConsultation(target, query, scope, req.CorrelationID, err), shared.ConsultationBusyDelegatedError(target, err)
+		}
 		a.logWarn("requestConsultation: FAILED",
 			"target", target,
 			"elapsed", elapsed.String(),

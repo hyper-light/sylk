@@ -168,6 +168,23 @@ func (p *GatewayProvider) Inner() providers.ProviderAdapter {
 	return p.inner
 }
 
+// GatewayMetrics returns live gateway metrics for autoscaling and admission
+// decisions that need provider-side headroom.
+func (p *GatewayProvider) GatewayMetrics() MetricsSnapshot {
+	if p == nil || p.gateway == nil {
+		return MetricsSnapshot{}
+	}
+	return p.gateway.Metrics()
+}
+
+// GatewayCapacity returns the wrapped gateway's current static capacity limits.
+func (p *GatewayProvider) GatewayCapacity() CapacitySnapshot {
+	if p == nil || p.gateway == nil {
+		return CapacitySnapshot{}
+	}
+	return p.gateway.CapacitySnapshot()
+}
+
 // injectRetryObserver chains the gateway's 429-learning observer with any
 // existing observer on the context.
 func (p *GatewayProvider) injectRetryObserver(ctx context.Context) context.Context {

@@ -103,29 +103,36 @@ func (e *Engineer) requestConsultSync(ctx context.Context, req *guide.RouteReque
 
 	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, req.TargetAgentID, req.Input, req.Metadata)
 	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
-	if req.CorrelationID == "" {
-		req.CorrelationID = "corr_" + uuid.NewString()
-	}
 	if req.ParentCorrelationID == "" {
 		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
 			req.ParentCorrelationID = stream.CorrelationID
 		}
 	}
 	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
-	wait := e.registerPendingConsult(req.CorrelationID)
-	defer e.clearPendingConsult(req.CorrelationID)
+	req.ExplicitTarget = strings.TrimSpace(req.TargetAgentID) != ""
+	response, err := shared.RetryBusyRouteRequest(branchCtx, req.TargetAgentID, shared.DefaultBusyRetryPolicy(req.TargetAgentID), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+		req.CorrelationID = "corr_" + uuid.NewString()
+		wait := e.registerPendingConsult(req.CorrelationID)
+		defer e.clearPendingConsult(req.CorrelationID)
 
-	if err := e.publishConsultRequest(req); err != nil {
-		branch.Complete(branchCtx, "", "", err)
-		return nil, err
-	}
+		if err := e.publishConsultRequest(req); err != nil {
+			return nil, err
+		}
 
-	response, err := shared.WaitForPendingSyncResponse(
-		branchCtx,
-		fmt.Sprintf("consultation to %q", req.TargetAgentID),
-		engineerConsultationTimeout(req.TargetAgentID),
-		wait,
-	)
+		response, err := shared.WaitForPendingSyncResponse(
+			attemptCtx,
+			fmt.Sprintf("consultation to %q", req.TargetAgentID),
+			engineerConsultationTimeout(req.TargetAgentID),
+			wait,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if busyErr, ok := shared.BusyRouteResponseMessage(response, req.TargetAgentID); ok {
+			return nil, busyErr
+		}
+		return response, nil
+	})
 	if err != nil {
 		branch.Complete(branchCtx, "", "", err)
 		return nil, err
@@ -171,6 +178,9 @@ func (e *Engineer) requestConsultationWithMetadata(
 	response, err := e.requestConsultSync(branchCtx, req)
 	branch.CompleteFromMessage(branchCtx, response, err)
 	if err != nil {
+		if shared.IsAgentBusyError(err) {
+			return failedConsultEvidence(target, query, scope, req.CorrelationID, err), shared.ConsultationBusyDelegatedError(target, err)
+		}
 		return failedConsultEvidence(target, query, scope, req.CorrelationID, err), err
 	}
 	return buildConsultEvidence(target, query, scope, req.CorrelationID, response), nil

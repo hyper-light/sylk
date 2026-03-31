@@ -214,6 +214,19 @@ func (a *UsageAccumulator) Total() *guide.StreamUsage {
 	}
 }
 
+func TotalUsageTokens(usage *guide.StreamUsage) int64 {
+	if usage == nil {
+		return 0
+	}
+	return int64(
+		usage.InputTokens +
+			usage.OutputTokens +
+			usage.ReasoningTokens +
+			usage.CacheReadTokens +
+			usage.CacheWriteTokens,
+	)
+}
+
 // PublishStreamEvent publishes a stream event to the bus.
 func PublishStreamEvent(
 	bus guide.EventBus,

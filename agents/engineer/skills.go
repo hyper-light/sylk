@@ -203,6 +203,9 @@ func consultSkill(e *Engineer) *skills.Skill {
 				shared.ConsultationMetadataWithResearchDepth(nil, params.Depth),
 			)
 			if err != nil {
+				if errors.Is(err, skills.ErrDelegatedRequested) {
+					return nil, err
+				}
 				return nil, err
 			}
 			return map[string]any{

@@ -490,6 +490,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		&phase1.guardianRef,
 		&phase1.orchRef,
 		&phase1.quarantineRef,
+		phase1.quota,
 		phase1.budget,
 	)
 
@@ -1359,6 +1360,7 @@ func registerAgentCreators(
 	guardianRef *atomic.Pointer[guardian.Guardian],
 	orchRef *atomic.Pointer[orchestrator.Orchestrator],
 	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
+	quota *container.ResourceQuota,
 	budget *concurrency.GoroutineBudget,
 ) {
 	// Guide — Gemini with rule-based fallback.
@@ -1419,7 +1421,7 @@ func registerAgentCreators(
 	})
 
 	// On-demand agents — created lazily by the ActivationController.
-	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, authRegistry, actCtrlRef, knowledgeStore, knowledgeBackend, guardianRef, orchRef, quarantineRef)
+	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, authRegistry, actCtrlRef, knowledgeStore, knowledgeBackend, guardianRef, orchRef, quarantineRef, quota)
 }
 
 // registerOnDemandAgentCreators registers factories for knowledge and pipeline agents.
@@ -1440,6 +1442,7 @@ type onDemandAgentCreatorDeps struct {
 	guardianRef      *atomic.Pointer[guardian.Guardian]
 	orchRef          *atomic.Pointer[orchestrator.Orchestrator]
 	quarantineRef    *atomic.Pointer[fetch.QuarantineBuffer]
+	quota            *container.ResourceQuota
 }
 
 func (d onDemandAgentCreatorDeps) configuredModel(agentType, fallback string) string {
@@ -1504,6 +1507,7 @@ func registerOnDemandAgentCreators(
 	guardianRef *atomic.Pointer[guardian.Guardian],
 	orchRef *atomic.Pointer[orchestrator.Orchestrator],
 	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
+	quota *container.ResourceQuota,
 ) {
 	deps := onDemandAgentCreatorDeps{
 		reg:              reg,
@@ -1521,6 +1525,7 @@ func registerOnDemandAgentCreators(
 		guardianRef:      guardianRef,
 		orchRef:          orchRef,
 		quarantineRef:    quarantineRef,
+		quota:            quota,
 	}
 	registerOnDemandKnowledgeAgentCreators(deps)
 	registerOnDemandQualityAgentCreators(deps)
@@ -1551,6 +1556,7 @@ func registerLibrarianAgentCreator(deps onDemandAgentCreatorDeps) {
 			WorkingDirectory: deps.projectRoot,
 			SearchSystem:     librarian.NewCommittedKnowledgeSearchSystem(deps.knowledgeBackend),
 			KnowledgeBackend: deps.knowledgeBackend,
+			ContextQuota:     deps.quota,
 		}
 		if guard := deps.requestGuard("librarian"); guard != nil {
 			libCfg.RequestGuard = guard
@@ -1604,6 +1610,7 @@ func buildOnDemandArchivalistConfig(deps onDemandAgentCreatorDeps, agentID, mode
 		EnableKnowledgeGraph: true,
 		EnableHybridQuery:    true,
 		EnableACTR:           true,
+		ContextQuota:         deps.quota,
 	}
 	if guard := deps.requestGuard("archivalist"); guard != nil {
 		archCfg.RequestGuard = guard
@@ -1620,9 +1627,10 @@ func registerAcademicAgentCreator(deps onDemandAgentCreatorDeps) {
 			return nil, fmt.Errorf("academic provider: %w", err)
 		}
 		acaCfg := academic.Config{
-			ID:          academicID,
-			Model:       model,
-			ActivityPub: deps.actPub,
+			ID:           academicID,
+			Model:        model,
+			ActivityPub:  deps.actPub,
+			ContextQuota: deps.quota,
 		}
 		if guard := deps.requestGuard("academic"); guard != nil {
 			acaCfg.RequestGuard = guard

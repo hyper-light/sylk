@@ -92,11 +92,6 @@ func (gi *GlobalInspector) requestRouteSync(
 	}
 	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(routeCtx, target, encoded, metadata)
 	metadata = branch.ApplyMetadata(branchCtx, metadata)
-
-	correlationID := fmt.Sprintf("gi_corr_%s", uuid.New().String()[:8])
-	wait := gi.registerPendingWait(correlationID)
-	defer gi.clearPendingWait(correlationID)
-
 	sessionID := strings.TrimSpace(versioning.SessionIDFromContext(routeCtx))
 	if sessionID == "" {
 		sessionID = strings.TrimSpace(gi.config.SessionID)
@@ -107,9 +102,7 @@ func (gi *GlobalInspector) requestRouteSync(
 		SourceAgentName: "inspector",
 		TargetAgentID:   target,
 		ExplicitTarget:  true,
-		CorrelationID:   correlationID,
 		SessionID:       sessionID,
-		Timestamp:       time.Now().UTC(),
 		Metadata:        metadata,
 	}
 	if req.ParentCorrelationID == "" {
@@ -118,15 +111,28 @@ func (gi *GlobalInspector) requestRouteSync(
 		}
 	}
 	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
-	msg := guide.NewRequestMessage(gi.generateMessageID(), req)
-	msg.CorrelationID = correlationID
+	response, err := shared.RetryBusyRouteRequest(branchCtx, target, shared.DefaultBusyRetryPolicy(target), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+		req.CorrelationID = fmt.Sprintf("gi_corr_%s", uuid.New().String()[:8])
+		req.Timestamp = time.Now().UTC()
+		wait := gi.registerPendingWait(req.CorrelationID)
+		defer gi.clearPendingWait(req.CorrelationID)
 
-	if err := gi.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
-		branch.Complete(branchCtx, "", "", err)
-		return nil, fmt.Errorf("publish consultation request: %w", err)
-	}
+		msg := guide.NewRequestMessage(gi.generateMessageID(), req)
+		msg.CorrelationID = req.CorrelationID
 
-	response, err := waitForPendingResponse(branchCtx, consultationWaitSubject(target), consultationInactivityTimeout(target), wait)
+		if err := gi.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+			return nil, fmt.Errorf("publish consultation request: %w", err)
+		}
+
+		response, err := waitForPendingResponse(attemptCtx, consultationWaitSubject(target), consultationInactivityTimeout(target), wait)
+		if err != nil {
+			return nil, err
+		}
+		if busyErr, ok := shared.BusyRouteResponseMessage(response, target); ok {
+			return nil, busyErr
+		}
+		return response, nil
+	})
 	if err != nil {
 		branch.Complete(branchCtx, "", "", err)
 		return nil, err

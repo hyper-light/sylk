@@ -3159,7 +3159,7 @@ func TestModel_StreamProgressAllowsEmptyMessageForExplicitUIState(t *testing.T) 
 	}
 }
 
-func TestModel_StreamProgressPromotesKnowledgeAgentFromRuntimeID(t *testing.T) {
+func TestModel_StreamProgressKeepsSingletonKnowledgeAgentRow(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SeedAgent("academic", "academic", "Academic", nil, "", "")
 
@@ -3171,18 +3171,24 @@ func TestModel_StreamProgressPromotesKnowledgeAgentFromRuntimeID(t *testing.T) {
 		Visibility: events.VisibilityUser,
 	})
 
-	agent := model.agents["academic-runtime-1"]
+	agent := model.agents["academic"]
 	if agent == nil {
-		t.Fatal("expected promoted academic agent row")
+		t.Fatal("expected canonical academic agent row")
 	}
-	if _, ok := model.agents["academic"]; ok {
-		t.Fatal("expected placeholder academic row to be promoted away")
+	if _, ok := model.agents["academic-runtime-1"]; ok {
+		t.Fatal("did not expect a separate academic runtime row")
 	}
 	if agent.Status != StatusThinking {
 		t.Fatalf("status = %v, want StatusThinking", agent.Status)
 	}
 	if agent.AgentType != "academic" {
 		t.Fatalf("agent type = %q, want academic", agent.AgentType)
+	}
+	if agent.RoutingID != "academic-runtime-1" {
+		t.Fatalf("routing id = %q, want academic-runtime-1", agent.RoutingID)
+	}
+	if got := model.resolveAgentID("academic-runtime-1"); got != "academic" {
+		t.Fatalf("resolved runtime id = %q, want academic", got)
 	}
 	if agent.ActivityState != events.AgentUIStateSearching {
 		t.Fatalf("activity state = %q, want %q", agent.ActivityState, events.AgentUIStateSearching)
@@ -3192,7 +3198,7 @@ func TestModel_StreamProgressPromotesKnowledgeAgentFromRuntimeID(t *testing.T) {
 	}
 }
 
-func TestModel_ToolCallEventPromotesKnowledgeAgentFromRuntimeID(t *testing.T) {
+func TestModel_ToolCallEventKeepsSingletonKnowledgeAgentRow(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SeedAgent("librarian", "librarian", "Librarian", nil, "", "")
 
@@ -3205,12 +3211,12 @@ func TestModel_ToolCallEventPromotesKnowledgeAgentFromRuntimeID(t *testing.T) {
 		ArgsSummary: "path=./pyproject.toml",
 	})
 
-	agent := model.agents["librarian-runtime-1"]
+	agent := model.agents["librarian"]
 	if agent == nil {
-		t.Fatal("expected promoted librarian agent row")
+		t.Fatal("expected canonical librarian agent row")
 	}
-	if _, ok := model.agents["librarian"]; ok {
-		t.Fatal("expected placeholder librarian row to be promoted away")
+	if _, ok := model.agents["librarian-runtime-1"]; ok {
+		t.Fatal("did not expect a separate librarian runtime row")
 	}
 	if agent.Status != StatusActing {
 		t.Fatalf("status = %v, want StatusActing", agent.Status)
@@ -3218,8 +3224,195 @@ func TestModel_ToolCallEventPromotesKnowledgeAgentFromRuntimeID(t *testing.T) {
 	if agent.AgentType != "librarian" {
 		t.Fatalf("agent type = %q, want librarian", agent.AgentType)
 	}
+	if agent.RoutingID != "librarian-runtime-1" {
+		t.Fatalf("routing id = %q, want librarian-runtime-1", agent.RoutingID)
+	}
+	if got := model.resolveAgentID("librarian-runtime-1"); got != "librarian" {
+		t.Fatalf("resolved runtime id = %q, want librarian", got)
+	}
 	if agent.TaskSummary == "" {
 		t.Fatal("expected tool summary to be populated")
+	}
+}
+
+func TestModel_KnowledgeActivityReplicaLoadStaysOnCanonicalRow(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+	model.SeedAgent("archivalist", "archivalist", "Archivalist", nil, "", "")
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_archivalist_replicas",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "archivalist-replica-2",
+			Content:   "Serving queued archive lookups.",
+			Data: map[string]any{
+				"agent_name":          "Archivalist",
+				"agent_type":          "archivalist",
+				"active_replicas":     3,
+				"max_replicas":        8,
+				"queued_requests":     2,
+				"max_queued_requests": 16,
+			},
+		},
+	})
+
+	agent := model.agents["archivalist"]
+	if agent == nil {
+		t.Fatal("expected canonical archivalist row")
+	}
+	if _, ok := model.agents["archivalist-replica-2"]; ok {
+		t.Fatal("did not expect a separate archivalist runtime row")
+	}
+	if agent.RoutingID != "archivalist-replica-2" {
+		t.Fatalf("routing id = %q, want archivalist-replica-2", agent.RoutingID)
+	}
+	if got := model.resolveAgentID("archivalist-replica-2"); got != "archivalist" {
+		t.Fatalf("resolved runtime id = %q, want archivalist", got)
+	}
+	if agent.ActiveReplicas != 3 {
+		t.Fatalf("active replicas = %d, want 3", agent.ActiveReplicas)
+	}
+	if agent.MaxReplicas != 8 {
+		t.Fatalf("max replicas = %d, want 8", agent.MaxReplicas)
+	}
+	if agent.QueuedRequests != 2 {
+		t.Fatalf("queued requests = %d, want 2", agent.QueuedRequests)
+	}
+	if agent.MaxQueuedRequests != 16 {
+		t.Fatalf("max queued requests = %d, want 16", agent.MaxQueuedRequests)
+	}
+	if agent.Status != StatusThinking {
+		t.Fatalf("status = %v, want StatusThinking", agent.Status)
+	}
+	if agent.ActivityState != events.AgentUIStateSearching {
+		t.Fatalf("activity state = %q, want %q", agent.ActivityState, events.AgentUIStateSearching)
+	}
+}
+
+func TestModel_StreamCompleteKeepsKnowledgeAgentActiveWhileReplicaLoadPending(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+	model.SeedAgent("librarian", "librarian", "Librarian", nil, "", "")
+
+	const corrID = "corr_librarian_replica_load"
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:            "evt_librarian_replica_load",
+			EventType:     events.EventTypeAgentAction,
+			Timestamp:     time.Now(),
+			AgentID:       "librarian-runtime-2",
+			CorrelationID: corrID,
+			Content:       "Handling concurrent consults.",
+			Data: map[string]any{
+				"agent_name":      "Librarian",
+				"agent_type":      "librarian",
+				"active_replicas": 2,
+				"queued_requests": 1,
+			},
+		},
+	})
+
+	_, _ = model.Update(msg.StreamStartMsg{
+		AgentID:       "librarian-runtime-2",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+		CorrelationID: corrID,
+	})
+	_, _ = model.Update(msg.StreamCompleteMsg{
+		AgentID:       "librarian-runtime-2",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+		CorrelationID: corrID,
+	})
+
+	agent := model.agents["librarian"]
+	if agent == nil {
+		t.Fatal("expected librarian row")
+	}
+	if agent.Status != StatusActing {
+		t.Fatalf("status after stream complete = %v, want StatusActing", agent.Status)
+	}
+	if agent.ActivityState != events.AgentUIStateResponding {
+		t.Fatalf("activity state after stream complete = %q, want %q", agent.ActivityState, events.AgentUIStateResponding)
+	}
+	if agent.activeCorrelationID != "" {
+		t.Fatalf("active correlation after stream complete = %q, want empty", agent.activeCorrelationID)
+	}
+	if agent.lastTerminalCorrelationID != corrID {
+		t.Fatalf("last terminal correlation = %q, want %q", agent.lastTerminalCorrelationID, corrID)
+	}
+	if agent.ActiveReplicas != 1 {
+		t.Fatalf("active replicas = %d, want 1 after consuming the completed replica", agent.ActiveReplicas)
+	}
+	if agent.QueuedRequests != 1 {
+		t.Fatalf("queued requests = %d, want 1", agent.QueuedRequests)
+	}
+}
+
+func TestModel_StreamCompleteDemotesKnowledgeAgentWhenOnlyCurrentReplicaWasActive(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+	model.SeedAgent("archivalist", "archivalist", "Archivalist", nil, "", "")
+
+	const corrID = "corr_archivalist_single_replica"
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:            "evt_archivalist_single_replica",
+			EventType:     events.EventTypeAgentAction,
+			Timestamp:     time.Now(),
+			AgentID:       "archivalist-runtime-1",
+			CorrelationID: corrID,
+			Content:       "Processing archival consult.",
+			Data: map[string]any{
+				"agent_name":      "Archivalist",
+				"agent_type":      "archivalist",
+				"active_replicas": 1,
+				"queued_requests": 0,
+			},
+		},
+	})
+
+	_, _ = model.Update(msg.StreamStartMsg{
+		AgentID:       "archivalist-runtime-1",
+		AgentType:     "archivalist",
+		AgentName:     "Archivalist",
+		CorrelationID: corrID,
+	})
+	_, _ = model.Update(msg.StreamCompleteMsg{
+		AgentID:       "archivalist-runtime-1",
+		AgentType:     "archivalist",
+		AgentName:     "Archivalist",
+		CorrelationID: corrID,
+	})
+
+	agent := model.agents["archivalist"]
+	if agent == nil {
+		t.Fatal("expected archivalist row")
+	}
+	if agent.Status != StatusIdle {
+		t.Fatalf("status after single-replica stream complete = %v, want StatusIdle", agent.Status)
+	}
+	if agent.ActivityState != events.AgentUIStateNone {
+		t.Fatalf("activity state after single-replica stream complete = %q, want %q", agent.ActivityState, events.AgentUIStateNone)
+	}
+	if agent.activeCorrelationID != "" {
+		t.Fatalf("active correlation after single-replica stream complete = %q, want empty", agent.activeCorrelationID)
+	}
+	if agent.lastTerminalCorrelationID != corrID {
+		t.Fatalf("last terminal correlation = %q, want %q", agent.lastTerminalCorrelationID, corrID)
+	}
+	if agent.ActiveReplicas != 0 {
+		t.Fatalf("active replicas = %d, want 0 after consuming the completed replica", agent.ActiveReplicas)
+	}
+	if agent.QueuedRequests != 0 {
+		t.Fatalf("queued requests = %d, want 0", agent.QueuedRequests)
 	}
 }
 

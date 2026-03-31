@@ -127,13 +127,16 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 			return "", fmt.Errorf("global inspector repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted := gi.applyToolCalls(ctx, req, resp)
+		errCount, rerouted, delegated, delegatedMessage := gi.applyToolCalls(ctx, req, resp)
 		gi.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if agentShared.GlobalReviewTurnTerminated(ctx) {
 			return "", nil
 		}
 		if rerouted {
 			return "", skills.ErrRerouteRequested
+		}
+		if delegated {
+			return strings.TrimSpace(delegatedMessage), nil
 		}
 		requiredActionGraceTurns = agentShared.ExtendRequiredProtocolGrace(ctx, requiredActionGraceTurns)
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
@@ -159,12 +162,14 @@ func (gi *GlobalInspector) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
-) (int, bool) {
+) (int, bool, bool, string) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
 	recoveryHints := make([]string, 0, 1)
 	rerouted := false
+	delegated := false
+	delegatedMessage := ""
 	for _, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
@@ -181,6 +186,9 @@ func (gi *GlobalInspector) applyToolCalls(
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
+			} else if errors.Is(err, skills.ErrDelegatedRequested) {
+				delegated = true
+				delegatedMessage = agentShared.DelegatedToolMessage(result, err)
 			} else {
 				result = shared.ToolErrorPayload(err)
 				isError = true
@@ -212,12 +220,12 @@ func (gi *GlobalInspector) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
-		if rerouted {
+		if rerouted || delegated {
 			break
 		}
 	}
 	agentShared.AppendToolRecoveryMessage(req, recoveryHints)
-	return errCount, rerouted
+	return errCount, rerouted, delegated, delegatedMessage
 }
 
 func (gi *GlobalInspector) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {

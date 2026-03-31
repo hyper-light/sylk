@@ -152,9 +152,12 @@ func (pt *PipelineTester) executeToolLoopWithSurface(
 			return "", fmt.Errorf("pipeline tester repeated tool call: %s", sig.Name)
 		}
 
-		errCount, controlErr := pt.applyToolCalls(ctx, req, resp, surface)
+		errCount, controlErr, delegatedMessage := pt.applyToolCalls(ctx, req, resp, surface)
 		pt.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if controlErr != nil {
+			if errors.Is(controlErr, skills.ErrDelegatedRequested) {
+				return strings.TrimSpace(delegatedMessage), nil
+			}
 			return "", controlErr
 		}
 		if shared.PipelineTurnTerminated(ctx) {
@@ -185,12 +188,13 @@ func (pt *PipelineTester) applyToolCalls(
 	req *providers.Request,
 	resp *providers.Response,
 	surface toolruntime.Surface,
-) (int, error) {
+) (int, error, string) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
 	recoveryHints := make([]string, 0, 1)
 	var controlErr error
+	delegatedMessage := ""
 	for _, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
@@ -208,6 +212,9 @@ func (pt *PipelineTester) applyToolCalls(
 			case errors.Is(err, skills.ErrRerouteRequested):
 				controlErr = skills.ErrRerouteRequested
 				result = `{"rerouted": true}`
+			case errors.Is(err, skills.ErrDelegatedRequested):
+				controlErr = err
+				delegatedMessage = shared.DelegatedToolMessage(result, err)
 			default:
 				result = shared.ToolErrorPayload(err)
 				isError = true
@@ -244,7 +251,7 @@ func (pt *PipelineTester) applyToolCalls(
 		}
 	}
 	shared.AppendToolRecoveryMessage(req, recoveryHints)
-	return errCount, controlErr
+	return errCount, controlErr, delegatedMessage
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.

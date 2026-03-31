@@ -65,6 +65,10 @@ var agentModelTable = map[string][]ModelEntry{
 		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
 		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
 	},
+	"tester-pipeline": {
+		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
+		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
+	},
 	"orchestrator": {
 		{ID: "gemini-3.1-pro-preview", DisplayName: "Gemini 3.1 Pro"},
 		{ID: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6"},

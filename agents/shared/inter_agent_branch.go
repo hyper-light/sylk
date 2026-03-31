@@ -162,6 +162,9 @@ func (h InterAgentBranchHandle) ApplyMetadata(ctx context.Context, metadata map[
 // response message that satisfied the direct inter-agent request.
 func (h InterAgentBranchHandle) CompleteFromMessage(ctx context.Context, msg *guide.Message, err error) {
 	summary, output := interAgentMessageSummaryAndOutput(msg)
+	if err == nil {
+		err = interAgentMessageTerminalError(msg)
+	}
 	h.Complete(ctx, summary, output, err)
 }
 
@@ -288,6 +291,28 @@ func interAgentMessageSummaryAndOutput(msg *guide.Message) (string, string) {
 		return errText, errText
 	}
 	return "", ""
+}
+
+func interAgentMessageTerminalError(msg *guide.Message) error {
+	if msg == nil {
+		return nil
+	}
+	if resp, ok := msg.GetRouteResponse(); ok && resp != nil {
+		if resp.Success {
+			return nil
+		}
+		if errText := normalizeInlineString(resp.Error); errText != "" {
+			return fmt.Errorf("%s", errText)
+		}
+		return fmt.Errorf("inter-agent route failed")
+	}
+	if errText, ok := msg.GetError(); ok {
+		if errText = normalizeInlineString(errText); errText != "" {
+			return fmt.Errorf("%s", errText)
+		}
+		return fmt.Errorf("inter-agent request failed")
+	}
+	return nil
 }
 
 func routeResponseSummary(data any) string {

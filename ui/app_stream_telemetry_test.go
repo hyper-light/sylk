@@ -200,6 +200,25 @@ func TestStreamTelemetry_TokenUsageOverridesStalePanelContextForStandaloneAgent(
 	}
 }
 
+func TestStreamTelemetry_RuntimeModelOverridesStalePanelModelForEngineer(t *testing.T) {
+	m := newStreamTelemetryModel()
+	m.agentPanel.SeedAgent("task_auth_checkout:engineer", "engineer", "Engineer", []agentpkg.ModelEntry{
+		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
+		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
+	}, "claude-opus-4-6", "anthropic")
+
+	model, _ := m.Update(msg.TokenUsageMsg{
+		AgentID:     "task_auth_checkout:engineer",
+		Model:       "gpt-5.4-pro",
+		InputTokens: 210000,
+	})
+	m = model.(*AppModel)
+
+	if got := m.agentPanel.ContextUsageOf("task_auth_checkout:engineer"); got < 0.77 || got > 0.78 {
+		t.Fatalf("panel context usage = %.4f, want about 0.7721 from observed runtime model", got)
+	}
+}
+
 func TestStreamTelemetry_TokenUsageOverridesStalePanelContextForGuide(t *testing.T) {
 	m := newStreamTelemetryModel()
 	m.agentPanel.SeedAgent("guide", "guide", "Guide", nil, "", "")
@@ -1340,6 +1359,122 @@ func TestToolCallTelemetry_DoesNotReRegisterReroutedSourceCorrelation(t *testing
 	}
 	if _, ok := app.activeStreams["corr-tester"]; !ok {
 		t.Fatal("expected rerouted tester stream to remain active")
+	}
+}
+
+func TestPipelineHandoffDoesNotLeaveInspectorWaitingForChildWork(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	startedAt := time.Now().Add(-50 * time.Millisecond)
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target_agents":["tester-pipeline"],"request":"Run the pipeline audit."}`,
+		Phase:         0,
+		StartedAt:     startedAt,
+	})
+	app = model.(*AppModel)
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target_agents":["tester-pipeline"],"request":"Run the pipeline audit."}`,
+		Output:        `{"selected":true,"target_agents":["tester-pipeline"],"challenge_id":"pipeline-review-1"}`,
+		Phase:         1,
+		StartedAt:     startedAt,
+		Duration:      50 * time.Millisecond,
+		Success:       true,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamRerouteMsg{
+		SessionID:             "s1",
+		OriginalCorrelationID: "corr-inspector",
+		CorrelationID:         "corr-tester",
+		FromAgentID:           "inspector-pipeline",
+		ToAgentID:             "tester-pipeline",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-tester",
+		AgentID:       "runtime-tester",
+		AgentType:     "tester-pipeline",
+		AgentName:     "Tester",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+		ToolCallKey:   "tool-1",
+		ToolName:      "coord_publish_artifact",
+		ArgsSummary:   "type=verification_result",
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	inspectorEntry := findChatEntryByCorrelation(app.chat, "corr-inspector")
+	if inspectorEntry == nil {
+		t.Fatal("expected inspector entry to remain present")
+	}
+	if inspectorEntry.Streaming {
+		t.Fatalf("expected inspector entry to stop streaming after handoff: %+v", inspectorEntry)
+	}
+	if strings.TrimSpace(inspectorEntry.ThinkingStatus) != "" {
+		t.Fatalf("expected inspector waiting status to clear after handoff, got %q", inspectorEntry.ThinkingStatus)
+	}
+	if view := app.chat.View(); strings.Contains(view, "Waiting for child work to finish...") {
+		t.Fatalf("unexpected deferred child-work status after tester handoff: %q", view)
+	}
+	if !strings.Contains(app.chat.View(), "coord_publish_artifact") {
+		t.Fatalf("expected tester coordination tool call to remain visible, got %q", app.chat.View())
 	}
 }
 

@@ -40,6 +40,15 @@ type GatewayConfig struct {
 	MaxQueueSize          int
 }
 
+// CapacitySnapshot captures the static concurrency and queueing limits for a
+// provider gateway at a point in time.
+type CapacitySnapshot struct {
+	Name                  string
+	MaxConcurrentRequests int
+	MaxQueueSize          int
+	MaxWaitTime           time.Duration
+}
+
 // GatewayMetrics tracks gateway operation counts using atomic counters.
 type GatewayMetrics struct {
 	Admitted    atomic.Int64

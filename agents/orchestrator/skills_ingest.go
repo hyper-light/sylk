@@ -28,6 +28,7 @@ func ingestPlanSkill(o *Orchestrator) *skills.Skill {
 		Example(`{"plan_json": "{\"plan_id\":\"plan_abc\",\"tasks\":[...],\"execution_layers\":[[\"task_1\"],[\"task_2\",\"task_3\"]]}"}`).
 		BestPractice("After ingestion, use analyze_plan with the returned dag_id to understand the execution structure before monitoring.").
 		BestPractice("If ingestion fails with a validation error, escalate to the architect — the plan may need revision.").
+		BestPractice("When streaming the pre-kickoff receipt, use a short multi-line summary with labeled lines or bullets. Do not collapse the plan id, objective, and execution counts into one dense sentence.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				PlanJSON string `json:"plan_json"`
@@ -347,16 +348,28 @@ func buildPreKickoffIngestionReceipt(h *architect.PlanHandoff) string {
 	taskCount := len(h.Tasks)
 	layerCount := len(h.ExecutionLayers)
 	query := strings.TrimSpace(h.Query)
-	if query == "" {
-		return fmt.Sprintf(
-			"Received plan %s. Prepared %d tasks across %d layers. Starting execution next.",
-			planID, taskCount, layerCount,
-		)
+
+	lines := []string{
+		fmt.Sprintf("Received plan `%s`", planID),
+		"",
 	}
-	return fmt.Sprintf(
-		"Received plan %s for %s. Prepared %d tasks across %d layers. Starting execution next.",
-		planID, query, taskCount, layerCount,
+	if query != "" {
+		lines = append(lines, fmt.Sprintf("- Goal: %s", query))
+	}
+	lines = append(
+		lines,
+		fmt.Sprintf("- Execution: %d task%s across %d layer%s", taskCount, pluralSuffix(taskCount), layerCount, pluralSuffix(layerCount)),
+		"",
+		"Starting execution next.",
 	)
+	return strings.Join(lines, "\n")
+}
+
+func pluralSuffix(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func receiptIDOf(receipt *PlanHandoffReceiptRecord) string {
@@ -420,20 +433,20 @@ func (o *Orchestrator) createWorkflowAndTasks(h *architect.PlanHandoff, wfID str
 			MaxAttempts: 2,
 			SessionID:   h.SessionID,
 			Metadata: map[string]any{
-				"agent_type":           ht.AgentType,
-				"task_slug":            ht.Slug,
-				"complexity":           ht.Complexity,
-				"estimated_tokens":     ht.EstimatedTokens,
-				"plan_id":              h.PlanID,
-				"plan_file_path":       planFilePath,
-				"success_criteria":     ht.SuccessCriteria,
-				"acceptance_criteria":  ht.AcceptanceCriteria,
-				"guidelines":           ht.Guidelines,
-				"implementation_guide": ht.ImplementationGuide,
+				"agent_type":             ht.AgentType,
+				"task_slug":              ht.Slug,
+				"complexity":             ht.Complexity,
+				"estimated_tokens":       ht.EstimatedTokens,
+				"plan_id":                h.PlanID,
+				"plan_file_path":         planFilePath,
+				"success_criteria":       ht.SuccessCriteria,
+				"acceptance_criteria":    ht.AcceptanceCriteria,
+				"guidelines":             ht.Guidelines,
+				"implementation_guide":   ht.ImplementationGuide,
 				"task_criteria_snapshot": buildGlobalInspectorTaskCriteriaSnapshot(ht),
-				"affected_files":       ht.AffectedFiles,
-				"test_requirements":    ht.TestRequirements,
-				"risk_factors":         ht.RiskFactors,
+				"affected_files":         ht.AffectedFiles,
+				"test_requirements":      ht.TestRequirements,
+				"risk_factors":           ht.RiskFactors,
 			},
 		}
 		if preflight != nil {
@@ -455,14 +468,14 @@ func (o *Orchestrator) createWorkflowAndTasks(h *architect.PlanHandoff, wfID str
 		LeadAgentID: "architect",
 		SessionID:   h.SessionID,
 		Metadata: map[string]any{
-			"plan_id":          h.PlanID,
-			"plan_file_path":   planFilePath,
+			"plan_id":               h.PlanID,
+			"plan_file_path":        planFilePath,
 			workflowPlanSnapshotKey: planSnapshot,
-			"revision":         h.Revision,
-			"trigger":          h.Trigger,
-			"total_tokens":     h.TotalTokens,
-			"critical_path":    h.CriticalPath,
-			"execution_layers": h.ExecutionLayers,
+			"revision":              h.Revision,
+			"trigger":               h.Trigger,
+			"total_tokens":          h.TotalTokens,
+			"critical_path":         h.CriticalPath,
+			"execution_layers":      h.ExecutionLayers,
 		},
 	}
 	if preflight != nil {

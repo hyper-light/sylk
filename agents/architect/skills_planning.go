@@ -3,6 +3,7 @@ package architect
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -67,6 +68,9 @@ func consultSkill(a *Architect) *skills.Skill {
 				shared.ConsultationMetadataWithResearchDepth(nil, p.Depth),
 			)
 			if err != nil {
+				if errors.Is(err, skills.ErrDelegatedRequested) {
+					return nil, err
+				}
 				return nil, err
 			}
 			return map[string]any{
@@ -155,6 +159,9 @@ func consultSkill(a *Architect) *skills.Skill {
 				shared.ConsultationMetadataWithResearchDepth(nil, p.Depth),
 			)
 			if err != nil {
+				if errors.Is(err, skills.ErrDelegatedRequested) {
+					return nil, err
+				}
 				return map[string]any{
 					"target": p.Target,
 					"status": "failed",

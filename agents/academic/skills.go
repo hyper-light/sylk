@@ -3,6 +3,7 @@ package academic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -104,6 +105,9 @@ func cloneViaLibrarianSkill(a *Academic) *skills.Skill {
 			cloneQuery := fmt.Sprintf("Clone repository %s for analysis: %s", params.URL, params.Reason)
 			evidence, err := a.requestConsultation(ctx, "librarian", cloneQuery, "", "")
 			if err != nil {
+				if errors.Is(err, skills.ErrDelegatedRequested) {
+					return nil, err
+				}
 				return map[string]any{
 					"success": false,
 					"url":     params.URL,
@@ -125,6 +129,23 @@ func cloneViaLibrarianSkill(a *Academic) *skills.Skill {
 var consultTargets = map[string]string{
 	"librarian":   "Codebase patterns, existing implementations, and dependency information",
 	"archivalist": "Historical context on code decisions and past changes",
+}
+
+func academicConsultFailureResult(target, query, scope string, err error) map[string]any {
+	result := map[string]any{
+		"target":   strings.TrimSpace(target),
+		"query":    strings.TrimSpace(query),
+		"scope":    strings.TrimSpace(scope),
+		"success":  false,
+		"status":   "failed",
+		"guidance": "Continue with direct research or synthesize current evidence instead of repeating the same consultation.",
+	}
+	if err != nil {
+		if message := strings.TrimSpace(err.Error()); message != "" {
+			result["error"] = message
+		}
+	}
+	return result
 }
 
 func consultSkill(a *Academic) *skills.Skill {
@@ -154,18 +175,30 @@ func consultSkill(a *Academic) *skills.Skill {
 			if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
 				if err := execState.recordConsultAttempt(params.Target, params.Query, params.Scope); err != nil {
 					academicLogDuplicateConsultationBlocked(ctx, params.Target, params.Query, params.Scope)
-					return nil, err
+					return academicConsultFailureResult(params.Target, params.Query, params.Scope, err), nil
 				}
 			}
 			evidence, err := a.requestConsultation(ctx, params.Target, params.Query, params.Scope, "")
 			if err != nil {
-				return nil, err
+				if errors.Is(err, skills.ErrDelegatedRequested) {
+					return nil, err
+				}
+				return academicConsultFailureResult(params.Target, params.Query, params.Scope, err), nil
 			}
-			return map[string]any{
+			result := map[string]any{
 				"target":  params.Target,
 				"success": evidence.Success,
 				"data":    evidence.Data,
-			}, nil
+			}
+			if evidence.Success {
+				result["status"] = "ok"
+			} else {
+				result["status"] = "failed"
+			}
+			if message := strings.TrimSpace(evidence.Error); message != "" {
+				result["error"] = message
+			}
+			return result, nil
 		}).
 		Build()
 }
@@ -526,6 +559,9 @@ func (a *Academic) validateApproach(ctx context.Context, approach string, filesA
 		fmt.Sprintf("Validate approach compatibility: %s", approach),
 		"", a.config.SessionID)
 	if err != nil {
+		if errors.Is(err, skills.ErrDelegatedRequested) {
+			return nil, err
+		}
 		result.Valid = false
 		result.Reason = "Could not consult Librarian for validation"
 		result.Error = err.Error()

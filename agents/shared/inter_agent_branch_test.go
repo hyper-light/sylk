@@ -3,6 +3,8 @@ package shared
 import (
 	"context"
 	"testing"
+
+	"github.com/adalundhe/sylk/agents/guide"
 )
 
 func TestBeginAutoInterAgentRouteBranch_DoesNotSynthesizeWithoutExistingBranch(t *testing.T) {
@@ -92,5 +94,41 @@ func TestRouteResponseSummary_GuardianPayloadPrefersHumanMessage(t *testing.T) {
 	})
 	if summary != "Proceed with caution around infra changes." {
 		t.Fatalf("route response summary = %q", summary)
+	}
+}
+
+func TestInterAgentBranchCompleteFromMessage_TreatsTerminalGuideErrorAsFailure(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithStreamContext(context.Background(), "corr-parent", "inspector")
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) {
+		events = append(events, ev)
+	})
+
+	branchCtx, branch := BeginInterAgentBranch(ctx, InterAgentBranchSpec{
+		Kind:       InterAgentToolEventKindConsult,
+		ToolName:   "consult_academic",
+		AgentTypes: []string{"academic"},
+		Summary:    "Assess whether the current approach is sound.",
+	})
+	branch.CompleteFromMessage(branchCtx, guide.NewErrorMessage("err-1", "corr-parent", "academic", "academic consultation failed: provider unavailable"), nil)
+
+	if len(events) != 2 {
+		t.Fatalf("emitted events = %d, want 2", len(events))
+	}
+	complete := events[1]
+	if complete.Success {
+		t.Fatal("expected failed completion event")
+	}
+	if complete.ErrorMsg != "academic consultation failed: provider unavailable" {
+		t.Fatalf("error = %q", complete.ErrorMsg)
+	}
+	if complete.InterAgent == nil {
+		t.Fatal("expected inter-agent metadata on completion")
+	}
+	if complete.InterAgent.Status != InterAgentToolEventStatusFailed {
+		t.Fatalf("status = %q, want %q", complete.InterAgent.Status, InterAgentToolEventStatusFailed)
+	}
+	if complete.InterAgent.Summary != "academic consultation failed: provider unavailable" {
+		t.Fatalf("summary = %q", complete.InterAgent.Summary)
 	}
 }
