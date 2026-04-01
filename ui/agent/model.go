@@ -754,6 +754,9 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 }
 
 func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
+	if start.Visibility == events.VisibilitySystem {
+		return nil
+	}
 	candidateID := canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
 	if isInternalSidecarAgent(candidateID, start.AgentType) || isInternalSidecarAgent(start.AgentID, start.AgentType) {
 		return nil
@@ -790,6 +793,9 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 // when a stream finishes. This is the normal completion counterpart to
 // handleStreamProgress (which sets StatusThinking on progress events).
 func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
+	if done.Visibility == events.VisibilitySystem {
+		return nil
+	}
 	if isInternalSidecarAgent(done.AgentID, done.AgentType) {
 		return nil
 	}

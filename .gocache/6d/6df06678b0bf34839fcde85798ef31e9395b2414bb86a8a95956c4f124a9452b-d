@@ -1,0 +1,6 @@
+./config_parser.go
+./go_parser.go
+./markdown_parser.go
+./parser.go
+./python_parser.go
+./typescript_parser.go

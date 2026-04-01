@@ -210,18 +210,24 @@ func New(cfg Config, provider guardianProvider) (*Guardian, error) {
 func (g *Guardian) initSkills() error {
 	g.skills = skills.NewRegistry()
 	g.hooks = skills.NewHookRegistry()
+	g.registerCoreSkills()
+
+	if err := shared.RegisterMemoryForestSkills(g.skills, "guardian", g.config.Forest, nil); err != nil {
+		return fmt.Errorf("register guardian forest skills: %w", err)
+	}
+
+	manifest := guardianToolManifestForRegistry(g.skills)
 
 	loaderCfg := skills.DefaultLoaderConfig()
-	loaderCfg.CoreSkills = guardianPinnedSkillNames()
+	loaderCfg.CoreSkills = filterSyntheticGuardianRuntimeTools(manifest.DefaultVisibleNames())
 	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	g.skillLoader = skills.NewLoader(g.skills, loaderCfg)
 
-	g.registerCoreSkills()
-	registerGuardianSafetyHook(g.hooks, g.skills, guardianAllSkillNames())
+	registerGuardianSafetyHook(g.hooks, g.skills, manifest.AllowedNames())
 	tools, err := toolruntime.New(toolruntime.Config{
 		Registry: g.skills,
 		Hooks:    g.hooks,
-		Manifest: guardianToolManifest(),
+		Manifest: manifest,
 		State:    toolruntime.NewState(),
 	})
 	if err != nil {

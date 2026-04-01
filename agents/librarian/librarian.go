@@ -158,6 +158,9 @@ type Config struct {
 	// ContextQuota exposes global runtime pressure so autoscaling can stop
 	// scaling up when aggregate context or goroutine headroom is exhausted.
 	ContextQuota *container.ResourceQuota
+
+	// Forest exposes Memory Forest recall/prediction skills.
+	Forest shared.MemoryForestService
 }
 
 // New creates a new Librarian agent with optional LLM provider.
@@ -258,6 +261,9 @@ func (l *Librarian) initSkills() error {
 	// buildToolDefinitions() returns nil — the LLM never sees tool
 	// definitions and outputs tool calls as text instead of structured calls.
 	l.registerCoreSkills()
+	if err := shared.RegisterMemoryForestSkills(l.skills, "librarian", l.config.Forest, nil); err != nil {
+		return fmt.Errorf("register librarian forest skills: %w", err)
+	}
 
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = librarianVisibleSkillNames()
@@ -545,7 +551,11 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 	gov := shared.NewContextGovernor(l.CurrentModel(), l.config.MaxTokens, 0)
 	if l.handoffBridge != nil {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
-			return l.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+			bridge := shared.EffectiveHandoffBridge(bctx, l.handoffBridge)
+			if bridge == nil {
+				return shared.ErrContextBudgetExhausted
+			}
+			return bridge.ForceHandoff(bctx, "context budget exhausted")
 		}
 	}
 	ctx = shared.WithContextGovernor(ctx, gov)
@@ -612,6 +622,21 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 	if l.config.RequestGuard != nil {
 		release := l.config.RequestGuard()
 		defer release()
+	}
+
+	if l.handoffBridge != nil {
+		var replicaErr error
+		var cleanupReplicaBridge func()
+		ctx, cleanupReplicaBridge, _, replicaErr = shared.AttachReplicaHandoffBridge(ctx, l, l.handoffBridge, shared.KnowledgeReplicaHandoffOptions{
+			SessionID:         fwd.SessionID,
+			CorrelationID:     fwd.CorrelationID,
+			ActivityPublisher: l.activityPub,
+		})
+		if replicaErr != nil {
+			lease.Release()
+			return replicaErr
+		}
+		defer cleanupReplicaBridge()
 	}
 
 	bundle, err := l.newForwardedToolBundle()

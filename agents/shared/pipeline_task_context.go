@@ -154,6 +154,7 @@ func BuildPipelineSystemContext(task *PipelineTaskInput) string {
 		writeListSection(&b, "Audit Lock", summarizePipelineAuditLock(protocol["audit_lock"]))
 		writeListSection(&b, "Pending Challenge", summarizePipelineChallenge(protocol["pending_challenge"]))
 		writeListSection(&b, "Pending Validation", summarizePipelineValidation(protocol["pending_validation"]))
+		writeListSection(&b, "Protocol Obligations", summarizePipelineProtocolObligations(task.Context["pipeline_protocol_obligations"]))
 		writeListSection(&b, "Recent Protocol Events", summarizePipelineProtocolEvents(protocol["recent_events"]))
 		b.WriteString("\nProtocol Rules:\n")
 		b.WriteString("- Inspector is the only pipeline entrypoint and the ultimate pipeline exit point; only Inspector may accept work and hand off to OT.\n")
@@ -228,6 +229,7 @@ func ComposePipelineTaskUserPrompt(task *PipelineTaskInput) string {
 		writeListSection(&b, "Audit Lock", summarizePipelineAuditLock(protocol["audit_lock"]))
 		writeListSection(&b, "Pending Challenge", summarizePipelineChallenge(protocol["pending_challenge"]))
 		writeListSection(&b, "Pending Validation", summarizePipelineValidation(protocol["pending_validation"]))
+		writeListSection(&b, "Protocol Obligations", summarizePipelineProtocolObligations(task.Context["pipeline_protocol_obligations"]))
 		writeListSection(&b, "Recent Protocol Events", summarizePipelineProtocolEvents(protocol["recent_events"]))
 	}
 
@@ -328,6 +330,42 @@ func summarizePipelineProtocolMembers(value any) []string {
 	default:
 		return nil
 	}
+}
+
+func summarizePipelineProtocolObligations(value any) []string {
+	var items []map[string]any
+	switch typed := value.(type) {
+	case []map[string]any:
+		items = append(items, typed...)
+	case []any:
+		items = make([]map[string]any, 0, len(typed))
+		for _, entry := range typed {
+			if item, _ := entry.(map[string]any); item != nil {
+				items = append(items, item)
+			}
+		}
+	default:
+		return nil
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		action, _ := item["action"].(string)
+		summary, _ := item["summary"].(string)
+		action = strings.TrimSpace(action)
+		summary = strings.TrimSpace(summary)
+		switch {
+		case action != "" && summary != "":
+			out = append(out, action+": "+summary)
+		case action != "":
+			out = append(out, action)
+		case summary != "":
+			out = append(out, summary)
+		}
+	}
+	return out
 }
 
 func summarizePipelineChallenge(value any) []string {

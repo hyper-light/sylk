@@ -1,0 +1,4 @@
+./batch.go
+./kvstore.go
+./merge.go
+./multiget.go

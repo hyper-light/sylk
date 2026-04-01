@@ -689,12 +689,10 @@ func buildTaskAgentPod(
 			return nil, fmt.Errorf("task pod %s: spec for %s: %w", task.TaskID, agentType, err)
 		}
 		spec.Name = TaskScopedRoutingName(task.TaskSlug, task.TaskID, agentType)
-		workerAgentID := PipelineWorkerAgentID(task.TaskID, agentType)
 		if spec.Labels == nil {
-			spec.Labels = make(map[string]string, 4)
+			spec.Labels = make(map[string]string, 3)
 		}
 		spec.Labels["task_id"] = task.TaskID
-		spec.Labels["pipeline_worker_id"] = workerAgentID
 		if task.TaskSlug != "" {
 			spec.Labels["task_slug"] = task.TaskSlug
 		}

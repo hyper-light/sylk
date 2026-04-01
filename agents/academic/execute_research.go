@@ -1061,7 +1061,11 @@ func (a *Academic) upsertResearchSource(source *Source) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if source.UpdatedAt.IsZero() {
+		source.UpdatedAt = time.Now().UTC()
+	}
 	a.sourceIndex[source.ID] = source
+	a.pruneSourceIndexLocked(time.Now())
 }
 
 func academicShouldUseArchitectResearchProtocol(fwd *guide.ForwardedRequest) bool {

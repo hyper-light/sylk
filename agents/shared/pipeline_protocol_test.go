@@ -353,7 +353,7 @@ func TestPipelineProtocolSkills_HandoffNextPublishesGuideRoute(t *testing.T) {
 	if req.ParentCorrelationID != "corr-inspector" {
 		t.Fatalf("parent_correlation_id = %q, want corr-inspector", req.ParentCorrelationID)
 	}
-	if req.TargetAgentID != PipelineWorkerAgentID("task-async", PipelineAgentTester) {
+	if req.TargetAgentID != PipelineWorkerRoutingTarget("task-async", PipelineAgentTester) {
 		t.Fatalf("target_agent_id = %q", req.TargetAgentID)
 	}
 	if req.Metadata["chat_nested_branch"] == true {
@@ -511,7 +511,7 @@ func TestPipelineProtocolSkills_ChallengeAgentPublishesGuideRoute(t *testing.T) 
 	if req.ParentCorrelationID != "corr-engineer" {
 		t.Fatalf("parent_correlation_id = %q, want corr-engineer", req.ParentCorrelationID)
 	}
-	if req.TargetAgentID != PipelineWorkerAgentID("task-challenge", PipelineAgentTester) {
+	if req.TargetAgentID != PipelineWorkerRoutingTarget("task-challenge", PipelineAgentTester) {
 		t.Fatalf("target_agent_id = %q", req.TargetAgentID)
 	}
 
@@ -751,6 +751,7 @@ func TestBuildPipelineValidationTask_CompactsValidationSummaryForTaskPayload(t *
 }
 
 func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
+	sessionDir := t.TempDir()
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
@@ -814,6 +815,7 @@ func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
 		Prompt:    "Validate the inspector challenge.",
 		SessionID: "session-2",
 		Context: map[string]any{
+			"session_dir":    sessionDir,
 			"pipeline_stage": "test",
 			"pipeline_protocol": PipelineProtocolSnapshotMap(&PipelineProtocolSnapshot{
 				Roster: []PipelineProtocolAgent{
@@ -868,7 +870,7 @@ func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
 	if req.Metadata["chat_nested_branch"] == true {
 		t.Fatalf("validate_work should not stamp nested chat branch metadata: %#v", req.Metadata)
 	}
-	if req.TargetAgentID != PipelineWorkerAgentID("task-validate", PipelineAgentInspector) {
+	if req.TargetAgentID != PipelineWorkerRoutingTarget("task-validate", PipelineAgentInspector) {
 		t.Fatalf("target_agent_id = %q", req.TargetAgentID)
 	}
 
@@ -917,6 +919,7 @@ func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
 }
 
 func TestPipelineProtocolSkills_FinalizePipelineChallengesTester(t *testing.T) {
+	sessionDir := t.TempDir()
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
@@ -977,10 +980,11 @@ func TestPipelineProtocolSkills_FinalizePipelineChallengesTester(t *testing.T) {
 	task := &PipelineTaskInput{
 		TaskID:        "task-finalize-gate",
 		AgentType:     PipelineAgentInspector,
-		TargetAgentID: PipelineWorkerAgentID("task-finalize-gate", PipelineAgentInspector),
+		TargetAgentID: PipelineWorkerRoutingTarget("task-finalize-gate", PipelineAgentInspector),
 		Prompt:        "Finalize the accepted pipeline.",
 		SessionID:     "session-finalize-gate",
 		Context: map[string]any{
+			"session_dir":    sessionDir,
 			"pipeline_stage": "inspect",
 			"pipeline_protocol": PipelineProtocolSnapshotMap(&PipelineProtocolSnapshot{
 				Roster: []PipelineProtocolAgent{
@@ -1025,7 +1029,7 @@ func TestPipelineProtocolSkills_FinalizePipelineChallengesTester(t *testing.T) {
 	}
 
 	req := waitForRouteRequest(t, routeCh)
-	if req.TargetAgentID != PipelineWorkerAgentID("task-finalize-gate", PipelineAgentTester) {
+	if req.TargetAgentID != PipelineWorkerRoutingTarget("task-finalize-gate", PipelineAgentTester) {
 		t.Fatalf("target_agent_id = %q", req.TargetAgentID)
 	}
 	if req.Metadata["chat_nested_branch"] == true {
@@ -1429,6 +1433,7 @@ func TestBuildPipelineHandoffTasks_PreservesAuditLockAcrossWorkerHandoff(t *test
 }
 
 func TestPipelineProtocolSkills_FinalizePipelineSignalsReadinessAndHandoffToOTPublishesTerminalUpdate(t *testing.T) {
+	sessionDir := t.TempDir()
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
@@ -1452,10 +1457,11 @@ func TestPipelineProtocolSkills_FinalizePipelineSignalsReadinessAndHandoffToOTPu
 	task := &PipelineTaskInput{
 		TaskID:        "task-ot",
 		AgentType:     PipelineAgentInspector,
-		TargetAgentID: PipelineWorkerAgentID("task-ot", PipelineAgentInspector),
+		TargetAgentID: PipelineWorkerRoutingTarget("task-ot", PipelineAgentInspector),
 		Prompt:        "Finalize the accepted pipeline.",
 		SessionID:     "session-ot",
 		Context: map[string]any{
+			"session_dir":    sessionDir,
 			"pipeline_stage": "inspect",
 			"pipeline_protocol": PipelineProtocolSnapshotMap(&PipelineProtocolSnapshot{
 				Roster: []PipelineProtocolAgent{

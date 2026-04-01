@@ -44,11 +44,15 @@ var dispatchTable = [...]dispatchEntry{
 	{guide.StreamEventError, convertError},
 }
 
-func convertStart(d *streamDispatcher, _ *guide.StreamEvent) any {
-	return msg.StreamStartMsg{
+func convertStart(d *streamDispatcher, event *guide.StreamEvent) any {
+	m := msg.StreamStartMsg{
 		SessionID:     d.sessionID,
 		CorrelationID: d.correlationID,
 	}
+	if event != nil {
+		m.Visibility = event.Visibility
+	}
+	return m
 }
 
 func convertData(d *streamDispatcher, event *guide.StreamEvent) any {
@@ -89,6 +93,9 @@ func convertComplete(d *streamDispatcher, event *guide.StreamEvent) any {
 		complete.ReasoningTokens = event.Usage.ReasoningTokens
 		complete.CacheReadTokens = event.Usage.CacheReadTokens
 		complete.CacheWriteTokens = event.Usage.CacheWriteTokens
+	}
+	if event != nil {
+		complete.Visibility = event.Visibility
 	}
 	return complete
 }

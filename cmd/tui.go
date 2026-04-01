@@ -40,9 +40,11 @@ import (
 	"github.com/adalundhe/sylk/core/container/activation"
 	"github.com/adalundhe/sylk/core/container/daemon"
 	"github.com/adalundhe/sylk/core/container/network"
+	ctxpkg "github.com/adalundhe/sylk/core/context"
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/fetch"
+	forestsvc "github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/core/knowledge/query"
@@ -55,11 +57,13 @@ import (
 	"github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/core/storage"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
+	"github.com/adalundhe/sylk/core/vectorgraphdb"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/adalundhe/sylk/ui"
 	agentpkg "github.com/adalundhe/sylk/ui/agent"
 	"github.com/adalundhe/sylk/ui/fonts"
 	"github.com/blevesearch/bleve/v2"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/spf13/cobra"
 )
 
@@ -192,6 +196,9 @@ type bootstrapPhase1 struct {
 	planStore        *architect.PlanStore
 	knowledgeStore   *knowledge.KnowledgeStore
 	knowledgeBackend *knowledgeruntime.CommittedKnowledgeBackend
+	forest           *forestsvc.MemoryForest
+	forestContent    *ctxpkg.UniversalContentStore
+	forestVectorDB   *vectorgraphdb.VectorGraphDB
 
 	guideRef      atomic.Pointer[guide.Guide]
 	guardianRef   atomic.Pointer[guardian.Guardian]
@@ -221,6 +228,7 @@ type bootstrapPhase4 struct {
 	seeds         []ui.AgentSeed
 	modelStore    *agentpkg.AgentModelStore
 	modelSwapper  modelSwapperFunc
+	knowledgeSync *librarian.KnowledgeSyncService
 	phase4Done    chan struct{}
 	supervisorRef atomic.Pointer[handoff.HandoffSupervisor]
 	bootLogger    *agentlog.BootEventLogger
@@ -283,6 +291,58 @@ func buildBleveSearcher(projectRoot string) (*query.BleveSearcher, io.Closer, er
 	return searcher, closer, nil
 }
 
+func buildMemoryForest(projectRoot string, budget *concurrency.GoroutineBudget) (*forestsvc.MemoryForest, *ctxpkg.UniversalContentStore, *vectorgraphdb.VectorGraphDB, error) {
+	sd := sylkdir.New(projectRoot)
+	if err := sd.Init(); err != nil {
+		return nil, nil, nil, fmt.Errorf("init sylk dir for memory forest: %w", err)
+	}
+
+	basePath := filepath.Join(sd.SessionPath("default"), "state", "memory_forest")
+	if err := os.MkdirAll(basePath, 0o755); err != nil {
+		return nil, nil, nil, fmt.Errorf("create memory forest state dir: %w", err)
+	}
+
+	// The forest projection and content store both depend on the vectorgraph
+	// nodes table, so they share a single session-scoped graph DB.
+	contentVectorDB, err := vectorgraphdb.Open(filepath.Join(basePath, "content.sqlite"))
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("open memory forest content vector db: %w", err)
+	}
+
+	forestLogger := slog.Default().With("component", "memory_forest")
+	forest, err := forestsvc.New(forestsvc.Config{
+		DB:        contentVectorDB.DB(),
+		Logger:    forestLogger,
+		MaxTraces: 2048,
+	})
+	if err != nil {
+		_ = contentVectorDB.Close()
+		return nil, nil, nil, fmt.Errorf("create memory forest: %w", err)
+	}
+
+	contentStore, err := ctxpkg.NewUniversalContentStore(ctxpkg.ContentStoreConfig{
+		BlevePath:       filepath.Join(basePath, "documents.bleve"),
+		VectorDB:        contentVectorDB,
+		GoroutineBudget: budget,
+		Logger:          forestLogger,
+		Observer:        forest,
+	})
+	if err != nil {
+		_ = forest.Close()
+		_ = contentVectorDB.Close()
+		return nil, nil, nil, fmt.Errorf("create memory forest content store: %w", err)
+	}
+
+	searcher := ctxpkg.NewTieredSearcher(ctxpkg.TieredSearcherConfig{
+		HotCache: ctxpkg.NewDefaultHotCache(),
+		Bleve:    contentStore.BleveIndex(),
+	})
+	forest.SetContentStore(contentStore)
+	forest.SetSearcher(searcher)
+
+	return forest, contentStore, contentVectorDB, nil
+}
+
 // hydrateOnceCell is a one-shot rendezvous: the hydration goroutine calls
 // resolve() exactly once; consumers call result() and block until the value
 // is available. After the first resolve, result() returns immediately.
@@ -321,7 +381,13 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	start := time.Now()
 	loadBootstrapDotenv(projectRoot)
 
-	phase1 := buildBootstrapPhase1(ctx, projectRoot, start)
+	phase1, err := buildBootstrapPhase1(ctx, projectRoot, start)
+	if err != nil {
+		if phase1 != nil {
+			cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
+		}
+		return ui.Deps{}, nil, err
+	}
 	phase2, err := runBootstrapPhase2(phase1)
 	if err != nil {
 		return ui.Deps{}, nil, err
@@ -346,7 +412,7 @@ func loadBootstrapDotenv(projectRoot string) {
 	}
 }
 
-func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Time) *bootstrapPhase1 {
+func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Time) (*bootstrapPhase1, error) {
 	phase1 := &bootstrapPhase1{
 		ctx:         ctx,
 		projectRoot: projectRoot,
@@ -381,6 +447,8 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 
 	pressureLevel := new(atomic.Int32)
 	phase1.budget = concurrency.NewGoroutineBudget(pressureLevel)
+	phase1.budget.RegisterAgent("tui", "tui")
+	phase1.scope.SetBudget(phase1.budget)
 	phase1.containerReg = container.NewContainerRegistry()
 	phase1.serviceReg = network.NewServiceRegistry()
 	phase1.specReg = container.NewAgentSpecRegistry(phase1.descriptors)
@@ -467,6 +535,13 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		slog.Default(),
 	)
 	phase1.knowledgeBackend = knowledgeruntime.NewCommittedKnowledgeBackend(projectRoot, slog.Default())
+	forest, forestContent, forestVectorDB, err := buildMemoryForest(projectRoot, phase1.budget)
+	if err != nil {
+		return phase1, fmt.Errorf("bootstrap memory forest: %w", err)
+	}
+	phase1.forest = forest
+	phase1.forestContent = forestContent
+	phase1.forestVectorDB = forestVectorDB
 
 	registerAgentCreators(
 		creatorReg,
@@ -485,6 +560,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		phase1.planStore,
 		phase1.knowledgeStore,
 		phase1.knowledgeBackend,
+		phase1.forest,
 		phase1.daemonCtrl,
 		&phase1.guideRef,
 		&phase1.guardianRef,
@@ -495,7 +571,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	)
 
 	slog.Info("bootstrap phase 1 complete", "elapsed", time.Since(start))
-	return phase1
+	return phase1, nil
 }
 
 func startDaemonContainerBootstrap(
@@ -798,12 +874,12 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 	}
 	g.SetServiceRegistry(phase1.serviceReg)
 	g.SetProviderWrapper(phase1.googleGateway.Wrapper(gateway.PriorityUserInteractive))
-	g.SetAgentRegistrar(func(agentType string) {
-		containers := phase1.containerReg.ListByType(agentType)
-		if len(containers) == 0 {
+	g.SetAgentRegistrar(func(podID, agentType string) {
+		c := findRegisteredPodContainer(phase1.containerReg, podID, agentType)
+		if c == nil {
 			return
 		}
-		agent := containers[0].Agent()
+		agent := c.Agent()
 		if router, ok := agent.(guide.AgentRouter); ok {
 			_ = registerAgentWithGuide(g, router, agentType)
 		}
@@ -847,6 +923,7 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 		phase1.authRegistry,
 		phase1.guideBus,
 		phase1.scope,
+		phase1.forest,
 		&phase1.handoffRef,
 	)
 	if phase3.scribeFactory != nil {
@@ -900,6 +977,35 @@ func waitForBootBleveReady(ctx context.Context, store *knowledge.KnowledgeStore)
 	case <-ctx.Done():
 	}
 	return nil
+}
+
+func startLibrarianKnowledgeSync(phase1 *bootstrapPhase1, phase4 *bootstrapPhase4, initialSync bool) {
+	if phase4 == nil || phase4.knowledgeSync != nil || phase1 == nil || phase1.knowledgeStore == nil || phase1.knowledgeBackend == nil {
+		return
+	}
+	gitRes := phase1.gitSubsRef.Load()
+	if gitRes == nil || gitRes.watcher == nil {
+		slog.Warn("librarian knowledge sync unavailable", "reason", "git watcher unavailable")
+		return
+	}
+	syncSvc, err := librarian.NewKnowledgeSyncService(librarian.KnowledgeSyncConfig{
+		ProjectRoot: phase1.projectRoot,
+		Watcher:     gitRes.watcher,
+		Store:       phase1.knowledgeStore,
+		Backend:     phase1.knowledgeBackend,
+		Scope:       phase1.scope,
+		Logger:      slog.Default(),
+		InitialSync: initialSync,
+	})
+	if err != nil {
+		slog.Warn("librarian knowledge sync setup failed", "error", err)
+		return
+	}
+	if err := syncSvc.Start(); err != nil {
+		slog.Warn("librarian knowledge sync start failed", "error", err)
+		return
+	}
+	phase4.knowledgeSync = syncSvc
 }
 
 func schedulePhase4Activation(
@@ -1154,11 +1260,13 @@ func startBootstrapPhase4(
 		})
 		if err != nil {
 			slog.Warn("knowledge boot failed (non-critical)", "error", err)
+			startLibrarianKnowledgeSync(phase1, phase4, true)
 			return nil
 		}
 		backend := phase1.knowledgeBackend
 		if backend == nil {
 			slog.Warn("knowledge backend unavailable (non-critical)")
+			startLibrarianKnowledgeSync(phase1, phase4, false)
 			return nil
 		}
 		var refreshErr error
@@ -1169,9 +1277,11 @@ func startBootstrapPhase4(
 		}
 		if refreshErr != nil {
 			slog.Warn("knowledge backend refresh failed (non-critical)", "error", refreshErr)
+			startLibrarianKnowledgeSync(phase1, phase4, true)
 			return nil
 		}
 		phase1.knowledgeStore.PromotePartial(query.NewBleveSearcher(backend), result.BackgroundIndexer, backend)
+		startLibrarianKnowledgeSync(phase1, phase4, false)
 		return nil
 	})
 	schedulePhase4Task(phase1.scope, "phase4-bleve-ready", 0, &phase4Remaining, phase4Finish, func(bgCtx context.Context) error {
@@ -1223,8 +1333,28 @@ func buildBootstrapCleanup(
 		if phase4.bootLogger != nil {
 			_ = phase4.bootLogger.Close()
 		}
+		if phase4.knowledgeSync != nil {
+			if err := phase4.knowledgeSync.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
 		if err := phase1.knowledgeStore.Close(); err != nil {
 			errs = append(errs, err)
+		}
+		if phase1.forest != nil {
+			if err := phase1.forest.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if phase1.forestContent != nil {
+			if err := phase1.forestContent.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if phase1.forestVectorDB != nil {
+			if err := phase1.forestVectorDB.Close(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		if phase1.knowledgeBackend != nil {
 			if err := phase1.knowledgeBackend.Close(); err != nil {
@@ -1355,6 +1485,7 @@ func registerAgentCreators(
 	planStore *architect.PlanStore,
 	knowledgeStore *knowledge.KnowledgeStore,
 	knowledgeBackend *knowledgeruntime.CommittedKnowledgeBackend,
+	forest agentShared.MemoryForestService,
 	daemonCtrl *daemon.DaemonSetController,
 	guideRef *atomic.Pointer[guide.Guide],
 	guardianRef *atomic.Pointer[guardian.Guardian],
@@ -1371,7 +1502,7 @@ func registerAgentCreators(
 		if h == nil {
 			h = hydratedRef.Load()
 		}
-		return bootstrapLiveGuide(ctx, bus, actPub, h, googleGw, authRegistry, projectRoot, func(sessionID string) *versioning.SessionVFS {
+		return bootstrapLiveGuide(ctx, bus, actPub, h, googleGw, authRegistry, projectRoot, forest, func(sessionID string) *versioning.SessionVFS {
 			if orch := orchRef.Load(); orch != nil {
 				return orch.GetSessionVFS(sessionID)
 			}
@@ -1383,7 +1514,7 @@ func registerAgentCreators(
 	// overlay when a session is active, falling back to read-only disk access.
 	architectID, _ := ids.Get("architect")
 	reg.Register("architect", func(ctx context.Context) (container.ContainerAgent, error) {
-		return bootstrapArchitect(ctx, architectID, bus, actPub, projectRoot, anthropicGw, authRegistry, actCtrlRef, planStore, func(sessionID string) *versioning.SessionVFS {
+		return bootstrapArchitect(ctx, architectID, bus, actPub, projectRoot, anthropicGw, authRegistry, actCtrlRef, planStore, forest, func(sessionID string) *versioning.SessionVFS {
 			if orch := orchRef.Load(); orch != nil {
 				return orch.GetSessionVFS(sessionID)
 			}
@@ -1398,14 +1529,14 @@ func registerAgentCreators(
 		if h == nil {
 			h = hydratedRef.Load()
 		}
-		return bootstrapOrchestrator(ctx, orchestratorID, bus, actPub, projectRoot, h, authRegistry, googleGw)
+		return bootstrapOrchestrator(ctx, orchestratorID, bus, actPub, projectRoot, h, authRegistry, googleGw, forest)
 	})
 
 	// Guardian — safety sidecar daemon.
 	// On daemon restart the factory must re-wire post-boot deps (observability,
 	// git, agent seeding) that Phase 3 originally set up.
 	reg.Register("guardian", func(ctx context.Context) (container.ContainerAgent, error) {
-		grd, err := bootstrapGuardian(ctx, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, authRegistry, gitSubsRef, quarantineRef, func(sessionID string) *versioning.SessionVFS {
+		grd, err := bootstrapGuardian(ctx, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, authRegistry, gitSubsRef, quarantineRef, forest, func(sessionID string) *versioning.SessionVFS {
 			if orch := orchRef.Load(); orch != nil {
 				return orch.GetSessionVFS(sessionID)
 			}
@@ -1421,7 +1552,7 @@ func registerAgentCreators(
 	})
 
 	// On-demand agents — created lazily by the ActivationController.
-	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, authRegistry, actCtrlRef, knowledgeStore, knowledgeBackend, guardianRef, orchRef, quarantineRef, quota)
+	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, authRegistry, actCtrlRef, knowledgeStore, knowledgeBackend, forest, guardianRef, orchRef, quarantineRef, quota)
 }
 
 // registerOnDemandAgentCreators registers factories for knowledge and pipeline agents.
@@ -1439,6 +1570,7 @@ type onDemandAgentCreatorDeps struct {
 	actCtrlRef       *atomic.Pointer[activation.ActivationController]
 	knowledgeStore   *knowledge.KnowledgeStore
 	knowledgeBackend *knowledgeruntime.CommittedKnowledgeBackend
+	forest           agentShared.MemoryForestService
 	guardianRef      *atomic.Pointer[guardian.Guardian]
 	orchRef          *atomic.Pointer[orchestrator.Orchestrator]
 	quarantineRef    *atomic.Pointer[fetch.QuarantineBuffer]
@@ -1504,6 +1636,7 @@ func registerOnDemandAgentCreators(
 	actCtrlRef *atomic.Pointer[activation.ActivationController],
 	knowledgeStore *knowledge.KnowledgeStore,
 	knowledgeBackend *knowledgeruntime.CommittedKnowledgeBackend,
+	forest agentShared.MemoryForestService,
 	guardianRef *atomic.Pointer[guardian.Guardian],
 	orchRef *atomic.Pointer[orchestrator.Orchestrator],
 	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
@@ -1522,6 +1655,7 @@ func registerOnDemandAgentCreators(
 		actCtrlRef:       actCtrlRef,
 		knowledgeStore:   knowledgeStore,
 		knowledgeBackend: knowledgeBackend,
+		forest:           forest,
 		guardianRef:      guardianRef,
 		orchRef:          orchRef,
 		quarantineRef:    quarantineRef,
@@ -1557,6 +1691,7 @@ func registerLibrarianAgentCreator(deps onDemandAgentCreatorDeps) {
 			SearchSystem:     librarian.NewCommittedKnowledgeSearchSystem(deps.knowledgeBackend),
 			KnowledgeBackend: deps.knowledgeBackend,
 			ContextQuota:     deps.quota,
+			Forest:           deps.forest,
 		}
 		if guard := deps.requestGuard("librarian"); guard != nil {
 			libCfg.RequestGuard = guard
@@ -1611,6 +1746,7 @@ func buildOnDemandArchivalistConfig(deps onDemandAgentCreatorDeps, agentID, mode
 		EnableHybridQuery:    true,
 		EnableACTR:           true,
 		ContextQuota:         deps.quota,
+		Forest:               deps.forest,
 	}
 	if guard := deps.requestGuard("archivalist"); guard != nil {
 		archCfg.RequestGuard = guard
@@ -1631,6 +1767,7 @@ func registerAcademicAgentCreator(deps onDemandAgentCreatorDeps) {
 			Model:        model,
 			ActivityPub:  deps.actPub,
 			ContextQuota: deps.quota,
+			Forest:       deps.forest,
 		}
 		if guard := deps.requestGuard("academic"); guard != nil {
 			acaCfg.RequestGuard = guard
@@ -1640,6 +1777,8 @@ func registerAcademicAgentCreator(deps onDemandAgentCreatorDeps) {
 			return nil, err
 		}
 		a.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution))
+		a.SetKnowledgeStore(deps.knowledgeStore)
+		a.SetKnowledgeBackend(deps.knowledgeBackend)
 		a.SetFetchPipeline(buildAcademicFetchPipeline(deps.projectRoot, deps.guardianRef, deps.quarantineRef, deps.knowledgeBackend))
 		if startErr := a.Start(deps.bus); startErr != nil {
 			return nil, startErr
@@ -1668,6 +1807,7 @@ func registerGlobalInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 			SessionID:   deps.defaultSessionID(),
 			Model:       model,
 			ActivityPub: deps.actPub,
+			Forest:      deps.forest,
 		}, wrapped)
 		if err != nil {
 			return nil, err
@@ -1688,16 +1828,13 @@ func registerGlobalInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 
 func registerPipelineInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 	deps.reg.Register("inspector-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
-		agentID, err := requirePipelineWorkerAgentID(ctx, "inspector-pipeline")
-		if err != nil {
-			return nil, err
-		}
+		agentID := pipelineWorkerAgentID(ctx, "inspector-pipeline")
 		model := deps.configuredModel("inspector-pipeline", "claude-opus-4-6")
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline inspector provider: %w", err)
 		}
-		pi, err := inspectorPipeline.New(inspectorShared.PipelineInspectorConfig{AgentID: agentID}, wrapped)
+		pi, err := inspectorPipeline.New(inspectorShared.PipelineInspectorConfig{AgentID: agentID, Forest: deps.forest}, wrapped)
 		if err != nil {
 			return nil, err
 		}
@@ -1724,6 +1861,7 @@ func registerGlobalTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 			SessionID:   deps.defaultSessionID(),
 			Model:       model,
 			ActivityPub: deps.actPub,
+			Forest:      deps.forest,
 		}, wrapped)
 		if err != nil {
 			return nil, err
@@ -1744,16 +1882,13 @@ func registerGlobalTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 
 func registerPipelineTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 	deps.reg.Register("tester-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
-		agentID, err := requirePipelineWorkerAgentID(ctx, "tester-pipeline")
-		if err != nil {
-			return nil, err
-		}
+		agentID := pipelineWorkerAgentID(ctx, "tester-pipeline")
 		model := deps.configuredModel("tester-pipeline", "gpt-5.4-pro")
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline tester provider: %w", err)
 		}
-		pt, err := pipelinetester.New(shared.PipelineTesterConfig{AgentID: agentID, Model: model}, wrapped)
+		pt, err := pipelinetester.New(shared.PipelineTesterConfig{AgentID: agentID, Model: model, Forest: deps.forest}, wrapped)
 		if err != nil {
 			return nil, err
 		}
@@ -1773,16 +1908,13 @@ func registerOnDemandImplementationAgentCreators(deps onDemandAgentCreatorDeps) 
 func registerEngineerAgentCreator(deps onDemandAgentCreatorDeps) {
 	engineerID, _ := deps.ids.Get("engineer")
 	deps.reg.Register("engineer", func(ctx context.Context) (container.ContainerAgent, error) {
-		agentID := engineerID
-		if workerID := pipelineWorkerAgentID(ctx, "engineer"); workerID != "" {
-			agentID = workerID
-		}
+		agentID := taskScopedCreationAgentID(ctx, "engineer", engineerID)
 		model := deps.configuredModel("engineer", "gpt-5.4-pro")
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("engineer provider: %w", err)
 		}
-		engCfg := engineer.Config{ID: agentID, ActivityPub: deps.actPub}
+		engCfg := engineer.Config{ID: agentID, ActivityPub: deps.actPub, Forest: deps.forest}
 		engCfg.EngineerConfig.Model = model
 		if guard := deps.requestGuard("engineer"); guard != nil {
 			engCfg.RequestGuard = guard
@@ -1802,16 +1934,13 @@ func registerEngineerAgentCreator(deps onDemandAgentCreatorDeps) {
 func registerDesignerAgentCreator(deps onDemandAgentCreatorDeps) {
 	designerID, _ := deps.ids.Get("designer")
 	deps.reg.Register("designer", func(ctx context.Context) (container.ContainerAgent, error) {
-		agentID := designerID
-		if workerID := pipelineWorkerAgentID(ctx, "designer"); workerID != "" {
-			agentID = workerID
-		}
+		agentID := taskScopedCreationAgentID(ctx, "designer", designerID)
 		model := deps.configuredModel("designer", string(providers.Gemini31Pro))
 		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("designer provider: %w", err)
 		}
-		desCfg := designer.Config{ID: agentID, ActivityPub: deps.actPub}
+		desCfg := designer.Config{ID: agentID, ActivityPub: deps.actPub, Forest: deps.forest}
 		if guard := deps.requestGuard("designer"); guard != nil {
 			desCfg.RequestGuard = guard
 		}
@@ -2036,7 +2165,7 @@ func quotaFromSpecs(specReg *container.AgentSpecRegistry) container.ResourceQuot
 // When hydrated is non-nil, it reuses pre-resolved auth (skipping duplicate
 // OAuth + Code Assist setup). If provider auth is unavailable, it falls back
 // to a local rule-based classifier so the UI can launch without authorization.
-func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.ActivityPublisher, hydrated *providers.HydratedGoogleAuth, googleGw *gateway.ProviderGateway, authRegistry *credentials.AuthRegistry, projectRoot string, sessionVFSLookup func(string) *versioning.SessionVFS) (*guide.Guide, error) {
+func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.ActivityPublisher, hydrated *providers.HydratedGoogleAuth, googleGw *gateway.ProviderGateway, authRegistry *credentials.AuthRegistry, projectRoot string, forest agentShared.MemoryForestService, sessionVFSLookup func(string) *versioning.SessionVFS) (*guide.Guide, error) {
 	googleCfg := defaultGuideGoogleConfig(authRegistry)
 	cfg := guide.Config{
 		Bus:          bus,
@@ -2044,6 +2173,7 @@ func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.A
 		AgentID:      "guide",
 		SessionID:    "default",
 		GoogleConfig: &googleCfg,
+		Forest:       forest,
 		WorkspaceViews: versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
 			DefaultView:      versioning.WorkspaceViewDisk,
 			DefaultSessionID: "default",
@@ -2084,7 +2214,7 @@ func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.A
 	return g, nil
 }
 
-func bootstrapArchitect(ctx context.Context, canonicalID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, anthropicGw *gateway.ProviderGateway, authRegistry *credentials.AuthRegistry, actCtrlRef *atomic.Pointer[activation.ActivationController], planStore *architect.PlanStore, sessionVFSLookup func(string) *versioning.SessionVFS) (*architect.Architect, error) {
+func bootstrapArchitect(ctx context.Context, canonicalID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, anthropicGw *gateway.ProviderGateway, authRegistry *credentials.AuthRegistry, actCtrlRef *atomic.Pointer[activation.ActivationController], planStore *architect.PlanStore, forest agentShared.MemoryForestService, sessionVFSLookup func(string) *versioning.SessionVFS) (*architect.Architect, error) {
 	bootstrapStart := time.Now()
 	deadline, hasDL := ctx.Deadline()
 	guide.DebugFileLog().Info("DEBUG: bootstrap_architect_start", "has_deadline", hasDL, "deadline", deadline)
@@ -2110,6 +2240,7 @@ func bootstrapArchitect(ctx context.Context, canonicalID string, bus guide.Event
 		AnthropicAPIKey:   apiKey,
 		ActivityPub:       actPub,
 		PlanStore:         planStore,
+		Forest:            forest,
 		PlannerProviderWrapper: func(p *providers.AnthropicProvider) architect.PlannerStreamProvider {
 			return anthropicGw.WrapProvider(p, gateway.PriorityPlanning)
 		},
@@ -2151,6 +2282,7 @@ func bootstrapGuardian(
 	authRegistry *credentials.AuthRegistry,
 	gitSubsRef *atomic.Pointer[gitBootResult],
 	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
+	forest agentShared.MemoryForestService,
 	sessionVFSLookup func(string) *versioning.SessionVFS,
 ) (*guardian.Guardian, error) {
 	model := effectiveModelForCurrentAuth(authRegistry, guardian.DefaultGuardianModel)
@@ -2175,6 +2307,7 @@ func bootstrapGuardian(
 			DiskFallback:  versioning.NewDiskFileAccess(projectRoot, true),
 		}),
 		Sanitizer: security.NewSecretSanitizer(),
+		Forest:    forest,
 	}
 
 	// Wire git subsystems from atomic ref (available on daemon restart,
@@ -2385,6 +2518,7 @@ func findRegisteredPodContainer(reg *container.ContainerRegistry, podID, agentTy
 				return ctr
 			}
 		}
+		return nil
 	}
 	containers := reg.ListByType(agentType)
 	if len(containers) == 0 {
@@ -2413,19 +2547,19 @@ func taskScopedWorkerRoutingInfo(info *guide.AgentRoutingInfo, podID, agentType 
 	taskAlias := orchestrator.TaskScopedRoutingName("", podID, agentType)
 	cloned.PodID = podID
 	cloned.Name = strings.TrimSpace(info.Name)
-	cloned.Aliases = nil
-	if taskAlias != "" && taskAlias != cloned.Name {
-		cloned.Aliases = []string{taskAlias}
+	if taskAlias != "" {
+		cloned.Name = taskAlias
 	}
+	cloned.Aliases = nil
 	cloned.ActionShortcuts = nil
 	cloned.Triggers = guide.AgentTriggers{}
 	if info.Registration != nil {
 		reg := *info.Registration
 		reg.Name = strings.TrimSpace(info.Registration.Name)
-		reg.Aliases = nil
-		if taskAlias != "" && taskAlias != reg.Name {
-			reg.Aliases = []string{taskAlias}
+		if taskAlias != "" {
+			reg.Name = taskAlias
 		}
+		reg.Aliases = nil
 		cloned.Registration = &reg
 	}
 	return &cloned
@@ -2441,19 +2575,18 @@ func pipelineWorkerAgentID(ctx context.Context, agentType string) string {
 			}
 		}
 	}
-	podID, ok := container.CreationPodIDFromContext(ctx)
-	if !ok || !isTaskScopedPipelineWorker(string(podID), agentType) {
-		return ""
-	}
-	return orchestrator.PipelineWorkerAgentID(string(podID), agentType)
+	return ""
 }
 
-func requirePipelineWorkerAgentID(ctx context.Context, agentType string) (string, error) {
-	agentType = strings.TrimSpace(agentType)
+func taskScopedCreationAgentID(ctx context.Context, agentType, singletonID string) string {
 	if workerID := pipelineWorkerAgentID(ctx, agentType); workerID != "" {
-		return workerID, nil
+		return workerID
 	}
-	return "", fmt.Errorf("%s requires task-scoped pipeline creation context", agentType)
+	podID, ok := container.CreationPodIDFromContext(ctx)
+	if ok && isTaskScopedPipelineWorker(string(podID), agentType) {
+		return ""
+	}
+	return singletonID
 }
 
 // preRegisterAgentRouting pre-registers static routing metadata for all
@@ -2929,7 +3062,7 @@ func defaultOrchestratorGoogleConfig(authRegistry *credentials.AuthRegistry) pro
 	return cfg
 }
 
-func bootstrapOrchestrator(ctx context.Context, agentID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, hydrated *providers.HydratedGoogleAuth, authRegistry *credentials.AuthRegistry, googleGw *gateway.ProviderGateway) (*orchestrator.Orchestrator, error) {
+func bootstrapOrchestrator(ctx context.Context, agentID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, hydrated *providers.HydratedGoogleAuth, authRegistry *credentials.AuthRegistry, googleGw *gateway.ProviderGateway, forest agentShared.MemoryForestService) (*orchestrator.Orchestrator, error) {
 	googleCfg := defaultOrchestratorGoogleConfig(authRegistry)
 
 	// Best-effort provider creation. If Google auth isn't available yet,
@@ -2946,6 +3079,7 @@ func bootstrapOrchestrator(ctx context.Context, agentID string, bus guide.EventB
 	cfg.AgentID = agentID
 	cfg.SessionID = "default"
 	cfg.EnableLLM = true
+	cfg.Forest = forest
 	if provErr == nil && provider != nil {
 		cfg.GoogleConfig = &googleCfg
 	}
@@ -3051,20 +3185,28 @@ func cleanupInfra(
 	ns *network.NetworkNamespace,
 	bus guide.EventBus,
 ) {
-	for _, c := range reg.All() {
-		if c.IsRunning() {
-			if err := rt.StopContainer(context.Background(), c); err != nil {
-				slog.Warn("cleanup: stop container failed", "container", c.ID(), "error", err)
+	if rt != nil && reg != nil {
+		for _, c := range reg.All() {
+			if c.IsRunning() {
+				if err := rt.StopContainer(context.Background(), c); err != nil {
+					slog.Warn("cleanup: stop container failed", "container", c.ID(), "error", err)
+				}
+			}
+			if err := rt.RemoveContainer(context.Background(), c); err != nil {
+				slog.Warn("cleanup: remove container failed", "container", c.ID(), "error", err)
 			}
 		}
-		if err := rt.RemoveContainer(context.Background(), c); err != nil {
-			slog.Warn("cleanup: remove container failed", "container", c.ID(), "error", err)
-		}
 	}
-	ns.Close()
-	rt.Close()
-	if err := bus.Close(); err != nil {
-		slog.Warn("cleanup: bus close failed", "error", err)
+	if ns != nil {
+		ns.Close()
+	}
+	if rt != nil {
+		rt.Close()
+	}
+	if bus != nil {
+		if err := bus.Close(); err != nil {
+			slog.Warn("cleanup: bus close failed", "error", err)
+		}
 	}
 }
 
@@ -3125,6 +3267,20 @@ func bootstrapHandoffSupervisor(
 	supervisor.SetAgentReplacedCallback(func(oldID, _ string, newAgent handoff.HandoffableAgent) error {
 		if setter, ok := newAgent.(interface{ SetCanonicalID(string) }); ok {
 			setter.SetCanonicalID(oldID)
+		}
+		if replacement, ok := newAgent.(handoffScribeAgent); ok {
+			if pod := replacement.AgentPod(); pod != nil {
+				previous := pod.ReplaceScribe(replacement.ParentAgentType(), replacement)
+				if previous != nil && previous != replacement {
+					if retiring, ok := previous.(handoffRetiringScribe); ok {
+						if err := retiring.RetireForHandoff(); err != nil {
+							slog.Warn("retire replaced scribe", "agent_id", oldID, "error", err)
+						}
+					} else if err := previous.Stop(); err != nil {
+						slog.Warn("stop replaced scribe", "agent_id", oldID, "error", err)
+					}
+				}
+			}
 		}
 		inheritHandoffRuntimeBindings(containerReg, oldID, newAgent)
 		g.UnregisterAgent(oldID)
@@ -3224,6 +3380,17 @@ type handoffBridgeSetter interface {
 
 type handoffPodGetter interface {
 	AgentPod() *agentShared.AgentPod
+}
+
+type handoffScribeAgent interface {
+	agentShared.Scribe
+	handoff.HandoffInjectable
+	ParentAgentType() string
+	AgentPod() *agentShared.AgentPod
+}
+
+type handoffRetiringScribe interface {
+	RetireForHandoff() error
 }
 
 // registerHandoffAgent registers a single agent with the supervisor and
@@ -3369,55 +3536,234 @@ func unregisterHandoffContainer(supervisor *handoff.HandoffSupervisor, c *contai
 }
 
 type handoffManagedScribe struct {
-	inner         agentShared.Scribe
-	handoffable   handoff.HandoffableAgent
-	supervisorRef *atomic.Pointer[handoff.HandoffSupervisor]
-	logger        *slog.Logger
+	inner           *scribe.Scribe
+	supervisorRef   *atomic.Pointer[handoff.HandoffSupervisor]
+	logger          *slog.Logger
+	parentAgentType string
+	pod             *agentShared.AgentPod
+	registry        *handoffManagedScribeRegistry
+	newManaged      func(parentAgentType string, logger *slog.Logger, autoRegister bool) (*handoffManagedScribe, error)
+	autoRegister    bool
 
-	mu            sync.Mutex
-	registeredSup *handoff.HandoffSupervisor
+	mu             sync.Mutex
+	registeredSup  *handoff.HandoffSupervisor
+	bridgeAssigned bool
 }
 
 func (s *handoffManagedScribe) Start() error {
 	if err := s.inner.Start(); err != nil {
 		return err
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.registeredSup != nil || s.supervisorRef == nil || s.handoffable == nil {
-		return nil
+	if s.registry != nil {
+		s.registry.Track(s)
 	}
-
-	sup := s.supervisorRef.Load()
-	if sup == nil {
-		return nil
-	}
-
-	registerHandoffAgent(sup, s.handoffable)
-	s.registeredSup = sup
+	s.ensureHandoffRegistration()
 	return nil
 }
 
 func (s *handoffManagedScribe) Stop() error {
+	agentID := s.AgentID()
+	if s.registry != nil {
+		s.registry.DeleteIf(agentID, s)
+	}
+
 	s.mu.Lock()
 	sup := s.registeredSup
+	shouldUnregister := s.registeredSup != nil || s.bridgeAssigned
 	s.registeredSup = nil
+	s.bridgeAssigned = false
 	s.mu.Unlock()
 
-	if sup != nil && s.handoffable != nil {
-		_ = sup.UnregisterAgent(s.handoffable.AgentID())
-		if setter, ok := s.handoffable.(handoffBridgeSetter); ok {
-			setter.SetHandoffBridge(nil)
+	if shouldUnregister {
+		if sup == nil && s.supervisorRef != nil {
+			sup = s.supervisorRef.Load()
 		}
+		if sup != nil {
+			_ = sup.UnregisterAgent(agentID)
+		}
+		s.SetHandoffBridge(nil)
 	}
 
 	return s.inner.Stop()
 }
 
+func (s *handoffManagedScribe) RetireForHandoff() error {
+	agentID := s.AgentID()
+	if s.registry != nil {
+		s.registry.DeleteIf(agentID, s)
+	}
+	s.mu.Lock()
+	s.registeredSup = nil
+	s.bridgeAssigned = false
+	s.mu.Unlock()
+	s.SetHandoffBridge(nil)
+	return s.inner.Stop()
+}
+
 func (s *handoffManagedScribe) Feed(feed agentShared.ScribeFeed) {
+	s.ensureHandoffRegistration()
 	s.inner.Feed(feed)
+}
+
+func (s *handoffManagedScribe) AgentID() string { return s.inner.AgentID() }
+
+func (s *handoffManagedScribe) AgentType() string { return s.inner.AgentType() }
+
+func (s *handoffManagedScribe) Descriptor() handoff.AgentDescriptor { return s.inner.Descriptor() }
+
+func (s *handoffManagedScribe) ExtractArchivableState() *handoff.ArchivableState {
+	return s.inner.ExtractArchivableState()
+}
+
+func (s *handoffManagedScribe) Terminate(ctx context.Context) error { return s.Stop() }
+
+func (s *handoffManagedScribe) InjectPreparedContext(pc *handoff.PreparedContext) error {
+	return s.inner.InjectPreparedContext(pc)
+}
+
+func (s *handoffManagedScribe) SetCanonicalID(id string) {
+	oldID := s.AgentID()
+	s.inner.SetCanonicalID(id)
+	if s.registry != nil {
+		s.registry.Rename(oldID, s.AgentID(), s)
+	}
+}
+
+func (s *handoffManagedScribe) SetHandoffBridge(bridge *handoff.HandoffBridge) {
+	s.mu.Lock()
+	s.bridgeAssigned = bridge != nil
+	s.mu.Unlock()
+	s.inner.SetHandoffBridge(bridge)
+}
+
+func (s *handoffManagedScribe) SetAgentPod(pod *agentShared.AgentPod) {
+	s.pod = pod
+}
+
+func (s *handoffManagedScribe) AgentPod() *agentShared.AgentPod {
+	return s.pod
+}
+
+func (s *handoffManagedScribe) ParentAgentType() string {
+	return s.parentAgentType
+}
+
+func (s *handoffManagedScribe) ensureHandoffRegistration() {
+	if s == nil || !s.autoRegister || s.supervisorRef == nil {
+		return
+	}
+	sup := s.supervisorRef.Load()
+	if sup == nil {
+		return
+	}
+
+	if s.registry != nil && s.newManaged != nil {
+		agentType := s.AgentType()
+		sup.Factory().RegisterCreator(agentType, func(ctx context.Context) (handoff.HandoffableAgent, error) {
+			metadata, ok := handoff.FactoryCreationMetadataFromContext(ctx)
+			if !ok || strings.TrimSpace(metadata.AgentID) == "" {
+				return nil, fmt.Errorf("scribe handoff for %q missing source agent id", agentType)
+			}
+			source := s.registry.Get(metadata.AgentID)
+			if source == nil {
+				return nil, fmt.Errorf("no live scribe source found for agent id %q", metadata.AgentID)
+			}
+			replacement, err := source.newManaged(source.parentAgentType, source.logger, false)
+			if err != nil {
+				return nil, err
+			}
+			replacement.SetAgentPod(source.AgentPod())
+			if err := replacement.Start(); err != nil {
+				return nil, err
+			}
+			return replacement, nil
+		})
+	}
+
+	s.mu.Lock()
+	if s.registeredSup != nil || s.bridgeAssigned {
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+
+	registerHandoffAgent(sup, s)
+
+	s.mu.Lock()
+	if s.bridgeAssigned {
+		s.registeredSup = sup
+	}
+	s.mu.Unlock()
+}
+
+type handoffManagedScribeRegistry struct {
+	mu   sync.Mutex
+	byID map[string]*handoffManagedScribe
+}
+
+func newHandoffManagedScribeRegistry() *handoffManagedScribeRegistry {
+	return &handoffManagedScribeRegistry{
+		byID: make(map[string]*handoffManagedScribe),
+	}
+}
+
+func (r *handoffManagedScribeRegistry) Track(s *handoffManagedScribe) {
+	if r == nil || s == nil {
+		return
+	}
+	id := strings.TrimSpace(s.AgentID())
+	if id == "" {
+		return
+	}
+	r.mu.Lock()
+	r.byID[id] = s
+	r.mu.Unlock()
+}
+
+func (r *handoffManagedScribeRegistry) DeleteIf(id string, target *handoffManagedScribe) {
+	if r == nil || target == nil {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	r.mu.Lock()
+	if existing := r.byID[id]; existing == target {
+		delete(r.byID, id)
+	}
+	r.mu.Unlock()
+}
+
+func (r *handoffManagedScribeRegistry) Rename(oldID, newID string, target *handoffManagedScribe) {
+	if r == nil || target == nil {
+		return
+	}
+	oldID = strings.TrimSpace(oldID)
+	newID = strings.TrimSpace(newID)
+	r.mu.Lock()
+	if oldID != "" {
+		if existing := r.byID[oldID]; existing == target {
+			delete(r.byID, oldID)
+		}
+	}
+	if newID != "" {
+		r.byID[newID] = target
+	}
+	r.mu.Unlock()
+}
+
+func (r *handoffManagedScribeRegistry) Get(id string) *handoffManagedScribe {
+	if r == nil {
+		return nil
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.byID[id]
 }
 
 // buildScribeFactory creates a ScribeFactory that produces Gemini 3 Flash
@@ -3429,6 +3775,7 @@ func buildScribeFactory(
 	authRegistry *credentials.AuthRegistry,
 	bus guide.EventBus,
 	scope *concurrency.GoroutineScope,
+	forest agentShared.MemoryForestService,
 	supervisorRef *atomic.Pointer[handoff.HandoffSupervisor],
 ) agentShared.ScribeFactory {
 	scribeCfg := providers.DefaultGoogleConfig()
@@ -3443,21 +3790,30 @@ func buildScribeFactory(
 	}
 
 	wrapped := googleGw.WrapProvider(scribeProvider, gateway.PriorityBackground)
+	registry := newHandoffManagedScribeRegistry()
+	var newManaged func(parentAgentType string, logger *slog.Logger, autoRegister bool) (*handoffManagedScribe, error)
+	newManaged = func(parentAgentType string, logger *slog.Logger, autoRegister bool) (*handoffManagedScribe, error) {
+		managed := &handoffManagedScribe{
+			inner: scribe.New(scribe.Config{
+				ParentAgentType: parentAgentType,
+				Provider:        wrapped,
+				Model:           "gemini-3-flash-preview",
+				Bus:             bus,
+				Scope:           scope,
+				Logger:          logger,
+				Forest:          forest,
+			}),
+			supervisorRef:   supervisorRef,
+			logger:          logger,
+			parentAgentType: parentAgentType,
+			registry:        registry,
+			autoRegister:    autoRegister,
+		}
+		managed.newManaged = newManaged
+		return managed, nil
+	}
 	return func(parentAgentType string, logger *slog.Logger) (agentShared.Scribe, error) {
-		s := scribe.New(scribe.Config{
-			ParentAgentType: parentAgentType,
-			Provider:        wrapped,
-			Model:           "gemini-3-flash-preview",
-			Bus:             bus,
-			Scope:           scope,
-			Logger:          logger,
-		})
-		return &handoffManagedScribe{
-			inner:         s,
-			handoffable:   s,
-			supervisorRef: supervisorRef,
-			logger:        logger,
-		}, nil
+		return newManaged(parentAgentType, logger, true)
 	}
 }
 

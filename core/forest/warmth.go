@@ -40,10 +40,9 @@ func (w *WarmthStore) RecordAccess(ctx context.Context, branchID string, accessT
 	_, err = w.db.ExecContext(ctx, `
 		UPDATE forest_branches
 		SET access_count = access_count + 1,
-		    last_accessed_at = ?,
-		    updated_at = MAX(updated_at, ?)
+		    last_accessed_at = ?
 		WHERE id = ?
-	`, now.Unix(), now.Unix(), branchID)
+	`, now.Unix(), branchID)
 	if err != nil {
 		return fmt.Errorf("update branch access stats: %w", err)
 	}

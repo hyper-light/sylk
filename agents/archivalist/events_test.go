@@ -366,6 +366,37 @@ func TestEventLog_PruningPreservesRecent(t *testing.T) {
 	assert.Len(t, recent, 10, "Should still have recent events")
 }
 
+func TestEventLog_PruningTrimsIndexes(t *testing.T) {
+	el := NewEventLog(EventLogConfig{MaxEvents: 10})
+	defer el.Close()
+
+	retainedIDs := make([]string, 0, 10)
+	for i := 0; i < 15; i++ {
+		event := makeEvent(EventTypeFileRead, "agent-1", "session-1", nil)
+		event.Scope = ScopeFiles
+		require.NoError(t, el.Append(event))
+		if i >= 5 {
+			retainedIDs = append(retainedIDs, event.ID)
+		}
+	}
+
+	agentEvents := el.GetByAgent("agent-1", 0)
+	require.Len(t, agentEvents, 10)
+	require.Len(t, el.GetBySession("session-1", 0), 10)
+	require.Len(t, el.GetByType(EventTypeFileRead, 0), 10)
+	require.Len(t, el.GetByScope(ScopeFiles, 0), 10)
+	for i, event := range agentEvents {
+		assert.Equal(t, retainedIDs[i], event.ID)
+	}
+
+	stats := el.Stats()
+	assert.Equal(t, 10, stats.TotalEvents)
+	assert.Equal(t, 10, stats.EventsByAgent["agent-1"])
+	assert.Equal(t, 10, stats.EventsBySession["session-1"])
+	assert.Equal(t, 10, stats.EventsByType[EventTypeFileRead])
+	assert.Equal(t, 10, stats.EventsByScope[ScopeFiles])
+}
+
 func TestEventLog_Ordering(t *testing.T) {
 	el := newTestEventLog(t)
 

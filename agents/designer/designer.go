@@ -15,6 +15,7 @@ import (
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
@@ -85,6 +86,8 @@ type Designer struct {
 
 	// Steering ledger management.
 	steering *shared.SteeringManager
+	// Tracks Memory Forest branches surfaced during design work.
+	forestTracker *shared.MemoryForestTracker
 
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
@@ -111,6 +114,9 @@ type Config struct {
 	Logger *slog.Logger
 
 	SessionID string
+
+	// Forest exposes Memory Forest preference and precedent skills.
+	Forest shared.MemoryForestService
 }
 
 const (
@@ -145,6 +151,7 @@ func New(cfg Config, provider designerProvider) (*Designer, error) {
 		},
 		consultations:     make([]Consultation, 0),
 		pendingBus:        make(map[string]chan *guide.Message),
+		forestTracker:     shared.NewMemoryForestTracker(),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
 		executionBroker:   purevfs.DefaultExecutionBroker(),
@@ -273,6 +280,33 @@ func applyConfigDefaults(cfg Config) Config {
 func (d *Designer) initSkills() error {
 	d.skills = skills.NewRegistry()
 	d.registerCoreSkills()
+	if err := shared.RegisterMemoryForestSkills(d.skills, "designer", d.config.Forest, d.forestTracker); err != nil {
+		return fmt.Errorf("register designer forest skills: %w", err)
+	}
+	if err := shared.AttachForestOutcomeRecorder(
+		d.skills,
+		"handoff_next",
+		d.forestTracker,
+		d.config.Forest,
+		func() string { return d.id },
+		"designer",
+		func() string { return d.config.SessionID },
+		shared.OutcomeOnSuccess("designer handoff succeeded"),
+	); err != nil {
+		return fmt.Errorf("attach designer forest handoff outcome: %w", err)
+	}
+	if err := shared.AttachForestOutcomeRecorder(
+		d.skills,
+		"report_to_orchestrator",
+		d.forestTracker,
+		d.config.Forest,
+		func() string { return d.id },
+		"designer",
+		func() string { return d.config.SessionID },
+		shared.OutcomeAlways(forest.OutcomeStatusFailed, "designer escalated a design failure to the orchestrator"),
+	); err != nil {
+		return fmt.Errorf("attach designer forest escalation outcome: %w", err)
+	}
 
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = designerVisibleSkillNames()
@@ -439,8 +473,6 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 
 	if taskID, _ := fwd.Metadata["task_id"].(string); taskID != "" {
 		d.pipelineID = taskID
-	} else if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
-		d.pipelineID = dagID
 	}
 	if taskSlug, _ := fwd.Metadata["task_slug"].(string); taskSlug != "" {
 		d.pipelineSlug = taskSlug
@@ -636,6 +668,7 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 	userMessage := fwd.Input
 	task := shared.DecodePipelineTaskInput(fwd.Input)
 	ctx = shared.WithPipelineTaskProtocolState(ctx, task)
+	defer shared.ClosePipelineProtocolState(ctx)
 	contract := (*shared.TaskExecutionContract)(nil)
 	if task != nil {
 		contract = shared.BuildTaskExecutionContract(task)

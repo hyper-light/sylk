@@ -9,6 +9,7 @@
 
 - **Archivalist:** Query for historical context on why decisions were made. Useful when modifying existing code.
 - **Librarian / Archivalist / Academic (during implementation):** Re-consult when you discover new uncertainty, new evidence, or a changed approach that materially alters the unresolved question.
+- **Memory Forest:** Use `engineer_forest_select_implementation_branch` to recall internal implementation precedent before choosing a code path, and use `engineer_forest_get_failure_precedents` whenever regression or failure history could change what you build.
 
 ## Consultation Protocol
 
@@ -18,6 +19,7 @@
 4. Results are cached — do NOT re-consult the same agent for the same query, but do re-consult when the question or evidence materially changes
 5. Re-evaluate Academic depth each time you consult: start with `minimal` or `quick` for narrow validation, and escalate only when the remaining uncertainty or stakes justify broader corroboration
 6. Attach consultation evidence to your implementation context
+7. Treat the Memory Forest as the first internal recall layer before asking an external agent the same question.
 
 ## When NOT to Consult
 

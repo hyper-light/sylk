@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/commandapproval"
 )
 
@@ -82,6 +83,36 @@ func TestBuildDependencyInstallResearchPrompt_AvoidsAdHocVirtualenvBootstrap(t *
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q", want)
 		}
+	}
+}
+
+func TestExtractDependencyInstallResearchContent_AcceptsPlanObjectPayload(t *testing.T) {
+	msg := guide.NewResponseMessage("academic", &guide.RouteResponse{
+		CorrelationID:       "corr-install-plan-object",
+		Success:             true,
+		RespondingAgentID:   "academic-1",
+		RespondingAgentName: "Academic",
+		Data: map[string]any{
+			"summary":      "Install pytest",
+			"missing_tool": "pytest",
+			"steps": []map[string]any{
+				{
+					"command": "python -m pip install pytest",
+					"reason":  "provide pytest",
+				},
+			},
+		},
+	})
+	content, err := ExtractDependencyInstallResearchContent(msg)
+	if err != nil {
+		t.Fatalf("ExtractDependencyInstallResearchContent() error = %v", err)
+	}
+	plan, err := ParseDependencyInstallPlan(content)
+	if err != nil {
+		t.Fatalf("ParseDependencyInstallPlan() error = %v", err)
+	}
+	if plan.MissingTool != "pytest" {
+		t.Fatalf("missing tool = %q, want pytest", plan.MissingTool)
 	}
 }
 

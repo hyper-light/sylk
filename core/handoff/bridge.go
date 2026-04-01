@@ -595,6 +595,9 @@ func (b *HandoffBridge) ReplaceAgent(newAgent HandoffableAgent) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.agent = newAgent
+	if setter, ok := newAgent.(interface{ SetHandoffBridge(*HandoffBridge) }); ok {
+		setter.SetHandoffBridge(b)
+	}
 	b.turnCount.Store(0)
 	b.prepared.Clear()
 }
@@ -604,6 +607,14 @@ func (b *HandoffBridge) Agent() HandoffableAgent {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.agent
+}
+
+// Supervisor returns the shared supervisor that owns this bridge.
+func (b *HandoffBridge) Supervisor() *HandoffSupervisor {
+	if b == nil {
+		return nil
+	}
+	return b.supervisor
 }
 
 // monitorLoop drains the context check notification channel and handles
@@ -673,12 +684,12 @@ func (b *HandoffBridge) triggerHandoff(rec *HandoffRecommendation) {
 // until the replacement is fully created, hydrated, and applied. We do not
 // register a second visible active agent during this transition.
 func (b *HandoffBridge) executeStandaloneHandoff(rec *HandoffRecommendation) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	b.refreshPreparedBrief(ctx, rec)
 	if b.briefGen != nil {
 		b.briefGen.SetOnPreparedContext(b.prepared)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	b.emitHandoffTrace("handoff_execute_started", "info", nil, map[string]any{
 		"mode":                "direct",
 		"trigger":             rec.Trigger.String(),
@@ -738,7 +749,9 @@ func (b *HandoffBridge) executeStandaloneHandoff(rec *HandoffRecommendation) {
 // agent receives canary traffic first and weight ramps up as GP quality is
 // confirmed.
 func (b *HandoffBridge) executeOverlapHandoff(_ *HandoffRecommendation) {
-	// Inject latest brief into prepared context before snapshot.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	b.refreshPreparedBrief(ctx, nil)
 	if b.briefGen != nil {
 		b.briefGen.SetOnPreparedContext(b.prepared)
 	}
@@ -765,9 +778,9 @@ func (b *HandoffBridge) executeOverlapHandoff(_ *HandoffRecommendation) {
 	}
 
 	// Wait for new agent to be ready (context injected).
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	waitCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := handle.WaitDrain(ctx); err != nil {
+	if err := handle.WaitDrain(waitCtx); err != nil {
 		handle.Abort(err.Error())
 		b.parallelBuffer.elastic.Reset()
 		return
@@ -811,6 +824,33 @@ func (b *HandoffBridge) executeOverlapHandoff(_ *HandoffRecommendation) {
 		b.mu.Lock()
 		b.activeShift = nil
 		b.mu.Unlock()
+	}
+}
+
+func (b *HandoffBridge) refreshPreparedBrief(ctx context.Context, rec *HandoffRecommendation) {
+	if b == nil || b.briefGen == nil {
+		return
+	}
+
+	var (
+		contextSize int
+		turnNumber  int
+	)
+	if contextSize <= 0 {
+		contextSize = b.prepared.TokenCount()
+	}
+	if turnNumber <= 0 {
+		turnNumber = int(b.turnCount.Load())
+		if turnNumber <= 0 {
+			turnNumber = 1
+		}
+	}
+
+	if _, err := b.briefGen.Refresh(ctx, b.config.Descriptor.AgentType, contextSize, turnNumber); err != nil {
+		b.emitHandoffTrace("handoff_brief_refresh_failed", "warn", err, map[string]any{
+			"context_size": contextSize,
+			"turn_number":  turnNumber,
+		})
 	}
 }
 
@@ -973,6 +1013,9 @@ func (b *HandoffBridge) captureTraceMeta(rec TurnRecord) {
 func (b *HandoffBridge) syncPreparedMetadata(rec TurnRecord) {
 	b.prepared.SetMetadata("agent_id", b.agent.AgentID())
 	b.prepared.SetMetadata("agent_type", b.agent.AgentType())
+	if trimmed := strings.TrimSpace(rec.CorrelationID); trimmed != "" {
+		b.prepared.SetMetadata("correlation_id", trimmed)
+	}
 	if trimmed := strings.TrimSpace(rec.SessionID); trimmed != "" {
 		b.prepared.SetMetadata("session_id", trimmed)
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
+	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
@@ -87,6 +88,8 @@ type GlobalTester struct {
 
 	// Steering ledger management.
 	steering *agentshared.SteeringManager
+	// Tracks Memory Forest branches surfaced during global testing.
+	forestTracker *agentshared.MemoryForestTracker
 
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
@@ -110,6 +113,7 @@ func New(cfg shared.GlobalTesterConfig, provider providers.ProviderAdapter) (*Gl
 		diagnoses:         make(map[string]*shared.DiagnosisReport),
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		diagEngine:        shared.NewDiagnosisEngine(),
+		forestTracker:     agentshared.NewMemoryForestTracker(),
 		steering:          agentshared.NewSteeringManager(),
 		requestSerializer: agentshared.NewRequestSerializer(),
 		executionBroker:   purevfs.DefaultExecutionBroker(),
@@ -243,6 +247,39 @@ func (gt *GlobalTester) initSkills() error {
 	gt.skills = skills.NewRegistry()
 
 	gt.registerCoreSkills()
+	if err := agentshared.RegisterMemoryForestSkills(gt.skills, "tester", gt.config.Forest, gt.forestTracker); err != nil {
+		return fmt.Errorf("register global tester forest skills: %w", err)
+	}
+	if err := agentshared.AttachForestOutcomeRecorder(
+		gt.skills,
+		"validate_global_review",
+		gt.forestTracker,
+		gt.config.Forest,
+		func() string { return gt.id },
+		"tester",
+		func() string { return gt.config.SessionID },
+		agentshared.OutcomeFromGlobalReviewValidation(
+			"global tester validation passed",
+			"global tester validation failed",
+			"global tester validation was mixed or blocked",
+		),
+	); err != nil {
+		return fmt.Errorf("attach global tester forest review outcome: %w", err)
+	}
+	for _, skillName := range []string{"report_to_orchestrator", "report_to_architect", "escalate_failure"} {
+		if err := agentshared.AttachForestOutcomeRecorder(
+			gt.skills,
+			skillName,
+			gt.forestTracker,
+			gt.config.Forest,
+			func() string { return gt.id },
+			"tester",
+			func() string { return gt.config.SessionID },
+			agentshared.OutcomeAlways(forest.OutcomeStatusFailed, "global tester escalated a systemic failure"),
+		); err != nil {
+			return fmt.Errorf("attach global tester forest escalation outcome for %s: %w", skillName, err)
+		}
+	}
 
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = globalTesterVisibleSkillNames()
@@ -474,6 +511,7 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 	}
 
 	ctx = agentshared.WithGlobalReviewContext(ctx, fwd.Metadata)
+	defer agentshared.CloseGlobalReviewState(ctx)
 	contract := agentshared.BuildGlobalExecutionContract("tester-global", fwd.Intent, fwd.Input)
 	systemPrompt := shared.GlobalTesterSystemPromptForContract(contract)
 	systemPrompt = agentshared.AppendGlobalExecutionGuidance(systemPrompt, contract, "tester-global")

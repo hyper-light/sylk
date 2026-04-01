@@ -491,8 +491,11 @@ func buildSessionGroundTruth(nodes []*Node) (sessionKeys map[string]bool, indexe
 		if n.CanonicalKey != "" {
 			sessionKeys[n.CanonicalKey] = true
 		}
-		if NodeType(n.NodeType) == NodeTypeFile && n.Path != "" {
-			indexedPaths[n.Path] = true
+		switch NodeType(n.NodeType) {
+		case NodeTypeFile, NodeTypeDocument:
+			if n.Path != "" {
+				indexedPaths[n.Path] = true
+			}
 		}
 	}
 	return sessionKeys, indexedPaths

@@ -514,7 +514,7 @@ func TestTaskRouter_DeliverResponse_MirrorStreamAddsTaskMetadataWhenMissing(t *t
 	router := testRouter(bus, scope)
 	task := testTask()
 	task.AgentType = "tester-pipeline"
-	task.TargetAgentID = PipelineWorkerAgentID(task.TaskID, task.AgentType)
+	task.TargetAgentID = PipelineWorkerRoutingTarget(task.TaskID, task.AgentType)
 	task.Context = map[string]any{
 		"task_slug": "hello-cli",
 		"task_name": "Hello CLI",
@@ -566,7 +566,7 @@ func TestTaskRouter_DeliverResponse_MirrorStreamAddsTaskMetadataWhenMissing(t *t
 		Type:          guide.MessageTypeStream,
 		Payload: &guide.StreamResponse{
 			CorrelationID:     corrID,
-			RespondingAgentID: PipelineWorkerAgentID(task.TaskID, task.AgentType),
+			RespondingAgentID: PipelineWorkerRoutingTarget(task.TaskID, task.AgentType),
 			Event: &guide.StreamEvent{
 				Type: guide.StreamEventProgress,
 				Data: &guide.ProgressData{},
@@ -591,7 +591,7 @@ func TestTaskRouter_DeliverResponse_MirrorStreamAddsTaskMetadataWhenMissing(t *t
 		CorrelationID:     corrID,
 		Success:           true,
 		Data:              "task output",
-		RespondingAgentID: PipelineWorkerAgentID(task.TaskID, task.AgentType),
+		RespondingAgentID: PipelineWorkerRoutingTarget(task.TaskID, task.AgentType),
 	}
 	respMsg := guide.NewResponseMessage("", resp)
 	respMsg.CorrelationID = corrID
@@ -646,7 +646,7 @@ func TestTaskRouter_DeliverResponse_MirrorsUntrackedProtocolStreamAndRecordsActi
 		Type:          guide.MessageTypeStream,
 		Payload: &guide.StreamResponse{
 			CorrelationID:     "pipe_protocol_1",
-			RespondingAgentID: PipelineWorkerAgentID("task-1", agentshared.PipelineAgentTester),
+			RespondingAgentID: PipelineWorkerRoutingTarget("task-1", agentshared.PipelineAgentTester),
 			TargetAgentID:     "orchestrator",
 			Metadata: map[string]any{
 				"pipeline_task": true,
@@ -662,7 +662,7 @@ func TestTaskRouter_DeliverResponse_MirrorsUntrackedProtocolStreamAndRecordsActi
 				Data: &guide.ProgressData{Message: "Running tests"},
 			},
 		},
-		SourceAgentID: PipelineWorkerAgentID("task-1", agentshared.PipelineAgentTester),
+		SourceAgentID: PipelineWorkerRoutingTarget("task-1", agentshared.PipelineAgentTester),
 		TargetAgentID: "orchestrator",
 		Timestamp:     time.Now(),
 	}
@@ -976,7 +976,7 @@ func TestTaskRouter_DeliverResponse_ConsumesUntrackedProtocolTerminal(t *testing
 	resp := &guide.RouteResponse{
 		CorrelationID:     "pipe_protocol_2",
 		Success:           true,
-		RespondingAgentID: PipelineWorkerAgentID("task-1", agentshared.PipelineAgentTester),
+		RespondingAgentID: PipelineWorkerRoutingTarget("task-1", agentshared.PipelineAgentTester),
 		Data: &agentshared.PipelineTurnResponse{
 			Action: &agentshared.PipelineTurnAction{
 				Type:         agentshared.PipelineProtocolActionValidate,
@@ -1012,7 +1012,7 @@ func TestTaskRouter_DeliverResponse_ReconcilesUntrackedProtocolTerminalOT(t *tes
 	resp := &guide.RouteResponse{
 		CorrelationID:     "pipe_protocol_ot",
 		Success:           true,
-		RespondingAgentID: PipelineWorkerAgentID("task-1", agentshared.PipelineAgentInspector),
+		RespondingAgentID: PipelineWorkerRoutingTarget("task-1", agentshared.PipelineAgentInspector),
 		Data: &agentshared.PipelineTurnResponse{
 			Action: &agentshared.PipelineTurnAction{
 				Type:         agentshared.PipelineProtocolActionOT,

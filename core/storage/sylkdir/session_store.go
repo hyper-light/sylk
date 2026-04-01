@@ -37,7 +37,7 @@ type SessionMeta struct {
 
 // BaseSnapshot captures global state at session start.
 type BaseSnapshot struct {
-	GlobalVersion     SemanticVersion `json:"global_version"`     // Global KG version at session start
+	GlobalVersion     SemanticVersion `json:"global_version"` // Global KG version at session start
 	CommittedSessions []uint32        `json:"committed_sessions"`
 	SnapshotAt        time.Time       `json:"snapshot_at"`
 	NextNodeID        uint32          `json:"next_node_id"`
@@ -613,20 +613,20 @@ func (s *SessionStore) buildCheckpointController(delta *DeltaTracker, wal *Sessi
 
 // Session represents an active session.
 type Session struct {
-	store        *SessionStore
-	path         string
-	Meta         *SessionMeta
-	BaseSnapshot *BaseSnapshot
-	Manifest     *VersionManifest
-	BleveStore     *VersionBleveStore     // Per-version Bleve store (nil until opened)
-	WAL            *SessionWAL            // Session WAL (nil for global/committed sessions)
-	DeltaTracker   *DeltaTracker          // Mutation delta tracker (nil for committed sessions)
-	CheckpointCtrl *CheckpointController  // Adaptive checkpoint controller (nil for committed sessions)
-	NodeDataFile   *SharedDataFile        // Shared node data file (nil for committed sessions)
-	VectorDataFile *SharedDataFile        // Shared vector data file (nil for committed sessions)
-	DocDataFile    *SharedDataFile        // Shared doc data file (nil for committed sessions)
-	ChunkDataFile  *SharedDataFile        // Shared chunk ref data file (nil for committed sessions)
-	DocIDMap       *DocIDMap              // String→uint32 doc ID mapping (nil for committed sessions)
+	store          *SessionStore
+	path           string
+	Meta           *SessionMeta
+	BaseSnapshot   *BaseSnapshot
+	Manifest       *VersionManifest
+	BleveStore     *VersionBleveStore    // Per-version Bleve store (nil until opened)
+	WAL            *SessionWAL           // Session WAL (nil for global/committed sessions)
+	DeltaTracker   *DeltaTracker         // Mutation delta tracker (nil for committed sessions)
+	CheckpointCtrl *CheckpointController // Adaptive checkpoint controller (nil for committed sessions)
+	NodeDataFile   *SharedDataFile       // Shared node data file (nil for committed sessions)
+	VectorDataFile *SharedDataFile       // Shared vector data file (nil for committed sessions)
+	DocDataFile    *SharedDataFile       // Shared doc data file (nil for committed sessions)
+	ChunkDataFile  *SharedDataFile       // Shared chunk ref data file (nil for committed sessions)
+	DocIDMap       *DocIDMap             // String→uint32 doc ID mapping (nil for committed sessions)
 
 	// Shared node ID counter for ingestion. Initialized from BaseSnapshot.NextNodeID.
 	nextNodeID uint32
@@ -674,6 +674,19 @@ func (sess *Session) RegisterChunkRefStore(s *ChunkRefStore) {
 func (sess *Session) InsertDocument(ctx context.Context, req *JointDocRequest, e embedder.Embedder) (*JointDocResult, error) {
 	jdi := NewJointDocIngestion(sess, sess.nextAllocID(), e)
 	return jdi.Insert(ctx, req)
+}
+
+// UpdateDocument supersedes an existing document identified by canonicalKey
+// and inserts the replacement content into the current session.
+func (sess *Session) UpdateDocument(ctx context.Context, canonicalKey string, req *JointDocRequest, e embedder.Embedder) (*JointDocResult, error) {
+	jdi := NewJointDocIngestion(sess, sess.nextAllocID(), e)
+	return jdi.Update(ctx, canonicalKey, req)
+}
+
+// DeleteDocument tombstones an existing document identified by canonicalKey.
+func (sess *Session) DeleteDocument(ctx context.Context, canonicalKey string) error {
+	jdi := NewJointDocIngestion(sess, sess.nextAllocID(), nil)
+	return jdi.Delete(ctx, canonicalKey)
 }
 
 // nextAllocID returns a pointer to the session's shared node ID counter.
@@ -1121,10 +1134,10 @@ func (sess *Session) RebuildBleve() error {
 
 // SessionStoreStats contains statistics about session storage.
 type SessionStoreStats struct {
-	TotalSessions    int
-	ActiveSessions   int
+	TotalSessions     int
+	ActiveSessions    int
 	CommittedSessions int
-	TotalVersions    int
+	TotalVersions     int
 }
 
 // Stats returns statistics about the session store.

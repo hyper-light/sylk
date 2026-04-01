@@ -10,6 +10,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/commandapproval"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/fetch"
 	"github.com/adalundhe/sylk/core/providers"
 	uimsg "github.com/adalundhe/sylk/ui/msg"
@@ -1035,10 +1036,11 @@ func TestParseStreamMessages_PreferMetadataAgentName(t *testing.T) {
 		CorrelationID:     "corr-pipeline-agent-name",
 		RespondingAgentID: "8a7d3b2c",
 		Metadata: map[string]any{
-			"agent_name":  "Pipeline Inspector",
-			"agent_type":  "inspector-pipeline",
-			"pipeline_id": "task_auth_checkout",
-			"task_id":     "task_auth_checkout",
+			"agent_name":                 "Pipeline Inspector",
+			"agent_type":                 "inspector-pipeline",
+			"pipeline_id":                "task_auth_checkout",
+			"task_id":                    "task_auth_checkout",
+			"chat_parent_correlation_id": "corr-parent-top-level",
 		},
 		Event: &guide.StreamEvent{
 			Type: guide.StreamEventProgress,
@@ -1053,6 +1055,18 @@ func TestParseStreamMessages_PreferMetadataAgentName(t *testing.T) {
 	if start.AgentType != "inspector-pipeline" {
 		t.Fatalf("start.AgentType = %q, want inspector-pipeline", start.AgentType)
 	}
+	if start.RuntimeAgentID != "8a7d3b2c" {
+		t.Fatalf("start.RuntimeAgentID = %q, want 8a7d3b2c", start.RuntimeAgentID)
+	}
+	if start.ParentCorrelationID != "corr-parent-top-level" {
+		t.Fatalf("start.ParentCorrelationID = %q, want corr-parent-top-level", start.ParentCorrelationID)
+	}
+	if start.Visibility != events.VisibilityUser {
+		t.Fatalf("start.Visibility = %v, want %v", start.Visibility, events.VisibilityUser)
+	}
+	if start.BranchRef != nil {
+		t.Fatalf("start.BranchRef = %+v, want nil for top-level transfer metadata", start.BranchRef)
+	}
 
 	progress := toStreamProgressMsg("session-1", "corr-pipeline-agent-name", stream)
 	if progress.AgentName != "Pipeline Inspector" {
@@ -1061,6 +1075,41 @@ func TestParseStreamMessages_PreferMetadataAgentName(t *testing.T) {
 	if progress.AgentType != "inspector-pipeline" {
 		t.Fatalf("progress.AgentType = %q, want inspector-pipeline", progress.AgentType)
 	}
+	if progress.RuntimeAgentID != "8a7d3b2c" {
+		t.Fatalf("progress.RuntimeAgentID = %q, want 8a7d3b2c", progress.RuntimeAgentID)
+	}
+	if progress.ParentCorrelationID != "corr-parent-top-level" {
+		t.Fatalf("progress.ParentCorrelationID = %q, want corr-parent-top-level", progress.ParentCorrelationID)
+	}
+	if progress.BranchRef != nil {
+		t.Fatalf("progress.BranchRef = %+v, want nil for top-level transfer metadata", progress.BranchRef)
+	}
+
+	tool := parseToolCallEventMsg("session-1", "corr-pipeline-agent-name", &guide.StreamResponse{
+		CorrelationID:     "corr-pipeline-agent-name",
+		RespondingAgentID: "8a7d3b2c",
+		Metadata: map[string]any{
+			"agent_name":                 "Pipeline Inspector",
+			"agent_type":                 "inspector-pipeline",
+			"pipeline_id":                "task_auth_checkout",
+			"task_id":                    "task_auth_checkout",
+			"chat_parent_correlation_id": "corr-parent-top-level",
+		},
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventToolCall,
+			Data: map[string]any{
+				"phase":         0,
+				"tool_name":     "coord_publish_artifact",
+				"tool_call_key": "tool-1",
+			},
+		},
+	})
+	if tool.ParentCorrelationID != "corr-parent-top-level" {
+		t.Fatalf("tool.ParentCorrelationID = %q, want corr-parent-top-level", tool.ParentCorrelationID)
+	}
+	if tool.BranchRef != nil {
+		t.Fatalf("tool.BranchRef = %+v, want nil for top-level transfer metadata", tool.BranchRef)
+	}
 
 	complete := parseStreamCompleteMsg("session-1", "corr-pipeline-agent-name", stream)
 	if complete.AgentName != "Pipeline Inspector" {
@@ -1068,6 +1117,47 @@ func TestParseStreamMessages_PreferMetadataAgentName(t *testing.T) {
 	}
 	if complete.AgentType != "inspector-pipeline" {
 		t.Fatalf("complete.AgentType = %q, want inspector-pipeline", complete.AgentType)
+	}
+	if complete.RuntimeAgentID != "8a7d3b2c" {
+		t.Fatalf("complete.RuntimeAgentID = %q, want 8a7d3b2c", complete.RuntimeAgentID)
+	}
+	if complete.ParentCorrelationID != "corr-parent-top-level" {
+		t.Fatalf("complete.ParentCorrelationID = %q, want corr-parent-top-level", complete.ParentCorrelationID)
+	}
+	if complete.Visibility != events.VisibilityUser {
+		t.Fatalf("complete.Visibility = %v, want %v", complete.Visibility, events.VisibilityUser)
+	}
+	if complete.BranchRef != nil {
+		t.Fatalf("complete.BranchRef = %+v, want nil for top-level transfer metadata", complete.BranchRef)
+	}
+}
+
+func TestParseStreamLifecyclePreservesSystemVisibility(t *testing.T) {
+	stream := &guide.StreamResponse{
+		CorrelationID:     "corr-system-store",
+		RespondingAgentID: "archivalist",
+		Metadata: map[string]any{
+			"agent_name": "Archivalist",
+			"agent_type": "archivalist",
+		},
+		Event: &guide.StreamEvent{
+			Type:       guide.StreamEventStart,
+			Visibility: events.VisibilitySystem,
+		},
+	}
+
+	start := parseStreamStartMsg("session-1", "corr-system-store", stream)
+	if start.Visibility != events.VisibilitySystem {
+		t.Fatalf("start.Visibility = %v, want %v", start.Visibility, events.VisibilitySystem)
+	}
+
+	stream.Event = &guide.StreamEvent{
+		Type:       guide.StreamEventComplete,
+		Visibility: events.VisibilitySystem,
+	}
+	complete := parseStreamCompleteMsg("session-1", "corr-system-store", stream)
+	if complete.Visibility != events.VisibilitySystem {
+		t.Fatalf("complete.Visibility = %v, want %v", complete.Visibility, events.VisibilitySystem)
 	}
 }
 

@@ -2,12 +2,43 @@ package archivalist
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 )
+
+type captureArchivalistActivityPublisher struct {
+	mu     sync.Mutex
+	events []*events.ActivityEvent
+}
+
+func (p *captureArchivalistActivityPublisher) PublishActivity(event *events.ActivityEvent) {
+	if event == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	clone := *event
+	if event.Data != nil {
+		clone.Data = make(map[string]any, len(event.Data))
+		for key, value := range event.Data {
+			clone.Data[key] = value
+		}
+	}
+	p.events = append(p.events, &clone)
+}
+
+func (p *captureArchivalistActivityPublisher) snapshot() []*events.ActivityEvent {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]*events.ActivityEvent, len(p.events))
+	copy(out, p.events)
+	return out
+}
 
 func TestProcessForwardedRequest_StoreBypassesLLMAndUsesStructuredContent(t *testing.T) {
 	a := newTestArchivalist(t)
@@ -40,12 +71,14 @@ func TestProcessForwardedRequest_StoreBypassesLLMAndUsesStructuredContent(t *tes
 
 func TestHandleBusRequest_NestedFireAndForgetStorePublishesStreamLifecycle(t *testing.T) {
 	a := newTestArchivalist(t)
+	pub := &captureArchivalistActivityPublisher{}
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	t.Cleanup(func() { _ = bus.Close() })
 	a.bus = bus
 	a.channels = guide.NewAgentChannels("archivalist", a.id)
 	a.runCtx = context.Background()
 	a.running = true
+	a.activityPub = pub
 
 	streamCh := make(chan *guide.StreamResponse, 4)
 	responseCh := make(chan *guide.RouteResponse, 1)
@@ -112,6 +145,9 @@ func TestHandleBusRequest_NestedFireAndForgetStorePublishesStreamLifecycle(t *te
 			if got, _ := stream.Metadata["chat_inter_agent_kind"].(string); got != "store" {
 				t.Fatalf("chat_inter_agent_kind = %q, want store", got)
 			}
+			if stream.Event.Visibility != events.VisibilitySystem {
+				t.Fatalf("stream visibility = %v, want %v", stream.Event.Visibility, events.VisibilitySystem)
+			}
 			switch stream.Event.Type {
 			case guide.StreamEventStart:
 				sawStart = true
@@ -120,6 +156,15 @@ func TestHandleBusRequest_NestedFireAndForgetStorePublishesStreamLifecycle(t *te
 			}
 		case <-deadline:
 			t.Fatalf("timed out waiting for nested fire-and-forget stream lifecycle (start=%v complete=%v)", sawStart, sawComplete)
+		}
+	}
+
+	for _, event := range pub.snapshot() {
+		if event == nil || event.CorrelationID != "corr-nested-store" {
+			continue
+		}
+		if event.Visibility != events.VisibilitySystem {
+			t.Fatalf("activity visibility = %v, want %v for nested store", event.Visibility, events.VisibilitySystem)
 		}
 	}
 }

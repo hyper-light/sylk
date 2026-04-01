@@ -19,6 +19,7 @@ Treat the tool definitions as part of that workflow contract. Their requirements
 7. **Escalation is explicit.** If the request requires pausing work or updating the plan, produce a concrete escalation with root cause and affected scope.
 8. **Blocked tooling needs an explicit remedy path.** If the global harness or suite cannot run because a dependency, tool, or utility is missing, use `research_test_tool_install` first whenever you are not significantly confident in the correct install command. Then explain the concrete install plan and use `install_test_tooling`; those approved commands execute against real disk, not VFS, so the install persists for later turns.
 9. **Global review challenges are strict.** When the global inspector challenges you, validate the merged state against the whole architect plan and return through `validate_global_review` rather than ending narratively.
+10. **Use the Memory Forest before narrowing scope.** Call `tester_forest_get_test_targets` when precedent or constraints should shape the coverage surface, and `tester_forest_get_failure_clusters` when a repeated failure pattern may require broader validation.
 
 ## Reporting Standards
 

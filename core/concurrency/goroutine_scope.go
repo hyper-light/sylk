@@ -76,9 +76,10 @@ func NewGoroutineScope(parentCtx context.Context, agentID string, budget *Gorout
 
 func (s *GoroutineScope) Go(description string, timeout time.Duration, fn WorkFunc) error {
 	timeout = s.normalizeTimeout(timeout)
+	budget := s.currentBudget()
 
-	if s.budget != nil {
-		if err := s.budget.Acquire(s.agentID); err != nil {
+	if budget != nil {
+		if err := budget.Acquire(s.agentID); err != nil {
 			return err
 		}
 	}
@@ -89,8 +90,8 @@ func (s *GoroutineScope) Go(description string, timeout time.Duration, fn WorkFu
 	// between wg.Add(1) and wg.Wait() during shutdown.
 	if err := s.checkAndRegister(w); err != nil {
 		w.cancel()
-		if s.budget != nil {
-			s.budget.Release(s.agentID)
+		if budget != nil {
+			budget.Release(s.agentID)
 		}
 		return err
 	}
@@ -98,6 +99,12 @@ func (s *GoroutineScope) Go(description string, timeout time.Duration, fn WorkFu
 	s.emitWorkerStarted(w)
 	go s.runWorker(w, fn)
 	return nil
+}
+
+func (s *GoroutineScope) currentBudget() *GoroutineBudget {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.budget
 }
 
 // emitWorkerStarted emits a health event when a worker starts.
@@ -186,8 +193,8 @@ func (s *GoroutineScope) cleanupWorker(w *worker) {
 	s.mu.Unlock()
 
 	s.emitWorkerStopped(w, count, monitor)
-	if s.budget != nil {
-		s.budget.Release(s.agentID)
+	if budget := s.currentBudget(); budget != nil {
+		budget.Release(s.agentID)
 	}
 	s.wg.Done()
 }
@@ -333,6 +340,12 @@ func (s *GoroutineScope) SetMaxLifetime(d time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maxLifetime = d
+}
+
+func (s *GoroutineScope) SetBudget(budget *GoroutineBudget) {
+	s.mu.Lock()
+	s.budget = budget
+	s.mu.Unlock()
 }
 
 // SetHealthMonitor sets an optional health monitor for observability.

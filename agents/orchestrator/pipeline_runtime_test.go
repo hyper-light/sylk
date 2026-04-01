@@ -18,9 +18,10 @@ func TestRouteProtocolPipelineTask_SeedsInspectorAndPublishesRunningUpdate(t *te
 	task := testTask()
 	task.TargetAgentID = pipelineWorkerTargetAgentID(task.TaskID, task.AgentType)
 	task.Context = map[string]any{
-		"task_slug": "hello-cli",
-		"task_name": "Hello CLI",
-		"co_agents": []any{"designer"},
+		"task_slug":   "hello-cli",
+		"task_name":   "Hello CLI",
+		"co_agents":   []any{"designer"},
+		"session_dir": "/tmp/session-protocol",
 	}
 
 	reqCh := make(chan *guide.RouteRequest, 1)
@@ -75,6 +76,12 @@ func TestRouteProtocolPipelineTask_SeedsInspectorAndPublishesRunningUpdate(t *te
 	}
 	if req.Metadata["pipeline_task"] != true {
 		t.Fatalf("pipeline_task metadata = %#v, want true", req.Metadata["pipeline_task"])
+	}
+	if req.Metadata["session_id"] != task.SessionID {
+		t.Fatalf("session_id metadata = %#v, want %q", req.Metadata["session_id"], task.SessionID)
+	}
+	if req.Metadata["session_dir"] != "/tmp/session-protocol" {
+		t.Fatalf("session_dir metadata = %#v, want /tmp/session-protocol", req.Metadata["session_dir"])
 	}
 	if req.TargetAgentID != pipelineWorkerTargetAgentID(task.TaskID, agentshared.PipelineAgentInspector) {
 		t.Fatalf("target_agent_id = %q", req.TargetAgentID)

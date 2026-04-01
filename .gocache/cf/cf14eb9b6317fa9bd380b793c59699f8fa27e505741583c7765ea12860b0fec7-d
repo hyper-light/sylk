@@ -1,0 +1,4 @@
+./agent_daemonsets.go
+./controller.go
+./reconciler.go
+./spec.go

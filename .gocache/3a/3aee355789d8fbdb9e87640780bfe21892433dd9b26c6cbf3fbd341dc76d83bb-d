@@ -1,0 +1,5 @@
+./compile.go
+./dfa.go
+./inst.go
+./regexp.go
+./sparse.go

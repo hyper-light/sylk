@@ -49,6 +49,7 @@ func (p *scriptedPipelineProvider) Complete(_ context.Context, req *providers.Re
 }
 
 func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToOT(t *testing.T) {
+	sessionDir := t.TempDir()
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
@@ -125,6 +126,7 @@ func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToOT(t *testing.T) {
 		TargetAgentID: "inspector-pipeline",
 		Prompt:        "Audit the completed task.",
 		Context: map[string]any{
+			"session_dir":    sessionDir,
 			"pipeline_stage": "execute",
 			"pipeline_protocol": agentShared.PipelineProtocolSnapshotMap(&agentShared.PipelineProtocolSnapshot{
 				PendingValidation: &agentShared.PipelineValidationRecord{
@@ -177,6 +179,7 @@ func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToOT(t *testing.T) {
 }
 
 func TestHandle_PromptsImmediateHandoffToOTAfterFinalizePipelineReady(t *testing.T) {
+	sessionDir := t.TempDir()
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
@@ -247,6 +250,7 @@ func TestHandle_PromptsImmediateHandoffToOTAfterFinalizePipelineReady(t *testing
 		TargetAgentID: "inspector-pipeline",
 		Prompt:        "Audit the completed task.",
 		Context: map[string]any{
+			"session_dir":    sessionDir,
 			"pipeline_stage": "execute",
 			"pipeline_protocol": agentShared.PipelineProtocolSnapshotMap(&agentShared.PipelineProtocolSnapshot{
 				PendingValidation: &agentShared.PipelineValidationRecord{

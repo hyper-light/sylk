@@ -20,9 +20,9 @@ type JointDocIngestion struct {
 	docStore      *VersionDocStore
 	vectorStore   *VersionVectorStore
 	chunkRefStore *ChunkRefStore
-	embedder   embedder.Embedder
-	chunker    *UniversalChunker
-	nextNodeID *uint32 // shared counter (may be shared with SessionIngestion)
+	embedder      embedder.Embedder
+	chunker       *UniversalChunker
+	nextNodeID    *uint32 // shared counter (may be shared with SessionIngestion)
 }
 
 // JointDocRequest describes a document to ingest jointly.
@@ -458,8 +458,14 @@ func (j *JointDocIngestion) evalCheckpoint() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-func docCanonicalKey(dt search.DocumentType, path string) string {
+// DocumentCanonicalKey is the stable canonical key for a jointly-ingested
+// document parent node.
+func DocumentCanonicalKey(dt search.DocumentType, path string) string {
 	return fmt.Sprintf("doc:%s:%s", dt, path)
+}
+
+func docCanonicalKey(dt search.DocumentType, path string) string {
+	return DocumentCanonicalKey(dt, path)
 }
 
 func extractNodeIDs(nodes []*Node) []uint32 {

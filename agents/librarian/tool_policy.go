@@ -1,12 +1,13 @@
 package librarian
 
 import (
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 func librarianVisibleSkillNames() []string {
-	return []string{
+	return shared.AppendMemoryForestVisibleSkillNames([]string{
 		"search_codebase",
 		"find_pattern",
 		"consult",
@@ -15,15 +16,15 @@ func librarianVisibleSkillNames() []string {
 		"glob",
 		"grep",
 		"knowledge_search",
-	}
+	}, "librarian")
 }
 
 func librarianMutatingSkillNames() []string {
-	return []string{
+	return shared.AppendMemoryForestMutatingSkillNames([]string{
 		"clone_repository",
 		"remove_package",
 		"reroute_request",
-	}
+	})
 }
 
 func librarianToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {
@@ -31,20 +32,7 @@ func librarianToolManifest(registry *skills.Registry) *toolruntime.PolicyManifes
 		AgentID:          "librarian",
 		CapabilityScope:  "librarian.default",
 		Registry:         registry,
-		VisibleByDefault: registeredLibrarianSkillNames(registry, librarianVisibleSkillNames()),
-		Mutating:         registeredLibrarianSkillNames(registry, librarianMutatingSkillNames()),
+		VisibleByDefault: shared.FilterRegisteredSkillNames(registry, librarianVisibleSkillNames()),
+		Mutating:         shared.FilterRegisteredSkillNames(registry, librarianMutatingSkillNames()),
 	})
-}
-
-func registeredLibrarianSkillNames(registry *skills.Registry, names []string) []string {
-	if registry == nil || len(names) == 0 {
-		return nil
-	}
-	filtered := make([]string, 0, len(names))
-	for _, name := range names {
-		if registry.Get(name) != nil {
-			filtered = append(filtered, name)
-		}
-	}
-	return filtered
 }

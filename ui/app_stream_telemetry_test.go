@@ -20,6 +20,8 @@ func newStreamTelemetryModel() *AppModel {
 	return &AppModel{
 		agentContextTokens:      make(map[string]int),
 		agentContextModels:      make(map[string]string),
+		agentRuntimeContexts:    make(map[string]runtimeContextState),
+		agentReplicaCounts:      make(map[string]int),
 		streamUsage:             make(map[string]streamUsageEntry),
 		streamedResponses:       make(map[string]streamedResponseState),
 		activeStreams:           make(map[string]*activeStreamEntry),
@@ -54,6 +56,199 @@ func TestStreamTelemetry_FinalizeUpdatesAgentContext(t *testing.T) {
 	}
 	if m.agentContextTokens["architect"] <= 0 {
 		t.Fatalf("expected architect context tokens > 0, got %d", m.agentContextTokens["architect"])
+	}
+}
+
+func TestStreamTelemetry_AggregatesKnowledgeReplicaContextAcrossLiveReplicas(t *testing.T) {
+	m := newStreamTelemetryModel()
+	m.agentPanel.SeedAgent("academic", "academic", "Academic", nil, "", "")
+
+	_, _ = m.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_academic_replicas",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "academic",
+			Content:   "Serving parallel consults.",
+			Data: map[string]any{
+				"agent_type":      "academic",
+				"agent_name":      "Academic",
+				"active_replicas": 3,
+			},
+		},
+	})
+
+	first := msg.StreamStartMsg{
+		CorrelationID:  "corr-academic-1",
+		AgentID:        "academic",
+		RuntimeAgentID: "academic#replica-corr-1",
+		AgentType:      "academic",
+		AgentName:      "Academic",
+	}
+	second := msg.StreamStartMsg{
+		CorrelationID:  "corr-academic-2",
+		AgentID:        "academic",
+		RuntimeAgentID: "academic#replica-corr-2",
+		AgentType:      "academic",
+		AgentName:      "Academic",
+	}
+	m.trackStreamStart(first)
+	m.trackStreamStart(second)
+
+	model, _ := m.Update(msg.TokenUsageMsg{
+		CorrelationID:  "corr-academic-1",
+		AgentID:        "academic",
+		RuntimeAgentID: "academic#replica-corr-1",
+		AgentType:      "academic",
+		Model:          "gpt-5.4-pro",
+		InputTokens:    100000,
+	})
+	m = model.(*AppModel)
+	model, _ = m.Update(msg.TokenUsageMsg{
+		CorrelationID:  "corr-academic-2",
+		AgentID:        "academic",
+		RuntimeAgentID: "academic#replica-corr-2",
+		AgentType:      "academic",
+		Model:          "gpt-5.4-pro",
+		InputTokens:    150000,
+	})
+	m = model.(*AppModel)
+
+	if got := m.agentContextTokens["academic"]; got != 250000 {
+		t.Fatalf("agentContextTokens[academic] = %d, want 250000", got)
+	}
+	if got := m.agentPanel.ContextUsageOf("academic"); got < 0.30 || got > 0.31 {
+		t.Fatalf("panel context usage = %.4f, want about 0.3064", got)
+	}
+
+	m.finalizeStreamUsage("corr-academic-1", true, "")
+	if got := m.agentContextTokens["academic"]; got != 150000 {
+		t.Fatalf("agentContextTokens[academic] after first finalize = %d, want 150000", got)
+	}
+
+	_, _ = m.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_academic_replicas_down",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "academic",
+			Content:   "One consult completed.",
+			Data: map[string]any{
+				"agent_type":      "academic",
+				"agent_name":      "Academic",
+				"active_replicas": 2,
+			},
+		},
+	})
+	if got := m.agentPanel.ContextUsageOf("academic"); got < 0.27 || got > 0.28 {
+		t.Fatalf("panel context usage after spin-down = %.4f, want about 0.2757", got)
+	}
+}
+
+func TestStreamTelemetry_KnowledgeReplicaSpinUpEventRecomputesDisplayedUsage(t *testing.T) {
+	m := newStreamTelemetryModel()
+	m.agentPanel.SeedAgent("academic", "academic", "Academic", nil, "", "")
+
+	first := msg.StreamStartMsg{
+		CorrelationID:  "corr-academic-spin-up-1",
+		AgentID:        "academic",
+		RuntimeAgentID: "academic#replica-corr-spin-up-1",
+		AgentType:      "academic",
+		AgentName:      "Academic",
+	}
+	m.trackStreamStart(first)
+
+	model, _ := m.Update(msg.TokenUsageMsg{
+		CorrelationID:  "corr-academic-spin-up-1",
+		AgentID:        "academic",
+		RuntimeAgentID: "academic#replica-corr-spin-up-1",
+		AgentType:      "academic",
+		Model:          "gpt-5.4-pro",
+		InputTokens:    100000,
+	})
+	m = model.(*AppModel)
+
+	before := m.agentPanel.ContextUsageOf("academic")
+	if before < 0.36 || before > 0.38 {
+		t.Fatalf("panel context usage before spin-up = %.4f, want about 0.3676", before)
+	}
+
+	_, _ = m.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_academic_replicas_up",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "academic",
+			Content:   "Scaling consult replicas.",
+			Data: map[string]any{
+				"agent_type":      "academic",
+				"agent_name":      "Academic",
+				"active_replicas": 2,
+			},
+		},
+	})
+
+	after := m.agentPanel.ContextUsageOf("academic")
+	if after < 0.18 || after > 0.19 {
+		t.Fatalf("panel context usage after spin-up = %.4f, want about 0.1838", after)
+	}
+}
+
+func TestStreamTelemetry_PipelineRuntimeReplacementDoesNotDoubleCountContext(t *testing.T) {
+	m := newStreamTelemetryModel()
+	canonicalID := "task_auth_checkout:engineer"
+	m.agentPanel.SeedAgent(canonicalID, "engineer", "Engineer", nil, "", "")
+
+	first := msg.StreamStartMsg{
+		CorrelationID:  "corr-eng-1",
+		AgentID:        "runtime-engineer-1",
+		RuntimeAgentID: "runtime-engineer-1",
+		AgentType:      "engineer",
+		AgentName:      "Engineer",
+		PipelineID:     "task_auth_checkout",
+		TaskID:         "task_auth_checkout",
+	}
+	second := msg.StreamStartMsg{
+		CorrelationID:  "corr-eng-2",
+		AgentID:        "runtime-engineer-2",
+		RuntimeAgentID: "runtime-engineer-2",
+		AgentType:      "engineer",
+		AgentName:      "Engineer",
+		PipelineID:     "task_auth_checkout",
+		TaskID:         "task_auth_checkout",
+	}
+	m.trackStreamStart(first)
+
+	model, _ := m.Update(msg.TokenUsageMsg{
+		CorrelationID:  "corr-eng-1",
+		AgentID:        canonicalID,
+		RuntimeAgentID: "runtime-engineer-1",
+		AgentType:      "engineer",
+		PipelineID:     "task_auth_checkout",
+		TaskID:         "task_auth_checkout",
+		Model:          "gpt-5.4-pro",
+		InputTokens:    100000,
+	})
+	m = model.(*AppModel)
+
+	m.trackStreamStart(second)
+	model, _ = m.Update(msg.TokenUsageMsg{
+		CorrelationID:  "corr-eng-2",
+		AgentID:        canonicalID,
+		RuntimeAgentID: "runtime-engineer-2",
+		AgentType:      "engineer",
+		PipelineID:     "task_auth_checkout",
+		TaskID:         "task_auth_checkout",
+		Model:          "gpt-5.4-pro",
+		InputTokens:    120000,
+	})
+	m = model.(*AppModel)
+
+	if got := m.agentContextTokens[canonicalID]; got != 120000 {
+		t.Fatalf("agentContextTokens[%q] = %d, want 120000 after runtime replacement", canonicalID, got)
+	}
+	if got := m.agentPanel.ContextUsageOf(canonicalID); got < 0.44 || got > 0.45 {
+		t.Fatalf("panel context usage = %.4f, want about 0.4412", got)
 	}
 }
 
@@ -1475,6 +1670,334 @@ func TestPipelineHandoffDoesNotLeaveInspectorWaitingForChildWork(t *testing.T) {
 	}
 	if !strings.Contains(app.chat.View(), "coord_publish_artifact") {
 		t.Fatalf("expected tester coordination tool call to remain visible, got %q", app.chat.View())
+	}
+}
+
+func TestTopLevelTransferToolCallClearsStaleNestedTesterChildState(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	startedAt := time.Now().Add(-50 * time.Millisecond)
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target_agents":["tester-pipeline"],"request":"Run the pipeline audit."}`,
+		Phase:         0,
+		StartedAt:     startedAt,
+	})
+	app = model.(*AppModel)
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target_agents":["tester-pipeline"],"request":"Run the pipeline audit."}`,
+		Output:        `{"selected":true,"target_agents":["tester-pipeline"],"challenge_id":"pipeline-review-1"}`,
+		Phase:         1,
+		StartedAt:     startedAt,
+		Duration:      50 * time.Millisecond,
+		Success:       true,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-tester",
+		AgentID:       "runtime-tester",
+		AgentType:     "tester-pipeline",
+		AgentName:     "Tester",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+		Message:       "stale nested progress",
+		Visibility:    events.VisibilityUser,
+		BranchRef: &msg.InterAgentBranchRefMsg{
+			ParentCorrelationID: "corr-inspector",
+			ParentToolCallKey:   "challenge-1",
+			ThreadKey:           "pipeline:pipeline-review-1",
+			Kind:                "challenge",
+		},
+	})
+	app = model.(*AppModel)
+
+	inspectorEntry := findChatEntryByCorrelation(app.chat, "corr-inspector")
+	if inspectorEntry == nil || len(inspectorEntry.ToolCalls) != 1 || inspectorEntry.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected inspector challenge row before top-level transfer, got %+v", inspectorEntry)
+	}
+	if got := len(inspectorEntry.ToolCalls[0].InterAgent.Children); got != 1 {
+		t.Fatalf("expected stale nested tester child before transfer, got %d", got)
+	}
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-tester",
+		ParentCorrelationID: "corr-inspector",
+		AgentID:             "runtime-tester",
+		AgentType:           "tester-pipeline",
+		AgentName:           "Tester",
+		PipelineID:          "task_auth_checkout",
+		TaskID:              "task_auth_checkout",
+		TaskName:            "Auth Checkout",
+		TaskSlug:            "auth-checkout",
+		ToolCallKey:         "tool-1",
+		ToolName:            "coord_publish_artifact",
+		ArgsSummary:         "type=verification_result",
+		Phase:               0,
+		StartedAt:           time.Now(),
+	})
+	app = model.(*AppModel)
+
+	if _, ok := app.activeStreams["corr-tester"]; !ok {
+		t.Fatal("expected tester to register as a primary active stream after top-level transfer")
+	}
+	if _, ok := app.nestedStreams["corr-tester"]; ok {
+		t.Fatal("expected explicit top-level transfer to clear stale nested stream state")
+	}
+
+	testerEntry := findChatEntryByCorrelation(app.chat, "corr-tester")
+	if testerEntry == nil {
+		t.Fatal("expected tester to appear as a top-level chat entry")
+	}
+	if got := len(testerEntry.ToolCalls); got != 1 {
+		t.Fatalf("tester tool call count = %d, want 1", got)
+	}
+	if testerEntry.ToolCalls[0].InterAgent != nil {
+		t.Fatalf("coord_publish_artifact should stay a normal tool row, got %+v", testerEntry.ToolCalls[0].InterAgent)
+	}
+
+	inspectorEntry = findChatEntryByCorrelation(app.chat, "corr-inspector")
+	if inspectorEntry == nil || len(inspectorEntry.ToolCalls) != 1 || inspectorEntry.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected inspector challenge row after transfer, got %+v", inspectorEntry)
+	}
+	if got := len(inspectorEntry.ToolCalls[0].InterAgent.Children); got != 0 {
+		t.Fatalf("expected stale nested tester child to be removed after top-level transfer, got %d", got)
+	}
+	if view := app.chat.View(); strings.Contains(view, "stale nested progress") {
+		t.Fatalf("unexpected stale nested tester child render after top-level transfer: %q", view)
+	}
+}
+
+func TestTopLevelHandoffStart_ClearsDeferredThinkingWithoutExplicitReroute(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	startedAt := time.Now().Add(-50 * time.Millisecond)
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target_agents":["tester-pipeline"],"request":"Run the pipeline audit."}`,
+		Phase:         0,
+		StartedAt:     startedAt,
+	})
+	app = model.(*AppModel)
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target_agents":["tester-pipeline"],"request":"Run the pipeline audit."}`,
+		Output:        `{"selected":true,"target_agents":["tester-pipeline"],"challenge_id":"pipeline-review-1"}`,
+		Phase:         1,
+		StartedAt:     startedAt,
+		Duration:      50 * time.Millisecond,
+		Success:       true,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-tester",
+		ParentCorrelationID: "corr-inspector",
+		AgentID:             "runtime-tester",
+		AgentType:           "tester-pipeline",
+		AgentName:           "Tester",
+		PipelineID:          "task_auth_checkout",
+		TaskID:              "task_auth_checkout",
+		TaskName:            "Auth Checkout",
+		TaskSlug:            "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	inspectorEntry := findChatEntryByCorrelation(app.chat, "corr-inspector")
+	if inspectorEntry == nil {
+		t.Fatal("expected inspector entry to remain present")
+	}
+	if inspectorEntry.Streaming {
+		t.Fatalf("expected inspector entry to stop streaming after top-level handoff: %+v", inspectorEntry)
+	}
+	if strings.TrimSpace(inspectorEntry.ThinkingStatus) != "" {
+		t.Fatalf("expected inspector waiting status to clear after top-level handoff, got %q", inspectorEntry.ThinkingStatus)
+	}
+	if view := app.chat.View(); strings.Contains(view, "Waiting for child work to finish...") {
+		t.Fatalf("unexpected deferred child-work status after top-level handoff: %q", view)
+	}
+}
+
+func TestTopLevelHandoffProgressBootstrap_ClearsDeferredThinkingWithoutExplicitReroute(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	startedAt := time.Now().Add(-50 * time.Millisecond)
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target_agents":["tester-pipeline"],"request":"Run the pipeline audit."}`,
+		Phase:         0,
+		StartedAt:     startedAt,
+	})
+	app = model.(*AppModel)
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target_agents":["tester-pipeline"],"request":"Run the pipeline audit."}`,
+		Output:        `{"selected":true,"target_agents":["tester-pipeline"],"challenge_id":"pipeline-review-1"}`,
+		Phase:         1,
+		StartedAt:     startedAt,
+		Duration:      50 * time.Millisecond,
+		Success:       true,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamProgressMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-tester",
+		ParentCorrelationID: "corr-inspector",
+		AgentID:             "runtime-tester",
+		AgentType:           "tester-pipeline",
+		AgentName:           "Tester",
+		PipelineID:          "task_auth_checkout",
+		TaskID:              "task_auth_checkout",
+		TaskName:            "Auth Checkout",
+		TaskSlug:            "auth-checkout",
+		Message:             "Running the top-level validation pass.",
+		Visibility:          events.VisibilityUser,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		TaskName:      "Auth Checkout",
+		TaskSlug:      "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	if view := app.chat.View(); strings.Contains(view, "Waiting for child work to finish...") {
+		t.Fatalf("unexpected deferred child-work status after progress-bootstrap handoff: %q", view)
 	}
 }
 

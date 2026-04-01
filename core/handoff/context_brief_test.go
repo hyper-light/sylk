@@ -17,14 +17,14 @@ type stubBriefProvider struct {
 	err      error
 }
 
-func (s *stubBriefProvider) Name() string                                            { return "stub" }
-func (s *stubBriefProvider) SupportedModels() []providers.ModelInfo                  { return nil }
+func (s *stubBriefProvider) Name() string                           { return "stub" }
+func (s *stubBriefProvider) SupportedModels() []providers.ModelInfo { return nil }
 func (s *stubBriefProvider) Stream(_ context.Context, _ *providers.Request) (<-chan *providers.StreamChunk, error) {
 	return nil, nil
 }
 func (s *stubBriefProvider) CountTokens(_ []providers.Message) (int, error) { return 0, nil }
-func (s *stubBriefProvider) MaxContextTokens(_ string) int                 { return 200000 }
-func (s *stubBriefProvider) HealthCheck(_ context.Context) error           { return nil }
+func (s *stubBriefProvider) MaxContextTokens(_ string) int                  { return 200000 }
+func (s *stubBriefProvider) HealthCheck(_ context.Context) error            { return nil }
 func (s *stubBriefProvider) Complete(_ context.Context, _ *providers.Request) (*providers.Response, error) {
 	if s.err != nil {
 		return nil, s.err
@@ -138,6 +138,40 @@ func TestBriefGeneratorSetOnPreparedContext(t *testing.T) {
 	}
 	if decoded.TaskSummary != "test" {
 		t.Fatalf("unexpected decoded task_summary: %s", decoded.TaskSummary)
+	}
+}
+
+func TestBriefGeneratorRefresh(t *testing.T) {
+	source := &stubBriefSource{
+		brief: &ContextBrief{
+			TaskSummary:  "fresh handoff brief",
+			KeyDecisions: "preserve the live state",
+			ActiveState:  "working set warm",
+			NextSteps:    "continue the task",
+			Blockers:     "none",
+			GeneratedAt:  time.Now(),
+		},
+	}
+	bg := NewBriefGenerator(source)
+
+	brief, err := bg.Refresh(context.Background(), "engineer", 4321, 7)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if brief == nil {
+		t.Fatal("expected non-nil refreshed brief")
+	}
+	if source.calls != 1 {
+		t.Fatalf("source calls = %d, want 1", source.calls)
+	}
+	if brief.ContextSize != 4321 {
+		t.Fatalf("refreshed context_size = %d, want 4321", brief.ContextSize)
+	}
+	if brief.TurnNumber != 7 {
+		t.Fatalf("refreshed turn_number = %d, want 7", brief.TurnNumber)
+	}
+	if latest := bg.Latest(); latest == nil || latest.TaskSummary != "fresh handoff brief" {
+		t.Fatalf("latest brief = %#v, want refreshed brief", latest)
 	}
 }
 

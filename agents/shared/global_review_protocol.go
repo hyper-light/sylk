@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -119,6 +120,9 @@ type GlobalReviewTurnAction struct {
 
 type GlobalReviewState struct {
 	mu             sync.RWMutex
+	sessionDir     string
+	scopeID        string
+	store          *durableProtocolLog
 	snapshot       *GlobalReviewSnapshot
 	terminalAction *GlobalReviewTurnAction
 	processed      []GlobalReviewValidationProcessing
@@ -149,6 +153,18 @@ func WithGlobalReviewState(ctx context.Context, state *GlobalReviewState) contex
 }
 
 func WithGlobalReviewContext(ctx context.Context, metadata map[string]any) context.Context {
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	if sessionID := strings.TrimSpace(versioning.SessionIDFromContext(ctx)); sessionID != "" {
+		if _, ok := metadata["session_id"]; !ok {
+			metadata = cloneGlobalReviewMetadata(metadata)
+			if metadata == nil {
+				metadata = map[string]any{}
+			}
+			metadata["session_id"] = sessionID
+		}
+	}
 	if state := NewGlobalReviewStateFromMetadata(metadata); state != nil {
 		return WithGlobalReviewState(ctx, state)
 	}
@@ -175,7 +191,38 @@ func NewGlobalReviewStateFromMetadata(metadata map[string]any) *GlobalReviewStat
 		return nil
 	}
 	snapshot, _ := GlobalReviewSnapshotFromMetadata(metadata)
-	return NewGlobalReviewState(snapshot, metadata)
+	state := NewGlobalReviewState(snapshot, metadata)
+	scopeID := firstNonEmpty(strings.TrimSpace(snapshotReviewID(snapshot)), strings.TrimSpace(stringAny(metadata, "review_id")))
+	sessionDir := strings.TrimSpace(stringAny(metadata, "session_dir"))
+	sessionID := strings.TrimSpace(stringAny(metadata, "session_id"))
+	if sessionDir == "" && sessionID != "" {
+		sessionDir = filepath.Join(".sylk", "sessions", sessionID)
+	}
+	if scopeID == "" || sessionDir == "" {
+		return state
+	}
+	store, err := openDurableProtocolLog(sessionDir, globalReviewNamespace, scopeID)
+	if err != nil {
+		return state
+	}
+	state.sessionDir = sessionDir
+	state.scopeID = scopeID
+	state.store = store
+	if err := state.loadDurableProjection(); err != nil {
+		_ = state.store.Close()
+		state.store = nil
+		state.sessionDir = ""
+		state.scopeID = ""
+		return state
+	}
+	if err := state.syncMailboxes(); err != nil {
+		_ = state.store.Close()
+		state.store = nil
+		state.sessionDir = ""
+		state.scopeID = ""
+		return state
+	}
+	return state
 }
 
 func (s *GlobalReviewState) Snapshot() *GlobalReviewSnapshot {
@@ -216,6 +263,21 @@ func (s *GlobalReviewState) RequiredAction() (GlobalReviewActionType, string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.requiredAction, strings.TrimSpace(s.requiredReason)
+}
+
+func (s *GlobalReviewState) Close() error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	return s.store.Close()
+}
+
+func CloseGlobalReviewState(ctx context.Context) error {
+	state := GlobalReviewStateFromContext(ctx)
+	if state == nil {
+		return nil
+	}
+	return state.Close()
 }
 
 func (s *GlobalReviewState) BaseMetadata() map[string]any {
@@ -511,6 +573,9 @@ func issueGlobalReviewChallenge(
 	if err != nil {
 		return nil, err
 	}
+	if err := state.recordChallenge(ctx, action); err != nil {
+		return nil, err
+	}
 	if err := state.setTerminalAction(action); err != nil {
 		return nil, err
 	}
@@ -606,6 +671,9 @@ func globalReviewValidateSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skil
 			if err != nil {
 				return nil, err
 			}
+			if err := state.recordValidation(ctx, record); err != nil {
+				return nil, err
+			}
 			if err := state.setTerminalAction(&GlobalReviewTurnAction{
 				Type:        GlobalReviewActionValidate,
 				AgentType:   respondingAgent,
@@ -678,13 +746,16 @@ func globalReviewProcessValidationSkill(cfg GlobalReviewProtocolSkillConfig) *sk
 			if summary == "" {
 				return nil, fmt.Errorf("summary is required")
 			}
-			state.addProcessedValidation(GlobalReviewValidationProcessing{
+			entry := GlobalReviewValidationProcessing{
 				ChallengeID: challengeID,
 				AgentType:   GlobalReviewAgentInspector,
 				Decision:    decision,
 				Summary:     summary,
 				Validation:  cloneGlobalReviewValidationRecord(pending),
-			})
+			}
+			if err := state.recordValidationProcessing(ctx, entry); err != nil {
+				return nil, err
+			}
 			return map[string]any{
 				"processed":    true,
 				"challenge_id": challengeID,
@@ -728,7 +799,9 @@ func globalReviewFinalizeSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skil
 			snapshot := state.Snapshot()
 			evidenceRefs := normalizeStringList(params.EvidenceRefs)
 			if record, ok := finalizeGlobalReviewValidationReady(snapshot, state.ProcessedValidations()); ok {
-				state.requireTerminalAction(GlobalReviewActionCommit, "The tester-backed global review already passed; `commit_to_disk` is the only valid way to end this inspector turn.")
+				if err := state.recordReadyForCommit(ctx, summary, normalizeStringList(append(append([]string(nil), evidenceRefs...), record.EvidenceRefs...)), record); err != nil {
+					return nil, err
+				}
 				return map[string]any{
 					"finalize_global_review":    true,
 					"ready_for_commit":          true,
@@ -825,6 +898,14 @@ func globalReviewCommitToDiskSkill(cfg GlobalReviewProtocolSkillConfig) *skills.
 				Reason: summary,
 			})
 			if err != nil {
+				return nil, err
+			}
+			action := &GlobalReviewTurnAction{
+				Type:      GlobalReviewActionCommit,
+				AgentType: GlobalReviewAgentInspector,
+				Summary:   summary,
+			}
+			if err := state.recordCommitToDisk(ctx, action); err != nil {
 				return nil, err
 			}
 			if err := state.setTerminalAction(&GlobalReviewTurnAction{
@@ -961,7 +1042,40 @@ func dispatchGlobalReviewValidation(
 func buildGlobalReviewRouteMetadata(state *GlobalReviewState, snapshot *GlobalReviewSnapshot, targetAgent string) map[string]any {
 	metadata := GlobalReviewMetadata(state.BaseMetadata(), snapshot)
 	metadata["agent_type"] = strings.TrimSpace(targetAgent)
+	if obligations := globalReviewRouteObligations(state, snapshot, targetAgent); len(obligations) > 0 {
+		metadata["global_review_obligations"] = obligations
+	} else {
+		delete(metadata, "global_review_obligations")
+	}
 	return metadata
+}
+
+func globalReviewRouteObligations(state *GlobalReviewState, snapshot *GlobalReviewSnapshot, targetAgent string) []map[string]any {
+	targetAgent = normalizeGlobalReviewAgent(targetAgent)
+	if targetAgent == "" {
+		return nil
+	}
+	if state != nil {
+		if obligations := state.CurrentAgentObligations(targetAgent); len(obligations) > 0 {
+			return obligations
+		}
+	}
+	if snapshot == nil {
+		return nil
+	}
+	if challenge := snapshot.PendingChallenge; challenge != nil && normalizeGlobalReviewAgent(challenge.TargetAgent) == targetAgent {
+		return []map[string]any{{
+			"action":  "validate_global_review",
+			"summary": "Answer the active global-review challenge before ending the turn.",
+		}}
+	}
+	if validation := snapshot.PendingValidation; validation != nil && normalizeGlobalReviewAgent(validation.RequestingAgent) == targetAgent {
+		return []map[string]any{{
+			"action":  "process_global_validation",
+			"summary": "Process the pending validation response before selecting the next review step.",
+		}}
+	}
+	return nil
 }
 
 func buildGlobalReviewHandoffSnapshot(state *GlobalReviewState, action *GlobalReviewTurnAction) *GlobalReviewSnapshot {
@@ -1174,6 +1288,12 @@ func appendGlobalReviewContextLines(lines *[]string, metadata map[string]any) {
 	if planSnapshot := strings.TrimSpace(stringAny(metadata, "plan_snapshot")); planSnapshot != "" {
 		*lines = append(*lines, "Architect plan snapshot:", planSnapshot)
 	}
+	if obligations := summarizeGlobalReviewProtocolObligations(metadata["global_review_obligations"]); len(obligations) > 0 {
+		*lines = append(*lines, "Protocol obligations:")
+		for _, obligation := range obligations {
+			*lines = append(*lines, "- "+obligation)
+		}
+	}
 	if files := stringSliceAny(metadata, "affected_files"); len(files) > 0 {
 		*lines = append(*lines, "Affected files:")
 		for _, item := range files {
@@ -1213,6 +1333,44 @@ func globalReviewFinalizeRequiredOutput(finalWholePlanReview bool) string {
 		return "State whether the merged work satisfies the whole plan as completely and optimally as possible."
 	}
 	return "State whether the merged checkpoint satisfies the portion of the plan that should be true now and keeps the remaining plan on track."
+}
+
+func summarizeGlobalReviewProtocolObligations(raw any) []string {
+	var items []map[string]any
+	switch typed := raw.(type) {
+	case []map[string]any:
+		items = append(items, typed...)
+	case []any:
+		items = make([]map[string]any, 0, len(typed))
+		for _, entry := range typed {
+			if item, _ := entry.(map[string]any); item != nil {
+				items = append(items, item)
+			}
+		}
+	default:
+		return nil
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		action, _ := item["action"].(string)
+		summary, _ := item["summary"].(string)
+		action = strings.TrimSpace(action)
+		summary = strings.TrimSpace(summary)
+		switch {
+		case action == "" && summary == "":
+			continue
+		case action == "":
+			lines = append(lines, summary)
+		case summary == "":
+			lines = append(lines, action)
+		default:
+			lines = append(lines, action+": "+summary)
+		}
+	}
+	return lines
 }
 
 func intAny(metadata map[string]any, key string) int {

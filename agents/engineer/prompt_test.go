@@ -54,6 +54,8 @@ func TestDefaultEngineerSystemPrompt_UsesCurrentSkillNames(t *testing.T) {
 		"`discover_project_tools`",
 		"`discover_code_patterns`",
 		"`consult`",
+		"`engineer_forest_select_implementation_branch`",
+		"`engineer_forest_get_failure_precedents`",
 		"`audit`",
 		"`run_command`",
 		"`run_shell_script`",

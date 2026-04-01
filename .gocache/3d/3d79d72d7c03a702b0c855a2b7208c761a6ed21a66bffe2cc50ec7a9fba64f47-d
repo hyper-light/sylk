@@ -1,0 +1,7 @@
+./diagnosis.go
+./prompt.go
+./skills.go
+./types.go
+./workspace_skills.go
+./prompt_test.go
+./workspace_skills_test.go

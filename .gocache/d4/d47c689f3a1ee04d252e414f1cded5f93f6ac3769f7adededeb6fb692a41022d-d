@@ -1,0 +1,6 @@
+./filelist.go
+./find.go
+./mergepane.go
+./messages.go
+./model.go
+./toolbar.go

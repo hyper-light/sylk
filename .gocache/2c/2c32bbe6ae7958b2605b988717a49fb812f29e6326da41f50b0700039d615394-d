@@ -1,0 +1,3 @@
+./model.go
+./search_ignore.go
+./search_worker.go

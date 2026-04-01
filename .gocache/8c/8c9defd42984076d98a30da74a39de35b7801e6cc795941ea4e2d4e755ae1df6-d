@@ -1,0 +1,11 @@
+./document.go
+./field.go
+./field_boolean.go
+./field_composite.go
+./field_datetime.go
+./field_geopoint.go
+./field_geoshape.go
+./field_ip.go
+./field_numeric.go
+./field_synonym.go
+./field_text.go

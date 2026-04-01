@@ -1,0 +1,14 @@
+./app.go
+./app_bootstrap.go
+./app_editor_mouse.go
+./app_layout_render.go
+./app_lsp.go
+./app_modes_git.go
+./app_runtime.go
+./app_stream_telemetry.go
+./app_streams.go
+./app_submit_login.go
+./browser.go
+./config.go
+./mock.go
+./oauth_session_manager.go

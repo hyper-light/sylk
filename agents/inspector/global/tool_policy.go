@@ -1,12 +1,13 @@
 package global
 
 import (
+	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 func globalInspectorVisibleSkillNames() []string {
-	return []string{
+	return agentShared.AppendMemoryForestVisibleSkillNames([]string{
 		"run_linter",
 		"run_type_checker",
 		"run_security_scan",
@@ -41,11 +42,11 @@ func globalInspectorVisibleSkillNames() []string {
 		"escalate_findings",
 		"research_dependency_install",
 		"install_dependency_tooling",
-	}
+	}, "inspector")
 }
 
 func globalInspectorMutatingSkillNames() []string {
-	return []string{
+	return agentShared.AppendMemoryForestMutatingSkillNames([]string{
 		"run_command",
 		"run_shell_script",
 		"challenge_global_tester",
@@ -59,7 +60,7 @@ func globalInspectorMutatingSkillNames() []string {
 		"request_user_clarification",
 		"escalate_findings",
 		"reroute_request",
-	}
+	})
 }
 
 func globalInspectorToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {
@@ -67,7 +68,7 @@ func globalInspectorToolManifest(registry *skills.Registry) *toolruntime.PolicyM
 		AgentID:          "inspector",
 		CapabilityScope:  "inspector.global",
 		Registry:         registry,
-		VisibleByDefault: globalInspectorVisibleSkillNames(),
-		Mutating:         globalInspectorMutatingSkillNames(),
+		VisibleByDefault: agentShared.FilterRegisteredSkillNames(registry, globalInspectorVisibleSkillNames()),
+		Mutating:         agentShared.FilterRegisteredSkillNames(registry, globalInspectorMutatingSkillNames()),
 	})
 }

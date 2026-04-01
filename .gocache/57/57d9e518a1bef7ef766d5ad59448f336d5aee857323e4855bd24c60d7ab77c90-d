@@ -1,0 +1,11 @@
+./root.go
+./tui.go
+./tui_fetch_approval.go
+./tui_stdlog.go
+./root_test.go
+./tui_auth_resolution_test.go
+./tui_bootstrap_test.go
+./tui_fetch_approval_test.go
+./tui_model_swap_test.go
+./tui_pipeline_identity_test.go
+./tui_stdlog_test.go

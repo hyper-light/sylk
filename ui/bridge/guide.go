@@ -529,6 +529,11 @@ func parseStreamStartMsg(sessionID, correlationID string, stream *guide.StreamRe
 		return result
 	}
 	result.AgentID = strings.TrimSpace(stream.RespondingAgentID)
+	result.RuntimeAgentID = firstNonEmpty(
+		streamMetadataString(stream, "runtime_agent_id"),
+		strings.TrimSpace(stream.RespondingAgentID),
+	)
+	result.ParentCorrelationID = streamParentCorrelationID(stream)
 	result.AgentName = streamAgentName(stream)
 	result.AgentType = streamMetadataString(stream, "agent_type")
 	result.PipelineID = streamMetadataString(stream, "pipeline_id")
@@ -536,6 +541,9 @@ func parseStreamStartMsg(sessionID, correlationID string, stream *guide.StreamRe
 	result.TaskName = streamMetadataString(stream, "task_name")
 	result.TaskSlug = streamMetadataString(stream, "task_slug")
 	result.BranchRef = parseInterAgentBranchRef(stream)
+	if stream.Event != nil {
+		result.Visibility = stream.Event.Visibility
+	}
 	return result
 }
 
@@ -567,6 +575,7 @@ func parseToolCallEventMsg(sessionID, correlationID string, stream *guide.Stream
 		return result
 	}
 	result.AgentID = strings.TrimSpace(stream.RespondingAgentID)
+	result.ParentCorrelationID = streamParentCorrelationID(stream)
 	result.AgentName = streamAgentName(stream)
 	result.AgentType = streamMetadataString(stream, "agent_type")
 	result.PipelineID = streamMetadataString(stream, "pipeline_id")
@@ -694,20 +703,25 @@ func toStreamProgressMsg(sessionID, correlationID string, stream *guide.StreamRe
 	}
 	progress := parseProgressData(event)
 	m := msg.StreamProgressMsg{
-		SessionID:     sessionID,
-		CorrelationID: correlationID,
-		AgentID:       agentID,
-		AgentName:     agentName,
-		AgentType:     streamMetadataString(stream, "agent_type"),
-		PipelineID:    streamMetadataString(stream, "pipeline_id"),
-		TaskID:        streamMetadataString(stream, "task_id"),
-		TaskName:      streamMetadataString(stream, "task_name"),
-		TaskSlug:      streamMetadataString(stream, "task_slug"),
-		Current:       progress.Current,
-		Total:         progress.Total,
-		Message:       redact.Text(strings.TrimSpace(progress.Message)),
-		UIState:       events.NormalizeAgentUIState(progress.UIState),
-		BranchRef:     parseInterAgentBranchRef(stream),
+		SessionID:           sessionID,
+		CorrelationID:       correlationID,
+		ParentCorrelationID: streamParentCorrelationID(stream),
+		AgentID:             agentID,
+		RuntimeAgentID: firstNonEmpty(
+			streamMetadataString(stream, "runtime_agent_id"),
+			agentID,
+		),
+		AgentName:  agentName,
+		AgentType:  streamMetadataString(stream, "agent_type"),
+		PipelineID: streamMetadataString(stream, "pipeline_id"),
+		TaskID:     streamMetadataString(stream, "task_id"),
+		TaskName:   streamMetadataString(stream, "task_name"),
+		TaskSlug:   streamMetadataString(stream, "task_slug"),
+		Current:    progress.Current,
+		Total:      progress.Total,
+		Message:    redact.Text(strings.TrimSpace(progress.Message)),
+		UIState:    events.NormalizeAgentUIState(progress.UIState),
+		BranchRef:  parseInterAgentBranchRef(stream),
 	}
 	if event != nil {
 		m.Visibility = event.Visibility
@@ -724,6 +738,11 @@ func parseStreamCompleteMsg(sessionID, correlationID string, stream *guide.Strea
 		return result
 	}
 	result.AgentID = strings.TrimSpace(stream.RespondingAgentID)
+	result.RuntimeAgentID = firstNonEmpty(
+		streamMetadataString(stream, "runtime_agent_id"),
+		strings.TrimSpace(stream.RespondingAgentID),
+	)
+	result.ParentCorrelationID = streamParentCorrelationID(stream)
 	result.AgentName = streamAgentName(stream)
 	result.AgentType = streamMetadataString(stream, "agent_type")
 	result.PipelineID = streamMetadataString(stream, "pipeline_id")
@@ -733,6 +752,7 @@ func parseStreamCompleteMsg(sessionID, correlationID string, stream *guide.Strea
 	result.BranchRef = parseInterAgentBranchRef(stream)
 	if stream.Event != nil {
 		result.Result = stream.Event.Data
+		result.Visibility = stream.Event.Visibility
 	}
 	return result
 }
@@ -761,6 +781,10 @@ func streamAgentName(stream *guide.StreamResponse) string {
 		strings.TrimSpace(stream.RespondingAgentName),
 		streamMetadataString(stream, "agent_name"),
 	)
+}
+
+func streamParentCorrelationID(stream *guide.StreamResponse) string {
+	return streamMetadataString(stream, streamMetadataParentCorrelation)
 }
 
 func metadataString(metadata map[string]any, key string) string {

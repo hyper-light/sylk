@@ -151,3 +151,30 @@ func TestKnowledgeStore_CoordinatorSurvivesPromotion(t *testing.T) {
 		t.Error("coordinator instance changed after PromoteFull — expected same pointer")
 	}
 }
+
+func TestKnowledgeStore_RepeatedPromotionsAreIdempotent(t *testing.T) {
+	pub := &mockReadinessPublisher{}
+	ks := NewKnowledgeStore(pub, nil)
+	defer ks.Close()
+
+	ks.PromotePartial(nil, nil, nil)
+	ks.PromotePartial(nil, nil, nil)
+	ks.PromoteFull()
+	ks.PromotePartial(nil, nil, nil)
+	ks.PromoteFull()
+
+	if got := ks.Level(); got != ReadinessFull {
+		t.Fatalf("Level() = %d, want %d", got, ReadinessFull)
+	}
+
+	events := pub.collected()
+	if len(events) != 2 {
+		t.Fatalf("event count = %d, want 2", len(events))
+	}
+	if events[0].Level != ReadinessPartial {
+		t.Fatalf("first event level = %d, want %d", events[0].Level, ReadinessPartial)
+	}
+	if events[1].Level != ReadinessFull {
+		t.Fatalf("second event level = %d, want %d", events[1].Level, ReadinessFull)
+	}
+}

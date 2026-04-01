@@ -4,12 +4,13 @@ import (
 	"context"
 	"fmt"
 
+	contextskills "github.com/adalundhe/sylk/core/context/skills"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 func guideCoreSkillNames() []string {
-	return guideToolManifest().DefaultVisibleNames()
+	return filterSyntheticGuideRuntimeTools(guideToolManifest().DefaultVisibleNames())
 }
 
 func guideAllSkillNames() []string {
@@ -17,7 +18,11 @@ func guideAllSkillNames() []string {
 }
 
 func guideToolManifest() *toolruntime.PolicyManifest {
-	return toolruntime.ApplyAuthorityProfile("guide", toolruntime.NewManifest("guide", "guide.routing",
+	return guideToolManifestForRegistry(nil)
+}
+
+func guideToolManifestForRegistry(registry *skills.Registry) *toolruntime.PolicyManifest {
+	policies := []toolruntime.ToolPolicy{
 		toolruntime.NewToolPolicy("route", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("clarify", toolruntime.EffectReadOnly, toolruntime.DomainControl, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("guide_route", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
@@ -43,7 +48,31 @@ func guideToolManifest() *toolruntime.PolicyManifest {
 		toolruntime.NewToolPolicy("switch_session", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("create_session", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("close_session", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
-	))
+	}
+	for _, name := range contextskills.ForestSkillNamesForAgent("guide") {
+		if registry != nil && registry.Get(name) == nil {
+			continue
+		}
+		policies = append(policies, toolruntime.NewToolPolicy(
+			name,
+			toolruntime.EffectReadOnly,
+			toolruntime.DomainMemory,
+			toolruntime.ExecutionModeLocal,
+			toolruntime.WithVisibleByDefault(),
+		))
+	}
+	for _, name := range contextskills.ForestMutatingSkillNames() {
+		if registry != nil && registry.Get(name) == nil {
+			continue
+		}
+		policies = append(policies, toolruntime.NewToolPolicy(
+			name,
+			toolruntime.EffectMutating,
+			toolruntime.DomainMemory,
+			toolruntime.ExecutionModeLocalWorker,
+		))
+	}
+	return toolruntime.ApplyAuthorityProfile("guide", toolruntime.NewManifest("guide", "guide.routing", policies...))
 }
 
 func registerGuideSafetyHook(hooks *skills.HookRegistry, _ *skills.Registry, allowed []string) {
@@ -59,7 +88,18 @@ func registerGuideSafetyHook(hooks *skills.HookRegistry, _ *skills.Registry, all
 }
 
 func validateGuideSkillConfiguration(registry *skills.Registry) error {
-	return guideToolManifest().Validate(registry, false)
+	return guideToolManifestForRegistry(registry).Validate(registry, false)
+}
+
+func filterSyntheticGuideRuntimeTools(names []string) []string {
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		if name == toolruntime.SearchToolName {
+			continue
+		}
+		filtered = append(filtered, name)
+	}
+	return filtered
 }
 
 func guideAllowedToolSet(allowed []string) map[string]bool {

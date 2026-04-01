@@ -1,0 +1,14 @@
+./client.go
+./codec.go
+./document.go
+./download.go
+./encoding.go
+./installer.go
+./manager.go
+./manifest.go
+./protocol.go
+./provision.go
+./selector.go
+./servers.go
+./transport.go
+./types.go

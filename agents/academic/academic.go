@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,8 +22,12 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/fetch"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/knowledge"
+	knowledgequery "github.com/adalundhe/sylk/core/knowledge/query"
+	"github.com/adalundhe/sylk/core/knowledgeruntime"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -31,10 +36,12 @@ import (
 
 // Default configuration values.
 const (
-	DefaultModel          = "gpt-5.4-pro"
-	DefaultMaxToolRuns    = 32
-	DefaultReplicaCount   = 4
-	DefaultReplicaBacklog = 16
+	DefaultModel              = "gpt-5.4-pro"
+	DefaultMaxToolRuns        = 32
+	DefaultReplicaCount       = 4
+	DefaultReplicaBacklog     = 16
+	defaultResearchCacheLimit = 128
+	defaultSourceIndexLimit   = 2048
 )
 
 const academicChildProgressMessage = "Researching external sources and codebase fit."
@@ -45,6 +52,10 @@ var academicChildProgressKeepaliveInterval = 30 * time.Second
 // Satisfied by *providers.AnthropicProvider.
 type academicProvider interface {
 	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
+}
+
+type committedKnowledgeSearcher interface {
+	Search(ctx context.Context, req *search.SearchRequest) (*knowledgeruntime.CommittedSearchResult, error)
 }
 
 // Academic is the main agent for researching external knowledge and best practices.
@@ -100,11 +111,19 @@ type Academic struct {
 	researchCache map[string]*ResearchResult
 	sourceIndex   map[string]*Source
 
+	// Knowledge retrieval state.
+	knowledgeMu      sync.RWMutex
+	knowledgeStore   *knowledge.KnowledgeStore
+	knowledgeBackend committedKnowledgeSearcher
+	queryCoordinator *knowledgequery.HybridQueryCoordinator
+
 	// Outcome tracking for maturity-aware recommendations
 	outcomeHistory *OutcomeHistory
 
 	// External fetch pipeline — wired via SetFetchPipeline after construction.
 	fetchPipeline *fetch.Pipeline
+
+	forestTracker *shared.MemoryForestTracker
 
 	workspaceViews versioning.WorkspaceViewAccess
 
@@ -154,6 +173,8 @@ type Config struct {
 	// Research configuration
 	MaxSources                  int           // Max sources to consult per query (default: 10)
 	CacheExpiry                 time.Duration // How long to cache results (default: 30m)
+	ResearchCacheLimit          int           // Maximum retained research results (default: 128)
+	SourceIndexLimit            int           // Maximum retained source records (default: 2048)
 	LibrarianTimeout            time.Duration // Timeout for Librarian consultation (default: 30s)
 	RequireLibrarian            bool          // Require Librarian validation (default: true)
 	DisableSearchDiscipline     bool          // When true, allows Academic to answer without an observed native web search.
@@ -178,6 +199,9 @@ type Config struct {
 	// ContextQuota exposes aggregate runtime pressure so autoscaling can
 	// respect system headroom without user configuration.
 	ContextQuota *container.ResourceQuota
+
+	// Forest exposes role-shaped Memory Forest skills to the Academic.
+	Forest shared.MemoryForestService
 }
 
 // New creates a new Academic agent with the given LLM provider.
@@ -217,6 +241,7 @@ func New(cfg Config, provider academicProvider) (*Academic, error) {
 		sourceIndex:     make(map[string]*Source),
 		outcomeHistory:  NewOutcomeHistory(cfg.OutcomeHistoryLimit),
 		steering:        shared.NewSteeringManager(),
+		forestTracker:   shared.NewMemoryForestTracker(),
 		workspaceViews:  authority.RestrictWorkspaceViews("academic", cfg.WorkspaceViews),
 	}
 	a.requestPool = shared.NewAutoscalingRequestReplicaPool(shared.RequestReplicaPoolConfig{
@@ -233,6 +258,9 @@ func New(cfg Config, provider academicProvider) (*Academic, error) {
 	a.registerCoreSkills()
 	a.registerExtendedSkills()
 	a.registerFetchSkills()
+	if err := shared.RegisterMemoryForestSkills(a.skills, "academic", cfg.Forest, a.forestTracker); err != nil {
+		return nil, fmt.Errorf("register academic forest skills: %w", err)
+	}
 
 	skillsLoaderCfg := skills.DefaultLoaderConfig()
 	skillsLoaderCfg.CoreSkills = academicVisibleSkillNames()
@@ -273,6 +301,12 @@ func applyConfigDefaults(cfg Config) Config {
 	}
 	if cfg.CacheExpiry == 0 {
 		cfg.CacheExpiry = 30 * time.Minute
+	}
+	if cfg.ResearchCacheLimit <= 0 {
+		cfg.ResearchCacheLimit = defaultResearchCacheLimit
+	}
+	if cfg.SourceIndexLimit <= 0 {
+		cfg.SourceIndexLimit = defaultSourceIndexLimit
 	}
 	if cfg.LibrarianTimeout == 0 {
 		cfg.LibrarianTimeout = 30 * time.Second
@@ -578,7 +612,11 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	gov := shared.NewContextGovernor(a.config.Model, a.config.MaxOutputTokens, 0)
 	if a.handoffBridge != nil && shared.AutomaticHandoffEnabled(ctx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
-			return a.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+			bridge := shared.EffectiveHandoffBridge(bctx, a.handoffBridge)
+			if bridge == nil {
+				return shared.ErrContextBudgetExhausted
+			}
+			return bridge.ForceHandoff(bctx, "context budget exhausted")
 		}
 	}
 	ctx = shared.WithContextGovernor(ctx, gov)
@@ -640,6 +678,21 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 			return a.bus.Publish(a.channels.Responses, guide.NewResponseMessage(generateMessageID(), resp))
 		}
 		return acquireErr
+	}
+
+	if a.handoffBridge != nil && shared.AutomaticHandoffEnabled(ctx) {
+		var replicaErr error
+		var cleanupReplicaBridge func()
+		ctx, cleanupReplicaBridge, _, replicaErr = shared.AttachReplicaHandoffBridge(ctx, a, a.handoffBridge, shared.KnowledgeReplicaHandoffOptions{
+			SessionID:         fwd.SessionID,
+			CorrelationID:     fwd.CorrelationID,
+			ActivityPublisher: a.activityPub,
+		})
+		if replicaErr != nil {
+			lease.Release()
+			return replicaErr
+		}
+		defer cleanupReplicaBridge()
 	}
 
 	bundle, err := a.newForwardedToolBundle()
@@ -1071,13 +1124,14 @@ func academicExternalResearchDisciplinePrompt() string {
 			"Identify the underlying domain or domains behind the request and build enough domain knowledge to reason inside them: map the core concepts, standard terminology, governing metrics, canonical source types, and what counts as strong evidence in that field. " +
 			"For unfamiliar, specialized, or cross-domain topics, research from the ground up before recommending anything: start with authoritative primers, survey papers, review articles, standards, textbooks, professional society guidance, analyst or institutional research, and then drill into primary studies, technical reports, benchmarks, and direct sources. " +
 			"Use early searches to learn the field itself, not just to collect candidate options. Expand the domain vocabulary, identify the canonical debates and failure modes, and learn how practitioners and researchers in that field evaluate claims. " +
-			"2. Search: use `web_search` to discover authoritative candidates for each sub-question and keep searching only while you are still surfacing materially better, more relevant, well-sourced leads. Provider-native `web_search` is not just a title/snippet lookup; it may search, open pages, and inspect source content in-context. " +
-			"3. Ground: once a candidate looks promising, stop broad searching and examine it. Sylk may automatically secure-fetch the decisive surfaced exact URL coming out of native `web_search` so it can be Guardian-inspected, ingested, and marked grounded. Do not reflexively call `ground_source` after every `web_search`. Use `ground_source`, `web_fetch`, `fetch_document`, or one bounded `crawl_links` follow-up when you already know the exact URL, need a specific fetch mode, need a bounded crawl, or need to force grounding of an exact URL that has not yet gone through the secured fetch path. When you do need an explicit fetch, use `ground_source` when you want the runtime to choose the fetch mode, `web_fetch` for exact web pages or documentation pages, `fetch_document` for PDFs, papers, benchmark reports, standards, or other methodology-heavy documents, and one bounded `crawl_links` follow-up when the authoritative page obviously fans out to a small set of official subpages you need. `ground_source` returns grounded content immediately; background persistence to the knowledge graph and document store usually does not need to block synthesis. " +
+			"2. Internal recall: when prior Sylk-grounded sources, fetched documents, stored research, or internal architectural knowledge may already matter, call `knowledge_query` early to search the knowledge graph and grounded document index before duplicating work on the public web. Do not treat `knowledge_query` as a fallback after broad web search when existing grounded evidence could already change the answer. " +
+			"3. Search: use `web_search` to discover authoritative candidates for each sub-question and keep searching only while you are still surfacing materially better, more relevant, well-sourced leads. Provider-native `web_search` is not just a title/snippet lookup; it may search, open pages, and inspect source content in-context. " +
+			"4. Ground: once a candidate looks promising, stop broad searching and examine it. Sylk may automatically secure-fetch the decisive surfaced exact URL coming out of native `web_search` so it can be Guardian-inspected, ingested, and marked grounded. Do not reflexively call `ground_source` after every `web_search`. Use `ground_source`, `web_fetch`, `fetch_document`, or one bounded `crawl_links` follow-up when you already know the exact URL, need a specific fetch mode, need a bounded crawl, or need to force grounding of an exact URL that has not yet gone through the secured fetch path. When you do need an explicit fetch, use `ground_source` when you want the runtime to choose the fetch mode, `web_fetch` for exact web pages or documentation pages, `fetch_document` for PDFs, papers, benchmark reports, standards, or other methodology-heavy documents, and one bounded `crawl_links` follow-up when the authoritative page obviously fans out to a small set of official subpages you need. `ground_source` returns grounded content immediately; background persistence to the knowledge graph and document store usually does not need to block synthesis. " +
 			"Never present a bare search hit, title, snippet, or unexamined URL as a reference. Before finalizing an answer with citations, perform a source audit and confirm whether you are carrying forward a decisive surfaced exact URL from `web_search` that still needs the secured fetch path. " +
 			"Before finalizing, enumerate the exact URLs you intend to cite. Confirm which cited URL is the decisive surfaced exact URL coming out of `web_search`, and whether Sylk already secured-fetched that exact URL or whether you still need `ground_source`, `web_fetch`, or `fetch_document` before citing it. A successful `web_fetch` or `fetch_document` on the exact URL already satisfies that grounding obligation; do not redundantly call `ground_source` afterward for the same URL unless you need a different fetch mode. Do not imply that every intermediate searched URL also received an extra secured fetch. Do not examine or ground one page and then cite a different URL from the same site as if it were covered. " +
 			"Triangulate material claims across multiple grounded sources whenever feasible. If a conclusion rests on only one grounded source, say so explicitly and treat the confidence as lower unless that source is uniquely authoritative. " +
-			"4. Consult: use Librarian or Archivalist only when codebase fit or historical precedent materially changes the answer, and do not repeat the same consultation question to the same agent in one run. " +
-			"5. Synthesize: stop only when more searching is unlikely to materially change the conclusion. " +
+			"5. Consult: use Librarian or Archivalist only when codebase fit or historical precedent materially changes the answer, and do not repeat the same consultation question to the same agent in one run. " +
+			"6. Synthesize: stop only when more searching is unlikely to materially change the conclusion. " +
 			"For recommendation, comparison, and design questions, investigate multiple credible options or counterexamples before choosing one. Do not stop after the first plausible answer unless the space is genuinely trivial. " +
 			"Do not answer from memory alone when source-backed or current evidence matters, and do not keep issuing broad `web_search` calls once you have promising sources that should be grounded. " +
 			"Choose the evidence classes that matter for the domain instead of assuming one source type is enough. Common classes include primary or authoritative sources, empirical or observational evidence, counterevidence or failure cases, methodological or limitations evidence, implementation or operational burden, institutional or ecosystem or market context, and formal or academic or regulatory or standards evidence. Not every class applies to every question, but every relevant class must be checked or explicitly marked unavailable. " +
@@ -1115,6 +1169,7 @@ func academicForwardedResearchPrompt(fwd *guide.ForwardedRequest) string {
 	b.WriteString("Identify the underlying domain or domains behind the request and build enough domain knowledge to reason inside them: map the core concepts, standard terminology, governing metrics, canonical source types, and what counts as strong evidence in that field.\n")
 	b.WriteString("For unfamiliar, specialized, or cross-domain topics, research from the ground up before recommending anything: start with authoritative primers, survey papers, review articles, standards, textbooks, professional society guidance, analyst or institutional research, and then drill into primary studies, technical reports, benchmarks, and direct sources.\n")
 	b.WriteString("Use early searches to learn the field itself, not just to collect candidate options. Expand the domain vocabulary, identify the canonical debates and failure modes, and learn how practitioners and researchers in that field evaluate claims.\n")
+	b.WriteString("If prior Sylk-grounded sources, fetched documents, or stored research could materially help, call `knowledge_query` early to search the knowledge graph and grounded document index before duplicating work on the public web.\n")
 	b.WriteString("Provider-native `web_search` is not just a title/snippet lookup; it may search, open pages, and inspect source content in-context. When `web_search` surfaces a promising source, do not keep searching instead of examining it.\n")
 	b.WriteString("When native `web_search` surfaces a clearly relevant, high-quality exact URL that you are about to carry forward as the decisive surfaced source, Sylk may automatically secure-fetch that URL through the local pipeline so it can be Guardian-inspected, ingested, and marked grounded.\n")
 	b.WriteString("Do not reflexively call `ground_source`, `web_fetch`, or `fetch_document` after every `web_search`. Use explicit fetch tools when you already know the exact URL, need a specific fetch mode, need a bounded crawl, or need to force grounding of an exact URL that has not yet gone through the secured fetch path.\n")
@@ -1920,29 +1975,206 @@ func (a *Academic) cacheKey(query *ResearchQuery) string {
 }
 
 func (a *Academic) getCached(key string) *ResearchResult {
+	now := time.Now()
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-
 	result, exists := a.researchCache[key]
+	expired := academicResearchResultExpired(result, a.config.CacheExpiry, now)
+	a.mu.RUnlock()
 	if !exists {
 		return nil
 	}
-
-	// Check expiry
-	if result.CachedAt != nil && time.Since(*result.CachedAt) > a.config.CacheExpiry {
+	if expired {
+		a.mu.Lock()
+		if current, ok := a.researchCache[key]; ok && academicResearchResultExpired(current, a.config.CacheExpiry, now) {
+			delete(a.researchCache, key)
+			a.pruneSourceIndexLocked(now)
+		}
+		a.mu.Unlock()
 		return nil
 	}
-
 	return result
 }
 
 func (a *Academic) setCached(key string, result *ResearchResult) {
+	if result == nil {
+		return
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	now := time.Now()
+	if result.GeneratedAt.IsZero() {
+		result.GeneratedAt = now
+	}
 	result.CachedAt = &now
 	a.researchCache[key] = result
+	a.pruneResearchStateLocked(now)
+}
+
+func (a *Academic) pruneResearchStateLocked(now time.Time) {
+	if a == nil {
+		return
+	}
+	a.pruneResearchCacheLocked(now)
+	a.pruneSourceIndexLocked(now)
+}
+
+func (a *Academic) pruneResearchCacheLocked(now time.Time) {
+	for key, result := range a.researchCache {
+		if academicResearchResultExpired(result, a.config.CacheExpiry, now) {
+			delete(a.researchCache, key)
+		}
+	}
+	limit := a.config.ResearchCacheLimit
+	if limit <= 0 || len(a.researchCache) <= limit {
+		return
+	}
+	type agedResult struct {
+		key      string
+		cachedAt time.Time
+	}
+	oldest := make([]agedResult, 0, len(a.researchCache))
+	for key, result := range a.researchCache {
+		oldest = append(oldest, agedResult{
+			key:      key,
+			cachedAt: academicResearchResultTime(result),
+		})
+	}
+	sort.Slice(oldest, func(i, j int) bool {
+		return oldest[i].cachedAt.Before(oldest[j].cachedAt)
+	})
+	for _, item := range oldest[:len(oldest)-limit] {
+		delete(a.researchCache, item.key)
+	}
+}
+
+func (a *Academic) pruneSourceIndexLocked(now time.Time) {
+	if len(a.sourceIndex) == 0 {
+		return
+	}
+
+	protected := a.protectedSourceIDsLocked(now)
+	maxAge := a.config.CacheExpiry * 2
+	for id, source := range a.sourceIndex {
+		if _, ok := protected[id]; ok {
+			continue
+		}
+		if academicSourceExpired(source, maxAge, now) {
+			delete(a.sourceIndex, id)
+		}
+	}
+
+	limit := a.config.SourceIndexLimit
+	if limit <= 0 || len(a.sourceIndex) <= limit {
+		return
+	}
+
+	type agedSource struct {
+		id        string
+		updatedAt time.Time
+	}
+	unprotected := make([]agedSource, 0, len(a.sourceIndex))
+	all := make([]agedSource, 0, len(a.sourceIndex))
+	for id, source := range a.sourceIndex {
+		item := agedSource{id: id, updatedAt: academicSourceTime(source)}
+		all = append(all, item)
+		if _, ok := protected[id]; !ok {
+			unprotected = append(unprotected, item)
+		}
+	}
+	sort.Slice(unprotected, func(i, j int) bool {
+		return unprotected[i].updatedAt.Before(unprotected[j].updatedAt)
+	})
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].updatedAt.Before(all[j].updatedAt)
+	})
+
+	overflow := len(a.sourceIndex) - limit
+	for _, item := range unprotected {
+		if overflow == 0 {
+			return
+		}
+		if _, ok := a.sourceIndex[item.id]; ok {
+			delete(a.sourceIndex, item.id)
+			overflow--
+		}
+	}
+	for _, item := range all {
+		if overflow == 0 {
+			return
+		}
+		if _, ok := a.sourceIndex[item.id]; ok {
+			delete(a.sourceIndex, item.id)
+			overflow--
+		}
+	}
+}
+
+func (a *Academic) protectedSourceIDsLocked(now time.Time) map[string]struct{} {
+	protected := make(map[string]struct{})
+	for _, result := range a.researchCache {
+		if academicResearchResultExpired(result, a.config.CacheExpiry, now) {
+			continue
+		}
+		for _, id := range result.SourcesConsulted {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				protected[trimmed] = struct{}{}
+			}
+		}
+		for _, finding := range result.Findings {
+			for _, id := range finding.SourceIDs {
+				if trimmed := strings.TrimSpace(id); trimmed != "" {
+					protected[trimmed] = struct{}{}
+				}
+			}
+		}
+		for _, recommendation := range result.Recommendations {
+			for _, id := range recommendation.SourceIDs {
+				if trimmed := strings.TrimSpace(id); trimmed != "" {
+					protected[trimmed] = struct{}{}
+				}
+			}
+		}
+	}
+	return protected
+}
+
+func academicResearchResultExpired(result *ResearchResult, expiry time.Duration, now time.Time) bool {
+	if result == nil || expiry <= 0 || result.CachedAt == nil {
+		return false
+	}
+	return now.Sub(*result.CachedAt) > expiry
+}
+
+func academicResearchResultTime(result *ResearchResult) time.Time {
+	if result == nil {
+		return time.Time{}
+	}
+	if result.CachedAt != nil {
+		return *result.CachedAt
+	}
+	return result.GeneratedAt
+}
+
+func academicSourceExpired(source *Source, maxAge time.Duration, now time.Time) bool {
+	if source == nil || maxAge <= 0 {
+		return false
+	}
+	timestamp := academicSourceTime(source)
+	if timestamp.IsZero() {
+		return false
+	}
+	return now.Sub(timestamp) > maxAge
+}
+
+func academicSourceTime(source *Source) time.Time {
+	if source == nil {
+		return time.Time{}
+	}
+	if !source.UpdatedAt.IsZero() {
+		return source.UpdatedAt
+	}
+	return source.IngestedAt
 }
 
 // =============================================================================
@@ -2087,6 +2319,25 @@ func (a *Academic) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 // Called during Phase 3 wiring after Guardian and quarantine are ready.
 func (a *Academic) SetFetchPipeline(p *fetch.Pipeline) {
 	a.fetchPipeline = p
+}
+
+// SetKnowledgeStore wires the Academic to the shared knowledge-store coordinator.
+func (a *Academic) SetKnowledgeStore(ks *knowledge.KnowledgeStore) {
+	a.knowledgeMu.Lock()
+	defer a.knowledgeMu.Unlock()
+	a.knowledgeStore = ks
+	if ks != nil {
+		a.queryCoordinator = ks.Coordinator()
+		return
+	}
+	a.queryCoordinator = nil
+}
+
+// SetKnowledgeBackend wires the Academic to committed knowledge retrieval.
+func (a *Academic) SetKnowledgeBackend(backend committedKnowledgeSearcher) {
+	a.knowledgeMu.Lock()
+	defer a.knowledgeMu.Unlock()
+	a.knowledgeBackend = backend
 }
 
 // SetWorkspaceViews injects explicit disk/global/pipeline read access.

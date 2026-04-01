@@ -121,6 +121,9 @@ func (p *AgentPod) Promote(ctx context.Context, specs []container.ContainerSpec)
 	p.cacheSpecs(specs)
 	current := p.LoadTier()
 	if current == pod.TierHot {
+		if err := p.ensureVolumesReady(ctx); err != nil {
+			return err
+		}
 		p.metrics.HotHits.Add(1)
 		p.touchActivity()
 		return nil
@@ -238,6 +241,9 @@ func (p *AgentPod) promoteFromCool(ctx context.Context, specs []container.Contai
 }
 
 func (p *AgentPod) promoteFromWarm(ctx context.Context) error {
+	if err := p.ensureVolumesReady(ctx); err != nil {
+		return fmt.Errorf("pod %s: ensure volumes from warm: %w", p.podID, err)
+	}
 	for agentType, c := range p.allContainersSnapshot() {
 		if err := p.runtime.ResumeContainer(ctx, c); err != nil {
 			return fmt.Errorf("pod %s: resume %s: %w", p.podID, agentType, err)
@@ -308,6 +314,13 @@ func (p *AgentPod) mountVolumes(ctx context.Context) error {
 		return nil
 	}
 	return p.volumes.MountAll(ctx)
+}
+
+func (p *AgentPod) ensureVolumesReady(ctx context.Context) error {
+	if p.volumes == nil {
+		return nil
+	}
+	return p.volumes.EnsureReady(ctx)
 }
 
 func (p *AgentPod) unmountVolumes(ctx context.Context) {

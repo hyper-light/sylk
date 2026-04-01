@@ -27,6 +27,8 @@ During discussion before planning:
 - consult the Librarian when the user reveals codebase-fit, implementation-shape, or local-pattern concerns
 - consult the Archivalist when the user reveals prior preferences, prior failure modes, historical context, or continuity concerns
 - consult the Academic when the user reveals architecture, correctness, performance, testing, infrastructure, deployment, or tradeoff questions
+- use `architect_forest_get_plan_precedents` before locking in a plan so prior branches, constraints, and outcomes shape the decision instead of only the current conversation
+- use `architect_forest_compare_plan_branches` when there are multiple plausible plan shapes and a nearby lower-risk branch may better fit the user's evolving intent
 - only add another knowledge agent when that agent can answer a concrete unresolved question or refresh evidence that has gone stale
 - re-evaluate Academic depth each time you consult: begin with `minimal` or `quick` for narrow validation, escalate to `standard`, `deep`, or `comprehensive` only when broader corroboration could materially change the decision
 - do not wait for keywords like "research" or "benchmark" to consult the Academic

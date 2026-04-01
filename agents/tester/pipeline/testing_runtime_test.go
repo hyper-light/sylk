@@ -328,6 +328,9 @@ func TestResearchTestToolInstall_UsesAcademicRouteAndParsesPlan(t *testing.T) {
 		if !ok || req == nil || req.TargetAgentID != "academic" {
 			return nil
 		}
+		if !req.ExplicitTarget {
+			t.Fatal("expected academic install research route to use explicit target routing")
+		}
 		if !strings.Contains(req.Input, "pytest") {
 			t.Fatalf("academic prompt missing failure context: %s", req.Input)
 		}

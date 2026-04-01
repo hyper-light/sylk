@@ -230,6 +230,9 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 	}
 
 	o.registerCoreSkills()
+	if err := shared.RegisterMemoryForestSkills(o.skills, "orchestrator", cfg.Forest, nil); err != nil {
+		return nil, fmt.Errorf("register orchestrator forest skills: %w", err)
+	}
 	skillsLoaderCfg := skills.DefaultLoaderConfig()
 	skillsLoaderCfg.CoreSkills = orchestratorPinnedSkillNames()
 	skillsLoaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
@@ -1278,20 +1281,7 @@ func canonicalPipelineTaskIdentity(taskID, taskSlug string, nodeCtx map[string]a
 }
 
 func pipelineWorkerTargetAgentID(taskID, agentType string) string {
-	taskID = strings.TrimSpace(taskID)
-	agentType = strings.TrimSpace(agentType)
-	if taskID == "" {
-		return agentType
-	}
-	switch agentType {
-	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
-		if workerAgentID := PipelineWorkerAgentID(taskID, agentType); workerAgentID != "" {
-			return workerAgentID
-		}
-		return agentType
-	default:
-		return agentType
-	}
+	return PipelineWorkerRoutingTarget(taskID, agentType)
 }
 
 func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {

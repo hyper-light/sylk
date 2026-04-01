@@ -27,6 +27,8 @@ func (v *mockVolume) Mount(_ context.Context) error {
 	return nil
 }
 
+func (v *mockVolume) EnsureReady(_ context.Context) error { return nil }
+
 func (v *mockVolume) Unmount(_ context.Context) error {
 	v.mounted = false
 	return nil

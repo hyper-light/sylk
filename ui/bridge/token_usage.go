@@ -65,6 +65,18 @@ func (b *TokenUsageBridge) forwardHandler(program TeaProgram) guide.MessageHandl
 			CorrelationID: evt.CorrelationID,
 			AgentID:       evt.AgentID,
 		}
+		if v, ok := evt.Data["runtime_agent_id"].(string); ok {
+			um.RuntimeAgentID = v
+		}
+		if v, ok := evt.Data["agent_type"].(string); ok {
+			um.AgentType = v
+		}
+		if v, ok := evt.Data["pipeline_id"].(string); ok {
+			um.PipelineID = v
+		}
+		if v, ok := evt.Data["task_id"].(string); ok {
+			um.TaskID = v
+		}
 		if v, ok := evt.Data["model"].(string); ok {
 			um.Model = v
 		}

@@ -16,6 +16,7 @@ import (
 )
 
 func (a *Academic) registerCoreSkills() {
+	a.skills.Register(knowledgeQuerySkill(a))
 	a.skills.Register(researchTopicSkill(a))
 	a.skills.Register(findBestPracticesSkill(a))
 	a.skills.Register(compareApproachesSkill(a))

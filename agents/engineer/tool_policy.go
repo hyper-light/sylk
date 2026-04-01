@@ -1,12 +1,13 @@
 package engineer
 
 import (
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 func engineerVisibleSkillNames() []string {
-	return []string{
+	return shared.AppendMemoryForestVisibleSkillNames([]string{
 		"search_skills",
 		"read_file",
 		"read_workspace_file",
@@ -47,11 +48,11 @@ func engineerVisibleSkillNames() []string {
 		"run_shell_script",
 		"report_confidence",
 		"signal_orchestrator",
-	}
+	}, "engineer")
 }
 
 func engineerMutatingSkillNames() []string {
-	return []string{
+	return shared.AppendMemoryForestMutatingSkillNames([]string{
 		"write_pipeline_file",
 		"edit_pipeline_file",
 		"delete_pipeline_file",
@@ -73,7 +74,7 @@ func engineerMutatingSkillNames() []string {
 		"signal_orchestrator",
 		"report_confidence",
 		"reroute_request",
-	}
+	})
 }
 
 func engineerToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {
@@ -81,7 +82,7 @@ func engineerToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest
 		AgentID:          "engineer",
 		CapabilityScope:  "engineer.default",
 		Registry:         registry,
-		VisibleByDefault: engineerVisibleSkillNames(),
-		Mutating:         engineerMutatingSkillNames(),
+		VisibleByDefault: shared.FilterRegisteredSkillNames(registry, engineerVisibleSkillNames()),
+		Mutating:         shared.FilterRegisteredSkillNames(registry, engineerMutatingSkillNames()),
 	})
 }

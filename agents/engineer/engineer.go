@@ -16,6 +16,7 @@ import (
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/escalation"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
@@ -111,6 +112,8 @@ type Engineer struct {
 
 	// Steering ledger management.
 	steering *shared.SteeringManager
+	// Tracks Memory Forest branches surfaced during implementation.
+	forestTracker *shared.MemoryForestTracker
 
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
@@ -142,6 +145,9 @@ type Config struct {
 
 	// Session context
 	SessionID string // Session identifier
+
+	// Forest exposes Memory Forest precedent-recall skills.
+	Forest shared.MemoryForestService
 }
 
 // Default configuration values
@@ -180,6 +186,7 @@ func New(cfg Config, provider engineerProvider) (*Engineer, error) {
 			StartedAt: time.Now(),
 		},
 		consultations:     make([]Consultation, 0),
+		forestTracker:     shared.NewMemoryForestTracker(),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
 		executionBroker:   purevfs.DefaultExecutionBroker(),
@@ -316,6 +323,33 @@ func applyConfigDefaults(cfg Config) Config {
 func (e *Engineer) initSkills() error {
 	e.skills = skills.NewRegistry()
 	e.registerCoreSkills()
+	if err := shared.RegisterMemoryForestSkills(e.skills, "engineer", e.config.Forest, e.forestTracker); err != nil {
+		return fmt.Errorf("register engineer forest skills: %w", err)
+	}
+	if err := shared.AttachForestOutcomeRecorder(
+		e.skills,
+		"handoff_next",
+		e.forestTracker,
+		e.config.Forest,
+		func() string { return e.id },
+		"engineer",
+		func() string { return e.config.SessionID },
+		shared.OutcomeOnSuccess("engineer implementation handoff succeeded"),
+	); err != nil {
+		return fmt.Errorf("attach engineer forest handoff outcome: %w", err)
+	}
+	if err := shared.AttachForestOutcomeRecorder(
+		e.skills,
+		"report_confidence",
+		e.forestTracker,
+		e.config.Forest,
+		func() string { return e.id },
+		"engineer",
+		func() string { return e.config.SessionID },
+		shared.OutcomeAlways(forest.OutcomeStatusMixed, "engineer reported implementation confidence"),
+	); err != nil {
+		return fmt.Errorf("attach engineer forest confidence outcome: %w", err)
+	}
 
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = engineerVisibleSkillNames()
@@ -508,8 +542,6 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	// Track pipeline association for activity event grouping.
 	if taskID, _ := fwd.Metadata["task_id"].(string); taskID != "" {
 		e.pipelineID = taskID
-	} else if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
-		e.pipelineID = dagID
 	}
 	if taskSlug, _ := fwd.Metadata["task_slug"].(string); taskSlug != "" {
 		e.pipelineSlug = taskSlug
@@ -806,6 +838,7 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (_ *Enginee
 		return nil, fmt.Errorf("request cannot be nil")
 	}
 	ctx = shared.WithPipelineTaskProtocolState(ctx, req.PipelineTask)
+	defer shared.ClosePipelineProtocolState(ctx)
 
 	startTime := time.Now()
 	e.setStatus(AgentStatusBusy)

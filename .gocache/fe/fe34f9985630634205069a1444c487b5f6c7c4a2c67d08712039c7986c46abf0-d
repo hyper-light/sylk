@@ -1,0 +1,6 @@
+./completion.go
+./history.go
+./markdown.go
+./model.go
+./selection.go
+./wrap.go

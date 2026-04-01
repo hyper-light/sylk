@@ -22,6 +22,13 @@ type Config struct {
 	Logger       *slog.Logger
 	MaxTraces    int
 	Booster      boosterConfig
+
+	ReplayDelay         time.Duration
+	SubstrateDebounce   time.Duration
+	TrainingDebounce    time.Duration
+	ReplayBatchSize     int
+	SubstrateLimit      int
+	TrainingMaxExamples int
 }
 
 // MemoryForest provides forest projection, retrieval, and learning services.
@@ -33,6 +40,24 @@ type MemoryForest struct {
 	warmth       *WarmthStore
 	models       *learnedModelStore
 	booster      boosterConfig
+
+	runCtx    context.Context
+	runCancel context.CancelFunc
+
+	replayDelay         time.Duration
+	substrateDebounce   time.Duration
+	trainingDebounce    time.Duration
+	replayBatchSize     int
+	substrateLimit      int
+	trainingMaxExamples int
+
+	maintenanceRunMu sync.Mutex
+	maintenanceMu    sync.Mutex
+	maintenanceWake  chan struct{}
+	pendingSubstrate map[string]scheduledForestWork
+	replayDue        time.Time
+	trainingWork     scheduledForestWork
+	trainingDirty    bool
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -56,15 +81,26 @@ func New(cfg Config) (*MemoryForest, error) {
 		booster = defaultBoosterConfig()
 	}
 
+	runCtx, runCancel := context.WithCancel(context.Background())
 	service := &MemoryForest{
-		db:           cfg.DB,
-		contentStore: cfg.ContentStore,
-		searcher:     cfg.Searcher,
-		logger:       normalizeLogger(cfg.Logger),
-		warmth:       newWarmthStore(cfg.DB, cfg.MaxTraces),
-		models:       models,
-		booster:      booster,
-		stopCh:       make(chan struct{}),
+		db:                  cfg.DB,
+		contentStore:        cfg.ContentStore,
+		searcher:            cfg.Searcher,
+		logger:              normalizeLogger(cfg.Logger),
+		warmth:              newWarmthStore(cfg.DB, cfg.MaxTraces),
+		models:              models,
+		booster:             booster,
+		runCtx:              runCtx,
+		runCancel:           runCancel,
+		replayDelay:         resolveForestReplayDelay(cfg.ReplayDelay),
+		substrateDebounce:   resolveForestSubstrateDebounce(cfg.SubstrateDebounce),
+		trainingDebounce:    resolveForestTrainingDebounce(cfg.TrainingDebounce),
+		replayBatchSize:     resolveForestReplayBatchSize(cfg.ReplayBatchSize),
+		substrateLimit:      resolveForestSubstrateLimit(cfg.SubstrateLimit),
+		trainingMaxExamples: resolveForestTrainingExamples(cfg.TrainingMaxExamples),
+		maintenanceWake:     make(chan struct{}, 1),
+		pendingSubstrate:    make(map[string]scheduledForestWork),
+		stopCh:              make(chan struct{}),
 	}
 
 	service.startMaintenance()
@@ -74,36 +110,13 @@ func New(cfg Config) (*MemoryForest, error) {
 // Close stops background maintenance loops.
 func (m *MemoryForest) Close() error {
 	m.stopOnce.Do(func() {
+		if m.runCancel != nil {
+			m.runCancel()
+		}
 		close(m.stopCh)
 	})
 	m.wg.Wait()
 	return nil
-}
-
-func (m *MemoryForest) startMaintenance() {
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		var tickCount int
-		for {
-			select {
-			case <-m.stopCh:
-				return
-			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_, _ = m.RunSubstrateMaintenance(ctx, 96)
-				_, _ = m.RunReplay(ctx, 8)
-				_, _ = m.RunEcology(ctx)
-				tickCount++
-				if tickCount%4 == 0 {
-					_, _ = m.TrainModels(ctx, 1024)
-				}
-				cancel()
-			}
-		}
-	}()
 }
 
 func normalizeLogger(logger *slog.Logger) *slog.Logger {
@@ -111,6 +124,22 @@ func normalizeLogger(logger *slog.Logger) *slog.Logger {
 		return logger
 	}
 	return slog.Default()
+}
+
+// SetContentStore wires a content store after forest construction.
+func (m *MemoryForest) SetContentStore(store *ctxpkg.UniversalContentStore) {
+	if m == nil {
+		return
+	}
+	m.contentStore = store
+}
+
+// SetSearcher wires a tiered searcher after forest construction.
+func (m *MemoryForest) SetSearcher(searcher *ctxpkg.TieredSearcher) {
+	if m == nil {
+		return
+	}
+	m.searcher = searcher
 }
 
 // OnContentIndexed satisfies context.ContentIndexObserver.
@@ -182,7 +211,7 @@ func (m *MemoryForest) AppendEvent(ctx context.Context, event *Event) error {
 	}
 	defer tx.Rollback()
 
-	branch, created, err := m.projectEventTx(ctx, tx, prepared)
+	branch, created, replayDue, err := m.projectEventTx(ctx, tx, prepared)
 	if err != nil {
 		return err
 	}
@@ -200,6 +229,17 @@ func (m *MemoryForest) AppendEvent(ctx context.Context, event *Event) error {
 	case EventTypeValidation, EventTypeOutcomeRecorded, EventTypeReplayConsolidated:
 		_ = m.warmth.RecordAccess(ctx, branch.ID, memory.AccessReinforcement, prepared.Title)
 	}
+
+	var labeledCount int64
+	recordLabels := func(changed int64, err error) {
+		if err != nil {
+			if m.logger != nil {
+				m.logger.Debug("forest: label examples failed", "error", err)
+			}
+			return
+		}
+		labeledCount += changed
+	}
 	switch prepared.EventType {
 	case EventTypeOutcomeRecorded:
 		status := OutcomeStatusMixed
@@ -208,41 +248,52 @@ func (m *MemoryForest) AppendEvent(ctx context.Context, event *Event) error {
 		} else if raw, ok := prepared.Payload["status"].(string); ok {
 			status = OutcomeStatus(raw)
 		}
-		_ = m.labelExamplesForOutcome(ctx, branch.ID, prepared.SessionID, status)
+		recordLabels(m.labelExamplesForOutcome(ctx, branch.ID, prepared.SessionID, status))
 	case EventTypeValidation:
-		_ = m.labelExamplesForOutcome(ctx, branch.ID, prepared.SessionID, OutcomeStatusSucceeded)
+		recordLabels(m.labelExamplesForOutcome(ctx, branch.ID, prepared.SessionID, OutcomeStatusSucceeded))
 	case EventTypeContradiction:
-		_ = m.labelExamplesForOutcome(ctx, branch.ID, prepared.SessionID, OutcomeStatusFailed)
+		recordLabels(m.labelExamplesForOutcome(ctx, branch.ID, prepared.SessionID, OutcomeStatusFailed))
 	}
 
+	m.scheduleSubstrateRefresh(prepared.SessionID)
+	if !replayDue.IsZero() {
+		m.scheduleReplayAt(replayDue)
+	}
+	if labeledCount > 0 {
+		m.scheduleTraining()
+	}
 	return nil
 }
 
-func (m *MemoryForest) projectEventTx(ctx context.Context, tx *sql.Tx, event *Event) (*Branch, bool, error) {
+func (m *MemoryForest) projectEventTx(ctx context.Context, tx *sql.Tx, event *Event) (*Branch, bool, time.Time, error) {
 	if err := insertEventTx(ctx, tx, event); err != nil {
-		return nil, false, err
+		return nil, false, time.Time{}, err
 	}
 
 	branch, err := getBranchTx(ctx, tx, event.BranchID)
 	if err != nil {
-		return nil, false, err
+		return nil, false, time.Time{}, err
 	}
 	created := branch == nil
 	branch = applyEvent(branch, event)
 
 	if err := upsertBranchTx(ctx, tx, branch); err != nil {
-		return nil, false, err
+		return nil, false, time.Time{}, err
 	}
 	if err := upsertRelayEdgesTx(ctx, tx, event); err != nil {
-		return nil, false, err
+		return nil, false, time.Time{}, err
 	}
 	if err := refreshCanopiesTx(ctx, tx, event.SessionID, event.IntentID); err != nil {
-		return nil, false, err
+		return nil, false, time.Time{}, err
 	}
-	if err := enqueueReplayTx(ctx, tx, branch, event); err != nil {
-		return nil, false, err
+	replayDue, err := m.enqueueReplayTx(ctx, tx, branch, event)
+	if err != nil {
+		return nil, false, time.Time{}, err
 	}
-	return branch, created, nil
+	if err := markSubstrateDirtyTx(ctx, tx, event.SessionID, event.Timestamp); err != nil {
+		return nil, false, time.Time{}, err
+	}
+	return branch, created, replayDue, nil
 }
 
 func prepareEvent(event *Event) *Event {
@@ -810,21 +861,43 @@ func upsertCanopyTx(ctx context.Context, tx *sql.Tx, canopy Canopy) error {
 	return nil
 }
 
-func enqueueReplayTx(ctx context.Context, tx *sql.Tx, branch *Branch, event *Event) error {
+func markSubstrateDirtyTx(ctx context.Context, tx *sql.Tx, sessionID string, at time.Time) error {
+	sessionID = normalizeForestSessionID(sessionID)
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO forest_substrate_sessions
+		(session_id, graph_version, substrate_version, dirty, dirty_at, updated_at)
+		VALUES (?, 1, 0, 1, ?, ?)
+		ON CONFLICT(session_id) DO UPDATE SET
+			graph_version = forest_substrate_sessions.graph_version + 1,
+			dirty = 1,
+			dirty_at = excluded.dirty_at,
+			updated_at = excluded.updated_at
+	`, sessionID, at.Unix(), at.Unix())
+	if err != nil {
+		return fmt.Errorf("mark substrate dirty: %w", err)
+	}
+	return nil
+}
+
+func (m *MemoryForest) enqueueReplayTx(ctx context.Context, tx *sql.Tx, branch *Branch, event *Event) (time.Time, error) {
 	priority := replayPriority(branch, event)
 	if priority < 0.45 {
-		return nil
+		return time.Time{}, nil
 	}
+	availableAt := event.Timestamp.Add(m.replayDelay).UTC()
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO forest_replay_queue
 		(branch_id, root_id, priority, reason, state, available_at, payload)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, branch.ID, branch.RootID, priority, string(event.EventType), string(ReplayStateQueued),
-		event.Timestamp.Add(10*time.Second).Unix(), marshalJSON(event.Payload))
+		availableAt.Unix(), marshalJSON(event.Payload))
 	if err != nil {
-		return fmt.Errorf("enqueue replay: %w", err)
+		return time.Time{}, fmt.Errorf("enqueue replay: %w", err)
 	}
-	return nil
+	return availableAt, nil
 }
 
 func replayPriority(branch *Branch, event *Event) float64 {
@@ -847,6 +920,14 @@ func replayPriority(branch *Branch, event *Event) float64 {
 }
 
 func (m *MemoryForest) RunReplay(ctx context.Context, limit int) (ReplayResult, error) {
+	m.maintenanceRunMu.Lock()
+	defer m.maintenanceRunMu.Unlock()
+
+	result, _, err := m.runReplay(ctx, limit)
+	return result, err
+}
+
+func (m *MemoryForest) runReplay(ctx context.Context, limit int) (ReplayResult, []string, error) {
 	if limit <= 0 {
 		limit = 8
 	}
@@ -859,7 +940,7 @@ func (m *MemoryForest) RunReplay(ctx context.Context, limit int) (ReplayResult, 
 		LIMIT ?
 	`, string(ReplayStateQueued), time.Now().UTC().Unix(), limit)
 	if err != nil {
-		return ReplayResult{}, fmt.Errorf("query replay queue: %w", err)
+		return ReplayResult{}, nil, fmt.Errorf("query replay queue: %w", err)
 	}
 
 	var items []replayItem
@@ -867,29 +948,35 @@ func (m *MemoryForest) RunReplay(ctx context.Context, limit int) (ReplayResult, 
 		var item replayItem
 		if err := rows.Scan(&item.ID, &item.BranchID, &item.RootID, &item.Priority, &item.Reason, &item.Payload); err != nil {
 			_ = rows.Close()
-			return ReplayResult{}, fmt.Errorf("scan replay queue: %w", err)
+			return ReplayResult{}, nil, fmt.Errorf("scan replay queue: %w", err)
 		}
 		items = append(items, item)
 	}
 	if err := rows.Close(); err != nil {
-		return ReplayResult{}, err
+		return ReplayResult{}, nil, err
 	}
 	if err := rows.Err(); err != nil {
-		return ReplayResult{}, err
+		return ReplayResult{}, nil, err
 	}
 
-	var result ReplayResult
+	var (
+		result          ReplayResult
+		touchedSessions []string
+	)
 	for _, item := range items {
 		result.Processed++
-		promoted, err := m.replayBranch(ctx, item.ID, item.BranchID, item.RootID, item.Priority, item.Reason, item.Payload.String)
+		promoted, sessionID, err := m.replayBranch(ctx, item.ID, item.BranchID, item.RootID, item.Priority, item.Reason, item.Payload.String)
 		if err != nil {
-			return result, err
+			return result, touchedSessions, err
 		}
 		if promoted {
 			result.Promoted++
 		}
+		if sessionID != "" {
+			touchedSessions = append(touchedSessions, sessionID)
+		}
 	}
-	return result, nil
+	return result, dedupeStrings(touchedSessions), nil
 }
 
 type replayItem struct {
@@ -901,23 +988,24 @@ type replayItem struct {
 	Payload  sql.NullString
 }
 
-func (m *MemoryForest) replayBranch(ctx context.Context, queueID int64, branchID, rootID string, priority float64, reason, payload string) (bool, error) {
+func (m *MemoryForest) replayBranch(ctx context.Context, queueID int64, branchID, rootID string, priority float64, reason, payload string) (bool, string, error) {
 	branch, err := m.getBranch(ctx, branchID)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	if branch == nil {
 		_, _ = m.db.ExecContext(ctx, `UPDATE forest_replay_queue SET state = ? WHERE id = ?`, string(ReplayStateComplete), queueID)
-		return false, nil
+		return false, "", nil
 	}
 
 	_, err = m.db.ExecContext(ctx, `UPDATE forest_replay_queue SET state = ?, attempts = attempts + 1 WHERE id = ?`, string(ReplayStateRunning), queueID)
 	if err != nil {
-		return false, fmt.Errorf("mark replay running: %w", err)
+		return false, "", fmt.Errorf("mark replay running: %w", err)
 	}
 
 	promoted := false
 	if branch.Scope == ScopeEpisodic || branch.Scope == ScopeWorking {
+		now := time.Now().UTC()
 		semanticID := stableID("semantic", branch.RootID, normalizeText(branch.Title))
 		semanticBranch := &Branch{
 			ID:             semanticID,
@@ -944,8 +1032,8 @@ func (m *MemoryForest) replayBranch(ctx context.Context, queueID int64, branchID
 			FailureCount:   branch.FailureCount,
 			AccessCount:    branch.AccessCount,
 			LastAccessedAt: branch.LastAccessedAt,
-			CreatedAt:      time.Now().UTC(),
-			UpdatedAt:      time.Now().UTC(),
+			CreatedAt:      now,
+			UpdatedAt:      now,
 			Metadata: map[string]any{
 				"replay_reason":  reason,
 				"replay_payload": payload,
@@ -955,40 +1043,49 @@ func (m *MemoryForest) replayBranch(ctx context.Context, queueID int64, branchID
 
 		tx, err := m.db.BeginTx(ctx, nil)
 		if err != nil {
-			return false, fmt.Errorf("begin replay tx: %w", err)
+			return false, "", fmt.Errorf("begin replay tx: %w", err)
 		}
 		defer tx.Rollback()
 
 		if err := upsertBranchTx(ctx, tx, semanticBranch); err != nil {
-			return false, err
+			return false, "", err
 		}
 		if err := upsertRelayEdgesTx(ctx, tx, &Event{
 			BranchID:         semanticBranch.ID,
 			ParentBranchID:   branch.ID,
 			RelatedBranchIDs: []string{branch.ID},
-			Timestamp:        time.Now().UTC(),
+			Timestamp:        now,
 		}); err != nil {
-			return false, err
+			return false, "", err
+		}
+		if err := refreshCanopiesTx(ctx, tx, branch.SessionID, semanticBranch.IntentID); err != nil {
+			return false, "", err
+		}
+		if err := markSubstrateDirtyTx(ctx, tx, branch.SessionID, now); err != nil {
+			return false, "", err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE forest_replay_queue SET state = ? WHERE id = ?`, string(ReplayStateComplete), queueID); err != nil {
-			return false, err
+			return false, "", err
 		}
 		if err := tx.Commit(); err != nil {
-			return false, fmt.Errorf("commit replay tx: %w", err)
+			return false, "", fmt.Errorf("commit replay tx: %w", err)
 		}
 		_ = m.warmth.RecordAccess(ctx, semanticBranch.ID, memory.AccessReinforcement, "replay")
 		promoted = true
-	} else {
-		_, err = m.db.ExecContext(ctx, `UPDATE forest_replay_queue SET state = ? WHERE id = ?`, string(ReplayStateComplete), queueID)
-		if err != nil {
-			return false, fmt.Errorf("complete replay queue item: %w", err)
-		}
+		return promoted, branch.SessionID, nil
 	}
 
-	return promoted, nil
+	_, err = m.db.ExecContext(ctx, `UPDATE forest_replay_queue SET state = ? WHERE id = ?`, string(ReplayStateComplete), queueID)
+	if err != nil {
+		return false, "", fmt.Errorf("complete replay queue item: %w", err)
+	}
+	return false, "", nil
 }
 
 func (m *MemoryForest) RunEcology(ctx context.Context) (EcologyResult, error) {
+	m.maintenanceRunMu.Lock()
+	defer m.maintenanceRunMu.Unlock()
+
 	now := time.Now().UTC()
 	result := EcologyResult{}
 

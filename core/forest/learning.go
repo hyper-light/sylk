@@ -279,8 +279,14 @@ func normalizeRequesterAgentType(agentType string) string {
 }
 
 func (m *MemoryForest) TrainModels(ctx context.Context, maxExamples int) (TrainingResult, error) {
+	m.maintenanceRunMu.Lock()
+	defer m.maintenanceRunMu.Unlock()
+
 	if m.models == nil {
 		return TrainingResult{}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return TrainingResult{}, err
 	}
 	examples, err := m.loadTrainingExamples(ctx, maxExamples)
 	if err != nil {
@@ -291,42 +297,23 @@ func (m *MemoryForest) TrainModels(ctx context.Context, maxExamples int) (Traini
 		return TrainingResult{}, nil
 	}
 
-	type trainResult struct {
-		model *boosterModel
-		err   error
-	}
-
-	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex
-		results []trainResult
-	)
-	for _, group := range groups {
-		group := group
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			model, err := trainBoosterModel(group.objective, group.agentType, group.examples, m.booster)
-			mu.Lock()
-			results = append(results, trainResult{model: model, err: err})
-			mu.Unlock()
-		}()
-	}
-	wg.Wait()
-
 	var output TrainingResult
-	for _, result := range results {
-		if result.err != nil {
-			return output, result.err
+	for _, group := range groups {
+		if err := ctx.Err(); err != nil {
+			return output, err
 		}
-		if result.model == nil {
+		model, err := trainBoosterModel(ctx, group.objective, group.agentType, group.examples, m.booster)
+		if err != nil {
+			return output, err
+		}
+		if model == nil {
 			continue
 		}
-		if err := m.models.save(ctx, result.model); err != nil {
+		if err := m.models.save(ctx, model); err != nil {
 			return output, err
 		}
 		output.Trained++
-		output.Keys = append(output.Keys, result.model.Key)
+		output.Keys = append(output.Keys, model.Key)
 	}
 	sort.Strings(output.Keys)
 	return output, nil
@@ -446,7 +433,7 @@ func trimExamples(examples []labeledExample, limit int) []labeledExample {
 	return examples[:limit]
 }
 
-func trainBoosterModel(objective LearningObjective, agentType string, examples []labeledExample, cfg boosterConfig) (*boosterModel, error) {
+func trainBoosterModel(ctx context.Context, objective LearningObjective, agentType string, examples []labeledExample, cfg boosterConfig) (*boosterModel, error) {
 	if len(examples) < cfg.MinExamples {
 		return nil, nil
 	}
@@ -467,6 +454,9 @@ func trainBoosterModel(objective LearningObjective, agentType string, examples [
 	}
 
 	for epoch := 0; epoch < cfg.LinearEpochs; epoch++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var biasGrad float64
 		grad := make([]float32, featureCount)
 		for i, example := range examples {
@@ -491,6 +481,9 @@ func trainBoosterModel(objective LearningObjective, agentType string, examples [
 
 	trees := make([]decisionStump, 0, cfg.MaxTrees)
 	for round := 0; round < cfg.MaxTrees; round++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		grads := make([]float64, len(examples))
 		hess := make([]float64, len(examples))
 		for i := range examples {
@@ -838,25 +831,30 @@ func (m *MemoryForest) recordRetrievalExamples(
 	return nil
 }
 
-func (m *MemoryForest) labelExamplesForOutcome(ctx context.Context, branchID, sessionID string, status OutcomeStatus) error {
+func (m *MemoryForest) labelExamplesForOutcome(ctx context.Context, branchID, sessionID string, status OutcomeStatus) (int64, error) {
 	utilityLabel, riskLabel := outcomeLabels(status)
 	if branchID == "" {
-		return nil
+		return 0, nil
 	}
 	if sessionID == "" {
 		sessionID = "global"
 	}
-	_, err := m.db.ExecContext(ctx, `
+	result, err := m.db.ExecContext(ctx, `
 		UPDATE forest_training_examples
 		SET utility_label = COALESCE(utility_label, ?),
 		    risk_label = COALESCE(risk_label, ?),
 		    updated_at = ?
 		WHERE branch_id = ? AND session_id = ?
+		  AND (utility_label IS NULL OR risk_label IS NULL)
 	`, utilityLabel, riskLabel, time.Now().UTC().Unix(), branchID, sessionID)
 	if err != nil {
-		return fmt.Errorf("label forest training examples: %w", err)
+		return 0, fmt.Errorf("label forest training examples: %w", err)
 	}
-	return nil
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count labeled forest training examples: %w", err)
+	}
+	return changed, nil
 }
 
 func outcomeLabels(status OutcomeStatus) (float64, float64) {

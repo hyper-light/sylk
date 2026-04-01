@@ -1,0 +1,5 @@
+./batch_indexer.go
+./builder.go
+./incremental.go
+./reindex.go
+./scanner.go

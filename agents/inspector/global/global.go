@@ -17,6 +17,7 @@ import (
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
+	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
@@ -88,6 +89,8 @@ type GlobalInspector struct {
 
 	// Steering ledger management.
 	steering *agentShared.SteeringManager
+	// Tracks Memory Forest branches surfaced during audit.
+	forestTracker *agentShared.MemoryForestTracker
 
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
@@ -117,6 +120,7 @@ func New(cfg shared.GlobalInspectorConfig, provider providers.ProviderAdapter) (
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		pendingBus:        make(map[string]*pendingWait),
 		diffStore:         NewAuditDiffStore(cfg.MaxAge),
+		forestTracker:     agentShared.NewMemoryForestTracker(),
 		steering:          agentShared.NewSteeringManager(),
 		requestSerializer: agentShared.NewRequestSerializer(),
 		executionBroker:   purevfs.DefaultExecutionBroker(),
@@ -248,6 +252,37 @@ func (gi *GlobalInspector) initSkills() error {
 	gi.hooks = skills.NewHookRegistry()
 
 	gi.registerCoreSkills()
+	if err := agentShared.RegisterMemoryForestSkills(gi.skills, "inspector", gi.config.Forest, gi.forestTracker); err != nil {
+		return fmt.Errorf("register global inspector forest skills: %w", err)
+	}
+	if err := agentShared.AttachForestOutcomeRecorder(
+		gi.skills,
+		"validate_global_review",
+		gi.forestTracker,
+		gi.config.Forest,
+		func() string { return gi.id },
+		"inspector",
+		func() string { return gi.config.SessionID },
+		agentShared.OutcomeFromGlobalReviewValidation(
+			"global inspector validation passed",
+			"global inspector validation failed",
+			"global inspector validation was mixed or blocked",
+		),
+	); err != nil {
+		return fmt.Errorf("attach global inspector forest review outcome: %w", err)
+	}
+	if err := agentShared.AttachForestOutcomeRecorder(
+		gi.skills,
+		"finalize_global_review",
+		gi.forestTracker,
+		gi.config.Forest,
+		func() string { return gi.id },
+		"inspector",
+		func() string { return gi.config.SessionID },
+		agentShared.OutcomeAlways(forest.OutcomeStatusMixed, "global inspector finalized the review state"),
+	); err != nil {
+		return fmt.Errorf("attach global inspector forest finalize outcome: %w", err)
+	}
 	gi.registerSafetyHook()
 
 	loaderCfg := skills.DefaultLoaderConfig()
@@ -413,7 +448,9 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 		return shared.ConversationFallback(gi.getState()), nil
 	}
 
+	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	ctx = agentShared.WithGlobalReviewContext(ctx, fwd.Metadata)
+	defer agentShared.CloseGlobalReviewState(ctx)
 	contract := agentShared.BuildGlobalExecutionContract("inspector-global", fwd.Intent, fwd.Input)
 	systemPrompt := shared.GlobalInspectorSystemPromptForContract(contract)
 	systemPrompt = agentShared.AppendGlobalExecutionGuidance(systemPrompt, contract, "inspector-global")

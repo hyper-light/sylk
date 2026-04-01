@@ -3136,6 +3136,55 @@ func TestModel_StreamStartSetsRespondingActivityState(t *testing.T) {
 	}
 }
 
+func TestModel_SystemStreamLifecycleDoesNotActivateAgent(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SeedAgent("archivalist", "archivalist", "Archivalist", nil, "", "")
+
+	_, _ = model.Update(msg.StreamStartMsg{
+		AgentID:       "archivalist",
+		AgentType:     "archivalist",
+		AgentName:     "Archivalist",
+		SessionID:     "sess-1",
+		Visibility:    events.VisibilitySystem,
+		CorrelationID: "corr-system-store",
+	})
+
+	agent := model.agents["archivalist"]
+	if agent == nil {
+		t.Fatal("expected archivalist agent")
+	}
+	if agent.Status != StatusIdle {
+		t.Fatalf("status after system stream start = %v, want StatusIdle", agent.Status)
+	}
+	if agent.ActivityState != events.AgentUIStateNone {
+		t.Fatalf("activity state after system stream start = %q, want %q", agent.ActivityState, events.AgentUIStateNone)
+	}
+
+	_, _ = model.Update(msg.StreamStartMsg{
+		AgentID:       "archivalist",
+		AgentType:     "archivalist",
+		AgentName:     "Archivalist",
+		SessionID:     "sess-1",
+		CorrelationID: "corr-user-request",
+		Visibility:    events.VisibilityUser,
+	})
+	_, _ = model.Update(msg.StreamCompleteMsg{
+		AgentID:       "archivalist",
+		AgentType:     "archivalist",
+		AgentName:     "Archivalist",
+		SessionID:     "sess-1",
+		CorrelationID: "corr-system-store",
+		Visibility:    events.VisibilitySystem,
+	})
+
+	if agent.Status != StatusActing {
+		t.Fatalf("status after unrelated system stream complete = %v, want StatusActing", agent.Status)
+	}
+	if agent.activeCorrelationID != "corr-user-request" {
+		t.Fatalf("active correlation after unrelated system stream complete = %q, want corr-user-request", agent.activeCorrelationID)
+	}
+}
+
 func TestModel_StreamProgressAllowsEmptyMessageForExplicitUIState(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SeedAgent("guide", "guide", "Guide", nil, "", "")

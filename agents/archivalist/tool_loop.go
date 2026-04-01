@@ -94,8 +94,9 @@ func (a *Archivalist) executeToolLoopWithBundle(ctx context.Context, req *provid
 		}
 
 		toolCalls := len(resp.ToolCalls)
-		if toolCalls == 0 && a.handoffBridge != nil {
-			a.handoffBridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, 0, 0, turnStart))
+		bridge := shared.EffectiveHandoffBridge(ctx, a.handoffBridge)
+		if toolCalls == 0 && bridge != nil {
+			bridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, 0, 0, turnStart))
 		}
 
 		if toolCalls == 0 {
@@ -107,8 +108,8 @@ func (a *Archivalist) executeToolLoopWithBundle(ctx context.Context, req *provid
 		}
 
 		errCount, rerouted := a.applyToolCalls(ctx, req, resp, bundle)
-		if a.handoffBridge != nil {
-			a.handoffBridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
+		if bridge != nil {
+			bridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
 		}
 		if rerouted {
 			return "", skills.ErrRerouteRequested

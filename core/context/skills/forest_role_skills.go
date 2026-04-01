@@ -430,6 +430,7 @@ func registerRoleForestSkillsForAgentIntegration(
 	if registry == nil || deps == nil || deps.Forest == nil {
 		return nil
 	}
+	agentType = NormalizeAdaptiveAgentType(agentType)
 	for _, spec := range forestRoleSkillSpecs {
 		if !roleForestSpecMatchesAgent(spec, agentType) {
 			continue
@@ -444,6 +445,7 @@ func registerRoleForestSkillsForAgentIntegration(
 }
 
 func roleForestSpecMatchesAgent(spec forestRoleSkillSpec, agentType string) bool {
+	agentType = NormalizeAdaptiveAgentType(agentType)
 	if spec.Domain == agentType {
 		return true
 	}
@@ -566,6 +568,7 @@ func NewRoleForestSkill(deps *RetrievalDependencies, spec forestRoleSkillSpec) *
 }
 
 func supplementalDomainsForAgent(agentType string) []string {
+	agentType = NormalizeAdaptiveAgentType(agentType)
 	var domains []string
 	if strings.HasPrefix(agentType, AgentTypeScribe) {
 		domains = append(domains, AgentTypeScribe)
@@ -577,6 +580,7 @@ func supplementalDomainsForAgent(agentType string) []string {
 }
 
 func isPipelineScopedAgent(agentType string) bool {
+	agentType = NormalizeAdaptiveAgentType(agentType)
 	switch agentType {
 	case AgentTypePipeline, AgentTypeEngineer, AgentTypeDesigner, AgentTypeInspector, AgentTypeTester:
 		return true

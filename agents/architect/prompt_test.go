@@ -74,6 +74,8 @@ func TestDefaultSystemPrompt_IncludesDiscussionTimeConsultationGuidance(t *testi
 		"Prefer repeated, targeted consults over one broad omnibus consult.",
 		"Re-evaluate Academic research depth continuously based on the user's latest input",
 		"Do not treat the Academic as a rare keyword-triggered escalation.",
+		"`architect_forest_get_plan_precedents`",
+		"`architect_forest_compare_plan_branches`",
 		"During discussion before planning:",
 		"start with the most relevant knowledge agent and the narrowest question that can materially reduce the next uncertainty",
 		"do not wait for keywords like \"research\" or \"benchmark\" to consult the Academic",
@@ -130,6 +132,7 @@ func TestBuildPlannerConversationSystemPrompt_IncludesConsultationAndSkillsPolic
 	for _, want := range []string{
 		"## Consultation Policy",
 		"## Skill Use Policy",
+		"`architect_forest_get_plan_precedents`",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("conversation system prompt missing %q", want)

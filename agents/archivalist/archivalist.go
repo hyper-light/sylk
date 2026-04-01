@@ -44,6 +44,10 @@ type committedKnowledgeSearcher interface {
 	Search(ctx context.Context, req *search.SearchRequest) (*knowledgeruntime.CommittedSearchResult, error)
 }
 
+type committedKnowledgeWriter interface {
+	UpsertTextDocument(ctx context.Context, req *knowledgeruntime.TextDocumentIngestRequest) error
+}
+
 // Archivalist is the main agent for managing AI-generated content and conversation memory
 type Archivalist struct {
 	id           string
@@ -87,6 +91,7 @@ type Archivalist struct {
 	// Knowledge subsystems
 	knowledgeStore    *knowledge.KnowledgeStore
 	knowledgeBackend  committedKnowledgeSearcher
+	knowledgeWriter   committedKnowledgeWriter
 	queryCoordinator  *query.HybridQueryCoordinator
 	memoryScorer      *memory.MemoryWeightedScorer
 	hybridMemory      *memory.HybridQueryWithMemory
@@ -185,6 +190,9 @@ type Config struct {
 	// WorkspaceViews provides explicit disk/global/pipeline read access for
 	// session-memory grounding.
 	WorkspaceViews versioning.WorkspaceViewAccess
+
+	// Forest exposes Memory Forest recall/prediction skills.
+	Forest shared.MemoryForestService
 }
 
 // New creates a new Archivalist agent with provider-based LLM.
@@ -195,6 +203,10 @@ func New(ctx context.Context, cfg Config) (*Archivalist, error) {
 		return nil, err
 	}
 	archivalist := assembleArchivalist(cfg, components)
+	if err := shared.RegisterMemoryForestSkills(archivalist.skills, "archivalist", cfg.Forest, nil); err != nil {
+		return nil, fmt.Errorf("register archivalist forest skills: %w", err)
+	}
+	archivalist.skillLoader = skills.NewLoader(archivalist.skills, archivalistLoaderConfig(archivalist.skills))
 	if err := archivalist.initToolRuntime(); err != nil {
 		return nil, err
 	}
@@ -330,12 +342,16 @@ func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
 	a.registerCoreSkills()
 	a.registerExtendedSkills()
 
-	skillsLoaderCfg := skills.DefaultLoaderConfig()
-	skillsLoaderCfg.CoreSkills = archivalistVisibleSkillNames()
-	skillsLoaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
-	a.skillLoader = skills.NewLoader(skillsRegistry, skillsLoaderCfg)
+	a.skillLoader = skills.NewLoader(skillsRegistry, archivalistLoaderConfig(skillsRegistry))
 
 	return a
+}
+
+func archivalistLoaderConfig(registry *skills.Registry) skills.LoaderConfig {
+	skillsLoaderCfg := skills.DefaultLoaderConfig()
+	skillsLoaderCfg.CoreSkills = archivalistVisibleSkillNamesForRegistry(registry)
+	skillsLoaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
+	return skillsLoaderCfg
 }
 
 func (a *Archivalist) initToolRuntime() error {
@@ -662,7 +678,8 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	a.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
 	shared.LogIncomingRequest(a.steering.EventLogger(), fwd, a.id)
 	shared.EmitDispatchACK(a.bus, fwd.Metadata, a.id, "archivalist", fwd.CorrelationID)
-	if archivalistPublishesUserActivity(fwd) {
+	activityVisibility := archivalistRequestVisibility(fwd)
+	if activityVisibility == events.VisibilityUser {
 		a.publishActivity(events.EventTypeAgentAction, "Processing archivalist request")
 	} else {
 		a.publishSystemEvent(events.EventTypeAgentAction, "Processing archivalist request")
@@ -690,6 +707,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	emitter := shared.NewToolCallEmitter(a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
 	ctx = shared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
+	ctx = shared.WithStreamEventVisibility(ctx, activityVisibility)
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
@@ -701,7 +719,11 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	gov := shared.NewContextGovernor(a.CurrentModel(), a.config.MaxOutputTokens, 0)
 	if a.handoffBridge != nil {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
-			return a.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+			bridge := shared.EffectiveHandoffBridge(bctx, a.handoffBridge)
+			if bridge == nil {
+				return shared.ErrContextBudgetExhausted
+			}
+			return bridge.ForceHandoff(bctx, "context budget exhausted")
 		}
 	}
 	ctx = shared.WithContextGovernor(ctx, gov)
@@ -722,7 +744,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 				shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
 				streamStarted = true
 			}
-			a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentAction, "Waiting for an available archival replica", snapshot)
+			a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, activityVisibility, events.EventTypeAgentAction, "Waiting for an available archival replica", snapshot)
 			if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
 				pp.PublishState(events.AgentUIStateSearching, shared.KnowledgeQueueProgressMessage("archivalist", snapshot, queuePosition))
 			}
@@ -737,7 +759,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 				shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
 				streamStarted = true
 			}
-			a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentAction, "Processing archivalist request", snapshot)
+			a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, activityVisibility, events.EventTypeAgentAction, "Processing archivalist request", snapshot)
 		},
 	})
 	if stopQueueKeepalive != nil {
@@ -765,6 +787,21 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		return acquireErr
 	}
 
+	if a.handoffBridge != nil {
+		var replicaErr error
+		var cleanupReplicaBridge func()
+		ctx, cleanupReplicaBridge, _, replicaErr = shared.AttachReplicaHandoffBridge(ctx, a, a.handoffBridge, shared.KnowledgeReplicaHandoffOptions{
+			SessionID:         fwd.SessionID,
+			CorrelationID:     fwd.CorrelationID,
+			ActivityPublisher: a.activityPub,
+		})
+		if replicaErr != nil {
+			lease.Release()
+			return replicaErr
+		}
+		defer cleanupReplicaBridge()
+	}
+
 	bundle, err := a.newForwardedToolBundle()
 	if err != nil {
 		lease.Release()
@@ -788,7 +825,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		if fwd.FireAndForget {
 			return nil
 		}
-		a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentError, fmt.Sprintf("Request failed: %s", err.Error()), snapshot)
+		a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, activityVisibility, events.EventTypeAgentError, fmt.Sprintf("Request failed: %s", err.Error()), snapshot)
 		errMsg := guide.NewErrorMessage(a.generateMessageID(), fwd.CorrelationID, a.id, err.Error())
 		return a.bus.Publish(a.channels.Errors, errMsg)
 	}
@@ -808,7 +845,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		ProcessingTime:      time.Since(startTime),
 		Data:                result,
 	}
-	a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeSuccess, "Request completed", snapshot)
+	a.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, activityVisibility, events.EventTypeSuccess, "Request completed", snapshot)
 
 	respMsg := guide.NewResponseMessage(a.generateMessageID(), resp)
 	return a.bus.Publish(a.channels.Responses, respMsg)
@@ -953,6 +990,13 @@ func archivalistPublishesUserActivity(fwd *guide.ForwardedRequest) bool {
 		return true
 	}
 	return !archivalistBypassesLLM(fwd)
+}
+
+func archivalistRequestVisibility(fwd *guide.ForwardedRequest) events.EventVisibility {
+	if archivalistPublishesUserActivity(fwd) {
+		return events.VisibilityUser
+	}
+	return events.VisibilitySystem
 }
 
 func (a *Archivalist) processDeterministicForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
@@ -1313,11 +1357,22 @@ func (a *Archivalist) insertStoreEntry(storeEntry *Entry) (SubmissionResult, err
 func (a *Archivalist) runPostStoreHooks(ctx context.Context, storeData *skills.StoreHookData, result SubmissionResult, err error) error {
 	storeData.Result = result
 	storeData.Error = err
+	var mirrorErr error
 	if a.hooks == nil {
-		return nil
+		if result.Success && err == nil {
+			if entry, entryErr := entryFromStoreData(storeData); entryErr == nil {
+				mirrorErr = a.mirrorStoredEntryToKnowledge(ctx, entry, result)
+			}
+		}
+		return mirrorErr
 	}
 	_, _, hookErr := a.hooks.ExecutePostStoreHooks(ctx, storeData)
-	return hookErr
+	if result.Success && err == nil {
+		if entry, entryErr := entryFromStoreData(storeData); entryErr == nil {
+			mirrorErr = a.mirrorStoredEntryToKnowledge(ctx, entry, result)
+		}
+	}
+	return errors.Join(hookErr, mirrorErr)
 }
 
 func finalizeStoreResult(result SubmissionResult, err error, hookErr error) SubmissionResult {
@@ -3134,6 +3189,11 @@ func (a *Archivalist) SetKnowledgeBackend(backend committedKnowledgeSearcher) {
 	a.runMu.Lock()
 	defer a.runMu.Unlock()
 	a.knowledgeBackend = backend
+	if writer, ok := backend.(committedKnowledgeWriter); ok {
+		a.knowledgeWriter = writer
+	} else {
+		a.knowledgeWriter = nil
+	}
 }
 
 // SetWorkspaceViews injects explicit disk/global/pipeline read access.

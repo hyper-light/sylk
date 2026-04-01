@@ -1,12 +1,13 @@
 package designer
 
 import (
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 func designerVisibleSkillNames() []string {
-	return []string{
+	return shared.AppendMemoryForestVisibleSkillNames([]string{
 		"search_skills",
 		"read_file",
 		"prepare_pipeline_write_context",
@@ -40,11 +41,11 @@ func designerVisibleSkillNames() []string {
 		"coord_publish_artifact",
 		"coord_request_review",
 		"coord_resolve_artifact",
-	}
+	}, "designer")
 }
 
 func designerMutatingSkillNames() []string {
-	return []string{
+	return shared.AppendMemoryForestMutatingSkillNames([]string{
 		"write_pipeline_file",
 		"edit_pipeline_file",
 		"delete_pipeline_file",
@@ -68,7 +69,7 @@ func designerMutatingSkillNames() []string {
 		"report_to_engineer",
 		"report_to_orchestrator",
 		"reroute_request",
-	}
+	})
 }
 
 func designerToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {
@@ -76,7 +77,7 @@ func designerToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest
 		AgentID:          "designer",
 		CapabilityScope:  "designer.default",
 		Registry:         registry,
-		VisibleByDefault: designerVisibleSkillNames(),
-		Mutating:         designerMutatingSkillNames(),
+		VisibleByDefault: shared.FilterRegisteredSkillNames(registry, designerVisibleSkillNames()),
+		Mutating:         shared.FilterRegisteredSkillNames(registry, designerMutatingSkillNames()),
 	})
 }

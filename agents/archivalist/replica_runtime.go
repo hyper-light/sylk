@@ -27,9 +27,7 @@ func (a *Archivalist) newForwardedToolBundle() (*archivalistToolBundle, error) {
 	if err != nil {
 		return nil, err
 	}
-	loaderCfg := skills.DefaultLoaderConfig()
-	loaderCfg.CoreSkills = archivalistVisibleSkillNames()
-	loaderCfg.AutoLoadDomains = nil
+	loaderCfg := archivalistLoaderConfig(registry)
 	loader := skills.NewLoader(registry, loaderCfg)
 	runtime, err := toolruntime.New(toolruntime.Config{
 		Registry: registry,
@@ -122,6 +120,7 @@ func (b *archivalistToolBundle) toolInvocations(ctx context.Context, agentID str
 
 func (a *Archivalist) publishReplicaActivityForRequest(
 	sessionID, correlationID string,
+	visibility events.EventVisibility,
 	eventType events.EventType,
 	content string,
 	snapshot shared.RequestReplicaPoolSnapshot,
@@ -132,7 +131,7 @@ func (a *Archivalist) publishReplicaActivityForRequest(
 	evt := events.NewActivityEvent(eventType, strings.TrimSpace(sessionID), content)
 	evt.CorrelationID = strings.TrimSpace(correlationID)
 	evt.AgentID = a.id
-	evt.Visibility = events.VisibilityUser
+	evt.Visibility = visibility
 	evt.Data["agent_type"] = "archivalist"
 	evt.Data["agent_name"] = "Archivalist"
 	evt.Data["active_replicas"] = snapshot.Active

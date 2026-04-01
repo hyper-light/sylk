@@ -239,6 +239,29 @@ func TestOpenWithOptions(t *testing.T) {
 	}
 }
 
+func TestOpenReopensExistingDatabase(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	reopened, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen existing db: %v", err)
+	}
+	defer reopened.Close()
+
+	if _, err := reopened.db.Exec(`INSERT INTO vector_index_meta(key, value) VALUES ('k', 'v')`); err != nil {
+		t.Fatalf("write after reopen: %v", err)
+	}
+}
+
 func TestOpenWithOptionsInvalidConfig(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")

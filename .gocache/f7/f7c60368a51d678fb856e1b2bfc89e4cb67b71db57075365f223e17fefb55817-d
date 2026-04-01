@@ -1,0 +1,4 @@
+./controller.go
+./merger.go
+./registry.go
+./types.go

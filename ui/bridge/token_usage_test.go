@@ -23,6 +23,10 @@ func TestTokenUsageBridgeForwardHandlerAcceptsNumericVariants(t *testing.T) {
 	evt.Data["cache_read_tokens"] = uint32(125)
 	evt.Data["cache_write_tokens"] = float32(50)
 	evt.Data["reasoning_tokens"] = uint16(25)
+	evt.Data["runtime_agent_id"] = "engineer-runtime-1"
+	evt.Data["agent_type"] = "engineer"
+	evt.Data["pipeline_id"] = "task_auth_checkout"
+	evt.Data["task_id"] = "task_auth_checkout"
 
 	if err := handler(guide.NewActivityMessage("engineer", evt)); err != nil {
 		t.Fatalf("handler error: %v", err)
@@ -37,6 +41,18 @@ func TestTokenUsageBridgeForwardHandlerAcceptsNumericVariants(t *testing.T) {
 	}
 	if usage.AgentID != "engineer" {
 		t.Fatalf("AgentID = %q, want engineer", usage.AgentID)
+	}
+	if usage.RuntimeAgentID != "engineer-runtime-1" {
+		t.Fatalf("RuntimeAgentID = %q, want engineer-runtime-1", usage.RuntimeAgentID)
+	}
+	if usage.AgentType != "engineer" {
+		t.Fatalf("AgentType = %q, want engineer", usage.AgentType)
+	}
+	if usage.PipelineID != "task_auth_checkout" {
+		t.Fatalf("PipelineID = %q, want task_auth_checkout", usage.PipelineID)
+	}
+	if usage.TaskID != "task_auth_checkout" {
+		t.Fatalf("TaskID = %q, want task_auth_checkout", usage.TaskID)
 	}
 	if usage.CorrelationID != "corr-1" {
 		t.Fatalf("CorrelationID = %q, want corr-1", usage.CorrelationID)

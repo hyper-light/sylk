@@ -1,0 +1,14 @@
+./append.go
+./append_value.go
+./dialect.go
+./field.go
+./hook.go
+./querygen.go
+./reflect.go
+./relation.go
+./scan.go
+./sqlfmt.go
+./sqltype.go
+./table.go
+./tables.go
+./zerochecker.go

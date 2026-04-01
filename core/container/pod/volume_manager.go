@@ -14,6 +14,10 @@ type ManagedVolume interface {
 	// Mount prepares the volume for use (called on promote to Hot).
 	Mount(ctx context.Context) error
 
+	// EnsureReady validates any hot-pod bindings that must remain live across
+	// retries while the volume stays mounted.
+	EnsureReady(ctx context.Context) error
+
 	// Unmount tears down the volume (called on demote from Hot).
 	Unmount(ctx context.Context) error
 
@@ -77,6 +81,28 @@ func (vm *VolumeManager) MountAll(ctx context.Context) error {
 		}
 	}
 	vm.mounted = true
+	return nil
+}
+
+// EnsureReady refreshes mounted volumes that need deterministic rebinding
+// across hot-pod reuse without forcing an unmount/remount cycle.
+func (vm *VolumeManager) EnsureReady(ctx context.Context) error {
+	vm.mu.RLock()
+	if !vm.mounted {
+		vm.mu.RUnlock()
+		return nil
+	}
+	volumes := make([]ManagedVolume, 0, len(vm.volumes))
+	for _, v := range vm.volumes {
+		volumes = append(volumes, v)
+	}
+	vm.mu.RUnlock()
+
+	for _, v := range volumes {
+		if err := v.EnsureReady(ctx); err != nil {
+			return fmt.Errorf("ensure volume %q ready: %w", v.VolumeName(), err)
+		}
+	}
 	return nil
 }
 

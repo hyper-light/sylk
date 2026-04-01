@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	containerpod "github.com/adalundhe/sylk/core/container/pod"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 // --- test helpers ---
@@ -384,6 +386,92 @@ func TestAgentPod_HoldForNode_WithCoAgents(t *testing.T) {
 	}
 
 	pod.Release()
+}
+
+func TestAgentPod_HoldForNode_RebindsTaskDraftOnHotRetry(t *testing.T) {
+	dir := t.TempDir()
+	svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
+		SessionID:  "sess-1",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	defer func() { _ = svfs.Close() }()
+
+	volumeManager := containerpod.NewVolumeManager(containerpod.VolumeManagerConfig{
+		Volumes: []containerpod.ManagedVolume{
+			containerpod.NewVFSVolume(containerpod.VFSVolumeConfig{
+				Name:       "workspace",
+				PipelineID: "task-1",
+				SessionID:  "sess-1",
+				WorkingDir: dir,
+				SessionVFS: svfs,
+				Files:      []string{"retry.txt"},
+			}),
+		},
+		Mounts: map[string]string{
+			"engineer": "workspace",
+		},
+	})
+
+	pod := NewAgentPod(AgentPodConfig{
+		PodID:         "task-1",
+		SessionID:     "sess-1",
+		Runtime:       managedPodTestRuntime(),
+		VolumeManager: volumeManager,
+		Policy:        managedPodTestPolicy("task-1", []string{"engineer"}, containerpod.PodTypePipeline),
+		Specs:         managedPodTestSpecs([]string{"engineer"}),
+	})
+	defer pod.Release()
+
+	if err := pod.HoldForNode(context.Background(), "node-1", []string{"engineer"}); err != nil {
+		t.Fatalf("first HoldForNode: %v", err)
+	}
+	if !svfs.HasPipeline("task-1") {
+		t.Fatal("expected active task draft after first activation")
+	}
+
+	fa := pod.FileAccessFor("engineer")
+	if fa == nil {
+		t.Fatal("expected mounted file access")
+	}
+	if err := fa.WriteFile(context.Background(), "retry.txt", []byte("first")); err != nil {
+		t.Fatalf("initial WriteFile: %v", err)
+	}
+	pod.ReleaseForNode("node-1")
+
+	if pod.LoadTier() != containerpod.TierHot {
+		t.Fatalf("pod tier = %d, want hot", pod.LoadTier())
+	}
+	if err := svfs.RollbackPipeline("task-1"); err != nil {
+		t.Fatalf("RollbackPipeline: %v", err)
+	}
+	if svfs.HasPipeline("task-1") {
+		t.Fatal("expected task draft rollback to clear tracked pipeline")
+	}
+
+	if err := pod.HoldForNode(context.Background(), "node-2", []string{"engineer"}); err != nil {
+		t.Fatalf("second HoldForNode: %v", err)
+	}
+	if !svfs.HasPipeline("task-1") {
+		t.Fatal("expected hot retry to rebind a fresh task draft")
+	}
+	if err := fa.WriteFile(context.Background(), "retry.txt", []byte("second")); err != nil {
+		t.Fatalf("rebound WriteFile: %v", err)
+	}
+
+	pipelineFA, err := svfs.PipelineFileAccess("task-1")
+	if err != nil {
+		t.Fatalf("PipelineFileAccess: %v", err)
+	}
+	content, err := pipelineFA.ReadFile(context.Background(), filepath.Join(dir, "retry.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile from rebound draft: %v", err)
+	}
+	if string(content) != "second" {
+		t.Fatalf("rebound content = %q, want second", string(content))
+	}
 }
 
 func TestAgentPod_HoldForNode_RegistrarDedup(t *testing.T) {
@@ -859,6 +947,32 @@ func TestAgentPod_GetScribe(t *testing.T) {
 	}
 
 	pod.Release()
+}
+
+func TestAgentPod_ReplaceScribe(t *testing.T) {
+	pod := NewAgentPod(AgentPodConfig{PodID: "pod-1"})
+	first := &mockScribe{}
+	if previous := pod.ReplaceScribe("engineer", first); previous != nil {
+		t.Fatalf("initial replace returned previous=%#v, want nil", previous)
+	}
+	if got := pod.GetScribe("engineer"); got != first {
+		t.Fatalf("stored scribe = %#v, want %#v", got, first)
+	}
+
+	replacement := &mockScribe{}
+	if previous := pod.ReplaceScribe("engineer", replacement); previous != first {
+		t.Fatalf("replace returned previous=%#v, want first", previous)
+	}
+	if got := pod.GetScribe("engineer"); got != replacement {
+		t.Fatalf("stored replacement = %#v, want %#v", got, replacement)
+	}
+
+	if previous := pod.ReplaceScribe("engineer", nil); previous != replacement {
+		t.Fatalf("remove returned previous=%#v, want replacement", previous)
+	}
+	if got := pod.GetScribe("engineer"); got != nil {
+		t.Fatalf("expected nil after removal, got %#v", got)
+	}
 }
 
 func TestAgentPod_NoScribeFactory(t *testing.T) {

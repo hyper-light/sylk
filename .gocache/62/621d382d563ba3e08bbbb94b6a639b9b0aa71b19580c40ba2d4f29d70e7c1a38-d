@@ -1,0 +1,10 @@
+./analysis.go
+./batch.go
+./directory.go
+./document.go
+./freq.go
+./index.go
+./indexing_options.go
+./optimize.go
+./sizes.go
+./spatial_plugin.go

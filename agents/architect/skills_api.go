@@ -24,7 +24,11 @@ func architectAllSkillNames() []string {
 }
 
 func architectToolManifest() *toolruntime.PolicyManifest {
-	return toolruntime.ApplyAuthorityProfile("architect", toolruntime.NewManifest("architect", "architect.default",
+	return architectToolManifestForRegistry(nil)
+}
+
+func architectToolManifestForRegistry(registry *skills.Registry) *toolruntime.PolicyManifest {
+	policies := []toolruntime.ToolPolicy{
 		toolruntime.NewToolPolicy("plan", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("plan_workflow", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("start_planning", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
@@ -43,7 +47,9 @@ func architectToolManifest() *toolruntime.PolicyManifest {
 		toolruntime.NewToolPolicy("reroute_request", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("self_diagnostic", toolruntime.EffectReadOnly, toolruntime.DomainSystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy(toolruntime.SearchToolName, toolruntime.EffectReadOnly, toolruntime.DomainDiscovery, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault(), toolruntime.WithSearchable(false)),
-	))
+	}
+	policies = shared.AppendMemoryForestToolPolicies(policies, registry, "architect")
+	return toolruntime.ApplyAuthorityProfile("architect", toolruntime.NewManifest("architect", "architect.default", policies...))
 }
 
 func filterSyntheticRuntimeTools(names []string) []string {

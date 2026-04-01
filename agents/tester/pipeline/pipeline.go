@@ -99,6 +99,8 @@ type PipelineTester struct {
 
 	// Steering ledger management.
 	steering *agentshared.SteeringManager
+	// Tracks Memory Forest branches surfaced during pipeline testing.
+	forestTracker *agentshared.MemoryForestTracker
 
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
@@ -122,6 +124,7 @@ func New(cfg shared.PipelineTesterConfig, provider pipelineTesterProvider) (*Pip
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		pendingBus:        make(map[string]chan *guide.Message),
 		diagEngine:        shared.NewDiagnosisEngine(),
+		forestTracker:     agentshared.NewMemoryForestTracker(),
 		steering:          agentshared.NewSteeringManager(),
 		requestSerializer: agentshared.NewRequestSerializer(),
 		executionBroker:   purevfs.DefaultExecutionBroker(),
@@ -159,6 +162,36 @@ func (pt *PipelineTester) initSkills() error {
 	pt.skills = skills.NewRegistry()
 
 	pt.registerCoreSkills()
+	if err := agentshared.RegisterMemoryForestSkills(pt.skills, "tester-pipeline", pt.config.Forest, pt.forestTracker); err != nil {
+		return fmt.Errorf("register pipeline tester forest skills: %w", err)
+	}
+	if err := agentshared.AttachForestOutcomeRecorder(
+		pt.skills,
+		"run_test_suite",
+		pt.forestTracker,
+		pt.config.Forest,
+		func() string { return pt.id },
+		"tester-pipeline",
+		func() string { return pt.config.SessionID },
+		agentshared.OutcomeFromSuiteCounts(
+			"pipeline tester suite execution passed",
+			"pipeline tester suite execution found failing tests",
+		),
+	); err != nil {
+		return fmt.Errorf("attach pipeline tester forest suite outcome: %w", err)
+	}
+	if err := agentshared.AttachForestOutcomeRecorder(
+		pt.skills,
+		"handoff_next",
+		pt.forestTracker,
+		pt.config.Forest,
+		func() string { return pt.id },
+		"tester-pipeline",
+		func() string { return pt.config.SessionID },
+		agentshared.OutcomeOnSuccess("pipeline tester handed verification to the next worker"),
+	); err != nil {
+		return fmt.Errorf("attach pipeline tester forest handoff outcome: %w", err)
+	}
 
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = pipelineTesterVisibleSkillNames()
@@ -442,6 +475,7 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 	}
 
 	ctx = agentshared.WithPipelineTaskProtocolState(ctx, task)
+	defer agentshared.ClosePipelineProtocolState(ctx)
 	prevRuntime := pt.swapTaskRuntime(task)
 	defer pt.restoreTaskRuntime(prevRuntime)
 	userMessage := fwd.Input
@@ -534,8 +568,6 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 
 	if taskID, _ := fwd.Metadata["task_id"].(string); taskID != "" {
 		pt.pipelineID = taskID
-	} else if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
-		pt.pipelineID = dagID
 	}
 	if taskSlug, _ := fwd.Metadata["task_slug"].(string); taskSlug != "" {
 		pt.pipelineSlug = taskSlug

@@ -24,6 +24,18 @@ import (
 // is requested before the committed backend has been initialized.
 var ErrCommittedBackendUnavailable = errors.New("committed knowledge backend is unavailable")
 
+// TextDocumentIngestRequest describes a deterministic text document mutation
+// into the committed-global document and knowledge stores.
+type TextDocumentIngestRequest struct {
+	DocumentID string
+	Path       string
+	Content    string
+	DocType    search.DocumentType
+	Language   string
+	Domain     sylkdir.Domain
+	Metadata   map[string]string
+}
+
 // CommittedSearchHit is a committed global knowledge hit enriched with node and
 // edge metadata from the knowledge graph.
 type CommittedSearchHit struct {
@@ -67,10 +79,10 @@ type committedPathMeta struct {
 	RelatedPaths    []string
 	RelatedSymbols  []string
 
-	canonicalSet    map[string]struct{}
-	symbolSet       map[string]struct{}
-	nodeKindSet     map[string]struct{}
-	relatedPathSet  map[string]struct{}
+	canonicalSet     map[string]struct{}
+	symbolSet        map[string]struct{}
+	nodeKindSet      map[string]struct{}
+	relatedPathSet   map[string]struct{}
 	relatedSymbolSet map[string]struct{}
 }
 
@@ -153,13 +165,13 @@ type committedMetadataIndex struct {
 }
 
 type committedKnowledgeState struct {
-	head        sylkdir.SemanticVersion
-	bleveStore  *sylkdir.GlobalVersionBleveStore
-	nodeStore   *sylkdir.GlobalVersionNodeStore
-	edgeStore   *sylkdir.GlobalVersionEdgeStore
-	docStore    *sylkdir.GlobalVersionDocStore
+	head          sylkdir.SemanticVersion
+	bleveStore    *sylkdir.GlobalVersionBleveStore
+	nodeStore     *sylkdir.GlobalVersionNodeStore
+	edgeStore     *sylkdir.GlobalVersionEdgeStore
+	docStore      *sylkdir.GlobalVersionDocStore
 	externalBleve bool
-	index       *committedMetadataIndex
+	index         *committedMetadataIndex
 }
 
 func (s *committedKnowledgeState) Close() error {
@@ -195,9 +207,9 @@ type CommittedKnowledgeBackend struct {
 
 	refreshMu sync.Mutex
 
-	stateMu  sync.RWMutex
-	state    *committedKnowledgeState
-	retired  []*committedKnowledgeState
+	stateMu   sync.RWMutex
+	state     *committedKnowledgeState
+	retired   []*committedKnowledgeState
 	closeOnce sync.Once
 
 	embedderMu sync.Mutex
@@ -305,6 +317,57 @@ func (b *CommittedKnowledgeBackend) IngestFetchedDocument(ctx context.Context, e
 		return fmt.Errorf("committed ingest: extracted content is empty")
 	}
 
+	return b.upsertJointDocument(ctx, &sylkdir.JointDocRequest{
+		DocID:    stableFetchedDocumentID(provenance.FetchURL),
+		Path:     provenance.FetchURL,
+		Content:  []byte(content),
+		DocType:  search.DocTypeWebFetch,
+		Language: language,
+		Domain:   sylkdir.DomainResearch,
+	})
+}
+
+// UpsertTextDocument deterministically inserts or replaces a text-backed
+// document in the committed-global stores, then refreshes the live backend.
+func (b *CommittedKnowledgeBackend) UpsertTextDocument(ctx context.Context, req *TextDocumentIngestRequest) error {
+	if req == nil {
+		return fmt.Errorf("committed ingest: request is required")
+	}
+	if strings.TrimSpace(req.Path) == "" {
+		return fmt.Errorf("committed ingest: path is required")
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		return fmt.Errorf("committed ingest: content is required")
+	}
+	docType := req.DocType
+	if !docType.IsValid() {
+		docType = search.DocTypeNote
+	}
+	domain := req.Domain
+	if domain == sylkdir.DomainCode && docType != search.DocTypeSourceCode {
+		domain = sylkdir.DomainDoc
+	}
+	documentID := strings.TrimSpace(req.DocumentID)
+	if documentID == "" {
+		documentID = stableTextDocumentID(req.Path, req.Content)
+	}
+	return b.upsertJointDocument(ctx, &sylkdir.JointDocRequest{
+		DocID:    documentID,
+		Path:     strings.TrimSpace(req.Path),
+		Content:  []byte(req.Content),
+		DocType:  docType,
+		Language: strings.TrimSpace(req.Language),
+		Domain:   domain,
+		Metadata: cloneCommittedDocumentMetadata(req.Metadata),
+	})
+}
+
+func (b *CommittedKnowledgeBackend) upsertJointDocument(ctx context.Context, req *sylkdir.JointDocRequest) error {
+	if req == nil {
+		return fmt.Errorf("committed ingest: joint request is required")
+	}
+	canonicalKey := sylkdir.DocumentCanonicalKey(req.DocType, req.Path)
+
 	b.refreshMu.Lock()
 	defer b.refreshMu.Unlock()
 
@@ -345,16 +408,23 @@ func (b *CommittedKnowledgeBackend) IngestFetchedDocument(ctx context.Context, e
 		return fmt.Errorf("committed ingest: run recovery: %w", err)
 	}
 
-	bleveStore := sylkdir.NewGlobalVersionBleveStore(sd, gm.GetHead())
-	if err := bleveStore.OpenHead(); err != nil {
-		return fmt.Errorf("committed ingest: open global bleve: %w", err)
-	}
-	transferredBleve := false
-	defer func() {
-		if !transferredBleve {
-			_ = bleveStore.CloseAll()
+	var (
+		bleveStore          *sylkdir.GlobalVersionBleveStore
+		refreshAttached     bool
+		transferredAttached bool
+	)
+	if state := b.currentState(); state == nil || state.bleveStore == nil {
+		bleveStore = sylkdir.NewGlobalVersionBleveStore(sd, gm.GetHead())
+		if err := bleveStore.OpenHead(); err != nil {
+			return fmt.Errorf("committed ingest: open global bleve: %w", err)
 		}
-	}()
+		refreshAttached = true
+		defer func() {
+			if !transferredAttached {
+				_ = bleveStore.CloseAll()
+			}
+		}()
+	}
 
 	session, err := createCommittedIngestSession(sd, gm)
 	if err != nil {
@@ -364,22 +434,19 @@ func (b *CommittedKnowledgeBackend) IngestFetchedDocument(ctx context.Context, e
 	_ = session.CloseBleve()
 	session.BleveStore = nil
 
-	jointReq := &sylkdir.JointDocRequest{
-		DocID:    stableFetchedDocumentID(provenance.FetchURL),
-		Path:     provenance.FetchURL,
-		Content:  []byte(content),
-		DocType:  search.DocTypeWebFetch,
-		Language: language,
-		Domain:   sylkdir.DomainResearch,
-	}
-
 	ingestEmbedder, ingestErr := b.ensureEmbedder(ctx)
 	if ingestErr != nil {
 		b.logger.Warn("committed ingest: embedder unavailable, proceeding without vectors", "error", ingestErr)
 		ingestEmbedder = nil
 	}
 
-	if _, err := session.InsertDocument(ctx, jointReq, ingestEmbedder); err != nil {
+	if _, err := canon.Lookup(canonicalKey); err == nil {
+		if _, err := session.InsertDocument(ctx, req, ingestEmbedder); err != nil {
+			return fmt.Errorf("committed ingest: replace document: %w", err)
+		}
+	} else if !errors.Is(err, sylkdir.ErrKeyNotFound) {
+		return fmt.Errorf("committed ingest: lookup canonical key: %w", err)
+	} else if _, err := session.InsertDocument(ctx, req, ingestEmbedder); err != nil {
 		return fmt.Errorf("committed ingest: insert document: %w", err)
 	}
 
@@ -394,10 +461,14 @@ func (b *CommittedKnowledgeBackend) IngestFetchedDocument(ctx context.Context, e
 		return fmt.Errorf("committed ingest: commit to global: %w", err)
 	}
 
-	if err := b.refresh(ctx, bleveStore, false, true); err != nil {
+	attachedBleve := bleveStore
+	if !refreshAttached {
+		attachedBleve = nil
+	}
+	if err := b.refreshLocked(ctx, attachedBleve, false, true); err != nil {
 		return fmt.Errorf("committed ingest: refresh backend: %w", err)
 	}
-	transferredBleve = true
+	transferredAttached = refreshAttached
 	return nil
 }
 
@@ -462,7 +533,10 @@ func (b *CommittedKnowledgeBackend) ensureEmbedder(ctx context.Context) (embedde
 func (b *CommittedKnowledgeBackend) refresh(ctx context.Context, attachedBleve *sylkdir.GlobalVersionBleveStore, externalBleve bool, closeRetired bool) error {
 	b.refreshMu.Lock()
 	defer b.refreshMu.Unlock()
+	return b.refreshLocked(ctx, attachedBleve, externalBleve, closeRetired)
+}
 
+func (b *CommittedKnowledgeBackend) refreshLocked(ctx context.Context, attachedBleve *sylkdir.GlobalVersionBleveStore, externalBleve bool, closeRetired bool) error {
 	nextState, err := b.buildState(ctx, attachedBleve, externalBleve)
 	if err != nil {
 		return err
@@ -711,6 +785,22 @@ func composeFetchedDocumentContent(entry *fetch.QuarantineEntry, provenance *fet
 func stableFetchedDocumentID(rawURL string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(rawURL)))
 	return "fetch_" + hex.EncodeToString(sum[:8])
+}
+
+func stableTextDocumentID(path, content string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(path) + "\n" + strings.TrimSpace(content)))
+	return "doc_" + hex.EncodeToString(sum[:8])
+}
+
+func cloneCommittedDocumentMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	clone := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		clone[key] = value
+	}
+	return clone
 }
 
 func committedDomainName(value sylkdir.Domain) string {

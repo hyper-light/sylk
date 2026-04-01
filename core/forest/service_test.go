@@ -13,6 +13,10 @@ import (
 )
 
 func newTestForest(t *testing.T) (*MemoryForest, *sql.DB) {
+	return newTestForestWithConfig(t, Config{})
+}
+
+func newTestForestWithConfig(t *testing.T, cfg Config) (*MemoryForest, *sql.DB) {
 	t.Helper()
 
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", stableID("forest-test", t.Name()))
@@ -33,11 +37,50 @@ func newTestForest(t *testing.T) (*MemoryForest, *sql.DB) {
 		t.Fatalf("seed nodes table: %v", err)
 	}
 
-	forest, err := New(Config{DB: db})
+	cfg.DB = db
+	forest, err := New(cfg)
 	if err != nil {
 		t.Fatalf("new forest: %v", err)
 	}
 	return forest, db
+}
+
+func waitForForestCondition(t *testing.T, timeout time.Duration, check func() (bool, error)) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for {
+		ok, err := check()
+		if err != nil {
+			t.Fatalf("wait condition: %v", err)
+		}
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met before timeout")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestMemoryForest_NewRequiresNodesTable(t *testing.T) {
+	t.Parallel()
+
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", stableID("forest-missing-nodes", t.Name()))
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	_, err = New(Config{DB: db})
+	if err == nil {
+		t.Fatal("expected error for missing nodes table")
+	}
+	if !strings.Contains(err.Error(), "forest db missing nodes table") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestMemoryForest_RecordContentAndRetrieve(t *testing.T) {
@@ -133,6 +176,36 @@ func TestMemoryForest_ReplayPromotesSemanticBranch(t *testing.T) {
 	if count == 0 {
 		t.Fatal("expected replay to promote at least one semantic branch")
 	}
+}
+
+func TestMemoryForest_ReplayPromotesSemanticBranchEventDriven(t *testing.T) {
+	t.Parallel()
+
+	forest, db := newTestForestWithConfig(t, Config{ReplayDelay: 10 * time.Millisecond})
+	defer forest.Close()
+	defer db.Close()
+
+	entry := &ctxpkg.ContentEntry{
+		ID:          "scribe-event-driven",
+		SessionID:   "session-event-replay",
+		AgentID:     "scribe-engineer-1",
+		AgentType:   "scribe-engineer",
+		ContentType: ctxpkg.ContentTypeAssistantReply,
+		Content:     "Engineer sidecar notes: retry jitter eliminated flaky network bursts.",
+		Timestamp:   time.Now().UTC(),
+		TurnNumber:  3,
+		Confidence:  0.86,
+		Salience:    0.93,
+	}
+	if err := forest.RecordContent(context.Background(), entry); err != nil {
+		t.Fatalf("record content: %v", err)
+	}
+
+	waitForForestCondition(t, 2*time.Second, func() (bool, error) {
+		var count int
+		err := db.QueryRow(`SELECT COUNT(*) FROM forest_branches WHERE scope = ?`, string(ScopeSemantic)).Scan(&count)
+		return count > 0, err
+	})
 }
 
 func TestMemoryForest_TrainModelsAndPredict(t *testing.T) {
@@ -246,10 +319,172 @@ func TestMemoryForest_TrainModelsAndPredict(t *testing.T) {
 	}
 }
 
-func TestMemoryForest_SubstrateRefreshesState(t *testing.T) {
+func TestMemoryForest_TrainModelsEventDriven(t *testing.T) {
 	t.Parallel()
 
-	forest, db := newTestForest(t)
+	forest, db := newTestForestWithConfig(t, Config{TrainingDebounce: 10 * time.Millisecond})
+	defer forest.Close()
+	defer db.Close()
+
+	now := time.Now().UTC()
+	for i := 0; i < 10; i++ {
+		entry := &ctxpkg.ContentEntry{
+			ID:          fmt.Sprintf("event-positive-%d", i),
+			SessionID:   "session-train-event",
+			AgentID:     "engineer-1",
+			AgentType:   "engineer",
+			ContentType: ctxpkg.ContentTypeDecision,
+			Content:     fmt.Sprintf("Retry with jitter and capped exponential backoff for flaky API clients %d.", i),
+			Timestamp:   now.Add(time.Duration(i) * time.Second),
+			TurnNumber:  i + 1,
+			Confidence:  0.9,
+			Salience:    0.85,
+		}
+		if err := forest.RecordContent(context.Background(), entry); err != nil {
+			t.Fatalf("record positive content %d: %v", i, err)
+		}
+	}
+	for i := 0; i < 10; i++ {
+		entry := &ctxpkg.ContentEntry{
+			ID:          fmt.Sprintf("event-negative-%d", i),
+			SessionID:   "session-train-event",
+			AgentID:     "engineer-1",
+			AgentType:   "engineer",
+			ContentType: ctxpkg.ContentTypeDecision,
+			Content:     fmt.Sprintf("Refresh marketing splash gradients and update color theme token names %d.", i),
+			Timestamp:   now.Add(time.Duration(20+i) * time.Second),
+			TurnNumber:  i + 20,
+			Confidence:  0.7,
+			Salience:    0.6,
+		}
+		if err := forest.RecordContent(context.Background(), entry); err != nil {
+			t.Fatalf("record negative content %d: %v", i, err)
+		}
+	}
+
+	packets, err := forest.Retrieve(context.Background(), Query{
+		Query:     "retry jitter backoff flaky api",
+		SessionID: "session-train-event",
+		AgentType: "engineer",
+		Limit:     20,
+		Families:  []TreeFamily{TreeFamilyDecision},
+	})
+	if err != nil {
+		t.Fatalf("initial retrieve: %v", err)
+	}
+	if len(packets) < 16 {
+		t.Fatalf("expected at least 16 packets for training, got %d", len(packets))
+	}
+
+	for _, packet := range packets {
+		status := OutcomeStatusFailed
+		if strings.Contains(strings.ToLower(packet.Branch.Summary), "retry") {
+			status = OutcomeStatusSucceeded
+		}
+		if err := forest.RecordOutcome(context.Background(), OutcomeRecord{
+			BranchID:   packet.Branch.ID,
+			SessionID:  "session-train-event",
+			AgentID:    "engineer-1",
+			AgentType:  "engineer",
+			Status:     status,
+			Summary:    "training label",
+			Confidence: 0.9,
+			Salience:   0.8,
+		}); err != nil {
+			t.Fatalf("record outcome for %s: %v", packet.Branch.ID, err)
+		}
+	}
+
+	waitForForestCondition(t, 5*time.Second, func() (bool, error) {
+		var count int
+		err := db.QueryRow(`SELECT COUNT(*) FROM forest_models WHERE active = 1`).Scan(&count)
+		return count > 0, err
+	})
+
+	packets, err = forest.Retrieve(context.Background(), Query{
+		Query:     "retry jitter backoff flaky api",
+		SessionID: "session-train-event",
+		AgentType: "engineer",
+		Limit:     8,
+		Families:  []TreeFamily{TreeFamilyDecision},
+	})
+	if err != nil {
+		t.Fatalf("retrieve with learned model: %v", err)
+	}
+	if len(packets) == 0 {
+		t.Fatal("expected packets after training")
+	}
+	if packets[0].Prediction == nil {
+		t.Fatal("expected learned prediction on returned packet")
+	}
+}
+
+func TestMemoryForest_RetrieveDoesNotComputeSubstrate(t *testing.T) {
+	t.Parallel()
+
+	forest, db := newTestForestWithConfig(t, Config{SubstrateDebounce: 500 * time.Millisecond})
+	defer forest.Close()
+	defer db.Close()
+
+	now := time.Now().UTC()
+	entries := []*ctxpkg.ContentEntry{
+		{
+			ID:          "substrate-read-a",
+			SessionID:   "session-substrate-read",
+			AgentID:     "engineer-1",
+			AgentType:   "engineer",
+			ContentType: ctxpkg.ContentTypeDecision,
+			Content:     "Implement retry jitter on the API adapter and preserve previous timeout semantics.",
+			Timestamp:   now,
+			TurnNumber:  1,
+			Confidence:  0.88,
+			Salience:    0.82,
+		},
+		{
+			ID:          "substrate-read-b",
+			SessionID:   "session-substrate-read",
+			AgentID:     "guardian",
+			AgentType:   "guardian",
+			ContentType: ctxpkg.ContentTypeConstraint,
+			Content:     "Do not broaden retry scope beyond idempotent requests without explicit approval.",
+			Timestamp:   now.Add(time.Second),
+			TurnNumber:  2,
+			Confidence:  0.91,
+			Salience:    0.86,
+		},
+	}
+	for _, entry := range entries {
+		if err := forest.RecordContent(context.Background(), entry); err != nil {
+			t.Fatalf("record content %s: %v", entry.ID, err)
+		}
+	}
+
+	packets, err := forest.Retrieve(context.Background(), Query{
+		Query:     "retry jitter idempotent api adapter",
+		SessionID: "session-substrate-read",
+		AgentType: "engineer",
+		Limit:     4,
+	})
+	if err != nil {
+		t.Fatalf("retrieve: %v", err)
+	}
+	if len(packets) == 0 {
+		t.Fatal("expected packets before substrate maintenance runs")
+	}
+
+	var stateCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_substrate_state`).Scan(&stateCount); err != nil {
+		t.Fatalf("count substrate state: %v", err)
+	}
+	if stateCount != 0 {
+		t.Fatalf("expected retrieve to avoid computing substrate state, got %d rows", stateCount)
+	}
+}
+
+func TestMemoryForest_SubstrateRefreshesStateEventDriven(t *testing.T) {
+	t.Parallel()
+
+	forest, db := newTestForestWithConfig(t, Config{SubstrateDebounce: 10 * time.Millisecond})
 	defer forest.Close()
 	defer db.Close()
 
@@ -286,6 +521,18 @@ func TestMemoryForest_SubstrateRefreshesState(t *testing.T) {
 		}
 	}
 
+	waitForForestCondition(t, 2*time.Second, func() (bool, error) {
+		var stateCount int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM forest_substrate_state`).Scan(&stateCount); err != nil {
+			return false, err
+		}
+		var frontierCount int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM forest_substrate_frontiers`).Scan(&frontierCount); err != nil {
+			return false, err
+		}
+		return stateCount > 0 && frontierCount > 0, nil
+	})
+
 	packets, err := forest.Retrieve(context.Background(), Query{
 		Query:     "retry jitter idempotent api adapter",
 		SessionID: "session-substrate",
@@ -303,21 +550,5 @@ func TestMemoryForest_SubstrateRefreshesState(t *testing.T) {
 	}
 	if packets[0].Score.Frontier <= 0 {
 		t.Fatalf("expected positive frontier score, got %f", packets[0].Score.Frontier)
-	}
-
-	var stateCount int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_substrate_state`).Scan(&stateCount); err != nil {
-		t.Fatalf("count substrate state: %v", err)
-	}
-	if stateCount == 0 {
-		t.Fatal("expected persisted substrate state")
-	}
-
-	var frontierCount int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_substrate_frontiers`).Scan(&frontierCount); err != nil {
-		t.Fatalf("count substrate frontiers: %v", err)
-	}
-	if frontierCount == 0 {
-		t.Fatal("expected persisted substrate frontiers")
 	}
 }

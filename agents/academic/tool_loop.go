@@ -896,9 +896,10 @@ func (a *Academic) recordTurn(
 	turn, toolCalls, errCount int,
 	turnStart time.Time,
 ) {
-	if a.handoffBridge == nil || !shared.AutomaticHandoffEnabled(ctx) {
+	bridge := shared.EffectiveHandoffBridge(ctx, a.handoffBridge)
+	if bridge == nil || !shared.AutomaticHandoffEnabled(ctx) {
 		return
 	}
 
-	a.handoffBridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
+	bridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
 }

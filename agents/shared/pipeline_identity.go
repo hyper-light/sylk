@@ -1,23 +1,44 @@
 package shared
 
-import (
-	"strings"
+import "strings"
 
-	"github.com/google/uuid"
-)
-
-var pipelineWorkerIdentityNamespace = uuid.MustParse("7f5e9e9d-2b65-4ce3-9c8d-1d43d6d9b7a2")
-
-// PipelineWorkerAgentID returns the canonical stable short worker ID used for
-// task-scoped pipeline workers.
-func PipelineWorkerAgentID(taskID, agentType string) string {
-	taskID = sanitizePipelineIdentityPart(taskID)
-	agentType = sanitizePipelineIdentityPart(agentType)
-	if taskID == "" || agentType == "" {
-		return ""
+// TaskScopedRoutingName returns the deterministic routing name for a
+// task-scoped pipeline worker. This is a stable address for the task pod,
+// distinct from the worker's runtime-generated agent ID.
+func TaskScopedRoutingName(taskSlug, taskID, agentType string) string {
+	base := sanitizePipelineIdentityPart(taskSlug)
+	if base == "" {
+		base = sanitizePipelineIdentityPart(taskID)
 	}
-	sum := uuid.NewSHA1(pipelineWorkerIdentityNamespace, []byte(taskID+":"+agentType))
-	return sum.String()[:8]
+	agentType = sanitizePipelineIdentityPart(agentType)
+	if base == "" {
+		return agentType
+	}
+	if agentType == "" {
+		return base
+	}
+	return base + "-" + agentType
+}
+
+// PipelineWorkerRoutingTarget returns the explicit routing target for a
+// task-scoped worker when a task identity is available.
+func PipelineWorkerRoutingTarget(taskID, agentType string) string {
+	taskID = strings.TrimSpace(taskID)
+	agentType = strings.TrimSpace(agentType)
+	if taskID == "" {
+		return agentType
+	}
+	switch agentType {
+	case PipelineAgentInspector, PipelineAgentTester, PipelineAgentEngineer, PipelineAgentDesigner:
+		if target := TaskScopedRoutingName("", taskID, agentType); target != "" {
+			return target
+		}
+	}
+	return agentType
+}
+
+func SanitizePipelineIdentityPart(value string) string {
+	return sanitizePipelineIdentityPart(value)
 }
 
 func sanitizePipelineIdentityPart(value string) string {

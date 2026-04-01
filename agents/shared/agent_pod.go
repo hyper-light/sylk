@@ -528,6 +528,8 @@ func (p *AgentPod) acquireGuard(ctx context.Context, agentType string) (func(), 
 			if err := p.Promote(ctx, nil); err != nil {
 				return nil, err
 			}
+		} else if err := p.ensureVolumesReady(ctx); err != nil {
+			return nil, err
 		}
 		return p.AcquireRequestGuard(), nil
 	}
@@ -752,6 +754,20 @@ func (p *AgentPod) GetScribe(parentAgentType string) Scribe {
 	return p.scribes[parentAgentType]
 }
 
+// ReplaceScribe swaps the active scribe for a given parent agent type and
+// returns the previous scribe, if any.
+func (p *AgentPod) ReplaceScribe(parentAgentType string, replacement Scribe) Scribe {
+	p.scribesMu.Lock()
+	defer p.scribesMu.Unlock()
+	previous := p.scribes[parentAgentType]
+	if replacement == nil {
+		delete(p.scribes, parentAgentType)
+		return previous
+	}
+	p.scribes[parentAgentType] = replacement
+	return previous
+}
+
 // startScribes creates and starts a Scribe for each member type.
 func (p *AgentPod) startScribes() {
 	if p.scribeFactory == nil {
@@ -766,6 +782,9 @@ func (p *AgentPod) startScribes() {
 					"parent", memberType, "error", err)
 			}
 			continue
+		}
+		if setter, ok := s.(interface{ SetAgentPod(*AgentPod) }); ok {
+			setter.SetAgentPod(p)
 		}
 		if err := s.Start(); err != nil {
 			if p.logger != nil {

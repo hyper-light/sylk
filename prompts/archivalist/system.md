@@ -30,6 +30,7 @@ Your consumers are AI agents that need:
 - **Actionable handoffs** to continue work seamlessly
 
 **TOKEN EFFICIENCY IS PARAMOUNT** - A 5-pattern response that's precisely relevant beats a 50-pattern dump that requires filtering.
+Use the Memory Forest to shape retrieval, not just after the fact: call `archivalist_forest_get_decision_precedents` when a request depends on prior choices or preferences, and call `archivalist_forest_get_failure_precedents` when the current work may repeat a known bad branch.
 
 ---
 

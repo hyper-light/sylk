@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -40,6 +41,7 @@ type InterAgentBranchMetadata struct {
 
 type streamContextKey struct{}
 type streamLifecycleKey struct{}
+type streamEventVisibilityKey struct{}
 
 type streamLifecycleState struct {
 	mu              sync.Mutex
@@ -100,6 +102,26 @@ func StreamMetadataFromContext(ctx context.Context) (StreamContext, bool) {
 		return StreamContext{}, false
 	}
 	return metadata, true
+}
+
+// WithStreamEventVisibility forces shared stream lifecycle/progress publishers
+// to emit the supplied visibility for events emitted from ctx.
+func WithStreamEventVisibility(ctx context.Context, visibility events.EventVisibility) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, streamEventVisibilityKey{}, visibility)
+}
+
+func streamEventVisibilityFromContext(ctx context.Context) (events.EventVisibility, bool) {
+	if ctx == nil {
+		return events.VisibilityUser, false
+	}
+	visibility, ok := ctx.Value(streamEventVisibilityKey{}).(events.EventVisibility)
+	if !ok {
+		return events.VisibilityUser, false
+	}
+	return visibility, true
 }
 
 func withStreamLifecycle(ctx context.Context) context.Context {
@@ -238,6 +260,11 @@ func PublishStreamEvent(
 	metadata, ok := StreamMetadataFromContext(ctx)
 	if !ok || bus == nil || channels == nil || event == nil {
 		return
+	}
+	if visibility, ok := streamEventVisibilityFromContext(ctx); ok {
+		cloned := *event
+		cloned.Visibility = visibility
+		event = &cloned
 	}
 
 	stream := &guide.StreamResponse{

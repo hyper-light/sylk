@@ -40,6 +40,10 @@ type TokenUsageMsg struct {
 	ReasoningTokens  int
 	Model            string
 	AgentID          string
+	RuntimeAgentID   string
+	AgentType        string
+	PipelineID       string
+	TaskID           string
 }
 
 // ---------------------------------------------------------------------------
@@ -48,16 +52,19 @@ type TokenUsageMsg struct {
 
 // StreamStartMsg signals the start of an LLM response stream.
 type StreamStartMsg struct {
-	SessionID     string
-	CorrelationID string
-	AgentID       string // Responding agent ID for badge display.
-	AgentType     string
-	AgentName     string
-	PipelineID    string
-	TaskID        string
-	TaskName      string
-	TaskSlug      string
-	BranchRef     *InterAgentBranchRefMsg
+	SessionID           string
+	CorrelationID       string
+	ParentCorrelationID string
+	AgentID             string // Responding agent ID for badge display.
+	RuntimeAgentID      string
+	AgentType           string
+	AgentName           string
+	PipelineID          string
+	TaskID              string
+	TaskName            string
+	TaskSlug            string
+	Visibility          events.EventVisibility
+	BranchRef           *InterAgentBranchRefMsg
 }
 
 // StreamChunkMsg carries a streaming text chunk from an LLM response.
@@ -70,37 +77,41 @@ type StreamChunkMsg struct {
 
 // StreamProgressMsg reports progress during a streaming operation.
 type StreamProgressMsg struct {
-	SessionID     string
-	CorrelationID string
-	AgentID       string // Canonical UUID of the responding agent.
-	AgentName     string // Display name for UI attribution.
-	AgentType     string
-	PipelineID    string
-	TaskID        string
-	TaskName      string
-	TaskSlug      string
-	Current       int
-	Total         int
-	Message       string
-	UIState       events.AgentUIState
-	Visibility    events.EventVisibility
-	BranchRef     *InterAgentBranchRefMsg
+	SessionID           string
+	CorrelationID       string
+	ParentCorrelationID string
+	AgentID             string // Canonical UUID of the responding agent.
+	RuntimeAgentID      string
+	AgentName           string // Display name for UI attribution.
+	AgentType           string
+	PipelineID          string
+	TaskID              string
+	TaskName            string
+	TaskSlug            string
+	Current             int
+	Total               int
+	Message             string
+	UIState             events.AgentUIState
+	Visibility          events.EventVisibility
+	BranchRef           *InterAgentBranchRefMsg
 }
 
 // StreamCompleteMsg signals the end of an LLM response stream.
 type StreamCompleteMsg struct {
-	SessionID     string
-	CorrelationID string
-	AgentID       string // Canonical UUID of the responding agent.
-	AgentName     string // Display name for UI attribution.
-	AgentType     string
-	PipelineID    string
-	TaskID        string
-	TaskName      string
-	TaskSlug      string
-	Result        any
-	InputTokens   int // Real provider input tokens (0 = unavailable).
-	OutputTokens  int // Real provider output tokens (0 = unavailable).
+	SessionID           string
+	CorrelationID       string
+	ParentCorrelationID string
+	AgentID             string // Canonical UUID of the responding agent.
+	RuntimeAgentID      string
+	AgentName           string // Display name for UI attribution.
+	AgentType           string
+	PipelineID          string
+	TaskID              string
+	TaskName            string
+	TaskSlug            string
+	Result              any
+	InputTokens         int // Real provider input tokens (0 = unavailable).
+	OutputTokens        int // Real provider output tokens (0 = unavailable).
 
 	// Extended token fields for accurate cost/usage tracking.
 	ReasoningTokens  int // Reasoning/thinking tokens (OpenAI o-series, Google thinking).
@@ -111,6 +122,7 @@ type StreamCompleteMsg struct {
 	// When non-empty, the chat model replaces accumulated streaming content
 	// with this value to correct any dropped or reordered chunks.
 	AuthoritativeText string
+	Visibility        events.EventVisibility
 	BranchRef         *InterAgentBranchRefMsg
 }
 
@@ -798,27 +810,28 @@ type InterAgentBranchRefMsg struct {
 // display in the chat panel. Dispatched from the GuideBridge when it receives
 // a StreamEventToolCall stream event.
 type ToolCallEventMsg struct {
-	SessionID     string
-	CorrelationID string
-	AgentID       string
-	AgentType     string
-	AgentName     string
-	PipelineID    string
-	TaskID        string
-	TaskName      string
-	TaskSlug      string
-	ToolCallKey   string
-	Phase         int // 0 = start, 1 = complete.
-	ToolName      string
-	ArgsSummary   string
-	FullArgs      string // Pretty-printed JSON (for expanded view).
-	Output        string // Truncated result (for expanded view, max 512 chars).
-	ErrorMsg      string // Error text on failure.
-	StartedAt     time.Time
-	Duration      time.Duration
-	Success       bool
-	InterAgent    *InterAgentToolEventMsg
-	BranchRef     *InterAgentBranchRefMsg
+	SessionID           string
+	CorrelationID       string
+	ParentCorrelationID string
+	AgentID             string
+	AgentType           string
+	AgentName           string
+	PipelineID          string
+	TaskID              string
+	TaskName            string
+	TaskSlug            string
+	ToolCallKey         string
+	Phase               int // 0 = start, 1 = complete.
+	ToolName            string
+	ArgsSummary         string
+	FullArgs            string // Pretty-printed JSON (for expanded view).
+	Output              string // Truncated result (for expanded view, max 512 chars).
+	ErrorMsg            string // Error text on failure.
+	StartedAt           time.Time
+	Duration            time.Duration
+	Success             bool
+	InterAgent          *InterAgentToolEventMsg
+	BranchRef           *InterAgentBranchRefMsg
 }
 
 // TimePressureMsg signals that an agent is approaching its operation deadline.

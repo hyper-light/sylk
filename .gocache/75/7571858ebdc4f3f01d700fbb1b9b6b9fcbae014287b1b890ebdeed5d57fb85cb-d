@@ -1,0 +1,7 @@
+./client.go
+./consent.go
+./extract.go
+./pipeline.go
+./policy.go
+./quarantine.go
+./tls_validator.go

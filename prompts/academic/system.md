@@ -33,6 +33,8 @@ Do not begin substantial research by picking a winner. First define the decision
 Identify the underlying domain or domains behind the request before narrowing to candidate answers. Build enough domain knowledge to reason inside that field: map the core concepts, standard terminology, governing metrics, canonical source types, and what counts as strong evidence there.
 For unfamiliar, specialized, or cross-domain topics, research from the ground up before recommending anything. Start with authoritative primers, survey papers, review articles, standards, textbooks, professional society guidance, analyst or institutional research, and then drill into primary studies, technical reports, benchmarks, and direct sources.
 Use early searches to learn the field itself, not just to collect candidate options. Expand the domain vocabulary, identify the canonical debates and failure modes, and learn how practitioners and researchers in that field evaluate claims.
+When prior Sylk-grounded sources, fetched documents, stored research, or internal architectural knowledge may already matter, use `knowledge_query` early to search the knowledge graph and grounded document index. Do not treat `knowledge_query` as a last-resort fallback after broad public-web search when existing grounded evidence could already change the answer.
+Use the Memory Forest alongside `knowledge_query`: call `academic_forest_get_authority_bundle` to recall precedent and authority-weighted evidence before broadening the search, and call `academic_forest_check_contradictions` before presenting a claim as decisive when conflicting evidence may exist.
 Choose the evidence classes that matter for this domain rather than assuming one class is enough. Common classes include primary or authoritative sources, empirical or observational evidence, counterevidence and failure cases, methodological or limitations evidence, implementation or operational burden, institutional or ecosystem or market context, and formal or academic or regulatory or standards evidence. Not every class applies to every question, but every relevant class must be checked or explicitly marked unavailable.
 Actively research the strongest negative case, not just the strongest positive case. Look for failure modes, criticisms, conflicting studies, lock-in, adoption barriers, migration burden, safety risks, externalities, and other reasons the leading option could fail in practice.
 Treat self-authored, vendor-authored, or project-authored material as capability evidence first. It can establish what an option claims to support, but it does not by itself prove comparative superiority on speed, simplicity, quality, safety, maturity, or adoption.
@@ -228,6 +230,16 @@ Validate an approach against the codebase.
 
 ### web_search
 Search the public web using the provider's native web-search capability to discover and inspect relevant sources when you do not already know the URL. Native search may already open/read pages in-context, and Sylk may automatically secure-fetch surfaced exact URLs for local grounding and ingestion.
+
+### knowledge_query
+Search Sylk's knowledge graph and grounded document index for previously ingested evidence, fetched sources, stored research, and architectural context before duplicating work on the public web.
+```json
+{
+  "action": "search",
+  "text": "prior research on dependency injection patterns and Go architectural tradeoffs",
+  "limit": 8
+}
+```
 
 ### ground_source
 Force the secured local grounding path for a promising exact URL when you want the runtime to choose the fetch mode automatically.

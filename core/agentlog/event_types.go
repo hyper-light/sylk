@@ -6,59 +6,59 @@ type EventType uint16
 
 // Common events (0x0000–0x00FF) — written by every agent to events.wal.
 const (
-	EventActivated          EventType = 0x0001
-	EventReady              EventType = 0x0002
-	EventStopping           EventType = 0x0003
-	EventStopped            EventType = 0x0004
-	EventError              EventType = 0x0005
-	EventBusRequestReceived EventType = 0x0010
-	EventBusRequestSent     EventType = 0x0011
+	EventActivated           EventType = 0x0001
+	EventReady               EventType = 0x0002
+	EventStopping            EventType = 0x0003
+	EventStopped             EventType = 0x0004
+	EventError               EventType = 0x0005
+	EventBusRequestReceived  EventType = 0x0010
+	EventBusRequestSent      EventType = 0x0011
 	EventBusResponseReceived EventType = 0x0012
-	EventBusResponseSent    EventType = 0x0013
-	EventBusErrorReceived   EventType = 0x0014
-	EventBusErrorSent       EventType = 0x0015
-	EventBusAckSent         EventType = 0x0016
-	EventRegistryEvent      EventType = 0x0017
-	EventAuthChanged        EventType = 0x0018
-	EventLLMRequestSent     EventType = 0x0020
+	EventBusResponseSent     EventType = 0x0013
+	EventBusErrorReceived    EventType = 0x0014
+	EventBusErrorSent        EventType = 0x0015
+	EventBusAckSent          EventType = 0x0016
+	EventRegistryEvent       EventType = 0x0017
+	EventAuthChanged         EventType = 0x0018
+	EventLLMRequestSent      EventType = 0x0020
 	EventLLMResponseReceived EventType = 0x0021
-	EventLLMError           EventType = 0x0022
-	EventSkillInvoked       EventType = 0x0030
-	EventSkillCompleted     EventType = 0x0031
-	EventSkillFailed        EventType = 0x0032
+	EventLLMError            EventType = 0x0022
+	EventSkillInvoked        EventType = 0x0030
+	EventSkillCompleted      EventType = 0x0031
+	EventSkillFailed         EventType = 0x0032
 )
 
 // Guide events (0x0100–0x01FF) — routing.wal.
 const (
-	EventRouteClassified   EventType = 0x0100
-	EventRouteCacheHit     EventType = 0x0101
-	EventRouteLearned      EventType = 0x0102
-	EventRerouted          EventType = 0x0103
-	EventAgentRegistered   EventType = 0x0104
-	EventAgentUnregistered EventType = 0x0105
-	EventForwardDispatched EventType = 0x0106
+	EventRouteClassified    EventType = 0x0100
+	EventRouteCacheHit      EventType = 0x0101
+	EventRouteLearned       EventType = 0x0102
+	EventRerouted           EventType = 0x0103
+	EventAgentRegistered    EventType = 0x0104
+	EventAgentUnregistered  EventType = 0x0105
+	EventForwardDispatched  EventType = 0x0106
 	EventResponseCorrelated EventType = 0x0107
-	EventStreamStarted     EventType = 0x0108
-	EventStreamCompleted   EventType = 0x0109
+	EventStreamStarted      EventType = 0x0108
+	EventStreamCompleted    EventType = 0x0109
 )
 
 // Orchestrator events (0x0200–0x02FF) — dag.wal, pipeline.wal.
 const (
-	EventDAGStarted       EventType = 0x0200
-	EventDAGCompleted     EventType = 0x0201
-	EventDAGAborted       EventType = 0x0202
-	EventDAGCancelled     EventType = 0x0203
-	EventDAGModified      EventType = 0x0204
-	EventNodeDispatched   EventType = 0x0205
-	EventNodeCompleted    EventType = 0x0206
-	EventNodeFailed       EventType = 0x0207
-	EventLayerStarted     EventType = 0x0208
-	EventLayerCompleted   EventType = 0x0209
-	EventLayerDecisionReq  EventType = 0x020A
-	EventLayerDecisionRecv EventType = 0x020B
-	EventNodeAcked         EventType = 0x020C
-	EventPipelineExpanded  EventType = 0x020D
-	EventStageTransition   EventType = 0x020E
+	EventDAGStarted          EventType = 0x0200
+	EventDAGCompleted        EventType = 0x0201
+	EventDAGAborted          EventType = 0x0202
+	EventDAGCancelled        EventType = 0x0203
+	EventDAGModified         EventType = 0x0204
+	EventNodeDispatched      EventType = 0x0205
+	EventNodeCompleted       EventType = 0x0206
+	EventNodeFailed          EventType = 0x0207
+	EventLayerStarted        EventType = 0x0208
+	EventLayerCompleted      EventType = 0x0209
+	EventLayerDecisionReq    EventType = 0x020A
+	EventLayerDecisionRecv   EventType = 0x020B
+	EventNodeAcked           EventType = 0x020C
+	EventPipelineExpanded    EventType = 0x020D
+	EventStageTransition     EventType = 0x020E
 	EventPipelineUpdate      EventType = 0x0220
 	EventPipelineStateChange EventType = 0x0221
 	EventPipelineQuerySent   EventType = 0x0222
@@ -86,17 +86,17 @@ const (
 
 // Engineer events (0x0400–0x04FF) — tooluse.wal.
 const (
-	EventToolReadFile          EventType = 0x0400
-	EventToolWriteFile         EventType = 0x0401
-	EventToolGlob              EventType = 0x0402
-	EventToolGrep              EventType = 0x0403
-	EventToolExec              EventType = 0x0404
-	EventToolEditFile          EventType = 0x0405
-	EventDiscoveryStarted      EventType = 0x0406
-	EventDiscoveryCompleted    EventType = 0x0407
-	EventGenerationStarted     EventType = 0x0408
-	EventGenerationCompleted   EventType = 0x0409
-	EventToolAskUser           EventType = 0x040A
+	EventToolReadFile        EventType = 0x0400
+	EventToolWriteFile       EventType = 0x0401
+	EventToolGlob            EventType = 0x0402
+	EventToolGrep            EventType = 0x0403
+	EventToolExec            EventType = 0x0404
+	EventToolEditFile        EventType = 0x0405
+	EventDiscoveryStarted    EventType = 0x0406
+	EventDiscoveryCompleted  EventType = 0x0407
+	EventGenerationStarted   EventType = 0x0408
+	EventGenerationCompleted EventType = 0x0409
+	EventToolAskUser         EventType = 0x040A
 )
 
 // Designer events (0x0500–0x05FF) — design.wal.
@@ -110,13 +110,13 @@ const (
 
 // Guardian events (0x0600–0x06FF) — gate.wal, scan.wal.
 const (
-	EventDiffReviewed      EventType = 0x0600
-	EventDiffApproved      EventType = 0x0601
-	EventDiffRejected      EventType = 0x0602
-	EventApprovalRequested EventType = 0x0603
-	EventApprovalReceived  EventType = 0x0604
-	EventCheckpointCreated EventType = 0x0605
-	EventRollbackExecuted  EventType = 0x0606
+	EventDiffReviewed       EventType = 0x0600
+	EventDiffApproved       EventType = 0x0601
+	EventDiffRejected       EventType = 0x0602
+	EventApprovalRequested  EventType = 0x0603
+	EventApprovalReceived   EventType = 0x0604
+	EventCheckpointCreated  EventType = 0x0605
+	EventRollbackExecuted   EventType = 0x0606
 	EventContentScanned     EventType = 0x0620
 	EventInjectionDetected  EventType = 0x0621
 	EventCredentialDetected EventType = 0x0622
@@ -125,14 +125,14 @@ const (
 	EventHealthAlert        EventType = 0x0625
 
 	// Network security events.
-	EventTLSValidated       EventType = 0x0630
-	EventTLSWarning         EventType = 0x0631
-	EventTLSBlocked         EventType = 0x0632
-	EventDomainReputation   EventType = 0x0633
-	EventVulnDetected       EventType = 0x0634
-	EventFetchBlocked       EventType = 0x0635
-	EventFetchFlagged       EventType = 0x0636
-	EventFetchClean         EventType = 0x0637
+	EventTLSValidated     EventType = 0x0630
+	EventTLSWarning       EventType = 0x0631
+	EventTLSBlocked       EventType = 0x0632
+	EventDomainReputation EventType = 0x0633
+	EventVulnDetected     EventType = 0x0634
+	EventFetchBlocked     EventType = 0x0635
+	EventFetchFlagged     EventType = 0x0636
+	EventFetchClean       EventType = 0x0637
 )
 
 // Inspector events (0x0700–0x07FF) — audit.wal.
@@ -147,7 +147,7 @@ const (
 
 // Tester events (0x0800–0x08FF) — testrun.wal.
 const (
-	EventTestPlanCreated    EventType = 0x0800
+	EventTestPlanCreated   EventType = 0x0800
 	EventSuiteStarted      EventType = 0x0801
 	EventCaseStarted       EventType = 0x0802
 	EventCasePassed        EventType = 0x0803
@@ -161,12 +161,12 @@ const (
 
 // Librarian events (0x0900–0x09FF) — search.wal.
 const (
-	EventSearchQuery     EventType = 0x0900
-	EventSearchResult    EventType = 0x0901
-	EventIndexStarted    EventType = 0x0902
-	EventIndexCompleted  EventType = 0x0903
-	EventDocRetrieved    EventType = 0x0904
-	EventDocIngested     EventType = 0x0905
+	EventSearchQuery    EventType = 0x0900
+	EventSearchResult   EventType = 0x0901
+	EventIndexStarted   EventType = 0x0902
+	EventIndexCompleted EventType = 0x0903
+	EventDocRetrieved   EventType = 0x0904
+	EventDocIngested    EventType = 0x0905
 )
 
 // Academic events (0x0A00–0x0AFF) — research.wal.
@@ -226,12 +226,12 @@ const (
 
 // Ingestion pipeline events (0x0E20–0x0E3F).
 const (
-	EventIngestDiscovery  EventType = 0x0E20
-	EventIngestRead       EventType = 0x0E21
-	EventIngestParse      EventType = 0x0E22
-	EventIngestAggregate  EventType = 0x0E23
-	EventIngestPersist    EventType = 0x0E24
-	EventIngestEmbedding  EventType = 0x0E25
+	EventIngestDiscovery EventType = 0x0E20
+	EventIngestRead      EventType = 0x0E21
+	EventIngestParse     EventType = 0x0E22
+	EventIngestAggregate EventType = 0x0E23
+	EventIngestPersist   EventType = 0x0E24
+	EventIngestEmbedding EventType = 0x0E25
 )
 
 // Session ingestion events (0x0E40–0x0E5F).
@@ -266,6 +266,14 @@ const (
 	EventKnowledgePromotePartial EventType = 0x0EA0
 	EventKnowledgePromoteFull    EventType = 0x0EA1
 	EventKnowledgeClosed         EventType = 0x0EA2
+)
+
+// Durable protocol / mailbox events (0x0F00–0x0FFF).
+const (
+	EventProtocolEventAppended   EventType = 0x0F00
+	EventProtocolSnapshotSaved   EventType = 0x0F01
+	EventMailboxItemEnqueued     EventType = 0x0F10
+	EventMailboxItemAcknowledged EventType = 0x0F11
 )
 
 // eventNames maps every defined EventType to its human-readable name.
@@ -494,6 +502,12 @@ func init() {
 	eventNames[EventKnowledgePromotePartial] = "KnowledgePromotePartial"
 	eventNames[EventKnowledgePromoteFull] = "KnowledgePromoteFull"
 	eventNames[EventKnowledgeClosed] = "KnowledgeClosed"
+
+	// Durable protocol / mailbox
+	eventNames[EventProtocolEventAppended] = "ProtocolEventAppended"
+	eventNames[EventProtocolSnapshotSaved] = "ProtocolSnapshotSaved"
+	eventNames[EventMailboxItemEnqueued] = "MailboxItemEnqueued"
+	eventNames[EventMailboxItemAcknowledged] = "MailboxItemAcknowledged"
 }
 
 // String returns the human-readable name for an EventType,
@@ -507,36 +521,38 @@ func (e EventType) String() string {
 
 // Range boundary constants for ownership checks.
 const (
-	rangeCommonLo      EventType = 0x0000
-	rangeCommonHi      EventType = 0x00FF
-	rangeGuideLo       EventType = 0x0100
-	rangeGuideHi       EventType = 0x01FF
-	rangeOrchestratorLo EventType = 0x0200
-	rangeOrchestratorHi EventType = 0x02FF
-	rangeArchitectLo   EventType = 0x0300
-	rangeArchitectHi   EventType = 0x03FF
-	rangeEngineerLo    EventType = 0x0400
-	rangeEngineerHi    EventType = 0x04FF
-	rangeDesignerLo    EventType = 0x0500
-	rangeDesignerHi    EventType = 0x05FF
-	rangeGuardianLo    EventType = 0x0600
-	rangeGuardianHi    EventType = 0x06FF
-	rangeInspectorLo   EventType = 0x0700
-	rangeInspectorHi   EventType = 0x07FF
-	rangeTesterLo      EventType = 0x0800
-	rangeTesterHi      EventType = 0x08FF
-	rangeLibrarianLo   EventType = 0x0900
-	rangeLibrarianHi   EventType = 0x09FF
-	rangeAcademicLo    EventType = 0x0A00
-	rangeAcademicHi    EventType = 0x0AFF
-	rangeArchivalistLo EventType = 0x0B00
-	rangeArchivalistHi EventType = 0x0BFF
+	rangeCommonLo        EventType = 0x0000
+	rangeCommonHi        EventType = 0x00FF
+	rangeGuideLo         EventType = 0x0100
+	rangeGuideHi         EventType = 0x01FF
+	rangeOrchestratorLo  EventType = 0x0200
+	rangeOrchestratorHi  EventType = 0x02FF
+	rangeArchitectLo     EventType = 0x0300
+	rangeArchitectHi     EventType = 0x03FF
+	rangeEngineerLo      EventType = 0x0400
+	rangeEngineerHi      EventType = 0x04FF
+	rangeDesignerLo      EventType = 0x0500
+	rangeDesignerHi      EventType = 0x05FF
+	rangeGuardianLo      EventType = 0x0600
+	rangeGuardianHi      EventType = 0x06FF
+	rangeInspectorLo     EventType = 0x0700
+	rangeInspectorHi     EventType = 0x07FF
+	rangeTesterLo        EventType = 0x0800
+	rangeTesterHi        EventType = 0x08FF
+	rangeLibrarianLo     EventType = 0x0900
+	rangeLibrarianHi     EventType = 0x09FF
+	rangeAcademicLo      EventType = 0x0A00
+	rangeAcademicHi      EventType = 0x0AFF
+	rangeArchivalistLo   EventType = 0x0B00
+	rangeArchivalistHi   EventType = 0x0BFF
 	rangeSteeringLo      EventType = 0x0C00
 	rangeSteeringHi      EventType = 0x0CFF
 	rangeContextBudgetLo EventType = 0x0D00
 	rangeContextBudgetHi EventType = 0x0DFF
 	rangeBootLo          EventType = 0x0E00
 	rangeBootHi          EventType = 0x0EFF
+	rangeProtocolLo      EventType = 0x0F00
+	rangeProtocolHi      EventType = 0x0FFF
 )
 
 // IsCommon returns true if the event type is in the common range.
@@ -579,10 +595,15 @@ func (e EventType) IsArchivalist() bool { return e >= rangeArchivalistLo && e <=
 func (e EventType) IsSteering() bool { return e >= rangeSteeringLo && e <= rangeSteeringHi }
 
 // IsContextBudget returns true if the event type is a cross-cutting context budget event.
-func (e EventType) IsContextBudget() bool { return e >= rangeContextBudgetLo && e <= rangeContextBudgetHi }
+func (e EventType) IsContextBudget() bool {
+	return e >= rangeContextBudgetLo && e <= rangeContextBudgetHi
+}
 
 // IsBoot returns true if the event type belongs to the boot/ingestion/knowledge range.
 func (e EventType) IsBoot() bool { return e >= rangeBootLo && e <= rangeBootHi }
+
+// IsProtocol returns true if the event type belongs to the durable protocol range.
+func (e EventType) IsProtocol() bool { return e >= rangeProtocolLo && e <= rangeProtocolHi }
 
 // OwnerAgent returns the agent name that owns this event type range,
 // or "unknown" for unassigned ranges.
@@ -618,6 +639,8 @@ func (e EventType) OwnerAgent() string {
 		return "context_budget"
 	case e.IsBoot():
 		return "boot"
+	case e.IsProtocol():
+		return "protocol"
 	default:
 		return "unknown"
 	}

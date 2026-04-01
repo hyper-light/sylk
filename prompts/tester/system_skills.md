@@ -28,6 +28,8 @@ Treat the tool definitions as the tester workflow contract. Their requirements, 
 - Include evidence from earlier calls so later work stays grounded in real signals
 - Before any test file mutation, call `prepare_pipeline_write_context` or `prepare_global_write_context` for that output path and feed the returned basis into the write skill
 - Reuse the `next_basis` returned by each successful test write while the lease remains active instead of repreparing immediately
+- Use `tester_forest_get_test_targets` before narrowing scope when prior constraints, outcomes, or evidence should influence the chosen coverage surface
+- Use `tester_forest_get_failure_clusters` before repeating a thin test strategy that may already have missed the same class of defect
 - Claim the concrete test surface before duplicating peer work
 - Publish verification artifacts so Engineer and Designer receive concrete findings
 - Use `coord_watch_updates` when waiting on peer follow-up

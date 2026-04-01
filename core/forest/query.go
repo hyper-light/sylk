@@ -104,7 +104,7 @@ func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPack
 	for _, rootID := range canopy.RootIDs {
 		canopyRoots[rootID] = struct{}{}
 	}
-	substrateSignals, err := m.loadSubstrateSignals(ctx, query, branches, queryScores, canopyRoots)
+	structuralSubstrate, err := m.loadSubstrateSignals(ctx, branches)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +136,8 @@ func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPack
 			canopyScore = 1.0
 		}
 		evidenceScore := evidenceSignal(support)
-		substrate := substrateSignals[branch.ID]
+		structural := structuralSubstrate[branch.ID]
+		substrate := retrievalSubstrateSignal(branch, structural, queryScores[branch.ID], canopyRoots)
 		inputs = append(inputs, scoreInput{
 			QueryMatch:       queryScores[branch.ID],
 			Evidence:         evidenceScore,
@@ -174,7 +175,7 @@ func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPack
 			scores[i].Base,
 			relayMass[packetBranches[i].ID],
 			depths[packetBranches[i].ID],
-			substrateSignals[packetBranches[i].ID],
+			retrievalSubstrateSignal(packetBranches[i], structuralSubstrate[packetBranches[i].ID], queryScores[packetBranches[i].ID], canopyRoots),
 		)
 	}
 	m.applyLearnedPredictions(query, packets, featureByBranch)

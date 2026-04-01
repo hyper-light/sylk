@@ -280,9 +280,10 @@ func (l *Librarian) recordTurn(
 	turn, toolCalls, errCount int,
 	turnStart time.Time,
 ) {
-	if l.handoffBridge == nil {
+	bridge := shared.EffectiveHandoffBridge(ctx, l.handoffBridge)
+	if bridge == nil {
 		return
 	}
 
-	l.handoffBridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
+	bridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
 }

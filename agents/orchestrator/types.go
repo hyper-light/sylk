@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -53,6 +54,9 @@ type Config struct {
 	// LLM loop activates autonomously. Prevents permanent stall if the
 	// bootstrap signal is never sent.
 	BootstrapSafetyDeadline time.Duration `json:"bootstrap_safety_deadline"`
+
+	// Forest exposes Memory Forest coordination precedent skills.
+	Forest shared.MemoryForestService `json:"-"`
 }
 
 // DefaultConfig returns sensible defaults

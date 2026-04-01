@@ -1,12 +1,14 @@
 package academic
 
 import (
+	contextskills "github.com/adalundhe/sylk/core/context/skills"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 func academicVisibleSkillNames() []string {
 	return []string{
+		"knowledge_query",
 		"consult",
 		"web_search",
 		"ground_source",
@@ -34,12 +36,14 @@ func academicRecursiveSkillNames() []string {
 }
 
 func academicToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {
+	visible := appendRegisteredSkillNames(academicVisibleSkillNames(), registry, contextskills.ForestSkillNamesForAgent("academic")...)
+	mutating := appendRegisteredSkillNames(academicMutatingSkillNames(), registry, contextskills.ForestMutatingSkillNames()...)
 	manifest := toolruntime.BuildManifestFromRegistry(toolruntime.ManifestBuildConfig{
 		AgentID:          "academic",
 		CapabilityScope:  "academic.default",
 		Registry:         registry,
-		VisibleByDefault: academicVisibleSkillNames(),
-		Mutating:         academicMutatingSkillNames(),
+		VisibleByDefault: visible,
+		Mutating:         mutating,
 	})
 	for _, name := range academicRecursiveSkillNames() {
 		policy, ok := manifest.Tools[name]
@@ -51,4 +55,18 @@ func academicToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest
 		manifest.Tools[name] = policy
 	}
 	return manifest
+}
+
+func appendRegisteredSkillNames(base []string, registry *skills.Registry, names ...string) []string {
+	if registry == nil {
+		return append([]string(nil), base...)
+	}
+	result := append([]string(nil), base...)
+	for _, name := range names {
+		if registry.Get(name) == nil {
+			continue
+		}
+		result = append(result, name)
+	}
+	return result
 }

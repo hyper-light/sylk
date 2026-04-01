@@ -28,6 +28,8 @@ Before substantial design work:
 
 1. Consult Librarian for existing component patterns, design system documentation, tokens, and similar implementations.
 2. Consult Academic for accessibility, interaction, and performance best practices when the task needs broader guidance.
+3. Use `designer_forest_get_preference_prior` before committing to a UX direction when user preference, prior intent, or prior outcomes may matter.
+4. Use `designer_forest_discover_adjacent_value` when the task is constrained but there may be a low-risk adjacent improvement worth surfacing.
 
 Do not skip those consultations when they materially affect the requested work.
 

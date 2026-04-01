@@ -1,12 +1,13 @@
 package orchestrator
 
 import (
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 func orchestratorMutatingSkillNames() []string {
-	return []string{
+	return shared.AppendMemoryForestMutatingSkillNames([]string{
 		"push_status",
 		"report_failure",
 		"submit_task_event",
@@ -18,11 +19,11 @@ func orchestratorMutatingSkillNames() []string {
 		"modify_dag",
 		"ingest_plan",
 		"validate_global_review",
-	}
+	})
 }
 
 func orchestratorVisibleSkillNames() []string {
-	return []string{
+	return shared.AppendMemoryForestVisibleSkillNames([]string{
 		"query_task",
 		"query_workflow",
 		"query_dag_status",
@@ -40,7 +41,7 @@ func orchestratorVisibleSkillNames() []string {
 		"inspect_workspace_state",
 		"summarize_workspace_state",
 		"diff_workspace_file",
-	}
+	}, "orchestrator")
 }
 
 func orchestratorToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {
@@ -48,7 +49,7 @@ func orchestratorToolManifest(registry *skills.Registry) *toolruntime.PolicyMani
 		AgentID:          "orchestrator",
 		CapabilityScope:  "orchestrator.default",
 		Registry:         registry,
-		VisibleByDefault: orchestratorVisibleSkillNames(),
-		Mutating:         orchestratorMutatingSkillNames(),
+		VisibleByDefault: shared.FilterRegisteredSkillNames(registry, orchestratorVisibleSkillNames()),
+		Mutating:         shared.FilterRegisteredSkillNames(registry, orchestratorMutatingSkillNames()),
 	})
 }

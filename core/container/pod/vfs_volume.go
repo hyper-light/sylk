@@ -38,6 +38,7 @@ type VFSVolume struct {
 	pipelineFA  versioning.FileAccess
 	workspace   versioning.WorkspaceViewAccess
 	pipelineVFS *versioning.PipelineVFS
+	generation  uint64
 	mounted     bool
 }
 
@@ -62,9 +63,13 @@ func (v *VFSVolume) Mount(_ context.Context) error {
 	defer v.mu.Unlock()
 
 	if v.mounted {
+		if err := v.ensureBindingLocked("mount_hot_reuse"); err != nil {
+			return err
+		}
 		v.logTrace("vfs_volume_mount_skipped", "debug", agentlog.EventRegistryEvent, map[string]any{
 			"pipeline_id": v.pipelineID,
 			"reason":      "already_mounted",
+			"generation":  v.generation,
 		})
 		return nil
 	}
@@ -77,13 +82,7 @@ func (v *VFSVolume) Mount(_ context.Context) error {
 		"session_id":    string(v.sessionID),
 		"volume_name":   v.name,
 	})
-	pipelineVFS, err := v.sessionVFS.BeginPipeline(versioning.BeginPipelineConfig{
-		PipelineID: v.pipelineID,
-		SessionID:  v.sessionID,
-		WorkingDir: v.workingDir,
-		Files:      append([]string(nil), v.files...),
-	})
-	if err != nil {
+	if err := v.rebindLocked("mount"); err != nil {
 		v.logTrace("vfs_volume_mount_failed", "error", agentlog.EventError, map[string]any{
 			"pipeline_id": v.pipelineID,
 			"working_dir": v.workingDir,
@@ -92,16 +91,6 @@ func (v *VFSVolume) Mount(_ context.Context) error {
 		})
 		return err
 	}
-	v.pipelineVFS = pipelineVFS
-	v.pipelineFA = v.sessionVFS.NewPipelineFileAccess(pipelineVFS)
-	v.workspace = versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
-		DefaultView:       versioning.WorkspaceViewPipeline,
-		DefaultPipelineID: v.pipelineID,
-		DefaultSessionID:  string(v.sessionID),
-		WorkingDir:        v.workingDir,
-		Session:           v.sessionVFS,
-		DiskFallback:      versioning.NewDiskFileAccess(v.workingDir, true),
-	})
 	v.mounted = true
 	v.logTrace("vfs_volume_mount_done", "debug", agentlog.EventRegistryEvent, map[string]any{
 		"pipeline_id":   v.pipelineID,
@@ -110,8 +99,19 @@ func (v *VFSVolume) Mount(_ context.Context) error {
 		"files_preview": previewStrings(v.files, 8),
 		"session_id":    string(v.sessionID),
 		"volume_name":   v.name,
+		"generation":    v.generation,
 	})
 	return nil
+}
+
+func (v *VFSVolume) EnsureReady(_ context.Context) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if !v.mounted {
+		return nil
+	}
+	return v.ensureBindingLocked("ensure_ready")
 }
 
 func (v *VFSVolume) Unmount(_ context.Context) error {
@@ -125,6 +125,7 @@ func (v *VFSVolume) Unmount(_ context.Context) error {
 	v.pipelineFA = nil
 	v.workspace = nil
 	v.pipelineVFS = nil
+	v.generation = 0
 	v.mounted = false
 	return nil
 }
@@ -144,13 +145,21 @@ func (v *VFSVolume) WorkspaceViews() versioning.WorkspaceViewAccess {
 func (v *VFSVolume) Commit(ctx context.Context) (versioning.SemanticVersion, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	return v.sessionVFS.CommitPipeline(ctx, v.pipelineID)
+	ver, err := v.sessionVFS.CommitPipeline(ctx, v.pipelineID)
+	if err == nil {
+		v.pipelineVFS = nil
+	}
+	return ver, err
 }
 
 func (v *VFSVolume) Rollback() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	return v.sessionVFS.RollbackPipeline(v.pipelineID)
+	err := v.sessionVFS.RollbackPipeline(v.pipelineID)
+	if err == nil {
+		v.pipelineVFS = nil
+	}
+	return err
 }
 
 // ---------- DiskVolume ----------
@@ -178,8 +187,11 @@ func NewDiskVolume(name, workingDir string) *DiskVolume {
 	}
 }
 
-func (v *DiskVolume) VolumeName() string                { return v.name }
-func (v *DiskVolume) Mount(_ context.Context) error     { return nil }
+func (v *DiskVolume) VolumeName() string            { return v.name }
+func (v *DiskVolume) Mount(_ context.Context) error { return nil }
+func (v *DiskVolume) EnsureReady(_ context.Context) error {
+	return nil
+}
 func (v *DiskVolume) Unmount(_ context.Context) error   { return nil }
 func (v *DiskVolume) FileAccess() versioning.FileAccess { return v.fa }
 func (v *DiskVolume) WorkspaceViews() versioning.WorkspaceViewAccess {
@@ -203,8 +215,11 @@ func NewGlobalVFSVolume(name string, fa versioning.FileAccess, views versioning.
 	return &GlobalVFSVolume{name: name, fa: fa, views: views}
 }
 
-func (v *GlobalVFSVolume) VolumeName() string              { return v.name }
-func (v *GlobalVFSVolume) Mount(_ context.Context) error   { return nil }
+func (v *GlobalVFSVolume) VolumeName() string            { return v.name }
+func (v *GlobalVFSVolume) Mount(_ context.Context) error { return nil }
+func (v *GlobalVFSVolume) EnsureReady(_ context.Context) error {
+	return nil
+}
 func (v *GlobalVFSVolume) Unmount(_ context.Context) error { return nil }
 
 func (v *GlobalVFSVolume) FileAccess() versioning.FileAccess {
@@ -231,6 +246,56 @@ func (v *GlobalVFSVolume) SetWorkspaceViews(views versioning.WorkspaceViewAccess
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.views = views
+}
+
+func (v *VFSVolume) ensureBindingLocked(reason string) error {
+	if v.sessionVFS == nil {
+		return versioning.ErrNoActiveSessionVFS
+	}
+	if v.sessionVFS.HasPipeline(v.pipelineID) {
+		return nil
+	}
+	return v.rebindLocked(reason)
+}
+
+func (v *VFSVolume) rebindLocked(reason string) error {
+	pipelineVFS, err := v.sessionVFS.BeginPipeline(versioning.BeginPipelineConfig{
+		PipelineID: v.pipelineID,
+		SessionID:  v.sessionID,
+		WorkingDir: v.workingDir,
+		Files:      append([]string(nil), v.files...),
+	})
+	if err != nil {
+		v.logTrace("vfs_volume_rebind_failed", "error", agentlog.EventError, map[string]any{
+			"pipeline_id": v.pipelineID,
+			"reason":      reason,
+			"error":       err.Error(),
+		})
+		return err
+	}
+	v.pipelineVFS = pipelineVFS
+	v.generation++
+	if v.pipelineFA == nil {
+		v.pipelineFA = versioning.NewPipelineRoutingFileAccess(false, func() *versioning.SessionVFS {
+			return v.sessionVFS
+		}, v.pipelineID, v.workingDir)
+	}
+	if v.workspace == nil {
+		v.workspace = versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+			DefaultView:       versioning.WorkspaceViewPipeline,
+			DefaultPipelineID: v.pipelineID,
+			DefaultSessionID:  string(v.sessionID),
+			WorkingDir:        v.workingDir,
+			Session:           v.sessionVFS,
+			DiskFallback:      versioning.NewDiskFileAccess(v.workingDir, true),
+		})
+	}
+	v.logTrace("vfs_volume_rebind_done", "debug", agentlog.EventRegistryEvent, map[string]any{
+		"pipeline_id": v.pipelineID,
+		"reason":      reason,
+		"generation":  v.generation,
+	})
+	return nil
 }
 
 func (v *VFSVolume) logTrace(event, level string, eventCode agentlog.EventType, data map[string]any) {

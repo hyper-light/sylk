@@ -19,6 +19,7 @@ import (
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
@@ -99,6 +100,8 @@ type PipelineInspector struct {
 
 	// Steering ledger management.
 	steering *agentShared.SteeringManager
+	// Tracks Memory Forest branches surfaced during pipeline inspection.
+	forestTracker *agentShared.MemoryForestTracker
 
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
@@ -123,6 +126,7 @@ func New(cfg shared.PipelineInspectorConfig, provider providers.ProviderAdapter)
 		criteria:          make(map[string]*shared.InspectorCriteria),
 		taskFiles:         make(map[string][]string),
 		results:           make(map[string]*shared.InspectorResult),
+		forestTracker:     agentShared.NewMemoryForestTracker(),
 		steering:          agentShared.NewSteeringManager(),
 		requestSerializer: agentShared.NewRequestSerializer(),
 		executionBroker:   purevfs.DefaultExecutionBroker(),
@@ -182,6 +186,33 @@ func (pi *PipelineInspector) initSkills() error {
 	pi.hooks = skills.NewHookRegistry()
 
 	pi.registerCoreSkills()
+	if err := agentShared.RegisterMemoryForestSkills(pi.skills, "inspector-pipeline", pi.config.Forest, pi.forestTracker); err != nil {
+		return fmt.Errorf("register pipeline inspector forest skills: %w", err)
+	}
+	if err := agentShared.AttachForestOutcomeRecorder(
+		pi.skills,
+		"handoff_to_ot",
+		pi.forestTracker,
+		pi.config.Forest,
+		func() string { return pi.id },
+		"inspector-pipeline",
+		func() string { return pi.config.SessionID },
+		agentShared.OutcomeOnSuccess("pipeline inspector accepted the task for OT handoff"),
+	); err != nil {
+		return fmt.Errorf("attach pipeline inspector forest OT outcome: %w", err)
+	}
+	if err := agentShared.AttachForestOutcomeRecorder(
+		pi.skills,
+		"request_correction",
+		pi.forestTracker,
+		pi.config.Forest,
+		func() string { return pi.id },
+		"inspector-pipeline",
+		func() string { return pi.config.SessionID },
+		agentShared.OutcomeAlways(forest.OutcomeStatusFailed, "pipeline inspector requested a correction"),
+	); err != nil {
+		return fmt.Errorf("attach pipeline inspector forest correction outcome: %w", err)
+	}
 	pi.registerSafetyHook()
 
 	loaderCfg := skills.DefaultLoaderConfig()
@@ -435,6 +466,7 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 	// Decode structured pipeline task from orchestrator dispatch.
 	task := decodePipelineTask(fwd.Input)
 	ctx = agentShared.WithPipelineTaskProtocolState(ctx, task)
+	defer agentShared.ClosePipelineProtocolState(ctx)
 
 	// Only try static/conversational replies for non-pipeline inputs.
 	// Pipeline task JSON contains keywords like "state" that would falsely
@@ -539,8 +571,6 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 
 	if taskID, _ := fwd.Metadata["task_id"].(string); taskID != "" {
 		pi.pipelineID = taskID
-	} else if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
-		pi.pipelineID = dagID
 	}
 	if taskSlug, _ := fwd.Metadata["task_slug"].(string); taskSlug != "" {
 		pi.pipelineSlug = taskSlug

@@ -1,12 +1,13 @@
 package pipeline
 
 import (
+	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 func pipelineInspectorVisibleSkillNames() []string {
-	return []string{
+	return agentShared.AppendMemoryForestVisibleSkillNames([]string{
 		"search_skills",
 		"read_file",
 		"diff_workspace_file",
@@ -37,11 +38,11 @@ func pipelineInspectorVisibleSkillNames() []string {
 		"coord_publish_artifact",
 		"coord_request_review",
 		"coord_resolve_artifact",
-	}
+	}, "inspector-pipeline")
 }
 
 func pipelineInspectorMutatingSkillNames() []string {
-	return []string{
+	return agentShared.AppendMemoryForestMutatingSkillNames([]string{
 		"run_command",
 		"run_shell_script",
 		"define_criteria",
@@ -60,7 +61,7 @@ func pipelineInspectorMutatingSkillNames() []string {
 		"coord_request_review",
 		"coord_resolve_artifact",
 		"reroute_request",
-	}
+	})
 }
 
 func pipelineInspectorToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {
@@ -68,7 +69,7 @@ func pipelineInspectorToolManifest(registry *skills.Registry) *toolruntime.Polic
 		AgentID:          "inspector-pipeline",
 		CapabilityScope:  "inspector.pipeline",
 		Registry:         registry,
-		VisibleByDefault: pipelineInspectorVisibleSkillNames(),
-		Mutating:         pipelineInspectorMutatingSkillNames(),
+		VisibleByDefault: agentShared.FilterRegisteredSkillNames(registry, pipelineInspectorVisibleSkillNames()),
+		Mutating:         agentShared.FilterRegisteredSkillNames(registry, pipelineInspectorMutatingSkillNames()),
 	})
 }

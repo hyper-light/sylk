@@ -1,0 +1,6 @@
+./errors.go
+./loader.go
+./prompt.go
+./search_skills.go
+./skill.go
+./validator.go

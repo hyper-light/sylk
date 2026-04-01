@@ -62,11 +62,13 @@ type KnowledgeStore struct {
 
 	partialReady chan struct{} // closed at ReadinessPartial
 	fullReady    chan struct{} // closed at ReadinessFull
+	partialOnce  sync.Once
+	fullOnce     sync.Once
 
 	mu         sync.Mutex // guards resource ownership for cleanup
 	bgWaiter   BackgroundIndexWaiter
-	closeable  io.Closer          // bleve store closer, set by caller
-	progressFn ProgressObserver   // UI callback, guarded by mu
+	closeable  io.Closer        // bleve store closer, set by caller
+	progressFn ProgressObserver // UI callback, guarded by mu
 
 	publisher  ReadinessPublisher
 	logger     *slog.Logger
@@ -156,14 +158,19 @@ func (ks *KnowledgeStore) NotifyProgress(phase string, current, total int64) {
 func (ks *KnowledgeStore) PromotePartial(searcher *query.BleveSearcher, bgWaiter BackgroundIndexWaiter, closer io.Closer) {
 	ks.mu.Lock()
 	ks.bgWaiter = bgWaiter
-	ks.closeable = closer
+	if closer != nil {
+		ks.closeable = closer
+	}
 	ks.mu.Unlock()
 
 	ks.coordinator.SetBleveSearcher(searcher)
 
-	ks.level.Store(int32(ReadinessPartial))
-	close(ks.partialReady)
+	if ks.Level() >= ReadinessPartial {
+		return
+	}
 
+	ks.level.Store(int32(ReadinessPartial))
+	ks.partialOnce.Do(func() { close(ks.partialReady) })
 	ks.publishEvent(ReadinessPartial)
 	ks.logKnowledge(agentlog.EventKnowledgePromotePartial, "info", &agentlog.BootPhasePayload{
 		Phase: "promote_partial",
@@ -174,13 +181,13 @@ func (ks *KnowledgeStore) PromotePartial(searcher *query.BleveSearcher, bgWaiter
 
 // PromoteFull transitions to ReadinessFull (all docs indexed).
 func (ks *KnowledgeStore) PromoteFull() {
+	if ks.Level() >= ReadinessFull {
+		return
+	}
+
 	ks.level.Store(int32(ReadinessFull))
 
-	select {
-	case <-ks.fullReady:
-	default:
-		close(ks.fullReady)
-	}
+	ks.fullOnce.Do(func() { close(ks.fullReady) })
 
 	ks.publishEvent(ReadinessFull)
 	ks.logKnowledge(agentlog.EventKnowledgePromoteFull, "info", &agentlog.BootPhasePayload{

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/security"
@@ -84,6 +85,9 @@ type Config struct {
 	// RequestGuard is called at handler entry to prevent activation demotion
 	// during in-flight processing. Returns a release function. Nil-safe.
 	RequestGuard func() func()
+
+	// Forest exposes Memory Forest governance precedent skills.
+	Forest shared.MemoryForestService
 }
 
 // applyDefaults fills in zero values with sensible defaults.

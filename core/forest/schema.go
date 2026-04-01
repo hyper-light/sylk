@@ -2,6 +2,7 @@ package forest
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -200,6 +201,18 @@ func ensureSchema(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_forest_substrate_edges_target
 			ON forest_substrate_edges(session_id, target_branch_id, conductance DESC);
 
+		CREATE TABLE IF NOT EXISTS forest_substrate_sessions (
+			session_id TEXT PRIMARY KEY,
+			graph_version INTEGER NOT NULL DEFAULT 0,
+			substrate_version INTEGER NOT NULL DEFAULT 0,
+			dirty INTEGER NOT NULL DEFAULT 0,
+			dirty_at INTEGER NOT NULL DEFAULT 0,
+			updated_at INTEGER NOT NULL DEFAULT 0
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_forest_substrate_sessions_dirty
+			ON forest_substrate_sessions(dirty, dirty_at DESC, updated_at DESC);
+
 		CREATE TABLE IF NOT EXISTS forest_substrate_state (
 			context_key TEXT NOT NULL,
 			session_id TEXT NOT NULL,
@@ -278,6 +291,14 @@ func ensureForestSupportTables(db *sql.DB) error {
 }
 
 func ensureNodeMemoryColumns(db *sql.DB) error {
+	exists, err := tableExists(db, "nodes")
+	if err != nil {
+		return fmt.Errorf("inspect nodes table: %w", err)
+	}
+	if !exists {
+		return errors.New("forest db missing nodes table; initialize the backing DB with vectorgraphdb.Open before forest.New")
+	}
+
 	columns, err := tableColumns(db, "nodes")
 	if err != nil {
 		return fmt.Errorf("inspect node columns: %w", err)
@@ -298,6 +319,22 @@ func ensureNodeMemoryColumns(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+func tableExists(db *sql.DB, table string) (bool, error) {
+	var name string
+	err := db.QueryRow(
+		"SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+		table,
+	).Scan(&name)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 func tableColumns(db *sql.DB, table string) (map[string]struct{}, error) {

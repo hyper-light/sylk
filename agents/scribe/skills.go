@@ -1,0 +1,308 @@
+package scribe
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
+	"github.com/google/uuid"
+)
+
+const scribeStoreArchivalistSkillName = "store_archivalist"
+
+type scribeToolBundle struct {
+	registry *skills.Registry
+	loader   *skills.Loader
+	runtime  *toolruntime.Runtime
+}
+
+type scribeRunState struct {
+	feed       shared.ScribeFeed
+	tracker    *shared.MemoryForestTracker
+	stored     bool
+	commentary string
+}
+
+func (s *Scribe) newToolBundle(feed shared.ScribeFeed) (*scribeToolBundle, *scribeRunState, error) {
+	registry := skills.NewRegistry()
+	runState := &scribeRunState{
+		feed:    feed,
+		tracker: shared.NewMemoryForestTracker(),
+	}
+	if err := registry.Register(s.storeArchivalistSkill(runState)); err != nil {
+		return nil, nil, fmt.Errorf("register scribe store skill: %w", err)
+	}
+	if err := shared.RegisterMemoryForestSkills(registry, s.AgentType(), s.config.Forest, runState.tracker); err != nil {
+		return nil, nil, fmt.Errorf("register scribe forest skills: %w", err)
+	}
+	if err := shared.AttachForestOutcomeRecorder(
+		registry,
+		scribeStoreArchivalistSkillName,
+		runState.tracker,
+		s.config.Forest,
+		s.AgentID,
+		s.AgentType(),
+		nil,
+		shared.OutcomeOnSuccess("scribe stored commentary for future replay and handoff"),
+	); err != nil {
+		return nil, nil, fmt.Errorf("attach scribe forest outcome recorder: %w", err)
+	}
+	for _, name := range shared.AppendMemoryForestMutatingSkillNames(nil) {
+		registry.Unload(name)
+	}
+
+	loaderCfg := skills.DefaultLoaderConfig()
+	loaderCfg.CoreSkills = scribeVisibleSkillNamesForRegistry(registry, s.AgentType())
+	loaderCfg.AutoLoadDomains = nil
+	loader := skills.NewLoader(registry, loaderCfg)
+
+	runtime, err := toolruntime.New(toolruntime.Config{
+		Registry: registry,
+		Manifest: scribeToolManifest(registry, s.AgentType()),
+		State:    toolruntime.NewState(),
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("initialize scribe tool runtime: %w", err)
+	}
+	runtime.SyncActiveFromLoaded()
+	return &scribeToolBundle{
+		registry: registry,
+		loader:   loader,
+		runtime:  runtime,
+	}, runState, nil
+}
+
+func (b *scribeToolBundle) Close() {
+	if b == nil || b.runtime == nil {
+		return
+	}
+	b.runtime.Close()
+}
+
+func (b *scribeToolBundle) buildToolDefinitions() []providersTool {
+	if b == nil || b.runtime == nil {
+		return nil
+	}
+	b.runtime.SyncActiveFromLoaded()
+	return b.runtime.BuildToolDefinitions()
+}
+
+func (b *scribeToolBundle) prepareSkillsForInput(input string) {
+	if b == nil || b.loader == nil {
+		return
+	}
+	b.loader.LoadForInput(input)
+	b.loader.OptimizeForBudget()
+}
+
+func (b *scribeToolBundle) executeToolCall(ctx context.Context, agentID string, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
+	if b == nil || b.runtime == nil {
+		return toolruntime.ExecutionResult{}, fmt.Errorf("scribe tool runtime is not configured")
+	}
+	name := strings.TrimSpace(call.Name)
+	if name == "" {
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
+	}
+	raw := strings.TrimSpace(call.Arguments)
+	if raw == "" {
+		raw = "{}"
+	}
+	if !json.Valid([]byte(raw)) {
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
+	}
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = strings.TrimSpace(agentID) + "-local"
+	}
+	return b.runtime.Execute(ctx, toolruntime.Invocation{
+		ToolCall: providers.ToolCall{
+			ID:        call.ID,
+			Name:      name,
+			Arguments: raw,
+		},
+		AgentID:         b.runtime.AgentID(),
+		CorrelationID:   correlationID,
+		CapabilityScope: b.runtime.CapabilityScope(),
+	})
+}
+
+func (b *scribeToolBundle) toolInvocations(ctx context.Context, agentID string, calls []providers.ToolCall) []toolruntime.Invocation {
+	if b == nil || b.runtime == nil || len(calls) == 0 {
+		return nil
+	}
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = strings.TrimSpace(agentID) + "-local"
+	}
+	scope := b.runtime.CapabilityScope()
+	invocations := make([]toolruntime.Invocation, 0, len(calls))
+	for _, call := range calls {
+		invocations = append(invocations, toolruntime.Invocation{
+			ToolCall: providers.ToolCall{
+				ID:        call.ID,
+				Name:      strings.TrimSpace(call.Name),
+				Arguments: strings.TrimSpace(call.Arguments),
+			},
+			AgentID:         b.runtime.AgentID(),
+			CorrelationID:   correlationID,
+			CapabilityScope: scope,
+		})
+	}
+	return invocations
+}
+
+type providersTool = providers.Tool
+
+// storeArchivalistSkill persists the final structured commentary for the
+// current observed turn. It is the required terminal action for a Scribe turn.
+func (s *Scribe) storeArchivalistSkill(runState *scribeRunState) *skills.Skill {
+	return skills.NewSkill(scribeStoreArchivalistSkillName).
+		Description("Persist the final structured commentary for this observed turn into the Archivalist. This is the terminal step for a Scribe turn.").
+		Domain("memory").
+		Keywords("store", "archivalist", "scribe", "summary", "handoff", "commentary").
+		Priority(100).
+		Usage("Call exactly once after any needed forest lookups. Do not return free text instead of calling this tool.").
+		BestPractice("Keep the commentary compact, factual, and archival. Preserve only the details that will matter in later retrieval, replay, or handoff.").
+		ObjectParam("commentary", "Structured commentary object for the current observed turn", map[string]*skills.Property{
+			"summary":         {Type: "string", Description: "What happened this turn"},
+			"progress":        {Type: "string", Description: "Overall task progress after this turn"},
+			"decisions":       {Type: "string", Description: "Key decisions or tradeoffs made this turn"},
+			"state":           {Type: "string", Description: "Current working state after this turn"},
+			"risk":            {Type: "string", Description: "Risks, regressions, or unresolved concerns"},
+			"handoff_context": {Type: "string", Description: "Compact context worth preserving for future handoff or replay"},
+			"details":         {Type: "object", Description: "Optional role-specific details that carry high downstream value"},
+		}, true).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			commentary, err := parseScribeCommentary(input)
+			if err != nil {
+				return nil, err
+			}
+			if runState == nil {
+				return nil, fmt.Errorf("scribe run state is not configured")
+			}
+			if runState.stored {
+				return nil, fmt.Errorf("scribe commentary already stored for this turn")
+			}
+			summary := strings.TrimSpace(scribeStringFromAny(commentary["summary"]))
+			if summary == "" {
+				return nil, fmt.Errorf("commentary.summary is required")
+			}
+			payload, err := json.Marshal(commentary)
+			if err != nil {
+				return nil, fmt.Errorf("marshal commentary: %w", err)
+			}
+			if err := s.storeCommentaryInArchivalist(ctx, string(payload), runState.feed); err != nil {
+				return nil, err
+			}
+			runState.stored = true
+			runState.commentary = string(payload)
+			return map[string]any{
+				"stored":      true,
+				"summary":     summary,
+				"stored_at":   time.Now().UTC().Format(time.RFC3339),
+				"target":      "archivalist",
+				"correlation": strings.TrimSpace(runState.feed.ParentCorrelationID),
+			}, nil
+		}).
+		Build()
+}
+
+func parseScribeCommentary(input json.RawMessage) (map[string]any, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(input, &payload); err != nil {
+		return nil, fmt.Errorf("invalid parameters: %w", err)
+	}
+	if nested, ok := payload["commentary"].(map[string]any); ok {
+		return nested, nil
+	}
+	return payload, nil
+}
+
+func (s *Scribe) storeCommentaryInArchivalist(ctx context.Context, commentary string, feed shared.ScribeFeed) error {
+	if s.bus == nil {
+		return fmt.Errorf("scribe bus is not configured")
+	}
+	input, err := guide.ArchivalistStoreRouteInput(commentary)
+	if err != nil {
+		return fmt.Errorf("encode archivalist store route: %w", err)
+	}
+
+	parentCorrelationID := strings.TrimSpace(feed.ParentCorrelationID)
+	branchCtx := ctx
+	if parentCorrelationID != "" {
+		branchCtx = shared.WithStreamContext(branchCtx, parentCorrelationID, s.parentAgentType)
+	}
+	branchCtx, branch := shared.BeginArchivalistStoreBranch(branchCtx, "stored scribe commentary", map[string]any{
+		"parent_agent": s.parentAgentType,
+	})
+	metadata := branch.ApplyMetadata(branchCtx, map[string]any{
+		"source_type":  "scribe",
+		"parent_agent": s.parentAgentType,
+		"scribe_id":    s.id,
+	})
+
+	req := &guide.RouteRequest{
+		CorrelationID:       "scribe_" + uuid.NewString(),
+		ParentCorrelationID: parentCorrelationID,
+		SourceAgentID:       s.id,
+		Input:               input,
+		FireAndForget:       true,
+		Timestamp:           time.Now(),
+		Metadata:            metadata,
+	}
+	msg := guide.NewRequestMessage(
+		fmt.Sprintf("scribe_%s_msg_%s", s.parentAgentType, uuid.New().String()[:8]),
+		req,
+	)
+	msg.Metadata = metadata
+	if err := s.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+		branch.Complete(branchCtx, "", "", err)
+		return fmt.Errorf("publish archivalist store request: %w", err)
+	}
+	branch.Complete(branchCtx, "stored scribe commentary", "", nil)
+	return nil
+}
+
+func scribeVisibleSkillNames(agentType string) []string {
+	return shared.AppendMemoryForestVisibleSkillNames([]string{
+		scribeStoreArchivalistSkillName,
+	}, agentType)
+}
+
+func scribeVisibleSkillNamesForRegistry(registry *skills.Registry, agentType string) []string {
+	return shared.FilterRegisteredSkillNames(registry, scribeVisibleSkillNames(agentType))
+}
+
+func scribeMutatingSkillNames(agentType string) []string {
+	return shared.AppendMemoryForestMutatingSkillNames([]string{
+		scribeStoreArchivalistSkillName,
+	})
+}
+
+func scribeToolManifest(registry *skills.Registry, agentType string) *toolruntime.PolicyManifest {
+	return toolruntime.BuildManifestFromRegistry(toolruntime.ManifestBuildConfig{
+		AgentID:          strings.TrimSpace(agentType),
+		CapabilityScope:  strings.TrimSpace(agentType) + ".default",
+		Registry:         registry,
+		VisibleByDefault: scribeVisibleSkillNamesForRegistry(registry, agentType),
+		Mutating:         shared.FilterRegisteredSkillNames(registry, scribeMutatingSkillNames(agentType)),
+	})
+}
+
+func scribeStringFromAny(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case fmt.Stringer:
+		return typed.String()
+	default:
+		return ""
+	}
+}

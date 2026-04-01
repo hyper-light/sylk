@@ -198,6 +198,9 @@ type PipelineProtocolRouteConfig struct {
 
 type PipelineProtocolState struct {
 	mu             sync.RWMutex
+	sessionDir     string
+	scopeID        string
+	store          *durableProtocolLog
 	snapshot       *PipelineProtocolSnapshot
 	terminalAction *PipelineTurnAction
 	processed      []PipelineValidationProcessing
@@ -238,11 +241,15 @@ func WithPipelineTaskProtocolState(ctx context.Context, task *PipelineTaskInput)
 	if ctx == nil || task == nil || PipelineProtocolStateFromContext(ctx) != nil {
 		return ctx
 	}
-	snapshot, err := PipelineProtocolSnapshotFromTask(task)
-	if err != nil || snapshot == nil {
+	state, err := newPipelineProtocolStateForTask(task)
+	if err != nil || state == nil {
+		if snapshot, snapErr := PipelineProtocolSnapshotFromTask(task); snapErr == nil && snapshot != nil {
+			return WithPipelineProtocolState(ctx, NewPipelineProtocolState(snapshot))
+		}
 		return ctx
 	}
-	return WithPipelineProtocolState(ctx, NewPipelineProtocolState(snapshot))
+	state.HydrateTask(task)
+	return WithPipelineProtocolState(ctx, state)
 }
 
 func PipelineProtocolSnapshotFromTask(task *PipelineTaskInput) (*PipelineProtocolSnapshot, error) {
@@ -304,6 +311,21 @@ func (s *PipelineProtocolState) RequiredAction() (PipelineProtocolActionType, st
 	return s.requiredAction, strings.TrimSpace(s.requiredReason)
 }
 
+func (s *PipelineProtocolState) Close() error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	return s.store.Close()
+}
+
+func ClosePipelineProtocolState(ctx context.Context) error {
+	state := PipelineProtocolStateFromContext(ctx)
+	if state == nil {
+		return nil
+	}
+	return state.Close()
+}
+
 func (s *PipelineProtocolState) setTerminalAction(action *PipelineTurnAction) error {
 	if s == nil || action == nil {
 		return nil
@@ -341,6 +363,25 @@ func (s *PipelineProtocolState) requireTerminalAction(action PipelineProtocolAct
 	defer s.mu.Unlock()
 	s.requiredAction = action
 	s.requiredReason = strings.TrimSpace(reason)
+}
+
+func (s *PipelineProtocolState) HydrateTask(task *PipelineTaskInput) {
+	if s == nil || task == nil {
+		return
+	}
+	snapshot := materializePipelineProtocolSnapshot(s)
+	if snapshot == nil {
+		return
+	}
+	if task.Context == nil {
+		task.Context = map[string]any{}
+	}
+	task.Context["pipeline_protocol"] = pipelineProtocolTaskSnapshotMap(snapshot)
+	if obligations := s.CurrentAgentObligations(normalizePipelineAgentType(task.AgentType)); len(obligations) > 0 {
+		task.Context["pipeline_protocol_obligations"] = obligations
+	} else {
+		delete(task.Context, "pipeline_protocol_obligations")
+	}
 }
 
 func requiredPipelineActionMessage(action PipelineProtocolActionType, reason string) string {
@@ -625,10 +666,16 @@ func issuePipelineTurnSelection(
 		if err != nil {
 			return nil, err
 		}
+		if err := state.recordHandoffAction(ctx, action); err != nil {
+			return nil, err
+		}
 		if err := state.setTerminalAction(action); err != nil {
 			return nil, err
 		}
 		return pipelineTurnSelectionResult(agentType, action, dispatch), nil
+	}
+	if err := state.recordHandoffAction(ctx, action); err != nil {
+		return nil, err
 	}
 	if err := state.setTerminalAction(action); err != nil {
 		return nil, err
@@ -756,6 +803,9 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 				if err != nil {
 					return nil, err
 				}
+				if err := state.recordValidation(ctx, record); err != nil {
+					return nil, err
+				}
 				if err := state.setTerminalAction(&PipelineTurnAction{
 					Type:        PipelineProtocolActionValidate,
 					AgentType:   record.RespondingAgent,
@@ -781,6 +831,9 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 				ChallengeID: challenge.ID,
 				Validation:  record,
 			}); err != nil {
+				return nil, err
+			}
+			if err := state.recordValidation(ctx, record); err != nil {
 				return nil, err
 			}
 			return map[string]any{
@@ -847,14 +900,17 @@ func pipelineProcessValidationSkill(cfg PipelineProtocolSkillConfig) *skills.Ski
 			if summary == "" {
 				return nil, fmt.Errorf("summary is required")
 			}
-			state.addProcessedValidation(PipelineValidationProcessing{
+			entry := PipelineValidationProcessing{
 				ChallengeID: challengeID,
 				AgentType:   pipelineProtocolAgentType(ctx, cfg),
 				Decision:    decision,
 				Summary:     summary,
 				NextTargets: normalizeStringList(params.NextTargets),
 				Validation:  cloneValidationRecord(pending),
-			})
+			}
+			if err := state.recordValidationProcessing(ctx, entry); err != nil {
+				return nil, err
+			}
 			return map[string]any{
 				"processed":    true,
 				"challenge_id": challengeID,
@@ -899,7 +955,9 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 			snapshot := state.Snapshot()
 			evidenceRefs := normalizeStringList(params.EvidenceRefs)
 			if record, ok := finalizePipelineValidationReady(snapshot, state.ProcessedValidations()); ok {
-				state.requireTerminalAction(PipelineProtocolActionOT, "The audit already passed; `handoff_to_ot` is the only valid way to end this inspector turn.")
+				if err := state.recordReadyForOT(ctx, summary, normalizeStringList(append(append([]string(nil), evidenceRefs...), record.EvidenceRefs...)), record); err != nil {
+					return nil, err
+				}
 				return map[string]any{
 					"finalize_pipeline":         true,
 					"ready_for_ot":              true,
@@ -968,6 +1026,9 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 				if err != nil {
 					return nil, err
 				}
+				if err := state.recordHandoffAction(ctx, action); err != nil {
+					return nil, err
+				}
 				if err := state.setTerminalAction(action); err != nil {
 					return nil, err
 				}
@@ -975,6 +1036,9 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 				result["finalize_pipeline"] = false
 				result["verification_requested"] = true
 				return result, nil
+			}
+			if err := state.recordHandoffAction(ctx, action); err != nil {
+				return nil, err
 			}
 			if err := state.setTerminalAction(action); err != nil {
 				return nil, err
@@ -1019,6 +1083,15 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 				return nil, fmt.Errorf("pipeline protocol state not available")
 			}
 			evidenceRefs := normalizeStringList(params.EvidenceRefs)
+			action := &PipelineTurnAction{
+				Type:         PipelineProtocolActionOT,
+				AgentType:    agentType,
+				Summary:      summary,
+				EvidenceRefs: evidenceRefs,
+			}
+			if err := state.recordHandoffToOT(ctx, action); err != nil {
+				return nil, err
+			}
 			if err := state.setTerminalAction(&PipelineTurnAction{
 				Type:         PipelineProtocolActionOT,
 				AgentType:    agentType,
@@ -1788,18 +1861,7 @@ func pipelineRouteMetadata(task *PipelineTaskInput) map[string]any {
 func pipelineProtocolTargetAgentID(taskID, agentType string) string {
 	taskID = strings.TrimSpace(taskID)
 	agentType = strings.TrimSpace(normalizePipelineAgentType(agentType))
-	if taskID == "" {
-		return agentType
-	}
-	switch agentType {
-	case PipelineAgentInspector, PipelineAgentTester, PipelineAgentEngineer, PipelineAgentDesigner:
-		if workerAgentID := PipelineWorkerAgentID(taskID, agentType); workerAgentID != "" {
-			return workerAgentID
-		}
-		return agentType
-	default:
-		return agentType
-	}
+	return PipelineWorkerRoutingTarget(taskID, agentType)
 }
 
 func pipelineTerminalUpdateTask(ctx context.Context, cfg PipelineProtocolSkillConfig) *PipelineTaskInput {

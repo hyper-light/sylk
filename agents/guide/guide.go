@@ -17,6 +17,7 @@ import (
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	corecontext "github.com/adalundhe/sylk/core/context"
+	contextskills "github.com/adalundhe/sylk/core/context/skills"
 	"github.com/adalundhe/sylk/core/domain"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
@@ -160,6 +161,7 @@ type Guide struct {
 	// of distinct agent registrations (≤16). Used to resolve UUIDs back to
 	// type names for the activation controller, which indexes by type.
 	typeIndex *ShardedMap[string, string]
+	podIndex  *ShardedMap[string, string]
 
 	// Resilience components
 	circuits       *CircuitBreakerRegistry
@@ -194,7 +196,7 @@ type Guide struct {
 	// register the agent's routing info (capabilities, intents, channels)
 	// with the Guide. Bridges the container→guide registration gap for
 	// agents that weren't pre-activated during bootstrap.
-	agentRegistrar func(agentType string)
+	agentRegistrar func(podID, agentType string)
 
 	// Service registry for health-aware routing. When set, isAgentHealthy
 	// uses healthy endpoints from the registry instead of the local
@@ -306,6 +308,9 @@ type Config struct {
 	// WorkspaceViews provides explicit disk/global/pipeline read access for
 	// guide self-response and steering interactions about active work.
 	WorkspaceViews versioning.WorkspaceViewAccess
+
+	// Forest exposes Memory Forest intent/history skills.
+	Forest contextskills.ForestService
 }
 
 // DefaultConfig returns sensible defaults
@@ -362,6 +367,7 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		agentChannels:           NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:             NewStringMap[bool](DefaultShardCount),
 		typeIndex:               NewStringMap[string](DefaultShardCount),
+		podIndex:                NewStringMap[string](DefaultShardCount),
 		registry:                registry,
 		routing:                 routing,
 		triggers:                NewTriggerDetector(routing),
@@ -450,8 +456,10 @@ func resolveRouteCacheConfig(cfg Config) RouteCacheConfig {
 func buildSkills(cfg Config) (*skills.Registry, skills.LoaderConfig, *skills.HookRegistry) {
 	skillsRegistry := skills.NewRegistry()
 	skillsLoaderCfg := guideSkillsLoaderConfig(cfg)
-	skillsLoaderCfg.CoreSkills = guideCoreSkillNames()
 	skillsLoaderCfg.AutoLoadDomains = nil
+	if len(skillsLoaderCfg.CoreSkills) == 0 {
+		skillsLoaderCfg.CoreSkills = guideCoreSkillNames()
+	}
 
 	hooks := skills.NewHookRegistry()
 	registerGuideSafetyHook(hooks, skillsRegistry, guideAllSkillNames())
@@ -472,6 +480,13 @@ func guideSkillsLoaderConfig(cfg Config) skills.LoaderConfig {
 func (g *Guide) initializeSkills(loaderCfg skills.LoaderConfig) error {
 	g.registerCoreSkills()
 	g.registerExtendedSkills()
+	if err := contextskills.RegisterForestSkillsForAgent(g.skills, "guide", &contextskills.RetrievalDependencies{
+		Forest: g.config.Forest,
+	}); err != nil {
+		return fmt.Errorf("register guide forest skills: %w", err)
+	}
+	loaderCfg.CoreSkills = filterSyntheticGuideRuntimeTools(guideToolManifestForRegistry(g.skills).DefaultVisibleNames())
+	registerGuideSafetyHook(g.hooks, g.skills, guideToolManifestForRegistry(g.skills).AllowedNames())
 	if err := validateGuideSkillConfiguration(g.skills); err != nil {
 		return err
 	}
@@ -529,6 +544,7 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		agentChannels:           NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:             NewStringMap[bool](DefaultShardCount),
 		typeIndex:               NewStringMap[string](DefaultShardCount),
+		podIndex:                NewStringMap[string](DefaultShardCount),
 		registry:                registry,
 		routing:                 routing,
 		triggers:                NewTriggerDetector(routing),
@@ -635,6 +651,7 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 		agentChannels:           NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:             NewStringMap[bool](DefaultShardCount),
 		typeIndex:               NewStringMap[string](DefaultShardCount),
+		podIndex:                NewStringMap[string](DefaultShardCount),
 		registry:                registry,
 		routing:                 routing,
 		triggers:                NewTriggerDetector(routing),
@@ -1404,8 +1421,15 @@ func (g *Guide) resolveReadyAgentID(idOrName string) string {
 	if trimmed == "" {
 		return ""
 	}
-	if g.resolveAgent(trimmed) != nil && g.IsAgentReady(trimmed) {
-		return g.resolveAgentID(trimmed)
+	if agent := g.resolveAgent(trimmed); agent != nil && g.IsAgentReady(agent.ID) {
+		return agent.ID
+	}
+	if podID := g.persistentPodID(trimmed); podID != "" {
+		if target := taskScopedPipelineTargetName(podID, g.resolveActivationType(trimmed)); target != "" {
+			if agent := g.resolveAgent(target); agent != nil && g.IsAgentReady(agent.ID) {
+				return agent.ID
+			}
+		}
 	}
 	agentType := g.resolveActivationType(trimmed)
 	if agentType == "" {
@@ -1423,8 +1447,11 @@ func (g *Guide) resolveReadyAgentID(idOrName string) string {
 // no mapping exists — the caller should assume it is already a type name.
 func (g *Guide) resolveActivationType(idOrName string) string {
 	// Fast path: routing aggregator knows both UUID-keyed and name-keyed agents.
-	if info := g.routing.GetRoutingInfo(idOrName); info != nil && info.Type != "" {
+	if info := g.resolveRoutingInfo(idOrName); info != nil && info.Type != "" {
 		return info.Type
+	}
+	if _, agentType, ok := parseTaskScopedPipelineTarget(idOrName); ok {
+		return agentType
 	}
 	// Persistent index survives agent unregistration (e.g. after demotion).
 	if agentType, ok := g.typeIndex.Get(idOrName); ok {
@@ -1438,11 +1465,76 @@ func (g *Guide) resolveActivationType(idOrName string) string {
 // to resolve the pod. Returns the agent type itself when no activator
 // is set or no mapping exists (singleton pods).
 func (g *Guide) resolvePodID(idOrName string) string {
+	if info := g.resolveRoutingInfo(idOrName); info != nil && strings.TrimSpace(info.PodID) != "" {
+		return strings.TrimSpace(info.PodID)
+	}
+	if podID := g.persistentPodID(idOrName); podID != "" {
+		return podID
+	}
+	if podID, _, ok := parseTaskScopedPipelineTarget(idOrName); ok {
+		return podID
+	}
 	agentType := g.resolveActivationType(idOrName)
 	if g.activator != nil {
 		return g.activator.PodForAgent(agentType)
 	}
 	return agentType
+}
+
+func (g *Guide) resolveRoutingInfo(idOrName string) *AgentRoutingInfo {
+	if g == nil || g.routing == nil {
+		return nil
+	}
+	if info := g.routing.GetRoutingInfo(idOrName); info != nil {
+		return info
+	}
+	if resolvedID, ok := g.routing.ResolveAgent(idOrName); ok {
+		return g.routing.GetRoutingInfo(resolvedID)
+	}
+	return nil
+}
+
+func parseTaskScopedPipelineTarget(idOrName string) (podID, agentType string, ok bool) {
+	trimmed := strings.TrimSpace(idOrName)
+	if trimmed == "" {
+		return "", "", false
+	}
+	for _, candidate := range []string{"inspector-pipeline", "tester-pipeline", "engineer", "designer"} {
+		suffix := "-" + candidate
+		if !strings.HasSuffix(trimmed, suffix) {
+			continue
+		}
+		podID = strings.TrimSpace(strings.TrimSuffix(trimmed, suffix))
+		if podID == "" {
+			continue
+		}
+		return podID, candidate, true
+	}
+	return "", "", false
+}
+
+func taskScopedPipelineTargetName(podID, agentType string) string {
+	podID = strings.TrimSpace(podID)
+	agentType = strings.TrimSpace(agentType)
+	if podID == "" {
+		return ""
+	}
+	switch agentType {
+	case "inspector-pipeline", "tester-pipeline", "engineer", "designer":
+		return podID + "-" + agentType
+	default:
+		return ""
+	}
+}
+
+func (g *Guide) persistentPodID(idOrName string) string {
+	if g == nil || g.podIndex == nil {
+		return ""
+	}
+	if podID, ok := g.podIndex.Get(strings.TrimSpace(idOrName)); ok {
+		return strings.TrimSpace(podID)
+	}
+	return ""
 }
 
 // ensureExplicitTargetReady activates and registers the target agent if it
@@ -1468,6 +1560,7 @@ func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID str
 
 	// Resolve UUID → pod ID for the activation controller, which indexes
 	// by pod ID, not by agent UUID.
+	activationType := g.resolveActivationType(targetAgentID)
 	podID := g.resolvePodID(targetAgentID)
 
 	if g.activator != nil {
@@ -1490,7 +1583,7 @@ func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID str
 			"elapsed_ms", time.Since(activateStart).Milliseconds())
 	}
 	if g.agentRegistrar != nil {
-		g.agentRegistrar(g.resolveActivationType(targetAgentID))
+		g.agentRegistrar(podID, activationType)
 	}
 
 	if resolved := g.resolveReadyAgentID(targetAgentID); resolved != "" {
@@ -1511,7 +1604,7 @@ func (g *Guide) ensureClassifiedTargetReady(ctx context.Context, targetAgentID s
 	// An agent is fully ready only when it has been activated (channels
 	// created, bus subscriptions wired) AND marked ready. Pre-registered
 	// agents are resolvable but not ready — they still need activation.
-	if g.resolveAgent(targetAgentID) != nil && g.IsAgentReady(targetAgentID) {
+	if agent := g.resolveAgent(targetAgentID); agent != nil && g.IsAgentReady(agent.ID) {
 		guideFileLog().Info("DEBUG: target_already_registered", "target", targetAgentID)
 		if g.activator != nil {
 			g.activator.TouchPodActivity(g.resolvePodID(targetAgentID))
@@ -2374,6 +2467,9 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 	// Never cleared — bounded to ≤16 agent registrations.
 	if info.Type != "" {
 		g.typeIndex.Set(info.ID, info.Type)
+	}
+	if g.podIndex != nil && strings.TrimSpace(info.PodID) != "" {
+		g.podIndex.Set(info.ID, strings.TrimSpace(info.PodID))
 	}
 	// Register capabilities/constraints with registry
 	if info.Registration != nil {
@@ -3927,6 +4023,21 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 		g.observeStreamDirective(streamResp)
 		g.observeStreamReroute(streamResp)
 		if pending == nil {
+			fallbackTarget := strings.TrimSpace(streamResp.TargetAgentID)
+			if fallbackTarget == "" {
+				fallbackTarget = strings.TrimSpace(msg.TargetAgentID)
+			}
+			if fallbackTarget != "" {
+				streamResp.TargetAgentID = fallbackTarget
+				if streamResp.RespondingAgentName == "" {
+					streamResp.RespondingAgentName = g.resolveAgentDisplayName(streamResp.RespondingAgentID)
+				}
+				publishErr := g.publishStreamToSource(fallbackTarget, streamResp)
+				if streamResp.Event != nil && streamResp.Event.Type == StreamEventComplete && g.streams != nil {
+					g.streams.CloseStream(streamResp.CorrelationID)
+				}
+				return publishErr
+			}
 			if streamResp.Event != nil && streamResp.Event.Type == StreamEventComplete {
 				DebugFileLog().Warn("handleResponseMessage: STREAM_COMPLETE_NO_PENDING",
 					"correlation_id", streamResp.CorrelationID,
@@ -4458,7 +4569,7 @@ func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *Forward
 	// Skip when the resolved agent already has active bus subscriptions —
 	// re-registration is only needed when activation created a fresh agent.
 	if g.agentRegistrar != nil {
-		g.agentRegistrar(activationType)
+		g.agentRegistrar(podID, activationType)
 	}
 
 	// Re-resolve — cold start may create a fresh registration ID.
@@ -5044,7 +5155,7 @@ func (g *Guide) SetActivator(a PodActivator) {
 // register the agent's routing info with the Guide. This bridges the gap
 // between container activation (which only marks readiness) and Guide
 // registration (which provides capabilities, intents, and channels).
-func (g *Guide) SetAgentRegistrar(registrar func(agentType string)) {
+func (g *Guide) SetAgentRegistrar(registrar func(podID, agentType string)) {
 	g.agentRegistrar = registrar
 }
 

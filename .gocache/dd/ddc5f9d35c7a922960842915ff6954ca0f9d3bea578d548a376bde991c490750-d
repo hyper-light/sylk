@@ -1,0 +1,6 @@
+./geo.go
+./geo_dist.go
+./geo_s2plugin_impl.go
+./geohash.go
+./parse.go
+./sloppy.go

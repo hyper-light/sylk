@@ -493,10 +493,15 @@ func shouldSuppressActivity(ev msg.ActivityEventMsg) bool {
 	return chatSuppressedEvents[ev.Event.EventType.String()]
 }
 
+func isExplicitTopLevelTransfer(parentCorrelationID string, branchRef *msg.InterAgentBranchRefMsg) bool {
+	return branchRef == nil && strings.TrimSpace(parentCorrelationID) != ""
+}
+
 // handleStreamStart begins accumulation. If a thinking placeholder exists,
 // it is reused; otherwise a new entry is pushed. Multiple concurrent streams
 // are tracked in the streams map keyed by correlationID.
 func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
+	m.clearExplicitTopLevelTransferState(start.CorrelationID, start.ParentCorrelationID, start.BranchRef)
 	if start.BranchRef == nil {
 		if slot := m.nestedStream(start.CorrelationID); slot != nil {
 			ref := slot.branchRef
@@ -610,6 +615,7 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	if progress.Visibility == events.VisibilitySystem {
 		return nil
 	}
+	m.clearExplicitTopLevelTransferState(progress.CorrelationID, progress.ParentCorrelationID, progress.BranchRef)
 	if progress.BranchRef != nil {
 		m.handleNestedStreamProgress(progress)
 		return nil
@@ -644,6 +650,7 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 
 // handleStreamComplete finalizes a single streaming entry by correlationID.
 func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
+	m.clearExplicitTopLevelTransferState(done.CorrelationID, done.ParentCorrelationID, done.BranchRef)
 	if done.BranchRef != nil {
 		m.handleNestedStreamComplete(done)
 		return nil
@@ -708,7 +715,7 @@ func (m *Model) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
 	}
 	if entryIdx >= 0 {
 		m.history.UpdateAt(entryIdx, func(e *ChatEntry) {
-			if settlePipelineChallengeRowsForReroute(e) {
+			if settleProtocolChallengeRowsForReroute(e) {
 				invalidateChatEntryRender(e)
 			}
 		})
@@ -725,7 +732,7 @@ func (m *Model) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
 	return nil
 }
 
-func settlePipelineChallengeRowsForReroute(entry *ChatEntry) bool {
+func settleProtocolChallengeRowsForReroute(entry *ChatEntry) bool {
 	if entry == nil {
 		return false
 	}
@@ -738,7 +745,7 @@ func settlePipelineChallengeRowsForReroute(entry *ChatEntry) bool {
 		if record.InterAgent.Status != InterAgentToolPending {
 			continue
 		}
-		if !strings.HasPrefix(strings.TrimSpace(record.InterAgent.ThreadKey), pipelineThreadPrefix) {
+		if !isProtocolChallengeThreadKey(strings.TrimSpace(record.InterAgent.ThreadKey)) {
 			continue
 		}
 		record.InterAgent.Status = InterAgentToolDone
@@ -747,6 +754,11 @@ func settlePipelineChallengeRowsForReroute(entry *ChatEntry) bool {
 		changed = true
 	}
 	return changed
+}
+
+func isProtocolChallengeThreadKey(threadKey string) bool {
+	threadKey = strings.TrimSpace(threadKey)
+	return strings.HasPrefix(threadKey, pipelineThreadPrefix) || strings.HasPrefix(threadKey, globalReviewThreadPrefix)
 }
 
 // handleStreamError adds an error entry and cleans up the accumulator.
@@ -851,6 +863,7 @@ func formatRetryDelay(d time.Duration) string {
 // updating the matching streaming entry's ToolCalls list. Matches by
 // correlationID first, then falls back to the thinking placeholder.
 func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
+	m.clearExplicitTopLevelTransferState(ev.CorrelationID, ev.ParentCorrelationID, ev.BranchRef)
 	if ev.BranchRef != nil {
 		m.handleNestedToolCallEvent(ev)
 		return nil
@@ -1621,6 +1634,45 @@ func (m *Model) nestedStream(correlationID string) *nestedStreamSlot {
 	return m.nestedStreams[correlationID]
 }
 
+func (m *Model) clearExplicitTopLevelTransferState(correlationID, parentCorrelationID string, branchRef *msg.InterAgentBranchRefMsg) {
+	if !isExplicitTopLevelTransfer(parentCorrelationID, branchRef) || m == nil {
+		return
+	}
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	parentIDs := make([]string, 0, 2)
+	if slot := m.nestedStream(correlationID); slot != nil {
+		if parentID := strings.TrimSpace(slot.branchRef.ParentCorrelationID); parentID != "" {
+			parentIDs = append(parentIDs, parentID)
+		}
+	}
+	if parentID := strings.TrimSpace(parentCorrelationID); parentID != "" {
+		seen := false
+		for _, existing := range parentIDs {
+			if existing == parentID {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			parentIDs = append(parentIDs, parentID)
+		}
+	}
+	delete(m.nestedStreams, correlationID)
+	changed := false
+	for _, parentID := range parentIDs {
+		if m.pruneInterAgentChildActivity(parentID, correlationID) {
+			changed = true
+		}
+	}
+	if changed {
+		m.syncPendingInterAgentIndices()
+		m.viewDirty = true
+	}
+}
+
 func (m *Model) ensureNestedStreamSlot(correlationID string, ref *msg.InterAgentBranchRefMsg) *nestedStreamSlot {
 	correlationID = strings.TrimSpace(correlationID)
 	if correlationID == "" || ref == nil {
@@ -1645,6 +1697,79 @@ func (m *Model) ensureNestedStreamSlot(correlationID string, ref *msg.InterAgent
 	}
 	m.nestedStreams[correlationID] = slot
 	return slot
+}
+
+func (m *Model) pruneInterAgentChildActivity(parentCorrelationID, childCorrelationID string) bool {
+	parentCorrelationID = strings.TrimSpace(parentCorrelationID)
+	childCorrelationID = strings.TrimSpace(childCorrelationID)
+	if parentCorrelationID == "" || childCorrelationID == "" {
+		return false
+	}
+	changed := false
+	for idx := 0; idx < m.history.Len(); idx++ {
+		entryChanged := false
+		m.history.UpdateAt(idx, func(entry *ChatEntry) {
+			if entry == nil {
+				return
+			}
+			if !pruneInterAgentChildActivityInToolCalls(
+				strings.TrimSpace(entry.CorrelationID),
+				entry.ToolCalls,
+				parentCorrelationID,
+				childCorrelationID,
+			) {
+				return
+			}
+			invalidateChatEntryRender(entry)
+			entryChanged = true
+		})
+		if entryChanged {
+			changed = true
+		}
+	}
+	return changed
+}
+
+func pruneInterAgentChildActivityInToolCalls(
+	ownerCorrelationID string,
+	calls []ToolCallRecord,
+	parentCorrelationID, childCorrelationID string,
+) bool {
+	ownerCorrelationID = strings.TrimSpace(ownerCorrelationID)
+	parentCorrelationID = strings.TrimSpace(parentCorrelationID)
+	childCorrelationID = strings.TrimSpace(childCorrelationID)
+	if len(calls) == 0 || parentCorrelationID == "" || childCorrelationID == "" {
+		return false
+	}
+	changed := false
+	for i := range calls {
+		row := calls[i].InterAgent
+		if row == nil {
+			continue
+		}
+		if ownerCorrelationID == parentCorrelationID && len(row.Children) > 0 {
+			kept := row.Children[:0]
+			for _, child := range row.Children {
+				if strings.TrimSpace(child.CorrelationID) == childCorrelationID {
+					changed = true
+					continue
+				}
+				kept = append(kept, child)
+			}
+			row.Children = kept
+		}
+		for j := range row.Children {
+			if pruneInterAgentChildActivityInToolCalls(
+				strings.TrimSpace(row.Children[j].CorrelationID),
+				row.Children[j].ToolCalls,
+				parentCorrelationID,
+				childCorrelationID,
+			) {
+				changed = true
+			}
+		}
+	}
+	return changed
 }
 
 func (m *Model) syncPendingNestedStream(slot *nestedStreamSlot) bool {

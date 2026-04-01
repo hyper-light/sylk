@@ -162,18 +162,22 @@ func (el *EventLog) asyncWriter() {
 
 // flushBatch writes a batch of events (called from asyncWriter)
 func (el *EventLog) flushBatch(batch []*Event) {
+	var archived []*Event
 	el.eventsMu.Lock()
 	for _, event := range batch {
-		el.appendEventLocked(event)
+		archived = append(archived, el.appendEventLocked(event)...)
 	}
 	el.eventsMu.Unlock()
 
-	// Update indexes in separate lock scope
+	// Update indexes in separate lock scope.
 	el.indexesMu.Lock()
+	el.removeEventIndexesLocked(archived)
 	for _, event := range batch {
 		el.updateIndexesLocked(event)
 	}
 	el.indexesMu.Unlock()
+
+	el.archiveEvents(archived)
 }
 
 // Append adds an event to the log
@@ -210,19 +214,22 @@ func (el *EventLog) Append(event *Event) error {
 	}
 
 	// Synchronous write
+	var archived []*Event
 	el.eventsMu.Lock()
-	el.appendEventLocked(event)
+	archived = el.appendEventLocked(event)
 	el.eventsMu.Unlock()
 
 	el.indexesMu.Lock()
+	el.removeEventIndexesLocked(archived)
 	el.updateIndexesLocked(event)
 	el.indexesMu.Unlock()
 
+	el.archiveEvents(archived)
 	return nil
 }
 
 // appendEventLocked adds event to ring buffer (caller must hold eventsMu)
-func (el *EventLog) appendEventLocked(event *Event) {
+func (el *EventLog) appendEventLocked(event *Event) []*Event {
 	// Link to previous
 	if el.count > 0 {
 		prevIdx := (el.head - 1 + el.maxEvents) % el.maxEvents
@@ -231,9 +238,10 @@ func (el *EventLog) appendEventLocked(event *Event) {
 		}
 	}
 
-	// Check if we need to archive old events
+	// Check if we need to archive old events.
+	var archived []*Event
 	if el.count >= el.maxEvents {
-		el.archiveOldestLocked()
+		archived = el.archiveOldestLocked()
 	}
 
 	// Add to ring buffer
@@ -242,20 +250,12 @@ func (el *EventLog) appendEventLocked(event *Event) {
 	if el.count < el.maxEvents {
 		el.count++
 	}
+	return archived
 }
 
 // archiveOldestLocked removes oldest events (caller must hold eventsMu)
-func (el *EventLog) archiveOldestLocked() {
-	archiveCount := el.archiveCount()
-	if el.archiveFunc == nil {
-		el.removeOldest(archiveCount)
-		return
-	}
-
-	toArchive := el.collectOldestForArchive(archiveCount)
-	go func(events []*Event) {
-		_ = el.archiveFunc(events)
-	}(toArchive)
+func (el *EventLog) archiveOldestLocked() []*Event {
+	return el.collectOldestForArchive(el.archiveCount())
 }
 
 func (el *EventLog) archiveCount() int {
@@ -272,26 +272,37 @@ func (el *EventLog) collectOldestForArchive(archiveCount int) []*Event {
 		event := el.events[el.tail]
 		if event != nil {
 			toArchive = append(toArchive, event)
-			el.removeEventIndexes(event)
 		}
 		el.clearOldestEvent()
 	}
 	return toArchive
 }
 
-func (el *EventLog) removeOldest(archiveCount int) {
-	for i := 0; i < archiveCount && el.count > 0; i++ {
-		event := el.events[el.tail]
-		if event != nil {
-			el.removeEventIndexes(event)
-		}
-		el.clearOldestEvent()
+func (el *EventLog) archiveEvents(events []*Event) {
+	if el.archiveFunc == nil || len(events) == 0 {
+		return
+	}
+	_ = el.archiveFunc(events)
+}
+
+func (el *EventLog) removeEventIndexesLocked(events []*Event) {
+	for _, event := range events {
+		el.removeEventIndexLocked(event)
 	}
 }
 
-func (el *EventLog) removeEventIndexes(event *Event) {
+func (el *EventLog) removeEventIndexLocked(event *Event) {
+	if event == nil {
+		return
+	}
 	el.byID.Delete(event.ID)
 	el.byVersion.Delete(event.Version)
+	el.trimIndexLocked(el.byAgent, event.AgentID, event)
+	el.trimIndexLocked(el.bySession, event.SessionID, event)
+	trimTypedIndexLocked(el.byType, event.Type, event)
+	if event.Scope != "" {
+		trimTypedIndexLocked(el.byScope, event.Scope, event)
+	}
 }
 
 func (el *EventLog) clearOldestEvent() {
@@ -315,6 +326,56 @@ func (el *EventLog) updateIndexesLocked(event *Event) {
 	if event.Scope != "" {
 		el.byScope[event.Scope] = append(el.byScope[event.Scope], event)
 	}
+}
+
+func (el *EventLog) trimIndexLocked(index map[string][]*Event, key string, target *Event) {
+	if key == "" {
+		return
+	}
+	events := trimIndexedEvent(index[key], target)
+	if len(events) == 0 {
+		delete(index, key)
+		return
+	}
+	index[key] = events
+}
+
+func trimTypedIndexLocked[K comparable](index map[K][]*Event, key K, target *Event) {
+	events := trimIndexedEvent(index[key], target)
+	if len(events) == 0 {
+		delete(index, key)
+		return
+	}
+	index[key] = events
+}
+
+func trimIndexedEvent(events []*Event, target *Event) []*Event {
+	if len(events) == 0 || target == nil {
+		return events
+	}
+	if sameIndexedEvent(events[0], target) {
+		events[0] = nil
+		return events[1:]
+	}
+	for i, event := range events {
+		if !sameIndexedEvent(event, target) {
+			continue
+		}
+		copy(events[i:], events[i+1:])
+		events[len(events)-1] = nil
+		return events[:len(events)-1]
+	}
+	return events
+}
+
+func sameIndexedEvent(left, right *Event) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if left == right {
+		return true
+	}
+	return left.ID != "" && left.ID == right.ID
 }
 
 // Close shuts down the event log gracefully
@@ -345,48 +406,48 @@ func (el *EventLog) GetByVersion(version string) *Event {
 func (el *EventLog) GetByAgent(agentID string, limit int) []*Event {
 	el.indexesMu.RLock()
 	events := el.byAgent[agentID]
-	el.indexesMu.RUnlock()
-
 	if limit > 0 && len(events) > limit {
-		return events[len(events)-limit:]
+		events = events[len(events)-limit:]
 	}
-	return events
+	result := append([]*Event(nil), events...)
+	el.indexesMu.RUnlock()
+	return result
 }
 
 // GetBySession retrieves events for a session
 func (el *EventLog) GetBySession(sessionID string, limit int) []*Event {
 	el.indexesMu.RLock()
 	events := el.bySession[sessionID]
-	el.indexesMu.RUnlock()
-
 	if limit > 0 && len(events) > limit {
-		return events[len(events)-limit:]
+		events = events[len(events)-limit:]
 	}
-	return events
+	result := append([]*Event(nil), events...)
+	el.indexesMu.RUnlock()
+	return result
 }
 
 // GetByType retrieves events of a specific type
 func (el *EventLog) GetByType(eventType EventType, limit int) []*Event {
 	el.indexesMu.RLock()
 	events := el.byType[eventType]
-	el.indexesMu.RUnlock()
-
 	if limit > 0 && len(events) > limit {
-		return events[len(events)-limit:]
+		events = events[len(events)-limit:]
 	}
-	return events
+	result := append([]*Event(nil), events...)
+	el.indexesMu.RUnlock()
+	return result
 }
 
 // GetByScope retrieves events for a scope
 func (el *EventLog) GetByScope(scope Scope, limit int) []*Event {
 	el.indexesMu.RLock()
 	events := el.byScope[scope]
-	el.indexesMu.RUnlock()
-
 	if limit > 0 && len(events) > limit {
-		return events[len(events)-limit:]
+		events = events[len(events)-limit:]
 	}
-	return events
+	result := append([]*Event(nil), events...)
+	el.indexesMu.RUnlock()
+	return result
 }
 
 // GetSinceVersion retrieves all events after a given version

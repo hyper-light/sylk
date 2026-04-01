@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
 )
 
@@ -437,6 +438,9 @@ type PipelineInspectorConfig struct {
 
 	// MaxFeedbackLoops limits the number of validation feedback iterations.
 	MaxFeedbackLoops int `json:"max_feedback_loops"`
+
+	// Forest exposes Memory Forest validation precedent skills.
+	Forest agentshared.MemoryForestService `json:"-"`
 }
 
 // DefaultPipelineInspectorConfig returns sensible defaults for the pipeline inspector.
@@ -488,6 +492,9 @@ type GlobalInspectorConfig struct {
 
 	// MaxAge is the maximum age of cached audit results before they are stale.
 	MaxAge time.Duration `json:"max_age"`
+
+	// Forest exposes Memory Forest validation precedent skills.
+	Forest agentshared.MemoryForestService `json:"-"`
 }
 
 // DefaultGlobalInspectorConfig returns sensible defaults for the global inspector.

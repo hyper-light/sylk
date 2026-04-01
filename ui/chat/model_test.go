@@ -779,6 +779,106 @@ func TestStreamReroute_ClearsDeferredChildWaitWithoutConsumingSourceSlot(t *test
 	}
 }
 
+func TestTopLevelTransferStartClearsStaleNestedChildState(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	startedAt := time.Now()
+
+	m.PushEntry(&ChatEntry{
+		ID:             "resp-inspector-stale-nested",
+		Timestamp:      startedAt,
+		CorrelationID:  "corr-inspector",
+		Source:         SourceAgent,
+		AgentType:      "inspector-pipeline",
+		AgentID:        "inspector-pipeline",
+		Content:        "",
+		Streaming:      true,
+		ThinkingText:   "⠋  0.2s",
+		ThinkingStatus: deferredParentCompletionStatus,
+		Height:         -1,
+		ToolCalls: []ToolCallRecord{{
+			ToolCallKey: "challenge-1",
+			ToolName:    "challenge_agent",
+			StartedAt:   startedAt,
+			Completed:   true,
+			Success:     true,
+			InterAgent: &InterAgentTool{
+				Kind:       InterAgentToolChallenge,
+				AgentTypes: []string{"tester-pipeline"},
+				Summary:    "Run the pipeline audit.",
+				ThreadKey:  "pipeline:pipeline-review-stale",
+				Status:     InterAgentToolDone,
+				Children: []InterAgentChildActivity{{
+					CorrelationID:  "corr-tester",
+					AgentID:        "runtime-tester",
+					AgentType:      "tester-pipeline",
+					ThinkingText:   "⠋  0.1s",
+					ThinkingStatus: "stale nested progress",
+				}},
+			},
+		}},
+	})
+	idx := m.history.Len() - 1
+	slot := &streamSlot{
+		accumulator:     NewStreamAccumulator(idx),
+		agentID:         "inspector-pipeline",
+		thinkingIdx:     idx,
+		thinkingStart:   startedAt,
+		retryText:       deferredParentCompletionStatus,
+		deferCompletion: true,
+		renderState:     &streamRenderState{},
+	}
+	m.streams["corr-inspector"] = slot
+	m.pendingInterAgent[idx] = struct{}{}
+	m.viewport.AddStreamState(idx, slot.renderState)
+	m.nestedStreams["corr-tester"] = &nestedStreamSlot{
+		correlationID: "corr-tester",
+		branchRef: msg.InterAgentBranchRefMsg{
+			ParentCorrelationID: "corr-inspector",
+			ParentToolCallKey:   "challenge-1",
+			ThreadKey:           "pipeline:pipeline-review-stale",
+			Kind:                "challenge",
+		},
+		activity: InterAgentChildActivity{
+			CorrelationID:  "corr-tester",
+			AgentID:        "runtime-tester",
+			AgentType:      "tester-pipeline",
+			ThinkingText:   "⠋  0.1s",
+			ThinkingStatus: "stale nested progress",
+		},
+	}
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-tester",
+		ParentCorrelationID: "corr-inspector",
+		AgentID:             "runtime-tester",
+		AgentType:           "tester-pipeline",
+		AgentName:           "Tester",
+	})
+	m = comp.(*Model)
+
+	if _, ok := m.nestedStreams["corr-tester"]; ok {
+		t.Fatal("expected explicit top-level transfer to clear stale nested stream slot")
+	}
+	tester := findEntryByCorrelation(m, "corr-tester")
+	if tester == nil {
+		t.Fatal("expected tester to bootstrap as a top-level entry")
+	}
+	origin := findEntryByCorrelation(m, "corr-inspector")
+	if origin == nil || len(origin.ToolCalls) != 1 || origin.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected inspector challenge row, got %+v", origin)
+	}
+	if got := len(origin.ToolCalls[0].InterAgent.Children); got != 0 {
+		t.Fatalf("stale nested child count = %d, want 0 after top-level transfer", got)
+	}
+	if _, pending := m.pendingInterAgent[m.historyIndexForCorrelation("corr-inspector")]; pending {
+		t.Fatal("expected stale nested child removal to clear pending child-work state")
+	}
+	if view := m.View(); strings.Contains(view, "stale nested progress") {
+		t.Fatalf("unexpected stale nested child render after top-level transfer: %q", view)
+	}
+}
+
 func TestHandleToolCallEvent_ConsultationCompletesAsInterAgentRow(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 	m.PushEntry(&ChatEntry{
@@ -826,6 +926,90 @@ func TestHandleToolCallEvent_ConsultationCompletesAsInterAgentRow(t *testing.T) 
 	}
 	if !strings.Contains(row.Summary, "table-driven harness") {
 		t.Fatalf("consultation summary = %q, want academic response", row.Summary)
+	}
+}
+
+func TestHandleStreamReroute_SettlesGlobalReviewChallengeRows(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	startedAt := time.Now()
+
+	m.PushEntry(&ChatEntry{
+		ID:             "resp-global-review-reroute",
+		Timestamp:      startedAt,
+		CorrelationID:  "corr-global-inspector",
+		Source:         SourceAgent,
+		AgentType:      "inspector",
+		AgentID:        "inspector",
+		Content:        "",
+		Streaming:      true,
+		ThinkingText:   "⠋  0.2s",
+		ThinkingStatus: "Reviewing...",
+		Height:         -1,
+	})
+	idx := m.history.Len() - 1
+	slot := &streamSlot{
+		accumulator:   NewStreamAccumulator(idx),
+		agentID:       "inspector",
+		thinkingIdx:   idx,
+		thinkingStart: startedAt,
+		renderState:   &streamRenderState{},
+	}
+	m.streams["corr-global-inspector"] = slot
+	m.viewport.AddStreamState(idx, slot.renderState)
+
+	comp, _ := m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-global-inspector",
+		ToolCallKey:   "challenge-global-1",
+		ToolName:      "challenge_global_tester",
+		FullArgs:      `{"request":"Audit the merged state."}`,
+		Phase:         0,
+		StartedAt:     startedAt,
+	})
+	m = comp.(*Model)
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-global-inspector",
+		ToolCallKey:   "challenge-global-1",
+		ToolName:      "challenge_global_tester",
+		FullArgs:      `{"request":"Audit the merged state."}`,
+		Output:        `{"selected":true,"target_agent":"tester","challenge_id":"global-review-1"}`,
+		Phase:         1,
+		StartedAt:     startedAt,
+		Duration:      50 * time.Millisecond,
+		Success:       true,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamRerouteMsg{
+		SessionID:             "s1",
+		OriginalCorrelationID: "corr-global-inspector",
+		CorrelationID:         "corr-global-tester",
+		FromAgentID:           "inspector",
+		ToAgentID:             "tester",
+	})
+	m = comp.(*Model)
+
+	entry := findEntryByCorrelation(m, "corr-global-inspector")
+	if entry == nil {
+		t.Fatal("expected global inspector entry to remain in history")
+	}
+	if strings.TrimSpace(entry.ThinkingStatus) != "" {
+		t.Fatalf("expected rerouted global inspector thinking status to clear, got %q", entry.ThinkingStatus)
+	}
+	if idx := m.historyIndexForCorrelation("corr-global-inspector"); idx >= 0 {
+		if _, pending := m.pendingInterAgent[idx]; pending {
+			t.Fatal("expected rerouted global-review source entry to stop counting as pending child work")
+		}
+	}
+	if len(entry.ToolCalls) != 1 || entry.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected rerouted global-review source to retain a single inter-agent row, got %+v", entry.ToolCalls)
+	}
+	if status := entry.ToolCalls[0].InterAgent.Status; status != InterAgentToolDone {
+		t.Fatalf("expected global-review challenge row to settle on reroute, got %q", status)
+	}
+	if view := m.View(); strings.Contains(view, deferredParentCompletionStatus) {
+		t.Fatalf("unexpected deferred child-wait status after global-review reroute: %q", view)
 	}
 }
 

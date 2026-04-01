@@ -83,7 +83,9 @@ func (o *Orchestrator) buildOTGlobalFollowupRequest(
 		planText, planFilePath = o.globalInspectorPlanContext(task)
 	}
 	progress := o.globalReviewProgress(task)
+	sessionID := firstNonEmpty(strings.TrimSpace(task.SessionID), strings.TrimSpace(stringMapValue(task.Metadata, "session_id")), orchestratorStateSessionID(o), o.SessionID())
 	metadata := map[string]any{
+		"session_id":                  sessionID,
 		"task_id":                     strings.TrimSpace(task.ID),
 		"task_name":                   strings.TrimSpace(task.Name),
 		"task_slug":                   strings.TrimSpace(stringMapValue(task.Metadata, "task_slug")),
@@ -110,6 +112,9 @@ func (o *Orchestrator) buildOTGlobalFollowupRequest(
 		"workflow_completed_task_ids": progress.CompletedTaskIDs,
 		"workflow_remaining_task_ids": progress.RemainingTaskIDs,
 	}
+	if sessionDir := strings.TrimSpace(stringMapValue(task.Metadata, "session_dir")); sessionDir != "" {
+		metadata["session_dir"] = sessionDir
+	}
 	if strings.TrimSpace(planText) != "" {
 		metadata[workflowPlanSnapshotKey] = strings.TrimSpace(planText)
 	}
@@ -130,7 +135,7 @@ func (o *Orchestrator) buildOTGlobalFollowupRequest(
 		SourceAgentID:   o.config.AgentID,
 		SourceAgentName: "orchestrator",
 		FireAndForget:   false,
-		SessionID:       firstNonEmpty(strings.TrimSpace(task.SessionID), strings.TrimSpace(stringMapValue(task.Metadata, "session_id")), o.SessionID()),
+		SessionID:       sessionID,
 		Timestamp:       otGlobalFollowupTimestamp(update),
 		Metadata:        metadata,
 	}

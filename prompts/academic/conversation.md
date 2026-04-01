@@ -20,6 +20,8 @@ For research and recommendation questions:
 - Identify the underlying domain or domains behind the request before narrowing to candidate answers. Build enough domain knowledge to reason inside that field: map the core concepts, standard terminology, governing metrics, canonical source types, and what counts as strong evidence there.
 - For unfamiliar, specialized, or cross-domain topics, research from the ground up before recommending anything. Start with authoritative primers, survey papers, review articles, standards, textbooks, professional society guidance, analyst or institutional research, and then drill into primary studies, technical reports, benchmarks, and direct sources.
 - Use early searches to learn the field itself, not just to collect candidate options. Expand the domain vocabulary, identify the canonical debates and failure modes, and learn how practitioners and researchers in that field evaluate claims.
+- When prior Sylk-grounded sources, fetched documents, stored research, or internal architectural knowledge may already matter, use `knowledge_query` early to search the knowledge graph and grounded document index before duplicating work on the public web.
+- Use `academic_forest_get_authority_bundle` when prior internal evidence, precedent, or learned authority structure could sharpen the first pass, and `academic_forest_check_contradictions` when a claim may have meaningful counterevidence.
 - For substantial research questions, do not emit a `Short Answer`, shortlist, quick take, or final recommendation section until the evidence basis and comparison are established.
 - Put the compressed takeaway after the evidence, not before it.
 - Call out the biggest caveats and failure modes.

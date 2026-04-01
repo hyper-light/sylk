@@ -2,6 +2,7 @@ package forest
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"math"
 	"sort"
@@ -27,73 +28,72 @@ type substrateEdge struct {
 	Inhibition  float64
 }
 
-func substrateContextKey(query Query) string {
-	return stableID(
-		"substrate",
-		firstNonEmpty(query.SessionID, "global"),
-		query.IntentID,
-		string(query.Horizon),
-		normalizeRequesterAgentType(query.AgentType),
-		normalizeText(query.Query),
-	)
+const structuralSubstrateAgentType = "structural"
+
+func substrateContextKey(sessionID string) string {
+	return stableID("substrate", normalizeForestSessionID(sessionID))
 }
 
 func (m *MemoryForest) loadSubstrateSignals(
 	ctx context.Context,
-	query Query,
 	branches []*Branch,
-	queryScores map[string]float64,
-	canopyRoots map[string]struct{},
 ) (map[string]substrateSignal, error) {
-	contextKey := substrateContextKey(query)
-	signals := make(map[string]substrateSignal, len(branches))
-	if len(branches) == 0 {
-		return signals, nil
-	}
-
-	branchIDs := make([]string, 0, len(branches))
-	for _, branch := range branches {
-		branchIDs = append(branchIDs, branch.ID)
-	}
-
-	cached, err := m.loadStoredSubstrateState(ctx, contextKey, branchIDs)
-	if err != nil {
-		return nil, err
-	}
-	if len(cached) == len(branches) {
-		return cached, nil
-	}
-
-	refreshed, _, err := m.refreshSubstrateState(ctx, query, branches, queryScores, canopyRoots)
-	if err != nil {
-		return nil, err
-	}
-	return refreshed, nil
+	return m.loadStoredSubstrateState(ctx, branches)
 }
 
 func (m *MemoryForest) loadStoredSubstrateState(
 	ctx context.Context,
-	contextKey string,
-	branchIDs []string,
+	branches []*Branch,
 ) (map[string]substrateSignal, error) {
-	result := make(map[string]substrateSignal, len(branchIDs))
-	branchIDs = dedupeStrings(branchIDs)
-	if len(branchIDs) == 0 {
+	result := make(map[string]substrateSignal, len(branches))
+	if len(branches) == 0 {
 		return result, nil
 	}
 
-	placeholders := make([]string, 0, len(branchIDs))
-	args := make([]any, 0, len(branchIDs)+2)
-	args = append(args, contextKey, time.Now().UTC().Add(-2*time.Minute).Unix())
+	sessionIDs := substrateSessionIDsFromBranches(branches)
+	readySessions, err := m.loadReadySubstrateSessions(ctx, sessionIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	contextKeys := make([]string, 0, len(readySessions))
+	seenContexts := make(map[string]struct{}, len(readySessions))
+	branchIDs := make([]string, 0, len(branches))
+	for _, branch := range branches {
+		sessionID := normalizeForestSessionID(branch.SessionID)
+		if !readySessions[sessionID] {
+			continue
+		}
+		branchIDs = append(branchIDs, branch.ID)
+		contextKey := substrateContextKey(sessionID)
+		if _, ok := seenContexts[contextKey]; ok {
+			continue
+		}
+		seenContexts[contextKey] = struct{}{}
+		contextKeys = append(contextKeys, contextKey)
+	}
+	branchIDs = dedupeStrings(branchIDs)
+	if len(branchIDs) == 0 || len(contextKeys) == 0 {
+		return result, nil
+	}
+
+	contextPlaceholders := make([]string, 0, len(contextKeys))
+	branchPlaceholders := make([]string, 0, len(branchIDs))
+	args := make([]any, 0, len(contextKeys)+len(branchIDs))
+	for _, contextKey := range contextKeys {
+		contextPlaceholders = append(contextPlaceholders, "?")
+		args = append(args, contextKey)
+	}
 	for _, branchID := range branchIDs {
-		placeholders = append(placeholders, "?")
+		branchPlaceholders = append(branchPlaceholders, "?")
 		args = append(args, branchID)
 	}
 
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT branch_id, nutrient_potential, frontier_score, inhibition, conductance_mass
 		FROM forest_substrate_state
-		WHERE context_key = ? AND updated_at >= ? AND branch_id IN (`+strings.Join(placeholders, ",")+`)
+		WHERE context_key IN (`+strings.Join(contextPlaceholders, ",")+`)
+		  AND branch_id IN (`+strings.Join(branchPlaceholders, ",")+`)
 	`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query substrate state: %w", err)
@@ -116,25 +116,163 @@ func (m *MemoryForest) loadStoredSubstrateState(
 	return result, nil
 }
 
+func (m *MemoryForest) loadReadySubstrateSessions(ctx context.Context, sessionIDs []string) (map[string]bool, error) {
+	result := make(map[string]bool, len(sessionIDs))
+	sessionIDs = dedupeStrings(sessionIDs)
+	if len(sessionIDs) == 0 {
+		return result, nil
+	}
+
+	placeholders := make([]string, 0, len(sessionIDs))
+	args := make([]any, 0, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		placeholders = append(placeholders, "?")
+		args = append(args, normalizeForestSessionID(sessionID))
+	}
+
+	rows, err := m.db.QueryContext(ctx, `
+		SELECT session_id, graph_version, substrate_version, dirty
+		FROM forest_substrate_sessions
+		WHERE session_id IN (`+strings.Join(placeholders, ",")+`)
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query substrate sessions: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			sessionID        string
+			graphVersion     int64
+			substrateVersion int64
+			dirty            int
+		)
+		if err := rows.Scan(&sessionID, &graphVersion, &substrateVersion, &dirty); err != nil {
+			return nil, fmt.Errorf("scan substrate session: %w", err)
+		}
+		result[normalizeForestSessionID(sessionID)] = dirty == 0 && substrateVersion == graphVersion
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (m *MemoryForest) dirtySubstrateSessions(ctx context.Context) ([]string, error) {
+	rows, err := m.db.QueryContext(ctx, `
+		SELECT session_id
+		FROM forest_substrate_sessions
+		WHERE dirty = 1
+		ORDER BY dirty_at ASC, updated_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query dirty substrate sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var sessions []string
+	for rows.Next() {
+		var sessionID string
+		if err := rows.Scan(&sessionID); err != nil {
+			return nil, fmt.Errorf("scan dirty substrate session: %w", err)
+		}
+		sessions = append(sessions, normalizeForestSessionID(sessionID))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return dedupeStrings(sessions), nil
+}
+
+func (m *MemoryForest) currentSubstrateGraphVersion(ctx context.Context, sessionID string) (int64, error) {
+	sessionID = normalizeForestSessionID(sessionID)
+	var version int64
+	err := m.db.QueryRowContext(ctx, `
+		SELECT graph_version
+		FROM forest_substrate_sessions
+		WHERE session_id = ?
+	`, sessionID).Scan(&version)
+	switch {
+	case err == nil:
+		return version, nil
+	case err == sql.ErrNoRows:
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("load substrate graph version: %w", err)
+	}
+}
+
+func (m *MemoryForest) loadSessionCanopyRoots(ctx context.Context, sessionID string) (map[string]struct{}, error) {
+	canopy, err := m.resolveCanopy(ctx, Query{SessionID: sessionID, Horizon: CanopyHorizonSession})
+	if err != nil {
+		return nil, err
+	}
+	roots := make(map[string]struct{}, len(canopy.RootIDs))
+	for _, rootID := range canopy.RootIDs {
+		roots[rootID] = struct{}{}
+	}
+	return roots, nil
+}
+
+func substrateSessionIDsFromBranches(branches []*Branch) []string {
+	sessionIDs := make([]string, 0, len(branches))
+	for _, branch := range branches {
+		if branch == nil {
+			continue
+		}
+		sessionIDs = append(sessionIDs, normalizeForestSessionID(branch.SessionID))
+	}
+	return dedupeStrings(sessionIDs)
+}
+
+func retrievalSubstrateSignal(branch *Branch, signal substrateSignal, queryScore float64, canopyRoots map[string]struct{}) substrateSignal {
+	if branch == nil {
+		return signal
+	}
+	if signal == (substrateSignal{}) {
+		return signal
+	}
+	canopyBoost := 0.0
+	if _, ok := canopyRoots[branch.RootID]; ok {
+		canopyBoost = 1.0
+	}
+	frontier := clamp01(
+		(0.70 * signal.Frontier) +
+			(0.15 * clamp01(queryScore)) +
+			(0.10 * canopyBoost) +
+			(0.05 * (1 - accessPressure(branch))),
+	)
+	return substrateSignal{
+		Potential:       signal.Potential,
+		Frontier:        frontier,
+		Inhibition:      signal.Inhibition,
+		ConductanceMass: signal.ConductanceMass,
+	}
+}
+
 func (m *MemoryForest) refreshSubstrateState(
 	ctx context.Context,
-	query Query,
+	sessionID string,
 	branches []*Branch,
-	queryScores map[string]float64,
 	canopyRoots map[string]struct{},
 ) (map[string]substrateSignal, SubstrateResult, error) {
 	result := make(map[string]substrateSignal, len(branches))
+	sessionID = normalizeForestSessionID(sessionID)
+	contextKey := substrateContextKey(sessionID)
+	targetVersion, err := m.currentSubstrateGraphVersion(ctx, sessionID)
+	if err != nil {
+		return nil, SubstrateResult{}, err
+	}
 	if len(branches) == 0 {
+		if err := m.clearSubstrateState(ctx, sessionID, targetVersion); err != nil {
+			return nil, SubstrateResult{}, err
+		}
 		return result, SubstrateResult{}, nil
 	}
 
-	sessionID := firstNonEmpty(query.SessionID, "global")
-	contextKey := substrateContextKey(query)
-	branchIDs := make([]string, 0, len(branches))
 	byID := make(map[string]*Branch, len(branches))
 	indexByID := make(map[string]int, len(branches))
 	for idx, branch := range branches {
-		branchIDs = append(branchIDs, branch.ID)
 		byID[branch.ID] = branch
 		indexByID[branch.ID] = idx
 	}
@@ -152,7 +290,7 @@ func (m *MemoryForest) refreshSubstrateState(
 	sources := make([]float32, len(branches))
 	inhibitions := make([]float32, len(branches))
 	for idx, branch := range branches {
-		sources[idx] = float32(substrateSourceScore(query, branch, queryScores[branch.ID], canopyRoots))
+		sources[idx] = float32(substrateSourceScore(branch, canopyRoots))
 		inhibitions[idx] = float32(substrateInhibition(branch, byID, edges))
 	}
 
@@ -238,10 +376,10 @@ func (m *MemoryForest) refreshSubstrateState(
 		}
 		frontier := clamp01(
 			(0.40 * float64(current[idx])) +
-				(0.20 * (1 - accessPressure(branch))) +
-				(0.15 * agentFamilyAffinity(query.AgentType, branch.Family)) +
-				(0.15 * massSignal) +
-				(0.10 * (1 - float64(inhibitions[idx]))),
+				(0.20 * branch.Salience) +
+				(0.15 * branch.Utility) +
+				(0.10 * successBalance(branch)) +
+				(0.15 * (1 - float64(inhibitions[idx]))),
 		)
 		result[branch.ID] = substrateSignal{
 			Potential:       clamp01(float64(current[idx])),
@@ -274,10 +412,22 @@ func (m *MemoryForest) refreshSubstrateState(
 	defer tx.Rollback()
 
 	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM forest_substrate_state
+		WHERE context_key = ?
+	`, contextKey); err != nil {
+		return nil, SubstrateResult{}, fmt.Errorf("clear substrate state: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM forest_substrate_frontiers
 		WHERE context_key = ? AND agent_type = ?
-	`, contextKey, normalizeRequesterAgentType(query.AgentType)); err != nil {
+	`, contextKey, structuralSubstrateAgentType); err != nil {
 		return nil, SubstrateResult{}, fmt.Errorf("clear substrate frontiers: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM forest_substrate_edges
+		WHERE session_id = ?
+	`, sessionID); err != nil {
+		return nil, SubstrateResult{}, fmt.Errorf("clear substrate edges: %w", err)
 	}
 
 	for branchID, signal := range result {
@@ -287,21 +437,21 @@ func (m *MemoryForest) refreshSubstrateState(
 			(context_key, session_id, intent_id, horizon, agent_type, branch_id, nutrient_potential,
 			 frontier_score, inhibition, conductance_mass, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(context_key, branch_id) DO UPDATE SET
-				nutrient_potential = excluded.nutrient_potential,
-				frontier_score = excluded.frontier_score,
-				inhibition = excluded.inhibition,
-				conductance_mass = excluded.conductance_mass,
-				updated_at = excluded.updated_at
-		`, contextKey, sessionID, nullStringValue(query.IntentID), string(query.Horizon),
-			nullStringValue(normalizeRequesterAgentType(query.AgentType)), branchID, signal.Potential,
-			signal.Frontier, signal.Inhibition, signal.ConductanceMass, now.Unix()); err != nil {
-			return nil, SubstrateResult{}, fmt.Errorf("upsert substrate state: %w", err)
+		`, contextKey, sessionID, nil, string(CanopyHorizonSession), nil, branchID,
+			signal.Potential, signal.Frontier, signal.Inhibition, signal.ConductanceMass, now.Unix()); err != nil {
+			return nil, SubstrateResult{}, fmt.Errorf("insert substrate state: %w", err)
 		}
 		branch.Metadata = cloneMetadata(branch.Metadata)
 		branch.Metadata["substrate_potential"] = signal.Potential
 		branch.Metadata["substrate_frontier"] = signal.Frontier
 		branch.Metadata["substrate_inhibition"] = signal.Inhibition
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE forest_branches
+			SET metadata = ?
+			WHERE id = ?
+		`, marshalJSON(branch.Metadata), branchID); err != nil {
+			return nil, SubstrateResult{}, fmt.Errorf("update branch substrate metadata: %w", err)
+		}
 	}
 
 	for _, edge := range updatedEdges {
@@ -309,16 +459,9 @@ func (m *MemoryForest) refreshSubstrateState(
 			INSERT INTO forest_substrate_edges
 			(session_id, source_branch_id, target_branch_id, conductance, flux, redundancy, inhibition, updated_at, metadata)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(session_id, source_branch_id, target_branch_id) DO UPDATE SET
-				conductance = excluded.conductance,
-				flux = excluded.flux,
-				redundancy = excluded.redundancy,
-				inhibition = excluded.inhibition,
-				updated_at = excluded.updated_at,
-				metadata = excluded.metadata
 		`, sessionID, edge.SourceID, edge.TargetID, edge.Conductance, edge.Flux, edge.Redundancy, edge.Inhibition,
 			now.Unix(), marshalJSON(map[string]any{"context_key": contextKey})); err != nil {
-			return nil, SubstrateResult{}, fmt.Errorf("upsert substrate edge: %w", err)
+			return nil, SubstrateResult{}, fmt.Errorf("insert substrate edge: %w", err)
 		}
 	}
 
@@ -327,16 +470,15 @@ func (m *MemoryForest) refreshSubstrateState(
 			INSERT INTO forest_substrate_frontiers
 			(context_key, agent_type, root_id, branch_id, frontier_score, budget, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(context_key, agent_type, branch_id) DO UPDATE SET
-				frontier_score = excluded.frontier_score,
-				budget = excluded.budget,
-				updated_at = excluded.updated_at
-		`, contextKey, normalizeRequesterAgentType(query.AgentType), frontier.rootID, frontier.branchID,
+		`, contextKey, structuralSubstrateAgentType, frontier.rootID, frontier.branchID,
 			frontier.score, clamp01(frontier.score*1.25), now.Unix()); err != nil {
-			return nil, SubstrateResult{}, fmt.Errorf("upsert substrate frontier: %w", err)
+			return nil, SubstrateResult{}, fmt.Errorf("insert substrate frontier: %w", err)
 		}
 	}
 
+	if err := m.markSubstrateVersionTx(ctx, tx, sessionID, targetVersion, now); err != nil {
+		return nil, SubstrateResult{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, SubstrateResult{}, fmt.Errorf("commit substrate tx: %w", err)
 	}
@@ -346,6 +488,61 @@ func (m *MemoryForest) refreshSubstrateState(
 		EdgesUpdated:     len(updatedEdges),
 		FrontiersUpdated: len(frontiers),
 	}, nil
+}
+
+func (m *MemoryForest) markSubstrateVersionTx(ctx context.Context, tx *sql.Tx, sessionID string, targetVersion int64, at time.Time) error {
+	sessionID = normalizeForestSessionID(sessionID)
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO forest_substrate_sessions
+		(session_id, graph_version, substrate_version, dirty, dirty_at, updated_at)
+		VALUES (?, ?, ?, 0, 0, ?)
+		ON CONFLICT(session_id) DO UPDATE SET
+			substrate_version = CASE
+				WHEN forest_substrate_sessions.graph_version = excluded.substrate_version THEN excluded.substrate_version
+				ELSE forest_substrate_sessions.substrate_version
+			END,
+			dirty = CASE
+				WHEN forest_substrate_sessions.graph_version = excluded.substrate_version THEN 0
+				ELSE 1
+			END,
+			updated_at = excluded.updated_at
+	`, sessionID, targetVersion, targetVersion, at.Unix())
+	if err != nil {
+		return fmt.Errorf("mark substrate version: %w", err)
+	}
+	return nil
+}
+
+func (m *MemoryForest) clearSubstrateState(ctx context.Context, sessionID string, targetVersion int64) error {
+	sessionID = normalizeForestSessionID(sessionID)
+	contextKey := substrateContextKey(sessionID)
+	now := time.Now().UTC()
+
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin clear substrate tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM forest_substrate_state WHERE context_key = ?`, contextKey); err != nil {
+		return fmt.Errorf("clear substrate state: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM forest_substrate_frontiers WHERE context_key = ? AND agent_type = ?`, contextKey, structuralSubstrateAgentType); err != nil {
+		return fmt.Errorf("clear substrate frontiers: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM forest_substrate_edges WHERE session_id = ?`, sessionID); err != nil {
+		return fmt.Errorf("clear substrate edges: %w", err)
+	}
+	if err := m.markSubstrateVersionTx(ctx, tx, sessionID, targetVersion, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit clear substrate tx: %w", err)
+	}
+	return nil
 }
 
 func (m *MemoryForest) loadSubstrateAdjacency(ctx context.Context, sessionID string, branches []*Branch) ([]substrateEdge, error) {
@@ -499,7 +696,7 @@ func canonicalEdge(sourceID, targetID string) (string, string) {
 	return targetID, sourceID
 }
 
-func substrateSourceScore(query Query, branch *Branch, queryScore float64, canopyRoots map[string]struct{}) float64 {
+func substrateSourceScore(branch *Branch, canopyRoots map[string]struct{}) float64 {
 	if branch == nil {
 		return 0
 	}
@@ -507,22 +704,11 @@ func substrateSourceScore(query Query, branch *Branch, queryScore float64, canop
 	if _, ok := canopyRoots[branch.RootID]; ok {
 		canopyBoost = 1.0
 	}
-	novelty := 1 - accessPressure(branch)
-	if strings.TrimSpace(query.Query) == "" {
-		return clamp01(
-			(0.30 * branch.Utility) +
-				(0.25 * branch.Salience) +
-				(0.20 * successBalance(branch)) +
-				(0.15 * novelty) +
-				(0.10 * canopyBoost),
-		)
-	}
 	return clamp01(
-		(0.35 * queryScore) +
-			(0.20 * branch.Utility) +
-			(0.15 * branch.Salience) +
-			(0.10 * successBalance(branch)) +
-			(0.10 * novelty) +
+		(0.30 * branch.Utility) +
+			(0.25 * branch.Salience) +
+			(0.20 * successBalance(branch)) +
+			(0.15 * branchRecency(branch, time.Now().UTC())) +
 			(0.10 * canopyBoost),
 	)
 }
@@ -556,10 +742,67 @@ func substrateInhibition(branch *Branch, byID map[string]*Branch, edges []substr
 }
 
 func (m *MemoryForest) RunSubstrateMaintenance(ctx context.Context, limit int) (SubstrateResult, error) {
+	m.maintenanceRunMu.Lock()
+	defer m.maintenanceRunMu.Unlock()
+	return m.runSubstrateMaintenance(ctx, limit)
+}
+
+func (m *MemoryForest) runSubstrateMaintenance(ctx context.Context, limit int) (SubstrateResult, error) {
 	if limit <= 0 {
 		limit = 64
 	}
 
+	sessions, err := m.dirtySubstrateSessions(ctx)
+	if err != nil {
+		return SubstrateResult{}, err
+	}
+	if len(sessions) == 0 {
+		sessions, err = m.recentSubstrateSessions(ctx)
+		if err != nil {
+			return SubstrateResult{}, err
+		}
+	}
+	if len(sessions) == 0 {
+		sessions = append(sessions, "global")
+	}
+
+	var result SubstrateResult
+	for _, sessionID := range sessions {
+		refreshed, err := m.runSubstrateMaintenanceForSession(ctx, sessionID, limit)
+		if err != nil {
+			return result, err
+		}
+		result.StatesUpdated += refreshed.StatesUpdated
+		result.EdgesUpdated += refreshed.EdgesUpdated
+		result.FrontiersUpdated += refreshed.FrontiersUpdated
+	}
+	return result, nil
+}
+
+func (m *MemoryForest) RunSubstrateMaintenanceForSession(ctx context.Context, sessionID string, limit int) (SubstrateResult, error) {
+	m.maintenanceRunMu.Lock()
+	defer m.maintenanceRunMu.Unlock()
+	return m.runSubstrateMaintenanceForSession(ctx, sessionID, limit)
+}
+
+func (m *MemoryForest) runSubstrateMaintenanceForSession(ctx context.Context, sessionID string, limit int) (SubstrateResult, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	sessionID = normalizeForestSessionID(sessionID)
+	branches, err := m.queryBranches(ctx, sessionID, false, defaultFamilies(), limit)
+	if err != nil {
+		return SubstrateResult{}, err
+	}
+	canopyRoots, err := m.loadSessionCanopyRoots(ctx, sessionID)
+	if err != nil {
+		return SubstrateResult{}, err
+	}
+	_, refreshed, err := m.refreshSubstrateState(ctx, sessionID, branches, canopyRoots)
+	return refreshed, err
+}
+
+func (m *MemoryForest) recentSubstrateSessions(ctx context.Context) ([]string, error) {
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT session_id
 		FROM (
@@ -572,7 +815,7 @@ func (m *MemoryForest) RunSubstrateMaintenance(ctx context.Context, limit int) (
 		LIMIT 4
 	`)
 	if err != nil {
-		return SubstrateResult{}, fmt.Errorf("query substrate sessions: %w", err)
+		return nil, fmt.Errorf("query recent substrate sessions: %w", err)
 	}
 	defer rows.Close()
 
@@ -580,49 +823,14 @@ func (m *MemoryForest) RunSubstrateMaintenance(ctx context.Context, limit int) (
 	for rows.Next() {
 		var sessionID string
 		if err := rows.Scan(&sessionID); err != nil {
-			return SubstrateResult{}, fmt.Errorf("scan substrate session: %w", err)
+			return nil, fmt.Errorf("scan recent substrate session: %w", err)
 		}
-		sessions = append(sessions, sessionID)
+		sessions = append(sessions, normalizeForestSessionID(sessionID))
 	}
 	if err := rows.Err(); err != nil {
-		return SubstrateResult{}, err
+		return nil, err
 	}
-	if len(sessions) == 0 {
-		sessions = append(sessions, "global")
-	}
-
-	var result SubstrateResult
-	for _, sessionID := range sessions {
-		branches, err := m.queryBranches(ctx, sessionID, false, defaultFamilies(), limit)
-		if err != nil {
-			return result, err
-		}
-		if len(branches) == 0 {
-			continue
-		}
-		query := Query{
-			SessionID: sessionID,
-			AgentType: "guide",
-			Horizon:   CanopyHorizonSession,
-			Limit:     limit,
-		}
-		canopy, err := m.resolveCanopy(ctx, query)
-		if err != nil {
-			return result, err
-		}
-		canopyRoots := make(map[string]struct{}, len(canopy.RootIDs))
-		for _, rootID := range canopy.RootIDs {
-			canopyRoots[rootID] = struct{}{}
-		}
-		_, refreshed, err := m.refreshSubstrateState(ctx, query, branches, map[string]float64{}, canopyRoots)
-		if err != nil {
-			return result, err
-		}
-		result.StatesUpdated += refreshed.StatesUpdated
-		result.EdgesUpdated += refreshed.EdgesUpdated
-		result.FrontiersUpdated += refreshed.FrontiersUpdated
-	}
-	return result, nil
+	return dedupeStrings(sessions), nil
 }
 
 func cloneMetadata(metadata map[string]any) map[string]any {

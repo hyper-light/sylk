@@ -1,0 +1,6 @@
+./icons.go
+./icons_by_desktop_environment.go
+./icons_by_file_extension.go
+./icons_by_filename.go
+./icons_by_operating_system.go
+./icons_by_window_manager.go

@@ -1,12 +1,13 @@
 package pipeline
 
 import (
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 func pipelineTesterVisibleSkillNames() []string {
-	return []string{
+	return agentshared.AppendMemoryForestVisibleSkillNames([]string{
 		"search_skills",
 		"read_file",
 		"prepare_pipeline_write_context",
@@ -45,11 +46,11 @@ func pipelineTesterVisibleSkillNames() []string {
 		"coord_publish_artifact",
 		"coord_request_review",
 		"coord_resolve_artifact",
-	}
+	}, "tester-pipeline")
 }
 
 func pipelineTesterMutatingSkillNames() []string {
-	return []string{
+	return agentshared.AppendMemoryForestMutatingSkillNames([]string{
 		"write_test",
 		"install_test_tooling",
 		"write_pipeline_file",
@@ -71,7 +72,7 @@ func pipelineTesterMutatingSkillNames() []string {
 		"coord_request_review",
 		"coord_resolve_artifact",
 		"reroute_request",
-	}
+	})
 }
 
 func pipelineTesterToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {
@@ -79,7 +80,7 @@ func pipelineTesterToolManifest(registry *skills.Registry) *toolruntime.PolicyMa
 		AgentID:          "tester-pipeline",
 		CapabilityScope:  "tester.pipeline",
 		Registry:         registry,
-		VisibleByDefault: pipelineTesterVisibleSkillNames(),
-		Mutating:         pipelineTesterMutatingSkillNames(),
+		VisibleByDefault: agentshared.FilterRegisteredSkillNames(registry, pipelineTesterVisibleSkillNames()),
+		Mutating:         agentshared.FilterRegisteredSkillNames(registry, pipelineTesterMutatingSkillNames()),
 	})
 }

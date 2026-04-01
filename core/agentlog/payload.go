@@ -212,7 +212,7 @@ type HealthPayload struct {
 type TLSPayload struct {
 	Domain   string `json:"domain"`
 	Valid    bool   `json:"valid"`
-	Severity string `json:"severity"`           // "info" | "medium" | "high" | "critical"
+	Severity string `json:"severity"`            // "info" | "medium" | "high" | "critical"
 	Issue    string `json:"issue,omitempty"`     // Description of any problem found
 	Issuer   string `json:"issuer,omitempty"`    // Certificate issuer
 	Expiry   string `json:"expiry,omitempty"`    // Certificate expiration date
@@ -223,20 +223,20 @@ type TLSPayload struct {
 type FetchSecurityPayload struct {
 	URL          string `json:"url"`
 	Domain       string `json:"domain"`
-	Verdict      string `json:"verdict"`                 // "clean" | "flagged" | "blocked"
+	Verdict      string `json:"verdict"` // "clean" | "flagged" | "blocked"
 	FindingCount int    `json:"finding_count"`
-	Severity     string `json:"severity"`                // Highest severity among findings
-	Detail       string `json:"detail,omitempty"`        // Brief description
-	Action       string `json:"action"`                  // "allowed" | "blocked" | "flagged"
+	Severity     string `json:"severity"`         // Highest severity among findings
+	Detail       string `json:"detail,omitempty"` // Brief description
+	Action       string `json:"action"`           // "allowed" | "blocked" | "flagged"
 }
 
 // DomainReputationPayload records a domain trust assessment.
 type DomainReputationPayload struct {
 	Domain       string  `json:"domain"`
-	TrustScore   float64 `json:"trust_score"`   // 0.0–1.0
+	TrustScore   float64 `json:"trust_score"` // 0.0–1.0
 	FetchCount   int     `json:"fetch_count"`
 	FindingCount int     `json:"finding_count"`
-	TrustLevel   string  `json:"trust_level"`   // "new" | "known" | "trusted" | "suspicious"
+	TrustLevel   string  `json:"trust_level"` // "new" | "known" | "trusted" | "suspicious"
 }
 
 // VulnPayload records a vulnerability finding in dependencies.
@@ -257,6 +257,33 @@ type AuditPayload struct {
 	Severity string `json:"severity,omitempty"`
 	Finding  string `json:"finding,omitempty"`
 	DurNs    int64  `json:"dur_ns,omitempty"`
+}
+
+// ProtocolEventPayload records an append-only durable workflow event.
+type ProtocolEventPayload struct {
+	Namespace     string `json:"namespace"`
+	ScopeID       string `json:"scope_id"`
+	EventID       string `json:"event_id"`
+	EventKind     string `json:"event_kind"`
+	AgentType     string `json:"agent_type,omitempty"`
+	CorrelationID string `json:"correlation_id,omitempty"`
+}
+
+// ProtocolSnapshotPayload records an updated reducer checkpoint.
+type ProtocolSnapshotPayload struct {
+	Namespace string `json:"namespace"`
+	ScopeID   string `json:"scope_id"`
+	Seq       uint64 `json:"seq"`
+}
+
+// MailboxItemPayload records a durable per-agent mailbox item append/ack.
+type MailboxItemPayload struct {
+	Namespace string `json:"namespace"`
+	ScopeID   string `json:"scope_id"`
+	AgentID   string `json:"agent_id"`
+	ItemID    string `json:"item_id"`
+	ItemKind  string `json:"item_kind"`
+	Action    string `json:"action,omitempty"`
 }
 
 // ValidationPayload records a validation lifecycle event.

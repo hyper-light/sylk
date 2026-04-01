@@ -25,6 +25,8 @@ func TestPipelineTesterSystemPromptForWorkerAndContract_UsesTaskModePrompt(t *te
 		"Your first `challenge_agent` call to Engineer, Designer, or Inspector is allowed.",
 		"Re-challenge Inspector only after Inspector answered your prior challenge and you then changed pipeline VFS state yourself based on that answer.",
 		"`handoff_next` is the only transport step.",
+		"`tester_forest_get_test_targets`",
+		"`tester_forest_get_failure_clusters`",
 		"Test Categories:",
 		"## SAFETY CONSTRAINTS AND RULES",
 	} {
@@ -48,6 +50,8 @@ func TestGlobalTesterSystemPromptForContract_UsesTaskModePrompt(t *testing.T) {
 	for _, want := range []string{
 		"# THE GLOBAL TESTER",
 		"Use it as the source of workflow truth.",
+		"`tester_forest_get_test_targets`",
+		"`tester_forest_get_failure_clusters`",
 		"## Core Global Testing Principles",
 		"## SAFETY CONSTRAINTS AND RULES",
 	} {
@@ -63,6 +67,7 @@ func TestGlobalTesterSystemPrompt_IncludesGlobalReviewLoopGuidance(t *testing.T)
 		"## GLOBAL REVIEW LOOP",
 		"When the global inspector challenges you inside the strict global review loop:",
 		"End the challenged turn with `validate_global_review`.",
+		"`tester_forest_get_test_targets`",
 		"### When Responding To The Global Inspector",
 	} {
 		if !strings.Contains(prompt, want) {

@@ -70,6 +70,7 @@ func ResearchDependencyInstallPlan(ctx context.Context, req DependencyInstallRes
 		Request: &guide.RouteRequest{
 			Input:           prompt,
 			TargetAgentID:   "academic",
+			ExplicitTarget:  true,
 			SourceAgentID:   strings.TrimSpace(req.SourceAgentID),
 			SourceAgentName: strings.TrimSpace(req.SourceAgentName),
 			SessionID:       strings.TrimSpace(req.SessionID),
@@ -186,8 +187,26 @@ func ExtractDependencyInstallResearchContent(msg *guide.Message) (string, error)
 func extractDependencyInstallResponseContent(data any) string {
 	switch typed := data.(type) {
 	case map[string]any:
-		content, _ := typed["content"].(string)
-		return strings.TrimSpace(content)
+		if content, _ := typed["content"].(string); strings.TrimSpace(content) != "" {
+			return strings.TrimSpace(content)
+		}
+		for _, key := range []string{"result", "response", "answer", "text"} {
+			if content, _ := typed[key].(string); strings.TrimSpace(content) != "" {
+				return strings.TrimSpace(content)
+			}
+		}
+		if nested, ok := typed["data"]; ok {
+			if content := extractDependencyInstallResponseContent(nested); strings.TrimSpace(content) != "" {
+				return content
+			}
+		}
+		if looksLikeDependencyInstallPlanMap(typed) {
+			raw, err := json.Marshal(typed)
+			if err == nil {
+				return strings.TrimSpace(string(raw))
+			}
+		}
+		return ""
 	case string:
 		return strings.TrimSpace(typed)
 	default:
@@ -197,10 +216,33 @@ func extractDependencyInstallResponseContent(data any) string {
 		}
 		var payload map[string]any
 		if err := json.Unmarshal(raw, &payload); err != nil {
-			return ""
+			return strings.TrimSpace(string(raw))
 		}
-		content, _ := payload["content"].(string)
-		return strings.TrimSpace(content)
+		if content := extractDependencyInstallResponseContent(payload); strings.TrimSpace(content) != "" {
+			return content
+		}
+		if looksLikeDependencyInstallPlanMap(payload) {
+			return strings.TrimSpace(string(raw))
+		}
+		return ""
+	}
+}
+
+func looksLikeDependencyInstallPlanMap(payload map[string]any) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	steps, ok := payload["steps"]
+	if !ok {
+		return false
+	}
+	switch typed := steps.(type) {
+	case []any:
+		return len(typed) > 0
+	case []map[string]any:
+		return len(typed) > 0
+	default:
+		return false
 	}
 }
 

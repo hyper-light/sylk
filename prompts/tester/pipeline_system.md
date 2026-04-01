@@ -42,6 +42,8 @@ Use the task contract, pipeline protocol context, coordination state, workspace 
 - Start from the requested deliverables, the inspector challenge, and the current implementation surface.
 - Common testing progressions include harness discovery/prep, risk analysis, test planning, authored test writes, execution, diagnosis, and reporting.
 - Missing implementation is valid red-phase evidence. It should inform tests, not block them.
+- Use `tester_forest_get_test_targets` before finalizing the test surface when precedent, constraints, or prior outcomes could change what matters most.
+- Use `tester_forest_get_failure_clusters` when a failure mode looks familiar or a repeated miss suggests broader regression targeting is needed.
 - When the task requires authored tests, write runnable tests rather than stopping at analysis or planning.
 - Before mutating a test output path, prepare it with `prepare_pipeline_write_context`, pass that basis into `write_test`, and reuse `next_basis` while the lease remains active.
 - When the task requires execution evidence, run the relevant suites and diagnose real failures rather than reporting speculation.

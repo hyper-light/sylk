@@ -1,0 +1,9 @@
+./delete.go
+./distance.go
+./errors.go
+./index.go
+./insert.go
+./medoid.go
+./prune.go
+./search.go
+./types.go

@@ -18,6 +18,7 @@ func TestModelsForAgent(t *testing.T) {
 		{"engineer", 1},
 		{"designer", 2},
 		{"inspector", 2},
+		{"inspector-pipeline", 2},
 		{"tester", 2},
 		{"tester-pipeline", 2},
 		{"orchestrator", 2},
@@ -308,14 +309,15 @@ func TestSelectorDisabledForSingleModel(t *testing.T) {
 
 func TestDefaultModelForAgentType(t *testing.T) {
 	cases := map[string]string{
-		"guide":           "gemini-3.1-pro-preview",
-		"engineer":        "gpt-5.4-pro",
-		"designer":        "gemini-3.1-pro-preview",
-		"inspector":       "gpt-5.4-pro",
-		"tester":          "gpt-5.4-pro",
-		"tester-pipeline": "gpt-5.4-pro",
-		"orchestrator":    "gemini-3.1-pro-preview",
-		"architect":       "claude-opus-4-6",
+		"guide":              "gemini-3.1-pro-preview",
+		"engineer":           "gpt-5.4-pro",
+		"designer":           "gemini-3.1-pro-preview",
+		"inspector":          "gpt-5.4-pro",
+		"inspector-pipeline": "claude-opus-4-6",
+		"tester":             "gpt-5.4-pro",
+		"tester-pipeline":    "gpt-5.4-pro",
+		"orchestrator":       "gemini-3.1-pro-preview",
+		"architect":          "claude-opus-4-6",
 	}
 	for agentType, want := range cases {
 		got := DefaultModelForAgentType(agentType)

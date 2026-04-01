@@ -21,6 +21,7 @@ import (
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/domain"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/logging"
 	"github.com/adalundhe/sylk/core/providers"
@@ -92,6 +93,8 @@ type Architect struct {
 
 	// Agent pod for cross-agent coordination (Scribe feed, etc.).
 	agentPod *shared.AgentPod
+	// Tracks Memory Forest branches surfaced during the current planning line.
+	forestTracker *shared.MemoryForestTracker
 
 	// File access abstraction (DiskFileAccess, set at creation).
 	fileAccess     versioning.FileAccess
@@ -191,6 +194,9 @@ type Config struct {
 	Logger *slog.Logger // Optional, defaults to per-agent WAL logger if nil.
 
 	logWAL io.Closer
+
+	// Forest exposes Memory Forest planning precedent skills.
+	Forest shared.MemoryForestService
 }
 
 // Default configuration values
@@ -373,6 +379,7 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 		planModes:         make(map[string]*PlanModeState),
 		pendingBus:        make(map[string]*shared.PendingSyncWait),
 		inFlight:          make(map[string]context.CancelFunc),
+		forestTracker:     shared.NewMemoryForestTracker(),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
 	}
@@ -530,18 +537,72 @@ func (a *Architect) initSkills() error {
 	a.skills = skills.NewRegistry()
 	a.hooks = skills.NewHookRegistry()
 	a.registerCoreSkills()
+	if err := shared.RegisterMemoryForestSkills(a.skills, "architect", a.config.Forest, a.forestTracker); err != nil {
+		return fmt.Errorf("register architect forest skills: %w", err)
+	}
+	if err := shared.AttachForestOutcomeRecorder(
+		a.skills,
+		"route_plan_acceptance",
+		a.forestTracker,
+		a.config.Forest,
+		func() string { return a.id },
+		"architect",
+		nil,
+		shared.OutcomeOnSuccess("architect plan accepted for execution"),
+	); err != nil {
+		return fmt.Errorf("attach architect forest acceptance outcome: %w", err)
+	}
+	if err := shared.AttachForestOutcomeRecorder(
+		a.skills,
+		"validate_global_review",
+		a.forestTracker,
+		a.config.Forest,
+		func() string { return a.id },
+		"architect",
+		nil,
+		shared.OutcomeFromGlobalReviewValidation(
+			"architect global review validation passed",
+			"architect global review validation failed",
+			"architect global review validation was mixed or blocked",
+		),
+	); err != nil {
+		return fmt.Errorf("attach architect forest global review outcome: %w", err)
+	}
+	if err := shared.AttachForestOutcomeRecorder(
+		a.skills,
+		"route_plan_acceptance",
+		a.forestTracker,
+		a.config.Forest,
+		func() string { return a.id },
+		"architect",
+		nil,
+		func(_ context.Context, _ any, err error) shared.ForestOutcomeClassification {
+			if err != nil {
+				return shared.ForestOutcomeClassification{
+					Status:  forest.OutcomeStatusFailed,
+					Summary: "architect plan acceptance routing failed",
+					Enabled: true,
+				}
+			}
+			return shared.ForestOutcomeClassification{}
+		},
+	); err != nil {
+		return fmt.Errorf("attach architect forest acceptance failure outcome: %w", err)
+	}
+
+	manifest := architectToolManifestForRegistry(a.skills)
 
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.MaxLoadedSkills = DefaultSkillMaxLoaded
 	loaderCfg.TokenBudget = DefaultSkillTokenBudget
-	loaderCfg.CoreSkills = architectCoreSkillNames()
+	loaderCfg.CoreSkills = filterSyntheticRuntimeTools(manifest.DefaultVisibleNames())
 	loaderCfg.AutoLoadDomains = nil
 	a.skillLoader = skills.NewLoader(a.skills, loaderCfg)
-	registerArchitectSafetyHook(a.hooks, a.skills, architectAllSkillNames())
+	registerArchitectSafetyHook(a.hooks, a.skills, manifest.AllowedNames())
 	tools, err := toolruntime.New(toolruntime.Config{
 		Registry:             a.skills,
 		Hooks:                a.hooks,
-		Manifest:             architectToolManifest(),
+		Manifest:             manifest,
 		State:                toolruntime.NewState(),
 		GuardianControlPlane: newArchitectGuardianControlPlane(a),
 	})
@@ -1206,7 +1267,9 @@ func (a *Architect) handleRecall(ctx context.Context, fwd *guide.ForwardedReques
 	if a.shouldRouteExistingReadyPlanFollowupToConversation(fwd, time.Now().UTC()) {
 		return a.handleConversation(ctx, fwd)
 	}
+	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
+	defer shared.CloseGlobalReviewState(ctx)
 	req := &ArchitectRequest{
 		ID:                  uuid.New().String(),
 		Intent:              IntentRecall,
@@ -1225,7 +1288,9 @@ func (a *Architect) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest
 	if a.shouldRouteExistingReadyPlanFollowupToConversation(fwd, time.Now().UTC()) {
 		return a.handleConversation(ctx, fwd)
 	}
+	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
+	defer shared.CloseGlobalReviewState(ctx)
 	req := &ArchitectRequest{
 		ID:                  uuid.New().String(),
 		Intent:              IntentCheck,
@@ -1259,7 +1324,9 @@ func (a *Architect) shouldRouteExistingReadyPlanFollowupToConversation(
 // conversation mode so the architect can suggest resuming them instead of
 // silently resurrecting them.
 func (a *Architect) handleConversation(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
+	defer shared.CloseGlobalReviewState(ctx)
 	now := time.Now().UTC()
 	sessionID := sessionIDFromForwarded(fwd)
 	a.recoverSessionPendingWork(ctx, sessionID, now)

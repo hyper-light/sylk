@@ -7,7 +7,7 @@
 -- =============================================================================
 -- NODES TABLE (unified for all domains)
 -- =============================================================================
-CREATE TABLE nodes (
+CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY,
     domain INTEGER NOT NULL,
     node_type INTEGER NOT NULL,
@@ -55,7 +55,7 @@ CREATE TABLE nodes (
 -- =============================================================================
 -- EDGES TABLE
 -- =============================================================================
-CREATE TABLE edges (
+CREATE TABLE IF NOT EXISTS edges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_id TEXT NOT NULL,
     target_id TEXT NOT NULL,
@@ -72,7 +72,7 @@ CREATE TABLE edges (
 -- =============================================================================
 -- VECTORS TABLE (embeddings as BLOBs)
 -- =============================================================================
-CREATE TABLE vectors (
+CREATE TABLE IF NOT EXISTS vectors (
     node_id TEXT PRIMARY KEY,
     embedding BLOB NOT NULL,
     magnitude REAL NOT NULL,
@@ -86,7 +86,7 @@ CREATE TABLE vectors (
 -- =============================================================================
 -- PROVENANCE TABLE (tracks source of information)
 -- =============================================================================
-CREATE TABLE provenance (
+CREATE TABLE IF NOT EXISTS provenance (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     node_id TEXT NOT NULL,
     source_type INTEGER NOT NULL,
@@ -103,7 +103,7 @@ CREATE TABLE provenance (
 -- =============================================================================
 -- CONFLICTS TABLE (detected contradictions)
 -- =============================================================================
-CREATE TABLE conflicts (
+CREATE TABLE IF NOT EXISTS conflicts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     conflict_type INTEGER NOT NULL,
     subject TEXT NOT NULL,
@@ -125,7 +125,7 @@ CREATE TABLE conflicts (
 -- package which uses its own optimized binary file format for graph edges,
 -- centroids, and BBQ quantization data. These tables are for metadata only.
 -- =============================================================================
-CREATE TABLE vector_index_meta (
+CREATE TABLE IF NOT EXISTS vector_index_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
@@ -133,7 +133,7 @@ CREATE TABLE vector_index_meta (
 -- =============================================================================
 -- ACADEMIC-SPECIFIC TABLES
 -- =============================================================================
-CREATE TABLE academic_sources (
+CREATE TABLE IF NOT EXISTS academic_sources (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     base_url TEXT NOT NULL,
@@ -143,7 +143,7 @@ CREATE TABLE academic_sources (
     last_crawled_at DATETIME
 );
 
-CREATE TABLE academic_chunks (
+CREATE TABLE IF NOT EXISTS academic_chunks (
     id TEXT PRIMARY KEY,
     node_id TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
@@ -152,7 +152,7 @@ CREATE TABLE academic_chunks (
     UNIQUE (node_id, chunk_index)
 );
 
-CREATE TABLE library_docs (
+CREATE TABLE IF NOT EXISTS library_docs (
     library_path TEXT PRIMARY KEY,
     doc_node_id TEXT,
     FOREIGN KEY (doc_node_id) REFERENCES nodes(id) ON DELETE SET NULL

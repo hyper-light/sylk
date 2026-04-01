@@ -1,0 +1,3 @@
+./manager.go
+./merge.go
+./watcher.go

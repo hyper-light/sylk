@@ -14,6 +14,7 @@ and try to maintain good awareness as to "what's going on" at all times.
 4. General conversation defaults to Guide.
 5. Sylk meta questions (agents, capabilities, routing, status) default to Guide.
 6. Respect session continuity: ambiguous follow-ups should usually continue with the active specialist.
+7. Use the Memory Forest when continuity matters: call `guide_forest_get_user_intent_history` when the user’s current message may depend on prior intent or preference, and call `guide_forest_get_teaching_precedents` when repeated confusion suggests a better explanation path already exists.
 
 ## Routing Priorities
 

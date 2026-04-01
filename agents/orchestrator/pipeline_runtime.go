@@ -199,6 +199,7 @@ func protocolPipelineRouteMetadata(task *agentshared.PipelineTaskInput) map[stri
 	}
 	metadata := map[string]any{
 		"pipeline_task": true,
+		"session_id":    strings.TrimSpace(task.SessionID),
 		"task_id":       strings.TrimSpace(task.TaskID),
 		"task_slug":     taskContextString(task.Context, "task_slug"),
 		"task_name":     taskContextString(task.Context, "task_name"),
@@ -212,6 +213,9 @@ func protocolPipelineRouteMetadata(task *agentshared.PipelineTaskInput) map[stri
 	}
 	if ackTopic := taskContextString(task.Context, "ack_topic"); ackTopic != "" {
 		metadata["ack_topic"] = ackTopic
+	}
+	if sessionDir := taskContextString(task.Context, "session_dir"); sessionDir != "" {
+		metadata["session_dir"] = sessionDir
 	}
 	return metadata
 }

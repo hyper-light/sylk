@@ -98,6 +98,27 @@ func (bg *BriefGenerator) Latest() *ContextBrief {
 	return bg.latest.Load()
 }
 
+// Refresh synchronously requests a fresh brief from the configured source and
+// stores it as the latest brief. It is used at handoff time when rollover needs
+// a guaranteed current summary rather than a best-effort background one.
+func (bg *BriefGenerator) Refresh(ctx context.Context, agentType string, contextSize, turnNumber int) (*ContextBrief, error) {
+	if bg == nil || bg.source == nil {
+		return nil, nil
+	}
+
+	bg.mu.Lock()
+	defer bg.mu.Unlock()
+
+	brief, err := bg.source.RequestBrief(ctx, agentType, contextSize, turnNumber)
+	if err != nil {
+		return nil, err
+	}
+	if brief != nil {
+		bg.latest.Store(brief)
+	}
+	return brief, nil
+}
+
 // SetOnPreparedContext serializes the latest brief as JSON and stores it
 // in the PreparedContext metadata under "context_brief".
 func (bg *BriefGenerator) SetOnPreparedContext(pc *PreparedContext) {

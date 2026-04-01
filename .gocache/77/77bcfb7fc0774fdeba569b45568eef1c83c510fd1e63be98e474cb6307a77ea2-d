@@ -1,0 +1,7 @@
+./errors.go
+./eslint_parser.go
+./git_parser.go
+./go_parser.go
+./parser.go
+./streaming_parser.go
+./template_cache.go

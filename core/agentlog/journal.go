@@ -143,6 +143,16 @@ func (j *AgentJournal) Checkpoint(seq uint64) error {
 // Replay reads all entries with sequence > afterSeq and calls fn for each.
 // Scans the most recent recoverySegments segments.
 func (j *AgentJournal) Replay(afterSeq uint64, fn func(Entry) error) error {
+	return j.replay(afterSeq, recoverySegments, fn)
+}
+
+// ReplayAll reads all entries with sequence > afterSeq and calls fn for each.
+// Use this for durable reducers that must reconstruct complete state.
+func (j *AgentJournal) ReplayAll(afterSeq uint64, fn func(Entry) error) error {
+	return j.replay(afterSeq, 0, fn)
+}
+
+func (j *AgentJournal) replay(afterSeq uint64, segmentLimit int, fn func(Entry) error) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
@@ -154,7 +164,10 @@ func (j *AgentJournal) Replay(afterSeq uint64, fn func(Entry) error) error {
 		return nil
 	}
 
-	start := max(0, len(segments)-recoverySegments)
+	start := 0
+	if segmentLimit > 0 {
+		start = max(0, len(segments)-segmentLimit)
+	}
 	for _, segNum := range segments[start:] {
 		entries, err := j.readSegmentEntries(segNum)
 		if err != nil {

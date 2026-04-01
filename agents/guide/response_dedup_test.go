@@ -617,3 +617,67 @@ func TestNewWithProvider_InitializesResponseTrackingForStreamRelay(t *testing.T)
 		t.Fatal("timed out waiting for forwarded provider-backed stream")
 	}
 }
+
+func TestHandleResponseMessage_ForwardsStreamLifecycleWithoutPendingWhenTargetKnown(t *testing.T) {
+	g, out := newResponseTestGuide(t)
+
+	cases := []struct {
+		name      string
+		eventType StreamEventType
+		eventData any
+	}{
+		{name: "start", eventType: StreamEventStart},
+		{
+			name:      "reroute",
+			eventType: StreamEventReroute,
+			eventData: map[string]string{
+				"from_agent":              "inspector",
+				"to_agent":                "tester",
+				"original_correlation_id": "corr-parent",
+				"new_correlation_id":      "corr-child",
+			},
+		},
+		{name: "complete", eventType: StreamEventComplete},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := &Message{
+				ID:            "msg-" + tc.name,
+				CorrelationID: "corr-missing-pending-" + tc.name,
+				Type:          MessageTypeStream,
+				SourceAgentID: "tester-pipeline",
+				TargetAgentID: "tui",
+				Payload: &StreamResponse{
+					CorrelationID:     "corr-missing-pending-" + tc.name,
+					RespondingAgentID: "tester-pipeline",
+					TargetAgentID:     "tui",
+					Event: &StreamEvent{
+						Type: tc.eventType,
+						Data: tc.eventData,
+					},
+				},
+			}
+
+			if err := g.handleResponseMessage(msg); err != nil {
+				t.Fatalf("handleResponseMessage: %v", err)
+			}
+
+			select {
+			case forwarded := <-out:
+				stream, ok := forwarded.GetStreamResponse()
+				if !ok || stream == nil || stream.Event == nil {
+					t.Fatalf("unexpected forwarded message: %+v", forwarded)
+				}
+				if stream.TargetAgentID != "tui" {
+					t.Fatalf("stream.TargetAgentID = %q, want tui", stream.TargetAgentID)
+				}
+				if stream.Event.Type != tc.eventType {
+					t.Fatalf("stream.Event.Type = %q, want %q", stream.Event.Type, tc.eventType)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("timed out waiting for forwarded %s stream", tc.name)
+			}
+		})
+	}
+}

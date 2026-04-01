@@ -1,12 +1,13 @@
 package global
 
 import (
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 func globalTesterVisibleSkillNames() []string {
-	return []string{
+	return agentshared.AppendMemoryForestVisibleSkillNames([]string{
 		"analyze_risk",
 		"plan_tests",
 		"read_file",
@@ -30,11 +31,11 @@ func globalTesterVisibleSkillNames() []string {
 		"diagnose_failure",
 		"research_test_tool_install",
 		"install_test_tooling",
-	}
+	}, "tester")
 }
 
 func globalTesterMutatingSkillNames() []string {
-	return []string{
+	return agentshared.AppendMemoryForestMutatingSkillNames([]string{
 		"write_global_file",
 		"edit_global_file",
 		"delete_global_file",
@@ -52,7 +53,7 @@ func globalTesterMutatingSkillNames() []string {
 		"report_to_architect",
 		"escalate_failure",
 		"reroute_request",
-	}
+	})
 }
 
 func globalTesterToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {
@@ -60,7 +61,7 @@ func globalTesterToolManifest(registry *skills.Registry) *toolruntime.PolicyMani
 		AgentID:          "tester",
 		CapabilityScope:  "tester.global",
 		Registry:         registry,
-		VisibleByDefault: globalTesterVisibleSkillNames(),
-		Mutating:         globalTesterMutatingSkillNames(),
+		VisibleByDefault: agentshared.FilterRegisteredSkillNames(registry, globalTesterVisibleSkillNames()),
+		Mutating:         agentshared.FilterRegisteredSkillNames(registry, globalTesterMutatingSkillNames()),
 	})
 }

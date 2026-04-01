@@ -1,0 +1,12 @@
+./audit.go
+./auth_methods.go
+./auth_prefs.go
+./auth_registry.go
+./authorization.go
+./broker.go
+./encrypted_file.go
+./handle.go
+./hooks.go
+./keychain_linux.go
+./manager.go
+./scopes.go

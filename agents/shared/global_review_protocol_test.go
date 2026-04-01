@@ -195,6 +195,9 @@ func TestGlobalReviewChallengePublishesUserVisibleRoute(t *testing.T) {
 		if !strings.Contains(req.Input, "Future planned work that has not been merged yet is pending, not missing.") {
 			t.Fatalf("input = %q, want checkpoint pending guidance", req.Input)
 		}
+		if !strings.Contains(req.Input, "Protocol obligations:") || !strings.Contains(req.Input, "validate_global_review") {
+			t.Fatalf("input = %q, want protocol obligation guidance", req.Input)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for global review route request")
 	}

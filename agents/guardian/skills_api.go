@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -22,7 +23,11 @@ func guardianAllSkillNames() []string {
 }
 
 func guardianToolManifest() *toolruntime.PolicyManifest {
-	return toolruntime.ApplyAuthorityProfile("guardian", toolruntime.NewManifest("guardian", "guardian.control",
+	return guardianToolManifestForRegistry(nil)
+}
+
+func guardianToolManifestForRegistry(registry *skills.Registry) *toolruntime.PolicyManifest {
+	policies := []toolruntime.ToolPolicy{
 		toolruntime.NewToolPolicy("git_safety", toolruntime.EffectReadOnly, toolruntime.DomainGit, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("rollback", toolruntime.EffectMutating, toolruntime.DomainGit, toolruntime.ExecutionModeLocalWorker, toolruntime.WithApprovalSensitive()),
 		toolruntime.NewToolPolicy("content_scan", toolruntime.EffectReadOnly, toolruntime.DomainValidation, toolruntime.ExecutionModeLocal),
@@ -52,7 +57,9 @@ func guardianToolManifest() *toolruntime.PolicyManifest {
 		toolruntime.NewToolPolicy("reroute_request", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("self_diagnostic", toolruntime.EffectReadOnly, toolruntime.DomainSystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy(toolruntime.SearchToolName, toolruntime.EffectReadOnly, toolruntime.DomainDiscovery, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault(), toolruntime.WithSearchable(false)),
-	))
+	}
+	policies = shared.AppendMemoryForestToolPolicies(policies, registry, "guardian")
+	return toolruntime.ApplyAuthorityProfile("guardian", toolruntime.NewManifest("guardian", "guardian.control", policies...))
 }
 
 func filterSyntheticGuardianRuntimeTools(names []string) []string {

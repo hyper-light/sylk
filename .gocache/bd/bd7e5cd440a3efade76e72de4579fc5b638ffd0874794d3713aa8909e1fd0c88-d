@@ -1,0 +1,11 @@
+./auto_resolve.go
+./complexity.go
+./content.go
+./filelist.go
+./messages.go
+./model.go
+./regression.go
+./step_preview.go
+./syntax_check.go
+./toolbar.go
+./types.go

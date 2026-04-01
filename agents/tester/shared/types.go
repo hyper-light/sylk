@@ -5,6 +5,7 @@ package shared
 import (
 	"time"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
 )
 
@@ -146,6 +147,9 @@ type PipelineTesterConfig struct {
 	DefaultTimeout  time.Duration `json:"default_timeout"`
 	AgentID         string        `json:"agent_id"`
 	SessionID       string        `json:"session_id"`
+
+	// Forest exposes Memory Forest testing precedent skills.
+	Forest agentshared.MemoryForestService `json:"-"`
 }
 
 // DefaultPipelineTesterConfig returns sensible defaults.
@@ -176,6 +180,9 @@ type GlobalTesterConfig struct {
 	AgentID                string        `json:"agent_id"`
 	SessionID              string        `json:"session_id"`
 	ActivityPub            events.ActivityPublisher
+
+	// Forest exposes Memory Forest testing precedent skills.
+	Forest agentshared.MemoryForestService `json:"-"`
 }
 
 // DefaultGlobalTesterConfig returns sensible defaults.

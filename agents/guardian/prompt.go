@@ -89,6 +89,12 @@ You have the following skills available during conversations:
 - **ask_user_question**: Ask the user a question when you need clarification
 - **reroute_request**: Forward requests to other agents when outside your domain`
 
+const guardianForestGuide = `## Memory Forest
+
+Use the Memory Forest when governance decisions should be grounded in precedent rather than only the current diff:
+- **guardian_forest_evaluate_scope_risk**: recall prior conflicts, constraints, and risky scope expansions before approving or escalating
+- **guardian_forest_get_approval_precedents**: recall prior approved or rejected branches relevant to the current safety or approval decision`
+
 // buildSystemPrompt assembles the system prompt for a given intent.
 func (g *Guardian) buildSystemPrompt(intent GuardianIntent) string {
 	modules := []string{guardianCoreIdentity, guardianSafetyDomain}
@@ -107,7 +113,7 @@ func (g *Guardian) buildSystemPrompt(intent GuardianIntent) string {
 			"The user wants a safety checkpoint. Use git_safety with action=checkpoint "+
 				"to propose a safety commit. Remember: you MUST get user approval before committing.")
 	default:
-		modules = append(modules, guardianGuardrails, guardianSkillsGuide)
+		modules = append(modules, guardianGuardrails, guardianSkillsGuide, guardianForestGuide)
 	}
 
 	modules = append(modules, shared.BuildWorkspaceViewContext(shared.WorkspacePromptOptions{

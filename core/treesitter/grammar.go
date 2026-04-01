@@ -15,6 +15,17 @@ import (
 	"unsafe"
 
 	"github.com/ebitengine/purego"
+	tree_sitter_c "github.com/tree-sitter/tree-sitter-c/bindings/go"
+	tree_sitter_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
+	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
+	tree_sitter_html "github.com/tree-sitter/tree-sitter-html/bindings/go"
+	tree_sitter_java "github.com/tree-sitter/tree-sitter-java/bindings/go"
+	tree_sitter_javascript "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
+	tree_sitter_json "github.com/tree-sitter/tree-sitter-json/bindings/go"
+	tree_sitter_php "github.com/tree-sitter/tree-sitter-php/bindings/go"
+	tree_sitter_python "github.com/tree-sitter/tree-sitter-python/bindings/go"
+	tree_sitter_ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
+	tree_sitter_rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 )
@@ -150,11 +161,11 @@ func (gl *GrammarLoader) LoadContext(ctx context.Context, name string) (*sitter.
 		return nil, fmt.Errorf("grammar %q previously failed to load", name)
 	}
 
-	handle, err := gl.loadLibrarySafe(name)
+	handle, err := gl.loadBuiltinOrLibrary(name)
 	if err != nil {
 		if gl.autoDownload && gl.downloader != nil {
 			if downloadErr := gl.downloadAndRetry(ctx, name); downloadErr == nil {
-				handle, err = gl.loadLibrarySafe(name)
+				handle, err = gl.loadBuiltinOrLibrary(name)
 			}
 		}
 		if err != nil {
@@ -165,6 +176,13 @@ func (gl *GrammarLoader) LoadContext(ctx context.Context, name string) (*sitter.
 
 	gl.grammars[name] = handle
 	return sitter.NewLanguage(handle.langPtr), nil
+}
+
+func (gl *GrammarLoader) loadBuiltinOrLibrary(name string) (*GrammarHandle, error) {
+	if handle, ok, err := loadBuiltinGrammar(name); ok {
+		return handle, err
+	}
+	return gl.loadLibrarySafe(name)
 }
 
 func (gl *GrammarLoader) downloadAndRetry(ctx context.Context, name string) error {
@@ -179,6 +197,48 @@ func (gl *GrammarLoader) downloadAndRetry(ctx context.Context, name string) erro
 	}
 
 	return nil
+}
+
+func loadBuiltinGrammar(name string) (*GrammarHandle, bool, error) {
+	var langPtr unsafe.Pointer
+	switch name {
+	case "c":
+		langPtr = tree_sitter_c.Language()
+	case "cpp":
+		langPtr = tree_sitter_cpp.Language()
+	case "go":
+		langPtr = tree_sitter_go.Language()
+	case "html":
+		langPtr = tree_sitter_html.Language()
+	case "java":
+		langPtr = tree_sitter_java.Language()
+	case "javascript":
+		langPtr = tree_sitter_javascript.Language()
+	case "json":
+		langPtr = tree_sitter_json.Language()
+	case "php":
+		langPtr = tree_sitter_php.LanguagePHP()
+	case "python":
+		langPtr = tree_sitter_python.Language()
+	case "ruby":
+		langPtr = tree_sitter_ruby.Language()
+	case "rust":
+		langPtr = tree_sitter_rust.Language()
+	default:
+		return nil, false, nil
+	}
+	if langPtr == nil {
+		return nil, true, fmt.Errorf("builtin grammar %q returned nil language pointer", name)
+	}
+	if err := validateLanguageCompatibility(langPtr); err != nil {
+		return nil, true, fmt.Errorf("builtin grammar %q incompatible: %w", name, err)
+	}
+	return &GrammarHandle{
+		libHandle: 0,
+		langPtr:   langPtr,
+		name:      name,
+		checksum:  "builtin",
+	}, true, nil
 }
 
 func validateGrammarName(name string) error {
@@ -212,6 +272,10 @@ func (gl *GrammarLoader) loadLibrarySafe(name string) (*GrammarHandle, error) {
 		purego.Dlclose(lib)
 		return nil, fmt.Errorf("tree_sitter_%s returned null", name)
 	}
+	if err := validateLanguageCompatibility(ptr); err != nil {
+		purego.Dlclose(lib)
+		return nil, err
+	}
 
 	return &GrammarHandle{
 		libHandle: lib,
@@ -219,6 +283,16 @@ func (gl *GrammarLoader) loadLibrarySafe(name string) (*GrammarHandle, error) {
 		name:      name,
 		checksum:  checksum,
 	}, nil
+}
+
+func validateLanguageCompatibility(ptr unsafe.Pointer) error {
+	lang := sitter.NewLanguage(ptr)
+	parser := sitter.NewParser()
+	defer parser.Close()
+	if err := parser.SetLanguage(lang); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (gl *GrammarLoader) findAndValidateLibrary(name string) (string, error) {

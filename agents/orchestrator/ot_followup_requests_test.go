@@ -183,6 +183,40 @@ func TestBuildOTGlobalFollowupRequest_UsesTaskMetadataSessionID(t *testing.T) {
 	if req.SessionID != "sess-meta" {
 		t.Fatalf("session_id = %q, want sess-meta", req.SessionID)
 	}
+	if req.Metadata["session_id"] != "sess-meta" {
+		t.Fatalf("metadata session_id = %#v, want sess-meta", req.Metadata["session_id"])
+	}
+}
+
+func TestBuildOTGlobalFollowupRequest_PreservesSessionMetadataForDurableReviewState(t *testing.T) {
+	o := &Orchestrator{
+		state:  NewState("sess-state"),
+		config: Config{AgentID: "orchestrator"},
+	}
+	task := &TaskRecord{
+		ID: "task-12",
+		Metadata: map[string]any{
+			"session_id":  "sess-meta",
+			"session_dir": "/tmp/session-global-review",
+		},
+	}
+	update := &PipelineUpdate{
+		TaskID:    "task-12",
+		AgentType: agentshared.PipelineAgentInspector,
+		Status:    "succeeded",
+		Timestamp: time.Date(2026, 3, 23, 12, 6, 0, 0, time.UTC),
+	}
+
+	req := o.buildOTGlobalFollowupRequest(task, update, "inspector", versioning.SemanticVersion{}, false)
+	if req == nil {
+		t.Fatal("buildOTGlobalFollowupRequest returned nil")
+	}
+	if req.Metadata["session_id"] != "sess-meta" {
+		t.Fatalf("metadata session_id = %#v, want sess-meta", req.Metadata["session_id"])
+	}
+	if req.Metadata["session_dir"] != "/tmp/session-global-review" {
+		t.Fatalf("metadata session_dir = %#v, want /tmp/session-global-review", req.Metadata["session_dir"])
+	}
 }
 
 func TestFinalizePipelineUpdate_InspectorSuccessPublishesGlobalInspectorFollowup(t *testing.T) {

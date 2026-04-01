@@ -1,0 +1,226 @@
+package shared
+
+import (
+	"context"
+	"testing"
+)
+
+func TestPipelineProtocolDurableProjectionAndMailbox(t *testing.T) {
+	sessionDir := t.TempDir()
+	task := &PipelineTaskInput{
+		TaskID:    "task-durable",
+		AgentType: PipelineAgentInspector,
+		SessionID: "sess-durable",
+		Context: map[string]any{
+			"session_dir": sessionDir,
+			"pipeline_protocol": PipelineProtocolSnapshotMap(&PipelineProtocolSnapshot{
+				Roster: []PipelineProtocolAgent{
+					{AgentType: PipelineAgentInspector},
+					{AgentType: PipelineAgentTester},
+				},
+				ActiveAgents: []string{PipelineAgentTester},
+				PendingChallenge: &PipelineProtocolChallenge{
+					ID:              "challenge-validate",
+					RequestingAgent: PipelineAgentInspector,
+					TargetAgents:    []string{PipelineAgentTester},
+					Request:         "Validate the implementation.",
+					References:      []string{finalizePipelineVerificationReference},
+				},
+			}),
+		},
+	}
+
+	state, err := newPipelineProtocolStateForTask(task)
+	if err != nil {
+		t.Fatalf("newPipelineProtocolStateForTask() error = %v", err)
+	}
+	defer state.Close()
+
+	testerMailbox, err := openDurableAgentMailbox(sessionDir, PipelineAgentTester)
+	if err != nil {
+		t.Fatalf("open tester mailbox: %v", err)
+	}
+	defer testerMailbox.Close()
+	testerItems, err := testerMailbox.Pending(pipelineProtocolNamespace, task.TaskID)
+	if err != nil {
+		t.Fatalf("tester mailbox pending: %v", err)
+	}
+	if len(testerItems) != 1 || testerItems[0].Action != "validate_work" {
+		t.Fatalf("tester mailbox = %#v, want single validate_work obligation", testerItems)
+	}
+
+	testerCtx := WithPipelineTask(context.Background(), task)
+	testerCtx = WithTaskExecutionContract(testerCtx, &TaskExecutionContract{RuntimeAgentType: PipelineAgentTester})
+	if err := state.recordValidation(testerCtx, &PipelineValidationRecord{
+		ChallengeID:         "challenge-validate",
+		RequestingAgent:     PipelineAgentInspector,
+		RespondingAgent:     PipelineAgentTester,
+		Status:              string(PipelineValidationPassed),
+		Summary:             "Validation passed.",
+		ChallengeReferences: []string{finalizePipelineVerificationReference},
+		EvidenceRefs:        []string{"tests/auth_test.go"},
+	}); err != nil {
+		t.Fatalf("recordValidation() error = %v", err)
+	}
+
+	inspectorMailbox, err := openDurableAgentMailbox(sessionDir, PipelineAgentInspector)
+	if err != nil {
+		t.Fatalf("open inspector mailbox: %v", err)
+	}
+	defer inspectorMailbox.Close()
+	inspectorItems, err := inspectorMailbox.Pending(pipelineProtocolNamespace, task.TaskID)
+	if err != nil {
+		t.Fatalf("inspector mailbox pending after validation: %v", err)
+	}
+	if len(inspectorItems) != 1 || inspectorItems[0].Action != "process_validation" {
+		t.Fatalf("inspector mailbox after validation = %#v, want process_validation", inspectorItems)
+	}
+
+	inspectorCtx := WithPipelineTask(context.Background(), task)
+	inspectorCtx = WithTaskExecutionContract(inspectorCtx, &TaskExecutionContract{RuntimeAgentType: PipelineAgentInspector})
+	if err := state.recordValidationProcessing(inspectorCtx, PipelineValidationProcessing{
+		ChallengeID: "challenge-validate",
+		AgentType:   PipelineAgentInspector,
+		Decision:    PipelineValidationDecisionAccept,
+		Summary:     "Accepted tester validation.",
+		Validation: &PipelineValidationRecord{
+			ChallengeID:         "challenge-validate",
+			RequestingAgent:     PipelineAgentInspector,
+			RespondingAgent:     PipelineAgentTester,
+			Status:              string(PipelineValidationPassed),
+			Summary:             "Validation passed.",
+			ChallengeReferences: []string{finalizePipelineVerificationReference},
+			EvidenceRefs:        []string{"tests/auth_test.go"},
+		},
+	}); err != nil {
+		t.Fatalf("recordValidationProcessing() error = %v", err)
+	}
+
+	inspectorItems, err = inspectorMailbox.Pending(pipelineProtocolNamespace, task.TaskID)
+	if err != nil {
+		t.Fatalf("inspector mailbox pending after processing: %v", err)
+	}
+	if len(inspectorItems) != 1 || inspectorItems[0].Action != "finalize_pipeline" {
+		t.Fatalf("inspector mailbox after processing = %#v, want finalize_pipeline", inspectorItems)
+	}
+
+	if err := state.recordReadyForOT(inspectorCtx, "Pipeline ready for OT.", []string{"tests/auth_test.go"}, &PipelineValidationRecord{
+		ChallengeID: "challenge-validate",
+	}); err != nil {
+		t.Fatalf("recordReadyForOT() error = %v", err)
+	}
+
+	inspectorItems, err = inspectorMailbox.Pending(pipelineProtocolNamespace, task.TaskID)
+	if err != nil {
+		t.Fatalf("inspector mailbox pending after ready_for_ot: %v", err)
+	}
+	if len(inspectorItems) != 1 || inspectorItems[0].Action != string(PipelineProtocolActionOT) {
+		t.Fatalf("inspector mailbox after ready_for_ot = %#v, want handoff_to_ot obligation", inspectorItems)
+	}
+
+	if err := state.Close(); err != nil {
+		t.Fatalf("state.Close() error = %v", err)
+	}
+	reopened, err := newPipelineProtocolStateForTask(task)
+	if err != nil {
+		t.Fatalf("reopen state: %v", err)
+	}
+	defer reopened.Close()
+	if required, _ := reopened.RequiredAction(); required != PipelineProtocolActionOT {
+		t.Fatalf("required action after reopen = %q, want %q", required, PipelineProtocolActionOT)
+	}
+}
+
+func TestGlobalReviewDurableProjectionAndMailbox(t *testing.T) {
+	sessionDir := t.TempDir()
+	metadata := map[string]any{
+		"session_id":    "sess-global",
+		"session_dir":   sessionDir,
+		"review_id":     "review-durable",
+		"global_review": true,
+		"global_review_protocol": GlobalReviewSnapshotMap(&GlobalReviewSnapshot{
+			ReviewID:       "review-durable",
+			RequestedBy:    GlobalReviewAgentInspector,
+			CurrentRequest: "Validate the merged state.",
+			PendingChallenge: &GlobalReviewChallenge{
+				ID:              "global-challenge-1",
+				RequestingAgent: GlobalReviewAgentInspector,
+				TargetAgent:     GlobalReviewAgentTester,
+				Request:         "Audit the merged work.",
+			},
+		}),
+	}
+
+	state := NewGlobalReviewStateFromMetadata(metadata)
+	if state == nil {
+		t.Fatal("NewGlobalReviewStateFromMetadata() returned nil")
+	}
+	defer state.Close()
+
+	testerMailbox, err := openDurableAgentMailbox(sessionDir, GlobalReviewAgentTester)
+	if err != nil {
+		t.Fatalf("open tester mailbox: %v", err)
+	}
+	defer testerMailbox.Close()
+	items, err := testerMailbox.Pending(globalReviewNamespace, "review-durable")
+	if err != nil {
+		t.Fatalf("tester mailbox pending: %v", err)
+	}
+	if len(items) != 1 || items[0].Action != "validate_global_review" {
+		t.Fatalf("tester mailbox = %#v, want validate_global_review", items)
+	}
+
+	if err := state.recordValidation(context.Background(), &GlobalReviewValidationRecord{
+		ChallengeID:     "global-challenge-1",
+		RequestingAgent: GlobalReviewAgentInspector,
+		RespondingAgent: GlobalReviewAgentTester,
+		Status:          string(GlobalReviewValidationPassed),
+		Summary:         "Merged work passed.",
+		EvidenceRefs:    []string{"go test ./..."},
+	}); err != nil {
+		t.Fatalf("recordValidation() error = %v", err)
+	}
+	if err := state.recordValidationProcessing(context.Background(), GlobalReviewValidationProcessing{
+		ChallengeID: "global-challenge-1",
+		AgentType:   GlobalReviewAgentInspector,
+		Decision:    GlobalReviewValidationDecisionAccept,
+		Summary:     "Accepted tester validation.",
+		Validation: &GlobalReviewValidationRecord{
+			ChallengeID:     "global-challenge-1",
+			RequestingAgent: GlobalReviewAgentInspector,
+			RespondingAgent: GlobalReviewAgentTester,
+			Status:          string(GlobalReviewValidationPassed),
+			Summary:         "Merged work passed.",
+			EvidenceRefs:    []string{"go test ./..."},
+		},
+	}); err != nil {
+		t.Fatalf("recordValidationProcessing() error = %v", err)
+	}
+	if err := state.recordReadyForCommit(context.Background(), "Ready to commit merged work.", []string{"go test ./..."}, &GlobalReviewValidationRecord{
+		ChallengeID: "global-challenge-1",
+	}); err != nil {
+		t.Fatalf("recordReadyForCommit() error = %v", err)
+	}
+
+	inspectorMailbox, err := openDurableAgentMailbox(sessionDir, GlobalReviewAgentInspector)
+	if err != nil {
+		t.Fatalf("open inspector mailbox: %v", err)
+	}
+	defer inspectorMailbox.Close()
+	items, err = inspectorMailbox.Pending(globalReviewNamespace, "review-durable")
+	if err != nil {
+		t.Fatalf("inspector mailbox pending: %v", err)
+	}
+	if len(items) != 1 || items[0].Action != "commit_to_disk" {
+		t.Fatalf("inspector mailbox = %#v, want commit_to_disk", items)
+	}
+
+	reopened := NewGlobalReviewStateFromMetadata(metadata)
+	if reopened == nil {
+		t.Fatal("reopened global review state is nil")
+	}
+	defer reopened.Close()
+	if action, _ := reopened.RequiredAction(); action != GlobalReviewActionCommit {
+		t.Fatalf("required action after reopen = %q, want %q", action, GlobalReviewActionCommit)
+	}
+}

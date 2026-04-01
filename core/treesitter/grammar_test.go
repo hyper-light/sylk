@@ -218,6 +218,26 @@ func TestGrammarLoaderNotFound(t *testing.T) {
 	}
 }
 
+func TestGrammarLoaderPrefersBuiltinGoGrammar(t *testing.T) {
+	tmpDir := t.TempDir()
+	libPath := filepath.Join(tmpDir, grammarLibName("go"))
+	if err := os.WriteFile(libPath, []byte("not a real grammar"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	gl := NewGrammarLoader(WithTrustedDir(tmpDir))
+	lang, err := gl.Load("go")
+	if err != nil {
+		t.Fatalf("Load(go): %v", err)
+	}
+	if lang == nil {
+		t.Fatal("Load(go) returned nil language")
+	}
+	if got := lang.Version(); got == 0 {
+		t.Fatal("Load(go) returned language with version 0")
+	}
+}
+
 func TestGrammarLoaderChecksumMismatch(t *testing.T) {
 	tmpDir := t.TempDir()
 	libName := grammarLibName("testlang")

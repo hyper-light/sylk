@@ -1,6 +1,7 @@
 package archivalist
 
 import (
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -19,11 +20,20 @@ func archivalistVisibleSkillNames() []string {
 		ToolDeclareIntent,
 		ToolCompleteIntent,
 		ToolGetConflicts,
+		"knowledge_query",
+		"knowledge_memory",
 	}
 }
 
+func archivalistVisibleSkillNamesForRegistry(registry *skills.Registry) []string {
+	return shared.FilterRegisteredSkillNames(
+		registry,
+		shared.AppendMemoryForestVisibleSkillNames(archivalistVisibleSkillNames(), "archivalist"),
+	)
+}
+
 func archivalistMutatingSkillNames() []string {
-	return []string{
+	return shared.AppendMemoryForestMutatingSkillNames([]string{
 		"store",
 		ToolRecordPattern,
 		ToolRecordFailure,
@@ -35,7 +45,7 @@ func archivalistMutatingSkillNames() []string {
 		"reply_to",
 		"knowledge_memory",
 		"reroute_request",
-	}
+	})
 }
 
 func archivalistToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {
@@ -43,7 +53,7 @@ func archivalistToolManifest(registry *skills.Registry) *toolruntime.PolicyManif
 		AgentID:          "archivalist",
 		CapabilityScope:  "archivalist.default",
 		Registry:         registry,
-		VisibleByDefault: archivalistVisibleSkillNames(),
-		Mutating:         archivalistMutatingSkillNames(),
+		VisibleByDefault: archivalistVisibleSkillNamesForRegistry(registry),
+		Mutating:         shared.FilterRegisteredSkillNames(registry, archivalistMutatingSkillNames()),
 	})
 }

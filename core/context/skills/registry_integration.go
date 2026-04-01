@@ -226,7 +226,7 @@ func RegisterSkillsForAgent(
 		deps = &AdaptiveRetrievalDependencies{}
 	}
 
-	normalizedType := strings.ToLower(agentType)
+	normalizedType := NormalizeAdaptiveAgentType(agentType)
 
 	// All knowledge agents get universal skills
 	if IsKnowledgeAgent(normalizedType) {
@@ -244,6 +244,7 @@ func RegisterSkillsForAgent(
 
 // IsKnowledgeAgent checks if an agent type is a knowledge agent.
 func IsKnowledgeAgent(agentType string) bool {
+	agentType = NormalizeAdaptiveAgentType(agentType)
 	if strings.HasPrefix(agentType, AgentTypeScribe) {
 		return true
 	}
@@ -312,7 +313,7 @@ func GetSkillsForAgent(
 	registry *skills.Registry,
 	agentType string,
 ) []*skills.Skill {
-	normalizedType := strings.ToLower(agentType)
+	normalizedType := NormalizeAdaptiveAgentType(agentType)
 
 	var result []*skills.Skill
 

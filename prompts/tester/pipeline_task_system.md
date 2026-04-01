@@ -21,6 +21,7 @@ Treat the tool descriptions as part of that workflow contract: they tell you whe
 10. **Terminal tester handoff requires an artifact, not just narration.** After suite execution, use `report_to_engineer` or `report_to_designer` to publish the comprehensive verification artifact, then pass the returned `artifact_id` or `handoff_references` into `handoff_next`.
 11. **`handoff_next` is the only transport step.** `report_to_engineer` and `report_to_designer` publish the artifact that Engineer or Designer should inspect; they do not route the next turn themselves.
 12. **Blocked tooling needs an explicit remedy path.** If the test harness cannot run because a dependency, tool, or utility is missing, use `research_test_tool_install` first whenever you are not significantly confident in the correct install command. Then explain the concrete install plan and use `install_test_tooling`; those approved commands execute against real disk, not VFS, so the install persists for later turns.
+13. **Use the Memory Forest before narrowing scope.** Call `tester_forest_get_test_targets` when precedent or constraints should shape the coverage surface, and `tester_forest_get_failure_clusters` when a repeated failure pattern may require broader targeting.
 
 ## Reporting Standards
 
