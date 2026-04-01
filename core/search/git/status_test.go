@@ -233,9 +233,9 @@ func TestBuildStatusMap_PriorityOrder(t *testing.T) {
 
 func TestBuildTrackedDirs_DerivesAncestors(t *testing.T) {
 	tracked := map[string]struct{}{
-		"src/pkg/main.go":  {},
-		"src/pkg/util.go":  {},
-		"docs/readme.md":   {},
+		"src/pkg/main.go": {},
+		"src/pkg/util.go": {},
+		"docs/readme.md":  {},
 	}
 	dirs := BuildTrackedDirs(tracked)
 
@@ -251,6 +251,72 @@ func TestBuildTrackedDirs_Empty(t *testing.T) {
 	dirs := BuildTrackedDirs(nil)
 	if len(dirs) != 0 {
 		t.Errorf("expected empty, got %v", dirs)
+	}
+}
+
+func TestStatusUpdateFingerprint_EquivalentSnapshots(t *testing.T) {
+	left := StatusUpdate{
+		StatusMap: map[string]GitFileState{
+			"src/main.go": GitModified,
+			"docs":        GitDeleted,
+		},
+		TrackedSet: map[string]struct{}{
+			"src/main.go":    {},
+			"docs/readme.md": {},
+		},
+		TrackedDirs: map[string]struct{}{
+			"src":  {},
+			"docs": {},
+		},
+	}
+	right := StatusUpdate{
+		StatusMap: map[string]GitFileState{
+			"docs":        GitDeleted,
+			"src/main.go": GitModified,
+		},
+		TrackedSet: map[string]struct{}{
+			"docs/readme.md": {},
+			"src/main.go":    {},
+		},
+		TrackedDirs: map[string]struct{}{
+			"docs": {},
+			"src":  {},
+		},
+	}
+
+	if left.Fingerprint() != right.Fingerprint() {
+		t.Fatal("equivalent status snapshots should produce the same fingerprint")
+	}
+}
+
+func TestStatusUpdateFingerprint_DetectsTrackedDirChanges(t *testing.T) {
+	base := StatusUpdate{
+		StatusMap: map[string]GitFileState{
+			"src/main.go": GitModified,
+		},
+		TrackedSet: map[string]struct{}{
+			"src/main.go": {},
+		},
+		TrackedDirs: map[string]struct{}{
+			"src": {},
+		},
+	}
+	changed := StatusUpdate{
+		StatusMap: map[string]GitFileState{
+			"src/main.go": GitModified,
+		},
+		TrackedSet: map[string]struct{}{
+			"src/main.go":  {},
+			"pkg/extra.go": {},
+		},
+		TrackedDirs: map[string]struct{}{
+			"src": {},
+			"pkg": {},
+		},
+	}
+
+	if base.Fingerprint() == changed.Fingerprint() {
+		t.Fatal("different tracked snapshots should produce different fingerprints")
 	}
 }
 

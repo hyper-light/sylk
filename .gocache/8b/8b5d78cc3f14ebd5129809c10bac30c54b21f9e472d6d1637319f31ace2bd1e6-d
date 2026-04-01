@@ -1,7 +1,0 @@
-./bsi64.go
-./fastaggregation64.go
-./iterables64.go
-./parallel64.go
-./roaring64.go
-./roaringarray64.go
-./util.go

@@ -1,9 +1,0 @@
-./align.go
-./filelist.go
-./filepane.go
-./find.go
-./highlight.go
-./model.go
-./render.go
-./toolbar.go
-./types.go

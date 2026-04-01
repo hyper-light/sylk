@@ -66,6 +66,61 @@ type StatusUpdate struct {
 	TrackedDirs map[string]struct{}
 }
 
+// StatusFingerprint is an order-independent fingerprint of a full git status
+// snapshot. It is used for cheap change detection between refreshes.
+type StatusFingerprint struct {
+	statusLen   int
+	statusHash  uint64
+	trackedLen  int
+	trackedHash uint64
+	dirsLen     int
+	dirsHash    uint64
+}
+
+// Fingerprint returns an order-independent fingerprint for the full status
+// snapshot. Collisions are benign; they can only suppress one redundant update.
+func (u StatusUpdate) Fingerprint() StatusFingerprint {
+	return StatusFingerprint{
+		statusLen:   len(u.StatusMap),
+		statusHash:  statusMapHash(u.StatusMap),
+		trackedLen:  len(u.TrackedSet),
+		trackedHash: pathSetHash(u.TrackedSet),
+		dirsLen:     len(u.TrackedDirs),
+		dirsHash:    pathSetHash(u.TrackedDirs),
+	}
+}
+
+func statusMapHash(m map[string]GitFileState) uint64 {
+	var combined uint64
+	for path, state := range m {
+		combined ^= hashPath(path)
+		combined ^= uint64(state) * fnvPrime64
+	}
+	return combined
+}
+
+func pathSetHash(m map[string]struct{}) uint64 {
+	var combined uint64
+	for path := range m {
+		combined ^= hashPath(path)
+	}
+	return combined
+}
+
+func hashPath(path string) uint64 {
+	h := uint64(fnvBasis64)
+	for i := 0; i < len(path); i++ {
+		h ^= uint64(path[i])
+		h *= fnvPrime64
+	}
+	return h
+}
+
+const (
+	fnvBasis64 = 14695981039346656037
+	fnvPrime64 = 1099511628211
+)
+
 // =============================================================================
 // WorktreeStatus (go-git native)
 // =============================================================================

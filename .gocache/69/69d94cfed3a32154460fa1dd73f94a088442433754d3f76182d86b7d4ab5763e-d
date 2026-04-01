@@ -1,9 +1,0 @@
-./downloader.go
-./errors.go
-./grammar.go
-./manager.go
-./parser.go
-./queries.go
-./query.go
-./tool.go
-./tree.go

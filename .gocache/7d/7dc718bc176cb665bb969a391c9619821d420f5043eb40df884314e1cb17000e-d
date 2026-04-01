@@ -1,6 +1,0 @@
-./analyzer_en.go
-./plural_stemmer.go
-./possessive_filter_en.go
-./stemmer_en_snowball.go
-./stop_filter_en.go
-./stop_words_en.go

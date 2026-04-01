@@ -1,7 +1,0 @@
-./collection.go
-./document.go
-./git_document.go
-./llm_document.go
-./result.go
-./search_system.go
-./web_document.go

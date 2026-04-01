@@ -56,10 +56,10 @@ type StatusWatcher struct {
 	out     chan StatusUpdate
 	nudgeCh chan struct{}
 
-	engine    *StatusEngine     // stat-dirty engine, replaces direct client calls
-	fsw       *fsnotify.Watcher // .git/ internal watcher
-	wtWatcher *fsnotify.Watcher // working-tree directory watcher
-	stopOnce  sync.Once
+	engine     *StatusEngine     // stat-dirty engine, replaces direct client calls
+	fsw        *fsnotify.Watcher // .git/ internal watcher
+	wtWatcher  *fsnotify.Watcher // working-tree directory watcher
+	stopOnce   sync.Once
 	lastUpdate atomic.Pointer[StatusUpdate]
 }
 
@@ -251,11 +251,11 @@ func (w *StatusWatcher) loop(ctx context.Context) {
 	refreshDone := make(chan StatusUpdate, 1)
 	inFlight := false
 
-	// Change detection for adaptive backoff. Tracks fingerprints of
-	// the previous refresh result.
-	prevStatusLen   := -1
-	prevStatusHash  := uint64(0)
-	prevTrackedLen  := -1
+	// Change detection for adaptive backoff and duplicate suppression.
+	var (
+		prevFingerprint     StatusFingerprint
+		havePrevFingerprint bool
+	)
 
 	for {
 		select {
@@ -317,29 +317,25 @@ func (w *StatusWatcher) loop(ctx context.Context) {
 
 		case update := <-refreshDone:
 			inFlight = false
-			w.lastUpdate.Store(&update)
 
-			// Adaptive backoff: if this was a fallback-initiated refresh
-			// and neither StatusMap nor TrackedSet changed, double the
-			// fallback interval to reduce idle CPU.
-			curStatusLen := len(update.StatusMap)
-			curStatusHash := statusHash(update.StatusMap)
-			curTrackedLen := len(update.TrackedSet)
-			unchanged := curStatusLen == prevStatusLen &&
-				curStatusHash == prevStatusHash &&
-				curTrackedLen == prevTrackedLen
+			fingerprint := update.Fingerprint()
+			unchanged := havePrevFingerprint && fingerprint == prevFingerprint
 			if !fallbackFromEvent && unchanged {
 				fallbackInterval = min(fallbackInterval*2, statusFallbackMax)
 			} else {
 				fallbackInterval = statusFallbackBase
 			}
-			prevStatusLen = curStatusLen
-			prevStatusHash = curStatusHash
-			prevTrackedLen = curTrackedLen
+			prevFingerprint = fingerprint
+			havePrevFingerprint = true
 
 			// Re-arm fallback for the next cycle.
 			drainTimer(fallback)
 			fallback.Reset(fallbackInterval)
+
+			if unchanged {
+				continue
+			}
+			w.lastUpdate.Store(&update)
 
 			// Drop-oldest: if the channel is full, discard the stale value.
 			select {
@@ -446,29 +442,6 @@ func (w *StatusWatcher) watchNewRefDir(ev fsnotify.Event) {
 		return
 	}
 	_ = w.fsw.Add(ev.Name)
-}
-
-// statusHash computes an order-independent fingerprint of a status map.
-// Each entry is hashed independently (FNV-1a of path+state), then all
-// per-entry hashes are XOR'd together. XOR is commutative, so Go's
-// non-deterministic map iteration order does not affect the result.
-// Collisions are benign (they only delay backoff by one cycle).
-func statusHash(m map[string]GitFileState) uint64 {
-	const fnvBasis = 14695981039346656037
-	const fnvPrime = 1099511628211
-
-	var combined uint64
-	for path, state := range m {
-		h := uint64(fnvBasis)
-		for i := range len(path) {
-			h ^= uint64(path[i])
-			h *= fnvPrime
-		}
-		h ^= uint64(state)
-		h *= fnvPrime
-		combined ^= h
-	}
-	return combined
 }
 
 // =============================================================================

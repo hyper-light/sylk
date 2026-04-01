@@ -1,5 +1,0 @@
-./anthropic_oauth.go
-./google_codeassist.go
-./google_codeassist_trace.go
-./google_oauth.go
-./openai_chatgpt.go

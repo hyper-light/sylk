@@ -42,3 +42,4 @@ k8s_bench
 vendor/
 .env*
 wip/*
+.gocache

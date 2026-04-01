@@ -1,6 +1,0 @@
-./context_check_hook.go
-./designer_handoff.go
-./guide_handoff.go
-./handoff_archival.go
-./handoff_manager.go
-./orchestrator_handoff.go

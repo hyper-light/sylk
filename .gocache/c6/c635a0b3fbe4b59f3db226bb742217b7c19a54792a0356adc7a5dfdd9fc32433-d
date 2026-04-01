@@ -1,8 +1,0 @@
-./analysis.go
-./document.go
-./field.go
-./index.go
-./mapping.go
-./mapping_no_vectors.go
-./reflect.go
-./synonym.go

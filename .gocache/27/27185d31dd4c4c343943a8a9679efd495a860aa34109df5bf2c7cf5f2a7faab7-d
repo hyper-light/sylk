@@ -1,5 +1,0 @@
-./alphabet.go
-./dfa.go
-./levenshtein.go
-./levenshtein_nfa.go
-./parametric_dfa.go

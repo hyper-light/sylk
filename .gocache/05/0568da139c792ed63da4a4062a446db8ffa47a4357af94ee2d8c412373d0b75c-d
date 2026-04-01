@@ -1,8 +1,0 @@
-./cmdline.go
-./cursor.go
-./insert.go
-./mode.go
-./normal.go
-./operpending.go
-./replace.go
-./visual.go

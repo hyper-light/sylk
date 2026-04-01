@@ -1,4 +1,0 @@
-./hex.go
-./hex_amd64.go
-./hex_decode_amd64.s
-./hex_encode_amd64.s

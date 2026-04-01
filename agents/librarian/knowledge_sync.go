@@ -161,7 +161,7 @@ func (s *KnowledgeSyncService) loop(ctx context.Context) {
 	timerActive := s.cfg.InitialSync
 	pending := s.cfg.InitialSync
 	var (
-		lastFingerprint knowledgeSyncFingerprint
+		lastFingerprint git.StatusFingerprint
 		haveFingerprint bool
 	)
 
@@ -180,7 +180,7 @@ func (s *KnowledgeSyncService) loop(ctx context.Context) {
 				events = nil
 				continue
 			}
-			fingerprint := fingerprintKnowledgeSyncUpdate(update)
+			fingerprint := update.Fingerprint()
 			if haveFingerprint && fingerprint == lastFingerprint {
 				continue
 			}
@@ -305,60 +305,6 @@ func (s *KnowledgeSyncService) awaitFullPromotion(ctx context.Context, seq uint6
 		}
 	case <-ctx.Done():
 	}
-}
-
-type knowledgeSyncFingerprint struct {
-	statusLen   int
-	statusHash  uint64
-	trackedLen  int
-	trackedHash uint64
-	dirsLen     int
-	dirsHash    uint64
-}
-
-func fingerprintKnowledgeSyncUpdate(update git.StatusUpdate) knowledgeSyncFingerprint {
-	return knowledgeSyncFingerprint{
-		statusLen:   len(update.StatusMap),
-		statusHash:  knowledgeSyncStatusHash(update.StatusMap),
-		trackedLen:  len(update.TrackedSet),
-		trackedHash: knowledgeSyncSetHash(update.TrackedSet),
-		dirsLen:     len(update.TrackedDirs),
-		dirsHash:    knowledgeSyncSetHash(update.TrackedDirs),
-	}
-}
-
-func knowledgeSyncStatusHash(m map[string]git.GitFileState) uint64 {
-	const fnvBasis = 14695981039346656037
-	const fnvPrime = 1099511628211
-
-	var combined uint64
-	for path, state := range m {
-		h := uint64(fnvBasis)
-		for i := 0; i < len(path); i++ {
-			h ^= uint64(path[i])
-			h *= fnvPrime
-		}
-		h ^= uint64(state)
-		h *= fnvPrime
-		combined ^= h
-	}
-	return combined
-}
-
-func knowledgeSyncSetHash(m map[string]struct{}) uint64 {
-	const fnvBasis = 14695981039346656037
-	const fnvPrime = 1099511628211
-
-	var combined uint64
-	for path := range m {
-		h := uint64(fnvBasis)
-		for i := 0; i < len(path); i++ {
-			h ^= uint64(path[i])
-			h *= fnvPrime
-		}
-		combined ^= h
-	}
-	return combined
 }
 
 func bindKnowledgeSyncContext(scopeCtx context.Context, localCtx context.Context) (context.Context, func()) {

@@ -1,7 +1,0 @@
-./checkpoint.go
-./format.go
-./ledger.go
-./mailbox.go
-./snapshotter.go
-./types.go
-./wal.go
