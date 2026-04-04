@@ -20,11 +20,12 @@ func TestPipelineProtocolDurableProjectionAndMailbox(t *testing.T) {
 				},
 				ActiveAgents: []string{PipelineAgentTester},
 				PendingChallenge: &PipelineProtocolChallenge{
-					ID:              "challenge-validate",
-					RequestingAgent: PipelineAgentInspector,
-					TargetAgents:    []string{PipelineAgentTester},
-					Request:         "Validate the implementation.",
-					References:      []string{finalizePipelineVerificationReference},
+					ID:                "challenge-validate",
+					RequestingAgent:   PipelineAgentInspector,
+					RequestingAgentID: "inspector-runtime-1",
+					TargetAgents:      []string{PipelineAgentTester},
+					Request:           "Validate the implementation.",
+					References:        []string{finalizePipelineVerificationReference},
 				},
 			}),
 		},
@@ -54,9 +55,11 @@ func TestPipelineProtocolDurableProjectionAndMailbox(t *testing.T) {
 	if err := state.recordValidation(testerCtx, &PipelineValidationRecord{
 		ChallengeID:         "challenge-validate",
 		RequestingAgent:     PipelineAgentInspector,
+		RequestingAgentID:   "inspector-runtime-1",
 		RespondingAgent:     PipelineAgentTester,
-		Status:              string(PipelineValidationPassed),
-		Summary:             "Validation passed.",
+		RespondingAgentID:   "tester-runtime-1",
+		Status:              string(PipelineValidationPartial),
+		Summary:             "Validation is accepted, but the remaining execution caveat is environmental.",
 		ChallengeReferences: []string{finalizePipelineVerificationReference},
 		EvidenceRefs:        []string{"tests/auth_test.go"},
 	}); err != nil {
@@ -86,14 +89,21 @@ func TestPipelineProtocolDurableProjectionAndMailbox(t *testing.T) {
 		Validation: &PipelineValidationRecord{
 			ChallengeID:         "challenge-validate",
 			RequestingAgent:     PipelineAgentInspector,
+			RequestingAgentID:   "inspector-runtime-1",
 			RespondingAgent:     PipelineAgentTester,
-			Status:              string(PipelineValidationPassed),
-			Summary:             "Validation passed.",
+			RespondingAgentID:   "tester-runtime-1",
+			Status:              string(PipelineValidationPartial),
+			Summary:             "Validation is accepted, but the remaining execution caveat is environmental.",
 			ChallengeReferences: []string{finalizePipelineVerificationReference},
 			EvidenceRefs:        []string{"tests/auth_test.go"},
 		},
 	}); err != nil {
 		t.Fatalf("recordValidationProcessing() error = %v", err)
+	}
+	if snapshot := state.Snapshot(); snapshot == nil || snapshot.PendingValidation != nil {
+		t.Fatalf("snapshot pending_validation after processing = %#v, want nil", snapshot)
+	} else if snapshot.CurrentRequest != "Choose the next pipeline action after processing challenge challenge-validate." {
+		t.Fatalf("current_request after processing = %q", snapshot.CurrentRequest)
 	}
 
 	inspectorItems, err = inspectorMailbox.Pending(pipelineProtocolNamespace, task.TaskID)
@@ -166,8 +176,8 @@ func TestGlobalReviewDurableProjectionAndMailbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tester mailbox pending: %v", err)
 	}
-	if len(items) != 1 || items[0].Action != "validate_global_review" {
-		t.Fatalf("tester mailbox = %#v, want validate_global_review", items)
+	if len(items) != 1 || items[0].Action != "validate_work" {
+		t.Fatalf("tester mailbox = %#v, want validate_work", items)
 	}
 
 	if err := state.recordValidation(context.Background(), &GlobalReviewValidationRecord{

@@ -100,7 +100,7 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 				req.Messages = append(req.Messages, providers.Message{
 					Role: providers.RoleUser,
 					Content: err.Error() +
-						"\nUse the strict global review protocol now. If a validation response arrived, call process_global_validation before deciding whether to challenge the tester, challenge the orchestrator, challenge the architect, finalize the review, or commit to disk.",
+						"\nUse the global review protocol now. If a challenge response arrived, call process_validation before choosing challenge_agent, handoff_next, finalize_global_review, or commit_to_disk.",
 				})
 				requiredActionGraceTurns = agentShared.ExtendRequiredProtocolGrace(ctx, requiredActionGraceTurns)
 				continue
@@ -166,11 +166,10 @@ func (gi *GlobalInspector) applyToolCalls(
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
-	recoveryHints := make([]string, 0, 1)
 	rerouted := false
 	delegated := false
 	delegatedMessage := ""
-	for _, call := range resp.ToolCalls {
+	for idx, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
 		execCtx := agentShared.WithActiveToolCall(ctx, call)
@@ -195,9 +194,6 @@ func (gi *GlobalInspector) applyToolCalls(
 				if agentShared.ToolErrorCountsTowardAbort(err) {
 					errCount++
 				}
-				if hint := agentShared.ToolRecoveryHint(call.Name, err); hint != "" {
-					recoveryHints = append(recoveryHints, hint)
-				}
 				if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 					agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventSkillFailed,
 						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
@@ -220,11 +216,11 @@ func (gi *GlobalInspector) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
-		if rerouted || delegated {
+		if rerouted || delegated || agentShared.GlobalReviewTurnTerminated(ctx) {
+			agentShared.AppendSkippedToolResults(req, resp.ToolCalls[idx+1:], "a previous tool call in this assistant turn already completed or redirected the global review decision")
 			break
 		}
 	}
-	agentShared.AppendToolRecoveryMessage(req, recoveryHints)
 	return errCount, rerouted, delegated, delegatedMessage
 }
 

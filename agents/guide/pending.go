@@ -99,9 +99,7 @@ func (ps *PendingStore) Add(req *RouteRequest, classification *RouteResult, targ
 	}
 
 	if parentID := strings.TrimSpace(req.ParentCorrelationID); parentID != "" && !metadataPreservesSourceStreamTarget(req.Metadata) {
-		if parent := ps.pending[parentID]; parent != nil {
-			pending.StreamTargetOverride = inheritedPendingStreamTarget(parent)
-		}
+		pending.StreamTargetOverride = ps.inheritedStreamTargetOverrideLocked(parentID)
 	}
 
 	// Store by correlation ID
@@ -141,6 +139,26 @@ func inheritedPendingStreamTarget(pending *PendingRequest) string {
 	}
 	if target := strings.TrimSpace(pending.StreamTargetOverride); target != "" {
 		return target
+	}
+	return strings.TrimSpace(pending.SourceAgentID)
+}
+
+func (ps *PendingStore) inheritedStreamTargetOverrideLocked(correlationID string) string {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return ""
+	}
+	pending := ps.pending[correlationID]
+	if pending == nil {
+		return ""
+	}
+	if target := strings.TrimSpace(pending.StreamTargetOverride); target != "" {
+		return target
+	}
+	if pending.Request != nil {
+		if parentTarget := ps.inheritedStreamTargetOverrideLocked(strings.TrimSpace(pending.Request.ParentCorrelationID)); parentTarget != "" {
+			return parentTarget
+		}
 	}
 	return strings.TrimSpace(pending.SourceAgentID)
 }

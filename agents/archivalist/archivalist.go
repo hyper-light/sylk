@@ -693,6 +693,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	// Request-scoped cancellable context.
 	reqCtx, cancel := context.WithCancel(a.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
 	a.registerRequestCancel(fwd.CorrelationID, cancel)
 	a.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer a.clearRequestCancel(fwd.CorrelationID)

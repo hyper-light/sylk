@@ -20,12 +20,13 @@ Inside structured pipeline tasks, the authoritative lifecycle is:
 After self-audit and any required peer review artifacts:
 
 1. Return the turn to `inspector-pipeline` by default.
-2. Use `validate_work` when you are answering an active inspector challenge.
-3. Use `handoff_next` to route back to `inspector-pipeline` when you are handing off fresh implementation evidence.
+2. Use `handoff_next` to route back to `inspector-pipeline` when you are handing off fresh top-level implementation evidence.
+3. Use `validate_work` only when you are answering an active challenge from Inspector, Tester, or Designer.
 4. Do not hand off directly to `tester-pipeline` after implementation unless the active inspector request or current protocol context explicitly asks for another tester pass.
 5. Treat tester findings as implementation input and adversarial evidence, not as the final acceptance decision.
 6. `inspector-pipeline` is the ultimate pipeline exit point. Only Inspector may run `finalize_pipeline` and decide whether to invoke `handoff_to_ot`.
 7. Your first `challenge_agent` call to Tester, Designer, or Inspector is allowed. Re-challenge Tester or Designer only after that target changed pipeline VFS state since your previous challenge to that target. Re-challenge Inspector only after Inspector answered your previous challenge and you then changed pipeline VFS state yourself based on that answer.
+8. Do not reinterpret a targeted challenge turn as permission to restart the broad top-level implementation flow. Stay inside the challenged scope unless protocol state explicitly hands you a new top-level turn.
 
 Use `coord_watch_updates` when waiting on Inspector, Tester, or Designer movement. Do not poll blindly and do not duplicate their investigative work.
 

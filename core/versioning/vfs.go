@@ -32,6 +32,7 @@ type FileModification struct {
 	OriginalPath string
 	StagingPath  string
 	Operation    FileOp
+	Persistence  FilePersistence
 	Timestamp    time.Time
 	ContentHash  ContentHash
 	BaseVersion  VersionID
@@ -291,7 +292,7 @@ func (v *PipelineVFS) Write(ctx context.Context, path string, content []byte) er
 		return err
 	}
 
-	return v.stageWrite(absPath, content)
+	return v.stageWrite(ctx, absPath, content)
 }
 
 func (v *PipelineVFS) MkdirAll(ctx context.Context, path string) error {
@@ -309,7 +310,7 @@ func (v *PipelineVFS) MkdirAll(ctx context.Context, path string) error {
 	if err := v.checkWritePermission(ctx, absPath); err != nil {
 		return err
 	}
-	return v.stageMkdirAll(absPath)
+	return v.stageMkdirAll(ctx, absPath)
 }
 
 func (v *PipelineVFS) checkWritePrereqs() error {
@@ -329,7 +330,7 @@ func (v *PipelineVFS) checkWritePermission(ctx context.Context, path string) err
 	return v.config.PermChecker.CheckFileWrite(ctx, v.config.AgentID, v.config.AgentRole, path)
 }
 
-func (v *PipelineVFS) stageWrite(absPath string, content []byte) error {
+func (v *PipelineVFS) stageWrite(ctx context.Context, absPath string, content []byte) error {
 	prev := v.captureOverlayState(absPath)
 	op, oldContent := v.determineWriteOp(absPath)
 	baseVersion := v.getBaseVersion(absPath)
@@ -342,6 +343,7 @@ func (v *PipelineVFS) stageWrite(absPath string, content []byte) error {
 		OriginalPath: absPath,
 		StagingPath:  v.getStagingPath(absPath),
 		Operation:    op,
+		Persistence:  classifyWorkspaceMutation(ctx, v.config.WorkingDir, absPath, false),
 		Timestamp:    time.Now(),
 		ContentHash:  contentHash,
 		BaseVersion:  baseVersion,
@@ -426,7 +428,7 @@ func (v *PipelineVFS) getStagingPath(absPath string) string {
 	return filepath.Join(v.config.StagingDir, rel)
 }
 
-func (v *PipelineVFS) stageMkdirAll(absPath string) error {
+func (v *PipelineVFS) stageMkdirAll(ctx context.Context, absPath string) error {
 	segments := make([]string, 0, 8)
 	for current := absPath; current != "" && isUnderPath(current, v.config.WorkingDir); current = filepath.Dir(current) {
 		segments = append(segments, current)
@@ -455,6 +457,7 @@ func (v *PipelineVFS) stageMkdirAll(absPath string) error {
 		v.modifications[dirPath] = &FileModification{
 			OriginalPath: dirPath,
 			Operation:    FileOpMkdir,
+			Persistence:  classifyWorkspaceMutation(ctx, v.config.WorkingDir, dirPath, true),
 			Timestamp:    time.Now(),
 		}
 	}
@@ -478,7 +481,7 @@ func (v *PipelineVFS) Delete(ctx context.Context, path string) error {
 		return err
 	}
 
-	return v.stageDelete(absPath)
+	return v.stageDelete(ctx, absPath)
 }
 
 func (v *PipelineVFS) checkDeletePermission(ctx context.Context, path string) error {
@@ -488,7 +491,7 @@ func (v *PipelineVFS) checkDeletePermission(ctx context.Context, path string) er
 	return v.config.PermChecker.CheckFileDelete(ctx, v.config.AgentID, v.config.AgentRole, path)
 }
 
-func (v *PipelineVFS) stageDelete(absPath string) error {
+func (v *PipelineVFS) stageDelete(ctx context.Context, absPath string) error {
 	prev := v.captureOverlayState(absPath)
 	oldContent, err := v.getDeleteContent(absPath)
 	if err != nil {
@@ -502,6 +505,7 @@ func (v *PipelineVFS) stageDelete(absPath string) error {
 	v.modifications[absPath] = &FileModification{
 		OriginalPath: absPath,
 		Operation:    FileOpDelete,
+		Persistence:  classifyWorkspaceMutation(ctx, v.config.WorkingDir, absPath, false),
 		Timestamp:    time.Now(),
 		BaseVersion:  baseVersion,
 		OldContent:   oldContent,
@@ -1435,11 +1439,11 @@ func (tx *pipelineTx) Commit(ctx context.Context) error {
 		return ErrTransactionAborted
 	}
 
-	if err := tx.commitWrites(); err != nil {
+	if err := tx.commitWrites(ctx); err != nil {
 		return err
 	}
 
-	if err := tx.commitDeletes(); err != nil {
+	if err := tx.commitDeletes(ctx); err != nil {
 		return err
 	}
 
@@ -1447,18 +1451,18 @@ func (tx *pipelineTx) Commit(ctx context.Context) error {
 	return nil
 }
 
-func (tx *pipelineTx) commitWrites() error {
+func (tx *pipelineTx) commitWrites(ctx context.Context) error {
 	for path, content := range tx.staged {
-		if err := tx.vfs.stageWrite(path, content); err != nil {
+		if err := tx.vfs.stageWrite(ctx, path, content); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (tx *pipelineTx) commitDeletes() error {
+func (tx *pipelineTx) commitDeletes(ctx context.Context) error {
 	for path := range tx.deleted {
-		err := tx.vfs.stageDelete(path)
+		err := tx.vfs.stageDelete(ctx, path)
 		if err != nil && err != ErrFileNotFound {
 			return err
 		}

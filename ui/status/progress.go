@@ -132,6 +132,13 @@ func (pd *ProgressDisplay) IsAnimating() bool {
 	return pd.displayFrac != pd.targetFrac
 }
 
+// NeedsTick reports whether a decor tick is still required, either because
+// the display is animating toward its target or because a terminal done
+// state still needs expiry processing.
+func (pd *ProgressDisplay) NeedsTick() bool {
+	return pd.IsAnimating() || (pd.phase == PhaseDone && !pd.doneUntil.IsZero())
+}
+
 // Clear transitions to PhaseDone with a brief hold before hiding.
 func (pd *ProgressDisplay) Clear() {
 	pd.phase = PhaseDone

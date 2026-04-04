@@ -14,6 +14,7 @@ func (gt *GlobalTester) applyLLMRuntimeProfile(req *providers.Request, stageName
 		AgentID:   "tester",
 		SessionID: gt.config.SessionID,
 	})
+	req.DisableParallelToolUse = true
 }
 
 func (gt *GlobalTester) llmStageProfile(stageName string) llmruntime.StageProfile {

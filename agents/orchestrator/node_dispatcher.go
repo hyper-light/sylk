@@ -62,6 +62,8 @@ type BusNodeDispatcher struct {
 
 	// onACK is called when an agent ACKs a node dispatch. Optional.
 	onACK func(nodeID string, ack *ACKResult)
+	// onGuardReleased is called after the node's guard/pod lease is released.
+	onGuardReleased func(nodeID string)
 }
 
 // compile-time assertion
@@ -106,6 +108,11 @@ func (d *BusNodeDispatcher) SetExecutionHoldChecker(fn func(sessionID, dagID, no
 // SetACKCallback registers a function called on every successful ACK.
 func (d *BusNodeDispatcher) SetACKCallback(fn func(nodeID string, ack *ACKResult)) {
 	d.onACK = fn
+}
+
+// SetGuardReleasedCallback registers a function called after node guard release.
+func (d *BusNodeDispatcher) SetGuardReleasedCallback(fn func(nodeID string)) {
+	d.onGuardReleased = fn
 }
 
 // SetEventLogger installs the session JSONL logger for dispatch traces.
@@ -533,10 +540,16 @@ func (d *BusNodeDispatcher) ReleaseGuard(nodeID string) {
 		if resolved, ok := pod.(*shared.AgentPod); ok && resolved != nil {
 			resolved.ReleaseForNode(nodeID)
 		}
+		if d.onGuardReleased != nil {
+			d.onGuardReleased(nodeID)
+		}
 		return
 	}
 	if d.pod != nil {
 		d.pod.ReleaseForNode(nodeID)
+	}
+	if d.onGuardReleased != nil {
+		d.onGuardReleased(nodeID)
 	}
 }
 

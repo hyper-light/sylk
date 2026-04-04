@@ -82,10 +82,6 @@ func (a *Archivalist) requestConsultationWithMetadata(
 	if a.bus == nil || !a.running {
 		return archivalistFailedConsultEvidence(target, query, scope, "", fmt.Errorf("archivalist bus is unavailable")), fmt.Errorf("archivalist bus is unavailable")
 	}
-	if !a.isAgentRegistered(target) {
-		err := fmt.Errorf("agent %q is not registered", target)
-		return archivalistFailedConsultEvidence(target, query, scope, "", err), err
-	}
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		sessionID = versioning.SessionIDFromContext(ctx)
@@ -122,24 +118,6 @@ func archivalistResponseTopic(a *Archivalist) string {
 		agentID = strings.TrimSpace(a.id)
 	}
 	return guide.TopicResponses("archivalist", agentID)
-}
-
-func (a *Archivalist) isAgentRegistered(target string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(target))
-	if normalized == "" {
-		return false
-	}
-	a.knownAgentsMu.RLock()
-	defer a.knownAgentsMu.RUnlock()
-	for _, ann := range a.knownAgents {
-		if ann == nil {
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(ann.AgentID), normalized) || strings.EqualFold(strings.TrimSpace(ann.AgentType), normalized) {
-			return true
-		}
-	}
-	return false
 }
 
 func archivalistBuildConsultEvidence(

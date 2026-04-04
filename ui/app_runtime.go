@@ -6,11 +6,14 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/boot"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/ui/bridge"
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/editor/mode"
@@ -222,6 +225,11 @@ func (m *AppModel) panelGroup(id component.FocusID) layout.PanelGroup {
 }
 
 func (m *AppModel) leftSubPanelGroup() layout.PanelGroup {
+	if m.viewMode == ViewMemory {
+		return layout.PanelGroup{SubPanels: [][]component.FocusID{
+			{component.FocusSessionPanel},
+		}}
+	}
 	return layout.PanelGroup{SubPanels: [][]component.FocusID{
 		{component.FocusSessionPanel},
 		{component.FocusAgentPanel},
@@ -394,17 +402,41 @@ func (m *AppModel) startIndexProgressObserver(program bridge.TeaProgram) {
 		})
 	})
 
-	// Goroutine waits for partial readiness, then hooks background indexer.
-	_ = scope.Go("index-progress-observer", 0, func(bgCtx context.Context) error {
-		if err := ks.WaitForPartial(bgCtx); err != nil {
-			return nil
+	var (
+		waiterMu     sync.Mutex
+		waiterCancel context.CancelFunc
+		waiterSeq    atomic.Uint64
+	)
+
+	cancelActiveWaiter := func() {
+		waiterMu.Lock()
+		cancel := waiterCancel
+		waiterCancel = nil
+		waiterMu.Unlock()
+		if cancel != nil {
+			cancel()
 		}
-		bgWaiter := ks.BackgroundWaiter()
+	}
+
+	startWaiterWatch := func(bgWaiter knowledge.BackgroundIndexWaiter) {
+		cancelActiveWaiter()
 		if bgWaiter == nil {
-			return nil
+			return
+		}
+
+		seq := waiterSeq.Add(1)
+		if indexed, total := bgWaiter.Progress(); total > 0 {
+			program.Send(msg.IndexProgressMsg{
+				Phase:   int(status.PhaseIndex),
+				Current: indexed,
+				Total:   total,
+			})
 		}
 
 		bgWaiter.OnProgress(func(indexed, total int64) {
+			if waiterSeq.Load() != seq {
+				return
+			}
 			program.Send(msg.IndexProgressMsg{
 				Phase:   int(status.PhaseIndex),
 				Current: indexed,
@@ -412,12 +444,34 @@ func (m *AppModel) startIndexProgressObserver(program bridge.TeaProgram) {
 			})
 		})
 
-		select {
-		case <-bgWaiter.Ready():
+		waitCtx, cancel := context.WithCancel(context.Background())
+		waiterMu.Lock()
+		waiterCancel = cancel
+		waiterMu.Unlock()
+
+		_ = scope.Go("index-progress-ready", 0, func(scopeCtx context.Context) error {
+			defer cancel()
+			select {
+			case <-bgWaiter.Ready():
+				if scopeCtx.Err() != nil || waitCtx.Err() != nil || waiterSeq.Load() != seq {
+					return nil
+				}
+				program.Send(msg.IndexProgressMsg{Phase: int(status.PhaseDone), Done: true})
+			case <-waitCtx.Done():
+			case <-scopeCtx.Done():
+			}
+			return nil
+		})
+	}
+
+	ks.SetLifecycleObserver(func(event knowledge.LifecycleEvent) {
+		switch event.Kind {
+		case knowledge.LifecycleEventPartial:
+			startWaiterWatch(event.Waiter)
+		case knowledge.LifecycleEventFull:
+			cancelActiveWaiter()
 			program.Send(msg.IndexProgressMsg{Phase: int(status.PhaseDone), Done: true})
-		case <-bgCtx.Done():
 		}
-		return nil
 	})
 }
 
@@ -964,7 +1018,8 @@ func boolMask(ok bool) uint16 {
 func (m *AppModel) needsIdleDecorTick() bool {
 	return m.needsActiveDecorTick() ||
 		(m.agentPanel != nil && m.agentPanel.NeedsDecorTick()) ||
-		m.currentFocusGradient() != nil
+		m.currentFocusGradient() != nil ||
+		m.viewMode == ViewMemory
 }
 
 // needsDecorTick reports whether any decor effect is active at all.

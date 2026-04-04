@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	inspectorshared "github.com/adalundhe/sylk/agents/inspector/shared"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
@@ -37,14 +38,15 @@ func researchDependencyInstallSkill(gi *GlobalInspector) *skills.Skill {
 	}
 
 	return skills.NewSkill("research_dependency_install").
-		Description("Ask Academic to research concrete dependency or tool installation steps for missing audit or validation tooling.").
+		Description("Ask Academic to research concrete installation steps for missing non-test audit or validation tooling.").
 		Domain("audit").
 		Keywords("install", "dependency", "tooling", "academic", "linter", "type checker").
 		Priority(83).
-		Usage("Use when global validation or audit work is blocked by missing project tooling and you need concrete install steps before proceeding.").
-		Requirement("Provide the missing tool/package or the failing output that proves the dependency gap.").
-		Satisfies("Produces a concrete install plan that can be shown to the user and then executed through install_dependency_tooling using the existing approval dialogue.").
+		Usage("Use when global validation or audit work is blocked by missing non-test project tooling and you need concrete install steps before proceeding.").
+		Requirement("Provide the missing non-test tool/package or the failing output that proves the dependency gap.").
+		Satisfies("Produces a concrete install plan for non-test audit or validation tooling that can be shown to the user and then executed through install_dependency_tooling using the existing approval dialogue.").
 		Avoid("Do not guess install commands when Academic can infer the repository’s package manager and minimal steps first.").
+		Avoid("Do not use for pytest, vitest, jest, playwright, cypress, or any other test-execution tool; route that work to Tester so it can use `research_test_tool_install` and `install_test_tooling`.").
 		StringParam("missing_tool", "Missing executable or package if already known.", false).
 		StringParam("failure", "Error output showing the missing dependency or tool.", false).
 		StringParam("framework_id", "Detected framework or ecosystem identifier.", false).
@@ -56,6 +58,9 @@ func researchDependencyInstallSkill(gi *GlobalInspector) *skills.Skill {
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
+			if err := inspectorshared.InspectorRejectTestDependencyResearch(p.MissingTool, p.FrameworkID, p.RunCommand, p.Failure); err != nil {
+				return nil, err
+			}
 			return gi.researchDependencyInstall(ctx, p.MissingTool, p.Failure, p.FrameworkID, p.RunCommand, p.Files, p.TaskSpec)
 		}).
 		Build()
@@ -64,14 +69,14 @@ func researchDependencyInstallSkill(gi *GlobalInspector) *skills.Skill {
 func installDependencyToolingSkill(gi *GlobalInspector) *skills.Skill {
 	return agentshared.NewDependencyInstallExecutionSkill(agentshared.DependencyInstallSkillConfig{
 		SkillName:     "install_dependency_tooling",
-		Description:   "Execute an approved dependency install plan step-by-step using the existing command-approval dialogue.",
+		Description:   "Execute an approved dependency install plan step-by-step for non-test tooling using the existing command-approval dialogue.",
 		Domain:        "audit",
 		Keywords:      []string{"install", "dependency", "tooling", "approval", "package manager"},
 		Priority:      81,
-		Usage:         "Use after research_dependency_install once you have a concrete plan to show the user. Each command goes through the existing approval dialogue and executes against the real disk workspace.",
+		Usage:         "Use after research_dependency_install once you have a concrete plan to show the user for missing non-test tooling. Each command goes through the existing approval dialogue and executes against the real disk workspace.",
 		Requirement:   "Provide a concrete summary and a list of single install commands. Each step must be one command without chaining or shell control operators.",
-		Satisfies:     "Installs missing project tooling or dependencies to disk and captures command output plus optional validation evidence.",
-		Avoid:         "Do not use for speculative dependency changes or arbitrary shell work unrelated to unblocking the requested project tooling.",
+		Satisfies:     "Installs missing non-test project tooling or dependencies to disk and captures command output plus optional validation evidence.",
+		Avoid:         "Do not use for speculative dependency changes, arbitrary shell work unrelated to unblocking the requested project tooling, or test runners/harnesses/execution-only test tooling; route those to Tester so it can use `research_test_tool_install` and `install_test_tooling`.",
 		ResearchSkill: "research_dependency_install",
 		AgentType:     "inspector",
 		AgentID:       func() string { return gi.id },
@@ -80,6 +85,7 @@ func installDependencyToolingSkill(gi *GlobalInspector) *skills.Skill {
 		DefaultTimeout: func() time.Duration {
 			return gi.config.DefaultTimeout
 		},
+		ValidatePlan: inspectorshared.InspectorRejectTestDependencyInstallPlan,
 	})
 }
 
@@ -118,6 +124,7 @@ func (gi *GlobalInspector) installDependencyTooling(ctx context.Context, plan *g
 		SessionID:      func() string { return gi.config.SessionID },
 		WorkingDir:     gi.toolRunner.WorkingDir,
 		DefaultTimeout: func() time.Duration { return gi.config.DefaultTimeout },
+		ValidatePlan:   inspectorshared.InspectorRejectTestDependencyInstallPlan,
 	}, plan)
 }
 

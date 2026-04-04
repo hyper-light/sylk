@@ -56,6 +56,9 @@ func NewReadWorkspaceFileSkill(getViews WorkspaceViewAccessFunc, defaultPipeline
 				if errors.Is(err, ErrFileNotFound) || os.IsNotExist(err) {
 					return missingWorkspaceContent(params.Path, params.View, params.Offset, params.Limit), nil
 				}
+				if isUnavailableWorkspaceViewError(err) {
+					return unavailableWorkspaceContent(params.Path, params.View, params.Offset, params.Limit, err), nil
+				}
 				return nil, err
 			}
 			return sliceWorkspaceContent(params.Path, params.View, content, params.Offset, params.Limit), nil
@@ -95,6 +98,9 @@ func NewWorkspaceGlobSkill(getViews WorkspaceViewAccessFunc, defaultPipelineID D
 			}
 			matches, err := views.Glob(ctx, WorkspaceView(params.View), params.Path, params.Pattern, params.Exclude, resolveSkillPipelineID(params.PipelineID, defaultPipelineID))
 			if err != nil {
+				if isUnavailableWorkspaceViewError(err) {
+					return unavailableWorkspaceGlob(params.View, params.Pattern, err), nil
+				}
 				return nil, err
 			}
 			return map[string]any{
@@ -156,6 +162,9 @@ func NewWorkspaceGrepSkill(getViews WorkspaceViewAccessFunc, defaultPipelineID D
 				resolveSkillPipelineID(params.PipelineID, defaultPipelineID),
 			)
 			if err != nil {
+				if isUnavailableWorkspaceViewError(err) {
+					return unavailableWorkspaceGrep(params.View, params.Pattern, err), nil
+				}
 				return nil, err
 			}
 			return map[string]any{
@@ -296,4 +305,58 @@ func missingWorkspaceContent(path, view string, offset, limit int) map[string]an
 		"truncated":   false,
 		"reason":      "file not found in requested workspace view",
 	}
+}
+
+func unavailableWorkspaceContent(path, view string, offset, limit int, err error) map[string]any {
+	start := max(0, offset)
+	if limit <= 0 {
+		limit = 1000
+	}
+	return map[string]any{
+		"path":        path,
+		"view":        view,
+		"exists":      false,
+		"missing":     false,
+		"unavailable": true,
+		"content":     "",
+		"total_lines": 0,
+		"offset":      start,
+		"limit":       limit,
+		"truncated":   false,
+		"reason":      strings.TrimSpace(err.Error()),
+	}
+}
+
+func unavailableWorkspaceGlob(view, pattern string, err error) map[string]any {
+	return map[string]any{
+		"view":        view,
+		"pattern":     pattern,
+		"matches":     []string{},
+		"count":       0,
+		"unavailable": true,
+		"reason":      strings.TrimSpace(err.Error()),
+	}
+}
+
+func unavailableWorkspaceGrep(view, pattern string, err error) map[string]any {
+	return map[string]any{
+		"view":        view,
+		"pattern":     pattern,
+		"matches":     []GrepMatch{},
+		"count":       0,
+		"truncated":   false,
+		"unavailable": true,
+		"reason":      strings.TrimSpace(err.Error()),
+	}
+}
+
+func isUnavailableWorkspaceViewError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrVFSNotFound) {
+		return true
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(message, "workspace view") && strings.Contains(message, "unavailable")
 }

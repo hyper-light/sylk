@@ -794,6 +794,24 @@ func TestFormatToolDuration_SubMillisecondUsesLessThanOneMillisecond(t *testing.
 	}
 }
 
+func TestFormatToolCallDuration_InterAgentPendingUsesLiveElapsedAfterDispatchCompletion(t *testing.T) {
+	dispatchDuration := 100 * time.Millisecond
+	got := formatToolCallDuration(ToolCallRecord{
+		StartedAt: time.Now().Add(-1500 * time.Millisecond),
+		Duration:  dispatchDuration,
+		Completed: true,
+		InterAgent: &InterAgentTool{
+			Status: InterAgentToolPending,
+		},
+	})
+	if got == formatToolDuration(dispatchDuration) {
+		t.Fatalf("expected pending inter-agent duration to stay live after dispatch completion, got %q", got)
+	}
+	if got == "" {
+		t.Fatal("expected pending inter-agent duration to remain visible")
+	}
+}
+
 func TestRenderEntry_InterAgentChildRowsRenderSubMillisecondDurations(t *testing.T) {
 	entry := &ChatEntry{
 		ID:        "inter-agent-sub-ms-child",
@@ -839,6 +857,57 @@ func TestRenderEntry_InterAgentChildRowsRenderSubMillisecondDurations(t *testing
 	}
 	if strings.Contains(joined, "0ms") {
 		t.Fatalf("unexpected 0ms duration in nested child tool row: %q", joined)
+	}
+}
+
+func TestRenderEntry_DoneInterAgentParentWithPendingChildStillAdvancesSpinner(t *testing.T) {
+	prevSpinner := interAgentSpinnerIndex
+	interAgentSpinnerIndex = 0
+	defer func() {
+		interAgentSpinnerIndex = prevSpinner
+	}()
+
+	entry := &ChatEntry{
+		ID:        "inter-agent-done-parent-pending-child",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "inspector-pipeline",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "challenge_agent",
+				ToolCallKey: "challenge-1",
+				StartedAt:   time.Now().Add(-600 * time.Millisecond),
+				Completed:   true,
+				Success:     true,
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolChallenge,
+					AgentTypes: []string{"tester-pipeline"},
+					Summary:    "Prepare the pipeline tester handoff.",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "corr-pending-tester",
+							AgentType:     "tester-pipeline",
+							Completed:     false,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	firstLines, _ := RenderEntry(entry, 88, theme.DefaultDark(), nil)
+	secondLines, _ := RenderEntry(entry, 88, theme.DefaultDark(), nil)
+	first := strings.Join(firstLines, "\n")
+	second := strings.Join(secondLines, "\n")
+	if first == second {
+		t.Fatalf("expected spinner frame to advance for pending child under completed parent, got %q", first)
+	}
+	if !containsAny(first, interAgentSpinnerFrames[:]...) {
+		t.Fatalf("expected first render to contain an inter-agent spinner, got %q", first)
+	}
+	if !containsAny(second, interAgentSpinnerFrames[:]...) {
+		t.Fatalf("expected second render to contain an inter-agent spinner, got %q", second)
 	}
 }
 
@@ -1422,6 +1491,31 @@ func TestRenderStreamingEntryFull_PipelineStatusFooterRespectsViewportWidth(t *t
 	}
 }
 
+func TestRenderEntry_CompletedProgressOnlyEntryRetainsStatusSummary(t *testing.T) {
+	entry := &ChatEntry{
+		ID:              "inspector-progress-only-complete",
+		Timestamp:       time.Now(),
+		Source:          SourceAgent,
+		AgentType:       "inspector-pipeline",
+		AgentID:         "task_auth_checkout:inspector-pipeline",
+		TaskName:        "Auth checkout",
+		TaskSlug:        "auth-checkout",
+		Content:         "",
+		Streaming:       false,
+		ThinkingStatus:  "Validation accepted. Proceeding to closure gate.",
+		ThinkingElapsed: 3*time.Second + 400*time.Millisecond,
+	}
+
+	lines, _ := RenderEntry(entry, 88, theme.DefaultDark(), nil)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "thought for 3.4s") {
+		t.Fatalf("expected collapsed thinking summary, got %q", joined)
+	}
+	if !strings.Contains(joined, "Validation accepted. Proceeding to closure gate.") {
+		t.Fatalf("expected preserved progress-only status, got %q", joined)
+	}
+}
+
 func TestRenderEntry_KeepsParentContentVisibleWhileInterAgentChallengePending(t *testing.T) {
 	entry := &ChatEntry{
 		ID:        "architect-with-pending-challenge",
@@ -1447,8 +1541,8 @@ func TestRenderEntry_KeepsParentContentVisibleWhileInterAgentChallengePending(t 
 
 	lines, _ := RenderEntry(entry, 80, theme.DefaultDark(), nil)
 	joined := strings.Join(lines, "\n")
-	if strings.Contains(joined, "This should stay hidden until the challenge completes.") {
-		t.Fatalf("expected parent content to stay hidden while challenge is pending, got %q", joined)
+	if !strings.Contains(joined, "This should stay hidden until the challenge completes.") {
+		t.Fatalf("expected parent content to remain visible while challenge is pending, got %q", joined)
 	}
 	if !strings.Contains(joined, "Implement the accepted patch plan.") {
 		t.Fatalf("expected pending challenge row to remain visible, got %q", joined)
@@ -1490,8 +1584,8 @@ func TestRenderStreamingEntryFull_KeepsParentContentVisibleWhileInterAgentConsul
 
 	lines, _ := renderStreamingEntryFull(entry, 88, theme.DefaultDark(), nil, &streamRenderState{})
 	joined := strings.Join(lines, "\n")
-	if strings.Contains(joined, "The final audit summary should wait for the consult result.") {
-		t.Fatalf("expected parent streaming content to stay hidden while consult is pending, got %q", joined)
+	if !strings.Contains(joined, "The final audit summary should wait for the consult result.") {
+		t.Fatalf("expected parent streaming content to remain visible while consult is pending, got %q", joined)
 	}
 	if !strings.Contains(joined, "Compare current packaging guidance") {
 		t.Fatalf("expected consult row to remain visible, got %q", joined)
@@ -1508,7 +1602,7 @@ func TestRenderStreamingEntryFull_KeepsParentContentVisibleWhileInterAgentConsul
 	}
 }
 
-func TestRenderStreamingEntryFull_HidesParentContentWhileNestedChildPendingAfterApproval(t *testing.T) {
+func TestRenderStreamingEntryFull_KeepsParentContentVisibleWhileNestedChildPendingAfterApproval(t *testing.T) {
 	entry := &ChatEntry{
 		ID:             "architect-with-pending-academic-after-approval",
 		Timestamp:      time.Now(),
@@ -1516,8 +1610,8 @@ func TestRenderStreamingEntryFull_HidesParentContentWhileNestedChildPendingAfter
 		AgentType:      "architect",
 		Content:        "The architect should not speak yet.",
 		Streaming:      true,
-		ThinkingText:   deferredParentCompletionStatus,
-		ThinkingStatus: deferredParentCompletionStatus,
+		ThinkingText:   "⠋  0.5s",
+		ThinkingStatus: "Waiting on academic follow-up.",
 		ToolCalls: []ToolCallRecord{
 			{
 				ToolName:  "consult_academic_approach",
@@ -1556,14 +1650,14 @@ func TestRenderStreamingEntryFull_HidesParentContentWhileNestedChildPendingAfter
 
 	lines, _ := renderStreamingEntryFull(entry, 88, theme.DefaultDark(), nil, &streamRenderState{})
 	joined := strings.Join(lines, "\n")
-	if strings.Contains(joined, "The architect should not speak yet.") {
-		t.Fatalf("expected parent streaming content to stay hidden while academic child remains pending, got %q", joined)
+	if !strings.Contains(joined, "The architect should not speak yet.") {
+		t.Fatalf("expected parent streaming content to remain visible while academic child remains pending, got %q", joined)
 	}
 	if !strings.Contains(joined, "academic") || !strings.Contains(joined, "guardian") {
 		t.Fatalf("expected nested academic and guardian rows to remain visible, got %q", joined)
 	}
-	if !strings.Contains(joined, deferredParentCompletionStatus) {
-		t.Fatalf("expected deferred parent footer to remain visible, got %q", joined)
+	if !strings.Contains(joined, "Waiting on academic follow-up.") {
+		t.Fatalf("expected parent streaming footer to remain visible, got %q", joined)
 	}
 
 	entry.ToolCalls[0].InterAgent.Children[0].Completed = true
@@ -1574,7 +1668,7 @@ func TestRenderStreamingEntryFull_HidesParentContentWhileNestedChildPendingAfter
 	}
 }
 
-func TestRenderStreamingEntryFull_KeepsNestedConsultedAgentAndToolRowsVisibleWhileParentContentHidden(t *testing.T) {
+func TestRenderStreamingEntryFull_KeepsNestedConsultedAgentAndToolRowsVisibleAlongsideParentContent(t *testing.T) {
 	entry := &ChatEntry{
 		ID:             "architect-with-nested-consulted-agent-tools",
 		Timestamp:      time.Now(),
@@ -1582,8 +1676,8 @@ func TestRenderStreamingEntryFull_KeepsNestedConsultedAgentAndToolRowsVisibleWhi
 		AgentType:      "architect",
 		Content:        "The architect has draft text that must stay hidden until research settles.",
 		Streaming:      true,
-		ThinkingText:   deferredParentCompletionStatus,
-		ThinkingStatus: deferredParentCompletionStatus,
+		ThinkingText:   "⠋  0.7s",
+		ThinkingStatus: "Waiting on research details.",
 		ToolCalls: []ToolCallRecord{
 			{
 				ToolName:  "consult_academic_approach",
@@ -1638,16 +1732,17 @@ func TestRenderStreamingEntryFull_KeepsNestedConsultedAgentAndToolRowsVisibleWhi
 
 	lines, _ := renderStreamingEntryFull(entry, 100, theme.DefaultDark(), nil, &streamRenderState{})
 	joined := strings.Join(lines, "\n")
-	if strings.Contains(joined, "The architect has draft text that must stay hidden until research settles.") {
-		t.Fatalf("expected parent streaming content to stay hidden while nested consult work is active, got %q", joined)
+	if !strings.Contains(joined, "The architect has draft text that must stay hidden until research settles.") {
+		t.Fatalf("expected parent streaming content to remain visible while nested consult work is active, got %q", joined)
 	}
 	for _, needle := range []string{
+		"The architect has draft text that must stay hidden until research settles.",
 		"academic",
 		"librarian",
 		"Collect benchmark and methodology sources.",
 		"web_search",
 		"framework benchmark methodology",
-		deferredParentCompletionStatus,
+		"Waiting on research details.",
 	} {
 		if !strings.Contains(joined, needle) {
 			t.Fatalf("expected streaming nested consult render to contain %q, got %q", needle, joined)

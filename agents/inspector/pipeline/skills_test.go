@@ -157,6 +157,29 @@ func TestGradeTaskQualitySkill_AutoValidatesResolvedCurrentTask(t *testing.T) {
 	}
 }
 
+func TestDefaultQualityGates_DoNotAutoAddCoverageGate(t *testing.T) {
+	gates := defaultQualityGates("engineer", true)
+	for _, gate := range gates {
+		if gate.Name == "coverage_clean" || strings.EqualFold(gate.Metric, "coverage") {
+			t.Fatalf("default quality gates unexpectedly included coverage gate: %#v", gates)
+		}
+	}
+}
+
+func TestValidationToolPlan_DoesNotRunCoverageLocally(t *testing.T) {
+	plan := validationToolPlan("engineer", &shared.InspectorCriteria{
+		QualityGates: []shared.QualityGate{{
+			Name:      "coverage_clean",
+			Metric:    "coverage",
+			Operator:  ">=",
+			Threshold: 80,
+		}},
+	})
+	if containsName(plan, "check_coverage") {
+		t.Fatalf("validation tool plan unexpectedly includes check_coverage: %#v", plan)
+	}
+}
+
 func TestStageInstructions_InspectAvoidsValidationAndGradingTools(t *testing.T) {
 	instructions := stageInstructions(&agentShared.TaskExecutionContract{
 		Stage:             "inspect",
@@ -181,8 +204,11 @@ func TestStageInstructions_ImplementationPrefersSingleAuditCycle(t *testing.T) {
 	}, "execute")
 
 	for _, want := range []string{
-		"Prefer a single tester-backed audit cycle",
-		"`finalize_pipeline`",
+		"Audit the returned work yourself before choosing the next protocol step",
+		"`handoff_next` for ordinary phase progression and `challenge_agent` only when a specific returned deliverable is unclear",
+		"`process_validation` immediately before choosing any next handoff, challenge, or closure action",
+		"Do not use `finalize_pipeline` as a substitute for that targeted audit work",
+		"When you do call `finalize_pipeline`, pass the strongest criteria, implementation, test, and challenge evidence",
 		"Do not fan out into repeated audit or grading passes on unchanged workspace state",
 	} {
 		if !strings.Contains(instructions, want) {
@@ -203,7 +229,7 @@ func TestPipelineInspectorDefaultToolDefinitionsExcludeValidationAndGradeTools(t
 	})
 
 	names := toolDefinitionNames(pi.buildToolDefinitions())
-	for _, want := range []string{"search_skills", "define_criteria", "get_validation_status"} {
+	for _, want := range []string{"search_skills", "define_criteria", "get_validation_status", "process_validation", "finalize_pipeline"} {
 		if !containsName(names, want) {
 			t.Fatalf("tool definitions missing %q: %v", want, names)
 		}

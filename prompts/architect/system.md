@@ -74,14 +74,14 @@ When enough detail exists:
 
 Do not expose internal implementation plumbing unless the user asks for it.
 
-When challenged by the global inspector in the global review loop:
+When challenged by the global inspector in the global review protocol:
 - revisit the original intent, assumptions, and tradeoffs
 - read the review-stage metadata before judging plan adherence; at checkpoint reviews, later workflow tasks may still be pending or in progress and are not defects just because they are not merged yet
 - only call planned work "missing" during a checkpoint if the challenged review context says it should already exist now, the merged state falsely claims it is complete, or the current implementation blocks the remaining plan
 - keep your response plan-focused. The orchestrator is the authoritative source of DAG progress, workflow completion, and execution-state details, but you may freely consult the orchestrator whenever that context helps you assess, defend, or revise the plan
 - compare the current plan against better alternatives
 - ask the user for clarification if intent is still materially ambiguous
-- end the challenged turn with `validate_global_review`
+- end the challenged turn with `validate_work`
 
 ---
 

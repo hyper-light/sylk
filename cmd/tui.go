@@ -1109,6 +1109,15 @@ func registerPhase4Archivalist(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) 
 	return nil
 }
 
+func registerPhase4Academic(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) error {
+	academicAgent, err := extractAgent[*academic.Academic](phase1.containerReg, "academic")
+	if err != nil {
+		return nil
+	}
+	_ = registerAgentWithGuide(phase3.guide, academicAgent, "academic")
+	return nil
+}
+
 func startBootstrapPhase4(
 	phase1 *bootstrapPhase1,
 	phase2 bootstrapPhase2,
@@ -1197,7 +1206,9 @@ func startBootstrapPhase4(
 		schedulePhase4Activation(phase1, phase3, handoffReady, "archivalist", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
 			return registerPhase4Archivalist(phase1, phase3)
 		})
-		schedulePhase4Activation(phase1, phase3, handoffReady, "academic", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, nil)
+		schedulePhase4Activation(phase1, phase3, handoffReady, "academic", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
+			return registerPhase4Academic(phase1, phase3)
+		})
 	} else {
 		close(activationsDone)
 	}
@@ -1400,6 +1411,7 @@ func buildBootstrapDeps(
 		},
 		AgentModelStore: phase4.modelStore,
 		KnowledgeStore:  phase1.knowledgeStore,
+		Forest:          phase1.forest,
 	}
 }
 

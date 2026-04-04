@@ -257,6 +257,12 @@ func (s *SessionVFS) CommitPipeline(ctx context.Context, pipelineID string) (Sem
 	if err != nil {
 		return SemanticVersion{}, err
 	}
+	if len(mods) == 0 {
+		if rollbackErr := s.RollbackPipeline(pipelineID); rollbackErr != nil {
+			return SemanticVersion{}, rollbackErr
+		}
+		return s.CurrentVersion(), nil
+	}
 
 	// Merge outside of s.mu — the merge goroutine is independent.
 	ver, mergeErr := s.mergePipe.Merge(
@@ -307,7 +313,7 @@ func (s *SessionVFS) extractPipelineMods(pipelineID string) ([]FileModification,
 	if err != nil {
 		return nil, fmt.Errorf("session vfs: get pipeline: %w", err)
 	}
-	return pipelineVFS.GetModifications(), nil
+	return persistentFileModifications(pipelineVFS.GetModifications()), nil
 }
 
 // RollbackPipeline unregisters a pipeline from MergePipe (no merge) and closes it.

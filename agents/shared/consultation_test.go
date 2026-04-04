@@ -18,14 +18,15 @@ func TestDefaultConsultationTimeout_Value(t *testing.T) {
 	}
 }
 
-func TestConsultationInactivityTimeout_AcademicUsesResearchBudget(t *testing.T) {
+func TestConsultationInactivityTimeout_UsesUniformStartupBudget(t *testing.T) {
 	tests := []struct {
 		target string
 		want   time.Duration
 	}{
-		{target: "academic", want: DefaultResearchConsultationTimeout},
-		{target: "task_1:academic", want: DefaultResearchConsultationTimeout},
+		{target: "academic", want: DefaultConsultationTimeout},
+		{target: "task_1:academic", want: DefaultConsultationTimeout},
 		{target: "librarian", want: DefaultConsultationTimeout},
+		{target: "archivalist", want: DefaultConsultationTimeout},
 		{target: "", want: DefaultConsultationTimeout},
 	}
 

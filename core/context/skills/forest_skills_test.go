@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/adalundhe/sylk/core/forest"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 type mockForestService struct {
@@ -97,6 +98,34 @@ func TestForestRecallSkill(t *testing.T) {
 	}
 }
 
+func TestForestRecallSkillDefaultsScopeFromContext(t *testing.T) {
+	t.Parallel()
+
+	deps := &RetrievalDependencies{
+		Forest: &mockForestService{
+			retrieve: func(_ context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+				if query.SessionID != "sess-ctx" {
+					t.Fatalf("retrieve session_id = %q, want sess-ctx", query.SessionID)
+				}
+				if query.TaskID != "task-ctx" {
+					t.Fatalf("retrieve task_id = %q, want task-ctx", query.TaskID)
+				}
+				if query.Horizon != forest.CanopyHorizonTask {
+					t.Fatalf("retrieve horizon = %q, want %q", query.Horizon, forest.CanopyHorizonTask)
+				}
+				return []*forest.BranchPacket{}, nil
+			},
+		},
+	}
+
+	ctx := versioning.WithTaskID(versioning.WithSessionID(context.Background(), "sess-ctx"), "task-ctx")
+	skill := NewForestRecallSkill(deps)
+	input, _ := json.Marshal(ForestRecallInput{Query: "retry policy"})
+	if _, err := skill.Handler(ctx, input); err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+}
+
 func TestForestRecordOutcomeSkill(t *testing.T) {
 	t.Parallel()
 
@@ -125,5 +154,30 @@ func TestForestRecordOutcomeSkill(t *testing.T) {
 	}
 	if !result.(*ForestOutcomeOutput).Recorded {
 		t.Fatal("expected recorded=true")
+	}
+}
+
+func TestForestResolveIntentSkillDefaultsScopeFromContext(t *testing.T) {
+	t.Parallel()
+
+	deps := &RetrievalDependencies{
+		Forest: &mockForestService{
+			resolveIntent: func(_ context.Context, input forest.ResolveIntentInput) (*forest.IntentResolution, error) {
+				if input.SessionID != "sess-ctx" {
+					t.Fatalf("resolve session_id = %q, want sess-ctx", input.SessionID)
+				}
+				if input.TaskID != "task-ctx" {
+					t.Fatalf("resolve task_id = %q, want task-ctx", input.TaskID)
+				}
+				return &forest.IntentResolution{PrimaryIntent: "ctx intent"}, nil
+			},
+		},
+	}
+
+	ctx := versioning.WithTaskID(versioning.WithSessionID(context.Background(), "sess-ctx"), "task-ctx")
+	skill := NewForestResolveIntentSkill(deps)
+	input, _ := json.Marshal(forest.ResolveIntentInput{Query: "make retries safer"})
+	if _, err := skill.Handler(ctx, input); err != nil {
+		t.Fatalf("handler error: %v", err)
 	}
 }

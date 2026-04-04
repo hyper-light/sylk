@@ -178,6 +178,7 @@ func (m *MemoryForest) RecordOutcome(ctx context.Context, record OutcomeRecord) 
 
 	event := &Event{
 		SessionID:      firstNonEmpty(record.SessionID, branch.SessionID),
+		TaskID:         firstNonEmpty(record.TaskID, branch.TaskID),
 		AgentID:        record.AgentID,
 		AgentType:      record.AgentType,
 		EventType:      EventTypeOutcomeRecorded,
@@ -283,7 +284,7 @@ func (m *MemoryForest) projectEventTx(ctx context.Context, tx *sql.Tx, event *Ev
 	if err := upsertRelayEdgesTx(ctx, tx, event); err != nil {
 		return nil, false, time.Time{}, err
 	}
-	if err := refreshCanopiesTx(ctx, tx, event.SessionID, event.IntentID); err != nil {
+	if err := refreshCanopiesTx(ctx, tx, event.SessionID, event.TaskID, event.IntentID); err != nil {
 		return nil, false, time.Time{}, err
 	}
 	replayDue, err := m.enqueueReplayTx(ctx, tx, branch, event)
@@ -308,6 +309,7 @@ func prepareEvent(event *Event) *Event {
 	if event.SessionID == "" {
 		event.SessionID = "global"
 	}
+	event.TaskID = normalizeForestTaskID(firstNonEmpty(event.TaskID, forestTaskIDFromPayload(event.Payload)))
 	if event.Scope == "" {
 		event.Scope = ScopeEpisodic
 	}
@@ -323,18 +325,19 @@ func prepareEvent(event *Event) *Event {
 		event.Title = summarizeText(event.Summary, 72)
 	}
 	if event.IntentID == "" {
-		event.IntentID = stableID("intent", event.SessionID, normalizeText(firstNonEmpty(event.Title, event.Summary, event.BranchID)))
+		event.IntentID = stableID("intent", event.SessionID, event.TaskID, normalizeText(firstNonEmpty(event.Title, event.Summary, event.BranchID)))
 	}
 	if event.RootID == "" {
-		event.RootID = stableID("root", event.SessionID, event.IntentID, string(event.Family))
+		event.RootID = stableID("root", event.SessionID, event.TaskID, event.IntentID, string(event.Family))
 	}
 	if event.BranchID == "" {
-		event.BranchID = stableID("branch", event.RootID, normalizeText(firstNonEmpty(event.Title, event.Summary)), event.AgentType)
+		event.BranchID = stableID("branch", event.RootID, event.TaskID, normalizeText(firstNonEmpty(event.Title, event.Summary)), event.AgentType)
 	}
 	if event.ID == "" {
 		event.ID = stableID(
 			"event",
 			event.SessionID,
+			event.TaskID,
 			event.BranchID,
 			string(event.EventType),
 			event.Timestamp.UTC().Format(time.RFC3339Nano),
@@ -355,13 +358,15 @@ func eventFromContent(entry *ctxpkg.ContentEntry) *Event {
 
 	family := familyFromContentEntry(entry)
 	scope := scopeFromContentEntry(entry, family)
-	intentID := firstNonEmpty(entry.IntentID, stableID("intent", entry.SessionID, normalizeText(entry.Content)))
-	rootID := stableID("root", firstNonEmpty(entry.SessionID, "global"), intentID, string(family))
-	branchID := firstNonEmpty(entry.BranchID, stableID("branch", rootID, entry.ParentID, entry.AgentType, fmt.Sprintf("%d", entry.TurnNumber)))
+	taskID := forestTaskIDFromStringMetadata(entry.Metadata)
+	intentID := firstNonEmpty(entry.IntentID, stableID("intent", entry.SessionID, taskID, normalizeText(entry.Content)))
+	rootID := stableID("root", firstNonEmpty(entry.SessionID, "global"), taskID, intentID, string(family))
+	branchID := firstNonEmpty(entry.BranchID, stableID("branch", rootID, taskID, entry.ParentID, entry.AgentType, fmt.Sprintf("%d", entry.TurnNumber)))
 	eventType := eventTypeFromContentType(entry.ContentType)
 
 	return prepareEvent(&Event{
 		SessionID:      entry.SessionID,
+		TaskID:         taskID,
 		AgentID:        entry.AgentID,
 		AgentType:      entry.AgentType,
 		EventType:      eventType,
@@ -490,6 +495,7 @@ func applyEvent(branch *Branch, event *Event) *Branch {
 			Scope:      event.Scope,
 			State:      BranchStateActive,
 			SessionID:  event.SessionID,
+			TaskID:     event.TaskID,
 			AgentID:    event.AgentID,
 			AgentType:  event.AgentType,
 			IntentID:   event.IntentID,
@@ -509,6 +515,7 @@ func applyEvent(branch *Branch, event *Event) *Branch {
 	branch.Family = nonEmptyFamily(branch.Family, event.Family)
 	branch.Scope = nonEmptyScope(branch.Scope, event.Scope)
 	branch.SessionID = firstNonEmpty(branch.SessionID, event.SessionID)
+	branch.TaskID = firstNonEmpty(branch.TaskID, event.TaskID)
 	branch.AgentID = firstNonEmpty(branch.AgentID, event.AgentID)
 	branch.AgentType = firstNonEmpty(branch.AgentType, event.AgentType)
 	branch.IntentID = firstNonEmpty(branch.IntentID, event.IntentID)
@@ -610,11 +617,11 @@ func computeSuccessRate(branch *Branch) float64 {
 func insertEventTx(ctx context.Context, tx *sql.Tx, event *Event) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT OR REPLACE INTO forest_events
-		(id, session_id, agent_id, agent_type, event_type, family, scope, root_id, branch_id,
+		(id, session_id, task_id, agent_id, agent_type, event_type, family, scope, root_id, branch_id,
 		 parent_branch_id, intent_id, content_id, source_id, confidence, salience, timestamp,
 		 title, summary, provenance_refs, supersedes, contradicts, related_branch_ids, payload)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, event.ID, event.SessionID, event.AgentID, event.AgentType, string(event.EventType), string(event.Family),
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, event.ID, event.SessionID, nullStringValue(event.TaskID), event.AgentID, event.AgentType, string(event.EventType), string(event.Family),
 		string(event.Scope), event.RootID, event.BranchID, nullStringValue(event.ParentBranchID), nullStringValue(event.IntentID),
 		nullStringValue(event.ContentID), nullStringValue(event.SourceID), event.Confidence, event.Salience,
 		event.Timestamp.Unix(), event.Title, event.Summary, marshalJSON(event.ProvenanceRefs), marshalJSON(event.Supersedes),
@@ -627,7 +634,7 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event *Event) error {
 
 func getBranchTx(ctx context.Context, tx *sql.Tx, branchID string) (*Branch, error) {
 	row := tx.QueryRowContext(ctx, `
-		SELECT id, root_id, parent_id, family, scope, state, session_id, agent_id, agent_type,
+		SELECT id, root_id, parent_id, family, scope, state, session_id, task_id, agent_id, agent_type,
 		       intent_id, title, summary, confidence, salience, utility, success_rate,
 		       scope_risk, conflict_score, support_count, counter_count, success_count,
 		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata
@@ -639,7 +646,7 @@ func getBranchTx(ctx context.Context, tx *sql.Tx, branchID string) (*Branch, err
 
 func (m *MemoryForest) getBranch(ctx context.Context, branchID string) (*Branch, error) {
 	row := m.db.QueryRowContext(ctx, `
-		SELECT id, root_id, parent_id, family, scope, state, session_id, agent_id, agent_type,
+		SELECT id, root_id, parent_id, family, scope, state, session_id, task_id, agent_id, agent_type,
 		       intent_id, title, summary, confidence, salience, utility, success_rate,
 		       scope_risk, conflict_score, support_count, counter_count, success_count,
 		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata
@@ -653,6 +660,7 @@ func scanBranch(row rowScanner) (*Branch, error) {
 	var (
 		branch         Branch
 		parentID       sql.NullString
+		taskID         sql.NullString
 		agentID        sql.NullString
 		agentType      sql.NullString
 		intentID       sql.NullString
@@ -663,7 +671,7 @@ func scanBranch(row rowScanner) (*Branch, error) {
 	)
 	err := row.Scan(
 		&branch.ID, &branch.RootID, &parentID, &branch.Family, &branch.Scope, &branch.State,
-		&branch.SessionID, &agentID, &agentType, &intentID, &branch.Title, &branch.Summary,
+		&branch.SessionID, &taskID, &agentID, &agentType, &intentID, &branch.Title, &branch.Summary,
 		&branch.Confidence, &branch.Salience, &branch.Utility, &branch.SuccessRate, &branch.ScopeRisk,
 		&branch.ConflictScore, &branch.SupportCount, &branch.CounterCount, &branch.SuccessCount,
 		&branch.FailureCount, &branch.AccessCount, &lastAccessedAt, &createdAt, &updatedAt, &metadataRaw,
@@ -675,6 +683,7 @@ func scanBranch(row rowScanner) (*Branch, error) {
 		return nil, fmt.Errorf("scan branch: %w", err)
 	}
 	branch.ParentID = parentID.String
+	branch.TaskID = taskID.String
 	branch.AgentID = agentID.String
 	branch.AgentType = agentType.String
 	branch.IntentID = intentID.String
@@ -696,11 +705,11 @@ type rowScanner interface {
 func upsertBranchTx(ctx context.Context, tx *sql.Tx, branch *Branch) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO forest_branches
-		(id, root_id, parent_id, family, scope, state, session_id, agent_id, agent_type,
+		(id, root_id, parent_id, family, scope, state, session_id, task_id, agent_id, agent_type,
 		 intent_id, title, summary, confidence, salience, utility, success_rate, scope_risk,
 		 conflict_score, support_count, counter_count, success_count, failure_count,
 		 access_count, last_accessed_at, created_at, updated_at, metadata)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			root_id = excluded.root_id,
 			parent_id = excluded.parent_id,
@@ -708,6 +717,7 @@ func upsertBranchTx(ctx context.Context, tx *sql.Tx, branch *Branch) error {
 			scope = excluded.scope,
 			state = excluded.state,
 			session_id = excluded.session_id,
+			task_id = excluded.task_id,
 			agent_id = excluded.agent_id,
 			agent_type = excluded.agent_type,
 			intent_id = excluded.intent_id,
@@ -728,7 +738,7 @@ func upsertBranchTx(ctx context.Context, tx *sql.Tx, branch *Branch) error {
 			updated_at = excluded.updated_at,
 			metadata = excluded.metadata
 	`, branch.ID, branch.RootID, nullStringValue(branch.ParentID), string(branch.Family), string(branch.Scope),
-		string(branch.State), branch.SessionID, nullStringValue(branch.AgentID), nullStringValue(branch.AgentType),
+		string(branch.State), branch.SessionID, nullStringValue(branch.TaskID), nullStringValue(branch.AgentID), nullStringValue(branch.AgentType),
 		nullStringValue(branch.IntentID), branch.Title, branch.Summary, branch.Confidence, branch.Salience, branch.Utility,
 		branch.SuccessRate, branch.ScopeRisk, branch.ConflictScore, branch.SupportCount, branch.CounterCount,
 		branch.SuccessCount, branch.FailureCount, branch.AccessCount, branch.LastAccessedAt.Unix(), branch.CreatedAt.Unix(),
@@ -780,10 +790,11 @@ type relayUpdate struct {
 	Weight   float64
 }
 
-func refreshCanopiesTx(ctx context.Context, tx *sql.Tx, sessionID, intentID string) error {
+func refreshCanopiesTx(ctx context.Context, tx *sql.Tx, sessionID, taskID, intentID string) error {
 	if sessionID == "" {
 		sessionID = "global"
 	}
+	taskID = normalizeForestTaskID(taskID)
 	sessionRoots, err := topRootsTx(ctx, tx, `
 		SELECT root_id
 		FROM forest_branches
@@ -795,16 +806,38 @@ func refreshCanopiesTx(ctx context.Context, tx *sql.Tx, sessionID, intentID stri
 	if err != nil {
 		return err
 	}
-	if err := upsertCanopyTx(ctx, tx, Canopy{
-		Key:       canopyKey(CanopyHorizonSession, sessionID, intentID),
+	if err := upsertCanopyVariantsTx(ctx, tx, Canopy{
 		SessionID: sessionID,
-		IntentID:  intentID,
 		Horizon:   CanopyHorizonSession,
 		RootIDs:   sessionRoots,
 		Summary:   summarizeText(strings.Join(sessionRoots, " "), 160),
 		UpdatedAt: time.Now().UTC(),
-	}); err != nil {
+	}, intentID); err != nil {
 		return err
+	}
+
+	if taskID != "" {
+		taskRoots, err := topRootsTx(ctx, tx, `
+			SELECT root_id
+			FROM forest_branches
+			WHERE session_id = ? AND task_id = ? AND state != ?
+			GROUP BY root_id
+			ORDER BY MAX(salience) DESC, MAX(updated_at) DESC
+			LIMIT 8
+		`, sessionID, taskID, string(BranchStateDormant))
+		if err != nil {
+			return err
+		}
+		if err := upsertCanopyVariantsTx(ctx, tx, Canopy{
+			SessionID: sessionID,
+			TaskID:    taskID,
+			Horizon:   CanopyHorizonTask,
+			RootIDs:   taskRoots,
+			Summary:   summarizeText(strings.Join(taskRoots, " "), 160),
+			UpdatedAt: time.Now().UTC(),
+		}, intentID); err != nil {
+			return err
+		}
 	}
 
 	projectRoots, err := topRootsTx(ctx, tx, `
@@ -819,12 +852,26 @@ func refreshCanopiesTx(ctx context.Context, tx *sql.Tx, sessionID, intentID stri
 		return err
 	}
 	return upsertCanopyTx(ctx, tx, Canopy{
-		Key:       canopyKey(CanopyHorizonProject, "", ""),
 		Horizon:   CanopyHorizonProject,
 		RootIDs:   projectRoots,
 		Summary:   summarizeText(strings.Join(projectRoots, " "), 160),
 		UpdatedAt: time.Now().UTC(),
 	})
+}
+
+func upsertCanopyVariantsTx(ctx context.Context, tx *sql.Tx, canopy Canopy, intentID string) error {
+	canopy.IntentID = ""
+	canopy.Key = canopyKey(canopy.Horizon, canopy.SessionID, canopy.TaskID, "")
+	if err := upsertCanopyTx(ctx, tx, canopy); err != nil {
+		return err
+	}
+	intentID = strings.TrimSpace(intentID)
+	if intentID == "" {
+		return nil
+	}
+	canopy.IntentID = intentID
+	canopy.Key = canopyKey(canopy.Horizon, canopy.SessionID, canopy.TaskID, intentID)
+	return upsertCanopyTx(ctx, tx, canopy)
 }
 
 func topRootsTx(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]string, error) {
@@ -847,13 +894,13 @@ func topRootsTx(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]s
 
 func upsertCanopyTx(ctx context.Context, tx *sql.Tx, canopy Canopy) error {
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO forest_canopies (canopy_key, session_id, intent_id, horizon, root_ids, summary, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO forest_canopies (canopy_key, session_id, task_id, intent_id, horizon, root_ids, summary, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(canopy_key) DO UPDATE SET
 			root_ids = excluded.root_ids,
 			summary = excluded.summary,
 			updated_at = excluded.updated_at
-	`, canopy.Key, nullStringValue(canopy.SessionID), nullStringValue(canopy.IntentID), string(canopy.Horizon),
+	`, canopy.Key, nullStringValue(canopy.SessionID), nullStringValue(canopy.TaskID), nullStringValue(canopy.IntentID), string(canopy.Horizon),
 		marshalJSON(canopy.RootIDs), canopy.Summary, canopy.UpdatedAt.Unix())
 	if err != nil {
 		return fmt.Errorf("upsert canopy: %w", err)
@@ -1006,7 +1053,7 @@ func (m *MemoryForest) replayBranch(ctx context.Context, queueID int64, branchID
 	promoted := false
 	if branch.Scope == ScopeEpisodic || branch.Scope == ScopeWorking {
 		now := time.Now().UTC()
-		semanticID := stableID("semantic", branch.RootID, normalizeText(branch.Title))
+		semanticID := stableID("semantic", branch.RootID, branch.TaskID, normalizeText(branch.Title))
 		semanticBranch := &Branch{
 			ID:             semanticID,
 			RootID:         branch.RootID,
@@ -1015,6 +1062,7 @@ func (m *MemoryForest) replayBranch(ctx context.Context, queueID int64, branchID
 			Scope:          ScopeSemantic,
 			State:          BranchStateActive,
 			SessionID:      branch.SessionID,
+			TaskID:         branch.TaskID,
 			AgentID:        branch.AgentID,
 			AgentType:      branch.AgentType,
 			IntentID:       firstNonEmpty(branch.IntentID, rootID),
@@ -1058,7 +1106,7 @@ func (m *MemoryForest) replayBranch(ctx context.Context, queueID int64, branchID
 		}); err != nil {
 			return false, "", err
 		}
-		if err := refreshCanopiesTx(ctx, tx, branch.SessionID, semanticBranch.IntentID); err != nil {
+		if err := refreshCanopiesTx(ctx, tx, branch.SessionID, branch.TaskID, semanticBranch.IntentID); err != nil {
 			return false, "", err
 		}
 		if err := markSubstrateDirtyTx(ctx, tx, branch.SessionID, now); err != nil {
@@ -1201,4 +1249,17 @@ func nullStringValue(value string) any {
 		return nil
 	}
 	return value
+}
+
+func forestTaskIDFromPayload(payload map[string]any) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	if taskID := forestTaskIDFromAny(payload["task_id"]); taskID != "" {
+		return taskID
+	}
+	if metadata, ok := payload["metadata"].(map[string]any); ok {
+		return forestTaskIDFromAnyMetadata(metadata)
+	}
+	return ""
 }

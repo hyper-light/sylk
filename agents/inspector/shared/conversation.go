@@ -106,7 +106,7 @@ func formatIssueSummary(state *InspectorState, issues []ValidationIssue) string 
 
 func inspectorCapabilities() string {
 	return "Inspector agent: code quality validation, lint checks, type checks, " +
-		"security scans, coverage analysis, complexity analysis, race detection, " +
-		"deadlock detection, memory leak analysis. Operates in pipeline (per-task) " +
+		"security scans, complexity analysis, deadlock detection, memory leak analysis, " +
+		"and tester-backed validation review. Operates in pipeline (per-task) " +
 		"and global (cross-file audit) modes."
 }

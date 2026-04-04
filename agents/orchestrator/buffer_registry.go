@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -324,6 +325,31 @@ func (r *BufferRegistry) runGC() {
 		}
 		r.cache.Del("latest:" + taskID)
 	}
+}
+
+// ReleaseTask flushes and evicts a single task buffer immediately.
+func (r *BufferRegistry) ReleaseTask(taskID string) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return
+	}
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	buf := r.buffers[taskID]
+	delete(r.buffers, taskID)
+	r.mu.Unlock()
+
+	if buf != nil {
+		entries := buf.flush()
+		if len(entries) > 0 && r.store != nil {
+			r.store.InsertTaskUpdates(entries)
+		}
+	}
+	r.cache.Del("latest:" + taskID)
 }
 
 // Close flushes all hot buffers to SQLite and closes Ristretto.

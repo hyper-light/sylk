@@ -7,6 +7,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/steering"
 )
 
 type streamingWatchdogProvider struct {
@@ -149,6 +150,52 @@ func TestCompleteWithWatchdog_FallsBackOnlyWhenStreamNeverStarts(t *testing.T) {
 	}
 	if resp == nil || resp.Content != "fallback" {
 		t.Fatalf("unexpected fallback response: %#v", resp)
+	}
+}
+
+type gatedWatchdogProvider struct {
+	started chan struct{}
+}
+
+func (p *gatedWatchdogProvider) Complete(_ context.Context, _ *providers.Request) (*providers.Response, error) {
+	p.started <- struct{}{}
+	return &providers.Response{Content: "ok"}, nil
+}
+
+func TestCompleteWithWatchdog_WaitsWhilePaused(t *testing.T) {
+	ledger := steering.NewSteeringLedger("corr-paused-llm", "engineer", "sess", nil, nil)
+	ledger.SetPace(steering.PacePaused)
+	ctx := WithSteeringLedger(context.Background(), ledger)
+
+	provider := &gatedWatchdogProvider{started: make(chan struct{}, 1)}
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := CompleteWithWatchdog(ctx, provider, &providers.Request{Model: "gpt-5.4-pro"}, AgentDisplayName("engineer"))
+		done <- err
+	}()
+
+	select {
+	case <-provider.started:
+		t.Fatal("provider started while paused")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	ledger.SetPace(steering.PaceAuto)
+
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not start after resume")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("CompleteWithWatchdog returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CompleteWithWatchdog did not finish after resume")
 	}
 }
 

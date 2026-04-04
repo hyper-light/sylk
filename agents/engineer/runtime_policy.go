@@ -14,6 +14,7 @@ func (e *Engineer) applyLLMRuntimeProfile(req *providers.Request, stageName stri
 		AgentID:   "engineer",
 		SessionID: e.config.SessionID,
 	})
+	req.DisableParallelToolUse = true
 }
 
 func (e *Engineer) llmStageProfile(stageName string) llmruntime.StageProfile {

@@ -178,7 +178,7 @@ func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToOT(t *testing.T) {
 	}
 }
 
-func TestHandle_PromptsImmediateHandoffToOTAfterFinalizePipelineReady(t *testing.T) {
+func TestHandle_UsesFinalizePipelineToolResultToDriveImmediateHandoffToOT(t *testing.T) {
 	sessionDir := t.TempDir()
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
@@ -207,21 +207,27 @@ func TestHandle_PromptsImmediateHandoffToOTAfterFinalizePipelineReady(t *testing
 			},
 		},
 		requestInspect: map[int]func(*providers.Request) error{
+			0: func(req *providers.Request) error {
+				if req == nil {
+					return fmt.Errorf("request is nil")
+				}
+				if !req.DisableParallelToolUse {
+					return fmt.Errorf("DisableParallelToolUse = false, want true")
+				}
+				return nil
+			},
 			1: func(req *providers.Request) error {
 				if req == nil {
 					return fmt.Errorf("request is nil")
 				}
-				for i := len(req.Messages) - 1; i >= 0; i-- {
-					msg := req.Messages[i]
-					if msg.Role != providers.RoleUser {
-						continue
-					}
-					if strings.Contains(msg.Content, "Your very next tool call in this turn must be `handoff_to_ot`") {
-						return nil
-					}
-					return fmt.Errorf("latest user follow-up = %q, want immediate handoff_to_ot instruction", msg.Content)
+				last := req.Messages[len(req.Messages)-1]
+				if last.Role != providers.RoleTool {
+					return fmt.Errorf("last message role = %q, want tool", last.Role)
 				}
-				return fmt.Errorf("no user follow-up message found before second provider call")
+				if !strings.Contains(last.Content, "handoff_to_ot") {
+					return fmt.Errorf("last tool result = %q, want handoff_to_ot guidance", last.Content)
+				}
+				return nil
 			},
 		},
 	}
@@ -283,5 +289,150 @@ func TestHandle_PromptsImmediateHandoffToOTAfterFinalizePipelineReady(t *testing
 
 	if provider.calls != 2 {
 		t.Fatalf("provider calls = %d, want 2", provider.calls)
+	}
+}
+
+func TestHandle_PostValidationAuditContinuesFromToolResultsWithoutInjectedUserPrompts(t *testing.T) {
+	sessionDir := t.TempDir()
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	provider := &scriptedPipelineProvider{
+		responses: []*providers.Response{
+			{
+				ToolCalls: []providers.ToolCall{{
+					ID:   "tool-process",
+					Name: "process_validation",
+					Arguments: `{
+						"challenge_id":"challenge-post-validation",
+						"decision":"accept",
+						"summary":"Accepted tester validation and will perform a direct audit before closure."
+					}`,
+				}},
+			},
+			{
+				ToolCalls: []providers.ToolCall{{
+					ID:        "tool-inspect",
+					Name:      "inspect_workspace_state",
+					Arguments: `{"path":"examples/hello-py/pyproject.toml"}`,
+				}},
+			},
+			{
+				ToolCalls: []providers.ToolCall{{
+					ID:   "tool-finalize",
+					Name: "finalize_pipeline",
+					Arguments: `{
+						"summary":"The direct audit confirms the implementation is correct and the remaining failures were environmental.",
+						"evidence_refs":["examples/hello-py/pyproject.toml","examples/hello-py/tests/test_pyproject.py"]
+					}`,
+				}},
+			},
+			{
+				ToolCalls: []providers.ToolCall{{
+					ID:   "tool-ot",
+					Name: "handoff_to_ot",
+					Arguments: `{
+						"summary":"Ready for OT merge.",
+						"evidence_refs":["examples/hello-py/pyproject.toml","examples/hello-py/tests/test_pyproject.py"]
+					}`,
+				}},
+			},
+		},
+		requestInspect: map[int]func(*providers.Request) error{
+			0: func(req *providers.Request) error {
+				if req == nil {
+					return fmt.Errorf("request is nil")
+				}
+				if !req.DisableParallelToolUse {
+					return fmt.Errorf("DisableParallelToolUse = false, want true")
+				}
+				return nil
+			},
+			1: func(req *providers.Request) error {
+				if req == nil {
+					return fmt.Errorf("request is nil")
+				}
+				last := req.Messages[len(req.Messages)-1]
+				if last.Role != providers.RoleTool {
+					return fmt.Errorf("last message role = %q, want tool after process_validation", last.Role)
+				}
+				if last.ToolName != "process_validation" {
+					return fmt.Errorf("last tool name = %q, want process_validation", last.ToolName)
+				}
+				return nil
+			},
+			2: func(req *providers.Request) error {
+				if req == nil {
+					return fmt.Errorf("request is nil")
+				}
+				last := req.Messages[len(req.Messages)-1]
+				if last.Role != providers.RoleTool {
+					return fmt.Errorf("last message role = %q, want tool after direct audit", last.Role)
+				}
+				if last.ToolName != "inspect_workspace_state" {
+					return fmt.Errorf("last tool name = %q, want inspect_workspace_state", last.ToolName)
+				}
+				return nil
+			},
+		},
+	}
+
+	pi, err := New(inspectorshared.PipelineInspectorConfig{
+		AgentID:        "inspector-pipeline",
+		SessionID:      "sess-3",
+		MaxToolRuns:    3,
+		DefaultTimeout: 5 * time.Second,
+	}, nil)
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = pi.Close()
+	})
+	pi.SetProvider(provider)
+	pi.bus = bus
+	pi.state.CurrentTaskID = "task-3"
+
+	task := &agentShared.PipelineTaskInput{
+		NodeID:        "task-3",
+		DAGID:         "dag-3",
+		TaskID:        "task-3",
+		AgentType:     agentShared.PipelineAgentInspector,
+		TargetAgentID: "inspector-pipeline",
+		Prompt:        "Audit the completed task.",
+		Context: map[string]any{
+			"session_dir":    sessionDir,
+			"pipeline_stage": "execute",
+			"pipeline_protocol": agentShared.PipelineProtocolSnapshotMap(&agentShared.PipelineProtocolSnapshot{
+				PendingValidation: &agentShared.PipelineValidationRecord{
+					ChallengeID:         "challenge-post-validation",
+					RequestingAgent:     agentShared.PipelineAgentInspector,
+					RespondingAgent:     agentShared.PipelineAgentTester,
+					Status:              string(agentShared.PipelineValidationPartial),
+					Summary:             "Tester accepted the audit, but canonical execution remained partially blocked by environmental caveats.",
+					ChallengeReferences: []string{"finalize_pipeline_verification"},
+					EvidenceRefs:        []string{"artifact:tester"},
+				},
+			}),
+		},
+		SessionID: "sess-3",
+	}
+	input, err := json.Marshal(task)
+	if err != nil {
+		t.Fatalf("Marshal(task): %v", err)
+	}
+
+	if _, err := pi.Handle(context.Background(), &guide.ForwardedRequest{
+		CorrelationID: "pipe-test-3",
+		Input:         string(input),
+		SourceAgentID: "orchestrator",
+		TargetAgentID: "inspector-pipeline",
+		SessionID:     "sess-3",
+	}); err != nil {
+		t.Fatalf("Handle(): %v", err)
+	}
+
+	if provider.calls != 4 {
+		t.Fatalf("provider calls = %d, want 4", provider.calls)
 	}
 }

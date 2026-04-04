@@ -60,11 +60,18 @@ type TaskRouter struct {
 	pending   map[string]*pendingRoute // correlationID → pending
 
 	visibleMu sync.Mutex
-	visible   map[string]*visibleRoute // correlationID → mirrored user-visible route
+	visible   map[string]*visibleRoute // root correlationID → mirrored user-visible route
+	// descendant correlationID → root mirrored user-visible route correlationID
+	visibleDescendants map[string]string
 
 	followupMu     sync.Mutex
 	followupActive map[string]string
 	followupQueued map[string][]*guide.RouteRequest
+
+	protocolRouteMu     sync.Mutex
+	protocolRouteActive map[string]string
+	protocolRouteCorr   map[string]string
+	protocolRouteTask   map[string]*PipelineTask
 }
 
 // pendingRoute tracks a dispatched task awaiting a Guide-routed response.
@@ -98,8 +105,12 @@ func NewTaskRouter(cfg TaskRouterConfig) *TaskRouter {
 		onNodeActivity:       cfg.OnNodeActivity,
 		pending:              make(map[string]*pendingRoute),
 		visible:              make(map[string]*visibleRoute),
+		visibleDescendants:   make(map[string]string),
 		followupActive:       make(map[string]string),
 		followupQueued:       make(map[string][]*guide.RouteRequest),
+		protocolRouteActive:  make(map[string]string),
+		protocolRouteCorr:    make(map[string]string),
+		protocolRouteTask:    make(map[string]*PipelineTask),
 	}
 }
 
@@ -241,6 +252,142 @@ func (r *TaskRouter) publishVisibleRouteNow(req *guide.RouteRequest) error {
 	return nil
 }
 
+func protocolSerializedRouteKey(req *guide.RouteRequest) string {
+	if req == nil || !metadataBool(req.Metadata, "pipeline_task") {
+		return ""
+	}
+	return strings.TrimSpace(req.TargetAgentID)
+}
+
+func protocolTaskFromRouteRequest(req *guide.RouteRequest) *PipelineTask {
+	if req == nil || !metadataBool(req.Metadata, "pipeline_task") {
+		return nil
+	}
+	taskID := metadataString(req.Metadata, "task_id")
+	agentType := metadataString(req.Metadata, "agent_type")
+	if taskID == "" || agentType == "" {
+		return nil
+	}
+	ctx := map[string]any{}
+	if stage := metadataString(req.Metadata, "pipeline_stage"); stage != "" {
+		ctx["pipeline_stage"] = stage
+	}
+	if taskSlug := metadataString(req.Metadata, "task_slug"); taskSlug != "" {
+		ctx["task_slug"] = taskSlug
+	}
+	if taskName := metadataString(req.Metadata, "task_name"); taskName != "" {
+		ctx["task_name"] = taskName
+	}
+	return &PipelineTask{
+		NodeID:        firstNonEmpty(metadataString(req.Metadata, "node_id"), taskID),
+		DAGID:         metadataString(req.Metadata, "dag_id"),
+		TaskID:        taskID,
+		AgentType:     agentType,
+		TargetAgentID: strings.TrimSpace(req.TargetAgentID),
+		SessionID:     strings.TrimSpace(req.SessionID),
+		Context:       ctx,
+	}
+}
+
+func (r *TaskRouter) publishProtocolRoute(req *guide.RouteRequest) (bool, error) {
+	if r == nil || req == nil {
+		return false, fmt.Errorf("route request is required")
+	}
+	if r.bus == nil {
+		return false, fmt.Errorf("task router bus is not configured")
+	}
+
+	corrID := strings.TrimSpace(req.CorrelationID)
+	if corrID == "" {
+		corrID = "pipe_" + generateMessageID()
+		req.CorrelationID = corrID
+	}
+
+	queueKey := protocolSerializedRouteKey(req)
+	protocolTask := protocolTaskFromRouteRequest(req)
+	if queueKey != "" {
+		r.protocolRouteMu.Lock()
+		if activeCorrID := strings.TrimSpace(r.protocolRouteActive[queueKey]); activeCorrID != "" && activeCorrID != corrID {
+			r.protocolRouteMu.Unlock()
+			r.logTrace("task_router_protocol_route_suppressed_active", "info", agentlog.EventPipelineStateChange, corrID, map[string]any{
+				"target_agent_id":       strings.TrimSpace(req.TargetAgentID),
+				"active_correlation_id": activeCorrID,
+				"task_id":               metadataString(req.Metadata, "task_id"),
+				"agent_type":            metadataString(req.Metadata, "agent_type"),
+			})
+			return false, nil
+		}
+		r.protocolRouteActive[queueKey] = corrID
+		r.protocolRouteCorr[corrID] = queueKey
+		if protocolTask != nil {
+			r.protocolRouteTask[queueKey] = clonePipelineTask(protocolTask)
+		}
+		r.protocolRouteMu.Unlock()
+	}
+
+	msg := guide.NewRequestMessage(generateMessageID(), req)
+	msg.Metadata = cloneMetadata(req.Metadata)
+	if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+		if queueKey != "" {
+			r.protocolRouteMu.Lock()
+			if r.protocolRouteActive[queueKey] == corrID {
+				delete(r.protocolRouteActive, queueKey)
+				delete(r.protocolRouteTask, queueKey)
+			}
+			delete(r.protocolRouteCorr, corrID)
+			r.protocolRouteMu.Unlock()
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func protocolSerializedRouteKeyFromMessage(msg *guide.Message) string {
+	task := protocolTaskFromResponseMetadata(msg)
+	if task == nil {
+		return ""
+	}
+	return pipelineWorkerTargetAgentID(task.TaskID, task.AgentType)
+}
+
+func (r *TaskRouter) clearProtocolRoute(msg *guide.Message) {
+	if r == nil {
+		return
+	}
+	if msg == nil {
+		return
+	}
+	correlationID := strings.TrimSpace(msg.CorrelationID)
+	if correlationID == "" {
+		// Fall through: some protocol responses do not preserve the originating
+		// route correlation, but still identify the responding pipeline agent in
+		// metadata.
+	}
+	r.protocolRouteMu.Lock()
+	defer r.protocolRouteMu.Unlock()
+	queueKey := strings.TrimSpace(r.protocolRouteCorr[correlationID])
+	if correlationID != "" {
+		delete(r.protocolRouteCorr, correlationID)
+	}
+	if queueKey == "" {
+		queueKey = protocolSerializedRouteKeyFromMessage(msg)
+	}
+	if queueKey == "" {
+		return
+	}
+	if activeCorrID := strings.TrimSpace(r.protocolRouteActive[queueKey]); activeCorrID == correlationID || correlationID == "" {
+		delete(r.protocolRouteActive, queueKey)
+		delete(r.protocolRouteTask, queueKey)
+		return
+	}
+	// Some protocol terminals arrive with a fresh correlation but still
+	// represent completion for the currently active task-scoped pipeline worker.
+	if strings.TrimSpace(r.protocolRouteActive[queueKey]) != "" {
+		delete(r.protocolRouteActive, queueKey)
+		delete(r.protocolRouteTask, queueKey)
+	}
+}
+
 func (r *TaskRouter) publishSerializedFollowupRoute(req *guide.RouteRequest) error {
 	if r == nil || req == nil {
 		return fmt.Errorf("route request is required")
@@ -295,6 +442,7 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 	if !isTerminalRouteMessage(msg) {
 		return false
 	}
+	r.clearProtocolRoute(msg)
 
 	r.pendingMu.Lock()
 	pr := r.pending[msg.CorrelationID]
@@ -360,25 +508,99 @@ func (r *TaskRouter) visibleRoute(corrID string) *visibleRoute {
 	}
 	r.visibleMu.Lock()
 	defer r.visibleMu.Unlock()
-	route := r.visible[corrID]
+	route := r.visible[strings.TrimSpace(corrID)]
 	if route == nil {
 		return nil
 	}
-	cloned := &visibleRoute{
-		agentType:          route.agentType,
-		targetAgentID:      route.targetAgentID,
-		serializedFollowup: route.serializedFollowup,
-		metadata:           cloneMetadata(route.metadata),
-	}
-	return cloned
+	return cloneVisibleRoute(route)
 }
 
 func (r *TaskRouter) clearVisibleRoute(corrID string) {
 	if r == nil || strings.TrimSpace(corrID) == "" {
 		return
 	}
+	rootCorrID := strings.TrimSpace(corrID)
 	r.visibleMu.Lock()
-	delete(r.visible, corrID)
+	delete(r.visible, rootCorrID)
+	for childCorrID, mappedRoot := range r.visibleDescendants {
+		if strings.TrimSpace(mappedRoot) == rootCorrID {
+			delete(r.visibleDescendants, childCorrID)
+		}
+	}
+	r.visibleMu.Unlock()
+}
+
+func cloneVisibleRoute(route *visibleRoute) *visibleRoute {
+	if route == nil {
+		return nil
+	}
+	return &visibleRoute{
+		agentType:          route.agentType,
+		targetAgentID:      route.targetAgentID,
+		serializedFollowup: route.serializedFollowup,
+		metadata:           cloneMetadata(route.metadata),
+	}
+}
+
+func (r *TaskRouter) visibleRouteForStream(corrID string, metadata map[string]any) (*visibleRoute, string) {
+	if r == nil {
+		return nil, ""
+	}
+	corrID = strings.TrimSpace(corrID)
+	if corrID == "" {
+		return nil, ""
+	}
+
+	r.visibleMu.Lock()
+	defer r.visibleMu.Unlock()
+
+	if route := r.visible[corrID]; route != nil {
+		return cloneVisibleRoute(route), corrID
+	}
+
+	if rootCorrID := strings.TrimSpace(r.visibleDescendants[corrID]); rootCorrID != "" {
+		if route := r.visible[rootCorrID]; route != nil {
+			return cloneVisibleRoute(route), rootCorrID
+		}
+		delete(r.visibleDescendants, corrID)
+	}
+
+	parentCorrID := strings.TrimSpace(metadataString(metadata, "chat_parent_correlation_id"))
+	if parentCorrID == "" {
+		return nil, ""
+	}
+
+	rootCorrID := parentCorrID
+	if route := r.visible[rootCorrID]; route != nil {
+		r.visibleDescendants[corrID] = rootCorrID
+		return cloneVisibleRoute(route), rootCorrID
+	}
+
+	rootCorrID = strings.TrimSpace(r.visibleDescendants[parentCorrID])
+	if rootCorrID == "" {
+		return nil, ""
+	}
+	if route := r.visible[rootCorrID]; route != nil {
+		r.visibleDescendants[corrID] = rootCorrID
+		return cloneVisibleRoute(route), rootCorrID
+	}
+	delete(r.visibleDescendants, parentCorrID)
+	return nil, ""
+}
+
+func (r *TaskRouter) clearVisibleDescendant(corrID, rootCorrID string) {
+	if r == nil {
+		return
+	}
+	corrID = strings.TrimSpace(corrID)
+	rootCorrID = strings.TrimSpace(rootCorrID)
+	if corrID == "" || rootCorrID == "" || corrID == rootCorrID {
+		return
+	}
+	r.visibleMu.Lock()
+	if strings.TrimSpace(r.visibleDescendants[corrID]) == rootCorrID {
+		delete(r.visibleDescendants, corrID)
+	}
 	r.visibleMu.Unlock()
 }
 
@@ -488,7 +710,7 @@ func (r *TaskRouter) mirrorVisibleRouteStreamToUser(msg *guide.Message) bool {
 	if !ok || stream == nil || stream.Event == nil {
 		return false
 	}
-	route := r.visibleRoute(msg.CorrelationID)
+	route, rootCorrID := r.visibleRouteForStream(msg.CorrelationID, stream.Metadata)
 	if route == nil {
 		return false
 	}
@@ -523,10 +745,14 @@ func (r *TaskRouter) mirrorVisibleRouteStreamToUser(msg *guide.Message) bool {
 		})
 		return true
 	}
+	if stream.Event.Type == guide.StreamEventComplete || stream.Event.Type == guide.StreamEventError {
+		r.clearVisibleDescendant(msg.CorrelationID, rootCorrID)
+	}
 	r.logTrace("task_router_visible_stream_mirrored", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, map[string]any{
 		"mirror_target":   r.streamMirrorTargetID,
 		"source_agent_id": msg.SourceAgentID,
 		"agent_type":      route.agentType,
+		"visible_root":    rootCorrID,
 	})
 	return true
 }
@@ -822,6 +1048,16 @@ func protocolTerminalOutput(turnResp *agentshared.PipelineTurnResponse) any {
 	return turnResp.Result
 }
 
+func clonePipelineTask(task *PipelineTask) *PipelineTask {
+	if task == nil {
+		return nil
+	}
+	out := *task
+	out.Context = clonePipelineTaskContext(task.Context)
+	out.ParentResults = clonePipelineParentResults(task.ParentResults)
+	return &out
+}
+
 func enrichMirroredStreamMetadata(task *PipelineTask, metadata map[string]any) map[string]any {
 	if task == nil {
 		return metadata
@@ -1040,7 +1276,7 @@ func (r *TaskRouter) consumeProtocolTerminal(msg *guide.Message) bool {
 			Error:     errText,
 			Timestamp: time.Now().UTC(),
 		})
-		r.logTrace("task_router_protocol_terminal_failed_recovered", "warn", agentlog.EventError, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+		r.logTrace("task_router_protocol_terminal_failed", "warn", agentlog.EventError, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
 			"source_agent_id": msg.SourceAgentID,
 			"error":           errText,
 		}))
@@ -1048,9 +1284,17 @@ func (r *TaskRouter) consumeProtocolTerminal(msg *guide.Message) bool {
 	}
 	turnResp, err := agentshared.DecodePipelineTurnResponse(resp.Data)
 	if err != nil || turnResp == nil {
+		if task != nil {
+			r.publishProtocolMalformedTurnFailure(task, msg, "protocol pipeline route returned an invalid turn envelope")
+			return true
+		}
 		return false
 	}
 	if turnResp.Action == nil && len(turnResp.Processed) == 0 {
+		if task != nil {
+			r.publishProtocolMalformedTurnFailure(task, msg, "protocol pipeline turn ended without recording the next pipeline step")
+			return true
+		}
 		return false
 	}
 	actionType := ""
@@ -1075,6 +1319,21 @@ func (r *TaskRouter) consumeProtocolTerminal(msg *guide.Message) bool {
 			"source_agent_id": msg.SourceAgentID,
 			"action_type":     actionType,
 		}))
+	} else if turnResp.Action == nil && len(turnResp.Processed) > 0 && task != nil {
+		r.publishProtocolMalformedTurnFailure(task, msg, "protocol pipeline turn processed validation but did not record the next pipeline step")
+		return true
+	} else if turnResp.Action != nil && task != nil {
+		r.logTrace("task_router_protocol_terminal_acknowledged", "debug", agentlog.EventPipelineStateChange, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+			"source_agent_id":   msg.SourceAgentID,
+			"action_type":       actionType,
+			"creates_challenge": turnResp.Action.CreatesChallenge,
+		}))
+		if turnResp.Action.Type == agentshared.PipelineProtocolActionHandoff {
+			// Shared pipeline protocol dispatch already published the exact next
+			// route request and running update. The router only acknowledges the
+			// explicit turn-closing protocol action here; it no longer reconstructs
+			// the next internal pipeline worker from durable protocol state.
+		}
 	}
 	r.logTrace("task_router_protocol_terminal_consumed", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, map[string]any{
 		"source_agent_id": msg.SourceAgentID,
@@ -1082,6 +1341,154 @@ func (r *TaskRouter) consumeProtocolTerminal(msg *guide.Message) bool {
 		"action_type":     actionType,
 	})
 	return true
+}
+
+func (r *TaskRouter) publishProtocolMalformedTurnFailure(task *PipelineTask, msg *guide.Message, reason string) {
+	if r == nil || task == nil || r.bus == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "protocol pipeline turn ended without a valid closing action"
+	}
+	publishPipelineUpdateMessage(r.bus, r.agentID, &PipelineUpdate{
+		DAGID:     task.DAGID,
+		NodeID:    task.NodeID,
+		TaskID:    task.TaskID,
+		AgentID:   routeTargetAgentID(task),
+		AgentType: task.AgentType,
+		Status:    "failed",
+		Stage:     protocolTaskStage(task),
+		Progress:  1,
+		Message:   reason,
+		Error:     reason,
+		Timestamp: time.Now().UTC(),
+	})
+	r.logTrace("task_router_protocol_terminal_invalid", "warn", agentlog.EventError, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+		"source_agent_id": msg.SourceAgentID,
+		"error":           reason,
+	}))
+}
+
+type activePipelineRouteControl struct {
+	correlationID string
+	task          *PipelineTask
+}
+
+func (r *TaskRouter) snapshotActivePipelineRoutes(sessionID, dagID string) []activePipelineRouteControl {
+	if r == nil {
+		return nil
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	dagID = strings.TrimSpace(dagID)
+	routes := make([]activePipelineRouteControl, 0, len(r.pending)+len(r.protocolRouteActive))
+	seen := make(map[string]struct{}, len(r.pending)+len(r.protocolRouteActive))
+
+	r.pendingMu.Lock()
+	for corrID, pr := range r.pending {
+		if pr == nil || pr.closed || pr.task == nil {
+			continue
+		}
+		if sessionID != "" && strings.TrimSpace(pr.task.SessionID) != sessionID {
+			continue
+		}
+		if dagID != "" && strings.TrimSpace(pr.task.DAGID) != dagID {
+			continue
+		}
+		seen[corrID] = struct{}{}
+		routes = append(routes, activePipelineRouteControl{
+			correlationID: corrID,
+			task:          clonePipelineTask(pr.task),
+		})
+	}
+	r.pendingMu.Unlock()
+
+	r.protocolRouteMu.Lock()
+	for queueKey, corrID := range r.protocolRouteActive {
+		corrID = strings.TrimSpace(corrID)
+		if corrID == "" {
+			continue
+		}
+		if _, ok := seen[corrID]; ok {
+			continue
+		}
+		task := r.protocolRouteTask[queueKey]
+		if task == nil {
+			continue
+		}
+		if sessionID != "" && strings.TrimSpace(task.SessionID) != sessionID {
+			continue
+		}
+		if dagID != "" && strings.TrimSpace(task.DAGID) != dagID {
+			continue
+		}
+		seen[corrID] = struct{}{}
+		routes = append(routes, activePipelineRouteControl{
+			correlationID: corrID,
+			task:          clonePipelineTask(task),
+		})
+	}
+	r.protocolRouteMu.Unlock()
+
+	return routes
+}
+
+func (r *TaskRouter) publishActiveRoutePace(action, sessionID, dagID, reason string) int {
+	if r == nil || r.bus == nil {
+		return 0
+	}
+	action = strings.TrimSpace(strings.ToLower(action))
+	if action == "" {
+		return 0
+	}
+	routes := r.snapshotActivePipelineRoutes(sessionID, dagID)
+	applied := 0
+	for _, route := range routes {
+		if route.task == nil {
+			continue
+		}
+		req := &guide.ActionRequest{
+			CorrelationID: route.correlationID,
+			SourceAgentID: r.agentID,
+			TargetAgentID: routeTargetAgentID(route.task),
+			Action:        "pace",
+			Data: map[string]any{
+				"correlation_id": route.correlationID,
+				"session_id":     route.task.SessionID,
+				"pace":           action,
+				"reason":         strings.TrimSpace(reason),
+			},
+			FireAndForget: true,
+			Timestamp:     time.Now().UTC(),
+		}
+		msg := guide.NewActionMessage(generateMessageID(), req)
+		if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+			r.logger.Warn("publish pipeline pace action",
+				"correlation_id", route.correlationID,
+				"agent_type", route.task.AgentType,
+				"pace", action,
+				"error", err)
+			r.logTrace("task_router_active_route_pace_failed", "warn", agentlog.EventError, route.correlationID, mergeRouteTraceData(routeTraceData(route.task), map[string]any{
+				"pace":  action,
+				"error": err.Error(),
+			}))
+			continue
+		}
+		applied++
+		r.logTrace("task_router_active_route_pace_published", "debug", agentlog.EventPipelineStateChange, route.correlationID, mergeRouteTraceData(routeTraceData(route.task), map[string]any{
+			"pace":   action,
+			"reason": strings.TrimSpace(reason),
+		}))
+	}
+	return applied
+}
+
+func (r *TaskRouter) PauseActiveRoutes(sessionID, dagID, reason string) int {
+	return r.publishActiveRoutePace("paused", sessionID, dagID, reason)
+}
+
+func (r *TaskRouter) ResumeActiveRoutes(sessionID, dagID, reason string) int {
+	return r.publishActiveRoutePace("auto", sessionID, dagID, reason)
 }
 
 // CancelAllPending cancels all in-flight pipeline routes by publishing a

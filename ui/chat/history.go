@@ -90,6 +90,7 @@ type InterAgentChildActivity struct {
 	CorrelationID     string
 	AgentID           string
 	AgentType         string
+	ThinkingStartedAt time.Time
 	ThinkingText      string
 	ThinkingStatus    string
 	ThinkingColor     string

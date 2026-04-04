@@ -414,6 +414,9 @@ type ProgressData struct {
 	Percent float64             `json:"percent"`
 	Message string              `json:"message,omitempty"`
 	UIState events.AgentUIState `json:"ui_state,omitempty"`
+	// ToolDerived marks progress narration synthesized from an in-flight tool
+	// turn so downstream UIs can retire it precisely when the tool finishes.
+	ToolDerived bool `json:"tool_derived,omitempty"`
 }
 
 // SendHeartbeat sends a keep-alive heartbeat

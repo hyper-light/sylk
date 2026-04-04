@@ -519,6 +519,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 	shared.EmitDispatchACK(l.bus, fwd.Metadata, l.id, "librarian", fwd.CorrelationID)
 	reqCtx, cancel := context.WithCancel(l.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
 	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
 		BusProvider:     func() guide.EventBus { return l.bus },
 		SourceAgentID:   func() string { return l.id },

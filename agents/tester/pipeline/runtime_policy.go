@@ -14,6 +14,7 @@ func (pt *PipelineTester) applyLLMRuntimeProfile(req *providers.Request, stageNa
 		AgentID:   "tester-pipeline",
 		SessionID: pt.config.SessionID,
 	})
+	req.DisableParallelToolUse = true
 }
 
 func (pt *PipelineTester) llmStageProfile(stageName string) llmruntime.StageProfile {

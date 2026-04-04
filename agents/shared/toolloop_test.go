@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/commandapproval"
@@ -121,6 +120,36 @@ func TestToolErrorPayload_IncludesRecoveryForApprovalDenied(t *testing.T) {
 	}
 }
 
+func TestToolErrorPayload_IncludesRecoveryForInspectorTestToolingReroute(t *testing.T) {
+	got := ToolErrorPayload(fmt.Errorf("%w: research_dependency_install is not permitted for inspector when the missing dependency is for test execution", ErrRouteTestToolingToTester))
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("payload is not valid JSON: %v", err)
+	}
+	if parsed["error_kind"] != "route_test_tooling_to_tester" {
+		t.Fatalf("error_kind = %v, want %q", parsed["error_kind"], "route_test_tooling_to_tester")
+	}
+	recovery, ok := parsed["recovery"].([]any)
+	if !ok || len(recovery) == 0 {
+		t.Fatalf("expected recovery guidance, got %#v", parsed["recovery"])
+	}
+}
+
+func TestToolErrorPayload_IncludesRecoveryForInspectorTestExecutionReroute(t *testing.T) {
+	got := ToolErrorPayload(fmt.Errorf("%w: run_command is not permitted for inspector when it executes tests", ErrRouteTestExecutionToTester))
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("payload is not valid JSON: %v", err)
+	}
+	if parsed["error_kind"] != "route_test_execution_to_tester" {
+		t.Fatalf("error_kind = %v, want %q", parsed["error_kind"], "route_test_execution_to_tester")
+	}
+	recovery, ok := parsed["recovery"].([]any)
+	if !ok || len(recovery) == 0 {
+		t.Fatalf("expected recovery guidance, got %#v", parsed["recovery"])
+	}
+}
+
 func TestToolErrorPayload_NilError(t *testing.T) {
 	got := ToolErrorPayload(nil)
 	if got != "" {
@@ -128,15 +157,32 @@ func TestToolErrorPayload_NilError(t *testing.T) {
 	}
 }
 
-func TestAppendToolRecoveryMessage_DeduplicatesHints(t *testing.T) {
+func TestAppendSkippedToolResults_AppendsErrorResultsForRemainingCalls(t *testing.T) {
 	req := &providers.Request{}
-	AppendToolRecoveryMessage(req, []string{"adapt", "adapt", "", "switch tools"})
-	if len(req.Messages) != 1 {
-		t.Fatalf("expected 1 appended message, got %d", len(req.Messages))
+	AppendSkippedToolResults(req, []providers.ToolCall{
+		{ID: "tool-2", Name: "handoff_next"},
+		{ID: "tool-3", Name: "inspect_workspace_state"},
+	}, "an earlier tool already ended the turn")
+	if len(req.Messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(req.Messages))
 	}
-	content := req.Messages[0].Content
-	if !strings.Contains(content, "adapt") || !strings.Contains(content, "switch tools") {
-		t.Fatalf("unexpected recovery message content: %q", content)
+	for i, msg := range req.Messages {
+		if msg.Role != providers.RoleTool {
+			t.Fatalf("message %d role = %q, want tool", i, msg.Role)
+		}
+		if !msg.IsError {
+			t.Fatalf("message %d IsError = false, want true", i)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(msg.Content), &parsed); err != nil {
+			t.Fatalf("message %d content is not valid JSON: %v", i, err)
+		}
+		if parsed["error_kind"] != "tool_call_skipped" {
+			t.Fatalf("message %d error_kind = %v, want tool_call_skipped", i, parsed["error_kind"])
+		}
+		if parsed["reason"] != "an earlier tool already ended the turn" {
+			t.Fatalf("message %d reason = %v, want propagated reason", i, parsed["reason"])
+		}
 	}
 }
 

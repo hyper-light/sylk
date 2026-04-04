@@ -44,6 +44,7 @@ import (
 	"github.com/adalundhe/sylk/ui/layout"
 	"github.com/adalundhe/sylk/ui/login"
 	markdownpkg "github.com/adalundhe/sylk/ui/markdown"
+	"github.com/adalundhe/sylk/ui/memoryview"
 	"github.com/adalundhe/sylk/ui/mergediff"
 	"github.com/adalundhe/sylk/ui/modal"
 	"github.com/adalundhe/sylk/ui/msg"
@@ -331,6 +332,9 @@ type Deps struct {
 
 	// KnowledgeStore exposes background indexing progress for the status bar.
 	KnowledgeStore *knowledge.KnowledgeStore
+
+	// Forest exposes structural memory snapshots for the MEMR view.
+	Forest MemoryViewService
 }
 
 // AgentSeed describes an agent to pre-populate in the UI agent panel.
@@ -439,6 +443,7 @@ type AppModel struct {
 	agentPanel     *agentpkg.Model
 	codePanel      *codepkg.Model
 	knowledgePanel *knowledgepkg.Model
+	memoryView     *memoryview.Model
 	fileTree       *filetree.Model
 
 	// Overlay components
@@ -484,12 +489,16 @@ type AppModel struct {
 	bounce                bounceState      // Current bounce animation state.
 	swipe                 swipeState       // Horizontal scroll accumulation for ring cycling.
 
-	// View mode state machine — exactly one of ViewChat/ViewEdit/ViewGit.
-	viewMode       ViewMode
-	savedLeftIdx   int               // Saved leftRing.index before edit mode.
-	savedRightIdx  int               // Saved rightRing.index before edit mode.
-	savedChatFocus component.FocusID // Last focused panel in chat mode.
-	savedEditFocus component.FocusID // Last focused panel in edit mode.
+	// View mode state machine — exactly one of ViewChat/ViewMemory/ViewEdit/ViewGit.
+	viewMode            ViewMode
+	savedLeftIdx        int               // Saved leftRing.index before edit mode.
+	savedRightIdx       int               // Saved rightRing.index before edit mode.
+	savedMemoryLeftIdx  int               // Saved leftRing.index before memory mode.
+	savedMemoryRightIdx int               // Saved rightRing.index before memory mode.
+	savedChatFocus      component.FocusID // Last focused panel in chat mode.
+	savedEditFocus      component.FocusID // Last focused panel in edit mode.
+	memoryLoadedAt      time.Time
+	memoryIndexedIDs    map[string]struct{}
 
 	// Git mode resources.
 	gitClient        *git.GitClient    // Git client for StatusWatcher and direct low-level use (nil if not a repo).
@@ -706,7 +715,9 @@ type AppModel struct {
 	streamUsage             map[string]streamUsageEntry
 	streamedResponses       map[string]streamedResponseState
 	activeStreams           map[string]*activeStreamEntry // key = correlationID
+	deferredStreams         map[string]*activeStreamEntry // key = correlationID; top-level parents awaiting child work after LLM completion
 	nestedStreams           map[string]*activeStreamEntry // key = correlationID; visible child consult/challenge streams only
+	delayedPrimaryBootstrap map[string][]tea.Msg          // key = correlationID; early top-level progress/tool events held until authoritative start metadata arrives
 	reroutedStreamCIDs      map[string]time.Time          // Recently rerouted source streams allowed to emit terminal cleanup events.
 	interruptedCorrelations map[string]struct{}           // Correlation IDs killed by interrupt.
 	engagedAgentID          string                        // Sticky agent the user is conversing with.
@@ -745,6 +756,9 @@ type AppModel struct {
 	// TUI-local WAL logger for suppressed/non-UI operational errors.
 	walLogger *slog.Logger
 	walCloser io.Closer
+
+	// Optional plain-text capture of rendered chat updates for UI debugging.
+	chatDebugCapture *uiChatDebugCapture
 }
 
 type streamUsageEntry struct {
@@ -767,6 +781,7 @@ type streamedResponseState struct {
 	Completed bool
 	Succeeded bool
 	SeenAt    time.Time
+	BranchRef *msg.InterAgentBranchRefMsg
 }
 
 type activeStreamEntry struct {
@@ -882,14 +897,17 @@ func (m *AppModel) isDiffPaneFocused() bool {
 type ViewMode int
 
 const (
-	ViewChat ViewMode = iota // Default: chat + panels.
-	ViewEdit                 // Inline vim editor active.
-	ViewGit                  // Git explorer + commit tree.
+	ViewChat   ViewMode = iota // Default: chat + panels.
+	ViewMemory                 // Memory forest view in the chat slot.
+	ViewEdit                   // Inline vim editor active.
+	ViewGit                    // Git explorer + commit tree.
 )
 
 // String returns the status bar label for this mode.
 func (v ViewMode) String() string {
 	switch v {
+	case ViewMemory:
+		return "MEMR"
 	case ViewEdit:
 		return "EDIT"
 	case ViewGit:
@@ -932,7 +950,11 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *AppModel) finishUpdate(raw tea.Msg, cmd tea.Cmd) (tea.Model, tea.Cmd) {
-	if m.passiveUpdate(raw) {
+	passive := m.passiveUpdate(raw)
+	if !passive {
+		m.flushChatDebugCapture()
+	}
+	if passive {
 		return m, cmd
 	}
 	if _, ok := raw.(tea.KeyMsg); ok {
@@ -2336,6 +2358,9 @@ func (m *AppModel) Shutdown() error {
 		}
 		m.walCloser = nil
 	}
+	if err := m.stopChatDebugCapture(); err != nil {
+		errs = append(errs, err)
+	}
 	if err := m.deps.Scope.Shutdown(shutdownGrace, shutdownHard); err != nil {
 		errs = append(errs, err)
 	}
@@ -2719,6 +2744,9 @@ var appKeyDispatchRoutes = []appKeyDispatchRoute{
 	),
 	keyStringRoute("alt+c", func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
 		return m, m.switchToChatMode()
+	}),
+	keyStringRoute("alt+m", func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+		return m, m.toggleMemoryMode()
 	}),
 	keyStringRoute("alt+g", func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
 		if m.viewMode == ViewGit {

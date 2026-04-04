@@ -54,7 +54,7 @@ func NewDiskFlusher(cfg DiskFlusherConfig) *DiskFlusher {
 
 // PendingChanges returns the current set of modifications in the global VFS overlay.
 func (df *DiskFlusher) PendingChanges() []FileModification {
-	return df.globalVFS.GetModifications()
+	return persistentFileModifications(df.globalVFS.GetModifications())
 }
 
 // Flush writes all pending changes from the global VFS to disk,
@@ -68,7 +68,8 @@ func (df *DiskFlusher) Flush(ctx context.Context) (*FlushResult, error) {
 		defer df.draftMu.Unlock()
 	}
 
-	mods := df.globalVFS.GetModifications()
+	allMods := df.globalVFS.GetModifications()
+	mods := persistentFileModifications(allMods)
 	if len(mods) == 0 {
 		return &FlushResult{Version: df.wal.CurrentVersion()}, nil
 	}
@@ -101,7 +102,11 @@ func (df *DiskFlusher) Flush(ctx context.Context) (*FlushResult, error) {
 		}
 	}
 
+	ephemeral := ephemeralFileModifications(allMods)
 	df.globalVFS.ResetOverlay()
+	if err := df.reapplyEphemeralModifications(ctx, ephemeral); err != nil {
+		return result, fmt.Errorf("disk flusher: restore ephemeral overlay: %w", err)
+	}
 	return result, nil
 }
 
@@ -293,6 +298,26 @@ func (df *DiskFlusher) applyInverseDeltas(ctx context.Context, deltas []WALFileD
 	for _, d := range deltas {
 		if err := df.applyInverseDelta(ctx, d, toDisk); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (df *DiskFlusher) reapplyEphemeralModifications(ctx context.Context, mods []FileModification) error {
+	for _, mod := range mods {
+		switch mod.Operation {
+		case FileOpDelete:
+			if err := df.globalVFS.Delete(WithWorkspaceMutationOrigin(ctx, WorkspaceMutationOriginCommandExecution), mod.OriginalPath); err != nil && err != ErrFileNotFound {
+				return err
+			}
+		case FileOpMkdir:
+			if err := df.globalVFS.MkdirAll(WithWorkspaceMutationOrigin(ctx, WorkspaceMutationOriginCommandExecution), mod.OriginalPath); err != nil && err != ErrFileExists {
+				return err
+			}
+		default:
+			if err := df.globalVFS.Write(WithWorkspaceMutationOrigin(ctx, WorkspaceMutationOriginCommandExecution), mod.OriginalPath, mod.NewContent); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

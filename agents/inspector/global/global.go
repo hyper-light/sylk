@@ -257,7 +257,7 @@ func (gi *GlobalInspector) initSkills() error {
 	}
 	if err := agentShared.AttachForestOutcomeRecorder(
 		gi.skills,
-		"validate_global_review",
+		"validate_work",
 		gi.forestTracker,
 		gi.config.Forest,
 		func() string { return gi.id },
@@ -428,6 +428,7 @@ func (gi *GlobalInspector) unsubRegistry() error {
 // Handle processes a forwarded request with intent dispatch.
 func (gi *GlobalInspector) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
+	ctx = agentShared.WithForwardedTaskScope(ctx, fwd.Metadata)
 	ctx = agentShared.WithGuardianCommandGate(ctx, agentShared.GuardianCommandGateConfig{
 		BusProvider:     func() guide.EventBus { return gi.bus },
 		SourceAgentID:   func() string { return gi.id },
@@ -449,6 +450,7 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 	}
 
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
+	ctx = agentShared.WithForwardedTaskScope(ctx, fwd.Metadata)
 	ctx = agentShared.WithGlobalReviewContext(ctx, fwd.Metadata)
 	defer agentShared.CloseGlobalReviewState(ctx)
 	contract := agentShared.BuildGlobalExecutionContract("inspector-global", fwd.Intent, fwd.Input)

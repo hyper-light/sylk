@@ -27,9 +27,7 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	pi.skills.Register(shared.RunTypeCheckerSkill(pi.toolRunner))
 	pi.skills.Register(shared.RunFormatterCheckSkill(pi.toolRunner))
 	pi.skills.Register(shared.RunSecurityScanSkill(pi.toolRunner))
-	pi.skills.Register(shared.CheckCoverageSkill(pi.toolRunner))
 	pi.skills.Register(shared.AnalyzeComplexitySkill(pi.toolRunner))
-	pi.skills.Register(shared.DetectRaceConditionsSkill(pi.toolRunner))
 	pi.skills.Register(shared.DetectDeadlocksSkill(pi.toolRunner))
 	pi.skills.Register(shared.DetectMemoryLeaksSkill(pi.toolRunner))
 	pi.skills.Register(runCommandSkill(pi))
@@ -87,6 +85,7 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	}
 	for _, skill := range agentShared.PipelineProtocolSkills(agentShared.PipelineProtocolSkillConfig{
 		AgentType:      func() string { return "inspector-pipeline" },
+		AgentID:        func() string { return pi.id },
 		InspectorOT:    true,
 		WorkspaceViews: func() versioning.WorkspaceViewAccess { return pi.workspaceViews },
 		Route: agentShared.PipelineProtocolRouteConfig{

@@ -571,6 +571,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	// Process the request with a cancellable request-scoped context.
 	reqCtx, cancel := context.WithCancel(a.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
 	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
 		BusProvider:     func() guide.EventBus { return a.bus },
 		SourceAgentID:   func() string { return a.id },

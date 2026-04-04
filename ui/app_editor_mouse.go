@@ -2261,6 +2261,9 @@ func (m *AppModel) isInsideLeftPanelContent(x, y int) bool {
 }
 
 func (m *AppModel) isInsideAgentsSection(x, y int) bool {
+	if m.viewMode == ViewMemory {
+		return false
+	}
 	rect := m.leftPanelSections.agentsRect
 	return rect.W > 0 && rect.H > 0 && x >= rect.X && x < rect.X+rect.W && y >= rect.Y && y < rect.Y+rect.H
 }
@@ -2285,6 +2288,9 @@ func (m *AppModel) updateSelectorHover(mouse tea.MouseMsg) {
 
 // handleAgentSelectorClick routes a press on the model selector line.
 func (m *AppModel) handleAgentSelectorClick(screenX, screenY int) tea.Cmd {
+	if m.viewMode == ViewMemory {
+		return nil
+	}
 	selY := m.agentSelectorScreenY()
 	if selY < 0 || screenY != selY {
 		return nil
@@ -2302,6 +2308,9 @@ func (m *AppModel) handleAgentSelectorClick(screenX, screenY int) tea.Cmd {
 }
 
 func (m *AppModel) handleAgentPanelClick(screenX, screenY int) tea.Cmd {
+	if m.viewMode == ViewMemory {
+		return nil
+	}
 	if !m.isInsideAgentsSection(screenX, screenY) {
 		return nil
 	}
@@ -2357,6 +2366,9 @@ func (m *AppModel) singleColumnPanelForScroll(x, y int) (component.FocusID, bool
 	current := m.leftRing.current()
 	if current != component.FocusSessionPanel && current != component.FocusAgentPanel {
 		return current, true
+	}
+	if m.viewMode == ViewMemory {
+		return component.FocusSessionPanel, true
 	}
 	if m.isInsideAgentsSection(x, y) {
 		return component.FocusAgentPanel, true
@@ -2419,6 +2431,9 @@ func (m *AppModel) sessionPanelScrollTarget(
 ) (component.FocusID, bool) {
 	if resolved != component.FocusSessionPanel && resolved != component.FocusAgentPanel {
 		return 0, false
+	}
+	if m.viewMode == ViewMemory {
+		return component.FocusSessionPanel, true
 	}
 	if m.isInsideAgentsSection(x, y) {
 		return component.FocusAgentPanel, true
@@ -4094,6 +4109,57 @@ func (m *AppModel) propagate(raw tea.Msg) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+func (m *AppModel) propagateWithoutChat(raw tea.Msg) tea.Cmd {
+	switch raw.(type) {
+	case msg.TickMsg, msg.DecorTickMsg:
+		return nil
+	}
+
+	var cmds []tea.Cmd
+
+	inputComp, inputCmd := m.input.Update(raw)
+	m.input = inputComp.(*inputpkg.Model)
+	cmds = appendCmd(cmds, inputCmd)
+
+	_, statusCmd := m.statusBar.Update(raw)
+	cmds = appendCmd(cmds, statusCmd)
+
+	sessionComp, sessionCmd := m.sessionPanel.Update(raw)
+	m.sessionPanel = sessionComp.(*sessionpkg.Model)
+	cmds = appendCmd(cmds, sessionCmd)
+
+	agentComp, agentCmd := m.agentPanel.Update(raw)
+	m.agentPanel = agentComp.(*agentpkg.Model)
+	cmds = appendCmd(cmds, agentCmd)
+
+	codeComp, codeCmd := m.codePanel.Update(raw)
+	m.codePanel = codeComp.(*codepkg.Model)
+	cmds = appendCmd(cmds, codeCmd)
+
+	knowledgeComp, knowledgeCmd := m.knowledgePanel.Update(raw)
+	m.knowledgePanel = knowledgeComp.(*knowledgepkg.Model)
+	cmds = appendCmd(cmds, knowledgeCmd)
+
+	treeComp, treeCmd := m.fileTree.Update(raw)
+	m.fileTree = treeComp.(*filetree.Model)
+	cmds = appendCmd(cmds, treeCmd)
+
+	if m.gitPanel != nil {
+		gitComp, gitCmd := m.gitPanel.Update(raw)
+		m.gitPanel = gitComp.(*gitpanel.Model)
+		cmds = appendCmd(cmds, gitCmd)
+		m.syncStagedFiles()
+	}
+
+	if m.commitTree != nil {
+		ctComp, ctCmd := m.commitTree.Update(raw)
+		m.commitTree = ctComp.(*committree.Model)
+		cmds = appendCmd(cmds, ctCmd)
+	}
+
+	return tea.Batch(cmds...)
+}
+
 type focusedKeyHandler func(*AppModel, tea.KeyMsg) tea.Cmd
 
 var focusedKeyHandlers = map[component.FocusID]focusedKeyHandler{
@@ -4149,18 +4215,33 @@ func (m *AppModel) propagateToInput(key tea.KeyMsg) tea.Cmd {
 }
 
 func (m *AppModel) propagateToChat(key tea.KeyMsg) tea.Cmd {
+	if m.viewMode == ViewMemory && m.memoryView != nil {
+		if m.memoryView.HandleCanvasKey(key) {
+			m.viewDirty = true
+		}
+		return nil
+	}
 	comp, cmd := m.chat.Update(key)
 	m.chat = comp.(*chat.Model)
 	return cmd
 }
 
 func (m *AppModel) propagateToSessionPanel(key tea.KeyMsg) tea.Cmd {
+	if m.viewMode == ViewMemory && m.memoryView != nil {
+		if m.memoryView.HandleIndexKey(key) {
+			m.viewDirty = true
+		}
+		return nil
+	}
 	comp, cmd := m.sessionPanel.Update(key)
 	m.sessionPanel = comp.(*sessionpkg.Model)
 	return cmd
 }
 
 func (m *AppModel) propagateToAgentPanel(key tea.KeyMsg) tea.Cmd {
+	if m.viewMode == ViewMemory {
+		return m.propagateToSessionPanel(key)
+	}
 	comp, cmd := m.agentPanel.Update(key)
 	m.agentPanel = comp.(*agentpkg.Model)
 	m.syncManualTargetFromAgentSelection()

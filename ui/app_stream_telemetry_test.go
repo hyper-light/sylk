@@ -25,7 +25,9 @@ func newStreamTelemetryModel() *AppModel {
 		streamUsage:             make(map[string]streamUsageEntry),
 		streamedResponses:       make(map[string]streamedResponseState),
 		activeStreams:           make(map[string]*activeStreamEntry),
+		deferredStreams:         make(map[string]*activeStreamEntry),
 		nestedStreams:           make(map[string]*activeStreamEntry),
+		delayedPrimaryBootstrap: make(map[string][]tea.Msg),
 		reroutedStreamCIDs:      make(map[string]time.Time),
 		interruptedCorrelations: make(map[string]struct{}),
 		agentPanel:              agentpkg.New(th),
@@ -44,6 +46,257 @@ func registerPipelineWorkerRow(m *AppModel, start msg.StreamStartMsg) {
 	}
 }
 
+func seedDeferredInspectorChallengeReturn(t *testing.T) *AppModel {
+	t.Helper()
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-parent-inspector-challenge",
+		AgentID:        "task_1:inspector-pipeline",
+		RuntimeAgentID: "runtime-inspector",
+		AgentType:      "inspector-pipeline",
+		AgentName:      "Inspector",
+		TaskID:         "task_1",
+		TaskName:       "Create hello.py CLI module with argparse and greet function",
+		TaskSlug:       "create-cli-module",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-parent-inspector-challenge",
+		AgentID:       "task_1:inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		TaskID:        "task_1",
+		TaskName:      "Create hello.py CLI module with argparse and greet function",
+		TaskSlug:      "create-cli-module",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target":"tester-pipeline","prompt":"Fix the failing test file."}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "challenge",
+			Status:     "pending",
+			AgentTypes: []string{"tester-pipeline"},
+			Summary:    "Fix the failing test file.",
+			ThreadKey:  "pipeline:task_1-challenge-seed",
+		},
+	})
+	app = model.(*AppModel)
+
+	branchRef := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-inspector-challenge",
+		ParentToolCallKey:   "challenge-1",
+		Kind:                "challenge",
+		ThreadKey:           "pipeline:task_1-challenge-seed",
+	}
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-child-tester-challenge",
+		AgentID:        "task_1:tester-pipeline",
+		RuntimeAgentID: "runtime-tester",
+		AgentType:      "tester-pipeline",
+		AgentName:      "Tester",
+		TaskID:         "task_1",
+		TaskName:       "Create hello.py CLI module with argparse and greet function",
+		TaskSlug:       "create-cli-module",
+		BranchRef:      branchRef,
+	})
+	app = model.(*AppModel)
+
+	chatComp, _ := app.chat.Update(msg.StreamCompleteMsg{
+		CorrelationID:     "corr-parent-inspector-challenge",
+		AgentID:           "task_1:inspector-pipeline",
+		AgentType:         "inspector-pipeline",
+		AuthoritativeText: "Waiting for the tester challenge result.",
+	})
+	app.chat = chatComp.(*chatpkg.Model)
+	app.deferPrimaryStream("corr-parent-inspector-challenge")
+
+	if entry := app.streamEntryForCorrelation("corr-parent-inspector-challenge"); entry == nil {
+		t.Fatal("expected parent inspector stream to remain registered after deferred challenge response")
+	}
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:         "s1",
+		CorrelationID:     "corr-child-tester-challenge",
+		AgentID:           "task_1:tester-pipeline",
+		RuntimeAgentID:    "runtime-tester",
+		AgentType:         "tester-pipeline",
+		AgentName:         "Tester",
+		TaskID:            "task_1",
+		TaskName:          "Create hello.py CLI module with argparse and greet function",
+		TaskSlug:          "create-cli-module",
+		AuthoritativeText: "Fixed the test file defect.",
+		BranchRef:         branchRef,
+	})
+	app = model.(*AppModel)
+
+	if entry := app.streamEntryForCorrelation("corr-parent-inspector-challenge"); entry == nil {
+		t.Fatal("expected parent inspector stream to remain registered after child challenge completion")
+	}
+	return app
+}
+
+func seedDeferredInspectorChallengeReturnUnscopedParent(t *testing.T) *AppModel {
+	t.Helper()
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-parent-inspector-unscoped",
+		AgentID:        "inspector-pipeline",
+		RuntimeAgentID: "runtime-inspector",
+		AgentType:      "inspector-pipeline",
+		AgentName:      "Inspector",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-parent-inspector-unscoped",
+		AgentID:       "inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target":"tester-pipeline","prompt":"Fix the failing test file."}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "challenge",
+			Status:     "pending",
+			AgentTypes: []string{"tester-pipeline"},
+			Summary:    "Fix the failing test file.",
+			ThreadKey:  "pipeline:task_1-challenge-seed",
+		},
+	})
+	app = model.(*AppModel)
+
+	branchRef := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-inspector-unscoped",
+		ParentToolCallKey:   "challenge-1",
+		Kind:                "challenge",
+		ThreadKey:           "pipeline:task_1-challenge-seed",
+	}
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-child-tester-unscoped",
+		AgentID:        "task_1:tester-pipeline",
+		RuntimeAgentID: "runtime-tester",
+		AgentType:      "tester-pipeline",
+		AgentName:      "Tester",
+		TaskID:         "task_1",
+		TaskName:       "Create hello.py CLI module with argparse and greet function",
+		TaskSlug:       "create-cli-module",
+		BranchRef:      branchRef,
+	})
+	app = model.(*AppModel)
+
+	chatComp, _ := app.chat.Update(msg.StreamCompleteMsg{
+		CorrelationID:     "corr-parent-inspector-unscoped",
+		AgentID:           "inspector-pipeline",
+		AgentType:         "inspector-pipeline",
+		AuthoritativeText: "Waiting for the tester challenge result.",
+	})
+	app.chat = chatComp.(*chatpkg.Model)
+	app.deferPrimaryStream("corr-parent-inspector-unscoped")
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:         "s1",
+		CorrelationID:     "corr-child-tester-unscoped",
+		AgentID:           "task_1:tester-pipeline",
+		RuntimeAgentID:    "runtime-tester",
+		AgentType:         "tester-pipeline",
+		AgentName:         "Tester",
+		TaskID:            "task_1",
+		TaskName:          "Create hello.py CLI module with argparse and greet function",
+		TaskSlug:          "create-cli-module",
+		AuthoritativeText: "Fixed the test file defect.",
+		BranchRef:         branchRef,
+	})
+	app = model.(*AppModel)
+	return app
+}
+
+func TestPrepareStreamStart_PreservesRawAgentIDWhileRegisteringCanonicalPipelineWorker(t *testing.T) {
+	m := newStreamTelemetryModel()
+
+	start, created := m.prepareStreamStart(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-inspector-raw-preserved",
+		AgentID:        "inspector-pipeline",
+		RuntimeAgentID: "inspector-pipeline",
+		AgentType:      "inspector-pipeline",
+		AgentName:      "Pipeline Inspector",
+		PipelineID:     "task_auth_checkout",
+		TaskID:         "task_auth_checkout",
+		TaskName:       "Auth Checkout",
+		TaskSlug:       "auth-checkout",
+	})
+	if !created {
+		t.Fatal("expected prepareStreamStart to register a new stream")
+	}
+	if start.AgentID != "inspector-pipeline" {
+		t.Fatalf("prepared start AgentID = %q, want raw inspector-pipeline", start.AgentID)
+	}
+	if start.RuntimeAgentID != "inspector-pipeline" {
+		t.Fatalf("prepared start RuntimeAgentID = %q, want inspector-pipeline", start.RuntimeAgentID)
+	}
+
+	entry := m.streamEntryForCorrelation("corr-inspector-raw-preserved")
+	if entry == nil {
+		t.Fatal("expected active stream entry to be registered")
+	}
+	if entry.AgentID != "task_auth_checkout:inspector-pipeline" {
+		t.Fatalf("active stream entry AgentID = %q, want canonical task_auth_checkout:inspector-pipeline", entry.AgentID)
+	}
+	if entry.RuntimeAgentID != "inspector-pipeline" {
+		t.Fatalf("active stream entry RuntimeAgentID = %q, want raw inspector-pipeline", entry.RuntimeAgentID)
+	}
+}
+
+func TestEffectiveStreamUIAgentID_PrefersVisibleIdentity(t *testing.T) {
+	entry := &activeStreamEntry{
+		AgentID:        "task_auth_checkout:inspector-pipeline",
+		RuntimeAgentID: "runtime-inspector",
+		AgentType:      "inspector-pipeline",
+		PipelineID:     "task_auth_checkout",
+		TaskID:         "task_auth_checkout",
+	}
+
+	if got := effectiveStreamUIAgentID(entry, "inspector-pipeline", "runtime-inspector", "inspector-pipeline", "task_auth_checkout", "task_auth_checkout"); got != "task_auth_checkout:inspector-pipeline" {
+		t.Fatalf("effectiveStreamUIAgentID = %q, want task_auth_checkout:inspector-pipeline", got)
+	}
+
+	if got := effectiveStreamUIAgentID(entry, "", "", "inspector-pipeline", "task_auth_checkout", "task_auth_checkout"); got != "task_auth_checkout:inspector-pipeline" {
+		t.Fatalf("effectiveStreamUIAgentID without explicit agent = %q, want task_auth_checkout:inspector-pipeline", got)
+	}
+}
+
+func TestEffectiveStreamUIAgentID_DoesNotReuseGuidePlaceholderForResolvedAgent(t *testing.T) {
+	entry := &activeStreamEntry{
+		AgentID:        "guide",
+		RuntimeAgentID: "guide",
+		AgentType:      "guide",
+	}
+
+	if got := effectiveStreamUIAgentID(entry, "architect", "architect", "", "", ""); got != "architect" {
+		t.Fatalf("effectiveStreamUIAgentID = %q, want architect", got)
+	}
+}
+
 func TestStreamTelemetry_FinalizeUpdatesAgentContext(t *testing.T) {
 	m := newStreamTelemetryModel()
 
@@ -56,6 +309,21 @@ func TestStreamTelemetry_FinalizeUpdatesAgentContext(t *testing.T) {
 	}
 	if m.agentContextTokens["architect"] <= 0 {
 		t.Fatalf("expected architect context tokens > 0, got %d", m.agentContextTokens["architect"])
+	}
+}
+
+func TestCanonicalActivityAgentID_PrefersCanonicalVisibleReplicaIdentity(t *testing.T) {
+	ev := &events.ActivityEvent{
+		AgentID: "librarian#replica-corr-1",
+		Data: map[string]any{
+			"agent_type":         "librarian",
+			"canonical_agent_id": "librarian",
+			"runtime_agent_id":   "librarian#replica-corr-1",
+		},
+	}
+
+	if got := canonicalActivityAgentID(ev); got != "librarian" {
+		t.Fatalf("canonicalActivityAgentID = %q, want librarian", got)
 	}
 }
 
@@ -674,6 +942,32 @@ func TestHandleGuideResponse_PreservesSemanticPipelineAgentLabel(t *testing.T) {
 	}
 }
 
+func TestHandleGuideResponse_EmptySuccessfulResponseDoesNotPublishOrRender(t *testing.T) {
+	m := newStreamTelemetryModel()
+	m.chat.SetSize(80, 20)
+	collector := events.NewTestActivityCollector()
+	m.deps.ActivityPub = collector
+
+	if cmd := m.handleGuideResponse(msg.GuideResponseMsg{
+		CorrelationID: "corr-empty-response",
+		AgentID:       "inspector",
+		AgentType:     "inspector",
+		AgentName:     "Inspector",
+		Content:       "",
+	}); cmd != nil {
+		_ = cmd()
+	}
+
+	if got := len(collector.Events()); got != 0 {
+		t.Fatalf("published activity count = %d, want 0", got)
+	}
+	for y := 0; y < m.chat.ViewportHeight(); y++ {
+		if entry := m.chat.EntryAtViewLine(y); entry != nil {
+			t.Fatalf("expected no top-level chat entry for empty successful response, got %+v", entry)
+		}
+	}
+}
+
 func TestHandleGuideResponse_NestedBranchDoesNotCreateTopLevelChatEntry(t *testing.T) {
 	m := newStreamTelemetryModel()
 	m.chat.SetSize(80, 20)
@@ -994,6 +1288,140 @@ func TestStreamStartTelemetry_PreservesExistingNestedBranchWhenLaterStartDropsMe
 	}
 }
 
+func TestPrepareStreamStart_PreservesExistingNestedOwnershipWhenSyntheticStartDropsBranch(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	_, _ = app.prepareStreamStart(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-parent-synthetic-reset",
+		AgentID:       "architect",
+		AgentType:     "architect",
+		AgentName:     "Architect",
+	})
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-synthetic-reset",
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+		BranchRef: &msg.InterAgentBranchRefMsg{
+			ParentCorrelationID: "corr-parent-synthetic-reset",
+			ParentToolCallKey:   "consult-1",
+			Kind:                "consult",
+		},
+	})
+	app = model.(*AppModel)
+
+	start, created := app.prepareStreamStart(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-synthetic-reset",
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+	})
+	if created {
+		t.Fatal("expected synthetic metadata-less bootstrap to reuse existing nested registration")
+	}
+	if start.BranchRef != nil {
+		t.Fatalf("synthetic start BranchRef = %+v, want nil so registerPrimaryStream preserves the nested slot itself", start.BranchRef)
+	}
+	if _, ok := app.activeStreams["corr-child-synthetic-reset"]; ok {
+		t.Fatal("expected metadata-less synthetic bootstrap to avoid primary active stream registration")
+	}
+	entry, ok := app.nestedStreams["corr-child-synthetic-reset"]
+	if !ok || entry == nil || entry.BranchRef == nil {
+		t.Fatal("expected child stream to remain registered as nested after synthetic bootstrap")
+	}
+	if entry.BranchRef.ParentCorrelationID != "corr-parent-synthetic-reset" || entry.BranchRef.ParentToolCallKey != "consult-1" {
+		t.Fatalf("unexpected nested branch ref after synthetic bootstrap: %+v", entry.BranchRef)
+	}
+}
+
+func TestToolCallTelemetry_PreservesExistingNestedBranchWhenLaterEventDropsMetadata(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	_, _ = app.prepareStreamStart(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-parent-tool-reset",
+		AgentID:       "architect",
+		AgentType:     "architect",
+		AgentName:     "Architect",
+	})
+	app.chat.PushEntry(&chatpkg.ChatEntry{
+		ID:            "parent-tool-reset-entry",
+		Timestamp:     time.Now(),
+		CorrelationID: "corr-parent-tool-reset",
+		Source:        chatpkg.SourceAgent,
+		AgentType:     "architect",
+		Content:       "Refining the patch plan.",
+		Height:        -1,
+		ToolCalls: []chatpkg.ToolCallRecord{
+			{
+				ToolCallKey: "challenge-1",
+				ToolName:    "challenge_agent",
+				InterAgent: &chatpkg.InterAgentTool{
+					Kind:       chatpkg.InterAgentToolChallenge,
+					AgentTypes: []string{"tester-pipeline"},
+					Summary:    "Fix the failing test file.",
+					Status:     chatpkg.InterAgentToolPending,
+				},
+			},
+		},
+	})
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-tool-reset",
+		AgentID:       "task_1:tester-pipeline",
+		AgentType:     "tester-pipeline",
+		AgentName:     "Tester",
+		BranchRef: &msg.InterAgentBranchRefMsg{
+			ParentCorrelationID: "corr-parent-tool-reset",
+			ParentToolCallKey:   "challenge-1",
+			Kind:                "challenge",
+		},
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-child-tool-reset",
+		ParentCorrelationID: "corr-parent-tool-reset",
+		AgentID:             "runtime-tester",
+		AgentType:           "tester-pipeline",
+		AgentName:           "Tester",
+		ToolCallKey:         "tool-1",
+		ToolName:            "run_test_suite",
+		Phase:               0,
+		StartedAt:           time.Now(),
+	})
+	app = model.(*AppModel)
+
+	if _, ok := app.activeStreams["corr-child-tool-reset"]; ok {
+		t.Fatal("expected metadata-less child tool event to preserve nested ownership")
+	}
+	entry, ok := app.nestedStreams["corr-child-tool-reset"]
+	if !ok || entry == nil || entry.BranchRef == nil {
+		t.Fatal("expected child tool event to remain registered as nested")
+	}
+	if entry.BranchRef.ParentCorrelationID != "corr-parent-tool-reset" || entry.BranchRef.ParentToolCallKey != "challenge-1" {
+		t.Fatalf("unexpected nested branch ref after metadata-less tool event: %+v", entry.BranchRef)
+	}
+	for y := 0; y < app.chat.ViewportHeight(); y++ {
+		entry := app.chat.EntryAtViewLine(y)
+		if entry != nil && entry.CorrelationID == "corr-child-tool-reset" {
+			t.Fatal("expected metadata-less child tool event to avoid a top-level chat row")
+		}
+	}
+}
+
 func TestStreamProgressTelemetry_IgnoresLateNestedProgressAfterTerminalComplete(t *testing.T) {
 	app := newResizeTestApp(t)
 	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
@@ -1211,6 +1639,97 @@ func TestHandleGuideResponse_UsesExistingNestedBranchWhenMetadataDrops(t *testin
 	}
 }
 
+func TestHandleGuideResponse_UsesRecordedNestedBranchAfterTerminalComplete(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	app.chat.PushEntry(&chatpkg.ChatEntry{
+		ID:            "parent-entry-terminal-nested-response",
+		Timestamp:     time.Now(),
+		CorrelationID: "corr-parent-terminal-response",
+		Source:        chatpkg.SourceAgent,
+		AgentType:     "architect",
+		Content:       "Waiting on Academic confirmation.",
+		Height:        -1,
+		ToolCalls: []chatpkg.ToolCallRecord{
+			{
+				ToolCallKey: "consult-1",
+				ToolName:    "consult_academic_approach",
+				InterAgent: &chatpkg.InterAgentTool{
+					Kind:       chatpkg.InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Verify the proposed approach",
+					Status:     chatpkg.InterAgentToolPending,
+				},
+			},
+		},
+	})
+
+	branchRef := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-terminal-response",
+		ParentToolCallKey:   "consult-1",
+		Kind:                "consult",
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-terminal-response",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		AgentName:     "Academic",
+		BranchRef:     branchRef,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-terminal-response",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		AgentName:     "Academic",
+		BranchRef:     branchRef,
+	})
+	app = model.(*AppModel)
+
+	if _, ok := app.nestedStreams["corr-child-terminal-response"]; ok {
+		t.Fatal("expected nested stream registration to clear after terminal completion")
+	}
+
+	if cmd := app.handleGuideResponse(msg.GuideResponseMsg{
+		CorrelationID: "corr-child-terminal-response",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		Content:       "The proposed approach is sound and low risk.",
+	}); cmd != nil {
+		_ = cmd()
+	}
+
+	for y := 0; y < app.chat.ViewportHeight(); y++ {
+		entry := app.chat.EntryAtViewLine(y)
+		if entry != nil && entry.CorrelationID == "corr-child-terminal-response" {
+			t.Fatal("expected late nested route response after terminal completion to avoid a top-level chat row")
+		}
+	}
+
+	parent := findChatEntryByCorrelation(app.chat, "corr-parent-terminal-response")
+	if parent == nil || len(parent.ToolCalls) != 1 || parent.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected parent consult row after late nested route response, got %+v", parent)
+	}
+	row := parent.ToolCalls[0].InterAgent
+	if len(row.Children) != 1 {
+		t.Fatalf("expected one nested child activity after late route response, got %+v", row.Children)
+	}
+	child := row.Children[0]
+	if !child.Completed || child.Failed {
+		t.Fatalf("expected nested child to remain completed after late route response, got %+v", child)
+	}
+	if !strings.Contains(child.ResultSummary, "approach is sound and low risk") {
+		t.Fatalf("nested child result summary = %q, want late route-response content", child.ResultSummary)
+	}
+}
+
 func TestInterruptAllActiveRoutes_InterruptsNestedChildStreams(t *testing.T) {
 	app := newResizeTestApp(t)
 	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
@@ -1346,6 +1865,192 @@ func TestCommandApprovalRequest_UsesPrimaryInputFlowDuringNestedChildStream(t *t
 	}
 	if app.commandApproval.proposal == nil || app.commandApproval.proposal.CorrelationID != "corr-child-approval" {
 		t.Fatalf("approval proposal correlation = %+v, want corr-child-approval", app.commandApproval.proposal)
+	}
+}
+
+func TestCommandApprovalRequest_KeepsDeferredPipelineInspectorAnimating(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 120, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-parent-inspector-approval",
+		AgentID:       "task_1:inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Pipeline Inspector",
+		PipelineID:    "task_1",
+		TaskID:        "task_1",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-parent-inspector-approval",
+		AgentID:       "task_1:inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Pipeline Inspector",
+		PipelineID:    "task_1",
+		TaskID:        "task_1",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		FullArgs:      `{"target":"tester-pipeline","request":"Validate the implementation against the criteria contract."}`,
+		Phase:         0,
+		StartedAt:     time.Now().Add(-1500 * time.Millisecond),
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "challenge",
+			Status:     "pending",
+			AgentTypes: []string{"tester-pipeline"},
+			Summary:    "Validate the implementation against the criteria contract.",
+			ThreadKey:  "pipeline:task_1-challenge-1",
+		},
+	})
+	app = model.(*AppModel)
+
+	challengeBranch := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-inspector-approval",
+		ParentToolCallKey:   "challenge-1",
+		Kind:                "challenge",
+	}
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-tester-approval",
+		AgentID:       "task_1:tester-pipeline",
+		AgentType:     "tester-pipeline",
+		AgentName:     "Pipeline Tester",
+		PipelineID:    "task_1",
+		TaskID:        "task_1",
+		BranchRef:     challengeBranch,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-tester-approval",
+		AgentID:       "task_1:tester-pipeline",
+		AgentType:     "tester-pipeline",
+		AgentName:     "Pipeline Tester",
+		PipelineID:    "task_1",
+		TaskID:        "task_1",
+		Message:       "Waiting for Guardian approval for run_command",
+		BranchRef:     challengeBranch,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-tester-approval",
+		AgentID:       "task_1:tester-pipeline",
+		AgentType:     "tester-pipeline",
+		AgentName:     "Pipeline Tester",
+		PipelineID:    "task_1",
+		TaskID:        "task_1",
+		ToolCallKey:   "approval-1",
+		ToolName:      "approval_guardian",
+		FullArgs:      `{"target":"guardian","tool_name":"run_command","summary":"Waiting for Guardian approval for run_command"}`,
+		Phase:         0,
+		StartedAt:     time.Now().Add(-1200 * time.Millisecond),
+		BranchRef:     challengeBranch,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "approval",
+			Status:     "pending",
+			AgentTypes: []string{"guardian"},
+			Summary:    "Waiting for Guardian approval for run_command",
+		},
+	})
+	app = model.(*AppModel)
+
+	approvalBranch := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-child-tester-approval",
+		ParentToolCallKey:   "approval-1",
+		Kind:                "approval",
+	}
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-grandchild-guardian-approval",
+		AgentID:       "guardian",
+		AgentType:     "guardian",
+		AgentName:     "Guardian",
+		BranchRef:     approvalBranch,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-parent-inspector-approval",
+		AgentID:       "task_1:inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Pipeline Inspector",
+		PipelineID:    "task_1",
+		TaskID:        "task_1",
+	})
+	app = model.(*AppModel)
+
+	parent := findChatEntryByCorrelation(app.chat, "corr-parent-inspector-approval")
+	if parent == nil {
+		t.Fatal("expected inspector parent entry")
+	}
+	if parent.Streaming {
+		t.Fatalf("expected inspector entry to finalize while tester child is pending, got %+v", parent)
+	}
+	if strings.TrimSpace(parent.ThinkingStatus) != "" || strings.TrimSpace(parent.ThinkingText) != "" {
+		t.Fatalf("expected parent waiting footer to clear after completion, got %+v", parent)
+	}
+	if got := len(parent.ToolCalls); got != 1 {
+		t.Fatalf("parent tool call count = %d, want 1 challenge row", got)
+	}
+	if parent.ToolCalls[0].InterAgent == nil || len(parent.ToolCalls[0].InterAgent.Children) != 1 {
+		t.Fatalf("expected nested tester child activity, got %+v", parent.ToolCalls[0])
+	}
+	beforeChildText := parent.ToolCalls[0].InterAgent.Children[0].ThinkingText
+	if strings.TrimSpace(beforeChildText) == "" {
+		t.Fatalf("expected nested tester child spinner text before approval, got %+v", parent.ToolCalls[0].InterAgent.Children[0])
+	}
+
+	model, _ = app.Update(msg.CommandApprovalRequestMsg{
+		Proposal: &commandapproval.Proposal{
+			CorrelationID: "corr-grandchild-guardian-approval",
+			TargetAgentID: "guardian",
+			AgentType:     "guardian",
+			Command:       "python -m pytest tools/hello-cli/test_hello.py",
+		},
+	})
+	app = model.(*AppModel)
+
+	if app.commandApproval == nil {
+		t.Fatal("expected command approval to open while tester child is pending")
+	}
+	beforeView := app.View()
+
+	model, _ = app.Update(msg.DecorTickMsg{
+		Time: time.Now().Add(900 * time.Millisecond),
+		Gen:  app.decorGen,
+	})
+	app = model.(*AppModel)
+
+	parent = findChatEntryByCorrelation(app.chat, "corr-parent-inspector-approval")
+	if parent == nil {
+		t.Fatal("expected inspector parent entry after decor tick")
+	}
+	if parent.Streaming {
+		t.Fatalf("expected inspector parent to remain finalized across approval flow, got %+v", parent)
+	}
+	child := parent.ToolCalls[0].InterAgent.Children[0]
+	if child.ThinkingText == beforeChildText {
+		t.Fatalf("expected nested tester child spinner/timer to keep animating across approval flow, got %q", child.ThinkingText)
+	}
+	if child.ThinkingStatus != "Waiting for Guardian approval for run_command" {
+		t.Fatalf("child thinking status = %q, want waiting-for-approval status", child.ThinkingStatus)
+	}
+	afterView := app.View()
+	if afterView == beforeView {
+		t.Fatal("expected rendered frame to change when nested child timers advance during approval flow")
+	}
+	if entry := app.streamEntryForCorrelation("corr-parent-inspector-approval"); entry == nil {
+		t.Fatal("expected deferred inspector parent stream entry to remain registered across approval flow")
 	}
 }
 
@@ -1496,6 +2201,131 @@ func TestToolCallTelemetry_BootstrapsPrimaryPipelineOwnerBeforeStreamStart(t *te
 	}
 	if view := app.chat.View(); !strings.Contains(view, "coord_publish_artifact") {
 		t.Fatalf("expected tester tool call in chat view, got %q", view)
+	}
+}
+
+func TestStreamProgressTelemetry_DoesNotRebootstrapKnownPrimaryStream(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-engineer-live-progress",
+		AgentID:        "task_2:engineer",
+		RuntimeAgentID: "runtime-engineer",
+		AgentType:      "engineer",
+		AgentName:      "Engineer",
+		TaskID:         "task_2",
+		TaskName:       "Create pyproject.toml",
+		TaskSlug:       "create-pyproject-toml",
+	})
+	app = model.(*AppModel)
+
+	app.recordStreamChunk("corr-engineer-live-progress", "implementation is underway")
+
+	model, _ = app.Update(msg.StreamProgressMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-engineer-live-progress",
+		AgentID:        "task_2:engineer",
+		RuntimeAgentID: "runtime-engineer",
+		AgentType:      "engineer",
+		AgentName:      "Engineer",
+		TaskID:         "task_2",
+		TaskName:       "Create pyproject.toml",
+		TaskSlug:       "create-pyproject-toml",
+		Message:        "Publishing the validation findings artifact for downstream review.",
+	})
+	app = model.(*AppModel)
+
+	state, ok := app.streamedResponses["corr-engineer-live-progress"]
+	if !ok {
+		t.Fatal("expected recorded stream state for active engineer correlation")
+	}
+	if !state.HadChunk {
+		t.Fatalf("expected progress on an active primary stream to preserve recorded output state, got %+v", state)
+	}
+	if entry := app.streamEntryForCorrelation("corr-engineer-live-progress"); entry == nil || entry.AgentID != "task_2:engineer" {
+		t.Fatalf("expected active engineer stream to remain registered under the same primary row, got %+v", entry)
+	}
+}
+
+func TestToolCallTelemetry_DoesNotRebootstrapKnownPrimaryStream(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-inspector-live-tool",
+		AgentID:        "task_3:inspector-pipeline",
+		RuntimeAgentID: "runtime-inspector",
+		AgentType:      "inspector-pipeline",
+		AgentName:      "Inspector",
+		TaskID:         "task_3",
+		TaskName:       "Create hello.py CLI entrypoint",
+		TaskSlug:       "create-cli-entrypoint",
+	})
+	app = model.(*AppModel)
+
+	app.recordStreamChunk("corr-inspector-live-tool", "auditing the returned implementation")
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector-live-tool",
+		AgentID:       "task_3:inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		TaskID:        "task_3",
+		TaskName:      "Create hello.py CLI entrypoint",
+		TaskSlug:      "create-cli-entrypoint",
+		ToolCallKey:   "finalize-1",
+		ToolName:      "finalize_pipeline",
+		ArgsSummary:   "summary=Inspector audit complete.",
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	app = model.(*AppModel)
+
+	state, ok := app.streamedResponses["corr-inspector-live-tool"]
+	if !ok {
+		t.Fatal("expected recorded stream state for active inspector correlation")
+	}
+	if !state.HadChunk {
+		t.Fatalf("expected tool start on an active primary stream to preserve recorded output state, got %+v", state)
+	}
+	if entry := app.streamEntryForCorrelation("corr-inspector-live-tool"); entry == nil || entry.AgentID != "task_3:inspector-pipeline" {
+		t.Fatalf("expected active inspector stream to remain registered under the same primary row, got %+v", entry)
+	}
+}
+
+func TestResolveIncomingStreamBranchRef_PreservesRecordedNestedBranchAfterUnregister(t *testing.T) {
+	app := newStreamTelemetryModel()
+	branchRef := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent",
+		ParentToolCallKey:   "challenge-1",
+		Kind:                "challenge",
+		ThreadKey:           "pipeline:task_1-challenge-1",
+	}
+
+	app.recordStreamStart("corr-child")
+	app.recordStreamBranchRef("corr-child", branchRef)
+	app.nestedStreams["corr-child"] = &activeStreamEntry{
+		CorrelationID: "corr-child",
+		AgentID:       "task_1:tester-pipeline",
+		AgentType:     "tester-pipeline",
+		BranchRef:     cloneInterAgentBranchRef(branchRef),
+	}
+	app.unregisterStream("corr-child")
+
+	resolved := app.resolveIncomingStreamBranchRef("corr-child", "", nil, false)
+	if resolved == nil {
+		t.Fatal("expected recorded nested branch metadata to survive stream unregister")
+	}
+	if resolved.ParentCorrelationID != "corr-parent" || resolved.ParentToolCallKey != "challenge-1" || resolved.Kind != "challenge" {
+		t.Fatalf("resolved branch ref = %+v, want preserved recorded branch metadata", resolved)
 	}
 }
 
@@ -1764,6 +2594,7 @@ func TestTopLevelTransferToolCallClearsStaleNestedTesterChildState(t *testing.T)
 		SessionID:           "s1",
 		CorrelationID:       "corr-tester",
 		ParentCorrelationID: "corr-inspector",
+		TopLevelTransfer:    true,
 		AgentID:             "runtime-tester",
 		AgentType:           "tester-pipeline",
 		AgentName:           "Tester",
@@ -1871,6 +2702,7 @@ func TestTopLevelHandoffStart_ClearsDeferredThinkingWithoutExplicitReroute(t *te
 		SessionID:           "s1",
 		CorrelationID:       "corr-tester",
 		ParentCorrelationID: "corr-inspector",
+		TopLevelTransfer:    true,
 		AgentID:             "runtime-tester",
 		AgentType:           "tester-pipeline",
 		AgentName:           "Tester",
@@ -1971,6 +2803,7 @@ func TestTopLevelHandoffProgressBootstrap_ClearsDeferredThinkingWithoutExplicitR
 		SessionID:           "s1",
 		CorrelationID:       "corr-tester",
 		ParentCorrelationID: "corr-inspector",
+		TopLevelTransfer:    true,
 		AgentID:             "runtime-tester",
 		AgentType:           "tester-pipeline",
 		AgentName:           "Tester",
@@ -1998,6 +2831,104 @@ func TestTopLevelHandoffProgressBootstrap_ClearsDeferredThinkingWithoutExplicitR
 
 	if view := app.chat.View(); strings.Contains(view, "Waiting for child work to finish...") {
 		t.Fatalf("unexpected deferred child-work status after progress-bootstrap handoff: %q", view)
+	}
+}
+
+func TestTopLevelHandoffReturn_CreatesNewInspectorChatEntry(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-inspector-initial",
+		AgentID:        "runtime-inspector",
+		RuntimeAgentID: "runtime-inspector",
+		AgentType:      "inspector-pipeline",
+		AgentName:      "Inspector",
+		PipelineID:     "task_auth_checkout",
+		TaskID:         "task_auth_checkout",
+		TaskName:       "Auth Checkout",
+		TaskSlug:       "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-inspector-initial",
+		AgentID:        "runtime-inspector",
+		RuntimeAgentID: "runtime-inspector",
+		AgentType:      "inspector-pipeline",
+		AgentName:      "Inspector",
+		PipelineID:     "task_auth_checkout",
+		TaskID:         "task_auth_checkout",
+		TaskName:       "Auth Checkout",
+		TaskSlug:       "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-tester-top-level",
+		ParentCorrelationID: "corr-inspector-initial",
+		TopLevelTransfer:    true,
+		AgentID:             "runtime-tester",
+		RuntimeAgentID:      "runtime-tester",
+		AgentType:           "tester-pipeline",
+		AgentName:           "Tester",
+		PipelineID:          "task_auth_checkout",
+		TaskID:              "task_auth_checkout",
+		TaskName:            "Auth Checkout",
+		TaskSlug:            "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-tester-top-level",
+		AgentID:        "runtime-tester",
+		RuntimeAgentID: "runtime-tester",
+		AgentType:      "tester-pipeline",
+		AgentName:      "Tester",
+		PipelineID:     "task_auth_checkout",
+		TaskID:         "task_auth_checkout",
+		TaskName:       "Auth Checkout",
+		TaskSlug:       "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-inspector-return",
+		ParentCorrelationID: "corr-tester-top-level",
+		TopLevelTransfer:    true,
+		AgentID:             "runtime-inspector",
+		RuntimeAgentID:      "runtime-inspector",
+		AgentType:           "inspector-pipeline",
+		AgentName:           "Inspector",
+		PipelineID:          "task_auth_checkout",
+		TaskID:              "task_auth_checkout",
+		TaskName:            "Auth Checkout",
+		TaskSlug:            "auth-checkout",
+	})
+	app = model.(*AppModel)
+
+	if old := findChatEntryByCorrelation(app.chat, "corr-inspector-initial"); old == nil {
+		t.Fatal("expected old inspector correlation to remain in the transcript")
+	}
+	resumed := findChatEntryByCorrelation(app.chat, "corr-inspector-return")
+	if resumed == nil {
+		t.Fatal("expected new inspector chat entry after handoff return")
+	}
+	if !resumed.Streaming {
+		t.Fatalf("expected resumed inspector row to be live, got %+v", resumed)
+	}
+	if strings.TrimSpace(resumed.ThinkingText) == "" {
+		t.Fatalf("expected resumed inspector footer to restart, got %+v", resumed)
+	}
+	if tester := findChatEntryByCorrelation(app.chat, "corr-tester-top-level"); tester == nil {
+		t.Fatal("expected top-level tester handoff row to remain present")
 	}
 }
 
@@ -2251,7 +3182,141 @@ func TestStreamCompleteTelemetry_PropagatesNestedCompletionEvenWhenTopLevelRende
 	}
 }
 
-func TestHandleGuideResponse_TopLevelPendingChildWorkDefersCompletion(t *testing.T) {
+func TestLateNestedChildToolAndGrandchildStreamAfterRouteResponseRemainVisible(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	app.chat.PushEntry(&chatpkg.ChatEntry{
+		ID:            "inspector-origin-late-nested-after-response",
+		Timestamp:     time.Now(),
+		CorrelationID: "corr-parent-late-nested-after-response",
+		Source:        chatpkg.SourceAgent,
+		AgentType:     "inspector",
+		Content:       "Reviewing the strongest alternatives.",
+		Height:        -1,
+		ToolCalls: []chatpkg.ToolCallRecord{
+			{
+				ToolCallKey: "consult-academic-1",
+				ToolName:    "consult_academic_approach",
+				Completed:   true,
+				Success:     true,
+				InterAgent: &chatpkg.InterAgentTool{
+					Kind:       chatpkg.InterAgentToolConsult,
+					AgentTypes: []string{"academic"},
+					Summary:    "Challenge the current implementation.",
+					Status:     chatpkg.InterAgentToolPending,
+				},
+			},
+		},
+	})
+
+	parentBranch := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-late-nested-after-response",
+		ParentToolCallKey:   "consult-academic-1",
+		Kind:                "consult",
+	}
+
+	if cmd := app.handleGuideResponse(msg.GuideResponseMsg{
+		CorrelationID: "corr-child-academic-late-after-response",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		Content:       "The current approach is probably acceptable.",
+		BranchRef:     parentBranch,
+	}); cmd != nil {
+		_ = cmd()
+	}
+
+	if _, ok := app.nestedStreams["corr-child-academic-late-after-response"]; ok {
+		t.Fatal("expected nested stream registration to stay cleared after synthetic child completion")
+	}
+
+	model, _ := app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-academic-late-after-response",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		AgentName:     "Academic",
+		ToolCallKey:   "consult-lib-1",
+		ToolName:      "consult",
+		FullArgs:      `{"target":"librarian","query":"Find benchmark and methodology sources."}`,
+		Phase:         0,
+		StartedAt:     time.Now().Add(-300 * time.Millisecond),
+		BranchRef:     parentBranch,
+	})
+	app = model.(*AppModel)
+
+	librarianBranch := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-child-academic-late-after-response",
+		ParentToolCallKey:   "consult-lib-1",
+		Kind:                "consult",
+	}
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-grandchild-librarian-late-after-response",
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+		BranchRef:     librarianBranch,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-grandchild-librarian-late-after-response",
+		AgentID:       "librarian",
+		AgentType:     "librarian",
+		AgentName:     "Librarian",
+		ToolCallKey:   "ws_1",
+		ToolName:      "web_search",
+		ArgsSummary:   "query=framework benchmark methodology",
+		FullArgs:      `{"query":"framework benchmark methodology"}`,
+		Phase:         0,
+		StartedAt:     time.Now().Add(-150 * time.Millisecond),
+		BranchRef:     librarianBranch,
+	})
+	app = model.(*AppModel)
+
+	parent := findChatEntryByCorrelation(app.chat, "corr-parent-late-nested-after-response")
+	if parent == nil || len(parent.ToolCalls) != 1 || parent.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected parent consult row after late nested events, got %+v", parent)
+	}
+	root := parent.ToolCalls[0].InterAgent
+	if len(root.Children) != 1 {
+		t.Fatalf("expected one academic child activity, got %+v", root.Children)
+	}
+	academic := root.Children[0]
+	if got := len(academic.ToolCalls); got != 1 {
+		t.Fatalf("expected academic child consult row after late events, got %+v", academic.ToolCalls)
+	}
+	consult := academic.ToolCalls[0].InterAgent
+	if consult == nil {
+		t.Fatalf("expected academic child consult branch, got %+v", academic.ToolCalls[0])
+	}
+	if got := len(consult.Children); got != 1 {
+		t.Fatalf("expected one librarian grandchild activity, got %+v", consult.Children)
+	}
+	librarian := consult.Children[0]
+	if librarian.CorrelationID != "corr-grandchild-librarian-late-after-response" {
+		t.Fatalf("librarian correlation = %q, want corr-grandchild-librarian-late-after-response", librarian.CorrelationID)
+	}
+	if got := len(librarian.ToolCalls); got != 1 {
+		t.Fatalf("expected librarian grandchild tool call after late events, got %+v", librarian.ToolCalls)
+	}
+	if librarian.ToolCalls[0].ToolName != "web_search" {
+		t.Fatalf("librarian grandchild tool = %q, want web_search", librarian.ToolCalls[0].ToolName)
+	}
+	if findChatEntryByCorrelation(app.chat, "corr-child-academic-late-after-response") != nil {
+		t.Fatal("expected academic child to remain nested after late events")
+	}
+	if findChatEntryByCorrelation(app.chat, "corr-grandchild-librarian-late-after-response") != nil {
+		t.Fatal("expected librarian grandchild to remain nested after late events")
+	}
+}
+
+func TestHandleGuideResponse_TopLevelPendingChildWorkKeepsParentResumable(t *testing.T) {
 	app := newResizeTestApp(t)
 	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
 		t.Fatalf("initial resize command = %v, want nil", cmd)
@@ -2320,20 +3385,368 @@ func TestHandleGuideResponse_TopLevelPendingChildWorkDefersCompletion(t *testing
 	if parent == nil {
 		t.Fatal("expected parent entry after top-level route response")
 	}
-	if !parent.Streaming {
-		t.Fatalf("expected parent entry to remain streaming while child work is active, got %+v", parent)
+	if parent.Streaming {
+		t.Fatalf("expected parent entry to finalize while child work remains nested, got %+v", parent)
 	}
 	if parent.Content != "Research synthesis is ready." {
 		t.Fatalf("parent content = %q, want authoritative route-response content", parent.Content)
 	}
-	if !strings.Contains(parent.ThinkingStatus, "Waiting for child work to finish...") {
-		t.Fatalf("parent thinking status = %q, want deferred completion status", parent.ThinkingStatus)
+	if strings.TrimSpace(parent.ThinkingStatus) != "" || strings.TrimSpace(parent.ThinkingText) != "" {
+		t.Fatalf("expected parent waiting footer to clear after completion, got %+v", parent)
 	}
 	if !app.chat.HasPendingCorrelation("corr-parent-deferred-route") {
-		t.Fatal("expected route response to stay attached to the existing chat stream slot")
+		t.Fatal("expected completed parent correlation to remain resumable for follow-up work")
+	}
+	if entry := app.streamEntryForCorrelation("corr-parent-deferred-route"); entry == nil {
+		t.Fatal("expected route-response parent stream entry to remain registered for follow-up work")
 	}
 	if findChatEntryByCorrelation(app.chat, "corr-child-deferred-route") != nil {
 		t.Fatal("expected child guardian activity to stay nested")
+	}
+
+	beforeChildText := parent.ToolCalls[0].InterAgent.Children[0].ThinkingText
+	model, _ = app.Update(msg.DecorTickMsg{
+		Time: time.Now().Add(700 * time.Millisecond),
+		Gen:  app.decorGen,
+	})
+	app = model.(*AppModel)
+
+	parent = findChatEntryByCorrelation(app.chat, "corr-parent-deferred-route")
+	if parent == nil {
+		t.Fatal("expected parent entry after decor tick")
+	}
+	if got := parent.ToolCalls[0].InterAgent.Children[0].ThinkingText; got == beforeChildText {
+		t.Fatalf("expected nested child spinner/timer to keep animating, got %q", got)
+	}
+}
+
+func TestPostConsultParentResume_StreamStartKeepsDeferredParentCorrelatedByRuntimeID(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-parent-runtime-consult",
+		AgentID:        "academic",
+		RuntimeAgentID: "runtime-academic",
+		AgentType:      "academic",
+		AgentName:      "Academic",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-parent-runtime-consult",
+		AgentID:       "runtime-academic",
+		AgentType:     "academic",
+		AgentName:     "Academic",
+		ToolCallKey:   "consult-guardian-runtime",
+		ToolName:      "consult",
+		FullArgs:      `{"target":"guardian","query":"Check the current safety assumptions."}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	app = model.(*AppModel)
+
+	branchRef := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-runtime-consult",
+		ParentToolCallKey:   "consult-guardian-runtime",
+		Kind:                "consult",
+	}
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-child-runtime-consult",
+		AgentID:        "guardian",
+		RuntimeAgentID: "guardian",
+		AgentType:      "guardian",
+		AgentName:      "Guardian",
+		BranchRef:      branchRef,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.GuideResponseMsg{
+		CorrelationID: "corr-parent-runtime-consult",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		AgentName:     "Academic",
+		Content:       "Research synthesis is ready.",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:         "s1",
+		CorrelationID:     "corr-child-runtime-consult",
+		AgentID:           "guardian",
+		RuntimeAgentID:    "guardian",
+		AgentType:         "guardian",
+		AgentName:         "Guardian",
+		AuthoritativeText: "Safety assumptions confirmed.",
+		BranchRef:         branchRef,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-parent-runtime-followup",
+		AgentID:        "academic",
+		RuntimeAgentID: "runtime-academic",
+		AgentType:      "academic",
+		AgentName:      "Academic",
+	})
+	app = model.(*AppModel)
+
+	if old := findChatEntryByCorrelation(app.chat, "corr-parent-runtime-consult"); old != nil {
+		t.Fatalf("expected deferred parent correlation to be replaced on consult resume, got %+v", old)
+	}
+	resumed := findChatEntryByCorrelation(app.chat, "corr-parent-runtime-followup")
+	if resumed == nil {
+		t.Fatal("expected resumed parent entry after consult completion")
+	}
+	if resumed.AgentID != "academic" {
+		t.Fatalf("resumed parent AgentID = %q, want academic", resumed.AgentID)
+	}
+	if resumed.Content != "Research synthesis is ready." {
+		t.Fatalf("resumed parent content = %q, want preserved deferred content", resumed.Content)
+	}
+}
+
+func TestPostConsultParentResume_ProgressBootstrapKeepsDeferredParentCorrelatedByRuntimeID(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-parent-runtime-progress",
+		AgentID:        "academic",
+		RuntimeAgentID: "runtime-academic",
+		AgentType:      "academic",
+		AgentName:      "Academic",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-parent-runtime-progress",
+		AgentID:       "runtime-academic",
+		AgentType:     "academic",
+		AgentName:     "Academic",
+		ToolCallKey:   "consult-guardian-progress",
+		ToolName:      "consult",
+		FullArgs:      `{"target":"guardian","query":"Check the current safety assumptions."}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	app = model.(*AppModel)
+
+	branchRef := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-runtime-progress",
+		ParentToolCallKey:   "consult-guardian-progress",
+		Kind:                "consult",
+	}
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-child-runtime-progress",
+		AgentID:        "guardian",
+		RuntimeAgentID: "guardian",
+		AgentType:      "guardian",
+		AgentName:      "Guardian",
+		BranchRef:      branchRef,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.GuideResponseMsg{
+		CorrelationID: "corr-parent-runtime-progress",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		AgentName:     "Academic",
+		Content:       "Research synthesis is ready.",
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:         "s1",
+		CorrelationID:     "corr-child-runtime-progress",
+		AgentID:           "guardian",
+		RuntimeAgentID:    "guardian",
+		AgentType:         "guardian",
+		AgentName:         "Guardian",
+		AuthoritativeText: "Safety assumptions confirmed.",
+		BranchRef:         branchRef,
+	})
+	app = model.(*AppModel)
+
+	model, _ = app.Update(msg.StreamProgressMsg{
+		SessionID:      "s1",
+		CorrelationID:  "corr-parent-runtime-progress-followup",
+		AgentID:        "academic",
+		RuntimeAgentID: "runtime-academic",
+		AgentType:      "academic",
+		AgentName:      "Academic",
+		Message:        "Refining the final recommendation.",
+	})
+	app = model.(*AppModel)
+
+	if old := findChatEntryByCorrelation(app.chat, "corr-parent-runtime-progress"); old != nil {
+		t.Fatalf("expected deferred parent correlation to be replaced after progress bootstrap, got %+v", old)
+	}
+	resumed := findChatEntryByCorrelation(app.chat, "corr-parent-runtime-progress-followup")
+	if resumed == nil {
+		t.Fatal("expected resumed parent entry after progress bootstrap")
+	}
+	if resumed.AgentID != "academic" {
+		t.Fatalf("resumed parent AgentID = %q, want academic", resumed.AgentID)
+	}
+	if resumed.Content != "Research synthesis is ready." {
+		t.Fatalf("resumed parent content = %q, want preserved deferred content", resumed.Content)
+	}
+	if strings.TrimSpace(resumed.ThinkingStatus) == "" {
+		t.Fatalf("expected resumed parent to keep active progress after bootstrap, got %+v", resumed)
+	}
+}
+
+func TestChallengeReturn_ProgressBootstrapWaitsForAuthoritativeStart(t *testing.T) {
+	app := seedDeferredInspectorChallengeReturn(t)
+
+	model, _ := app.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-parent-inspector-followup-progress",
+		AgentID:       "inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		Message:       "Processing the returned challenge evidence.",
+	})
+	app = model.(*AppModel)
+
+	if duplicate := findChatEntryByCorrelation(app.chat, "corr-parent-inspector-followup-progress"); duplicate != nil {
+		t.Fatalf("expected ambiguous challenge-return progress to avoid creating a duplicate inspector row, got %+v", duplicate)
+	}
+	if pending := len(app.delayedPrimaryBootstrap["corr-parent-inspector-followup-progress"]); pending != 1 {
+		t.Fatalf("delayed primary bootstrap count = %d, want 1 buffered progress event", pending)
+	}
+	if original := findChatEntryByCorrelation(app.chat, "corr-parent-inspector-challenge"); original == nil {
+		t.Fatal("expected original deferred inspector row to remain visible")
+	}
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-parent-inspector-followup-progress",
+		ParentCorrelationID: "corr-child-tester-challenge",
+		TopLevelTransfer:    true,
+		AgentID:             "task_1:inspector-pipeline",
+		RuntimeAgentID:      "runtime-inspector",
+		AgentType:           "inspector-pipeline",
+		AgentName:           "Inspector",
+		TaskID:              "task_1",
+		TaskName:            "Create hello.py CLI module with argparse and greet function",
+		TaskSlug:            "create-cli-module",
+	})
+	app = model.(*AppModel)
+
+	if old := findChatEntryByCorrelation(app.chat, "corr-parent-inspector-challenge"); old != nil {
+		t.Fatalf("expected original deferred inspector correlation to be replaced after authoritative resume, got %+v", old)
+	}
+	resumed := findChatEntryByCorrelation(app.chat, "corr-parent-inspector-followup-progress")
+	if resumed == nil {
+		t.Fatal("expected authoritative inspector resume to reuse the original row")
+	}
+	if len(app.delayedPrimaryBootstrap["corr-parent-inspector-followup-progress"]) != 0 {
+		t.Fatalf("expected delayed progress buffer to clear after authoritative start, got %d pending events", len(app.delayedPrimaryBootstrap["corr-parent-inspector-followup-progress"]))
+	}
+	if strings.TrimSpace(resumed.ThinkingText) == "" {
+		t.Fatalf("expected resumed inspector row to remain live after authoritative resume, got %+v", resumed)
+	}
+}
+
+func TestChallengeReturn_ToolCallBootstrapWaitsForAuthoritativeStart(t *testing.T) {
+	app := seedDeferredInspectorChallengeReturn(t)
+
+	model, _ := app.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-parent-inspector-followup-tool",
+		AgentID:       "inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		ToolCallKey:   "process-validation-1",
+		ToolName:      "process_validation",
+		FullArgs:      `{"validation_id":"val-1","decision":"accept"}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	app = model.(*AppModel)
+
+	if duplicate := findChatEntryByCorrelation(app.chat, "corr-parent-inspector-followup-tool"); duplicate != nil {
+		t.Fatalf("expected ambiguous challenge-return tool bootstrap to avoid creating a duplicate inspector row, got %+v", duplicate)
+	}
+	if pending := len(app.delayedPrimaryBootstrap["corr-parent-inspector-followup-tool"]); pending != 1 {
+		t.Fatalf("delayed primary bootstrap count = %d, want 1 buffered tool event", pending)
+	}
+
+	model, _ = app.Update(msg.StreamStartMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-parent-inspector-followup-tool",
+		ParentCorrelationID: "corr-child-tester-challenge",
+		TopLevelTransfer:    true,
+		AgentID:             "task_1:inspector-pipeline",
+		RuntimeAgentID:      "runtime-inspector",
+		AgentType:           "inspector-pipeline",
+		AgentName:           "Inspector",
+		TaskID:              "task_1",
+		TaskName:            "Create hello.py CLI module with argparse and greet function",
+		TaskSlug:            "create-cli-module",
+	})
+	app = model.(*AppModel)
+
+	resumed := findChatEntryByCorrelation(app.chat, "corr-parent-inspector-followup-tool")
+	if resumed == nil {
+		t.Fatal("expected authoritative inspector resume after buffered tool bootstrap")
+	}
+	if len(app.delayedPrimaryBootstrap["corr-parent-inspector-followup-tool"]) != 0 {
+		t.Fatalf("expected delayed tool buffer to clear after authoritative start, got %d pending events", len(app.delayedPrimaryBootstrap["corr-parent-inspector-followup-tool"]))
+	}
+	if strings.TrimSpace(resumed.ThinkingText) == "" {
+		t.Fatalf("expected resumed inspector row to remain live after buffered tool bootstrap, got %+v", resumed)
+	}
+}
+
+func TestChallengeReturn_AuthoritativeStartReusesDeferredInspectorWhenTaskIdentityArrivesOnResume(t *testing.T) {
+	app := seedDeferredInspectorChallengeReturnUnscopedParent(t)
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-parent-inspector-followup-unscoped",
+		ParentCorrelationID: "corr-child-tester-unscoped",
+		TopLevelTransfer:    true,
+		AgentID:             "task_1:inspector-pipeline",
+		RuntimeAgentID:      "runtime-inspector",
+		AgentType:           "inspector-pipeline",
+		AgentName:           "Inspector",
+		TaskID:              "task_1",
+		TaskName:            "Create hello.py CLI module with argparse and greet function",
+		TaskSlug:            "create-cli-module",
+	})
+	app = model.(*AppModel)
+
+	if old := findChatEntryByCorrelation(app.chat, "corr-parent-inspector-unscoped"); old != nil {
+		t.Fatalf("expected original unscoped inspector correlation to be replaced after authoritative resume, got %+v", old)
+	}
+	resumed := findChatEntryByCorrelation(app.chat, "corr-parent-inspector-followup-unscoped")
+	if resumed == nil {
+		t.Fatal("expected authoritative inspector resume to reuse the original row when task identity arrives late")
+	}
+	if resumed.Content != "Waiting for the tester challenge result." {
+		t.Fatalf("resumed inspector content = %q, want preserved deferred content", resumed.Content)
+	}
+	if resumed.TaskID != "task_1" {
+		t.Fatalf("resumed inspector task_id = %q, want task_1", resumed.TaskID)
+	}
+	if strings.TrimSpace(resumed.ThinkingText) == "" {
+		t.Fatalf("expected resumed inspector row to remain live after authoritative resume, got %+v", resumed)
 	}
 }
 
@@ -2351,8 +3764,8 @@ func TestHandleGuideResponse_NestedConsultRowsRemainVisibleAfterChildStreamText(
 		AgentType:      "architect",
 		Content:        "Architect draft text should stay hidden while the consult runs.",
 		Streaming:      true,
-		ThinkingText:   "Waiting for child work to finish...",
-		ThinkingStatus: "Waiting for child work to finish...",
+		ThinkingText:   "⠋  0.3s",
+		ThinkingStatus: "Waiting on academic consult.",
 		Height:         -1,
 		ToolCalls: []chatpkg.ToolCallRecord{
 			{
@@ -2441,8 +3854,8 @@ func TestHandleGuideResponse_NestedConsultRowsRemainVisibleAfterChildStreamText(
 	app = model.(*AppModel)
 
 	rendered := app.chat.View()
-	if strings.Contains(rendered, "Architect draft text should stay hidden while the consult runs.") {
-		t.Fatalf("expected parent draft text to stay hidden while nested consult work is active, got %q", rendered)
+	if !strings.Contains(rendered, "Architect draft text should stay hidden while the consult runs.") {
+		t.Fatalf("expected parent draft text to remain visible while nested consult work is active, got %q", rendered)
 	}
 	for _, needle := range []string{
 		"academic",

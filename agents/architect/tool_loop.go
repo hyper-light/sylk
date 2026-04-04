@@ -208,7 +208,7 @@ func (a *Architect) executeToolLoop(
 				req.Messages = append(req.Messages, providers.Message{
 					Role: providers.RoleUser,
 					Content: err.Error() +
-						"\nUse the strict global review protocol now. Answer the active inspector challenge with validate_global_review.",
+						"\nUse the global review protocol now. Answer the active inspector challenge with validate_work.",
 				})
 				continue
 			}

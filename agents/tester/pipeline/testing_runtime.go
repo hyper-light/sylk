@@ -1894,8 +1894,11 @@ func (pt *PipelineTester) executionWorkspace(allowWrites bool) purevfs.Execution
 	if pt.fileAccess == nil {
 		return versioning.NewDiskFileAccess(pt.workingDir(), true)
 	}
-	if allowWrites && testerWorkspaceWritesAllowed(pt.fileAccess) {
-		return pt.fileAccess
+	if allowWrites {
+		if testerWorkspaceWritesAllowed(pt.fileAccess) {
+			return versioning.TagExecutionFS(pt.fileAccess, versioning.WorkspaceMutationOriginCommandExecution)
+		}
+		return versioning.TagExecutionFS(purevfs.ReadOnlyExecutionFS(pt.fileAccess), versioning.WorkspaceMutationOriginCommandExecution)
 	}
 	return purevfs.ReadOnlyExecutionFS(pt.fileAccess)
 }

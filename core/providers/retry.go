@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -270,7 +271,36 @@ func isRetryableTransportError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := strings.ToLower(safeErrorString(err))
+	switch {
+	case strings.Contains(msg, "unexpected eof"):
+		return true
+	case strings.Contains(msg, "stream error: stream id") && strings.Contains(msg, "received from peer"):
+		return true
+	case strings.Contains(msg, "http2: client connection lost"):
+		return true
+	case strings.Contains(msg, "server sent goaway and closed the connection"):
+		return true
+	case strings.Contains(msg, "connection reset by peer"):
+		return true
+	default:
+		return false
+	}
+}
+
+func safeErrorString(err error) (msg string) {
+	defer func() {
+		if recover() != nil {
+			msg = ""
+		}
+	}()
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func isAnthropicInternalServerError(err error) bool {

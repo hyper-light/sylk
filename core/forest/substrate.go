@@ -790,7 +790,7 @@ func (m *MemoryForest) runSubstrateMaintenanceForSession(ctx context.Context, se
 		limit = 64
 	}
 	sessionID = normalizeForestSessionID(sessionID)
-	branches, err := m.queryBranches(ctx, sessionID, false, defaultFamilies(), limit)
+	branches, err := m.queryBranches(ctx, sessionID, "", false, defaultFamilies(), limit)
 	if err != nil {
 		return SubstrateResult{}, err
 	}

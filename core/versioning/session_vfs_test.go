@@ -378,6 +378,59 @@ func TestSessionVFS_BeginAndCommitPipeline(t *testing.T) {
 	}
 }
 
+func TestSessionVFS_CommitPipelineSkipsTransientExecutionArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	svfs, err := NewSessionVFS(SessionVFSConfig{
+		SessionID:  "test-session",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	defer svfs.Close()
+
+	pipe, err := svfs.BeginPipeline(BeginPipelineConfig{
+		PipelineID: "pipe1",
+		SessionID:  "test-session",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("BeginPipeline: %v", err)
+	}
+
+	fa := svfs.NewPipelineFileAccess(pipe)
+	ctx := context.Background()
+	execCtx := WithWorkspaceMutationOrigin(ctx, WorkspaceMutationOriginCommandExecution)
+	durablePath := filepath.Join(dir, "pkg", "main.py")
+	transientPath := filepath.Join(dir, "pkg", "__pycache__", "main.cpython-312.pyc")
+
+	if err := fa.WriteFile(ctx, durablePath, []byte("print('ok')")); err != nil {
+		t.Fatalf("WriteFile durable: %v", err)
+	}
+	if err := fa.WriteFile(execCtx, transientPath, []byte("bytecode")); err != nil {
+		t.Fatalf("WriteFile transient: %v", err)
+	}
+
+	ver, err := svfs.CommitPipeline(ctx, "pipe1")
+	if err != nil {
+		t.Fatalf("CommitPipeline: %v", err)
+	}
+	if ver.IsZero() {
+		t.Fatal("expected durable pipeline write to advance version")
+	}
+
+	content, err := svfs.GlobalVFS().Read(ctx, durablePath)
+	if err != nil {
+		t.Fatalf("GlobalVFS.Read durable: %v", err)
+	}
+	if got := string(content); got != "print('ok')" {
+		t.Fatalf("durable content = %q, want %q", got, "print('ok')")
+	}
+	if _, err := svfs.GlobalVFS().Read(ctx, transientPath); !errors.Is(err, ErrFileNotFound) {
+		t.Fatalf("GlobalVFS.Read transient error = %v, want %v", err, ErrFileNotFound)
+	}
+}
+
 func TestSessionVFS_RollbackPipeline(t *testing.T) {
 	dir := t.TempDir()
 	svfs, err := NewSessionVFS(SessionVFSConfig{

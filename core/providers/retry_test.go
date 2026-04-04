@@ -399,6 +399,24 @@ func TestRetryAnthropicInternalServerStream_RetriesUnexpectedEOF(t *testing.T) {
 	}
 }
 
+func TestRetryStream_RetriesHTTP2PeerResetError(t *testing.T) {
+	cfg := BaseConfig{MaxRetries: 2, RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
+	calls := 0
+	err := retryStream(context.Background(), cfg, func(_ context.Context) error {
+		calls++
+		if calls == 1 {
+			return errors.New("stream error: stream ID 1; INTERNAL_ERROR; received from peer")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", calls)
+	}
+}
+
 func TestRetryAwareHandler_MarksRetryResetAfterError(t *testing.T) {
 	var starts []*StreamChunk
 	handler := retryAwareHandler(func(chunk *StreamChunk) error {

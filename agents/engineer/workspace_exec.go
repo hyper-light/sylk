@@ -84,8 +84,11 @@ func (e *Engineer) executionWorkspace(allowWrites bool) purevfs.ExecutionFS {
 	if e.fileAccess == nil {
 		return versioning.NewDiskFileAccess(e.effectiveWorkingDirectory(), true)
 	}
-	if allowWrites && strictWorkspaceWritesAllowed(e.fileAccess) {
-		return e.fileAccess
+	if allowWrites {
+		if strictWorkspaceWritesAllowed(e.fileAccess) {
+			return versioning.TagExecutionFS(e.fileAccess, versioning.WorkspaceMutationOriginCommandExecution)
+		}
+		return versioning.TagExecutionFS(purevfs.ReadOnlyExecutionFS(e.fileAccess), versioning.WorkspaceMutationOriginCommandExecution)
 	}
 	return purevfs.ReadOnlyExecutionFS(e.fileAccess)
 }

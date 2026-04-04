@@ -17,6 +17,7 @@ const defaultRoleForestLimit = 6
 type ForestRoleInput struct {
 	Query                  string `json:"query"`
 	SessionID              string `json:"session_id,omitempty"`
+	TaskID                 string `json:"task_id,omitempty"`
 	AgentID                string `json:"agent_id,omitempty"`
 	IntentID               string `json:"intent_id,omitempty"`
 	Horizon                string `json:"horizon,omitempty"`
@@ -461,11 +462,13 @@ func NewRoleForestSkill(deps *RetrievalDependencies, spec forestRoleSkillSpec) *
 		Priority(95).
 		StringParam("query", firstNonEmpty(spec.QueryDescription, "Natural language description of the current task or concern"), true).
 		StringParam("session_id", "Optional session identifier for session-scoped retrieval", false).
+		StringParam("task_id", "Optional task identifier for task-scoped retrieval", false).
 		StringParam("agent_id", "Optional concrete agent identifier", false).
 		StringParam("intent_id", "Optional explicit intent identifier", false).
-		EnumParam("horizon", "Optional canopy horizon: turn, session, user, or project", []string{
+		EnumParam("horizon", "Optional canopy horizon: turn, task, session, user, or project.", []string{
 			string(forest.CanopyHorizonTurn),
 			string(forest.CanopyHorizonSession),
+			string(forest.CanopyHorizonTask),
 			string(forest.CanopyHorizonUser),
 			string(forest.CanopyHorizonProject),
 		}, false).
@@ -491,15 +494,17 @@ func NewRoleForestSkill(deps *RetrievalDependencies, spec forestRoleSkillSpec) *
 		if strings.TrimSpace(params.Query) == "" {
 			return nil, fmt.Errorf("query is required")
 		}
+		sessionID, taskID := resolveForestSkillScope(ctx, params.SessionID, params.TaskID)
 
-		horizon, err := parseRoleForestHorizon(params.Horizon)
+		horizon, err := resolveForestSkillHorizon(params.Horizon, sessionID, taskID)
 		if err != nil {
 			return nil, err
 		}
 
 		query := forest.Query{
 			Query:                  strings.TrimSpace(params.Query),
-			SessionID:              strings.TrimSpace(params.SessionID),
+			SessionID:              sessionID,
+			TaskID:                 taskID,
 			AgentID:                strings.TrimSpace(params.AgentID),
 			AgentType:              spec.Domain,
 			IntentID:               strings.TrimSpace(params.IntentID),
@@ -511,6 +516,7 @@ func NewRoleForestSkill(deps *RetrievalDependencies, spec forestRoleSkillSpec) *
 		intentInput := forest.ResolveIntentInput{
 			Query:     query.Query,
 			SessionID: query.SessionID,
+			TaskID:    query.TaskID,
 			AgentID:   query.AgentID,
 			AgentType: spec.Domain,
 			IntentID:  query.IntentID,
@@ -586,23 +592,6 @@ func isPipelineScopedAgent(agentType string) bool {
 		return true
 	default:
 		return false
-	}
-}
-
-func parseRoleForestHorizon(raw string) (forest.CanopyHorizon, error) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "":
-		return "", nil
-	case string(forest.CanopyHorizonTurn):
-		return forest.CanopyHorizonTurn, nil
-	case string(forest.CanopyHorizonSession):
-		return forest.CanopyHorizonSession, nil
-	case string(forest.CanopyHorizonUser):
-		return forest.CanopyHorizonUser, nil
-	case string(forest.CanopyHorizonProject):
-		return forest.CanopyHorizonProject, nil
-	default:
-		return "", fmt.Errorf("invalid horizon %q", raw)
 	}
 }
 

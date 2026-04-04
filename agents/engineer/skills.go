@@ -81,6 +81,7 @@ func (e *Engineer) registerCoreSkills() {
 	}
 	for _, skill := range shared.PipelineProtocolSkills(shared.PipelineProtocolSkillConfig{
 		AgentType:      func() string { return "engineer" },
+		AgentID:        func() string { return e.id },
 		WorkspaceViews: func() versioning.WorkspaceViewAccess { return e.workspaceViews },
 		Route: shared.PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return e.bus },

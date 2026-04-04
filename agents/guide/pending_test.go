@@ -97,6 +97,34 @@ func TestPendingStore_AddInheritsStreamTargetOverrideFromParent(t *testing.T) {
 	assert.Equal(t, "tui", child.StreamTargetOverride)
 }
 
+func TestPendingStore_AddInheritsVisibleStreamTargetFromAncestorChain(t *testing.T) {
+	store := guide.NewPendingStore(guide.DefaultPendingStoreConfig())
+
+	rootID := store.Add(&guide.RouteRequest{
+		Input:         "root",
+		SourceAgentID: "tui",
+		CorrelationID: "corr-root",
+	}, nil, "architect")
+
+	parentID := store.Add(&guide.RouteRequest{
+		Input:               "parent",
+		SourceAgentID:       "orchestrator",
+		CorrelationID:       "corr-parent",
+		ParentCorrelationID: rootID,
+	}, nil, "engineer")
+
+	childID := store.Add(&guide.RouteRequest{
+		Input:               "child",
+		SourceAgentID:       "engineer-runtime",
+		CorrelationID:       "corr-child",
+		ParentCorrelationID: parentID,
+	}, nil, "librarian")
+
+	child := store.Get(childID)
+	require.NotNil(t, child)
+	assert.Equal(t, "tui", child.StreamTargetOverride)
+}
+
 func TestPendingStore_AddPreservesSourceStreamTargetWhenRequested(t *testing.T) {
 	store := guide.NewPendingStore(guide.DefaultPendingStoreConfig())
 

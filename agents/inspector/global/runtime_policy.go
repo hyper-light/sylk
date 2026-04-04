@@ -12,6 +12,7 @@ func (gi *GlobalInspector) applyLLMRuntimeProfile(req *providers.Request, stage 
 		AgentID:   "inspector",
 		SessionID: gi.config.SessionID,
 	})
+	req.DisableParallelToolUse = true
 }
 
 func (gi *GlobalInspector) llmStageProfile(stage string) llmruntime.StageProfile {

@@ -175,6 +175,14 @@ func (s *GlobalReviewState) applyEvent(seq uint64, event *durableProtocolEvent) 
 			return err
 		}
 		s.processed = append(s.processed, cloneGlobalReviewValidationProcessing(entry))
+		if s.snapshot != nil && s.snapshot.PendingValidation != nil &&
+			strings.TrimSpace(s.snapshot.PendingValidation.ChallengeID) == strings.TrimSpace(entry.ChallengeID) {
+			s.snapshot.PendingValidation = nil
+			s.snapshot.CurrentRequest = fmt.Sprintf(
+				"Choose the next global review action after processing challenge %s.",
+				strings.TrimSpace(entry.ChallengeID),
+			)
+		}
 	case globalReviewEventReadyForCommit:
 		var ready globalReviewReadyForCommitEvent
 		if err := decodeProtocolPayload(event.Payload, &ready); err != nil {
@@ -219,8 +227,9 @@ func (s *GlobalReviewState) applyValidationEvent(record *GlobalReviewValidationR
 	if s.snapshot == nil {
 		s.snapshot = &GlobalReviewSnapshot{}
 	}
+	s.snapshot.ActiveAgents = []string{normalizeGlobalReviewAgent(record.RequestingAgent)}
 	s.snapshot.RequestedBy = normalizeGlobalReviewAgent(record.RespondingAgent)
-	s.snapshot.CurrentRequest = fmt.Sprintf("Process global review validation response for challenge %s.", strings.TrimSpace(record.ChallengeID))
+	s.snapshot.CurrentRequest = fmt.Sprintf("Process validation response for challenge %s and decide the next handoff.", strings.TrimSpace(record.ChallengeID))
 	s.snapshot.PendingChallenge = nil
 	s.snapshot.PendingValidation = cloneGlobalReviewValidationRecord(record)
 	appendGlobalReviewEvent(s.snapshot, GlobalReviewEvent{
@@ -273,11 +282,10 @@ func (s *GlobalReviewState) desiredMailboxItems() map[string][]durableMailboxIte
 	if challenge := snapshot.PendingChallenge; challenge != nil {
 		target := normalizeGlobalReviewAgent(challenge.TargetAgent)
 		if target != "" {
-			action := "validate_global_review"
 			desired[target] = append(desired[target], durableMailboxItem{
 				Key:      fmt.Sprintf("global_review:%s:%s:challenge:%s", s.scopeID, target, strings.TrimSpace(challenge.ID)),
 				ItemKind: globalReviewMailboxItemKind,
-				Action:   action,
+				Action:   "validate_work",
 				Summary:  strings.TrimSpace(challenge.Request),
 				Payload:  mustMarshalRaw(cloneGlobalReviewChallenge(challenge)),
 			})
@@ -289,7 +297,7 @@ func (s *GlobalReviewState) desiredMailboxItems() map[string][]durableMailboxIte
 			desired[requesting] = append(desired[requesting], durableMailboxItem{
 				Key:      fmt.Sprintf("global_review:%s:%s:process:%s", s.scopeID, requesting, strings.TrimSpace(validation.ChallengeID)),
 				ItemKind: globalReviewMailboxItemKind,
-				Action:   "process_global_validation",
+				Action:   "process_validation",
 				Summary:  strings.TrimSpace(validation.Summary),
 				Payload:  mustMarshalRaw(cloneGlobalReviewValidationRecord(validation)),
 			})
@@ -323,6 +331,7 @@ func buildGlobalReviewSnapshotAfterChallenge(base *GlobalReviewSnapshot, action 
 	if snapshot == nil {
 		snapshot = &GlobalReviewSnapshot{}
 	}
+	snapshot.ActiveAgents = []string{normalizeGlobalReviewAgent(action.TargetAgent)}
 	snapshot.RequestedBy = normalizeGlobalReviewAgent(action.AgentType)
 	snapshot.CurrentRequest = strings.TrimSpace(action.Request)
 	snapshot.PendingValidation = nil
@@ -366,6 +375,9 @@ func globalReviewMailboxAgents(snapshot *GlobalReviewSnapshot) []string {
 	add(GlobalReviewAgentArchitect)
 	add(GlobalReviewAgentOrchestrator)
 	if snapshot != nil {
+		for _, active := range snapshot.ActiveAgents {
+			add(active)
+		}
 		if snapshot.PendingChallenge != nil {
 			add(snapshot.PendingChallenge.RequestingAgent)
 			add(snapshot.PendingChallenge.TargetAgent)

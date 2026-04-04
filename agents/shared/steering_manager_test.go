@@ -128,6 +128,9 @@ func TestSteeringManagerHandlePace(t *testing.T) {
 	if !handled {
 		t.Fatal("expected pace action to be handled")
 	}
+	if ledger.Pace() != steering.PaceStep {
+		t.Fatalf("ledger pace = %v, want step", ledger.Pace())
+	}
 
 	cmds := ledger.Mailbox.Drain()
 	if len(cmds) != 1 {
@@ -138,6 +141,53 @@ func TestSteeringManagerHandlePace(t *testing.T) {
 	}
 	if cmds[0].Pace != steering.PaceStep {
 		t.Errorf("pace = %v, want Step", cmds[0].Pace)
+	}
+}
+
+func TestSteeringManagerHandlePausedBlocksUntilResume(t *testing.T) {
+	sm := NewSteeringManager()
+	ledger := sm.Create("corr-1", "a", "s", nil, nil)
+	defer sm.CloseAll()
+
+	handled := sm.HandleAction(&guide.ActionRequest{
+		Action:        "pace",
+		CorrelationID: "corr-1",
+		Data:          map[string]any{"pace": "paused"},
+	})
+	if !handled {
+		t.Fatal("expected pause action to be handled")
+	}
+	if ledger.Pace() != steering.PacePaused {
+		t.Fatalf("ledger pace = %v, want paused", ledger.Pace())
+	}
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- ledger.WaitForResume(context.Background())
+	}()
+
+	select {
+	case err := <-waitDone:
+		t.Fatalf("pause should not self-resume, got %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	handled = sm.HandleAction(&guide.ActionRequest{
+		Action:        "pace",
+		CorrelationID: "corr-1",
+		Data:          map[string]any{"pace": "auto"},
+	})
+	if !handled {
+		t.Fatal("expected resume action to be handled")
+	}
+
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("WaitForResume returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForResume did not unblock after resume")
 	}
 }
 

@@ -82,10 +82,6 @@ func (l *Librarian) requestConsultationWithMetadata(
 	if l.bus == nil || !l.running {
 		return failedConsultEvidence(target, query, scope, "", fmt.Errorf("librarian bus is unavailable")), fmt.Errorf("librarian bus is unavailable")
 	}
-	if !l.isAgentRegistered(target) {
-		err := fmt.Errorf("agent %q is not registered", target)
-		return failedConsultEvidence(target, query, scope, "", err), err
-	}
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		sessionID = versioning.SessionIDFromContext(ctx)
@@ -122,24 +118,6 @@ func librarianResponseTopic(l *Librarian) string {
 		agentID = strings.TrimSpace(l.id)
 	}
 	return guide.TopicResponses("librarian", agentID)
-}
-
-func (l *Librarian) isAgentRegistered(target string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(target))
-	if normalized == "" {
-		return false
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, ann := range l.knownAgents {
-		if ann == nil {
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(ann.AgentID), normalized) || strings.EqualFold(strings.TrimSpace(ann.AgentType), normalized) {
-			return true
-		}
-	}
-	return false
 }
 
 func buildConsultEvidence(

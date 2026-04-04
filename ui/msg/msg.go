@@ -55,7 +55,8 @@ type StreamStartMsg struct {
 	SessionID           string
 	CorrelationID       string
 	ParentCorrelationID string
-	AgentID             string // Responding agent ID for badge display.
+	TopLevelTransfer    bool
+	AgentID             string // Raw responding agent ID; UI layers canonicalize separately when needed.
 	RuntimeAgentID      string
 	AgentType           string
 	AgentName           string
@@ -80,7 +81,8 @@ type StreamProgressMsg struct {
 	SessionID           string
 	CorrelationID       string
 	ParentCorrelationID string
-	AgentID             string // Canonical UUID of the responding agent.
+	TopLevelTransfer    bool
+	AgentID             string // Raw responding agent ID; UI layers canonicalize separately when needed.
 	RuntimeAgentID      string
 	AgentName           string // Display name for UI attribution.
 	AgentType           string
@@ -91,6 +93,7 @@ type StreamProgressMsg struct {
 	Current             int
 	Total               int
 	Message             string
+	ToolDerived         bool
 	UIState             events.AgentUIState
 	Visibility          events.EventVisibility
 	BranchRef           *InterAgentBranchRefMsg
@@ -101,7 +104,8 @@ type StreamCompleteMsg struct {
 	SessionID           string
 	CorrelationID       string
 	ParentCorrelationID string
-	AgentID             string // Canonical UUID of the responding agent.
+	TopLevelTransfer    bool
+	AgentID             string // Raw responding agent ID; UI layers canonicalize separately when needed.
 	RuntimeAgentID      string
 	AgentName           string // Display name for UI attribution.
 	AgentType           string
@@ -813,6 +817,7 @@ type ToolCallEventMsg struct {
 	SessionID           string
 	CorrelationID       string
 	ParentCorrelationID string
+	TopLevelTransfer    bool
 	AgentID             string
 	AgentType           string
 	AgentName           string

@@ -26,5 +26,5 @@ Your tools are provided as function definitions. Use them according to these pri
 - Do not call `generate_summary` in a tight loop — it recomputes on each call
 - Use `report_failure` instead of `push_status` with `status=failed` — it also records health metrics
 - For fire-and-forget queries (`query_health_history`, `archivalist_request`), do not block waiting for results
-- When the global inspector challenges execution progress or DAG/workflow state, gather only the state needed to answer and then return through `validate_global_review`
-- Do not use `validate_global_review` to opine on plan quality or plan revision; that belongs to the architect branch of the review loop
+- When the global inspector challenges execution progress or DAG/workflow state, gather only the state needed to answer and then return through `validate_work`
+- Do not use `validate_work` to opine on plan quality or plan revision; that belongs to the architect branch of the review loop

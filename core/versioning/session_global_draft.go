@@ -68,6 +68,7 @@ func (s *SessionVFS) buildGlobalWriteModification(ctx context.Context, path stri
 	}
 	mod := FileModification{
 		OriginalPath: resolved,
+		Persistence:  classifyWorkspaceMutation(ctx, s.workingDir, resolved, false),
 		Timestamp:    time.Now(),
 		NewContent:   cloneBytes(content),
 	}
@@ -91,6 +92,7 @@ func (s *SessionVFS) buildGlobalDeleteModification(ctx context.Context, path str
 	return FileModification{
 		OriginalPath: resolved,
 		Operation:    FileOpDelete,
+		Persistence:  classifyWorkspaceMutation(ctx, s.workingDir, resolved, false),
 		Timestamp:    time.Now(),
 		OldContent:   cloneBytes(current),
 	}, true, nil
@@ -112,6 +114,7 @@ func (s *SessionVFS) buildGlobalMkdirModification(ctx context.Context, path stri
 	return FileModification{
 		OriginalPath: resolved,
 		Operation:    FileOpMkdir,
+		Persistence:  classifyWorkspaceMutation(ctx, s.workingDir, resolved, true),
 		Timestamp:    time.Now(),
 	}, true, nil
 }

@@ -57,8 +57,8 @@ func TestDefaultSystemPrompt_IncludesGlobalReviewChallengeGuidance(t *testing.T)
 		"later workflow tasks may still be pending or in progress",
 		"only call planned work \"missing\" during a checkpoint",
 		"you may freely consult the orchestrator whenever that context helps you assess, defend, or revise the plan",
-		"end the challenged turn with `validate_global_review`",
-		"`validate_global_review`",
+		"end the challenged turn with `validate_work`",
+		"`validate_work`",
 	} {
 		if !strings.Contains(DefaultSystemPrompt, want) {
 			t.Fatalf("default system prompt missing %q", want)

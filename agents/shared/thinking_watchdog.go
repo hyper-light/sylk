@@ -210,6 +210,9 @@ func CompleteWithWatchdog(
 	req *providers.Request,
 	displayName string,
 ) (*providers.Response, error) {
+	if err := WaitWhileExecutionPaused(ctx); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	if shouldLiveStreamTurn(ctx) {
 		if sp, ok := p.(streamingCompletionProvider); ok {

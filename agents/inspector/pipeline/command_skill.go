@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	inspectorshared "github.com/adalundhe/sylk/agents/inspector/shared"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
@@ -37,5 +38,8 @@ func pipelineInspectorCommandSkillConfig(pi *PipelineInspector) agentshared.Comm
 		ExecutionBroker:      func() purevfs.ExecutionBroker { return pi.executionBroker },
 		ExecutionWorkspace:   pi.executionWorkspace,
 		AllowWorkspaceWrites: false,
+		PreAuthorizeCheck: func(command, toolName string) error {
+			return inspectorshared.InspectorRejectTestExecution(command, toolName)
+		},
 	}
 }

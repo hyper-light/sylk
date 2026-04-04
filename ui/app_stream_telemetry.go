@@ -9,6 +9,7 @@ import (
 	coreerrors "github.com/adalundhe/sylk/core/errors"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/ui/agentidentity"
 	"github.com/adalundhe/sylk/ui/chat"
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/conflictview"
@@ -34,32 +35,90 @@ func (m *AppModel) handleStreamStartTelemetry(start msg.StreamStartMsg) tea.Cmd 
 		return nil
 	}
 	if m.shouldIgnoreLateStreamBootstrap(correlationID) {
+		if start.BranchRef != nil {
+			return m.propagate(start)
+		}
 		return nil
 	}
-	m.clearExplicitTopLevelTransferState(correlationID, start.ParentCorrelationID, start.BranchRef)
-	start.BranchRef = m.resolveIncomingStreamBranchRef(correlationID, start.ParentCorrelationID, start.BranchRef)
+	if entry := m.streamEntryForCorrelation(start.CorrelationID); entry != nil {
+		start.AgentID = effectiveStreamUIAgentID(entry, start.AgentID, start.RuntimeAgentID, start.AgentType, start.PipelineID, start.TaskID)
+		start.RuntimeAgentID = firstNonEmpty(start.RuntimeAgentID, entry.RuntimeAgentID, start.AgentID)
+	} else {
+		start.AgentID = effectiveStreamUIAgentID(nil, start.AgentID, start.RuntimeAgentID, start.AgentType, start.PipelineID, start.TaskID)
+	}
+	m.clearExplicitTopLevelTransferState(correlationID, start.ParentCorrelationID, start.BranchRef, start.TopLevelTransfer)
+	start.BranchRef = m.resolveIncomingStreamBranchRef(correlationID, start.ParentCorrelationID, start.BranchRef, start.TopLevelTransfer)
+	startAttrs := []any{
+		"correlation_id", correlationID,
+		"agent_id", strings.TrimSpace(start.AgentID),
+		"runtime_agent_id", strings.TrimSpace(start.RuntimeAgentID),
+		"agent_type", strings.TrimSpace(start.AgentType),
+		"parent_correlation_id", strings.TrimSpace(start.ParentCorrelationID),
+		"task_id", strings.TrimSpace(start.TaskID),
+		"task_name", strings.TrimSpace(start.TaskName),
+		"task_slug", strings.TrimSpace(start.TaskSlug),
+		"active_streams", len(m.activeStreams),
+		"deferred_streams", len(m.deferredStreams),
+		"nested_streams", len(m.nestedStreams),
+	}
+	startAttrs = appendBranchRefLogAttrs(startAttrs, "resolved_branch_ref", start.BranchRef)
+	if entry := m.streamEntryForCorrelation(correlationID); entry != nil {
+		startAttrs = append(startAttrs,
+			"existing_stream_entry", true,
+			"existing_stream_agent_id", entry.AgentID,
+			"existing_stream_runtime_agent_id", entry.RuntimeAgentID,
+			"existing_stream_agent_type", entry.AgentType,
+		)
+		startAttrs = appendBranchRefLogAttrs(startAttrs, "existing_stream_branch_ref", entry.BranchRef)
+	} else {
+		startAttrs = append(startAttrs, "existing_stream_entry", false)
+	}
+	uiDebugFileLog().Info("AppModel: STREAM_START_TELEMETRY", startAttrs...)
 	transferCmd := m.observeTopLevelStreamTransfer(
 		start.SessionID,
 		start.ParentCorrelationID,
 		start.CorrelationID,
 		firstNonEmpty(strings.TrimSpace(start.AgentType), strings.TrimSpace(start.AgentID)),
 		start.BranchRef,
+		start.TopLevelTransfer,
 	)
 	start, _ = m.prepareStreamStart(start)
+	startCmd := m.propagate(start)
+	flushCmd := m.flushDelayedPrimaryBootstrap(correlationID)
 	if transferCmd != nil {
-		return tea.Batch(transferCmd, m.propagate(start))
+		return tea.Batch(transferCmd, startCmd, flushCmd)
 	}
-	return m.propagate(start)
+	return tea.Batch(startCmd, flushCmd)
 }
 
 func (m *AppModel) prepareStreamStart(start msg.StreamStartMsg) (msg.StreamStartMsg, bool) {
-	start.RuntimeAgentID = normalizeRuntimeAgentID(start.AgentID, firstNonEmpty(start.RuntimeAgentID, start.AgentID))
-	start.AgentID = canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
-	m.recordStreamStart(start.CorrelationID)
+	canonicalAgentID := canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
+	start.RuntimeAgentID = normalizeRuntimeAgentID(canonicalAgentID, firstNonEmpty(start.RuntimeAgentID, start.AgentID))
+	resetRecordedState := m.shouldResetRecordedStreamStart(start)
+	if resetRecordedState {
+		m.recordStreamStart(start.CorrelationID)
+	} else {
+		m.touchRecordedStream(start.CorrelationID)
+	}
+	m.recordStreamBranchRef(start.CorrelationID, start.BranchRef)
 	m.trackStreamStart(start)
 	created := m.registerStream(start)
+	attrs := []any{
+		"correlation_id", strings.TrimSpace(start.CorrelationID),
+		"agent_id", strings.TrimSpace(start.AgentID),
+		"runtime_agent_id", strings.TrimSpace(start.RuntimeAgentID),
+		"canonical_agent_id", canonicalAgentID,
+		"agent_type", strings.TrimSpace(start.AgentType),
+		"created", created,
+		"is_nested", start.BranchRef != nil,
+		"active_streams", len(m.activeStreams),
+		"deferred_streams", len(m.deferredStreams),
+		"nested_streams", len(m.nestedStreams),
+	}
+	attrs = appendBranchRefLogAttrs(attrs, "branch_ref", start.BranchRef)
+	uiDebugFileLog().Info("AppModel: PREPARE_STREAM_START", attrs...)
 	if start.BranchRef == nil {
-		newAgent := normalizeAgentID(start.AgentID)
+		newAgent := normalizeAgentID(firstNonEmpty(canonicalAgentID, start.AgentType, start.AgentID))
 		if newAgent != "" && newAgent != "guide" && m.agentPanel != nil {
 			m.agentPanel.DemoteAgent("guide")
 		}
@@ -96,32 +155,37 @@ func (m *AppModel) handleStreamChunkTelemetry(chunk msg.StreamChunkMsg) tea.Cmd 
 }
 
 func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg) tea.Cmd {
-	if m.shouldIgnoreLateStreamBootstrap(progress.CorrelationID) {
-		return nil
-	}
-	progress.AgentID = effectiveCanonicalStreamAgentID(
-		m.streamEntryForCorrelation(progress.CorrelationID),
-		progress.AgentID,
-		progress.AgentType,
-		progress.PipelineID,
-		progress.TaskID,
-	)
 	if entry := m.streamEntryForCorrelation(progress.CorrelationID); entry != nil {
+		progress.AgentID = effectiveStreamUIAgentID(entry, progress.AgentID, progress.RuntimeAgentID, progress.AgentType, progress.PipelineID, progress.TaskID)
 		progress.RuntimeAgentID = firstNonEmpty(progress.RuntimeAgentID, entry.RuntimeAgentID, progress.AgentID)
+	} else {
+		progress.AgentID = effectiveStreamUIAgentID(nil, progress.AgentID, progress.RuntimeAgentID, progress.AgentType, progress.PipelineID, progress.TaskID)
 	}
-	m.clearExplicitTopLevelTransferState(progress.CorrelationID, progress.ParentCorrelationID, progress.BranchRef)
-	progress.BranchRef = m.resolveIncomingStreamBranchRef(progress.CorrelationID, progress.ParentCorrelationID, progress.BranchRef)
+	m.clearExplicitTopLevelTransferState(progress.CorrelationID, progress.ParentCorrelationID, progress.BranchRef, progress.TopLevelTransfer)
+	progress.BranchRef = m.resolveIncomingStreamBranchRef(progress.CorrelationID, progress.ParentCorrelationID, progress.BranchRef, progress.TopLevelTransfer)
 	transferCmd := m.observeTopLevelStreamTransfer(
 		progress.SessionID,
 		progress.ParentCorrelationID,
 		progress.CorrelationID,
 		firstNonEmpty(strings.TrimSpace(progress.AgentType), strings.TrimSpace(progress.AgentID)),
 		progress.BranchRef,
+		progress.TopLevelTransfer,
 	)
+	if m.shouldIgnoreLateStreamBootstrap(progress.CorrelationID) {
+		if progress.BranchRef != nil {
+			progress.Message = redactSecrets(progress.Message)
+			if transferCmd != nil {
+				return tea.Batch(transferCmd, m.propagate(progress))
+			}
+			return m.propagate(progress)
+		}
+		return nil
+	}
 	start := msg.StreamStartMsg{
 		SessionID:           progress.SessionID,
 		CorrelationID:       progress.CorrelationID,
 		ParentCorrelationID: progress.ParentCorrelationID,
+		TopLevelTransfer:    progress.TopLevelTransfer,
 		AgentID:             progress.AgentID,
 		RuntimeAgentID:      progress.RuntimeAgentID,
 		AgentType:           progress.AgentType,
@@ -132,16 +196,31 @@ func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg)
 		TaskSlug:            progress.TaskSlug,
 		BranchRef:           progress.BranchRef,
 	}
-	start, created := m.prepareStreamStart(start)
 	progress.Message = redactSecrets(progress.Message)
+	if m.shouldBootstrapStreamFromTelemetry(progress.CorrelationID, isExplicitTopLevelTransfer(progress.ParentCorrelationID, progress.BranchRef, progress.TopLevelTransfer)) {
+		if m.shouldDelayAmbiguousPrimaryBootstrap(start) {
+			m.enqueueDelayedPrimaryBootstrap(progress.CorrelationID, progress)
+			return transferCmd
+		}
+		start, created := m.prepareStreamStart(start)
+		startCmd := m.propagate(start)
+		flushCmd := m.flushDelayedPrimaryBootstrap(progress.CorrelationID)
+		if !m.shouldRenderStreamEvent(progress.CorrelationID) {
+			return tea.Batch(transferCmd, flushCmd)
+		}
+		if created {
+			if transferCmd != nil {
+				return tea.Batch(transferCmd, startCmd, flushCmd, m.propagate(progress))
+			}
+			return tea.Batch(startCmd, flushCmd, m.propagate(progress))
+		}
+		if transferCmd != nil {
+			return tea.Batch(transferCmd, flushCmd, m.propagate(progress))
+		}
+		return tea.Batch(flushCmd, m.propagate(progress))
+	}
 	if !m.shouldRenderStreamEvent(progress.CorrelationID) {
 		return transferCmd
-	}
-	if created {
-		if transferCmd != nil {
-			return tea.Batch(transferCmd, m.propagate(start), m.propagate(progress))
-		}
-		return tea.Batch(m.propagate(start), m.propagate(progress))
 	}
 	if transferCmd != nil {
 		return tea.Batch(transferCmd, m.propagate(progress))
@@ -150,22 +229,24 @@ func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg)
 }
 
 func (m *AppModel) handleToolCallTelemetry(ev msg.ToolCallEventMsg) tea.Cmd {
-	ev.AgentID = effectiveCanonicalStreamAgentID(
+	ev.AgentID = effectiveStreamUIAgentID(
 		m.streamEntryForCorrelation(ev.CorrelationID),
 		ev.AgentID,
+		"",
 		ev.AgentType,
 		ev.PipelineID,
 		ev.TaskID,
 	)
-	m.clearExplicitTopLevelTransferState(ev.CorrelationID, ev.ParentCorrelationID, ev.BranchRef)
-	ev.BranchRef = m.resolveIncomingStreamBranchRef(ev.CorrelationID, ev.ParentCorrelationID, ev.BranchRef)
-	explicitTopLevelTransfer := isExplicitTopLevelTransfer(ev.ParentCorrelationID, ev.BranchRef)
+	m.clearExplicitTopLevelTransferState(ev.CorrelationID, ev.ParentCorrelationID, ev.BranchRef, ev.TopLevelTransfer)
+	ev.BranchRef = m.resolveIncomingStreamBranchRef(ev.CorrelationID, ev.ParentCorrelationID, ev.BranchRef, ev.TopLevelTransfer)
+	explicitTopLevelTransfer := isExplicitTopLevelTransfer(ev.ParentCorrelationID, ev.BranchRef, ev.TopLevelTransfer)
 	transferCmd := m.observeTopLevelStreamTransfer(
 		ev.SessionID,
 		ev.ParentCorrelationID,
 		ev.CorrelationID,
 		firstNonEmpty(strings.TrimSpace(ev.AgentType), strings.TrimSpace(ev.AgentID)),
 		ev.BranchRef,
+		ev.TopLevelTransfer,
 	)
 
 	correlationID := strings.TrimSpace(ev.CorrelationID)
@@ -174,6 +255,15 @@ func (m *AppModel) handleToolCallTelemetry(ev msg.ToolCallEventMsg) tea.Cmd {
 		m.hasRecordedStreamCorrelation(correlationID) &&
 		m.chat != nil &&
 		m.chat.HasPendingCorrelation(correlationID) {
+		if transferCmd != nil {
+			return tea.Batch(transferCmd, m.propagate(ev))
+		}
+		return m.propagate(ev)
+	}
+	if m.streamEntryForCorrelation(correlationID) != nil {
+		if !m.shouldRenderTerminalStreamEvent(correlationID) && ev.Phase == 1 {
+			return transferCmd
+		}
 		if transferCmd != nil {
 			return tea.Batch(transferCmd, m.propagate(ev))
 		}
@@ -189,14 +279,21 @@ func (m *AppModel) handleToolCallTelemetry(ev msg.ToolCallEventMsg) tea.Cmd {
 		return transferCmd
 	}
 	if m.shouldIgnoreLateStreamBootstrap(correlationID) {
+		if ev.BranchRef != nil {
+			if transferCmd != nil {
+				return tea.Batch(transferCmd, m.propagate(ev))
+			}
+			return m.propagate(ev)
+		}
 		return nil
 	}
 	if correlationID != "" {
-		if _, rerouted := m.reroutedStreamCIDs[correlationID]; !rerouted {
+		if _, rerouted := m.reroutedStreamCIDs[correlationID]; !rerouted && m.shouldBootstrapStreamFromTelemetry(correlationID, explicitTopLevelTransfer) {
 			start := msg.StreamStartMsg{
 				SessionID:           ev.SessionID,
 				CorrelationID:       ev.CorrelationID,
 				ParentCorrelationID: ev.ParentCorrelationID,
+				TopLevelTransfer:    ev.TopLevelTransfer,
 				AgentID:             ev.AgentID,
 				RuntimeAgentID:      ev.AgentID,
 				AgentType:           ev.AgentType,
@@ -207,20 +304,26 @@ func (m *AppModel) handleToolCallTelemetry(ev msg.ToolCallEventMsg) tea.Cmd {
 				TaskSlug:            ev.TaskSlug,
 				BranchRef:           ev.BranchRef,
 			}
-			start, created := m.prepareStreamStart(start)
-			if !m.shouldRenderStreamEvent(ev.CorrelationID) {
+			if m.shouldDelayAmbiguousPrimaryBootstrap(start) {
+				m.enqueueDelayedPrimaryBootstrap(ev.CorrelationID, ev)
 				return transferCmd
+			}
+			start, created := m.prepareStreamStart(start)
+			startCmd := m.propagate(start)
+			flushCmd := m.flushDelayedPrimaryBootstrap(ev.CorrelationID)
+			if !m.shouldRenderStreamEvent(ev.CorrelationID) {
+				return tea.Batch(transferCmd, flushCmd)
 			}
 			if created {
 				if transferCmd != nil {
-					return tea.Batch(transferCmd, m.propagate(start), m.propagate(ev))
+					return tea.Batch(transferCmd, startCmd, flushCmd, m.propagate(ev))
 				}
-				return tea.Batch(m.propagate(start), m.propagate(ev))
+				return tea.Batch(startCmd, flushCmd, m.propagate(ev))
 			}
 			if transferCmd != nil {
-				return tea.Batch(transferCmd, m.propagate(ev))
+				return tea.Batch(transferCmd, flushCmd, m.propagate(ev))
 			}
-			return m.propagate(ev)
+			return tea.Batch(flushCmd, m.propagate(ev))
 		}
 	}
 
@@ -234,24 +337,21 @@ func (m *AppModel) handleToolCallTelemetry(ev msg.ToolCallEventMsg) tea.Cmd {
 }
 
 func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea.Cmd {
-	done.AgentID = effectiveCanonicalStreamAgentID(
-		m.streamEntryForCorrelation(done.CorrelationID),
-		done.AgentID,
-		done.AgentType,
-		done.PipelineID,
-		done.TaskID,
-	)
 	if entry := m.streamEntryForCorrelation(done.CorrelationID); entry != nil {
+		done.AgentID = effectiveStreamUIAgentID(entry, done.AgentID, done.RuntimeAgentID, done.AgentType, done.PipelineID, done.TaskID)
 		done.RuntimeAgentID = firstNonEmpty(done.RuntimeAgentID, entry.RuntimeAgentID, done.AgentID)
+	} else {
+		done.AgentID = effectiveStreamUIAgentID(nil, done.AgentID, done.RuntimeAgentID, done.AgentType, done.PipelineID, done.TaskID)
 	}
-	m.clearExplicitTopLevelTransferState(done.CorrelationID, done.ParentCorrelationID, done.BranchRef)
-	done.BranchRef = m.resolveIncomingStreamBranchRef(done.CorrelationID, done.ParentCorrelationID, done.BranchRef)
+	m.clearExplicitTopLevelTransferState(done.CorrelationID, done.ParentCorrelationID, done.BranchRef, done.TopLevelTransfer)
+	done.BranchRef = m.resolveIncomingStreamBranchRef(done.CorrelationID, done.ParentCorrelationID, done.BranchRef, done.TopLevelTransfer)
 	uiDebugFileLog().Info("AppModel: STREAM_COMPLETE_RECEIVED",
 		"correlation_id", done.CorrelationID,
 		"agent_id", done.AgentID,
 		"active_streams", len(m.activeStreams),
 		"authoritative_text_len", len(done.AuthoritativeText))
 	m.recordStreamComplete(done.CorrelationID)
+	m.recordStreamBranchRef(done.CorrelationID, done.BranchRef)
 	shouldRender := m.shouldRenderTerminalStreamEvent(done.CorrelationID)
 	shouldPropagate := shouldRender || done.BranchRef != nil
 	uiDebugFileLog().Info("AppModel: STREAM_COMPLETE_SHOULD_RENDER",
@@ -261,9 +361,9 @@ func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea
 	m.applyRealStreamUsage(done)
 	m.finalizeStreamUsage(done.CorrelationID, true, "")
 	m.markQueueEntryByCorrelation(done.CorrelationID, true)
-	m.unregisterStream(done.CorrelationID)
-	m.clearReroutedStreamCID(done.CorrelationID)
 	if !shouldPropagate {
+		m.unregisterStream(done.CorrelationID)
+		m.clearReroutedStreamCID(done.CorrelationID)
 		uiDebugFileLog().Warn("AppModel: STREAM_COMPLETE_NOT_RENDERED",
 			"correlation_id", done.CorrelationID)
 		m.statusBar.StopSpinner()
@@ -276,10 +376,21 @@ func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea
 	if strings.TrimSpace(done.AuthoritativeText) != "" {
 		m.recordStreamChunk(done.CorrelationID, done.AuthoritativeText)
 	}
-	if advCmd := m.tryAdvanceQueue(); advCmd != nil {
-		return tea.Batch(m.propagate(done), advCmd)
+	var cmds []tea.Cmd
+	chatComp, chatCmd := m.chat.Update(done)
+	m.chat = chatComp.(*chat.Model)
+	cmds = appendCmd(cmds, chatCmd)
+	if done.BranchRef == nil && m.chat.HasPendingCorrelation(done.CorrelationID) {
+		m.deferPrimaryStream(done.CorrelationID)
+	} else {
+		m.unregisterStream(done.CorrelationID)
 	}
-	return m.propagate(done)
+	m.clearReroutedStreamCID(done.CorrelationID)
+	cmds = appendCmd(cmds, m.propagateWithoutChat(done))
+	if advCmd := m.tryAdvanceQueue(); advCmd != nil {
+		cmds = appendCmd(cmds, advCmd)
+	}
+	return tea.Batch(cmds...)
 }
 
 // isTerminalStreamError returns true when the error represents a condition
@@ -431,6 +542,61 @@ func (m *AppModel) recordStreamStart(correlationID string) {
 	}
 }
 
+func (m *AppModel) touchRecordedStream(correlationID string) {
+	if correlationID == "" || m.streamedResponses == nil {
+		return
+	}
+	state, ok := m.streamedResponses[correlationID]
+	if !ok {
+		return
+	}
+	state.SeenAt = time.Now()
+	m.streamedResponses[correlationID] = state
+}
+
+func (m *AppModel) shouldResetRecordedStreamStart(start msg.StreamStartMsg) bool {
+	correlationID := strings.TrimSpace(start.CorrelationID)
+	if correlationID == "" {
+		return false
+	}
+	if !m.hasRecordedStreamCorrelation(correlationID) {
+		return true
+	}
+	incomingIdentity := normalizeAgentID(firstNonEmpty(
+		canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID),
+		start.AgentType,
+		start.AgentID,
+	))
+	if incomingIdentity == "" {
+		return false
+	}
+	if usage, ok := m.streamUsage[correlationID]; ok {
+		existingIdentity := normalizeAgentID(firstNonEmpty(usage.AgentID, usage.AgentType))
+		if existingIdentity != "" {
+			return existingIdentity != incomingIdentity
+		}
+	}
+	if entry := m.streamEntryForCorrelation(correlationID); entry != nil {
+		existingIdentity := normalizeAgentID(firstNonEmpty(entry.AgentID, entry.AgentType))
+		if existingIdentity != "" {
+			return existingIdentity != incomingIdentity
+		}
+	}
+	return false
+}
+
+func (m *AppModel) recordStreamBranchRef(correlationID string, ref *msg.InterAgentBranchRefMsg) {
+	if correlationID == "" || ref == nil {
+		return
+	}
+	m.ensureStreamedResponseState()
+	state := m.streamedResponses[correlationID]
+	cloned := *ref
+	state.BranchRef = &cloned
+	state.SeenAt = time.Now()
+	m.streamedResponses[correlationID] = state
+}
+
 func (m *AppModel) recordStreamChunk(correlationID, text string) {
 	if correlationID == "" || strings.TrimSpace(text) == "" {
 		return
@@ -509,6 +675,18 @@ func (m *AppModel) clearRecordedStream(correlationID string) {
 		return
 	}
 	delete(m.streamedResponses, correlationID)
+}
+
+func (m *AppModel) recordedStreamBranchRef(correlationID string) *msg.InterAgentBranchRefMsg {
+	if correlationID == "" || m.streamedResponses == nil {
+		return nil
+	}
+	state, ok := m.streamedResponses[correlationID]
+	if !ok || state.BranchRef == nil {
+		return nil
+	}
+	cloned := *state.BranchRef
+	return &cloned
 }
 
 func (m *AppModel) shouldSuppressStreamedRouteResponse(correlationID string, hasErr bool) bool {
@@ -725,6 +903,38 @@ func normalizeRuntimeAgentID(panelAgentID, runtimeAgentID string) string {
 	return normalizeAgentID(panelAgentID)
 }
 
+func effectiveStreamUIAgentID(entry *activeStreamEntry, agentID, runtimeAgentID, agentType, pipelineID, taskID string) string {
+	if canonicalID := agentidentity.VisibleAgentID(
+		agentID,
+		"",
+		agentType,
+		pipelineID,
+		taskID,
+	); canonicalID != "" {
+		return canonicalID
+	}
+	if entry != nil {
+		if canonicalID := agentidentity.VisibleAgentID(
+			entry.AgentID,
+			"",
+			entryAgentType(entry),
+			entryPipelineID(entry),
+			entryTaskID(entry),
+		); canonicalID != "" {
+			return canonicalID
+		}
+	}
+	if resolved := strings.TrimSpace(runtimeAgentID); resolved != "" {
+		return resolved
+	}
+	if entry != nil {
+		if resolved := strings.TrimSpace(entry.RuntimeAgentID); resolved != "" {
+			return resolved
+		}
+	}
+	return ""
+}
+
 func runtimeContextKey(panelAgentID, runtimeAgentID string) string {
 	panelAgentID = normalizeAgentID(panelAgentID)
 	runtimeAgentID = normalizeRuntimeAgentID(panelAgentID, runtimeAgentID)
@@ -915,9 +1125,36 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 		content = redactSecrets(r.Err.Error())
 	}
 	effectiveBranchRef := m.effectiveStreamBranchRef(r.CorrelationID, r.BranchRef)
+	if effectiveBranchRef == nil {
+		effectiveBranchRef = m.recordedStreamBranchRef(r.CorrelationID)
+	}
 	hasPendingChatCorrelation := m.chat != nil && m.chat.HasPendingCorrelation(r.CorrelationID)
 	streamEntry := cloneActiveStreamEntry(m.streamEntryForCorrelation(r.CorrelationID))
-	m.unregisterStream(r.CorrelationID)
+	responseAttrs := []any{
+		"correlation_id", strings.TrimSpace(r.CorrelationID),
+		"agent_id", strings.TrimSpace(r.AgentID),
+		"agent_type", strings.TrimSpace(r.AgentType),
+		"has_error", r.Err != nil,
+		"has_pending_chat_correlation", hasPendingChatCorrelation,
+		"content_len", len(content),
+		"active_streams", len(m.activeStreams),
+		"deferred_streams", len(m.deferredStreams),
+		"nested_streams", len(m.nestedStreams),
+	}
+	responseAttrs = appendBranchRefLogAttrs(responseAttrs, "effective_branch_ref", effectiveBranchRef)
+	if streamEntry != nil {
+		responseAttrs = append(responseAttrs,
+			"stream_entry_found", true,
+			"stream_entry_agent_id", streamEntry.AgentID,
+			"stream_entry_runtime_agent_id", streamEntry.RuntimeAgentID,
+			"stream_entry_agent_type", streamEntry.AgentType,
+			"stream_entry_task_id", streamEntry.TaskID,
+		)
+		responseAttrs = appendBranchRefLogAttrs(responseAttrs, "stream_entry_branch_ref", streamEntry.BranchRef)
+	} else {
+		responseAttrs = append(responseAttrs, "stream_entry_found", false)
+	}
+	uiDebugFileLog().Info("AppModel: GUIDE_RESPONSE_CONTINUITY", responseAttrs...)
 	added := estimateGuideTokens(content)
 	contextAgentID := r.AgentID
 	if streamEntry != nil {
@@ -967,8 +1204,39 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 			})
 		}
 		m.chat = comp.(*chat.Model)
+		if r.Err == nil && effectiveBranchRef == nil && m.chat.HasPendingCorrelation(r.CorrelationID) {
+			m.deferPrimaryStream(r.CorrelationID)
+			uiDebugFileLog().Info("AppModel: GUIDE_RESPONSE_CONTINUITY_DECISION",
+				"correlation_id", strings.TrimSpace(r.CorrelationID),
+				"decision", "synthetic_complete_then_defer_primary",
+				"has_pending_chat_correlation", true)
+		} else {
+			m.unregisterStream(r.CorrelationID)
+			uiDebugFileLog().Info("AppModel: GUIDE_RESPONSE_CONTINUITY_DECISION",
+				"correlation_id", strings.TrimSpace(r.CorrelationID),
+				"decision", "synthetic_terminal_then_unregister",
+				"has_pending_chat_correlation", hasPendingChatCorrelation,
+				"has_effective_branch_ref", effectiveBranchRef != nil,
+				"has_error", r.Err != nil)
+		}
 		return cmd
 	}
+	m.unregisterStream(r.CorrelationID)
+	if source != chat.SourceError && strings.TrimSpace(content) == "" {
+		uiDebugFileLog().Info("AppModel: GUIDE_RESPONSE_CONTINUITY_DECISION",
+			"correlation_id", strings.TrimSpace(r.CorrelationID),
+			"decision", "skip_empty_success_response",
+			"has_pending_chat_correlation", false,
+			"has_effective_branch_ref", effectiveBranchRef != nil,
+			"has_error", false)
+		return nil
+	}
+	uiDebugFileLog().Info("AppModel: GUIDE_RESPONSE_CONTINUITY_DECISION",
+		"correlation_id", strings.TrimSpace(r.CorrelationID),
+		"decision", "create_top_level_chat_entry",
+		"has_pending_chat_correlation", false,
+		"has_effective_branch_ref", effectiveBranchRef != nil,
+		"has_error", r.Err != nil)
 	streamTaskID := ""
 	streamTaskName := ""
 	streamTaskSlug := ""
@@ -1012,6 +1280,9 @@ func (m *AppModel) publishResponseActivity(
 	streamEntry *activeStreamEntry,
 ) {
 	if m.deps.ActivityPub == nil {
+		return
+	}
+	if source != chat.SourceError && strings.TrimSpace(content) == "" {
 		return
 	}
 	streamAgentID := ""

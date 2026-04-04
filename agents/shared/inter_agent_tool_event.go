@@ -296,10 +296,7 @@ func deriveInterAgentOriginUpdate(toolName string, args, output map[string]any, 
 		)
 	}
 
-	threadKey := globalReviewThreadPrefix + challengeID
-	if toolName == "validate_work" || toolName == "process_validation" {
-		threadKey = pipelineThreadPrefix + challengeID
-	}
+	threadKey := interAgentResponseThreadKey(toolName, args, output, challengeID)
 	return &InterAgentToolEvent{
 		Kind:         InterAgentToolEventKindChallenge,
 		AgentTypes:   normalizeAgentTypeList(agentTypes),
@@ -308,6 +305,29 @@ func deriveInterAgentOriginUpdate(toolName string, args, output map[string]any, 
 		Status:       status,
 		UpdateOrigin: true,
 	}
+}
+
+func interAgentResponseThreadKey(toolName string, args, output map[string]any, challengeID string) string {
+	if explicit := firstNonEmptyInline(
+		stringFromAnyMap(output, "thread_key"),
+		stringFromAnyMap(args, "thread_key"),
+	); explicit != "" {
+		return explicit
+	}
+	scope := firstNonEmptyInline(
+		stringFromAnyMap(output, "protocol_scope"),
+		stringFromAnyMap(args, "protocol_scope"),
+	)
+	switch strings.TrimSpace(scope) {
+	case globalReviewNamespace:
+		return globalReviewThreadPrefix + challengeID
+	case pipelineProtocolNamespace:
+		return pipelineThreadPrefix + challengeID
+	}
+	if toolName == "validate_work" || toolName == "process_validation" {
+		return pipelineThreadPrefix + challengeID
+	}
+	return globalReviewThreadPrefix + challengeID
 }
 
 func isInterAgentConsultToolName(toolName string, args map[string]any) bool {

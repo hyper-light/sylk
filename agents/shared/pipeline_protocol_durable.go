@@ -303,10 +303,11 @@ func (s *PipelineProtocolState) desiredMailboxItems() map[string][]durableMailbo
 				Action:   "validate_work",
 				Summary:  strings.TrimSpace(challenge.Request),
 				Payload: mustMarshalRaw(map[string]any{
-					"challenge_id":     strings.TrimSpace(challenge.ID),
-					"requesting_agent": strings.TrimSpace(challenge.RequestingAgent),
-					"required_output":  append([]string(nil), challenge.RequiredOutput...),
-					"references":       append([]string(nil), challenge.References...),
+					"challenge_id":        strings.TrimSpace(challenge.ID),
+					"requesting_agent":    strings.TrimSpace(challenge.RequestingAgent),
+					"requesting_agent_id": strings.TrimSpace(challenge.RequestingAgentID),
+					"required_output":     append([]string(nil), challenge.RequiredOutput...),
+					"references":          append([]string(nil), challenge.References...),
 				}),
 			})
 		}
@@ -376,6 +377,21 @@ func (s *PipelineProtocolState) applyValidationEvent(record *PipelineValidationR
 
 func (s *PipelineProtocolState) applyProcessedValidationEvent(entry PipelineValidationProcessing) {
 	s.processed = append(s.processed, clonePipelineValidationProcessing(entry))
+	if s.snapshot == nil {
+		return
+	}
+	pending := s.snapshot.PendingValidation
+	if pending == nil {
+		return
+	}
+	if strings.TrimSpace(pending.ChallengeID) != strings.TrimSpace(entry.ChallengeID) {
+		return
+	}
+	s.snapshot.PendingValidation = nil
+	s.snapshot.CurrentRequest = fmt.Sprintf(
+		"Choose the next pipeline action after processing challenge %s.",
+		strings.TrimSpace(entry.ChallengeID),
+	)
 }
 
 func (s *PipelineProtocolState) applyReadyForOTEvent(ready pipelineReadyForOTEvent) {
@@ -422,14 +438,15 @@ func buildPipelineSnapshotAfterHandoff(base *PipelineProtocolSnapshot, action *P
 	snapshot.PendingChallenge = nil
 	if action.CreatesChallenge {
 		snapshot.PendingChallenge = &PipelineProtocolChallenge{
-			ID:              firstNonEmpty(strings.TrimSpace(action.ChallengeID), uuid.NewString()),
-			RequestingAgent: normalizePipelineAgentType(action.AgentType),
-			TargetAgents:    append([]string(nil), action.TargetAgents...),
-			Mode:            string(action.Mode),
-			Reason:          strings.TrimSpace(action.Reason),
-			Request:         strings.TrimSpace(action.Request),
-			RequiredOutput:  append([]string(nil), action.RequiredOutput...),
-			References:      append([]string(nil), action.References...),
+			ID:                firstNonEmpty(strings.TrimSpace(action.ChallengeID), uuid.NewString()),
+			RequestingAgent:   normalizePipelineAgentType(action.AgentType),
+			RequestingAgentID: strings.TrimSpace(action.AgentID),
+			TargetAgents:      append([]string(nil), action.TargetAgents...),
+			Mode:              string(action.Mode),
+			Reason:            strings.TrimSpace(action.Reason),
+			Request:           strings.TrimSpace(action.Request),
+			RequiredOutput:    append([]string(nil), action.RequiredOutput...),
+			References:        append([]string(nil), action.References...),
 		}
 	}
 	appendPipelineProtocolEvent(snapshot, PipelineProtocolEvent{

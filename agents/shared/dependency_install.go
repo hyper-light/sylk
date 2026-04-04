@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -135,6 +136,7 @@ Hard requirements:
 - When Python package installation is needed, prefer 'python -m pip ...' or 'python3 -m pip ...' over bare 'pip' or 'pip3'.
 - Prefer the package manager already implied by the repository files.
 - Prefer workspace-local or project-scoped installation when possible.
+- If you provide validation_command, make it a simple non-mutating availability check such as '--version', '--help', or an import probe. Do not run the project test suite, lint the repo, or depend on files/tests that may not exist yet.
 - Keep the plan minimal.
 
 Repository root: %s
@@ -181,24 +183,35 @@ func ExtractDependencyInstallResearchContent(msg *guide.Message) (string, error)
 	if content := extractDependencyInstallResponseContent(resp.Data); strings.TrimSpace(content) != "" {
 		return content, nil
 	}
-	return "", fmt.Errorf("academic response did not include install-plan content")
+	return "", fmt.Errorf("academic response did not include install instructions")
+}
+
+type dependencyInstallResponseTexter interface {
+	ResponseText() string
 }
 
 func extractDependencyInstallResponseContent(data any) string {
+	if data == nil {
+		return ""
+	}
+	if text, ok := data.(dependencyInstallResponseTexter); ok {
+		return strings.TrimSpace(text.ResponseText())
+	}
 	switch typed := data.(type) {
 	case map[string]any:
-		if content, _ := typed["content"].(string); strings.TrimSpace(content) != "" {
-			return strings.TrimSpace(content)
-		}
-		for _, key := range []string{"result", "response", "answer", "text"} {
-			if content, _ := typed[key].(string); strings.TrimSpace(content) != "" {
-				return strings.TrimSpace(content)
+		for _, key := range []string{
+			"content", "result", "response", "answer", "text", "output", "message",
+			"instructions", "install_plan", "installPlan", "plan", "body", "payload", "data",
+			"Response", "Result", "Answer", "Text", "Output", "Message", "Instructions", "Plan",
+		} {
+			if nested, ok := typed[key]; ok {
+				if content := extractDependencyInstallResponseContent(nested); strings.TrimSpace(content) != "" {
+					return content
+				}
 			}
 		}
-		if nested, ok := typed["data"]; ok {
-			if content := extractDependencyInstallResponseContent(nested); strings.TrimSpace(content) != "" {
-				return content
-			}
+		if blocks := extractDependencyInstallContentBlocksFromMap(typed); strings.TrimSpace(blocks) != "" {
+			return blocks
 		}
 		if looksLikeDependencyInstallPlanMap(typed) {
 			raw, err := json.Marshal(typed)
@@ -209,7 +222,20 @@ func extractDependencyInstallResponseContent(data any) string {
 		return ""
 	case string:
 		return strings.TrimSpace(typed)
+	case []any:
+		return extractDependencyInstallResponseContentFromSlice(typed)
+	case []string:
+		return extractDependencyInstallResponseContentFromStrings(typed)
+	case []map[string]any:
+		items := make([]any, 0, len(typed))
+		for _, item := range typed {
+			items = append(items, item)
+		}
+		return extractDependencyInstallResponseContentFromSlice(items)
 	default:
+		if content := extractDependencyInstallResponseContentFromReflectedValue(reflect.ValueOf(data)); strings.TrimSpace(content) != "" {
+			return content
+		}
 		raw, err := json.Marshal(data)
 		if err != nil {
 			return ""
@@ -226,6 +252,84 @@ func extractDependencyInstallResponseContent(data any) string {
 		}
 		return ""
 	}
+}
+
+func extractDependencyInstallResponseContentFromSlice(items []any) string {
+	texts := make([]string, 0, len(items))
+	for _, item := range items {
+		if content := extractDependencyInstallResponseContent(item); strings.TrimSpace(content) != "" {
+			texts = append(texts, content)
+		}
+	}
+	return strings.TrimSpace(strings.Join(texts, "\n"))
+}
+
+func extractDependencyInstallResponseContentFromStrings(items []string) string {
+	texts := make([]string, 0, len(items))
+	for _, item := range items {
+		trimmed := strings.TrimSpace(item)
+		if trimmed != "" {
+			texts = append(texts, trimmed)
+		}
+	}
+	return strings.TrimSpace(strings.Join(texts, "\n"))
+}
+
+func extractDependencyInstallContentBlocksFromMap(payload map[string]any) string {
+	for _, key := range []string{"content_blocks", "contentBlocks", "blocks", "items"} {
+		raw, ok := payload[key]
+		if !ok || raw == nil {
+			continue
+		}
+		switch typed := raw.(type) {
+		case []any:
+			return extractDependencyInstallResponseContentFromSlice(typed)
+		case []map[string]any:
+			items := make([]any, 0, len(typed))
+			for _, item := range typed {
+				items = append(items, item)
+			}
+			return extractDependencyInstallResponseContentFromSlice(items)
+		}
+	}
+	if blockType, _ := payload["type"].(string); strings.EqualFold(strings.TrimSpace(blockType), "text") {
+		for _, key := range []string{"text", "content", "value"} {
+			if text, _ := payload[key].(string); strings.TrimSpace(text) != "" {
+				return strings.TrimSpace(text)
+			}
+		}
+	}
+	return ""
+}
+
+func extractDependencyInstallResponseContentFromReflectedValue(v reflect.Value) string {
+	if !v.IsValid() {
+		return ""
+	}
+	for v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return ""
+		}
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.Struct:
+		for _, name := range []string{"Response", "Content", "Text", "Message", "Output", "Instructions"} {
+			field := v.FieldByName(name)
+			if field.IsValid() && field.Kind() == reflect.String {
+				if trimmed := strings.TrimSpace(field.String()); trimmed != "" {
+					return trimmed
+				}
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		items := make([]any, 0, v.Len())
+		for i := 0; i < v.Len(); i++ {
+			items = append(items, v.Index(i).Interface())
+		}
+		return extractDependencyInstallResponseContentFromSlice(items)
+	}
+	return ""
 }
 
 func looksLikeDependencyInstallPlanMap(payload map[string]any) bool {
@@ -265,6 +369,12 @@ func ParseDependencyInstallPlan(raw string) (*DependencyInstallPlan, error) {
 		}
 		return &plan, nil
 	}
+	if plan, err := parseDependencyInstallPlanText(raw); err == nil {
+		if err := ValidateDependencyInstallPlan(plan); err != nil {
+			return nil, err
+		}
+		return plan, nil
+	}
 	return nil, fmt.Errorf("academic response did not contain valid install-plan JSON")
 }
 
@@ -293,6 +403,219 @@ func ExtractJSONObject(raw string) string {
 		return ""
 	}
 	return strings.TrimSpace(raw[start : end+1])
+}
+
+func parseDependencyInstallPlanText(raw string) (*DependencyInstallPlan, error) {
+	lines := strings.Split(raw, "\n")
+	steps := make([]DependencyInstallStep, 0, 4)
+	seen := map[string]struct{}{}
+	summary := ""
+	validation := ""
+
+	addStep := func(command string) {
+		command = strings.TrimSpace(command)
+		if command == "" {
+			return
+		}
+		if _, ok := seen[command]; ok {
+			return
+		}
+		seen[command] = struct{}{}
+		steps = append(steps, DependencyInstallStep{Command: command})
+	}
+
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		if summary == "" && !dependencyLineLooksCommandLike(line) {
+			summary = dependencyInstallSummaryLine(line)
+		}
+		if cmd := dependencyValidationCommandFromLine(line); cmd != "" {
+			validation = cmd
+			continue
+		}
+		if cmd := dependencyInstallCommandFromLine(line); cmd != "" {
+			addStep(cmd)
+		}
+	}
+	if len(steps) == 0 {
+		for _, segment := range extractInlineCodeSegments(raw) {
+			if cmd := strings.TrimSpace(segment); looksLikeDependencyInstallCommand(cmd) {
+				addStep(cmd)
+			}
+		}
+	}
+	if len(steps) == 0 {
+		return nil, fmt.Errorf("no executable install commands found in academic response")
+	}
+	if summary == "" {
+		summary = "Install missing project tooling"
+	}
+	return &DependencyInstallPlan{
+		Summary:           summary,
+		ValidationCommand: validation,
+		Steps:             steps,
+	}, nil
+}
+
+func dependencyInstallSummaryLine(line string) string {
+	line = strings.TrimSpace(stripDependencyListPrefix(line))
+	line = strings.TrimLeft(line, "#")
+	line = strings.TrimSpace(line)
+	lower := strings.ToLower(line)
+	switch {
+	case strings.HasPrefix(lower, "summary:"):
+		return strings.TrimSpace(line[len("summary:"):])
+	case strings.HasPrefix(lower, "plan:"):
+		return strings.TrimSpace(line[len("plan:"):])
+	default:
+		return line
+	}
+}
+
+func dependencyInstallCommandFromLine(line string) string {
+	for _, segment := range extractInlineCodeSegments(line) {
+		candidate := strings.TrimSpace(segment)
+		if looksLikeDependencyInstallCommand(candidate) {
+			return candidate
+		}
+	}
+	candidate := strings.TrimSpace(stripDependencyListPrefix(line))
+	if looksLikeDependencyInstallCommand(candidate) {
+		return candidate
+	}
+	return ""
+}
+
+func dependencyValidationCommandFromLine(line string) string {
+	cleaned := strings.TrimSpace(stripDependencyListPrefix(line))
+	lower := strings.ToLower(cleaned)
+	isValidationLine := strings.HasPrefix(lower, "validation_command") ||
+		strings.HasPrefix(lower, "validation command") ||
+		strings.HasPrefix(lower, "validation:") ||
+		strings.HasPrefix(lower, "validate with") ||
+		strings.HasPrefix(lower, "verify with") ||
+		strings.HasPrefix(lower, "verification:")
+	if !isValidationLine {
+		return ""
+	}
+	for _, segment := range extractInlineCodeSegments(cleaned) {
+		candidate := strings.TrimSpace(segment)
+		if dependencyLineLooksCommandLike(candidate) {
+			return candidate
+		}
+	}
+	if idx := strings.Index(cleaned, ":"); idx >= 0 {
+		candidate := strings.TrimSpace(cleaned[idx+1:])
+		if dependencyLineLooksCommandLike(candidate) {
+			return candidate
+		}
+	}
+	fields := strings.Fields(cleaned)
+	for i := 0; i < len(fields); i++ {
+		candidate := strings.Join(fields[i:], " ")
+		if dependencyLineLooksCommandLike(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func stripDependencyListPrefix(line string) string {
+	line = strings.TrimSpace(line)
+	for _, prefix := range []string{"- ", "* ", "• "} {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(line[len(prefix):])
+		}
+	}
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if ch >= '0' && ch <= '9' {
+			continue
+		}
+		if ch == '.' || ch == ')' {
+			if i+1 < len(line) && line[i+1] == ' ' {
+				return strings.TrimSpace(line[i+2:])
+			}
+		}
+		break
+	}
+	return line
+}
+
+func extractInlineCodeSegments(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	segments := make([]string, 0, 4)
+	for {
+		start := strings.Index(raw, "`")
+		if start < 0 {
+			break
+		}
+		raw = raw[start+1:]
+		end := strings.Index(raw, "`")
+		if end < 0 {
+			break
+		}
+		segment := strings.TrimSpace(raw[:end])
+		if segment != "" {
+			segments = append(segments, segment)
+		}
+		raw = raw[end+1:]
+	}
+	return segments
+}
+
+func dependencyLineLooksCommandLike(line string) bool {
+	line = strings.TrimSpace(line)
+	if line == "" || DependencyCommandHasUnsafeShellSyntax(line) {
+		return false
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return false
+	}
+	first := strings.ToLower(filepath.Base(fields[0]))
+	switch first {
+	case "python", "python3", "pip", "pip3", "npm", "pnpm", "yarn", "bun", "uv", "poetry", "rye", "pixi",
+		"go", "cargo", "brew", "apt", "apt-get", "dnf", "yum", "apk", "pacman", "choco", "scoop", "winget",
+		"gem", "bundle", "composer", "php", "dotnet", "nuget", "mvn", "gradle", "gradlew", "sbt", "nix", "nix-env",
+		"pytest", "vitest", "jest", "mocha", "playwright", "ruff", "black", "mypy", "eslint", "prettier":
+		return true
+	}
+	if strings.HasPrefix(strings.ToLower(fields[0]), "./") {
+		return true
+	}
+	lower := strings.ToLower(line)
+	return strings.Contains(lower, " --version") ||
+		strings.Contains(lower, " -m ") ||
+		strings.Contains(lower, " install ") ||
+		strings.Contains(lower, " add ")
+}
+
+func looksLikeDependencyInstallCommand(command string) bool {
+	command = strings.TrimSpace(command)
+	if !dependencyLineLooksCommandLike(command) {
+		return false
+	}
+	lower := strings.ToLower(command)
+	return strings.Contains(lower, " install ") ||
+		strings.Contains(lower, " add ") ||
+		strings.HasPrefix(lower, "go install ") ||
+		strings.HasPrefix(lower, "cargo install ") ||
+		strings.HasPrefix(lower, "brew install ") ||
+		strings.HasPrefix(lower, "apt install ") ||
+		strings.HasPrefix(lower, "apt-get install ") ||
+		strings.HasPrefix(lower, "dnf install ") ||
+		strings.HasPrefix(lower, "yum install ") ||
+		strings.HasPrefix(lower, "apk add ") ||
+		strings.HasPrefix(lower, "pacman -s ") ||
+		strings.HasPrefix(lower, "choco install ") ||
+		strings.HasPrefix(lower, "scoop install ") ||
+		strings.HasPrefix(lower, "winget install ")
 }
 
 func ValidateDependencyInstallPlan(plan *DependencyInstallPlan) error {

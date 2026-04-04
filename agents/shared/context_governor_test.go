@@ -29,6 +29,60 @@ func TestContextGovernorFromEmptyContext(t *testing.T) {
 	}
 }
 
+func TestStampRequestIdentity_UsesTaskScopedPipelineWorkerID(t *testing.T) {
+	ctx := WithLogMeta(context.Background(), LogMeta{
+		AgentID:   "d3d1a28f",
+		SessionID: "session-1",
+	})
+	ctx = WithForwardedStreamContext(ctx, "corr-1", "orchestrator", "parent-1", map[string]any{
+		"agent_type":  "engineer",
+		"pipeline_id": "task_2",
+		"task_id":     "task_2",
+	})
+
+	req := &providers.Request{}
+	stampRequestIdentity(ctx, req)
+
+	if got, _ := req.Metadata["agent_id"].(string); got != "task_2:engineer" {
+		t.Fatalf("agent_id = %q, want task_2:engineer", got)
+	}
+	if got, _ := req.Metadata["runtime_agent_id"].(string); got != "d3d1a28f" {
+		t.Fatalf("runtime_agent_id = %q, want d3d1a28f", got)
+	}
+	if got, _ := req.Metadata["session_id"].(string); got != "session-1" {
+		t.Fatalf("session_id = %q, want session-1", got)
+	}
+	if got, _ := req.Metadata["task_id"].(string); got != "task_2" {
+		t.Fatalf("task_id = %q, want task_2", got)
+	}
+	if got, _ := req.Metadata["pipeline_id"].(string); got != "task_2" {
+		t.Fatalf("pipeline_id = %q, want task_2", got)
+	}
+	if got, _ := req.Metadata["agent_type"].(string); got != "engineer" {
+		t.Fatalf("agent_type = %q, want engineer", got)
+	}
+}
+
+func TestStampRequestIdentity_KeepsRawIDForNonPipelineAgent(t *testing.T) {
+	ctx := WithLogMeta(context.Background(), LogMeta{
+		AgentID:   "architect-1",
+		SessionID: "session-1",
+	})
+	ctx = WithForwardedStreamContext(ctx, "corr-1", "guide", "", map[string]any{
+		"agent_type": "architect",
+	})
+
+	req := &providers.Request{}
+	stampRequestIdentity(ctx, req)
+
+	if got, _ := req.Metadata["agent_id"].(string); got != "architect-1" {
+		t.Fatalf("agent_id = %q, want architect-1", got)
+	}
+	if _, ok := req.Metadata["runtime_agent_id"]; ok {
+		t.Fatalf("runtime_agent_id unexpectedly set: %#v", req.Metadata["runtime_agent_id"])
+	}
+}
+
 func TestContextGovernorBeginTurn_Green(t *testing.T) {
 	gov := NewContextGovernor("claude-opus-4-6", 4096, 0)
 	req := &providers.Request{

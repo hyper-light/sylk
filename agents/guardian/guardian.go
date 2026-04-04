@@ -708,6 +708,7 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 	startTime := time.Now()
 	reqCtx, cancel := context.WithCancel(ctx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
 	reqCtx = shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	g.registerInFlight(fwd.CorrelationID, cancel)
 	g.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)

@@ -31,8 +31,9 @@ const (
 type GlobalReviewActionType string
 
 const (
+	GlobalReviewActionHandoff   GlobalReviewActionType = "handoff"
 	GlobalReviewActionChallenge GlobalReviewActionType = "challenge"
-	GlobalReviewActionValidate  GlobalReviewActionType = "validate"
+	GlobalReviewActionValidate  GlobalReviewActionType = "validation"
 	GlobalReviewActionCommit    GlobalReviewActionType = "commit_to_disk"
 )
 
@@ -54,6 +55,7 @@ const (
 	GlobalReviewValidationDecisionClarify GlobalReviewValidationDecision = "clarify"
 	GlobalReviewValidationDecisionLoop    GlobalReviewValidationDecision = "loop"
 	GlobalReviewValidationDecisionConsult GlobalReviewValidationDecision = "consult"
+	GlobalReviewValidationDecisionHandoff GlobalReviewValidationDecision = "handoff"
 )
 
 type GlobalReviewChallenge struct {
@@ -88,6 +90,7 @@ type GlobalReviewEvent struct {
 
 type GlobalReviewSnapshot struct {
 	ReviewID          string                        `json:"review_id,omitempty"`
+	ActiveAgents      []string                      `json:"active_agents,omitempty"`
 	RequestedBy       string                        `json:"requested_by,omitempty"`
 	CurrentRequest    string                        `json:"current_request,omitempty"`
 	PendingChallenge  *GlobalReviewChallenge        `json:"pending_challenge,omitempty"`
@@ -355,15 +358,26 @@ func ValidateGlobalReviewCompletion(ctx context.Context, agentType string) error
 
 	snapshot := materializeGlobalReviewSnapshot(state)
 	agentType = normalizeGlobalReviewAgent(agentType)
+	if snapshot != nil && snapshot.PendingChallenge != nil &&
+		normalizeGlobalReviewAgent(snapshot.PendingChallenge.TargetAgent) == agentType {
+		return fmt.Errorf("Before ending this global review turn, answer the active challenge with `validate_work`.")
+	}
 	switch agentType {
 	case GlobalReviewAgentInspector:
 		if snapshot != nil && snapshot.PendingValidation != nil {
-			return fmt.Errorf("Before ending this global inspector turn, call `process_global_validation` and then decide the next move with `challenge_global_tester`, `challenge_orchestrator`, `challenge_architect`, `finalize_global_review`, or `commit_to_disk`.")
+			return fmt.Errorf("Before ending this global inspector turn, call `process_validation` and then decide whether the next move is `challenge_agent`, `handoff_next`, `finalize_global_review`, or `commit_to_disk`.")
 		}
-		return fmt.Errorf("Before ending this global inspector turn, use `challenge_global_tester`, `challenge_orchestrator`, `challenge_architect`, `finalize_global_review`, or `commit_to_disk` to record the next review step.")
-	case GlobalReviewAgentTester, GlobalReviewAgentArchitect, GlobalReviewAgentOrchestrator:
-		if snapshot != nil && snapshot.PendingChallenge != nil && normalizeGlobalReviewAgent(snapshot.PendingChallenge.TargetAgent) == agentType {
-			return fmt.Errorf("Before ending this global review turn, answer the active challenge with `validate_global_review`.")
+		return fmt.Errorf("Before ending this global inspector turn, use `challenge_agent`, `handoff_next`, `validate_work`, `process_validation`, `finalize_global_review`, or `commit_to_disk` to record the next review step.")
+	case GlobalReviewAgentTester:
+		if snapshot != nil && snapshot.PendingValidation != nil &&
+			normalizeGlobalReviewAgent(snapshot.PendingValidation.RequestingAgent) == agentType {
+			return fmt.Errorf("Before ending this global tester turn, call `process_validation` before choosing the next handoff or challenge.")
+		}
+		return fmt.Errorf("Before ending this global tester turn, use `challenge_agent`, `handoff_next`, `validate_work`, or `process_validation` to record the next review step.")
+	case GlobalReviewAgentArchitect, GlobalReviewAgentOrchestrator:
+		if snapshot != nil && snapshot.PendingValidation != nil &&
+			normalizeGlobalReviewAgent(snapshot.PendingValidation.RequestingAgent) == agentType {
+			return fmt.Errorf("Before ending this global review turn, call `process_validation` before choosing another challenge or handoff.")
 		}
 	}
 	return nil
@@ -417,137 +431,127 @@ func NewGlobalReviewProtocolSkills(cfg GlobalReviewProtocolSkillConfig) []*skill
 	switch normalizeGlobalReviewAgent(globalReviewAgentType(context.Background(), cfg)) {
 	case GlobalReviewAgentInspector:
 		return []*skills.Skill{
-			globalReviewChallengeTesterSkill(cfg),
-			globalReviewChallengeOrchestratorSkill(cfg),
-			globalReviewChallengeArchitectSkill(cfg),
+			globalReviewChallengeAgentSkill(cfg),
+			globalReviewHandoffNextSkill(cfg),
+			globalReviewValidateWorkSkill(cfg),
 			globalReviewProcessValidationSkill(cfg),
 			globalReviewFinalizeSkill(cfg),
 			globalReviewCommitToDiskSkill(cfg),
 		}
-	case GlobalReviewAgentTester, GlobalReviewAgentArchitect, GlobalReviewAgentOrchestrator:
+	case GlobalReviewAgentTester:
 		return []*skills.Skill{
-			globalReviewValidateSkill(cfg),
+			globalReviewChallengeAgentSkill(cfg),
+			globalReviewHandoffNextSkill(cfg),
+			globalReviewValidateWorkSkill(cfg),
+			globalReviewProcessValidationSkill(cfg),
+		}
+	case GlobalReviewAgentArchitect, GlobalReviewAgentOrchestrator:
+		return []*skills.Skill{
+			globalReviewValidateWorkSkill(cfg),
 		}
 	default:
 		return nil
 	}
 }
 
-func globalReviewChallengeTesterSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
-	return skills.NewSkill("challenge_global_tester").
-		Description("Challenge the global tester to validate merged work against the entire architect plan, preserved behavior, and repository quality bar.").
+type globalReviewTurnSelectionParams struct {
+	TargetAgents   []string `json:"target_agents"`
+	Reason         string   `json:"reason"`
+	Request        string   `json:"request"`
+	RequiredOutput []string `json:"required_output"`
+	References     []string `json:"references"`
+}
+
+func globalReviewChallengeAgentSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
+	return skills.NewSkill("challenge_agent").
+		Description("Issue a targeted follow-up challenge during global review when returned work, execution state, or plan rationale needs direct clarification.").
 		Domain("global_review").
-		Keywords("global", "review", "tester", "challenge", "validation").
+		Keywords("global", "review", "challenge", "validation", "route").
 		Priority(100).
-		Usage("Use when the global inspector needs the global tester to audit or execute merged-state validation before final acceptance.").
-		Requirement("Provide the concrete concern, the exact request, and any required evidence the tester must return.").
-		Satisfies("Creates the next strict global-review handoff from inspector to tester.").
+		Usage("Use when a specific global-review gap needs a direct response from another agent. Use `handoff_next` for ordinary top-level Inspector <-> Tester progression; reserve this skill for targeted follow-up to Tester, Architect, Orchestrator, or Inspector.").
+		Requirement("Provide exactly one target agent plus the concrete concern, the exact request, and any required evidence that target must return.").
+		Satisfies("Creates an explicit targeted challenge and routes it to the challenged global-review agent.").
+		ArrayParam("target_agents", "Canonical target agent: inspector, tester, architect, or orchestrator", "string", true).
 		StringParam("reason", "Why the tester challenge is necessary now", true).
-		StringParam("request", "Concrete validation work the global tester must perform", true).
-		ArrayParam("required_output", "What the tester must return", "string", false).
+		StringParam("request", "Concrete validation work or clarification the challenged agent must perform", true).
+		ArrayParam("required_output", "What the challenged agent must return", "string", false).
 		ArrayParam("references", "Relevant files, evidence, or criteria", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Reason         string   `json:"reason"`
-				Request        string   `json:"request"`
-				RequiredOutput []string `json:"required_output"`
-				References     []string `json:"references"`
-			}
+			var params globalReviewTurnSelectionParams
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			target, err := normalizeGlobalReviewSelectionTarget(params.TargetAgents)
+			if err != nil {
+				return nil, err
 			}
 			action := &GlobalReviewTurnAction{
 				Type:             GlobalReviewActionChallenge,
 				AgentType:        normalizeGlobalReviewAgent(globalReviewAgentType(ctx, cfg)),
-				TargetAgent:      GlobalReviewAgentTester,
+				TargetAgent:      target,
 				CreatesChallenge: true,
 				Reason:           strings.TrimSpace(params.Reason),
 				Request:          strings.TrimSpace(params.Request),
 				RequiredOutput:   normalizeStringList(params.RequiredOutput),
 				References:       normalizeStringList(params.References),
 			}
-			return issueGlobalReviewChallenge(ctx, cfg, action)
+			return issueGlobalReviewSelection(ctx, cfg, action)
 		}).
 		Build()
 }
 
-func globalReviewChallengeArchitectSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
-	return skills.NewSkill("challenge_architect").
-		Description("Challenge the architect when the plan, rationale, or chosen approach appears defective, unclear, or materially suboptimal. Do not use this for DAG or workflow progress.").
+func globalReviewHandoffNextSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
+	return skills.NewSkill("handoff_next").
+		Description("Hand top-level global-review ownership to the next ordinary owner for broad testing or audit progression.").
 		Domain("global_review").
-		Keywords("global", "review", "architect", "challenge", "plan").
+		Keywords("global", "review", "handoff", "next", "route").
 		Priority(100).
-		Usage("Use when the global inspector concludes the audit requires direct architect response about the plan itself: defects in the plan, missing rationale, ambiguity, or stronger alternatives. For workflow progress, DAG state, or merged-work execution progress, use `challenge_orchestrator` instead.").
-		Requirement("Provide the concrete plan defect or concern, the requested architect response about the plan or rationale, and supporting references.").
-		Satisfies("Creates a strict architect challenge in the global review flow about plan quality, rationale, or needed plan revision.").
-		StringParam("reason", "Why the architect challenge is necessary now", true).
-		StringParam("request", "Concrete response or revision explanation required from the architect", true).
-		ArrayParam("required_output", "What the architect must return", "string", false).
+		Usage("Use for ordinary top-level global-review phase progression: Global Inspector -> Global Tester for broad merged-state validation, and Global Tester -> Global Inspector when returning completed top-level validation evidence. Do not use this for targeted follow-up; use `challenge_agent` for that.").
+		Requirement("Provide exactly one target agent plus the concrete request, why this handoff is correct now, and any required evidence the next owner must inspect or return.").
+		Satisfies("Records the next top-level global-review owner without turning the handoff into a challenge.").
+		ArrayParam("target_agents", "Canonical target agent: inspector or tester", "string", true).
+		StringParam("reason", "Why this handoff is the correct next move", true).
+		StringParam("request", "The concrete top-level testing or audit request for the target agent", true).
+		ArrayParam("required_output", "What the target agent must return", "string", false).
 		ArrayParam("references", "Relevant files, evidence, or criteria", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Reason         string   `json:"reason"`
-				Request        string   `json:"request"`
-				RequiredOutput []string `json:"required_output"`
-				References     []string `json:"references"`
-			}
+			var params globalReviewTurnSelectionParams
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			action := &GlobalReviewTurnAction{
-				Type:             GlobalReviewActionChallenge,
-				AgentType:        normalizeGlobalReviewAgent(globalReviewAgentType(ctx, cfg)),
-				TargetAgent:      GlobalReviewAgentArchitect,
-				CreatesChallenge: true,
-				Reason:           strings.TrimSpace(params.Reason),
-				Request:          strings.TrimSpace(params.Request),
-				RequiredOutput:   normalizeStringList(params.RequiredOutput),
-				References:       normalizeStringList(params.References),
+			target, err := normalizeGlobalReviewSelectionTarget(params.TargetAgents)
+			if err != nil {
+				return nil, err
 			}
-			return issueGlobalReviewChallenge(ctx, cfg, action)
+			action := &GlobalReviewTurnAction{
+				Type:           GlobalReviewActionHandoff,
+				AgentType:      normalizeGlobalReviewAgent(globalReviewAgentType(ctx, cfg)),
+				TargetAgent:    target,
+				Reason:         strings.TrimSpace(params.Reason),
+				Request:        strings.TrimSpace(params.Request),
+				RequiredOutput: normalizeStringList(params.RequiredOutput),
+				References:     normalizeStringList(params.References),
+			}
+			return issueGlobalReviewSelection(ctx, cfg, action)
 		}).
 		Build()
 }
 
-func globalReviewChallengeOrchestratorSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
-	return skills.NewSkill("challenge_orchestrator").
-		Description("Challenge the orchestrator for authoritative DAG, workflow, task, pipeline, and execution-progress state needed by the global review.").
-		Domain("global_review").
-		Keywords("global", "review", "orchestrator", "challenge", "dag", "workflow", "progress", "pipeline").
-		Priority(100).
-		Usage("Use when the global inspector concludes the audit requires authoritative execution-state information such as DAG progress, workflow completion, pending tasks, active pipelines, or current merged-work progress. Do not route these questions to the architect.").
-		Requirement("Provide the concrete progress/state concern, the exact orchestrator response needed, and any relevant references such as DAG IDs, workflow IDs, task IDs, or pipeline IDs.").
-		Satisfies("Creates a strict orchestrator challenge in the global review flow so the inspector can validate real execution-state data.").
-		StringParam("reason", "Why the orchestrator challenge is necessary now", true).
-		StringParam("request", "Concrete workflow, DAG, pipeline, or progress information required from the orchestrator", true).
-		ArrayParam("required_output", "What the orchestrator must return", "string", false).
-		ArrayParam("references", "Relevant DAG, workflow, task, or pipeline identifiers", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Reason         string   `json:"reason"`
-				Request        string   `json:"request"`
-				RequiredOutput []string `json:"required_output"`
-				References     []string `json:"references"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			action := &GlobalReviewTurnAction{
-				Type:             GlobalReviewActionChallenge,
-				AgentType:        normalizeGlobalReviewAgent(globalReviewAgentType(ctx, cfg)),
-				TargetAgent:      GlobalReviewAgentOrchestrator,
-				CreatesChallenge: true,
-				Reason:           strings.TrimSpace(params.Reason),
-				Request:          strings.TrimSpace(params.Request),
-				RequiredOutput:   normalizeStringList(params.RequiredOutput),
-				References:       normalizeStringList(params.References),
-			}
-			return issueGlobalReviewChallenge(ctx, cfg, action)
-		}).
-		Build()
+func normalizeGlobalReviewSelectionTarget(raw []string) (string, error) {
+	targets := normalizeStringList(raw)
+	if len(targets) != 1 {
+		return "", fmt.Errorf("exactly one target agent is required")
+	}
+	target := normalizeGlobalReviewAgent(targets[0])
+	switch target {
+	case GlobalReviewAgentInspector, GlobalReviewAgentTester, GlobalReviewAgentArchitect, GlobalReviewAgentOrchestrator:
+		return target, nil
+	default:
+		return "", fmt.Errorf("target agent %q is invalid", targets[0])
+	}
 }
 
-func issueGlobalReviewChallenge(
+func issueGlobalReviewSelection(
 	ctx context.Context,
 	cfg GlobalReviewProtocolSkillConfig,
 	action *GlobalReviewTurnAction,
@@ -556,8 +560,8 @@ func issueGlobalReviewChallenge(
 	if state == nil {
 		return nil, fmt.Errorf("global review state not available")
 	}
-	if normalizeGlobalReviewAgent(action.AgentType) != GlobalReviewAgentInspector {
-		return nil, fmt.Errorf("%s is only permitted for the global inspector", actionNameForTarget(action.TargetAgent))
+	if err := validateGlobalReviewSelection(action); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(action.Reason) == "" {
 		return nil, fmt.Errorf("reason is required")
@@ -568,7 +572,9 @@ func issueGlobalReviewChallenge(
 	if snapshot := state.Snapshot(); snapshot != nil && snapshot.PendingValidation != nil {
 		return nil, fmt.Errorf("process the pending validation before issuing another global review challenge")
 	}
-	action.ChallengeID = nextGlobalReviewChallengeID(state.Snapshot())
+	if action.CreatesChallenge {
+		action.ChallengeID = nextGlobalReviewChallengeID(state.Snapshot())
+	}
 	dispatch, err := dispatchGlobalReviewSelection(ctx, cfg, state, action)
 	if err != nil {
 		return nil, err
@@ -580,22 +586,56 @@ func issueGlobalReviewChallenge(
 		return nil, err
 	}
 	return map[string]any{
-		"selected":       true,
-		"agent_type":     action.AgentType,
-		"target_agent":   action.TargetAgent,
-		"challenge_id":   action.ChallengeID,
-		"forwarded":      true,
-		"correlation_id": dispatch.CorrelationID,
+		"selected":          true,
+		"agent_type":        action.AgentType,
+		"target_agent":      action.TargetAgent,
+		"target_agents":     []string{action.TargetAgent},
+		"creates_challenge": action.CreatesChallenge,
+		"challenge_id":      strings.TrimSpace(action.ChallengeID),
+		"forwarded":         true,
+		"correlation_id":    dispatch.CorrelationID,
 	}, nil
 }
 
-func globalReviewValidateSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
-	return skills.NewSkill("validate_global_review").
+func validateGlobalReviewSelection(action *GlobalReviewTurnAction) error {
+	if action == nil {
+		return fmt.Errorf("global review action is required")
+	}
+	actor := normalizeGlobalReviewAgent(action.AgentType)
+	target := normalizeGlobalReviewAgent(action.TargetAgent)
+	switch actor {
+	case GlobalReviewAgentInspector:
+		if action.CreatesChallenge {
+			switch target {
+			case GlobalReviewAgentTester, GlobalReviewAgentArchitect, GlobalReviewAgentOrchestrator:
+				return nil
+			}
+		} else if target == GlobalReviewAgentTester {
+			return nil
+		}
+	case GlobalReviewAgentTester:
+		if action.CreatesChallenge {
+			if target == GlobalReviewAgentInspector {
+				return nil
+			}
+		} else if target == GlobalReviewAgentInspector {
+			return nil
+		}
+	}
+	verb := "handoff_next"
+	if action.CreatesChallenge {
+		verb = "challenge_agent"
+	}
+	return fmt.Errorf("%s is not permitted for %s -> %s in the global review protocol", verb, actor, target)
+}
+
+func globalReviewValidateWorkSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
+	return skills.NewSkill("validate_work").
 		Description("Answer an active global-review challenge from the global inspector with a structured validation response and evidence.").
 		Domain("global_review").
 		Keywords("global", "review", "validate", "response", "evidence").
 		Priority(100).
-		Usage("Use when the global inspector challenged you to validate merged-state behavior, execution progress/state, plan fit, or approach quality.").
+		Usage("Use only when another global-review agent has an active challenge waiting for your response. Ordinary top-level Inspector <-> Tester progression still uses `handoff_next`.").
 		Requirement("Your response must match the active challenge ID and return concrete evidence or missing inputs.").
 		Satisfies("Returns the structured response that hands control back to the global inspector.").
 		StringParam("challenge_id", "The active global-review challenge identifier", true).
@@ -688,6 +728,8 @@ func globalReviewValidateSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skil
 				"requesting_agent": record.RequestingAgent,
 				"responding_agent": record.RespondingAgent,
 				"status":           record.Status,
+				"protocol_scope":   globalReviewNamespace,
+				"thread_key":       globalReviewThreadPrefix + strings.TrimSpace(record.ChallengeID),
 				"forwarded":        true,
 				"correlation_id":   correlationID,
 				"target_agent":     requestingAgent,
@@ -697,13 +739,13 @@ func globalReviewValidateSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skil
 }
 
 func globalReviewProcessValidationSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
-	return skills.NewSkill("process_global_validation").
+	return skills.NewSkill("process_validation").
 		Description("Acknowledge and interpret a global-review validation response before choosing the next step.").
 		Domain("global_review").
 		Keywords("global", "review", "process", "validation").
 		Priority(99).
-		Usage("Use after the global tester or architect responds and before issuing another challenge, finalizing, or committing to disk.").
-		Satisfies("Records how the global inspector interpreted the received validation response.").
+		Usage("Use after another global-review agent answers one of your challenges and before issuing another challenge, handing ownership forward, finalizing, or committing to disk.").
+		Satisfies("Records how the requesting global-review agent interpreted the received validation response.").
 		StringParam("challenge_id", "The validation challenge being processed", true).
 		EnumParam("decision", "How you interpreted the response", []string{
 			string(GlobalReviewValidationDecisionAccept),
@@ -711,6 +753,7 @@ func globalReviewProcessValidationSkill(cfg GlobalReviewProtocolSkillConfig) *sk
 			string(GlobalReviewValidationDecisionClarify),
 			string(GlobalReviewValidationDecisionLoop),
 			string(GlobalReviewValidationDecisionConsult),
+			string(GlobalReviewValidationDecisionHandoff),
 		}, true).
 		StringParam("summary", "Why you accepted, rejected, or need follow-up", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -722,9 +765,7 @@ func globalReviewProcessValidationSkill(cfg GlobalReviewProtocolSkillConfig) *sk
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			if normalizeGlobalReviewAgent(globalReviewAgentType(ctx, cfg)) != GlobalReviewAgentInspector {
-				return nil, fmt.Errorf("process_global_validation is only permitted for the global inspector")
-			}
+			agentType := normalizeGlobalReviewAgent(globalReviewAgentType(ctx, cfg))
 			state := GlobalReviewStateFromContext(ctx)
 			if state == nil {
 				return nil, fmt.Errorf("global review state not available")
@@ -738,6 +779,9 @@ func globalReviewProcessValidationSkill(cfg GlobalReviewProtocolSkillConfig) *sk
 			if challengeID == "" || challengeID != strings.TrimSpace(pending.ChallengeID) {
 				return nil, fmt.Errorf("challenge_id %q does not match the pending global-review validation", challengeID)
 			}
+			if agentType == "" || agentType != normalizeGlobalReviewAgent(pending.RequestingAgent) {
+				return nil, fmt.Errorf("process_validation is only permitted for the agent that requested the active challenge")
+			}
 			decision := GlobalReviewValidationDecision(strings.TrimSpace(params.Decision))
 			if !isGlobalReviewValidationDecision(string(decision)) {
 				return nil, fmt.Errorf("decision %q is invalid", params.Decision)
@@ -748,7 +792,7 @@ func globalReviewProcessValidationSkill(cfg GlobalReviewProtocolSkillConfig) *sk
 			}
 			entry := GlobalReviewValidationProcessing{
 				ChallengeID: challengeID,
-				AgentType:   GlobalReviewAgentInspector,
+				AgentType:   agentType,
 				Decision:    decision,
 				Summary:     summary,
 				Validation:  cloneGlobalReviewValidationRecord(pending),
@@ -757,9 +801,12 @@ func globalReviewProcessValidationSkill(cfg GlobalReviewProtocolSkillConfig) *sk
 				return nil, err
 			}
 			return map[string]any{
-				"processed":    true,
-				"challenge_id": challengeID,
-				"decision":     string(decision),
+				"processed":      true,
+				"challenge_id":   challengeID,
+				"decision":       string(decision),
+				"agent_type":     agentType,
+				"protocol_scope": globalReviewNamespace,
+				"thread_key":     globalReviewThreadPrefix + challengeID,
 			}, nil
 		}).
 		Build()
@@ -837,7 +884,7 @@ func globalReviewFinalizeSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skil
 				},
 				References: evidenceRefs,
 			}
-			return issueGlobalReviewChallenge(ctx, cfg, action)
+			return issueGlobalReviewSelection(ctx, cfg, action)
 		}).
 		Build()
 }
@@ -944,24 +991,30 @@ func dispatchGlobalReviewSelection(
 	}
 	snapshot := buildGlobalReviewHandoffSnapshot(state, action)
 	metadata := buildGlobalReviewRouteMetadata(state, snapshot, action.TargetAgent)
-	branchCtx, branch := BeginInterAgentBranch(ctx, InterAgentBranchSpec{
-		Kind:          InterAgentToolEventKindChallenge,
-		ToolName:      actionNameForTarget(strings.TrimSpace(action.TargetAgent)),
-		AgentTypes:    []string{strings.TrimSpace(action.TargetAgent)},
-		Summary:       action.Request,
-		ThreadKey:     globalReviewThreadPrefix + strings.TrimSpace(action.ChallengeID),
-		SuccessStatus: InterAgentToolEventStatusPending,
-		Args: map[string]any{
-			"target_agent": strings.TrimSpace(action.TargetAgent),
-			"challenge_id": strings.TrimSpace(action.ChallengeID),
-			"request":      action.Request,
-		},
-	})
-	metadata = RouteMetadataWithExplicitInterAgentBranch(branchCtx, metadata, InterAgentBranchMetadata{
-		ThreadKey: globalReviewThreadPrefix + strings.TrimSpace(action.ChallengeID),
-		Kind:      InterAgentToolEventKindChallenge,
-	})
-	prompt := buildGlobalReviewChallengePrompt(action.TargetAgent, action, metadata)
+	branchCtx := ctx
+	var branch InterAgentBranchHandle
+	if action.CreatesChallenge {
+		branchCtx, branch = BeginInterAgentBranch(ctx, InterAgentBranchSpec{
+			Kind:          InterAgentToolEventKindChallenge,
+			ToolName:      "challenge_agent",
+			AgentTypes:    []string{strings.TrimSpace(action.TargetAgent)},
+			Summary:       action.Request,
+			ThreadKey:     globalReviewThreadPrefix + strings.TrimSpace(action.ChallengeID),
+			SuccessStatus: InterAgentToolEventStatusPending,
+			Args: map[string]any{
+				"target_agent":   strings.TrimSpace(action.TargetAgent),
+				"challenge_id":   strings.TrimSpace(action.ChallengeID),
+				"request":        action.Request,
+				"protocol_scope": globalReviewNamespace,
+				"thread_key":     globalReviewThreadPrefix + strings.TrimSpace(action.ChallengeID),
+			},
+		})
+		metadata = RouteMetadataWithExplicitInterAgentBranch(branchCtx, metadata, InterAgentBranchMetadata{
+			ThreadKey: globalReviewThreadPrefix + strings.TrimSpace(action.ChallengeID),
+			Kind:      InterAgentToolEventKindChallenge,
+		})
+	}
+	prompt := buildGlobalReviewTurnPrompt(action, metadata)
 	correlationID := "global_review_" + uuid.NewString()[:12]
 	sourceAgentID := globalReviewVisibleSourceAgentID(stream)
 	req := &guide.RouteRequest{
@@ -1002,14 +1055,16 @@ func dispatchGlobalReviewValidation(
 	metadata := buildGlobalReviewRouteMetadata(state, snapshot, record.RequestingAgent)
 	branchCtx, branch := BeginInterAgentBranch(ctx, InterAgentBranchSpec{
 		Kind:       InterAgentToolEventKindChallenge,
-		ToolName:   "validate_global_review",
+		ToolName:   "validate_work",
 		AgentTypes: []string{strings.TrimSpace(record.RequestingAgent)},
 		Summary:    record.Summary,
 		ThreadKey:  globalReviewThreadPrefix + strings.TrimSpace(record.ChallengeID),
 		Args: map[string]any{
-			"target_agent": strings.TrimSpace(record.RequestingAgent),
-			"challenge_id": strings.TrimSpace(record.ChallengeID),
-			"summary":      record.Summary,
+			"target_agent":   strings.TrimSpace(record.RequestingAgent),
+			"challenge_id":   strings.TrimSpace(record.ChallengeID),
+			"summary":        record.Summary,
+			"protocol_scope": globalReviewNamespace,
+			"thread_key":     globalReviewThreadPrefix + strings.TrimSpace(record.ChallengeID),
 		},
 	})
 	metadata = RouteMetadataWithExplicitInterAgentBranch(branchCtx, metadata, InterAgentBranchMetadata{
@@ -1065,13 +1120,13 @@ func globalReviewRouteObligations(state *GlobalReviewState, snapshot *GlobalRevi
 	}
 	if challenge := snapshot.PendingChallenge; challenge != nil && normalizeGlobalReviewAgent(challenge.TargetAgent) == targetAgent {
 		return []map[string]any{{
-			"action":  "validate_global_review",
+			"action":  "validate_work",
 			"summary": "Answer the active global-review challenge before ending the turn.",
 		}}
 	}
 	if validation := snapshot.PendingValidation; validation != nil && normalizeGlobalReviewAgent(validation.RequestingAgent) == targetAgent {
 		return []map[string]any{{
-			"action":  "process_global_validation",
+			"action":  "process_validation",
 			"summary": "Process the pending validation response before selecting the next review step.",
 		}}
 	}
@@ -1083,6 +1138,7 @@ func buildGlobalReviewHandoffSnapshot(state *GlobalReviewState, action *GlobalRe
 	if snapshot == nil {
 		snapshot = &GlobalReviewSnapshot{}
 	}
+	snapshot.ActiveAgents = []string{normalizeGlobalReviewAgent(action.TargetAgent)}
 	snapshot.RequestedBy = normalizeGlobalReviewAgent(action.AgentType)
 	snapshot.CurrentRequest = strings.TrimSpace(action.Request)
 	snapshot.PendingValidation = nil
@@ -1112,8 +1168,9 @@ func buildGlobalReviewValidationSnapshot(state *GlobalReviewState, record *Globa
 	if snapshot == nil {
 		snapshot = &GlobalReviewSnapshot{}
 	}
+	snapshot.ActiveAgents = []string{normalizeGlobalReviewAgent(record.RequestingAgent)}
 	snapshot.RequestedBy = normalizeGlobalReviewAgent(record.RespondingAgent)
-	snapshot.CurrentRequest = fmt.Sprintf("Process global review validation response for challenge %s.", strings.TrimSpace(record.ChallengeID))
+	snapshot.CurrentRequest = fmt.Sprintf("Process validation response for challenge %s and decide the next handoff.", strings.TrimSpace(record.ChallengeID))
 	snapshot.PendingChallenge = nil
 	snapshot.PendingValidation = cloneGlobalReviewValidationRecord(record)
 	appendGlobalReviewEvent(snapshot, GlobalReviewEvent{
@@ -1135,32 +1192,50 @@ func materializeGlobalReviewSnapshot(state *GlobalReviewState) *GlobalReviewSnap
 	}
 	for _, entry := range state.ProcessedValidations() {
 		appendGlobalReviewEvent(snapshot, GlobalReviewEvent{
-			Type:      "process_global_validation",
+			Type:      "process_validation",
 			AgentType: normalizeGlobalReviewAgent(entry.AgentType),
 			Summary:   strings.TrimSpace(entry.Summary),
 		})
 		if snapshot.PendingValidation != nil && strings.TrimSpace(snapshot.PendingValidation.ChallengeID) == strings.TrimSpace(entry.ChallengeID) {
 			snapshot.PendingValidation = nil
+			snapshot.CurrentRequest = fmt.Sprintf(
+				"Choose the next global review action after processing challenge %s.",
+				strings.TrimSpace(entry.ChallengeID),
+			)
 		}
 	}
 	return snapshot
 }
 
-func buildGlobalReviewChallengePrompt(targetAgent string, action *GlobalReviewTurnAction, metadata map[string]any) string {
-	normalizedTarget := normalizeGlobalReviewAgent(targetAgent)
+func buildGlobalReviewTurnPrompt(action *GlobalReviewTurnAction, metadata map[string]any) string {
+	normalizedTarget := normalizeGlobalReviewAgent(action.TargetAgent)
 	var lines []string
 	switch normalizedTarget {
 	case GlobalReviewAgentArchitect:
-		lines = append(lines, "Global inspector challenge for the architect.")
+		lines = append(lines, "Global review request for the architect.")
 	case GlobalReviewAgentOrchestrator:
-		lines = append(lines, "Global inspector challenge for the orchestrator.")
+		lines = append(lines, "Global review request for the orchestrator.")
+	case GlobalReviewAgentInspector:
+		lines = append(lines, "Global tester handoff back to the global inspector.")
 	default:
-		lines = append(lines, "Global inspector challenge for the global tester.")
+		if action.CreatesChallenge {
+			lines = append(lines, "Global inspector challenge for the global tester.")
+		} else {
+			lines = append(lines, "Global review handoff for the global tester.")
+		}
 	}
-	lines = append(lines,
-		"This request is part of the strict global review loop over merged global state.",
-		"Do not answer narratively without recording the result. End this turn with `validate_global_review`.",
-	)
+	if action.CreatesChallenge {
+		lines = append(lines,
+			"This request is part of the global review protocol over merged global state.",
+			"This is a targeted challenge turn. Do not answer narratively without recording the result. End this turn with `validate_work`.",
+		)
+	} else {
+		lines = append(lines,
+			"This request is part of the global review protocol over merged global state.",
+			"This is an ordinary top-level handoff, not a targeted challenge. End this turn with `handoff_next` when the requested broad work is complete.",
+			"Use `challenge_agent` only if a specific ambiguity or blocker needs a narrower follow-up instead of a normal top-level return.",
+		)
+	}
 	appendGlobalReviewContextLines(&lines, metadata)
 	appendGlobalReviewCheckpointGuard(&lines, normalizedTarget, metadata)
 	if strings.TrimSpace(action.Reason) != "" {
@@ -1181,16 +1256,22 @@ func buildGlobalReviewChallengePrompt(targetAgent string, action *GlobalReviewTu
 			lines = append(lines, "- "+item)
 		}
 	}
-	lines = append(lines, fmt.Sprintf("Use `validate_global_review` with challenge_id %s to hand the result back to the global inspector.", strings.TrimSpace(action.ChallengeID)))
+	if action.CreatesChallenge {
+		lines = append(lines, fmt.Sprintf("Use `validate_work` with challenge_id %s to hand the result back to the requesting agent.", strings.TrimSpace(action.ChallengeID)))
+	} else if normalizedTarget == GlobalReviewAgentTester {
+		lines = append(lines, "When you complete the requested merged-state validation work, use `handoff_next` to return top-level ownership to the global inspector.")
+	} else if normalizedTarget == GlobalReviewAgentInspector {
+		lines = append(lines, "After you audit the returned global testing evidence, use `challenge_agent` for targeted follow-up, `handoff_next` for another top-level tester pass, or `finalize_global_review` when the current audit is actually settled.")
+	}
 	return strings.Join(lines, "\n")
 }
 
 func buildGlobalReviewValidationPrompt(record *GlobalReviewValidationRecord, metadata map[string]any) string {
 	normalizedResponder := normalizeGlobalReviewAgent(record.RespondingAgent)
 	lines := []string{
-		fmt.Sprintf("Global review validation response from %s.", normalizedResponder),
-		"This request is part of the strict global review loop over merged global state.",
-		"Use `process_global_validation` before choosing the next action.",
+		fmt.Sprintf("Global review challenge response from %s.", normalizedResponder),
+		"This request is part of the global review protocol over merged global state.",
+		"Use `process_validation` before choosing the next action.",
 	}
 	appendGlobalReviewContextLines(&lines, metadata)
 	appendGlobalReviewCheckpointGuard(&lines, normalizedResponder, metadata)
@@ -1212,7 +1293,7 @@ func buildGlobalReviewValidationPrompt(record *GlobalReviewValidationRecord, met
 			lines = append(lines, "- "+item)
 		}
 	}
-	lines = append(lines, "After `process_global_validation`, decide whether to challenge again, challenge the orchestrator, challenge the architect, finalize the global review, or commit to disk.")
+	lines = append(lines, "After `process_validation`, decide whether the next step is another targeted `challenge_agent`, an ordinary `handoff_next`, `finalize_global_review`, or `commit_to_disk`.")
 	return strings.Join(lines, "\n")
 }
 
@@ -1467,6 +1548,7 @@ func cloneGlobalReviewSnapshot(snapshot *GlobalReviewSnapshot) *GlobalReviewSnap
 		return nil
 	}
 	out := *snapshot
+	out.ActiveAgents = append([]string(nil), snapshot.ActiveAgents...)
 	out.PendingChallenge = cloneGlobalReviewChallenge(snapshot.PendingChallenge)
 	out.PendingValidation = cloneGlobalReviewValidationRecord(snapshot.PendingValidation)
 	out.RecentEvents = append([]GlobalReviewEvent(nil), snapshot.RecentEvents...)
@@ -1569,17 +1651,6 @@ func nextGlobalReviewChallengeID(snapshot *GlobalReviewSnapshot) string {
 	return fmt.Sprintf("%s-challenge-%s", base, uuid.NewString()[:8])
 }
 
-func actionNameForTarget(target string) string {
-	switch normalizeGlobalReviewAgent(target) {
-	case GlobalReviewAgentArchitect:
-		return "challenge_architect"
-	case GlobalReviewAgentOrchestrator:
-		return "challenge_orchestrator"
-	default:
-		return "challenge_global_tester"
-	}
-}
-
 func isGlobalReviewValidationStatus(status string) bool {
 	switch strings.TrimSpace(status) {
 	case string(GlobalReviewValidationPassed),
@@ -1599,7 +1670,8 @@ func isGlobalReviewValidationDecision(decision string) bool {
 		string(GlobalReviewValidationDecisionReject),
 		string(GlobalReviewValidationDecisionClarify),
 		string(GlobalReviewValidationDecisionLoop),
-		string(GlobalReviewValidationDecisionConsult):
+		string(GlobalReviewValidationDecisionConsult),
+		string(GlobalReviewValidationDecisionHandoff):
 		return true
 	default:
 		return false

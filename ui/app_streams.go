@@ -7,6 +7,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/ui/agentidentity"
 	"github.com/adalundhe/sylk/ui/chat"
 	"github.com/adalundhe/sylk/ui/compositor"
 	"github.com/adalundhe/sylk/ui/msg"
@@ -15,6 +16,19 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/google/uuid"
 )
+
+func appendBranchRefLogAttrs(attrs []any, prefix string, ref *msg.InterAgentBranchRefMsg) []any {
+	attrs = append(attrs, prefix+"_present", ref != nil)
+	if ref == nil {
+		return attrs
+	}
+	return append(attrs,
+		prefix+"_parent_correlation_id", strings.TrimSpace(ref.ParentCorrelationID),
+		prefix+"_parent_tool_call_key", strings.TrimSpace(ref.ParentToolCallKey),
+		prefix+"_kind", strings.TrimSpace(ref.Kind),
+		prefix+"_thread_key", strings.TrimSpace(ref.ThreadKey),
+	)
+}
 
 func normalizeExplicitTargetAgent(raw string) string {
 	target := strings.ToLower(strings.TrimSpace(raw))
@@ -426,94 +440,27 @@ func logicalStreamPipelineID(pipelineID, taskID string) string {
 }
 
 func parseTaskScopedPipelineAgentID(agentID string) (taskID, agentType string, ok bool) {
-	agentID = strings.TrimSpace(agentID)
-	if agentID == "" {
-		return "", "", false
-	}
-	parts := strings.SplitN(agentID, "__", 2)
-	if len(parts) != 2 {
-		return "", "", false
-	}
-	taskID = strings.TrimSpace(parts[0])
-	agentType = strings.TrimSpace(parts[1])
-	if taskID == "" {
-		return "", "", false
-	}
-	switch agentType {
-	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
-		return taskID, agentType, true
-	default:
-		return "", "", false
-	}
+	return agentidentity.ParseTaskScopedPipelineAgentID(agentID)
 }
 
 func parseCanonicalPipelinePanelAgentID(agentID string) (pipelineID, agentType string, ok bool) {
-	agentID = strings.TrimSpace(agentID)
-	if agentID == "" {
-		return "", "", false
-	}
-	for _, candidateType := range []string{"inspector-pipeline", "tester-pipeline", "engineer", "designer"} {
-		suffix := ":" + candidateType
-		if !strings.HasSuffix(agentID, suffix) {
-			continue
-		}
-		pipelineID = strings.TrimSpace(strings.TrimSuffix(agentID, suffix))
-		if pipelineID == "" {
-			return "", "", false
-		}
-		return pipelineID, candidateType, true
-	}
-	return "", "", false
+	return agentidentity.ParseCanonicalPipelinePanelAgentID(agentID)
 }
 
 func isPipelineWorkerType(agentType string) bool {
-	switch strings.TrimSpace(agentType) {
-	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
-		return true
-	default:
-		return false
-	}
+	return agentidentity.IsPipelineWorkerType(agentType)
 }
 
 func canonicalPipelineWorkerPlaceholderID(agentType, pipelineID string) string {
-	agentType = strings.TrimSpace(agentType)
-	pipelineID = strings.TrimSpace(pipelineID)
-	if !isPipelineWorkerType(agentType) || pipelineID == "" {
-		return ""
-	}
-	return pipelineID + ":" + agentType
+	return agentidentity.CanonicalPipelinePanelID(agentType, pipelineID)
 }
 
 func streamPanelAgentID(agentID, agentType, pipelineID string) string {
-	if scopedTaskID, scopedAgentType, ok := parseTaskScopedPipelineAgentID(agentID); ok {
-		if strings.TrimSpace(pipelineID) == "" {
-			pipelineID = scopedTaskID
-		}
-		if strings.TrimSpace(agentType) == "" {
-			agentType = scopedAgentType
-		}
-	}
-	if canonicalPipelineID, canonicalAgentType, ok := parseCanonicalPipelinePanelAgentID(agentID); ok {
-		if strings.TrimSpace(pipelineID) == "" {
-			pipelineID = canonicalPipelineID
-		}
-		if strings.TrimSpace(agentType) == "" {
-			agentType = canonicalAgentType
-		}
-	}
-	agentType = strings.TrimSpace(agentType)
-	pipelineID = strings.TrimSpace(pipelineID)
-	if placeholder := canonicalPipelineWorkerPlaceholderID(agentType, pipelineID); placeholder != "" {
-		return placeholder
-	}
-	if agentType != "" {
-		return normalizeAgentID(agentType)
-	}
-	return normalizeAgentID(agentID)
+	return agentidentity.VisibleAgentID(agentID, "", agentType, pipelineID, "")
 }
 
 func canonicalStreamAgentID(agentID, agentType, pipelineID, taskID string) string {
-	return streamPanelAgentID(agentID, agentType, logicalStreamPipelineID(pipelineID, taskID))
+	return agentidentity.VisibleAgentID(agentID, "", agentType, pipelineID, taskID)
 }
 
 func effectiveCanonicalStreamAgentID(entry *activeStreamEntry, agentID, agentType, pipelineID, taskID string) string {
@@ -604,16 +551,13 @@ func canonicalActivityAgentID(ev *events.ActivityEvent) string {
 	if ev == nil {
 		return ""
 	}
-	rawAgentID := firstNonEmpty(activityDataString(ev.Data, "runtime_agent_id"), ev.AgentID)
-	agentType := activityDataString(ev.Data, "agent_type")
-	pipelineID := logicalStreamPipelineID(
+	return agentidentity.VisibleAgentID(
+		ev.AgentID,
+		activityDataString(ev.Data, "canonical_agent_id"),
+		activityDataString(ev.Data, "agent_type"),
 		activityDataString(ev.Data, "pipeline_id"),
 		activityDataString(ev.Data, "task_id"),
 	)
-	if canonical := streamPanelAgentID(rawAgentID, agentType, pipelineID); canonical != "" {
-		return canonical
-	}
-	return normalizeAgentID(firstNonEmpty(rawAgentID, agentType))
 }
 
 func (m *AppModel) applyActivityTelemetry(activity msg.ActivityEventMsg) {
@@ -661,12 +605,12 @@ func cloneInterAgentBranchRef(ref *msg.InterAgentBranchRefMsg) *msg.InterAgentBr
 	return &cloned
 }
 
-func isExplicitTopLevelTransfer(parentCorrelationID string, ref *msg.InterAgentBranchRefMsg) bool {
-	return ref == nil && strings.TrimSpace(parentCorrelationID) != ""
+func isExplicitTopLevelTransfer(parentCorrelationID string, ref *msg.InterAgentBranchRefMsg, topLevelTransfer bool) bool {
+	return topLevelTransfer && ref == nil && strings.TrimSpace(parentCorrelationID) != ""
 }
 
-func (m *AppModel) clearExplicitTopLevelTransferState(correlationID, parentCorrelationID string, ref *msg.InterAgentBranchRefMsg) {
-	if !isExplicitTopLevelTransfer(parentCorrelationID, ref) || m == nil || m.nestedStreams == nil {
+func (m *AppModel) clearExplicitTopLevelTransferState(correlationID, parentCorrelationID string, ref *msg.InterAgentBranchRefMsg, topLevelTransfer bool) {
+	if !isExplicitTopLevelTransfer(parentCorrelationID, ref, topLevelTransfer) || m == nil || m.nestedStreams == nil {
 		return
 	}
 	delete(m.nestedStreams, strings.TrimSpace(correlationID))
@@ -675,11 +619,15 @@ func (m *AppModel) clearExplicitTopLevelTransferState(correlationID, parentCorre
 func (m *AppModel) resolveIncomingStreamBranchRef(
 	correlationID, parentCorrelationID string,
 	ref *msg.InterAgentBranchRefMsg,
+	topLevelTransfer bool,
 ) *msg.InterAgentBranchRefMsg {
-	if isExplicitTopLevelTransfer(parentCorrelationID, ref) {
+	if isExplicitTopLevelTransfer(parentCorrelationID, ref, topLevelTransfer) {
 		return nil
 	}
-	return m.effectiveStreamBranchRef(correlationID, ref)
+	if resolved := m.effectiveStreamBranchRef(correlationID, ref); resolved != nil {
+		return resolved
+	}
+	return nil
 }
 
 func (m *AppModel) effectiveStreamBranchRef(correlationID string, ref *msg.InterAgentBranchRefMsg) *msg.InterAgentBranchRefMsg {
@@ -688,6 +636,9 @@ func (m *AppModel) effectiveStreamBranchRef(correlationID string, ref *msg.Inter
 	}
 	if existing := m.streamEntryForCorrelation(correlationID); existing != nil && existing.BranchRef != nil {
 		return cloneInterAgentBranchRef(existing.BranchRef)
+	}
+	if recorded := m.recordedStreamBranchRef(correlationID); recorded != nil {
+		return cloneInterAgentBranchRef(recorded)
 	}
 	return nil
 }
@@ -707,15 +658,77 @@ func (m *AppModel) registerPrimaryStream(start msg.StreamStartMsg) bool {
 	if m.activeStreams == nil {
 		m.activeStreams = make(map[string]*activeStreamEntry)
 	}
+	if m.deferredStreams == nil {
+		m.deferredStreams = make(map[string]*activeStreamEntry)
+	}
 	logicalPipelineID := logicalStreamPipelineID(start.PipelineID, start.TaskID)
 	canonicalAgentID := canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
 	if existing, exists := m.activeStreams[correlationID]; exists {
 		updateStreamEntry(existing, start, canonicalAgentID, logicalPipelineID)
+		attrs := []any{
+			"correlation_id", correlationID,
+			"registration", "active_update",
+			"canonical_agent_id", canonicalAgentID,
+			"runtime_agent_id", normalizeRuntimeAgentID(canonicalAgentID, firstNonEmpty(start.RuntimeAgentID, start.AgentID)),
+			"agent_type", strings.TrimSpace(start.AgentType),
+			"active_streams", len(m.activeStreams),
+			"deferred_streams", len(m.deferredStreams),
+			"nested_streams", len(m.nestedStreams),
+		}
+		attrs = appendBranchRefLogAttrs(attrs, "branch_ref", start.BranchRef)
+		uiDebugFileLog().Info("AppModel: REGISTER_PRIMARY_STREAM", attrs...)
+		return false
+	}
+	if existing, exists := m.deferredStreams[correlationID]; exists {
+		delete(m.deferredStreams, correlationID)
+		updateStreamEntry(existing, start, canonicalAgentID, logicalPipelineID)
+		m.activeStreams[correlationID] = existing
+		attrs := []any{
+			"correlation_id", correlationID,
+			"registration", "deferred_resume",
+			"canonical_agent_id", canonicalAgentID,
+			"runtime_agent_id", normalizeRuntimeAgentID(canonicalAgentID, firstNonEmpty(start.RuntimeAgentID, start.AgentID)),
+			"agent_type", strings.TrimSpace(start.AgentType),
+			"active_streams", len(m.activeStreams),
+			"deferred_streams", len(m.deferredStreams),
+			"nested_streams", len(m.nestedStreams),
+		}
+		attrs = appendBranchRefLogAttrs(attrs, "branch_ref", start.BranchRef)
+		uiDebugFileLog().Info("AppModel: REGISTER_PRIMARY_STREAM", attrs...)
+		return false
+	}
+	if existing, exists := m.nestedStreams[correlationID]; exists && existing != nil {
+		updateStreamEntry(existing, start, canonicalAgentID, logicalPipelineID)
+		attrs := []any{
+			"correlation_id", correlationID,
+			"registration", "nested_preserve",
+			"canonical_agent_id", canonicalAgentID,
+			"runtime_agent_id", normalizeRuntimeAgentID(canonicalAgentID, firstNonEmpty(start.RuntimeAgentID, start.AgentID)),
+			"agent_type", strings.TrimSpace(start.AgentType),
+			"active_streams", len(m.activeStreams),
+			"deferred_streams", len(m.deferredStreams),
+			"nested_streams", len(m.nestedStreams),
+		}
+		attrs = appendBranchRefLogAttrs(attrs, "branch_ref", start.BranchRef)
+		attrs = append(attrs, "preserved_existing_nested", true)
+		uiDebugFileLog().Info("AppModel: REGISTER_PRIMARY_STREAM", attrs...)
 		return false
 	}
 	m.replaceActivePipelineWorkerStream(correlationID, canonicalAgentID)
 	delete(m.nestedStreams, correlationID)
 	m.activeStreams[correlationID] = newStreamEntry(start, canonicalAgentID, logicalPipelineID)
+	attrs := []any{
+		"correlation_id", correlationID,
+		"registration", "new_primary",
+		"canonical_agent_id", canonicalAgentID,
+		"runtime_agent_id", normalizeRuntimeAgentID(canonicalAgentID, firstNonEmpty(start.RuntimeAgentID, start.AgentID)),
+		"agent_type", strings.TrimSpace(start.AgentType),
+		"active_streams", len(m.activeStreams),
+		"deferred_streams", len(m.deferredStreams),
+		"nested_streams", len(m.nestedStreams),
+	}
+	attrs = appendBranchRefLogAttrs(attrs, "branch_ref", start.BranchRef)
+	uiDebugFileLog().Info("AppModel: REGISTER_PRIMARY_STREAM", attrs...)
 	return true
 }
 
@@ -785,6 +798,25 @@ func (m *AppModel) replaceActivePipelineWorkerStream(correlationID, canonicalAge
 		}
 		m.markReroutedStreamCID(existingCID)
 		delete(m.activeStreams, existingCID)
+		uiDebugFileLog().Info("AppModel: REPLACE_ACTIVE_PIPELINE_WORKER_STREAM",
+			"correlation_id", correlationID,
+			"replaced_correlation_id", existingCID,
+			"canonical_agent_id", canonicalAgentID,
+			"source_registry", "active")
+	}
+	for existingCID, entry := range m.deferredStreams {
+		if existingCID == correlationID || entry == nil {
+			continue
+		}
+		if strings.TrimSpace(entry.AgentID) != canonicalAgentID {
+			continue
+		}
+		delete(m.deferredStreams, existingCID)
+		uiDebugFileLog().Info("AppModel: REPLACE_ACTIVE_PIPELINE_WORKER_STREAM",
+			"correlation_id", correlationID,
+			"replaced_correlation_id", existingCID,
+			"canonical_agent_id", canonicalAgentID,
+			"source_registry", "deferred")
 	}
 }
 
@@ -864,6 +896,20 @@ func (m *AppModel) hasRecordedStreamCorrelation(correlationID string) bool {
 	return ok
 }
 
+func (m *AppModel) shouldBootstrapStreamFromTelemetry(correlationID string, explicitTopLevelTransfer bool) bool {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return false
+	}
+	if m.streamEntryForCorrelation(correlationID) != nil {
+		return false
+	}
+	if explicitTopLevelTransfer {
+		return true
+	}
+	return !m.hasRecordedStreamCorrelation(correlationID)
+}
+
 func (m *AppModel) markReroutedStreamCID(correlationID string) {
 	correlationID = strings.TrimSpace(correlationID)
 	if correlationID == "" {
@@ -899,7 +945,37 @@ func (m *AppModel) pruneReroutedStreamCIDs(now time.Time) {
 func (m *AppModel) unregisterStream(correlationID string) {
 	correlationID = strings.TrimSpace(correlationID)
 	delete(m.activeStreams, correlationID)
+	delete(m.deferredStreams, correlationID)
 	delete(m.nestedStreams, correlationID)
+	delete(m.delayedPrimaryBootstrap, correlationID)
+}
+
+func (m *AppModel) deferPrimaryStream(correlationID string) {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	entry, ok := m.activeStreams[correlationID]
+	if !ok || entry == nil {
+		return
+	}
+	if m.deferredStreams == nil {
+		m.deferredStreams = make(map[string]*activeStreamEntry)
+	}
+	delete(m.activeStreams, correlationID)
+	m.deferredStreams[correlationID] = entry
+	attrs := []any{
+		"correlation_id", correlationID,
+		"agent_id", entry.AgentID,
+		"runtime_agent_id", entry.RuntimeAgentID,
+		"agent_type", entry.AgentType,
+		"task_id", entry.TaskID,
+		"active_streams", len(m.activeStreams),
+		"deferred_streams", len(m.deferredStreams),
+		"nested_streams", len(m.nestedStreams),
+	}
+	attrs = appendBranchRefLogAttrs(attrs, "branch_ref", entry.BranchRef)
+	uiDebugFileLog().Info("AppModel: DEFER_PRIMARY_STREAM", attrs...)
 }
 
 // activeStreamForAgent returns the active stream entry for the given agent,
@@ -910,6 +986,9 @@ func (m *AppModel) activeStreamForAgent(agentID string) *activeStreamEntry {
 
 func (m *AppModel) visibleStreamForAgent(agentID string) *activeStreamEntry {
 	if entry := streamEntryForAgentMap(m.activeStreams, agentID, m.resolveConcreteTargetAgent(agentID)); entry != nil {
+		return entry
+	}
+	if entry := streamEntryForAgentMap(m.deferredStreams, agentID, m.resolveConcreteTargetAgent(agentID)); entry != nil {
 		return entry
 	}
 	return streamEntryForAgentMap(m.nestedStreams, agentID, m.resolveConcreteTargetAgent(agentID))
@@ -937,6 +1016,9 @@ func (m *AppModel) streamEntryForCorrelation(correlationID string) *activeStream
 	if entry, ok := m.activeStreams[correlationID]; ok && entry != nil {
 		return entry
 	}
+	if entry, ok := m.deferredStreams[correlationID]; ok && entry != nil {
+		return entry
+	}
 	if entry, ok := m.nestedStreams[correlationID]; ok && entry != nil {
 		return entry
 	}
@@ -944,12 +1026,91 @@ func (m *AppModel) streamEntryForCorrelation(correlationID string) *activeStream
 }
 
 func (m *AppModel) visibleStreamCount() int {
-	return len(m.activeStreams) + len(m.nestedStreams)
+	return len(m.activeStreams) + len(m.deferredStreams) + len(m.nestedStreams)
+}
+
+func (m *AppModel) shouldDelayAmbiguousPrimaryBootstrap(start msg.StreamStartMsg) bool {
+	if m == nil || start.BranchRef != nil {
+		return false
+	}
+	if strings.TrimSpace(start.CorrelationID) == "" {
+		return false
+	}
+	if strings.TrimSpace(start.ParentCorrelationID) != "" ||
+		strings.TrimSpace(start.TaskID) != "" ||
+		strings.TrimSpace(start.PipelineID) != "" {
+		return false
+	}
+	canonicalAgentID := canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
+	if strings.Contains(strings.TrimSpace(canonicalAgentID), ":") {
+		return false
+	}
+	bootstrapIdentity := normalizeAgentID(firstNonEmpty(strings.TrimSpace(start.AgentType), strings.TrimSpace(start.AgentID)))
+	if bootstrapIdentity == "" || len(m.deferredStreams) == 0 {
+		return false
+	}
+	for _, entry := range m.deferredStreams {
+		if entry == nil || entry.BranchRef != nil {
+			continue
+		}
+		entryIdentity := normalizeAgentID(firstNonEmpty(strings.TrimSpace(entry.AgentType), strings.TrimSpace(entry.AgentID)))
+		if entryIdentity != bootstrapIdentity {
+			continue
+		}
+		if strings.TrimSpace(entry.TaskID) != "" ||
+			strings.TrimSpace(entry.PipelineID) != "" ||
+			strings.Contains(strings.TrimSpace(entry.AgentID), ":") {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *AppModel) enqueueDelayedPrimaryBootstrap(correlationID string, event tea.Msg) {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" || event == nil {
+		return
+	}
+	if m.delayedPrimaryBootstrap == nil {
+		m.delayedPrimaryBootstrap = make(map[string][]tea.Msg)
+	}
+	m.delayedPrimaryBootstrap[correlationID] = append(m.delayedPrimaryBootstrap[correlationID], event)
+}
+
+func (m *AppModel) flushDelayedPrimaryBootstrap(correlationID string) tea.Cmd {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" || len(m.delayedPrimaryBootstrap) == 0 {
+		return nil
+	}
+	events := m.delayedPrimaryBootstrap[correlationID]
+	if len(events) == 0 {
+		delete(m.delayedPrimaryBootstrap, correlationID)
+		return nil
+	}
+	delete(m.delayedPrimaryBootstrap, correlationID)
+	cmds := make([]tea.Cmd, 0, len(events))
+	for _, pending := range events {
+		switch typed := pending.(type) {
+		case msg.StreamProgressMsg:
+			cmds = appendCmd(cmds, m.handleStreamProgressTelemetry(typed))
+		case msg.ToolCallEventMsg:
+			cmds = appendCmd(cmds, m.handleToolCallTelemetry(typed))
+		}
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m *AppModel) allVisibleStreamEntries() []activeStreamEntry {
 	targets := make([]activeStreamEntry, 0, m.visibleStreamCount())
 	for _, entry := range m.activeStreams {
+		if entry != nil {
+			targets = append(targets, *entry)
+		}
+	}
+	for _, entry := range m.deferredStreams {
 		if entry != nil {
 			targets = append(targets, *entry)
 		}
@@ -1178,10 +1339,11 @@ func (m *AppModel) applyStreamTransfer(reroute msg.StreamRerouteMsg, bootstrapNe
 func (m *AppModel) observeTopLevelStreamTransfer(
 	sessionID, parentCorrelationID, correlationID, toAgentID string,
 	branchRef *msg.InterAgentBranchRefMsg,
+	topLevelTransfer bool,
 ) tea.Cmd {
 	parentCorrelationID = strings.TrimSpace(parentCorrelationID)
 	correlationID = strings.TrimSpace(correlationID)
-	if !isExplicitTopLevelTransfer(parentCorrelationID, branchRef) || correlationID == "" || parentCorrelationID == correlationID {
+	if !isExplicitTopLevelTransfer(parentCorrelationID, branchRef, topLevelTransfer) || correlationID == "" || parentCorrelationID == correlationID {
 		return nil
 	}
 	fromAgentID := ""
@@ -1307,6 +1469,9 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	changed = m.advanceGitPanelDecor(changed)
 	changed = m.advanceSidebarDecor(tick.Time, changed)
 	changed = m.advanceFocusDecor(tick.Time, changed)
+	if m.viewMode == ViewMemory && m.refreshMemoryView(false) {
+		changed = true
+	}
 
 	if changed {
 		m.viewDirty = true

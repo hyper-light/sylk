@@ -18,7 +18,7 @@ func orchestratorMutatingSkillNames() []string {
 		"cancel_dag",
 		"modify_dag",
 		"ingest_plan",
-		"validate_global_review",
+		"validate_work",
 	})
 }
 
@@ -33,7 +33,7 @@ func orchestratorVisibleSkillNames() []string {
 		"push_status",
 		"ingest_plan",
 		"execute_dag",
-		"validate_global_review",
+		"validate_work",
 		"escalate_to_architect",
 		"read_workspace_file",
 		"workspace_glob",

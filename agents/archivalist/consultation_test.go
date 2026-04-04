@@ -14,12 +14,10 @@ func TestArchivalistRequestConsultationWithMetadataPropagatesResearchDepth(t *te
 	defer bus.Close()
 
 	a := &Archivalist{
-		id:      "archivalist-test",
-		bus:     bus,
-		running: true,
-		knownAgents: map[string]*guide.AgentAnnouncement{
-			"academic": &guide.AgentAnnouncement{AgentID: "academic", AgentType: "academic"},
-		},
+		id:          "archivalist-test",
+		bus:         bus,
+		running:     true,
+		knownAgents: map[string]*guide.AgentAnnouncement{},
 	}
 
 	requests := make(chan *guide.RouteRequest, 1)
@@ -62,5 +60,49 @@ func TestArchivalistRequestConsultationWithMetadataPropagatesResearchDepth(t *te
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for routed request")
+	}
+}
+
+func TestArchivalistRequestConsultationWithMetadataDoesNotRequireKnownAgent(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	a := &Archivalist{
+		id:          "archivalist-test",
+		bus:         bus,
+		running:     true,
+		knownAgents: map[string]*guide.AgentAnnouncement{},
+	}
+
+	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		return bus.Publish(archivalistResponseTopic(a), guide.NewResponseMessage("resp", &guide.RouteResponse{
+			CorrelationID:     req.CorrelationID,
+			Success:           true,
+			RespondingAgentID: "academic",
+			Data:              map[string]any{"ok": true},
+		}))
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	evidence, err := a.requestConsultationWithMetadata(
+		context.Background(),
+		"academic",
+		"check this policy",
+		"",
+		"sess-1",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("requestConsultationWithMetadata: %v", err)
+	}
+	if !evidence.Success {
+		t.Fatalf("expected successful consultation evidence, got %+v", evidence)
 	}
 }

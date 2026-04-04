@@ -514,18 +514,21 @@ func (sm *SteeringManager) handlePace(req *guide.ActionRequest) bool {
 	paceStr, _ := data["pace"].(string)
 	switch strings.ToLower(paceStr) {
 	case "auto":
+		ledger.SetPace(steering.PaceAuto)
 		ledger.DepositCommand(steering.Command{
 			Type:      steering.CommandResume,
 			Timestamp: time.Now(),
 		})
 	case "step":
-		ledger.DepositCommand(steering.Command{
+		ledger.SetPace(steering.PaceStep)
+		ledger.DepositCommandWithoutResume(steering.Command{
 			Type:      steering.CommandPace,
 			Pace:      steering.PaceStep,
 			Timestamp: time.Now(),
 		})
 	case "paused":
-		ledger.DepositCommand(steering.Command{
+		ledger.SetPace(steering.PacePaused)
+		ledger.DepositCommandWithoutResume(steering.Command{
 			Type:      steering.CommandPace,
 			Pace:      steering.PacePaused,
 			Timestamp: time.Now(),

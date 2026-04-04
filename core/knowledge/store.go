@@ -53,6 +53,28 @@ type BackgroundIndexWaiter interface {
 // background indexer. Set via SetProgressObserver; called from producer goroutines.
 type ProgressObserver func(phase string, current, total int64)
 
+// LifecycleEventKind identifies a knowledge lifecycle transition emitted to observers.
+type LifecycleEventKind int
+
+const (
+	// LifecycleEventPartial is emitted whenever PromotePartial updates the active
+	// searcher/waiter pair, even if the store was already partially or fully ready.
+	LifecycleEventPartial LifecycleEventKind = iota + 1
+	// LifecycleEventFull is emitted whenever the store reaches full readiness.
+	LifecycleEventFull
+)
+
+// LifecycleEvent reports a partial/full promotion together with the active
+// background waiter for that promotion cycle.
+type LifecycleEvent struct {
+	Kind   LifecycleEventKind
+	Level  ReadinessLevel
+	Waiter BackgroundIndexWaiter
+}
+
+// LifecycleObserver receives repeatable promotion-cycle updates.
+type LifecycleObserver func(event LifecycleEvent)
+
 // KnowledgeStore owns the single HybridQueryCoordinator and the underlying
 // storage resources. Agents receive the coordinator at construction time;
 // backends are atomically set as they come online.
@@ -65,10 +87,11 @@ type KnowledgeStore struct {
 	partialOnce  sync.Once
 	fullOnce     sync.Once
 
-	mu         sync.Mutex // guards resource ownership for cleanup
-	bgWaiter   BackgroundIndexWaiter
-	closeable  io.Closer        // bleve store closer, set by caller
-	progressFn ProgressObserver // UI callback, guarded by mu
+	mu          sync.Mutex // guards resource ownership for cleanup
+	bgWaiter    BackgroundIndexWaiter
+	closeable   io.Closer        // bleve store closer, set by caller
+	progressFn  ProgressObserver // UI callback, guarded by mu
+	lifecycleFn LifecycleObserver
 
 	publisher  ReadinessPublisher
 	logger     *slog.Logger
@@ -141,6 +164,27 @@ func (ks *KnowledgeStore) SetProgressObserver(fn ProgressObserver) {
 	ks.mu.Unlock()
 }
 
+// SetLifecycleObserver registers a callback for repeatable partial/full
+// promotion events. The observer receives an immediate snapshot of the current
+// active waiter or full readiness when available.
+func (ks *KnowledgeStore) SetLifecycleObserver(fn LifecycleObserver) {
+	ks.mu.Lock()
+	ks.lifecycleFn = fn
+	level := ReadinessLevel(ks.level.Load())
+	bgWaiter := ks.bgWaiter
+	ks.mu.Unlock()
+
+	if fn == nil {
+		return
+	}
+	switch {
+	case bgWaiter != nil || level == ReadinessPartial:
+		fn(LifecycleEvent{Kind: LifecycleEventPartial, Level: level, Waiter: bgWaiter})
+	case level >= ReadinessFull:
+		fn(LifecycleEvent{Kind: LifecycleEventFull, Level: level})
+	}
+}
+
 // NotifyProgress forwards a progress event to the registered observer.
 // No-op if no observer is set. Safe as a PipelineConfig.OnProgress callback.
 func (ks *KnowledgeStore) NotifyProgress(phase string, current, total int64) {
@@ -161,9 +205,22 @@ func (ks *KnowledgeStore) PromotePartial(searcher *query.BleveSearcher, bgWaiter
 	if closer != nil {
 		ks.closeable = closer
 	}
+	lifecycleFn := ks.lifecycleFn
 	ks.mu.Unlock()
 
 	ks.coordinator.SetBleveSearcher(searcher)
+
+	if lifecycleFn != nil {
+		level := ks.Level()
+		if level < ReadinessPartial {
+			level = ReadinessPartial
+		}
+		lifecycleFn(LifecycleEvent{
+			Kind:   LifecycleEventPartial,
+			Level:  level,
+			Waiter: bgWaiter,
+		})
+	}
 
 	if ks.Level() >= ReadinessPartial {
 		return
@@ -181,6 +238,18 @@ func (ks *KnowledgeStore) PromotePartial(searcher *query.BleveSearcher, bgWaiter
 
 // PromoteFull transitions to ReadinessFull (all docs indexed).
 func (ks *KnowledgeStore) PromoteFull() {
+	ks.mu.Lock()
+	ks.bgWaiter = nil
+	lifecycleFn := ks.lifecycleFn
+	ks.mu.Unlock()
+
+	if lifecycleFn != nil {
+		lifecycleFn(LifecycleEvent{
+			Kind:  LifecycleEventFull,
+			Level: ReadinessFull,
+		})
+	}
+
 	if ks.Level() >= ReadinessFull {
 		return
 	}

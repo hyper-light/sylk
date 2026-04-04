@@ -69,10 +69,11 @@ type ActiveDAGMeta struct {
 
 	// SubNodeMap maps expanded sub-node IDs to their original parent
 	// node IDs. Populated during pipeline expansion.
-	SubNodeMap           map[string]string // subNodeID → parentNodeID
-	SubNodeTasks         map[string]taskPipelineRef
-	TaskLabels           map[string]string
-	ResetPendingTaskPods map[string]struct{}
+	SubNodeMap             map[string]string // subNodeID → parentNodeID
+	SubNodeTasks           map[string]taskPipelineRef
+	TaskLabels             map[string]string
+	ResetPendingTaskPods   map[string]struct{}
+	ReleasePendingTaskPods map[string]struct{}
 }
 
 // DAGBridge wires the dag.Scheduler into the orchestrator's bus/WAL/store/buffers.
@@ -97,12 +98,13 @@ type DAGBridge struct {
 	agentID            string
 	logger             *slog.Logger
 
-	activityPub   events.ActivityPublisher
-	eventLogger   *agentlog.SessionEventLogger
-	orchestrator  *Orchestrator
-	activeDAGs    map[string]*ActiveDAGMeta
-	gates         map[string]*dag.DecisionGate // per-DAG decision gates
-	scribeFactory shared.ScribeFactory         // optional Scribe factory for pipeline pods
+	activityPub        events.ActivityPublisher
+	eventLogger        *agentlog.SessionEventLogger
+	orchestrator       *Orchestrator
+	activeDAGs         map[string]*ActiveDAGMeta
+	gates              map[string]*dag.DecisionGate // per-DAG decision gates
+	scribeFactory      shared.ScribeFactory         // optional Scribe factory for pipeline pods
+	taskPodMonitorOnce sync.Once
 }
 
 // NewDAGBridge creates a bridge between the DAG scheduler and orchestrator subsystems.
@@ -136,6 +138,7 @@ func NewDAGBridge(cfg DAGBridgeConfig, deps DAGBridgeDeps) *DAGBridge {
 	}
 
 	b.scheduler.SetDefaultLayerGate(b.compositeGate())
+	b.startTaskPodMonitor()
 	return b
 }
 
@@ -329,6 +332,10 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		return taskPods[taskID]
 	})
 	dagID := d.ID()
+	dispatcher.SetGuardReleasedCallback(func(string) {
+		b.releasePendingCompletedTaskPods(dagID)
+		b.maintainTaskPods(context.Background())
+	})
 
 	// 3c. Create decision gate for this DAG
 	gate := dag.NewDecisionGate(d, b.onNonBlockingFailure, b.onBlockingDecisionRequired)
@@ -362,12 +369,13 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 			}
 			return buildTaskAgentPod(def, sessionID, runtime, specReg, registrar, logger, scribeFactory, svfs, b.eventLogger, b.activityPub, b.agentID)
 		},
-		CancelFunc:           dagCancel,
-		StartedAt:            time.Now(),
-		SubNodeMap:           subNodeMap,
-		SubNodeTasks:         make(map[string]taskPipelineRef, len(subNodeMap)),
-		TaskLabels:           make(map[string]string, len(taskPods)),
-		ResetPendingTaskPods: make(map[string]struct{}),
+		CancelFunc:             dagCancel,
+		StartedAt:              time.Now(),
+		SubNodeMap:             subNodeMap,
+		SubNodeTasks:           make(map[string]taskPipelineRef, len(subNodeMap)),
+		TaskLabels:             make(map[string]string, len(taskPods)),
+		ResetPendingTaskPods:   make(map[string]struct{}),
+		ReleasePendingTaskPods: make(map[string]struct{}),
 	}
 	b.mu.Unlock()
 
@@ -1282,6 +1290,81 @@ func (b *DAGBridge) ResetPendingTaskPods(dagID string) {
 	}
 }
 
+func (b *DAGBridge) ReleaseCompletedTaskResources(dagID, taskID string) {
+	dagID = strings.TrimSpace(dagID)
+	taskID = strings.TrimSpace(taskID)
+	if dagID == "" || taskID == "" {
+		return
+	}
+	if b.releaseCompletedTaskResourcesNow(dagID, taskID) {
+		return
+	}
+	b.releasePendingCompletedTaskPods(dagID)
+}
+
+func (b *DAGBridge) releaseCompletedTaskResourcesNow(dagID, taskID string) bool {
+	var (
+		taskPod *shared.AgentPod
+		buffers *BufferRegistry
+	)
+
+	b.mu.Lock()
+	meta := b.activeDAGs[dagID]
+	if meta == nil {
+		b.mu.Unlock()
+		return false
+	}
+	if meta.ReleasePendingTaskPods == nil {
+		meta.ReleasePendingTaskPods = make(map[string]struct{})
+	}
+	taskPod = meta.TaskPods[taskID]
+	if taskPod == nil {
+		delete(meta.ReleasePendingTaskPods, taskID)
+		b.mu.Unlock()
+		return false
+	}
+	if taskPod.HasActiveRequests() {
+		meta.ReleasePendingTaskPods[taskID] = struct{}{}
+		b.mu.Unlock()
+		return false
+	}
+	delete(meta.TaskPods, taskID)
+	delete(meta.TaskLabels, taskID)
+	delete(meta.ResetPendingTaskPods, taskID)
+	delete(meta.ReleasePendingTaskPods, taskID)
+	buffers = b.buffers
+	b.mu.Unlock()
+
+	if buffers != nil {
+		buffers.ReleaseTask(taskID)
+	}
+	taskPod.Release()
+	b.logTrace("task_pod_released_after_ot_ack", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id":  dagID,
+		"task_id": taskID,
+	})
+	return true
+}
+
+func (b *DAGBridge) releasePendingCompletedTaskPods(dagID string) {
+	b.mu.RLock()
+	meta := b.activeDAGs[dagID]
+	if meta == nil {
+		b.mu.RUnlock()
+		return
+	}
+	taskIDs := make([]string, 0, len(meta.ReleasePendingTaskPods))
+	for taskID := range meta.ReleasePendingTaskPods {
+		taskIDs = append(taskIDs, taskID)
+	}
+	b.mu.RUnlock()
+
+	slices.Sort(taskIDs)
+	for _, taskID := range taskIDs {
+		_ = b.releaseCompletedTaskResourcesNow(dagID, taskID)
+	}
+}
+
 func (b *DAGBridge) resetTaskPod(dagID, taskID string) error {
 	b.mu.RLock()
 	meta := b.activeDAGs[dagID]
@@ -1375,6 +1458,194 @@ func (b *DAGBridge) cleanupDAG(dagID string) {
 	}
 	if meta.Unsub != nil {
 		meta.Unsub()
+	}
+}
+
+func (b *DAGBridge) startTaskPodMonitor() {
+	if b.scope == nil {
+		return
+	}
+	b.taskPodMonitorOnce.Do(func() {
+		_ = b.scope.Go("dagbridge-task-pod-monitor", 0, func(ctx context.Context) error {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-ticker.C:
+					b.maintainTaskPods(ctx)
+				}
+			}
+		})
+	})
+}
+
+func (b *DAGBridge) maintainTaskPods(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b.releasePendingCompletedTaskPodsForAll()
+	pods := b.snapshotTaskPods()
+	if len(pods) == 0 {
+		return
+	}
+
+	for _, taskPod := range pods {
+		b.demoteIdleTaskPod(ctx, taskPod)
+	}
+
+	usage := b.currentQuotaUsage()
+	if usage.ContainerCount <= 0 {
+		return
+	}
+	target := usage.ContainerSoftCapacity
+	if target <= 0 {
+		target = usage.ContainerLimit
+	}
+	if target <= 0 || usage.ContainerCount <= target {
+		return
+	}
+
+	candidates := b.pressureDemotionCandidates(pods)
+	for _, taskPod := range candidates {
+		if usage.ContainerCount <= target {
+			break
+		}
+		if err := taskPod.Demote(ctx, containerpod.TierCool); err != nil {
+			b.logTrace("task_pod_pressure_demote_failed", agentlog.EventError, map[string]any{
+				"pod_id": taskPod.Policy().PodID,
+				"error":  err.Error(),
+			})
+			continue
+		}
+		usage = b.currentQuotaUsage()
+	}
+}
+
+func (b *DAGBridge) releasePendingCompletedTaskPodsForAll() {
+	b.mu.RLock()
+	dagIDs := make([]string, 0, len(b.activeDAGs))
+	for dagID := range b.activeDAGs {
+		dagIDs = append(dagIDs, dagID)
+	}
+	b.mu.RUnlock()
+
+	slices.Sort(dagIDs)
+	for _, dagID := range dagIDs {
+		b.releasePendingCompletedTaskPods(dagID)
+	}
+}
+
+func (b *DAGBridge) snapshotTaskPods() []*shared.AgentPod {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	pods := make([]*shared.AgentPod, 0)
+	for _, meta := range b.activeDAGs {
+		if meta == nil {
+			continue
+		}
+		for _, taskPod := range meta.TaskPods {
+			if taskPod == nil {
+				continue
+			}
+			pods = append(pods, taskPod)
+		}
+	}
+	return pods
+}
+
+func (b *DAGBridge) currentQuotaUsage() container.ResourceQuotaUsage {
+	b.mu.RLock()
+	quota := b.quota
+	b.mu.RUnlock()
+	if quota == nil {
+		return container.ResourceQuotaUsage{}
+	}
+	return quota.Usage()
+}
+
+func (b *DAGBridge) demoteIdleTaskPod(ctx context.Context, taskPod *shared.AgentPod) {
+	if taskPod == nil || taskPod.HasActiveRequests() || taskPod.IsReleased() {
+		return
+	}
+	policy := taskPod.Policy()
+	if policy == nil {
+		return
+	}
+	current := taskPod.LoadTier()
+	target := current
+	idle := taskPod.IdleDuration()
+
+	switch {
+	case policy.IdleToCold > 0 && idle >= policy.IdleToCold:
+		target = containerpod.TierCold
+	case policy.IdleToCool > 0 && idle >= policy.IdleToCool:
+		target = containerpod.TierCool
+	case policy.IdleToWarm > 0 && idle >= policy.IdleToWarm:
+		target = containerpod.TierWarm
+	}
+
+	if target >= current {
+		return
+	}
+	if err := taskPod.Demote(ctx, target); err != nil {
+		b.logTrace("task_pod_idle_demote_failed", agentlog.EventError, map[string]any{
+			"pod_id": taskPod.Policy().PodID,
+			"error":  err.Error(),
+		})
+	}
+}
+
+func (b *DAGBridge) pressureDemotionCandidates(pods []*shared.AgentPod) []*shared.AgentPod {
+	candidates := make([]*shared.AgentPod, 0, len(pods))
+	for _, taskPod := range pods {
+		if taskPod == nil || taskPod.HasActiveRequests() || taskPod.IsReleased() {
+			continue
+		}
+		switch taskPod.LoadTier() {
+		case containerpod.TierHot, containerpod.TierWarm:
+			candidates = append(candidates, taskPod)
+		}
+	}
+	slices.SortFunc(candidates, func(left, right *shared.AgentPod) int {
+		if left == nil && right == nil {
+			return 0
+		}
+		if left == nil {
+			return 1
+		}
+		if right == nil {
+			return -1
+		}
+		if idleCmp := cmpDuration(right.IdleDuration(), left.IdleDuration()); idleCmp != 0 {
+			return idleCmp
+		}
+		return cmpTier(right.LoadTier(), left.LoadTier())
+	})
+	return candidates
+}
+
+func cmpDuration(left, right time.Duration) int {
+	switch {
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func cmpTier(left, right containerpod.ActivationTier) int {
+	switch {
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
 	}
 }
 

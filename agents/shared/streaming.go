@@ -17,6 +17,7 @@ const streamedTextMetadataKey = "shared_streamed_text"
 
 const (
 	streamMetadataNestedBranch      = "chat_nested_branch"
+	streamMetadataTopLevelTransfer  = "chat_top_level_transfer"
 	streamMetadataParentCorrelation = "chat_parent_correlation_id"
 	streamMetadataParentToolCallKey = "chat_parent_tool_call_key"
 	streamMetadataInterAgentThread  = "chat_inter_agent_thread_key"
@@ -91,6 +92,11 @@ func WithForwardedStreamContext(
 			merged = make(map[string]any, 1)
 		}
 		merged[streamMetadataParentCorrelation] = parentCorrelationID
+		if hasNestedInterAgentBranchMetadata(merged) {
+			delete(merged, streamMetadataTopLevelTransfer)
+		} else {
+			merged[streamMetadataTopLevelTransfer] = true
+		}
 	}
 	return WithStreamContextMetadata(ctx, merged)
 }
@@ -330,6 +336,7 @@ func MergeStreamMetadata(base, extra map[string]any) map[string]any {
 // RouteMetadataWithInterAgentBranch stamps nested-branch metadata onto a
 // child route request when it originates from an active consult/challenge tool.
 func RouteMetadataWithInterAgentBranch(ctx context.Context, metadata map[string]any) map[string]any {
+	metadata = RouteMetadataWithTaskScope(ctx, metadata)
 	stream, ok := StreamMetadataFromContext(ctx)
 	if !ok || strings.TrimSpace(stream.CorrelationID) == "" {
 		return metadata
@@ -353,6 +360,7 @@ func RouteMetadataWithExplicitInterAgentBranch(
 	metadata map[string]any,
 	branch InterAgentBranchMetadata,
 ) map[string]any {
+	metadata = RouteMetadataWithTaskScope(ctx, metadata)
 	stream, ok := StreamMetadataFromContext(ctx)
 	if ok && strings.TrimSpace(stream.CorrelationID) != "" && strings.TrimSpace(branch.ParentCorrelationID) == "" {
 		branch.ParentCorrelationID = strings.TrimSpace(stream.CorrelationID)
@@ -380,6 +388,7 @@ func applyInterAgentBranchMetadata(metadata map[string]any, branch InterAgentBra
 	if cloned == nil {
 		cloned = make(map[string]any, 4)
 	}
+	delete(cloned, streamMetadataTopLevelTransfer)
 	cloned[streamMetadataNestedBranch] = true
 	cloned[streamMetadataParentCorrelation] = branch.ParentCorrelationID
 	if branch.ParentToolCallKey != "" {
@@ -392,6 +401,23 @@ func applyInterAgentBranchMetadata(metadata map[string]any, branch InterAgentBra
 		cloned[streamMetadataInterAgentKind] = branch.Kind
 	}
 	return cloned
+}
+
+func hasNestedInterAgentBranchMetadata(metadata map[string]any) bool {
+	if len(metadata) == 0 {
+		return false
+	}
+	if nested, _ := metadata[streamMetadataNestedBranch].(bool); nested {
+		if parent, _ := metadata[streamMetadataParentCorrelation].(string); strings.TrimSpace(parent) != "" {
+			return true
+		}
+	}
+	if nested, _ := metadata[streamMetadataNestedBranch].(string); strings.EqualFold(strings.TrimSpace(nested), "true") {
+		if parent, _ := metadata[streamMetadataParentCorrelation].(string); strings.TrimSpace(parent) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // PublishStreamStart emits a stream start event.
@@ -413,6 +439,16 @@ func PublishStreamChunk(bus guide.EventBus, channels *guide.AgentChannels, ctx c
 
 // PublishStreamProgress emits a progress update tied to the current stream.
 func PublishStreamProgress(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID, message string) {
+	publishStreamProgress(bus, channels, ctx, agentID, message, false)
+}
+
+func publishStreamProgress(
+	bus guide.EventBus,
+	channels *guide.AgentChannels,
+	ctx context.Context,
+	agentID, message string,
+	toolDerived bool,
+) {
 	message = strings.TrimSpace(message)
 	if message == "" {
 		return
@@ -420,7 +456,8 @@ func PublishStreamProgress(bus guide.EventBus, channels *guide.AgentChannels, ct
 	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
 		Type: guide.StreamEventProgress,
 		Data: &guide.ProgressData{
-			Message: message,
+			Message:     message,
+			ToolDerived: toolDerived,
 		},
 		Timestamp: time.Now(),
 	})
@@ -717,7 +754,7 @@ func PublishIntermediateToolTurn(
 		return
 	}
 	if text := IntermediateToolTurnTextWithContext(ctx, resp); text != "" {
-		PublishStreamProgress(bus, channels, ctx, agentID, text)
+		publishStreamProgress(bus, channels, ctx, agentID, text, true)
 	}
 }
 

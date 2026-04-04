@@ -2221,6 +2221,7 @@ func (o *Orchestrator) handlePipelineUpdate(msg *guide.Message) error {
 		o.finalizePipelineUpdate(update)
 		result := convertPipelineToNodeResult(update)
 		o.dagBridge.NotifyNodeComplete(update.NodeID, result)
+		o.releaseAcceptedPipelineResources(update)
 	}
 
 	o.pushEvent(&busEvent{
@@ -2231,6 +2232,19 @@ func (o *Orchestrator) handlePipelineUpdate(msg *guide.Message) error {
 	})
 
 	return nil
+}
+
+func (o *Orchestrator) releaseAcceptedPipelineResources(update *PipelineUpdate) {
+	if o == nil || o.dagBridge == nil || update == nil {
+		return
+	}
+	if strings.TrimSpace(update.Status) != "succeeded" {
+		return
+	}
+	if strings.TrimSpace(update.AgentType) != shared.PipelineAgentInspector {
+		return
+	}
+	o.dagBridge.ReleaseCompletedTaskResources(update.DAGID, update.TaskID)
 }
 
 func (o *Orchestrator) handlePipelineState(msg *guide.Message) error {

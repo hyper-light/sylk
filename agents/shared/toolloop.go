@@ -372,6 +372,24 @@ func toolErrorDetail(err error) toolErrorDetailPayload {
 	}
 	message := strings.ToLower(strings.TrimSpace(err.Error()))
 	switch {
+	case errors.Is(err, ErrRouteTestExecutionToTester):
+		return toolErrorDetailPayload{
+			Kind: "route_test_execution_to_tester",
+			Recovery: []string{
+				"Do not retry the same inspector test-execution call",
+				"Route the execution-backed test work to Tester with challenge_agent or handoff_next",
+				"Have Tester return the requested evidence with validate_work for a challenge or handoff_next for a normal top-level testing turn",
+			},
+		}
+	case errors.Is(err, ErrRouteTestToolingToTester):
+		return toolErrorDetailPayload{
+			Kind: "route_test_tooling_to_tester",
+			Recovery: []string{
+				"Do not retry the same inspector dependency-install call",
+				"Route the blocked test-tooling work to Tester with challenge_agent or handoff_next",
+				"Have Tester use research_test_tool_install first and install_test_tooling only after it has a concrete plan",
+			},
+		}
 	case strings.Contains(message, "only accepts one plain command"),
 		strings.Contains(message, "shell control operators are not allowed in run_command"):
 		return toolErrorDetailPayload{
@@ -433,35 +451,41 @@ func ToolRecoveryHint(toolName string, err error) string {
 	return prefix + ": " + strings.Join(detail.Recovery, "; ") + ". Do not repeat the same invalid invocation."
 }
 
-func AppendToolRecoveryMessage(req *providers.Request, hints []string) {
-	if req == nil || len(hints) == 0 {
+// SkippedToolResultPayload returns a synthetic tool_result payload for tool
+// calls that were not executed because an earlier tool in the same assistant
+// batch already ended or redirected the turn.
+func SkippedToolResultPayload(reason string) string {
+	payload := map[string]any{
+		"error":      "tool call skipped",
+		"error_kind": "tool_call_skipped",
+		"skipped":    true,
+	}
+	if trimmed := strings.TrimSpace(reason); trimmed != "" {
+		payload["reason"] = trimmed
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return `{"error":"tool call skipped","error_kind":"tool_call_skipped","skipped":true}`
+	}
+	return string(payloadJSON)
+}
+
+// AppendSkippedToolResults appends synthetic error tool results for any tool
+// calls left unexecuted in the current assistant batch. This preserves the
+// provider contract for APIs that require a tool_result for every prior
+// tool_use block before the next model turn.
+func AppendSkippedToolResults(req *providers.Request, calls []providers.ToolCall, reason string) {
+	if req == nil || len(calls) == 0 {
 		return
 	}
-	seen := make(map[string]struct{}, len(hints))
-	unique := make([]string, 0, len(hints))
-	for _, hint := range hints {
-		hint = strings.TrimSpace(hint)
-		if hint == "" {
-			continue
-		}
-		if _, ok := seen[hint]; ok {
-			continue
-		}
-		seen[hint] = struct{}{}
-		unique = append(unique, hint)
+	payload := SkippedToolResultPayload(reason)
+	for _, call := range calls {
+		req.Messages = append(req.Messages, providers.Message{
+			Role:       providers.RoleTool,
+			ToolCallID: call.ID,
+			ToolName:   call.Name,
+			Content:    payload,
+			IsError:    true,
+		})
 	}
-	if len(unique) == 0 {
-		return
-	}
-	var builder strings.Builder
-	builder.WriteString("Tool recovery guidance:\n")
-	for _, hint := range unique {
-		builder.WriteString("- ")
-		builder.WriteString(hint)
-		builder.WriteString("\n")
-	}
-	req.Messages = append(req.Messages, providers.Message{
-		Role:    providers.RoleUser,
-		Content: strings.TrimSpace(builder.String()),
-	})
 }

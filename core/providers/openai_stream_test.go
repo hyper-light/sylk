@@ -284,6 +284,140 @@ func TestOpenAIProviderGenerate_ChatGPTBadRequestIncludesErrorBody(t *testing.T)
 	}
 }
 
+func TestOpenAIProviderGenerate_RetriesTransientStreamFailure(t *testing.T) {
+	if !canListenLocalTCP() {
+		t.Skip("local TCP listeners are not permitted in this environment")
+	}
+
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		attempt := atomic.AddInt32(&requestCount, 1)
+		if attempt == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if _, err := fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial \",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"sequence_number\":1}\n\n"); err != nil {
+				t.Fatalf("failed to write partial stream: %v", err)
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("expected response writer to support hijacking")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("Hijack: %v", err)
+			}
+			_ = conn.Close()
+			return
+		}
+		if err := writeSSE(w,
+			`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_retry","model":"gpt-5.4-pro","status":"completed","service_tier":"default","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"after retry"}]}],"usage":{"input_tokens":2,"output_tokens":2,"total_tokens":4}}}`,
+		); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultOpenAIConfig()
+	cfg.APIKey = "test-api-key"
+	cfg.BaseURL = server.URL
+	cfg.AuthMode = openAIAuthModeChatGPT
+	cfg.ChatGPTAccountID = "acct_123"
+	cfg.MaxRetries = 2
+	cfg.RetryBaseDelay = time.Millisecond
+	cfg.RetryMaxDelay = 5 * time.Millisecond
+
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider() error = %v", err)
+	}
+
+	resp, err := provider.Generate(context.Background(), &Request{
+		Messages: []Message{{Role: RoleUser, Content: "retry please"}},
+	})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if resp.Content != "after retry" {
+		t.Fatalf("unexpected response content %q", resp.Content)
+	}
+	if got := atomic.LoadInt32(&requestCount); got != 2 {
+		t.Fatalf("expected exactly two attempts, got %d", got)
+	}
+}
+
+func TestOpenAIProviderStreamWithHandler_RetriesTransientStreamFailure(t *testing.T) {
+	if !canListenLocalTCP() {
+		t.Skip("local TCP listeners are not permitted in this environment")
+	}
+
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		attempt := atomic.AddInt32(&requestCount, 1)
+		if attempt == 1 {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("expected response writer to support hijacking")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("Hijack: %v", err)
+			}
+			_ = conn.Close()
+			return
+		}
+		if err := writeSSE(w,
+			`{"type":"response.output_text.delta","delta":"after retry","item_id":"msg_1","output_index":0,"content_index":0,"sequence_number":1}`,
+			`{"type":"response.completed","sequence_number":2,"response":{"id":"resp_retry_stream","model":"gpt-5.4-pro","status":"completed","service_tier":"default","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"after retry"}]}],"usage":{"input_tokens":2,"output_tokens":2,"total_tokens":4}}}`,
+		); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultOpenAIConfig()
+	cfg.APIKey = "test-api-key"
+	cfg.BaseURL = server.URL
+	cfg.MaxRetries = 2
+	cfg.RetryBaseDelay = time.Millisecond
+	cfg.RetryMaxDelay = 5 * time.Millisecond
+
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider() error = %v", err)
+	}
+
+	var text string
+	err = provider.StreamWithHandler(context.Background(), &Request{
+		Messages: []Message{{Role: RoleUser, Content: "retry stream please"}},
+	}, func(chunk *StreamChunk) error {
+		switch chunk.Type {
+		case ChunkTypeText:
+			text += chunk.Text
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamWithHandler() error = %v", err)
+	}
+	if text != "after retry" {
+		t.Fatalf("unexpected streamed text %q", text)
+	}
+	if got := atomic.LoadInt32(&requestCount); got != 2 {
+		t.Fatalf("expected exactly two attempts, got %d", got)
+	}
+}
+
 func containsAll(s string, parts ...string) bool {
 	for _, part := range parts {
 		if !strings.Contains(s, part) {

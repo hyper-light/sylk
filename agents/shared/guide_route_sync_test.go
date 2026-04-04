@@ -184,8 +184,8 @@ func TestRequestGuideRouteSyncPreservesExplicitNestedBranchMetadata(t *testing.T
 }
 
 func TestInactivityTimeoutOrDefault_UsesTargetAwareDefault(t *testing.T) {
-	if got := inactivityTimeoutOrDefault(0, "academic"); got != DefaultResearchConsultationTimeout {
-		t.Fatalf("inactivityTimeoutOrDefault(academic) = %v, want %v", got, DefaultResearchConsultationTimeout)
+	if got := inactivityTimeoutOrDefault(0, "academic"); got != DefaultConsultationTimeout {
+		t.Fatalf("inactivityTimeoutOrDefault(academic) = %v, want %v", got, DefaultConsultationTimeout)
 	}
 	if got := inactivityTimeoutOrDefault(0, "librarian"); got != DefaultConsultationTimeout {
 		t.Fatalf("inactivityTimeoutOrDefault(librarian) = %v, want %v", got, DefaultConsultationTimeout)

@@ -76,6 +76,7 @@ type CanopyHorizon string
 
 const (
 	CanopyHorizonTurn    CanopyHorizon = "turn"
+	CanopyHorizonTask    CanopyHorizon = "task"
 	CanopyHorizonSession CanopyHorizon = "session"
 	CanopyHorizonUser    CanopyHorizon = "user"
 	CanopyHorizonProject CanopyHorizon = "project"
@@ -103,6 +104,7 @@ const (
 type Event struct {
 	ID               string         `json:"id"`
 	SessionID        string         `json:"session_id"`
+	TaskID           string         `json:"task_id,omitempty"`
 	AgentID          string         `json:"agent_id"`
 	AgentType        string         `json:"agent_type"`
 	EventType        EventType      `json:"event_type"`
@@ -135,6 +137,7 @@ type Branch struct {
 	Scope          MemoryScope    `json:"scope"`
 	State          BranchState    `json:"state"`
 	SessionID      string         `json:"session_id"`
+	TaskID         string         `json:"task_id,omitempty"`
 	AgentID        string         `json:"agent_id,omitempty"`
 	AgentType      string         `json:"agent_type,omitempty"`
 	IntentID       string         `json:"intent_id,omitempty"`
@@ -161,6 +164,7 @@ type Branch struct {
 type Canopy struct {
 	Key       string        `json:"key"`
 	SessionID string        `json:"session_id,omitempty"`
+	TaskID    string        `json:"task_id,omitempty"`
 	IntentID  string        `json:"intent_id,omitempty"`
 	Horizon   CanopyHorizon `json:"horizon"`
 	RootIDs   []string      `json:"root_ids"`
@@ -249,6 +253,7 @@ type BranchPacket struct {
 type Query struct {
 	Query                  string        `json:"query"`
 	SessionID              string        `json:"session_id,omitempty"`
+	TaskID                 string        `json:"task_id,omitempty"`
 	AgentID                string        `json:"agent_id,omitempty"`
 	AgentType              string        `json:"agent_type,omitempty"`
 	IntentID               string        `json:"intent_id,omitempty"`
@@ -262,6 +267,7 @@ type Query struct {
 type ResolveIntentInput struct {
 	Query     string        `json:"query"`
 	SessionID string        `json:"session_id,omitempty"`
+	TaskID    string        `json:"task_id,omitempty"`
 	AgentID   string        `json:"agent_id,omitempty"`
 	AgentType string        `json:"agent_type,omitempty"`
 	IntentID  string        `json:"intent_id,omitempty"`
@@ -284,6 +290,7 @@ type IntentResolution struct {
 type OutcomeRecord struct {
 	BranchID       string        `json:"branch_id"`
 	SessionID      string        `json:"session_id,omitempty"`
+	TaskID         string        `json:"task_id,omitempty"`
 	AgentID        string        `json:"agent_id,omitempty"`
 	AgentType      string        `json:"agent_type,omitempty"`
 	Status         OutcomeStatus `json:"status"`

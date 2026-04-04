@@ -43,6 +43,7 @@ func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
 		ID:        uuid.New().String(),
 		Timestamp: time.Now(),
 		Source:    chat.SourceUser,
+		SessionID: submit.SessionID,
 		Content:   submit.Text,
 		Height:    -1,
 	}
@@ -53,6 +54,7 @@ func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
 		ID:        uuid.New().String(),
 		Timestamp: time.Now(),
 		Source:    chat.SourceSystem,
+		SessionID: submit.SessionID,
 		Content:   routingStatusText(targetAgent),
 		Height:    -1,
 	}
@@ -88,12 +90,30 @@ func parseChatCommand(text string) (string, bool) {
 	return cmd, true
 }
 
+func parseChatCommandArgs(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "/") {
+		return ""
+	}
+	body := strings.TrimSpace(strings.TrimPrefix(trimmed, "/"))
+	if body == "" {
+		return ""
+	}
+	parts := strings.SplitN(body, " ", 2)
+	if len(parts) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(parts[1])
+}
+
 // handleChatCommand dispatches a "/command" from chat input.
 func (m *AppModel) handleChatCommand(cmd string, submit msg.SubmitPromptMsg) tea.Cmd {
 	switch cmd {
 	case "clear":
 		m.chat.Clear()
 		return nil
+	case "debug-ui":
+		return m.handleDebugUICommand(parseChatCommandArgs(submit.Text))
 	case "login":
 		return m.handleLoginCommand(submit)
 	default:

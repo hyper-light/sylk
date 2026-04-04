@@ -14,6 +14,7 @@ func (d *Designer) applyDesignRuntimeProfile(req *providers.Request) {
 		AgentID:   "designer",
 		SessionID: d.config.SessionID,
 	})
+	req.DisableParallelToolUse = true
 }
 
 func (d *Designer) designStageProfile() llmruntime.StageProfile {

@@ -252,7 +252,7 @@ func (gt *GlobalTester) initSkills() error {
 	}
 	if err := agentshared.AttachForestOutcomeRecorder(
 		gt.skills,
-		"validate_global_review",
+		"validate_work",
 		gt.forestTracker,
 		gt.config.Forest,
 		func() string { return gt.id },
@@ -490,6 +490,7 @@ func (gt *GlobalTester) unsubRegistry() error {
 // system prompt.
 func (gt *GlobalTester) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
+	ctx = agentshared.WithForwardedTaskScope(ctx, fwd.Metadata)
 	ctx = agentshared.WithGuardianCommandGate(ctx, agentshared.GuardianCommandGateConfig{
 		BusProvider:     func() guide.EventBus { return gt.bus },
 		SourceAgentID:   func() string { return gt.id },

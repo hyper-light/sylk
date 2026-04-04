@@ -56,11 +56,25 @@ func (o *Orchestrator) handleCommandApprovalHoldForward(_ context.Context, fwd *
 		if o.dispatchGate != nil && result.SessionID != "" && result.DAGID != "" {
 			o.dispatchGate.activateDAG(result.SessionID, result.DAGID, result.HoldID)
 		}
+		if o.taskRouter != nil {
+			o.taskRouter.PauseActiveRoutes(
+				result.SessionID,
+				result.DAGID,
+				fmt.Sprintf("command approval hold %s is active", result.HoldID),
+			)
+		}
 		result.State = "active"
 		return result, nil
 	case agentshared.CommandApprovalHoldResolve:
 		if o.dispatchGate != nil && result.SessionID != "" && result.HoldID != "" {
 			o.dispatchGate.resolveHold(result.SessionID, result.HoldID)
+		}
+		if o.taskRouter != nil {
+			o.taskRouter.ResumeActiveRoutes(
+				result.SessionID,
+				result.DAGID,
+				fmt.Sprintf("command approval hold %s resolved", result.HoldID),
+			)
 		}
 		result.State = "resolved"
 		return result, nil

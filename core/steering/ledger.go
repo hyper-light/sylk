@@ -59,13 +59,26 @@ func NewSteeringLedger(
 // DepositCommand adds a command to the mailbox, WAL-logs it, and signals
 // resume (unblocking any WaitForResume call).
 func (l *SteeringLedger) DepositCommand(cmd Command) {
+	l.depositCommand(cmd, true)
+}
+
+// DepositCommandWithoutResume adds a command to the mailbox and WAL without
+// signaling resume. Use this for pace changes that should not self-wake a
+// paused/step wait before a real resume arrives.
+func (l *SteeringLedger) DepositCommandWithoutResume(cmd Command) {
+	l.depositCommand(cmd, false)
+}
+
+func (l *SteeringLedger) depositCommand(cmd Command, signal bool) {
 	l.Mailbox.Deposit(cmd)
 
 	if l.journal != nil {
 		l.journal.LogCommand(cmd)
 	}
 
-	l.signalResume()
+	if signal {
+		l.signalResume()
+	}
 }
 
 // RecordCheckpoint captures a checkpoint, WAL-logs it, and publishes an

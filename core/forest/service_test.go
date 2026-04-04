@@ -52,9 +52,13 @@ func waitForForestCondition(t *testing.T, timeout time.Duration, check func() (b
 	for {
 		ok, err := check()
 		if err != nil {
-			t.Fatalf("wait condition: %v", err)
+			if strings.Contains(err.Error(), "database table is locked") {
+				err = nil
+			} else {
+				t.Fatalf("wait condition: %v", err)
+			}
 		}
-		if ok {
+		if err == nil && ok {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -124,6 +128,91 @@ func TestMemoryForest_RecordContentAndRetrieve(t *testing.T) {
 	}
 	if packets[0].Score.Total <= 0 {
 		t.Fatalf("expected positive score, got %f", packets[0].Score.Total)
+	}
+}
+
+func TestMemoryForest_TaskHorizonIsTaskScoped(t *testing.T) {
+	t.Parallel()
+
+	forest, db := newTestForest(t)
+	defer forest.Close()
+	defer db.Close()
+
+	now := time.Now().UTC()
+	entries := []*ctxpkg.ContentEntry{
+		{
+			ID:          "task-a-decision",
+			SessionID:   "session-task",
+			AgentID:     "tester-1",
+			AgentType:   "tester",
+			ContentType: ctxpkg.ContentTypeDecision,
+			Content:     "Focus test coverage on timeout handling for task A.",
+			Timestamp:   now,
+			TurnNumber:  1,
+			Confidence:  0.9,
+			Salience:    0.9,
+			Metadata:    map[string]string{"task_id": "task-a"},
+		},
+		{
+			ID:          "task-b-decision",
+			SessionID:   "session-task",
+			AgentID:     "tester-1",
+			AgentType:   "tester",
+			ContentType: ctxpkg.ContentTypeDecision,
+			Content:     "Focus test coverage on install flows for task B.",
+			Timestamp:   now.Add(time.Second),
+			TurnNumber:  2,
+			Confidence:  0.9,
+			Salience:    0.9,
+			Metadata:    map[string]string{"task_id": "task-b"},
+		},
+	}
+	for _, entry := range entries {
+		if err := forest.RecordContent(context.Background(), entry); err != nil {
+			t.Fatalf("record content %s: %v", entry.ID, err)
+		}
+	}
+
+	packets, err := forest.Retrieve(context.Background(), Query{
+		Query:     "timeout coverage",
+		SessionID: "session-task",
+		TaskID:    "task-a",
+		Horizon:   CanopyHorizonTask,
+		Limit:     8,
+		Families:  []TreeFamily{TreeFamilyDecision},
+	})
+	if err != nil {
+		t.Fatalf("retrieve task-scoped packets: %v", err)
+	}
+	if len(packets) == 0 {
+		t.Fatal("expected task-scoped packets")
+	}
+	for _, packet := range packets {
+		if packet == nil || packet.Branch == nil {
+			continue
+		}
+		if packet.Branch.TaskID != "task-a" {
+			t.Fatalf("retrieved branch task_id = %q, want task-a", packet.Branch.TaskID)
+		}
+	}
+
+	intent, err := forest.ResolveIntent(context.Background(), ResolveIntentInput{
+		Query:     "timeout coverage",
+		SessionID: "session-task",
+		TaskID:    "task-a",
+		Horizon:   CanopyHorizonTask,
+		Limit:     8,
+	})
+	if err != nil {
+		t.Fatalf("resolve intent task-scoped: %v", err)
+	}
+	if len(intent.ActiveRoots) == 0 {
+		t.Fatal("expected task canopy roots")
+	}
+	for _, rootID := range intent.ActiveRoots {
+		if strings.Contains(rootID, "task-b") {
+			t.Fatalf("task canopy leaked other task root %q", rootID)
+		}
 	}
 }
 

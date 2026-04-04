@@ -1,12 +1,14 @@
 package orchestrator
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/versioning"
 )
 
@@ -360,5 +362,112 @@ func TestFinalizePipelineUpdate_NonInspectorSuccessDoesNotPublishGlobalFollowups
 	case req := <-reqCh:
 		t.Fatalf("unexpected OT global follow-up request: %#v", req)
 	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestHandlePipelineUpdate_InspectorSuccessReleasesAcceptedTaskResources(t *testing.T) {
+	quota := container.NewResourceQuota(container.ResourceQuotaConfig{
+		GoroutineLimit: 200,
+		ContainerLimit: 4,
+	})
+	runtime := newTaskPodTestRuntime(quota)
+	taskPod := newTaskPodForTest("task-1", runtime, time.Minute, time.Minute, time.Minute)
+	if err := taskPod.HoldForNode(context.Background(), "node-1", []string{"inspector-pipeline"}); err != nil {
+		t.Fatalf("taskPod.HoldForNode: %v", err)
+	}
+	if usage := quota.Usage(); usage.ContainerCount != 4 {
+		t.Fatalf("expected hot task pod containers before OT cleanup, got %+v", usage)
+	}
+
+	workingDir := t.TempDir()
+	svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
+		SessionID:       versioning.SessionID("sess-1"),
+		WorkingDir:      workingDir,
+		AllowDiskExport: true,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	defer svfs.Close()
+	if _, err := svfs.BeginPipeline(versioning.BeginPipelineConfig{
+		PipelineID: "task-1",
+		SessionID:  versioning.SessionID("sess-1"),
+		WorkingDir: workingDir,
+		AgentID:    "inspector-pipeline",
+		AgentRole:  "inspector",
+	}); err != nil {
+		t.Fatalf("BeginPipeline: %v", err)
+	}
+	if !svfs.HasPipeline("task-1") {
+		t.Fatal("expected tracked pipeline draft before OT cleanup")
+	}
+
+	scope := testScope()
+	buffers, err := NewBufferRegistry(DefaultBufferRegistryConfig(4), nil, scope)
+	if err != nil {
+		t.Fatalf("NewBufferRegistry: %v", err)
+	}
+
+	dispatcher := NewBusNodeDispatcher(nil, "orchestrator", "sess-1", "dag-1", nil, nil, nil)
+	dispatcher.nodePods.Store("node-1", taskPod)
+
+	bridge := NewDAGBridge(DefaultDAGBridgeConfig(), DAGBridgeDeps{
+		SessionID: "sess-1",
+		AgentID:   "orchestrator",
+	})
+	bridge.buffers = buffers
+	bridge.activeDAGs["dag-1"] = &ActiveDAGMeta{
+		Dispatcher:             dispatcher,
+		TaskPods:               map[string]*agentshared.AgentPod{"task-1": taskPod},
+		TaskLabels:             map[string]string{"task-1": "auth-checkout"},
+		ResetPendingTaskPods:   make(map[string]struct{}),
+		ReleasePendingTaskPods: make(map[string]struct{}),
+	}
+
+	o := &Orchestrator{
+		state:          NewState("sess-1"),
+		config:         Config{AgentID: "orchestrator", SessionID: "sess-1"},
+		bufferRegistry: buffers,
+		dagBridge:      bridge,
+		sessionVFS:     map[string]*versioning.SessionVFS{"sess-1": svfs},
+	}
+	o.state.Tasks["task-1"] = &TaskRecord{
+		ID:        "task-1",
+		Name:      "auth checkout",
+		SessionID: "sess-1",
+	}
+
+	err = o.handlePipelineUpdate(&guide.Message{
+		ID: "msg-1",
+		Payload: &PipelineUpdate{
+			DAGID:     "dag-1",
+			NodeID:    "node-1",
+			TaskID:    "task-1",
+			AgentType: agentshared.PipelineAgentInspector,
+			Status:    "succeeded",
+			Output: map[string]any{
+				"summary": "Inspector accepted the completed pipeline.",
+			},
+			Timestamp: time.Now().UTC(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("handlePipelineUpdate: %v", err)
+	}
+
+	if svfs.HasPipeline("task-1") {
+		t.Fatal("expected OT-accepted task draft to be removed from SessionVFS")
+	}
+	if !taskPod.IsReleased() {
+		t.Fatal("expected accepted task pod to be released after node completion")
+	}
+	if usage := quota.Usage(); usage.ContainerCount != 0 {
+		t.Fatalf("expected accepted task cleanup to deallocate containers, got %+v", usage)
+	}
+	if got := buffers.ActiveBufferCount(); got != 0 {
+		t.Fatalf("expected accepted task buffer to be released, got %d active buffers", got)
+	}
+	if _, present := bridge.activeDAGs["dag-1"].TaskPods["task-1"]; present {
+		t.Fatal("expected accepted task pod to be removed from active DAG state")
 	}
 }

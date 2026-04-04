@@ -118,9 +118,12 @@ func TestEngineerSystemCollabPrompt_RoutesImplementationBackToInspector(t *testi
 		"`inspector-pipeline`",
 		"`inspector -> tester -> engineer/designer -> inspector`",
 		"Do not hand off directly to `tester-pipeline` after implementation",
+		"Use `handoff_next` to route back to `inspector-pipeline` when you are handing off fresh top-level implementation evidence.",
+		"Use `validate_work` only when you are answering an active challenge from Inspector, Tester, or Designer.",
 		"Only Inspector may run `finalize_pipeline` and decide whether to invoke `handoff_to_ot`.",
 		"Your first `challenge_agent` call to Tester, Designer, or Inspector is allowed.",
 		"Re-challenge Inspector only after Inspector answered your previous challenge and you then changed pipeline VFS state yourself based on that answer.",
+		"Do not reinterpret a targeted challenge turn as permission to restart the broad top-level implementation flow.",
 	}
 	for _, want := range required {
 		if !strings.Contains(EngineerSystemCollabPrompt, want) {

@@ -157,7 +157,7 @@ func CompileCriteriaFromTask(task *agentShared.PipelineTaskInput) *shared.Inspec
 	return compileCriteriaFromTask(task)
 }
 
-func defaultQualityGates(workerType string, hasTests bool) []shared.QualityGate {
+func defaultQualityGates(workerType string, _ bool) []shared.QualityGate {
 	if workerType == "designer" {
 		return []shared.QualityGate{
 			{Name: "token_usage_clean", Metric: "blocking_issues", Operator: "==", Threshold: 0},
@@ -173,14 +173,6 @@ func defaultQualityGates(workerType string, hasTests bool) []shared.QualityGate 
 		{Name: "format_clean", Metric: "blocking_issues", Operator: "==", Threshold: 0},
 		{Name: "security_clean", Metric: "blocking_issues", Operator: "==", Threshold: 0},
 		{Name: "complexity_clean", Metric: "blocking_issues", Operator: "==", Threshold: 0},
-	}
-	if hasTests {
-		gates = append(gates, shared.QualityGate{
-			Name:      "coverage_clean",
-			Metric:    "blocking_issues",
-			Operator:  "==",
-			Threshold: 0,
-		})
 	}
 	return gates
 }
@@ -252,11 +244,22 @@ func (pi *PipelineInspector) collectValidationEvidence(
 		results[toolName] = toolIssues
 		issues = append(issues, toolIssues...)
 	}
+	if criteriaHasCoverageGate(criteria) {
+		coverageIssues := []shared.ValidationIssue{{
+			ID:       "coverage_requires_tester_evidence",
+			Severity: shared.Medium,
+			Message:  "Coverage validation requires tester-owned execution evidence; inspector does not run test commands locally.",
+			RuleID:   "inspector/test-execution-boundary",
+			Domain:   shared.ValidationDomainFromWorkerType(workerType),
+		}}
+		results["coverage_from_tester"] = coverageIssues
+		issues = append(issues, coverageIssues...)
+	}
 
 	return results, issues
 }
 
-func validationToolPlan(workerType string, criteria *shared.InspectorCriteria) []string {
+func validationToolPlan(workerType string, _ *shared.InspectorCriteria) []string {
 	if workerType == "designer" {
 		return []string{
 			"validate_token_usage",
@@ -273,9 +276,6 @@ func validationToolPlan(workerType string, criteria *shared.InspectorCriteria) [
 		"run_security_scan",
 		"analyze_complexity",
 	}
-	if criteriaHasCoverageGate(criteria) {
-		plan = append(plan, "check_coverage")
-	}
 	return plan
 }
 
@@ -284,7 +284,8 @@ func criteriaHasCoverageGate(criteria *shared.InspectorCriteria) bool {
 		return false
 	}
 	for _, gate := range criteria.QualityGates {
-		if gate.Name == "coverage_clean" {
+		if strings.EqualFold(strings.TrimSpace(gate.Name), "coverage_clean") ||
+			strings.EqualFold(strings.TrimSpace(gate.Metric), "coverage") {
 			return true
 		}
 	}
@@ -355,6 +356,11 @@ func decodeValidationIssues(data any) ([]shared.ValidationIssue, error) {
 func evaluateQualityGates(criteria *shared.InspectorCriteria, toolResults map[string][]shared.ValidationIssue) map[string]bool {
 	results := make(map[string]bool, len(criteria.QualityGates))
 	for _, gate := range criteria.QualityGates {
+		if strings.EqualFold(strings.TrimSpace(gate.Name), "coverage_clean") ||
+			strings.EqualFold(strings.TrimSpace(gate.Metric), "coverage") {
+			results[gate.Name] = false
+			continue
+		}
 		switch gate.Name {
 		case "lint_clean":
 			results[gate.Name] = !shared.HasBlockingIssues(toolResults["run_linter"])
@@ -366,8 +372,6 @@ func evaluateQualityGates(criteria *shared.InspectorCriteria, toolResults map[st
 			results[gate.Name] = !shared.HasBlockingIssues(toolResults["run_security_scan"])
 		case "complexity_clean":
 			results[gate.Name] = !shared.HasBlockingIssues(toolResults["analyze_complexity"])
-		case "coverage_clean":
-			results[gate.Name] = !shared.HasBlockingIssues(toolResults["check_coverage"])
 		case "token_usage_clean":
 			results[gate.Name] = !shared.HasBlockingIssues(toolResults["validate_token_usage"])
 		case "accessibility_clean":

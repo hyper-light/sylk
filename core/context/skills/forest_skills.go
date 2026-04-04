@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 // ForestService captures the forest capabilities exposed to skills.
@@ -21,7 +23,9 @@ type ForestService interface {
 type ForestRecallInput struct {
 	Query                  string   `json:"query"`
 	SessionID              string   `json:"session_id,omitempty"`
+	TaskID                 string   `json:"task_id,omitempty"`
 	IntentID               string   `json:"intent_id,omitempty"`
+	Horizon                string   `json:"horizon,omitempty"`
 	Families               []string `json:"families,omitempty"`
 	Limit                  int      `json:"limit,omitempty"`
 	IncludeCounterEvidence bool     `json:"include_counter_evidence,omitempty"`
@@ -36,6 +40,7 @@ type ForestRecallOutput struct {
 type ForestOutcomeInput struct {
 	BranchID   string  `json:"branch_id"`
 	SessionID  string  `json:"session_id,omitempty"`
+	TaskID     string  `json:"task_id,omitempty"`
 	Status     string  `json:"status"`
 	Summary    string  `json:"summary"`
 	Confidence float64 `json:"confidence,omitempty"`
@@ -56,7 +61,15 @@ func NewForestResolveIntentSkill(deps *RetrievalDependencies) *skills.Skill {
 		Priority(100).
 		StringParam("query", "Natural language description of the current task or user request", true).
 		StringParam("session_id", "Optional session identifier for session-scoped intent resolution", false).
+		StringParam("task_id", "Optional task identifier for task-scoped intent resolution", false).
 		StringParam("intent_id", "Optional explicit intent identifier", false).
+		EnumParam("horizon", "Optional canopy horizon: turn, task, session, user, or project.", []string{
+			string(forest.CanopyHorizonTurn),
+			string(forest.CanopyHorizonTask),
+			string(forest.CanopyHorizonSession),
+			string(forest.CanopyHorizonUser),
+			string(forest.CanopyHorizonProject),
+		}, false).
 		IntParam("limit", "Maximum number of supporting branches to inspect", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			if deps == nil || deps.Forest == nil {
@@ -66,6 +79,12 @@ func NewForestResolveIntentSkill(deps *RetrievalDependencies) *skills.Skill {
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid input: %w", err)
 			}
+			params.SessionID, params.TaskID = resolveForestSkillScope(ctx, params.SessionID, params.TaskID)
+			horizon, err := resolveForestSkillHorizon(string(params.Horizon), params.SessionID, params.TaskID)
+			if err != nil {
+				return nil, err
+			}
+			params.Horizon = horizon
 			return deps.Forest.ResolveIntent(ctx, params)
 		}).
 		Build()
@@ -80,7 +99,15 @@ func NewForestRecallSkill(deps *RetrievalDependencies) *skills.Skill {
 		Priority(100).
 		StringParam("query", "Natural language query for branch recall", true).
 		StringParam("session_id", "Optional session identifier", false).
+		StringParam("task_id", "Optional task identifier for task-scoped recall", false).
 		StringParam("intent_id", "Optional explicit intent identifier", false).
+		EnumParam("horizon", "Optional canopy horizon: turn, task, session, user, or project.", []string{
+			string(forest.CanopyHorizonTurn),
+			string(forest.CanopyHorizonTask),
+			string(forest.CanopyHorizonSession),
+			string(forest.CanopyHorizonUser),
+			string(forest.CanopyHorizonProject),
+		}, false).
 		ArrayParam("families", "Optional tree families to constrain recall", "string", false).
 		IntParam("limit", "Maximum number of packets to return", false).
 		BoolParam("include_counter_evidence", "Whether to include contradictory evidence", false).
@@ -92,10 +119,17 @@ func NewForestRecallSkill(deps *RetrievalDependencies) *skills.Skill {
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid input: %w", err)
 			}
+			sessionID, taskID := resolveForestSkillScope(ctx, params.SessionID, params.TaskID)
+			horizon, err := resolveForestSkillHorizon(params.Horizon, sessionID, taskID)
+			if err != nil {
+				return nil, err
+			}
 			packets, err := deps.Forest.Retrieve(ctx, forest.Query{
 				Query:                  params.Query,
-				SessionID:              params.SessionID,
+				SessionID:              sessionID,
+				TaskID:                 taskID,
 				IntentID:               params.IntentID,
+				Horizon:                horizon,
 				Families:               parseForestFamilies(params.Families),
 				Limit:                  params.Limit,
 				IncludeCounterEvidence: params.IncludeCounterEvidence,
@@ -117,7 +151,15 @@ func NewForestPredictNextSkill(deps *RetrievalDependencies) *skills.Skill {
 		Priority(95).
 		StringParam("query", "Natural language description of the current task", true).
 		StringParam("session_id", "Optional session identifier", false).
+		StringParam("task_id", "Optional task identifier for task-scoped prediction", false).
 		StringParam("intent_id", "Optional explicit intent identifier", false).
+		EnumParam("horizon", "Optional canopy horizon: turn, task, session, user, or project.", []string{
+			string(forest.CanopyHorizonTurn),
+			string(forest.CanopyHorizonTask),
+			string(forest.CanopyHorizonSession),
+			string(forest.CanopyHorizonUser),
+			string(forest.CanopyHorizonProject),
+		}, false).
 		IntParam("limit", "Maximum number of packets to return", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			if deps == nil || deps.Forest == nil {
@@ -127,10 +169,17 @@ func NewForestPredictNextSkill(deps *RetrievalDependencies) *skills.Skill {
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid input: %w", err)
 			}
+			sessionID, taskID := resolveForestSkillScope(ctx, params.SessionID, params.TaskID)
+			horizon, err := resolveForestSkillHorizon(params.Horizon, sessionID, taskID)
+			if err != nil {
+				return nil, err
+			}
 			packets, err := deps.Forest.PredictNextBranches(ctx, forest.Query{
 				Query:     params.Query,
-				SessionID: params.SessionID,
+				SessionID: sessionID,
+				TaskID:    taskID,
 				IntentID:  params.IntentID,
+				Horizon:   horizon,
 				Limit:     params.Limit,
 			})
 			if err != nil {
@@ -150,6 +199,7 @@ func NewForestRecordOutcomeSkill(deps *RetrievalDependencies) *skills.Skill {
 		Priority(90).
 		StringParam("branch_id", "Branch identifier to update", true).
 		StringParam("session_id", "Optional session identifier", false).
+		StringParam("task_id", "Optional task identifier", false).
 		StringParam("status", "Outcome status: succeeded, failed, or mixed", true).
 		StringParam("summary", "Short description of what happened", true).
 		FloatParam("confidence", "Confidence in the recorded outcome", false).
@@ -162,9 +212,11 @@ func NewForestRecordOutcomeSkill(deps *RetrievalDependencies) *skills.Skill {
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid input: %w", err)
 			}
+			sessionID, taskID := resolveForestSkillScope(ctx, params.SessionID, params.TaskID)
 			if err := deps.Forest.RecordOutcome(ctx, forest.OutcomeRecord{
 				BranchID:   params.BranchID,
-				SessionID:  params.SessionID,
+				SessionID:  sessionID,
+				TaskID:     taskID,
 				Status:     forest.OutcomeStatus(params.Status),
 				Summary:    params.Summary,
 				Confidence: params.Confidence,
@@ -197,4 +249,42 @@ func parseForestFamilies(values []string) []forest.TreeFamily {
 		}
 	}
 	return families
+}
+
+func resolveForestSkillScope(ctx context.Context, sessionID, taskID string) (string, string) {
+	sessionID = strings.TrimSpace(sessionID)
+	taskID = strings.TrimSpace(taskID)
+	if sessionID == "" {
+		sessionID = versioning.SessionIDFromContext(ctx)
+	}
+	if taskID == "" {
+		taskID = versioning.TaskIDFromContext(ctx)
+	}
+	return sessionID, taskID
+}
+
+func resolveForestSkillHorizon(raw, sessionID, taskID string) (forest.CanopyHorizon, error) {
+	switch normalized := strings.ToLower(strings.TrimSpace(raw)); normalized {
+	case "":
+		switch {
+		case taskID != "":
+			return forest.CanopyHorizonTask, nil
+		case sessionID != "":
+			return forest.CanopyHorizonSession, nil
+		default:
+			return forest.CanopyHorizonProject, nil
+		}
+	case string(forest.CanopyHorizonTurn):
+		return forest.CanopyHorizonTurn, nil
+	case string(forest.CanopyHorizonTask):
+		return forest.CanopyHorizonTask, nil
+	case string(forest.CanopyHorizonSession):
+		return forest.CanopyHorizonSession, nil
+	case string(forest.CanopyHorizonUser):
+		return forest.CanopyHorizonUser, nil
+	case string(forest.CanopyHorizonProject):
+		return forest.CanopyHorizonProject, nil
+	default:
+		return "", fmt.Errorf("invalid horizon %q", raw)
+	}
 }

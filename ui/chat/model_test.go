@@ -260,6 +260,146 @@ func TestDuplicateStartDoesNotResetProgressOnlyStreamSlot(t *testing.T) {
 	}
 }
 
+func TestSameCorrelationResponderTransitionClearsPriorProgressOverride(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.BeginThinking("guide")
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-shared-handoff",
+		AgentID:       "guide",
+		AgentType:     "guide",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-shared-handoff",
+		AgentID:       "guide",
+		AgentType:     "guide",
+		Message:       "Classifying request...",
+	})
+	m = comp.(*Model)
+
+	before := findEntryByCorrelation(m, "corr-shared-handoff")
+	if before == nil {
+		t.Fatal("expected shared-correlation guide entry")
+	}
+	if before.ThinkingStatus != "Classifying request..." {
+		t.Fatalf("initial thinking status = %q, want guide progress override", before.ThinkingStatus)
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-shared-handoff",
+		AgentID:       "architect",
+		AgentType:     "architect",
+	})
+	m = comp.(*Model)
+
+	after := findEntryByCorrelation(m, "corr-shared-handoff")
+	if after == nil {
+		t.Fatal("expected shared-correlation architect entry")
+	}
+	if after.AgentID != "architect" {
+		t.Fatalf("AgentID = %q, want architect", after.AgentID)
+	}
+	if after.AgentType != "architect" {
+		t.Fatalf("AgentType = %q, want architect", after.AgentType)
+	}
+	if after.ThinkingStatus == "Classifying request..." {
+		t.Fatalf("expected guide progress override cleared on responder transition, got %q", after.ThinkingStatus)
+	}
+	if want := thinkingMessagesForAgent("architect")[0]; after.ThinkingStatus != want {
+		t.Fatalf("thinking status = %q, want %q", after.ThinkingStatus, want)
+	}
+
+	slot := m.streamSlot("corr-shared-handoff")
+	if slot == nil {
+		t.Fatal("expected shared-correlation stream slot")
+	}
+	if slot.retryText != "" {
+		t.Fatalf("slot retryText = %q, want cleared override", slot.retryText)
+	}
+	if !slot.lastProgressSet.IsZero() {
+		t.Fatalf("expected slot progress throttle reset, got %v", slot.lastProgressSet)
+	}
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-shared-handoff",
+		AgentID:       "architect",
+		AgentType:     "architect",
+		Message:       "Designing architecture options...",
+	})
+	m = comp.(*Model)
+
+	final := findEntryByCorrelation(m, "corr-shared-handoff")
+	if final == nil {
+		t.Fatal("expected architect entry after progress")
+	}
+	if final.ThinkingStatus != "Designing architecture options..." {
+		t.Fatalf("thinking status = %q, want immediate architect progress", final.ThinkingStatus)
+	}
+}
+
+func TestStreamCompletePreservesExplicitProgressForProgressOnlyEntry(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.SetSize(88, 20)
+
+	const status = "Validation accepted. Proceeding to closure gate."
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "c1",
+		AgentID:       "task_auth_checkout:inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		TaskName:      "Auth checkout",
+		TaskSlug:      "auth-checkout",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "c1",
+		AgentID:       "task_auth_checkout:inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		Message:       status,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamCompleteMsg{
+		SessionID:     "s1",
+		CorrelationID: "c1",
+		AgentID:       "task_auth_checkout:inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+	})
+	m = comp.(*Model)
+
+	entry := findEntryByCorrelation(m, "c1")
+	if entry == nil {
+		t.Fatal("expected completed progress-only entry")
+	}
+	if entry.Streaming {
+		t.Fatalf("expected progress-only entry to be finalized, got %+v", entry)
+	}
+	if entry.Content != "" {
+		t.Fatalf("expected progress-only entry to stay contentless, got %q", entry.Content)
+	}
+	if entry.ThinkingElapsed <= 0 {
+		t.Fatalf("expected preserved thinking elapsed, got %v", entry.ThinkingElapsed)
+	}
+	if entry.ThinkingText != "" {
+		t.Fatalf("expected spinner text cleared on completion, got %q", entry.ThinkingText)
+	}
+	if entry.ThinkingStatus != status {
+		t.Fatalf("thinking status = %q, want %q", entry.ThinkingStatus, status)
+	}
+	if view := m.View(); !strings.Contains(view, status) {
+		t.Fatalf("expected completed progress-only status to remain visible, got %q", view)
+	}
+}
+
 func TestHandleActivity_AllowsChatVisibleSuccessEvents(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 
@@ -487,6 +627,75 @@ func TestHandleToolCallEvent_MatchesGenericToolCompletionWhenKeysDifferButArgsMa
 	}
 	if !last.ToolCalls[0].Completed || last.ToolCalls[0].Output != "ok" {
 		t.Fatalf("generic tool row = %+v, want completed output ok", last.ToolCalls[0])
+	}
+}
+
+func TestHandleToolCallEvent_ClearsToolDerivedProgressOverrideOnCompletion(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.BeginThinking("tester-pipeline")
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-tool-progress",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+	})
+	m = comp.(*Model)
+
+	const toolProgress = "Working through this with read file."
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-tool-progress",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+		Message:       toolProgress,
+		ToolDerived:   true,
+	})
+	m = comp.(*Model)
+
+	slot := m.streamSlot("corr-tool-progress")
+	if slot == nil || slot.retryText != toolProgress || !slot.retryToolDerived {
+		t.Fatalf("expected tool-derived slot progress, got %+v", slot)
+	}
+
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-tool-progress",
+		ToolCallKey:   "read-1",
+		ToolName:      "read_file",
+		ArgsSummary:   "path=README.md",
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	m = comp.(*Model)
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-tool-progress",
+		ToolCallKey:   "read-1",
+		ToolName:      "read_file",
+		Phase:         1,
+		Duration:      50 * time.Millisecond,
+		Success:       true,
+	})
+	m = comp.(*Model)
+
+	slot = m.streamSlot("corr-tool-progress")
+	if slot == nil {
+		t.Fatal("expected active stream slot to remain present")
+	}
+	if slot.retryText != "" || slot.retryToolDerived {
+		t.Fatalf("expected tool-derived progress override cleared, got retryText=%q toolDerived=%v", slot.retryText, slot.retryToolDerived)
+	}
+
+	entry := findEntryByCorrelation(m, "corr-tool-progress")
+	if entry == nil {
+		t.Fatal("expected stream entry")
+	}
+	if len(entry.ToolCalls) != 1 || !entry.ToolCalls[0].Completed {
+		t.Fatalf("expected completed tool call row, got %+v", entry.ToolCalls)
+	}
+	if entry.ThinkingStatus == toolProgress {
+		t.Fatalf("expected stale tool progress status cleared, got %q", entry.ThinkingStatus)
 	}
 }
 
@@ -774,7 +983,7 @@ func TestStreamReroute_ClearsDeferredChildWaitWithoutConsumingSourceSlot(t *test
 	if status := entry.ToolCalls[0].InterAgent.Status; status != InterAgentToolDone {
 		t.Fatalf("expected pipeline challenge row to settle on reroute, got %q", status)
 	}
-	if view := m.View(); strings.Contains(view, deferredParentCompletionStatus) {
+	if view := m.View(); strings.Contains(view, "Waiting for child work to finish...") {
 		t.Fatalf("unexpected deferred child-wait status after reroute: %q", view)
 	}
 }
@@ -793,7 +1002,7 @@ func TestTopLevelTransferStartClearsStaleNestedChildState(t *testing.T) {
 		Content:        "",
 		Streaming:      true,
 		ThinkingText:   "⠋  0.2s",
-		ThinkingStatus: deferredParentCompletionStatus,
+		ThinkingStatus: "Waiting on tester progress.",
 		Height:         -1,
 		ToolCalls: []ToolCallRecord{{
 			ToolCallKey: "challenge-1",
@@ -819,13 +1028,12 @@ func TestTopLevelTransferStartClearsStaleNestedChildState(t *testing.T) {
 	})
 	idx := m.history.Len() - 1
 	slot := &streamSlot{
-		accumulator:     NewStreamAccumulator(idx),
-		agentID:         "inspector-pipeline",
-		thinkingIdx:     idx,
-		thinkingStart:   startedAt,
-		retryText:       deferredParentCompletionStatus,
-		deferCompletion: true,
-		renderState:     &streamRenderState{},
+		accumulator:   NewStreamAccumulator(idx),
+		agentID:       "inspector-pipeline",
+		thinkingIdx:   idx,
+		thinkingStart: startedAt,
+		retryText:     "Waiting on tester progress.",
+		renderState:   &streamRenderState{},
 	}
 	m.streams["corr-inspector"] = slot
 	m.pendingInterAgent[idx] = struct{}{}
@@ -851,6 +1059,7 @@ func TestTopLevelTransferStartClearsStaleNestedChildState(t *testing.T) {
 		SessionID:           "s1",
 		CorrelationID:       "corr-tester",
 		ParentCorrelationID: "corr-inspector",
+		TopLevelTransfer:    true,
 		AgentID:             "runtime-tester",
 		AgentType:           "tester-pipeline",
 		AgentName:           "Tester",
@@ -876,6 +1085,279 @@ func TestTopLevelTransferStartClearsStaleNestedChildState(t *testing.T) {
 	}
 	if view := m.View(); strings.Contains(view, "stale nested progress") {
 		t.Fatalf("unexpected stale nested child render after top-level transfer: %q", view)
+	}
+}
+
+func TestTopLevelTransferReturn_CreatesNewInspectorRowAcrossHandoffChain(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.SetSize(96, 24)
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector-initial",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamCompleteMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector-initial",
+		AgentID:       "runtime-inspector",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+	})
+	m = comp.(*Model)
+
+	inspector := findEntryByCorrelation(m, "corr-inspector-initial")
+	if inspector == nil {
+		t.Fatal("expected initial inspector entry")
+	}
+	if inspector.Streaming {
+		t.Fatalf("expected initial inspector entry to complete before handoff return, got %+v", inspector)
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-tester",
+		ParentCorrelationID: "corr-inspector-initial",
+		TopLevelTransfer:    true,
+		AgentID:             "runtime-tester",
+		AgentType:           "tester-pipeline",
+		AgentName:           "Tester",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamCompleteMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-tester",
+		AgentID:       "runtime-tester",
+		AgentType:     "tester-pipeline",
+		AgentName:     "Tester",
+	})
+	m = comp.(*Model)
+
+	historyBefore := m.history.Len()
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-inspector-return",
+		ParentCorrelationID: "corr-tester",
+		TopLevelTransfer:    true,
+		AgentID:             "runtime-inspector",
+		AgentType:           "inspector-pipeline",
+		AgentName:           "Inspector",
+	})
+	m = comp.(*Model)
+
+	if m.history.Len() != historyBefore+1 {
+		t.Fatalf("history len = %d, want %d after creating a fresh inspector handoff row", m.history.Len(), historyBefore+1)
+	}
+	if original := findEntryByCorrelation(m, "corr-inspector-initial"); original == nil {
+		t.Fatal("expected original inspector row to remain in the transcript")
+	}
+	resumed := findEntryByCorrelation(m, "corr-inspector-return")
+	if resumed == nil {
+		t.Fatal("expected returning inspector to create a new row")
+	}
+	if !resumed.Streaming {
+		t.Fatalf("expected resumed inspector row to be live, got %+v", resumed)
+	}
+	if strings.TrimSpace(resumed.ThinkingText) == "" {
+		t.Fatalf("expected resumed inspector row to restart its thinking footer, got %+v", resumed)
+	}
+	if tester := findEntryByCorrelation(m, "corr-tester"); tester == nil {
+		t.Fatal("expected tester handoff row to remain top-level")
+	}
+}
+
+func TestTopLevelTransferReturn_ReusesCompletedOwnerRowAcrossRawAgentIDMismatch(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.SetSize(96, 24)
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector-parent",
+		AgentID:       "inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+		TaskID:        "task_auth_checkout",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector-parent",
+		AgentID:       "inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		Phase:         0,
+		StartedAt:     time.Now(),
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "challenge",
+			Status:     "pending",
+			AgentTypes: []string{"tester-pipeline"},
+			Summary:    "Re-run the audit.",
+			ThreadKey:  "pipeline:task_auth_checkout-challenge-1",
+		},
+	})
+	m = comp.(*Model)
+
+	branchRef := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-inspector-parent",
+		ParentToolCallKey:   "challenge-1",
+		Kind:                "challenge",
+		ThreadKey:           "pipeline:task_auth_checkout-challenge-1",
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-tester-child",
+		AgentID:       "task_auth_checkout:tester-pipeline",
+		AgentType:     "tester-pipeline",
+		AgentName:     "Tester",
+		TaskID:        "task_auth_checkout",
+		BranchRef:     branchRef,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamCompleteMsg{
+		SessionID:         "s1",
+		CorrelationID:     "corr-inspector-parent",
+		AgentID:           "inspector-pipeline",
+		AgentType:         "inspector-pipeline",
+		AgentName:         "Inspector",
+		TaskID:            "task_auth_checkout",
+		AuthoritativeText: "Waiting on the tester challenge result.",
+	})
+	m = comp.(*Model)
+
+	if !m.HasPendingCorrelation("corr-inspector-parent") {
+		t.Fatal("expected completed inspector row to remain resumable")
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-inspector-return",
+		ParentCorrelationID: "corr-tester-child",
+		TopLevelTransfer:    true,
+		AgentID:             "task_auth_checkout:inspector-pipeline",
+		RuntimeAgentID:      "runtime-inspector",
+		AgentType:           "inspector-pipeline",
+		AgentName:           "Inspector",
+		TaskID:              "task_auth_checkout",
+	})
+	m = comp.(*Model)
+
+	if old := findEntryByCorrelation(m, "corr-inspector-parent"); old != nil {
+		t.Fatalf("expected original resumable correlation to be replaced after visible-identity-matched return, got %+v", old)
+	}
+	resumed := findEntryByCorrelation(m, "corr-inspector-return")
+	if resumed == nil {
+		t.Fatal("expected resumed inspector row")
+	}
+	if resumed.Content != "Waiting on the tester challenge result." {
+		t.Fatalf("resumed inspector content = %q, want preserved content", resumed.Content)
+	}
+	if !resumed.Streaming {
+		t.Fatalf("expected resumed inspector row to be live after return, got %+v", resumed)
+	}
+}
+
+func TestTopLevelTransferReturn_ReusesCompletedOwnerRowWhenTaskIdentityArrivesOnResume(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.SetSize(96, 24)
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector-parent-unscoped",
+		AgentID:       "inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		AgentName:     "Inspector",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-inspector-parent-unscoped",
+		AgentID:       "inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		ToolCallKey:   "challenge-1",
+		ToolName:      "challenge_agent",
+		Phase:         0,
+		StartedAt:     time.Now(),
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "challenge",
+			Status:     "pending",
+			AgentTypes: []string{"tester-pipeline"},
+			Summary:    "Re-run the audit.",
+			ThreadKey:  "pipeline:task_auth_checkout-challenge-1",
+		},
+	})
+	m = comp.(*Model)
+
+	branchRef := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-inspector-parent-unscoped",
+		ParentToolCallKey:   "challenge-1",
+		Kind:                "challenge",
+		ThreadKey:           "pipeline:task_auth_checkout-challenge-1",
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-tester-child-unscoped",
+		AgentID:       "task_auth_checkout:tester-pipeline",
+		AgentType:     "tester-pipeline",
+		AgentName:     "Tester",
+		TaskID:        "task_auth_checkout",
+		BranchRef:     branchRef,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamCompleteMsg{
+		SessionID:         "s1",
+		CorrelationID:     "corr-inspector-parent-unscoped",
+		AgentID:           "inspector-pipeline",
+		AgentType:         "inspector-pipeline",
+		AgentName:         "Inspector",
+		AuthoritativeText: "Waiting on the tester challenge result.",
+	})
+	m = comp.(*Model)
+
+	if !m.HasPendingCorrelation("corr-inspector-parent-unscoped") {
+		t.Fatal("expected unscoped inspector row to remain resumable")
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:           "s1",
+		CorrelationID:       "corr-inspector-return-unscoped",
+		ParentCorrelationID: "corr-tester-child-unscoped",
+		TopLevelTransfer:    true,
+		AgentID:             "task_auth_checkout:inspector-pipeline",
+		RuntimeAgentID:      "runtime-inspector",
+		AgentType:           "inspector-pipeline",
+		AgentName:           "Inspector",
+		TaskID:              "task_auth_checkout",
+	})
+	m = comp.(*Model)
+
+	if old := findEntryByCorrelation(m, "corr-inspector-parent-unscoped"); old != nil {
+		t.Fatalf("expected original unscoped inspector correlation to be replaced on child-owner resume, got %+v", old)
+	}
+	resumed := findEntryByCorrelation(m, "corr-inspector-return-unscoped")
+	if resumed == nil {
+		t.Fatal("expected resumed inspector row after task-scoped identity arrived")
+	}
+	if resumed.Content != "Waiting on the tester challenge result." {
+		t.Fatalf("resumed inspector content = %q, want preserved content", resumed.Content)
+	}
+	if resumed.TaskID != "task_auth_checkout" {
+		t.Fatalf("resumed inspector task_id = %q, want task_auth_checkout", resumed.TaskID)
+	}
+	if !resumed.Streaming {
+		t.Fatalf("expected resumed inspector row to be live after child-owner resume, got %+v", resumed)
 	}
 }
 
@@ -1008,7 +1490,7 @@ func TestHandleStreamReroute_SettlesGlobalReviewChallengeRows(t *testing.T) {
 	if status := entry.ToolCalls[0].InterAgent.Status; status != InterAgentToolDone {
 		t.Fatalf("expected global-review challenge row to settle on reroute, got %q", status)
 	}
-	if view := m.View(); strings.Contains(view, deferredParentCompletionStatus) {
+	if view := m.View(); strings.Contains(view, "Waiting for child work to finish...") {
 		t.Fatalf("unexpected deferred child-wait status after global-review reroute: %q", view)
 	}
 }
@@ -2318,6 +2800,106 @@ func TestNestedConsultationStreamAttachesToOriginBranchWithoutCreatingTopLevelEn
 	}
 }
 
+func TestNestedToolCompletion_ClearsToolDerivedChildProgressOverride(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.PushEntry(&ChatEntry{
+		ID:            "architect-origin-progress",
+		Timestamp:     time.Now(),
+		CorrelationID: "corr-parent-nested-progress",
+		Source:        SourceAgent,
+		AgentType:     "architect",
+		Content:       "Checking the supporting evidence.",
+		Height:        -1,
+	})
+
+	comp, _ := m.Update(msg.ToolCallEventMsg{
+		CorrelationID: "corr-parent-nested-progress",
+		ToolCallKey:   "consult-1",
+		ToolName:      "consult_academic_approach",
+		FullArgs:      `{"question":"Is there a cleaner harness structure?"}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	m = comp.(*Model)
+
+	branchRef := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-nested-progress",
+		ParentToolCallKey:   "consult-1",
+		Kind:                "consult",
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-nested-progress",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		BranchRef:     branchRef,
+	})
+	m = comp.(*Model)
+
+	const toolProgress = "Working through this with read file."
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-nested-progress",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		Message:       toolProgress,
+		ToolDerived:   true,
+		BranchRef:     branchRef,
+	})
+	m = comp.(*Model)
+
+	slot := m.nestedStream("corr-child-nested-progress")
+	if slot == nil || slot.retryText != toolProgress || !slot.retryToolDerived {
+		t.Fatalf("expected nested tool-derived progress, got %+v", slot)
+	}
+
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-nested-progress",
+		AgentID:       "academic",
+		ToolCallKey:   "read-1",
+		ToolName:      "read_file",
+		ArgsSummary:   "path=ui/chat/model.go",
+		Phase:         0,
+		StartedAt:     time.Now(),
+		BranchRef:     branchRef,
+	})
+	m = comp.(*Model)
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-nested-progress",
+		AgentID:       "academic",
+		ToolCallKey:   "read-1",
+		ToolName:      "read_file",
+		Phase:         1,
+		Duration:      25 * time.Millisecond,
+		Success:       true,
+		BranchRef:     branchRef,
+	})
+	m = comp.(*Model)
+
+	slot = m.nestedStream("corr-child-nested-progress")
+	if slot == nil {
+		t.Fatal("expected nested stream slot to remain active")
+	}
+	if slot.retryText != "" || slot.retryToolDerived {
+		t.Fatalf("expected nested tool-derived progress override cleared, got retryText=%q toolDerived=%v", slot.retryText, slot.retryToolDerived)
+	}
+
+	origin := findEntryByCorrelation(m, "corr-parent-nested-progress")
+	if origin == nil || len(origin.ToolCalls) != 1 || origin.ToolCalls[0].InterAgent == nil || len(origin.ToolCalls[0].InterAgent.Children) != 1 {
+		t.Fatalf("expected one nested child row, got %+v", origin)
+	}
+	child := origin.ToolCalls[0].InterAgent.Children[0]
+	if len(child.ToolCalls) != 1 || !child.ToolCalls[0].Completed {
+		t.Fatalf("expected completed nested child tool row, got %+v", child.ToolCalls)
+	}
+	if child.ThinkingStatus == toolProgress {
+		t.Fatalf("expected stale nested tool progress status cleared, got %q", child.ThinkingStatus)
+	}
+}
+
 func TestNestedConsultationStreamWaitsForOriginRowInsteadOfCreatingFallbackEntry(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 	m.PushEntry(&ChatEntry{
@@ -2538,8 +3120,8 @@ func TestNestedChildConsultRowsRemainVisibleAfterChildStreamEmitsText(t *testing
 		AgentType:      "architect",
 		Content:        "Architect draft text should stay hidden while the consult runs.",
 		Streaming:      true,
-		ThinkingText:   deferredParentCompletionStatus,
-		ThinkingStatus: deferredParentCompletionStatus,
+		ThinkingText:   "⠋  0.3s",
+		ThinkingStatus: "Waiting on academic consult.",
 		Height:         -1,
 		ToolCalls: []ToolCallRecord{
 			{
@@ -2625,8 +3207,8 @@ func TestNestedChildConsultRowsRemainVisibleAfterChildStreamEmitsText(t *testing
 	m = comp.(*Model)
 
 	view := m.View()
-	if strings.Contains(view, "Architect draft text should stay hidden while the consult runs.") {
-		t.Fatalf("expected parent content to stay hidden while nested consult work is active, got %q", view)
+	if !strings.Contains(view, "Architect draft text should stay hidden while the consult runs.") {
+		t.Fatalf("expected parent content to remain visible while nested consult work is active, got %q", view)
 	}
 	for _, needle := range []string{
 		"academic",
@@ -3639,7 +4221,7 @@ func TestNestedConsultationStreamStartKeepsExistingBranchWhenLaterStartDropsMeta
 	}
 }
 
-func TestHandleStreamComplete_DefersParentCompletionUntilInterAgentChildrenSettle(t *testing.T) {
+func TestHandleStreamComplete_FinalizesParentWhileInterAgentChildrenRemainPending(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 	m.SetSize(96, 24)
 
@@ -3711,31 +4293,31 @@ func TestHandleStreamComplete_DefersParentCompletionUntilInterAgentChildrenSettl
 	})
 	m = comp.(*Model)
 
-	deferred := findEntryByCorrelation(m, entry.CorrelationID)
-	if deferred == nil {
-		t.Fatal("expected deferred parent entry")
+	final := findEntryByCorrelation(m, entry.CorrelationID)
+	if final == nil {
+		t.Fatal("expected completed parent entry")
 	}
-	if !deferred.Streaming {
-		t.Fatalf("expected parent completion to remain deferred while child work is active, got %+v", deferred)
+	if final.Streaming {
+		t.Fatalf("expected parent completion to finalize immediately, got %+v", final)
 	}
-	if deferred.Content != "Architect response is ready." {
-		t.Fatalf("parent content = %q, want authoritative content while completion is deferred", deferred.Content)
+	if final.Content != "Architect response is ready." {
+		t.Fatalf("parent content = %q, want authoritative finalized content", final.Content)
 	}
-	if strings.TrimSpace(deferred.ThinkingText) == "" {
-		t.Fatalf("expected parent thinking footer to remain active while child work is pending, got %+v", deferred)
+	if strings.TrimSpace(final.ThinkingText) != "" || strings.TrimSpace(final.ThinkingStatus) != "" {
+		t.Fatalf("expected parent waiting footer to clear after completion, got %+v", final)
 	}
-	if !strings.Contains(deferred.ThinkingStatus, deferredParentCompletionStatus) {
-		t.Fatalf("expected deferred completion status %q, got %q", deferredParentCompletionStatus, deferred.ThinkingStatus)
+	if slot := m.streamSlot(entry.CorrelationID); slot != nil {
+		t.Fatalf("expected parent stream slot to be cleared after completion, got %+v", slot)
 	}
-	if _, ok := m.streams[entry.CorrelationID]; !ok {
-		t.Fatal("expected parent stream slot to stay alive until child work settles")
+	if !m.HasPendingCorrelation(entry.CorrelationID) {
+		t.Fatal("expected completed parent correlation to remain resumable")
 	}
 	view := m.View()
-	if strings.Contains(view, "Architect response is ready.") {
-		t.Fatalf("expected deferred parent content to stay hidden in the chat view, got %q", view)
+	if !strings.Contains(view, "Architect response is ready.") {
+		t.Fatalf("expected parent content to stay visible in the chat view, got %q", view)
 	}
-	if !strings.Contains(view, deferredParentCompletionStatus) {
-		t.Fatalf("expected deferred parent status footer in the chat view, got %q", view)
+	if !strings.Contains(view, "Still researching source quality.") {
+		t.Fatalf("expected nested child activity to stay visible after parent completion, got %q", view)
 	}
 
 	m.history.UpdateAt(idx, func(e *ChatEntry) {
@@ -3750,66 +4332,53 @@ func TestHandleStreamComplete_DefersParentCompletionUntilInterAgentChildrenSettl
 	})
 	m.syncPendingInterAgentEntry(idx)
 
-	final := findEntryByCorrelation(m, entry.CorrelationID)
+	final = findEntryByCorrelation(m, entry.CorrelationID)
 	if final == nil {
-		t.Fatal("expected finalized parent entry")
+		t.Fatal("expected completed parent entry after child settlement")
 	}
 	if final.Streaming {
-		t.Fatalf("expected parent entry to finalize once child work settles, got %+v", final)
+		t.Fatalf("expected completed parent entry to stay finalized once child settles, got %+v", final)
 	}
-	if strings.TrimSpace(final.ThinkingText) != "" || strings.TrimSpace(final.ThinkingStatus) != "" {
-		t.Fatalf("expected parent thinking footer to clear after deferred completion resolves, got %+v", final)
-	}
-	if _, ok := m.streams[entry.CorrelationID]; ok {
-		t.Fatal("expected deferred parent stream slot to be released once child work settles")
+	if !m.HasPendingCorrelation(entry.CorrelationID) {
+		t.Fatal("expected completed parent correlation to remain resumable for follow-up")
 	}
 }
 
-func TestHandleStreamComplete_DefersParentCompletionWhileNestedChildPendingWithoutVisibleSpinner(t *testing.T) {
+func TestHandleStreamComplete_FinalizesProgressOnlyParentWhileNestedChildPending(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 	m.SetSize(96, 24)
 
 	entry := &ChatEntry{
-		ID:             "architect-parent-deferred-child-pending",
+		ID:             "inspector-parent-deferred-child-pending-no-content",
 		Timestamp:      time.Now(),
-		CorrelationID:  "corr-parent-deferred-child-pending",
+		CorrelationID:  "corr-parent-deferred-no-content",
 		Source:         SourceAgent,
-		AgentType:      "architect",
-		AgentID:        "architect",
-		Content:        "Architect response is ready.",
+		AgentType:      "inspector-pipeline",
+		AgentID:        "task_auth_checkout:inspector-pipeline",
+		Content:        "",
 		Streaming:      true,
 		ThinkingText:   "⠋  2.0s",
-		ThinkingStatus: "Drafting the final recommendation...",
+		ThinkingStatus: "Drafting the closure decision...",
 		Height:         -1,
 		ToolCalls: []ToolCallRecord{
 			{
-				ToolName:    "consult_academic_approach",
-				ToolCallKey: "consult-1",
+				ToolName:    "challenge_agent",
+				ToolCallKey: "challenge-1",
 				Completed:   true,
 				Success:     true,
 				InterAgent: &InterAgentTool{
-					Kind:       InterAgentToolConsult,
-					AgentTypes: []string{"academic"},
-					Summary:    "Fetch official source material.",
+					Kind:       InterAgentToolChallenge,
+					AgentTypes: []string{"tester-pipeline"},
+					Summary:    "Re-run the audit against the corrected workspace.",
 					Status:     InterAgentToolDone,
 					Children: []InterAgentChildActivity{
 						{
-							CorrelationID: "corr-child-academic-pending",
-							AgentType:     "academic",
-							Completed:     false,
-							ToolCalls: []ToolCallRecord{
-								{
-									ToolName:  "approval_guardian",
-									Completed: true,
-									Success:   true,
-									InterAgent: &InterAgentTool{
-										Kind:       InterAgentToolApproval,
-										AgentTypes: []string{"guardian"},
-										Summary:    "Requesting Guardian approval for raw.githubusercontent.com",
-										Status:     InterAgentToolDone,
-									},
-								},
-							},
+							CorrelationID:     "corr-child-tester-pending-no-content",
+							AgentType:         "tester-pipeline",
+							Completed:         false,
+							ThinkingStartedAt: time.Now().Add(-200 * time.Millisecond),
+							ThinkingText:      "⠋  0.2s",
+							ThinkingStatus:    "Running the audit again.",
 						},
 					},
 				},
@@ -3821,12 +4390,11 @@ func TestHandleStreamComplete_DefersParentCompletionWhileNestedChildPendingWitho
 
 	slot := &streamSlot{
 		accumulator:   NewStreamAccumulator(idx),
-		agentID:       "architect",
+		agentID:       "inspector-pipeline",
 		thinkingIdx:   idx,
 		thinkingStart: time.Now().Add(-2 * time.Second),
 		renderState:   &streamRenderState{},
 	}
-	slot.accumulator.Replace(entry.Content)
 	m.streams = map[string]*streamSlot{
 		entry.CorrelationID: slot,
 	}
@@ -3834,41 +4402,270 @@ func TestHandleStreamComplete_DefersParentCompletionWhileNestedChildPendingWitho
 	m.syncPendingInterAgentEntry(idx)
 
 	comp, _ := m.Update(msg.StreamCompleteMsg{
-		SessionID:         "s1",
-		CorrelationID:     entry.CorrelationID,
-		AgentID:           "architect",
-		AgentType:         "architect",
-		AuthoritativeText: entry.Content,
+		SessionID:     "s1",
+		CorrelationID: entry.CorrelationID,
+		AgentID:       entry.AgentID,
+		AgentType:     entry.AgentType,
 	})
 	m = comp.(*Model)
 
-	deferred := findEntryByCorrelation(m, entry.CorrelationID)
-	if deferred == nil {
-		t.Fatal("expected deferred parent entry")
+	final := findEntryByCorrelation(m, entry.CorrelationID)
+	if final == nil {
+		t.Fatal("expected completed progress-only parent entry")
 	}
-	if !deferred.Streaming {
-		t.Fatalf("expected parent completion to remain deferred while child consult is still pending, got %+v", deferred)
+	if final.Streaming {
+		t.Fatalf("expected progress-only parent completion to finalize, got %+v", final)
 	}
-	if _, ok := m.streams[entry.CorrelationID]; !ok {
-		t.Fatal("expected parent stream slot to stay alive while nested child is pending")
+	if strings.TrimSpace(final.ThinkingText) != "" || strings.TrimSpace(final.ThinkingStatus) != "" {
+		t.Fatalf("expected parent waiting footer to clear, got %+v", final)
+	}
+	if slot := m.streamSlot(entry.CorrelationID); slot != nil {
+		t.Fatalf("expected progress-only parent stream slot to be cleared, got %+v", slot)
+	}
+	if !m.HasPendingCorrelation(entry.CorrelationID) {
+		t.Fatal("expected progress-only parent correlation to remain resumable")
+	}
+
+	beforeText := final.ToolCalls[0].InterAgent.Children[0].ThinkingText
+	comp, _ = m.Update(msg.DecorTickMsg{Time: time.Now().Add(600 * time.Millisecond)})
+	m = comp.(*Model)
+	final = findEntryByCorrelation(m, entry.CorrelationID)
+	if final == nil {
+		t.Fatal("expected completed progress-only parent entry after decor tick")
+	}
+	child := final.ToolCalls[0].InterAgent.Children[0]
+	if child.ThinkingText == beforeText {
+		t.Fatalf("expected nested child spinner to continue animating after parent completion, got %q", child.ThinkingText)
+	}
+	if view := m.View(); !strings.Contains(view, "Re-run the audit against the corrected workspace.") {
+		t.Fatalf("expected nested child branch to remain visible, got %q", view)
 	}
 
 	m.history.UpdateAt(idx, func(e *ChatEntry) {
 		child := &e.ToolCalls[0].InterAgent.Children[0]
 		child.Completed = true
+		child.ThinkingText = ""
+		child.ThinkingStatus = ""
 		invalidateChatEntryRender(e)
 	})
 	m.syncPendingInterAgentEntry(idx)
 
-	final := findEntryByCorrelation(m, entry.CorrelationID)
+	final = findEntryByCorrelation(m, entry.CorrelationID)
 	if final == nil {
-		t.Fatal("expected finalized parent entry")
+		t.Fatal("expected completed progress-only parent entry")
 	}
 	if final.Streaming {
-		t.Fatalf("expected parent entry to finalize once child consult completes, got %+v", final)
+		t.Fatalf("expected progress-only parent entry to remain finalized once child challenge completes, got %+v", final)
 	}
-	if _, ok := m.streams[entry.CorrelationID]; ok {
-		t.Fatal("expected deferred parent stream slot to be released once child consult completes")
+	if !m.HasPendingCorrelation(entry.CorrelationID) {
+		t.Fatal("expected progress-only parent correlation to remain resumable for follow-up")
+	}
+}
+
+func TestDecorTick_AnimatesHistoryBackedPendingNestedChildThinking(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.SetSize(96, 24)
+
+	startedAt := time.Now().Add(-200 * time.Millisecond)
+	entry := &ChatEntry{
+		ID:            "inspector-history-backed-child-pending",
+		Timestamp:     startedAt,
+		CorrelationID: "corr-inspector-history-backed-child-pending",
+		Source:        SourceAgent,
+		AgentType:     "inspector-pipeline",
+		AgentID:       "task_auth_checkout:inspector-pipeline",
+		Content:       "Inspector is waiting for the tester handoff.",
+		Height:        -1,
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "challenge_agent",
+				ToolCallKey: "challenge-1",
+				StartedAt:   startedAt,
+				Completed:   true,
+				Success:     true,
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolChallenge,
+					AgentTypes: []string{"tester-pipeline"},
+					Summary:    "Prepare the pipeline tester handoff.",
+					Status:     InterAgentToolDone,
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID:     "corr-history-backed-tester",
+							AgentType:         "tester-pipeline",
+							ThinkingStartedAt: startedAt,
+							ThinkingText:      "⠋  0.2s",
+							ThinkingStatus:    "Waiting for challenge instructions.",
+							ThinkingColor:     "#7dcfff",
+							Completed:         false,
+						},
+					},
+				},
+			},
+		},
+	}
+	m.PushEntry(entry)
+	idx := m.history.Len() - 1
+	m.pendingInterAgent[idx] = struct{}{}
+
+	before := findEntryByCorrelation(m, entry.CorrelationID)
+	if before == nil {
+		t.Fatal("expected pending parent entry")
+	}
+	beforeChild := before.ToolCalls[0].InterAgent.Children[0]
+
+	comp, _ := m.Update(msg.DecorTickMsg{Time: startedAt.Add(900 * time.Millisecond)})
+	m = comp.(*Model)
+
+	after := findEntryByCorrelation(m, entry.CorrelationID)
+	if after == nil {
+		t.Fatal("expected pending parent entry after decor tick")
+	}
+	child := after.ToolCalls[0].InterAgent.Children[0]
+	if child.ThinkingText == beforeChild.ThinkingText {
+		t.Fatalf("expected history-backed child spinner/timer to animate, got %q", child.ThinkingText)
+	}
+	if child.ThinkingStatus != beforeChild.ThinkingStatus {
+		t.Fatalf("expected history-backed child status to be preserved, got %q want %q", child.ThinkingStatus, beforeChild.ThinkingStatus)
+	}
+	if child.ThinkingColor == "" {
+		t.Fatalf("expected history-backed child color to remain active, got %+v", child)
+	}
+	if child.ThinkingStartedAt.IsZero() {
+		t.Fatalf("expected history-backed child thinking start to remain set, got %+v", child)
+	}
+}
+
+func TestHandleStreamStart_ReusesDeferredPipelineWorkerEntryForSameRawAgentID(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.SetSize(96, 24)
+
+	entry := &ChatEntry{
+		ID:             "inspector-parent-reuse-deferred",
+		Timestamp:      time.Now(),
+		CorrelationID:  "corr-old-inspector",
+		Source:         SourceAgent,
+		AgentType:      "inspector-pipeline",
+		AgentID:        "inspector-pipeline",
+		TaskID:         "task_auth_checkout",
+		Content:        "Existing audit context.",
+		Streaming:      true,
+		ThinkingText:   "⠋  1.8s",
+		ThinkingStatus: deferredParentCompletionStatus,
+		Height:         -1,
+	}
+	m.PushEntry(entry)
+	idx := m.history.Len() - 1
+
+	slot := &streamSlot{
+		accumulator:     NewStreamAccumulator(idx),
+		agentID:         "inspector-pipeline",
+		thinkingIdx:     idx,
+		thinkingStart:   time.Now().Add(-2 * time.Second),
+		retryText:       deferredParentCompletionStatus,
+		lastProgressSet: time.Now(),
+		renderState:     &streamRenderState{},
+		deferCompletion: true,
+	}
+	m.streams = map[string]*streamSlot{
+		entry.CorrelationID: slot,
+	}
+	m.viewport.AddStreamState(idx, slot.renderState)
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-new-inspector",
+		AgentID:       "inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		TaskID:        "task_auth_checkout",
+	})
+	m = comp.(*Model)
+
+	if m.history.Len() != 1 {
+		t.Fatalf("history len = %d, want 1 reused entry", m.history.Len())
+	}
+	if _, ok := m.streams["corr-old-inspector"]; ok {
+		t.Fatal("expected old deferred inspector correlation to be replaced")
+	}
+	newSlot := m.streamSlot("corr-new-inspector")
+	if newSlot == nil {
+		t.Fatal("expected new inspector correlation to reuse deferred slot")
+	}
+	if newSlot.accumulator.EntryIndex() != idx {
+		t.Fatalf("reused slot entry index = %d, want %d", newSlot.accumulator.EntryIndex(), idx)
+	}
+	if newSlot.deferCompletion {
+		t.Fatal("expected reused slot to resume active streaming instead of staying deferred")
+	}
+
+	reused := findEntryByCorrelation(m, "corr-new-inspector")
+	if reused == nil {
+		t.Fatal("expected deferred inspector entry correlation to update")
+	}
+	if reused.Content != "Existing audit context." {
+		t.Fatalf("reused entry content = %q, want preserved prior context", reused.Content)
+	}
+	if strings.Contains(reused.ThinkingStatus, deferredParentCompletionStatus) {
+		t.Fatalf("expected deferred waiting status to clear on resumed stream, got %q", reused.ThinkingStatus)
+	}
+}
+
+func TestHandleStreamStart_ReusesDeferredPipelineWorkerEntryAcrossRawAgentIDMismatchWhenVisibleIdentityMatches(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.SetSize(96, 24)
+
+	entry := &ChatEntry{
+		ID:             "inspector-parent-reuse-deferred-raw-id",
+		Timestamp:      time.Now(),
+		CorrelationID:  "corr-old-inspector-raw-id",
+		Source:         SourceAgent,
+		AgentType:      "inspector-pipeline",
+		AgentID:        "inspector-pipeline",
+		TaskID:         "task_auth_checkout",
+		Content:        "Existing audit context.",
+		Streaming:      true,
+		ThinkingText:   "⠋  1.8s",
+		ThinkingStatus: deferredParentCompletionStatus,
+		Height:         -1,
+	}
+	m.PushEntry(entry)
+	idx := m.history.Len() - 1
+
+	slot := &streamSlot{
+		accumulator:     NewStreamAccumulator(idx),
+		agentID:         "inspector-pipeline",
+		thinkingIdx:     idx,
+		thinkingStart:   time.Now().Add(-2 * time.Second),
+		retryText:       deferredParentCompletionStatus,
+		lastProgressSet: time.Now(),
+		renderState:     &streamRenderState{},
+		deferCompletion: true,
+	}
+	m.streams = map[string]*streamSlot{
+		entry.CorrelationID: slot,
+	}
+	m.viewport.AddStreamState(idx, slot.renderState)
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-new-inspector-raw-id",
+		AgentID:       "task_auth_checkout:inspector-pipeline",
+		AgentType:     "inspector-pipeline",
+		TaskID:        "task_auth_checkout",
+	})
+	m = comp.(*Model)
+
+	if m.history.Len() != 1 {
+		t.Fatalf("history len = %d, want 1 reused entry after visible-identity match", m.history.Len())
+	}
+	if _, ok := m.streams["corr-old-inspector-raw-id"]; ok {
+		t.Fatal("expected old deferred inspector correlation to be replaced after visible-identity match")
+	}
+	newSlot := m.streamSlot("corr-new-inspector-raw-id")
+	if newSlot == nil {
+		t.Fatal("expected visible-identity-matched inspector correlation to reuse the deferred slot")
+	}
+	if newSlot.accumulator.EntryIndex() != idx {
+		t.Fatalf("reused slot entry index = %d, want %d", newSlot.accumulator.EntryIndex(), idx)
 	}
 }
 

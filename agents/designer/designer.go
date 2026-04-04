@@ -492,6 +492,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	// Request-scoped cancellable context.
 	reqCtx, cancel := context.WithCancel(d.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
 	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
 		BusProvider:     func() guide.EventBus { return d.bus },
 		SourceAgentID:   func() string { return d.id },
@@ -546,6 +547,12 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		Bus: d.bus, Channels: d.channels,
 		AgentID: d.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
+	protocolTask := shared.DecodePipelineTaskInput(fwd.Input)
+	hadProtocolState := shared.PipelineProtocolStateFromContext(ctx) != nil
+	ctx = shared.WithPipelineTaskProtocolState(ctx, protocolTask)
+	if !hadProtocolState {
+		defer shared.ClosePipelineProtocolState(ctx)
+	}
 	if !fwd.FireAndForget {
 		shared.PublishStreamStart(d.bus, d.channels, ctx, d.id)
 		if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
@@ -589,7 +596,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	respData := result
-	if shared.DecodePipelineTaskInput(fwd.Input) != nil {
+	if protocolTask != nil {
 		respData = shared.BuildPipelineTurnResponse(ctx, result)
 	}
 	resp.Data = respData
@@ -667,8 +674,12 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 
 	userMessage := fwd.Input
 	task := shared.DecodePipelineTaskInput(fwd.Input)
+	hadProtocolState := shared.PipelineProtocolStateFromContext(ctx) != nil
 	ctx = shared.WithPipelineTaskProtocolState(ctx, task)
-	defer shared.ClosePipelineProtocolState(ctx)
+	if !hadProtocolState {
+		defer shared.ClosePipelineProtocolState(ctx)
+	}
+	ctx = shared.WithPipelineTurnBaseline(ctx)
 	contract := (*shared.TaskExecutionContract)(nil)
 	if task != nil {
 		contract = shared.BuildTaskExecutionContract(task)

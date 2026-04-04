@@ -60,3 +60,41 @@ func TestWaitForPendingSyncResponse_UsesInactivityTimeout(t *testing.T) {
 		t.Fatal("timed out waiting for response")
 	}
 }
+
+func TestWaitForPendingSyncResponse_AllowsLongSilenceAfterChildStarts(t *testing.T) {
+	wait := NewPendingSyncWait()
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := WaitForPendingSyncResponse(ctx, `consultation to "academic"`, 20*time.Millisecond, wait)
+		done <- err
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	wait.Activity <- struct{}{}
+	time.Sleep(60 * time.Millisecond)
+	wait.Response <- &guide.Message{Type: guide.MessageTypeResponse, CorrelationID: "corr-1"}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitForPendingSyncResponse() error = %v, want nil", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("timed out waiting for response")
+	}
+}
+
+func TestWaitForPendingSyncResponse_TimesOutBeforeChildStarts(t *testing.T) {
+	wait := NewPendingSyncWait()
+
+	_, err := WaitForPendingSyncResponse(context.Background(), `consultation to "academic"`, 15*time.Millisecond, wait)
+	if err == nil {
+		t.Fatal("expected startup inactivity timeout error")
+	}
+	if err.Error() == "" {
+		t.Fatal("expected non-empty timeout error")
+	}
+}

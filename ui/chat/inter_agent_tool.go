@@ -15,17 +15,24 @@ const (
 
 func toolCallHasActiveVisual(tc ToolCallRecord) bool {
 	if tc.InterAgent != nil {
-		if tc.InterAgent.Status == InterAgentToolPending {
-			return true
-		}
-		for i := range tc.InterAgent.Children {
-			if interAgentChildHasActiveVisual(&tc.InterAgent.Children[i]) {
-				return true
-			}
-		}
-		return false
+		return interAgentToolHasActiveVisual(tc.InterAgent)
 	}
 	return !tc.Completed
+}
+
+func interAgentToolHasActiveVisual(row *InterAgentTool) bool {
+	if row == nil {
+		return false
+	}
+	if row.Status == InterAgentToolPending {
+		return true
+	}
+	for i := range row.Children {
+		if interAgentChildHasActiveVisual(&row.Children[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 func entryHasPendingInterAgentToolCalls(entry *ChatEntry) bool {
@@ -36,23 +43,11 @@ func entryHasPendingInterAgentToolCalls(entry *ChatEntry) bool {
 		if call.InterAgent == nil {
 			continue
 		}
-		if call.InterAgent.Status == InterAgentToolPending {
+		if interAgentToolHasActiveVisual(call.InterAgent) {
 			return true
-		}
-		for i := range call.InterAgent.Children {
-			if interAgentChildHasActiveVisual(&call.InterAgent.Children[i]) {
-				return true
-			}
 		}
 	}
 	return false
-}
-
-func shouldDeferEntryCompletion(entry *ChatEntry) bool {
-	if entry == nil {
-		return false
-	}
-	return entryHasPendingInterAgentToolCalls(entry)
 }
 
 func interAgentChildHasActiveVisual(child *InterAgentChildActivity) bool {
@@ -331,7 +326,7 @@ func interAgentOriginUpdate(ev msg.ToolCallEventMsg, currentAgentType string) (*
 		status := stringFromMap(output, "status")
 		return &InterAgentTool{
 			Kind:      InterAgentToolChallenge,
-			ThreadKey: pipelineThreadPrefix + challengeID,
+			ThreadKey: responseThreadKey(ev.ToolName, args, output, challengeID),
 			AgentTypes: normalizeAgentTypes([]string{firstNonEmptyString(
 				stringFromMap(output, "responding_agent"),
 				currentAgentType,
@@ -350,7 +345,7 @@ func interAgentOriginUpdate(ev msg.ToolCallEventMsg, currentAgentType string) (*
 		}
 		return &InterAgentTool{
 			Kind:       InterAgentToolChallenge,
-			ThreadKey:  pipelineThreadPrefix + challengeID,
+			ThreadKey:  responseThreadKey(ev.ToolName, args, output, challengeID),
 			AgentTypes: normalizeAgentTypes([]string{currentAgentType}),
 			Summary: normalizeInlineText(firstNonEmptyString(
 				stringFromMap(args, "summary"),
@@ -365,6 +360,23 @@ func interAgentOriginUpdate(ev msg.ToolCallEventMsg, currentAgentType string) (*
 	default:
 		return nil, false
 	}
+}
+
+func responseThreadKey(toolName string, args, output map[string]any, challengeID string) string {
+	if explicit := firstNonEmptyString(stringFromMap(output, "thread_key"), stringFromMap(args, "thread_key")); explicit != "" {
+		return explicit
+	}
+	scope := firstNonEmptyString(stringFromMap(output, "protocol_scope"), stringFromMap(args, "protocol_scope"))
+	switch strings.TrimSpace(scope) {
+	case "global_review":
+		return globalReviewThreadPrefix + challengeID
+	case "pipeline":
+		return pipelineThreadPrefix + challengeID
+	}
+	if toolName == "validate_work" || toolName == "process_validation" {
+		return pipelineThreadPrefix + challengeID
+	}
+	return globalReviewThreadPrefix + challengeID
 }
 
 func buildInterAgentCompletionFallback(ev msg.ToolCallEventMsg, currentAgentType string) (ToolCallRecord, bool) {

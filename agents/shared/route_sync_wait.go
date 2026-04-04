@@ -63,8 +63,13 @@ func WaitForPendingSyncResponse(
 		inactivityTimeout = DefaultConsultationTimeout
 	}
 
-	timer := time.NewTimer(inactivityTimeout)
-	defer timer.Stop()
+	response, started, err := waitForPendingSyncStart(ctx, subject, inactivityTimeout, wait)
+	if err != nil {
+		return nil, err
+	}
+	if response != nil || !started {
+		return response, nil
+	}
 
 	for {
 		select {
@@ -73,15 +78,43 @@ func WaitForPendingSyncResponse(
 		case response := <-wait.Response:
 			return response, nil
 		case <-wait.Activity:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(inactivityTimeout)
-		case <-timer.C:
-			return nil, WrapLeaseTimeoutError(subject, inactivityTimeout, context.DeadlineExceeded)
+			// Once the child route has started, trust the parent context to own
+			// lifetime. Long quiet periods should not be treated as failure.
 		}
 	}
+}
+
+func waitForPendingSyncStart(
+	ctx context.Context,
+	subject string,
+	inactivityTimeout time.Duration,
+	wait *PendingSyncWait,
+) (*guide.Message, bool, error) {
+	var (
+		response *guide.Message
+		started  bool
+	)
+
+	err := RunWithContextLease(ctx, ContextLeaseConfig{
+		AttemptTimeout: inactivityTimeout,
+		MaxRefreshes:   DefaultConsultationLeaseRefreshes,
+		DeadlineGuard:  DefaultContextLeaseDeadlineGuard,
+	}, func(waitCtx context.Context) error {
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case response = <-wait.Response:
+			return nil
+		case <-wait.Activity:
+			started = true
+			return nil
+		}
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+		return nil, false, WrapLeaseTimeoutError(subject, inactivityTimeout, err)
+	}
+	return response, started, nil
 }

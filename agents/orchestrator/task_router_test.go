@@ -812,6 +812,125 @@ func TestTaskRouter_PublishUserVisibleRoute_MirrorsGlobalFollowupToTUI(t *testin
 	}
 }
 
+func TestTaskRouter_PublishUserVisibleRoute_MirrorsNestedVisibleChildStreamsToTUI(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+
+	tuiStreamCh := make(chan *guide.StreamResponse, 4)
+	tuiSub, err := bus.SubscribeAsync(guide.TopicResponses("tui", "tui"), func(msg *guide.Message) error {
+		stream, ok := msg.GetStreamResponse()
+		if !ok || stream == nil {
+			return nil
+		}
+		select {
+		case tuiStreamCh <- stream:
+		default:
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer tuiSub.Unsubscribe()
+
+	req := &guide.RouteRequest{
+		CorrelationID:   "ot_followup_nested_1",
+		Input:           "Audit the merged task result.",
+		TargetAgentID:   "inspector",
+		ExplicitTarget:  true,
+		SourceAgentID:   "orchestrator",
+		SourceAgentName: "orchestrator",
+		SessionID:       "test-session",
+		Metadata: map[string]any{
+			"agent_type":          "inspector",
+			"task_id":             "task-1",
+			"task_name":           "Hello CLI",
+			"task_slug":           "hello-cli",
+			"ot_handoff_followup": true,
+		},
+		Timestamp: time.Now(),
+	}
+	require.NoError(t, router.PublishUserVisibleRoute(req))
+
+	childMsg := &guide.Message{
+		ID:            "stream-visible-child-1",
+		CorrelationID: "corr-child-academic",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "corr-child-academic",
+			RespondingAgentID: "academic",
+			Metadata: map[string]any{
+				"chat_nested_branch":         true,
+				"chat_parent_correlation_id": req.CorrelationID,
+				"chat_parent_tool_call_key":  "consult-academic-1",
+				"chat_inter_agent_kind":      agentshared.InterAgentToolEventKindConsult,
+				"agent_type":                 "academic",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Gathering stronger alternatives"},
+			},
+		},
+		SourceAgentID: "academic",
+		TargetAgentID: "orchestrator",
+		Timestamp:     time.Now(),
+	}
+	require.True(t, router.DeliverResponse(childMsg))
+
+	select {
+	case mirrored := <-tuiStreamCh:
+		require.NotNil(t, mirrored)
+		assert.Equal(t, "tui", mirrored.TargetAgentID)
+		assert.Equal(t, "academic", mirrored.RespondingAgentID)
+		assert.Equal(t, req.Metadata["task_id"], mirrored.Metadata["task_id"])
+		assert.Equal(t, req.Metadata["task_slug"], mirrored.Metadata["task_slug"])
+		assert.Equal(t, req.CorrelationID, mirrored.Metadata["chat_parent_correlation_id"])
+		assert.Equal(t, "consult-academic-1", mirrored.Metadata["chat_parent_tool_call_key"])
+		assert.Equal(t, agentshared.InterAgentToolEventKindConsult, mirrored.Metadata["chat_inter_agent_kind"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected nested child stream to be mirrored to the TUI response topic")
+	}
+
+	grandchildMsg := &guide.Message{
+		ID:            "stream-visible-grandchild-1",
+		CorrelationID: "corr-grandchild-librarian",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "corr-grandchild-librarian",
+			RespondingAgentID: "librarian",
+			Metadata: map[string]any{
+				"chat_nested_branch":         true,
+				"chat_parent_correlation_id": "corr-child-academic",
+				"chat_parent_tool_call_key":  "consult-librarian-1",
+				"chat_inter_agent_kind":      agentshared.InterAgentToolEventKindConsult,
+				"agent_type":                 "librarian",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Checking prior repository patterns"},
+			},
+		},
+		SourceAgentID: "librarian",
+		TargetAgentID: "orchestrator",
+		Timestamp:     time.Now(),
+	}
+	require.True(t, router.DeliverResponse(grandchildMsg))
+
+	select {
+	case mirrored := <-tuiStreamCh:
+		require.NotNil(t, mirrored)
+		assert.Equal(t, "tui", mirrored.TargetAgentID)
+		assert.Equal(t, "librarian", mirrored.RespondingAgentID)
+		assert.Equal(t, req.Metadata["task_id"], mirrored.Metadata["task_id"])
+		assert.Equal(t, "corr-child-academic", mirrored.Metadata["chat_parent_correlation_id"])
+		assert.Equal(t, "consult-librarian-1", mirrored.Metadata["chat_parent_tool_call_key"])
+		assert.Equal(t, agentshared.InterAgentToolEventKindConsult, mirrored.Metadata["chat_inter_agent_kind"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected nested grandchild stream to be mirrored to the TUI response topic")
+	}
+}
+
 func TestTaskRouter_PublishUserVisibleRoute_QueuesOTFollowupsPerReviewer(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
@@ -1051,6 +1170,528 @@ func TestTaskRouter_DeliverResponse_ReconcilesUntrackedProtocolTerminalOT(t *tes
 		assert.Equal(t, "Pipeline accepted and ready for OT merge.", output["summary"])
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected recovered protocol terminal update")
+	}
+}
+
+func TestTaskRouter_DeliverResponse_RejectsProcessedOnlyProtocolTurn(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+
+	reqCh := make(chan *guide.RouteRequest, 4)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.Metadata["pipeline_task"] != true {
+			return nil
+		}
+		reqCh <- req
+		return nil
+	})
+	require.NoError(t, err)
+	defer reqSub.Unsubscribe()
+
+	updateCh := make(chan *PipelineUpdate, 4)
+	updateSub, err := bus.SubscribeAsync("pipeline.update."+agentshared.PipelineAgentInspector, func(msg *guide.Message) error {
+		update, ok := msg.Payload.(*PipelineUpdate)
+		if !ok || update == nil {
+			return nil
+		}
+		updateCh <- update
+		return nil
+	})
+	require.NoError(t, err)
+	defer updateSub.Unsubscribe()
+
+	task := testTask()
+	task.TargetAgentID = pipelineWorkerTargetAgentID(task.TaskID, task.AgentType)
+	task.Context = map[string]any{
+		"session_dir": t.TempDir(),
+		"task_slug":   "hello-cli",
+		"task_name":   "Hello CLI",
+	}
+	require.NoError(t, router.RouteWithLifecycle(task, nil))
+
+	select {
+	case <-reqCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial protocol route")
+	}
+	select {
+	case <-updateCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial running update")
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:     "pipe_protocol_processed",
+		Success:           true,
+		RespondingAgentID: PipelineWorkerRoutingTarget(task.TaskID, agentshared.PipelineAgentInspector),
+		Data: &agentshared.PipelineTurnResponse{
+			Processed: []agentshared.PipelineValidationProcessing{
+				{
+					ChallengeID: "challenge-1",
+					AgentType:   agentshared.PipelineAgentInspector,
+					Decision:    agentshared.PipelineValidationDecisionAccept,
+					Summary:     "Accepted tester validation.",
+				},
+			},
+		},
+	}
+	msg := guide.NewResponseMessage("", resp)
+	msg.CorrelationID = resp.CorrelationID
+	msg.Metadata = map[string]any{
+		"pipeline_task": true,
+		"session_id":    task.SessionID,
+		"session_dir":   task.Context["session_dir"],
+		"dag_id":        task.DAGID,
+		"node_id":       task.NodeID,
+		"task_id":       task.TaskID,
+		"task_slug":     task.Context["task_slug"],
+		"task_name":     task.Context["task_name"],
+		"agent_type":    agentshared.PipelineAgentInspector,
+	}
+
+	require.True(t, router.DeliverResponse(msg))
+
+	select {
+	case update := <-updateCh:
+		require.NotNil(t, update)
+		assert.Equal(t, "failed", update.Status)
+		assert.Equal(t, agentshared.PipelineAgentInspector, update.AgentType)
+		assert.Contains(t, update.Error, "processed validation but did not record the next pipeline step")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for processed-only protocol failure update")
+	}
+
+	select {
+	case req := <-reqCh:
+		t.Fatalf("unexpected protocol follow-up route published for processed-only protocol turn: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestTaskRouter_PublishProtocolRoute_SuppressesDuplicateActiveTarget(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	router := testRouter(bus, testScope())
+	reqCh := make(chan *guide.RouteRequest, 2)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.Metadata["pipeline_task"] != true {
+			return nil
+		}
+		reqCh <- req
+		return nil
+	})
+	require.NoError(t, err)
+	defer reqSub.Unsubscribe()
+
+	target := PipelineWorkerRoutingTarget("task-1", agentshared.PipelineAgentTester)
+	req1 := &guide.RouteRequest{
+		CorrelationID:  "pipe_active_tester",
+		TargetAgentID:  target,
+		ExplicitTarget: true,
+		SourceAgentID:  "orchestrator",
+		SessionID:      "test-session",
+		Timestamp:      time.Now().UTC(),
+		Metadata: map[string]any{
+			"pipeline_task": true,
+			"task_id":       "task-1",
+			"agent_type":    agentshared.PipelineAgentTester,
+		},
+	}
+	req2 := &guide.RouteRequest{
+		CorrelationID:  "pipe_duplicate_tester",
+		TargetAgentID:  target,
+		ExplicitTarget: true,
+		SourceAgentID:  "orchestrator",
+		SessionID:      "test-session",
+		Timestamp:      time.Now().Add(1 * time.Second).UTC(),
+		Metadata: map[string]any{
+			"pipeline_task": true,
+			"task_id":       "task-1",
+			"agent_type":    agentshared.PipelineAgentTester,
+		},
+	}
+
+	published, err := router.publishProtocolRoute(req1)
+	require.NoError(t, err)
+	require.True(t, published)
+	select {
+	case got := <-reqCh:
+		require.NotNil(t, got)
+		assert.Equal(t, req1.CorrelationID, got.CorrelationID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first protocol route")
+	}
+
+	published, err = router.publishProtocolRoute(req2)
+	require.NoError(t, err)
+	assert.False(t, published)
+
+	select {
+	case got := <-reqCh:
+		t.Fatalf("unexpected duplicate protocol route published: %+v", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	assert.Equal(t, req1.CorrelationID, router.protocolRouteActive[target])
+	_, ok := router.protocolRouteCorr[req2.CorrelationID]
+	assert.False(t, ok)
+}
+
+func TestTaskRouter_DeliverResponse_ProcessedWithoutActionFailsProtocolTurn(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+
+	reqCh := make(chan *guide.RouteRequest, 4)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.Metadata["pipeline_task"] != true {
+			return nil
+		}
+		reqCh <- req
+		return nil
+	})
+	require.NoError(t, err)
+	defer reqSub.Unsubscribe()
+
+	updateCh := make(chan *PipelineUpdate, 4)
+	updateSub, err := bus.SubscribeAsync("pipeline.update."+agentshared.PipelineAgentInspector, func(msg *guide.Message) error {
+		update, ok := msg.Payload.(*PipelineUpdate)
+		if !ok || update == nil {
+			return nil
+		}
+		updateCh <- update
+		return nil
+	})
+	require.NoError(t, err)
+	defer updateSub.Unsubscribe()
+
+	task := testTask()
+	task.TargetAgentID = pipelineWorkerTargetAgentID(task.TaskID, task.AgentType)
+	task.Context = map[string]any{
+		"session_dir": t.TempDir(),
+		"task_slug":   "hello-cli",
+		"task_name":   "Hello CLI",
+	}
+	require.NoError(t, router.RouteWithLifecycle(task, nil))
+
+	select {
+	case <-reqCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial protocol route")
+	}
+	select {
+	case <-updateCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial running update")
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:     "pipe_protocol_processed",
+		Success:           true,
+		RespondingAgentID: PipelineWorkerRoutingTarget(task.TaskID, agentshared.PipelineAgentInspector),
+		Data: &agentshared.PipelineTurnResponse{
+			Processed: []agentshared.PipelineValidationProcessing{
+				{
+					ChallengeID: "challenge-1",
+					AgentType:   agentshared.PipelineAgentInspector,
+					Decision:    agentshared.PipelineValidationDecisionClarify,
+					Summary:     "Tester needs to repair the returned file.",
+				},
+			},
+		},
+	}
+	msg := guide.NewResponseMessage("", resp)
+	msg.CorrelationID = resp.CorrelationID
+	msg.Metadata = map[string]any{
+		"pipeline_task": true,
+		"session_id":    task.SessionID,
+		"session_dir":   task.Context["session_dir"],
+		"dag_id":        task.DAGID,
+		"node_id":       task.NodeID,
+		"task_id":       task.TaskID,
+		"task_slug":     task.Context["task_slug"],
+		"task_name":     task.Context["task_name"],
+		"agent_type":    agentshared.PipelineAgentInspector,
+	}
+
+	require.True(t, router.DeliverResponse(msg))
+
+	select {
+	case update := <-updateCh:
+		require.NotNil(t, update)
+		assert.Equal(t, "failed", update.Status)
+		assert.Equal(t, agentshared.PipelineAgentInspector, update.AgentType)
+		assert.Contains(t, update.Error, "processed validation but did not record the next pipeline step")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for malformed processed-turn failure update")
+	}
+
+	select {
+	case req := <-reqCh:
+		t.Fatalf("unexpected protocol follow-up route published for malformed processed turn: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestTaskRouterPauseActiveRoutesPublishesPaceActionsForPendingAndProtocolRoutes(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	router := testRouter(bus, testScope())
+
+	pendingTask := testTask()
+	pendingTask.TargetAgentID = pipelineWorkerTargetAgentID(pendingTask.TaskID, pendingTask.AgentType)
+	router.registerPending("pipe_pending_engineer", pendingTask)
+
+	protocolReq := &guide.RouteRequest{
+		CorrelationID:  "pipe_active_tester",
+		TargetAgentID:  PipelineWorkerRoutingTarget("task-1", agentshared.PipelineAgentTester),
+		ExplicitTarget: true,
+		SourceAgentID:  "orchestrator",
+		SessionID:      "test-session",
+		Timestamp:      time.Now().UTC(),
+		Metadata: map[string]any{
+			"pipeline_task": true,
+			"dag_id":        "dag-1",
+			"node_id":       "node-1",
+			"task_id":       "task-1",
+			"agent_type":    agentshared.PipelineAgentTester,
+		},
+	}
+	published, err := router.publishProtocolRoute(protocolReq)
+	require.NoError(t, err)
+	require.True(t, published)
+
+	actionCh := make(chan *guide.ActionRequest, 4)
+	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetActionRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		actionCh <- req
+		return nil
+	})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	count := router.PauseActiveRoutes("test-session", "", "validation hold active")
+	require.Equal(t, 2, count)
+
+	received := make(map[string]*guide.ActionRequest, 2)
+	deadline := time.After(2 * time.Second)
+	for len(received) < 2 {
+		select {
+		case req := <-actionCh:
+			received[req.CorrelationID] = req
+		case <-deadline:
+			t.Fatalf("timed out waiting for pace actions; received=%d", len(received))
+		}
+	}
+
+	engineerReq := received["pipe_pending_engineer"]
+	require.NotNil(t, engineerReq)
+	assert.Equal(t, "pace", engineerReq.Action)
+	assert.Equal(t, "paused", engineerReq.Data.(map[string]any)["pace"])
+	assert.Equal(t, pendingTask.TargetAgentID, engineerReq.TargetAgentID)
+
+	testerReq := received["pipe_active_tester"]
+	require.NotNil(t, testerReq)
+	assert.Equal(t, "pace", testerReq.Action)
+	assert.Equal(t, "paused", testerReq.Data.(map[string]any)["pace"])
+	assert.Equal(t, protocolReq.TargetAgentID, testerReq.TargetAgentID)
+}
+
+func TestTaskRouter_DeliverResponse_AcknowledgesTopLevelHandoffWithoutRepublishing(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+
+	reqCh := make(chan *guide.RouteRequest, 4)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.Metadata["pipeline_task"] != true {
+			return nil
+		}
+		reqCh <- req
+		return nil
+	})
+	require.NoError(t, err)
+	defer reqSub.Unsubscribe()
+
+	updateCh := make(chan *PipelineUpdate, 4)
+	updateSub, err := bus.SubscribeAsync("pipeline.update."+agentshared.PipelineAgentInspector, func(msg *guide.Message) error {
+		update, ok := msg.Payload.(*PipelineUpdate)
+		if !ok || update == nil {
+			return nil
+		}
+		updateCh <- update
+		return nil
+	})
+	require.NoError(t, err)
+	defer updateSub.Unsubscribe()
+
+	task := testTask()
+	task.TargetAgentID = pipelineWorkerTargetAgentID(task.TaskID, task.AgentType)
+	task.Context = map[string]any{
+		"session_dir": t.TempDir(),
+		"task_slug":   "hello-cli",
+		"task_name":   "Hello CLI",
+	}
+	require.NoError(t, router.RouteWithLifecycle(task, nil))
+
+	select {
+	case <-reqCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial protocol route")
+	}
+	select {
+	case <-updateCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial running update")
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:     "pipe_protocol_handoff",
+		Success:           true,
+		RespondingAgentID: PipelineWorkerRoutingTarget(task.TaskID, agentshared.PipelineAgentInspector),
+		Data: &agentshared.PipelineTurnResponse{
+			Action: &agentshared.PipelineTurnAction{
+				Type:         agentshared.PipelineProtocolActionHandoff,
+				AgentType:    agentshared.PipelineAgentInspector,
+				TargetAgents: []string{agentshared.PipelineAgentTester},
+				Mode:         agentshared.PipelineTurnModeSingle,
+				Reason:       "testing should verify the criteria next",
+				Request:      "Author the failing tests for the agreed contract.",
+			},
+		},
+	}
+	msg := guide.NewResponseMessage("", resp)
+	msg.CorrelationID = resp.CorrelationID
+	msg.Metadata = map[string]any{
+		"pipeline_task": true,
+		"session_id":    task.SessionID,
+		"session_dir":   task.Context["session_dir"],
+		"dag_id":        task.DAGID,
+		"node_id":       task.NodeID,
+		"task_id":       task.TaskID,
+		"task_slug":     task.Context["task_slug"],
+		"task_name":     task.Context["task_name"],
+		"agent_type":    agentshared.PipelineAgentInspector,
+	}
+
+	require.True(t, router.DeliverResponse(msg))
+
+	select {
+	case req := <-reqCh:
+		t.Fatalf("unexpected orchestrator-published follow-up route for explicit handoff action: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	select {
+	case update := <-updateCh:
+		t.Fatalf("unexpected orchestrator-published running update for explicit handoff action: %+v", update)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestTaskRouter_DeliverResponse_EmptyProtocolTurnFails(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+
+	reqCh := make(chan *guide.RouteRequest, 4)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.Metadata["pipeline_task"] != true {
+			return nil
+		}
+		reqCh <- req
+		return nil
+	})
+	require.NoError(t, err)
+	defer reqSub.Unsubscribe()
+
+	updateCh := make(chan *PipelineUpdate, 4)
+	updateSub, err := bus.SubscribeAsync("pipeline.update."+agentshared.PipelineAgentInspector, func(msg *guide.Message) error {
+		update, ok := msg.Payload.(*PipelineUpdate)
+		if !ok || update == nil {
+			return nil
+		}
+		updateCh <- update
+		return nil
+	})
+	require.NoError(t, err)
+	defer updateSub.Unsubscribe()
+
+	task := testTask()
+	task.TargetAgentID = pipelineWorkerTargetAgentID(task.TaskID, task.AgentType)
+	task.Context = map[string]any{
+		"session_dir": t.TempDir(),
+		"task_slug":   "hello-cli",
+		"task_name":   "Hello CLI",
+	}
+	require.NoError(t, router.RouteWithLifecycle(task, nil))
+
+	select {
+	case <-reqCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial protocol route")
+	}
+	select {
+	case <-updateCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial running update")
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:     "pipe_protocol_empty",
+		Success:           true,
+		RespondingAgentID: PipelineWorkerRoutingTarget(task.TaskID, agentshared.PipelineAgentInspector),
+		Data:              &agentshared.PipelineTurnResponse{},
+	}
+	msg := guide.NewResponseMessage("", resp)
+	msg.CorrelationID = resp.CorrelationID
+	msg.Metadata = map[string]any{
+		"pipeline_task": true,
+		"session_id":    task.SessionID,
+		"session_dir":   task.Context["session_dir"],
+		"dag_id":        task.DAGID,
+		"node_id":       task.NodeID,
+		"task_id":       task.TaskID,
+		"task_slug":     task.Context["task_slug"],
+		"task_name":     task.Context["task_name"],
+		"agent_type":    agentshared.PipelineAgentInspector,
+	}
+
+	require.True(t, router.DeliverResponse(msg))
+
+	select {
+	case update := <-updateCh:
+		require.NotNil(t, update)
+		assert.Equal(t, "failed", update.Status)
+		assert.Equal(t, agentshared.PipelineAgentInspector, update.AgentType)
+		assert.Contains(t, update.Error, "ended without recording the next pipeline step")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for malformed empty-turn failure update")
+	}
+
+	select {
+	case req := <-reqCh:
+		t.Fatalf("unexpected protocol follow-up route published for malformed empty turn: %+v", req)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 

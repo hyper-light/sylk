@@ -3206,7 +3206,7 @@ func (g *Guide) publishRerouteEvent(correlationID, sourceAgentID string, reroute
 		CorrelationID:     correlationID,
 		RespondingAgentID: "guide",
 		TargetAgentID:     sourceAgentID,
-		Metadata:          g.mergedStreamRelayMetadata(correlationID, nil),
+		Metadata:          g.mergedStreamRelayMetadata(correlationID, "guide", "Guide", nil),
 		Event:             event,
 	}
 	msg := &Message{
@@ -3713,7 +3713,7 @@ func (g *Guide) publishRetryStatus(correlationID, sourceAgentID string, status R
 		CorrelationID:     correlationID,
 		RespondingAgentID: g.agentID,
 		TargetAgentID:     sourceAgentID,
-		Metadata:          g.mergedStreamRelayMetadata(correlationID, nil),
+		Metadata:          g.mergedStreamRelayMetadata(correlationID, g.agentID, "Guide", nil),
 		Event:             event,
 	}
 	busMsg := &Message{
@@ -3894,7 +3894,7 @@ func (g *Guide) publishStreamEventForResponder(correlationID, sourceAgentID, res
 		CorrelationID:     correlationID,
 		RespondingAgentID: responderID,
 		TargetAgentID:     sourceAgentID,
-		Metadata:          g.mergedStreamRelayMetadata(correlationID, nil),
+		Metadata:          g.mergedStreamRelayMetadata(correlationID, responderID, "", nil),
 		Event:             event,
 	}
 	msg := &Message{
@@ -4607,19 +4607,95 @@ func (g *Guide) forwardMessage(targetAgentID string, forwarded *ForwardedRequest
 func (g *Guide) publishResponseToSource(sourceAgentID string, resp *RouteResponse, pending *PendingRequest) error {
 	respMsg := NewResponseMessage(generateMessageID(), resp)
 	respMsg.TargetAgentID = sourceAgentID
-	respMsg.Metadata = relayResponseMetadata(pending)
+	respMsg.Metadata = g.relayResponseMetadata(pending, resp)
 	return g.bus.Publish(g.agentResponseTopic(sourceAgentID), respMsg)
 }
 
-func relayResponseMetadata(pending *PendingRequest) map[string]any {
-	metadata := map[string]any{"_guide_relayed": true}
-	if pending == nil || pending.Request == nil || len(pending.Request.Metadata) == 0 {
-		return metadata
+func filteredRelayContextMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return nil
 	}
-	for key, value := range pending.Request.Metadata {
-		metadata[key] = value
+	filtered := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		switch strings.TrimSpace(key) {
+		case "agent_type", "agent_name", "runtime_agent_id":
+			continue
+		default:
+			filtered[key] = value
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
+}
+
+func (g *Guide) derivedResponderAgentType(responderID string) string {
+	responderID = strings.TrimSpace(responderID)
+	if responderID == "" {
+		return ""
+	}
+	if strings.EqualFold(responderID, g.agentID) || strings.EqualFold(responderID, "guide") {
+		return "guide"
+	}
+	if g == nil || g.typeIndex == nil {
+		return responderID
+	}
+	return strings.TrimSpace(g.resolveActivationType(responderID))
+}
+
+func (g *Guide) derivedResponderRuntimeID(responderID, explicitRuntimeID string) string {
+	explicitRuntimeID = strings.TrimSpace(explicitRuntimeID)
+	if explicitRuntimeID != "" {
+		return explicitRuntimeID
+	}
+	responderID = strings.TrimSpace(responderID)
+	if responderID == "" {
+		return ""
+	}
+	responderType := strings.TrimSpace(g.derivedResponderAgentType(responderID))
+	if responderType == "" || strings.EqualFold(responderID, responderType) {
+		return ""
+	}
+	return responderID
+}
+
+func (g *Guide) applyResponderIdentityMetadata(metadata map[string]any, responderID, responderName, explicitRuntimeID string) map[string]any {
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	delete(metadata, "runtime_agent_id")
+	responderID = strings.TrimSpace(responderID)
+	responderType := g.derivedResponderAgentType(responderID)
+	if responderType != "" {
+		metadata["agent_type"] = responderType
+	}
+	if strings.EqualFold(responderID, g.agentID) || strings.EqualFold(responderID, "guide") {
+		responderName = "Guide"
+	}
+	responderName = strings.TrimSpace(firstNonEmptyString(responderName, g.resolveAgentDisplayName(responderID)))
+	if responderName != "" {
+		metadata["agent_name"] = responderName
+	}
+	if runtimeID := g.derivedResponderRuntimeID(responderID, explicitRuntimeID); runtimeID != "" &&
+		!strings.EqualFold(responderID, g.agentID) &&
+		!strings.EqualFold(responderID, "guide") {
+		metadata["runtime_agent_id"] = runtimeID
 	}
 	return metadata
+}
+
+func (g *Guide) relayResponseMetadata(pending *PendingRequest, resp *RouteResponse) map[string]any {
+	metadata := map[string]any{"_guide_relayed": true}
+	if pending != nil && pending.Request != nil {
+		for key, value := range filteredRelayContextMetadata(pending.Request.Metadata) {
+			metadata[key] = value
+		}
+	}
+	if resp == nil {
+		return metadata
+	}
+	return g.applyResponderIdentityMetadata(metadata, resp.RespondingAgentID, resp.RespondingAgentName, "")
 }
 
 func cloneMetadata(metadata map[string]any) map[string]any {
@@ -4642,9 +4718,34 @@ func mergeMetadata(base, overlay map[string]any) map[string]any {
 		merged = make(map[string]any, len(overlay))
 	}
 	for key, value := range overlay {
+		if !metadataValueCarriesContinuity(value) {
+			if _, exists := merged[key]; exists {
+				continue
+			}
+			continue
+		}
 		merged[key] = value
 	}
 	return merged
+}
+
+func metadataValueCarriesContinuity(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case bool:
+		return typed
+	case []any:
+		return len(typed) > 0
+	case []string:
+		return len(typed) > 0
+	case map[string]any:
+		return len(typed) > 0
+	default:
+		return true
+	}
 }
 
 func (g *Guide) pendingForCorrelation(correlationID string) *PendingRequest {
@@ -4661,16 +4762,17 @@ func (g *Guide) pendingForCorrelation(correlationID string) *PendingRequest {
 	return g.completedPending(correlationID)
 }
 
-func streamRelayMetadata(pending *PendingRequest) map[string]any {
-	if pending == nil || pending.Request == nil {
-		return nil
+func (g *Guide) mergedStreamRelayMetadata(correlationID, responderID, responderName string, current map[string]any) map[string]any {
+	pending := g.pendingForCorrelation(correlationID)
+	var base map[string]any
+	if pending != nil && pending.Request != nil {
+		base = filteredRelayContextMetadata(pending.Request.Metadata)
 	}
-	return cloneMetadata(pending.Request.Metadata)
-}
-
-func (g *Guide) mergedStreamRelayMetadata(correlationID string, current map[string]any) map[string]any {
-	base := streamRelayMetadata(g.pendingForCorrelation(correlationID))
-	return mergeMetadata(base, current)
+	merged := mergeMetadata(base, current)
+	if strings.TrimSpace(responderID) == "" {
+		return merged
+	}
+	return g.applyResponderIdentityMetadata(merged, responderID, responderName, metadataString(current, "runtime_agent_id"))
 }
 
 func cloneStreamResponse(resp *StreamResponse) *StreamResponse {
@@ -4686,7 +4788,7 @@ func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse
 	resp = cloneStreamResponse(resp)
 	if resp != nil {
 		resp.TargetAgentID = sourceAgentID
-		resp.Metadata = g.mergedStreamRelayMetadata(resp.CorrelationID, resp.Metadata)
+		resp.Metadata = g.mergedStreamRelayMetadata(resp.CorrelationID, resp.RespondingAgentID, resp.RespondingAgentName, resp.Metadata)
 	}
 	msg := &Message{
 		ID:            generateMessageID(),
@@ -4717,16 +4819,56 @@ func (g *Guide) publishStreamActivityToRequester(pending *PendingRequest, primar
 	if pending == nil || resp == nil {
 		return nil
 	}
-	sourceAgentID := strings.TrimSpace(pending.SourceAgentID)
-	if sourceAgentID == "" || sourceAgentID == strings.TrimSpace(primaryTarget) {
-		return nil
+	targets := make([]string, 0, 4)
+	seen := make(map[string]struct{}, 4)
+	addTarget := func(target string) {
+		target = strings.TrimSpace(target)
+		if target == "" {
+			return
+		}
+		if _, ok := seen[target]; ok {
+			return
+		}
+		seen[target] = struct{}{}
+		targets = append(targets, target)
 	}
-	return g.publishStreamToSource(sourceAgentID, resp)
+	addTarget(strings.TrimSpace(pending.SourceAgentID))
+	addTargetAncestorStreamTargets := func(parentCorrelationID string) {
+		parentCorrelationID = strings.TrimSpace(parentCorrelationID)
+		for parentCorrelationID != "" {
+			parent := g.pending.Get(parentCorrelationID)
+			if parent == nil {
+				parent = g.completedPending(parentCorrelationID)
+			}
+			if parent == nil {
+				return
+			}
+			addTarget(g.resolveStreamTarget(parent))
+			if parent.Request == nil {
+				return
+			}
+			parentCorrelationID = strings.TrimSpace(parent.Request.ParentCorrelationID)
+		}
+	}
+	if pending.Request != nil {
+		addTargetAncestorStreamTargets(pending.Request.ParentCorrelationID)
+	}
+	primaryTarget = strings.TrimSpace(primaryTarget)
+	var publishErr error
+	for _, target := range targets {
+		if target == primaryTarget {
+			continue
+		}
+		publishErr = errors.Join(publishErr, g.publishStreamToSource(target, resp))
+	}
+	return publishErr
 }
 
 func (g *Guide) publishErrorToSource(sourceAgentID string, correlationID string, sourceAgent string, errStr string, pending *PendingRequest) error {
 	errMsg := NewErrorMessage(generateMessageID(), correlationID, sourceAgent, errStr)
-	errMsg.Metadata = relayResponseMetadata(pending)
+	errMsg.Metadata = g.relayResponseMetadata(pending, &RouteResponse{
+		RespondingAgentID: sourceAgent,
+	})
 	return g.bus.Publish(g.agentResponseTopic(sourceAgentID), errMsg)
 }
 

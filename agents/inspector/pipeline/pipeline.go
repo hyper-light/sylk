@@ -448,8 +448,12 @@ func stageInstructions(contract *agentShared.TaskExecutionContract, stage string
 			"Use the task contract and the relevant tool definitions as the workflow source of truth. Missing implementation is expected evidence at this stage. Record pending validation with `get_validation_status` and publish the reusable handoff artifact once the criteria and scope are clear.\n"
 	}
 	return "### Instructions\n\n" +
-		"Implementation evidence exists. Prefer a single tester-backed audit cycle over broad local re-auditing.\n" +
-		"If Engineer or Designer just handed work back and no tester audit is already pending, call `finalize_pipeline` to issue or recognize the single audit cycle.\n" +
+		"Implementation evidence exists. Audit the returned work yourself before choosing the next protocol step.\n" +
+		"Use `handoff_next` for ordinary phase progression and `challenge_agent` only when a specific returned deliverable is unclear, off-spec, incomplete, or otherwise needs targeted follow-up.\n" +
+		"If another agent has already returned a response to one of your challenges, call `process_validation` immediately before choosing any next handoff, challenge, or closure action.\n" +
+		"After `process_validation`, you may perform any final direct audit you still need in the same turn, but you must not end that turn without a concrete protocol tool call: `challenge_agent`, `handoff_next`, `finalize_pipeline`, or `handoff_to_ot`.\n" +
+		"Do not use `finalize_pipeline` as a substitute for that targeted audit work. Call it only after the current inspector audit is complete and any challenge responses needed for that audit have already been processed.\n" +
+		"When you do call `finalize_pipeline`, pass the strongest criteria, implementation, test, and challenge evidence from the current audit so it can determine whether the final tester-backed acceptance step is still needed or OT handoff is now justified.\n" +
 		"If `finalize_pipeline` reports `ready_for_ot: true` or `must_handoff_to_ot: true`, immediately call `handoff_to_ot` as the next tool call. Do not answer in prose first.\n" +
 		"Do not fan out into repeated audit or grading passes on unchanged workspace state. Use additional local validation tools only when a specific concrete gap remains that the current tester response or protocol state does not already answer.\n"
 }
@@ -465,8 +469,12 @@ func inspectorContractSynthesisMode(contract *agentShared.TaskExecutionContract,
 func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	// Decode structured pipeline task from orchestrator dispatch.
 	task := decodePipelineTask(fwd.Input)
+	hadProtocolState := agentShared.PipelineProtocolStateFromContext(ctx) != nil
 	ctx = agentShared.WithPipelineTaskProtocolState(ctx, task)
-	defer agentShared.ClosePipelineProtocolState(ctx)
+	if !hadProtocolState {
+		defer agentShared.ClosePipelineProtocolState(ctx)
+	}
+	ctx = agentShared.WithPipelineTurnBaseline(ctx)
 
 	// Only try static/conversational replies for non-pipeline inputs.
 	// Pipeline task JSON contains keywords like "state" that would falsely
@@ -584,6 +592,7 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 
 	reqCtx, cancel := context.WithCancel(pi.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = agentShared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
 	reqCtx = agentShared.WithGuardianCommandGate(reqCtx, agentShared.GuardianCommandGateConfig{
 		BusProvider:     func() guide.EventBus { return pi.bus },
 		SourceAgentID:   func() string { return pi.id },
@@ -618,6 +627,9 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 		AgentID:     pi.id,
 		SessionID:   fwd.SessionID,
 	})
+	protocolTask := decodePipelineTask(fwd.Input)
+	ctx = agentShared.WithPipelineTaskProtocolState(ctx, protocolTask)
+	defer agentShared.ClosePipelineProtocolState(ctx)
 
 	toolEmitter := agentShared.NewToolCallEmitter(pi.bus, pi.channels, pi.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentShared.WithToolCallEmitter(ctx, toolEmitter)
@@ -671,8 +683,8 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	pi.publishActivity(events.EventTypeAgentAction, "Inspection task completed")
 
 	respData := result
-	if task := decodePipelineTask(fwd.Input); task != nil {
-		if snapshot, snapErr := pi.stageSnapshot(task.TaskID); snapErr == nil {
+	if protocolTask != nil {
+		if snapshot, snapErr := pi.stageSnapshot(protocolTask.TaskID); snapErr == nil {
 			respData = snapshot
 		}
 	}

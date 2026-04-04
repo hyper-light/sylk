@@ -9,6 +9,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/steering"
 )
 
 func TestWithToolCallEmitter_RoundTrip(t *testing.T) {
@@ -520,6 +521,47 @@ func TestTimedToolCall_Success(t *testing.T) {
 	}
 	if complete.Output != "found 3 matches" {
 		t.Errorf("expected output 'found 3 matches', got %q", complete.Output)
+	}
+}
+
+func TestTimedToolCall_WaitsWhilePaused(t *testing.T) {
+	ledger := steering.NewSteeringLedger("corr-paused-tool", "engineer", "sess", nil, nil)
+	ledger.SetPace(steering.PacePaused)
+	ctx := WithSteeringLedger(context.Background(), ledger)
+
+	started := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	call := providers.ToolCall{Name: "read_file", Arguments: `{"path":"README.md"}`}
+
+	go func() {
+		_, err := TimedToolCall(ctx, "engineer", call, func() (string, error) {
+			started <- struct{}{}
+			return "ok", nil
+		})
+		done <- err
+	}()
+
+	select {
+	case <-started:
+		t.Fatal("tool call started while paused")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	ledger.SetPace(steering.PaceAuto)
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("tool call did not start after resume")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("TimedToolCall returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("TimedToolCall did not finish after resume")
 	}
 }
 

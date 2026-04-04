@@ -3,6 +3,7 @@ package chat
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,8 +28,6 @@ const thinkingFrameInterval = 100 * time.Millisecond
 // thinkingProgressMinInterval limits immediate UI updates from progress messages.
 // Decor ticks still animate every 100ms; this only dampens bursty progress input.
 const thinkingProgressMinInterval = 250 * time.Millisecond
-
-const deferredParentCompletionStatus = "Waiting for child work to finish..."
 
 // spinnerFrames is a Braille dot animation sequence (matches status/spinner.go).
 var spinnerFrames = [...]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -209,32 +208,44 @@ func lookupThinkingMessages(agentID string) ([]string, bool) {
 // active concurrently when several agents stream in parallel (e.g. architect
 // and orchestrator).
 type streamSlot struct {
-	accumulator     *StreamAccumulator
-	agentID         string
-	thinkingIdx     int                // History index of thinking placeholder for this stream.
-	thinkingStart   time.Time          // When this stream's thinking phase began.
-	retryText       string             // Progress override shown instead of fun messages.
-	lastProgressSet time.Time          // Last immediate progress text write time.
-	renderState     *streamRenderState // Incremental render state for this stream.
-	planID          string             // Plan ID embedded in this stream, if any.
-	planMarkdown    string             // Rendered plan markdown for this stream.
-	planOffset      int                // Accumulator content length when plan was injected.
-	deferCompletion bool               // Stream text is done, but child inter-agent work is still settling.
+	accumulator      *StreamAccumulator
+	agentID          string
+	thinkingIdx      int                // History index of thinking placeholder for this stream.
+	thinkingStart    time.Time          // When this stream's thinking phase began.
+	retryText        string             // Progress override shown instead of fun messages.
+	retryToolDerived bool               // Progress override is synthesized from active tool calls.
+	lastProgressSet  time.Time          // Last immediate progress text write time.
+	renderState      *streamRenderState // Incremental render state for this stream.
+	planID           string             // Plan ID embedded in this stream, if any.
+	planMarkdown     string             // Rendered plan markdown for this stream.
+	planOffset       int                // Accumulator content length when plan was injected.
+	deferCompletion  bool               // Parent stream finished, but child inter-agent work still owns the row.
 }
+
+const deferredParentCompletionStatus = "Waiting for child work to finish..."
 
 // nestedStreamSlot tracks a child agent stream that belongs to an inter-agent
 // consult/challenge branch owned by a parent chat entry.
 type nestedStreamSlot struct {
-	correlationID   string
-	branchRef       msg.InterAgentBranchRefMsg
-	thinkingStart   time.Time
-	retryText       string
-	lastProgressSet time.Time
-	content         strings.Builder
-	activity        InterAgentChildActivity
-	terminalSeen    bool
-	terminalFailed  bool
-	done            bool
+	correlationID    string
+	branchRef        msg.InterAgentBranchRefMsg
+	thinkingStart    time.Time
+	retryText        string
+	retryToolDerived bool
+	lastProgressSet  time.Time
+	content          strings.Builder
+	activity         InterAgentChildActivity
+	terminalSeen     bool
+	terminalFailed   bool
+	done             bool
+}
+
+type resumablePrimaryState struct {
+	visibleAgentID string
+	agentType      string
+	sessionID      string
+	taskID         string
+	children       map[string]struct{}
 }
 
 // Model is the Bubble Tea model for the chat panel.
@@ -259,6 +270,7 @@ type Model struct {
 	thinkingAgentID  string          // Agent currently thinking (for agent-specific messages).
 	thinkingStart    time.Time       // When current thinking phase began.
 	retryText        string          // Retry/model-fallback status (replaces fun messages when set).
+	retryToolDerived bool            // Progress override is synthesized from active tool calls.
 	thinkingGradient *theme.Gradient // Color gradient cycled during thinking animation.
 	lastProgressSet  time.Time       // Last immediate progress text write time.
 
@@ -273,6 +285,11 @@ type Model struct {
 	// Completed entries with pending inter-agent rows still need spinner ticks
 	// while a consultation/challenge is awaiting a later response.
 	pendingInterAgent map[int]struct{}
+
+	// Completed parent turns that are awaiting a same-agent continuation after
+	// nested consult/challenge work remain resumable without staying visually live.
+	resumablePrimaries   map[string]resumablePrimaryState
+	resumableChildOwners map[string]string
 
 	// Steering animation: pending entries shimmer with holographic color until acknowledged.
 	steeringPending  []steeringPendingEntry
@@ -302,16 +319,18 @@ func New(th *theme.Theme, historyCapacity int) *Model {
 	h := NewHistory(historyCapacity)
 	vp := NewViewport(h, th)
 	return &Model{
-		history:           h,
-		viewport:          vp,
-		streams:           make(map[string]*streamSlot),
-		nestedStreams:     make(map[string]*nestedStreamSlot),
-		theme:             th,
-		thinkingIdx:       -1,
-		planEntryIdx:      -1,
-		pendingInterAgent: make(map[int]struct{}),
-		thinkingGradient:  th.Palette.ThinkingGradient(),
-		steeringGradient:  th.Palette.GroupGradient(),
+		history:              h,
+		viewport:             vp,
+		streams:              make(map[string]*streamSlot),
+		nestedStreams:        make(map[string]*nestedStreamSlot),
+		theme:                th,
+		thinkingIdx:          -1,
+		planEntryIdx:         -1,
+		pendingInterAgent:    make(map[int]struct{}),
+		resumablePrimaries:   make(map[string]resumablePrimaryState),
+		resumableChildOwners: make(map[string]string),
+		thinkingGradient:     th.Palette.ThinkingGradient(),
+		steeringGradient:     th.Palette.GroupGradient(),
 	}
 }
 
@@ -493,15 +512,28 @@ func shouldSuppressActivity(ev msg.ActivityEventMsg) bool {
 	return chatSuppressedEvents[ev.Event.EventType.String()]
 }
 
-func isExplicitTopLevelTransfer(parentCorrelationID string, branchRef *msg.InterAgentBranchRefMsg) bool {
-	return branchRef == nil && strings.TrimSpace(parentCorrelationID) != ""
+func isExplicitTopLevelTransfer(parentCorrelationID string, branchRef *msg.InterAgentBranchRefMsg, topLevelTransfer bool) bool {
+	return topLevelTransfer && branchRef == nil && strings.TrimSpace(parentCorrelationID) != ""
+}
+
+func appendChatBranchRefLogAttrs(attrs []any, prefix string, ref *msg.InterAgentBranchRefMsg) []any {
+	attrs = append(attrs, prefix+"_present", ref != nil)
+	if ref == nil {
+		return attrs
+	}
+	return append(attrs,
+		prefix+"_parent_correlation_id", strings.TrimSpace(ref.ParentCorrelationID),
+		prefix+"_parent_tool_call_key", strings.TrimSpace(ref.ParentToolCallKey),
+		prefix+"_kind", strings.TrimSpace(ref.Kind),
+		prefix+"_thread_key", strings.TrimSpace(ref.ThreadKey),
+	)
 }
 
 // handleStreamStart begins accumulation. If a thinking placeholder exists,
 // it is reused; otherwise a new entry is pushed. Multiple concurrent streams
 // are tracked in the streams map keyed by correlationID.
 func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
-	m.clearExplicitTopLevelTransferState(start.CorrelationID, start.ParentCorrelationID, start.BranchRef)
+	m.clearExplicitTopLevelTransferState(start.CorrelationID, start.ParentCorrelationID, start.BranchRef, start.TopLevelTransfer)
 	if start.BranchRef == nil {
 		if slot := m.nestedStream(start.CorrelationID); slot != nil {
 			ref := slot.branchRef
@@ -519,13 +551,61 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 	chatDebugLog().Info("chat.handleStreamStart: ENTRY",
 		"correlation_id", cid,
 		"agent_id", start.AgentID,
+		"runtime_agent_id", start.RuntimeAgentID,
+		"agent_type", start.AgentType,
+		"parent_correlation_id", start.ParentCorrelationID,
 		"active_streams", len(m.streams),
 		"thinking_idx", m.thinkingIdx)
+	chatDebugLog().Info("chat.handleStreamStart: CONTINUITY",
+		appendChatBranchRefLogAttrs([]any{
+			"correlation_id", cid,
+			"agent_id", start.AgentID,
+			"runtime_agent_id", start.RuntimeAgentID,
+			"agent_type", start.AgentType,
+			"parent_correlation_id", start.ParentCorrelationID,
+			"task_id", strings.TrimSpace(start.TaskID),
+			"session_id", strings.TrimSpace(start.SessionID),
+			"stream_count", len(m.streams),
+			"thinking_idx", m.thinkingIdx,
+		}, "branch_ref", start.BranchRef)...)
 	now := time.Now()
 	streamAgentType := streamEntryAgentType(start)
 
 	if slot, ok := m.streams[cid]; ok && slot.accumulator != nil {
+		chatDebugLog().Info("chat.handleStreamStart: REUSE_EXISTING_SLOT",
+			"correlation_id", cid,
+			"entry_index", slot.accumulator.EntryIndex(),
+			"agent_id", start.AgentID,
+			"runtime_agent_id", start.RuntimeAgentID,
+			"agent_type", streamAgentType)
 		m.refreshExistingStreamSlot(slot, start)
+		return nil
+	}
+
+	if oldCID, slot := m.reusableDeferredPrimaryStreamSlot(start); slot != nil {
+		chatDebugLog().Info("chat.handleStreamStart: REUSE_DEFERRED_SLOT",
+			"correlation_id", cid,
+			"reused_correlation_id", oldCID,
+			"entry_index", slot.accumulator.EntryIndex(),
+			"agent_id", start.AgentID,
+			"runtime_agent_id", start.RuntimeAgentID,
+			"agent_type", streamAgentType)
+		delete(m.streams, oldCID)
+		m.resumeDeferredPrimaryStreamSlot(slot, start, now)
+		m.streams[cid] = slot
+		return nil
+	}
+	if oldCID, idx := m.reusableResumablePrimaryEntry(start); idx >= 0 {
+		chatDebugLog().Info("chat.handleStreamStart: REUSE_RESUMABLE_ENTRY",
+			"correlation_id", cid,
+			"reused_correlation_id", oldCID,
+			"entry_index", idx,
+			"agent_id", start.AgentID,
+			"runtime_agent_id", start.RuntimeAgentID,
+			"agent_type", streamAgentType)
+		m.clearResumablePrimary(oldCID)
+		delete(m.streams, oldCID)
+		m.streams[cid] = m.resumeCompletedPrimaryEntry(idx, start, now)
 		return nil
 	}
 
@@ -542,6 +622,12 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		m.adoptGlobalThinkingState(now, slot)
 		m.streams[cid] = slot
 		m.clearThinkingState()
+		chatDebugLog().Info("chat.handleStreamStart: REUSE_GLOBAL_THINKING",
+			"correlation_id", cid,
+			"entry_index", idx,
+			"agent_id", start.AgentID,
+			"runtime_agent_id", start.RuntimeAgentID,
+			"agent_type", streamAgentType)
 		m.viewDirty = true
 		return nil
 	}
@@ -581,7 +667,139 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 	}
 	m.startSlotThinkingAnimation(now, slot)
 	m.streams[cid] = slot
+	chatDebugLog().Info("chat.handleStreamStart: NEW_ENTRY",
+		"correlation_id", cid,
+		"entry_index", idx,
+		"agent_id", start.AgentID,
+		"runtime_agent_id", start.RuntimeAgentID,
+		"agent_type", streamAgentType)
 	return nil
+}
+
+func (m *Model) reusableDeferredPrimaryStreamSlot(start msg.StreamStartMsg) (string, *streamSlot) {
+	agentType := streamEntryAgentType(start)
+	visibleAgentID := streamVisibleAgentID(start)
+	sessionID := strings.TrimSpace(start.SessionID)
+	if visibleAgentID == "" {
+		return "", nil
+	}
+	bestCID := ""
+	var bestSlot *streamSlot
+	bestIdx := -1
+	for correlationID, slot := range m.streams {
+		if slot == nil || !slot.deferCompletion || slot.accumulator == nil {
+			continue
+		}
+		entry := m.history.Get(slot.accumulator.EntryIndex())
+		if entry == nil || !entry.Streaming {
+			continue
+		}
+		if entryVisibleAgentID(entry) != visibleAgentID {
+			continue
+		}
+		if badgeAgentType(entry) != agentType {
+			continue
+		}
+		if sessionID != "" && strings.TrimSpace(entry.SessionID) != "" && strings.TrimSpace(entry.SessionID) != sessionID {
+			continue
+		}
+		if idx := slot.accumulator.EntryIndex(); idx > bestIdx {
+			bestIdx = idx
+			bestCID = correlationID
+			bestSlot = slot
+		}
+	}
+	return bestCID, bestSlot
+}
+
+func (m *Model) reusableResumablePrimaryEntry(start msg.StreamStartMsg) (string, int) {
+	if m == nil || len(m.resumablePrimaries) == 0 {
+		return "", -1
+	}
+	if isExplicitTopLevelTransfer(start.ParentCorrelationID, start.BranchRef, start.TopLevelTransfer) {
+		ownerCID := strings.TrimSpace(m.resumableChildOwners[strings.TrimSpace(start.ParentCorrelationID)])
+		if ownerCID == "" || !m.resumablePrimaryMatchesChildOwner(ownerCID, start) {
+			return "", -1
+		}
+		if idx := m.historyIndexForCorrelation(ownerCID); idx >= 0 {
+			return ownerCID, idx
+		}
+		m.clearResumablePrimary(ownerCID)
+		return "", -1
+	}
+	bestCID := ""
+	bestIdx := -1
+	for ownerCID := range m.resumablePrimaries {
+		if !m.resumablePrimaryMatches(ownerCID, start) {
+			continue
+		}
+		if idx := m.historyIndexForCorrelation(ownerCID); idx >= 0 && idx > bestIdx {
+			bestCID = ownerCID
+			bestIdx = idx
+		}
+	}
+	return bestCID, bestIdx
+}
+
+func (m *Model) resumablePrimaryMatchesChildOwner(correlationID string, start msg.StreamStartMsg) bool {
+	state, entry, ok := m.loadResumablePrimaryMatch(correlationID)
+	if !ok {
+		return false
+	}
+	if agentType := streamEntryAgentType(start); agentType != "" && badgeAgentType(entry) != agentType {
+		return false
+	}
+	if sessionID := strings.TrimSpace(start.SessionID); sessionID != "" && state.sessionID != "" && state.sessionID != sessionID {
+		return false
+	}
+	if taskID := strings.TrimSpace(start.TaskID); taskID != "" && state.taskID != "" && state.taskID != taskID {
+		return false
+	}
+	return true
+}
+
+func (m *Model) resumeDeferredPrimaryStreamSlot(slot *streamSlot, start msg.StreamStartMsg, now time.Time) {
+	if slot == nil || slot.accumulator == nil {
+		return
+	}
+	chatDebugLog().Info("chat.resumeDeferredPrimaryStreamSlot",
+		"correlation_id", strings.TrimSpace(start.CorrelationID),
+		"entry_index", slot.accumulator.EntryIndex(),
+		"agent_id", strings.TrimSpace(start.AgentID),
+		"runtime_agent_id", strings.TrimSpace(start.RuntimeAgentID),
+		"agent_type", streamEntryAgentType(start))
+	slot.agentID = streamEntryAgentType(start)
+	slot.deferCompletion = false
+	m.updateStreamEntryMetadata(slot.accumulator.EntryIndex(), start)
+	m.startSlotThinkingAnimation(now, slot)
+	if slot.renderState == nil {
+		slot.renderState = &streamRenderState{}
+	}
+	m.viewport.AddStreamState(slot.accumulator.EntryIndex(), slot.renderState)
+	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, now)
+	m.viewDirty = true
+}
+
+func (m *Model) resumeCompletedPrimaryEntry(idx int, start msg.StreamStartMsg, now time.Time) *streamSlot {
+	chatDebugLog().Info("chat.resumeCompletedPrimaryEntry",
+		"correlation_id", strings.TrimSpace(start.CorrelationID),
+		"entry_index", idx,
+		"agent_id", strings.TrimSpace(start.AgentID),
+		"runtime_agent_id", strings.TrimSpace(start.RuntimeAgentID),
+		"agent_type", streamEntryAgentType(start),
+		"parent_correlation_id", strings.TrimSpace(start.ParentCorrelationID))
+	slot := &streamSlot{
+		accumulator: NewStreamAccumulator(idx),
+		agentID:     streamEntryAgentType(start),
+		thinkingIdx: idx,
+		renderState: &streamRenderState{},
+	}
+	m.updateStreamEntryMetadata(idx, start)
+	m.startSlotThinkingAnimation(now, slot)
+	m.viewport.AddStreamState(idx, slot.renderState)
+	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, now)
+	m.viewDirty = true
+	return slot
 }
 
 // handleStreamChunk appends text to the accumulator. The entry is NOT synced
@@ -615,7 +833,7 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	if progress.Visibility == events.VisibilitySystem {
 		return nil
 	}
-	m.clearExplicitTopLevelTransferState(progress.CorrelationID, progress.ParentCorrelationID, progress.BranchRef)
+	m.clearExplicitTopLevelTransferState(progress.CorrelationID, progress.ParentCorrelationID, progress.BranchRef, progress.TopLevelTransfer)
 	if progress.BranchRef != nil {
 		m.handleNestedStreamProgress(progress)
 		return nil
@@ -623,23 +841,28 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	if m.handleNestedStreamProgress(progress) {
 		return nil
 	}
+	displayAgentID := streamEntryAgentType(msg.StreamStartMsg{
+		AgentID:   progress.AgentID,
+		AgentType: progress.AgentType,
+	})
 	message := sanitizeThinkingMessage(progress.Message)
 	if slot := m.streamSlot(progress.CorrelationID); slot != nil {
-		m.updateSlotThinkingAgent(slot, progress.AgentID)
-		m.applySlotProgress(slot, message)
+		m.updateSlotThinkingAgent(slot, displayAgentID)
+		m.applySlotProgress(slot, message, progress.ToolDerived)
 		return nil
 	}
-	m.updateThinkingAgent(progress.AgentID)
+	m.updateThinkingAgent(displayAgentID)
 	if message == "" {
 		return nil
 	}
 	if m.thinkingIdx < 0 {
 		return nil
 	}
-	if message == m.retryText {
+	if message == m.retryText && progress.ToolDerived == m.retryToolDerived {
 		return nil
 	}
 	m.retryText = message
+	m.retryToolDerived = progress.ToolDerived
 	now := time.Now()
 	if m.lastProgressSet.IsZero() || now.Sub(m.lastProgressSet) >= thinkingProgressMinInterval {
 		m.lastProgressSet = now
@@ -650,7 +873,7 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 
 // handleStreamComplete finalizes a single streaming entry by correlationID.
 func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
-	m.clearExplicitTopLevelTransferState(done.CorrelationID, done.ParentCorrelationID, done.BranchRef)
+	m.clearExplicitTopLevelTransferState(done.CorrelationID, done.ParentCorrelationID, done.BranchRef, done.TopLevelTransfer)
 	if done.BranchRef != nil {
 		m.handleNestedStreamComplete(done)
 		return nil
@@ -685,11 +908,11 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 		m.acknowledgeSteering(cid)
 	}
 
-	if m.deferSlotCompletionIfPending(slot) {
-		chatDebugLog().Info("chat.handleStreamComplete: DEFERRED",
+	if m.shouldRecordResumablePrimary(slot) {
+		m.recordResumableCompletedPrimary(cid, slot)
+		chatDebugLog().Info("chat.handleStreamComplete: RESUMABLE",
 			"correlation_id", cid,
-			"entry_index", slot.accumulator.EntryIndex())
-		return nil
+			"pending_inter_agent", true)
 	}
 
 	m.finalizeCompletedStreamSlot(cid, slot, true, "")
@@ -721,7 +944,6 @@ func (m *Model) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
 		})
 		delete(m.pendingInterAgent, entryIdx)
 	}
-	slot.deferCompletion = false
 	m.resolveSlotThinkingEntry(slot)
 	if entryIdx >= 0 {
 		m.history.UpdateAt(entryIdx, func(e *ChatEntry) {
@@ -821,11 +1043,12 @@ func (m *Model) handleRetryStatus(retry msg.RetryStatusMsg) tea.Cmd {
 	delayStr := formatRetryDelay(retry.Delay)
 	message := sanitizeThinkingMessage(fmt.Sprintf("retrying (%d/%d) in %s...", retry.Attempt, retry.MaxAttempts, delayStr))
 	if slot := m.streamSlot(retry.CorrelationID); slot != nil {
-		m.applySlotProgress(slot, message)
+		m.applySlotProgress(slot, message, false)
 		return nil
 	}
 	if m.thinkingIdx >= 0 {
 		m.retryText = message
+		m.retryToolDerived = false
 	}
 	return nil
 }
@@ -863,7 +1086,7 @@ func formatRetryDelay(d time.Duration) string {
 // updating the matching streaming entry's ToolCalls list. Matches by
 // correlationID first, then falls back to the thinking placeholder.
 func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
-	m.clearExplicitTopLevelTransferState(ev.CorrelationID, ev.ParentCorrelationID, ev.BranchRef)
+	m.clearExplicitTopLevelTransferState(ev.CorrelationID, ev.ParentCorrelationID, ev.BranchRef, ev.TopLevelTransfer)
 	if ev.BranchRef != nil {
 		m.handleNestedToolCallEvent(ev)
 		return nil
@@ -882,6 +1105,11 @@ func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
 		currentAgentType = badgeAgentType(current)
 	}
 	if m.handleInterAgentToolCallEvent(idx, currentAgentType, ev) {
+		if slot := m.streamSlot(ev.CorrelationID); slot != nil {
+			m.reconcileToolDerivedSlotProgress(slot)
+		} else if idx == m.thinkingIdx {
+			m.reconcileToolDerivedThinkingProgress(idx)
+		}
 		return nil
 	}
 
@@ -932,6 +1160,11 @@ func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
 		}
 		invalidateChatEntryRender(e)
 	})
+	if slot := m.streamSlot(ev.CorrelationID); slot != nil {
+		m.reconcileToolDerivedSlotProgress(slot)
+	} else if idx == m.thinkingIdx {
+		m.reconcileToolDerivedThinkingProgress(idx)
+	}
 	return nil
 }
 
@@ -1283,6 +1516,27 @@ func (m *Model) handleInterAgentToolCallEvent(idx int, currentAgentType string, 
 	}
 }
 
+// SnapshotEntries returns a stable copy of the current chat history in
+// chronological order.
+func (m *Model) SnapshotEntries() []ChatEntry {
+	if m == nil || m.history == nil {
+		return nil
+	}
+	total := m.history.Len()
+	if total == 0 {
+		return nil
+	}
+	entries := make([]ChatEntry, 0, total)
+	for idx := 0; idx < total; idx++ {
+		entry := m.history.Get(idx)
+		if entry == nil {
+			continue
+		}
+		entries = append(entries, *entry)
+	}
+	return entries
+}
+
 func (m *Model) completeLocalInterAgentToolRecord(idx int, currentAgentType string, ev msg.ToolCallEventMsg) bool {
 	matched := false
 	m.history.UpdateAt(idx, func(e *ChatEntry) {
@@ -1359,56 +1613,9 @@ func (m *Model) syncPendingInterAgentEntry(idx int) {
 	entry := m.history.Get(idx)
 	if entry == nil || !entryHasPendingInterAgentToolCalls(entry) {
 		delete(m.pendingInterAgent, idx)
-		m.finalizeDeferredStreamSlotsForEntry(idx)
 		return
 	}
 	m.pendingInterAgent[idx] = struct{}{}
-}
-
-func (m *Model) deferSlotCompletionIfPending(slot *streamSlot) bool {
-	if slot == nil || slot.accumulator == nil {
-		return false
-	}
-	if !shouldDeferEntryCompletion(m.history.Get(slot.accumulator.EntryIndex())) {
-		return false
-	}
-	slot.deferCompletion = true
-	slot.retryText = deferredParentCompletionStatus
-	slot.lastProgressSet = time.Time{}
-	m.setSlotThinkingTextNow(slot, deferredParentCompletionStatus)
-	m.syncSlotToEntry(slot)
-	if slot.renderState == nil {
-		slot.renderState = &streamRenderState{}
-	}
-	m.viewport.AddStreamState(slot.accumulator.EntryIndex(), slot.renderState)
-	m.viewDirty = true
-	return true
-}
-
-func (m *Model) finalizeDeferredStreamSlotsForEntry(idx int) {
-	if idx < 0 {
-		return
-	}
-	keys := make([]string, 0, 1)
-	for correlationID, slot := range m.streams {
-		if slot == nil || !slot.deferCompletion || slot.accumulator == nil {
-			continue
-		}
-		if slot.accumulator.EntryIndex() != idx {
-			continue
-		}
-		keys = append(keys, correlationID)
-	}
-	for _, correlationID := range keys {
-		slot := m.streams[correlationID]
-		if slot == nil || !slot.deferCompletion || slot.accumulator == nil {
-			continue
-		}
-		if shouldDeferEntryCompletion(m.history.Get(slot.accumulator.EntryIndex())) {
-			continue
-		}
-		m.finalizeCompletedStreamSlot(correlationID, slot, true, "")
-	}
 }
 
 func (m *Model) handleNestedStreamStart(start msg.StreamStartMsg) {
@@ -1423,6 +1630,9 @@ func (m *Model) handleNestedStreamStart(start msg.StreamStartMsg) {
 	if agentType := streamEntryAgentType(start); agentType != "" {
 		slot.activity.AgentType = agentType
 	}
+	if parentID := strings.TrimSpace(start.BranchRef.ParentCorrelationID); parentID != "" {
+		m.noteResumableChildOwner(start.CorrelationID, parentID)
+	}
 	slot.terminalSeen = false
 	slot.terminalFailed = false
 	if slot.done {
@@ -1435,7 +1645,9 @@ func (m *Model) handleNestedStreamStart(start msg.StreamStartMsg) {
 	}
 	slot.thinkingStart = now
 	slot.retryText = ""
+	slot.retryToolDerived = false
 	slot.lastProgressSet = time.Time{}
+	slot.activity.ThinkingStartedAt = now
 	m.renderNestedStreamThinking(slot, now)
 	m.syncPendingNestedStream(slot)
 }
@@ -1477,6 +1689,7 @@ func (m *Model) handleNestedStreamProgress(progress msg.StreamProgressMsg) bool 
 	}
 	if message != "" {
 		slot.retryText = message
+		slot.retryToolDerived = progress.ToolDerived
 	}
 	if slot.thinkingStart.IsZero() {
 		slot.thinkingStart = time.Now()
@@ -1512,11 +1725,13 @@ func (m *Model) handleNestedStreamComplete(done msg.StreamCompleteMsg) bool {
 		slot.content.String(),
 	))
 	slot.activity.ResultSummary = summary
+	slot.activity.ThinkingStartedAt = time.Time{}
 	slot.activity.ThinkingText = ""
 	slot.activity.ThinkingStatus = ""
 	slot.activity.ThinkingColor = ""
 	slot.thinkingStart = time.Time{}
 	slot.retryText = ""
+	slot.retryToolDerived = false
 	slot.lastProgressSet = time.Time{}
 	slot.terminalSeen = true
 	slot.terminalFailed = false
@@ -1535,11 +1750,13 @@ func (m *Model) handleNestedStreamError(errMsg msg.StreamErrorMsg) bool {
 		return false
 	}
 	slot.activity.ResultSummary = summarizeNestedStreamText(formatErrorForChat(errMsg.Err))
+	slot.activity.ThinkingStartedAt = time.Time{}
 	slot.activity.ThinkingText = ""
 	slot.activity.ThinkingStatus = ""
 	slot.activity.ThinkingColor = ""
 	slot.thinkingStart = time.Time{}
 	slot.retryText = ""
+	slot.retryToolDerived = false
 	slot.lastProgressSet = time.Time{}
 	slot.terminalSeen = true
 	slot.terminalFailed = true
@@ -1565,6 +1782,7 @@ func (m *Model) handleNestedToolCallEvent(ev msg.ToolCallEventMsg) bool {
 	}
 	currentAgentType := nestedActivityAgentType(&slot.activity)
 	if handleInterAgentToolCallInList(&slot.activity.ToolCalls, currentAgentType, ev) {
+		m.reconcileToolDerivedNestedProgress(slot)
 		m.syncPendingNestedStream(slot)
 		return true
 	}
@@ -1604,6 +1822,7 @@ func (m *Model) handleNestedToolCallEvent(ev msg.ToolCallEventMsg) bool {
 			break
 		}
 	}
+	m.reconcileToolDerivedNestedProgress(slot)
 	m.finalizeNestedStreamSlotIfReady(slot, time.Now())
 	m.syncPendingNestedStream(slot)
 	return true
@@ -1634,14 +1853,15 @@ func (m *Model) nestedStream(correlationID string) *nestedStreamSlot {
 	return m.nestedStreams[correlationID]
 }
 
-func (m *Model) clearExplicitTopLevelTransferState(correlationID, parentCorrelationID string, branchRef *msg.InterAgentBranchRefMsg) {
-	if !isExplicitTopLevelTransfer(parentCorrelationID, branchRef) || m == nil {
+func (m *Model) clearExplicitTopLevelTransferState(correlationID, parentCorrelationID string, branchRef *msg.InterAgentBranchRefMsg, topLevelTransfer bool) {
+	if !isExplicitTopLevelTransfer(parentCorrelationID, branchRef, topLevelTransfer) || m == nil {
 		return
 	}
 	correlationID = strings.TrimSpace(correlationID)
 	if correlationID == "" {
 		return
 	}
+	delete(m.resumableChildOwners, correlationID)
 	parentIDs := make([]string, 0, 2)
 	if slot := m.nestedStream(correlationID); slot != nil {
 		if parentID := strings.TrimSpace(slot.branchRef.ParentCorrelationID); parentID != "" {
@@ -1816,6 +2036,102 @@ func (m *Model) tickNestedStreamThinking(now time.Time) bool {
 	return updated
 }
 
+func (m *Model) tickPendingInterAgentHistory(now time.Time) bool {
+	if len(m.pendingInterAgent) == 0 {
+		return false
+	}
+	liveNested := make(map[string]struct{}, len(m.nestedStreams))
+	for correlationID, slot := range m.nestedStreams {
+		if slot == nil || slot.done {
+			continue
+		}
+		correlationID = strings.TrimSpace(correlationID)
+		if correlationID == "" {
+			continue
+		}
+		liveNested[correlationID] = struct{}{}
+	}
+
+	updated := false
+	for idx := range m.pendingInterAgent {
+		entryUpdated := false
+		m.history.UpdateAt(idx, func(entry *ChatEntry) {
+			if entry == nil {
+				return
+			}
+			if tickPendingInterAgentHistoryToolCalls(entry.ToolCalls, now, liveNested, m.thinkingColorFor) {
+				invalidateChatEntryRender(entry)
+				entryUpdated = true
+			}
+		})
+		if entryUpdated {
+			updated = true
+		}
+	}
+	return updated
+}
+
+func tickPendingInterAgentHistoryToolCalls(
+	calls []ToolCallRecord,
+	now time.Time,
+	liveNested map[string]struct{},
+	colorFor func(time.Duration) string,
+) bool {
+	updated := false
+	for i := range calls {
+		if tickPendingInterAgentHistoryRow(calls[i].InterAgent, now, liveNested, colorFor) {
+			updated = true
+		}
+	}
+	return updated
+}
+
+func tickPendingInterAgentHistoryRow(
+	row *InterAgentTool,
+	now time.Time,
+	liveNested map[string]struct{},
+	colorFor func(time.Duration) string,
+) bool {
+	if row == nil {
+		return false
+	}
+	updated := false
+	for i := range row.Children {
+		if tickPendingInterAgentHistoryChild(&row.Children[i], now, liveNested, colorFor) {
+			updated = true
+		}
+		if tickPendingInterAgentHistoryToolCalls(row.Children[i].ToolCalls, now, liveNested, colorFor) {
+			updated = true
+		}
+	}
+	return updated
+}
+
+func tickPendingInterAgentHistoryChild(
+	child *InterAgentChildActivity,
+	now time.Time,
+	liveNested map[string]struct{},
+	colorFor func(time.Duration) string,
+) bool {
+	if child == nil || child.Completed || child.Failed || child.ThinkingStartedAt.IsZero() {
+		return false
+	}
+	if correlationID := strings.TrimSpace(child.CorrelationID); correlationID != "" {
+		if _, ok := liveNested[correlationID]; ok {
+			return false
+		}
+	}
+	elapsed := thinkingElapsed(child.ThinkingStartedAt, now)
+	text := fmt.Sprintf("%s  %.1fs", spinnerFrames[thinkingFrameAt(elapsed)], elapsed.Seconds())
+	color := colorFor(elapsed)
+	if child.ThinkingText == text && child.ThinkingColor == color {
+		return false
+	}
+	child.ThinkingText = text
+	child.ThinkingColor = color
+	return true
+}
+
 func (m *Model) renderNestedStreamThinking(slot *nestedStreamSlot, now time.Time) bool {
 	if slot == nil {
 		return false
@@ -1827,6 +2143,7 @@ func (m *Model) renderNestedStreamThinking(slot *nestedStreamSlot, now time.Time
 		if slot.activity.ThinkingText == "" && slot.activity.ThinkingStatus == "" && slot.activity.ThinkingColor == "" {
 			return false
 		}
+		slot.activity.ThinkingStartedAt = time.Time{}
 		slot.activity.ThinkingText = ""
 		slot.activity.ThinkingStatus = ""
 		slot.activity.ThinkingColor = ""
@@ -1841,6 +2158,7 @@ func (m *Model) renderNestedStreamThinking(slot *nestedStreamSlot, now time.Time
 		slot.activity.ThinkingColor == color {
 		return false
 	}
+	slot.activity.ThinkingStartedAt = slot.thinkingStart
 	slot.activity.ThinkingText = text
 	slot.activity.ThinkingStatus = status
 	slot.activity.ThinkingColor = color
@@ -2038,6 +2356,11 @@ func mergeInterAgentChildActivity(prev, next InterAgentChildActivity) InterAgent
 	}
 	if agentType := strings.TrimSpace(next.AgentType); agentType != "" {
 		merged.AgentType = agentType
+	}
+	if !next.ThinkingStartedAt.IsZero() {
+		merged.ThinkingStartedAt = next.ThinkingStartedAt
+	} else if next.Completed {
+		merged.ThinkingStartedAt = time.Time{}
 	}
 
 	merged.ThinkingText = next.ThinkingText
@@ -3111,6 +3434,9 @@ func (m *Model) tickThinking(now time.Time) {
 	if m.tickNestedStreamThinking(now) {
 		updated = true
 	}
+	if m.tickPendingInterAgentHistory(now) {
+		updated = true
+	}
 	if updated {
 		m.viewDirty = true
 	}
@@ -3216,6 +3542,7 @@ func (m *Model) startThinkingAnimation(now time.Time, idx int) {
 	m.thinkingStart = now
 	m.lastProgressSet = time.Time{}
 	m.retryText = ""
+	m.retryToolDerived = false
 }
 
 // resolveThinkingEntry transitions the thinking placeholder to content phase,
@@ -3241,6 +3568,7 @@ func (m *Model) clearThinkingState() {
 	m.thinkingAgentID = ""
 	m.thinkingStart = time.Time{}
 	m.retryText = ""
+	m.retryToolDerived = false
 	m.lastProgressSet = time.Time{}
 }
 
@@ -3259,6 +3587,9 @@ func (m *Model) HasPendingCorrelation(correlationID string) bool {
 	if slot, ok := m.nestedStreams[correlationID]; ok && slot != nil && !slot.done {
 		return true
 	}
+	if _, ok := m.resumablePrimaries[correlationID]; ok {
+		return true
+	}
 	return false
 }
 
@@ -3271,17 +3602,22 @@ func (m *Model) updateThinkingAgent(agentID string) {
 	// progress override so agent-specific rotating messages take over.
 	if agentID != m.thinkingAgentID {
 		m.retryText = ""
+		m.retryToolDerived = false
 	}
 	m.thinkingAgentID = agentID
 	idx := m.thinkingIdx
 	m.history.mu.Lock()
 	if idx >= 0 && idx < m.history.count {
 		physical := m.history.logicalToPhysical(idx)
-		m.history.entries[physical].AgentType = agentID
-		m.history.entries[physical].AgentID = agentID
-		m.history.entries[physical].RenderedLines = nil
-		m.history.entries[physical].CodeRegions = nil
-		m.history.entries[physical].Height = -1
+		entry := &m.history.entries[physical]
+		preserveDistinctAgentID := strings.TrimSpace(entry.AgentID) != "" && strings.TrimSpace(entry.AgentID) != strings.TrimSpace(entry.AgentType)
+		entry.AgentType = agentID
+		if !preserveDistinctAgentID {
+			entry.AgentID = agentID
+		}
+		entry.RenderedLines = nil
+		entry.CodeRegions = nil
+		entry.Height = -1
 	}
 	m.history.mu.Unlock()
 	m.viewDirty = true
@@ -3463,9 +3799,23 @@ func (m *Model) refreshExistingStreamSlot(slot *streamSlot, start msg.StreamStar
 	if slot == nil || slot.accumulator == nil {
 		return
 	}
-	slot.agentID = streamEntryAgentType(start)
+	nextAgentID := streamEntryAgentType(start)
+	agentChanged := normalizeChatAgentID(slot.agentID) != normalizeChatAgentID(nextAgentID)
+	slot.agentID = nextAgentID
+	slot.deferCompletion = false
+	if agentChanged {
+		// Shared-correlation handoffs (for example Guide -> Architect) reuse the
+		// same row, but the previous speaker's progress override must not leak
+		// into the new responder's thinking state.
+		slot.retryText = ""
+		slot.retryToolDerived = false
+		slot.lastProgressSet = time.Time{}
+	}
 	m.updateStreamEntryMetadata(slot.accumulator.EntryIndex(), start)
 	if !shouldResetStreamSlot(slot) {
+		if agentChanged {
+			m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, time.Now())
+		}
 		m.viewDirty = true
 		return
 	}
@@ -3501,6 +3851,7 @@ func (m *Model) adoptGlobalThinkingState(now time.Time, slot *streamSlot) {
 	}
 	slot.thinkingStart = m.thinkingStart
 	slot.retryText = m.retryText
+	slot.retryToolDerived = m.retryToolDerived
 	slot.lastProgressSet = m.lastProgressSet
 }
 
@@ -3509,9 +3860,10 @@ func (m *Model) startSlotThinkingAnimation(now time.Time, slot *streamSlot) {
 		return
 	}
 	slot.thinkingStart = now
-	slot.retryText = ""
-	slot.lastProgressSet = time.Time{}
 	slot.deferCompletion = false
+	slot.retryText = ""
+	slot.retryToolDerived = false
+	slot.lastProgressSet = time.Time{}
 }
 
 func (m *Model) streamSlot(correlationID string) *streamSlot {
@@ -3524,14 +3876,15 @@ func (m *Model) streamSlot(correlationID string) *streamSlot {
 	return nil
 }
 
-func (m *Model) applySlotProgress(slot *streamSlot, message string) {
+func (m *Model) applySlotProgress(slot *streamSlot, message string, toolDerived bool) {
 	if slot == nil || slot.thinkingIdx < 0 || message == "" {
 		return
 	}
-	if message == slot.retryText {
+	if message == slot.retryText && toolDerived == slot.retryToolDerived {
 		return
 	}
 	slot.retryText = message
+	slot.retryToolDerived = toolDerived
 	now := time.Now()
 	if slot.lastProgressSet.IsZero() || now.Sub(slot.lastProgressSet) >= thinkingProgressMinInterval {
 		slot.lastProgressSet = now
@@ -3548,11 +3901,16 @@ func (m *Model) updateSlotThinkingAgent(slot *streamSlot, agentID string) {
 	}
 	if agentID != slot.agentID {
 		slot.retryText = ""
+		slot.retryToolDerived = false
 	}
 	slot.agentID = agentID
 	m.history.UpdateAt(slot.thinkingIdx, func(entry *ChatEntry) {
+		oldAgentType := strings.TrimSpace(entry.AgentType)
+		oldAgentID := strings.TrimSpace(entry.AgentID)
 		entry.AgentType = agentID
-		entry.AgentID = agentID
+		if oldAgentID == "" || oldAgentID == oldAgentType {
+			entry.AgentID = agentID
+		}
 		entry.RenderedLines = nil
 		entry.CodeRegions = nil
 		entry.Height = -1
@@ -3573,18 +3931,126 @@ func (m *Model) resolveSlotThinkingEntry(slot *streamSlot) {
 	}
 	elapsed := thinkingElapsed(slot.thinkingStart, time.Now())
 	idx := slot.thinkingIdx
+	preservedStatus := ""
+	if idx >= 0 && strings.TrimSpace(slot.retryText) != "" {
+		if entry := m.history.Get(idx); entry != nil && strings.TrimSpace(entry.Content) == "" && !slot.retryToolDerived {
+			preservedStatus = sanitizeThinkingMessage(firstNonEmptyString(entry.ThinkingStatus, slot.retryText))
+		}
+	}
 	m.history.mu.Lock()
 	if idx >= 0 && idx < m.history.count {
 		physical := m.history.logicalToPhysical(idx)
 		m.history.entries[physical].ThinkingElapsed = elapsed
 		m.history.entries[physical].ThinkingText = ""
-		m.history.entries[physical].ThinkingStatus = ""
+		m.history.entries[physical].ThinkingStatus = preservedStatus
 		m.history.entries[physical].ThinkingColor = ""
 	}
 	m.history.mu.Unlock()
 	slot.thinkingStart = time.Time{}
 	slot.retryText = ""
+	slot.retryToolDerived = false
 	slot.lastProgressSet = time.Time{}
+}
+
+func (m *Model) reconcileToolDerivedThinkingProgress(idx int) {
+	if !m.retryToolDerived || idx < 0 || idx != m.thinkingIdx || m.thinkingStart.IsZero() {
+		return
+	}
+	entry := m.history.Get(idx)
+	if entry == nil {
+		return
+	}
+	next := toolDerivedProgressSummary(entry.ToolCalls)
+	if next == m.retryText {
+		return
+	}
+	now := time.Now()
+	m.retryText = next
+	m.retryToolDerived = next != ""
+	m.lastProgressSet = now
+	m.renderThinkingEntry(idx, m.thinkingAgentID, m.retryText, m.thinkingStart, now)
+	m.viewDirty = true
+}
+
+func (m *Model) reconcileToolDerivedSlotProgress(slot *streamSlot) {
+	if slot == nil || !slot.retryToolDerived || slot.thinkingIdx < 0 || slot.thinkingStart.IsZero() || slot.accumulator == nil {
+		return
+	}
+	entry := m.history.Get(slot.accumulator.EntryIndex())
+	if entry == nil {
+		return
+	}
+	next := toolDerivedProgressSummary(entry.ToolCalls)
+	if next == slot.retryText {
+		return
+	}
+	now := time.Now()
+	slot.retryText = next
+	slot.retryToolDerived = next != ""
+	slot.lastProgressSet = now
+	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, now)
+	m.viewDirty = true
+}
+
+func (m *Model) reconcileToolDerivedNestedProgress(slot *nestedStreamSlot) {
+	if slot == nil || !slot.retryToolDerived || slot.thinkingStart.IsZero() {
+		return
+	}
+	next := toolDerivedProgressSummary(slot.activity.ToolCalls)
+	if next == slot.retryText {
+		return
+	}
+	now := time.Now()
+	slot.retryText = next
+	slot.retryToolDerived = next != ""
+	slot.lastProgressSet = now
+	if m.renderNestedStreamThinking(slot, now) {
+		m.syncPendingNestedStream(slot)
+	}
+}
+
+func toolDerivedProgressSummary(calls []ToolCallRecord) string {
+	if len(calls) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(calls))
+	seen := make(map[string]struct{}, len(calls))
+	for i := range calls {
+		if !toolCallHasActiveVisual(calls[i]) {
+			continue
+		}
+		name := humanizeToolCallName(calls[i].ToolName)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	switch len(names) {
+	case 1:
+		return "Working through this with " + names[0] + "."
+	case 2:
+		return "Working through this with " + names[0] + " and " + names[1] + "."
+	default:
+		head := strings.Join(names[:len(names)-1], ", ")
+		return "Working through this with " + head + ", and " + names[len(names)-1] + "."
+	}
+}
+
+func humanizeToolCallName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	name = strings.ReplaceAll(name, "_", " ")
+	return strings.Join(strings.Fields(name), " ")
 }
 
 func (m *Model) renderThinkingEntry(idx int, agentID, retryText string, start, now time.Time) bool {
@@ -3680,6 +4146,7 @@ func (m *Model) updateStreamEntryMetadata(idx int, start msg.StreamStartMsg) {
 		entry.TaskID = strings.TrimSpace(start.TaskID)
 		entry.TaskName = strings.TrimSpace(start.TaskName)
 		entry.TaskSlug = strings.TrimSpace(start.TaskSlug)
+		entry.Streaming = true
 		entry.RenderedLines = nil
 		entry.CodeRegions = nil
 		entry.Height = -1
@@ -3692,6 +4159,33 @@ func streamEntryAgentType(start msg.StreamStartMsg) string {
 		return agentType
 	}
 	return strings.TrimSpace(start.AgentID)
+}
+
+func normalizeChatAgentID(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
+func visiblePrimaryAgentID(agentID, agentType, taskID string) string {
+	taskID = normalizeChatAgentID(taskID)
+	agentType = normalizeChatAgentID(agentType)
+	if taskID != "" && agentType != "" {
+		return taskID + ":" + agentType
+	}
+	if agentType != "" {
+		return agentType
+	}
+	return normalizeChatAgentID(agentID)
+}
+
+func streamVisibleAgentID(start msg.StreamStartMsg) string {
+	return visiblePrimaryAgentID(start.AgentID, streamEntryAgentType(start), start.TaskID)
+}
+
+func entryVisibleAgentID(entry *ChatEntry) string {
+	if entry == nil {
+		return ""
+	}
+	return visiblePrimaryAgentID(entry.AgentID, badgeAgentType(entry), entry.TaskID)
 }
 
 // composeSlotContent returns the full entry content for a stream slot by
@@ -3760,12 +4254,186 @@ func (m *Model) finalizeCompletedStreamSlot(correlationID string, slot *streamSl
 	m.resolveSlotThinkingEntry(slot)
 	m.finalizeSlotToolCalls(slot, success, errorMsg)
 	slot.accumulator.Complete()
-	slot.deferCompletion = false
 	m.finalizeSlotStream(slot)
 	delete(m.streams, correlationID)
 	if len(m.streams) == 0 {
 		m.streamRenderPending = false
 	}
+}
+
+func (m *Model) shouldRecordResumablePrimary(slot *streamSlot) bool {
+	if slot == nil || slot.accumulator == nil {
+		return false
+	}
+	entry := m.history.Get(slot.accumulator.EntryIndex())
+	return entryHasPendingInterAgentToolCalls(entry)
+}
+
+func (m *Model) recordResumableCompletedPrimary(correlationID string, slot *streamSlot) {
+	if m == nil || slot == nil || slot.accumulator == nil {
+		return
+	}
+	entry := m.history.Get(slot.accumulator.EntryIndex())
+	if entry == nil {
+		return
+	}
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	state := resumablePrimaryState{
+		visibleAgentID: entryVisibleAgentID(entry),
+		agentType:      badgeAgentType(entry),
+		sessionID:      strings.TrimSpace(entry.SessionID),
+		taskID:         strings.TrimSpace(entry.TaskID),
+		children:       make(map[string]struct{}),
+	}
+	if m.resumablePrimaries == nil {
+		m.resumablePrimaries = make(map[string]resumablePrimaryState)
+	}
+	m.resumablePrimaries[correlationID] = state
+	for _, childCID := range interAgentChildCorrelations(entry) {
+		m.noteResumableChildOwner(childCID, correlationID)
+	}
+}
+
+func (m *Model) noteResumableChildOwner(childCorrelationID, ownerCorrelationID string) {
+	if m == nil {
+		return
+	}
+	childCorrelationID = strings.TrimSpace(childCorrelationID)
+	ownerCorrelationID = strings.TrimSpace(ownerCorrelationID)
+	if childCorrelationID == "" || ownerCorrelationID == "" {
+		return
+	}
+	state, ok := m.resumablePrimaries[ownerCorrelationID]
+	if !ok {
+		return
+	}
+	if state.children == nil {
+		state.children = make(map[string]struct{})
+	}
+	state.children[childCorrelationID] = struct{}{}
+	m.resumablePrimaries[ownerCorrelationID] = state
+	if m.resumableChildOwners == nil {
+		m.resumableChildOwners = make(map[string]string)
+	}
+	m.resumableChildOwners[childCorrelationID] = ownerCorrelationID
+}
+
+func (m *Model) clearResumablePrimary(correlationID string) {
+	if m == nil {
+		return
+	}
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	state, ok := m.resumablePrimaries[correlationID]
+	if !ok {
+		return
+	}
+	for childCID := range state.children {
+		if owner := strings.TrimSpace(m.resumableChildOwners[childCID]); owner == correlationID {
+			delete(m.resumableChildOwners, childCID)
+		}
+	}
+	delete(m.resumablePrimaries, correlationID)
+}
+
+func (m *Model) resumablePrimaryMatches(correlationID string, start msg.StreamStartMsg) bool {
+	state, entry, ok := m.loadResumablePrimaryMatch(correlationID)
+	if !ok {
+		return false
+	}
+	if visibleAgentID := streamVisibleAgentID(start); visibleAgentID != "" && state.visibleAgentID != "" && state.visibleAgentID != visibleAgentID {
+		return false
+	}
+	if agentType := streamEntryAgentType(start); agentType != "" && badgeAgentType(entry) != agentType {
+		return false
+	}
+	if sessionID := strings.TrimSpace(start.SessionID); sessionID != "" && state.sessionID != "" && state.sessionID != sessionID {
+		return false
+	}
+	if taskID := strings.TrimSpace(start.TaskID); taskID != "" && state.taskID != "" && state.taskID != taskID {
+		return false
+	}
+	return true
+}
+
+func (m *Model) loadResumablePrimaryMatch(correlationID string) (resumablePrimaryState, *ChatEntry, bool) {
+	state, ok := m.resumablePrimaries[correlationID]
+	if !ok {
+		return resumablePrimaryState{}, nil, false
+	}
+	idx := m.historyIndexForCorrelation(correlationID)
+	if idx < 0 {
+		m.clearResumablePrimary(correlationID)
+		return resumablePrimaryState{}, nil, false
+	}
+	entry := m.history.Get(idx)
+	if entry == nil || entry.Streaming {
+		m.clearResumablePrimary(correlationID)
+		return resumablePrimaryState{}, nil, false
+	}
+	return state, entry, true
+}
+
+func interAgentChildCorrelations(entry *ChatEntry) []string {
+	if entry == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	collected := make([]string, 0, 4)
+	var visit func([]InterAgentChildActivity)
+	visit = func(children []InterAgentChildActivity) {
+		for _, child := range children {
+			if childCID := strings.TrimSpace(child.CorrelationID); childCID != "" {
+				if _, ok := seen[childCID]; !ok {
+					seen[childCID] = struct{}{}
+					collected = append(collected, childCID)
+				}
+			}
+			for _, toolCall := range child.ToolCalls {
+				if toolCall.InterAgent != nil {
+					visit(toolCall.InterAgent.Children)
+				}
+			}
+		}
+	}
+	for _, toolCall := range entry.ToolCalls {
+		if toolCall.InterAgent != nil {
+			visit(toolCall.InterAgent.Children)
+		}
+	}
+	return collected
+}
+
+func (m *Model) deferCompletedStreamSlot(slot *streamSlot) {
+	if slot == nil || slot.accumulator == nil {
+		return
+	}
+	now := time.Now()
+	chatDebugLog().Info("chat.deferCompletedStreamSlot",
+		"entry_index", slot.accumulator.EntryIndex(),
+		"agent_id", slot.agentID,
+		"thinking_idx", slot.thinkingIdx)
+	slot.deferCompletion = true
+	if slot.thinkingStart.IsZero() {
+		slot.thinkingStart = now
+	}
+	slot.retryText = deferredParentCompletionStatus
+	slot.retryToolDerived = false
+	slot.lastProgressSet = now
+	m.syncSlotToEntry(slot)
+	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, now)
+	if idx := slot.accumulator.EntryIndex(); idx >= 0 {
+		m.history.UpdateAt(idx, func(e *ChatEntry) {
+			e.Streaming = true
+			invalidateChatEntryRender(e)
+		})
+	}
+	m.viewDirty = true
 }
 
 func (m *Model) finalizeSlotToolCalls(slot *streamSlot, success bool, errorMsg string) {

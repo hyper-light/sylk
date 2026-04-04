@@ -47,7 +47,7 @@ func renderToolCalls(calls []ToolCallRecord, width int, th *theme.Theme) ([]stri
 		if toolCallHasActiveVisual(calls[i]) {
 			hasActive = true
 		}
-		if calls[i].InterAgent != nil && calls[i].InterAgent.Status == InterAgentToolPending {
+		if interAgentToolHasActiveVisual(calls[i].InterAgent) {
 			hasInterAgentActive = true
 		}
 	}
@@ -1089,6 +1089,9 @@ func wrapRenderedToolLine(line string, width int) []string {
 
 // formatToolCallDuration formats the tool call's duration for display.
 func formatToolCallDuration(tc ToolCallRecord) string {
+	if tc.InterAgent != nil && tc.InterAgent.Status == InterAgentToolPending && !tc.StartedAt.IsZero() {
+		return formatToolDuration(time.Since(tc.StartedAt))
+	}
 	if !tc.Completed {
 		d := time.Since(tc.StartedAt)
 		return formatToolDuration(d)

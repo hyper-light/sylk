@@ -344,7 +344,14 @@ func (s *SessionWorkspaceViews) fileAccessFor(ctx context.Context, view Workspac
 		if resolvedPipelineID == "" {
 			return nil, fmt.Errorf("workspace view %q requires pipeline_id", view)
 		}
-		return svfs.ReadOnlyPipelineFileAccess(resolvedPipelineID)
+		fa, err := svfs.ReadOnlyPipelineFileAccess(resolvedPipelineID)
+		if err != nil {
+			if err == ErrVFSNotFound {
+				return nil, fmt.Errorf("workspace view %q unavailable: pipeline VFS %q not found: %w", view, resolvedPipelineID, err)
+			}
+			return nil, err
+		}
+		return fa, nil
 	default:
 		return nil, fmt.Errorf("unsupported workspace view %q", view)
 	}

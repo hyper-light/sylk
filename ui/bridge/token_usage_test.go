@@ -39,8 +39,8 @@ func TestTokenUsageBridgeForwardHandlerAcceptsNumericVariants(t *testing.T) {
 	if !ok {
 		t.Fatalf("sent message type %T, want msg.TokenUsageMsg", program.messages[0])
 	}
-	if usage.AgentID != "engineer" {
-		t.Fatalf("AgentID = %q, want engineer", usage.AgentID)
+	if usage.AgentID != "task_auth_checkout:engineer" {
+		t.Fatalf("AgentID = %q, want task_auth_checkout:engineer", usage.AgentID)
 	}
 	if usage.RuntimeAgentID != "engineer-runtime-1" {
 		t.Fatalf("RuntimeAgentID = %q, want engineer-runtime-1", usage.RuntimeAgentID)
@@ -74,5 +74,39 @@ func TestTokenUsageBridgeForwardHandlerAcceptsNumericVariants(t *testing.T) {
 	}
 	if usage.ReasoningTokens != 25 {
 		t.Fatalf("ReasoningTokens = %d, want 25", usage.ReasoningTokens)
+	}
+}
+
+func TestTokenUsageBridgeForwardHandler_CanonicalizesReplicaAgentIdentity(t *testing.T) {
+	b := NewTokenUsageBridge("test", nil)
+	program := &recordingProgram{}
+	handler := b.forwardHandler(program)
+
+	evt := events.NewActivityEvent(events.EventTypeLLMResponse, "default", "ok")
+	evt.AgentID = "academic#replica-corr-1"
+	evt.CorrelationID = "corr-2"
+	evt.Outcome = events.OutcomeSuccess
+	evt.Data["input_tokens"] = 300
+	evt.Data["output_tokens"] = 120
+	evt.Data["runtime_agent_id"] = "academic#replica-corr-1"
+	evt.Data["canonical_agent_id"] = "academic"
+	evt.Data["agent_type"] = "academic"
+
+	if err := handler(guide.NewActivityMessage("academic#replica-corr-1", evt)); err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if len(program.messages) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(program.messages))
+	}
+
+	usage, ok := program.messages[0].(msg.TokenUsageMsg)
+	if !ok {
+		t.Fatalf("sent message type %T, want msg.TokenUsageMsg", program.messages[0])
+	}
+	if usage.AgentID != "academic" {
+		t.Fatalf("AgentID = %q, want academic", usage.AgentID)
+	}
+	if usage.RuntimeAgentID != "academic#replica-corr-1" {
+		t.Fatalf("RuntimeAgentID = %q, want academic#replica-corr-1", usage.RuntimeAgentID)
 	}
 }

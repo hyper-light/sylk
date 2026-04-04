@@ -554,7 +554,7 @@ func (a *Architect) initSkills() error {
 	}
 	if err := shared.AttachForestOutcomeRecorder(
 		a.skills,
-		"validate_global_review",
+		"validate_work",
 		a.forestTracker,
 		a.config.Forest,
 		func() string { return a.id },
@@ -892,6 +892,7 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	startTime := time.Now()
 	reqCtx, cancel := context.WithCancel(ctx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
 	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
 		BusProvider:     func() guide.EventBus { return a.bus },
 		SourceAgentID:   func() string { return a.id },
@@ -1268,6 +1269,7 @@ func (a *Architect) handleRecall(ctx context.Context, fwd *guide.ForwardedReques
 		return a.handleConversation(ctx, fwd)
 	}
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
+	ctx = shared.WithForwardedTaskScope(ctx, fwd.Metadata)
 	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
 	defer shared.CloseGlobalReviewState(ctx)
 	req := &ArchitectRequest{
@@ -1289,6 +1291,7 @@ func (a *Architect) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest
 		return a.handleConversation(ctx, fwd)
 	}
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
+	ctx = shared.WithForwardedTaskScope(ctx, fwd.Metadata)
 	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
 	defer shared.CloseGlobalReviewState(ctx)
 	req := &ArchitectRequest{
@@ -1325,6 +1328,7 @@ func (a *Architect) shouldRouteExistingReadyPlanFollowupToConversation(
 // silently resurrecting them.
 func (a *Architect) handleConversation(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
+	ctx = shared.WithForwardedTaskScope(ctx, fwd.Metadata)
 	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
 	defer shared.CloseGlobalReviewState(ctx)
 	now := time.Now().UTC()

@@ -43,3 +43,6 @@ vendor/
 .env*
 wip/*
 .gocache
+.gotmp
+.tmp
+.pytest_cache

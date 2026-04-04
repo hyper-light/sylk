@@ -40,6 +40,7 @@ Treat the tool definitions as the tester workflow contract. Their requirements, 
 
 ### When Responding To The Global Inspector
 
-- If the global inspector challenged you, treat `validate_global_review` as the required terminal action for that challenged turn.
+- Use `handoff_next` for ordinary top-level global testing work returning to the global inspector.
+- If the global inspector challenged you, treat `validate_work` as the required terminal action for that challenged turn.
 - Use the merged global workspace, the full architect plan context, and the inspector's request as the validation scope.
 - Report weak plan fit, brittle behavior, insufficient coverage, or stronger alternatives explicitly instead of smoothing them over.

@@ -11,6 +11,7 @@ func ensureSchema(db *sql.DB) error {
 		CREATE TABLE IF NOT EXISTS forest_events (
 			id TEXT PRIMARY KEY,
 			session_id TEXT NOT NULL,
+			task_id TEXT,
 			agent_id TEXT,
 			agent_type TEXT,
 			event_type TEXT NOT NULL,
@@ -53,6 +54,7 @@ func ensureSchema(db *sql.DB) error {
 			scope TEXT NOT NULL,
 			state TEXT NOT NULL,
 			session_id TEXT NOT NULL,
+			task_id TEXT,
 			agent_id TEXT,
 			agent_type TEXT,
 			intent_id TEXT,
@@ -103,6 +105,7 @@ func ensureSchema(db *sql.DB) error {
 		CREATE TABLE IF NOT EXISTS forest_canopies (
 			canopy_key TEXT PRIMARY KEY,
 			session_id TEXT,
+			task_id TEXT,
 			intent_id TEXT,
 			horizon TEXT NOT NULL,
 			root_ids TEXT NOT NULL,
@@ -258,6 +261,10 @@ func ensureSchema(db *sql.DB) error {
 		return err
 	}
 
+	if err := ensureForestTaskColumns(db); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -285,6 +292,56 @@ func ensureForestSupportTables(db *sql.DB) error {
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
 			return fmt.Errorf("create support table: %w", err)
+		}
+	}
+	return nil
+}
+
+func ensureForestTaskColumns(db *sql.DB) error {
+	required := map[string]map[string]string{
+		"forest_events": {
+			"task_id": "ALTER TABLE forest_events ADD COLUMN task_id TEXT",
+		},
+		"forest_branches": {
+			"task_id": "ALTER TABLE forest_branches ADD COLUMN task_id TEXT",
+		},
+		"forest_canopies": {
+			"task_id": "ALTER TABLE forest_canopies ADD COLUMN task_id TEXT",
+		},
+	}
+	for table, columnsToAdd := range required {
+		exists, err := tableExists(db, table)
+		if err != nil {
+			return fmt.Errorf("inspect %s table: %w", table, err)
+		}
+		if !exists {
+			continue
+		}
+		columns, err := tableColumns(db, table)
+		if err != nil {
+			return fmt.Errorf("inspect %s columns: %w", table, err)
+		}
+		for column, statement := range columnsToAdd {
+			if _, ok := columns[column]; ok {
+				continue
+			}
+			if _, err := db.Exec(statement); err != nil {
+				return fmt.Errorf("add %s.%s: %w", table, column, err)
+			}
+		}
+	}
+
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_forest_events_task_time
+			ON forest_events(session_id, task_id, timestamp DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_forest_branches_task
+			ON forest_branches(session_id, task_id, updated_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_forest_canopies_task
+			ON forest_canopies(session_id, task_id, horizon, updated_at DESC)`,
+	}
+	for _, statement := range indexes {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create forest task index: %w", err)
 		}
 	}
 	return nil

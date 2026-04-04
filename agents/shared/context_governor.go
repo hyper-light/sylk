@@ -111,13 +111,69 @@ func stampRequestIdentity(ctx context.Context, req *providers.Request) {
 		return
 	}
 	if req.Metadata == nil {
-		req.Metadata = make(map[string]any, 2)
+		req.Metadata = make(map[string]any, 6)
 	}
+	visibleAgentID, runtimeAgentID := requestIdentityForContext(ctx, m)
 	if _, ok := req.Metadata["agent_id"]; !ok {
-		req.Metadata["agent_id"] = m.AgentID
+		req.Metadata["agent_id"] = visibleAgentID
 	}
 	if _, ok := req.Metadata["session_id"]; !ok {
 		req.Metadata["session_id"] = m.SessionID
+	}
+	if runtimeAgentID != "" && runtimeAgentID != visibleAgentID {
+		if _, ok := req.Metadata["runtime_agent_id"]; !ok {
+			req.Metadata["runtime_agent_id"] = runtimeAgentID
+		}
+	}
+	if stream, ok := StreamMetadataFromContext(ctx); ok {
+		if agentType := streamMetadataString(stream.Metadata, "agent_type"); agentType != "" {
+			if _, ok := req.Metadata["agent_type"]; !ok {
+				req.Metadata["agent_type"] = agentType
+			}
+		}
+		if taskID := streamMetadataString(stream.Metadata, "task_id"); taskID != "" {
+			if _, ok := req.Metadata["task_id"]; !ok {
+				req.Metadata["task_id"] = taskID
+			}
+		}
+		if pipelineID := firstNonEmpty(
+			streamMetadataString(stream.Metadata, "task_id"),
+			streamMetadataString(stream.Metadata, "pipeline_id"),
+		); pipelineID != "" {
+			if _, ok := req.Metadata["pipeline_id"]; !ok {
+				req.Metadata["pipeline_id"] = pipelineID
+			}
+		}
+	}
+}
+
+func requestIdentityForContext(ctx context.Context, m LogMeta) (visibleAgentID, runtimeAgentID string) {
+	runtimeAgentID = strings.TrimSpace(m.AgentID)
+	visibleAgentID = runtimeAgentID
+	if stream, ok := StreamMetadataFromContext(ctx); ok {
+		agentType := streamMetadataString(stream.Metadata, "agent_type")
+		pipelineID := firstNonEmpty(
+			streamMetadataString(stream.Metadata, "task_id"),
+			streamMetadataString(stream.Metadata, "pipeline_id"),
+		)
+		if scopedID := pipelineWorkerVisibleAgentID(agentType, pipelineID); scopedID != "" {
+			visibleAgentID = scopedID
+		}
+	}
+	return visibleAgentID, runtimeAgentID
+}
+
+func pipelineWorkerVisibleAgentID(agentType, pipelineID string) string {
+	agentType = strings.TrimSpace(agentType)
+	pipelineID = strings.TrimSpace(pipelineID)
+	if pipelineID == "" {
+		return ""
+	}
+	switch agentType {
+	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+		return pipelineID + ":" + agentType
+	default:
+		return ""
 	}
 }
 

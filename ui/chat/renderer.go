@@ -124,25 +124,31 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme, cache *codeBlockC
 		summaryLines = wrapLine(summaryText, width, summaryStyle)
 	}
 
+	var progressOnlyStatusLines []string
+	if !entry.Streaming && entry.Content == "" {
+		if status := strings.TrimSpace(entry.ThinkingStatus); status != "" {
+			statusStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted).Italic(true)
+			mdLines, _ := renderMarkdownContent(status, width, statusStyle, th, nil)
+			progressOnlyStatusLines = capLines(mdLines, thinkingStatusMaxLines, width, statusStyle)
+		}
+	}
+
 	// Phase 2b: Inline tool call visualization.
 	toolCallLines, toolCallRegions := renderToolCalls(entry.ToolCalls, width, th)
 
 	contentLines, codeRegions := renderContent(entry.Content, width, bodyStyle, th, cache)
-	if entryHasPendingInterAgentToolCalls(entry) {
-		contentLines = nil
-		codeRegions = nil
-	}
 
 	// Pre-allocate: 1 header + summary + tool calls + content lines + 1 trailing spacer.
-	lines := make([]string, 0, 2+len(summaryLines)+len(toolCallLines)+len(contentLines))
+	lines := make([]string, 0, 2+len(summaryLines)+len(toolCallLines)+len(progressOnlyStatusLines)+len(contentLines))
 	lines = append(lines, header)
 	lines = append(lines, summaryLines...)
 	lines = append(lines, toolCallLines...)
+	lines = append(lines, progressOnlyStatusLines...)
 	lines = append(lines, contentLines...)
 	lines = append(lines, "")
 
 	// Offset code region indices to account for the header + summary + tool call lines.
-	headerOffset := headerLines + len(summaryLines) + len(toolCallLines)
+	headerOffset := headerLines + len(summaryLines) + len(toolCallLines) + len(progressOnlyStatusLines)
 	for i := range codeRegions {
 		codeRegions[i].Start += headerOffset
 		codeRegions[i].End += headerOffset

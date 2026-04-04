@@ -15,12 +15,14 @@ This pipeline is TDD-aware. Treat inspector criteria and tester outputs as execu
 - Before each file mutation, call `prepare_pipeline_write_context`, then mutate through `write_pipeline_file`, `edit_pipeline_file`, `delete_pipeline_file`, or `create_pipeline_directory`. Reuse the returned `next_basis` while the lease remains active.
 - Use `edit_pipeline_file` only for exact search/replace edits where each edit item includes the current `old_text` plus the desired `new_text`. If the change is broad or you cannot express exact replacements, use `write_pipeline_file` instead.
 - Verify the change with focused commands, audits, and follow-up fixes before reporting completion.
-- If Inspector criteria or Tester expectations are unclear, use `challenge_agent` for a new question and `validate_work` only when you are answering an active challenge instead of guessing.
+- If Inspector criteria or Tester expectations are unclear on a normal top-level turn, use `challenge_agent` for a new question. Use `validate_work` only when you are answering an active challenge instead of guessing.
 - Your first `challenge_agent` call to Tester, Designer, or Inspector is allowed.
 - Re-challenge Tester or Designer only after that target modified pipeline VFS state since your previous challenge to that target.
 - Re-challenge Inspector only after Inspector answered your previous challenge and you then modified pipeline VFS state yourself based on that answer.
 - In structured pipelines, hand implementation turns back to Inspector by default; do not skip Inspector by routing directly to Tester unless the active protocol context explicitly requires it.
-- End each pipeline turn with `handoff_next` or `validate_work`. Do not imply completion without recording the next protocol step.
+- Use `handoff_next` for ordinary top-level implementation handoff back into the pipeline flow.
+- Use `validate_work` only when you are directly answering an active challenge from Inspector, Tester, or Designer.
+- End each pipeline turn with the protocol action that matches the turn type. Do not imply completion without recording that next protocol step.
 
 ## Scope Limits
 

@@ -171,8 +171,11 @@ func (gt *GlobalTester) executionWorkspace(allowWrites bool) purevfs.ExecutionFS
 	if gt.fileAccess == nil {
 		return versioning.NewDiskFileAccess(gt.workingDir(), true)
 	}
-	if allowWrites && globalTesterWorkspaceWritesAllowed(gt.fileAccess) {
-		return gt.fileAccess
+	if allowWrites {
+		if globalTesterWorkspaceWritesAllowed(gt.fileAccess) {
+			return versioning.TagExecutionFS(gt.fileAccess, versioning.WorkspaceMutationOriginCommandExecution)
+		}
+		return versioning.TagExecutionFS(purevfs.ReadOnlyExecutionFS(gt.fileAccess), versioning.WorkspaceMutationOriginCommandExecution)
 	}
 	return purevfs.ReadOnlyExecutionFS(gt.fileAccess)
 }

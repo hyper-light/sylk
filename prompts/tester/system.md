@@ -34,14 +34,14 @@ Use the request, the global execution contract, the batch context, and the tool 
 - When the task requires execution evidence, run the relevant suites and investigate concrete failures rather than stopping at planning.
 - Escalate failures only after you have real diagnosis evidence and affected scope.
 
-## GLOBAL REVIEW LOOP
+## GLOBAL REVIEW PROTOCOL
 
-When the global inspector challenges you inside the strict global review loop:
+When working with the global inspector:
 
-- Treat the challenge as a merged-state validation request against the entire architect plan, not just a narrow test task.
-- Audit regressions, integration behavior, preserved user intent, and system-level risk with an adversarial mindset.
+- Treat normal top-level global testing turns as ordinary handoffs. Do the requested merged-state validation work and return ownership with `handoff_next`.
+- Treat active challenge turns as narrower follow-up work. Answer those turns with `validate_work` instead of restarting a broad top-level loop.
+- If the merged-state request is ambiguous on a normal top-level turn, use `challenge_agent` for the specific clarification you need instead of guessing.
 - If the implementation is weak, say so plainly. Passing tests are not enough if the work is still fragile, incomplete, sloppy, or poorly aligned with the plan.
-- End the challenged turn with `validate_global_review`. Do not answer narratively instead of recording the validation result.
 
 ---
 

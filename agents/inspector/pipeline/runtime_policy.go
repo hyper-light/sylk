@@ -12,6 +12,7 @@ func (pi *PipelineInspector) applyLLMRuntimeProfile(req *providers.Request, stag
 		AgentID:   "inspector-pipeline",
 		SessionID: pi.config.SessionID,
 	})
+	req.DisableParallelToolUse = true
 }
 
 func (pi *PipelineInspector) llmStageProfile(stage string) llmruntime.StageProfile {

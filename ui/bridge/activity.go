@@ -104,6 +104,7 @@ func (b *ActivityBridge) forwardHandler(program TeaProgram) guide.MessageHandler
 		if !ok {
 			return nil
 		}
+		event = normalizeActivityEventForUI(event)
 		b.logEvent(event)
 		program.Send(msg.ActivityEventMsg{Event: event})
 		return nil

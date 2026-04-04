@@ -457,6 +457,9 @@ func TimedToolCall(
 	call providers.ToolCall,
 	execute func() (string, error),
 ) (string, error) {
+	if err := WaitWhileExecutionPaused(ctx); err != nil {
+		return "", err
+	}
 	summary := SummarizeToolArgs(call.Name, call.Arguments)
 	fullArgs := PrettyPrintArgs(call.Arguments)
 	start := time.Now()

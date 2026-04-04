@@ -450,6 +450,9 @@ func (m *AppModel) switchToChatMode() tea.Cmd {
 	switch m.viewMode {
 	case ViewGit:
 		return m.exitGitMode()
+	case ViewMemory:
+		m.exitMemoryMode()
+		return nil
 	case ViewEdit:
 		m.exitEditMode()
 		return nil
@@ -1937,6 +1940,7 @@ type slashCommand struct {
 // Both the validator and the completer derive from this slice.
 var chatSlashCommands = []slashCommand{
 	{name: "clear", desc: "Clear the chat history"},
+	{name: "debug-ui", desc: "Toggle or set plain-text chat capture in ./chat.log"},
 	{name: "login", desc: "Open the provider login panel"},
 }
 

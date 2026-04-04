@@ -2692,12 +2692,12 @@ func TestModel_SeedAgent_CanonicalPipelineWorkerSeedsPipelineMembership(t *testi
 	}
 }
 
-func TestModel_SeedAgent_PromotePlaceholder(t *testing.T) {
+func TestModel_SeedAgent_StandalonePreservesCanonicalRow(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)
 	model.SetFocused(true)
 
-	// Seed with placeholder ID == AgentType (activation failed, no real ID).
+	// Seed singleton standalone rows by type.
 	model.SeedAgent("tester", "tester", "Tester", nil, "", "")
 	model.SeedAgent("inspector", "inspector", "Inspector", nil, "", "")
 
@@ -2708,50 +2708,126 @@ func TestModel_SeedAgent_PromotePlaceholder(t *testing.T) {
 	// Simulate real agent activation: activity event arrives with UUID-based ID.
 	pushAgentActivity(model, "a8f2c1d0", "tester")
 
-	// Should promote the placeholder, not create a duplicate.
+	// Should keep the canonical singleton row, not create or re-key a duplicate.
 	if len(model.agents) != 2 {
-		t.Fatalf("agents count after promotion = %d, want 2", len(model.agents))
+		t.Fatalf("agents count after activation = %d, want 2", len(model.agents))
 	}
 
-	// Old placeholder key should be gone; new key should exist.
-	if _, exists := model.agents["tester"]; exists {
-		t.Fatal("placeholder key 'tester' still present after promotion")
+	// Canonical row must remain keyed by type and capture the runtime routing ID.
+	tester := model.agents["tester"]
+	if tester == nil {
+		t.Fatal("canonical tester row not found")
 	}
-	promoted := model.agents["a8f2c1d0"]
-	if promoted == nil {
-		t.Fatal("promoted agent 'a8f2c1d0' not found")
+	if _, exists := model.agents["a8f2c1d0"]; exists {
+		t.Fatal("unexpected runtime-keyed standalone row 'a8f2c1d0'")
 	}
-	if promoted.Name != "Tester" {
-		t.Fatalf("promoted Name = %q, want 'Tester'", promoted.Name)
+	if tester.Name != "Tester" {
+		t.Fatalf("tester Name = %q, want 'Tester'", tester.Name)
 	}
-	if promoted.AgentType != "tester" {
-		t.Fatalf("promoted AgentType = %q, want 'tester'", promoted.AgentType)
+	if tester.AgentType != "tester" {
+		t.Fatalf("tester AgentType = %q, want 'tester'", tester.AgentType)
 	}
-	if promoted.Category != "standalone" {
-		t.Fatalf("promoted Category = %q, want 'standalone'", promoted.Category)
+	if tester.Category != "standalone" {
+		t.Fatalf("tester Category = %q, want 'standalone'", tester.Category)
+	}
+	if tester.RoutingID != "a8f2c1d0" {
+		t.Fatalf("tester RoutingID = %q, want 'a8f2c1d0'", tester.RoutingID)
 	}
 
-	// Order should contain the new ID, not the old one.
+	// Order should keep the canonical row ID.
 	model.ensureRows()
-	foundOld, foundNew := false, false
+	foundTester, foundRuntime := false, false
 	for _, id := range model.order {
-		if id == "tester" {
-			foundOld = true
-		}
 		if id == "a8f2c1d0" {
-			foundNew = true
+			foundRuntime = true
+		}
+		if id == "tester" {
+			foundTester = true
 		}
 	}
-	if foundOld {
-		t.Fatal("order still contains old placeholder ID 'tester'")
+	if !foundTester {
+		t.Fatal("order missing canonical tester row")
 	}
-	if !foundNew {
-		t.Fatal("order missing promoted ID 'a8f2c1d0'")
+	if foundRuntime {
+		t.Fatal("order unexpectedly contains runtime standalone ID 'a8f2c1d0'")
 	}
 
-	// Inspector placeholder should be untouched.
+	// Inspector singleton should be untouched.
 	if model.agents["inspector"] == nil {
-		t.Fatal("inspector placeholder was incorrectly removed")
+		t.Fatal("inspector singleton row was incorrectly removed")
+	}
+}
+
+func TestModel_GuideRuntimeActivationPreservesCanonicalGuideRow(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+	model.SeedAgent("guide", "guide", "Guide", nil, "", "")
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_guide_runtime",
+			EventType: events.EventTypeLLMRequest,
+			Timestamp: time.Now(),
+			AgentID:   "guide-runtime-1",
+			Content:   "routing request",
+			Data: map[string]any{
+				"agent_name": "Guide",
+				"agent_type": "guide",
+			},
+		},
+	})
+
+	guide := model.agents["guide"]
+	if guide == nil {
+		t.Fatal("expected canonical guide row")
+	}
+	if _, exists := model.agents["guide-runtime-1"]; exists {
+		t.Fatal("unexpected runtime-keyed guide row")
+	}
+	if guide.RoutingID != "guide-runtime-1" {
+		t.Fatalf("guide RoutingID = %q, want 'guide-runtime-1'", guide.RoutingID)
+	}
+	if got := model.ResolveTargetAgentID("guide"); got != "guide-runtime-1" {
+		t.Fatalf("ResolveTargetAgentID(guide) = %q, want 'guide-runtime-1'", got)
+	}
+}
+
+func TestModel_GuideCanonicalRowCannotBeAliasedOrAbsorbedIntoArchitect(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+	model.SeedAgent("guide", "guide", "Guide", nil, "", "")
+	model.SeedAgent("architect", "architect", "Architect", nil, "", "")
+
+	// Simulate a stale/bad alias pointing guide activity at the architect row.
+	model.aliases["guide"] = "architect"
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_guide_after_architect",
+			EventType: events.EventTypeLLMResponse,
+			Timestamp: time.Now(),
+			AgentID:   "guide",
+			Content:   "Request forwarded",
+			Data: map[string]any{
+				"agent_name": "Guide",
+				"agent_type": "guide",
+			},
+		},
+	})
+
+	if model.agents["guide"] == nil {
+		t.Fatal("expected canonical guide row to survive")
+	}
+	if model.agents["architect"] == nil {
+		t.Fatal("expected architect row to survive")
+	}
+	if got := model.resolveAgentID("guide"); got != "guide" {
+		t.Fatalf("resolveAgentID(guide) = %q, want guide", got)
+	}
+	if model.aliases["guide"] != "guide" {
+		t.Fatalf("guide alias target = %q, want guide", model.aliases["guide"])
 	}
 }
 
@@ -3213,11 +3289,12 @@ func TestModel_StreamProgressKeepsSingletonKnowledgeAgentRow(t *testing.T) {
 	model.SeedAgent("academic", "academic", "Academic", nil, "", "")
 
 	_, _ = model.Update(msg.StreamProgressMsg{
-		AgentID:    "academic-runtime-1",
-		AgentType:  "academic",
-		AgentName:  "Academic",
-		Message:    "Consulting Librarian about packaging guidance.",
-		Visibility: events.VisibilityUser,
+		AgentID:        "academic",
+		RuntimeAgentID: "academic-runtime-1",
+		AgentType:      "academic",
+		AgentName:      "Academic",
+		Message:        "Consulting Librarian about packaging guidance.",
+		Visibility:     events.VisibilityUser,
 	})
 
 	agent := model.agents["academic"]
@@ -3233,11 +3310,8 @@ func TestModel_StreamProgressKeepsSingletonKnowledgeAgentRow(t *testing.T) {
 	if agent.AgentType != "academic" {
 		t.Fatalf("agent type = %q, want academic", agent.AgentType)
 	}
-	if agent.RoutingID != "academic-runtime-1" {
-		t.Fatalf("routing id = %q, want academic-runtime-1", agent.RoutingID)
-	}
-	if got := model.resolveAgentID("academic-runtime-1"); got != "academic" {
-		t.Fatalf("resolved runtime id = %q, want academic", got)
+	if agent.RoutingID != "academic" {
+		t.Fatalf("routing id = %q, want academic", agent.RoutingID)
 	}
 	if agent.ActivityState != events.AgentUIStateSearching {
 		t.Fatalf("activity state = %q, want %q", agent.ActivityState, events.AgentUIStateSearching)
@@ -3252,7 +3326,7 @@ func TestModel_ToolCallEventKeepsSingletonKnowledgeAgentRow(t *testing.T) {
 	model.SeedAgent("librarian", "librarian", "Librarian", nil, "", "")
 
 	_, _ = model.Update(msg.ToolCallEventMsg{
-		AgentID:     "librarian-runtime-1",
+		AgentID:     "librarian",
 		AgentType:   "librarian",
 		AgentName:   "Librarian",
 		Phase:       0,
@@ -3273,11 +3347,8 @@ func TestModel_ToolCallEventKeepsSingletonKnowledgeAgentRow(t *testing.T) {
 	if agent.AgentType != "librarian" {
 		t.Fatalf("agent type = %q, want librarian", agent.AgentType)
 	}
-	if agent.RoutingID != "librarian-runtime-1" {
-		t.Fatalf("routing id = %q, want librarian-runtime-1", agent.RoutingID)
-	}
-	if got := model.resolveAgentID("librarian-runtime-1"); got != "librarian" {
-		t.Fatalf("resolved runtime id = %q, want librarian", got)
+	if agent.RoutingID != "librarian" {
+		t.Fatalf("routing id = %q, want librarian", agent.RoutingID)
 	}
 	if agent.TaskSummary == "" {
 		t.Fatal("expected tool summary to be populated")

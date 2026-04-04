@@ -72,7 +72,7 @@ func orchestratorPinnedSkillNames() []string {
 	return []string{
 		"query_task", "query_workflow", "push_status",
 		"ingest_plan", "execute_dag",
-		"validate_global_review",
+		"validate_work",
 		"escalate_to_architect",
 		"read_workspace_file", "inspect_workspace_state", "diff_workspace_file",
 	}
@@ -95,7 +95,7 @@ func orchestratorCoreSkillNames() []string {
 		"query_buffer", "query_pipeline_state",
 		"query_dag_status",
 		"ingest_plan", "analyze_plan",
-		"validate_global_review",
+		"validate_work",
 		"self_diagnostic",
 	}
 }

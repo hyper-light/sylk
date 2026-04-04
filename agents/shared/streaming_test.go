@@ -138,6 +138,38 @@ func TestPublishIntermediateToolTurnPublishesToolTurnProgress(t *testing.T) {
 	}
 }
 
+func TestWithForwardedStreamContext_MarksTopLevelTransferWhenParentHasNoNestedBranch(t *testing.T) {
+	ctx := WithForwardedStreamContext(context.Background(), "corr-child", "tui", "corr-parent", nil)
+
+	stream, ok := StreamMetadataFromContext(ctx)
+	if !ok {
+		t.Fatal("expected stream context")
+	}
+	if got, _ := stream.Metadata[streamMetadataParentCorrelation].(string); got != "corr-parent" {
+		t.Fatalf("parent correlation = %q, want corr-parent", got)
+	}
+	if got, _ := stream.Metadata[streamMetadataTopLevelTransfer].(bool); !got {
+		t.Fatalf("top-level transfer marker = %#v, want true", stream.Metadata[streamMetadataTopLevelTransfer])
+	}
+}
+
+func TestWithForwardedStreamContext_DoesNotMarkTopLevelTransferForNestedBranch(t *testing.T) {
+	ctx := WithForwardedStreamContext(context.Background(), "corr-child", "tui", "corr-parent", map[string]any{
+		streamMetadataNestedBranch:      true,
+		streamMetadataParentCorrelation: "corr-parent",
+		streamMetadataParentToolCallKey: "challenge-1",
+		streamMetadataInterAgentKind:    "challenge",
+	})
+
+	stream, ok := StreamMetadataFromContext(ctx)
+	if !ok {
+		t.Fatal("expected stream context")
+	}
+	if _, ok := stream.Metadata[streamMetadataTopLevelTransfer]; ok {
+		t.Fatalf("top-level transfer marker = %#v, want absent for nested branch", stream.Metadata[streamMetadataTopLevelTransfer])
+	}
+}
+
 func TestIntermediateToolTurnText_FallsBackToThinking(t *testing.T) {
 	got := IntermediateToolTurnTextWithContext(context.Background(), &providers.Response{
 		Thinking: "Checking packaging guidance and reconciling it with current Python recommendations.",

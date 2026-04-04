@@ -86,15 +86,12 @@ func (r *TaskRouter) routeProtocolPipelineTask(task *PipelineTask, _ <-chan stru
 		Timestamp:       time.Now().UTC(),
 		Metadata:        protocolPipelineRouteMetadata(initialTask),
 	}
-	msg := guide.NewRequestMessage(generateMessageID(), req)
-	msg.Metadata = map[string]any{
-		"pipeline_task": true,
-		"dag_id":        task.DAGID,
-		"node_id":       task.NodeID,
-		"task_id":       task.TaskID,
-	}
-	if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+	published, err := r.publishProtocolRoute(req)
+	if err != nil {
 		publishProtocolPipelineFailure(r.bus, r.agentID, task, fmt.Errorf("publish protocol pipeline request: %w", err))
+		return nil
+	}
+	if !published {
 		return nil
 	}
 

@@ -674,6 +674,9 @@ func (m *AppModel) recalcLayout() {
 	newChatViewH := max(chatH-panelBorderSize, 1)
 
 	m.chat.SetSize(max(chatW-panelBorderSize, 1), newChatViewH)
+	if m.memoryView != nil {
+		m.memoryView.SetCanvasSize(max(chatW-panelBorderSize, 1), newChatViewH)
+	}
 
 	// Left panel: split between session (top) and agent (bottom).
 	leftW, leftH := m.layout.GetPanelSize(component.FocusSessionPanel)
@@ -685,6 +688,9 @@ func (m *AppModel) recalcLayout() {
 	agentH := sections.agentsRect.H
 	m.sessionPanel.SetSize(innerLeftW, sessionH)
 	m.agentPanel.SetSize(innerLeftW, max(agentH, 1))
+	if m.memoryView != nil {
+		m.memoryView.SetIndexSize(innerLeftW, max(leftH-panelBorderSize, 1))
+	}
 
 	// File tree panel.
 	treeW, treeH := m.layout.GetPanelSize(component.FocusFileTree)
@@ -943,6 +949,9 @@ func (m *AppModel) syncViewModeRingSelection() {
 	switch m.viewMode {
 	case ViewChat:
 		m.syncChatRingSelection()
+	case ViewMemory:
+		m.positionRing(&m.leftRing, component.FocusSessionPanel)
+		m.syncChatRingSelection()
 	case ViewEdit:
 		m.syncEditRingSelection()
 	case ViewGit:
@@ -1038,8 +1047,10 @@ func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
 			component.FocusInput,
 			component.FocusChat,
 			component.FocusSessionPanel,
-			component.FocusAgentPanel,
 			component.FocusFileTree,
+		}
+		if m.viewMode != ViewMemory {
+			order = append(order[:3], append([]component.FocusID{component.FocusAgentPanel}, order[3:]...)...)
 		}
 		return m.appendCodePanelFocus(order)
 	case layout.ThreeColumn:
@@ -1049,7 +1060,7 @@ func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
 			component.FocusChat,
 			left,
 		}
-		if left == component.FocusSessionPanel {
+		if left == component.FocusSessionPanel && m.viewMode != ViewMemory {
 			order = append(order, component.FocusAgentPanel)
 		}
 		return m.appendCodePanelFocus(order)
@@ -1061,7 +1072,7 @@ func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
 			right,
 			left,
 		}
-		if left == component.FocusSessionPanel {
+		if left == component.FocusSessionPanel && m.viewMode != ViewMemory {
 			order = append(order, component.FocusAgentPanel)
 		}
 		return m.appendCodePanelFocus(order)
@@ -1069,7 +1080,7 @@ func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
 		// SingleColumn: Input + whatever the left ring shows.
 		active := m.leftRing.current()
 		order := []component.FocusID{component.FocusInput, active}
-		if active == component.FocusSessionPanel {
+		if active == component.FocusSessionPanel && m.viewMode != ViewMemory {
 			order = append(order, component.FocusAgentPanel)
 		}
 		return m.appendCodePanelFocus(order)
@@ -1179,6 +1190,16 @@ var panelDisplayNames = map[component.FocusID]string{
 	component.FocusDiffFileList: "Files",
 }
 
+func (m *AppModel) panelDisplayName(id component.FocusID) string {
+	if id == component.FocusChat && m.viewMode == ViewMemory {
+		return "Memr"
+	}
+	if name, ok := panelDisplayNames[id]; ok {
+		return name
+	}
+	return ""
+}
+
 // buildRingHint returns the formatted ring indicator string for the status bar.
 // Returns "" when both rings are empty (FourColumn).
 // When both rings are active, shows: ◀ Sess ● Tree ○ | Chat ● Code ○ ▶
@@ -1194,12 +1215,12 @@ func (m *AppModel) buildRingHint() string {
 	renderRing := func(ring *viewRing) []string {
 		var items []string
 		for i, pid := range ring.panels {
-			name := panelDisplayNames[pid]
+			name := m.panelDisplayName(pid)
 			var indicator string
 			switch {
 			case i == ring.index:
 				indicator = currentStyle.Render(name + " \u25cf")
-			case pid == component.FocusChat && m.chat.IsStreaming():
+			case pid == component.FocusChat && m.viewMode != ViewMemory && m.chat.IsStreaming():
 				indicator = activeStyle.Render(name + " \u2731")
 			default:
 				indicator = dimStyle.Render(name + " \u25cb")
@@ -1684,7 +1705,7 @@ func (m *AppModel) cacheableSlotBorderMeta(id compositor.SlotID) (slotBorderMeta
 }
 
 func (m *AppModel) slotCenterContent(th *theme.Theme) string {
-	return m.overlayChordHint(m.chat.View(), component.FocusChat, th)
+	return m.overlayChordHint(m.memoryPanelView(), component.FocusChat, th)
 }
 
 func (m *AppModel) slotCenterBorderMeta() slotBorderMeta {
@@ -1856,7 +1877,7 @@ func (m *AppModel) renderSlotCenterLeft(th *theme.Theme) string {
 // renderSlotCenter renders the bordered chat for the center slot.
 func (m *AppModel) renderSlotCenter(th *theme.Theme) string {
 	return m.renderPanel(
-		m.overlayChordHint(m.chat.View(), component.FocusChat, th),
+		m.overlayChordHint(m.memoryPanelView(), component.FocusChat, th),
 		component.FocusChat, th)
 }
 
@@ -2061,7 +2082,7 @@ func (m *AppModel) conditionalLeftSlotRenderer(active bool, renderer themeRender
 func (m *AppModel) panelContent(id component.FocusID) string {
 	switch id {
 	case component.FocusChat:
-		return m.chat.View()
+		return m.memoryPanelView()
 	case component.FocusCodeViewer:
 		if m.viewMode == ViewGit {
 			return m.commitTree.View(m.cursorVisible)
@@ -2139,6 +2160,10 @@ func (m *AppModel) borderLeftPanel(content string, th *theme.Theme) string {
 // renderLeftPanel stacks sessions and agents with line-extended headers and a divider.
 // The model selector is pinned to the absolute bottom row (just above the border).
 func (m *AppModel) renderLeftPanel(th *theme.Theme) string {
+	if m.viewMode == ViewMemory {
+		return m.renderMemorySidebar(th)
+	}
+
 	leftW, leftH := m.layout.GetPanelSize(component.FocusSessionPanel)
 	innerW := max(leftW-panelBorderSize, 1)
 	innerH := max(leftH-panelBorderSize, 1)

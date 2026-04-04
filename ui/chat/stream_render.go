@@ -221,10 +221,6 @@ func renderStreamingEntryFull(entry *ChatEntry, width int, th *theme.Theme, cach
 	toolCallLines, toolCallRegions := renderToolCalls(entry.ToolCalls, width, th)
 
 	contentLines, codeRegions := renderStreamingEntry(entry.Content, width, th, cache, state)
-	if entryHasPendingInterAgentToolCalls(entry) {
-		contentLines = nil
-		codeRegions = nil
-	}
 
 	// Streaming status footer: when content is present but the stream is
 	// still active, show the spinner + progress message below the content.

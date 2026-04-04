@@ -22,9 +22,11 @@ func TestPipelineTesterSystemPromptForWorkerAndContract_UsesTaskModePrompt(t *te
 		"# THE PIPELINE TESTER",
 		"Use them as the source of workflow truth.",
 		"## Core Testing Principles",
+		"If Inspector's criteria are ambiguous or untestable on a normal top-level turn, use `challenge_agent` to ask for clarification instead of guessing.",
 		"Your first `challenge_agent` call to Engineer, Designer, or Inspector is allowed.",
 		"Re-challenge Inspector only after Inspector answered your prior challenge and you then changed pipeline VFS state yourself based on that answer.",
-		"`handoff_next` is the only transport step.",
+		"`handoff_next` is the normal top-level transport step.",
+		"`validate_work` is the challenge-response transport step.",
 		"`tester_forest_get_test_targets`",
 		"`tester_forest_get_failure_clusters`",
 		"Test Categories:",
@@ -61,12 +63,12 @@ func TestGlobalTesterSystemPromptForContract_UsesTaskModePrompt(t *testing.T) {
 	}
 }
 
-func TestGlobalTesterSystemPrompt_IncludesGlobalReviewLoopGuidance(t *testing.T) {
+func TestGlobalTesterSystemPrompt_IncludesGlobalReviewProtocolGuidance(t *testing.T) {
 	prompt := GlobalTesterSystemPrompt()
 	for _, want := range []string{
-		"## GLOBAL REVIEW LOOP",
-		"When the global inspector challenges you inside the strict global review loop:",
-		"End the challenged turn with `validate_global_review`.",
+		"## GLOBAL REVIEW PROTOCOL",
+		"Treat normal top-level global testing turns as ordinary handoffs.",
+		"Treat active challenge turns as narrower follow-up work. Answer those turns with `validate_work`",
 		"`tester_forest_get_test_targets`",
 		"### When Responding To The Global Inspector",
 	} {

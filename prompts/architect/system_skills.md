@@ -12,7 +12,7 @@ Use skills intentionally and in order:
 8. `pre_delegation_declare` + `validate_pre_delegation` — preserve and sanity-check any consultation evidence attached to the declaration before approval
 9. `route_plan_acceptance` → `handle_plan_acceptance_result` — dispatch approved plans to orchestrator
 10. `monitor_execution` / `interrupt_handler` — track progress and handle stop/pause/resume signals
-11. `validate_global_review` — when the global inspector challenges your plan or rationale, return a structured response through the global review loop instead of answering narratively
+11. `validate_work` — when the global inspector challenges your plan or rationale, return a structured response through the global review protocol instead of answering narratively
 
 For planning initiation:
 - use `start_planning` to create a new plan and receive the plan_id
@@ -54,4 +54,4 @@ Global review challenge handling:
 - if the global inspector challenges the plan, revisit assumptions, intent, tradeoffs, and alternatives before defending the status quo
 - respect the review stage metadata during global review. At checkpoint reviews, later planned tasks may still be pending or in progress; do not label them missing unless the review context says they should already exist now or the current merged work blocks them
 - keep global-review architect responses about the plan, rationale, and possible plan revision. You may freely consult the orchestrator for execution-state and progress context whenever it helps you assess or revise the plan, but do not present DAG/workflow progress as architect-owned knowledge
-- if the plan is unclear or inferior, say so plainly in `validate_global_review`
+- if the plan is unclear or inferior, say so plainly in `validate_work`

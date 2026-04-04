@@ -58,6 +58,7 @@ func newResponseTestGuide(t *testing.T) (*Guide, chan *Message) {
 		pending:              NewPendingStore(DefaultPendingStoreConfig()),
 		streams:              newGuideStreamManager(nil),
 		agentChannels:        NewStringMap[*AgentChannels](DefaultShardCount),
+		agentID:              "guide",
 		sessionID:            "test-session",
 		responseMessagesSeen: make(map[string]time.Time),
 		completedPendings:    make(map[string]completedPendingRoute),
@@ -65,25 +66,18 @@ func newResponseTestGuide(t *testing.T) (*Guide, chan *Message) {
 }
 
 func setPendingRoute(g *Guide, correlationID string) {
-	g.pending.Set(correlationID, &PendingRequest{
-		CorrelationID: correlationID,
-		SourceAgentID: "tui",
-		TargetAgentID: "academic",
-		Request: &RouteRequest{
-			CorrelationID: correlationID,
-			SessionID:     "test-session",
-			SourceAgentID: "tui",
-		},
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(DefaultPendingStoreConfig().DefaultTimeout),
-	})
+	setPendingRouteWithTargetAndMetadata(g, correlationID, "academic", nil)
 }
 
 func setPendingRouteWithMetadata(g *Guide, correlationID string, metadata map[string]any) {
+	setPendingRouteWithTargetAndMetadata(g, correlationID, "academic", metadata)
+}
+
+func setPendingRouteWithTargetAndMetadata(g *Guide, correlationID, targetAgentID string, metadata map[string]any) {
 	g.pending.Set(correlationID, &PendingRequest{
 		CorrelationID: correlationID,
 		SourceAgentID: "tui",
-		TargetAgentID: "academic",
+		TargetAgentID: targetAgentID,
 		Request: &RouteRequest{
 			CorrelationID: correlationID,
 			SessionID:     "test-session",
@@ -93,6 +87,184 @@ func setPendingRouteWithMetadata(g *Guide, correlationID string, metadata map[st
 		CreatedAt: time.Now(),
 		ExpiresAt: time.Now().Add(DefaultPendingStoreConfig().DefaultTimeout),
 	})
+}
+
+func TestGuideSelfStreamMetadataDoesNotLeakTargetIdentity(t *testing.T) {
+	g, out := newResponseTestGuide(t)
+	setPendingRouteWithMetadata(g, "corr-guide-stream", map[string]any{
+		"agent_type":                 "architect",
+		"agent_name":                 "Architect",
+		"runtime_agent_id":           "architect",
+		"chat_nested_branch":         true,
+		"chat_parent_correlation_id": "corr-parent",
+		"chat_parent_tool_call_key":  "consult-1",
+		"chat_inter_agent_kind":      "consult",
+	})
+
+	g.publishGuideStreamComplete("corr-guide-stream", "tui", nil)
+
+	select {
+	case msg := <-out:
+		stream, ok := msg.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatal("expected relayed guide stream response")
+		}
+		if got := stream.RespondingAgentID; got != "guide" {
+			t.Fatalf("responding agent = %q, want guide", got)
+		}
+		if got := stream.Metadata["agent_type"]; got != "guide" {
+			t.Fatalf("stream metadata agent_type = %#v, want guide", got)
+		}
+		if got := stream.Metadata["agent_name"]; got != "Guide" {
+			t.Fatalf("stream metadata agent_name = %#v, want Guide", got)
+		}
+		if _, ok := stream.Metadata["runtime_agent_id"]; ok {
+			t.Fatalf("guide self-stream should not leak runtime_agent_id: %#v", stream.Metadata["runtime_agent_id"])
+		}
+		if got := stream.Metadata["chat_parent_correlation_id"]; got != "corr-parent" {
+			t.Fatalf("stream metadata chat_parent_correlation_id = %#v, want corr-parent", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for relayed guide stream response")
+	}
+}
+
+func TestGuideSelfResponseMetadataDoesNotLeakTargetIdentity(t *testing.T) {
+	g, out := newResponseTestGuide(t)
+	setPendingRouteWithMetadata(g, "corr-guide-response", map[string]any{
+		"agent_type":       "architect",
+		"agent_name":       "Architect",
+		"runtime_agent_id": "architect",
+		"task_id":          "task-123",
+	})
+	pending := g.pending.Get("corr-guide-response")
+	if pending == nil {
+		t.Fatal("expected pending request")
+	}
+
+	err := g.publishResponseToSource("tui", &RouteResponse{
+		CorrelationID:       "corr-guide-response",
+		RespondingAgentID:   "guide",
+		RespondingAgentName: "Guide",
+		Success:             true,
+		Data:                "ok",
+	}, pending)
+	if err != nil {
+		t.Fatalf("publish response to source: %v", err)
+	}
+
+	select {
+	case msg := <-out:
+		resp, ok := msg.GetRouteResponse()
+		if !ok || resp == nil {
+			t.Fatal("expected relayed guide route response")
+		}
+		if got := msg.Metadata["agent_type"]; got != "guide" {
+			t.Fatalf("response metadata agent_type = %#v, want guide", got)
+		}
+		if got := msg.Metadata["agent_name"]; got != "Guide" {
+			t.Fatalf("response metadata agent_name = %#v, want Guide", got)
+		}
+		if _, ok := msg.Metadata["runtime_agent_id"]; ok {
+			t.Fatalf("guide self-response should not leak runtime_agent_id: %#v", msg.Metadata["runtime_agent_id"])
+		}
+		if got := msg.Metadata["task_id"]; got != "task-123" {
+			t.Fatalf("response metadata task_id = %#v, want task-123", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for relayed guide route response")
+	}
+}
+
+func TestRelayedNonGuideStreamMetadataUsesResponderIdentity(t *testing.T) {
+	g, out := newResponseTestGuide(t)
+	setPendingRouteWithTargetAndMetadata(g, "corr-architect-stream", "architect", map[string]any{
+		"agent_type":       "guide",
+		"agent_name":       "Guide",
+		"runtime_agent_id": "guide",
+		"task_id":          "task-123",
+	})
+
+	err := g.publishStreamToSource("tui", &StreamResponse{
+		CorrelationID:       "corr-architect-stream",
+		RespondingAgentID:   "architect",
+		RespondingAgentName: "Architect",
+		Event: &StreamEvent{
+			Type: StreamEventStart,
+		},
+	})
+	if err != nil {
+		t.Fatalf("publish stream to source: %v", err)
+	}
+
+	select {
+	case msg := <-out:
+		stream, ok := msg.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatal("expected relayed architect stream response")
+		}
+		if got := stream.Metadata["agent_type"]; got != "architect" {
+			t.Fatalf("stream metadata agent_type = %#v, want architect", got)
+		}
+		if got := stream.Metadata["agent_name"]; got != "Architect" {
+			t.Fatalf("stream metadata agent_name = %#v, want Architect", got)
+		}
+		if got := stream.Metadata["task_id"]; got != "task-123" {
+			t.Fatalf("stream metadata task_id = %#v, want task-123", got)
+		}
+		if got := stream.Metadata["runtime_agent_id"]; got != nil {
+			t.Fatalf("stream metadata runtime_agent_id = %#v, want nil for canonical architect responder", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for relayed architect stream response")
+	}
+}
+
+func TestRelayedNonGuideResponseMetadataUsesResponderIdentity(t *testing.T) {
+	g, out := newResponseTestGuide(t)
+	setPendingRouteWithTargetAndMetadata(g, "corr-architect-response", "architect", map[string]any{
+		"agent_type":       "guide",
+		"agent_name":       "Guide",
+		"runtime_agent_id": "guide",
+		"task_id":          "task-123",
+	})
+	pending := g.pending.Get("corr-architect-response")
+	if pending == nil {
+		t.Fatal("expected pending request")
+	}
+
+	err := g.publishResponseToSource("tui", &RouteResponse{
+		CorrelationID:       "corr-architect-response",
+		RespondingAgentID:   "architect",
+		RespondingAgentName: "Architect",
+		Success:             true,
+		Data:                "ok",
+	}, pending)
+	if err != nil {
+		t.Fatalf("publish response to source: %v", err)
+	}
+
+	select {
+	case msg := <-out:
+		resp, ok := msg.GetRouteResponse()
+		if !ok || resp == nil {
+			t.Fatal("expected relayed architect route response")
+		}
+		if got := msg.Metadata["agent_type"]; got != "architect" {
+			t.Fatalf("response metadata agent_type = %#v, want architect", got)
+		}
+		if got := msg.Metadata["agent_name"]; got != "Architect" {
+			t.Fatalf("response metadata agent_name = %#v, want Architect", got)
+		}
+		if got := msg.Metadata["task_id"]; got != "task-123" {
+			t.Fatalf("response metadata task_id = %#v, want task-123", got)
+		}
+		if got := msg.Metadata["runtime_agent_id"]; got != nil {
+			t.Fatalf("response metadata runtime_agent_id = %#v, want nil for canonical architect responder", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for relayed architect route response")
+	}
 }
 
 func setPendingRouteWithOverride(g *Guide, correlationID, sourceAgentID, targetAgentID, streamTarget string, metadata map[string]any) {
@@ -321,8 +493,8 @@ func TestHandleResponseMessage_IgnoresGuideRelayedRouteResponses(t *testing.T) {
 	if got := forwarded.Metadata["task_id"]; got != "task-1" {
 		t.Fatalf("forwarded task_id metadata = %#v, want task-1", got)
 	}
-	if got := forwarded.Metadata["agent_type"]; got != "inspector-pipeline" {
-		t.Fatalf("forwarded agent_type metadata = %#v, want inspector-pipeline", got)
+	if got := forwarded.Metadata["agent_type"]; got != "guardian" {
+		t.Fatalf("forwarded agent_type metadata = %#v, want guardian", got)
 	}
 
 	if err := g.handleResponseMessage(forwarded); err != nil {
@@ -387,6 +559,67 @@ func TestHandleResponseMessage_RestoresPendingMetadataOnRelayedStream(t *testing
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for relayed stream start")
+	}
+}
+
+func TestHandleResponseMessage_SparseStreamMetadataDoesNotClobberPendingIdentity(t *testing.T) {
+	g, out := newResponseTestGuide(t)
+	setPendingRouteWithMetadata(g, "corr-relayed-stream-sparse", map[string]any{
+		"chat_nested_branch":          true,
+		"chat_parent_correlation_id":  "corr-parent",
+		"chat_parent_tool_call_key":   "challenge-1",
+		"chat_inter_agent_kind":       "challenge",
+		"chat_inter_agent_thread_key": "thread-1",
+		"agent_type":                  "tester-pipeline",
+		"task_id":                     "task-3",
+		"task_name":                   "Create hello.py CLI entrypoint",
+		"task_slug":                   "create-cli-entrypoint",
+	})
+
+	msg := &Message{
+		ID:            "msg-relayed-stream-progress-sparse",
+		CorrelationID: "corr-relayed-stream-sparse",
+		Type:          MessageTypeStream,
+		SourceAgentID: "runtime-tester",
+		Payload: &StreamResponse{
+			CorrelationID:     "corr-relayed-stream-sparse",
+			RespondingAgentID: "runtime-tester",
+			Metadata: map[string]any{
+				"task_id":   "",
+				"task_name": "",
+				"task_slug": "",
+			},
+			Event: &StreamEvent{
+				Type:      StreamEventProgress,
+				Timestamp: time.Now(),
+			},
+		},
+	}
+
+	if err := g.handleResponseMessage(msg); err != nil {
+		t.Fatalf("handleResponseMessage: %v", err)
+	}
+
+	select {
+	case forwarded := <-out:
+		stream, ok := forwarded.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatalf("unexpected forwarded message: %+v", forwarded)
+		}
+		if got := stream.Metadata["task_id"]; got != "task-3" {
+			t.Fatalf("task_id metadata = %#v, want task-3", got)
+		}
+		if got := stream.Metadata["task_name"]; got != "Create hello.py CLI entrypoint" {
+			t.Fatalf("task_name metadata = %#v, want preserved task name", got)
+		}
+		if got := stream.Metadata["task_slug"]; got != "create-cli-entrypoint" {
+			t.Fatalf("task_slug metadata = %#v, want preserved task slug", got)
+		}
+		if got := stream.Metadata["chat_parent_correlation_id"]; got != "corr-parent" {
+			t.Fatalf("parent correlation metadata = %#v, want corr-parent", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for relayed sparse stream progress")
 	}
 }
 
@@ -548,6 +781,272 @@ func TestHandleResponseMessage_MirrorsRelayedStreamActivityToRequesterWhenRerout
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for mirrored academic stream")
 	}
+}
+
+func TestHandleResponseMessage_MirrorsNestedStreamToAncestorVisibleTarget(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	t.Cleanup(func() {
+		_ = bus.Close()
+	})
+
+	tuiOut := make(chan *Message, 1)
+	tuiSub, err := bus.Subscribe(TopicResponses("tui", "tui"), func(msg *Message) error {
+		tuiOut <- msg
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe tui responses: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = tuiSub.Unsubscribe()
+	})
+
+	orchestratorOut := make(chan *Message, 1)
+	orchestratorSub, err := bus.Subscribe(TopicResponses("orchestrator", "orchestrator"), func(msg *Message) error {
+		orchestratorOut <- msg
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe orchestrator responses: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = orchestratorSub.Unsubscribe()
+	})
+
+	inspectorOut := make(chan *Message, 1)
+	inspectorSub, err := bus.Subscribe(TopicResponses("inspector", "inspector"), func(msg *Message) error {
+		inspectorOut <- msg
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe inspector responses: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = inspectorSub.Unsubscribe()
+	})
+
+	g := &Guide{
+		bus:                  bus,
+		pending:              NewPendingStore(DefaultPendingStoreConfig()),
+		streams:              newGuideStreamManager(nil),
+		agentChannels:        NewStringMap[*AgentChannels](DefaultShardCount),
+		sessionID:            "test-session",
+		responseMessagesSeen: make(map[string]time.Time),
+		completedPendings:    make(map[string]completedPendingRoute),
+	}
+	g.pending.Set("corr-root", &PendingRequest{
+		CorrelationID: "corr-root",
+		SourceAgentID: "tui",
+		TargetAgentID: "orchestrator",
+		Request: &RouteRequest{
+			CorrelationID: "corr-root",
+			SessionID:     "test-session",
+			SourceAgentID: "tui",
+		},
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(DefaultPendingStoreConfig().DefaultTimeout),
+	})
+	g.pending.Set("corr-child", &PendingRequest{
+		CorrelationID:        "corr-child",
+		SourceAgentID:        "inspector",
+		TargetAgentID:        "academic",
+		StreamTargetOverride: "orchestrator",
+		Request: &RouteRequest{
+			CorrelationID:       "corr-child",
+			SessionID:           "test-session",
+			SourceAgentID:       "inspector",
+			ParentCorrelationID: "corr-root",
+			Metadata: map[string]any{
+				"chat_nested_branch":         true,
+				"chat_parent_correlation_id": "corr-root",
+				"chat_parent_tool_call_key":  "challenge-1",
+				"chat_inter_agent_kind":      "challenge",
+			},
+		},
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(DefaultPendingStoreConfig().DefaultTimeout),
+	})
+
+	msg := &Message{
+		ID:            "msg-mirror-ancestor-progress",
+		CorrelationID: "corr-child",
+		Type:          MessageTypeStream,
+		SourceAgentID: "academic",
+		Payload: &StreamResponse{
+			CorrelationID:     "corr-child",
+			RespondingAgentID: "academic",
+			Event: &StreamEvent{
+				Type: StreamEventProgress,
+				Data: &ProgressData{Message: "Comparing the strongest alternatives"},
+			},
+		},
+	}
+	if err := g.handleResponseMessage(msg); err != nil {
+		t.Fatalf("handleResponseMessage: %v", err)
+	}
+
+	select {
+	case forwarded := <-tuiOut:
+		stream, ok := forwarded.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatalf("unexpected tui message: %+v", forwarded)
+		}
+		if stream.TargetAgentID != "tui" {
+			t.Fatalf("tui target agent = %q, want tui", stream.TargetAgentID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ancestor-visible tui stream")
+	}
+
+	select {
+	case forwarded := <-orchestratorOut:
+		stream, ok := forwarded.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatalf("unexpected orchestrator message: %+v", forwarded)
+		}
+		if stream.TargetAgentID != "orchestrator" {
+			t.Fatalf("orchestrator target agent = %q, want orchestrator", stream.TargetAgentID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for primary nested stream target")
+	}
+
+	select {
+	case mirrored := <-inspectorOut:
+		stream, ok := mirrored.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatalf("unexpected inspector message: %+v", mirrored)
+		}
+		if stream.TargetAgentID != "inspector" {
+			t.Fatalf("inspector target agent = %q, want inspector", stream.TargetAgentID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for requester mirror")
+	}
+}
+
+func TestHandleResponseMessage_MirrorsEngineerNestedConsultStreamToTUIImmediately(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	t.Cleanup(func() {
+		_ = bus.Close()
+	})
+
+	tuiOut := make(chan *Message, 1)
+	tuiSub, err := bus.Subscribe(TopicResponses("tui", "tui"), func(msg *Message) error {
+		tuiOut <- msg
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe tui responses: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = tuiSub.Unsubscribe()
+	})
+
+	engineerOut := make(chan *Message, 1)
+	engineerSub, err := bus.Subscribe(TopicResponses("engineer-runtime", "engineer-runtime"), func(msg *Message) error {
+		engineerOut <- msg
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe engineer responses: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = engineerSub.Unsubscribe()
+	})
+
+	g := &Guide{
+		bus:                  bus,
+		pending:              NewPendingStore(DefaultPendingStoreConfig()),
+		streams:              newGuideStreamManager(nil),
+		agentChannels:        NewStringMap[*AgentChannels](DefaultShardCount),
+		sessionID:            "test-session",
+		responseMessagesSeen: make(map[string]time.Time),
+		completedPendings:    make(map[string]completedPendingRoute),
+	}
+	g.pending.Set("corr-root", &PendingRequest{
+		CorrelationID: "corr-root",
+		SourceAgentID: "tui",
+		TargetAgentID: "orchestrator",
+		Request: &RouteRequest{
+			CorrelationID: "corr-root",
+			SessionID:     "test-session",
+			SourceAgentID: "tui",
+		},
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(DefaultPendingStoreConfig().DefaultTimeout),
+	})
+
+	engineerParentID := g.pending.Add(&RouteRequest{
+		CorrelationID:       "corr-engineer",
+		SessionID:           "test-session",
+		SourceAgentID:       "orchestrator",
+		ParentCorrelationID: "corr-root",
+	}, nil, "engineer")
+	if engineerParentID != "corr-engineer" {
+		t.Fatalf("engineer parent correlation = %q, want corr-engineer", engineerParentID)
+	}
+
+	childID := g.pending.Add(&RouteRequest{
+		CorrelationID:       "corr-librarian",
+		SessionID:           "test-session",
+		SourceAgentID:       "engineer-runtime",
+		ParentCorrelationID: engineerParentID,
+		Metadata: map[string]any{
+			"chat_nested_branch":         true,
+			"chat_parent_correlation_id": "corr-engineer",
+			"chat_parent_tool_call_key":  "consult-1",
+			"chat_inter_agent_kind":      "consult",
+		},
+	}, nil, "librarian")
+	if childID != "corr-librarian" {
+		t.Fatalf("child correlation = %q, want corr-librarian", childID)
+	}
+
+	msg := &Message{
+		ID:            "msg-engineer-child-progress",
+		CorrelationID: "corr-librarian",
+		Type:          MessageTypeStream,
+		SourceAgentID: "librarian",
+		Payload: &StreamResponse{
+			CorrelationID:     "corr-librarian",
+			RespondingAgentID: "librarian",
+			Event: &StreamEvent{
+				Type: StreamEventProgress,
+				Data: &ProgressData{Message: "Searching codebase"},
+			},
+		},
+	}
+	if err := g.handleResponseMessage(msg); err != nil {
+		t.Fatalf("handleResponseMessage: %v", err)
+	}
+
+	select {
+	case forwarded := <-tuiOut:
+		stream, ok := forwarded.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatalf("unexpected tui message: %+v", forwarded)
+		}
+		if stream.TargetAgentID != "tui" {
+			t.Fatalf("tui target agent = %q, want tui", stream.TargetAgentID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for immediate tui relayed stream")
+	}
+
+	select {
+	case mirrored := <-engineerOut:
+		stream, ok := mirrored.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatalf("unexpected engineer message: %+v", mirrored)
+		}
+		if stream.TargetAgentID != "engineer-runtime" {
+			t.Fatalf("engineer target agent = %q, want engineer-runtime", stream.TargetAgentID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for mirrored engineer stream")
+	}
+
 }
 
 func TestNewWithProvider_InitializesResponseTrackingForStreamRelay(t *testing.T) {

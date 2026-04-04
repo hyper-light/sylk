@@ -18,31 +18,31 @@ func TestNewGlobalReviewProtocolSkills_AgentSpecificOwnership(t *testing.T) {
 		want      []string
 	}{
 		{
-			name:      "inspector owns challenge and commit path",
+			name:      "inspector owns global handoff challenge and commit path",
 			agentType: GlobalReviewAgentInspector,
 			want: []string{
-				"challenge_global_tester",
-				"challenge_orchestrator",
-				"challenge_architect",
-				"process_global_validation",
+				"challenge_agent",
+				"handoff_next",
+				"validate_work",
+				"process_validation",
 				"finalize_global_review",
 				"commit_to_disk",
 			},
 		},
 		{
-			name:      "tester only validates",
+			name:      "tester mirrors pipeline handoff and challenge mechanics",
 			agentType: GlobalReviewAgentTester,
-			want:      []string{"validate_global_review"},
+			want:      []string{"challenge_agent", "handoff_next", "validate_work", "process_validation"},
 		},
 		{
 			name:      "architect only validates",
 			agentType: GlobalReviewAgentArchitect,
-			want:      []string{"validate_global_review"},
+			want:      []string{"validate_work"},
 		},
 		{
 			name:      "orchestrator only validates",
 			agentType: GlobalReviewAgentOrchestrator,
-			want:      []string{"validate_global_review"},
+			want:      []string{"validate_work"},
 		},
 	}
 
@@ -107,23 +107,24 @@ func TestGlobalReviewOrchestratorChallenge_CarriesExecutionStateGuard(t *testing
 			SessionID: func() string { return "sess-1" },
 		},
 	})
-	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_orchestrator", map[string]any{
-		"reason":  "Need authoritative workflow progress before deciding whether the checkpoint is on track.",
-		"request": "Report DAG/workflow progress, remaining tasks, and any blockers for the current merged checkpoint.",
+	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_agent", map[string]any{
+		"target_agents": []string{GlobalReviewAgentOrchestrator},
+		"reason":        "Need authoritative workflow progress before deciding whether the checkpoint is on track.",
+		"request":       "Report DAG/workflow progress, remaining tasks, and any blockers for the current merged checkpoint.",
 	}); err != nil {
-		t.Fatalf("challenge_orchestrator: %v", err)
+		t.Fatalf("challenge_agent orchestrator: %v", err)
 	}
 
 	select {
 	case req := <-reqCh:
-		if !strings.Contains(req.Input, "Global inspector challenge for the orchestrator.") {
-			t.Fatalf("input = %q, want orchestrator challenge heading", req.Input)
+		if !strings.Contains(req.Input, "Global review request for the orchestrator.") {
+			t.Fatalf("input = %q, want orchestrator request heading", req.Input)
 		}
 		if !strings.Contains(req.Input, "Orchestrator scope rule") {
 			t.Fatalf("input = %q, want orchestrator scope rule", req.Input)
 		}
-		if !strings.Contains(req.Input, "validate_global_review") {
-			t.Fatalf("input = %q, want validate_global_review instruction", req.Input)
+		if !strings.Contains(req.Input, "validate_work") {
+			t.Fatalf("input = %q, want validate_work instruction", req.Input)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for orchestrator challenge route")
@@ -171,11 +172,12 @@ func TestGlobalReviewChallengePublishesUserVisibleRoute(t *testing.T) {
 			SessionID: func() string { return "sess-1" },
 		},
 	})
-	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_global_tester", map[string]any{
-		"reason":  "Need merged-state adversarial validation.",
-		"request": "Run the full tester audit against the merged plan.",
+	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_agent", map[string]any{
+		"target_agents": []string{GlobalReviewAgentTester},
+		"reason":        "Need merged-state adversarial validation.",
+		"request":       "Run the full tester audit against the merged plan.",
 	}); err != nil {
-		t.Fatalf("challenge_global_tester: %v", err)
+		t.Fatalf("challenge_agent tester: %v", err)
 	}
 
 	select {
@@ -195,11 +197,75 @@ func TestGlobalReviewChallengePublishesUserVisibleRoute(t *testing.T) {
 		if !strings.Contains(req.Input, "Future planned work that has not been merged yet is pending, not missing.") {
 			t.Fatalf("input = %q, want checkpoint pending guidance", req.Input)
 		}
-		if !strings.Contains(req.Input, "Protocol obligations:") || !strings.Contains(req.Input, "validate_global_review") {
+		if !strings.Contains(req.Input, "Protocol obligations:") || !strings.Contains(req.Input, "validate_work") {
 			t.Fatalf("input = %q, want protocol obligation guidance", req.Input)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for global review route request")
+	}
+}
+
+func TestGlobalReviewHandoffPublishesTopLevelRoute(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	t.Cleanup(func() { _ = bus.Close() })
+
+	reqCh := make(chan *guide.RouteRequest, 1)
+	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.TargetAgentID != GlobalReviewAgentTester {
+			return nil
+		}
+		select {
+		case reqCh <- req:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	snapshot := &GlobalReviewSnapshot{
+		ReviewID:       "review-handoff",
+		CurrentRequest: "Audit the merged result.",
+	}
+	ctx := WithGlobalReviewState(context.Background(), NewGlobalReviewState(snapshot, GlobalReviewMetadata(map[string]any{
+		"global_review_stage": "checkpoint",
+	}, snapshot)))
+	ctx = WithStreamContext(ctx, "corr-handoff", "orchestrator")
+
+	skills := NewGlobalReviewProtocolSkills(GlobalReviewProtocolSkillConfig{
+		AgentType: func() string { return GlobalReviewAgentInspector },
+		Route: GlobalReviewRouteConfig{
+			Bus:       bus,
+			SessionID: func() string { return "sess-1" },
+		},
+	})
+	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "handoff_next", map[string]any{
+		"target_agents": []string{GlobalReviewAgentTester},
+		"reason":        "Tester should perform the next broad merged-state validation pass.",
+		"request":       "Audit the merged checkpoint and return the broad testing verdict.",
+	}); err != nil {
+		t.Fatalf("handoff_next: %v", err)
+	}
+
+	select {
+	case req := <-reqCh:
+		if req.ParentCorrelationID != "corr-handoff" {
+			t.Fatalf("parent_correlation_id = %q, want corr-handoff", req.ParentCorrelationID)
+		}
+		if req.Metadata["chat_nested_branch"] == true {
+			t.Fatalf("handoff_next should not stamp nested challenge metadata: %#v", req.Metadata)
+		}
+		if !strings.Contains(req.Input, "ordinary top-level handoff") {
+			t.Fatalf("input = %q, want top-level handoff guidance", req.Input)
+		}
+		if !strings.Contains(req.Input, "`handoff_next`") {
+			t.Fatalf("input = %q, want handoff_next guidance", req.Input)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for global review handoff route")
 	}
 }
 
@@ -244,11 +310,12 @@ func TestGlobalReviewArchitectChallenge_CarriesCheckpointGuard(t *testing.T) {
 			SessionID: func() string { return "sess-1" },
 		},
 	})
-	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_architect", map[string]any{
-		"reason":  "Need plan-level clarification for this checkpoint review.",
-		"request": "Explain whether the current checkpoint is still aligned with the plan.",
+	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_agent", map[string]any{
+		"target_agents": []string{GlobalReviewAgentArchitect},
+		"reason":        "Need plan-level clarification for this checkpoint review.",
+		"request":       "Explain whether the current checkpoint is still aligned with the plan.",
 	}); err != nil {
-		t.Fatalf("challenge_architect: %v", err)
+		t.Fatalf("challenge_agent architect: %v", err)
 	}
 
 	select {

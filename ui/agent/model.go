@@ -11,6 +11,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/ui/agentidentity"
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
@@ -258,12 +259,45 @@ func inferSeedPipelineIdentity(agentID, agentType string) (resolvedAgentType, pi
 }
 
 func canonicalPipelineAgentID(agentType, pipelineID string) string {
-	agentType = strings.TrimSpace(agentType)
-	pipelineID = strings.TrimSpace(pipelineID)
-	if resolveAgentCategory(agentType, pipelineID) != "pipeline" || pipelineID == "" {
+	if resolveAgentCategory(agentType, pipelineID) != "pipeline" {
 		return ""
 	}
-	return pipelineID + ":" + agentType
+	return agentidentity.CanonicalPipelinePanelID(agentType, pipelineID)
+}
+
+func shouldUseCanonicalSingletonRow(agentType, category string) bool {
+	agentType = strings.TrimSpace(agentType)
+	category = strings.TrimSpace(category)
+	if agentType == "" {
+		return false
+	}
+	switch category {
+	case "standalone", "knowledge":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCanonicalSingletonAgentType(agentType string) bool {
+	agentType = strings.TrimSpace(agentType)
+	if agentType == "" {
+		return false
+	}
+	switch resolveAgentCategory(agentType, "") {
+	case "standalone", "knowledge":
+		return true
+	default:
+		return false
+	}
+}
+
+func isProtectedCanonicalSingletonID(agentID string) bool {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return false
+	}
+	return isCanonicalSingletonAgentType(agentID)
 }
 
 func isInternalSidecarAgent(agentID, agentType string) bool {
@@ -276,65 +310,15 @@ func isInternalSidecarAgent(agentID, agentType string) bool {
 }
 
 func parseTaskScopedPipelineAgentID(agentID string) (taskID, agentType string, ok bool) {
-	agentID = strings.TrimSpace(agentID)
-	if agentID == "" {
-		return "", "", false
-	}
-	parts := strings.SplitN(agentID, "__", 2)
-	if len(parts) != 2 {
-		return "", "", false
-	}
-	taskID = strings.TrimSpace(parts[0])
-	agentType = strings.TrimSpace(parts[1])
-	if taskID == "" {
-		return "", "", false
-	}
-	switch agentType {
-	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
-		return taskID, agentType, true
-	default:
-		return "", "", false
-	}
+	return agentidentity.ParseTaskScopedPipelineAgentID(agentID)
 }
 
 func parseCanonicalPipelinePanelAgentID(agentID string) (pipelineID, agentType string, ok bool) {
-	agentID = strings.TrimSpace(agentID)
-	if agentID == "" {
-		return "", "", false
-	}
-	for _, candidateType := range []string{"inspector-pipeline", "tester-pipeline", "engineer", "designer"} {
-		suffix := ":" + candidateType
-		if !strings.HasSuffix(agentID, suffix) {
-			continue
-		}
-		pipelineID = strings.TrimSpace(strings.TrimSuffix(agentID, suffix))
-		if pipelineID == "" {
-			return "", "", false
-		}
-		return pipelineID, candidateType, true
-	}
-	return "", "", false
+	return agentidentity.ParseCanonicalPipelinePanelAgentID(agentID)
 }
 
 func canonicalStreamAgentID(agentID, agentType, pipelineID, taskID string) string {
-	if trimmed := strings.TrimSpace(taskID); trimmed != "" {
-		pipelineID = trimmed
-	} else {
-		pipelineID = strings.TrimSpace(pipelineID)
-	}
-	agentType = strings.TrimSpace(agentType)
-	if scopedTaskID, scopedAgentType, ok := parseTaskScopedPipelineAgentID(agentID); ok {
-		if pipelineID == "" {
-			pipelineID = scopedTaskID
-		}
-		if agentType == "" {
-			agentType = scopedAgentType
-		}
-	}
-	if canonical := canonicalPipelineAgentID(agentType, pipelineID); canonical != "" {
-		return canonical
-	}
-	return strings.TrimSpace(agentID)
+	return agentidentity.VisibleAgentID(agentID, "", agentType, pipelineID, taskID)
 }
 
 func defaultRoutingAgentID(agentID, agentType, pipelineID string) string {
@@ -978,7 +962,11 @@ func (m *Model) ensureAgentForLiveEvent(panelID, rawAgentID, agentType, agentNam
 }
 
 func (m *Model) canonicalizeAgentID(agentID string, ev msg.ActivityEventMsg) string {
-	candidateID := firstNonEmptyTrimmed(extractString(ev.Event.Data, "runtime_agent_id"), agentID)
+	candidateID := firstNonEmptyTrimmed(
+		extractString(ev.Event.Data, "canonical_agent_id"),
+		agentID,
+		extractString(ev.Event.Data, "runtime_agent_id"),
+	)
 	agentType, pipelineID := m.inferActivityAgentIdentity(candidateID, ev)
 	if panelID := canonicalPipelineAgentID(agentType, pipelineID); panelID != "" {
 		return m.resolveAgentID(panelID)
@@ -990,6 +978,9 @@ func (m *Model) resolveAgentID(agentID string) string {
 	agentID = strings.TrimSpace(agentID)
 	if agentID == "" {
 		return ""
+	}
+	if _, ok := m.agents[agentID]; ok {
+		return agentID
 	}
 	seen := make(map[string]struct{}, 4)
 	current := agentID
@@ -1023,7 +1014,9 @@ func (m *Model) rememberAgentAliases(canonicalID, rawAgentID string, ev msg.Acti
 			agent.RoutingID = canonicalID
 		}
 	}
-	if rawAgentID != "" && shouldRememberRawAgentAlias(rawAgentID) {
+	if rawAgentID != "" &&
+		shouldRememberRawAgentAlias(rawAgentID) &&
+		(!isProtectedCanonicalSingletonID(rawAgentID) || rawAgentID == canonicalID) {
 		m.aliases[rawAgentID] = canonicalID
 	}
 	if runtimeID := extractString(ev.Event.Data, "runtime_agent_id"); runtimeID != "" {
@@ -1058,6 +1051,9 @@ func (m *Model) rehomeDuplicateAgentRows(canonicalID string, ev msg.ActivityEven
 		if candidateID == "" || candidateID == canonicalID {
 			continue
 		}
+		if isProtectedCanonicalSingletonID(candidateID) && candidateID != canonicalID {
+			continue
+		}
 		candidate := m.agents[candidateID]
 		if candidate == nil {
 			continue
@@ -1071,12 +1067,10 @@ func (m *Model) rehomeDuplicateAgentRows(canonicalID string, ev msg.ActivityEven
 }
 
 // ensureAgent creates an agent entry if it does not exist, respecting the bound.
-// For standalone agents (one-per-type), re-keys the existing entry to the new
-// UUID instead of creating a duplicate. Pipeline workers stay anchored to their
-// stable task-scoped panel row and only update routing metadata when a concrete
-// runtime worker ID is observed. This handles two cases:
-//  1. Seeded placeholder (ID == AgentType) promoted on first activation.
-//  2. Re-activation after demotion: old UUID entry promoted to new UUID.
+// Standalone and knowledge agents stay anchored to stable singleton panel rows
+// keyed by agent type; concrete runtime IDs are tracked as routing aliases only.
+// Pipeline workers stay anchored to their stable task-scoped panel row and only
+// update routing metadata when a concrete runtime worker ID is observed.
 func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 	if existing, exists := m.agents[agentID]; exists {
 		m.reconcileExistingAgent(existing, ev)
@@ -1096,11 +1090,14 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 	// re-keyed on first activation; pipeline rows stay stable and only refresh
 	// their routing metadata when a concrete runtime worker ID is observed.
 	// This covers:
-	//  1. Seeded placeholder (ID == AgentType) promoted on first activation.
-	//  2. Re-activation after demotion: old UUID entry promoted to new UUID.
+	//  1. Singleton rows (standalone/knowledge) remain stable across activations.
+	//  2. Pipeline workers keep their stable task-scoped row IDs.
 	category := resolveAgentCategory(agentType, pipelineID)
 	if category != "pipeline" {
 		pipelineID = ""
+	}
+	if shouldUseCanonicalSingletonRow(agentType, category) {
+		agentID = strings.TrimSpace(agentType)
 	}
 	if agentType != "" {
 		var existing *AgentState
@@ -1111,20 +1108,9 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 			existing = m.findAgentByType(agentType)
 		}
 		if existing != nil {
-			if category == "pipeline" {
-				m.reconcileExistingAgent(existing, ev)
-				return existing.ID
-			}
-			if category == "knowledge" {
-				m.reconcileExistingAgent(existing, ev)
-				return existing.ID
-			}
-			return m.promoteSeededAgent(existing, agentID, ev)
+			m.reconcileExistingAgent(existing, ev)
+			return existing.ID
 		}
-	}
-
-	if category == "knowledge" && strings.TrimSpace(agentType) != "" {
-		agentID = strings.TrimSpace(agentType)
 	}
 
 	agentName := extractString(ev.Event.Data, "agent_name")

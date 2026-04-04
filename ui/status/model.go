@@ -229,7 +229,7 @@ func (m *Model) SetNerdFonts(detected bool) {
 // Uses m.flash rather than time-based check to guarantee the clearing
 // tick fires even when the flash deadline and the tick align exactly.
 func (m *Model) IsAnimating() bool {
-	return m.spinnerActive || m.flash != "" || m.tokens.IsAnimating() || m.progress.IsActive() || m.progress.IsAnimating()
+	return m.spinnerActive || m.flash != "" || m.tokens.IsAnimating() || m.progress.IsActive() || m.progress.NeedsTick()
 }
 
 func (m *Model) handleDecorTick(now time.Time) (tea.Model, tea.Cmd) {

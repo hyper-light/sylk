@@ -10,9 +10,13 @@ import (
 
 type stubReadWorkspaceViews struct {
 	content map[string][]byte
+	errs    map[string]error
 }
 
 func (s *stubReadWorkspaceViews) ReadFile(_ context.Context, _ WorkspaceView, path string, _ string) ([]byte, error) {
+	if err, ok := s.errs[path]; ok {
+		return nil, err
+	}
 	if content, ok := s.content[path]; ok {
 		return content, nil
 	}
@@ -63,5 +67,39 @@ func TestReadWorkspaceFileSkill_MissingFileReturnsMetadata(t *testing.T) {
 	}
 	if reason, _ := data["reason"].(string); reason == "" {
 		t.Fatal("expected missing-file reason")
+	}
+}
+
+func TestReadWorkspaceFileSkill_UnavailablePipelineViewReturnsStructuredMetadata(t *testing.T) {
+	registry := skills.NewRegistry()
+	registry.Register(NewReadWorkspaceFileSkill(
+		func() WorkspaceViewAccess {
+			return &stubReadWorkspaceViews{
+				content: map[string][]byte{},
+				errs: map[string]error{
+					"hello.py": ErrVFSNotFound,
+				},
+			}
+		},
+		func() string { return "task-1" },
+	))
+
+	result := registry.Invoke(context.Background(), "read_workspace_file", json.RawMessage(`{"view":"pipeline","path":"hello.py"}`))
+	if !result.Success {
+		t.Fatalf("Invoke success = false, error = %s", result.Error)
+	}
+
+	data, ok := result.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("result data type = %T, want map[string]any", result.Data)
+	}
+	if unavailable, _ := data["unavailable"].(bool); !unavailable {
+		t.Fatalf("unavailable = false, want true")
+	}
+	if missing, _ := data["missing"].(bool); missing {
+		t.Fatalf("missing = true, want false")
+	}
+	if reason, _ := data["reason"].(string); reason == "" {
+		t.Fatal("expected unavailable-view reason")
 	}
 }

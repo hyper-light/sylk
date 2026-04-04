@@ -794,7 +794,7 @@ func (p *OpenAIProvider) runStandardGenerateAttempt(
 
 func (p *OpenAIProvider) generateViaStreaming(ctx context.Context, req *Request) (*Response, error) {
 	assembler := newStreamResponseAssembler()
-	completion, streamStopReason, streamUsage, streamMetadata, err := p.runResponseStream(ctx, req, assembler.onChunk)
+	completion, streamStopReason, streamUsage, streamMetadata, err := p.runResponseStreamWithRetry(ctx, req, retryAwareHandler(assembler.onChunk))
 	if err != nil {
 		return nil, err
 	}
@@ -864,15 +864,34 @@ func (p *OpenAIProvider) StreamWithHandler(ctx context.Context, req *Request, ha
 }
 
 func (p *OpenAIProvider) streamWithAuthRefreshRetry(ctx context.Context, req *Request, handler StreamHandler) error {
-	_, _, _, _, err := p.runResponseStream(ctx, req, handler)
+	_, _, _, _, err := p.runResponseStreamWithRetry(ctx, req, handler)
 	if !p.shouldRetryStreamForAuth(err) {
 		return err
 	}
 	if refreshErr := p.refreshChatGPTAuth(ctx); refreshErr != nil {
 		return refreshErr
 	}
-	_, _, _, _, err = p.runResponseStream(ctx, req, handler)
+	_, _, _, _, err = p.runResponseStreamWithRetry(ctx, req, handler)
 	return err
+}
+
+func (p *OpenAIProvider) runResponseStreamWithRetry(
+	ctx context.Context,
+	req *Request,
+	handler StreamHandler,
+) (*responses.Response, StopReason, Usage, map[string]any, error) {
+	var (
+		completion *responses.Response
+		stopReason StopReason
+		usage      Usage
+		metadata   map[string]any
+	)
+	err := retryStream(ctx, p.config.BaseConfig, func(ctx context.Context) error {
+		var runErr error
+		completion, stopReason, usage, metadata, runErr = p.runResponseStream(ctx, req, handler)
+		return runErr
+	})
+	return completion, stopReason, usage, metadata, err
 }
 
 func (p *OpenAIProvider) shouldRetryStreamForAuth(err error) bool {
@@ -915,12 +934,24 @@ func (a *streamResponseAssembler) onChunk(chunk *StreamChunk) error {
 	if chunk == nil {
 		return nil
 	}
+	if chunk.Type == ChunkTypeStart && chunk.RetryReset {
+		a.reset()
+	}
 	for _, handler := range a.handlers {
 		if err := handler(chunk); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (a *streamResponseAssembler) reset() {
+	if a == nil {
+		return
+	}
+	a.content.Reset()
+	a.toolCalls = make(map[string]*ToolCall)
+	a.toolCallOrder = make([]string, 0, 4)
 }
 
 func (a *streamResponseAssembler) handleTextChunk(chunk *StreamChunk) error {

@@ -98,3 +98,43 @@ func TestEngineerRequestConsultSync_UsesStreamActivityWithoutRepublish(t *testin
 		t.Fatalf("publish count = %d, want 1", got)
 	}
 }
+
+func TestEngineerRequestConsultSync_InheritsParentCorrelationFromStreamContext(t *testing.T) {
+	e := &Engineer{
+		id:              "eng-1234",
+		running:         true,
+		pendingConsults: make(map[string]*shared.PendingSyncWait),
+	}
+
+	requests := make(chan *guide.RouteRequest, 1)
+	bus := &consultationTestBus{}
+	bus.onPublish = func(req *guide.RouteRequest) {
+		select {
+		case requests <- req:
+		default:
+		}
+		go e.deliverConsultResponse(guide.NewResponseMessage("", &guide.RouteResponse{
+			CorrelationID: req.CorrelationID,
+			Success:       true,
+			Data:          map[string]any{"ok": true},
+		}))
+	}
+	e.bus = bus
+
+	ctx := shared.WithStreamContext(context.Background(), "corr-parent", "tui")
+	if _, err := e.requestConsultSync(ctx, &guide.RouteRequest{
+		TargetAgentID: "librarian",
+		Input:         "inspect the repository",
+	}); err != nil {
+		t.Fatalf("requestConsultSync() error = %v", err)
+	}
+
+	select {
+	case req := <-requests:
+		if req.ParentCorrelationID != "corr-parent" {
+			t.Fatalf("parent_correlation_id = %q, want corr-parent", req.ParentCorrelationID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for routed request")
+	}
+}

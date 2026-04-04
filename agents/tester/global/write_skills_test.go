@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -116,6 +117,51 @@ func TestGlobalTesterWriteTestAutoRenewsExpiredLease(t *testing.T) {
 	}
 }
 
+func TestGlobalTesterWriteTestAutoRenewsExpiredLeaseWithVisibleInternalToolSteps(t *testing.T) {
+	gt, _, baseCtx := newGlobalTesterWriteHarness(t)
+
+	var emitted []agentshared.ToolCallEvent
+	ctx := agentshared.WithToolCallEmitter(baseCtx, func(event agentshared.ToolCallEvent) {
+		emitted = append(emitted, event)
+	})
+
+	basis := prepareGlobalWriteBasis(t, gt, ctx, "pkg/service/service_test.go")
+	basis.LeaseExpiresAt = time.Now().UTC().Add(-time.Second)
+	emitted = nil
+
+	input, err := json.Marshal(map[string]any{
+		"test_case": map[string]any{
+			"name":        "TestServiceLeaseVisible",
+			"target_file": "pkg/service/service.go",
+		},
+		"target_file": "pkg/service/service.go",
+		"output_file": "pkg/service/service_test.go",
+		"content":     "package service\n\nimport \"testing\"\n\nfunc TestServiceLeaseVisible(t *testing.T) {}\n",
+		"basis":       basis,
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	result := gt.skills.Invoke(ctx, "write_test", input)
+	if !result.Success {
+		t.Fatalf("write_test failed: %s", result.Error)
+	}
+
+	if !hasGlobalToolEvent(emitted, "write_global_file", agentshared.ToolCallStart, false) {
+		t.Fatalf("expected write_global_file start event, got %#v", emitted)
+	}
+	if !hasGlobalToolEvent(emitted, "prepare_global_write_context", agentshared.ToolCallStart, false) {
+		t.Fatalf("expected prepare_global_write_context start event, got %#v", emitted)
+	}
+	if !hasGlobalToolEvent(emitted, "prepare_global_write_context", agentshared.ToolCallComplete, true) {
+		t.Fatalf("expected successful prepare_global_write_context completion event, got %#v", emitted)
+	}
+	if !hasGlobalToolEvent(emitted, "write_global_file", agentshared.ToolCallComplete, true) {
+		t.Fatalf("expected successful write_global_file completion after refresh, got %#v", emitted)
+	}
+}
+
 func newGlobalTesterWriteHarness(t *testing.T) (*GlobalTester, versioning.FileAccess, context.Context) {
 	t.Helper()
 
@@ -176,4 +222,17 @@ func prepareGlobalWriteBasis(
 		t.Fatalf("prepare result type = %T, want PreparedWorkspaceWriteContext", result.Data)
 	}
 	return prepared.Basis
+}
+
+func hasGlobalToolEvent(events []agentshared.ToolCallEvent, name string, phase agentshared.ToolCallPhase, success bool) bool {
+	for _, event := range events {
+		if event.ToolName != name || event.Phase != phase {
+			continue
+		}
+		if phase == agentshared.ToolCallComplete && event.Success != success {
+			continue
+		}
+		return true
+	}
+	return false
 }

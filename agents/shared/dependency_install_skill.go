@@ -36,6 +36,7 @@ type DependencyInstallSkillConfig struct {
 	WorkingDir      func() string
 	CommandsEnabled func() bool
 	DefaultTimeout  func() time.Duration
+	ValidatePlan    func(*DependencyInstallPlan) error
 	ExecuteCommand  func(context.Context, DependencyInstallCommandRequest) (*DependencyInstallCommandResult, error)
 }
 
@@ -91,6 +92,7 @@ func NewDependencyInstallExecutionSkill(cfg DependencyInstallSkillConfig) *skill
 		Avoid(cfg.Avoid).
 		BestPractice("These commands execute against the real disk workspace, not the VFS overlay, so successful installs persist to disk for later agent turns.").
 		BestPractice("Each install or validation step uses exact approval semantics through the same approval flow as command execution tools.").
+		BestPractice("When you include validation_command, make it a simple non-mutating availability check such as '--version' or an import probe, not a project test run or repo-wide audit.").
 		BestPractice(fmt.Sprintf("If you cannot determine the correct install command with significant confidence, call `%s` first instead of guessing.", researchSkill)).
 		StringParam("summary", "Short explanation of the install plan.", true).
 		StringParam("missing_tool", "Missing dependency, tool, or utility this plan remedies.", false).
@@ -124,6 +126,11 @@ func ExecuteDependencyInstallPlan(ctx context.Context, cfg DependencyInstallSkil
 	}
 	if err := ValidateDependencyInstallPlan(plan); err != nil {
 		return nil, err
+	}
+	if cfg.ValidatePlan != nil {
+		if err := cfg.ValidatePlan(plan); err != nil {
+			return nil, err
+		}
 	}
 
 	workspaceRoot := dependencyInstallWorkingDir(cfg)
@@ -159,7 +166,7 @@ func ExecuteDependencyInstallPlan(ctx context.Context, cfg DependencyInstallSkil
 		"steps":        stepResults,
 	}
 	if validationCommand := strings.TrimSpace(plan.ValidationCommand); validationCommand != "" {
-		runResult, err := runDependencyInstallCommand(ctx, cfg, DependencyInstallCommandRequest{
+		runResult, err := runDependencyInstallCommandWithOptions(ctx, cfg, DependencyInstallCommandRequest{
 			ToolName:      cfg.SkillName,
 			Command:       validationCommand,
 			WorkingDir:    workspaceRoot,
@@ -168,22 +175,41 @@ func ExecuteDependencyInstallPlan(ctx context.Context, cfg DependencyInstallSkil
 			AgentType:     strings.TrimSpace(cfg.AgentType),
 			SessionID:     dependencyInstallSessionID(ctx, cfg),
 			Timeout:       timeout,
-		})
+		}, dependencyInstallCommandRunOptions{AllowNonZeroExit: true})
+		validation := map[string]any{
+			"command": validationCommand,
+			"success": false,
+		}
+		if runResult != nil {
+			validation["exit_code"] = runResult.ExitCode
+			validation["stdout"] = string(runResult.Stdout)
+			validation["stderr"] = string(runResult.Stderr)
+			validation["truncated"] = runResult.StdoutTruncated || runResult.StderrTruncated
+			validation["success"] = runResult.ExitCode == 0
+		}
 		if err != nil {
-			return nil, err
+			validation["error"] = err.Error()
 		}
-		result["validation"] = map[string]any{
-			"command":   validationCommand,
-			"exit_code": runResult.ExitCode,
-			"stdout":    string(runResult.Stdout),
-			"stderr":    string(runResult.Stderr),
-			"truncated": runResult.StdoutTruncated || runResult.StderrTruncated,
-		}
+		result["validation"] = validation
+		result["validation_passed"], _ = validation["success"].(bool)
 	}
 	return result, nil
 }
 
 func runDependencyInstallCommand(ctx context.Context, cfg DependencyInstallSkillConfig, req DependencyInstallCommandRequest) (*DependencyInstallCommandResult, error) {
+	return runDependencyInstallCommandWithOptions(ctx, cfg, req, dependencyInstallCommandRunOptions{})
+}
+
+type dependencyInstallCommandRunOptions struct {
+	AllowNonZeroExit bool
+}
+
+func runDependencyInstallCommandWithOptions(
+	ctx context.Context,
+	cfg DependencyInstallSkillConfig,
+	req DependencyInstallCommandRequest,
+	opts dependencyInstallCommandRunOptions,
+) (*DependencyInstallCommandResult, error) {
 	command := strings.TrimSpace(req.Command)
 	if DependencyCommandHasUnsafeShellSyntax(command) {
 		return nil, fmt.Errorf("shell control operators are not allowed in %s", strings.TrimSpace(req.ToolName))
@@ -212,6 +238,9 @@ func runDependencyInstallCommand(ctx context.Context, cfg DependencyInstallSkill
 		return nil, err
 	}
 	if runResult.ExitCode != 0 {
+		if opts.AllowNonZeroExit {
+			return runResult, nil
+		}
 		stderr := strings.TrimSpace(string(runResult.Stderr))
 		if stderr == "" {
 			stderr = strings.TrimSpace(string(runResult.Stdout))

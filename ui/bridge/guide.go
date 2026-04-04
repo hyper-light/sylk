@@ -41,24 +41,37 @@ type GuideBridge struct {
 	scope        *concurrency.GoroutineScope
 	priority     chan *guide.Message
 	buffer       chan *guide.Message
+	started      map[string]struct{}
+	metadata     map[string]map[string]any
+	completed    map[string]struct{}
 	dropped      atomic.Int64
 	done         chan struct{}
 	subscription guide.Subscription
 	decisionSub  guide.Subscription
 	sessionID    string
 	stopOnce     sync.Once
+
+	stateMu        sync.Mutex
+	pendingRegular map[string]int
+	heldTerminals  map[string][]*guide.Message
+	heldOrder      []string
 }
 
 // NewGuideBridge creates a bridge that converts Guide bus response messages
 // into Bubble Tea messages.
 func NewGuideBridge(bus guide.EventBus, scope *concurrency.GoroutineScope, sessionID string) *GuideBridge {
 	return &GuideBridge{
-		bus:       bus,
-		scope:     scope,
-		priority:  make(chan *guide.Message, guidePriorityBufferSize),
-		buffer:    make(chan *guide.Message, guideBufferSize),
-		done:      make(chan struct{}),
-		sessionID: sessionID,
+		bus:            bus,
+		scope:          scope,
+		priority:       make(chan *guide.Message, guidePriorityBufferSize),
+		buffer:         make(chan *guide.Message, guideBufferSize),
+		started:        make(map[string]struct{}),
+		metadata:       make(map[string]map[string]any),
+		completed:      make(map[string]struct{}),
+		done:           make(chan struct{}),
+		sessionID:      sessionID,
+		pendingRegular: make(map[string]int),
+		heldTerminals:  make(map[string][]*guide.Message),
 	}
 }
 
@@ -104,12 +117,18 @@ func (b *GuideBridge) DroppedCount() int64 { return b.dropped.Load() }
 // onMessage is the guide.MessageHandler called by the EventBus.
 // It enqueues the raw message into the bounded buffer for type dispatch.
 func (b *GuideBridge) onMessage(busMsg *guide.Message) error {
+	if b.holdTerminalUntilRegularsDrain(busMsg) {
+		return nil
+	}
 	target := b.buffer
 	if isPriorityGuideMessage(busMsg) {
 		target = b.priority
 	}
 	select {
 	case target <- busMsg:
+		if target == b.buffer {
+			b.noteRegularQueued(busMsg)
+		}
 	default:
 		b.dropped.Add(1)
 		if stream, ok := busMsg.GetStreamResponse(); ok && stream.Event != nil && stream.Event.Type == guide.StreamEventComplete {
@@ -144,6 +163,10 @@ func (b *GuideBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 }
 
 func (b *GuideBridge) nextMessage(ctx context.Context) (*guide.Message, bool) {
+	if busMsg, ok := b.nextReadyHeldTerminal(); ok {
+		return busMsg, true
+	}
+
 	select {
 	case busMsg := <-b.priority:
 		return busMsg, true
@@ -154,12 +177,89 @@ func (b *GuideBridge) nextMessage(ctx context.Context) (*guide.Message, bool) {
 	case busMsg := <-b.priority:
 		return busMsg, true
 	case busMsg := <-b.buffer:
+		b.noteRegularDequeued(busMsg)
 		return busMsg, true
 	case <-b.done:
 		return nil, false
 	case <-ctx.Done():
 		return nil, false
 	}
+}
+
+func (b *GuideBridge) holdTerminalUntilRegularsDrain(busMsg *guide.Message) bool {
+	key := streamPhaseKeyForMessage(busMsg)
+	if key == "" || !isTerminalStreamMessage(busMsg) {
+		return false
+	}
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if b.pendingRegular[key] == 0 {
+		return false
+	}
+	if _, exists := b.heldTerminals[key]; !exists {
+		b.heldOrder = append(b.heldOrder, key)
+	}
+	b.heldTerminals[key] = append(b.heldTerminals[key], busMsg)
+	bridgeEventDebugLog().Info("GuideBridge: HOLD_TERMINAL_BEHIND_REGULAR",
+		"correlation_id", busMsg.CorrelationID,
+		"phase_key", key,
+		"pending_regular", b.pendingRegular[key])
+	return true
+}
+
+func (b *GuideBridge) noteRegularQueued(busMsg *guide.Message) {
+	key := streamPhaseKeyForMessage(busMsg)
+	if key == "" {
+		return
+	}
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	b.pendingRegular[key]++
+}
+
+func (b *GuideBridge) noteRegularDequeued(busMsg *guide.Message) {
+	key := streamPhaseKeyForMessage(busMsg)
+	if key == "" {
+		return
+	}
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	remaining := b.pendingRegular[key] - 1
+	if remaining <= 0 {
+		delete(b.pendingRegular, key)
+		return
+	}
+	b.pendingRegular[key] = remaining
+}
+
+func (b *GuideBridge) nextReadyHeldTerminal() (*guide.Message, bool) {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	for idx := 0; idx < len(b.heldOrder); idx++ {
+		key := b.heldOrder[idx]
+		if b.pendingRegular[key] > 0 {
+			continue
+		}
+		queue := b.heldTerminals[key]
+		if len(queue) == 0 {
+			delete(b.heldTerminals, key)
+			b.heldOrder = append(b.heldOrder[:idx], b.heldOrder[idx+1:]...)
+			idx--
+			continue
+		}
+		busMsg := queue[0]
+		if len(queue) == 1 {
+			delete(b.heldTerminals, key)
+			b.heldOrder = append(b.heldOrder[:idx], b.heldOrder[idx+1:]...)
+		} else {
+			b.heldTerminals[key] = queue[1:]
+		}
+		bridgeEventDebugLog().Info("GuideBridge: RELEASE_HELD_TERMINAL",
+			"correlation_id", strings.TrimSpace(busMsg.CorrelationID),
+			"phase_key", key)
+		return busMsg, true
+	}
+	return nil, false
 }
 
 func isPriorityGuideMessage(busMsg *guide.Message) bool {
@@ -177,13 +277,42 @@ func isPriorityGuideMessage(busMsg *guide.Message) bool {
 		switch stream.Event.Type {
 		case guide.StreamEventComplete, guide.StreamEventError:
 			return true
-		case guide.StreamEventStart, guide.StreamEventProgress:
+		case guide.StreamEventStart:
+			return true
+		case guide.StreamEventProgress:
 			return streamHasPriorityInterAgentBranch(stream)
 		case guide.StreamEventToolCall:
 			return true
 		default:
 			return false
 		}
+	default:
+		return false
+	}
+}
+
+func streamPhaseKeyForMessage(busMsg *guide.Message) string {
+	if busMsg == nil {
+		return ""
+	}
+	stream, ok := busMsg.GetStreamResponse()
+	if !ok || stream == nil {
+		return ""
+	}
+	return streamPhaseKey(busMsg.CorrelationID, stream)
+}
+
+func isTerminalStreamMessage(busMsg *guide.Message) bool {
+	if busMsg == nil {
+		return false
+	}
+	stream, ok := busMsg.GetStreamResponse()
+	if !ok || stream == nil || stream.Event == nil {
+		return false
+	}
+	switch stream.Event.Type {
+	case guide.StreamEventComplete, guide.StreamEventError:
+		return true
 	default:
 		return false
 	}
@@ -236,6 +365,8 @@ func (b *GuideBridge) dispatch(busMsg *guide.Message, program TeaProgram) {
 	}
 	if stream, ok := busMsg.GetStreamResponse(); ok {
 		stream = streamWithEnvelopeMetadata(stream, busMsg.Metadata)
+		stream = b.streamWithRememberedMetadata(busMsg.CorrelationID, stream)
+		b.rememberStreamMetadata(busMsg.CorrelationID, stream)
 		b.dispatchStream(stream, program)
 		return
 	}
@@ -460,8 +591,18 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 
 	switch stream.Event.Type {
 	case guide.StreamEventStart:
+		b.clearStreamCompleted(cid, stream)
+		if !b.markStreamStarted(cid, stream) {
+			bridgeEventDebugLog().Info("GuideBridge: STREAM_START_SUPPRESSED",
+				"correlation_id", cid,
+				"agent_id", stream.RespondingAgentID)
+			return
+		}
 		program.Send(parseStreamStartMsg(sid, cid, stream))
 	case guide.StreamEventData:
+		if !b.ensureStreamStarted(sid, cid, stream, program) {
+			return
+		}
 		if planMsg, ok := tryPlanUpdateMsg(stream.Event); ok {
 			planMsg.CorrelationID = cid
 			program.Send(planMsg)
@@ -474,8 +615,14 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 			program.Send(chunk)
 		}
 	case guide.StreamEventProgress:
+		if !b.ensureStreamStarted(sid, cid, stream, program) {
+			return
+		}
 		program.Send(toStreamProgressMsg(sid, cid, stream))
 	case guide.StreamEventComplete:
+		if !b.ensureStreamStarted(sid, cid, stream, program) {
+			return
+		}
 		bridgeEventDebugLog().Info("GuideBridge: STREAM_COMPLETE_DISPATCH",
 			"correlation_id", cid,
 			"agent_id", stream.RespondingAgentID,
@@ -490,16 +637,26 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 			complete.OutputTokens = stream.Event.Usage.OutputTokens
 		}
 		program.Send(complete)
+		b.clearStreamStarted(cid, stream)
+		b.markStreamCompleted(cid, stream)
 		bridgeEventDebugLog().Info("GuideBridge: STREAM_COMPLETE_SENT",
 			"correlation_id", cid)
 	case guide.StreamEventError:
+		if !b.ensureStreamStarted(sid, cid, stream, program) {
+			return
+		}
 		program.Send(msg.StreamErrorMsg{
 			SessionID:     sid,
 			CorrelationID: cid,
 			Err:           redact.Error(extractStreamError(stream.Event)),
 			BranchRef:     parseInterAgentBranchRef(stream),
 		})
+		b.clearStreamStarted(cid, stream)
+		b.markStreamCompleted(cid, stream)
 	case guide.StreamEventRetry:
+		if !b.ensureStreamStarted(sid, cid, stream, program) {
+			return
+		}
 		status, _ := stream.Event.Data.(guide.RetryStatus)
 		errText := ""
 		if status.Err != nil {
@@ -516,8 +673,103 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 	case guide.StreamEventReroute:
 		program.Send(parseStreamRerouteMsg(sid, cid, stream.Event))
 	case guide.StreamEventToolCall:
+		if !b.ensureStreamStarted(sid, cid, stream, program) {
+			return
+		}
 		program.Send(parseToolCallEventMsg(sid, cid, stream))
 	}
+}
+
+func streamPhaseAgentID(stream *guide.StreamResponse) string {
+	if stream == nil {
+		return ""
+	}
+	if responderID := strings.TrimSpace(stream.RespondingAgentID); responderID != "" {
+		return responderID
+	}
+	if runtimeID := streamRuntimeAgentID(stream); runtimeID != "" {
+		return runtimeID
+	}
+	return streamMetadataString(stream, "agent_type")
+}
+
+func streamPhaseKey(correlationID string, stream *guide.StreamResponse) string {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return ""
+	}
+	phaseAgentID := strings.TrimSpace(streamPhaseAgentID(stream))
+	if phaseAgentID == "" {
+		return correlationID
+	}
+	return correlationID + "\x00" + phaseAgentID
+}
+
+func (b *GuideBridge) markStreamStarted(correlationID string, stream *guide.StreamResponse) bool {
+	key := streamPhaseKey(correlationID, stream)
+	if key == "" {
+		return false
+	}
+	if _, exists := b.started[key]; exists {
+		return false
+	}
+	b.started[key] = struct{}{}
+	return true
+}
+
+func (b *GuideBridge) clearStreamStarted(correlationID string, stream *guide.StreamResponse) {
+	key := streamPhaseKey(correlationID, stream)
+	if key == "" {
+		return
+	}
+	delete(b.started, key)
+	delete(b.metadata, key)
+}
+
+func (b *GuideBridge) markStreamCompleted(correlationID string, stream *guide.StreamResponse) {
+	key := streamPhaseKey(correlationID, stream)
+	if key == "" {
+		return
+	}
+	b.completed[key] = struct{}{}
+}
+
+func (b *GuideBridge) clearStreamCompleted(correlationID string, stream *guide.StreamResponse) {
+	key := streamPhaseKey(correlationID, stream)
+	if key == "" {
+		return
+	}
+	delete(b.completed, key)
+}
+
+func (b *GuideBridge) isStreamCompleted(correlationID string, stream *guide.StreamResponse) bool {
+	key := streamPhaseKey(correlationID, stream)
+	if key == "" {
+		return false
+	}
+	_, completed := b.completed[key]
+	return completed
+}
+
+func (b *GuideBridge) ensureStreamStarted(sessionID, correlationID string, stream *guide.StreamResponse, program TeaProgram) bool {
+	if b.isStreamCompleted(correlationID, stream) {
+		bridgeEventDebugLog().Info("GuideBridge: STALE_STREAM_EVENT_DROPPED",
+			"correlation_id", correlationID,
+			"event_type", stream.Event.Type,
+			"agent_id", stream.RespondingAgentID)
+		return false
+	}
+	if !b.markStreamStarted(correlationID, stream) {
+		return true
+	}
+	bridgeEventDebugLog().Info("GuideBridge: SYNTHETIC_STREAM_START",
+		"correlation_id", correlationID,
+		"event_type", stream.Event.Type,
+		"agent_id", stream.RespondingAgentID,
+		"parent_correlation_id", streamParentCorrelationID(stream),
+		"task_id", streamMetadataString(stream, "task_id"))
+	program.Send(parseStreamStartMsg(sessionID, correlationID, stream))
+	return true
 }
 
 func parseStreamStartMsg(sessionID, correlationID string, stream *guide.StreamResponse) msg.StreamStartMsg {
@@ -529,11 +781,9 @@ func parseStreamStartMsg(sessionID, correlationID string, stream *guide.StreamRe
 		return result
 	}
 	result.AgentID = strings.TrimSpace(stream.RespondingAgentID)
-	result.RuntimeAgentID = firstNonEmpty(
-		streamMetadataString(stream, "runtime_agent_id"),
-		strings.TrimSpace(stream.RespondingAgentID),
-	)
+	result.RuntimeAgentID = streamRuntimeAgentID(stream)
 	result.ParentCorrelationID = streamParentCorrelationID(stream)
+	result.TopLevelTransfer = streamTopLevelTransfer(stream)
 	result.AgentName = streamAgentName(stream)
 	result.AgentType = streamMetadataString(stream, "agent_type")
 	result.PipelineID = streamMetadataString(stream, "pipeline_id")
@@ -576,6 +826,7 @@ func parseToolCallEventMsg(sessionID, correlationID string, stream *guide.Stream
 	}
 	result.AgentID = strings.TrimSpace(stream.RespondingAgentID)
 	result.ParentCorrelationID = streamParentCorrelationID(stream)
+	result.TopLevelTransfer = streamTopLevelTransfer(stream)
 	result.AgentName = streamAgentName(stream)
 	result.AgentType = streamMetadataString(stream, "agent_type")
 	result.PipelineID = streamMetadataString(stream, "pipeline_id")
@@ -706,22 +957,21 @@ func toStreamProgressMsg(sessionID, correlationID string, stream *guide.StreamRe
 		SessionID:           sessionID,
 		CorrelationID:       correlationID,
 		ParentCorrelationID: streamParentCorrelationID(stream),
+		TopLevelTransfer:    streamTopLevelTransfer(stream),
 		AgentID:             agentID,
-		RuntimeAgentID: firstNonEmpty(
-			streamMetadataString(stream, "runtime_agent_id"),
-			agentID,
-		),
-		AgentName:  agentName,
-		AgentType:  streamMetadataString(stream, "agent_type"),
-		PipelineID: streamMetadataString(stream, "pipeline_id"),
-		TaskID:     streamMetadataString(stream, "task_id"),
-		TaskName:   streamMetadataString(stream, "task_name"),
-		TaskSlug:   streamMetadataString(stream, "task_slug"),
-		Current:    progress.Current,
-		Total:      progress.Total,
-		Message:    redact.Text(strings.TrimSpace(progress.Message)),
-		UIState:    events.NormalizeAgentUIState(progress.UIState),
-		BranchRef:  parseInterAgentBranchRef(stream),
+		RuntimeAgentID:      streamRuntimeAgentID(stream),
+		AgentName:           agentName,
+		AgentType:           streamMetadataString(stream, "agent_type"),
+		PipelineID:          streamMetadataString(stream, "pipeline_id"),
+		TaskID:              streamMetadataString(stream, "task_id"),
+		TaskName:            streamMetadataString(stream, "task_name"),
+		TaskSlug:            streamMetadataString(stream, "task_slug"),
+		Current:             progress.Current,
+		Total:               progress.Total,
+		Message:             redact.Text(strings.TrimSpace(progress.Message)),
+		ToolDerived:         progress.ToolDerived,
+		UIState:             events.NormalizeAgentUIState(progress.UIState),
+		BranchRef:           parseInterAgentBranchRef(stream),
 	}
 	if event != nil {
 		m.Visibility = event.Visibility
@@ -738,11 +988,9 @@ func parseStreamCompleteMsg(sessionID, correlationID string, stream *guide.Strea
 		return result
 	}
 	result.AgentID = strings.TrimSpace(stream.RespondingAgentID)
-	result.RuntimeAgentID = firstNonEmpty(
-		streamMetadataString(stream, "runtime_agent_id"),
-		strings.TrimSpace(stream.RespondingAgentID),
-	)
+	result.RuntimeAgentID = streamRuntimeAgentID(stream)
 	result.ParentCorrelationID = streamParentCorrelationID(stream)
+	result.TopLevelTransfer = streamTopLevelTransfer(stream)
 	result.AgentName = streamAgentName(stream)
 	result.AgentType = streamMetadataString(stream, "agent_type")
 	result.PipelineID = streamMetadataString(stream, "pipeline_id")
@@ -759,6 +1007,7 @@ func parseStreamCompleteMsg(sessionID, correlationID string, stream *guide.Strea
 
 const (
 	streamMetadataNestedBranch      = "chat_nested_branch"
+	streamMetadataTopLevelTransfer  = "chat_top_level_transfer"
 	streamMetadataParentCorrelation = "chat_parent_correlation_id"
 	streamMetadataParentToolCallKey = "chat_parent_tool_call_key"
 	streamMetadataInterAgentThread  = "chat_inter_agent_thread_key"
@@ -787,6 +1036,10 @@ func streamParentCorrelationID(stream *guide.StreamResponse) string {
 	return streamMetadataString(stream, streamMetadataParentCorrelation)
 }
 
+func streamTopLevelTransfer(stream *guide.StreamResponse) bool {
+	return metadataBool(effectiveStreamMetadata(stream), streamMetadataTopLevelTransfer)
+}
+
 func metadataString(metadata map[string]any, key string) string {
 	if len(metadata) == 0 {
 		return ""
@@ -807,15 +1060,7 @@ func streamWithEnvelopeMetadata(stream *guide.StreamResponse, envelope map[strin
 	if stream == nil || len(envelope) == 0 {
 		return stream
 	}
-	merged := cloneMetadataMap(envelope)
-	if streamMetadata := cloneMetadataMap(stream.Metadata); len(streamMetadata) > 0 {
-		if merged == nil {
-			merged = map[string]any{}
-		}
-		for key, value := range streamMetadata {
-			merged[key] = value
-		}
-	}
+	merged := mergeStreamMetadata(envelope, stream.Metadata)
 	cloned := *stream
 	cloned.Metadata = merged
 	return &cloned
@@ -825,16 +1070,7 @@ func effectiveStreamMetadata(stream *guide.StreamResponse) map[string]any {
 	if stream == nil {
 		return nil
 	}
-	metadata := cloneMetadataMap(stream.Metadata)
-	if eventMetadata := streamEventMetadata(stream.Event); len(eventMetadata) > 0 {
-		if metadata == nil {
-			metadata = map[string]any{}
-		}
-		for key, value := range eventMetadata {
-			metadata[key] = value
-		}
-	}
-	return metadata
+	return mergeStreamMetadata(stream.Metadata, streamEventMetadata(stream.Event))
 }
 
 func streamEventMetadata(event *guide.StreamEvent) map[string]any {
@@ -866,6 +1102,74 @@ func cloneMetadataMap(metadata map[string]any) map[string]any {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+func (b *GuideBridge) streamWithRememberedMetadata(correlationID string, stream *guide.StreamResponse) *guide.StreamResponse {
+	key := streamPhaseKey(correlationID, stream)
+	if key == "" || stream == nil {
+		return stream
+	}
+	merged := mergeStreamMetadata(b.metadata[key], effectiveStreamMetadata(stream))
+	if len(merged) == 0 {
+		return stream
+	}
+	cloned := *stream
+	cloned.Metadata = merged
+	return &cloned
+}
+
+func (b *GuideBridge) rememberStreamMetadata(correlationID string, stream *guide.StreamResponse) {
+	key := streamPhaseKey(correlationID, stream)
+	if key == "" || stream == nil {
+		return
+	}
+	metadata := effectiveStreamMetadata(stream)
+	if len(metadata) == 0 {
+		return
+	}
+	b.metadata[key] = mergeStreamMetadata(b.metadata[key], metadata)
+}
+
+func mergeStreamMetadata(base, overlay map[string]any) map[string]any {
+	if len(base) == 0 && len(overlay) == 0 {
+		return nil
+	}
+	merged := cloneMetadataMap(base)
+	if merged == nil {
+		merged = make(map[string]any, len(overlay))
+	}
+	for key, value := range overlay {
+		if !streamMetadataValueCarriesIdentity(value) {
+			if _, exists := merged[key]; exists {
+				continue
+			}
+			continue
+		}
+		merged[key] = value
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+func streamMetadataValueCarriesIdentity(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case bool:
+		return typed
+	case []any:
+		return len(typed) > 0
+	case []string:
+		return len(typed) > 0
+	case map[string]any:
+		return len(typed) > 0
+	default:
+		return true
+	}
 }
 
 func parseInterAgentBranchRefFromMetadata(metadata map[string]any) *msg.InterAgentBranchRefMsg {
@@ -928,10 +1232,11 @@ func parseProgressData(event *guide.StreamEvent) guide.ProgressData {
 	}
 	if data, ok := event.Data.(map[string]any); ok {
 		return guide.ProgressData{
-			Current: parseProgressInt(data["current"]),
-			Total:   parseProgressInt(data["total"]),
-			Message: parseProgressString(data["message"]),
-			UIState: events.AgentUIStateFromData(data),
+			Current:     parseProgressInt(data["current"]),
+			Total:       parseProgressInt(data["total"]),
+			Message:     parseProgressString(data["message"]),
+			UIState:     events.AgentUIStateFromData(data),
+			ToolDerived: parseProgressBool(data["tool_derived"]),
 		}
 	}
 	return guide.ProgressData{}
@@ -951,6 +1256,11 @@ func parseProgressInt(value any) int {
 func parseProgressString(value any) string {
 	text, _ := value.(string)
 	return text
+}
+
+func parseProgressBool(value any) bool {
+	flag, _ := value.(bool)
+	return flag
 }
 
 // streamCompleteText extracts the user-facing text from a StreamEventComplete.

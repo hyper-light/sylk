@@ -11,6 +11,8 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestPipelineProtocolSkills_RecordTurnActions(t *testing.T) {
@@ -132,6 +134,87 @@ func TestFinalizePipeline_RequiresImmediateHandoffToOT(t *testing.T) {
 	}
 }
 
+func TestFinalizePipeline_RequiresImmediateHandoffToOT_BlocksHandoffDispatch(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	routeCh := make(chan *guide.RouteRequest, 1)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		select {
+		case routeCh <- req:
+		default:
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer reqSub.Unsubscribe()
+
+	task := &PipelineTaskInput{
+		TaskID:        "task-ready-ot",
+		AgentType:     PipelineAgentInspector,
+		TargetAgentID: PipelineWorkerRoutingTarget("task-ready-ot", PipelineAgentInspector),
+		Prompt:        "Close the pipeline.",
+		SessionID:     "session-ready-ot",
+		Context: map[string]any{
+			"pipeline_stage": "inspect",
+			"pipeline_protocol": PipelineProtocolSnapshotMap(&PipelineProtocolSnapshot{
+				Roster: []PipelineProtocolAgent{
+					{AgentType: PipelineAgentInspector},
+					{AgentType: PipelineAgentTester},
+					{AgentType: PipelineAgentEngineer},
+				},
+				ActiveAgents: []string{PipelineAgentInspector},
+				PendingValidation: &PipelineValidationRecord{
+					ChallengeID:         "challenge-ready-dispatch",
+					RequestingAgent:     PipelineAgentInspector,
+					RespondingAgent:     PipelineAgentTester,
+					Status:              string(PipelineValidationPassed),
+					Summary:             "tester accepted the audit",
+					ChallengeReferences: []string{finalizePipelineVerificationReference},
+					EvidenceRefs:        []string{"artifact:tester"},
+				},
+			}),
+		},
+	}
+	ctx := WithPipelineTaskProtocolState(context.Background(), task)
+	ctx = WithTaskExecutionContract(ctx, &TaskExecutionContract{RuntimeAgentType: PipelineAgentInspector})
+	ctx = WithStreamContext(ctx, "corr-ready-ot", "tui")
+
+	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
+		AgentType:   func() string { return PipelineAgentInspector },
+		AgentID:     func() string { return "inspector-ready-ot-1" },
+		InspectorOT: true,
+		Route: PipelineProtocolRouteConfig{
+			BusProvider: func() guide.EventBus { return bus },
+			SessionID:   func() string { return task.SessionID },
+		},
+	})
+
+	_, err = callSkill(t, ctx, skills, "finalize_pipeline", map[string]any{
+		"summary":       "all criteria passed",
+		"evidence_refs": []string{"artifact:inspector"},
+	})
+	require.NoError(t, err)
+
+	if _, err := callSkill(t, ctx, skills, "handoff_next", map[string]any{
+		"target_agents": []string{"tester"},
+		"reason":        "try another audit anyway",
+		"request":       "this should be blocked",
+	}); err == nil || !strings.Contains(err.Error(), "must invoke `handoff_to_ot` now") {
+		t.Fatalf("handoff_next error = %v, want immediate handoff_to_ot requirement", err)
+	}
+
+	select {
+	case req := <-routeCh:
+		t.Fatalf("unexpected route published while handoff_to_ot was required: %+v", req)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 func TestFinalizePipeline_ReadyAfterAcceptedProcessValidation(t *testing.T) {
 	snapshot := &PipelineProtocolSnapshot{
 		PendingValidation: &PipelineValidationRecord{
@@ -173,6 +256,54 @@ func TestFinalizePipeline_ReadyAfterAcceptedProcessValidation(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("finalize_pipeline after process_validation: %v", err)
+	}
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("finalize_pipeline result = %#v, want map", result)
+	}
+	if resultMap["ready_for_ot"] != true {
+		t.Fatalf("finalize_pipeline result = %#v, want ready_for_ot=true", result)
+	}
+	if resultMap["must_handoff_to_ot"] != true {
+		t.Fatalf("finalize_pipeline result = %#v, want must_handoff_to_ot=true", result)
+	}
+	if resultMap["required_next_action"] != "handoff_to_ot" {
+		t.Fatalf("finalize_pipeline result = %#v, want required_next_action=handoff_to_ot", result)
+	}
+}
+
+func TestFinalizePipeline_ReadyAfterAcceptedPartialProcessValidation(t *testing.T) {
+	snapshot := &PipelineProtocolSnapshot{
+		PendingValidation: &PipelineValidationRecord{
+			ChallengeID:         "challenge-ready-partial",
+			RequestingAgent:     PipelineAgentInspector,
+			RespondingAgent:     PipelineAgentTester,
+			Status:              string(PipelineValidationPartial),
+			Summary:             "tester accepted the audit but execution remained partially blocked by environment issues",
+			ChallengeReferences: []string{finalizePipelineVerificationReference},
+			EvidenceRefs:        []string{"artifact:tester", "tests/test_init.py"},
+		},
+	}
+	ctx := WithPipelineProtocolState(context.Background(), NewPipelineProtocolState(snapshot))
+	ctx = WithTaskExecutionContract(ctx, &TaskExecutionContract{RuntimeAgentType: PipelineAgentInspector})
+
+	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
+		AgentType:   func() string { return PipelineAgentInspector },
+		InspectorOT: true,
+	})
+
+	runSkill(t, ctx, skills, "process_validation", map[string]any{
+		"challenge_id": "challenge-ready-partial",
+		"decision":     "accept",
+		"summary":      "accepted the tester audit because the remaining blockers were harness-only and the implementation audit passed",
+	})
+
+	result, err := callSkill(t, ctx, skills, "finalize_pipeline", map[string]any{
+		"summary":       "the implementation is correct and the remaining execution caveats are environmental only",
+		"evidence_refs": []string{"artifact:inspector", "tests/test_init.py"},
+	})
+	if err != nil {
+		t.Fatalf("finalize_pipeline after accepted partial process_validation: %v", err)
 	}
 	resultMap, ok := result.(map[string]any)
 	if !ok {
@@ -325,6 +456,7 @@ func TestPipelineProtocolSkills_HandoffNextPublishesGuideRoute(t *testing.T) {
 
 	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
 		AgentType: func() string { return PipelineAgentInspector },
+		AgentID:   func() string { return "inspector-1" },
 		Route: PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return bus },
 			SessionID:   func() string { return task.SessionID },
@@ -345,52 +477,52 @@ func TestPipelineProtocolSkills_HandoffNextPublishesGuideRoute(t *testing.T) {
 		t.Fatalf("handoff_next error = %v", err)
 	}
 	resultMap, _ := result.(map[string]any)
-	if resultMap == nil || resultMap["forwarded"] != true {
+	if resultMap == nil {
+		t.Fatalf("handoff_next result = %#v, want result map", result)
+	}
+	if resultMap["forwarded"] != true {
 		t.Fatalf("handoff_next result = %#v, want forwarded=true", result)
 	}
 
-	req := waitForRouteRequest(t, routeCh)
-	if req.ParentCorrelationID != "corr-inspector" {
-		t.Fatalf("parent_correlation_id = %q, want corr-inspector", req.ParentCorrelationID)
+	state := PipelineProtocolStateFromContext(ctx)
+	if state == nil {
+		t.Fatal("expected pipeline protocol state")
 	}
-	if req.TargetAgentID != PipelineWorkerRoutingTarget("task-async", PipelineAgentTester) {
-		t.Fatalf("target_agent_id = %q", req.TargetAgentID)
+	action := state.TerminalAction()
+	if action == nil || action.Type != PipelineProtocolActionHandoff {
+		t.Fatalf("terminal action = %#v, want handoff", action)
 	}
-	if req.Metadata["chat_nested_branch"] == true {
-		t.Fatalf("handoff_next should not stamp nested chat branch metadata: %#v", req.Metadata)
+	if action.CreatesChallenge {
+		t.Fatalf("handoff_next should not create a challenge action: %#v", action)
 	}
-	if got, _ := req.Metadata["chat_parent_correlation_id"].(string); strings.TrimSpace(got) != "" {
-		t.Fatalf("handoff_next parent branch metadata = %q, want empty", got)
+	if action.Request != "Author the failing tests for the agreed contract." {
+		t.Fatalf("request = %q", action.Request)
+	}
+	if len(action.TargetAgents) != 1 || action.TargetAgents[0] != PipelineAgentTester {
+		t.Fatalf("target_agents = %#v, want [tester-pipeline]", action.TargetAgents)
 	}
 
-	var nextTask PipelineTaskInput
-	if err := json.Unmarshal([]byte(req.Input), &nextTask); err != nil {
-		t.Fatalf("decode next task: %v", err)
-	}
-	if nextTask.AgentType != PipelineAgentTester {
-		t.Fatalf("next agent_type = %q, want %q", nextTask.AgentType, PipelineAgentTester)
-	}
-	if nextTask.TargetAgentID != req.TargetAgentID {
-		t.Fatalf("next target_agent_id = %q, want %q", nextTask.TargetAgentID, req.TargetAgentID)
-	}
-	snapshot, err := PipelineProtocolSnapshotFromTask(&nextTask)
-	if err != nil {
-		t.Fatalf("PipelineProtocolSnapshotFromTask: %v", err)
-	}
-	if snapshot == nil {
-		t.Fatalf("snapshot = %#v, want value", snapshot)
-	}
-	if snapshot.PendingChallenge != nil {
-		t.Fatalf("pending challenge = %#v, want nil for handoff_next", snapshot.PendingChallenge)
-	}
-	if snapshot.RequestedBy != PipelineAgentInspector {
-		t.Fatalf("requested_by = %q, want %q", snapshot.RequestedBy, PipelineAgentInspector)
-	}
-	if snapshot.CurrentRequest != "Author the failing tests for the agreed contract." {
-		t.Fatalf("current_request = %q", snapshot.CurrentRequest)
-	}
-	if len(snapshot.ActiveAgents) != 1 || snapshot.ActiveAgents[0] != PipelineAgentTester {
-		t.Fatalf("active_agents = %#v, want tester", snapshot.ActiveAgents)
+	select {
+	case req := <-routeCh:
+		require.NotNil(t, req)
+		assert.Equal(t, "corr-inspector", req.ParentCorrelationID)
+		assert.Equal(t, PipelineWorkerRoutingTarget("task-async", PipelineAgentTester), req.TargetAgentID)
+		assert.NotEqual(t, true, req.Metadata[streamMetadataNestedBranch])
+		if preserved, _ := req.Metadata["chat_preserve_source_stream_target"].(bool); !preserved {
+			t.Fatalf("chat_preserve_source_stream_target = %#v, want true", req.Metadata["chat_preserve_source_stream_target"])
+		}
+
+		var nextTask PipelineTaskInput
+		require.NoError(t, json.Unmarshal([]byte(req.Input), &nextTask))
+		assert.Equal(t, PipelineAgentTester, nextTask.AgentType)
+		assert.Equal(t, "Author the failing tests for the agreed contract.", PipelineCurrentRequest(&nextTask))
+
+		snapshot, err := PipelineProtocolSnapshotFromTask(&nextTask)
+		require.NoError(t, err)
+		require.NotNil(t, snapshot)
+		assert.Equal(t, []string{PipelineAgentTester}, snapshot.ActiveAgents)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for top-level handoff route")
 	}
 
 	reroute := waitForReroute(t, rerouteCh)
@@ -399,12 +531,6 @@ func TestPipelineProtocolSkills_HandoffNextPublishesGuideRoute(t *testing.T) {
 	}
 	if reroute["to_agent"] != PipelineAgentTester {
 		t.Fatalf("to_agent = %q, want %q", reroute["to_agent"], PipelineAgentTester)
-	}
-	if reroute["original_correlation_id"] != "corr-inspector" {
-		t.Fatalf("original_correlation_id = %q, want corr-inspector", reroute["original_correlation_id"])
-	}
-	if reroute["new_correlation_id"] != req.CorrelationID {
-		t.Fatalf("new_correlation_id = %q, want %q", reroute["new_correlation_id"], req.CorrelationID)
 	}
 
 	update := waitForPipelineUpdate(t, updateCh)
@@ -483,6 +609,7 @@ func TestPipelineProtocolSkills_ChallengeAgentPublishesGuideRoute(t *testing.T) 
 
 	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
 		AgentType: func() string { return PipelineAgentEngineer },
+		AgentID:   func() string { return "engineer-1" },
 		Route: PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return bus },
 			SessionID:   func() string { return task.SessionID },
@@ -514,6 +641,9 @@ func TestPipelineProtocolSkills_ChallengeAgentPublishesGuideRoute(t *testing.T) 
 	if req.TargetAgentID != PipelineWorkerRoutingTarget("task-challenge", PipelineAgentTester) {
 		t.Fatalf("target_agent_id = %q", req.TargetAgentID)
 	}
+	if preserved, _ := req.Metadata["chat_preserve_source_stream_target"].(bool); !preserved {
+		t.Fatalf("chat_preserve_source_stream_target = %#v, want true", req.Metadata["chat_preserve_source_stream_target"])
+	}
 
 	var nextTask PipelineTaskInput
 	if err := json.Unmarshal([]byte(req.Input), &nextTask); err != nil {
@@ -528,6 +658,21 @@ func TestPipelineProtocolSkills_ChallengeAgentPublishesGuideRoute(t *testing.T) 
 	}
 	if snapshot.PendingChallenge.RequestingAgent != PipelineAgentEngineer {
 		t.Fatalf("requesting_agent = %q, want %q", snapshot.PendingChallenge.RequestingAgent, PipelineAgentEngineer)
+	}
+	if snapshot.PendingChallenge.RequestingAgentID != "engineer-1" {
+		t.Fatalf("requesting_agent_id = %q, want %q", snapshot.PendingChallenge.RequestingAgentID, "engineer-1")
+	}
+	if req.Metadata[streamMetadataNestedBranch] != true {
+		t.Fatalf("chat_nested_branch = %#v, want true", req.Metadata[streamMetadataNestedBranch])
+	}
+	if got, _ := req.Metadata[streamMetadataParentCorrelation].(string); got != "corr-engineer" {
+		t.Fatalf("chat_parent_correlation_id = %q, want corr-engineer", got)
+	}
+	if got, _ := req.Metadata[streamMetadataInterAgentKind].(string); got != InterAgentToolEventKindChallenge {
+		t.Fatalf("chat_inter_agent_kind = %q, want %q", got, InterAgentToolEventKindChallenge)
+	}
+	if got, _ := req.Metadata[streamMetadataInterAgentThread].(string); got != pipelineThreadPrefix+snapshot.PendingChallenge.ID {
+		t.Fatalf("chat_inter_agent_thread = %q, want %q", got, pipelineThreadPrefix+snapshot.PendingChallenge.ID)
 	}
 
 	reroute := waitForReroute(t, rerouteCh)
@@ -716,7 +861,9 @@ func TestBuildPipelineValidationTask_CompactsValidationSummaryForTaskPayload(t *
 	record := &PipelineValidationRecord{
 		ChallengeID:         "challenge-1",
 		RequestingAgent:     PipelineAgentInspector,
+		RequestingAgentID:   "inspector-runtime-1",
 		RespondingAgent:     PipelineAgentTester,
+		RespondingAgentID:   "tester-runtime-1",
 		Status:              string(PipelineValidationPassed),
 		Summary:             strings.Repeat("summary ", 400),
 		ChallengeRequest:    strings.Repeat("request ", 300),
@@ -747,6 +894,34 @@ func TestBuildPipelineValidationTask_CompactsValidationSummaryForTaskPayload(t *
 	}
 	if len(snapshot.PendingValidation.EvidenceRefs) != 1 || len(snapshot.PendingValidation.EvidenceRefs[0]) > maxPipelineProtocolReferenceLen {
 		t.Fatalf("evidence refs = %#v, want compact values", snapshot.PendingValidation.EvidenceRefs)
+	}
+}
+
+func TestBuildPipelineValidationTask_RequiresExactRequestingAgentID(t *testing.T) {
+	state := NewPipelineProtocolState(&PipelineProtocolSnapshot{
+		Roster: []PipelineProtocolAgent{
+			{AgentType: PipelineAgentInspector},
+			{AgentType: PipelineAgentTester},
+		},
+		ActiveAgents: []string{PipelineAgentTester},
+	})
+	task := &PipelineTaskInput{
+		TaskID:    "task-validate-missing-id",
+		AgentType: PipelineAgentTester,
+		Context:   map[string]any{},
+	}
+	record := &PipelineValidationRecord{
+		ChallengeID:       "challenge-1",
+		RequestingAgent:   PipelineAgentInspector,
+		RespondingAgent:   PipelineAgentTester,
+		RespondingAgentID: "tester-runtime-1",
+		Status:            string(PipelineValidationPassed),
+		Summary:           "Validation passed.",
+	}
+
+	_, err := buildPipelineValidationTask(state, task, record)
+	if err == nil || !strings.Contains(err.Error(), "missing the exact requesting agent id") {
+		t.Fatalf("buildPipelineValidationTask error = %v, want missing requester id failure", err)
 	}
 }
 
@@ -824,10 +999,11 @@ func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
 				},
 				ActiveAgents: []string{PipelineAgentTester},
 				PendingChallenge: &PipelineProtocolChallenge{
-					ID:              "challenge-1",
-					RequestingAgent: PipelineAgentInspector,
-					TargetAgents:    []string{PipelineAgentTester},
-					Request:         "Author and run the validating tests.",
+					ID:                "challenge-1",
+					RequestingAgent:   PipelineAgentInspector,
+					RequestingAgentID: "inspector-runtime-1",
+					TargetAgents:      []string{PipelineAgentTester},
+					Request:           "Author and run the validating tests.",
 				},
 			}),
 		},
@@ -838,6 +1014,7 @@ func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
 
 	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
 		AgentType: func() string { return PipelineAgentTester },
+		AgentID:   func() string { return "tester-1" },
 		Route: PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return bus },
 			SessionID:   func() string { return task.SessionID },
@@ -870,7 +1047,10 @@ func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
 	if req.Metadata["chat_nested_branch"] == true {
 		t.Fatalf("validate_work should not stamp nested chat branch metadata: %#v", req.Metadata)
 	}
-	if req.TargetAgentID != PipelineWorkerRoutingTarget("task-validate", PipelineAgentInspector) {
+	if preserved, _ := req.Metadata["chat_preserve_source_stream_target"].(bool); !preserved {
+		t.Fatalf("chat_preserve_source_stream_target = %#v, want true", req.Metadata["chat_preserve_source_stream_target"])
+	}
+	if req.TargetAgentID != "inspector-runtime-1" {
 		t.Fatalf("target_agent_id = %q", req.TargetAgentID)
 	}
 
@@ -888,8 +1068,14 @@ func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
 	if snapshot == nil || snapshot.PendingValidation == nil {
 		t.Fatalf("pending_validation = %#v, want value", snapshot)
 	}
+	if snapshot.PendingValidation.RequestingAgentID != "inspector-runtime-1" {
+		t.Fatalf("requesting_agent_id = %q, want %q", snapshot.PendingValidation.RequestingAgentID, "inspector-runtime-1")
+	}
 	if snapshot.PendingValidation.RespondingAgent != PipelineAgentTester {
 		t.Fatalf("responding_agent = %q, want %q", snapshot.PendingValidation.RespondingAgent, PipelineAgentTester)
+	}
+	if snapshot.PendingValidation.RespondingAgentID != "tester-1" {
+		t.Fatalf("responding_agent_id = %q, want %q", snapshot.PendingValidation.RespondingAgentID, "tester-1")
 	}
 	if len(snapshot.ActiveAgents) != 1 || snapshot.ActiveAgents[0] != PipelineAgentInspector {
 		t.Fatalf("active_agents = %#v, want inspector", snapshot.ActiveAgents)
@@ -1003,6 +1189,7 @@ func TestPipelineProtocolSkills_FinalizePipelineChallengesTester(t *testing.T) {
 
 	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
 		AgentType:   func() string { return PipelineAgentInspector },
+		AgentID:     func() string { return "inspector-finalize-1" },
 		InspectorOT: true,
 		Route: PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return bus },
@@ -1032,8 +1219,8 @@ func TestPipelineProtocolSkills_FinalizePipelineChallengesTester(t *testing.T) {
 	if req.TargetAgentID != PipelineWorkerRoutingTarget("task-finalize-gate", PipelineAgentTester) {
 		t.Fatalf("target_agent_id = %q", req.TargetAgentID)
 	}
-	if req.Metadata["chat_nested_branch"] == true {
-		t.Fatalf("finalize_pipeline should not stamp nested chat branch metadata: %#v", req.Metadata)
+	if req.Metadata[streamMetadataNestedBranch] != true {
+		t.Fatalf("chat_nested_branch = %#v, want true", req.Metadata[streamMetadataNestedBranch])
 	}
 
 	var nextTask PipelineTaskInput
@@ -1047,6 +1234,9 @@ func TestPipelineProtocolSkills_FinalizePipelineChallengesTester(t *testing.T) {
 	if snapshot == nil || snapshot.PendingChallenge == nil {
 		t.Fatalf("pending challenge = %#v, want value", snapshot)
 	}
+	if snapshot.PendingChallenge.RequestingAgentID != "inspector-finalize-1" {
+		t.Fatalf("requesting_agent_id = %q, want %q", snapshot.PendingChallenge.RequestingAgentID, "inspector-finalize-1")
+	}
 	if snapshot.AuditLock == nil {
 		t.Fatalf("audit_lock = %#v, want value", snapshot.AuditLock)
 	}
@@ -1055,6 +1245,15 @@ func TestPipelineProtocolSkills_FinalizePipelineChallengesTester(t *testing.T) {
 	}
 	if snapshot.AuditLock.Phase != PipelineAuditPhaseFinalizing {
 		t.Fatalf("audit_lock.phase = %q, want %q", snapshot.AuditLock.Phase, PipelineAuditPhaseFinalizing)
+	}
+	if got, _ := req.Metadata[streamMetadataParentCorrelation].(string); got != "corr-finalize-gate" {
+		t.Fatalf("chat_parent_correlation_id = %q, want corr-finalize-gate", got)
+	}
+	if got, _ := req.Metadata[streamMetadataInterAgentKind].(string); got != InterAgentToolEventKindChallenge {
+		t.Fatalf("chat_inter_agent_kind = %q, want %q", got, InterAgentToolEventKindChallenge)
+	}
+	if got, _ := req.Metadata[streamMetadataInterAgentThread].(string); got != pipelineThreadPrefix+snapshot.PendingChallenge.ID {
+		t.Fatalf("chat_inter_agent_thread = %q, want %q", got, pipelineThreadPrefix+snapshot.PendingChallenge.ID)
 	}
 	if !containsNormalizedString(snapshot.PendingChallenge.References, finalizePipelineVerificationReference) {
 		t.Fatalf("challenge references = %#v, want finalize marker", snapshot.PendingChallenge.References)
@@ -1488,6 +1687,7 @@ func TestPipelineProtocolSkills_FinalizePipelineSignalsReadinessAndHandoffToOTPu
 
 	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
 		AgentType:   func() string { return PipelineAgentInspector },
+		AgentID:     func() string { return "inspector-ot-1" },
 		InspectorOT: true,
 		Route: PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return bus },
@@ -1591,6 +1791,7 @@ func TestPipelineProtocolSkills_HandoffToOTPublishesTerminalUpdateWithoutBoundPi
 
 	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
 		AgentType:   func() string { return PipelineAgentInspector },
+		AgentID:     func() string { return "inspector-fallback-1" },
 		InspectorOT: true,
 		Route: PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return bus },

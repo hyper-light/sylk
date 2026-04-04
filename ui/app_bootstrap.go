@@ -32,6 +32,7 @@ import (
 	"github.com/adalundhe/sylk/ui/layout"
 	"github.com/adalundhe/sylk/ui/login"
 	markdownpkg "github.com/adalundhe/sylk/ui/markdown"
+	"github.com/adalundhe/sylk/ui/memoryview"
 	"github.com/adalundhe/sylk/ui/modal"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/pane"
@@ -87,6 +88,8 @@ func newAppModel(
 		agentPanel:         agentpkg.New(th),
 		codePanel:          codepkg.New(th),
 		knowledgePanel:     knowledgepkg.New(th),
+		memoryView:         memoryview.New(th),
+		memoryIndexedIDs:   make(map[string]struct{}),
 		fileTree:           filetree.New(th),
 		editorOverlay:      editor.New(th),
 		editorCache:        editor.NewEditorCache(editor.CacheConfig{}),
@@ -125,6 +128,7 @@ func newAppModel(
 		streamUsage:            make(map[string]streamUsageEntry),
 		streamedResponses:      make(map[string]streamedResponseState),
 		activeStreams:          make(map[string]*activeStreamEntry),
+		deferredStreams:        make(map[string]*activeStreamEntry),
 		nestedStreams:          make(map[string]*activeStreamEntry),
 		reroutedStreamCIDs:     make(map[string]time.Time),
 		oauthSessions:          newOAuthSessionManager(),

@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"strings"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
+	"github.com/google/uuid"
 )
 
 type globalTestWriteParams struct {
@@ -111,42 +114,65 @@ func (gt *GlobalTester) writeGlobalTestFile(
 	if basis == nil {
 		return nil, fmt.Errorf("basis is required")
 	}
-	result := gt.invokeGlobalWriteSkill(ctx, path, content, *basis)
-	if result.Success {
+	if err := gt.ensureVisibleGlobalWriteBasis(ctx, path, basis); err != nil {
+		return nil, err
+	}
+	result, err := gt.invokeGlobalWriteSkill(ctx, path, content, *basis)
+	if err == nil {
 		return globalWriteResultData(result)
 	}
-	if !errors.Is(result.Err, versioning.ErrWorkspaceWriteLeaseExpired) {
-		return nil, skillInvokeError("write_global_file", result)
+	if !errors.Is(err, versioning.ErrWorkspaceWriteLeaseExpired) {
+		return nil, err
 	}
 	if err := gt.refreshGlobalWriteBasis(ctx, path, basis); err != nil {
 		return nil, err
 	}
-	retried := gt.invokeGlobalWriteSkill(ctx, path, content, *basis)
-	if !retried.Success {
-		return nil, skillInvokeError("write_global_file", retried)
+	retried, err := gt.invokeGlobalWriteSkill(ctx, path, content, *basis)
+	if err != nil {
+		return nil, err
 	}
 	return globalWriteResultData(retried)
+}
+
+func (gt *GlobalTester) ensureVisibleGlobalWriteBasis(
+	ctx context.Context,
+	path string,
+	basis *versioning.WorkspaceWriteBasis,
+) error {
+	if basis == nil {
+		return fmt.Errorf("basis is required")
+	}
+	if gt.workspaceViews == nil {
+		return fmt.Errorf("workspace views are unavailable")
+	}
+	if err := versioning.ValidateWorkspaceWriteBasis(
+		ctx,
+		gt.workspaceViews,
+		versioning.WorkspaceWriteScopeGlobal,
+		path,
+		*basis,
+	); err != nil {
+		if errors.Is(err, versioning.ErrWorkspaceWriteLeaseExpired) {
+			return gt.refreshGlobalWriteBasis(ctx, path, basis)
+		}
+		if _, ok := versioning.WorkspaceWriteStale(err); ok {
+			return gt.refreshGlobalWriteBasis(ctx, path, basis)
+		}
+		return err
+	}
+	return nil
 }
 
 func (gt *GlobalTester) invokeGlobalWriteSkill(
 	ctx context.Context,
 	path, content string,
 	basis versioning.WorkspaceWriteBasis,
-) *skills.Result {
-	payload, err := json.Marshal(map[string]any{
+) (*skills.Result, error) {
+	return gt.runDeterministicGlobalSkillCall(ctx, "write_global_file", map[string]any{
 		"path":    path,
 		"content": content,
 		"basis":   basis,
 	})
-	if err != nil {
-		return &skills.Result{
-			SkillName: "write_global_file",
-			Success:   false,
-			Error:     err.Error(),
-			Err:       err,
-		}
-	}
-	return gt.skills.Invoke(ctx, "write_global_file", payload)
 }
 
 func (gt *GlobalTester) refreshGlobalWriteBasis(
@@ -157,21 +183,72 @@ func (gt *GlobalTester) refreshGlobalWriteBasis(
 	if basis == nil {
 		return nil
 	}
-	if gt.workspaceViews == nil {
-		return fmt.Errorf("workspace views are unavailable")
-	}
-	refreshed, err := versioning.RefreshWorkspaceWriteBasis(
-		ctx,
-		gt.workspaceViews,
-		versioning.WorkspaceWriteScopeGlobal,
-		path,
-		"",
-	)
+	result, err := gt.runDeterministicGlobalSkillCall(ctx, "prepare_global_write_context", map[string]any{
+		"path": path,
+	})
 	if err != nil {
 		return err
 	}
-	*basis = refreshed
+	prepared, err := globalPreparedWriteContext(result)
+	if err != nil {
+		return err
+	}
+	*basis = prepared.Basis
 	return nil
+}
+
+func (gt *GlobalTester) runDeterministicGlobalSkillCall(
+	ctx context.Context,
+	name string,
+	payload map[string]any,
+) (*skills.Result, error) {
+	arguments, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal %s arguments: %w", name, err)
+	}
+	call := providers.ToolCall{
+		ID:        "det_" + uuid.NewString()[:8],
+		Name:      name,
+		Arguments: string(arguments),
+	}
+	execCtx := agentshared.WithActiveToolCall(ctx, call)
+
+	var result *skills.Result
+	_, err = agentshared.TimedToolCall(execCtx, "tester", call, func() (string, error) {
+		result = gt.skills.Invoke(execCtx, name, arguments)
+		if result == nil {
+			return "", fmt.Errorf("%s returned no result", name)
+		}
+		if !result.Success {
+			return "", skillInvokeError(name, result)
+		}
+		output, marshalErr := agentshared.MarshalToolOutput(result.Data)
+		if marshalErr != nil {
+			return "", fmt.Errorf("marshal %s output: %w", name, marshalErr)
+		}
+		return output, nil
+	})
+	if err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func globalPreparedWriteContext(result *skills.Result) (versioning.PreparedWorkspaceWriteContext, error) {
+	if result == nil {
+		return versioning.PreparedWorkspaceWriteContext{}, fmt.Errorf("prepare_global_write_context returned no result")
+	}
+	switch typed := result.Data.(type) {
+	case versioning.PreparedWorkspaceWriteContext:
+		return typed, nil
+	case *versioning.PreparedWorkspaceWriteContext:
+		if typed == nil {
+			return versioning.PreparedWorkspaceWriteContext{}, fmt.Errorf("prepare_global_write_context returned nil context")
+		}
+		return *typed, nil
+	default:
+		return versioning.PreparedWorkspaceWriteContext{}, fmt.Errorf("prepare_global_write_context returned unexpected result type %T", result.Data)
+	}
 }
 
 func globalWriteResultData(result *skills.Result) (map[string]any, error) {

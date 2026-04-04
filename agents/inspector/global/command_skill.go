@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	inspectorshared "github.com/adalundhe/sylk/agents/inspector/shared"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
@@ -37,5 +38,8 @@ func globalInspectorCommandSkillConfig(gi *GlobalInspector) agentshared.CommandS
 		ExecutionBroker:      func() purevfs.ExecutionBroker { return gi.executionBroker },
 		ExecutionWorkspace:   gi.executionWorkspace,
 		AllowWorkspaceWrites: false,
+		PreAuthorizeCheck: func(command, toolName string) error {
+			return inspectorshared.InspectorRejectTestExecution(command, toolName)
+		},
 	}
 }

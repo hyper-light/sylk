@@ -74,6 +74,45 @@ func TestResourceQuota_ReleaseFreesSpace(t *testing.T) {
 	}
 }
 
+func TestResourceQuota_ElasticContainerCapacityUsesResourceHeadroom(t *testing.T) {
+	q := NewResourceQuota(ResourceQuotaConfig{
+		GoroutineLimit: 100,
+		ContainerLimit: 2,
+	})
+
+	spec := &ContainerSpec{
+		Resources: ResourceSpec{GoroutineLimit: 10},
+	}
+	q.Reserve(spec)
+	q.Reserve(spec)
+
+	usage := q.Usage()
+	if usage.ContainerHardCapacity <= usage.ContainerLimit {
+		t.Fatalf("expected elastic hard capacity above base limit, got %+v", usage)
+	}
+	if err := q.CheckContainerFits(spec); err != nil {
+		t.Fatalf("expected elastic container headroom, got %v", err)
+	}
+}
+
+func TestResourceQuota_ElasticContainerCapacityStillRespectsResourceHeadroom(t *testing.T) {
+	q := NewResourceQuota(ResourceQuotaConfig{
+		GoroutineLimit: 25,
+		ContainerLimit: 2,
+	})
+
+	spec := &ContainerSpec{
+		Resources: ResourceSpec{GoroutineLimit: 10},
+	}
+	q.Reserve(spec)
+	q.Reserve(spec)
+
+	err := q.CheckContainerFits(spec)
+	if !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("expected ErrQuotaExceeded when goroutine headroom is exhausted, got %v", err)
+	}
+}
+
 func TestResourceQuota_Usage(t *testing.T) {
 	q := NewResourceQuota(ResourceQuotaConfig{
 		GoroutineLimit:       100,

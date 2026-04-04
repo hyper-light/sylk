@@ -1656,7 +1656,7 @@ func (m *Model) highlightSlashCommand(lineStr string) string {
 	if m.slashValidator == nil {
 		return lineStr
 	}
-	cmd := detectSlashCommand(lineStr)
+	cmd, start, end := detectSlashCommandSpan(lineStr)
 	if cmd == "" {
 		return lineStr
 	}
@@ -1665,43 +1665,66 @@ func (m *Model) highlightSlashCommand(lineStr string) string {
 	if !matched && !completing {
 		return lineStr
 	}
-	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Secondary).Bold(true)
-	tag := "/" + cmd
-	return style.Render(tag) + lineStr[len(tag):]
+	cmdStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Secondary).Bold(true)
+	argStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Info)
+	var out strings.Builder
+	out.Grow(len(lineStr) + 32)
+	out.WriteString(lineStr[:start])
+	out.WriteString(cmdStyle.Render(lineStr[start:end]))
+	remainder := lineStr[end:]
+	if matched {
+		argStart := 0
+		for argStart < len(remainder) && (remainder[argStart] == ' ' || remainder[argStart] == '\t') {
+			argStart++
+		}
+		out.WriteString(remainder[:argStart])
+		if argStart < len(remainder) {
+			out.WriteString(argStyle.Render(remainder[argStart:]))
+		}
+		return out.String()
+	}
+	out.WriteString(remainder)
+	return out.String()
 }
 
 // detectSlashCommand returns the command name (without "/") if text begins
 // with an unquoted /word token, or "" otherwise.
 func detectSlashCommand(text string) string {
+	cmd, _, _ := detectSlashCommandSpan(text)
+	return cmd
+}
+
+func detectSlashCommandSpan(text string) (cmd string, start int, end int) {
 	trimmed := strings.TrimLeft(text, " \t")
 	if len(trimmed) < 2 {
-		return ""
+		return "", 0, 0
 	}
+	start = len(text) - len(trimmed)
 	// Reject text enclosed in quotes.
 	if trimmed[0] == '"' || trimmed[0] == '\'' {
-		return ""
+		return "", 0, 0
 	}
 	if trimmed[0] != '/' {
-		return ""
+		return "", 0, 0
 	}
-	end := 1
-	for end < len(trimmed) && trimmed[end] != ' ' && trimmed[end] != '\t' && trimmed[end] != '\n' {
-		end++
+	tokenEnd := 1
+	for tokenEnd < len(trimmed) && trimmed[tokenEnd] != ' ' && trimmed[tokenEnd] != '\t' && trimmed[tokenEnd] != '\n' {
+		tokenEnd++
 	}
-	if end <= 1 {
-		return ""
+	if tokenEnd <= 1 {
+		return "", 0, 0
 	}
-	cmd := strings.ToLower(trimmed[1:end])
-	for _, r := range cmd {
+	normalized := strings.ToLower(trimmed[1:tokenEnd])
+	for _, r := range normalized {
 		switch {
 		case r >= 'a' && r <= 'z':
 		case r >= '0' && r <= '9':
 		case r == '_', r == '-':
 		default:
-			return ""
+			return "", 0, 0
 		}
 	}
-	return cmd
+	return normalized, start, start + tokenEnd
 }
 
 // isEmpty reports whether the input buffer has no content.

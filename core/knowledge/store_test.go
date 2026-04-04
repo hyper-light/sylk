@@ -7,6 +7,16 @@ import (
 	"time"
 )
 
+type testBackgroundWaiter struct {
+	ready chan struct{}
+}
+
+func (w *testBackgroundWaiter) Ready() <-chan struct{} { return w.ready }
+func (w *testBackgroundWaiter) Progress() (indexed, total int64) {
+	return 0, 0
+}
+func (w *testBackgroundWaiter) OnProgress(func(indexed, total int64)) {}
+
 // mockReadinessPublisher collects published events for test assertions.
 type mockReadinessPublisher struct {
 	mu     sync.Mutex
@@ -176,5 +186,42 @@ func TestKnowledgeStore_RepeatedPromotionsAreIdempotent(t *testing.T) {
 	}
 	if events[1].Level != ReadinessFull {
 		t.Fatalf("second event level = %d, want %d", events[1].Level, ReadinessFull)
+	}
+}
+
+func TestKnowledgeStore_LifecycleObserverReceivesRepeatedPartialCycles(t *testing.T) {
+	ks := NewKnowledgeStore(nil, nil)
+	defer ks.Close()
+
+	waiter1 := &testBackgroundWaiter{ready: make(chan struct{})}
+	waiter2 := &testBackgroundWaiter{ready: make(chan struct{})}
+
+	var (
+		mu     sync.Mutex
+		events []LifecycleEvent
+	)
+	ks.SetLifecycleObserver(func(event LifecycleEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, event)
+	})
+
+	ks.PromotePartial(nil, waiter1, nil)
+	ks.PromoteFull()
+	ks.PromotePartial(nil, waiter2, nil)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != 3 {
+		t.Fatalf("lifecycle event count = %d, want 3", len(events))
+	}
+	if events[0].Kind != LifecycleEventPartial || events[0].Waiter != waiter1 {
+		t.Fatalf("first lifecycle event = %#v, want partial waiter1", events[0])
+	}
+	if events[1].Kind != LifecycleEventFull {
+		t.Fatalf("second lifecycle event = %#v, want full", events[1])
+	}
+	if events[2].Kind != LifecycleEventPartial || events[2].Waiter != waiter2 {
+		t.Fatalf("third lifecycle event = %#v, want partial waiter2", events[2])
 	}
 }

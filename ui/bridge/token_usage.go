@@ -6,6 +6,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/ui/agentidentity"
 	"github.com/adalundhe/sylk/ui/msg"
 )
 
@@ -63,10 +64,18 @@ func (b *TokenUsageBridge) forwardHandler(program TeaProgram) guide.MessageHandl
 
 		um := msg.TokenUsageMsg{
 			CorrelationID: evt.CorrelationID,
-			AgentID:       evt.AgentID,
+			AgentID: agentidentity.VisibleAgentID(
+				evt.AgentID,
+				activityMetadataString(evt.Data, "canonical_agent_id"),
+				activityMetadataString(evt.Data, "agent_type"),
+				activityMetadataString(evt.Data, "pipeline_id"),
+				activityMetadataString(evt.Data, "task_id"),
+			),
 		}
 		if v, ok := evt.Data["runtime_agent_id"].(string); ok {
 			um.RuntimeAgentID = v
+		} else {
+			um.RuntimeAgentID = agentidentity.RuntimeAgentID(evt.AgentID, "")
 		}
 		if v, ok := evt.Data["agent_type"].(string); ok {
 			um.AgentType = v

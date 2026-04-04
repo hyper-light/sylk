@@ -51,11 +51,7 @@ func formatResponseTextPayload(payload any) (string, bool) {
 	if !ok || rt == nil {
 		return "", false
 	}
-	text := strings.TrimSpace(rt.ResponseText())
-	if text == "" {
-		return "", false
-	}
-	return text, true
+	return strings.TrimSpace(rt.ResponseText()), true
 }
 
 // formatConversationResult extracts the Response field from a ConversationResult

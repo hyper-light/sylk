@@ -172,8 +172,37 @@ func sortPackets(packets []*BranchPacket) {
 	})
 }
 
-func canopyKey(horizon CanopyHorizon, sessionID, intentID string) string {
-	return fmt.Sprintf("%s:%s:%s", horizon, sessionID, intentID)
+func canopyKey(horizon CanopyHorizon, sessionID, taskID, intentID string) string {
+	return fmt.Sprintf("%s:%s:%s:%s", horizon, sessionID, taskID, intentID)
+}
+
+func normalizeForestTaskID(taskID string) string {
+	return strings.TrimSpace(taskID)
+}
+
+func forestTaskIDFromStringMetadata(metadata map[string]string) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	return normalizeForestTaskID(metadata["task_id"])
+}
+
+func forestTaskIDFromAnyMetadata(metadata map[string]any) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	return forestTaskIDFromAny(metadata["task_id"])
+}
+
+func forestTaskIDFromAny(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return normalizeForestTaskID(typed)
+	case fmt.Stringer:
+		return normalizeForestTaskID(typed.String())
+	default:
+		return ""
+	}
 }
 
 func minInt(a, b int) int {

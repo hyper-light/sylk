@@ -104,7 +104,7 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 				req.Messages = append(req.Messages, providers.Message{
 					Role: providers.RoleUser,
 					Content: err.Error() +
-						"\nUse the strict global review protocol now. Answer the active inspector challenge with validate_global_review instead of ending the turn narratively.",
+						"\nUse the global review protocol now. End ordinary top-level turns with handoff_next and active challenge turns with validate_work instead of ending narratively.",
 				})
 				continue
 			}
@@ -169,11 +169,10 @@ func (gt *GlobalTester) applyToolCalls(
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
-	recoveryHints := make([]string, 0, 1)
 	rerouted := false
 	delegated := false
 	delegatedMessage := ""
-	for _, call := range resp.ToolCalls {
+	for idx, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
 		execCtx := agentshared.WithActiveToolCall(ctx, call)
@@ -198,9 +197,6 @@ func (gt *GlobalTester) applyToolCalls(
 				if agentshared.ToolErrorCountsTowardAbort(err) {
 					errCount++
 				}
-				if hint := agentshared.ToolRecoveryHint(call.Name, err); hint != "" {
-					recoveryHints = append(recoveryHints, hint)
-				}
 				if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 					agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventSkillFailed,
 						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
@@ -223,11 +219,11 @@ func (gt *GlobalTester) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
-		if rerouted || delegated {
+		if rerouted || delegated || agentshared.GlobalReviewTurnTerminated(ctx) {
+			agentshared.AppendSkippedToolResults(req, resp.ToolCalls[idx+1:], "a previous tool call in this assistant turn already completed or redirected the global review decision")
 			break
 		}
 	}
-	agentshared.AppendToolRecoveryMessage(req, recoveryHints)
 	return errCount, rerouted, delegated, delegatedMessage
 }
 

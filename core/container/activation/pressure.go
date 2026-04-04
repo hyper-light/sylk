@@ -73,8 +73,12 @@ func (pe *PressureEvaluator) IsUnderPressure() bool {
 	}
 	if pe.quota != nil {
 		usage := pe.quota.Usage()
-		if usage.ContainerLimit > 0 {
-			containerUtil := float64(usage.ContainerCount) / float64(usage.ContainerLimit)
+		containerLimit := usage.ContainerHardCapacity
+		if containerLimit <= 0 {
+			containerLimit = usage.ContainerLimit
+		}
+		if containerLimit > 0 {
+			containerUtil := float64(usage.ContainerCount) / float64(containerLimit)
 			if containerUtil >= pe.config.ThresholdFraction {
 				return true
 			}

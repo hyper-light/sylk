@@ -24,6 +24,10 @@ func (r *recordingProgram) Send(m any) {
 	r.messages = append(r.messages, m)
 }
 
+type emptyResponseTextPayload struct{}
+
+func (emptyResponseTextPayload) ResponseText() string { return "" }
+
 func TestGuideBridgeDispatch_ForwardsErrorMessageAsStreamError(t *testing.T) {
 	b := NewGuideBridge(nil, nil, "session-1")
 	program := &recordingProgram{}
@@ -254,6 +258,67 @@ func TestGuideBridgePriorityQueue_StreamCompleteSurvivesStreamFlood(t *testing.T
 	}
 }
 
+func TestGuideBridgePriorityQueue_HoldsTerminalUntilEarlierSamePhaseProgressDequeues(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+
+	progress := &guide.Message{
+		CorrelationID: "corr-ordered-terminal",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "corr-ordered-terminal",
+			RespondingAgentID: "inspector",
+			Metadata: map[string]any{
+				"agent_type": "inspector",
+				"task_id":    "task_1",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Working through this with challenge agent."},
+			},
+		},
+	}
+	complete := &guide.Message{
+		CorrelationID: "corr-ordered-terminal",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "corr-ordered-terminal",
+			RespondingAgentID: "inspector",
+			Metadata: map[string]any{
+				"agent_type": "inspector",
+				"task_id":    "task_1",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventComplete,
+			},
+		},
+	}
+
+	if err := b.onMessage(progress); err != nil {
+		t.Fatalf("enqueue progress: %v", err)
+	}
+	if err := b.onMessage(complete); err != nil {
+		t.Fatalf("enqueue complete: %v", err)
+	}
+
+	first, ok := b.nextMessage(context.Background())
+	if !ok {
+		t.Fatal("expected first queued message")
+	}
+	firstStream, ok := first.GetStreamResponse()
+	if !ok || firstStream == nil || firstStream.Event == nil || firstStream.Event.Type != guide.StreamEventProgress {
+		t.Fatalf("first dequeued message = %#v, want same-phase progress", first)
+	}
+
+	second, ok := b.nextMessage(context.Background())
+	if !ok {
+		t.Fatal("expected held terminal after progress drains")
+	}
+	secondStream, ok := second.GetStreamResponse()
+	if !ok || secondStream == nil || secondStream.Event == nil || secondStream.Event.Type != guide.StreamEventComplete {
+		t.Fatalf("second dequeued message = %#v, want held stream complete", second)
+	}
+}
+
 func TestGuideBridgePriorityQueue_InterAgentToolCallSurvivesStreamFlood(t *testing.T) {
 	b := NewGuideBridge(nil, nil, "session-1")
 
@@ -455,6 +520,68 @@ func TestGuideBridgePriorityQueue_NestedBranchProgressSurvivesStreamFlood(t *tes
 	stream, streamOK := got.GetStreamResponse()
 	if !streamOK || stream == nil || stream.Event == nil || stream.Event.Type != guide.StreamEventProgress {
 		t.Fatalf("first dequeued message = %#v, want nested branch progress", got)
+	}
+}
+
+func TestGuideBridgeDispatch_PreservesRememberedTaskIdentityAcrossSparseProgress(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatch(&guide.Message{
+		CorrelationID: "corr-inspector-sparse-progress",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "corr-inspector-sparse-progress",
+			RespondingAgentID: "runtime-inspector",
+			Metadata: map[string]any{
+				"agent_type": "inspector-pipeline",
+				"task_id":    "task_3",
+				"task_name":  "Create hello.py CLI entrypoint",
+				"task_slug":  "create-cli-entrypoint",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Initial inspector progress."},
+			},
+		},
+	}, program)
+
+	program.messages = nil
+
+	b.dispatch(&guide.Message{
+		CorrelationID: "corr-inspector-sparse-progress",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "corr-inspector-sparse-progress",
+			RespondingAgentID: "runtime-inspector",
+			Metadata: map[string]any{
+				"agent_type": "inspector-pipeline",
+				"task_id":    "",
+				"task_name":  "",
+				"task_slug":  "",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Sparse follow-up progress."},
+			},
+		},
+	}, program)
+
+	if len(program.messages) == 0 {
+		t.Fatal("expected follow-up progress messages")
+	}
+	progress, ok := program.messages[len(program.messages)-1].(uimsg.StreamProgressMsg)
+	if !ok {
+		t.Fatalf("expected final dispatched message to be StreamProgressMsg, got %T", program.messages[len(program.messages)-1])
+	}
+	if progress.TaskID != "task_3" {
+		t.Fatalf("progress TaskID = %q, want remembered task_3", progress.TaskID)
+	}
+	if progress.TaskName != "Create hello.py CLI entrypoint" {
+		t.Fatalf("progress TaskName = %q, want remembered task label", progress.TaskName)
+	}
+	if progress.TaskSlug != "create-cli-entrypoint" {
+		t.Fatalf("progress TaskSlug = %q, want remembered create-cli-entrypoint", progress.TaskSlug)
 	}
 }
 
@@ -855,12 +982,19 @@ func TestGuideBridgeDispatch_UsesEnvelopeMetadataForNestedToolCall(t *testing.T)
 		},
 	}, program)
 
-	if len(program.messages) != 1 {
-		t.Fatalf("expected 1 forwarded message, got %d", len(program.messages))
+	if len(program.messages) != 2 {
+		t.Fatalf("expected synthetic start + tool event, got %d forwarded messages", len(program.messages))
 	}
-	ev, ok := program.messages[0].(uimsg.ToolCallEventMsg)
+	start, ok := program.messages[0].(uimsg.StreamStartMsg)
 	if !ok {
-		t.Fatalf("expected ToolCallEventMsg, got %T", program.messages[0])
+		t.Fatalf("expected first message to be StreamStartMsg, got %T", program.messages[0])
+	}
+	if start.BranchRef == nil {
+		t.Fatal("expected branch ref on synthetic nested start")
+	}
+	ev, ok := program.messages[1].(uimsg.ToolCallEventMsg)
+	if !ok {
+		t.Fatalf("expected second message to be ToolCallEventMsg, got %T", program.messages[1])
 	}
 	if ev.AgentType != "academic" {
 		t.Fatalf("AgentType = %q, want academic", ev.AgentType)
@@ -1019,12 +1153,15 @@ func TestGuideBridgeDispatchStream_CompleteEmitsChunkFromStructuredPayload(t *te
 		},
 	}, program)
 
-	if len(program.messages) != 1 {
-		t.Fatalf("expected 1 message (complete with authoritative text), got %d", len(program.messages))
+	if len(program.messages) != 2 {
+		t.Fatalf("expected synthetic start + complete with authoritative text, got %d messages", len(program.messages))
 	}
-	complete, ok := program.messages[0].(uimsg.StreamCompleteMsg)
+	if _, ok := program.messages[0].(uimsg.StreamStartMsg); !ok {
+		t.Fatalf("expected first message to be StreamStartMsg, got %T", program.messages[0])
+	}
+	complete, ok := program.messages[1].(uimsg.StreamCompleteMsg)
 	if !ok {
-		t.Fatalf("expected StreamCompleteMsg, got %T", program.messages[0])
+		t.Fatalf("expected second message to be StreamCompleteMsg, got %T", program.messages[1])
 	}
 	if !strings.Contains(complete.AuthoritativeText, "I drafted a concrete plan for oauth.") {
 		t.Fatalf("expected authoritative text with plan summary, got %q", complete.AuthoritativeText)
@@ -1040,15 +1177,19 @@ func TestParseStreamMessages_PreferMetadataAgentName(t *testing.T) {
 			"agent_type":                 "inspector-pipeline",
 			"pipeline_id":                "task_auth_checkout",
 			"task_id":                    "task_auth_checkout",
+			"chat_top_level_transfer":    true,
 			"chat_parent_correlation_id": "corr-parent-top-level",
 		},
 		Event: &guide.StreamEvent{
 			Type: guide.StreamEventProgress,
-			Data: &guide.ProgressData{Message: "Inspecting criteria."},
+			Data: &guide.ProgressData{Message: "Inspecting criteria.", ToolDerived: true},
 		},
 	}
 
 	start := parseStreamStartMsg("session-1", "corr-pipeline-agent-name", stream)
+	if start.AgentID != "8a7d3b2c" {
+		t.Fatalf("start.AgentID = %q, want 8a7d3b2c", start.AgentID)
+	}
 	if start.AgentName != "Pipeline Inspector" {
 		t.Fatalf("start.AgentName = %q, want Pipeline Inspector", start.AgentName)
 	}
@@ -1061,6 +1202,9 @@ func TestParseStreamMessages_PreferMetadataAgentName(t *testing.T) {
 	if start.ParentCorrelationID != "corr-parent-top-level" {
 		t.Fatalf("start.ParentCorrelationID = %q, want corr-parent-top-level", start.ParentCorrelationID)
 	}
+	if !start.TopLevelTransfer {
+		t.Fatal("expected top-level transfer marker on parsed start")
+	}
 	if start.Visibility != events.VisibilityUser {
 		t.Fatalf("start.Visibility = %v, want %v", start.Visibility, events.VisibilityUser)
 	}
@@ -1069,6 +1213,9 @@ func TestParseStreamMessages_PreferMetadataAgentName(t *testing.T) {
 	}
 
 	progress := toStreamProgressMsg("session-1", "corr-pipeline-agent-name", stream)
+	if progress.AgentID != "8a7d3b2c" {
+		t.Fatalf("progress.AgentID = %q, want 8a7d3b2c", progress.AgentID)
+	}
 	if progress.AgentName != "Pipeline Inspector" {
 		t.Fatalf("progress.AgentName = %q, want Pipeline Inspector", progress.AgentName)
 	}
@@ -1080,6 +1227,12 @@ func TestParseStreamMessages_PreferMetadataAgentName(t *testing.T) {
 	}
 	if progress.ParentCorrelationID != "corr-parent-top-level" {
 		t.Fatalf("progress.ParentCorrelationID = %q, want corr-parent-top-level", progress.ParentCorrelationID)
+	}
+	if !progress.TopLevelTransfer {
+		t.Fatal("expected top-level transfer marker on parsed progress")
+	}
+	if !progress.ToolDerived {
+		t.Fatal("expected tool-derived progress flag to survive bridge parsing")
 	}
 	if progress.BranchRef != nil {
 		t.Fatalf("progress.BranchRef = %+v, want nil for top-level transfer metadata", progress.BranchRef)
@@ -1093,6 +1246,7 @@ func TestParseStreamMessages_PreferMetadataAgentName(t *testing.T) {
 			"agent_type":                 "inspector-pipeline",
 			"pipeline_id":                "task_auth_checkout",
 			"task_id":                    "task_auth_checkout",
+			"chat_top_level_transfer":    true,
 			"chat_parent_correlation_id": "corr-parent-top-level",
 		},
 		Event: &guide.StreamEvent{
@@ -1104,14 +1258,23 @@ func TestParseStreamMessages_PreferMetadataAgentName(t *testing.T) {
 			},
 		},
 	})
+	if tool.AgentID != "8a7d3b2c" {
+		t.Fatalf("tool.AgentID = %q, want 8a7d3b2c", tool.AgentID)
+	}
 	if tool.ParentCorrelationID != "corr-parent-top-level" {
 		t.Fatalf("tool.ParentCorrelationID = %q, want corr-parent-top-level", tool.ParentCorrelationID)
+	}
+	if !tool.TopLevelTransfer {
+		t.Fatal("expected top-level transfer marker on parsed tool call")
 	}
 	if tool.BranchRef != nil {
 		t.Fatalf("tool.BranchRef = %+v, want nil for top-level transfer metadata", tool.BranchRef)
 	}
 
 	complete := parseStreamCompleteMsg("session-1", "corr-pipeline-agent-name", stream)
+	if complete.AgentID != "8a7d3b2c" {
+		t.Fatalf("complete.AgentID = %q, want 8a7d3b2c", complete.AgentID)
+	}
 	if complete.AgentName != "Pipeline Inspector" {
 		t.Fatalf("complete.AgentName = %q, want Pipeline Inspector", complete.AgentName)
 	}
@@ -1124,11 +1287,118 @@ func TestParseStreamMessages_PreferMetadataAgentName(t *testing.T) {
 	if complete.ParentCorrelationID != "corr-parent-top-level" {
 		t.Fatalf("complete.ParentCorrelationID = %q, want corr-parent-top-level", complete.ParentCorrelationID)
 	}
+	if !complete.TopLevelTransfer {
+		t.Fatal("expected top-level transfer marker on parsed complete")
+	}
 	if complete.Visibility != events.VisibilityUser {
 		t.Fatalf("complete.Visibility = %v, want %v", complete.Visibility, events.VisibilityUser)
 	}
 	if complete.BranchRef != nil {
 		t.Fatalf("complete.BranchRef = %+v, want nil for top-level transfer metadata", complete.BranchRef)
+	}
+}
+
+func TestGuideBridgeDispatch_RemembersNestedBranchMetadataAcrossIncompleteEvents(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatch(&guide.Message{
+		CorrelationID: "corr-remembered-nested",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "corr-remembered-nested",
+			RespondingAgentID: "runtime-tester",
+			Metadata: map[string]any{
+				"agent_type":                 "tester-pipeline",
+				"task_id":                    "task_1",
+				"chat_nested_branch":         true,
+				"chat_parent_correlation_id": "corr-parent",
+				"chat_parent_tool_call_key":  "challenge-1",
+				"chat_inter_agent_kind":      "challenge",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Working the challenge."},
+			},
+		},
+	}, program)
+
+	b.dispatch(&guide.Message{
+		CorrelationID: "corr-remembered-nested",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "corr-remembered-nested",
+			RespondingAgentID: "runtime-tester",
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventToolCall,
+				Data: map[string]any{
+					"phase":         0,
+					"tool_name":     "run_test_suite",
+					"tool_call_key": "tool-1",
+				},
+			},
+		},
+	}, program)
+
+	if len(program.messages) != 3 {
+		t.Fatalf("expected synthetic start + progress + remembered tool event, got %d messages", len(program.messages))
+	}
+	start, ok := program.messages[0].(uimsg.StreamStartMsg)
+	if !ok || start.BranchRef == nil {
+		t.Fatalf("expected nested synthetic start, got %#v", program.messages[0])
+	}
+	tool, ok := program.messages[2].(uimsg.ToolCallEventMsg)
+	if !ok {
+		t.Fatalf("expected remembered tool event, got %#v", program.messages[2])
+	}
+	if tool.BranchRef == nil {
+		t.Fatal("expected remembered nested branch metadata on later tool event")
+	}
+	if tool.BranchRef.ParentCorrelationID != "corr-parent" || tool.BranchRef.ParentToolCallKey != "challenge-1" {
+		t.Fatalf("tool.BranchRef = %+v, want remembered parent correlation/tool key", tool.BranchRef)
+	}
+	if tool.TopLevelTransfer {
+		t.Fatal("did not expect top-level transfer marker on remembered nested event")
+	}
+}
+
+func TestParseStreamMessages_PreserveRawKnowledgeReplicaIdentity(t *testing.T) {
+	stream := &guide.StreamResponse{
+		CorrelationID:     "corr-knowledge-replica",
+		RespondingAgentID: "librarian#replica-corr-1",
+		Metadata: map[string]any{
+			"agent_name":       "Librarian",
+			"agent_type":       "librarian",
+			"runtime_agent_id": "librarian#replica-corr-1",
+		},
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventProgress,
+			Data: &guide.ProgressData{Message: "Searching history."},
+		},
+	}
+
+	start := parseStreamStartMsg("session-1", "corr-knowledge-replica", stream)
+	if start.AgentID != "librarian#replica-corr-1" {
+		t.Fatalf("start.AgentID = %q, want librarian#replica-corr-1", start.AgentID)
+	}
+	if start.RuntimeAgentID != "librarian#replica-corr-1" {
+		t.Fatalf("start.RuntimeAgentID = %q, want librarian#replica-corr-1", start.RuntimeAgentID)
+	}
+
+	progress := toStreamProgressMsg("session-1", "corr-knowledge-replica", stream)
+	if progress.AgentID != "librarian#replica-corr-1" {
+		t.Fatalf("progress.AgentID = %q, want librarian#replica-corr-1", progress.AgentID)
+	}
+	if progress.RuntimeAgentID != "librarian#replica-corr-1" {
+		t.Fatalf("progress.RuntimeAgentID = %q, want librarian#replica-corr-1", progress.RuntimeAgentID)
+	}
+
+	complete := parseStreamCompleteMsg("session-1", "corr-knowledge-replica", stream)
+	if complete.AgentID != "librarian#replica-corr-1" {
+		t.Fatalf("complete.AgentID = %q, want librarian#replica-corr-1", complete.AgentID)
+	}
+	if complete.RuntimeAgentID != "librarian#replica-corr-1" {
+		t.Fatalf("complete.RuntimeAgentID = %q, want librarian#replica-corr-1", complete.RuntimeAgentID)
 	}
 }
 
@@ -1188,12 +1458,15 @@ func TestGuideBridgeDispatchStream_CompleteHumanizesPipelineTesterEnvelope(t *te
 		},
 	}, program)
 
-	if len(program.messages) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(program.messages))
+	if len(program.messages) != 2 {
+		t.Fatalf("expected synthetic start + complete, got %d messages", len(program.messages))
 	}
-	complete, ok := program.messages[0].(uimsg.StreamCompleteMsg)
+	if _, ok := program.messages[0].(uimsg.StreamStartMsg); !ok {
+		t.Fatalf("expected first message to be StreamStartMsg, got %T", program.messages[0])
+	}
+	complete, ok := program.messages[1].(uimsg.StreamCompleteMsg)
 	if !ok {
-		t.Fatalf("expected StreamCompleteMsg, got %T", program.messages[0])
+		t.Fatalf("expected second message to be StreamCompleteMsg, got %T", program.messages[1])
 	}
 	if strings.Contains(complete.AuthoritativeText, "\"created_files\"") || strings.Contains(complete.AuthoritativeText, "\"suite_result\"") {
 		t.Fatalf("expected humanized tester payload, got raw JSON %q", complete.AuthoritativeText)
@@ -1237,12 +1510,15 @@ func TestGuideBridgeDispatchStream_CompleteHumanizesPipelineInspectorEnvelope(t 
 		},
 	}, program)
 
-	if len(program.messages) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(program.messages))
+	if len(program.messages) != 2 {
+		t.Fatalf("expected synthetic start + complete, got %d messages", len(program.messages))
 	}
-	complete, ok := program.messages[0].(uimsg.StreamCompleteMsg)
+	if _, ok := program.messages[0].(uimsg.StreamStartMsg); !ok {
+		t.Fatalf("expected first message to be StreamStartMsg, got %T", program.messages[0])
+	}
+	complete, ok := program.messages[1].(uimsg.StreamCompleteMsg)
 	if !ok {
-		t.Fatalf("expected StreamCompleteMsg, got %T", program.messages[0])
+		t.Fatalf("expected second message to be StreamCompleteMsg, got %T", program.messages[1])
 	}
 	if strings.Contains(complete.AuthoritativeText, "\"Criteria\"") || strings.Contains(complete.AuthoritativeText, "\"success_criteria\"") {
 		t.Fatalf("expected humanized inspector payload, got raw JSON %q", complete.AuthoritativeText)
@@ -1265,12 +1541,15 @@ func TestGuideBridgeDispatchStream_DataUsesFallbackPayloadText(t *testing.T) {
 		},
 	}, program)
 
-	if len(program.messages) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(program.messages))
+	if len(program.messages) != 2 {
+		t.Fatalf("expected synthetic start + chunk, got %d messages", len(program.messages))
 	}
-	chunk, ok := program.messages[0].(uimsg.StreamChunkMsg)
+	if _, ok := program.messages[0].(uimsg.StreamStartMsg); !ok {
+		t.Fatalf("expected first message to be StreamStartMsg, got %T", program.messages[0])
+	}
+	chunk, ok := program.messages[1].(uimsg.StreamChunkMsg)
 	if !ok {
-		t.Fatalf("expected StreamChunkMsg, got %T", program.messages[0])
+		t.Fatalf("expected second message to be StreamChunkMsg, got %T", program.messages[1])
 	}
 	if chunk.Text != "partial reply" {
 		t.Fatalf("chunk text = %q", chunk.Text)
@@ -1294,12 +1573,19 @@ func TestGuideBridgeDispatchStream_ProgressEmitsProgressMsg(t *testing.T) {
 		},
 	}, program)
 
-	if len(program.messages) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(program.messages))
+	if len(program.messages) != 2 {
+		t.Fatalf("expected synthetic start + progress, got %d messages", len(program.messages))
 	}
-	progress, ok := program.messages[0].(uimsg.StreamProgressMsg)
+	start, ok := program.messages[0].(uimsg.StreamStartMsg)
 	if !ok {
-		t.Fatalf("expected StreamProgressMsg, got %T", program.messages[0])
+		t.Fatalf("expected first message to be StreamStartMsg, got %T", program.messages[0])
+	}
+	if start.CorrelationID != "corr-progress" {
+		t.Fatalf("unexpected start correlation id: %q", start.CorrelationID)
+	}
+	progress, ok := program.messages[1].(uimsg.StreamProgressMsg)
+	if !ok {
+		t.Fatalf("expected second message to be StreamProgressMsg, got %T", program.messages[1])
 	}
 	if progress.Current != 3 || progress.Total != 6 {
 		t.Fatalf("unexpected progress values: %+v", progress)
@@ -1309,6 +1595,226 @@ func TestGuideBridgeDispatchStream_ProgressEmitsProgressMsg(t *testing.T) {
 	}
 	if progress.Message != "Designing architecture options..." {
 		t.Fatalf("unexpected progress message: %q", progress.Message)
+	}
+}
+
+func TestGuideBridgeDispatchStream_ToolCallSynthesizesStartBeforeToolEvent(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatchStream(&guide.StreamResponse{
+		CorrelationID:     "corr-tool",
+		RespondingAgentID: "inspector-pipeline",
+		Metadata: map[string]any{
+			"agent_type": "inspector-pipeline",
+			"task_id":    "task_1",
+			"task_slug":  "create-pyproject",
+		},
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventToolCall,
+			Data: map[string]any{
+				"tool_name":     "process_validation",
+				"tool_call_key": "process-validation-1",
+				"phase":         0,
+			},
+		},
+	}, program)
+
+	if len(program.messages) != 2 {
+		t.Fatalf("expected synthetic start + tool event, got %d messages", len(program.messages))
+	}
+	start, ok := program.messages[0].(uimsg.StreamStartMsg)
+	if !ok {
+		t.Fatalf("expected first message to be StreamStartMsg, got %T", program.messages[0])
+	}
+	if start.CorrelationID != "corr-tool" || start.TaskID != "task_1" {
+		t.Fatalf("unexpected synthetic start: %+v", start)
+	}
+	tool, ok := program.messages[1].(uimsg.ToolCallEventMsg)
+	if !ok {
+		t.Fatalf("expected second message to be ToolCallEventMsg, got %T", program.messages[1])
+	}
+	if tool.ToolName != "process_validation" || tool.ToolCallKey != "process-validation-1" {
+		t.Fatalf("unexpected tool event: %+v", tool)
+	}
+}
+
+func TestGuideBridgeDispatchStream_SuppressesDuplicateRealStartAfterSyntheticStart(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	progressStream := &guide.StreamResponse{
+		CorrelationID:     "corr-dup-start",
+		RespondingAgentID: "inspector-pipeline",
+		Metadata: map[string]any{
+			"agent_type": "inspector-pipeline",
+			"task_id":    "task_1",
+		},
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventProgress,
+			Data: map[string]any{
+				"message": "Processing returned challenge evidence.",
+			},
+		},
+	}
+	b.dispatchStream(progressStream, program)
+
+	b.dispatchStream(&guide.StreamResponse{
+		CorrelationID:     "corr-dup-start",
+		RespondingAgentID: "inspector-pipeline",
+		Metadata: map[string]any{
+			"agent_type": "inspector-pipeline",
+			"task_id":    "task_1",
+		},
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventStart,
+		},
+	}, program)
+
+	if len(program.messages) != 2 {
+		t.Fatalf("expected synthetic start + progress only, got %d messages", len(program.messages))
+	}
+	if _, ok := program.messages[0].(uimsg.StreamStartMsg); !ok {
+		t.Fatalf("expected first message to be StreamStartMsg, got %T", program.messages[0])
+	}
+	if _, ok := program.messages[1].(uimsg.StreamProgressMsg); !ok {
+		t.Fatalf("expected second message to be StreamProgressMsg, got %T", program.messages[1])
+	}
+}
+
+func TestGuideBridgeDispatchStream_DropsLateProgressAfterComplete(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	complete := &guide.StreamResponse{
+		CorrelationID:     "corr-complete-then-late-progress",
+		RespondingAgentID: "inspector",
+		Metadata: map[string]any{
+			"agent_type": "inspector",
+			"task_id":    "task_1",
+		},
+		Event: &guide.StreamEvent{Type: guide.StreamEventComplete},
+	}
+	b.dispatchStream(complete, program)
+
+	if len(program.messages) != 2 {
+		t.Fatalf("expected synthetic start + complete, got %d messages", len(program.messages))
+	}
+	program.messages = nil
+
+	b.dispatchStream(&guide.StreamResponse{
+		CorrelationID:     "corr-complete-then-late-progress",
+		RespondingAgentID: "inspector",
+		Metadata: map[string]any{
+			"agent_type": "inspector",
+			"task_id":    "task_1",
+		},
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventProgress,
+			Data: &guide.ProgressData{Message: "Working through this with challenge agent."},
+		},
+	}, program)
+
+	if len(program.messages) != 0 {
+		t.Fatalf("expected stale late progress to be dropped, got %d messages", len(program.messages))
+	}
+}
+
+func TestGuideBridgeDispatchStream_ExplicitStartReopensCompletedPhase(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatchStream(&guide.StreamResponse{
+		CorrelationID:     "corr-reopen-completed-phase",
+		RespondingAgentID: "inspector",
+		Metadata: map[string]any{
+			"agent_type": "inspector",
+			"task_id":    "task_1",
+		},
+		Event: &guide.StreamEvent{Type: guide.StreamEventComplete},
+	}, program)
+	program.messages = nil
+
+	b.dispatchStream(&guide.StreamResponse{
+		CorrelationID:     "corr-reopen-completed-phase",
+		RespondingAgentID: "inspector",
+		Metadata: map[string]any{
+			"agent_type": "inspector",
+			"task_id":    "task_1",
+		},
+		Event: &guide.StreamEvent{Type: guide.StreamEventStart},
+	}, program)
+	b.dispatchStream(&guide.StreamResponse{
+		CorrelationID:     "corr-reopen-completed-phase",
+		RespondingAgentID: "inspector",
+		Metadata: map[string]any{
+			"agent_type": "inspector",
+			"task_id":    "task_1",
+		},
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventProgress,
+			Data: &guide.ProgressData{Message: "Resumed inspector work."},
+		},
+	}, program)
+
+	if len(program.messages) != 2 {
+		t.Fatalf("expected explicit restart + progress, got %d messages", len(program.messages))
+	}
+	if _, ok := program.messages[0].(uimsg.StreamStartMsg); !ok {
+		t.Fatalf("expected first message to be StreamStartMsg, got %T", program.messages[0])
+	}
+	progress, ok := program.messages[1].(uimsg.StreamProgressMsg)
+	if !ok {
+		t.Fatalf("expected second message to be StreamProgressMsg, got %T", program.messages[1])
+	}
+	if progress.Message != "Resumed inspector work." {
+		t.Fatalf("progress message = %q, want resumed inspector work", progress.Message)
+	}
+}
+
+func TestGuideBridgeDispatchStream_AllowsResponderTransitionOnSameCorrelation(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatchStream(&guide.StreamResponse{
+		CorrelationID:     "corr-same-correlation-transfer",
+		RespondingAgentID: "guide",
+		Metadata: map[string]any{
+			"agent_type": "guide",
+			"agent_name": "Guide",
+		},
+		Event: &guide.StreamEvent{Type: guide.StreamEventStart},
+	}, program)
+
+	b.dispatchStream(&guide.StreamResponse{
+		CorrelationID:     "corr-same-correlation-transfer",
+		RespondingAgentID: "architect",
+		Metadata: map[string]any{
+			"agent_type": "architect",
+			"agent_name": "Architect",
+		},
+		Event: &guide.StreamEvent{Type: guide.StreamEventStart},
+	}, program)
+
+	if len(program.messages) != 2 {
+		t.Fatalf("expected guide start + architect start, got %d messages", len(program.messages))
+	}
+	first, ok := program.messages[0].(uimsg.StreamStartMsg)
+	if !ok {
+		t.Fatalf("expected first message to be StreamStartMsg, got %T", program.messages[0])
+	}
+	second, ok := program.messages[1].(uimsg.StreamStartMsg)
+	if !ok {
+		t.Fatalf("expected second message to be StreamStartMsg, got %T", program.messages[1])
+	}
+	if first.AgentID != "guide" {
+		t.Fatalf("first.AgentID = %q, want guide", first.AgentID)
+	}
+	if second.AgentID != "architect" {
+		t.Fatalf("second.AgentID = %q, want architect", second.AgentID)
+	}
+	if second.AgentType != "architect" {
+		t.Fatalf("second.AgentType = %q, want architect", second.AgentType)
 	}
 }
 
@@ -1423,6 +1929,16 @@ func TestFormatConversationResult_EmptyResponse(t *testing.T) {
 	_, ok := formatConversationResult(payload)
 	if ok {
 		t.Fatal("expected formatConversationResult to return false for empty response")
+	}
+}
+
+func TestRouteResponseContent_SuppressesEmptyResponseTextPayload(t *testing.T) {
+	resp := &guide.RouteResponse{
+		RespondingAgentID: "inspector",
+		Data:              emptyResponseTextPayload{},
+	}
+	if got := routeResponseContent(resp); got != "" {
+		t.Fatalf("routeResponseContent() = %q, want empty string", got)
 	}
 }
 

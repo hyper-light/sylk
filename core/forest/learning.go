@@ -771,6 +771,7 @@ func (m *MemoryForest) recordRetrievalExamples(
 	retrievalID := stableID(
 		"retrieval",
 		query.SessionID,
+		query.TaskID,
 		query.AgentType,
 		query.IntentID,
 		normalizeText(query.Query),
@@ -799,6 +800,7 @@ func (m *MemoryForest) recordRetrievalExamples(
 		metadata := map[string]any{
 			"query":      query.Query,
 			"families":   query.Families,
+			"task_id":    query.TaskID,
 			"intent_id":  query.IntentID,
 			"horizon":    query.Horizon,
 			"packet":     packet.Score,

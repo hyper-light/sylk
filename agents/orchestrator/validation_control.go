@@ -243,6 +243,13 @@ func (o *Orchestrator) handleValidationVerdictForward(ctx context.Context, fwd *
 	if o.dispatchGate != nil {
 		o.dispatchGate.activate(payload.SessionID)
 	}
+	if o.taskRouter != nil {
+		o.taskRouter.PauseActiveRoutes(
+			payload.SessionID,
+			"",
+			fmt.Sprintf("execution hold %s opened after %s", hold.HoldID, payload.Kind),
+		)
+	}
 	o.publishValidationActivity(
 		events.EventTypeAgentError,
 		fmt.Sprintf("Execution hold opened for session %s: %s", payload.SessionID, payload.Summary),

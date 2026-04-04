@@ -18,18 +18,24 @@ var (
 type ResourceQuota struct {
 	mu sync.RWMutex
 
-	goroutineLimit       int64
-	goroutineUsed        atomic.Int64
-	contextWindowRequest int64
-	contextWindowLimit   int64
-	contextWindowUsed    atomic.Int64
-	contextSoftCapacity  atomic.Int64
-	contextBurstCapacity atomic.Int64
-	contextHardCapacity  atomic.Int64
-	vfsQuotaLimit        int64
-	vfsQuotaUsed         atomic.Int64
-	containerLimit       int64
-	containerCount       atomic.Int64
+	goroutineLimit           int64
+	goroutineUsed            atomic.Int64
+	contextWindowRequest     int64
+	contextWindowLimit       int64
+	contextWindowUsed        atomic.Int64
+	contextSoftCapacity      atomic.Int64
+	contextBurstCapacity     atomic.Int64
+	contextHardCapacity      atomic.Int64
+	vfsQuotaLimit            int64
+	vfsQuotaUsed             atomic.Int64
+	containerLimit           int64
+	containerCount           atomic.Int64
+	containerSoftCapacity    atomic.Int64
+	containerBurstCapacity   atomic.Int64
+	containerHardCapacity    atomic.Int64
+	containerReleaseHalfLife time.Duration
+	containerReleaseCredit   float64
+	containerLastEvent       time.Time
 
 	contextLeaseMin        time.Duration
 	contextReleaseHalfLife time.Duration
@@ -46,11 +52,12 @@ type ResourceQuota struct {
 
 // ResourceQuotaConfig configures the quota limits.
 type ResourceQuotaConfig struct {
-	GoroutineLimit       int64
-	ContextWindowRequest int64
-	ContextWindowLimit   int64
-	VFSQuotaLimit        int64
-	ContainerLimit       int64
+	GoroutineLimit           int64
+	ContextWindowRequest     int64
+	ContextWindowLimit       int64
+	VFSQuotaLimit            int64
+	ContainerLimit           int64
+	ContainerReleaseHalfLife time.Duration
 
 	ContextLeaseMin        time.Duration
 	ContextReleaseHalfLife time.Duration
@@ -62,25 +69,30 @@ type ResourceQuotaConfig struct {
 // NewResourceQuota creates a quota with the given limits.
 func NewResourceQuota(cfg ResourceQuotaConfig) *ResourceQuota {
 	applyContextQuotaDefaults(&cfg)
+	applyContainerQuotaDefaults(&cfg)
 	q := &ResourceQuota{
-		goroutineLimit:         cfg.GoroutineLimit,
-		contextWindowRequest:   cfg.ContextWindowRequest,
-		contextWindowLimit:     cfg.ContextWindowLimit,
-		vfsQuotaLimit:          cfg.VFSQuotaLimit,
-		containerLimit:         cfg.ContainerLimit,
-		contextLeaseMin:        cfg.ContextLeaseMin,
-		contextReleaseHalfLife: cfg.ContextReleaseHalfLife,
-		contextShortWindow:     cfg.ContextShortWindow,
-		contextLongWindow:      cfg.ContextLongWindow,
-		contextAdmissionTick:   cfg.ContextAdmissionTick,
-		contextClaims:          make(map[string]*contextClaim),
-		contextAliases:         make(map[string]string),
-		contextWaiters:         make(map[string]time.Time),
-		contextNotify:          make(chan struct{}),
+		goroutineLimit:           cfg.GoroutineLimit,
+		contextWindowRequest:     cfg.ContextWindowRequest,
+		contextWindowLimit:       cfg.ContextWindowLimit,
+		vfsQuotaLimit:            cfg.VFSQuotaLimit,
+		containerLimit:           cfg.ContainerLimit,
+		containerReleaseHalfLife: cfg.ContainerReleaseHalfLife,
+		contextLeaseMin:          cfg.ContextLeaseMin,
+		contextReleaseHalfLife:   cfg.ContextReleaseHalfLife,
+		contextShortWindow:       cfg.ContextShortWindow,
+		contextLongWindow:        cfg.ContextLongWindow,
+		contextAdmissionTick:     cfg.ContextAdmissionTick,
+		contextClaims:            make(map[string]*contextClaim),
+		contextAliases:           make(map[string]string),
+		contextWaiters:           make(map[string]time.Time),
+		contextNotify:            make(chan struct{}),
 	}
 	q.contextSoftCapacity.Store(cfg.ContextWindowRequest)
 	q.contextBurstCapacity.Store(cfg.ContextWindowLimit)
 	q.contextHardCapacity.Store(cfg.ContextWindowLimit)
+	q.containerSoftCapacity.Store(cfg.ContainerLimit)
+	q.containerBurstCapacity.Store(cfg.ContainerLimit)
+	q.containerHardCapacity.Store(cfg.ContainerLimit)
 	return q
 }
 
@@ -113,6 +125,15 @@ func applyContextQuotaDefaults(cfg *ResourceQuotaConfig) {
 	}
 }
 
+func applyContainerQuotaDefaults(cfg *ResourceQuotaConfig) {
+	if cfg.ContainerReleaseHalfLife <= 0 {
+		// Container churn is materially slower than tool-turn context churn.
+		// Keep recent release credit around long enough to absorb adjacent
+		// pipeline task transitions without pinning the hard count.
+		cfg.ContainerReleaseHalfLife = 30 * time.Second
+	}
+}
+
 // CheckContainerFits verifies that adding a container with the given spec
 // would not exceed the quota. Does not consume quota — call Reserve after.
 func (q *ResourceQuota) CheckContainerFits(spec *ContainerSpec) error {
@@ -122,7 +143,7 @@ func (q *ResourceQuota) CheckContainerFits(spec *ContainerSpec) error {
 	if err := q.checkVFS(spec.Resources.VFSQuotaBytes); err != nil {
 		return err
 	}
-	return q.checkContainerCount()
+	return q.checkContainerCount(spec)
 }
 
 func (q *ResourceQuota) checkGoroutines(request int64) error {
@@ -147,13 +168,23 @@ func (q *ResourceQuota) checkVFS(request int64) error {
 	return nil
 }
 
-func (q *ResourceQuota) checkContainerCount() error {
+func (q *ResourceQuota) checkContainerCount(spec *ContainerSpec) error {
 	if q.containerLimit <= 0 {
 		return nil
 	}
-	if q.containerCount.Load()+1 > q.containerLimit {
-		return fmt.Errorf("%w: container count %d >= %d", ErrQuotaExceeded,
-			q.containerCount.Load(), q.containerLimit)
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	now := time.Now()
+	soft, burst, hard := q.containerCapacitiesLocked(now, spec)
+	q.containerSoftCapacity.Store(soft)
+	q.containerBurstCapacity.Store(burst)
+	q.containerHardCapacity.Store(hard)
+
+	current := q.containerCount.Load()
+	if current+1 > hard {
+		return fmt.Errorf("%w: container count %d >= %d", ErrQuotaExceeded, current, hard)
 	}
 	return nil
 }
@@ -164,6 +195,13 @@ func (q *ResourceQuota) Reserve(spec *ContainerSpec) {
 	q.goroutineUsed.Add(spec.Resources.GoroutineLimit)
 	q.vfsQuotaUsed.Add(spec.Resources.VFSQuotaBytes)
 	q.containerCount.Add(1)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.adjustContainerReleaseCreditLocked(time.Now(), -1.0)
+	soft, burst, hard := q.containerCapacitiesLocked(time.Now(), spec)
+	q.containerSoftCapacity.Store(soft)
+	q.containerBurstCapacity.Store(burst)
+	q.containerHardCapacity.Store(hard)
 }
 
 // Release returns quota consumed by a container.
@@ -171,47 +209,67 @@ func (q *ResourceQuota) Release(spec *ContainerSpec) {
 	q.goroutineUsed.Add(-spec.Resources.GoroutineLimit)
 	q.vfsQuotaUsed.Add(-spec.Resources.VFSQuotaBytes)
 	q.containerCount.Add(-1)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.adjustContainerReleaseCreditLocked(time.Now(), 1.0)
+	soft, burst, hard := q.containerCapacitiesLocked(time.Now(), nil)
+	q.containerSoftCapacity.Store(soft)
+	q.containerBurstCapacity.Store(burst)
+	q.containerHardCapacity.Store(hard)
 }
 
 // Usage returns current quota usage.
 func (q *ResourceQuota) Usage() ResourceQuotaUsage {
-	if q != nil && q.contextWindowLimit > 0 {
+	if q != nil {
 		q.mu.Lock()
-		q.recomputeContextStateLocked(time.Now())
+		now := time.Now()
+		if q.contextWindowLimit > 0 {
+			q.recomputeContextStateLocked(now)
+		}
+		soft, burst, hard := q.containerCapacitiesLocked(now, nil)
+		q.containerSoftCapacity.Store(soft)
+		q.containerBurstCapacity.Store(burst)
+		q.containerHardCapacity.Store(hard)
 		q.mu.Unlock()
 	}
 	return ResourceQuotaUsage{
-		GoroutineUsed:        q.goroutineUsed.Load(),
-		GoroutineLimit:       q.goroutineLimit,
-		ContextWindowUsed:    q.contextWindowUsed.Load(),
-		ContextWindowRequest: q.contextWindowRequest,
-		ContextWindowLimit:   q.contextWindowLimit,
-		ContextSoftCapacity:  q.contextSoftCapacity.Load(),
-		ContextBurstCapacity: q.contextBurstCapacity.Load(),
-		ContextHardCapacity:  q.contextHardCapacity.Load(),
-		VFSUsed:              q.vfsQuotaUsed.Load(),
-		VFSLimit:             q.vfsQuotaLimit,
-		ContainerCount:       q.containerCount.Load(),
-		ContainerLimit:       q.containerLimit,
-		ContextWaiterCount:   q.contextWaiterCount(),
+		GoroutineUsed:          q.goroutineUsed.Load(),
+		GoroutineLimit:         q.goroutineLimit,
+		ContextWindowUsed:      q.contextWindowUsed.Load(),
+		ContextWindowRequest:   q.contextWindowRequest,
+		ContextWindowLimit:     q.contextWindowLimit,
+		ContextSoftCapacity:    q.contextSoftCapacity.Load(),
+		ContextBurstCapacity:   q.contextBurstCapacity.Load(),
+		ContextHardCapacity:    q.contextHardCapacity.Load(),
+		VFSUsed:                q.vfsQuotaUsed.Load(),
+		VFSLimit:               q.vfsQuotaLimit,
+		ContainerCount:         q.containerCount.Load(),
+		ContainerLimit:         q.containerLimit,
+		ContainerSoftCapacity:  q.containerSoftCapacity.Load(),
+		ContainerBurstCapacity: q.containerBurstCapacity.Load(),
+		ContainerHardCapacity:  q.containerHardCapacity.Load(),
+		ContextWaiterCount:     q.contextWaiterCount(),
 	}
 }
 
 // ResourceQuotaUsage is a snapshot of quota usage.
 type ResourceQuotaUsage struct {
-	GoroutineUsed        int64
-	GoroutineLimit       int64
-	ContextWindowUsed    int64
-	ContextWindowRequest int64
-	ContextWindowLimit   int64
-	ContextSoftCapacity  int64
-	ContextBurstCapacity int64
-	ContextHardCapacity  int64
-	VFSUsed              int64
-	VFSLimit             int64
-	ContainerCount       int64
-	ContainerLimit       int64
-	ContextWaiterCount   int
+	GoroutineUsed          int64
+	GoroutineLimit         int64
+	ContextWindowUsed      int64
+	ContextWindowRequest   int64
+	ContextWindowLimit     int64
+	ContextSoftCapacity    int64
+	ContextBurstCapacity   int64
+	ContextHardCapacity    int64
+	VFSUsed                int64
+	VFSLimit               int64
+	ContainerCount         int64
+	ContainerLimit         int64
+	ContainerSoftCapacity  int64
+	ContainerBurstCapacity int64
+	ContainerHardCapacity  int64
+	ContextWaiterCount     int
 }
 
 // LimitRange defines per-container resource bounds.

@@ -14,7 +14,11 @@ import (
 
 // Retrieve returns ranked branch packets for the supplied query.
 func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPacket, error) {
-	query = normalizeQuery(query)
+	var err error
+	query, err = normalizeQuery(query)
+	if err != nil {
+		return nil, err
+	}
 
 	var (
 		branches         []*Branch
@@ -197,9 +201,10 @@ func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPack
 
 // ResolveIntent returns the active intent frontier for the caller.
 func (m *MemoryForest) ResolveIntent(ctx context.Context, input ResolveIntentInput) (*IntentResolution, error) {
-	canopy, err := m.resolveCanopy(ctx, Query{
+	query, err := normalizeQuery(Query{
 		Query:     input.Query,
 		SessionID: input.SessionID,
+		TaskID:    input.TaskID,
 		IntentID:  input.IntentID,
 		Horizon:   input.Horizon,
 		Limit:     input.Limit,
@@ -207,15 +212,20 @@ func (m *MemoryForest) ResolveIntent(ctx context.Context, input ResolveIntentInp
 	if err != nil {
 		return nil, err
 	}
+	canopy, err := m.resolveCanopy(ctx, query)
+	if err != nil {
+		return nil, err
+	}
 
 	packets, err := m.Retrieve(ctx, Query{
-		Query:     input.Query,
-		SessionID: input.SessionID,
+		Query:     query.Query,
+		SessionID: query.SessionID,
+		TaskID:    query.TaskID,
 		AgentID:   input.AgentID,
 		AgentType: input.AgentType,
-		IntentID:  input.IntentID,
-		Horizon:   input.Horizon,
-		Limit:     maxInt(input.Limit, 8),
+		IntentID:  query.IntentID,
+		Horizon:   query.Horizon,
+		Limit:     maxInt(query.Limit, 8),
 		Families: []TreeFamily{
 			TreeFamilyIntent,
 			TreeFamilyConstraint,
@@ -252,7 +262,11 @@ func (m *MemoryForest) ResolveIntent(ctx context.Context, input ResolveIntentInp
 
 // PredictNextBranches retrieves low-risk adjacent-value branches.
 func (m *MemoryForest) PredictNextBranches(ctx context.Context, query Query) ([]*BranchPacket, error) {
-	query = normalizeQuery(query)
+	var err error
+	query, err = normalizeQuery(query)
+	if err != nil {
+		return nil, err
+	}
 	query.Families = []TreeFamily{
 		TreeFamilyOpportunity,
 		TreeFamilyCapability,
@@ -263,21 +277,38 @@ func (m *MemoryForest) PredictNextBranches(ctx context.Context, query Query) ([]
 	return m.Retrieve(ctx, query)
 }
 
-func normalizeQuery(query Query) Query {
+func normalizeQuery(query Query) (Query, error) {
+	query.Query = strings.TrimSpace(query.Query)
+	query.SessionID = strings.TrimSpace(query.SessionID)
+	query.TaskID = normalizeForestTaskID(query.TaskID)
+	query.AgentID = strings.TrimSpace(query.AgentID)
+	query.AgentType = strings.TrimSpace(query.AgentType)
+	query.IntentID = strings.TrimSpace(query.IntentID)
 	if query.Limit <= 0 {
 		query.Limit = 8
 	}
 	if query.Horizon == "" {
-		if query.SessionID != "" {
+		switch {
+		case query.TaskID != "":
+			query.Horizon = CanopyHorizonTask
+		case query.SessionID != "":
 			query.Horizon = CanopyHorizonSession
-		} else {
+		default:
 			query.Horizon = CanopyHorizonProject
 		}
+	}
+	switch query.Horizon {
+	case CanopyHorizonTurn, CanopyHorizonTask, CanopyHorizonSession, CanopyHorizonUser, CanopyHorizonProject:
+	default:
+		return query, fmt.Errorf("invalid horizon %q", query.Horizon)
+	}
+	if query.Horizon == CanopyHorizonTask && query.TaskID == "" {
+		return query, fmt.Errorf("task_id is required when horizon is task")
 	}
 	if len(query.Families) == 0 {
 		query.Families = defaultFamilies()
 	}
-	return query
+	return query, nil
 }
 
 func (m *MemoryForest) loadCandidateBranches(ctx context.Context, query Query) ([]*Branch, map[string]float64, error) {
@@ -289,9 +320,9 @@ func (m *MemoryForest) loadCandidateBranches(ctx context.Context, query Query) (
 		firstErr    error
 	)
 
-	load := func(sessionID string, semanticOnly bool) {
+	load := func(sessionID, taskID string, semanticOnly bool) {
 		defer wg.Done()
-		rows, err := m.queryBranches(ctx, sessionID, semanticOnly, query.Families, 128)
+		rows, err := m.queryBranches(ctx, sessionID, taskID, semanticOnly, query.Families, 128)
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
@@ -315,12 +346,15 @@ func (m *MemoryForest) loadCandidateBranches(ctx context.Context, query Query) (
 		}
 	}
 
-	if query.SessionID != "" {
+	if query.TaskID != "" {
 		wg.Add(1)
-		go load(query.SessionID, false)
+		go load(query.SessionID, query.TaskID, false)
+	} else if query.SessionID != "" {
+		wg.Add(1)
+		go load(query.SessionID, "", false)
 	}
 	wg.Add(1)
-	go load("", true)
+	go load("", "", true)
 	wg.Wait()
 	if firstErr != nil {
 		return nil, nil, firstErr
@@ -333,9 +367,9 @@ func (m *MemoryForest) loadCandidateBranches(ctx context.Context, query Query) (
 	return branches, queryScores, nil
 }
 
-func (m *MemoryForest) queryBranches(ctx context.Context, sessionID string, semanticOnly bool, families []TreeFamily, limit int) ([]*Branch, error) {
+func (m *MemoryForest) queryBranches(ctx context.Context, sessionID, taskID string, semanticOnly bool, families []TreeFamily, limit int) ([]*Branch, error) {
 	query := `
-		SELECT id, root_id, parent_id, family, scope, state, session_id, agent_id, agent_type,
+		SELECT id, root_id, parent_id, family, scope, state, session_id, task_id, agent_id, agent_type,
 		       intent_id, title, summary, confidence, salience, utility, success_rate,
 		       scope_risk, conflict_score, support_count, counter_count, success_count,
 		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata
@@ -347,6 +381,10 @@ func (m *MemoryForest) queryBranches(ctx context.Context, sessionID string, sema
 	if sessionID != "" {
 		query += " AND session_id = ?"
 		args = append(args, sessionID)
+	}
+	if taskID != "" {
+		query += " AND task_id = ?"
+		args = append(args, taskID)
 	}
 	if semanticOnly {
 		query += " AND scope = ?"
@@ -395,7 +433,7 @@ func (m *MemoryForest) loadBranchesByID(ctx context.Context, ids []string) ([]*B
 		args = append(args, id)
 	}
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT id, root_id, parent_id, family, scope, state, session_id, agent_id, agent_type,
+		SELECT id, root_id, parent_id, family, scope, state, session_id, task_id, agent_id, agent_type,
 		       intent_id, title, summary, confidence, salience, utility, success_rate,
 		       scope_risk, conflict_score, support_count, counter_count, success_count,
 		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata
@@ -421,36 +459,31 @@ func (m *MemoryForest) loadBranchesByID(ctx context.Context, ids []string) ([]*B
 }
 
 func (m *MemoryForest) resolveCanopy(ctx context.Context, query Query) (*Canopy, error) {
-	key := canopyKey(query.Horizon, query.SessionID, query.IntentID)
-	row := m.db.QueryRowContext(ctx, `
-		SELECT canopy_key, session_id, intent_id, horizon, root_ids, summary, updated_at
-		FROM forest_canopies
-		WHERE canopy_key = ?
-	`, key)
-
-	var (
-		canopy    Canopy
-		sessionID sql.NullString
-		intentID  sql.NullString
-		rootIDs   string
-		updatedAt int64
-	)
-	err := row.Scan(&canopy.Key, &sessionID, &intentID, &canopy.Horizon, &rootIDs, &canopy.Summary, &updatedAt)
-	if err == sql.ErrNoRows {
-		if query.SessionID == "" && query.Horizon != CanopyHorizonProject {
-			query.Horizon = CanopyHorizonProject
-			return m.resolveCanopy(ctx, query)
+	candidates := buildCanopyLookupCandidates(query)
+	for _, candidate := range candidates {
+		canopy, found, err := m.loadCanopyCandidate(ctx, candidate)
+		if err != nil {
+			return nil, err
 		}
-		return &Canopy{Key: key, Horizon: query.Horizon, UpdatedAt: time.Now().UTC()}, nil
+		if found {
+			return canopy, nil
+		}
 	}
-	if err != nil {
-		return nil, fmt.Errorf("load canopy: %w", err)
+
+	if query.SessionID == "" && query.Horizon != CanopyHorizonProject && query.Horizon != CanopyHorizonTask {
+		query.Horizon = CanopyHorizonProject
+		query.IntentID = ""
+		return m.resolveCanopy(ctx, query)
 	}
-	canopy.SessionID = sessionID.String
-	canopy.IntentID = intentID.String
-	canopy.UpdatedAt = time.Unix(updatedAt, 0).UTC()
-	_ = unmarshalJSON(rootIDs, &canopy.RootIDs)
-	return &canopy, nil
+
+	return &Canopy{
+		Key:       canopyKey(query.Horizon, query.SessionID, query.TaskID, query.IntentID),
+		SessionID: query.SessionID,
+		TaskID:    query.TaskID,
+		IntentID:  query.IntentID,
+		Horizon:   query.Horizon,
+		UpdatedAt: time.Now().UTC(),
+	}, nil
 }
 
 func (m *MemoryForest) searchEvidence(ctx context.Context, query Query) (map[string][]PacketEvidence, error) {
@@ -483,6 +516,9 @@ func (m *MemoryForest) searchEvidence(ctx context.Context, query Query) (map[str
 				return
 			}
 			for _, entry := range entries {
+				if !matchesEvidenceScope(entry, query) {
+					continue
+				}
 				results[entry.ID] = entry
 			}
 		}()
@@ -496,6 +532,9 @@ func (m *MemoryForest) searchEvidence(ctx context.Context, query Query) (map[str
 			mu.Lock()
 			defer mu.Unlock()
 			for _, entry := range search.Results {
+				if !matchesEvidenceScope(entry, query) {
+					continue
+				}
 				results[entry.ID] = entry
 			}
 		}()
@@ -534,6 +573,118 @@ func (m *MemoryForest) searchEvidence(ctx context.Context, query Query) (map[str
 		}
 	}
 	return byBranch, nil
+}
+
+type canopyLookupCandidate struct {
+	Horizon   CanopyHorizon
+	SessionID string
+	TaskID    string
+	IntentID  string
+}
+
+func buildCanopyLookupCandidates(query Query) []canopyLookupCandidate {
+	sessionID := normalizeForestSessionID(query.SessionID)
+	taskID := normalizeForestTaskID(query.TaskID)
+	intentID := strings.TrimSpace(query.IntentID)
+
+	candidates := make([]canopyLookupCandidate, 0, 2)
+	if intentID != "" {
+		candidates = append(candidates, canopyLookupCandidate{
+			Horizon:   query.Horizon,
+			SessionID: sessionID,
+			TaskID:    taskID,
+			IntentID:  intentID,
+		})
+	}
+	candidates = append(candidates, canopyLookupCandidate{
+		Horizon:   query.Horizon,
+		SessionID: sessionID,
+		TaskID:    taskID,
+		IntentID:  "",
+	})
+	return candidates
+}
+
+func (m *MemoryForest) loadCanopyCandidate(ctx context.Context, candidate canopyLookupCandidate) (*Canopy, bool, error) {
+	statement := `
+		SELECT canopy_key, session_id, task_id, intent_id, horizon, root_ids, summary, updated_at
+		FROM forest_canopies
+		WHERE horizon = ?
+	`
+	args := []any{string(candidate.Horizon)}
+
+	switch candidate.Horizon {
+	case CanopyHorizonTask:
+		if candidate.TaskID == "" {
+			return nil, false, nil
+		}
+		statement += " AND task_id = ?"
+		args = append(args, candidate.TaskID)
+		if candidate.SessionID != "" {
+			statement += " AND session_id = ?"
+			args = append(args, candidate.SessionID)
+		}
+	case CanopyHorizonSession:
+		if candidate.SessionID == "" {
+			return nil, false, nil
+		}
+		statement += " AND session_id = ?"
+		args = append(args, candidate.SessionID)
+	case CanopyHorizonProject:
+		statement += " AND COALESCE(session_id, '') = '' AND COALESCE(task_id, '') = ''"
+	default:
+		if candidate.SessionID == "" {
+			return nil, false, nil
+		}
+		statement += " AND session_id = ?"
+		args = append(args, candidate.SessionID)
+	}
+
+	if candidate.IntentID != "" {
+		statement += " AND intent_id = ?"
+		args = append(args, candidate.IntentID)
+	} else {
+		statement += " AND COALESCE(intent_id, '') = ''"
+	}
+	statement += " ORDER BY updated_at DESC LIMIT 1"
+
+	row := m.db.QueryRowContext(ctx, statement, args...)
+
+	var (
+		canopy    Canopy
+		sessionID sql.NullString
+		taskID    sql.NullString
+		intentID  sql.NullString
+		rootIDs   string
+		updatedAt int64
+	)
+	err := row.Scan(&canopy.Key, &sessionID, &taskID, &intentID, &canopy.Horizon, &rootIDs, &canopy.Summary, &updatedAt)
+	switch {
+	case err == sql.ErrNoRows:
+		return nil, false, nil
+	case err != nil:
+		return nil, false, fmt.Errorf("load canopy: %w", err)
+	}
+
+	canopy.SessionID = normalizeForestSessionID(sessionID.String)
+	canopy.TaskID = normalizeForestTaskID(taskID.String)
+	canopy.IntentID = strings.TrimSpace(intentID.String)
+	canopy.UpdatedAt = time.Unix(updatedAt, 0).UTC()
+	_ = unmarshalJSON(rootIDs, &canopy.RootIDs)
+	return &canopy, true, nil
+}
+
+func matchesEvidenceScope(entry *ctxpkg.ContentEntry, query Query) bool {
+	if entry == nil {
+		return false
+	}
+	if query.SessionID != "" && normalizeForestSessionID(entry.SessionID) != normalizeForestSessionID(query.SessionID) {
+		return false
+	}
+	if query.TaskID != "" && forestTaskIDFromStringMetadata(entry.Metadata) != normalizeForestTaskID(query.TaskID) {
+		return false
+	}
+	return true
 }
 
 func (m *MemoryForest) findBranchIDsForContent(ctx context.Context, contentIDs []string) (map[string][]string, error) {

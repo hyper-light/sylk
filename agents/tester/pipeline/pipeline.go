@@ -261,6 +261,7 @@ func (pt *PipelineTester) registerCoreSkills() {
 	}
 	for _, skill := range agentshared.PipelineProtocolSkills(agentshared.PipelineProtocolSkillConfig{
 		AgentType:      func() string { return "tester-pipeline" },
+		AgentID:        func() string { return pt.id },
 		WorkspaceViews: func() versioning.WorkspaceViewAccess { return pt.workspaceViews },
 		Route: agentshared.PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return pt.bus },
@@ -474,8 +475,11 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		return nil, fmt.Errorf("pipeline tester: no LLM provider configured")
 	}
 
+	hadProtocolState := agentshared.PipelineProtocolStateFromContext(ctx) != nil
 	ctx = agentshared.WithPipelineTaskProtocolState(ctx, task)
-	defer agentshared.ClosePipelineProtocolState(ctx)
+	if !hadProtocolState {
+		defer agentshared.ClosePipelineProtocolState(ctx)
+	}
 	prevRuntime := pt.swapTaskRuntime(task)
 	defer pt.restoreTaskRuntime(prevRuntime)
 	userMessage := fwd.Input
@@ -581,6 +585,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 
 	reqCtx, cancel := context.WithCancel(pt.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = agentshared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
 	reqCtx = agentshared.WithGuardianCommandGate(reqCtx, agentshared.GuardianCommandGateConfig{
 		BusProvider:     func() guide.EventBus { return pt.bus },
 		SourceAgentID:   func() string { return pt.id },
@@ -613,6 +618,9 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 		AgentID:     pt.id,
 		SessionID:   fwd.SessionID,
 	})
+	protocolTask := agentshared.DecodePipelineTaskInput(fwd.Input)
+	ctx = agentshared.WithPipelineTaskProtocolState(ctx, protocolTask)
+	defer agentshared.ClosePipelineProtocolState(ctx)
 	startTime := time.Now()
 	toolEmitter := agentshared.NewToolCallEmitter(pt.bus, pt.channels, pt.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
@@ -669,7 +677,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	}
 
 	respData := result
-	if task := agentshared.DecodePipelineTaskInput(fwd.Input); task != nil {
+	if protocolTask != nil {
 		respData = &TaskStageResult{
 			Plan:         pt.planSnapshot(),
 			CreatedFiles: pt.createdArtifacts(),
