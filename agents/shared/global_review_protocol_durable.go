@@ -8,13 +8,15 @@ import (
 )
 
 const (
-	globalReviewNamespace           = "global_review"
-	globalReviewEventChallenge      = "challenge_selected"
-	globalReviewEventValidation     = "validation_submitted"
-	globalReviewEventProcessed      = "validation_processed"
-	globalReviewEventReadyForCommit = "ready_for_commit"
-	globalReviewEventCommitToDisk   = "commit_to_disk"
-	globalReviewMailboxItemKind     = "protocol_obligation"
+	globalReviewNamespace             = "global_review"
+	globalReviewEventChallenge        = "challenge_selected"
+	globalReviewEventValidation       = "validation_submitted"
+	globalReviewEventProcessed        = "validation_processed"
+	globalReviewEventReadyCheckpoint  = "ready_for_checkpoint"
+	globalReviewEventReadyForCommit   = "ready_for_commit"
+	globalReviewEventAcceptCheckpoint = "accept_checkpoint"
+	globalReviewEventCommitToDisk     = "commit_to_disk"
+	globalReviewMailboxItemKind       = "protocol_obligation"
 )
 
 type globalReviewReadyForCommitEvent struct {
@@ -80,6 +82,24 @@ func (s *GlobalReviewState) recordReadyForCommit(ctx context.Context, summary st
 		Summary:      strings.TrimSpace(summary),
 		EvidenceRefs: normalizeStringList(evidenceRefs),
 	})
+}
+
+func (s *GlobalReviewState) recordReadyForCheckpoint(ctx context.Context, summary string, evidenceRefs []string, record *GlobalReviewValidationRecord) error {
+	if s == nil {
+		return nil
+	}
+	return s.appendEvent(ctx, globalReviewEventReadyCheckpoint, globalReviewReadyForCommitEvent{
+		ChallengeID:  globalReviewChallengeID(record),
+		Summary:      strings.TrimSpace(summary),
+		EvidenceRefs: normalizeStringList(evidenceRefs),
+	})
+}
+
+func (s *GlobalReviewState) recordCheckpointAccepted(ctx context.Context, action *GlobalReviewTurnAction) error {
+	if s == nil || action == nil {
+		return nil
+	}
+	return s.appendEvent(ctx, globalReviewEventAcceptCheckpoint, action)
 }
 
 func (s *GlobalReviewState) recordCommitToDisk(ctx context.Context, action *GlobalReviewTurnAction) error {
@@ -198,6 +218,40 @@ func (s *GlobalReviewState) applyEvent(seq uint64, event *durableProtocolEvent) 
 			AgentType: GlobalReviewAgentInspector,
 			Summary:   firstNonEmpty(strings.TrimSpace(ready.Summary), "Global review ready for commit."),
 		})
+	case globalReviewEventReadyCheckpoint:
+		var ready globalReviewReadyForCommitEvent
+		if err := decodeProtocolPayload(event.Payload, &ready); err != nil {
+			return err
+		}
+		s.requiredAction = GlobalReviewActionAccept
+		s.requiredReason = "The tester-backed checkpoint review already passed; `accept_checkpoint` is the only valid way to end this inspector turn."
+		if s.snapshot == nil {
+			s.snapshot = &GlobalReviewSnapshot{}
+		}
+		appendGlobalReviewEvent(s.snapshot, GlobalReviewEvent{
+			Type:      "finalize_global_review",
+			AgentType: GlobalReviewAgentInspector,
+			Summary:   firstNonEmpty(strings.TrimSpace(ready.Summary), "Global review ready for checkpoint acceptance."),
+		})
+	case globalReviewEventAcceptCheckpoint:
+		var action GlobalReviewTurnAction
+		if err := decodeProtocolPayload(event.Payload, &action); err != nil {
+			return err
+		}
+		s.requiredAction = ""
+		s.requiredReason = ""
+		if s.snapshot == nil {
+			s.snapshot = &GlobalReviewSnapshot{}
+		}
+		s.snapshot.ActiveAgents = nil
+		s.snapshot.CurrentRequest = ""
+		s.snapshot.PendingChallenge = nil
+		s.snapshot.PendingValidation = nil
+		appendGlobalReviewEvent(s.snapshot, GlobalReviewEvent{
+			Type:      string(GlobalReviewActionAccept),
+			AgentType: GlobalReviewAgentInspector,
+			Summary:   strings.TrimSpace(action.Summary),
+		})
 	case globalReviewEventCommitToDisk:
 		var action GlobalReviewTurnAction
 		if err := decodeProtocolPayload(event.Payload, &action); err != nil {
@@ -208,6 +262,8 @@ func (s *GlobalReviewState) applyEvent(seq uint64, event *durableProtocolEvent) 
 		if s.snapshot == nil {
 			s.snapshot = &GlobalReviewSnapshot{}
 		}
+		s.snapshot.ActiveAgents = nil
+		s.snapshot.CurrentRequest = ""
 		s.snapshot.PendingChallenge = nil
 		s.snapshot.PendingValidation = nil
 		appendGlobalReviewEvent(s.snapshot, GlobalReviewEvent{
@@ -303,7 +359,18 @@ func (s *GlobalReviewState) desiredMailboxItems() map[string][]durableMailboxIte
 			})
 		}
 	}
-	if strings.TrimSpace(string(s.requiredAction)) == string(GlobalReviewActionCommit) {
+	if strings.TrimSpace(string(s.requiredAction)) == string(GlobalReviewActionAccept) {
+		desired[GlobalReviewAgentInspector] = append(desired[GlobalReviewAgentInspector], durableMailboxItem{
+			Key:      fmt.Sprintf("global_review:%s:%s:required:%s", s.scopeID, GlobalReviewAgentInspector, GlobalReviewActionAccept),
+			ItemKind: globalReviewMailboxItemKind,
+			Action:   "accept_checkpoint",
+			Summary:  strings.TrimSpace(s.requiredReason),
+			Payload: mustMarshalRaw(map[string]any{
+				"required_action": string(GlobalReviewActionAccept),
+				"reason":          strings.TrimSpace(s.requiredReason),
+			}),
+		})
+	} else if strings.TrimSpace(string(s.requiredAction)) == string(GlobalReviewActionCommit) {
 		desired[GlobalReviewAgentInspector] = append(desired[GlobalReviewAgentInspector], durableMailboxItem{
 			Key:      fmt.Sprintf("global_review:%s:%s:required:%s", s.scopeID, GlobalReviewAgentInspector, GlobalReviewActionCommit),
 			ItemKind: globalReviewMailboxItemKind,
@@ -314,16 +381,30 @@ func (s *GlobalReviewState) desiredMailboxItems() map[string][]durableMailboxIte
 				"reason":          strings.TrimSpace(s.requiredReason),
 			}),
 		})
-	} else if record, ok := finalizeGlobalReviewValidationReady(snapshot, s.processed); ok && snapshot.PendingValidation == nil {
-		desired[GlobalReviewAgentInspector] = append(desired[GlobalReviewAgentInspector], durableMailboxItem{
-			Key:      fmt.Sprintf("global_review:%s:%s:finalize:%s", s.scopeID, GlobalReviewAgentInspector, strings.TrimSpace(record.ChallengeID)),
-			ItemKind: globalReviewMailboxItemKind,
-			Action:   "finalize_global_review",
-			Summary:  "A tester-backed global review is accepted; finalize the review now.",
-			Payload:  mustMarshalRaw(cloneGlobalReviewValidationRecord(record)),
-		})
+	} else if !globalReviewReviewClosed(snapshot) {
+		if record, ok := finalizeGlobalReviewValidationReady(snapshot, s.processed); ok && snapshot.PendingValidation == nil {
+			desired[GlobalReviewAgentInspector] = append(desired[GlobalReviewAgentInspector], durableMailboxItem{
+				Key:      fmt.Sprintf("global_review:%s:%s:finalize:%s", s.scopeID, GlobalReviewAgentInspector, strings.TrimSpace(record.ChallengeID)),
+				ItemKind: globalReviewMailboxItemKind,
+				Action:   "finalize_global_review",
+				Summary:  "A tester-backed global review is accepted; finalize the review now.",
+				Payload:  mustMarshalRaw(cloneGlobalReviewValidationRecord(record)),
+			})
+		}
 	}
 	return desired
+}
+
+func globalReviewReviewClosed(snapshot *GlobalReviewSnapshot) bool {
+	if snapshot == nil || len(snapshot.RecentEvents) == 0 {
+		return false
+	}
+	switch strings.TrimSpace(snapshot.RecentEvents[len(snapshot.RecentEvents)-1].Type) {
+	case string(GlobalReviewActionAccept), string(GlobalReviewActionCommit):
+		return true
+	default:
+		return false
+	}
 }
 
 func buildGlobalReviewSnapshotAfterChallenge(base *GlobalReviewSnapshot, action *GlobalReviewTurnAction) *GlobalReviewSnapshot {

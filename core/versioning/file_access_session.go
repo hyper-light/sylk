@@ -12,6 +12,7 @@ type SessionRoutingFileAccess struct {
 	readOnly bool
 	lookup   func(sessionID string) *SessionVFS
 	fallback FileAccess
+	review   bool
 }
 
 // NewSessionRoutingFileAccess creates a file-access router that prefers the
@@ -26,6 +27,22 @@ func NewSessionRoutingFileAccess(
 		readOnly: readOnly,
 		lookup:   lookup,
 		fallback: fallback,
+	}
+}
+
+// NewSessionReviewRoutingFileAccess creates a file-access router that prefers
+// the current session's active review overlay and otherwise falls back to the
+// provided FileAccess implementation.
+func NewSessionReviewRoutingFileAccess(
+	readOnly bool,
+	lookup func(sessionID string) *SessionVFS,
+	fallback FileAccess,
+) *SessionRoutingFileAccess {
+	return &SessionRoutingFileAccess{
+		readOnly: readOnly,
+		lookup:   lookup,
+		fallback: fallback,
+		review:   true,
 	}
 }
 
@@ -81,6 +98,9 @@ func (s *SessionRoutingFileAccess) resolve(ctx context.Context) FileAccess {
 	if s.lookup != nil {
 		if sessionID := SessionIDFromContext(ctx); sessionID != "" {
 			if svfs := s.lookup(sessionID); svfs != nil {
+				if s.review {
+					return svfs.NewReviewFileAccess(s.readOnly)
+				}
 				return svfs.NewGlobalFileAccess(s.readOnly)
 			}
 		}

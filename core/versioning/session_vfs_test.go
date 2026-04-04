@@ -217,6 +217,81 @@ func TestSessionVFS_GlobalDraftWritesAdvanceWAL(t *testing.T) {
 	}
 }
 
+func TestSessionVFS_ReviewCandidateStaysOutOfCheckpointUntilAccepted(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "hello.txt")
+	if err := os.WriteFile(target, []byte("disk"), 0644); err != nil {
+		t.Fatalf("seed disk: %v", err)
+	}
+
+	svfs, err := NewSessionVFS(SessionVFSConfig{
+		SessionID:  "test-session",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	defer svfs.Close()
+
+	ctx := context.Background()
+	pipe, err := svfs.BeginPipeline(BeginPipelineConfig{
+		PipelineID: "task-1",
+		SessionID:  "test-session",
+		WorkingDir: dir,
+		Files:      []string{"hello.txt"},
+	})
+	if err != nil {
+		t.Fatalf("BeginPipeline: %v", err)
+	}
+	if err := pipe.Write(ctx, target, []byte("candidate")); err != nil {
+		t.Fatalf("pipeline write: %v", err)
+	}
+
+	candidate, err := svfs.ExtractReviewCandidate("task-1")
+	if err != nil {
+		t.Fatalf("ExtractReviewCandidate: %v", err)
+	}
+	if candidate == nil {
+		t.Fatal("expected extracted review candidate")
+	}
+	if svfs.HasPipeline("task-1") {
+		t.Fatal("expected pipeline to be closed after extraction")
+	}
+
+	globalContent, err := svfs.NewGlobalFileAccess(true).ReadFile(ctx, "hello.txt")
+	if err != nil {
+		t.Fatalf("global read before accept: %v", err)
+	}
+	if got := string(globalContent); got != "disk" {
+		t.Fatalf("global content before accept = %q, want %q", got, "disk")
+	}
+
+	if err := svfs.ActivateReviewCandidate(ctx, candidate.ID); err != nil {
+		t.Fatalf("ActivateReviewCandidate: %v", err)
+	}
+	reviewContent, err := svfs.NewReviewFileAccess(true).ReadFile(ctx, "hello.txt")
+	if err != nil {
+		t.Fatalf("review read: %v", err)
+	}
+	if got := string(reviewContent); got != "candidate" {
+		t.Fatalf("review content = %q, want %q", got, "candidate")
+	}
+
+	if _, changed, err := svfs.AcceptActiveReviewCandidate(ctx, "task-1"); err != nil {
+		t.Fatalf("AcceptActiveReviewCandidate: %v", err)
+	} else if !changed {
+		t.Fatal("expected accept to promote the candidate")
+	}
+
+	globalContent, err = svfs.NewGlobalFileAccess(true).ReadFile(ctx, "hello.txt")
+	if err != nil {
+		t.Fatalf("global read after accept: %v", err)
+	}
+	if got := string(globalContent); got != "candidate" {
+		t.Fatalf("global content after accept = %q, want %q", got, "candidate")
+	}
+}
+
 func TestSessionVFS_FlushCommitsDraftAndSeedsNextPipelineFromDisk(t *testing.T) {
 	dir := t.TempDir()
 	svfs, err := NewSessionVFS(SessionVFSConfig{

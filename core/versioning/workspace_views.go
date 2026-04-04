@@ -17,6 +17,13 @@ const (
 	WorkspaceViewPipeline WorkspaceView = "pipeline"
 )
 
+type WorkspaceGlobalSource string
+
+const (
+	WorkspaceGlobalSourceCheckpoint WorkspaceGlobalSource = "checkpoint"
+	WorkspaceGlobalSourceReview     WorkspaceGlobalSource = "review"
+)
+
 // WorkspaceViewAccess provides explicit read-only access to the committed disk
 // state, the session-global merged overlay, and an optional task-local
 // pipeline overlay.
@@ -94,6 +101,7 @@ type SessionWorkspaceViews struct {
 	defaultView       WorkspaceView
 	defaultPipelineID string
 	defaultSessionID  string
+	globalSource      WorkspaceGlobalSource
 	workingDir        string
 	sessionLookup     func(sessionID string) *SessionVFS
 	session           *SessionVFS
@@ -105,6 +113,7 @@ type SessionWorkspaceViewsConfig struct {
 	DefaultView       WorkspaceView
 	DefaultPipelineID string
 	DefaultSessionID  string
+	GlobalSource      WorkspaceGlobalSource
 	WorkingDir        string
 	SessionLookup     func(sessionID string) *SessionVFS
 	Session           *SessionVFS
@@ -118,6 +127,10 @@ func NewSessionWorkspaceViews(cfg SessionWorkspaceViewsConfig) *SessionWorkspace
 	if defaultView == "" {
 		defaultView = WorkspaceViewDisk
 	}
+	globalSource := cfg.GlobalSource
+	if globalSource == "" {
+		globalSource = WorkspaceGlobalSourceCheckpoint
+	}
 	diskFallback := cfg.DiskFallback
 	if diskFallback == nil {
 		diskFallback = NewDiskFileAccess(cfg.WorkingDir, true)
@@ -126,6 +139,7 @@ func NewSessionWorkspaceViews(cfg SessionWorkspaceViewsConfig) *SessionWorkspace
 		defaultView:       defaultView,
 		defaultPipelineID: strings.TrimSpace(cfg.DefaultPipelineID),
 		defaultSessionID:  strings.TrimSpace(cfg.DefaultSessionID),
+		globalSource:      globalSource,
 		workingDir:        cfg.WorkingDir,
 		sessionLookup:     cfg.SessionLookup,
 		session:           cfg.Session,
@@ -333,6 +347,9 @@ func (s *SessionWorkspaceViews) fileAccessFor(ctx context.Context, view Workspac
 		svfs := s.resolveSession(ctx)
 		if svfs == nil {
 			return nil, fmt.Errorf("workspace view %q unavailable: no active session VFS", view)
+		}
+		if s.globalSource == WorkspaceGlobalSourceReview {
+			return svfs.NewReviewFileAccess(true), nil
 		}
 		return svfs.NewGlobalFileAccess(true), nil
 	case WorkspaceViewPipeline:

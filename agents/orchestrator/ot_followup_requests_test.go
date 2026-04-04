@@ -37,7 +37,7 @@ func TestBuildOTGlobalFollowupRequest_UsesDirectPrompt(t *testing.T) {
 		Timestamp: time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC),
 	}
 
-	req := o.buildOTGlobalFollowupRequest(task, update, "inspector", versioning.SemanticVersion{}, false)
+	req := o.buildOTGlobalFollowupRequest(task, update, "inspector", versioning.SemanticVersion{}, false, "")
 	if req == nil {
 		t.Fatal("buildOTGlobalFollowupRequest returned nil")
 	}
@@ -58,6 +58,9 @@ func TestBuildOTGlobalFollowupRequest_UsesDirectPrompt(t *testing.T) {
 	}
 	if req.Metadata["ot_handoff_followup"] != true {
 		t.Fatalf("metadata ot_handoff_followup = %#v, want true", req.Metadata["ot_handoff_followup"])
+	}
+	if req.Metadata["serialized_followup_queue_key"] != "global_review:sess-1" {
+		t.Fatalf("metadata serialized_followup_queue_key = %#v, want %q", req.Metadata["serialized_followup_queue_key"], "global_review:sess-1")
 	}
 	if req.Metadata["global_review"] != true {
 		t.Fatalf("metadata global_review = %#v, want true", req.Metadata["global_review"])
@@ -111,7 +114,7 @@ func TestBuildOTGlobalFollowupRequest_CheckpointReviewMetadata(t *testing.T) {
 		Timestamp: time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC),
 	}
 
-	req := o.buildOTGlobalFollowupRequest(task, update, "inspector", versioning.SemanticVersion{}, false)
+	req := o.buildOTGlobalFollowupRequest(task, update, "inspector", versioning.SemanticVersion{}, false, "")
 	if req == nil {
 		t.Fatal("buildOTGlobalFollowupRequest returned nil")
 	}
@@ -151,7 +154,7 @@ func TestBuildOTGlobalFollowupRequest_FallsBackToStateSession(t *testing.T) {
 		Timestamp: time.Date(2026, 3, 23, 12, 5, 0, 0, time.UTC),
 	}
 
-	req := o.buildOTGlobalFollowupRequest(task, update, "tester", versioning.SemanticVersion{}, false)
+	req := o.buildOTGlobalFollowupRequest(task, update, "tester", versioning.SemanticVersion{}, false, "")
 	if req == nil {
 		t.Fatal("buildOTGlobalFollowupRequest returned nil")
 	}
@@ -178,7 +181,7 @@ func TestBuildOTGlobalFollowupRequest_UsesTaskMetadataSessionID(t *testing.T) {
 		Timestamp: time.Date(2026, 3, 23, 12, 5, 0, 0, time.UTC),
 	}
 
-	req := o.buildOTGlobalFollowupRequest(task, update, "tester", versioning.SemanticVersion{}, false)
+	req := o.buildOTGlobalFollowupRequest(task, update, "tester", versioning.SemanticVersion{}, false, "")
 	if req == nil {
 		t.Fatal("buildOTGlobalFollowupRequest returned nil")
 	}
@@ -209,7 +212,7 @@ func TestBuildOTGlobalFollowupRequest_PreservesSessionMetadataForDurableReviewSt
 		Timestamp: time.Date(2026, 3, 23, 12, 6, 0, 0, time.UTC),
 	}
 
-	req := o.buildOTGlobalFollowupRequest(task, update, "inspector", versioning.SemanticVersion{}, false)
+	req := o.buildOTGlobalFollowupRequest(task, update, "inspector", versioning.SemanticVersion{}, false, "")
 	if req == nil {
 		t.Fatal("buildOTGlobalFollowupRequest returned nil")
 	}
@@ -365,7 +368,24 @@ func TestFinalizePipelineUpdate_NonInspectorSuccessDoesNotPublishGlobalFollowups
 	}
 }
 
-func TestHandlePipelineUpdate_InspectorSuccessReleasesAcceptedTaskResources(t *testing.T) {
+func TestHandlePipelineUpdate_InspectorSuccessDefersResourceReleaseUntilCheckpointAccept(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	reqCh := make(chan *guide.RouteRequest, 1)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.Metadata["ot_handoff_followup"] != true {
+			return nil
+		}
+		reqCh <- req
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer reqSub.Unsubscribe()
+
 	quota := container.NewResourceQuota(container.ResourceQuotaConfig{
 		GoroutineLimit: 200,
 		ContainerLimit: 4,
@@ -389,14 +409,18 @@ func TestHandlePipelineUpdate_InspectorSuccessReleasesAcceptedTaskResources(t *t
 		t.Fatalf("NewSessionVFS: %v", err)
 	}
 	defer svfs.Close()
-	if _, err := svfs.BeginPipeline(versioning.BeginPipelineConfig{
+	pipe, err := svfs.BeginPipeline(versioning.BeginPipelineConfig{
 		PipelineID: "task-1",
 		SessionID:  versioning.SessionID("sess-1"),
 		WorkingDir: workingDir,
 		AgentID:    "inspector-pipeline",
 		AgentRole:  "inspector",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("BeginPipeline: %v", err)
+	}
+	if err := pipe.Write(context.Background(), "main.txt", []byte("candidate")); err != nil {
+		t.Fatalf("pipeline write: %v", err)
 	}
 	if !svfs.HasPipeline("task-1") {
 		t.Fatal("expected tracked pipeline draft before OT cleanup")
@@ -425,12 +449,23 @@ func TestHandlePipelineUpdate_InspectorSuccessReleasesAcceptedTaskResources(t *t
 	}
 
 	o := &Orchestrator{
-		state:          NewState("sess-1"),
-		config:         Config{AgentID: "orchestrator", SessionID: "sess-1"},
-		bufferRegistry: buffers,
-		dagBridge:      bridge,
-		sessionVFS:     map[string]*versioning.SessionVFS{"sess-1": svfs},
+		bus:                      bus,
+		state:                    NewState("sess-1"),
+		config:                   Config{AgentID: "orchestrator", SessionID: "sess-1"},
+		bufferRegistry:           buffers,
+		dagBridge:                bridge,
+		sessionVFS:               map[string]*versioning.SessionVFS{"sess-1": svfs},
+		pendingCheckpointReviews: make(map[string]*pendingCheckpointReview),
 	}
+	router := NewTaskRouter(TaskRouterConfig{
+		Bus:                    bus,
+		Scope:                  scope,
+		AgentID:                "orchestrator",
+		SessionID:              "sess-1",
+		OnVisibleRoutePublish:  o.ActivatePublishedReviewCandidate,
+		OnVisibleRouteTerminal: o.HandleCheckpointReviewTerminal,
+	})
+	o.SetTaskRouter(router)
 	o.state.Tasks["task-1"] = &TaskRecord{
 		ID:        "task-1",
 		Name:      "auth checkout",
@@ -458,8 +493,40 @@ func TestHandlePipelineUpdate_InspectorSuccessReleasesAcceptedTaskResources(t *t
 	if svfs.HasPipeline("task-1") {
 		t.Fatal("expected OT-accepted task draft to be removed from SessionVFS")
 	}
+	if taskPod.IsReleased() {
+		t.Fatal("expected accepted task pod to remain allocated until checkpoint acceptance")
+	}
+	if got := buffers.ActiveBufferCount(); got == 0 {
+		t.Fatal("expected task buffer to remain active until checkpoint acceptance")
+	}
+	select {
+	case req := <-reqCh:
+		if req.Metadata["review_candidate_id"] != "task-1" {
+			t.Fatalf("review_candidate_id = %#v, want task-1", req.Metadata["review_candidate_id"])
+		}
+		respMsg := guide.NewResponseMessage("", &guide.RouteResponse{
+			CorrelationID:       req.CorrelationID,
+			Success:             true,
+			RespondingAgentID:   "inspector",
+			RespondingAgentName: "Inspector",
+			Data: &agentshared.GlobalReviewTurnResponse{
+				Result: "checkpoint accepted",
+				Action: &agentshared.GlobalReviewTurnAction{
+					Type:      agentshared.GlobalReviewActionAccept,
+					AgentType: agentshared.GlobalReviewAgentInspector,
+					Summary:   "checkpoint accepted",
+				},
+			},
+		})
+		respMsg.CorrelationID = req.CorrelationID
+		if !router.DeliverResponse(respMsg) {
+			t.Fatal("expected checkpoint-accept response to be consumed by task router")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected OT global-review follow-up request")
+	}
 	if !taskPod.IsReleased() {
-		t.Fatal("expected accepted task pod to be released after node completion")
+		t.Fatal("expected accepted task pod to be released after checkpoint acceptance")
 	}
 	if usage := quota.Usage(); usage.ContainerCount != 0 {
 		t.Fatalf("expected accepted task cleanup to deallocate containers, got %+v", usage)

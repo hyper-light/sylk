@@ -34,6 +34,7 @@ const (
 	GlobalReviewActionHandoff   GlobalReviewActionType = "handoff"
 	GlobalReviewActionChallenge GlobalReviewActionType = "challenge"
 	GlobalReviewActionValidate  GlobalReviewActionType = "validation"
+	GlobalReviewActionAccept    GlobalReviewActionType = "accept_checkpoint"
 	GlobalReviewActionCommit    GlobalReviewActionType = "commit_to_disk"
 )
 
@@ -365,9 +366,9 @@ func ValidateGlobalReviewCompletion(ctx context.Context, agentType string) error
 	switch agentType {
 	case GlobalReviewAgentInspector:
 		if snapshot != nil && snapshot.PendingValidation != nil {
-			return fmt.Errorf("Before ending this global inspector turn, call `process_validation` and then decide whether the next move is `challenge_agent`, `handoff_next`, `finalize_global_review`, or `commit_to_disk`.")
+			return fmt.Errorf("Before ending this global inspector turn, call `process_validation` and then decide whether the next move is `challenge_agent`, `handoff_next`, `finalize_global_review`, `accept_checkpoint`, or `commit_to_disk`.")
 		}
-		return fmt.Errorf("Before ending this global inspector turn, use `challenge_agent`, `handoff_next`, `validate_work`, `process_validation`, `finalize_global_review`, or `commit_to_disk` to record the next review step.")
+		return fmt.Errorf("Before ending this global inspector turn, use `challenge_agent`, `handoff_next`, `validate_work`, `process_validation`, `finalize_global_review`, `accept_checkpoint`, or `commit_to_disk` to record the next review step.")
 	case GlobalReviewAgentTester:
 		if snapshot != nil && snapshot.PendingValidation != nil &&
 			normalizeGlobalReviewAgent(snapshot.PendingValidation.RequestingAgent) == agentType {
@@ -381,6 +382,21 @@ func ValidateGlobalReviewCompletion(ctx context.Context, agentType string) error
 		}
 	}
 	return nil
+}
+
+func WrapGlobalReviewTurnResult(ctx context.Context, result any) any {
+	state := GlobalReviewStateFromContext(ctx)
+	if state == nil {
+		return result
+	}
+	action := state.TerminalAction()
+	if action == nil {
+		return result
+	}
+	return &GlobalReviewTurnResponse{
+		Result: result,
+		Action: action,
+	}
 }
 
 func GlobalReviewSnapshotFromMetadata(metadata map[string]any) (*GlobalReviewSnapshot, error) {
@@ -436,6 +452,7 @@ func NewGlobalReviewProtocolSkills(cfg GlobalReviewProtocolSkillConfig) []*skill
 			globalReviewValidateWorkSkill(cfg),
 			globalReviewProcessValidationSkill(cfg),
 			globalReviewFinalizeSkill(cfg),
+			globalReviewAcceptCheckpointSkill(cfg),
 			globalReviewCommitToDiskSkill(cfg),
 		}
 	case GlobalReviewAgentTester:
@@ -819,8 +836,8 @@ func globalReviewFinalizeSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skil
 		Keywords("global", "review", "finalize", "audit", "commit").
 		Priority(100).
 		Usage("Invoke this when the current merged state should either be challenged again or be promoted toward commit-to-disk.").
-		Requirement("If this returns ready_for_commit or must_commit_to_disk, your next terminal action in this turn must be `commit_to_disk`.").
-		Satisfies("Issues the tester challenge for the current review stage or recognizes that the tester-backed audit already passed and commit-to-disk is now required.").
+		Requirement("If this returns ready_for_checkpoint, your next terminal action in this turn must be `accept_checkpoint`. If it returns ready_for_commit or must_commit_to_disk, your next terminal action in this turn must be `commit_to_disk`.").
+		Satisfies("Issues the tester challenge for the current review stage or recognizes that the tester-backed audit already passed and the current checkpoint is ready for acceptance or final commit.").
 		StringParam("summary", "Why the merged work is ready for final global review or commit", true).
 		ArrayParam("evidence_refs", "Files, tests, and artifacts supporting the audit", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -846,17 +863,32 @@ func globalReviewFinalizeSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skil
 			snapshot := state.Snapshot()
 			evidenceRefs := normalizeStringList(params.EvidenceRefs)
 			if record, ok := finalizeGlobalReviewValidationReady(snapshot, state.ProcessedValidations()); ok {
-				if err := state.recordReadyForCommit(ctx, summary, normalizeStringList(append(append([]string(nil), evidenceRefs...), record.EvidenceRefs...)), record); err != nil {
+				allEvidence := normalizeStringList(append(append([]string(nil), evidenceRefs...), record.EvidenceRefs...))
+				if finalWholePlanReview {
+					if err := state.recordReadyForCommit(ctx, summary, allEvidence, record); err != nil {
+						return nil, err
+					}
+					return map[string]any{
+						"finalize_global_review":    true,
+						"ready_for_commit":          true,
+						"must_commit_to_disk":       true,
+						"required_next_action":      "commit_to_disk",
+						"required_next_action_only": true,
+						"challenge_id":              record.ChallengeID,
+						"evidence_refs":             allEvidence,
+					}, nil
+				}
+				if err := state.recordReadyForCheckpoint(ctx, summary, allEvidence, record); err != nil {
 					return nil, err
 				}
 				return map[string]any{
 					"finalize_global_review":    true,
-					"ready_for_commit":          true,
-					"must_commit_to_disk":       true,
-					"required_next_action":      "commit_to_disk",
+					"ready_for_checkpoint":      true,
+					"must_accept_checkpoint":    true,
+					"required_next_action":      "accept_checkpoint",
 					"required_next_action_only": true,
 					"challenge_id":              record.ChallengeID,
-					"evidence_refs":             normalizeStringList(append(append([]string(nil), evidenceRefs...), record.EvidenceRefs...)),
+					"evidence_refs":             allEvidence,
 				}, nil
 			}
 			if snapshot != nil && snapshot.PendingValidation != nil {
@@ -885,6 +917,70 @@ func globalReviewFinalizeSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skil
 				References: evidenceRefs,
 			}
 			return issueGlobalReviewSelection(ctx, cfg, action)
+		}).
+		Build()
+}
+
+func globalReviewAcceptCheckpointSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
+	return skills.NewSkill("accept_checkpoint").
+		Description("Promote the currently reviewed checkpoint candidate into dependency-visible shared session state. Global inspector only.").
+		Domain("global_review").
+		Keywords("global", "review", "checkpoint", "accept", "promote").
+		Priority(100).
+		Usage("Use only after a checkpoint-stage tester-backed global review has passed and the current merged candidate is ready to become dependency-visible to downstream work.").
+		Requirement("This is not the final disk commit. Use `commit_to_disk` only for the final whole-plan review stage.").
+		Satisfies("Makes the current reviewed candidate the new shared checkpoint and closes the progressive checkpoint review for this task.").
+		StringParam("summary", "Why the current checkpoint is safe to promote for downstream work", true).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Summary string `json:"summary"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if normalizeGlobalReviewAgent(globalReviewAgentType(ctx, cfg)) != GlobalReviewAgentInspector {
+				return nil, fmt.Errorf("accept_checkpoint is only permitted for the global inspector")
+			}
+			summary := strings.TrimSpace(params.Summary)
+			if summary == "" {
+				return nil, fmt.Errorf("summary is required")
+			}
+			state := GlobalReviewStateFromContext(ctx)
+			if state == nil {
+				return nil, fmt.Errorf("global review state not available")
+			}
+			if globalReviewIsFinal(state.BaseMetadata()) {
+				return nil, fmt.Errorf("accept_checkpoint is only valid during checkpoint-stage global review; use commit_to_disk for the final stage")
+			}
+			if _, ok := finalizeGlobalReviewValidationReady(state.Snapshot(), state.ProcessedValidations()); !ok {
+				return nil, fmt.Errorf("accept_checkpoint requires a passing tester-backed global review first")
+			}
+			views := cfg.WorkspaceViews()
+			if views == nil {
+				return nil, fmt.Errorf("workspace views are unavailable")
+			}
+			svfs := versioning.SessionForWorkspaceViews(ctx, views)
+			if svfs == nil {
+				return nil, fmt.Errorf("session VFS is unavailable for accept_checkpoint")
+			}
+			if _, _, err := svfs.AcceptActiveReviewCandidate(ctx, "global-review"); err != nil {
+				return nil, err
+			}
+			action := &GlobalReviewTurnAction{
+				Type:      GlobalReviewActionAccept,
+				AgentType: GlobalReviewAgentInspector,
+				Summary:   summary,
+			}
+			if err := state.recordCheckpointAccepted(ctx, action); err != nil {
+				return nil, err
+			}
+			if err := state.setTerminalAction(action); err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"accepted_checkpoint": true,
+				"summary":             summary,
+			}, nil
 		}).
 		Build()
 }
@@ -927,6 +1023,9 @@ func globalReviewCommitToDiskSkill(cfg GlobalReviewProtocolSkillConfig) *skills.
 			svfs := versioning.SessionForWorkspaceViews(ctx, views)
 			if svfs == nil {
 				return nil, fmt.Errorf("session VFS is unavailable for commit_to_disk")
+			}
+			if _, _, err := svfs.AcceptActiveReviewCandidate(ctx, "global-review"); err != nil {
+				return nil, err
 			}
 			authReq := commandapproval.Request{
 				Command:        fmt.Sprintf("commit_to_disk --reason %q", summary),
@@ -1293,7 +1392,7 @@ func buildGlobalReviewValidationPrompt(record *GlobalReviewValidationRecord, met
 			lines = append(lines, "- "+item)
 		}
 	}
-	lines = append(lines, "After `process_validation`, decide whether the next step is another targeted `challenge_agent`, an ordinary `handoff_next`, `finalize_global_review`, or `commit_to_disk`.")
+	lines = append(lines, "After `process_validation`, decide whether the next step is another targeted `challenge_agent`, an ordinary `handoff_next`, `finalize_global_review`, `accept_checkpoint`, or `commit_to_disk`.")
 	return strings.Join(lines, "\n")
 }
 
@@ -1399,7 +1498,7 @@ func globalReviewFinalizeReason(finalWholePlanReview bool) string {
 	if finalWholePlanReview {
 		return "Run the adversarial whole-plan global tester audit before committing merged work to disk."
 	}
-	return "Run the adversarial global tester audit for this merged checkpoint before deciding whether the current state is safe and strong enough to commit to disk."
+	return "Run the adversarial global tester audit for this merged checkpoint before deciding whether the current state is safe and strong enough to become the next shared checkpoint."
 }
 
 func globalReviewFinalizeRequest(finalWholePlanReview bool) string {

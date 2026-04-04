@@ -376,6 +376,38 @@ func RouteMetadataWithExplicitInterAgentBranch(
 	return applyInterAgentBranchMetadata(metadata, branch)
 }
 
+// RouteMetadataWithExplicitTopLevelTransfer stamps explicit top-level transfer
+// lineage onto a route request so mirrored protocol streams can preserve the
+// parent correlation even when the child's first visible event is a synthetic
+// bootstrap from progress/tool traffic.
+func RouteMetadataWithExplicitTopLevelTransfer(
+	ctx context.Context,
+	metadata map[string]any,
+	parentCorrelationID string,
+) map[string]any {
+	metadata = RouteMetadataWithTaskScope(ctx, metadata)
+	parentCorrelationID = strings.TrimSpace(parentCorrelationID)
+	if parentCorrelationID == "" {
+		if stream, ok := StreamMetadataFromContext(ctx); ok {
+			parentCorrelationID = strings.TrimSpace(stream.CorrelationID)
+		}
+	}
+	if parentCorrelationID == "" {
+		return metadata
+	}
+	cloned := cloneStreamMetadata(metadata)
+	if cloned == nil {
+		cloned = make(map[string]any, 2)
+	}
+	delete(cloned, streamMetadataNestedBranch)
+	delete(cloned, streamMetadataParentToolCallKey)
+	delete(cloned, streamMetadataInterAgentThread)
+	delete(cloned, streamMetadataInterAgentKind)
+	cloned[streamMetadataParentCorrelation] = parentCorrelationID
+	cloned[streamMetadataTopLevelTransfer] = true
+	return cloned
+}
+
 func applyInterAgentBranchMetadata(metadata map[string]any, branch InterAgentBranchMetadata) map[string]any {
 	branch.ParentCorrelationID = strings.TrimSpace(branch.ParentCorrelationID)
 	branch.ParentToolCallKey = strings.TrimSpace(branch.ParentToolCallKey)

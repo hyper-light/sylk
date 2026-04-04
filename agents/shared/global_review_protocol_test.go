@@ -26,6 +26,7 @@ func TestNewGlobalReviewProtocolSkills_AgentSpecificOwnership(t *testing.T) {
 				"validate_work",
 				"process_validation",
 				"finalize_global_review",
+				"accept_checkpoint",
 				"commit_to_disk",
 			},
 		},
@@ -403,7 +404,7 @@ func TestFinalizeGlobalReview_CheckpointChallengeUsesProgressiveRequest(t *testi
 	}
 }
 
-func TestFinalizeGlobalReview_RequiresCommitAfterAcceptedTesterValidation(t *testing.T) {
+func TestFinalizeGlobalReview_CheckpointRequiresAcceptAfterAcceptedTesterValidation(t *testing.T) {
 	state := NewGlobalReviewState(&GlobalReviewSnapshot{ReviewID: "review-2"}, nil)
 	state.addProcessedValidation(GlobalReviewValidationProcessing{
 		ChallengeID: "review-2-challenge-1",
@@ -412,6 +413,46 @@ func TestFinalizeGlobalReview_RequiresCommitAfterAcceptedTesterValidation(t *tes
 		Summary:     "Tester-backed global review passed.",
 		Validation: &GlobalReviewValidationRecord{
 			ChallengeID:     "review-2-challenge-1",
+			RequestingAgent: GlobalReviewAgentInspector,
+			RespondingAgent: GlobalReviewAgentTester,
+			Status:          string(GlobalReviewValidationPassed),
+			Summary:         "Merged state passed the tester's adversarial validation.",
+		},
+	})
+	ctx := WithGlobalReviewState(context.Background(), state)
+
+	skills := NewGlobalReviewProtocolSkills(GlobalReviewProtocolSkillConfig{
+		AgentType: func() string { return GlobalReviewAgentInspector },
+	})
+	resultAny, err := invokeGlobalReviewSkill(t, ctx, skills, "finalize_global_review", map[string]any{
+		"summary": "Final merged review is ready to commit.",
+	})
+	if err != nil {
+		t.Fatalf("finalize_global_review: %v", err)
+	}
+	result, ok := resultAny.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map[string]any", resultAny)
+	}
+	if result["must_accept_checkpoint"] != true {
+		t.Fatalf("must_accept_checkpoint = %#v, want true", result["must_accept_checkpoint"])
+	}
+	if err := ValidateGlobalReviewCompletion(ctx, GlobalReviewAgentInspector); err == nil {
+		t.Fatal("expected completion guard to require accept_checkpoint")
+	}
+}
+
+func TestFinalizeGlobalReview_FinalStageRequiresCommitAfterAcceptedTesterValidation(t *testing.T) {
+	state := NewGlobalReviewState(&GlobalReviewSnapshot{ReviewID: "review-final"}, GlobalReviewMetadata(map[string]any{
+		"global_review_stage": "final",
+	}, &GlobalReviewSnapshot{ReviewID: "review-final"}))
+	state.addProcessedValidation(GlobalReviewValidationProcessing{
+		ChallengeID: "review-final-challenge-1",
+		AgentType:   GlobalReviewAgentInspector,
+		Decision:    GlobalReviewValidationDecisionAccept,
+		Summary:     "Tester-backed final global review passed.",
+		Validation: &GlobalReviewValidationRecord{
+			ChallengeID:     "review-final-challenge-1",
 			RequestingAgent: GlobalReviewAgentInspector,
 			RespondingAgent: GlobalReviewAgentTester,
 			Status:          string(GlobalReviewValidationPassed),

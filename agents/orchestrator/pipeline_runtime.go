@@ -301,48 +301,60 @@ func pipelineTaskStateForUpdate(status, stage string) taskstate.Status {
 	}
 }
 
-func (o *Orchestrator) finalizePipelineUpdate(update *PipelineUpdate) {
+func (o *Orchestrator) finalizePipelineUpdate(update *PipelineUpdate) bool {
 	if update == nil || strings.TrimSpace(update.TaskID) == "" || !isPipelineCommitAgent(update.AgentType) {
-		return
+		return false
 	}
 
 	task := o.lookupTask(update.TaskID)
 	if task == nil {
-		return
+		return false
 	}
 
 	var (
-		mergeVersion versioning.SemanticVersion
-		hadDraft     bool
+		checkpointVersion   versioning.SemanticVersion
+		hadDraft            bool
+		reviewCandidateID   string
+		deferNodeCompletion bool
 	)
 
 	switch update.Status {
 	case "succeeded":
-		if strings.TrimSpace(update.AgentType) == agentshared.PipelineAgentInspector {
-			o.publishTaskDraftMergeStarted(task)
-		}
 		var err error
-		mergeVersion, hadDraft, err = o.commitTaskDraft(context.Background(), task)
+		if strings.TrimSpace(update.AgentType) == agentshared.PipelineAgentInspector {
+			checkpointVersion, reviewCandidateID, hadDraft, err = o.extractTaskReviewCandidate(context.Background(), task)
+			if err == nil {
+				err = o.publishOTGlobalFollowupRequest(context.Background(), task, update, checkpointVersion, hadDraft, reviewCandidateID)
+			}
+			if err == nil {
+				deferNodeCompletion = true
+				o.recordPendingCheckpointReview(task, update, convertPipelineToNodeResult(update))
+			}
+		} else {
+			checkpointVersion, hadDraft, err = o.commitTaskDraft(context.Background(), task)
+			if err == nil && hadDraft {
+				o.publishTaskDraftMergeSuccess(task, checkpointVersion)
+			}
+		}
 		if err != nil {
-			o.publishTaskDraftMergeFailure(task, err)
+			if strings.TrimSpace(update.AgentType) == agentshared.PipelineAgentInspector && reviewCandidateID != "" {
+				if svfs := o.GetSessionVFS(task.SessionID); svfs != nil {
+					svfs.DiscardReviewCandidate(reviewCandidateID)
+				}
+			}
 			update.Status = "failed"
 			update.Error = err.Error()
 			update.Message = firstNonEmpty(update.Message, "draft merge failed")
 			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", taskstate.StatusFailed, update.AgentType)
-		} else if hadDraft {
-			o.publishTaskDraftMergeSuccess(task, mergeVersion)
 		}
 	case "failed", "timed_out", "cancelled":
 		_ = o.rollbackTaskDraft(task)
 	}
 
-	if update.Status == "succeeded" && strings.TrimSpace(update.AgentType) == agentshared.PipelineAgentInspector {
-		o.publishOTGlobalFollowupRequestsBestEffort(context.Background(), task, update, mergeVersion, hadDraft)
-	}
-
 	if o.coordination != nil {
 		_ = o.coordination.ReleaseTaskClaims(context.Background(), update.TaskID)
 	}
+	return deferNodeCompletion
 }
 
 func isPipelineCommitAgent(agentType string) bool {

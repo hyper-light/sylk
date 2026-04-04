@@ -234,3 +234,65 @@ func TestGlobalReviewDurableProjectionAndMailbox(t *testing.T) {
 		t.Fatalf("required action after reopen = %q, want %q", action, GlobalReviewActionCommit)
 	}
 }
+
+func TestGlobalReviewDurableProjection_CheckpointAcceptMailbox(t *testing.T) {
+	sessionDir := t.TempDir()
+	metadata := map[string]any{
+		"session_id":    "sess-global",
+		"session_dir":   sessionDir,
+		"review_id":     "review-checkpoint",
+		"global_review": true,
+		"global_review_protocol": GlobalReviewSnapshotMap(&GlobalReviewSnapshot{
+			ReviewID: "review-checkpoint",
+		}),
+	}
+
+	state := NewGlobalReviewStateFromMetadata(metadata)
+	if state == nil {
+		t.Fatal("NewGlobalReviewStateFromMetadata() returned nil")
+	}
+	defer state.Close()
+
+	record := &GlobalReviewValidationRecord{
+		ChallengeID:     "checkpoint-challenge-1",
+		RequestingAgent: GlobalReviewAgentInspector,
+		RespondingAgent: GlobalReviewAgentTester,
+		Status:          string(GlobalReviewValidationPassed),
+		Summary:         "Checkpoint review passed.",
+		EvidenceRefs:    []string{"go test ./..."},
+	}
+	if err := state.recordValidationProcessing(context.Background(), GlobalReviewValidationProcessing{
+		ChallengeID: record.ChallengeID,
+		AgentType:   GlobalReviewAgentInspector,
+		Decision:    GlobalReviewValidationDecisionAccept,
+		Summary:     "Accepted tester validation.",
+		Validation:  record,
+	}); err != nil {
+		t.Fatalf("recordValidationProcessing() error = %v", err)
+	}
+	if err := state.recordReadyForCheckpoint(context.Background(), "Ready to accept checkpoint.", record.EvidenceRefs, record); err != nil {
+		t.Fatalf("recordReadyForCheckpoint() error = %v", err)
+	}
+
+	inspectorMailbox, err := openDurableAgentMailbox(sessionDir, GlobalReviewAgentInspector)
+	if err != nil {
+		t.Fatalf("open inspector mailbox: %v", err)
+	}
+	defer inspectorMailbox.Close()
+	items, err := inspectorMailbox.Pending(globalReviewNamespace, "review-checkpoint")
+	if err != nil {
+		t.Fatalf("inspector mailbox pending: %v", err)
+	}
+	if len(items) != 1 || items[0].Action != "accept_checkpoint" {
+		t.Fatalf("inspector mailbox = %#v, want accept_checkpoint", items)
+	}
+
+	reopened := NewGlobalReviewStateFromMetadata(metadata)
+	if reopened == nil {
+		t.Fatal("reopened global review state is nil")
+	}
+	defer reopened.Close()
+	if action, _ := reopened.RequiredAction(); action != GlobalReviewActionAccept {
+		t.Fatalf("required action after reopen = %q, want %q", action, GlobalReviewActionAccept)
+	}
+}

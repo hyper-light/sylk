@@ -1017,6 +1017,141 @@ func TestTaskRouter_PublishUserVisibleRoute_QueuesOTFollowupsPerReviewer(t *test
 	}
 }
 
+func TestTaskRouter_PublishUserVisibleRoute_HoldsSerializedReviewSlotAcrossChildHandoffs(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+
+	reqCh := make(chan *guide.RouteRequest, 4)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.Metadata["ot_handoff_followup"] != true {
+			return nil
+		}
+		reqCh <- req
+		return nil
+	})
+	require.NoError(t, err)
+	defer reqSub.Unsubscribe()
+
+	req1 := &guide.RouteRequest{
+		CorrelationID:   "ot_followup_review_a",
+		Input:           "Audit candidate A.",
+		TargetAgentID:   "inspector",
+		ExplicitTarget:  true,
+		SourceAgentID:   "orchestrator",
+		SourceAgentName: "orchestrator",
+		SessionID:       "test-session",
+		Timestamp:       time.Date(2026, 3, 25, 16, 0, 0, 0, time.UTC),
+		Metadata: map[string]any{
+			"agent_type":                    "inspector",
+			"task_id":                       "task-a",
+			"ot_handoff_followup":           true,
+			"global_review":                 true,
+			"serialized_followup_queue_key": "global_review:test-session",
+		},
+	}
+	req2 := &guide.RouteRequest{
+		CorrelationID:   "ot_followup_review_b",
+		Input:           "Audit candidate B.",
+		TargetAgentID:   "inspector",
+		ExplicitTarget:  true,
+		SourceAgentID:   "orchestrator",
+		SourceAgentName: "orchestrator",
+		SessionID:       "test-session",
+		Timestamp:       time.Date(2026, 3, 25, 16, 0, 1, 0, time.UTC),
+		Metadata: map[string]any{
+			"agent_type":                    "inspector",
+			"task_id":                       "task-b",
+			"ot_handoff_followup":           true,
+			"global_review":                 true,
+			"serialized_followup_queue_key": "global_review:test-session",
+		},
+	}
+
+	require.NoError(t, router.PublishUserVisibleRoute(req1))
+	require.NoError(t, router.PublishUserVisibleRoute(req2))
+
+	select {
+	case published := <-reqCh:
+		require.NotNil(t, published)
+		assert.Equal(t, req1.CorrelationID, published.CorrelationID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected first serialized review request to publish immediately")
+	}
+
+	rootTerminal := guide.NewResponseMessage("", &guide.RouteResponse{
+		CorrelationID:       req1.CorrelationID,
+		Success:             true,
+		RespondingAgentID:   "inspector",
+		RespondingAgentName: "Inspector",
+		Data: &agentshared.GlobalReviewTurnResponse{
+			Result: "handoff to tester",
+			Action: &agentshared.GlobalReviewTurnAction{
+				Type:        agentshared.GlobalReviewActionHandoff,
+				AgentType:   agentshared.GlobalReviewAgentInspector,
+				TargetAgent: agentshared.GlobalReviewAgentTester,
+			},
+		},
+	})
+	rootTerminal.CorrelationID = req1.CorrelationID
+	require.True(t, router.DeliverResponse(rootTerminal))
+
+	select {
+	case published := <-reqCh:
+		t.Fatalf("queued review request published too early after root handoff: %s", published.CorrelationID)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	childStream := &guide.Message{
+		ID:            "stream-child-review",
+		CorrelationID: "global_review_child_a",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:       "global_review_child_a",
+			RespondingAgentID:   "tester",
+			RespondingAgentName: "Tester",
+			Metadata: map[string]any{
+				"chat_parent_correlation_id": req1.CorrelationID,
+				"agent_type":                 "tester",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventStart,
+			},
+		},
+		SourceAgentID: "tester",
+		TargetAgentID: "orchestrator",
+		Timestamp:     time.Now(),
+	}
+	require.True(t, router.DeliverResponse(childStream))
+
+	childTerminal := guide.NewResponseMessage("", &guide.RouteResponse{
+		CorrelationID:       "global_review_child_a",
+		Success:             true,
+		RespondingAgentID:   "inspector",
+		RespondingAgentName: "Inspector",
+		Data: &agentshared.GlobalReviewTurnResponse{
+			Result: "checkpoint accepted",
+			Action: &agentshared.GlobalReviewTurnAction{
+				Type:      agentshared.GlobalReviewActionAccept,
+				AgentType: agentshared.GlobalReviewAgentInspector,
+			},
+		},
+	})
+	childTerminal.CorrelationID = "global_review_child_a"
+	require.True(t, router.DeliverResponse(childTerminal))
+
+	select {
+	case published := <-reqCh:
+		require.NotNil(t, published)
+		assert.Equal(t, req2.CorrelationID, published.CorrelationID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected second serialized review request after checkpoint acceptance")
+	}
+}
+
 func TestTaskRouter_PublishUserVisibleRoute_OTFollowupsQueuePerTarget(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()

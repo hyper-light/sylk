@@ -21,6 +21,7 @@ type SessionVFS struct {
 	baseFS              vfsBaseFS
 	baseImage           *workspaceImageHandle
 	globalVFS           *PipelineVFS
+	reviewVFS           *PipelineVFS
 	mergePipe           *MergePipe
 	wal                 SemanticWAL
 	diskFlusher         *DiskFlusher
@@ -41,6 +42,7 @@ type SessionVFS struct {
 	oldWAL    WriteAheadLog
 
 	pipelines map[string]*sessionPipeline
+	reviews   *sessionReviewState
 	closed    bool
 }
 
@@ -105,6 +107,18 @@ func NewSessionVFS(cfg SessionVFSConfig) (*SessionVFS, error) {
 	})
 	globalVFS.SetBaseFS(baseFS)
 
+	// Create a separate review overlay for the currently active OT/global-review
+	// candidate. This sits above the dependency-visible global checkpoint state.
+	reviewVFS := NewGlobalVFS(VFSConfig{
+		PipelineID: "review",
+		SessionID:  cfg.SessionID,
+		WorkingDir: cfg.WorkingDir,
+	})
+	reviewVFS.SetBaseReader(func(path string) ([]byte, error) {
+		return globalVFS.Read(context.Background(), path)
+	})
+	reviewVFS.SetBaseFS(pipelineOverlayBaseFS{vfs: globalVFS})
+
 	// Create MergePipe wired to global VFS + WAL + OT.
 	mp := NewMergePipe(MergePipeConfig{
 		GlobalVFS: globalVFS,
@@ -156,6 +170,7 @@ func NewSessionVFS(cfg SessionVFSConfig) (*SessionVFS, error) {
 		baseFS:              baseFS,
 		baseImage:           baseImage,
 		globalVFS:           globalVFS,
+		reviewVFS:           reviewVFS,
 		mergePipe:           mp,
 		wal:                 vwal,
 		diskFlusher:         df,
@@ -170,6 +185,7 @@ func NewSessionVFS(cfg SessionVFSConfig) (*SessionVFS, error) {
 		opLog:               opLog,
 		oldWAL:              oldWAL,
 		pipelines:           make(map[string]*sessionPipeline),
+		reviews:             newSessionReviewState(),
 	}
 
 	s.cvsShim = NewCVSShim(s)
@@ -440,6 +456,9 @@ func (s *SessionVFS) Close() error {
 		firstErr = err
 	}
 	if err := s.globalVFS.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.reviewVFS.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if s.baseImage != nil {

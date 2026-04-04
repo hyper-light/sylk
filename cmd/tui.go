@@ -889,10 +889,12 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 		refreshOrchestratorProvider(refreshCtx, orch, phase1.googleGateway, phase1.authRegistry, authMethod)
 	})
 	orch.SetTaskRouter(orchestrator.NewTaskRouter(orchestrator.TaskRouterConfig{
-		Bus:       phase1.guideBus,
-		Scope:     phase1.scope,
-		AgentID:   orch.AgentID(),
-		SessionID: "default",
+		Bus:                    phase1.guideBus,
+		Scope:                  phase1.scope,
+		AgentID:                orch.AgentID(),
+		SessionID:              "default",
+		OnVisibleRoutePublish:  orch.ActivatePublishedReviewCandidate,
+		OnVisibleRouteTerminal: orch.HandleCheckpointReviewTerminal,
 	}))
 	if phase3.activator != nil {
 		orch.SetActivator(phase3.activator)
@@ -1614,9 +1616,17 @@ func (d onDemandAgentCreatorDeps) defaultSessionID() string {
 }
 
 func (d onDemandAgentCreatorDeps) workspaceViews(defaultView versioning.WorkspaceView) *versioning.SessionWorkspaceViews {
+	return d.workspaceViewsWithGlobalSource(defaultView, versioning.WorkspaceGlobalSourceCheckpoint)
+}
+
+func (d onDemandAgentCreatorDeps) workspaceViewsWithGlobalSource(
+	defaultView versioning.WorkspaceView,
+	globalSource versioning.WorkspaceGlobalSource,
+) *versioning.SessionWorkspaceViews {
 	return versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
 		DefaultView:      defaultView,
 		DefaultSessionID: d.defaultSessionID(),
+		GlobalSource:     globalSource,
 		WorkingDir:       d.projectRoot,
 		SessionLookup:    d.sessionLookup,
 		DiskFallback:     versioning.NewDiskFileAccess(d.projectRoot, true),
@@ -1824,12 +1834,15 @@ func registerGlobalInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 		if err != nil {
 			return nil, err
 		}
-		gi.SetFileAccess(versioning.NewSessionRoutingFileAccess(
+		gi.SetFileAccess(versioning.NewSessionReviewRoutingFileAccess(
 			false,
 			deps.sessionLookup,
 			versioning.NewDiskFileAccess(deps.projectRoot, false),
 		))
-		gi.SetWorkspaceViews(deps.workspaceViews(versioning.WorkspaceViewGlobal))
+		gi.SetWorkspaceViews(deps.workspaceViewsWithGlobalSource(
+			versioning.WorkspaceViewGlobal,
+			versioning.WorkspaceGlobalSourceReview,
+		))
 		gi.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation))
 		if startErr := gi.Start(deps.bus); startErr != nil {
 			return nil, startErr
@@ -1878,12 +1891,15 @@ func registerGlobalTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 		if err != nil {
 			return nil, err
 		}
-		gt.SetFileAccess(versioning.NewSessionRoutingFileAccess(
+		gt.SetFileAccess(versioning.NewSessionReviewRoutingFileAccess(
 			false,
 			deps.sessionLookup,
 			versioning.NewDiskFileAccess(deps.projectRoot, false),
 		))
-		gt.SetWorkspaceViews(deps.workspaceViews(versioning.WorkspaceViewGlobal))
+		gt.SetWorkspaceViews(deps.workspaceViewsWithGlobalSource(
+			versioning.WorkspaceViewGlobal,
+			versioning.WorkspaceGlobalSourceReview,
+		))
 		gt.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation))
 		if startErr := gt.Start(deps.bus); startErr != nil {
 			return nil, startErr

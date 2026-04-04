@@ -750,7 +750,8 @@ type pipelineDispatchSelection struct {
 }
 
 type pipelineProtocolRouteOptions struct {
-	InterAgentBranch *InterAgentBranchSpec
+	InterAgentBranch                  *InterAgentBranchSpec
+	ExplicitTopLevelTransferParentCID string
 }
 
 func pipelineTurnSelectionResult(agentType string, action *PipelineTurnAction, dispatch *pipelineDispatchSelection) map[string]any {
@@ -884,7 +885,13 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 				if err != nil {
 					return nil, err
 				}
-				correlationID, err := dispatchPipelineProtocolTask(ctx, cfg, nextTask, record.Summary)
+				correlationID, err := dispatchPipelineProtocolTaskWithOptions(
+					ctx,
+					cfg,
+					nextTask,
+					record.Summary,
+					pipelineValidationRouteOptions(ctx),
+				)
 				if err != nil {
 					return nil, err
 				}
@@ -1405,6 +1412,9 @@ func dispatchPipelineProtocolTaskWithOptions(
 		branchCtx, branch = BeginInterAgentBranch(ctx, *options.InterAgentBranch)
 		metadata = branch.ApplyMetadata(branchCtx, metadata)
 	}
+	if parentCID := strings.TrimSpace(options.ExplicitTopLevelTransferParentCID); parentCID != "" {
+		metadata = RouteMetadataWithExplicitTopLevelTransfer(branchCtx, metadata, parentCID)
+	}
 	// Pipeline protocol streams should stay on the active requester channel
 	// (typically orchestrator) and let the task router own any user-visible
 	// mirroring. Inheriting an ancestor TUI stream override here duplicates the
@@ -1469,6 +1479,18 @@ func pipelineChallengeRouteOptions(task *PipelineTaskInput, action *PipelineTurn
 			},
 		},
 	}
+}
+
+func pipelineValidationRouteOptions(ctx context.Context) pipelineProtocolRouteOptions {
+	stream, ok := StreamMetadataFromContext(ctx)
+	if !ok {
+		return pipelineProtocolRouteOptions{}
+	}
+	parentCID := strings.TrimSpace(stream.CorrelationID)
+	if parentCID == "" {
+		return pipelineProtocolRouteOptions{}
+	}
+	return pipelineProtocolRouteOptions{ExplicitTopLevelTransferParentCID: parentCID}
 }
 
 func pipelineChallengeToolName(action *PipelineTurnAction) string {

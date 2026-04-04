@@ -584,6 +584,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 		return nil
 	}
 
+	result = agentShared.WrapGlobalReviewTurnResult(ctx, result)
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             true,

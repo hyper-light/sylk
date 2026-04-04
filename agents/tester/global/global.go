@@ -649,8 +649,6 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 		return gt.bus.Publish(gt.channels.Errors, errMsg)
 	}
 
-	resp.Data = result
-
 	// Conversation text is already streamed via chunks — send complete with
 	// empty text so the bridge doesn't duplicate content.
 	completeText := extractTesterUserResponse(result)
@@ -658,6 +656,9 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 		completeText = ""
 	}
 	gt.publishStreamComplete(ctx, completeText, usageAcc.Total())
+
+	result = agentshared.WrapGlobalReviewTurnResult(ctx, result)
+	resp.Data = result
 
 	if gt.agentPod != nil {
 		gt.agentPod.FeedScribe("tester", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)

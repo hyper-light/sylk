@@ -30,46 +30,50 @@ type globalReviewProgress struct {
 	RemainingTaskIDs []string
 }
 
-func (o *Orchestrator) publishOTGlobalFollowupRequestsBestEffort(
+func (o *Orchestrator) publishOTGlobalFollowupRequest(
 	_ context.Context,
 	task *TaskRecord,
 	update *PipelineUpdate,
-	mergeVersion versioning.SemanticVersion,
+	checkpointVersion versioning.SemanticVersion,
 	hadDraft bool,
-) {
-	if o == nil || o.bus == nil || task == nil || update == nil {
-		return
+	reviewCandidateID string,
+) error {
+	if o == nil || task == nil || update == nil {
+		return nil
 	}
-	for _, reviewerType := range []string{"inspector"} {
-		req := o.buildOTGlobalFollowupRequest(task, update, reviewerType, mergeVersion, hadDraft)
-		if req == nil {
-			continue
-		}
-		if err := o.publishUserVisibleFollowupRoute(req); err != nil {
-			o.logWarnMsg("publish OT global follow-up", "task_id", task.ID, "reviewer_type", reviewerType, "error", err)
-			continue
-		}
-		o.publishStandaloneAgentActivity(
-			reviewerType,
-			fmt.Sprintf("Operational Transform queued follow-up for task %s", firstNonEmpty(strings.TrimSpace(task.Name), strings.TrimSpace(task.ID))),
-			events.VisibilityUser,
-			map[string]any{
-				"task_id":     strings.TrimSpace(task.ID),
-				"task_name":   strings.TrimSpace(task.Name),
-				"source":      otGlobalFollowupSource,
-				"reviewer":    reviewerType,
-				"pipeline_id": strings.TrimSpace(task.ID),
-			},
-		)
+	if o.bus == nil {
+		return fmt.Errorf("guide bus is not configured")
 	}
+	reviewerType := "inspector"
+	req := o.buildOTGlobalFollowupRequest(task, update, reviewerType, checkpointVersion, hadDraft, reviewCandidateID)
+	if req == nil {
+		return nil
+	}
+	if err := o.publishUserVisibleFollowupRoute(req); err != nil {
+		return fmt.Errorf("publish OT global follow-up for %s: %w", task.ID, err)
+	}
+	o.publishStandaloneAgentActivity(
+		reviewerType,
+		fmt.Sprintf("Operational Transform queued follow-up for task %s", firstNonEmpty(strings.TrimSpace(task.Name), strings.TrimSpace(task.ID))),
+		events.VisibilityUser,
+		map[string]any{
+			"task_id":     strings.TrimSpace(task.ID),
+			"task_name":   strings.TrimSpace(task.Name),
+			"source":      otGlobalFollowupSource,
+			"reviewer":    reviewerType,
+			"pipeline_id": strings.TrimSpace(task.ID),
+		},
+	)
+	return nil
 }
 
 func (o *Orchestrator) buildOTGlobalFollowupRequest(
 	task *TaskRecord,
 	update *PipelineUpdate,
 	reviewerType string,
-	mergeVersion versioning.SemanticVersion,
+	checkpointVersion versioning.SemanticVersion,
 	hadDraft bool,
+	reviewCandidateID string,
 ) *guide.RouteRequest {
 	if o == nil || task == nil || update == nil {
 		return nil
@@ -85,32 +89,36 @@ func (o *Orchestrator) buildOTGlobalFollowupRequest(
 	progress := o.globalReviewProgress(task)
 	sessionID := firstNonEmpty(strings.TrimSpace(task.SessionID), strings.TrimSpace(stringMapValue(task.Metadata, "session_id")), orchestratorStateSessionID(o), o.SessionID())
 	metadata := map[string]any{
-		"session_id":                  sessionID,
-		"task_id":                     strings.TrimSpace(task.ID),
-		"task_name":                   strings.TrimSpace(task.Name),
-		"task_slug":                   strings.TrimSpace(stringMapValue(task.Metadata, "task_slug")),
-		"plan_id":                     strings.TrimSpace(stringMapValue(task.Metadata, "plan_id")),
-		"plan_file_path":              strings.TrimSpace(stringMapValue(task.Metadata, "plan_file_path")),
-		"agent_type":                  reviewerType,
-		"reviewer_type":               reviewerType,
-		"handoff_source":              otGlobalFollowupSource,
-		"pipeline_agent_type":         strings.TrimSpace(update.AgentType),
-		"pipeline_node_id":            strings.TrimSpace(update.NodeID),
-		"pipeline_task":               false,
-		"global_followup":             true,
-		"ot_handoff_followup":         true,
-		"global_vfs_version":          mergeVersionString(mergeVersion, hadDraft),
-		"affected_files":              taskAffectedPaths(task),
-		"acceptance_evidence":         updateEvidenceRefs(update),
-		"acceptance_summary":          strings.TrimSpace(updateSummary(update)),
-		"task_description":            strings.TrimSpace(task.Description),
-		"global_review_stage":         progress.Stage,
-		"workflow_total_tasks":        progress.TotalTasks,
-		"workflow_completed_tasks":    progress.CompletedTasks,
-		"workflow_failed_tasks":       progress.FailedTasks,
-		"workflow_remaining_tasks":    progress.RemainingTasks,
-		"workflow_completed_task_ids": progress.CompletedTaskIDs,
-		"workflow_remaining_task_ids": progress.RemainingTaskIDs,
+		"session_id":                    sessionID,
+		"task_id":                       strings.TrimSpace(task.ID),
+		"task_name":                     strings.TrimSpace(task.Name),
+		"task_slug":                     strings.TrimSpace(stringMapValue(task.Metadata, "task_slug")),
+		"plan_id":                       strings.TrimSpace(stringMapValue(task.Metadata, "plan_id")),
+		"plan_file_path":                strings.TrimSpace(stringMapValue(task.Metadata, "plan_file_path")),
+		"agent_type":                    reviewerType,
+		"reviewer_type":                 reviewerType,
+		"handoff_source":                otGlobalFollowupSource,
+		"pipeline_agent_type":           strings.TrimSpace(update.AgentType),
+		"pipeline_node_id":              strings.TrimSpace(update.NodeID),
+		"pipeline_task":                 false,
+		"global_followup":               true,
+		"ot_handoff_followup":           true,
+		"serialized_followup_queue_key": globalReviewSerializedQueueKey(sessionID),
+		"global_vfs_version":            mergeVersionString(checkpointVersion, hadDraft),
+		"affected_files":                taskAffectedPaths(task),
+		"acceptance_evidence":           updateEvidenceRefs(update),
+		"acceptance_summary":            strings.TrimSpace(updateSummary(update)),
+		"task_description":              strings.TrimSpace(task.Description),
+		"global_review_stage":           progress.Stage,
+		"workflow_total_tasks":          progress.TotalTasks,
+		"workflow_completed_tasks":      progress.CompletedTasks,
+		"workflow_failed_tasks":         progress.FailedTasks,
+		"workflow_remaining_tasks":      progress.RemainingTasks,
+		"workflow_completed_task_ids":   progress.CompletedTaskIDs,
+		"workflow_remaining_task_ids":   progress.RemainingTaskIDs,
+	}
+	if candidateID := strings.TrimSpace(reviewCandidateID); candidateID != "" {
+		metadata["review_candidate_id"] = candidateID
 	}
 	if sessionDir := strings.TrimSpace(stringMapValue(task.Metadata, "session_dir")); sessionDir != "" {
 		metadata["session_dir"] = sessionDir
@@ -129,7 +137,7 @@ func (o *Orchestrator) buildOTGlobalFollowupRequest(
 	})
 	return &guide.RouteRequest{
 		CorrelationID:   otGlobalFollowupCorrelationID(task, reviewerType, update),
-		Input:           otGlobalFollowupPrompt(task, update, reviewerType, mergeVersion, hadDraft, planText, planFilePath, progress),
+		Input:           otGlobalFollowupPrompt(task, update, reviewerType, checkpointVersion, hadDraft, planText, planFilePath, progress),
 		TargetAgentID:   reviewerType,
 		ExplicitTarget:  true,
 		SourceAgentID:   o.config.AgentID,
@@ -139,6 +147,14 @@ func (o *Orchestrator) buildOTGlobalFollowupRequest(
 		Timestamp:       otGlobalFollowupTimestamp(update),
 		Metadata:        metadata,
 	}
+}
+
+func globalReviewSerializedQueueKey(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		sessionID = "default"
+	}
+	return "global_review:" + sessionID
 }
 
 func (o *Orchestrator) publishUserVisibleFollowupRoute(req *guide.RouteRequest) error {

@@ -118,9 +118,11 @@ type Orchestrator struct {
 
 	mu sync.RWMutex
 
-	pipelinePanelMu         sync.Mutex
-	pipelinePanelState      map[string]pipelinePanelSnapshot
-	pipelinePanelRegistered map[string]struct{}
+	pipelinePanelMu          sync.Mutex
+	pipelinePanelState       map[string]pipelinePanelSnapshot
+	pipelinePanelRegistered  map[string]struct{}
+	checkpointReviewMu       sync.Mutex
+	pendingCheckpointReviews map[string]*pendingCheckpointReview
 
 	// Request lifecycle: runCtx is cancelled in Stop() and serves as parent
 	// for per-request contexts, enabling graceful cancellation.
@@ -184,21 +186,22 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 	hookRegistry := skills.NewHookRegistry()
 
 	o := &Orchestrator{
-		config:                  cfg,
-		state:                   NewState(cfg.SessionID),
-		skills:                  skillsRegistry,
-		hooks:                   hookRegistry,
-		knownAgents:             make(map[string]*guide.AgentAnnouncement),
-		activityPub:             activityPub,
-		sessionVFS:              make(map[string]*versioning.SessionVFS),
-		logger:                  logger,
-		logWAL:                  logCloser,
-		steering:                shared.NewSteeringManager(),
-		requestSerializer:       shared.NewRequestSerializer(),
-		pendingBus:              make(map[string]*shared.PendingSyncWait),
-		dispatchGate:            newDispatchHoldGate(),
-		pipelinePanelState:      make(map[string]pipelinePanelSnapshot),
-		pipelinePanelRegistered: make(map[string]struct{}),
+		config:                   cfg,
+		state:                    NewState(cfg.SessionID),
+		skills:                   skillsRegistry,
+		hooks:                    hookRegistry,
+		knownAgents:              make(map[string]*guide.AgentAnnouncement),
+		activityPub:              activityPub,
+		sessionVFS:               make(map[string]*versioning.SessionVFS),
+		logger:                   logger,
+		logWAL:                   logCloser,
+		steering:                 shared.NewSteeringManager(),
+		requestSerializer:        shared.NewRequestSerializer(),
+		pendingBus:               make(map[string]*shared.PendingSyncWait),
+		dispatchGate:             newDispatchHoldGate(),
+		pipelinePanelState:       make(map[string]pipelinePanelSnapshot),
+		pipelinePanelRegistered:  make(map[string]struct{}),
+		pendingCheckpointReviews: make(map[string]*pendingCheckpointReview),
 	}
 
 	if provider != nil {
@@ -2218,10 +2221,12 @@ func (o *Orchestrator) handlePipelineUpdate(msg *guide.Message) error {
 	}
 
 	if isTerminalStatus(update.Status) {
-		o.finalizePipelineUpdate(update)
-		result := convertPipelineToNodeResult(update)
-		o.dagBridge.NotifyNodeComplete(update.NodeID, result)
-		o.releaseAcceptedPipelineResources(update)
+		deferNodeCompletion := o.finalizePipelineUpdate(update)
+		if !deferNodeCompletion {
+			result := convertPipelineToNodeResult(update)
+			o.dagBridge.NotifyNodeComplete(update.NodeID, result)
+			o.releaseAcceptedPipelineResources(update)
+		}
 	}
 
 	o.pushEvent(&busEvent{

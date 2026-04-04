@@ -1047,6 +1047,12 @@ func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
 	if req.Metadata["chat_nested_branch"] == true {
 		t.Fatalf("validate_work should not stamp nested chat branch metadata: %#v", req.Metadata)
 	}
+	if got, _ := req.Metadata[streamMetadataParentCorrelation].(string); got != "corr-tester" {
+		t.Fatalf("chat_parent_correlation_id = %q, want corr-tester", got)
+	}
+	if got, _ := req.Metadata[streamMetadataTopLevelTransfer].(bool); !got {
+		t.Fatalf("chat_top_level_transfer = %#v, want true", req.Metadata[streamMetadataTopLevelTransfer])
+	}
 	if preserved, _ := req.Metadata["chat_preserve_source_stream_target"].(bool); !preserved {
 		t.Fatalf("chat_preserve_source_stream_target = %#v, want true", req.Metadata["chat_preserve_source_stream_target"])
 	}

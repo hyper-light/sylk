@@ -140,14 +140,18 @@ func (mp *MergePipe) transformSingle(ctx context.Context, op *Operation, against
 }
 
 func (mp *MergePipe) applyTransformedModToGlobal(ctx context.Context, tm transformedFileMod) (*WALFileDelta, error) {
-	current, exists, err := mp.readGlobalDraftContent(ctx, tm.mod.OriginalPath)
+	return applyTransformedModToVFS(ctx, mp.globalVFS, tm)
+}
+
+func applyTransformedModToVFS(ctx context.Context, target *PipelineVFS, tm transformedFileMod) (*WALFileDelta, error) {
+	current, exists, err := readDraftContent(ctx, target, tm.mod.OriginalPath)
 	if err != nil {
 		return nil, err
 	}
 
 	switch tm.mod.Operation {
 	case FileOpMkdir:
-		if err := mp.globalVFS.MkdirAll(ctx, tm.mod.OriginalPath); err != nil && !errors.Is(err, ErrFileExists) {
+		if err := target.MkdirAll(ctx, tm.mod.OriginalPath); err != nil && !errors.Is(err, ErrFileExists) {
 			return nil, err
 		}
 		return &WALFileDelta{
@@ -158,7 +162,7 @@ func (mp *MergePipe) applyTransformedModToGlobal(ctx context.Context, tm transfo
 		if !exists {
 			return nil, nil
 		}
-		if err := mp.globalVFS.Delete(ctx, tm.mod.OriginalPath); err != nil && !errors.Is(err, ErrFileNotFound) {
+		if err := target.Delete(ctx, tm.mod.OriginalPath); err != nil && !errors.Is(err, ErrFileNotFound) {
 			return nil, err
 		}
 		return &WALFileDelta{
@@ -167,28 +171,28 @@ func (mp *MergePipe) applyTransformedModToGlobal(ctx context.Context, tm transfo
 			OldContent: current,
 		}, nil
 	default:
-		target := cloneBytes(current)
+		targetContent := cloneBytes(current)
 		if len(tm.ops) == 0 {
-			target = cloneBytes(tm.mod.NewContent)
+			targetContent = cloneBytes(tm.mod.NewContent)
 		} else {
-			target, err = applyOperationsToContent(current, tm.ops)
+			targetContent, err = applyOperationsToContent(current, tm.ops)
 			if err != nil {
 				return nil, err
 			}
 		}
-		if exists && bytes.Equal(current, target) {
+		if exists && bytes.Equal(current, targetContent) {
 			return nil, nil
 		}
-		if !exists && bytes.Equal(target, nil) && tm.mod.Operation != FileOpCreate {
+		if !exists && bytes.Equal(targetContent, nil) && tm.mod.Operation != FileOpCreate {
 			return nil, nil
 		}
-		if err := mp.globalVFS.Write(ctx, tm.mod.OriginalPath, target); err != nil {
+		if err := target.Write(ctx, tm.mod.OriginalPath, targetContent); err != nil {
 			return nil, err
 		}
 		return &WALFileDelta{
 			Path:       tm.mod.OriginalPath,
 			Op:         walDeltaOpForGlobalWrite(exists),
-			NewContent: target,
+			NewContent: targetContent,
 			OldContent: current,
 		}, nil
 	}
@@ -202,7 +206,11 @@ func walDeltaOpForGlobalWrite(exists bool) WALDeltaOp {
 }
 
 func (mp *MergePipe) readGlobalDraftContent(ctx context.Context, path string) ([]byte, bool, error) {
-	content, err := mp.globalVFS.Read(ctx, path)
+	return readDraftContent(ctx, mp.globalVFS, path)
+}
+
+func readDraftContent(ctx context.Context, target *PipelineVFS, path string) ([]byte, bool, error) {
+	content, err := target.Read(ctx, path)
 	if err == nil {
 		return content, true, nil
 	}
