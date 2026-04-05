@@ -9,7 +9,7 @@ import (
 )
 
 func formatStructuredPayload(agentID string, payload any) (string, bool) {
-	payload = unwrapPipelineTurnPayload(payload)
+	payload = decodeStructuredJSONPayload(payload)
 	if text, ok := formatResponseTextPayload(payload); ok {
 		return text, true
 	}
@@ -98,22 +98,71 @@ func unwrapResponseEnvelope(payload any) any {
 	return envelope["Data"]
 }
 
-func unwrapPipelineTurnPayload(payload any) any {
+func normalizeStructuredPayload(payload any) any {
+	payload = decodeStructuredJSONPayload(payload)
+	payload = unwrapResponseEnvelope(payload)
+	payload = decodeStructuredJSONPayload(payload)
+	return payload
+}
+
+func extractTurnEnvelopeResult(payload any) (any, bool) {
 	values, ok := toMap(payload)
 	if !ok {
-		return payload
+		return payload, false
 	}
 	if result, ok := values["result"]; ok {
 		if _, hasAction := values["action"]; hasAction || values["processed"] != nil {
-			return result
+			return decodeStructuredJSONPayload(result), true
 		}
 	}
 	if result, ok := values["Result"]; ok {
 		if _, hasAction := values["Action"]; hasAction || values["Processed"] != nil {
-			return result
+			return decodeStructuredJSONPayload(result), true
 		}
 	}
-	return payload
+	if _, hasAction := values["action"]; hasAction {
+		return nil, true
+	}
+	if _, hasAction := values["Action"]; hasAction {
+		return nil, true
+	}
+	if values["processed"] != nil || values["Processed"] != nil {
+		return nil, true
+	}
+	return payload, false
+}
+
+func decodeStructuredJSONPayload(payload any) any {
+	switch typed := payload.(type) {
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if len(trimmed) == 0 {
+			return payload
+		}
+		if trimmed[0] != '{' && trimmed[0] != '[' {
+			return payload
+		}
+		var decoded any
+		if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+			return payload
+		}
+		return decoded
+	case []byte:
+		trimmed := strings.TrimSpace(string(typed))
+		if len(trimmed) == 0 {
+			return payload
+		}
+		if trimmed[0] != '{' && trimmed[0] != '[' {
+			return payload
+		}
+		var decoded any
+		if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+			return payload
+		}
+		return decoded
+	default:
+		return payload
+	}
 }
 
 func looksLikeResponseEnvelope(values map[string]any) bool {

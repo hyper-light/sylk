@@ -269,6 +269,7 @@ func completeStreamingWithWatchdog(
 	firstVisibleChunk := false
 	streamedText := false
 	sawChunks := false
+	suppressThoughtProgress := suppressIntermediateThinkingNarration(progressNarrationAgentType(ctx))
 	emitter := NewThoughtEmitter(llmruntime.EmitsThoughts(req))
 	collector := providers.NewStreamCollector(func(chunk *providers.StreamChunk) {
 		if chunk == nil {
@@ -300,7 +301,7 @@ func completeStreamingWithWatchdog(
 				cancel()
 				firstVisibleChunk = true
 			}
-			if pp != nil {
+			if pp != nil && !suppressThoughtProgress {
 				if thought := emitter.AddDelta(chunk.Text); thought != "" {
 					pp.Publish(thought)
 				}
@@ -321,7 +322,7 @@ func completeStreamingWithWatchdog(
 			streamErr = fmt.Errorf("stream error: %s", chunk.Text)
 		}
 	}
-	if pp != nil {
+	if pp != nil && !suppressThoughtProgress {
 		if thought := emitter.Flush(); thought != "" {
 			pp.Publish(thought)
 		}

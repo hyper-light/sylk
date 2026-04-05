@@ -2456,6 +2456,11 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 	if info == nil {
 		return fmt.Errorf("routing info is nil")
 	}
+	var err error
+	info, err = normalizeRoutingInfo(info)
+	if err != nil {
+		return err
+	}
 	if isInternalSidecarRoutingInfo(info) {
 		return nil
 	}
@@ -2540,7 +2545,9 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 // subscribeToAgentChannels subscribes to an agent's response and error channels
 func (g *Guide) subscribeToAgentChannels(agentID string, channels *AgentChannels) (*agentSubscriptions, error) {
 	// Subscribe to responses channel
-	respSub, err := g.bus.Subscribe(channels.Responses, g.handleResponseMessage)
+	respSub, err := g.bus.Subscribe(channels.Responses, func(msg *Message) error {
+		return g.handleResponseMessage(g.normalizeChannelOwnedMessage(agentID, msg))
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to subscribe to %s: %w", channels.Responses, err)
 	}
@@ -2566,6 +2573,11 @@ func (g *Guide) subscribeToAgentChannels(agentID string, channels *AgentChannels
 func (g *Guide) PreRegister(info *AgentRoutingInfo) error {
 	if info == nil {
 		return fmt.Errorf("routing info is nil")
+	}
+	var err error
+	info, err = normalizeRoutingInfo(info)
+	if err != nil {
+		return err
 	}
 	if isInternalSidecarRoutingInfo(info) {
 		return nil
@@ -4618,7 +4630,7 @@ func filteredRelayContextMetadata(metadata map[string]any) map[string]any {
 	filtered := make(map[string]any, len(metadata))
 	for key, value := range metadata {
 		switch strings.TrimSpace(key) {
-		case "agent_type", "agent_name", "runtime_agent_id":
+		case "agent_type", "agent_name", "runtime_agent_id", metadataVisibleTarget:
 			continue
 		default:
 			filtered[key] = value
@@ -4687,15 +4699,39 @@ func (g *Guide) applyResponderIdentityMetadata(metadata map[string]any, responde
 
 func (g *Guide) relayResponseMetadata(pending *PendingRequest, resp *RouteResponse) map[string]any {
 	metadata := map[string]any{"_guide_relayed": true}
-	if pending != nil && pending.Request != nil {
-		for key, value := range filteredRelayContextMetadata(pending.Request.Metadata) {
-			metadata[key] = value
-		}
+	for key, value := range g.mergedRelayContextMetadata(pending) {
+		metadata[key] = value
 	}
 	if resp == nil {
 		return metadata
 	}
 	return g.applyResponderIdentityMetadata(metadata, resp.RespondingAgentID, resp.RespondingAgentName, "")
+}
+
+func (g *Guide) mergedRelayContextMetadata(pending *PendingRequest) map[string]any {
+	if pending == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, 4)
+	var walk func(*PendingRequest) map[string]any
+	walk = func(current *PendingRequest) map[string]any {
+		if current == nil || current.Request == nil {
+			return nil
+		}
+		if correlationID := strings.TrimSpace(current.CorrelationID); correlationID != "" {
+			if _, exists := seen[correlationID]; exists {
+				return nil
+			}
+			seen[correlationID] = struct{}{}
+		}
+		merged := map[string]any(nil)
+		parentID := strings.TrimSpace(current.Request.ParentCorrelationID)
+		if parentID != "" {
+			merged = walk(g.pendingForCorrelation(parentID))
+		}
+		return mergeMetadata(merged, filteredRelayContextMetadata(current.Request.Metadata))
+	}
+	return walk(pending)
 }
 
 func cloneMetadata(metadata map[string]any) map[string]any {
@@ -4726,7 +4762,25 @@ func mergeMetadata(base, overlay map[string]any) map[string]any {
 		}
 		merged[key] = value
 	}
+	merged = normalizeExclusiveChatTransferMetadata(merged)
 	return merged
+}
+
+func normalizeExclusiveChatTransferMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return metadata
+	}
+	if metadataBoolean(metadata, "chat_top_level_transfer") {
+		delete(metadata, metadataNestedBranch)
+		delete(metadata, "chat_parent_tool_call_key")
+		delete(metadata, "chat_inter_agent_thread_key")
+		delete(metadata, metadataInterAgentKind)
+		return metadata
+	}
+	if metadataBoolean(metadata, metadataNestedBranch) {
+		delete(metadata, "chat_top_level_transfer")
+	}
+	return metadata
 }
 
 func metadataValueCarriesContinuity(value any) bool {
@@ -4764,10 +4818,7 @@ func (g *Guide) pendingForCorrelation(correlationID string) *PendingRequest {
 
 func (g *Guide) mergedStreamRelayMetadata(correlationID, responderID, responderName string, current map[string]any) map[string]any {
 	pending := g.pendingForCorrelation(correlationID)
-	var base map[string]any
-	if pending != nil && pending.Request != nil {
-		base = filteredRelayContextMetadata(pending.Request.Metadata)
-	}
+	base := g.mergedRelayContextMetadata(pending)
 	merged := mergeMetadata(base, current)
 	if strings.TrimSpace(responderID) == "" {
 		return merged

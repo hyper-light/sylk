@@ -98,11 +98,17 @@ func (a *Archivalist) requestConsultationWithMetadata(
 		ExplicitTarget:  true,
 		Metadata:        shared.CloneMetadataMap(metadata),
 	}
+	admission := shared.AdmitConsultation(ctx, target, query, req.Metadata)
+	if !admission.Allowed {
+		return archivalistFailedConsultEvidence(target, query, scope, "", shared.ConsultationAdmissionError(admission)), nil
+	}
+	req.Metadata = admission.Metadata
 	response, err := shared.RequestGuideRouteSync(ctx, shared.GuideRouteSyncRequest{
 		Bus:           a.bus,
 		ResponseTopic: archivalistResponseTopic(a),
 		Request:       req,
 	})
+	shared.RecordConsultationOutcome(ctx, admission.AttemptID, err == nil, shared.ConsultationDataFromMessage(response), err)
 	if err != nil {
 		return archivalistFailedConsultEvidence(target, query, scope, req.CorrelationID, err), err
 	}

@@ -193,3 +193,25 @@ func TestDeriveInterAgentToolEvent_PipelineValidationFlow(t *testing.T) {
 		t.Fatalf("pipeline process status = %q", got)
 	}
 }
+
+func TestNormalizeInterAgentToolEventForEmit_PipelineChallengeCanonicalizesTesterLabel(t *testing.T) {
+	meta := NormalizeInterAgentToolEventForEmit(
+		"challenge_agent",
+		`{"target_agents":["tester"],"request":"Audit the pipeline results."}`,
+		"",
+		ToolCallStart,
+		false,
+		"",
+		nil,
+		map[string]any{
+			"agent_type":  "inspector-pipeline",
+			"pipeline_id": "task_1",
+		},
+	)
+	if meta == nil {
+		t.Fatal("expected normalized inter-agent metadata")
+	}
+	if got := meta.AgentTypes; len(got) != 1 || got[0] != "tester-pipeline" {
+		t.Fatalf("agent types = %#v, want [tester-pipeline]", got)
+	}
+}

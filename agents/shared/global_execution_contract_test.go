@@ -73,6 +73,20 @@ func TestAppendGlobalExecutionGuidance_IncludesDerivedDeliverables(t *testing.T)
 	}
 }
 
+func TestAppendGlobalExecutionGuidance_InspectorGlobalIsSurfaceFirst(t *testing.T) {
+	contract := BuildGlobalExecutionContract("inspector-global", guide.IntentCheck, "Audit the merged auth flow changes against the plan.")
+	prompt := AppendGlobalExecutionGuidance("", contract, "inspector-global")
+	for _, want := range []string{
+		"Start with the changed files, directly affected interfaces, and current tester or protocol evidence.",
+		"expand to adjacent files, broader plan context, or specialist consults only when a concrete unresolved risk requires it",
+		"Pending planned work is a compatibility contract",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q", want)
+		}
+	}
+}
+
 func hasGlobalDeliverable(values []GlobalExecutionDeliverable, want GlobalExecutionDeliverable) bool {
 	for _, value := range values {
 		if value == want {

@@ -419,13 +419,15 @@ func buildGlobalReviewSnapshotAfterChallenge(base *GlobalReviewSnapshot, action 
 	snapshot.PendingChallenge = nil
 	if action.CreatesChallenge {
 		snapshot.PendingChallenge = &GlobalReviewChallenge{
-			ID:              strings.TrimSpace(action.ChallengeID),
-			RequestingAgent: normalizeGlobalReviewAgent(action.AgentType),
-			TargetAgent:     normalizeGlobalReviewAgent(action.TargetAgent),
-			Reason:          strings.TrimSpace(action.Reason),
-			Request:         strings.TrimSpace(action.Request),
-			RequiredOutput:  append([]string(nil), action.RequiredOutput...),
-			References:      append([]string(nil), action.References...),
+			ID:                strings.TrimSpace(action.ChallengeID),
+			RequestingAgent:   normalizeGlobalReviewAgent(action.AgentType),
+			RequestingAgentID: strings.TrimSpace(action.AgentID),
+			TargetAgent:       normalizeGlobalReviewAgent(action.TargetAgent),
+			TargetAgentID:     strings.TrimSpace(action.TargetAgentID),
+			Reason:            strings.TrimSpace(action.Reason),
+			Request:           strings.TrimSpace(action.Request),
+			RequiredOutput:    append([]string(nil), action.RequiredOutput...),
+			References:        append([]string(nil), action.References...),
 		}
 	}
 	appendGlobalReviewEvent(snapshot, GlobalReviewEvent{

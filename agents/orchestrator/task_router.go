@@ -64,8 +64,8 @@ type TaskRouter struct {
 	pending   map[string]*pendingRoute // correlationID → pending
 
 	visibleMu sync.Mutex
-	visible   map[string]*visibleRoute // root correlationID → mirrored user-visible route
-	// descendant correlationID → root mirrored user-visible route correlationID
+	visible   map[string]*visibleRoute // root correlationID → visible route state
+	// descendant correlationID → root visible route correlationID
 	visibleDescendants map[string]string
 
 	followupMu     sync.Mutex
@@ -86,8 +86,6 @@ type pendingRoute struct {
 }
 
 type visibleRoute struct {
-	agentType          string
-	targetAgentID      string
 	serializedFollowup bool
 	queueKey           string
 	metadata           map[string]any
@@ -219,9 +217,9 @@ func (r *TaskRouter) RouteWithLifecycle(task *PipelineTask, done <-chan struct{}
 	})
 }
 
-// PublishUserVisibleRoute publishes a direct Guide route request and mirrors the
-// resulting stream/terminal responses onto the TUI response topic so the chat
-// panel sees the full conversation.
+// PublishUserVisibleRoute publishes a direct Guide route request whose UI
+// visibility is owned by Guide-delivered stream/terminal traffic instead of
+// router-side chat mirroring.
 func (r *TaskRouter) PublishUserVisibleRoute(req *guide.RouteRequest) error {
 	if r == nil {
 		return fmt.Errorf("task router is not configured")
@@ -242,6 +240,7 @@ func (r *TaskRouter) publishVisibleRouteNow(req *guide.RouteRequest) error {
 	if r == nil || req == nil {
 		return fmt.Errorf("route request is required")
 	}
+	req.Metadata = guide.MetadataWithVisibleTarget(req.Metadata, r.streamMirrorTargetID)
 
 	corrID := strings.TrimSpace(req.CorrelationID)
 	if corrID == "" {
@@ -447,7 +446,7 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 		if r.mirrorStreamToUser(msg) {
 			return true
 		}
-		if r.mirrorVisibleRouteStreamToUser(msg) {
+		if r.consumeVisibleRouteStream(msg) {
 			return true
 		}
 		return r.mirrorProtocolStreamToUser(msg)
@@ -461,7 +460,7 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 	pr := r.pending[msg.CorrelationID]
 	if pr == nil || pr.closed {
 		r.pendingMu.Unlock()
-		if r.mirrorVisibleRouteTerminalToUser(msg) {
+		if r.consumeVisibleRouteTerminal(msg) {
 			return true
 		}
 		if r.consumeProtocolTerminal(msg) {
@@ -548,8 +547,6 @@ func cloneVisibleRoute(route *visibleRoute) *visibleRoute {
 		return nil
 	}
 	return &visibleRoute{
-		agentType:          route.agentType,
-		targetAgentID:      route.targetAgentID,
 		serializedFollowup: route.serializedFollowup,
 		queueKey:           route.queueKey,
 		metadata:           cloneMetadata(route.metadata),
@@ -671,42 +668,11 @@ func visibleRouteFromRequest(req *guide.RouteRequest) *visibleRoute {
 	if req == nil {
 		return nil
 	}
-	metadata := cloneMetadata(req.Metadata)
-	if metadata == nil {
-		metadata = make(map[string]any, 4)
-	}
-	agentType := metadataString(metadata, "agent_type")
-	if agentType == "" {
-		agentType = strings.TrimSpace(req.TargetAgentID)
-		if agentType != "" {
-			metadata["agent_type"] = agentType
-		}
-	}
 	return &visibleRoute{
-		agentType:          agentType,
-		targetAgentID:      strings.TrimSpace(req.TargetAgentID),
 		serializedFollowup: routeRequiresSerializedFollowup(req),
 		queueKey:           visibleFollowupQueueKey(req),
-		metadata:           metadata,
+		metadata:           cloneMetadata(req.Metadata),
 	}
-}
-
-func enrichVisibleRouteMetadata(route *visibleRoute, metadata map[string]any) map[string]any {
-	if route == nil {
-		return metadata
-	}
-	if metadata == nil {
-		metadata = make(map[string]any, len(route.metadata)+1)
-	}
-	for key, value := range route.metadata {
-		if _, exists := metadata[key]; !exists {
-			metadata[key] = value
-		}
-	}
-	if _, ok := metadata["agent_type"]; !ok && strings.TrimSpace(route.agentType) != "" {
-		metadata["agent_type"] = strings.TrimSpace(route.agentType)
-	}
-	return metadata
 }
 
 func (r *TaskRouter) mirrorStreamToUser(msg *guide.Message) bool {
@@ -766,7 +732,7 @@ func (r *TaskRouter) mirrorStreamToUser(msg *guide.Message) bool {
 	return true
 }
 
-func (r *TaskRouter) mirrorVisibleRouteStreamToUser(msg *guide.Message) bool {
+func (r *TaskRouter) consumeVisibleRouteStream(msg *guide.Message) bool {
 	if msg == nil || msg.CorrelationID == "" {
 		return false
 	}
@@ -774,48 +740,15 @@ func (r *TaskRouter) mirrorVisibleRouteStreamToUser(msg *guide.Message) bool {
 	if !ok || stream == nil || stream.Event == nil {
 		return false
 	}
-	route, rootCorrID := r.visibleRouteForStream(msg.CorrelationID, stream.Metadata)
-	if route == nil {
+	_, rootCorrID := r.visibleRouteForStream(msg.CorrelationID, stream.Metadata)
+	if rootCorrID == "" {
 		return false
-	}
-	if r.streamMirrorTargetID == "" || r.bus == nil {
-		return true
-	}
-
-	mirrored := &guide.StreamResponse{
-		CorrelationID:       stream.CorrelationID,
-		RespondingAgentID:   firstNonEmpty(stream.RespondingAgentID, msg.SourceAgentID, strings.TrimSpace(route.agentType)),
-		RespondingAgentName: firstNonEmpty(stream.RespondingAgentName, agentshared.AgentDisplayName(route.agentType)),
-		TargetAgentID:       r.streamMirrorTargetID,
-		Metadata:            enrichVisibleRouteMetadata(route, cloneMetadata(stream.Metadata)),
-		Event:               cloneStreamEvent(stream.Event),
-	}
-	mirroredMsg := &guide.Message{
-		ID:            generateMessageID(),
-		CorrelationID: mirrored.CorrelationID,
-		Type:          guide.MessageTypeStream,
-		Payload:       mirrored,
-		SourceAgentID: mirrored.RespondingAgentID,
-		TargetAgentID: r.streamMirrorTargetID,
-		Timestamp:     time.Now(),
-	}
-	if err := r.bus.Publish(guide.TopicResponses(r.streamMirrorTargetID, r.streamMirrorTargetID), mirroredMsg); err != nil {
-		r.logger.Warn("mirror visible route stream to user", "correlation_id", msg.CorrelationID, "error", err)
-		r.logTrace("task_router_visible_stream_mirror_failed", "warn", agentlog.EventError, msg.CorrelationID, map[string]any{
-			"mirror_target":   r.streamMirrorTargetID,
-			"source_agent_id": msg.SourceAgentID,
-			"agent_type":      route.agentType,
-			"error":           err.Error(),
-		})
-		return true
 	}
 	if stream.Event.Type == guide.StreamEventComplete || stream.Event.Type == guide.StreamEventError {
 		r.clearVisibleDescendant(msg.CorrelationID, rootCorrID)
 	}
-	r.logTrace("task_router_visible_stream_mirrored", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, map[string]any{
-		"mirror_target":   r.streamMirrorTargetID,
+	r.logTrace("task_router_visible_stream_observed", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, map[string]any{
 		"source_agent_id": msg.SourceAgentID,
-		"agent_type":      route.agentType,
 		"visible_root":    rootCorrID,
 	})
 	return true
@@ -842,7 +775,7 @@ func (r *TaskRouter) mirrorProtocolStreamToUser(msg *guide.Message) bool {
 
 	mirrored := &guide.StreamResponse{
 		CorrelationID:       stream.CorrelationID,
-		RespondingAgentID:   firstNonEmpty(stream.RespondingAgentID, routeTargetAgentID(task)),
+		RespondingAgentID:   mirroredStreamResponderID(stream, msg, routeTargetAgentID(task), task.AgentType),
 		RespondingAgentName: firstNonEmpty(stream.RespondingAgentName, task.AgentType),
 		TargetAgentID:       r.streamMirrorTargetID,
 		Metadata:            enrichMirroredStreamMetadata(task, cloneMetadata(stream.Metadata)),
@@ -873,7 +806,7 @@ func (r *TaskRouter) mirrorProtocolStreamToUser(msg *guide.Message) bool {
 	return true
 }
 
-func (r *TaskRouter) mirrorVisibleRouteTerminalToUser(msg *guide.Message) bool {
+func (r *TaskRouter) consumeVisibleRouteTerminal(msg *guide.Message) bool {
 	if msg == nil || msg.CorrelationID == "" {
 		return false
 	}
@@ -881,7 +814,7 @@ func (r *TaskRouter) mirrorVisibleRouteTerminalToUser(msg *guide.Message) bool {
 	if route == nil {
 		return false
 	}
-	resp := mirroredVisibleRouteResponse(msg, route)
+	resp := visibleRouteResponse(msg)
 	if resp == nil {
 		return false
 	}
@@ -898,25 +831,8 @@ func (r *TaskRouter) mirrorVisibleRouteTerminalToUser(msg *guide.Message) bool {
 	if r.onVisibleRouteTerminal != nil {
 		r.onVisibleRouteTerminal(rootCorrID, cloneMetadata(route.metadata), resp)
 	}
-	if r.streamMirrorTargetID == "" || r.bus == nil {
-		return true
-	}
-	mirrored := guide.NewResponseMessage(generateMessageID(), resp)
-	mirrored.TargetAgentID = r.streamMirrorTargetID
-	if err := r.bus.Publish(guide.TopicResponses(r.streamMirrorTargetID, r.streamMirrorTargetID), mirrored); err != nil {
-		r.logger.Warn("mirror visible route terminal to user", "correlation_id", msg.CorrelationID, "error", err)
-		r.logTrace("task_router_visible_terminal_mirror_failed", "warn", agentlog.EventError, msg.CorrelationID, map[string]any{
-			"mirror_target":   r.streamMirrorTargetID,
-			"source_agent_id": msg.SourceAgentID,
-			"agent_type":      route.agentType,
-			"error":           err.Error(),
-		})
-		return true
-	}
-	r.logTrace("task_router_visible_terminal_mirrored", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, map[string]any{
-		"mirror_target":   r.streamMirrorTargetID,
+	r.logTrace("task_router_visible_terminal_observed", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, map[string]any{
 		"source_agent_id": msg.SourceAgentID,
-		"agent_type":      route.agentType,
 		"success":         resp.Success,
 	})
 	return true
@@ -957,7 +873,7 @@ func (r *TaskRouter) advanceSerializedFollowupRoute(route *visibleRoute, corrID 
 	if r == nil || route == nil || !route.serializedFollowup {
 		return
 	}
-	queueKey := firstNonEmpty(route.queueKey, route.targetAgentID, route.agentType)
+	queueKey := strings.TrimSpace(route.queueKey)
 	if queueKey == "" {
 		return
 	}
@@ -998,31 +914,72 @@ func (r *TaskRouter) advanceSerializedFollowupRoute(route *visibleRoute, corrID 
 	}
 }
 
-func mirroredVisibleRouteResponse(msg *guide.Message, route *visibleRoute) *guide.RouteResponse {
+func visibleRouteResponse(msg *guide.Message) *guide.RouteResponse {
 	if msg == nil {
 		return nil
 	}
 	if resp, ok := msg.GetRouteResponse(); ok && resp != nil {
-		return &guide.RouteResponse{
-			CorrelationID:       resp.CorrelationID,
-			Success:             resp.Success,
-			Data:                resp.Data,
-			Error:               resp.Error,
-			RespondingAgentID:   firstNonEmpty(resp.RespondingAgentID, msg.SourceAgentID, strings.TrimSpace(route.agentType)),
-			RespondingAgentName: firstNonEmpty(resp.RespondingAgentName, agentshared.AgentDisplayName(route.agentType)),
-			ProcessingTime:      resp.ProcessingTime,
-		}
+		cloned := *resp
+		return &cloned
 	}
 	if errText, ok := msg.GetError(); ok {
 		return &guide.RouteResponse{
-			CorrelationID:       msg.CorrelationID,
-			Success:             false,
-			Error:               errText,
-			RespondingAgentID:   firstNonEmpty(msg.SourceAgentID, strings.TrimSpace(route.agentType)),
-			RespondingAgentName: agentshared.AgentDisplayName(route.agentType),
+			CorrelationID:     msg.CorrelationID,
+			Success:           false,
+			Error:             errText,
+			RespondingAgentID: strings.TrimSpace(msg.SourceAgentID),
 		}
 	}
 	return nil
+}
+
+func mirroredStreamResponderID(stream *guide.StreamResponse, msg *guide.Message, fallbackTargetAgentID, fallbackAgentType string) string {
+	if stream != nil {
+		if responderID := strings.TrimSpace(stream.RespondingAgentID); responderID != "" {
+			return responderID
+		}
+		if runtimeID := strings.TrimSpace(metadataString(stream.Metadata, "runtime_agent_id")); runtimeID != "" {
+			return runtimeID
+		}
+	}
+	return mirroredTerminalResponderID("", msg, fallbackTargetAgentID, fallbackAgentType)
+}
+
+func mirroredTerminalResponderID(explicitResponderID string, msg *guide.Message, fallbackTargetAgentID, fallbackAgentType string) string {
+	if responderID := strings.TrimSpace(explicitResponderID); responderID != "" {
+		return responderID
+	}
+	if runtimeID := strings.TrimSpace(messageMetadataString(msg, "runtime_agent_id")); runtimeID != "" {
+		return runtimeID
+	}
+	if sourceID := mirroredMessageSourceAgentID(msg, fallbackAgentType); sourceID != "" {
+		return sourceID
+	}
+	if fallbackTargetAgentID = strings.TrimSpace(fallbackTargetAgentID); fallbackTargetAgentID != "" {
+		return fallbackTargetAgentID
+	}
+	return ""
+}
+
+func mirroredMessageSourceAgentID(msg *guide.Message, fallbackAgentType string) string {
+	if msg == nil {
+		return ""
+	}
+	sourceID := strings.TrimSpace(msg.SourceAgentID)
+	if sourceID == "" || strings.EqualFold(sourceID, "guide") {
+		return ""
+	}
+	if fallbackAgentType = strings.TrimSpace(fallbackAgentType); fallbackAgentType != "" && strings.EqualFold(sourceID, fallbackAgentType) {
+		return ""
+	}
+	return sourceID
+}
+
+func messageMetadataString(msg *guide.Message, key string) string {
+	if msg == nil {
+		return ""
+	}
+	return metadataString(msg.Metadata, key)
 }
 
 func protocolTaskFromStreamMetadata(stream *guide.StreamResponse) *PipelineTask {

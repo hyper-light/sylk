@@ -20,8 +20,9 @@ const (
 
 // ConversationResult holds the response from a conversational interaction.
 type ConversationResult struct {
-	Response string `json:"response"`
-	Intent   string `json:"intent"`
+	Response  string                   `json:"response"`
+	Intent    string                   `json:"intent"`
+	Directive *guide.ResponseDirective `json:"directive,omitempty"`
 }
 
 // ResponseText implements the guide-layer responseTexter interface so the
@@ -31,6 +32,13 @@ func (r *ConversationResult) ResponseText() string {
 		return ""
 	}
 	return r.Response
+}
+
+func (r *ConversationResult) ResponseDirective() *guide.ResponseDirective {
+	if r == nil {
+		return nil
+	}
+	return r.Directive
 }
 
 // handleConversation processes conversational requests. Static meta queries
@@ -174,10 +182,23 @@ func buildInspectorConversationPrompt(fwd *guide.ForwardedRequest) string {
 
 // extractInspectorUserResponse returns the human-readable text from a result.
 func extractInspectorUserResponse(data any) string {
-	if cr, ok := data.(*ConversationResult); ok && cr != nil {
-		return cr.Response
+	type responseTexter interface {
+		ResponseText() string
+	}
+	if rt, ok := data.(responseTexter); ok && rt != nil {
+		return rt.ResponseText()
 	}
 	return ""
+}
+
+func extractInspectorResponseDirective(data any) *guide.ResponseDirective {
+	type directiveCarrier interface {
+		ResponseDirective() *guide.ResponseDirective
+	}
+	if carrier, ok := data.(directiveCarrier); ok && carrier != nil {
+		return carrier.ResponseDirective()
+	}
+	return nil
 }
 
 // isStreamedInspectorConversation reports whether the result was a streamed

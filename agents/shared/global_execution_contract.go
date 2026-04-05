@@ -175,7 +175,11 @@ func roleSpecificGlobalGuidance(contract *GlobalExecutionContract, role string) 
 		if contract.Mode == GlobalExecutionModeRecall {
 			return []string{"- This request is recall-oriented. Summarize plan, diff, or audit context rather than issuing a blocking quality judgment unless the request explicitly asks for it."}
 		}
-		return []string{"- This request is audit-oriented. Compare cross-file changes against the plan, gather concrete findings, and make a judgment that matches the requested deliverables."}
+		return []string{
+			"- This request is audit-oriented. Start with the changed files, directly affected interfaces, and current tester or protocol evidence.",
+			"- Judge against merged and pending plan obligations, but expand to adjacent files, broader plan context, or specialist consults only when a concrete unresolved risk requires it.",
+			"- Pending planned work is a compatibility contract: verify the current change does not block, contradict, or mis-shape future tasks. Do not reopen unrelated pending tasks that this change does not affect.",
+		}
 	default:
 		return nil
 	}

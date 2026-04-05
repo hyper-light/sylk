@@ -116,3 +116,29 @@ func TestBuildInterAgentStartRecord_UsesApprovalMetadata(t *testing.T) {
 		t.Fatalf("agent types = %#v, want [guardian]", got)
 	}
 }
+
+func TestBuildInterAgentStartRecord_PipelineChallengeNormalizesTesterLabel(t *testing.T) {
+	record, ok := buildInterAgentStartRecord(msg.ToolCallEventMsg{
+		CorrelationID: "corr-pipeline",
+		ToolCallKey:   "challenge-pipeline-1",
+		ToolName:      "challenge_agent",
+		AgentType:     "inspector-pipeline",
+		PipelineID:    "task_1",
+		FullArgs:      `{"target_agents":["tester"],"request":"Audit the pipeline results."}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:   "challenge",
+			Status: "pending",
+		},
+	})
+	if !ok {
+		t.Fatal("expected pipeline challenge start record")
+	}
+	if record.InterAgent == nil {
+		t.Fatal("expected inter-agent row")
+	}
+	if got := record.InterAgent.AgentTypes; len(got) != 1 || got[0] != "tester-pipeline" {
+		t.Fatalf("agent types = %#v, want [tester-pipeline]", got)
+	}
+}

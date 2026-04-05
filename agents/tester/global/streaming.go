@@ -103,14 +103,13 @@ func (gt *GlobalTester) publishStreamChunk(ctx context.Context, text string) {
 	})
 }
 
-func (gt *GlobalTester) publishStreamComplete(ctx context.Context, userResponse string, usage *guide.StreamUsage) {
+func (gt *GlobalTester) publishStreamComplete(ctx context.Context, userResponse string, usage *guide.StreamUsage, directive *guide.ResponseDirective) {
 	event := &guide.StreamEvent{
 		Type:      guide.StreamEventComplete,
+		Text:      strings.TrimSpace(userResponse),
 		Usage:     usage,
+		Directive: directive,
 		Timestamp: time.Now(),
-	}
-	if trimmed := strings.TrimSpace(userResponse); trimmed != "" {
-		event.Data = map[string]string{"user_response": trimmed}
 	}
 	gt.publishStreamEvent(ctx, event)
 }

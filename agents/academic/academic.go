@@ -119,6 +119,7 @@ type Academic struct {
 
 	// Outcome tracking for maturity-aware recommendations
 	outcomeHistory *OutcomeHistory
+	webSearchModel *academicWebSearchLearner
 
 	// External fetch pipeline — wired via SetFetchPipeline after construction.
 	fetchPipeline *fetch.Pipeline
@@ -240,6 +241,7 @@ func New(cfg Config, provider academicProvider) (*Academic, error) {
 		researchCache:   make(map[string]*ResearchResult),
 		sourceIndex:     make(map[string]*Source),
 		outcomeHistory:  NewOutcomeHistory(cfg.OutcomeHistoryLimit),
+		webSearchModel:  newAcademicWebSearchLearner(),
 		steering:        shared.NewSteeringManager(),
 		forestTracker:   shared.NewMemoryForestTracker(),
 		workspaceViews:  authority.RestrictWorkspaceViews("academic", cfg.WorkspaceViews),
@@ -1662,6 +1664,10 @@ func (a *Academic) requestConsultation(
 		TargetAgentID: target,
 		SessionID:     sessionID,
 	}
+	admission := shared.AdmitConsultation(ctx, target, query, req.Metadata)
+	if !admission.Allowed {
+		return failedConsultEvidence(target, query, scope, "", shared.ConsultationAdmissionError(admission)), nil
+	}
 	branchCtx, branch := shared.BeginInterAgentBranch(ctx, shared.InterAgentBranchSpec{
 		Kind:       shared.InterAgentToolEventKindConsult,
 		ToolName:   "consult_" + strings.ReplaceAll(strings.TrimSpace(target), "-", "_"),
@@ -1673,8 +1679,9 @@ func (a *Academic) requestConsultation(
 			"scope":  scope,
 		},
 	})
-	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
+	req.Metadata = branch.ApplyMetadata(branchCtx, admission.Metadata)
 	response, err := a.requestConsultSync(branchCtx, req)
+	shared.RecordConsultationOutcome(branchCtx, admission.AttemptID, err == nil, shared.ConsultationDataFromMessage(response), err)
 	branch.CompleteFromMessage(branchCtx, response, err)
 	if err != nil {
 		if shared.IsAgentBusyError(err) {

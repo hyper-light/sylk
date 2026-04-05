@@ -66,23 +66,29 @@ func newResponseTestGuide(t *testing.T) (*Guide, chan *Message) {
 }
 
 func setPendingRoute(g *Guide, correlationID string) {
-	setPendingRouteWithTargetAndMetadata(g, correlationID, "academic", nil)
+	setPendingRouteWithSourceTargetAndMetadata(g, correlationID, "tui", "academic", "", nil)
 }
 
 func setPendingRouteWithMetadata(g *Guide, correlationID string, metadata map[string]any) {
-	setPendingRouteWithTargetAndMetadata(g, correlationID, "academic", metadata)
+	setPendingRouteWithSourceTargetAndMetadata(g, correlationID, "tui", "academic", "", metadata)
 }
 
 func setPendingRouteWithTargetAndMetadata(g *Guide, correlationID, targetAgentID string, metadata map[string]any) {
+	setPendingRouteWithSourceTargetAndMetadata(g, correlationID, "tui", targetAgentID, "", metadata)
+}
+
+func setPendingRouteWithSourceTargetAndMetadata(g *Guide, correlationID, sourceAgentID, targetAgentID, parentCorrelationID string, metadata map[string]any) {
 	g.pending.Set(correlationID, &PendingRequest{
-		CorrelationID: correlationID,
-		SourceAgentID: "tui",
-		TargetAgentID: targetAgentID,
+		CorrelationID:        correlationID,
+		SourceAgentID:        sourceAgentID,
+		TargetAgentID:        targetAgentID,
+		StreamTargetOverride: metadataVisibleTargetValue(metadata),
 		Request: &RouteRequest{
-			CorrelationID: correlationID,
-			SessionID:     "test-session",
-			SourceAgentID: "tui",
-			Metadata:      metadata,
+			CorrelationID:       correlationID,
+			ParentCorrelationID: parentCorrelationID,
+			SessionID:           "test-session",
+			SourceAgentID:       sourceAgentID,
+			Metadata:            metadata,
 		},
 		CreatedAt: time.Now(),
 		ExpiresAt: time.Now().Add(DefaultPendingStoreConfig().DefaultTimeout),
@@ -173,6 +179,88 @@ func TestGuideSelfResponseMetadataDoesNotLeakTargetIdentity(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for relayed guide route response")
+	}
+}
+
+func TestHandleResponseMessage_RelaysAncestorVisibleMetadataToTUI(t *testing.T) {
+	g, tuiOut := newResponseTestGuide(t)
+	rootCID := g.pending.Add(&RouteRequest{
+		CorrelationID: "corr-visible-root",
+		Input:         "audit root",
+		SourceAgentID: "orchestrator",
+		TargetAgentID: "inspector",
+		SessionID:     "test-session",
+		Metadata: map[string]any{
+			metadataVisibleTarget: "tui",
+			"task_id":             "task-123",
+			"task_name":           "Hello CLI",
+			"task_slug":           "hello-cli",
+		},
+	}, nil, "inspector")
+	childCID := g.pending.Add(&RouteRequest{
+		CorrelationID:       "corr-visible-child",
+		ParentCorrelationID: rootCID,
+		Input:               "consult academic",
+		SourceAgentID:       "inspector",
+		TargetAgentID:       "academic",
+		SessionID:           "test-session",
+		Metadata: map[string]any{
+			"chat_nested_branch":         true,
+			"chat_parent_correlation_id": rootCID,
+			"chat_parent_tool_call_key":  "consult-academic-1",
+			"chat_inter_agent_kind":      "consult",
+		},
+	}, nil, "academic")
+
+	if err := g.handleResponseMessage(&Message{
+		ID:            "msg-visible-child-progress",
+		CorrelationID: childCID,
+		Type:          MessageTypeStream,
+		SourceAgentID: "academic",
+		Payload: &StreamResponse{
+			CorrelationID:     childCID,
+			RespondingAgentID: "academic",
+			Metadata: map[string]any{
+				"agent_type": "academic",
+			},
+			Event: &StreamEvent{
+				Type: StreamEventProgress,
+				Data: &ProgressData{Message: "Gathering stronger alternatives"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("handleResponseMessage: %v", err)
+	}
+
+	select {
+	case msg := <-tuiOut:
+		stream, ok := msg.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatal("expected relayed visible child stream")
+		}
+		if got := stream.TargetAgentID; got != "tui" {
+			t.Fatalf("target_agent_id = %q, want tui", got)
+		}
+		if got := stream.Metadata["task_id"]; got != "task-123" {
+			t.Fatalf("stream metadata task_id = %#v, want task-123", got)
+		}
+		if got := stream.Metadata["task_name"]; got != "Hello CLI" {
+			t.Fatalf("stream metadata task_name = %#v, want Hello CLI", got)
+		}
+		if got := stream.Metadata["task_slug"]; got != "hello-cli" {
+			t.Fatalf("stream metadata task_slug = %#v, want hello-cli", got)
+		}
+		if got := stream.Metadata["chat_parent_correlation_id"]; got != rootCID {
+			t.Fatalf("stream metadata chat_parent_correlation_id = %#v, want %s", got, rootCID)
+		}
+		if got := stream.Metadata["chat_parent_tool_call_key"]; got != "consult-academic-1" {
+			t.Fatalf("stream metadata chat_parent_tool_call_key = %#v, want consult-academic-1", got)
+		}
+		if got := stream.Metadata["chat_inter_agent_kind"]; got != "consult" {
+			t.Fatalf("stream metadata chat_inter_agent_kind = %#v, want consult", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for relayed visible child stream")
 	}
 }
 

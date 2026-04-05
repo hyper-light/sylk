@@ -1362,6 +1362,120 @@ func TestGuideBridgeDispatch_RemembersNestedBranchMetadataAcrossIncompleteEvents
 	}
 }
 
+func TestMergeStreamMetadata_TopLevelTransferClearsNestedBranch(t *testing.T) {
+	merged := mergeStreamMetadata(
+		map[string]any{
+			"agent_type":                  "tester-pipeline",
+			"chat_nested_branch":          true,
+			"chat_parent_correlation_id":  "corr-nested-parent",
+			"chat_parent_tool_call_key":   "challenge-1",
+			"chat_inter_agent_thread_key": "pipeline:task_1-challenge-1",
+			"chat_inter_agent_kind":       "challenge",
+		},
+		map[string]any{
+			"chat_top_level_transfer":    true,
+			"chat_parent_correlation_id": "corr-top-level-parent",
+		},
+	)
+
+	if merged == nil {
+		t.Fatal("expected merged metadata")
+	}
+	if got, _ := merged["chat_top_level_transfer"].(bool); !got {
+		t.Fatalf("chat_top_level_transfer = %#v, want true", merged["chat_top_level_transfer"])
+	}
+	if got, _ := merged["chat_parent_correlation_id"].(string); got != "corr-top-level-parent" {
+		t.Fatalf("chat_parent_correlation_id = %q, want corr-top-level-parent", got)
+	}
+	if _, exists := merged["chat_nested_branch"]; exists {
+		t.Fatalf("chat_nested_branch = %#v, want absent", merged["chat_nested_branch"])
+	}
+	if _, exists := merged["chat_parent_tool_call_key"]; exists {
+		t.Fatalf("chat_parent_tool_call_key = %#v, want absent", merged["chat_parent_tool_call_key"])
+	}
+	if _, exists := merged["chat_inter_agent_thread_key"]; exists {
+		t.Fatalf("chat_inter_agent_thread_key = %#v, want absent", merged["chat_inter_agent_thread_key"])
+	}
+	if _, exists := merged["chat_inter_agent_kind"]; exists {
+		t.Fatalf("chat_inter_agent_kind = %#v, want absent", merged["chat_inter_agent_kind"])
+	}
+}
+
+func TestParseInterAgentBranchRefFromMetadata_TopLevelTransferWins(t *testing.T) {
+	ref := parseInterAgentBranchRefFromMetadata(map[string]any{
+		"chat_nested_branch":         true,
+		"chat_top_level_transfer":    true,
+		"chat_parent_correlation_id": "corr-parent",
+		"chat_parent_tool_call_key":  "challenge-1",
+		"chat_inter_agent_kind":      "challenge",
+	})
+	if ref != nil {
+		t.Fatalf("parseInterAgentBranchRefFromMetadata() = %+v, want nil for explicit top-level transfer", ref)
+	}
+}
+
+func TestGuideBridgeDispatch_TopLevelTransferOverridesRememberedNestedMetadata(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatch(&guide.Message{
+		CorrelationID: "corr-remembered-transition",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "corr-remembered-transition",
+			RespondingAgentID: "runtime-tester",
+			Metadata: map[string]any{
+				"agent_type":                 "tester-pipeline",
+				"task_id":                    "task_1",
+				"chat_nested_branch":         true,
+				"chat_parent_correlation_id": "corr-nested-parent",
+				"chat_parent_tool_call_key":  "challenge-1",
+				"chat_inter_agent_kind":      "challenge",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Working the nested branch."},
+			},
+		},
+	}, program)
+
+	b.dispatch(&guide.Message{
+		CorrelationID: "corr-remembered-transition",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     "corr-remembered-transition",
+			RespondingAgentID: "runtime-tester",
+			Metadata: map[string]any{
+				"agent_type":                 "tester-pipeline",
+				"task_id":                    "task_1",
+				"chat_top_level_transfer":    true,
+				"chat_parent_correlation_id": "corr-top-level-parent",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Returning to the top-level turn."},
+			},
+		},
+	}, program)
+
+	if len(program.messages) != 3 {
+		t.Fatalf("expected synthetic start + first progress + second progress, got %d messages", len(program.messages))
+	}
+	progress, ok := program.messages[2].(uimsg.StreamProgressMsg)
+	if !ok {
+		t.Fatalf("expected final message to be StreamProgressMsg, got %#v", program.messages[2])
+	}
+	if progress.BranchRef != nil {
+		t.Fatalf("progress.BranchRef = %+v, want nil after explicit top-level transfer", progress.BranchRef)
+	}
+	if !progress.TopLevelTransfer {
+		t.Fatal("expected top-level transfer marker on remembered metadata transition")
+	}
+	if progress.ParentCorrelationID != "corr-top-level-parent" {
+		t.Fatalf("progress.ParentCorrelationID = %q, want corr-top-level-parent", progress.ParentCorrelationID)
+	}
+}
+
 func TestParseStreamMessages_PreserveRawKnowledgeReplicaIdentity(t *testing.T) {
 	stream := &guide.StreamResponse{
 		CorrelationID:     "corr-knowledge-replica",
@@ -1939,6 +2053,63 @@ func TestRouteResponseContent_SuppressesEmptyResponseTextPayload(t *testing.T) {
 	}
 	if got := routeResponseContent(resp); got != "" {
 		t.Fatalf("routeResponseContent() = %q, want empty string", got)
+	}
+}
+
+func TestRouteResponseContent_SuppressesStringifiedWrappedEmptyConversationResult(t *testing.T) {
+	resp := &guide.RouteResponse{
+		RespondingAgentID: "tester",
+		Data: `{
+			"result": {
+				"response": "",
+				"intent": "check"
+			},
+			"action": {
+				"Type": "challenge",
+				"AgentType": "inspector",
+				"TargetAgent": "architect"
+			}
+		}`,
+	}
+	if got := routeResponseContent(resp); got != "" {
+		t.Fatalf("routeResponseContent() = %q, want empty string", got)
+	}
+}
+
+func TestStreamCompleteContent_SuppressesStringifiedWrappedEmptyConversationResult(t *testing.T) {
+	payload := `{
+		"result": {
+			"response": "",
+			"intent": "check"
+		},
+		"action": {
+			"Type": "challenge",
+			"AgentType": "inspector",
+			"TargetAgent": "architect"
+		}
+	}`
+	if got := streamCompleteContent("tester", payload); got != "" {
+		t.Fatalf("streamCompleteContent() = %q, want empty string", got)
+	}
+}
+
+func TestRouteResponseContent_RendersInnerStringifiedWrappedConversationResult(t *testing.T) {
+	resp := &guide.RouteResponse{
+		RespondingAgentID: "tester",
+		Data: `{
+			"result": {
+				"response": "Checkpoint is acceptable as-is.",
+				"intent": "check"
+			},
+			"action": {
+				"Type": "challenge",
+				"AgentType": "inspector",
+				"TargetAgent": "architect"
+			}
+		}`,
+	}
+	if got := routeResponseContent(resp); got != "Checkpoint is acceptable as-is." {
+		t.Fatalf("routeResponseContent() = %q, want inner response text", got)
 	}
 }
 

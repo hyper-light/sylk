@@ -241,16 +241,24 @@ func (gt *GlobalTester) executeToolCall(ctx context.Context, call providers.Tool
 	if !json.Valid([]byte(raw)) {
 		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
+	var input map[string]any
+	if err := json.Unmarshal([]byte(raw), &input); err != nil {
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
+	}
 	correlationID := agentshared.LogMetaFromContext(ctx).CorrID
 	if correlationID == "" {
 		correlationID = gt.id + "-local"
 	}
-	return gt.toolRuntime().Execute(ctx, toolruntime.Invocation{
+	result, err := gt.toolRuntime().Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
 		AgentID:         gt.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: gt.toolRuntime().CapabilityScope(),
 	})
+	if err == nil {
+		agentshared.RecordGlobalExecutionSuccess(ctx, name, input, result.Output)
+	}
+	return result, err
 }
 
 // prepareSkillsForInput progressively loads skills relevant to the user's

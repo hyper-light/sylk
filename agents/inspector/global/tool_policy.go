@@ -24,6 +24,7 @@ func globalInspectorVisibleSkillNames() []string {
 		"run_command",
 		"run_shell_script",
 		"audit_layer",
+		"determine_audit_depth",
 		"challenge_agent",
 		"handoff_next",
 		"validate_work",

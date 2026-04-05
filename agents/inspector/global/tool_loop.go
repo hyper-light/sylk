@@ -90,6 +90,22 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		agentShared.PublishIntermediateToolTurn(gi.bus, gi.channels, ctx, gi.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
+			if auditDepthRequired(ctx) {
+				gi.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: fmt.Sprintf(
+						"Before any other global audit work, call `%s` first and use its returned depth for your own assessment and for any compatible knowledge consults.",
+						determineAuditDepthToolName,
+					),
+				})
+				continue
+			}
 			if err := agentShared.ValidateGlobalReviewCompletion(ctx, "inspector"); err != nil {
 				gi.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
 				req.Messages = append(req.Messages, providers.Message{
@@ -164,6 +180,19 @@ func (gi *GlobalInspector) applyToolCalls(
 	resp *providers.Response,
 ) (int, bool, bool, string) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
+	initialDepthRequired := auditDepthRequired(ctx)
+	if initialDepthRequired && len(resp.ToolCalls) > 0 && strings.TrimSpace(resp.ToolCalls[0].Name) != determineAuditDepthToolName {
+		first := resp.ToolCalls[0]
+		req.Messages = append(req.Messages, providers.Message{
+			Role:       providers.RoleTool,
+			ToolCallID: first.ID,
+			ToolName:   first.Name,
+			Content:    shared.ToolErrorPayload(auditDepthGateViolation(resp)),
+			IsError:    true,
+		})
+		agentShared.AppendSkippedToolResults(req, resp.ToolCalls[1:], "determine_audit_depth must run first on a new global audit branch")
+		return 1, false, false, ""
+	}
 
 	errCount := 0
 	rerouted := false
@@ -216,6 +245,10 @@ func (gi *GlobalInspector) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
+		if initialDepthRequired && idx == 0 && strings.TrimSpace(call.Name) == determineAuditDepthToolName && len(resp.ToolCalls) > 1 {
+			agentShared.AppendSkippedToolResults(req, resp.ToolCalls[idx+1:], "wait for determine_audit_depth to resolve the branch audit contract before taking further audit actions")
+			break
+		}
 		if rerouted || delegated || agentShared.GlobalReviewTurnTerminated(ctx) {
 			agentShared.AppendSkippedToolResults(req, resp.ToolCalls[idx+1:], "a previous tool call in this assistant turn already completed or redirected the global review decision")
 			break

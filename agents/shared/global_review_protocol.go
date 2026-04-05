@@ -60,19 +60,23 @@ const (
 )
 
 type GlobalReviewChallenge struct {
-	ID              string   `json:"id"`
-	RequestingAgent string   `json:"requesting_agent"`
-	TargetAgent     string   `json:"target_agent"`
-	Reason          string   `json:"reason,omitempty"`
-	Request         string   `json:"request,omitempty"`
-	RequiredOutput  []string `json:"required_output,omitempty"`
-	References      []string `json:"references,omitempty"`
+	ID                string   `json:"id"`
+	RequestingAgent   string   `json:"requesting_agent"`
+	RequestingAgentID string   `json:"requesting_agent_id,omitempty"`
+	TargetAgent       string   `json:"target_agent"`
+	TargetAgentID     string   `json:"target_agent_id,omitempty"`
+	Reason            string   `json:"reason,omitempty"`
+	Request           string   `json:"request,omitempty"`
+	RequiredOutput    []string `json:"required_output,omitempty"`
+	References        []string `json:"references,omitempty"`
 }
 
 type GlobalReviewValidationRecord struct {
 	ChallengeID           string   `json:"challenge_id"`
 	RequestingAgent       string   `json:"requesting_agent"`
+	RequestingAgentID     string   `json:"requesting_agent_id,omitempty"`
 	RespondingAgent       string   `json:"responding_agent"`
+	RespondingAgentID     string   `json:"responding_agent_id,omitempty"`
 	Status                string   `json:"status"`
 	Summary               string   `json:"summary"`
 	ChallengeRequest      string   `json:"challenge_request,omitempty"`
@@ -110,7 +114,9 @@ type GlobalReviewValidationProcessing struct {
 type GlobalReviewTurnAction struct {
 	Type             GlobalReviewActionType
 	AgentType        string
+	AgentID          string
 	TargetAgent      string
+	TargetAgentID    string
 	CreatesChallenge bool
 	Reason           string
 	Request          string
@@ -143,6 +149,8 @@ type GlobalReviewRouteConfig struct {
 
 type GlobalReviewProtocolSkillConfig struct {
 	AgentType      func() string
+	AgentID        func() string
+	ResolveTarget  func(agentType string) string
 	Route          GlobalReviewRouteConfig
 	WorkspaceViews func() versioning.WorkspaceViewAccess
 }
@@ -157,6 +165,9 @@ func WithGlobalReviewState(ctx context.Context, state *GlobalReviewState) contex
 }
 
 func WithGlobalReviewContext(ctx context.Context, metadata map[string]any) context.Context {
+	if GlobalReviewStateFromContext(ctx) != nil {
+		return ctx
+	}
 	if metadata == nil {
 		metadata = map[string]any{}
 	}
@@ -291,6 +302,15 @@ func (s *GlobalReviewState) BaseMetadata() map[string]any {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return cloneGlobalReviewMetadata(s.baseMetadata)
+}
+
+func (s *GlobalReviewState) SetBaseMetadata(metadata map[string]any) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.baseMetadata = cloneGlobalReviewMetadata(metadata)
 }
 
 func (s *GlobalReviewState) setTerminalAction(action *GlobalReviewTurnAction) error {
@@ -505,7 +525,9 @@ func globalReviewChallengeAgentSkill(cfg GlobalReviewProtocolSkillConfig) *skill
 			action := &GlobalReviewTurnAction{
 				Type:             GlobalReviewActionChallenge,
 				AgentType:        normalizeGlobalReviewAgent(globalReviewAgentType(ctx, cfg)),
+				AgentID:          globalReviewAgentID(ctx, cfg),
 				TargetAgent:      target,
+				TargetAgentID:    globalReviewResolveTargetAgentID(cfg, target),
 				CreatesChallenge: true,
 				Reason:           strings.TrimSpace(params.Reason),
 				Request:          strings.TrimSpace(params.Request),
@@ -543,7 +565,9 @@ func globalReviewHandoffNextSkill(cfg GlobalReviewProtocolSkillConfig) *skills.S
 			action := &GlobalReviewTurnAction{
 				Type:           GlobalReviewActionHandoff,
 				AgentType:      normalizeGlobalReviewAgent(globalReviewAgentType(ctx, cfg)),
+				AgentID:        globalReviewAgentID(ctx, cfg),
 				TargetAgent:    target,
+				TargetAgentID:  globalReviewResolveTargetAgentID(cfg, target),
 				Reason:         strings.TrimSpace(params.Reason),
 				Request:        strings.TrimSpace(params.Request),
 				RequiredOutput: normalizeStringList(params.RequiredOutput),
@@ -580,11 +604,20 @@ func issueGlobalReviewSelection(
 	if err := validateGlobalReviewSelection(action); err != nil {
 		return nil, err
 	}
+	if strings.TrimSpace(action.AgentID) == "" {
+		return nil, fmt.Errorf("global review routing requires the exact current agent id; missing current agent identity")
+	}
+	if strings.TrimSpace(action.TargetAgentID) == "" {
+		return nil, fmt.Errorf("global review routing requires the exact target agent id for %s", strings.TrimSpace(action.TargetAgent))
+	}
 	if strings.TrimSpace(action.Reason) == "" {
 		return nil, fmt.Errorf("reason is required")
 	}
 	if strings.TrimSpace(action.Request) == "" {
 		return nil, fmt.Errorf("request is required")
+	}
+	if err := ValidateGlobalTesterHandoffEvidence(ctx, action); err != nil {
+		return nil, err
 	}
 	if snapshot := state.Snapshot(); snapshot != nil && snapshot.PendingValidation != nil {
 		return nil, fmt.Errorf("process the pending validation before issuing another global review challenge")
@@ -605,7 +638,9 @@ func issueGlobalReviewSelection(
 	return map[string]any{
 		"selected":          true,
 		"agent_type":        action.AgentType,
+		"agent_id":          action.AgentID,
 		"target_agent":      action.TargetAgent,
+		"target_agent_id":   action.TargetAgentID,
 		"target_agents":     []string{action.TargetAgent},
 		"creates_challenge": action.CreatesChallenge,
 		"challenge_id":      strings.TrimSpace(action.ChallengeID),
@@ -694,6 +729,10 @@ func globalReviewValidateWorkSkill(cfg GlobalReviewProtocolSkillConfig) *skills.
 			if respondingAgent == "" {
 				return nil, fmt.Errorf("global review responding agent is unavailable")
 			}
+			respondingAgentID := strings.TrimSpace(globalReviewAgentID(ctx, cfg))
+			if respondingAgentID == "" {
+				return nil, fmt.Errorf("global review validation requires the exact responding agent id")
+			}
 			if normalizeGlobalReviewAgent(challenge.TargetAgent) != respondingAgent {
 				return nil, fmt.Errorf("the active global-review challenge is not assigned to %s", respondingAgent)
 			}
@@ -715,7 +754,9 @@ func globalReviewValidateWorkSkill(cfg GlobalReviewProtocolSkillConfig) *skills.
 			record := &GlobalReviewValidationRecord{
 				ChallengeID:           challenge.ID,
 				RequestingAgent:       requestingAgent,
+				RequestingAgentID:     globalReviewExactChallengeRequestingAgentID(challenge),
 				RespondingAgent:       respondingAgent,
+				RespondingAgentID:     respondingAgentID,
 				Status:                status,
 				Summary:               summary,
 				ChallengeRequest:      strings.TrimSpace(challenge.Request),
@@ -740,16 +781,19 @@ func globalReviewValidateWorkSkill(cfg GlobalReviewProtocolSkillConfig) *skills.
 				return nil, err
 			}
 			return map[string]any{
-				"validated":        true,
-				"challenge_id":     record.ChallengeID,
-				"requesting_agent": record.RequestingAgent,
-				"responding_agent": record.RespondingAgent,
-				"status":           record.Status,
-				"protocol_scope":   globalReviewNamespace,
-				"thread_key":       globalReviewThreadPrefix + strings.TrimSpace(record.ChallengeID),
-				"forwarded":        true,
-				"correlation_id":   correlationID,
-				"target_agent":     requestingAgent,
+				"validated":           true,
+				"challenge_id":        record.ChallengeID,
+				"requesting_agent":    record.RequestingAgent,
+				"requesting_agent_id": record.RequestingAgentID,
+				"responding_agent":    record.RespondingAgent,
+				"responding_agent_id": record.RespondingAgentID,
+				"status":              record.Status,
+				"protocol_scope":      globalReviewNamespace,
+				"thread_key":          globalReviewThreadPrefix + strings.TrimSpace(record.ChallengeID),
+				"forwarded":           true,
+				"correlation_id":      correlationID,
+				"target_agent":        requestingAgent,
+				"target_agent_id":     record.RequestingAgentID,
 			}, nil
 		}).
 		Build()
@@ -904,7 +948,9 @@ func globalReviewFinalizeSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skil
 			action := &GlobalReviewTurnAction{
 				Type:             GlobalReviewActionChallenge,
 				AgentType:        GlobalReviewAgentInspector,
+				AgentID:          globalReviewAgentID(ctx, cfg),
 				TargetAgent:      GlobalReviewAgentTester,
+				TargetAgentID:    globalReviewResolveTargetAgentID(cfg, GlobalReviewAgentTester),
 				CreatesChallenge: true,
 				Reason:           globalReviewFinalizeReason(finalWholePlanReview),
 				Request:          globalReviewFinalizeRequest(finalWholePlanReview),
@@ -969,6 +1015,7 @@ func globalReviewAcceptCheckpointSkill(cfg GlobalReviewProtocolSkillConfig) *ski
 			action := &GlobalReviewTurnAction{
 				Type:      GlobalReviewActionAccept,
 				AgentType: GlobalReviewAgentInspector,
+				AgentID:   globalReviewAgentID(ctx, cfg),
 				Summary:   summary,
 			}
 			if err := state.recordCheckpointAccepted(ctx, action); err != nil {
@@ -1030,7 +1077,7 @@ func globalReviewCommitToDiskSkill(cfg GlobalReviewProtocolSkillConfig) *skills.
 			authReq := commandapproval.Request{
 				Command:        fmt.Sprintf("commit_to_disk --reason %q", summary),
 				ToolName:       "commit_to_disk",
-				AgentID:        GlobalReviewAgentInspector,
+				AgentID:        firstNonEmpty(globalReviewAgentID(ctx, cfg), GlobalReviewAgentInspector),
 				AgentType:      GlobalReviewAgentInspector,
 				SessionID:      versioning.SessionIDFromContext(ctx),
 				ApprovalPolicy: commandapproval.ApprovalPolicyExact,
@@ -1049,6 +1096,7 @@ func globalReviewCommitToDiskSkill(cfg GlobalReviewProtocolSkillConfig) *skills.
 			action := &GlobalReviewTurnAction{
 				Type:      GlobalReviewActionCommit,
 				AgentType: GlobalReviewAgentInspector,
+				AgentID:   globalReviewAgentID(ctx, cfg),
 				Summary:   summary,
 			}
 			if err := state.recordCommitToDisk(ctx, action); err != nil {
@@ -1057,6 +1105,7 @@ func globalReviewCommitToDiskSkill(cfg GlobalReviewProtocolSkillConfig) *skills.
 			if err := state.setTerminalAction(&GlobalReviewTurnAction{
 				Type:      GlobalReviewActionCommit,
 				AgentType: GlobalReviewAgentInspector,
+				AgentID:   globalReviewAgentID(ctx, cfg),
 				Summary:   summary,
 			}); err != nil {
 				return nil, err
@@ -1101,7 +1150,8 @@ func dispatchGlobalReviewSelection(
 			ThreadKey:     globalReviewThreadPrefix + strings.TrimSpace(action.ChallengeID),
 			SuccessStatus: InterAgentToolEventStatusPending,
 			Args: map[string]any{
-				"target_agent":   strings.TrimSpace(action.TargetAgent),
+				"target_agent":   strings.TrimSpace(action.TargetAgentID),
+				"target_type":    strings.TrimSpace(action.TargetAgent),
 				"challenge_id":   strings.TrimSpace(action.ChallengeID),
 				"request":        action.Request,
 				"protocol_scope": globalReviewNamespace,
@@ -1120,7 +1170,7 @@ func dispatchGlobalReviewSelection(
 		CorrelationID:       correlationID,
 		ParentCorrelationID: strings.TrimSpace(stream.CorrelationID),
 		Input:               prompt,
-		TargetAgentID:       strings.TrimSpace(action.TargetAgent),
+		TargetAgentID:       strings.TrimSpace(action.TargetAgentID),
 		ExplicitTarget:      true,
 		SourceAgentID:       sourceAgentID,
 		SourceAgentName:     sourceAgentID,
@@ -1132,7 +1182,7 @@ func dispatchGlobalReviewSelection(
 		branch.Complete(branchCtx, "", "", err)
 		return nil, fmt.Errorf("publish global review handoff: %w", err)
 	}
-	publishGlobalReviewReroute(bus, ctx, action.AgentType, action.TargetAgent, action.Request, correlationID)
+	publishGlobalReviewReroute(bus, ctx, action.AgentType, action.AgentID, action.TargetAgent, action.TargetAgentID, action.Request, correlationID)
 	return &globalReviewDispatchSelection{CorrelationID: correlationID}, nil
 }
 
@@ -1159,7 +1209,8 @@ func dispatchGlobalReviewValidation(
 		Summary:    record.Summary,
 		ThreadKey:  globalReviewThreadPrefix + strings.TrimSpace(record.ChallengeID),
 		Args: map[string]any{
-			"target_agent":   strings.TrimSpace(record.RequestingAgent),
+			"target_agent":   strings.TrimSpace(record.RequestingAgentID),
+			"target_type":    strings.TrimSpace(record.RequestingAgent),
 			"challenge_id":   strings.TrimSpace(record.ChallengeID),
 			"summary":        record.Summary,
 			"protocol_scope": globalReviewNamespace,
@@ -1177,7 +1228,7 @@ func dispatchGlobalReviewValidation(
 		CorrelationID:       correlationID,
 		ParentCorrelationID: strings.TrimSpace(stream.CorrelationID),
 		Input:               prompt,
-		TargetAgentID:       strings.TrimSpace(record.RequestingAgent),
+		TargetAgentID:       strings.TrimSpace(record.RequestingAgentID),
 		ExplicitTarget:      true,
 		SourceAgentID:       sourceAgentID,
 		SourceAgentName:     sourceAgentID,
@@ -1189,7 +1240,7 @@ func dispatchGlobalReviewValidation(
 		branch.Complete(branchCtx, "", "", err)
 		return "", fmt.Errorf("publish global review validation: %w", err)
 	}
-	publishGlobalReviewReroute(bus, ctx, record.RespondingAgent, record.RequestingAgent, record.Summary, correlationID)
+	publishGlobalReviewReroute(bus, ctx, record.RespondingAgent, record.RespondingAgentID, record.RequestingAgent, record.RequestingAgentID, record.Summary, correlationID)
 	return correlationID, nil
 }
 
@@ -1244,13 +1295,15 @@ func buildGlobalReviewHandoffSnapshot(state *GlobalReviewState, action *GlobalRe
 	snapshot.PendingChallenge = nil
 	if action.CreatesChallenge {
 		snapshot.PendingChallenge = &GlobalReviewChallenge{
-			ID:              strings.TrimSpace(action.ChallengeID),
-			RequestingAgent: normalizeGlobalReviewAgent(action.AgentType),
-			TargetAgent:     normalizeGlobalReviewAgent(action.TargetAgent),
-			Reason:          strings.TrimSpace(action.Reason),
-			Request:         strings.TrimSpace(action.Request),
-			RequiredOutput:  append([]string(nil), action.RequiredOutput...),
-			References:      append([]string(nil), action.References...),
+			ID:                strings.TrimSpace(action.ChallengeID),
+			RequestingAgent:   normalizeGlobalReviewAgent(action.AgentType),
+			RequestingAgentID: strings.TrimSpace(action.AgentID),
+			TargetAgent:       normalizeGlobalReviewAgent(action.TargetAgent),
+			TargetAgentID:     strings.TrimSpace(action.TargetAgentID),
+			Reason:            strings.TrimSpace(action.Reason),
+			Request:           strings.TrimSpace(action.Request),
+			RequiredOutput:    append([]string(nil), action.RequiredOutput...),
+			References:        append([]string(nil), action.References...),
 		}
 	}
 	appendGlobalReviewEvent(snapshot, GlobalReviewEvent{
@@ -1581,7 +1634,11 @@ func intAny(metadata map[string]any, key string) int {
 	}
 }
 
-func publishGlobalReviewReroute(bus guide.EventBus, ctx context.Context, fromAgent, toAgent, reason, newCorrelationID string) {
+func publishGlobalReviewReroute(
+	bus guide.EventBus,
+	ctx context.Context,
+	fromAgentType, fromAgentID, toAgentType, toAgentID, reason, newCorrelationID string,
+) {
 	if bus == nil {
 		return
 	}
@@ -1589,11 +1646,14 @@ func publishGlobalReviewReroute(bus guide.EventBus, ctx context.Context, fromAge
 	if !ok || strings.TrimSpace(stream.CorrelationID) == "" || strings.TrimSpace(newCorrelationID) == "" {
 		return
 	}
-	PublishStreamEvent(bus, guide.NewAgentChannels(strings.TrimSpace(normalizeGlobalReviewAgent(fromAgent)), strings.TrimSpace(normalizeGlobalReviewAgent(fromAgent))), ctx, strings.TrimSpace(normalizeGlobalReviewAgent(fromAgent)), &guide.StreamEvent{
+	fromType := strings.TrimSpace(normalizeGlobalReviewAgent(fromAgentType))
+	fromID := firstNonEmpty(strings.TrimSpace(fromAgentID), fromType)
+	toID := firstNonEmpty(strings.TrimSpace(toAgentID), strings.TrimSpace(normalizeGlobalReviewAgent(toAgentType)))
+	PublishStreamEvent(bus, guide.NewAgentChannels(fromType, fromID), ctx, fromID, &guide.StreamEvent{
 		Type: guide.StreamEventReroute,
 		Data: map[string]string{
-			"from_agent":              strings.TrimSpace(normalizeGlobalReviewAgent(fromAgent)),
-			"to_agent":                strings.TrimSpace(normalizeGlobalReviewAgent(toAgent)),
+			"from_agent":              fromID,
+			"to_agent":                toID,
 			"reason":                  firstNonEmpty(strings.TrimSpace(reason), "global review handoff"),
 			"original_correlation_id": strings.TrimSpace(stream.CorrelationID),
 			"new_correlation_id":      strings.TrimSpace(newCorrelationID),
@@ -1607,6 +1667,35 @@ func globalReviewAgentType(ctx context.Context, cfg GlobalReviewProtocolSkillCon
 		return normalizeGlobalReviewAgent(cfg.AgentType())
 	}
 	return ""
+}
+
+func globalReviewAgentID(ctx context.Context, cfg GlobalReviewProtocolSkillConfig) string {
+	if cfg.AgentID != nil {
+		if agentID := strings.TrimSpace(cfg.AgentID()); agentID != "" {
+			return agentID
+		}
+	}
+	if meta := LogMetaFromContext(ctx); strings.TrimSpace(meta.AgentID) != "" {
+		return strings.TrimSpace(meta.AgentID)
+	}
+	return globalReviewAgentType(ctx, cfg)
+}
+
+func globalReviewResolveTargetAgentID(cfg GlobalReviewProtocolSkillConfig, agentType string) string {
+	normalized := normalizeGlobalReviewAgent(agentType)
+	if cfg.ResolveTarget != nil {
+		if agentID := strings.TrimSpace(cfg.ResolveTarget(normalized)); agentID != "" {
+			return agentID
+		}
+	}
+	return strings.TrimSpace(normalized)
+}
+
+func globalReviewExactChallengeRequestingAgentID(challenge *GlobalReviewChallenge) string {
+	if challenge == nil {
+		return ""
+	}
+	return firstNonEmpty(strings.TrimSpace(challenge.RequestingAgentID), strings.TrimSpace(challenge.RequestingAgent))
 }
 
 func globalReviewVisibleSourceAgentID(stream StreamContext) string {

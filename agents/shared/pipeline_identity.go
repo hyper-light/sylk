@@ -1,6 +1,10 @@
 package shared
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/google/uuid"
+)
 
 // TaskScopedRoutingName returns the deterministic routing name for a
 // task-scoped pipeline worker. This is a stable address for the task pod,
@@ -18,6 +22,21 @@ func TaskScopedRoutingName(taskSlug, taskID, agentType string) string {
 		return base
 	}
 	return base + "-" + agentType
+}
+
+// PipelineWorkerCanonicalID returns the stable logical worker identity for a
+// task-scoped pipeline worker. This ID is used for direct agent-to-agent
+// communication and survives container restarts or handoff replacements for
+// the same logical worker.
+func PipelineWorkerCanonicalID(sessionID, taskID, agentType string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	taskID = strings.TrimSpace(taskID)
+	agentType = strings.TrimSpace(agentType)
+	if taskID == "" || agentType == "" {
+		return ""
+	}
+	seed := "sylk:pipeline-worker:" + sessionID + ":" + taskID + ":" + agentType
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(seed)).String()
 }
 
 // PipelineWorkerRoutingTarget returns the explicit routing target for a

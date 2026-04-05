@@ -95,7 +95,7 @@ func TestGoogleConvertMessages_RestoresThoughtSignatureFromRawProviderData(t *te
 	}
 }
 
-func TestGoogleConvertMessages_SkipsReplayPartsWithoutData(t *testing.T) {
+func TestGoogleConvertMessages_PreservesThoughtSignatureOnlyReplayParts(t *testing.T) {
 	g := &GoogleProvider{}
 	raw := &googleSerializableContent{
 		Role: "model",
@@ -121,14 +121,55 @@ func TestGoogleConvertMessages_SkipsReplayPartsWithoutData(t *testing.T) {
 	if len(contents) != 1 {
 		t.Fatalf("got %d contents, want 1", len(contents))
 	}
-	if len(contents[0].Parts) != 1 {
-		t.Fatalf("got %d parts, want 1", len(contents[0].Parts))
+	if len(contents[0].Parts) != 2 {
+		t.Fatalf("got %d parts, want 2", len(contents[0].Parts))
 	}
-	if contents[0].Parts[0].FunctionCall == nil {
-		t.Fatal("expected surviving part to be a function call")
+	if !bytes.Equal(contents[0].Parts[0].ThoughtSignature, []byte("sig-only")) {
+		t.Fatalf("thought signature = %q, want %q", string(contents[0].Parts[0].ThoughtSignature), "sig-only")
 	}
-	if contents[0].Parts[0].FunctionCall.Name != "default_api:clarify" {
-		t.Fatalf("function call name = %q, want %q", contents[0].Parts[0].FunctionCall.Name, "default_api:clarify")
+	if contents[0].Parts[1].FunctionCall == nil {
+		t.Fatal("expected function call part")
+	}
+	if contents[0].Parts[1].FunctionCall.Name != "default_api:clarify" {
+		t.Fatalf("function call name = %q, want %q", contents[0].Parts[1].FunctionCall.Name, "default_api:clarify")
+	}
+}
+
+func TestMergeGoogleRawContent_PreservesEarlierThoughtSignature(t *testing.T) {
+	current := &googleSerializableContent{
+		Role: "model",
+		Parts: []googleSerializablePartItem{
+			{
+				FunctionCallID:   "fc_1",
+				FunctionCallName: "default_api:clarify",
+				FunctionCallArgs: map[string]any{"question": "draft"},
+				ThoughtSignature: []byte("sig-123"),
+			},
+		},
+	}
+	next := &googleSerializableContent{
+		Role: "model",
+		Parts: []googleSerializablePartItem{
+			{
+				FunctionCallID:   "fc_1",
+				FunctionCallName: "default_api:clarify",
+				FunctionCallArgs: map[string]any{"question": "final"},
+			},
+		},
+	}
+
+	merged := mergeGoogleRawContent(current, next)
+	if merged == nil {
+		t.Fatal("expected merged raw content")
+	}
+	if len(merged.Parts) != 1 {
+		t.Fatalf("got %d parts, want 1", len(merged.Parts))
+	}
+	if !bytes.Equal(merged.Parts[0].ThoughtSignature, []byte("sig-123")) {
+		t.Fatalf("thought signature = %q, want %q", string(merged.Parts[0].ThoughtSignature), "sig-123")
+	}
+	if got := merged.Parts[0].FunctionCallArgs["question"]; got != "final" {
+		t.Fatalf("function call args = %#v, want final question", merged.Parts[0].FunctionCallArgs)
 	}
 }
 
@@ -233,7 +274,7 @@ func TestExtractGoogleRawContent_PreservesThoughtSignatureForReplay(t *testing.T
 	}
 }
 
-func TestExtractGoogleRawContent_SkipsPartsWithoutReplayData(t *testing.T) {
+func TestExtractGoogleRawContent_PreservesThoughtSignatureOnlyParts(t *testing.T) {
 	raw := extractGoogleRawContent(&genai.GenerateContentResponse{
 		Candidates: []*genai.Candidate{{
 			Content: &genai.Content{
@@ -257,11 +298,14 @@ func TestExtractGoogleRawContent_SkipsPartsWithoutReplayData(t *testing.T) {
 	if raw == nil {
 		t.Fatal("expected raw content")
 	}
-	if len(raw.Parts) != 1 {
-		t.Fatalf("got %d raw parts, want 1", len(raw.Parts))
+	if len(raw.Parts) != 2 {
+		t.Fatalf("got %d raw parts, want 2", len(raw.Parts))
 	}
-	if raw.Parts[0].FunctionCallName != "default_api:clarify" {
-		t.Fatalf("function call name = %q, want %q", raw.Parts[0].FunctionCallName, "default_api:clarify")
+	if !bytes.Equal(raw.Parts[0].ThoughtSignature, []byte("sig-only")) {
+		t.Fatalf("thought signature = %q, want %q", string(raw.Parts[0].ThoughtSignature), "sig-only")
+	}
+	if raw.Parts[1].FunctionCallName != "default_api:clarify" {
+		t.Fatalf("function call name = %q, want %q", raw.Parts[1].FunctionCallName, "default_api:clarify")
 	}
 }
 

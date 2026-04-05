@@ -698,8 +698,9 @@ func buildTaskAgentPod(
 		}
 		spec.Name = TaskScopedRoutingName(task.TaskSlug, task.TaskID, agentType)
 		if spec.Labels == nil {
-			spec.Labels = make(map[string]string, 3)
+			spec.Labels = make(map[string]string, 4)
 		}
+		spec.Labels["pipeline_worker_id"] = shared.PipelineWorkerCanonicalID(sessionID, task.TaskID, agentType)
 		spec.Labels["task_id"] = task.TaskID
 		if task.TaskSlug != "" {
 			spec.Labels["task_slug"] = task.TaskSlug

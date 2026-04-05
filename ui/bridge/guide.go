@@ -1147,10 +1147,28 @@ func mergeStreamMetadata(base, overlay map[string]any) map[string]any {
 		}
 		merged[key] = value
 	}
+	merged = normalizeExclusiveChatTransferMetadata(merged)
 	if len(merged) == 0 {
 		return nil
 	}
 	return merged
+}
+
+func normalizeExclusiveChatTransferMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return metadata
+	}
+	if metadataBool(metadata, streamMetadataTopLevelTransfer) {
+		delete(metadata, streamMetadataNestedBranch)
+		delete(metadata, streamMetadataParentToolCallKey)
+		delete(metadata, streamMetadataInterAgentThread)
+		delete(metadata, streamMetadataInterAgentKind)
+		return metadata
+	}
+	if metadataBool(metadata, streamMetadataNestedBranch) {
+		delete(metadata, streamMetadataTopLevelTransfer)
+	}
+	return metadata
 }
 
 func streamMetadataValueCarriesIdentity(value any) bool {
@@ -1174,6 +1192,9 @@ func streamMetadataValueCarriesIdentity(value any) bool {
 
 func parseInterAgentBranchRefFromMetadata(metadata map[string]any) *msg.InterAgentBranchRefMsg {
 	if len(metadata) == 0 {
+		return nil
+	}
+	if metadataBool(metadata, streamMetadataTopLevelTransfer) {
 		return nil
 	}
 	nested := metadataBool(metadata, streamMetadataNestedBranch)
@@ -1277,11 +1298,15 @@ func streamCompleteText(agentID string, event *guide.StreamEvent) string {
 }
 
 func streamCompleteContent(agentID string, payload any) string {
-	data := unwrapResponseEnvelope(payload)
-	if text, ok := formatStructuredPayload(agentID, data); ok {
+	data := normalizeStructuredPayload(payload)
+	renderable, controlOnly := extractTurnEnvelopeResult(data)
+	if text, ok := formatStructuredPayload(agentID, renderable); ok {
 		return text
 	}
-	switch typed := data.(type) {
+	if controlOnly {
+		return ""
+	}
+	switch typed := renderable.(type) {
 	case nil:
 		return ""
 	case string:
@@ -1289,9 +1314,9 @@ func streamCompleteContent(agentID string, payload any) string {
 	case []byte:
 		return string(typed)
 	}
-	encoded, err := json.MarshalIndent(data, "", "  ")
+	encoded, err := json.MarshalIndent(renderable, "", "  ")
 	if err != nil {
-		return fmt.Sprint(data)
+		return fmt.Sprint(renderable)
 	}
 	return string(encoded)
 }
@@ -1327,11 +1352,15 @@ func routeResponseContent(resp *guide.RouteResponse) string {
 	if resp == nil {
 		return ""
 	}
-	data := unwrapResponseEnvelope(resp.Data)
-	if text, ok := formatStructuredPayload(resp.RespondingAgentID, data); ok {
+	data := normalizeStructuredPayload(resp.Data)
+	renderable, controlOnly := extractTurnEnvelopeResult(data)
+	if text, ok := formatStructuredPayload(resp.RespondingAgentID, renderable); ok {
 		return text
 	}
-	switch typed := data.(type) {
+	if controlOnly {
+		return ""
+	}
+	switch typed := renderable.(type) {
 	case nil:
 		return ""
 	case string:
@@ -1347,9 +1376,9 @@ func routeResponseContent(resp *guide.RouteResponse) string {
 			return text
 		}
 	}
-	encoded, err := json.MarshalIndent(data, "", "  ")
+	encoded, err := json.MarshalIndent(renderable, "", "  ")
 	if err != nil {
-		return fmt.Sprint(data)
+		return fmt.Sprint(renderable)
 	}
 	return string(encoded)
 }

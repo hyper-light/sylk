@@ -32,6 +32,7 @@ func PublishToolCallStreamEvent(
 		event.Success,
 		event.ErrorMsg,
 		event.InterAgent,
+		event.StreamMetadata,
 	)
 
 	streamEvent := &guide.StreamEvent{

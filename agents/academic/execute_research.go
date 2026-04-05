@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -40,6 +41,10 @@ type academicResearchExecutionState struct {
 	searchAttempts     map[string]researchExecutionSearch
 	observedSearches   map[string]struct{}
 	discoveredResults  map[string]researchExecutionDiscoveredResult
+	searchEpisodes     []researchExecutionSearchEpisode
+	searchEpisodeByID  map[string]int
+	searchEpisodeURLs  map[string][]int
+	authorityDomains   map[string]struct{}
 	sources            []researchExecutionSource
 	sourceIDsByURL     map[string]string
 	librarianEvidence  *shared.ConsultationEvidence
@@ -87,6 +92,19 @@ type researchExecutionDiscoveredResult struct {
 	PageAge  string
 }
 
+type researchExecutionSearchEpisode struct {
+	Ordinal          int
+	SearchID         string
+	Fingerprint      string
+	Query            string
+	Action           string
+	URL              string
+	Repeated         bool
+	NovelResultCount int
+	NovelDomainCount int
+	GroundedCount    int
+}
+
 func WithAcademicResearchExecutionState(ctx context.Context, state *academicResearchExecutionState) context.Context {
 	if state == nil {
 		return ctx
@@ -109,6 +127,9 @@ func newAcademicResearchExecutionState(sessionID string) *academicResearchExecut
 		searchAttempts:    make(map[string]researchExecutionSearch),
 		observedSearches:  make(map[string]struct{}),
 		discoveredResults: make(map[string]researchExecutionDiscoveredResult),
+		searchEpisodeByID: make(map[string]int),
+		searchEpisodeURLs: make(map[string][]int),
+		authorityDomains:  make(map[string]struct{}),
 		sourceIDsByURL:    make(map[string]string),
 	}
 }
@@ -230,6 +251,20 @@ func (s *academicResearchExecutionState) observeNativeSearchCall(ctx context.Con
 	attempt.Count++
 	attempt.GroundedSourceCount = groundedCount
 	s.searchAttempts[fingerprint] = attempt
+	episode := researchExecutionSearchEpisode{
+		Ordinal:     len(s.searchEpisodes) + 1,
+		SearchID:    searchKey,
+		Fingerprint: fingerprint,
+		Query:       query,
+		Action:      action,
+		URL:         rawURL,
+		Repeated:    attempt.RepeatedWithoutGround,
+	}
+	s.searchEpisodes = append(s.searchEpisodes, episode)
+	s.searchEpisodeByID[searchKey] = len(s.searchEpisodes) - 1
+	if rawURL != "" {
+		s.searchEpisodeURLs[rawURL] = appendUniqueInt(s.searchEpisodeURLs[rawURL], len(s.searchEpisodes)-1)
+	}
 	s.sawNativeSearch = true
 	if strings.EqualFold(action, "search") || (query != "" && rawURL == "") {
 		s.sawDiscoverySearch = true
@@ -276,10 +311,29 @@ func (s *academicResearchExecutionState) observeNativeSearchResult(ctx context.C
 	}
 
 	s.mu.Lock()
-	existing := s.discoveredResults[rawURL]
+	idx := -1
+	idx, ok := s.searchEpisodeByID[strings.TrimSpace(result.SearchID)]
+	if !ok && len(s.searchEpisodes) > 0 {
+		idx = len(s.searchEpisodes) - 1
+	}
+	existing, alreadyKnown := s.discoveredResults[rawURL]
 	s.discoveredResults[rawURL] = mergeResearchExecutionDiscoveredResult(existing, discovered)
 	s.reserveSourceIDForURLLocked(rawURL)
 	grounded := s.hasGroundedURLLocked(rawURL)
+	if idx >= 0 && idx < len(s.searchEpisodes) {
+		if !alreadyKnown {
+			s.searchEpisodes[idx].NovelResultCount++
+		}
+		s.searchEpisodeURLs[rawURL] = appendUniqueInt(s.searchEpisodeURLs[rawURL], idx)
+	}
+	if domain := authorityDomainFromURL(rawURL); domain != "" {
+		if _, seen := s.authorityDomains[domain]; !seen {
+			s.authorityDomains[domain] = struct{}{}
+			if idx >= 0 && idx < len(s.searchEpisodes) {
+				s.searchEpisodes[idx].NovelDomainCount++
+			}
+		}
+	}
 	s.sawNativeSearch = true
 	s.sawDiscoverySearch = true
 	discoveredCount := len(s.discoveredResults)
@@ -394,6 +448,16 @@ func (s *academicResearchExecutionState) recordFetchResult(ctx context.Context, 
 	}
 	if !updated {
 		s.sources = append(s.sources, sourceRecord)
+	}
+	if boolValue(payload["grounded"]) {
+		for _, idx := range s.searchEpisodeURLs[rawURL] {
+			if idx < 0 || idx >= len(s.searchEpisodes) {
+				continue
+			}
+			if s.searchEpisodes[idx].GroundedCount == 0 {
+				s.searchEpisodes[idx].GroundedCount++
+			}
+		}
 	}
 	s.mu.Unlock()
 
@@ -809,6 +873,63 @@ func (s *academicResearchExecutionState) discoveredResultsSliceLocked() []resear
 		results = append(results, discovered)
 	}
 	return results
+}
+
+func (s *academicResearchExecutionState) webSearchFrontier() academicWebSearchFrontier {
+	if s == nil {
+		return academicWebSearchFrontier{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	total := len(s.searchEpisodes)
+	if total == 0 {
+		return academicWebSearchFrontier{}
+	}
+	repeated := 0
+	rewardSum := 0.0
+	for _, episode := range s.searchEpisodes {
+		if episode.Repeated {
+			repeated++
+		}
+		rewardSum += episode.reward()
+	}
+	return academicWebSearchFrontier{
+		TotalSearches:    total,
+		RepeatedSearches: repeated,
+		UniqueResults:    len(s.discoveredResults),
+		UniqueDomains:    len(s.authorityDomains),
+		GroundedSources:  s.groundedSourceCountLocked(),
+		LocalRewardMean:  rewardSum / float64(total),
+	}
+}
+
+func (s *academicResearchExecutionState) webSearchEpisodeRewards() []searchEpisodeReward {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rewards := make([]searchEpisodeReward, 0, len(s.searchEpisodes))
+	for _, episode := range s.searchEpisodes {
+		rewards = append(rewards, searchEpisodeReward{
+			Ordinal: episode.Ordinal,
+			Reward:  episode.reward(),
+		})
+	}
+	return rewards
+}
+
+func (e researchExecutionSearchEpisode) reward() float64 {
+	switch {
+	case e.GroundedCount > 0:
+		return 1
+	case e.NovelDomainCount > 0:
+		return 1
+	case e.NovelResultCount > 0:
+		return 1
+	default:
+		return 0
+	}
 }
 
 type researchResultBuildOptions struct {
@@ -1413,4 +1534,25 @@ func versioningSessionIDOrDefault(ctx context.Context, fallback string) string {
 		return strings.TrimSpace(sessionID)
 	}
 	return strings.TrimSpace(fallback)
+}
+
+func appendUniqueInt(values []int, value int) []int {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func authorityDomainFromURL(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(parsed.Hostname()))
 }

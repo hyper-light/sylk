@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,11 +47,12 @@ type GlobalTester struct {
 	refresher container.ProviderRefresher
 
 	// State.
-	currentPlan  *shared.TestPlan
-	harness      *TestHarness
-	batchContext *shared.BatchContext
-	diagnoses    map[string]*shared.DiagnosisReport
-	mu           sync.RWMutex
+	currentPlan      *shared.TestPlan
+	harness          *TestHarness
+	executionHarness *globalTestHarnessState
+	batchContext     *shared.BatchContext
+	diagnoses        map[string]*shared.DiagnosisReport
+	mu               sync.RWMutex
 
 	// Diagnosis engine.
 	diagEngine shared.DiagnosisEngine
@@ -308,10 +310,10 @@ func (gt *GlobalTester) registerCoreSkills() {
 	gt.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return gt.fileAccess }))
 	gt.skills.Register(runCommandSkill(gt))
 	gt.skills.Register(runShellScriptSkill(gt))
-	gt.skills.Register(shared.AnalyzeRiskSkill())
-	gt.skills.Register(shared.PlanTestsSkill())
+	gt.skills.Register(shared.AnalyzeRiskSkill(gt))
+	gt.skills.Register(shared.PlanTestsSkill(gt))
 	gt.skills.Register(writeTestSkill(gt))
-	gt.skills.Register(shared.RunTestSuiteSkill())
+	gt.skills.Register(shared.RunTestSuiteSkill(gt))
 	gt.skills.Register(shared.DiagnoseFailureSkill(gt.diagEngine))
 	gt.skills.Register(researchTestToolInstallSkill(gt))
 	gt.skills.Register(installTestToolingSkill(gt))
@@ -330,9 +332,9 @@ func (gt *GlobalTester) registerCoreSkills() {
 
 	// Global-tester-specific skills.
 	gt.skills.Register(analyzeBatchSkill(gt))
-	gt.skills.Register(analyzeIntegrationRisksSkill())
-	gt.skills.Register(planIntegrationTestsSkill())
-	gt.skills.Register(planE2ETestsSkill())
+	gt.skills.Register(analyzeIntegrationRisksSkill(gt))
+	gt.skills.Register(planIntegrationTestsSkill(gt))
+	gt.skills.Register(planE2ETestsSkill(gt))
 	gt.skills.Register(buildHarnessSkill(gt))
 	gt.skills.Register(writeIntegrationTestSkill(gt))
 	gt.skills.Register(writeE2ETestSkill(gt))
@@ -341,6 +343,8 @@ func (gt *GlobalTester) registerCoreSkills() {
 	gt.skills.Register(escalateFailureSkill(gt))
 	for _, skill := range agentshared.NewGlobalReviewProtocolSkills(agentshared.GlobalReviewProtocolSkillConfig{
 		AgentType:      func() string { return "tester" },
+		AgentID:        func() string { return gt.id },
+		ResolveTarget:  func(agentType string) string { return gt.knownAgentIDByType(agentType, agentType) },
 		WorkspaceViews: func() versioning.WorkspaceViewAccess { return gt.workspaceViews },
 		Route: agentshared.GlobalReviewRouteConfig{
 			BusProvider: func() guide.EventBus { return gt.bus },
@@ -511,9 +515,13 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 		return nil, fmt.Errorf("global tester: no LLM provider configured — authenticate with OpenAI to enable")
 	}
 
+	hadGlobalReviewState := agentshared.GlobalReviewStateFromContext(ctx) != nil
 	ctx = agentshared.WithGlobalReviewContext(ctx, fwd.Metadata)
-	defer agentshared.CloseGlobalReviewState(ctx)
+	if !hadGlobalReviewState {
+		defer agentshared.CloseGlobalReviewState(ctx)
+	}
 	contract := agentshared.BuildGlobalExecutionContract("tester-global", fwd.Intent, fwd.Input)
+	ctx = agentshared.WithGlobalExecutionState(ctx, agentshared.NewGlobalExecutionState(contract))
 	systemPrompt := shared.GlobalTesterSystemPromptForContract(contract)
 	systemPrompt = agentshared.AppendGlobalExecutionGuidance(systemPrompt, contract, "tester-global")
 	gt.prepareSkillsForInput(fwd.Input)
@@ -582,6 +590,13 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	ctx := reqCtx
 	startTime := time.Now()
 
+	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
+	ctx = agentshared.WithForwardedTaskScope(ctx, fwd.Metadata)
+	hadGlobalReviewState := agentshared.GlobalReviewStateFromContext(ctx) != nil
+	ctx = agentshared.WithGlobalReviewContext(ctx, fwd.Metadata)
+	if !hadGlobalReviewState {
+		defer agentshared.CloseGlobalReviewState(ctx)
+	}
 	ctx = withTesterStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	ctx, usageAcc := withTesterUsageAccumulator(ctx)
@@ -636,7 +651,7 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
 		gt.publishStreamError(ctx, err)
-		gt.publishStreamComplete(ctx, "", usageAcc.Total())
+		gt.publishStreamComplete(ctx, "", usageAcc.Total(), nil)
 		resp.Error = err.Error()
 		respMsg := guide.NewResponseMessage(gt.generateMessageID(), resp)
 		_ = gt.bus.Publish(gt.channels.Responses, respMsg)
@@ -652,10 +667,11 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	// Conversation text is already streamed via chunks — send complete with
 	// empty text so the bridge doesn't duplicate content.
 	completeText := extractTesterUserResponse(result)
+	directive := extractTesterResponseDirective(result)
 	if isStreamedTesterConversation(result) {
 		completeText = ""
 	}
-	gt.publishStreamComplete(ctx, completeText, usageAcc.Total())
+	gt.publishStreamComplete(ctx, completeText, usageAcc.Total(), directive)
 
 	result = agentshared.WrapGlobalReviewTurnResult(ctx, result)
 	resp.Data = result
@@ -701,6 +717,27 @@ func (gt *GlobalTester) handleRegistryAnnouncement(msg *guide.Message) error {
 
 func (gt *GlobalTester) generateMessageID() string {
 	return fmt.Sprintf("gt_msg_%s", uuid.New().String()[:8])
+}
+
+func (gt *GlobalTester) knownAgentIDByType(agentType, fallback string) string {
+	if gt == nil {
+		return fallback
+	}
+	targetType := strings.TrimSpace(agentType)
+	if targetType == "" {
+		return fallback
+	}
+	gt.knownAgentsMu.RLock()
+	defer gt.knownAgentsMu.RUnlock()
+	for _, ann := range gt.knownAgents {
+		if ann == nil {
+			continue
+		}
+		if strings.TrimSpace(ann.AgentType) == targetType && strings.TrimSpace(ann.AgentID) != "" {
+			return strings.TrimSpace(ann.AgentID)
+		}
+	}
+	return fallback
 }
 
 func (gt *GlobalTester) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {

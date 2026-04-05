@@ -1364,7 +1364,7 @@ func (g *GoogleProvider) streamWithHandlerOnce(ctx context.Context, req *Request
 		chunkIndex++
 
 		if raw := extractGoogleRawContent(resp); raw != nil {
-			rawContent = raw
+			rawContent = mergeGoogleRawContent(rawContent, raw)
 		}
 
 		text, thought := extractGoogleStreamTextAndThought(resp)
@@ -1969,7 +1969,59 @@ type googleSerializablePartItem struct {
 }
 
 func (sp googleSerializablePartItem) hasReplayData() bool {
-	return strings.TrimSpace(sp.Text) != "" || strings.TrimSpace(sp.FunctionCallName) != ""
+	return strings.TrimSpace(sp.Text) != "" ||
+		strings.TrimSpace(sp.FunctionCallName) != "" ||
+		len(sp.ThoughtSignature) > 0
+}
+
+func mergeGoogleRawContent(current, next *googleSerializableContent) *googleSerializableContent {
+	if current == nil {
+		return next
+	}
+	if next == nil {
+		return current
+	}
+	if len(next.Parts) != len(current.Parts) {
+		if len(next.Parts) > len(current.Parts) {
+			return next
+		}
+		return current
+	}
+
+	merged := &googleSerializableContent{
+		Role:  next.Role,
+		Parts: make([]googleSerializablePartItem, len(current.Parts)),
+	}
+	if strings.TrimSpace(merged.Role) == "" {
+		merged.Role = current.Role
+	}
+	for i := range current.Parts {
+		merged.Parts[i] = mergeGoogleRawPart(current.Parts[i], next.Parts[i])
+	}
+	return merged
+}
+
+func mergeGoogleRawPart(current, next googleSerializablePartItem) googleSerializablePartItem {
+	merged := current
+	if strings.TrimSpace(next.Text) != "" {
+		merged.Text = next.Text
+	}
+	if next.Thought {
+		merged.Thought = true
+	}
+	if len(next.ThoughtSignature) > 0 {
+		merged.ThoughtSignature = next.ThoughtSignature
+	}
+	if strings.TrimSpace(next.FunctionCallID) != "" {
+		merged.FunctionCallID = next.FunctionCallID
+	}
+	if strings.TrimSpace(next.FunctionCallName) != "" {
+		merged.FunctionCallName = next.FunctionCallName
+	}
+	if next.FunctionCallArgs != nil {
+		merged.FunctionCallArgs = next.FunctionCallArgs
+	}
+	return merged
 }
 
 // toGenaiContent reconstructs a *genai.Content from the serializable snapshot.

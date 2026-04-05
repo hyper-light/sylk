@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -112,14 +113,21 @@ func agentDisplayName(agent AgentState) string {
 	if name == "" {
 		name = strings.TrimSpace(agent.AgentType)
 	}
-	suffix := knowledgeReplicaSuffix(agent)
-	if suffix == "" {
-		return name
+	if suffix := knowledgeReplicaSuffix(agent); suffix != "" {
+		if name == "" {
+			name = suffix
+		} else {
+			name += " " + suffix
+		}
 	}
-	if name == "" {
-		return suffix
+	if suffix := globalPendingSuperscriptSuffix(agent); suffix != "" {
+		if name == "" {
+			name = suffix
+		} else {
+			name += " " + suffix
+		}
 	}
-	return name + " " + suffix
+	return name
 }
 
 func knowledgeReplicaSuffix(agent AgentState) string {
@@ -134,6 +142,53 @@ func knowledgeReplicaSuffix(agent AgentState) string {
 		parts = append(parts, fmt.Sprintf("q%d", agent.QueuedRequests))
 	}
 	return strings.Join(parts, " ")
+}
+
+func globalPendingSuperscriptSuffix(agent AgentState) string {
+	if agent.QueuedRequests <= 0 || strings.TrimSpace(agent.PipelineID) != "" {
+		return ""
+	}
+	switch strings.TrimSpace(agent.AgentType) {
+	case "inspector", "tester":
+		return "⁺" + superscriptNumber(agent.QueuedRequests)
+	default:
+		return ""
+	}
+}
+
+func superscriptNumber(value int) string {
+	if value <= 0 {
+		return ""
+	}
+	raw := strconv.Itoa(value)
+	var b strings.Builder
+	for _, ch := range raw {
+		switch ch {
+		case '0':
+			b.WriteRune('⁰')
+		case '1':
+			b.WriteRune('¹')
+		case '2':
+			b.WriteRune('²')
+		case '3':
+			b.WriteRune('³')
+		case '4':
+			b.WriteRune('⁴')
+		case '5':
+			b.WriteRune('⁵')
+		case '6':
+			b.WriteRune('⁶')
+		case '7':
+			b.WriteRune('⁷')
+		case '8':
+			b.WriteRune('⁸')
+		case '9':
+			b.WriteRune('⁹')
+		default:
+			b.WriteRune(ch)
+		}
+	}
+	return b.String()
 }
 
 // renderSelectedCard renders a two-line card for the selected agent.

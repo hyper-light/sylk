@@ -506,12 +506,16 @@ func IntermediateToolTurnTextWithContext(ctx context.Context, resp *providers.Re
 	if resp == nil || len(resp.ToolCalls) == 0 {
 		return ""
 	}
+	agentType := progressNarrationAgentType(ctx)
 	content := strings.TrimSpace(resp.Content)
-	if content == "" {
+	if content == "" && !suppressIntermediateThinkingNarration(agentType) {
 		content = summarizeIntermediateThinking(resp.Thinking)
 	}
 	if content == "" {
-		content = summarizeIntermediateToolCalls(progressNarrationAgentType(ctx), TaskExecutionContractFromContext(ctx), resp.ToolCalls)
+		content = summarizeIntermediateToolCalls(agentType, TaskExecutionContractFromContext(ctx), resp.ToolCalls)
+	}
+	if content == "" && suppressIntermediateThinkingNarration(agentType) {
+		content = summarizeIntermediateThinking(resp.Thinking)
 	}
 	if content == "" {
 		return ""
@@ -797,6 +801,15 @@ func progressNarrationAgentType(ctx context.Context) string {
 	}
 	value, _ := stream.Metadata["agent_type"].(string)
 	return strings.TrimSpace(value)
+}
+
+func suppressIntermediateThinkingNarration(agentType string) bool {
+	switch strings.TrimSpace(agentType) {
+	case "tester", "tester-pipeline":
+		return true
+	default:
+		return false
+	}
 }
 
 // PublishStreamComplete emits a stream completion event.

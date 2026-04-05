@@ -54,6 +54,7 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(validatePlanAdherenceSkill(gi))
 	gi.skills.Register(crossReferenceChangesSkill(gi))
 	gi.skills.Register(gradeLayerQualitySkill(gi))
+	gi.skills.Register(determineAuditDepthSkill(gi))
 	gi.skills.Register(loadPlanContextSkill(gi))
 	gi.skills.Register(consultLibrarianStyleSkill(gi))
 	gi.skills.Register(consultAcademicApproachSkill(gi))
@@ -63,6 +64,8 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(escalateFindingsSkill(gi))
 	for _, skill := range agentShared.NewGlobalReviewProtocolSkills(agentShared.GlobalReviewProtocolSkillConfig{
 		AgentType:      func() string { return "inspector" },
+		AgentID:        func() string { return gi.id },
+		ResolveTarget:  func(agentType string) string { return gi.knownAgentIDByType(agentType, agentType) },
 		WorkspaceViews: func() versioning.WorkspaceViewAccess { return gi.workspaceViews },
 		Route: agentShared.GlobalReviewRouteConfig{
 			BusProvider: func() guide.EventBus { return gi.bus },
@@ -436,13 +439,13 @@ func requestArchitectResearchSkill(gi *GlobalInspector) *skills.Skill {
 
 func requestUserClarificationSkill(gi *GlobalInspector) *skills.Skill {
 	return skills.NewSkill("request_user_clarification").
-		Description("Route a clarification request to the user via the guide.").
+		Description("Ask the user a direct clarification question and end the current audit turn so the answer can come back through the normal Guide conversation flow.").
 		Domain("audit").
 		Keywords("clarification", "user", "question").
 		Priority(85).
 		Usage("Use when the audit is blocked on missing product intent or a user decision that cannot be responsibly inferred from the existing evidence.").
 		Requirement("Ask a concrete, decision-relevant question that explains what ambiguity is blocking the audit.").
-		Satisfies("Creates a user clarification request that can unblock the audit without guessing.").
+		Satisfies("Returns a user-facing clarification prompt and stops the current audit turn so the user can answer directly.").
 		Avoid("Do not use when the answer is already available in the plan, diffs, or existing task context.").
 		StringParam("question", "Question for the user", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -452,23 +455,26 @@ func requestUserClarificationSkill(gi *GlobalInspector) *skills.Skill {
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-
-			if gi.bus != nil {
-				payload := map[string]any{
-					"type":     "user_clarification",
-					"question": params.Question,
-					"source":   gi.id,
-				}
-				payloadJSON, _ := json.Marshal(payload)
-				_, _ = gi.requestRouteSync(ctx, "guide", string(payloadJSON), map[string]any{
-					"clarification_request": true,
-				})
+			question := strings.TrimSpace(params.Question)
+			if question == "" {
+				return nil, fmt.Errorf("question is required")
 			}
 
-			return map[string]any{
-				"requested": true,
-				"question":  params.Question,
-			}, nil
+			payload := map[string]any{
+				"status":       "clarification_requested",
+				"question":     question,
+				"user_message": question,
+				"agent_type":   "inspector",
+			}
+			if gi != nil {
+				if trimmed := strings.TrimSpace(gi.id); trimmed != "" {
+					payload["agent_id"] = trimmed
+				}
+				if trimmed := strings.TrimSpace(gi.config.SessionID); trimmed != "" {
+					payload["session_id"] = trimmed
+				}
+			}
+			return nil, skills.NewDelegatedError(payload, question)
 		}).
 		Build()
 }

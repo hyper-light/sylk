@@ -10,6 +10,27 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
+type RiskAnalyzer interface {
+	AnalyzeRisks(ctx context.Context, files []string, taskSpec, workerType, diffPatch string) ([]RiskArea, error)
+}
+
+type TestPlanner interface {
+	PlanTests(ctx context.Context, riskAreas []RiskArea, taskSpec string, files []string) (*TestPlan, error)
+}
+
+type SuiteRunRequest struct {
+	Packages  []string
+	Files     []string
+	TestNames []string
+	Race      bool
+	Verbose   bool
+	Timeout   int
+}
+
+type SuiteRunner interface {
+	RunTestSuite(ctx context.Context, req SuiteRunRequest) (map[string]any, error)
+}
+
 // DiagnoseFailureSkill creates a skill that delegates to the DiagnosisEngine.
 func DiagnoseFailureSkill(engine DiagnosisEngine) *skills.Skill {
 	type params struct {
@@ -67,11 +88,12 @@ func DiagnoseFailureSkill(engine DiagnosisEngine) *skills.Skill {
 }
 
 // AnalyzeRiskSkill creates a skill for identifying risk areas in code.
-func AnalyzeRiskSkill() *skills.Skill {
+func AnalyzeRiskSkill(analyzer RiskAnalyzer) *skills.Skill {
 	type params struct {
-		Files     []string `json:"files"`
-		TaskSpec  string   `json:"task_spec,omitempty"`
-		DiffPatch string   `json:"diff_patch,omitempty"`
+		Files      []string `json:"files"`
+		TaskSpec   string   `json:"task_spec,omitempty"`
+		WorkerType string   `json:"worker_type,omitempty"`
+		DiffPatch  string   `json:"diff_patch,omitempty"`
 	}
 
 	return skills.NewSkill("analyze_risk").
@@ -85,22 +107,31 @@ func AnalyzeRiskSkill() *skills.Skill {
 		Avoid("Do not stop here when the requested deliverable is executable tests or execution evidence.").
 		ArrayParam("files", "Source files to analyze for risks", "string", true).
 		StringParam("task_spec", "Task specification for context", false).
+		StringParam("worker_type", "Primary worker type such as engineer or designer", false).
 		StringParam("diff_patch", "Git diff patch for targeted analysis", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var p params
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
+			if analyzer == nil {
+				return nil, fmt.Errorf("risk analysis is unavailable")
+			}
+			risks, err := analyzer.AnalyzeRisks(ctx, p.Files, p.TaskSpec, p.WorkerType, p.DiffPatch)
+			if err != nil {
+				return nil, err
+			}
 			return map[string]any{
 				"files_analyzed": len(p.Files),
-				"risk_areas":     []RiskArea{},
+				"risk_areas":     risks,
+				"risk_count":     len(risks),
 			}, nil
 		}).
 		Build()
 }
 
 // PlanTestsSkill creates a skill for formulating test plans.
-func PlanTestsSkill() *skills.Skill {
+func PlanTestsSkill(planner TestPlanner) *skills.Skill {
 	type params struct {
 		RiskAreas []RiskArea `json:"risk_areas"`
 		TaskSpec  string     `json:"task_spec,omitempty"`
@@ -116,6 +147,7 @@ func PlanTestsSkill() *skills.Skill {
 		Requirement("Prefer to supply the risk areas or equivalent specification-driven failure hypotheses first.").
 		Satisfies("Produces deliberate test-case structure and satisfies the tester planning stage.").
 		Avoid("Do not treat the plan itself as completion when the requested deliverable still requires test artifacts or suite execution.").
+		ArrayObjectParam("risk_areas", "Risk areas that should directly inform the planned coverage.", riskAreaProperties(), []string{"file", "category", "level", "description"}, false).
 		StringParam("task_spec", "Task specification for context", false).
 		ArrayParam("files", "Source files under test", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -123,20 +155,29 @@ func PlanTestsSkill() *skills.Skill {
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
+			if planner == nil {
+				return nil, fmt.Errorf("test planning is unavailable")
+			}
+			plan, err := planner.PlanTests(ctx, p.RiskAreas, p.TaskSpec, p.Files)
+			if err != nil {
+				return nil, err
+			}
 			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventTestPlanCreated,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
-					&agentlog.TestPlanPayload{TestCount: len(p.RiskAreas)})
+					&agentlog.TestPlanPayload{TestCount: len(plan.PlannedCase)})
 			}
 			return map[string]any{
-				"plan": &TestPlan{},
+				"plan":       plan,
+				"risk_count": len(plan.RiskAreas),
+				"case_count": len(plan.PlannedCase),
 			}, nil
 		}).
 		Build()
 }
 
 // RunTestSuiteSkill creates a skill for executing test suites.
-func RunTestSuiteSkill() *skills.Skill {
+func RunTestSuiteSkill(runner SuiteRunner) *skills.Skill {
 	type params struct {
 		Packages  []string `json:"packages,omitempty"`
 		Files     []string `json:"files,omitempty"`
@@ -165,16 +206,24 @@ func RunTestSuiteSkill() *skills.Skill {
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
+			if runner == nil {
+				return nil, fmt.Errorf("test execution is unavailable")
+			}
 			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventSuiteStarted,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
 					&agentlog.TestSuitePayload{Phase: "started"})
 			}
-			result := map[string]any{
-				"packages": p.Packages,
-				"passed":   0,
-				"failed":   0,
-				"output":   "",
+			result, err := runner.RunTestSuite(ctx, SuiteRunRequest{
+				Packages:  p.Packages,
+				Files:     p.Files,
+				TestNames: p.TestNames,
+				Race:      p.Race,
+				Verbose:   p.Verbose,
+				Timeout:   p.Timeout,
+			})
+			if err != nil {
+				return nil, err
 			}
 			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventSuiteCompleted,
@@ -184,4 +233,14 @@ func RunTestSuiteSkill() *skills.Skill {
 			return result, nil
 		}).
 		Build()
+}
+
+func riskAreaProperties() map[string]*skills.Property {
+	return map[string]*skills.Property{
+		"file":        {Type: "string", Description: "Path associated with the risk."},
+		"function":    {Type: "string", Description: "Optional function or symbol associated with the risk."},
+		"category":    {Type: "string", Description: "Risk category."},
+		"level":       {Type: "string", Description: "Risk severity level."},
+		"description": {Type: "string", Description: "Why this risk matters."},
+	}
 }

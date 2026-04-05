@@ -98,8 +98,13 @@ func (ps *PendingStore) Add(req *RouteRequest, classification *RouteResult, targ
 		ExpiresAt:       now.Add(ps.defaultTimeout),
 	}
 
-	if parentID := strings.TrimSpace(req.ParentCorrelationID); parentID != "" && !metadataPreservesSourceStreamTarget(req.Metadata) {
-		pending.StreamTargetOverride = ps.inheritedStreamTargetOverrideLocked(parentID)
+	if target := metadataVisibleTargetValue(req.Metadata); target != "" {
+		pending.StreamTargetOverride = target
+	}
+	if pending.StreamTargetOverride == "" {
+		if parentID := strings.TrimSpace(req.ParentCorrelationID); parentID != "" && !metadataPreservesSourceStreamTarget(req.Metadata) {
+			pending.StreamTargetOverride = ps.inheritedStreamTargetOverrideLocked(parentID)
+		}
 	}
 
 	// Store by correlation ID

@@ -29,7 +29,9 @@ func (a *Architect) registerCoreSkills() {
 	a.skills.Register(routeRequirementsResearchSkill(a))
 	a.skills.Register(readResearchPaperSkill(a))
 	for _, skill := range shared.NewGlobalReviewProtocolSkills(shared.GlobalReviewProtocolSkillConfig{
-		AgentType: func() string { return "architect" },
+		AgentType:     func() string { return "architect" },
+		AgentID:       func() string { return a.id },
+		ResolveTarget: func(agentType string) string { return a.knownAgentIDByType(agentType, agentType) },
 		Route: shared.GlobalReviewRouteConfig{
 			BusProvider: func() guide.EventBus { return a.bus },
 		},

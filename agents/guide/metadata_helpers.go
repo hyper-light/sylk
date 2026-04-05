@@ -6,6 +6,7 @@ import (
 )
 
 const metadataPreserveSourceStreamTarget = "chat_preserve_source_stream_target"
+const metadataVisibleTarget = "chat_visible_target"
 const metadataNestedBranch = "chat_nested_branch"
 const metadataInterAgentKind = "chat_inter_agent_kind"
 
@@ -21,6 +22,25 @@ func MetadataWithPreservedSourceStreamTarget(metadata map[string]any) map[string
 		cloned[key] = value
 	}
 	cloned[metadataPreserveSourceStreamTarget] = true
+	return cloned
+}
+
+// MetadataWithVisibleTarget marks a route request so Guide forwards stream and
+// terminal UI traffic to the declared target without requiring the caller to
+// mirror chat transport itself.
+func MetadataWithVisibleTarget(metadata map[string]any, target string) map[string]any {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return metadata
+	}
+	if len(metadata) == 0 {
+		return map[string]any{metadataVisibleTarget: target}
+	}
+	cloned := make(map[string]any, len(metadata)+1)
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	cloned[metadataVisibleTarget] = target
 	return cloned
 }
 
@@ -42,6 +62,22 @@ func metadataPreservesSourceStreamTarget(metadata map[string]any) bool {
 		}
 	}
 	return false
+}
+
+func metadataVisibleTargetValue(metadata map[string]any) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	value, ok := metadata[metadataVisibleTarget]
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	default:
+		return strings.TrimSpace(fmt.Sprint(value))
+	}
 }
 
 func metadataHasNestedInterAgentBranch(metadata map[string]any) bool {

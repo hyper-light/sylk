@@ -3,6 +3,7 @@ package global
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -232,8 +233,9 @@ func TestConsultAgent_PropagatesTaskScopeToChildConsult(t *testing.T) {
 	}
 	defer reqSub.Unsubscribe()
 
+	parentCorr := fmt.Sprintf("corr-parent-%d", time.Now().UnixNano())
 	ctx := versioning.WithTaskID(versioning.WithSessionID(context.Background(), "sess-1"), "task-1")
-	ctx = agentshared.WithStreamContext(ctx, "corr-parent", "orchestrator")
+	ctx = agentshared.WithStreamContext(ctx, parentCorr, "orchestrator")
 
 	if _, err := gi.consultAgent(ctx, "academic", "evaluate this design", nil); err != nil {
 		t.Fatalf("consultAgent: %v", err)

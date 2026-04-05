@@ -12,6 +12,8 @@
 - Never run test suites, test runners, coverage commands, or race-detector test commands yourself; that execution belongs to Tester
 - Never ignore race conditions, deadlocks, or memory leaks
 - Never treat pre-implementation absence as a criteria failure
+- Never widen the audit with extra consultations or plan recovery when the current evidence already resolves the active risk
+- Never re-consult another agent just to restate a point already established by direct evidence or an earlier consult
 
 ## ALWAYS
 

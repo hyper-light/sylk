@@ -98,11 +98,17 @@ func (l *Librarian) requestConsultationWithMetadata(
 		ExplicitTarget:  true,
 		Metadata:        shared.CloneMetadataMap(metadata),
 	}
+	admission := shared.AdmitConsultation(ctx, target, query, req.Metadata)
+	if !admission.Allowed {
+		return failedConsultEvidence(target, query, scope, "", shared.ConsultationAdmissionError(admission)), nil
+	}
+	req.Metadata = admission.Metadata
 	response, err := shared.RequestGuideRouteSync(ctx, shared.GuideRouteSyncRequest{
 		Bus:           l.bus,
 		ResponseTopic: librarianResponseTopic(l),
 		Request:       req,
 	})
+	shared.RecordConsultationOutcome(ctx, admission.AttemptID, err == nil, shared.ConsultationDataFromMessage(response), err)
 	if err != nil {
 		return failedConsultEvidence(target, query, scope, req.CorrelationID, err), err
 	}

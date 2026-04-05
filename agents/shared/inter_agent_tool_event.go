@@ -46,10 +46,11 @@ func NormalizeInterAgentToolEventForEmit(
 	success bool,
 	errorMsg string,
 	existing *InterAgentToolEvent,
+	streamMetadata map[string]any,
 ) *InterAgentToolEvent {
 	derived := DeriveInterAgentToolEvent(toolName, fullArgs, output, phase, success, errorMsg)
 	if existing == nil {
-		return normalizeInterAgentToolEventShape(derived, phase)
+		return normalizeInterAgentToolEventShape(derived, phase, toolName, fullArgs, output, streamMetadata)
 	}
 
 	normalized := &InterAgentToolEvent{
@@ -80,16 +81,25 @@ func NormalizeInterAgentToolEventForEmit(
 		normalized.UpdateOrigin = normalized.UpdateOrigin || derived.UpdateOrigin
 	}
 
-	return normalizeInterAgentToolEventShape(normalized, phase)
+	return normalizeInterAgentToolEventShape(normalized, phase, toolName, fullArgs, output, streamMetadata)
 }
 
-func normalizeInterAgentToolEventShape(meta *InterAgentToolEvent, phase ToolCallPhase) *InterAgentToolEvent {
+func normalizeInterAgentToolEventShape(
+	meta *InterAgentToolEvent,
+	phase ToolCallPhase,
+	toolName string,
+	fullArgs string,
+	output string,
+	streamMetadata map[string]any,
+) *InterAgentToolEvent {
 	if meta == nil {
 		return nil
 	}
+	args := parseInterAgentJSONMap(fullArgs)
+	out := parseInterAgentJSONMap(output)
 	normalized := &InterAgentToolEvent{
 		Kind:         normalizeInterAgentBranchKind(meta.Kind),
-		AgentTypes:   normalizeAgentTypeList(meta.AgentTypes),
+		AgentTypes:   normalizeInterAgentAgentTypes(meta.Kind, meta.AgentTypes, toolName, args, out, streamMetadata),
 		Summary:      normalizeInlineString(meta.Summary),
 		ThreadKey:    normalizeInlineString(meta.ThreadKey),
 		Status:       normalizeInlineString(meta.Status),
@@ -412,6 +422,62 @@ func interAgentChallengeTargets(toolName string, args, output map[string]any) []
 		return []string{resolved}
 	}
 	return nil
+}
+
+func normalizeInterAgentAgentTypes(
+	kind string,
+	values []string,
+	toolName string,
+	args, output, streamMetadata map[string]any,
+) []string {
+	normalized := normalizeAgentTypeList(values)
+	if strings.TrimSpace(kind) != InterAgentToolEventKindChallenge || len(normalized) == 0 {
+		return normalized
+	}
+	if interAgentProtocolScope(toolName, args, output, streamMetadata) != pipelineProtocolNamespace {
+		return normalized
+	}
+	out := make([]string, 0, len(normalized))
+	for _, value := range normalized {
+		out = append(out, normalizePipelineChallengeAgentType(value))
+	}
+	return normalizeAgentTypeList(out)
+}
+
+func interAgentProtocolScope(toolName string, args, output, streamMetadata map[string]any) string {
+	if scope := firstNonEmptyInline(
+		stringFromAnyMap(output, "protocol_scope"),
+		stringFromAnyMap(args, "protocol_scope"),
+		stringFromAnyMap(streamMetadata, "protocol_scope"),
+	); scope != "" {
+		return scope
+	}
+	if strings.TrimSpace(stringFromAnyMap(streamMetadata, "pipeline_id")) != "" {
+		return pipelineProtocolNamespace
+	}
+	switch normalizeAgentType(stringFromAnyMap(streamMetadata, "agent_type")) {
+	case "inspector-pipeline", "tester-pipeline", "engineer", "designer":
+		return pipelineProtocolNamespace
+	case "inspector", "tester":
+		return globalReviewNamespace
+	}
+	if strings.TrimSpace(toolName) == "challenge_agent" {
+		if strings.TrimSpace(stringFromAnyMap(output, "challenge_id")) != "" {
+			return pipelineProtocolNamespace
+		}
+	}
+	return ""
+}
+
+func normalizePipelineChallengeAgentType(value string) string {
+	switch normalizeAgentType(value) {
+	case "inspector":
+		return "inspector-pipeline"
+	case "tester":
+		return "tester-pipeline"
+	default:
+		return normalizeAgentType(value)
+	}
 }
 
 func interAgentChallengeThreadKey(toolName string, args, output map[string]any) string {

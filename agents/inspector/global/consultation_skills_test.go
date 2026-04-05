@@ -3,10 +3,12 @@ package global
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	shared "github.com/adalundhe/sylk/agents/inspector/shared"
@@ -138,7 +140,8 @@ func TestConsultAgent_FailedAcademicConsultMarksInterAgentBranchFailed(t *testin
 	defer reqSub.Unsubscribe()
 
 	var events []agentshared.ToolCallEvent
-	ctx := agentshared.WithStreamContext(context.Background(), "corr-parent", "inspector")
+	parentCorr := fmt.Sprintf("corr-parent-%d", time.Now().UnixNano())
+	ctx := agentshared.WithStreamContext(context.Background(), parentCorr, "inspector")
 	ctx = agentshared.WithToolCallEmitter(ctx, func(ev agentshared.ToolCallEvent) {
 		events = append(events, ev)
 	})

@@ -161,6 +161,10 @@ func (e *Engineer) requestConsultationWithMetadata(
 		SessionID:     sessionID,
 		Metadata:      shared.CloneMetadataMap(metadata),
 	}
+	admission := shared.AdmitConsultation(ctx, target, query, req.Metadata)
+	if !admission.Allowed {
+		return failedConsultEvidence(target, query, scope, "", shared.ConsultationAdmissionError(admission)), nil
+	}
 	researchDepth := shared.ConsultationResearchDepth(req.Metadata)
 	branchCtx, branch := shared.BeginInterAgentBranch(ctx, shared.InterAgentBranchSpec{
 		Kind:       shared.InterAgentToolEventKindConsult,
@@ -174,8 +178,9 @@ func (e *Engineer) requestConsultationWithMetadata(
 			"depth":  string(researchDepth),
 		},
 	})
-	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
+	req.Metadata = branch.ApplyMetadata(branchCtx, admission.Metadata)
 	response, err := e.requestConsultSync(branchCtx, req)
+	shared.RecordConsultationOutcome(branchCtx, admission.AttemptID, err == nil, shared.ConsultationDataFromMessage(response), err)
 	branch.CompleteFromMessage(branchCtx, response, err)
 	if err != nil {
 		if shared.IsAgentBusyError(err) {

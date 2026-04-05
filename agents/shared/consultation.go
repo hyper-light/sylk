@@ -2,8 +2,10 @@ package shared
 
 import (
 	"context"
+	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/deadlinelease"
 )
 
@@ -66,4 +68,17 @@ type ConsultationEvidence struct {
 	Error       string    `json:"error,omitempty"`
 	RequestedAt time.Time `json:"requested_at"`
 	ReceivedAt  time.Time `json:"received_at"`
+}
+
+func ConsultationDataFromMessage(msg *guide.Message) any {
+	if msg == nil {
+		return nil
+	}
+	if resp, ok := msg.GetRouteResponse(); ok && resp != nil {
+		return resp.Data
+	}
+	if errText, ok := msg.GetError(); ok && strings.TrimSpace(errText) != "" {
+		return errText
+	}
+	return nil
 }

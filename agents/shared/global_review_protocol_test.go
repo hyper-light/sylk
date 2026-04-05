@@ -11,6 +11,25 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
+type globalReviewDirectiveCarrierStub struct {
+	Response  string
+	Directive *guide.ResponseDirective
+}
+
+func (s *globalReviewDirectiveCarrierStub) ResponseText() string {
+	if s == nil {
+		return ""
+	}
+	return s.Response
+}
+
+func (s *globalReviewDirectiveCarrierStub) ResponseDirective() *guide.ResponseDirective {
+	if s == nil {
+		return nil
+	}
+	return s.Directive
+}
+
 func TestNewGlobalReviewProtocolSkills_AgentSpecificOwnership(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -103,6 +122,13 @@ func TestGlobalReviewOrchestratorChallenge_CarriesExecutionStateGuard(t *testing
 
 	skills := NewGlobalReviewProtocolSkills(GlobalReviewProtocolSkillConfig{
 		AgentType: func() string { return GlobalReviewAgentInspector },
+		AgentID:   func() string { return "inspector-global-1" },
+		ResolveTarget: func(agentType string) string {
+			if agentType == GlobalReviewAgentTester {
+				return "tester-global-1"
+			}
+			return agentType
+		},
 		Route: GlobalReviewRouteConfig{
 			Bus:       bus,
 			SessionID: func() string { return "sess-1" },
@@ -139,7 +165,7 @@ func TestGlobalReviewChallengePublishesUserVisibleRoute(t *testing.T) {
 	reqCh := make(chan *guide.RouteRequest, 1)
 	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
 		req, ok := msg.GetRouteRequest()
-		if !ok || req == nil || req.TargetAgentID != GlobalReviewAgentTester {
+		if !ok || req == nil || req.TargetAgentID != "tester-global-1" {
 			return nil
 		}
 		select {
@@ -168,6 +194,13 @@ func TestGlobalReviewChallengePublishesUserVisibleRoute(t *testing.T) {
 
 	skills := NewGlobalReviewProtocolSkills(GlobalReviewProtocolSkillConfig{
 		AgentType: func() string { return GlobalReviewAgentInspector },
+		AgentID:   func() string { return "inspector-global-1" },
+		ResolveTarget: func(agentType string) string {
+			if agentType == GlobalReviewAgentTester {
+				return "tester-global-1"
+			}
+			return agentType
+		},
 		Route: GlobalReviewRouteConfig{
 			Bus:       bus,
 			SessionID: func() string { return "sess-1" },
@@ -183,6 +216,9 @@ func TestGlobalReviewChallengePublishesUserVisibleRoute(t *testing.T) {
 
 	select {
 	case req := <-reqCh:
+		if req.TargetAgentID != "tester-global-1" {
+			t.Fatalf("target_agent_id = %q, want tester-global-1", req.TargetAgentID)
+		}
 		if req.SourceAgentID != "tui" {
 			t.Fatalf("source_agent_id = %q, want tui", req.SourceAgentID)
 		}
@@ -213,7 +249,7 @@ func TestGlobalReviewHandoffPublishesTopLevelRoute(t *testing.T) {
 	reqCh := make(chan *guide.RouteRequest, 1)
 	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
 		req, ok := msg.GetRouteRequest()
-		if !ok || req == nil || req.TargetAgentID != GlobalReviewAgentTester {
+		if !ok || req == nil || req.TargetAgentID != "tester-global-1" {
 			return nil
 		}
 		select {
@@ -238,6 +274,13 @@ func TestGlobalReviewHandoffPublishesTopLevelRoute(t *testing.T) {
 
 	skills := NewGlobalReviewProtocolSkills(GlobalReviewProtocolSkillConfig{
 		AgentType: func() string { return GlobalReviewAgentInspector },
+		AgentID:   func() string { return "inspector-global-1" },
+		ResolveTarget: func(agentType string) string {
+			if agentType == GlobalReviewAgentTester {
+				return "tester-global-1"
+			}
+			return agentType
+		},
 		Route: GlobalReviewRouteConfig{
 			Bus:       bus,
 			SessionID: func() string { return "sess-1" },
@@ -253,6 +296,9 @@ func TestGlobalReviewHandoffPublishesTopLevelRoute(t *testing.T) {
 
 	select {
 	case req := <-reqCh:
+		if req.TargetAgentID != "tester-global-1" {
+			t.Fatalf("target_agent_id = %q, want tester-global-1", req.TargetAgentID)
+		}
 		if req.ParentCorrelationID != "corr-handoff" {
 			t.Fatalf("parent_correlation_id = %q, want corr-handoff", req.ParentCorrelationID)
 		}
@@ -267,6 +313,164 @@ func TestGlobalReviewHandoffPublishesTopLevelRoute(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for global review handoff route")
+	}
+}
+
+func TestWithGlobalReviewContext_PreservesExistingState(t *testing.T) {
+	snapshot := &GlobalReviewSnapshot{
+		ReviewID:       "global-review-task_1",
+		CurrentRequest: "Audit the merged checkpoint for task_1.",
+		ActiveAgents:   []string{GlobalReviewAgentInspector},
+	}
+	outer := WithGlobalReviewContext(
+		context.Background(),
+		GlobalReviewMetadata(map[string]any{"task_id": "task_1"}, snapshot),
+	)
+	outerState := GlobalReviewStateFromContext(outer)
+	if outerState == nil {
+		t.Fatal("expected outer global review state")
+	}
+
+	inner := WithGlobalReviewContext(
+		outer,
+		GlobalReviewMetadata(map[string]any{"task_id": "task_1", "global_review_stage": "checkpoint"}, snapshot),
+	)
+	innerState := GlobalReviewStateFromContext(inner)
+	if innerState == nil {
+		t.Fatal("expected inner global review state")
+	}
+	if innerState != outerState {
+		t.Fatal("expected inner context to reuse the existing global review state")
+	}
+}
+
+func TestWrapGlobalReviewTurnResult_OuterContextPreservesRecordedAction(t *testing.T) {
+	snapshot := &GlobalReviewSnapshot{
+		ReviewID:       "global-review-task_1",
+		CurrentRequest: "Audit the merged checkpoint for task_1.",
+		ActiveAgents:   []string{GlobalReviewAgentInspector},
+	}
+	outer := WithGlobalReviewContext(
+		context.Background(),
+		GlobalReviewMetadata(map[string]any{"task_id": "task_1"}, snapshot),
+	)
+	inner := WithGlobalReviewContext(
+		outer,
+		GlobalReviewMetadata(map[string]any{"task_id": "task_1", "global_review_stage": "checkpoint"}, snapshot),
+	)
+	state := GlobalReviewStateFromContext(inner)
+	if state == nil {
+		t.Fatal("expected inner global review state")
+	}
+	action := &GlobalReviewTurnAction{
+		Type:          GlobalReviewActionChallenge,
+		AgentType:     GlobalReviewAgentInspector,
+		AgentID:       "inspector-global-1",
+		TargetAgent:   GlobalReviewAgentTester,
+		TargetAgentID: "tester-global-1",
+		Reason:        "Need tester-backed global validation before accepting the checkpoint.",
+		Request:       "Audit the merged checkpoint and return a validation result.",
+	}
+	if err := state.setTerminalAction(action); err != nil {
+		t.Fatalf("setTerminalAction: %v", err)
+	}
+
+	wrapped := WrapGlobalReviewTurnResult(outer, map[string]any{"response": "ok"})
+	turnResp, err := DecodeGlobalReviewTurnResponse(wrapped)
+	if err != nil {
+		t.Fatalf("DecodeGlobalReviewTurnResponse: %v", err)
+	}
+	if turnResp == nil || turnResp.Action == nil {
+		t.Fatal("expected wrapped global review turn response to include the recorded action")
+	}
+	if turnResp.Action.Type != GlobalReviewActionChallenge {
+		t.Fatalf("action type = %q, want %q", turnResp.Action.Type, GlobalReviewActionChallenge)
+	}
+	if turnResp.Action.TargetAgent != GlobalReviewAgentTester {
+		t.Fatalf("target agent = %q, want %q", turnResp.Action.TargetAgent, GlobalReviewAgentTester)
+	}
+	if turnResp.Action.AgentID != "inspector-global-1" {
+		t.Fatalf("agent id = %q, want inspector-global-1", turnResp.Action.AgentID)
+	}
+	if turnResp.Action.TargetAgentID != "tester-global-1" {
+		t.Fatalf("target agent id = %q, want tester-global-1", turnResp.Action.TargetAgentID)
+	}
+
+	wrapped = WrapGlobalReviewTurnResult(outer, &globalReviewDirectiveCarrierStub{
+		Response: "ok",
+		Directive: &guide.ResponseDirective{
+			Phase:   guide.PhasePlanApproval,
+			AgentID: "architect",
+		},
+	})
+	turnResp, err = DecodeGlobalReviewTurnResponse(wrapped)
+	if err != nil {
+		t.Fatalf("DecodeGlobalReviewTurnResponse(second): %v", err)
+	}
+	if directive := turnResp.ResponseDirective(); directive == nil || directive.AgentID != "architect" {
+		t.Fatalf("directive = %#v, want architect directive passthrough", directive)
+	}
+}
+
+func TestGlobalReviewValidateWork_RoutesBackToExactRequestingAgentID(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	t.Cleanup(func() { _ = bus.Close() })
+
+	reqCh := make(chan *guide.RouteRequest, 1)
+	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.TargetAgentID != "inspector-global-1" {
+			return nil
+		}
+		select {
+		case reqCh <- req:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	snapshot := &GlobalReviewSnapshot{
+		ReviewID: "review-validate-1",
+		PendingChallenge: &GlobalReviewChallenge{
+			ID:                "review-validate-1-challenge-1",
+			RequestingAgent:   GlobalReviewAgentInspector,
+			RequestingAgentID: "inspector-global-1",
+			TargetAgent:       GlobalReviewAgentArchitect,
+			TargetAgentID:     "architect",
+			Request:           "Clarify the checkpoint.",
+		},
+	}
+	ctx := WithGlobalReviewState(context.Background(), NewGlobalReviewState(snapshot, GlobalReviewMetadata(nil, snapshot)))
+	ctx = WithStreamContext(ctx, "corr-validate", "tui")
+
+	skills := NewGlobalReviewProtocolSkills(GlobalReviewProtocolSkillConfig{
+		AgentType: func() string { return GlobalReviewAgentArchitect },
+		AgentID:   func() string { return "architect" },
+		Route: GlobalReviewRouteConfig{
+			Bus:       bus,
+			SessionID: func() string { return "sess-1" },
+		},
+	})
+	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "validate_work", map[string]any{
+		"challenge_id":     "review-validate-1-challenge-1",
+		"requesting_agent": GlobalReviewAgentInspector,
+		"status":           string(GlobalReviewValidationPassed),
+		"summary":          "Checkpoint is plan-adherent.",
+	}); err != nil {
+		t.Fatalf("validate_work: %v", err)
+	}
+
+	select {
+	case req := <-reqCh:
+		if req.TargetAgentID != "inspector-global-1" {
+			t.Fatalf("target_agent_id = %q, want inspector-global-1", req.TargetAgentID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for validation route request")
 	}
 }
 
@@ -306,6 +510,13 @@ func TestGlobalReviewArchitectChallenge_CarriesCheckpointGuard(t *testing.T) {
 
 	skills := NewGlobalReviewProtocolSkills(GlobalReviewProtocolSkillConfig{
 		AgentType: func() string { return GlobalReviewAgentInspector },
+		AgentID:   func() string { return "inspector-global-1" },
+		ResolveTarget: func(agentType string) string {
+			if agentType == GlobalReviewAgentTester {
+				return "tester-global-1"
+			}
+			return agentType
+		},
 		Route: GlobalReviewRouteConfig{
 			Bus:       bus,
 			SessionID: func() string { return "sess-1" },

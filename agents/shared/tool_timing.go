@@ -134,6 +134,11 @@ func ActiveToolCallFromContext(ctx context.Context) (ActiveToolCallContext, bool
 
 // EmitToolCall invokes the emitter attached to ctx, if present.
 func EmitToolCall(ctx context.Context, event ToolCallEvent) {
+	if len(event.StreamMetadata) == 0 {
+		if stream, ok := StreamMetadataFromContext(ctx); ok && len(stream.Metadata) > 0 {
+			event.StreamMetadata = cloneStreamMetadata(stream.Metadata)
+		}
+	}
 	event.InterAgent = NormalizeInterAgentToolEventForEmit(
 		event.ToolName,
 		event.FullArgs,
@@ -142,12 +147,8 @@ func EmitToolCall(ctx context.Context, event ToolCallEvent) {
 		event.Success,
 		event.ErrorMsg,
 		event.InterAgent,
+		event.StreamMetadata,
 	)
-	if len(event.StreamMetadata) == 0 {
-		if stream, ok := StreamMetadataFromContext(ctx); ok && len(stream.Metadata) > 0 {
-			event.StreamMetadata = cloneStreamMetadata(stream.Metadata)
-		}
-	}
 	emitter, ok := ctx.Value(toolCallEmitterKey{}).(ToolCallEmitter)
 	if !ok || emitter == nil {
 		return

@@ -108,7 +108,7 @@ func buildInterAgentStartRecordFallback(ev msg.ToolCallEventMsg, args map[string
 			},
 		}, true
 	case isChallengeTool(ev.ToolName):
-		targets := challengeTargets(ev.ToolName, args, nil)
+		targets := challengeTargets(ev.ToolName, args, nil, ev.AgentType, ev.PipelineID)
 		if len(targets) == 0 {
 			return ToolCallRecord{}, false
 		}
@@ -242,7 +242,7 @@ func updateInterAgentCompletion(record *ToolCallRecord, ev msg.ToolCallEventMsg)
 		if threadKey := challengeThreadKey(ev.ToolName, args, output); threadKey != "" {
 			record.InterAgent.ThreadKey = threadKey
 		}
-		if labels := challengeTargets(ev.ToolName, args, output); len(labels) > 0 {
+		if labels := challengeTargets(ev.ToolName, args, output, ev.AgentType, ev.PipelineID); len(labels) > 0 {
 			record.InterAgent.AgentTypes = normalizeAgentTypes(labels)
 		}
 		if summary := normalizeInlineText(firstNonEmptyString(stringFromMap(args, "request"), record.InterAgent.Summary)); summary != "" {
@@ -524,15 +524,16 @@ func consultationTargets(toolName string, args map[string]any) []string {
 	}
 }
 
-func challengeTargets(toolName string, args, output map[string]any) []string {
+func challengeTargets(toolName string, args, output map[string]any, currentAgentType, pipelineID string) []string {
+	scope := challengeScope(toolName, args, output, currentAgentType, pipelineID)
 	if targets := stringSliceFromMap(args, "target_agents"); len(targets) > 0 {
-		return targets
+		return normalizeChallengeTargetsForScope(targets, scope)
 	}
 	if targets := stringSliceFromMap(output, "target_agents"); len(targets) > 0 {
-		return targets
+		return normalizeChallengeTargetsForScope(targets, scope)
 	}
 	if target := firstNonEmptyString(stringFromMap(args, "target_agent"), stringFromMap(output, "target_agent")); target != "" {
-		return []string{target}
+		return normalizeChallengeTargetsForScope([]string{target}, scope)
 	}
 	switch strings.TrimSpace(toolName) {
 	case "challenge_global_tester":
@@ -544,6 +545,43 @@ func challengeTargets(toolName string, args, output map[string]any) []string {
 	default:
 		return nil
 	}
+}
+
+func challengeScope(toolName string, args, output map[string]any, currentAgentType, pipelineID string) string {
+	scope := firstNonEmptyString(stringFromMap(output, "protocol_scope"), stringFromMap(args, "protocol_scope"))
+	if scope != "" {
+		return scope
+	}
+	if strings.TrimSpace(pipelineID) != "" {
+		return "pipeline"
+	}
+	switch normalizeAgentTypeLabel(currentAgentType) {
+	case "inspector-pipeline", "tester-pipeline", "engineer", "designer":
+		return "pipeline"
+	}
+	if strings.TrimSpace(toolName) == "challenge_agent" && firstNonEmptyString(stringFromMap(output, "challenge_id"), stringFromMap(args, "challenge_id")) != "" {
+		return "pipeline"
+	}
+	return ""
+}
+
+func normalizeChallengeTargetsForScope(targets []string, scope string) []string {
+	targets = normalizeAgentTypes(targets)
+	if scope != "pipeline" {
+		return targets
+	}
+	out := make([]string, 0, len(targets))
+	for _, target := range targets {
+		switch normalizeAgentTypeLabel(target) {
+		case "inspector":
+			out = append(out, "inspector-pipeline")
+		case "tester":
+			out = append(out, "tester-pipeline")
+		default:
+			out = append(out, normalizeAgentTypeLabel(target))
+		}
+	}
+	return normalizeAgentTypes(out)
 }
 
 func challengeThreadKey(toolName string, args, output map[string]any) string {

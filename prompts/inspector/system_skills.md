@@ -74,7 +74,10 @@ Rules:
 
 ## When Operating As The Global Inspector
 
-- Treat `load_plan_context`, `consult_librarian_style`, `consult_academic_approach`, and `consult_archivalist_context` as high-value audit tools. Use them when they materially strengthen the verdict; skip rote consultation for trivial or boilerplate work.
+- Call `determine_audit_depth` first on every fresh global-audit branch before any other audit or consultation work. Use its returned depth as the branch-wide default for your own assessment and for any knowledge consults that support depth. Only revise that depth after the branch changes materially.
+- Treat `load_plan_context`, `consult_librarian_style`, `consult_academic_approach`, and `consult_archivalist_context` as escalation tools for unresolved audit gaps after direct evidence review.
+- Use `load_plan_context` to recover missing plan slices or final-review whole-plan context, not as a reflex on every global audit branch.
+- Default to zero external consults on small or local audits. Use at most one consult per distinct unresolved gap unless returned evidence materially changes the question.
 - Respect the review stage metadata. At checkpoint reviews, challenge drift, regressions, slop, and future-plan hazards, but do not mark later planned work as missing just because it has not been merged yet.
 - Use `handoff_next` for the ordinary top-level Inspector <-> Tester loop: Inspector -> Tester for broad merged-state validation, Tester -> Inspector when returning completed top-level validation evidence.
 - Use `challenge_agent` only when a specific returned deliverable or authority gap needs targeted follow-up. Challenge Tester for narrow testing gaps, Orchestrator for authoritative DAG/workflow/task/pipeline/progress state, and Architect for plan/rationale defects or stronger alternatives.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +61,44 @@ func TestEffectiveResearchDepthDefaultsToStandard(t *testing.T) {
 	}
 	if got := EffectiveResearchDepth("unknown"); got != ResearchDepthStandard {
 		t.Fatalf("EffectiveResearchDepth(\"unknown\") = %q, want %q", got, ResearchDepthStandard)
+	}
+}
+
+func TestAdmitConsultation_StandardDepthAllowsNovelNestedConsult(t *testing.T) {
+	rootCorr := fmt.Sprintf("corr-root-standard-%d", time.Now().UnixNano())
+	childCorr := fmt.Sprintf("corr-child-standard-%d", time.Now().UnixNano())
+	ctx := WithStreamContext(context.Background(), rootCorr, "inspector")
+	root := AdmitConsultation(ctx, "academic", "challenge the current packaging approach", ConsultationMetadataWithResearchDepth(nil, "standard"))
+	if !root.Allowed {
+		t.Fatalf("root consult unexpectedly blocked: %+v", root)
+	}
+	if root.Depth != 1 {
+		t.Fatalf("root depth = %d, want 1", root.Depth)
+	}
+
+	childCtx := WithForwardedStreamContext(context.Background(), childCorr, "academic", rootCorr, root.Metadata)
+	child := AdmitConsultation(childCtx, "librarian", "check repository packaging conventions", nil)
+	if !child.Allowed {
+		t.Fatalf("nested consult unexpectedly blocked: %+v", child)
+	}
+	if child.Depth != 2 {
+		t.Fatalf("child depth = %d, want 2", child.Depth)
+	}
+}
+
+func TestAdmitConsultation_RepeatedSameQuestionToSameTargetIsBlocked(t *testing.T) {
+	rootCorr := fmt.Sprintf("corr-root-repeat-%d", time.Now().UnixNano())
+	ctx := WithStreamContext(context.Background(), rootCorr, "inspector")
+	first := AdmitConsultation(ctx, "academic", "is hatchling the right backend here?", ConsultationMetadataWithResearchDepth(nil, "standard"))
+	if !first.Allowed {
+		t.Fatalf("first consult unexpectedly blocked: %+v", first)
+	}
+	second := AdmitConsultation(ctx, "academic", "is hatchling the right backend here?", ConsultationMetadataWithResearchDepth(nil, "standard"))
+	if second.Allowed {
+		t.Fatalf("expected duplicate consult to be blocked, got %+v", second)
+	}
+	if second.Guidance == "" || !strings.Contains(strings.ToLower(second.Guidance), "consultation pressure") {
+		t.Fatalf("guidance = %q, want pressure guidance", second.Guidance)
 	}
 }
 

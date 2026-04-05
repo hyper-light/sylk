@@ -99,6 +99,71 @@ func TestCompleteWithWatchdog_StreamsLiveTurnForTUI(t *testing.T) {
 	}
 }
 
+func TestCompleteWithWatchdog_SuppressesTesterThoughtProgress(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	channels := guide.NewAgentChannels("tester", "tester")
+	streams := make(chan *guide.StreamResponse, 8)
+	sub, err := bus.Subscribe(channels.Responses, func(msg *guide.Message) error {
+		if stream, ok := msg.GetStreamResponse(); ok && stream != nil {
+			streams <- stream
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	ctx := WithStreamContext(context.Background(), "corr-tester-live", "tui")
+	ctx = WithStreamContextMetadata(ctx, map[string]any{"agent_type": "tester"})
+	ctx = WithProgressPublisher(ctx, &ProgressPublisher{
+		Bus:           bus,
+		Channels:      channels,
+		AgentID:       "tester",
+		CorrelationID: "corr-tester-live",
+		SourceAgentID: "tui",
+	})
+
+	provider := &streamingWatchdogProvider{}
+	resp, err := CompleteWithWatchdog(ctx, provider, &providers.Request{
+		Model: "gpt-5.4-pro",
+	}, AgentDisplayName("tester"))
+	if err != nil {
+		t.Fatalf("CompleteWithWatchdog: %v", err)
+	}
+	if !ResponseStreamedText(resp) {
+		t.Fatal("expected streamed response to be marked as live-text streamed")
+	}
+
+	deadline := time.After(2 * time.Second)
+	var sawThought, sawText bool
+	for !sawText {
+		select {
+		case stream := <-streams:
+			if stream == nil || stream.Event == nil {
+				continue
+			}
+			switch stream.Event.Type {
+			case guide.StreamEventProgress:
+				if data, ok := stream.Event.Data.(*guide.ProgressData); ok && data.Message == "Planning the response." {
+					sawThought = true
+				}
+			case guide.StreamEventData:
+				if stream.Event.Text == "Live streamed reply." {
+					sawText = true
+				}
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for tester live stream; sawThought=%v sawText=%v", sawThought, sawText)
+		}
+	}
+	if sawThought {
+		t.Fatal("expected tester thought summary progress to be suppressed")
+	}
+}
+
 func TestCompleteWithWatchdog_KeepsSyncPathForInternalTurns(t *testing.T) {
 	req := &providers.Request{Model: "gpt-5.4-pro"}
 	provider := &streamingWatchdogProvider{}

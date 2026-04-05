@@ -569,7 +569,7 @@ func (g *GoogleProvider) processCodeAssistSSE(
 		}
 
 		if raw := extractVertexRawContent(vResp); raw != nil {
-			rawContent = raw
+			rawContent = mergeGoogleRawContent(rawContent, raw)
 		}
 
 		text, thought := extractVertexStreamParts(vResp)
@@ -760,7 +760,7 @@ func extractVertexRawContent(resp *vertexStreamResponse) *googleSerializableCont
 			sp.FunctionCallName = vp.FunctionCall.Name
 			sp.FunctionCallArgs = vp.FunctionCall.Args
 		}
-		if sp.Text == "" && sp.FunctionCallName == "" && !sp.Thought {
+		if !sp.hasReplayData() {
 			continue
 		}
 		sc.Parts = append(sc.Parts, sp)

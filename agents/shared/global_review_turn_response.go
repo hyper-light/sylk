@@ -3,10 +3,16 @@ package shared
 import (
 	"encoding/json"
 	"strings"
+
+	"github.com/adalundhe/sylk/agents/guide"
 )
 
 type globalReviewResponseTexter interface {
 	ResponseText() string
+}
+
+type globalReviewDirectiveCarrier interface {
+	ResponseDirective() *guide.ResponseDirective
 }
 
 // GlobalReviewTurnResponse carries the human-facing response text plus the
@@ -27,6 +33,16 @@ func (r *GlobalReviewTurnResponse) ResponseText() string {
 		return strings.TrimSpace(rt.ResponseText())
 	}
 	return ""
+}
+
+func (r *GlobalReviewTurnResponse) ResponseDirective() *guide.ResponseDirective {
+	if r == nil || r.Result == nil {
+		return nil
+	}
+	if carrier, ok := r.Result.(globalReviewDirectiveCarrier); ok {
+		return carrier.ResponseDirective()
+	}
+	return nil
 }
 
 func EncodeGlobalReviewTurnResponse(resp *GlobalReviewTurnResponse) any {

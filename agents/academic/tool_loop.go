@@ -170,10 +170,14 @@ func (a *Academic) executeToolLoop(
 	autoFetchAttempts := make(map[string]struct{})
 	seen := make(map[shared.ToolCallSignature]int, maxRuns)
 	baseTools := append([]providers.Tool(nil), req.Tools...)
+	execState := academicResearchExecutionStateFromContext(ctx)
 	if surface == nil {
 		surface = a.toolRuntime()
 	}
 	bundle := academicToolBundleFromContext(ctx)
+	if execState != nil {
+		defer a.commitWebSearchLearning(ctx, execState)
+	}
 
 	p := a.getProvider()
 	if p == nil {
@@ -236,7 +240,7 @@ func (a *Academic) executeToolLoop(
 			baseTools = a.buildToolDefinitionsWithSurface(surface)
 			a.toolDefsDirty = false
 		}
-		req.Tools = append([]providers.Tool(nil), baseTools...)
+		req.Tools = a.applyAdaptiveWebSearchBudget(ctx, baseTools, execState)
 
 		// ── CONTEXT BUDGET ──
 		if err := shared.ApplyContextBudget(ctx, turn, maxRuns, req); err != nil {
@@ -264,10 +268,7 @@ func (a *Academic) executeToolLoop(
 		if !streamed {
 			shared.PublishIntermediateToolTurn(a.bus, a.channels, ctx, a.id, resp)
 		}
-		var (
-			execState                  = academicResearchExecutionStateFromContext(ctx)
-			responseAutoFetchCandidate researchExecutionDiscoveredResult
-		)
+		var responseAutoFetchCandidate researchExecutionDiscoveredResult
 		if execState != nil {
 			execState.observeProviderResponse(ctx, a, resp)
 			responseAutoFetchCandidate, _ = a.autoFetchCandidateForProviderResponse(resp, execState, autoFetchAttempts)

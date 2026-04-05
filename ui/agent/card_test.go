@@ -135,3 +135,52 @@ func TestRenderCard_KnowledgeReplicaSuffixPreservesWidth(t *testing.T) {
 		t.Fatalf("card display width = %d, want %d for %q", got, width, plain)
 	}
 }
+
+func TestRenderCard_GlobalPendingSuperscriptPreservesWidth(t *testing.T) {
+	th := theme.DefaultDark()
+	width := 52
+	agent := AgentState{
+		ID:             "inspector",
+		Name:           "Inspector",
+		AgentType:      "inspector",
+		Category:       "standalone",
+		Status:         StatusThinking,
+		TaskSummary:    "Cross-checking queued validation work against recent handoffs.",
+		ContextUsage:   0.06,
+		QueuedRequests: 4,
+	}
+
+	card := RenderCard(agent, width, th, false, false, "", AnimState{})
+	plain := stripANSI(card)
+	if !strings.Contains(plain, "Inspector ⁺⁴") {
+		t.Fatalf("card = %q, want global pending superscript suffix", plain)
+	}
+	if got := displayWidth(card, false); got != width {
+		t.Fatalf("card display width = %d, want %d for %q", got, width, plain)
+	}
+}
+
+func TestRenderCard_PipelineTesterDoesNotUseGlobalPendingSuperscript(t *testing.T) {
+	th := theme.DefaultDark()
+	width := 58
+	agent := AgentState{
+		ID:             "task_7:tester-pipeline",
+		Name:           "Tester",
+		AgentType:      "tester",
+		Category:       "standalone",
+		PipelineID:     "task_7",
+		Status:         StatusThinking,
+		TaskSummary:    "Reviewing queued pipeline checks.",
+		ContextUsage:   0.12,
+		QueuedRequests: 2,
+	}
+
+	card := RenderCard(agent, width, th, false, false, "", AnimState{})
+	plain := stripANSI(card)
+	if strings.Contains(plain, "Tester ⁺²") {
+		t.Fatalf("card = %q, did not expect global pending superscript suffix", plain)
+	}
+	if got := displayWidth(card, false); got != width {
+		t.Fatalf("card display width = %d, want %d for %q", got, width, plain)
+	}
+}

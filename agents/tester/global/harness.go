@@ -9,10 +9,10 @@ import (
 // It is populated through the build_harness skill and any leased global writes
 // needed to materialize harness files.
 type TestHarness struct {
-	Fixtures     []TestFixture   `json:"fixtures"`
-	MockServers  []MockServer    `json:"mock_servers"`
-	TestDBs      []TestDB        `json:"test_dbs"`
-	CreatedFiles []string        `json:"created_files"`
+	Fixtures     []TestFixture `json:"fixtures"`
+	MockServers  []MockServer  `json:"mock_servers"`
+	TestDBs      []TestDB      `json:"test_dbs"`
+	CreatedFiles []string      `json:"created_files"`
 	mu           sync.RWMutex
 }
 
@@ -54,6 +54,11 @@ func NewTestHarness() *TestHarness {
 func (h *TestHarness) AddFixture(f TestFixture) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	for _, existing := range h.Fixtures {
+		if existing.Name == f.Name && existing.Type == f.Type && existing.File == f.File {
+			return
+		}
+	}
 	h.Fixtures = append(h.Fixtures, f)
 }
 
@@ -61,6 +66,11 @@ func (h *TestHarness) AddFixture(f TestFixture) {
 func (h *TestHarness) AddMockServer(m MockServer) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	for _, existing := range h.MockServers {
+		if existing.Name == m.Name && existing.Endpoint == m.Endpoint && existing.File == m.File {
+			return
+		}
+	}
 	h.MockServers = append(h.MockServers, m)
 }
 
@@ -68,6 +78,11 @@ func (h *TestHarness) AddMockServer(m MockServer) {
 func (h *TestHarness) AddTestDB(db TestDB) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	for _, existing := range h.TestDBs {
+		if existing.Name == db.Name && existing.Driver == db.Driver && existing.File == db.File {
+			return
+		}
+	}
 	h.TestDBs = append(h.TestDBs, db)
 }
 
@@ -75,6 +90,11 @@ func (h *TestHarness) AddTestDB(db TestDB) {
 func (h *TestHarness) TrackFile(path string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	for _, existing := range h.CreatedFiles {
+		if existing == path {
+			return
+		}
+	}
 	h.CreatedFiles = append(h.CreatedFiles, path)
 }
 

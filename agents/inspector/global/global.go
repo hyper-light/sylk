@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -451,11 +452,17 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	ctx = agentShared.WithForwardedTaskScope(ctx, fwd.Metadata)
+	hadGlobalReviewState := agentShared.GlobalReviewStateFromContext(ctx) != nil
 	ctx = agentShared.WithGlobalReviewContext(ctx, fwd.Metadata)
-	defer agentShared.CloseGlobalReviewState(ctx)
+	ctx = agentShared.WithAuditDepthContext(ctx, fwd.Metadata)
+	if !hadGlobalReviewState {
+		defer agentShared.CloseGlobalReviewState(ctx)
+	}
 	contract := agentShared.BuildGlobalExecutionContract("inspector-global", fwd.Intent, fwd.Input)
+	ctx = withGlobalAuditRequestState(ctx, fwd.Input, contract, fwd.Metadata)
 	systemPrompt := shared.GlobalInspectorSystemPromptForContract(contract)
 	systemPrompt = agentShared.AppendGlobalExecutionGuidance(systemPrompt, contract, "inspector-global")
+	systemPrompt = appendAuditDepthGuidance(systemPrompt, ctx)
 	gi.prepareSkillsForInput(fwd.Input)
 	tools := gi.buildToolDefinitions()
 
@@ -520,6 +527,13 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 	defer cancel()
 
 	ctx := reqCtx
+	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
+	ctx = agentShared.WithForwardedTaskScope(ctx, fwd.Metadata)
+	hadGlobalReviewState := agentShared.GlobalReviewStateFromContext(ctx) != nil
+	ctx = agentShared.WithGlobalReviewContext(ctx, fwd.Metadata)
+	if !hadGlobalReviewState {
+		defer agentShared.CloseGlobalReviewState(ctx)
+	}
 	ctx = agentShared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	startTime := time.Now()
@@ -577,8 +591,15 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 	// For streamed conversations, include the authoritative text in the
 	// completion event so the chat model can correct dropped/reordered chunks.
 	completeText := extractInspectorUserResponse(result)
+	directive := extractInspectorResponseDirective(result)
 	if publishStreamLifecycle {
-		shared.PublishStreamComplete(gi.bus, gi.channels, ctx, gi.id, completeText, usageAcc.Total())
+		shared.PublishStreamEvent(gi.bus, gi.channels, ctx, gi.id, &guide.StreamEvent{
+			Type:      guide.StreamEventComplete,
+			Text:      completeText,
+			Usage:     usageAcc.Total(),
+			Directive: directive,
+			Timestamp: time.Now(),
+		})
 	}
 	if fwd.FireAndForget {
 		return nil
@@ -639,6 +660,27 @@ func (gi *GlobalInspector) getState() *shared.InspectorState {
 	gi.mu.RLock()
 	defer gi.mu.RUnlock()
 	return nil // state tracked during audit operations
+}
+
+func (gi *GlobalInspector) knownAgentIDByType(agentType, fallback string) string {
+	if gi == nil {
+		return fallback
+	}
+	targetType := strings.TrimSpace(agentType)
+	if targetType == "" {
+		return fallback
+	}
+	gi.knownAgentsMu.RLock()
+	defer gi.knownAgentsMu.RUnlock()
+	for _, ann := range gi.knownAgents {
+		if ann == nil {
+			continue
+		}
+		if strings.TrimSpace(ann.AgentType) == targetType && strings.TrimSpace(ann.AgentID) != "" {
+			return strings.TrimSpace(ann.AgentID)
+		}
+	}
+	return fallback
 }
 
 func (gi *GlobalInspector) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {

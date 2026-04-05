@@ -2,6 +2,7 @@ package academic
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -207,5 +208,32 @@ func TestAcademicRequestConsultation_PropagatesRouteHopsFromContext(t *testing.T
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for consultation request")
+	}
+}
+
+func TestAcademicRequestConsultation_DeliberationPressureReturnsStructuredFailure(t *testing.T) {
+	a, err := New(Config{ID: "academic-custom", SessionID: "sess-config"}, nil)
+	if err != nil {
+		t.Fatalf("new academic: %v", err)
+	}
+
+	ctx := shared.WithStreamContext(context.Background(), "corr-academic-repeat", "academic")
+	first := shared.AdmitConsultation(ctx, "librarian", "inspect repo layout", nil)
+	if !first.Allowed {
+		t.Fatalf("first admit unexpectedly blocked: %+v", first)
+	}
+
+	evidence, err := a.requestConsultation(ctx, "librarian", "inspect repo layout", "", "sess-config")
+	if err != nil {
+		t.Fatalf("requestConsultation() error = %v, want nil structured failure", err)
+	}
+	if evidence == nil {
+		t.Fatal("expected consultation evidence")
+	}
+	if evidence.Success {
+		t.Fatalf("success = true, want blocked failure evidence")
+	}
+	if !strings.Contains(strings.ToLower(evidence.Error), "consultation pressure") {
+		t.Fatalf("error = %q, want consultation pressure guidance", evidence.Error)
 	}
 }

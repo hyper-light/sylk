@@ -689,7 +689,7 @@ func TestTaskRouter_DeliverResponse_MirrorsUntrackedProtocolStreamAndRecordsActi
 	}
 }
 
-func TestTaskRouter_PublishUserVisibleRoute_MirrorsGlobalFollowupToTUI(t *testing.T) {
+func TestTaskRouter_PublishUserVisibleRoute_MarksGuideVisibleTarget(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
@@ -710,26 +710,6 @@ func TestTaskRouter_PublishUserVisibleRoute_MirrorsGlobalFollowupToTUI(t *testin
 	})
 	require.NoError(t, err)
 	defer reqSub.Unsubscribe()
-
-	tuiStreamCh := make(chan *guide.StreamResponse, 1)
-	tuiRespCh := make(chan *guide.RouteResponse, 1)
-	tuiSub, err := bus.SubscribeAsync(guide.TopicResponses("tui", "tui"), func(msg *guide.Message) error {
-		if stream, ok := msg.GetStreamResponse(); ok && stream != nil {
-			select {
-			case tuiStreamCh <- stream:
-			default:
-			}
-		}
-		if resp, ok := msg.GetRouteResponse(); ok && resp != nil {
-			select {
-			case tuiRespCh <- resp:
-			default:
-			}
-		}
-		return nil
-	})
-	require.NoError(t, err)
-	defer tuiSub.Unsubscribe()
 
 	req := &guide.RouteRequest{
 		CorrelationID:   "ot_followup_1",
@@ -755,6 +735,7 @@ func TestTaskRouter_PublishUserVisibleRoute_MirrorsGlobalFollowupToTUI(t *testin
 		require.NotNil(t, published)
 		assert.Equal(t, req.CorrelationID, published.CorrelationID)
 		assert.Equal(t, "inspector", published.TargetAgentID)
+		assert.Equal(t, "tui", published.Metadata["chat_visible_target"])
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected user-visible guide request to be published")
 	}
@@ -777,19 +758,6 @@ func TestTaskRouter_PublishUserVisibleRoute_MirrorsGlobalFollowupToTUI(t *testin
 	}
 	require.True(t, router.DeliverResponse(streamMsg))
 
-	select {
-	case mirrored := <-tuiStreamCh:
-		require.NotNil(t, mirrored)
-		assert.Equal(t, "tui", mirrored.TargetAgentID)
-		assert.Equal(t, "inspector", mirrored.RespondingAgentID)
-		assert.Equal(t, "inspector", mirrored.Metadata["agent_type"])
-		assert.Equal(t, "task-1", mirrored.Metadata["task_id"])
-		assert.Equal(t, "Hello CLI", mirrored.Metadata["task_name"])
-		assert.Equal(t, "hello-cli", mirrored.Metadata["task_slug"])
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected mirrored visible stream on the TUI response topic")
-	}
-
 	respMsg := guide.NewResponseMessage("", &guide.RouteResponse{
 		CorrelationID:       req.CorrelationID,
 		Success:             true,
@@ -799,40 +767,90 @@ func TestTaskRouter_PublishUserVisibleRoute_MirrorsGlobalFollowupToTUI(t *testin
 	})
 	respMsg.CorrelationID = req.CorrelationID
 	require.True(t, router.DeliverResponse(respMsg))
-
-	select {
-	case mirrored := <-tuiRespCh:
-		require.NotNil(t, mirrored)
-		assert.Equal(t, req.CorrelationID, mirrored.CorrelationID)
-		assert.True(t, mirrored.Success)
-		assert.Equal(t, "Global inspector audit complete.", mirrored.Data)
-		assert.Equal(t, "inspector", mirrored.RespondingAgentID)
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected mirrored visible terminal response on the TUI response topic")
-	}
 }
 
-func TestTaskRouter_PublishUserVisibleRoute_MirrorsNestedVisibleChildStreamsToTUI(t *testing.T) {
+func TestTaskRouter_PublishUserVisibleRoute_PreservesPipelineVisibleTargetMetadata(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
 	scope := testScope()
 	router := testRouter(bus, scope)
 
-	tuiStreamCh := make(chan *guide.StreamResponse, 4)
-	tuiSub, err := bus.SubscribeAsync(guide.TopicResponses("tui", "tui"), func(msg *guide.Message) error {
-		stream, ok := msg.GetStreamResponse()
-		if !ok || stream == nil {
+	reqCh := make(chan *guide.RouteRequest, 1)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
 			return nil
 		}
 		select {
-		case tuiStreamCh <- stream:
+		case reqCh <- req:
 		default:
 		}
 		return nil
 	})
 	require.NoError(t, err)
-	defer tuiSub.Unsubscribe()
+	defer reqSub.Unsubscribe()
+
+	req := &guide.RouteRequest{
+		CorrelationID:   "pipe_visible_runtime_id_1",
+		Input:           "Implement the pipeline task.",
+		TargetAgentID:   PipelineWorkerRoutingTarget("task-1", "engineer"),
+		ExplicitTarget:  true,
+		SourceAgentID:   "orchestrator",
+		SourceAgentName: "orchestrator",
+		SessionID:       "test-session",
+		Metadata: map[string]any{
+			"agent_type":    "engineer",
+			"task_id":       "task-1",
+			"task_name":     "Hello CLI",
+			"task_slug":     "hello-cli",
+			"pipeline_task": true,
+		},
+		Timestamp: time.Now(),
+	}
+	require.NoError(t, router.PublishUserVisibleRoute(req))
+
+	select {
+	case published := <-reqCh:
+		require.NotNil(t, published)
+		assert.Equal(t, "tui", published.Metadata["chat_visible_target"])
+		assert.Equal(t, true, published.Metadata["pipeline_task"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected visible route request to publish")
+	}
+
+	streamMsg := &guide.Message{
+		ID:            "stream-visible-runtime-id-1",
+		CorrelationID: req.CorrelationID,
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID: req.CorrelationID,
+			Metadata: map[string]any{
+				"agent_type":       "engineer",
+				"task_id":          "task-1",
+				"task_name":        "Hello CLI",
+				"task_slug":        "hello-cli",
+				"pipeline_id":      "task-1",
+				"runtime_agent_id": "engineer-runtime-1",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Implementing task"},
+			},
+		},
+		SourceAgentID: "engineer",
+		TargetAgentID: "orchestrator",
+		Timestamp:     time.Now(),
+	}
+	require.True(t, router.DeliverResponse(streamMsg))
+}
+
+func TestTaskRouter_PublishUserVisibleRoute_ConsumesNestedVisibleChildStreams(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
 
 	req := &guide.RouteRequest{
 		CorrelationID:   "ot_followup_nested_1",
@@ -878,20 +896,6 @@ func TestTaskRouter_PublishUserVisibleRoute_MirrorsNestedVisibleChildStreamsToTU
 	}
 	require.True(t, router.DeliverResponse(childMsg))
 
-	select {
-	case mirrored := <-tuiStreamCh:
-		require.NotNil(t, mirrored)
-		assert.Equal(t, "tui", mirrored.TargetAgentID)
-		assert.Equal(t, "academic", mirrored.RespondingAgentID)
-		assert.Equal(t, req.Metadata["task_id"], mirrored.Metadata["task_id"])
-		assert.Equal(t, req.Metadata["task_slug"], mirrored.Metadata["task_slug"])
-		assert.Equal(t, req.CorrelationID, mirrored.Metadata["chat_parent_correlation_id"])
-		assert.Equal(t, "consult-academic-1", mirrored.Metadata["chat_parent_tool_call_key"])
-		assert.Equal(t, agentshared.InterAgentToolEventKindConsult, mirrored.Metadata["chat_inter_agent_kind"])
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected nested child stream to be mirrored to the TUI response topic")
-	}
-
 	grandchildMsg := &guide.Message{
 		ID:            "stream-visible-grandchild-1",
 		CorrelationID: "corr-grandchild-librarian",
@@ -916,19 +920,6 @@ func TestTaskRouter_PublishUserVisibleRoute_MirrorsNestedVisibleChildStreamsToTU
 		Timestamp:     time.Now(),
 	}
 	require.True(t, router.DeliverResponse(grandchildMsg))
-
-	select {
-	case mirrored := <-tuiStreamCh:
-		require.NotNil(t, mirrored)
-		assert.Equal(t, "tui", mirrored.TargetAgentID)
-		assert.Equal(t, "librarian", mirrored.RespondingAgentID)
-		assert.Equal(t, req.Metadata["task_id"], mirrored.Metadata["task_id"])
-		assert.Equal(t, "corr-child-academic", mirrored.Metadata["chat_parent_correlation_id"])
-		assert.Equal(t, "consult-librarian-1", mirrored.Metadata["chat_parent_tool_call_key"])
-		assert.Equal(t, agentshared.InterAgentToolEventKindConsult, mirrored.Metadata["chat_inter_agent_kind"])
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected nested grandchild stream to be mirrored to the TUI response topic")
-	}
 }
 
 func TestTaskRouter_PublishUserVisibleRoute_QueuesOTFollowupsPerReviewer(t *testing.T) {
