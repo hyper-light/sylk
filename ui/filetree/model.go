@@ -2475,7 +2475,6 @@ func (m *Model) exitNewEntry() {
 // handleNewEntryKey processes keys while the new-entry input is active.
 func (m *Model) handleNewEntryKey(key tea.KeyMsg) tea.Cmd {
 
-
 	switch key.String() {
 	case "escape":
 		m.exitNewEntry()
@@ -2684,7 +2683,6 @@ func (m *Model) exitRename() {
 // handleRenameKey processes keys while the rename input is active.
 func (m *Model) handleRenameKey(key tea.KeyMsg) tea.Cmd {
 
-
 	switch key.String() {
 	case "escape":
 		m.exitRename()
@@ -2868,7 +2866,6 @@ func (m *Model) enterSearch() {
 	m.searchScroll = 0
 	m.searchNumWidth = 0
 	m.searchDone = true
-
 
 	// Create async search worker.
 	m.searchWorker = NewSearchWorker()
