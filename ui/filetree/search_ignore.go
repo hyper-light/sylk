@@ -3,6 +3,7 @@ package filetree
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
 )
