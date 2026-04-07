@@ -87,6 +87,29 @@ func TestExtractAcceptanceResult_ParsesJSONStringData(t *testing.T) {
 	}
 }
 
+func TestExtractAcceptanceResult_ParsesFencedJSONStringData(t *testing.T) {
+	payload := &planAcceptancePayload{
+		Plan:         "plan",
+		PlanID:       "plan-1",
+		PlanName:     "Build feature",
+		UserResponse: "go ahead",
+	}
+	msg := guide.NewResponseMessage("resp-1", &guide.RouteResponse{
+		CorrelationID:     "corr-1",
+		Success:           true,
+		RespondingAgentID: "guide",
+		Data:              "```json\n{\"result\":\"accept\",\"modifications\":[]}\n```",
+	})
+
+	result, err := extractAcceptanceResult(msg, payload)
+	if err != nil {
+		t.Fatalf("extractAcceptanceResult error = %v", err)
+	}
+	if result.Result != "accept" {
+		t.Fatalf("result = %q, want accept", result.Result)
+	}
+}
+
 func TestExtractAcceptanceResult_FallsBackToUserResponseVerdict(t *testing.T) {
 	payload := &planAcceptancePayload{
 		Plan:         "plan",
