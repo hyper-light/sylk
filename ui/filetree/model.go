@@ -3899,7 +3899,8 @@ func (m *Model) loadDir(root string, depth int) {
 
 // readDir reads directory contents and returns sorted Entry slices.
 // Directories are listed before files, both sorted alphabetically.
-// Hidden files (dot-prefixed) are excluded.
+// Dot-prefixed entries are included so config files remain reachable,
+// but VCS metadata directories are excluded.
 func (m *Model) readDir(dirPath string, depth int) []Entry {
 	dirEntries, err := os.ReadDir(dirPath)
 	if err != nil {
@@ -3909,7 +3910,7 @@ func (m *Model) readDir(dirPath string, depth int) []Entry {
 	var dirs, files []Entry
 	for _, de := range dirEntries {
 		name := de.Name()
-		if strings.HasPrefix(name, ".") {
+		if shouldSkipTreeEntry(name, de.IsDir()) {
 			continue
 		}
 		entry := Entry{

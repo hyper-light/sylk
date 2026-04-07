@@ -3,7 +3,6 @@ package filetree
 import (
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
 )
@@ -17,10 +16,14 @@ import (
 const maxWalkDepth = 32
 
 // collectSearchableFiles walks rootPath recursively, respecting .gitignore
-// rules at every directory level, and returns all non-ignored, non-hidden
-// file paths. Entire ignored directory trees are pruned at the directory
-// level — a single matcher.Match call skips node_modules/, vendor/, etc.
-// without descending into them.
+// rules at every directory level, and returns all non-ignored file paths.
+// Dot-prefixed files and directories are included so config files like
+// .env, .editorconfig, and .github/workflows/... participate in tree search,
+// but VCS metadata directories remain excluded.
+//
+// Entire ignored directory trees are pruned at the directory level — a
+// single matcher.Match call skips node_modules/, vendor/, etc. without
+// descending into them.
 //
 // No artificial file count limit; output volume is bounded downstream by
 // maxTotalMatches.
@@ -40,8 +43,8 @@ func rootIgnorePatterns(rootPath string) []gitignore.Pattern {
 	return patterns
 }
 
-// walkCollect recursively collects non-ignored, non-hidden file paths from
-// absPath. parentPatterns accumulate gitignore rules from ancestor dirs.
+// walkCollect recursively collects non-ignored file paths from absPath.
+// parentPatterns accumulate gitignore rules from ancestor dirs.
 // relParts is the slash-split relative path from the project root.
 func walkCollect(absPath string, relParts []string, parentPatterns []gitignore.Pattern, files *[]string) {
 	if len(relParts) >= maxWalkDepth {
@@ -58,7 +61,7 @@ func walkCollect(absPath string, relParts []string, parentPatterns []gitignore.P
 
 	for _, de := range dirEntries {
 		name := de.Name()
-		if strings.HasPrefix(name, ".") {
+		if shouldSkipTreeEntry(name, de.IsDir()) {
 			continue
 		}
 		childRel := append(relParts[:len(relParts):len(relParts)], name)
