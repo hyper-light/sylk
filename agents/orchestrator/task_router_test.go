@@ -1143,6 +1143,100 @@ func TestTaskRouter_PublishUserVisibleRoute_HoldsSerializedReviewSlotAcrossChild
 	}
 }
 
+func TestTaskRouter_PublishUserVisibleRoute_ReleasesSerializedReviewSlotAfterProtocolRefusal(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+
+	reqCh := make(chan *guide.RouteRequest, 4)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil || req.Metadata["ot_handoff_followup"] != true {
+			return nil
+		}
+		reqCh <- req
+		return nil
+	})
+	require.NoError(t, err)
+	defer reqSub.Unsubscribe()
+
+	req1 := &guide.RouteRequest{
+		CorrelationID:   "ot_followup_review_refusal_a",
+		Input:           "Audit candidate A.",
+		TargetAgentID:   "inspector",
+		ExplicitTarget:  true,
+		SourceAgentID:   "orchestrator",
+		SourceAgentName: "orchestrator",
+		SessionID:       "test-session",
+		Timestamp:       time.Date(2026, 3, 25, 16, 0, 0, 0, time.UTC),
+		Metadata: map[string]any{
+			"agent_type":                    "inspector",
+			"task_id":                       "task-a",
+			"ot_handoff_followup":           true,
+			"global_review":                 true,
+			"serialized_followup_queue_key": "global_review:test-session",
+		},
+	}
+	req2 := &guide.RouteRequest{
+		CorrelationID:   "ot_followup_review_refusal_b",
+		Input:           "Audit candidate B.",
+		TargetAgentID:   "inspector",
+		ExplicitTarget:  true,
+		SourceAgentID:   "orchestrator",
+		SourceAgentName: "orchestrator",
+		SessionID:       "test-session",
+		Timestamp:       time.Date(2026, 3, 25, 16, 0, 1, 0, time.UTC),
+		Metadata: map[string]any{
+			"agent_type":                    "inspector",
+			"task_id":                       "task-b",
+			"ot_handoff_followup":           true,
+			"global_review":                 true,
+			"serialized_followup_queue_key": "global_review:test-session",
+		},
+	}
+
+	require.NoError(t, router.PublishUserVisibleRoute(req1))
+	require.NoError(t, router.PublishUserVisibleRoute(req2))
+
+	select {
+	case published := <-reqCh:
+		require.NotNil(t, published)
+		assert.Equal(t, req1.CorrelationID, published.CorrelationID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected first serialized review request to publish immediately")
+	}
+
+	rootTerminal := guide.NewResponseMessage("", &guide.RouteResponse{
+		CorrelationID:       req1.CorrelationID,
+		Success:             true,
+		RespondingAgentID:   "inspector",
+		RespondingAgentName: "Inspector",
+		Data: &agentshared.GlobalReviewTurnResponse{
+			Result: map[string]any{
+				"refused": true,
+				"reason":  "Repeated global review handoff to tester requires fresh merged-state evidence or a materially different request.",
+			},
+			Action: &agentshared.GlobalReviewTurnAction{
+				Type:      agentshared.GlobalReviewActionRefusal,
+				AgentType: agentshared.GlobalReviewAgentInspector,
+				Summary:   "Repeated global review handoff to tester requires fresh merged-state evidence or a materially different request.",
+			},
+		},
+	})
+	rootTerminal.CorrelationID = req1.CorrelationID
+	require.True(t, router.DeliverResponse(rootTerminal))
+
+	select {
+	case published := <-reqCh:
+		require.NotNil(t, published)
+		assert.Equal(t, req2.CorrelationID, published.CorrelationID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected second serialized review request after protocol refusal")
+	}
+}
+
 func TestTaskRouter_PublishUserVisibleRoute_OTFollowupsQueuePerTarget(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()

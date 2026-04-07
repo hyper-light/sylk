@@ -657,7 +657,7 @@ func shouldReleaseVisibleRoute(route *visibleRoute, resp *guide.RouteResponse) b
 		return true
 	}
 	switch turnResp.Action.Type {
-	case agentshared.GlobalReviewActionAccept, agentshared.GlobalReviewActionCommit:
+	case agentshared.GlobalReviewActionAccept, agentshared.GlobalReviewActionCommit, agentshared.GlobalReviewActionRefusal:
 		return true
 	default:
 		return false

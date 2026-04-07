@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 type globalReviewDirectiveCarrierStub struct {
@@ -313,6 +314,161 @@ func TestGlobalReviewHandoffPublishesTopLevelRoute(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for global review handoff route")
+	}
+}
+
+func TestGlobalReviewHandoffRefusesRepeatedUnchangedMergedState(t *testing.T) {
+	views := stubGlobalReviewProtocolWorkspaceViews{
+		summary: &versioning.WorkspaceSummary{
+			DefaultView:        versioning.WorkspaceViewGlobal,
+			SourceOfTruth:      versioning.WorkspaceViewGlobal,
+			Paths:              []string{"src/app.go"},
+			GlobalChangedPaths: []string{"src/app.go"},
+		},
+	}
+	baseSnapshot := &GlobalReviewSnapshot{ReviewID: "review-repeat"}
+	metadata := GlobalReviewMetadata(map[string]any{
+		"global_review_stage": "checkpoint",
+		"affected_files":      []any{"src/app.go"},
+		"plan_snapshot":       "checkpoint plan v1",
+	}, baseSnapshot)
+	cfg := GlobalReviewProtocolSkillConfig{
+		AgentType:      func() string { return GlobalReviewAgentInspector },
+		AgentID:        func() string { return "inspector-global-1" },
+		ResolveTarget:  func(agentType string) string { return agentType },
+		WorkspaceViews: func() versioning.WorkspaceViewAccess { return views },
+	}
+	currentAction := &GlobalReviewTurnAction{
+		Type:        GlobalReviewActionHandoff,
+		AgentType:   GlobalReviewAgentInspector,
+		TargetAgent: GlobalReviewAgentTester,
+		Reason:      "Tester should perform the next broad merged-state validation pass.",
+		Request:     "Audit the merged checkpoint and return the broad testing verdict.",
+	}
+	tempState := NewGlobalReviewState(baseSnapshot, metadata)
+	tempCtx := WithGlobalReviewState(context.Background(), tempState)
+	stateFingerprint := resolveGlobalReviewSelectionStateFingerprint(tempCtx, cfg, tempState)
+	requestFingerprint := globalReviewSelectionRequestFingerprint(currentAction)
+	if stateFingerprint == "" {
+		t.Fatal("expected merged-state fingerprint")
+	}
+	if requestFingerprint == "" {
+		t.Fatal("expected request fingerprint")
+	}
+
+	snapshot := &GlobalReviewSnapshot{
+		ReviewID: "review-repeat",
+		RecentEvents: []GlobalReviewEvent{{
+			Type:               string(GlobalReviewActionHandoff),
+			AgentType:          GlobalReviewAgentInspector,
+			TargetAgent:        GlobalReviewAgentTester,
+			Summary:            currentAction.Request,
+			StateFingerprint:   stateFingerprint,
+			RequestFingerprint: requestFingerprint,
+		}},
+	}
+	state := NewGlobalReviewState(snapshot, metadata)
+	ctx := WithGlobalReviewState(context.Background(), state)
+	ctx = WithStreamContext(ctx, "corr-repeat", "orchestrator")
+
+	skills := NewGlobalReviewProtocolSkills(cfg)
+	result, err := invokeGlobalReviewSkill(t, ctx, skills, "handoff_next", map[string]any{
+		"target_agents": []string{GlobalReviewAgentTester},
+		"reason":        currentAction.Reason,
+		"request":       currentAction.Request,
+	})
+	if err != nil {
+		t.Fatalf("handoff_next error = %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	if resultMap == nil || resultMap["refused"] != true {
+		t.Fatalf("handoff_next result = %#v, want refused=true", result)
+	}
+	if resultMap["refused_by"] != "global-review-protocol" {
+		t.Fatalf("refused_by = %#v, want global-review-protocol", resultMap["refused_by"])
+	}
+	if resultMap["must_wait"] != true {
+		t.Fatalf("must_wait = %#v, want true", resultMap["must_wait"])
+	}
+	if !strings.Contains(resultMap["reason"].(string), "fresh merged-state evidence") {
+		t.Fatalf("reason = %#v, want merged-state evidence guidance", resultMap["reason"])
+	}
+	if action := state.TerminalAction(); action == nil || action.Type != GlobalReviewActionRefusal {
+		t.Fatalf("terminal action = %#v, want refusal", action)
+	}
+}
+
+func TestGlobalReviewHandoffAllowsDifferentRequestWithoutMergedStateChange(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	t.Cleanup(func() { _ = bus.Close() })
+
+	views := stubGlobalReviewProtocolWorkspaceViews{
+		summary: &versioning.WorkspaceSummary{
+			DefaultView:        versioning.WorkspaceViewGlobal,
+			SourceOfTruth:      versioning.WorkspaceViewGlobal,
+			Paths:              []string{"src/app.go"},
+			GlobalChangedPaths: []string{"src/app.go"},
+		},
+	}
+	baseSnapshot := &GlobalReviewSnapshot{ReviewID: "review-reframe"}
+	metadata := GlobalReviewMetadata(map[string]any{
+		"global_review_stage": "checkpoint",
+		"affected_files":      []any{"src/app.go"},
+		"plan_snapshot":       "checkpoint plan v1",
+	}, baseSnapshot)
+	cfg := GlobalReviewProtocolSkillConfig{
+		AgentType:      func() string { return GlobalReviewAgentInspector },
+		AgentID:        func() string { return "inspector-global-1" },
+		ResolveTarget:  func(agentType string) string { return agentType },
+		WorkspaceViews: func() versioning.WorkspaceViewAccess { return views },
+		Route: GlobalReviewRouteConfig{
+			Bus:       bus,
+			SessionID: func() string { return "sess-1" },
+		},
+	}
+	previousAction := &GlobalReviewTurnAction{
+		Type:        GlobalReviewActionHandoff,
+		AgentType:   GlobalReviewAgentInspector,
+		TargetAgent: GlobalReviewAgentTester,
+		Reason:      "Tester should perform the next broad merged-state validation pass.",
+		Request:     "Audit the merged checkpoint and return the broad testing verdict.",
+	}
+	tempState := NewGlobalReviewState(baseSnapshot, metadata)
+	tempCtx := WithGlobalReviewState(context.Background(), tempState)
+
+	snapshot := &GlobalReviewSnapshot{
+		ReviewID: "review-reframe",
+		RecentEvents: []GlobalReviewEvent{{
+			Type:               string(GlobalReviewActionHandoff),
+			AgentType:          GlobalReviewAgentInspector,
+			TargetAgent:        GlobalReviewAgentTester,
+			Summary:            previousAction.Request,
+			StateFingerprint:   resolveGlobalReviewSelectionStateFingerprint(tempCtx, cfg, tempState),
+			RequestFingerprint: globalReviewSelectionRequestFingerprint(previousAction),
+		}},
+	}
+	state := NewGlobalReviewState(snapshot, metadata)
+	ctx := WithGlobalReviewState(context.Background(), state)
+	ctx = WithStreamContext(ctx, "corr-reframe", "orchestrator")
+
+	skills := NewGlobalReviewProtocolSkills(cfg)
+	result, err := invokeGlobalReviewSkill(t, ctx, skills, "handoff_next", map[string]any{
+		"target_agents": []string{GlobalReviewAgentTester},
+		"reason":        "Tester should re-audit the same merged checkpoint, but now focused on CLI entrypoint integration and install docs coherence.",
+		"request":       "Audit the merged checkpoint with emphasis on argparse wiring, CLI invocation behavior, and README-facing install flow.",
+	})
+	if err != nil {
+		t.Fatalf("handoff_next error = %v", err)
+	}
+	resultMap, _ := result.(map[string]any)
+	if resultMap == nil || resultMap["selected"] != true {
+		t.Fatalf("handoff_next result = %#v, want selected=true", result)
+	}
+	if resultMap["refused"] == true {
+		t.Fatalf("handoff_next result = %#v, did not expect refusal", result)
+	}
+	if action := state.TerminalAction(); action == nil || action.Type != GlobalReviewActionHandoff {
+		t.Fatalf("terminal action = %#v, want handoff", action)
 	}
 }
 
@@ -707,4 +863,32 @@ func invokeGlobalReviewSkill(t *testing.T, ctx context.Context, skills []*skills
 	}
 	t.Fatalf("skill %s not found", name)
 	return nil, nil
+}
+
+type stubGlobalReviewProtocolWorkspaceViews struct {
+	summary *versioning.WorkspaceSummary
+}
+
+func (s stubGlobalReviewProtocolWorkspaceViews) ReadFile(context.Context, versioning.WorkspaceView, string, string) ([]byte, error) {
+	return nil, nil
+}
+
+func (s stubGlobalReviewProtocolWorkspaceViews) Glob(context.Context, versioning.WorkspaceView, string, string, []string, string) ([]string, error) {
+	return nil, nil
+}
+
+func (s stubGlobalReviewProtocolWorkspaceViews) Grep(context.Context, versioning.WorkspaceView, string, string, string, int, int, string) ([]versioning.GrepMatch, error) {
+	return nil, nil
+}
+
+func (s stubGlobalReviewProtocolWorkspaceViews) InspectPath(context.Context, string, string) (*versioning.WorkspacePathState, error) {
+	return nil, nil
+}
+
+func (s stubGlobalReviewProtocolWorkspaceViews) SummarizePaths(context.Context, []string, string) (*versioning.WorkspaceSummary, error) {
+	return s.summary, nil
+}
+
+func (s stubGlobalReviewProtocolWorkspaceViews) DefaultView() versioning.WorkspaceView {
+	return versioning.WorkspaceViewGlobal
 }

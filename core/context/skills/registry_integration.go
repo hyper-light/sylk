@@ -361,6 +361,7 @@ func GetAllAdaptiveRetrievalSkillNames() []string {
 		"promote_to_hot",
 		"forest_resolve_intent",
 		"forest_recall",
+		"recall_recent",
 		"forest_predict_next_branches",
 		"forest_record_outcome",
 

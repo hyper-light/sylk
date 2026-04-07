@@ -292,6 +292,9 @@ func TestLLMEventPublisher_PublishLLMError(t *testing.T) {
 		if evt.Outcome != events.OutcomeFailure {
 			t.Errorf("expected OutcomeFailure, got %v", evt.Outcome)
 		}
+		if evt.Content != "LLM error from gpt-4: API rate limit exceeded" {
+			t.Errorf("expected friendly event content, got %q", evt.Content)
+		}
 		if evt.Data["model"] != "gpt-4" {
 			t.Errorf("expected gpt-4, got %v", evt.Data["model"])
 		}
@@ -300,6 +303,23 @@ func TestLLMEventPublisher_PublishLLMError(t *testing.T) {
 		}
 		if evt.Data["error_type"] != "llm_api_error" {
 			t.Errorf("expected error_type llm_api_error, got %v", evt.Data["error_type"])
+		}
+	})
+
+	t.Run("formats_embedded_provider_json_in_event_content", func(t *testing.T) {
+		testErr := errors.New(`anthropic stream: received error while streaming: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_test"}`)
+		err := publisher.PublishLLMError("session-2", "agent-2", "claude-sonnet-4-6", testErr)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		evts := collector.Events()
+		evt := evts[len(evts)-1]
+		if evt.Content != "LLM error from claude-sonnet-4-6: Overloaded (overloaded_error) [req_test]" {
+			t.Errorf("expected friendly overloaded content, got %q", evt.Content)
+		}
+		if evt.Data["error"] != testErr.Error() {
+			t.Errorf("expected raw error in data, got %v", evt.Data["error"])
 		}
 	})
 

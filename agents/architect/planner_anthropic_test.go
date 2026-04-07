@@ -926,6 +926,118 @@ func TestCompleteForToolLoop_UsesProgressTimeoutNotWallClock(t *testing.T) {
 	}
 }
 
+func TestCompleteForToolLoop_BuffersTextUntilTextOnlyCompletion(t *testing.T) {
+	var chunks []string
+	p := &anthropicPlanner{
+		provider: plannerStreamProviderFunc(func(ctx context.Context, req *providers.Request, handler providers.StreamHandler) error {
+			if err := handler(&providers.StreamChunk{Type: providers.ChunkTypeStart}); err != nil {
+				return err
+			}
+			for _, part := range []string{"tool ", "loop ", "response"} {
+				if err := handler(&providers.StreamChunk{Type: providers.ChunkTypeText, Text: part}); err != nil {
+					return err
+				}
+			}
+			return handler(&providers.StreamChunk{
+				Type:       providers.ChunkTypeEnd,
+				StopReason: providers.StopReasonEndTurn,
+			})
+		}),
+		maxTokens:      testMaxOutputTokens,
+		thinkingBudget: 0,
+		contextWindow:  testContextWindow,
+		system:         "test system",
+		timeout:        30 * time.Second,
+		logger:         slog.Default(),
+	}
+
+	resp, err := p.CompleteForToolLoop(context.Background(), &providers.Request{
+		Messages:  []providers.Message{{Role: providers.RoleUser, Content: "plan it"}},
+		MaxTokens: 256,
+	}, "planning_protocol", func(s string) { chunks = append(chunks, s) })
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.Content != "tool loop response" {
+		t.Fatalf("response = %#v, want content %q", resp, "tool loop response")
+	}
+	if len(chunks) != 1 || chunks[0] != "tool loop response" {
+		t.Fatalf("chunks = %#v, want one buffered flush", chunks)
+	}
+}
+
+func TestCompleteForToolLoop_SuppressesPreToolNarration(t *testing.T) {
+	var chunks []string
+	p := &anthropicPlanner{
+		provider: plannerStreamProviderFunc(func(ctx context.Context, req *providers.Request, handler providers.StreamHandler) error {
+			if err := handler(&providers.StreamChunk{Type: providers.ChunkTypeStart}); err != nil {
+				return err
+			}
+			if err := handler(&providers.StreamChunk{Type: providers.ChunkTypeText, Text: "Starting the plan now."}); err != nil {
+				return err
+			}
+			if err := handler(&providers.StreamChunk{
+				Type: providers.ChunkTypeToolStart,
+				ToolCall: &providers.ToolCallChunk{
+					ID:   "tool_1",
+					Name: "start_planning",
+				},
+			}); err != nil {
+				return err
+			}
+			if err := handler(&providers.StreamChunk{
+				Type: providers.ChunkTypeToolDelta,
+				ToolCall: &providers.ToolCallChunk{
+					ID:             "tool_1",
+					Name:           "start_planning",
+					ArgumentsDelta: `{"query":"hello"}`,
+				},
+			}); err != nil {
+				return err
+			}
+			if err := handler(&providers.StreamChunk{
+				Type: providers.ChunkTypeToolEnd,
+				ToolCall: &providers.ToolCallChunk{
+					ID:   "tool_1",
+					Name: "start_planning",
+				},
+			}); err != nil {
+				return err
+			}
+			return handler(&providers.StreamChunk{
+				Type:       providers.ChunkTypeEnd,
+				StopReason: providers.StopReasonToolUse,
+			})
+		}),
+		maxTokens:      testMaxOutputTokens,
+		thinkingBudget: 0,
+		contextWindow:  testContextWindow,
+		system:         "test system",
+		timeout:        30 * time.Second,
+		logger:         slog.Default(),
+	}
+
+	resp, err := p.CompleteForToolLoop(context.Background(), &providers.Request{
+		Messages:  []providers.Message{{Role: providers.RoleUser, Content: "plan it"}},
+		MaxTokens: 256,
+	}, "planning_protocol", func(s string) { chunks = append(chunks, s) })
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("expected response")
+	}
+	if resp.Content != "Starting the plan now." {
+		t.Fatalf("response content = %q, want preserved assistant content", resp.Content)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Name != "start_planning" {
+		t.Fatalf("tool calls = %#v, want start_planning", resp.ToolCalls)
+	}
+	if len(chunks) != 0 {
+		t.Fatalf("chunks = %#v, want pre-tool narration suppressed", chunks)
+	}
+}
+
 func TestPlannerRequestLease_MaxRefreshes_DerivesFromParentDeadline(t *testing.T) {
 	parent, cancel := context.WithDeadline(context.Background(), time.Now().Add(45*time.Second))
 	defer cancel()

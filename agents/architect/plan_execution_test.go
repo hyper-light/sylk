@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/dag"
+	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -35,6 +36,41 @@ func testArchitectWithStore(t *testing.T, plans ...*DesignPlan) *Architect {
 type captureConversationPlanner struct {
 	lastRequest plannerConversationRequest
 	response    string
+}
+
+type captureArchitectForest struct {
+	resolveIntent func(context.Context, forest.ResolveIntentInput) (*forest.IntentResolution, error)
+	retrieve      func(context.Context, forest.Query) ([]*forest.BranchPacket, error)
+	predict       func(context.Context, forest.Query) ([]*forest.BranchPacket, error)
+	recordOutcome func(context.Context, forest.OutcomeRecord) error
+}
+
+func (m *captureArchitectForest) ResolveIntent(ctx context.Context, input forest.ResolveIntentInput) (*forest.IntentResolution, error) {
+	if m.resolveIntent != nil {
+		return m.resolveIntent(ctx, input)
+	}
+	return &forest.IntentResolution{}, nil
+}
+
+func (m *captureArchitectForest) Retrieve(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+	if m.retrieve != nil {
+		return m.retrieve(ctx, query)
+	}
+	return nil, nil
+}
+
+func (m *captureArchitectForest) PredictNextBranches(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+	if m.predict != nil {
+		return m.predict(ctx, query)
+	}
+	return nil, nil
+}
+
+func (m *captureArchitectForest) RecordOutcome(ctx context.Context, record forest.OutcomeRecord) error {
+	if m.recordOutcome != nil {
+		return m.recordOutcome(ctx, record)
+	}
+	return nil
 }
 
 func (p *captureConversationPlanner) AnalyzeRequirements(context.Context, string, map[string]any) (*Requirements, error) {
@@ -376,6 +412,46 @@ func TestHandleConversation_ClearsExpiredPendingWorkAndCarriesReadyPlanIntoPlann
 	}
 	if !strings.Contains(planner.lastRequest.PlanSummary, "Wire the endpoint") {
 		t.Fatalf("plan_summary = %q, want task summary from ready plan", planner.lastRequest.PlanSummary)
+	}
+}
+
+func TestHandleConversation_RecoversRecentContextForTerseResume(t *testing.T) {
+	a := testArchitectWithStore(t)
+	planner := &captureConversationPlanner{response: "planner resumed from recovered context"}
+	a.config.EnableLLM = true
+	a.config.Forest = &captureArchitectForest{
+		retrieve: func(_ context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+			if query.SessionID != "sess-recall" {
+				t.Fatalf("retrieve session_id = %q, want sess-recall", query.SessionID)
+			}
+			if query.Query != "" {
+				t.Fatalf("retrieve query = %q, want empty for terse follow-up", query.Query)
+			}
+			return []*forest.BranchPacket{
+				{Branch: &forest.Branch{ID: "intent-1", Family: forest.TreeFamilyIntent, Summary: "Create the Python CLI package with argparse"}},
+				{Branch: &forest.Branch{ID: "decision-1", Family: forest.TreeFamilyDecision, Summary: "Use pyproject.toml and __main__.py"}},
+			}, nil
+		},
+	}
+	a.planner = planner
+
+	result, err := a.handleConversation(context.Background(), &guide.ForwardedRequest{
+		Input:     "go ahead",
+		SessionID: "sess-recall",
+		Intent:    guide.IntentChat,
+	})
+	if err != nil {
+		t.Fatalf("handleConversation error = %v", err)
+	}
+	conv := unwrapConversationResult(t, result)
+	if conv.Response != "planner resumed from recovered context" {
+		t.Fatalf("response = %q, want planner response", conv.Response)
+	}
+	if !strings.Contains(planner.lastRequest.RecentContextSummary, "Create the Python CLI package with argparse") {
+		t.Fatalf("recent_context_summary = %q, want recovered continuity", planner.lastRequest.RecentContextSummary)
+	}
+	if len(planner.lastRequest.RecentContextFocus) == 0 {
+		t.Fatal("expected recent_context_focus to be populated")
 	}
 }
 

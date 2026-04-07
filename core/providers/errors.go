@@ -30,18 +30,18 @@ var (
 
 // ProviderError wraps errors with provider-specific context
 type ProviderError struct {
-	Provider    ProviderType
-	Operation   string
-	StatusCode  int
-	Message     string
-	Retryable   bool
-	RetryAfter  time.Duration
-	Underlying  error
+	Provider   ProviderType
+	Operation  string
+	StatusCode int
+	Message    string
+	Retryable  bool
+	RetryAfter time.Duration
+	Underlying error
 
 	// ContextTooLarge is true when the request exceeded the model's context
 	// window. ContextUsedTokens and ContextMaxTokens provide the extracted
 	// token counts when available (zero otherwise).
-	ContextTooLarge  bool
+	ContextTooLarge   bool
 	ContextUsedTokens int
 	ContextMaxTokens  int
 }
@@ -290,7 +290,7 @@ func (e *ProviderError) parseError(err error) {
 	var anthropicErr *anthropic.Error
 	if errors.As(err, &anthropicErr) {
 		e.StatusCode = anthropicErr.StatusCode
-		e.Retryable = isRetryableHTTPStatus(anthropicErr.StatusCode)
+		e.Retryable = isRetryableHTTPStatus(anthropicErr.StatusCode) || isAnthropicOverloadedError(anthropicErr)
 		if anthropicErr.Response != nil {
 			if d, ok := parseRetryAfterHeader(anthropicErr.Response.Header); ok {
 				e.RetryAfter = d

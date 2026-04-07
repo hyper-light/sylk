@@ -574,24 +574,8 @@ func RegisterUniversalSkills(registry *skills.Registry, deps *RetrievalDependenc
 	}
 
 	if deps != nil && deps.Forest != nil {
-		resolveIntentSkill := NewForestResolveIntentSkill(deps)
-		if err := registry.Register(resolveIntentSkill); err != nil {
-			return fmt.Errorf("failed to register forest_resolve_intent: %w", err)
-		}
-
-		recallSkill := NewForestRecallSkill(deps)
-		if err := registry.Register(recallSkill); err != nil {
-			return fmt.Errorf("failed to register forest_recall: %w", err)
-		}
-
-		predictSkill := NewForestPredictNextSkill(deps)
-		if err := registry.Register(predictSkill); err != nil {
-			return fmt.Errorf("failed to register forest_predict_next_branches: %w", err)
-		}
-
-		recordOutcomeSkill := NewForestRecordOutcomeSkill(deps)
-		if err := registry.Register(recordOutcomeSkill); err != nil {
-			return fmt.Errorf("failed to register forest_record_outcome: %w", err)
+		if err := registerGenericForestSkills(registry, deps); err != nil {
+			return fmt.Errorf("failed to register forest skills: %w", err)
 		}
 	}
 
@@ -599,12 +583,6 @@ func RegisterUniversalSkills(registry *skills.Registry, deps *RetrievalDependenc
 	registry.Load("retrieve_context")
 	registry.Load("search_history")
 	registry.Load("promote_to_hot")
-	if deps != nil && deps.Forest != nil {
-		registry.Load("forest_resolve_intent")
-		registry.Load("forest_recall")
-		registry.Load("forest_predict_next_branches")
-		registry.Load("forest_record_outcome")
-	}
 
 	return nil
 }

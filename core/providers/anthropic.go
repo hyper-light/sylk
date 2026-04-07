@@ -468,7 +468,7 @@ func (p *AnthropicProvider) Generate(ctx context.Context, req *Request) (*Respon
 }
 
 func (p *AnthropicProvider) generateWithRetry(ctx context.Context, req *Request) (*Response, error) {
-	return retryAnthropicInternalServerGenerate(ctx, p.config.BaseConfig, func(ctx context.Context) (*Response, error) {
+	return retryAnthropicTransientGenerate(ctx, p.config.BaseConfig, func(ctx context.Context) (*Response, error) {
 		return p.generateOnce(ctx, req)
 	})
 }
@@ -497,7 +497,7 @@ func (p *AnthropicProvider) StreamWithHandler(ctx context.Context, req *Request,
 }
 
 func (p *AnthropicProvider) streamWithRetry(ctx context.Context, req *Request, handler StreamHandler) error {
-	return retryAnthropicInternalServerStream(ctx, p.config.BaseConfig, func(ctx context.Context) error {
+	return retryAnthropicTransientStream(ctx, p.config.BaseConfig, func(ctx context.Context) error {
 		return p.streamWithHandlerOnce(ctx, req, handler)
 	})
 }
@@ -601,10 +601,14 @@ func (p *AnthropicProvider) streamWithHandlerOnce(ctx context.Context, req *Requ
 		if p.shouldRetryForAnthropicAuth(err) {
 			return err
 		}
+		message := FriendlyErrorMessage(err)
+		if strings.TrimSpace(message) == "" {
+			message = err.Error()
+		}
 		handler(&StreamChunk{
 			Index:     chunkIndex + 1,
 			Type:      ChunkTypeError,
-			Text:      err.Error(),
+			Text:      message,
 			Timestamp: time.Now(),
 		})
 		return fmt.Errorf("anthropic stream: %w", err)

@@ -294,8 +294,17 @@ func parsePlanAcceptanceResponse(content string, input planAcceptanceInput) (map
 		Result        string   `json:"result"`
 		Modifications []string `json:"modifications"`
 	}
-	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
-		return nil, fmt.Errorf("parse plan acceptance response: %w", err)
+	var parseErr error
+	for _, candidate := range planAcceptanceJSONCandidates(trimmed) {
+		if err := json.Unmarshal([]byte(candidate), &raw); err == nil {
+			parseErr = nil
+			break
+		} else if parseErr == nil {
+			parseErr = err
+		}
+	}
+	if parseErr != nil {
+		return nil, fmt.Errorf("parse plan acceptance response: %w", parseErr)
 	}
 
 	result := strings.TrimSpace(strings.ToLower(raw.Result))
@@ -316,6 +325,17 @@ func parsePlanAcceptanceResponse(content string, input planAcceptanceInput) (map
 		"result":        result,
 		"modifications": mods,
 	}, nil
+}
+
+func planAcceptanceJSONCandidates(text string) []string {
+	candidates := []string{strings.TrimSpace(text)}
+	if block := extractJSONBlock(text); block != "" {
+		candidates = append(candidates, block)
+	}
+	if fenced := extractFencedJSONBlock(text); fenced != "" {
+		candidates = append(candidates, fenced)
+	}
+	return uniqueClassificationCandidates(candidates)
 }
 
 // ---------------------------------------------------------------------------

@@ -253,6 +253,9 @@ func TestRegisterSkillsForAgent_Engineer(t *testing.T) {
 	if registry.Get("retrieve_context") == nil {
 		t.Error("engineer should receive universal skills")
 	}
+	if registry.Get("recall_recent") == nil {
+		t.Error("engineer should receive recall_recent")
+	}
 	if registry.Get("engineer_forest_select_implementation_branch") == nil {
 		t.Error("engineer should receive role-specific forest skills")
 	}
@@ -542,7 +545,7 @@ func TestGetAllAdaptiveRetrievalSkillNames(t *testing.T) {
 
 	names := GetAllAdaptiveRetrievalSkillNames()
 
-	expected := 25 + len(roleForestSkillNames())
+	expected := 26 + len(roleForestSkillNames())
 	if len(names) != expected {
 		t.Errorf("GetAllAdaptiveRetrievalSkillNames() returned %d names, want %d",
 			len(names), expected)
@@ -567,6 +570,7 @@ func TestIsAdaptiveRetrievalSkill(t *testing.T) {
 	}{
 		{"retrieve_context", true},
 		{"forest_recall", true},
+		{"recall_recent", true},
 		{"librarian_search_codebase", true},
 		{"archivalist_search_sessions", true},
 		{"academic_search_research", true},

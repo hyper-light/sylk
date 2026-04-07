@@ -1571,7 +1571,9 @@ func (m *Model) applyInterAgentOriginUpdate(ev msg.ToolCallEventMsg, currentAgen
 		if recordIdx < 0 || recordIdx >= len(e.ToolCalls) || e.ToolCalls[recordIdx].InterAgent == nil {
 			return
 		}
-		e.ToolCalls[recordIdx].InterAgent.AgentTypes = append([]string(nil), row.AgentTypes...)
+		if len(row.AgentTypes) > 0 {
+			e.ToolCalls[recordIdx].InterAgent.AgentTypes = append([]string(nil), row.AgentTypes...)
+		}
 		e.ToolCalls[recordIdx].InterAgent.Summary = row.Summary
 		e.ToolCalls[recordIdx].InterAgent.Status = row.Status
 		e.ToolCalls[recordIdx].InterAgent.ThreadKey = row.ThreadKey

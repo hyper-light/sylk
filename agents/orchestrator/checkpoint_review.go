@@ -138,6 +138,8 @@ func (o *Orchestrator) HandleCheckpointReviewTerminal(_ string, metadata map[str
 	switch turnResp.Action.Type {
 	case agentshared.GlobalReviewActionAccept, agentshared.GlobalReviewActionCommit:
 		o.completePendingCheckpointReview(taskID)
+	case agentshared.GlobalReviewActionRefusal:
+		o.failPendingCheckpointReview(taskID, firstNonEmpty(strings.TrimSpace(turnResp.Action.Summary), "global review route refused repeated unchanged selection"))
 	}
 }
 

@@ -2,14 +2,41 @@ package providers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
+
+func testAnthropicAPIError(t *testing.T, status int, body string) *anthropic.Error {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+	resp := &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}
+
+	var apiErr anthropic.Error
+	if err := json.Unmarshal([]byte(body), &apiErr); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	apiErr.StatusCode = status
+	apiErr.Request = req
+	apiErr.Response = resp
+	return &apiErr
+}
 
 func TestRetryGenerate_SucceedsFirstAttempt(t *testing.T) {
 	cfg := BaseConfig{MaxRetries: 3, RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
@@ -250,7 +277,7 @@ func TestRetryStream_SucceedsFirstAttempt(t *testing.T) {
 	}
 }
 
-func TestRetryAnthropicInternalServerGenerate_RetriesThreeTimes(t *testing.T) {
+func TestRetryAnthropicTransientGenerate_RetriesThreeTimes(t *testing.T) {
 	cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
 	ctx := context.Background()
 	var events []RetryEvent
@@ -259,9 +286,9 @@ func TestRetryAnthropicInternalServerGenerate_RetriesThreeTimes(t *testing.T) {
 	})
 
 	calls := 0
-	resp, err := retryAnthropicInternalServerGenerate(ctx, cfg, func(_ context.Context) (*Response, error) {
+	resp, err := retryAnthropicTransientGenerate(ctx, cfg, func(_ context.Context) (*Response, error) {
 		calls++
-		if calls <= anthropicInternalServerMaxRetries {
+		if calls <= anthropicTransientMaxRetries {
 			return nil, &anthropic.Error{StatusCode: 500}
 		}
 		return &Response{Content: "ok"}, nil
@@ -272,23 +299,53 @@ func TestRetryAnthropicInternalServerGenerate_RetriesThreeTimes(t *testing.T) {
 	if resp == nil || resp.Content != "ok" {
 		t.Fatalf("unexpected response: %#v", resp)
 	}
-	if calls != anthropicInternalServerMaxRetries+1 {
-		t.Fatalf("expected %d calls, got %d", anthropicInternalServerMaxRetries+1, calls)
+	if calls != anthropicTransientMaxRetries+1 {
+		t.Fatalf("expected %d calls, got %d", anthropicTransientMaxRetries+1, calls)
 	}
-	if len(events) != anthropicInternalServerMaxRetries {
-		t.Fatalf("expected %d retry events, got %d", anthropicInternalServerMaxRetries, len(events))
+	if len(events) != anthropicTransientMaxRetries {
+		t.Fatalf("expected %d retry events, got %d", anthropicTransientMaxRetries, len(events))
 	}
 	for i, event := range events {
 		if event.Attempt != i+1 {
 			t.Fatalf("event %d attempt = %d, want %d", i, event.Attempt, i+1)
 		}
-		if event.MaxAttempts != anthropicInternalServerMaxRetries {
-			t.Fatalf("event %d max attempts = %d, want %d", i, event.MaxAttempts, anthropicInternalServerMaxRetries)
+		if event.MaxAttempts != anthropicTransientMaxRetries {
+			t.Fatalf("event %d max attempts = %d, want %d", i, event.MaxAttempts, anthropicTransientMaxRetries)
 		}
 	}
 }
 
-func TestRetryAnthropicInternalServerGenerate_OnlyRetries500(t *testing.T) {
+func TestRetryAnthropicTransientGenerate_RetriesOverloadedError(t *testing.T) {
+	cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
+	ctx := context.Background()
+	var events []RetryEvent
+	ctx = WithRetryObserver(ctx, func(event RetryEvent) {
+		events = append(events, event)
+	})
+
+	calls := 0
+	resp, err := retryAnthropicTransientGenerate(ctx, cfg, func(_ context.Context) (*Response, error) {
+		calls++
+		if calls <= anthropicTransientMaxRetries {
+			return nil, testAnthropicAPIError(t, 529, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_test"}`)
+		}
+		return &Response{Content: "ok"}, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.Content != "ok" {
+		t.Fatalf("unexpected response: %#v", resp)
+	}
+	if calls != anthropicTransientMaxRetries+1 {
+		t.Fatalf("expected %d calls, got %d", anthropicTransientMaxRetries+1, calls)
+	}
+	if len(events) != anthropicTransientMaxRetries {
+		t.Fatalf("expected %d retry events, got %d", anthropicTransientMaxRetries, len(events))
+	}
+}
+
+func TestRetryAnthropicTransientGenerate_DoesNotRetryNonTransientStatus(t *testing.T) {
 	tests := []struct {
 		name   string
 		status int
@@ -301,7 +358,7 @@ func TestRetryAnthropicInternalServerGenerate_OnlyRetries500(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
 			calls := 0
-			_, err := retryAnthropicInternalServerGenerate(context.Background(), cfg, func(_ context.Context) (*Response, error) {
+			_, err := retryAnthropicTransientGenerate(context.Background(), cfg, func(_ context.Context) (*Response, error) {
 				calls++
 				return nil, &anthropic.Error{StatusCode: tt.status}
 			})
@@ -315,7 +372,7 @@ func TestRetryAnthropicInternalServerGenerate_OnlyRetries500(t *testing.T) {
 	}
 }
 
-func TestRetryAnthropicInternalServerGenerate_RetriesUnexpectedEOF(t *testing.T) {
+func TestRetryAnthropicTransientGenerate_RetriesUnexpectedEOF(t *testing.T) {
 	cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
 	ctx := context.Background()
 	var events []RetryEvent
@@ -324,9 +381,9 @@ func TestRetryAnthropicInternalServerGenerate_RetriesUnexpectedEOF(t *testing.T)
 	})
 
 	calls := 0
-	resp, err := retryAnthropicInternalServerGenerate(ctx, cfg, func(_ context.Context) (*Response, error) {
+	resp, err := retryAnthropicTransientGenerate(ctx, cfg, func(_ context.Context) (*Response, error) {
 		calls++
-		if calls <= anthropicInternalServerMaxRetries {
+		if calls <= anthropicTransientMaxRetries {
 			return nil, io.ErrUnexpectedEOF
 		}
 		return &Response{Content: "ok"}, nil
@@ -337,15 +394,15 @@ func TestRetryAnthropicInternalServerGenerate_RetriesUnexpectedEOF(t *testing.T)
 	if resp == nil || resp.Content != "ok" {
 		t.Fatalf("unexpected response: %#v", resp)
 	}
-	if calls != anthropicInternalServerMaxRetries+1 {
-		t.Fatalf("expected %d calls, got %d", anthropicInternalServerMaxRetries+1, calls)
+	if calls != anthropicTransientMaxRetries+1 {
+		t.Fatalf("expected %d calls, got %d", anthropicTransientMaxRetries+1, calls)
 	}
-	if len(events) != anthropicInternalServerMaxRetries {
-		t.Fatalf("expected %d retry events, got %d", anthropicInternalServerMaxRetries, len(events))
+	if len(events) != anthropicTransientMaxRetries {
+		t.Fatalf("expected %d retry events, got %d", anthropicTransientMaxRetries, len(events))
 	}
 }
 
-func TestRetryAnthropicInternalServerStream_RetriesThreeTimes(t *testing.T) {
+func TestRetryAnthropicTransientStream_RetriesThreeTimes(t *testing.T) {
 	cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
 	ctx := context.Background()
 	var events []RetryEvent
@@ -354,9 +411,9 @@ func TestRetryAnthropicInternalServerStream_RetriesThreeTimes(t *testing.T) {
 	})
 
 	calls := 0
-	err := retryAnthropicInternalServerStream(ctx, cfg, func(_ context.Context) error {
+	err := retryAnthropicTransientStream(ctx, cfg, func(_ context.Context) error {
 		calls++
-		if calls <= anthropicInternalServerMaxRetries {
+		if calls <= anthropicTransientMaxRetries {
 			return &anthropic.Error{StatusCode: 500}
 		}
 		return nil
@@ -364,15 +421,15 @@ func TestRetryAnthropicInternalServerStream_RetriesThreeTimes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if calls != anthropicInternalServerMaxRetries+1 {
-		t.Fatalf("expected %d calls, got %d", anthropicInternalServerMaxRetries+1, calls)
+	if calls != anthropicTransientMaxRetries+1 {
+		t.Fatalf("expected %d calls, got %d", anthropicTransientMaxRetries+1, calls)
 	}
-	if len(events) != anthropicInternalServerMaxRetries {
-		t.Fatalf("expected %d retry events, got %d", anthropicInternalServerMaxRetries, len(events))
+	if len(events) != anthropicTransientMaxRetries {
+		t.Fatalf("expected %d retry events, got %d", anthropicTransientMaxRetries, len(events))
 	}
 }
 
-func TestRetryAnthropicInternalServerStream_RetriesUnexpectedEOF(t *testing.T) {
+func TestRetryAnthropicTransientStream_RetriesOverloadedError(t *testing.T) {
 	cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
 	ctx := context.Background()
 	var events []RetryEvent
@@ -381,9 +438,36 @@ func TestRetryAnthropicInternalServerStream_RetriesUnexpectedEOF(t *testing.T) {
 	})
 
 	calls := 0
-	err := retryAnthropicInternalServerStream(ctx, cfg, func(_ context.Context) error {
+	err := retryAnthropicTransientStream(ctx, cfg, func(_ context.Context) error {
 		calls++
-		if calls <= anthropicInternalServerMaxRetries {
+		if calls <= anthropicTransientMaxRetries {
+			return testAnthropicAPIError(t, 529, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_test"}`)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != anthropicTransientMaxRetries+1 {
+		t.Fatalf("expected %d calls, got %d", anthropicTransientMaxRetries+1, calls)
+	}
+	if len(events) != anthropicTransientMaxRetries {
+		t.Fatalf("expected %d retry events, got %d", anthropicTransientMaxRetries, len(events))
+	}
+}
+
+func TestRetryAnthropicTransientStream_RetriesUnexpectedEOF(t *testing.T) {
+	cfg := BaseConfig{RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
+	ctx := context.Background()
+	var events []RetryEvent
+	ctx = WithRetryObserver(ctx, func(event RetryEvent) {
+		events = append(events, event)
+	})
+
+	calls := 0
+	err := retryAnthropicTransientStream(ctx, cfg, func(_ context.Context) error {
+		calls++
+		if calls <= anthropicTransientMaxRetries {
 			return io.ErrUnexpectedEOF
 		}
 		return nil
@@ -391,11 +475,11 @@ func TestRetryAnthropicInternalServerStream_RetriesUnexpectedEOF(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if calls != anthropicInternalServerMaxRetries+1 {
-		t.Fatalf("expected %d calls, got %d", anthropicInternalServerMaxRetries+1, calls)
+	if calls != anthropicTransientMaxRetries+1 {
+		t.Fatalf("expected %d calls, got %d", anthropicTransientMaxRetries+1, calls)
 	}
-	if len(events) != anthropicInternalServerMaxRetries {
-		t.Fatalf("expected %d retry events, got %d", anthropicInternalServerMaxRetries, len(events))
+	if len(events) != anthropicTransientMaxRetries {
+		t.Fatalf("expected %d retry events, got %d", anthropicTransientMaxRetries, len(events))
 	}
 }
 

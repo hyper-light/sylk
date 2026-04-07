@@ -2,6 +2,8 @@ package shared
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -34,6 +36,7 @@ const (
 	GlobalReviewActionHandoff   GlobalReviewActionType = "handoff"
 	GlobalReviewActionChallenge GlobalReviewActionType = "challenge"
 	GlobalReviewActionValidate  GlobalReviewActionType = "validation"
+	GlobalReviewActionRefusal   GlobalReviewActionType = "refusal"
 	GlobalReviewActionAccept    GlobalReviewActionType = "accept_checkpoint"
 	GlobalReviewActionCommit    GlobalReviewActionType = "commit_to_disk"
 )
@@ -87,10 +90,12 @@ type GlobalReviewValidationRecord struct {
 }
 
 type GlobalReviewEvent struct {
-	Type        string `json:"type"`
-	AgentType   string `json:"agent_type"`
-	TargetAgent string `json:"target_agent,omitempty"`
-	Summary     string `json:"summary,omitempty"`
+	Type               string `json:"type"`
+	AgentType          string `json:"agent_type"`
+	TargetAgent        string `json:"target_agent,omitempty"`
+	Summary            string `json:"summary,omitempty"`
+	StateFingerprint   string `json:"state_fingerprint,omitempty"`
+	RequestFingerprint string `json:"request_fingerprint,omitempty"`
 }
 
 type GlobalReviewSnapshot struct {
@@ -112,20 +117,28 @@ type GlobalReviewValidationProcessing struct {
 }
 
 type GlobalReviewTurnAction struct {
-	Type             GlobalReviewActionType
-	AgentType        string
-	AgentID          string
-	TargetAgent      string
-	TargetAgentID    string
-	CreatesChallenge bool
+	Type               GlobalReviewActionType
+	AgentType          string
+	AgentID            string
+	TargetAgent        string
+	TargetAgentID      string
+	CreatesChallenge   bool
+	Reason             string
+	Request            string
+	RequiredOutput     []string
+	References         []string
+	ChallengeID        string
+	Validation         *GlobalReviewValidationRecord
+	Summary            string
+	EvidenceRefs       []string
+	StateFingerprint   string
+	RequestFingerprint string
+}
+
+type globalReviewSelectionRefusal struct {
+	RefusedBy        string
 	Reason           string
-	Request          string
-	RequiredOutput   []string
-	References       []string
-	ChallengeID      string
-	Validation       *GlobalReviewValidationRecord
-	Summary          string
-	EvidenceRefs     []string
+	ResumeConditions []string
 }
 
 type GlobalReviewState struct {
@@ -619,11 +632,37 @@ func issueGlobalReviewSelection(
 	if err := ValidateGlobalTesterHandoffEvidence(ctx, action); err != nil {
 		return nil, err
 	}
-	if snapshot := state.Snapshot(); snapshot != nil && snapshot.PendingValidation != nil {
+	snapshot := state.Snapshot()
+	if snapshot != nil && snapshot.PendingValidation != nil {
 		return nil, fmt.Errorf("process the pending validation before issuing another global review challenge")
 	}
+	action.StateFingerprint = resolveGlobalReviewSelectionStateFingerprint(ctx, cfg, state)
+	action.RequestFingerprint = globalReviewSelectionRequestFingerprint(action)
+	if refusal := globalReviewRepeatedSelectionRefusal(snapshot, action); refusal != nil {
+		if err := state.setTerminalAction(&GlobalReviewTurnAction{
+			Type:               GlobalReviewActionRefusal,
+			AgentType:          normalizeGlobalReviewAgent(action.AgentType),
+			AgentID:            strings.TrimSpace(action.AgentID),
+			TargetAgent:        normalizeGlobalReviewAgent(action.TargetAgent),
+			TargetAgentID:      strings.TrimSpace(action.TargetAgentID),
+			Summary:            refusal.Reason,
+			StateFingerprint:   action.StateFingerprint,
+			RequestFingerprint: action.RequestFingerprint,
+		}); err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"refused":           true,
+			"refused_by":        firstNonEmpty(strings.TrimSpace(refusal.RefusedBy), "global-review-protocol"),
+			"agent_type":        normalizeGlobalReviewAgent(action.AgentType),
+			"target_agent":      normalizeGlobalReviewAgent(action.TargetAgent),
+			"reason":            refusal.Reason,
+			"must_wait":         true,
+			"resume_conditions": append([]string(nil), refusal.ResumeConditions...),
+		}, nil
+	}
 	if action.CreatesChallenge {
-		action.ChallengeID = nextGlobalReviewChallengeID(state.Snapshot())
+		action.ChallengeID = nextGlobalReviewChallengeID(snapshot)
 	}
 	dispatch, err := dispatchGlobalReviewSelection(ctx, cfg, state, action)
 	if err != nil {
@@ -647,6 +686,163 @@ func issueGlobalReviewSelection(
 		"forwarded":         true,
 		"correlation_id":    dispatch.CorrelationID,
 	}, nil
+}
+
+func globalReviewRepeatedSelectionRefusal(
+	snapshot *GlobalReviewSnapshot,
+	action *GlobalReviewTurnAction,
+) *globalReviewSelectionRefusal {
+	if snapshot == nil || action == nil {
+		return nil
+	}
+	currentState := strings.TrimSpace(action.StateFingerprint)
+	currentRequest := strings.TrimSpace(action.RequestFingerprint)
+	if currentState == "" || currentRequest == "" {
+		return nil
+	}
+	previous, ok := recentGlobalReviewSelectionEvent(
+		snapshot.RecentEvents,
+		string(action.Type),
+		action.AgentType,
+		action.TargetAgent,
+	)
+	if !ok {
+		return nil
+	}
+	if strings.TrimSpace(previous.StateFingerprint) != currentState ||
+		strings.TrimSpace(previous.RequestFingerprint) != currentRequest {
+		return nil
+	}
+	targetLabel := firstNonEmpty(normalizeGlobalReviewAgent(action.TargetAgent), "the same target")
+	verb := "handoff"
+	if action.CreatesChallenge {
+		verb = "challenge"
+	}
+	return &globalReviewSelectionRefusal{
+		RefusedBy: "global-review-protocol",
+		Reason: fmt.Sprintf(
+			"Repeated global review %s to %s requires fresh merged-state evidence or a materially different request, but the current merged state and routed request are unchanged since the previous selection on this directed pair.",
+			verb,
+			targetLabel,
+		),
+		ResumeConditions: []string{
+			fmt.Sprintf("Wait for the merged review state to change before issuing another %s to %s.", verb, targetLabel),
+			"Use `inspect_workspace_state`, `summarize_workspace_state`, or a narrower targeted challenge to gather genuinely new evidence before retrying.",
+		},
+	}
+}
+
+func recentGlobalReviewSelectionEvent(
+	events []GlobalReviewEvent,
+	actionType, agentType, targetAgent string,
+) (GlobalReviewEvent, bool) {
+	actionType = strings.TrimSpace(actionType)
+	agentType = normalizeGlobalReviewAgent(agentType)
+	targetAgent = normalizeGlobalReviewAgent(targetAgent)
+	for i := len(events) - 1; i >= 0; i-- {
+		evt := events[i]
+		if strings.TrimSpace(evt.Type) != actionType {
+			continue
+		}
+		if normalizeGlobalReviewAgent(evt.AgentType) != agentType {
+			continue
+		}
+		if normalizeGlobalReviewAgent(evt.TargetAgent) != targetAgent {
+			continue
+		}
+		return evt, true
+	}
+	return GlobalReviewEvent{}, false
+}
+
+func resolveGlobalReviewSelectionStateFingerprint(
+	ctx context.Context,
+	cfg GlobalReviewProtocolSkillConfig,
+	state *GlobalReviewState,
+) string {
+	metadata := map[string]any(nil)
+	if state != nil {
+		metadata = state.BaseMetadata()
+	}
+	payload := map[string]any{}
+	if version := strings.TrimSpace(stringAny(metadata, "global_vfs_version")); version != "" {
+		payload["global_vfs_version"] = version
+	}
+	if stage := strings.TrimSpace(globalReviewStageFromMetadata(metadata)); stage != "" {
+		payload["global_review_stage"] = stage
+	}
+	if summary := strings.TrimSpace(stringAny(metadata, "acceptance_summary")); summary != "" {
+		payload["acceptance_summary"] = summary
+	}
+	if criteria := strings.TrimSpace(stringAny(metadata, "task_criteria_snapshot")); criteria != "" {
+		payload["task_criteria_snapshot"] = criteria
+	}
+	if plan := strings.TrimSpace(stringAny(metadata, "plan_snapshot")); plan != "" {
+		payload["plan_snapshot"] = plan
+	}
+	if description := strings.TrimSpace(stringAny(metadata, "task_description")); description != "" {
+		payload["task_description"] = description
+	}
+	if paths := globalReviewEvidencePaths(metadata); len(paths) > 0 {
+		payload["evidence_paths"] = paths
+		if cfg.WorkspaceViews != nil {
+			if views := cfg.WorkspaceViews(); views != nil {
+				if summary, err := views.SummarizePaths(ctx, paths, ""); err == nil && summary != nil {
+					payload["workspace_summary"] = summary
+				}
+			}
+		}
+	}
+	return globalReviewFingerprint(payload)
+}
+
+func globalReviewSelectionRequestFingerprint(action *GlobalReviewTurnAction) string {
+	if action == nil {
+		return ""
+	}
+	return globalReviewFingerprint(map[string]any{
+		"type":            strings.TrimSpace(string(action.Type)),
+		"reason":          strings.TrimSpace(action.Reason),
+		"request":         strings.TrimSpace(action.Request),
+		"required_output": normalizeStringList(action.RequiredOutput),
+		"references":      normalizeStringList(action.References),
+	})
+}
+
+func globalReviewEvidencePaths(metadata map[string]any) []string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := []string{}
+	appendPath := func(raw string) {
+		path := strings.TrimSpace(raw)
+		if path == "" {
+			return
+		}
+		if _, ok := seen[path]; ok {
+			return
+		}
+		seen[path] = struct{}{}
+		out = append(out, path)
+	}
+	for _, path := range stringSliceAny(metadata, "affected_files") {
+		appendPath(path)
+	}
+	appendPath(stringAny(metadata, "plan_file_path"))
+	return out
+}
+
+func globalReviewFingerprint(payload any) string {
+	if payload == nil {
+		return ""
+	}
+	data, err := json.Marshal(payload)
+	if err != nil || len(data) == 0 || string(data) == "{}" || string(data) == "null" {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 func validateGlobalReviewSelection(action *GlobalReviewTurnAction) error {
@@ -1284,9 +1480,35 @@ func globalReviewRouteObligations(state *GlobalReviewState, snapshot *GlobalRevi
 }
 
 func buildGlobalReviewHandoffSnapshot(state *GlobalReviewState, action *GlobalReviewTurnAction) *GlobalReviewSnapshot {
+	return applyGlobalReviewSelectionToSnapshot(materializeGlobalReviewSnapshot(state), action)
+}
+
+func buildGlobalReviewValidationSnapshot(state *GlobalReviewState, record *GlobalReviewValidationRecord) *GlobalReviewSnapshot {
 	snapshot := materializeGlobalReviewSnapshot(state)
 	if snapshot == nil {
 		snapshot = &GlobalReviewSnapshot{}
+	}
+	snapshot.ActiveAgents = []string{normalizeGlobalReviewAgent(record.RequestingAgent)}
+	snapshot.RequestedBy = normalizeGlobalReviewAgent(record.RespondingAgent)
+	snapshot.CurrentRequest = fmt.Sprintf("Process validation response for challenge %s and decide the next handoff.", strings.TrimSpace(record.ChallengeID))
+	snapshot.PendingChallenge = nil
+	snapshot.PendingValidation = cloneGlobalReviewValidationRecord(record)
+	appendGlobalReviewEvent(snapshot, GlobalReviewEvent{
+		Type:        string(GlobalReviewActionValidate),
+		AgentType:   normalizeGlobalReviewAgent(record.RespondingAgent),
+		TargetAgent: normalizeGlobalReviewAgent(record.RequestingAgent),
+		Summary:     strings.TrimSpace(record.Summary),
+	})
+	return snapshot
+}
+
+func applyGlobalReviewSelectionToSnapshot(base *GlobalReviewSnapshot, action *GlobalReviewTurnAction) *GlobalReviewSnapshot {
+	snapshot := cloneGlobalReviewSnapshot(base)
+	if snapshot == nil {
+		snapshot = &GlobalReviewSnapshot{}
+	}
+	if action == nil {
+		return snapshot
 	}
 	snapshot.ActiveAgents = []string{normalizeGlobalReviewAgent(action.TargetAgent)}
 	snapshot.RequestedBy = normalizeGlobalReviewAgent(action.AgentType)
@@ -1307,29 +1529,12 @@ func buildGlobalReviewHandoffSnapshot(state *GlobalReviewState, action *GlobalRe
 		}
 	}
 	appendGlobalReviewEvent(snapshot, GlobalReviewEvent{
-		Type:        string(action.Type),
-		AgentType:   normalizeGlobalReviewAgent(action.AgentType),
-		TargetAgent: normalizeGlobalReviewAgent(action.TargetAgent),
-		Summary:     firstNonEmpty(strings.TrimSpace(action.Request), strings.TrimSpace(action.Summary)),
-	})
-	return snapshot
-}
-
-func buildGlobalReviewValidationSnapshot(state *GlobalReviewState, record *GlobalReviewValidationRecord) *GlobalReviewSnapshot {
-	snapshot := materializeGlobalReviewSnapshot(state)
-	if snapshot == nil {
-		snapshot = &GlobalReviewSnapshot{}
-	}
-	snapshot.ActiveAgents = []string{normalizeGlobalReviewAgent(record.RequestingAgent)}
-	snapshot.RequestedBy = normalizeGlobalReviewAgent(record.RespondingAgent)
-	snapshot.CurrentRequest = fmt.Sprintf("Process validation response for challenge %s and decide the next handoff.", strings.TrimSpace(record.ChallengeID))
-	snapshot.PendingChallenge = nil
-	snapshot.PendingValidation = cloneGlobalReviewValidationRecord(record)
-	appendGlobalReviewEvent(snapshot, GlobalReviewEvent{
-		Type:        string(GlobalReviewActionValidate),
-		AgentType:   normalizeGlobalReviewAgent(record.RespondingAgent),
-		TargetAgent: normalizeGlobalReviewAgent(record.RequestingAgent),
-		Summary:     strings.TrimSpace(record.Summary),
+		Type:               string(action.Type),
+		AgentType:          normalizeGlobalReviewAgent(action.AgentType),
+		TargetAgent:        normalizeGlobalReviewAgent(action.TargetAgent),
+		Summary:            firstNonEmpty(strings.TrimSpace(action.Request), strings.TrimSpace(action.Summary)),
+		StateFingerprint:   strings.TrimSpace(action.StateFingerprint),
+		RequestFingerprint: strings.TrimSpace(action.RequestFingerprint),
 	})
 	return snapshot
 }

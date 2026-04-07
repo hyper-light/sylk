@@ -38,6 +38,8 @@ type plannerConversationRequest struct {
 	FirstTask               string                   `json:"first_task,omitempty"`
 	PlanSummary             string                   `json:"plan_summary,omitempty"`
 	ApprovalRequired        bool                     `json:"approval_required,omitempty"`
+	RecentContextSummary    string                   `json:"recent_context_summary,omitempty"`
+	RecentContextFocus      []string                 `json:"recent_context_focus,omitempty"`
 	SessionID               string                   `json:"session_id,omitempty"`
 	ConversationHistory     []guide.ConversationTurn `json:"conversation_history,omitempty"`
 	OnChunk                 func(string)             `json:"-"`
@@ -149,7 +151,7 @@ func (a *Architect) composeUserFacingResponseWithTools(
 	}
 
 	mode := request.normalizedMode()
-	tools = filterToolsByNames(tools, toolsForConversationMode(mode))
+	tools = filterToolsByNames(tools, toolsForConversationModeWithContext(ctx, mode))
 
 	prompt := buildPlannerConversationPrompt(request)
 	maxTokens := plannerConversationMaxTokensForMode(mode, a.config.MaxOutputTokens)
@@ -306,6 +308,8 @@ func normalizePlannerConversationRequest(request plannerConversationRequest) pla
 	}
 	request.FirstTask = strings.TrimSpace(request.FirstTask)
 	request.PlanSummary = strings.TrimSpace(request.PlanSummary)
+	request.RecentContextSummary = strings.TrimSpace(request.RecentContextSummary)
+	request.RecentContextFocus = normalizePlannerConversationList(request.RecentContextFocus)
 	request.SessionID = strings.TrimSpace(request.SessionID)
 	return request
 }
@@ -377,12 +381,16 @@ General rules:
 		return `Write the next user-facing response.
 
 Planning flow:
-0. If the request is still too vague or underspecified to start responsible planning,
+0. If the user's message is a terse follow-up, resume request, or reference to earlier discussion
+   and the needed context is not already explicit in conversation_history, plan fields, or the
+   recovered recent_context fields, invoke recall_recent before claiming the earlier discussion is
+   unavailable.
+0a. If the request is still too vague or underspecified to start responsible planning,
    invoke route_requirements_research instead of start_planning. Use that tool when the
    user first needs help shaping the problem, scope, constraints, or success criteria.
    Use ask_user_question only for one or two narrow decisions after the plan is already
    mostly understood.
-0a. During discussion before planning, use consult(mode=knowledge, target=librarian),
+0b. During discussion before planning, use consult(mode=knowledge, target=librarian),
     consult(mode=knowledge, target=archivalist), and consult(mode=knowledge, target=academic)
     as new material information arrives. Do not wait until start_planning to gather obvious
     codebase, historical, or Academic evidence. Consult the Librarian for codebase reality and
@@ -437,6 +445,9 @@ Requirements:
 - If the conversation reveals that the problem is too underspecified to plan safely,
   hand the user to the Academic via route_requirements_research instead of pretending
   the missing requirements are already known.
+- If recent_context_summary or recent_context_focus are present in the context JSON, treat them as
+  recovered preserved session context and continue naturally from them instead of claiming the prior
+  discussion is missing.
 - If the conversation is concrete enough to keep discussing but still lacks codebase,
   historical, or architectural evidence, stay in the Architect and consult the relevant
   knowledge agents instead of waiting for the formal planning phase.
@@ -552,6 +563,9 @@ Requirements:
 - Draw on your architectural expertise — be opinionated with clear reasoning.
 - For general conversation (no planning intent), engage naturally. If the conversation
   leads to a concrete task, ask if they'd like you to create a plan.
+- If recent_context_summary or recent_context_focus are present in the context JSON, treat them as
+  recovered preserved context and continue from them instead of claiming the earlier discussion is
+  unavailable.
 - During substantive implementation, planning, or architecture discussion, reason as if you
   are actively grounding your answer in Librarian, Archivalist, and Academic evidence, using the
   subset most relevant to the current unresolved question. On the first substantive turn for a new
@@ -595,6 +609,7 @@ General rules:
 
 var discussionConversationTools = []string{
 	"consult",
+	"recall_recent",
 	"ask_user_question",
 	"route_requirements_research",
 	"start_planning",
@@ -602,6 +617,7 @@ var discussionConversationTools = []string{
 
 var planningConversationTools = []string{
 	"consult",
+	"recall_recent",
 	"ask_user_question",
 	"route_requirements_research",
 	"start_planning",
@@ -619,10 +635,39 @@ func toolsForConversationMode(mode plannerConversationMode) []string {
 	case plannerConversationModeConverse, plannerConversationModeExistingReady, plannerConversationModeClarification:
 		return planningConversationTools
 	case plannerConversationModeFeedback, plannerConversationModeReady:
-		return []string{"route_plan_acceptance", "ask_user_question"}
+		return []string{"route_plan_acceptance", "ask_user_question", "recall_recent"}
 	default:
 		return planningConversationTools
 	}
+}
+
+func toolsForConversationModeWithContext(ctx context.Context, mode plannerConversationMode) []string {
+	tools := append([]string(nil), toolsForConversationMode(mode)...)
+	if architectNeedsGlobalReviewValidateWork(ctx) && !containsConversationTool(tools, "validate_work") {
+		tools = append(tools, "validate_work")
+	}
+	return tools
+}
+
+func architectNeedsGlobalReviewValidateWork(ctx context.Context) bool {
+	state := shared.GlobalReviewStateFromContext(ctx)
+	if state == nil {
+		return false
+	}
+	snapshot := state.Snapshot()
+	if snapshot == nil || snapshot.PendingChallenge == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(snapshot.PendingChallenge.TargetAgent), shared.GlobalReviewAgentArchitect)
+}
+
+func containsConversationTool(values []string, want string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) == strings.TrimSpace(want) {
+			return true
+		}
+	}
+	return false
 }
 
 func plannerConversationMaxTokensForMode(mode plannerConversationMode, maxTokens int) int {

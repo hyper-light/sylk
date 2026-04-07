@@ -2487,7 +2487,7 @@ func TestHandleToolCallEvent_UsesExplicitInterAgentMetadataForUnknownTool(t *tes
 	}
 }
 
-func TestHandleToolCallEvent_GlobalChallengeReplacesOriginRowAcrossResponseAndValidation(t *testing.T) {
+func TestHandleToolCallEvent_GlobalChallengeKeepsResponderOnOriginRowAcrossResponseAndValidation(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 	m.PushEntry(&ChatEntry{
 		ID:            "inspector-origin",
@@ -2573,8 +2573,8 @@ func TestHandleToolCallEvent_GlobalChallengeReplacesOriginRowAcrossResponseAndVa
 	m = comp.(*Model)
 
 	origin = findEntryByCorrelation(m, "corr-global-challenge")
-	if got := origin.ToolCalls[0].InterAgent.AgentTypes; len(got) != 1 || got[0] != "inspector" {
-		t.Fatalf("origin validation agent types = %#v, want [inspector]", got)
+	if got := origin.ToolCalls[0].InterAgent.AgentTypes; len(got) != 1 || got[0] != "architect" {
+		t.Fatalf("origin validation agent types = %#v, want [architect]", got)
 	}
 	if !strings.Contains(origin.ToolCalls[0].InterAgent.Summary, "Accepted the architect response") {
 		t.Fatalf("origin validation summary = %q", origin.ToolCalls[0].InterAgent.Summary)
@@ -2584,7 +2584,7 @@ func TestHandleToolCallEvent_GlobalChallengeReplacesOriginRowAcrossResponseAndVa
 	}
 }
 
-func TestHandleToolCallEvent_PipelineChallengeReplacesOriginRowAcrossResponseAndValidation(t *testing.T) {
+func TestHandleToolCallEvent_PipelineChallengeKeepsResponderOnOriginRowAcrossResponseAndValidation(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 	m.PushEntry(&ChatEntry{
 		ID:            "pipeline-origin",
@@ -2664,8 +2664,8 @@ func TestHandleToolCallEvent_PipelineChallengeReplacesOriginRowAcrossResponseAnd
 	m = comp.(*Model)
 
 	origin = findEntryByCorrelation(m, "corr-pipeline-challenge")
-	if got := origin.ToolCalls[0].InterAgent.AgentTypes; len(got) != 1 || got[0] != "inspector-pipeline" {
-		t.Fatalf("pipeline validation agent types = %#v, want [inspector-pipeline]", got)
+	if got := origin.ToolCalls[0].InterAgent.AgentTypes; len(got) != 1 || got[0] != "tester-pipeline" {
+		t.Fatalf("pipeline validation agent types = %#v, want [tester-pipeline]", got)
 	}
 	if !strings.Contains(origin.ToolCalls[0].InterAgent.Summary, "move toward OT handoff") {
 		t.Fatalf("pipeline validation summary = %q", origin.ToolCalls[0].InterAgent.Summary)

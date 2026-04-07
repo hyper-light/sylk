@@ -18,6 +18,7 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/authority"
+	contextskills "github.com/adalundhe/sylk/core/context/skills"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/domain"
 	"github.com/adalundhe/sylk/core/events"
@@ -2524,6 +2525,19 @@ func (a *Architect) executeCreateDAG(ctx context.Context, req *ArchitectRequest)
 }
 
 func (a *Architect) executeRecall(ctx context.Context, req *ArchitectRequest) (any, error) {
+	recall, err := a.recallRecentConversationContext(
+		ctx,
+		architectRecentRecallQuery(req.Query, req.ConversationHistory),
+		req.SessionID,
+	)
+	if err != nil {
+		a.logWarn("executeRecall: recall_recent failed", "error", err, "session_id", req.SessionID)
+	} else if recall != nil {
+		return recall, nil
+	}
+	if a.planStore == nil {
+		return nil, nil
+	}
 	return a.planStore.MatchingQuery(req.Query), nil
 }
 
@@ -2570,9 +2584,11 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 	// conversation history is degraded (e.g. prior protocols hung and
 	// never delivered agent replies back to the Guide).
 	a.enrichConversationWithPlanContext(&request, req)
+	a.enrichConversationWithRecentRecall(ctx, &request, req)
 	a.logInfo("executeConversation: calling composeUserFacingResponse",
 		"has_plan_summary", request.PlanSummary != "",
-		"has_prior_query", request.PriorQuery != "")
+		"has_prior_query", request.PriorQuery != "",
+		"has_recent_context", request.RecentContextSummary != "")
 	requestCorrelationID := originalCIDFromContext(ctx)
 	composeStart := time.Now()
 	response, composeErr := a.composeUserFacingResponse(ctx, request)
@@ -2669,6 +2685,38 @@ func (a *Architect) enrichConversationWithPlanContext(request *plannerConversati
 	populatePlannerConversationRequestFromPlan(request, plan)
 }
 
+func (a *Architect) enrichConversationWithRecentRecall(
+	ctx context.Context,
+	request *plannerConversationRequest,
+	req *ArchitectRequest,
+) {
+	if a == nil || request == nil || req == nil {
+		return
+	}
+	if !shouldRecoverRecentConversationContext(request, req) {
+		return
+	}
+	recall, err := a.recallRecentConversationContext(
+		ctx,
+		architectRecentRecallQuery(req.Query, req.ConversationHistory),
+		req.SessionID,
+	)
+	if err != nil {
+		a.logWarn("enrichConversationWithRecentRecall: recall_recent failed",
+			"error", err,
+			"session_id", req.SessionID)
+		return
+	}
+	if recall == nil || strings.TrimSpace(recall.Summary) == "" {
+		return
+	}
+	if len(recall.Focus) == 0 && len(recall.Packets) == 0 {
+		return
+	}
+	request.RecentContextSummary = strings.TrimSpace(recall.Summary)
+	request.RecentContextFocus = normalizePlannerConversationList(recall.Focus)
+}
+
 func (a *Architect) existingReadyPlanForConversation(params map[string]any, now time.Time) *DesignPlan {
 	if a == nil || a.planStore == nil || len(params) == 0 {
 		return nil
@@ -2697,6 +2745,173 @@ func populatePlannerConversationRequestFromPlan(request *plannerConversationRequ
 	if plan.Requirements != nil && strings.TrimSpace(plan.Requirements.Scope) != "" {
 		request.Scope = plan.Requirements.Scope
 	}
+}
+
+func (a *Architect) recallRecentConversationContext(
+	ctx context.Context,
+	query string,
+	sessionID string,
+) (*contextskills.RecallRecentOutput, error) {
+	if a == nil || a.config.Forest == nil {
+		return nil, nil
+	}
+	result, err := contextskills.ExecuteRecallRecent(ctx, contextskills.RecallRecentInput{
+		Query:     strings.TrimSpace(query),
+		SessionID: strings.TrimSpace(sessionID),
+		Limit:     5,
+	}, &contextskills.RetrievalDependencies{
+		Forest: a.config.Forest,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result, nil
+}
+
+func shouldRecoverRecentConversationContext(
+	request *plannerConversationRequest,
+	req *ArchitectRequest,
+) bool {
+	if request == nil || req == nil {
+		return false
+	}
+	if strings.TrimSpace(req.SessionID) == "" {
+		return false
+	}
+	if strings.TrimSpace(request.PlanID) != "" ||
+		strings.TrimSpace(request.PlanSummary) != "" ||
+		strings.TrimSpace(request.PriorQuery) != "" {
+		return false
+	}
+	query := strings.TrimSpace(req.Query)
+	if architectQueryRequestsPriorContext(query) {
+		return true
+	}
+	return architectIsLowInformationFollowup(query) && architectConversationHistoryThin(req.ConversationHistory)
+}
+
+func architectRecentRecallQuery(query string, history []guide.ConversationTurn) string {
+	trimmed := strings.TrimSpace(query)
+	if trimmed != "" && !architectIsLowInformationFollowup(trimmed) {
+		return trimmed
+	}
+	for i := len(history) - 1; i >= 0; i-- {
+		candidate := strings.TrimSpace(history[i].UserInput)
+		if architectSubstantiveConversationText(candidate) && !architectIsLowInformationFollowup(candidate) {
+			return candidate
+		}
+	}
+	for i := len(history) - 1; i >= 0; i-- {
+		candidate := strings.TrimSpace(history[i].AgentReply)
+		if architectSubstantiveConversationText(candidate) && !architectIsLowInformationFollowup(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func architectConversationHistoryThin(history []guide.ConversationTurn) bool {
+	if len(history) == 0 {
+		return true
+	}
+	for _, turn := range history {
+		if architectSubstantiveConversationText(turn.UserInput) || architectSubstantiveConversationText(turn.AgentReply) {
+			return false
+		}
+	}
+	return true
+}
+
+func architectSubstantiveConversationText(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	return len(strings.Fields(trimmed)) >= 6 || len(trimmed) >= 48
+}
+
+func architectIsLowInformationFollowup(query string) bool {
+	normalized := normalizeArchitectRecallQuery(query)
+	if normalized == "" {
+		return true
+	}
+	for _, phrase := range []string{
+		"yes",
+		"yep",
+		"yeah",
+		"sure",
+		"ok",
+		"okay",
+		"sounds good",
+		"that works",
+		"works for me",
+		"go ahead",
+		"do it",
+		"lets do it",
+		"let's do it",
+		"continue",
+		"resume",
+		"proceed",
+		"same plan",
+	} {
+		if normalized == phrase {
+			return true
+		}
+	}
+	if len(strings.Fields(normalized)) > 5 {
+		return false
+	}
+	markers := map[string]struct{}{
+		"it":       {},
+		"that":     {},
+		"this":     {},
+		"plan":     {},
+		"previous": {},
+		"earlier":  {},
+		"resume":   {},
+		"continue": {},
+	}
+	for _, token := range strings.Fields(normalized) {
+		if _, ok := markers[token]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func architectQueryRequestsPriorContext(query string) bool {
+	normalized := normalizeArchitectRecallQuery(query)
+	if normalized == "" {
+		return false
+	}
+	for _, phrase := range []string{
+		"what were we planning",
+		"what are we planning",
+		"what did we plan",
+		"what was the plan",
+		"what did we discuss",
+		"what did we decide",
+		"pick up where we left off",
+		"pick back up",
+		"remind me",
+		"recap",
+		"previous plan",
+		"previous conversation",
+		"prior discussion",
+		"earlier discussion",
+	} {
+		if strings.Contains(normalized, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeArchitectRecallQuery(query string) string {
+	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(query))), " ")
 }
 
 // conversationFallback runs the domain-specific execution path when the
@@ -2917,6 +3132,10 @@ func extractUserResponse(data any) string {
 	case *ConversationResult:
 		if v != nil {
 			return v.Response
+		}
+	case *contextskills.RecallRecentOutput:
+		if v != nil {
+			return v.Summary
 		}
 	case *SolutionArchitecture:
 		if v != nil {

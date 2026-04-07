@@ -67,6 +67,32 @@ func TestPipelineProtocolSkills_RecordTurnActions(t *testing.T) {
 	}
 }
 
+func TestPipelineProtocol_RejectsSelfTargetSelection(t *testing.T) {
+	ctx := WithPipelineProtocolState(context.Background(), NewPipelineProtocolState(&PipelineProtocolSnapshot{
+		Roster: []PipelineProtocolAgent{
+			{AgentType: PipelineAgentInspector},
+			{AgentType: PipelineAgentTester},
+		},
+		ActiveAgents: []string{PipelineAgentInspector},
+	}))
+	ctx = WithTaskExecutionContract(ctx, &TaskExecutionContract{RuntimeAgentType: PipelineAgentInspector})
+
+	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
+		AgentType: func() string { return PipelineAgentInspector },
+	})
+
+	for _, toolName := range []string{"challenge_agent", "handoff_next"} {
+		_, err := callSkill(t, ctx, skills, toolName, map[string]any{
+			"target_agents": []string{"inspector-pipeline"},
+			"reason":        "loop back to inspector",
+			"request":       "this should be refused",
+		})
+		if err == nil || !strings.Contains(err.Error(), "cannot target itself") {
+			t.Fatalf("%s error = %v, want self-target refusal", toolName, err)
+		}
+	}
+}
+
 func TestValidatePipelineProtocolCompletion_RequiresTurnAction(t *testing.T) {
 	ctx := WithPipelineProtocolState(context.Background(), NewPipelineProtocolState(&PipelineProtocolSnapshot{}))
 	if err := ValidatePipelineProtocolCompletion(ctx, PipelineAgentEngineer); err == nil {

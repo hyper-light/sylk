@@ -10,6 +10,7 @@ import (
 var genericForestSkillNames = []string{
 	"forest_resolve_intent",
 	"forest_recall",
+	"recall_recent",
 	"forest_predict_next_branches",
 }
 
@@ -42,6 +43,7 @@ func registerGenericForestSkills(registry *skills.Registry, deps *RetrievalDepen
 	for _, skill := range []*skills.Skill{
 		NewForestResolveIntentSkill(deps),
 		NewForestRecallSkill(deps),
+		NewRecallRecentSkill(deps),
 		NewForestPredictNextSkill(deps),
 		NewForestRecordOutcomeSkill(deps),
 	} {

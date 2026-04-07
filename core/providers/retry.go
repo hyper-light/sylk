@@ -113,13 +113,13 @@ func retryStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) e
 	return lastErr
 }
 
-const anthropicInternalServerMaxRetries = 3
+const anthropicTransientMaxRetries = 3
 
-// retryAnthropicInternalServerGenerate retries Anthropic generate calls only
-// for HTTP 500 internal server errors and transient transport failures like
+// retryAnthropicTransientGenerate retries Anthropic generate calls for
+// provider-declared transient failures and transient transport failures like
 // unexpected EOF. MaxRetries here is a retry budget, not a total-attempt
 // budget: 3 means the initial request plus up to 3 retries.
-func retryAnthropicInternalServerGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Context) (*Response, error)) (*Response, error) {
+func retryAnthropicTransientGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Context) (*Response, error)) (*Response, error) {
 	var lastErr error
 	for retry := 0; ; retry++ {
 		resp, err := fn(ctx)
@@ -127,13 +127,13 @@ func retryAnthropicInternalServerGenerate(ctx context.Context, cfg BaseConfig, f
 			return resp, nil
 		}
 		lastErr = err
-		if !shouldRetryAnthropicInternalServerCall(ctx, err, retry) {
+		if !shouldRetryAnthropicTransientCall(ctx, err, retry) {
 			break
 		}
 		delay := serverGuidedDelay(err, retry, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
 		notifyRetryObserver(ctx, RetryEvent{
 			Attempt:     retry + 1,
-			MaxAttempts: anthropicInternalServerMaxRetries,
+			MaxAttempts: anthropicTransientMaxRetries,
 			Err:         err,
 			Delay:       delay,
 		})
@@ -144,11 +144,11 @@ func retryAnthropicInternalServerGenerate(ctx context.Context, cfg BaseConfig, f
 	return nil, lastErr
 }
 
-// retryAnthropicInternalServerStream retries Anthropic stream calls only for
-// HTTP 500 internal server errors and transient transport failures like
+// retryAnthropicTransientStream retries Anthropic stream calls for
+// provider-declared transient failures and transient transport failures like
 // unexpected EOF. MaxRetries here is a retry budget, not a total-attempt
 // budget: 3 means the initial request plus up to 3 retries.
-func retryAnthropicInternalServerStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) error) error {
+func retryAnthropicTransientStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) error) error {
 	var lastErr error
 	for retry := 0; ; retry++ {
 		err := fn(ctx)
@@ -156,13 +156,13 @@ func retryAnthropicInternalServerStream(ctx context.Context, cfg BaseConfig, fn 
 			return nil
 		}
 		lastErr = err
-		if !shouldRetryAnthropicInternalServerCall(ctx, err, retry) {
+		if !shouldRetryAnthropicTransientCall(ctx, err, retry) {
 			break
 		}
 		delay := serverGuidedDelay(err, retry, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
 		notifyRetryObserver(ctx, RetryEvent{
 			Attempt:     retry + 1,
-			MaxAttempts: anthropicInternalServerMaxRetries,
+			MaxAttempts: anthropicTransientMaxRetries,
 			Err:         err,
 			Delay:       delay,
 		})
@@ -232,8 +232,8 @@ func shouldRetryProviderCall(ctx context.Context, err error, attempt int, maxAtt
 	return isRetryableError(err)
 }
 
-func shouldRetryAnthropicInternalServerCall(ctx context.Context, err error, retry int) bool {
-	if retry >= anthropicInternalServerMaxRetries {
+func shouldRetryAnthropicTransientCall(ctx context.Context, err error, retry int) bool {
+	if retry >= anthropicTransientMaxRetries {
 		return false
 	}
 	if ctx.Err() != nil {
@@ -242,7 +242,7 @@ func shouldRetryAnthropicInternalServerCall(ctx context.Context, err error, retr
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	return isAnthropicInternalServerError(err) || isRetryableTransportError(err)
+	return isAnthropicTransientError(err) || isRetryableTransportError(err)
 }
 
 // isRetryableError returns true for transient errors using typed error
@@ -254,11 +254,11 @@ func isRetryableError(err error) bool {
 	}
 	var pe *ProviderError
 	if errors.As(err, &pe) {
-		return pe.Retryable
+		return pe.Retryable || (pe.Provider == ProviderTypeAnthropic && isAnthropicOverloadedError(pe))
 	}
 	var anthropicErr *anthropic.Error
 	if errors.As(err, &anthropicErr) {
-		return isRetryableHTTPStatus(anthropicErr.StatusCode)
+		return isRetryableHTTPStatus(anthropicErr.StatusCode) || isAnthropicOverloadedError(anthropicErr)
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
@@ -303,19 +303,46 @@ func safeErrorString(err error) (msg string) {
 	return err.Error()
 }
 
-func isAnthropicInternalServerError(err error) bool {
+func isAnthropicTransientError(err error) bool {
 	if err == nil {
 		return false
 	}
 	var pe *ProviderError
 	if errors.As(err, &pe) {
-		return pe.StatusCode == http.StatusInternalServerError
+		return pe.StatusCode == http.StatusInternalServerError || isAnthropicOverloadedError(pe)
 	}
 	var anthropicErr *anthropic.Error
 	if errors.As(err, &anthropicErr) {
-		return anthropicErr.StatusCode == http.StatusInternalServerError
+		return anthropicErr.StatusCode == http.StatusInternalServerError || isAnthropicOverloadedError(anthropicErr)
 	}
-	return false
+	return isAnthropicOverloadedError(err)
+}
+
+type anthropicRawJSONCarrier interface {
+	RawJSON() string
+}
+
+func isAnthropicOverloadedError(err error) bool {
+	return anthropicErrorDetail(err).ErrorType == "overloaded_error"
+}
+
+func anthropicErrorDetail(err error) jsonErrorDetail {
+	if err == nil {
+		return jsonErrorDetail{}
+	}
+	var rawCarrier anthropicRawJSONCarrier
+	if errors.As(err, &rawCarrier) {
+		if detail := extractJSONErrorDetail(rawCarrier.RawJSON()); detail.Message != "" || detail.ErrorType != "" || detail.RequestID != "" {
+			return detail
+		}
+	}
+	var pe *ProviderError
+	if errors.As(err, &pe) {
+		if detail := extractJSONErrorDetail(pe.Message); detail.Message != "" || detail.ErrorType != "" || detail.RequestID != "" {
+			return detail
+		}
+	}
+	return extractJSONErrorDetail(safeErrorString(err))
 }
 
 // isRetryableHTTPStatus returns true for HTTP status codes that indicate

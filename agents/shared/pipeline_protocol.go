@@ -643,6 +643,11 @@ func issuePipelineTurnSelection(
 		return nil, fmt.Errorf("cohort handoff requires at least two target agents")
 	}
 	agentType := pipelineProtocolAgentType(ctx, cfg)
+	for _, target := range targets {
+		if normalizePipelineAgentType(target) == normalizePipelineAgentType(agentType) {
+			return nil, fmt.Errorf("pipeline agent %q cannot target itself", strings.TrimSpace(agentType))
+		}
+	}
 	if createsChallenge {
 		if refusal := pipelineAuditChallengeRefusal(snapshot, agentType, targets); refusal != nil {
 			action := &PipelineTurnAction{

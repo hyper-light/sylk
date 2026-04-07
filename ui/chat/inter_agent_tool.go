@@ -305,9 +305,8 @@ func interAgentOriginUpdate(ev msg.ToolCallEventMsg, currentAgentType string) (*
 			return nil, false
 		}
 		return &InterAgentTool{
-			Kind:       InterAgentToolChallenge,
-			ThreadKey:  globalReviewThreadPrefix + challengeID,
-			AgentTypes: normalizeAgentTypes([]string{currentAgentType}),
+			Kind:      InterAgentToolChallenge,
+			ThreadKey: globalReviewThreadPrefix + challengeID,
 			Summary: normalizeInlineText(firstNonEmptyString(
 				stringFromMap(args, "summary"),
 				stringFromMap(output, "decision"),
@@ -344,9 +343,8 @@ func interAgentOriginUpdate(ev msg.ToolCallEventMsg, currentAgentType string) (*
 			return nil, false
 		}
 		return &InterAgentTool{
-			Kind:       InterAgentToolChallenge,
-			ThreadKey:  responseThreadKey(ev.ToolName, args, output, challengeID),
-			AgentTypes: normalizeAgentTypes([]string{currentAgentType}),
+			Kind:      InterAgentToolChallenge,
+			ThreadKey: responseThreadKey(ev.ToolName, args, output, challengeID),
 			Summary: normalizeInlineText(firstNonEmptyString(
 				stringFromMap(args, "summary"),
 				stringFromMap(output, "decision"),

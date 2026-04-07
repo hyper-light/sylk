@@ -408,35 +408,7 @@ func globalReviewReviewClosed(snapshot *GlobalReviewSnapshot) bool {
 }
 
 func buildGlobalReviewSnapshotAfterChallenge(base *GlobalReviewSnapshot, action *GlobalReviewTurnAction) *GlobalReviewSnapshot {
-	snapshot := cloneGlobalReviewSnapshot(base)
-	if snapshot == nil {
-		snapshot = &GlobalReviewSnapshot{}
-	}
-	snapshot.ActiveAgents = []string{normalizeGlobalReviewAgent(action.TargetAgent)}
-	snapshot.RequestedBy = normalizeGlobalReviewAgent(action.AgentType)
-	snapshot.CurrentRequest = strings.TrimSpace(action.Request)
-	snapshot.PendingValidation = nil
-	snapshot.PendingChallenge = nil
-	if action.CreatesChallenge {
-		snapshot.PendingChallenge = &GlobalReviewChallenge{
-			ID:                strings.TrimSpace(action.ChallengeID),
-			RequestingAgent:   normalizeGlobalReviewAgent(action.AgentType),
-			RequestingAgentID: strings.TrimSpace(action.AgentID),
-			TargetAgent:       normalizeGlobalReviewAgent(action.TargetAgent),
-			TargetAgentID:     strings.TrimSpace(action.TargetAgentID),
-			Reason:            strings.TrimSpace(action.Reason),
-			Request:           strings.TrimSpace(action.Request),
-			RequiredOutput:    append([]string(nil), action.RequiredOutput...),
-			References:        append([]string(nil), action.References...),
-		}
-	}
-	appendGlobalReviewEvent(snapshot, GlobalReviewEvent{
-		Type:        string(action.Type),
-		AgentType:   normalizeGlobalReviewAgent(action.AgentType),
-		TargetAgent: normalizeGlobalReviewAgent(action.TargetAgent),
-		Summary:     firstNonEmpty(strings.TrimSpace(action.Request), strings.TrimSpace(action.Summary)),
-	})
-	return snapshot
+	return applyGlobalReviewSelectionToSnapshot(base, action)
 }
 
 func globalReviewMailboxAgents(snapshot *GlobalReviewSnapshot) []string {

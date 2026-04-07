@@ -188,19 +188,23 @@ func (p *LLMEventPublisher) PublishLLMError(sessionID, agentID, model string, er
 	if err == nil {
 		return fmt.Errorf("error cannot be nil")
 	}
+	message := FriendlyErrorMessage(err)
+	if message == "" {
+		message = err.Error()
+	}
 
 	event := events.NewActivityEvent(
 		events.EventTypeAgentError,
 		sessionID,
-		fmt.Sprintf("LLM error from %s: %v", model, err),
+		fmt.Sprintf("LLM error from %s: %s", model, message),
 	)
 	event.AgentID = agentID
 	event.Outcome = events.OutcomeFailure
 	event.Data = map[string]any{
-		"model":         model,
-		"error":         err.Error(),
-		"error_type":    "llm_api_error",
-		"timestamp":     time.Now().UnixMilli(),
+		"model":      model,
+		"error":      err.Error(),
+		"error_type": "llm_api_error",
+		"timestamp":  time.Now().UnixMilli(),
 	}
 	event.Category = "llm"
 

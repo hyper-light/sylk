@@ -653,6 +653,7 @@ func (p *anthropicPlanner) streamRequestFullWithTimeout(
 ) (*providers.Response, error) {
 	accumulator := providers.NewStreamAccumulator()
 	emitter := newThoughtEmitter(ctx)
+	var streamedText strings.Builder
 
 	streamStart := time.Now()
 	var textChunks, thoughtChunks, toolChunks, otherChunks int
@@ -694,7 +695,7 @@ func (p *anthropicPlanner) streamRequestFullWithTimeout(
 		case providers.ChunkTypeText:
 			textChunks++
 			if onChunk != nil {
-				onChunk(chunk.Text)
+				streamedText.WriteString(chunk.Text)
 			}
 		case providers.ChunkTypeThought:
 			thoughtChunks++
@@ -755,6 +756,9 @@ func (p *anthropicPlanner) streamRequestFullWithTimeout(
 		"tool_call_count", len(resp.ToolCalls),
 		"stop_reason", string(resp.StopReason),
 		"model", resp.Model)
+	if onChunk != nil && len(resp.ToolCalls) == 0 && streamedText.Len() > 0 {
+		onChunk(streamedText.String())
+	}
 
 	return resp, nil
 }

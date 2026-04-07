@@ -2058,11 +2058,13 @@ func decodeAcceptanceResultMapJSON(raw []byte) map[string]any {
 	if trimmed == "" {
 		return nil
 	}
-	var data map[string]any
-	if err := json.Unmarshal([]byte(trimmed), &data); err != nil {
-		return nil
+	for _, candidate := range jsonCandidates(trimmed) {
+		var data map[string]any
+		if err := json.Unmarshal([]byte(candidate), &data); err == nil {
+			return data
+		}
 	}
-	return data
+	return nil
 }
 
 func inferAcceptanceVerdict(userResponse string, modifications []string) string {

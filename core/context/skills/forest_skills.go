@@ -36,6 +36,26 @@ type ForestRecallOutput struct {
 	Packets []*forest.BranchPacket `json:"packets"`
 }
 
+// RecallRecentInput requests recent preserved context from the Memory Forest.
+type RecallRecentInput struct {
+	Query                  string   `json:"query,omitempty"`
+	SessionID              string   `json:"session_id,omitempty"`
+	TaskID                 string   `json:"task_id,omitempty"`
+	IntentID               string   `json:"intent_id,omitempty"`
+	Horizon                string   `json:"horizon,omitempty"`
+	Families               []string `json:"families,omitempty"`
+	Limit                  int      `json:"limit,omitempty"`
+	IncludeCounterEvidence *bool    `json:"include_counter_evidence,omitempty"`
+}
+
+// RecallRecentOutput returns a compact continuity summary plus the raw packets.
+type RecallRecentOutput struct {
+	Summary string                   `json:"summary"`
+	Focus   []string                 `json:"focus,omitempty"`
+	Intent  *forest.IntentResolution `json:"intent,omitempty"`
+	Packets []*forest.BranchPacket   `json:"packets,omitempty"`
+}
+
 // ForestOutcomeInput records explicit branch outcome feedback.
 type ForestOutcomeInput struct {
 	BranchID   string  `json:"branch_id"`
@@ -142,6 +162,37 @@ func NewForestRecallSkill(deps *RetrievalDependencies) *skills.Skill {
 		Build()
 }
 
+// NewRecallRecentSkill creates the recall_recent skill.
+func NewRecallRecentSkill(deps *RetrievalDependencies) *skills.Skill {
+	return skills.NewSkill("recall_recent").
+		Description("Recover recent preserved session context from the Memory Forest so a terse follow-up can continue naturally from earlier discussion.").
+		Domain(RetrievalDomain).
+		Keywords("recent", "recall", "continuity", "prior discussion", "memory forest").
+		Priority(100).
+		StringParam("query", "Optional query to bias recent recall toward a specific topic", false).
+		StringParam("session_id", "Optional session identifier", false).
+		StringParam("task_id", "Optional task identifier for task-scoped recall", false).
+		StringParam("intent_id", "Optional explicit intent identifier", false).
+		EnumParam("horizon", "Optional canopy horizon: turn, task, session, user, or project.", []string{
+			string(forest.CanopyHorizonTurn),
+			string(forest.CanopyHorizonTask),
+			string(forest.CanopyHorizonSession),
+			string(forest.CanopyHorizonUser),
+			string(forest.CanopyHorizonProject),
+		}, false).
+		ArrayParam("families", "Optional tree families to constrain recall", "string", false).
+		IntParam("limit", "Maximum number of packets to inspect", false).
+		BoolParam("include_counter_evidence", "Whether to include contradictory evidence", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params RecallRecentInput
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid input: %w", err)
+			}
+			return ExecuteRecallRecent(ctx, params, deps)
+		}).
+		Build()
+}
+
 // NewForestPredictNextSkill creates the forest_predict_next_branches skill.
 func NewForestPredictNextSkill(deps *RetrievalDependencies) *skills.Skill {
 	return skills.NewSkill("forest_predict_next_branches").
@@ -229,6 +280,67 @@ func NewForestRecordOutcomeSkill(deps *RetrievalDependencies) *skills.Skill {
 		Build()
 }
 
+// ExecuteRecallRecent performs the continuity-oriented retrieval behind the
+// recall_recent skill so agents can reuse it programmatically.
+func ExecuteRecallRecent(
+	ctx context.Context,
+	params RecallRecentInput,
+	deps *RetrievalDependencies,
+) (*RecallRecentOutput, error) {
+	if deps == nil || deps.Forest == nil {
+		return nil, fmt.Errorf("forest is not configured")
+	}
+	sessionID, taskID := resolveForestSkillScope(ctx, params.SessionID, params.TaskID)
+	horizon, err := resolveForestSkillHorizon(params.Horizon, sessionID, taskID)
+	if err != nil {
+		return nil, err
+	}
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 6
+	}
+	families := parseForestFamilies(params.Families)
+	if len(families) == 0 {
+		families = recallRecentFamilies()
+	}
+	includeCounterEvidence := true
+	if params.IncludeCounterEvidence != nil {
+		includeCounterEvidence = *params.IncludeCounterEvidence
+	}
+	queryText := strings.TrimSpace(params.Query)
+	packets, err := deps.Forest.Retrieve(ctx, forest.Query{
+		Query:                  queryText,
+		SessionID:              sessionID,
+		TaskID:                 taskID,
+		IntentID:               strings.TrimSpace(params.IntentID),
+		Horizon:                horizon,
+		Families:               families,
+		Limit:                  limit,
+		IncludeCounterEvidence: includeCounterEvidence,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var intent *forest.IntentResolution
+	if queryText != "" {
+		intent, _ = deps.Forest.ResolveIntent(ctx, forest.ResolveIntentInput{
+			Query:     queryText,
+			SessionID: sessionID,
+			TaskID:    taskID,
+			IntentID:  strings.TrimSpace(params.IntentID),
+			Horizon:   horizon,
+			Limit:     maxForestSkillLimit(limit, 4),
+		})
+	}
+	summary, focus := summarizeRecentRecall(queryText, intent, packets)
+	return &RecallRecentOutput{
+		Summary: summary,
+		Focus:   focus,
+		Intent:  intent,
+		Packets: packets,
+	}, nil
+}
+
 func parseForestFamilies(values []string) []forest.TreeFamily {
 	if len(values) == 0 {
 		return nil
@@ -287,4 +399,143 @@ func resolveForestSkillHorizon(raw, sessionID, taskID string) (forest.CanopyHori
 	default:
 		return "", fmt.Errorf("invalid horizon %q", raw)
 	}
+}
+
+func recallRecentFamilies() []forest.TreeFamily {
+	return []forest.TreeFamily{
+		forest.TreeFamilyIntent,
+		forest.TreeFamilyDecision,
+		forest.TreeFamilyPreference,
+		forest.TreeFamilyConstraint,
+		forest.TreeFamilyEvidence,
+		forest.TreeFamilyOutcome,
+		forest.TreeFamilyConflict,
+	}
+}
+
+func summarizeRecentRecall(
+	query string,
+	intent *forest.IntentResolution,
+	packets []*forest.BranchPacket,
+) (string, []string) {
+	focus := collectRecentRecallFocus(packets)
+	primaryIntent := ""
+	if intent != nil {
+		primaryIntent = strings.TrimSpace(intent.PrimaryIntent)
+	}
+	if primaryIntent == "" {
+		for _, packet := range packets {
+			if packet == nil || packet.Branch == nil || packet.Branch.Family != forest.TreeFamilyIntent {
+				continue
+			}
+			primaryIntent = strings.TrimSpace(packet.Branch.Summary)
+			if primaryIntent == "" {
+				primaryIntent = strings.TrimSpace(packet.Branch.Title)
+			}
+			if primaryIntent != "" {
+				break
+			}
+		}
+	}
+	if primaryIntent == "" && len(focus) == 0 {
+		if strings.TrimSpace(query) == "" {
+			return "No recent preserved context found for this session.", nil
+		}
+		return "No recent preserved context found for that topic in this session.", nil
+	}
+	var summary strings.Builder
+	if primaryIntent != "" {
+		summary.WriteString("Recovered recent preserved context. Prior intent: ")
+		summary.WriteString(trimRecallSentence(primaryIntent))
+		summary.WriteString(".")
+	} else {
+		summary.WriteString("Recovered recent preserved context from session memory.")
+	}
+	if len(focus) > 0 {
+		highlights := focus
+		if len(highlights) > 3 {
+			highlights = highlights[:3]
+		}
+		summary.WriteString(" Key points: ")
+		summary.WriteString(strings.Join(highlights, "; "))
+		summary.WriteString(".")
+	}
+	return summary.String(), focus
+}
+
+func collectRecentRecallFocus(packets []*forest.BranchPacket) []string {
+	focus := make([]string, 0, len(packets))
+	seen := make(map[string]struct{}, len(packets))
+	for _, packet := range packets {
+		item := formatRecentRecallFocus(packet)
+		if item == "" {
+			continue
+		}
+		key := strings.ToLower(item)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		focus = append(focus, item)
+		if len(focus) >= 5 {
+			break
+		}
+	}
+	return focus
+}
+
+func formatRecentRecallFocus(packet *forest.BranchPacket) string {
+	if packet == nil || packet.Branch == nil {
+		return ""
+	}
+	summary := strings.TrimSpace(packet.Branch.Summary)
+	if summary == "" {
+		summary = strings.TrimSpace(packet.Branch.Title)
+	}
+	if summary == "" {
+		return ""
+	}
+	label := strings.TrimSpace(recallFamilyLabel(packet.Branch.Family))
+	if label == "" {
+		return trimRecallSentence(summary)
+	}
+	return label + ": " + trimRecallSentence(summary)
+}
+
+func recallFamilyLabel(family forest.TreeFamily) string {
+	switch family {
+	case forest.TreeFamilyIntent:
+		return "Intent"
+	case forest.TreeFamilyDecision:
+		return "Decision"
+	case forest.TreeFamilyPreference:
+		return "Preference"
+	case forest.TreeFamilyConstraint:
+		return "Constraint"
+	case forest.TreeFamilyEvidence:
+		return "Evidence"
+	case forest.TreeFamilyOutcome:
+		return "Outcome"
+	case forest.TreeFamilyConflict:
+		return "Conflict"
+	case forest.TreeFamilyCapability:
+		return "Capability"
+	case forest.TreeFamilyOpportunity:
+		return "Opportunity"
+	default:
+		return ""
+	}
+}
+
+func trimRecallSentence(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimRight(value, ".!?:;")
+	return strings.TrimSpace(value)
+}
+
+func maxForestSkillLimit(value, fallback int) int {
+	if value > fallback {
+		return value
+	}
+	return fallback
 }

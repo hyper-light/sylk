@@ -3,8 +3,8 @@ package providers
 import (
 	"context"
 	"encoding/json"
-	"net/http"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -219,7 +219,7 @@ func TestAnthropicProviderGenerate_Retries500ForAPIKeyAndOAuth(t *testing.T) {
 			attempts := 0
 			client := newTestHTTPClient(func(r *http.Request) (*http.Response, error) {
 				attempts++
-				if attempts <= anthropicInternalServerMaxRetries {
+				if attempts <= anthropicTransientMaxRetries {
 					return jsonResponse(http.StatusInternalServerError, `{"type":"error","error":{"type":"api_error","message":"internal server error"},"request_id":"req_test"}`, r), nil
 				}
 				return jsonResponse(http.StatusOK, `{
@@ -262,25 +262,80 @@ func TestAnthropicProviderGenerate_Retries500ForAPIKeyAndOAuth(t *testing.T) {
 			if resp == nil || resp.Content != "ok" {
 				t.Fatalf("unexpected response: %#v", resp)
 			}
-			if attempts != anthropicInternalServerMaxRetries+1 {
-				t.Fatalf("expected %d attempts, got %d", anthropicInternalServerMaxRetries+1, attempts)
+			if attempts != anthropicTransientMaxRetries+1 {
+				t.Fatalf("expected %d attempts, got %d", anthropicTransientMaxRetries+1, attempts)
 			}
-			if len(ctx.events) != anthropicInternalServerMaxRetries {
-				t.Fatalf("expected %d retry events, got %d", anthropicInternalServerMaxRetries, len(ctx.events))
+			if len(ctx.events) != anthropicTransientMaxRetries {
+				t.Fatalf("expected %d retry events, got %d", anthropicTransientMaxRetries, len(ctx.events))
 			}
 			for i, event := range ctx.events {
 				if event.Attempt != i+1 {
 					t.Fatalf("event %d attempt = %d, want %d", i, event.Attempt, i+1)
 				}
-				if event.MaxAttempts != anthropicInternalServerMaxRetries {
-					t.Fatalf("event %d max attempts = %d, want %d", i, event.MaxAttempts, anthropicInternalServerMaxRetries)
+				if event.MaxAttempts != anthropicTransientMaxRetries {
+					t.Fatalf("event %d max attempts = %d, want %d", i, event.MaxAttempts, anthropicTransientMaxRetries)
 				}
 			}
 		})
 	}
 }
 
-func TestAnthropicProviderGenerate_DoesNotRetryNon500(t *testing.T) {
+func TestAnthropicProviderGenerate_RetriesOverloadedError(t *testing.T) {
+	attempts := 0
+	client := newTestHTTPClient(func(r *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts <= anthropicTransientMaxRetries {
+			return jsonResponse(529, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_test"}`, r), nil
+		}
+		return jsonResponse(http.StatusOK, `{
+			"id":"msg_test",
+			"type":"message",
+			"role":"assistant",
+			"model":"claude-sonnet-4-6",
+			"content":[{"type":"text","text":"ok"}],
+			"stop_reason":"end_turn",
+			"usage":{"input_tokens":1,"output_tokens":1}
+		}`, r), nil
+	})
+
+	cfg := AnthropicConfig{
+		BaseConfig: BaseConfig{
+			APIKey:         "test-key",
+			Model:          "claude-sonnet-4-6",
+			MaxTokens:      64,
+			Timeout:        time.Second,
+			RetryBaseDelay: time.Millisecond,
+			RetryMaxDelay:  10 * time.Millisecond,
+		},
+		AuthMode:   AnthropicAuthModeAPIKey,
+		HTTPClient: client,
+	}
+
+	ctx := contextWithRetryRecorder(t)
+	p, err := NewAnthropicProviderWithAuthService(ctx.ctx, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewAnthropicProviderWithAuthService() error = %v", err)
+	}
+
+	resp, err := p.Generate(ctx.ctx, &Request{
+		Messages:  []Message{{Role: RoleUser, Content: "hello"}},
+		MaxTokens: 16,
+	})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if resp == nil || resp.Content != "ok" {
+		t.Fatalf("unexpected response: %#v", resp)
+	}
+	if attempts != anthropicTransientMaxRetries+1 {
+		t.Fatalf("expected %d attempts, got %d", anthropicTransientMaxRetries+1, attempts)
+	}
+	if len(ctx.events) != anthropicTransientMaxRetries {
+		t.Fatalf("expected %d retry events, got %d", anthropicTransientMaxRetries, len(ctx.events))
+	}
+}
+
+func TestAnthropicProviderGenerate_DoesNotRetryNonTransientStatus(t *testing.T) {
 	tests := []struct {
 		name   string
 		status int

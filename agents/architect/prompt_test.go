@@ -1,8 +1,11 @@
 package architect
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	shared "github.com/adalundhe/sylk/agents/shared"
 )
 
 func compactPromptWhitespace(text string) string {
@@ -106,6 +109,8 @@ func TestPlannerConversationModeConverse_InsistsOnDiscussionTimeConsultation(t *
 		"start with the most relevant knowledge agent and the narrowest question that can materially reduce the next uncertainty.",
 		"Prefer repeated targeted consults over one broad omnibus consult.",
 		"Re-evaluate Academic depth as the user's constraints evolve and your own understanding improves:",
+		"invoke recall_recent before claiming the earlier discussion is unavailable",
+		"recent_context_summary or recent_context_focus are present",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("converse instructions missing %q", want)
@@ -120,6 +125,7 @@ func TestTextOnlyModeConverse_PreservesConsultationPosture(t *testing.T) {
 		"are actively grounding your answer in Librarian, Archivalist, and Academic evidence, using the",
 		"tool-enabled path would normally start with the most relevant knowledge agent and",
 		"Prefer answers that reflect codebase reality, historical precedent, and stronger architectural",
+		"recent_context_summary or recent_context_focus are present",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("text-only converse instructions missing %q", want)
@@ -144,6 +150,7 @@ func TestToolsForConversationMode_ConverseIncludesPlanningProtocolTools(t *testi
 	tools := toolsForConversationMode(plannerConversationModeConverse)
 	for _, want := range []string{
 		"consult",
+		"recall_recent",
 		"ask_user_question",
 		"route_requirements_research",
 		"start_planning",
@@ -184,6 +191,30 @@ func TestToolsForConversationMode_ExistingReadyIncludesAcceptanceAndReplanningTo
 	}
 }
 
+func TestToolsForConversationModeWithContext_AddsValidateWorkForArchitectGlobalReviewChallenge(t *testing.T) {
+	ctx := shared.WithGlobalReviewState(context.Background(), shared.NewGlobalReviewState(&shared.GlobalReviewSnapshot{
+		ReviewID: "review-architect",
+		PendingChallenge: &shared.GlobalReviewChallenge{
+			ID:              "review-architect-challenge",
+			RequestingAgent: shared.GlobalReviewAgentInspector,
+			TargetAgent:     shared.GlobalReviewAgentArchitect,
+			Request:         "Reconcile the design contract.",
+		},
+	}, nil))
+
+	tools := toolsForConversationModeWithContext(ctx, plannerConversationModeConverse)
+	if !containsToolName(tools, "validate_work") {
+		t.Fatalf("challenge tools missing validate_work: %v", tools)
+	}
+}
+
+func TestToolsForConversationModeWithContext_DoesNotExposeValidateWorkWithoutArchitectChallenge(t *testing.T) {
+	tools := toolsForConversationModeWithContext(context.Background(), plannerConversationModeConverse)
+	if containsToolName(tools, "validate_work") {
+		t.Fatalf("unexpected validate_work in ordinary converse tools: %v", tools)
+	}
+}
+
 func TestPlannerConversationModeConverse_ToolSurfaceMatchesProtocolInstructions(t *testing.T) {
 	text := compactPromptWhitespace(plannerConversationModeInstructions(plannerConversationModeConverse))
 	for _, want := range []string{
@@ -197,7 +228,7 @@ func TestPlannerConversationModeConverse_ToolSurfaceMatchesProtocolInstructions(
 		}
 	}
 	tools := toolsForConversationMode(plannerConversationModeConverse)
-	for _, wantTool := range []string{"plan", "consult", "route_plan_acceptance"} {
+	for _, wantTool := range []string{"plan", "consult", "recall_recent", "route_plan_acceptance"} {
 		if !containsToolName(tools, wantTool) {
 			t.Fatalf("converse tools missing protocol-required tool %q: %v", wantTool, tools)
 		}

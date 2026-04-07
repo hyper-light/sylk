@@ -63,6 +63,24 @@ func TestParsePlanAcceptanceResponse_Modify(t *testing.T) {
 	}
 }
 
+func TestParsePlanAcceptanceResponse_FencedJSON(t *testing.T) {
+	input := planAcceptanceInput{
+		Plan:         "Step 1: foo",
+		PlanID:       "plan-2b",
+		PlanName:     "Edit Plan",
+		UserResponse: "Add error handling",
+	}
+	content := "```json\n{\"result\":\"modify\",\"modifications\":[\"Add error handling to step 1\"]}\n```"
+
+	got, err := parsePlanAcceptanceResponse(content, input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got["result"] != "modify" {
+		t.Errorf("result = %q, want %q", got["result"], "modify")
+	}
+}
+
 func TestParsePlanAcceptanceResponse_Reject(t *testing.T) {
 	input := planAcceptanceInput{
 		Plan:         "Step 1: foo",
