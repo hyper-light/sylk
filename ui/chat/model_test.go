@@ -72,8 +72,8 @@ func TestStreamProgressUpdatesThinkingText(t *testing.T) {
 	})
 	m = comp.(*Model)
 
-	if m.retryText != "Consulting available knowledge agents..." {
-		t.Fatalf("retryText = %q", m.retryText)
+	if m.progress.retryText != "Consulting available knowledge agents..." {
+		t.Fatalf("retryText = %q", m.progress.retryText)
 	}
 	comp, _ = m.Update(msg.DecorTickMsg{Time: time.Now().Add(thinkingProgressMinInterval)})
 	m = comp.(*Model)
@@ -115,6 +115,167 @@ func TestStreamProgressSanitizesThinkingMessage(t *testing.T) {
 	}
 	if !strings.Contains(last.ThinkingStatus, "line one line two") {
 		t.Fatalf("expected normalized progress status, got %q", last.ThinkingStatus)
+	}
+}
+
+func TestStreamProgressQueuesHumanProgressBehindThrottle(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.BeginThinking("tester-pipeline")
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-progress-throttle",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-progress-throttle",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+		Message:       "Pipeline Tester is reasoning deeply...",
+		Sequence:      1,
+		Watchdog:      true,
+	})
+	m = comp.(*Model)
+
+	slot := m.streamSlot("corr-progress-throttle")
+	if slot == nil {
+		t.Fatal("expected active stream slot")
+	}
+	base := time.Now()
+	slot.progress.lastProgressSet = base
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-progress-throttle",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+		Message:       "Publishing the validation findings artifact for downstream review.",
+		Sequence:      2,
+	})
+	m = comp.(*Model)
+
+	entry := findEntryByCorrelation(m, "corr-progress-throttle")
+	if entry == nil {
+		t.Fatal("expected active stream entry")
+	}
+	if entry.ThinkingStatus != "Pipeline Tester is reasoning deeply..." {
+		t.Fatalf("thinking status = %q, want throttle to defer update", entry.ThinkingStatus)
+	}
+
+	slot = m.streamSlot("corr-progress-throttle")
+	if slot == nil {
+		t.Fatal("expected active stream slot after queued progress")
+	}
+	if slot.progress.pendingRetryText != "Publishing the validation findings artifact for downstream review." {
+		t.Fatalf("pending progress = %q", slot.progress.pendingRetryText)
+	}
+	if slot.progress.pendingRetrySequence != 2 {
+		t.Fatalf("pending progress sequence = %d, want 2", slot.progress.pendingRetrySequence)
+	}
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-progress-throttle",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+		Message:       "Pipeline Tester is reasoning deeply...",
+		Sequence:      3,
+		Watchdog:      true,
+	})
+	m = comp.(*Model)
+
+	slot = m.streamSlot("corr-progress-throttle")
+	if slot == nil {
+		t.Fatal("expected active stream slot after watchdog progress")
+	}
+	if slot.progress.pendingRetryText != "Publishing the validation findings artifact for downstream review." {
+		t.Fatalf("expected watchdog progress not to displace pending human update, got %q", slot.progress.pendingRetryText)
+	}
+	if slot.progress.pendingRetrySequence != 2 {
+		t.Fatalf("expected pending human sequence to remain 2, got %d", slot.progress.pendingRetrySequence)
+	}
+
+	comp, _ = m.Update(msg.DecorTickMsg{Time: base.Add(thinkingProgressMinInterval)})
+	m = comp.(*Model)
+
+	entry = findEntryByCorrelation(m, "corr-progress-throttle")
+	if entry == nil {
+		t.Fatal("expected active stream entry after flush")
+	}
+	if entry.ThinkingStatus != "Publishing the validation findings artifact for downstream review." {
+		t.Fatalf("thinking status = %q, want throttled human-authored progress update", entry.ThinkingStatus)
+	}
+}
+
+func TestStreamProgressToolDerivedCanReplaceRenderedHumanProgress(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.BeginThinking("tester-pipeline")
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-progress-tool-replace",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-progress-tool-replace",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+		Message:       "Translating task and inspector criteria into executable tests and validating the current failure surface.",
+		Sequence:      1,
+	})
+	m = comp.(*Model)
+
+	slot := m.streamSlot("corr-progress-tool-replace")
+	if slot == nil {
+		t.Fatal("expected active stream slot")
+	}
+	base := time.Now()
+	slot.progress.lastProgressSet = base
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-progress-tool-replace",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+		Message:       "Working through this with read file.",
+		ToolDerived:   true,
+		Sequence:      2,
+	})
+	m = comp.(*Model)
+
+	entry := findEntryByCorrelation(m, "corr-progress-tool-replace")
+	if entry == nil {
+		t.Fatal("expected active stream entry")
+	}
+	if entry.ThinkingStatus != "Translating task and inspector criteria into executable tests and validating the current failure surface." {
+		t.Fatalf("thinking status = %q, want rendered human progress preserved until flush", entry.ThinkingStatus)
+	}
+
+	slot = m.streamSlot("corr-progress-tool-replace")
+	if slot == nil {
+		t.Fatal("expected active stream slot after tool progress")
+	}
+	if slot.progress.pendingRetryText != "Working through this with read file." || !slot.progress.pendingRetryToolDerived {
+		t.Fatalf("pending progress = %+v, want queued tool-derived update", slot.progress)
+	}
+
+	comp, _ = m.Update(msg.DecorTickMsg{Time: base.Add(thinkingProgressMinInterval)})
+	m = comp.(*Model)
+
+	entry = findEntryByCorrelation(m, "corr-progress-tool-replace")
+	if entry == nil {
+		t.Fatal("expected active stream entry after flush")
+	}
+	if entry.ThinkingStatus != "Working through this with read file." {
+		t.Fatalf("thinking status = %q, want newer tool-derived progress", entry.ThinkingStatus)
 	}
 }
 
@@ -318,11 +479,11 @@ func TestSameCorrelationResponderTransitionClearsPriorProgressOverride(t *testin
 	if slot == nil {
 		t.Fatal("expected shared-correlation stream slot")
 	}
-	if slot.retryText != "" {
-		t.Fatalf("slot retryText = %q, want cleared override", slot.retryText)
+	if slot.progress.retryText != "" {
+		t.Fatalf("slot retryText = %q, want cleared override", slot.progress.retryText)
 	}
-	if !slot.lastProgressSet.IsZero() {
-		t.Fatalf("expected slot progress throttle reset, got %v", slot.lastProgressSet)
+	if !slot.progress.lastProgressSet.IsZero() {
+		t.Fatalf("expected slot progress throttle reset, got %v", slot.progress.lastProgressSet)
 	}
 
 	comp, _ = m.Update(msg.StreamProgressMsg{
@@ -654,7 +815,7 @@ func TestHandleToolCallEvent_ClearsToolDerivedProgressOverrideOnCompletion(t *te
 	m = comp.(*Model)
 
 	slot := m.streamSlot("corr-tool-progress")
-	if slot == nil || slot.retryText != toolProgress || !slot.retryToolDerived {
+	if slot == nil || slot.progress.retryText != toolProgress || !slot.progress.retryToolDerived {
 		t.Fatalf("expected tool-derived slot progress, got %+v", slot)
 	}
 
@@ -683,8 +844,8 @@ func TestHandleToolCallEvent_ClearsToolDerivedProgressOverrideOnCompletion(t *te
 	if slot == nil {
 		t.Fatal("expected active stream slot to remain present")
 	}
-	if slot.retryText != "" || slot.retryToolDerived {
-		t.Fatalf("expected tool-derived progress override cleared, got retryText=%q toolDerived=%v", slot.retryText, slot.retryToolDerived)
+	if slot.progress.retryText != "" || slot.progress.retryToolDerived {
+		t.Fatalf("expected tool-derived progress override cleared, got retryText=%q toolDerived=%v", slot.progress.retryText, slot.progress.retryToolDerived)
 	}
 
 	entry := findEntryByCorrelation(m, "corr-tool-progress")
@@ -696,6 +857,58 @@ func TestHandleToolCallEvent_ClearsToolDerivedProgressOverrideOnCompletion(t *te
 	}
 	if entry.ThinkingStatus == toolProgress {
 		t.Fatalf("expected stale tool progress status cleared, got %q", entry.ThinkingStatus)
+	}
+}
+
+func TestHandleToolCallEvent_ReplacesDisplayedWatchdogProgressWithToolSummary(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.BeginThinking("tester-pipeline")
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-watchdog-tool-progress",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-watchdog-tool-progress",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+		Message:       "Pipeline Tester is reasoning deeply...",
+		Watchdog:      true,
+		Sequence:      1,
+	})
+	m = comp.(*Model)
+
+	const toolProgress = "Working through this with read file."
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-watchdog-tool-progress",
+		ToolCallKey:   "read-1",
+		ToolName:      "read_file",
+		ArgsSummary:   "path=README.md",
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	m = comp.(*Model)
+
+	slot := m.streamSlot("corr-watchdog-tool-progress")
+	if slot == nil {
+		t.Fatal("expected active stream slot")
+	}
+	if slot.progress.retryText != toolProgress || !slot.progress.retryToolDerived || slot.progress.retryWatchdog {
+		t.Fatalf("expected tool summary to replace watchdog progress, got %+v", slot.progress)
+	}
+
+	entry := findEntryByCorrelation(m, "corr-watchdog-tool-progress")
+	if entry == nil {
+		t.Fatal("expected active stream entry")
+	}
+	if entry.ThinkingStatus != toolProgress {
+		t.Fatalf("thinking status = %q, want tool-derived summary", entry.ThinkingStatus)
 	}
 }
 
@@ -1032,8 +1245,10 @@ func TestTopLevelTransferStartClearsStaleNestedChildState(t *testing.T) {
 		agentID:       "inspector-pipeline",
 		thinkingIdx:   idx,
 		thinkingStart: startedAt,
-		retryText:     "Waiting on tester progress.",
-		renderState:   &streamRenderState{},
+		progress: progressOverrideState{
+			retryText: "Waiting on tester progress.",
+		},
+		renderState: &streamRenderState{},
 	}
 	m.streams["corr-inspector"] = slot
 	m.pendingInterAgent[idx] = struct{}{}
@@ -2850,7 +3065,7 @@ func TestNestedToolCompletion_ClearsToolDerivedChildProgressOverride(t *testing.
 	m = comp.(*Model)
 
 	slot := m.nestedStream("corr-child-nested-progress")
-	if slot == nil || slot.retryText != toolProgress || !slot.retryToolDerived {
+	if slot == nil || slot.progress.retryText != toolProgress || !slot.progress.retryToolDerived {
 		t.Fatalf("expected nested tool-derived progress, got %+v", slot)
 	}
 
@@ -2883,8 +3098,8 @@ func TestNestedToolCompletion_ClearsToolDerivedChildProgressOverride(t *testing.
 	if slot == nil {
 		t.Fatal("expected nested stream slot to remain active")
 	}
-	if slot.retryText != "" || slot.retryToolDerived {
-		t.Fatalf("expected nested tool-derived progress override cleared, got retryText=%q toolDerived=%v", slot.retryText, slot.retryToolDerived)
+	if slot.progress.retryText != "" || slot.progress.retryToolDerived {
+		t.Fatalf("expected nested tool-derived progress override cleared, got retryText=%q toolDerived=%v", slot.progress.retryText, slot.progress.retryToolDerived)
 	}
 
 	origin := findEntryByCorrelation(m, "corr-parent-nested-progress")
@@ -4557,12 +4772,14 @@ func TestHandleStreamStart_ReusesDeferredPipelineWorkerEntryForSameRawAgentID(t 
 	idx := m.history.Len() - 1
 
 	slot := &streamSlot{
-		accumulator:     NewStreamAccumulator(idx),
-		agentID:         "inspector-pipeline",
-		thinkingIdx:     idx,
-		thinkingStart:   time.Now().Add(-2 * time.Second),
-		retryText:       deferredParentCompletionStatus,
-		lastProgressSet: time.Now(),
+		accumulator:   NewStreamAccumulator(idx),
+		agentID:       "inspector-pipeline",
+		thinkingIdx:   idx,
+		thinkingStart: time.Now().Add(-2 * time.Second),
+		progress: progressOverrideState{
+			retryText:       deferredParentCompletionStatus,
+			lastProgressSet: time.Now(),
+		},
 		renderState:     &streamRenderState{},
 		deferCompletion: true,
 	}
@@ -4631,12 +4848,14 @@ func TestHandleStreamStart_ReusesDeferredPipelineWorkerEntryAcrossRawAgentIDMism
 	idx := m.history.Len() - 1
 
 	slot := &streamSlot{
-		accumulator:     NewStreamAccumulator(idx),
-		agentID:         "inspector-pipeline",
-		thinkingIdx:     idx,
-		thinkingStart:   time.Now().Add(-2 * time.Second),
-		retryText:       deferredParentCompletionStatus,
-		lastProgressSet: time.Now(),
+		accumulator:   NewStreamAccumulator(idx),
+		agentID:       "inspector-pipeline",
+		thinkingIdx:   idx,
+		thinkingStart: time.Now().Add(-2 * time.Second),
+		progress: progressOverrideState{
+			retryText:       deferredParentCompletionStatus,
+			lastProgressSet: time.Now(),
+		},
 		renderState:     &streamRenderState{},
 		deferCompletion: true,
 	}

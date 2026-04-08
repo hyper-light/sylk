@@ -95,6 +95,111 @@ func TestOpenAIProviderGenerate_ChatGPTUsesCompletedResponse(t *testing.T) {
 	}
 }
 
+func TestOpenAIProviderGenerate_ChatGPTRecoversStreamedTextWhenCompletedResponseEmpty(t *testing.T) {
+	if !canListenLocalTCP() {
+		t.Skip("local TCP listeners are not permitted in this environment")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		if err := writeSSE(w,
+			`{"type":"response.output_text.done","text":"streamed answer","item_id":"msg_1","output_index":0,"content_index":0,"sequence_number":1}`,
+			`{"type":"response.completed","sequence_number":2,"response":{"id":"resp_empty_completion","model":"gpt-5.4","status":"completed","service_tier":"default","output":[],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`,
+		); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultOpenAIConfig()
+	cfg.APIKey = "test-access-token"
+	cfg.BaseURL = server.URL
+	cfg.AuthMode = openAIAuthModeChatGPT
+	cfg.ChatGPTAccountID = "acct_123"
+
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider() error = %v", err)
+	}
+
+	resp, err := provider.Generate(context.Background(), &Request{
+		Messages: []Message{{Role: RoleUser, Content: "say hello"}},
+	})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	if resp.Content != "streamed answer" {
+		t.Fatalf("expected streamed fallback content, got %q", resp.Content)
+	}
+	if resp.Usage.TotalTokens != 6 {
+		t.Fatalf("expected total_tokens=6, got %d", resp.Usage.TotalTokens)
+	}
+	if recovered, ok := resp.ProviderMetadata["stream_completion_recovered"].(bool); !ok || !recovered {
+		t.Fatalf("expected stream_completion_recovered=true, got %#v", resp.ProviderMetadata["stream_completion_recovered"])
+	}
+	if got, ok := resp.ProviderMetadata["openai_stream_completion_output_count"].(int); !ok || got != 0 {
+		t.Fatalf("expected openai_stream_completion_output_count=0, got %#v", resp.ProviderMetadata["openai_stream_completion_output_count"])
+	}
+}
+
+func TestOpenAIProviderGenerate_ChatGPTRecoversStreamedToolCallsWhenCompletedResponseEmpty(t *testing.T) {
+	if !canListenLocalTCP() {
+		t.Skip("local TCP listeners are not permitted in this environment")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		if err := writeSSE(w,
+			`{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"tool_1","type":"function_call","name":"run_test"}}`,
+			`{"type":"response.function_call_arguments.done","arguments":"{\"path\":\"/tmp\"}","item_id":"tool_1","output_index":0,"sequence_number":2}`,
+			`{"type":"response.completed","sequence_number":3,"response":{"id":"resp_empty_tool_completion","model":"gpt-5.4","status":"completed","service_tier":"default","output":[],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}`,
+		); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultOpenAIConfig()
+	cfg.APIKey = "test-access-token"
+	cfg.BaseURL = server.URL
+	cfg.AuthMode = openAIAuthModeChatGPT
+	cfg.ChatGPTAccountID = "acct_123"
+
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider() error = %v", err)
+	}
+
+	resp, err := provider.Generate(context.Background(), &Request{
+		Messages: []Message{{Role: RoleUser, Content: "run tool"}},
+	})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	if resp.StopReason != StopReasonToolUse {
+		t.Fatalf("expected stop_reason=%q, got %q", StopReasonToolUse, resp.StopReason)
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("expected exactly one recovered tool call, got %d", len(resp.ToolCalls))
+	}
+	if resp.ToolCalls[0].Name != "run_test" {
+		t.Fatalf("expected tool name run_test, got %q", resp.ToolCalls[0].Name)
+	}
+	if resp.ToolCalls[0].Arguments != "{\"path\":\"/tmp\"}" {
+		t.Fatalf("expected recovered arguments, got %q", resp.ToolCalls[0].Arguments)
+	}
+}
+
 func TestOpenAIProviderGenerate_ChatGPTGPT54OmitsPromptCacheRetention(t *testing.T) {
 	if !canListenLocalTCP() {
 		t.Skip("local TCP listeners are not permitted in this environment")

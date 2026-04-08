@@ -1712,6 +1712,42 @@ func TestGuideBridgeDispatchStream_ProgressEmitsProgressMsg(t *testing.T) {
 	}
 }
 
+func TestGuideBridgeDispatchStream_RetryDoesNotSynthesizeStart(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatchStream(&guide.StreamResponse{
+		CorrelationID:     "corr-retry",
+		RespondingAgentID: "orchestrator",
+		Event: &guide.StreamEvent{
+			Type: guide.StreamEventRetry,
+			Data: guide.RetryStatus{
+				Attempt:     1,
+				MaxAttempts: 3,
+				Delay:       2 * time.Second,
+				Err:         errors.New("read: connection reset by peer"),
+			},
+		},
+	}, program)
+
+	if len(program.messages) != 1 {
+		t.Fatalf("expected retry status only, got %d messages", len(program.messages))
+	}
+	retry, ok := program.messages[0].(uimsg.RetryStatusMsg)
+	if !ok {
+		t.Fatalf("expected RetryStatusMsg, got %T", program.messages[0])
+	}
+	if retry.CorrelationID != "corr-retry" {
+		t.Fatalf("unexpected retry correlation id: %q", retry.CorrelationID)
+	}
+	if retry.Attempt != 1 || retry.MaxAttempts != 3 {
+		t.Fatalf("unexpected retry status: %+v", retry)
+	}
+	if retry.Error == "" || !strings.Contains(strings.ToLower(retry.Error), "connection reset by peer") {
+		t.Fatalf("unexpected retry error text: %q", retry.Error)
+	}
+}
+
 func TestGuideBridgeDispatchStream_ToolCallSynthesizesStartBeforeToolEvent(t *testing.T) {
 	b := NewGuideBridge(nil, nil, "session-1")
 	program := &recordingProgram{}

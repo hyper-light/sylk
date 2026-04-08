@@ -754,7 +754,9 @@ func (p *OpenAIProvider) runChatGPTGenerateAttempt(ctx context.Context, req *Req
 func (p *OpenAIProvider) generateStandard(ctx context.Context, req *Request) (*Response, error) {
 	params := p.buildResponseParams(req)
 	requestedModel := string(params.Model)
-	resp, err := p.runStandardGenerateAttempt(ctx, req, params)
+	resp, err := retryGenerate(ctx, p.config.BaseConfig, func(ctx context.Context) (*Response, error) {
+		return p.runStandardGenerateAttempt(ctx, req, params)
+	})
 	if err == nil {
 		return resp, nil
 	}
@@ -764,7 +766,10 @@ func (p *OpenAIProvider) generateStandard(ctx context.Context, req *Request) (*R
 	}
 	retryReq := *req
 	retryReq.Model = fallbackModel
-	resp, err = p.runStandardGenerateAttempt(ctx, &retryReq, p.buildResponseParams(&retryReq))
+	retryParams := p.buildResponseParams(&retryReq)
+	resp, err = retryGenerate(ctx, p.config.BaseConfig, func(ctx context.Context) (*Response, error) {
+		return p.runStandardGenerateAttempt(ctx, &retryReq, retryParams)
+	})
 	if err != nil {
 		return nil, wrapOpenAIProviderError("generate", err)
 	}
@@ -799,16 +804,25 @@ func (p *OpenAIProvider) generateViaStreaming(ctx context.Context, req *Request)
 		return nil, err
 	}
 
+	fallback := p.responseFromStreamingFallback(req, assembler, streamStopReason, streamUsage, streamMetadata)
 	if completion != nil {
-		return p.responseFromStreamingCompletion(completion, streamMetadata), nil
+		return p.responseFromStreamingCompletion(completion, fallback, streamMetadata), nil
 	}
-	return p.responseFromStreamingFallback(req, assembler, streamStopReason, streamUsage, streamMetadata), nil
+	return fallback, nil
 }
 
-func (p *OpenAIProvider) responseFromStreamingCompletion(completion *responses.Response, metadata map[string]any) *Response {
+func (p *OpenAIProvider) responseFromStreamingCompletion(
+	completion *responses.Response,
+	fallback *Response,
+	metadata map[string]any,
+) *Response {
 	resp := p.convertResponse(completion)
 	resp.ProviderMetadata = mergeMetadata(resp.ProviderMetadata, metadata)
 	resp.ProviderMetadata["auth_mode"] = p.config.AuthMode
+	if shouldRecoverStreamingCompletion(resp, fallback) {
+		resp = mergeStreamingFallbackResponse(resp, fallback)
+		resp.ProviderMetadata["stream_completion_recovered"] = true
+	}
 	return resp
 }
 
@@ -822,6 +836,7 @@ func (p *OpenAIProvider) responseFromStreamingFallback(
 	assembler = ensureStreamResponseAssembler(assembler)
 	resp := &Response{
 		Content:    assembler.content.String(),
+		Thinking:   strings.TrimSpace(assembler.thinking.String()),
 		StopReason: streamStopReason,
 		Usage:      streamUsage,
 	}
@@ -829,7 +844,11 @@ func (p *OpenAIProvider) responseFromStreamingFallback(
 	resp.Model = p.resolveStreamResponseModel(req)
 	if toolCalls := assembler.orderedToolCalls(); len(toolCalls) > 0 {
 		resp.ToolCalls = toolCalls
+		if resp.StopReason == StopReasonEndTurn {
+			resp.StopReason = StopReasonToolUse
+		}
 	}
+	resp.ProviderMetadata = mergeMetadata(resp.ProviderMetadata, openAIStreamingDebugMetadata(assembler))
 	resp.ProviderMetadata = mergeMetadata(resp.ProviderMetadata, streamMetadata)
 	resp.ProviderMetadata["auth_mode"] = p.config.AuthMode
 	return resp
@@ -847,6 +866,49 @@ func coalesceStopReason(reason StopReason) StopReason {
 		return reason
 	}
 	return StopReasonEndTurn
+}
+
+func shouldRecoverStreamingCompletion(completion *Response, fallback *Response) bool {
+	return !responseHasVisibleOutput(completion) && responseHasVisibleOutput(fallback)
+}
+
+func responseHasVisibleOutput(resp *Response) bool {
+	if resp == nil {
+		return false
+	}
+	if strings.TrimSpace(resp.Content) != "" {
+		return true
+	}
+	if strings.TrimSpace(resp.Thinking) != "" {
+		return true
+	}
+	return len(resp.ToolCalls) > 0
+}
+
+func mergeStreamingFallbackResponse(completion *Response, fallback *Response) *Response {
+	if completion == nil {
+		return fallback
+	}
+	if fallback == nil {
+		return completion
+	}
+	merged := *completion
+	if strings.TrimSpace(merged.Content) == "" {
+		merged.Content = fallback.Content
+	}
+	if strings.TrimSpace(merged.Thinking) == "" {
+		merged.Thinking = fallback.Thinking
+	}
+	if len(merged.ToolCalls) == 0 && len(fallback.ToolCalls) > 0 {
+		merged.ToolCalls = append([]ToolCall(nil), fallback.ToolCalls...)
+	}
+	if (merged.StopReason == "" || merged.StopReason == StopReasonEndTurn) && len(merged.ToolCalls) > 0 {
+		merged.StopReason = StopReasonToolUse
+	} else if merged.StopReason == "" {
+		merged.StopReason = fallback.StopReason
+	}
+	merged.ProviderMetadata = mergeMetadata(fallback.ProviderMetadata, merged.ProviderMetadata)
+	return &merged
 }
 
 func (p *OpenAIProvider) resolveStreamResponseModel(req *Request) string {
@@ -911,6 +973,7 @@ type streamToolCallState struct {
 
 type streamResponseAssembler struct {
 	content       strings.Builder
+	thinking      strings.Builder
 	toolCalls     map[string]*ToolCall
 	toolCallOrder []string
 	handlers      []func(*StreamChunk) error
@@ -923,6 +986,7 @@ func newStreamResponseAssembler() *streamResponseAssembler {
 	}
 	assembler.handlers = []func(*StreamChunk) error{
 		assembler.handleTextChunk,
+		assembler.handleThoughtChunk,
 		assembler.handleToolStartChunk,
 		assembler.handleToolDeltaChunk,
 		assembler.handleToolEndChunk,
@@ -950,6 +1014,7 @@ func (a *streamResponseAssembler) reset() {
 		return
 	}
 	a.content.Reset()
+	a.thinking.Reset()
 	a.toolCalls = make(map[string]*ToolCall)
 	a.toolCallOrder = make([]string, 0, 4)
 }
@@ -959,6 +1024,14 @@ func (a *streamResponseAssembler) handleTextChunk(chunk *StreamChunk) error {
 		return nil
 	}
 	a.content.WriteString(chunk.Text)
+	return nil
+}
+
+func (a *streamResponseAssembler) handleThoughtChunk(chunk *StreamChunk) error {
+	if chunk.Type != ChunkTypeThought {
+		return nil
+	}
+	a.thinking.WriteString(chunk.Text)
 	return nil
 }
 
@@ -1086,12 +1159,16 @@ type openAIResponseStreamRunner struct {
 	toolCallBuilders map[string]*streamToolCallState
 	toolCallStarted  map[string]bool
 	toolCallEnded    map[string]bool
+	textPartsSeen    map[string]bool
 
 	completion            *responses.Response
 	responseStopReason    StopReason
 	responseUsage         Usage
 	preserveUsageOnErrors bool
 	eventHandlers         []func(any) error
+	eventCount            int
+	eventTypes            []string
+	eventTypeCounts       map[string]int
 }
 
 func newOpenAIResponseStreamRunner(
@@ -1115,10 +1192,15 @@ func newOpenAIResponseStreamRunner(
 		toolCallBuilders:   make(map[string]*streamToolCallState),
 		toolCallStarted:    make(map[string]bool),
 		toolCallEnded:      make(map[string]bool),
+		textPartsSeen:      make(map[string]bool),
 		responseStopReason: StopReasonEndTurn,
+		eventTypeCounts:    make(map[string]int),
 	}
 	runner.eventHandlers = []func(any) error{
 		runner.handleTextDeltaEvent,
+		runner.handleTextDoneEvent,
+		runner.handleContentPartDoneEvent,
+		runner.handleRefusalDoneEvent,
 		runner.handleReasoningSummaryDeltaEvent,
 		runner.handleFunctionCallArgumentsDeltaEvent,
 		runner.handleFunctionCallArgumentsDoneEvent,
@@ -1169,11 +1251,28 @@ func (r *openAIResponseStreamRunner) consume() error {
 	}
 	for r.stream.Next() {
 		r.chunkIndex++
-		if err := r.processEvent(r.stream.Current().AsAny()); err != nil {
+		event := r.stream.Current()
+		r.recordStreamEvent(event)
+		if err := r.processEvent(event.AsAny()); err != nil {
 			return err
 		}
 	}
 	return r.consumeStreamError()
+}
+
+func (r *openAIResponseStreamRunner) recordStreamEvent(event responses.ResponseStreamEventUnion) {
+	if r == nil {
+		return
+	}
+	eventType := strings.TrimSpace(event.Type)
+	if eventType == "" {
+		eventType = "unknown"
+	}
+	r.eventCount++
+	if _, ok := r.eventTypeCounts[eventType]; !ok {
+		r.eventTypes = append(r.eventTypes, eventType)
+	}
+	r.eventTypeCounts[eventType]++
 }
 
 func (r *openAIResponseStreamRunner) processEvent(event any) error {
@@ -1268,7 +1367,7 @@ func (r *openAIResponseStreamRunner) emitEndChunk() error {
 }
 
 func (r *openAIResponseStreamRunner) success() (*responses.Response, StopReason, Usage, map[string]any, error) {
-	return r.completion, r.responseStopReason, r.responseUsage, r.observer.metadata(), nil
+	return r.completion, r.responseStopReason, r.responseUsage, r.streamMetadata(), nil
 }
 
 func (r *openAIResponseStreamRunner) zeroUsageFailure(err error) (*responses.Response, StopReason, Usage, map[string]any, error) {
@@ -1277,9 +1376,37 @@ func (r *openAIResponseStreamRunner) zeroUsageFailure(err error) (*responses.Res
 
 func (r *openAIResponseStreamRunner) consumeFailure(err error) (*responses.Response, StopReason, Usage, map[string]any, error) {
 	if r.preserveUsageOnErrors {
-		return nil, StopReasonError, r.responseUsage, r.observer.metadata(), err
+		return nil, StopReasonError, r.responseUsage, r.streamMetadata(), err
 	}
-	return nil, StopReasonError, Usage{}, r.observer.metadata(), err
+	return nil, StopReasonError, Usage{}, r.streamMetadata(), err
+}
+
+func (r *openAIResponseStreamRunner) streamMetadata() map[string]any {
+	metadata := r.observer.metadata()
+	if r == nil {
+		return metadata
+	}
+	streamData := map[string]any{
+		"openai_stream_event_count":       r.eventCount,
+		"openai_stream_event_types":       append([]string(nil), r.eventTypes...),
+		"openai_stream_event_type_counts": cloneStringIntMap(r.eventTypeCounts),
+	}
+	if r.completion != nil {
+		streamData["openai_stream_completion_output_count"] = len(r.completion.Output)
+		streamData["openai_stream_completion_status"] = string(r.completion.Status)
+	}
+	return mergeMetadata(metadata, streamData)
+}
+
+func cloneStringIntMap(src map[string]int) map[string]int {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]int, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
 }
 
 func (r *openAIResponseStreamRunner) emitChunk(chunk *StreamChunk) error {
@@ -1297,12 +1424,76 @@ func (r *openAIResponseStreamRunner) handleTextDeltaEvent(event any) error {
 	if ev.Delta == "" {
 		return nil
 	}
+	r.markTextPartSeen(ev.ItemID, ev.OutputIndex, ev.ContentIndex)
 	return r.emitChunk(&StreamChunk{
 		Index:     r.chunkIndex,
 		Type:      ChunkTypeText,
 		Text:      ev.Delta,
 		Timestamp: time.Now(),
 	})
+}
+
+func (r *openAIResponseStreamRunner) handleTextDoneEvent(event any) error {
+	ev, ok := event.(responses.ResponseTextDoneEvent)
+	if !ok {
+		return nil
+	}
+	return r.emitCompletedTextPart(ev.ItemID, ev.OutputIndex, ev.ContentIndex, ev.Text)
+}
+
+func (r *openAIResponseStreamRunner) handleContentPartDoneEvent(event any) error {
+	ev, ok := event.(responses.ResponseContentPartDoneEvent)
+	if !ok {
+		return nil
+	}
+	switch part := ev.Part.AsAny().(type) {
+	case responses.ResponseOutputText:
+		return r.emitCompletedTextPart(ev.ItemID, ev.OutputIndex, ev.ContentIndex, part.Text)
+	case responses.ResponseOutputRefusal:
+		return r.emitCompletedTextPart(ev.ItemID, ev.OutputIndex, ev.ContentIndex, part.Refusal)
+	default:
+		return nil
+	}
+}
+
+func (r *openAIResponseStreamRunner) handleRefusalDoneEvent(event any) error {
+	ev, ok := event.(responses.ResponseRefusalDoneEvent)
+	if !ok {
+		return nil
+	}
+	return r.emitCompletedTextPart(ev.ItemID, ev.OutputIndex, ev.ContentIndex, ev.Refusal)
+}
+
+func (r *openAIResponseStreamRunner) emitCompletedTextPart(
+	itemID string,
+	outputIndex int64,
+	contentIndex int64,
+	text string,
+) error {
+	if text == "" {
+		return nil
+	}
+	if r.textPartsSeen[textPartKey(itemID, outputIndex, contentIndex)] {
+		return nil
+	}
+	r.markTextPartSeen(itemID, outputIndex, contentIndex)
+	return r.emitChunk(&StreamChunk{
+		Index:     r.chunkIndex,
+		Type:      ChunkTypeText,
+		Text:      text,
+		Timestamp: time.Now(),
+	})
+}
+
+func (r *openAIResponseStreamRunner) markTextPartSeen(itemID string, outputIndex int64, contentIndex int64) {
+	if r == nil {
+		return
+	}
+	r.textPartsSeen[textPartKey(itemID, outputIndex, contentIndex)] = true
+}
+
+func textPartKey(itemID string, outputIndex int64, contentIndex int64) string {
+	return fmt.Sprintf("%s:%d:%d", itemID, outputIndex, contentIndex)
 }
 
 func (r *openAIResponseStreamRunner) handleReasoningSummaryDeltaEvent(event any) error {
@@ -2244,6 +2435,7 @@ func (p *OpenAIProvider) convertResponse(result *responses.Response) *Response {
 	if searchResults := extractOpenAIWebSearchResults(result); len(searchResults) > 0 {
 		metadata[ProviderMetadataNativeWebSearchResultsKey] = searchResults
 	}
+	metadata = mergeMetadata(metadata, openAIResponseDebugMetadata(result))
 
 	response := &Response{
 		Content:          result.OutputText(),
@@ -2260,6 +2452,55 @@ func (p *OpenAIProvider) convertResponse(result *responses.Response) *Response {
 	}
 
 	return response
+}
+
+func openAIResponseDebugMetadata(result *responses.Response) map[string]any {
+	if result == nil {
+		return nil
+	}
+	itemTypes := make([]string, 0, len(result.Output))
+	typeCounts := make(map[string]int, len(result.Output))
+	for _, item := range result.Output {
+		itemType := strings.TrimSpace(item.Type)
+		if itemType == "" {
+			itemType = "unknown"
+		}
+		itemTypes = append(itemTypes, itemType)
+		typeCounts[itemType]++
+	}
+	return map[string]any{
+		"output_item_count":       len(result.Output),
+		"output_item_types":       itemTypes,
+		"output_item_type_counts": typeCounts,
+	}
+}
+
+func openAIStreamingDebugMetadata(assembler *streamResponseAssembler) map[string]any {
+	if assembler == nil {
+		return nil
+	}
+	toolCalls := assembler.orderedToolCalls()
+	return map[string]any{
+		"stream_fallback":        true,
+		"stream_text_len":        assembler.content.Len(),
+		"stream_tool_call_count": len(toolCalls),
+		"stream_tool_call_names": llmToolCallNames(toolCalls),
+	}
+}
+
+func llmToolCallNames(calls []ToolCall) []string {
+	if len(calls) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(calls))
+	for _, call := range calls {
+		name := strings.TrimSpace(call.Name)
+		if name == "" {
+			name = "<unnamed>"
+		}
+		names = append(names, name)
+	}
+	return names
 }
 
 func extractOpenAIReasoningSummary(result *responses.Response) string {

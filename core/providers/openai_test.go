@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,6 +15,7 @@ import (
 	"github.com/adalundhe/sylk/core/oauth"
 	promptskills "github.com/adalundhe/sylk/skills"
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/responses"
 	"github.com/openai/openai-go/shared"
 )
@@ -35,6 +39,87 @@ func TestDefaultOpenAIConfig_UsesGPT54Pro(t *testing.T) {
 func TestResolveOpenAITimeout_UsesOpenAISpecificDefault(t *testing.T) {
 	if got := resolveOpenAITimeout(0); got != defaultOpenAIRequestTimeout {
 		t.Fatalf("resolveOpenAITimeout(0) = %v, want %v", got, defaultOpenAIRequestTimeout)
+	}
+}
+
+func TestOpenAIProviderGenerate_StandardRetriesTransportReset(t *testing.T) {
+	if !canListenLocalTCP() {
+		t.Skip("local TCP listeners are not permitted in this environment")
+	}
+
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "hijacking unsupported", http.StatusInternalServerError)
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_retry_ok","model":"gpt-5.4-pro","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok after retry"}]}],"usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7}}`)
+	}))
+	defer server.Close()
+
+	cfg := DefaultOpenAIConfig()
+	cfg.APIKey = "test-api-key"
+	cfg.BaseURL = server.URL
+	cfg.MaxRetries = 2
+	cfg.RetryBaseDelay = time.Millisecond
+	cfg.RetryMaxDelay = 5 * time.Millisecond
+
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider() error = %v", err)
+	}
+
+	client := openai.NewClient(
+		option.WithAPIKey(cfg.APIKey),
+		option.WithBaseURL(server.URL),
+		option.WithHTTPClient(server.Client()),
+		option.WithMaxRetries(0),
+	)
+	provider.replaceClient(&client)
+
+	var observed int32
+	ctx := WithRetryObserver(context.Background(), func(event RetryEvent) {
+		atomic.AddInt32(&observed, 1)
+		if event.Attempt != 1 {
+			t.Errorf("retry attempt = %d, want 1", event.Attempt)
+		}
+		if event.MaxAttempts != 2 {
+			t.Errorf("retry max attempts = %d, want 2", event.MaxAttempts)
+		}
+		if event.Delay <= 0 {
+			t.Errorf("retry delay = %v, want > 0", event.Delay)
+		}
+	})
+
+	resp, err := provider.Generate(ctx, &Request{
+		Messages: []Message{{Role: RoleUser, Content: "say ok"}},
+	})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if resp.Content != "ok after retry" {
+		t.Fatalf("response content = %q, want %q", resp.Content, "ok after retry")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Fatalf("request attempts = %d, want 2", got)
+	}
+	if got := atomic.LoadInt32(&observed); got != 1 {
+		t.Fatalf("retry observer calls = %d, want 1", got)
 	}
 }
 

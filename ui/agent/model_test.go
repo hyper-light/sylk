@@ -3321,6 +3321,96 @@ func TestModel_StreamProgressKeepsSingletonKnowledgeAgentRow(t *testing.T) {
 	}
 }
 
+func TestModel_StreamProgressReleasesPinnedToolSummaryForHumanAuthoredUpdates(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "inspector", "inspector")
+
+	_, _ = model.Update(msg.ToolCallEventMsg{
+		AgentID:     "inspector",
+		AgentType:   "inspector",
+		ToolCallKey: "tool_consult_academic",
+		Phase:       0,
+		ToolName:    "consult_academic_approach",
+		FullArgs:    `{"query":"cleaner or more robust approach?"}`,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "consult",
+			AgentTypes: []string{"academic"},
+			Summary:    "cleaner or more robust approach?",
+			Status:     "pending",
+		},
+	})
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "inspector",
+		AgentType:  "inspector",
+		Message:    "Publishing the validation findings artifact for downstream review.",
+		Visibility: events.VisibilityUser,
+	})
+
+	agent := model.agents["inspector"]
+	if agent == nil {
+		t.Fatal("expected inspector row")
+	}
+	if agent.TaskSummary != "Publishing the validation findings artifact for downstream review." {
+		t.Fatalf("task summary = %q, want human-authored progress summary", agent.TaskSummary)
+	}
+	if agent.toolSummaryPinned {
+		t.Fatal("expected human-authored stream progress to release pinned tool summary")
+	}
+}
+
+func TestModel_WatchdogProgressDoesNotOverrideExistingSummary(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_tester_registered_watchdog",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "task_1:tester-pipeline",
+			Content:   "Pipeline agent registered",
+			Data: map[string]any{
+				"agent_name":  "Tester",
+				"agent_type":  "tester-pipeline",
+				"pipeline_id": "task_1",
+				"task_id":     "task_1",
+			},
+		},
+	})
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "task_1:tester-pipeline",
+		AgentType:  "tester-pipeline",
+		PipelineID: "task_1",
+		TaskID:     "task_1",
+		Message:    "Translating task and inspector criteria into executable tests and validating the current failure surface.",
+		Visibility: events.VisibilityUser,
+	})
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "task_1:tester-pipeline",
+		AgentType:  "tester-pipeline",
+		PipelineID: "task_1",
+		TaskID:     "task_1",
+		Message:    "Pipeline Tester is reasoning deeply...",
+		Visibility: events.VisibilityUser,
+		Watchdog:   true,
+	})
+
+	agent := model.agents["task_1:tester-pipeline"]
+	if agent == nil {
+		t.Fatal("expected pipeline tester row")
+	}
+	if agent.TaskSummary != "Translating task and inspector criteria into executable tests and validating the current failure surface." {
+		t.Fatalf("task summary = %q, want existing informative summary preserved", agent.TaskSummary)
+	}
+}
+
 func TestModel_ToolCallEventKeepsSingletonKnowledgeAgentRow(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SeedAgent("librarian", "librarian", "Librarian", nil, "", "")

@@ -103,19 +103,29 @@ func ProgressPublisherFromContext(ctx context.Context) *ProgressPublisher {
 
 // Publish sends a progress message to the UI via the bus.
 func (pp *ProgressPublisher) Publish(message string) {
-	pp.PublishState(events.AgentUIStateNone, message)
+	pp.publishProgress(events.AgentUIStateNone, message, false)
 }
 
 // PublishState sends a progress message with an explicit UI state.
 func (pp *ProgressPublisher) PublishState(state events.AgentUIState, message string) {
+	pp.publishProgress(state, message, false)
+}
+
+// PublishWatchdog sends a low-priority watchdog progress message.
+func (pp *ProgressPublisher) PublishWatchdog(message string) {
+	pp.publishProgress(events.AgentUIStateNone, message, true)
+}
+
+func (pp *ProgressPublisher) publishProgress(state events.AgentUIState, message string, watchdog bool) {
 	if pp == nil || pp.Bus == nil || pp.Channels == nil {
 		return
 	}
 	pp.publishEvent(&guide.StreamEvent{
 		Type: guide.StreamEventProgress,
 		Data: &guide.ProgressData{
-			Message: message,
-			UIState: events.NormalizeAgentUIState(state),
+			Message:  message,
+			UIState:  events.NormalizeAgentUIState(state),
+			Watchdog: watchdog,
 		},
 		Timestamp: time.Now(),
 	})
@@ -363,7 +373,7 @@ func startThinkingTimer(
 			})
 
 		if pp := ProgressPublisherFromContext(ctx); pp != nil {
-			pp.Publish(fmt.Sprintf("%s is reasoning deeply...", displayName))
+			pp.PublishWatchdog(fmt.Sprintf("%s is reasoning deeply...", displayName))
 		}
 	})
 	return func() { timer.Stop() }

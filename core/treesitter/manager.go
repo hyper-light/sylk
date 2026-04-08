@@ -447,6 +447,7 @@ var extToLang = map[string]string{
 	".properties": "properties",
 	".scala":      "scala",
 	".sc":         "scala",
+	".hcl":        "hcl",
 	".tf":         "hcl",
 	".tfvars":     "hcl",
 	".vue":        "vue",

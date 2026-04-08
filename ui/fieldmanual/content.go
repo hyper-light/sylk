@@ -246,6 +246,8 @@ func sectionFileTree() Section {
 			{"Enter", "Open file / activate entry", "File tree focused"},
 			{"g", "Go to first entry", "File tree focused"},
 			{"G", "Go to last entry", "File tree focused"},
+			{"Alt+n, f", "Create a new file in the selected directory", "File tree focused"},
+			{"Alt+n, d", "Create a new directory in the selected directory", "File tree focused"},
 			{"Alt+f", "Toggle file content search", "File tree focused"},
 			{"Alt+Shift+r", "Toggle multi-file find and replace", "File tree focused"},
 			{"/", "Enter tab filter (in tabs mode)", "Tabs panel active"},

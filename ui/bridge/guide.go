@@ -654,7 +654,10 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 		b.clearStreamStarted(cid, stream)
 		b.markStreamCompleted(cid, stream)
 	case guide.StreamEventRetry:
-		if !b.ensureStreamStarted(sid, cid, stream, program) {
+		if b.isStreamCompleted(cid, stream) {
+			bridgeEventDebugLog().Info("GuideBridge: STALE_RETRY_EVENT_DROPPED",
+				"correlation_id", cid,
+				"agent_id", stream.RespondingAgentID)
 			return
 		}
 		status, _ := stream.Event.Data.(guide.RetryStatus)
@@ -958,6 +961,7 @@ func toStreamProgressMsg(sessionID, correlationID string, stream *guide.StreamRe
 		CorrelationID:       correlationID,
 		ParentCorrelationID: streamParentCorrelationID(stream),
 		TopLevelTransfer:    streamTopLevelTransfer(stream),
+		Sequence:            0,
 		AgentID:             agentID,
 		RuntimeAgentID:      streamRuntimeAgentID(stream),
 		AgentName:           agentName,
@@ -970,10 +974,12 @@ func toStreamProgressMsg(sessionID, correlationID string, stream *guide.StreamRe
 		Total:               progress.Total,
 		Message:             redact.Text(strings.TrimSpace(progress.Message)),
 		ToolDerived:         progress.ToolDerived,
+		Watchdog:            progress.Watchdog,
 		UIState:             events.NormalizeAgentUIState(progress.UIState),
 		BranchRef:           parseInterAgentBranchRef(stream),
 	}
 	if event != nil {
+		m.Sequence = event.Sequence
 		m.Visibility = event.Visibility
 	}
 	return m
@@ -1258,6 +1264,7 @@ func parseProgressData(event *guide.StreamEvent) guide.ProgressData {
 			Message:     parseProgressString(data["message"]),
 			UIState:     events.AgentUIStateFromData(data),
 			ToolDerived: parseProgressBool(data["tool_derived"]),
+			Watchdog:    parseProgressBool(data["watchdog"]),
 		}
 	}
 	return guide.ProgressData{}

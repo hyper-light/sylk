@@ -30,6 +30,8 @@ func TestToolDetectLanguage(t *testing.T) {
 		{"main.go", "go", true},
 		{"script.py", "python", true},
 		{"app.js", "javascript", true},
+		{"terraform/main.hcl", "hcl", true},
+		{"terraform/vars.tf", "hcl", true},
 		{"unknown.xyz", "", false},
 	}
 

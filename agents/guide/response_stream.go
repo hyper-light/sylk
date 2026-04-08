@@ -417,6 +417,9 @@ type ProgressData struct {
 	// ToolDerived marks progress narration synthesized from an in-flight tool
 	// turn so downstream UIs can retire it precisely when the tool finishes.
 	ToolDerived bool `json:"tool_derived,omitempty"`
+	// Watchdog marks low-priority liveness narration emitted by the thinking
+	// watchdog. Downstream UIs should not let this displace stronger progress.
+	Watchdog bool `json:"watchdog,omitempty"`
 }
 
 // SendHeartbeat sends a keep-alive heartbeat

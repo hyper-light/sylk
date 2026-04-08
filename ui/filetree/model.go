@@ -57,6 +57,10 @@ const footerToolbarOffset = 1
 // Derived from: separator(1) + hint line(1) = 2.
 const refsFooterHeight = 2
 
+// treeFooterHeight is the vertical space consumed by the normal tree footer.
+// Derived from: separator(1) + toolbar(1) = 2.
+const treeFooterHeight = 2
+
 // tabsChromeHeight is the vertical space consumed by the top section in
 // tabs mode when the filter is active (filter input moves to top).
 // Derived from: header(1) + title(1) + separator(1) + filter input(1) + divider(1) = 5.
@@ -1293,7 +1297,7 @@ func (m *Model) ClickAt(viewX, viewY int) tea.Cmd {
 	case viewTabs:
 		return m.clickTabsMode(viewX, viewY)
 	default:
-		return m.clickTreeMode(viewY)
+		return m.clickTreeMode(viewX, viewY)
 	}
 }
 
@@ -1315,16 +1319,24 @@ func (m *Model) clickReferencesMode(viewY int) tea.Cmd {
 }
 
 // clickTreeMode handles clicks in tree browsing mode.
-func (m *Model) clickTreeMode(viewY int) tea.Cmd {
+func (m *Model) clickTreeMode(viewX, viewY int) tea.Cmd {
+	bh := m.bodyHeight()
+
 	// Click on search hint (row 1) → enter search mode.
 	if viewY == headerHeight {
 		m.enterSearch()
 		return nil
 	}
 
+	footerBase := treeChromeHeight + bh
+	if viewY-footerBase == footerToolbarOffset &&
+		!m.pendingNewEntry && !m.newEntryActive && !m.deleteConfirm && !m.renameActive {
+		return m.clickTreeToolbar(viewX)
+	}
+
 	// Click in body area (rows treeChromeHeight .. treeChromeHeight+bh-1).
 	bodyY := viewY - treeChromeHeight
-	if bodyY < 0 {
+	if bodyY < 0 || bodyY >= bh {
 		return nil
 	}
 	idx := m.scroll + bodyY
@@ -1333,6 +1345,18 @@ func (m *Model) clickTreeMode(viewY int) tea.Cmd {
 	}
 	m.cursor = idx
 	return m.activateEntry()
+}
+
+// clickTreeToolbar activates the footer actions in tree mode.
+func (m *Model) clickTreeToolbar(viewX int) tea.Cmd {
+	layout := m.treeToolbarLayout(max(m.width, 1))
+	switch {
+	case viewX >= layout.fileCol && viewX < layout.fileCol+layout.fileWidth:
+		m.EnterNewEntry(m.SelectedDir(), false)
+	case viewX >= layout.dirCol && viewX < layout.dirCol+layout.dirWidth:
+		m.EnterNewEntry(m.SelectedDir(), true)
+	}
+	return nil
 }
 
 // clickSearchMode handles clicks in search mode, dispatching to search
@@ -3933,7 +3957,7 @@ func (m *Model) readDir(dirPath string, depth int) []Entry {
 // Rendering: tree mode
 // ---------------------------------------------------------------------------
 
-// viewTreeMode renders the normal tree view with header, entries, and search hint.
+// viewTreeMode renders the normal tree view with header, entries, and footer actions.
 func (m *Model) viewTreeMode(cursorVisible bool) string {
 	contentWidth := max(m.width, 1)
 	header := m.renderHeader(contentWidth)
@@ -3963,7 +3987,7 @@ func (m *Model) viewTreeMode(cursorVisible bool) string {
 	// Apply bounce shift (same approach as code panel's applyCodeBounceShift).
 	bodyLines = applyBounceShift(bodyLines, m.bounceOffset, bh, emptyLine)
 
-	// Combine header + search hint + divider + body + optional new-entry footer.
+	// Combine header + search hint + divider + body + footer.
 	var b strings.Builder
 	b.WriteString(header)
 	b.WriteByte('\n')
@@ -3994,6 +4018,11 @@ func (m *Model) viewTreeMode(cursorVisible bool) string {
 		b.WriteString(m.renderToolbarSeparator(contentWidth))
 		b.WriteByte('\n')
 		b.WriteString(m.renderNewEntryInput(contentWidth, cursorVisible))
+	} else {
+		b.WriteByte('\n')
+		b.WriteString(m.renderToolbarSeparator(contentWidth))
+		b.WriteByte('\n')
+		b.WriteString(m.renderTreeToolbar(contentWidth))
 	}
 	return b.String()
 }
@@ -4510,6 +4539,95 @@ func (m *Model) renderTabsToolbar(contentWidth int) string {
 		line += strings.Repeat(" ", padCount)
 	}
 	return line
+}
+
+type treeToolbarLayout struct {
+	fileText  string
+	fileCol   int
+	fileWidth int
+	dirText   string
+	dirCol    int
+	dirWidth  int
+}
+
+// renderTreeToolbar renders the normal tree footer actions for creating files
+// and directories in the currently selected directory.
+func (m *Model) renderTreeToolbar(contentWidth int) string {
+	layout := m.treeToolbarLayout(contentWidth)
+	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Subtext)
+	if m.focused {
+		style = style.Foreground(m.theme.Palette.Accent)
+	} else {
+		style = style.Foreground(m.theme.Palette.Muted)
+	}
+
+	line := " " + style.Render(layout.fileText) + "  " + style.Render(layout.dirText)
+	if padCount := max(contentWidth-lipgloss.Width(line), 0); padCount > 0 {
+		line += strings.Repeat(" ", padCount)
+	}
+	return line
+}
+
+func (m *Model) treeToolbarLayout(contentWidth int) treeToolbarLayout {
+	variants := []struct {
+		fileText string
+		dirText  string
+	}{
+		{
+			fileText: treeToolbarActionPlain(false, m.nerdFonts, "New file"),
+			dirText:  treeToolbarActionPlain(true, m.nerdFonts, "New dir"),
+		},
+		{
+			fileText: treeToolbarActionPlain(false, m.nerdFonts, "File"),
+			dirText:  treeToolbarActionPlain(true, m.nerdFonts, "Dir"),
+		},
+		{
+			fileText: treeToolbarActionPlain(false, m.nerdFonts, "F"),
+			dirText:  treeToolbarActionPlain(true, m.nerdFonts, "D"),
+		},
+		{
+			fileText: treeToolbarActionPlain(false, m.nerdFonts, ""),
+			dirText:  treeToolbarActionPlain(true, m.nerdFonts, ""),
+		},
+	}
+
+	const gap = "  "
+	fileCol := 1
+	gapWidth := lipgloss.Width(gap)
+	chosen := variants[len(variants)-1]
+	for _, variant := range variants {
+		totalWidth := 1 + lipgloss.Width(variant.fileText) + gapWidth + lipgloss.Width(variant.dirText)
+		if totalWidth <= contentWidth {
+			chosen = variant
+			break
+		}
+	}
+
+	fileWidth := lipgloss.Width(chosen.fileText)
+	dirWidth := lipgloss.Width(chosen.dirText)
+	return treeToolbarLayout{
+		fileText:  chosen.fileText,
+		fileCol:   fileCol,
+		fileWidth: fileWidth,
+		dirText:   chosen.dirText,
+		dirCol:    fileCol + fileWidth + gapWidth,
+		dirWidth:  dirWidth,
+	}
+}
+
+func treeToolbarActionPlain(isDir, nerdFonts bool, label string) string {
+	glyph := theme.IconFilter
+	if nerdFonts {
+		if isDir {
+			glyph = "󰉖"
+		} else {
+			glyph = "󰈔"
+		}
+	}
+	if label == "" {
+		return "[" + glyph + "]"
+	}
+	return "[" + glyph + "] " + label
 }
 
 // renderTabBadge renders a single toggle badge for the tabs toolbar.
@@ -5523,7 +5641,7 @@ func (m *Model) emptyView(contentWidth int) string {
 // bodyHeight returns the number of entry lines visible between the top
 // chrome (header + input/hint + divider) and the mode-specific footer.
 func (m *Model) bodyHeight() int {
-	footer := 0
+	footer := treeFooterHeight
 	top := treeChromeHeight
 	switch m.mode {
 	case viewSearch:
@@ -5544,7 +5662,7 @@ func (m *Model) bodyHeight() int {
 			footer = tabsHintHeight
 		}
 	}
-	if m.pendingNewEntry || m.newEntryActive || m.deleteConfirm || m.renameActive {
+	if m.mode != viewTree && (m.pendingNewEntry || m.newEntryActive || m.deleteConfirm || m.renameActive) {
 		footer += newEntryFooterHeight
 	}
 	return max(m.height-top-footer, 1)

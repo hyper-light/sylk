@@ -95,9 +95,11 @@ func (pt *PipelineTester) executeToolLoopWithSurface(
 		}
 		shared.AccumulateUsage(ctx, &resp.Usage)
 		shared.PublishIntermediateToolTurn(pt.bus, pt.channels, ctx, pt.id, resp)
+		logPipelineTesterTurn(ctx, turn, resp)
 
 		if len(resp.ToolCalls) == 0 {
 			if err := shared.ValidatePipelineProtocolCompletion(ctx, "tester-pipeline"); err != nil {
+				logPipelineTesterRetry(ctx, turn, "protocol_incomplete", err, resp)
 				pt.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
 				req.Messages = append(req.Messages, providers.Message{
 					Role:     providers.RoleAssistant,
@@ -112,6 +114,7 @@ func (pt *PipelineTester) executeToolLoopWithSurface(
 				continue
 			}
 			if err := shared.ValidateTaskExecutionCompletion(ctx, "tester-pipeline"); err != nil {
+				logPipelineTesterRetry(ctx, turn, "task_execution_incomplete", err, resp)
 				pt.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
 				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 					shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -142,6 +145,7 @@ func (pt *PipelineTester) executeToolLoopWithSurface(
 		if err := surface.ValidateBatch(pt.toolInvocationsWithSurface(ctx, resp.ToolCalls, surface)); err != nil {
 			return "", err
 		}
+		logPipelineTesterToolBatch(ctx, turn, resp.ToolCalls)
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen, req.Messages); dup {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -356,6 +360,141 @@ func (pt *PipelineTester) toolInvocationsWithSurface(
 		})
 	}
 	return invocations
+}
+
+func logPipelineTesterTurn(ctx context.Context, turn int, resp *providers.Response) {
+	lm := shared.LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	data := pipelineTesterTurnLogData(turn, resp)
+	lm.EventLogger.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     "debug",
+		Agent:     lm.AgentID,
+		SessionID: lm.SessionID,
+		Event:     "tester_turn_response",
+		CorrID:    lm.CorrID,
+		Data:      data,
+	})
+}
+
+func logPipelineTesterRetry(ctx context.Context, turn int, reason string, retryErr error, resp *providers.Response) {
+	lm := shared.LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	data := pipelineTesterTurnLogData(turn, resp)
+	data["retry_reason"] = reason
+	if retryErr != nil {
+		data["retry_error"] = retryErr.Error()
+	}
+	lm.EventLogger.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     "debug",
+		Agent:     lm.AgentID,
+		SessionID: lm.SessionID,
+		Event:     "tester_turn_retry",
+		CorrID:    lm.CorrID,
+		Data:      data,
+	})
+}
+
+func logPipelineTesterToolBatch(ctx context.Context, turn int, calls []providers.ToolCall) {
+	lm := shared.LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	lm.EventLogger.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     "debug",
+		Agent:     lm.AgentID,
+		SessionID: lm.SessionID,
+		Event:     "tester_tool_batch",
+		CorrID:    lm.CorrID,
+		Data: map[string]any{
+			"turn":       turn,
+			"tool_count": len(calls),
+			"tool_names": pipelineTesterToolNames(calls),
+		},
+	})
+}
+
+func pipelineTesterTurnLogData(turn int, resp *providers.Response) map[string]any {
+	data := map[string]any{
+		"turn": turn,
+	}
+	if resp == nil {
+		data["response_nil"] = true
+		return data
+	}
+	data["stop_reason"] = resp.StopReason
+	data["tool_call_count"] = len(resp.ToolCalls)
+	data["tool_call_names"] = pipelineTesterToolNames(resp.ToolCalls)
+	data["content_len"] = len(resp.Content)
+	data["thinking_len"] = len(resp.Thinking)
+	if preview := pipelineTesterPreview(resp.Content); preview != "" {
+		data["content_preview"] = preview
+	}
+	if preview := pipelineTesterPreview(resp.Thinking); preview != "" {
+		data["thinking_preview"] = preview
+	}
+	if metadata := resp.ProviderMetadata; len(metadata) > 0 {
+		if itemTypes, ok := metadata["output_item_types"]; ok {
+			data["output_item_types"] = itemTypes
+		}
+		if itemCount, ok := metadata["output_item_count"]; ok {
+			data["output_item_count"] = itemCount
+		}
+		if typeCounts, ok := metadata["output_item_type_counts"]; ok {
+			data["output_item_type_counts"] = typeCounts
+		}
+		if streamFallback, ok := metadata["stream_fallback"]; ok {
+			data["stream_fallback"] = streamFallback
+		}
+		if eventCount, ok := metadata["openai_stream_event_count"]; ok {
+			data["openai_stream_event_count"] = eventCount
+		}
+		if eventTypes, ok := metadata["openai_stream_event_types"]; ok {
+			data["openai_stream_event_types"] = eventTypes
+		}
+		if typeCounts, ok := metadata["openai_stream_event_type_counts"]; ok {
+			data["openai_stream_event_type_counts"] = typeCounts
+		}
+		if outputCount, ok := metadata["openai_stream_completion_output_count"]; ok {
+			data["openai_stream_completion_output_count"] = outputCount
+		}
+		if recovered, ok := metadata["stream_completion_recovered"]; ok {
+			data["stream_completion_recovered"] = recovered
+		}
+	}
+	return data
+}
+
+func pipelineTesterToolNames(calls []providers.ToolCall) []string {
+	if len(calls) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(calls))
+	for _, call := range calls {
+		name := strings.TrimSpace(call.Name)
+		if name == "" {
+			name = "<unnamed>"
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+func pipelineTesterPreview(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	if len(text) <= 240 {
+		return text
+	}
+	return text[:240] + "..."
 }
 
 // Tool loop helpers (marshalToolOutput, toolErrorPayload, coerceMap,

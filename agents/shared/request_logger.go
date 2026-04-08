@@ -2,6 +2,7 @@ package shared
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -61,7 +62,18 @@ func LogLLMCallFromContext(ctx context.Context, model string, resp *providers.Re
 	}
 	usage := TokenCount(resp)
 	LogLLMCall(m.EventLogger, m.CorrID, m.AgentID, m.SessionID, model, &usage, dur, err)
-	if resp != nil && resp.Content != "" {
+	if resp != nil {
+		m.EventLogger.LogEvent(agentlog.JSONLEntry{
+			Timestamp: time.Now(),
+			Level:     "debug",
+			Agent:     m.AgentID,
+			SessionID: m.SessionID,
+			Event:     "llm_response_shape",
+			CorrID:    m.CorrID,
+			Data:      buildLLMResponseShape(resp),
+		})
+	}
+	if resp != nil && strings.TrimSpace(resp.Content) != "" {
 		m.EventLogger.LogEvent(agentlog.JSONLEntry{
 			Timestamp: time.Now(),
 			Level:     "debug",
@@ -73,6 +85,111 @@ func LogLLMCallFromContext(ctx context.Context, model string, resp *providers.Re
 				"response_preview": truncate(resp.Content, 512),
 			},
 		})
+		return
+	}
+	if resp != nil && strings.TrimSpace(resp.Thinking) != "" {
+		m.EventLogger.LogEvent(agentlog.JSONLEntry{
+			Timestamp: time.Now(),
+			Level:     "debug",
+			Agent:     m.AgentID,
+			SessionID: m.SessionID,
+			Event:     "llm_thinking_preview",
+			CorrID:    m.CorrID,
+			Data: map[string]any{
+				"thinking_preview": truncate(resp.Thinking, 512),
+			},
+		})
+	}
+}
+
+func buildLLMResponseShape(resp *providers.Response) map[string]any {
+	if resp == nil {
+		return map[string]any{
+			"response_nil": true,
+		}
+	}
+	data := map[string]any{
+		"model":           resp.Model,
+		"stop_reason":     resp.StopReason,
+		"content_len":     len(resp.Content),
+		"thinking_len":    len(resp.Thinking),
+		"tool_call_count": len(resp.ToolCalls),
+	}
+	if toolNames := llmToolCallNames(resp.ToolCalls); len(toolNames) > 0 {
+		data["tool_call_names"] = toolNames
+	}
+	if metadata := resp.ProviderMetadata; len(metadata) > 0 {
+		if itemTypes := metadataStringSlice(metadata["output_item_types"]); len(itemTypes) > 0 {
+			data["output_item_types"] = itemTypes
+		}
+		if itemCount, ok := metadata["output_item_count"]; ok {
+			data["output_item_count"] = itemCount
+		}
+		if typeCounts, ok := metadata["output_item_type_counts"]; ok {
+			data["output_item_type_counts"] = typeCounts
+		}
+		if streamFallback, ok := metadata["stream_fallback"]; ok {
+			data["stream_fallback"] = streamFallback
+		}
+		if eventCount, ok := metadata["openai_stream_event_count"]; ok {
+			data["openai_stream_event_count"] = eventCount
+		}
+		if eventTypes := metadataStringSlice(metadata["openai_stream_event_types"]); len(eventTypes) > 0 {
+			data["openai_stream_event_types"] = eventTypes
+		}
+		if typeCounts, ok := metadata["openai_stream_event_type_counts"]; ok {
+			data["openai_stream_event_type_counts"] = typeCounts
+		}
+		if outputCount, ok := metadata["openai_stream_completion_output_count"]; ok {
+			data["openai_stream_completion_output_count"] = outputCount
+		}
+		if recovered, ok := metadata["stream_completion_recovered"]; ok {
+			data["stream_completion_recovered"] = recovered
+		}
+	}
+	return data
+}
+
+func llmToolCallNames(calls []providers.ToolCall) []string {
+	if len(calls) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(calls))
+	for _, call := range calls {
+		name := strings.TrimSpace(call.Name)
+		if name == "" {
+			name = "<unnamed>"
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+func metadataStringSlice(raw any) []string {
+	switch typed := raw.(type) {
+	case []string:
+		if len(typed) == 0 {
+			return nil
+		}
+		return append([]string(nil), typed...)
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, value := range typed {
+			text, ok := value.(string)
+			if !ok {
+				continue
+			}
+			text = strings.TrimSpace(text)
+			if text != "" {
+				out = append(out, text)
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	default:
+		return nil
 	}
 }
 

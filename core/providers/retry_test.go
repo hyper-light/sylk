@@ -197,6 +197,11 @@ func TestIsRetryableError_TypedErrors(t *testing.T) {
 			retryable: true,
 		},
 		{
+			name:      "connection reset by peer",
+			err:       errors.New("read: connection reset by peer"),
+			retryable: true,
+		},
+		{
 			name:      "nil error",
 			err:       nil,
 			retryable: false,

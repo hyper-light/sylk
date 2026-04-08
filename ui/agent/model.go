@@ -724,9 +724,18 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 		Status:        next.Status,
 		ActivityState: next.ActivityState,
 	})
-	if raw := strings.TrimSpace(progress.Message); raw != "" && !agent.toolSummaryPinned {
+	if raw := strings.TrimSpace(progress.Message); raw != "" {
+		if progress.Watchdog && strings.TrimSpace(agent.TaskSummary) != "" {
+			m.rowsDirty = true
+			return nil
+		}
 		payload := compactAgentPanelPayload(raw)
-		if shouldApplyStructuredProgressSummary(agent.TaskSummary, payload) {
+		shouldApply := shouldApplyStructuredProgressSummary(agent.TaskSummary, payload)
+		if !progress.ToolDerived && !progress.Watchdog && shouldApply && agent.toolSummaryPinned {
+			agent.toolSummaryPinned = false
+			agent.pinnedToolCallKey = ""
+		}
+		if shouldApply && !agent.toolSummaryPinned {
 			agent.TaskSummary = payload.summary
 		}
 	}

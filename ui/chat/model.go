@@ -207,19 +207,29 @@ func lookupThinkingMessages(agentID string) ([]string, bool) {
 // streamSlot tracks per-stream accumulation state. Multiple slots can be
 // active concurrently when several agents stream in parallel (e.g. architect
 // and orchestrator).
+type progressOverrideState struct {
+	retryText               string
+	retryToolDerived        bool
+	retryWatchdog           bool
+	retrySequence           int64
+	pendingRetryText        string
+	pendingRetryToolDerived bool
+	pendingRetryWatchdog    bool
+	pendingRetrySequence    int64
+	lastProgressSet         time.Time
+}
+
 type streamSlot struct {
-	accumulator      *StreamAccumulator
-	agentID          string
-	thinkingIdx      int                // History index of thinking placeholder for this stream.
-	thinkingStart    time.Time          // When this stream's thinking phase began.
-	retryText        string             // Progress override shown instead of fun messages.
-	retryToolDerived bool               // Progress override is synthesized from active tool calls.
-	lastProgressSet  time.Time          // Last immediate progress text write time.
-	renderState      *streamRenderState // Incremental render state for this stream.
-	planID           string             // Plan ID embedded in this stream, if any.
-	planMarkdown     string             // Rendered plan markdown for this stream.
-	planOffset       int                // Accumulator content length when plan was injected.
-	deferCompletion  bool               // Parent stream finished, but child inter-agent work still owns the row.
+	accumulator     *StreamAccumulator
+	agentID         string
+	thinkingIdx     int       // History index of thinking placeholder for this stream.
+	thinkingStart   time.Time // When this stream's thinking phase began.
+	progress        progressOverrideState
+	renderState     *streamRenderState // Incremental render state for this stream.
+	planID          string             // Plan ID embedded in this stream, if any.
+	planMarkdown    string             // Rendered plan markdown for this stream.
+	planOffset      int                // Accumulator content length when plan was injected.
+	deferCompletion bool               // Parent stream finished, but child inter-agent work still owns the row.
 }
 
 const deferredParentCompletionStatus = "Waiting for child work to finish..."
@@ -227,17 +237,15 @@ const deferredParentCompletionStatus = "Waiting for child work to finish..."
 // nestedStreamSlot tracks a child agent stream that belongs to an inter-agent
 // consult/challenge branch owned by a parent chat entry.
 type nestedStreamSlot struct {
-	correlationID    string
-	branchRef        msg.InterAgentBranchRefMsg
-	thinkingStart    time.Time
-	retryText        string
-	retryToolDerived bool
-	lastProgressSet  time.Time
-	content          strings.Builder
-	activity         InterAgentChildActivity
-	terminalSeen     bool
-	terminalFailed   bool
-	done             bool
+	correlationID  string
+	branchRef      msg.InterAgentBranchRefMsg
+	thinkingStart  time.Time
+	progress       progressOverrideState
+	content        strings.Builder
+	activity       InterAgentChildActivity
+	terminalSeen   bool
+	terminalFailed bool
+	done           bool
 }
 
 type resumablePrimaryState struct {
@@ -266,13 +274,11 @@ type Model struct {
 	highlightUntil time.Time
 
 	// Thinking animation state (active between prompt submit and first content).
-	thinkingIdx      int             // History index of thinking placeholder (-1 = inactive).
-	thinkingAgentID  string          // Agent currently thinking (for agent-specific messages).
-	thinkingStart    time.Time       // When current thinking phase began.
-	retryText        string          // Retry/model-fallback status (replaces fun messages when set).
-	retryToolDerived bool            // Progress override is synthesized from active tool calls.
+	thinkingIdx      int       // History index of thinking placeholder (-1 = inactive).
+	thinkingAgentID  string    // Agent currently thinking (for agent-specific messages).
+	thinkingStart    time.Time // When current thinking phase began.
+	progress         progressOverrideState
 	thinkingGradient *theme.Gradient // Color gradient cycled during thinking animation.
-	lastProgressSet  time.Time       // Last immediate progress text write time.
 
 	// Inline plan tracking: the plan renders as a chat entry updated in place.
 	planEntryIdx int    // History index of the plan ChatEntry (-1 = no plan entry).
@@ -299,6 +305,198 @@ type Model struct {
 	// View cache: avoids re-rendering when no visible state changed.
 	viewCache string
 	viewDirty bool
+}
+
+func progressPriority(toolDerived, watchdog bool) int {
+	if watchdog {
+		return 0
+	}
+	if toolDerived {
+		return 1
+	}
+	return 2
+}
+
+func (s *progressOverrideState) clear() {
+	if s == nil {
+		return
+	}
+	s.retryText = ""
+	s.retryToolDerived = false
+	s.retryWatchdog = false
+	s.retrySequence = 0
+	s.pendingRetryText = ""
+	s.pendingRetryToolDerived = false
+	s.pendingRetryWatchdog = false
+	s.pendingRetrySequence = 0
+	s.lastProgressSet = time.Time{}
+}
+
+func (s *progressOverrideState) hasPending() bool {
+	if s == nil {
+		return false
+	}
+	return s.pendingRetrySequence > s.retrySequence && strings.TrimSpace(s.pendingRetryText) != ""
+}
+
+func (s *progressOverrideState) hasDisplayed() bool {
+	if s == nil {
+		return false
+	}
+	return strings.TrimSpace(s.retryText) != ""
+}
+
+func (s *progressOverrideState) normalizeSequence(sequence int64) int64 {
+	if s == nil {
+		return sequence
+	}
+	if sequence > 0 {
+		return sequence
+	}
+	maxSeq := s.retrySequence
+	if s.pendingRetrySequence > maxSeq {
+		maxSeq = s.pendingRetrySequence
+	}
+	return maxSeq + 1
+}
+
+func (s *progressOverrideState) queue(message string, sequence int64, toolDerived, watchdog bool) bool {
+	if s == nil {
+		return false
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return false
+	}
+	sequence = s.normalizeSequence(sequence)
+	nextPriority := progressPriority(toolDerived, watchdog)
+	if s.hasPending() {
+		if sequence <= s.pendingRetrySequence {
+			return false
+		}
+		if nextPriority < progressPriority(s.pendingRetryToolDerived, s.pendingRetryWatchdog) {
+			return false
+		}
+	}
+	if s.hasDisplayed() {
+		if sequence <= s.retrySequence {
+			return false
+		}
+		if watchdog && !s.retryWatchdog {
+			return false
+		}
+	} else if !s.hasPending() && sequence <= s.retrySequence {
+		return false
+	}
+	s.pendingRetryText = message
+	s.pendingRetryToolDerived = toolDerived
+	s.pendingRetryWatchdog = watchdog
+	s.pendingRetrySequence = sequence
+	return true
+}
+
+func (s *progressOverrideState) canPromote(now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	return s.lastProgressSet.IsZero() || now.Sub(s.lastProgressSet) >= thinkingProgressMinInterval
+}
+
+func (s *progressOverrideState) promotePending(now time.Time) bool {
+	if !s.hasPending() {
+		return false
+	}
+	s.retryText = s.pendingRetryText
+	s.retryToolDerived = s.pendingRetryToolDerived
+	s.retryWatchdog = s.pendingRetryWatchdog
+	s.retrySequence = s.pendingRetrySequence
+	s.pendingRetryText = ""
+	s.pendingRetryToolDerived = false
+	s.pendingRetryWatchdog = false
+	s.pendingRetrySequence = 0
+	s.lastProgressSet = now
+	return true
+}
+
+func (s *progressOverrideState) clearDisplayed(now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	if strings.TrimSpace(s.retryText) == "" && !s.retryToolDerived && !s.retryWatchdog {
+		return false
+	}
+	s.retryText = ""
+	s.retryToolDerived = false
+	s.retryWatchdog = false
+	s.lastProgressSet = now
+	return true
+}
+
+func (s *progressOverrideState) clearPending() {
+	if s == nil {
+		return
+	}
+	s.pendingRetryText = ""
+	s.pendingRetryToolDerived = false
+	s.pendingRetryWatchdog = false
+	s.pendingRetrySequence = 0
+}
+
+func (s *progressOverrideState) reconcileToolDerived(next string, now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	if strings.TrimSpace(next) == "" {
+		if s.hasPending() && (s.pendingRetryToolDerived || s.pendingRetryWatchdog) {
+			s.clearPending()
+		}
+		if s.retryToolDerived {
+			return s.clearDisplayed(now)
+		}
+		return false
+	}
+	if s.hasPending() {
+		if !s.pendingRetryToolDerived && !s.pendingRetryWatchdog {
+			return false
+		}
+		if next == s.pendingRetryText && s.pendingRetryToolDerived && !s.pendingRetryWatchdog {
+			return false
+		}
+		s.pendingRetryText = next
+		s.pendingRetryToolDerived = true
+		s.pendingRetryWatchdog = false
+		if s.pendingRetrySequence == 0 {
+			s.pendingRetrySequence = s.normalizeSequence(0)
+		}
+		if s.canPromote(now) {
+			return s.promotePending(now)
+		}
+		return false
+	}
+	if !s.hasDisplayed() {
+		s.retryText = next
+		s.retryToolDerived = true
+		s.retryWatchdog = false
+		if s.retrySequence == 0 {
+			s.retrySequence = s.normalizeSequence(0)
+		}
+		s.lastProgressSet = now
+		return true
+	}
+	if !s.retryToolDerived && !s.retryWatchdog {
+		return false
+	}
+	if next == s.retryText && s.retryToolDerived && !s.retryWatchdog {
+		return false
+	}
+	s.retryText = next
+	s.retryToolDerived = true
+	s.retryWatchdog = false
+	if s.retrySequence == 0 {
+		s.retrySequence = s.normalizeSequence(0)
+	}
+	s.lastProgressSet = now
+	return true
 }
 
 // steeringPendingEntry tracks a single steering chat entry awaiting acknowledgment.
@@ -776,7 +974,7 @@ func (m *Model) resumeDeferredPrimaryStreamSlot(slot *streamSlot, start msg.Stre
 		slot.renderState = &streamRenderState{}
 	}
 	m.viewport.AddStreamState(slot.accumulator.EntryIndex(), slot.renderState)
-	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, now)
+	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.progress.retryText, slot.thinkingStart, now)
 	m.viewDirty = true
 }
 
@@ -797,7 +995,7 @@ func (m *Model) resumeCompletedPrimaryEntry(idx int, start msg.StreamStartMsg, n
 	m.updateStreamEntryMetadata(idx, start)
 	m.startSlotThinkingAnimation(now, slot)
 	m.viewport.AddStreamState(idx, slot.renderState)
-	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, now)
+	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.progress.retryText, slot.thinkingStart, now)
 	m.viewDirty = true
 	return slot
 }
@@ -848,7 +1046,7 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	message := sanitizeThinkingMessage(progress.Message)
 	if slot := m.streamSlot(progress.CorrelationID); slot != nil {
 		m.updateSlotThinkingAgent(slot, displayAgentID)
-		m.applySlotProgress(slot, message, progress.ToolDerived)
+		m.applySlotProgress(slot, message, progress.Sequence, progress.ToolDerived, progress.Watchdog)
 		return nil
 	}
 	m.updateThinkingAgent(displayAgentID)
@@ -858,15 +1056,11 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	if m.thinkingIdx < 0 {
 		return nil
 	}
-	if message == m.retryText && progress.ToolDerived == m.retryToolDerived {
-		return nil
-	}
-	m.retryText = message
-	m.retryToolDerived = progress.ToolDerived
 	now := time.Now()
-	if m.lastProgressSet.IsZero() || now.Sub(m.lastProgressSet) >= thinkingProgressMinInterval {
-		m.lastProgressSet = now
-		m.setThinkingTextNow(message)
+	if m.progress.queue(message, progress.Sequence, progress.ToolDerived, progress.Watchdog) && m.progress.canPromote(now) {
+		if m.progress.promotePending(now) {
+			m.setThinkingTextNow(m.progress.retryText)
+		}
 	}
 	return nil
 }
@@ -1043,12 +1237,16 @@ func (m *Model) handleRetryStatus(retry msg.RetryStatusMsg) tea.Cmd {
 	delayStr := formatRetryDelay(retry.Delay)
 	message := sanitizeThinkingMessage(fmt.Sprintf("retrying (%d/%d) in %s...", retry.Attempt, retry.MaxAttempts, delayStr))
 	if slot := m.streamSlot(retry.CorrelationID); slot != nil {
-		m.applySlotProgress(slot, message, false)
+		m.applySlotProgress(slot, message, 0, false, false)
 		return nil
 	}
 	if m.thinkingIdx >= 0 {
-		m.retryText = message
-		m.retryToolDerived = false
+		now := time.Now()
+		if m.progress.queue(message, 0, false, false) && m.progress.canPromote(now) {
+			if m.progress.promotePending(now) {
+				m.setThinkingTextNow(m.progress.retryText)
+			}
+		}
 	}
 	return nil
 }
@@ -1646,9 +1844,7 @@ func (m *Model) handleNestedStreamStart(start msg.StreamStartMsg) {
 		slot.activity.Failed = false
 	}
 	slot.thinkingStart = now
-	slot.retryText = ""
-	slot.retryToolDerived = false
-	slot.lastProgressSet = time.Time{}
+	slot.progress.clear()
 	slot.activity.ThinkingStartedAt = now
 	m.renderNestedStreamThinking(slot, now)
 	m.syncPendingNestedStream(slot)
@@ -1690,15 +1886,13 @@ func (m *Model) handleNestedStreamProgress(progress msg.StreamProgressMsg) bool 
 		return true
 	}
 	if message != "" {
-		slot.retryText = message
-		slot.retryToolDerived = progress.ToolDerived
+		slot.progress.queue(message, progress.Sequence, progress.ToolDerived, progress.Watchdog)
 	}
 	if slot.thinkingStart.IsZero() {
 		slot.thinkingStart = time.Now()
 	}
 	now := time.Now()
-	if slot.lastProgressSet.IsZero() || now.Sub(slot.lastProgressSet) >= thinkingProgressMinInterval {
-		slot.lastProgressSet = now
+	if slot.progress.canPromote(now) && slot.progress.promotePending(now) {
 		m.renderNestedStreamThinking(slot, now)
 		m.syncPendingNestedStream(slot)
 	}
@@ -1732,9 +1926,7 @@ func (m *Model) handleNestedStreamComplete(done msg.StreamCompleteMsg) bool {
 	slot.activity.ThinkingStatus = ""
 	slot.activity.ThinkingColor = ""
 	slot.thinkingStart = time.Time{}
-	slot.retryText = ""
-	slot.retryToolDerived = false
-	slot.lastProgressSet = time.Time{}
+	slot.progress.clear()
 	slot.terminalSeen = true
 	slot.terminalFailed = false
 	finalizeNestedStreamToolCallsOnTerminal(slot.activity.ToolCalls, time.Now(), true, summary)
@@ -1757,9 +1949,7 @@ func (m *Model) handleNestedStreamError(errMsg msg.StreamErrorMsg) bool {
 	slot.activity.ThinkingStatus = ""
 	slot.activity.ThinkingColor = ""
 	slot.thinkingStart = time.Time{}
-	slot.retryText = ""
-	slot.retryToolDerived = false
-	slot.lastProgressSet = time.Time{}
+	slot.progress.clear()
 	slot.terminalSeen = true
 	slot.terminalFailed = true
 	finalizeNestedStreamToolCallsOnTerminal(slot.activity.ToolCalls, time.Now(), false, slot.activity.ResultSummary)
@@ -2029,6 +2219,9 @@ func (m *Model) tickNestedStreamThinking(now time.Time) bool {
 		if slot == nil || slot.done {
 			continue
 		}
+		if slot.progress.canPromote(now) && slot.progress.promotePending(now) {
+			updated = true
+		}
 		if m.renderNestedStreamThinking(slot, now) {
 			if m.syncPendingNestedStream(slot) {
 				updated = true
@@ -2141,7 +2334,7 @@ func (m *Model) renderNestedStreamThinking(slot *nestedStreamSlot, now time.Time
 	if slot.thinkingStart.IsZero() {
 		return false
 	}
-	if strings.TrimSpace(slot.retryText) == "" {
+	if strings.TrimSpace(slot.progress.retryText) == "" {
 		if slot.activity.ThinkingText == "" && slot.activity.ThinkingStatus == "" && slot.activity.ThinkingColor == "" {
 			return false
 		}
@@ -2153,7 +2346,7 @@ func (m *Model) renderNestedStreamThinking(slot *nestedStreamSlot, now time.Time
 	}
 	elapsed := thinkingElapsed(slot.thinkingStart, now)
 	text := fmt.Sprintf("%s  %.1fs", spinnerFrames[thinkingFrameAt(elapsed)], elapsed.Seconds())
-	status := thinkingStatusFor(nestedActivityAgentType(&slot.activity), slot.retryText, elapsed)
+	status := thinkingStatusFor(nestedActivityAgentType(&slot.activity), slot.progress.retryText, elapsed)
 	color := m.thinkingColorFor(elapsed)
 	if slot.activity.ThinkingText == text &&
 		slot.activity.ThinkingStatus == status &&
@@ -3422,14 +3615,20 @@ func (m *Model) flushStreamRender() {
 // Active whenever a thinking placeholder exists (streaming or non-streaming).
 func (m *Model) tickThinking(now time.Time) {
 	updated := false
-	if m.renderThinkingEntry(m.thinkingIdx, m.thinkingAgentID, m.retryText, m.thinkingStart, now) {
+	if m.progress.canPromote(now) && m.progress.promotePending(now) {
+		updated = true
+	}
+	if m.renderThinkingEntry(m.thinkingIdx, m.thinkingAgentID, m.progress.retryText, m.thinkingStart, now) {
 		updated = true
 	}
 	for _, slot := range m.streams {
 		if slot == nil {
 			continue
 		}
-		if m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, now) {
+		if slot.progress.canPromote(now) && slot.progress.promotePending(now) {
+			updated = true
+		}
+		if m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.progress.retryText, slot.thinkingStart, now) {
 			updated = true
 		}
 	}
@@ -3542,9 +3741,7 @@ func (m *Model) FinishThinking(entry *ChatEntry) {
 func (m *Model) startThinkingAnimation(now time.Time, idx int) {
 	m.thinkingIdx = idx
 	m.thinkingStart = now
-	m.lastProgressSet = time.Time{}
-	m.retryText = ""
-	m.retryToolDerived = false
+	m.progress.clear()
 }
 
 // resolveThinkingEntry transitions the thinking placeholder to content phase,
@@ -3569,9 +3766,7 @@ func (m *Model) clearThinkingState() {
 	m.thinkingIdx = -1
 	m.thinkingAgentID = ""
 	m.thinkingStart = time.Time{}
-	m.retryText = ""
-	m.retryToolDerived = false
-	m.lastProgressSet = time.Time{}
+	m.progress.clear()
 }
 
 // HasPendingCorrelation reports whether the chat model still has an active or
@@ -3603,8 +3798,7 @@ func (m *Model) updateThinkingAgent(agentID string) {
 	// When the active agent changes (e.g. guide → architect), clear the
 	// progress override so agent-specific rotating messages take over.
 	if agentID != m.thinkingAgentID {
-		m.retryText = ""
-		m.retryToolDerived = false
+		m.progress.clear()
 	}
 	m.thinkingAgentID = agentID
 	idx := m.thinkingIdx
@@ -3809,14 +4003,12 @@ func (m *Model) refreshExistingStreamSlot(slot *streamSlot, start msg.StreamStar
 		// Shared-correlation handoffs (for example Guide -> Architect) reuse the
 		// same row, but the previous speaker's progress override must not leak
 		// into the new responder's thinking state.
-		slot.retryText = ""
-		slot.retryToolDerived = false
-		slot.lastProgressSet = time.Time{}
+		slot.progress.clear()
 	}
 	m.updateStreamEntryMetadata(slot.accumulator.EntryIndex(), start)
 	if !shouldResetStreamSlot(slot) {
 		if agentChanged {
-			m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, time.Now())
+			m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.progress.retryText, slot.thinkingStart, time.Now())
 		}
 		m.viewDirty = true
 		return
@@ -3832,7 +4024,7 @@ func (m *Model) refreshExistingStreamSlot(slot *streamSlot, start msg.StreamStar
 	if slot.renderState != nil {
 		m.viewport.AddStreamState(slot.accumulator.EntryIndex(), slot.renderState)
 	}
-	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, slot.thinkingStart)
+	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.progress.retryText, slot.thinkingStart, slot.thinkingStart)
 	m.viewDirty = true
 }
 
@@ -3852,9 +4044,7 @@ func (m *Model) adoptGlobalThinkingState(now time.Time, slot *streamSlot) {
 		return
 	}
 	slot.thinkingStart = m.thinkingStart
-	slot.retryText = m.retryText
-	slot.retryToolDerived = m.retryToolDerived
-	slot.lastProgressSet = m.lastProgressSet
+	slot.progress = m.progress
 }
 
 func (m *Model) startSlotThinkingAnimation(now time.Time, slot *streamSlot) {
@@ -3863,9 +4053,7 @@ func (m *Model) startSlotThinkingAnimation(now time.Time, slot *streamSlot) {
 	}
 	slot.thinkingStart = now
 	slot.deferCompletion = false
-	slot.retryText = ""
-	slot.retryToolDerived = false
-	slot.lastProgressSet = time.Time{}
+	slot.progress.clear()
 }
 
 func (m *Model) streamSlot(correlationID string) *streamSlot {
@@ -3878,19 +4066,13 @@ func (m *Model) streamSlot(correlationID string) *streamSlot {
 	return nil
 }
 
-func (m *Model) applySlotProgress(slot *streamSlot, message string, toolDerived bool) {
+func (m *Model) applySlotProgress(slot *streamSlot, message string, sequence int64, toolDerived, watchdog bool) {
 	if slot == nil || slot.thinkingIdx < 0 || message == "" {
 		return
 	}
-	if message == slot.retryText && toolDerived == slot.retryToolDerived {
-		return
-	}
-	slot.retryText = message
-	slot.retryToolDerived = toolDerived
 	now := time.Now()
-	if slot.lastProgressSet.IsZero() || now.Sub(slot.lastProgressSet) >= thinkingProgressMinInterval {
-		slot.lastProgressSet = now
-		if m.setSlotThinkingTextNow(slot, message) {
+	if slot.progress.queue(message, sequence, toolDerived, watchdog) && slot.progress.canPromote(now) {
+		if slot.progress.promotePending(now) && m.setSlotThinkingTextNow(slot, slot.progress.retryText) {
 			m.viewDirty = true
 		}
 	}
@@ -3902,8 +4084,7 @@ func (m *Model) updateSlotThinkingAgent(slot *streamSlot, agentID string) {
 		return
 	}
 	if agentID != slot.agentID {
-		slot.retryText = ""
-		slot.retryToolDerived = false
+		slot.progress.clear()
 	}
 	slot.agentID = agentID
 	m.history.UpdateAt(slot.thinkingIdx, func(entry *ChatEntry) {
@@ -3934,9 +4115,9 @@ func (m *Model) resolveSlotThinkingEntry(slot *streamSlot) {
 	elapsed := thinkingElapsed(slot.thinkingStart, time.Now())
 	idx := slot.thinkingIdx
 	preservedStatus := ""
-	if idx >= 0 && strings.TrimSpace(slot.retryText) != "" {
-		if entry := m.history.Get(idx); entry != nil && strings.TrimSpace(entry.Content) == "" && !slot.retryToolDerived {
-			preservedStatus = sanitizeThinkingMessage(firstNonEmptyString(entry.ThinkingStatus, slot.retryText))
+	if idx >= 0 && strings.TrimSpace(slot.progress.retryText) != "" {
+		if entry := m.history.Get(idx); entry != nil && strings.TrimSpace(entry.Content) == "" && !slot.progress.retryToolDerived {
+			preservedStatus = sanitizeThinkingMessage(firstNonEmptyString(entry.ThinkingStatus, slot.progress.retryText))
 		}
 	}
 	m.history.mu.Lock()
@@ -3949,13 +4130,11 @@ func (m *Model) resolveSlotThinkingEntry(slot *streamSlot) {
 	}
 	m.history.mu.Unlock()
 	slot.thinkingStart = time.Time{}
-	slot.retryText = ""
-	slot.retryToolDerived = false
-	slot.lastProgressSet = time.Time{}
+	slot.progress.clear()
 }
 
 func (m *Model) reconcileToolDerivedThinkingProgress(idx int) {
-	if !m.retryToolDerived || idx < 0 || idx != m.thinkingIdx || m.thinkingStart.IsZero() {
+	if idx < 0 || idx != m.thinkingIdx || m.thinkingStart.IsZero() {
 		return
 	}
 	entry := m.history.Get(idx)
@@ -3963,19 +4142,15 @@ func (m *Model) reconcileToolDerivedThinkingProgress(idx int) {
 		return
 	}
 	next := toolDerivedProgressSummary(entry.ToolCalls)
-	if next == m.retryText {
-		return
-	}
 	now := time.Now()
-	m.retryText = next
-	m.retryToolDerived = next != ""
-	m.lastProgressSet = now
-	m.renderThinkingEntry(idx, m.thinkingAgentID, m.retryText, m.thinkingStart, now)
-	m.viewDirty = true
+	if m.progress.reconcileToolDerived(next, now) {
+		m.renderThinkingEntry(idx, m.thinkingAgentID, m.progress.retryText, m.thinkingStart, now)
+		m.viewDirty = true
+	}
 }
 
 func (m *Model) reconcileToolDerivedSlotProgress(slot *streamSlot) {
-	if slot == nil || !slot.retryToolDerived || slot.thinkingIdx < 0 || slot.thinkingStart.IsZero() || slot.accumulator == nil {
+	if slot == nil || slot.thinkingIdx < 0 || slot.thinkingStart.IsZero() || slot.accumulator == nil {
 		return
 	}
 	entry := m.history.Get(slot.accumulator.EntryIndex())
@@ -3983,30 +4158,20 @@ func (m *Model) reconcileToolDerivedSlotProgress(slot *streamSlot) {
 		return
 	}
 	next := toolDerivedProgressSummary(entry.ToolCalls)
-	if next == slot.retryText {
-		return
-	}
 	now := time.Now()
-	slot.retryText = next
-	slot.retryToolDerived = next != ""
-	slot.lastProgressSet = now
-	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, now)
-	m.viewDirty = true
+	if slot.progress.reconcileToolDerived(next, now) {
+		m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.progress.retryText, slot.thinkingStart, now)
+		m.viewDirty = true
+	}
 }
 
 func (m *Model) reconcileToolDerivedNestedProgress(slot *nestedStreamSlot) {
-	if slot == nil || !slot.retryToolDerived || slot.thinkingStart.IsZero() {
+	if slot == nil || slot.thinkingStart.IsZero() {
 		return
 	}
 	next := toolDerivedProgressSummary(slot.activity.ToolCalls)
-	if next == slot.retryText {
-		return
-	}
 	now := time.Now()
-	slot.retryText = next
-	slot.retryToolDerived = next != ""
-	slot.lastProgressSet = now
-	if m.renderNestedStreamThinking(slot, now) {
+	if slot.progress.reconcileToolDerived(next, now) && m.renderNestedStreamThinking(slot, now) {
 		m.syncPendingNestedStream(slot)
 	}
 }
@@ -4424,11 +4589,14 @@ func (m *Model) deferCompletedStreamSlot(slot *streamSlot) {
 	if slot.thinkingStart.IsZero() {
 		slot.thinkingStart = now
 	}
-	slot.retryText = deferredParentCompletionStatus
-	slot.retryToolDerived = false
-	slot.lastProgressSet = now
+	slot.progress.retryText = deferredParentCompletionStatus
+	slot.progress.retryToolDerived = false
+	slot.progress.retryWatchdog = false
+	slot.progress.retrySequence = slot.progress.normalizeSequence(0)
+	slot.progress.clearPending()
+	slot.progress.lastProgressSet = now
 	m.syncSlotToEntry(slot)
-	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, now)
+	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.progress.retryText, slot.thinkingStart, now)
 	if idx := slot.accumulator.EntryIndex(); idx >= 0 {
 		m.history.UpdateAt(idx, func(e *ChatEntry) {
 			e.Streaming = true

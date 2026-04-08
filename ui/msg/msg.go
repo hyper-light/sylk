@@ -82,6 +82,7 @@ type StreamProgressMsg struct {
 	CorrelationID       string
 	ParentCorrelationID string
 	TopLevelTransfer    bool
+	Sequence            int64
 	AgentID             string // Raw responding agent ID; UI layers canonicalize separately when needed.
 	RuntimeAgentID      string
 	AgentName           string // Display name for UI attribution.
@@ -94,6 +95,7 @@ type StreamProgressMsg struct {
 	Total               int
 	Message             string
 	ToolDerived         bool
+	Watchdog            bool
 	UIState             events.AgentUIState
 	Visibility          events.EventVisibility
 	BranchRef           *InterAgentBranchRefMsg

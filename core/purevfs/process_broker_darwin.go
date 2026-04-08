@@ -73,7 +73,7 @@ func runMountedExecution(ctx context.Context, req BrokerRunRequest, mountRoot st
 	stderr := newExecutionCaptureBuffer(guard.budget, guard.outputLimit)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	err := cmd.Run()
+	err = cmd.Run()
 	exitCode, exitErr := captureExitCode(err)
 	if exitErr != nil {
 		return nil, exitErr
