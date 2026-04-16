@@ -3038,6 +3038,16 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 			Err:         event.Err,
 		})
 	})
+	reqCtx = handoff.WithTransportRetryHandoff(reqCtx, handoff.TransportRetryHandoffConfig{
+		Enabled:       true,
+		Bridge:        g.handoffBridge,
+		AgentID:       g.config.AgentID,
+		AgentType:     "guide",
+		UserRequest:   req.Input,
+		CorrelationID: correlationID,
+		SessionID:     req.SessionID,
+		EventLogger:   g.eventLogger,
+	})
 
 	vis := classifyRequestVisibility(req)
 
@@ -3158,6 +3168,16 @@ func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
 	g.registerRequestCancel(correlationID, cancel)
 	defer g.clearRequestCancel(correlationID)
 	defer cancel()
+	reqCtx = handoff.WithTransportRetryHandoff(reqCtx, handoff.TransportRetryHandoffConfig{
+		Enabled:       true,
+		Bridge:        g.handoffBridge,
+		AgentID:       g.config.AgentID,
+		AgentType:     "guide",
+		UserRequest:   req.Input,
+		CorrelationID: correlationID,
+		SessionID:     req.SessionID,
+		EventLogger:   g.eventLogger,
+	})
 
 	// Inject exclude list into context for loop prevention.
 	reqCtx = withRerouteExcludeAgents(reqCtx, reroute.ExcludeAgents)

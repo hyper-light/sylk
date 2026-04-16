@@ -118,6 +118,7 @@ func applyAnthropicProviderDefaults(config *AnthropicConfig) {
 		return
 	}
 	defaults := DefaultAnthropicConfig()
+	applyBaseConfigDefaults(&config.BaseConfig, defaults.BaseConfig)
 	applyDefaultString(&config.Model, defaults.Model)
 	applyDefaultInt(&config.MaxTokens, defaults.MaxTokens)
 	applyDefaultString(&config.AuthMode, defaults.AuthMode)

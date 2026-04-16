@@ -486,15 +486,8 @@ func isConsultationTool(toolName string, args map[string]any) bool {
 }
 
 func isChallengeTool(toolName string) bool {
-	if toolName == "challenge_agent" {
-		return true
-	}
-	switch strings.TrimSpace(toolName) {
-	case "challenge_global_tester", "challenge_architect", "challenge_orchestrator":
-		return true
-	default:
-		return false
-	}
+	toolName = strings.TrimSpace(toolName)
+	return toolName == "challenge_agent" || strings.HasPrefix(toolName, "challenge_")
 }
 
 func isInterAgentResponseTool(toolName string) bool {
@@ -533,16 +526,15 @@ func challengeTargets(toolName string, args, output map[string]any, currentAgent
 	if target := firstNonEmptyString(stringFromMap(args, "target_agent"), stringFromMap(output, "target_agent")); target != "" {
 		return normalizeChallengeTargetsForScope([]string{target}, scope)
 	}
-	switch strings.TrimSpace(toolName) {
-	case "challenge_global_tester":
-		return []string{"tester"}
-	case "challenge_architect":
-		return []string{"architect"}
-	case "challenge_orchestrator":
-		return []string{"orchestrator"}
-	default:
+	if strings.TrimSpace(toolName) == "challenge_agent" {
 		return nil
 	}
+	target := strings.TrimPrefix(strings.TrimSpace(toolName), "challenge_")
+	target = strings.TrimPrefix(target, "global_")
+	if resolved := firstKnownChallengeAgentInName(target); resolved != "" {
+		return normalizeChallengeTargetsForScope([]string{resolved}, scope)
+	}
+	return nil
 }
 
 func challengeScope(toolName string, args, output map[string]any, currentAgentType, pipelineID string) string {
@@ -583,14 +575,49 @@ func normalizeChallengeTargetsForScope(targets []string, scope string) []string 
 }
 
 func challengeThreadKey(toolName string, args, output map[string]any) string {
+	if explicit := firstNonEmptyString(stringFromMap(output, "thread_key"), stringFromMap(args, "thread_key")); explicit != "" {
+		return explicit
+	}
 	challengeID := firstNonEmptyString(stringFromMap(output, "challenge_id"), stringFromMap(args, "challenge_id"))
 	if challengeID == "" {
 		return ""
+	}
+	switch strings.TrimSpace(firstNonEmptyString(stringFromMap(output, "protocol_scope"), stringFromMap(args, "protocol_scope"))) {
+	case "global_review":
+		return globalReviewThreadPrefix + challengeID
+	case "pipeline":
+		return pipelineThreadPrefix + challengeID
 	}
 	if toolName == "challenge_agent" {
 		return pipelineThreadPrefix + challengeID
 	}
 	return globalReviewThreadPrefix + challengeID
+}
+
+func firstKnownChallengeAgentInName(name string) string {
+	name = strings.TrimSpace(strings.ReplaceAll(name, "_", "-"))
+	if name == "" {
+		return ""
+	}
+	for _, candidate := range []string{
+		"inspector-pipeline",
+		"tester-pipeline",
+		"orchestrator",
+		"architect",
+		"inspector",
+		"designer",
+		"engineer",
+		"academic",
+		"librarian",
+		"archivalist",
+		"tester",
+		"guide",
+	} {
+		if strings.Contains(name, candidate) {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func validationStatusToInterAgentStatus(status string, success bool, errMsg string) InterAgentToolStatus {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path"
+	"path/filepath"
 	"testing"
 )
 
@@ -130,10 +131,60 @@ func TestExecutionPlannerPythonIncludesPip3Toolchain(t *testing.T) {
 	want := path.Join(executionToolchainRoot, "pip3")
 	for _, mount := range plan.Mounts {
 		if mount.Kind == MountToolchain && mount.VirtualPath == want {
-			return
+			if got := plan.Cell.ExecutableAliases["python"]; len(got) == 1 && got[0] == "python3" {
+				return
+			}
+			t.Fatalf("python executable aliases = %#v, want [\"python3\"]", plan.Cell.ExecutableAliases["python"])
 		}
 	}
 	t.Fatalf("toolchain mount %q missing from %#v", want, plan.Mounts)
+}
+
+func TestResolveHostExecutionExecutable_UsesExecutableAliasFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	aliasPath := filepath.Join(tmpDir, "python3")
+	if err := os.WriteFile(aliasPath, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	plan := ExecutionPlan{
+		Cell: ExecCellPlan{
+			ExecutableAliases: map[string][]string{
+				"python": {"python3"},
+			},
+		},
+	}
+	resolved, err := resolveHostExecutionExecutable(plan, map[string]string{"PATH": tmpDir}, "", "python")
+	if err != nil {
+		t.Fatalf("resolveHostExecutionExecutable: %v", err)
+	}
+	if resolved != aliasPath {
+		t.Fatalf("resolved = %q, want %q", resolved, aliasPath)
+	}
+}
+
+func TestResolveHostExecutionExecutable_ReturnsTypedMissingExecutable(t *testing.T) {
+	plan := ExecutionPlan{
+		Cell: ExecCellPlan{
+			ExecutableAliases: map[string][]string{
+				"python": {"python3"},
+			},
+		},
+	}
+	_, err := resolveHostExecutionExecutable(plan, map[string]string{"PATH": t.TempDir()}, "", "python")
+	if err == nil {
+		t.Fatal("expected missing executable error")
+	}
+	var execErr *ExecutableNotFoundError
+	if !errors.As(err, &execErr) {
+		t.Fatalf("error = %T, want *ExecutableNotFoundError", err)
+	}
+	if execErr.Executable != "python" {
+		t.Fatalf("executable = %q, want python", execErr.Executable)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected errors.Is(err, os.ErrNotExist) to succeed, got %v", err)
+	}
 }
 
 func TestTranslateExecutionEnvValueRewritesPathLists(t *testing.T) {

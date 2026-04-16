@@ -697,6 +697,16 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		}
 		defer cleanupReplicaBridge()
 	}
+	ctx = handoff.WithTransportRetryHandoff(ctx, handoff.TransportRetryHandoffConfig{
+		Enabled:       shared.AutomaticHandoffEnabled(ctx),
+		Bridge:        shared.EffectiveHandoffBridge(ctx, a.handoffBridge),
+		AgentID:       a.id,
+		AgentType:     "academic",
+		UserRequest:   fwd.Input,
+		CorrelationID: fwd.CorrelationID,
+		SessionID:     fwd.SessionID,
+		EventLogger:   a.steering.EventLogger(),
+	})
 
 	bundle, err := a.newForwardedToolBundle()
 	if err != nil {

@@ -41,7 +41,9 @@ func TestNewGlobalReviewProtocolSkills_AgentSpecificOwnership(t *testing.T) {
 			name:      "inspector owns global handoff challenge and commit path",
 			agentType: GlobalReviewAgentInspector,
 			want: []string{
-				"challenge_agent",
+				"challenge_global_tester",
+				"challenge_architect",
+				"challenge_orchestrator",
 				"handoff_next",
 				"validate_work",
 				"process_validation",
@@ -53,7 +55,7 @@ func TestNewGlobalReviewProtocolSkills_AgentSpecificOwnership(t *testing.T) {
 		{
 			name:      "tester mirrors pipeline handoff and challenge mechanics",
 			agentType: GlobalReviewAgentTester,
-			want:      []string{"challenge_agent", "handoff_next", "validate_work", "process_validation"},
+			want:      []string{"challenge_inspector", "handoff_next", "validate_work", "process_validation"},
 		},
 		{
 			name:      "architect only validates",
@@ -135,12 +137,11 @@ func TestGlobalReviewOrchestratorChallenge_CarriesExecutionStateGuard(t *testing
 			SessionID: func() string { return "sess-1" },
 		},
 	})
-	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_agent", map[string]any{
-		"target_agents": []string{GlobalReviewAgentOrchestrator},
-		"reason":        "Need authoritative workflow progress before deciding whether the checkpoint is on track.",
-		"request":       "Report DAG/workflow progress, remaining tasks, and any blockers for the current merged checkpoint.",
+	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_orchestrator", map[string]any{
+		"reason":  "Need authoritative workflow progress before deciding whether the checkpoint is on track.",
+		"request": "Report DAG/workflow progress, remaining tasks, and any blockers for the current merged checkpoint.",
 	}); err != nil {
-		t.Fatalf("challenge_agent orchestrator: %v", err)
+		t.Fatalf("challenge_orchestrator: %v", err)
 	}
 
 	select {
@@ -207,12 +208,11 @@ func TestGlobalReviewChallengePublishesUserVisibleRoute(t *testing.T) {
 			SessionID: func() string { return "sess-1" },
 		},
 	})
-	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_agent", map[string]any{
-		"target_agents": []string{GlobalReviewAgentTester},
-		"reason":        "Need merged-state adversarial validation.",
-		"request":       "Run the full tester audit against the merged plan.",
+	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_global_tester", map[string]any{
+		"reason":  "Need merged-state adversarial validation.",
+		"request": "Run the full tester audit against the merged plan.",
 	}); err != nil {
-		t.Fatalf("challenge_agent tester: %v", err)
+		t.Fatalf("challenge_global_tester: %v", err)
 	}
 
 	select {
@@ -678,12 +678,11 @@ func TestGlobalReviewArchitectChallenge_CarriesCheckpointGuard(t *testing.T) {
 			SessionID: func() string { return "sess-1" },
 		},
 	})
-	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_agent", map[string]any{
-		"target_agents": []string{GlobalReviewAgentArchitect},
-		"reason":        "Need plan-level clarification for this checkpoint review.",
-		"request":       "Explain whether the current checkpoint is still aligned with the plan.",
+	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_architect", map[string]any{
+		"reason":  "Need plan-level clarification for this checkpoint review.",
+		"request": "Explain whether the current checkpoint is still aligned with the plan.",
 	}); err != nil {
-		t.Fatalf("challenge_agent architect: %v", err)
+		t.Fatalf("challenge_architect: %v", err)
 	}
 
 	select {

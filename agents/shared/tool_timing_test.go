@@ -83,6 +83,45 @@ func TestEmitToolCall_NormalizesPartialInterAgentConsultStartMetadata(t *testing
 	}
 }
 
+func TestTimedToolCall_GlobalReviewChallengeEmitsTargetSpecificToolName(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithStreamContext(context.Background(), "corr-global-review-challenge", "tui")
+	ctx = WithStreamContextMetadata(ctx, map[string]any{
+		"agent_type": "inspector",
+	})
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { events = append(events, ev) })
+
+	call := providers.ToolCall{
+		ID:        "call-global-review-challenge",
+		Name:      "challenge_agent",
+		Arguments: `{"target_agents":["tester"],"reason":"Need merged-state validation.","request":"Audit the merged state.","protocol_scope":"global_review"}`,
+	}
+	result, err := TimedToolCall(ctx, "inspector", call, func() (string, error) {
+		return `{"selected":true,"target_agents":["tester"],"challenge_id":"global-review-123","protocol_scope":"global_review","thread_key":"global_review:global-review-123"}`, nil
+	})
+	if err != nil {
+		t.Fatalf("TimedToolCall: %v", err)
+	}
+	if result == "" {
+		t.Fatal("expected tool result")
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 tool-call events, got %d", len(events))
+	}
+	if got := events[0].ToolName; got != "challenge_global_tester" {
+		t.Fatalf("start tool name = %q, want %q", got, "challenge_global_tester")
+	}
+	if got := events[1].ToolName; got != "challenge_global_tester" {
+		t.Fatalf("complete tool name = %q, want %q", got, "challenge_global_tester")
+	}
+	if events[1].InterAgent == nil {
+		t.Fatal("expected inter-agent metadata on completion")
+	}
+	if got := events[1].InterAgent.ThreadKey; got != "global_review:global-review-123" {
+		t.Fatalf("completion thread key = %q, want %q", got, "global_review:global-review-123")
+	}
+}
+
 func TestObserveProviderToolCallChunk_PreAnnouncesWithoutDuplicateTimedStart(t *testing.T) {
 	var events []ToolCallEvent
 	ctx := WithStreamContext(context.Background(), "corr-provider-tool", "tui")

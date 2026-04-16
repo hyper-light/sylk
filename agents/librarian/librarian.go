@@ -549,8 +549,10 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		AgentID:     l.id,
 		SessionID:   fwd.SessionID,
 	})
+	allowedHandoff := shared.AutomaticHandoffAllowedForForwardedRequest(fwd)
+	ctx = shared.WithAutomaticHandoffEnabled(ctx, allowedHandoff)
 	gov := shared.NewContextGovernor(l.CurrentModel(), l.config.MaxTokens, 0)
-	if l.handoffBridge != nil {
+	if l.handoffBridge != nil && shared.AutomaticHandoffEnabled(ctx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
 			bridge := shared.EffectiveHandoffBridge(bctx, l.handoffBridge)
 			if bridge == nil {
@@ -639,6 +641,17 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		}
 		defer cleanupReplicaBridge()
 	}
+	ctx = handoff.WithTransportRetryHandoff(ctx, handoff.TransportRetryHandoffConfig{
+		Enabled:       shared.AutomaticHandoffEnabled(ctx),
+		Bridge:        shared.EffectiveHandoffBridge(ctx, l.handoffBridge),
+		AgentID:       l.id,
+		AgentType:     "librarian",
+		UserRequest:   fwd.Input,
+		CorrelationID: fwd.CorrelationID,
+		SessionID:     fwd.SessionID,
+		EventLogger:   l.steering.EventLogger(),
+		Scribe:        l.agentPod,
+	})
 
 	bundle, err := l.newForwardedToolBundle()
 	if err != nil {

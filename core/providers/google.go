@@ -630,6 +630,7 @@ func applyGoogleProviderDefaults(config *GoogleConfig) {
 		return
 	}
 	defaults := DefaultGoogleConfig()
+	applyBaseConfigDefaults(&config.BaseConfig, defaults.BaseConfig)
 	if strings.TrimSpace(config.Model) == "" {
 		config.Model = defaults.Model
 	}
@@ -1211,7 +1212,10 @@ func googleBackendName(useVertexAI bool) string {
 func retryGoogleGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Context) (*Response, error)) (*Response, error) {
 	maxAttempts := resolveGoogleMaxRetries(cfg.MaxRetries)
 	var lastErr error
+	retriesUsed := 0
+	totalAttempts := 0
 	for attempt := range maxAttempts {
+		totalAttempts = attempt + 1
 		resp, err := fn(ctx)
 		if err == nil {
 			return resp, nil
@@ -1220,6 +1224,7 @@ func retryGoogleGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Co
 		if !shouldRetryGoogleCall(ctx, err, attempt, maxAttempts) {
 			break
 		}
+		retriesUsed++
 		delay := googleRetryDelay(err, attempt, cfg)
 		notifyRetryObserver(ctx, RetryEvent{
 			Attempt:     attempt + 1,
@@ -1231,6 +1236,7 @@ func retryGoogleGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Co
 			return nil, err
 		}
 	}
+	notifyRetryExhaustedTransport(ctx, retriesUsed, totalAttempts, lastErr)
 	return nil, lastErr
 }
 
@@ -1258,7 +1264,10 @@ func (g *GoogleProvider) StreamWithHandler(ctx context.Context, req *Request, ha
 func retryGoogleStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) error) error {
 	maxAttempts := resolveGoogleMaxRetries(cfg.MaxRetries)
 	var lastErr error
+	retriesUsed := 0
+	totalAttempts := 0
 	for attempt := range maxAttempts {
+		totalAttempts = attempt + 1
 		err := fn(ctx)
 		if err == nil {
 			return nil
@@ -1267,6 +1276,7 @@ func retryGoogleStream(ctx context.Context, cfg BaseConfig, fn func(context.Cont
 		if !shouldRetryGoogleCall(ctx, err, attempt, maxAttempts) {
 			break
 		}
+		retriesUsed++
 		delay := googleRetryDelay(err, attempt, cfg)
 		notifyRetryObserver(ctx, RetryEvent{
 			Attempt:     attempt + 1,
@@ -1278,6 +1288,7 @@ func retryGoogleStream(ctx context.Context, cfg BaseConfig, fn func(context.Cont
 			return err
 		}
 	}
+	notifyRetryExhaustedTransport(ctx, retriesUsed, totalAttempts, lastErr)
 	return lastErr
 }
 

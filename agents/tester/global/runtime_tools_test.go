@@ -3,6 +3,7 @@ package global
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/commandapproval"
@@ -146,6 +147,56 @@ func TestGlobalTesterCoreSkillsProduceConcreteOutputs(t *testing.T) {
 	}
 	if command, _ := runSuiteResult["command"].(string); command == "" {
 		t.Fatalf("expected concrete run_test_suite command, got %#v", runSuiteResult["command"])
+	}
+}
+
+func TestGlobalTesterRunTestSuite_UsesCreatedPythonTestArtifactForSourceFocus(t *testing.T) {
+	gt, fa, baseCtx := newGlobalTesterWriteHarness(t)
+	ctx := commandapproval.WithGate(baseCtx, allowAllGlobalCommandGate{})
+	if err := fa.WriteFile(ctx, "pyproject.toml", []byte("[project]\nname = \"tester\"\nversion = \"0.1.0\"\n")); err != nil {
+		t.Fatalf("WriteFile pyproject.toml: %v", err)
+	}
+	if err := fa.WriteFile(ctx, "app/service.py", []byte("def add(a, b):\n    return a + b\n")); err != nil {
+		t.Fatalf("WriteFile service.py: %v", err)
+	}
+
+	harness, err := gt.detectHarness(ctx, []string{"app/service.py"}, "", "")
+	if err != nil {
+		t.Fatalf("detectHarness: %v", err)
+	}
+	if got := string(harness.FrameworkID); got != "pytest" {
+		t.Fatalf("framework_id = %q, want pytest", got)
+	}
+
+	basis := prepareGlobalWriteBasis(t, gt, ctx, "app/test_service.py")
+	invokeGlobalSkill(t, gt, ctx, "write_test", map[string]any{
+		"test_case": map[string]any{
+			"name":        "TestAdd",
+			"target_file": "app/service.py",
+		},
+		"target_file": "app/service.py",
+		"output_file": "app/test_service.py",
+		"content":     "def test_add():\n    assert True\n",
+		"basis":       basis,
+	})
+
+	var captured purevfs.BrokerRunRequest
+	gt.SetExecutionBroker(stubGlobalExecutionBroker{
+		caps: purevfs.StrictBrokerCapabilities(),
+		run: func(_ context.Context, req purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error) {
+			captured = req
+			return &purevfs.BrokerRunResult{ExitCode: 0}, nil
+		},
+	})
+
+	runSuiteResult := invokeGlobalSkill(t, gt, ctx, "run_test_suite", map[string]any{
+		"files": []string{filepath.Join(fa.WorkingDir(), "app/service.py")},
+	})
+	if got := captured.Argv; len(got) != 4 || got[3] != "app/test_service.py" {
+		t.Fatalf("argv = %#v, want focused test artifact", got)
+	}
+	if got, _ := runSuiteResult["focused_file"].(string); got != "app/test_service.py" {
+		t.Fatalf("focused_file = %q, want app/test_service.py", got)
 	}
 }
 

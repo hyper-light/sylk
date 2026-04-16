@@ -725,10 +725,27 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 		AgentID:     g.id,
 		SessionID:   fwd.SessionID,
 	})
+	allowedHandoff := shared.AutomaticHandoffAllowedForForwardedRequest(fwd)
+	reqCtx = shared.WithAutomaticHandoffEnabled(reqCtx, allowedHandoff)
+	reqCtx = handoff.WithTransportRetryHandoff(reqCtx, handoff.TransportRetryHandoffConfig{
+		Enabled:       allowedHandoff,
+		Bridge:        shared.EffectiveHandoffBridge(reqCtx, g.handoffBridge),
+		AgentID:       g.id,
+		AgentType:     "guardian",
+		UserRequest:   fwd.Input,
+		CorrelationID: fwd.CorrelationID,
+		SessionID:     fwd.SessionID,
+		EventLogger:   g.steering.EventLogger(),
+		Scribe:        g.agentPod,
+	})
 	gov := shared.NewContextGovernor(DefaultGuardianModel, DefaultMaxOutputTokens, 0)
-	if g.handoffBridge != nil {
+	if g.handoffBridge != nil && shared.AutomaticHandoffEnabled(reqCtx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
-			return g.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+			bridge := shared.EffectiveHandoffBridge(bctx, g.handoffBridge)
+			if bridge == nil {
+				return shared.ErrContextBudgetExhausted
+			}
+			return bridge.ForceHandoff(bctx, "context budget exhausted")
 		}
 	}
 	reqCtx = shared.WithContextGovernor(reqCtx, gov)

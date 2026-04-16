@@ -567,6 +567,33 @@ func (b *HandoffBridge) RecordQualitySignal(sig QualitySignal) {
 	})
 }
 
+// PreserveInFlightWork injects request-scoped metadata and synthetic messages
+// into the prepared context before a forced handoff. This is intended for
+// recovery paths where the active turn failed before RecordTurn could run.
+func (b *HandoffBridge) PreserveInFlightWork(rec TurnRecord, messages ...Message) {
+	if b == nil {
+		return
+	}
+
+	b.captureTraceMeta(rec)
+	b.syncPreparedMetadata(rec)
+
+	for _, msg := range messages {
+		msg.Role = strings.TrimSpace(msg.Role)
+		msg.Content = strings.TrimSpace(msg.Content)
+		if msg.Role == "" || msg.Content == "" {
+			continue
+		}
+		if msg.Timestamp.IsZero() {
+			msg.Timestamp = time.Now()
+		}
+		if msg.TokenCount <= 0 {
+			msg.TokenCount = estimateTokens(msg.Content)
+		}
+		b.prepared.AddMessage(msg)
+	}
+}
+
 // ForceHandoff triggers an immediate handoff with the given reason.
 func (b *HandoffBridge) ForceHandoff(ctx context.Context, reason string) error {
 	result := b.manager.ForceHandoff(ctx, reason)

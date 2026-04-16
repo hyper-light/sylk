@@ -24,6 +24,7 @@ func PublishToolCallStreamEvent(
 	if bus == nil || channels == nil {
 		return
 	}
+	event.ToolName = canonicalizeInterAgentToolName(event.ToolName, event.FullArgs, event.Output, event.StreamMetadata)
 	event.InterAgent = NormalizeInterAgentToolEventForEmit(
 		event.ToolName,
 		event.FullArgs,

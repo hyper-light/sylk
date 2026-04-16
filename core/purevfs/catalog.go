@@ -26,14 +26,15 @@ type FrameworkProfile struct {
 }
 
 type RuntimePolicy struct {
-	TempVars    []string
-	HomeVars    []string
-	CacheVars   map[string]string
-	OutVars     map[string]string
-	StaticEnv   map[string]string
-	Toolchains  []string
-	ManifestRO  []string
-	CacheBucket string
+	TempVars          []string
+	HomeVars          []string
+	CacheVars         map[string]string
+	OutVars           map[string]string
+	StaticEnv         map[string]string
+	Toolchains        []string
+	ExecutableAliases map[string][]string
+	ManifestRO        []string
+	CacheBucket       string
 }
 
 type RuntimeProfile struct {
@@ -56,14 +57,15 @@ type ExecRoots struct {
 }
 
 type ExecCellPlan struct {
-	Language      string
-	WorkspaceRoot string
-	TempRoot      string
-	CacheRoot     string
-	HomeRoot      string
-	OutRoot       string
-	Toolchains    []string
-	Env           map[string]string
+	Language          string
+	WorkspaceRoot     string
+	TempRoot          string
+	CacheRoot         string
+	HomeRoot          string
+	OutRoot           string
+	Toolchains        []string
+	ExecutableAliases map[string][]string
+	Env               map[string]string
 }
 
 type DetectedFramework struct {
@@ -185,14 +187,15 @@ func (c *Catalog) PlanExecCell(language string, roots ExecRoots) (ExecCellPlan, 
 	}
 
 	plan := ExecCellPlan{
-		Language:      profile.Language,
-		WorkspaceRoot: roots.Workspace,
-		TempRoot:      roots.Temp,
-		CacheRoot:     cacheRoot,
-		HomeRoot:      roots.Home,
-		OutRoot:       roots.Out,
-		Toolchains:    append([]string(nil), profile.Policy.Toolchains...),
-		Env:           make(map[string]string),
+		Language:          profile.Language,
+		WorkspaceRoot:     roots.Workspace,
+		TempRoot:          roots.Temp,
+		CacheRoot:         cacheRoot,
+		HomeRoot:          roots.Home,
+		OutRoot:           roots.Out,
+		Toolchains:        append([]string(nil), profile.Policy.Toolchains...),
+		ExecutableAliases: copyStringSliceMap(profile.Policy.ExecutableAliases),
+		Env:               make(map[string]string),
 	}
 
 	for _, key := range profile.Policy.TempVars {
@@ -218,6 +221,17 @@ func resolveEnvRoot(root, rel string) string {
 		return root
 	}
 	return filepath.Join(root, rel)
+}
+
+func copyStringSliceMap(src map[string][]string) map[string][]string {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(src))
+	for key, values := range src {
+		out[key] = append([]string(nil), values...)
+	}
+	return out
 }
 
 func renderEnvTemplate(tmpl string, roots ExecRoots, cacheRoot string) string {
@@ -542,8 +556,11 @@ func pythonProfile() RuntimeProfile {
 		ManifestFiles: []string{"pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "tox.ini"},
 		LockFiles:     []string{"poetry.lock", "Pipfile.lock", "uv.lock"},
 		Frameworks: []FrameworkProfile{
-			framework("pytest", "pytest", "python", "pytest", "python -m compileall .", "python", "ptw", []string{"pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"}, nil, []string{"test_*.py", "*_test.py"}, 100,
+			framework("pytest", "pytest", "python", "python -m pytest", "python -m compileall .", "python", "ptw", []string{"pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"}, nil, []string{"test_*.py", "*_test.py"}, 100,
 				func(root string) bool {
+					if detect.Which("python") == "" && detect.Which("python3") == "" {
+						return false
+					}
 					ok, _ := detect.HasPythonDependency(root, "pytest")
 					return ok || detect.FileExists(root, "pytest.ini", "tox.ini")
 				}),
@@ -565,7 +582,11 @@ func pythonProfile() RuntimeProfile {
 			StaticEnv: map[string]string{
 				"PYTHONNOUSERSITE": "1",
 			},
-			Toolchains:  []string{"python", "python3", "pip", "pip3", "pytest"},
+			Toolchains: []string{"python", "python3", "pip", "pip3", "pytest"},
+			ExecutableAliases: map[string][]string{
+				"python": {"python3"},
+				"pip":    {"pip3"},
+			},
 			ManifestRO:  []string{"pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "tox.ini"},
 			CacheBucket: "python",
 		},

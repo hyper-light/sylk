@@ -3928,6 +3928,211 @@ func TestNestedGrandchildGuardianCompletionAttachesToImmediateApprovalBranch(t *
 	}
 }
 
+func TestGuardianApprovalCompletionClearsTopLevelProgressFooter(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-top-guardian-approval",
+		AgentID:       "task_1:tester-pipeline",
+		AgentType:     "tester-pipeline",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-top-guardian-approval",
+		AgentID:       "task_1:tester-pipeline",
+		AgentType:     "tester-pipeline",
+		Message:       "Waiting for Guardian approval for run_command",
+	})
+	m = comp.(*Model)
+
+	startedAt := time.Now().Add(-250 * time.Millisecond)
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-top-guardian-approval",
+		AgentID:       "task_1:tester-pipeline",
+		AgentType:     "tester-pipeline",
+		ToolCallKey:   "approval-1",
+		ToolName:      "approval_guardian",
+		FullArgs:      `{"target":"guardian","tool_name":"run_command","summary":"Waiting for Guardian approval for run_command"}`,
+		Phase:         0,
+		StartedAt:     startedAt,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "approval",
+			Status:     "pending",
+			AgentTypes: []string{"guardian"},
+			Summary:    "Waiting for Guardian approval for run_command",
+		},
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-top-guardian-approval",
+		AgentID:       "task_1:tester-pipeline",
+		AgentType:     "tester-pipeline",
+		Message:       "Guardian approval received for run_command",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-top-guardian-approval",
+		AgentID:       "task_1:tester-pipeline",
+		AgentType:     "tester-pipeline",
+		ToolCallKey:   "approval-1",
+		ToolName:      "approval_guardian",
+		FullArgs:      `{"target":"guardian","tool_name":"run_command","summary":"Waiting for Guardian approval for run_command"}`,
+		Phase:         1,
+		StartedAt:     startedAt,
+		Duration:      250 * time.Millisecond,
+		Success:       true,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "approval",
+			Status:     "done",
+			AgentTypes: []string{"guardian"},
+			Summary:    "Guardian approval received for run_command",
+		},
+	})
+	m = comp.(*Model)
+
+	entry := findEntryByCorrelation(m, "corr-top-guardian-approval")
+	if entry == nil {
+		t.Fatal("expected top-level guardian approval entry")
+	}
+	if strings.TrimSpace(entry.ThinkingText) != "" || strings.TrimSpace(entry.ThinkingStatus) != "" {
+		t.Fatalf("expected guardian approval footer to clear after approval completion, got text=%q status=%q", entry.ThinkingText, entry.ThinkingStatus)
+	}
+	if len(entry.ToolCalls) != 1 || !entry.ToolCalls[0].Completed || entry.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected completed guardian approval tool call, got %+v", entry.ToolCalls)
+	}
+	if entry.ToolCalls[0].InterAgent.Status != InterAgentToolDone {
+		t.Fatalf("expected guardian approval branch to be done, got %+v", entry.ToolCalls[0].InterAgent)
+	}
+}
+
+func TestGuardianApprovalCompletionClearsNestedChildProgressFooter(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.PushEntry(&ChatEntry{
+		ID:            "architect-origin-child-guardian-progress",
+		Timestamp:     time.Now(),
+		CorrelationID: "corr-parent-child-guardian-progress",
+		Source:        SourceAgent,
+		AgentType:     "architect",
+		Content:       "Refining the patch plan.",
+		Height:        -1,
+	})
+
+	comp, _ := m.Update(msg.ToolCallEventMsg{
+		CorrelationID: "corr-parent-child-guardian-progress",
+		ToolCallKey:   "consult-1",
+		ToolName:      "consult_academic_approach",
+		FullArgs:      `{"target":"academic","query":"Research implementation options."}`,
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	m = comp.(*Model)
+
+	branchRef := &msg.InterAgentBranchRefMsg{
+		ParentCorrelationID: "corr-parent-child-guardian-progress",
+		ParentToolCallKey:   "consult-1",
+		Kind:                "consult",
+	}
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-guardian-progress",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		BranchRef:     branchRef,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-guardian-progress",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		Message:       "Waiting for Guardian approval for run_command",
+		BranchRef:     branchRef,
+	})
+	m = comp.(*Model)
+
+	startedAt := time.Now().Add(-250 * time.Millisecond)
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-guardian-progress",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		ToolCallKey:   "approval-1",
+		ToolName:      "approval_guardian",
+		FullArgs:      `{"target":"guardian","tool_name":"run_command","summary":"Waiting for Guardian approval for run_command"}`,
+		Phase:         0,
+		StartedAt:     startedAt,
+		BranchRef:     branchRef,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "approval",
+			Status:     "pending",
+			AgentTypes: []string{"guardian"},
+			Summary:    "Waiting for Guardian approval for run_command",
+		},
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-guardian-progress",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		Message:       "Guardian approval received for run_command",
+		BranchRef:     branchRef,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-child-guardian-progress",
+		AgentID:       "academic",
+		AgentType:     "academic",
+		ToolCallKey:   "approval-1",
+		ToolName:      "approval_guardian",
+		FullArgs:      `{"target":"guardian","tool_name":"run_command","summary":"Waiting for Guardian approval for run_command"}`,
+		Phase:         1,
+		StartedAt:     startedAt,
+		Duration:      250 * time.Millisecond,
+		Success:       true,
+		BranchRef:     branchRef,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "approval",
+			Status:     "done",
+			AgentTypes: []string{"guardian"},
+			Summary:    "Guardian approval received for run_command",
+		},
+	})
+	m = comp.(*Model)
+
+	origin := findEntryByCorrelation(m, "corr-parent-child-guardian-progress")
+	if origin == nil || len(origin.ToolCalls) != 1 || origin.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected parent consult row, got %+v", origin)
+	}
+	row := origin.ToolCalls[0].InterAgent
+	if len(row.Children) != 1 {
+		t.Fatalf("expected one nested child activity, got %+v", row.Children)
+	}
+	child := row.Children[0]
+	if strings.TrimSpace(child.ThinkingText) != "" || strings.TrimSpace(child.ThinkingStatus) != "" {
+		t.Fatalf("expected nested guardian approval footer to clear after approval completion, got text=%q status=%q", child.ThinkingText, child.ThinkingStatus)
+	}
+	if len(child.ToolCalls) != 1 || !child.ToolCalls[0].Completed || child.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("expected completed nested guardian approval tool call, got %+v", child.ToolCalls)
+	}
+	if child.ToolCalls[0].InterAgent.Status != InterAgentToolDone {
+		t.Fatalf("expected nested guardian approval branch to be done, got %+v", child.ToolCalls[0].InterAgent)
+	}
+}
+
 func TestNestedConsultationChildNativeWebSearchCompletesBeforeChildStreamCompletes(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 	m.PushEntry(&ChatEntry{

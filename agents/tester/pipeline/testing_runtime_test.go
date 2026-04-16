@@ -149,6 +149,73 @@ func TestPipelineTesterRunGoTestSuite_UsesStrictBroker(t *testing.T) {
 	}
 }
 
+func TestPipelineTesterRunGenericSuite_UsesCreatedTestArtifactForSourceFocus(t *testing.T) {
+	pt, ctx, _ := newPythonPipelineTesterWithVFS(t)
+	var captured purevfs.BrokerRunRequest
+	pt.SetExecutionBroker(stubExecutionBroker{
+		caps: purevfs.StrictBrokerCapabilities(),
+		run: func(_ context.Context, req purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error) {
+			captured = req
+			return &purevfs.BrokerRunResult{ExitCode: 0}, nil
+		},
+	})
+
+	harness, err := pt.detectHarness(ctx, []string{"app/service.py"}, "Write service tests", "engineer")
+	if err != nil {
+		t.Fatalf("detectHarness: %v", err)
+	}
+	_, err = pt.writeTestArtifact(ctx, harness, testershared.PlannedTestCase{
+		Name:       "TestAdd",
+		TargetFile: "app/service.py",
+	}, "app/test_service.py", "def test_add():\n    assert True\n", nil)
+	if err != nil {
+		t.Fatalf("writeTestArtifact: %v", err)
+	}
+
+	result, err := pt.executeSuite(ctx, harness, nil, []string{"app/service.py"}, nil, false, false, 30)
+	if err != nil {
+		t.Fatalf("executeSuite: %v", err)
+	}
+	if got := captured.Argv; len(got) != 4 || got[3] != "app/test_service.py" {
+		t.Fatalf("argv = %#v, want focused test artifact", got)
+	}
+	if got, _ := result["focused_file"].(string); got != "app/test_service.py" {
+		t.Fatalf("focused_file = %q, want app/test_service.py", got)
+	}
+}
+
+func TestPipelineTesterRunGenericSuite_NormalizesAbsoluteSourceFocusPath(t *testing.T) {
+	pt, ctx, fa := newPythonPipelineTesterWithVFS(t)
+	var captured purevfs.BrokerRunRequest
+	pt.SetExecutionBroker(stubExecutionBroker{
+		caps: purevfs.StrictBrokerCapabilities(),
+		run: func(_ context.Context, req purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error) {
+			captured = req
+			return &purevfs.BrokerRunResult{ExitCode: 0}, nil
+		},
+	})
+
+	harness, err := pt.detectHarness(ctx, []string{"app/service.py"}, "Write service tests", "engineer")
+	if err != nil {
+		t.Fatalf("detectHarness: %v", err)
+	}
+	_, err = pt.writeTestArtifact(ctx, harness, testershared.PlannedTestCase{
+		Name:       "TestAdd",
+		TargetFile: "app/service.py",
+	}, "app/test_service.py", "def test_add():\n    assert True\n", nil)
+	if err != nil {
+		t.Fatalf("writeTestArtifact: %v", err)
+	}
+
+	absoluteSource := filepath.Join(fa.WorkingDir(), "app/service.py")
+	if _, err := pt.executeSuite(ctx, harness, nil, []string{absoluteSource}, nil, false, false, 30); err != nil {
+		t.Fatalf("executeSuite: %v", err)
+	}
+	if got := captured.Argv; len(got) != 4 || got[3] != "app/test_service.py" {
+		t.Fatalf("argv = %#v, want normalized focused test artifact", got)
+	}
+}
+
 func TestPipelineTesterWriteTestArtifact_RefreshesStaleBasisViaSharedWriteSkill(t *testing.T) {
 	pt, ctx, fa := newGoPipelineTesterWithVFS(t)
 
@@ -457,6 +524,48 @@ func newGoPipelineTesterWithVFS(t *testing.T) (*PipelineTester, context.Context,
 		SessionID:  "sess-1",
 		WorkingDir: root,
 		Files:      []string{"pkg/service/service.go"},
+	})
+	if err != nil {
+		t.Fatalf("BeginPipeline: %v", err)
+	}
+
+	fa := svfs.NewPipelineFileAccess(pipe)
+	pt, err := New(testershared.PipelineTesterConfig{}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	pt.SetFileAccess(fa)
+	pt.SetWorkspaceViews(versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+		DefaultView:       versioning.WorkspaceViewPipeline,
+		DefaultPipelineID: "task-1",
+		Session:           svfs,
+		WorkingDir:        root,
+		DiskFallback:      versioning.NewDiskFileAccess(root, true),
+	}))
+	pt.pipelineID = "task-1"
+
+	return pt, versioning.WithSessionID(context.Background(), "sess-1"), fa
+}
+
+func newPythonPipelineTesterWithVFS(t *testing.T) (*PipelineTester, context.Context, versioning.FileAccess) {
+	t.Helper()
+
+	root := t.TempDir()
+	mustWriteTestFile(t, filepath.Join(root, "pyproject.toml"), "[project]\nname = \"tester\"\nversion = \"0.1.0\"\n")
+	mustWriteTestFile(t, filepath.Join(root, "app/service.py"), "def add(a, b):\n    return a + b\n")
+
+	svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
+		SessionID:  "sess-1",
+		WorkingDir: root,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	pipe, err := svfs.BeginPipeline(versioning.BeginPipelineConfig{
+		PipelineID: "task-1",
+		SessionID:  "sess-1",
+		WorkingDir: root,
+		Files:      []string{"app/service.py"},
 	})
 	if err != nil {
 		t.Fatalf("BeginPipeline: %v", err)

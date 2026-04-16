@@ -611,13 +611,30 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 		AgentID:     gt.id,
 		SessionID:   fwd.SessionID,
 	})
+	allowedHandoff := agentshared.AutomaticHandoffAllowedForForwardedRequest(fwd)
+	ctx = agentshared.WithAutomaticHandoffEnabled(ctx, allowedHandoff)
+	ctx = handoff.WithTransportRetryHandoff(ctx, handoff.TransportRetryHandoffConfig{
+		Enabled:       allowedHandoff,
+		Bridge:        agentshared.EffectiveHandoffBridge(ctx, gt.handoffBridge),
+		AgentID:       gt.id,
+		AgentType:     "tester",
+		UserRequest:   fwd.Input,
+		CorrelationID: fwd.CorrelationID,
+		SessionID:     fwd.SessionID,
+		EventLogger:   gt.steering.EventLogger(),
+		Scribe:        gt.agentPod,
+	})
 
 	toolEmitter := agentshared.NewToolCallEmitter(gt.bus, gt.channels, gt.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
 	gov := agentshared.NewContextGovernor(gt.config.Model, gt.config.MaxTokens, 0)
-	if gt.handoffBridge != nil {
+	if gt.handoffBridge != nil && agentshared.AutomaticHandoffEnabled(ctx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
-			return gt.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+			bridge := agentshared.EffectiveHandoffBridge(bctx, gt.handoffBridge)
+			if bridge == nil {
+				return agentshared.ErrContextBudgetExhausted
+			}
+			return bridge.ForceHandoff(bctx, "context budget exhausted")
 		}
 	}
 	ctx = agentshared.WithContextGovernor(ctx, gov)

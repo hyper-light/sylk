@@ -994,10 +994,27 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 		AgentID:     o.config.AgentID,
 		SessionID:   fwd.SessionID,
 	})
+	allowedHandoff := shared.AutomaticHandoffAllowedForForwardedRequest(fwd)
+	ctx = shared.WithAutomaticHandoffEnabled(ctx, allowedHandoff)
+	ctx = handoff.WithTransportRetryHandoff(ctx, handoff.TransportRetryHandoffConfig{
+		Enabled:       allowedHandoff,
+		Bridge:        shared.EffectiveHandoffBridge(ctx, o.handoffBridge),
+		AgentID:       o.config.AgentID,
+		AgentType:     "orchestrator",
+		UserRequest:   fwd.Input,
+		CorrelationID: fwd.CorrelationID,
+		SessionID:     fwd.SessionID,
+		EventLogger:   o.steering.EventLogger(),
+		Scribe:        o.agentPod,
+	})
 	gov := shared.NewContextGovernor(o.config.Model, o.config.MaxOutputTokens, 0)
-	if o.handoffBridge != nil {
+	if o.handoffBridge != nil && shared.AutomaticHandoffEnabled(ctx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
-			return o.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+			bridge := shared.EffectiveHandoffBridge(bctx, o.handoffBridge)
+			if bridge == nil {
+				return shared.ErrContextBudgetExhausted
+			}
+			return bridge.ForceHandoff(bctx, "context budget exhausted")
 		}
 	}
 	ctx = shared.WithContextGovernor(ctx, gov)

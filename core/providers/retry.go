@@ -22,11 +22,26 @@ type RetryEvent struct {
 	Delay       time.Duration
 }
 
+// RetryExhaustedEvent describes a provider call that failed after consuming
+// its retry budget.
+type RetryExhaustedEvent struct {
+	RetriesUsed   int
+	TotalAttempts int
+	Err           error
+	Transport     bool
+}
+
 // RetryObserver is called before each retry wait so callers can surface
 // status to the user (e.g. "rate limited, retrying in 39s").
 type RetryObserver func(RetryEvent)
 
+// RetryExhaustedObserver is called once when a provider call still fails after
+// exhausting its retries. It is intended for higher-level recovery actions
+// such as agent handoff.
+type RetryExhaustedObserver func(RetryExhaustedEvent)
+
 type retryObserverKey struct{}
+type retryExhaustedObserverKey struct{}
 
 // WithRetryObserver attaches a retry observer to the context. The observer is
 // invoked by retry loops before sleeping, giving callers visibility into
@@ -48,6 +63,26 @@ func RetryObserverFromContext(ctx context.Context) RetryObserver {
 	return obs
 }
 
+// WithRetryExhaustedObserver attaches a callback invoked when a provider call
+// fails after consuming its retry budget.
+func WithRetryExhaustedObserver(ctx context.Context, observer RetryExhaustedObserver) context.Context {
+	if observer == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, retryExhaustedObserverKey{}, observer)
+}
+
+// RetryExhaustedObserverFromContext extracts a previously attached retry
+// exhausted observer from the context. Returns nil when no observer is
+// present.
+func RetryExhaustedObserverFromContext(ctx context.Context) RetryExhaustedObserver {
+	if ctx == nil {
+		return nil
+	}
+	obs, _ := ctx.Value(retryExhaustedObserverKey{}).(RetryExhaustedObserver)
+	return obs
+}
+
 func notifyRetryObserver(ctx context.Context, event RetryEvent) {
 	if ctx == nil {
 		return
@@ -59,11 +94,37 @@ func notifyRetryObserver(ctx context.Context, event RetryEvent) {
 	obs(event)
 }
 
+func notifyRetryExhaustedObserver(ctx context.Context, event RetryExhaustedEvent) {
+	if ctx == nil {
+		return
+	}
+	obs, ok := ctx.Value(retryExhaustedObserverKey{}).(RetryExhaustedObserver)
+	if !ok || obs == nil {
+		return
+	}
+	obs(event)
+}
+
+func notifyRetryExhaustedTransport(ctx context.Context, retriesUsed, totalAttempts int, err error) {
+	if retriesUsed <= 0 || totalAttempts <= 0 || !isRetryableTransportError(err) {
+		return
+	}
+	notifyRetryExhaustedObserver(ctx, RetryExhaustedEvent{
+		RetriesUsed:   retriesUsed,
+		TotalAttempts: totalAttempts,
+		Err:           err,
+		Transport:     true,
+	})
+}
+
 // retryGenerate wraps a generate function with retry logic using the provider's config.
 func retryGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Context) (*Response, error)) (*Response, error) {
 	maxAttempts := resolveMaxRetries(cfg.MaxRetries)
 	var lastErr error
+	retriesUsed := 0
+	totalAttempts := 0
 	for attempt := range maxAttempts {
+		totalAttempts = attempt + 1
 		resp, err := fn(ctx)
 		if err == nil {
 			return resp, nil
@@ -72,6 +133,7 @@ func retryGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Context)
 		if !shouldRetryProviderCall(ctx, err, attempt, maxAttempts) {
 			break
 		}
+		retriesUsed++
 		delay := serverGuidedDelay(err, attempt, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
 		notifyRetryObserver(ctx, RetryEvent{
 			Attempt:     attempt + 1,
@@ -83,6 +145,7 @@ func retryGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Context)
 			return nil, err
 		}
 	}
+	notifyRetryExhaustedTransport(ctx, retriesUsed, totalAttempts, lastErr)
 	return nil, lastErr
 }
 
@@ -90,7 +153,10 @@ func retryGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Context)
 func retryStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) error) error {
 	maxAttempts := resolveMaxRetries(cfg.MaxRetries)
 	var lastErr error
+	retriesUsed := 0
+	totalAttempts := 0
 	for attempt := range maxAttempts {
+		totalAttempts = attempt + 1
 		err := fn(ctx)
 		if err == nil {
 			return nil
@@ -99,6 +165,7 @@ func retryStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) e
 		if !shouldRetryProviderCall(ctx, err, attempt, maxAttempts) {
 			break
 		}
+		retriesUsed++
 		delay := serverGuidedDelay(err, attempt, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
 		notifyRetryObserver(ctx, RetryEvent{
 			Attempt:     attempt + 1,
@@ -110,6 +177,7 @@ func retryStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) e
 			return err
 		}
 	}
+	notifyRetryExhaustedTransport(ctx, retriesUsed, totalAttempts, lastErr)
 	return lastErr
 }
 
@@ -121,7 +189,10 @@ const anthropicTransientMaxRetries = 3
 // budget: 3 means the initial request plus up to 3 retries.
 func retryAnthropicTransientGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Context) (*Response, error)) (*Response, error) {
 	var lastErr error
+	retriesUsed := 0
+	totalAttempts := 0
 	for retry := 0; ; retry++ {
+		totalAttempts = retry + 1
 		resp, err := fn(ctx)
 		if err == nil {
 			return resp, nil
@@ -130,6 +201,7 @@ func retryAnthropicTransientGenerate(ctx context.Context, cfg BaseConfig, fn fun
 		if !shouldRetryAnthropicTransientCall(ctx, err, retry) {
 			break
 		}
+		retriesUsed++
 		delay := serverGuidedDelay(err, retry, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
 		notifyRetryObserver(ctx, RetryEvent{
 			Attempt:     retry + 1,
@@ -141,6 +213,7 @@ func retryAnthropicTransientGenerate(ctx context.Context, cfg BaseConfig, fn fun
 			return nil, err
 		}
 	}
+	notifyRetryExhaustedTransport(ctx, retriesUsed, totalAttempts, lastErr)
 	return nil, lastErr
 }
 
@@ -150,7 +223,10 @@ func retryAnthropicTransientGenerate(ctx context.Context, cfg BaseConfig, fn fun
 // budget: 3 means the initial request plus up to 3 retries.
 func retryAnthropicTransientStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) error) error {
 	var lastErr error
+	retriesUsed := 0
+	totalAttempts := 0
 	for retry := 0; ; retry++ {
+		totalAttempts = retry + 1
 		err := fn(ctx)
 		if err == nil {
 			return nil
@@ -159,6 +235,7 @@ func retryAnthropicTransientStream(ctx context.Context, cfg BaseConfig, fn func(
 		if !shouldRetryAnthropicTransientCall(ctx, err, retry) {
 			break
 		}
+		retriesUsed++
 		delay := serverGuidedDelay(err, retry, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
 		notifyRetryObserver(ctx, RetryEvent{
 			Attempt:     retry + 1,
@@ -170,6 +247,7 @@ func retryAnthropicTransientStream(ctx context.Context, cfg BaseConfig, fn func(
 			return err
 		}
 	}
+	notifyRetryExhaustedTransport(ctx, retriesUsed, totalAttempts, lastErr)
 	return lastErr
 }
 
@@ -247,7 +325,7 @@ func shouldRetryAnthropicTransientCall(ctx context.Context, err error, retry int
 
 // isRetryableError returns true for transient errors using typed error
 // inspection. Cascade: ProviderError (already-classified) → anthropic.Error
-// (SDK typed) → net.Error (network transient) → false.
+// (SDK typed) → timeout net.Error → transport classifier → false.
 func isRetryableError(err error) bool {
 	if err == nil {
 		return false
@@ -262,7 +340,9 @@ func isRetryableError(err error) bool {
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
-		return netErr.Timeout()
+		if netErr.Timeout() {
+			return true
+		}
 	}
 	return isRetryableTransportError(err)
 }
@@ -272,6 +352,9 @@ func isRetryableTransportError(err error) bool {
 		return false
 	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if isRetryableNetOpError(err) {
 		return true
 	}
 	msg := strings.ToLower(safeErrorString(err))
@@ -289,6 +372,21 @@ func isRetryableTransportError(err error) bool {
 	default:
 		return false
 	}
+}
+
+// IsRetryableTransport reports whether err is a transient transport failure,
+// such as a socket reset or unexpected EOF, that is safe to replay.
+func IsRetryableTransport(err error) bool {
+	return isRetryableTransportError(err)
+}
+
+// isRetryableNetOpError treats connection-level network operation failures as
+// retryable. Provider calls are safe to replay on transport failure, and
+// net.OpError is the stable typed wrapper Go uses for dial/read/write errors
+// across SDKs, which is more reliable than enumerating message fragments.
+func isRetryableNetOpError(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr)
 }
 
 func safeErrorString(err error) (msg string) {

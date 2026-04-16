@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/purevfs"
 )
 
 // --- MarshalToolOutput ---
@@ -143,6 +144,24 @@ func TestToolErrorPayload_IncludesRecoveryForInspectorTestExecutionReroute(t *te
 	}
 	if parsed["error_kind"] != "route_test_execution_to_tester" {
 		t.Fatalf("error_kind = %v, want %q", parsed["error_kind"], "route_test_execution_to_tester")
+	}
+	recovery, ok := parsed["recovery"].([]any)
+	if !ok || len(recovery) == 0 {
+		t.Fatalf("expected recovery guidance, got %#v", parsed["recovery"])
+	}
+}
+
+func TestToolErrorPayload_IncludesRecoveryForMissingExecutable(t *testing.T) {
+	got := ToolErrorPayload(&purevfs.ExecutableNotFoundError{
+		Executable: "python",
+		Aliases:    []string{"python3"},
+	})
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("payload is not valid JSON: %v", err)
+	}
+	if parsed["error_kind"] != "missing_executable" {
+		t.Fatalf("error_kind = %v, want %q", parsed["error_kind"], "missing_executable")
 	}
 	recovery, ok := parsed["recovery"].([]any)
 	if !ok || len(recovery) == 0 {

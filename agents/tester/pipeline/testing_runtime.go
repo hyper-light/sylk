@@ -2083,8 +2083,11 @@ func (pt *PipelineTester) runGenericSuite(ctx context.Context, harness *testHarn
 	}
 
 	command := harness.RunCommand
-	if len(files) == 1 && strings.TrimSpace(files[0]) != "" {
-		command = strings.ReplaceAll(commandForFile(harness, files[0]), "{file}", files[0])
+	resolvedFiles := pt.resolveSuiteFocusFiles(ctx, harness, files)
+	focusedFile := ""
+	if len(resolvedFiles) == 1 && strings.TrimSpace(resolvedFiles[0]) != "" {
+		focusedFile = resolvedFiles[0]
+		command = strings.ReplaceAll(commandForFile(harness, focusedFile), "{file}", focusedFile)
 	}
 	command = strings.ReplaceAll(command, "{test}", strings.Join(testNames, "|"))
 
@@ -2136,6 +2139,8 @@ func (pt *PipelineTester) runGenericSuite(ctx context.Context, harness *testHarn
 		"execution_mode":     plan.Mode,
 		"packages":           packages,
 		"files":              files,
+		"resolved_files":     resolvedFiles,
+		"focused_file":       focusedFile,
 		"passed":             boolToCount(passed),
 		"failed":             boolToCount(!passed),
 		"output":             string(runResult.Stdout),
@@ -2146,6 +2151,106 @@ func (pt *PipelineTester) runGenericSuite(ctx context.Context, harness *testHarn
 		"run_dir":            plan.WorkingDir,
 		"materialized":       plan.RequiresMaterialize,
 	}, nil
+}
+
+func (pt *PipelineTester) resolveSuiteFocusFiles(ctx context.Context, harness *testHarnessState, files []string) []string {
+	if harness == nil || len(files) == 0 {
+		return append([]string(nil), files...)
+	}
+	resolved := make([]string, 0, len(files))
+	seen := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		focused, ok := pt.resolveSuiteFocusFile(ctx, harness, file)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[focused]; exists {
+			continue
+		}
+		seen[focused] = struct{}{}
+		resolved = append(resolved, focused)
+	}
+	return resolved
+}
+
+func (pt *PipelineTester) resolveSuiteFocusFile(ctx context.Context, harness *testHarnessState, file string) (string, bool) {
+	normalized := normalizePathCandidate(pt.workingDir(), file)
+	if normalized == "" {
+		return "", false
+	}
+	def := frameworkDefinition(harness.FrameworkID)
+	candidates := make([]string, 0, 4)
+	addCandidate := func(path string) {
+		path = strings.TrimSpace(filepath.ToSlash(path))
+		if path == "" {
+			return
+		}
+		for _, existing := range candidates {
+			if existing == path {
+				return
+			}
+		}
+		candidates = append(candidates, path)
+	}
+
+	if pt.isRunnableSuiteFocusFile(harness, def, normalized) {
+		addCandidate(normalized)
+	}
+	companion := recommendedOutputFile(def, normalized)
+	if companion != "" && companion != normalized {
+		addCandidate(companion)
+	}
+	for _, created := range harness.CreatedFiles {
+		if strings.EqualFold(strings.TrimSpace(created), companion) {
+			addCandidate(created)
+		}
+	}
+	for _, existing := range harness.ExistingTestFiles {
+		if strings.EqualFold(strings.TrimSpace(existing), companion) {
+			addCandidate(existing)
+		}
+	}
+
+	for _, candidate := range candidates {
+		exists, err := pt.fileExists(ctx, candidate)
+		if err == nil && exists {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func (pt *PipelineTester) isRunnableSuiteFocusFile(harness *testHarnessState, def *coretest.TestFrameworkDefinition, path string) bool {
+	path = strings.TrimSpace(filepath.ToSlash(path))
+	if path == "" {
+		return false
+	}
+	if isTestArtifact(path) {
+		return true
+	}
+	for _, file := range harness.CreatedFiles {
+		if filepath.ToSlash(strings.TrimSpace(file)) == path {
+			return true
+		}
+	}
+	for _, file := range harness.ExistingTestFiles {
+		if filepath.ToSlash(strings.TrimSpace(file)) == path {
+			return true
+		}
+	}
+	if def == nil {
+		return false
+	}
+	base := filepath.Base(path)
+	for _, pattern := range def.TestFilePatterns {
+		if matched, _ := filepath.Match(pattern, base); matched {
+			return true
+		}
+		if matched, _ := filepath.Match(pattern, path); matched {
+			return true
+		}
+	}
+	return false
 }
 
 func commandForFile(harness *testHarnessState, file string) string {

@@ -717,8 +717,10 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		AgentID:     a.id,
 		SessionID:   fwd.SessionID,
 	})
+	allowedHandoff := shared.AutomaticHandoffAllowedForForwardedRequest(fwd)
+	ctx = shared.WithAutomaticHandoffEnabled(ctx, allowedHandoff)
 	gov := shared.NewContextGovernor(a.CurrentModel(), a.config.MaxOutputTokens, 0)
-	if a.handoffBridge != nil {
+	if a.handoffBridge != nil && shared.AutomaticHandoffEnabled(ctx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
 			bridge := shared.EffectiveHandoffBridge(bctx, a.handoffBridge)
 			if bridge == nil {
@@ -802,6 +804,16 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		}
 		defer cleanupReplicaBridge()
 	}
+	ctx = handoff.WithTransportRetryHandoff(ctx, handoff.TransportRetryHandoffConfig{
+		Enabled:       shared.AutomaticHandoffEnabled(ctx),
+		Bridge:        shared.EffectiveHandoffBridge(ctx, a.handoffBridge),
+		AgentID:       a.id,
+		AgentType:     "archivalist",
+		UserRequest:   fwd.Input,
+		CorrelationID: fwd.CorrelationID,
+		SessionID:     fwd.SessionID,
+		EventLogger:   a.steering.EventLogger(),
+	})
 
 	bundle, err := a.newForwardedToolBundle()
 	if err != nil {

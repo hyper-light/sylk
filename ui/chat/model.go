@@ -442,6 +442,20 @@ func (s *progressOverrideState) clearPending() {
 	s.pendingRetrySequence = 0
 }
 
+func (s *progressOverrideState) clearPendingDisplayed() bool {
+	if s == nil {
+		return false
+	}
+	if strings.TrimSpace(s.pendingRetryText) == "" &&
+		!s.pendingRetryToolDerived &&
+		!s.pendingRetryWatchdog &&
+		s.pendingRetrySequence == 0 {
+		return false
+	}
+	s.clearPending()
+	return true
+}
+
 func (s *progressOverrideState) reconcileToolDerived(next string, now time.Time) bool {
 	if s == nil {
 		return false
@@ -1057,6 +1071,15 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 		return nil
 	}
 	now := time.Now()
+	if entry := m.history.Get(m.thinkingIdx); entry != nil && staleGuardianInterAgentProgress(message, entry.ToolCalls) {
+		if m.clearPrimaryThinkingDisplay(m.thinkingIdx, now) {
+			m.viewDirty = true
+		}
+		return nil
+	}
+	if m.thinkingStart.IsZero() {
+		m.thinkingStart = now
+	}
 	if m.progress.queue(message, progress.Sequence, progress.ToolDerived, progress.Watchdog) && m.progress.canPromote(now) {
 		if m.progress.promotePending(now) {
 			m.setThinkingTextNow(m.progress.retryText)
@@ -1877,6 +1900,12 @@ func (m *Model) handleNestedStreamProgress(progress msg.StreamProgressMsg) bool 
 		slot.activity.AgentType = agentType
 	}
 	message := sanitizeThinkingMessage(progress.Message)
+	if staleGuardianInterAgentProgress(message, slot.activity.ToolCalls) {
+		if m.clearNestedThinkingDisplay(slot, time.Now()) {
+			m.syncPendingNestedStream(slot)
+		}
+		return true
+	}
 	if message == "" &&
 		slot.thinkingStart.IsZero() &&
 		strings.TrimSpace(slot.activity.ThinkingText) == "" &&
@@ -2033,6 +2062,78 @@ func (m *Model) finalizeNestedStreamSlotIfReady(slot *nestedStreamSlot, doneAt t
 	slot.activity.Completed = true
 	slot.activity.Failed = slot.terminalFailed
 	slot.done = true
+}
+
+func staleGuardianInterAgentProgress(text string, calls []ToolCallRecord) bool {
+	text = strings.TrimSpace(text)
+	if text == "" || hasActiveToolCallVisual(calls) || !hasResolvedGuardianInterAgentToolCall(calls) {
+		return false
+	}
+	lower := strings.ToLower(text)
+	if !strings.Contains(lower, "guardian") {
+		return false
+	}
+	for _, keyword := range []string{"approval", "check", "consult", "review", "validation", "validate", "received"} {
+		if strings.Contains(lower, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasActiveToolCallVisual(calls []ToolCallRecord) bool {
+	for i := range calls {
+		if toolCallHasActiveVisual(calls[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasResolvedGuardianInterAgentToolCall(calls []ToolCallRecord) bool {
+	type toolCallFrame struct {
+		calls []ToolCallRecord
+	}
+
+	stack := []toolCallFrame{{calls: calls}}
+	for len(stack) > 0 {
+		frame := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for i := range frame.calls {
+			record := frame.calls[i]
+			if record.InterAgent != nil {
+				if record.Completed &&
+					record.InterAgent.Status != InterAgentToolPending &&
+					interAgentTargetsAgent(record.InterAgent, "guardian") {
+					return true
+				}
+				for childIdx := len(record.InterAgent.Children) - 1; childIdx >= 0; childIdx-- {
+					childCalls := record.InterAgent.Children[childIdx].ToolCalls
+					if len(childCalls) == 0 {
+						continue
+					}
+					stack = append(stack, toolCallFrame{calls: childCalls})
+				}
+			}
+		}
+	}
+	return false
+}
+
+func interAgentTargetsAgent(row *InterAgentTool, target string) bool {
+	if row == nil {
+		return false
+	}
+	target = strings.TrimSpace(strings.ToLower(target))
+	if target == "" {
+		return false
+	}
+	for _, agentType := range row.AgentTypes {
+		if strings.TrimSpace(strings.ToLower(agentType)) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Model) nestedStream(correlationID string) *nestedStreamSlot {
@@ -4071,6 +4172,15 @@ func (m *Model) applySlotProgress(slot *streamSlot, message string, sequence int
 		return
 	}
 	now := time.Now()
+	if entry := m.history.Get(slot.thinkingIdx); entry != nil && staleGuardianInterAgentProgress(message, entry.ToolCalls) {
+		if m.clearSlotThinkingDisplay(slot, now) {
+			m.viewDirty = true
+		}
+		return
+	}
+	if slot.thinkingStart.IsZero() {
+		slot.thinkingStart = now
+	}
 	if slot.progress.queue(message, sequence, toolDerived, watchdog) && slot.progress.canPromote(now) {
 		if slot.progress.promotePending(now) && m.setSlotThinkingTextNow(slot, slot.progress.retryText) {
 			m.viewDirty = true
@@ -4133,8 +4243,78 @@ func (m *Model) resolveSlotThinkingEntry(slot *streamSlot) {
 	slot.progress.clear()
 }
 
+func (m *Model) clearPrimaryThinkingDisplay(idx int, now time.Time) bool {
+	if idx < 0 {
+		return false
+	}
+	changed := false
+	if m.progress.clearPendingDisplayed() {
+		changed = true
+	}
+	if m.progress.clearDisplayed(now) {
+		changed = true
+	}
+	if !m.thinkingStart.IsZero() {
+		m.thinkingStart = time.Time{}
+		changed = true
+	}
+	if changed {
+		m.writeThinkingEntry(idx, "", "", "")
+	}
+	return changed
+}
+
+func (m *Model) clearSlotThinkingDisplay(slot *streamSlot, now time.Time) bool {
+	if slot == nil {
+		return false
+	}
+	changed := false
+	if slot.progress.clearPendingDisplayed() {
+		changed = true
+	}
+	if slot.progress.clearDisplayed(now) {
+		changed = true
+	}
+	if !slot.thinkingStart.IsZero() {
+		slot.thinkingStart = time.Time{}
+		changed = true
+	}
+	if changed {
+		m.writeThinkingEntry(slot.thinkingIdx, "", "", "")
+	}
+	return changed
+}
+
+func (m *Model) clearNestedThinkingDisplay(slot *nestedStreamSlot, now time.Time) bool {
+	if slot == nil {
+		return false
+	}
+	changed := false
+	if slot.progress.clearPendingDisplayed() {
+		changed = true
+	}
+	if slot.progress.clearDisplayed(now) {
+		changed = true
+	}
+	if !slot.thinkingStart.IsZero() {
+		slot.thinkingStart = time.Time{}
+		changed = true
+	}
+	if !slot.activity.ThinkingStartedAt.IsZero() ||
+		strings.TrimSpace(slot.activity.ThinkingText) != "" ||
+		strings.TrimSpace(slot.activity.ThinkingStatus) != "" ||
+		strings.TrimSpace(slot.activity.ThinkingColor) != "" {
+		slot.activity.ThinkingStartedAt = time.Time{}
+		slot.activity.ThinkingText = ""
+		slot.activity.ThinkingStatus = ""
+		slot.activity.ThinkingColor = ""
+		changed = true
+	}
+	return changed
+}
+
 func (m *Model) reconcileToolDerivedThinkingProgress(idx int) {
-	if idx < 0 || idx != m.thinkingIdx || m.thinkingStart.IsZero() {
+	if idx < 0 || idx != m.thinkingIdx {
 		return
 	}
 	entry := m.history.Get(idx)
@@ -4143,14 +4323,27 @@ func (m *Model) reconcileToolDerivedThinkingProgress(idx int) {
 	}
 	next := toolDerivedProgressSummary(entry.ToolCalls)
 	now := time.Now()
+	if next != "" && m.thinkingStart.IsZero() {
+		m.thinkingStart = now
+	}
 	if m.progress.reconcileToolDerived(next, now) {
-		m.renderThinkingEntry(idx, m.thinkingAgentID, m.progress.retryText, m.thinkingStart, now)
+		if m.thinkingStart.IsZero() {
+			m.writeThinkingEntry(idx, "", "", "")
+		} else {
+			m.renderThinkingEntry(idx, m.thinkingAgentID, m.progress.retryText, m.thinkingStart, now)
+		}
 		m.viewDirty = true
+	}
+	if staleGuardianInterAgentProgress(m.progress.retryText, entry.ToolCalls) ||
+		staleGuardianInterAgentProgress(m.progress.pendingRetryText, entry.ToolCalls) {
+		if m.clearPrimaryThinkingDisplay(idx, now) {
+			m.viewDirty = true
+		}
 	}
 }
 
 func (m *Model) reconcileToolDerivedSlotProgress(slot *streamSlot) {
-	if slot == nil || slot.thinkingIdx < 0 || slot.thinkingStart.IsZero() || slot.accumulator == nil {
+	if slot == nil || slot.thinkingIdx < 0 || slot.accumulator == nil {
 		return
 	}
 	entry := m.history.Get(slot.accumulator.EntryIndex())
@@ -4159,20 +4352,42 @@ func (m *Model) reconcileToolDerivedSlotProgress(slot *streamSlot) {
 	}
 	next := toolDerivedProgressSummary(entry.ToolCalls)
 	now := time.Now()
+	if next != "" && slot.thinkingStart.IsZero() {
+		slot.thinkingStart = now
+	}
 	if slot.progress.reconcileToolDerived(next, now) {
-		m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.progress.retryText, slot.thinkingStart, now)
+		if slot.thinkingStart.IsZero() {
+			m.writeThinkingEntry(slot.thinkingIdx, "", "", "")
+		} else {
+			m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.progress.retryText, slot.thinkingStart, now)
+		}
 		m.viewDirty = true
+	}
+	if staleGuardianInterAgentProgress(slot.progress.retryText, entry.ToolCalls) ||
+		staleGuardianInterAgentProgress(slot.progress.pendingRetryText, entry.ToolCalls) {
+		if m.clearSlotThinkingDisplay(slot, now) {
+			m.viewDirty = true
+		}
 	}
 }
 
 func (m *Model) reconcileToolDerivedNestedProgress(slot *nestedStreamSlot) {
-	if slot == nil || slot.thinkingStart.IsZero() {
+	if slot == nil {
 		return
 	}
 	next := toolDerivedProgressSummary(slot.activity.ToolCalls)
 	now := time.Now()
+	if next != "" && slot.thinkingStart.IsZero() {
+		slot.thinkingStart = now
+	}
 	if slot.progress.reconcileToolDerived(next, now) && m.renderNestedStreamThinking(slot, now) {
 		m.syncPendingNestedStream(slot)
+	}
+	if staleGuardianInterAgentProgress(slot.progress.retryText, slot.activity.ToolCalls) ||
+		staleGuardianInterAgentProgress(slot.progress.pendingRetryText, slot.activity.ToolCalls) {
+		if m.clearNestedThinkingDisplay(slot, now) {
+			m.syncPendingNestedStream(slot)
+		}
 	}
 }
 

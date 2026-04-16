@@ -116,7 +116,7 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 				req.Messages = append(req.Messages, providers.Message{
 					Role: providers.RoleUser,
 					Content: err.Error() +
-						"\nUse the global review protocol now. If a challenge response arrived, call process_validation before choosing challenge_agent, handoff_next, finalize_global_review, or commit_to_disk.",
+						"\nUse the global review protocol now. If a challenge response arrived, call process_validation before choosing challenge_global_tester, challenge_architect, challenge_orchestrator, handoff_next, finalize_global_review, or commit_to_disk.",
 				})
 				requiredActionGraceTurns = agentShared.ExtendRequiredProtocolGrace(ctx, requiredActionGraceTurns)
 				continue

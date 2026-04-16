@@ -122,6 +122,7 @@ func applyOpenAIProviderDefaults(config *OpenAIConfig) {
 		return
 	}
 	defaults := DefaultOpenAIConfig()
+	applyBaseConfigDefaults(&config.BaseConfig, defaults.BaseConfig)
 	applyDefaultString(&config.Model, defaults.Model)
 	applyDefaultInt(&config.MaxTokens, defaults.MaxTokens)
 	applyDefaultString(&config.AuthMode, defaults.AuthMode)
@@ -140,6 +141,27 @@ func applyDefaultInt(value *int, fallback int) {
 		return
 	}
 	*value = fallback
+}
+
+func applyDefaultDuration(value *time.Duration, fallback time.Duration) {
+	if *value != 0 {
+		return
+	}
+	*value = fallback
+}
+
+func applyBaseConfigDefaults(config *BaseConfig, defaults BaseConfig) {
+	if config == nil {
+		return
+	}
+	applyDefaultInt(&config.MaxTokens, defaults.MaxTokens)
+	if config.Temperature == 0 {
+		config.Temperature = defaults.Temperature
+	}
+	applyDefaultDuration(&config.Timeout, defaults.Timeout)
+	applyDefaultInt(&config.MaxRetries, defaults.MaxRetries)
+	applyDefaultDuration(&config.RetryBaseDelay, defaults.RetryBaseDelay)
+	applyDefaultDuration(&config.RetryMaxDelay, defaults.RetryMaxDelay)
 }
 
 func normalizeOpenAIProviderModels(config *OpenAIConfig) {

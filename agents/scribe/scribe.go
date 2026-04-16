@@ -348,10 +348,18 @@ func (s *Scribe) contextForFeed(ctx context.Context, feed shared.ScribeFeed) con
 	if parentCorrelationID != "" {
 		ctx = shared.WithStreamContext(ctx, parentCorrelationID, s.parentAgentType)
 	}
-	return shared.WithLogMeta(ctx, shared.LogMeta{
+	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
 		CorrID:    s.workstreamKey(feed),
 		AgentID:   s.id,
 		SessionID: "",
+	})
+	return handoff.WithTransportRetryHandoff(ctx, handoff.TransportRetryHandoffConfig{
+		Enabled:       true,
+		Bridge:        s.handoffBridge,
+		AgentID:       s.id,
+		AgentType:     s.AgentType(),
+		UserRequest:   s.buildTurnMessage(feed).Content,
+		CorrelationID: strings.TrimSpace(feed.ParentCorrelationID),
 	})
 }
 

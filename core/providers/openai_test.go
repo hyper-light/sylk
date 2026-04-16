@@ -42,6 +42,29 @@ func TestResolveOpenAITimeout_UsesOpenAISpecificDefault(t *testing.T) {
 	}
 }
 
+func TestNewOpenAIProvider_SparseConfigGetsRetryDefaults(t *testing.T) {
+	provider, err := NewOpenAIProvider(context.Background(), OpenAIConfig{
+		BaseConfig: BaseConfig{
+			APIKey: "test-api-key",
+			Model:  "gpt-5.4-pro",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider() error = %v", err)
+	}
+
+	defaults := DefaultOpenAIConfig()
+	if provider.config.MaxRetries != defaults.MaxRetries {
+		t.Fatalf("MaxRetries = %d, want %d", provider.config.MaxRetries, defaults.MaxRetries)
+	}
+	if provider.config.RetryBaseDelay != defaults.RetryBaseDelay {
+		t.Fatalf("RetryBaseDelay = %v, want %v", provider.config.RetryBaseDelay, defaults.RetryBaseDelay)
+	}
+	if provider.config.RetryMaxDelay != defaults.RetryMaxDelay {
+		t.Fatalf("RetryMaxDelay = %v, want %v", provider.config.RetryMaxDelay, defaults.RetryMaxDelay)
+	}
+}
+
 func TestOpenAIProviderGenerate_StandardRetriesTransportReset(t *testing.T) {
 	if !canListenLocalTCP() {
 		t.Skip("local TCP listeners are not permitted in this environment")

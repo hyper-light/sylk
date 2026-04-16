@@ -301,7 +301,7 @@ func (e *ProviderError) parseError(err error) {
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
-		e.Retryable = netErr.Timeout()
+		e.Retryable = netErr.Timeout() || isRetryableTransportError(err)
 		return
 	}
 }

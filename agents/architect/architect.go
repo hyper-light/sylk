@@ -921,7 +921,19 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 		AgentID:     a.id,
 		SessionID:   fwd.SessionID,
 	})
-	reqCtx = shared.WithAutomaticHandoffEnabled(reqCtx, shared.AutomaticHandoffAllowedForForwardedRequest(fwd))
+	allowedHandoff := shared.AutomaticHandoffAllowedForForwardedRequest(fwd)
+	reqCtx = shared.WithAutomaticHandoffEnabled(reqCtx, allowedHandoff)
+	reqCtx = handoff.WithTransportRetryHandoff(reqCtx, handoff.TransportRetryHandoffConfig{
+		Enabled:       allowedHandoff,
+		Bridge:        a.handoffBridge,
+		AgentID:       a.id,
+		AgentType:     "architect",
+		UserRequest:   fwd.Input,
+		CorrelationID: fwd.CorrelationID,
+		SessionID:     fwd.SessionID,
+		EventLogger:   a.steering.EventLogger(),
+		Scribe:        a.agentPod,
+	})
 	gov := shared.NewContextGovernor(a.config.Model, a.config.MaxOutputTokens, 0)
 	if a.handoffBridge != nil && shared.AutomaticHandoffEnabled(reqCtx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {

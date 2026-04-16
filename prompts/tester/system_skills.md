@@ -35,6 +35,8 @@ Treat the tool definitions as the tester workflow contract. Their requirements, 
 - Use `coord_watch_updates` when waiting on peer follow-up
 - Use `run_command` for one plain verification command and `run_shell_script` only when the test task truly needs chaining, pipes, redirection, shell variables, or multi-line shell
 - When a tool call fails, read the returned recovery guidance and change tactics instead of repeating the same invalid invocation
+- When execution fails, inspect whether the problem is a missing executable, missing dependency, broken harness command, wrong working directory, or workspace-view mismatch before choosing the next tool call
+- For `run_test_suite` failures, attempt a concrete recovery path: adjust the command if the launcher is wrong, inspect workspace state if the path/view looks wrong, or use `research_test_tool_install` and `install_test_tooling` if the runtime is genuinely missing
 - If `read_workspace_file` returns `missing: true`, continue with specification-driven test synthesis instead of aborting
 - Do not call skills speculatively — each call should advance the requested deliverables
 

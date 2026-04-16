@@ -112,11 +112,12 @@ func WithActiveToolCall(ctx context.Context, call providers.ToolCall) context.Co
 		ctx = context.Background()
 	}
 	fullArgs := PrettyPrintArgs(call.Arguments)
+	toolName := emittedToolCallNameForContext(ctx, call.Name, fullArgs, "")
 	return context.WithValue(ctx, activeToolCallContextKey{}, ActiveToolCallContext{
 		ToolCallKey: toolCallEventKey(call),
-		ToolName:    call.Name,
+		ToolName:    toolName,
 		FullArgs:    fullArgs,
-		InterAgent:  DeriveInterAgentToolEvent(call.Name, fullArgs, "", ToolCallStart, false, ""),
+		InterAgent:  DeriveInterAgentToolEvent(toolName, fullArgs, "", ToolCallStart, false, ""),
 	})
 }
 
@@ -139,6 +140,7 @@ func EmitToolCall(ctx context.Context, event ToolCallEvent) {
 			event.StreamMetadata = cloneStreamMetadata(stream.Metadata)
 		}
 	}
+	event.ToolName = canonicalizeInterAgentToolName(event.ToolName, event.FullArgs, event.Output, event.StreamMetadata)
 	event.InterAgent = NormalizeInterAgentToolEventForEmit(
 		event.ToolName,
 		event.FullArgs,
@@ -156,6 +158,16 @@ func EmitToolCall(ctx context.Context, event ToolCallEvent) {
 	publishWithStreamLifecycle(ctx, guide.StreamEventToolCall, func() {
 		emitter(event)
 	})
+}
+
+func emittedToolCallNameForContext(ctx context.Context, toolName, fullArgs, output string) string {
+	if ctx == nil {
+		return canonicalizeInterAgentToolName(toolName, fullArgs, output, nil)
+	}
+	if stream, ok := StreamMetadataFromContext(ctx); ok {
+		return canonicalizeInterAgentToolName(toolName, fullArgs, output, stream.Metadata)
+	}
+	return canonicalizeInterAgentToolName(toolName, fullArgs, output, nil)
 }
 
 // ObserveProviderToolCallChunk translates provider tool streaming into a single
@@ -231,7 +243,7 @@ func (t *toolCallTracker) observeChunk(ctx context.Context, chunk *providers.Str
 			Name:      state.Name,
 			Arguments: state.Arguments.String(),
 		}
-		startEvent = t.preannounceToolCallStart(call, state, chunk)
+		startEvent = t.preannounceToolCallStart(ctx, call, state, chunk)
 	}
 	if chunk.Type == providers.ChunkTypeToolEnd && !state.Announced {
 		call := providers.ToolCall{
@@ -239,7 +251,7 @@ func (t *toolCallTracker) observeChunk(ctx context.Context, chunk *providers.Str
 			Name:      state.Name,
 			Arguments: state.Arguments.String(),
 		}
-		startEvent = t.preannounceToolCallStart(call, state, chunk)
+		startEvent = t.preannounceToolCallStart(ctx, call, state, chunk)
 		if startEvent != nil && state.Kind == providers.ToolKindNativeWebSearch && !state.StartedAt.IsZero() {
 			startEvent.StartedAt = state.StartedAt
 		}
@@ -265,19 +277,21 @@ func (t *toolCallTracker) observeChunk(ctx context.Context, chunk *providers.Str
 		if key := toolCallTrackingKey(call); key != "" {
 			t.completed[key] = struct{}{}
 		}
+		fullArgs := PrettyPrintArgs(call.Arguments)
+		emittedToolName := emittedToolCallNameForContext(ctx, call.Name, fullArgs, "")
 		completeEvent = &ToolCallEvent{
 			ToolCallKey: toolCallEventKey(call),
 			Phase:       ToolCallComplete,
-			ToolName:    call.Name,
+			ToolName:    emittedToolName,
 			ArgsSummary: SummarizeToolArgs(call.Name, call.Arguments),
-			FullArgs:    PrettyPrintArgs(call.Arguments),
+			FullArgs:    fullArgs,
 			AgentID:     "",
 			StartedAt:   startedAt,
 			Duration:    duration,
 			Success:     true,
 			InterAgent: DeriveInterAgentToolEvent(
-				call.Name,
-				PrettyPrintArgs(call.Arguments),
+				emittedToolName,
+				fullArgs,
 				"",
 				ToolCallComplete,
 				true,
@@ -296,13 +310,15 @@ func (t *toolCallTracker) observeChunk(ctx context.Context, chunk *providers.Str
 }
 
 func (t *toolCallTracker) preannounceToolCallStart(
+	ctx context.Context,
 	call providers.ToolCall,
 	state *streamedToolCallState,
 	chunk *providers.StreamChunk,
 ) *ToolCallEvent {
 	fullArgs := PrettyPrintArgs(call.Arguments)
+	emittedToolName := emittedToolCallNameForContext(ctx, call.Name, fullArgs, "")
 	interAgent := DeriveInterAgentToolEvent(
-		call.Name,
+		emittedToolName,
 		fullArgs,
 		"",
 		ToolCallStart,
@@ -323,7 +339,7 @@ func (t *toolCallTracker) preannounceToolCallStart(
 	return &ToolCallEvent{
 		ToolCallKey: toolCallEventKey(call),
 		Phase:       ToolCallStart,
-		ToolName:    call.Name,
+		ToolName:    emittedToolName,
 		ArgsSummary: SummarizeToolArgs(call.Name, call.Arguments),
 		FullArgs:    fullArgs,
 		StartedAt:   startedAt,
@@ -472,11 +488,12 @@ func TimedToolCall(
 				start = preannouncedStart
 			}
 		} else {
-			startInterAgent := DeriveInterAgentToolEvent(call.Name, fullArgs, "", ToolCallStart, false, "")
+			emittedToolName := emittedToolCallNameForContext(ctx, call.Name, fullArgs, "")
+			startInterAgent := DeriveInterAgentToolEvent(emittedToolName, fullArgs, "", ToolCallStart, false, "")
 			EmitToolCall(ctx, ToolCallEvent{
 				ToolCallKey: toolCallEventKey(call),
 				Phase:       ToolCallStart,
-				ToolName:    call.Name,
+				ToolName:    emittedToolName,
 				ArgsSummary: summary,
 				FullArgs:    fullArgs,
 				AgentID:     agentID,
@@ -485,11 +502,12 @@ func TimedToolCall(
 			})
 		}
 	} else {
-		startInterAgent := DeriveInterAgentToolEvent(call.Name, fullArgs, "", ToolCallStart, false, "")
+		emittedToolName := emittedToolCallNameForContext(ctx, call.Name, fullArgs, "")
+		startInterAgent := DeriveInterAgentToolEvent(emittedToolName, fullArgs, "", ToolCallStart, false, "")
 		EmitToolCall(ctx, ToolCallEvent{
 			ToolCallKey: toolCallEventKey(call),
 			Phase:       ToolCallStart,
-			ToolName:    call.Name,
+			ToolName:    emittedToolName,
 			ArgsSummary: summary,
 			FullArgs:    fullArgs,
 			AgentID:     agentID,
@@ -500,12 +518,13 @@ func TimedToolCall(
 
 	result, err := execute()
 	output, success, errorMsg := toolCallCompletionOutcome(result, err)
-	interAgent := DeriveInterAgentToolEvent(call.Name, fullArgs, output, ToolCallComplete, success, errorMsg)
+	emittedToolName := emittedToolCallNameForContext(ctx, call.Name, fullArgs, output)
+	interAgent := DeriveInterAgentToolEvent(emittedToolName, fullArgs, output, ToolCallComplete, success, errorMsg)
 
 	event := ToolCallEvent{
 		ToolCallKey: toolCallEventKey(call),
 		Phase:       ToolCallComplete,
-		ToolName:    call.Name,
+		ToolName:    emittedToolName,
 		ArgsSummary: summary,
 		FullArgs:    fullArgs,
 		Output:      TruncateOutput(output, maxOutputBytes),
@@ -545,34 +564,37 @@ func CompleteProviderNativeToolCall(
 				start = preannouncedStart
 			}
 		} else {
+			emittedToolName := emittedToolCallNameForContext(ctx, call.Name, fullArgs, "")
 			EmitToolCall(ctx, ToolCallEvent{
 				ToolCallKey: toolCallEventKey(call),
 				Phase:       ToolCallStart,
-				ToolName:    call.Name,
+				ToolName:    emittedToolName,
 				ArgsSummary: summary,
 				FullArgs:    fullArgs,
 				AgentID:     agentID,
 				StartedAt:   start,
-				InterAgent:  DeriveInterAgentToolEvent(call.Name, fullArgs, "", ToolCallStart, false, ""),
+				InterAgent:  DeriveInterAgentToolEvent(emittedToolName, fullArgs, "", ToolCallStart, false, ""),
 			})
 		}
 	} else {
+		emittedToolName := emittedToolCallNameForContext(ctx, call.Name, fullArgs, "")
 		EmitToolCall(ctx, ToolCallEvent{
 			ToolCallKey: toolCallEventKey(call),
 			Phase:       ToolCallStart,
-			ToolName:    call.Name,
+			ToolName:    emittedToolName,
 			ArgsSummary: summary,
 			FullArgs:    fullArgs,
 			AgentID:     agentID,
 			StartedAt:   start,
-			InterAgent:  DeriveInterAgentToolEvent(call.Name, fullArgs, "", ToolCallStart, false, ""),
+			InterAgent:  DeriveInterAgentToolEvent(emittedToolName, fullArgs, "", ToolCallStart, false, ""),
 		})
 	}
 
+	emittedToolName := emittedToolCallNameForContext(ctx, call.Name, fullArgs, output)
 	EmitToolCall(ctx, ToolCallEvent{
 		ToolCallKey: toolCallEventKey(call),
 		Phase:       ToolCallComplete,
-		ToolName:    call.Name,
+		ToolName:    emittedToolName,
 		ArgsSummary: summary,
 		FullArgs:    fullArgs,
 		Output:      TruncateOutput(output, maxOutputBytes),
@@ -580,7 +602,7 @@ func CompleteProviderNativeToolCall(
 		StartedAt:   start,
 		Duration:    time.Since(start),
 		Success:     true,
-		InterAgent:  DeriveInterAgentToolEvent(call.Name, fullArgs, output, ToolCallComplete, true, ""),
+		InterAgent:  DeriveInterAgentToolEvent(emittedToolName, fullArgs, output, ToolCallComplete, true, ""),
 	})
 }
 

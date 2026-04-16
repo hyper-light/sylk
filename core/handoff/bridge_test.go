@@ -53,10 +53,12 @@ func newTestEvictableAgent(id, agentType string, desc AgentDescriptor) *testEvic
 type testInjectableAgent struct {
 	testBridgeAgent
 	injected bool
+	prepared *PreparedContext
 }
 
-func (a *testInjectableAgent) InjectPreparedContext(_ *PreparedContext) error {
+func (a *testInjectableAgent) InjectPreparedContext(pc *PreparedContext) error {
 	a.injected = true
+	a.prepared = pc
 	return nil
 }
 

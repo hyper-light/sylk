@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -89,6 +90,51 @@ func TestRetryGenerate_StopsOnNonRetryableError(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("expected 1 call for non-retryable error, got %d", calls)
+	}
+}
+
+func TestRetryGenerate_NotifiesRetryExhaustedObserverOnTransportFailure(t *testing.T) {
+	cfg := BaseConfig{MaxRetries: 3, RetryBaseDelay: time.Millisecond, RetryMaxDelay: time.Millisecond}
+	var events []RetryExhaustedEvent
+	ctx := WithRetryExhaustedObserver(context.Background(), func(event RetryExhaustedEvent) {
+		events = append(events, event)
+	})
+
+	_, err := retryGenerate(ctx, cfg, func(_ context.Context) (*Response, error) {
+		return nil, &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}
+	})
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	if len(events) != 1 {
+		t.Fatalf("retry exhausted events = %d, want 1", len(events))
+	}
+	if !events[0].Transport {
+		t.Fatal("expected exhausted event to be marked as transport")
+	}
+	if events[0].RetriesUsed != 2 {
+		t.Fatalf("retries used = %d, want 2", events[0].RetriesUsed)
+	}
+	if events[0].TotalAttempts != 3 {
+		t.Fatalf("total attempts = %d, want 3", events[0].TotalAttempts)
+	}
+}
+
+func TestRetryGenerate_DoesNotNotifyRetryExhaustedObserverWithoutRetryBudget(t *testing.T) {
+	cfg := BaseConfig{MaxRetries: 1, RetryBaseDelay: time.Millisecond, RetryMaxDelay: time.Millisecond}
+	notified := false
+	ctx := WithRetryExhaustedObserver(context.Background(), func(event RetryExhaustedEvent) {
+		notified = true
+	})
+
+	_, err := retryGenerate(ctx, cfg, func(_ context.Context) (*Response, error) {
+		return nil, &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}
+	})
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	if notified {
+		t.Fatal("expected no exhausted notification without an actual retry")
 	}
 }
 
@@ -202,6 +248,16 @@ func TestIsRetryableError_TypedErrors(t *testing.T) {
 			retryable: true,
 		},
 		{
+			name:      "connection reset by peer net.Error",
+			err:       &testTransportNetError{msg: "read tcp 192.168.1.32:57205->172.64.155.209:443: read: connection reset by peer"},
+			retryable: true,
+		},
+		{
+			name:      "net.OpError",
+			err:       &net.OpError{Op: "read", Net: "tcp", Err: errors.New("socket failure")},
+			retryable: true,
+		},
+		{
 			name:      "nil error",
 			err:       nil,
 			retryable: false,
@@ -227,6 +283,16 @@ func (e *testTimeoutError) Timeout() bool   { return e.timeout }
 func (e *testTimeoutError) Temporary() bool { return false }
 
 var _ net.Error = (*testTimeoutError)(nil)
+
+type testTransportNetError struct {
+	msg string
+}
+
+func (e *testTransportNetError) Error() string   { return e.msg }
+func (e *testTransportNetError) Timeout() bool   { return false }
+func (e *testTransportNetError) Temporary() bool { return false }
+
+var _ net.Error = (*testTransportNetError)(nil)
 
 func TestServerGuidedDelay_UsesServerHint(t *testing.T) {
 	// When the server says "wait 30s", the delay should be at least 30s
@@ -495,6 +561,48 @@ func TestRetryStream_RetriesHTTP2PeerResetError(t *testing.T) {
 		calls++
 		if calls == 1 {
 			return errors.New("stream error: stream ID 1; INTERNAL_ERROR; received from peer")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", calls)
+	}
+}
+
+func TestRetryStream_RetriesConnectionResetNetError(t *testing.T) {
+	cfg := BaseConfig{MaxRetries: 2, RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
+	calls := 0
+	err := retryStream(context.Background(), cfg, func(_ context.Context) error {
+		calls++
+		if calls == 1 {
+			return fmt.Errorf("openai stream: %w", &testTransportNetError{
+				msg: "read tcp 192.168.1.32:57205->172.64.155.209:443: read: connection reset by peer",
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", calls)
+	}
+}
+
+func TestRetryStream_RetriesNetOpError(t *testing.T) {
+	cfg := BaseConfig{MaxRetries: 2, RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
+	calls := 0
+	err := retryStream(context.Background(), cfg, func(_ context.Context) error {
+		calls++
+		if calls == 1 {
+			return fmt.Errorf("openai stream: %w", &net.OpError{
+				Op:  "read",
+				Net: "tcp",
+				Err: errors.New("socket failure"),
+			})
 		}
 		return nil
 	})

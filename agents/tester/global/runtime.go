@@ -370,8 +370,11 @@ func (gt *GlobalTester) runGenericSuite(ctx context.Context, harness *globalTest
 	}
 
 	command := harness.RunCommand
-	if len(files) == 1 && strings.TrimSpace(files[0]) != "" {
-		command = strings.ReplaceAll(commandForFile(harness, files[0]), "{file}", files[0])
+	resolvedFiles := gt.resolveSuiteFocusFiles(ctx, harness, files)
+	focusedFile := ""
+	if len(resolvedFiles) == 1 && strings.TrimSpace(resolvedFiles[0]) != "" {
+		focusedFile = resolvedFiles[0]
+		command = strings.ReplaceAll(commandForFile(harness, focusedFile), "{file}", focusedFile)
 	}
 	command = strings.ReplaceAll(command, "{test}", strings.Join(testNames, "|"))
 	if issue, ok := agentshared.DetectShellControlOperator(command); ok {
@@ -425,6 +428,8 @@ func (gt *GlobalTester) runGenericSuite(ctx context.Context, harness *globalTest
 		"execution_mode":     plan.Mode,
 		"packages":           packages,
 		"files":              files,
+		"resolved_files":     resolvedFiles,
+		"focused_file":       focusedFile,
 		"passed":             boolToCount(passed),
 		"failed":             boolToCount(!passed),
 		"output":             string(runResult.Stdout),
@@ -435,6 +440,137 @@ func (gt *GlobalTester) runGenericSuite(ctx context.Context, harness *globalTest
 		"run_dir":            plan.WorkingDir,
 		"materialized":       plan.RequiresMaterialize,
 	}, nil
+}
+
+func (gt *GlobalTester) resolveSuiteFocusFiles(ctx context.Context, harness *globalTestHarnessState, files []string) []string {
+	if harness == nil || len(files) == 0 {
+		return append([]string(nil), files...)
+	}
+	resolved := make([]string, 0, len(files))
+	seen := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		focused, ok := gt.resolveSuiteFocusFile(ctx, harness, file)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[focused]; exists {
+			continue
+		}
+		seen[focused] = struct{}{}
+		resolved = append(resolved, focused)
+	}
+	return resolved
+}
+
+func (gt *GlobalTester) resolveSuiteFocusFile(ctx context.Context, harness *globalTestHarnessState, file string) (string, bool) {
+	normalized := normalizePathCandidate(gt.workingDir(), file)
+	if normalized == "" {
+		return "", false
+	}
+	def := frameworkDefinition(harness.FrameworkID)
+	candidates := make([]string, 0, 4)
+	addCandidate := func(path string) {
+		path = strings.TrimSpace(filepath.ToSlash(path))
+		if path == "" {
+			return
+		}
+		for _, existing := range candidates {
+			if existing == path {
+				return
+			}
+		}
+		candidates = append(candidates, path)
+	}
+
+	if isRunnableGlobalSuiteFocusFile(harness, def, normalized) {
+		addCandidate(normalized)
+	}
+	companion := recommendedOutputFile(def, normalized)
+	if companion != "" && companion != normalized {
+		addCandidate(companion)
+	}
+	for _, created := range harness.CreatedFiles {
+		if strings.EqualFold(strings.TrimSpace(created), companion) {
+			addCandidate(created)
+		}
+	}
+	for _, existing := range harness.ExistingTestFiles {
+		if strings.EqualFold(strings.TrimSpace(existing), companion) {
+			addCandidate(existing)
+		}
+	}
+
+	for _, candidate := range candidates {
+		exists, err := gt.fileExists(ctx, candidate)
+		if err == nil && exists {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func isRunnableGlobalSuiteFocusFile(harness *globalTestHarnessState, def *coretest.TestFrameworkDefinition, path string) bool {
+	path = strings.TrimSpace(filepath.ToSlash(path))
+	if path == "" {
+		return false
+	}
+	if isGlobalTestArtifact(path) {
+		return true
+	}
+	for _, file := range harness.CreatedFiles {
+		if filepath.ToSlash(strings.TrimSpace(file)) == path {
+			return true
+		}
+	}
+	for _, file := range harness.ExistingTestFiles {
+		if filepath.ToSlash(strings.TrimSpace(file)) == path {
+			return true
+		}
+	}
+	if def == nil {
+		return false
+	}
+	base := filepath.Base(path)
+	for _, pattern := range def.TestFilePatterns {
+		if matched, _ := filepath.Match(pattern, base); matched {
+			return true
+		}
+		if matched, _ := filepath.Match(pattern, path); matched {
+			return true
+		}
+	}
+	return false
+}
+
+func isGlobalTestArtifact(path string) bool {
+	base := filepath.Base(path)
+	switch {
+	case strings.HasSuffix(base, "_test.go"),
+		strings.Contains(base, ".test."),
+		strings.Contains(base, ".spec."),
+		strings.HasSuffix(base, "Spec.scala"),
+		strings.HasPrefix(base, "test_") && strings.HasSuffix(base, ".py"),
+		strings.HasSuffix(base, "Test.java"),
+		strings.HasSuffix(base, "Test.kt"),
+		strings.HasSuffix(base, "Test.scala"),
+		strings.HasSuffix(base, "Spec.hs"),
+		strings.HasSuffix(base, "Test.hs"),
+		strings.HasSuffix(base, "Tests.cs"),
+		strings.HasSuffix(base, "_test.dart"),
+		strings.HasSuffix(base, "_test.exs"),
+		strings.HasSuffix(base, "_tests.erl"),
+		strings.HasSuffix(base, "Tests.swift"),
+		strings.HasSuffix(base, "_test.zig"),
+		strings.HasSuffix(base, "_spec.rb"),
+		strings.HasSuffix(base, "Test.php"),
+		strings.HasPrefix(filepath.ToSlash(path), "testharness/"),
+		base == "vitest.config.ts",
+		base == "jest.config.cjs",
+		base == "pytest.ini":
+		return true
+	default:
+		return false
+	}
 }
 
 func (gt *GlobalTester) buildGoOverlay(_ context.Context) (string, func(), error) {

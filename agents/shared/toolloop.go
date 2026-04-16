@@ -417,6 +417,15 @@ func toolErrorDetail(err error) toolErrorDetailPayload {
 				"Use a simpler command, a dedicated higher-level tool, or a workspace mode that supports strict broker execution",
 			},
 		}
+	case executableNotFound(err):
+		return toolErrorDetailPayload{
+			Kind: "missing_executable",
+			Recovery: []string{
+				"Inspect the detected harness, generated command, and working directory before retrying",
+				"If the executable is a language or test tool, look for an available runtime or module-based invocation instead of repeating the same launcher",
+				"If the toolchain is actually missing, use the relevant research/install tooling path before retrying suite execution",
+			},
+		}
 	case errors.Is(err, commandapproval.ErrApprovalRequired):
 		return toolErrorDetailPayload{
 			Kind: "approval_required",
@@ -433,9 +442,13 @@ func toolErrorDetail(err error) toolErrorDetailPayload {
 				"If the task is blocked on the user's preference, explain the blockage and ask what they want to do instead",
 			},
 		}
-	default:
-		return toolErrorDetailPayload{}
 	}
+	return toolErrorDetailPayload{}
+}
+
+func executableNotFound(err error) bool {
+	var execErr *purevfs.ExecutableNotFoundError
+	return errors.As(err, &execErr)
 }
 
 func ToolRecoveryHint(toolName string, err error) string {

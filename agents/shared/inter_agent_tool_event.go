@@ -173,6 +173,38 @@ func DeriveInterAgentToolEvent(
 	}
 }
 
+func canonicalizeInterAgentToolName(toolName, fullArgs, output string, streamMetadata map[string]any) string {
+	toolName = strings.TrimSpace(toolName)
+	if toolName != "challenge_agent" {
+		return toolName
+	}
+	args := parseInterAgentJSONMap(fullArgs)
+	out := parseInterAgentJSONMap(output)
+	if interAgentProtocolScope(toolName, args, out, streamMetadata) != globalReviewNamespace {
+		return toolName
+	}
+	targets := interAgentChallengeTargets(toolName, args, out)
+	if len(targets) != 1 {
+		return toolName
+	}
+	target := firstKnownAgentInName(targets[0])
+	if target == "" {
+		target = normalizeAgentType(targets[0])
+	}
+	switch target {
+	case "tester":
+		return "challenge_global_tester"
+	case "architect":
+		return "challenge_architect"
+	case "orchestrator":
+		return "challenge_orchestrator"
+	case "inspector":
+		return "challenge_inspector"
+	default:
+		return toolName
+	}
+}
+
 func deriveInterAgentConsultStart(toolName string, args map[string]any) *InterAgentToolEvent {
 	targets := interAgentConsultationTargets(toolName, args)
 	if len(targets) == 0 {
@@ -256,7 +288,7 @@ func deriveInterAgentChallengeCompletion(toolName string, args, output map[strin
 		Kind:       InterAgentToolEventKindChallenge,
 		AgentTypes: normalizeAgentTypeList(targets),
 		Summary:    summary,
-		ThreadKey:  interAgentChallengeThreadKey(toolName, args, output),
+		ThreadKey:  interAgentChallengeThreadKey(toolName, args, output, nil),
 		Status:     status,
 	}
 }
@@ -480,13 +512,26 @@ func normalizePipelineChallengeAgentType(value string) string {
 	}
 }
 
-func interAgentChallengeThreadKey(toolName string, args, output map[string]any) string {
+func interAgentChallengeThreadKey(toolName string, args, output, streamMetadata map[string]any) string {
+	if explicit := firstNonEmptyInline(
+		stringFromAnyMap(output, "thread_key"),
+		stringFromAnyMap(args, "thread_key"),
+		stringFromAnyMap(streamMetadata, streamMetadataInterAgentThread),
+	); explicit != "" {
+		return explicit
+	}
 	challengeID := firstNonEmptyInline(
 		stringFromAnyMap(output, "challenge_id"),
 		stringFromAnyMap(args, "challenge_id"),
 	)
 	if challengeID == "" {
 		return ""
+	}
+	switch interAgentProtocolScope(toolName, args, output, streamMetadata) {
+	case globalReviewNamespace:
+		return globalReviewThreadPrefix + challengeID
+	case pipelineProtocolNamespace:
+		return pipelineThreadPrefix + challengeID
 	}
 	if toolName == "challenge_agent" {
 		return pipelineThreadPrefix + challengeID

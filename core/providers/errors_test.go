@@ -3,6 +3,7 @@ package providers
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -124,6 +125,35 @@ func TestParseError_AnthropicOverloaded529(t *testing.T) {
 	}
 	if pe.RetryAfter != 0 {
 		t.Fatalf("expected zero RetryAfter for bare 529, got %v", pe.RetryAfter)
+	}
+}
+
+type testConnResetNetError struct{}
+
+func (e *testConnResetNetError) Error() string {
+	return "read tcp 192.168.1.32:57205->172.64.155.209:443: read: connection reset by peer"
+}
+
+func (e *testConnResetNetError) Timeout() bool   { return false }
+func (e *testConnResetNetError) Temporary() bool { return false }
+
+var _ net.Error = (*testConnResetNetError)(nil)
+
+func TestParseError_NetConnectionResetRetryable(t *testing.T) {
+	pe := NewProviderError(ProviderTypeOpenAI, "stream", &testConnResetNetError{})
+	if !pe.Retryable {
+		t.Fatal("expected connection reset net.Error to be retryable")
+	}
+}
+
+func TestParseError_NetOpErrorRetryable(t *testing.T) {
+	pe := NewProviderError(ProviderTypeOpenAI, "stream", &net.OpError{
+		Op:  "read",
+		Net: "tcp",
+		Err: errors.New("socket failure"),
+	})
+	if !pe.Retryable {
+		t.Fatal("expected net.OpError to be retryable")
 	}
 }
 

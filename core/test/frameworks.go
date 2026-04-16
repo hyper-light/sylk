@@ -142,10 +142,10 @@ func pytestFramework() *TestFrameworkDefinition {
 		ID:               FrameworkPytest,
 		Name:             "pytest",
 		Language:         "python",
-		RunCommand:       "pytest",
-		RunFileCommand:   "pytest {file}",
-		RunSingleCommand: "pytest {file}::{test}",
-		CoverageCommand:  "pytest --cov",
+		RunCommand:       "python -m pytest",
+		RunFileCommand:   "python -m pytest {file}",
+		RunSingleCommand: "python -m pytest {file}::{test}",
+		CoverageCommand:  "python -m pytest --cov",
 		WatchCommand:     "ptw",
 		TestFilePatterns: []string{"test_*.py", "*_test.py"},
 		ConfigFiles:      []string{"pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"},
@@ -470,16 +470,20 @@ func nodeTestEnabled(projectDir string) bool {
 	return detect.Which("node") != "" && detect.FileExists(projectDir, "package.json")
 }
 
+func pythonInterpreterAvailable() bool {
+	return detect.Which("python") != "" || detect.Which("python3") != ""
+}
+
 func pytestEnabled(projectDir string) bool {
-	if detect.Which("pytest") == "" {
+	if !pythonInterpreterAvailable() {
 		return false
 	}
 	ok, _ := detect.HasPythonDependency(projectDir, "pytest")
-	return ok || detect.FileExists(projectDir, "pytest.ini")
+	return ok || detect.FileExists(projectDir, "pytest.ini", "tox.ini")
 }
 
 func pythonUnitTestEnabled(projectDir string) bool {
-	if detect.Which("python") == "" && detect.Which("python3") == "" {
+	if !pythonInterpreterAvailable() {
 		return false
 	}
 	if !dirExists(projectDir, "tests", "test") {

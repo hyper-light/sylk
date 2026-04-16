@@ -215,3 +215,32 @@ func TestNormalizeInterAgentToolEventForEmit_PipelineChallengeCanonicalizesTeste
 		t.Fatalf("agent types = %#v, want [tester-pipeline]", got)
 	}
 }
+
+func TestCanonicalizeInterAgentToolName_GlobalReviewChallengeTargetsTester(t *testing.T) {
+	got := canonicalizeInterAgentToolName(
+		"challenge_agent",
+		`{"target_agents":["tester"],"request":"Audit the merged state.","protocol_scope":"global_review"}`,
+		"",
+		map[string]any{"agent_type": "inspector"},
+	)
+	if got != "challenge_global_tester" {
+		t.Fatalf("tool name = %q, want %q", got, "challenge_global_tester")
+	}
+}
+
+func TestDeriveInterAgentToolEvent_GenericGlobalReviewChallengeUsesGlobalThreadKey(t *testing.T) {
+	challenge := DeriveInterAgentToolEvent(
+		"challenge_agent",
+		`{"target_agents":["tester"],"request":"Audit the merged state.","protocol_scope":"global_review","thread_key":"global_review:global-review-123"}`,
+		`{"selected":true,"target_agents":["tester"],"challenge_id":"global-review-123","protocol_scope":"global_review","thread_key":"global_review:global-review-123"}`,
+		ToolCallComplete,
+		true,
+		"",
+	)
+	if challenge == nil {
+		t.Fatal("expected global-review challenge metadata")
+	}
+	if got := challenge.ThreadKey; got != "global_review:global-review-123" {
+		t.Fatalf("challenge thread key = %q, want %q", got, "global_review:global-review-123")
+	}
+}

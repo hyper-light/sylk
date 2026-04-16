@@ -627,6 +627,19 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 		AgentID:     pi.id,
 		SessionID:   fwd.SessionID,
 	})
+	allowedHandoff := agentShared.AutomaticHandoffAllowedForForwardedRequest(fwd)
+	ctx = agentShared.WithAutomaticHandoffEnabled(ctx, allowedHandoff)
+	ctx = handoff.WithTransportRetryHandoff(ctx, handoff.TransportRetryHandoffConfig{
+		Enabled:       allowedHandoff,
+		Bridge:        agentShared.EffectiveHandoffBridge(ctx, pi.handoffBridge),
+		AgentID:       pi.id,
+		AgentType:     "inspector-pipeline",
+		UserRequest:   fwd.Input,
+		CorrelationID: fwd.CorrelationID,
+		SessionID:     fwd.SessionID,
+		EventLogger:   pi.steering.EventLogger(),
+		Scribe:        pi.agentPod,
+	})
 	protocolTask := decodePipelineTask(fwd.Input)
 	ctx = agentShared.WithPipelineTaskProtocolState(ctx, protocolTask)
 	defer agentShared.ClosePipelineProtocolState(ctx)
@@ -634,9 +647,13 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	toolEmitter := agentShared.NewToolCallEmitter(pi.bus, pi.channels, pi.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentShared.WithToolCallEmitter(ctx, toolEmitter)
 	gov := agentShared.NewContextGovernor(pi.config.Model, pi.config.MaxTokens, 0)
-	if pi.handoffBridge != nil {
+	if pi.handoffBridge != nil && agentShared.AutomaticHandoffEnabled(ctx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
-			return pi.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+			bridge := agentShared.EffectiveHandoffBridge(bctx, pi.handoffBridge)
+			if bridge == nil {
+				return agentShared.ErrContextBudgetExhausted
+			}
+			return bridge.ForceHandoff(bctx, "context budget exhausted")
 		}
 	}
 	ctx = agentShared.WithContextGovernor(ctx, gov)

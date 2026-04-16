@@ -536,10 +536,27 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		AgentID:     d.id,
 		SessionID:   fwd.SessionID,
 	})
+	allowedHandoff := shared.AutomaticHandoffAllowedForForwardedRequest(fwd)
+	ctx = shared.WithAutomaticHandoffEnabled(ctx, allowedHandoff)
+	ctx = handoff.WithTransportRetryHandoff(ctx, handoff.TransportRetryHandoffConfig{
+		Enabled:       allowedHandoff,
+		Bridge:        shared.EffectiveHandoffBridge(ctx, d.handoffBridge),
+		AgentID:       d.id,
+		AgentType:     "designer",
+		UserRequest:   fwd.Input,
+		CorrelationID: fwd.CorrelationID,
+		SessionID:     fwd.SessionID,
+		EventLogger:   d.steering.EventLogger(),
+		Scribe:        d.agentPod,
+	})
 	gov := shared.NewContextGovernor(d.config.DesignerConfig.Model, d.config.DesignerConfig.MaxTokens, 0)
-	if d.handoffBridge != nil {
+	if d.handoffBridge != nil && shared.AutomaticHandoffEnabled(ctx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
-			return d.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+			bridge := shared.EffectiveHandoffBridge(bctx, d.handoffBridge)
+			if bridge == nil {
+				return shared.ErrContextBudgetExhausted
+			}
+			return bridge.ForceHandoff(bctx, "context budget exhausted")
 		}
 	}
 	ctx = shared.WithContextGovernor(ctx, gov)

@@ -12,6 +12,27 @@ import (
 
 const executionToolchainRoot = "/.sylk/toolchain/bin"
 
+type ExecutableNotFoundError struct {
+	Executable string
+	Aliases    []string
+}
+
+func (e *ExecutableNotFoundError) Error() string {
+	name := strings.TrimSpace(e.Executable)
+	if name == "" {
+		name = "<unknown>"
+	}
+	tried := append([]string{name}, e.Aliases...)
+	if len(tried) == 1 {
+		return fmt.Sprintf("executable %q not found in strict execution PATH", name)
+	}
+	return fmt.Sprintf("executable %q not found in strict execution PATH (tried: %s)", name, strings.Join(tried, ", "))
+}
+
+func (e *ExecutableNotFoundError) Is(target error) bool {
+	return target == fs.ErrNotExist
+}
+
 type mountedExecutionRoot interface {
 	Root() string
 	Close() error
@@ -271,10 +292,37 @@ func resolveHostExecutionExecutable(plan ExecutionPlan, env map[string]string, m
 	if looksLikeExecPath(trimmed) {
 		return translateExecutionArgument(plan, mountRoot, trimmed), nil
 	}
-	if resolved, ok := lookupExecutionPath(trimmed, env); ok {
-		return resolved, nil
+	candidates := executionLookupCandidates(plan, trimmed)
+	for _, candidate := range candidates {
+		if resolved, ok := lookupExecutionPath(candidate, env); ok {
+			return resolved, nil
+		}
 	}
-	return "", fs.ErrNotExist
+	return "", &ExecutableNotFoundError{
+		Executable: trimmed,
+		Aliases:    append([]string(nil), candidates[1:]...),
+	}
+}
+
+func executionLookupCandidates(plan ExecutionPlan, executable string) []string {
+	trimmed := strings.TrimSpace(executable)
+	if trimmed == "" {
+		return nil
+	}
+	candidates := []string{trimmed}
+	seen := map[string]struct{}{trimmed: {}}
+	for _, alias := range plan.Cell.ExecutableAliases[trimmed] {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		if _, ok := seen[alias]; ok {
+			continue
+		}
+		seen[alias] = struct{}{}
+		candidates = append(candidates, alias)
+	}
+	return candidates
 }
 
 func translateExecutionArgument(plan ExecutionPlan, mountRoot, value string) string {
