@@ -937,3 +937,44 @@ func TestParseSGRMouseEvent(t *testing.T) {
 		})
 	}
 }
+
+func TestParseX10MouseEvent_InvalidInputReturnsUnknown(t *testing.T) {
+	tt := []struct {
+		name string
+		buf  []byte
+	}{
+		{name: "nil", buf: nil},
+		{name: "short", buf: []byte("\x1b[M@A")},
+		{name: "wrong prefix", buf: []byte("abc123")},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseX10MouseEvent(tc.buf)
+			if got.Type != MouseUnknown {
+				t.Fatalf("Type = %v, want %v", got.Type, MouseUnknown)
+			}
+		})
+	}
+}
+
+func TestParseSGRMouseEvent_InvalidInputReturnsUnknown(t *testing.T) {
+	tt := []struct {
+		name string
+		buf  []byte
+	}{
+		{name: "nil", buf: nil},
+		{name: "short", buf: []byte("\x1b[<")},
+		{name: "malformed", buf: []byte("\x1b[<oops")},
+		{name: "wrong prefix", buf: []byte("\x1b[M1;2;3M")},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseSGRMouseEvent(tc.buf)
+			if got.Type != MouseUnknown {
+				t.Fatalf("Type = %v, want %v", got.Type, MouseUnknown)
+			}
+		})
+	}
+}

@@ -45,7 +45,11 @@
       "Bash(GOFLAGS=-mod=mod go env:*)",
       "Bash(go get:*)",
       "Bash(GIT_TERMINAL_PROMPT=0 git --no-pager log --oneline -30 main 2>&1)",
-      "Bash(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND=\"ssh -o ConnectTimeout=1\" git --no-optional-locks log --oneline -30 main 2>&1)"
+      "Bash(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND=\"ssh -o ConnectTimeout=1\" git --no-optional-locks log --oneline -30 main 2>&1)",
+      "Bash(env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go build ./...)",
+      "Bash(awk '$1 > 500')",
+      "Bash(env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go vet ./...)",
+      "Bash(awk '/^func /{start=NR; name=$0} /^}$/{if \\(start && NR-start > 100\\) print FILENAME\":\"start\": \"NR-start\" lines: \"name; start=0}' agents/guide/guide.go agents/architect/architect.go agents/orchestrator/orchestrator.go agents/archivalist/archivalist.go agents/engineer/engineer.go)"
     ]
   }
 }

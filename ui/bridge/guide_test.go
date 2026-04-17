@@ -1401,6 +1401,45 @@ func TestMergeStreamMetadata_TopLevelTransferClearsNestedBranch(t *testing.T) {
 	}
 }
 
+func TestMergeStreamMetadata_NestedBranchClearsInheritedTopLevelTransfer(t *testing.T) {
+	merged := mergeStreamMetadata(
+		map[string]any{
+			"agent_type":                 "inspector",
+			"chat_top_level_transfer":    true,
+			"chat_parent_correlation_id": "corr-top-level-parent",
+		},
+		map[string]any{
+			"chat_nested_branch":          true,
+			"chat_parent_correlation_id":  "corr-nested-parent",
+			"chat_parent_tool_call_key":   "consult-1",
+			"chat_inter_agent_thread_key": "thread-1",
+			"chat_inter_agent_kind":       "consult",
+		},
+	)
+
+	if merged == nil {
+		t.Fatal("expected merged metadata")
+	}
+	if got, _ := merged["chat_nested_branch"].(bool); !got {
+		t.Fatalf("chat_nested_branch = %#v, want true", merged["chat_nested_branch"])
+	}
+	if got, _ := merged["chat_parent_correlation_id"].(string); got != "corr-nested-parent" {
+		t.Fatalf("chat_parent_correlation_id = %q, want corr-nested-parent", got)
+	}
+	if got, _ := merged["chat_parent_tool_call_key"].(string); got != "consult-1" {
+		t.Fatalf("chat_parent_tool_call_key = %q, want consult-1", got)
+	}
+	if got, _ := merged["chat_inter_agent_thread_key"].(string); got != "thread-1" {
+		t.Fatalf("chat_inter_agent_thread_key = %q, want thread-1", got)
+	}
+	if got, _ := merged["chat_inter_agent_kind"].(string); got != "consult" {
+		t.Fatalf("chat_inter_agent_kind = %q, want consult", got)
+	}
+	if _, exists := merged["chat_top_level_transfer"]; exists {
+		t.Fatalf("chat_top_level_transfer = %#v, want absent", merged["chat_top_level_transfer"])
+	}
+}
+
 func TestParseInterAgentBranchRefFromMetadata_TopLevelTransferWins(t *testing.T) {
 	ref := parseInterAgentBranchRefFromMetadata(map[string]any{
 		"chat_nested_branch":         true,

@@ -81,6 +81,40 @@ func TestVFSFileAccess_WriteFileWidensSparseWorkspaceHierarchy(t *testing.T) {
 	}
 }
 
+func TestReadFileToolResult_AllowsSessionPlanArtifactsOutsideSparseWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	allowed := filepath.Join(dir, "allowed.go")
+	planPath := filepath.Join(dir, ".sylk", "sessions", "sess-1", "plans", "plan_v1.0.md")
+	if err := os.MkdirAll(filepath.Dir(planPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(planPath, []byte("# Plan\n\nhello"), 0o644); err != nil {
+		t.Fatalf("WriteFile plan: %v", err)
+	}
+
+	vfs := NewPipelineVFS(VFSConfig{
+		PipelineID:   "pipe1",
+		SessionID:    "sess-1",
+		WorkingDir:   dir,
+		AllowedPaths: []string{allowed},
+	}, nil, nil)
+	defer vfs.Close()
+	vfs.SeedFile(allowed, []byte("package main"))
+
+	fa := NewVFSFileAccess(vfs, dir)
+	result, err := ReadFileToolResult(context.Background(), fa, planPath, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadFileToolResult: %v", err)
+	}
+	if got, _ := result["kind"].(string); got != "file" {
+		t.Fatalf("kind = %q, want file", got)
+	}
+	content, _ := result["content"].(string)
+	if content != "# Plan\n\nhello" {
+		t.Fatalf("content = %q, want %q", content, "# Plan\n\nhello")
+	}
+}
+
 func TestVFSFileAccess_MkdirAllWidensSparseWorkspaceHierarchy(t *testing.T) {
 	dir := t.TempDir()
 	allowed := filepath.Join(dir, "allowed.go")

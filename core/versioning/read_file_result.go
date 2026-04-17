@@ -2,6 +2,9 @@ package versioning
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -22,6 +25,9 @@ func ReadFileToolResult(ctx context.Context, fa FileAccess, path string, offset,
 
 	content, err := fa.ReadFile(ctx, path)
 	if err != nil {
+		if fallback, ok := readSessionPlanArtifactFromDisk(path, err); ok {
+			return readFileContentResult(path, string(fallback), offset, limit), nil
+		}
 		return nil, err
 	}
 	return readFileContentResult(path, string(content), offset, limit), nil
@@ -96,4 +102,49 @@ func readFileDirectoryResult(ctx context.Context, fa FileAccess, path string) (m
 		"entry_count":       len(entries),
 		"truncated_entries": truncated,
 	}, nil
+}
+
+// Sparse/global VFS layers intentionally hide most `.sylk` state from normal
+// workspace reads, but agents still need to inspect published architect plan
+// artifacts when the workflow explicitly references them.
+func readSessionPlanArtifactFromDisk(path string, readErr error) ([]byte, bool) {
+	if !sessionPlanArtifactFallbackAllowed(path, readErr) {
+		return nil, false
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	return content, true
+}
+
+func sessionPlanArtifactFallbackAllowed(path string, readErr error) bool {
+	if !isSessionPlanArtifactPath(path) {
+		return false
+	}
+	if readErr == nil {
+		return true
+	}
+	return errors.Is(readErr, ErrPathOutsideBounds) ||
+		errors.Is(readErr, ErrPermissionDenied) ||
+		errors.Is(readErr, ErrFileNotFound) ||
+		errors.Is(readErr, os.ErrNotExist)
+}
+
+func isSessionPlanArtifactPath(path string) bool {
+	cleaned := filepath.ToSlash(filepath.Clean(strings.TrimSpace(path)))
+	if cleaned == "" || cleaned == "." {
+		return false
+	}
+	if !(strings.HasPrefix(cleaned, ".sylk/sessions/") || strings.Contains(cleaned, "/.sylk/sessions/")) {
+		return false
+	}
+	switch {
+	case strings.HasSuffix(cleaned, ".md") && strings.Contains(cleaned, "/plans/"):
+		return true
+	case strings.HasSuffix(cleaned, ".json") && strings.Contains(cleaned, "/agents/architect/plans/"):
+		return true
+	default:
+		return false
+	}
 }

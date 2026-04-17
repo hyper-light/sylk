@@ -170,16 +170,27 @@ const (
 //
 // https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Extended-coordinates
 func parseSGRMouseEvent(buf []byte) MouseEvent {
+	if len(buf) < 4 || buf[0] != '\x1b' || buf[1] != '[' || buf[2] != '<' {
+		return invalidMouseEvent()
+	}
 	str := string(buf[3:])
 	matches := mouseSGRRegex.FindStringSubmatch(str)
 	if len(matches) != 5 { //nolint:mnd
-		// Unreachable, we already checked the regex in `detectOneMsg`.
-		panic("invalid mouse event")
+		return invalidMouseEvent()
 	}
 
-	b, _ := strconv.Atoi(matches[1])
-	px := matches[2]
-	py := matches[3]
+	b, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return invalidMouseEvent()
+	}
+	px, err := strconv.Atoi(matches[2])
+	if err != nil {
+		return invalidMouseEvent()
+	}
+	py, err := strconv.Atoi(matches[3])
+	if err != nil {
+		return invalidMouseEvent()
+	}
 	release := matches[4] == "m"
 	m := parseMouseButton(b, true)
 
@@ -190,12 +201,9 @@ func parseSGRMouseEvent(buf []byte) MouseEvent {
 		m.Type = MouseRelease
 	}
 
-	x, _ := strconv.Atoi(px)
-	y, _ := strconv.Atoi(py)
-
 	// (1,1) is the upper left. We subtract 1 to normalize it to (0,0).
-	m.X = x - 1
-	m.Y = y - 1
+	m.X = px - 1
+	m.Y = py - 1
 
 	return m
 }
@@ -212,7 +220,11 @@ const x10MouseByteOffset = 32
 //
 // See: http://www.xfree86.org/current/ctlseqs.html#Mouse%20Tracking
 func parseX10MouseEvent(buf []byte) MouseEvent {
-	v := buf[3:6]
+	const mouseEventX10Len = 6
+	if len(buf) < mouseEventX10Len || buf[0] != '\x1b' || buf[1] != '[' || buf[2] != 'M' {
+		return invalidMouseEvent()
+	}
+	v := buf[3:mouseEventX10Len]
 	m := parseMouseButton(int(v[0]), false)
 
 	// (1,1) is the upper left. We subtract 1 to normalize it to (0,0).
@@ -220,6 +232,10 @@ func parseX10MouseEvent(buf []byte) MouseEvent {
 	m.Y = int(v[2]) - x10MouseByteOffset - 1
 
 	return m
+}
+
+func invalidMouseEvent() MouseEvent {
+	return MouseEvent{Type: MouseUnknown}
 }
 
 // See: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Extended-coordinates

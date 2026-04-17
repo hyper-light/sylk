@@ -264,6 +264,82 @@ func TestHandleResponseMessage_RelaysAncestorVisibleMetadataToTUI(t *testing.T) 
 	}
 }
 
+func TestHandleResponseMessage_NestedBranchOverridesAncestorTopLevelTransfer(t *testing.T) {
+	g, tuiOut := newResponseTestGuide(t)
+	rootCID := g.pending.Add(&RouteRequest{
+		CorrelationID: "corr-top-level-root",
+		Input:         "review root",
+		SourceAgentID: "orchestrator",
+		TargetAgentID: "inspector",
+		SessionID:     "test-session",
+		Metadata: map[string]any{
+			metadataVisibleTarget:        "tui",
+			"chat_top_level_transfer":    true,
+			"chat_parent_correlation_id": "corr-orchestrator-parent",
+		},
+	}, nil, "inspector")
+	childCID := g.pending.Add(&RouteRequest{
+		CorrelationID:       "corr-top-level-child",
+		ParentCorrelationID: rootCID,
+		Input:               "consult archivalist",
+		SourceAgentID:       "inspector",
+		TargetAgentID:       "archivalist",
+		SessionID:           "test-session",
+		Metadata: map[string]any{
+			"chat_nested_branch":          true,
+			"chat_parent_correlation_id":  rootCID,
+			"chat_parent_tool_call_key":   "consult-archivalist-1",
+			"chat_inter_agent_kind":       "consult",
+			"chat_inter_agent_thread_key": "thread-archivalist-1",
+		},
+	}, nil, "archivalist")
+
+	if err := g.handleResponseMessage(&Message{
+		ID:            "msg-top-level-child-stream",
+		CorrelationID: childCID,
+		Type:          MessageTypeStream,
+		SourceAgentID: "archivalist",
+		Payload: &StreamResponse{
+			CorrelationID:     childCID,
+			RespondingAgentID: "archivalist",
+			Event: &StreamEvent{
+				Type:      StreamEventStart,
+				Timestamp: time.Now(),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("handleResponseMessage: %v", err)
+	}
+
+	select {
+	case forwarded := <-tuiOut:
+		stream, ok := forwarded.GetStreamResponse()
+		if !ok || stream == nil {
+			t.Fatalf("unexpected forwarded message: %+v", forwarded)
+		}
+		if got := stream.Metadata["chat_parent_correlation_id"]; got != rootCID {
+			t.Fatalf("parent correlation metadata = %#v, want %s", got, rootCID)
+		}
+		if got := stream.Metadata["chat_parent_tool_call_key"]; got != "consult-archivalist-1" {
+			t.Fatalf("parent tool call metadata = %#v, want consult-archivalist-1", got)
+		}
+		if got := stream.Metadata["chat_inter_agent_kind"]; got != "consult" {
+			t.Fatalf("inter-agent kind metadata = %#v, want consult", got)
+		}
+		if got := stream.Metadata["chat_inter_agent_thread_key"]; got != "thread-archivalist-1" {
+			t.Fatalf("inter-agent thread metadata = %#v, want thread-archivalist-1", got)
+		}
+		if got, _ := stream.Metadata["chat_nested_branch"].(bool); !got {
+			t.Fatalf("chat_nested_branch = %#v, want true", stream.Metadata["chat_nested_branch"])
+		}
+		if got, _ := stream.Metadata["chat_top_level_transfer"].(bool); got {
+			t.Fatalf("chat_top_level_transfer = %#v, want absent/false", stream.Metadata["chat_top_level_transfer"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for relayed child stream start")
+	}
+}
+
 func TestRelayedNonGuideStreamMetadataUsesResponderIdentity(t *testing.T) {
 	g, out := newResponseTestGuide(t)
 	setPendingRouteWithTargetAndMetadata(g, "corr-architect-stream", "architect", map[string]any{

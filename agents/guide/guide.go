@@ -4773,6 +4773,7 @@ func mergeMetadata(base, overlay map[string]any) map[string]any {
 	if merged == nil {
 		merged = make(map[string]any, len(overlay))
 	}
+	applyExclusiveChatTransferOverlay(merged, overlay)
 	for key, value := range overlay {
 		if !metadataValueCarriesContinuity(value) {
 			if _, exists := merged[key]; exists {
@@ -4784,6 +4785,21 @@ func mergeMetadata(base, overlay map[string]any) map[string]any {
 	}
 	merged = normalizeExclusiveChatTransferMetadata(merged)
 	return merged
+}
+
+func applyExclusiveChatTransferOverlay(merged, overlay map[string]any) {
+	if len(merged) == 0 || len(overlay) == 0 {
+		return
+	}
+	if metadataBoolean(overlay, metadataNestedBranch) {
+		delete(merged, "chat_top_level_transfer")
+	}
+	if metadataBoolean(overlay, "chat_top_level_transfer") {
+		delete(merged, metadataNestedBranch)
+		delete(merged, "chat_parent_tool_call_key")
+		delete(merged, "chat_inter_agent_thread_key")
+		delete(merged, metadataInterAgentKind)
+	}
 }
 
 func normalizeExclusiveChatTransferMetadata(metadata map[string]any) map[string]any {

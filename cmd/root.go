@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"fmt"
+
+	"github.com/adalundhe/sylk/prompts"
 	"github.com/spf13/cobra"
 )
 
@@ -14,5 +17,8 @@ var rootCmd = &cobra.Command{
 }
 
 func Execute() error {
+	if err := prompts.Validate(); err != nil {
+		return fmt.Errorf("embedded prompt initialization failed: %w", err)
+	}
 	return rootCmd.Execute()
 }

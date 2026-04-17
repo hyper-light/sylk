@@ -1144,6 +1144,7 @@ func mergeStreamMetadata(base, overlay map[string]any) map[string]any {
 	if merged == nil {
 		merged = make(map[string]any, len(overlay))
 	}
+	applyExclusiveChatTransferOverlay(merged, overlay)
 	for key, value := range overlay {
 		if !streamMetadataValueCarriesIdentity(value) {
 			if _, exists := merged[key]; exists {
@@ -1158,6 +1159,21 @@ func mergeStreamMetadata(base, overlay map[string]any) map[string]any {
 		return nil
 	}
 	return merged
+}
+
+func applyExclusiveChatTransferOverlay(merged, overlay map[string]any) {
+	if len(merged) == 0 || len(overlay) == 0 {
+		return
+	}
+	if metadataBool(overlay, streamMetadataNestedBranch) {
+		delete(merged, streamMetadataTopLevelTransfer)
+	}
+	if metadataBool(overlay, streamMetadataTopLevelTransfer) {
+		delete(merged, streamMetadataNestedBranch)
+		delete(merged, streamMetadataParentToolCallKey)
+		delete(merged, streamMetadataInterAgentThread)
+		delete(merged, streamMetadataInterAgentKind)
+	}
 }
 
 func normalizeExclusiveChatTransferMetadata(metadata map[string]any) map[string]any {
