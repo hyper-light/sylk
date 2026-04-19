@@ -128,6 +128,13 @@ type Config struct {
 	// Canonical agent ID. If empty, defaults to "architect".
 	ID string
 
+	// SessionID is the canonical session this architect instance is bound
+	// to at construction time. Used to scope on-disk state (control DB,
+	// plan store) under .sylk/sessions/{SessionID}/agents/architect/.
+	// Empty defaults to the bootstrap default session ID ("default") so
+	// existing callers that don't set it still land in the right place.
+	SessionID string
+
 	// System prompt configuration
 	SystemPrompt    string // Optional, uses DefaultSystemPrompt if empty
 	MaxOutputTokens int    // Optional, uses DefaultMaxOutputTokens if 0
@@ -363,7 +370,11 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 	}
 	ownedControlStore := false
 	if cfg.ControlStore == nil {
-		controlPath := filepath.Join(cfg.WorkingDirectory, ".sylk", "state", "architect.db")
+		sid := strings.TrimSpace(cfg.SessionID)
+		if sid == "" {
+			sid = "default"
+		}
+		controlPath := filepath.Join(cfg.WorkingDirectory, ".sylk", "sessions", sid, "agents", "architect", "architect.db")
 		if err := os.MkdirAll(filepath.Dir(controlPath), 0o755); err != nil {
 			return nil, fmt.Errorf("create architect state directory: %w", err)
 		}

@@ -1908,7 +1908,7 @@ func testerWorkspaceWritesAllowed(fa versioning.FileAccess) bool {
 	if fa == nil || fa.IsReadOnly() {
 		return false
 	}
-	switch fa.(type) {
+	switch versioning.Underlying(fa).(type) {
 	case *versioning.DiskFileAccess:
 		return false
 	default:

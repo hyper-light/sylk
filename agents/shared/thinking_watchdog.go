@@ -246,6 +246,7 @@ func CompleteWithWatchdog(
 	// this one; the next transition (tool_executing or composing_response)
 	// supersedes this one in turn.
 	publishAgentStateFromWatchdog(ctx, displayName, guide.AgentStateReasoning, "")
+	LogLLMCallStartedFromContext(ctx, req)
 	start := time.Now()
 	if shouldLiveStreamTurn(ctx) {
 		if sp, ok := p.(streamingCompletionProvider); ok {
@@ -362,6 +363,7 @@ func completeStreamingWithWatchdog(
 			if pp != nil && !suppressThoughtProgress {
 				if thought := emitter.AddDelta(chunk.Text); thought != "" {
 					pp.Publish(thought)
+					LogThinkingChunk(ctx, thought)
 				}
 			}
 		}
@@ -383,6 +385,7 @@ func completeStreamingWithWatchdog(
 	if pp != nil && !suppressThoughtProgress {
 		if thought := emitter.Flush(); thought != "" {
 			pp.Publish(thought)
+			LogThinkingChunk(ctx, thought)
 		}
 	}
 	if streamErr != nil {

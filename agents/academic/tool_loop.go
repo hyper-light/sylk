@@ -788,6 +788,7 @@ func (a *Academic) streamLLMTurn(
 			}
 			if thought := emitter.AddDelta(chunk.Text); thought != "" {
 				a.publishThoughtProgress(ctx, thought)
+				shared.LogThinkingChunk(ctx, thought)
 			}
 		}
 	})
@@ -803,6 +804,7 @@ func (a *Academic) streamLLMTurn(
 	}
 	if thought := emitter.Flush(); thought != "" {
 		a.publishThoughtProgress(ctx, thought)
+		shared.LogThinkingChunk(ctx, thought)
 	}
 	resp := collector.Response()
 	if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {

@@ -80,6 +80,7 @@ func (c *LLMClassifier) Classify(ctx context.Context, input string) (*Classifica
 		SessionID: "",
 	})
 
+	logClassifierLLMCallStarted(c.eventLogger, req)
 	completeStart := time.Now()
 	guideFileLog().Info("DEBUG: classifier_complete_start",
 		"model", c.model,
@@ -181,6 +182,32 @@ func classifierResponseLen(resp *providers.Response) int {
 		return 0
 	}
 	return len(resp.Content)
+}
+
+// logClassifierLLMCallStarted records the dispatch of an LLM call from the
+// Guide's classifier or self-response, paired with logClassifierLLMCall at
+// completion. Captures model, message count, and tools-offered count so
+// hung calls remain observable in the WAL until the response (or an error)
+// arrives.
+func logClassifierLLMCallStarted(el *agentlog.SessionEventLogger, req *providers.Request) {
+	if el == nil || req == nil {
+		return
+	}
+	el.LogWALJSON(agentlog.EventLLMRequestSent, &agentlog.LLMPayload{
+		Model: req.Model,
+	})
+	el.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     "info",
+		Agent:     "guide",
+		Event:     "llm_call_started",
+		EventCode: agentlog.EventLLMRequestSent,
+		Data: map[string]any{
+			"model":          req.Model,
+			"messages_count": len(req.Messages),
+			"tools_offered":  len(req.Tools),
+		},
+	})
 }
 
 // logClassifierLLMCall records an LLM call from the Guide's classifier.

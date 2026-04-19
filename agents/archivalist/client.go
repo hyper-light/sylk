@@ -135,7 +135,10 @@ func (c *Client) generate(ctx context.Context, prompt string, sourceIDs []string
 	}
 	c.applyGenerationRuntimeProfile(req)
 
+	agentshared.LogLLMCallStartedFromContext(ctx, req)
+	llmStart := time.Now()
 	resp, err := provider.Complete(ctx, req)
+	agentshared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(llmStart), err)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate summary: %w", err)
 	}

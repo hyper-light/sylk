@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/adalundhe/sylk/core/manifest"
 )
@@ -57,6 +58,15 @@ func TestDecisionManifest_DeclareThenQueryReturnsTheValue(t *testing.T) {
 		t.Fatalf("first declaration should have no conflict, got %+v", declared.Conflict)
 	}
 
+	// Production semantics: the tentative-alive Ristretto gate is
+	// eventually-consistent. A test asserting same-process
+	// read-your-writes must explicitly drain the cache flush before
+	// querying — production agents that need this guarantee call the
+	// SQLite path directly through manifest.Query semantics, not the
+	// gate. See TestDecisionManifest_TentativeHiddenUntilCacheVisible
+	// for the negative case that documents the contract.
+	store.tentativeAlive.Wait()
+
 	q, err := store.Query(ctx, "sess-1", manifest.QueryDecisionsInput{
 		Domain: "test_framework",
 		Scope: manifest.Scope{
@@ -70,6 +80,161 @@ func TestDecisionManifest_DeclareThenQueryReturnsTheValue(t *testing.T) {
 	if q.Winner == nil || q.Winner.Value != "pytest" {
 		t.Fatalf("Winner = %+v, want pytest", q.Winner)
 	}
+}
+
+// TestDecisionManifest_TentativeHiddenUntilCacheVisible documents the
+// non-happy-path contract: a Tentative declaration is filtered out of
+// Query results until its Ristretto gate entry is visible. This is the
+// production cache-cold race, exercised explicitly so a future
+// "optimization" that re-introduces tentativeAlive.Wait() in markTentativeAlive
+// (and the synchronous-contention bug it caused under bursty load) is
+// caught by an existing test, not by a production incident.
+//
+// The contract: cross-pipeline visibility is eventually-consistent;
+// callers that need read-your-writes within a single agent's loop must
+// drain the cache themselves (test-side) or query SQLite directly
+// (production-side) — never block the Declare path.
+func TestDecisionManifest_TentativeHiddenUntilCacheVisible(t *testing.T) {
+	store := newManifestTestStore(t)
+	ctx := context.Background()
+	author := manifest.AgentRef{AgentID: "tester-pipeline-1", AgentType: "tester-pipeline"}
+
+	manifest.RegisterDomain(manifest.DomainSpec{
+		Name:                  "build_backend",
+		RecommendedDimensions: []manifest.Dimension{manifest.DimensionLanguage},
+		Compatibility: func(a, b string) manifest.Compatibility {
+			return manifest.CompatibilityIncompatible
+		},
+		ResolutionPolicy: manifest.ResolvePolicySpecificityFirstMover,
+	})
+
+	declared, err := store.Declare(ctx, "sess-cold", author, manifest.DeclareDecisionInput{
+		Domain:     "build_backend",
+		Scope:      manifest.Scope{manifest.DimensionLanguage: "python"},
+		Value:      "hatchling",
+		Confidence: manifest.ConfidenceTentative,
+		Evidence:   []string{"pyproject.toml"},
+	})
+	if err != nil {
+		t.Fatalf("Declare: %v", err)
+	}
+
+	// Forcibly clear the gate to simulate the cache-cold window
+	// (production: cache flush hasn't run yet; under bursty load it
+	// may take several ms before SetWithTTL becomes visible).
+	store.tentativeAlive.Del(declared.Decision.ID)
+	store.tentativeAlive.Wait()
+
+	// Production behavior: with the gate clear, the Tentative row
+	// must be filtered out of Query results — that's the safety
+	// property that prevents stale Tentative entries from leaking
+	// into peer pipelines after their author abandons them.
+	q, err := store.Query(ctx, "sess-cold", manifest.QueryDecisionsInput{
+		Domain: "build_backend",
+		Scope:  manifest.Scope{manifest.DimensionLanguage: "python"},
+	})
+	if err != nil {
+		t.Fatalf("Query during cache-cold window: %v", err)
+	}
+	if q.Winner != nil {
+		t.Fatalf("Tentative entry must be hidden when cache gate is cold; got Winner=%+v", q.Winner)
+	}
+	if len(q.Matches) != 0 {
+		t.Fatalf("Tentative entry must not appear in AllMatching when cache gate is cold; got %d", len(q.Matches))
+	}
+
+	// Restore the gate (simulating the cache flush completing) and
+	// re-query — the row should now be visible.
+	store.markTentativeAlive(declared.Decision.ID)
+	store.tentativeAlive.Wait()
+
+	q, err = store.Query(ctx, "sess-cold", manifest.QueryDecisionsInput{
+		Domain: "build_backend",
+		Scope:  manifest.Scope{manifest.DimensionLanguage: "python"},
+	})
+	if err != nil {
+		t.Fatalf("Query after gate restored: %v", err)
+	}
+	if q.Winner == nil || q.Winner.Value != "hatchling" {
+		t.Fatalf("Winner after gate restored: %+v, want hatchling", q.Winner)
+	}
+}
+
+// TestDecisionManifest_DeclareIsNonBlocking documents the related
+// invariant: markTentativeAlive must NOT call tentativeAlive.Wait()
+// inline. The earlier defect was a synchronous Wait inside
+// markTentativeAlive that serialized cross-pipeline declares behind one
+// another's cache flushes, producing the kind of long-tail latency that
+// looks like a hang. We assert the property by measuring that ten
+// rapid declares complete well under the time it would take if each
+// one waited on a 50ms-ish flush worker — i.e., they overlap rather
+// than serialize.
+//
+// If a future refactor re-introduces an in-Declare Wait, this test
+// stops being subsecond and flags the regression before production
+// agents hit it.
+func TestDecisionManifest_DeclareIsNonBlocking(t *testing.T) {
+	store := newManifestTestStore(t)
+	ctx := context.Background()
+	author := manifest.AgentRef{AgentID: "tester-pipeline-1", AgentType: "tester-pipeline"}
+
+	manifest.RegisterDomain(manifest.DomainSpec{
+		Name:                  "module_layout",
+		RecommendedDimensions: []manifest.Dimension{manifest.DimensionPath},
+		Compatibility: func(a, b string) manifest.Compatibility {
+			if a == b {
+				return manifest.CompatibilityEquivalent
+			}
+			return manifest.CompatibilityIncompatible
+		},
+		ResolutionPolicy: manifest.ResolvePolicySpecificityFirstMover,
+	})
+
+	const declares = 10
+	deadline := 500 * time.Millisecond
+	start := time.Now()
+	for i := 0; i < declares; i++ {
+		_, err := store.Declare(ctx, "sess-burst", author, manifest.DeclareDecisionInput{
+			Domain: "module_layout",
+			Scope: manifest.Scope{
+				manifest.DimensionPath: filepath.Join("services", "burst", strconvItoa(i)) + "/",
+			},
+			Value:      "src-layout",
+			Confidence: manifest.ConfidenceTentative,
+		})
+		if err != nil {
+			t.Fatalf("Declare iter %d: %v", i, err)
+		}
+	}
+	elapsed := time.Since(start)
+	if elapsed > deadline {
+		t.Fatalf("rapid Declare burst took %s (deadline %s); markTentativeAlive may be calling Wait inline again", elapsed, deadline)
+	}
+}
+
+// strconvItoa avoids the strconv import in the test file by inlining.
+func strconvItoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	const digits = "0123456789"
+	var buf [20]byte
+	n := 0
+	if i < 0 {
+		buf[n] = '-'
+		n++
+		i = -i
+	}
+	start := n
+	for ; i > 0; i /= 10 {
+		buf[n] = digits[i%10]
+		n++
+	}
+	// reverse the digit slice
+	for l, r := start, n-1; l < r; l, r = l+1, r-1 {
+		buf[l], buf[r] = buf[r], buf[l]
+	}
+	return string(buf[:n])
 }
 
 // TestDecisionManifest_TwoTestersConvergeOnSameValue mirrors the screenshot
@@ -188,6 +353,14 @@ func TestDecisionManifest_TwoTestersIncompatibleValuesProduceConflict(t *testing
 	if declB.Decision.Confidence != manifest.ConfidenceTentative {
 		t.Fatalf("B confidence = %s, want forced-back to tentative on incompatibility", declB.Decision.Confidence)
 	}
+
+	// Drain the Ristretto Set buffer so the just-marked Tentative
+	// entries are visible to the immediately-following Query. See
+	// TestDecisionManifest_DeclareThenQueryReturnsTheValue for the
+	// rationale — production agents that need read-your-writes drain
+	// the buffer themselves; the lint test for the contract lives in
+	// TestDecisionManifest_DeclareIsNonBlocking.
+	store.tentativeAlive.Wait()
 
 	// Query: the first-mover (A) wins the resolution because of policy.
 	q, err := store.Query(ctx, "sess-clash", manifest.QueryDecisionsInput{

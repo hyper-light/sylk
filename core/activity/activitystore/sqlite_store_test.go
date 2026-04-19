@@ -1,4 +1,4 @@
-package activity
+package activitystore
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/database"
 )
 
@@ -27,10 +28,10 @@ func openTestStore(t *testing.T) *SQLiteStore {
 
 func sampleActivity(kind ActionKind, sessionID, path string) AgentActivity {
 	return AgentActivity{
-		ID:         NewActivityID(),
+		ID:         activity.NewActivityID(),
 		SessionID:  SessionID(sessionID),
 		Timestamp:  time.Now(),
-		Resolution: ResolutionFor(kind),
+		Resolution: activity.ResolutionFor(kind),
 		Actor: Actor{
 			AgentID:    "test-agent-1",
 			AgentType:  "tester-pipeline",
@@ -38,7 +39,7 @@ func sampleActivity(kind ActionKind, sessionID, path string) AgentActivity {
 		},
 		Action:  kind,
 		Subject: Subject{PathPrefix: path, Domain: "test_framework"},
-		State:   StatePoint,
+		State:   activity.StatePoint,
 	}
 }
 

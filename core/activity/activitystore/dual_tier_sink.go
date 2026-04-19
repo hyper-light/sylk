@@ -1,4 +1,4 @@
-package activity
+package activitystore
 
 import (
 	"context"
@@ -6,6 +6,14 @@ import (
 	"time"
 
 	"github.com/dgraph-io/ristretto"
+
+	"github.com/adalundhe/sylk/core/activity"
+)
+
+// Resolution constants re-exported for tier comparisons in this file.
+const (
+	resolutionAtomic = activity.ResolutionAtomic
+	resolutionFine   = activity.ResolutionFine
 )
 
 // DualTierSink fans every emitted activity into the appropriate tiers:
@@ -123,7 +131,7 @@ func (s *DualTierSink) Append(ctx context.Context, a AgentActivity) {
 	}
 
 	// Atomic + Fine into the rolling ring buffer.
-	if s.ring != nil && (a.Resolution == ResolutionAtomic || a.Resolution == ResolutionFine) {
+	if s.ring != nil && (a.Resolution == resolutionAtomic || a.Resolution == resolutionFine) {
 		s.ring.append(a)
 	}
 

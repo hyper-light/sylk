@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -778,11 +779,48 @@ func PublishAgentState(
 	// they call WithStreamContext, so this is a no-op outside a streaming
 	// context.
 	recordAgentStateTransition(ctx, state)
+	logAgentStateTransitionToWAL(ctx, payload)
 	return PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
 		Type:      guide.StreamEventAgentState,
 		Data:      payload,
 		Timestamp: time.Now(),
 	})
+}
+
+// logAgentStateTransitionToWAL mirrors every PublishAgentState call into
+// the agent's WAL/JSONL log so the durable history reflects the same
+// state machine the chat activity indicator drives. Without this hook
+// the only authoritative state record is in transient bus traffic — once
+// the process exits there is no way to reconstruct what each agent was
+// doing during a session. No-op when ctx lacks a SessionEventLogger.
+func logAgentStateTransitionToWAL(ctx context.Context, payload *guide.AgentStateEvent) {
+	if payload == nil {
+		return
+	}
+	lm := LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	data := map[string]any{
+		"state":         string(payload.State),
+		"agent_id":      payload.AgentID,
+		"agent_type":    payload.AgentType,
+		"transition_id": payload.TransitionID,
+	}
+	if payload.Detail != "" {
+		data["detail"] = payload.Detail
+	}
+	if payload.PeerAgentType != "" {
+		data["peer_agent_type"] = payload.PeerAgentType
+	}
+	if payload.PeerCorrelationID != "" {
+		data["peer_correlation_id"] = payload.PeerCorrelationID
+	}
+	if payload.CorrelationID != "" {
+		data["stream_correlation_id"] = payload.CorrelationID
+	}
+	LogAgentEvent(lm.EventLogger, agentlog.EventAgentStateTransition,
+		lm.AgentID, lm.SessionID, lm.CorrID, "info", data)
 }
 
 // agentStateTransitionCounter is a process-wide monotonic counter used to

@@ -326,7 +326,7 @@ func (r restrictedFileAccess) allowsWrites() bool {
 	if !r.profile.AllowsFileWrites() {
 		return false
 	}
-	if _, ok := r.delegate.(*versioning.DiskFileAccess); ok {
+	if _, ok := versioning.Underlying(r.delegate).(*versioning.DiskFileAccess); ok {
 		switch r.profile.FileScope {
 		case FileScopeGlobalReadWrite, FileScopePipelineReadWrite:
 			return false

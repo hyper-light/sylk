@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,8 @@ import (
 	"github.com/uptrace/bun/driver/sqliteshim"
 	modernsqlite "modernc.org/sqlite"
 	modernsqlite3 "modernc.org/sqlite/lib"
+
+	"github.com/adalundhe/sylk/core/activity"
 )
 
 // BunSQLiteConfig configures a shared Bun-backed SQLite database handle.
@@ -341,6 +344,13 @@ func (db *BunSQLiteDB) Begin() (*sql.Tx, error) {
 
 // RunInWriteTx serializes SQLite write transactions and retries on busy/locked
 // failures so callers can safely compose multi-statement mutations.
+//
+// Activity Fabric chokepoint: every successful transaction emits one
+// store_write_committed activity (Fine resolution) carrying store
+// identity and retry attempt count. Failed transactions emit
+// store_write_failed (also Fine). The activity store's own writes
+// bypass this path via SQLDB().ExecContext to avoid recursive
+// emission.
 func (db *BunSQLiteDB) RunInWriteTx(
 	ctx context.Context,
 	fn func(context.Context, bun.Tx) error,
@@ -352,6 +362,13 @@ func (db *BunSQLiteDB) RunInWriteTx(
 		ctx = context.Background()
 	}
 
+	span := activity.StartSpan(ctx, activity.ActionStoreWriteCommitted, activity.Subject{
+		TargetArtifact: filepath.Base(db.path),
+	})
+	span.SetAttribute("store_path", db.path)
+	defer func() { span.End() }()
+	ctx = span.Context()
+
 	attempts := db.config.WriteRetryMax + 1
 	if attempts < 1 {
 		attempts = 1
@@ -362,6 +379,7 @@ func (db *BunSQLiteDB) RunInWriteTx(
 	}
 
 	var lastErr error
+	retries := 0
 	for attempt := 1; attempt <= attempts; attempt++ {
 		db.writeMu.Lock()
 		err := db.bunDB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
@@ -369,21 +387,29 @@ func (db *BunSQLiteDB) RunInWriteTx(
 		})
 		db.writeMu.Unlock()
 		if err == nil {
+			span.SetAttribute("retries", retries)
 			return nil
 		}
 		lastErr = err
+		retries++
 		if ctx.Err() != nil || !IsSQLiteBusy(err) || attempt == attempts {
+			span.SetAttribute("retries", retries-1)
+			span.EndWithError(err)
 			return err
 		}
 		timer := time.NewTimer(backoff * time.Duration(1<<(attempt-1)))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			span.SetAttribute("retries", retries-1)
+			span.EndWithError(ctx.Err())
 			return ctx.Err()
 		case <-timer.C:
 		}
 	}
 
+	span.SetAttribute("retries", retries-1)
+	span.EndWithError(lastErr)
 	return lastErr
 }
 

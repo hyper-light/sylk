@@ -1,4 +1,9 @@
-package activity
+// Package activitystore is the durable persistence + tiered-sink
+// implementation for the Activity Fabric. Split from the leaf-level
+// core/activity package so that core/database (and other chokepoints)
+// can depend on core/activity for the span helper without pulling in
+// BunSQLite. See docs/FABRIC.md.
+package activitystore
 
 import (
 	"context"
@@ -11,7 +16,43 @@ import (
 
 	"github.com/uptrace/bun"
 
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/database"
+)
+
+// Re-exported aliases so callers that previously imported only the
+// activity package (now-renamed activitystore) keep their type names.
+type (
+	AgentActivity = activity.AgentActivity
+	ActivityID    = activity.ActivityID
+	SessionID     = activity.SessionID
+	ActionKind    = activity.ActionKind
+	ActivityState = activity.ActivityState
+	Resolution    = activity.Resolution
+	Confidence    = activity.Confidence
+	Subject       = activity.Subject
+	Actor         = activity.Actor
+	EvidenceRef   = activity.EvidenceRef
+	QueryFilter   = activity.QueryFilter
+	Sink          = activity.Sink
+	Source        = activity.Source
+)
+
+// Action kind aliases used across this package.
+const (
+	ActionDecisionDeclared  = activity.ActionDecisionDeclared
+	ActionDecisionPromoted  = activity.ActionDecisionPromoted
+	ActionFileRead          = activity.ActionFileRead
+	ActionChallengeEmitted  = activity.ActionChallengeEmitted
+	ActionChallengeResponse = activity.ActionChallengeResponse
+)
+
+// Sink helpers re-exported.
+var (
+	SetDefaultSink       = activity.SetDefaultSink
+	StartSpan            = activity.StartSpan
+	EnsureFabricContext  = activity.EnsureFabricContext
+	NewActivityID        = activity.NewActivityID
 )
 
 // SQLiteSchema is the DDL for the agent_activity table. Append-only,

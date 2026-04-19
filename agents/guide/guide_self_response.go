@@ -203,6 +203,7 @@ func (r *GuideResponder) completeTurn(
 		}
 	}
 
+	logClassifierLLMCallStarted(r.eventLogger, req)
 	turnStart := time.Now()
 	resp, err := r.provider.Complete(ctx, req)
 	logClassifierLLMCall(r.eventLogger, r.model, resp, time.Since(turnStart), err)

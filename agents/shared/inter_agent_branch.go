@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/google/uuid"
 )
 
@@ -114,6 +115,7 @@ func BeginInterAgentBranch(ctx context.Context, spec InterAgentBranchSpec) (cont
 	}); err != nil {
 		logMissingToolCallID(ctx, "inter_agent_branch_start", toolName, err)
 	}
+	logInterAgentDispatchStart(ctx, toolCallKey, kind, targets, threadKey, summary, startedAt)
 
 	return ctx, InterAgentBranchHandle{
 		branch: InterAgentBranchMetadata{
@@ -268,6 +270,7 @@ func (h InterAgentBranchHandle) Complete(ctx context.Context, summary, output st
 		ThreadKey:  strings.TrimSpace(h.branch.ThreadKey),
 		Status:     status,
 	}
+	duration := time.Since(h.startedAt)
 	if emitErr := EmitToolCall(ctx, ToolCallEvent{
 		ToolCallKey: h.toolCallKey,
 		ToolName:    h.toolName,
@@ -277,12 +280,69 @@ func (h InterAgentBranchHandle) Complete(ctx context.Context, summary, output st
 		ErrorMsg:    errorMsg,
 		Phase:       ToolCallComplete,
 		StartedAt:   h.startedAt,
-		Duration:    time.Since(h.startedAt),
+		Duration:    duration,
 		Success:     success,
 		InterAgent:  interAgent,
 	}); emitErr != nil {
 		logMissingToolCallID(ctx, "inter_agent_branch_complete", h.toolName, emitErr)
 	}
+	logInterAgentDispatchComplete(ctx, h.toolCallKey, interAgent.Kind, interAgent.AgentTypes, output, duration, success, errorMsg)
+}
+
+// logInterAgentDispatchStart writes an inter_agent_dispatch_started event
+// to the parent agent's WAL/JSONL log, paired with the completion event
+// emitted from InterAgentBranchHandle.Complete. The pre-existing
+// EventConsultationSent path covers architect/engineer consultations
+// only; this hook generalizes the dispatch lifecycle to every kind
+// (consult, challenge, store, approval) routed through the canonical
+// branch helper. No-op when ctx lacks a SessionEventLogger.
+func logInterAgentDispatchStart(ctx context.Context, branchKey, kind string, targets []string, threadKey, summary string, startedAt time.Time) {
+	lm := LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	data := map[string]any{
+		"branch_key": branchKey,
+		"kind":       kind,
+		"targets":    append([]string(nil), targets...),
+		"started_at": startedAt.UnixNano(),
+	}
+	if threadKey != "" {
+		data["thread_key"] = threadKey
+	}
+	if summary != "" {
+		data["summary"] = summary
+	}
+	LogAgentEvent(lm.EventLogger, agentlog.EventInterAgentDispatchStarted,
+		lm.AgentID, lm.SessionID, lm.CorrID, "info", data)
+}
+
+// logInterAgentDispatchComplete pairs with logInterAgentDispatchStart.
+// Captures duration, success, output size, and error so the WAL has
+// closed-loop dispatch records (vs. the prior open-loop signal where
+// only the start half was visible until the response arrived).
+func logInterAgentDispatchComplete(ctx context.Context, branchKey, kind string, targets []string, output string, duration time.Duration, success bool, errorMsg string) {
+	lm := LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	data := map[string]any{
+		"branch_key":  branchKey,
+		"kind":        kind,
+		"targets":     append([]string(nil), targets...),
+		"duration_ms": duration.Milliseconds(),
+		"output_size": len(output),
+		"success":     success,
+	}
+	if errorMsg != "" {
+		data["error"] = errorMsg
+	}
+	level := "info"
+	if !success {
+		level = "warn"
+	}
+	LogAgentEvent(lm.EventLogger, agentlog.EventInterAgentDispatchCompleted,
+		lm.AgentID, lm.SessionID, lm.CorrID, level, data)
 }
 
 func (h InterAgentBranchHandle) summary() string {

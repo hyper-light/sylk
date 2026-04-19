@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -837,6 +838,7 @@ func (s *ToolCallSession) Start(call providers.ToolCall, startedAt time.Time, st
 	}); err != nil {
 		logMissingToolCallID(s.ctx, "session_start", call.Name, err)
 	}
+	logToolCallSessionStart(s.ctx, s.toolCallKey, emittedToolName, argsSummary, startedAt)
 	return true
 }
 
@@ -904,8 +906,62 @@ func (s *ToolCallSession) completeInternal(call providers.ToolCall, output strin
 	}); err != nil {
 		logMissingToolCallID(s.ctx, "session_complete", call.Name, err)
 	}
+	logToolCallSessionComplete(s.ctx, s.toolCallKey, emittedToolName, argsSummary, outputStr, duration, success, errorMsg)
 	releaseToolCallSession(s.ctx, s.toolCallKey)
 	return true
+}
+
+// logToolCallSessionStart writes a tool_call_started event to both the
+// agent's binary WAL and JSONL log. No-op when the context lacks a
+// SessionEventLogger (boot-time emissions, ad-hoc tests). Single-point
+// instrumentation: every agent that uses TimedToolCall (which is all of
+// them) gets WAL coverage without per-agent wiring.
+func logToolCallSessionStart(ctx context.Context, callKey, toolName, argsSummary string, startedAt time.Time) {
+	lm := LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	payload := map[string]any{
+		"tool_call_id": callKey,
+		"tool_name":    toolName,
+		"args_summary": argsSummary,
+		"started_at":   startedAt.UnixNano(),
+	}
+	LogAgentEvent(lm.EventLogger, agentlog.EventToolCallStarted, lm.AgentID, lm.SessionID, lm.CorrID, "info", payload)
+}
+
+// logToolCallSessionComplete writes a tool_call_completed event with
+// duration, success, output size, and error (if any). Mirrors the UI
+// completion event into the durable log so the WAL has paired
+// start/end records for every tool invocation.
+func logToolCallSessionComplete(
+	ctx context.Context,
+	callKey, toolName, argsSummary, output string,
+	duration time.Duration,
+	success bool,
+	errorMsg string,
+) {
+	lm := LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	payload := map[string]any{
+		"tool_call_id": callKey,
+		"tool_name":    toolName,
+		"args_summary": argsSummary,
+		"output_size":  len(output),
+		"duration_ms":  duration.Milliseconds(),
+		"success":      success,
+	}
+	if errorMsg != "" {
+		payload["error"] = errorMsg
+	}
+	level := "info"
+	eventType := agentlog.EventToolCallCompleted
+	if !success {
+		level = "warn"
+	}
+	LogAgentEvent(lm.EventLogger, eventType, lm.AgentID, lm.SessionID, lm.CorrID, level, payload)
 }
 
 // StartedAt returns the captured start time so streaming preannouncers can

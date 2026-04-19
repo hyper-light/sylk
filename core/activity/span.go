@@ -254,14 +254,21 @@ func pairedStartKind(kind ActionKind) (ActionKind, bool) {
 // End for kinds that have distinct start/end ActionKinds. Kinds whose
 // emission is point-shaped (a single activity at completion) return
 // false here.
+//
+// ActionBusMessageEmitted is intentionally point-shaped here even
+// though ActionBusMessageDelivered exists as a related kind — the
+// production ChannelBus.Publish path delivers synchronously to every
+// subscriber in the same call, so a single emit-at-end captures the
+// full operation. ActionBusMessageDelivered is reserved for *future*
+// async-handler instrumentation (when delivery completes after the
+// publisher has returned, e.g., in a queued handler) and is not
+// emitted by the Publish chokepoint itself.
 func pairedEndKind(kind ActionKind) (ActionKind, bool) {
 	switch kind {
 	case ActionLLMRequestEmitted:
 		return ActionLLMResponseCompleted, true
 	case ActionToolCallStarted:
 		return ActionToolCallCompleted, true
-	case ActionBusMessageEmitted:
-		return ActionBusMessageDelivered, true
 	case ActionGoroutineStarted:
 		return ActionGoroutineStopped, true
 	case ActionClaimAcquired:

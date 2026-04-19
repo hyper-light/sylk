@@ -193,6 +193,7 @@ func (a *Archivalist) streamLLMTurn(
 			if pp != nil {
 				if thought := emitter.AddDelta(chunk.Text); thought != "" {
 					pp.Publish(thought)
+					shared.LogThinkingChunk(ctx, thought)
 				}
 			}
 		}
@@ -210,6 +211,7 @@ func (a *Archivalist) streamLLMTurn(
 	if pp != nil {
 		if thought := emitter.Flush(); thought != "" {
 			pp.Publish(thought)
+			shared.LogThinkingChunk(ctx, thought)
 		}
 	}
 	if streamErr != nil {

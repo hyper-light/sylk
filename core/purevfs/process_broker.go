@@ -45,7 +45,11 @@ type readOnlyExecutionFS struct {
 }
 
 func DefaultExecutionBroker() ExecutionBroker {
-	return &nativeExecutionBroker{}
+	// Wrap with Activity Fabric chokepoint instrumentation so every
+	// brokered command emits a command_executed activity. The wrapper
+	// is transparent — UnderlyingBroker peels it off for capability
+	// type-assertions.
+	return InstrumentBroker(&nativeExecutionBroker{})
 }
 
 func ReadOnlyExecutionFS(base ExecutionFS) ExecutionFS {

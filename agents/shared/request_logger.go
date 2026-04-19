@@ -54,6 +54,28 @@ func LogAgentEvent(
 	})
 }
 
+// LogLLMCallStartedFromContext records the moment an LLM call is dispatched
+// to the provider — paired with LogLLMCallFromContext at completion. Without
+// this start record, hung or long-running LLM calls produce no observable
+// trace in the WAL until they return (or never do). Captures the model
+// name, message count, and tools-offered count so the JSONL log shows the
+// shape of the request that may be stuck. No-op when ctx lacks LogMeta.
+func LogLLMCallStartedFromContext(ctx context.Context, req *providers.Request) {
+	if req == nil {
+		return
+	}
+	m := LogMetaFromContext(ctx)
+	if m.EventLogger == nil {
+		return
+	}
+	payload := map[string]any{
+		"model":          req.Model,
+		"messages_count": len(req.Messages),
+		"tools_offered":  len(req.Tools),
+	}
+	LogAgentEvent(m.EventLogger, agentlog.EventLLMRequestSent, m.AgentID, m.SessionID, m.CorrID, "info", payload)
+}
+
 // LogLLMCallFromContext extracts LogMeta from context and records an LLM call.
 func LogLLMCallFromContext(ctx context.Context, model string, resp *providers.Response, dur time.Duration, err error) {
 	m := LogMetaFromContext(ctx)
@@ -420,6 +442,29 @@ func LogInfo(el *agentlog.SessionEventLogger, agentID, sessionID, corrID, msg st
 		CorrID:    corrID,
 		Data:      data,
 	})
+}
+
+// LogThinkingChunk records a sampled thinking-stream chunk to the agent's
+// WAL/JSONL log. The caller is expected to have already throttled emission
+// (typically via ThoughtEmitter, which only returns non-empty at sentence
+// boundaries) so this fires at most once per logical sentence rather than
+// per provider chunk. Captures byte size and a short preview so the WAL
+// shows liveness without recording the full content. No-op when ctx
+// lacks LogMeta.
+func LogThinkingChunk(ctx context.Context, chunk string) {
+	if chunk == "" {
+		return
+	}
+	m := LogMetaFromContext(ctx)
+	if m.EventLogger == nil {
+		return
+	}
+	LogAgentEvent(m.EventLogger, agentlog.EventLLMStreamChunk,
+		m.AgentID, m.SessionID, m.CorrID, "info",
+		map[string]any{
+			"thinking_size": len(chunk),
+			"preview":       truncate(chunk, 240),
+		})
 }
 
 // LogStatusUpdate records an agent status change.

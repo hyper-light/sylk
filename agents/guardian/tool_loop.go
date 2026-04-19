@@ -96,6 +96,7 @@ func (g *Guardian) executeToolLoop(
 			return "", usageAcc.Total(), err
 		}
 
+		shared.LogLLMCallStartedFromContext(ctx, req)
 		turnStart := time.Now()
 		resp, err := g.streamToolLoopTurn(ctx, provider, req, onChunk)
 		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
@@ -184,6 +185,7 @@ func (g *Guardian) streamToolLoopTurn(
 			if llmruntime.EmitsThoughts(req) {
 				if thought := emitter.AddDelta(chunk.Text); thought != "" {
 					g.publishThoughtProgress(ctx, correlationID, thought)
+					shared.LogThinkingChunk(ctx, thought)
 				}
 			}
 		}
@@ -201,6 +203,7 @@ func (g *Guardian) streamToolLoopTurn(
 	}
 	if thought := emitter.Flush(); thought != "" {
 		g.publishThoughtProgress(ctx, correlationID, thought)
+		shared.LogThinkingChunk(ctx, thought)
 	}
 	if streamErr != nil {
 		return nil, streamErr

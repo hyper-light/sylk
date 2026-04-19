@@ -23,9 +23,25 @@ const (
 	EventLLMRequestSent      EventType = 0x0020
 	EventLLMResponseReceived EventType = 0x0021
 	EventLLMError            EventType = 0x0022
+	EventLLMStreamChunk      EventType = 0x0023
 	EventSkillInvoked        EventType = 0x0030
 	EventSkillCompleted      EventType = 0x0031
 	EventSkillFailed         EventType = 0x0032
+	// EventToolCallStarted fires when a tool invocation begins. Paired
+	// with EventToolCallCompleted (or the per-tool EventTool* family) at
+	// completion. Emitted by the canonical ToolCallSession lifecycle so
+	// every agent benefits without per-agent wiring.
+	EventToolCallStarted   EventType = 0x0033
+	EventToolCallCompleted EventType = 0x0034
+	// EventInterAgentDispatchStarted/Completed pair frames an outbound
+	// peer dispatch (consult/challenge/store/approval) so the WAL has
+	// both the start and end of every cross-agent call.
+	EventInterAgentDispatchStarted   EventType = 0x0035
+	EventInterAgentDispatchCompleted EventType = 0x0036
+	// EventAgentStateTransition captures explicit agent state changes
+	// (receiving / reasoning / tool_executing / consulting_peer / ...)
+	// previously published only to the activity bus.
+	EventAgentStateTransition EventType = 0x0037
 )
 
 // Guide events (0x0100–0x01FF) — routing.wal.
@@ -299,9 +315,15 @@ func init() {
 	eventNames[EventLLMRequestSent] = "LLMRequestSent"
 	eventNames[EventLLMResponseReceived] = "LLMResponseReceived"
 	eventNames[EventLLMError] = "LLMError"
+	eventNames[EventLLMStreamChunk] = "LLMStreamChunk"
 	eventNames[EventSkillInvoked] = "SkillInvoked"
 	eventNames[EventSkillCompleted] = "SkillCompleted"
 	eventNames[EventSkillFailed] = "SkillFailed"
+	eventNames[EventToolCallStarted] = "ToolCallStarted"
+	eventNames[EventToolCallCompleted] = "ToolCallCompleted"
+	eventNames[EventInterAgentDispatchStarted] = "InterAgentDispatchStarted"
+	eventNames[EventInterAgentDispatchCompleted] = "InterAgentDispatchCompleted"
+	eventNames[EventAgentStateTransition] = "AgentStateTransition"
 
 	// Guide
 	eventNames[EventRouteClassified] = "RouteClassified"

@@ -183,7 +183,10 @@ func (o *Orchestrator) generateIngestionSummary(
 	defer cancel()
 	llmCtx = providers.WithRetryObserver(llmCtx, o.retryObserver())
 
+	shared.LogLLMCallStartedFromContext(llmCtx, llmReq)
+	llmStart := time.Now()
 	resp, err := o.provider.Complete(llmCtx, llmReq)
+	shared.LogLLMCallFromContext(llmCtx, llmReq.Model, resp, time.Since(llmStart), err)
 	if err != nil {
 		return nil, fmt.Errorf("ingestion summary LLM: %w", err)
 	}

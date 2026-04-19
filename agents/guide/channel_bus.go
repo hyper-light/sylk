@@ -167,7 +167,17 @@ func NewChannelBus(cfg ChannelBusConfig) *ChannelBus {
 }
 
 func (b *ChannelBus) Publish(topic string, msg *Message) error {
+	// Activity Fabric chokepoint: every cross-agent message emits one
+	// bus_message_emitted activity (Medium resolution) carrying topic,
+	// correlation chain, source/target. Causal context is read from
+	// context.Context where available; for now the publisher chokepoint
+	// uses Background — the message itself carries CorrelationID for
+	// causal stitching.
+	span := publishSpan(topic, msg)
+	defer func() { span.End() }()
+
 	if b.closed.Load() {
+		span.EndWithError(ErrBusClosed)
 		return ErrBusClosed
 	}
 	// SCH-02: routing middleware rejects messages that have already missed
@@ -175,13 +185,17 @@ func (b *ChannelBus) Publish(topic string, msg *Message) error {
 	// it on its reply channel; downstream subscribers aren't even charged
 	// for the delivery attempt.
 	if msg != nil && msg.IsExpired() {
-		return newExpiredMessageError(topic, msg)
+		err := newExpiredMessageError(topic, msg)
+		span.EndWithError(err)
+		return err
 	}
 
 	// Exact-match subscribers.
+	totalSubs := 0
 	topicSubs, ok := b.subscriptions.Get(topic)
 	if ok && topicSubs != nil {
 		subs := b.snapshotSubscribers(topicSubs)
+		totalSubs = len(subs)
 
 		// Diagnostic: log subscriber state for stream-complete events.
 		if b.isStreamComplete(msg) {
@@ -196,6 +210,7 @@ func (b *ChannelBus) Publish(topic string, msg *Message) error {
 
 		b.publishToSubscribers(subs, msg)
 	}
+	span.SetAttribute("subscriber_count", totalSubs)
 
 	// Wildcard-match subscribers.
 	b.publishToWildcardMatches(topic, msg)

@@ -226,6 +226,16 @@ func (s *DecisionManifestStore) Declare(ctx context.Context, sessionID string, a
 
 // markTentativeAlive records a Tentative decision ID in the live cache
 // with the standard TTL. No-op when the cache is unavailable (test stubs).
+//
+// Deliberately does NOT call tentativeAlive.Wait(). An earlier revision
+// did, and it created a synchronous-contention bug under bursty load
+// — the Wait blocked the Declare path on the cache's flush worker,
+// which under contention serialized cross-pipeline declares behind one
+// another. The production semantics are intentionally
+// eventually-consistent for cross-process visibility; agents that need
+// read-your-writes within their own loop must Query against SQLite
+// directly (the row is already committed) rather than relying on the
+// cache gate.
 func (s *DecisionManifestStore) markTentativeAlive(id string) {
 	if s == nil || s.tentativeAlive == nil || strings.TrimSpace(id) == "" {
 		return

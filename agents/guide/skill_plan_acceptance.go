@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -134,7 +135,10 @@ func (g *Guide) evaluatePlanAcceptance(ctx context.Context, input planAcceptance
 	}
 	g.applyPlanAcceptanceRuntimeProfile(req)
 
+	logClassifierLLMCallStarted(g.eventLogger, req)
+	llmStart := time.Now()
 	resp, err := provider.Complete(ctx, req)
+	logClassifierLLMCall(g.eventLogger, req.Model, resp, time.Since(llmStart), err)
 	if err != nil {
 		return nil, fmt.Errorf("plan acceptance classification: %w", err)
 	}

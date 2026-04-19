@@ -154,6 +154,7 @@ func (a *Architect) executeToolLoop(
 			"turn", turn,
 			"loop_elapsed", time.Since(loopStart).String(),
 			"ctx_deadline", contextDeadlineString(ctx))
+		shared.LogLLMCallStartedFromContext(ctx, req)
 		turnStart := time.Now()
 		resp, err := planner.CompleteForToolLoop(ctx, req, stage, onChunk)
 		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
