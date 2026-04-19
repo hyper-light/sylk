@@ -116,11 +116,10 @@ func (s *DualTierSink) Append(ctx context.Context, a AgentActivity) {
 	// walks see the activity even if it's still in the durable
 	// write-back pipeline.
 	if s.recent != nil {
-		// Cost is approximate — counted in bytes (payload + subject +
-		// chain JSON). A flat 1 KiB estimate is good enough for
-		// in-process bounding; precise per-activity sizing is not
-		// worth the marshalling cost here.
-		s.recent.SetWithTTL(string(a.ID), a, 1024, ristretto.NoExpiration)
+		// Cost is approximate — counted in bytes. A flat 1 KiB
+		// estimate is good enough for in-process bounding; precise
+		// per-activity sizing is not worth the marshalling cost.
+		s.recent.Set(string(a.ID), a, 1024)
 	}
 
 	// Atomic + Fine into the rolling ring buffer.
@@ -152,8 +151,10 @@ func (s *DualTierSink) GetActivity(ctx context.Context, id ActivityID) (*AgentAc
 		return nil, nil
 	}
 	if s.recent != nil {
-		if a, ok := s.recent.Get(string(id)); ok {
-			return &a, nil
+		if raw, ok := s.recent.Get(string(id)); ok {
+			if a, ok := raw.(AgentActivity); ok {
+				return &a, nil
+			}
 		}
 	}
 	if s.durable != nil {

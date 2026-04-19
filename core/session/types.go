@@ -100,7 +100,16 @@ func (s stateSet) has(state State) bool {
 
 // Config holds configuration for creating a new session
 type Config struct {
-	// Name is a human-readable name for the session
+	// ID is the canonical session identifier used for storage paths,
+	// agent routing, and registry lookups. When empty, NewSession mints
+	// a UUID. Set explicitly when the runtime session must align with a
+	// pre-existing storage-layer ID (e.g. the bootstrap "default"
+	// session matches .sylk/sessions/default/).
+	ID string
+
+	// Name is the human-readable display label. Independent of ID — the
+	// user may rename a session at any time via Session.SetName without
+	// changing its canonical ID.
 	Name string
 
 	// Description provides additional context about the session
@@ -125,7 +134,10 @@ type Config struct {
 	PersistencePath string
 }
 
-// DefaultConfig returns a Config with sensible defaults
+// DefaultConfig returns a Config with sensible defaults. ID is left
+// empty so each Create mints a fresh UUID; callers that need to align
+// the runtime ID with a pre-existing storage-layer ID (e.g. the
+// bootstrap "default" session) should set Config.ID explicitly.
 func DefaultConfig() Config {
 	return Config{
 		Name:               "default",
@@ -135,6 +147,16 @@ func DefaultConfig() Config {
 		PersistenceEnabled: true,
 		PersistencePath:    ".sylk/sessions",
 	}
+}
+
+// BootstrapDefaultConfig returns the Config used to mint the system's
+// default session at startup. The ID "default" intentionally matches
+// the storage-layer default session created by SylkDir at
+// .sylk/sessions/default/ — runtime and disk converge on the same key.
+func BootstrapDefaultConfig() Config {
+	cfg := DefaultConfig()
+	cfg.ID = "default"
+	return cfg
 }
 
 // =============================================================================

@@ -469,7 +469,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	// on-demand — receives a non-nil Factory; there is no late-bind
 	// path. If session.Manager.Create fails, the whole bootstrap
 	// fails loud rather than silently leaving Factory nil.
-	defaultSession, err := phase1.sessionMgr.Create(ctx, session.DefaultConfig())
+	defaultSession, err := phase1.sessionMgr.Create(ctx, session.BootstrapDefaultConfig())
 	if err != nil {
 		return phase1, fmt.Errorf("create default session: %w", err)
 	}

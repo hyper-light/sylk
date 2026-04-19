@@ -1,81 +1,25 @@
-// Cross-pipeline decision-coherence gate enforced just-in-time at
-// test-authoring time. Without this gate, the prompt teaches the
-// query-first / declare-second contract but nothing forces the LLM to
-// actually follow it — which is exactly how the parallel-pipeline
-// "pytest vs unittest" bug arises.
+// Helpers used by Tier 4 auto-publish. The original
+// requireTestFrameworkDecision JIT gate is gone — see docs/FABRIC.md
+// "no-gates, auto-publish, ambient awareness." Cross-pipeline coherence
+// is now enforced by the manifest auto-publish hook on
+// detect_test_harness + write_test plus the ambient_context envelope on
+// every tool result; never by blocking the agent's primary work.
 package pipeline
 
 import (
-	"context"
-	"fmt"
 	"path/filepath"
 	"strings"
 
-	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/manifest"
 )
 
-// requireTestFrameworkDecision blocks write_test until the manifest holds
-// a winning test_framework decision for the relevant scope. This is the
-// just-in-time enforcement of the cross-pipeline coherence contract: the
-// prompt teaches the LLM to query/declare; this gate guarantees it.
-//
-// The error message is precise enough to drive the next LLM iteration
-// without ambiguity: it names the missing scope dimensions and the
-// adopt/declare guidance, so the model's next turn fixes the omission
-// rather than thrashing.
-//
-// Returns nil when the gate is satisfied. Returns a non-nil error that
-// the write_test handler propagates to the LLM as a structured tool
-// failure when the gate refuses.
-func (pt *PipelineTester) requireTestFrameworkDecision(ctx context.Context, outputPath string) error {
-	client := pt.decisionManifestClient()
-	if !client.IsConfigured() {
-		// Test/dev environments without a live orchestrator manifest:
-		// degrade gracefully. Production wiring always configures the
-		// client; this only fires under fixtures that don't spin up the
-		// orchestrator bus and would otherwise be unable to exercise
-		// the deterministic write path.
-		return nil
-	}
-
-	scope := manifest.Scope{}
-	if lang := inferTesterLanguageFromPath(outputPath); lang != "" {
-		scope[manifest.DimensionLanguage] = lang
-	}
-	if dir := writeTestScopeDir(outputPath); dir != "" {
-		scope[manifest.DimensionPath] = dir
-	}
-
-	result, err := client.Query(ctx, manifest.QueryDecisionsInput{
-		Domain: "test_framework",
-		Scope:  scope,
-	})
-	if err != nil {
-		// Surface the manifest infrastructure error as a tool failure so
-		// the LLM does not silently proceed to author tests with no
-		// decision. The orchestrator-side store should not normally fail
-		// (it's a single indexed read on the BunSQLite handle), so this
-		// path indicates something is genuinely wrong.
-		return fmt.Errorf("decision manifest unavailable: %w. Cannot proceed with write_test until cross-pipeline coherence can be checked", err)
-	}
-	if result == nil || result.Winner == nil {
-		return fmt.Errorf(
-			"no test_framework decision exists in the cross-pipeline manifest for scope %s. "+
-				"Before authoring tests, call query_decisions(domain=\"test_framework\") to see if a peer pipeline already declared a framework. "+
-				"If a winner exists, ADOPT it (write your tests using that framework, do not declare again). "+
-				"If no winner exists, call declare_decision(domain=\"test_framework\", value=\"<your-choice>\", confidence=\"tentative\") to record your intent so parallel pipelines see it. "+
-				"Then retry write_test.",
-			describeScope(scope),
-		)
-	}
-	return nil
-}
-
 // decisionManifestClient returns a fresh manifest client for the pipeline
 // tester. Mirrors the coordinationClient() helper: stateless construction,
-// reuses the agent's bus + pending-wait infrastructure.
+// reuses the agent's bus + pending-wait infrastructure. Used by Tier 4
+// auto-publish to declare typed framework decisions as a side-effect of
+// detect_test_harness / plan_tests / write_test / finalize_pipeline.
 func (pt *PipelineTester) decisionManifestClient() agentshared.DecisionManifestClient {
 	return agentshared.DecisionManifestClient{
 		BusProvider:     func() guide.EventBus { return pt.bus },

@@ -81,13 +81,19 @@ type sessionSnapshot struct {
 	Config           Config         `json:"config"`
 }
 
-// NewSession creates a new session with the given configuration
+// NewSession creates a new session with the given configuration. When
+// cfg.ID is set, it is used verbatim as the canonical ID; otherwise a
+// fresh UUID is minted. Name is purely cosmetic and may be renamed
+// later via SetName.
 func NewSession(cfg Config) *Session {
 	now := time.Now()
-	id := uuid.NewString()
+	id := cfg.ID
+	if id == "" {
+		id = uuid.NewString()
+	}
 
 	if cfg.Name == "" {
-		cfg.Name = "session-" + id[:8]
+		cfg.Name = "session-" + id[:min(8, len(id))]
 	}
 
 	metadata := cfg.Metadata
@@ -123,6 +129,16 @@ func (s *Session) Name() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.name
+}
+
+// SetName updates the session's display name. The canonical ID is
+// unchanged — renaming is purely cosmetic and must not affect storage
+// paths, agent routing, or registry lookups.
+func (s *Session) SetName(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.name = name
+	s.updatedAt = time.Now()
 }
 
 // Description returns the session description

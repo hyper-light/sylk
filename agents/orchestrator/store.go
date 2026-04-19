@@ -1,11 +1,13 @@
 package orchestrator
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/database"
 )
 
@@ -72,7 +74,24 @@ func (s *Store) Migrate() error {
 	if err := s.ensurePlanHandoffReceiptSchema(); err != nil {
 		return fmt.Errorf("orchestrator store: migrate handoff receipts: %w", err)
 	}
+	// Activity Fabric: every sovereign store on this BunSQLite handle
+	// emits projections into agent_activity. The schema lives here so
+	// it inherits the WAL + busy_timeout + writeMu policy.
+	activityStore := activity.NewSQLiteStore(s.db)
+	if err := activityStore.EnsureSchema(context.Background()); err != nil {
+		return fmt.Errorf("orchestrator store: migrate agent_activity: %w", err)
+	}
 	return nil
+}
+
+// ActivityStore returns a fabric-aware SQLiteStore wrapping this
+// orchestrator's BunSQLite handle. The TUI wiring uses this to install
+// the dual-tier sink as the process-wide DefaultSink at startup.
+func (s *Store) ActivityStore() *activity.SQLiteStore {
+	if s == nil {
+		return nil
+	}
+	return activity.NewSQLiteStore(s.db)
 }
 
 func (s *Store) ensurePlanHandoffReceiptSchema() error {

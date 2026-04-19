@@ -37,6 +37,47 @@ func TestSession_DefaultName(t *testing.T) {
 	assert.Contains(t, s.Name(), "session-")
 }
 
+// TestSession_ExplicitIDIsHonored pins the contract that callers can
+// pin a runtime session's ID to a known value (e.g. "default" to align
+// with the storage-layer default session). When cfg.ID is empty, the
+// constructor falls back to a UUID — the existing behavior.
+func TestSession_ExplicitIDIsHonored(t *testing.T) {
+	pinned := session.NewSession(session.Config{ID: "default", Name: "default"})
+	assert.Equal(t, "default", pinned.ID())
+	assert.Equal(t, "default", pinned.Name())
+
+	autoID := session.NewSession(session.Config{Name: "scratch"})
+	assert.NotEmpty(t, autoID.ID())
+	assert.NotEqual(t, "default", autoID.ID())
+}
+
+// TestSession_BootstrapDefaultConfigPinsID pins the bootstrap helper
+// that ties the runtime default session to the canonical "default" ID
+// used by the storage layer (.sylk/sessions/default/). Without this
+// alignment, runtime requests tagged SessionID="default" would write
+// to a different directory than the one SylkDir initialized.
+func TestSession_BootstrapDefaultConfigPinsID(t *testing.T) {
+	cfg := session.BootstrapDefaultConfig()
+	assert.Equal(t, "default", cfg.ID)
+	assert.Equal(t, "default", cfg.Name)
+
+	s := session.NewSession(cfg)
+	assert.Equal(t, "default", s.ID())
+}
+
+// TestSession_SetNameDoesNotChangeID pins the ID/Name separation: a
+// rename is purely cosmetic. Storage paths, agent routing, and registry
+// lookups all key off ID, which must remain stable across renames.
+func TestSession_SetNameDoesNotChangeID(t *testing.T) {
+	s := session.NewSession(session.Config{ID: "ses_007", Name: "default"})
+	originalID := s.ID()
+
+	s.SetName("auth refactor")
+	assert.Equal(t, "auth refactor", s.Name())
+	assert.Equal(t, originalID, s.ID(), "rename must not change canonical ID")
+	assert.Equal(t, "ses_007", s.ID())
+}
+
 func TestSession_StateTransitions(t *testing.T) {
 	s := session.NewSession(session.DefaultConfig())
 

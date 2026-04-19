@@ -1,25 +1,17 @@
 package pipeline
 
 import (
-	"context"
 	"testing"
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/manifest"
 )
 
-// TestRequireTestFrameworkDecision_NoOpWhenClientNotConfigured guards the
-// degrade-gracefully path: a tester instance with no manifest wiring
-// (test fixture without the orchestrator bus) must NOT block write_test
-// on the gate. Production wiring always configures the client; this is
-// the fixture-friendliness escape hatch that keeps deterministic-path
-// tests runnable without spinning up the full orchestrator.
-func TestRequireTestFrameworkDecision_NoOpWhenClientNotConfigured(t *testing.T) {
-	pt := &PipelineTester{} // no bus, no pending wait → IsConfigured() == false
-	if err := pt.requireTestFrameworkDecision(context.Background(), "tests/test_init.py"); err != nil {
-		t.Fatalf("gate must be a no-op without manifest wiring, got %v", err)
-	}
-}
+// The original TestRequireTestFrameworkDecision_NoOpWhenClientNotConfigured
+// is gone. The gate it covered was the inciting bug: a JIT precondition
+// that blocked write_test on cache-cold manifest reads, producing the
+// 543-second freeze. The Activity Fabric replaces gates with
+// auto-publish + ambient awareness — see docs/FABRIC.md.
 
 // TestInferTesterLanguageFromPath covers the path-extension → language
 // mapping the gate uses to populate the manifest scope. Recognized

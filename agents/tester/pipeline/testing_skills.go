@@ -238,20 +238,15 @@ func writeTestSkill(pt *PipelineTester) *skills.Skill {
 					return nil, err
 				}
 			}
-			// Cross-pipeline coherence gate: refuse the write until the
-			// manifest holds a winning test_framework decision for the
-			// scope this output_file lives in. Prevents parallel
-			// pipelines from authoring tests in incompatible frameworks
-			// (the screenshot bug). The error message guides the LLM
-			// through query/declare; bounded retries via the existing
-			// tool-loop consecutive-error counter prevent thrashing.
-			outputForGate := strings.TrimSpace(p.OutputFile)
-			if outputForGate == "" {
-				outputForGate = strings.TrimSpace(p.TestCase.TargetFile)
-			}
-			if err := pt.requireTestFrameworkDecision(ctx, outputForGate); err != nil {
-				return nil, err
-			}
+			// Cross-pipeline coherence is enforced by the Activity
+			// Fabric, not by gating write_test. The fabric surfaces
+			// peer pipeline commitments through ambient context; the
+			// LLM adopts compatible commitments by default and uses
+			// challenge_peer with concrete evidence when it disagrees.
+			// Auto-publishing the test_framework projection from
+			// detect_test_harness + write_test is what keeps parallel
+			// pipelines coherent — see docs/FABRIC.md "no-gates,
+			// auto-publish, ambient awareness."
 			writtenPath, err := pt.writeTestArtifact(ctx, harness, p.TestCase, p.OutputFile, p.Content, &p.Basis)
 			if err != nil {
 				return nil, err
