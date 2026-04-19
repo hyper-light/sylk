@@ -769,6 +769,13 @@ func PipelineProtocolSkills(cfg PipelineProtocolSkillConfig) []*skills.Skill {
 		// LLM converge faster when it knows an artifact is stale before
 		// the threshold trips.
 		pipelineDiscardQueuedArtifactsSkill(cfg),
+		// query_pipeline_state surfaces the authoritative protocol
+		// projection — pending challenges, queued artifacts, required
+		// terminal action, tester snapshot status — to the LLM so it
+		// reasons about state instead of hitting validation gates blind.
+		// Eliminates the class of bugs where finalize_pipeline fails
+		// with "phantom" errors the LLM had no way to anticipate.
+		QueryPipelineStateSkill(cfg),
 	}
 	if cfg.InspectorOT {
 		out = append(out, pipelineFinalizePipelineSkill(cfg), pipelineHandoffOTSkill(cfg), pipelineDiscardPipelineSkill(cfg))

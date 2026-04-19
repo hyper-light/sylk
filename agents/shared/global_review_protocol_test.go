@@ -51,22 +51,23 @@ func TestNewGlobalReviewProtocolSkills_AgentSpecificOwnership(t *testing.T) {
 				"accept_checkpoint",
 				"commit_to_disk",
 				"discard_checkpoint",
+				"query_global_review_state",
 			},
 		},
 		{
 			name:      "tester mirrors pipeline handoff and challenge mechanics",
 			agentType: GlobalReviewAgentTester,
-			want:      []string{"challenge_inspector", "handoff_next", "validate_work", "process_validation"},
+			want:      []string{"challenge_inspector", "handoff_next", "validate_work", "process_validation", "query_global_review_state"},
 		},
 		{
 			name:      "architect only validates",
 			agentType: GlobalReviewAgentArchitect,
-			want:      []string{"validate_work"},
+			want:      []string{"validate_work", "query_global_review_state"},
 		},
 		{
 			name:      "orchestrator only validates",
 			agentType: GlobalReviewAgentOrchestrator,
-			want:      []string{"validate_work"},
+			want:      []string{"validate_work", "query_global_review_state"},
 		},
 	}
 

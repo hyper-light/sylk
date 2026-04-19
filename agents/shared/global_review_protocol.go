@@ -545,6 +545,10 @@ func NewGlobalReviewProtocolSkills(cfg GlobalReviewProtocolSkillConfig) []*skill
 			globalReviewAcceptCheckpointSkill(cfg),
 			globalReviewCommitToDiskSkill(cfg),
 			globalReviewDiscardCheckpointSkill(cfg),
+			// query_global_review_state surfaces the authoritative
+			// protocol projection so the LLM reasons about pending
+			// challenges and required actions before committing.
+			QueryGlobalReviewStateSkill(cfg),
 		}
 	case GlobalReviewAgentTester:
 		return []*skills.Skill{
@@ -558,10 +562,12 @@ func NewGlobalReviewProtocolSkills(cfg GlobalReviewProtocolSkillConfig) []*skill
 			globalReviewHandoffNextSkill(cfg),
 			globalReviewValidateWorkSkill(cfg),
 			globalReviewProcessValidationSkill(cfg),
+			QueryGlobalReviewStateSkill(cfg),
 		}
 	case GlobalReviewAgentArchitect, GlobalReviewAgentOrchestrator:
 		return []*skills.Skill{
 			globalReviewValidateWorkSkill(cfg),
+			QueryGlobalReviewStateSkill(cfg),
 		}
 	default:
 		return nil
