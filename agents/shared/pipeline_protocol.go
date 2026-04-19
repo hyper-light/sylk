@@ -1909,7 +1909,12 @@ func pipelineTesterFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skill
 					return nil, fmt.Errorf("active challenge has no requesting agent identity")
 				}
 				if len(specs) != 1 || normalizePipelineAgentType(specs[0].Target) != challenger {
-					return nil, fmt.Errorf("a pending challenge from %q is awaiting your response — finalize_pipeline must list exactly one targets entry for %q so the verification artifact threads into validate_work", challenger, challenger)
+					return nil, NewPipelineProtocolError(
+						"pipeline.finalize.challenge_target_mismatch",
+						"finalize_pipeline",
+						fmt.Sprintf("a pending challenge from %q is awaiting your response — finalize_pipeline must list exactly one targets entry for %q so the verification artifact threads into validate_work", challenger, challenger),
+						fmt.Sprintf("call finalize_pipeline with targets=[{target:%q,...}] so the verification artifact threads into validate_work", challenger),
+					)
 				}
 			} else if len(specs) > 1 {
 				if !pipelineFinalizeTargetsAreCohort(specs) {
@@ -1921,7 +1926,12 @@ func pipelineTesterFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skill
 				suiteID = strings.TrimSpace(cfg.TesterCurrentSuiteID())
 			}
 			if suiteID == "" {
-				return nil, fmt.Errorf("run_test_suite must produce a snapshot during this turn before finalize_pipeline can package the verification artifact — run the suite (after write_test if needed) and call finalize_pipeline again")
+				return nil, NewMissingArtifactProtocolError(
+					"pipeline",
+					"pipeline.finalize.requires_test_snapshot",
+					"finalize_pipeline",
+					ArtifactTestSnapshot,
+				)
 			}
 			existing := state.QueuedArtifacts()
 			for _, spec := range specs {
