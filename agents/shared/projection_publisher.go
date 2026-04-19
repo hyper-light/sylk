@@ -5,8 +5,68 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
+
+// PipelineProjectionPresenceChecker returns a skills.ArtifactPresenceChecker
+// that reads the current projection snapshot from state each call. The
+// tool runtime consults the checker before invoking a skill that
+// declares Consumes, and after handler success to validate Produces.
+// Using the live state — not a frozen projection — means produce
+// checks see post-handler mutations.
+func PipelineProjectionPresenceChecker(state *PipelineProtocolState) skills.ArtifactPresenceChecker {
+	if state == nil {
+		return nil
+	}
+	return func(artifact string) bool {
+		projection := state.Projection()
+		if projection == nil {
+			return false
+		}
+		switch artifact {
+		case ArtifactTestSnapshot:
+			return projection.TesterSuiteCaptured
+		case ArtifactPendingChallenge:
+			return projection.PendingChallenge != nil
+		case ArtifactVerificationArtifact:
+			return len(projection.QueuedArtifacts) > 0
+		case ArtifactPendingValidation:
+			return projection.PendingValidation != nil
+		}
+		return false
+	}
+}
+
+// GlobalReviewProjectionPresenceChecker is the global-review sibling
+// of PipelineProjectionPresenceChecker.
+func GlobalReviewProjectionPresenceChecker(state *GlobalReviewState) skills.ArtifactPresenceChecker {
+	if state == nil {
+		return nil
+	}
+	return func(artifact string) bool {
+		projection := state.Projection()
+		if projection == nil {
+			return false
+		}
+		switch artifact {
+		case ArtifactPendingChallenge:
+			return projection.PendingChallenge != nil
+		case ArtifactPendingValidation:
+			return projection.PendingValidation != nil
+		}
+		return false
+	}
+}
+
+// recoveryHintForArtifact is the canonical recovery-hint mapper
+// registered alongside the presence checker. The tool runtime's
+// ContractViolation surface calls this when a Consumes check fails so
+// the LLM reads the same recovery prose the typed ProtocolError path
+// uses.
+func recoveryHintForArtifact(artifact string) string {
+	return recoveryForArtifact(artifact)
+}
 
 // ProtocolProjectionScope names which protocol emitted a projection
 // event. Typed so consumers can fan messages to the right panel without
@@ -62,16 +122,60 @@ func OpenPipelineTaskProtocolStateWithPublisher(
 ) (context.Context, func()) {
 	existing := PipelineProtocolStateFromContext(ctx) != nil
 	ctx = WithPipelineTaskProtocolState(ctx, task)
+	state := PipelineProtocolStateFromContext(ctx)
+	// Install the dispatcher-facing presence checker + recovery hint
+	// regardless of whether the state was opened here or upstream —
+	// every tool call made through this context must enforce declared
+	// contracts consistently.
+	if checker := PipelineProjectionPresenceChecker(state); checker != nil {
+		ctx = skills.WithArtifactPresenceChecker(ctx, checker)
+		ctx = skills.WithRecoveryHintFn(ctx, recoveryHintForArtifact)
+	}
 	if existing {
 		// Protocol state was opened upstream; do not publish or close
 		// here — ownership belongs to the caller that opened it.
 		return ctx, func() {}
 	}
-	state := PipelineProtocolStateFromContext(ctx)
 	unsubscribe := PublishPipelineProjectionUpdates(bus, state, sessionID, agentType)
 	return ctx, func() {
 		unsubscribe()
 		_ = ClosePipelineProtocolState(ctx)
+	}
+}
+
+// OpenGlobalReviewContextWithPublisher is the global-review sibling of
+// OpenPipelineTaskProtocolStateWithPublisher. Opens the global review
+// state from metadata into ctx, installs the projection presence
+// checker + recovery-hint mapper, and — when a bus is supplied —
+// publishes projection snapshots on TopicProtocolProjection.
+//
+// Returns the derived context (unchanged when no state is opened) and
+// an unsubscribe closure for the publisher (no-op when bus is nil).
+// Global review state is not explicitly closed (no durable handle owned
+// by the context), so this function returns only an unsubscribe.
+func OpenGlobalReviewContextWithPublisher(
+	ctx context.Context,
+	metadata map[string]any,
+	bus guide.EventBus,
+	sessionID, agentType string,
+) (context.Context, func()) {
+	existing := GlobalReviewStateFromContext(ctx) != nil
+	ctx = WithGlobalReviewContext(ctx, metadata)
+	state := GlobalReviewStateFromContext(ctx)
+	if checker := GlobalReviewProjectionPresenceChecker(state); checker != nil {
+		ctx = skills.WithArtifactPresenceChecker(ctx, checker)
+		ctx = skills.WithRecoveryHintFn(ctx, recoveryHintForArtifact)
+	}
+	if state == nil {
+		return ctx, func() {}
+	}
+	if existing {
+		return ctx, func() {}
+	}
+	unsubscribe := PublishGlobalReviewProjectionUpdates(bus, state, sessionID, agentType)
+	return ctx, func() {
+		unsubscribe()
+		_ = CloseGlobalReviewState(ctx)
 	}
 }
 

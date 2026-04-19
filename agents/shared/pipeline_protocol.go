@@ -262,6 +262,12 @@ type PipelineProtocolState struct {
 	requiredReason  string
 	queuedArtifacts map[string]PipelineHandoffArtifactRef
 
+	// testerSuiteID is the latest test snapshot captured this turn via
+	// run_test_suite. Empty until run_test_suite records one; consumed
+	// by the dispatcher's Produces check and by the projection's
+	// TesterSuiteCaptured / TesterCurrentSuiteID fields.
+	testerSuiteID string
+
 	// subscribersMu / subscribers form the in-process projection
 	// subscription layer. Every mutation fires notifyProjectionSubscribers
 	// which feeds the latest Projection to each subscriber. This is the
@@ -498,6 +504,33 @@ func (s *PipelineProtocolState) RequiredAction() (PipelineProtocolActionType, st
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.requiredAction, strings.TrimSpace(s.requiredReason)
+}
+
+// RecordTesterSuiteID persists the latest test snapshot id on the
+// protocol state. Called by run_test_suite after a successful run; the
+// dispatcher's Produces check and the projection's TesterSuiteCaptured
+// field both read this value, so recording here is the single place
+// that makes "a snapshot exists this turn" observable.
+func (s *PipelineProtocolState) RecordTesterSuiteID(id string) {
+	if s == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(id)
+	s.mu.Lock()
+	s.testerSuiteID = trimmed
+	s.mu.Unlock()
+	s.notifyProjectionSubscribers()
+}
+
+// TesterSuiteID returns the suite id recorded this turn, or empty when
+// run_test_suite has not succeeded yet.
+func (s *PipelineProtocolState) TesterSuiteID() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.testerSuiteID
 }
 
 // QueuedArtifacts returns a snapshot of pending tester verification artifact
@@ -901,6 +934,7 @@ func pipelineChallengeAgentSkill(cfg PipelineProtocolSkillConfig) *skills.Skill 
 		StringParam("request", "The concrete challenge, assignment, or question for the target agent(s)", true).
 		ArrayParam("required_output", "What the target agent must return or validate", "string", false).
 		ArrayParam("references", "Relevant files, artifacts, tests, or criteria to inspect", "string", false).
+		Produces(ArtifactPendingChallenge).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params pipelineTurnSelectionParams
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -1414,6 +1448,7 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 		ArrayParam("evidence_refs", "Files, tests, artifacts, or commands that support this response", "string", false).
 		ArrayParam("missing_inputs", "What is still unclear or missing", "string", false).
 		ArrayParam("recommended_next_agents", "Suggested next agent or cohort after this response", "string", false).
+		Consumes(ArtifactPendingChallenge).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				ChallengeID           string   `json:"challenge_id"`
@@ -1572,6 +1607,7 @@ func pipelineProcessValidationSkill(cfg PipelineProtocolSkillConfig) *skills.Ski
 		}, true).
 		StringParam("summary", "Why you accepted, rejected, or need follow-up", true).
 		ArrayParam("next_targets", "Optional next agents you are considering after processing the validation", "string", false).
+		Consumes(ArtifactPendingValidation).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				ChallengeID string   `json:"challenge_id"`

@@ -472,12 +472,12 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	ctx = agentShared.WithForwardedTaskScope(ctx, fwd.Metadata)
-	hadGlobalReviewState := agentShared.GlobalReviewStateFromContext(ctx) != nil
-	ctx = agentShared.WithGlobalReviewContext(ctx, fwd.Metadata)
+	var closeGlobalReviewState func()
+	ctx, closeGlobalReviewState = agentShared.OpenGlobalReviewContextWithPublisher(
+		ctx, fwd.Metadata, gi.bus, fwd.SessionID, "inspector-global",
+	)
+	defer closeGlobalReviewState()
 	ctx = agentShared.WithAuditDepthContext(ctx, fwd.Metadata)
-	if !hadGlobalReviewState {
-		defer agentShared.CloseGlobalReviewState(ctx)
-	}
 	contract := agentShared.BuildGlobalExecutionContract("inspector-global", fwd.Intent, fwd.Input)
 	ctx = withGlobalAuditRequestState(ctx, fwd.Input, contract, fwd.Metadata)
 	systemPrompt := shared.GlobalInspectorSystemPromptForContract(contract)
@@ -549,11 +549,11 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 	ctx := reqCtx
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	ctx = agentShared.WithForwardedTaskScope(ctx, fwd.Metadata)
-	hadGlobalReviewState := agentShared.GlobalReviewStateFromContext(ctx) != nil
-	ctx = agentShared.WithGlobalReviewContext(ctx, fwd.Metadata)
-	if !hadGlobalReviewState {
-		defer agentShared.CloseGlobalReviewState(ctx)
-	}
+	var closeGlobalReviewState func()
+	ctx, closeGlobalReviewState = agentShared.OpenGlobalReviewContextWithPublisher(
+		ctx, fwd.Metadata, gi.bus, fwd.SessionID, "inspector-global",
+	)
+	defer closeGlobalReviewState()
 	ctx = agentShared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	ctx = agentShared.WithOwnedStreamIdentity(ctx, "inspector-global", "Inspector")
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)

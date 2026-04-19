@@ -680,6 +680,7 @@ func globalReviewChallengeSkill(
 		StringParam("request", "Concrete validation work or clarification the challenged agent must perform", true).
 		ArrayParam("required_output", "What the challenged agent must return", "string", false).
 		ArrayParam("references", "Relevant files, evidence, or criteria", "string", false).
+		Produces(ArtifactPendingChallenge).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				Reason         string   `json:"reason"`
@@ -1210,6 +1211,7 @@ func globalReviewValidateWorkSkill(cfg GlobalReviewProtocolSkillConfig) *skills.
 		ArrayParam("evidence_refs", "Files, tests, artifacts, or commands supporting the response", "string", false).
 		ArrayParam("missing_inputs", "What is still unclear or missing", "string", false).
 		ArrayParam("recommended_next_agents", "Optional suggested next agents", "string", false).
+		Consumes(ArtifactPendingChallenge).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				ChallengeID           string   `json:"challenge_id"`
@@ -1324,6 +1326,7 @@ func globalReviewProcessValidationSkill(cfg GlobalReviewProtocolSkillConfig) *sk
 			string(GlobalReviewValidationDecisionHandoff),
 		}, true).
 		StringParam("summary", "Why you accepted, rejected, or need follow-up", true).
+		Consumes(ArtifactPendingValidation).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				ChallengeID string `json:"challenge_id"`

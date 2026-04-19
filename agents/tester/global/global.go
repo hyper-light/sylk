@@ -567,11 +567,11 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 		return nil, fmt.Errorf("global tester: %w: LLM provider not yet wired — authenticate with OpenAI to enable", agentshared.ErrAgentNotReady)
 	}
 
-	hadGlobalReviewState := agentshared.GlobalReviewStateFromContext(ctx) != nil
-	ctx = agentshared.WithGlobalReviewContext(ctx, fwd.Metadata)
-	if !hadGlobalReviewState {
-		defer agentshared.CloseGlobalReviewState(ctx)
-	}
+	var closeGlobalReviewState func()
+	ctx, closeGlobalReviewState = agentshared.OpenGlobalReviewContextWithPublisher(
+		ctx, fwd.Metadata, gt.bus, fwd.SessionID, "tester-global",
+	)
+	defer closeGlobalReviewState()
 	contract := agentshared.BuildGlobalExecutionContract("tester-global", fwd.Intent, fwd.Input)
 	ctx = agentshared.WithGlobalExecutionState(ctx, agentshared.NewGlobalExecutionState(contract))
 	systemPrompt := shared.GlobalTesterSystemPromptForContract(contract)
@@ -644,11 +644,11 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	ctx = agentshared.WithForwardedTaskScope(ctx, fwd.Metadata)
-	hadGlobalReviewState := agentshared.GlobalReviewStateFromContext(ctx) != nil
-	ctx = agentshared.WithGlobalReviewContext(ctx, fwd.Metadata)
-	if !hadGlobalReviewState {
-		defer agentshared.CloseGlobalReviewState(ctx)
-	}
+	var closeGlobalReviewState func()
+	ctx, closeGlobalReviewState = agentshared.OpenGlobalReviewContextWithPublisher(
+		ctx, fwd.Metadata, gt.bus, fwd.SessionID, "tester-global",
+	)
+	defer closeGlobalReviewState()
 	ctx = withTesterStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
 	ctx = agentshared.WithOwnedStreamIdentity(ctx, "tester-global", "Tester")

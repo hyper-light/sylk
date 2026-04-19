@@ -345,7 +345,15 @@ func runTestSuiteSkill(pt *PipelineTester) *skills.Skill {
 			if err != nil {
 				return nil, err
 			}
-			pt.setLastSuiteResult(suiteResultFromExecution(result, start))
+			suite := suiteResultFromExecution(result, start)
+			pt.setLastSuiteResult(suite)
+			// Record the suite id on the protocol state so the
+			// dispatcher's Produces check and the projection's
+			// TesterSuiteCaptured field observe the snapshot in a
+			// single authoritative location.
+			if state := agentshared.PipelineProtocolStateFromContext(ctx); state != nil && suite != nil {
+				state.RecordTesterSuiteID(suite.SuiteID)
+			}
 			return result, nil
 		}).
 		Build()

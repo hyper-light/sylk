@@ -126,6 +126,10 @@ func (s *PipelineProtocolState) Projection() *PipelineProjection {
 			projection.QueuedArtifacts[k] = v
 		}
 	}
+	if suiteID := strings.TrimSpace(s.testerSuiteID); suiteID != "" {
+		projection.TesterCurrentSuiteID = suiteID
+		projection.TesterSuiteCaptured = true
+	}
 	return projection
 }
 

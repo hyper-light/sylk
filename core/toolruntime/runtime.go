@@ -408,6 +408,18 @@ func (r *Runtime) executeRaw(
 		}
 	}
 
+	skill := r.resolveSkill(name)
+	// Consumes check — refuse to invoke when a required artifact is
+	// missing. Surfacing here (rather than in a downstream terminal
+	// validator) means the LLM sees the violation on the call it just
+	// made, with a RecoveryAction naming the producer skill.
+	if err := skills.ValidateContractConsumes(ctx, skill); err != nil {
+		if postErr := r.runPostHooks(ctx, toolData, nil, err); postErr != nil {
+			return RawExecutionResult{}, postErr
+		}
+		return RawExecutionResult{}, err
+	}
+
 	result, err := r.executePolicy(ctx, name, toolData.Input, policy)
 	if postErr := r.runPostHooks(ctx, toolData, resultData(result), resultError(result)); postErr != nil {
 		return RawExecutionResult{}, postErr
@@ -421,10 +433,27 @@ func (r *Runtime) executeRaw(
 	if !result.Success {
 		return RawExecutionResult{}, resultToError(name, result)
 	}
+	// Produces check — the handler succeeded; verify each declared
+	// artifact is now visible in the protocol state. The presence
+	// checker reads the live projection so its answer reflects any
+	// mutation the handler made.
+	if err := skills.ValidateContractProduces(ctx, skill); err != nil {
+		return RawExecutionResult{}, err
+	}
 	return RawExecutionResult{
 		Data:     result.Data,
 		ToolName: name,
 	}, nil
+}
+
+// resolveSkill returns the registered skill by name, or nil when the
+// registry is unavailable or the skill is not registered. Used for
+// contract enforcement — a nil skill means no Contract to enforce.
+func (r *Runtime) resolveSkill(name string) *skills.Skill {
+	if r == nil || r.registry == nil {
+		return nil
+	}
+	return r.registry.Get(name)
 }
 
 func (r *Runtime) validateInvocation(inv Invocation) (string, ToolPolicy, error) {
