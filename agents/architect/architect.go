@@ -1334,8 +1334,11 @@ func (a *Architect) handleRecall(ctx context.Context, fwd *guide.ForwardedReques
 	}
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	ctx = shared.WithForwardedTaskScope(ctx, fwd.Metadata)
-	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
-	defer shared.CloseGlobalReviewState(ctx)
+	var closeGlobalReviewState func()
+	ctx, closeGlobalReviewState = shared.OpenGlobalReviewContextWithPublisher(
+		ctx, fwd.Metadata, a.bus, fwd.SessionID, "architect",
+	)
+	defer closeGlobalReviewState()
 	req := &ArchitectRequest{
 		ID:                  uuid.New().String(),
 		Intent:              IntentRecall,
@@ -1356,8 +1359,11 @@ func (a *Architect) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest
 	}
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	ctx = shared.WithForwardedTaskScope(ctx, fwd.Metadata)
-	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
-	defer shared.CloseGlobalReviewState(ctx)
+	var closeGlobalReviewState func()
+	ctx, closeGlobalReviewState = shared.OpenGlobalReviewContextWithPublisher(
+		ctx, fwd.Metadata, a.bus, fwd.SessionID, "architect",
+	)
+	defer closeGlobalReviewState()
 	req := &ArchitectRequest{
 		ID:                  uuid.New().String(),
 		Intent:              IntentCheck,
@@ -1393,8 +1399,11 @@ func (a *Architect) shouldRouteExistingReadyPlanFollowupToConversation(
 func (a *Architect) handleConversation(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	ctx = shared.WithForwardedTaskScope(ctx, fwd.Metadata)
-	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
-	defer shared.CloseGlobalReviewState(ctx)
+	var closeGlobalReviewState func()
+	ctx, closeGlobalReviewState = shared.OpenGlobalReviewContextWithPublisher(
+		ctx, fwd.Metadata, a.bus, fwd.SessionID, "architect",
+	)
+	defer closeGlobalReviewState()
 	now := time.Now().UTC()
 	sessionID := sessionIDFromForwarded(fwd)
 	a.recoverSessionPendingWork(ctx, sessionID, now)

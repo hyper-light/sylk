@@ -1106,11 +1106,11 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	// so the LLM exits with text and the inspector waits forever for a
 	// validate_work response that is never dispatched. Mirrors what
 	// inspector-global / global-tester / pipeline workers already do.
-	hadGlobalReviewState := shared.GlobalReviewStateFromContext(ctx) != nil
-	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
-	if !hadGlobalReviewState {
-		defer shared.CloseGlobalReviewState(ctx)
-	}
+	var closeGlobalReviewState func()
+	ctx, closeGlobalReviewState = shared.OpenGlobalReviewContextWithPublisher(
+		ctx, fwd.Metadata, o.bus, fwd.SessionID, "orchestrator",
+	)
+	defer closeGlobalReviewState()
 
 	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
 	if publishStreamLifecycle {
