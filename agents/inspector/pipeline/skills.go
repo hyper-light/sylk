@@ -112,6 +112,15 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	}) {
 		pi.skills.Register(skill)
 	}
+	// Phase 5 of SCRIBE_FABRIC.md: recall_my_history.
+	for _, skill := range agentShared.RecallSkills(agentShared.RecallSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return pi.config.SessionID },
+		AgentID:        func() string { return pi.id },
+		AgentType:      func() string { return "inspector-pipeline" },
+	}) {
+		pi.skills.Register(skill)
+	}
 	for _, skill := range agentShared.PipelineProtocolSkills(agentShared.PipelineProtocolSkillConfig{
 		AgentType:      func() string { return "inspector-pipeline" },
 		AgentID:        func() string { return pi.id },

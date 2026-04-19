@@ -396,6 +396,15 @@ func (gt *GlobalTester) registerCoreSkills() {
 	}) {
 		gt.skills.Register(skill)
 	}
+	// Phase 5 of SCRIBE_FABRIC.md: recall_my_history.
+	for _, skill := range agentshared.RecallSkills(agentshared.RecallSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return gt.config.SessionID },
+		AgentID:        func() string { return gt.id },
+		AgentType:      func() string { return "tester" },
+	}) {
+		gt.skills.Register(skill)
+	}
 
 	// Diagnostics
 	gt.skills.Register(agentshared.NewSelfDiagnosticSkill(&globalTesterDiag{gt: gt}))

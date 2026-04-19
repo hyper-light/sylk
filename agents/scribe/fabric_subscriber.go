@@ -10,6 +10,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/activity/lenses"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -250,16 +251,18 @@ func (s *Scribe) dispatchBatchNarration(ctx context.Context, key, trigger string
 }
 
 // narrateBatch is the batched-narration entry point. It synthesizes a
-// ScribeFeed-shaped input from the batch and dispatches into the
+// ScribeFeed-shaped input from the batch — with causal context
+// (Phase 6) walked from the batch tip — and dispatches into the
 // existing processFeed path so the LLM tool loop, archivalist
-// publish, and (in Phase 3) fabric narration_emitted projection all
-// operate against a single coherent unit of narration work.
+// publish, and fabric narration_emitted projection all operate
+// against a single coherent unit of narration work.
 func (s *Scribe) narrateBatch(ctx context.Context, key, trigger string, batch []activity.AgentActivity) {
 	if len(batch) == 0 && trigger != "periodic" {
 		return
 	}
+	causal := s.collectCausalContext(ctx, batch)
 	feed := shared.ScribeFeed{
-		UserRequest:         buildBatchUserRequest(s.parentAgentType, trigger, batch),
+		UserRequest:         buildBatchUserRequest(s.parentAgentType, trigger, batch, causal),
 		AgentResponse:       buildBatchAgentResponse(batch),
 		ParentCorrelationID: key,
 		Timestamp:           time.Now(),
@@ -267,15 +270,55 @@ func (s *Scribe) narrateBatch(ctx context.Context, key, trigger string, batch []
 	s.processFeed(ctx, feed)
 }
 
+// collectCausalContext walks the causal DAG anchored at the most
+// recent activity in the batch (the "tip") to produce ancestor
+// context the scribe LLM can ground its narration in. Bounded by
+// the lens helper's max-depth (default 32). Returns nil silently
+// when no activity source is wired (test fixtures).
+func (s *Scribe) collectCausalContext(ctx context.Context, batch []activity.AgentActivity) []activity.AgentActivity {
+	if len(batch) == 0 {
+		return nil
+	}
+	src := activity.DefaultSource()
+	if src == nil {
+		return nil
+	}
+	tip := batch[len(batch)-1]
+	walked, err := lenses.CausalContext(ctx, src, tip.ID, 0)
+	if err != nil {
+		return nil
+	}
+	return walked.Ancestors
+}
+
 // buildBatchUserRequest synthesizes the user-facing prompt the
 // scribe LLM sees as "the request" for this batched narration. It
 // frames the batch as a structured stream of typed activities the
-// scribe is asked to narrate.
-func buildBatchUserRequest(parentAgentType, trigger string, batch []activity.AgentActivity) string {
+// scribe is asked to narrate, plus (Phase 6) a "causal antecedents"
+// section sourced from the fabric's CausalContext lens — so the
+// narration can describe *why* the batch happened, not just *what*.
+func buildBatchUserRequest(parentAgentType, trigger string, batch []activity.AgentActivity, causal []activity.AgentActivity) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Narrate the following batch of activities your parent agent (%s) just emitted.\n", parentAgentType)
 	fmt.Fprintf(&b, "Trigger: %s\n", trigger)
 	fmt.Fprintf(&b, "Batch size: %d activities\n\n", len(batch))
+
+	if len(causal) > 0 {
+		b.WriteString("Causal antecedents (the chain that led to this batch):\n")
+		for i, a := range causal {
+			fmt.Fprintf(&b, "  ↑[%d] %s by %s/%s (%s)",
+				i+1, a.Action, a.Actor.AgentType, a.Actor.AgentID, a.Timestamp.Format(time.RFC3339))
+			if a.Subject.PathPrefix != "" {
+				fmt.Fprintf(&b, " scope=%s", a.Subject.PathPrefix)
+			}
+			if a.Subject.Domain != "" {
+				fmt.Fprintf(&b, " domain=%s", a.Subject.Domain)
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("\nUse these antecedents to ground your narration in the why, not just the what.\n\n")
+	}
+
 	b.WriteString("Activities (chronological order):\n")
 	for i, a := range batch {
 		fmt.Fprintf(&b, "  [%d] %s (resolution=%s, state=%s) at %s\n",

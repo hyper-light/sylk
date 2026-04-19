@@ -210,17 +210,34 @@ type PipelineProtocolRouteConfig struct {
 // queued by the tester's finalize_pipeline. Each entry encodes which artifact
 // the downstream recipient should consume, the source suite that produced it,
 // and the LLM-supplied narrative for that recipient. The tester finalize
-// populates one ref per target; handoff_next / validate_work consume them
-// during dispatch and clear them from the queue.
+// populates one ref per target; handoff_next / validate_work / passthrough
+// dispatch consume them and clear them from the queue.
+//
+// QueuedAtIteration captures the protocol iteration the artifact was queued
+// at. The dispatch path uses it to surface age advisories on every terminal
+// action result and to auto-discard artifacts older than
+// pipelineArtifactMaxIterations as a bounded-loss convergence guard. Pure
+// advisory data — no terminal action is rejected based on age. The LLM reads
+// the age in queue_state and decides whether to converge faster, route
+// directly, or invoke discard_queued_artifacts.
 type PipelineHandoffArtifactRef struct {
-	ArtifactID   string   `json:"artifact_id"`
-	Kind         string   `json:"kind,omitempty"`
-	Target       string   `json:"target"`
-	SuiteID      string   `json:"suite_id,omitempty"`
-	Summary      string   `json:"summary,omitempty"`
-	EvidenceRefs []string `json:"evidence_refs,omitempty"`
-	FailureFocus []string `json:"failure_focus,omitempty"`
+	ArtifactID        string   `json:"artifact_id"`
+	Kind              string   `json:"kind,omitempty"`
+	Target            string   `json:"target"`
+	SuiteID           string   `json:"suite_id,omitempty"`
+	Summary           string   `json:"summary,omitempty"`
+	EvidenceRefs      []string `json:"evidence_refs,omitempty"`
+	FailureFocus      []string `json:"failure_focus,omitempty"`
+	QueuedAtIteration int      `json:"queued_at_iteration,omitempty"`
 }
+
+// pipelineArtifactMaxIterations bounds how long a queued artifact may persist
+// before the dispatch path auto-discards it. Five iterations is the empirical
+// bound we picked: a normal red-green-refactor task converges in 1-3
+// iterations; anything past 5 iterations stranding an artifact is divergence.
+// Bounded loss (one artifact dropped, one warning event) is preferable to
+// unbounded queue accumulation across pipeline runs.
+const pipelineArtifactMaxIterations = 5
 
 // PipelineTesterFinalizeTargetSpec is the per-recipient input the tester
 // supplies when calling finalize_pipeline. The summary, evidence_refs, and
@@ -494,9 +511,6 @@ func (s *PipelineProtocolState) setTerminalAction(action *PipelineTurnAction) er
 	if s.requiredAction != "" && action.Type != s.requiredAction {
 		return fmt.Errorf("%s", requiredPipelineActionMessageLocked(s.requiredAction, s.requiredReason))
 	}
-	if err := validateQueuedArtifactConsumptionLocked(s.queuedArtifacts, action); err != nil {
-		return err
-	}
 	if s.terminalAction != nil {
 		return fmt.Errorf("pipeline turn already selected %s", s.terminalAction.Type)
 	}
@@ -517,58 +531,33 @@ func (s *PipelineProtocolState) validateTerminalAction(action *PipelineTurnActio
 	if s.requiredAction != "" && action.Type != s.requiredAction {
 		return fmt.Errorf("%s", requiredPipelineActionMessageLocked(s.requiredAction, s.requiredReason))
 	}
-	if err := validateQueuedArtifactConsumptionLocked(s.queuedArtifacts, action); err != nil {
-		return err
-	}
 	if s.terminalAction != nil {
 		return fmt.Errorf("pipeline turn already selected %s", s.terminalAction.Type)
 	}
 	return nil
 }
 
-// validateQueuedArtifactConsumptionLocked enforces that when finalize_pipeline
-// has queued per-recipient verification artifacts, the only legal terminal
-// actions are handoff_next or validate_work and their target set must match
-// the queue exactly. Caller holds s.mu (read or write).
-func validateQueuedArtifactConsumptionLocked(queue map[string]PipelineHandoffArtifactRef, action *PipelineTurnAction) error {
-	if len(queue) == 0 || action == nil {
-		return nil
-	}
-	switch action.Type {
-	case PipelineProtocolActionHandoff:
-		if action.CreatesChallenge {
-			return fmt.Errorf("queued tester verification artifacts must be consumed via handoff_next, not via challenge_agent — invoke handoff_next now or call finalize_pipeline again with a fresh suite to overwrite the queue")
-		}
-		queueTargets := make([]string, 0, len(queue))
-		for target := range queue {
-			queueTargets = append(queueTargets, target)
-		}
-		actionTargets := make([]string, 0, len(action.TargetAgents))
-		for _, target := range action.TargetAgents {
-			actionTargets = append(actionTargets, normalizePipelineAgentType(target))
-		}
-		if !pipelineTargetSetsEqual(queueTargets, actionTargets) {
-			return fmt.Errorf("handoff_next target set %v does not match the finalized verification target set %v — finalize_pipeline for the missing recipients before handing off, or call finalize_pipeline with the new target set after running a fresh suite", actionTargets, queueTargets)
-		}
-	case PipelineProtocolActionValidate:
-		if action.Validation == nil {
-			return fmt.Errorf("validate_work missing validation record while queued tester artifacts are pending")
-		}
-		requestingAgent := normalizePipelineAgentType(action.Validation.RequestingAgent)
-		if requestingAgent == "" {
-			return fmt.Errorf("validate_work missing requesting agent identity while queued tester artifacts are pending")
-		}
-		if len(queue) != 1 {
-			return fmt.Errorf("validate_work consumes exactly one queued artifact; finalize_pipeline produced %d. When responding to a challenge, finalize for only the challenger", len(queue))
-		}
-		if _, ok := queue[requestingAgent]; !ok {
-			return fmt.Errorf("validate_work targets %q but queued verification artifact was finalized for a different recipient", requestingAgent)
-		}
-	default:
-		return fmt.Errorf("queued tester verification artifacts must be consumed via handoff_next or validate_work; %s is not a valid terminal action while artifacts are pending", action.Type)
-	}
-	return nil
-}
+// Removed: validateQueuedArtifactConsumptionLocked.
+//
+// Queue-state was previously enforced as a hard runtime gate on terminal
+// actions (handoff_next had to match the finalize_pipeline target set;
+// challenge_agent and validate_work were either rejected or constrained).
+// That conflated finalize_pipeline's "package an artifact for recipient X"
+// contract with handoff_next's "route the next turn" contract, which the
+// system prompts treat as separate concerns (tester finalizes for engineer,
+// then hands off to inspector for review; inspector eventually routes to
+// engineer with the artifact attached). The strict gate boxed agents in:
+// when one terminal action was rejected, the fallbacks were too — leaving
+// no escape and surfacing as opaque "stream error" pipeline aborts.
+//
+// The contract now lives in skill Usage/Avoid clauses (the LLM can read
+// and reason about it) and in the dispatch path's passthrough behavior:
+// queued artifacts ride along to non-recipient handoff targets via
+// Context["inherited_artifacts"], age-tracked across iterations, and
+// auto-discarded if they exceed pipelineArtifactMaxIterations as a
+// bounded-loss convergence guard. Every terminal action carries a
+// queue_state advisory in its result so the LLM sees what's pending and
+// what was delivered, without any path being silently rejected.
 
 func pipelineTargetSetsEqual(a, b []string) bool {
 	if len(a) != len(b) {
@@ -774,6 +763,12 @@ func PipelineProtocolSkills(cfg PipelineProtocolSkillConfig) []*skills.Skill {
 		pipelineHandoffNextSkill(cfg),
 		pipelineValidateWorkSkill(cfg),
 		pipelineProcessValidationSkill(cfg),
+		// discard_queued_artifacts is the explicit-recovery affordance
+		// surfaced to every pipeline agent. The protocol passes artifacts
+		// through and auto-discards at age threshold; this skill lets the
+		// LLM converge faster when it knows an artifact is stale before
+		// the threshold trips.
+		pipelineDiscardQueuedArtifactsSkill(cfg),
 	}
 	if cfg.InspectorOT {
 		out = append(out, pipelineFinalizePipelineSkill(cfg), pipelineHandoffOTSkill(cfg), pipelineDiscardPipelineSkill(cfg))
@@ -800,10 +795,10 @@ func pipelineChallengeAgentSkill(cfg PipelineProtocolSkillConfig) *skills.Skill 
 		Domain("pipeline").
 		Keywords("challenge", "peer review", "validation", "pipeline", "route").
 		Priority(100).
-		Usage("Use after you have inspected returned peer work and a specific unresolved gap remains that the target agent must answer directly. A first challenge to a directed target is allowed. Repeated challenges require the directed pair's required new VFS evidence before you call this skill again. Do not use this for ordinary phase progression; use `handoff_next` for the normal top-level flow.").
+		Usage("Use after you have inspected returned peer work and a specific unresolved gap remains that the target agent must answer directly. Legal regardless of whether tester verification artifacts are queued — the queue persists across challenge cycles and re-attaches to the eventual delivery hop via inherited_artifacts. A first challenge to a directed target is allowed. Repeated challenges require the directed pair's required new VFS evidence before you call this skill again. Do not use this for ordinary phase progression; use `handoff_next` for the normal top-level flow.").
 		Satisfies("Creates an explicit targeted pipeline challenge and routes it to the challenged agent or cohort.").
 		Requirement("Do not re-challenge the same agent without fresh pipeline VFS evidence. Inspector may re-challenge Tester, Engineer, or Designer only after that target changed VFS since Inspector's previous challenge to that target. Tester, Engineer, and Designer may re-challenge each other only after the target changed VFS since the challenger's previous challenge. Tester, Engineer, and Designer may re-challenge Inspector only after the challenger changed VFS in response to Inspector's previous answer.").
-		Avoid("Do not use to advance the normal Inspector -> Tester -> Engineer/Designer -> Inspector phase flow, and do not use to ping the same pipeline agent again when the required side has not changed the pipeline VFS since the prior challenge on that directed pair.").
+		Avoid("Do not use to advance the normal Inspector -> Tester -> Engineer/Designer -> Inspector phase flow, and do not use to ping the same pipeline agent again when the required side has not changed the pipeline VFS since the prior challenge on that directed pair. Do not challenge solely as a workaround for queued artifacts — they pass through; if you genuinely need to drop them, use `discard_queued_artifacts` with a reason.").
 		EnumArrayParam("target_agents", "Target pipeline peers. Each entry must be one of the pipeline roles your agent is allowed to challenge.", "string", targetEnum, true).
 		EnumParam("mode", "single or cohort", []string{string(PipelineTurnModeSingle), string(PipelineTurnModeCohort)}, false).
 		StringParam("reason", "Why this challenge is necessary now", true).
@@ -820,6 +815,107 @@ func pipelineChallengeAgentSkill(cfg PipelineProtocolSkillConfig) *skills.Skill 
 		Build()
 }
 
+// pipelineDiscardQueuedArtifactsSkill is the explicit-recovery affordance
+// in the agentic queue model. The protocol no longer rejects terminal
+// actions when artifacts are queued — it auto-passes them through and
+// auto-discards at age threshold. But there are situations where the
+// LLM knows an artifact is no longer relevant before that threshold
+// (the underlying suite was wrong, the recipient is no longer needed,
+// the requirement changed mid-turn). Rather than letting stale state
+// accumulate or waiting for the age sweep, the LLM names the targets
+// and a reason, and the protocol records both for observability and
+// drops the entries from the queue.
+func pipelineDiscardQueuedArtifactsSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
+	return skills.NewSkill("discard_queued_artifacts").
+		Description("Explicitly drop one or more queued tester verification artifacts when they are no longer relevant. Requires a reason; recorded for observability.").
+		Domain("pipeline").
+		Keywords("discard", "queue", "artifact", "pipeline", "recovery").
+		Priority(60).
+		Usage("Use when a previously finalized verification artifact is no longer relevant — the underlying suite was wrong, the recipient is no longer in scope, or the task requirement changed before the artifact was delivered. Provide one targets entry per recipient to drop and a single reason describing why the discard is correct. Discard is bounded loss: dropped artifacts are not delivered, and the LLM is responsible for re-finalizing when fresh evidence is available.").
+		Avoid("Do not use as a routing shortcut — handoff_next/validate_work already pass queued artifacts through to non-recipient targets via inherited_artifacts. Discard is for genuine obsolescence, not for sidestepping delivery semantics.").
+		Satisfies("Lets the LLM converge faster when it knows an artifact is stale instead of waiting for the iteration-age sweep to drop it automatically.").
+		EnumArrayParam("targets", "Recipient names whose queued artifacts should be dropped.",
+			"string",
+			[]string{PipelineAgentEngineer, PipelineAgentDesigner, PipelineAgentInspector, "inspector", PipelineAgentTester, "tester"},
+			true).
+		StringParam("reason", "Why these queued artifacts are no longer relevant", true).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Targets []string `json:"targets"`
+				Reason  string   `json:"reason"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			reason := strings.TrimSpace(params.Reason)
+			if reason == "" {
+				return nil, fmt.Errorf("reason is required: explain why these artifacts are no longer relevant")
+			}
+			if len(params.Targets) == 0 {
+				return nil, fmt.Errorf("targets is required: name at least one recipient whose artifact should be dropped")
+			}
+			normalized := make([]string, 0, len(params.Targets))
+			seen := make(map[string]struct{}, len(params.Targets))
+			for _, t := range params.Targets {
+				n := normalizePipelineAgentType(t)
+				if n == "" {
+					continue
+				}
+				if _, dup := seen[n]; dup {
+					continue
+				}
+				seen[n] = struct{}{}
+				normalized = append(normalized, n)
+			}
+			if len(normalized) == 0 {
+				return nil, fmt.Errorf("targets must name at least one valid pipeline recipient")
+			}
+			state := PipelineProtocolStateFromContext(ctx)
+			if state == nil {
+				return nil, fmt.Errorf("pipeline protocol state not available")
+			}
+			queueBefore := state.QueuedArtifacts()
+			dropped := make([]map[string]any, 0, len(normalized))
+			notFound := make([]string, 0)
+			for _, target := range normalized {
+				if ref, ok := queueBefore[target]; ok {
+					entry := pipelineHandoffArtifactRefMap(ref)
+					entry["discard_reason"] = reason
+					dropped = append(dropped, entry)
+				} else {
+					notFound = append(notFound, target)
+				}
+			}
+			if len(dropped) == 0 {
+				return map[string]any{
+					"discard_queued_artifacts": true,
+					"dropped":                  []map[string]any{},
+					"not_found":                notFound,
+					"reason":                   reason,
+				}, nil
+			}
+			droppedTargets := make([]string, 0, len(dropped))
+			for _, entry := range dropped {
+				if t, _ := entry["target"].(string); t != "" {
+					droppedTargets = append(droppedTargets, t)
+				}
+			}
+			if err := state.consumeQueuedArtifacts(ctx, droppedTargets); err != nil {
+				return nil, err
+			}
+			result := map[string]any{
+				"discard_queued_artifacts": true,
+				"dropped":                  dropped,
+				"reason":                   reason,
+			}
+			if len(notFound) > 0 {
+				result["not_found"] = notFound
+			}
+			return result, nil
+		}).
+		Build()
+}
+
 func pipelineHandoffNextSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 	targetEnum := pipelineChallengeTargetEnum(pipelineInvokerAgentType(cfg))
 	return skills.NewSkill("handoff_next").
@@ -827,7 +923,8 @@ func pipelineHandoffNextSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 		Domain("pipeline").
 		Keywords("handoff", "next", "pipeline", "challenge", "route").
 		Priority(100).
-		Usage("End the current pipeline turn by handing top-level ownership to the next agent or cohort with a concrete request, required output, and references. Use this for ordinary phase progression such as Inspector -> Tester for initial tests, Inspector -> Engineer/Designer for implementation, and returned top-level work back to Inspector. Do not use this when you are directly answering an active challenge; use `validate_work` instead.").
+		Usage("End the current pipeline turn by handing top-level ownership to the next agent or cohort. Routes the next turn — separate concern from packaging artifacts. Tester can finalize for engineer/designer and then handoff_next to inspector for review; queued verification artifacts ride along on every dispatched task as `inherited_artifacts` until the receiving agent eventually routes to the actual recipient. Direct routing (handoff_next target == finalize target) delivers the artifact immediately as `verification_artifact_ref`. The result includes `queue_state` describing what was delivered, what was passed through, and what's still pending with age. Do not use this when you are directly answering an active challenge; use `validate_work` instead.").
+		Avoid("Do not strand artifacts. If you finalize for engineer but never route work toward engineer (directly or via inspector relay), the artifact ages out at "+intToString(pipelineArtifactMaxIterations)+" iterations — bounded loss but wasted work. If a queued artifact is no longer relevant, invoke `discard_queued_artifacts` with a reason instead of letting it age out.").
 		Satisfies("Records and dispatches the next top-level pipeline owner without hardcoding semantic stage transitions in the runtime.").
 		EnumArrayParam("target_agents", "Next-owner pipeline roles. Each entry must be one of the pipeline peers your agent is allowed to hand off to.", "string", targetEnum, true).
 		EnumParam("mode", "single or cohort", []string{string(PipelineTurnModeSingle), string(PipelineTurnModeCohort)}, false).
@@ -982,7 +1079,7 @@ func issuePipelineTurnSelection(
 		if err := state.setTerminalAction(action); err != nil {
 			return nil, err
 		}
-		return pipelineTurnSelectionResult(agentType, action, dispatch), nil
+		return pipelineTurnSelectionResult(agentType, action, dispatch, state), nil
 	}
 	if err := state.recordHandoffAction(ctx, action); err != nil {
 		return nil, err
@@ -990,7 +1087,7 @@ func issuePipelineTurnSelection(
 	if err := state.setTerminalAction(action); err != nil {
 		return nil, err
 	}
-	return pipelineTurnSelectionResult(agentType, action, nil), nil
+	return pipelineTurnSelectionResult(agentType, action, nil, state), nil
 }
 
 type pipelineDispatchSelection struct {
@@ -1031,7 +1128,7 @@ type pipelineProtocolRouteOptions struct {
 	ResponderContinuationCID  string
 }
 
-func pipelineTurnSelectionResult(agentType string, action *PipelineTurnAction, dispatch *pipelineDispatchSelection) map[string]any {
+func pipelineTurnSelectionResult(agentType string, action *PipelineTurnAction, dispatch *pipelineDispatchSelection, state *PipelineProtocolState) map[string]any {
 	result := map[string]any{
 		"selected":       true,
 		"agent_type":     agentType,
@@ -1057,7 +1154,111 @@ func pipelineTurnSelectionResult(agentType string, action *PipelineTurnAction, d
 			result["target_agent_id"] = strings.TrimSpace(dispatch.TargetAgentIDs[0])
 		}
 	}
+	if advisory := buildQueueStateAdvisory(state, action, dispatch); advisory != nil {
+		result["queue_state"] = advisory
+	}
 	return result
+}
+
+// buildQueueStateAdvisory describes the post-dispatch queue situation in
+// the terminal-action result. Pure informational — every terminal action
+// succeeds regardless. The advisory tells the LLM what got delivered to
+// its routed cohort, what got passed through as inherited_artifacts to
+// the next hop, and what's still pending and at what age. The LLM reads
+// this on its next turn (via the previous result reflected back in
+// context) and can converge accordingly.
+//
+// Returns nil when there's nothing to advise (no queue activity, no
+// dispatch, etc.) so the result key is omitted entirely rather than
+// always present-but-empty — keeps low-noise turns clean.
+func buildQueueStateAdvisory(state *PipelineProtocolState, action *PipelineTurnAction, dispatch *pipelineDispatchSelection) map[string]any {
+	if state == nil || action == nil {
+		return nil
+	}
+	queue := state.QueuedArtifacts()
+	if len(queue) == 0 && (dispatch == nil || len(dispatch.TargetAgentIDs) == 0) {
+		return nil
+	}
+	currentIteration := 0
+	if snap := state.Snapshot(); snap != nil {
+		currentIteration = snap.Iteration
+	}
+	dispatchedTargets := make(map[string]struct{}, len(action.TargetAgents))
+	for _, target := range action.TargetAgents {
+		dispatchedTargets[normalizePipelineAgentType(target)] = struct{}{}
+	}
+	advisory := map[string]any{
+		"current_iteration":       currentIteration,
+		"max_artifact_iterations": pipelineArtifactMaxIterations,
+	}
+	delivered := make([]map[string]any, 0)
+	inheritedPassthrough := make([]map[string]any, 0)
+	queuedRemaining := make([]map[string]any, 0)
+	for target, ref := range queue {
+		entry := pipelineHandoffArtifactRefMap(ref)
+		age := 0
+		if ref.QueuedAtIteration > 0 {
+			age = currentIteration - ref.QueuedAtIteration
+			entry["age_iterations"] = age
+		}
+		switch {
+		case dispatch == nil:
+			queuedRemaining = append(queuedRemaining, entry)
+		case dispatchHasTarget(dispatchedTargets, target):
+			delivered = append(delivered, entry)
+		default:
+			entry["via"] = append([]string(nil), action.TargetAgents...)
+			if age >= pipelineArtifactMaxIterations {
+				entry["advisory"] = "stranded ≥" + intToString(pipelineArtifactMaxIterations) + " iterations — will auto-discard on next dispatch unless delivered or explicitly discarded via discard_queued_artifacts"
+			} else if age >= 2 {
+				entry["advisory"] = "stranded — consider routing directly to recipient or invoking discard_queued_artifacts with a reason"
+			}
+			inheritedPassthrough = append(inheritedPassthrough, entry)
+		}
+	}
+	if len(delivered) > 0 {
+		advisory["delivered"] = delivered
+	}
+	if len(inheritedPassthrough) > 0 {
+		advisory["inherited_passthrough"] = inheritedPassthrough
+	}
+	if len(queuedRemaining) > 0 {
+		advisory["queued_remaining"] = queuedRemaining
+	}
+	if len(delivered) == 0 && len(inheritedPassthrough) == 0 && len(queuedRemaining) == 0 {
+		return nil
+	}
+	return advisory
+}
+
+func dispatchHasTarget(set map[string]struct{}, target string) bool {
+	_, ok := set[target]
+	return ok
+}
+
+// intToString avoids importing strconv into this file just for the
+// advisory string. Small enough to inline.
+func intToString(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := false
+	if n < 0 {
+		neg = true
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
 }
 
 func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
@@ -1066,7 +1267,7 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 		Domain("pipeline").
 		Keywords("validate", "challenge", "response", "evidence", "pipeline").
 		Priority(100).
-		Usage("Use only when another pipeline agent has an active challenge waiting for your response. This is the required response path for inspector, tester, engineer, or designer challenge turns. Ordinary top-level phase completion still uses `handoff_next`.").
+		Usage("Use only when another pipeline agent has an active challenge waiting for your response. This is the required response path for inspector, tester, engineer, or designer challenge turns. Ordinary top-level phase completion still uses `handoff_next`. If a queued tester verification artifact targets the requesting agent, validate_work delivers it as part of the response; queue entries for other targets ride along as inherited_artifacts and continue forward as the routing chain progresses.").
 		Satisfies("Returns structured adversarial validation to the requesting agent instead of creating a new top-level handoff.").
 		StringParam("challenge_id", "The challenge identifier from the active protocol context", true).
 		StringParam("requesting_agent", "The agent that asked this question", true).
@@ -1426,7 +1627,7 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 				if err := state.setTerminalAction(action); err != nil {
 					return nil, err
 				}
-				result := pipelineTurnSelectionResult(agentType, action, dispatch)
+				result := pipelineTurnSelectionResult(agentType, action, dispatch, state)
 				result["finalize_pipeline"] = false
 				result["verification_requested"] = true
 				return result, nil
@@ -1437,7 +1638,7 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 			if err := state.setTerminalAction(action); err != nil {
 				return nil, err
 			}
-			result := pipelineTurnSelectionResult(agentType, action, nil)
+			result := pipelineTurnSelectionResult(agentType, action, nil, state)
 			result["finalize_pipeline"] = false
 			result["verification_requested"] = true
 			return result, nil
@@ -1729,6 +1930,10 @@ func pipelineTesterFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skill
 			if len(refs) != len(specs) {
 				return nil, fmt.Errorf("tester finalize callback returned %d refs for %d specs", len(refs), len(specs))
 			}
+			currentIteration := 0
+			if snap := state.Snapshot(); snap != nil {
+				currentIteration = snap.Iteration
+			}
 			normalized := make([]PipelineHandoffArtifactRef, len(refs))
 			for i, ref := range refs {
 				if strings.TrimSpace(ref.ArtifactID) == "" {
@@ -1737,6 +1942,9 @@ func pipelineTesterFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skill
 				ref.Target = normalizePipelineAgentType(specs[i].Target)
 				if ref.SuiteID == "" {
 					ref.SuiteID = suiteID
+				}
+				if ref.QueuedAtIteration == 0 {
+					ref.QueuedAtIteration = currentIteration
 				}
 				normalized[i] = ref
 			}
@@ -2188,6 +2396,9 @@ func dispatchPipelineHandoffSelection(
 	if state == nil {
 		return nil, fmt.Errorf("pipeline protocol state not available")
 	}
+	if err := state.sweepAgedArtifacts(ctx); err != nil {
+		return nil, err
+	}
 	tasks, err := buildPipelineHandoffTasks(state, task, action)
 	if err != nil {
 		return nil, err
@@ -2212,7 +2423,28 @@ func dispatchPipelineHandoffSelection(
 		dispatch.TargetAgentIDs = append(dispatch.TargetAgentIDs, strings.TrimSpace(nextTask.TargetAgentID))
 		dispatchedTargets = append(dispatchedTargets, normalizePipelineAgentType(nextTask.AgentType))
 	}
-	if err := state.consumeQueuedArtifacts(ctx, dispatchedTargets); err != nil {
+	// Consume both direct deliveries and stranded artifacts ridden along
+	// in inherited_artifacts. Direct: target was in dispatch cohort, the
+	// artifact was attached as verification_artifact_ref. Stranded: target
+	// was NOT in dispatch cohort, the artifact was attached as
+	// inherited_artifacts on every dispatched task — responsibility for
+	// onward delivery now belongs to those receivers. Either way the
+	// queue entry is consumed: the protocol has handed it off.
+	consumeTargets := make([]string, 0, len(tasks)+len(state.QueuedArtifacts()))
+	consumeTargets = append(consumeTargets, dispatchedTargets...)
+	for target := range state.QueuedArtifacts() {
+		dispatched := false
+		for _, t := range dispatchedTargets {
+			if t == target {
+				dispatched = true
+				break
+			}
+		}
+		if !dispatched {
+			consumeTargets = append(consumeTargets, target)
+		}
+	}
+	if err := state.consumeQueuedArtifacts(ctx, consumeTargets); err != nil {
 		return nil, err
 	}
 	return dispatch, nil
@@ -2265,6 +2497,25 @@ func buildPipelineHandoffTasks(state *PipelineProtocolState, task *PipelineTaskI
 	stage := pipelineStageForAgents(action.TargetAgents)
 	nextTasks := make([]*PipelineTaskInput, 0, len(action.TargetAgents))
 	queue := state.QueuedArtifacts()
+	directTargets := make(map[string]struct{}, len(action.TargetAgents))
+	for _, rawTarget := range action.TargetAgents {
+		directTargets[normalizePipelineAgentType(rawTarget)] = struct{}{}
+	}
+	// Stranded artifacts are queue entries whose recipient is NOT in the
+	// current dispatch cohort. Per the agentic dispatch contract, they
+	// ride along on every dispatched task as inherited_artifacts so the
+	// next hop (typically inspector) can route them onward to the actual
+	// recipient when it next dispatches. The first dispatch consumes the
+	// stranded entries from the queue — they have been handed off to the
+	// next hop's responsibility, even though they aren't yet delivered to
+	// their final target.
+	stranded := make([]PipelineHandoffArtifactRef, 0)
+	for target, ref := range queue {
+		if _, direct := directTargets[target]; direct {
+			continue
+		}
+		stranded = append(stranded, ref)
+	}
 	for _, rawTarget := range action.TargetAgents {
 		targetAgent := normalizePipelineAgentType(rawTarget)
 		next := clonePipelineTaskInput(task)
@@ -2277,6 +2528,19 @@ func buildPipelineHandoffTasks(state *PipelineProtocolState, task *PipelineTaskI
 		next.Context["pipeline_protocol"] = pipelineProtocolTaskSnapshotMap(snapshot)
 		if ref, ok := queue[targetAgent]; ok {
 			next.Context["verification_artifact_ref"] = pipelineHandoffArtifactRefMap(ref)
+		}
+		// Inherited artifacts: queued for OTHER recipients that this hop
+		// should carry forward. The receiving agent reads them from
+		// task.Context["inherited_artifacts"] and decides whether to route
+		// to those recipients on its next handoff. Inheritance is an
+		// agentic responsibility — the protocol delivers context, the LLM
+		// decides what to do with it.
+		if len(stranded) > 0 {
+			inherited := make([]map[string]any, 0, len(stranded))
+			for _, ref := range stranded {
+				inherited = append(inherited, pipelineHandoffArtifactRefMap(ref))
+			}
+			next.Context["inherited_artifacts"] = inherited
 		}
 		nextTasks = append(nextTasks, next)
 	}
@@ -2302,6 +2566,9 @@ func pipelineHandoffArtifactRefMap(ref PipelineHandoffArtifactRef) map[string]an
 	}
 	if focus := normalizeStringList(ref.FailureFocus); len(focus) > 0 {
 		out["failure_focus"] = focus
+	}
+	if ref.QueuedAtIteration > 0 {
+		out["queued_at_iteration"] = ref.QueuedAtIteration
 	}
 	return out
 }

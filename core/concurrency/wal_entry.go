@@ -15,14 +15,31 @@ const (
 	EntryLLMRequest
 	EntryLLMResponse
 	EntryFileChange
+
+	// Bayesian learning WAL entries (SCORE-04). The payloads are owned
+	// by core/quality to avoid a dependency cycle: this package defines
+	// the entry-type enum; the quality package defines the payload
+	// schemas and exposes encode/decode helpers.
+	//
+	// Replay during recovery requires the quality package to register a
+	// handler via RegisterQualityEntryReplayer — core/concurrency does
+	// not know how to interpret the payloads itself.
+	EntryWeightObservation
+	EntryGPObservation
+	EntryThresholdFeedback
+	EntryDecayFeedback
 )
 
 var entryTypeNames = map[EntryType]string{
-	EntryCheckpoint:  "checkpoint",
-	EntryStateChange: "state_change",
-	EntryLLMRequest:  "llm_request",
-	EntryLLMResponse: "llm_response",
-	EntryFileChange:  "file_change",
+	EntryCheckpoint:        "checkpoint",
+	EntryStateChange:       "state_change",
+	EntryLLMRequest:        "llm_request",
+	EntryLLMResponse:       "llm_response",
+	EntryFileChange:        "file_change",
+	EntryWeightObservation: "weight_observation",
+	EntryGPObservation:     "gp_observation",
+	EntryThresholdFeedback: "threshold_feedback",
+	EntryDecayFeedback:     "decay_feedback",
 }
 
 func (e EntryType) String() string {

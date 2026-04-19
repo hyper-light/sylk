@@ -163,7 +163,16 @@ func TestTesterFinalize_ChallengeResponseRequiresChallengerOnly(t *testing.T) {
 	}
 }
 
-func TestQueueValidator_RefusesHandoffMismatch(t *testing.T) {
+// TestQueueValidator_HandoffMismatchIsNoLongerRejected pins the agentic
+// shift: terminal-action selection is no longer gated by queue-vs-action
+// target parity. The legacy strict validator that rejected handoff_next
+// when its target set did not match the finalized queue conflated
+// finalize_pipeline's "package an artifact for recipient X" contract with
+// handoff_next's "route the next turn" contract — see the rationale block
+// in pipeline_protocol.go where validateQueuedArtifactConsumptionLocked
+// used to live. The contract now lives in skill Usage/Avoid clauses and
+// the dispatch passthrough path; the validator must not gate.
+func TestQueueValidator_HandoffMismatchIsNoLongerRejected(t *testing.T) {
 	state := NewPipelineProtocolState(&PipelineProtocolSnapshot{})
 	state.queuedArtifacts = map[string]PipelineHandoffArtifactRef{
 		PipelineAgentEngineer: {ArtifactID: "a-eng", Target: PipelineAgentEngineer, SuiteID: "suite-1"},
@@ -172,12 +181,16 @@ func TestQueueValidator_RefusesHandoffMismatch(t *testing.T) {
 		Type:         PipelineProtocolActionHandoff,
 		TargetAgents: []string{PipelineAgentDesigner},
 	}
-	if err := state.validateTerminalAction(action); err == nil || !strings.Contains(err.Error(), "does not match") {
-		t.Fatalf("expected target-mismatch refusal, got %v", err)
+	if err := state.validateTerminalAction(action); err != nil {
+		t.Fatalf("handoff_next to non-recipient must succeed (queue rides along via passthrough); got %v", err)
 	}
 }
 
-func TestQueueValidator_RefusesChallengeWhileQueued(t *testing.T) {
+// TestQueueValidator_ChallengeWhileQueuedIsNoLongerRejected pins that
+// challenge_agent is legal regardless of queue contents. Previously the
+// queue blocked challenge_agent entirely which left the LLM with no
+// recoverable terminal action when handoff_next was also rejected.
+func TestQueueValidator_ChallengeWhileQueuedIsNoLongerRejected(t *testing.T) {
 	state := NewPipelineProtocolState(&PipelineProtocolSnapshot{})
 	state.queuedArtifacts = map[string]PipelineHandoffArtifactRef{
 		PipelineAgentEngineer: {ArtifactID: "a-eng", Target: PipelineAgentEngineer},
@@ -187,12 +200,16 @@ func TestQueueValidator_RefusesChallengeWhileQueued(t *testing.T) {
 		CreatesChallenge: true,
 		TargetAgents:     []string{PipelineAgentEngineer},
 	}
-	if err := state.validateTerminalAction(action); err == nil || !strings.Contains(err.Error(), "challenge_agent") {
-		t.Fatalf("expected challenge-vs-queue refusal, got %v", err)
+	if err := state.validateTerminalAction(action); err != nil {
+		t.Fatalf("challenge_agent must be legal while artifacts are queued; got %v", err)
 	}
 }
 
-func TestQueueValidator_AllowsHandoffWhenTargetSetMatches(t *testing.T) {
+// TestQueueValidator_HandoffMatchingCohortStillSucceeds pins backwards
+// compatibility with the canonical "tester finalizes for engineer and
+// hands off directly to engineer" flow. The change loosens the validator
+// for non-matching targets but must not regress the matching case.
+func TestQueueValidator_HandoffMatchingCohortStillSucceeds(t *testing.T) {
 	state := NewPipelineProtocolState(&PipelineProtocolSnapshot{})
 	state.queuedArtifacts = map[string]PipelineHandoffArtifactRef{
 		PipelineAgentEngineer: {ArtifactID: "a-eng", Target: PipelineAgentEngineer},

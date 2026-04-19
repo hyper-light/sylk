@@ -352,6 +352,72 @@ func TestConcurrentStreamThinkingAnimatesSecondaryPipelineEntry(t *testing.T) {
 	}
 }
 
+func TestRenderActivityBridge_MultipleConcurrentPendingStates(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.SetSize(120, 24)
+
+	// Two concurrent pipelines each publish a non-terminal state with no
+	// streaming entry to own them (the routing gap between complete of
+	// agent A and start of agent B). Both should render as bridge rows —
+	// the single-bridge model clobbered one with the other before this
+	// test existed.
+	comp, _ := m.Update(msg.AgentStateMsg{
+		SessionID:     "s1",
+		CorrelationID: "pipeline-A-cid",
+		AgentID:       "engineer-A",
+		AgentType:     "engineer",
+		State:         "reasoning",
+		TransitionID:  10,
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.AgentStateMsg{
+		SessionID:     "s1",
+		CorrelationID: "pipeline-B-cid",
+		AgentID:       "tester-B",
+		AgentType:     "tester-pipeline",
+		State:         "awaiting_peer_response",
+		Detail:        "awaiting engineer handoff",
+		TransitionID:  11,
+	})
+	m = comp.(*Model)
+
+	rendered := m.renderActivityBridge()
+	if rendered == "" {
+		t.Fatal("expected bridge to render for pending concurrent states")
+	}
+	lines := strings.Split(rendered, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("bridge line count = %d, want 2 (one per concurrent state); got:\n%s", len(lines), rendered)
+	}
+	if !strings.Contains(lines[0], "engineer") {
+		t.Fatalf("first bridge line missing engineer label: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "tester-pipeline") {
+		t.Fatalf("second bridge line missing tester-pipeline label: %q", lines[1])
+	}
+
+	// A terminal state on the first correlation evicts it; only the
+	// second bridge row should remain.
+	comp, _ = m.Update(msg.AgentStateMsg{
+		SessionID:     "s1",
+		CorrelationID: "pipeline-A-cid",
+		AgentID:       "engineer-A",
+		AgentType:     "engineer",
+		State:         "complete",
+		TransitionID:  12,
+	})
+	m = comp.(*Model)
+	rendered = m.renderActivityBridge()
+	lines = strings.Split(rendered, "\n")
+	if len(lines) != 1 {
+		t.Fatalf("after terminal on A: line count = %d, want 1; got:\n%s", len(lines), rendered)
+	}
+	if !strings.Contains(lines[0], "tester-pipeline") {
+		t.Fatalf("remaining bridge line missing tester-pipeline label: %q", lines[0])
+	}
+}
+
 func TestAgentStateMsg_SurfacesReasoningOnStreamingEntry(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 

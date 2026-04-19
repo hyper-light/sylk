@@ -7,7 +7,7 @@ import (
 )
 
 func pipelineInspectorVisibleSkillNames() []string {
-	return agentShared.AppendMemoryForestVisibleSkillNames([]string{
+	base := agentShared.AppendMemoryForestVisibleSkillNames([]string{
 		"search_skills",
 		"read_file",
 		"diff_workspace_file",
@@ -39,6 +39,11 @@ func pipelineInspectorVisibleSkillNames() []string {
 		"coord_request_review",
 		"coord_resolve_artifact",
 	}, "inspector-pipeline")
+	// Inspector gets BOTH the awareness skills AND the audit-time
+	// inspect_open_activity. The audit skill is what makes the
+	// inspector's role at finalize time actually inspect open
+	// fabric activity (challenges, holds, hot scopes, decisions).
+	return agentShared.AppendFabricInspectorSkillNames(base)
 }
 
 func pipelineInspectorMutatingSkillNames() []string {

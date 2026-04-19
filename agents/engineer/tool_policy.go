@@ -7,7 +7,7 @@ import (
 )
 
 func engineerVisibleSkillNames() []string {
-	return shared.AppendMemoryForestVisibleSkillNames([]string{
+	base := shared.AppendMemoryForestVisibleSkillNames([]string{
 		"search_skills",
 		"read_file",
 		"read_workspace_file",
@@ -49,6 +49,9 @@ func engineerVisibleSkillNames() []string {
 		"report_confidence",
 		"signal_orchestrator",
 	}, "engineer")
+	// Activity Fabric: ambient awareness primitives must be visible
+	// by default. See docs/SCRIBE_FABRIC.md.
+	return shared.AppendFabricAwarenessSkillNames(base)
 }
 
 func engineerMutatingSkillNames() []string {

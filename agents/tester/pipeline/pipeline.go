@@ -310,6 +310,16 @@ func (pt *PipelineTester) registerCoreSkills() {
 	}) {
 		pt.skills.Register(skill)
 	}
+	// Phase 5 of SCRIBE_FABRIC.md: recall_my_history lets the agent
+	// consult its own scribe biographer.
+	for _, skill := range agentshared.RecallSkills(agentshared.RecallSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return pt.config.SessionID },
+		AgentID:        func() string { return pt.id },
+		AgentType:      func() string { return "tester-pipeline" },
+	}) {
+		pt.skills.Register(skill)
+	}
 	for _, skill := range agentshared.PipelineProtocolSkills(agentshared.PipelineProtocolSkillConfig{
 		AgentType:      func() string { return "tester-pipeline" },
 		AgentID:        func() string { return pt.id },

@@ -7,7 +7,7 @@ import (
 )
 
 func globalInspectorVisibleSkillNames() []string {
-	return agentShared.AppendMemoryForestVisibleSkillNames([]string{
+	base := agentShared.AppendMemoryForestVisibleSkillNames([]string{
 		"run_linter",
 		"run_type_checker",
 		"run_security_scan",
@@ -45,6 +45,9 @@ func globalInspectorVisibleSkillNames() []string {
 		"research_dependency_install",
 		"install_dependency_tooling",
 	}, "inspector")
+	// Global inspector audits at session level — gets the full
+	// fabric awareness + audit skill bundle.
+	return agentShared.AppendFabricInspectorSkillNames(base)
 }
 
 func globalInspectorMutatingSkillNames() []string {

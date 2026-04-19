@@ -171,13 +171,15 @@ func (s *Scribe) storeArchivalistSkill(runState *scribeRunState) *skills.Skill {
 		Usage("Call exactly once after any needed forest lookups. Do not return free text instead of calling this tool.").
 		BestPractice("Keep the commentary compact, factual, and archival. Preserve only the details that will matter in later retrieval, replay, or handoff.").
 		ObjectParam("commentary", "Structured commentary object for the current observed turn", map[string]*skills.Property{
-			"summary":         {Type: "string", Description: "What happened this turn"},
-			"progress":        {Type: "string", Description: "Overall task progress after this turn"},
-			"decisions":       {Type: "string", Description: "Key decisions or tradeoffs made this turn"},
-			"state":           {Type: "string", Description: "Current working state after this turn"},
-			"risk":            {Type: "string", Description: "Risks, regressions, or unresolved concerns"},
-			"handoff_context": {Type: "string", Description: "Compact context worth preserving for future handoff or replay"},
-			"details":         {Type: "object", Description: "Optional role-specific details that carry high downstream value"},
+			"summary":          {Type: "string", Description: "What happened this turn"},
+			"progress":         {Type: "string", Description: "Overall task progress after this turn"},
+			"decisions":        {Type: "string", Description: "Key decisions or tradeoffs made this turn"},
+			"state":            {Type: "string", Description: "Current working state after this turn"},
+			"risk":             {Type: "string", Description: "Risks, regressions, or unresolved concerns"},
+			"handoff_context":  {Type: "string", Description: "Compact context worth preserving for future handoff or replay"},
+			"details":          {Type: "object", Description: "Optional role-specific details that carry high downstream value"},
+			"precedent_worthy": {Type: "boolean", Description: "Optional: true when this batch's pattern is precedent-quality and should be harvested by Memory Forest. Reserve for genuinely high-signal patterns (successful cross-pipeline reconciliations, unusual failures with clean recoveries, etc.)."},
+			"precedent_why":    {Type: "string", Description: "Optional: short prose explaining why this pattern is precedent-worthy. Required when precedent_worthy=true."},
 		}, true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			commentary, err := parseScribeCommentary(input)
@@ -203,6 +205,16 @@ func (s *Scribe) storeArchivalistSkill(runState *scribeRunState) *skills.Skill {
 			}
 			runState.stored = true
 			runState.commentary = string(payload)
+
+			// Phase 7 — precedent emission. When the LLM marked this
+			// batch as precedent-worthy, emit a separate
+			// ActionPrecedentEmitted activity. The ForestSubscriber
+			// already harvests these as Memory Forest candidates
+			// (see Tier 11 of FABRIC.md).
+			if precedentWorthyFromCommentary(commentary) {
+				s.emitPrecedentActivity(ctx, commentary, runState.feed)
+			}
+
 			return map[string]any{
 				"stored":      true,
 				"summary":     summary,
@@ -212,6 +224,33 @@ func (s *Scribe) storeArchivalistSkill(runState *scribeRunState) *skills.Skill {
 			}, nil
 		}).
 		Build()
+}
+
+// precedentWorthyFromCommentary inspects the LLM's structured
+// commentary and reports whether it flagged the batch as precedent-
+// worthy. Tolerant of multiple JSON-shape conventions: bool true,
+// string "true", string "yes". A non-empty precedent_why is also
+// treated as a positive signal even when the bool is missing or
+// false (the LLM articulated a reason — that's good enough).
+func precedentWorthyFromCommentary(commentary map[string]any) bool {
+	if commentary == nil {
+		return false
+	}
+	switch v := commentary["precedent_worthy"].(type) {
+	case bool:
+		if v {
+			return true
+		}
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "yes", "1":
+			return true
+		}
+	}
+	if why := strings.TrimSpace(scribeStringFromAny(commentary["precedent_why"])); why != "" {
+		return true
+	}
+	return false
 }
 
 func parseScribeCommentary(input json.RawMessage) (map[string]any, error) {

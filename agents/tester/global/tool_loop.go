@@ -237,6 +237,12 @@ func (gt *GlobalTester) applyToolCalls(
 		if gov := agentshared.ContextGovernorFromContext(ctx); gov != nil && !isError {
 			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
+		// Activity Fabric ambient_context envelope.
+		result = agentshared.AppendAmbientContext(ctx, agentshared.AmbientEnvelopeConfig{
+			SessionID: func() string { return gt.config.SessionID },
+			AgentID:   func() string { return gt.id },
+			AgentType: func() string { return "tester" },
+		}, result)
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,

@@ -256,6 +256,13 @@ func (e *Engineer) applyToolCalls(
 		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && !isError {
 			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
+		// Activity Fabric ambient_context envelope.
+		result = shared.AppendAmbientContext(ctx, shared.AmbientEnvelopeConfig{
+			SessionID:  func() string { return e.config.SessionID },
+			AgentID:    func() string { return e.id },
+			AgentType:  func() string { return "engineer" },
+			PipelineID: func() string { return e.pipelineID },
+		}, result)
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,

@@ -88,6 +88,13 @@ type AgentPodConfig struct {
 	// ScribeFactory creates Scribes for each member type. Nil = no Scribes.
 	ScribeFactory ScribeFactory
 
+	// SessionDir is the per-session storage directory (typically
+	// {.sylk}/sessions/{sessionID}). Passed into Scribes so they can
+	// persist replica-generation counters and surface them on
+	// narrations (SCRIBE_FABRIC.md Phase 0). Empty is allowed —
+	// scribes degrade gracefully to generation 0 in that case.
+	SessionDir string
+
 	// Direct pod lifecycle configuration. When Runtime is set, AgentPod owns
 	// tier transitions, member containers, mounted volumes, and request guard
 	// bookkeeping directly.
@@ -123,6 +130,7 @@ const preActivateNodeID = "__pre_activate__"
 type AgentPod struct {
 	podID        string
 	sessionID    string
+	sessionDir   string
 	activator    guide.PodActivator
 	registrar    PodRegistrar
 	activityPub  events.ActivityPublisher
@@ -180,6 +188,7 @@ func NewAgentPod(cfg AgentPodConfig) *AgentPod {
 	agentPod := &AgentPod{
 		podID:         cfg.PodID,
 		sessionID:     cfg.SessionID,
+		sessionDir:    cfg.SessionDir,
 		activator:     cfg.Activator,
 		registrar:     cfg.Registrar,
 		activityPub:   cfg.ActivityPub,
@@ -785,6 +794,13 @@ func (p *AgentPod) startScribes() {
 		}
 		if setter, ok := s.(interface{ SetAgentPod(*AgentPod) }); ok {
 			setter.SetAgentPod(p)
+		}
+		// SCRIBE_FABRIC.md Phase 0: inject per-session state so the
+		// scribe can persist its replica-generation counter and tag
+		// narrations with sessionID. Optional via interface check —
+		// older Scribe implementations without SetSession still work.
+		if setter, ok := s.(interface{ SetSession(sessionID, sessionDir string) }); ok {
+			setter.SetSession(p.sessionID, p.sessionDir)
 		}
 		if err := s.Start(); err != nil {
 			if p.logger != nil {

@@ -1737,13 +1737,24 @@ func routePlanAcceptanceSkill(a *Architect) *skills.Skill {
 				"plan_id_param", params.PlanID,
 				"session_id", sessionID,
 				"user_response", truncateString(params.UserResponse, 200))
-			plan, err := a.resolveReadyPlanForAcceptance(params.PlanID, sessionID)
+			plan, statusReport, err := a.resolveReadyPlanForAcceptance(params.PlanID, sessionID)
 			if err != nil {
 				architectDebugLog().Warn("route_plan_acceptance: PLAN_RESOLVE_FAILED",
 					"error", err.Error(),
 					"plan_id_param", params.PlanID,
 					"session_id", sessionID)
 				return nil, err
+			}
+			if statusReport != nil {
+				architectDebugLog().Info("route_plan_acceptance: STATUS_REPORT_RETURNED",
+					"plan_id", statusReport.PlanID,
+					"status", statusReport.Status,
+					"resumable", statusReport.Resumable)
+				// Non-Ready status is informational, not an error. The
+				// LLM reads the structured report and composes a
+				// user-facing response (e.g. "your plan is already
+				// running" instead of an opaque tool failure).
+				return statusReport, nil
 			}
 			architectDebugLog().Info("route_plan_acceptance: PLAN_RESOLVED",
 				"plan_id", plan.ID,
@@ -1781,9 +1792,98 @@ func parseRoutePlanAcceptanceParams(input json.RawMessage) (*routePlanAcceptance
 	return &params, nil
 }
 
+// planAcceptanceStatusReport is the structured advisory returned to the LLM
+// when route_plan_acceptance is invoked against a plan that is found but
+// not in PlanStatusReady. It is NOT an error — it is informational context
+// the architect uses to compose a meaningful user-facing message instead
+// of a brick-wall failure. Per the agentic skill design (skill code is
+// mechanism, not policy), the runtime tells the LLM what's true and lets
+// the LLM choose how to respond.
+type planAcceptanceStatusReport struct {
+	RoutePlanAcceptance bool   `json:"route_plan_acceptance"`
+	Routed              bool   `json:"routed"`
+	PlanID              string `json:"plan_id"`
+	PlanName            string `json:"plan_name,omitempty"`
+	Status              string `json:"status"`
+	Message             string `json:"message"`
+	UserGuidance        string `json:"user_guidance"`
+	Resumable           bool   `json:"resumable"`
+}
+
+// statusReportForNonReadyPlan classifies a TERMINAL non-Ready plan into
+// a friendly advisory the LLM can act on. Only terminal statuses
+// (Completed / Failed / Superseded) and pre-Ready formulation states
+// produce advisories — those are situations where re-dispatch is
+// genuinely wrong.
+//
+// Executing and Orchestrating intentionally do NOT produce an advisory:
+// they flow through to actOnAccept → dispatchPlanExecution, which is
+// idempotent. dispatchPlanExecution checks plan.PendingWork: if a
+// plan-handoff continuation exists, it returns "already being handed
+// off" without re-dispatching; if no continuation exists (the in-flight
+// state was lost across architect restart), it re-creates one. This
+// gives us proper resume semantics for the "user re-confirms after
+// architect demotion/restart" case without papering over genuine
+// stalled state with a misleading "your plan is running" message when
+// it actually isn't.
+func statusReportForNonReadyPlan(plan *DesignPlan) *planAcceptanceStatusReport {
+	report := &planAcceptanceStatusReport{
+		RoutePlanAcceptance: true,
+		Routed:              false,
+		PlanID:              plan.ID,
+		PlanName:            derivePlanName(plan),
+		Status:              plan.Status.String(),
+	}
+	switch plan.Status {
+	case PlanStatusCompleted:
+		report.Message = "Plan completed in a prior turn. Acceptance routing is moot."
+		report.UserGuidance = "Tell the user the plan has already completed. If they want a new plan, propose one via plan action=propose; do not re-accept this one."
+		report.Resumable = false
+	case PlanStatusFailed:
+		report.Message = "Plan previously failed. Acceptance routing on the failed plan would not restart execution."
+		report.UserGuidance = "Tell the user the prior run failed and ask whether they want a fresh plan or a targeted retry. Use plan action=propose for a fresh plan; use the failure context to inform the new approach."
+		report.Resumable = false
+	case PlanStatusSuperseded:
+		report.Message = "Plan was superseded by a newer revision. Route the user's response to the active plan instead."
+		report.UserGuidance = "Look for a newer plan (latest ready plan in this session) and re-invoke route_plan_acceptance against it; do not re-accept the superseded plan."
+		report.Resumable = false
+	default:
+		// Pending / Analyzing / Consulting / Designing / Generating —
+		// the plan is mid-formulation and not yet presentable.
+		report.Message = "Plan is still being formulated and is not yet ready for user acceptance."
+		report.UserGuidance = "Wait for the plan to reach Ready status before routing acceptance. If the user is asking about progress, summarize what stage the planning is in."
+		report.Resumable = false
+	}
+	return report
+}
+
+// nonReadyStatusProducesAdvisory reports whether the given plan status
+// should short-circuit route_plan_acceptance with a structured advisory.
+// Terminal statuses (Completed/Failed/Superseded) and pre-Ready
+// formulation states produce advisories. Executing and Orchestrating do
+// not — they flow through to dispatchPlanExecution's idempotent path so
+// resume-after-restart correctly re-attaches or re-dispatches.
+func nonReadyStatusProducesAdvisory(s PlanStatus) bool {
+	switch s {
+	case PlanStatusExecuting, PlanStatusOrchestrating:
+		return false
+	default:
+		return true
+	}
+}
+
 // resolveReadyPlanForAcceptance locates the plan by ID or falls back to the
-// latest ready plan for the given session. Returns an error if no eligible plan exists.
-func (a *Architect) resolveReadyPlanForAcceptance(planID, sessionID string) (*DesignPlan, error) {
+// latest ready plan for the given session.
+//
+// Return shape (mutually exclusive):
+//   - (plan, nil, nil) — Ready plan found; proceed with normal acceptance routing.
+//   - (nil, report, nil) — Plan found but not in Ready status; the report is
+//     informational and the handler returns it directly to the LLM as a
+//     non-error result. Per the agentic design, status mismatch is data,
+//     not a runtime gate.
+//   - (nil, nil, err) — Plan genuinely cannot be located (no ID match, no
+//     ready-fallback). Returned as an actual error.
+func (a *Architect) resolveReadyPlanForAcceptance(planID, sessionID string) (*DesignPlan, *planAcceptanceStatusReport, error) {
 	architectDebugLog().Info("resolveReadyPlanForAcceptance: ENTRY",
 		"plan_id_param", planID,
 		"session_id", sessionID)
@@ -1792,29 +1892,30 @@ func (a *Architect) resolveReadyPlanForAcceptance(planID, sessionID string) (*De
 		if !ok {
 			architectDebugLog().Warn("resolveReadyPlanForAcceptance: NOT_FOUND",
 				"plan_id", id)
-			return nil, fmt.Errorf("plan not found: %s", id)
+			return nil, nil, fmt.Errorf("plan not found: %s", id)
 		}
-		if plan.Status != PlanStatusReady {
-			architectDebugLog().Warn("resolveReadyPlanForAcceptance: NOT_READY",
+		if plan.Status != PlanStatusReady && nonReadyStatusProducesAdvisory(plan.Status) {
+			architectDebugLog().Info("resolveReadyPlanForAcceptance: NON_READY_ADVISORY",
 				"plan_id", id,
 				"status", plan.Status.String())
-			return nil, fmt.Errorf("plan %s is not in ready status (current: %s)", id, plan.Status)
+			return nil, statusReportForNonReadyPlan(plan), nil
 		}
 		architectDebugLog().Info("resolveReadyPlanForAcceptance: FOUND_BY_ID",
 			"plan_id", id,
-			"status", plan.Status.String())
-		return plan, nil
+			"status", plan.Status.String(),
+			"resume_through_dispatch", plan.Status != PlanStatusReady)
+		return plan, nil, nil
 	}
 	plan := a.latestReadyPlan(sessionID)
 	if plan == nil {
 		architectDebugLog().Warn("resolveReadyPlanForAcceptance: NO_READY_PLAN",
 			"session_id", sessionID)
-		return nil, fmt.Errorf("no ready plan available for acceptance evaluation")
+		return nil, nil, fmt.Errorf("no ready plan available for acceptance evaluation")
 	}
 	architectDebugLog().Info("resolveReadyPlanForAcceptance: FOUND_BY_SESSION",
 		"plan_id", plan.ID,
 		"session_id", sessionID)
-	return plan, nil
+	return plan, nil, nil
 }
 
 // planAcceptancePayload is the exact structure the Guide's
@@ -2191,13 +2292,24 @@ func handlePlanAcceptanceResultSkill(a *Architect) *skills.Skill {
 				"user_response_len", len(params.UserResponse),
 				"modifications", len(params.Modifications))
 			sessionID := architectSessionIDFromContext(ctx)
-			plan, err := a.resolveReadyPlanForAcceptance(params.PlanID, sessionID)
+			plan, statusReport, err := a.resolveReadyPlanForAcceptance(params.PlanID, sessionID)
 			if err != nil {
 				architectDebugLog().Warn("handlePlanAcceptanceResult: PLAN_RESOLVE_FAILED",
 					"plan_id", params.PlanID,
 					"session_id", sessionID,
 					"error", err.Error())
 				return nil, err
+			}
+			if statusReport != nil {
+				architectDebugLog().Info("handlePlanAcceptanceResult: STATUS_REPORT_RETURNED",
+					"plan_id", statusReport.PlanID,
+					"status", statusReport.Status,
+					"resumable", statusReport.Resumable)
+				// Plan is not in Ready status — surface the structured
+				// advisory back to the LLM so it can compose an
+				// appropriate user-facing message rather than aborting
+				// the turn with an opaque tool failure.
+				return statusReport, nil
 			}
 			verdict := acceptanceVerdict(params.Result)
 			architectDebugLog().Info("handlePlanAcceptanceResult: DISPATCHING",

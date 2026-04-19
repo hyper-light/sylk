@@ -111,6 +111,15 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	}) {
 		gi.skills.Register(skill)
 	}
+	// Phase 5 of SCRIBE_FABRIC.md: recall_my_history.
+	for _, skill := range agentShared.RecallSkills(agentShared.RecallSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return gi.config.SessionID },
+		AgentID:        func() string { return gi.id },
+		AgentType:      func() string { return "inspector" },
+	}) {
+		gi.skills.Register(skill)
+	}
 
 	// Diagnostics
 	gi.skills.Register(agentShared.NewSelfDiagnosticSkill(&globalInspectorDiag{gi: gi}))

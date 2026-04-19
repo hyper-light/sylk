@@ -7,7 +7,7 @@ import (
 )
 
 func globalTesterVisibleSkillNames() []string {
-	return agentshared.AppendMemoryForestVisibleSkillNames([]string{
+	base := agentshared.AppendMemoryForestVisibleSkillNames([]string{
 		"analyze_risk",
 		"plan_tests",
 		"read_file",
@@ -35,6 +35,7 @@ func globalTesterVisibleSkillNames() []string {
 		"research_test_tool_install",
 		"install_test_tooling",
 	}, "tester")
+	return agentshared.AppendFabricAwarenessSkillNames(base)
 }
 
 func globalTesterMutatingSkillNames() []string {

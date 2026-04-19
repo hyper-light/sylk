@@ -167,6 +167,42 @@ func (s *PipelineProtocolState) recordTesterFinalize(ctx context.Context, refs [
 	})
 }
 
+// sweepAgedArtifacts auto-discards queued artifacts whose age (current
+// iteration minus QueuedAtIteration) exceeds pipelineArtifactMaxIterations.
+// Bounded-loss convergence guard: prevents queue accumulation across
+// pipeline iterations when an LLM finalizes for a recipient but never
+// routes work toward them. The auto-discard surfaces as a normal
+// consumed event in the durable log so observability tooling can see
+// what was dropped and at what age. No error is returned — the LLM sees
+// the post-sweep state via its next queue_state advisory and can
+// re-finalize if it still needs the artifact.
+func (s *PipelineProtocolState) sweepAgedArtifacts(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	currentIteration := 0
+	if s.snapshot != nil {
+		currentIteration = s.snapshot.Iteration
+	}
+	aged := make([]string, 0)
+	for target, ref := range s.queuedArtifacts {
+		if ref.QueuedAtIteration <= 0 {
+			continue
+		}
+		if currentIteration-ref.QueuedAtIteration > pipelineArtifactMaxIterations {
+			aged = append(aged, target)
+		}
+	}
+	s.mu.RUnlock()
+	if len(aged) == 0 {
+		return nil
+	}
+	return s.appendEvent(ctx, pipelineProtocolEventArtifactConsumed, pipelineArtifactConsumedEvent{
+		Targets: aged,
+	})
+}
+
 // consumeQueuedArtifacts records that the named targets' queued artifact refs
 // have been consumed by a successful dispatch. Cleared from the protocol-state
 // queue so the next turn doesn't re-thread stale refs.

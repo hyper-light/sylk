@@ -263,6 +263,17 @@ func (pt *PipelineTester) applyToolCalls(
 		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && !isError {
 			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
+		// Activity Fabric: append the ambient_context envelope so
+		// the LLM sees peer activity, inbound disputes, and
+		// advisories on every tool result. Bounded; rate-limited;
+		// best-effort. See docs/SCRIBE_FABRIC.md and
+		// agents/shared/ambient_envelope.go.
+		result = shared.AppendAmbientContext(ctx, shared.AmbientEnvelopeConfig{
+			SessionID:  func() string { return pt.config.SessionID },
+			AgentID:    func() string { return pt.id },
+			AgentType:  func() string { return "tester-pipeline" },
+			PipelineID: func() string { return pt.pipelineID },
+		}, result)
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,

@@ -147,7 +147,7 @@ func TestBuildBatchUserRequest_IncludesAllActivities(t *testing.T) {
 			Resolution: activity.ResolutionFine,
 		},
 	}
-	got := buildBatchUserRequest("tester-pipeline", "batch_size", batch)
+	got := buildBatchUserRequest("tester-pipeline", "batch_size", batch, nil)
 	for _, want := range []string{
 		"tester-pipeline",
 		"batch_size",

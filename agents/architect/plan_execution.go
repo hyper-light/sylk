@@ -321,10 +321,26 @@ func (a *Architect) dispatchPlanExecution(
 	}
 
 	if plan.PendingWork != nil && plan.PendingWork.Kind == string(continuationKindPlanHandoff) {
-		return &ConversationResult{
-			Response: "The plan is already being handed off to the orchestrator. I'll update you when it confirms ingestion.",
-			Intent:   IntentExecute,
-		}, true
+		// Idempotency guard: if a plan-handoff continuation is still
+		// fresh (ExpiresAt in the future), the orchestrator already
+		// owns this dispatch — return early to avoid double-handoff.
+		// If the continuation has expired, it's stale state from a
+		// prior architect run that never received a confirmation
+		// (typically: process restart between dispatch and confirm).
+		// In that case clear the stale continuation and fall through
+		// to a fresh dispatch so the user's resume actually executes
+		// instead of getting "already being handed off" forever.
+		if plan.PendingWork.ExpiresAt.IsZero() || time.Now().UTC().Before(plan.PendingWork.ExpiresAt) {
+			return &ConversationResult{
+				Response: "The plan is already being handed off to the orchestrator. I'll update you when it confirms ingestion.",
+				Intent:   IntentExecute,
+			}, true
+		}
+		a.logInfo("dispatchPlanExecution: clearing stale plan_handoff continuation",
+			"plan_id", plan.ID,
+			"continuation_corr_id", plan.PendingWork.CorrelationID,
+			"expired_at", plan.PendingWork.ExpiresAt)
+		plan.PendingWork = nil
 	}
 
 	payload := buildHandoffPayload(plan, "user-approved execution")

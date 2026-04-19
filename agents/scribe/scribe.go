@@ -146,28 +146,25 @@ func New(cfg Config) *Scribe {
 	if maxToolRuns == 0 {
 		maxToolRuns = defaultMaxToolRuns
 	}
-	// Acquire the replica generation immediately at construction so
-	// every narration this instance produces is correctly attributed
-	// to its specific replica life. Best-effort — empty session dir
-	// (test fixtures) yields generation 0.
-	replicaGen, _ := AcquireReplicaGeneration(cfg.SessionDir, cfg.ParentAgentType)
-
+	// Replica generation is acquired in Start (not here) so
+	// agent_pod has a chance to inject per-session state via
+	// SetSession between construction and start. The factory is
+	// process-wide and doesn't know per-session paths.
 	return &Scribe{
-		id:                id,
-		parentAgentType:   cfg.ParentAgentType,
-		provider:          cfg.Provider,
-		model:             cfg.Model,
-		bus:               cfg.Bus,
-		logger:            cfg.Logger,
-		scope:             cfg.Scope,
-		config:            cfg,
-		workstreams:       make(map[string]*scribeWorkstream),
-		maxMessages:       maxMsgs,
-		maxToolRuns:       maxToolRuns,
-		feedCh:            make(chan shared.ScribeFeed, feedBufferSize),
-		replicaGeneration: replicaGen,
-		sessionID:         cfg.SessionID,
-		sessionDir:        cfg.SessionDir,
+		id:              id,
+		parentAgentType: cfg.ParentAgentType,
+		provider:        cfg.Provider,
+		model:           cfg.Model,
+		bus:             cfg.Bus,
+		logger:          cfg.Logger,
+		scope:           cfg.Scope,
+		config:          cfg,
+		workstreams:     make(map[string]*scribeWorkstream),
+		maxMessages:     maxMsgs,
+		maxToolRuns:     maxToolRuns,
+		feedCh:          make(chan shared.ScribeFeed, feedBufferSize),
+		sessionID:       cfg.SessionID,
+		sessionDir:      cfg.SessionDir,
 	}
 }
 
@@ -182,6 +179,26 @@ func (s *Scribe) ReplicaGeneration() int {
 	return s.replicaGeneration
 }
 
+// SetSession lets agent_pod.startScribes inject per-session state
+// (sessionID + sessionDir) after the scribe is constructed by the
+// process-wide ScribeFactory but before Start. Acquires the replica
+// generation counter at Start time so test fixtures that don't wire
+// session info still work cleanly.
+//
+// Best-effort: empty values are ignored. Calling this after Start is
+// also a no-op — the replica counter has already been acquired.
+func (s *Scribe) SetSession(sessionID, sessionDir string) {
+	if s == nil || s.running.Load() {
+		return
+	}
+	if sessionID != "" {
+		s.sessionID = sessionID
+	}
+	if sessionDir != "" {
+		s.sessionDir = sessionDir
+	}
+}
+
 // Start begins the Scribe's feed processing loop and bus subscriptions.
 func (s *Scribe) Start() error {
 	if s.running.Swap(true) {
@@ -190,6 +207,12 @@ func (s *Scribe) Start() error {
 	if s.bus == nil {
 		s.running.Store(false)
 		return fmt.Errorf("scribe %s: bus is required", s.id)
+	}
+	// Acquire replica generation now — SetSession may have populated
+	// sessionDir between New() and here. Best-effort; empty session
+	// dir yields zero (test fixtures).
+	if s.replicaGeneration == 0 {
+		s.replicaGeneration, _ = AcquireReplicaGeneration(s.sessionDir, s.parentAgentType)
 	}
 	s.runCtx, s.runCancel = context.WithCancel(context.Background())
 	s.channels = guide.NewAgentChannels("scribe-"+s.parentAgentType, s.id)
@@ -227,6 +250,13 @@ func (s *Scribe) Start() error {
 	// a silent no-op — the FeedScribe push path stays operational
 	// for that environment.
 	s.fabricUnsubscribe = activitystore.SubscribeToDefault(s)
+
+	// Phase 8: cross-replica continuity via fabric query. Best-effort
+	// — when no prior replica produced narrations or the fabric
+	// source isn't yet wired, the scribe boots cold. The handoff
+	// bridge (when present) still seeds additional in-memory state
+	// via InjectPreparedContext as a warm fast-path.
+	s.inheritPriorReplicaNarrative(s.runCtx)
 	return nil
 }
 

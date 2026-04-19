@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -14,6 +15,51 @@ var (
 	ErrRecoveryFailed    = errors.New("recovery failed")
 	ErrNoValidCheckpoint = errors.New("no valid checkpoint found")
 )
+
+// WALEntryReplayer is the contract a package implements to participate in
+// WAL replay for its own EntryType. Registration lets packages above
+// core/concurrency (e.g. core/quality for Bayesian observations) plug their
+// decode-and-apply logic without pulling their imports down into this
+// foundational package — avoiding the import cycle that would otherwise
+// gate the Bayesian scoring replay path.
+type WALEntryReplayer interface {
+	// ReplayEntry decodes and re-applies a WAL entry. Implementations
+	// return an error only when the entry is malformed in a way the
+	// system cannot recover from; a best-effort implementation should
+	// log and skip individual malformed entries so a single bad record
+	// does not block recovery of the rest of the WAL.
+	ReplayEntry(entry *WALEntry) error
+}
+
+// walEntryReplayers is the process-wide registry, keyed by EntryType.
+// Registration is typically done in the package's init() so replay works
+// regardless of which caller triggered the recovery. A nil replayer value
+// removes any prior registration.
+var (
+	walEntryReplayersMu sync.RWMutex
+	walEntryReplayers   = map[EntryType]WALEntryReplayer{}
+)
+
+// RegisterWALEntryReplayer installs (or replaces) the replayer for an
+// EntryType. Thread-safe; intended for init-time use but safe to call at
+// any point during process lifetime.
+func RegisterWALEntryReplayer(entryType EntryType, replayer WALEntryReplayer) {
+	walEntryReplayersMu.Lock()
+	defer walEntryReplayersMu.Unlock()
+	if replayer == nil {
+		delete(walEntryReplayers, entryType)
+		return
+	}
+	walEntryReplayers[entryType] = replayer
+}
+
+// lookupWALEntryReplayer returns the registered replayer for an EntryType,
+// or nil when none is registered. Used internally by applyWALEntry.
+func lookupWALEntryReplayer(entryType EntryType) WALEntryReplayer {
+	walEntryReplayersMu.RLock()
+	defer walEntryReplayersMu.RUnlock()
+	return walEntryReplayers[entryType]
+}
 
 type RecoveryConfig struct {
 	DataDir            string        `yaml:"data_dir"`
@@ -232,6 +278,15 @@ func (r *RecoveryManager) applyWALEntries(ctx context.Context, entries []*WALEnt
 }
 
 func (r *RecoveryManager) applyWALEntry(entry *WALEntry) error {
+	if entry == nil {
+		return nil
+	}
+	// Registered replayers handle package-owned entry types (e.g. the
+	// Bayesian observations owned by core/quality). We look up the
+	// replayer by EntryType and let it decode its own payload schema.
+	if replayer := lookupWALEntryReplayer(entry.Type); replayer != nil {
+		return replayer.ReplayEntry(entry)
+	}
 	switch entry.Type {
 	case EntryStateChange:
 		return nil

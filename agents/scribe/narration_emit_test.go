@@ -5,8 +5,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/activity"
 )
+
+func sharedScribeFeedHelper(corr string) shared.ScribeFeed {
+	return shared.ScribeFeed{ParentCorrelationID: corr}
+}
 
 func TestEmitNarrationActivity_PublishesActivity(t *testing.T) {
 	col := activity.NewTestCollector()
@@ -90,6 +95,59 @@ func TestEmitNarrationActivity_WrapsNonJsonCommentary(t *testing.T) {
 	}
 	if !strings.Contains(string(emitted[0].Payload), `"raw"`) {
 		t.Errorf("non-JSON commentary should be wrapped; got %s", string(emitted[0].Payload))
+	}
+}
+
+func TestEmitPrecedentActivity_PublishesActivity(t *testing.T) {
+	col := activity.NewTestCollector()
+	prev := activity.SetDefaultSink(col)
+	defer activity.SetDefaultSink(prev)
+
+	s := &Scribe{
+		id:                "scribe-tester-pipeline-x",
+		parentAgentType:   "tester-pipeline",
+		sessionID:         "sess-1",
+		replicaGeneration: 5,
+	}
+	commentary := map[string]any{
+		"summary":          "scope-split resolved cleanly",
+		"precedent_worthy": true,
+		"precedent_why":    "two pipelines reconciled in 3 messages — template for framework disputes",
+	}
+	s.emitPrecedentActivity(context.Background(), commentary, sharedScribeFeedHelper("corr-99"))
+
+	emitted := col.FilterByKind(activity.ActionPrecedentEmitted)
+	if len(emitted) != 1 {
+		t.Fatalf("expected 1 precedent activity; got %d", len(emitted))
+	}
+	a := emitted[0]
+	if !strings.Contains(string(a.Payload), "framework disputes") {
+		t.Errorf("payload should embed precedent_why; got %s", string(a.Payload))
+	}
+	if a.Subject.Coordinates["replica_generation"] != "5" {
+		t.Errorf("coords replica_generation = %q, want 5", a.Subject.Coordinates["replica_generation"])
+	}
+}
+
+func TestPrecedentWorthyFromCommentary(t *testing.T) {
+	cases := map[string]struct {
+		commentary map[string]any
+		want       bool
+	}{
+		"bool true":   {map[string]any{"precedent_worthy": true}, true},
+		"bool false":  {map[string]any{"precedent_worthy": false}, false},
+		"string yes":  {map[string]any{"precedent_worthy": "yes"}, true},
+		"string True": {map[string]any{"precedent_worthy": "True"}, true},
+		"why only":    {map[string]any{"precedent_why": "good reason"}, true},
+		"empty":       {map[string]any{}, false},
+		"nil map":     {nil, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := precedentWorthyFromCommentary(tc.commentary); got != tc.want {
+				t.Errorf("precedentWorthyFromCommentary(%v) = %v, want %v", tc.commentary, got, tc.want)
+			}
+		})
 	}
 }
 

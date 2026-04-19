@@ -105,7 +105,8 @@
       "Bash(cp /home/alundhe/.go_cache/github.com/winfsp/cgofuse@v1.6.0/go.mod third_party/cgofuse/)",
       "Bash(cp /home/alundhe/.go_cache/github.com/winfsp/cgofuse@v1.6.0/fuse/*.go third_party/cgofuse/fuse/)",
       "Bash(awk NR==472 || NR==932 || NR==2348 || NR==4034 {print NR\":\"$0} *)",
-      "Bash(awk 'NR>=1500 && NR<=1656 && /^func/' /home/alundhe/Projects/sylk/cmd/tui.go)"
+      "Bash(awk 'NR>=1500 && NR<=1656 && /^func/' /home/alundhe/Projects/sylk/cmd/tui.go)",
+      "Bash(go clean *)"
     ]
   }
 }

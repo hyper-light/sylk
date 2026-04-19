@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/quality"
 	"github.com/adalundhe/sylk/core/vectorgraphdb"
 )
 
@@ -216,23 +217,19 @@ type ReviewItem struct {
 }
 
 // QualityWeights configures the weights for context quality scoring.
-type QualityWeights struct {
-	Relevance  float64 `json:"relevance"`
-	Freshness  float64 `json:"freshness"`
-	Trust      float64 `json:"trust"`
-	Density    float64 `json:"density"`
-	Redundancy float64 `json:"redundancy"`
-}
+// SCORE-06 migration: the canonical type and defaults now live in
+// core/quality as ScalarWeights / DefaultScalarWeights. This alias
+// preserves the local-import ergonomics for the legacy scorer while the
+// hierarchical Bayesian posteriors (core/quality.QualityWeights) become
+// the source of truth. New code should derive the scalar form at scoring
+// time via quality.ComputeScalarWeights / quality.SampleScalarWeights.
+type QualityWeights = quality.ScalarWeights
 
 // DefaultQualityWeights returns the default quality scoring weights.
+// Delegates to core/quality; present here only to preserve the package
+// import surface for existing callers.
 func DefaultQualityWeights() QualityWeights {
-	return QualityWeights{
-		Relevance:  0.35,
-		Freshness:  0.20,
-		Trust:      0.25,
-		Density:    0.15,
-		Redundancy: 0.05,
-	}
+	return quality.DefaultScalarWeights()
 }
 
 // QualityComponents contains the individual quality metric values.

@@ -642,37 +642,110 @@ func (m *Model) View() string {
 	// never goes silent during routing hops (orchestrator → pipeline →
 	// orchestrator). Streaming entries handle the state inline via their
 	// ThinkingStatus field, so we only render the bridge when no streaming
-	// entry owns the latest state.
+	// entry owns the latest state. The bridge REPLACES the viewport's last
+	// line (the trailing spacer every chat entry emits) rather than appending
+	// a new line — appending would push the panel past its allocated height
+	// and break the enclosing pane's bottom border. Chat-entry renderers
+	// already reserve a blank trailing line, so overlay is lossless.
 	if bridge := m.renderActivityBridge(); bridge != "" {
-		if base != "" {
-			base = base + "\n" + bridge
-		} else {
-			base = bridge
-		}
+		base = overlayBridgeOnLastLine(base, bridge)
 	}
 	m.viewCache = base
 	m.viewDirty = false
 	return m.viewCache
 }
 
-// renderActivityBridge returns a one-line italic indicator showing the
-// latest non-terminal agent-activity state when no currently-streaming
-// entry is surfacing it inline. Returns "" when no bridge is needed
-// (either there is no active state, or the state's correlation already has
-// a streaming entry that is rendering it as a ThinkingStatus trailing
-// line). The bridge exists specifically to cover the gap between one
-// agent's stream complete and the next agent's stream start — the case the
-// explicit agent-state channel was designed to eliminate.
+// overlayBridgeOnLastLine overlays N bridge lines onto the last N lines of
+// the viewport output, preserving total line count so the enclosing pane's
+// bottom border stays aligned. Chat-entry renderers always reserve a blank
+// trailing spacer, so single-line overlays are lossless; multi-line
+// overlays (concurrent pending states) replace additional lines from the
+// bottom of the content area. When the bridge has more lines than the
+// viewport (extreme case: many concurrent pending states with a near-empty
+// viewport), we truncate the bridge to fit so the pane height invariant
+// holds.
+func overlayBridgeOnLastLine(base, bridge string) string {
+	if base == "" {
+		return bridge
+	}
+	bridgeLines := strings.Split(bridge, "\n")
+	baseLines := strings.Split(base, "\n")
+	if len(bridgeLines) == 0 {
+		return base
+	}
+	if len(bridgeLines) >= len(baseLines) {
+		// Bridge alone fills the viewport. Keep only the last len(baseLines)
+		// bridge rows so we preserve the pane height exactly.
+		start := len(bridgeLines) - len(baseLines)
+		return strings.Join(bridgeLines[start:], "\n")
+	}
+	// Replace the trailing N lines of the viewport with the bridge rows.
+	replaceStart := len(baseLines) - len(bridgeLines)
+	for i, line := range bridgeLines {
+		baseLines[replaceStart+i] = line
+	}
+	return strings.Join(baseLines, "\n")
+}
+
+// renderActivityBridge returns a multi-line italic indicator showing every
+// non-terminal agent-activity state whose correlation has no currently-
+// streaming entry to surface it inline. Each concurrent pending state gets
+// its own line so multiple parallel pipelines don't clobber one another.
+// Returns "" when there are no bridgeable states (every non-terminal state
+// is already owned by a streaming entry whose thinking status renders it).
+//
+// The bridge exists specifically to cover the gap between one agent's
+// stream complete and the next agent's stream start — the case the
+// explicit agent-state channel was designed to eliminate. The color cycles
+// through the same holographic thinking gradient used by streaming
+// entries' thinking indicator so the visual language is uniform.
+//
+// Lines are ordered by TransitionID so the most recently-transitioned
+// agent sits last (the typical "what just changed" spot), giving the eye a
+// stable reading order even as states update.
 func (m *Model) renderActivityBridge() string {
-	state := m.latestAgentState
-	if state == nil {
+	if len(m.agentStates) == 0 {
 		return ""
 	}
-	if slot, ok := m.streams[state.CorrelationID]; ok && slot != nil && slot.accumulator != nil {
-		// A streaming entry owns this correlation; the trailing activity
-		// indicator on that entry is already rendering the state inline.
+	pending := make([]*agentActivityState, 0, len(m.agentStates))
+	for cid, state := range m.agentStates {
+		if state == nil {
+			continue
+		}
+		if slot, ok := m.streams[cid]; ok && slot != nil && slot.accumulator != nil {
+			// A streaming entry owns this correlation; the trailing
+			// activity indicator on that entry renders the state inline.
+			continue
+		}
+		pending = append(pending, state)
+	}
+	if len(pending) == 0 {
 		return ""
 	}
+	sort.Slice(pending, func(i, j int) bool {
+		return pending[i].TransitionID < pending[j].TransitionID
+	})
+	width := m.viewport.viewWidth
+	if width <= 0 {
+		width = m.width
+	}
+	now := time.Now()
+	lines := make([]string, 0, len(pending))
+	for _, state := range pending {
+		if line := m.renderBridgeLine(state, width, now); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderBridgeLine renders a single non-terminal state as one bridge line
+// with spinner + elapsed + label + detail, all sharing the holographic
+// gradient style. Returns "" when the state has no renderable detail.
+func (m *Model) renderBridgeLine(state *agentActivityState, width int, now time.Time) string {
 	detail := state.Detail
 	if detail == "" {
 		detail = humanizeAgentState(state.State)
@@ -687,12 +760,12 @@ func (m *Model) renderActivityBridge() string {
 	if label == "" {
 		label = "agent"
 	}
-	text := thinkingSummaryGlyph + " " + label + " — " + detail
-	width := m.viewport.viewWidth
-	if width <= 0 {
-		width = m.width
-	}
-	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted).Italic(true)
+	elapsed := thinkingElapsed(state.ObservedAt, now)
+	spinner := spinnerFrames[thinkingFrameAt(elapsed)]
+	elapsedStr := formatToolDuration(elapsed)
+	text := fmt.Sprintf("%s  %s  %s — %s", spinner, elapsedStr, label, detail)
+	color := lipgloss.Color(m.thinkingColorFor(elapsed))
+	style := lipgloss.NewStyle().Foreground(color).Italic(true)
 	if width > 0 {
 		return style.Render(truncateToWidth(text, width))
 	}
@@ -4144,9 +4217,38 @@ func (m *Model) tickThinking(now time.Time) {
 	if m.tickPendingInterAgentHistory(now) {
 		updated = true
 	}
+	// Keep the inter-stream bridge animating at the same cadence as the
+	// Phase 1 thinking indicator: when a non-terminal state exists and no
+	// streaming entry owns it, each tick advances the spinner frame and
+	// elapsed counter. Marking viewDirty triggers re-render via renderActivityBridge,
+	// which samples the gradient and spinner fresh each frame.
+	if m.bridgeActive() {
+		updated = true
+	}
 	if updated {
 		m.viewDirty = true
 	}
+}
+
+// bridgeActive reports whether at least one non-terminal state has no
+// streaming entry to surface it, so the inter-stream bridge should
+// animate this tick. Used by tickThinking to flag viewDirty every 100ms
+// whenever the bridge rows are visible — each tick advances spinner frame,
+// elapsed counter, and gradient color.
+func (m *Model) bridgeActive() bool {
+	if len(m.agentStates) == 0 {
+		return false
+	}
+	for cid, state := range m.agentStates {
+		if state == nil {
+			continue
+		}
+		if slot, ok := m.streams[cid]; ok && slot != nil && slot.accumulator != nil {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------

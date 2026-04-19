@@ -7,7 +7,7 @@ import (
 )
 
 func pipelineTesterVisibleSkillNames() []string {
-	return agentshared.AppendMemoryForestVisibleSkillNames([]string{
+	base := agentshared.AppendMemoryForestVisibleSkillNames([]string{
 		"search_skills",
 		"read_file",
 		"prepare_pipeline_write_context",
@@ -48,6 +48,13 @@ func pipelineTesterVisibleSkillNames() []string {
 		"query_decisions",
 		"declare_decision",
 	}, "tester-pipeline")
+	// Activity Fabric: awareness + cross-pipeline + recall must be
+	// in the LLM's default tool catalog so the ambient model is
+	// reachable without keyword matching. See SCRIBE_FABRIC.md and
+	// the screenshot review — without this, agents default to the
+	// older direct skills (query_decisions, coord_query_view) and
+	// never reach the fabric.
+	return agentshared.AppendFabricAwarenessSkillNames(base)
 }
 
 func pipelineTesterMutatingSkillNames() []string {

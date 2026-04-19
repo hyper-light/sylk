@@ -237,6 +237,13 @@ func (pi *PipelineInspector) applyToolCalls(
 		if gov := agentShared.ContextGovernorFromContext(ctx); gov != nil && !isError {
 			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
+		// Activity Fabric ambient_context envelope.
+		result = agentShared.AppendAmbientContext(ctx, agentShared.AmbientEnvelopeConfig{
+			SessionID:  func() string { return pi.config.SessionID },
+			AgentID:    func() string { return pi.id },
+			AgentType:  func() string { return "inspector-pipeline" },
+			PipelineID: func() string { return pi.pipelineID },
+		}, result)
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,

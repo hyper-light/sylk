@@ -84,6 +84,15 @@ func (d *Designer) registerCoreSkills() {
 	}) {
 		d.skills.Register(skill)
 	}
+	// Phase 5 of SCRIBE_FABRIC.md: recall_my_history.
+	for _, skill := range shared.RecallSkills(shared.RecallSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return d.config.SessionID },
+		AgentID:        func() string { return d.id },
+		AgentType:      func() string { return "designer" },
+	}) {
+		d.skills.Register(skill)
+	}
 	for _, skill := range shared.PipelineProtocolSkills(shared.PipelineProtocolSkillConfig{
 		AgentType:      func() string { return "designer" },
 		AgentID:        func() string { return d.id },

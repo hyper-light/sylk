@@ -238,6 +238,12 @@ func (gi *GlobalInspector) applyToolCalls(
 		if gov := agentShared.ContextGovernorFromContext(ctx); gov != nil && !isError {
 			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
+		// Activity Fabric ambient_context envelope.
+		result = agentShared.AppendAmbientContext(ctx, agentShared.AmbientEnvelopeConfig{
+			SessionID: func() string { return gi.config.SessionID },
+			AgentID:   func() string { return gi.id },
+			AgentType: func() string { return "inspector" },
+		}, result)
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,

@@ -7,7 +7,7 @@ import (
 )
 
 func designerVisibleSkillNames() []string {
-	return shared.AppendMemoryForestVisibleSkillNames([]string{
+	base := shared.AppendMemoryForestVisibleSkillNames([]string{
 		"search_skills",
 		"read_file",
 		"prepare_pipeline_write_context",
@@ -42,6 +42,7 @@ func designerVisibleSkillNames() []string {
 		"coord_request_review",
 		"coord_resolve_artifact",
 	}, "designer")
+	return shared.AppendFabricAwarenessSkillNames(base)
 }
 
 func designerMutatingSkillNames() []string {

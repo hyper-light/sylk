@@ -39,6 +39,46 @@ type Checkpoint struct {
 	LLMQueues   LLMQueueSnapshot            `json:"llm_queues"`
 	StagingDir  StagingSnapshot             `json:"staging_dir"`
 	Agents      map[string]AgentSnapshot    `json:"agents"`
+
+	// Extras is the open-ended map CheckpointStateProvider implementations
+	// write into. Keyed by a package-owned string (e.g. "quality.weights")
+	// with an opaque JSON payload. Kept outside the top-level struct so
+	// the package defining the payload owns its schema and the checkpoint
+	// core stays dependency-free.
+	Extras map[string]json.RawMessage `json:"extras,omitempty"`
+}
+
+// SetExtra writes an arbitrary payload into the extras map. The key
+// convention is "package.feature" so multiple providers can coexist
+// without collision. The value is JSON-encoded so the checkpoint file
+// remains human-inspectable.
+func (c *Checkpoint) SetExtra(key string, value any) error {
+	if c.Extras == nil {
+		c.Extras = make(map[string]json.RawMessage)
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	c.Extras[key] = data
+	return nil
+}
+
+// GetExtra decodes the named extras payload into out. Returns ok=false
+// when the key is missing so callers can distinguish "no state" from
+// "decode failed." Decode errors surface via the error return.
+func (c *Checkpoint) GetExtra(key string, out any) (bool, error) {
+	if c.Extras == nil {
+		return false, nil
+	}
+	raw, ok := c.Extras[key]
+	if !ok {
+		return false, nil
+	}
+	if out == nil {
+		return true, nil
+	}
+	return true, json.Unmarshal(raw, out)
 }
 
 type PipelineSnapshot struct {
@@ -104,11 +144,13 @@ func (c *Checkpoint) ComputeHash() string {
 		Pipelines   map[string]PipelineSnapshot `json:"pipelines"`
 		LLMQueues   LLMQueueSnapshot            `json:"llm_queues"`
 		Agents      map[string]AgentSnapshot    `json:"agents"`
+		Extras      map[string]json.RawMessage  `json:"extras"`
 	}{
 		WALSequence: c.WALSequence,
 		Pipelines:   c.Pipelines,
 		LLMQueues:   c.LLMQueues,
 		Agents:      c.Agents,
+		Extras:      c.Extras,
 	}
 
 	data, _ := json.Marshal(hashData)

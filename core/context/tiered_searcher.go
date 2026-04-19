@@ -141,6 +141,36 @@ type TieredSearcherConfig struct {
 // Tier 0 (Hot): In-memory cache, < 1ms
 // Tier 1 (Warm): Bleve full-text, < 10ms
 // Tier 2 (Full): Bleve + VectorDB with RRF fusion, < 200ms
+// SearchResultHook is invoked after each tier of a SearchWithBudget call
+// completes, with the results that tier contributed. SCORE-07: quality
+// signal consumers register here so every result batch flows through a
+// hookable surface — scorers can re-rank, attach quality annotations, or
+// record observations for the Bayesian learner.
+//
+// Hooks must be thread-safe: TieredSearcher holds a read lock while
+// iterating the registered list, but hook implementations may be called
+// concurrently from different goroutines if multiple searches run in
+// parallel. Hooks must also be fast — they run inside the search's
+// latency budget and slow hooks will push the searcher past its budget.
+type SearchResultHook interface {
+	// OnResultBatch is called once per tier whose search returned
+	// results. query is the raw query string; tier identifies which
+	// tier produced the batch; batch is the newly-appended slice of
+	// entries (NOT the cumulative result set). Hooks must not mutate
+	// the batch slice — it is aliased into the caller's
+	// TieredSearchResult.
+	OnResultBatch(query string, tier SearchTier, batch []*ContentEntry)
+}
+
+// SearchResultHookFunc adapts a function to SearchResultHook. Useful for
+// ad-hoc hook registration in tests and one-off consumers.
+type SearchResultHookFunc func(query string, tier SearchTier, batch []*ContentEntry)
+
+// OnResultBatch implements SearchResultHook.
+func (f SearchResultHookFunc) OnResultBatch(query string, tier SearchTier, batch []*ContentEntry) {
+	f(query, tier, batch)
+}
+
 type TieredSearcher struct {
 	hotCache *HotCache
 	bleve    TieredBleveSearcher
@@ -159,6 +189,11 @@ type TieredSearcher struct {
 	mu          sync.RWMutex
 	searchCount int64
 	tierHits    map[SearchTier]int64
+
+	// hooksMu guards the result-hook list. Separate from mu to keep the
+	// stats hot-path and the hook registration path contention-free.
+	hooksMu sync.RWMutex
+	hooks   []SearchResultHook
 
 	// config
 	defaultLimit int
@@ -273,6 +308,7 @@ func (ts *TieredSearcher) searchTierHot(
 		result.Tier = TierHotCache
 		ts.recordTierHit(TierHotCache)
 		ts.cbHot.RecordResult(true)
+		ts.fireResultHooks(query, TierHotCache, entries)
 	}
 }
 
@@ -336,7 +372,7 @@ func (ts *TieredSearcher) searchTierWarm(
 		return
 	}
 
-	ts.processBleveResults(searchResult, result)
+	ts.processBleveResults(query, searchResult, result)
 	ts.cbWarm.RecordResult(true)
 }
 
@@ -352,6 +388,7 @@ func (ts *TieredSearcher) executeBleveSearch(
 }
 
 func (ts *TieredSearcher) processBleveResults(
+	query string,
 	searchResult *search.SearchResult,
 	result *TieredSearchResult,
 ) {
@@ -359,6 +396,7 @@ func (ts *TieredSearcher) processBleveResults(
 		return
 	}
 
+	batchStart := len(result.Results)
 	for _, doc := range searchResult.Documents {
 		entry := ts.bleveDocToContentEntry(doc)
 		result.Results = append(result.Results, entry)
@@ -368,6 +406,7 @@ func (ts *TieredSearcher) processBleveResults(
 	if result.WarmHits > 0 {
 		result.Tier = TierWarmIndex
 		ts.recordTierHit(TierWarmIndex)
+		ts.fireResultHooks(query, TierWarmIndex, result.Results[batchStart:])
 	}
 }
 
@@ -409,7 +448,7 @@ func (ts *TieredSearcher) searchTierFull(
 		return
 	}
 
-	ts.processVectorResults(vectorResults, result)
+	ts.processVectorResults(query, vectorResults, result)
 	ts.cbFull.RecordResult(true)
 }
 
@@ -430,9 +469,11 @@ func (ts *TieredSearcher) executeVectorSearch(
 }
 
 func (ts *TieredSearcher) processVectorResults(
+	query string,
 	vectorResults []coordinator.ScoredVectorResult,
 	result *TieredSearchResult,
 ) {
+	batchStart := len(result.Results)
 	for _, vr := range vectorResults {
 		entry := ts.vectorResultToContentEntry(vr)
 		result.Results = append(result.Results, entry)
@@ -442,6 +483,7 @@ func (ts *TieredSearcher) processVectorResults(
 	if result.FullHits > 0 {
 		result.Tier = TierFullSearch
 		ts.recordTierHit(TierFullSearch)
+		ts.fireResultHooks(query, TierFullSearch, result.Results[batchStart:])
 	}
 }
 
@@ -595,4 +637,47 @@ func charsEqualIgnoreCase(a, b byte) bool {
 		b += 'a' - 'A'
 	}
 	return a == b
+}
+
+// =============================================================================
+// SCORE-07: result-hook registration
+// =============================================================================
+
+// RegisterResultHook installs a SearchResultHook that will be called once
+// per tier whose search returned results. Multiple hooks can be
+// registered; all fire for each batch. Registration is thread-safe and
+// preserves order — hooks fire in registration order.
+func (ts *TieredSearcher) RegisterResultHook(hook SearchResultHook) {
+	if ts == nil || hook == nil {
+		return
+	}
+	ts.hooksMu.Lock()
+	defer ts.hooksMu.Unlock()
+	ts.hooks = append(ts.hooks, hook)
+}
+
+// ClearResultHooks removes every registered hook. Tests use this for
+// isolation; production code should not normally clear hooks.
+func (ts *TieredSearcher) ClearResultHooks() {
+	if ts == nil {
+		return
+	}
+	ts.hooksMu.Lock()
+	defer ts.hooksMu.Unlock()
+	ts.hooks = nil
+}
+
+// fireResultHooks invokes every registered hook with the batch the tier
+// just produced. Safe to call with an empty batch (no-op) or when no
+// hooks are registered (no-op). Holds the read lock during fan-out so
+// concurrent RegisterResultHook does not race with in-flight invocations.
+func (ts *TieredSearcher) fireResultHooks(query string, tier SearchTier, batch []*ContentEntry) {
+	if ts == nil || len(batch) == 0 {
+		return
+	}
+	ts.hooksMu.RLock()
+	defer ts.hooksMu.RUnlock()
+	for _, hook := range ts.hooks {
+		hook.OnResultBatch(query, tier, batch)
+	}
 }
