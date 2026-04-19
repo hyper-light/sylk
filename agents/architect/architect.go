@@ -17,6 +17,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	contextskills "github.com/adalundhe/sylk/core/context/skills"
 	"github.com/adalundhe/sylk/core/dag"
@@ -42,10 +43,12 @@ import (
 // The Architect consults with Librarian for codebase patterns and creates
 // workflow DAGs for task orchestration.
 type Architect struct {
-	id     string
-	config Config
-	logger *slog.Logger
-	logWAL io.Closer
+	id       string
+	config   Config
+	logger   *slog.Logger
+	logWAL   io.Closer
+	identity *identity.AgentIdentity
+	factory  *identity.Factory
 
 	// Cross-domain handling
 	crossDomainHandler *CrossDomainHandler
@@ -198,6 +201,13 @@ type Config struct {
 
 	// Forest exposes Memory Forest planning precedent skills.
 	Forest shared.MemoryForestService
+
+	// Factory mints the Architect's AgentIdentity at New() time.
+	// Architect is a singleton, created on-demand by the activation
+	// controller after phase4 — so Factory is expected to be present
+	// at construction. If nil, identity.WithIdentity is not attached
+	// and the gateway will reject dispatches.
+	Factory *identity.Factory
 }
 
 // Default configuration values
@@ -205,7 +215,14 @@ const (
 	DefaultMaxOutputTokens     = 16384
 	DefaultThinkingBudget      = 8192
 	DefaultArchitectModel      = "claude-opus-4-6"
-	DefaultLLMRequestTimeout   = 120 * time.Second
+	// DefaultLLMRequestTimeout is the per-chunk/beat idle tolerance
+	// for planner LLM streams. 15 minutes accommodates Claude Opus
+	// 4.7's adaptive-thinking silent windows — the model can think
+	// server-side for multi-minute stretches between observable
+	// stream chunks. The planner's watchdog resets this timer on
+	// every inbound chunk and on every heartbeat pulse, so the full
+	// 15 minutes is an idle threshold, not a total-call cap.
+	DefaultLLMRequestTimeout = 15 * time.Minute
 	DefaultLLMRetryMax         = 3
 	DefaultPromptCacheTTL      = 1 * time.Hour
 	DefaultCrossDomainTimeout  = 30 * time.Second
@@ -384,6 +401,16 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
 	}
+
+	architect.factory = cfg.Factory
+	architectIdentity, err := cfg.Factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeArchitect,
+		Pod:  identity.PodRef{ID: "architect", Type: identity.PodTypeSingleton},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("architect: mint identity: %w", err)
+	}
+	architect.identity = architectIdentity
 
 	architect.steering.InitLazy("architect", cfg.ActivityPub)
 	if architect.planStore != nil {
@@ -903,6 +930,7 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	reqCtx = withRouteHops(reqCtx, fwd.Hops)
 	reqCtx = withArchitectStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
 	reqCtx = shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
+	reqCtx = shared.WithOwnedStreamIdentity(reqCtx, "architect", "Architect")
 	reqCtx, usageAcc := withArchitectUsageAccumulator(reqCtx)
 	reqCtx = withArchitectEarlyUsageEmitter(reqCtx, func(inputTokens int) {
 		a.publishPlanStreamEarlyUsage(reqCtx, inputTokens)
@@ -921,6 +949,18 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 		AgentID:     a.id,
 		SessionID:   fwd.SessionID,
 	})
+	if a.factory != nil && a.identity != nil {
+		task, taskErr := a.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+		})
+		if taskErr != nil {
+			cancel()
+			return fmt.Errorf("architect: mint task: %w", taskErr)
+		}
+		reqCtx = identity.WithIdentity(reqCtx, a.identity)
+		reqCtx = identity.WithTask(reqCtx, task)
+	}
 	allowedHandoff := shared.AutomaticHandoffAllowedForForwardedRequest(fwd)
 	reqCtx = shared.WithAutomaticHandoffEnabled(reqCtx, allowedHandoff)
 	reqCtx = handoff.WithTransportRetryHandoff(reqCtx, handoff.TransportRetryHandoffConfig{

@@ -2,9 +2,28 @@ package signal
 
 import (
 	"errors"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// DroppedSignalEvent is fired to an installed OverflowListener whenever a
+// broadcast cannot be enqueued on a subscriber's channel (channel full).
+// Keep listener handlers fast — they run in the broadcast critical path.
+type DroppedSignalEvent struct {
+	SubscriberID string
+	AgentID      string
+	Signal       Signal
+	SignalID     string
+	TargetID     string
+	TotalDropped uint64 // cumulative drops on this bus
+}
+
+// OverflowListener is a callback invoked when a signal is dropped due to a
+// full subscriber channel. A nil listener disables the callback; logs fire
+// regardless.
+type OverflowListener func(DroppedSignalEvent)
 
 var (
 	ErrSubscriberExists   = errors.New("subscriber already exists")
@@ -48,6 +67,38 @@ type SignalBus struct {
 	closed      bool
 	done        chan struct{}
 	stopOnce    sync.Once
+
+	// droppedCount tallies broadcasts that could not be enqueued on a
+	// subscriber channel due to channel-full conditions.
+	droppedCount atomic.Uint64
+
+	// overflowListener, when non-nil, is called synchronously on each drop.
+	overflowListener atomic.Value // of OverflowListener
+}
+
+// SetOverflowListener installs (or replaces) the overflow listener. Pass nil
+// to clear. The listener must be fast — it runs in the broadcast path.
+func (b *SignalBus) SetOverflowListener(fn OverflowListener) {
+	if fn == nil {
+		b.overflowListener.Store(OverflowListener(nil))
+		return
+	}
+	b.overflowListener.Store(fn)
+}
+
+func (b *SignalBus) loadOverflowListener() OverflowListener {
+	v := b.overflowListener.Load()
+	if v == nil {
+		return nil
+	}
+	fn, _ := v.(OverflowListener)
+	return fn
+}
+
+// DroppedCount returns the cumulative number of signal messages dropped due
+// to subscriber-channel overflow since the bus was created.
+func (b *SignalBus) DroppedCount() uint64 {
+	return b.droppedCount.Load()
 }
 
 func NewSignalBus(config SignalBusConfig) *SignalBus {
@@ -165,6 +216,28 @@ func (b *SignalBus) sendToSubscriber(sub *SignalSubscriber, msg SignalMessage) {
 	select {
 	case sub.Channel <- msg:
 	default:
+		b.recordDrop(sub, msg)
+	}
+}
+
+func (b *SignalBus) recordDrop(sub *SignalSubscriber, msg SignalMessage) {
+	total := b.droppedCount.Add(1)
+	slog.Default().Warn("signal bus drop: subscriber channel full",
+		"subscriber_id", sub.ID,
+		"agent_id", sub.AgentID,
+		"signal", string(msg.Signal),
+		"signal_id", msg.ID,
+		"target_id", msg.TargetID,
+		"total_dropped", total)
+	if listener := b.loadOverflowListener(); listener != nil {
+		listener(DroppedSignalEvent{
+			SubscriberID: sub.ID,
+			AgentID:      sub.AgentID,
+			Signal:       msg.Signal,
+			SignalID:     msg.ID,
+			TargetID:     msg.TargetID,
+			TotalDropped: total,
+		})
 	}
 }
 

@@ -10,6 +10,16 @@ import (
 	"github.com/adalundhe/sylk/core/tools"
 )
 
+// Identity propagation is now the responsibility of the dispatch site:
+// every caller must attach the typed *identity.AgentIdentity + *identity.TaskRef
+// to ctx via identity.WithIdentity / identity.WithTask before invoking
+// the provider. The gateway enforces presence via identity.RequireDispatch
+// and aborts with ErrDispatchIdentityMissing when either is absent.
+//
+// The prior stampRequestIdentity helper that copied LogMeta into
+// req.Metadata has been removed; it stamped string-typed identity for
+// the old (now-deleted) metadata-map fallback.
+
 // ErrContextBudgetExhausted is returned when the context window utilization
 // exceeds the critical watermark and no further compaction or eviction can
 // bring it below threshold.
@@ -74,10 +84,9 @@ func ContextGovernorFromContext(ctx context.Context) *ContextGovernor {
 // ApplyContextBudget checks context governor zones and the safety ceiling,
 // stripping tools when context pressure reaches Red or turn reaches maxRuns.
 // Returns ErrContextBudgetExhausted if the context is critically full.
-// Must be called before each LLM call.
+// Must be called before each LLM call. Identity propagation is the
+// caller's responsibility (see package doc).
 func ApplyContextBudget(ctx context.Context, turn, maxRuns int, req *providers.Request) error {
-	stampRequestIdentity(ctx, req)
-
 	if gov := ContextGovernorFromContext(ctx); gov != nil {
 		zone := gov.BeginTurn(ctx, turn, maxRuns, req)
 		switch {
@@ -101,80 +110,6 @@ func ApplyContextBudget(ctx context.Context, turn, maxRuns int, req *providers.R
 		req.Tools = nil // safety ceiling — force synthesis
 	}
 	return nil
-}
-
-// stampRequestIdentity sets agent_id and session_id in the request Metadata
-// from the LogMeta carried in ctx. Idempotent — skips if already set.
-func stampRequestIdentity(ctx context.Context, req *providers.Request) {
-	m := LogMetaFromContext(ctx)
-	if m.AgentID == "" && m.SessionID == "" {
-		return
-	}
-	if req.Metadata == nil {
-		req.Metadata = make(map[string]any, 6)
-	}
-	visibleAgentID, runtimeAgentID := requestIdentityForContext(ctx, m)
-	if _, ok := req.Metadata["agent_id"]; !ok {
-		req.Metadata["agent_id"] = visibleAgentID
-	}
-	if _, ok := req.Metadata["session_id"]; !ok {
-		req.Metadata["session_id"] = m.SessionID
-	}
-	if runtimeAgentID != "" && runtimeAgentID != visibleAgentID {
-		if _, ok := req.Metadata["runtime_agent_id"]; !ok {
-			req.Metadata["runtime_agent_id"] = runtimeAgentID
-		}
-	}
-	if stream, ok := StreamMetadataFromContext(ctx); ok {
-		if agentType := streamMetadataString(stream.Metadata, "agent_type"); agentType != "" {
-			if _, ok := req.Metadata["agent_type"]; !ok {
-				req.Metadata["agent_type"] = agentType
-			}
-		}
-		if taskID := streamMetadataString(stream.Metadata, "task_id"); taskID != "" {
-			if _, ok := req.Metadata["task_id"]; !ok {
-				req.Metadata["task_id"] = taskID
-			}
-		}
-		if pipelineID := firstNonEmpty(
-			streamMetadataString(stream.Metadata, "task_id"),
-			streamMetadataString(stream.Metadata, "pipeline_id"),
-		); pipelineID != "" {
-			if _, ok := req.Metadata["pipeline_id"]; !ok {
-				req.Metadata["pipeline_id"] = pipelineID
-			}
-		}
-	}
-}
-
-func requestIdentityForContext(ctx context.Context, m LogMeta) (visibleAgentID, runtimeAgentID string) {
-	runtimeAgentID = strings.TrimSpace(m.AgentID)
-	visibleAgentID = runtimeAgentID
-	if stream, ok := StreamMetadataFromContext(ctx); ok {
-		agentType := streamMetadataString(stream.Metadata, "agent_type")
-		pipelineID := firstNonEmpty(
-			streamMetadataString(stream.Metadata, "task_id"),
-			streamMetadataString(stream.Metadata, "pipeline_id"),
-		)
-		if scopedID := pipelineWorkerVisibleAgentID(agentType, pipelineID); scopedID != "" {
-			visibleAgentID = scopedID
-		}
-	}
-	return visibleAgentID, runtimeAgentID
-}
-
-func pipelineWorkerVisibleAgentID(agentType, pipelineID string) string {
-	agentType = strings.TrimSpace(agentType)
-	pipelineID = strings.TrimSpace(pipelineID)
-	if pipelineID == "" {
-		return ""
-	}
-	switch agentType {
-	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
-		return pipelineID + ":" + agentType
-	default:
-		return ""
-	}
 }
 
 // Initialize computes the fixed overhead (system prompt + tool definitions)

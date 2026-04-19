@@ -19,6 +19,7 @@ func TestReadFileSkill_DirectoryReturnsPreview(t *testing.T) {
 	}
 
 	l, err := New(Config{
+		Factory: newTestFactory(t),
 		ID:               "librarian-test",
 		EnableLLM:        true,
 		WorkingDirectory: dir,

@@ -14,11 +14,13 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	corecontext "github.com/adalundhe/sylk/core/context"
 	contextskills "github.com/adalundhe/sylk/core/context/skills"
 	"github.com/adalundhe/sylk/core/domain"
+	"github.com/adalundhe/sylk/core/escalation"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/llmruntime"
@@ -28,8 +30,6 @@ import (
 	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
-	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/option"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -112,6 +112,13 @@ type Guide struct {
 	// Event bus for async message passing
 	bus EventBus
 
+	// routerHook (optional) evaluates the envelope's ConfidenceChain and
+	// RerouteHistory against the escalation policy just before dispatch.
+	// A Deny decision short-circuits publishForwardedRequest, emits a
+	// user escalation, and surfaces a Guardian gate event when the hook
+	// flags one.
+	routerHook escalation.RouterHook
+
 	// Activity publisher for UI agent-panel updates
 	activityPub events.ActivityPublisher
 
@@ -180,6 +187,15 @@ type Guide struct {
 	// Session metadata
 	sessionID string
 	agentID   string
+
+	// Typed identity surface. identity + factory are nullable at
+	// construction time and late-bound by SetIdentityFactory once the
+	// session-scoped Factory exists (see cmd/tui.go:wireIdentityAccounting).
+	// When both are set, Guide attaches them to request contexts so
+	// the provider gateway can emit per-identity / per-task token
+	// accounting.
+	identity *identity.AgentIdentity
+	factory  *identity.Factory
 	// Session-scoped conversation flow tracking for interactive handoffs.
 	conversation   *ConversationFlowManager
 	workspaceViews versioning.WorkspaceViewAccess
@@ -311,6 +327,11 @@ type Config struct {
 
 	// Forest exposes Memory Forest intent/history skills.
 	Forest contextskills.ForestService
+
+	// Factory mints the Guide's AgentIdentity. Optional at construction
+	// time — Guide is a daemon that boots before the session-scoped
+	// Factory exists. Late-bound via SetIdentityFactory.
+	Factory *identity.Factory
 }
 
 // DefaultConfig returns sensible defaults
@@ -320,87 +341,12 @@ func DefaultConfig() Config {
 	}
 }
 
-// New creates a new Guide agent
-func New(client *anthropic.Client, cfg Config) (*Guide, error) {
-	cfg = ensureRouterConfig(cfg)
-	if err := validateBus(cfg); err != nil {
-		return nil, err
-	}
-
-	registry := resolveRegistry(cfg)
-	routing := NewRoutingAggregator()
-	routing.RegisterAgent(GuideRoutingInfo())
-
-	parser := NewParserWithRouting(cfg.RouterConfig.DSLPrefix, routing)
-	classifier := NewClassifierWithClient(NewRealClassifierClient(client), cfg.RouterConfig)
-	router := &Router{
-		config:     cfg.RouterConfig,
-		parser:     parser,
-		classifier: classifier,
-	}
-
-	pendingCfg := resolvePendingConfig(cfg)
-	agentID := resolveAgentID(cfg)
-	cacheCfg := resolveRouteCacheConfig(cfg)
-	circuits := NewCircuitBreakerRegistry(DefaultCircuitBreakerConfig())
-	dlq := NewDeadLetterQueue(DeadLetterQueueConfig{MaxSize: 10000})
-	pendingCleanup := NewPendingCleanup(PendingCleanupConfig{
-		CheckInterval:  1 * time.Second,
-		DefaultTimeout: pendingCfg.DefaultTimeout,
-		DLQ:            dlq,
-		Circuits:       circuits,
-	})
-	health := NewHealthMonitor(cfg.Bus, HealthMonitorConfig{
-		AgentConfig: DefaultAgentHealthConfig(),
-		Circuits:    circuits,
-	})
-
-	skillsRegistry, loaderCfg, hookRegistry := buildSkills(cfg)
-	selfResponder := resolveGuideSelfResponder(cfg, nil, "", nil)
-
-	guide := &Guide{
-		router:                  router,
-		config:                  cfg,
-		bus:                     cfg.Bus,
-		activityPub:             cfg.ActivityPub,
-		agentSubs:               NewStringMap[*agentSubscriptions](DefaultShardCount),
-		agentChannels:           NewStringMap[*AgentChannels](DefaultShardCount),
-		readyAgents:             NewStringMap[bool](DefaultShardCount),
-		typeIndex:               NewStringMap[string](DefaultShardCount),
-		podIndex:                NewStringMap[string](DefaultShardCount),
-		registry:                registry,
-		routing:                 routing,
-		triggers:                NewTriggerDetector(routing),
-		pending:                 NewPendingStore(pendingCfg),
-		routeCache:              NewRouteCache(cacheCfg),
-		circuits:                circuits,
-		health:                  health,
-		dlq:                     dlq,
-		pendingCleanup:          pendingCleanup,
-		observer:                NewConsultationObserver(cfg.Bus, cfg.SessionID),
-		skills:                  skillsRegistry,
-		skillLoader:             nil,
-		hooks:                   hookRegistry,
-		selfResponder:           selfResponder,
-		sessionID:               cfg.SessionID,
-		agentID:                 agentID,
-		workspaceViews:          authority.RestrictWorkspaceViews("guide", cfg.WorkspaceViews),
-		requestCancels:          make(map[string]context.CancelFunc),
-		interruptedCorrelations: make(map[string]time.Time),
-		responseMessagesSeen:    make(map[string]time.Time),
-		completedPendings:       make(map[string]completedPendingRoute),
-		streamReroutes:          make(map[string]string),
-	}
-
-	if err := guide.initializeSkills(loaderCfg); err != nil {
-		return nil, err
-	}
-	if err := guide.initRuntimeExtensions(cfg); err != nil {
-		return nil, err
-	}
-
-	return guide, nil
-}
+// New is removed. Raw anthropic.Client construction bypasses the
+// provider gateway and its accounting hook, violating the invariant
+// that every LLM call is observable. Callers must use
+// NewWithProvider (for LLM-backed classification routed through the
+// gateway) or NewWithClassifier (for rule-based / mock classifiers
+// used in tests).
 
 func ensureRouterConfig(cfg Config) Config {
 	if cfg.RouterConfig.Model == "" {
@@ -577,23 +523,34 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		return nil, err
 	}
 
+	// Every Guide must carry an identity because any LLM call that later
+	// routes through the provider gateway requires it. NewWithProvider and
+	// NewWithClassifier both satisfy this invariant via bindGuideIdentity;
+	// construction fails loudly if Factory is missing rather than silently
+	// producing a Guide that will fail at first LLM call.
+	if err := guide.bindGuideIdentity(cfg.Factory); err != nil {
+		return nil, err
+	}
+
 	return guide, nil
 }
 
-// NewWithAPIKey creates a new Guide agent with an API key
-func NewWithAPIKey(apiKey string, cfg Config) (*Guide, error) {
+// NewWithAPIKey constructs a Guide with a failing classifier client.
+// Historically it wrapped a raw anthropic.Client; that bypassed the
+// provider gateway and emitted no accounting events. Per
+// docs/FIX_ID_AND_TOKENS.md, raw-client construction is not allowed
+// — callers that need an LLM-backed classifier must use
+// NewWithProvider so the call routes through the gateway's
+// accounting hook. The apiKey parameter is retained for
+// backwards-compatible test construction but is ignored; tests that
+// feed non-DSL input will observe an immediate classifier error
+// (matching the prior empty-api-key behavior) rather than hanging on
+// a rule-based route.
+func NewWithAPIKey(_ string, cfg Config) (*Guide, error) {
 	if cfg.RouterConfig.Model == "" {
 		cfg.RouterConfig = DefaultRouterConfig()
 	}
-
-	opts := []option.RequestOption{}
-	if apiKey != "" {
-		opts = append(opts, option.WithAPIKey(apiKey))
-	}
-	opts = append(opts, option.WithMaxRetries(0))
-	client := anthropic.NewClient(opts...)
-
-	return New(&client, cfg)
+	return NewWithClassifier(&failingClassifierClient{}, cfg)
 }
 
 // NewWithProvider creates a new Guide agent with any LLM provider.
@@ -689,7 +646,56 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 		return nil, err
 	}
 
+	if err := guide.bindGuideIdentity(cfg.Factory); err != nil {
+		return nil, err
+	}
+
 	return guide, nil
+}
+
+// bindGuideIdentity requires a non-nil Factory and mints the Guide's
+// AgentIdentity. Failure is surfaced as a construction error — every path
+// downstream that reaches the provider gateway relies on this being set, so
+// deferring or soft-failing here is how we produced the "no AgentIdentity on
+// ctx" boot-time regression.
+func (g *Guide) bindGuideIdentity(factory *identity.Factory) error {
+	if factory == nil {
+		return fmt.Errorf("guide: identity Factory is required")
+	}
+	id, err := factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeGuide,
+		Pod:  identity.PodRef{ID: "guide", Type: identity.PodTypeDaemon},
+	})
+	if err != nil {
+		return fmt.Errorf("guide: mint identity: %w", err)
+	}
+	g.factory = factory
+	g.identity = id
+	return nil
+}
+
+// withIdentityDispatch derives a task for the given correlation and
+// attaches (identity, task) to ctx. bindGuideIdentity (called by every
+// constructor) guarantees factory + identity are non-nil by the time any
+// request handler runs; a silent no-op here would resurrect the "no
+// AgentIdentity on ctx" failure mode the constructors are designed to
+// prevent, so task-mint failures are logged and still return an
+// unmodified ctx (the gateway will then fail loudly, which is the desired
+// behavior — we want contract breaches visible, not absorbed).
+func (g *Guide) withIdentityDispatch(ctx context.Context, correlationID string) context.Context {
+	task, err := g.factory.NewTask(identity.TaskOptions{
+		DisplayID:   correlationID,
+		Correlation: identity.CorrelationID(correlationID),
+	})
+	if err != nil {
+		slog.Error("guide: identity task mint failed — downstream gateway call will reject",
+			"correlation_id", correlationID,
+			"error", err)
+		return ctx
+	}
+	ctx = identity.WithIdentity(ctx, g.identity)
+	ctx = identity.WithTask(ctx, task)
+	return ctx
 }
 
 func (g *Guide) initRuntimeExtensions(cfg Config) error {
@@ -3030,6 +3036,8 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 	defer g.clearRequestCancel(correlationID)
 	defer cancel()
 
+	reqCtx = g.withIdentityDispatch(reqCtx, correlationID)
+
 	reqCtx = providers.WithRetryObserver(reqCtx, func(event providers.RetryEvent) {
 		g.publishRetryStatus(correlationID, req.SourceAgentID, RetryStatus{
 			Attempt:     event.Attempt,
@@ -3139,13 +3147,40 @@ func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
 		g.conversation.Clear(reroute.SessionID)
 	}
 
-	// Build a fresh RouteRequest from the reroute payload.
+	// Build a fresh RouteRequest from the reroute payload. Preserve the
+	// prior RerouteHistory (if any) and append the current hop so every
+	// Step-0 rejection is observable downstream. The MaxReroutesPerRequest
+	// guard (complementary to maxRouteHops) kicks in when the chain is
+	// long enough that further re-classification would be pathological.
 	req := &RouteRequest{
 		Input:               reroute.OriginalInput,
 		SourceAgentID:       reroute.SourceAgentID,
 		ParentCorrelationID: strings.TrimSpace(reroute.OriginalCorrelationID),
 		SessionID:           reroute.SessionID,
 		Timestamp:           msg.Timestamp,
+		RerouteHistory:      nextRerouteHistory(reroute, msg),
+	}
+	if len(req.RerouteHistory) > messaging.MaxReroutesPerRequest {
+		guideFileLog().Warn("guide: reroute budget exhausted — escalating",
+			"original_correlation_id", reroute.OriginalCorrelationID,
+			"hops", len(req.RerouteHistory),
+			"source_agent", reroute.SourceAgentID)
+		g.publishUserEscalation(UserEscalationPayload{
+			SessionID:             reroute.SessionID,
+			CorrelationID:         msg.CorrelationID,
+			OriginalCorrelationID: reroute.OriginalCorrelationID,
+			OriginalInput:         reroute.OriginalInput,
+			Reason: fmt.Sprintf("reroute budget exhausted after %d hops; last rejection from %q: %s",
+				len(req.RerouteHistory), reroute.SourceAgentID, reroute.Reason),
+			SourceAgentID:  reroute.SourceAgentID,
+			RerouteHistory: req.RerouteHistory,
+		})
+		return g.publishRouteError(
+			msg.CorrelationID,
+			reroute.SourceAgentID,
+			fmt.Errorf("reroute budget exhausted after %d hops: last reason=%q suggested=%q",
+				len(req.RerouteHistory), reroute.Reason, reroute.SuggestedTarget),
+		)
 	}
 
 	// If the source agent suggested a target, try that first.
@@ -3168,6 +3203,15 @@ func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
 	g.registerRequestCancel(correlationID, cancel)
 	defer g.clearRequestCancel(correlationID)
 	defer cancel()
+
+	// Stamp agent identity + task on the reroute context so downstream LLM
+	// calls through the provider gateway can pass requireDispatch. Missing
+	// this call here (while the primary handleRouteRequestMessage path has
+	// it) produced "gateway: dispatch context missing identity or task"
+	// whenever a routing reroute landed back on the guide itself and
+	// triggered the LLM-backed self-responder.
+	reqCtx = g.withIdentityDispatch(reqCtx, correlationID)
+
 	reqCtx = handoff.WithTransportRetryHandoff(reqCtx, handoff.TransportRetryHandoffConfig{
 		Enabled:       true,
 		Bridge:        g.handoffBridge,
@@ -3255,6 +3299,100 @@ func (g *Guide) publishRerouteEvent(correlationID, sourceAgentID string, reroute
 
 // rerouteExcludeKey is the context key for reroute excluded agent IDs.
 type rerouteExcludeKey struct{}
+
+// SetRouterHook wires a RouterHook that fires immediately before every
+// forward dispatch. A nil hook disables policy checks (default). Thread-safe
+// writes are serialized — callers should install the hook during boot.
+func (g *Guide) SetRouterHook(hook escalation.RouterHook) {
+	g.routerHook = hook
+}
+
+// evaluateRouterHook consults the installed RouterHook (if any) and returns
+// (err, true) when the dispatch should be aborted. The bool signals "skip
+// the rest of publishForwardedRequest" — callers obey it before doing any
+// side effects. Hook absence or allow-decision returns (nil, false).
+func (g *Guide) evaluateRouterHook(targetAgentID string, fwd *ForwardedRequest) (error, bool) {
+	hook := g.routerHook
+	if hook == nil || fwd == nil {
+		return nil, false
+	}
+	ctx := escalation.RouterDispatchContext{
+		SessionID:     g.sessionID,
+		CorrelationID: "",
+		SourceAgent:   fwd.SourceAgentID,
+		TargetAgent:   targetAgentID,
+		Input:         fwd.Input,
+	}
+	decision := hook.Evaluate(ctx)
+	if decision.Allow {
+		return nil, false
+	}
+	// Emit the escalation event so operators can see what the hook flagged.
+	g.publishUserEscalation(UserEscalationPayload{
+		SessionID:     g.sessionID,
+		SourceAgentID: fwd.SourceAgentID,
+		OriginalInput: fwd.Input,
+		Reason:        routerHookReason(decision),
+	})
+	return fmt.Errorf("router hook denied dispatch to %q: %s", targetAgentID, routerHookReason(decision)), true
+}
+
+func routerHookReason(d escalation.RouterHookDecision) string {
+	if d.Reason != "" {
+		return d.Reason
+	}
+	return "router hook denied"
+}
+
+// publishUserEscalation broadcasts a UserEscalationPayload to TopicUserEscalation
+// so the TUI (or other observers) can surface the escalation to the user.
+// Fire-and-forget: publish errors are logged but don't block the caller's
+// cleanup path (the caller typically follows up with publishRouteError).
+func (g *Guide) publishUserEscalation(payload UserEscalationPayload) {
+	if g == nil || g.bus == nil {
+		return
+	}
+	msg := &Message{
+		ID:            generateMessageID(),
+		CorrelationID: payload.CorrelationID,
+		Type:          MessageTypeUserEscalation,
+		Payload:       &payload,
+		SourceAgentID: "guide",
+		Timestamp:     time.Now(),
+	}
+	if err := g.bus.Publish(TopicUserEscalation, msg); err != nil {
+		guideFileLog().Warn("guide: failed to publish user escalation",
+			"topic", TopicUserEscalation,
+			"correlation_id", payload.CorrelationID,
+			"error", err)
+	}
+}
+
+// nextRerouteHistory extracts any RerouteHistory carried on the inbound
+// reroute message (via msg.Metadata["reroute_history"]) and appends a hop
+// describing the current reroute. A fresh request has no metadata so this
+// returns a single-entry slice; chained reroutes accumulate.
+func nextRerouteHistory(reroute *RerouteRequest, msg *Message) []messaging.RerouteHop {
+	var history []messaging.RerouteHop
+	if msg != nil && msg.Metadata != nil {
+		if raw, ok := msg.Metadata[rerouteHistoryMetadataKey]; ok {
+			if typed, ok := raw.([]messaging.RerouteHop); ok {
+				history = append(history, typed...)
+			}
+		}
+	}
+	return append(history, messaging.RerouteHop{
+		From:   reroute.SourceAgentID,
+		To:     reroute.SuggestedTarget,
+		Reason: reroute.Reason,
+		At:     time.Now(),
+	})
+}
+
+// rerouteHistoryMetadataKey is the message-metadata key that carries the
+// cumulative RerouteHistory across hops. Agents re-emitting a reroute
+// propagate it; Guide appends a new hop via nextRerouteHistory.
+const rerouteHistoryMetadataKey = "reroute_history"
 
 func withRerouteExcludeAgents(ctx context.Context, agents []string) context.Context {
 	if len(agents) == 0 {
@@ -4576,6 +4714,13 @@ func (g *Guide) publishRouteError(correlationID string, sourceAgentID string, er
 }
 
 func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *ForwardedRequest, replyTo *ReplyTo) error {
+	// SCH-17: if a RouterHook is wired, consult it before any side effects
+	// (activation, publish). Policy violations short-circuit the dispatch
+	// and route to the user-escalation path instead of the target agent.
+	if decision, skip := g.evaluateRouterHook(targetAgentID, forwarded); skip {
+		return decision
+	}
+
 	// Resolve name/alias to the actual registration ID. Agents with UUID-based
 	// IDs (tester, inspector) register channels under the UUID but routing uses
 	// the type name ("tester", "inspector") as the target.

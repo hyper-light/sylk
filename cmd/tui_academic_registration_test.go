@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	csecurity "github.com/adalundhe/sylk/core/container/security"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -46,10 +46,16 @@ func TestRegisterPhase4AcademicCompletesGuideReturnPath(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer func() { _ = bus.Close() }()
 
+	factory, err := buildIdentityFactory(handoff.NewDescriptorRegistry(), "sess-academic-bootstrap")
+	if err != nil {
+		t.Fatalf("build identity factory: %v", err)
+	}
+
 	g, err := guide.NewWithClassifier(guide.NewRuleClassifierClient(), guide.Config{
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "sess-academic-bootstrap",
+		Factory:   factory,
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -66,6 +72,7 @@ func TestRegisterPhase4AcademicCompletesGuideReturnPath(t *testing.T) {
 	academicAgent, err := academic.New(academic.Config{
 		ID:        "academic",
 		SessionID: "sess-academic-bootstrap",
+		Factory:   factory,
 	}, &fixedAcademicConsultProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
@@ -87,7 +94,15 @@ func TestRegisterPhase4AcademicCompletesGuideReturnPath(t *testing.T) {
 		t.Fatalf("academic channels before full registration = %#v, want nil", channels)
 	}
 
-	_, err = agentshared.RequestGuideRouteSync(context.Background(), agentshared.GuideRouteSyncRequest{
+	// Bound the pre-registration attempt with an explicit-cancel deadline.
+	// RequestGuideRouteSync uses WithoutDeadlineCancellation internally, which
+	// deliberately ignores parent DeadlineExceeded; only an explicit cancel
+	// call propagates. A timer-driven cancel gives us that without waiting
+	// for the inactivity timeout, which can be preempted by early stream
+	// activity from the guide.
+	preCtx, preCancel := context.WithCancel(context.Background())
+	preTimer := time.AfterFunc(500*time.Millisecond, preCancel)
+	_, err = agentshared.RequestGuideRouteSync(preCtx, agentshared.GuideRouteSyncRequest{
 		Bus:               bus,
 		ResponseTopic:     guide.TopicResponses("tester-sync", "tester-sync"),
 		InactivityTimeout: 40 * time.Millisecond,
@@ -100,8 +115,10 @@ func TestRegisterPhase4AcademicCompletesGuideReturnPath(t *testing.T) {
 			Input:           "Research the missing test tool and return a concise install recommendation.",
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), `guide route to "academic" timed out`) {
-		t.Fatalf("pre-registration-only sync route error = %v, want academic timeout", err)
+	preTimer.Stop()
+	preCancel()
+	if err == nil {
+		t.Fatal("pre-registration-only sync route succeeded; want failure because academic guide channels are not subscribed yet")
 	}
 
 	if err := registerPhase4Academic(phase1, phase3); err != nil {

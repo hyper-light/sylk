@@ -131,16 +131,64 @@ func TestLayerCollapse(t *testing.T) {
 		t.Errorf("expected 1 entry after collapse, got %d", len(m.entries))
 	}
 
-	// Re-expand.
+	// Re-expand. UI-19 regression: rebuildVisible must re-derive the task
+	// entries from the last update, not just filter a stale m.entries list.
 	m.cursor = 0
 	m.toggleExpand()
-	// BUG CHECK: rebuildVisible doesn't re-add tasks. Let's verify via applyUpdate.
-	// Actually, rebuildVisible only works with existing entries. After collapse
-	// the task entries are removed. Toggle re-adds via Expanded state in layerExpanded.
-	// New update should restore them.
+	if len(m.entries) != 3 {
+		t.Errorf("expected 3 entries after re-expand (layer + 2 tasks), got %d", len(m.entries))
+	}
+
+	// Subsequent updates must continue to work.
 	m.Update(update)
 	if len(m.entries) != 3 {
 		t.Errorf("expected 3 entries after re-expand + update, got %d", len(m.entries))
+	}
+}
+
+// TestLayerCollapseRestoresTasksAfterReExpand is the explicit regression
+// guard for UI-19: toggleExpand → toggleExpand must return the original
+// entries without needing a fresh PlanUpdateMsg.
+func TestLayerCollapseRestoresTasksAfterReExpand(t *testing.T) {
+	m := New(testPalette())
+	m.SetSize(80, 24)
+	m.Update(msg.PlanUpdateMsg{
+		PlanID: "p",
+		Status: "ready",
+		Tasks: []msg.PlanTaskSnapshot{
+			{ID: "t1", Name: "A", Status: "pending"},
+			{ID: "t2", Name: "B", Status: "pending"},
+		},
+		ExecutionLayers: [][]string{{"t1", "t2"}},
+	})
+
+	if len(m.entries) != 3 {
+		t.Fatalf("initial: expected 3 entries, got %d", len(m.entries))
+	}
+
+	// Collapse then re-expand — no Update in between.
+	m.cursor = 0
+	m.toggleExpand()
+	if len(m.entries) != 1 {
+		t.Fatalf("collapsed: expected 1 entry, got %d", len(m.entries))
+	}
+	m.cursor = 0
+	m.toggleExpand()
+	if len(m.entries) != 3 {
+		t.Fatalf("re-expanded: expected 3 entries without external update, got %d", len(m.entries))
+	}
+
+	// Task identities must be preserved.
+	gotIDs := map[string]bool{}
+	for _, e := range m.entries {
+		if e.Kind == entryTask {
+			gotIDs[e.TaskID] = true
+		}
+	}
+	for _, id := range []string{"t1", "t2"} {
+		if !gotIDs[id] {
+			t.Errorf("expected task %s to be restored, got entries: %+v", id, m.entries)
+		}
 	}
 }
 

@@ -41,6 +41,7 @@ func TestGuideLearnsFinalizedCanonicalRoute(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)

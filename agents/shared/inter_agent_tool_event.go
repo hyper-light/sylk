@@ -466,14 +466,67 @@ func normalizeInterAgentAgentTypes(
 	if strings.TrimSpace(kind) != InterAgentToolEventKindChallenge || len(normalized) == 0 {
 		return normalized
 	}
-	if interAgentProtocolScope(toolName, args, output, streamMetadata) != pipelineProtocolNamespace {
+	scope := interAgentProtocolScope(toolName, args, output, streamMetadata)
+	switch scope {
+	case pipelineProtocolNamespace:
+		out := make([]string, 0, len(normalized))
+		for _, value := range normalized {
+			canonical := normalizePipelineChallengeAgentType(value)
+			if !isValidPipelineChallengeTarget(canonical) {
+				// Drop targets that pipeline protocol would reject at the
+				// handler boundary (e.g. "orchestrator", "architect"). Without
+				// this filter the UI row is committed pre-validation and the
+				// Challenge-kind lifecycle keeps it rendering as pending even
+				// after the handler rejects the call.
+				continue
+			}
+			out = append(out, canonical)
+		}
+		return normalizeAgentTypeList(out)
+	case globalReviewNamespace:
+		out := make([]string, 0, len(normalized))
+		for _, value := range normalized {
+			canonical := normalizeGlobalReviewChallengeTarget(value, toolName)
+			if canonical == "" {
+				continue
+			}
+			out = append(out, canonical)
+		}
+		return normalizeAgentTypeList(out)
+	default:
 		return normalized
 	}
-	out := make([]string, 0, len(normalized))
-	for _, value := range normalized {
-		out = append(out, normalizePipelineChallengeAgentType(value))
+}
+
+// isValidPipelineChallengeTarget reports whether the canonical agent name is
+// one the pipeline protocol will accept as a challenge target. The value is
+// already canonicalized via normalizePipelineChallengeAgentType.
+func isValidPipelineChallengeTarget(canonical string) bool {
+	switch strings.TrimSpace(canonical) {
+	case "inspector-pipeline", "tester-pipeline", "engineer", "designer":
+		return true
+	default:
+		return false
 	}
-	return normalizeAgentTypeList(out)
+}
+
+// normalizeGlobalReviewChallengeTarget validates a target name for the global
+// review scope. Returns "" when the target is not a legal global-review
+// participant. Named single-target tools (challenge_architect etc.) bypass
+// filtering here because the target is encoded in the tool name, not in
+// target_agents.
+func normalizeGlobalReviewChallengeTarget(value, toolName string) string {
+	canonical := strings.TrimSpace(normalizeAgentType(value))
+	switch canonical {
+	case "inspector", "tester", "architect", "orchestrator":
+		return canonical
+	case "inspector-pipeline":
+		return "inspector"
+	case "tester-pipeline":
+		return "tester"
+	default:
+		return ""
+	}
 }
 
 func interAgentProtocolScope(toolName string, args, output, streamMetadata map[string]any) string {

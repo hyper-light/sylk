@@ -49,7 +49,7 @@ func TestFormatPipelineCounterLabel_UsesLoopsOrPhaseFallback(t *testing.T) {
 	}
 }
 
-func TestRenderPipelineRow_WrapsProgressWithContinuationPrefix(t *testing.T) {
+func TestRenderPipelineRow_KeepsProgressOnSingleLineWithRightAlignment(t *testing.T) {
 	th := theme.DefaultDark()
 	grad := th.Palette.PipelineGradient()
 	pl := &PipelineState{
@@ -60,22 +60,52 @@ func TestRenderPipelineRow_WrapsProgressWithContinuationPrefix(t *testing.T) {
 		MaxLoops:  12,
 	}
 
-	rendered := stripANSI(renderPipelineRow(pl, 26, 0, grad, th, false, "", AnimState{}, false))
-	lines := strings.Split(rendered, "\n")
-	if len(lines) != 2 {
-		t.Fatalf("expected wrapped pipeline row to use 2 lines, got %d: %q", len(lines), rendered)
+	width := 40
+	rendered := stripANSI(renderPipelineRow(pl, width, 0, grad, th, false, "", AnimState{}, false))
+	if strings.Contains(rendered, "\n") {
+		t.Fatalf("expected single-line pipeline row, got %q", rendered)
 	}
-	if !strings.HasPrefix(lines[0], pipelineHeaderPrefix(false)) {
-		t.Fatalf("first line = %q, want prefix %q", lines[0], pipelineHeaderPrefix(false))
+	if !strings.HasPrefix(rendered, pipelineHeaderPrefix(false)) {
+		t.Fatalf("rendered = %q, want prefix %q", rendered, pipelineHeaderPrefix(false))
 	}
-	if !strings.HasPrefix(lines[1], pipelineContinuationPrefix()) {
-		t.Fatalf("second line = %q, want continuation prefix %q", lines[1], pipelineContinuationPrefix())
+	bar := strings.Repeat(pipelineProgressGlyph, progressBarCells)
+	if !strings.Contains(rendered, bar) {
+		t.Fatalf("rendered = %q, want progress bar %q", rendered, bar)
 	}
-	if strings.Contains(lines[0], strings.Repeat(pipelineProgressGlyph, progressBarCells)) {
-		t.Fatalf("expected progress bar to move off the first line, got %q", lines[0])
+	suffix := bar + " 3/12"
+	if !strings.HasSuffix(rendered, suffix) {
+		t.Fatalf("rendered = %q, want right-aligned suffix %q", rendered, suffix)
 	}
-	if !strings.Contains(lines[1], strings.Repeat(pipelineProgressGlyph, progressBarCells)) || !strings.Contains(lines[1], "3/12") {
-		t.Fatalf("second line = %q, want progress bar and counter", lines[1])
+	// Title must have been truncated (ellipsis from `truncate`).
+	if !strings.Contains(rendered, "\u2026") {
+		t.Fatalf("expected task label or status to be truncated with an ellipsis, got %q", rendered)
+	}
+}
+
+func TestRenderPipelineRow_FitsTitleAndStatusWhenWidthAllows(t *testing.T) {
+	th := theme.DefaultDark()
+	grad := th.Palette.PipelineGradient()
+	pl := &PipelineState{
+		ID:        "task_short",
+		TaskLabel: "short-task",
+		Status:    "executing",
+		LoopCount: 1,
+		MaxLoops:  4,
+	}
+
+	rendered := stripANSI(renderPipelineRow(pl, 80, 0, grad, th, false, "", AnimState{}, false))
+	if strings.Contains(rendered, "\n") {
+		t.Fatalf("expected single-line row, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "short-task") {
+		t.Fatalf("expected full task label, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "executing") {
+		t.Fatalf("expected full status, got %q", rendered)
+	}
+	suffix := strings.Repeat(pipelineProgressGlyph, progressBarCells) + " 1/4"
+	if !strings.HasSuffix(rendered, suffix) {
+		t.Fatalf("rendered = %q, want right-aligned suffix %q", rendered, suffix)
 	}
 }
 

@@ -619,6 +619,7 @@ func TestPipelineProtocolSkills_ChallengeAgentPublishesGuideRoute(t *testing.T) 
 		SessionID: "session-3",
 		Context: map[string]any{
 			"pipeline_stage": "execute",
+			"session_dir":    t.TempDir(),
 			"pipeline_protocol": PipelineProtocolSnapshotMap(&PipelineProtocolSnapshot{
 				Roster: []PipelineProtocolAgent{
 					{AgentType: PipelineAgentInspector},
@@ -1037,6 +1038,14 @@ func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
 	ctx := WithPipelineTaskProtocolState(context.Background(), task)
 	ctx = WithTaskExecutionContract(ctx, &TaskExecutionContract{RuntimeAgentType: PipelineAgentTester})
 	ctx = WithStreamContext(ctx, "corr-tester", "tui")
+	// Simulate the branch metadata the tester would have inherited from the
+	// inspector's outbound challenge (BeginInterAgentBranch stamps
+	// chat_parent_correlation_id = originator's CID). Without this, the
+	// validate_work route has no originator to continue and emits a plain
+	// route; with it, the validate_work route carries continuation metadata.
+	ctx = WithStreamContextMetadata(ctx, map[string]any{
+		streamMetadataParentCorrelation: "corr-inspector",
+	})
 
 	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
 		AgentType: func() string { return PipelineAgentTester },
@@ -1073,11 +1082,18 @@ func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
 	if req.Metadata["chat_nested_branch"] == true {
 		t.Fatalf("validate_work should not stamp nested chat branch metadata: %#v", req.Metadata)
 	}
+	// Continuation semantics: the route points the TUI at the originator's
+	// existing entry (continuation key = inspector's CID) and the responder
+	// that triggered this resumption (parent correlation = tester's CID).
+	// Top-level-transfer is NOT set — the originator resumes inline.
+	if got, _ := req.Metadata[streamMetadataOriginatorContinuation].(string); got != "corr-inspector" {
+		t.Fatalf("chat_continuation_of_correlation_id = %q, want corr-inspector", got)
+	}
 	if got, _ := req.Metadata[streamMetadataParentCorrelation].(string); got != "corr-tester" {
 		t.Fatalf("chat_parent_correlation_id = %q, want corr-tester", got)
 	}
-	if got, _ := req.Metadata[streamMetadataTopLevelTransfer].(bool); !got {
-		t.Fatalf("chat_top_level_transfer = %#v, want true", req.Metadata[streamMetadataTopLevelTransfer])
+	if _, set := req.Metadata[streamMetadataTopLevelTransfer]; set {
+		t.Fatalf("chat_top_level_transfer should be absent on continuation route, got %#v", req.Metadata[streamMetadataTopLevelTransfer])
 	}
 	if preserved, _ := req.Metadata["chat_preserve_source_stream_target"].(bool); !preserved {
 		t.Fatalf("chat_preserve_source_stream_target = %#v, want true", req.Metadata["chat_preserve_source_stream_target"])
@@ -1859,6 +1875,78 @@ func waitForRouteRequest(t *testing.T, ch <-chan *guide.RouteRequest) *guide.Rou
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for route request")
 		return nil
+	}
+}
+
+// TestPipelineChallengeAgentSchema_PerInvokerEnumExcludesSelfAndNonPeers
+// verifies that the per-invoker enum baked into challenge_agent.target_agents
+// excludes the invoker itself and every non-pipeline agent (orchestrator,
+// architect, guardian, etc). This is the schema-level guard that prevents the
+// LLM from even attempting a challenge to orchestrator — the bug that
+// produced the stuck "orchestrator 486s" UI row.
+func TestPipelineChallengeAgentSchema_PerInvokerEnumExcludesSelfAndNonPeers(t *testing.T) {
+	invokers := map[string]struct {
+		mustInclude []string
+		mustExclude []string
+	}{
+		PipelineAgentInspector: {
+			mustInclude: []string{PipelineAgentTester, PipelineAgentEngineer, PipelineAgentDesigner, "tester"},
+			mustExclude: []string{PipelineAgentInspector, "inspector", "orchestrator", "architect", "guardian"},
+		},
+		PipelineAgentTester: {
+			mustInclude: []string{PipelineAgentInspector, PipelineAgentEngineer, PipelineAgentDesigner, "inspector"},
+			mustExclude: []string{PipelineAgentTester, "tester", "orchestrator", "architect"},
+		},
+		PipelineAgentEngineer: {
+			mustInclude: []string{PipelineAgentInspector, PipelineAgentTester, PipelineAgentDesigner},
+			mustExclude: []string{PipelineAgentEngineer, "orchestrator", "architect"},
+		},
+		PipelineAgentDesigner: {
+			mustInclude: []string{PipelineAgentInspector, PipelineAgentTester, PipelineAgentEngineer},
+			mustExclude: []string{PipelineAgentDesigner, "orchestrator", "architect"},
+		},
+	}
+	for invoker, spec := range invokers {
+		invoker := invoker
+		spec := spec
+		t.Run(invoker, func(t *testing.T) {
+			skillsList := PipelineProtocolSkills(PipelineProtocolSkillConfig{
+				AgentType: func() string { return invoker },
+			})
+			for _, toolName := range []string{"challenge_agent", "handoff_next"} {
+				var challenge *skills.Skill
+				for _, s := range skillsList {
+					if s.Name == toolName {
+						challenge = s
+						break
+					}
+				}
+				if challenge == nil {
+					t.Fatalf("%s skill not registered for invoker %s", toolName, invoker)
+				}
+				prop, ok := challenge.InputSchema.Properties["target_agents"]
+				if !ok || prop == nil || prop.Items == nil {
+					t.Fatalf("%s: target_agents property missing for invoker %s", toolName, invoker)
+				}
+				if len(prop.Items.Enum) == 0 {
+					t.Fatalf("%s: target_agents.Items.Enum must be populated for invoker %s", toolName, invoker)
+				}
+				enumSet := map[string]struct{}{}
+				for _, v := range prop.Items.Enum {
+					enumSet[v] = struct{}{}
+				}
+				for _, v := range spec.mustInclude {
+					if _, ok := enumSet[v]; !ok {
+						t.Errorf("%s invoker %s: enum missing %q (have %v)", toolName, invoker, v, prop.Items.Enum)
+					}
+				}
+				for _, v := range spec.mustExclude {
+					if _, ok := enumSet[v]; ok {
+						t.Errorf("%s invoker %s: enum must not include %q (have %v)", toolName, invoker, v, prop.Items.Enum)
+					}
+				}
+			}
+		})
 	}
 }
 

@@ -10,7 +10,7 @@ import (
 )
 
 func TestAcademicToolInvocationsUseManifestAgentID(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -36,7 +36,7 @@ func TestAcademicToolInvocationsUseManifestAgentID(t *testing.T) {
 }
 
 func TestAcademicExecuteToolCallAllowsSearchSkillsWithCustomInstanceID(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestAcademicExecuteToolCallAllowsSearchSkillsWithCustomInstanceID(t *testin
 }
 
 func TestAcademicManifestHidesRecursiveResearchWrappers(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestAcademicManifestHidesRecursiveResearchWrappers(t *testing.T) {
 }
 
 func TestAcademicSearchSkillsDoesNotReturnRecursiveResearchWrappers(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestAcademicSearchSkillsDoesNotReturnRecursiveResearchWrappers(t *testing.T
 }
 
 func TestAcademicBuildToolDefinitionsIncludesNativeWebSearch(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestAcademicBuildToolDefinitionsIncludesNativeWebSearch(t *testing.T) {
 }
 
 func TestAcademicBuildToolDefinitionsIncludesGroundSource(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestAcademicBuildToolDefinitionsIncludesGroundSource(t *testing.T) {
 }
 
 func TestAcademicBuildToolDefinitionsIncludesKnowledgeQuery(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestAcademicBuildToolDefinitionsIncludesKnowledgeQuery(t *testing.T) {
 }
 
 func TestAcademicExecuteToolCallRejectsProviderNativeWebSearch(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}

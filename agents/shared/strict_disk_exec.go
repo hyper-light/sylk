@@ -34,9 +34,10 @@ func RunStrictDiskCommand(ctx context.Context, cfg StrictDiskExecConfig, binary 
 	if err != nil {
 		return "", normalizeStrictDiskExecError(binary, err)
 	}
+	argv := append([]string{binary}, applySandboxCompatArgs(binary, args)...)
 	result, err := broker.Run(callCtx, purevfs.BrokerRunRequest{
 		Plan:      plan,
-		Argv:      append([]string{binary}, args...),
+		Argv:      argv,
 		Env:       extraEnv,
 		Workspace: purevfs.ReadOnlyExecutionFS(versioning.NewDiskFileAccess(cfg.WorkingDir, true)),
 	})
@@ -113,4 +114,23 @@ func normalizeExecTimeout(timeout time.Duration) time.Duration {
 		return timeout
 	}
 	return 20 * time.Second
+}
+
+// applySandboxCompatArgs prepends binary-specific flags that keep the command
+// functional inside the strict-disk sandbox. Applied after authorization — the
+// user-approved intent is unchanged; these are safety invariants the broker
+// needs to bridge UID/ownership differences between the sandbox namespace and
+// the disk-backed workspace.
+//
+// For git: the broker runs inside bwrap with --unshare-all, which remaps the
+// outer UID. The repo directory is still owned by the outer UID, so git ≥2.36
+// aborts with "detected dubious ownership" unless safe.directory is
+// configured. Passing -c safe.directory=* on every invocation disables that
+// check for the single process — safe because we are already inside an
+// isolated sandbox.
+func applySandboxCompatArgs(binary string, args []string) []string {
+	if !strings.EqualFold(strings.TrimSpace(binary), "git") {
+		return args
+	}
+	return append([]string{"-c", "safe.directory=*"}, args...)
 }

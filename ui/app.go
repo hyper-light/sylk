@@ -17,6 +17,7 @@ import (
 	"github.com/adalundhe/sylk/core/detect"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/knowledge"
+	"github.com/adalundhe/sylk/core/llm/accounting"
 	"github.com/adalundhe/sylk/core/lsp"
 	"github.com/adalundhe/sylk/core/pipeline/variants"
 	"github.com/adalundhe/sylk/core/providers"
@@ -294,6 +295,7 @@ type Deps struct {
 	Guide              *guide.Guide
 	Scope              *concurrency.GoroutineScope
 	AuthRegistry       *credentials.AuthRegistry
+	Accountant         *accounting.Accountant
 	InterruptAllAgents func(sessionID, reason string) error
 
 	// SignalStop restores default signal handling and cancels the parent
@@ -456,6 +458,7 @@ type AppModel struct {
 	// Bridges
 	activityBridge   *bridge.ActivityBridge
 	tokenUsageBridge *bridge.TokenUsageBridge
+	accountantBridge *bridge.AccountantBridge
 	sessionBridge    *bridge.SessionBridge
 	streamBridge     *bridge.StreamBridge
 	guideBridge      *bridge.GuideBridge
@@ -752,6 +755,18 @@ type AppModel struct {
 	busCacheReadTokens  int
 	busCacheWriteTokens int
 	busReasoningTokens  int
+
+	// Accountant-sourced snapshot totals (item 52). Refreshed on
+	// every AccountingSnapshotMsg which the AccountantBridge emits
+	// on a ticker. These are the billable, session-wide totals
+	// aggregated by accounting.Accountant — the canonical source.
+	// The bus-sourced counters above remain for per-replica
+	// per-correlation views the status bar does not own.
+	accountantTotalInput     int64
+	accountantTotalOutput    int64
+	accountantTotalReasoning int64
+	accountantTotalRequests  int64
+	accountantTotalErrors    int64
 
 	// TUI-local WAL logger for suppressed/non-UI operational errors.
 	walLogger *slog.Logger
@@ -2074,6 +2089,20 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 		m.applyActivityTelemetry(typed)
 		return m.propagate(typed)
 	}),
+	reflect.TypeFor[msg.AccountingSnapshotMsg](): appMsgStateRoute(func(m *AppModel, typed msg.AccountingSnapshotMsg) {
+		// Item 52: status bar reads accountant-aggregated totals via
+		// accountant.Billable() snapshots published on each tick.
+		m.accountantTotalInput = typed.TotalInput
+		m.accountantTotalOutput = typed.TotalOutput
+		m.accountantTotalReasoning = typed.TotalReasoning
+		m.accountantTotalRequests = typed.TotalRequests
+		m.accountantTotalErrors = typed.TotalErrors
+	}),
+	reflect.TypeFor[msg.TokenDeltaMsg](): appMsgStateRoute(func(m *AppModel, typed msg.TokenDeltaMsg) {
+		// Typed-identity delta path (item 50). Consumers read
+		// Identity.UID() / Identity.Owner() directly; no
+		// "#replica-" string parsing.
+	}),
 	reflect.TypeFor[msg.TokenUsageMsg](): appMsgStateRoute(func(m *AppModel, typed msg.TokenUsageMsg) {
 		m.busInputTokens += typed.InputTokens
 		m.busOutputTokens += typed.OutputTokens
@@ -2332,6 +2361,7 @@ func (m *AppModel) Shutdown() error {
 	m.cancel() // Cancel all in-flight Cmd contexts first.
 	m.activityBridge.Stop()
 	m.tokenUsageBridge.Stop()
+	m.accountantBridge.Stop()
 	m.sessionBridge.Stop()
 	m.streamBridge.Stop()
 	m.guideBridge.Stop()

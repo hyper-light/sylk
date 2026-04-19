@@ -8,9 +8,40 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/llm/ratelimit"
 	"github.com/adalundhe/sylk/core/providers"
 )
+
+// dispatchCtx returns a background context decorated with a minimal
+// identity + task pair. The gateway requires both at every call site;
+// tests that don't care about identity attribution still need to
+// satisfy that contract.
+func dispatchCtx() context.Context {
+	id := identity.RebuildForReplay(identity.ReplayAgentIdentity{
+		UID:       "uid-test",
+		Namespace: "ns-test",
+		Pod:       identity.PodRef{ID: "guide", Type: identity.PodTypeDaemon},
+		Name:      "guide",
+		Kind:      identity.AgentTypeGuide,
+		Category:  identity.CategoryStandalone,
+		Model:     "test-model",
+		Labels: identity.Labels{
+			identity.LabelKind:      identity.AgentTypeGuide.String(),
+			identity.LabelCategory:  identity.CategoryStandalone.String(),
+			identity.LabelPod:       "guide",
+			identity.LabelNamespace: "ns-test",
+		},
+	})
+	task := identity.RebuildTaskForReplay(identity.ReplayTaskRef{
+		UID:         "task-test",
+		DisplayID:   "test-task",
+		Correlation: "corr-test",
+		Namespace:   "ns-test",
+	})
+	ctx := identity.WithIdentity(context.Background(), id)
+	return identity.WithTask(ctx, task)
+}
 
 // --- Test helpers ---
 
@@ -420,7 +451,7 @@ func TestProxy_Complete(t *testing.T) {
 
 	proxy := gw.WrapProvider(inner, PriorityExecution)
 
-	resp, err := proxy.Complete(context.Background(), &providers.CompletionRequest{})
+	resp, err := proxy.Complete(dispatchCtx(), &providers.CompletionRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,7 +482,7 @@ func TestProxy_Complete_429Detection(t *testing.T) {
 	}
 
 	proxy := gw.WrapProvider(inner, PriorityExecution)
-	_, err := proxy.Complete(context.Background(), &providers.CompletionRequest{})
+	_, err := proxy.Complete(dispatchCtx(), &providers.CompletionRequest{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -475,7 +506,7 @@ func TestProxy_StreamWithHandler(t *testing.T) {
 	}
 
 	proxy := gw.WrapProvider(inner, PriorityExecution)
-	err := proxy.StreamWithHandler(context.Background(), &providers.StreamRequest{}, func(chunk *providers.StreamChunk) error {
+	err := proxy.StreamWithHandler(dispatchCtx(), &providers.StreamRequest{}, func(chunk *providers.StreamChunk) error {
 		return nil
 	})
 	if err != nil {
@@ -506,7 +537,7 @@ func TestProxy_Stream(t *testing.T) {
 	}
 
 	proxy := gw.WrapProvider(inner, PriorityExecution)
-	ch, err := proxy.Stream(context.Background(), &providers.CompletionRequest{})
+	ch, err := proxy.Stream(dispatchCtx(), &providers.CompletionRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,7 +594,7 @@ func TestProxy_RetryObserverChaining(t *testing.T) {
 	defer gw.Stop()
 
 	var existingFired atomic.Bool
-	ctx := providers.WithRetryObserver(context.Background(), func(event providers.RetryEvent) {
+	ctx := providers.WithRetryObserver(dispatchCtx(), func(event providers.RetryEvent) {
 		existingFired.Store(true)
 	})
 

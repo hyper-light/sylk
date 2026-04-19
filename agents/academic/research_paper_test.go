@@ -28,7 +28,7 @@ func (p *countingAcademicProvider) Complete(_ context.Context, _ *providers.Requ
 }
 
 func TestBuildResearchPaperAndArtifact(t *testing.T) {
-	a, err := New(Config{SessionID: "sess-paper"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), SessionID: "sess-paper"}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -159,7 +159,7 @@ func TestBuildResearchPaperAndArtifact(t *testing.T) {
 }
 
 func TestAuthorResearchPaperStoresByDefaultWithoutBus(t *testing.T) {
-	a, err := New(Config{SessionID: "sess-author"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), SessionID: "sess-author"}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -201,7 +201,7 @@ func TestAuthorResearchPaperStoresByDefaultWithoutBus(t *testing.T) {
 }
 
 func TestAuthorResearchPaper_UsesExecuteResearchStateWithoutRerunningResearch(t *testing.T) {
-	a, err := New(Config{SessionID: "sess-exec-paper"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), SessionID: "sess-exec-paper"}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -272,7 +272,7 @@ func TestAuthorResearchPaper_UsesExecuteResearchStateWithoutRerunningResearch(t 
 
 func TestResolveResearchPaperInputs_TerminalConsultationAutoGroundsDiscoveredURLs(t *testing.T) {
 	provider := &countingAcademicProvider{}
-	a, err := New(Config{SessionID: "sess-terminal-paper"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), SessionID: "sess-terminal-paper"}, provider)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -363,7 +363,7 @@ func TestResolveResearchPaperInputs_TerminalConsultationAutoGroundsDiscoveredURL
 
 func TestResolveResearchPaperInputs_TerminalConsultationAutoGroundsProviderSearchResults(t *testing.T) {
 	provider := &countingAcademicProvider{}
-	a, err := New(Config{SessionID: "sess-terminal-paper"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), SessionID: "sess-terminal-paper"}, provider)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -465,7 +465,7 @@ func TestResolveResearchPaperInputs_TerminalConsultationAutoGroundsProviderSearc
 
 func TestResolveResearchPaperInputs_TerminalConsultationApprovalDeniedAutoGroundReturnsDelegatedError(t *testing.T) {
 	provider := &countingAcademicProvider{}
-	a, err := New(Config{SessionID: "sess-terminal-paper"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), SessionID: "sess-terminal-paper"}, provider)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -515,7 +515,7 @@ func TestResolveResearchPaperInputs_TerminalConsultationApprovalDeniedAutoGround
 
 func TestResolveResearchPaperInputs_TerminalConsultationSynthesizesAsIsWhenAutoGroundFails(t *testing.T) {
 	provider := &countingAcademicProvider{}
-	a, err := New(Config{SessionID: "sess-terminal-paper"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), SessionID: "sess-terminal-paper"}, provider)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

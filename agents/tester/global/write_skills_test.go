@@ -184,7 +184,7 @@ func newGlobalTesterWriteHarness(t *testing.T) (*GlobalTester, versioning.FileAc
 		_ = svfs.Close()
 	})
 
-	gt, err := New(testershared.GlobalTesterConfig{}, nil)
+	gt, err := New(testershared.GlobalTesterConfig{Factory: newTestFactory(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

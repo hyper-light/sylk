@@ -2,7 +2,16 @@
 // piece-table data structure. All positions are rune-indexed (Unicode-aware).
 package buffer
 
-import "slices"
+import (
+	"errors"
+	"slices"
+)
+
+// ErrPositionOutOfBounds is returned by Insert / Delete when the requested
+// position (or range) is outside the buffer's current contents. Callers can
+// errors.Is against this sentinel to detect validation failures. The prior
+// implementation silently clamped or faulted at the piece-lookup stage.
+var ErrPositionOutOfBounds = errors.New("piecetable: position out of bounds")
 
 // Source indicates which buffer a piece references.
 type Source int
@@ -61,11 +70,16 @@ func NewPieceTable(content string) *PieceTable {
 // Length returns the total number of runes across all pieces. O(1).
 func (pt *PieceTable) Length() int { return pt.length }
 
-// Insert inserts text at the given rune position.
-func (pt *PieceTable) Insert(pos int, text string) {
+// Insert inserts text at the given rune position. Returns
+// ErrPositionOutOfBounds if pos is outside [0, Length()]. Inserting at
+// Length() (append) is valid. An empty text returns nil without mutation.
+func (pt *PieceTable) Insert(pos int, text string) error {
+	if pos < 0 || pos > pt.length {
+		return ErrPositionOutOfBounds
+	}
 	runes := []rune(text)
 	if len(runes) == 0 {
-		return
+		return nil
 	}
 	addOffset := len(pt.add)
 	pt.add = append(pt.add, runes...)
@@ -80,12 +94,18 @@ func (pt *PieceTable) Insert(pos int, text string) {
 		Delta:      len(runes),
 		HadNewline: containsNewline(runes),
 	}
+	return nil
 }
 
-// Delete removes length runes starting at pos.
-func (pt *PieceTable) Delete(pos, length int) {
+// Delete removes length runes starting at pos. Returns
+// ErrPositionOutOfBounds if [pos, pos+length) is not fully contained in
+// [0, Length()). A non-positive length returns nil without mutation.
+func (pt *PieceTable) Delete(pos, length int) error {
 	if length <= 0 {
-		return
+		return nil
+	}
+	if pos < 0 || pos+length > pt.length {
+		return ErrPositionOutOfBounds
 	}
 	// Check for newlines before mutating pieces.
 	hadNL := pt.rangeHasNewline(pos, length)
@@ -100,6 +120,7 @@ func (pt *PieceTable) Delete(pos, length int) {
 		Delta:      -length,
 		HadNewline: hadNL,
 	}
+	return nil
 }
 
 // Version returns a monotonically increasing counter that changes on every
@@ -196,17 +217,23 @@ func (pt *PieceTable) LineCount() int {
 	return count
 }
 
-// RuneAt returns the rune at the absolute rune position.
-func (pt *PieceTable) RuneAt(pos int) rune {
+// RuneAt returns the rune at the absolute rune position and ok=true. If pos
+// is outside [0, Length()), it returns (0, false) so callers can branch on
+// the bounds result rather than mis-interpreting a genuine NUL rune. This
+// replaces the prior silent-0-return signature that masked cursor bugs.
+func (pt *PieceTable) RuneAt(pos int) (rune, bool) {
+	if pos < 0 || pos >= pt.length {
+		return 0, false
+	}
 	offset := 0
 	for _, p := range pt.pieces {
 		if pos < offset+p.Length {
 			src := pt.sourceBuffer(p.Source)
-			return src[p.Offset+(pos-offset)]
+			return src[p.Offset+(pos-offset)], true
 		}
 		offset += p.Length
 	}
-	return 0
+	return 0, false
 }
 
 // ---------------------------------------------------------------------------

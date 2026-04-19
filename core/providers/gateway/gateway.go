@@ -28,6 +28,11 @@ type ProviderGateway struct {
 	slotMu      sync.Mutex
 	logger      *slog.Logger
 	eventHook   providers.LLMProviderEventHook
+
+	// streamWG tracks in-flight stream-forwarder goroutines spawned by
+	// GatewayProvider.Stream so Stop() can wait for them to drain instead
+	// of leaving orphaned writers on the output channel after shutdown.
+	streamWG sync.WaitGroup
 }
 
 // NewProviderGateway creates a gateway with the given configuration.
@@ -128,12 +133,15 @@ func (g *ProviderGateway) CapacitySnapshot() CapacitySnapshot {
 	}
 }
 
-// Stop closes the gateway, signaling all queued waiters.
+// Stop closes the gateway, signaling all queued waiters. Blocks until all
+// in-flight stream-forwarder goroutines have drained so the caller can rely
+// on the output channels being closed before their consumers exit.
 func (g *ProviderGateway) Stop() {
 	if g.closed.Swap(true) {
 		return
 	}
 	g.scheduler.Close()
+	g.streamWG.Wait()
 	g.logger.Info("gateway stopped", "name", g.config.Name)
 }
 

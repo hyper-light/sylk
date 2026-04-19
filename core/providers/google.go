@@ -1358,6 +1358,7 @@ func (g *GoogleProvider) streamWithHandlerOnce(ctx context.Context, req *Request
 	var stopReason StopReason
 	var rawContent *googleSerializableContent
 	toolCallsSeen := map[googleToolCallKey]bool{}
+	toolCallIDs := map[googleToolCallKey]string{}
 	textDelta := &providerDeltaEmitter{}
 	thoughtDelta := &providerDeltaEmitter{}
 
@@ -1404,13 +1405,18 @@ func (g *GoogleProvider) streamWithHandlerOnce(ctx context.Context, req *Request
 			for _, fc := range resp.FunctionCalls() {
 				argsJSON, _ := json.Marshal(fc.Args)
 				key := googleToolCallKey{ID: fc.ID, Name: fc.Name}
+				stableID, ok := toolCallIDs[key]
+				if !ok {
+					stableID = EnsureToolCallID(fc.ID)
+					toolCallIDs[key] = stableID
+				}
 				if !toolCallsSeen[key] {
 					toolCallsSeen[key] = true
 					if err := handler(&StreamChunk{
 						Index: chunkIndex,
 						Type:  ChunkTypeToolStart,
 						ToolCall: &ToolCallChunk{
-							ID:   fc.ID,
+							ID:   stableID,
 							Name: fc.Name,
 						},
 						Timestamp: time.Now(),
@@ -1422,7 +1428,7 @@ func (g *GoogleProvider) streamWithHandlerOnce(ctx context.Context, req *Request
 					Index: chunkIndex,
 					Type:  ChunkTypeToolDelta,
 					ToolCall: &ToolCallChunk{
-						ID:             fc.ID,
+						ID:             stableID,
 						ArgumentsDelta: string(argsJSON),
 					},
 					Timestamp: time.Now(),
@@ -1985,6 +1991,14 @@ func (sp googleSerializablePartItem) hasReplayData() bool {
 		len(sp.ThoughtSignature) > 0
 }
 
+func (sp googleSerializablePartItem) hasTextReplayData() bool {
+	return strings.TrimSpace(sp.Text) != "" || sp.Thought || len(sp.ThoughtSignature) > 0
+}
+
+func (sp googleSerializablePartItem) hasFunctionCallReplayData() bool {
+	return strings.TrimSpace(sp.FunctionCallName) != ""
+}
+
 func mergeGoogleRawContent(current, next *googleSerializableContent) *googleSerializableContent {
 	if current == nil {
 		return next
@@ -2042,19 +2056,36 @@ func (sc googleSerializableContent) toGenaiContent() *genai.Content {
 		if !sp.hasReplayData() {
 			continue
 		}
-		part := &genai.Part{
+
+		// genai.Part uses a protobuf oneof for its payload fields. Replayed
+		// text/thought data and function calls must be emitted as separate parts
+		// even if earlier stream merges collapsed them into one serialized item.
+		// Gemini 3 attaches thought signatures directly to functionCall parts and
+		// rejects history when the signature is hoisted onto a sibling text part,
+		// so the signature stays with the function call when one is present.
+		if sp.hasFunctionCallReplayData() {
+			if strings.TrimSpace(sp.Text) != "" || sp.Thought {
+				content.Parts = append(content.Parts, &genai.Part{
+					Text:    sp.Text,
+					Thought: sp.Thought,
+				})
+			}
+			content.Parts = append(content.Parts, &genai.Part{
+				FunctionCall: &genai.FunctionCall{
+					ID:   sp.FunctionCallID,
+					Name: sp.FunctionCallName,
+					Args: sp.FunctionCallArgs,
+				},
+				ThoughtSignature: sp.ThoughtSignature,
+			})
+			continue
+		}
+
+		content.Parts = append(content.Parts, &genai.Part{
 			Text:             sp.Text,
 			Thought:          sp.Thought,
 			ThoughtSignature: sp.ThoughtSignature,
-		}
-		if sp.FunctionCallName != "" {
-			part.FunctionCall = &genai.FunctionCall{
-				ID:   sp.FunctionCallID,
-				Name: sp.FunctionCallName,
-				Args: sp.FunctionCallArgs,
-			}
-		}
-		content.Parts = append(content.Parts, part)
+		})
 	}
 	if len(content.Parts) == 0 {
 		return nil
@@ -2138,7 +2169,7 @@ func (g *GoogleProvider) convertResponse(result *genai.GenerateContentResponse, 
 		for _, fc := range fcs {
 			argsJSON, _ := json.Marshal(fc.Args)
 			resp.ToolCalls = append(resp.ToolCalls, ToolCall{
-				ID:        fc.ID,
+				ID:        EnsureToolCallID(fc.ID),
 				Name:      fc.Name,
 				Arguments: string(argsJSON),
 			})

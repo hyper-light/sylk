@@ -10,6 +10,7 @@ import (
 func TestApplyLLMRuntimeProfile_DisablesParallelToolUse(t *testing.T) {
 	pt := &PipelineTester{
 		config: testershared.PipelineTesterConfig{
+		Factory: newTestFactory(t),
 			SessionID: "sess-1",
 			Model:     "claude-opus-4-6",
 		},

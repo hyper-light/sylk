@@ -96,7 +96,15 @@ var profiles = map[string]Profile{
 	"librarian": {
 		AgentType: "librarian",
 		FileScope: FileScopeDiskRead,
-		ExecScope: ExecScopeDisk,
+		// Librarian needs to inspect both committed disk state and the
+		// in-flight global VFS overlay. read_file stays disk-only by design;
+		// the workspace-aware skills (read_workspace_file, workspace_glob,
+		// workspace_grep, inspect_workspace_state, summarize_workspace_state)
+		// are how the librarian reaches the global VFS — pipeline-local
+		// overlays remain off limits because the librarian operates above
+		// any single pipeline's scope.
+		WorkspaceViews: []versioning.WorkspaceView{versioning.WorkspaceViewDisk, versioning.WorkspaceViewGlobal},
+		ExecScope:      ExecScopeDisk,
 	},
 	"orchestrator": {
 		AgentType:      "orchestrator",

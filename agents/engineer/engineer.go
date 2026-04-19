@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/escalation"
@@ -40,9 +41,11 @@ type engineerProvider interface {
 // It uses GPT-5.4 Pro with xhigh reasoning to execute individual coding
 // tasks via an LLM-driven tool loop.
 type Engineer struct {
-	id     string
-	config Config
-	logger *slog.Logger
+	id       string
+	config   Config
+	logger   *slog.Logger
+	identity *identity.AgentIdentity
+	factory  *identity.Factory
 
 	// LLM provider
 	provider  engineerProvider
@@ -148,6 +151,11 @@ type Config struct {
 
 	// Forest exposes Memory Forest precedent-recall skills.
 	Forest shared.MemoryForestService
+
+	// Factory mints the Engineer's AgentIdentity at New() time.
+	// Pipeline agent, created by the orchestrator's task router inside
+	// the pipeline pod after phase4.
+	Factory *identity.Factory
 }
 
 // Default configuration values
@@ -191,6 +199,16 @@ func New(cfg Config, provider engineerProvider) (*Engineer, error) {
 		requestSerializer: shared.NewRequestSerializer(),
 		executionBroker:   purevfs.DefaultExecutionBroker(),
 	}
+
+	eng.factory = cfg.Factory
+	engineerIdentity, err := cfg.Factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeEngineer,
+		Pod:  identity.PodRef{ID: "pipeline", Type: identity.PodTypePipeline},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("engineer: mint identity: %w", err)
+	}
+	eng.identity = engineerIdentity
 
 	eng.steering.InitLazy("engineer", nil)
 
@@ -573,6 +591,27 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	defer e.clearRequestCancel(fwd.CorrelationID)
 	defer cancel()
 
+	if e.factory != nil && e.identity != nil {
+		pipelineID, _ := fwd.Metadata["task_id"].(string)
+		var pipeline *identity.PipelineRef
+		if pipelineID != "" {
+			pipeline = &identity.PipelineRef{
+				ID:    identity.PipelineID(pipelineID),
+				Stage: "implement",
+			}
+		}
+		task, taskErr := e.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+			Pipeline:    pipeline,
+		})
+		if taskErr != nil {
+			return fmt.Errorf("engineer: mint task: %w", taskErr)
+		}
+		reqCtx = identity.WithIdentity(reqCtx, e.identity)
+		reqCtx = identity.WithTask(reqCtx, task)
+	}
+
 	// Create steering ledger for this request.
 	ledger := e.steering.Create(fwd.CorrelationID, e.id, fwd.SessionID, nil, nil)
 	defer e.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
@@ -590,8 +629,6 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	}
 	ctx := shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, shared.MergeStreamMetadata(fwd.Metadata, map[string]any{
 		"pipeline_task": true,
-		"agent_type":    "engineer",
-		"agent_name":    "Engineer",
 		"pipeline_id":   e.pipelineID,
 		"task_id":       e.pipelineID,
 		"task_slug":     e.pipelineSlug,
@@ -599,6 +636,7 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		"dag_id":        metaString("dag_id"),
 		"node_id":       metaString("node_id"),
 	}))
+	ctx = shared.WithOwnedStreamIdentity(ctx, "engineer", "Engineer")
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)

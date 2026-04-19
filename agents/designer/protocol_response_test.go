@@ -50,7 +50,7 @@ func TestHandleBusRequest_PipelineResponsePreservesRecordedAction(t *testing.T) 
 		},
 	}
 
-	d, err := New(Config{SessionID: "sess-1"}, provider)
+	d, err := New(Config{Factory: newTestFactory(t), SessionID: "sess-1"}, provider)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

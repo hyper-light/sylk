@@ -16,10 +16,11 @@ func NewTestActivityCollector() *TestActivityCollector {
 }
 
 // PublishActivity records the event for later inspection.
-func (c *TestActivityCollector) PublishActivity(event *ActivityEvent) {
+func (c *TestActivityCollector) PublishActivity(event *ActivityEvent) error {
 	c.mu.Lock()
 	c.events = append(c.events, event)
 	c.mu.Unlock()
+	return nil
 }
 
 // Events returns a snapshot of all collected events.

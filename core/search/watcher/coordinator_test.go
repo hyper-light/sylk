@@ -587,18 +587,28 @@ func TestChangeDetector_HigherPriorityOverrides(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	fsSource.Send(makeEvent("/test/file.go", OpModify, SourceFSNotify))
 
-	// Collect events
+	// Collect events. Wait until we have both (periodic + fsnotify override)
+	// OR a generous hard deadline expires. A fixed short timeout is flaky
+	// under concurrent test load because event delivery can be delayed past
+	// the window even though the detector is working correctly.
 	var received []*ChangeEvent
-	timeout := time.After(150 * time.Millisecond)
+	var hasFSNotify bool
+	deadline := time.After(2 * time.Second)
 collecting:
 	for {
+		if len(received) >= 2 && hasFSNotify {
+			break
+		}
 		select {
 		case event, ok := <-events:
 			if !ok {
 				break collecting
 			}
 			received = append(received, event)
-		case <-timeout:
+			if event.Source == SourceFSNotify {
+				hasFSNotify = true
+			}
+		case <-deadline:
 			break collecting
 		}
 	}
@@ -606,15 +616,6 @@ collecting:
 	// Should receive both: first periodic (new), then fsnotify (higher priority override)
 	if len(received) < 2 {
 		t.Errorf("expected at least 2 events (periodic + fsnotify override), got %d", len(received))
-	}
-
-	// Check that fsnotify event was emitted despite being within window
-	var hasFSNotify bool
-	for _, e := range received {
-		if e.Source == SourceFSNotify {
-			hasFSNotify = true
-			break
-		}
 	}
 	if !hasFSNotify {
 		t.Error("higher priority fsnotify event should override dedupe for lower priority")

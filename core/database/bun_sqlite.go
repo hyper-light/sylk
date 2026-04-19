@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -64,10 +65,18 @@ type BunSQLiteDB struct {
 }
 
 // OpenBunSQLite opens a Bun-backed SQLite database with a consistent
-// connection, pragma, and write-retry policy.
+// connection, pragma, and write-retry policy. The DSN is generated for the
+// active sqliteshim driver (modernc.org/sqlite or mattn/go-sqlite3) — they
+// require different parameter syntax. After open, every requested pragma is
+// probed back via PRAGMA queries to fail loudly if the driver silently
+// dropped any setting (the historical failure mode that produced
+// "database is locked" within sub-millisecond on the orchestrator's store).
 func OpenBunSQLite(cfg BunSQLiteConfig) (*BunSQLiteDB, error) {
 	cfg = normalizeBunSQLiteConfig(cfg)
-	dsn := buildBunSQLiteDSN(cfg)
+	dsn, err := buildBunSQLiteDSN(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("bun sqlite: dsn: %w", err)
+	}
 
 	sqlDB, err := sql.Open(sqliteshim.ShimName, dsn)
 	if err != nil {
@@ -81,6 +90,11 @@ func OpenBunSQLite(cfg BunSQLiteConfig) (*BunSQLiteDB, error) {
 	if err := sqlDB.Ping(); err != nil {
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("bun sqlite: ping: %w", err)
+	}
+
+	if err := verifyBunSQLitePragmas(sqlDB, cfg); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("bun sqlite: pragma verify: %w", err)
 	}
 
 	return &BunSQLiteDB{
@@ -119,20 +133,121 @@ func normalizeBunSQLiteConfig(cfg BunSQLiteConfig) BunSQLiteConfig {
 	return cfg
 }
 
-func buildBunSQLiteDSN(cfg BunSQLiteConfig) string {
+// buildBunSQLiteDSN emits a DSN whose query parameters are honored by the
+// active sqliteshim driver. modernc.org/sqlite reads only `_pragma=name(value)`
+// (see modernc/sqlite applyQueryParams); mattn/go-sqlite3 reads its own set
+// (`_busy_timeout`, `_journal_mode`, `_foreign_keys`, `_synchronous`,
+// `_cache_size`). The two formats are mutually exclusive — passing one to the
+// other driver is silently dropped, which previously left the orchestrator
+// running without busy_timeout and without WAL.
+func buildBunSQLiteDSN(cfg BunSQLiteConfig) (string, error) {
 	journalMode := "DELETE"
 	if cfg.EnableWAL {
 		journalMode = "WAL"
 	}
-	return fmt.Sprintf(
-		"file:%s?_busy_timeout=%d&_journal_mode=%s&_foreign_keys=%d&_synchronous=%s&cache_size=%d",
-		cfg.Path,
-		int(cfg.BusyTimeout.Milliseconds()),
-		journalMode,
-		boolToInt(cfg.ForeignKeys),
-		strings.ToUpper(strings.TrimSpace(cfg.Synchronous)),
-		cfg.CacheSize,
-	)
+	syncMode := strings.ToUpper(strings.TrimSpace(cfg.Synchronous))
+	busyMs := int(cfg.BusyTimeout.Milliseconds())
+	fkInt := boolToInt(cfg.ForeignKeys)
+
+	var params string
+	switch driver := sqliteshim.DriverName(); driver {
+	case "sqlite": // modernc.org/sqlite
+		// Order matters cosmetically but not functionally; modernc applies
+		// busy_timeout first regardless of order.
+		params = fmt.Sprintf(
+			"_pragma=busy_timeout(%d)&_pragma=journal_mode(%s)&_pragma=foreign_keys(%d)&_pragma=synchronous(%s)&_pragma=cache_size(%d)",
+			busyMs, journalMode, fkInt, syncMode, cfg.CacheSize,
+		)
+	case "sqlite3": // mattn/go-sqlite3
+		params = fmt.Sprintf(
+			"_busy_timeout=%d&_journal_mode=%s&_foreign_keys=%d&_synchronous=%s&_cache_size=%d",
+			busyMs, journalMode, fkInt, syncMode, cfg.CacheSize,
+		)
+	default:
+		return "", fmt.Errorf("unsupported sqlite driver %q (sqliteshim has no backing driver — this build cannot use sqlite)", driver)
+	}
+
+	return fmt.Sprintf("file:%s?%s", cfg.Path, params), nil
+}
+
+// verifyBunSQLitePragmas probes the live database for each pragma the caller
+// asked for and errors if any value didn't take effect. A silent driver-side
+// drop is the historical failure mode that produced sub-millisecond
+// "database is locked" errors on the orchestrator's coordination store
+// (modernc.org/sqlite ignores mattn-style query params; the legacy DSN was
+// mattn-style; every pragma was being dropped).
+func verifyBunSQLitePragmas(db *sql.DB, cfg BunSQLiteConfig) error {
+	if db == nil {
+		return nil
+	}
+
+	wantJournal := "delete"
+	if cfg.EnableWAL {
+		wantJournal = "wal"
+	}
+	if got, err := readSQLitePragma(db, "journal_mode"); err != nil {
+		return fmt.Errorf("read journal_mode: %w", err)
+	} else if !strings.EqualFold(got, wantJournal) {
+		return fmt.Errorf("journal_mode = %q, want %q (driver %q likely ignored DSN params)", got, wantJournal, sqliteshim.DriverName())
+	}
+
+	wantBusyMs := int64(cfg.BusyTimeout.Milliseconds())
+	if got, err := readSQLitePragma(db, "busy_timeout"); err != nil {
+		return fmt.Errorf("read busy_timeout: %w", err)
+	} else if gotMs, parseErr := strconv.ParseInt(strings.TrimSpace(got), 10, 64); parseErr != nil {
+		return fmt.Errorf("busy_timeout pragma returned non-numeric %q", got)
+	} else if gotMs != wantBusyMs {
+		return fmt.Errorf("busy_timeout = %d ms, want %d ms (driver %q likely ignored DSN params)", gotMs, wantBusyMs, sqliteshim.DriverName())
+	}
+
+	wantFK := "0"
+	if cfg.ForeignKeys {
+		wantFK = "1"
+	}
+	if got, err := readSQLitePragma(db, "foreign_keys"); err != nil {
+		return fmt.Errorf("read foreign_keys: %w", err)
+	} else if strings.TrimSpace(got) != wantFK {
+		return fmt.Errorf("foreign_keys = %q, want %q", got, wantFK)
+	}
+
+	wantSync := strings.ToLower(strings.TrimSpace(cfg.Synchronous))
+	if wantSync != "" {
+		got, err := readSQLitePragma(db, "synchronous")
+		if err != nil {
+			return fmt.Errorf("read synchronous: %w", err)
+		}
+		gotName := normalizeSQLiteSynchronous(strings.TrimSpace(got))
+		if !strings.EqualFold(gotName, wantSync) {
+			return fmt.Errorf("synchronous = %q, want %q", gotName, wantSync)
+		}
+	}
+
+	return nil
+}
+
+func readSQLitePragma(db *sql.DB, name string) (string, error) {
+	var raw string
+	row := db.QueryRow("PRAGMA " + name)
+	if err := row.Scan(&raw); err != nil {
+		return "", err
+	}
+	return raw, nil
+}
+
+// normalizeSQLiteSynchronous maps SQLite's numeric PRAGMA synchronous result
+// (0/1/2/3) onto the symbolic name the caller used in config.
+func normalizeSQLiteSynchronous(raw string) string {
+	switch strings.TrimSpace(raw) {
+	case "0":
+		return "off"
+	case "1":
+		return "normal"
+	case "2":
+		return "full"
+	case "3":
+		return "extra"
+	}
+	return strings.ToLower(raw)
 }
 
 // Bun returns the Bun DB facade.

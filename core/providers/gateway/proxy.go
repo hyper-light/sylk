@@ -2,10 +2,24 @@ package gateway
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/providers"
 )
+
+// ErrDispatchIdentityMissing is returned by the gateway when a
+// provider call is attempted without a fully-populated dispatch
+// context (AgentIdentity + TaskRef). Every LLM call site must stamp
+// identity on ctx via identity.WithIdentity / WithTask before
+// invoking the gateway — this error surfaces that contract breach
+// loudly rather than silently attributing the call to the wrong
+// bucket.
+var ErrDispatchIdentityMissing = errors.New("gateway: dispatch context missing identity or task")
 
 // ProviderWrapper re-applies gateway admission control to a fresh provider.
 // Agents store this callback and invoke it after credential refresh so the
@@ -54,6 +68,12 @@ func (p *GatewayProvider) RequestTimeout() time.Duration {
 
 // Complete performs a non-streaming completion through the gateway.
 func (p *GatewayProvider) Complete(ctx context.Context, req *providers.CompletionRequest) (*providers.CompletionResponse, error) {
+	id, task, err := requireDispatch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	model := identity.ModelID(req.Model)
+
 	admitStart := time.Now()
 	p.gateway.logger.Info("DEBUG: gateway_admit_start",
 		"gateway", p.gateway.config.Name,
@@ -61,6 +81,8 @@ func (p *GatewayProvider) Complete(ctx context.Context, req *providers.Completio
 		"inflight", p.gateway.inflight.Load(),
 		"max_inflight", p.gateway.maxInflight,
 		"model", req.Model,
+		"agent", id.Panel(),
+		"task", string(task.UID()),
 		"skip_skills", req.SkipProviderSkills)
 	if err := p.gateway.Admit(ctx, p.priority); err != nil {
 		p.gateway.logger.Info("DEBUG: gateway_admit_failed",
@@ -73,9 +95,8 @@ func (p *GatewayProvider) Complete(ctx context.Context, req *providers.Completio
 		"gateway", p.gateway.config.Name,
 		"elapsed_ms", time.Since(admitStart).Milliseconds())
 
-	sessionID, agentID := extractRequestIdentity(req)
 	if hook := p.gateway.eventHook; hook != nil {
-		hook.OnRequest(sessionID, agentID, req.Model, 0)
+		hook.OnRequest(ctx, id, task, model)
 	}
 
 	ctx = p.injectRetryObserver(ctx)
@@ -91,9 +112,9 @@ func (p *GatewayProvider) Complete(ctx context.Context, req *providers.Completio
 
 	if hook := p.gateway.eventHook; hook != nil {
 		if err != nil {
-			hook.OnError(sessionID, agentID, req.Model, err)
+			hook.OnError(ctx, id, task, model, err, elapsed)
 		} else {
-			hook.OnResponse(sessionID, agentID, resp.Model, &resp.Usage, elapsed)
+			hook.OnResponse(ctx, id, task, identity.ModelID(resp.Model), &resp.Usage, elapsed)
 		}
 	}
 
@@ -103,13 +124,18 @@ func (p *GatewayProvider) Complete(ctx context.Context, req *providers.Completio
 // Stream performs a channel-based streaming completion through the gateway.
 // The concurrency slot is held until the returned channel is drained.
 func (p *GatewayProvider) Stream(ctx context.Context, req *providers.CompletionRequest) (<-chan *providers.StreamChunk, error) {
+	id, task, err := requireDispatch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	model := identity.ModelID(req.Model)
+
 	if err := p.gateway.Admit(ctx, p.priority); err != nil {
 		return nil, err
 	}
 
-	sessionID, agentID := extractRequestIdentity(req)
 	if hook := p.gateway.eventHook; hook != nil {
-		hook.OnRequest(sessionID, agentID, req.Model, 0)
+		hook.OnRequest(ctx, id, task, model)
 	}
 
 	ctx = p.injectRetryObserver(ctx)
@@ -119,15 +145,54 @@ func (p *GatewayProvider) Stream(ctx context.Context, req *providers.CompletionR
 		p.gateway.Release(err)
 		p.detect429(err)
 		if hook := p.gateway.eventHook; hook != nil {
-			hook.OnError(sessionID, agentID, req.Model, err)
+			hook.OnError(ctx, id, task, model, err, time.Since(streamStart))
 		}
 		return nil, err
 	}
 
-	// Wrap the channel to release the slot when the source closes.
+	// Wrap the channel to release the slot when the source closes. The
+	// forwarder runs in a goroutine tracked by ProviderGateway.streamWG so
+	// Stop() can wait for it to drain. Panics are recovered in-place —
+	// otherwise an inner provider panic would strand the consumer on a
+	// never-closed output channel and the gateway slot would never release.
 	out := make(chan *providers.StreamChunk, cap(ch))
-	go p.forwardStreamChunks(ch, out, p.gateway.eventHook, sessionID, agentID, req.Model, streamStart)
+	p.gateway.streamWG.Add(1)
+	go p.runStreamForwarder(ch, out, p.gateway.eventHook, id, task, model, streamStart)
 	return out, nil
+}
+
+// runStreamForwarder wraps forwardStreamChunks with WaitGroup tracking and
+// panic recovery.
+func (p *GatewayProvider) runStreamForwarder(
+	src <-chan *providers.StreamChunk,
+	dst chan<- *providers.StreamChunk,
+	hook providers.LLMProviderEventHook,
+	id *identity.AgentIdentity,
+	task *identity.TaskRef,
+	model identity.ModelID,
+	streamStart time.Time,
+) {
+	defer p.gateway.streamWG.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Default().Error("gateway stream forwarder: panic recovered",
+				"gateway", p.gateway.config.Name,
+				"model", string(model),
+				"agent", id.Panel(),
+				"task", string(task.UID()),
+				"panic", r,
+				"stack", string(debug.Stack()))
+			safeClose(dst)
+			p.gateway.Release(nil)
+		}
+	}()
+	p.forwardStreamChunks(src, dst, hook, id, task, model, streamStart)
+}
+
+// safeClose closes a channel at most once, ignoring a close-of-closed panic.
+func safeClose(ch chan<- *providers.StreamChunk) {
+	defer func() { _ = recover() }()
+	close(ch)
 }
 
 // StreamWithHandler performs a handler-based streaming completion through the
@@ -139,25 +204,30 @@ func (p *GatewayProvider) StreamWithHandler(ctx context.Context, req *providers.
 			providers.ErrModelNotSupported)
 	}
 
+	id, task, err := requireDispatch(ctx)
+	if err != nil {
+		return err
+	}
+	model := identity.ModelID(req.Model)
+
 	if err := p.gateway.Admit(ctx, p.priority); err != nil {
 		return err
 	}
 
-	sessionID, agentID := extractRequestIdentity(req)
 	hook := p.gateway.eventHook
 	if hook != nil {
-		hook.OnRequest(sessionID, agentID, req.Model, 0)
+		hook.OnRequest(ctx, id, task, model)
 	}
 
 	ctx = p.injectRetryObserver(ctx)
 	streamStart := time.Now()
-	wrappedHandler := p.wrapStreamHandler(handler, hook, sessionID, agentID, req.Model, streamStart)
-	err := shp.StreamWithHandler(ctx, req, wrappedHandler)
+	wrappedHandler := p.wrapStreamHandler(handler, hook, ctx, id, task, model, streamStart)
+	err = shp.StreamWithHandler(ctx, req, wrappedHandler)
 	p.gateway.Release(err)
 	p.detect429(err)
 
 	if err != nil && hook != nil {
-		hook.OnError(sessionID, agentID, req.Model, err)
+		hook.OnError(ctx, id, task, model, err, time.Since(streamStart))
 	}
 
 	return err
@@ -216,7 +286,9 @@ func (p *GatewayProvider) forwardStreamChunks(
 	src <-chan *providers.StreamChunk,
 	dst chan<- *providers.StreamChunk,
 	hook providers.LLMProviderEventHook,
-	sessionID, agentID, model string,
+	id *identity.AgentIdentity,
+	task *identity.TaskRef,
+	model identity.ModelID,
 	streamStart time.Time,
 ) {
 	defer func() {
@@ -226,7 +298,7 @@ func (p *GatewayProvider) forwardStreamChunks(
 
 	for chunk := range src {
 		if hook != nil && chunk != nil && chunk.Type == providers.ChunkTypeEnd && chunk.Usage != nil {
-			hook.OnResponse(sessionID, agentID, model, chunk.Usage, time.Since(streamStart))
+			hook.OnResponse(context.Background(), id, task, model, chunk.Usage, time.Since(streamStart))
 		}
 		dst <- chunk
 	}
@@ -237,7 +309,10 @@ func (p *GatewayProvider) forwardStreamChunks(
 func (p *GatewayProvider) wrapStreamHandler(
 	inner providers.StreamHandler,
 	hook providers.LLMProviderEventHook,
-	sessionID, agentID, model string,
+	ctx context.Context,
+	id *identity.AgentIdentity,
+	task *identity.TaskRef,
+	model identity.ModelID,
 	streamStart time.Time,
 ) providers.StreamHandler {
 	if hook == nil {
@@ -246,23 +321,19 @@ func (p *GatewayProvider) wrapStreamHandler(
 	return func(chunk *providers.StreamChunk) error {
 		err := inner(chunk)
 		if chunk != nil && chunk.Type == providers.ChunkTypeEnd && chunk.Usage != nil {
-			hook.OnResponse(sessionID, agentID, model, chunk.Usage, time.Since(streamStart))
+			hook.OnResponse(ctx, id, task, model, chunk.Usage, time.Since(streamStart))
 		}
 		return err
 	}
 }
 
-// extractRequestIdentity pulls session_id and agent_id from the request
-// metadata map, returning empty strings when absent.
-func extractRequestIdentity(req *providers.Request) (sessionID, agentID string) {
-	if req == nil || req.Metadata == nil {
-		return "", ""
+// requireDispatch extracts the typed AgentIdentity + TaskRef from ctx.
+// Wraps identity.RequireDispatch to surface the gateway-scoped error
+// with context for log correlation.
+func requireDispatch(ctx context.Context) (*identity.AgentIdentity, *identity.TaskRef, error) {
+	id, task, err := identity.RequireDispatch(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrDispatchIdentityMissing, err)
 	}
-	if v, ok := req.Metadata["session_id"].(string); ok {
-		sessionID = v
-	}
-	if v, ok := req.Metadata["agent_id"].(string); ok {
-		agentID = v
-	}
-	return sessionID, agentID
+	return id, task, nil
 }

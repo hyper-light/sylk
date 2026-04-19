@@ -477,3 +477,194 @@ func TestVectorSearcherBatchLoadingPreservesOrder(t *testing.T) {
 		}
 	}
 }
+
+// =============================================================================
+// W2 KG-30 / KG-31 / KG-32 / KG-33
+// =============================================================================
+
+type stubConflictLookup struct{ byNode map[string][]string }
+
+func (s *stubConflictLookup) ActiveForNode(nodeID string) []string {
+	if s == nil {
+		return nil
+	}
+	return s.byNode[nodeID]
+}
+
+type stubProvenanceLookup struct{ byNode map[string][]ProvenanceHop }
+
+func (s *stubProvenanceLookup) ChainForNode(nodeID string, _ int) []ProvenanceHop {
+	if s == nil {
+		return nil
+	}
+	return s.byNode[nodeID]
+}
+
+func setupRankableDB(t *testing.T) (*VectorGraphDB, *mockVectorIndexSearcher, func()) {
+	t.Helper()
+	db, path := setupTestDB(t)
+	cleanup := func() { cleanupDB(db, path) }
+
+	ns := NewNodeStore(db, nil)
+	// High-trust node.
+	if err := ns.InsertNode(&GraphNode{
+		ID:         "ground-1",
+		Domain:     DomainCode,
+		NodeType:   NodeTypeFile,
+		TrustLevel: TrustLevelGround,
+	}, []float32{1, 0.1, 0.1}); err != nil {
+		t.Fatalf("insert ground-1: %v", err)
+	}
+	// Low-trust node with slightly higher raw similarity.
+	if err := ns.InsertNode(&GraphNode{
+		ID:         "llm-2",
+		Domain:     DomainCode,
+		NodeType:   NodeTypeFunction,
+		TrustLevel: TrustLevelLLM,
+	}, []float32{0.9, 0.2, 0.1}); err != nil {
+		t.Fatalf("insert llm-2: %v", err)
+	}
+	// Off-domain node for KG-33.
+	if err := ns.InsertNode(&GraphNode{
+		ID:         "hist-3",
+		Domain:     DomainHistory,
+		NodeType:   NodeTypeHistoryEntry,
+		TrustLevel: TrustLevelStandard,
+	}, []float32{0.8, 0.3, 0.1}); err != nil {
+		t.Fatalf("insert hist-3: %v", err)
+	}
+
+	mock := newMockVectorIndexSearcher()
+	mock.setResults([]VectorIndexSearchResult{
+		{ID: "llm-2", Similarity: 0.91, Domain: DomainCode, NodeType: NodeTypeFunction},
+		{ID: "ground-1", Similarity: 0.90, Domain: DomainCode, NodeType: NodeTypeFile},
+		{ID: "hist-3", Similarity: 0.85, Domain: DomainHistory, NodeType: NodeTypeHistoryEntry},
+	})
+	return db, mock, cleanup
+}
+
+// TestVectorSearcher_TrustBoostReordersResults closes KG-30.
+func TestVectorSearcher_TrustBoostReordersResults(t *testing.T) {
+	db, mock, cleanup := setupRankableDB(t)
+	defer cleanup()
+
+	vs := NewVectorSearcher(db, mock)
+	// Without boost: llm-2 (0.91) ranks above ground-1 (0.90).
+	plain, err := vs.Search([]float32{1, 0, 0}, &SearchOptions{Limit: 3})
+	if err != nil {
+		t.Fatalf("plain Search: %v", err)
+	}
+	if plain[0].Node.ID != "llm-2" {
+		t.Fatalf("baseline: want llm-2 first, got %s", plain[0].Node.ID)
+	}
+	for _, r := range plain {
+		if r.Score != r.Similarity {
+			t.Fatalf("no boost: Score must equal Similarity, got %v != %v", r.Score, r.Similarity)
+		}
+	}
+
+	// With boost: ground-1's trust pulls it ahead.
+	boosted, err := vs.Search([]float32{1, 0, 0}, &SearchOptions{Limit: 3, TrustBoost: 0.5})
+	if err != nil {
+		t.Fatalf("boosted Search: %v", err)
+	}
+	if boosted[0].Node.ID != "ground-1" {
+		t.Fatalf("boosted: want ground-1 first, got %s", boosted[0].Node.ID)
+	}
+	if boosted[0].Score <= boosted[1].Score {
+		t.Fatalf("top-1 Score must exceed top-2: %v vs %v", boosted[0].Score, boosted[1].Score)
+	}
+}
+
+// TestVectorSearcher_HomeDomainFilter closes KG-33.
+func TestVectorSearcher_HomeDomainFilter(t *testing.T) {
+	db, mock, cleanup := setupRankableDB(t)
+	defer cleanup()
+
+	vs := NewVectorSearcher(db, mock)
+	results, err := vs.Search([]float32{1, 0, 0}, &SearchOptions{
+		Limit:       10,
+		HomeDomains: []Domain{DomainCode},
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	for _, r := range results {
+		if r.Node.Domain != DomainCode {
+			t.Fatalf("HomeDomains filter should exclude %s, got result %s", r.Node.Domain, r.Node.ID)
+		}
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 code results, got %d", len(results))
+	}
+}
+
+// TestVectorSearcher_SurfaceConflicts closes KG-32.
+func TestVectorSearcher_SurfaceConflicts(t *testing.T) {
+	db, mock, cleanup := setupRankableDB(t)
+	defer cleanup()
+
+	lookup := &stubConflictLookup{byNode: map[string][]string{
+		"ground-1": {"conflict-A", "conflict-B"},
+	}}
+	vs := NewVectorSearcher(db, mock)
+	vs.SetConflictLookup(lookup)
+
+	results, err := vs.Search([]float32{1, 0, 0}, &SearchOptions{
+		Limit:            10,
+		SurfaceConflicts: true,
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+
+	var got *SearchResult
+	for i := range results {
+		if results[i].Node.ID == "ground-1" {
+			got = &results[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("ground-1 missing from results")
+	}
+	if len(got.Conflicts) != 2 {
+		t.Fatalf("want 2 conflict ids, got %v", got.Conflicts)
+	}
+}
+
+// TestVectorSearcher_AttachProvenance closes KG-31.
+func TestVectorSearcher_AttachProvenance(t *testing.T) {
+	db, mock, cleanup := setupRankableDB(t)
+	defer cleanup()
+
+	chain := []ProvenanceHop{
+		{SourceType: SourceTypeCode, SourceID: "repo-a/file.go", Confidence: 0.95},
+		{SourceType: SourceTypeHistory, SourceID: "commit-abc", Confidence: 0.80},
+	}
+	lookup := &stubProvenanceLookup{byNode: map[string][]ProvenanceHop{"ground-1": chain}}
+
+	vs := NewVectorSearcher(db, mock)
+	vs.SetProvenanceLookup(lookup)
+
+	results, err := vs.Search([]float32{1, 0, 0}, &SearchOptions{
+		Limit:            10,
+		AttachProvenance: true,
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	for _, r := range results {
+		if r.Node.ID != "ground-1" {
+			continue
+		}
+		if len(r.Provenance) != 2 {
+			t.Fatalf("want 2 provenance hops, got %d", len(r.Provenance))
+		}
+		if r.Provenance[0].SourceID != "repo-a/file.go" {
+			t.Fatalf("unexpected first hop: %+v", r.Provenance[0])
+		}
+		return
+	}
+	t.Fatal("ground-1 not present in results")
+}

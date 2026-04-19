@@ -162,6 +162,13 @@ func TestIsGuideGreetingQuery_StandaloneTokensOnly(t *testing.T) {
 		{name: "this", input: "this is not a greeting", want: false},
 		{name: "which", input: "which agent should I use", want: false},
 		{name: "high", input: "high availability design", want: false},
+		// Greetings must only match when they LEAD the message. "hello"
+		// appearing mid-sentence as part of a task description must not
+		// short-circuit classification to the greeting reply.
+		{name: "hello world task", input: "Let's create a toy python hello world cli app.", want: false},
+		{name: "hello embedded", input: "Build a hi-there-world function.", want: false},
+		{name: "hey mid", input: "The command says hey when it starts.", want: false},
+		{name: "good morning mid", input: "Tell me a good morning joke.", want: false},
 	}
 	for _, tt := range tests {
 		tt := tt

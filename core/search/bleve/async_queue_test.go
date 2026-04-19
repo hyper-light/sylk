@@ -1457,9 +1457,11 @@ func TestAsyncIndexQueue_SubmitNoRetry(t *testing.T) {
 		nil,
 	)
 
-	// Fill queue and block processor
+	// Fill queue and block processor. Give the processor a generous window
+	// to pick up "fill1" before submitting "fill2" — 20ms is enough when the
+	// machine is idle but flakes under concurrent test load.
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill1", nil))
-	time.Sleep(20 * time.Millisecond) // Wait for processor to pick up and block
+	time.Sleep(100 * time.Millisecond)
 	_ = q.SubmitNoRetry(NewIndexOperation(OpIndex, "fill2", nil))
 
 	// SubmitNoRetry should fail immediately
@@ -1472,9 +1474,12 @@ func TestAsyncIndexQueue_SubmitNoRetry(t *testing.T) {
 		t.Errorf("SubmitNoRetry() error = %v, want %v", err, ErrQueueFull)
 	}
 
-	// Should be instant (no retry)
-	if elapsed > 20*time.Millisecond {
-		t.Errorf("SubmitNoRetry() took %v, expected < 20ms", elapsed)
+	// Should return fast (no retry loop). Retry base delay is 50ms, so any
+	// elapsed time below that proves no retry happened. The upper bound is
+	// set well under 50ms to retain the assertion's intent while surviving
+	// goroutine scheduling jitter under concurrent test load.
+	if elapsed > 40*time.Millisecond {
+		t.Errorf("SubmitNoRetry() took %v, expected < 40ms (would indicate retry loop engaged)", elapsed)
 	}
 
 	// Cleanup

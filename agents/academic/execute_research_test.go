@@ -10,7 +10,7 @@ import (
 )
 
 func TestConsultSkill_ExecuteResearchReturnsStructuredFailureForDuplicateQuestion(t *testing.T) {
-	a, err := New(Config{ID: "academic"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestAcademicResearchExecutionState_FinalizationBlockFlagsRepeatedSearchWith
 }
 
 func TestAcademicResearchExecutionState_FinalizationBlockClearsRepeatedSearchAfterGrounding(t *testing.T) {
-	a, err := New(Config{ID: "academic"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestAcademicResearchExecutionState_FinalizationBlockRequiresSecuredFetchAft
 }
 
 func TestAcademicResearchExecutionState_RecordFetchResultReusesReservedSourceIDAndMarksGrounded(t *testing.T) {
-	a, err := New(Config{ID: "academic"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}

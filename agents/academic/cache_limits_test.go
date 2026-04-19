@@ -7,6 +7,7 @@ import (
 
 func TestAcademicGetCachedPrunesExpiredEntryAndSource(t *testing.T) {
 	a, err := New(Config{
+		Factory: newTestFactory(t),
 		CacheExpiry:        time.Minute,
 		ResearchCacheLimit: 4,
 		SourceIndexLimit:   4,
@@ -45,6 +46,7 @@ func TestAcademicGetCachedPrunesExpiredEntryAndSource(t *testing.T) {
 
 func TestAcademicPrunesSourceIndexButKeepsLiveReferencedSources(t *testing.T) {
 	a, err := New(Config{
+		Factory: newTestFactory(t),
 		CacheExpiry:        time.Hour,
 		ResearchCacheLimit: 4,
 		SourceIndexLimit:   3,

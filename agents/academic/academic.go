@@ -17,6 +17,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
@@ -65,6 +66,8 @@ type Academic struct {
 	config       Config
 	domainFilter *AcademicDomainFilter
 	logger       *slog.Logger
+	identity     *identity.AgentIdentity
+	factory      *identity.Factory
 
 	// LLM provider
 	provider   academicProvider
@@ -203,6 +206,11 @@ type Config struct {
 
 	// Forest exposes role-shaped Memory Forest skills to the Academic.
 	Forest shared.MemoryForestService
+
+	// Factory mints the Academic's AgentIdentity at New() time.
+	// Academic is an on-demand agent created after phase4, so Factory
+	// should be populated at construction.
+	Factory *identity.Factory
 }
 
 // New creates a new Academic agent with the given LLM provider.
@@ -254,6 +262,16 @@ func New(cfg Config, provider academicProvider) (*Academic, error) {
 		ProviderTelemetry: a.currentProviderAutoscaleSnapshot,
 		ContextQuota:      cfg.ContextQuota,
 	})
+
+	a.factory = cfg.Factory
+	academicIdentity, err := cfg.Factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeAcademic,
+		Pod:  identity.PodRef{ID: "academic", Type: identity.PodTypeSingleton},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("academic: mint identity: %w", err)
+	}
+	a.identity = academicIdentity
 
 	a.steering.InitLazy("academic", cfg.ActivityPub)
 
@@ -585,6 +603,18 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	defer a.clearRequestCancel(fwd.CorrelationID)
 	defer cancel()
 
+	if a.factory != nil && a.identity != nil {
+		task, taskErr := a.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+		})
+		if taskErr != nil {
+			return fmt.Errorf("academic: mint task: %w", taskErr)
+		}
+		reqCtx = identity.WithIdentity(reqCtx, a.identity)
+		reqCtx = identity.WithTask(reqCtx, task)
+	}
+
 	// Create steering ledger for this request.
 	ledger := a.steering.Create(fwd.CorrelationID, "academic", fwd.SessionID, nil, nil)
 	defer a.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
@@ -595,13 +625,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	emitter := shared.NewToolCallEmitter(a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID)
 	reqCtx = withRouteHops(reqCtx, fwd.Hops)
 	ctx := shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
-	ctx = shared.WithStreamContextMetadata(ctx, shared.MergeStreamMetadata(
-		shared.StreamResponseMetadataFromContext(ctx),
-		map[string]any{
-			"agent_type": "academic",
-			"agent_name": "Academic",
-		},
-	))
+	ctx = shared.WithOwnedStreamIdentity(ctx, "academic", "Academic")
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
@@ -690,6 +714,8 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 			SessionID:         fwd.SessionID,
 			CorrelationID:     fwd.CorrelationID,
 			ActivityPublisher: a.activityPub,
+			Factory:           a.factory,
+			ParentIdentity:    a.identity,
 		})
 		if replicaErr != nil {
 			lease.Release()

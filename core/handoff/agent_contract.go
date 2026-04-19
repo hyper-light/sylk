@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -56,11 +57,20 @@ type AgentDescriptor struct {
 }
 
 // ArchivableState captures agent state for handoff persistence.
+//
+// Identity and Task carry the typed primary key when the source
+// agent was constructed through the identity.Factory (Step 5
+// per-agent migration). Not JSON-serialized — persistence uses the
+// flat AgentID + AgentType fields alongside a per-agent WAL that
+// records the typed form (see core/llm/accounting/wal.go). Archivalist
+// consumers key on Identity.UID() + Task.UID() when both are set.
 type ArchivableState struct {
-	AgentID   string            `json:"agent_id"`
-	AgentType string            `json:"agent_type"`
-	State     map[string]string `json:"state,omitempty"`
-	Timestamp time.Time         `json:"timestamp"`
+	AgentID   string                  `json:"agent_id"`
+	AgentType string                  `json:"agent_type"`
+	State     map[string]string       `json:"state,omitempty"`
+	Timestamp time.Time               `json:"timestamp"`
+	Identity  *identity.AgentIdentity `json:"-"`
+	Task      *identity.TaskRef       `json:"-"`
 }
 
 // HandoffableAgent is the base interface for handoff participation.

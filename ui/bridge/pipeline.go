@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 
@@ -11,6 +12,30 @@ import (
 	"github.com/adalundhe/sylk/core/pipeline/variants"
 	"github.com/adalundhe/sylk/ui/msg"
 )
+
+// BridgeDropKind identifies the kind of event that was dropped.
+type BridgeDropKind string
+
+const (
+	BridgeDropKindVariant   BridgeDropKind = "variant"
+	BridgeDropKindTaskState BridgeDropKind = "taskstate"
+)
+
+// BridgeDropEvent is fired to an installed DropListener when a pipeline
+// bridge fails to enqueue an event because its inbound channel is full.
+// Keep listeners fast — they run in the publish path (the variant registry
+// subscriber callback or the bus message handler).
+type BridgeDropEvent struct {
+	Kind         BridgeDropKind
+	TotalDropped int64  // cumulative drops on this bridge
+	PipelineID   string // populated for taskstate drops where known
+	TaskID       string // populated for taskstate drops where known
+	VariantID    string // populated for variant drops where known
+}
+
+// DropListener is a callback fired on every backpressure drop. A nil listener
+// disables callbacks; structured logs still fire regardless.
+type DropListener func(BridgeDropEvent)
 
 const (
 	pipelineBridgeName   = "bridge.pipeline"
@@ -29,10 +54,30 @@ type PipelineBridge struct {
 	taskStateCh     chan taskstate.Event
 	variantCh       chan variants.VariantEvent
 	dropped         atomic.Int64
+	dropListener    atomic.Value // of DropListener (may be nil)
 	done            chan struct{}
 	stopOnce        sync.Once
 	unsubVariant    func() // returned by Registry.Subscribe
 	taskStateSub    guide.Subscription
+}
+
+// SetDropListener installs (or replaces) the drop-observation callback.
+// Pass nil to clear. The listener must be fast — it runs in the publish path.
+func (b *PipelineBridge) SetDropListener(fn DropListener) {
+	if fn == nil {
+		b.dropListener.Store(DropListener(nil))
+		return
+	}
+	b.dropListener.Store(fn)
+}
+
+func (b *PipelineBridge) loadDropListener() DropListener {
+	v := b.dropListener.Load()
+	if v == nil {
+		return nil
+	}
+	fn, _ := v.(DropListener)
+	return fn
 }
 
 // NewPipelineBridge creates a bridge that converts pipeline/variant events
@@ -59,7 +104,10 @@ func (b *PipelineBridge) onVariantEvent(evt variants.VariantEvent) {
 	select {
 	case b.variantCh <- evt:
 	default:
-		b.dropped.Add(1)
+		b.recordDrop(BridgeDropEvent{
+			Kind:      BridgeDropKindVariant,
+			VariantID: string(evt.VariantID),
+		})
 	}
 }
 
@@ -84,7 +132,29 @@ func (b *PipelineBridge) enqueueTaskState(evt taskstate.Event) {
 	select {
 	case b.taskStateCh <- evt:
 	default:
-		b.dropped.Add(1)
+		b.recordDrop(BridgeDropEvent{
+			Kind:       BridgeDropKindTaskState,
+			PipelineID: evt.PipelineID,
+			TaskID:     evt.TaskID,
+		})
+	}
+}
+
+// recordDrop logs the drop and invokes the installed listener (if any). Keeps
+// the drop path cyclomatically simple and centralises observability so we
+// can't regress to silent drops.
+func (b *PipelineBridge) recordDrop(evt BridgeDropEvent) {
+	total := b.dropped.Add(1)
+	evt.TotalDropped = total
+	slog.Default().Warn("pipeline bridge drop: channel full",
+		"bridge_id", b.id,
+		"kind", string(evt.Kind),
+		"pipeline_id", evt.PipelineID,
+		"task_id", evt.TaskID,
+		"variant_id", evt.VariantID,
+		"total_dropped", total)
+	if listener := b.loadDropListener(); listener != nil {
+		listener(evt)
 	}
 }
 

@@ -128,19 +128,27 @@ func defaultArchitectControlStoreConfig(dbPath string) ArchitectControlStoreConf
 }
 
 func OpenArchitectControlStore(cfg ArchitectControlStoreConfig) (*ArchitectControlStore, error) {
-	db, err := database.OpenBunSQLite(database.BunSQLiteConfig{
-		Path:              cfg.Path,
-		MaxOpen:           cfg.MaxOpenConns,
-		MaxIdle:           cfg.MaxIdleConns,
-		MaxLifetime:       cfg.ConnMaxLifetime,
-		BusyTimeout:       cfg.BusyTimeout,
-		EnableWAL:         true,
-		ForeignKeys:       true,
-		CacheSize:         -2000,
-		Synchronous:       "normal",
-		WriteRetryMax:     cfg.WriteRetryMax,
-		WriteRetryBackoff: cfg.WriteRetryBackoff,
-	})
+	bunCfg := database.DefaultBunSQLiteConfig(cfg.Path)
+	if cfg.MaxOpenConns > 0 {
+		bunCfg.MaxOpen = cfg.MaxOpenConns
+	}
+	if cfg.MaxIdleConns > 0 {
+		bunCfg.MaxIdle = cfg.MaxIdleConns
+	}
+	if cfg.ConnMaxLifetime > 0 {
+		bunCfg.MaxLifetime = cfg.ConnMaxLifetime
+	}
+	if cfg.BusyTimeout > 0 {
+		bunCfg.BusyTimeout = cfg.BusyTimeout
+	}
+	if cfg.WriteRetryMax > 0 {
+		bunCfg.WriteRetryMax = cfg.WriteRetryMax
+	}
+	if cfg.WriteRetryBackoff > 0 {
+		bunCfg.WriteRetryBackoff = cfg.WriteRetryBackoff
+	}
+
+	db, err := database.OpenBunSQLite(bunCfg)
 	if err != nil {
 		return nil, fmt.Errorf("architect control store: open: %w", err)
 	}

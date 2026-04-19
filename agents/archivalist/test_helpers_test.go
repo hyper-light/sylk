@@ -64,6 +64,7 @@ func newTestAgentContext(t *testing.T) *AgentContext {
 func newTestArchivalist(t *testing.T) *Archivalist {
 	t.Helper()
 	a, err := New(context.Background(), Config{
+		Factory:       newTestFactory(t),
 		EnableArchive: false,
 		EnableRAG:     false,
 	})
@@ -78,6 +79,7 @@ func newTestArchivalistWithRAG(t *testing.T) *Archivalist {
 	t.Helper()
 	tmpDir := t.TempDir()
 	a, err := New(context.Background(), Config{
+		Factory:        newTestFactory(t),
 		EnableArchive:  true,
 		EnableRAG:      true,
 		ArchivePath:    tmpDir + "/archive.db",

@@ -319,6 +319,24 @@ func (b *Builder) ArrayParam(name, description, itemType string, required bool) 
 	return b
 }
 
+// EnumArrayParam adds an array parameter whose items must be one of the
+// provided enum values. Use this when a repeated field has a closed
+// vocabulary (e.g. pipeline target_agents).
+func (b *Builder) EnumArrayParam(name, description, itemType string, values []string, required bool) *Builder {
+	b.skill.InputSchema.Properties[name] = &Property{
+		Type:        "array",
+		Description: description,
+		Items: &Property{
+			Type: itemType,
+			Enum: append([]string(nil), values...),
+		},
+	}
+	if required {
+		b.skill.InputSchema.Required = append(b.skill.InputSchema.Required, name)
+	}
+	return b
+}
+
 // ArrayObjectParam adds an array parameter whose items are typed objects.
 func (b *Builder) ArrayObjectParam(
 	name, description string,

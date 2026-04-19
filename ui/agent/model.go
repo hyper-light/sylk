@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/ui/agentidentity"
@@ -73,6 +74,17 @@ func (s AgentStatus) String() string {
 }
 
 // AgentState holds the current state of a single agent.
+//
+// Identity keying: every row has a stable panel `ID` string (used as
+// the map key in `Model.agents`) and — once the first event with a
+// typed `*identity.AgentIdentity` arrives — a populated `Identity`
+// pointer. The panel map is seeded with placeholder rows keyed on
+// the agent-type string; when an event arrives the matching
+// placeholder is bound to the concrete Identity. Replicas (Owner !=
+// nil) always create a NEW row keyed on `Identity.UID()` — they
+// never absorb an existing row. Generation bumps (SwapModel) keep
+// the same UID → same row, with `Identity.Model()` and `Generation()`
+// advancing in place.
 type AgentState struct {
 	ID                        string
 	RoutingID                 string
@@ -94,6 +106,24 @@ type AgentState struct {
 	pinnedToolCallKey         string
 	activeCorrelationID       string
 	lastTerminalCorrelationID string
+
+	// Identity carries the typed AgentIdentity once an activity event
+	// or token-delta with an attached Identity value has reached this
+	// row. Populated from ActivityEvent.Identity or TokenDeltaMsg.Identity.
+	// Stable reference: same UID across model swaps (Generation bumps).
+	// Non-nil indicates the row is bound to a live typed identity —
+	// seeded placeholders have Identity == nil until first activation.
+	// Always points at the canonical agent (Owner == nil); replicas
+	// are tracked via replicaUIDs, not this field.
+	Identity *identity.AgentIdentity
+	// Generation mirrors Identity.Generation() for cheap comparison
+	// when detecting SwapModel transitions.
+	Generation uint64
+	// replicaUIDs is the set of active replica UIDs bound to this
+	// canonical row. Len(replicaUIDs) == ActiveReplicas. Replicas do
+	// not get their own panel rows — they accumulate here so the
+	// knowledgeReplicaSuffix display can show "x3" / "q2" counts.
+	replicaUIDs map[identity.UID]struct{}
 
 	// SupportedModels is the raw per-agent model list from the backend.
 	// When non-empty, it overrides the static provider-based model table and
@@ -417,6 +447,14 @@ func isActiveStatus(s AgentStatus) bool { return activeStatuses[s] }
 type Model struct {
 	agents    map[string]*AgentState
 	aliases   map[string]string // Runtime/ephemeral agent IDs → canonical panel row IDs.
+	// byUID indexes the agents map by identity.UID once a row has
+	// been bound to a typed *AgentIdentity. Used to route ActivityEvents
+	// carrying event.Identity directly to their row, and to enforce
+	// per-replica / per-generation panel semantics:
+	//   - Replicas (Owner != nil) always get their own row keyed on UID.
+	//   - SwapModel (Generation bump) keeps the same UID → same row.
+	// Seeded placeholder rows have no UID entry until first activation.
+	byUID     map[identity.UID]string
 	streams   map[string]*AgentEventStream
 	order     []string  // Agent IDs in insertion order.
 	engagedID string    // Agent ID the user is conversing with (sticky until reroute/override).
@@ -477,6 +515,7 @@ func New(th *theme.Theme) *Model {
 	return &Model{
 		agents:              make(map[string]*AgentState, initialAgentCapacity),
 		aliases:             make(map[string]string, initialAgentCapacity*2),
+		byUID:               make(map[identity.UID]string, initialAgentCapacity),
 		streams:             make(map[string]*AgentEventStream, initialAgentCapacity),
 		order:               make([]string, 0, initialAgentOrderCapacity),
 		pipelines:           make(map[string]*PipelineState, initialPipelineCapacity),
@@ -612,6 +651,18 @@ func (m *Model) SetSize(width, height int) {
 
 // handleActivity processes an activity event to update agent state.
 func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
+	// Typed-identity fast path: when the provider-gateway hook
+	// stamped a *AgentIdentity on the event (post-FIX_ID_AND_TOKENS),
+	// route directly to the UID-indexed row. This bypasses string
+	// canonicalization entirely — replicas and generation bumps land
+	// on the correct row by construction, not by string matching.
+	if ev.Event != nil && ev.Event.Identity != nil {
+		rowID := m.bindIdentityToRow(ev.Event.Identity)
+		if rowID != "" {
+			ev.Event.AgentID = rowID
+		}
+	}
+
 	rawAgentID := strings.TrimSpace(ev.Event.AgentID)
 	if agentType, _ := m.inferActivityAgentIdentity(rawAgentID, ev); isInternalSidecarAgent(rawAgentID, agentType) {
 		return nil
@@ -981,6 +1032,240 @@ func (m *Model) canonicalizeAgentID(agentID string, ev msg.ActivityEventMsg) str
 		return m.resolveAgentID(panelID)
 	}
 	return m.resolveAgentID(candidateID)
+}
+
+// bindIdentityToRow routes a typed *AgentIdentity to its panel row.
+// Panel rows are singletons per agent Kind (for standalone/knowledge
+// agents) and singletons per (Kind, PipelineID) (for pipeline workers).
+// Replicas do NOT get their own rows — they bind to the same row as
+// their canonical parent and are counted via AgentState.ActiveReplicas.
+//
+// Cases:
+//
+//  1. UID already indexed in byUID → update the row's Identity +
+//     Generation + ModelID in place. Absorbs SwapModel transitions
+//     (same UID, bumped Generation, new Model) without creating
+//     duplicates.
+//
+//  2. Replica (Owner != nil) whose parent UID is indexed → bind to
+//     the parent's row. The row's ActiveReplicas counter tracks the
+//     current active set by UID; map in byUID points the replica's
+//     UID at the parent's row key so subsequent events route correctly.
+//
+//  3. Canonical agent (or replica whose parent is not yet indexed) →
+//     find an existing row for the same Kind (seed placeholder or
+//     activated row). For pipeline workers, match on (Kind, PipelineID).
+//     If found, bind this Identity to that row. Otherwise create a new
+//     row keyed on Kind.String() (or the canonical pipeline form).
+//
+// Returns the panel row key string (the map key in m.agents).
+func (m *Model) bindIdentityToRow(id *identity.AgentIdentity) string {
+	if id == nil {
+		return ""
+	}
+	uid := id.UID()
+
+	// Case 1: UID already indexed — in-place update (handles SwapModel).
+	if rowID, ok := m.byUID[uid]; ok {
+		if agent, exists := m.agents[rowID]; exists && agent != nil {
+			m.applyIdentityToAgent(agent, id)
+		}
+		return rowID
+	}
+
+	// Case 2: Replica whose parent is indexed — bind to parent row.
+	if owner := id.Owner(); owner != nil {
+		if parentRow, ok := m.byUID[owner.UID]; ok {
+			if agent, exists := m.agents[parentRow]; exists && agent != nil {
+				m.trackReplicaOnParent(agent, id)
+				m.byUID[uid] = parentRow
+				return parentRow
+			}
+		}
+	}
+
+	// Case 3: Bind to a matching row by Kind (seed or activated).
+	// Pipeline workers are singleton per (Kind, PipelineID); singletons
+	// and knowledge agents are singleton per Kind.
+	kindKey := id.Kind().String()
+	if row := m.matchingRowForKind(kindKey); row != nil {
+		m.applyIdentityToAgent(row, id)
+		m.byUID[uid] = row.ID
+		if id.Owner() != nil {
+			m.trackReplicaOnParent(row, id)
+		}
+		return row.ID
+	}
+
+	// No existing row — create a fresh canonical row keyed on Kind.
+	rowID := kindKey
+	if rowID == "" {
+		rowID = string(uid)
+	}
+	if existing, ok := m.agents[rowID]; ok && existing != nil {
+		// Race with another path that created the row. Bind and return.
+		m.applyIdentityToAgent(existing, id)
+		m.byUID[uid] = rowID
+		return rowID
+	}
+	agent := m.newAgentFromIdentity(rowID, id)
+	m.agents[rowID] = agent
+	if _, exists := m.streams[rowID]; !exists {
+		m.streams[rowID] = NewAgentEventStream()
+	}
+	if !slices.Contains(m.order, rowID) {
+		m.order = append(m.order, rowID)
+	}
+	m.byUID[uid] = rowID
+	m.rowsDirty = true
+	return rowID
+}
+
+// matchingRowForKind finds the canonical singleton row matching the
+// given kind. Prefers an existing row with Identity already bound
+// (active); falls back to an unbound seeded placeholder. Returns
+// nil when no row matches.
+//
+// Pipeline workers are NOT matched here — their per-(Kind, PipelineID)
+// grouping is resolved separately when the caller supplies a
+// pipeline id (not yet plumbed through the typed path; pipeline
+// events still flow through the legacy string route).
+func (m *Model) matchingRowForKind(kindKey string) *AgentState {
+	kindKey = strings.TrimSpace(kindKey)
+	if kindKey == "" {
+		return nil
+	}
+	// Pipeline workers are singleton per (Kind, PipelineID); the
+	// typed path does not yet know the pipeline id so skip them here.
+	if isPipelineAgentType(kindKey) {
+		return nil
+	}
+	// Prefer an already-bound row (Identity != nil) with the same Kind.
+	for _, rowID := range m.order {
+		agent, ok := m.agents[rowID]
+		if !ok || agent == nil {
+			continue
+		}
+		if !strings.EqualFold(agent.AgentType, kindKey) {
+			continue
+		}
+		if agent.Identity != nil {
+			return agent
+		}
+	}
+	// Otherwise use the first seeded placeholder with the same Kind.
+	for _, rowID := range m.order {
+		agent, ok := m.agents[rowID]
+		if !ok || agent == nil || agent.Identity != nil {
+			continue
+		}
+		if strings.EqualFold(agent.AgentType, kindKey) {
+			return agent
+		}
+	}
+	return nil
+}
+
+// trackReplicaOnParent records a replica UID on its parent's row.
+// Uses AgentState.replicaUIDs as a set so the same replica is not
+// double-counted, and mirrors the cardinality into
+// AgentState.ActiveReplicas for display. Never increments past the
+// number of distinct replica UIDs observed.
+func (m *Model) trackReplicaOnParent(parent *AgentState, replica *identity.AgentIdentity) {
+	if parent == nil || replica == nil || !replica.IsReplica() {
+		return
+	}
+	if parent.replicaUIDs == nil {
+		parent.replicaUIDs = make(map[identity.UID]struct{}, 2)
+	}
+	if _, exists := parent.replicaUIDs[replica.UID()]; exists {
+		return
+	}
+	parent.replicaUIDs[replica.UID()] = struct{}{}
+	parent.ActiveReplicas = len(parent.replicaUIDs)
+	m.rowsDirty = true
+}
+
+// applyIdentityToAgent binds a *AgentIdentity onto an AgentState.
+// Updates the Identity pointer, Generation, AgentType, Category,
+// ModelID/ProviderID, and Name when appropriate. Used by both
+// fresh-bind (seeded placeholder → concrete identity) and
+// SwapModel-update (existing row → bumped generation).
+//
+// Replicas do not overwrite the canonical parent's Identity — the
+// parent row's Identity tracks the canonical agent (Owner == nil).
+// Generation bumps on the canonical agent (SwapModel) do update.
+func (m *Model) applyIdentityToAgent(agent *AgentState, id *identity.AgentIdentity) {
+	if agent == nil || id == nil {
+		return
+	}
+	// Only the canonical agent claims the Identity pointer. A replica
+	// event routed to the parent row must not clobber the parent's
+	// canonical identity.
+	if id.IsReplica() && agent.Identity != nil {
+		return
+	}
+	priorGen := agent.Generation
+	agent.Identity = id
+	agent.Generation = uint64(id.Generation())
+	kind := id.Kind().String()
+	if agent.AgentType == "" {
+		agent.AgentType = kind
+	}
+	if agent.Category == "" {
+		agent.Category = resolveAgentCategory(kind, agent.PipelineID)
+	}
+	if model := string(id.Model()); model != "" {
+		agent.ModelID = model
+		if agent.ProviderID == "" {
+			agent.ProviderID = deriveProvider(model)
+		}
+	}
+	if agent.Name == "" {
+		agent.Name = agentDisplayNameFromIdentity(id)
+	}
+	if priorGen != agent.Generation {
+		m.rowsDirty = true
+	}
+}
+
+// newAgentFromIdentity constructs an AgentState from a typed Identity
+// for canonical agents that have no existing seed or activated row.
+// Replicas never call this — they always bind to an existing parent
+// row via trackReplicaOnParent.
+func (m *Model) newAgentFromIdentity(rowID string, id *identity.AgentIdentity) *AgentState {
+	kind := id.Kind().String()
+	agent := &AgentState{
+		ID:         rowID,
+		RoutingID:  rowID,
+		Name:       agentDisplayNameFromIdentity(id),
+		AgentType:  kind,
+		Category:   resolveAgentCategory(kind, ""),
+		Status:     StatusIdle,
+		Identity:   id,
+		Generation: uint64(id.Generation()),
+		ModelID:    string(id.Model()),
+	}
+	if agent.ModelID != "" {
+		agent.ProviderID = deriveProvider(agent.ModelID)
+	}
+	return agent
+}
+
+// agentDisplayNameFromIdentity returns the human-friendly name for a
+// canonical (non-replica) identity: the agent Kind title-cased.
+// Replicas never claim a row's display name — they bind to the
+// parent row whose Name is already set.
+func agentDisplayNameFromIdentity(id *identity.AgentIdentity) string {
+	if id == nil {
+		return ""
+	}
+	kind := id.Kind().String()
+	if kind == "" {
+		return ""
+	}
+	// Title-case "guide" → "Guide", "inspector-pipeline" → "Inspector-pipeline".
+	return strings.ToUpper(kind[:1]) + kind[1:]
 }
 
 func (m *Model) resolveAgentID(agentID string) string {

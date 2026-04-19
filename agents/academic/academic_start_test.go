@@ -10,7 +10,7 @@ func TestAcademicStartUsesConfiguredAgentIDForChannels(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer func() { _ = bus.Close() }()
 
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}

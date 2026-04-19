@@ -16,6 +16,7 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
@@ -37,9 +38,11 @@ type pipelineInspectorProvider interface {
 
 // PipelineInspector validates individual task implementations within pipelines.
 type PipelineInspector struct {
-	id     string
-	config shared.PipelineInspectorConfig
-	logger *slog.Logger
+	id       string
+	config   shared.PipelineInspectorConfig
+	logger   *slog.Logger
+	identity *identity.AgentIdentity
+	factory  *identity.Factory
 
 	// LLM provider (Anthropic Opus 4.6).
 	provider pipelineInspectorProvider
@@ -142,6 +145,16 @@ func New(cfg shared.PipelineInspectorConfig, provider providers.ProviderAdapter)
 		Broker:        func() purevfs.ExecutionBroker { return pi.executionBroker },
 		RequireBroker: true,
 	})
+
+	pi.factory = cfg.Factory
+	pipelineInspectorIdentity, err := cfg.Factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeInspectorPipeline,
+		Pod:  identity.PodRef{ID: "pipeline", Type: identity.PodTypePipeline},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("inspector-pipeline: mint identity: %w", err)
+	}
+	pi.identity = pipelineInspectorIdentity
 
 	pi.steering.InitLazy("inspector-pipeline", nil)
 
@@ -602,11 +615,29 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	pi.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer cancel()
 
+	if pi.factory != nil && pi.identity != nil {
+		var pipeline *identity.PipelineRef
+		if pi.pipelineID != "" {
+			pipeline = &identity.PipelineRef{
+				ID:    identity.PipelineID(pi.pipelineID),
+				Stage: "inspect",
+			}
+		}
+		task, taskErr := pi.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+			Pipeline:    pipeline,
+		})
+		if taskErr != nil {
+			return fmt.Errorf("inspector-pipeline: mint task: %w", taskErr)
+		}
+		reqCtx = identity.WithIdentity(reqCtx, pi.identity)
+		reqCtx = identity.WithTask(reqCtx, task)
+	}
+
 	ctx := reqCtx
 	ctx = agentShared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, agentShared.MergeStreamMetadata(fwd.Metadata, map[string]any{
 		"pipeline_task": true,
-		"agent_type":    "inspector-pipeline",
-		"agent_name":    "Inspector",
 		"pipeline_id":   pi.pipelineID,
 		"task_id":       pi.pipelineID,
 		"task_slug":     pi.pipelineSlug,
@@ -614,6 +645,7 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 		"dag_id":        stringValue(fwd.Metadata, "dag_id"),
 		"node_id":       stringValue(fwd.Metadata, "node_id"),
 	}))
+	ctx = agentShared.WithOwnedStreamIdentity(ctx, "inspector-pipeline", "Inspector")
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	startTime := time.Now()
 

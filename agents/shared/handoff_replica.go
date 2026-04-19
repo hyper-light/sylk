@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 )
@@ -44,6 +45,18 @@ type KnowledgeReplicaHandoffOptions struct {
 	SessionID         string
 	CorrelationID     string
 	ActivityPublisher events.ActivityPublisher
+
+	// Factory, when supplied together with ParentIdentity, causes
+	// AttachReplicaHandoffBridge to mint a typed replica identity via
+	// Factory.MintReplica and overlay it on the returned ctx. The
+	// accountant then attributes tokens to the replica's distinct
+	// UID (with Owner back-pointing to the canonical parent) instead
+	// of lumping replica usage into the parent bucket. When Factory
+	// or ParentIdentity is nil the replica-identity overlay is
+	// skipped and the canonical identity already on ctx (if any)
+	// remains in effect.
+	Factory        *identity.Factory
+	ParentIdentity *identity.AgentIdentity
 }
 
 // ReplicaHandoffAgentID returns the internal runtime ID for a request-scoped
@@ -116,6 +129,13 @@ func AttachReplicaHandoffBridge(
 		"runtime_agent_id":   runtimeIDForStream(replicaID),
 		"handoff_replica_id": replicaID,
 	}))
+	if opts.Factory != nil && opts.ParentIdentity != nil {
+		if replicaIdentity, mintErr := opts.Factory.MintReplica(identity.MintReplicaOptions{
+			Parent: opts.ParentIdentity,
+		}); mintErr == nil {
+			ctx = identity.WithIdentity(ctx, replicaIdentity)
+		}
+	}
 	cleanup := func() {
 		_ = supervisor.UnregisterAgent(replicaID)
 	}
@@ -205,9 +225,9 @@ type replicaHandoffActivityPublisher struct {
 	runtimeAgentID   string
 }
 
-func (p *replicaHandoffActivityPublisher) PublishActivity(event *events.ActivityEvent) {
+func (p *replicaHandoffActivityPublisher) PublishActivity(event *events.ActivityEvent) error {
 	if p == nil || p.base == nil || event == nil {
-		return
+		return nil
 	}
 
 	cloned := &events.ActivityEvent{
@@ -243,5 +263,5 @@ func (p *replicaHandoffActivityPublisher) PublishActivity(event *events.Activity
 		cloned.Data["canonical_agent_id"] = p.canonicalAgentID
 	}
 
-	p.base.PublishActivity(cloned)
+	return p.base.PublishActivity(cloned)
 }

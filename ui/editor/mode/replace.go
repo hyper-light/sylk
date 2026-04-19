@@ -99,7 +99,7 @@ func replaceBackspace(rm *ReplaceMode, state *EditorState) Mode {
 	state.UndoTree.Record(buffer.EditOp{
 		Type:    buffer.EditDelete,
 		Pos:     last.Pos,
-		OldText: string(state.Buffer.RuneAt(last.Pos)),
+		OldText: replaceOriginalText(state, last.Pos),
 	})
 	state.UndoTree.Record(buffer.EditOp{
 		Type: buffer.EditInsert,
@@ -117,7 +117,7 @@ func replaceRune(rm *ReplaceMode, state *EditorState, r rune) Mode {
 	bufLen := state.Buffer.Length()
 	// Record the original character before overwriting.
 	if pos < bufLen && len(rm.State.Originals) < maxReplaceOriginalBuffer {
-		original := state.Buffer.RuneAt(pos)
+		original, _ := state.Buffer.RuneAt(pos)
 		rm.State.Originals = append(rm.State.Originals, runeRestore{
 			Pos:  pos,
 			Char: original,
@@ -153,4 +153,14 @@ func replaceRune(rm *ReplaceMode, state *EditorState, r rune) Mode {
 		return ModeNormal
 	}
 	return ModeReplace
+}
+
+// replaceOriginalText returns the rune at pos as a string, or "" if pos is
+// out of range. Used for undo-tree records in continuous replace mode.
+func replaceOriginalText(state *EditorState, pos int) string {
+	r, ok := state.Buffer.RuneAt(pos)
+	if !ok {
+		return ""
+	}
+	return string(r)
 }

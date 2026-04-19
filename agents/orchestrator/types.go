@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -57,6 +58,14 @@ type Config struct {
 
 	// Forest exposes Memory Forest coordination precedent skills.
 	Forest shared.MemoryForestService `json:"-"`
+
+	// Factory mints the Orchestrator's AgentIdentity. Optional at
+	// construction time — the Orchestrator is a daemon that boots
+	// before the session-scoped Factory exists. Late-bound via
+	// SetIdentityFactory after phase4. If still nil when a request
+	// arrives, dispatch through the provider gateway fails with
+	// ErrDispatchIdentityMissing.
+	Factory *identity.Factory `json:"-"`
 }
 
 // DefaultConfig returns sensible defaults

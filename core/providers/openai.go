@@ -1142,6 +1142,7 @@ func applyToolEndArguments(tc *ToolCall, delta string) {
 }
 
 func (a *streamResponseAssembler) ensureToolCall(id string) *ToolCall {
+	id = EnsureToolCallID(id)
 	tc, ok := a.toolCalls[id]
 	if ok {
 		return tc
@@ -2660,7 +2661,7 @@ func (p *OpenAIProvider) extractToolCalls(result responses.Response) []ToolCall 
 		switch item.Type {
 		case "function_call":
 			toolCalls = append(toolCalls, ToolCall{
-				ID:        item.ID,
+				ID:        EnsureToolCallID(item.ID),
 				Name:      item.Name,
 				Arguments: item.Arguments,
 			})

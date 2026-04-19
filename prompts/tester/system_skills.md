@@ -8,7 +8,7 @@ Treat the tool definitions as the tester workflow contract. Their requirements, 
 - Harness and environment: `detect_test_harness`, `prepare_test_harness`, `build_harness`
 - Analysis and planning: `analyze_risk`, `analyze_integration_risks`, `analyze_batch`, `plan_tests`, `plan_integration_tests`, `plan_e2e_tests`
 - Authoring and execution: `prepare_pipeline_write_context`, `prepare_global_write_context`, `write_test`, `write_integration_test`, `write_e2e_test`, `run_test_suite`, `run_command`, `run_shell_script`
-- Diagnosis and reporting: `diagnose_failure`, `report_to_engineer`, `report_to_designer`, `report_to_orchestrator`, `report_to_architect`, `escalate_failure`
+- Diagnosis and reporting: `diagnose_failure`, `finalize_pipeline` (pipeline tester — packages per-recipient verification artifacts before `handoff_next`/`validate_work`), `report_to_orchestrator`, `report_to_architect`, `escalate_failure` (global tester)
 
 ### When to Iterate vs Finalize
 

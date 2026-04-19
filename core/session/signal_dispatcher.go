@@ -140,7 +140,15 @@ func (d *CrossSessionSignalDispatcher) mergeStopChannels(ctx context.Context) (<
 	}
 }
 
+// signalDispatcherSweepInterval is the fallback scan cadence. Under heavy
+// CPU load, fsnotify event delivery can be delayed by many seconds or
+// (rarely) lost entirely if the inotify queue overflows. A periodic sweep
+// guarantees bounded-latency pickup independently of inotify health.
+const signalDispatcherSweepInterval = 500 * time.Millisecond
+
 func (d *CrossSessionSignalDispatcher) processNextEvent(done <-chan struct{}) bool {
+	sweep := time.NewTimer(signalDispatcherSweepInterval)
+	defer sweep.Stop()
 	select {
 	case <-done:
 		return true
@@ -148,6 +156,28 @@ func (d *CrossSessionSignalDispatcher) processNextEvent(done <-chan struct{}) bo
 		return d.onWatcherEvent(event, ok)
 	case <-d.watcher.Errors:
 		return false
+	case <-sweep.C:
+		d.sweepSignalDir()
+		return false
+	}
+}
+
+// sweepSignalDir scans the watched directory for any pending signal files and
+// processes them. Belt-and-suspenders fallback for inotify event delivery.
+func (d *CrossSessionSignalDispatcher) sweepSignalDir() {
+	entries, err := os.ReadDir(d.signalDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !isSignalFile(name) {
+			continue
+		}
+		d.processSignalFile(filepath.Join(d.signalDir, name))
 	}
 }
 

@@ -763,6 +763,34 @@ func (p *anthropicPlanner) streamRequestFullWithTimeout(
 	return resp, nil
 }
 
+// streamWithProgressTimeout enforces a liveness deadline on the LLM
+// stream while accommodating Claude Opus 4.6's adaptive thinking
+// (which may stay server-side for long stretches).
+//
+// Design:
+//
+//  1. Watchdog timer: if no liveness signal arrives within `timeout`,
+//     the inner stream context is canceled and TimedOut() returns
+//     true. Caller translates that into context.DeadlineExceeded so
+//     it is distinguishable from caller-initiated cancellation.
+//  2. Chunk-driven heartbeat: every StreamChunk the model emits is
+//     the heartbeat. This covers text deltas, thinking deltas, and
+//     tool-use deltas. Any Anthropic SSE event the SDK surfaces
+//     (message_start, content_block_start/delta/stop, message_delta,
+//     message_stop) produces a StreamChunk and resets the timer.
+//     The SDK swallows `ping` frames internally, so the watchdog
+//     cannot observe those as chunks — but any real work the server
+//     does emits at least one visible event, and the generous
+//     timeout below absorbs the rest.
+//  3. Long timeout: the configured timeout is sized for Opus 4.7's
+//     adaptive thinking windows (see DefaultLLMRequestTimeout). A
+//     genuine stall of that length is a hard failure worth aborting.
+//
+// Using a ticker-driven heartbeat here would mask stalls: any
+// interval short enough to be useful is short enough to perpetually
+// reset the watchdog while ctx is alive, leaving only ctx.Done() to
+// ever terminate the request. The stream itself is the correct
+// liveness source.
 func (p *anthropicPlanner) streamWithProgressTimeout(
 	ctx context.Context,
 	stage string,
@@ -793,6 +821,11 @@ func (p *anthropicPlanner) streamWithProgressTimeout(
 	return err
 }
 
+// plannerStreamWatchdog enforces a per-window liveness deadline on
+// planner streams. Each Progress() call (driven by inbound stream
+// chunks) resets the timer; when the timer fires without a
+// preceding reset, the attached cancel func is invoked and
+// TimedOut() returns true.
 type plannerStreamWatchdog struct {
 	done     chan struct{}
 	progress chan struct{}
@@ -842,6 +875,10 @@ func (w *plannerStreamWatchdog) run(
 	}
 }
 
+// Progress signals liveness to the watchdog. Called on every inbound
+// stream chunk and by the heartbeat ticker. Non-blocking: if the
+// signal channel is full the caller's progress is coalesced with
+// the already-pending signal.
 func (w *plannerStreamWatchdog) Progress() {
 	if w == nil {
 		return
@@ -852,13 +889,24 @@ func (w *plannerStreamWatchdog) Progress() {
 	}
 }
 
+// Stop releases the watchdog goroutine. Safe to call multiple times;
+// subsequent calls are no-ops because run() exits on the first
+// done-channel receive.
 func (w *plannerStreamWatchdog) Stop() {
 	if w == nil {
 		return
 	}
-	close(w.done)
+	select {
+	case <-w.done:
+		// already closed
+	default:
+		close(w.done)
+	}
 }
 
+// TimedOut reports whether the watchdog timer fired before Stop was
+// called. Callers use this to distinguish watchdog-initiated
+// cancellation from caller-initiated ctx cancellation.
 func (w *plannerStreamWatchdog) TimedOut() bool {
 	if w == nil {
 		return false

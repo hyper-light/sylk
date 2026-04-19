@@ -26,7 +26,7 @@ func (f *fakeAcademicKnowledgeBackend) Search(_ context.Context, _ *search.Searc
 }
 
 func TestAcademicKnowledgeQuery_NilGuards(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestAcademicKnowledgeQuery_NilGuards(t *testing.T) {
 }
 
 func TestAcademicKnowledgeQueryReadiness_WithCoordinator(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestAcademicKnowledgeQueryReadiness_WithCoordinator(t *testing.T) {
 }
 
 func TestAcademicKnowledgeQuerySearch_UsesCommittedBackend(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}

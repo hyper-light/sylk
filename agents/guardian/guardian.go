@@ -15,6 +15,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/container"
@@ -47,9 +48,11 @@ type guardianProvider interface {
 // explicit user approval, validates content for injection/credential leaks,
 // and monitors agent health. Guardian has NO filesystem write access.
 type Guardian struct {
-	id     string
-	config Config
-	logger *slog.Logger
+	id       string
+	config   Config
+	logger   *slog.Logger
+	identity *identity.AgentIdentity
+	factory  *identity.Factory
 
 	// LLM provider — GPT-5.4 Pro for on-demand escalation.
 	// Deterministic by default; LLM invoked only for ambiguous cases.
@@ -184,6 +187,7 @@ func New(cfg Config, provider guardianProvider) (*Guardian, error) {
 		id:                guardianID,
 		config:            cfg,
 		logger:            cfg.Logger,
+		factory:           cfg.Factory,
 		provider:          provider,
 		model:             DefaultGuardianModel,
 		activityPub:       cfg.ActivityPub,
@@ -196,6 +200,16 @@ func New(cfg Config, provider guardianProvider) (*Guardian, error) {
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
 	}
+
+	g.factory = cfg.Factory
+	guardianIdentity, err := cfg.Factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeGuardian,
+		Pod:  identity.PodRef{ID: "guardian", Type: identity.PodTypeDaemon},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("guardian: mint identity: %w", err)
+	}
+	g.identity = guardianIdentity
 
 	g.steering.InitLazy("guardian", cfg.ActivityPub)
 
@@ -474,6 +488,7 @@ func (g *Guardian) SetCostCalculator(fn CostCalculator) {
 
 // SetQuarantine wires the quarantine buffer for external content inspection.
 // Called during pipeline setup after construction.
+
 func (g *Guardian) SetQuarantine(q *fetch.QuarantineBuffer) {
 	g.quarantine = q
 }
@@ -710,6 +725,7 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
 	reqCtx = shared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
 	reqCtx = shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
+	reqCtx = shared.WithOwnedStreamIdentity(reqCtx, "guardian", "Guardian")
 	g.registerInFlight(fwd.CorrelationID, cancel)
 	g.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer g.clearInFlight(fwd.CorrelationID)
@@ -725,6 +741,17 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 		AgentID:     g.id,
 		SessionID:   fwd.SessionID,
 	})
+	if g.factory != nil && g.identity != nil {
+		task, taskErr := g.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+		})
+		if taskErr != nil {
+			return fmt.Errorf("guardian: mint task: %w", taskErr)
+		}
+		reqCtx = identity.WithIdentity(reqCtx, g.identity)
+		reqCtx = identity.WithTask(reqCtx, task)
+	}
 	allowedHandoff := shared.AutomaticHandoffAllowedForForwardedRequest(fwd)
 	reqCtx = shared.WithAutomaticHandoffEnabled(reqCtx, allowedHandoff)
 	reqCtx = handoff.WithTransportRetryHandoff(reqCtx, handoff.TransportRetryHandoffConfig{

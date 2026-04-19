@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
@@ -37,9 +38,11 @@ type designerProvider interface {
 }
 
 type Designer struct {
-	id     string
-	config Config
-	logger *slog.Logger
+	id       string
+	config   Config
+	logger   *slog.Logger
+	identity *identity.AgentIdentity
+	factory  *identity.Factory
 
 	provider      designerProvider
 	refresher     container.ProviderRefresher
@@ -117,6 +120,10 @@ type Config struct {
 
 	// Forest exposes Memory Forest preference and precedent skills.
 	Forest shared.MemoryForestService
+
+	// Factory mints the Designer's AgentIdentity at New() time.
+	// Pipeline agent created inside the pipeline pod after phase4.
+	Factory *identity.Factory
 }
 
 const (
@@ -156,6 +163,16 @@ func New(cfg Config, provider designerProvider) (*Designer, error) {
 		requestSerializer: shared.NewRequestSerializer(),
 		executionBroker:   purevfs.DefaultExecutionBroker(),
 	}
+
+	d.factory = cfg.Factory
+	designerIdentity, err := cfg.Factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeDesigner,
+		Pod:  identity.PodRef{ID: "pipeline", Type: identity.PodTypePipeline},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("designer: mint identity: %w", err)
+	}
+	d.identity = designerIdentity
 
 	d.steering.InitLazy("designer", nil)
 
@@ -504,6 +521,26 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	defer d.clearRequestCancel(fwd.CorrelationID)
 	defer cancel()
 
+	if d.factory != nil && d.identity != nil {
+		var pipeline *identity.PipelineRef
+		if d.pipelineID != "" {
+			pipeline = &identity.PipelineRef{
+				ID:    identity.PipelineID(d.pipelineID),
+				Stage: "design",
+			}
+		}
+		task, taskErr := d.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+			Pipeline:    pipeline,
+		})
+		if taskErr != nil {
+			return fmt.Errorf("designer: mint task: %w", taskErr)
+		}
+		reqCtx = identity.WithIdentity(reqCtx, d.identity)
+		reqCtx = identity.WithTask(reqCtx, task)
+	}
+
 	// Create steering ledger for this request.
 	ledger := d.steering.Create(fwd.CorrelationID, d.id, fwd.SessionID, nil, nil)
 	defer d.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
@@ -518,8 +555,6 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}
 	ctx := shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, shared.MergeStreamMetadata(fwd.Metadata, map[string]any{
 		"pipeline_task": true,
-		"agent_type":    "designer",
-		"agent_name":    "Designer",
 		"pipeline_id":   d.pipelineID,
 		"task_id":       d.pipelineID,
 		"task_slug":     d.pipelineSlug,
@@ -527,6 +562,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		"dag_id":        metaString("dag_id"),
 		"node_id":       metaString("node_id"),
 	}))
+	ctx = shared.WithOwnedStreamIdentity(ctx, "designer", "Designer")
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)

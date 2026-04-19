@@ -105,6 +105,22 @@ func (b *TokenUsageBridge) forwardHandler(program TeaProgram) guide.MessageHandl
 			um.ReasoningTokens = v
 		}
 
+		// Typed identity + task overlay. Populated by the
+		// provider-gateway MultiHook when the call carried typed
+		// *AgentIdentity / *TaskRef on ctx. Empty when the call
+		// originated from an unmigrated path.
+		if id := evt.Identity; id != nil {
+			um.AgentUID = string(id.UID())
+			um.Generation = uint64(id.Generation())
+			if owner := id.Owner(); owner != nil {
+				um.OwnerAgentUID = string(owner.UID)
+			}
+		}
+		if task := evt.Task; task != nil {
+			um.TaskUID = string(task.UID())
+			um.TaskCorrelation = string(task.Correlation())
+		}
+
 		program.Send(um)
 		return nil
 	}

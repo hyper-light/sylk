@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/llmruntime"
+	"github.com/adalundhe/sylk/core/messaging"
 )
 
 // RerouteRequest is published by an agent's reroute_request skill when the
@@ -369,6 +370,30 @@ type RouteRequest struct {
 	// When Hops exceeds maxRouteHops the Guide rejects the request with
 	// an error instead of forwarding, breaking routing loops structurally.
 	Hops int `json:"hops,omitempty"`
+
+	// RerouteHistory carries the chain of Step-0 rejections that produced
+	// this request. Each entry records which agent rejected, which target
+	// was suggested, and why. Append-only; bounded by maxRouteHops /
+	// messaging.MaxReroutesPerRequest.
+	RerouteHistory []messaging.RerouteHop `json:"reroute_history,omitempty"`
+
+	// ConfidenceChain accumulates each routing decision's confidence
+	// score along the request's path. RouterHook and the escalation
+	// policy consume this to decide whether to gate the dispatch.
+	ConfidenceChain []messaging.ConfidenceEntry `json:"confidence_chain,omitempty"`
+}
+
+// AppendConfidence records a routing decision's confidence onto the
+// request. Guide / Architect / Engineer call this at each classification
+// or decomposition step so the RouterHook has full context when deciding
+// whether to let the next dispatch proceed.
+func (r *RouteRequest) AppendConfidence(agent string, confidence float64, reason string) {
+	r.ConfidenceChain = append(r.ConfidenceChain, messaging.ConfidenceEntry{
+		Agent:      agent,
+		Confidence: confidence,
+		Reason:     reason,
+		At:         time.Now(),
+	})
 }
 
 // RouteResponse represents a response from a target agent

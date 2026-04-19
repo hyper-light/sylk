@@ -524,6 +524,7 @@ func (g *GoogleProvider) processCodeAssistSSE(
 	textDelta := &providerDeltaEmitter{}
 	thoughtDelta := &providerDeltaEmitter{}
 	toolCallsSeen := make(map[googleToolCallKey]bool)
+	toolCallIDs := make(map[googleToolCallKey]string)
 	var rawContent *googleSerializableContent
 
 	var totalTextLen, totalThoughtLen int
@@ -599,13 +600,18 @@ func (g *GoogleProvider) processCodeAssistSSE(
 
 		for _, fc := range extractVertexFunctionCalls(vResp) {
 			key := googleToolCallKey{ID: fc.ID, Name: fc.Name}
+			stableID, ok := toolCallIDs[key]
+			if !ok {
+				stableID = EnsureToolCallID(fc.ID)
+				toolCallIDs[key] = stableID
+			}
 			if !toolCallsSeen[key] {
 				toolCallsSeen[key] = true
 				if err := handler(&StreamChunk{
 					Index: chunkIndex,
 					Type:  ChunkTypeToolStart,
 					ToolCall: &ToolCallChunk{
-						ID:   fc.ID,
+						ID:   stableID,
 						Name: fc.Name,
 					},
 					Timestamp: time.Now(),
@@ -617,7 +623,7 @@ func (g *GoogleProvider) processCodeAssistSSE(
 				Index: chunkIndex,
 				Type:  ChunkTypeToolDelta,
 				ToolCall: &ToolCallChunk{
-					ID:             fc.ID,
+					ID:             stableID,
 					ArgumentsDelta: fc.Arguments,
 				},
 				Timestamp: time.Now(),
@@ -730,7 +736,7 @@ func extractVertexFunctionCalls(resp *vertexStreamResponse) []ToolCall {
 			continue
 		}
 		calls = append(calls, ToolCall{
-			ID:        part.FunctionCall.ID,
+			ID:        EnsureToolCallID(part.FunctionCall.ID),
 			Name:      part.FunctionCall.Name,
 			Arguments: string(argsJSON),
 		})

@@ -661,6 +661,7 @@ func TestHandleToolCallEvent_AttachesToCompletedEntryByCorrelation(t *testing.T)
 
 	comp, _ := m.Update(msg.ToolCallEventMsg{
 		CorrelationID: "corr-tool",
+		ToolCallKey:   "tc-attach-1",
 		ToolName:      "read_file",
 		ArgsSummary:   "path=README.md",
 		Phase:         0,
@@ -669,6 +670,7 @@ func TestHandleToolCallEvent_AttachesToCompletedEntryByCorrelation(t *testing.T)
 	m = comp.(*Model)
 	comp, _ = m.Update(msg.ToolCallEventMsg{
 		CorrelationID: "corr-tool",
+		ToolCallKey:   "tc-attach-1",
 		ToolName:      "read_file",
 		Phase:         1,
 		Duration:      250 * time.Millisecond,
@@ -746,48 +748,6 @@ func TestHandleToolCallEvent_MatchesGenericToolCompletionByToolCallKey(t *testin
 	}
 	if last.ToolCalls[1].Completed {
 		t.Fatalf("second generic tool row = %+v, want still pending", last.ToolCalls[1])
-	}
-}
-
-func TestHandleToolCallEvent_MatchesGenericToolCompletionWhenKeysDifferButArgsMatch(t *testing.T) {
-	m := New(theme.DefaultDark(), 16)
-	m.PushEntry(&ChatEntry{
-		ID:            "resp-generic-args",
-		Timestamp:     time.Now(),
-		CorrelationID: "corr-generic-args",
-		Source:        SourceAgent,
-		AgentType:     "architect",
-		Content:       "Done.",
-		Height:        -1,
-	})
-
-	comp, _ := m.Update(msg.ToolCallEventMsg{
-		CorrelationID: "corr-generic-args",
-		ToolCallKey:   `sig:read_file` + "\x00" + `{"path":"README.md","line":1}`,
-		ToolName:      "read_file",
-		FullArgs:      "{\n  \"path\": \"README.md\",\n  \"line\": 1\n}",
-		Phase:         0,
-		StartedAt:     time.Now(),
-	})
-	m = comp.(*Model)
-	comp, _ = m.Update(msg.ToolCallEventMsg{
-		CorrelationID: "corr-generic-args",
-		ToolCallKey:   `sig:read_file` + "\x00" + "{\n  \"line\": 1,\n  \"path\": \"README.md\"\n}",
-		ToolName:      "read_file",
-		FullArgs:      `{"line":1,"path":"README.md"}`,
-		Phase:         1,
-		Duration:      25 * time.Millisecond,
-		Success:       true,
-		Output:        "ok",
-	})
-	m = comp.(*Model)
-
-	last := m.history.Last()
-	if last == nil || len(last.ToolCalls) != 1 {
-		t.Fatalf("expected one generic tool row, got %+v", last)
-	}
-	if !last.ToolCalls[0].Completed || last.ToolCalls[0].Output != "ok" {
-		t.Fatalf("generic tool row = %+v, want completed output ok", last.ToolCalls[0])
 	}
 }
 
@@ -1590,6 +1550,7 @@ func TestHandleToolCallEvent_ConsultationCompletesAsInterAgentRow(t *testing.T) 
 
 	comp, _ := m.Update(msg.ToolCallEventMsg{
 		CorrelationID: "corr-consult",
+		ToolCallKey:   "tc-consult-1",
 		ToolName:      "consult_academic_approach",
 		FullArgs:      `{"question":"Is there a cleaner approach?"}`,
 		Phase:         0,
@@ -1598,6 +1559,7 @@ func TestHandleToolCallEvent_ConsultationCompletesAsInterAgentRow(t *testing.T) 
 	m = comp.(*Model)
 	comp, _ = m.Update(msg.ToolCallEventMsg{
 		CorrelationID: "corr-consult",
+		ToolCallKey:   "tc-consult-1",
 		ToolName:      "consult_academic_approach",
 		FullArgs:      `{"question":"Is there a cleaner approach?"}`,
 		Output:        `{"consulted":true,"target":"academic","response":"A table-driven harness would be cleaner and easier to extend."}`,
@@ -2657,6 +2619,7 @@ func TestHandleToolCallEvent_UsesExplicitInterAgentMetadataForUnknownTool(t *tes
 
 	comp, _ := m.Update(msg.ToolCallEventMsg{
 		CorrelationID: "corr-metadata",
+		ToolCallKey:   "tc-metadata-1",
 		ToolName:      "custom_agent_exchange",
 		Phase:         0,
 		StartedAt:     time.Now(),
@@ -2670,6 +2633,7 @@ func TestHandleToolCallEvent_UsesExplicitInterAgentMetadataForUnknownTool(t *tes
 	m = comp.(*Model)
 	comp, _ = m.Update(msg.ToolCallEventMsg{
 		CorrelationID: "corr-metadata",
+		ToolCallKey:   "tc-metadata-1",
 		ToolName:      "custom_agent_exchange",
 		Phase:         1,
 		Duration:      120 * time.Millisecond,
@@ -2734,6 +2698,7 @@ func TestHandleToolCallEvent_GlobalChallengeKeepsResponderOnOriginRowAcrossRespo
 
 	comp, _ := m.Update(msg.ToolCallEventMsg{
 		CorrelationID: "corr-global-challenge",
+		ToolCallKey:   "tc-global-challenge-1",
 		ToolName:      "challenge_architect",
 		FullArgs:      `{"reason":"Need plan clarification","request":"Reassess the testing scope."}`,
 		Phase:         0,
@@ -2742,6 +2707,7 @@ func TestHandleToolCallEvent_GlobalChallengeKeepsResponderOnOriginRowAcrossRespo
 	m = comp.(*Model)
 	comp, _ = m.Update(msg.ToolCallEventMsg{
 		CorrelationID: "corr-global-challenge",
+		ToolCallKey:   "tc-global-challenge-1",
 		ToolName:      "challenge_architect",
 		FullArgs:      `{"reason":"Need plan clarification","request":"Reassess the testing scope."}`,
 		Output:        `{"selected":true,"target_agent":"architect","challenge_id":"global-review-123"}`,
@@ -2831,6 +2797,7 @@ func TestHandleToolCallEvent_PipelineChallengeKeepsResponderOnOriginRowAcrossRes
 
 	comp, _ := m.Update(msg.ToolCallEventMsg{
 		CorrelationID: "corr-pipeline-challenge",
+		ToolCallKey:   "tc-pipeline-challenge-1",
 		ToolName:      "challenge_agent",
 		FullArgs:      `{"target_agents":["tester-pipeline"],"reason":"Need verification","request":"Run the final pipeline audit."}`,
 		Phase:         0,
@@ -2839,6 +2806,7 @@ func TestHandleToolCallEvent_PipelineChallengeKeepsResponderOnOriginRowAcrossRes
 	m = comp.(*Model)
 	comp, _ = m.Update(msg.ToolCallEventMsg{
 		CorrelationID: "corr-pipeline-challenge",
+		ToolCallKey:   "tc-pipeline-challenge-1",
 		ToolName:      "challenge_agent",
 		FullArgs:      `{"target_agents":["tester-pipeline"],"reason":"Need verification","request":"Run the final pipeline audit."}`,
 		Output:        `{"selected":true,"target_agents":["tester-pipeline"],"challenge_id":"pipeline-review-456"}`,
@@ -5028,6 +4996,104 @@ func TestHandleStreamStart_ReusesDeferredPipelineWorkerEntryForSameRawAgentID(t 
 	}
 	if strings.Contains(reused.ThinkingStatus, deferredParentCompletionStatus) {
 		t.Fatalf("expected deferred waiting status to clear on resumed stream, got %q", reused.ThinkingStatus)
+	}
+}
+
+// TestHandleStreamStart_OriginatorContinuationResumesExistingEntry covers the
+// pipeline challenge → validate_work → inspector-resumption flow. When a
+// StreamStartMsg carries ContinuationOfCorrelationID, the TUI must append
+// the new correlation's work into the existing entry (no new chat block) and
+// settle any pending challenge row whose child's response just arrived.
+func TestHandleStreamStart_OriginatorContinuationResumesExistingEntry(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.SetSize(96, 24)
+
+	// Seed an inspector entry that already contains a challenge_agent row
+	// whose nested child (tester-pipeline) is still Pending.
+	entry := &ChatEntry{
+		ID:            "inspector-origin-continuation",
+		Timestamp:     time.Now(),
+		CorrelationID: "corr-inspector",
+		Source:        SourceAgent,
+		AgentType:     "inspector-pipeline",
+		AgentID:       "inspector-pipeline",
+		TaskID:        "task_auth",
+		Content:       "Pre-challenge audit work.",
+		Streaming:     false,
+		Height:        -1,
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:  "challenge_agent",
+				Completed: false,
+				InterAgent: &InterAgentTool{
+					Kind:       InterAgentToolChallenge,
+					AgentTypes: []string{"tester-pipeline"},
+					Status:     InterAgentToolPending,
+					ThreadKey:  "pipeline:challenge-1",
+					Children: []InterAgentChildActivity{
+						{
+							CorrelationID: "corr-tester",
+							AgentType:     "tester-pipeline",
+						},
+					},
+				},
+			},
+		},
+	}
+	m.PushEntry(entry)
+
+	// validate_work dispatched from tester now arrives as a new forwarded
+	// request to the inspector. The routing layer stamps:
+	//   ContinuationOfCorrelationID = originator (inspector) CID
+	//   ParentCorrelationID          = responder (tester) CID
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:                   "s1",
+		CorrelationID:               "corr-inspector-resume",
+		ContinuationOfCorrelationID: "corr-inspector",
+		ParentCorrelationID:         "corr-tester",
+		AgentID:                     "inspector-pipeline",
+		AgentType:                   "inspector-pipeline",
+		TaskID:                      "task_auth",
+	})
+	m = comp.(*Model)
+
+	// No second entry — the inspector resumed its existing one.
+	if m.history.Len() != 1 {
+		t.Fatalf("history len = %d, want 1 (continuation must not create a new entry)", m.history.Len())
+	}
+
+	// The new correlation must resolve to the same existing entry.
+	newSlot := m.streamSlot("corr-inspector-resume")
+	if newSlot == nil {
+		t.Fatal("expected new correlation to register a stream slot")
+	}
+	if newSlot.accumulator == nil || newSlot.accumulator.EntryIndex() != 0 {
+		t.Fatalf("slot entry index = %v, want 0 (same entry)",
+			func() any {
+				if newSlot.accumulator == nil {
+					return "nil"
+				}
+				return newSlot.accumulator.EntryIndex()
+			}())
+	}
+
+	// The pending challenge row for the responder child must be settled.
+	resumed := m.history.Get(0)
+	if resumed == nil || len(resumed.ToolCalls) == 0 || resumed.ToolCalls[0].InterAgent == nil {
+		t.Fatal("expected resumed entry to preserve challenge_agent row")
+	}
+	if resumed.ToolCalls[0].InterAgent.Status == InterAgentToolPending {
+		t.Fatalf("challenge row status = %q, want settled (Done)",
+			resumed.ToolCalls[0].InterAgent.Status)
+	}
+
+	// The original correlation should still resolve to the same entry (both
+	// pre- and post-continuation CIDs point to the inspector entry).
+	if idx := m.historyIndexForCorrelation("corr-inspector"); idx != 0 {
+		t.Fatalf("original CID resolution = %d, want 0", idx)
+	}
+	if idx := m.historyIndexForCorrelation("corr-inspector-resume"); idx != 0 {
+		t.Fatalf("new CID resolution = %d, want 0", idx)
 	}
 }
 

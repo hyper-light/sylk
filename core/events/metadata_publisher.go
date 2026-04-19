@@ -59,10 +59,12 @@ func NewMetadataCachingPublisher(
 	}
 }
 
-// PublishActivity enriches and forwards the activity event.
-func (p *MetadataCachingPublisher) PublishActivity(event *ActivityEvent) {
+// PublishActivity enriches and forwards the activity event. Errors from the
+// wrapped publisher are propagated so callers can react to a closed bus or
+// other transport failures.
+func (p *MetadataCachingPublisher) PublishActivity(event *ActivityEvent) error {
 	if p == nil || p.base == nil || event == nil {
-		return
+		return nil
 	}
 
 	cloned := cloneActivityEvent(event)
@@ -99,7 +101,7 @@ func (p *MetadataCachingPublisher) PublishActivity(event *ActivityEvent) {
 	}
 
 	p.rememberMetadata(rawID, cloned)
-	p.base.PublishActivity(cloned)
+	return p.base.PublishActivity(cloned)
 }
 
 func (p *MetadataCachingPublisher) resolveMetadata(agentID string, data map[string]any) cachedAgentMetadata {
@@ -196,6 +198,17 @@ func (p *MetadataCachingPublisher) storeCached(agentID string, meta cachedAgentM
 	p.cache[agentID] = meta
 }
 
+// metadataPipelinePanelID returns the per-pipeline panel row key for an
+// agent emission. Only task-scoped pipeline workers (engineer, designer,
+// inspector-pipeline, tester-pipeline) get rekeyed — each pipeline spawns
+// its own replica of these, so they legitimately render as distinct rows.
+//
+// The orchestrator is intentionally excluded: it is a singleton control-
+// plane agent that orchestrates many pipelines concurrently, and its row
+// must collapse to a single "orchestrator" entry regardless of which
+// task_id / pipeline_id happens to be tagged on a given event. This list
+// must stay aligned with agents/orchestrator/pipeline_pod.go's
+// PipelinePanelAgentTypes (source of truth for per-pipeline workers).
 func metadataPipelinePanelID(agentType, pipelineID string) string {
 	agentType = strings.TrimSpace(agentType)
 	pipelineID = strings.TrimSpace(pipelineID)
@@ -203,7 +216,7 @@ func metadataPipelinePanelID(agentType, pipelineID string) string {
 		return ""
 	}
 	switch agentType {
-	case "engineer", "designer", "inspector-pipeline", "tester-pipeline", "orchestrator":
+	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
 		return pipelineID + ":" + agentType
 	default:
 		return ""

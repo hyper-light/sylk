@@ -1,12 +1,15 @@
 package guide_test
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -253,6 +256,334 @@ func TestChannelBus_HandlerPanicRecovery(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	assert.Equal(t, int32(1), atomic.LoadInt32(&afterPanic))
+}
+
+// TestChannelBus_PriorityOrdering closes SCH-01. Higher-priority messages
+// published to a topic with a blocked consumer should be delivered ahead of
+// lower-priority messages already queued, while FIFO order is preserved
+// within the same priority class. We block the subscriber on the first
+// message, publish an interleaved priority stream, then release and
+// observe the dispatch order.
+func TestChannelBus_PriorityOrdering(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	released := make(chan struct{})
+	var order []string
+	var orderMu sync.Mutex
+
+	_, err := bus.Subscribe("priority-topic", func(msg *guide.Message) error {
+		if msg.ID == "blocker" {
+			<-released
+		}
+		orderMu.Lock()
+		order = append(order, msg.ID)
+		orderMu.Unlock()
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Prime the consumer with the blocker.
+	require.NoError(t, bus.Publish("priority-topic", &guide.Message{ID: "blocker"}))
+	// Give the consumer a tick to pull the blocker off the queue.
+	time.Sleep(10 * time.Millisecond)
+
+	// Enqueue interleaved priorities. Expected post-release drain order:
+	//   high-1, high-2 (stable within high)
+	//   normal-1, normal-2 (stable within normal)
+	//   low-1, low-2 (stable within low)
+	require.NoError(t, bus.Publish("priority-topic", &guide.Message{ID: "low-1", Priority: messaging.PriorityLow}))
+	require.NoError(t, bus.Publish("priority-topic", &guide.Message{ID: "normal-1", Priority: messaging.PriorityNormal}))
+	require.NoError(t, bus.Publish("priority-topic", &guide.Message{ID: "high-1", Priority: messaging.PriorityHigh}))
+	require.NoError(t, bus.Publish("priority-topic", &guide.Message{ID: "normal-2", Priority: messaging.PriorityNormal}))
+	require.NoError(t, bus.Publish("priority-topic", &guide.Message{ID: "low-2", Priority: messaging.PriorityLow}))
+	require.NoError(t, bus.Publish("priority-topic", &guide.Message{ID: "high-2", Priority: messaging.PriorityHigh}))
+
+	close(released)
+
+	require.Eventually(t, func() bool {
+		orderMu.Lock()
+		defer orderMu.Unlock()
+		return len(order) == 7
+	}, time.Second, 5*time.Millisecond)
+
+	expected := []string{"blocker", "high-1", "high-2", "normal-1", "normal-2", "low-1", "low-2"}
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	assert.Equal(t, expected, order)
+}
+
+// TestChannelBus_ExpiredMessageRejected closes SCH-02. Publishing a message
+// whose Deadline has already elapsed returns ErrMessageExpired wrapped in a
+// structured ExpiredMessageError carrying the rejected topic and ids. The
+// subscriber never sees the message.
+func TestChannelBus_ExpiredMessageRejected(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	var received atomic.Int32
+	_, err := bus.Subscribe("expiry-topic", func(msg *guide.Message) error {
+		received.Add(1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	past := time.Now().Add(-time.Second)
+	err = bus.Publish("expiry-topic", &guide.Message{
+		ID:            "expired-1",
+		CorrelationID: "corr-expired",
+		Timestamp:     past.Add(-2 * time.Second),
+		Deadline:      &past,
+	})
+
+	require.Error(t, err)
+	require.True(t, errors.Is(err, guide.ErrMessageExpired),
+		"Publish should return an error wrapping ErrMessageExpired")
+
+	var expiredErr *guide.ExpiredMessageError
+	require.ErrorAs(t, err, &expiredErr)
+	assert.Equal(t, "expiry-topic", expiredErr.Topic)
+	assert.Equal(t, "expired-1", expiredErr.MessageID)
+	assert.Equal(t, "corr-expired", expiredErr.CorrelationID)
+
+	// Subscriber must not observe the message.
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int32(0), received.Load())
+}
+
+// TestChannelBus_UnexpiredMessagePassesThrough sanity-checks the negative
+// case — a message with a future deadline is delivered normally.
+func TestChannelBus_UnexpiredMessagePassesThrough(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	var received atomic.Int32
+	_, err := bus.Subscribe("expiry-pass-topic", func(*guide.Message) error {
+		received.Add(1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	future := time.Now().Add(5 * time.Second)
+	require.NoError(t, bus.Publish("expiry-pass-topic", &guide.Message{
+		ID:       "fresh-1",
+		Deadline: &future,
+	}))
+
+	require.Eventually(t, func() bool { return received.Load() == 1 },
+		time.Second, 5*time.Millisecond)
+}
+
+// TestChannelBus_CloseTimeout_ReportsStuckSubscriptions closes MSG-15. A
+// subscription blocked inside its handler should be identified in the
+// returned error when Close() exceeds its configured timeout.
+func TestChannelBus_CloseTimeout_ReportsStuckSubscriptions(t *testing.T) {
+	cfg := guide.DefaultChannelBusConfig()
+	cfg.CloseTimeout = 100 * time.Millisecond
+	bus := guide.NewChannelBus(cfg)
+
+	block := make(chan struct{})
+	release := make(chan struct{})
+	_, err := bus.Subscribe("stuck-topic", func(msg *guide.Message) error {
+		close(block)
+		<-release
+		return nil
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, bus.Publish("stuck-topic", &guide.Message{ID: "blocker"}))
+	<-block
+
+	err = bus.Close()
+	require.Error(t, err)
+
+	var timeoutErr *guide.BusCloseTimeoutError
+	require.ErrorAs(t, err, &timeoutErr, "Close error should unwrap to *BusCloseTimeoutError")
+	require.True(t, errors.Is(err, guide.ErrBusCloseTimeout), "error should wrap ErrBusCloseTimeout")
+	require.NotEmpty(t, timeoutErr.Stuck, "should identify at least one stuck subscription")
+	assert.Equal(t, "stuck-topic", timeoutErr.Stuck[0].Topic)
+
+	// Free the stuck handler so the waiter goroutine can exit.
+	close(release)
+	bus.WaitForPendingClosers()
+}
+
+// TestChannelBus_Close_NoStuckOnCleanShutdown verifies that Close() returns
+// nil and the closer goroutine exits promptly when all subscriptions are
+// responsive. Regression guard against awaitDrain introducing a wait that
+// persists after Close returns.
+func TestChannelBus_Close_NoStuckOnCleanShutdown(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	_, err := bus.Subscribe("clean-topic", func(msg *guide.Message) error { return nil })
+	require.NoError(t, err)
+
+	require.NoError(t, bus.Publish("clean-topic", &guide.Message{ID: "msg"}))
+	require.NoError(t, bus.Close())
+	bus.WaitForPendingClosers()
+}
+
+// TestChannelBus_OverflowListener verifies the per-subscription drop counter,
+// the `DropCounter` capability interface, and the `SetOverflowListener`
+// callback all fire once the queue exceeds maxQueueSize. This closes MSG-13
+// (overflow drops were previously logged as a bare count with no correlation
+// IDs and no programmatic observability).
+func TestChannelBus_OverflowListener(t *testing.T) {
+	cfg := guide.DefaultChannelBusConfig()
+	bus := guide.NewChannelBus(cfg)
+	defer bus.Close()
+
+	// Block the subscriber on the first message so subsequent publishes queue.
+	// Using sync Subscribe (not Async) means the consumer loop blocks entirely
+	// inside the handler — no asyncLimiter absorbs messages, so queue growth
+	// is determined purely by publish rate vs. handler progress.
+	blockCh := make(chan struct{})
+	proceed := make(chan struct{})
+	var firstOnce sync.Once
+	sub, err := bus.Subscribe("overflow-topic", func(msg *guide.Message) error {
+		if msg.ID == "first" {
+			firstOnce.Do(func() { close(blockCh) })
+			<-proceed
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Wire the overflow listener.
+	var events []guide.OverflowEvent
+	var evMu sync.Mutex
+	bus.SetOverflowListener(func(evt guide.OverflowEvent) {
+		evMu.Lock()
+		events = append(events, evt)
+		evMu.Unlock()
+	})
+
+	// Fire the blocker.
+	require.NoError(t, bus.Publish("overflow-topic", &guide.Message{ID: "first", CorrelationID: "corr-first"}))
+	<-blockCh
+
+	// Consumer is pinned inside handler for "first". Every subsequent publish
+	// queues. Push maxQueueSize + overflow to force overflow.
+	const overflowCount = 5
+	const maxQueue = 4096
+	for i := 0; i < maxQueue+overflowCount; i++ {
+		require.NoError(t, bus.Publish("overflow-topic", &guide.Message{
+			ID:            fmt.Sprintf("msg-%d", i),
+			CorrelationID: fmt.Sprintf("corr-%d", i),
+		}))
+	}
+
+	// Unblock and drain.
+	close(proceed)
+
+	// Assertions — use Eventually so we don't race the listener.
+	require.Eventually(t, func() bool {
+		evMu.Lock()
+		defer evMu.Unlock()
+		return len(events) > 0
+	}, time.Second, 5*time.Millisecond, "listener should have observed overflow")
+
+	evMu.Lock()
+	require.NotEmpty(t, events)
+	evt := events[0]
+	evMu.Unlock()
+
+	assert.Equal(t, "overflow-topic", evt.Topic)
+	assert.Greater(t, evt.Dropped, 0, "should drop at least 1 message")
+	assert.NotEmpty(t, evt.Correlations, "should capture at least one correlation_id")
+	assert.LessOrEqual(t, len(evt.Correlations), 8, "correlation capture is bounded")
+
+	dc, ok := sub.(guide.DropCounter)
+	require.True(t, ok, "subscription should satisfy DropCounter")
+	assert.Greater(t, dc.DroppedCount(), uint64(0))
+}
+
+// TestChannelBus_OverflowListener_NilOK verifies clearing the listener is safe.
+func TestChannelBus_OverflowListener_NilOK(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	bus.SetOverflowListener(func(evt guide.OverflowEvent) {})
+	bus.SetOverflowListener(nil)
+	// No assertion needed — should not panic.
+	_, _ = bus.Subscribe("noop", func(m *guide.Message) error { return nil })
+}
+
+// TestChannelBus_ConcurrentUnsubscribeAndClose exercises the path flagged in
+// MSG-16 (unsubscribe race with nil topicSubs). On inspection the existing
+// code is correct: `topicSubs.mu` serializes, `append(nil, ...)` is safe, and
+// `channelSubscription.close()` guards double-close via atomic.Swap. This
+// test is a regression guard — the -race detector would flag any future
+// change that reintroduces the hazard.
+func TestChannelBus_ConcurrentUnsubscribeAndClose(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+
+	const n = 32
+	subs := make([]guide.Subscription, 0, n)
+	for i := 0; i < n; i++ {
+		s, err := bus.Subscribe(fmt.Sprintf("race-topic-%d", i), func(m *guide.Message) error {
+			return nil
+		})
+		require.NoError(t, err)
+		subs = append(subs, s)
+	}
+
+	var wg sync.WaitGroup
+	for _, s := range subs {
+		wg.Add(1)
+		go func(sub guide.Subscription) {
+			defer wg.Done()
+			_ = sub.Unsubscribe()
+		}(s)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = bus.Close()
+	}()
+	wg.Wait()
+
+	// Additional Unsubscribe calls after Close should be a no-op / return
+	// ErrSubscriptionClosed without panicking.
+	for _, s := range subs {
+		_ = s.Unsubscribe()
+	}
+}
+
+// TestChannelBus_PanicCounter verifies the recovered-panic counter is exposed
+// via the PanicCounter capability interface and increments per panic. The
+// worker must continue serving subsequent messages on the same subscription
+// after a panic — the counter lets operators detect chronic failures without
+// tailing logs.
+func TestChannelBus_PanicCounter(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	var served atomic.Int64
+	sub, err := bus.Subscribe("panic-counter", func(msg *guide.Message) error {
+		served.Add(1)
+		if msg.ID == "boom" {
+			panic("intentional panic for test")
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	pc, ok := sub.(guide.PanicCounter)
+	require.True(t, ok, "channel subscription should satisfy PanicCounter")
+	require.Equal(t, uint64(0), pc.PanicCount())
+
+	// Interleave good and bad messages to verify (a) counter increments only on
+	// panic, and (b) the worker keeps serving after recovery.
+	require.NoError(t, bus.Publish("panic-counter", &guide.Message{ID: "ok-1"}))
+	require.NoError(t, bus.Publish("panic-counter", &guide.Message{ID: "boom"}))
+	require.NoError(t, bus.Publish("panic-counter", &guide.Message{ID: "boom"}))
+	require.NoError(t, bus.Publish("panic-counter", &guide.Message{ID: "ok-2"}))
+
+	require.Eventually(t, func() bool {
+		return served.Load() == 4
+	}, time.Second, 5*time.Millisecond, "all 4 messages should have been dispatched despite panics")
+
+	assert.Equal(t, uint64(2), pc.PanicCount(), "counter should equal number of panicking handlers")
 }
 
 // =============================================================================

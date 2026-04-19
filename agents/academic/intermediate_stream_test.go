@@ -162,7 +162,7 @@ func TestAcademicExecuteToolLoop_PublishesIntermediateTurnChunks(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	a, err := New(Config{ID: "academic"}, &intermediateTurnProvider{})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, &intermediateTurnProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestAcademicExecuteToolLoop_PublishesThinkingFallbackIntermediateTurn(t *te
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	a, err := New(Config{ID: "academic"}, &thinkingFallbackIntermediateTurnProvider{})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, &thinkingFallbackIntermediateTurnProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestAcademicExecuteToolLoop_StreamsThoughtsAndTextDuringTurn(t *testing.T) 
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	a, err := New(Config{ID: "academic"}, &streamingIntermediateTurnProvider{})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, &streamingIntermediateTurnProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestAcademicExecuteToolLoop_StreamsToolCallsDuringTurn(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	a, err := New(Config{ID: "academic"}, &streamingIntermediateTurnProvider{})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, &streamingIntermediateTurnProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestAcademicExecuteToolLoop_StreamsToolCallStartBeforeToolEnd(t *testing.T)
 	defer bus.Close()
 
 	provider := &delayedToolEndProvider{release: make(chan struct{})}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -546,7 +546,7 @@ func TestAcademicExecuteToolLoop_HidesThoughtsForWorkerResearchTurns(t *testing.
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	a, err := New(Config{ID: "academic"}, &streamingIntermediateTurnProvider{})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, &streamingIntermediateTurnProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}

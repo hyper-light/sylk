@@ -16,6 +16,16 @@ import (
 // This error indicates the publisher was created without a valid ActivityEventBus reference.
 var ErrNilBus = errors.New("event bus is nil")
 
+// checkBus returns ErrNilBus when bus is nil. Every typed publisher in this
+// package routes its nil guard through this helper so the behavior is
+// consistent and can be changed in one place.
+func checkBus(bus ActivityPublisher) error {
+	if bus == nil {
+		return ErrNilBus
+	}
+	return nil
+}
+
 // =============================================================================
 // GuidePublisher - Publishes guide/router related events
 // =============================================================================
@@ -37,8 +47,8 @@ func NewGuidePublisher(bus ActivityPublisher, sessionID string) *GuidePublisher 
 
 // PublishUserPrompt publishes a user prompt event.
 func (p *GuidePublisher) PublishUserPrompt(prompt string) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	event := NewActivityEvent(EventTypeUserPrompt, p.sessionID, prompt)
@@ -47,14 +57,13 @@ func (p *GuidePublisher) PublishUserPrompt(prompt string) error {
 
 	event.Data["prompt"] = prompt
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // PublishRoutingDecision publishes a routing decision event.
 func (p *GuidePublisher) PublishRoutingDecision(fromAgent, toAgent, reason string) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	content := fmt.Sprintf("Routing from %s to %s: %s", fromAgent, toAgent, reason)
@@ -67,14 +76,13 @@ func (p *GuidePublisher) PublishRoutingDecision(fromAgent, toAgent, reason strin
 	event.Data["toAgent"] = toAgent
 	event.Data["reason"] = reason
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // PublishClarificationRequest publishes a clarification request event.
 func (p *GuidePublisher) PublishClarificationRequest(question string) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	event := NewActivityEvent(EventTypeUserClarification, p.sessionID, question)
@@ -83,8 +91,7 @@ func (p *GuidePublisher) PublishClarificationRequest(question string) error {
 
 	event.Data["question"] = question
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // =============================================================================
@@ -110,8 +117,8 @@ func NewToolPublisher(bus ActivityPublisher, sessionID, agentID string) *ToolPub
 
 // PublishToolCall publishes a tool call event.
 func (p *ToolPublisher) PublishToolCall(toolName string, params map[string]any) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	content := fmt.Sprintf("Tool call: %s", toolName)
@@ -124,14 +131,13 @@ func (p *ToolPublisher) PublishToolCall(toolName string, params map[string]any) 
 	event.Data["tool_name"] = toolName
 	event.Data["params"] = params
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // PublishToolResult publishes a tool result event.
 func (p *ToolPublisher) PublishToolResult(toolName string, result any, success bool) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	content := fmt.Sprintf("Tool result: %s", toolName)
@@ -151,14 +157,13 @@ func (p *ToolPublisher) PublishToolResult(toolName string, result any, success b
 	event.Data["result"] = result
 	event.Data["outcome"] = event.Outcome.String()
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // PublishToolTimeout publishes a tool timeout event.
 func (p *ToolPublisher) PublishToolTimeout(toolName string, timeout time.Duration) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	content := fmt.Sprintf("Tool timeout: %s after %v", toolName, timeout)
@@ -173,8 +178,7 @@ func (p *ToolPublisher) PublishToolTimeout(toolName string, timeout time.Duratio
 	event.Data["timeout_duration"] = timeout.String()
 	event.Data["timeout_ms"] = timeout.Milliseconds()
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // =============================================================================
@@ -200,8 +204,8 @@ func NewAgentPublisher(bus ActivityPublisher, sessionID, agentID string) *AgentP
 
 // PublishAgentAction publishes an agent action event.
 func (p *AgentPublisher) PublishAgentAction(action, details string) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	content := fmt.Sprintf("Agent action: %s - %s", action, details)
@@ -214,14 +218,13 @@ func (p *AgentPublisher) PublishAgentAction(action, details string) error {
 	event.Data["action"] = action
 	event.Data["details"] = details
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // PublishAgentDecision publishes an agent decision event.
 func (p *AgentPublisher) PublishAgentDecision(decision, rationale string) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	content := fmt.Sprintf("Agent decision: %s - %s", decision, rationale)
@@ -234,16 +237,15 @@ func (p *AgentPublisher) PublishAgentDecision(decision, rationale string) error 
 	event.Data["decision"] = decision
 	event.Data["rationale"] = rationale
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // PublishAgentError publishes an agent error event.
 // The err parameter can be nil, in which case an empty error message is recorded.
 // The context parameter provides additional context about where/why the error occurred.
 func (p *AgentPublisher) PublishAgentError(err error, context string) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	var errMsg string
@@ -262,14 +264,13 @@ func (p *AgentPublisher) PublishAgentError(err error, context string) error {
 	event.Data["error_message"] = errMsg
 	event.Data["context"] = context
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // PublishSuccess publishes a success outcome event.
 func (p *AgentPublisher) PublishSuccess(summary string) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	event := NewActivityEvent(EventTypeSuccess, p.sessionID, summary)
@@ -280,14 +281,13 @@ func (p *AgentPublisher) PublishSuccess(summary string) error {
 
 	event.Data["summary"] = summary
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // PublishFailure publishes a failure outcome event.
 func (p *AgentPublisher) PublishFailure(err error, summary string) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	var errMsg string
@@ -306,8 +306,7 @@ func (p *AgentPublisher) PublishFailure(err error, summary string) error {
 	event.Data["error"] = errMsg
 	event.Data["summary"] = summary
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // =============================================================================
@@ -333,8 +332,8 @@ func NewLLMPublisher(bus ActivityPublisher, sessionID, agentID string) *LLMPubli
 
 // PublishLLMRequest publishes an LLM request event.
 func (p *LLMPublisher) PublishLLMRequest(model string, inputTokens int) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	content := fmt.Sprintf("LLM request: model=%s, input_tokens=%d", model, inputTokens)
@@ -347,14 +346,13 @@ func (p *LLMPublisher) PublishLLMRequest(model string, inputTokens int) error {
 	event.Data["model"] = model
 	event.Data["input_tokens"] = inputTokens
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // PublishLLMResponse publishes an LLM response event.
 func (p *LLMPublisher) PublishLLMResponse(model string, inputTokens, outputTokens int, duration time.Duration) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	var tokensPerSec float64
@@ -377,8 +375,7 @@ func (p *LLMPublisher) PublishLLMResponse(model string, inputTokens, outputToken
 	event.Data["duration_ms"] = duration.Milliseconds()
 	event.Data["tokens_per_sec"] = tokensPerSec
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }
 
 // PublishLLMError publishes an LLM error event.
@@ -388,8 +385,8 @@ func (p *LLMPublisher) PublishLLMResponse(model string, inputTokens, outputToken
 // The err parameter can be nil, in which case "unknown error" is recorded.
 // The errContext parameter provides additional context about where/why the error occurred.
 func (p *LLMPublisher) PublishLLMError(model string, err error, errContext string) error {
-	if p.bus == nil {
-		return ErrNilBus
+	if err := checkBus(p.bus); err != nil {
+		return err
 	}
 
 	var errMsg string
@@ -411,6 +408,5 @@ func (p *LLMPublisher) PublishLLMError(model string, err error, errContext strin
 	event.Data["error"] = errMsg
 	event.Data["error_context"] = errContext
 
-	p.bus.PublishActivity(event)
-	return nil
+	return p.bus.PublishActivity(event)
 }

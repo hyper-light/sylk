@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +45,17 @@ type LLMRequestCoordinator struct {
 	streamTimeoutCfg  timeout.StreamingTimeoutConfig
 
 	logger *slog.Logger
+
+	// streamWG tracks in-flight forwardStreamingChunks goroutines so
+	// Shutdown() can await them before returning.
+	streamWG sync.WaitGroup
+}
+
+// Shutdown blocks until every in-flight streaming forwarder has drained.
+// Safe to call multiple times. Does not cancel in-flight requests — callers
+// cancel via their own context. Intended for deterministic app teardown.
+func (c *LLMRequestCoordinator) Shutdown() {
+	c.streamWG.Wait()
 }
 
 // NewLLMRequestCoordinator creates a coordinator with all protection layers.
@@ -224,9 +236,34 @@ func (c *LLMRequestCoordinator) executeStreaming(
 	monitor := timeout.NewStreamingTimeoutMonitor(ctx, c.streamTimeoutCfg)
 	resp := NewStreamingLLMResponse(streamingChunkBuffer)
 
-	go c.forwardStreamingChunks(monitor, provider.Stream(monitor.Context(), req), resp.Chunks)
+	c.streamWG.Add(1)
+	go c.runForwardStreamingChunks(monitor, provider.Stream(monitor.Context(), req), resp.Chunks)
 
 	return c.waitForStreamCompletion(monitor, resp)
+}
+
+// runForwardStreamingChunks wraps forwardStreamingChunks with WaitGroup
+// tracking and panic recovery so a provider-side panic can't strand the
+// consumer on an unclosed chunk channel (waitForStreamCompletion would
+// otherwise block forever).
+func (c *LLMRequestCoordinator) runForwardStreamingChunks(
+	monitor *timeout.StreamingTimeoutMonitor,
+	sourceCh <-chan string,
+	destCh chan string,
+) {
+	defer c.streamWG.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Error("coordinator stream forwarder: panic recovered",
+				"panic", r,
+				"stack", string(debug.Stack()))
+			// Ensure monitor/dest are closed on the panic path so
+			// waitForStreamCompletion unwedges.
+			func() { defer func() { _ = recover() }(); close(destCh) }()
+			monitor.Done()
+		}
+	}()
+	c.forwardStreamingChunks(monitor, sourceCh, destCh)
 }
 
 // forwardStreamingChunks forwards chunks from provider to response channel.

@@ -16,6 +16,7 @@ func TestGuide_ConcurrentRegisterAndRouteDSL(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-concurrent-register-route",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)

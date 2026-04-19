@@ -7,7 +7,7 @@ import (
 )
 
 func TestBuildLLMRequestUsesForwardedSessionMetadata(t *testing.T) {
-	l, err := New(Config{ID: "librarian", SessionID: "sess-config", EnableLLM: true}, nil)
+	l, err := New(Config{Factory: newTestFactory(t), ID: "librarian", SessionID: "sess-config", EnableLLM: true}, nil)
 	if err != nil {
 		t.Fatalf("new librarian: %v", err)
 	}

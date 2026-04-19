@@ -49,8 +49,14 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(versioning.NewDeleteGlobalFileSkill(writeCfg))
 	gi.skills.Register(versioning.NewCreateGlobalDirectorySkill(writeCfg))
 
-	// Global-specific skills.
-	gi.skills.Register(auditLayerSkill(gi))
+	// Global-specific skills. audit_layer is intentionally NOT registered as
+	// an LLM tool: it is the entry point of the inspector's own LLM tool
+	// loop, invoked by the Go-side layer gate (see NewInspectorLayerGate).
+	// Exposing it as a Skill creates recursive LLM invocation because the
+	// inner audit's tool loop sees audit_layer in its toolset and calls it
+	// again. The audit prepass also requires NodeDiffs/NodeResults that the
+	// LLM cannot supply, so the LLM-callable form was always functionally
+	// degenerate.
 	gi.skills.Register(validatePlanAdherenceSkill(gi))
 	gi.skills.Register(crossReferenceChangesSkill(gi))
 	gi.skills.Register(gradeLayerQualitySkill(gi))
@@ -103,57 +109,6 @@ func (d *globalInspectorDiag) RecoveryHints() []string         { return nil }
 
 func (d *globalInspectorDiag) AgentSpecificDiagnostics() map[string]any {
 	return map[string]any{}
-}
-
-func auditLayerSkill(gi *GlobalInspector) *skills.Skill {
-	return skills.NewSkill("audit_layer").
-		Description("Run an adversarial, whole-plan audit on a completed DAG layer.").
-		Domain("audit").
-		Keywords("audit", "layer", "dag").
-		Priority(100).
-		Usage("Use when a completed DAG layer needs a hard, cross-file quality gate against the entire architect plan, the codebase's existing style, and the user's preserved intent.").
-		Requirement("Provide the DAG, layer, and the full architect plan snapshot when available. If the plan is missing or partial, call `load_plan_context` before concluding.").
-		Satisfies("Produces the whole-layer audit evidence that drives global inspection, blocking decisions, architect pushback, and escalation.").
-		Avoid("Do not use for narrow single-file inspection when a scoped pipeline inspector pass is the correct tool.").
-		StringParam("dag_id", "DAG identifier", true).
-		IntParam("layer_idx", "Layer index to audit", true).
-		StringParam("plan_snapshot", "Architect plan snapshot", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				DAGID        string `json:"dag_id"`
-				LayerIdx     int    `json:"layer_idx"`
-				PlanSnapshot string `json:"plan_snapshot"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			if params.DAGID == "" {
-				return nil, fmt.Errorf("dag_id is required")
-			}
-
-			req := &shared.LayerAuditRequest{
-				DAGID:        params.DAGID,
-				LayerIdx:     params.LayerIdx,
-				PlanSnapshot: params.PlanSnapshot,
-			}
-
-			result, err := gi.AuditLayer(ctx, req)
-			if err != nil {
-				return nil, err
-			}
-
-			return map[string]any{
-				"dag_id":           result.DAGID,
-				"layer_idx":        result.LayerIdx,
-				"passed":           result.Passed,
-				"critical_count":   result.CriticalCount,
-				"high_count":       result.HighCount,
-				"issue_count":      len(result.Issues),
-				"cross_file_count": len(result.CrossFileIssues),
-				"plan_adherence":   result.PlanAdherence.Score,
-			}, nil
-		}).
-		Build()
 }
 
 func validatePlanAdherenceSkill(_ *GlobalInspector) *skills.Skill {

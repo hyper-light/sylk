@@ -14,6 +14,7 @@ func TestConversationContextSkill_ReturnsActiveContext(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "sess-1",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -45,6 +46,7 @@ func TestConversationContextSkill_NoContext(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "sess-1",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)

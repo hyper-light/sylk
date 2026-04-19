@@ -15,6 +15,13 @@ func librarianVisibleSkillNames() []string {
 		"read_file",
 		"glob",
 		"grep",
+		// Workspace-aware reads reach the in-flight global VFS overlay.
+		// Disk-only read_file/glob/grep stay above for committed state.
+		"read_workspace_file",
+		"workspace_glob",
+		"workspace_grep",
+		"inspect_workspace_state",
+		"summarize_workspace_state",
 		"knowledge_search",
 	}, "librarian")
 }

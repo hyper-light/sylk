@@ -64,13 +64,13 @@ func wordObject(buf *buffer.PieceTable, cursor int, inner, bigWord bool) MotionR
 		return MotionRange{Start: cursor, End: cursor}
 	}
 	pos := max(min(cursor, length-1), 0)
-	curRune := buf.RuneAt(pos)
+	curRune, _ := buf.RuneAt(pos)
 	curIsSpace := unicode.IsSpace(curRune)
 	curIsWord := isWordCharCheck(curRune, bigWord)
 	// Expand backward to the start of the word/WORD.
 	start := pos
 	for start > 0 {
-		prev := buf.RuneAt(start - 1)
+		prev, _ := buf.RuneAt(start - 1)
 		prevIsSpace := unicode.IsSpace(prev)
 		prevIsWord := isWordCharCheck(prev, bigWord)
 		if prevIsSpace != curIsSpace || prevIsWord != curIsWord {
@@ -81,7 +81,7 @@ func wordObject(buf *buffer.PieceTable, cursor int, inner, bigWord bool) MotionR
 	// Expand forward to the end of the word/WORD.
 	end := pos
 	for end+1 < length {
-		next := buf.RuneAt(end + 1)
+		next, _ := buf.RuneAt(end + 1)
 		nextIsSpace := unicode.IsSpace(next)
 		nextIsWord := isWordCharCheck(next, bigWord)
 		if nextIsSpace != curIsSpace || nextIsWord != curIsWord {
@@ -94,14 +94,22 @@ func wordObject(buf *buffer.PieceTable, cursor int, inner, bigWord bool) MotionR
 	}
 	// "a word" includes trailing whitespace if present, else leading.
 	trailEnd := end
-	for trailEnd+1 < length && unicode.IsSpace(buf.RuneAt(trailEnd+1)) {
+	for trailEnd+1 < length {
+		r, _ := buf.RuneAt(trailEnd + 1)
+		if !unicode.IsSpace(r) {
+			break
+		}
 		trailEnd++
 	}
 	if trailEnd > end {
 		return MotionRange{Start: start, End: trailEnd}
 	}
 	leadStart := start
-	for leadStart > 0 && unicode.IsSpace(buf.RuneAt(leadStart-1)) {
+	for leadStart > 0 {
+		r, _ := buf.RuneAt(leadStart - 1)
+		if !unicode.IsSpace(r) {
+			break
+		}
 		leadStart--
 	}
 	return MotionRange{Start: leadStart, End: end}
@@ -121,7 +129,7 @@ func textObjSentence(ctx TextObjectContext, inner bool) MotionRange {
 	// Scan backward to find sentence start.
 	start := pos
 	for start > 0 {
-		prev := buf.RuneAt(start - 1)
+		prev, _ := buf.RuneAt(start - 1)
 		if isSentenceEnd(prev) {
 			break
 		}
@@ -129,14 +137,18 @@ func textObjSentence(ctx TextObjectContext, inner bool) MotionRange {
 	}
 	// Skip leading whitespace for "inner" or include it for "a".
 	if inner {
-		for start < length && unicode.IsSpace(buf.RuneAt(start)) {
+		for start < length {
+			r, _ := buf.RuneAt(start)
+			if !unicode.IsSpace(r) {
+				break
+			}
 			start++
 		}
 	}
 	// Scan forward to find sentence end.
 	end := pos
 	for end+1 < length {
-		r := buf.RuneAt(end)
+		r, _ := buf.RuneAt(end)
 		if isSentenceEnd(r) {
 			break
 		}
@@ -144,7 +156,11 @@ func textObjSentence(ctx TextObjectContext, inner bool) MotionRange {
 	}
 	if !inner {
 		// Include trailing whitespace for "a sentence".
-		for end+1 < length && unicode.IsSpace(buf.RuneAt(end+1)) {
+		for end+1 < length {
+			r, _ := buf.RuneAt(end + 1)
+			if !unicode.IsSpace(r) {
+				break
+			}
 			end++
 		}
 	}
@@ -233,10 +249,14 @@ func quoteObject(buf *buffer.PieceTable, cursor int, quote rune, inner bool) Mot
 	pos := max(min(cursor, length-1), 0)
 	// Scan backward for the opening quote.
 	start := pos
-	for start > 0 && buf.RuneAt(start) != quote {
+	for start > 0 {
+		r, _ := buf.RuneAt(start)
+		if r == quote {
+			break
+		}
 		start--
 	}
-	if buf.RuneAt(start) != quote {
+	if r, _ := buf.RuneAt(start); r != quote {
 		return MotionRange{Start: cursor, End: cursor}
 	}
 	// Scan forward for the closing quote.
@@ -244,10 +264,17 @@ func quoteObject(buf *buffer.PieceTable, cursor int, quote rune, inner bool) Mot
 	if end <= start {
 		end = start + 1
 	}
-	for end < length && buf.RuneAt(end) != quote {
+	for end < length {
+		r, _ := buf.RuneAt(end)
+		if r == quote {
+			break
+		}
 		end++
 	}
-	if end >= length || buf.RuneAt(end) != quote {
+	if end >= length {
+		return MotionRange{Start: cursor, End: cursor}
+	}
+	if r, _ := buf.RuneAt(end); r != quote {
 		return MotionRange{Start: cursor, End: cursor}
 	}
 	if inner {
@@ -293,7 +320,7 @@ func pairObject(buf *buffer.PieceTable, cursor int, open, close rune, inner bool
 func findOpenBracket(buf *buffer.PieceTable, pos int, open, close rune) int {
 	depth := 0
 	for i := pos; i >= 0; i-- {
-		r := buf.RuneAt(i)
+		r, _ := buf.RuneAt(i)
 		if r == close {
 			depth++
 		}
@@ -311,7 +338,7 @@ func findOpenBracket(buf *buffer.PieceTable, pos int, open, close rune) int {
 func findCloseBracket(buf *buffer.PieceTable, start, length int, open, close rune) int {
 	depth := 0
 	for i := start; i < length; i++ {
-		r := buf.RuneAt(i)
+		r, _ := buf.RuneAt(i)
 		if r == open {
 			depth++
 		}
@@ -338,15 +365,23 @@ func textObjTag(ctx TextObjectContext, inner bool) MotionRange {
 	pos := max(min(ctx.Cursor, length-1), 0)
 	// Scan backward for opening '<'.
 	openStart := pos
-	for openStart > 0 && buf.RuneAt(openStart) != '<' {
+	for openStart > 0 {
+		r, _ := buf.RuneAt(openStart)
+		if r == '<' {
+			break
+		}
 		openStart--
 	}
-	if buf.RuneAt(openStart) != '<' {
+	if r, _ := buf.RuneAt(openStart); r != '<' {
 		return MotionRange{Start: ctx.Cursor, End: ctx.Cursor}
 	}
 	// Find end of opening tag '>'.
 	openEnd := openStart + 1
-	for openEnd < length && buf.RuneAt(openEnd) != '>' {
+	for openEnd < length {
+		r, _ := buf.RuneAt(openEnd)
+		if r == '>' {
+			break
+		}
 		openEnd++
 	}
 	if openEnd >= length {
@@ -355,8 +390,12 @@ func textObjTag(ctx TextObjectContext, inner bool) MotionRange {
 	// Scan forward for matching closing tag '</'.
 	closeStart := openEnd + 1
 	for closeStart+1 < length {
-		if buf.RuneAt(closeStart) == '<' && closeStart+1 < length && buf.RuneAt(closeStart+1) == '/' {
-			break
+		r, _ := buf.RuneAt(closeStart)
+		if r == '<' {
+			next, _ := buf.RuneAt(closeStart + 1)
+			if next == '/' {
+				break
+			}
 		}
 		closeStart++
 	}
@@ -365,7 +404,11 @@ func textObjTag(ctx TextObjectContext, inner bool) MotionRange {
 	}
 	// Find end of closing tag.
 	closeEnd := closeStart + 1
-	for closeEnd < length && buf.RuneAt(closeEnd) != '>' {
+	for closeEnd < length {
+		r, _ := buf.RuneAt(closeEnd)
+		if r == '>' {
+			break
+		}
 		closeEnd++
 	}
 	if closeEnd >= length {

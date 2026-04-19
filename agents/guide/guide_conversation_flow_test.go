@@ -15,6 +15,7 @@ func TestGuideApplyConversationFlow_RemapsFollowUpToActiveAgent(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-1",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -155,6 +156,7 @@ func TestGuideApplyConversationFlow_UsesWorkPreferenceForLowConfidenceGuideTarge
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-1",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)

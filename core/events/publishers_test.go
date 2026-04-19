@@ -1515,3 +1515,78 @@ func TestLLMPublisher_EventTypes(t *testing.T) {
 		})
 	}
 }
+
+// =============================================================================
+// MSG-17 / MSG-19 / MSG-20: Interface error propagation + checkBus helper
+// =============================================================================
+
+// failingPublisher returns a configured error from every PublishActivity call.
+// Used to verify typed publishers propagate transport failures back to their
+// callers instead of silently swallowing them.
+type failingPublisher struct {
+	err error
+}
+
+func (f *failingPublisher) PublishActivity(*ActivityEvent) error {
+	return f.err
+}
+
+// TestCheckBus_Helper verifies the centralized nil guard is what typed
+// publishers use; we assert the sentinel error is returned for a nil bus and
+// nil for a non-nil one.
+func TestCheckBus_Helper(t *testing.T) {
+	t.Parallel()
+
+	if err := checkBus(nil); !errors.Is(err, ErrNilBus) {
+		t.Fatalf("checkBus(nil) = %v; want ErrNilBus", err)
+	}
+	if err := checkBus(setupTestCollector()); err != nil {
+		t.Fatalf("checkBus(collector) = %v; want nil", err)
+	}
+}
+
+// TestPublisher_ErrorPropagation verifies MSG-17 and MSG-19: every typed
+// publisher wrapper now returns the error from the underlying
+// ActivityPublisher.PublishActivity call. One method per typed publisher is
+// sufficient because the wrappers share a single pattern.
+func TestPublisher_ErrorPropagation(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("transport failure")
+	failing := &failingPublisher{err: sentinel}
+
+	guide := NewGuidePublisher(failing, "sess")
+	if err := guide.PublishUserPrompt("hi"); !errors.Is(err, sentinel) {
+		t.Fatalf("GuidePublisher.PublishUserPrompt error = %v; want %v", err, sentinel)
+	}
+
+	tool := NewToolPublisher(failing, "sess", "agent")
+	if err := tool.PublishToolCall("grep", nil); !errors.Is(err, sentinel) {
+		t.Fatalf("ToolPublisher.PublishToolCall error = %v; want %v", err, sentinel)
+	}
+
+	agent := NewAgentPublisher(failing, "sess", "agent")
+	if err := agent.PublishAgentAction("thinking", "decomposing request"); !errors.Is(err, sentinel) {
+		t.Fatalf("AgentPublisher.PublishAgentAction error = %v; want %v", err, sentinel)
+	}
+
+	llm := NewLLMPublisher(failing, "sess", "agent")
+	if err := llm.PublishLLMRequest("sonnet", 100); !errors.Is(err, sentinel) {
+		t.Fatalf("LLMPublisher.PublishLLMRequest error = %v; want %v", err, sentinel)
+	}
+}
+
+// TestPublisher_NoErrorOnSuccess documents the happy path once so we can't
+// regress back to always-nil returns that swallow the underlying status.
+func TestPublisher_NoErrorOnSuccess(t *testing.T) {
+	t.Parallel()
+
+	collector := setupTestCollector()
+	agent := NewAgentPublisher(collector, "sess", "agent")
+	if err := agent.PublishSuccess("done"); err != nil {
+		t.Fatalf("PublishSuccess returned unexpected error: %v", err)
+	}
+	if collector.EventCount() != 1 {
+		t.Fatalf("collector expected 1 event, got %d", collector.EventCount())
+	}
+}

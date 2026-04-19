@@ -23,6 +23,30 @@ func (t *Tree) Copy() *Tree {
 	}
 }
 
+func (t *Tree) Edit(edit *InputEdit) {
+	if t == nil || t.inner == nil || edit == nil {
+		return
+	}
+	t.inner.Edit(edit.toSitter())
+}
+
+func (t *Tree) ChangedRanges(other *Tree) []Range {
+	if t == nil || other == nil || t.inner == nil || other.inner == nil {
+		return nil
+	}
+	changed := t.inner.ChangedRanges(other.inner)
+	ranges := make([]Range, 0, len(changed))
+	for _, r := range changed {
+		ranges = append(ranges, Range{
+			StartPoint: Point{Row: uint32(r.StartPoint.Row), Column: uint32(r.StartPoint.Column)},
+			EndPoint:   Point{Row: uint32(r.EndPoint.Row), Column: uint32(r.EndPoint.Column)},
+			StartByte:  uint(r.StartByte),
+			EndByte:    uint(r.EndByte),
+		})
+	}
+	return ranges
+}
+
 func (t *Tree) Close() {
 	t.inner.Close()
 }
@@ -254,6 +278,45 @@ func (c *TreeCursor) Close() {
 type Point struct {
 	Row    uint32
 	Column uint32
+}
+
+type Range struct {
+	StartPoint Point
+	EndPoint   Point
+	StartByte  uint
+	EndByte    uint
+}
+
+type InputEdit struct {
+	StartByte      uint
+	OldEndByte     uint
+	NewEndByte     uint
+	StartPosition  Point
+	OldEndPosition Point
+	NewEndPosition Point
+}
+
+func (e *InputEdit) toSitter() *sitter.InputEdit {
+	if e == nil {
+		return nil
+	}
+	return &sitter.InputEdit{
+		StartByte:  e.StartByte,
+		OldEndByte: e.OldEndByte,
+		NewEndByte: e.NewEndByte,
+		StartPosition: sitter.Point{
+			Row:    uint(e.StartPosition.Row),
+			Column: uint(e.StartPosition.Column),
+		},
+		OldEndPosition: sitter.Point{
+			Row:    uint(e.OldEndPosition.Row),
+			Column: uint(e.OldEndPosition.Column),
+		},
+		NewEndPosition: sitter.Point{
+			Row:    uint(e.NewEndPosition.Row),
+			Column: uint(e.NewEndPosition.Column),
+		},
+	}
 }
 
 // CollectParseErrors walks the tree and returns all parse error positions.

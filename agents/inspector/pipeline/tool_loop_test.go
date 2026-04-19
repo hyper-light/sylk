@@ -86,6 +86,7 @@ func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToOT(t *testing.T) {
 	}
 
 	pi, err := New(inspectorshared.PipelineInspectorConfig{
+		Factory: newTestFactory(t),
 		AgentID:        "inspector-pipeline",
 		SessionID:      "sess-1",
 		MaxToolRuns:    1,
@@ -233,6 +234,7 @@ func TestHandle_UsesFinalizePipelineToolResultToDriveImmediateHandoffToOT(t *tes
 	}
 
 	pi, err := New(inspectorshared.PipelineInspectorConfig{
+		Factory: newTestFactory(t),
 		AgentID:        "inspector-pipeline",
 		SessionID:      "sess-2",
 		MaxToolRuns:    1,
@@ -378,6 +380,7 @@ func TestHandle_PostValidationAuditContinuesFromToolResultsWithoutInjectedUserPr
 	}
 
 	pi, err := New(inspectorshared.PipelineInspectorConfig{
+		Factory: newTestFactory(t),
 		AgentID:        "inspector-pipeline",
 		SessionID:      "sess-3",
 		MaxToolRuns:    3,

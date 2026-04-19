@@ -1,12 +1,14 @@
 package orchestrator
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/uptrace/bun"
 )
 
 func encodeStringSliceJSON(values []string) string {
@@ -81,22 +83,24 @@ func (s *Store) CreateValidationEpoch(record *ValidationEpochRecord) error {
 	const q = `INSERT INTO validation_epochs
 		(epoch_id, session_id, status, reason, workflow_ids_json, dag_ids_json, task_ids_json, plan_id, summary, validator_verdict_json, created_at, updated_at, completed_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	_, err := s.db.Exec(q,
-		record.EpochID,
-		record.SessionID,
-		string(record.Status),
-		record.Reason,
-		encodeStringSliceJSON(record.WorkflowIDs),
-		encodeStringSliceJSON(record.DAGIDs),
-		encodeStringSliceJSON(record.TaskIDs),
-		record.PlanID,
-		record.Summary,
-		encodeJSONValue(record.ValidatorVerdict),
-		record.CreatedAt,
-		record.UpdatedAt,
-		record.CompletedAt,
-	)
-	if err != nil {
+	if err := s.db.RunInWriteTx(context.Background(), func(ctx context.Context, tx bun.Tx) error {
+		_, err := tx.ExecContext(ctx, q,
+			record.EpochID,
+			record.SessionID,
+			string(record.Status),
+			record.Reason,
+			encodeStringSliceJSON(record.WorkflowIDs),
+			encodeStringSliceJSON(record.DAGIDs),
+			encodeStringSliceJSON(record.TaskIDs),
+			record.PlanID,
+			record.Summary,
+			encodeJSONValue(record.ValidatorVerdict),
+			record.CreatedAt,
+			record.UpdatedAt,
+			record.CompletedAt,
+		)
+		return err
+	}); err != nil {
 		return fmt.Errorf("create validation epoch: %w", err)
 	}
 	return nil
@@ -110,20 +114,22 @@ func (s *Store) UpdateValidationEpoch(record *ValidationEpochRecord) error {
 	const q = `UPDATE validation_epochs
 		SET status = ?, reason = ?, workflow_ids_json = ?, dag_ids_json = ?, task_ids_json = ?, plan_id = ?, summary = ?, validator_verdict_json = ?, updated_at = ?, completed_at = ?
 		WHERE epoch_id = ?`
-	_, err := s.db.Exec(q,
-		string(record.Status),
-		record.Reason,
-		encodeStringSliceJSON(record.WorkflowIDs),
-		encodeStringSliceJSON(record.DAGIDs),
-		encodeStringSliceJSON(record.TaskIDs),
-		record.PlanID,
-		record.Summary,
-		encodeJSONValue(record.ValidatorVerdict),
-		record.UpdatedAt,
-		record.CompletedAt,
-		record.EpochID,
-	)
-	if err != nil {
+	if err := s.db.RunInWriteTx(context.Background(), func(ctx context.Context, tx bun.Tx) error {
+		_, err := tx.ExecContext(ctx, q,
+			string(record.Status),
+			record.Reason,
+			encodeStringSliceJSON(record.WorkflowIDs),
+			encodeStringSliceJSON(record.DAGIDs),
+			encodeStringSliceJSON(record.TaskIDs),
+			record.PlanID,
+			record.Summary,
+			encodeJSONValue(record.ValidatorVerdict),
+			record.UpdatedAt,
+			record.CompletedAt,
+			record.EpochID,
+		)
+		return err
+	}); err != nil {
 		return fmt.Errorf("update validation epoch: %w", err)
 	}
 	return nil
@@ -174,21 +180,23 @@ func (s *Store) CreateExecutionHold(record *ExecutionHoldRecord) error {
 	const q = `INSERT INTO execution_holds
 		(hold_id, session_id, epoch_id, remediation_case_id, status, reason, summary, created_by_agent_id, created_by_agent_type, released_at, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	_, err := s.db.Exec(q,
-		record.HoldID,
-		record.SessionID,
-		record.EpochID,
-		record.RemediationCaseID,
-		string(record.Status),
-		record.Reason,
-		record.Summary,
-		record.CreatedByAgentID,
-		record.CreatedByAgentType,
-		record.ReleasedAt,
-		record.CreatedAt,
-		record.UpdatedAt,
-	)
-	if err != nil {
+	if err := s.db.RunInWriteTx(context.Background(), func(ctx context.Context, tx bun.Tx) error {
+		_, err := tx.ExecContext(ctx, q,
+			record.HoldID,
+			record.SessionID,
+			record.EpochID,
+			record.RemediationCaseID,
+			string(record.Status),
+			record.Reason,
+			record.Summary,
+			record.CreatedByAgentID,
+			record.CreatedByAgentType,
+			record.ReleasedAt,
+			record.CreatedAt,
+			record.UpdatedAt,
+		)
+		return err
+	}); err != nil {
 		return fmt.Errorf("create execution hold: %w", err)
 	}
 	return nil
@@ -202,17 +210,19 @@ func (s *Store) UpdateExecutionHold(record *ExecutionHoldRecord) error {
 	const q = `UPDATE execution_holds
 		SET epoch_id = ?, remediation_case_id = ?, status = ?, reason = ?, summary = ?, released_at = ?, updated_at = ?
 		WHERE hold_id = ?`
-	_, err := s.db.Exec(q,
-		record.EpochID,
-		record.RemediationCaseID,
-		string(record.Status),
-		record.Reason,
-		record.Summary,
-		record.ReleasedAt,
-		record.UpdatedAt,
-		record.HoldID,
-	)
-	if err != nil {
+	if err := s.db.RunInWriteTx(context.Background(), func(ctx context.Context, tx bun.Tx) error {
+		_, err := tx.ExecContext(ctx, q,
+			record.EpochID,
+			record.RemediationCaseID,
+			string(record.Status),
+			record.Reason,
+			record.Summary,
+			record.ReleasedAt,
+			record.UpdatedAt,
+			record.HoldID,
+		)
+		return err
+	}); err != nil {
 		return fmt.Errorf("update execution hold: %w", err)
 	}
 	return nil
@@ -259,21 +269,23 @@ func (s *Store) CreateRemediationCase(record *RemediationCaseRecord) error {
 	const q = `INSERT INTO remediation_cases
 		(case_id, session_id, epoch_id, hold_id, plan_id, status, summary, request_json, result_json, created_at, updated_at, completed_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	_, err := s.db.Exec(q,
-		record.CaseID,
-		record.SessionID,
-		record.EpochID,
-		record.HoldID,
-		record.PlanID,
-		string(record.Status),
-		record.Summary,
-		encodeJSONValue(record.Request),
-		encodeJSONValue(record.Result),
-		record.CreatedAt,
-		record.UpdatedAt,
-		record.CompletedAt,
-	)
-	if err != nil {
+	if err := s.db.RunInWriteTx(context.Background(), func(ctx context.Context, tx bun.Tx) error {
+		_, err := tx.ExecContext(ctx, q,
+			record.CaseID,
+			record.SessionID,
+			record.EpochID,
+			record.HoldID,
+			record.PlanID,
+			string(record.Status),
+			record.Summary,
+			encodeJSONValue(record.Request),
+			encodeJSONValue(record.Result),
+			record.CreatedAt,
+			record.UpdatedAt,
+			record.CompletedAt,
+		)
+		return err
+	}); err != nil {
 		return fmt.Errorf("create remediation case: %w", err)
 	}
 	return nil
@@ -287,17 +299,19 @@ func (s *Store) UpdateRemediationCase(record *RemediationCaseRecord) error {
 	const q = `UPDATE remediation_cases
 		SET plan_id = ?, status = ?, summary = ?, request_json = ?, result_json = ?, updated_at = ?, completed_at = ?
 		WHERE case_id = ?`
-	_, err := s.db.Exec(q,
-		record.PlanID,
-		string(record.Status),
-		record.Summary,
-		encodeJSONValue(record.Request),
-		encodeJSONValue(record.Result),
-		record.UpdatedAt,
-		record.CompletedAt,
-		record.CaseID,
-	)
-	if err != nil {
+	if err := s.db.RunInWriteTx(context.Background(), func(ctx context.Context, tx bun.Tx) error {
+		_, err := tx.ExecContext(ctx, q,
+			record.PlanID,
+			string(record.Status),
+			record.Summary,
+			encodeJSONValue(record.Request),
+			encodeJSONValue(record.Result),
+			record.UpdatedAt,
+			record.CompletedAt,
+			record.CaseID,
+		)
+		return err
+	}); err != nil {
 		return fmt.Errorf("update remediation case: %w", err)
 	}
 	return nil

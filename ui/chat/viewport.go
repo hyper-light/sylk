@@ -514,13 +514,11 @@ type toggleTarget struct {
 	childToolCallIdx    int
 	childPath           []int
 	interAgentPath      []int
-	toolCallKey         string
-	toolCallName        string
-	toolCallArgsID      string
-	childID             string
-	childToolCallKey    string
-	childToolCallName   string
-	childToolCallArgsID string
+	toolCallKey       string
+	toolCallName      string
+	childID           string
+	childToolCallKey  string
+	childToolCallName string
 }
 
 func cloneToggleTarget(target *toggleTarget) *toggleTarget {
@@ -574,13 +572,12 @@ func cloneCopyTargets(targets []*CopyTarget) []*CopyTarget {
 
 func buildToolCallToggleTarget(entry *ChatEntry, entryIndex, toolCallIndex int, record ToolCallRecord) *toggleTarget {
 	return &toggleTarget{
-		entryID:        strings.TrimSpace(entry.ID),
-		entryIndex:     entryIndex,
-		kind:           toggleTargetToolCall,
-		toolCallIndex:  toolCallIndex,
-		toolCallKey:    strings.TrimSpace(record.ToolCallKey),
-		toolCallName:   strings.TrimSpace(record.ToolName),
-		toolCallArgsID: toolCallArgumentsIdentity(record.FullArgs, record.ArgsSummary),
+		entryID:       strings.TrimSpace(entry.ID),
+		entryIndex:    entryIndex,
+		kind:          toggleTargetToolCall,
+		toolCallIndex: toolCallIndex,
+		toolCallKey:   strings.TrimSpace(record.ToolCallKey),
+		toolCallName:  strings.TrimSpace(record.ToolName),
 	}
 }
 
@@ -628,7 +625,6 @@ func buildChildToolCallToggleTarget(
 	target.childID = strings.TrimSpace(child.CorrelationID)
 	target.childToolCallKey = strings.TrimSpace(childTool.ToolCallKey)
 	target.childToolCallName = strings.TrimSpace(childTool.ToolName)
-	target.childToolCallArgsID = toolCallArgumentsIdentity(childTool.FullArgs, childTool.ArgsSummary)
 	return target
 }
 

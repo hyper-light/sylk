@@ -22,7 +22,26 @@ const (
 	streamMetadataParentToolCallKey = "chat_parent_tool_call_key"
 	streamMetadataInterAgentThread  = "chat_inter_agent_thread_key"
 	streamMetadataInterAgentKind    = "chat_inter_agent_kind"
+	// streamMetadataOriginatorContinuation marks a routed request as the
+	// *continuation* of an earlier turn on the same originator agent — not a
+	// new top-level turn and not a nested child. Used when a challenge's
+	// response (e.g. tester validate_work → inspector) returns control to the
+	// originator, so the TUI resumes the originator's existing chat entry
+	// inline rather than creating a second entry for the same interaction.
+	streamMetadataOriginatorContinuation = "chat_continuation_of_correlation_id"
+
+	streamMetadataAgentType = "agent_type"
+	streamMetadataAgentName = "agent_name"
 )
+
+// streamAttributionKeys are metadata fields that describe the *publisher* of
+// a stream event. They must never be inherited from a forwarded caller —
+// WithForwardedStreamContext strips them, and each agent is required to
+// re-set them via WithOwnedStreamIdentity before emitting events.
+var streamAttributionKeys = [...]string{
+	streamMetadataAgentType,
+	streamMetadataAgentName,
+}
 
 // StreamContext carries streaming correlation data through context.
 type StreamContext struct {
@@ -79,6 +98,14 @@ func WithStreamContextMetadata(ctx context.Context, metadata map[string]any) con
 
 // WithForwardedStreamContext attaches stream routing identity for a forwarded
 // request and merges parent-correlation metadata needed by the chat UI.
+//
+// Attribution fields (agent_type, agent_name) are stripped from the inherited
+// metadata because they describe the *publisher* of a stream event, not the
+// routing path. Every agent must claim its own identity via
+// WithOwnedStreamIdentity before publishing. Without this strip, an agent
+// that forwards a request to another agent would see its chunks attributed
+// to the original caller in the TUI, because the TUI reads agent_type
+// directly from emitted metadata (ui/bridge/guide.go).
 func WithForwardedStreamContext(
 	ctx context.Context,
 	correlationID, sourceAgentID, parentCorrelationID string,
@@ -86,6 +113,12 @@ func WithForwardedStreamContext(
 ) context.Context {
 	ctx = WithStreamContext(ctx, correlationID, sourceAgentID)
 	merged := cloneStreamMetadata(metadata)
+	for _, key := range streamAttributionKeys {
+		if merged == nil {
+			break
+		}
+		delete(merged, key)
+	}
 	parentCorrelationID = strings.TrimSpace(parentCorrelationID)
 	if parentCorrelationID != "" {
 		if merged == nil {
@@ -97,6 +130,35 @@ func WithForwardedStreamContext(
 		} else {
 			merged[streamMetadataTopLevelTransfer] = true
 		}
+	}
+	return WithStreamContextMetadata(ctx, merged)
+}
+
+// WithOwnedStreamIdentity stamps the current agent's display identity into
+// stream metadata. Every call to publish a stream event (chunk, start,
+// complete, tool-call, progress) reads agent_type and agent_name from the
+// emitted metadata, so the agent that writes to the stream is the one that
+// must set them — inheriting them from the forwarder causes mis-attribution
+// in the TUI (e.g. orchestrator chunks rendered under an "Architect" header
+// when architect routed the plan handoff).
+//
+// Call this once at the top of handleBusRequest (after WithForwardedStreamContext,
+// which clears inherited attribution). Forgetting to call it is caught by
+// the TUI falling back to RespondingAgentID — attribution may be thin but
+// never wrong.
+func WithOwnedStreamIdentity(ctx context.Context, agentType, agentName string) context.Context {
+	agentType = strings.TrimSpace(agentType)
+	if agentType == "" {
+		return ctx
+	}
+	existing, _ := StreamMetadataFromContext(ctx)
+	merged := cloneStreamMetadata(existing.Metadata)
+	if merged == nil {
+		merged = make(map[string]any, 2)
+	}
+	merged[streamMetadataAgentType] = agentType
+	if agentName = strings.TrimSpace(agentName); agentName != "" {
+		merged[streamMetadataAgentName] = agentName
 	}
 	return WithStreamContextMetadata(ctx, merged)
 }
@@ -149,16 +211,49 @@ func streamLifecycleFromContext(ctx context.Context) *streamLifecycleState {
 }
 
 func publishWithStreamLifecycle(ctx context.Context, eventType guide.StreamEventType, publish func()) bool {
-	return publishWithLifecycleState(streamLifecycleFromContext(ctx), eventType, publish)
+	lifecycle := streamLifecycleFromContext(ctx)
+	delivered, lateBypass := publishWithLifecycleState(lifecycle, eventType, publish)
+	if lateBypass {
+		// Tool-call events whose Complete races the agent's StreamComplete
+		// (slow handler, callback-driven synthetic branch, request
+		// cancellation race) used to be silently dropped here, leaving the
+		// UI row stuck pending forever. Logging the bypass surfaces the
+		// rate so we can see whether the late-delivery path is healthy or
+		// hiding a regression.
+		if lm := LogMetaFromContext(ctx); lm.EventLogger != nil {
+			LogInfo(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+				"tool_call_event_after_stream_terminal", map[string]any{
+					"event_type": string(eventType),
+				})
+		}
+	}
+	return delivered
 }
 
-func publishWithLifecycleState(lifecycle *streamLifecycleState, eventType guide.StreamEventType, publish func()) bool {
+// publishWithLifecycleState gates a single stream-event publish against the
+// stream's terminal lifecycle. Returns (delivered, lateBypass):
+//   - delivered = true means publish was invoked.
+//   - lateBypass = true means publish was invoked despite terminalStarted being
+//     set, because the event type owns its own out-of-band lifecycle (currently
+//     only StreamEventToolCall). Callers can use this to log telemetry.
+//
+// The lifecycle gate exists to suppress late stream-content events (text
+// chunks, progress, thinking) so they cannot leak into the user's view after
+// StreamComplete finalizes the message. Tool-call events are categorically
+// different: they are metadata about side effects with their own Start/Complete
+// pairing identity (see toolCallEventKey), and a slow handler or async
+// inter-agent branch callback can legitimately deliver one after the parent
+// stream's text lifecycle has ended. Including them in the gate caused every
+// "tool completed but row stayed pending" bug we have hunted: the bytes never
+// reached the bus to begin with, so no producer-side or matcher-side patch
+// could close the row.
+func publishWithLifecycleState(lifecycle *streamLifecycleState, eventType guide.StreamEventType, publish func()) (delivered bool, lateBypass bool) {
 	if publish == nil {
-		return false
+		return false, false
 	}
 	if lifecycle == nil {
 		publish()
-		return true
+		return true, false
 	}
 
 	lifecycle.mu.Lock()
@@ -167,25 +262,36 @@ func publishWithLifecycleState(lifecycle *streamLifecycleState, eventType guide.
 	switch eventType {
 	case guide.StreamEventComplete:
 		if lifecycle.completed {
-			return false
+			return false, false
 		}
 		lifecycle.terminalStarted = true
 		lifecycle.completed = true
 		publish()
-		return true
+		return true, false
 	case guide.StreamEventError:
 		if lifecycle.completed {
-			return false
+			return false, false
 		}
 		lifecycle.terminalStarted = true
 		publish()
-		return true
+		return true, false
+	case guide.StreamEventToolCall:
+		// Bypass the terminal gate for tool-call events. They are out-of-band
+		// metadata, paired by toolCallEventKey, and dropping them after
+		// terminalStarted produces stuck-pending rows the UI cannot recover
+		// from. Both Start and Complete are bypassed symmetrically so that
+		// callback-driven synthetic branches (guardian approval responses,
+		// archivalist consults) can still open and close their rows after
+		// the parent stream finalizes.
+		late := lifecycle.terminalStarted
+		publish()
+		return true, late
 	default:
 		if lifecycle.terminalStarted {
-			return false
+			return false, false
 		}
 		publish()
-		return true
+		return true, false
 	}
 }
 
@@ -374,6 +480,56 @@ func RouteMetadataWithExplicitInterAgentBranch(
 		}
 	}
 	return applyInterAgentBranchMetadata(metadata, branch)
+}
+
+// RouteMetadataWithOriginatorContinuation stamps continuation lineage onto a
+// route request so the TUI resumes the originator's existing chat entry
+// inline instead of spawning a second top-level entry.
+//
+// Use for challenge-response returns: when the challenged agent answers via
+// validate_work, the routed request back to the originator carries this
+// metadata so the originator's post-validation work appends to the same
+// chat entry that contains its pre-challenge work + the nested challenge
+// row. Do NOT use for forward handoffs (handoff_next) that legitimately
+// transfer top-level ownership — those use RouteMetadataWithExplicitTopLevelTransfer.
+//
+// Two lineage pointers are stamped:
+//
+//   - chat_continuation_of_correlation_id → the originator (inspector) whose
+//     existing entry should be resumed inline.
+//   - chat_parent_correlation_id → the responder (tester) whose child stream
+//     is now resolved; the TUI uses this to settle the nested challenge row
+//     that was waiting for the response.
+//
+// Mutually exclusive with nested-branch and top-level-transfer; this helper
+// clears conflicting keys so exactly one routing intent reaches the UI.
+func RouteMetadataWithOriginatorContinuation(
+	ctx context.Context,
+	metadata map[string]any,
+	originatorCorrelationID string,
+	responderCorrelationID string,
+) map[string]any {
+	metadata = RouteMetadataWithTaskScope(ctx, metadata)
+	originatorCorrelationID = strings.TrimSpace(originatorCorrelationID)
+	if originatorCorrelationID == "" {
+		return metadata
+	}
+	cloned := cloneStreamMetadata(metadata)
+	if cloned == nil {
+		cloned = make(map[string]any, 3)
+	}
+	delete(cloned, streamMetadataNestedBranch)
+	delete(cloned, streamMetadataParentToolCallKey)
+	delete(cloned, streamMetadataInterAgentThread)
+	delete(cloned, streamMetadataInterAgentKind)
+	delete(cloned, streamMetadataTopLevelTransfer)
+	cloned[streamMetadataOriginatorContinuation] = originatorCorrelationID
+	if responderCorrelationID = strings.TrimSpace(responderCorrelationID); responderCorrelationID != "" {
+		cloned[streamMetadataParentCorrelation] = responderCorrelationID
+	} else {
+		cloned[streamMetadataParentCorrelation] = originatorCorrelationID
+	}
+	return cloned
 }
 
 // RouteMetadataWithExplicitTopLevelTransfer stamps explicit top-level transfer
@@ -812,7 +968,12 @@ func suppressIntermediateThinkingNarration(agentType string) bool {
 	}
 }
 
-// PublishStreamComplete emits a stream completion event.
+// PublishStreamComplete emits a stream completion event. Before publishing it
+// snapshots any tool calls whose Start has been emitted but whose Complete
+// has not, and logs each as a greppable orphan-detection event. The
+// (A) lifecycle bypass means a Complete may still arrive after this fires —
+// the log is informational ("this call was outstanding when the stream
+// terminated"), not a permanent assertion of loss.
 func PublishStreamComplete(
 	bus guide.EventBus,
 	channels *guide.AgentChannels,
@@ -820,6 +981,7 @@ func PublishStreamComplete(
 	agentID, text string,
 	usage *guide.StreamUsage,
 ) {
+	LogInFlightToolCallsAtTerminal(ctx, "stream_complete")
 	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
 		Type:      guide.StreamEventComplete,
 		Text:      text,
@@ -828,11 +990,14 @@ func PublishStreamComplete(
 	})
 }
 
-// PublishStreamError emits a stream error event.
+// PublishStreamError emits a stream error event. As with PublishStreamComplete
+// it snapshots in-flight tool calls first so a stuck call is observable in
+// the log even when the agent terminates abnormally.
 func PublishStreamError(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID string, err error) {
 	if err == nil {
 		return
 	}
+	LogInFlightToolCallsAtTerminal(ctx, "stream_error")
 	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
 		Type:      guide.StreamEventError,
 		Data:      map[string]string{"error": err.Error()},

@@ -787,6 +787,7 @@ func parseStreamStartMsg(sessionID, correlationID string, stream *guide.StreamRe
 	result.RuntimeAgentID = streamRuntimeAgentID(stream)
 	result.ParentCorrelationID = streamParentCorrelationID(stream)
 	result.TopLevelTransfer = streamTopLevelTransfer(stream)
+	result.ContinuationOfCorrelationID = streamMetadataString(stream, "chat_continuation_of_correlation_id")
 	result.AgentName = streamAgentName(stream)
 	result.AgentType = streamMetadataString(stream, "agent_type")
 	result.PipelineID = streamMetadataString(stream, "pipeline_id")

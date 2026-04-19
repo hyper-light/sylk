@@ -228,6 +228,58 @@ func TestCanonicalizeInterAgentToolName_GlobalReviewChallengeTargetsTester(t *te
 	}
 }
 
+// TestNormalizeInterAgentToolEventForEmit_PipelineChallengeRejectsOrchestratorTarget
+// reproduces the "challenges escape the pipeline" hang: a pipeline-inspector
+// challenge_agent call with target_agents=["orchestrator"] must NOT produce a
+// publishable inter-agent event, because the pipeline protocol rejects such
+// targets at the handler boundary. Without this filter the UI commits a
+// Challenge-kind row before the handler runs; the Challenge-kind status
+// lifecycle then keeps it rendering as pending forever.
+func TestNormalizeInterAgentToolEventForEmit_PipelineChallengeRejectsOrchestratorTarget(t *testing.T) {
+	meta := NormalizeInterAgentToolEventForEmit(
+		"challenge_agent",
+		`{"target_agents":["orchestrator"],"request":"Escalate workflow."}`,
+		"",
+		ToolCallStart,
+		false,
+		"",
+		nil,
+		map[string]any{
+			"agent_type":  "inspector-pipeline",
+			"pipeline_id": "task_1",
+		},
+	)
+	if meta != nil {
+		t.Fatalf("expected nil inter-agent metadata for invalid pipeline target, got %#v", meta)
+	}
+}
+
+// TestNormalizeInterAgentToolEventForEmit_PipelineChallengeFiltersInvalidAmongValid
+// ensures that a mixed target list (e.g. LLM asks for both orchestrator and
+// tester) drops orchestrator without emitting an "orchestrator" row — only
+// valid pipeline peers remain in AgentTypes.
+func TestNormalizeInterAgentToolEventForEmit_PipelineChallengeFiltersInvalidAmongValid(t *testing.T) {
+	meta := NormalizeInterAgentToolEventForEmit(
+		"challenge_agent",
+		`{"target_agents":["orchestrator","tester"],"request":"Audit plus escalate."}`,
+		"",
+		ToolCallStart,
+		false,
+		"",
+		nil,
+		map[string]any{
+			"agent_type":  "inspector-pipeline",
+			"pipeline_id": "task_1",
+		},
+	)
+	if meta == nil {
+		t.Fatal("expected inter-agent metadata for the valid subset of targets")
+	}
+	if got := meta.AgentTypes; len(got) != 1 || got[0] != "tester-pipeline" {
+		t.Fatalf("agent types = %#v, want [tester-pipeline] (orchestrator filtered)", got)
+	}
+}
+
 func TestDeriveInterAgentToolEvent_GenericGlobalReviewChallengeUsesGlobalThreadKey(t *testing.T) {
 	challenge := DeriveInterAgentToolEvent(
 		"challenge_agent",

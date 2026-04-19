@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
 // =============================================================================
@@ -124,19 +123,20 @@ type ClassifierClient interface {
 	New(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error)
 }
 
-// RealClassifierClient wraps the real Anthropic client
-type RealClassifierClient struct {
-	messages *anthropic.MessageService
-}
+// RealClassifierClient (raw anthropic.Client adapter) has been
+// removed. It bypassed the provider gateway and emitted no
+// accounting events. Callers that need an LLM-backed classifier
+// should use LLMClassifier (llm_classifier.go), which uses a
+// providers.ProviderAdapter wrapped by the gateway.
 
-// NewRealClassifierClient creates a wrapper around the real Anthropic client
-func NewRealClassifierClient(client *anthropic.Client) *RealClassifierClient {
-	return &RealClassifierClient{messages: &client.Messages}
-}
+// failingClassifierClient is the fallback ClassifierClient used by
+// NewWithAPIKey — it returns an auth error on every call so tests
+// that construct a Guide without a real provider observe the same
+// fast-fail behavior as the prior empty-api-key raw-client path.
+type failingClassifierClient struct{}
 
-// New calls the real Anthropic API
-func (r *RealClassifierClient) New(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error) {
-	return r.messages.New(ctx, params)
+func (failingClassifierClient) New(ctx context.Context, _ anthropic.MessageNewParams) (*anthropic.Message, error) {
+	return nil, fmt.Errorf("guide: classifier unavailable (NewWithAPIKey stub); use NewWithProvider for LLM-backed classification")
 }
 
 // Classifier handles LLM-based query classification
@@ -147,35 +147,18 @@ type Classifier struct {
 	corrections *correctionMemory
 }
 
-// NewClassifier creates a new classifier
-func NewClassifier(client *anthropic.Client, config RouterConfig) *Classifier {
-	return &Classifier{
-		client:      NewRealClassifierClient(client),
-		config:      config,
-		corrections: newCorrectionMemory(config.MaxCorrections),
-	}
-}
-
-// NewClassifierWithClient creates a new classifier with a custom client (for testing)
+// NewClassifierWithClient creates a new classifier with a custom
+// ClassifierClient. Used by tests with a rule-based or mock client.
+// The raw anthropic.Client construction paths (NewClassifier and
+// NewClassifierWithAPIKey) have been removed: they bypassed the
+// provider gateway and emitted no accounting events, violating the
+// single-dispatch invariant in docs/FIX_ID_AND_TOKENS.md. LLM-backed
+// classification now lives exclusively in LLMClassifier (see
+// llm_classifier.go) which uses a providers.ProviderAdapter wrapped
+// by the gateway.
 func NewClassifierWithClient(client ClassifierClient, config RouterConfig) *Classifier {
 	return &Classifier{
 		client:      client,
-		config:      config,
-		corrections: newCorrectionMemory(config.MaxCorrections),
-	}
-}
-
-// NewClassifierWithAPIKey creates a new classifier with an API key
-func NewClassifierWithAPIKey(apiKey string, config RouterConfig) *Classifier {
-	opts := []option.RequestOption{}
-	if apiKey != "" {
-		opts = append(opts, option.WithAPIKey(apiKey))
-	}
-	opts = append(opts, option.WithMaxRetries(0))
-	client := anthropic.NewClient(opts...)
-
-	return &Classifier{
-		client:      NewRealClassifierClient(&client),
 		config:      config,
 		corrections: newCorrectionMemory(config.MaxCorrections),
 	}

@@ -3,6 +3,8 @@ package timeout
 
 import (
 	"context"
+	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -22,6 +24,13 @@ type StreamingTimeoutMonitor struct {
 	errorCh chan error    // Signal timeout errors
 
 	mu sync.Mutex
+
+	// wg tracks the monitorTimeouts goroutine so Close() (or a deferred
+	// Wait) can deterministically observe its exit. The goroutine is
+	// bounded by totalCtx (which expires at config.TotalTimeout), but
+	// untracked fire-and-forget would let it outlive its owner during
+	// shutdown sequences.
+	wg sync.WaitGroup
 }
 
 // NewStreamingTimeoutMonitor creates monitor with TotalTimeout context.
@@ -37,9 +46,32 @@ func NewStreamingTimeoutMonitor(ctx context.Context, config StreamingTimeoutConf
 		errorCh:     make(chan error, 1),
 	}
 
-	go stm.monitorTimeouts()
+	stm.wg.Add(1)
+	go stm.runMonitor()
 
 	return stm
+}
+
+// runMonitor wraps monitorTimeouts with WaitGroup tracking + panic recovery.
+// A panic here would otherwise kill the anonymous goroutine silently,
+// leaving the owning stream without timeout enforcement.
+func (stm *StreamingTimeoutMonitor) runMonitor() {
+	defer stm.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Default().Error("streaming timeout monitor: panic recovered",
+				"panic", r,
+				"stack", string(debug.Stack()))
+			stm.sendError(ErrFirstTokenTimeout)
+		}
+	}()
+	stm.monitorTimeouts()
+}
+
+// Wait blocks until the monitor goroutine exits. Safe after Done() or when
+// totalCtx has expired. Intended for deterministic shutdown and tests.
+func (stm *StreamingTimeoutMonitor) Wait() {
+	stm.wg.Wait()
 }
 
 // monitorTimeouts runs the timeout detection logic.

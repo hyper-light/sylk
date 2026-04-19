@@ -21,6 +21,7 @@ func TestGuideRoute_FallsBackToGuideWhenTargetLacksIntentSupport(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -62,6 +63,7 @@ func TestGuideRoute_ExplicitTargetHonorsUserSelection(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -115,6 +117,7 @@ func TestGuideRoute_PromotesChatToHelpForSpecialistTarget(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -167,6 +170,7 @@ func TestGuideRoute_NormalizesAcademicIntentBeforeGuideFallback(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -219,6 +223,7 @@ func TestGuideRoute_CanonicalizesArchitectPlanningDomain(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -270,6 +275,7 @@ func TestGuideRoute_CanonicalizesLibrarianLocalDomain(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -321,6 +327,7 @@ func TestGuideRoute_CanonicalizesArchivalistHistoryDomain(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 

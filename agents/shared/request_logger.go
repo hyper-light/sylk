@@ -402,6 +402,26 @@ func LogWarning(el *agentlog.SessionEventLogger, agentID, sessionID, corrID, msg
 	})
 }
 
+// LogInfo records an informational event. Use for expected-but-noteworthy
+// operations that aren't errors (e.g. tool-call delivery after stream
+// terminal, recovery paths, late-arriving events).
+func LogInfo(el *agentlog.SessionEventLogger, agentID, sessionID, corrID, msg string, data map[string]any) {
+	if el == nil {
+		return
+	}
+
+	el.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     "info",
+		Agent:     agentID,
+		SessionID: sessionID,
+		Event:     msg,
+		EventCode: agentlog.EventSkillInvoked,
+		CorrID:    corrID,
+		Data:      data,
+	})
+}
+
 // LogStatusUpdate records an agent status change.
 func LogStatusUpdate(el *agentlog.SessionEventLogger, agentID, sessionID, status string) {
 	if el == nil {

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/openai/openai-go"
+	"google.golang.org/genai"
 )
 
 func TestFriendlyErrorMessage_Nil(t *testing.T) {
@@ -154,6 +156,162 @@ func TestParseError_NetOpErrorRetryable(t *testing.T) {
 	})
 	if !pe.Retryable {
 		t.Fatal("expected net.OpError to be retryable")
+	}
+}
+
+// ===== Google APIError path =====
+
+func TestParseError_GoogleRetryAfterFromDetails(t *testing.T) {
+	apiErr := genai.APIError{
+		Code:    429,
+		Status:  "RESOURCE_EXHAUSTED",
+		Message: "rate limit hit",
+		Details: []map[string]any{{
+			"@type":      "type.googleapis.com/google.rpc.RetryInfo",
+			"retryDelay": "7s",
+		}},
+	}
+	pe := NewProviderError(ProviderTypeGoogle, "generate", apiErr)
+	if pe.StatusCode != 429 {
+		t.Fatalf("expected status 429, got %d", pe.StatusCode)
+	}
+	if !pe.Retryable {
+		t.Fatal("expected 429 to be retryable")
+	}
+	if pe.RetryAfter != 7*time.Second {
+		t.Fatalf("expected RetryAfter=7s, got %v", pe.RetryAfter)
+	}
+}
+
+func TestParseError_GoogleRetryAfterFromMessage(t *testing.T) {
+	apiErr := genai.APIError{
+		Code:    429,
+		Status:  "RESOURCE_EXHAUSTED",
+		Message: "Your quota will reset after 42s.",
+	}
+	pe := NewProviderError(ProviderTypeGoogle, "generate", apiErr)
+	if pe.RetryAfter != 42*time.Second {
+		t.Fatalf("expected RetryAfter=42s from message, got %v", pe.RetryAfter)
+	}
+}
+
+func TestParseError_GoogleTerminalQuotaNotRetryable(t *testing.T) {
+	apiErr := genai.APIError{
+		Code:    429,
+		Status:  "RESOURCE_EXHAUSTED",
+		Message: "daily quota exceeded",
+		Details: []map[string]any{{
+			"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+			"violations": []any{
+				map[string]any{
+					"quotaId":    "GenerateRequestsPerDayPerProject",
+					"quotaMetric": "aiplatform.googleapis.com/generate_content_requests",
+				},
+			},
+		}},
+	}
+	pe := NewProviderError(ProviderTypeGoogle, "generate", apiErr)
+	if pe.Retryable {
+		t.Fatal("expected terminal quota to be non-retryable")
+	}
+}
+
+func TestParseError_GoogleServerError(t *testing.T) {
+	apiErr := genai.APIError{Code: 503, Status: "UNAVAILABLE", Message: "service unavailable"}
+	pe := NewProviderError(ProviderTypeGoogle, "generate", apiErr)
+	if pe.StatusCode != 503 {
+		t.Fatalf("expected status 503, got %d", pe.StatusCode)
+	}
+	if !pe.Retryable {
+		t.Fatal("expected 503 to be retryable")
+	}
+	if pe.RetryAfter != 0 {
+		t.Fatalf("expected zero RetryAfter without hint, got %v", pe.RetryAfter)
+	}
+}
+
+func TestParseError_GoogleNonAPIErrorFallsThrough(t *testing.T) {
+	pe := NewProviderError(ProviderTypeGoogle, "generate", errors.New("no api envelope"))
+	if pe.StatusCode != 0 {
+		t.Fatalf("expected status 0 for non-API error, got %d", pe.StatusCode)
+	}
+	if pe.Retryable {
+		t.Fatal("expected non-retryable for opaque error")
+	}
+}
+
+// ===== OpenAI Error path =====
+
+// testOpenAIError builds an *openai.Error with Response headers populated.
+func testOpenAIError(statusCode int, headers http.Header) *openai.Error {
+	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/responses", nil)
+	resp := &http.Response{StatusCode: statusCode, Header: headers, Request: req}
+	return &openai.Error{
+		StatusCode: statusCode,
+		Message:    "test failure",
+		Request:    req,
+		Response:   resp,
+	}
+}
+
+func TestParseError_OpenAIRetryAfterSeconds(t *testing.T) {
+	apiErr := testOpenAIError(429, http.Header{"Retry-After": []string{"12"}})
+	pe := NewProviderError(ProviderTypeOpenAI, "generate", apiErr)
+	if pe.StatusCode != 429 {
+		t.Fatalf("expected status 429, got %d", pe.StatusCode)
+	}
+	if !pe.Retryable {
+		t.Fatal("expected 429 to be retryable")
+	}
+	if pe.RetryAfter != 12*time.Second {
+		t.Fatalf("expected RetryAfter=12s, got %v", pe.RetryAfter)
+	}
+}
+
+func TestParseError_OpenAIRetryAfterMs(t *testing.T) {
+	apiErr := testOpenAIError(429, http.Header{"Retry-After-Ms": []string{"750"}})
+	pe := NewProviderError(ProviderTypeOpenAI, "generate", apiErr)
+	if pe.RetryAfter != 750*time.Millisecond {
+		t.Fatalf("expected RetryAfter=750ms, got %v", pe.RetryAfter)
+	}
+}
+
+func TestParseError_OpenAIServerError(t *testing.T) {
+	apiErr := testOpenAIError(503, http.Header{})
+	pe := NewProviderError(ProviderTypeOpenAI, "generate", apiErr)
+	if pe.StatusCode != 503 {
+		t.Fatalf("expected status 503, got %d", pe.StatusCode)
+	}
+	if !pe.Retryable {
+		t.Fatal("expected 503 to be retryable")
+	}
+	if pe.RetryAfter != 0 {
+		t.Fatalf("expected zero RetryAfter for bare 503, got %v", pe.RetryAfter)
+	}
+}
+
+func TestParseError_OpenAINon429NotRetryable(t *testing.T) {
+	apiErr := testOpenAIError(400, http.Header{})
+	pe := NewProviderError(ProviderTypeOpenAI, "generate", apiErr)
+	if pe.Retryable {
+		t.Fatal("expected 400 to be non-retryable")
+	}
+}
+
+// ===== Provider-route independence =====
+
+// TestParseError_ProviderTypeIsAdvisory verifies parseError classifies purely
+// by the underlying error's SDK type, not the provider label. A Google APIError
+// wrapped under ProviderTypeAnthropic (unrealistic but possible through the
+// gateway) must still extract Retry-After via the Google path.
+func TestParseError_ProviderTypeIsAdvisory(t *testing.T) {
+	apiErr := genai.APIError{
+		Code:    429,
+		Message: "Your quota will reset after 9s.",
+	}
+	pe := NewProviderError(ProviderTypeAnthropic, "forwarded", apiErr)
+	if pe.RetryAfter != 9*time.Second {
+		t.Fatalf("expected Google path to extract RetryAfter regardless of provider label, got %v", pe.RetryAfter)
 	}
 }
 

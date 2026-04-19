@@ -206,17 +206,56 @@ type PipelineProtocolRouteConfig struct {
 	PublishReroute func(context.Context, string, string, string)
 }
 
-type PipelineProtocolState struct {
-	mu             sync.RWMutex
-	sessionDir     string
-	scopeID        string
-	store          *durableProtocolLog
-	snapshot       *PipelineProtocolSnapshot
-	terminalAction *PipelineTurnAction
-	processed      []PipelineValidationProcessing
-	requiredAction PipelineProtocolActionType
-	requiredReason string
+// PipelineHandoffArtifactRef is a per-recipient verification artifact reference
+// queued by the tester's finalize_pipeline. Each entry encodes which artifact
+// the downstream recipient should consume, the source suite that produced it,
+// and the LLM-supplied narrative for that recipient. The tester finalize
+// populates one ref per target; handoff_next / validate_work consume them
+// during dispatch and clear them from the queue.
+type PipelineHandoffArtifactRef struct {
+	ArtifactID   string   `json:"artifact_id"`
+	Kind         string   `json:"kind,omitempty"`
+	Target       string   `json:"target"`
+	SuiteID      string   `json:"suite_id,omitempty"`
+	Summary      string   `json:"summary,omitempty"`
+	EvidenceRefs []string `json:"evidence_refs,omitempty"`
+	FailureFocus []string `json:"failure_focus,omitempty"`
 }
+
+// PipelineTesterFinalizeTargetSpec is the per-recipient input the tester
+// supplies when calling finalize_pipeline. The summary, evidence_refs, and
+// failure_focus reflect what the LLM determined is relevant to that specific
+// recipient — engineer-relevant failures and contracts go to engineer, etc.
+type PipelineTesterFinalizeTargetSpec struct {
+	Target       string   `json:"target"`
+	Summary      string   `json:"summary"`
+	EvidenceRefs []string `json:"evidence_refs,omitempty"`
+	FailureFocus []string `json:"failure_focus,omitempty"`
+}
+
+type PipelineProtocolState struct {
+	mu              sync.RWMutex
+	sessionDir      string
+	scopeID         string
+	store           *durableProtocolLog
+	snapshot        *PipelineProtocolSnapshot
+	terminalAction  *PipelineTurnAction
+	processed       []PipelineValidationProcessing
+	requiredAction  PipelineProtocolActionType
+	requiredReason  string
+	queuedArtifacts map[string]PipelineHandoffArtifactRef
+}
+
+// PipelineTesterFinalizeFn is the agent-supplied finalize callback. The tester
+// wires this to its publish-verification-artifact path. Returns one artifact
+// reference per requested target, in the same order as the input specs.
+type PipelineTesterFinalizeFn func(ctx context.Context, suiteID string, specs []PipelineTesterFinalizeTargetSpec) ([]PipelineHandoffArtifactRef, error)
+
+// PipelineTesterSuiteIDFn returns the identifier of the suite snapshot the
+// tester captured during the current turn, or empty string if no suite has
+// been run yet. Used by the finalize_pipeline skill for freshness and
+// no-repeat checks before invoking the publish callback.
+type PipelineTesterSuiteIDFn func() string
 
 type PipelineProtocolSkillConfig struct {
 	AgentType      func() string
@@ -224,6 +263,17 @@ type PipelineProtocolSkillConfig struct {
 	InspectorOT    bool
 	WorkspaceViews func() versioning.WorkspaceViewAccess
 	Route          PipelineProtocolRouteConfig
+	// TesterFinalize, when non-nil, opts the agent into the tester
+	// finalize_pipeline skill. The skill packages a per-recipient
+	// verification artifact for each target spec the LLM provides and
+	// queues the resulting refs in the protocol state for handoff_next /
+	// validate_work to consume during dispatch.
+	TesterFinalize PipelineTesterFinalizeFn
+	// TesterCurrentSuiteID returns the current turn's suite snapshot ID
+	// (empty when no run_test_suite has succeeded this turn). Required
+	// when TesterFinalize is set; the finalize handler uses it for
+	// freshness and no-repeat enforcement.
+	TesterCurrentSuiteID PipelineTesterSuiteIDFn
 }
 
 type pipelineProtocolStateKey struct{}
@@ -322,6 +372,66 @@ func (s *PipelineProtocolState) RequiredAction() (PipelineProtocolActionType, st
 	return s.requiredAction, strings.TrimSpace(s.requiredReason)
 }
 
+// QueuedArtifacts returns a snapshot of pending tester verification artifact
+// refs keyed by target. An empty map means no finalize_pipeline output is
+// awaiting a terminal handoff/validate consumption.
+func (s *PipelineProtocolState) QueuedArtifacts() map[string]PipelineHandoffArtifactRef {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return clonePipelineHandoffArtifactMap(s.queuedArtifacts)
+}
+
+// QueuedArtifactForTarget returns the queued ref for the named target, if any.
+func (s *PipelineProtocolState) QueuedArtifactForTarget(target string) (PipelineHandoffArtifactRef, bool) {
+	target = normalizePipelineAgentType(target)
+	if s == nil || target == "" {
+		return PipelineHandoffArtifactRef{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ref, ok := s.queuedArtifacts[target]
+	if !ok {
+		return PipelineHandoffArtifactRef{}, false
+	}
+	return cloneHandoffArtifactRef(ref), true
+}
+
+func clonePipelineHandoffArtifactMap(in map[string]PipelineHandoffArtifactRef) map[string]PipelineHandoffArtifactRef {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]PipelineHandoffArtifactRef, len(in))
+	for k, v := range in {
+		out[k] = cloneHandoffArtifactRef(v)
+	}
+	return out
+}
+
+func cloneHandoffArtifactRef(in PipelineHandoffArtifactRef) PipelineHandoffArtifactRef {
+	out := in
+	if len(in.EvidenceRefs) > 0 {
+		out.EvidenceRefs = append([]string(nil), in.EvidenceRefs...)
+	}
+	if len(in.FailureFocus) > 0 {
+		out.FailureFocus = append([]string(nil), in.FailureFocus...)
+	}
+	return out
+}
+
+func clonePipelineHandoffArtifactRefList(in []PipelineHandoffArtifactRef) []PipelineHandoffArtifactRef {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]PipelineHandoffArtifactRef, len(in))
+	for i, v := range in {
+		out[i] = cloneHandoffArtifactRef(v)
+	}
+	return out
+}
+
 func (s *PipelineProtocolState) Close() error {
 	if s == nil || s.store == nil {
 		return nil
@@ -346,6 +456,9 @@ func (s *PipelineProtocolState) setTerminalAction(action *PipelineTurnAction) er
 	if s.requiredAction != "" && action.Type != s.requiredAction {
 		return fmt.Errorf("%s", requiredPipelineActionMessageLocked(s.requiredAction, s.requiredReason))
 	}
+	if err := validateQueuedArtifactConsumptionLocked(s.queuedArtifacts, action); err != nil {
+		return err
+	}
 	if s.terminalAction != nil {
 		return fmt.Errorf("pipeline turn already selected %s", s.terminalAction.Type)
 	}
@@ -366,10 +479,79 @@ func (s *PipelineProtocolState) validateTerminalAction(action *PipelineTurnActio
 	if s.requiredAction != "" && action.Type != s.requiredAction {
 		return fmt.Errorf("%s", requiredPipelineActionMessageLocked(s.requiredAction, s.requiredReason))
 	}
+	if err := validateQueuedArtifactConsumptionLocked(s.queuedArtifacts, action); err != nil {
+		return err
+	}
 	if s.terminalAction != nil {
 		return fmt.Errorf("pipeline turn already selected %s", s.terminalAction.Type)
 	}
 	return nil
+}
+
+// validateQueuedArtifactConsumptionLocked enforces that when finalize_pipeline
+// has queued per-recipient verification artifacts, the only legal terminal
+// actions are handoff_next or validate_work and their target set must match
+// the queue exactly. Caller holds s.mu (read or write).
+func validateQueuedArtifactConsumptionLocked(queue map[string]PipelineHandoffArtifactRef, action *PipelineTurnAction) error {
+	if len(queue) == 0 || action == nil {
+		return nil
+	}
+	switch action.Type {
+	case PipelineProtocolActionHandoff:
+		if action.CreatesChallenge {
+			return fmt.Errorf("queued tester verification artifacts must be consumed via handoff_next, not via challenge_agent — invoke handoff_next now or call finalize_pipeline again with a fresh suite to overwrite the queue")
+		}
+		queueTargets := make([]string, 0, len(queue))
+		for target := range queue {
+			queueTargets = append(queueTargets, target)
+		}
+		actionTargets := make([]string, 0, len(action.TargetAgents))
+		for _, target := range action.TargetAgents {
+			actionTargets = append(actionTargets, normalizePipelineAgentType(target))
+		}
+		if !pipelineTargetSetsEqual(queueTargets, actionTargets) {
+			return fmt.Errorf("handoff_next target set %v does not match the finalized verification target set %v — finalize_pipeline for the missing recipients before handing off, or call finalize_pipeline with the new target set after running a fresh suite", actionTargets, queueTargets)
+		}
+	case PipelineProtocolActionValidate:
+		if action.Validation == nil {
+			return fmt.Errorf("validate_work missing validation record while queued tester artifacts are pending")
+		}
+		requestingAgent := normalizePipelineAgentType(action.Validation.RequestingAgent)
+		if requestingAgent == "" {
+			return fmt.Errorf("validate_work missing requesting agent identity while queued tester artifacts are pending")
+		}
+		if len(queue) != 1 {
+			return fmt.Errorf("validate_work consumes exactly one queued artifact; finalize_pipeline produced %d. When responding to a challenge, finalize for only the challenger", len(queue))
+		}
+		if _, ok := queue[requestingAgent]; !ok {
+			return fmt.Errorf("validate_work targets %q but queued verification artifact was finalized for a different recipient", requestingAgent)
+		}
+	default:
+		return fmt.Errorf("queued tester verification artifacts must be consumed via handoff_next or validate_work; %s is not a valid terminal action while artifacts are pending", action.Type)
+	}
+	return nil
+}
+
+func pipelineTargetSetsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, target := range a {
+		seen[target]++
+	}
+	for _, target := range b {
+		seen[target]--
+		if seen[target] < 0 {
+			return false
+		}
+	}
+	for _, count := range seen {
+		if count != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *PipelineProtocolState) addProcessedValidation(entry PipelineValidationProcessing) {
@@ -558,6 +740,9 @@ func PipelineProtocolSkills(cfg PipelineProtocolSkillConfig) []*skills.Skill {
 	if cfg.InspectorOT {
 		out = append(out, pipelineFinalizePipelineSkill(cfg), pipelineHandoffOTSkill(cfg))
 	}
+	if cfg.TesterFinalize != nil {
+		out = append(out, pipelineTesterFinalizePipelineSkill(cfg))
+	}
 	return out
 }
 
@@ -571,6 +756,7 @@ type pipelineTurnSelectionParams struct {
 }
 
 func pipelineChallengeAgentSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
+	targetEnum := pipelineChallengeTargetEnum(pipelineInvokerAgentType(cfg))
 	return skills.NewSkill("challenge_agent").
 		Description("Issue a targeted follow-up challenge when returned pipeline work is unclear, off-spec, incomplete, or otherwise needs direct response.").
 		Domain("pipeline").
@@ -580,7 +766,7 @@ func pipelineChallengeAgentSkill(cfg PipelineProtocolSkillConfig) *skills.Skill 
 		Satisfies("Creates an explicit targeted pipeline challenge and routes it to the challenged agent or cohort.").
 		Requirement("Do not re-challenge the same agent without fresh pipeline VFS evidence. Inspector may re-challenge Tester, Engineer, or Designer only after that target changed VFS since Inspector's previous challenge to that target. Tester, Engineer, and Designer may re-challenge each other only after the target changed VFS since the challenger's previous challenge. Tester, Engineer, and Designer may re-challenge Inspector only after the challenger changed VFS in response to Inspector's previous answer.").
 		Avoid("Do not use to advance the normal Inspector -> Tester -> Engineer/Designer -> Inspector phase flow, and do not use to ping the same pipeline agent again when the required side has not changed the pipeline VFS since the prior challenge on that directed pair.").
-		ArrayParam("target_agents", "Canonical target agents: inspector, tester, engineer, designer, inspector-pipeline, or tester-pipeline", "string", true).
+		EnumArrayParam("target_agents", "Target pipeline peers. Each entry must be one of the pipeline roles your agent is allowed to challenge.", "string", targetEnum, true).
 		EnumParam("mode", "single or cohort", []string{string(PipelineTurnModeSingle), string(PipelineTurnModeCohort)}, false).
 		StringParam("reason", "Why this challenge is necessary now", true).
 		StringParam("request", "The concrete challenge, assignment, or question for the target agent(s)", true).
@@ -597,6 +783,7 @@ func pipelineChallengeAgentSkill(cfg PipelineProtocolSkillConfig) *skills.Skill 
 }
 
 func pipelineHandoffNextSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
+	targetEnum := pipelineChallengeTargetEnum(pipelineInvokerAgentType(cfg))
 	return skills.NewSkill("handoff_next").
 		Description("Select the next active top-level pipeline owner for ordinary phase progression and state the concrete request they should satisfy.").
 		Domain("pipeline").
@@ -604,7 +791,7 @@ func pipelineHandoffNextSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 		Priority(100).
 		Usage("End the current pipeline turn by handing top-level ownership to the next agent or cohort with a concrete request, required output, and references. Use this for ordinary phase progression such as Inspector -> Tester for initial tests, Inspector -> Engineer/Designer for implementation, and returned top-level work back to Inspector. Do not use this when you are directly answering an active challenge; use `validate_work` instead.").
 		Satisfies("Records and dispatches the next top-level pipeline owner without hardcoding semantic stage transitions in the runtime.").
-		ArrayParam("target_agents", "Canonical target agents: inspector, tester, engineer, designer, inspector-pipeline, or tester-pipeline", "string", true).
+		EnumArrayParam("target_agents", "Next-owner pipeline roles. Each entry must be one of the pipeline peers your agent is allowed to hand off to.", "string", targetEnum, true).
 		EnumParam("mode", "single or cohort", []string{string(PipelineTurnModeSingle), string(PipelineTurnModeCohort)}, false).
 		StringParam("reason", "Why this handoff is the correct next move", true).
 		StringParam("request", "The concrete challenge, assignment, or question for the target agent(s)", true).
@@ -692,6 +879,25 @@ func issuePipelineTurnSelection(
 				"resume_conditions": append([]string(nil), refusal.ResumeConditions...),
 			}, nil
 		}
+		if refusal := pipelineIdenticalRequestRefusal(snapshot, agentType, targets, params.Request); refusal != nil {
+			action := &PipelineTurnAction{
+				Type:         PipelineProtocolActionRefusal,
+				AgentType:    agentType,
+				TargetAgents: append([]string(nil), targets...),
+				Summary:      refusal.Reason,
+			}
+			if err := state.setTerminalAction(action); err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"refused":           true,
+				"refused_by":        firstNonEmpty(strings.TrimSpace(refusal.RefusedBy), "pipeline-protocol"),
+				"agent_type":        agentType,
+				"reason":            refusal.Reason,
+				"must_wait":         true,
+				"resume_conditions": append([]string(nil), refusal.ResumeConditions...),
+			}, nil
+		}
 	}
 	action := &PipelineTurnAction{
 		Type:                 PipelineProtocolActionHandoff,
@@ -754,9 +960,37 @@ type pipelineDispatchSelection struct {
 	TargetAgentIDs []string
 }
 
+// pipelineProtocolRouteOptions is a tagged-union over the three valid
+// routing intents for a pipeline-protocol-dispatched task. Exactly one field
+// should be non-zero per call; leaving them all empty yields a plain task
+// route with no special UI framing. Mixing more than one is a caller bug —
+// the fields are applied in the order checked below but later ones clobber
+// earlier metadata keys, so the behavior is undefined for mixed inputs.
+//
+// Intent semantics:
+//
+//   - InterAgentBranch: the task is child work under a parent tool call
+//     (e.g. the challenge_agent dispatching work to the challenged agent).
+//     The TUI renders it as a nested row under the parent's tool call.
+//
+//   - ForwardHandoffParentCID: the task is a forward handoff that transfers
+//     top-level turn ownership to a peer (e.g. handoff_next). The TUI
+//     creates a new top-level entry for the recipient while preserving
+//     parent-correlation lineage.
+//
+//   - OriginatorContinuationCID: the task is a response returning to its
+//     originator so the originator can resume its own turn inline — NOT a
+//     new top-level entry, NOT nested child work. Used for challenge
+//     responses (validate_work → inspector) so the originator's
+//     post-response tool calls append to the same chat entry as its
+//     pre-challenge work. ResponderContinuationCID (optional) identifies
+//     the child whose response this is, so the TUI can settle the pending
+//     challenge row for that child.
 type pipelineProtocolRouteOptions struct {
-	InterAgentBranch                  *InterAgentBranchSpec
-	ExplicitTopLevelTransferParentCID string
+	InterAgentBranch          *InterAgentBranchSpec
+	ForwardHandoffParentCID   string
+	OriginatorContinuationCID string
+	ResponderContinuationCID  string
 }
 
 func pipelineTurnSelectionResult(agentType string, action *PipelineTurnAction, dispatch *pipelineDispatchSelection) map[string]any {
@@ -898,6 +1132,9 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 					pipelineValidationRouteOptions(ctx),
 				)
 				if err != nil {
+					return nil, err
+				}
+				if err := state.consumeQueuedArtifacts(ctx, []string{normalizePipelineAgentType(record.RequestingAgent)}); err != nil {
 					return nil, err
 				}
 				if err := state.recordValidation(ctx, record); err != nil {
@@ -1093,6 +1330,27 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 				}, nil
 			}
 
+			priorTesterAudits := priorTesterFinalizeAudits(state)
+			verificationRequest := finalizePipelineVerificationRequest(priorTesterAudits)
+			if refusal := pipelineIdenticalRequestRefusal(snapshot, agentType, []string{PipelineAgentTester}, verificationRequest); refusal != nil {
+				if err := state.setTerminalAction(&PipelineTurnAction{
+					Type:         PipelineProtocolActionRefusal,
+					AgentType:    agentType,
+					TargetAgents: []string{PipelineAgentTester},
+					Summary:      refusal.Reason,
+				}); err != nil {
+					return nil, err
+				}
+				return map[string]any{
+					"finalize_pipeline": false,
+					"refused":           true,
+					"refused_by":        firstNonEmpty(strings.TrimSpace(refusal.RefusedBy), "pipeline-protocol"),
+					"agent_type":        agentType,
+					"reason":            refusal.Reason,
+					"must_wait":         true,
+					"resume_conditions": append([]string(nil), refusal.ResumeConditions...),
+				}, nil
+			}
 			action := &PipelineTurnAction{
 				Type:             PipelineProtocolActionHandoff,
 				AgentType:        agentType,
@@ -1101,13 +1359,9 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 				AuditLockPhase:   PipelineAuditPhaseFinalizing,
 				TargetAgents:     []string{PipelineAgentTester},
 				Mode:             PipelineTurnModeSingle,
-				Reason:           "Run the inspector audit cycle before OT handoff.",
-				Request:          "Audit the Engineer and Designer outputs as quality production code, not excessive or agentic slop. Verify correctness, robustness, performance, scope discipline, and production quality, and penalize unrelated code, premature abstraction, or verbosity. Also verify that all required tests are implemented and passing and that the tests add real value rather than noisy or low-quality surface area.",
-				RequiredOutput: []string{
-					"State whether all required tests are implemented and passing.",
-					"Audit the engineer/designer implementation for correctness, robustness, performance, scope discipline, and production quality.",
-					"Call out any excessive code, premature abstraction, verbosity, low-value tests, or agentic slop that should force another cycle.",
-				},
+				Reason:           finalizePipelineVerificationReason(priorTesterAudits),
+				Request:          verificationRequest,
+				RequiredOutput:   finalizePipelineVerificationRequiredOutput(priorTesterAudits),
 				References:           append([]string{finalizePipelineVerificationReference}, evidenceRefs...),
 				WorkspaceFingerprint: pipelineChallengeFingerprint(challengeEvidence),
 			}
@@ -1221,6 +1475,239 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 		Build()
 }
 
+// pipelineTesterFinalizePipelineSkill is the tester analog of the inspector's
+// closure-gate finalize. It packages a per-recipient verification artifact for
+// each target the LLM lists and queues the resulting refs in protocol state
+// for handoff_next or validate_work to consume during dispatch. The skill is
+// registered only when cfg.TesterFinalize is set, and the handler hard-rejects
+// callers that aren't tester-pipeline.
+func pipelineTesterFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
+	return skills.NewSkill("finalize_pipeline").
+		Description("Package the per-recipient tester verification handoff artifact and lock the turn into handoff_next (or validate_work when answering an active challenge). Tester only.").
+		Domain("pipeline").
+		Keywords("finalize", "verification", "handoff", "tester", "pipeline").
+		Priority(100).
+		Usage("Use after run_test_suite when the turn is ready to hand verification work to one or more downstream recipients. Provide one targets entry per recipient (engineer, designer, or both); each entry carries the recipient-specific summary, evidence refs, and optional failure focus. The artifact references this returns are auto-attached to the next handoff_next or validate_work — you do not need to pass them again.").
+		Requirement("Requires that run_test_suite has produced a snapshot during this turn. The targets you list determine the only legal terminal action: a finalize for {engineer, designer} requires a cohort handoff_next to that exact set; a finalize for the challenger requires validate_work. Re-finalize is rejected unless a fresh run_test_suite has produced a new snapshot since the prior finalize.").
+		Avoid("Do not use as a substitute for handoff_next; this skill packages artifacts but does not route the turn. Do not finalize for a target you are not actually handing work to. Do not finalize twice for the same target without running a fresh suite first.").
+		ArrayObjectParam("targets", "Per-recipient verification specs. Provide one entry per recipient.",
+			map[string]*skills.Property{
+				"target": {
+					Type:        "string",
+					Description: "Canonical recipient agent type: engineer or designer (or inspector when answering an inspector challenge).",
+				},
+				"summary": {
+					Type:        "string",
+					Description: "What this recipient should know about the verification result and why it is relevant to their work.",
+				},
+				"evidence_refs": {
+					Type:        "array",
+					Description: "Files, tests, artifacts, or commands the recipient should inspect.",
+					Items:       &skills.Property{Type: "string"},
+				},
+				"failure_focus": {
+					Type:        "array",
+					Description: "Specific failing test names or failure indicators this recipient should prioritize. Optional.",
+					Items:       &skills.Property{Type: "string"},
+				},
+			},
+			[]string{"target", "summary"},
+			true,
+		).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Targets []PipelineTesterFinalizeTargetSpec `json:"targets"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			agentType := pipelineProtocolAgentType(ctx, cfg)
+			if agentType != PipelineAgentTester {
+				return nil, fmt.Errorf("finalize_pipeline (tester variant) is only permitted for the pipeline tester")
+			}
+			if cfg.TesterFinalize == nil {
+				return nil, fmt.Errorf("tester finalize callback not configured")
+			}
+			specs, err := normalizeTesterFinalizeSpecs(params.Targets)
+			if err != nil {
+				return nil, err
+			}
+			state := PipelineProtocolStateFromContext(ctx)
+			if state == nil {
+				return nil, fmt.Errorf("pipeline protocol state not available")
+			}
+			snapshot := state.Snapshot()
+			if snapshot != nil && snapshot.PendingChallenge != nil {
+				challenger := normalizePipelineAgentType(snapshot.PendingChallenge.RequestingAgent)
+				if challenger == "" {
+					return nil, fmt.Errorf("active challenge has no requesting agent identity")
+				}
+				if len(specs) != 1 || normalizePipelineAgentType(specs[0].Target) != challenger {
+					return nil, fmt.Errorf("a pending challenge from %q is awaiting your response — finalize_pipeline must list exactly one targets entry for %q so the verification artifact threads into validate_work", challenger, challenger)
+				}
+			} else if len(specs) > 1 {
+				if !pipelineFinalizeTargetsAreCohort(specs) {
+					return nil, fmt.Errorf("finalize_pipeline targets must be distinct downstream recipients")
+				}
+			}
+			suiteID := ""
+			if cfg.TesterCurrentSuiteID != nil {
+				suiteID = strings.TrimSpace(cfg.TesterCurrentSuiteID())
+			}
+			if suiteID == "" {
+				return nil, fmt.Errorf("run_test_suite must produce a snapshot during this turn before finalize_pipeline can package the verification artifact — run the suite (after write_test if needed) and call finalize_pipeline again")
+			}
+			existing := state.QueuedArtifacts()
+			for _, spec := range specs {
+				target := normalizePipelineAgentType(spec.Target)
+				if existing != nil {
+					if prior, ok := existing[target]; ok && strings.TrimSpace(prior.SuiteID) == suiteID {
+						return nil, fmt.Errorf("finalize_pipeline already published a verification artifact for %q from suite %s — run_test_suite again to capture fresh evidence before refinalizing for that recipient", target, suiteID)
+					}
+				}
+			}
+			refs, err := cfg.TesterFinalize(ctx, suiteID, specs)
+			if err != nil {
+				return nil, err
+			}
+			if len(refs) != len(specs) {
+				return nil, fmt.Errorf("tester finalize callback returned %d refs for %d specs", len(refs), len(specs))
+			}
+			normalized := make([]PipelineHandoffArtifactRef, len(refs))
+			for i, ref := range refs {
+				if strings.TrimSpace(ref.ArtifactID) == "" {
+					return nil, fmt.Errorf("tester finalize callback returned an empty artifact id for target %q", specs[i].Target)
+				}
+				ref.Target = normalizePipelineAgentType(specs[i].Target)
+				if ref.SuiteID == "" {
+					ref.SuiteID = suiteID
+				}
+				normalized[i] = ref
+			}
+			if err := state.recordTesterFinalize(ctx, normalized); err != nil {
+				return nil, err
+			}
+			result := map[string]any{
+				"finalize_pipeline":    true,
+				"agent_type":           agentType,
+				"suite_id":             suiteID,
+				"queued_targets":       collectTargets(normalized),
+				"queued_artifacts":     buildQueuedArtifactsResult(normalized),
+				"required_next_action": pipelineTesterRequiredNextAction(snapshot),
+			}
+			return result, nil
+		}).
+		Build()
+}
+
+func normalizeTesterFinalizeSpecs(in []PipelineTesterFinalizeTargetSpec) ([]PipelineTesterFinalizeTargetSpec, error) {
+	if len(in) == 0 {
+		return nil, fmt.Errorf("targets is required: provide at least one per-recipient verification spec")
+	}
+	out := make([]PipelineTesterFinalizeTargetSpec, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for i, spec := range in {
+		target := normalizePipelineAgentType(spec.Target)
+		if target == "" {
+			return nil, fmt.Errorf("targets[%d].target is required", i)
+		}
+		if target == PipelineAgentTester {
+			return nil, fmt.Errorf("targets[%d].target %q is invalid: the tester cannot finalize for itself", i, target)
+		}
+		if _, dup := seen[target]; dup {
+			return nil, fmt.Errorf("targets[%d].target %q is duplicated", i, target)
+		}
+		seen[target] = struct{}{}
+		summary := strings.TrimSpace(spec.Summary)
+		if summary == "" {
+			return nil, fmt.Errorf("targets[%d].summary is required", i)
+		}
+		out = append(out, PipelineTesterFinalizeTargetSpec{
+			Target:       target,
+			Summary:      summary,
+			EvidenceRefs: normalizeStringList(spec.EvidenceRefs),
+			FailureFocus: normalizeStringList(spec.FailureFocus),
+		})
+	}
+	return out, nil
+}
+
+func pipelineFinalizeTargetsAreCohort(specs []PipelineTesterFinalizeTargetSpec) bool {
+	for _, spec := range specs {
+		switch normalizePipelineAgentType(spec.Target) {
+		case PipelineAgentEngineer, PipelineAgentDesigner, PipelineAgentInspector:
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func pipelineTesterRequiredNextAction(snapshot *PipelineProtocolSnapshot) string {
+	if snapshot != nil && snapshot.PendingChallenge != nil {
+		return "validate_work"
+	}
+	return "handoff_next"
+}
+
+func collectTargets(refs []PipelineHandoffArtifactRef) []string {
+	out := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, normalizePipelineAgentType(ref.Target))
+	}
+	return out
+}
+
+func buildQueuedArtifactsResult(refs []PipelineHandoffArtifactRef) []map[string]any {
+	out := make([]map[string]any, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, pipelineHandoffArtifactRefMap(ref))
+	}
+	return out
+}
+
+// pipelineInvokerAgentType returns the invoker's role at skill-build time. Used
+// to bake a per-invoker Items.Enum into tools like challenge_agent /
+// handoff_next so the LLM cannot emit disallowed targets such as "orchestrator"
+// or the invoker itself.
+func pipelineInvokerAgentType(cfg PipelineProtocolSkillConfig) string {
+	if cfg.AgentType == nil {
+		return ""
+	}
+	return normalizePipelineAgentType(cfg.AgentType())
+}
+
+// pipelineChallengeTargetEnum returns the static list of pipeline peer
+// identifiers that the given invoker is allowed to name in target_agents.
+// Both the canonical form ("inspector-pipeline", "tester-pipeline") and the
+// short aliases ("inspector", "tester") are accepted, mirroring the
+// documentation the prompts use. The invoker itself is always excluded.
+func pipelineChallengeTargetEnum(invoker string) []string {
+	invokerNorm := normalizePipelineAgentType(invoker)
+	type pair struct {
+		canonical string
+		alias     string
+	}
+	all := []pair{
+		{PipelineAgentInspector, "inspector"},
+		{PipelineAgentTester, "tester"},
+		{PipelineAgentEngineer, ""},
+		{PipelineAgentDesigner, ""},
+	}
+	out := make([]string, 0, 6)
+	for _, p := range all {
+		if normalizePipelineAgentType(p.canonical) == invokerNorm {
+			continue
+		}
+		out = append(out, p.canonical)
+		if p.alias != "" {
+			out = append(out, p.alias)
+		}
+	}
+	return out
+}
+
 func pipelineProtocolAgentType(ctx context.Context, cfg PipelineProtocolSkillConfig) string {
 	if contract := TaskExecutionContractFromContext(ctx); contract != nil {
 		if agentType := normalizePipelineAgentType(contract.RuntimeAgentType); agentType != "" {
@@ -1273,7 +1760,12 @@ func normalizePipelineTargets(values []string) ([]string, error) {
 		switch target {
 		case PipelineAgentInspector, PipelineAgentTester, PipelineAgentEngineer, PipelineAgentDesigner:
 		default:
-			return nil, fmt.Errorf("unknown pipeline target agent %q", value)
+			return nil, fmt.Errorf(
+				"target agent %q is not a pipeline peer — pipeline challenge_agent and handoff_next only accept inspector-pipeline, tester-pipeline, engineer, or designer. "+
+					"Orchestrator, architect, and every other agent type are outside the pipeline protocol and cannot be challenged from inside a pipeline turn; "+
+					"if you need workflow or plan-level escalation, end the pipeline turn with the appropriate terminal action instead",
+				value,
+			)
 		}
 		if _, ok := seen[target]; ok {
 			continue
@@ -1417,8 +1909,11 @@ func dispatchPipelineProtocolTaskWithOptions(
 		branchCtx, branch = BeginInterAgentBranch(ctx, *options.InterAgentBranch)
 		metadata = branch.ApplyMetadata(branchCtx, metadata)
 	}
-	if parentCID := strings.TrimSpace(options.ExplicitTopLevelTransferParentCID); parentCID != "" {
+	if parentCID := strings.TrimSpace(options.ForwardHandoffParentCID); parentCID != "" {
 		metadata = RouteMetadataWithExplicitTopLevelTransfer(branchCtx, metadata, parentCID)
+	}
+	if originatorCID := strings.TrimSpace(options.OriginatorContinuationCID); originatorCID != "" {
+		metadata = RouteMetadataWithOriginatorContinuation(branchCtx, metadata, originatorCID, strings.TrimSpace(options.ResponderContinuationCID))
 	}
 	// Pipeline protocol streams should stay on the active requester channel
 	// (typically orchestrator) and let the task router own any user-visible
@@ -1486,16 +1981,34 @@ func pipelineChallengeRouteOptions(task *PipelineTaskInput, action *PipelineTurn
 	}
 }
 
+// pipelineValidationRouteOptions builds the dispatch options for a
+// validate_work response routed from the challenged agent back to the
+// originator (inspector). The originator should resume its existing chat
+// entry inline — the challenge is one interaction, not two — so this uses
+// the OriginatorContinuationCID intent rather than the forward-handoff
+// top-level-transfer intent.
+//
+// The originator's correlation is read from the tester ctx's branch
+// metadata (stamped by BeginInterAgentBranch on the outbound challenge
+// leg). The responder's correlation is the tester's current stream CID,
+// which the TUI uses to settle the originator's pending challenge row for
+// this specific child. When no branch metadata is present (legacy /
+// non-challenge paths) no continuation hint is emitted and the dispatch
+// falls back to a plain task route.
 func pipelineValidationRouteOptions(ctx context.Context) pipelineProtocolRouteOptions {
 	stream, ok := StreamMetadataFromContext(ctx)
 	if !ok {
 		return pipelineProtocolRouteOptions{}
 	}
-	parentCID := strings.TrimSpace(stream.CorrelationID)
-	if parentCID == "" {
+	originatorCID := strings.TrimSpace(pipelineTaskMetadataString(stream.Metadata, streamMetadataParentCorrelation))
+	if originatorCID == "" {
 		return pipelineProtocolRouteOptions{}
 	}
-	return pipelineProtocolRouteOptions{ExplicitTopLevelTransferParentCID: parentCID}
+	responderCID := strings.TrimSpace(stream.CorrelationID)
+	return pipelineProtocolRouteOptions{
+		OriginatorContinuationCID: originatorCID,
+		ResponderContinuationCID:  responderCID,
+	}
 }
 
 func pipelineChallengeToolName(action *PipelineTurnAction) string {
@@ -1527,6 +2040,7 @@ func dispatchPipelineHandoffSelection(
 		CorrelationIDs: make([]string, 0, len(tasks)),
 		TargetAgentIDs: make([]string, 0, len(tasks)),
 	}
+	dispatchedTargets := make([]string, 0, len(tasks))
 	for _, nextTask := range tasks {
 		correlationID, err := dispatchPipelineProtocolTaskWithOptions(
 			ctx,
@@ -1540,6 +2054,10 @@ func dispatchPipelineHandoffSelection(
 		}
 		dispatch.CorrelationIDs = append(dispatch.CorrelationIDs, correlationID)
 		dispatch.TargetAgentIDs = append(dispatch.TargetAgentIDs, strings.TrimSpace(nextTask.TargetAgentID))
+		dispatchedTargets = append(dispatchedTargets, normalizePipelineAgentType(nextTask.AgentType))
+	}
+	if err := state.consumeQueuedArtifacts(ctx, dispatchedTargets); err != nil {
+		return nil, err
 	}
 	return dispatch, nil
 }
@@ -1590,6 +2108,7 @@ func buildPipelineHandoffTasks(state *PipelineProtocolState, task *PipelineTaskI
 	snapshot := buildHandoffSnapshot(state, task, action)
 	stage := pipelineStageForAgents(action.TargetAgents)
 	nextTasks := make([]*PipelineTaskInput, 0, len(action.TargetAgents))
+	queue := state.QueuedArtifacts()
 	for _, rawTarget := range action.TargetAgents {
 		targetAgent := normalizePipelineAgentType(rawTarget)
 		next := clonePipelineTaskInput(task)
@@ -1600,9 +2119,35 @@ func buildPipelineHandoffTasks(state *PipelineProtocolState, task *PipelineTaskI
 		}
 		next.Context["pipeline_stage"] = stage
 		next.Context["pipeline_protocol"] = pipelineProtocolTaskSnapshotMap(snapshot)
+		if ref, ok := queue[targetAgent]; ok {
+			next.Context["verification_artifact_ref"] = pipelineHandoffArtifactRefMap(ref)
+		}
 		nextTasks = append(nextTasks, next)
 	}
 	return nextTasks, nil
+}
+
+func pipelineHandoffArtifactRefMap(ref PipelineHandoffArtifactRef) map[string]any {
+	out := map[string]any{
+		"artifact_id": strings.TrimSpace(ref.ArtifactID),
+		"target":      normalizePipelineAgentType(ref.Target),
+	}
+	if kind := strings.TrimSpace(ref.Kind); kind != "" {
+		out["kind"] = kind
+	}
+	if suite := strings.TrimSpace(ref.SuiteID); suite != "" {
+		out["suite_id"] = suite
+	}
+	if summary := strings.TrimSpace(ref.Summary); summary != "" {
+		out["summary"] = summary
+	}
+	if refs := normalizeStringList(ref.EvidenceRefs); len(refs) > 0 {
+		out["evidence_refs"] = refs
+	}
+	if focus := normalizeStringList(ref.FailureFocus); len(focus) > 0 {
+		out["failure_focus"] = focus
+	}
+	return out
 }
 
 func buildPipelineValidationTask(state *PipelineProtocolState, task *PipelineTaskInput, record *PipelineValidationRecord) (*PipelineTaskInput, error) {
@@ -1627,6 +2172,9 @@ func buildPipelineValidationTask(state *PipelineProtocolState, task *PipelineTas
 	}
 	next.Context["pipeline_stage"] = pipelineStageForAgents([]string{requestingAgent})
 	next.Context["pipeline_protocol"] = pipelineProtocolTaskSnapshotMap(buildValidationSnapshot(state, record))
+	if ref, ok := state.QueuedArtifactForTarget(requestingAgent); ok {
+		next.Context["verification_artifact_ref"] = pipelineHandoffArtifactRefMap(ref)
+	}
 	return next, nil
 }
 
@@ -1736,6 +2284,66 @@ func pipelineRepeatedChallengeRefusal(
 			"Use `inspect_workspace_state` or `summarize_workspace_state` to reconcile live disk, global, and pipeline state before retrying.",
 		},
 	}
+}
+
+// pipelineIdenticalRequestRefusal refuses a challenge whose request text is
+// byte-identical (after whitespace normalization) to a prior challenge from
+// the same requesting agent to the same target set earlier in this task's
+// protocol history. Protects against duplicate-text challenges regardless of
+// whether workspace state changed between rounds — the workspace-fingerprint
+// check already handles the "nothing changed" case; this check catches
+// "something changed but the new challenge asks the same question word-for-
+// word", which is the observed symptom when a hardcoded template re-fires.
+func pipelineIdenticalRequestRefusal(
+	snapshot *PipelineProtocolSnapshot,
+	requestingAgent string,
+	targets []string,
+	requestText string,
+) *pipelineChallengeRefusal {
+	normalized := normalizePipelineRequestText(requestText)
+	if snapshot == nil || normalized == "" {
+		return nil
+	}
+	requestingAgent = normalizePipelineAgentType(requestingAgent)
+	targetKey := pipelineProtocolTargetKey(targets)
+	if requestingAgent == "" || targetKey == "" {
+		return nil
+	}
+	for i := len(snapshot.RecentEvents) - 1; i >= 0; i-- {
+		event := snapshot.RecentEvents[i]
+		if !event.CreatesChallenge {
+			continue
+		}
+		if normalizePipelineAgentType(event.AgentType) != requestingAgent {
+			continue
+		}
+		if pipelineProtocolTargetKey(event.Targets) != targetKey {
+			continue
+		}
+		if normalizePipelineRequestText(event.Summary) != normalized {
+			continue
+		}
+		targetLabel := strings.Join(normalizeStringList(targets), ", ")
+		if strings.TrimSpace(targetLabel) == "" {
+			targetLabel = "the same target"
+		}
+		return &pipelineChallengeRefusal{
+			RefusedBy: "pipeline-protocol",
+			Reason: fmt.Sprintf(
+				"This is a byte-identical repeat of an earlier challenge to %s in this task. Challenges must either advance the request text with new focus or acknowledge resolution — do not re-issue the same template.",
+				targetLabel,
+			),
+			ResumeConditions: []string{
+				"Rewrite the request with concrete, new concerns (e.g., issues unresolved since the prior round, new evidence to validate).",
+				fmt.Sprintf("If no new concerns remain, accept the prior %s verdict via process_validation and proceed to the next protocol action instead of re-challenging.", targetLabel),
+			},
+		}
+	}
+	return nil
+}
+
+func normalizePipelineRequestText(text string) string {
+	return strings.Join(strings.Fields(text), " ")
 }
 
 func resolvePipelineChallengeEvidence(ctx context.Context, cfg PipelineProtocolSkillConfig) *pipelineChallengeEvidence {
@@ -2229,6 +2837,110 @@ func classifyFinalizePipelineValidationRecord(record *PipelineValidationRecord) 
 		return nil, false
 	}
 	return cloneValidationRecord(record), true
+}
+
+// priorTesterFinalizeAudits returns processed validations where the tester
+// responded to a prior finalize_pipeline-generated verification challenge.
+// Used to vary the outgoing challenge text across audit cycles so tester sees
+// context from prior rounds instead of an identical canned request.
+func priorTesterFinalizeAudits(state *PipelineProtocolState) []PipelineValidationProcessing {
+	if state == nil {
+		return nil
+	}
+	processed := state.ProcessedValidations()
+	out := make([]PipelineValidationProcessing, 0, len(processed))
+	for _, entry := range processed {
+		if entry.Validation == nil {
+			continue
+		}
+		if normalizePipelineAgentType(entry.Validation.RespondingAgent) != PipelineAgentTester {
+			continue
+		}
+		if !containsNormalizedString(entry.Validation.ChallengeReferences, finalizePipelineVerificationReference) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// finalizePipelineVerificationRequest builds the request text sent to tester
+// in a finalize_pipeline-generated audit challenge. On the first cycle this
+// is the canonical audit prompt. On subsequent cycles the text incorporates
+// the iteration number, prior tester verdicts, and inspector decisions so the
+// challenge carries continuity across rounds rather than repeating identical
+// text byte-for-byte.
+func finalizePipelineVerificationRequest(priors []PipelineValidationProcessing) string {
+	base := "Audit the Engineer and Designer outputs as quality production code, not excessive or agentic slop. Verify correctness, robustness, performance, scope discipline, and production quality, and penalize unrelated code, premature abstraction, or verbosity. Also verify that all required tests are implemented and passing and that the tests add real value rather than noisy or low-quality surface area."
+	if len(priors) == 0 {
+		return base
+	}
+	var b strings.Builder
+	b.WriteString(base)
+	b.WriteString(fmt.Sprintf("\n\nThis is re-audit cycle %d. Prior audit history on this pipeline task:", len(priors)+1))
+	for i, entry := range priors {
+		testerSummary := shortenFinalizeAuditSummary(priorTesterSummary(entry), 220)
+		inspectorDecision := strings.TrimSpace(string(entry.Decision))
+		inspectorSummary := shortenFinalizeAuditSummary(entry.Summary, 180)
+		b.WriteString(fmt.Sprintf("\n  Round %d:", i+1))
+		if testerSummary != "" {
+			b.WriteString("\n    - Tester verdict: " + testerSummary)
+		}
+		if inspectorDecision != "" || inspectorSummary != "" {
+			b.WriteString("\n    - Inspector decision: " + strings.TrimSpace(inspectorDecision+" — "+inspectorSummary))
+		}
+	}
+	b.WriteString("\n\nFocus this round on what changed since your previous verdict. Validate whether each unresolved concern from earlier rounds has been addressed by the new engineer/designer output, and flag any new concerns introduced by the latest changes. Do not restate resolved issues as if they are new.")
+	return b.String()
+}
+
+// finalizePipelineVerificationReason varies the audit-cycle reason so repeat
+// rounds are distinguishable in the protocol event stream.
+func finalizePipelineVerificationReason(priors []PipelineValidationProcessing) string {
+	if len(priors) == 0 {
+		return "Run the inspector audit cycle before OT handoff."
+	}
+	return fmt.Sprintf("Run re-audit cycle %d before OT handoff; prior rounds did not settle the pipeline for acceptance.", len(priors)+1)
+}
+
+// finalizePipelineVerificationRequiredOutput narrows the required deliverables
+// on re-audit rounds so tester responds to remaining concerns rather than
+// re-auditing settled criteria.
+func finalizePipelineVerificationRequiredOutput(priors []PipelineValidationProcessing) []string {
+	if len(priors) == 0 {
+		return []string{
+			"State whether all required tests are implemented and passing.",
+			"Audit the engineer/designer implementation for correctness, robustness, performance, scope discipline, and production quality.",
+			"Call out any excessive code, premature abstraction, verbosity, low-value tests, or agentic slop that should force another cycle.",
+		}
+	}
+	return []string{
+		"State whether all required tests are implemented and passing on this re-audit.",
+		"For each concern you raised in a prior round, state explicitly whether it is now resolved, still open, or superseded by newer evidence.",
+		"Call out any newly introduced excessive code, premature abstraction, verbosity, low-value tests, or agentic slop from the latest changes.",
+		fmt.Sprintf("If your verdict is unchanged from round %d, say so and cite the concrete reason the latest changes did not move the verdict.", len(priors)),
+	}
+}
+
+func priorTesterSummary(entry PipelineValidationProcessing) string {
+	if entry.Validation != nil {
+		if summary := strings.TrimSpace(entry.Validation.Summary); summary != "" {
+			return summary
+		}
+	}
+	return ""
+}
+
+func shortenFinalizeAuditSummary(text string, max int) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if text == "" || max <= 0 || len(text) <= max {
+		return text
+	}
+	cut := strings.LastIndex(text[:max], " ")
+	if cut <= 0 {
+		cut = max
+	}
+	return strings.TrimSpace(text[:cut]) + "…"
 }
 
 func finalizePipelineChallengePending(snapshot *PipelineProtocolSnapshot) bool {

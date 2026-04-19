@@ -47,6 +47,16 @@ type ToolCallRecord struct {
 	// InterAgent renders a compact tree row for consultations, challenges,
 	// responses, and validations instead of the generic tool-call block.
 	InterAgent *InterAgentTool
+
+	// OrphanedAtRender is a transient flag the renderer sets on a per-frame
+	// copy when the row has been pending for more than the orphan threshold
+	// AND the agent has emitted enough subsequent tool events to suggest the
+	// agent has moved on without seeing this call's Complete. The duration
+	// formatter swaps the live spinner for a `?` glyph so the user is not
+	// misled into thinking the tool is still genuinely running. This does
+	// NOT mutate the persisted row — `renderToolCalls` makes a local copy
+	// before stuffing the flag, so toggling is purely cosmetic.
+	OrphanedAtRender bool
 }
 
 type ToolCallSubregionKind string
@@ -105,13 +115,20 @@ type InterAgentChildActivity struct {
 // the active thinking block. AgentTypes are rendered in their normal colors.
 // Children capture the nested work performed by the consulted/challenged
 // agent so that the parent agent remains the sole top-level chat entry.
+//
+// RepeatCount tracks consecutive same-template emissions that the protocol
+// allowed through (e.g., audit-cycle repeats where targets + summary are
+// byte-identical to the prior row). RepeatCount==0 or 1 renders as a single
+// row; values ≥2 suffix the headline with "×N" so the pattern is visible
+// without spawning duplicate rows.
 type InterAgentTool struct {
-	Kind       InterAgentToolKind
-	ThreadKey  string
-	AgentTypes []string
-	Summary    string
-	Status     InterAgentToolStatus
-	Children   []InterAgentChildActivity
+	Kind        InterAgentToolKind
+	ThreadKey   string
+	AgentTypes  []string
+	Summary     string
+	Status      InterAgentToolStatus
+	Children    []InterAgentChildActivity
+	RepeatCount int
 }
 
 // ToolCallRegion describes a tool call block's position within rendered lines.
@@ -124,16 +141,25 @@ type ToolCallRegion struct {
 
 // ChatEntry represents a single message in the chat history.
 type ChatEntry struct {
-	ID            string
-	Timestamp     time.Time
-	CorrelationID string
-	Source        ChatSource
-	AgentType     string
-	AgentID       string
-	TaskID        string
-	TaskName      string
-	TaskSlug      string
-	SessionID     string
+	ID        string
+	Timestamp time.Time
+	// CorrelationID is the entry's primary stream identity, assigned at first
+	// stream. AdditionalCorrelationIDs holds CIDs of any subsequent streams
+	// that took over this entry (e.g., a top-level-transfer continuation
+	// after an inter-agent excursion). Lookups by either field resolve to
+	// this entry — necessary because tool-call Phase=1 events can arrive
+	// under the OLD CID after the entry has been resumed under a NEW CID;
+	// without multi-CID lookup those events strand and their spinners never
+	// clear.
+	CorrelationID            string
+	AdditionalCorrelationIDs []string
+	Source                   ChatSource
+	AgentType                string
+	AgentID                  string
+	TaskID                   string
+	TaskName                 string
+	TaskSlug                 string
+	SessionID                string
 	Content       string       // Raw content (markdown).
 	RenderedLines []string     // Cached rendered output lines (lazily computed).
 	CodeRegions   []CodeRegion // Cached code block positions (lazily computed).

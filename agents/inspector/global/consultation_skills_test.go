@@ -78,7 +78,7 @@ func TestLoadPlanContext_UsesLatestVersionedArchitectSnapshot(t *testing.T) {
 	writeSnapshot("plan-1_v1.3.json", map[string]any{"revision": 4, "status": "executing"})
 
 	gi := &GlobalInspector{
-		config: shared.GlobalInspectorConfig{SessionID: "sess-1"},
+		config: shared.GlobalInspectorConfig{Factory: newTestFactory(t), SessionID: "sess-1"},
 	}
 	content, source, resolvedPath, err := gi.loadPlanContext(context.Background(), "", "plan-1", "", "sess-1")
 	if err != nil {
@@ -113,7 +113,7 @@ func TestConsultAgent_FailedAcademicConsultMarksInterAgentBranchFailed(t *testin
 		bus:        bus,
 		channels:   guide.NewAgentChannels("inspector", "inspector-id"),
 		pendingBus: make(map[string]*pendingWait),
-		config:     shared.GlobalInspectorConfig{SessionID: "sess-1"},
+		config:     shared.GlobalInspectorConfig{Factory: newTestFactory(t), SessionID: "sess-1"},
 	}
 
 	respSub, err := bus.SubscribeAsync(gi.channels.Responses, gi.handleBusResponse)

@@ -337,6 +337,7 @@ func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 	bridges := []bridge.Bridge{
 		m.activityBridge,
 		m.tokenUsageBridge,
+		m.accountantBridge,
 		m.sessionBridge,
 		m.streamBridge,
 		m.guideBridge,

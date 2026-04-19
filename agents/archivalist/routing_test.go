@@ -6,7 +6,7 @@ import (
 )
 
 func TestArchivalistGetRoutingInfoUsesConfiguredAgentID(t *testing.T) {
-	a, err := New(context.Background(), Config{ID: "archivalist-custom"})
+	a, err := New(context.Background(), Config{ID: "archivalist-custom", Factory: newTestFactory(t)})
 	if err != nil {
 		t.Fatalf("new archivalist: %v", err)
 	}

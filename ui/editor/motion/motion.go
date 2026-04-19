@@ -213,7 +213,7 @@ func motionFirstNonBlank(buf *buffer.PieceTable, li *buffer.LineIndex, cursor, _
 	}
 	col := 0
 	for col < info.Length {
-		r := buf.RuneAt(info.StartPos + col)
+		r, _ := buf.RuneAt(info.StartPos + col)
 		if !unicode.IsSpace(r) {
 			break
 		}
@@ -367,9 +367,10 @@ func skipForward(buf *buffer.PieceTable, p, length int, bigWord, matchCurrent bo
 	if p >= length {
 		return p
 	}
-	startIsWord := isWordCharCheck(buf.RuneAt(p), bigWord)
+	rStart, _ := buf.RuneAt(p)
+	startIsWord := isWordCharCheck(rStart, bigWord)
 	for p < length {
-		r := buf.RuneAt(p)
+		r, _ := buf.RuneAt(p)
 		charIsWord := isWordCharCheck(r, bigWord)
 		if matchCurrent && charIsWord != startIsWord {
 			return p
@@ -386,9 +387,10 @@ func skipForwardToEnd(buf *buffer.PieceTable, p, length int, bigWord bool) int {
 	if p >= length {
 		return p
 	}
-	startIsWord := isWordCharCheck(buf.RuneAt(p), bigWord)
+	rStart, _ := buf.RuneAt(p)
+	startIsWord := isWordCharCheck(rStart, bigWord)
 	for p+1 < length {
-		next := buf.RuneAt(p + 1)
+		next, _ := buf.RuneAt(p + 1)
 		nextIsWord := isWordCharCheck(next, bigWord)
 		if nextIsWord != startIsWord || unicode.IsSpace(next) {
 			return p
@@ -402,9 +404,10 @@ func skipBackward(buf *buffer.PieceTable, p int, bigWord, matchCurrent bool) int
 	if p <= 0 {
 		return 0
 	}
-	startIsWord := isWordCharCheck(buf.RuneAt(p), bigWord)
+	rStart, _ := buf.RuneAt(p)
+	startIsWord := isWordCharCheck(rStart, bigWord)
 	for p > 0 {
-		prev := buf.RuneAt(p - 1)
+		prev, _ := buf.RuneAt(p - 1)
 		prevIsWord := isWordCharCheck(prev, bigWord)
 		if matchCurrent && prevIsWord != startIsWord {
 			return p
@@ -418,14 +421,22 @@ func skipBackward(buf *buffer.PieceTable, p int, bigWord, matchCurrent bool) int
 }
 
 func skipWhitespaceForward(buf *buffer.PieceTable, p, length int) int {
-	for p < length && unicode.IsSpace(buf.RuneAt(p)) {
+	for p < length {
+		r, _ := buf.RuneAt(p)
+		if !unicode.IsSpace(r) {
+			break
+		}
 		p++
 	}
 	return p
 }
 
 func skipWhitespaceBackward(buf *buffer.PieceTable, p int) int {
-	for p > 0 && unicode.IsSpace(buf.RuneAt(p)) {
+	for p > 0 {
+		r, _ := buf.RuneAt(p)
+		if !unicode.IsSpace(r) {
+			break
+		}
 		p--
 	}
 	return p

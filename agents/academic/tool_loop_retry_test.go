@@ -38,7 +38,7 @@ func (p *deadlineRetryProvider) RequestTimeout() time.Duration {
 
 func TestAcademicExecuteToolLoop_RetriesDeadlineExceededOnce(t *testing.T) {
 	provider := &deadlineRetryProvider{requestTimeout: 2 * time.Minute}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -108,7 +108,7 @@ func (p *nativeWebSearchStreamingProvider) Stream(_ context.Context, _ *provider
 }
 
 func TestAcademicExecuteToolLoop_StreamedNativeWebSearchDoesNotExecuteLocally(t *testing.T) {
-	a, err := New(Config{ID: "academic"}, &nativeWebSearchStreamingProvider{})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, &nativeWebSearchStreamingProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -178,7 +178,7 @@ func (p *delegatedFetchProvider) Complete(_ context.Context, _ *providers.Reques
 
 func TestAcademicExecuteToolLoop_DelegatedFetchReturnsUserMessage(t *testing.T) {
 	provider := &delegatedFetchProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -229,7 +229,7 @@ func (p *failedConsultThenAnswerProvider) Complete(_ context.Context, _ *provide
 
 func TestAcademicExecuteToolLoop_ConsultFailureReturnsStructuredToolResultAndContinues(t *testing.T) {
 	provider := &failedConsultThenAnswerProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -315,7 +315,7 @@ func (p *surfacedSearchResultProvider) Complete(_ context.Context, _ *providers.
 
 func TestAcademicExecuteToolLoop_AutoFetchesSurfacedNativeSearchResult(t *testing.T) {
 	provider := &surfacedSearchResultProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -387,7 +387,7 @@ func (p *surfacedOpenPageCallProvider) Complete(_ context.Context, _ *providers.
 
 func TestAcademicExecuteToolLoop_AutoFetchesSurfacedNativeOpenPageCall(t *testing.T) {
 	provider := &surfacedOpenPageCallProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -441,7 +441,7 @@ func (p *duplicateConsultProvider) Complete(_ context.Context, _ *providers.Requ
 
 func TestAcademicExecuteToolLoop_RepeatedToolBatchFailsFast(t *testing.T) {
 	provider := &duplicateConsultProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -501,7 +501,7 @@ func (p *researchPaperProvider) Complete(_ context.Context, _ *providers.Request
 
 func TestAcademicExecuteToolLoop_AuthorResearchPaperTerminatesRequiredConsultation(t *testing.T) {
 	provider := &researchPaperProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}

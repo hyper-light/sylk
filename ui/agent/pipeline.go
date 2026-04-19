@@ -77,67 +77,48 @@ const pipelineHeaderIndent = " \u2502  " // " │  "
 const variantPrefix = " \u2502  \u250a " // " │  ┊ "
 
 // renderPipelineRow renders a pipeline header row.
-// Layout: [indicator] [task-id] [status] [progress-bar] [loop/max]
+// Layout: [indicator] [task-id] [status]   [progress-bar] [loop/max]
+// The progress bar and counter are right-aligned; the task-id and status are
+// truncated as needed so the row always fits on a single line.
 // When activeColor is non-empty the indicator and task-id use the holographic
 // group color; the task-id additionally gets a ripple shimmer via anim.
 func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad *theme.Gradient, th *theme.Theme, selected bool, activeColor lipgloss.Color, anim AnimState, collapsed bool) string {
-	// Task ID — always bold, matching renderSectionHeader.
-	taskLabel := truncate(pipelineDisplayLabel(pl), 24)
-	var name string
-	if activeColor != "" && anim.Ripple {
-		hGrad := anim.RippleGrad
-		if selected && anim.HolographicGrad != nil {
-			hGrad = anim.HolographicGrad
-		}
-		if hGrad != nil {
-			name = "\x1b[1m" + theme.RenderRippleText(taskLabel, anim.Elapsed, hGrad, 0)
-		}
-	}
-	if name == "" {
-		nameStyle := lipgloss.NewStyle().Foreground(th.Palette.Primary).Bold(true)
-		if !selected {
-			nameStyle = lipgloss.NewStyle().Foreground(th.Palette.Muted).Bold(true)
-		}
-		name = nameStyle.Render(taskLabel)
-	}
-	statusText := truncate(pl.Status, 12)
 	prefixPlain := pipelineHeaderPrefix(collapsed)
 	prefix := renderTreePrefix(prefixPlain, activeColor, th)
 
-	// Status label.
 	statusStyle := lipgloss.NewStyle().Foreground(th.Palette.Subtext)
-	statusLabel := statusStyle.Render(statusText)
-
-	// Progress bar.
 	bar := renderProgressBar(pl.Status, elapsed, grad, th)
-
-	// Counter: real loop progress when available, otherwise phase progress.
 	loopStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	loopText := formatPipelineCounterLabel(pl.Status, pl.LoopCount, pl.MaxLoops)
 	loopLabel := loopStyle.Render(loopText)
+	rightWidth := progressBarCells + 1 + lipgloss.Width(loopText) // bar + space + counter
 
-	if shouldWrapPipelineRow(width, prefixPlain, taskLabel, statusText, loopText) {
-		wrappedTask, wrappedStatus := fitWrappedPipelineHeader(taskLabel, statusText, max(width-lipgloss.Width(prefixPlain), 0))
-		lineOne := prefix + renderPipelineTaskLabel(wrappedTask, name, selected, activeColor, anim, th)
-		if wrappedStatus != "" {
-			lineOne += " " + statusStyle.Render(wrappedStatus)
-		}
-		lineTwo := renderTreePrefix(pipelineContinuationPrefix(), activeColor, th) + bar + " " + loopLabel
-		return lineOne + "\n" + lineTwo
+	available := width - lipgloss.Width(prefixPlain) - rightWidth - 1
+	if available < 1 {
+		available = 1
 	}
 
-	return fmt.Sprintf("%s%s %s %s %s", prefix, name, statusLabel, bar, loopLabel)
+	taskLabel, statusText := fitPipelineHeaderInline(pipelineDisplayLabel(pl), pl.Status, available)
+	name := renderPipelineTaskLabel(taskLabel, "", selected, activeColor, anim, th)
+
+	leftPlainWidth := lipgloss.Width(taskLabel)
+	left := prefix + name
+	if statusText != "" {
+		left += " " + statusStyle.Render(statusText)
+		leftPlainWidth += 1 + lipgloss.Width(statusText)
+	}
+
+	pad := width - lipgloss.Width(prefixPlain) - leftPlainWidth - rightWidth
+	if pad < 1 {
+		pad = 1
+	}
+
+	return left + strings.Repeat(" ", pad) + bar + " " + loopLabel
 }
 
 func pipelineRowLineCount(pl *PipelineState, width int) int {
 	if pl == nil {
 		return 0
-	}
-	taskLabel := truncate(pipelineDisplayLabel(pl), 24)
-	statusText := truncate(pl.Status, 12)
-	loopText := formatPipelineCounterLabel(pl.Status, pl.LoopCount, pl.MaxLoops)
-	if shouldWrapPipelineRow(width, pipelineHeaderPrefix(false), taskLabel, statusText, loopText) {
-		return 2
 	}
 	return 1
 }
@@ -150,36 +131,41 @@ func pipelineHeaderPrefix(collapsed bool) string {
 	return pipelineHeaderIndent + marker + " "
 }
 
-func pipelineContinuationPrefix() string {
-	return pipelineHeaderIndent + "  "
-}
-
-func shouldWrapPipelineRow(width int, prefixPlain, taskLabel, statusText, loopText string) bool {
-	if width <= 0 {
-		return false
-	}
-	plain := taskLabel + " " + statusText + " " + strings.Repeat(pipelineProgressGlyph, progressBarCells) + " " + loopText
-	return lipgloss.Width(prefixPlain)+lipgloss.Width(plain) > width
-}
-
-func fitWrappedPipelineHeader(taskLabel, statusText string, maxWidth int) (string, string) {
-	if maxWidth <= 0 {
+// fitPipelineHeaderInline returns task label and status sized to fit
+// within available width (which excludes the prefix and the right-aligned
+// bar+counter). Status is shrunk before the task label, and dropped entirely
+// when there is not enough room to show it meaningfully.
+func fitPipelineHeaderInline(taskLabel, statusText string, available int) (string, string) {
+	if available <= 0 {
 		return "", ""
 	}
-	if statusText == "" {
-		return truncate(taskLabel, maxWidth), ""
+	task := truncate(taskLabel, min(24, available))
+	status := truncate(statusText, 12)
+
+	taskW := lipgloss.Width(task)
+	statusW := lipgloss.Width(status)
+	sep := 0
+	if statusW > 0 {
+		sep = 1
 	}
-	if lipgloss.Width(taskLabel+" "+statusText) <= maxWidth {
-		return taskLabel, statusText
+	if taskW+sep+statusW <= available {
+		return task, status
 	}
-	if lipgloss.Width(taskLabel) >= maxWidth {
-		return truncate(taskLabel, maxWidth), ""
+
+	if statusW > 0 {
+		minTaskBudget := min(taskW, max(6, available/2))
+		statusBudget := available - minTaskBudget - 1
+		if statusBudget >= 1 {
+			status = truncate(status, statusBudget)
+			statusW = lipgloss.Width(status)
+			taskBudget := available - statusW - 1
+			if taskBudget >= 1 {
+				return truncate(task, taskBudget), status
+			}
+		}
 	}
-	statusWidth := maxWidth - lipgloss.Width(taskLabel) - 1
-	if statusWidth <= 0 {
-		return taskLabel, ""
-	}
-	return taskLabel, truncate(statusText, statusWidth)
+
+	return truncate(task, available), ""
 }
 
 func renderPipelineTaskLabel(taskLabel, styledName string, selected bool, activeColor lipgloss.Color, anim AnimState, th *theme.Theme) string {

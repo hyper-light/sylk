@@ -8,8 +8,18 @@ import (
 )
 
 const (
-	globalReviewNamespace             = "global_review"
+	globalReviewNamespace = "global_review"
+	// globalReviewEventChallenge persists peer-targeted challenge selections
+	// (challenge_global_tester, challenge_architect, challenge_orchestrator,
+	// challenge_inspector). globalReviewEventHandoff persists Type=Handoff
+	// selections — including the audit-closure handoff issued by
+	// finalize_global_review which carries CreatesChallenge=true. Both kinds
+	// rebuild the snapshot through buildGlobalReviewSnapshotAfterChallenge,
+	// so replay produces the same projection regardless of which kind was
+	// recorded; the split exists so downstream code can distinguish the two
+	// classes of selection without looking at action.CreatesChallenge.
 	globalReviewEventChallenge        = "challenge_selected"
+	globalReviewEventHandoff          = "handoff_selected"
 	globalReviewEventValidation       = "validation_submitted"
 	globalReviewEventProcessed        = "validation_processed"
 	globalReviewEventReadyCheckpoint  = "ready_for_checkpoint"
@@ -57,6 +67,13 @@ func (s *GlobalReviewState) recordChallenge(ctx context.Context, action *GlobalR
 		return nil
 	}
 	return s.appendEvent(ctx, globalReviewEventChallenge, action)
+}
+
+func (s *GlobalReviewState) recordHandoff(ctx context.Context, action *GlobalReviewTurnAction) error {
+	if s == nil || action == nil {
+		return nil
+	}
+	return s.appendEvent(ctx, globalReviewEventHandoff, action)
 }
 
 func (s *GlobalReviewState) recordValidation(ctx context.Context, record *GlobalReviewValidationRecord) error {
@@ -177,7 +194,7 @@ func (s *GlobalReviewState) applyEvent(seq uint64, event *durableProtocolEvent) 
 		return nil
 	}
 	switch strings.TrimSpace(event.Kind) {
-	case globalReviewEventChallenge:
+	case globalReviewEventChallenge, globalReviewEventHandoff:
 		var action GlobalReviewTurnAction
 		if err := decodeProtocolPayload(event.Payload, &action); err != nil {
 			return err
@@ -245,6 +262,7 @@ func (s *GlobalReviewState) applyEvent(seq uint64, event *durableProtocolEvent) 
 		}
 		s.snapshot.ActiveAgents = nil
 		s.snapshot.CurrentRequest = ""
+		s.snapshot.AuditLock = nil
 		s.snapshot.PendingChallenge = nil
 		s.snapshot.PendingValidation = nil
 		appendGlobalReviewEvent(s.snapshot, GlobalReviewEvent{
@@ -264,6 +282,7 @@ func (s *GlobalReviewState) applyEvent(seq uint64, event *durableProtocolEvent) 
 		}
 		s.snapshot.ActiveAgents = nil
 		s.snapshot.CurrentRequest = ""
+		s.snapshot.AuditLock = nil
 		s.snapshot.PendingChallenge = nil
 		s.snapshot.PendingValidation = nil
 		appendGlobalReviewEvent(s.snapshot, GlobalReviewEvent{

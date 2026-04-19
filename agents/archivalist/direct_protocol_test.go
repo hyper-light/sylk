@@ -16,9 +16,9 @@ type captureArchivalistActivityPublisher struct {
 	events []*events.ActivityEvent
 }
 
-func (p *captureArchivalistActivityPublisher) PublishActivity(event *events.ActivityEvent) {
+func (p *captureArchivalistActivityPublisher) PublishActivity(event *events.ActivityEvent) error {
 	if event == nil {
-		return
+		return nil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -30,6 +30,7 @@ func (p *captureArchivalistActivityPublisher) PublishActivity(event *events.Acti
 		}
 	}
 	p.events = append(p.events, &clone)
+	return nil
 }
 
 func (p *captureArchivalistActivityPublisher) snapshot() []*events.ActivityEvent {

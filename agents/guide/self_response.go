@@ -324,17 +324,17 @@ func isGuideGreetingQuery(query string) bool {
 		return false
 	}
 
-	for _, token := range tokens {
-		if token == "hello" || token == "hi" || token == "hey" {
-			return true
-		}
+	// Greetings are conversational openers: only match when they lead the
+	// message. Otherwise "Let's create a toy python hello world cli app"
+	// would trip the "hello" token mid-message and short-circuit
+	// classification, blocking the request from being routed to an
+	// implementation agent.
+	switch tokens[0] {
+	case "hello", "hi", "hey":
+		return true
 	}
-
-	for i := 0; i+1 < len(tokens); i++ {
-		if tokens[i] != "good" {
-			continue
-		}
-		switch tokens[i+1] {
+	if len(tokens) >= 2 && tokens[0] == "good" {
+		switch tokens[1] {
 		case "morning", "afternoon", "evening":
 			return true
 		}

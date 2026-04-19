@@ -1,6 +1,8 @@
 package messaging
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -495,4 +497,160 @@ func TestPriority_String(t *testing.T) {
 			t.Errorf("expected %s, got %s", tc.expected, tc.priority.String())
 		}
 	}
+}
+
+// =============================================================================
+// W2 SCH-10 / SCH-11 / SCH-12 / SCH-13 / SCH-14
+// =============================================================================
+
+// TestMessage_AppendConfidence closes SCH-10 for the core envelope: the
+// ConfidenceChain is populated via the helper in chronological order.
+func TestMessage_AppendConfidence(t *testing.T) {
+	msg := NewWithSession(TypeRequest, "guide", "session-x", "hello")
+	msg.AppendConfidence("guide", 0.82, "intent=code-edit classifier=llm")
+	msg.AppendConfidence("architect", 0.95, "decomposed 3 tasks")
+
+	if len(msg.ConfidenceChain) != 2 {
+		t.Fatalf("want 2 entries, got %d", len(msg.ConfidenceChain))
+	}
+	if msg.ConfidenceChain[0].Agent != "guide" || msg.ConfidenceChain[0].Confidence != 0.82 {
+		t.Fatalf("unexpected first entry: %+v", msg.ConfidenceChain[0])
+	}
+	if msg.ConfidenceChain[1].Agent != "architect" {
+		t.Fatalf("unexpected second entry: %+v", msg.ConfidenceChain[1])
+	}
+	if msg.ConfidenceChain[0].At.IsZero() {
+		t.Fatalf("expected non-zero At on ConfidenceEntry")
+	}
+	if msg.ConfidenceChain[1].At.Before(msg.ConfidenceChain[0].At) {
+		t.Fatalf("second entry predates first")
+	}
+}
+
+// TestMessage_RerouteBookkeeping closes SCH-11 for the core envelope:
+// reroute hops accumulate and TooManyReroutes trips at the documented cap.
+func TestMessage_RerouteBookkeeping(t *testing.T) {
+	msg := NewWithSession(TypeRequest, "engineer", "session-reroute", "hello")
+
+	if msg.RerouteCount() != 0 {
+		t.Fatalf("fresh message should have zero reroutes, got %d", msg.RerouteCount())
+	}
+	if msg.TooManyReroutes() {
+		t.Fatal("fresh message should not be flagged TooManyReroutes")
+	}
+
+	for i := 0; i < MaxReroutesPerRequest; i++ {
+		msg.AppendReroute("engineer", "architect", "mis-classified")
+	}
+	if msg.RerouteCount() != MaxReroutesPerRequest {
+		t.Fatalf("want %d reroutes, got %d", MaxReroutesPerRequest, msg.RerouteCount())
+	}
+	if !msg.TooManyReroutes() {
+		t.Fatalf("should trip TooManyReroutes at the cap")
+	}
+	for _, hop := range msg.RerouteHistory {
+		if hop.At.IsZero() {
+			t.Fatal("RerouteHop.At must be set by AppendReroute")
+		}
+	}
+}
+
+// TestMessage_StructuredIntentValidation closes SCH-12: a nil intent is
+// tolerated, but any non-nil intent must have OriginalRequest + IntentType.
+func TestMessage_StructuredIntentValidation(t *testing.T) {
+	base := func() *Message[string] {
+		return NewWithSession(TypeRequest, "guide", "sess", "hi")
+	}
+
+	t.Run("NilIntentValid", func(t *testing.T) {
+		if err := base().Validate(); err != nil {
+			t.Fatalf("nil intent should validate, got %v", err)
+		}
+	})
+
+	t.Run("CompleteIntentValid", func(t *testing.T) {
+		msg := base()
+		msg.StructuredIntent = &StructuredIntent{OriginalRequest: "fix foo", IntentType: "code"}
+		if err := msg.Validate(); err != nil {
+			t.Fatalf("complete intent should validate, got %v", err)
+		}
+	})
+
+	t.Run("MissingOriginalRequest", func(t *testing.T) {
+		msg := base()
+		msg.StructuredIntent = &StructuredIntent{IntentType: "code"}
+		err := msg.Validate()
+		var verr *ValidationError
+		if !errors.As(err, &verr) || verr.Field != "structured_intent.original_request" {
+			t.Fatalf("want structured_intent.original_request error, got %v", err)
+		}
+	})
+
+	t.Run("MissingIntentType", func(t *testing.T) {
+		msg := base()
+		msg.StructuredIntent = &StructuredIntent{OriginalRequest: "fix"}
+		err := msg.Validate()
+		var verr *ValidationError
+		if !errors.As(err, &verr) || verr.Field != "structured_intent.intent_type" {
+			t.Fatalf("want structured_intent.intent_type error, got %v", err)
+		}
+	})
+}
+
+// TestMessage_SessionExemptTypes closes SCH-13: infrastructure signals
+// don't require a SessionID, whereas ordinary request/response types do.
+func TestMessage_SessionExemptTypes(t *testing.T) {
+	exempt := []MessageType{
+		TypeHeartbeat,
+		TypeAgentRegistered,
+		TypeAgentUnregistered,
+		TypeAgentReady,
+		TypeRouteLearned,
+	}
+	for _, mt := range exempt {
+		msg := New(mt, "src", "payload")
+		if err := msg.Validate(); err != nil {
+			t.Fatalf("exempt type %q should validate without SessionID: %v", mt, err)
+		}
+	}
+
+	msg := New(TypeRequest, "src", "payload")
+	err := msg.Validate()
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Field != "session_id" {
+		t.Fatalf("non-exempt type must require session_id; got %v", err)
+	}
+}
+
+// TestMessage_WithReplyTo closes SCH-14: the ReplyTo struct is present on
+// the envelope and enforces the observer-topic cap.
+func TestMessage_WithReplyTo(t *testing.T) {
+	msg := NewWithSession(TypeRequest, "src", "sess", "payload").
+		WithReplyTo("reply.primary", "observer.a", "observer.b")
+	if msg.ReplyTo == nil {
+		t.Fatal("ReplyTo must be non-nil")
+	}
+	if msg.ReplyTo.Topic != "reply.primary" {
+		t.Fatalf("Topic = %q; want reply.primary", msg.ReplyTo.Topic)
+	}
+	if len(msg.ReplyTo.ObserverTopics) != 2 {
+		t.Fatalf("ObserverTopics len = %d; want 2", len(msg.ReplyTo.ObserverTopics))
+	}
+
+	t.Run("DedupAndCap", func(t *testing.T) {
+		rt := &ReplyTo{Topic: "primary"}
+		rt.AddObserver("obs1")
+		if rt.AddObserver("obs1") {
+			t.Fatal("duplicate observer should be rejected")
+		}
+		for i := 0; i < maxReplyObserverTopics; i++ {
+			rt.AddObserver(fmt.Sprintf("obs%d", i+10))
+		}
+		if rt.AddObserver("overflow") {
+			t.Fatal("should reject observer beyond cap")
+		}
+		if len(rt.ObserverTopics) > maxReplyObserverTopics {
+			t.Fatalf("observer list exceeded cap: %d", len(rt.ObserverTopics))
+		}
+	})
 }

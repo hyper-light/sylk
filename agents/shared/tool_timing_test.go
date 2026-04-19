@@ -3,6 +3,7 @@ package shared
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ func TestWithToolCallEmitter_RoundTrip(t *testing.T) {
 	emitter := func(ev ToolCallEvent) { received = append(received, ev) }
 
 	ctx := WithToolCallEmitter(context.Background(), emitter)
-	EmitToolCall(ctx, ToolCallEvent{ToolName: "read_file", Phase: ToolCallStart})
+	EmitToolCall(ctx, ToolCallEvent{ToolCallKey: "tc-1", ToolName: "read_file", Phase: ToolCallStart})
 
 	if len(received) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(received))
@@ -25,11 +26,32 @@ func TestWithToolCallEmitter_RoundTrip(t *testing.T) {
 	if received[0].ToolName != "read_file" {
 		t.Errorf("expected tool_name=read_file, got %s", received[0].ToolName)
 	}
+	if received[0].ToolCallKey != "tc-1" {
+		t.Errorf("expected tool_call_key=tc-1, got %s", received[0].ToolCallKey)
+	}
 }
 
 func TestEmitToolCall_NilEmitter(t *testing.T) {
-	// Must not panic with a bare context.
-	EmitToolCall(context.Background(), ToolCallEvent{ToolName: "test"})
+	// Must not panic with a bare context (assuming event carries the required ID).
+	EmitToolCall(context.Background(), ToolCallEvent{ToolCallKey: "tc-nil", ToolName: "test"})
+}
+
+func TestEmitToolCall_PanicsOnEmptyToolCallKey(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on empty ToolCallKey; got none")
+		}
+	}()
+	EmitToolCall(context.Background(), ToolCallEvent{ToolName: "read_file", Phase: ToolCallStart})
+}
+
+func TestToolCallEventKey_PanicsOnEmptyID(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on empty call.ID; got none")
+		}
+	}()
+	_ = toolCallEventKey(providers.ToolCall{Name: "read_file"})
 }
 
 func TestEmitToolCall_AttachesStreamMetadata(t *testing.T) {
@@ -42,7 +64,7 @@ func TestEmitToolCall_AttachesStreamMetadata(t *testing.T) {
 	})
 	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { received = append(received, ev) })
 
-	EmitToolCall(ctx, ToolCallEvent{ToolName: "read_file", Phase: ToolCallStart})
+	EmitToolCall(ctx, ToolCallEvent{ToolCallKey: "tc-meta", ToolName: "read_file", Phase: ToolCallStart})
 
 	if len(received) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(received))
@@ -60,9 +82,10 @@ func TestEmitToolCall_NormalizesPartialInterAgentConsultStartMetadata(t *testing
 	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { received = append(received, ev) })
 
 	EmitToolCall(ctx, ToolCallEvent{
-		ToolName: "consult",
-		Phase:    ToolCallStart,
-		FullArgs: `{"mode":"single","target":"academic","query":"Assess the approach."}`,
+		ToolCallKey: "tc-consult",
+		ToolName:    "consult",
+		Phase:       ToolCallStart,
+		FullArgs:    `{"mode":"single","target":"academic","query":"Assess the approach."}`,
 		InterAgent: &InterAgentToolEvent{
 			Kind:   InterAgentToolEventKindConsult,
 			Status: InterAgentToolEventStatusPending,
@@ -220,7 +243,7 @@ func TestObserveProviderToolCallChunk_AnnouncesStartOnToolStartWhenIDIsKnown(t *
 	if events[0].Phase != ToolCallStart {
 		t.Fatalf("phase = %d, want start", events[0].Phase)
 	}
-	if got, want := events[0].ToolCallKey, "id:call-immediate"; got != want {
+	if got, want := events[0].ToolCallKey, "call-immediate"; got != want {
 		t.Fatalf("tool_call_key = %q, want %q", got, want)
 	}
 	if got, want := events[0].StartedAt, startedAt; !got.Equal(want) {
@@ -338,32 +361,34 @@ func TestObserveProviderToolCallChunk_GenericConsultCanPreannounceAtToolEndWhenA
 	}
 }
 
-func TestObserveProviderToolCallChunk_NoIDCanonicalizesArgsForCompletionMatch(t *testing.T) {
+func TestObserveProviderToolCallChunk_StreamedChunksShareIDKeyAcrossPhases(t *testing.T) {
 	var events []ToolCallEvent
 	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
 
 	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
 		Type: providers.ChunkTypeToolStart,
 		ToolCall: &providers.ToolCallChunk{
+			ID:   "call-stable",
 			Name: "read_file",
 		},
 	})
 	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
 		Type: providers.ChunkTypeToolDelta,
 		ToolCall: &providers.ToolCallChunk{
-			Name:           "read_file",
+			ID:             "call-stable",
 			ArgumentsDelta: `{"path":"README.md","line":1`,
 		},
 	})
 	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
 		Type: providers.ChunkTypeToolEnd,
 		ToolCall: &providers.ToolCallChunk{
-			Name:           "read_file",
+			ID:             "call-stable",
 			ArgumentsDelta: `}`,
 		},
 	})
 
 	call := providers.ToolCall{
+		ID:        "call-stable",
 		Name:      "read_file",
 		Arguments: "{\n  \"line\": 1,\n  \"path\": \"README.md\"\n}",
 	}
@@ -379,8 +404,8 @@ func TestObserveProviderToolCallChunk_NoIDCanonicalizesArgsForCompletionMatch(t 
 	if events[0].Phase != ToolCallStart || events[1].Phase != ToolCallComplete {
 		t.Fatalf("unexpected phases: %#v", events)
 	}
-	if events[0].ToolCallKey != events[1].ToolCallKey {
-		t.Fatalf("tool call keys differ: start=%q complete=%q", events[0].ToolCallKey, events[1].ToolCallKey)
+	if events[0].ToolCallKey != "call-stable" || events[1].ToolCallKey != "call-stable" {
+		t.Fatalf("tool call keys not equal to ID: start=%q complete=%q", events[0].ToolCallKey, events[1].ToolCallKey)
 	}
 }
 
@@ -495,7 +520,16 @@ func TestObserveProviderToolCallChunk_NativeWebSearchCompletesAtToolEndWithoutDu
 	}
 }
 
-func TestEmitToolCall_SuppressesLateEventsAfterStreamComplete(t *testing.T) {
+// TestEmitToolCall_DeliversLateEventsAfterStreamComplete inverts the historical
+// "suppresses late events" expectation: the stream-content terminal lifecycle
+// must NOT gate tool-call events. Tool calls have their own out-of-band
+// lifecycle (toolCallEventKey-paired Start/Complete) and a slow handler or
+// callback-driven synthetic branch can legitimately deliver one after the
+// agent's StreamComplete fires. Suppressing them here was the largest single
+// source of "tool completed but row stayed pending" reports we ever hunted —
+// no producer-side or matcher-side patch could close those rows because the
+// bytes never reached the bus to begin with.
+func TestEmitToolCall_DeliversLateEventsAfterStreamComplete(t *testing.T) {
 	var events []ToolCallEvent
 	ctx := WithStreamContext(context.Background(), "corr-complete", "tui")
 	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { events = append(events, ev) })
@@ -511,8 +545,11 @@ func TestEmitToolCall_SuppressesLateEventsAfterStreamComplete(t *testing.T) {
 		FullArgs:    `{"query":"late"}`,
 	})
 
-	if len(events) != 0 {
-		t.Fatalf("expected no late tool-call events after stream completion, got %#v", events)
+	if len(events) != 1 {
+		t.Fatalf("expected late tool-call event to reach the emitter, got %d events", len(events))
+	}
+	if events[0].ToolCallKey != "ws_late" {
+		t.Fatalf("late event ToolCallKey = %q, want ws_late", events[0].ToolCallKey)
 	}
 }
 
@@ -570,7 +607,7 @@ func TestTimedToolCall_WaitsWhilePaused(t *testing.T) {
 
 	started := make(chan struct{}, 1)
 	done := make(chan error, 1)
-	call := providers.ToolCall{Name: "read_file", Arguments: `{"path":"README.md"}`}
+	call := providers.ToolCall{ID: "paused-1", Name: "read_file", Arguments: `{"path":"README.md"}`}
 
 	go func() {
 		_, err := TimedToolCall(ctx, "engineer", call, func() (string, error) {
@@ -790,5 +827,218 @@ func TestPrettyPrintArgs_Empty(t *testing.T) {
 	}
 	if got := PrettyPrintArgs("{}"); got != "{}" {
 		t.Errorf("expected '{}', got %q", got)
+	}
+}
+
+// TestTimedToolCall_ReusesPinnedEventKeyFromPreannounce verifies that when the
+// streaming observer preannounces a Start event with a particular set of
+// accumulated arguments and the tool loop later assembles a slightly different
+// final argument string, the Complete event still pairs with the Start by
+// reusing the pinned EventKey. This is the generalization of the web_search
+// fix to any tool that routes through TimedToolCall — notably challenge_agent
+// and consult, whose `genericInterAgentToolRequiresResolvedArgs` gate delays
+// the preannounce until target_agents becomes parseable, after which later
+// argument deltas can still alter the args-derived key.
+func TestTimedToolCall_ReusesPinnedEventKeyFromPreannounce(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithStreamContext(context.Background(), "corr-tool-call", "tui")
+	ctx = WithStreamContextMetadata(ctx, map[string]any{
+		"agent_type":  "inspector-pipeline",
+		"pipeline_id": "task_1",
+	})
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { events = append(events, ev) })
+
+	preannounceArgs := `{"target_agents":["tester"],"reason":"need"}`
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolStart,
+		ToolCall: &providers.ToolCallChunk{
+			ID:   "call_1",
+			Name: "challenge_agent",
+		},
+	})
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolDelta,
+		ToolCall: &providers.ToolCallChunk{
+			ID:             "call_1",
+			Name:           "challenge_agent",
+			ArgumentsDelta: preannounceArgs,
+		},
+	})
+	if len(events) != 1 || events[0].Phase != ToolCallStart {
+		t.Fatalf("expected single ToolCallStart, got %d events", len(events))
+	}
+	startKey := events[0].ToolCallKey
+	if strings.TrimSpace(startKey) == "" {
+		t.Fatal("expected non-empty start ToolCallKey")
+	}
+
+	// The tool loop receives the assembled call with a longer argument payload
+	// (extra request field). Without pinning, toolCallEventKey(call) would
+	// derive a different signature than the preannounced Start.
+	call := providers.ToolCall{
+		ID:        "call_1",
+		Name:      "challenge_agent",
+		Arguments: `{"target_agents":["tester"],"reason":"need","request":"audit"}`,
+	}
+	_, _ = TimedToolCall(ctx, "inspector-pipeline", call, func() (string, error) {
+		return "", errors.New("unknown pipeline target agent \"foo\"")
+	})
+
+	if len(events) != 2 {
+		t.Fatalf("expected start + complete, got %d events", len(events))
+	}
+	if events[1].Phase != ToolCallComplete {
+		t.Fatalf("phase = %d, want ToolCallComplete", events[1].Phase)
+	}
+	if events[1].ToolCallKey != startKey {
+		t.Fatalf("complete ToolCallKey = %q, want pinned start key %q", events[1].ToolCallKey, startKey)
+	}
+	if events[1].Success {
+		t.Fatal("expected complete success=false after handler error")
+	}
+}
+
+// TestObserveProviderToolCallChunk_NativeWebSearchPairsStartAndEndDespiteArgDrift
+// reproduces the historical "academic web_search status=in_progress 7m33s" stuck
+// row: the provider streams the call's arguments with a lifecycle "status" field
+// that flips from in_progress to completed between Start and End. Without a
+// stable EventKey the ToolCallStart and ToolCallComplete events would carry
+// different ToolCallKey signatures and the UI matcher would never pair them.
+func TestObserveProviderToolCallChunk_NativeWebSearchPairsStartAndEndDespiteArgDrift(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithStreamContext(context.Background(), "corr-web-search", "tui")
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { events = append(events, ev) })
+
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolStart,
+		ToolCall: &providers.ToolCallChunk{
+			ID:             "ws_call_1",
+			Name:           "web_search",
+			Kind:           providers.ToolKindNativeWebSearch,
+			ArgumentsDelta: `{"action":"search","query":"sylk","status":"in_progress"}`,
+		},
+	})
+	if len(events) != 1 || events[0].Phase != ToolCallStart {
+		t.Fatalf("expected single ToolCallStart, got %d events", len(events))
+	}
+	if strings.TrimSpace(events[0].ToolCallKey) == "" {
+		t.Fatal("expected non-empty start ToolCallKey")
+	}
+	startKey := events[0].ToolCallKey
+
+	// Provider sends the End chunk with the lifecycle status flipped — the
+	// accumulated state.Arguments will now contain the in_progress JSON
+	// concatenated with the completed JSON. Without the EventKey pinning,
+	// toolCallEventKey would derive a different signature here.
+	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
+		Type: providers.ChunkTypeToolEnd,
+		ToolCall: &providers.ToolCallChunk{
+			ID:             "ws_call_1",
+			Name:           "web_search",
+			Kind:           providers.ToolKindNativeWebSearch,
+			ArgumentsDelta: `{"action":"search","query":"sylk","status":"completed"}`,
+		},
+	})
+
+	if len(events) != 2 {
+		t.Fatalf("expected start + complete, got %d events", len(events))
+	}
+	if events[1].Phase != ToolCallComplete {
+		t.Fatalf("phase = %d, want ToolCallComplete", events[1].Phase)
+	}
+	if events[1].ToolCallKey != startKey {
+		t.Fatalf("complete ToolCallKey = %q, want pinned start key %q", events[1].ToolCallKey, startKey)
+	}
+	if !events[1].Success {
+		t.Fatal("expected native web_search completion success=true")
+	}
+}
+
+// TestToolCallTracker_InFlightSnapshotReflectsStartCompletePairs verifies the
+// orphan-tracking surface used by (D). EmitToolCall records Start emissions
+// in tracker.inFlight; Complete emissions clear them. snapshotInFlight returns
+// only the unmatched Starts, sorted by StartedAt ascending so the oldest
+// (most-likely-stuck) calls appear first.
+func TestToolCallTracker_InFlightSnapshotReflectsStartCompletePairs(t *testing.T) {
+	emitter := func(ev ToolCallEvent) {}
+	ctx := WithToolCallEmitter(context.Background(), emitter)
+	tracker := toolCallTrackerFromContext(ctx)
+	if tracker == nil {
+		t.Fatal("expected tracker on ctx")
+	}
+
+	now := time.Now()
+	EmitToolCall(ctx, ToolCallEvent{
+		ToolCallKey: "tc-old",
+		ToolName:    "summarize_workspace_state",
+		Phase:       ToolCallStart,
+		StartedAt:   now.Add(-2 * time.Minute),
+	})
+	EmitToolCall(ctx, ToolCallEvent{
+		ToolCallKey: "tc-new",
+		ToolName:    "read_workspace_file",
+		Phase:       ToolCallStart,
+		StartedAt:   now.Add(-3 * time.Second),
+	})
+	EmitToolCall(ctx, ToolCallEvent{
+		ToolCallKey: "tc-paired",
+		ToolName:    "coord_query_view",
+		Phase:       ToolCallStart,
+		StartedAt:   now,
+	})
+	EmitToolCall(ctx, ToolCallEvent{
+		ToolCallKey: "tc-paired",
+		ToolName:    "coord_query_view",
+		Phase:       ToolCallComplete,
+		StartedAt:   now,
+	})
+
+	snapshot := tracker.snapshotInFlightToolCalls()
+	if len(snapshot) != 2 {
+		t.Fatalf("expected 2 in-flight calls (the paired one cleared), got %d: %#v", len(snapshot), snapshot)
+	}
+	if snapshot[0].ToolCallKey != "tc-old" {
+		t.Fatalf("oldest first: snapshot[0].ToolCallKey = %q, want tc-old", snapshot[0].ToolCallKey)
+	}
+	if snapshot[1].ToolCallKey != "tc-new" {
+		t.Fatalf("newer second: snapshot[1].ToolCallKey = %q, want tc-new", snapshot[1].ToolCallKey)
+	}
+}
+
+// TestToolCallTracker_LateCompleteClearsInFlight covers the (A)+(D) interaction:
+// a Complete event arriving after the parent stream's terminal lifecycle (which
+// (A) now allows through) must still drain the in-flight tracker so the orphan
+// log doesn't continue surfacing the same call after every subsequent
+// terminal event.
+func TestToolCallTracker_LateCompleteClearsInFlight(t *testing.T) {
+	emitter := func(ev ToolCallEvent) {}
+	ctx := WithStreamContext(context.Background(), "corr-late", "tui")
+	ctx = WithToolCallEmitter(ctx, emitter)
+	tracker := toolCallTrackerFromContext(ctx)
+
+	EmitToolCall(ctx, ToolCallEvent{
+		ToolCallKey: "tc-late",
+		ToolName:    "summarize_workspace_state",
+		Phase:       ToolCallStart,
+		StartedAt:   time.Now().Add(-30 * time.Second),
+	})
+
+	// Drive stream to terminal.
+	publishWithStreamLifecycle(ctx, guide.StreamEventComplete, func() {})
+
+	if got := len(tracker.snapshotInFlightToolCalls()); got != 1 {
+		t.Fatalf("expected 1 in-flight call before late Complete, got %d", got)
+	}
+
+	// Late Complete arrives after terminalStarted; (A) lets it through.
+	EmitToolCall(ctx, ToolCallEvent{
+		ToolCallKey: "tc-late",
+		ToolName:    "summarize_workspace_state",
+		Phase:       ToolCallComplete,
+		Success:     true,
+	})
+
+	if got := len(tracker.snapshotInFlightToolCalls()); got != 0 {
+		t.Fatalf("late Complete must clear in-flight entry, got %d remaining", got)
 	}
 }

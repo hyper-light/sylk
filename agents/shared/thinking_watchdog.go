@@ -193,7 +193,9 @@ func (pp *ProgressPublisher) publishEvent(event *guide.StreamEvent) {
 	}
 	publishWithLifecycleState(pp.lifecycle, event.Type, func() {
 		_ = pp.Bus.Publish(pp.Channels.Responses, msg)
-	})
+	}) // discard (delivered, lateBypass) — watchdog progress events are
+	// gated normally; tool-call bypass telemetry only matters at the
+	// publishWithStreamLifecycle entry point that has ctx for logging.
 }
 
 // CompleteWithWatchdog wraps a provider Complete call with a TTFT watchdog.

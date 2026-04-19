@@ -15,19 +15,26 @@ import (
 
 const testerVerificationArtifactTitle = "Tester Verification Handoff"
 
-func (pt *PipelineTester) publishVerificationArtifact(ctx context.Context, target string) (*coordination.Artifact, error) {
-	target = strings.TrimSpace(target)
+// publishVerificationArtifact packages the verification handoff for a single
+// downstream recipient and publishes it via the coordination client. The
+// recipient-specific summary, evidence_refs, and failure_focus shape what
+// that recipient sees in the artifact's recipient_view block; bulk evidence
+// (suite results, diagnoses, authored files) ships the same way for every
+// recipient because the workspace is the workspace.
+func (pt *PipelineTester) publishVerificationArtifact(ctx context.Context, spec agentshared.PipelineTesterFinalizeTargetSpec) (*coordination.Artifact, error) {
+	target := strings.TrimSpace(spec.Target)
 	if target == "" {
 		return nil, fmt.Errorf("verification handoff target is required")
 	}
-	input, err := pt.buildVerificationArtifactInput()
+	input, err := pt.buildVerificationArtifactInput(spec)
 	if err != nil {
 		return nil, err
 	}
 	return pt.coordinationClient().PublishArtifact(ctx, input)
 }
 
-func (pt *PipelineTester) buildVerificationArtifactInput() (coordination.PublishArtifactInput, error) {
+func (pt *PipelineTester) buildVerificationArtifactInput(spec agentshared.PipelineTesterFinalizeTargetSpec) (coordination.PublishArtifactInput, error) {
+	target := strings.TrimSpace(spec.Target)
 	task := pt.currentTaskSnapshot()
 	if task == nil {
 		return coordination.PublishArtifactInput{}, fmt.Errorf("tester task context unavailable")
@@ -71,6 +78,7 @@ func (pt *PipelineTester) buildVerificationArtifactInput() (coordination.Publish
 		"suite_result":        suite,
 		"failures":            suiteFailurePayloads(suite),
 		"diagnoses":           diagnoses,
+		"recipient_view":      buildRecipientView(spec, suite),
 	}
 	if harness != nil {
 		payload["harness"] = map[string]any{
@@ -83,19 +91,92 @@ func (pt *PipelineTester) buildVerificationArtifactInput() (coordination.Publish
 		}
 	}
 
+	recipientSummary := strings.TrimSpace(spec.Summary)
+	if recipientSummary == "" {
+		recipientSummary = buildVerificationArtifactSummary(suite, authoredFiles, diagnoses)
+	}
+
 	return coordination.PublishArtifactInput{
 		TaskID:              taskID,
 		TaskName:            pt.currentTaskName(),
 		Kind:                "verification_result",
-		Title:               testerVerificationArtifactTitle,
-		Summary:             buildVerificationArtifactSummary(suite, authoredFiles, diagnoses),
+		Title:               testerVerificationArtifactTitle + " for " + target,
+		Summary:             recipientSummary,
 		ScopeKind:           coordination.ScopeKindTestSurface,
 		ScopeKey:            taskID,
 		Payload:             payload,
-		Evidence:            buildVerificationEvidence(authoredFiles, diagnoses),
+		Evidence:            buildVerificationEvidence(authoredFiles, diagnoses, spec.EvidenceRefs),
 		UpstreamArtifactIDs: upstreamIDs,
-		IdempotencyKey:      testerVerificationArtifactID(taskID, suite),
+		IdempotencyKey:      testerVerificationArtifactID(taskID, suite, target),
 	}, nil
+}
+
+// buildRecipientView packages the LLM's per-target judgment — narrative,
+// evidence pointers, and the subset of failures the recipient should
+// prioritize — so each recipient sees a focused entry into the bulk evidence.
+func buildRecipientView(spec agentshared.PipelineTesterFinalizeTargetSpec, suite *tester.TestSuiteResult) map[string]any {
+	view := map[string]any{
+		"target":  strings.TrimSpace(spec.Target),
+		"summary": strings.TrimSpace(spec.Summary),
+	}
+	if refs := normalizeStringSliceForView(spec.EvidenceRefs); len(refs) > 0 {
+		view["evidence_refs"] = refs
+	}
+	focus := normalizeStringSliceForView(spec.FailureFocus)
+	if len(focus) > 0 {
+		view["failure_focus"] = focus
+		view["focused_failures"] = focusedFailures(suite, focus)
+	}
+	return view
+}
+
+func normalizeStringSliceForView(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+func focusedFailures(suite *tester.TestSuiteResult, focus []string) []map[string]any {
+	if suite == nil || len(focus) == 0 {
+		return nil
+	}
+	wanted := make(map[string]struct{}, len(focus))
+	for _, f := range focus {
+		wanted[strings.ToLower(strings.TrimSpace(f))] = struct{}{}
+	}
+	out := make([]map[string]any, 0)
+	for _, result := range suite.Results {
+		switch result.Status {
+		case tester.StatusFailed, tester.StatusError:
+		default:
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(result.Name))
+		if _, ok := wanted[name]; !ok {
+			continue
+		}
+		out = append(out, map[string]any{
+			"name":          strings.TrimSpace(result.Name),
+			"package":       strings.TrimSpace(result.Package),
+			"status":        result.Status,
+			"error_message": strings.TrimSpace(result.ErrorMessage),
+		})
+	}
+	return out
 }
 
 func buildVerificationArtifactSummary(
@@ -129,19 +210,24 @@ func buildVerificationArtifactSummary(
 	return strings.Join(parts, " ")
 }
 
-func testerVerificationArtifactID(taskID string, suite *tester.TestSuiteResult) string {
+func testerVerificationArtifactID(taskID string, suite *tester.TestSuiteResult, target string) string {
 	taskID = strings.TrimSpace(taskID)
+	target = strings.TrimSpace(target)
 	suiteID := ""
 	if suite != nil {
 		suiteID = strings.TrimSpace(suite.SuiteID)
 	}
-	if taskID == "" {
-		return "tester-verification-handoff"
+	parts := []string{"tester-verification-handoff"}
+	if taskID != "" {
+		parts = append(parts, taskID)
 	}
-	if suiteID == "" {
-		return "tester-verification-handoff:" + taskID
+	if suiteID != "" {
+		parts = append(parts, suiteID)
 	}
-	return "tester-verification-handoff:" + taskID + ":" + suiteID
+	if target != "" {
+		parts = append(parts, target)
+	}
+	return strings.Join(parts, ":")
 }
 
 func suiteFailurePayloads(suite *tester.TestSuiteResult) []map[string]any {
@@ -208,9 +294,9 @@ func relevantArtifactIDs(artifacts []map[string]any) []string {
 	return out
 }
 
-func buildVerificationEvidence(authoredFiles []string, diagnoses []*testershared.DiagnosisReport) []coordination.EvidenceRef {
+func buildVerificationEvidence(authoredFiles []string, diagnoses []*testershared.DiagnosisReport, recipientRefs []string) []coordination.EvidenceRef {
 	seen := make(map[string]struct{})
-	evidence := make([]coordination.EvidenceRef, 0, len(authoredFiles)+len(diagnoses))
+	evidence := make([]coordination.EvidenceRef, 0, len(authoredFiles)+len(diagnoses)+len(recipientRefs))
 	appendRef := func(kind, value string) {
 		value = strings.TrimSpace(value)
 		if value == "" {
@@ -233,6 +319,9 @@ func buildVerificationEvidence(authoredFiles []string, diagnoses []*testershared
 		for _, cause := range report.RootCauses {
 			appendRef("file", cause.File)
 		}
+	}
+	for _, ref := range recipientRefs {
+		appendRef("recipient_evidence", ref)
 	}
 	return evidence
 }

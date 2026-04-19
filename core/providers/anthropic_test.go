@@ -88,7 +88,7 @@ func TestAnthropicBuildParams_IncludesNativeWebSearchTool(t *testing.T) {
 	}
 }
 
-func TestAnthropicBuildParams_DisablesThinkingWhenMaxTokensTooSmall(t *testing.T) {
+func TestAnthropicBuildParams_AlwaysUsesAdaptiveThinking(t *testing.T) {
 	p := &AnthropicProvider{
 		config: AnthropicConfig{
 			BaseConfig: BaseConfig{
@@ -105,12 +105,19 @@ func TestAnthropicBuildParams_DisablesThinkingWhenMaxTokensTooSmall(t *testing.T
 	})
 
 	body := marshalAnthropicParams(t, params)
-	if thinking, ok := body["thinking"]; ok && thinking != nil {
-		t.Fatalf("thinking = %#v, want omitted/disabled for too-small max tokens", thinking)
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("thinking = %#v, want adaptive object", body["thinking"])
+	}
+	if got := thinking["type"]; got != "adaptive" {
+		t.Fatalf("thinking.type = %#v, want \"adaptive\"", got)
+	}
+	if _, leaked := thinking["budget_tokens"]; leaked {
+		t.Fatalf("adaptive thinking must not carry budget_tokens: %#v", thinking)
 	}
 }
 
-func TestAnthropicBuildParams_ClampsThinkingBudgetToMinimum(t *testing.T) {
+func TestAnthropicBuildParams_StampsOutputConfigEffortMax(t *testing.T) {
 	p := &AnthropicProvider{
 		config: AnthropicConfig{
 			BaseConfig: BaseConfig{
@@ -127,12 +134,12 @@ func TestAnthropicBuildParams_ClampsThinkingBudgetToMinimum(t *testing.T) {
 	})
 
 	body := marshalAnthropicParams(t, params)
-	thinking, ok := body["thinking"].(map[string]any)
+	outputCfg, ok := body["output_config"].(map[string]any)
 	if !ok {
-		t.Fatalf("thinking = %#v, want object", body["thinking"])
+		t.Fatalf("output_config = %#v, want object", body["output_config"])
 	}
-	if got := thinking["budget_tokens"]; got != float64(1024) {
-		t.Fatalf("thinking.budget_tokens = %#v, want 1024", got)
+	if got := outputCfg["effort"]; got != "max" {
+		t.Fatalf("output_config.effort = %#v, want \"max\"", got)
 	}
 }
 

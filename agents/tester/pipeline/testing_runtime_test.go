@@ -46,7 +46,7 @@ func TestPipelineTesterDetectHarness_SelectsGoAndDefaultOutput(t *testing.T) {
 	mustWriteTestFile(t, filepath.Join(root, "go.mod"), "module example.com/tester\n\ngo 1.24.0\n")
 	mustWriteTestFile(t, filepath.Join(root, "pkg/service/service.go"), "package service\n\nfunc Add(a, b int) int { return a + b }\n")
 
-	pt, err := New(testershared.PipelineTesterConfig{}, nil)
+	pt, err := New(testershared.PipelineTesterConfig{Factory: newTestFactory(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -319,8 +319,7 @@ func TestPipelineTesterVisibleSkills_IncludeHarnessAndReportingTools(t *testing.
 		"handoff_next",
 		"validate_work",
 		"process_validation",
-		"report_to_engineer",
-		"report_to_designer",
+		"finalize_pipeline",
 	} {
 		if !containsName(pipelineTesterVisibleSkillNames(), want) {
 			t.Fatalf("visible skills missing %q", want)
@@ -441,7 +440,7 @@ func TestPipelineTesterDetectHarness_SelectsPythonAndDefaultOutput(t *testing.T)
 	mustWriteTestFile(t, filepath.Join(root, "pyproject.toml"), "[project]\nname = \"tester\"\nversion = \"0.1.0\"\n")
 	mustWriteTestFile(t, filepath.Join(root, "app/service.py"), "def add(a, b):\n    return a + b\n")
 
-	pt, err := New(testershared.PipelineTesterConfig{}, nil)
+	pt, err := New(testershared.PipelineTesterConfig{Factory: newTestFactory(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -464,7 +463,7 @@ func TestPipelineTesterDetectHarness_SelectsGradleForKotlin(t *testing.T) {
 	mustWriteTestFile(t, filepath.Join(root, "build.gradle.kts"), "plugins { kotlin(\"jvm\") version \"2.1.0\" }\n")
 	mustWriteTestFile(t, filepath.Join(root, "src/main/kotlin/demo/Service.kt"), "package demo\nclass Service\n")
 
-	pt, err := New(testershared.PipelineTesterConfig{}, nil)
+	pt, err := New(testershared.PipelineTesterConfig{Factory: newTestFactory(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -487,7 +486,7 @@ func TestPipelineTesterDetectHarness_SelectsSBTForScala(t *testing.T) {
 	mustWriteTestFile(t, filepath.Join(root, "build.sbt"), "scalaVersion := \"3.6.2\"\n")
 	mustWriteTestFile(t, filepath.Join(root, "src/main/scala/demo/Service.scala"), "package demo\nclass Service\n")
 
-	pt, err := New(testershared.PipelineTesterConfig{}, nil)
+	pt, err := New(testershared.PipelineTesterConfig{Factory: newTestFactory(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -530,7 +529,7 @@ func newGoPipelineTesterWithVFS(t *testing.T) (*PipelineTester, context.Context,
 	}
 
 	fa := svfs.NewPipelineFileAccess(pipe)
-	pt, err := New(testershared.PipelineTesterConfig{}, nil)
+	pt, err := New(testershared.PipelineTesterConfig{Factory: newTestFactory(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -572,7 +571,7 @@ func newPythonPipelineTesterWithVFS(t *testing.T) (*PipelineTester, context.Cont
 	}
 
 	fa := svfs.NewPipelineFileAccess(pipe)
-	pt, err := New(testershared.PipelineTesterConfig{}, nil)
+	pt, err := New(testershared.PipelineTesterConfig{Factory: newTestFactory(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -639,7 +638,7 @@ func TestPipelineTesterPrepareHarnessRequiresWriteContexts(t *testing.T) {
 		t.Fatalf("BeginPipeline: %v", err)
 	}
 
-	pt, err := New(testershared.PipelineTesterConfig{}, nil)
+	pt, err := New(testershared.PipelineTesterConfig{Factory: newTestFactory(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

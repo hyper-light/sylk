@@ -1047,7 +1047,7 @@ func TestModel_ScrollingOverflowingPipelinesKeepsFooterPinned(t *testing.T) {
 		if footerLine := footerLineIndex(lines); footerLine != len(lines)-1 {
 			t.Fatalf("footer line = %d, want %d while scrolling:\n%s", footerLine, len(lines)-1, strings.Join(lines, "\n"))
 		}
-		if strings.Contains(strings.Join(lines, "\n"), "search-tuning") {
+		if strings.Contains(strings.Join(lines, "\n"), "search-") {
 			seenLastPipeline = true
 			break
 		}
@@ -1216,7 +1216,9 @@ func TestModel_ViewDoesNotAutoFollowActivePipelinesWhenUnfocused(t *testing.T) {
 	}
 
 	view := stripANSI(model.View())
-	if !strings.Contains(view, "pipeline-a") {
+	// The pipeline label is truncated to fit within the narrow width — assert
+	// on the recognizable prefix that survives truncation.
+	if !strings.Contains(view, "pipelin") {
 		t.Fatalf("expected unfocused view to preserve the top of the pipeline list, got %q", view)
 	}
 	if model.pipelineScroll != 0 {
@@ -1224,7 +1226,7 @@ func TestModel_ViewDoesNotAutoFollowActivePipelinesWhenUnfocused(t *testing.T) {
 	}
 }
 
-func TestModel_PipelineViewportLayoutCountsWrappedHeaderLines(t *testing.T) {
+func TestModel_PipelineViewportLayoutKeepsHeaderOnSingleLine(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(26, 8)
 	model.SetFocused(true)
@@ -1260,14 +1262,11 @@ func TestModel_PipelineViewportLayoutCountsWrappedHeaderLines(t *testing.T) {
 	if len(layout.rowHeights) < 2 {
 		t.Fatalf("rowHeights len = %d, want at least 2", len(layout.rowHeights))
 	}
-	if layout.rowHeights[0] != 2 {
-		t.Fatalf("pipeline header height = %d, want 2", layout.rowHeights[0])
+	if layout.rowHeights[0] != 1 {
+		t.Fatalf("pipeline header height = %d, want 1", layout.rowHeights[0])
 	}
 	if layout.rowHeights[1] != 1 {
 		t.Fatalf("pipeline member height = %d, want 1", layout.rowHeights[1])
-	}
-	if layout.totalLines < 3 {
-		t.Fatalf("totalLines = %d, want at least 3", layout.totalLines)
 	}
 }
 

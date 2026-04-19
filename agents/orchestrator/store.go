@@ -38,19 +38,25 @@ func DefaultStoreConfig(dbPath string) StoreConfig {
 	}
 }
 
-// OpenStore opens or creates the orchestrator SQLite database.
+// OpenStore opens or creates the orchestrator SQLite database. Pragma and
+// retry policy come from database.DefaultBunSQLiteConfig — only pool sizing
+// is overridden here. Without an explicit WriteRetryMax the orchestrator
+// previously got zero retries on SQLITE_BUSY, which (combined with the
+// historical DSN bug that dropped busy_timeout entirely) produced
+// sub-millisecond "database is locked" failures under coord_* bursts.
 func OpenStore(cfg StoreConfig) (*Store, error) {
-	db, err := database.OpenBunSQLite(database.BunSQLiteConfig{
-		Path:        cfg.Path,
-		MaxOpen:     cfg.MaxOpenConns,
-		MaxIdle:     cfg.MaxIdleConns,
-		MaxLifetime: cfg.ConnMaxLifetime,
-		BusyTimeout: 5 * time.Second,
-		EnableWAL:   true,
-		ForeignKeys: true,
-		CacheSize:   -2000,
-		Synchronous: "normal",
-	})
+	bunCfg := database.DefaultBunSQLiteConfig(cfg.Path)
+	if cfg.MaxOpenConns > 0 {
+		bunCfg.MaxOpen = cfg.MaxOpenConns
+	}
+	if cfg.MaxIdleConns > 0 {
+		bunCfg.MaxIdle = cfg.MaxIdleConns
+	}
+	if cfg.ConnMaxLifetime > 0 {
+		bunCfg.MaxLifetime = cfg.ConnMaxLifetime
+	}
+
+	db, err := database.OpenBunSQLite(bunCfg)
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator store: open: %w", err)
 	}

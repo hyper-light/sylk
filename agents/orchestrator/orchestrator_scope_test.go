@@ -16,7 +16,9 @@ func TestNew_WithSylkDir_ConfiguresLongLivedBackgroundScope(t *testing.T) {
 		t.Fatalf("Init() error = %v", err)
 	}
 
-	o, err := New(DefaultConfig(), nil, nil, sd)
+	cfg := DefaultConfig()
+	cfg.Factory = newTestFactory(t)
+	o, err := New(cfg, nil, nil, sd)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

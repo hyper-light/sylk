@@ -41,6 +41,26 @@ const (
 	GlobalReviewActionCommit    GlobalReviewActionType = "commit_to_disk"
 )
 
+// GlobalReviewAuditPhase* are the phases the global inspector can enter that
+// block peer → inspector challenges. Mirrors PipelineAuditPhase* on the
+// pipeline side: once the inspector has called finalize_global_review (which
+// dispatches the tester-backed closure challenge), peers cannot bounce the
+// inspector back into mid-cycle audit work. The lock is one-way — the
+// inspector can still issue challenges to peers during this window.
+const (
+	GlobalReviewAuditPhaseFinalizing = "finalize_global_review"
+	GlobalReviewAuditPhaseCommit     = "commit_to_disk"
+)
+
+// finalizeGlobalReviewVerificationReference marks the inspector → tester
+// audit-closure leg of finalize_global_review. Mirrors
+// finalizePipelineVerificationReference on the pipeline side. The marker is
+// the single load-bearing token: the wire tool name resolver, the responder
+// prompt branch, and the pending-challenge classifier all key off it to
+// distinguish the closure-round handoff from an ordinary peer-targeted
+// challenge_global_tester invocation.
+const finalizeGlobalReviewVerificationReference = "finalize_global_review_verification"
+
 type GlobalReviewValidationStatus string
 
 const (
@@ -96,6 +116,16 @@ type GlobalReviewEvent struct {
 	Summary            string `json:"summary,omitempty"`
 	StateFingerprint   string `json:"state_fingerprint,omitempty"`
 	RequestFingerprint string `json:"request_fingerprint,omitempty"`
+	CreatesChallenge   bool   `json:"creates_challenge,omitempty"`
+}
+
+// GlobalReviewAuditLock is the inspector-owned phase lock for global review.
+// Parallel to PipelineAuditLock: when non-nil and OwnerAgent == inspector,
+// peer → inspector challenges are refused for the duration of the phase.
+type GlobalReviewAuditLock struct {
+	OwnerAgent string `json:"owner_agent"`
+	Phase      string `json:"phase"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 type GlobalReviewSnapshot struct {
@@ -103,6 +133,7 @@ type GlobalReviewSnapshot struct {
 	ActiveAgents      []string                      `json:"active_agents,omitempty"`
 	RequestedBy       string                        `json:"requested_by,omitempty"`
 	CurrentRequest    string                        `json:"current_request,omitempty"`
+	AuditLock         *GlobalReviewAuditLock        `json:"audit_lock,omitempty"`
 	PendingChallenge  *GlobalReviewChallenge        `json:"pending_challenge,omitempty"`
 	PendingValidation *GlobalReviewValidationRecord `json:"pending_validation,omitempty"`
 	RecentEvents      []GlobalReviewEvent           `json:"recent_events,omitempty"`
@@ -123,6 +154,11 @@ type GlobalReviewTurnAction struct {
 	TargetAgent        string
 	TargetAgentID      string
 	CreatesChallenge   bool
+	// AuditLockPhase, when non-empty on an inspector-owned challenge,
+	// engages the review-phase lock via nextGlobalReviewAuditLock. Only
+	// finalize_global_review currently sets this — mirrors the pipeline's
+	// PipelineTurnAction.AuditLockPhase.
+	AuditLockPhase     string
 	Reason             string
 	Request            string
 	RequiredOutput     []string
@@ -137,6 +173,7 @@ type GlobalReviewTurnAction struct {
 
 type globalReviewSelectionRefusal struct {
 	RefusedBy        string
+	AuditPhase       string
 	Reason           string
 	ResumeConditions []string
 }
@@ -585,13 +622,15 @@ func globalReviewChallengeSkill(
 }
 
 func globalReviewHandoffNextSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
+	invoker := normalizeGlobalReviewAgent(globalReviewAgentType(context.Background(), cfg))
 	usage := "Use for ordinary top-level global-review phase progression: Global Inspector -> Global Tester for broad merged-state validation, and Global Tester -> Global Inspector when returning completed top-level validation evidence."
-	switch normalizeGlobalReviewAgent(globalReviewAgentType(context.Background(), cfg)) {
+	switch invoker {
 	case GlobalReviewAgentInspector:
 		usage += " Do not use this for targeted follow-up; use `challenge_global_tester`, `challenge_architect`, or `challenge_orchestrator` for that."
 	case GlobalReviewAgentTester:
 		usage += " Do not use this for targeted follow-up; use `challenge_inspector` for that."
 	}
+	targetEnum := globalReviewHandoffTargetEnum(invoker)
 	return skills.NewSkill("handoff_next").
 		Description("Hand top-level global-review ownership to the next ordinary owner for broad testing or audit progression.").
 		Domain("global_review").
@@ -600,7 +639,7 @@ func globalReviewHandoffNextSkill(cfg GlobalReviewProtocolSkillConfig) *skills.S
 		Usage(usage).
 		Requirement("Provide exactly one target agent plus the concrete request, why this handoff is correct now, and any required evidence the next owner must inspect or return.").
 		Satisfies("Records the next top-level global-review owner without turning the handoff into a challenge.").
-		ArrayParam("target_agents", "Canonical target agent: inspector or tester", "string", true).
+		EnumArrayParam("target_agents", "Single-entry next owner. Inspector hands off to tester; Tester hands off to inspector.", "string", targetEnum, true).
 		StringParam("reason", "Why this handoff is the correct next move", true).
 		StringParam("request", "The concrete top-level testing or audit request for the target agent", true).
 		ArrayParam("required_output", "What the target agent must return", "string", false).
@@ -628,6 +667,22 @@ func globalReviewHandoffNextSkill(cfg GlobalReviewProtocolSkillConfig) *skills.S
 			return issueGlobalReviewSelection(ctx, cfg, action)
 		}).
 		Build()
+}
+
+// globalReviewHandoffTargetEnum returns the valid handoff_next target set for
+// the given invoker. Tester may only hand off to inspector; inspector may only
+// hand off to tester. The enum is baked into the tool schema so the LLM
+// cannot emit an invalid target such as "architect" or "orchestrator" as a
+// top-level handoff.
+func globalReviewHandoffTargetEnum(invoker string) []string {
+	switch normalizeGlobalReviewAgent(invoker) {
+	case GlobalReviewAgentInspector:
+		return []string{GlobalReviewAgentTester}
+	case GlobalReviewAgentTester:
+		return []string{GlobalReviewAgentInspector}
+	default:
+		return []string{GlobalReviewAgentInspector, GlobalReviewAgentTester}
+	}
 }
 
 func normalizeGlobalReviewSelectionTarget(raw []string) (string, error) {
@@ -677,7 +732,19 @@ func issueGlobalReviewSelection(
 	}
 	action.StateFingerprint = resolveGlobalReviewSelectionStateFingerprint(ctx, cfg, state)
 	action.RequestFingerprint = globalReviewSelectionRequestFingerprint(action)
-	if refusal := globalReviewRepeatedSelectionRefusal(snapshot, action); refusal != nil {
+	// Three independent refusal guards, checked in order of specificity.
+	// Any one firing short-circuits the dispatch. Mirrors the pipeline
+	// protocol's layered guards (audit-phase lock, workspace fingerprint,
+	// identical request text) that prevent the same class of re-challenge
+	// loops that bit global review previously.
+	for _, refusal := range []*globalReviewSelectionRefusal{
+		globalReviewAuditChallengeRefusal(snapshot, action),
+		globalReviewRepeatedStateRefusal(snapshot, action),
+		globalReviewIdenticalRequestRefusal(snapshot, action),
+	} {
+		if refusal == nil {
+			continue
+		}
 		if err := state.setTerminalAction(&GlobalReviewTurnAction{
 			Type:               GlobalReviewActionRefusal,
 			AgentType:          normalizeGlobalReviewAgent(action.AgentType),
@@ -690,7 +757,7 @@ func issueGlobalReviewSelection(
 		}); err != nil {
 			return nil, err
 		}
-		return map[string]any{
+		result := map[string]any{
 			"refused":           true,
 			"refused_by":        firstNonEmpty(strings.TrimSpace(refusal.RefusedBy), "global-review-protocol"),
 			"agent_type":        normalizeGlobalReviewAgent(action.AgentType),
@@ -698,7 +765,11 @@ func issueGlobalReviewSelection(
 			"reason":            refusal.Reason,
 			"must_wait":         true,
 			"resume_conditions": append([]string(nil), refusal.ResumeConditions...),
-		}, nil
+		}
+		if phase := strings.TrimSpace(refusal.AuditPhase); phase != "" {
+			result["audit_phase"] = phase
+		}
+		return result, nil
 	}
 	if action.CreatesChallenge {
 		action.ChallengeID = nextGlobalReviewChallengeID(snapshot)
@@ -707,7 +778,15 @@ func issueGlobalReviewSelection(
 	if err != nil {
 		return nil, err
 	}
-	if err := state.recordChallenge(ctx, action); err != nil {
+	// Route the durable record by action.Type so peer-targeted challenges and
+	// audit-closure handoffs land under distinct event kinds. The snapshot
+	// rebuild path is shared, so replay produces identical projections; the
+	// split exists to give downstream consumers a clean classification.
+	recordSelection := state.recordChallenge
+	if action.Type == GlobalReviewActionHandoff {
+		recordSelection = state.recordHandoff
+	}
+	if err := recordSelection(ctx, action); err != nil {
 		return nil, err
 	}
 	if err := state.setTerminalAction(action); err != nil {
@@ -727,7 +806,14 @@ func issueGlobalReviewSelection(
 	}, nil
 }
 
-func globalReviewRepeatedSelectionRefusal(
+// globalReviewRepeatedStateRefusal refuses a selection when the current merged
+// review state fingerprint matches the fingerprint captured at the *previous*
+// selection on this (requester, target, actionType) triple — regardless of
+// whether the request text changed. This is the content-derived half of the
+// OR'd guard that mirrors pipelineRepeatedChallengeRefusal: if no file on the
+// review surface changed, rephrasing the same concern should not bypass the
+// refusal.
+func globalReviewRepeatedStateRefusal(
 	snapshot *GlobalReviewSnapshot,
 	action *GlobalReviewTurnAction,
 ) *globalReviewSelectionRefusal {
@@ -735,8 +821,7 @@ func globalReviewRepeatedSelectionRefusal(
 		return nil
 	}
 	currentState := strings.TrimSpace(action.StateFingerprint)
-	currentRequest := strings.TrimSpace(action.RequestFingerprint)
-	if currentState == "" || currentRequest == "" {
+	if currentState == "" {
 		return nil
 	}
 	previous, ok := recentGlobalReviewSelectionEvent(
@@ -744,12 +829,12 @@ func globalReviewRepeatedSelectionRefusal(
 		string(action.Type),
 		action.AgentType,
 		action.TargetAgent,
+		action.CreatesChallenge,
 	)
 	if !ok {
 		return nil
 	}
-	if strings.TrimSpace(previous.StateFingerprint) != currentState ||
-		strings.TrimSpace(previous.RequestFingerprint) != currentRequest {
+	if strings.TrimSpace(previous.StateFingerprint) != currentState {
 		return nil
 	}
 	targetLabel := firstNonEmpty(normalizeGlobalReviewAgent(action.TargetAgent), "the same target")
@@ -760,20 +845,122 @@ func globalReviewRepeatedSelectionRefusal(
 	return &globalReviewSelectionRefusal{
 		RefusedBy: "global-review-protocol",
 		Reason: fmt.Sprintf(
-			"Repeated global review %s to %s requires fresh merged-state evidence or a materially different request, but the current merged state and routed request are unchanged since the previous selection on this directed pair.",
-			verb,
-			targetLabel,
+			"Repeated global review %s to %s requires fresh merged-state evidence, but the live review surface has not changed since the previous %s on this directed pair.",
+			verb, targetLabel, verb,
 		),
 		ResumeConditions: []string{
 			fmt.Sprintf("Wait for the merged review state to change before issuing another %s to %s.", verb, targetLabel),
-			"Use `inspect_workspace_state`, `summarize_workspace_state`, or a narrower targeted challenge to gather genuinely new evidence before retrying.",
+			"Use `inspect_workspace_state`, `summarize_workspace_state`, or gather new evidence before retrying; rewording alone does not unblock a repeat.",
 		},
 	}
+}
+
+// globalReviewIdenticalRequestRefusal refuses a challenge whose request text
+// is byte-identical (after whitespace normalization) to a prior challenge
+// from the same requesting agent to the same target — regardless of whether
+// the review surface changed. This catches the "state moved but the LLM is
+// still asking the exact same thing" case that the state-fingerprint check
+// alone would let through. Mirrors pipelineIdenticalRequestRefusal.
+func globalReviewIdenticalRequestRefusal(
+	snapshot *GlobalReviewSnapshot,
+	action *GlobalReviewTurnAction,
+) *globalReviewSelectionRefusal {
+	if snapshot == nil || action == nil || !action.CreatesChallenge {
+		return nil
+	}
+	normalized := normalizeGlobalReviewRequestText(action.Request)
+	if normalized == "" {
+		return nil
+	}
+	requestingAgent := normalizeGlobalReviewAgent(action.AgentType)
+	targetAgent := normalizeGlobalReviewAgent(action.TargetAgent)
+	if requestingAgent == "" || targetAgent == "" {
+		return nil
+	}
+	for i := len(snapshot.RecentEvents) - 1; i >= 0; i-- {
+		event := snapshot.RecentEvents[i]
+		// Gate on the dispatch-level fact (CreatesChallenge), not the
+		// protocol-level Type. Mirrors pipelineIdenticalRequestRefusal so
+		// audit-closure handoffs (Type=Handoff with CreatesChallenge=true)
+		// stay protected against byte-identical re-issue alongside ordinary
+		// peer-targeted challenges.
+		if !event.CreatesChallenge {
+			continue
+		}
+		if normalizeGlobalReviewAgent(event.AgentType) != requestingAgent {
+			continue
+		}
+		if normalizeGlobalReviewAgent(event.TargetAgent) != targetAgent {
+			continue
+		}
+		if normalizeGlobalReviewRequestText(event.Summary) != normalized {
+			continue
+		}
+		targetLabel := firstNonEmpty(targetAgent, "the same target")
+		return &globalReviewSelectionRefusal{
+			RefusedBy: "global-review-protocol",
+			Reason: fmt.Sprintf(
+				"Repeated global review challenge to %s reuses the exact request text from an earlier round. The LLM must materially revise the concern or gather new evidence before re-challenging this recipient.",
+				targetLabel,
+			),
+			ResumeConditions: []string{
+				"Rewrite the challenge request to reflect new evidence or a distinct concern.",
+				"Use `inspect_workspace_state` or a different consultation before re-challenging with the same question.",
+			},
+		}
+	}
+	return nil
+}
+
+// globalReviewAuditChallengeRefusal refuses peer → inspector challenges while
+// the inspector is in a review-phase lock (finalize_global_review or
+// commit_to_disk). Inspector → peer challenges are unaffected. Mirrors the
+// directionality of pipelineAuditChallengeRefusal.
+func globalReviewAuditChallengeRefusal(
+	snapshot *GlobalReviewSnapshot,
+	action *GlobalReviewTurnAction,
+) *globalReviewSelectionRefusal {
+	if snapshot == nil || snapshot.AuditLock == nil || action == nil {
+		return nil
+	}
+	lock := snapshot.AuditLock
+	if normalizeGlobalReviewAgent(lock.OwnerAgent) != GlobalReviewAgentInspector {
+		return nil
+	}
+	if normalizeGlobalReviewAgent(action.AgentType) == GlobalReviewAgentInspector {
+		return nil
+	}
+	if normalizeGlobalReviewAgent(action.TargetAgent) != GlobalReviewAgentInspector {
+		return nil
+	}
+	phase := strings.TrimSpace(lock.Phase)
+	if phase == "" {
+		phase = GlobalReviewAuditPhaseFinalizing
+	}
+	return &globalReviewSelectionRefusal{
+		RefusedBy:  GlobalReviewAgentInspector,
+		AuditPhase: phase,
+		Reason: fmt.Sprintf(
+			"Global inspector is in %s audit lock. Challenges to the inspector are refused; wait for the lock to clear before re-engaging.",
+			phase,
+		),
+		ResumeConditions: []string{
+			"Wait for the inspector to complete commit_to_disk or exit the finalize phase.",
+			"If responding to an active challenge, use `validate_work` instead of issuing a new challenge back to the inspector.",
+		},
+	}
+}
+
+// normalizeGlobalReviewRequestText collapses whitespace runs for byte-match
+// comparison of challenge request bodies.
+func normalizeGlobalReviewRequestText(text string) string {
+	return strings.Join(strings.Fields(text), " ")
 }
 
 func recentGlobalReviewSelectionEvent(
 	events []GlobalReviewEvent,
 	actionType, agentType, targetAgent string,
+	createsChallenge bool,
 ) (GlobalReviewEvent, bool) {
 	actionType = strings.TrimSpace(actionType)
 	agentType = normalizeGlobalReviewAgent(agentType)
@@ -789,11 +976,24 @@ func recentGlobalReviewSelectionEvent(
 		if normalizeGlobalReviewAgent(evt.TargetAgent) != targetAgent {
 			continue
 		}
+		if evt.CreatesChallenge != createsChallenge {
+			continue
+		}
 		return evt, true
 	}
 	return GlobalReviewEvent{}, false
 }
 
+// resolveGlobalReviewSelectionStateFingerprint produces a content-derived
+// fingerprint over the live merged-state review surface (the session-VFS
+// summary of the affected paths plus the plan file). It intentionally does
+// NOT mix in coarse metadata fields like acceptance_summary, stage, or
+// task_criteria_snapshot — those are stable across iterations of the same
+// checkpoint, and including them made the fingerprint impossible to move
+// during a review cycle, which let the LLM bypass the repeat-refusal simply
+// by rephrasing its challenge. Parallel to pipelineChallengeFingerprint:
+// any real file change on the review surface flips the fingerprint; no file
+// change leaves it stable regardless of how the LLM paraphrases.
 func resolveGlobalReviewSelectionStateFingerprint(
 	ctx context.Context,
 	cfg GlobalReviewProtocolSkillConfig,
@@ -803,36 +1003,22 @@ func resolveGlobalReviewSelectionStateFingerprint(
 	if state != nil {
 		metadata = state.BaseMetadata()
 	}
-	payload := map[string]any{}
-	if version := strings.TrimSpace(stringAny(metadata, "global_vfs_version")); version != "" {
-		payload["global_vfs_version"] = version
+	paths := globalReviewEvidencePaths(metadata)
+	if len(paths) == 0 || cfg.WorkspaceViews == nil {
+		return ""
 	}
-	if stage := strings.TrimSpace(globalReviewStageFromMetadata(metadata)); stage != "" {
-		payload["global_review_stage"] = stage
+	views := cfg.WorkspaceViews()
+	if views == nil {
+		return ""
 	}
-	if summary := strings.TrimSpace(stringAny(metadata, "acceptance_summary")); summary != "" {
-		payload["acceptance_summary"] = summary
+	summary, err := views.SummarizePaths(ctx, paths, "")
+	if err != nil || summary == nil {
+		return ""
 	}
-	if criteria := strings.TrimSpace(stringAny(metadata, "task_criteria_snapshot")); criteria != "" {
-		payload["task_criteria_snapshot"] = criteria
-	}
-	if plan := strings.TrimSpace(stringAny(metadata, "plan_snapshot")); plan != "" {
-		payload["plan_snapshot"] = plan
-	}
-	if description := strings.TrimSpace(stringAny(metadata, "task_description")); description != "" {
-		payload["task_description"] = description
-	}
-	if paths := globalReviewEvidencePaths(metadata); len(paths) > 0 {
-		payload["evidence_paths"] = paths
-		if cfg.WorkspaceViews != nil {
-			if views := cfg.WorkspaceViews(); views != nil {
-				if summary, err := views.SummarizePaths(ctx, paths, ""); err == nil && summary != nil {
-					payload["workspace_summary"] = summary
-				}
-			}
-		}
-	}
-	return globalReviewFingerprint(payload)
+	return globalReviewFingerprint(map[string]any{
+		"evidence_paths":    paths,
+		"workspace_summary": summary,
+	})
 }
 
 func globalReviewSelectionRequestFingerprint(action *GlobalReviewTurnAction) string {
@@ -1181,21 +1367,37 @@ func globalReviewFinalizeSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skil
 				}, nil
 			}
 			action := &GlobalReviewTurnAction{
-				Type:             GlobalReviewActionChallenge,
+				// Mirror pipeline finalize_pipeline: typed as Handoff (the
+				// protocol-level intent) with CreatesChallenge=true (the
+				// dispatch-level fact that the responder still returns via
+				// validate_work over a branch ref + audit lock). Type and
+				// CreatesChallenge are deliberately orthogonal — Type drives
+				// downstream protocol/orchestrator routing decisions; the
+				// flag drives wire-side branch creation.
+				Type:             GlobalReviewActionHandoff,
 				AgentType:        GlobalReviewAgentInspector,
 				AgentID:          globalReviewAgentID(ctx, cfg),
 				TargetAgent:      GlobalReviewAgentTester,
 				TargetAgentID:    globalReviewResolveTargetAgentID(cfg, GlobalReviewAgentTester),
 				CreatesChallenge: true,
-				Reason:           globalReviewFinalizeReason(finalWholePlanReview),
-				Request:          globalReviewFinalizeRequest(finalWholePlanReview),
+				// Engage the inspector-owned audit lock for the duration of
+				// the finalize round. Peers can no longer challenge the
+				// inspector back until the lock clears on commit_to_disk
+				// (or accept_checkpoint for checkpoint stages).
+				AuditLockPhase: GlobalReviewAuditPhaseFinalizing,
+				Reason:         globalReviewFinalizeReason(finalWholePlanReview),
+				Request:        globalReviewFinalizeRequest(finalWholePlanReview),
 				RequiredOutput: []string{
 					globalReviewFinalizeRequiredOutput(finalWholePlanReview),
 					"Call out correctness, robustness, performance, style-fit, and regression risks.",
 					"Identify stronger alternative implementations if the current one is not the best fit.",
 					"State whether the work should be handed back for more changes instead of committed to disk.",
 				},
-				References: evidenceRefs,
+				// Marker is required for the wire tool name resolver, the
+				// responder prompt branch, and the pending classifier to
+				// recognize this as the closure-round handoff rather than an
+				// ordinary peer-targeted challenge.
+				References: append([]string{finalizeGlobalReviewVerificationReference}, evidenceRefs...),
 			}
 			return issueGlobalReviewSelection(ctx, cfg, action)
 		}).
@@ -1377,7 +1579,7 @@ func dispatchGlobalReviewSelection(
 	branchCtx := ctx
 	var branch InterAgentBranchHandle
 	if action.CreatesChallenge {
-		toolName := globalReviewChallengeToolName(action.TargetAgent)
+		toolName := globalReviewToolNameForAction(action)
 		if strings.TrimSpace(toolName) == "" {
 			return nil, fmt.Errorf("global review challenge target %q does not have a concrete challenge tool", strings.TrimSpace(action.TargetAgent))
 		}
@@ -1440,6 +1642,44 @@ func globalReviewChallengeToolName(target string) string {
 	}
 }
 
+// globalReviewToolNameForAction picks the wire-side tool name for a global
+// review selection. The audit-closure handoff (inspector → tester carrying
+// finalizeGlobalReviewVerificationReference) reports as "finalize_global_review"
+// so the chat panel and the responder prompt can distinguish it from a
+// peer-targeted challenge_global_tester. Mirrors pipelineChallengeToolName.
+// All other selections fall back to the target-only resolver.
+func globalReviewToolNameForAction(action *GlobalReviewTurnAction) string {
+	if action != nil &&
+		normalizeGlobalReviewAgent(action.AgentType) == GlobalReviewAgentInspector &&
+		normalizeGlobalReviewAgent(action.TargetAgent) == GlobalReviewAgentTester &&
+		containsNormalizedString(action.References, finalizeGlobalReviewVerificationReference) {
+		return "finalize_global_review"
+	}
+	if action == nil {
+		return ""
+	}
+	return globalReviewChallengeToolName(action.TargetAgent)
+}
+
+// finalizeGlobalReviewChallengePending reports whether the snapshot's pending
+// challenge is the inspector → tester audit-closure handoff. Mirrors
+// finalizePipelineChallengePending: the tester's responder logic and the
+// dispatch-time prompt builder use this to surface closure-round language
+// distinct from a peer-targeted challenge_global_tester.
+func finalizeGlobalReviewChallengePending(snapshot *GlobalReviewSnapshot) bool {
+	if snapshot == nil || snapshot.PendingChallenge == nil {
+		return false
+	}
+	challenge := snapshot.PendingChallenge
+	if normalizeGlobalReviewAgent(challenge.RequestingAgent) != GlobalReviewAgentInspector {
+		return false
+	}
+	if normalizeGlobalReviewAgent(challenge.TargetAgent) != GlobalReviewAgentTester {
+		return false
+	}
+	return containsNormalizedString(challenge.References, finalizeGlobalReviewVerificationReference)
+}
+
 func dispatchGlobalReviewValidation(
 	ctx context.Context,
 	cfg GlobalReviewProtocolSkillConfig,
@@ -1456,25 +1696,15 @@ func dispatchGlobalReviewValidation(
 	}
 	snapshot := buildGlobalReviewValidationSnapshot(state, record)
 	metadata := buildGlobalReviewRouteMetadata(state, snapshot, record.RequestingAgent)
-	branchCtx, branch := BeginInterAgentBranch(ctx, InterAgentBranchSpec{
-		Kind:       InterAgentToolEventKindChallenge,
-		ToolName:   "validate_work",
-		AgentTypes: []string{strings.TrimSpace(record.RequestingAgent)},
-		Summary:    record.Summary,
-		ThreadKey:  globalReviewThreadPrefix + strings.TrimSpace(record.ChallengeID),
-		Args: map[string]any{
-			"target_agent":   strings.TrimSpace(record.RequestingAgentID),
-			"target_type":    strings.TrimSpace(record.RequestingAgent),
-			"challenge_id":   strings.TrimSpace(record.ChallengeID),
-			"summary":        record.Summary,
-			"protocol_scope": globalReviewNamespace,
-			"thread_key":     globalReviewThreadPrefix + strings.TrimSpace(record.ChallengeID),
-		},
-	})
-	metadata = RouteMetadataWithExplicitInterAgentBranch(branchCtx, metadata, InterAgentBranchMetadata{
-		ThreadKey: globalReviewThreadPrefix + strings.TrimSpace(record.ChallengeID),
-		Kind:      InterAgentToolEventKindChallenge,
-	})
+	// Parity with the pipeline protocol: validate_work back to the
+	// originator is a continuation of the originator's existing chat entry,
+	// not a new nested child row and not a top-level transfer. The
+	// originator's CID is carried on the responder's stream metadata via
+	// the branch set up by the outbound challenge leg.
+	originatorCID := strings.TrimSpace(pipelineTaskMetadataString(stream.Metadata, streamMetadataParentCorrelation))
+	if originatorCID != "" {
+		metadata = RouteMetadataWithOriginatorContinuation(ctx, metadata, originatorCID, strings.TrimSpace(stream.CorrelationID))
+	}
 	prompt := buildGlobalReviewValidationPrompt(record, metadata)
 	correlationID := "global_review_" + uuid.NewString()[:12]
 	sourceAgentID := globalReviewVisibleSourceAgentID(stream)
@@ -1491,7 +1721,6 @@ func dispatchGlobalReviewValidation(
 		Metadata:            metadata,
 	}
 	if err := bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage("", req)); err != nil {
-		branch.Complete(branchCtx, "", "", err)
 		return "", fmt.Errorf("publish global review validation: %w", err)
 	}
 	publishGlobalReviewReroute(bus, ctx, record.RespondingAgent, record.RespondingAgentID, record.RequestingAgent, record.RequestingAgentID, record.Summary, correlationID)
@@ -1573,6 +1802,7 @@ func applyGlobalReviewSelectionToSnapshot(base *GlobalReviewSnapshot, action *Gl
 	snapshot.CurrentRequest = strings.TrimSpace(action.Request)
 	snapshot.PendingValidation = nil
 	snapshot.PendingChallenge = nil
+	snapshot.AuditLock = nextGlobalReviewAuditLock(snapshot.AuditLock, action)
 	if action.CreatesChallenge {
 		snapshot.PendingChallenge = &GlobalReviewChallenge{
 			ID:                strings.TrimSpace(action.ChallengeID),
@@ -1593,8 +1823,40 @@ func applyGlobalReviewSelectionToSnapshot(base *GlobalReviewSnapshot, action *Gl
 		Summary:            firstNonEmpty(strings.TrimSpace(action.Request), strings.TrimSpace(action.Summary)),
 		StateFingerprint:   strings.TrimSpace(action.StateFingerprint),
 		RequestFingerprint: strings.TrimSpace(action.RequestFingerprint),
+		CreatesChallenge:   action.CreatesChallenge,
 	})
 	return snapshot
+}
+
+// nextGlobalReviewAuditLock mirrors nextPipelineAuditLock: an inspector-owned
+// challenge with a non-empty AuditLockPhase *sets* the lock; any other
+// inspector-originated selection *clears* the lock (the inspector is done
+// with the locked phase and is moving on); selections originating from peers
+// leave the lock untouched (peers cannot unilaterally clear the inspector's
+// lock by challenging back).
+func nextGlobalReviewAuditLock(existing *GlobalReviewAuditLock, action *GlobalReviewTurnAction) *GlobalReviewAuditLock {
+	if action == nil {
+		return cloneGlobalReviewAuditLock(existing)
+	}
+	if phase := strings.TrimSpace(action.AuditLockPhase); phase != "" {
+		return &GlobalReviewAuditLock{
+			OwnerAgent: GlobalReviewAgentInspector,
+			Phase:      phase,
+			Reason:     strings.TrimSpace(action.Reason),
+		}
+	}
+	if normalizeGlobalReviewAgent(action.AgentType) == GlobalReviewAgentInspector {
+		return nil
+	}
+	return cloneGlobalReviewAuditLock(existing)
+}
+
+func cloneGlobalReviewAuditLock(lock *GlobalReviewAuditLock) *GlobalReviewAuditLock {
+	if lock == nil {
+		return nil
+	}
+	out := *lock
+	return &out
 }
 
 func materializeGlobalReviewSnapshot(state *GlobalReviewState) *GlobalReviewSnapshot {
@@ -1624,6 +1886,17 @@ func materializeGlobalReviewSnapshot(state *GlobalReviewState) *GlobalReviewSnap
 
 func buildGlobalReviewTurnPrompt(action *GlobalReviewTurnAction, metadata map[string]any) string {
 	normalizedTarget := normalizeGlobalReviewAgent(action.TargetAgent)
+	// Audit-closure handoff identification: inspector → tester carrying the
+	// finalize-marker. This is structurally a challenge (audit lock + branch
+	// ref + validate_work return) but conceptually a handoff (the inspector
+	// has already decided the audit passed; tester only needs to confirm
+	// against merged state). The responder prompt language reflects that
+	// distinction so the tester treats it as a closure-round verification
+	// rather than a narrowly-scoped peer challenge.
+	isFinalizeHandoff := action != nil &&
+		normalizeGlobalReviewAgent(action.AgentType) == GlobalReviewAgentInspector &&
+		normalizedTarget == GlobalReviewAgentTester &&
+		containsNormalizedString(action.References, finalizeGlobalReviewVerificationReference)
 	var lines []string
 	switch normalizedTarget {
 	case GlobalReviewAgentArchitect:
@@ -1633,17 +1906,27 @@ func buildGlobalReviewTurnPrompt(action *GlobalReviewTurnAction, metadata map[st
 	case GlobalReviewAgentInspector:
 		lines = append(lines, "Global tester handoff back to the global inspector.")
 	default:
-		if action.CreatesChallenge {
+		switch {
+		case isFinalizeHandoff:
+			lines = append(lines, "Global inspector audit-closure handoff to the global tester.")
+		case action.CreatesChallenge:
 			lines = append(lines, "Global inspector challenge for the global tester.")
-		} else {
+		default:
 			lines = append(lines, "Global review handoff for the global tester.")
 		}
 	}
 	if action.CreatesChallenge {
-		lines = append(lines,
-			"This request is part of the global review protocol over merged global state.",
-			"This is a targeted challenge turn. Do not answer narratively without recording the result. End this turn with `validate_work`.",
-		)
+		if isFinalizeHandoff {
+			lines = append(lines,
+				"This request is part of the global review protocol over merged global state.",
+				"This is the global inspector's audit-closure handoff to the global tester. The inspector has already determined the merged candidate is ready; run the requested merged-state verification pass and return with `validate_work` so the inspector can record the verdict and proceed to `accept_checkpoint` or `commit_to_disk`.",
+			)
+		} else {
+			lines = append(lines,
+				"This request is part of the global review protocol over merged global state.",
+				"This is a targeted challenge turn. Do not answer narratively without recording the result. End this turn with `validate_work`.",
+			)
+		}
 	} else {
 		lines = append(lines,
 			"This request is part of the global review protocol over merged global state.",
@@ -2012,6 +2295,7 @@ func cloneGlobalReviewSnapshot(snapshot *GlobalReviewSnapshot) *GlobalReviewSnap
 	}
 	out := *snapshot
 	out.ActiveAgents = append([]string(nil), snapshot.ActiveAgents...)
+	out.AuditLock = cloneGlobalReviewAuditLock(snapshot.AuditLock)
 	out.PendingChallenge = cloneGlobalReviewChallenge(snapshot.PendingChallenge)
 	out.PendingValidation = cloneGlobalReviewValidationRecord(snapshot.PendingValidation)
 	out.RecentEvents = append([]GlobalReviewEvent(nil), snapshot.RecentEvents...)

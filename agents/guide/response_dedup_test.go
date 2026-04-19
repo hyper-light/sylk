@@ -1235,6 +1235,7 @@ func TestNewWithProvider_InitializesResponseTrackingForStreamRelay(t *testing.T)
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory:   newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("NewWithProvider: %v", err)

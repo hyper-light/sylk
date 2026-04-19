@@ -12,13 +12,15 @@ import (
 )
 
 const (
-	pipelineProtocolNamespace         = "pipeline"
-	pipelineProtocolEventHandoff      = "handoff_selected"
-	pipelineProtocolEventValidation   = "validation_submitted"
-	pipelineProtocolEventProcessed    = "validation_processed"
-	pipelineProtocolEventReadyForOT   = "ready_for_ot"
-	pipelineProtocolEventHandoffToOT  = "handoff_to_ot"
-	pipelineMailboxItemKindObligation = "protocol_obligation"
+	pipelineProtocolNamespace             = "pipeline"
+	pipelineProtocolEventHandoff          = "handoff_selected"
+	pipelineProtocolEventValidation       = "validation_submitted"
+	pipelineProtocolEventProcessed        = "validation_processed"
+	pipelineProtocolEventReadyForOT       = "ready_for_ot"
+	pipelineProtocolEventHandoffToOT      = "handoff_to_ot"
+	pipelineProtocolEventTesterFinalize   = "tester_finalize"
+	pipelineProtocolEventArtifactConsumed = "tester_artifact_consumed"
+	pipelineMailboxItemKindObligation     = "protocol_obligation"
 )
 
 type pipelineReadyForOTEvent struct {
@@ -27,11 +29,20 @@ type pipelineReadyForOTEvent struct {
 	EvidenceRefs []string `json:"evidence_refs,omitempty"`
 }
 
+type pipelineTesterFinalizeEvent struct {
+	Refs []PipelineHandoffArtifactRef `json:"refs"`
+}
+
+type pipelineArtifactConsumedEvent struct {
+	Targets []string `json:"targets"`
+}
+
 type pipelineProtocolCheckpoint struct {
-	Snapshot       *PipelineProtocolSnapshot      `json:"snapshot,omitempty"`
-	Processed      []PipelineValidationProcessing `json:"processed,omitempty"`
-	RequiredAction string                         `json:"required_action,omitempty"`
-	RequiredReason string                         `json:"required_reason,omitempty"`
+	Snapshot        *PipelineProtocolSnapshot             `json:"snapshot,omitempty"`
+	Processed       []PipelineValidationProcessing        `json:"processed,omitempty"`
+	RequiredAction  string                                `json:"required_action,omitempty"`
+	RequiredReason  string                                `json:"required_reason,omitempty"`
+	QueuedArtifacts map[string]PipelineHandoffArtifactRef `json:"queued_artifacts,omitempty"`
 }
 
 type pipelineProtocolObligation struct {
@@ -67,6 +78,7 @@ func newPipelineProtocolStateForTask(task *PipelineTaskInput) (*PipelineProtocol
 		state.processed = clonePipelineValidationProcessingList(checkpoint.Processed)
 		state.requiredAction = PipelineProtocolActionType(strings.TrimSpace(checkpoint.RequiredAction))
 		state.requiredReason = strings.TrimSpace(checkpoint.RequiredReason)
+		state.queuedArtifacts = clonePipelineHandoffArtifactMap(checkpoint.QueuedArtifacts)
 		if err := state.replayFrom(seq); err != nil {
 			return state, err
 		}
@@ -139,6 +151,54 @@ func (s *PipelineProtocolState) recordHandoffToOT(ctx context.Context, action *P
 		return nil
 	}
 	return s.appendEvent(ctx, pipelineProtocolEventHandoffToOT, action)
+}
+
+// recordTesterFinalize appends the per-recipient verification artifact refs
+// produced by the tester finalize_pipeline call. The apply handler populates
+// the protocol-state queue so subsequent handoff_next/validate_work dispatch
+// can thread the right ref to each recipient.
+func (s *PipelineProtocolState) recordTesterFinalize(ctx context.Context, refs []PipelineHandoffArtifactRef) error {
+	if s == nil || len(refs) == 0 {
+		return nil
+	}
+	return s.appendEvent(ctx, pipelineProtocolEventTesterFinalize, pipelineTesterFinalizeEvent{
+		Refs: clonePipelineHandoffArtifactRefList(refs),
+	})
+}
+
+// consumeQueuedArtifacts records that the named targets' queued artifact refs
+// have been consumed by a successful dispatch. Cleared from the protocol-state
+// queue so the next turn doesn't re-thread stale refs.
+func (s *PipelineProtocolState) consumeQueuedArtifacts(ctx context.Context, targets []string) error {
+	if s == nil {
+		return nil
+	}
+	normalized := make([]string, 0, len(targets))
+	for _, target := range targets {
+		t := normalizePipelineAgentType(target)
+		if t == "" {
+			continue
+		}
+		normalized = append(normalized, t)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	s.mu.RLock()
+	hasQueued := false
+	for _, target := range normalized {
+		if _, ok := s.queuedArtifacts[target]; ok {
+			hasQueued = true
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if !hasQueued {
+		return nil
+	}
+	return s.appendEvent(ctx, pipelineProtocolEventArtifactConsumed, pipelineArtifactConsumedEvent{
+		Targets: normalized,
+	})
 }
 
 func (s *PipelineProtocolState) CurrentAgentObligations(agentType string) []map[string]any {
@@ -246,6 +306,18 @@ func (s *PipelineProtocolState) applyEvent(seq uint64, event *durableProtocolEve
 			return err
 		}
 		s.applyHandoffToOTEvent(&action)
+	case pipelineProtocolEventTesterFinalize:
+		var finalize pipelineTesterFinalizeEvent
+		if err := decodeProtocolPayload(event.Payload, &finalize); err != nil {
+			return err
+		}
+		s.applyTesterFinalizeEvent(finalize)
+	case pipelineProtocolEventArtifactConsumed:
+		var consumed pipelineArtifactConsumedEvent
+		if err := decodeProtocolPayload(event.Payload, &consumed); err != nil {
+			return err
+		}
+		s.applyArtifactConsumedEvent(consumed)
 	}
 	_ = seq
 	return nil
@@ -256,10 +328,11 @@ func (s *PipelineProtocolState) persistProjection() error {
 		return nil
 	}
 	checkpoint := pipelineProtocolCheckpoint{
-		Snapshot:       clonePipelineProtocolSnapshot(s.snapshot),
-		Processed:      clonePipelineValidationProcessingList(s.processed),
-		RequiredAction: strings.TrimSpace(string(s.requiredAction)),
-		RequiredReason: strings.TrimSpace(s.requiredReason),
+		Snapshot:        clonePipelineProtocolSnapshot(s.snapshot),
+		Processed:       clonePipelineValidationProcessingList(s.processed),
+		RequiredAction:  strings.TrimSpace(string(s.requiredAction)),
+		RequiredReason:  strings.TrimSpace(s.requiredReason),
+		QueuedArtifacts: clonePipelineHandoffArtifactMap(s.queuedArtifacts),
 	}
 	return s.store.SaveSnapshot(s.store.journal.LastSequence(), checkpoint)
 }
@@ -422,6 +495,58 @@ func (s *PipelineProtocolState) applyHandoffToOTEvent(action *PipelineTurnAction
 		Targets:   []string{PipelineAgentInspector},
 		Summary:   strings.TrimSpace(action.Summary),
 	})
+}
+
+// applyTesterFinalizeEvent populates the queued-artifacts map with the per-
+// recipient refs the tester finalize_pipeline produced. Re-finalize for an
+// existing target overwrites the prior ref (the no-repeat guard in the skill
+// handler ensures the suite changed before this overwrite is allowed).
+func (s *PipelineProtocolState) applyTesterFinalizeEvent(event pipelineTesterFinalizeEvent) {
+	if len(event.Refs) == 0 {
+		return
+	}
+	if s.queuedArtifacts == nil {
+		s.queuedArtifacts = make(map[string]PipelineHandoffArtifactRef, len(event.Refs))
+	}
+	for _, ref := range event.Refs {
+		target := normalizePipelineAgentType(ref.Target)
+		if target == "" {
+			continue
+		}
+		s.queuedArtifacts[target] = cloneHandoffArtifactRef(ref)
+	}
+	if s.snapshot == nil {
+		s.snapshot = &PipelineProtocolSnapshot{}
+	}
+	targets := make([]string, 0, len(event.Refs))
+	for _, ref := range event.Refs {
+		targets = append(targets, normalizePipelineAgentType(ref.Target))
+	}
+	appendPipelineProtocolEvent(s.snapshot, PipelineProtocolEvent{
+		Type:      pipelineProtocolEventTesterFinalize,
+		AgentType: PipelineAgentTester,
+		Targets:   targets,
+		Summary:   "Tester verification artifacts finalized for downstream recipients.",
+	})
+}
+
+// applyArtifactConsumedEvent removes the named targets' refs from the queue.
+// Successful handoff_next/validate_work dispatch records this so the queue
+// doesn't survive into the next turn with stale refs.
+func (s *PipelineProtocolState) applyArtifactConsumedEvent(event pipelineArtifactConsumedEvent) {
+	if len(event.Targets) == 0 || len(s.queuedArtifacts) == 0 {
+		return
+	}
+	for _, target := range event.Targets {
+		t := normalizePipelineAgentType(target)
+		if t == "" {
+			continue
+		}
+		delete(s.queuedArtifacts, t)
+	}
+	if len(s.queuedArtifacts) == 0 {
+		s.queuedArtifacts = nil
+	}
 }
 
 func buildPipelineSnapshotAfterHandoff(base *PipelineProtocolSnapshot, action *PipelineTurnAction) *PipelineProtocolSnapshot {

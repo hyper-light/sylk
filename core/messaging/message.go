@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/adalundhe/sylk/core/agents/identity"
 )
 
 // =============================================================================
@@ -115,6 +117,83 @@ type Message[T any] struct {
 	StructuredIntent *StructuredIntent `json:"structured_intent,omitempty"`
 	ConfidenceChain  []ConfidenceEntry `json:"confidence_chain,omitempty"`
 	RerouteHistory   []RerouteHop      `json:"reroute_history,omitempty"`
+
+	// ReplyTo carries the return address so agents respond directly to the
+	// originator's topic (removing Guide from the response hot path). When
+	// non-nil, routing layers prefer ReplyTo.Topic over correlation-based
+	// broadcast. Guide (or other observers) can subscribe to ObserverTopics
+	// for correlation/telemetry without being on the response hot path.
+	ReplyTo *ReplyTo `json:"reply_to,omitempty"`
+
+	// Identity and Task carry the typed dispatch identifiers when the
+	// message was produced by a Factory-aware agent (Step 5). Not
+	// JSON-serialized — the flat SessionID and CorrelationID fields
+	// carry the same information in persisted form. In-memory
+	// consumers read the typed form via Namespace() / Correlation()
+	// which prefer the typed source and fall back to the flat string.
+	Identity *identity.AgentIdentity `json:"-"`
+	Task     *identity.TaskRef       `json:"-"`
+}
+
+// Namespace returns the message's session / namespace, preferring the
+// typed Identity.Namespace when present. Falls back to the flat
+// SessionID field for messages produced before Step 5 migration or
+// for over-the-wire messages reconstructed from JSON.
+func (m *Message[T]) Namespace() string {
+	if m == nil {
+		return ""
+	}
+	if m.Identity != nil {
+		return string(m.Identity.Namespace())
+	}
+	return m.SessionID
+}
+
+// Correlation returns the message's correlation id, preferring the
+// typed Task.Correlation() when present.
+func (m *Message[T]) Correlation() string {
+	if m == nil {
+		return ""
+	}
+	if m.Task != nil {
+		return string(m.Task.Correlation())
+	}
+	return m.CorrelationID
+}
+
+// maxReplyObserverTopics caps the number of observer topics on ReplyTo to
+// prevent unbounded growth. Mirror of the guide-package constant so
+// callers constructing messaging.Message can enforce the same limit.
+const maxReplyObserverTopics = 4
+
+// ReplyTo carries the return address for direct agent-to-originator
+// response routing.
+type ReplyTo struct {
+	// Topic is the primary response destination.
+	Topic string `json:"topic"`
+	// ObserverTopics are additional topics that receive a copy of the
+	// response for observation (e.g. Guide correlation, telemetry).
+	// Capped at maxReplyObserverTopics on append.
+	ObserverTopics []string `json:"observer_topics,omitempty"`
+}
+
+// AddObserver appends topic to ObserverTopics, respecting the cap. Returns
+// true if appended, false if the topic was empty, already present, or the
+// list is full.
+func (r *ReplyTo) AddObserver(topic string) bool {
+	if r == nil || topic == "" {
+		return false
+	}
+	for _, t := range r.ObserverTopics {
+		if t == topic {
+			return false
+		}
+	}
+	if len(r.ObserverTopics) >= maxReplyObserverTopics {
+		return false
+	}
+	r.ObserverTopics = append(r.ObserverTopics, topic)
+	return true
 }
 
 // =============================================================================
@@ -132,16 +211,23 @@ type StructuredIntent struct {
 }
 
 type ConfidenceEntry struct {
-	Agent      string  `json:"agent"`
-	Confidence float64 `json:"confidence"`
-	Reason     string  `json:"reason"`
+	Agent      string    `json:"agent"`
+	Confidence float64   `json:"confidence"`
+	Reason     string    `json:"reason"`
+	At         time.Time `json:"at"`
 }
 
 type RerouteHop struct {
-	From   string `json:"from"`
-	Reason string `json:"reason"`
-	To     string `json:"to"`
+	From   string    `json:"from"`
+	Reason string    `json:"reason"`
+	To     string    `json:"to"`
+	At     time.Time `json:"at"`
 }
+
+// MaxReroutesPerRequest is the upper bound on reroute hops before a message
+// is treated as a reroute loop. Mirrors ARCHITECTURE.md:676 — after this
+// many hops we escalate rather than keep re-classifying.
+const MaxReroutesPerRequest = 3
 
 const (
 	// Request is a request to be routed
@@ -358,6 +444,52 @@ func (m *Message[T]) WithMetadata(key string, value any) *Message[T] {
 	return m
 }
 
+// WithReplyTo attaches a primary reply topic (and optional observer topics)
+// so agents can respond directly to the originator.
+func (m *Message[T]) WithReplyTo(topic string, observers ...string) *Message[T] {
+	rt := &ReplyTo{Topic: topic}
+	for _, obs := range observers {
+		rt.AddObserver(obs)
+	}
+	m.ReplyTo = rt
+	return m
+}
+
+// AppendConfidence records an agent's confidence decision onto the message's
+// ConfidenceChain. Call this at every routing / classification decision
+// point so observers can trace why a request ended up where it did.
+func (m *Message[T]) AppendConfidence(agent string, confidence float64, reason string) {
+	m.ConfidenceChain = append(m.ConfidenceChain, ConfidenceEntry{
+		Agent:      agent,
+		Confidence: confidence,
+		Reason:     reason,
+		At:         time.Now(),
+	})
+}
+
+// AppendReroute records a reroute hop onto RerouteHistory. Step-0
+// rejections call this just before re-publishing the request.
+func (m *Message[T]) AppendReroute(from, to, reason string) {
+	m.RerouteHistory = append(m.RerouteHistory, RerouteHop{
+		From:   from,
+		To:     to,
+		Reason: reason,
+		At:     time.Now(),
+	})
+}
+
+// RerouteCount returns the number of hops recorded so far.
+func (m *Message[T]) RerouteCount() int {
+	return len(m.RerouteHistory)
+}
+
+// TooManyReroutes reports whether the message has exceeded the
+// MaxReroutesPerRequest budget. Callers enforcing the loop-breaker should
+// escalate to the user rather than re-route again.
+func (m *Message[T]) TooManyReroutes() bool {
+	return m.RerouteCount() >= MaxReroutesPerRequest
+}
+
 // =============================================================================
 // Temporal Methods
 // =============================================================================
@@ -490,7 +622,7 @@ func (m *Message[T]) validateRequiredFields() error {
 	if m.Source == "" {
 		return &ValidationError{Field: "source", Message: "required"}
 	}
-	if m.SessionID == "" {
+	if m.SessionID == "" && !sessionExemptMessageType(m.Type) {
 		return &ValidationError{Field: "session_id", Message: "required"}
 	}
 	if m.Type == "" {
@@ -501,6 +633,41 @@ func (m *Message[T]) validateRequiredFields() error {
 	}
 	if m.Attempt < 1 {
 		return &ValidationError{Field: "attempt", Message: "must be >= 1"}
+	}
+	return m.validateStructuredIntent()
+}
+
+// sessionExemptMessageTypes enumerates message kinds that legitimately
+// operate outside a session: infrastructure signals (heartbeat, agent
+// registration lifecycle) and cross-session observability. Matches
+// ARCHITECTURE.md:88 "session_id REQUIRED for most messages".
+var sessionExemptMessageTypes = map[MessageType]struct{}{
+	TypeHeartbeat:         {},
+	TypeAgentRegistered:   {},
+	TypeAgentUnregistered: {},
+	TypeAgentReady:        {},
+	TypeRouteLearned:      {},
+}
+
+func sessionExemptMessageType(t MessageType) bool {
+	_, ok := sessionExemptMessageTypes[t]
+	return ok
+}
+
+// validateStructuredIntent verifies that when StructuredIntent is set its
+// load-bearing fields are populated. A nil intent is allowed (many message
+// types don't need an intent); but a partially-populated one is a signal
+// of producer bug and is rejected.
+func (m *Message[T]) validateStructuredIntent() error {
+	intent := m.StructuredIntent
+	if intent == nil {
+		return nil
+	}
+	if intent.OriginalRequest == "" {
+		return &ValidationError{Field: "structured_intent.original_request", Message: "required"}
+	}
+	if intent.IntentType == "" {
+		return &ValidationError{Field: "structured_intent.intent_type", Message: "required"}
 	}
 	return nil
 }

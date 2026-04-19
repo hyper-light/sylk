@@ -93,7 +93,8 @@ func insertBackspace(state *EditorState) Mode {
 		return ModeInsert
 	}
 	pos := state.Cursor - 1
-	old := string(state.Buffer.RuneAt(pos))
+	r, _ := state.Buffer.RuneAt(pos)
+	old := string(r)
 	state.Buffer.Delete(pos, 1)
 	state.UndoTree.Record(buffer.EditOp{
 		Type:    buffer.EditDelete,
@@ -235,7 +236,8 @@ func skipClosingBracket(state *EditorState, r rune) bool {
 	if state.Cursor >= state.Buffer.Length() {
 		return false
 	}
-	if state.Buffer.RuneAt(state.Cursor) != r {
+	cur, _ := state.Buffer.RuneAt(state.Cursor)
+	if cur != r {
 		return false
 	}
 	state.Cursor++
@@ -250,9 +252,13 @@ func deleteEmptyPair(state *EditorState) bool {
 	if state.Cursor <= 0 || state.Cursor >= state.Buffer.Length() {
 		return false
 	}
-	prev := state.Buffer.RuneAt(state.Cursor - 1)
+	prev, _ := state.Buffer.RuneAt(state.Cursor - 1)
 	closer, ok := bracketPairs[prev]
-	if !ok || state.Buffer.RuneAt(state.Cursor) != closer {
+	if !ok {
+		return false
+	}
+	cur, _ := state.Buffer.RuneAt(state.Cursor)
+	if cur != closer {
 		return false
 	}
 	pos := state.Cursor - 1

@@ -57,6 +57,22 @@ type Subscription interface {
 	IsActive() bool
 }
 
+// PanicCounter is an optional capability of Subscription implementations that
+// recover handler panics. Bus operators and tests type-assert to observe
+// chronic handler failures without scraping logs. A subscription exposes this
+// when its worker keeps running after panics (which is the default for
+// ChannelBus).
+type PanicCounter interface {
+	PanicCount() uint64
+}
+
+// DropCounter is an optional capability of Subscription implementations that
+// bound their internal queue. Callers type-assert to observe overflow drops
+// on a per-subscription basis.
+type DropCounter interface {
+	DroppedCount() uint64
+}
+
 // MessageHandler processes a message from a topic
 type MessageHandler func(msg *Message) error
 
@@ -354,6 +370,10 @@ const (
 	MessageTypeTaskComplete MessageType = "task_complete"
 	MessageTypeTaskFailed   MessageType = "task_failed"
 	MessageTypeTaskHelp     MessageType = "task_help"
+	// MessageTypeUserEscalation signals the Guide could not route/handle a
+	// request autonomously and needs user intervention — reroute budget
+	// exhausted, consensus failure, or explicit ask-user.
+	MessageTypeUserEscalation MessageType = "user_escalation"
 	// MessageTypeAuditResult carries audit findings from the inspector
 	MessageTypeAuditResult MessageType = "audit_result"
 	// MessageTypeClarificationRequest is a request for user clarification
@@ -516,9 +536,29 @@ const (
 	// subscribe for cache warming and telemetry.
 	TopicKnowledgeReady = "knowledge.ready"
 
+	// TopicUserEscalation is published when a request cannot be handled
+	// autonomously and requires user intervention — e.g. reroute budget
+	// exhausted, low-confidence chain, or explicit "ask user" escalation.
+	// The TUI subscribes to surface the escalation to the user.
+	TopicUserEscalation = "guide.user_escalation"
+
 	// UserAgentType is the agent type used for user session service endpoints.
 	UserAgentType = "user"
 )
+
+// UserEscalationPayload describes a user-intervention request routed through
+// TopicUserEscalation. Carries the full reroute chain (if any) and the
+// confidence history so the UI can render actionable context.
+type UserEscalationPayload struct {
+	SessionID             string                  `json:"session_id"`
+	CorrelationID         string                  `json:"correlation_id"`
+	OriginalCorrelationID string                  `json:"original_correlation_id,omitempty"`
+	OriginalInput         string                  `json:"original_input"`
+	Reason                string                  `json:"reason"`
+	SourceAgentID         string                  `json:"source_agent_id,omitempty"`
+	RerouteHistory        []messaging.RerouteHop  `json:"reroute_history,omitempty"`
+	ConfidenceChain       []messaging.ConfidenceEntry `json:"confidence_chain,omitempty"`
+}
 
 // AgentTopic returns the topic for a specific agent and channel type
 func AgentTopic(agentType, agentID string, channelType ChannelType) string {

@@ -560,6 +560,9 @@ func newTestArchitect(t *testing.T, cfg Config) *Architect {
 	if cfg.WorkingDirectory == "" {
 		cfg.WorkingDirectory = t.TempDir()
 	}
+	if cfg.Factory == nil {
+		cfg.Factory = newTestFactory(t)
+	}
 	a, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("failed to create architect: %v", err)

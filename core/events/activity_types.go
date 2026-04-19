@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/adalundhe/sylk/core/agents/identity"
 )
 
 // =============================================================================
@@ -398,23 +400,33 @@ func (v EventVisibility) IsUserVisible() bool {
 // =============================================================================
 
 // ActivityEvent represents a single activity event in the system.
+//
+// Identity and Task carry the typed canonical identifiers populated
+// by the provider-gateway hook (see core/providers/event_publisher.go).
+// Downstream subscribers read them structurally — UI per-replica
+// breakdown, per-task cost views, handoff learning. They are NOT
+// JSON-encoded; the flat AgentID, SessionID, CorrelationID, and Data
+// map carry the same information in serialized form for persistence
+// and logs.
 type ActivityEvent struct {
-	ID            string          `json:"id"`
-	EventType     EventType       `json:"event_type"`
-	Timestamp     time.Time       `json:"timestamp"`
-	SessionID     string          `json:"session_id"`
-	CorrelationID string          `json:"correlation_id,omitempty"`
-	AgentID       string          `json:"agent_id,omitempty"`
-	Content       string          `json:"content"`
-	Summary       string          `json:"summary,omitempty"`
-	Category      string          `json:"category,omitempty"`
-	FilePaths     []string        `json:"file_paths,omitempty"`
-	Keywords      []string        `json:"keywords,omitempty"`
-	RelatedIDs    []string        `json:"related_ids,omitempty"`
-	Outcome       EventOutcome    `json:"outcome"`
-	Importance    float64         `json:"importance"`
-	Visibility    EventVisibility `json:"visibility"`
-	Data          map[string]any  `json:"data,omitempty"`
+	ID            string                  `json:"id"`
+	EventType     EventType               `json:"event_type"`
+	Timestamp     time.Time               `json:"timestamp"`
+	SessionID     string                  `json:"session_id"`
+	CorrelationID string                  `json:"correlation_id,omitempty"`
+	AgentID       string                  `json:"agent_id,omitempty"`
+	Content       string                  `json:"content"`
+	Summary       string                  `json:"summary,omitempty"`
+	Category      string                  `json:"category,omitempty"`
+	FilePaths     []string                `json:"file_paths,omitempty"`
+	Keywords      []string                `json:"keywords,omitempty"`
+	RelatedIDs    []string                `json:"related_ids,omitempty"`
+	Outcome       EventOutcome            `json:"outcome"`
+	Importance    float64                 `json:"importance"`
+	Visibility    EventVisibility         `json:"visibility"`
+	Data          map[string]any          `json:"data,omitempty"`
+	Identity      *identity.AgentIdentity `json:"-"`
+	Task          *identity.TaskRef       `json:"-"`
 }
 
 // NewActivityEvent creates a new ActivityEvent with the given type, session ID, and content.

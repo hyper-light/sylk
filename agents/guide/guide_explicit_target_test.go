@@ -14,6 +14,7 @@ func TestGuideRoute_ExplicitTargetAndFollowupContinuity(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-1",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -102,6 +103,7 @@ func TestGuideRoute_ExplicitGuideFollowupDoesNotRemapToSidecar(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-sidecar",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -184,6 +186,7 @@ func TestGuideRoute_NestedConsultDoesNotStealConversationStickiness(t *testing.T
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-nested",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -282,6 +285,7 @@ func TestGuideRoute_AppliesDeferredStreamRerouteToNewPending(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-reroute",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -346,6 +350,7 @@ func TestGuideHandleRouteRequestMessage_FireAndForgetExplicitTargetStillForwards
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-fire-and-forget",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -421,6 +426,7 @@ func TestGuideHandleRouteRequestMessage_DSLStoreSkipsClassificationProgress(t *t
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-dsl-store",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -530,6 +536,7 @@ func TestGuideRoute_DSLBypassesConversationStickiness(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-dsl-stickiness",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -623,6 +630,7 @@ func TestGuideResolveReadyAgentID_TaskScopedPipelineNameUsesRegisteredWorker(t *
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-task-scoped-pipeline",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -666,6 +674,7 @@ func TestGuideRoute_ExplicitGuideTargetRetainsConversationContinuity(t *testing.
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-explicit-guide",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -738,6 +747,7 @@ func TestGuideRoute_ExplicitNonGuideTargetOverridesConversationFlow(t *testing.T
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-2",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)
@@ -815,6 +825,7 @@ func TestGuideRoute_ExplicitAgentSwitchRetainsPerAgentHistory(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-3",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)

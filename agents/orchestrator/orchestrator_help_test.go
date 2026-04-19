@@ -11,6 +11,7 @@ import (
 
 func TestOrchestratorHandle_HelpIntent(t *testing.T) {
 	o, err := New(Config{
+		Factory: newTestFactory(t),
 		AgentID:   "orchestrator",
 		SessionID: "test-session",
 	}, nil, nil, nil)
@@ -31,6 +32,7 @@ func TestOrchestratorHandle_HelpIntent(t *testing.T) {
 
 func TestOrchestratorHandle_ChatIntent(t *testing.T) {
 	o, err := New(Config{
+		Factory: newTestFactory(t),
 		AgentID:   "orchestrator",
 		SessionID: "test-session",
 	}, nil, nil, nil)

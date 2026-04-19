@@ -86,7 +86,7 @@ func TestDefineCriteriaSkill_SchemaDeclaresNumericThreshold(t *testing.T) {
 }
 
 func TestDefineCriteriaSkill_UsesCurrentTaskIDWhenRequestedIDIsPlaceholder(t *testing.T) {
-	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
+	pi, err := New(shared.PipelineInspectorConfig{Factory: newTestFactory(t), AgentID: "inspector-pipeline"}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -218,7 +218,7 @@ func TestStageInstructions_ImplementationPrefersSingleAuditCycle(t *testing.T) {
 }
 
 func TestPipelineInspectorDefaultToolDefinitionsExcludeValidationAndGradeTools(t *testing.T) {
-	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
+	pi, err := New(shared.PipelineInspectorConfig{Factory: newTestFactory(t), AgentID: "inspector-pipeline"}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -242,7 +242,7 @@ func TestPipelineInspectorDefaultToolDefinitionsExcludeValidationAndGradeTools(t
 }
 
 func TestPipelineInspectorToolDefinitionsIncludeCoordinationTools(t *testing.T) {
-	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
+	pi, err := New(shared.PipelineInspectorConfig{Factory: newTestFactory(t), AgentID: "inspector-pipeline"}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -269,7 +269,7 @@ func TestPipelineInspectorToolDefinitionsIncludeCoordinationTools(t *testing.T) 
 }
 
 func TestPipelineInspectorSafetyHookAllowsSearchSkills(t *testing.T) {
-	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
+	pi, err := New(shared.PipelineInspectorConfig{Factory: newTestFactory(t), AgentID: "inspector-pipeline"}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -290,7 +290,7 @@ func TestPipelineInspectorSafetyHookAllowsSearchSkills(t *testing.T) {
 }
 
 func TestPipelineInspectorSafetyHookAllowsCoordinationTools(t *testing.T) {
-	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
+	pi, err := New(shared.PipelineInspectorConfig{Factory: newTestFactory(t), AgentID: "inspector-pipeline"}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -314,7 +314,7 @@ func TestPipelineInspectorSafetyHookAllowsCoordinationTools(t *testing.T) {
 }
 
 func TestPipelineInspectorSafetyHookBlocksPreparePipelineWriteContext(t *testing.T) {
-	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
+	pi, err := New(shared.PipelineInspectorConfig{Factory: newTestFactory(t), AgentID: "inspector-pipeline"}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

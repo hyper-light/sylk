@@ -3,7 +3,7 @@ package engineer
 import "testing"
 
 func TestEngineerBuildToolDefinitions_IncludeDiscoveryAndQualityTools(t *testing.T) {
-	e, err := New(Config{}, nil)
+	e, err := New(Config{Factory: newTestFactory(t)}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

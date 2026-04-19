@@ -14,12 +14,23 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 )
 
+// auditLayerInProgressKey is a context-scoped sentinel that marks the audit
+// branch as already running. Defense-in-depth against accidental re-entry
+// from a future skill that calls back into AuditLayer; today the only entry
+// path is the Go-side layer gate, but exposing audit_layer as a skill in the
+// past produced an infinite recursion loop, so the guard stays.
+type auditLayerInProgressKey struct{}
+
 // AuditLayer performs a comprehensive audit on a completed DAG layer.
 func (gi *GlobalInspector) AuditLayer(ctx context.Context, req *shared.LayerAuditRequest) (*shared.AuditResult, error) {
+	if _, alreadyRunning := ctx.Value(auditLayerInProgressKey{}).(struct{}); alreadyRunning {
+		return nil, fmt.Errorf("audit_layer re-entered for DAG %s layer %d while a parent audit is still in progress; refusing to recurse", req.DAGID, req.LayerIdx)
+	}
 	startTime := time.Now()
 
 	auditCtx, cancel := agentShared.WithoutDeadlineCancellation(ctx)
 	defer cancel()
+	auditCtx = context.WithValue(auditCtx, auditLayerInProgressKey{}, struct{}{})
 
 	lm := agentShared.LogMetaFromContext(ctx)
 	if lm.EventLogger != nil {
@@ -145,9 +156,20 @@ func (gi *GlobalInspector) buildAuditPrompt(req *shared.LayerAuditRequest) strin
 		}
 	}
 
-	prompt += "\nRun all critical analysis tools on the modified files. " +
-		"Check cross-file coherence. Validate plan adherence. " +
-		"Grade the layer quality. Escalate any blocking findings."
+	prompt += "\nRun the analysis tools you actually need on the modified files, " +
+		"check cross-file coherence with `cross_reference_changes`, " +
+		"validate plan adherence with `validate_plan_adherence`, and " +
+		"grade the layer with `grade_layer_quality` once you have the evidence. " +
+		"Escalate any blocking findings.\n\n" +
+		"## Terminal Action\n\n" +
+		"This audit turn ends with a global-review protocol action — never with prose alone. " +
+		"Once you have enough evidence to decide, choose exactly one:\n" +
+		"- `handoff_next` to `tester-global` for tester-backed validation of the merged surface (the normal exit path).\n" +
+		"- `challenge_global_tester`, `challenge_architect`, or `challenge_orchestrator` for a targeted, narrower follow-up question.\n" +
+		"- `finalize_global_review` only when this is the final whole-plan stage and the audit is closure-ready.\n" +
+		"- `commit_to_disk` only after `finalize_global_review` has returned ready-for-commit on a passing tester-backed review.\n\n" +
+		"Do not loop on additional analysis tools after you already have enough evidence to take one of these actions. " +
+		"Do not narrate the handoff in place of invoking it."
 
 	return prompt
 }
@@ -163,6 +185,9 @@ func (gi *GlobalInspector) buildWorkspaceAuditContext(ctx context.Context, req *
 			continue
 		}
 		for _, modified := range diff.ModifiedFiles {
+			if modified == nil {
+				continue
+			}
 			path := strings.TrimSpace(modified.Path)
 			if path == "" {
 				continue
@@ -244,6 +269,9 @@ func (gi *GlobalInspector) applyDeterministicAuditPrepass(
 			continue
 		}
 		for _, modified := range diff.ModifiedFiles {
+			if modified == nil {
+				continue
+			}
 			path := strings.TrimSpace(modified.Path)
 			if path == "" {
 				continue

@@ -32,7 +32,13 @@ func TestRestrictFileAccessDeniesKnowledgeWrites(t *testing.T) {
 	}
 }
 
-func TestRestrictWorkspaceViewsDeniesLibrarianVFSReads(t *testing.T) {
+// TestRestrictWorkspaceViewsLibrarianAllowsDiskAndGlobalDeniesPipeline pins
+// the librarian's read scope: disk and global are reachable through the
+// workspace-aware skills (so files staged in the global VFS but not yet
+// promoted to disk no longer surface as phantom "no such file" errors); the
+// pipeline-local view stays denied because the librarian operates above any
+// single pipeline.
+func TestRestrictWorkspaceViewsLibrarianAllowsDiskAndGlobalDeniesPipeline(t *testing.T) {
 	root := t.TempDir()
 	views := versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
 		DefaultView:  versioning.WorkspaceViewDisk,
@@ -43,8 +49,18 @@ func TestRestrictWorkspaceViewsDeniesLibrarianVFSReads(t *testing.T) {
 	if restricted == nil {
 		t.Fatal("restricted workspace views should not be nil")
 	}
-	if _, err := restricted.ReadFile(context.Background(), versioning.WorkspaceViewGlobal, "missing.txt", ""); err != versioning.ErrPermissionDenied {
-		t.Fatalf("ReadFile error = %v, want %v", err, versioning.ErrPermissionDenied)
+	// Disk and global must NOT short-circuit with permission-denied — they
+	// reach the delegate, which may then return a different error (such as
+	// "no active session VFS" in this test fixture). The important thing is
+	// that the authority layer no longer blocks the call.
+	if _, err := restricted.ReadFile(context.Background(), versioning.WorkspaceViewDisk, "missing.txt", ""); err == versioning.ErrPermissionDenied {
+		t.Fatal("disk view must be reachable for librarian")
+	}
+	if _, err := restricted.ReadFile(context.Background(), versioning.WorkspaceViewGlobal, "missing.txt", ""); err == versioning.ErrPermissionDenied {
+		t.Fatal("global view must be reachable for librarian")
+	}
+	if _, err := restricted.ReadFile(context.Background(), versioning.WorkspaceViewPipeline, "missing.txt", "task_1"); err != versioning.ErrPermissionDenied {
+		t.Fatalf("pipeline view ReadFile error = %v, want %v", err, versioning.ErrPermissionDenied)
 	}
 }
 

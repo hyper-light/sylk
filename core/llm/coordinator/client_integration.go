@@ -4,6 +4,9 @@ package coordinator
 
 import (
 	"context"
+	"log/slog"
+	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/core/llm"
@@ -91,6 +94,17 @@ type TrackedClientAdapter struct {
 	client       *llm.TrackedLLMClient
 	supervisor   llm.LLMSupervisor
 	providerName string
+
+	// streamWG tracks in-flight forwardStreamChunks goroutines so Shutdown
+	// can await them before returning.
+	streamWG sync.WaitGroup
+}
+
+// Shutdown blocks until every in-flight stream-forwarder goroutine on this
+// adapter has exited. Does not cancel in-flight forwarders; callers cancel
+// via the stream's context.
+func (a *TrackedClientAdapter) Shutdown() {
+	a.streamWG.Wait()
 }
 
 // NewTrackedClientAdapter creates an adapter that wraps a TrackedLLMClient.
@@ -183,11 +197,32 @@ func (a *TrackedClientAdapter) createErrorChannel() <-chan string {
 	return ch
 }
 
-// forwardStreamChunks forwards StreamChunks to a string channel.
+// forwardStreamChunks forwards StreamChunks to a string channel. The
+// forwarder is tracked in TrackedClientAdapter.streamWG and wrapped with
+// panic recovery so an inner-provider crash cannot strand the consumer on
+// an unclosed channel.
 func (a *TrackedClientAdapter) forwardStreamChunks(chunks <-chan llm.StreamChunk) <-chan string {
 	output := make(chan string, streamingChunkBufferSize)
-	go a.runStreamForwarder(chunks, output)
+	a.streamWG.Add(1)
+	go a.safeRunStreamForwarder(chunks, output)
 	return output
+}
+
+// safeRunStreamForwarder wraps runStreamForwarder with WaitGroup tracking
+// and panic recovery.
+func (a *TrackedClientAdapter) safeRunStreamForwarder(input <-chan llm.StreamChunk, output chan<- string) {
+	defer a.streamWG.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Default().Error("tracked client adapter stream forwarder: panic recovered",
+				"provider", a.providerName,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			// Ensure output is closed so the consumer unblocks.
+			func() { defer func() { _ = recover() }(); close(output) }()
+		}
+	}()
+	a.runStreamForwarder(input, output)
 }
 
 // runStreamForwarder reads chunks and forwards content to the output channel.

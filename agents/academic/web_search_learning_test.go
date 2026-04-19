@@ -9,7 +9,7 @@ import (
 )
 
 func TestAdaptiveNativeWebSearchLimit_DepthConditioned(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestAdaptiveNativeWebSearchLimit_DepthConditioned(t *testing.T) {
 }
 
 func TestAdaptiveNativeWebSearchLimit_CollapsesAfterUnproductiveSearches(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestAdaptiveNativeWebSearchLimit_CollapsesAfterUnproductiveSearches(t *test
 }
 
 func TestApplyAdaptiveWebSearchBudget_RemovesWebSearchWhenMarginalValueFallsBelowCost(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}

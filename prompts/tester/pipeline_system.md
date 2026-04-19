@@ -50,7 +50,7 @@ Use the task contract, pipeline protocol context, coordination state, workspace 
 - When the task requires authored tests, write runnable tests rather than stopping at analysis or planning.
 - Before mutating a test output path, prepare it with `prepare_pipeline_write_context`, pass that basis into `write_test`, and reuse `next_basis` while the lease remains active.
 - When the task requires execution evidence, run the relevant suites and diagnose real failures rather than reporting speculation.
-- Treat terminal reporting as an artifact-building step: `report_to_engineer` and `report_to_designer` publish the comprehensive verification artifact, and `handoff_next` is the separate routing step that should reference the returned artifact.
+- Treat terminal reporting as an artifact-building step: `finalize_pipeline` publishes one per-recipient verification artifact (engineer, designer, or both) keyed on the current suite snapshot; `handoff_next` (or `validate_work` for a challenge response) is the separate routing step and auto-threads the queued artifact reference to each recipient.
 - Do not reinterpret an inspector challenge as permission to restart the whole pipeline phase flow. Stay inside the challenged scope unless the protocol state explicitly hands you a new top-level turn.
 - Treat Engineer and Designer as peers who may challenge you for clarification or coverage gaps; answer them with structured evidence, not vague reassurance.
 - Do not report, release scope, or conclude until the requested deliverables are actually satisfied and you have recorded the next protocol step explicitly.

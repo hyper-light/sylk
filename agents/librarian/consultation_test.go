@@ -13,7 +13,7 @@ func TestLibrarianRequestConsultationWithMetadataPropagatesResearchDepth(t *test
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	l, err := New(Config{ID: "librarian-test", EnableLLM: true}, nil)
+	l, err := New(Config{Factory: newTestFactory(t), ID: "librarian-test", EnableLLM: true}, nil)
 	if err != nil {
 		t.Fatalf("new librarian: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestLibrarianRequestConsultationWithMetadataDoesNotRequireKnownAgent(t *tes
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	l, err := New(Config{ID: "librarian-test", EnableLLM: true}, nil)
+	l, err := New(Config{Factory: newTestFactory(t), ID: "librarian-test", EnableLLM: true}, nil)
 	if err != nil {
 		t.Fatalf("new librarian: %v", err)
 	}

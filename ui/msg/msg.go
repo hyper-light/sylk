@@ -3,6 +3,7 @@ package msg
 import (
 	"time"
 
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/lsp"
@@ -44,6 +45,53 @@ type TokenUsageMsg struct {
 	AgentType        string
 	PipelineID       string
 	TaskID           string
+
+	// Typed identity surface populated from ActivityEvent when the
+	// provider emits typed Identity/Task refs (Step 3 MultiHook).
+	// Empty when not available. These fields let the status bar and
+	// agent panel key on stable per-replica UIDs instead of parsing
+	// the legacy "agent#replica-corr" string convention.
+	AgentUID       string
+	Generation     uint64
+	OwnerAgentUID  string
+	TaskUID        string
+	TaskCorrelation string
+}
+
+// TokenDeltaMsg is the typed-identity form of a token-usage delta
+// published by AccountantBridge. Unlike TokenUsageMsg (which is
+// derived from activity events and filters to Outcome=Success),
+// TokenDeltaMsg flows directly from accounting.Accountant.Subscribe()
+// and carries the full typed *AgentIdentity + *TaskRef pair used as
+// the aggregator's primary key. UI consumers that want per-replica,
+// per-generation, or per-task breakdown key on Identity/Task
+// directly; AgentID-string fallbacks are derivable via Identity.Panel().
+type TokenDeltaMsg struct {
+	Timestamp        time.Time
+	Identity         *identity.AgentIdentity
+	Task             *identity.TaskRef
+	Model            string
+	Phase            string // "request", "response", "error"
+	Billable         bool
+	InputTokens      int
+	OutputTokens     int
+	ReasoningTokens  int
+	CacheReadTokens  int
+	CacheWriteTokens int
+	ElapsedMS        int64
+}
+
+// AccountingSnapshotMsg is broadcast by AccountantBridge periodically
+// (or on first connect) so the status bar can render a total-tokens
+// view without maintaining its own running counter. The status bar
+// consumer reads TotalInput+TotalOutput.
+type AccountingSnapshotMsg struct {
+	Timestamp      time.Time
+	TotalInput     int64
+	TotalOutput    int64
+	TotalReasoning int64
+	TotalRequests  int64
+	TotalErrors    int64
 }
 
 // ---------------------------------------------------------------------------
@@ -56,16 +104,22 @@ type StreamStartMsg struct {
 	CorrelationID       string
 	ParentCorrelationID string
 	TopLevelTransfer    bool
-	AgentID             string // Raw responding agent ID; UI layers canonicalize separately when needed.
-	RuntimeAgentID      string
-	AgentType           string
-	AgentName           string
-	PipelineID          string
-	TaskID              string
-	TaskName            string
-	TaskSlug            string
-	Visibility          events.EventVisibility
-	BranchRef           *InterAgentBranchRefMsg
+	// ContinuationOfCorrelationID, when non-empty, marks this start as the
+	// resumption of an earlier turn on the originator agent (e.g. the
+	// inspector receiving a validate_work response to its own challenge).
+	// The TUI routes the new correlation into the existing chat entry for
+	// this CID instead of opening a new top-level entry.
+	ContinuationOfCorrelationID string
+	AgentID                     string // Raw responding agent ID; UI layers canonicalize separately when needed.
+	RuntimeAgentID              string
+	AgentType                   string
+	AgentName                   string
+	PipelineID                  string
+	TaskID                      string
+	TaskName                    string
+	TaskSlug                    string
+	Visibility                  events.EventVisibility
+	BranchRef                   *InterAgentBranchRefMsg
 }
 
 // StreamChunkMsg carries a streaming text chunk from an LLM response.

@@ -42,7 +42,7 @@ type NativeWebSearchResult struct {
 // so the existing tool-call UI can render it without a special case.
 func (c NativeWebSearchCall) ToolCall() ToolCall {
 	return ToolCall{
-		ID:        c.ID,
+		ID:        EnsureToolCallID(c.ID),
 		Name:      "web_search",
 		Arguments: c.ArgumentsJSON(),
 	}

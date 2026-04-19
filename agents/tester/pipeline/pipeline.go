@@ -18,6 +18,7 @@ import (
 	"github.com/adalundhe/sylk/agents/tester"
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
@@ -38,9 +39,11 @@ type pipelineTesterProvider interface {
 
 // PipelineTester validates individual task implementations within pipelines.
 type PipelineTester struct {
-	id     string
-	config shared.PipelineTesterConfig
-	logger *slog.Logger
+	id       string
+	config   shared.PipelineTesterConfig
+	logger   *slog.Logger
+	identity *identity.AgentIdentity
+	factory  *identity.Factory
 
 	// LLM provider (OpenAI gpt-5.4-pro with xhigh reasoning).
 	provider pipelineTesterProvider
@@ -129,6 +132,16 @@ func New(cfg shared.PipelineTesterConfig, provider pipelineTesterProvider) (*Pip
 		requestSerializer: agentshared.NewRequestSerializer(),
 		executionBroker:   purevfs.DefaultExecutionBroker(),
 	}
+
+	pt.factory = cfg.Factory
+	pipelineTesterIdentity, err := cfg.Factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeTesterPipeline,
+		Pod:  identity.PodRef{ID: "pipeline", Type: identity.PodTypePipeline},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("tester-pipeline: mint identity: %w", err)
+	}
+	pt.identity = pipelineTesterIdentity
 
 	pt.steering.InitLazy("tester-pipeline", nil)
 
@@ -241,8 +254,6 @@ func (pt *PipelineTester) registerCoreSkills() {
 	pt.skills.Register(versioning.NewEditPipelineFileSkill(writeCfg))
 	pt.skills.Register(versioning.NewDeletePipelineFileSkill(writeCfg))
 	pt.skills.Register(versioning.NewCreatePipelineDirectorySkill(writeCfg))
-	pt.skills.Register(reportToEngineerSkill(pt))
-	pt.skills.Register(reportToDesignerSkill(pt))
 	for _, skill := range agentshared.CoordinationSkills(agentshared.CoordinationSkillConfig{
 		Client: agentshared.CoordinationClient{
 			BusProvider:     func() guide.EventBus { return pt.bus },
@@ -270,6 +281,8 @@ func (pt *PipelineTester) registerCoreSkills() {
 				agentshared.PublishPipelineHandoffReroute(pt.bus, pt.channels, ctx, "tester-pipeline", toAgentID, reason, newCorrelationID)
 			},
 		},
+		TesterFinalize:       pt.finalizeForTargets,
+		TesterCurrentSuiteID: pt.currentSuiteID,
 	}) {
 		pt.skills.Register(skill)
 	}
@@ -601,8 +614,6 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	ctx := reqCtx
 	ctx = agentshared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, agentshared.MergeStreamMetadata(fwd.Metadata, map[string]any{
 		"pipeline_task": true,
-		"agent_type":    "tester-pipeline",
-		"agent_name":    "Tester",
 		"pipeline_id":   pt.pipelineID,
 		"task_id":       pt.pipelineID,
 		"task_slug":     pt.pipelineSlug,
@@ -610,6 +621,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 		"dag_id":        taskContextString(fwd.Metadata, "dag_id"),
 		"node_id":       taskContextString(fwd.Metadata, "node_id"),
 	}))
+	ctx = agentshared.WithOwnedStreamIdentity(ctx, "tester-pipeline", "Tester")
 	ctx, usageAcc := agentshared.WithUsageAccumulator(ctx)
 	ctx = agentshared.WithSteeringLedger(ctx, ledger)
 	ctx = agentshared.WithLogMeta(ctx, agentshared.LogMeta{
@@ -618,6 +630,25 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 		AgentID:     pt.id,
 		SessionID:   fwd.SessionID,
 	})
+	if pt.factory != nil && pt.identity != nil {
+		var pipeline *identity.PipelineRef
+		if pt.pipelineID != "" {
+			pipeline = &identity.PipelineRef{
+				ID:    identity.PipelineID(pt.pipelineID),
+				Stage: "test",
+			}
+		}
+		task, taskErr := pt.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+			Pipeline:    pipeline,
+		})
+		if taskErr != nil {
+			return fmt.Errorf("tester-pipeline: mint task: %w", taskErr)
+		}
+		ctx = identity.WithIdentity(ctx, pt.identity)
+		ctx = identity.WithTask(ctx, task)
+	}
 	allowedHandoff := agentshared.AutomaticHandoffAllowedForForwardedRequest(fwd)
 	ctx = agentshared.WithAutomaticHandoffEnabled(ctx, allowedHandoff)
 	ctx = handoff.WithTransportRetryHandoff(ctx, handoff.TransportRetryHandoffConfig{

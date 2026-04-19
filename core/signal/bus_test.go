@@ -768,3 +768,125 @@ func TestSignalBus_MultipleCloseIsSafe(t *testing.T) {
 	wg.Wait()
 	// Should not panic
 }
+
+// TestSignalBus_OverflowListener closes MSG-05: the previously-silent drop on
+// a full subscriber channel now increments a counter and fires the listener.
+func TestSignalBus_OverflowListener(t *testing.T) {
+	bus := signal.NewSignalBus(signal.DefaultSignalBusConfig())
+	defer bus.Close()
+
+	// Cap-1 channel. First broadcast fills it; second must drop.
+	ch := make(chan signal.SignalMessage, 1)
+	sub := signal.SignalSubscriber{
+		ID:      "sub-overflow",
+		AgentID: "agent-overflow",
+		Signals: []signal.Signal{signal.PauseAll},
+		Channel: ch,
+	}
+	require.NoError(t, bus.Subscribe(sub))
+
+	var events []signal.DroppedSignalEvent
+	var mu sync.Mutex
+	bus.SetOverflowListener(func(evt signal.DroppedSignalEvent) {
+		mu.Lock()
+		events = append(events, evt)
+		mu.Unlock()
+	})
+
+	require.NoError(t, bus.Broadcast(signal.SignalMessage{ID: "ok", Signal: signal.PauseAll}))
+	require.NoError(t, bus.Broadcast(signal.SignalMessage{ID: "dropped", Signal: signal.PauseAll}))
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(events) == 1
+	}, time.Second, 5*time.Millisecond, "listener should have observed 1 drop")
+
+	mu.Lock()
+	evt := events[0]
+	mu.Unlock()
+	assert.Equal(t, "sub-overflow", evt.SubscriberID)
+	assert.Equal(t, "agent-overflow", evt.AgentID)
+	assert.Equal(t, signal.PauseAll, evt.Signal)
+	assert.Equal(t, "dropped", evt.SignalID)
+	assert.Equal(t, uint64(1), evt.TotalDropped)
+	assert.Equal(t, uint64(1), bus.DroppedCount())
+}
+
+// TestSignalBus_OverflowListener_NilOK verifies clearing the listener is safe.
+func TestSignalBus_OverflowListener_NilOK(t *testing.T) {
+	bus := signal.NewSignalBus(signal.DefaultSignalBusConfig())
+	defer bus.Close()
+	bus.SetOverflowListener(func(signal.DroppedSignalEvent) {})
+	bus.SetOverflowListener(nil)
+	// Broadcast to no subscribers — should not panic.
+	require.NoError(t, bus.Broadcast(signal.SignalMessage{ID: "x", Signal: signal.PauseAll}))
+}
+
+// TestSignalBus_ConcurrentCloseAndWaitForAcks is a regression guard for MSG-08.
+// On re-inspection the existing code is safe: lock order is consistent
+// (b.mu → pa.mu) and pa.done is either already closed or closed under Lock.
+// This test exercises the concurrent path under -race.
+func TestSignalBus_ConcurrentCloseAndWaitForAcks(t *testing.T) {
+	bus := signal.NewSignalBus(signal.DefaultSignalBusConfig())
+
+	ch := make(chan signal.SignalMessage, 1)
+	require.NoError(t, bus.Subscribe(signal.SignalSubscriber{
+		ID:      "race-sub",
+		AgentID: "race-agent",
+		Signals: []signal.Signal{signal.PauseAll},
+		Channel: ch,
+	}))
+	require.NoError(t, bus.Broadcast(signal.SignalMessage{
+		ID:          "race-msg",
+		Signal:      signal.PauseAll,
+		RequiresAck: true,
+	}))
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = bus.WaitForAcks("race-msg", 500*time.Millisecond)
+	}()
+	go func() {
+		defer wg.Done()
+		bus.Close()
+	}()
+	wg.Wait()
+}
+
+// TestSignalBus_CleanupClosesPendingAckChannels is a regression guard for
+// MSG-07. cleanupExpiredPendingAcks MUST close pa.done before removing the
+// map entry, otherwise a parallel WaitForAcks would block forever. We
+// verify by starting WaitForAcks with a long timeout and relying on cleanup
+// (short TTL) to unblock it.
+func TestSignalBus_CleanupClosesPendingAckChannels(t *testing.T) {
+	cfg := signal.DefaultSignalBusConfig()
+	cfg.PendingAckTTL = 50 * time.Millisecond
+	cfg.CleanupInterval = 25 * time.Millisecond
+	bus := signal.NewSignalBus(cfg)
+	defer bus.Close()
+
+	ch := make(chan signal.SignalMessage, 1)
+	require.NoError(t, bus.Subscribe(signal.SignalSubscriber{
+		ID:      "cleanup-sub",
+		AgentID: "cleanup-agent",
+		Signals: []signal.Signal{signal.PauseAll},
+		Channel: ch,
+	}))
+	require.NoError(t, bus.Broadcast(signal.SignalMessage{
+		ID:          "cleanup-msg",
+		Signal:      signal.PauseAll,
+		RequiresAck: true,
+	}))
+
+	start := time.Now()
+	// Long timeout — relying on cleanup-driven channel close to return early.
+	_, err := bus.WaitForAcks("cleanup-msg", 10*time.Second)
+	elapsed := time.Since(start)
+	assert.NoError(t, err)
+	assert.Less(t, elapsed, time.Second,
+		"WaitForAcks must return shortly after TTL cleanup closes pa.done; got %v", elapsed)
+}
+

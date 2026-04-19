@@ -746,6 +746,13 @@ func (p *AnthropicProvider) buildParams(req *Request) anthropic.MessageNewParams
 	applyAnthropicToolChoice(&params, req.ToolChoice, req.DisableParallelToolUse, p.outboundAnthropicToolName)
 
 	params.Thinking = p.resolveThinkingConfig(req.ThinkingBudget, maxTokens)
+	// All Anthropic requests pair adaptive thinking with
+	// output_config.effort = max. "max" is the canonical
+	// "think as long as needed" depth per the Anthropic API
+	// contract for Claude 4.x models.
+	params.OutputConfig = anthropic.OutputConfigParam{
+		Effort: anthropic.OutputConfigEffortMax,
+	}
 	thinkingEnabled := isAnthropicThinkingEnabled(params.Thinking)
 
 	// TopP and TopK are incompatible with extended thinking — the API
@@ -874,17 +881,20 @@ func oauthSystemDynamicPrompt(systemPrompt string) string {
 }
 
 // resolveThinkingConfig returns the thinking configuration for a request.
-// Adaptive thinking takes precedence over budget-based thinking.
-func (p *AnthropicProvider) resolveThinkingConfig(requestBudget int, maxTokens int) anthropic.ThinkingConfigParamUnion {
-	if p.config.AdaptiveThinking {
-		adaptive := anthropic.NewThinkingConfigAdaptiveParam()
-		return anthropic.ThinkingConfigParamUnion{OfAdaptive: &adaptive}
-	}
-	budget := normalizeAnthropicThinkingBudget(resolveThinkingBudget(requestBudget, p.config.ThinkingBudget), maxTokens)
-	if budget <= 0 {
-		return anthropic.ThinkingConfigParamUnion{}
-	}
-	return anthropic.ThinkingConfigParamOfEnabled(int64(budget))
+//
+// Every Anthropic model in this codebase uses the `thinking.type =
+// adaptive` shape paired with `output_config.effort = max` (applied
+// in the MessageNewParams build below). The legacy
+// `thinking.type = enabled` + integer budget variant is not routed —
+// opus-4.7 rejects it outright, and forcing adaptive uniformly
+// avoids per-model branching.
+//
+// requestBudget and maxTokens are retained on the signature for
+// call-site compatibility but are no longer used: depth is
+// controlled by output_config.effort.
+func (p *AnthropicProvider) resolveThinkingConfig(_ int, _ int) anthropic.ThinkingConfigParamUnion {
+	adaptive := anthropic.NewThinkingConfigAdaptiveParam()
+	return anthropic.ThinkingConfigParamUnion{OfAdaptive: &adaptive}
 }
 
 // resolveThinkingBudget returns the thinking budget to use. Request-level takes
@@ -1204,7 +1214,7 @@ func (p *AnthropicProvider) convertResponse(msg *anthropic.Message) *Response {
 		case anthropic.ToolUseBlock:
 			args, _ := b.Input.MarshalJSON()
 			toolCalls = append(toolCalls, ToolCall{
-				ID:        b.ID,
+				ID:        EnsureToolCallID(b.ID),
 				Name:      p.inboundAnthropicToolName(b.Name),
 				Arguments: string(args),
 			})
@@ -1286,12 +1296,13 @@ func (p *AnthropicProvider) convertStreamEvent(event anthropic.MessageStreamEven
 	case anthropic.ContentBlockStartEvent:
 		if ev.ContentBlock.Type == "tool_use" {
 			tb := ev.ContentBlock.AsAny().(anthropic.ToolUseBlock)
-			toolCallIDForIndex[ev.Index] = tb.ID
+			stableID := EnsureToolCallID(tb.ID)
+			toolCallIDForIndex[ev.Index] = stableID
 			return &StreamChunk{
 				Index: index,
 				Type:  ChunkTypeToolStart,
 				ToolCall: &ToolCallChunk{
-					ID:   tb.ID,
+					ID:   stableID,
 					Name: p.inboundAnthropicToolName(tb.Name),
 				},
 				Timestamp: time.Now(),
@@ -1300,12 +1311,13 @@ func (p *AnthropicProvider) convertStreamEvent(event anthropic.MessageStreamEven
 		if ev.ContentBlock.Type == "server_tool_use" {
 			tb := ev.ContentBlock.AsAny().(anthropic.ServerToolUseBlock)
 			if native := anthropicServerToolUseToNativeWebSearch(tb); native != nil {
-				toolCallIDForIndex[ev.Index] = tb.ID
+				stableID := EnsureToolCallID(tb.ID)
+				toolCallIDForIndex[ev.Index] = stableID
 				return &StreamChunk{
 					Index: index,
 					Type:  ChunkTypeToolStart,
 					ToolCall: &ToolCallChunk{
-						ID:             tb.ID,
+						ID:             stableID,
 						Name:           "web_search",
 						Kind:           ToolKindNativeWebSearch,
 						ArgumentsDelta: native.ArgumentsJSON(),

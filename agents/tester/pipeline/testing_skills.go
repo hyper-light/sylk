@@ -159,7 +159,7 @@ func planTestsSkill(pt *PipelineTester) *skills.Skill {
 		Usage("Use after risk analysis to turn the defect surface into concrete, purposeful test cases. The resulting plan should make the next write_test step clear.").
 		Requirement("Prefer to run after analyze_risk or provide equivalent risk areas in the input.").
 		Satisfies("Produces the tester plan artifact and defines the concrete cases that write_test should materialize before suite execution and reporting.").
-		Avoid("Do not treat the plan as completion. A terminal tester handoff still requires write_test, run_test_suite, and report_to_engineer or report_to_designer before handoff_next.").
+		Avoid("Do not treat the plan as completion. A terminal tester handoff still requires write_test, run_test_suite, and finalize_pipeline before handoff_next.").
 		ArrayParam("files", "Source files that need test coverage", "string", false).
 		StringParam("task_spec", "Task brief and acceptance criteria", false).
 		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
@@ -269,7 +269,7 @@ func runTestSuiteSkill(pt *PipelineTester) *skills.Skill {
 		Keywords("run", "test", "suite", "race", "execute").
 		Priority(92).
 		Usage("Use after write_test when the task requires execution evidence or when you need a concrete failing signal to diagnose. Target the most relevant packages, files, or tests instead of running blindly.").
-		Satisfies("Produces suite execution evidence and the raw failure signal needed for diagnose_failure and for the final report_to_engineer or report_to_designer artifact.").
+		Satisfies("Produces suite execution evidence and the raw failure signal needed for diagnose_failure and for the per-recipient verification artifact published by finalize_pipeline.").
 		Avoid("Do not use as a substitute for write_test when the task still requires new test artifacts, and do not stop here when the turn still requires terminal reporting plus handoff_next.").
 		ArrayParam("packages", "Package patterns to test", "string", false).
 		ArrayParam("files", "Source or test files to focus on", "string", false).

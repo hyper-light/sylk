@@ -17,6 +17,7 @@ import (
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/forest"
@@ -38,9 +39,11 @@ type globalTesterProvider interface {
 // GlobalTester architects and runs integration/e2e/cross-cutting tests
 // after a batch of concurrent pipelines completes.
 type GlobalTester struct {
-	id     string
-	config shared.GlobalTesterConfig
-	logger *slog.Logger
+	id       string
+	config   shared.GlobalTesterConfig
+	logger   *slog.Logger
+	identity *identity.AgentIdentity
+	factory  *identity.Factory
 
 	// LLM provider (OpenAI gpt-5.4-pro with xhigh reasoning).
 	provider  globalTesterProvider
@@ -120,6 +123,16 @@ func New(cfg shared.GlobalTesterConfig, provider providers.ProviderAdapter) (*Gl
 		requestSerializer: agentshared.NewRequestSerializer(),
 		executionBroker:   purevfs.DefaultExecutionBroker(),
 	}
+
+	gt.factory = cfg.Factory
+	globalTesterIdentity, err := cfg.Factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeTesterGlobal,
+		Pod:  identity.PodRef{ID: "tester", Type: identity.PodTypeSingleton},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("tester: mint identity: %w", err)
+	}
+	gt.identity = globalTesterIdentity
 
 	gt.steering.InitLazy("tester", cfg.ActivityPub)
 
@@ -599,6 +612,7 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	}
 	ctx = withTesterStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
+	ctx = agentshared.WithOwnedStreamIdentity(ctx, "tester-global", "Tester")
 	ctx, usageAcc := withTesterUsageAccumulator(ctx)
 
 	// Create steering ledger for this request.
@@ -611,6 +625,17 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 		AgentID:     gt.id,
 		SessionID:   fwd.SessionID,
 	})
+	if gt.factory != nil && gt.identity != nil {
+		task, taskErr := gt.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+		})
+		if taskErr != nil {
+			return fmt.Errorf("tester: mint task: %w", taskErr)
+		}
+		ctx = identity.WithIdentity(ctx, gt.identity)
+		ctx = identity.WithTask(ctx, task)
+	}
 	allowedHandoff := agentshared.AutomaticHandoffAllowedForForwardedRequest(fwd)
 	ctx = agentshared.WithAutomaticHandoffEnabled(ctx, allowedHandoff)
 	ctx = handoff.WithTransportRetryHandoff(ctx, handoff.TransportRetryHandoffConfig{

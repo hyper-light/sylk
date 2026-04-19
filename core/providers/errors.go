@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/openai/openai-go"
+	"google.golang.org/genai"
 )
 
 // Common provider errors
@@ -285,25 +287,102 @@ func NewProviderError(provider ProviderType, operation string, err error) *Provi
 }
 
 // parseError extracts information from provider-specific errors using typed
-// error inspection rather than string matching.
+// error inspection rather than string matching. Dispatches across supported
+// SDKs (Anthropic, Google genai, OpenAI) and falls back to generic net.Error
+// detection so Retry-After / retryability is extracted regardless of which
+// construction path (NewProviderError vs. provider-specific builders) is used.
 func (e *ProviderError) parseError(err error) {
-	var anthropicErr *anthropic.Error
-	if errors.As(err, &anthropicErr) {
-		e.StatusCode = anthropicErr.StatusCode
-		e.Retryable = isRetryableHTTPStatus(anthropicErr.StatusCode) || isAnthropicOverloadedError(anthropicErr)
-		if anthropicErr.Response != nil {
-			if d, ok := parseRetryAfterHeader(anthropicErr.Response.Header); ok {
-				e.RetryAfter = d
-			}
+	parsers := []func(error) bool{
+		e.parseAnthropicFields,
+		e.parseGoogleFields,
+		e.parseOpenAIFields,
+	}
+	for _, parse := range parsers {
+		if parse(err) {
+			return
 		}
-		parseContextTooLarge(e.Message, e)
+	}
+	e.parseNetworkFields(err)
+}
+
+func (e *ProviderError) parseAnthropicFields(err error) bool {
+	var ae *anthropic.Error
+	if !errors.As(err, &ae) {
+		return false
+	}
+	e.StatusCode = ae.StatusCode
+	e.Retryable = anthropicRetryable(ae)
+	e.RetryAfter = anthropicRetryAfter(ae)
+	parseContextTooLarge(e.Message, e)
+	return true
+}
+
+func anthropicRetryable(ae *anthropic.Error) bool {
+	return isRetryableHTTPStatus(ae.StatusCode) || isAnthropicOverloadedError(ae)
+}
+
+func anthropicRetryAfter(ae *anthropic.Error) time.Duration {
+	if ae.Response == nil {
+		return 0
+	}
+	d, _ := parseRetryAfterHeader(ae.Response.Header)
+	return d
+}
+
+func (e *ProviderError) parseGoogleFields(err error) bool {
+	var apiErr genai.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	e.StatusCode = apiErr.Code
+	e.Retryable = isGoogleRetryableStatus(apiErr.Code)
+	applyGoogleQuota(apiErr, e)
+	e.RetryAfter = maxRetryAfter(e.RetryAfter, googleRetryAfterDuration(apiErr))
+	parseContextTooLarge(apiErr.Message, e)
+	return true
+}
+
+func googleRetryAfterDuration(apiErr genai.APIError) time.Duration {
+	d, _ := googleRetryAfter(apiErr)
+	return d
+}
+
+func applyGoogleQuota(apiErr genai.APIError, e *ProviderError) {
+	quota := classifyGoogleQuota(apiErr)
+	if quota == nil {
 		return
 	}
+	applyGoogleQuotaFields(quota, e)
+}
+
+func applyGoogleQuotaFields(quota *GoogleQuotaInfo, e *ProviderError) {
+	if quota.Class == GoogleQuotaTerminal {
+		e.Retryable = false
+	}
+	if quota.RetryDelay > 0 {
+		e.RetryAfter = quota.RetryDelay
+	}
+}
+
+func (e *ProviderError) parseOpenAIFields(err error) bool {
+	var apiErr *openai.Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	e.StatusCode = apiErr.StatusCode
+	e.Retryable = isOpenAIRetryableStatus(apiErr.StatusCode)
+	d, _ := openAIRetryAfter(apiErr)
+	e.RetryAfter = d
+	parseContextTooLarge(e.Message, e)
+	return true
+}
+
+func (e *ProviderError) parseNetworkFields(err error) {
 	var netErr net.Error
-	if errors.As(err, &netErr) {
-		e.Retryable = netErr.Timeout() || isRetryableTransportError(err)
+	if !errors.As(err, &netErr) {
 		return
 	}
+	e.Retryable = netErr.Timeout() || isRetryableTransportError(err)
 }
 
 // IsRetryable checks if an error is retryable using typed error inspection.

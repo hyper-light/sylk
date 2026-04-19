@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/security"
@@ -88,6 +89,11 @@ type Config struct {
 
 	// Forest exposes Memory Forest governance precedent skills.
 	Forest shared.MemoryForestService
+
+	// Factory mints the Guardian's AgentIdentity at New() time. Required —
+	// every LLM dispatch goes through the provider gateway which rejects
+	// requests without typed identity on ctx.
+	Factory *identity.Factory
 }
 
 // applyDefaults fills in zero values with sensible defaults.
@@ -130,5 +136,10 @@ func (c *Config) validate() error {
 	if c.ActivityPub == nil {
 		return fmt.Errorf("guardian: ActivityPub is required")
 	}
+	// Factory is optional at construction time because the Guardian
+	// is a daemon that boots before the session (and thus the
+	// session-scoped Factory) exists. Callers wire it in after phase4
+	// via SetIdentityFactory; if still unset when a forwarded request
+	// arrives, dispatch fails loudly via ErrDispatchIdentityMissing.
 	return nil
 }

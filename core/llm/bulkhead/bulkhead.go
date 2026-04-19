@@ -3,6 +3,8 @@ package bulkhead
 
 import (
 	"context"
+	"log/slog"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -189,6 +191,16 @@ func (b *Bulkhead) transitionToHalfOpen() {
 
 // enqueue adds a request to the queue and waits for a slot.
 func (b *Bulkhead) enqueue(ctx context.Context) error {
+	// MaxQueueSize == 0 is documented to mean "no queue, immediate rejection".
+	// The queue channel is still created (buffered with capacity 0) and a
+	// processQueue goroutine drains it, so a naive `select { case <- b.queue:
+	// default }` races with the drainer: if processQueue is blocked on
+	// receive when this select runs, the send succeeds, the caller ends up
+	// in waitForSlot, and returns ErrQueueTimeout after QueueTimeout instead
+	// of ErrQueueFull. Honor the zero-queue contract explicitly.
+	if b.config.MaxQueueSize <= 0 {
+		return ErrQueueFull
+	}
 	req := &pendingRequest{
 		ctx:      ctx,
 		resultCh: make(chan AcquireResult, 1),
@@ -219,7 +231,10 @@ func (b *Bulkhead) waitForSlot(ctx context.Context, req *pendingRequest) error {
 	}
 }
 
-// processQueue handles pending requests from the queue.
+// processQueue handles pending requests from the queue. Panics in the
+// request-handling path are recovered so the worker keeps draining the
+// queue — without this, a single misbehaving handler would strand every
+// waiter in b.queue until the bulkhead was manually stopped.
 func (b *Bulkhead) processQueue() {
 	defer b.wg.Done()
 
@@ -229,9 +244,29 @@ func (b *Bulkhead) processQueue() {
 			b.drainQueue()
 			return
 		case req := <-b.queue:
-			b.handlePendingRequest(req)
+			b.safeHandlePendingRequest(req)
 		}
 	}
+}
+
+// safeHandlePendingRequest wraps handlePendingRequest with panic recovery,
+// keeping the queue processor alive across faulty handlers.
+func (b *Bulkhead) safeHandlePendingRequest(req *pendingRequest) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Default().Error("bulkhead processQueue: panic recovered",
+				"bulkhead_id", b.id,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			// Unblock the caller so they observe a failure rather than
+			// hanging on req.resultCh forever.
+			select {
+			case req.resultCh <- AcquireResult{Error: context.Canceled}:
+			default:
+			}
+		}
+	}()
+	b.handlePendingRequest(req)
 }
 
 // handlePendingRequest processes a single pending request.

@@ -45,6 +45,7 @@ func TestGuideRoute_ChatForwardsToCapableAgent(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -92,6 +93,7 @@ func TestGuideRoute_ChatFallsBackToGuideWhenUnsupported(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 

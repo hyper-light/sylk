@@ -794,21 +794,53 @@ func TestFormatToolDuration_SubMillisecondUsesLessThanOneMillisecond(t *testing.
 	}
 }
 
-func TestFormatToolCallDuration_InterAgentPendingUsesLiveElapsedAfterDispatchCompletion(t *testing.T) {
+func TestFormatToolCallDuration_ChallengePendingUsesLiveElapsedAfterDispatchCompletion(t *testing.T) {
+	// Challenge rows deliberately stay Pending after Complete=true while the
+	// challenged agent is still composing its response, so the duration must
+	// keep ticking. Other inter-agent kinds reach a terminal status at
+	// dispatch and freeze instead.
 	dispatchDuration := 100 * time.Millisecond
 	got := formatToolCallDuration(ToolCallRecord{
 		StartedAt: time.Now().Add(-1500 * time.Millisecond),
 		Duration:  dispatchDuration,
 		Completed: true,
 		InterAgent: &InterAgentTool{
+			Kind:   InterAgentToolChallenge,
 			Status: InterAgentToolPending,
 		},
 	})
 	if got == formatToolDuration(dispatchDuration) {
-		t.Fatalf("expected pending inter-agent duration to stay live after dispatch completion, got %q", got)
+		t.Fatalf("expected pending challenge duration to stay live after dispatch completion, got %q", got)
 	}
 	if got == "" {
-		t.Fatal("expected pending inter-agent duration to remain visible")
+		t.Fatal("expected pending challenge duration to remain visible")
+	}
+}
+
+func TestFormatToolCallDuration_NonChallengePendingFreezesOnCompletion(t *testing.T) {
+	// Approval/consult/store rows that somehow land in Completed=true with a
+	// stale Pending status (a missed terminal Status update — historically
+	// the "guardian - approved by user" stuck row) must freeze on the
+	// captured Duration so the row doesn't appear to keep growing forever.
+	dispatchDuration := 100 * time.Millisecond
+	for _, kind := range []InterAgentToolKind{
+		InterAgentToolApproval,
+		InterAgentToolConsult,
+		InterAgentToolStore,
+		"", // unknown kind defaults to freezing too
+	} {
+		got := formatToolCallDuration(ToolCallRecord{
+			StartedAt: time.Now().Add(-1500 * time.Millisecond),
+			Duration:  dispatchDuration,
+			Completed: true,
+			InterAgent: &InterAgentTool{
+				Kind:   kind,
+				Status: InterAgentToolPending,
+			},
+		})
+		if got != formatToolDuration(dispatchDuration) {
+			t.Fatalf("kind %q: expected frozen captured duration on completion, got %q", kind, got)
+		}
 	}
 }
 
@@ -1967,4 +1999,108 @@ func stripANSITest(s string) string {
 		i++
 	}
 	return out.String()
+}
+
+// TestToolCallVisuallyOrphaned_FlagsLongPendingWithSubsequentActivity covers
+// the (E) heuristic: a tool call that has been pending for more than the
+// orphan threshold AND has at least N completed peers after it in the same
+// list is treated as visually abandoned. The renderer swaps the live spinner
+// for a `?` so users are not misled by a still-spinning timer for a row whose
+// Complete event has very likely been lost.
+func TestToolCallVisuallyOrphaned_FlagsLongPendingWithSubsequentActivity(t *testing.T) {
+	now := time.Now()
+	calls := []ToolCallRecord{
+		{ToolCallKey: "stuck", ToolName: "summarize_workspace_state", StartedAt: now.Add(-2 * time.Minute)},
+		{ToolCallKey: "p1", ToolName: "coord_query_view", StartedAt: now.Add(-90 * time.Second), Completed: true, Success: true},
+		{ToolCallKey: "p2", ToolName: "coord_claim_scope", StartedAt: now.Add(-80 * time.Second), Completed: true, Success: true},
+		{ToolCallKey: "p3", ToolName: "prepare_pipeline_write_context", StartedAt: now.Add(-70 * time.Second), Completed: true, Success: true},
+	}
+	if !toolCallVisuallyOrphaned(calls, 0, now) {
+		t.Fatal("expected the long-pending call with 3 completed peers after it to be flagged orphaned")
+	}
+}
+
+// TestToolCallVisuallyOrphaned_DoesNotFlagFreshLongPending confirms a recent
+// pending call is never flagged, even after later peers complete. Many
+// genuinely slow tools (build runs, large summarizations) can outlast a few
+// quick peers.
+func TestToolCallVisuallyOrphaned_DoesNotFlagFreshLongPending(t *testing.T) {
+	now := time.Now()
+	calls := []ToolCallRecord{
+		{ToolCallKey: "fresh", ToolName: "summarize_workspace_state", StartedAt: now.Add(-5 * time.Second)},
+		{ToolCallKey: "p1", ToolName: "coord_query_view", StartedAt: now.Add(-4 * time.Second), Completed: true, Success: true},
+		{ToolCallKey: "p2", ToolName: "coord_claim_scope", StartedAt: now.Add(-3 * time.Second), Completed: true, Success: true},
+		{ToolCallKey: "p3", ToolName: "prepare_pipeline_write_context", StartedAt: now.Add(-2 * time.Second), Completed: true, Success: true},
+	}
+	if toolCallVisuallyOrphaned(calls, 0, now) {
+		t.Fatal("a 5s-old pending call must not be flagged orphaned regardless of peer completions")
+	}
+}
+
+// TestToolCallVisuallyOrphaned_DoesNotFlagWithoutSubsequentActivity confirms
+// the "agent has moved on" signal is required: a long-pending call with no
+// later peers stays unflagged because we cannot tell from one row alone
+// whether the tool is genuinely working or stuck.
+func TestToolCallVisuallyOrphaned_DoesNotFlagWithoutSubsequentActivity(t *testing.T) {
+	now := time.Now()
+	calls := []ToolCallRecord{
+		{ToolCallKey: "lone", ToolName: "summarize_workspace_state", StartedAt: now.Add(-2 * time.Minute)},
+	}
+	if toolCallVisuallyOrphaned(calls, 0, now) {
+		t.Fatal("a lone long-pending call must not be flagged orphaned without subsequent activity")
+	}
+}
+
+// TestToolCallVisuallyOrphaned_SkipsCompletedRows confirms completed rows
+// never get flagged regardless of age or surrounding peers.
+func TestToolCallVisuallyOrphaned_SkipsCompletedRows(t *testing.T) {
+	now := time.Now()
+	calls := []ToolCallRecord{
+		{ToolCallKey: "done", ToolName: "summarize_workspace_state", StartedAt: now.Add(-2 * time.Minute), Completed: true, Success: true},
+		{ToolCallKey: "p1", ToolName: "coord_query_view", StartedAt: now.Add(-90 * time.Second), Completed: true, Success: true},
+		{ToolCallKey: "p2", ToolName: "coord_claim_scope", StartedAt: now.Add(-80 * time.Second), Completed: true, Success: true},
+		{ToolCallKey: "p3", ToolName: "prepare_pipeline_write_context", StartedAt: now.Add(-70 * time.Second), Completed: true, Success: true},
+	}
+	if toolCallVisuallyOrphaned(calls, 0, now) {
+		t.Fatal("completed rows must never be flagged orphaned")
+	}
+}
+
+// TestToolCallVisuallyOrphaned_SkipsPendingChallengeRows confirms inter-agent
+// challenge rows that legitimately wait for a peer response are exempt from
+// the orphan heuristic — they are *expected* to remain pending after dispatch
+// until the response thread arrives, sometimes for many minutes.
+func TestToolCallVisuallyOrphaned_SkipsPendingChallengeRows(t *testing.T) {
+	now := time.Now()
+	calls := []ToolCallRecord{
+		{
+			ToolCallKey: "challenge",
+			ToolName:    "challenge_agent",
+			StartedAt:   now.Add(-2 * time.Minute),
+			InterAgent:  &InterAgentTool{Kind: InterAgentToolChallenge, Status: InterAgentToolPending},
+		},
+		{ToolCallKey: "p1", Completed: true, Success: true, StartedAt: now.Add(-90 * time.Second)},
+		{ToolCallKey: "p2", Completed: true, Success: true, StartedAt: now.Add(-80 * time.Second)},
+		{ToolCallKey: "p3", Completed: true, Success: true, StartedAt: now.Add(-70 * time.Second)},
+	}
+	if toolCallVisuallyOrphaned(calls, 0, now) {
+		t.Fatal("challenge rows must be exempt from the orphan heuristic — they are expected to wait")
+	}
+}
+
+// TestFormatToolCallDuration_OrphanedSwapsLiveSpinnerForGlyph confirms the
+// formatter renders the orphan glyph alongside the elapsed string when the
+// transient OrphanedAtRender flag is set on a render-time copy. The persisted
+// row is unaffected — flag is render-only.
+func TestFormatToolCallDuration_OrphanedSwapsLiveSpinnerForGlyph(t *testing.T) {
+	tc := ToolCallRecord{
+		ToolCallKey:      "stuck",
+		ToolName:         "summarize_workspace_state",
+		StartedAt:        time.Now().Add(-2 * time.Minute),
+		OrphanedAtRender: true,
+	}
+	got := formatToolCallDuration(tc)
+	if !strings.Contains(got, orphanGlyph) {
+		t.Fatalf("orphaned duration = %q, want it to contain the orphan glyph %q", got, orphanGlyph)
+	}
 }

@@ -10,7 +10,7 @@ import (
 )
 
 func TestApplyLLMRuntimeProfileUsesContextSessionMetadata(t *testing.T) {
-	a, err := New(Config{ID: "academic", SessionID: "sess-config"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic", SessionID: "sess-config"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestApplyLLMRuntimeProfileUsesContextSessionMetadata(t *testing.T) {
 }
 
 func TestApplyLLMRuntimeProfileQuickResearchDepthLowersResearchDeliberation(t *testing.T) {
-	a, err := New(Config{ID: "academic", SessionID: "sess-config"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic", SessionID: "sess-config"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestApplyLLMRuntimeProfileQuickResearchDepthLowersResearchDeliberation(t *t
 }
 
 func TestApplyLLMRuntimeProfileComprehensiveResearchDepthRaisesResearchDeliberation(t *testing.T) {
-	a, err := New(Config{ID: "academic", SessionID: "sess-config"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic", SessionID: "sess-config"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestApplyLLMRuntimeProfileComprehensiveResearchDepthRaisesResearchDeliberat
 }
 
 func TestAcademicCacheKeyIncludesResearchDepth(t *testing.T) {
-	a, err := New(Config{ID: "academic", SessionID: "sess-config"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic", SessionID: "sess-config"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}

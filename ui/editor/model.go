@@ -1095,7 +1095,8 @@ func (m *Model) WordAt(line, col int) string {
 	}
 	var b strings.Builder
 	for c := start; c < end; c++ {
-		b.WriteRune(m.buf.RuneAt(info.StartPos + c))
+		r, _ := m.buf.RuneAt(info.StartPos + c)
+		b.WriteRune(r)
 	}
 	return b.String()
 }
@@ -1144,7 +1145,7 @@ func (m *Model) IsWordCharAtPos(line, col int) bool {
 	if !ok || col >= info.Length {
 		return false
 	}
-	r := m.buf.RuneAt(info.StartPos + col)
+	r, _ := m.buf.RuneAt(info.StartPos + col)
 	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
 }
 
@@ -1159,7 +1160,7 @@ func (m *Model) WordBoundsAt(line, col int) (start, end int) {
 		if c < 0 || c >= info.Length {
 			return false
 		}
-		r := m.buf.RuneAt(info.StartPos + c)
+		r, _ := m.buf.RuneAt(info.StartPos + c)
 		return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
 	}
 	if !isWord(col) {
@@ -1873,7 +1874,7 @@ func (m *Model) runeColToByteCol(lineInfo buffer.LineInfo, runeCol int) int {
 	byteCol := 0
 	limit := min(runeCol, lineInfo.Length)
 	for i := range limit {
-		r := m.buf.RuneAt(lineInfo.StartPos + i)
+		r, _ := m.buf.RuneAt(lineInfo.StartPos + i)
 		byteCol += utf8.RuneLen(r)
 	}
 	return byteCol
@@ -2472,7 +2473,7 @@ func (m *Model) deleteSelection() {
 	length := end - start + 1
 	runes := make([]rune, length)
 	for i := range length {
-		runes[i] = m.buf.RuneAt(start + i)
+		runes[i], _ = m.buf.RuneAt(start + i)
 	}
 	m.buf.Delete(start, length)
 	m.undoTree.Record(buffer.EditOp{
@@ -2652,7 +2653,7 @@ func (m *Model) screenToBufferCol(line, screenCol int) int {
 	}
 	visCol := 0
 	for bufCol := 0; bufCol < info.Length; bufCol++ {
-		r := m.buf.RuneAt(info.StartPos + bufCol)
+		r, _ := m.buf.RuneAt(info.StartPos + bufCol)
 		charWidth := 1
 		if r == '\t' {
 			charWidth = editorTabWidth - (visCol % editorTabWidth)

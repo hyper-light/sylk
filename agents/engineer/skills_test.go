@@ -72,7 +72,7 @@ func TestRunCommandRejectsPipelineVFSWritesWithoutStrictBroker(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	e, err := New(Config{}, nil)
+	e, err := New(Config{Factory: newTestFactory(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestRunCommandUsesStrictBrokerOverlayWorkspace(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	e, err := New(Config{}, nil)
+	e, err := New(Config{Factory: newTestFactory(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestRunCommandWrapsDiskWorkspaceReadOnly(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	e, err := New(Config{}, nil)
+	e, err := New(Config{Factory: newTestFactory(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -76,6 +76,7 @@ func TestGuideStop_WithRegisteredAgent_DoesNotDeadlock(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -121,6 +122,7 @@ func TestGuide_ExplicitGuideTargetRespondsToSource(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -193,6 +195,7 @@ func TestGuide_ExplicitGuideTarget_UsesConfiguredSelfResponder(t *testing.T) {
 		AgentID:       "guide",
 		SessionID:     "test-session",
 		SelfResponder: fixedGuideResponder{reply: "real guide response"},
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -289,7 +292,8 @@ func TestCapabilityIndex_Remove(t *testing.T) {
 func TestGuide_SkillsLoaded(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	g, err := guide.NewWithAPIKey("", guide.Config{
-		Bus: bus,
+		Bus:     bus,
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -314,7 +318,8 @@ func toolDefsContain(defs []map[string]any, name string) bool {
 func TestGuide_HooksStats(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	g, err := guide.NewWithAPIKey("", guide.Config{
-		Bus: bus,
+		Bus:     bus,
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -329,7 +334,8 @@ func TestGuide_HooksStats(t *testing.T) {
 func TestSessionRouter_GetOrCreateSession(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	g, err := guide.NewWithAPIKey("", guide.Config{
-		Bus: bus,
+		Bus:     bus,
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -349,7 +355,8 @@ func TestSessionRouter_GetOrCreateSession(t *testing.T) {
 func TestSessionRouter_SetPreferredAgent(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	g, err := guide.NewWithAPIKey("", guide.Config{
-		Bus: bus,
+		Bus:     bus,
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -365,7 +372,8 @@ func TestSessionRouter_SetPreferredAgent(t *testing.T) {
 func TestSessionRouter_BlockAgent(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	g, err := guide.NewWithAPIKey("", guide.Config{
-		Bus: bus,
+		Bus:     bus,
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -385,7 +393,8 @@ func TestSessionRouter_BlockAgent(t *testing.T) {
 func TestSessionRouter_RemoveSession(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	g, err := guide.NewWithAPIKey("", guide.Config{
-		Bus: bus,
+		Bus:     bus,
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -513,7 +522,8 @@ func TestRouteVersionStore_Diff(t *testing.T) {
 func TestBatchProcessor_Add(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	g, err := guide.NewWithAPIKey("", guide.Config{
-		Bus: bus,
+		Bus:     bus,
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -542,7 +552,8 @@ func TestBatchProcessor_Add(t *testing.T) {
 func TestBatchProcessor_AddBatch(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	g, err := guide.NewWithAPIKey("", guide.Config{
-		Bus: bus,
+		Bus:     bus,
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -574,7 +585,8 @@ func TestBatchProcessor_AddBatch(t *testing.T) {
 func TestBatchProcessor_Stats(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	g, err := guide.NewWithAPIKey("", guide.Config{
-		Bus: bus,
+		Bus:     bus,
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -754,7 +766,8 @@ func TestCapabilityIndex_ConcurrentAccess(t *testing.T) {
 func TestSessionRouter_ConcurrentSessions(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	g, err := guide.NewWithAPIKey("", guide.Config{
-		Bus: bus,
+		Bus:     bus,
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 

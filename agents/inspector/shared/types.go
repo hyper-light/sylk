@@ -12,6 +12,7 @@ import (
 	"time"
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/events"
 )
 
@@ -441,6 +442,9 @@ type PipelineInspectorConfig struct {
 
 	// Forest exposes Memory Forest validation precedent skills.
 	Forest agentshared.MemoryForestService `json:"-"`
+
+	// Factory mints the Pipeline Inspector's AgentIdentity at New().
+	Factory *identity.Factory `json:"-"`
 }
 
 // DefaultPipelineInspectorConfig returns sensible defaults for the pipeline inspector.
@@ -495,6 +499,9 @@ type GlobalInspectorConfig struct {
 
 	// Forest exposes Memory Forest validation precedent skills.
 	Forest agentshared.MemoryForestService `json:"-"`
+
+	// Factory mints the Global Inspector's AgentIdentity at New().
+	Factory *identity.Factory `json:"-"`
 }
 
 // DefaultGlobalInspectorConfig returns sensible defaults for the global inspector.
@@ -707,7 +714,10 @@ type NodeDiffSnapshot struct {
 	NodeID string `json:"node_id"`
 
 	// ModifiedFiles lists the file diffs produced by this node.
-	ModifiedFiles []AuditFileDiff `json:"modified_files"`
+	// Stored as pointers because AuditFileDiff embeds a sync.Once (noCopy),
+	// so callers can range the slice idiomatically without copy-locks
+	// warnings and keep the lazy-diff cache coherent across accessors.
+	ModifiedFiles []*AuditFileDiff `json:"modified_files"`
 }
 
 // AuditFileDiff captures the before and after content of a modified file,

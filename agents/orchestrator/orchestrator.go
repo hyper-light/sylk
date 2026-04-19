@@ -15,6 +15,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
@@ -40,8 +41,10 @@ type OrchestratorProvider interface {
 // Identity: observational nervous system (provider-agnostic)
 // Role: Monitor workflows, track task health, submit events to Archivalist
 type Orchestrator struct {
-	config Config
-	state  *State
+	config   Config
+	state    *State
+	identity *identity.AgentIdentity
+	factory  *identity.Factory
 
 	bus         guide.EventBus
 	channels    *guide.AgentChannels
@@ -207,6 +210,15 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 	if provider != nil {
 		o.provider = provider
 	}
+	o.factory = cfg.Factory
+	orchestratorIdentity, err := cfg.Factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeOrchestrator,
+		Pod:  identity.PodRef{ID: "orchestrator", Type: identity.PodTypeDaemon},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: mint identity: %w", err)
+	}
+	o.identity = orchestratorIdentity
 	if cfg.EnableLLM {
 		o.eventCh = make(chan *busEvent, llmEventBufferSize)
 		o.bootGate = newBootstrapGate(cfg.BootstrapSafetyDeadline)
@@ -456,6 +468,7 @@ func (o *Orchestrator) SetScribeFactory(f shared.ScribeFactory) {
 		o.dagBridge.SetScribeFactory(f)
 	}
 }
+
 
 // SetTaskPodInfra wires the runtime/spec/session-VFS dependencies needed for
 // real task-scoped pipeline pods.
@@ -967,6 +980,18 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	ctx := reqCtx
 	startTime := time.Now()
 
+	if o.factory != nil && o.identity != nil {
+		task, taskErr := o.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+		})
+		if taskErr != nil {
+			return fmt.Errorf("orchestrator: mint task: %w", taskErr)
+		}
+		ctx = identity.WithIdentity(ctx, o.identity)
+		ctx = identity.WithTask(ctx, task)
+	}
+
 	o.logInfo("handleBusRequest: received",
 		"correlation_id", fwd.CorrelationID,
 		"source_agent", fwd.SourceAgentID,
@@ -979,6 +1004,7 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	// This mirrors the architect's handleForwardBusRequest pattern.
 	ctx = withOrchestratorStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = shared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
+	ctx = shared.WithOwnedStreamIdentity(ctx, "orchestrator", "Orchestrator")
 	ctx, usageAcc := withOrchestratorUsageAccumulator(ctx)
 
 	toolEmitter := shared.NewToolCallEmitter(o.bus, o.channels, o.config.AgentID, fwd.CorrelationID, fwd.SourceAgentID)

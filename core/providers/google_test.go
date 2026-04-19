@@ -309,6 +309,78 @@ func TestExtractGoogleRawContent_PreservesThoughtSignatureOnlyParts(t *testing.T
 	}
 }
 
+func TestRestoreGoogleRawContent_SplitsMixedReplayPartIntoSeparateGenaiParts(t *testing.T) {
+	raw := &googleSerializableContent{
+		Role: "model",
+		Parts: []googleSerializablePartItem{{
+			Text:             "streamed thought",
+			Thought:          true,
+			ThoughtSignature: []byte("sig-mixed"),
+			FunctionCallID:   "fc_mixed",
+			FunctionCallName: "default_api:clarify",
+			FunctionCallArgs: map[string]any{"question": "Clarify input"},
+		}},
+	}
+
+	restored := restoreGoogleRawContent(googleRawProviderData(raw))
+	if restored == nil {
+		t.Fatal("expected restored content")
+	}
+	if len(restored.Parts) != 2 {
+		t.Fatalf("got %d restored parts, want 2", len(restored.Parts))
+	}
+	if restored.Parts[0].FunctionCall != nil {
+		t.Fatal("expected first restored part to be text/thought only")
+	}
+	if restored.Parts[0].Text != "streamed thought" {
+		t.Fatalf("restored text = %q, want %q", restored.Parts[0].Text, "streamed thought")
+	}
+	if !restored.Parts[0].Thought {
+		t.Fatal("expected first restored part to be marked as thought")
+	}
+	if len(restored.Parts[0].ThoughtSignature) != 0 {
+		t.Fatalf("text part should not own the signature; got %q", string(restored.Parts[0].ThoughtSignature))
+	}
+	if restored.Parts[1].Text != "" {
+		t.Fatalf("second restored part text = %q, want empty", restored.Parts[1].Text)
+	}
+	if restored.Parts[1].FunctionCall == nil {
+		t.Fatal("expected second restored part to contain the function call")
+	}
+	if restored.Parts[1].FunctionCall.Name != "default_api:clarify" {
+		t.Fatalf("function call name = %q, want %q", restored.Parts[1].FunctionCall.Name, "default_api:clarify")
+	}
+	if !bytes.Equal(restored.Parts[1].ThoughtSignature, []byte("sig-mixed")) {
+		t.Fatalf("function call signature = %q, want %q", string(restored.Parts[1].ThoughtSignature), "sig-mixed")
+	}
+}
+
+func TestRestoreGoogleRawContent_KeepsSignatureOnFunctionCallPart(t *testing.T) {
+	raw := &googleSerializableContent{
+		Role: "model",
+		Parts: []googleSerializablePartItem{{
+			ThoughtSignature: []byte("sig-fc"),
+			FunctionCallID:   "fc_g3",
+			FunctionCallName: "default_api:store_archivalist",
+			FunctionCallArgs: map[string]any{"summary": "ok"},
+		}},
+	}
+
+	restored := restoreGoogleRawContent(googleRawProviderData(raw))
+	if restored == nil {
+		t.Fatal("expected restored content")
+	}
+	if len(restored.Parts) != 1 {
+		t.Fatalf("got %d restored parts, want 1", len(restored.Parts))
+	}
+	if restored.Parts[0].FunctionCall == nil {
+		t.Fatal("expected function call part")
+	}
+	if !bytes.Equal(restored.Parts[0].ThoughtSignature, []byte("sig-fc")) {
+		t.Fatalf("function call signature = %q, want %q", string(restored.Parts[0].ThoughtSignature), "sig-fc")
+	}
+}
+
 func TestGoogleStreamCollectorResponse_PreservesRawContentForReplay(t *testing.T) {
 	raw := extractGoogleRawContent(&genai.GenerateContentResponse{
 		Candidates: []*genai.Candidate{{

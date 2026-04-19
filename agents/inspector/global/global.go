@@ -16,6 +16,7 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/forest"
@@ -37,9 +38,11 @@ type inspectorProvider interface {
 
 // GlobalInspector validates cross-file architectural quality on DAG layer completion.
 type GlobalInspector struct {
-	id     string
-	config shared.GlobalInspectorConfig
-	logger *slog.Logger
+	id       string
+	config   shared.GlobalInspectorConfig
+	logger   *slog.Logger
+	identity *identity.AgentIdentity
+	factory  *identity.Factory
 
 	// LLM provider (Anthropic Opus 4.6).
 	provider  inspectorProvider
@@ -137,6 +140,16 @@ func New(cfg shared.GlobalInspectorConfig, provider providers.ProviderAdapter) (
 		Broker:        func() purevfs.ExecutionBroker { return gi.executionBroker },
 		RequireBroker: true,
 	})
+
+	gi.factory = cfg.Factory
+	inspectorIdentity, err := cfg.Factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeInspectorGlobal,
+		Pod:  identity.PodRef{ID: "inspector", Type: identity.PodTypeSingleton},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("inspector: mint identity: %w", err)
+	}
+	gi.identity = inspectorIdentity
 
 	gi.steering.InitLazy("inspector", cfg.ActivityPub)
 
@@ -535,6 +548,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 		defer agentShared.CloseGlobalReviewState(ctx)
 	}
 	ctx = agentShared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
+	ctx = agentShared.WithOwnedStreamIdentity(ctx, "inspector-global", "Inspector")
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	startTime := time.Now()
 
@@ -548,6 +562,17 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 		AgentID:     gi.id,
 		SessionID:   fwd.SessionID,
 	})
+	if gi.factory != nil && gi.identity != nil {
+		task, taskErr := gi.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+		})
+		if taskErr != nil {
+			return fmt.Errorf("inspector: mint task: %w", taskErr)
+		}
+		ctx = identity.WithIdentity(ctx, gi.identity)
+		ctx = identity.WithTask(ctx, task)
+	}
 	allowedHandoff := agentShared.AutomaticHandoffAllowedForForwardedRequest(fwd)
 	ctx = agentShared.WithAutomaticHandoffEnabled(ctx, allowedHandoff)
 	ctx = handoff.WithTransportRetryHandoff(ctx, handoff.TransportRetryHandoffConfig{

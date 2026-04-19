@@ -7,7 +7,7 @@ import (
 )
 
 func TestNew_UsesConfiguredAgentID(t *testing.T) {
-	pt, err := New(testershared.PipelineTesterConfig{AgentID: "tester-pipeline"}, nil)
+	pt, err := New(testershared.PipelineTesterConfig{Factory: newTestFactory(t), AgentID: "tester-pipeline"}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

@@ -1,6 +1,7 @@
 package guide
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 
@@ -133,7 +134,9 @@ func (a *ChannelBusSignalAdapter) Broadcast(msg signal.SignalMessage) error {
 	}
 
 	// Also publish to the ChannelBus signal topic for any ChannelBus
-	// subscribers (e.g. telemetry observers).
+	// subscribers (e.g. telemetry observers). Errors are non-fatal for the
+	// direct-delivery path (subscribers above have already received the
+	// signal) but must be observable so chronic failures surface.
 	topic := TopicSignal(string(msg.Signal))
 	busMsg := NewSignalBusMessage(msg.ID, &SignalPayload{
 		Signal:      string(msg.Signal),
@@ -142,7 +145,13 @@ func (a *ChannelBusSignalAdapter) Broadcast(msg signal.SignalMessage) error {
 		Payload:     msg.Payload,
 		RequiresAck: msg.RequiresAck,
 	})
-	_ = a.bus.Publish(topic, busMsg)
+	if err := a.bus.Publish(topic, busMsg); err != nil {
+		slog.Default().Warn("signal adapter: bus publish failed",
+			"topic", topic,
+			"signal", string(msg.Signal),
+			"signal_id", msg.ID,
+			"error", err)
+	}
 
 	return nil
 }
@@ -180,7 +189,13 @@ func (a *ChannelBusSignalAdapter) Acknowledge(ack signal.SignalAck) error {
 		State:        ack.State,
 		Checkpoint:   ack.Checkpoint,
 	})
-	_ = a.bus.Publish(TopicSignalAck, ackMsg)
+	if err := a.bus.Publish(TopicSignalAck, ackMsg); err != nil {
+		slog.Default().Warn("signal adapter: ack bus publish failed",
+			"topic", TopicSignalAck,
+			"signal_id", ack.SignalID,
+			"subscriber_id", ack.SubscriberID,
+			"error", err)
+	}
 
 	return nil
 }

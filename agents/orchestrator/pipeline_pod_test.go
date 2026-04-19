@@ -678,10 +678,11 @@ type trackingActivityPub struct {
 	events []*events.ActivityEvent
 }
 
-func (p *trackingActivityPub) PublishActivity(evt *events.ActivityEvent) {
+func (p *trackingActivityPub) PublishActivity(evt *events.ActivityEvent) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.events = append(p.events, evt)
+	return nil
 }
 
 func (p *trackingActivityPub) collected() []*events.ActivityEvent {

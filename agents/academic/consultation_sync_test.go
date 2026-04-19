@@ -19,7 +19,7 @@ func TestAcademicRequestConsultSync_UsesNestedChildStreamActivity(t *testing.T) 
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	a, err := New(Config{ID: "academic-custom", SessionID: "sess-1"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom", SessionID: "sess-1"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestAcademicRequestConsultation_UsesLiveSessionAndAcademicID(t *testing.T) 
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	a, err := New(Config{ID: "academic-custom", SessionID: "sess-config"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom", SessionID: "sess-config"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestAcademicRequestConsultation_PropagatesRouteHopsFromContext(t *testing.T
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	a, err := New(Config{ID: "academic-custom", SessionID: "sess-config"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom", SessionID: "sess-config"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestAcademicRequestConsultation_PropagatesRouteHopsFromContext(t *testing.T
 }
 
 func TestAcademicRequestConsultation_DeliberationPressureReturnsStructuredFailure(t *testing.T) {
-	a, err := New(Config{ID: "academic-custom", SessionID: "sess-config"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic-custom", SessionID: "sess-config"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}

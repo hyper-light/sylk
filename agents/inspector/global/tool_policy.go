@@ -23,7 +23,6 @@ func globalInspectorVisibleSkillNames() []string {
 		"summarize_workspace_state",
 		"run_command",
 		"run_shell_script",
-		"audit_layer",
 		"determine_audit_depth",
 		"challenge_global_tester",
 		"challenge_architect",

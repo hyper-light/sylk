@@ -91,7 +91,7 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 		if gov := agentshared.ContextGovernorFromContext(ctx); gov != nil {
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
-		gt.publishStreamChunk(ctx, agentshared.IntermediateToolTurnText(resp))
+		agentshared.PublishIntermediateToolTurn(gt.bus, gt.channels, ctx, gt.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
 			if err := agentshared.ValidateGlobalReviewCompletion(ctx, "tester"); err != nil {

@@ -50,6 +50,127 @@ func entryHasPendingInterAgentToolCalls(entry *ChatEntry) bool {
 	return false
 }
 
+// settleChallengeRowsForChildCID flips Pending challenge rows in entry whose
+// nested child activity (recursively) includes childCID. success=true marks
+// them Done; success=false marks them Failed. Used when the response stream
+// for that child has materialized — either as a top-level transfer back to
+// the parent or as a nested completion. Only Pending rows are touched; Done
+// and Failed rows are not re-touched.
+func settleChallengeRowsForChildCID(entry *ChatEntry, childCID string, success bool) bool {
+	if entry == nil {
+		return false
+	}
+	childCID = strings.TrimSpace(childCID)
+	if childCID == "" {
+		return false
+	}
+	changed := false
+	for i := range entry.ToolCalls {
+		record := &entry.ToolCalls[i]
+		if record.InterAgent == nil || record.InterAgent.Kind != InterAgentToolChallenge {
+			continue
+		}
+		if record.InterAgent.Status != InterAgentToolPending {
+			continue
+		}
+		if !interAgentToolHasChildCID(record.InterAgent, childCID) {
+			continue
+		}
+		if success {
+			record.InterAgent.Status = InterAgentToolDone
+		} else {
+			record.InterAgent.Status = InterAgentToolFailed
+		}
+		record.Completed = true
+		record.Success = success
+		changed = true
+	}
+	return changed
+}
+
+// interAgentToolHasChildCID reports whether childCID appears anywhere in the
+// row's nested child activity tree.
+func interAgentToolHasChildCID(row *InterAgentTool, childCID string) bool {
+	if row == nil {
+		return false
+	}
+	childCID = strings.TrimSpace(childCID)
+	if childCID == "" {
+		return false
+	}
+	var visit func([]InterAgentChildActivity) bool
+	visit = func(children []InterAgentChildActivity) bool {
+		for i := range children {
+			if strings.TrimSpace(children[i].CorrelationID) == childCID {
+				return true
+			}
+			for _, tc := range children[i].ToolCalls {
+				if tc.InterAgent != nil && visit(tc.InterAgent.Children) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return visit(row.Children)
+}
+
+// lastInterAgentTemplateMatch scans calls backwards (skipping non-inter-agent
+// rows) looking for the most recent inter-agent row and reports whether the
+// incoming record has the same template (kind, normalized target set, and
+// normalized summary). It returns the matched row index and true when the
+// incoming record is an immediate same-template repeat — the caller collapses
+// the two into a single row with an incremented RepeatCount instead of
+// appending a visual duplicate.
+//
+// Only the IMMEDIATE previous inter-agent row is considered. An intervening
+// different-template row breaks the run (those two rows are unrelated from the
+// user's perspective and should render separately).
+func lastInterAgentTemplateMatch(calls []ToolCallRecord, incoming *ToolCallRecord) (int, bool) {
+	if incoming == nil || incoming.InterAgent == nil {
+		return -1, false
+	}
+	for i := len(calls) - 1; i >= 0; i-- {
+		prev := calls[i]
+		if prev.InterAgent == nil {
+			continue
+		}
+		return i, interAgentTemplatesMatch(prev.InterAgent, incoming.InterAgent)
+	}
+	return -1, false
+}
+
+func interAgentTemplatesMatch(a, b *InterAgentTool) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a.Kind != b.Kind {
+		return false
+	}
+	if !interAgentStringSetsEqual(a.AgentTypes, b.AgentTypes) {
+		return false
+	}
+	return normalizeInterAgentTemplateText(a.Summary) == normalizeInterAgentTemplateText(b.Summary)
+}
+
+func interAgentStringSetsEqual(a, b []string) bool {
+	normA := normalizeAgentTypes(a)
+	normB := normalizeAgentTypes(b)
+	if len(normA) != len(normB) {
+		return false
+	}
+	for i := range normA {
+		if strings.TrimSpace(normA[i]) != strings.TrimSpace(normB[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeInterAgentTemplateText(text string) string {
+	return strings.Join(strings.Fields(text), " ")
+}
+
 func interAgentChildHasActiveVisual(child *InterAgentChildActivity) bool {
 	if child == nil {
 		return false
@@ -192,6 +313,7 @@ func updateInterAgentCompletion(record *ToolCallRecord, ev msg.ToolCallEventMsg)
 		record.InterAgent.Summary = row.Summary
 		record.InterAgent.ThreadKey = row.ThreadKey
 		record.InterAgent.Status = row.Status
+		ensureInterAgentTerminalStatus(record, ev)
 		return true
 	}
 
@@ -387,6 +509,7 @@ func buildInterAgentCompletionFallback(ev msg.ToolCallEventMsg, currentAgentType
 		if row, ok := interAgentRowFromMetadata(ev.InterAgent); ok {
 			record.Success = row.Status != InterAgentToolFailed
 		}
+		ensureInterAgentTerminalStatus(&record, ev)
 		return record, true
 	}
 	if record, ok := buildInterAgentStartRecord(ev); ok {
@@ -396,11 +519,14 @@ func buildInterAgentCompletionFallback(ev msg.ToolCallEventMsg, currentAgentType
 		record.Output = ev.Output
 		record.ErrorMsg = ev.ErrorMsg
 		if updateInterAgentCompletion(&record, ev) {
+			ensureInterAgentTerminalStatus(&record, ev)
 			return record, true
 		}
+		ensureInterAgentTerminalStatus(&record, ev)
+		return record, true
 	}
 	if row, ok := interAgentOriginUpdate(ev, currentAgentType); ok {
-		return ToolCallRecord{
+		record := ToolCallRecord{
 			ToolCallKey: ev.ToolCallKey,
 			ToolName:    ev.ToolName,
 			ArgsSummary: ev.ArgsSummary,
@@ -412,9 +538,43 @@ func buildInterAgentCompletionFallback(ev msg.ToolCallEventMsg, currentAgentType
 			Success:     row.Status != InterAgentToolFailed,
 			Completed:   true,
 			InterAgent:  row,
-		}, true
+		}
+		ensureInterAgentTerminalStatus(&record, ev)
+		return record, true
 	}
 	return ToolCallRecord{}, false
+}
+
+// ensureInterAgentTerminalStatus normalizes an inter-agent row's Status when a
+// completion event arrives without a usable terminal status in its metadata.
+// Without this guard, a Phase-Complete event whose InterAgent.Status was left
+// at the default "pending" produced a Completed=true record that the renderer
+// still showed as in-flight, because the spinner branch in
+// formatToolCallDuration only consulted Status.
+//
+// Successful Challenge rows legitimately land in Completed+Pending after the
+// local dispatch and stay there until the peer response arrives on the shared
+// thread — skipping the success branch preserves that. A FAILED challenge
+// (the handler rejected the call, or the tool loop returned an error) has no
+// peer coming back, so it must finalize as Failed now or the row hangs
+// forever. This is the "orchestrator challenge stuck at 486s" class of bug:
+// the LLM hallucinated an invalid target, the handler rejected, but the
+// Challenge exception kept the row rendering as pending.
+func ensureInterAgentTerminalStatus(record *ToolCallRecord, ev msg.ToolCallEventMsg) {
+	if record == nil || record.InterAgent == nil || !record.Completed {
+		return
+	}
+	if record.InterAgent.Status != InterAgentToolPending {
+		return
+	}
+	if !ev.Success {
+		record.InterAgent.Status = InterAgentToolFailed
+		return
+	}
+	if record.InterAgent.Kind == InterAgentToolChallenge {
+		return
+	}
+	record.InterAgent.Status = InterAgentToolDone
 }
 
 func interAgentRecordFromMetadata(ev msg.ToolCallEventMsg) (ToolCallRecord, bool) {

@@ -1,7 +1,6 @@
 package chat
 
 import (
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -794,6 +793,33 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		return nil
 	}
 
+	// Explicit originator-continuation: the routing layer told us this new
+	// correlation is the resumption of an earlier entry on the same agent
+	// (e.g. inspector receiving validate_work after issuing a challenge).
+	// Resolve to the existing entry directly and append inline — skipping
+	// the resumable-primary heuristics below, which key off tester→inspector
+	// child lineage inference and can miss.
+	if originatorCID := strings.TrimSpace(start.ContinuationOfCorrelationID); originatorCID != "" {
+		if idx := m.historyIndexForCorrelation(originatorCID); idx >= 0 {
+			chatDebugLog().Info("chat.handleStreamStart: RESUME_ORIGINATOR_CONTINUATION",
+				"correlation_id", cid,
+				"originator_correlation_id", originatorCID,
+				"responder_correlation_id", strings.TrimSpace(start.ParentCorrelationID),
+				"entry_index", idx,
+				"agent_id", start.AgentID,
+				"agent_type", streamAgentType)
+			if responderCID := strings.TrimSpace(start.ParentCorrelationID); responderCID != "" {
+				m.settleChallengeRowsForChildCIDInEntry(idx, responderCID, true)
+			}
+			m.clearResumablePrimary(originatorCID)
+			m.streams[cid] = m.resumeCompletedPrimaryEntry(idx, start, now)
+			return nil
+		}
+		chatDebugLog().Warn("chat.handleStreamStart: CONTINUATION_ENTRY_MISSING",
+			"correlation_id", cid,
+			"originator_correlation_id", originatorCID)
+	}
+
 	if oldCID, slot := m.reusableDeferredPrimaryStreamSlot(start); slot != nil {
 		chatDebugLog().Info("chat.handleStreamStart: REUSE_DEFERRED_SLOT",
 			"correlation_id", cid,
@@ -815,6 +841,15 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 			"agent_id", start.AgentID,
 			"runtime_agent_id", start.RuntimeAgentID,
 			"agent_type", streamAgentType)
+		// When the resumption arrives via an explicit top-level transfer, the
+		// transfer's ParentCorrelationID is the CID of the child whose response
+		// has now materialized. Settle any Pending challenge rows in the parent
+		// entry that were waiting on that child — without this, the rows spin
+		// forever (the StreamRerouteMsg-only settle path is bypassed by the
+		// validation flow which uses StreamStartMsg+chat_top_level_transfer).
+		if isExplicitTopLevelTransfer(start.ParentCorrelationID, start.BranchRef, start.TopLevelTransfer) {
+			m.settleChallengeRowsForChildCIDInEntry(idx, start.ParentCorrelationID, true)
+		}
 		m.clearResumablePrimary(oldCID)
 		delete(m.streams, oldCID)
 		m.streams[cid] = m.resumeCompletedPrimaryEntry(idx, start, now)
@@ -1171,6 +1206,15 @@ func (m *Model) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
 	return nil
 }
 
+// settleProtocolChallengeRowsForReroute flips ALL Pending challenge rows in
+// entry to Done. A reroute means the conversation has handed back to a new
+// stream — at that point any in-flight challenge rooted in this entry is
+// over. This is the coarse settle path used when we don't have a specific
+// child CID to match (the precise path lives in
+// settleChallengeRowsForChildCID, used by top-level-transfer and
+// nested-complete handlers). The previous thread-key prefix gate
+// (pipeline:/global_review:) was overly conservative and left non-protocol
+// challenges spinning forever.
 func settleProtocolChallengeRowsForReroute(entry *ChatEntry) bool {
 	if entry == nil {
 		return false
@@ -1184,20 +1228,12 @@ func settleProtocolChallengeRowsForReroute(entry *ChatEntry) bool {
 		if record.InterAgent.Status != InterAgentToolPending {
 			continue
 		}
-		if !isProtocolChallengeThreadKey(strings.TrimSpace(record.InterAgent.ThreadKey)) {
-			continue
-		}
 		record.InterAgent.Status = InterAgentToolDone
 		record.Completed = true
 		record.Success = true
 		changed = true
 	}
 	return changed
-}
-
-func isProtocolChallengeThreadKey(threadKey string) bool {
-	threadKey = strings.TrimSpace(threadKey)
-	return strings.HasPrefix(threadKey, pipelineThreadPrefix) || strings.HasPrefix(threadKey, globalReviewThreadPrefix)
 }
 
 // handleStreamError adds an error entry and cleans up the accumulator.
@@ -1389,61 +1425,23 @@ func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
 	return nil
 }
 
+// toolCallRecordMatchesEvent pairs a stored start record with an incoming
+// complete event by exact ToolCallKey (lifecycle ID) equality.
+//
+// Every emitted tool-call event carries the provider-stamped lifecycle ID
+// (see providers.EnsureToolCallID and agents/shared.toolCallEventKey), so
+// key equality is necessary and sufficient. Earlier fallbacks over tool
+// name or normalized args existed to paper over a bug where start/complete
+// keys drifted between streaming phases; that bug is gone, and the
+// fallbacks would only ever mask regressions if they returned now.
 func toolCallRecordMatchesEvent(record ToolCallRecord, ev msg.ToolCallEventMsg) bool {
-	recordName := strings.TrimSpace(record.ToolName)
-	eventName := strings.TrimSpace(ev.ToolName)
-	if recordName != "" && eventName != "" && recordName != eventName {
-		return false
-	}
 	recordKey := strings.TrimSpace(record.ToolCallKey)
 	eventKey := strings.TrimSpace(ev.ToolCallKey)
-	if recordKey != "" && eventKey != "" {
-		if recordKey == eventKey {
-			return true
-		}
-		return toolCallArgumentsMatch(record, ev)
-	}
-	if toolCallArgumentsMatch(record, ev) {
-		return true
-	}
-	return recordName != "" && recordName == eventName
+	return recordKey != "" && recordKey == eventKey
 }
 
 func toolCallRecordCanAcceptCompletion(record ToolCallRecord) bool {
 	return !record.Completed || record.SyntheticCompletion
-}
-
-func toolCallArgumentsMatch(record ToolCallRecord, ev msg.ToolCallEventMsg) bool {
-	recordArgs := toolCallArgumentsIdentity(record.FullArgs, record.ArgsSummary)
-	eventArgs := toolCallArgumentsIdentity(ev.FullArgs, ev.ArgsSummary)
-	if recordArgs == "" || eventArgs == "" {
-		return false
-	}
-	return recordArgs == eventArgs
-}
-
-func toolCallArgumentsIdentity(fullArgs, argsSummary string) string {
-	if normalized := normalizeToolCallArgumentsText(fullArgs); normalized != "" {
-		return "args:" + normalized
-	}
-	if normalized := normalizeToolCallArgumentsText(argsSummary); normalized != "" {
-		return "summary:" + normalized
-	}
-	return ""
-}
-
-func normalizeToolCallArgumentsText(text string) string {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return ""
-	}
-	var parsed any
-	if err := json.Unmarshal([]byte(text), &parsed); err == nil {
-		if normalized, marshalErr := json.Marshal(parsed); marshalErr == nil {
-			return string(normalized)
-		}
-	}
-	return strings.Join(strings.Fields(text), " ")
 }
 
 func shouldBackfillToolCallArgs(current, incoming string) bool {
@@ -1483,8 +1481,14 @@ func (m *Model) historyIndexForCorrelation(correlationID string) int {
 	defer m.history.mu.RUnlock()
 	for idx := m.history.count - 1; idx >= 0; idx-- {
 		physical := m.history.logicalToPhysical(idx)
-		if strings.TrimSpace(m.history.entries[physical].CorrelationID) == correlationID {
+		entry := &m.history.entries[physical]
+		if strings.TrimSpace(entry.CorrelationID) == correlationID {
 			return idx
+		}
+		for _, alt := range entry.AdditionalCorrelationIDs {
+			if strings.TrimSpace(alt) == correlationID {
+				return idx
+			}
 		}
 	}
 	return -1
@@ -1961,6 +1965,15 @@ func (m *Model) handleNestedStreamComplete(done msg.StreamCompleteMsg) bool {
 	finalizeNestedStreamToolCallsOnTerminal(slot.activity.ToolCalls, time.Now(), true, summary)
 	m.finalizeNestedStreamSlotIfReady(slot, time.Now())
 	m.syncPendingNestedStream(slot)
+	// Settle any Pending challenge rows in the parent entry that were waiting
+	// on this nested child. The parent CID is on the branchRef. Without this
+	// the row spins forever for non-protocol-prefixed thread keys (the
+	// reroute-only settle path doesn't fire for direct nested completions).
+	if parentCID := strings.TrimSpace(slot.branchRef.ParentCorrelationID); parentCID != "" {
+		if parentIdx := m.historyIndexForCorrelation(parentCID); parentIdx >= 0 {
+			m.settleChallengeRowsForChildCIDInEntry(parentIdx, strings.TrimSpace(done.CorrelationID), true)
+		}
+	}
 	return true
 }
 
@@ -1984,6 +1997,11 @@ func (m *Model) handleNestedStreamError(errMsg msg.StreamErrorMsg) bool {
 	finalizeNestedStreamToolCallsOnTerminal(slot.activity.ToolCalls, time.Now(), false, slot.activity.ResultSummary)
 	m.finalizeNestedStreamSlotIfReady(slot, time.Now())
 	m.syncPendingNestedStream(slot)
+	if parentCID := strings.TrimSpace(slot.branchRef.ParentCorrelationID); parentCID != "" {
+		if parentIdx := m.historyIndexForCorrelation(parentCID); parentIdx >= 0 {
+			m.settleChallengeRowsForChildCIDInEntry(parentIdx, strings.TrimSpace(errMsg.CorrelationID), false)
+		}
+	}
 	return true
 }
 
@@ -2225,12 +2243,22 @@ func (m *Model) pruneInterAgentChildActivity(parentCorrelationID, childCorrelati
 			if entry == nil {
 				return
 			}
-			if !pruneInterAgentChildActivityInToolCalls(
-				strings.TrimSpace(entry.CorrelationID),
-				entry.ToolCalls,
-				parentCorrelationID,
-				childCorrelationID,
-			) {
+			// Try the entry's primary CID and any additional CIDs recorded
+			// from later top-level-transfer resumptions. The branch ref's
+			// parentCorrelationID may match either.
+			pruned := false
+			for _, ownerCID := range entryCorrelationIDs(entry) {
+				if pruneInterAgentChildActivityInToolCalls(
+					ownerCID,
+					entry.ToolCalls,
+					parentCorrelationID,
+					childCorrelationID,
+				) {
+					pruned = true
+					break
+				}
+			}
+			if !pruned {
 				return
 			}
 			invalidateChatEntryRender(entry)
@@ -2489,13 +2517,38 @@ func (m *Model) updateInterAgentBranch(ref msg.InterAgentBranchRefMsg, fn func(*
 			if found || entry == nil {
 				return
 			}
-			if updateInterAgentBranchInToolCalls(entry.CorrelationID, &entry.ToolCalls, parentCorrelationID, parentToolCallKey, threadKey, kind, fn) {
-				invalidateChatEntryRender(entry)
-				found = true
+			// Try the entry's primary CID first, then any additional CIDs
+			// recorded from later top-level-transfer resumptions. The branch
+			// ref's parentCorrelationID may match either, depending on which
+			// stream pass created the inter-agent row.
+			for _, ownerCID := range entryCorrelationIDs(entry) {
+				if updateInterAgentBranchInToolCalls(ownerCID, &entry.ToolCalls, parentCorrelationID, parentToolCallKey, threadKey, kind, fn) {
+					invalidateChatEntryRender(entry)
+					found = true
+					return
+				}
 			}
 		})
 	}
 	return found
+}
+
+// entryCorrelationIDs returns the entry's primary CID followed by any
+// additional CIDs recorded across resumptions. Empty CIDs are skipped.
+func entryCorrelationIDs(entry *ChatEntry) []string {
+	if entry == nil {
+		return nil
+	}
+	out := make([]string, 0, 1+len(entry.AdditionalCorrelationIDs))
+	if cid := strings.TrimSpace(entry.CorrelationID); cid != "" {
+		out = append(out, cid)
+	}
+	for _, alt := range entry.AdditionalCorrelationIDs {
+		if cid := strings.TrimSpace(alt); cid != "" {
+			out = append(out, cid)
+		}
+	}
+	return out
 }
 
 func updateInterAgentBranchInToolCalls(
@@ -2924,25 +2977,13 @@ func mergeInterAgentChildren(prev, next []InterAgentChildActivity) []InterAgentC
 	return merged
 }
 
+// toolCallRecordsShareIdentity reports whether two records describe the same
+// tool call lifecycle. Every record carries the provider-stamped lifecycle
+// ID in ToolCallKey, so this is exact-key equality.
 func toolCallRecordsShareIdentity(left, right ToolCallRecord) bool {
 	leftKey := strings.TrimSpace(left.ToolCallKey)
 	rightKey := strings.TrimSpace(right.ToolCallKey)
-	if leftKey != "" && rightKey != "" && leftKey == rightKey {
-		return true
-	}
-	leftArgs := toolCallArgumentsIdentity(left.FullArgs, left.ArgsSummary)
-	rightArgs := toolCallArgumentsIdentity(right.FullArgs, right.ArgsSummary)
-	if leftArgs != "" && rightArgs != "" {
-		if leftArgs != rightArgs {
-			return false
-		}
-		leftName := strings.TrimSpace(left.ToolName)
-		rightName := strings.TrimSpace(right.ToolName)
-		return leftName == "" || rightName == "" || leftName == rightName
-	}
-	leftName := strings.TrimSpace(left.ToolName)
-	rightName := strings.TrimSpace(right.ToolName)
-	return leftName != "" && leftName == rightName
+	return leftKey != "" && leftKey == rightKey
 }
 
 func cloneInterAgentChildActivity(activity InterAgentChildActivity) InterAgentChildActivity {
@@ -3036,6 +3077,25 @@ func handleInterAgentToolCallInList(calls *[]ToolCallRecord, currentAgentType st
 			return false
 		}
 		record.StartedAt = ev.StartedAt
+		if idx, match := lastInterAgentTemplateMatch(*calls, &record); match {
+			current := (*calls)[idx].InterAgent.RepeatCount
+			if current < 2 {
+				(*calls)[idx].InterAgent.RepeatCount = 2
+			} else {
+				(*calls)[idx].InterAgent.RepeatCount = current + 1
+			}
+			if record.StartedAt.After((*calls)[idx].StartedAt) {
+				(*calls)[idx].StartedAt = record.StartedAt
+			}
+			(*calls)[idx].Completed = false
+			(*calls)[idx].SyntheticCompletion = false
+			(*calls)[idx].Duration = 0
+			(*calls)[idx].InterAgent.Status = InterAgentToolPending
+			(*calls)[idx].ToolCallKey = strings.TrimSpace(record.ToolCallKey)
+			(*calls)[idx].FullArgs = record.FullArgs
+			(*calls)[idx].ArgsSummary = record.ArgsSummary
+			return true
+		}
 		*calls = append(*calls, record)
 		return true
 	case 1:
@@ -3418,29 +3478,19 @@ func resolveChildToolCallTargetIndex(target *toggleTarget, calls []ToolCallRecor
 	return -1
 }
 
+// toggleTargetMatchesToolCall pairs a persisted toggle target with a
+// ToolCallRecord by exact ToolCallKey (lifecycle ID) equality. Every record
+// carries the provider-stamped ID, so key equality is necessary and
+// sufficient; there is no args- or name-based fallback.
 func toggleTargetMatchesToolCall(target *toggleTarget, record ToolCallRecord, child bool) bool {
 	if target == nil {
 		return false
 	}
 	key := strings.TrimSpace(target.toolCallKey)
-	name := strings.TrimSpace(target.toolCallName)
-	argsID := strings.TrimSpace(target.toolCallArgsID)
 	if child {
 		key = strings.TrimSpace(target.childToolCallKey)
-		name = strings.TrimSpace(target.childToolCallName)
-		argsID = strings.TrimSpace(target.childToolCallArgsID)
 	}
-	if key != "" && strings.TrimSpace(record.ToolCallKey) == key {
-		return true
-	}
-	recordArgsID := toolCallArgumentsIdentity(record.FullArgs, record.ArgsSummary)
-	if argsID != "" && recordArgsID == argsID {
-		return name == "" || strings.TrimSpace(record.ToolName) == name
-	}
-	if key == "" && argsID == "" && name != "" && strings.TrimSpace(record.ToolName) == name {
-		return true
-	}
-	return false
+	return key != "" && strings.TrimSpace(record.ToolCallKey) == key
 }
 
 func (m *Model) toggleTarget(target *toggleTarget) bool {
@@ -3460,7 +3510,6 @@ func (m *Model) toggleTarget(target *toggleTarget) bool {
 		target.toolCallIndex = toolCallIndex
 		target.toolCallKey = strings.TrimSpace(record.ToolCallKey)
 		target.toolCallName = strings.TrimSpace(record.ToolName)
-		target.toolCallArgsID = toolCallArgumentsIdentity(record.FullArgs, record.ArgsSummary)
 		switch target.kind {
 		case toggleTargetToolCall:
 			record.Expanded = !record.Expanded
@@ -3496,7 +3545,6 @@ func (m *Model) toggleTarget(target *toggleTarget) bool {
 			target.childToolCallIdx = childToolCallIdx
 			target.childToolCallKey = strings.TrimSpace(child.ToolCalls[childToolCallIdx].ToolCallKey)
 			target.childToolCallName = strings.TrimSpace(child.ToolCalls[childToolCallIdx].ToolName)
-			target.childToolCallArgsID = toolCallArgumentsIdentity(child.ToolCalls[childToolCallIdx].FullArgs, child.ToolCalls[childToolCallIdx].ArgsSummary)
 			child.ToolCalls[childToolCallIdx].Expanded = !child.ToolCalls[childToolCallIdx].Expanded
 			toggled = true
 		}
@@ -3583,33 +3631,21 @@ func toggleTargetsReferToSameItem(left, right *toggleTarget) bool {
 		if leftChildToolKey != "" && rightChildToolKey != "" {
 			return leftChildToolKey == rightChildToolKey
 		}
-		leftChildToolArgsID := strings.TrimSpace(left.childToolCallArgsID)
-		rightChildToolArgsID := strings.TrimSpace(right.childToolCallArgsID)
-		if leftChildToolArgsID != "" && rightChildToolArgsID != "" {
-			return leftChildToolArgsID == rightChildToolArgsID &&
-				(strings.TrimSpace(left.childToolCallName) == "" ||
-					strings.TrimSpace(right.childToolCallName) == "" ||
-					strings.TrimSpace(left.childToolCallName) == strings.TrimSpace(right.childToolCallName))
-		}
 		return left.childToolCallIdx == right.childToolCallIdx
 	default:
 		return false
 	}
 }
 
+// sameToolCallToggleTarget compares two toggle targets by lifecycle ID
+// (ToolCallKey). When keys are present on both (the normal case), equality
+// is definitive. When either key is missing (legacy target from before
+// reload), we fall back to the positional tool-call index.
 func sameToolCallToggleTarget(left, right *toggleTarget) bool {
 	leftKey := strings.TrimSpace(left.toolCallKey)
 	rightKey := strings.TrimSpace(right.toolCallKey)
 	if leftKey != "" && rightKey != "" {
 		return leftKey == rightKey
-	}
-	leftArgsID := strings.TrimSpace(left.toolCallArgsID)
-	rightArgsID := strings.TrimSpace(right.toolCallArgsID)
-	if leftArgsID != "" && rightArgsID != "" {
-		return leftArgsID == rightArgsID &&
-			(strings.TrimSpace(left.toolCallName) == "" ||
-				strings.TrimSpace(right.toolCallName) == "" ||
-				strings.TrimSpace(left.toolCallName) == strings.TrimSpace(right.toolCallName))
 	}
 	return left.toolCallIndex == right.toolCallIndex
 }
@@ -4523,6 +4559,26 @@ func (m *Model) updateStreamEntryMetadata(idx int, start msg.StreamStartMsg) {
 		if agentType := streamEntryAgentType(start); agentType != "" {
 			entry.AgentType = agentType
 		}
+		// The entry's primary CID always reflects the LATEST stream that
+		// took over the entry. Any prior CIDs accumulate in
+		// AdditionalCorrelationIDs so in-flight tool events keyed by the
+		// older CID still resolve to this entry via historyIndexForCorrelation.
+		// Without this, Phase=1 of tools that started under the old CID
+		// would strand and their spinners would never clear.
+		newCID := strings.TrimSpace(start.CorrelationID)
+		oldCID := strings.TrimSpace(entry.CorrelationID)
+		if newCID != "" && oldCID != "" && newCID != oldCID {
+			already := false
+			for _, existing := range entry.AdditionalCorrelationIDs {
+				if strings.TrimSpace(existing) == oldCID {
+					already = true
+					break
+				}
+			}
+			if !already {
+				entry.AdditionalCorrelationIDs = append(entry.AdditionalCorrelationIDs, oldCID)
+			}
+		}
 		entry.CorrelationID = start.CorrelationID
 		entry.SessionID = start.SessionID
 		entry.TaskID = strings.TrimSpace(start.TaskID)
@@ -4679,6 +4735,54 @@ func (m *Model) recordResumableCompletedPrimary(correlationID string, slot *stre
 	}
 }
 
+// settleChallengeRowsForChildCIDInEntry settles Pending challenge rows in
+// the entry at idx whose nested children include childCID. success=true
+// marks them Done; success=false marks them Failed. If the entry no longer
+// has any pending inter-agent rows after settling, the resumable-primary
+// registration for the entry's primary CID is also cleared so the entry can
+// finalize cleanly on its next StreamComplete instead of being kept
+// perpetually open. Returns true if the entry was modified.
+func (m *Model) settleChallengeRowsForChildCIDInEntry(idx int, childCID string, success bool) bool {
+	if m == nil || idx < 0 {
+		return false
+	}
+	childCID = strings.TrimSpace(childCID)
+	if childCID == "" {
+		return false
+	}
+	changed := false
+	var entryCID string
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		if e == nil {
+			return
+		}
+		if !settleChallengeRowsForChildCID(e, childCID, success) {
+			return
+		}
+		invalidateChatEntryRender(e)
+		entryCID = strings.TrimSpace(e.CorrelationID)
+		changed = true
+	})
+	if !changed {
+		return false
+	}
+	m.syncPendingInterAgentEntry(idx)
+	if entry := m.history.Get(idx); entry != nil && !entryHasPendingInterAgentToolCalls(entry) {
+		if entryCID != "" {
+			m.clearResumablePrimary(entryCID)
+		}
+	}
+	delete(m.resumableChildOwners, childCID)
+	m.viewDirty = true
+	return true
+}
+
+// noteResumableChildOwner records the child→owner linkage in
+// m.resumableChildOwners and, if the owner's resumable-primary state already
+// exists, also registers the child within state.children. The linkage is
+// populated regardless of resumable-primary state so a top-level transfer or
+// nested completion that arrives BEFORE the parent's stream completes can
+// still resolve the right entry.
 func (m *Model) noteResumableChildOwner(childCorrelationID, ownerCorrelationID string) {
 	if m == nil {
 		return
@@ -4688,19 +4792,17 @@ func (m *Model) noteResumableChildOwner(childCorrelationID, ownerCorrelationID s
 	if childCorrelationID == "" || ownerCorrelationID == "" {
 		return
 	}
-	state, ok := m.resumablePrimaries[ownerCorrelationID]
-	if !ok {
-		return
-	}
-	if state.children == nil {
-		state.children = make(map[string]struct{})
-	}
-	state.children[childCorrelationID] = struct{}{}
-	m.resumablePrimaries[ownerCorrelationID] = state
 	if m.resumableChildOwners == nil {
 		m.resumableChildOwners = make(map[string]string)
 	}
 	m.resumableChildOwners[childCorrelationID] = ownerCorrelationID
+	if state, ok := m.resumablePrimaries[ownerCorrelationID]; ok {
+		if state.children == nil {
+			state.children = make(map[string]struct{})
+		}
+		state.children[childCorrelationID] = struct{}{}
+		m.resumablePrimaries[ownerCorrelationID] = state
+	}
 }
 
 func (m *Model) clearResumablePrimary(correlationID string) {

@@ -15,10 +15,11 @@ type testActivityPub struct {
 	events []*events.ActivityEvent
 }
 
-func (t *testActivityPub) PublishActivity(e *events.ActivityEvent) {
+func (t *testActivityPub) PublishActivity(e *events.ActivityEvent) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.events = append(t.events, e)
+	return nil
 }
 
 func (t *testActivityPub) Events() []*events.ActivityEvent {

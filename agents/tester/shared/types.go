@@ -6,6 +6,7 @@ import (
 	"time"
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/events"
 )
 
@@ -150,6 +151,9 @@ type PipelineTesterConfig struct {
 
 	// Forest exposes Memory Forest testing precedent skills.
 	Forest agentshared.MemoryForestService `json:"-"`
+
+	// Factory mints the Pipeline Tester's AgentIdentity.
+	Factory *identity.Factory `json:"-"`
 }
 
 // DefaultPipelineTesterConfig returns sensible defaults.
@@ -183,6 +187,9 @@ type GlobalTesterConfig struct {
 
 	// Forest exposes Memory Forest testing precedent skills.
 	Forest agentshared.MemoryForestService `json:"-"`
+
+	// Factory mints the Global Tester's AgentIdentity.
+	Factory *identity.Factory `json:"-"`
 }
 
 // DefaultGlobalTesterConfig returns sensible defaults.

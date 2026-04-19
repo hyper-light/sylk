@@ -174,6 +174,20 @@ func (vbs *VersionBleveStore) rebuildLocked() error {
 		vbs.head = nil
 	}
 
+	// Scrub any stale bleve payload at the target path. Callers in
+	// openOrRebuildLocked nil vbs.head after a failed open, which means the
+	// Delete above is a no-op; the directory still exists on disk and causes
+	// the subsequent Open() to fail with "path already exists" when bleve
+	// creates a fresh index. Always clean the directory here so rebuild has
+	// a blank slate regardless of how we got here.
+	blevePath := vbs.HeadBlevePath()
+	bleveDBPath := filepath.Join(blevePath, "documents.bleve")
+	if _, statErr := os.Stat(bleveDBPath); statErr == nil {
+		if err := os.RemoveAll(bleveDBPath); err != nil {
+			return fmt.Errorf("remove stale head bleve for rebuild: %w", err)
+		}
+	}
+
 	// Read docs from HEAD version's shared data file (which is cumulative).
 	// Use registered doc store if available (has in-memory indexes).
 	var docs []*VersionDocument
@@ -189,7 +203,6 @@ func (vbs *VersionBleveStore) rebuildLocked() error {
 	}
 
 	// Open fresh Bleve
-	blevePath := vbs.HeadBlevePath()
 	vbs.head = NewBleveStoreAtPath(blevePath)
 	if err := vbs.head.Open(); err != nil {
 		vbs.head = nil

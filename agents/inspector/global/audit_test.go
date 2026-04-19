@@ -14,13 +14,13 @@ func TestApplyDeterministicAuditPrepass_FailedNodeAndSharedFile(t *testing.T) {
 		NodeDiffs: map[string]*shared.NodeDiffSnapshot{
 			"node-a": {
 				NodeID: "node-a",
-				ModifiedFiles: []shared.AuditFileDiff{
+				ModifiedFiles: []*shared.AuditFileDiff{
 					{Path: "internal/service.go"},
 				},
 			},
 			"node-b": {
 				NodeID: "node-b",
-				ModifiedFiles: []shared.AuditFileDiff{
+				ModifiedFiles: []*shared.AuditFileDiff{
 					{Path: "internal/service.go"},
 				},
 			},

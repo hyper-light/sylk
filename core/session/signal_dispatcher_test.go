@@ -85,10 +85,19 @@ func TestSignalDispatcher_SignalConsumed(t *testing.T) {
 		t.Fatal("timeout waiting for signal")
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	_, err = os.Stat(signalFile)
-	assert.True(t, os.IsNotExist(err))
+	// Poll for the consumer cleanup to remove the signal file. A fixed 100ms
+	// sleep here is flaky under concurrent test load because the cleanup
+	// goroutine may not have been scheduled yet; poll up to 5s instead.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(signalFile); os.IsNotExist(err) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("signal file %q not removed within 5s", signalFile)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func TestSignalDispatcher_MultipleHandlers(t *testing.T) {
@@ -121,7 +130,11 @@ func TestSignalDispatcher_MultipleHandlers(t *testing.T) {
 
 	require.NoError(t, dispatcher.Watch(ctx))
 
-	time.Sleep(50 * time.Millisecond)
+	// Let the fsnotify goroutine enter its select loop before writing the
+	// signal file. 50ms is enough on an idle machine but flakes under
+	// concurrent test load; 250ms gives a comfortable margin without slowing
+	// the common path noticeably.
+	time.Sleep(250 * time.Millisecond)
 
 	signalFile := filepath.Join(baseDir, "test-session", "shutdown-123.signal")
 	data := `{"type":"shutdown","from_session":"other","timestamp":"2024-01-01T00:00:00Z"}`
@@ -137,7 +150,7 @@ func TestSignalDispatcher_MultipleHandlers(t *testing.T) {
 	case <-done:
 		assert.True(t, handler1Called)
 		assert.True(t, handler2Called)
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for handlers")
 	}
 }

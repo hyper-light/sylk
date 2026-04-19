@@ -44,6 +44,7 @@ func TestValidateGuideSkillConfiguration(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory:   newTestFactory(t),
 	})
 	require.NoError(t, err)
 	require.NoError(t, validateGuideSkillConfiguration(g.skills))

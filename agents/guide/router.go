@@ -6,8 +6,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/anthropics/anthropic-sdk-go"
 )
 
 // =============================================================================
@@ -45,10 +43,10 @@ func NewRouter(client ClassifierClient, config RouterConfig) *Router {
 	}
 }
 
-// NewRouterWithAnthropicClient creates a router with an Anthropic client
-func NewRouterWithAnthropicClient(client *anthropic.Client, config RouterConfig) *Router {
-	return NewRouter(NewRealClassifierClient(client), config)
-}
+// NewRouterWithAnthropicClient was a raw anthropic.Client bootstrap
+// helper that bypassed the provider gateway. Removed per
+// docs/FIX_ID_AND_TOKENS.md — all LLM-backed routing now flows
+// through a providers.ProviderAdapter wrapped by the gateway.
 
 // Route routes a request to the appropriate agent.
 // This method is stateless - it performs classification and returns a result

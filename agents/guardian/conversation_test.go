@@ -151,6 +151,7 @@ func newTestGuardian(t *testing.T, provider guardianProvider) *Guardian {
 	t.Helper()
 
 	g, err := New(Config{
+		Factory: newTestFactory(t),
 		ActivityPub: events.NewTestActivityCollector(),
 		FileAccess:  versioning.NewDiskFileAccess(t.TempDir(), true),
 		Sanitizer:   security.NewSecretSanitizer(),

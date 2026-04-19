@@ -13,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
@@ -56,6 +57,8 @@ type Archivalist struct {
 	agentContext *AgentContext
 	config       Config
 	logger       *slog.Logger
+	identity     *identity.AgentIdentity
+	factory      *identity.Factory
 
 	// LLM provider (replaces direct anthropic.Client)
 	provider archivalistProvider
@@ -193,6 +196,10 @@ type Config struct {
 
 	// Forest exposes Memory Forest recall/prediction skills.
 	Forest shared.MemoryForestService
+
+	// Factory mints the Archivalist's AgentIdentity at New() time.
+	// On-demand agent, created after phase4.
+	Factory *identity.Factory
 }
 
 // New creates a new Archivalist agent with provider-based LLM.
@@ -203,6 +210,15 @@ func New(ctx context.Context, cfg Config) (*Archivalist, error) {
 		return nil, err
 	}
 	archivalist := assembleArchivalist(cfg, components)
+	archivalist.factory = cfg.Factory
+	archivalistIdentity, err := cfg.Factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeArchivalist,
+		Pod:  identity.PodRef{ID: "archivalist", Type: identity.PodTypeSingleton},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("archivalist: mint identity: %w", err)
+	}
+	archivalist.identity = archivalistIdentity
 	if err := shared.RegisterMemoryForestSkills(archivalist.skills, "archivalist", cfg.Forest, nil); err != nil {
 		return nil, fmt.Errorf("register archivalist forest skills: %w", err)
 	}
@@ -699,6 +715,18 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	defer a.clearRequestCancel(fwd.CorrelationID)
 	defer cancel()
 
+	if a.factory != nil && a.identity != nil {
+		task, taskErr := a.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+		})
+		if taskErr != nil {
+			return fmt.Errorf("archivalist: mint task: %w", taskErr)
+		}
+		reqCtx = identity.WithIdentity(reqCtx, a.identity)
+		reqCtx = identity.WithTask(reqCtx, task)
+	}
+
 	// Create steering ledger for this request.
 	ledger := a.steering.Create(fwd.CorrelationID, a.id, fwd.SessionID, nil, nil)
 	defer a.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
@@ -708,6 +736,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	emitter := shared.NewToolCallEmitter(a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
 	ctx = shared.WithForwardedStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
+	ctx = shared.WithOwnedStreamIdentity(ctx, "archivalist", "Archivalist")
 	ctx = shared.WithStreamEventVisibility(ctx, activityVisibility)
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
@@ -794,6 +823,8 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		var replicaErr error
 		var cleanupReplicaBridge func()
 		ctx, cleanupReplicaBridge, _, replicaErr = shared.AttachReplicaHandoffBridge(ctx, a, a.handoffBridge, shared.KnowledgeReplicaHandoffOptions{
+			Factory:           a.factory,
+			ParentIdentity:    a.identity,
 			SessionID:         fwd.SessionID,
 			CorrelationID:     fwd.CorrelationID,
 			ActivityPublisher: a.activityPub,

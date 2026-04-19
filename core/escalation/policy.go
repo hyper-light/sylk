@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/messaging"
 )
 
 // EscalationReason identifies why an escalation was triggered.
@@ -179,6 +180,105 @@ func (h *EscalationHistory) RecentForTask(taskID string, n int) []EscalationEven
 		}
 	}
 	return result
+}
+
+// RouterDispatchContext carries the minimum per-dispatch information that
+// a RouterHook needs to decide whether to let a request proceed.
+type RouterDispatchContext struct {
+	SessionID       string
+	CorrelationID   string
+	SourceAgent     string
+	TargetAgent     string
+	Input           string
+	ConfidenceChain []messaging.ConfidenceEntry
+	RerouteHistory  []messaging.RerouteHop
+	Depth           int
+}
+
+// RouterHookDecision describes the outcome of a RouterHook evaluation.
+// Allow=false causes the caller (Guide's routing path) to reject the
+// dispatch; GuardianGate=true causes it to additionally surface a
+// Guardian-gate event for user approval rather than a silent error.
+type RouterHookDecision struct {
+	Allow        bool
+	GuardianGate bool
+	Escalation   *EscalationTarget
+	Reason       string
+}
+
+// RouterHook is called by the routing layer immediately before a request
+// leaves the Guide for its target agent. It evaluates the current
+// envelope's ConfidenceChain and RerouteHistory against the escalation
+// policy and returns a decision that the routing layer obeys.
+//
+// Implementations MUST be fast and side-effect-free — the hook is in the
+// publish hot path.
+type RouterHook interface {
+	Evaluate(ctx RouterDispatchContext) RouterHookDecision
+}
+
+// PolicyRouterHook is the default RouterHook implementation. It combines
+// the workaround-budget check (ARCHITECTURE.md:12022) with the
+// composite-confidence escalation policy. Budget exhaustion triggers the
+// Guardian gate so the user can intervene; low-confidence composites
+// short-circuit with Allow=false + an escalation target.
+type PolicyRouterHook struct {
+	Policy  *EscalationPolicy
+	Weights ConfidenceWeights
+	History *EscalationHistory
+	// AgentType supplied to the derived ConfidenceLevel; typically the
+	// dispatch target's type (engineer / architect / ...).
+	AgentType string
+	// Category is the handoff category used to look up CategoryThresholds
+	// in the policy. Defaults to CategoryStandalone when zero.
+	Category handoff.AgentCategory
+}
+
+// Evaluate implements RouterHook.
+func (h *PolicyRouterHook) Evaluate(ctx RouterDispatchContext) RouterHookDecision {
+	if h == nil {
+		return RouterHookDecision{Allow: true}
+	}
+	if WorkaroundBudgetExceeded(ctx.ConfidenceChain, DefaultWorkaroundThreshold, DefaultMaxWorkarounds) {
+		return RouterHookDecision{
+			Allow:        false,
+			GuardianGate: true,
+			Reason:       "workaround budget exceeded",
+			Escalation: &EscalationTarget{
+				TargetAgent:     "user",
+				Reason:          ReasonRepeatedFailure,
+				Priority:        95,
+				SuggestedAction: ActionAskUser,
+				Context: map[string]any{
+					"correlation_id":  ctx.CorrelationID,
+					"reroute_hops":    len(ctx.RerouteHistory),
+					"chain_len":       len(ctx.ConfidenceChain),
+				},
+			},
+		}
+	}
+	if len(ctx.ConfidenceChain) == 0 || h.Policy == nil {
+		return RouterHookDecision{Allow: true}
+	}
+	target, shouldEsc := DetermineEscalationFromChain(
+		ctx.ConfidenceChain,
+		h.AgentType,
+		ctx.CorrelationID,
+		h.Weights,
+		h.Policy,
+		h.Category,
+		h.History,
+		ctx.Depth,
+	)
+	if !shouldEsc {
+		return RouterHookDecision{Allow: true}
+	}
+	return RouterHookDecision{
+		Allow:        false,
+		GuardianGate: target.SuggestedAction == ActionAskUser,
+		Reason:       "confidence chain failed policy",
+		Escalation:   target,
+	}
 }
 
 // DetermineEscalation evaluates whether an escalation is warranted.

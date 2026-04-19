@@ -13,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/core/knowledge/query"
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -30,6 +31,10 @@ func (l *Librarian) registerCoreSkills() {
 	l.skills.Register(symbolReferenceGraphSkill(l))
 
 	// Codebase exploration tools (always available).
+	// read_file / glob / grep are intentionally disk-only — they read what's
+	// committed to the working tree. The workspace-aware variants below reach
+	// into the global VFS overlay so the librarian can answer questions about
+	// in-flight session state without falsely reporting a file as missing.
 	l.skills.Register(readFileSkill(l))
 	l.skills.Register(globSkill(l))
 	l.skills.Register(grepSkill(l))
@@ -37,6 +42,17 @@ func (l *Librarian) registerCoreSkills() {
 	l.skills.Register(gitSkill(l))
 	l.skills.Register(lspSkill(l))
 	l.skills.Register(astGrepSearchSkill(l))
+
+	// Workspace-aware reads. The librarian's authority profile permits
+	// view=disk and view=global; pipeline-local views are denied at the
+	// authority layer, so the LLM can name them but the call is rejected.
+	viewsFn := func() versioning.WorkspaceViewAccess { return l.workspaceViews }
+	noPipelineFn := func() string { return "" }
+	l.skills.Register(versioning.NewReadWorkspaceFileSkill(viewsFn, noPipelineFn))
+	l.skills.Register(versioning.NewWorkspaceGlobSkill(viewsFn, noPipelineFn))
+	l.skills.Register(versioning.NewWorkspaceGrepSkill(viewsFn, noPipelineFn))
+	l.skills.Register(versioning.NewInspectWorkspaceStateSkill(viewsFn, noPipelineFn))
+	l.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(viewsFn, noPipelineFn))
 
 	// Knowledge graph search (available when knowledge store is wired).
 	l.skills.Register(knowledgeSearchSkill(l))

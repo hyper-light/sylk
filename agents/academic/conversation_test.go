@@ -38,7 +38,7 @@ func (p *conversationSearchOnlyProvider) Complete(_ context.Context, req *provid
 }
 
 func TestAcademicProcessForwardedRequest_UserFacingUsesConversationMode(t *testing.T) {
-	a, err := New(Config{ID: "academic"}, &conversationModeProvider{})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, &conversationModeProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestAcademicProcessForwardedRequest_UserFacingUsesConversationMode(t *testi
 
 func TestAcademicProcessForwardedRequest_AgentConsultUsesConsultationMode(t *testing.T) {
 	provider := &conversationModeProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestAcademicProcessForwardedRequest_AgentConsultUsesConsultationMode(t *tes
 
 func TestAcademicProcessForwardedRequest_AgentConsultQuickDepthAdjustsPromptAndRuntime(t *testing.T) {
 	provider := &conversationModeProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestAcademicProcessForwardedRequest_AgentConsultQuickDepthAdjustsPromptAndR
 
 func TestAcademicProcessForwardedRequest_ArchitectConsultExposesResearchPaperTool(t *testing.T) {
 	provider := &conversationModeProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestAcademicProcessForwardedRequest_ArchitectConsultExposesResearchPaperToo
 
 func TestAcademicProcessForwardedRequest_CustomArchitectIDExposesResearchPaperTool(t *testing.T) {
 	provider := &conversationModeProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestAcademicProcessForwardedRequest_CustomArchitectIDExposesResearchPaperTo
 }
 
 func TestAcademicWithConsultationTurnState_ArchitectRequiresTerminalResearchPaper(t *testing.T) {
-	a, err := New(Config{ID: "academic"}, &conversationModeProvider{})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, &conversationModeProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestAcademicWithConsultationTurnState_ArchitectRequiresTerminalResearchPape
 }
 
 func TestAcademicProcessForwardedRequest_ArchitectHandoffUsesConversationMode(t *testing.T) {
-	a, err := New(Config{ID: "academic"}, &conversationModeProvider{})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, &conversationModeProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestAcademicProcessForwardedRequest_ArchitectHandoffUsesConversationMode(t 
 
 func TestAcademicProcessForwardedRequest_UserFacingConversationPromptEncouragesWebSearch(t *testing.T) {
 	provider := &conversationModeProvider{}
-	a, err := New(Config{ID: "academic"}, provider)
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestAcademicProcessForwardedRequest_UserFacingConversationPromptEncouragesW
 }
 
 func TestAcademicProcessForwardedRequest_UserFacingSearchOnlyConversationWithoutSurfacedCandidateCanFinalize(t *testing.T) {
-	a, err := New(Config{ID: "academic", MaxToolRuns: 1}, &conversationSearchOnlyProvider{})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic", MaxToolRuns: 1}, &conversationSearchOnlyProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestAcademicProcessForwardedRequest_UserFacingSearchOnlyConversationWithout
 }
 
 func TestAcademicProcessForwardedRequest_ChildConsultSearchOnlyCanFinalize(t *testing.T) {
-	a, err := New(Config{ID: "academic", MaxToolRuns: 1}, &conversationSearchOnlyProvider{})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic", MaxToolRuns: 1}, &conversationSearchOnlyProvider{})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}

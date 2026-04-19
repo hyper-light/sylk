@@ -235,3 +235,84 @@ func TestIntermediateToolTurnText_UsesAgentAwareNarrationForInspector(t *testing
 		t.Fatalf("IntermediateToolTurnText inspector narration = %q, want %q", got, want)
 	}
 }
+
+// TestPublishWithLifecycleState_ToolCallBypassesTerminalGate pins the (A) fix:
+// once StreamComplete fires, text chunks are correctly suppressed but
+// StreamEventToolCall events MUST still reach the publisher. Dropping them
+// here was the largest single source of "tool completed but row stayed
+// pending" reports — synthetic inter-agent branches (guardian approval
+// callback, archivalist consult response) and slow handlers can both
+// legitimately deliver a Complete after the parent stream's terminal lifecycle
+// ends, and the UI cannot recover the row from bytes that never reached the
+// bus.
+func TestPublishWithLifecycleState_ToolCallBypassesTerminalGate(t *testing.T) {
+	lifecycle := &streamLifecycleState{}
+
+	// Drive the stream to its terminal state.
+	chunkPublished := false
+	if delivered, _ := publishWithLifecycleState(lifecycle, guide.StreamEventData, func() { chunkPublished = true }); !delivered {
+		t.Fatal("pre-terminal chunk must be delivered")
+	}
+	if !chunkPublished {
+		t.Fatal("expected chunk publish to fire")
+	}
+	if delivered, _ := publishWithLifecycleState(lifecycle, guide.StreamEventComplete, func() {}); !delivered {
+		t.Fatal("StreamComplete must be delivered")
+	}
+
+	// After terminal: text chunks are correctly dropped, tool-call events MUST
+	// still pass through and the lateBypass signal MUST fire so callers can
+	// log telemetry.
+	lateChunkPublished := false
+	if delivered, late := publishWithLifecycleState(lifecycle, guide.StreamEventData, func() { lateChunkPublished = true }); delivered {
+		t.Fatal("post-terminal chunk must be suppressed")
+	} else if late {
+		t.Fatal("post-terminal chunk must not flag lateBypass")
+	}
+	if lateChunkPublished {
+		t.Fatal("late chunk publish must not fire")
+	}
+
+	for _, eventType := range []guide.StreamEventType{guide.StreamEventToolCall} {
+		published := false
+		delivered, late := publishWithLifecycleState(lifecycle, eventType, func() { published = true })
+		if !delivered {
+			t.Fatalf("%s must bypass the terminal gate", eventType)
+		}
+		if !late {
+			t.Fatalf("%s after terminal must report lateBypass=true for telemetry", eventType)
+		}
+		if !published {
+			t.Fatalf("%s publish callback must fire", eventType)
+		}
+	}
+}
+
+// TestPublishWithLifecycleState_ToolCallBeforeTerminalDoesNotFlagBypass
+// confirms the lateBypass signal only fires when the bypass actually rescued
+// an event — pre-terminal tool-call events flow through the normal path with
+// no telemetry noise.
+func TestPublishWithLifecycleState_ToolCallBeforeTerminalDoesNotFlagBypass(t *testing.T) {
+	lifecycle := &streamLifecycleState{}
+	delivered, late := publishWithLifecycleState(lifecycle, guide.StreamEventToolCall, func() {})
+	if !delivered {
+		t.Fatal("pre-terminal tool-call must be delivered")
+	}
+	if late {
+		t.Fatal("pre-terminal tool-call must not report lateBypass")
+	}
+}
+
+// TestPublishWithLifecycleState_NilLifecycleAlwaysPublishes covers the
+// no-context path used by direct test fixtures; nil lifecycle delivers
+// without flagging bypass.
+func TestPublishWithLifecycleState_NilLifecycleAlwaysPublishes(t *testing.T) {
+	published := false
+	delivered, late := publishWithLifecycleState(nil, guide.StreamEventToolCall, func() { published = true })
+	if !delivered || !published {
+		t.Fatal("nil lifecycle must deliver the publish")
+	}
+	if late {
+		t.Fatal("nil lifecycle never has a terminal to bypass")
+	}
+}

@@ -70,7 +70,7 @@ func TestAcademicChildPublishesSearchingProgressWithMetadata(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	a, err := New(Config{ID: "academic", SessionID: "sess-1"}, &delayedAcademicChildProvider{delay: 40 * time.Millisecond})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic", SessionID: "sess-1"}, &delayedAcademicChildProvider{delay: 40 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestAcademicChildKeepalivePublishesPeriodicSearchingProgress(t *testing.T) 
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	a, err := New(Config{ID: "academic", SessionID: "sess-1"}, &delayedAcademicTerminalProvider{delay: 55 * time.Millisecond})
+	a, err := New(Config{Factory: newTestFactory(t), ID: "academic", SessionID: "sess-1"}, &delayedAcademicTerminalProvider{delay: 55 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}

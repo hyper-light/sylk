@@ -14,9 +14,9 @@ type captureAcademicActivityPublisher struct {
 	events []*events.ActivityEvent
 }
 
-func (p *captureAcademicActivityPublisher) PublishActivity(event *events.ActivityEvent) {
+func (p *captureAcademicActivityPublisher) PublishActivity(event *events.ActivityEvent) error {
 	if event == nil {
-		return
+		return nil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -28,6 +28,7 @@ func (p *captureAcademicActivityPublisher) PublishActivity(event *events.Activit
 		}
 	}
 	p.events = append(p.events, &clone)
+	return nil
 }
 
 func (p *captureAcademicActivityPublisher) snapshot() []*events.ActivityEvent {
@@ -42,7 +43,7 @@ func TestAcademicPublishesStreamLifecycleForForwardedRequest(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	a, err := New(Config{SessionID: "sess-1"}, nil)
+	a, err := New(Config{Factory: newTestFactory(t), SessionID: "sess-1"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
@@ -109,6 +110,7 @@ func TestAcademicPublishesCorrelatedTerminalActivitiesForForwardedRequest(t *tes
 
 	pub := &captureAcademicActivityPublisher{}
 	a, err := New(Config{
+		Factory: newTestFactory(t),
 		ID:          "academic",
 		SessionID:   "sess-1",
 		ActivityPub: pub,

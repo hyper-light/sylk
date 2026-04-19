@@ -105,6 +105,7 @@ func newAppModel(
 		),
 		activityBridge:         bridge.NewActivityBridge("tui.activity", deps.GuideBus),
 		tokenUsageBridge:       bridge.NewTokenUsageBridge("tui.token_usage", deps.GuideBus),
+		accountantBridge:       bridge.NewAccountantBridge("tui.accountant", deps.Accountant),
 		sessionBridge:          bridge.NewSessionBridge(deps.SessionManager, deps.Scope),
 		streamBridge:           bridge.NewStreamBridge(deps.Scope),
 		guideBridge:            bridge.NewGuideBridge(deps.GuideBus, deps.Scope, "default"),

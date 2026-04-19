@@ -14,6 +14,7 @@ func TestGuideStartSubscribesPreRegisteredAgentChannels(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "session-start-subscriptions",
+		Factory: newTestFactory(t),
 	})
 	if err != nil {
 		t.Fatalf("new guide: %v", err)

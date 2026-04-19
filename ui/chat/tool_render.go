@@ -64,13 +64,26 @@ func renderToolCalls(calls []ToolCallRecord, width int, th *theme.Theme) ([]stri
 		grad = th.Palette.ToolCallGradient()
 	}
 
+	// Stamp orphan flags onto a per-frame copy of the call list so the
+	// formatter can swap the live spinner for a `?` indicator on rows the
+	// agent appears to have abandoned. Mutating the caller's slice would
+	// persist the visual hint across renders even if a late Complete
+	// eventually arrives, so we work on copies. See toolCallVisuallyOrphaned
+	// for the heuristic.
+	now := time.Now()
+	render := make([]ToolCallRecord, len(calls))
+	for i := range calls {
+		render[i] = calls[i]
+		render[i].OrphanedAtRender = toolCallVisuallyOrphaned(calls, i, now)
+	}
+
 	var lines []string
 	var regions []ToolCallRegion
 
-	for i := range calls {
+	for i := range render {
 		start := len(lines)
-		if calls[i].InterAgent != nil {
-			rendered, subregions := renderInterAgentToolCall(calls, i, width, th, grad)
+		if render[i].InterAgent != nil {
+			rendered, subregions := renderInterAgentToolCall(render, i, width, th, grad)
 			for j := range subregions {
 				subregions[j].Start += start
 				subregions[j].End += start
@@ -83,10 +96,10 @@ func renderToolCalls(calls []ToolCallRecord, width int, th *theme.Theme) ([]stri
 				Subregions: subregions,
 			})
 		} else {
-			if calls[i].Expanded {
-				lines = append(lines, renderToolCallExpanded(calls[i], width, th, grad)...)
+			if render[i].Expanded {
+				lines = append(lines, renderToolCallExpanded(render[i], width, th, grad)...)
 			} else {
-				lines = append(lines, renderToolCallCollapsed(calls[i], width, th, grad))
+				lines = append(lines, renderToolCallCollapsed(render[i], width, th, grad))
 			}
 			regions = append(regions, ToolCallRegion{
 				Start:     start,
@@ -166,6 +179,9 @@ func renderInterAgentHeadline(calls []ToolCallRecord, idx int, row *InterAgentTo
 	}
 
 	linePrefix := mutedStyle.Render(treePrefix+" ") + renderInterAgentLabels(row.AgentTypes, th, mutedStyle)
+	if row.RepeatCount >= 2 {
+		linePrefix += mutedStyle.Render(fmt.Sprintf(" ×%d", row.RepeatCount))
+	}
 	summary := interAgentDisplaySummary(calls[idx], row)
 	if summary != "" {
 		linePrefix += mutedStyle.Render(" - ") + summaryStyle.Render(truncatePlainWithDots(summary, max(width-lipgloss.Width(linePrefix+" - "), 0)))
@@ -1088,15 +1104,108 @@ func wrapRenderedToolLine(line string, width int) []string {
 }
 
 // formatToolCallDuration formats the tool call's duration for display.
+// Inter-agent rows whose Kind reaches a terminal Status at dispatch (consult,
+// approval, store) freeze their captured duration once Completed=true so a
+// stale Pending-after-Done status (the historical "guardian - approved by
+// user 471s" bug) cannot leave the row in a perpetually-growing live state.
+// Challenge rows deliberately stay Pending after dispatch until a response
+// arrives on the thread, so they keep ticking even when Completed=true.
+//
+// When OrphanedAtRender is set the live elapsed display is replaced with the
+// orphan glyph so the user is not misled by a still-spinning timer for a
+// row whose Complete event has very likely been lost. This does not assert
+// the call is dead — only that the agent has moved on enough that we should
+// stop pretending the row is actively in flight. The actual duration string
+// is still embedded so users can see how long the row has been outstanding.
 func formatToolCallDuration(tc ToolCallRecord) string {
+	if tc.OrphanedAtRender && !tc.Completed {
+		return orphanedToolCallDurationString(tc)
+	}
+	if tc.Completed && interAgentRowFreezesOnCompletion(tc.InterAgent) {
+		return formatToolDuration(tc.Duration)
+	}
 	if tc.InterAgent != nil && tc.InterAgent.Status == InterAgentToolPending && !tc.StartedAt.IsZero() {
 		return formatToolDuration(time.Since(tc.StartedAt))
 	}
 	if !tc.Completed {
-		d := time.Since(tc.StartedAt)
-		return formatToolDuration(d)
+		return formatToolDuration(time.Since(tc.StartedAt))
 	}
 	return formatToolDuration(tc.Duration)
+}
+
+// orphanGlyph is the single-character indicator used to replace the live
+// spinner for tool calls the renderer believes have been left behind by the
+// agent. A simple `?` keeps the column width identical to the spinner so
+// layout doesn't shift between frames as orphan status flips.
+const orphanGlyph = "?"
+
+func orphanedToolCallDurationString(tc ToolCallRecord) string {
+	elapsed := tc.Duration
+	if elapsed == 0 && !tc.StartedAt.IsZero() {
+		elapsed = time.Since(tc.StartedAt)
+	}
+	return orphanGlyph + " " + formatToolDuration(elapsed)
+}
+
+// interAgentRowFreezesOnCompletion reports whether an inter-agent row should
+// freeze its rendered duration once the underlying dispatch completes.
+// Non-inter-agent tool calls always freeze. Challenge rows are the sole
+// exception: their dispatch completes immediately but the row is logically
+// still in flight until a response arrives on the shared challenge thread,
+// so they keep displaying live elapsed time.
+func interAgentRowFreezesOnCompletion(row *InterAgentTool) bool {
+	if row == nil {
+		return true
+	}
+	return row.Kind != InterAgentToolChallenge
+}
+
+// orphanRenderAgeThreshold is how long a pending row must have been in flight
+// before it becomes eligible for the orphan indicator. Below this we assume
+// the call is genuinely working (file I/O, network requests, large
+// summarizations all take seconds). Above this AND with enough subsequent
+// activity, the row is most likely a lost-Complete artifact.
+const orphanRenderAgeThreshold = 30 * time.Second
+
+// orphanRenderSucceedingActivityCount is how many newer Completed peers must
+// have appeared after a pending row before we treat it as visually orphaned.
+// This is the "the agent has moved on" signal — without it we would flag any
+// long-running tool as orphaned the moment it crossed the age threshold.
+const orphanRenderSucceedingActivityCount = 3
+
+// toolCallVisuallyOrphaned reports whether the row at idx should render with
+// the orphan indicator. The signal combines (a) age greater than the threshold
+// and (b) at least N completed tool events appearing after this row in the
+// same call list. Inter-agent challenge rows are excluded because they are
+// designed to remain pending after dispatch until a peer response arrives —
+// a long-pending challenge is expected behavior, not an orphan.
+func toolCallVisuallyOrphaned(calls []ToolCallRecord, idx int, now time.Time) bool {
+	if idx < 0 || idx >= len(calls) {
+		return false
+	}
+	tc := calls[idx]
+	if tc.Completed {
+		return false
+	}
+	if tc.InterAgent != nil && tc.InterAgent.Kind == InterAgentToolChallenge {
+		return false
+	}
+	if tc.StartedAt.IsZero() {
+		return false
+	}
+	if now.Sub(tc.StartedAt) < orphanRenderAgeThreshold {
+		return false
+	}
+	completedAfter := 0
+	for j := idx + 1; j < len(calls); j++ {
+		if calls[j].Completed {
+			completedAfter++
+			if completedAfter >= orphanRenderSucceedingActivityCount {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // blockedSubstrings are error message fragments that indicate a tool call was

@@ -103,7 +103,7 @@ func TestRequestRouteSync_DoesNotPreserveChildSourceStreamTarget(t *testing.T) {
 		bus:        bus,
 		channels:   guide.NewAgentChannels("inspector", "inspector-id"),
 		pendingBus: make(map[string]*pendingWait),
-		config:     inspectorshared.GlobalInspectorConfig{SessionID: "sess-1"},
+		config:     inspectorshared.GlobalInspectorConfig{Factory: newTestFactory(t), SessionID: "sess-1"},
 	}
 
 	respSub, err := bus.SubscribeAsync(gi.channels.Responses, gi.handleBusResponse)
@@ -202,7 +202,7 @@ func TestConsultAgent_PropagatesTaskScopeToChildConsult(t *testing.T) {
 		bus:        bus,
 		channels:   guide.NewAgentChannels("inspector", "inspector-id"),
 		pendingBus: make(map[string]*pendingWait),
-		config:     inspectorshared.GlobalInspectorConfig{SessionID: "sess-1"},
+		config:     inspectorshared.GlobalInspectorConfig{Factory: newTestFactory(t), SessionID: "sess-1"},
 	}
 
 	respSub, err := bus.SubscribeAsync(gi.channels.Responses, gi.handleBusResponse)

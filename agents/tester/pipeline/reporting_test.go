@@ -76,7 +76,7 @@ func (b *testerCoordinationBus) SubscribeAsync(string, guide.MessageHandler) (gu
 
 func (b *testerCoordinationBus) Close() error { return nil }
 
-func TestReportToEngineerSkillPublishesVerificationArtifact(t *testing.T) {
+func TestPublishVerificationArtifact_PerRecipientPayload(t *testing.T) {
 	pt, ctx, _ := newGoPipelineTesterWithVFS(t)
 	pt.config.SessionID = "sess-1"
 	pt.pipelineName = "Implement CLI Module"
@@ -85,23 +85,14 @@ func TestReportToEngineerSkillPublishesVerificationArtifact(t *testing.T) {
 		AgentType: "tester-pipeline",
 		Prompt:    "Implement the CLI module and package entrypoint.",
 		Context: map[string]any{
-			"acceptance_criteria": []map[string]any{
-				{"id": "SC-01", "description": "CLI prints greeting"},
-			},
+			"acceptance_criteria":  []map[string]any{{"id": "SC-01", "description": "CLI prints greeting"}},
 			"success_criteria":     []string{"Tests fail before implementation and pass after."},
 			"test_requirements":    []string{"Write and execute red-phase tests."},
 			"implementation_guide": "Author CLI module, then execute tests.",
-			"pipeline_protocol": map[string]any{
-				"current_request": "Author and execute the red-phase tests, then prepare the verification handoff.",
-			},
+			"pipeline_protocol":    map[string]any{"current_request": "Author and execute the red-phase tests."},
 			"coordination_packet": map[string]any{
 				"relevant_artifacts": []any{
-					map[string]any{
-						"id":            "criteria-1",
-						"kind":          "invariant_set",
-						"summary":       "Inspector criteria",
-						"producer_type": "inspector-pipeline",
-					},
+					map[string]any{"id": "criteria-1", "kind": "invariant_set", "summary": "Inspector criteria", "producer_type": "inspector-pipeline"},
 				},
 			},
 		},
@@ -129,23 +120,19 @@ func TestReportToEngineerSkillPublishesVerificationArtifact(t *testing.T) {
 		Passed:     1,
 		Failed:     1,
 		Results: []tester.TestResult{
-			{Name: "TestAdd", Package: "pkg/service", Status: tester.StatusFailed, ErrorMessage: "got 4, want 5", Output: "assertion failed"},
+			{Name: "TestAdd", Package: "pkg/service", Status: tester.StatusFailed, ErrorMessage: "got 4, want 5"},
 			{Name: "TestSub", Package: "pkg/service", Status: tester.StatusPassed},
 		},
 	})
 	pt.storeDiagnosis(&testershared.DiagnosisReport{
-		ID:           "diag-1",
-		TestName:     "TestAdd",
-		Confidence:   0.9,
-		IsProductBug: true,
-		RootCauses: []testershared.RootCause{
-			{File: "pkg/service/service.go", Line: 3, Description: "Add returns the wrong value"},
-		},
+		ID: "diag-1", TestName: "TestAdd", Confidence: 0.9, IsProductBug: true,
+		RootCauses: []testershared.RootCause{{File: "pkg/service/service.go", Line: 3, Description: "Add returns the wrong value"}},
 	})
 
 	bus := &testerCoordinationBus{pending: make(map[string]chan *guide.Message)}
 	pt.bus = bus
 	pt.pendingBus = bus.pending
+	captured := make([]coordination.PublishArtifactInput, 0, 2)
 	bus.handle = func(req *guide.ActionRequest) (map[string]any, error) {
 		if req.Action != coordination.ActionPublishArtifact {
 			return nil, fmt.Errorf("unexpected action %q", req.Action)
@@ -158,31 +145,9 @@ func TestReportToEngineerSkillPublishesVerificationArtifact(t *testing.T) {
 		if err := json.Unmarshal(raw, &input); err != nil {
 			return nil, err
 		}
-		if input.Kind != "verification_result" {
-			t.Fatalf("artifact kind = %q, want verification_result", input.Kind)
-		}
-		if input.IdempotencyKey != "tester-verification-handoff:task-1:suite-1" {
-			t.Fatalf("idempotency key = %q", input.IdempotencyKey)
-		}
-		if got := input.UpstreamArtifactIDs; len(got) != 1 || got[0] != "criteria-1" {
-			t.Fatalf("upstream artifact ids = %#v, want [criteria-1]", got)
-		}
-		if got := input.Payload["current_request"]; got != "Author and execute the red-phase tests, then prepare the verification handoff." {
-			t.Fatalf("current_request = %#v", got)
-		}
-		if got := input.Payload["authored_test_files"].([]any); len(got) != 1 || got[0] != "pkg/service/service_test.go" {
-			t.Fatalf("authored_test_files = %#v", got)
-		}
-		failures, _ := input.Payload["failures"].([]any)
-		if len(failures) != 1 {
-			t.Fatalf("failures len = %d, want 1", len(failures))
-		}
-		diagnoses, _ := input.Payload["diagnoses"].([]any)
-		if len(diagnoses) != 1 {
-			t.Fatalf("diagnoses len = %d, want 1", len(diagnoses))
-		}
+		captured = append(captured, input)
 		return map[string]any{
-			"id":                    "artifact-1",
+			"id":                    fmt.Sprintf("artifact-%d", len(captured)),
 			"task_id":               input.TaskID,
 			"kind":                  input.Kind,
 			"summary":               input.Summary,
@@ -198,42 +163,104 @@ func TestReportToEngineerSkillPublishesVerificationArtifact(t *testing.T) {
 		}, nil
 	}
 
-	skill := reportToEngineerSkill(pt)
-	output, err := skill.Handler(ctx, []byte(`{}`))
+	engineerSpec := agentshared.PipelineTesterFinalizeTargetSpec{
+		Target:       agentshared.PipelineAgentEngineer,
+		Summary:      "Engineer-relevant: TestAdd asserts wrong value in Add().",
+		EvidenceRefs: []string{"pkg/service/service.go"},
+		FailureFocus: []string{"TestAdd"},
+	}
+	designerSpec := agentshared.PipelineTesterFinalizeTargetSpec{
+		Target:       agentshared.PipelineAgentDesigner,
+		Summary:      "Designer-relevant: contract for Add() needs success-criterion update.",
+		EvidenceRefs: []string{"design/contracts/add.md"},
+	}
+
+	engineerArt, err := pt.publishVerificationArtifact(ctx, engineerSpec)
 	if err != nil {
-		t.Fatalf("report_to_engineer error = %v", err)
+		t.Fatalf("publish engineer artifact: %v", err)
 	}
-	result, ok := output.(map[string]any)
-	if !ok {
-		t.Fatalf("result type = %T, want map[string]any", output)
+	designerArt, err := pt.publishVerificationArtifact(ctx, designerSpec)
+	if err != nil {
+		t.Fatalf("publish designer artifact: %v", err)
 	}
-	if got := result["artifact_id"]; got != "artifact-1" {
-		t.Fatalf("artifact_id = %#v, want artifact-1", got)
+	if engineerArt.ID == designerArt.ID {
+		t.Fatalf("expected per-target artifact IDs to differ; both = %q", engineerArt.ID)
 	}
-	refs, _ := result["handoff_references"].([]string)
-	if len(refs) != 1 || refs[0] != "artifact:artifact-1" {
-		t.Fatalf("handoff_references = %#v", result["handoff_references"])
+
+	if len(captured) != 2 {
+		t.Fatalf("captured %d publish calls, want 2", len(captured))
+	}
+	if want := "tester-verification-handoff:task-1:suite-1:engineer"; captured[0].IdempotencyKey != want {
+		t.Fatalf("engineer idempotency key = %q, want %q", captured[0].IdempotencyKey, want)
+	}
+	if want := "tester-verification-handoff:task-1:suite-1:designer"; captured[1].IdempotencyKey != want {
+		t.Fatalf("designer idempotency key = %q, want %q", captured[1].IdempotencyKey, want)
+	}
+	if !strings.Contains(captured[0].Title, "engineer") {
+		t.Fatalf("engineer artifact title = %q, want contains engineer", captured[0].Title)
+	}
+	if !strings.Contains(captured[1].Title, "designer") {
+		t.Fatalf("designer artifact title = %q, want contains designer", captured[1].Title)
+	}
+
+	engineerView, _ := captured[0].Payload["recipient_view"].(map[string]any)
+	if engineerView == nil {
+		t.Fatal("engineer payload missing recipient_view")
+	}
+	if engineerView["target"] != "engineer" {
+		t.Fatalf("engineer recipient_view target = %#v", engineerView["target"])
+	}
+	focused, _ := engineerView["focused_failures"].([]any)
+	if len(focused) != 1 {
+		t.Fatalf("engineer focused_failures = %#v, want single TestAdd entry", engineerView["focused_failures"])
+	}
+	first, _ := focused[0].(map[string]any)
+	if first["name"] != "TestAdd" {
+		t.Fatalf("engineer focused_failures[0].name = %#v, want TestAdd", first["name"])
+	}
+
+	designerView, _ := captured[1].Payload["recipient_view"].(map[string]any)
+	if designerView == nil {
+		t.Fatal("designer payload missing recipient_view")
+	}
+	if designerView["target"] != "designer" {
+		t.Fatalf("designer recipient_view target = %#v", designerView["target"])
+	}
+	if _, hasFocused := designerView["focused_failures"]; hasFocused {
+		t.Fatalf("designer recipient_view should not have focused_failures (no failure_focus given)")
 	}
 }
 
-func TestReportToDesignerSkillRequiresSuiteExecution(t *testing.T) {
+func TestPublishVerificationArtifact_RequiresSuiteSnapshot(t *testing.T) {
 	pt, ctx, _ := newGoPipelineTesterWithVFS(t)
 	pt.currentTask = &agentshared.PipelineTaskInput{
 		TaskID:    "task-1",
 		AgentType: "tester-pipeline",
 		Prompt:    "Implement the CLI module and package entrypoint.",
 		Context: map[string]any{
-			"pipeline_protocol": map[string]any{
-				"current_request": "Author and execute the red-phase tests, then prepare the verification handoff.",
-			},
+			"pipeline_protocol": map[string]any{"current_request": "Author and execute the red-phase tests."},
 		},
 	}
 
-	_, err := reportToDesignerSkill(pt).Handler(ctx, []byte(`{}`))
+	_, err := pt.publishVerificationArtifact(ctx, agentshared.PipelineTesterFinalizeTargetSpec{
+		Target:  agentshared.PipelineAgentDesigner,
+		Summary: "premature publish",
+	})
 	if err == nil {
 		t.Fatal("expected suite execution requirement error")
 	}
 	if !strings.Contains(err.Error(), "run_test_suite") {
 		t.Fatalf("error = %v, want run_test_suite guidance", err)
+	}
+}
+
+func TestCurrentSuiteID_EmptyBeforeSuite_PopulatedAfter(t *testing.T) {
+	pt, _, _ := newGoPipelineTesterWithVFS(t)
+	if got := pt.currentSuiteID(); got != "" {
+		t.Fatalf("currentSuiteID before suite = %q, want empty", got)
+	}
+	pt.setLastSuiteResult(&tester.TestSuiteResult{SuiteID: "suite-xyz"})
+	if got := pt.currentSuiteID(); got != "suite-xyz" {
+		t.Fatalf("currentSuiteID after suite = %q, want suite-xyz", got)
 	}
 }

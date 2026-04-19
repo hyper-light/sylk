@@ -4,6 +4,9 @@ import (
 	"math"
 	"testing"
 	"time"
+
+	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/messaging"
 )
 
 func TestNewConfidenceLevel(t *testing.T) {
@@ -213,5 +216,165 @@ func TestCategory_DelegatesToCompositeAndCategorize(t *testing.T) {
 	got2 := cl2.Category(w)
 	if got2 != ConfidenceCritical {
 		t.Errorf("Category = %v, want %v", got2, ConfidenceCritical)
+	}
+}
+
+// =============================================================================
+// W2 SCH-16: ConfidenceChain → ConfidenceLevel bridge
+// =============================================================================
+
+func TestFromConfidenceChain_EmptyReturnsNil(t *testing.T) {
+	if got := FromConfidenceChain(nil, "engineer", "task-1"); got != nil {
+		t.Fatalf("empty chain should return nil, got %+v", got)
+	}
+}
+
+func TestFromConfidenceChain_MinWinsOnCorrectness(t *testing.T) {
+	chain := []messaging.ConfidenceEntry{
+		{Agent: "guide", Confidence: 0.9, Reason: "strong intent match"},
+		{Agent: "architect", Confidence: 0.25, Reason: "missing constraints"},
+		{Agent: "engineer", Confidence: 0.7, Reason: "ok"},
+	}
+	level := FromConfidenceChain(chain, "engineer", "task-x")
+	if level == nil {
+		t.Fatal("expected non-nil ConfidenceLevel")
+	}
+	if level.Correctness != 0.25 {
+		t.Fatalf("Correctness must be weakest link, got %v", level.Correctness)
+	}
+	// Completeness = mean = (0.9 + 0.25 + 0.7) / 3 ≈ 0.6166
+	if math.Abs(level.Completeness-0.6166666666666667) > 1e-6 {
+		t.Fatalf("Completeness = %v, want mean of chain", level.Completeness)
+	}
+	if len(level.Dimensions) != 3 {
+		t.Fatalf("expected 3 named dimensions, got %d", len(level.Dimensions))
+	}
+}
+
+// TestWorkaroundBudgetExceeded closes the workaround-budget piece of SCH-16.
+func TestWorkaroundBudgetExceeded(t *testing.T) {
+	low := func(c float64) messaging.ConfidenceEntry {
+		return messaging.ConfidenceEntry{Agent: "x", Confidence: c}
+	}
+	// Below threshold, but < maxWorkarounds: not exceeded.
+	if WorkaroundBudgetExceeded([]messaging.ConfidenceEntry{low(0.1), low(0.2)}, 0.5, 3) {
+		t.Fatal("2 low hops should not exceed budget of 3")
+	}
+	// At limit: exceeded.
+	if !WorkaroundBudgetExceeded([]messaging.ConfidenceEntry{low(0.1), low(0.2), low(0.3)}, 0.5, 3) {
+		t.Fatal("3 low hops should exceed budget of 3")
+	}
+	// Mixed: only low hops count.
+	chain := []messaging.ConfidenceEntry{low(0.1), {Agent: "ok", Confidence: 0.9}, low(0.4), low(0.2)}
+	if !WorkaroundBudgetExceeded(chain, 0.5, 3) {
+		t.Fatal("3 low hops with intervening good ones should exceed budget")
+	}
+	// Zero-or-negative budget: never exceeded.
+	if WorkaroundBudgetExceeded(chain, 0.5, 0) {
+		t.Fatal("maxWorkarounds=0 should disable the check")
+	}
+}
+
+// TestDetermineEscalationFromChain_BudgetExceeded verifies the budget
+// short-circuit routes to the user with ActionAskUser.
+func TestDetermineEscalationFromChain_BudgetExceeded(t *testing.T) {
+	chain := []messaging.ConfidenceEntry{
+		{Agent: "a", Confidence: 0.1},
+		{Agent: "b", Confidence: 0.2},
+		{Agent: "c", Confidence: 0.3},
+	}
+	target, esc := DetermineEscalationFromChain(
+		chain, "engineer", "task-budget",
+		DefaultWeights(), DefaultEscalationPolicy(),
+		handoff.CategoryPipeline,
+		nil, 0,
+	)
+	if !esc || target == nil {
+		t.Fatal("budget exhaustion must produce an escalation target")
+	}
+	if target.SuggestedAction != ActionAskUser {
+		t.Fatalf("budget exhaustion must ActionAskUser, got %v", target.SuggestedAction)
+	}
+	if target.TargetAgent != "user" {
+		t.Fatalf("budget exhaustion must target user, got %q", target.TargetAgent)
+	}
+}
+
+// TestDetermineEscalationFromChain_CriticalDimensionEscalates verifies the
+// per-dimension threshold path (correctness < 0.3 is critical).
+func TestDetermineEscalationFromChain_CriticalDimensionEscalates(t *testing.T) {
+	// Two hops, both below critical-correctness threshold (0.3) but only
+	// two of them so the workaround budget (3) is not exhausted yet.
+	chain := []messaging.ConfidenceEntry{
+		{Agent: "guide", Confidence: 0.2, Reason: "weak intent"},
+		{Agent: "architect", Confidence: 0.25, Reason: "weak plan"},
+	}
+	target, esc := DetermineEscalationFromChain(
+		chain, "architect", "task-critical",
+		DefaultWeights(), DefaultEscalationPolicy(),
+		handoff.CategoryPipeline,
+		nil, 0,
+	)
+	if !esc {
+		t.Fatalf("expected escalation when correctness < critical threshold, got target=%+v", target)
+	}
+	if target.Reason != ReasonDimensionCritical && target.Reason != ReasonLowConfidence {
+		t.Fatalf("expected dimension-critical or low-confidence reason, got %v", target.Reason)
+	}
+}
+
+// =============================================================================
+// W2 SCH-17: PolicyRouterHook
+// =============================================================================
+
+func TestPolicyRouterHook_AllowsCleanRequest(t *testing.T) {
+	hook := &PolicyRouterHook{
+		Policy:   DefaultEscalationPolicy(),
+		Weights:  DefaultWeights(),
+		Category: handoff.CategoryPipeline,
+	}
+	decision := hook.Evaluate(RouterDispatchContext{
+		ConfidenceChain: []messaging.ConfidenceEntry{
+			{Agent: "guide", Confidence: 0.95},
+		},
+	})
+	if !decision.Allow {
+		t.Fatalf("clean confidence chain should Allow, got %+v", decision)
+	}
+	if decision.GuardianGate {
+		t.Fatal("clean chain should not trip Guardian gate")
+	}
+}
+
+func TestPolicyRouterHook_DeniesExhaustedBudget(t *testing.T) {
+	hook := &PolicyRouterHook{
+		Policy:   DefaultEscalationPolicy(),
+		Weights:  DefaultWeights(),
+		Category: handoff.CategoryPipeline,
+	}
+	low := func(c float64) messaging.ConfidenceEntry {
+		return messaging.ConfidenceEntry{Agent: "x", Confidence: c}
+	}
+	decision := hook.Evaluate(RouterDispatchContext{
+		ConfidenceChain: []messaging.ConfidenceEntry{low(0.1), low(0.2), low(0.3)},
+	})
+	if decision.Allow {
+		t.Fatalf("exhausted budget should deny, got %+v", decision)
+	}
+	if !decision.GuardianGate {
+		t.Fatal("exhausted budget should trip Guardian gate")
+	}
+	if decision.Escalation == nil || decision.Escalation.SuggestedAction != ActionAskUser {
+		t.Fatalf("expected ActionAskUser escalation, got %+v", decision.Escalation)
+	}
+}
+
+func TestPolicyRouterHook_NilHookIsNoop(t *testing.T) {
+	var hook *PolicyRouterHook
+	decision := hook.Evaluate(RouterDispatchContext{
+		ConfidenceChain: []messaging.ConfidenceEntry{{Agent: "x", Confidence: 0.1}},
+	})
+	if !decision.Allow {
+		t.Fatalf("nil hook must Allow, got %+v", decision)
 	}
 }

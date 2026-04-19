@@ -16,6 +16,7 @@ func TestGuide_UserInterrupt_RemovesPendingAndForwardsCancel(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -87,6 +88,7 @@ func TestGuide_UserInterrupt_SessionScopeCancelsAllPendingInSession(t *testing.T
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -175,6 +177,7 @@ func TestGuide_UserInterrupt_CancelsPendingDescendants(t *testing.T) {
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -269,6 +272,7 @@ func TestGuide_UserInterrupt_DropsLateChildRouteRequestForInterruptedParent(t *t
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 
@@ -327,6 +331,7 @@ func TestGuide_UserInterrupt_DropsLateRerouteForInterruptedCorrelation(t *testin
 		Bus:       bus,
 		AgentID:   "guide",
 		SessionID: "test-session",
+		Factory: newTestFactory(t),
 	})
 	require.NoError(t, err)
 

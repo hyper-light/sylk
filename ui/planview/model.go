@@ -84,6 +84,15 @@ type Model struct {
 	layerExpanded map[int]bool
 	taskExpanded  map[string]bool
 
+	// lastUpdate is the most recent PlanUpdateMsg that produced the entry
+	// list. Kept so rebuildVisible (invoked on expand/collapse toggles) can
+	// re-derive entries that were pruned during a prior collapse — the
+	// previous implementation filtered m.entries in place, which meant
+	// re-expanding a layer after collapse left its tasks unrecoverable until
+	// the next update arrived.
+	lastUpdate    msg.PlanUpdateMsg
+	hasLastUpdate bool
+
 	// Animation
 	animStart time.Time
 }
@@ -222,29 +231,38 @@ func (m *Model) applyUpdate(update msg.PlanUpdateMsg) {
 	m.planStatus = update.Status
 	m.startTime = update.StartTime
 	m.visible = true
+	m.lastUpdate = update
+	m.hasLastUpdate = true
 
-	// Build task lookup for layer assignment.
+	m.buildEntries(update)
+
+	m.cursor = clamp(m.cursor, 0, max(len(m.entries)-1, 0))
+	m.ensureVisible()
+	m.viewDirty = true
+}
+
+// buildEntries regenerates m.entries from update, honoring the current
+// layerExpanded/taskExpanded flags. Idempotent: calling it twice with the
+// same update produces the same entries. Callers are responsible for
+// clamping m.cursor afterwards.
+func (m *Model) buildEntries(update msg.PlanUpdateMsg) {
+	taskByID := m.buildTaskIndex(update)
+	m.entries = m.entries[:0]
+	m.appendLayeredEntries(update, taskByID)
+	m.appendOrphanTaskEntries(update)
+}
+
+func (m *Model) buildTaskIndex(update msg.PlanUpdateMsg) map[string]msg.PlanTaskSnapshot {
 	taskByID := make(map[string]msg.PlanTaskSnapshot, len(update.Tasks))
 	for _, t := range update.Tasks {
 		taskByID[t.ID] = t
 	}
+	return taskByID
+}
 
-	// Assign layers from ExecutionLayers.
-	taskLayer := make(map[string]int, len(update.Tasks))
-	for layer, ids := range update.ExecutionLayers {
-		for _, id := range ids {
-			taskLayer[id] = layer
-		}
-	}
-
-	// Build flat entry list organized by layer.
-	m.entries = m.entries[:0]
+func (m *Model) appendLayeredEntries(update msg.PlanUpdateMsg, taskByID map[string]msg.PlanTaskSnapshot) {
 	for layerIdx, ids := range update.ExecutionLayers {
-		expanded, ok := m.layerExpanded[layerIdx]
-		if !ok {
-			expanded = true // Default layers to expanded.
-			m.layerExpanded[layerIdx] = true
-		}
+		expanded := m.resolveLayerExpansion(layerIdx)
 		m.entries = append(m.entries, entry{
 			Kind:     entryLayer,
 			Layer:    layerIdx,
@@ -259,26 +277,21 @@ func (m *Model) applyUpdate(update msg.PlanUpdateMsg) {
 			if !ok {
 				continue
 			}
-			taskExp := m.taskExpanded[id]
-			m.entries = append(m.entries, entry{
-				Kind:          entryTask,
-				Layer:         layerIdx,
-				TaskID:        t.ID,
-				Name:          t.Name,
-				Description:   t.Description,
-				AgentType:     t.AgentType,
-				Status:        t.Status,
-				Dependencies:  t.Dependencies,
-				TokensIn:      t.TokensIn,
-				TokensOut:     t.TokensOut,
-				Duration:      t.Duration,
-				StatusMessage: t.StatusMessage,
-				Expanded:      taskExp,
-			})
+			m.entries = append(m.entries, m.newTaskEntry(t, layerIdx))
 		}
 	}
+}
 
-	// Handle tasks not in any layer (orphans).
+func (m *Model) resolveLayerExpansion(layerIdx int) bool {
+	expanded, ok := m.layerExpanded[layerIdx]
+	if !ok {
+		expanded = true // Default layers to expanded.
+		m.layerExpanded[layerIdx] = true
+	}
+	return expanded
+}
+
+func (m *Model) appendOrphanTaskEntries(update msg.PlanUpdateMsg) {
 	layered := make(map[string]struct{}, len(update.Tasks))
 	for _, ids := range update.ExecutionLayers {
 		for _, id := range ids {
@@ -289,48 +302,38 @@ func (m *Model) applyUpdate(update msg.PlanUpdateMsg) {
 		if _, ok := layered[t.ID]; ok {
 			continue
 		}
-		taskExp := m.taskExpanded[t.ID]
-		m.entries = append(m.entries, entry{
-			Kind:          entryTask,
-			Layer:         -1,
-			TaskID:        t.ID,
-			Name:          t.Name,
-			Description:   t.Description,
-			AgentType:     t.AgentType,
-			Status:        t.Status,
-			Dependencies:  t.Dependencies,
-			TokensIn:      t.TokensIn,
-			TokensOut:     t.TokensOut,
-			Duration:      t.Duration,
-			StatusMessage: t.StatusMessage,
-			Expanded:      taskExp,
-		})
+		m.entries = append(m.entries, m.newTaskEntry(t, -1))
 	}
-
-	m.cursor = clamp(m.cursor, 0, max(len(m.entries)-1, 0))
-	m.ensureVisible()
-	m.viewDirty = true
 }
 
-// rebuildVisible re-applies expand/collapse after toggling a layer.
-func (m *Model) rebuildVisible() {
-	visible := make([]entry, 0, len(m.entries))
-	skipLayer := -1
-	for _, e := range m.entries {
-		if e.Kind == entryLayer {
-			skipLayer = -1
-			if !e.Expanded {
-				skipLayer = e.Layer
-			}
-			visible = append(visible, e)
-			continue
-		}
-		if e.Layer == skipLayer {
-			continue
-		}
-		visible = append(visible, e)
+func (m *Model) newTaskEntry(t msg.PlanTaskSnapshot, layer int) entry {
+	return entry{
+		Kind:          entryTask,
+		Layer:         layer,
+		TaskID:        t.ID,
+		Name:          t.Name,
+		Description:   t.Description,
+		AgentType:     t.AgentType,
+		Status:        t.Status,
+		Dependencies:  t.Dependencies,
+		TokensIn:      t.TokensIn,
+		TokensOut:     t.TokensOut,
+		Duration:      t.Duration,
+		StatusMessage: t.StatusMessage,
+		Expanded:      m.taskExpanded[t.ID],
 	}
-	m.entries = visible
+}
+
+// rebuildVisible re-derives m.entries from the last observed update, honoring
+// the current layerExpanded/taskExpanded flags. Previously this filtered the
+// already-pruned m.entries in place; after a collapse the task entries were
+// gone and re-expanding the layer could not bring them back until the next
+// update arrived (UI-19).
+func (m *Model) rebuildVisible() {
+	if !m.hasLastUpdate {
+		return
+	}
+	m.buildEntries(m.lastUpdate)
 	m.cursor = clamp(m.cursor, 0, max(len(m.entries)-1, 0))
 }
 

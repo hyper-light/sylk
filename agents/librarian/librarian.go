@@ -14,6 +14,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
@@ -50,9 +51,11 @@ type LibrarianProvider interface {
 // and coding patterns in a codebase. Uses an LLM-driven tool loop for rich
 // contextual responses when EnableLLM is true.
 type Librarian struct {
-	id     string
-	config Config
-	logger *slog.Logger
+	id       string
+	config   Config
+	logger   *slog.Logger
+	identity *identity.AgentIdentity
+	factory  *identity.Factory
 
 	// LLM provider
 	provider   LibrarianProvider
@@ -161,6 +164,10 @@ type Config struct {
 
 	// Forest exposes Memory Forest recall/prediction skills.
 	Forest shared.MemoryForestService
+
+	// Factory mints the Librarian's AgentIdentity at New() time.
+	// On-demand agent, created after phase4.
+	Factory *identity.Factory
 }
 
 // New creates a new Librarian agent with optional LLM provider.
@@ -213,6 +220,16 @@ func New(cfg Config, provider ...LibrarianProvider) (*Librarian, error) {
 	// Initialize clone store for remote package fetching.
 	// SessionVFS is wired later via SetSessionVFS.
 	l.cloneStore = NewCloneStore(cfg.WorkingDirectory)
+
+	l.factory = cfg.Factory
+	id, err := cfg.Factory.Mint(identity.MintOptions{
+		Kind: identity.AgentTypeLibrarian,
+		Pod:  identity.PodRef{ID: "librarian", Type: identity.PodTypeSingleton},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("librarian: mint identity: %w", err)
+	}
+	l.identity = id
 
 	l.steering.InitLazy("librarian", cfg.ActivityPub)
 	if err := l.initSkills(); err != nil {
@@ -540,6 +557,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 	// Wire tool call emitter for inline visualization.
 	emitter := shared.NewToolCallEmitter(l.bus, l.channels, l.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
+	ctx = shared.WithOwnedStreamIdentity(ctx, "librarian", "Librarian")
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
@@ -549,6 +567,17 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		AgentID:     l.id,
 		SessionID:   fwd.SessionID,
 	})
+	if l.factory != nil && l.identity != nil {
+		task, taskErr := l.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+		})
+		if taskErr != nil {
+			return fmt.Errorf("librarian: mint task: %w", taskErr)
+		}
+		ctx = identity.WithIdentity(ctx, l.identity)
+		ctx = identity.WithTask(ctx, task)
+	}
 	allowedHandoff := shared.AutomaticHandoffAllowedForForwardedRequest(fwd)
 	ctx = shared.WithAutomaticHandoffEnabled(ctx, allowedHandoff)
 	gov := shared.NewContextGovernor(l.CurrentModel(), l.config.MaxTokens, 0)
@@ -631,6 +660,8 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		var replicaErr error
 		var cleanupReplicaBridge func()
 		ctx, cleanupReplicaBridge, _, replicaErr = shared.AttachReplicaHandoffBridge(ctx, l, l.handoffBridge, shared.KnowledgeReplicaHandoffOptions{
+			Factory:           l.factory,
+			ParentIdentity:    l.identity,
 			SessionID:         fwd.SessionID,
 			CorrelationID:     fwd.CorrelationID,
 			ActivityPublisher: l.activityPub,
