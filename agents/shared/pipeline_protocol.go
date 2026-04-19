@@ -1854,6 +1854,8 @@ func pipelineTesterFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skill
 		Usage("Use after run_test_suite when the turn is ready to hand verification work to one or more downstream recipients. Provide one targets entry per recipient (engineer, designer, or both); each entry carries the recipient-specific summary, evidence refs, and optional failure focus. The artifact references this returns are auto-attached to the next handoff_next or validate_work — you do not need to pass them again.").
 		Requirement("Requires that run_test_suite has produced a snapshot during this turn. The targets you list determine the only legal terminal action: a finalize for {engineer, designer} requires a cohort handoff_next to that exact set; a finalize for the challenger requires validate_work. Re-finalize is rejected unless a fresh run_test_suite has produced a new snapshot since the prior finalize.").
 		Avoid("Do not use as a substitute for handoff_next; this skill packages artifacts but does not route the turn. Do not finalize for a target you are not actually handing work to. Do not finalize twice for the same target without running a fresh suite first.").
+		Consumes(ArtifactTestSnapshot).
+		Produces(ArtifactVerificationArtifact).
 		ArrayObjectParam("targets", "Per-recipient verification specs. Provide one entry per recipient.",
 			map[string]*skills.Property{
 				"target": {

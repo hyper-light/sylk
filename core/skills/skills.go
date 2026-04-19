@@ -58,6 +58,40 @@ type Skill struct {
 	Requirements  []string `json:"requirements,omitempty"`
 	Satisfies     []string `json:"satisfies,omitempty"`
 	Avoids        []string `json:"avoids,omitempty"`
+
+	// Contract declares the protocol-state artifacts this skill produces
+	// and consumes. Used by the dispatcher to enforce invariants at the
+	// tool-return boundary so missing-artifact errors surface on the
+	// skill that should have produced the artifact, not three turns
+	// later when a terminal validator notices it's absent.
+	//
+	// Nil for skills that have no protocol-state side effects (the
+	// common case — ordinary read/search/compute skills).
+	Contract *SkillContract `json:"contract,omitempty"`
+}
+
+// SkillContract declares the protocol-state artifacts a skill produces
+// and consumes. The dispatcher (tool runtime) reads this after each
+// tool return: if the skill claimed `Produces: ["test_snapshot"]` but
+// the return payload did not populate a test snapshot field, the error
+// surfaces on THAT tool call, not three turns later when
+// finalize_pipeline notices.
+//
+// Artifacts are named with short, stable strings (`test_snapshot`,
+// `pending_challenge`, `verification_artifact`). The protocol layer
+// defines the canonical set; skills reference them by name.
+type SkillContract struct {
+	// Produces lists the artifact names this skill creates when it
+	// succeeds. The dispatcher validates each is present in the return
+	// payload (via the protocol state projection) after success.
+	Produces []string `json:"produces,omitempty"`
+	// Consumes lists artifact names this skill requires to be present
+	// in the current protocol state before it's legal to invoke. The
+	// dispatcher validates these at call-time; a missing artifact
+	// surfaces as a ProtocolContractViolation error with a clear
+	// recovery_action pointing at the skill that should have produced
+	// the artifact.
+	Consumes []string `json:"consumes,omitempty"`
 }
 
 // InputSchema defines the JSON Schema for skill inputs
@@ -230,6 +264,37 @@ func (b *Builder) Satisfies(outcome string) *Builder {
 // Avoid adds guidance for situations where the skill should not be used.
 func (b *Builder) Avoid(advice string) *Builder {
 	b.skill.Avoids = append(b.skill.Avoids, advice)
+	return b
+}
+
+// Produces declares protocol-state artifacts this skill creates on
+// success. The dispatcher validates the declared artifacts appear in the
+// return payload after the handler completes; a missing declared
+// artifact surfaces as an immediate ProtocolContractViolation on this
+// call site, not on a downstream terminal validator that can't explain
+// the drift.
+//
+// Artifact names are short, stable strings — the protocol layer owns
+// the canonical set (see agents/shared/skill_contract_artifacts.go).
+// Calling Produces multiple times appends to the list.
+func (b *Builder) Produces(artifacts ...string) *Builder {
+	if b.skill.Contract == nil {
+		b.skill.Contract = &SkillContract{}
+	}
+	b.skill.Contract.Produces = append(b.skill.Contract.Produces, artifacts...)
+	return b
+}
+
+// Consumes declares protocol-state artifacts this skill requires to be
+// present before invocation. The dispatcher validates these at call
+// time; a missing artifact raises a ProtocolContractViolation with a
+// recovery_action pointing to the skill that should have produced it.
+// Calling Consumes multiple times appends to the list.
+func (b *Builder) Consumes(artifacts ...string) *Builder {
+	if b.skill.Contract == nil {
+		b.skill.Contract = &SkillContract{}
+	}
+	b.skill.Contract.Consumes = append(b.skill.Contract.Consumes, artifacts...)
 	return b
 }
 

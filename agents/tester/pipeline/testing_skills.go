@@ -327,6 +327,7 @@ func runTestSuiteSkill(pt *PipelineTester) *skills.Skill {
 		Usage("Use after write_test when the task requires execution evidence or when you need a concrete failing signal to diagnose. Target the most relevant packages, files, or tests instead of running blindly.").
 		Satisfies("Produces suite execution evidence and the raw failure signal needed for diagnose_failure and for the per-recipient verification artifact published by finalize_pipeline.").
 		Avoid("Do not use as a substitute for write_test when the task still requires new test artifacts, and do not stop here when the turn still requires terminal reporting plus handoff_next.").
+		Produces(agentshared.ArtifactTestSnapshot).
 		ArrayParam("packages", "Package patterns to test", "string", false).
 		ArrayParam("files", "Source or test files to focus on", "string", false).
 		ArrayParam("test_names", "Specific tests to run", "string", false).
