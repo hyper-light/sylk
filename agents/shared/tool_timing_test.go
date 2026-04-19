@@ -1042,3 +1042,86 @@ func TestToolCallTracker_LateCompleteClearsInFlight(t *testing.T) {
 		t.Fatalf("late Complete must clear in-flight entry, got %d remaining", got)
 	}
 }
+
+// TestToolCallSession_StartIsIdempotentAcrossAcquires verifies the (C) core
+// invariant: two callers reaching for "the session for this call.ID" share
+// one handle, and Start fires exactly once. This is what kills the
+// "preannounce + TimedToolCall both emit Start → UI gets duplicate rows"
+// failure mode at the source. Local patches at one emit site couldn't fix
+// it because the next emit site reintroduced the same pattern; sessions
+// make the invariant structural.
+func TestToolCallSession_StartIsIdempotentAcrossAcquires(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+
+	call := providers.ToolCall{ID: "shared-id", Name: "read_file", Arguments: `{"path":"a.go"}`}
+
+	a := acquireToolCallSession(ctx, "agent", call)
+	b := acquireToolCallSession(ctx, "agent", call)
+	if a != b {
+		t.Fatal("expected the same session pointer for matching call.ID")
+	}
+
+	if !a.Start(call, time.Now(), nil) {
+		t.Fatal("first Start must report emitted=true")
+	}
+	if b.Start(call, time.Now(), nil) {
+		t.Fatal("second Start (via the parallel acquire) must be a no-op")
+	}
+	if got := len(events); got != 1 {
+		t.Fatalf("expected exactly 1 ToolCallStart event, got %d: %#v", got, events)
+	}
+}
+
+// TestToolCallSession_CompleteIsIdempotentAcrossPaths confirms a Complete
+// from one path (e.g. the web_search ToolEnd branch) prevents a later
+// Complete from a different path (e.g. CompleteProviderNativeToolCall)
+// from emitting a second terminal event. Without this, the UI sees two
+// Completes for the same key and the second clobbers the first's state.
+func TestToolCallSession_CompleteIsIdempotentAcrossPaths(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+
+	call := providers.ToolCall{ID: "complete-id", Name: "summarize_workspace_state", Arguments: `{"paths":["a"]}`}
+
+	session := acquireToolCallSession(ctx, "tester-pipeline", call)
+	session.Start(call, time.Now(), nil)
+	if !session.Complete(call, `{"ok":true}`, nil) {
+		t.Fatal("first Complete must report emitted=true")
+	}
+	if session.Complete(call, `{"ok":true}`, nil) {
+		t.Fatal("second Complete must be a no-op")
+	}
+	completes := 0
+	for _, e := range events {
+		if e.Phase == ToolCallComplete {
+			completes++
+		}
+	}
+	if completes != 1 {
+		t.Fatalf("expected exactly 1 ToolCallComplete event, got %d", completes)
+	}
+}
+
+// TestToolCallSession_CompleteReleasesTrackerEntry confirms a Completed
+// session is removed from tracker.sessions so a future call.ID reuse (e.g.
+// agent reissuing a tool call) gets a fresh session, not a stuck "already
+// completed" handle that would silently swallow the new emissions.
+func TestToolCallSession_CompleteReleasesTrackerEntry(t *testing.T) {
+	emitter := func(ev ToolCallEvent) {}
+	ctx := WithToolCallEmitter(context.Background(), emitter)
+
+	call := providers.ToolCall{ID: "reuse-id", Name: "read_file", Arguments: `{"path":"a.go"}`}
+
+	first := acquireToolCallSession(ctx, "agent", call)
+	first.Start(call, time.Now(), nil)
+	first.Complete(call, "ok", nil)
+
+	second := acquireToolCallSession(ctx, "agent", call)
+	if first == second {
+		t.Fatal("after Complete, a fresh acquire must return a new session pointer")
+	}
+	if !second.Start(call, time.Now(), nil) {
+		t.Fatal("the fresh session's Start must be emittable")
+	}
+}
