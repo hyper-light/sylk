@@ -2,6 +2,7 @@ package guide
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -126,7 +127,14 @@ func (c *ConsultationObserver) logToArchivalist(msg *Message) {
 	if len(msg.Metadata) > 0 {
 		req.Metadata = mergeRouteMetadata(msg.Metadata, req.Metadata)
 	}
-	_ = c.bus.Publish(TopicGuideRequests, NewRequestMessage(generateMessageID(), req))
+	if err := c.bus.Publish(TopicGuideRequests, NewRequestMessage(generateMessageID(), req)); err != nil {
+		slog.Warn("consultation_archival_publish_failed",
+			"correlation_id", msg.CorrelationID,
+			"from_agent", consReq.FromAgent,
+			"to_agent", consReq.ToAgent,
+			"error", err.Error(),
+		)
+	}
 }
 
 func firstNonEmptyConsultationSource(source string) string {

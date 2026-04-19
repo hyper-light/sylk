@@ -2,6 +2,7 @@ package guide
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -111,7 +112,12 @@ func (n *NotificationAggregator) flushUpdates() {
 			Timestamp:     time.Now(),
 			Payload:       updates,
 		}
-		_ = n.bus.Publish("ui.notifications", msg)
+		if err := n.bus.Publish("ui.notifications", msg); err != nil {
+			slog.Warn("notification_aggregator_publish_failed",
+				"update_count", len(updates),
+				"error", err.Error(),
+			)
+		}
 	}
 
 	// Clean up old task states after flushing

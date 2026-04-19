@@ -205,6 +205,14 @@ func (d *Designer) getProvider() designerProvider {
 	return d.provider
 }
 
+// Ready implements shared.ReadinessReporter.
+func (d *Designer) Ready() (bool, string) {
+	if d.getProvider() == nil {
+		return false, "LLM provider not yet wired (post-init / pre-auth window)"
+	}
+	return true, ""
+}
+
 // ProviderType implements container.AuthRefreshable.
 func (d *Designer) ProviderType() string {
 	return string(container.ProviderForModel(d.CurrentModel()))

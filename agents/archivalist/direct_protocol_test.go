@@ -80,6 +80,12 @@ func TestHandleBusRequest_NestedFireAndForgetStorePublishesStreamLifecycle(t *te
 	a.runCtx = context.Background()
 	a.running = true
 	a.activityPub = pub
+	// The readiness gate (added in Phase 5) refuses requests when the
+	// archivalist has no live provider. Store operations don't actually
+	// invoke the LLM, but the gate runs at the routing boundary before
+	// per-request intent classification — this stub keeps the agent
+	// "ready" so the store path can be exercised.
+	a.provider = NewMockProvider()
 
 	streamCh := make(chan *guide.StreamResponse, 4)
 	responseCh := make(chan *guide.RouteResponse, 1)

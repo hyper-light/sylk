@@ -2,6 +2,7 @@ package guardian
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -57,36 +58,39 @@ func (a *guardianUsageAccumulator) Total() *guide.StreamUsage {
 // Stream Publishing
 // =============================================================================
 
-// publishStreamStart emits a stream start event.
-func (g *Guardian) publishStreamStart(ctx context.Context, correlationID string) {
+// publishStreamStart emits a stream start event. Returns the underlying
+// publish error for the caller to surface.
+func (g *Guardian) publishStreamStart(ctx context.Context, correlationID string) error {
 	if g.bus == nil {
-		return
+		return nil
 	}
 	metadata := shared.StreamResponseMetadataFromContext(ctx)
 	event := &guide.StreamEvent{
 		Type: guide.StreamEventStart,
 		Data: map[string]any{"agent": "guardian"},
 	}
-	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, metadata, event))
+	return g.publishStream(ctx, correlationID, newStreamMessage(correlationID, g.id, metadata, event), event.Type)
 }
 
-// publishStreamChunk emits a text chunk during streaming.
-func (g *Guardian) publishStreamChunk(ctx context.Context, correlationID string, text string) {
+// publishStreamChunk emits a text chunk during streaming. Returns the
+// underlying publish error for the caller to surface.
+func (g *Guardian) publishStreamChunk(ctx context.Context, correlationID string, text string) error {
 	if g.bus == nil || text == "" {
-		return
+		return nil
 	}
 	metadata := shared.StreamResponseMetadataFromContext(ctx)
 	event := &guide.StreamEvent{
 		Type: guide.StreamEventData,
 		Text: text,
 	}
-	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, metadata, event))
+	return g.publishStream(ctx, correlationID, newStreamMessage(correlationID, g.id, metadata, event), event.Type)
 }
 
-// publishStreamComplete emits the final stream complete event.
-func (g *Guardian) publishStreamComplete(ctx context.Context, correlationID string, text string, usage *guide.StreamUsage) {
+// publishStreamComplete emits the final stream complete event. Returns the
+// underlying publish error for the caller to surface.
+func (g *Guardian) publishStreamComplete(ctx context.Context, correlationID string, text string, usage *guide.StreamUsage) error {
 	if g.bus == nil {
-		return
+		return nil
 	}
 	metadata := shared.StreamResponseMetadataFromContext(ctx)
 	event := &guide.StreamEvent{
@@ -94,17 +98,17 @@ func (g *Guardian) publishStreamComplete(ctx context.Context, correlationID stri
 		Text:  strings.TrimSpace(text),
 		Usage: usage,
 	}
-	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, metadata, event))
+	return g.publishStream(ctx, correlationID, newStreamMessage(correlationID, g.id, metadata, event), event.Type)
 }
 
-func (g *Guardian) publishThoughtProgress(ctx context.Context, correlationID string, thought string) {
+func (g *Guardian) publishThoughtProgress(ctx context.Context, correlationID string, thought string) error {
 	if g.bus == nil {
-		return
+		return nil
 	}
 	metadata := shared.StreamResponseMetadataFromContext(ctx)
 	thought = strings.TrimSpace(thought)
 	if thought == "" {
-		return
+		return nil
 	}
 	if len(thought) > 200 {
 		thought = thought[:197] + "..."
@@ -116,5 +120,24 @@ func (g *Guardian) publishThoughtProgress(ctx context.Context, correlationID str
 		},
 		Timestamp: time.Now(),
 	}
-	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, metadata, event))
+	return g.publishStream(ctx, correlationID, newStreamMessage(correlationID, g.id, metadata, event), event.Type)
+}
+
+// publishStream is the single bus-publish choke point for guardian stream
+// events. Any publish failure is logged (with correlation, event type, and
+// error) and returned so the caller's loop can surface a delivery failure
+// the same way it surfaces any other tool-execution error.
+func (g *Guardian) publishStream(ctx context.Context, correlationID string, msg *guide.Message, eventType guide.StreamEventType) error {
+	if err := g.bus.Publish(g.channels.Responses, msg); err != nil {
+		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			shared.LogWarning(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+				"guardian_stream_publish_failed", map[string]any{
+					"event_type":     string(eventType),
+					"correlation_id": correlationID,
+					"error":          err.Error(),
+				})
+		}
+		return fmt.Errorf("publish guardian stream event %s: %w", eventType, err)
+	}
+	return nil
 }

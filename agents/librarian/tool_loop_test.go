@@ -3,9 +3,11 @@ package librarian
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
@@ -200,6 +202,12 @@ func TestExecuteToolLoop_ExceedsMaxToolRuns(t *testing.T) {
 	}
 }
 
+// TestExecuteToolLoop_NoProvider pins the transient-error discipline:
+// when the librarian is invoked before its provider is wired, the failure
+// must wrap shared.ErrAgentNotReady so the dispatcher can retry-after-
+// readiness rather than treating it as a permanent misconfiguration.
+// Pre-refactor this returned a generic string the caller could not
+// classify.
 func TestExecuteToolLoop_NoProvider(t *testing.T) {
 	l := newTestLibrarian(nil)
 	l.provider = nil
@@ -209,10 +217,10 @@ func TestExecuteToolLoop_NoProvider(t *testing.T) {
 	}, nil)
 
 	if err == nil {
-		t.Fatal("expected 'no LLM provider' error, got nil")
+		t.Fatal("expected ErrAgentNotReady, got nil")
 	}
-	if got := err.Error(); !contains(got, "no LLM provider") {
-		t.Errorf("expected 'no LLM provider' error, got %q", got)
+	if !errors.Is(err, shared.ErrAgentNotReady) {
+		t.Errorf("err = %v, want it to wrap shared.ErrAgentNotReady", err)
 	}
 }
 

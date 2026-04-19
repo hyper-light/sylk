@@ -21,8 +21,9 @@ import (
 func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
 	seen := make(map[shared.ToolCallSignature]int, o.config.MaxToolRuns)
 	consecutiveErrors := 0
+	requiredActionGraceTurns := 0
 
-	for turn := 0; turn <= o.config.MaxToolRuns; turn++ {
+	for turn := 0; turn <= o.config.MaxToolRuns+requiredActionGraceTurns; turn++ {
 		if o.toolDefsDirty {
 			req.Tools = o.buildToolDefinitions()
 			o.toolDefsDirty = false
@@ -69,6 +70,26 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 		o.publishStreamChunk(ctx, shared.IntermediateToolTurnText(resp))
 
 		if len(resp.ToolCalls) == 0 {
+			// Enforce the global-review protocol contract: when this turn is
+			// answering an inspector challenge that targets the orchestrator,
+			// the LLM must end with `validate_work`. ValidateGlobalReviewCompletion
+			// is a no-op when no global-review state is hydrated (i.e. ordinary
+			// orchestrator turns), so this is safe for all callers.
+			if err := shared.ValidateGlobalReviewCompletion(ctx, "orchestrator"); err != nil {
+				o.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: err.Error() +
+						"\nAnswer the active global-review challenge by calling `validate_work` with your concrete findings. Do not end this turn until the validate_work call succeeds.",
+				})
+				requiredActionGraceTurns = shared.ExtendRequiredProtocolGrace(ctx, requiredActionGraceTurns)
+				continue
+			}
 			o.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
 			return strings.TrimSpace(resp.Content), nil
 		}

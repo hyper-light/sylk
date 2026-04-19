@@ -2,36 +2,47 @@ package librarian
 
 import "testing"
 
-// TestLibrarianVisibleSkillsExposeBothDiskAndWorkspaceReads pins the dual-read
-// design: disk-only read_file/glob/grep (committed source of truth) live
-// alongside the workspace-aware variants (in-flight global VFS overlay).
-// Mixing the two paths into a single tool led to "open ... no such file"
-// errors when the librarian tried to read files staged in the global VFS but
-// not yet promoted to disk; keeping them as separate, attributed tools makes
-// the LLM's view selection explicit.
+// TestLibrarianVisibleSkillsAreLayerExplicitOnly pins the post-refactor
+// invariant: the librarian's read surface is exclusively the workspace-aware
+// family (read_workspace_file, workspace_glob, workspace_grep,
+// inspect_workspace_state, summarize_workspace_state). Each of those
+// requires an explicit `view` parameter, so the layer (disk / global /
+// pipeline) is captured at the tool boundary and the LLM cannot pick a
+// layerless tool and report "file not found" for a file that lives in a
+// VFS overlay.
 //
-// Pipeline-scoped views are intentionally excluded — librarian operates above
-// any single pipeline's scope, so the authority profile only lists Disk and
-// Global. The workspace skills still register, but pipeline reads are denied
-// at the authority layer if attempted.
-func TestLibrarianVisibleSkillsExposeBothDiskAndWorkspaceReads(t *testing.T) {
+// The bare read_file / glob / grep skills used to coexist as disk-only
+// convenience wrappers, but LLM tool-name bias defeated the prompt's
+// "use workspace_* for in-flight state" rule and produced the historical
+// "librarian opened a disk file that exists only in the pipeline VFS and
+// reported it missing" trace. They must NOT reappear in this list.
+func TestLibrarianVisibleSkillsAreLayerExplicitOnly(t *testing.T) {
+	visible := map[string]struct{}{}
+	for _, name := range librarianVisibleSkillNames() {
+		visible[name] = struct{}{}
+	}
+
 	required := []string{
-		"read_file",
-		"glob",
-		"grep",
 		"read_workspace_file",
 		"workspace_glob",
 		"workspace_grep",
 		"inspect_workspace_state",
 		"summarize_workspace_state",
 	}
-	visible := map[string]struct{}{}
-	for _, name := range librarianVisibleSkillNames() {
-		visible[name] = struct{}{}
-	}
 	for _, name := range required {
 		if _, ok := visible[name]; !ok {
-			t.Errorf("librarian visible skills must include %q", name)
+			t.Errorf("librarian visible skills must include %q (layer-explicit read surface)", name)
+		}
+	}
+
+	forbidden := []string{
+		"read_file",
+		"glob",
+		"grep",
+	}
+	for _, name := range forbidden {
+		if _, ok := visible[name]; ok {
+			t.Errorf("librarian visible skills must NOT include %q — every read must name its layer via view=", name)
 		}
 	}
 }

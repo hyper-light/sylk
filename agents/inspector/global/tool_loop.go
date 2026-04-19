@@ -24,7 +24,7 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 
 	p := gi.getProvider()
 	if p == nil {
-		return "", fmt.Errorf("global inspector: no LLM provider configured")
+		return "", fmt.Errorf("global inspector: %w: LLM provider not yet wired", agentShared.ErrAgentNotReady)
 	}
 
 	for turn := 0; turn <= gi.config.MaxToolRuns+requiredActionGraceTurns; turn++ {

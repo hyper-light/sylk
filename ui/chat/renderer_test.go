@@ -2104,3 +2104,85 @@ func TestFormatToolCallDuration_OrphanedSwapsLiveSpinnerForGlyph(t *testing.T) {
 		t.Fatalf("orphaned duration = %q, want it to contain the orphan glyph %q", got, orphanGlyph)
 	}
 }
+
+// TestCapInterAgentChildRows_PinsFailedRowsToVisibleWindow reproduces the
+// orchestrator-consult failure-attribution bug: when a parent inter-agent
+// row has many child tool calls and some of them failed, the historical
+// "show only the last N" overflow policy left the failures hidden behind
+// "Show N earlier events" — the parent rendered an X with no visible cause.
+// The fix pins failed rows into the visible window so the user can always
+// see what failed.
+func TestCapInterAgentChildRows_PinsFailedRowsToVisibleWindow(t *testing.T) {
+	th := theme.DefaultDark()
+	failedRow := interAgentRenderedChildRow{lines: []string{"OLD-FAILED-CALL"}, failed: true}
+	successRow := interAgentRenderedChildRow{lines: []string{"plain"}}
+	rows := []interAgentRenderedChildRow{
+		successRow,        // 0 — old success, gets hidden
+		failedRow,         // 1 — old failure, MUST stay visible
+		successRow,        // 2 — old success, gets hidden
+		successRow,        // 3 — recent success
+		successRow,        // 4 — recent success
+		successRow,        // 5 — recent success
+		successRow,        // 6 — recent success
+	}
+
+	out := capInterAgentChildRows(rows, 80, th, false, nil, nil)
+
+	foundFailed := false
+	for _, row := range out {
+		for _, line := range row.lines {
+			if strings.Contains(line, "OLD-FAILED-CALL") {
+				foundFailed = true
+			}
+		}
+	}
+	if !foundFailed {
+		t.Fatal("failed row was hidden in the overflow bucket — pinning is not active")
+	}
+}
+
+// TestCapInterAgentChildRows_NoFailuresPreservesHistoricalCap confirms the
+// pinning logic does not change the layout when there are no failures —
+// the most recent N-1 successful events remain visible plus the overflow
+// indicator, matching the original behavior callers and existing tests rely
+// on.
+func TestCapInterAgentChildRows_NoFailuresPreservesHistoricalCap(t *testing.T) {
+	th := theme.DefaultDark()
+	row := func(label string) interAgentRenderedChildRow {
+		return interAgentRenderedChildRow{lines: []string{label}}
+	}
+	rows := []interAgentRenderedChildRow{
+		row("a"), row("b"), row("c"), row("d"), row("e"), row("f"), row("g"),
+	}
+
+	out := capInterAgentChildRows(rows, 80, th, false, nil, nil)
+
+	// Expect overflow indicator + (maxInterAgentChildLines-1) most-recent rows.
+	if len(out) != maxInterAgentChildLines {
+		t.Fatalf("output rows = %d, want %d (1 overflow + %d tail)", len(out), maxInterAgentChildLines, maxInterAgentChildLines-1)
+	}
+	if !strings.Contains(out[0].lines[0], "earlier event") {
+		t.Fatalf("first row should be the overflow indicator, got %q", out[0].lines[0])
+	}
+	for i, expected := range []string{"e", "f", "g"} {
+		if !strings.Contains(out[i+1].lines[0], expected) {
+			t.Fatalf("expected tail row %d to contain %q, got %q", i, expected, out[i+1].lines[0])
+		}
+	}
+}
+
+// TestRenderInterAgentOverflowControlLabel_AnnotatesHiddenFailures verifies
+// the overflow label surfaces the count of hidden failures (only happens when
+// the pinning cap kicks in for a very long failure history). The annotation
+// gives users a hint that expanding will reveal more failed rows.
+func TestRenderInterAgentOverflowControlLabel_AnnotatesHiddenFailures(t *testing.T) {
+	th := theme.DefaultDark()
+	withFailures := stripANSITest(renderInterAgentOverflowControlLabel(7, 3, false, th))
+	if !strings.Contains(withFailures, "(3 failed)") {
+		t.Fatalf("overflow label = %q, want it to annotate hidden failure count", withFailures)
+	}
+	plain := stripANSITest(renderInterAgentOverflowControlLabel(7, 0, false, th))
+	if strings.Contains(plain, "failed") {
+		t.Fatalf("overflow label without hidden failures must not annotate, got %q", plain)
+	}
+}

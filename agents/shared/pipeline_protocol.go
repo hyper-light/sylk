@@ -257,12 +257,50 @@ type PipelineTesterFinalizeFn func(ctx context.Context, suiteID string, specs []
 // no-repeat checks before invoking the publish callback.
 type PipelineTesterSuiteIDFn func() string
 
+// PipelineCommitter is the inspector-owned authority that mutates the
+// pipeline VFS lifecycle. The pipeline inspector's handoff_to_ot and
+// discard_pipeline skills call into this interface so the actual extract /
+// rollback operation is performed by the agent that decided it should
+// happen. Other pipeline agents (engineer, designer, tester) leave this
+// nil — they have no authority to commit or rollback.
+//
+// Background: the orchestrator used to react to "succeeded" / "failed"
+// pipeline-update broadcasts and call SessionVFS.ExtractReviewCandidate /
+// CommitPipeline / RollbackPipeline itself. That made the orchestrator the
+// effective owner of pipeline VFS lifecycle even though the protocol
+// designates the inspector as the only authorized terminator. The
+// resulting "edit_pipeline_file failed: VFS not found" reports were the
+// inspector seeing the orchestrator silently destroy the VFS while it
+// still had follow-up work queued. Moving the operations behind this
+// interface — invoked from the inspector's own skill handlers — keeps
+// authority where the protocol says it belongs.
+type PipelineCommitter interface {
+	// ExtractReviewCandidate closes the named pipeline draft, stashes its
+	// modifications as a review candidate for the global review tier, and
+	// removes the pipeline VFS from the session map. Returns the
+	// candidate's ID (empty when no modifications existed), whether a
+	// draft was actually present, and the resulting checkpoint version.
+	ExtractReviewCandidate(ctx context.Context, pipelineID string) (candidateID string, hadDraft bool, version versioning.SemanticVersion, err error)
+
+	// Rollback discards a pipeline draft without merging it. Used by the
+	// inspector's discard_pipeline skill when work is judged
+	// irrecoverable. Idempotent — a missing pipeline returns nil.
+	Rollback(ctx context.Context, pipelineID string) error
+}
+
 type PipelineProtocolSkillConfig struct {
 	AgentType      func() string
 	AgentID        func() string
 	InspectorOT    bool
 	WorkspaceViews func() versioning.WorkspaceViewAccess
 	Route          PipelineProtocolRouteConfig
+	// Committer returns the inspector-only VFS lifecycle authority.
+	// Required when InspectorOT is true (handoff_to_ot needs it); ignored
+	// otherwise. Lazy because the inspector's committer is wired after
+	// skill registration runs (the SessionVFS isn't available yet at
+	// agent construction). Returning nil from the lookup at call time is
+	// a configuration error and surfaces as a tool-call failure.
+	Committer func() PipelineCommitter
 	// TesterFinalize, when non-nil, opts the agent into the tester
 	// finalize_pipeline skill. The skill packages a per-recipient
 	// verification artifact for each target spec the LLM provides and
@@ -738,7 +776,7 @@ func PipelineProtocolSkills(cfg PipelineProtocolSkillConfig) []*skills.Skill {
 		pipelineProcessValidationSkill(cfg),
 	}
 	if cfg.InspectorOT {
-		out = append(out, pipelineFinalizePipelineSkill(cfg), pipelineHandoffOTSkill(cfg))
+		out = append(out, pipelineFinalizePipelineSkill(cfg), pipelineHandoffOTSkill(cfg), pipelineDiscardPipelineSkill(cfg))
 	}
 	if cfg.TesterFinalize != nil {
 		out = append(out, pipelineTesterFinalizePipelineSkill(cfg))
@@ -995,13 +1033,15 @@ type pipelineProtocolRouteOptions struct {
 
 func pipelineTurnSelectionResult(agentType string, action *PipelineTurnAction, dispatch *pipelineDispatchSelection) map[string]any {
 	result := map[string]any{
-		"selected":      true,
-		"agent_type":    agentType,
-		"target_agents": append([]string(nil), action.TargetAgents...),
-		"mode":          string(action.Mode),
+		"selected":       true,
+		"agent_type":     agentType,
+		"target_agents":  append([]string(nil), action.TargetAgents...),
+		"mode":           string(action.Mode),
+		"protocol_scope": pipelineProtocolNamespace,
 	}
 	if strings.TrimSpace(action.ChallengeID) != "" {
 		result["challenge_id"] = strings.TrimSpace(action.ChallengeID)
+		result["thread_key"] = pipelineThreadPrefix + strings.TrimSpace(action.ChallengeID)
 	}
 	if strings.TrimSpace(action.WorkspaceFingerprint) != "" {
 		result["workspace_fingerprint"] = strings.TrimSpace(action.WorkspaceFingerprint)
@@ -1154,6 +1194,7 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 					"forwarded":           true,
 					"correlation_id":      correlationID,
 					"target_agent_id":     strings.TrimSpace(nextTask.TargetAgentID),
+					"protocol_scope":      pipelineProtocolNamespace,
 				}, nil
 			}
 			if err := state.setTerminalAction(terminalAction); err != nil {
@@ -1170,6 +1211,7 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 				"responding_agent":    record.RespondingAgent,
 				"responding_agent_id": record.RespondingAgentID,
 				"status":              record.Status,
+				"protocol_scope":      pipelineProtocolNamespace,
 			}, nil
 		}).
 		Build()
@@ -1241,10 +1283,11 @@ func pipelineProcessValidationSkill(cfg PipelineProtocolSkillConfig) *skills.Ski
 				return nil, err
 			}
 			return map[string]any{
-				"processed":    true,
-				"challenge_id": challengeID,
-				"decision":     string(decision),
-				"next_targets": normalizeStringList(params.NextTargets),
+				"processed":      true,
+				"challenge_id":   challengeID,
+				"decision":       string(decision),
+				"next_targets":   normalizeStringList(params.NextTargets),
+				"protocol_scope": pipelineProtocolNamespace,
 			}, nil
 		}).
 		Build()
@@ -1453,23 +1496,136 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 			}); err != nil {
 				return nil, err
 			}
-			if task := pipelineTerminalUpdateTask(ctx, cfg); task != nil {
+
+			// Inspector-owned VFS authority: extract the review candidate
+			// here, where the inspector decided the pipeline is done. The
+			// orchestrator no longer reacts to "succeeded" status broadcasts
+			// to mutate the VFS — that previously made the orchestrator the
+			// effective owner of pipeline lifecycle and produced
+			// "edit_pipeline_file failed: VFS not found" reports when the
+			// orchestrator destroyed the VFS while the inspector still had
+			// follow-up work queued. If the committer is missing the inspector
+			// is misconfigured at registration; fail loudly rather than
+			// silently broadcasting success without the side effect.
+			//
+			// When no pipeline task is bound (protocol-only tests, fallback
+			// contexts), the extract is a no-op and we just publish the
+			// protocol state change — matching the prior behavior for this
+			// pre-refactor edge case.
+			task := pipelineTerminalUpdateTask(ctx, cfg)
+			pipelineID := ""
+			if task != nil {
+				pipelineID = strings.TrimSpace(task.TaskID)
+			}
+			candidateID := ""
+			hadDraft := false
+			var checkpointVersion versioning.SemanticVersion
+			if pipelineID != "" {
+				if cfg.Committer == nil {
+					return nil, fmt.Errorf("handoff_to_ot requires a configured pipeline committer (inspector misconfiguration)")
+				}
+				committer := cfg.Committer()
+				if committer == nil {
+					return nil, fmt.Errorf("handoff_to_ot requires a configured pipeline committer (inspector misconfiguration)")
+				}
+				cid, hd, ver, extractErr := committer.ExtractReviewCandidate(ctx, pipelineID)
+				if extractErr != nil {
+					return nil, fmt.Errorf("extract pipeline review candidate %s: %w", pipelineID, extractErr)
+				}
+				candidateID = cid
+				hadDraft = hd
+				checkpointVersion = ver
+			}
+
+			if task != nil {
 				PublishPipelineTaskSuccessUpdate(
 					cfg.Route.eventBus(),
 					agentType,
 					task,
 					summary,
 					map[string]any{
-						"summary":       summary,
-						"evidence_refs": evidenceRefs,
+						"summary":             summary,
+						"evidence_refs":       evidenceRefs,
+						"review_candidate_id": candidateID,
+						"had_draft":           hadDraft,
+						"checkpoint_version":  checkpointVersion.String(),
 					},
 					PipelineTaskAttempt(task),
 				)
 			}
 			return map[string]any{
-				"handoff_to_ot": true,
-				"agent_type":    agentType,
-				"evidence_refs": evidenceRefs,
+				"handoff_to_ot":       true,
+				"agent_type":          agentType,
+				"evidence_refs":       evidenceRefs,
+				"review_candidate_id": candidateID,
+				"had_draft":           hadDraft,
+			}, nil
+		}).
+		Build()
+}
+
+// pipelineDiscardPipelineSkill is the inspector-only rollback authority.
+// Replaces the orchestrator's reaction to "failed" status broadcasts so the
+// pipeline VFS is only destroyed when the inspector explicitly decides the
+// work is irrecoverable. Per-agent intermediate failures (engineer crash,
+// tester timeout, etc.) leave the VFS alive so the inspector can dispatch a
+// retry.
+func pipelineDiscardPipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
+	return skills.NewSkill("discard_pipeline").
+		Description("Rollback the active pipeline draft when the work is irrecoverable. Inspector only.").
+		Domain("pipeline").
+		Keywords("rollback", "discard", "abort", "fail", "pipeline").
+		Priority(95).
+		Usage("Use when an audit cycle has concluded that the pipeline cannot be salvaged — repeated failures, fundamentally wrong approach, or unrecoverable peer error. Prefer challenge_agent or handoff_next for any path where the work is still potentially recoverable. This is a destructive terminal action.").
+		Requirement("Provide a concrete reason explaining why the pipeline must be discarded.").
+		Satisfies("Removes the pipeline VFS draft from the session and clears its in-flight modifications.").
+		StringParam("reason", "Why the pipeline must be discarded", true).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Reason string `json:"reason"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			agentType := pipelineProtocolAgentType(ctx, cfg)
+			if agentType != PipelineAgentInspector {
+				return nil, fmt.Errorf("discard_pipeline is only permitted for the pipeline inspector")
+			}
+			reason := strings.TrimSpace(params.Reason)
+			if reason == "" {
+				return nil, fmt.Errorf("reason is required")
+			}
+			task := pipelineTerminalUpdateTask(ctx, cfg)
+			pipelineID := ""
+			if task != nil {
+				pipelineID = strings.TrimSpace(task.TaskID)
+			}
+			if pipelineID == "" {
+				return nil, fmt.Errorf("discard_pipeline requires a pipeline task id")
+			}
+			if cfg.Committer == nil {
+				return nil, fmt.Errorf("discard_pipeline requires a configured pipeline committer (inspector misconfiguration)")
+			}
+			committer := cfg.Committer()
+			if committer == nil {
+				return nil, fmt.Errorf("discard_pipeline requires a configured pipeline committer (inspector misconfiguration)")
+			}
+			if err := committer.Rollback(ctx, pipelineID); err != nil {
+				return nil, fmt.Errorf("rollback pipeline %s: %w", pipelineID, err)
+			}
+			if task != nil {
+				PublishPipelineTaskFailureUpdate(
+					cfg.Route.eventBus(),
+					agentType,
+					task,
+					reason,
+					PipelineTaskAttempt(task),
+				)
+			}
+			return map[string]any{
+				"discard_pipeline": true,
+				"agent_type":       agentType,
+				"reason":           reason,
 			}, nil
 		}).
 		Build()

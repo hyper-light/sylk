@@ -142,8 +142,9 @@ func TestConsultAgent_FailedAcademicConsultMarksInterAgentBranchFailed(t *testin
 	var events []agentshared.ToolCallEvent
 	parentCorr := fmt.Sprintf("corr-parent-%d", time.Now().UnixNano())
 	ctx := agentshared.WithStreamContext(context.Background(), parentCorr, "inspector")
-	ctx = agentshared.WithToolCallEmitter(ctx, func(ev agentshared.ToolCallEvent) {
+	ctx = agentshared.WithToolCallEmitter(ctx, func(ev agentshared.ToolCallEvent) error {
 		events = append(events, ev)
+		return nil
 	})
 
 	_, err = gi.consultAgent(ctx, "academic", "Assess whether the current approach is sound.", nil)

@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -1290,14 +1291,22 @@ func (m *AppModel) commitCommandApproval(commit msg.CommandApprovalCommitMsg) te
 		}
 	}
 	topic := guide.TopicResponses("guardian", commit.Proposal.TargetAgentID)
-	_ = m.deps.GuideBus.Publish(topic, &guide.Message{
+	if err := m.deps.GuideBus.Publish(topic, &guide.Message{
 		ID:            uuid.New().String(),
 		CorrelationID: commit.Proposal.CorrelationID,
 		Type:          guide.MessageTypeResponse,
 		SourceAgentID: "tui",
 		Payload:       payload,
 		Timestamp:     time.Now(),
-	})
+	}); err != nil {
+		slog.Warn("ui_command_approval_response_publish_failed",
+			"topic", topic,
+			"correlation_id", commit.Proposal.CorrelationID,
+			"target_agent", commit.Proposal.TargetAgentID,
+			"approved", approved,
+			"error", err.Error(),
+		)
+	}
 	return func() tea.Msg {
 		return msg.CommandApprovalResolvedMsg{}
 	}
@@ -1419,7 +1428,7 @@ func (m *AppModel) commitLayerDecision(commit msg.LayerDecisionCommitMsg) tea.Cm
 	if strings.TrimSpace(commit.DAGID) == "" || m.deps.GuideBus == nil {
 		return func() tea.Msg { return msg.LayerDecisionResolvedMsg{} }
 	}
-	_ = m.deps.GuideBus.Publish("dag.decision.response", &guide.Message{
+	if err := m.deps.GuideBus.Publish("dag.decision.response", &guide.Message{
 		ID:            uuid.New().String(),
 		Type:          guide.MessageTypeLayerDecisionResponse,
 		SourceAgentID: "tui",
@@ -1429,7 +1438,14 @@ func (m *AppModel) commitLayerDecision(commit msg.LayerDecisionCommitMsg) tea.Cm
 			"decision":  commit.Decision,
 		},
 		Timestamp: time.Now(),
-	})
+	}); err != nil {
+		slog.Warn("ui_layer_decision_publish_failed",
+			"dag_id", commit.DAGID,
+			"layer_idx", commit.LayerIdx,
+			"decision", commit.Decision,
+			"error", err.Error(),
+		)
+	}
 	return func() tea.Msg { return msg.LayerDecisionResolvedMsg{} }
 }
 

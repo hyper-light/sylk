@@ -110,10 +110,15 @@ func TestDeriveInterAgentToolEvent_GuardianConsultPrefersHumanizedNestedPayload(
 }
 
 func TestDeriveInterAgentToolEvent_GlobalReviewChallengeFlow(t *testing.T) {
+	// Producers (global_review_protocol.go) now stamp protocol_scope in both
+	// challenge-dispatch outputs and validate_global_review outputs. The UI
+	// reads ThreadKey directly from that explicit scope — no tool-name
+	// guessing. Tests that simulate producer emission must include the
+	// scope the same way real producers do.
 	challenge := DeriveInterAgentToolEvent(
 		"challenge_architect",
 		`{"reason":"Need plan clarification","request":"Reassess the testing scope."}`,
-		`{"selected":true,"target_agent":"architect","challenge_id":"global-review-123"}`,
+		`{"selected":true,"target_agent":"architect","challenge_id":"global-review-123","protocol_scope":"global_review"}`,
 		ToolCallComplete,
 		true,
 		"",
@@ -130,8 +135,8 @@ func TestDeriveInterAgentToolEvent_GlobalReviewChallengeFlow(t *testing.T) {
 
 	response := DeriveInterAgentToolEvent(
 		"validate_global_review",
-		`{"challenge_id":"global-review-123","requesting_agent":"inspector","status":"passed","summary":"Revise the plan to strengthen integration coverage."}`,
-		`{"validated":true,"challenge_id":"global-review-123","requesting_agent":"inspector","responding_agent":"architect","status":"passed"}`,
+		`{"challenge_id":"global-review-123","requesting_agent":"inspector","status":"passed","summary":"Revise the plan to strengthen integration coverage.","protocol_scope":"global_review"}`,
+		`{"validated":true,"challenge_id":"global-review-123","requesting_agent":"inspector","responding_agent":"architect","status":"passed","protocol_scope":"global_review"}`,
 		ToolCallComplete,
 		true,
 		"",

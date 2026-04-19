@@ -30,7 +30,7 @@ func (a *Archivalist) executeToolLoopWithBundle(ctx context.Context, req *provid
 
 	p := a.getProvider()
 	if p == nil {
-		return "", fmt.Errorf("archivalist: no LLM provider configured")
+		return "", fmt.Errorf("archivalist: %w: LLM provider not yet wired", shared.ErrAgentNotReady)
 	}
 
 	for turn := range maxRuns + 1 {

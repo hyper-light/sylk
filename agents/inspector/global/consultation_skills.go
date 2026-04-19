@@ -216,7 +216,7 @@ func (gi *GlobalInspector) consultAgent(ctx context.Context, target, prompt stri
 	if !admission.Allowed {
 		return "", agentShared.ConsultationAdmissionError(admission)
 	}
-	branchCtx, branch := agentShared.BeginInterAgentBranch(ctx, agentShared.InterAgentBranchSpec{
+	spec := agentShared.InterAgentBranchSpec{
 		Kind:       agentShared.InterAgentToolEventKindConsult,
 		ToolName:   "consult_" + strings.ReplaceAll(strings.TrimSpace(target), "-", "_"),
 		AgentTypes: []string{target},
@@ -225,21 +225,22 @@ func (gi *GlobalInspector) consultAgent(ctx context.Context, target, prompt stri
 			"target": target,
 			"query":  prompt,
 		},
+	}
+	msg, err := agentShared.WithInterAgentBranchMessage(ctx, spec, func(branchCtx context.Context, branch agentShared.InterAgentBranchHandle) (*guide.Message, error) {
+		branchMetadata := branch.ApplyMetadata(branchCtx, admission.Metadata)
+		resp, routeErr := gi.requestRouteSync(branchCtx, target, prompt, branchMetadata)
+		if routeErr != nil {
+			agentShared.RecordConsultationOutcome(branchCtx, admission.AttemptID, false, nil, routeErr)
+			return resp, routeErr
+		}
+		content, extractErr := extractConsultationResponse(resp)
+		agentShared.RecordConsultationOutcome(branchCtx, admission.AttemptID, extractErr == nil, content, extractErr)
+		return resp, extractErr
 	})
-	branchMetadata := branch.ApplyMetadata(branchCtx, admission.Metadata)
-	msg, err := gi.requestRouteSync(branchCtx, target, prompt, branchMetadata)
-	if err != nil {
-		agentShared.RecordConsultationOutcome(branchCtx, admission.AttemptID, false, nil, err)
-		branch.CompleteFromMessage(branchCtx, msg, err)
-		return "", err
-	}
-	content, err := extractConsultationResponse(msg)
-	agentShared.RecordConsultationOutcome(branchCtx, admission.AttemptID, err == nil, content, err)
-	branch.CompleteFromMessage(branchCtx, msg, err)
 	if err != nil {
 		return "", err
 	}
-	return content, nil
+	return extractConsultationResponse(msg)
 }
 
 func consultationBlockedResult(target string, err *agentShared.ConsultationPressureError) map[string]any {

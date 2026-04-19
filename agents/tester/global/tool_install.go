@@ -111,13 +111,22 @@ func (gt *GlobalTester) researchTestToolInstall(
 
 func (gt *GlobalTester) installTestTooling(ctx context.Context, plan *testToolInstallPlan) (map[string]any, error) {
 	return agentshared.ExecuteDependencyInstallPlan(ctx, agentshared.DependencyInstallSkillConfig{
-		SkillName:      "install_test_tooling",
-		ResearchSkill:  "research_test_tool_install",
-		AgentType:      "tester",
-		AgentID:        func() string { return gt.id },
-		SessionID:      func() string { return gt.config.SessionID },
-		WorkingDir:     gt.workingDir,
-		DefaultTimeout: func() time.Duration { return gt.config.DefaultTimeout },
+		SkillName:       "install_test_tooling",
+		ResearchSkill:   "research_test_tool_install",
+		AgentType:       "tester",
+		AgentID:         func() string { return gt.id },
+		SessionID:       func() string { return gt.config.SessionID },
+		WorkingDir:      gt.workingDir,
+		DefaultTimeout:  func() time.Duration { return gt.config.DefaultTimeout },
+		ExecutionBroker: func() purevfs.ExecutionBroker { return gt.executionBroker },
+		PrepareExecution: func(ctx context.Context, workingDir string) (agentshared.CommandExecContext, error) {
+			execCtx, err := gt.commandExecutionContext(ctx, workingDir)
+			if err != nil {
+				return agentshared.CommandExecContext{}, err
+			}
+			return agentshared.CommandExecContext{WorkDir: execCtx.workDir, Plan: execCtx.plan}, nil
+		},
+		ExecutionWorkspace: gt.executionWorkspace,
 	}, plan)
 }
 

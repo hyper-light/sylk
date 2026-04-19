@@ -80,9 +80,26 @@ type memoryNamespace struct {
 }
 
 type memoryFile struct {
-	content []byte
-	mode    fs.FileMode
-	modTime time.Time
+	// content holds the bytes as stored in memory. When compressed=true,
+	// this is the DEFLATE-encoded payload; otherwise it is the raw file
+	// bytes. rawSize records the pre-compression length so callers can
+	// report the real file size without decompressing.
+	content    []byte
+	mode       fs.FileMode
+	modTime    time.Time
+	accessTime time.Time // updated on every read; drives cold-file eviction
+	compressed bool
+	rawSize    int // only meaningful when compressed=true
+}
+
+// size returns the logical file size — the bytes a reader would see —
+// regardless of whether the stored payload is compressed. Stat and
+// directory listings use this so the sandbox sees consistent sizes.
+func (f *memoryFile) size() int64 {
+	if f.compressed {
+		return int64(f.rawSize)
+	}
+	return int64(len(f.content))
 }
 
 type memoryDir struct {
@@ -589,7 +606,11 @@ func (n hostNamespace) ListDir(_ context.Context, dir string) ([]fs.DirEntry, er
 }
 
 func (n hostNamespace) ReadFile(_ context.Context, name string) ([]byte, error) {
-	return os.ReadFile(n.resolve(name))
+	// Route through the process-wide toolchain read cache. hostNamespace is
+	// read-only by contract, and the cache keys by (path, size, mtime) so a
+	// toolchain file that actually changed on disk (rare — usually only if
+	// the user reinstalls a package) is invalidated automatically.
+	return cachedReadFile(n.resolve(name))
 }
 
 func (n hostNamespace) MkdirAll(context.Context, string) error {
@@ -627,7 +648,7 @@ func (n *memoryNamespace) Stat(_ context.Context, name string) (fs.FileInfo, err
 	if file := n.files[cleaned]; file != nil {
 		return projectionFileInfo{
 			name:    path.Base(cleaned),
-			size:    int64(len(file.content)),
+			size:    file.size(), // logical (uncompressed) size
 			mode:    file.mode,
 			modTime: file.modTime,
 		}, nil
@@ -651,7 +672,7 @@ func (n *memoryNamespace) ListDir(_ context.Context, dir string) ([]fs.DirEntry,
 	}
 	entries := make(map[string]projectionDirEntry)
 	for name, file := range n.files {
-		n.addChild(entries, cleaned, name, file.mode, int64(len(file.content)), file.modTime)
+		n.addChild(entries, cleaned, name, file.mode, file.size(), file.modTime)
 	}
 	for name, child := range n.dirs {
 		n.addChild(entries, cleaned, name, child.mode, 0, child.modTime)
@@ -693,13 +714,19 @@ func (n *memoryNamespace) addChild(entries map[string]projectionDirEntry, parent
 }
 
 func (n *memoryNamespace) ReadFile(_ context.Context, name string) ([]byte, error) {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	file := n.files[normalizeExecPath(name)]
+	// Write lock: reads of compressed files mutate access time and may
+	// inflate-in-place (which also updates the budget). Upgrading from
+	// RLock at read time is not safe, so we hold the write lock for the
+	// full read path.
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	cleaned := normalizeExecPath(name)
+	file := n.files[cleaned]
 	if file == nil {
 		return nil, syscall.ENOENT
 	}
-	return cloneBytes(file.content), nil
+	n.touchAccessLocked(file)
+	return n.maybeInflateInPlaceLocked(cleaned)
 }
 
 func (n *memoryNamespace) MkdirAll(_ context.Context, dir string) error {
@@ -717,10 +744,12 @@ func (n *memoryNamespace) WriteFile(_ context.Context, name string, content []by
 	if err := n.adjustFileBytesLocked(cleaned, len(content)); err != nil {
 		return err
 	}
+	now := time.Now().UTC()
 	n.files[cleaned] = &memoryFile{
-		content: cloneBytes(content),
-		mode:    0o644,
-		modTime: time.Now().UTC(),
+		content:    cloneBytes(content),
+		mode:       0o644,
+		modTime:    now,
+		accessTime: now,
 	}
 	return nil
 }
@@ -796,11 +825,25 @@ func (n *memoryNamespace) hasChildren(dir string) bool {
 func (n *memoryNamespace) adjustFileBytesLocked(name string, next int) error {
 	current := 0
 	if file := n.files[name]; file != nil {
+		// len(file.content) — the bytes actually held in memory, which
+		// is what the budget tracks. A compressed file's current usage is
+		// its compressed length, not its logical size.
 		current = len(file.content)
 	}
 	delta := int64(next - current)
 	if delta > 0 {
-		return n.reserveBytesLocked(delta)
+		if err := n.reserveBytesLocked(delta); err != nil {
+			// Pressure: compress cold files to make room, then retry. If
+			// the compression pass still can't free enough, propagate the
+			// original error — the user's budget is genuinely too small.
+			if freed := n.compressColdFilesLocked(delta); freed >= delta {
+				if retryErr := n.reserveBytesLocked(delta); retryErr == nil {
+					return nil
+				}
+			}
+			return err
+		}
+		return nil
 	}
 	n.releaseBytesLocked(-delta)
 	return nil

@@ -283,6 +283,11 @@ func isPriorityGuideMessage(busMsg *guide.Message) bool {
 			return streamHasPriorityInterAgentBranch(stream)
 		case guide.StreamEventToolCall:
 			return true
+		case guide.StreamEventAgentState:
+			// State events drive the activity indicator; they must not be
+			// de-prioritized behind chunk backpressure or the UI will go
+			// silent during routing hops.
+			return true
 		default:
 			return false
 		}
@@ -680,6 +685,15 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 			return
 		}
 		program.Send(parseToolCallEventMsg(sid, cid, stream))
+	case guide.StreamEventAgentState:
+		// Agent-state events are routed unconditionally. Unlike text/tool
+		// events they do NOT require a prior StreamStart — an orchestrator
+		// may publish `dispatching_to_peer` state on its response channel
+		// before any stream is attached to that correlation, and the chat
+		// panel uses the event to render an inter-stream bridge indicator.
+		// Stream-started gating here would produce exactly the silent gap
+		// these events exist to eliminate.
+		program.Send(parseAgentStateMsg(sid, cid, stream))
 	}
 }
 
@@ -1607,3 +1621,66 @@ func parsePlanTaskSnapshot(data map[string]any) msg.PlanTaskSnapshot {
 type guideError string
 
 func (e guideError) Error() string { return string(e) }
+
+// parseAgentStateMsg translates a StreamEventAgentState event into a UI
+// message. The payload is either a *guide.AgentStateEvent (in-process path)
+// or a generic map (post-serialization path). Both are accepted so the UI
+// does not care whether the event crossed a process boundary.
+func parseAgentStateMsg(sessionID, correlationID string, stream *guide.StreamResponse) msg.AgentStateMsg {
+	result := msg.AgentStateMsg{
+		SessionID:     sessionID,
+		CorrelationID: correlationID,
+	}
+	if stream == nil || stream.Event == nil {
+		return result
+	}
+	result.Timestamp = stream.Event.Timestamp
+	result.AgentID = strings.TrimSpace(stream.RespondingAgentID)
+	if payload, ok := stream.Event.Data.(*guide.AgentStateEvent); ok && payload != nil {
+		result.State = string(payload.State)
+		result.Detail = strings.TrimSpace(payload.Detail)
+		result.TransitionID = payload.TransitionID
+		result.PeerAgentType = strings.TrimSpace(payload.PeerAgentType)
+		result.PeerCorrelationID = strings.TrimSpace(payload.PeerCorrelationID)
+		if agentID := strings.TrimSpace(payload.AgentID); agentID != "" {
+			result.AgentID = agentID
+		}
+		if agentType := strings.TrimSpace(payload.AgentType); agentType != "" {
+			result.AgentType = agentType
+		}
+		if corr := strings.TrimSpace(payload.CorrelationID); corr != "" {
+			result.CorrelationID = corr
+		}
+		return result
+	}
+	if data, ok := stream.Event.Data.(map[string]any); ok {
+		if v, ok := data["state"].(string); ok {
+			result.State = v
+		}
+		if v, ok := data["detail"].(string); ok {
+			result.Detail = strings.TrimSpace(v)
+		}
+		if v, ok := data["agent_id"].(string); ok && strings.TrimSpace(v) != "" {
+			result.AgentID = strings.TrimSpace(v)
+		}
+		if v, ok := data["agent_type"].(string); ok {
+			result.AgentType = strings.TrimSpace(v)
+		}
+		if v, ok := data["correlation_id"].(string); ok && strings.TrimSpace(v) != "" {
+			result.CorrelationID = strings.TrimSpace(v)
+		}
+		if v, ok := data["peer_agent_type"].(string); ok {
+			result.PeerAgentType = strings.TrimSpace(v)
+		}
+		if v, ok := data["peer_correlation_id"].(string); ok {
+			result.PeerCorrelationID = strings.TrimSpace(v)
+		}
+		if v, ok := data["transition_id"].(float64); ok {
+			result.TransitionID = int64(v)
+		}
+		if v, ok := data["transition_id"].(int64); ok {
+			result.TransitionID = v
+		}
+	}
+	return result
+}

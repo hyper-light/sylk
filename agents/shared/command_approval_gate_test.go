@@ -677,7 +677,7 @@ func TestGuardianCommandGateAuthorize_CreatesImmediateApprovalBranchWhenAlreadyN
 		streamMetadataParentToolCallKey: "consult-1",
 		streamMetadataInterAgentKind:    InterAgentToolEventKindConsult,
 	})
-	ctx = WithToolCallEmitter(ctx, func(ToolCallEvent) {})
+	ctx = WithToolCallEmitter(ctx, func(ToolCallEvent) error { return nil })
 
 	errCh := make(chan error, 1)
 	go func() {

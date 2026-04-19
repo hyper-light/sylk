@@ -35,15 +35,14 @@ func RequestGuideRouteSync(ctx context.Context, cfg GuideRouteSyncRequest) (*gui
 	waitCtx, release := WithoutDeadlineCancellation(ctx)
 	defer release()
 
-	branchCtx, branch := BeginAutoInterAgentRouteBranch(waitCtx, req.TargetAgentID, req.Input, req.Metadata)
-	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
+	req.Metadata = InheritedBranchMetadata(waitCtx, req.Metadata)
 	if req.ParentCorrelationID == "" {
-		if stream, ok := StreamMetadataFromContext(branchCtx); ok {
+		if stream, ok := StreamMetadataFromContext(waitCtx); ok {
 			req.ParentCorrelationID = stream.CorrelationID
 		}
 	}
-	req.Metadata = RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
-	response, err := RetryBusyRouteRequest(branchCtx, req.TargetAgentID, DefaultBusyRetryPolicy(req.TargetAgentID), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+	req.Metadata = RouteMetadataWithInterAgentBranch(waitCtx, req.Metadata)
+	response, err := RetryBusyRouteRequest(waitCtx, req.TargetAgentID, DefaultBusyRetryPolicy(req.TargetAgentID), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
 		attemptReq := req
 		attemptReq.CorrelationID = "route_" + uuid.NewString()[:12]
 		attemptReq.Timestamp = time.Now()
@@ -105,7 +104,7 @@ func RequestGuideRouteSync(ctx context.Context, cfg GuideRouteSyncRequest) (*gui
 			wait,
 		)
 		if err != nil {
-			cancelGuideRouteRequest(cfg.Bus, &attemptReq, err)
+			cancelGuideRouteRequest(attemptCtx, cfg.Bus, &attemptReq, err)
 			return nil, err
 		}
 		if response == nil {
@@ -118,14 +117,12 @@ func RequestGuideRouteSync(ctx context.Context, cfg GuideRouteSyncRequest) (*gui
 		return response, nil
 	})
 	if err != nil {
-		branch.Complete(branchCtx, "", "", err)
 		return nil, err
 	}
-	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }
 
-func cancelGuideRouteRequest(bus guide.EventBus, req *guide.RouteRequest, cause error) {
+func cancelGuideRouteRequest(ctx context.Context, bus guide.EventBus, req *guide.RouteRequest, cause error) {
 	if bus == nil || req == nil || strings.TrimSpace(req.CorrelationID) == "" || strings.TrimSpace(req.TargetAgentID) == "" {
 		return
 	}
@@ -142,7 +139,23 @@ func cancelGuideRouteRequest(bus guide.EventBus, req *guide.RouteRequest, cause 
 		},
 		Timestamp: time.Now(),
 	}
-	_ = bus.Publish(guide.TopicGuideRequests, guide.NewActionMessage("", action))
+	// cancellation is best-effort by design — the sync route has already
+	// returned an error to the caller. A failed cancel leaves a pending
+	// route that the target agent will eventually time out, but we cannot
+	// propagate an error here (the function's callers are already unwinding
+	// a failure). Always log the delivery failure so stuck-cancel cases are
+	// observable in telemetry.
+	if err := bus.Publish(guide.TopicGuideRequests, guide.NewActionMessage("", action)); err != nil {
+		if lm := LogMetaFromContext(ctx); lm.EventLogger != nil {
+			LogWarning(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+				"guide_route_sync_cancel_publish_failed", map[string]any{
+					"correlation_id": req.CorrelationID,
+					"target_agent":   req.TargetAgentID,
+					"cause":          errorString(cause),
+					"error":          err.Error(),
+				})
+		}
+	}
 }
 
 func errorString(err error) string {

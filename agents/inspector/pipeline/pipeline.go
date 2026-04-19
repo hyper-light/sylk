@@ -97,6 +97,13 @@ type PipelineInspector struct {
 	fileAccess     versioning.FileAccess
 	workspaceViews versioning.WorkspaceViewAccess
 
+	// pipelineCommitter is the inspector-only VFS lifecycle authority.
+	// handoff_to_ot and discard_pipeline call into it; all other agents
+	// (engineer, designer, tester) leave their PipelineProtocolSkillConfig
+	// without one. See agents/shared/pipeline_committer.go for context on
+	// why this lives at the inspector rather than the orchestrator.
+	pipelineCommitter agentShared.PipelineCommitter
+
 	// Request lifecycle.
 	runCtx    context.Context
 	runCancel context.CancelFunc
@@ -135,15 +142,14 @@ func New(cfg shared.PipelineInspectorConfig, provider providers.ProviderAdapter)
 		executionBroker:   purevfs.DefaultExecutionBroker(),
 	}
 	pi.toolRunner = shared.NewToolRunner(shared.ToolRunnerConfig{
-		WorkingDir:    ".",
-		Timeout:       cfg.DefaultTimeout,
-		Logger:        slog.Default(),
-		AgentID:       agentID,
-		AgentType:     "inspector-pipeline",
-		SessionID:     func() string { return pi.config.SessionID },
-		FileAccess:    func() versioning.FileAccess { return pi.fileAccess },
-		Broker:        func() purevfs.ExecutionBroker { return pi.executionBroker },
-		RequireBroker: true,
+		WorkingDir: ".",
+		Timeout:    cfg.DefaultTimeout,
+		Logger:     slog.Default(),
+		AgentID:    agentID,
+		AgentType:  "inspector-pipeline",
+		SessionID:  func() string { return pi.config.SessionID },
+		FileAccess: func() versioning.FileAccess { return pi.fileAccess },
+		Broker:     func() purevfs.ExecutionBroker { return pi.executionBroker },
 	})
 
 	pi.factory = cfg.Factory
@@ -280,6 +286,14 @@ func (pi *PipelineInspector) getProvider() pipelineInspectorProvider {
 	pi.mu.RLock()
 	defer pi.mu.RUnlock()
 	return pi.provider
+}
+
+// Ready implements shared.ReadinessReporter.
+func (pi *PipelineInspector) Ready() (bool, string) {
+	if pi.getProvider() == nil {
+		return false, "LLM provider not yet wired (post-init / pre-auth window)"
+	}
+	return true, ""
 }
 
 // SwapModel implements container.ModelSwappable.
@@ -1133,6 +1147,16 @@ func (pi *PipelineInspector) SetFileAccess(fa versioning.FileAccess) {
 }
 func (pi *PipelineInspector) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
 	pi.workspaceViews = authority.RestrictWorkspaceViews("inspector-pipeline", views)
+}
+
+// SetPipelineCommitter installs the VFS lifecycle authority used by
+// handoff_to_ot and discard_pipeline. Wiring code that has access to the
+// SessionVFS (the agent host, e.g. cmd/tui.go) is responsible for
+// constructing this and injecting it before the inspector handles its
+// first request. Without it the inspector's terminal skills fail with a
+// configuration error rather than silently broadcasting success.
+func (pi *PipelineInspector) SetPipelineCommitter(c agentShared.PipelineCommitter) {
+	pi.pipelineCommitter = c
 }
 
 func (pi *PipelineInspector) SetExecutionBroker(broker purevfs.ExecutionBroker) {

@@ -348,8 +348,13 @@ drain:
 		}
 	}
 
-	if len(got) != 1 || got[0] != guide.StreamEventComplete {
-		t.Fatalf("expected only stream complete, got %#v", got)
+	// PublishStreamComplete auto-emits an AgentStateEvent (complete state)
+	// before the StreamEventComplete so the activity channel reflects the
+	// terminal transition in the same order as the text terminal. The
+	// subsequent late progress must still be suppressed — that is the
+	// invariant this test protects.
+	if len(got) != 2 || got[0] != guide.StreamEventAgentState || got[1] != guide.StreamEventComplete {
+		t.Fatalf("expected [agent_state complete, stream complete], got %#v", got)
 	}
 }
 
@@ -400,20 +405,27 @@ drain:
 		}
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("event count = %d, want 2 (%#v)", len(got), got)
-	}
+	// PublishStreamError auto-emits an AgentStateEvent(errored) before the
+	// StreamEventError, and PublishStreamComplete auto-emits
+	// AgentStateEvent(complete) before StreamEventComplete. The late
+	// progress between them must still be suppressed.
 	var sawError, sawComplete bool
+	var agentStateCount int
 	for _, eventType := range got {
-		if eventType == guide.StreamEventError {
+		switch eventType {
+		case guide.StreamEventError:
 			sawError = true
-		}
-		if eventType == guide.StreamEventComplete {
+		case guide.StreamEventComplete:
 			sawComplete = true
+		case guide.StreamEventAgentState:
+			agentStateCount++
 		}
 	}
 	if !sawError || !sawComplete {
-		t.Fatalf("expected error + complete only, got %#v", got)
+		t.Fatalf("expected error + complete, got %#v", got)
+	}
+	if agentStateCount != 2 {
+		t.Fatalf("expected 2 agent_state events (errored, complete), got %d (%#v)", agentStateCount, got)
 	}
 }
 
@@ -490,7 +502,7 @@ func TestCompleteWithWatchdog_EmitsToolCallStartFromStreamingProvider(t *testing
 	})
 	ctx = WithStreamContext(ctx, "corr-live-tool", "tui")
 	ctx = WithStreamContextMetadata(ctx, map[string]any{"agent_type": "engineer"})
-	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	resp, err := CompleteWithWatchdog(ctx, &toolStreamingWatchdogProvider{}, &providers.Request{
 		Model: "gpt-5.4-pro",

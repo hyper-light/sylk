@@ -544,6 +544,7 @@ func NewGlobalReviewProtocolSkills(cfg GlobalReviewProtocolSkillConfig) []*skill
 			globalReviewFinalizeSkill(cfg),
 			globalReviewAcceptCheckpointSkill(cfg),
 			globalReviewCommitToDiskSkill(cfg),
+			globalReviewDiscardCheckpointSkill(cfg),
 		}
 	case GlobalReviewAgentTester:
 		return []*skills.Skill{
@@ -1464,6 +1465,58 @@ func globalReviewAcceptCheckpointSkill(cfg GlobalReviewProtocolSkillConfig) *ski
 			return map[string]any{
 				"accepted_checkpoint": true,
 				"summary":             summary,
+			}, nil
+		}).
+		Build()
+}
+
+// globalReviewDiscardCheckpointSkill is the global inspector's analog of
+// the pipeline inspector's discard_pipeline. It removes a staged review
+// candidate without promoting it, used when the global inspector concludes
+// the merged checkpoint cannot be salvaged. The orchestrator no longer
+// performs this on its own — by design, the global inspector owns the
+// rollback decision the same way the pipeline inspector owns
+// discard_pipeline. Mirrors the commit_to_disk operation pattern.
+func globalReviewDiscardCheckpointSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
+	return skills.NewSkill("discard_checkpoint").
+		Description("Discard the active review candidate without promoting it. Global inspector only.").
+		Domain("global_review").
+		Keywords("global", "review", "discard", "rollback", "checkpoint").
+		Priority(95).
+		Usage("Use when the merged checkpoint cannot be salvaged through further architect/tester challenges and the work must be rolled back rather than promoted. Prefer challenge_architect or challenge_global_tester for any path where the work is still potentially recoverable. This is a destructive terminal action.").
+		Requirement("Provide a concrete reason explaining why the checkpoint must be discarded.").
+		Satisfies("Removes the staged review candidate and clears the active overlay so the global review session resets to the prior checkpoint state.").
+		StringParam("reason", "Why the checkpoint must be discarded", true).
+		StringParam("candidate_id", "Optional explicit review candidate id; defaults to the active candidate.", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Reason      string `json:"reason"`
+				CandidateID string `json:"candidate_id,omitempty"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if normalizeGlobalReviewAgent(globalReviewAgentType(ctx, cfg)) != GlobalReviewAgentInspector {
+				return nil, fmt.Errorf("discard_checkpoint is only permitted for the global inspector")
+			}
+			reason := strings.TrimSpace(params.Reason)
+			if reason == "" {
+				return nil, fmt.Errorf("reason is required")
+			}
+			views := cfg.WorkspaceViews()
+			if views == nil {
+				return nil, fmt.Errorf("workspace views are unavailable")
+			}
+			svfs := versioning.SessionForWorkspaceViews(ctx, views)
+			if svfs == nil {
+				return nil, fmt.Errorf("session VFS is unavailable for discard_checkpoint")
+			}
+			candidateID := strings.TrimSpace(params.CandidateID)
+			svfs.DiscardReviewCandidate(candidateID)
+			return map[string]any{
+				"discarded":    true,
+				"candidate_id": candidateID,
+				"reason":       reason,
 			}, nil
 		}).
 		Build()

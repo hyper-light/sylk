@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -26,6 +27,11 @@ type InterAgentBranchSpec struct {
 
 // InterAgentBranchHandle tracks either a reused active tool-call branch or a
 // synthetic branch emitted for direct inter-agent exchanges.
+//
+// `completed` is a pointer shared across copies of the handle so Complete is
+// idempotent no matter how many times a caller (or a deferred safety-net
+// caller) invokes it. Auto-reused handles do not allocate `completed` — their
+// Complete is already a no-op because `synthetic` is false.
 type InterAgentBranchHandle struct {
 	branch        InterAgentBranchMetadata
 	synthetic     bool
@@ -36,32 +42,7 @@ type InterAgentBranchHandle struct {
 	startedAt     time.Time
 	interAgent    *InterAgentToolEvent
 	successStatus string
-}
-
-// BeginAutoInterAgentRouteBranch only preserves an already-established nested
-// child branch. Generic route helpers must not invent new consult/challenge
-// rows on their own; explicit consult/challenge/store entry points own that.
-func BeginAutoInterAgentRouteBranch(
-	ctx context.Context,
-	_ string,
-	_ any,
-	metadata map[string]any,
-) (context.Context, InterAgentBranchHandle) {
-	if branch, ok := interAgentBranchMetadataFromMetadata(metadata); ok {
-		return ctx, InterAgentBranchHandle{
-			branch:        branch,
-			successStatus: normalizeInterAgentSuccessStatus(branch.Kind, ""),
-		}
-	}
-	if stream, ok := StreamMetadataFromContext(ctx); ok {
-		if branch, ok := interAgentBranchMetadataFromMetadata(stream.Metadata); ok {
-			return ctx, InterAgentBranchHandle{
-				branch:        branch,
-				successStatus: normalizeInterAgentSuccessStatus(branch.Kind, ""),
-			}
-		}
-	}
-	return ctx, InterAgentBranchHandle{}
+	completed     *atomic.Bool
 }
 
 // BeginInterAgentBranch ensures ctx carries branch identity for an inter-agent
@@ -122,7 +103,7 @@ func BeginInterAgentBranch(ctx context.Context, spec InterAgentBranchSpec) (cont
 		FullArgs:    fullArgs,
 		InterAgent:  interAgent,
 	})
-	EmitToolCall(ctx, ToolCallEvent{
+	if err := EmitToolCall(ctx, ToolCallEvent{
 		ToolCallKey: toolCallKey,
 		ToolName:    toolName,
 		ArgsSummary: argsSummary,
@@ -130,7 +111,9 @@ func BeginInterAgentBranch(ctx context.Context, spec InterAgentBranchSpec) (cont
 		Phase:       ToolCallStart,
 		StartedAt:   startedAt,
 		InterAgent:  interAgent,
-	})
+	}); err != nil {
+		logMissingToolCallID(ctx, "inter_agent_branch_start", toolName, err)
+	}
 
 	return ctx, InterAgentBranchHandle{
 		branch: InterAgentBranchMetadata{
@@ -147,7 +130,91 @@ func BeginInterAgentBranch(ctx context.Context, spec InterAgentBranchSpec) (cont
 		startedAt:     startedAt,
 		interAgent:    interAgent,
 		successStatus: successStatus,
+		completed:     new(atomic.Bool),
 	}
+}
+
+// WithInterAgentBranch opens a synthetic inter-agent branch (if ctx has the
+// stream metadata required), runs fn under the branch context, and guarantees
+// exactly one Complete emission against the returned error — including when
+// fn unwinds abnormally. The deferred Complete fires during panic propagation
+// and the row is finalized as failed via the fnReturned flag, so the UI
+// reflects the panic instead of a misleading success. We do NOT recover the
+// panic; invariant violations must surface to the goroutine boundary.
+//
+// This is the canonical entry point for consultations, challenges, approvals,
+// and other agent-to-agent exchanges that should render as a synthetic row.
+// It replaces the manual BeginInterAgentBranch / branch.Complete pattern that
+// had to be carefully threaded through every return path; that pattern is a
+// documented footgun — every past "stuck row at N seconds" class of bug has
+// been a missing Complete. Scope-based emission makes that class impossible
+// by construction.
+//
+// Returns fn's error unchanged. When ctx is missing the stream metadata
+// required by BeginInterAgentBranch, the branch is a no-op, fn still runs,
+// and fn's error still propagates.
+func WithInterAgentBranch(
+	ctx context.Context,
+	spec InterAgentBranchSpec,
+	fn func(ctx context.Context, handle InterAgentBranchHandle) error,
+) (err error) {
+	branchCtx, branch := BeginInterAgentBranch(ctx, spec)
+	fnReturned := false
+	defer func() {
+		if !fnReturned && err == nil {
+			err = fmt.Errorf("inter-agent %s branch unwound abnormally without returning", spec.Kind)
+		}
+		branch.Complete(branchCtx, "", "", err)
+	}()
+	err = fn(branchCtx, branch)
+	fnReturned = true
+	return err
+}
+
+// WithInterAgentBranchMessage is WithInterAgentBranch with CompleteFromMessage
+// semantics. It's the common shape for consult/route-sync flows that finalize
+// the row using the terminal response payload rather than a plain error.
+//
+// As with WithInterAgentBranch, the deferred CompleteFromMessage fires during
+// panic propagation and stamps a failed status via the fnReturned flag. We do
+// not recover; invariant violations must surface.
+func WithInterAgentBranchMessage(
+	ctx context.Context,
+	spec InterAgentBranchSpec,
+	fn func(ctx context.Context, handle InterAgentBranchHandle) (*guide.Message, error),
+) (response *guide.Message, err error) {
+	branchCtx, branch := BeginInterAgentBranch(ctx, spec)
+	fnReturned := false
+	defer func() {
+		if !fnReturned && err == nil {
+			err = fmt.Errorf("inter-agent %s branch unwound abnormally without returning", spec.Kind)
+		}
+		branch.CompleteFromMessage(branchCtx, response, err)
+	}()
+	response, err = fn(branchCtx, branch)
+	fnReturned = true
+	return response, err
+}
+
+// InheritedBranchMetadata returns request metadata stamped with any
+// inter-agent branch identity present on ctx (or inside the provided
+// metadata map itself). It replaces the lifecycle-less half of
+// BeginAutoInterAgentRouteBranch for callers that just need to propagate an
+// existing branch's identity to an outbound route request without creating
+// or completing a branch of their own.
+//
+// When ctx carries no branch metadata and the input metadata has none either,
+// the original map is returned unchanged.
+func InheritedBranchMetadata(ctx context.Context, metadata map[string]any) map[string]any {
+	if branch, ok := interAgentBranchMetadataFromMetadata(metadata); ok {
+		return RouteMetadataWithExplicitInterAgentBranch(ctx, metadata, branch)
+	}
+	if stream, ok := StreamMetadataFromContext(ctx); ok {
+		if branch, ok := interAgentBranchMetadataFromMetadata(stream.Metadata); ok {
+			return RouteMetadataWithExplicitInterAgentBranch(ctx, metadata, branch)
+		}
+	}
+	return metadata
 }
 
 // ApplyMetadata stamps this branch identity onto request metadata.
@@ -171,8 +238,15 @@ func (h InterAgentBranchHandle) CompleteFromMessage(ctx context.Context, msg *gu
 // Complete finalizes a synthetic branch row. Reused real tool-call branches are
 // left alone because their owning tool loop will emit the authoritative
 // completion event.
+//
+// Idempotent across calls via the handle's shared completed flag: a caller
+// that explicitly completes on the success path and a deferred safety-net
+// call that fires later both execute without producing a second UI row.
 func (h InterAgentBranchHandle) Complete(ctx context.Context, summary, output string, err error) {
 	if !h.synthetic || strings.TrimSpace(h.toolCallKey) == "" {
+		return
+	}
+	if h.completed != nil && !h.completed.CompareAndSwap(false, true) {
 		return
 	}
 
@@ -194,7 +268,7 @@ func (h InterAgentBranchHandle) Complete(ctx context.Context, summary, output st
 		ThreadKey:  strings.TrimSpace(h.branch.ThreadKey),
 		Status:     status,
 	}
-	EmitToolCall(ctx, ToolCallEvent{
+	if emitErr := EmitToolCall(ctx, ToolCallEvent{
 		ToolCallKey: h.toolCallKey,
 		ToolName:    h.toolName,
 		ArgsSummary: h.argsSummary,
@@ -206,7 +280,9 @@ func (h InterAgentBranchHandle) Complete(ctx context.Context, summary, output st
 		Duration:    time.Since(h.startedAt),
 		Success:     success,
 		InterAgent:  interAgent,
-	})
+	}); emitErr != nil {
+		logMissingToolCallID(ctx, "inter_agent_branch_complete", h.toolName, emitErr)
+	}
 }
 
 func (h InterAgentBranchHandle) summary() string {

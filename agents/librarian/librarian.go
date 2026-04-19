@@ -334,6 +334,14 @@ func (l *Librarian) getProvider() LibrarianProvider {
 	return l.provider
 }
 
+// Ready implements shared.ReadinessReporter.
+func (l *Librarian) Ready() (bool, string) {
+	if l.getProvider() == nil {
+		return false, "LLM provider not yet wired (post-init / pre-auth window)"
+	}
+	return true, ""
+}
+
 // SetProviderRefresher stores a callback that creates a fresh provider for
 // the current model and auth method. Set by cmd/tui.go at bootstrap.
 func (l *Librarian) SetProviderRefresher(fn container.ProviderRefresher) {

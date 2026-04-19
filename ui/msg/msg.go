@@ -194,6 +194,25 @@ type StreamErrorMsg struct {
 	BranchRef     *InterAgentBranchRefMsg
 }
 
+// AgentStateMsg carries an explicit agent activity-state transition from
+// the bus to the chat model. Unlike text stream messages this is routed
+// even when no prior StreamStart has been observed — state events are the
+// canonical source for "what is happening right now" and must reach the
+// UI regardless of text-stream lifecycle (see StreamEventAgentState in
+// agents/guide).
+type AgentStateMsg struct {
+	SessionID         string
+	CorrelationID     string
+	AgentID           string
+	AgentType         string
+	State             string
+	Detail            string
+	TransitionID      int64
+	PeerAgentType     string
+	PeerCorrelationID string
+	Timestamp         time.Time
+}
+
 // ---------------------------------------------------------------------------
 // Guide responses
 // ---------------------------------------------------------------------------

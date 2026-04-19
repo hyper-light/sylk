@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -200,7 +201,13 @@ func (m *MockAgent) publishStream(topic, correlationID string, event *guide.Stre
 		SourceAgentID: mockGuideID,
 		Timestamp:     time.Now(),
 	}
-	_ = m.bus.Publish(topic, busMsg)
+	if err := m.bus.Publish(topic, busMsg); err != nil {
+		slog.Warn("ui_mock_publish_failed",
+			"topic", topic,
+			"correlation_id", correlationID,
+			"error", err.Error(),
+		)
+	}
 }
 
 // sleepCtx pauses for the given duration, returning false if the context

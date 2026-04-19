@@ -149,3 +149,10 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+// Vendor cgofuse with an Apple Silicon Homebrew patch. Upstream v1.6.0 hardcodes
+// /usr/local/lib paths in the dlopen fallback chain; the vendored copy under
+// third_party/cgofuse extends the chain to also try /opt/homebrew/lib so brew
+// installs of FUSE-T / macFUSE load without manual symlinks. The fork matches
+// upstream v1.6.0 byte-for-byte in every other respect and is MIT-licensed.
+replace github.com/winfsp/cgofuse => ./third_party/cgofuse

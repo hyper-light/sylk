@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -279,7 +280,13 @@ func (m *AppModel) interruptAllActiveRoutes(reason string) tea.Cmd {
 					Reason:        strings.TrimSpace(reason),
 					Timestamp:     time.Now(),
 				}
-				_ = m.deps.GuideBus.Publish(guide.TopicGuideRequests, guide.NewUserInterruptMessage("", req))
+				if err := m.deps.GuideBus.Publish(guide.TopicGuideRequests, guide.NewUserInterruptMessage("", req)); err != nil {
+					slog.Warn("ui_user_interrupt_publish_failed",
+						"correlation_id", t.CorrelationID,
+						"reason", reason,
+						"error", err.Error(),
+					)
+				}
 			}
 		}
 		return nil

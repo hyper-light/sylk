@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"sync"
 	"time"
@@ -145,7 +146,17 @@ func (b *StreamBridge) drainFinalError(errs <-chan error, streamCtx *StreamConte
 // publishChunk wraps and publishes a single chunk.
 func (b *StreamBridge) publishChunk(chunk *StreamChunk, streamCtx *StreamContext) {
 	msg := WrapStreamChunk(chunk, streamCtx)
-	_ = b.publisher.Publish(msg)
+	if err := b.publisher.Publish(msg); err != nil {
+		correlationID := ""
+		if streamCtx != nil {
+			correlationID = streamCtx.CorrelationID
+		}
+		slog.Warn("stream_bridge_chunk_publish_failed",
+			"correlation_id", correlationID,
+			"chunk_type", string(chunk.Type),
+			"error", err.Error(),
+		)
+	}
 }
 
 // publishErrorChunk creates and publishes an error chunk.
@@ -156,7 +167,17 @@ func (b *StreamBridge) publishErrorChunk(err error, streamCtx *StreamContext) {
 		Timestamp: time.Now(),
 	}
 	msg := WrapStreamChunk(errChunk, streamCtx)
-	_ = b.publisher.Publish(msg)
+	if pubErr := b.publisher.Publish(msg); pubErr != nil {
+		correlationID := ""
+		if streamCtx != nil {
+			correlationID = streamCtx.CorrelationID
+		}
+		slog.Warn("stream_bridge_error_chunk_publish_failed",
+			"correlation_id", correlationID,
+			"underlying_error", err.Error(),
+			"publish_error", pubErr.Error(),
+		)
+	}
 }
 
 // CancelStream cancels an active stream and publishes a control message.

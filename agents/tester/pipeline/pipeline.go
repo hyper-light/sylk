@@ -270,6 +270,23 @@ func (pt *PipelineTester) registerCoreSkills() {
 	}) {
 		pt.skills.Register(skill)
 	}
+	// Decision Manifest skills give the pipeline tester cross-pipeline
+	// awareness of typed decisions (test framework, fixture strategy, etc.)
+	// that parallel pipelines must coordinate on. Pattern: query before
+	// declaring, declare before authoring code that depends on the choice.
+	for _, skill := range agentshared.DecisionManifestSkills(agentshared.DecisionManifestSkillConfig{
+		Client: agentshared.DecisionManifestClient{
+			BusProvider:     func() guide.EventBus { return pt.bus },
+			SourceAgentID:   func() string { return pt.id },
+			SourceAgentType: func() string { return "tester-pipeline" },
+			SessionID:       func() string { return pt.config.SessionID },
+			RegisterPending: pt.registerPendingWait,
+			ClearPending:    pt.clearPendingWait,
+			Timeout:         agentshared.DefaultConsultationTimeout,
+		},
+	}) {
+		pt.skills.Register(skill)
+	}
 	for _, skill := range agentshared.PipelineProtocolSkills(agentshared.PipelineProtocolSkillConfig{
 		AgentType:      func() string { return "tester-pipeline" },
 		AgentID:        func() string { return pt.id },
@@ -341,6 +358,14 @@ func (pt *PipelineTester) getProvider() pipelineTesterProvider {
 	pt.mu.RLock()
 	defer pt.mu.RUnlock()
 	return pt.provider
+}
+
+// Ready implements shared.ReadinessReporter.
+func (pt *PipelineTester) Ready() (bool, string) {
+	if pt.getProvider() == nil {
+		return false, "LLM provider not yet wired (post-init / pre-auth window)"
+	}
+	return true, ""
 }
 
 // SwapModel implements container.ModelSwappable.
@@ -485,7 +510,7 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		if task != nil {
 			agentshared.PublishPipelineTaskFailureUpdate(pt.bus, pt.id, task, "pipeline tester: no LLM provider configured", agentshared.PipelineTaskAttempt(task))
 		}
-		return nil, fmt.Errorf("pipeline tester: no LLM provider configured")
+		return nil, fmt.Errorf("pipeline tester: %w: LLM provider not yet wired", agentshared.ErrAgentNotReady)
 	}
 
 	hadProtocolState := agentshared.PipelineProtocolStateFromContext(ctx) != nil

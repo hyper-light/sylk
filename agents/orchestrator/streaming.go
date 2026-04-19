@@ -106,34 +106,60 @@ func accumulateOrchestratorUsage(ctx context.Context, usage *providers.Usage) {
 	acc.Add(usage)
 }
 
-func (o *Orchestrator) publishStreamStart(ctx context.Context) {
+func (o *Orchestrator) publishStreamStart(ctx context.Context) error {
 	metadata, ok := orchestratorStreamMetadataFromContext(ctx)
 	if ok {
 		o.logInfo("publishStreamStart",
 			"correlation_id", metadata.CorrelationID,
 			"source_agent", metadata.SourceAgentID)
 	}
-	o.publishStreamEvent(ctx, &guide.StreamEvent{
+	if err := o.publishStreamEvent(ctx, &guide.StreamEvent{
 		Type:      guide.StreamEventStart,
 		Timestamp: time.Now(),
-	})
+	}); err != nil {
+		return err
+	}
+	// Announce the canonical `receiving` activity state so the UI has an
+	// indicator from the moment the orchestrator begins work. Subsequent
+	// transitions (reasoning, dispatching_to_peer, awaiting_peer_response,
+	// composing_response) are announced from the relevant code paths.
+	return o.publishAgentState(ctx, guide.AgentStateReceiving, "", nil)
 }
 
-func (o *Orchestrator) publishStreamChunk(ctx context.Context, text string) {
+// publishAgentState is the orchestrator's canonical helper for declaring an
+// activity-state transition. It routes through shared.PublishAgentState
+// with the orchestrator's identity stamped, so every transition flows
+// through the single canonical publisher.
+func (o *Orchestrator) publishAgentState(
+	ctx context.Context,
+	state guide.AgentActivityState,
+	detail string,
+	peer *guide.AgentStateEvent,
+) error {
+	return shared.PublishAgentState(o.bus, o.channels, ctx, o.config.AgentID, "orchestrator", state, detail, peer)
+}
+
+func (o *Orchestrator) publishStreamChunk(ctx context.Context, text string) error {
 	if strings.TrimSpace(text) == "" {
-		return
+		return nil
 	}
 	o.logInfo("publishStreamChunk",
 		"text_len", len(text),
 		"text_prefix", truncateForLog(text, 80))
-	o.publishStreamEvent(ctx, &guide.StreamEvent{
+	return o.publishStreamEvent(ctx, &guide.StreamEvent{
 		Type:      guide.StreamEventData,
 		Text:      text,
 		Timestamp: time.Now(),
 	})
 }
 
-func (o *Orchestrator) publishStreamComplete(ctx context.Context, userResponse string, usage *guide.StreamUsage) {
+func (o *Orchestrator) publishStreamComplete(ctx context.Context, userResponse string, usage *guide.StreamUsage) error {
+	// Announce `complete` before the stream complete event so the activity
+	// channel and text-stream terminal arrive in the same order.
+	if err := o.publishAgentState(ctx, guide.AgentStateComplete, "", nil); err != nil {
+		o.logWarnMsg("orchestrator_agent_state_complete_publish_failed",
+			"error", err.Error())
+	}
 	event := &guide.StreamEvent{
 		Type:      guide.StreamEventComplete,
 		Usage:     usage,
@@ -142,14 +168,21 @@ func (o *Orchestrator) publishStreamComplete(ctx context.Context, userResponse s
 	if trimmed := strings.TrimSpace(userResponse); trimmed != "" {
 		event.Data = map[string]string{"user_response": trimmed}
 	}
-	o.publishStreamEvent(ctx, event)
+	return o.publishStreamEvent(ctx, event)
 }
 
-func (o *Orchestrator) publishStreamError(ctx context.Context, err error) {
+func (o *Orchestrator) publishStreamError(ctx context.Context, err error) error {
 	if err == nil {
-		return
+		return nil
 	}
-	o.publishStreamEvent(ctx, &guide.StreamEvent{
+	// Announce `errored` before the stream error event so the activity
+	// channel and text-stream terminal arrive in the same order.
+	if stateErr := o.publishAgentState(ctx, guide.AgentStateErrored, err.Error(), nil); stateErr != nil {
+		o.logWarnMsg("orchestrator_agent_state_errored_publish_failed",
+			"underlying_error", err.Error(),
+			"publish_error", stateErr.Error())
+	}
+	return o.publishStreamEvent(ctx, &guide.StreamEvent{
 		Type:      guide.StreamEventError,
 		Data:      map[string]string{"error": err.Error()},
 		Timestamp: time.Now(),
@@ -157,13 +190,16 @@ func (o *Orchestrator) publishStreamError(ctx context.Context, err error) {
 }
 
 // publishStreamEvent is the core bus publisher for conversation stream events.
-func (o *Orchestrator) publishStreamEvent(ctx context.Context, event *guide.StreamEvent) {
+// Returns the underlying publish error so the orchestrator's conversation
+// loop can surface a delivery failure; nil when bus/channels/metadata are
+// missing (caller is not in a publishable state).
+func (o *Orchestrator) publishStreamEvent(ctx context.Context, event *guide.StreamEvent) error {
 	if event == nil || o.bus == nil || o.channels == nil {
-		return
+		return nil
 	}
 	metadata, ok := orchestratorStreamMetadataFromContext(ctx)
 	if !ok {
-		return
+		return nil
 	}
 	stream := &guide.StreamResponse{
 		CorrelationID:     metadata.CorrelationID,
@@ -184,7 +220,15 @@ func (o *Orchestrator) publishStreamEvent(ctx context.Context, event *guide.Stre
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
 	}
-	_ = o.bus.Publish(o.channels.Responses, msg)
+	if err := o.bus.Publish(o.channels.Responses, msg); err != nil {
+		o.logWarnMsg("orchestrator_stream_publish_failed",
+			"event_type", string(event.Type),
+			"correlation_id", metadata.CorrelationID,
+			"target_agent", metadata.SourceAgentID,
+			"error", err.Error())
+		return fmt.Errorf("publish orchestrator stream event %s: %w", event.Type, err)
+	}
+	return nil
 }
 
 // publishStreamPush registers a stream push with the Guide so subsequent
@@ -236,10 +280,11 @@ func (o *Orchestrator) publishStreamPush(ctx context.Context) (string, error) {
 }
 
 // publishNotificationPush sends a one-shot notification to the TUI via the
-// agent push mechanism.
-func (o *Orchestrator) publishNotificationPush(content string) {
+// agent push mechanism. Returns the underlying publish error so the caller
+// can propagate delivery failures to the agent loop.
+func (o *Orchestrator) publishNotificationPush(content string) error {
 	if o.bus == nil || o.channels == nil {
-		return
+		return nil
 	}
 
 	pushID := "notif_" + uuid.New().String()
@@ -276,14 +321,21 @@ func (o *Orchestrator) publishNotificationPush(content string) {
 		Priority:      messaging.PriorityNormal,
 	}
 
-	_ = o.bus.Publish(o.channels.Responses, msg)
+	if err := o.bus.Publish(o.channels.Responses, msg); err != nil {
+		o.logWarnMsg("orchestrator_notification_push_failed",
+			"push_id", pushID,
+			"error", err.Error())
+		return fmt.Errorf("publish notification push: %w", err)
+	}
+	return nil
 }
 
 // publishStreamEventForPush publishes a stream event using a push ID as
 // correlation, so the Guide routes it to the TUI via the synthetic pending.
-func (o *Orchestrator) publishStreamEventForPush(pushID string, event *guide.StreamEvent) {
+// Returns the underlying publish error for the caller to surface.
+func (o *Orchestrator) publishStreamEventForPush(pushID string, event *guide.StreamEvent) error {
 	if o.bus == nil || o.channels == nil || event == nil {
-		return
+		return nil
 	}
 
 	stream := &guide.StreamResponse{
@@ -304,5 +356,12 @@ func (o *Orchestrator) publishStreamEventForPush(pushID string, event *guide.Str
 		Priority:      messaging.PriorityNormal,
 	}
 
-	_ = o.bus.Publish(o.channels.Responses, msg)
+	if err := o.bus.Publish(o.channels.Responses, msg); err != nil {
+		o.logWarnMsg("orchestrator_push_stream_publish_failed",
+			"push_id", pushID,
+			"event_type", string(event.Type),
+			"error", err.Error())
+		return fmt.Errorf("publish orchestrator push stream %s: %w", event.Type, err)
+	}
+	return nil
 }

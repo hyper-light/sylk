@@ -12,11 +12,14 @@ func librarianVisibleSkillNames() []string {
 		"find_pattern",
 		"consult",
 		"find_symbol",
-		"read_file",
-		"glob",
-		"grep",
-		// Workspace-aware reads reach the in-flight global VFS overlay.
-		// Disk-only read_file/glob/grep stay above for committed state.
+		// Layered reads only — every read tool requires a `view` parameter
+		// (disk / global / pipeline) so layer attribution is captured at
+		// the tool boundary. The bare read_file / glob / grep skills used
+		// to live alongside these as disk-only convenience wrappers, but
+		// LLM tool-name bias defeated the prompt's "use workspace_* for
+		// in-flight state" guidance every time and caused phantom
+		// "file not found" reports for files staged in the pipeline VFS.
+		// Removing the bare skills makes the wrong choice unrepresentable.
 		"read_workspace_file",
 		"workspace_glob",
 		"workspace_grep",

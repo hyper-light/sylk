@@ -43,7 +43,7 @@ func (e *Engineer) executeToolLoopWithSurface(
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: "no LLM provider configured"})
 		}
-		return "", fmt.Errorf("engineer: no LLM provider configured")
+		return "", fmt.Errorf("engineer: %w: LLM provider not yet wired", shared.ErrAgentNotReady)
 	}
 
 	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {

@@ -30,22 +30,27 @@ func (l *Librarian) registerCoreSkills() {
 	l.skills.Register(repoBriefSkill(l))
 	l.skills.Register(symbolReferenceGraphSkill(l))
 
-	// Codebase exploration tools (always available).
-	// read_file / glob / grep are intentionally disk-only — they read what's
-	// committed to the working tree. The workspace-aware variants below reach
-	// into the global VFS overlay so the librarian can answer questions about
-	// in-flight session state without falsely reporting a file as missing.
-	l.skills.Register(readFileSkill(l))
-	l.skills.Register(globSkill(l))
-	l.skills.Register(grepSkill(l))
+	// Codebase exploration tools.
+	//
+	// The bare read_file / glob / grep skills used to be registered here as
+	// disk-only tools, with the workspace-aware variants alongside as the
+	// "use this when you need the in-flight overlay" choice. In practice
+	// the LLM defaulted to read_file because the simpler tool name beat
+	// the prose instructions in the prompt — every "librarian opened a
+	// disk file that exists only in the pipeline VFS and reported it
+	// missing" trace traced to that tool-name bias. The fix is structural:
+	// every read goes through a layer-explicit tool. The LLM cannot pick
+	// a layerless read because there isn't one to pick. Disk reads use
+	// `read_workspace_file view=disk`; in-flight overlay reads use
+	// `read_workspace_file view=global` or `view=pipeline`.
 	l.skills.Register(findSymbolSkill(l))
 	l.skills.Register(gitSkill(l))
 	l.skills.Register(lspSkill(l))
 	l.skills.Register(astGrepSearchSkill(l))
 
-	// Workspace-aware reads. The librarian's authority profile permits
-	// view=disk and view=global; pipeline-local views are denied at the
-	// authority layer, so the LLM can name them but the call is rejected.
+	// Workspace-aware reads. The librarian's authority profile permits all
+	// three views (Disk, Global, Pipeline). The view parameter is required
+	// on every call so layer attribution is captured at the tool boundary.
 	viewsFn := func() versioning.WorkspaceViewAccess { return l.workspaceViews }
 	noPipelineFn := func() string { return "" }
 	l.skills.Register(versioning.NewReadWorkspaceFileSkill(viewsFn, noPipelineFn))

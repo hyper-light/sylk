@@ -2,10 +2,7 @@ package shared
 
 import (
 	"context"
-	"fmt"
-	"io"
 	"log/slog"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -17,30 +14,31 @@ import (
 	"github.com/adalundhe/sylk/core/versioning"
 )
 
-// ToolRunner executes external analysis tools with bounded output and timeouts.
+// ToolRunner executes external analysis tools inside the strict-disk process
+// broker with bounded output and timeouts. No command path bypasses the broker
+// — if the broker is unavailable the invocation fails loudly rather than
+// silently running against host disk.
 type ToolRunner struct {
-	workingDir    string
-	timeout       time.Duration
-	logger        *slog.Logger
-	agentID       string
-	agentType     string
-	sessionID     func() string
-	fileAccess    func() versioning.FileAccess
-	broker        func() purevfs.ExecutionBroker
-	requireBroker bool
-	available     sync.Map // caches binary availability checks
+	workingDir string
+	timeout    time.Duration
+	logger     *slog.Logger
+	agentID    string
+	agentType  string
+	sessionID  func() string
+	fileAccess func() versioning.FileAccess
+	broker     func() purevfs.ExecutionBroker
+	available  sync.Map // caches binary availability checks
 }
 
 type ToolRunnerConfig struct {
-	WorkingDir    string
-	Timeout       time.Duration
-	Logger        *slog.Logger
-	AgentID       string
-	AgentType     string
-	SessionID     func() string
-	FileAccess    func() versioning.FileAccess
-	Broker        func() purevfs.ExecutionBroker
-	RequireBroker bool
+	WorkingDir string
+	Timeout    time.Duration
+	Logger     *slog.Logger
+	AgentID    string
+	AgentType  string
+	SessionID  func() string
+	FileAccess func() versioning.FileAccess
+	Broker     func() purevfs.ExecutionBroker
 }
 
 type overlayAwareFileAccess interface {
@@ -51,15 +49,14 @@ type overlayAwareFileAccess interface {
 // NewToolRunner creates a ToolRunner rooted at the given working directory.
 func NewToolRunner(cfg ToolRunnerConfig) *ToolRunner {
 	return &ToolRunner{
-		workingDir:    cfg.WorkingDir,
-		timeout:       cfg.Timeout,
-		logger:        cfg.Logger,
-		agentID:       cfg.AgentID,
-		agentType:     cfg.AgentType,
-		sessionID:     cfg.SessionID,
-		fileAccess:    cfg.FileAccess,
-		broker:        cfg.Broker,
-		requireBroker: cfg.RequireBroker,
+		workingDir: cfg.WorkingDir,
+		timeout:    cfg.Timeout,
+		logger:     cfg.Logger,
+		agentID:    cfg.AgentID,
+		agentType:  cfg.AgentType,
+		sessionID:  cfg.SessionID,
+		fileAccess: cfg.FileAccess,
+		broker:     cfg.Broker,
 	}
 }
 
@@ -100,67 +97,7 @@ func (r *ToolRunner) exec(ctx context.Context, command string, argv []string) (*
 	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), authReq); err != nil {
 		return nil, agentshared.WrapApprovalDenied(authReq.ToolName, err)
 	}
-	if r.requireBroker {
-		return r.execBrokered(ctx, argv)
-	}
-	return r.execDirect(ctx, argv)
-}
-
-func (r *ToolRunner) execDirect(ctx context.Context, argv []string) (*ExecResult, error) {
-	execCtx, cancel := context.WithTimeout(ctx, r.timeout)
-	defer cancel()
-
-	if len(argv) == 0 {
-		return nil, purevfs.ErrStrictExecutionUnavailable
-	}
-	cmd := exec.CommandContext(execCtx, argv[0], argv[1:]...)
-	cmd.Dir = r.currentWorkingDir()
-
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdout pipe for %s: %w", argv[0], err)
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stderr pipe for %s: %w", argv[0], err)
-	}
-
-	start := time.Now()
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start %s: %w", argv[0], err)
-	}
-
-	stdout, _ := io.ReadAll(io.LimitReader(stdoutPipe, maxOutputBytes))
-	stderr, _ := io.ReadAll(io.LimitReader(stderrPipe, maxOutputBytes))
-
-	waitErr := cmd.Wait()
-	elapsed := time.Since(start)
-
-	exitCode := 0
-	if waitErr != nil {
-		if exitErr, ok := waitErr.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else if execCtx.Err() != nil {
-			return nil, fmt.Errorf("%s timed out after %v: %w", argv[0], r.timeout, execCtx.Err())
-		}
-		// Non-zero exit is normal for linters finding issues — not an error
-	}
-
-	r.logger.Debug("tool executed",
-		"binary", argv[0],
-		"argv", argv,
-		"exit_code", exitCode,
-		"elapsed", elapsed,
-		"stdout_bytes", len(stdout),
-		"stderr_bytes", len(stderr),
-	)
-
-	return &ExecResult{
-		Stdout:   stdout,
-		Stderr:   stderr,
-		ExitCode: exitCode,
-		Elapsed:  elapsed,
-	}, nil
+	return r.execBrokered(ctx, argv)
 }
 
 func (r *ToolRunner) execBrokered(ctx context.Context, argv []string) (*ExecResult, error) {
@@ -274,11 +211,11 @@ func (r *ToolRunner) WorkingDir() string {
 	return r.currentWorkingDir()
 }
 
+// LogicalTempDir returns the broker-projected temp directory. Since all
+// inspector tool execution flows through the strict-disk broker, the logical
+// temp path is always the in-memory projection root, never the host /tmp.
 func (r *ToolRunner) LogicalTempDir() string {
-	if r.requireBroker {
-		return purevfs.DefaultLogicalExecRoots(r.currentWorkingDir()).Temp
-	}
-	return osTempDir()
+	return purevfs.DefaultLogicalExecRoots(r.currentWorkingDir()).Temp
 }
 
 func overlayState(fa versioning.FileAccess) (bool, bool) {
@@ -320,6 +257,3 @@ func runnerToolName(argv []string) string {
 	return argv[0]
 }
 
-func osTempDir() string {
-	return os.TempDir()
-}

@@ -43,7 +43,7 @@ func (d *Designer) executeToolLoopWithSurface(
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: "no LLM provider configured"})
 		}
-		return "", fmt.Errorf("designer: no LLM provider configured")
+		return "", fmt.Errorf("designer: %w: LLM provider not yet wired", shared.ErrAgentNotReady)
 	}
 
 	for turn := 0; turn <= d.config.DesignerConfig.MaxToolRuns; turn++ {

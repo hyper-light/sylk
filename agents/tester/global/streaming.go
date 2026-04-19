@@ -2,6 +2,7 @@ package global
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -85,25 +86,25 @@ func withTesterUsageAccumulator(ctx context.Context) (context.Context, *testerUs
 	return context.WithValue(ctx, testerUsageAccumulatorKey{}, acc), acc
 }
 
-func (gt *GlobalTester) publishStreamStart(ctx context.Context) {
-	gt.publishStreamEvent(ctx, &guide.StreamEvent{
+func (gt *GlobalTester) publishStreamStart(ctx context.Context) error {
+	return gt.publishStreamEvent(ctx, &guide.StreamEvent{
 		Type:      guide.StreamEventStart,
 		Timestamp: time.Now(),
 	})
 }
 
-func (gt *GlobalTester) publishStreamChunk(ctx context.Context, text string) {
+func (gt *GlobalTester) publishStreamChunk(ctx context.Context, text string) error {
 	if strings.TrimSpace(text) == "" {
-		return
+		return nil
 	}
-	gt.publishStreamEvent(ctx, &guide.StreamEvent{
+	return gt.publishStreamEvent(ctx, &guide.StreamEvent{
 		Type:      guide.StreamEventData,
 		Text:      text,
 		Timestamp: time.Now(),
 	})
 }
 
-func (gt *GlobalTester) publishStreamComplete(ctx context.Context, userResponse string, usage *guide.StreamUsage, directive *guide.ResponseDirective) {
+func (gt *GlobalTester) publishStreamComplete(ctx context.Context, userResponse string, usage *guide.StreamUsage, directive *guide.ResponseDirective) error {
 	event := &guide.StreamEvent{
 		Type:      guide.StreamEventComplete,
 		Text:      strings.TrimSpace(userResponse),
@@ -111,14 +112,14 @@ func (gt *GlobalTester) publishStreamComplete(ctx context.Context, userResponse 
 		Directive: directive,
 		Timestamp: time.Now(),
 	}
-	gt.publishStreamEvent(ctx, event)
+	return gt.publishStreamEvent(ctx, event)
 }
 
-func (gt *GlobalTester) publishStreamError(ctx context.Context, err error) {
+func (gt *GlobalTester) publishStreamError(ctx context.Context, err error) error {
 	if err == nil {
-		return
+		return nil
 	}
-	gt.publishStreamEvent(ctx, &guide.StreamEvent{
+	return gt.publishStreamEvent(ctx, &guide.StreamEvent{
 		Type:      guide.StreamEventError,
 		Data:      map[string]string{"error": err.Error()},
 		Timestamp: time.Now(),
@@ -126,13 +127,15 @@ func (gt *GlobalTester) publishStreamError(ctx context.Context, err error) {
 }
 
 // publishStreamEvent is the core bus publisher for conversation stream events.
-func (gt *GlobalTester) publishStreamEvent(ctx context.Context, event *guide.StreamEvent) {
+// Returns the underlying publish error so the tester's loop can surface a
+// delivery failure; nil when bus/channels/metadata are missing.
+func (gt *GlobalTester) publishStreamEvent(ctx context.Context, event *guide.StreamEvent) error {
 	if event == nil || gt.bus == nil || gt.channels == nil {
-		return
+		return nil
 	}
 	metadata, ok := testerStreamMetadataFromContext(ctx)
 	if !ok {
-		return
+		return nil
 	}
 	stream := &guide.StreamResponse{
 		CorrelationID:     metadata.CorrelationID,
@@ -153,5 +156,17 @@ func (gt *GlobalTester) publishStreamEvent(ctx context.Context, event *guide.Str
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
 	}
-	_ = gt.bus.Publish(gt.channels.Responses, msg)
+	if err := gt.bus.Publish(gt.channels.Responses, msg); err != nil {
+		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentshared.LogWarning(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+				"global_tester_stream_publish_failed", map[string]any{
+					"event_type":     string(event.Type),
+					"correlation_id": metadata.CorrelationID,
+					"target_agent":   metadata.SourceAgentID,
+					"error":          err.Error(),
+				})
+		}
+		return fmt.Errorf("publish global tester stream event %s: %w", event.Type, err)
+	}
+	return nil
 }

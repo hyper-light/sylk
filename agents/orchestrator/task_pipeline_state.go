@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"log/slog"
 	"strings"
 	"time"
 
@@ -62,5 +63,14 @@ func publishTaskPipelineState(
 		Payload:       evt,
 		Timestamp:     evt.Timestamp,
 	}
-	_ = bus.Publish(taskstate.Topic, msg)
+	if err := bus.Publish(taskstate.Topic, msg); err != nil {
+		slog.Warn("task_pipeline_state_publish_failed",
+			"source_agent_id", sourceAgentID,
+			"pipeline_id", pipelineID,
+			"task_label", taskLabel,
+			"status", string(status),
+			"worker_type", workerType,
+			"error", err.Error(),
+		)
+	}
 }

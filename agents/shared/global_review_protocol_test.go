@@ -50,6 +50,7 @@ func TestNewGlobalReviewProtocolSkills_AgentSpecificOwnership(t *testing.T) {
 				"finalize_global_review",
 				"accept_checkpoint",
 				"commit_to_disk",
+				"discard_checkpoint",
 			},
 		},
 		{
@@ -636,6 +637,42 @@ func TestGlobalReviewValidateWork_RoutesBackToExactRequestingAgentID(t *testing.
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for validation route request")
+	}
+}
+
+// TestValidateGlobalReviewCompletion_OrchestratorMustAnswerChallenge locks in
+// the gate that prevents the orchestrator from ending its turn while a
+// pending inspector challenge targets it. Without this enforcement, the
+// orchestrator's LLM responds with text and exits silently, leaving the
+// inspector waiting forever for a validate_work that is never dispatched.
+// Mirrors how pipeline workers, the global tester, and the global inspector
+// already gate completion on their respective protocol obligations.
+func TestValidateGlobalReviewCompletion_OrchestratorMustAnswerChallenge(t *testing.T) {
+	snapshot := &GlobalReviewSnapshot{
+		ReviewID: "review-orch-pending-1",
+		PendingChallenge: &GlobalReviewChallenge{
+			ID:                "review-orch-pending-1-challenge-1",
+			RequestingAgent:   GlobalReviewAgentInspector,
+			RequestingAgentID: "inspector-global-1",
+			TargetAgent:       GlobalReviewAgentOrchestrator,
+			TargetAgentID:     "orchestrator",
+			Request:           "Investigate the visibility mismatch in the merged checkpoint.",
+		},
+	}
+	ctx := WithGlobalReviewState(context.Background(), NewGlobalReviewState(snapshot, GlobalReviewMetadata(nil, snapshot)))
+
+	err := ValidateGlobalReviewCompletion(ctx, GlobalReviewAgentOrchestrator)
+	if err == nil {
+		t.Fatal("ValidateGlobalReviewCompletion = nil, want error forcing validate_work for the pending orchestrator-targeted challenge")
+	}
+	if !strings.Contains(err.Error(), "validate_work") {
+		t.Fatalf("ValidateGlobalReviewCompletion error = %q, want validate_work guidance", err.Error())
+	}
+
+	// Sanity check: the same gate is a no-op when no global-review state is
+	// hydrated (ordinary orchestrator turns must not be affected).
+	if got := ValidateGlobalReviewCompletion(context.Background(), GlobalReviewAgentOrchestrator); got != nil {
+		t.Fatalf("ValidateGlobalReviewCompletion without state = %v, want nil (no-op for ordinary turns)", got)
 	}
 }
 

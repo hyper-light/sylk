@@ -96,7 +96,14 @@
       "Bash(env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test -race -timeout 60s -run 'TestVectorSearcher_TrustBoostReordersResults|TestVectorSearcher_HomeDomainFilter|TestVectorSearcher_SurfaceConflicts|TestVectorSearcher_AttachProvenance' ./core/vectorgraphdb/ -v)",
       "Bash(env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test -race -timeout 180s ./core/vectorgraphdb/ ./core/escalation/ ./core/messaging/ ./agents/guide/)",
       "Bash(env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test -race -timeout 60s ./core/agents/identity/ -v)",
-      "Bash(env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go vet ./core/agents/identity/)"
+      "Bash(env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go vet ./core/agents/identity/)",
+      "Bash(awk -F'correlation_id=' '{print $2}')",
+      "Bash(awk '{print $1}')",
+      "Bash(sort -u grep -a \"chat.handleStreamComplete: DONE\" ~/.sylk/logs/ui_events.log)",
+      "Bash(/tmp/sylk-lint-bin ./agents/... ./core/tools/...)",
+      "Bash(cp /home/alundhe/.go_cache/github.com/winfsp/cgofuse@v1.6.0/LICENSE.txt third_party/cgofuse/)",
+      "Bash(cp /home/alundhe/.go_cache/github.com/winfsp/cgofuse@v1.6.0/go.mod third_party/cgofuse/)",
+      "Bash(cp /home/alundhe/.go_cache/github.com/winfsp/cgofuse@v1.6.0/fuse/*.go third_party/cgofuse/fuse/)"
     ]
   }
 }

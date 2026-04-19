@@ -45,6 +45,8 @@ func pipelineTesterVisibleSkillNames() []string {
 		"coord_publish_artifact",
 		"coord_request_review",
 		"coord_resolve_artifact",
+		"query_decisions",
+		"declare_decision",
 	}, "tester-pipeline")
 }
 
@@ -69,6 +71,7 @@ func pipelineTesterMutatingSkillNames() []string {
 		"coord_publish_artifact",
 		"coord_request_review",
 		"coord_resolve_artifact",
+		"declare_decision",
 		"reroute_request",
 	})
 }

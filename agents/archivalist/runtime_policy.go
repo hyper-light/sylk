@@ -20,7 +20,7 @@ func (a *Archivalist) conversationStageProfile() llmruntime.StageProfile {
 
 func (c *Client) applyGenerationRuntimeProfile(req *providers.Request) {
 	llmruntime.ApplyStage(req, c.generationStageProfile(), llmruntime.ApplyOptions{
-		Model:     archivalistRuntimeModel(req, c.model),
+		Model:     archivalistRuntimeModel(req, c.modelLookup()),
 		MaxTokens: req.MaxTokens,
 		AgentID:   "archivalist",
 		SessionID: "",

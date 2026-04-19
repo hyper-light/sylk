@@ -482,7 +482,17 @@ func interAgentOriginUpdate(ev msg.ToolCallEventMsg, currentAgentType string) (*
 	}
 }
 
-func responseThreadKey(toolName string, args, output map[string]any, challengeID string) string {
+// responseThreadKey computes a challenge-response ThreadKey from explicit
+// values on the event payload. It requires either a pre-computed `thread_key`
+// or an explicit `protocol_scope` — no tool-name-based guessing. Producers
+// that emit validate_work / process_validation / validate_global_review /
+// process_global_validation must include `protocol_scope` in their output
+// map; the deriveInterAgentOriginUpdate producer path does this via
+// interAgentResponseThreadKey and the skill handlers themselves now stamp
+// protocol_scope on their outputs. Empty return means the caller cannot
+// cross-reference via ThreadKey and falls back to the existing origin-update
+// logic.
+func responseThreadKey(_ string, args, output map[string]any, challengeID string) string {
 	if explicit := firstNonEmptyString(stringFromMap(output, "thread_key"), stringFromMap(args, "thread_key")); explicit != "" {
 		return explicit
 	}
@@ -493,10 +503,7 @@ func responseThreadKey(toolName string, args, output map[string]any, challengeID
 	case "pipeline":
 		return pipelineThreadPrefix + challengeID
 	}
-	if toolName == "validate_work" || toolName == "process_validation" {
-		return pipelineThreadPrefix + challengeID
-	}
-	return globalReviewThreadPrefix + challengeID
+	return ""
 }
 
 func buildInterAgentCompletionFallback(ev msg.ToolCallEventMsg, currentAgentType string) (ToolCallRecord, bool) {
@@ -650,13 +657,31 @@ func isChallengeTool(toolName string) bool {
 	return toolName == "challenge_agent" || strings.HasPrefix(toolName, "challenge_")
 }
 
-func isInterAgentResponseTool(toolName string) bool {
-	switch strings.TrimSpace(toolName) {
-	case "validate_global_review", "process_global_validation", "validate_work", "process_validation":
+// eventIsInterAgentOriginUpdate reports whether an incoming tool-call event
+// is an *origin-update* — a message that should patch an existing InterAgent
+// row (the challenge the responder is answering) rather than create a new
+// one. Origin-update Phase 1 events carry the UpdateOrigin flag in their
+// serialized metadata; Phase 0 events for response tools carry no InterAgent
+// metadata at all (emission-side suppresses it), so classification at Start
+// still falls back on tool name. Both cases are handled here so callers have
+// a single discriminator.
+//
+// Do NOT split this back into tool-name vs flag checks at callsites — that
+// scatter was the root cause of the duplicate-row bug class where the
+// nested-stream dispatcher and the top-level dispatcher classified events
+// inconsistently.
+func eventIsInterAgentOriginUpdate(ev msg.ToolCallEventMsg) bool {
+	if ev.InterAgent != nil && ev.InterAgent.UpdateOrigin {
 		return true
-	default:
-		return false
 	}
+	return isInterAgentResponseTool(ev.ToolName)
+}
+
+// isInterAgentResponseTool defers to the canonical classifier in
+// agents/shared so the emission and UI sides share exactly one list. A new
+// response tool added there is automatically picked up by the UI.
+func isInterAgentResponseTool(toolName string) bool {
+	return shared.IsInterAgentResponseToolName(toolName)
 }
 
 func consultationTargets(toolName string, args map[string]any) []string {
@@ -734,7 +759,14 @@ func normalizeChallengeTargetsForScope(targets []string, scope string) []string 
 	return normalizeAgentTypes(out)
 }
 
-func challengeThreadKey(toolName string, args, output map[string]any) string {
+// challengeThreadKey computes a challenge-dispatch ThreadKey from explicit
+// values on the event payload. It requires either a pre-computed `thread_key`
+// or an explicit `protocol_scope` — no tool-name-based guessing. Producers
+// stamp protocol_scope onto challenge dispatch outputs (see
+// pipelineTurnSelectionResult, global_review_protocol.go); empty return
+// means the event is missing the scope and the UI falls back to
+// non-ThreadKey-based consolidation.
+func challengeThreadKey(_ string, args, output map[string]any) string {
 	if explicit := firstNonEmptyString(stringFromMap(output, "thread_key"), stringFromMap(args, "thread_key")); explicit != "" {
 		return explicit
 	}
@@ -748,10 +780,7 @@ func challengeThreadKey(toolName string, args, output map[string]any) string {
 	case "pipeline":
 		return pipelineThreadPrefix + challengeID
 	}
-	if toolName == "challenge_agent" {
-		return pipelineThreadPrefix + challengeID
-	}
-	return globalReviewThreadPrefix + challengeID
+	return ""
 }
 
 func firstKnownChallengeAgentInName(name string) string {

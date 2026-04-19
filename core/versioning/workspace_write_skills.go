@@ -331,6 +331,17 @@ func newPrepareWriteContextSkill(
 				return nil, fmt.Errorf("workspace views are unavailable")
 			}
 			pipelineID := resolveSkillPipelineID(params.PipelineID, defaultPipelineID)
+			// Probe the write surface BEFORE running the views-based
+			// inspection. The views path falls back to disk when the
+			// requested layer is unavailable, so it cannot detect a missing
+			// pipeline VFS. The actual write will route through the
+			// PipelineRoutingFileAccess and fail with ErrVFSNotFound —
+			// surface that here so the LLM sees the problem at prepare
+			// time rather than after authoring a write call. See
+			// probeWorkspaceWriteSurface.
+			if err := probeWorkspaceWriteSurface(ctx, views, writeScopeTargetView(scope), pipelineID); err != nil {
+				return nil, fmt.Errorf("prepare_%s_write_context: write surface unavailable: %w", scope, err)
+			}
 			state, err := views.InspectPath(ctx, path, pipelineID)
 			if err != nil {
 				return nil, err

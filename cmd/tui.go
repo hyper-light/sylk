@@ -257,7 +257,13 @@ func (p *busReadinessPublisher) PublishKnowledgeReady(event knowledge.ReadinessE
 		Level:     int(event.Level),
 		Searchers: event.Searchers,
 	})
-	_ = p.bus.Publish(guide.TopicKnowledgeReady, msg)
+	if err := p.bus.Publish(guide.TopicKnowledgeReady, msg); err != nil {
+		slog.Warn("tui_knowledge_ready_publish_failed",
+			"level", int(event.Level),
+			"searchers", event.Searchers,
+			"error", err.Error(),
+		)
+	}
 }
 
 // globalBleveAdapter implements query.BleveIndex by bridging to the
@@ -1992,6 +1998,14 @@ func registerPipelineInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 			return nil, err
 		}
 		pi.SetActivityPublisher(deps.actPub)
+		// Inspector-owned pipeline VFS authority — handoff_to_ot and
+		// discard_pipeline call this committer instead of the orchestrator
+		// reacting to "succeeded" / "failed" pipeline broadcasts. The
+		// session is resolved per-call via ctx so a single inspector pod
+		// can correctly serve work from multiple session contexts.
+		pi.SetPipelineCommitter(agentShared.NewSessionVFSPipelineCommitter(func(sessionID string) agentShared.SessionVFSPipelineCommitterBackend {
+			return deps.sessionLookup(sessionID)
+		}))
 		if startErr := pi.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
@@ -2806,7 +2820,14 @@ func buildAuthPublisher(bus guide.EventBus) credentials.AuthPublisher {
 			AuthMethod:   event.AuthMethod,
 			Available:    event.Available,
 		})
-		_ = bus.Publish(guide.TopicAuthCredentials, msg)
+		if err := bus.Publish(guide.TopicAuthCredentials, msg); err != nil {
+			slog.Warn("tui_auth_changed_publish_failed",
+				"provider_type", event.ProviderType,
+				"auth_method", event.AuthMethod,
+				"available", event.Available,
+				"error", err.Error(),
+			)
+		}
 	}
 }
 

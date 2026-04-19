@@ -472,6 +472,23 @@ func TestHandlePipelineUpdate_InspectorSuccessDefersResourceReleaseUntilCheckpoi
 		SessionID: "sess-1",
 	}
 
+	// Authority discipline: the inspector's handoff_to_ot skill performs
+	// the SessionVFS extract itself before publishing succeeded. The
+	// orchestrator no longer mutates the VFS on receipt of the broadcast.
+	// Simulate the inspector's pre-publish work here so the assertion
+	// below ("OT-accepted task draft removed from SessionVFS") still holds
+	// under the new model.
+	candidate, extractErr := svfs.ExtractReviewCandidate("task-1")
+	if extractErr != nil {
+		t.Fatalf("simulate inspector ExtractReviewCandidate: %v", extractErr)
+	}
+	candidateID := ""
+	hadDraft := false
+	if candidate != nil {
+		candidateID = candidate.ID
+		hadDraft = true
+	}
+
 	err = o.handlePipelineUpdate(&guide.Message{
 		ID: "msg-1",
 		Payload: &PipelineUpdate{
@@ -481,7 +498,9 @@ func TestHandlePipelineUpdate_InspectorSuccessDefersResourceReleaseUntilCheckpoi
 			AgentType: agentshared.PipelineAgentInspector,
 			Status:    "succeeded",
 			Output: map[string]any{
-				"summary": "Inspector accepted the completed pipeline.",
+				"summary":             "Inspector accepted the completed pipeline.",
+				"review_candidate_id": candidateID,
+				"had_draft":           hadDraft,
 			},
 			Timestamp: time.Now().UTC(),
 		},

@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -69,9 +70,12 @@ type streamLifecycleState struct {
 	completed       bool
 }
 
-// WithStreamContext attaches streaming metadata to a context.
+// WithStreamContext attaches streaming metadata to a context. Also
+// initializes the per-request agent-activity tracker so terminal-state
+// telemetry can observe whether the agent announced any state transitions.
 func WithStreamContext(ctx context.Context, correlationID, sourceAgentID string) context.Context {
 	ctx = withStreamLifecycle(ctx)
+	ctx = withStreamActivityState(ctx)
 	return context.WithValue(ctx, streamContextKey{}, StreamContext{
 		CorrelationID: correlationID,
 		SourceAgentID: sourceAgentID,
@@ -210,9 +214,23 @@ func streamLifecycleFromContext(ctx context.Context) *streamLifecycleState {
 	return lifecycle
 }
 
-func publishWithStreamLifecycle(ctx context.Context, eventType guide.StreamEventType, publish func()) bool {
+// publishWithStreamLifecycle gates a single stream-event publish against the
+// stream's terminal lifecycle and propagates any publish error up to the
+// caller. Returns:
+//   - publishErr: non-nil if the underlying publish call returned an error.
+//     The caller (typically PublishStreamEvent) must surface this to its own
+//     caller so the agent's loop can observe the failure and reason about it.
+//     A nil return means either the publish succeeded or the event was
+//     correctly suppressed by the lifecycle gate (post-terminal text/progress).
+//
+// Suppression by the gate is NOT an error — it is a deliberate design choice
+// to prevent late text from corrupting the user's view after StreamComplete
+// finalizes the message. The caller has no recovery path for suppression and
+// no need to know about it. Bus failure, on the other hand, IS observable
+// (the user lost a chunk) and must propagate.
+func publishWithStreamLifecycle(ctx context.Context, eventType guide.StreamEventType, publish func() error) error {
 	lifecycle := streamLifecycleFromContext(ctx)
-	delivered, lateBypass := publishWithLifecycleState(lifecycle, eventType, publish)
+	delivered, lateBypass, publishErr := publishWithLifecycleState(lifecycle, eventType, publish)
 	if lateBypass {
 		// Tool-call events whose Complete races the agent's StreamComplete
 		// (slow handler, callback-driven synthetic branch, request
@@ -227,15 +245,25 @@ func publishWithStreamLifecycle(ctx context.Context, eventType guide.StreamEvent
 				})
 		}
 	}
-	return delivered
+	if publishErr != nil {
+		return publishErr
+	}
+	if !delivered {
+		// Suppressed by the lifecycle gate (e.g., late text after stream
+		// complete). Not an error — the caller has nothing to surface.
+		return nil
+	}
+	return nil
 }
 
 // publishWithLifecycleState gates a single stream-event publish against the
-// stream's terminal lifecycle. Returns (delivered, lateBypass):
+// stream's terminal lifecycle. Returns (delivered, lateBypass, publishErr):
 //   - delivered = true means publish was invoked.
 //   - lateBypass = true means publish was invoked despite terminalStarted being
 //     set, because the event type owns its own out-of-band lifecycle (currently
 //     only StreamEventToolCall). Callers can use this to log telemetry.
+//   - publishErr is whatever the publish callback returned; nil if publish was
+//     not invoked or if it succeeded.
 //
 // The lifecycle gate exists to suppress late stream-content events (text
 // chunks, progress, thinking) so they cannot leak into the user's view after
@@ -247,13 +275,13 @@ func publishWithStreamLifecycle(ctx context.Context, eventType guide.StreamEvent
 // "tool completed but row stayed pending" bug we have hunted: the bytes never
 // reached the bus to begin with, so no producer-side or matcher-side patch
 // could close the row.
-func publishWithLifecycleState(lifecycle *streamLifecycleState, eventType guide.StreamEventType, publish func()) (delivered bool, lateBypass bool) {
+func publishWithLifecycleState(lifecycle *streamLifecycleState, eventType guide.StreamEventType, publish func() error) (delivered bool, lateBypass bool, publishErr error) {
 	if publish == nil {
-		return false, false
+		return false, false, nil
 	}
 	if lifecycle == nil {
-		publish()
-		return true, false
+		publishErr = publish()
+		return true, false, publishErr
 	}
 
 	lifecycle.mu.Lock()
@@ -262,19 +290,19 @@ func publishWithLifecycleState(lifecycle *streamLifecycleState, eventType guide.
 	switch eventType {
 	case guide.StreamEventComplete:
 		if lifecycle.completed {
-			return false, false
+			return false, false, nil
 		}
 		lifecycle.terminalStarted = true
 		lifecycle.completed = true
-		publish()
-		return true, false
+		publishErr = publish()
+		return true, false, publishErr
 	case guide.StreamEventError:
 		if lifecycle.completed {
-			return false, false
+			return false, false, nil
 		}
 		lifecycle.terminalStarted = true
-		publish()
-		return true, false
+		publishErr = publish()
+		return true, false, publishErr
 	case guide.StreamEventToolCall:
 		// Bypass the terminal gate for tool-call events. They are out-of-band
 		// metadata, paired by toolCallEventKey, and dropping them after
@@ -284,14 +312,26 @@ func publishWithLifecycleState(lifecycle *streamLifecycleState, eventType guide.
 		// archivalist consults) can still open and close their rows after
 		// the parent stream finalizes.
 		late := lifecycle.terminalStarted
-		publish()
-		return true, late
+		publishErr = publish()
+		return true, late, publishErr
+	case guide.StreamEventAgentState:
+		// Agent-state transitions are the canonical "what is happening now"
+		// channel. They are orthogonal to text-stream lifecycle — a
+		// `complete` or `errored` state must be deliverable even if it
+		// arrives alongside or just after StreamComplete, and an inter-agent
+		// `awaiting_peer_response` state can legitimately fire while the
+		// underlying text stream is between LLM turns. Dropping any state
+		// event produces a silent gap in the UI activity indicator, which
+		// is exactly the failure mode state events exist to eliminate.
+		late := lifecycle.terminalStarted
+		publishErr = publish()
+		return true, late, publishErr
 	default:
 		if lifecycle.terminalStarted {
-			return false, false
+			return false, false, nil
 		}
-		publish()
-		return true, false
+		publishErr = publish()
+		return true, false, publishErr
 	}
 }
 
@@ -362,16 +402,29 @@ func TotalUsageTokens(usage *guide.StreamUsage) int64 {
 }
 
 // PublishStreamEvent publishes a stream event to the bus.
+//
+// Returns an error if the bus.Publish call itself failed; nil if the event
+// was delivered or correctly suppressed by the lifecycle gate (post-terminal
+// text/progress, where suppression is by design and not a failure). When an
+// error is returned, it is also logged at warning level here so the failure
+// is observable even when the caller chooses to propagate it further. The
+// agent's loop receives the error like any other tool-execution failure and
+// the LLM reasons about it — there are no internal retries or fallbacks.
+//
+// Returns nil (without publishing) when bus, channels, event, or context
+// stream metadata are missing — these are caller-side preconditions that
+// indicate the agent is not in a publishable state. Those misses are logged
+// at debug level for diagnostic visibility.
 func PublishStreamEvent(
 	bus guide.EventBus,
 	channels *guide.AgentChannels,
 	ctx context.Context,
 	agentID string,
 	event *guide.StreamEvent,
-) {
+) error {
 	metadata, ok := StreamMetadataFromContext(ctx)
 	if !ok || bus == nil || channels == nil || event == nil {
-		return
+		return nil
 	}
 	if visibility, ok := streamEventVisibilityFromContext(ctx); ok {
 		cloned := *event
@@ -397,9 +450,22 @@ func PublishStreamEvent(
 		Timestamp:     time.Now(),
 	}
 
-	publishWithStreamLifecycle(ctx, event.Type, func() {
-		_ = bus.Publish(channels.Responses, msg)
-	})
+	if err := publishWithStreamLifecycle(ctx, event.Type, func() error {
+		return bus.Publish(channels.Responses, msg)
+	}); err != nil {
+		if lm := LogMetaFromContext(ctx); lm.EventLogger != nil {
+			LogWarning(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+				"stream_event_publish_failed", map[string]any{
+					"event_type":     string(event.Type),
+					"agent_id":       agentID,
+					"target_agent":   metadata.SourceAgentID,
+					"correlation_id": metadata.CorrelationID,
+					"error":          err.Error(),
+				})
+		}
+		return fmt.Errorf("publish stream event %s: %w", event.Type, err)
+	}
+	return nil
 }
 
 func cloneStreamMetadata(metadata map[string]any) map[string]any {
@@ -608,17 +674,43 @@ func hasNestedInterAgentBranchMetadata(metadata map[string]any) bool {
 	return false
 }
 
-// PublishStreamStart emits a stream start event.
-func PublishStreamStart(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID string) {
-	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
+// PublishStreamStart emits a stream start event AND announces the canonical
+// `receiving` agent-activity state so the UI has an activity indicator from
+// the moment the request enters the agent. Returns the first error observed
+// (start event or state event) so the agent's loop surfaces any delivery
+// failure. Stream-start is considered the authoritative source for the
+// `receiving` transition; agents should transition to `reasoning` /
+// `tool_executing` / etc. explicitly as work progresses.
+func PublishStreamStart(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID string) error {
+	if err := PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
 		Type:      guide.StreamEventStart,
 		Timestamp: time.Now(),
-	})
+	}); err != nil {
+		return err
+	}
+	return PublishAgentState(bus, channels, ctx, agentID, agentTypeFromStreamMetadata(ctx, agentID),
+		guide.AgentStateReceiving, "", nil)
 }
 
-// PublishStreamChunk emits a text data chunk.
-func PublishStreamChunk(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID, text string) {
-	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
+// agentTypeFromStreamMetadata returns the agent_type the agent has stamped
+// into its own stream metadata via WithOwnedStreamIdentity, falling back to
+// the explicit agentID when the metadata is missing. Used by the stream
+// publishers to auto-emit state events without callers having to pass
+// agent type again.
+func agentTypeFromStreamMetadata(ctx context.Context, agentID string) string {
+	if stream, ok := StreamMetadataFromContext(ctx); ok && len(stream.Metadata) > 0 {
+		if v, _ := stream.Metadata[streamMetadataAgentType].(string); strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return strings.TrimSpace(agentID)
+}
+
+// PublishStreamChunk emits a text data chunk. Returns the underlying publish
+// error for the agent's loop to surface; nil on success or when the caller is
+// not in a publishable state.
+func PublishStreamChunk(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID, text string) error {
+	return PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
 		Type:      guide.StreamEventData,
 		Text:      text,
 		Timestamp: time.Now(),
@@ -626,8 +718,160 @@ func PublishStreamChunk(bus guide.EventBus, channels *guide.AgentChannels, ctx c
 }
 
 // PublishStreamProgress emits a progress update tied to the current stream.
-func PublishStreamProgress(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID, message string) {
-	publishStreamProgress(bus, channels, ctx, agentID, message, false)
+// Returns the underlying publish error for the agent's loop to surface; nil
+// on success or when the message is empty.
+func PublishStreamProgress(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID, message string) error {
+	return publishStreamProgress(bus, channels, ctx, agentID, message, false)
+}
+
+// PublishAgentState declares an explicit agent activity state transition.
+//
+// State events are the canonical source of truth for user-visible "what is
+// the agent doing right now" — they are published at every transition
+// boundary (receiving → reasoning → tool_executing / consulting_peer /
+// dispatching_to_peer / awaiting_peer_response → composing_response →
+// complete | errored). The UI uses these events to keep a persistent
+// activity indicator current even between text-stream boundaries and
+// inter-agent routing hops. They are orthogonal to text chunks and flow on
+// the same response channel via StreamEventAgentState.
+//
+// `detail` is the short human-readable phrase surfaced to the user (e.g.,
+// "asking tester for verification", "running pytest suite"). `peer` may be
+// nil for self-contained transitions (Reasoning, ToolExecuting); set it to
+// a filled AgentStateEvent with only PeerAgentType and/or PeerCorrelationID
+// populated when the transition involves a peer.
+//
+// Returns the underlying publish error so callers surface delivery failures
+// the same way they do for any other stream event. No retries, no fallbacks
+// — a failed state publish is an observable event, not a paper-over moment.
+func PublishAgentState(
+	bus guide.EventBus,
+	channels *guide.AgentChannels,
+	ctx context.Context,
+	agentID string,
+	agentType string,
+	state guide.AgentActivityState,
+	detail string,
+	peer *guide.AgentStateEvent,
+) error {
+	if strings.TrimSpace(string(state)) == "" {
+		return nil
+	}
+	transitionID := nextAgentStateTransitionID()
+	payload := &guide.AgentStateEvent{
+		State:         state,
+		Detail:        strings.TrimSpace(detail),
+		AgentID:       strings.TrimSpace(agentID),
+		AgentType:     strings.TrimSpace(agentType),
+		TransitionID:  transitionID,
+	}
+	if stream, ok := StreamMetadataFromContext(ctx); ok {
+		payload.CorrelationID = stream.CorrelationID
+	}
+	if peer != nil {
+		payload.PeerAgentType = strings.TrimSpace(peer.PeerAgentType)
+		payload.PeerCorrelationID = strings.TrimSpace(peer.PeerCorrelationID)
+	}
+	// Record the transition on the per-stream tracker so terminal telemetry
+	// can detect producer gaps (a stream ended without ever announcing a
+	// state). The tracker lives on ctx — agents get one automatically when
+	// they call WithStreamContext, so this is a no-op outside a streaming
+	// context.
+	recordAgentStateTransition(ctx, state)
+	return PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
+		Type:      guide.StreamEventAgentState,
+		Data:      payload,
+		Timestamp: time.Now(),
+	})
+}
+
+// agentStateTransitionCounter is a process-wide monotonic counter used to
+// order AgentStateEvent emissions deterministically on the receiving side.
+// Per-correlation ordering is preserved as a side effect of the monotonic
+// global (deliveries for a single correlation observe the counter in the
+// same order the publisher issued them).
+var agentStateTransitionCounter atomic.Int64
+
+func nextAgentStateTransitionID() int64 {
+	return agentStateTransitionCounter.Add(1)
+}
+
+// streamActivityState tracks the most recent agent-activity state emitted
+// for a single stream so terminal telemetry can detect missing transitions.
+// It is attached to the stream lifecycle object so every per-request stream
+// has its own state track; concurrent requests do not share.
+type streamActivityState struct {
+	mu         sync.Mutex
+	lastState  guide.AgentActivityState
+	terminated bool
+}
+
+type streamActivityKey struct{}
+
+func withStreamActivityState(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if existing, _ := ctx.Value(streamActivityKey{}).(*streamActivityState); existing != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, streamActivityKey{}, &streamActivityState{})
+}
+
+func streamActivityFromContext(ctx context.Context) *streamActivityState {
+	if ctx == nil {
+		return nil
+	}
+	s, _ := ctx.Value(streamActivityKey{}).(*streamActivityState)
+	return s
+}
+
+// recordAgentStateTransition is called by PublishAgentState so the lifecycle
+// tracker knows what the most recently emitted state was. Enables the
+// terminal telemetry to detect "stream ended but we never saw any explicit
+// state transition" producer gaps.
+func recordAgentStateTransition(ctx context.Context, state guide.AgentActivityState) {
+	s := streamActivityFromContext(ctx)
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.lastState = state
+	if state == guide.AgentStateComplete || state == guide.AgentStateErrored {
+		s.terminated = true
+	}
+	s.mu.Unlock()
+}
+
+// LogMissingTerminalAgentStateAtStreamTerminal emits a telemetry event when
+// PublishStreamComplete or PublishStreamError fires without a prior terminal
+// agent-activity state having been announced via PublishAgentState. Terminal
+// states (complete / errored) are auto-emitted by the stream publishers, so
+// the gap this detects is specifically producer-side: an agent that never
+// emitted ANY state transition (not even receiving) during the full request
+// lifetime, which indicates the request handler bypassed PublishStreamStart
+// and similar canonical helpers. No fallback happens — we log and continue.
+func LogMissingTerminalAgentStateAtStreamTerminal(ctx context.Context, agentID, reason string) {
+	s := streamActivityFromContext(ctx)
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	seenAny := s.lastState != ""
+	already := s.terminated
+	s.mu.Unlock()
+	if seenAny || already {
+		return
+	}
+	lm := LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	LogInfo(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+		"agent_state_missing_at_stream_terminal", map[string]any{
+			"agent_id": strings.TrimSpace(agentID),
+			"reason":   strings.TrimSpace(reason),
+		})
 }
 
 func publishStreamProgress(
@@ -636,12 +880,12 @@ func publishStreamProgress(
 	ctx context.Context,
 	agentID, message string,
 	toolDerived bool,
-) {
+) error {
 	message = strings.TrimSpace(message)
 	if message == "" {
-		return
+		return nil
 	}
-	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
+	return PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
 		Type: guide.StreamEventProgress,
 		Data: &guide.ProgressData{
 			Message:     message,
@@ -934,20 +1178,22 @@ func humanizeToolName(name string) string {
 // PublishIntermediateToolTurn emits progress narration for tool-using turns so
 // the user sees meaningful status before the loop reaches its final answer.
 // This uses progress events instead of data chunks so intermediate narration
-// does not suppress the final route response.
+// does not suppress the final route response. Returns the underlying publish
+// error for the agent's loop to surface; nil when no narration was emitted.
 func PublishIntermediateToolTurn(
 	bus guide.EventBus,
 	channels *guide.AgentChannels,
 	ctx context.Context,
 	agentID string,
 	resp *providers.Response,
-) {
+) error {
 	if ResponseStreamedText(resp) {
-		return
+		return nil
 	}
 	if text := IntermediateToolTurnTextWithContext(ctx, resp); text != "" {
-		publishStreamProgress(bus, channels, ctx, agentID, text, true)
+		return publishStreamProgress(bus, channels, ctx, agentID, text, true)
 	}
+	return nil
 }
 
 func progressNarrationAgentType(ctx context.Context) string {
@@ -974,15 +1220,39 @@ func suppressIntermediateThinkingNarration(agentType string) bool {
 // (A) lifecycle bypass means a Complete may still arrive after this fires —
 // the log is informational ("this call was outstanding when the stream
 // terminated"), not a permanent assertion of loss.
+//
+// The canonical `complete` agent-activity state is announced via
+// PublishAgentState immediately before the complete event reaches the bus,
+// so consumers observing the activity channel see the terminal transition
+// in the same order as the stream terminal. Missing prior intermediate
+// transitions (no `reasoning` / `composing_response` between `receiving` and
+// `complete`) are logged as producer gaps by the terminal-state telemetry.
+// Returns the underlying publish error so the agent's loop can surface a
+// final-event delivery failure to the user.
 func PublishStreamComplete(
 	bus guide.EventBus,
 	channels *guide.AgentChannels,
 	ctx context.Context,
 	agentID, text string,
 	usage *guide.StreamUsage,
-) {
+) error {
 	LogInFlightToolCallsAtTerminal(ctx, "stream_complete")
-	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
+	LogMissingTerminalAgentStateAtStreamTerminal(ctx, agentID, "stream_complete")
+	agentType := agentTypeFromStreamMetadata(ctx, agentID)
+	if err := PublishAgentState(bus, channels, ctx, agentID, agentType,
+		guide.AgentStateComplete, "", nil); err != nil {
+		// Log but continue — the stream complete event is the user-visible
+		// terminal and must still fire even if the state channel failed.
+		if lm := LogMetaFromContext(ctx); lm.EventLogger != nil {
+			LogWarning(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+				"agent_state_complete_publish_failed", map[string]any{
+					"agent_id":   agentID,
+					"agent_type": agentType,
+					"error":      err.Error(),
+				})
+		}
+	}
+	return PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
 		Type:      guide.StreamEventComplete,
 		Text:      text,
 		Usage:     usage,
@@ -992,13 +1262,32 @@ func PublishStreamComplete(
 
 // PublishStreamError emits a stream error event. As with PublishStreamComplete
 // it snapshots in-flight tool calls first so a stuck call is observable in
-// the log even when the agent terminates abnormally.
-func PublishStreamError(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID string, err error) {
+// the log even when the agent terminates abnormally. The canonical `errored`
+// agent-activity state is announced before the error event so the activity
+// channel reflects the failure in the same order as the stream terminal.
+// Returns the underlying publish error so the agent's loop can surface a
+// final-event delivery failure (the user is then unaware the stream errored —
+// a serious bug we must propagate, not silently drop).
+func PublishStreamError(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID string, err error) error {
 	if err == nil {
-		return
+		return nil
 	}
 	LogInFlightToolCallsAtTerminal(ctx, "stream_error")
-	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
+	LogMissingTerminalAgentStateAtStreamTerminal(ctx, agentID, "stream_error")
+	agentType := agentTypeFromStreamMetadata(ctx, agentID)
+	if stateErr := PublishAgentState(bus, channels, ctx, agentID, agentType,
+		guide.AgentStateErrored, err.Error(), nil); stateErr != nil {
+		if lm := LogMetaFromContext(ctx); lm.EventLogger != nil {
+			LogWarning(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+				"agent_state_errored_publish_failed", map[string]any{
+					"agent_id":         agentID,
+					"agent_type":       agentType,
+					"underlying_error": err.Error(),
+					"publish_error":    stateErr.Error(),
+				})
+		}
+	}
+	return PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
 		Type:      guide.StreamEventError,
 		Data:      map[string]string{"error": err.Error()},
 		Timestamp: time.Now(),

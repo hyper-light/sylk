@@ -15,6 +15,7 @@ import (
 	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/adalundhe/sylk/core/storage"
 	agentpkg "github.com/adalundhe/sylk/ui/agent"
+	"github.com/adalundhe/sylk/ui/browser"
 	"github.com/adalundhe/sylk/ui/chat"
 	"github.com/adalundhe/sylk/ui/login"
 	"github.com/adalundhe/sylk/ui/msg"
@@ -716,7 +717,7 @@ func openURL(rawURL string) error {
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return fmt.Errorf("unsupported url scheme")
 	}
-	return openURLPlatform(parsed.String())
+	return browser.Open(parsed.String())
 }
 
 var explicitTargetAliases = map[string]string{

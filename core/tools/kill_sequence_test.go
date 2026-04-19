@@ -263,31 +263,6 @@ func TestOrphanedProcessError_Error(t *testing.T) {
 	assert.Contains(t, msg, "test-process")
 }
 
-func TestExtendedKillSequenceManager_DefaultConfig(t *testing.T) {
-	cfg := DefaultExtendedKillSequenceConfig()
-
-	assert.Equal(t, DefaultSIGINTGrace, cfg.SIGINTGrace)
-	assert.Equal(t, DefaultSIGTERMGrace, cfg.SIGTERMGrace)
-	assert.Equal(t, 500*time.Millisecond, cfg.ForceCloseWait)
-}
-
-func TestExtendedKillSequenceManager_HasOrphanTracker(t *testing.T) {
-	mgr := NewExtendedKillSequenceManager(DefaultExtendedKillSequenceConfig())
-
-	assert.NotNil(t, mgr.OrphanTracker())
-}
-
-func TestExtendedKillSequenceManager_CustomOrphanTracker(t *testing.T) {
-	tracker := NewOrphanTracker(time.Hour)
-
-	cfg := DefaultExtendedKillSequenceConfig()
-	cfg.OrphanTracker = tracker
-
-	mgr := NewExtendedKillSequenceManager(cfg)
-
-	assert.Same(t, tracker, mgr.OrphanTracker())
-}
-
 func TestKillPhase_Values(t *testing.T) {
 	assert.Equal(t, KillPhase(0), KillPhaseSIGINT)
 	assert.Equal(t, KillPhase(1), KillPhaseSIGTERM)

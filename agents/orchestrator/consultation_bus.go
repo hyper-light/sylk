@@ -83,8 +83,7 @@ func (o *Orchestrator) requestRouteSync(
 	waitCtx, release := shared.WithoutDeadlineCancellation(ctx)
 	defer release()
 
-	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, target, payload, metadata)
-	metadata = branch.ApplyMetadata(branchCtx, metadata)
+	metadata = shared.InheritedBranchMetadata(waitCtx, metadata)
 	req := &guide.RouteRequest{
 		Input:           payload,
 		SourceAgentID:   o.config.AgentID,
@@ -95,13 +94,13 @@ func (o *Orchestrator) requestRouteSync(
 		Metadata:        metadata,
 	}
 	if req.ParentCorrelationID == "" {
-		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+		if stream, ok := shared.StreamMetadataFromContext(waitCtx); ok {
 			req.ParentCorrelationID = stream.CorrelationID
 		}
 	}
-	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
+	req.Metadata = shared.RouteMetadataWithInterAgentBranch(waitCtx, req.Metadata)
 
-	response, err := shared.RetryBusyRouteRequest(branchCtx, target, shared.DefaultBusyRetryPolicy(target), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+	response, err := shared.RetryBusyRouteRequest(waitCtx, target, shared.DefaultBusyRetryPolicy(target), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
 		req.CorrelationID = "orchestrator_corr_" + uuid.NewString()[:8]
 		req.Timestamp = time.Now()
 		wait := o.registerPendingWait(req.CorrelationID)
@@ -110,8 +109,32 @@ func (o *Orchestrator) requestRouteSync(
 		msg := guide.NewRequestMessage(generateMessageID(), req)
 		msg.CorrelationID = req.CorrelationID
 
+		// Announce `dispatching_to_peer` before the bus publish so the UI
+		// indicator reflects the outbound dispatch transition even when the
+		// peer's own `receiving` state takes a few ms to arrive.
+		peerRef := &guide.AgentStateEvent{
+			PeerAgentType:     target,
+			PeerCorrelationID: req.CorrelationID,
+		}
+		if err := o.publishAgentState(attemptCtx, guide.AgentStateDispatchingToPeer,
+			fmt.Sprintf("dispatching to %s", target), peerRef); err != nil {
+			o.logWarnMsg("orchestrator_dispatching_to_peer_publish_failed",
+				"target", target, "error", err.Error())
+		}
+
 		if err := o.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
 			return nil, fmt.Errorf("publish route request: %w", err)
+		}
+
+		// Announce `awaiting_peer_response` during the sync wait so the UI
+		// indicator reflects ongoing activity while the peer processes. The
+		// peer's own `receiving`/`reasoning` states supersede this once its
+		// transitions arrive on the same correlation, but this one fills the
+		// gap until they do.
+		if err := o.publishAgentState(attemptCtx, guide.AgentStateAwaitingPeerResponse,
+			fmt.Sprintf("awaiting %s response", target), peerRef); err != nil {
+			o.logWarnMsg("orchestrator_awaiting_peer_response_publish_failed",
+				"target", target, "error", err.Error())
 		}
 
 		response, err := shared.WaitForPendingSyncResponse(
@@ -129,10 +152,8 @@ func (o *Orchestrator) requestRouteSync(
 		return response, nil
 	})
 	if err != nil {
-		branch.Complete(branchCtx, "", "", err)
 		return nil, err
 	}
-	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }
 

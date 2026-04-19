@@ -56,7 +56,7 @@ func (s *toolLoopState) provider() (LibrarianProvider, error) {
 			lm.AgentID, lm.SessionID, lm.CorrID, "error",
 			&agentlog.ErrorPayload{Error: "no LLM provider configured"})
 	}
-	return nil, fmt.Errorf("librarian: no LLM provider configured")
+	return nil, fmt.Errorf("librarian: %w: LLM provider not yet wired", shared.ErrAgentNotReady)
 }
 
 func (s *toolLoopState) logStart() {

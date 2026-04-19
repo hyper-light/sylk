@@ -220,7 +220,7 @@ func TestHandleInterAgentToolCallInList_ApprovalPairsByLifecycleID(t *testing.T)
 			Status:     "done",
 		},
 	}
-	if !handleInterAgentToolCallInList(&calls, "engineer", complete) {
+	if !handleInterAgentToolCallInList(&calls, "engineer", complete, interAgentDispatchCallbacks{}) {
 		t.Fatal("expected complete event to be handled")
 	}
 	if len(calls) != 1 {
@@ -234,6 +234,165 @@ func TestHandleInterAgentToolCallInList_ApprovalPairsByLifecycleID(t *testing.T)
 	}
 	if calls[0].InterAgent.Summary != "approved by user" {
 		t.Fatalf("summary = %q, want updated to %q", calls[0].InterAgent.Summary, "approved by user")
+	}
+}
+
+// TestHandleInterAgentToolCallInList_OriginUpdateDropsOnMiss verifies the
+// regression fix for the duplicate-agent-row bug class: when an origin-update
+// event (validate_work, process_validation, etc.) arrives at a list scope
+// that does NOT contain the originator row, the handler must NOT fallback-
+// append a phantom duplicate. It must either route cross-scope via the
+// provided callback or drop the event. Previous behavior appended a new
+// row to the nested list, producing visible duplicates like a second
+// "tester-pipeline" row under the tester's own nested slot.
+func TestHandleInterAgentToolCallInList_OriginUpdateDropsOnMiss(t *testing.T) {
+	calls := []ToolCallRecord{{
+		ToolCallKey: "tester_tool_abc",
+		ToolName:    "run_test_suite",
+		InterAgent:  nil, // ordinary local tool, not the originator row
+	}}
+	origUpdate := msg.ToolCallEventMsg{
+		ToolCallKey: "validate_work_xyz",
+		ToolName:    "validate_work",
+		Phase:       1,
+		Success:     true,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:         "challenge",
+			AgentTypes:   []string{"inspector-pipeline"},
+			Summary:      "Audit result: pass",
+			Status:       "done",
+			ThreadKey:    "pipeline:challenge-does-not-exist-in-this-list",
+			UpdateOrigin: true,
+		},
+	}
+	crossScopeCalled := false
+	cb := interAgentDispatchCallbacks{
+		crossScopeOriginUpdate: func(ev msg.ToolCallEventMsg) bool {
+			crossScopeCalled = true
+			return false // simulate: originator row doesn't exist anywhere
+		},
+	}
+	if !handleInterAgentToolCallInList(&calls, "tester-pipeline", origUpdate, cb) {
+		t.Fatal("expected origin-update to be consumed")
+	}
+	if !crossScopeCalled {
+		t.Fatal("expected cross-scope callback to be invoked for origin-update miss")
+	}
+	if len(calls) != 1 {
+		t.Fatalf("calls len = %d, want 1 (no fallback-append permitted for origin-updates)", len(calls))
+	}
+	// The single pre-existing record must be untouched.
+	if calls[0].ToolName != "run_test_suite" || calls[0].ToolCallKey != "tester_tool_abc" {
+		t.Fatalf("existing record mutated: %#v", calls[0])
+	}
+}
+
+// TestHandleInterAgentToolCallInList_OriginUpdateRoutesCrossScope verifies
+// that origin-updates with a matching cross-scope target do NOT fallback-
+// append even if the callback returns true. They are consumed by the
+// cross-scope handler and never touch the local list.
+func TestHandleInterAgentToolCallInList_OriginUpdateRoutesCrossScope(t *testing.T) {
+	calls := []ToolCallRecord{}
+	origUpdate := msg.ToolCallEventMsg{
+		ToolCallKey: "validate_work_abc",
+		ToolName:    "validate_work",
+		Phase:       1,
+		Success:     true,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:         "challenge",
+			AgentTypes:   []string{"inspector-pipeline"},
+			Summary:      "Pass",
+			Status:       "done",
+			ThreadKey:    "pipeline:challenge-abc",
+			UpdateOrigin: true,
+		},
+	}
+	cb := interAgentDispatchCallbacks{
+		crossScopeOriginUpdate: func(ev msg.ToolCallEventMsg) bool {
+			return true // simulate: originator row found and patched elsewhere
+		},
+	}
+	if !handleInterAgentToolCallInList(&calls, "tester-pipeline", origUpdate, cb) {
+		t.Fatal("expected origin-update to be consumed")
+	}
+	if len(calls) != 0 {
+		t.Fatalf("calls len = %d, want 0 (cross-scope handled the update, no local record created)", len(calls))
+	}
+}
+
+// TestHandleInterAgentToolCallInList_OriginUpdatePhase0Ignored verifies that
+// Phase 0 events for response tools (validate_work start) never open a row
+// in any scope. Classification now keys off either the UpdateOrigin flag
+// (Phase 1) or the shared tool-name classifier (Phase 0) — both routes
+// converge through eventIsInterAgentOriginUpdate.
+func TestHandleInterAgentToolCallInList_OriginUpdatePhase0Ignored(t *testing.T) {
+	calls := []ToolCallRecord{}
+	start := msg.ToolCallEventMsg{
+		ToolCallKey: "validate_work_abc",
+		ToolName:    "validate_work",
+		Phase:       0,
+		// Phase 0 events for response tools carry no InterAgent metadata
+		// (emission side returns nil from DeriveInterAgentToolEvent); the
+		// UI-side classifier falls back on tool name.
+		InterAgent: nil,
+	}
+	if !handleInterAgentToolCallInList(&calls, "tester-pipeline", start, interAgentDispatchCallbacks{}) {
+		t.Fatal("expected Phase 0 response-tool event to be consumed (swallowed)")
+	}
+	if len(calls) != 0 {
+		t.Fatalf("calls len = %d, want 0 (response tool must never open a row)", len(calls))
+	}
+}
+
+// TestApplyInterAgentOriginUpdateToList_MatchesChildInsideInterAgentChildren
+// verifies that the recursive walker finds a ThreadKey living only inside
+// tc.InterAgent.Children[j].ToolCalls — the post-merge scope that occurs
+// after a nested slot is upserted into its parent row and the slot is
+// cleared. findInterAgentThread only scans top-level entry.ToolCalls, so
+// without this recursion the origin-update would be silently dropped.
+func TestApplyInterAgentOriginUpdateToList_MatchesChildInsideInterAgentChildren(t *testing.T) {
+	const targetKey = "pipeline:challenge-nested-child"
+	calls := []ToolCallRecord{{
+		ToolCallKey: "parent-row",
+		InterAgent: &InterAgentTool{
+			Kind:       InterAgentToolChallenge,
+			AgentTypes: []string{"inspector-pipeline"},
+			ThreadKey:  "pipeline:parent-thread",
+			Status:     InterAgentToolPending,
+			Children: []InterAgentChildActivity{{
+				CorrelationID: "nested-cid",
+				AgentType:     "tester-pipeline",
+				ToolCalls: []ToolCallRecord{{
+					ToolCallKey: "nested-child-row",
+					InterAgent: &InterAgentTool{
+						Kind:       InterAgentToolChallenge,
+						AgentTypes: []string{"inspector-pipeline"},
+						ThreadKey:  targetKey,
+						Status:     InterAgentToolPending,
+					},
+				}},
+			}},
+		},
+	}}
+	row := &InterAgentTool{
+		Kind:       InterAgentToolChallenge,
+		AgentTypes: []string{"inspector-pipeline"},
+		Summary:    "Pass",
+		Status:     InterAgentToolDone,
+		ThreadKey:  targetKey,
+	}
+	if !applyInterAgentOriginUpdateToList(&calls, targetKey, row) {
+		t.Fatal("expected origin-update to match nested child ThreadKey")
+	}
+	got := calls[0].InterAgent.Children[0].ToolCalls[0]
+	if got.InterAgent.Status != InterAgentToolDone {
+		t.Fatalf("nested child status = %q, want Done", got.InterAgent.Status)
+	}
+	if !got.Completed {
+		t.Fatal("nested child not marked completed")
+	}
+	if got.InterAgent.Summary != "Pass" {
+		t.Fatalf("nested child summary = %q, want Pass", got.InterAgent.Summary)
 	}
 }
 

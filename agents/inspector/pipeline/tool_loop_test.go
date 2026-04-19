@@ -13,7 +13,25 @@ import (
 	inspectorshared "github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/versioning"
 )
+
+// noopPipelineCommitter satisfies agentShared.PipelineCommitter without a
+// real SessionVFS so handoff_to_ot / discard_pipeline tests can run without
+// fixturing a session. Real wiring (cmd/tui.go) installs a SessionVFS-backed
+// committer; here we just want the skill to succeed past its committer
+// gate so the test can observe the published update.
+type noopPipelineCommitter struct{}
+
+func (noopPipelineCommitter) ExtractReviewCandidate(_ context.Context, _ string) (string, bool, versioning.SemanticVersion, error) {
+	return "", false, versioning.SemanticVersion{}, nil
+}
+
+func (noopPipelineCommitter) Rollback(_ context.Context, _ string) error { return nil }
+
+func installNoopPipelineCommitter(pi *PipelineInspector) {
+	pi.SetPipelineCommitter(noopPipelineCommitter{})
+}
 
 type scriptedPipelineProvider struct {
 	mu             sync.Mutex
@@ -101,6 +119,7 @@ func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToOT(t *testing.T) {
 	pi.SetProvider(provider)
 	pi.bus = bus
 	pi.state.CurrentTaskID = "task-1"
+	installNoopPipelineCommitter(pi)
 
 	updateCh := make(chan map[string]any, 1)
 	sub, err := bus.SubscribeAsync("pipeline.update."+agentShared.PipelineAgentInspector, func(msg *guide.Message) error {
@@ -249,6 +268,7 @@ func TestHandle_UsesFinalizePipelineToolResultToDriveImmediateHandoffToOT(t *tes
 	pi.SetProvider(provider)
 	pi.bus = bus
 	pi.state.CurrentTaskID = "task-2"
+	installNoopPipelineCommitter(pi)
 
 	task := &agentShared.PipelineTaskInput{
 		NodeID:        "task-2",
@@ -395,6 +415,7 @@ func TestHandle_PostValidationAuditContinuesFromToolResultsWithoutInjectedUserPr
 	pi.SetProvider(provider)
 	pi.bus = bus
 	pi.state.CurrentTaskID = "task-3"
+	installNoopPipelineCommitter(pi)
 
 	task := &agentShared.PipelineTaskInput{
 		NodeID:        "task-3",

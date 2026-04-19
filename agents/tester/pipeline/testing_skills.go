@@ -238,6 +238,20 @@ func writeTestSkill(pt *PipelineTester) *skills.Skill {
 					return nil, err
 				}
 			}
+			// Cross-pipeline coherence gate: refuse the write until the
+			// manifest holds a winning test_framework decision for the
+			// scope this output_file lives in. Prevents parallel
+			// pipelines from authoring tests in incompatible frameworks
+			// (the screenshot bug). The error message guides the LLM
+			// through query/declare; bounded retries via the existing
+			// tool-loop consecutive-error counter prevent thrashing.
+			outputForGate := strings.TrimSpace(p.OutputFile)
+			if outputForGate == "" {
+				outputForGate = strings.TrimSpace(p.TestCase.TargetFile)
+			}
+			if err := pt.requireTestFrameworkDecision(ctx, outputForGate); err != nil {
+				return nil, err
+			}
 			writtenPath, err := pt.writeTestArtifact(ctx, harness, p.TestCase, p.OutputFile, p.Content, &p.Basis)
 			if err != nil {
 				return nil, err

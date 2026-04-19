@@ -2165,7 +2165,13 @@ func (g *Guide) broadcastLearnedRoute(input string, result *RouteResult) {
 	}
 
 	msg := NewRouteLearnedMessage(fmt.Sprintf("msg_%d", time.Now().UnixNano()), route)
-	_ = g.bus.Publish(TopicRoutesLearned, msg)
+	if err := g.bus.Publish(TopicRoutesLearned, msg); err != nil {
+		slog.Warn("guide_route_learned_publish_failed",
+			"target_agent", route.TargetAgentID,
+			"intent", route.Intent,
+			"error", err.Error(),
+		)
+	}
 }
 
 // RouteSimple is a convenience method for simple routing without full request struct
@@ -2299,7 +2305,15 @@ func (g *Guide) persistCorrectionToArchivalist(correction CorrectionRecord) {
 			"correction": correction,
 		},
 	}
-	go func() { _ = g.bus.Publish(TopicGuideRequests, NewRequestMessage(generateMessageID(), req)) }()
+	go func() {
+		if err := g.bus.Publish(TopicGuideRequests, NewRequestMessage(generateMessageID(), req)); err != nil {
+			slog.Warn("guide_route_correction_publish_failed",
+				"correlation_id", req.CorrelationID,
+				"source_agent", req.SourceAgentID,
+				"error", err.Error(),
+			)
+		}
+	}()
 }
 
 // IsDSL checks if input is a structured DSL command
@@ -2645,7 +2659,13 @@ func (g *Guide) Unregister(id string) {
 	// Publish unregistration announcement to event bus
 	if g.bus != nil && g.running {
 		msg := NewAgentUnregisteredMessage(generateMessageID(), id, agentName)
-		_ = g.bus.Publish(TopicAgentRegistry, msg)
+		if err := g.bus.Publish(TopicAgentRegistry, msg); err != nil {
+			slog.Warn("guide_agent_unregistered_publish_failed",
+				"agent_id", id,
+				"agent_name", agentName,
+				"error", err.Error(),
+			)
+		}
 	}
 }
 
@@ -3294,7 +3314,15 @@ func (g *Guide) publishRerouteEvent(correlationID, sourceAgentID string, reroute
 		TargetAgentID: sourceAgentID,
 		Timestamp:     time.Now(),
 	}
-	_ = g.bus.Publish(g.agentResponseTopic(sourceAgentID), msg)
+	if err := g.bus.Publish(g.agentResponseTopic(sourceAgentID), msg); err != nil {
+		slog.Warn("guide_reroute_event_publish_failed",
+			"correlation_id", correlationID,
+			"target_agent", sourceAgentID,
+			"from", reroute.SourceAgentID,
+			"to", reroute.SuggestedTarget,
+			"error", err.Error(),
+		)
+	}
 }
 
 // rerouteExcludeKey is the context key for reroute excluded agent IDs.
@@ -3892,7 +3920,14 @@ func (g *Guide) publishRetryStatus(correlationID, sourceAgentID string, status R
 		Type:          MessageTypeStream,
 		Payload:       resp,
 	}
-	_ = g.bus.Publish(g.agentResponseTopic(sourceAgentID), busMsg)
+	if err := g.bus.Publish(g.agentResponseTopic(sourceAgentID), busMsg); err != nil {
+		slog.Warn("guide_retry_status_publish_failed",
+			"correlation_id", correlationID,
+			"target_agent", sourceAgentID,
+			"attempt", status.Attempt,
+			"error", err.Error(),
+		)
+	}
 }
 
 func (g *Guide) publishGuideStreamStart(correlationID, sourceAgentID string) {
@@ -4079,7 +4114,15 @@ func (g *Guide) publishStreamEventForResponder(correlationID, sourceAgentID, res
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
 	}
-	_ = g.bus.Publish(g.agentResponseTopic(sourceAgentID), msg)
+	if err := g.bus.Publish(g.agentResponseTopic(sourceAgentID), msg); err != nil {
+		slog.Warn("guide_stream_event_for_responder_publish_failed",
+			"correlation_id", correlationID,
+			"target_agent", sourceAgentID,
+			"responder", responderID,
+			"event_type", string(event.Type),
+			"error", err.Error(),
+		)
+	}
 }
 
 func (g *Guide) registeredAgentIDs() []string {
@@ -4591,7 +4634,13 @@ func (g *Guide) forwardUserInterruptToTarget(req *UserInterruptRequest, pending 
 	}
 	action := g.userInterruptAction(req, pending)
 	msg := NewActionMessage(generateMessageID(), action)
-	_ = g.bus.Publish(g.agentRequestTopic(pending.TargetAgentID), msg)
+	if err := g.bus.Publish(g.agentRequestTopic(pending.TargetAgentID), msg); err != nil {
+		slog.Warn("guide_user_interrupt_forward_publish_failed",
+			"target_agent", pending.TargetAgentID,
+			"correlation_id", pending.CorrelationID,
+			"error", err.Error(),
+		)
+	}
 }
 
 func (g *Guide) userInterruptAction(req *UserInterruptRequest, pending *PendingRequest) *ActionRequest {
@@ -5146,7 +5195,12 @@ func (g *Guide) MarkAgentReady(agentID string) {
 		info := g.routing.GetRoutingInfo(agentID)
 		if info != nil {
 			msg := NewAgentReadyMessage(generateMessageID(), info)
-			_ = g.bus.Publish(TopicAgentRegistry, msg)
+			if err := g.bus.Publish(TopicAgentRegistry, msg); err != nil {
+				slog.Warn("guide_agent_ready_publish_failed",
+					"agent_id", agentID,
+					"error", err.Error(),
+				)
+			}
 		}
 	}
 }
@@ -5184,7 +5238,16 @@ func (g *Guide) ReapStaleRegistrations() int {
 // early-return paths in Register() can announce.
 func (g *Guide) publishRegistryAnnouncement(info *AgentRoutingInfo) {
 	msg := NewAgentRegisteredMessage(generateMessageID(), info)
-	_ = g.bus.Publish(TopicAgentRegistry, msg)
+	if err := g.bus.Publish(TopicAgentRegistry, msg); err != nil {
+		agentID := ""
+		if info != nil {
+			agentID = info.ID
+		}
+		slog.Warn("guide_registry_announcement_publish_failed",
+			"agent_id", agentID,
+			"error", err.Error(),
+		)
+	}
 }
 
 // RegisteredAgentInfos returns a snapshot of all currently registered agent

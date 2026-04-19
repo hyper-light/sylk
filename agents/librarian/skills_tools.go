@@ -13,45 +13,18 @@ import (
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/search/codebase"
 	"github.com/adalundhe/sylk/core/skills"
-	"github.com/adalundhe/sylk/core/versioning"
 )
 
-// ---------------------------------------------------------------------------
-// read_file
-// ---------------------------------------------------------------------------
-
-type readFileParams struct {
-	Path   string `json:"path"`
-	Offset int    `json:"offset,omitempty"`
-	Limit  int    `json:"limit,omitempty"`
-}
-
-func readFileSkill(l *Librarian) *skills.Skill {
-	return skills.NewSkill("read_file").
-		Description("Read file contents. Use offset and limit for large files.").
-		Domain("filesystem").
-		Keywords("read", "file", "content", "cat", "view").
-		Priority(95).
-		StringParam("path", "Path to file (relative to project root)", true).
-		IntParam("offset", "Starting line offset (0-based)", false).
-		IntParam("limit", "Max lines to return (default: 1000)", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params readFileParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			if strings.TrimSpace(params.Path) == "" {
-				return nil, fmt.Errorf("path is required")
-			}
-			fa := versioning.NewDiskFileAccess(l.config.WorkingDirectory, true)
-			result, err := versioning.ReadFileToolResult(ctx, fa, params.Path, params.Offset, params.Limit)
-			if err != nil {
-				return nil, err
-			}
-			return result, nil
-		}).
-		Build()
-}
+// Layered-read note: the bare `read_file`, `glob`, and `grep` skills used to
+// be defined in this file and registered for the librarian as disk-only
+// helpers, with workspace-aware variants alongside as the "in-flight overlay"
+// option. The dual surface failed in practice because LLMs picked the
+// shorter tool name regardless of the prompt's instructions, leading to
+// "file not found" reports for files that existed in the pipeline VFS
+// overlay. Every read now flows through `read_workspace_file` /
+// `workspace_glob` / `workspace_grep` (defined in core/versioning) which
+// require an explicit `view` parameter so the layer is captured at the
+// tool boundary. See agents/librarian/skills.go for registration.
 
 func resolvePath(root, path string) string {
 	if filepath.IsAbs(path) {
@@ -98,121 +71,11 @@ func clampLimit(limit int) int {
 	return limit
 }
 
-// ---------------------------------------------------------------------------
-// glob — gitignore-aware, gobwas/glob file discovery
-// ---------------------------------------------------------------------------
-
-type globParams struct {
-	Pattern string   `json:"pattern"`
-	Path    string   `json:"path,omitempty"`
-	Exclude []string `json:"exclude,omitempty"`
-}
-
-func globSkill(l *Librarian) *skills.Skill {
-	return skills.NewSkill("glob").
-		Description("Find files matching a glob pattern. Supports ** for recursive matching. Respects .gitignore rules.").
-		Domain("filesystem").
-		Keywords("glob", "find files", "pattern", "match", "list").
-		Priority(90).
-		StringParam("pattern", "Glob pattern (e.g. '**/*.go', 'agents/**/types.go')", true).
-		StringParam("path", "Base path (default: project root)", false).
-		ArrayParam("exclude", "Excluded glob patterns", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params globParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			if strings.TrimSpace(params.Pattern) == "" {
-				return nil, fmt.Errorf("pattern is required")
-			}
-			root := resolveRoot(l.config.WorkingDirectory, params.Path)
-			matches, err := codebase.GlobFiles(codebase.GlobConfig{
-				Root:            root,
-				Pattern:         params.Pattern,
-				ExcludePatterns: params.Exclude,
-			})
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{"pattern": params.Pattern, "matches": matches, "count": len(matches)}, nil
-		}).
-		Build()
-}
-
 func resolveRoot(workDir, path string) string {
 	if strings.TrimSpace(path) == "" {
 		return workDir
 	}
 	return resolvePath(workDir, path)
-}
-
-// ---------------------------------------------------------------------------
-// grep — parallel, gitignore-aware regex search with tree-sitter context
-// ---------------------------------------------------------------------------
-
-type grepParams struct {
-	Pattern         string `json:"pattern"`
-	Path            string `json:"path,omitempty"`
-	Include         string `json:"include,omitempty"`
-	MaxMatches      int    `json:"max_matches,omitempty"`
-	CaseInsensitive bool   `json:"case_insensitive,omitempty"`
-	WithSymbols     bool   `json:"with_symbols,omitempty"`
-}
-
-func grepSkill(l *Librarian) *skills.Skill {
-	return skills.NewSkill("grep").
-		Description("Parallel, gitignore-aware regex search across the codebase (pure-Go ripgrep equivalent). For finding symbol definitions/references, prefer find_symbol which uses tree-sitter structural analysis. Set with_symbols=true to annotate matches with their enclosing function/type via tree-sitter.").
-		Domain("filesystem").
-		Keywords("grep", "search", "regex", "find text", "ripgrep", "rg").
-		Priority(90).
-		StringParam("pattern", "Regular expression pattern", true).
-		StringParam("path", "Path to search (default: project root)", false).
-		StringParam("include", "Include filename glob pattern (e.g. '**/*.go')", false).
-		IntParam("max_matches", "Maximum number of matches (default: 200)", false).
-		BoolParam("case_insensitive", "Case-insensitive matching", false).
-		BoolParam("with_symbols", "Annotate matches with enclosing symbol name via tree-sitter", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params grepParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			if strings.TrimSpace(params.Pattern) == "" {
-				return nil, fmt.Errorf("pattern is required")
-			}
-
-			flags := ""
-			if params.CaseInsensitive {
-				flags = "(?i)"
-			}
-			regex, err := regexp.Compile(flags + params.Pattern)
-			if err != nil {
-				return nil, fmt.Errorf("invalid regex: %w", err)
-			}
-
-			var includes []string
-			if params.Include != "" {
-				includes = []string{params.Include}
-			}
-
-			matches, err := codebase.Search(ctx, codebase.SearchConfig{
-				Root:            resolveRoot(l.config.WorkingDirectory, params.Path),
-				Pattern:         regex,
-				IncludePatterns: includes,
-				MaxMatches:      params.MaxMatches,
-				WithSymbols:     params.WithSymbols,
-			})
-			if err != nil {
-				return nil, err
-			}
-
-			return map[string]any{
-				"pattern":   params.Pattern,
-				"matches":   matches,
-				"count":     len(matches),
-				"truncated": len(matches) >= params.MaxMatches && params.MaxMatches > 0,
-			}, nil
-		}).
-		Build()
 }
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -269,7 +271,19 @@ func publishPipelineUpdateMessage(bus guide.EventBus, sourceAgentID string, upda
 		Payload:       update,
 		Timestamp:     time.Now().UTC(),
 	}
-	_ = bus.Publish("pipeline.update."+update.AgentType, msg)
+	if err := bus.Publish("pipeline.update."+update.AgentType, msg); err != nil {
+		// Pipeline update drives UI panel state for the agent's pipeline
+		// tab. Missing updates leave the UI stuck on stale status. Log
+		// unconditionally for observability — this helper has no ctx to
+		// attribute to a single correlation.
+		slog.Warn("pipeline_update_message_publish_failed",
+			"source_agent_id", sourceAgentID,
+			"agent_type", update.AgentType,
+			"node_id", update.NodeID,
+			"status", update.Status,
+			"error", err.Error(),
+		)
+	}
 }
 
 func (o *Orchestrator) recordDispatchActivity(dagID, nodeID string) {
@@ -301,6 +315,19 @@ func pipelineTaskStateForUpdate(status, stage string) taskstate.Status {
 	}
 }
 
+// finalizePipelineUpdate observes a terminal pipeline update broadcast.
+//
+// Authority discipline (post-refactor): the orchestrator NO LONGER mutates
+// pipeline VFS state from this handler. The pipeline inspector's
+// handoff_to_ot and discard_pipeline skills perform the SessionVFS
+// extract/rollback themselves via PipelineCommitter so the agent that
+// actually decided the lifecycle transition is the one performing it.
+// This handler is now purely observational: it routes the inspector's
+// post-handoff_to_ot work into the global review followup and clears
+// coordination claims. Per-agent intermediate "succeeded" / "failed"
+// updates from engineer/designer/tester used to commit or rollback the
+// pipeline VFS here, which destroyed it while the inspector still had
+// follow-up work queued — that path is now removed.
 func (o *Orchestrator) finalizePipelineUpdate(update *PipelineUpdate) bool {
 	if update == nil || strings.TrimSpace(update.TaskID) == "" || !isPipelineCommitAgent(update.AgentType) {
 		return false
@@ -311,50 +338,92 @@ func (o *Orchestrator) finalizePipelineUpdate(update *PipelineUpdate) bool {
 		return false
 	}
 
-	var (
-		checkpointVersion   versioning.SemanticVersion
-		hadDraft            bool
-		reviewCandidateID   string
-		deferNodeCompletion bool
-	)
+	deferNodeCompletion := false
 
-	switch update.Status {
-	case "succeeded":
-		var err error
-		if strings.TrimSpace(update.AgentType) == agentshared.PipelineAgentInspector {
-			checkpointVersion, reviewCandidateID, hadDraft, err = o.extractTaskReviewCandidate(context.Background(), task)
-			if err == nil {
-				err = o.publishOTGlobalFollowupRequest(context.Background(), task, update, checkpointVersion, hadDraft, reviewCandidateID)
-			}
-			if err == nil {
-				deferNodeCompletion = true
-				o.recordPendingCheckpointReview(task, update, convertPipelineToNodeResult(update))
-			}
-		} else {
-			checkpointVersion, hadDraft, err = o.commitTaskDraft(context.Background(), task)
-			if err == nil && hadDraft {
-				o.publishTaskDraftMergeSuccess(task, checkpointVersion)
-			}
+	if update.Status == "succeeded" && strings.TrimSpace(update.AgentType) == agentshared.PipelineAgentInspector {
+		// The inspector already extracted the review candidate inside
+		// handoff_to_ot. Read the candidate id and version it published
+		// in the update output and route the global review followup.
+		// Guard against the typed-nil-interface trap by passing nil when
+		// the session lookup returns a nil pointer.
+		var checkpointReader SessionVFSCheckpointReader
+		if svfs := o.GetSessionVFS(task.SessionID); svfs != nil {
+			checkpointReader = svfs
 		}
+		checkpointVersion, reviewCandidateID, hadDraft := readInspectorHandoffOutcome(update, checkpointReader)
+		err := o.publishOTGlobalFollowupRequest(context.Background(), task, update, checkpointVersion, hadDraft, reviewCandidateID)
 		if err != nil {
-			if strings.TrimSpace(update.AgentType) == agentshared.PipelineAgentInspector && reviewCandidateID != "" {
+			if reviewCandidateID != "" {
 				if svfs := o.GetSessionVFS(task.SessionID); svfs != nil {
 					svfs.DiscardReviewCandidate(reviewCandidateID)
 				}
 			}
 			update.Status = "failed"
 			update.Error = err.Error()
-			update.Message = firstNonEmpty(update.Message, "draft merge failed")
+			update.Message = firstNonEmpty(update.Message, "global followup publish failed")
 			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", taskstate.StatusFailed, update.AgentType)
+		} else {
+			deferNodeCompletion = true
+			o.recordPendingCheckpointReview(task, update, convertPipelineToNodeResult(update))
 		}
-	case "failed", "timed_out", "cancelled":
-		_ = o.rollbackTaskDraft(task)
 	}
 
 	if o.coordination != nil {
 		_ = o.coordination.ReleaseTaskClaims(context.Background(), update.TaskID)
 	}
 	return deferNodeCompletion
+}
+
+// readInspectorHandoffOutcome extracts the review-candidate id, draft flag,
+// and checkpoint version that the inspector's handoff_to_ot skill published
+// in its update output. Falls back to the session's current version when
+// the output is absent (legacy publishers, test fixtures).
+func readInspectorHandoffOutcome(update *PipelineUpdate, svfs SessionVFSCheckpointReader) (versioning.SemanticVersion, string, bool) {
+	output, _ := update.Output.(map[string]any)
+	candidateID, _ := output["review_candidate_id"].(string)
+	hadDraft, _ := output["had_draft"].(bool)
+	versionStr, _ := output["checkpoint_version"].(string)
+
+	var version versioning.SemanticVersion
+	if versionStr != "" {
+		if parsed, ok := parseSemanticVersionString(versionStr); ok {
+			version = parsed
+		}
+	}
+	if (version == versioning.SemanticVersion{}) && svfs != nil {
+		version = svfs.CurrentVersion()
+	}
+	return version, strings.TrimSpace(candidateID), hadDraft
+}
+
+// parseSemanticVersionString parses the "Major.Minor" format produced by
+// SemanticVersion.String. Returns ok=false when the input is malformed; the
+// caller falls back to the session's current version in that case.
+func parseSemanticVersionString(s string) (versioning.SemanticVersion, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return versioning.SemanticVersion{}, false
+	}
+	dot := strings.IndexByte(s, '.')
+	if dot < 0 {
+		return versioning.SemanticVersion{}, false
+	}
+	major, err := strconv.ParseUint(s[:dot], 10, 32)
+	if err != nil {
+		return versioning.SemanticVersion{}, false
+	}
+	minor, err := strconv.ParseUint(s[dot+1:], 10, 32)
+	if err != nil {
+		return versioning.SemanticVersion{}, false
+	}
+	return versioning.SemanticVersion{Major: uint32(major), Minor: uint32(minor)}, true
+}
+
+// SessionVFSCheckpointReader is the structural subset of *versioning.SessionVFS
+// used by readInspectorHandoffOutcome. Defined here so test fixtures can stub
+// it without constructing a full session.
+type SessionVFSCheckpointReader interface {
+	CurrentVersion() versioning.SemanticVersion
 }
 
 func isPipelineCommitAgent(agentType string) bool {

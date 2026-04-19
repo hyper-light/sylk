@@ -338,6 +338,14 @@ func (g *Guardian) getProvider() guardianProvider {
 	return g.provider
 }
 
+// Ready implements shared.ReadinessReporter.
+func (g *Guardian) Ready() (bool, string) {
+	if g.getProvider() == nil {
+		return false, "LLM provider not yet wired (post-init / pre-auth window)"
+	}
+	return true, ""
+}
+
 // ---------------------------------------------------------------------------
 // AuthRefreshable
 // ---------------------------------------------------------------------------

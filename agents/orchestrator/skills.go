@@ -49,6 +49,11 @@ func (o *Orchestrator) registerCoreSkills() {
 	o.skills.Register(analyzePlanSkill(o))
 	for _, skill := range shared.NewGlobalReviewProtocolSkills(shared.GlobalReviewProtocolSkillConfig{
 		AgentType: func() string { return "orchestrator" },
+		// AgentID is required for validate_work to identify the responder
+		// when answering an inspector challenge. Without it, the orchestrator
+		// cannot satisfy the global-review protocol's challenge contract and
+		// the inspector hangs waiting for a validate_work that never comes.
+		AgentID: func() string { return o.config.AgentID },
 		Route: shared.GlobalReviewRouteConfig{
 			BusProvider: func() guide.EventBus { return o.bus },
 			SessionID:   func() string { return o.SessionID() },

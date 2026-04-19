@@ -3,6 +3,7 @@ package shared
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -142,7 +143,26 @@ func publishPipelineTaskUpdate(
 		Payload:       update,
 		Timestamp:     time.Now().UTC(),
 	}
-	_ = bus.Publish("pipeline.update."+agentType, msg)
+	if err := bus.Publish("pipeline.update."+agentType, msg); err != nil {
+		// Pipeline updates drive UI panel state. A delivery failure means
+		// the UI misses a status transition. Log unconditionally so the gap
+		// is observable even though this function has no ctx/agent identity
+		// to attribute the log more precisely.
+		pipelineUpdatePublishErrorLogger(sourceAgentID, agentType, status, err)
+	}
+}
+
+// pipelineUpdatePublishErrorLogger is overridable for tests; the default
+// implementation writes to the standard slog.
+var pipelineUpdatePublishErrorLogger = defaultPipelineUpdatePublishErrorLogger
+
+func defaultPipelineUpdatePublishErrorLogger(sourceAgentID, agentType, status string, err error) {
+	slog.Warn("pipeline_update_publish_failed",
+		"source_agent_id", sourceAgentID,
+		"agent_type", agentType,
+		"status", status,
+		"error", err.Error(),
+	)
 }
 
 func pipelineTaskStage(task *PipelineTaskInput) string {

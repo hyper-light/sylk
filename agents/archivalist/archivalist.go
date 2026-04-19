@@ -453,12 +453,24 @@ func (a *Archivalist) initRAG(cfg Config) error {
 	}
 	a.retriever = retriever
 
-	// Create synthesizer with provider-based LLM
+	// Create synthesizer and client with provider/model LOOKUPS, not
+	// snapshots. At init time a.provider may be nil — auth/credential
+	// wiring happens after agent construction. Both components read the
+	// live fields on every call so SetProvider / SwapModel are observed
+	// without any re-binding needed. See agents/archivalist/synthesis.go
+	// and agents/archivalist/client.go for why snapshots here are
+	// structurally wrong.
 	a.synthesizer = NewSynthesizer(SynthesizerConfig{
-		Provider:   a.provider,
-		Model:      cfg.Model,
-		Retriever:  a.retriever,
-		QueryCache: a.queryCache,
+		ProviderLookup: a.lookupProvider,
+		Model:          cfg.Model,
+		Retriever:      a.retriever,
+		QueryCache:     a.queryCache,
+	})
+	a.client = NewClient(ClientConfig{
+		ProviderLookup:  a.lookupProvider,
+		ModelLookup:     a.lookupModel,
+		SystemPrompt:    cfg.SystemPrompt,
+		MaxOutputTokens: cfg.MaxOutputTokens,
 	})
 
 	// Create tool handler
@@ -689,6 +701,19 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
+	}
+
+	// Readiness gate. Refuse the request at the routing boundary when
+	// the agent has no live LLM provider, instead of letting it reach the
+	// deepest tool layer and surface "synthesis: no LLM provider
+	// configured" — the historical impossible-state symptom. The error is
+	// wrapped in shared.ErrAgentNotReady so retry-after-readiness
+	// semantics propagate; the caller can re-dispatch once the agent is
+	// ready (typically post-auth).
+	if ready, reason := a.Ready(); !ready {
+		errMsg := fmt.Sprintf("archivalist: %v: %s", shared.ErrAgentNotReady, reason)
+		respMsg := guide.NewErrorMessage(generateMessageID(), fwd.CorrelationID, a.id, errMsg)
+		return a.bus.Publish(a.channels.Errors, respMsg)
 	}
 
 	a.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
@@ -3205,16 +3230,55 @@ func (a *Archivalist) SetCanonicalID(id string) {
 }
 
 // SetProvider sets or replaces the LLM provider at runtime. Thread-safe.
+//
+// Components that depend on the provider (synthesizer, anything else added
+// later) MUST consume it via lookupProvider rather than capturing the
+// argument here. The synthesizer historically captured the provider as a
+// value at construction and produced "synthesis: no LLM provider
+// configured" errors after this method ran because its snapshot was nil
+// while a.provider was live. See lookupProvider for the discipline.
 func (a *Archivalist) SetProvider(p archivalistProvider) {
 	a.runMu.Lock()
 	defer a.runMu.Unlock()
 	a.provider = p
-	a.client = NewClient(ClientConfig{
-		Provider:        p,
-		Model:           a.config.Model,
-		SystemPrompt:    a.config.SystemPrompt,
-		MaxOutputTokens: a.config.MaxOutputTokens,
-	})
+	// No client/synthesizer rebuild required: both consume the live
+	// provider via lookupProvider on every call. See client.go and
+	// synthesis.go for why the snapshot pattern was removed.
+}
+
+// lookupProvider returns the live LLM provider, taking the read lock so
+// callers see the result of the most recent SetProvider / SwapModel. This
+// is the canonical accessor for any archivalist component that needs the
+// provider — never store the result, always re-call. See SetProvider for
+// why snapshotting is forbidden.
+func (a *Archivalist) lookupProvider() archivalistProvider {
+	a.runMu.RLock()
+	defer a.runMu.RUnlock()
+	return a.provider
+}
+
+// lookupModel returns the live model identifier, taking the read lock so
+// callers see the result of the most recent SwapModel. Counterpart to
+// lookupProvider for components that need both.
+func (a *Archivalist) lookupModel() string {
+	a.runMu.RLock()
+	defer a.runMu.RUnlock()
+	return a.config.Model
+}
+
+// Ready implements shared.ReadinessReporter. The archivalist serves
+// LLM-backed RAG (synthesizer) and summary generation (client); both
+// require a live provider. Returns false during the post-init / pre-auth
+// window so the dispatcher refuses routing rather than letting the call
+// reach the deepest tool layer with a confusing error. See
+// agents/shared/readiness.go.
+func (a *Archivalist) Ready() (bool, string) {
+	a.runMu.RLock()
+	defer a.runMu.RUnlock()
+	if a.provider == nil {
+		return false, "LLM provider not yet wired (post-init / pre-auth window)"
+	}
+	return true, ""
 }
 
 // SetKnowledgeStore wires the archivalist to use the KnowledgeStore's
@@ -3246,17 +3310,16 @@ func (a *Archivalist) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
 }
 
 // SwapModel implements container.ModelSwappable.
+//
+// No client/synthesizer rebuild required: both consume the live provider
+// AND model via the lookup functions on every call (lookupProvider /
+// lookupModel). See client.go and synthesis.go for why the snapshot
+// pattern was removed.
 func (a *Archivalist) SwapModel(_ context.Context, modelID string, provider providers.ProviderAdapter) error {
 	a.runMu.Lock()
 	defer a.runMu.Unlock()
 	a.provider = provider
 	a.config.Model = modelID
-	a.client = NewClient(ClientConfig{
-		Provider:        provider,
-		Model:           modelID,
-		SystemPrompt:    a.config.SystemPrompt,
-		MaxOutputTokens: a.config.MaxOutputTokens,
-	})
 	return nil
 }
 

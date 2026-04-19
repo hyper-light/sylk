@@ -186,7 +186,7 @@ func (a *Academic) executeToolLoop(
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: "no LLM provider configured"})
 		}
-		return "", fmt.Errorf("academic: no LLM provider configured")
+		return "", fmt.Errorf("academic: %w: LLM provider not yet wired", shared.ErrAgentNotReady)
 	}
 	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 		shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationStarted,

@@ -22,6 +22,7 @@ import (
 func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
 	seen := make(map[agentshared.ToolCallSignature]int, gt.config.MaxToolRuns)
 	consecutiveErrors := 0
+	reportShapeGraceTurns := 0
 
 	provider := gt.getProvider()
 	if provider == nil {
@@ -30,10 +31,10 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: "no LLM provider configured"})
 		}
-		return "", fmt.Errorf("global tester: no LLM provider configured")
+		return "", fmt.Errorf("global tester: %w: LLM provider not yet wired", agentshared.ErrAgentNotReady)
 	}
 
-	for turn := 0; turn <= gt.config.MaxToolRuns; turn++ {
+	for turn := 0; turn <= gt.config.MaxToolRuns+reportShapeGraceTurns; turn++ {
 		if gt.toolDefsDirty {
 			req.Tools = gt.buildToolDefinitions()
 			gt.toolDefsDirty = false
@@ -106,6 +107,30 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 					Content: err.Error() +
 						"\nUse the global review protocol now. End ordinary top-level turns with handoff_next and active challenge turns with validate_work instead of ending narratively.",
 				})
+				continue
+			}
+			// Enforce the tester report shape contract on the terminal text.
+			// Same mechanism as the pipeline tester: re-prompt up to a bounded
+			// grace budget if the model emits unstructured prose, then accept
+			// the model's output rather than holding the user's turn hostage.
+			if err := agentshared.ValidateAgentReportShape(resp.Content, agentshared.TesterTurnReportShapeProfile); err != nil {
+				if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+					agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+						&agentlog.ErrorPayload{Error: fmt.Sprintf("report_shape_invalid: %v", err)})
+				}
+				gt.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: err.Error() +
+						"\nRe-emit your terminal response strictly using the report format defined in the system prompt: start with a `## Tester Turn Report` heading, then include the required sections (`### Summary`, `### Findings`, `### Next`) using bullet/numbered lists and code spans for paths. Do not write narrative prose paragraphs.",
+				})
+				reportShapeGraceTurns = agentshared.ExtendReportShapeGrace(reportShapeGraceTurns)
 				continue
 			}
 			gt.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)

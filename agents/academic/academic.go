@@ -386,6 +386,14 @@ func (a *Academic) getProvider() academicProvider {
 	return a.provider
 }
 
+// Ready implements shared.ReadinessReporter.
+func (a *Academic) Ready() (bool, string) {
+	if a.getProvider() == nil {
+		return false, "LLM provider not yet wired (post-init / pre-auth window)"
+	}
+	return true, ""
+}
+
 // SetProviderRefresher stores a callback that creates a fresh provider for
 // the current model and auth method. Set by cmd/tui.go at bootstrap.
 func (a *Academic) SetProviderRefresher(fn container.ProviderRefresher) {
@@ -1637,21 +1645,20 @@ func (a *Academic) requestConsultSync(ctx context.Context, req *guide.RouteReque
 	waitCtx, release := shared.WithoutDeadlineCancellation(ctx)
 	defer release()
 
-	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, req.TargetAgentID, req.Input, req.Metadata)
-	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
+	req.Metadata = shared.InheritedBranchMetadata(waitCtx, req.Metadata)
 	if req.ParentCorrelationID == "" {
-		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+		if stream, ok := shared.StreamMetadataFromContext(waitCtx); ok {
 			req.ParentCorrelationID = stream.CorrelationID
 		}
 	}
-	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
+	req.Metadata = shared.RouteMetadataWithInterAgentBranch(waitCtx, req.Metadata)
 	if req.TargetAgentID != "" {
 		req.ExplicitTarget = true
 	}
 	if req.Hops == 0 {
-		req.Hops = routeHopsFromContext(branchCtx)
+		req.Hops = routeHopsFromContext(waitCtx)
 	}
-	response, err := shared.RetryBusyRouteRequest(branchCtx, req.TargetAgentID, shared.DefaultBusyRetryPolicy(req.TargetAgentID), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+	response, err := shared.RetryBusyRouteRequest(waitCtx, req.TargetAgentID, shared.DefaultBusyRetryPolicy(req.TargetAgentID), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
 		req.CorrelationID = "corr_" + uuid.NewString()
 		wait := a.registerPendingConsult(req.CorrelationID)
 		defer a.clearPendingConsult(req.CorrelationID)
@@ -1675,10 +1682,8 @@ func (a *Academic) requestConsultSync(ctx context.Context, req *guide.RouteReque
 		return response, nil
 	})
 	if err != nil {
-		branch.Complete(branchCtx, "", "", err)
 		return nil, err
 	}
-	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }
 
@@ -1704,7 +1709,7 @@ func (a *Academic) requestConsultation(
 	if !admission.Allowed {
 		return failedConsultEvidence(target, query, scope, "", shared.ConsultationAdmissionError(admission)), nil
 	}
-	branchCtx, branch := shared.BeginInterAgentBranch(ctx, shared.InterAgentBranchSpec{
+	spec := shared.InterAgentBranchSpec{
 		Kind:       shared.InterAgentToolEventKindConsult,
 		ToolName:   "consult_" + strings.ReplaceAll(strings.TrimSpace(target), "-", "_"),
 		AgentTypes: []string{target},
@@ -1714,11 +1719,13 @@ func (a *Academic) requestConsultation(
 			"query":  query,
 			"scope":  scope,
 		},
+	}
+	response, err := shared.WithInterAgentBranchMessage(ctx, spec, func(branchCtx context.Context, branch shared.InterAgentBranchHandle) (*guide.Message, error) {
+		req.Metadata = branch.ApplyMetadata(branchCtx, admission.Metadata)
+		resp, err := a.requestConsultSync(branchCtx, req)
+		shared.RecordConsultationOutcome(branchCtx, admission.AttemptID, err == nil, shared.ConsultationDataFromMessage(resp), err)
+		return resp, err
 	})
-	req.Metadata = branch.ApplyMetadata(branchCtx, admission.Metadata)
-	response, err := a.requestConsultSync(branchCtx, req)
-	shared.RecordConsultationOutcome(branchCtx, admission.AttemptID, err == nil, shared.ConsultationDataFromMessage(response), err)
-	branch.CompleteFromMessage(branchCtx, response, err)
 	if err != nil {
 		if shared.IsAgentBusyError(err) {
 			return failedConsultEvidence(target, query, scope, req.CorrelationID, err), shared.ConsultationBusyDelegatedError(target, err)

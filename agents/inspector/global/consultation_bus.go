@@ -90,8 +90,7 @@ func (gi *GlobalInspector) requestRouteSync(
 	if err != nil {
 		return nil, err
 	}
-	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(routeCtx, target, encoded, metadata)
-	metadata = branch.ApplyMetadata(branchCtx, metadata)
+	metadata = shared.InheritedBranchMetadata(routeCtx, metadata)
 	sessionID := strings.TrimSpace(versioning.SessionIDFromContext(routeCtx))
 	if sessionID == "" {
 		sessionID = strings.TrimSpace(gi.config.SessionID)
@@ -106,12 +105,12 @@ func (gi *GlobalInspector) requestRouteSync(
 		Metadata:        metadata,
 	}
 	if req.ParentCorrelationID == "" {
-		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+		if stream, ok := shared.StreamMetadataFromContext(routeCtx); ok {
 			req.ParentCorrelationID = stream.CorrelationID
 		}
 	}
-	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
-	response, err := shared.RetryBusyRouteRequest(branchCtx, target, shared.DefaultBusyRetryPolicy(target), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+	req.Metadata = shared.RouteMetadataWithInterAgentBranch(routeCtx, req.Metadata)
+	response, err := shared.RetryBusyRouteRequest(routeCtx, target, shared.DefaultBusyRetryPolicy(target), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
 		req.CorrelationID = fmt.Sprintf("gi_corr_%s", uuid.New().String()[:8])
 		req.Timestamp = time.Now().UTC()
 		wait := gi.registerPendingWait(req.CorrelationID)
@@ -134,10 +133,8 @@ func (gi *GlobalInspector) requestRouteSync(
 		return response, nil
 	})
 	if err != nil {
-		branch.Complete(branchCtx, "", "", err)
 		return nil, err
 	}
-	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }
 

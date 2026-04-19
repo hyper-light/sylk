@@ -13,6 +13,7 @@ import (
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester"
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/ci/zeroleak"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/purevfs"
 	coretest "github.com/adalundhe/sylk/core/test"
@@ -274,11 +275,12 @@ func TestPipelineTesterCreateTestsDeterministically_EmitsWriteToolCalls(t *testi
 	pt, baseCtx, _ := newGoPipelineTesterWithVFS(t)
 
 	var toolNames []string
-	ctx := agentshared.WithToolCallEmitter(baseCtx, func(event agentshared.ToolCallEvent) {
+	ctx := agentshared.WithToolCallEmitter(baseCtx, func(event agentshared.ToolCallEvent) error {
 		if event.Phase != agentshared.ToolCallStart {
-			return
+			return nil
 		}
 		toolNames = append(toolNames, event.ToolName)
+		return nil
 	})
 
 	req := &tester.TesterRequest{
@@ -342,24 +344,39 @@ func TestParseTestToolInstallPlan_ExtractsFencedJSON(t *testing.T) {
 	}
 }
 
+// TestInstallTestTooling_ExecutesApprovedSteps verifies the install plan is
+// routed through the broker and no host-disk side effects appear. The test
+// stubs the broker so no real execution happens, then asserts (1) the broker
+// captured every approved step + validation, (2) the zero-leak harness
+// confirms nothing wrote to the workspace during the install.
 func TestInstallTestTooling_ExecutesApprovedSteps(t *testing.T) {
 	pt, baseCtx, fa := newGoPipelineTesterWithVFS(t)
 	ctx := commandapproval.WithGate(baseCtx, allowAllCommandGate{})
-	markerPath := filepath.Join(fa.WorkingDir(), ".install-marker")
+	zeroleak.Guard(t, fa.WorkingDir())
+
+	var captured []purevfs.BrokerRunRequest
+	pt.SetExecutionBroker(stubExecutionBroker{
+		caps: purevfs.ExecutionCapabilities{ProcessBroker: true, InMemoryScratch: true},
+		run: func(_ context.Context, req purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error) {
+			captured = append(captured, req)
+			return &purevfs.BrokerRunResult{ExitCode: 0}, nil
+		},
+	})
 
 	result, err := pt.installTestTooling(ctx, &testToolInstallPlan{
 		Summary:           "Install pytest for the Python test harness",
 		MissingTool:       "pytest",
-		ValidationCommand: "test -f .install-marker",
+		ValidationCommand: "pytest --version",
 		Steps: []testToolInstallStep{
-			{Command: "touch .install-marker", Reason: "create a disk marker so the install path can be validated"},
+			{Command: "python -m pip install pytest", Reason: "install pytest for the harness"},
 		},
 	})
 	if err != nil {
 		t.Fatalf("installTestTooling: %v", err)
 	}
-	if _, err := os.Stat(markerPath); err != nil {
-		t.Fatalf("install marker not persisted to disk at %s: %v", markerPath, err)
+
+	if got := len(captured); got != 2 {
+		t.Fatalf("broker invocations = %d, want 2 (install step + validation)", got)
 	}
 	if installed, _ := result["installed"].(bool); !installed {
 		t.Fatalf("result installed = %v, want true", result["installed"])

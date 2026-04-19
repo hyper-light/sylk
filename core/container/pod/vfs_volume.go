@@ -276,9 +276,21 @@ func (v *VFSVolume) rebindLocked(reason string) error {
 	v.pipelineVFS = pipelineVFS
 	v.generation++
 	if v.pipelineFA == nil {
+		// Defense-in-depth: if the pipeline VFS gets destroyed mid-work
+		// (race against a stray cleanup, or a regression of the
+		// orchestrator's old commit-on-broadcast behavior), the routing
+		// access auto-rebinds via the same BeginPipeline config used here
+		// instead of failing the write with ErrVFSNotFound. The inspector
+		// owns lifecycle commits under the new discipline, so this should
+		// never fire in normal operation.
 		v.pipelineFA = versioning.NewPipelineRoutingFileAccess(false, func() *versioning.SessionVFS {
 			return v.sessionVFS
-		}, v.pipelineID, v.workingDir)
+		}, v.pipelineID, v.workingDir).WithRebindConfig(versioning.BeginPipelineConfig{
+			PipelineID: v.pipelineID,
+			SessionID:  v.sessionID,
+			WorkingDir: v.workingDir,
+			Files:      append([]string(nil), v.files...),
+		})
 	}
 	if v.workspace == nil {
 		v.workspace = versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{

@@ -23,20 +23,31 @@ func TestApplyAuthorityProfilePrunesArchitectFilesystemTools(t *testing.T) {
 	}
 }
 
-// TestApplyAuthorityProfileKeepsLibrarianReadSurface pins the dual-read
-// design: librarian retains both disk-only read_file (committed source of
-// truth) and the workspace-aware read_workspace_file (in-flight global VFS
-// overlay). Previously read_workspace_file was pruned at the authority
-// filter, which forced the librarian to use bare read_file even when files
-// existed only in the global VFS, producing phantom "no such file" errors.
-func TestApplyAuthorityProfileKeepsLibrarianReadSurface(t *testing.T) {
+// TestApplyAuthorityProfileKeepsLibrarianLayeredReadSurface pins the
+// post-refactor invariant: the workspace-aware read tools survive the
+// authority filter for the librarian. The bare read_file / glob / grep
+// skills are no longer registered for the librarian (see
+// agents/librarian/skills.go), so this test asserts only that the
+// layer-explicit family is preserved by the filter — it does NOT include
+// the bare names because they should never appear in a librarian manifest
+// to begin with.
+func TestApplyAuthorityProfileKeepsLibrarianLayeredReadSurface(t *testing.T) {
 	manifest := ApplyAuthorityProfile("librarian", NewManifest("librarian", "librarian.default",
-		NewToolPolicy("read_file", EffectReadOnly, DomainFilesystem, ExecutionModeLocal),
 		NewToolPolicy("git", EffectReadOnly, DomainSystem, ExecutionModeLocal),
 		NewToolPolicy("read_workspace_file", EffectReadOnly, DomainFilesystem, ExecutionModeLocal),
 		NewToolPolicy("workspace_glob", EffectReadOnly, DomainFilesystem, ExecutionModeLocal),
+		NewToolPolicy("workspace_grep", EffectReadOnly, DomainFilesystem, ExecutionModeLocal),
+		NewToolPolicy("inspect_workspace_state", EffectReadOnly, DomainFilesystem, ExecutionModeLocal),
+		NewToolPolicy("summarize_workspace_state", EffectReadOnly, DomainFilesystem, ExecutionModeLocal),
 	))
-	for _, name := range []string{"read_file", "git", "read_workspace_file", "workspace_glob"} {
+	for _, name := range []string{
+		"git",
+		"read_workspace_file",
+		"workspace_glob",
+		"workspace_grep",
+		"inspect_workspace_state",
+		"summarize_workspace_state",
+	} {
 		if _, ok := manifest.Tools[name]; !ok {
 			t.Fatalf("%s should remain for librarian", name)
 		}

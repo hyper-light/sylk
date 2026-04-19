@@ -82,7 +82,11 @@ type Orchestrator struct {
 	bufferRegistry *BufferRegistry
 	dagBridge      *DAGBridge
 	coordination   *CoordinationService
-	scope          *concurrency.GoroutineScope
+	// decisionManifest tracks cross-pipeline typed decisions (test framework
+	// choice, build backend, etc.) so parallel pipelines can see each other's
+	// in-flight commitments before producing incompatible work.
+	decisionManifest *DecisionManifestStore
+	scope            *concurrency.GoroutineScope
 
 	// Pipeline subscriptions
 	pipelineSubs []guide.Subscription
@@ -321,6 +325,22 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 		o.submitCoordinationEventAsync(event)
 	})
 	o.coordination = coordSvc
+
+	// Decision Manifest store reuses the orchestrator's BunSQLite handle so
+	// it inherits the WAL + busy_timeout + writeMu policy. Migration runs
+	// idempotently (CREATE TABLE IF NOT EXISTS) so re-init is safe.
+	manifestStore, err := NewDecisionManifestStore(store.db)
+	if err != nil {
+		journal.Close()
+		store.Close()
+		return fmt.Errorf("orchestrator: open decision manifest: %w", err)
+	}
+	if err := manifestStore.Migrate(); err != nil {
+		journal.Close()
+		store.Close()
+		return fmt.Errorf("orchestrator: migrate decision manifest: %w", err)
+	}
+	o.decisionManifest = manifestStore
 
 	// DAG Bridge
 	o.dagBridge = NewDAGBridge(cfg.DAGConfig, DAGBridgeDeps{
@@ -669,6 +689,8 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 		o.reconcilePlanHandoffReceipts()
 		o.bufferRegistry.StartGC(context.Background())
 		o.startWALGC()
+		// Decision manifest uses a Ristretto TTL gate for Tentative
+		// expiry — no reaper goroutine needed; cache eviction handles it.
 	}
 
 	o.running = true
@@ -938,6 +960,9 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 			if handled, err := o.handleCoordinationAction(o.runCtx, action); handled {
 				return err
 			}
+			if handled, err := o.handleDecisionManifestAction(o.runCtx, action); handled {
+				return err
+			}
 			o.steering.HandleAction(action)
 		}
 		return nil
@@ -1049,6 +1074,19 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 		AgentID: o.config.AgentID, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
 
+	// Hydrate global review state when the incoming forwarded request carries
+	// global-review protocol metadata (e.g. an inspector challenge to the
+	// orchestrator). Without this, the orchestrator's tool loop cannot detect
+	// the pending challenge and ValidateGlobalReviewCompletion is a no-op,
+	// so the LLM exits with text and the inspector waits forever for a
+	// validate_work response that is never dispatched. Mirrors what
+	// inspector-global / global-tester / pipeline workers already do.
+	hadGlobalReviewState := shared.GlobalReviewStateFromContext(ctx) != nil
+	ctx = shared.WithGlobalReviewContext(ctx, fwd.Metadata)
+	if !hadGlobalReviewState {
+		defer shared.CloseGlobalReviewState(ctx)
+	}
+
 	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
 	if publishStreamLifecycle {
 		o.logInfo("handleBusRequest: publishing StreamStart",
@@ -1083,9 +1121,17 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 		}
 		// Publish to BOTH error and response channels. The response channel
 		// is what the Guide relays to the source agent's synchronous waiter;
-		// the error channel is for observability/logging subscribers.
+		// the error channel is for observability/logging subscribers. The
+		// response-channel failure is logged but not returned — the caller
+		// already has an error to surface — so the error-channel publish is
+		// the one whose outcome drives the return value.
 		respMsg := guide.NewResponseMessage(generateMessageID(), resp)
-		_ = o.bus.Publish(o.channels.Responses, respMsg)
+		if pubErr := o.bus.Publish(o.channels.Responses, respMsg); pubErr != nil {
+			o.logWarnMsg("orchestrator_forward_response_publish_failed",
+				"correlation_id", fwd.CorrelationID,
+				"underlying_error", err.Error(),
+				"publish_error", pubErr.Error())
+		}
 		errMsg := guide.NewErrorMessage(
 			generateMessageID(),
 			fwd.CorrelationID,
@@ -1359,12 +1405,11 @@ func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 	}
 	o.mu.Unlock()
 
-	mergeVersion, hadDraft, mergeErr := o.commitTaskDraft(context.Background(), task)
-	if mergeErr != nil {
-		o.publishTaskDraftMergeFailure(task, mergeErr)
-	} else if hadDraft {
-		o.publishTaskDraftMergeSuccess(task, mergeVersion)
-	}
+	// Authority discipline: the orchestrator does not commit task drafts.
+	// The pipeline inspector's handoff_to_ot already extracted the review
+	// candidate (or discard_pipeline rolled back) inside its skill handler.
+	// This handler is now strictly task-bookkeeping. See
+	// finalizePipelineUpdate for the rationale.
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -1373,35 +1418,6 @@ func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 		return nil
 	}
 	now := time.Now()
-	if mergeErr != nil {
-		task.Status = TaskStatusFailed
-		task.CompletedAt = &now
-		task.Error = mergeErr.Error()
-		o.state.Stats.FailedTasks++
-
-		o.healthMonitor.RecordTaskFailed(task.AssignedAgentID, taskID, mergeErr.Error())
-		o.updateWorkflowProgress(task.WorkflowID)
-
-		if o.dagBridge != nil {
-			if nodeID, hasNode := data["node_id"].(string); hasNode && nodeID != "" {
-				o.dagBridge.NotifyNodeComplete(nodeID, convertTaskFailedToNodeResult(task))
-			}
-		}
-
-		o.submitTaskEventAsync(task)
-		if o.coordination != nil {
-			_ = o.coordination.ReleaseTaskClaims(context.Background(), taskID)
-		}
-
-		o.pushEvent(&busEvent{
-			Topic:     "tasks.failed",
-			Timestamp: now,
-			Severity:  severityCritical,
-			Summary:   fmt.Sprintf("Task %q failed during draft merge on agent %s: %s", task.Name, task.AssignedAgentID, mergeErr.Error()),
-			Data:      map[string]any{"task_id": taskID, "agent_id": task.AssignedAgentID, "error": mergeErr.Error()},
-		})
-		return nil
-	}
 
 	task.Status = TaskStatusCompleted
 	task.CompletedAt = &now
@@ -2410,6 +2426,7 @@ func (o *Orchestrator) startWALGC() {
 		}
 	})
 }
+
 
 func extractPipelineUpdate(data map[string]any) *PipelineUpdate {
 	u := &PipelineUpdate{}

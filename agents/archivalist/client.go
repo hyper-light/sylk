@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -20,24 +21,52 @@ const (
 	ModelSonnet45 = "claude-sonnet-4-6"
 )
 
-// Client wraps a provider for summary generation
+// Client wraps a provider for summary generation.
+//
+// Both provider AND model are accessed via lookup functions rather than
+// stored values so the client always sees the live state on the
+// archivalist. The historical pattern (snapshot + manual rebuild in
+// SetProvider/SwapModel) works as long as every hot-swap call site
+// remembers to rebuild — but that's a footgun: every new sub-component
+// that takes a provider has to be remembered, and a stale model on the
+// next request after SwapModel goes silently to the wrong endpoint. The
+// lookup pattern makes both bug classes structurally impossible. See
+// agents/archivalist/synthesis.go for the same discipline applied to the
+// synthesizer.
 type Client struct {
-	provider        archivalistProvider
-	model           string
+	providerLookup  func() archivalistProvider
+	modelLookup     func() string
 	systemPrompt    string
 	maxOutputTokens int
 }
 
-// ClientConfig configures the AI client
+// ClientConfig configures the AI client.
 type ClientConfig struct {
-	Provider        archivalistProvider
-	Model           string
+	// ProviderLookup returns the live LLM provider from the owning agent.
+	// Resolved per call so a SetProvider / SwapModel on the agent is
+	// observed immediately without the client having to be re-bound.
+	// Required — see NewClient.
+	ProviderLookup func() archivalistProvider
+	// ModelLookup returns the live model identifier from the owning agent.
+	// Resolved per call so SwapModel takes effect on the next request
+	// without the client having to be re-bound. Required.
+	ModelLookup     func() string
 	SystemPrompt    string
 	MaxOutputTokens int
 }
 
-// NewClient creates a new AI client for summary generation
+// NewClient creates a new AI client for summary generation. Panics if
+// ProviderLookup or ModelLookup is nil — half-constructed clients that
+// pretend to be live but cannot generate are the worst possible failure
+// mode.
 func NewClient(cfg ClientConfig) *Client {
+	if cfg.ProviderLookup == nil {
+		panic("archivalist.NewClient: ProviderLookup is required (see client.go for rationale)")
+	}
+	if cfg.ModelLookup == nil {
+		panic("archivalist.NewClient: ModelLookup is required (see client.go for rationale)")
+	}
+
 	maxTokens := DefaultMaxOutputTokens
 	if cfg.MaxOutputTokens > 0 {
 		maxTokens = cfg.MaxOutputTokens
@@ -48,14 +77,9 @@ func NewClient(cfg ClientConfig) *Client {
 		systemPrompt = DefaultSystemPrompt
 	}
 
-	model := cfg.Model
-	if model == "" {
-		model = ModelSonnet45
-	}
-
 	return &Client{
-		provider:        cfg.Provider,
-		model:           model,
+		providerLookup:  cfg.ProviderLookup,
+		modelLookup:     cfg.ModelLookup,
 		systemPrompt:    systemPrompt,
 		maxOutputTokens: maxTokens,
 	}
@@ -94,19 +118,24 @@ func (c *Client) GenerateSummaryFromSubmissions(ctx context.Context, submissions
 
 // generate performs the actual LLM call via the provider
 func (c *Client) generate(ctx context.Context, prompt string, sourceIDs []string) (*GeneratedSummary, error) {
-	if c.provider == nil {
-		return nil, fmt.Errorf("client: no LLM provider configured")
+	provider := c.providerLookup()
+	if provider == nil {
+		return nil, fmt.Errorf("client: %w: LLM provider not yet wired", agentshared.ErrAgentNotReady)
+	}
+	model := c.modelLookup()
+	if strings.TrimSpace(model) == "" {
+		model = ModelSonnet45
 	}
 
 	req := &providers.Request{
 		SystemPrompt: c.systemPrompt,
-		Model:        c.model,
+		Model:        model,
 		MaxTokens:    c.maxOutputTokens,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: prompt}},
 	}
 	c.applyGenerationRuntimeProfile(req)
 
-	resp, err := c.provider.Complete(ctx, req)
+	resp, err := provider.Complete(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate summary: %w", err)
 	}

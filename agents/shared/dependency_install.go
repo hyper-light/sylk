@@ -53,7 +53,7 @@ func ResearchDependencyInstallPlan(ctx context.Context, req DependencyInstallRes
 		strings.TrimSpace(req.FrameworkID),
 		"dependency install plan",
 	)
-	branchCtx, branch := BeginInterAgentBranch(ctx, InterAgentBranchSpec{
+	spec := InterAgentBranchSpec{
 		Kind:       InterAgentToolEventKindConsult,
 		ToolName:   "consult_academic_dependency_install",
 		AgentTypes: []string{"academic"},
@@ -64,21 +64,22 @@ func ResearchDependencyInstallPlan(ctx context.Context, req DependencyInstallRes
 			"missing_tool": strings.TrimSpace(req.MissingTool),
 			"framework":    strings.TrimSpace(req.FrameworkID),
 		},
+	}
+	msg, err := WithInterAgentBranchMessage(ctx, spec, func(branchCtx context.Context, branch InterAgentBranchHandle) (*guide.Message, error) {
+		return RequestGuideRouteSync(branchCtx, GuideRouteSyncRequest{
+			Bus:           req.Bus,
+			ResponseTopic: req.ResponseTopic,
+			Request: &guide.RouteRequest{
+				Input:           prompt,
+				TargetAgentID:   "academic",
+				ExplicitTarget:  true,
+				SourceAgentID:   strings.TrimSpace(req.SourceAgentID),
+				SourceAgentName: strings.TrimSpace(req.SourceAgentName),
+				SessionID:       strings.TrimSpace(req.SessionID),
+				Metadata:        branch.ApplyMetadata(branchCtx, nil),
+			},
+		})
 	})
-	msg, err := RequestGuideRouteSync(branchCtx, GuideRouteSyncRequest{
-		Bus:           req.Bus,
-		ResponseTopic: req.ResponseTopic,
-		Request: &guide.RouteRequest{
-			Input:           prompt,
-			TargetAgentID:   "academic",
-			ExplicitTarget:  true,
-			SourceAgentID:   strings.TrimSpace(req.SourceAgentID),
-			SourceAgentName: strings.TrimSpace(req.SourceAgentName),
-			SessionID:       strings.TrimSpace(req.SessionID),
-			Metadata:        branch.ApplyMetadata(branchCtx, nil),
-		},
-	})
-	branch.CompleteFromMessage(branchCtx, msg, err)
 	if err != nil {
 		return nil, fmt.Errorf("research install steps via Academic: %w", err)
 	}

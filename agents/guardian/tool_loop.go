@@ -38,7 +38,7 @@ func (g *Guardian) executeToolLoop(
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: "no LLM provider configured"})
 		}
-		return "", nil, fmt.Errorf("guardian: no LLM provider configured")
+		return "", nil, fmt.Errorf("guardian: %w: LLM provider not yet wired", shared.ErrAgentNotReady)
 	}
 
 	g.logDebug("tool_loop: START",

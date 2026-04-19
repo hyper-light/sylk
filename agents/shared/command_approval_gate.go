@@ -37,7 +37,7 @@ func WithGuardianCommandGate(ctx context.Context, cfg GuardianCommandGateConfig)
 	return commandapproval.WithGate(ctx, NewGuardianCommandGate(cfg))
 }
 
-func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval.Request) (commandapproval.Evaluation, error) {
+func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval.Request) (eval commandapproval.Evaluation, err error) {
 	if g == nil || g.cfg.BusProvider == nil {
 		return commandapproval.Evaluation{}, fmt.Errorf("guardian command gate is not configured")
 	}
@@ -69,7 +69,7 @@ func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval
 	correlationID := "cmd_approval_" + uuid.NewString()
 	responseTopic := guide.TopicResponses(sourceAgentType, sourceAgentID)
 	waitCh := make(chan *guide.Message, 1)
-	sub, err := bus.SubscribeAsync(responseTopic, func(msg *guide.Message) error {
+	sub, subErr := bus.SubscribeAsync(responseTopic, func(msg *guide.Message) error {
 		if !isCommandApprovalTerminalMessage(msg, correlationID) {
 			return nil
 		}
@@ -79,14 +79,14 @@ func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval
 		}
 		return nil
 	})
-	if err != nil {
-		return commandapproval.Evaluation{}, fmt.Errorf("subscribe command approval response: %w", err)
+	if subErr != nil {
+		return commandapproval.Evaluation{}, fmt.Errorf("subscribe command approval response: %w", subErr)
 	}
 	defer sub.Unsubscribe()
 
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return commandapproval.Evaluation{}, fmt.Errorf("encode command approval request: %w", err)
+	payload, payloadErr := json.Marshal(req)
+	if payloadErr != nil {
+		return commandapproval.Evaluation{}, fmt.Errorf("encode command approval request: %w", payloadErr)
 	}
 	targetAgentID := "guardian"
 	if g.cfg.GuardianTargetAgentID != nil {
@@ -95,13 +95,33 @@ func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval
 		}
 	}
 	branchCtx, branch := beginGuardianApprovalBranch(ctx, targetAgentID, req)
-	if strings.TrimSpace(branch.branch.ParentCorrelationID) == "" {
-		branchCtx, branch = BeginAutoInterAgentRouteBranch(ctx, targetAgentID, payload, map[string]any{
-			"direct_skill": "command_execution_control",
-			"tool_name":    req.ToolName,
-			"summary":      req.Command,
-		})
-	}
+	// The branch is the canonical owner of the approval row's lifecycle. A
+	// deferred safety-net Complete guarantees the row is closed on every exit
+	// path (early error return, context cancel after the inline handler
+	// already closed it, panic propagating through the goroutine). The
+	// handle's atomic-once guard makes this idempotent with any earlier
+	// explicit Complete on the success path. We do NOT recover panics —
+	// invariant violations must surface to the goroutine boundary so they
+	// appear in logs.
+	//
+	// abnormalExit is a sentinel error initialized non-nil and cleared at the
+	// natural success point (right after the explicit CompleteFromMessage
+	// fires). When the deferred Complete runs from a normal error return,
+	// terminalErr or err is set and wins via firstNonNilError. When the
+	// deferred Complete runs during panic propagation (no error variables
+	// set, success point never reached), abnormalExit wins so the row is
+	// stamped as failed instead of misleadingly successful.
+	var terminalErr error
+	abnormalExit := fmt.Errorf("command approval gate unwound abnormally without returning (tool %q)", req.ToolName)
+	defer func() {
+		branch.Complete(branchCtx, "", "", firstNonNilError(terminalErr, err, abnormalExit))
+	}()
+
+	routeMetadata := InheritedBranchMetadata(branchCtx, map[string]any{
+		"direct_skill": "command_execution_control",
+		"tool_name":    req.ToolName,
+		"summary":      req.Command,
+	})
 	routeReq := &guide.RouteRequest{
 		CorrelationID: correlationID,
 		Input:         string(payload),
@@ -112,10 +132,7 @@ func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval
 		TargetAgentID: targetAgentID,
 		SessionID:     req.SessionID,
 		Timestamp:     time.Now(),
-		Metadata: branch.ApplyMetadata(branchCtx, map[string]any{
-			"direct_skill": "command_execution_control",
-			"tool_name":    req.ToolName,
-		}),
+		Metadata:      branch.ApplyMetadata(branchCtx, routeMetadata),
 	}
 	if routeReq.ParentCorrelationID == "" {
 		if stream, ok := StreamMetadataFromContext(branchCtx); ok {
@@ -124,9 +141,9 @@ func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval
 	}
 	routeReq.Metadata = RouteMetadataWithInterAgentBranch(branchCtx, routeReq.Metadata)
 	requestMsg := guide.NewRequestMessage("", routeReq).WithReplyTo(responseTopic)
-	if err := bus.Publish(guide.TopicGuideRequests, requestMsg); err != nil {
-		branch.Complete(branchCtx, "", "", err)
-		return commandapproval.Evaluation{}, fmt.Errorf("publish command approval request: %w", err)
+	if publishErr := bus.Publish(guide.TopicGuideRequests, requestMsg); publishErr != nil {
+		terminalErr = publishErr
+		return commandapproval.Evaluation{}, fmt.Errorf("publish command approval request: %w", publishErr)
 	}
 
 	publishGuardianApprovalKeepalive(branchCtx, req)
@@ -144,13 +161,32 @@ func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval
 		case <-ticker.C:
 			publishGuardianApprovalKeepalive(branchCtx, req)
 		case <-ctx.Done():
-			branch.Complete(branchCtx, "", "", ctx.Err())
+			terminalErr = ctx.Err()
 			return commandapproval.Evaluation{}, ctx.Err()
 		}
 	}
 	publishGuardianApprovalResolvedProgress(branchCtx, req)
 	branch.CompleteFromMessage(branchCtx, msg, nil)
+	// We reached the natural success point — Complete fired authoritatively
+	// via CompleteFromMessage. Clear the abnormal-exit sentinel so the
+	// deferred safety-net Complete (which is now a no-op via the atomic-once
+	// guard) does not also leak a misleading abnormal-exit error if anything
+	// downstream were to ever observe it.
+	abnormalExit = nil
 	return decodeCommandApprovalMessage(msg, req)
+}
+
+// firstNonNilError returns the first non-nil error from the list. Used to
+// resolve which error the deferred branch.Complete should reflect when the
+// function has multiple error sources (explicit return err, sentinel
+// abnormal-exit error, context cancellation).
+func firstNonNilError(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }
 
 func beginGuardianApprovalBranch(
@@ -159,12 +195,21 @@ func beginGuardianApprovalBranch(
 	req commandapproval.Request,
 ) (context.Context, InterAgentBranchHandle) {
 	summary := guardianApprovalBranchSummary(req)
+	// Stamp a stable ThreadKey on the approval branch so the TUI can
+	// consolidate the Start (emitted here) with the Complete (emitted later
+	// by CompleteFromMessage) even when they route through different scopes
+	// — and so any intermediate status update can target the same row by
+	// identity rather than creating a parallel one. The key is built from
+	// the approval correlation id in the upstream dispatcher; we fall back
+	// to a request-derived signature when that's unavailable so the branch
+	// always carries a non-empty identity.
 	return BeginInterAgentBranch(ctx, InterAgentBranchSpec{
 		Kind:          InterAgentToolEventKindApproval,
 		ToolName:      "approval_guardian",
 		AgentTypes:    []string{firstNonEmptyApprovalTarget(targetAgentID)},
 		Summary:       summary,
 		SuccessStatus: InterAgentToolEventStatusDone,
+		ThreadKey:     guardianApprovalThreadKey(req),
 		Args: map[string]any{
 			"target":    firstNonEmptyApprovalTarget(targetAgentID),
 			"tool_name": strings.TrimSpace(req.ToolName),
@@ -173,6 +218,27 @@ func beginGuardianApprovalBranch(
 			"summary":   summary,
 		},
 	})
+}
+
+// guardianApprovalThreadKey produces a deterministic thread identity for a
+// single approval lifecycle. The ToolCallKey already identifies Start/Complete
+// across the bus, but the UI's InterAgent matcher consults ThreadKey when an
+// origin-update arrives from a different scope or the Start/Complete drift
+// routing (e.g. guardian re-publishes a status mid-flight). A non-empty
+// ThreadKey makes consolidation identity-based rather than dependent on the
+// Start row surviving at the same list position until Complete arrives.
+func guardianApprovalThreadKey(req commandapproval.Request) string {
+	parts := []string{
+		strings.TrimSpace(req.SessionID),
+		strings.TrimSpace(req.AgentID),
+		strings.TrimSpace(req.ToolName),
+		strings.TrimSpace(req.Command),
+	}
+	base := strings.Join(parts, "|")
+	if strings.TrimSpace(base) == "" {
+		return ""
+	}
+	return "guardian_approval:" + base
 }
 
 func guardianApprovalBranchSummary(req commandapproval.Request) string {

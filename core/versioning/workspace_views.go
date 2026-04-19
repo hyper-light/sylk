@@ -333,6 +333,40 @@ func inspectWorkspacePath(
 	return status
 }
 
+// ProbeWriteSurface verifies that a write to the requested workspace view
+// will resolve to a live FileAccess. Returns ErrVFSNotFound when the view is
+// unavailable so prepare_*_write_context can surface the failure to the LLM
+// at prepare time. Disk view always succeeds (the disk fallback never
+// disappears mid-session). Global and pipeline views require a live
+// SessionVFS and (for pipeline) a tracked pipeline draft.
+func (s *SessionWorkspaceViews) ProbeWriteSurface(ctx context.Context, view WorkspaceView, pipelineID string) error {
+	switch view {
+	case WorkspaceViewDisk:
+		return nil
+	case WorkspaceViewGlobal:
+		svfs := s.resolveSession(ctx)
+		if svfs == nil {
+			return fmt.Errorf("workspace view %q unavailable: no active session VFS", view)
+		}
+		return nil
+	case WorkspaceViewPipeline:
+		svfs := s.resolveSession(ctx)
+		if svfs == nil {
+			return fmt.Errorf("workspace view %q unavailable: no active session VFS", view)
+		}
+		resolvedPipelineID := s.resolvePipelineID(pipelineID)
+		if resolvedPipelineID == "" {
+			return fmt.Errorf("workspace view %q requires pipeline_id", view)
+		}
+		if !svfs.HasPipeline(resolvedPipelineID) {
+			return fmt.Errorf("pipeline VFS %q not found in session: %w", resolvedPipelineID, ErrVFSNotFound)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported workspace view %q", view)
+	}
+}
+
 func (s *SessionWorkspaceViews) fileAccessFor(ctx context.Context, view WorkspaceView, pipelineID string) (FileAccess, error) {
 	switch view {
 	case WorkspaceViewDisk:

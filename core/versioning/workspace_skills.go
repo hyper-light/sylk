@@ -17,6 +17,32 @@ type WorkspaceViewAccessFunc func() WorkspaceViewAccess
 // DefaultPipelineIDFunc returns the current task pipeline ID when one exists.
 type DefaultPipelineIDFunc func() string
 
+// probeWorkspaceWriteSurface probes the FileAccess that a subsequent write
+// tool would resolve, surfacing ErrVFSNotFound to the LLM during prepare
+// rather than later at the actual write call. Without this, prepare passes
+// (it inspects via workspace views with disk fallback) and the write fails
+// with "VFS not found" — the historical "edit_pipeline_file failed: VFS
+// not found" symptom. nil viewsAccess is fine: the prepare's view-only
+// inspection still runs.
+func probeWorkspaceWriteSurface(ctx context.Context, views WorkspaceViewAccess, view WorkspaceView, pipelineID string) error {
+	if views == nil {
+		return nil
+	}
+	probe, ok := views.(workspaceWriteSurfaceProber)
+	if !ok {
+		return nil
+	}
+	return probe.ProbeWriteSurface(ctx, view, pipelineID)
+}
+
+// workspaceWriteSurfaceProber is the optional capability a WorkspaceViewAccess
+// implements to let prepare confirm the write surface before the LLM emits a
+// write tool call. SessionWorkspaceViews implements this; ad-hoc test stubs
+// can omit it.
+type workspaceWriteSurfaceProber interface {
+	ProbeWriteSurface(ctx context.Context, view WorkspaceView, pipelineID string) error
+}
+
 // NewReadWorkspaceFileSkill creates a view-aware read skill so agents can
 // compare disk, session-global, and task-local pipeline state explicitly.
 func NewReadWorkspaceFileSkill(getViews WorkspaceViewAccessFunc, defaultPipelineID DefaultPipelineIDFunc) *skills.Skill {

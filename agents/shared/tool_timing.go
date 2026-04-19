@@ -25,6 +25,14 @@ const (
 	ToolCallComplete ToolCallPhase = 1
 )
 
+// ErrMissingToolCallID reports an invariant violation: a tool-call construction
+// or emission site reached shared code without a non-empty lifecycle ID.
+// Provider adapters (see providers.EnsureToolCallID) are expected to stamp an
+// ID on every ToolCall they surface; sibling emission sites are expected to
+// carry that ID through. Returning this error rather than panicking lets
+// callers log with full agent/correlation context and keep the turn alive.
+var ErrMissingToolCallID = errors.New("tool call missing required lifecycle ID")
+
 // maxArgsSummaryLen is the maximum character length for a compact args summary.
 const maxArgsSummaryLen = 60
 
@@ -56,7 +64,11 @@ type ToolCallEvent struct {
 }
 
 // ToolCallEmitter is a callback that publishes a tool call event to the bus.
-type ToolCallEmitter func(ToolCallEvent)
+// Returns the underlying publish error so EmitToolCall can surface it up to
+// the agent's tool loop, which decides whether to abort the in-flight tool,
+// emit a system error to the user, or continue. Emitters that have no
+// destination (test stubs, no-op wirings) return nil.
+type ToolCallEmitter func(ToolCallEvent) error
 
 type toolCallEmitterKey struct{}
 type toolCallTrackerKey struct{}
@@ -80,26 +92,57 @@ type streamedToolCallState struct {
 	Announced bool
 }
 
+// ToolCallLifecycle is the single authoritative per-tool-call state record
+// inside a toolCallTracker. It replaces five earlier overlapping maps
+// (pending, preannounced, completed, inFlight, sessions) with one struct
+// per call.ID. All five lifecycle phases — streaming accumulation,
+// preannouncement, start/complete emission, completion flag, and in-flight
+// telemetry — update fields on the same record, which eliminates the
+// bookkeeping gaps that produced the "Start says emitted, map X says not"
+// races the prior shape accumulated.
+//
+// Read/write synchronization is owned by the parent tracker's mutex; the
+// lifecycle itself is a plain struct. The `session` handle exposes the
+// emission idempotency API (Start / Complete / CompleteAt) externally and
+// holds its own mutex for caller-facing concurrency.
+type ToolCallLifecycle struct {
+	// Streaming accumulation — populated by observeChunk as chunks arrive.
+	// nil when the lifecycle was acquired directly (non-streaming path).
+	stream *streamedToolCallState
+
+	// Emission session — lazily created when a caller acquires a session for
+	// this lifecycle. Once created, Start and Complete emissions route
+	// through it idempotently. nil while the lifecycle only has streaming
+	// state with no session yet.
+	session *ToolCallSession
+
+	// preannouncedAt records the timestamp a streaming preannounce captured
+	// before TimedToolCall took ownership. Zero when no preannounce has
+	// fired for this call. Consumed (cleared) by consumePreannounced when
+	// the tool loop picks the call up.
+	preannouncedAt time.Time
+
+	// completed is set when a terminal (Complete / failure) emission has
+	// fired for this lifecycle. Retained after session release so
+	// late-arriving duplicate-complete paths (notably CompleteProviderNativeToolCall)
+	// can short-circuit instead of re-emitting.
+	completed bool
+
+	// inFlight carries the telemetry snapshot populated at Start emission
+	// time and cleared at Complete. Used by snapshotInFlightToolCalls to
+	// emit the tool_call_in_flight_at_stream_terminal log entries. Zero
+	// value means the lifecycle has no outstanding Start emission.
+	inFlight inFlightToolCall
+}
+
 type toolCallTracker struct {
-	mu           sync.Mutex
-	pending      map[string]*streamedToolCallState
-	preannounced map[string]time.Time
-	completed    map[string]struct{}
-	// inFlight tracks tool calls keyed by ToolCallKey whose Start event has
-	// been emitted but whose Complete event has not. Populated by EmitToolCall
-	// after publish so we never assert in-flight on an event that failed to
-	// reach the bus. Drained at Complete. snapshotInFlightToolCalls() reads
-	// this for orphan-detection telemetry.
-	inFlight map[string]inFlightToolCall
-	// sessions is the canonical owner index for a tool call's emission
-	// lifecycle (see ToolCallSession). One session per call.ID. Multiple
-	// callers requesting a session for the same ID receive the same handle,
-	// which makes Start and Complete emissions idempotent across the
-	// preannounce/TimedToolCall/CompleteProviderNativeToolCall handoff. This
-	// is the structural fix for the "two emitters race and the UI sees
-	// duplicate rows or a missing Complete" failure mode that local patches
-	// could only address one collision at a time.
-	sessions map[string]*ToolCallSession
+	mu sync.Mutex
+	// lifecycles is the single map keyed by call.ID that holds every
+	// tool-call record the tracker knows about. All five former maps
+	// (pending, preannounced, completed, inFlight, sessions) were
+	// consolidated into fields on *ToolCallLifecycle so every update to a
+	// given call sees the same record atomically under t.mu.
+	lifecycles map[string]*ToolCallLifecycle
 }
 
 // inFlightToolCall is a snapshot of a tool call that has emitted Start but
@@ -113,23 +156,32 @@ type inFlightToolCall struct {
 
 func newToolCallTracker() *toolCallTracker {
 	return &toolCallTracker{
-		pending:      make(map[string]*streamedToolCallState),
-		preannounced: make(map[string]time.Time),
-		completed:    make(map[string]struct{}),
-		inFlight:     make(map[string]inFlightToolCall),
-		sessions:     make(map[string]*ToolCallSession),
+		lifecycles: make(map[string]*ToolCallLifecycle),
 	}
 }
 
-// recordInFlight registers a Start emission. Called from EmitToolCall after the
-// publish succeeds (or would succeed if a publisher exists), regardless of
-// whether the bus actually has subscribers.
+// ensureLifecycleLocked returns the lifecycle record for id, creating an
+// empty one if needed. Caller must hold t.mu.
+func (t *toolCallTracker) ensureLifecycleLocked(id string) *ToolCallLifecycle {
+	if lc, ok := t.lifecycles[id]; ok {
+		return lc
+	}
+	lc := &ToolCallLifecycle{}
+	t.lifecycles[id] = lc
+	return lc
+}
+
+// recordInFlight registers a Start emission on the lifecycle for
+// event.ToolCallKey. Called from EmitToolCall after the publish succeeds (or
+// would succeed if a publisher exists), regardless of whether the bus
+// actually has subscribers.
 func (t *toolCallTracker) recordInFlight(event ToolCallEvent) {
 	if t == nil || strings.TrimSpace(event.ToolCallKey) == "" {
 		return
 	}
 	t.mu.Lock()
-	t.inFlight[event.ToolCallKey] = inFlightToolCall{
+	lc := t.ensureLifecycleLocked(event.ToolCallKey)
+	lc.inFlight = inFlightToolCall{
 		ToolCallKey: event.ToolCallKey,
 		ToolName:    event.ToolName,
 		ArgsSummary: event.ArgsSummary,
@@ -138,14 +190,16 @@ func (t *toolCallTracker) recordInFlight(event ToolCallEvent) {
 	t.mu.Unlock()
 }
 
-// clearInFlight removes a Complete-paired entry. Called from EmitToolCall
-// after the Complete publish.
+// clearInFlight drops the in-flight telemetry on the matching lifecycle.
+// Called from EmitToolCall after the Complete publish.
 func (t *toolCallTracker) clearInFlight(event ToolCallEvent) {
 	if t == nil || strings.TrimSpace(event.ToolCallKey) == "" {
 		return
 	}
 	t.mu.Lock()
-	delete(t.inFlight, event.ToolCallKey)
+	if lc, ok := t.lifecycles[event.ToolCallKey]; ok {
+		lc.inFlight = inFlightToolCall{}
+	}
 	t.mu.Unlock()
 }
 
@@ -158,12 +212,15 @@ func (t *toolCallTracker) snapshotInFlightToolCalls() []inFlightToolCall {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if len(t.inFlight) == 0 {
-		return nil
+	out := make([]inFlightToolCall, 0, len(t.lifecycles))
+	for _, lc := range t.lifecycles {
+		if strings.TrimSpace(lc.inFlight.ToolCallKey) == "" {
+			continue
+		}
+		out = append(out, lc.inFlight)
 	}
-	out := make([]inFlightToolCall, 0, len(t.inFlight))
-	for _, call := range t.inFlight {
-		out = append(out, call)
+	if len(out) == 0 {
+		return nil
 	}
 	// Insertion sort by StartedAt — n is small (single-digit typical).
 	for i := 1; i < len(out); i++ {
@@ -227,18 +284,47 @@ func WithToolCallEmitter(ctx context.Context, emitter ToolCallEmitter) context.C
 }
 
 // WithActiveToolCall annotates ctx with the tool currently being executed.
+// If the call lacks a lifecycle ID (a producer defect), the annotation is
+// skipped and the violation is logged — later callers will simply see no
+// active tool call on ctx instead of a half-populated one.
 func WithActiveToolCall(ctx context.Context, call providers.ToolCall) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	fullArgs := PrettyPrintArgs(call.Arguments)
 	toolName := emittedToolCallNameForContext(ctx, call.Name, fullArgs, "")
+	key, err := toolCallEventKey(call)
+	if err != nil {
+		logMissingToolCallID(ctx, "with_active_tool_call", call.Name, err)
+		return ctx
+	}
 	return context.WithValue(ctx, activeToolCallContextKey{}, ActiveToolCallContext{
-		ToolCallKey: toolCallEventKey(call),
+		ToolCallKey: key,
 		ToolName:    toolName,
 		FullArgs:    fullArgs,
 		InterAgent:  DeriveInterAgentToolEvent(toolName, fullArgs, "", ToolCallStart, false, ""),
 	})
+}
+
+// logMissingToolCallID emits a warning event when a code path reaches a
+// lifecycle-ID-required boundary with an empty ID. Uses the logger attached
+// to ctx via LogMetaFromContext; if ctx carries no logger (tests, bare
+// contexts), the call is a silent no-op — by the time the turn runs live,
+// the agent always wires a logger through.
+func logMissingToolCallID(ctx context.Context, site, toolName string, err error) {
+	if ctx == nil {
+		return
+	}
+	lm := LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	LogWarning(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+		"tool_call_missing_id", map[string]any{
+			"site":      site,
+			"tool_name": toolName,
+			"error":     err.Error(),
+		})
 }
 
 // ActiveToolCallFromContext returns the tool currently executing on ctx.
@@ -255,13 +341,22 @@ func ActiveToolCallFromContext(ctx context.Context) (ActiveToolCallContext, bool
 
 // EmitToolCall invokes the emitter attached to ctx, if present.
 //
-// Every event must carry a non-empty ToolCallKey (the tool call's
-// lifecycle ID, stamped at the provider adapter boundary). Empty keys
-// would leave the UI unable to pair Start and Complete events, so they
-// are refused as a programming defect rather than silently tolerated.
-func EmitToolCall(ctx context.Context, event ToolCallEvent) {
+// Every event must carry a non-empty ToolCallKey (the tool call's lifecycle
+// ID, stamped at the provider adapter boundary). Empty keys would leave the
+// UI unable to pair Start and Complete events. Rather than crash the agent
+// on a producer defect, EmitToolCall returns ErrMissingToolCallID wrapped
+// with the tool name and phase; the caller is expected to log with full
+// agent/correlation context so the producer gap surfaces without silently
+// dropping the event.
+//
+// A nil return means the event was successfully handed to the emitter (or
+// there was no emitter on ctx, which is also valid for ad-hoc paths). Name
+// canonicalization that yields an empty name is likewise logged by
+// EmitToolCall and then dropped with a nil return — it is not a caller-
+// actionable failure, only a stream-metadata mismatch.
+func EmitToolCall(ctx context.Context, event ToolCallEvent) error {
 	if strings.TrimSpace(event.ToolCallKey) == "" {
-		panic(fmt.Sprintf("EmitToolCall: event missing required ToolCallKey (tool=%q phase=%d)", event.ToolName, event.Phase))
+		return fmt.Errorf("emit tool call: %w (tool=%q phase=%d)", ErrMissingToolCallID, event.ToolName, event.Phase)
 	}
 	if len(event.StreamMetadata) == 0 {
 		if stream, ok := StreamMetadataFromContext(ctx); ok && len(stream.Metadata) > 0 {
@@ -278,7 +373,7 @@ func EmitToolCall(ctx context.Context, event ToolCallEvent) {
 					"args_summary":  event.ArgsSummary,
 				})
 		}
-		return
+		return nil
 	}
 	event.InterAgent = NormalizeInterAgentToolEventForEmit(
 		event.ToolName,
@@ -292,17 +387,33 @@ func EmitToolCall(ctx context.Context, event ToolCallEvent) {
 	)
 	emitter, ok := ctx.Value(toolCallEmitterKey{}).(ToolCallEmitter)
 	if !ok || emitter == nil {
-		return
+		return nil
 	}
 	tracker := toolCallTrackerFromContext(ctx)
-	delivered := publishWithStreamLifecycle(ctx, guide.StreamEventToolCall, func() {
-		emitter(event)
-	})
-	// Track in-flight regardless of delivery: even if the emitter is gated
-	// (it currently isn't for tool-call events thanks to (A)), the orphan
-	// telemetry should reflect what the agent attempted, not just what made
-	// it to the bus. recordInFlight on Start, clearInFlight on Complete.
-	_ = delivered
+	var emitErr error
+	if err := publishWithStreamLifecycle(ctx, guide.StreamEventToolCall, func() error {
+		emitErr = emitter(event)
+		return emitErr
+	}); err != nil {
+		// Lifecycle wrapper already preserved emitErr; logging is the
+		// responsibility of the emitter's bus layer (it has no access to
+		// LogMeta from there). We log here too so the agent's loop sees a
+		// structured event no matter which layer dropped the publish.
+		if lm := LogMetaFromContext(ctx); lm.EventLogger != nil {
+			LogWarning(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+				"tool_call_event_emit_failed", map[string]any{
+					"tool_name":     event.ToolName,
+					"tool_call_key": event.ToolCallKey,
+					"phase":         int(event.Phase),
+					"error":         err.Error(),
+				})
+		}
+	}
+	// Track in-flight regardless of delivery: orphan telemetry reflects what
+	// the agent attempted, not just what made it to the bus. recordInFlight
+	// on Start, clearInFlight on Complete. The tracking is independent of
+	// publish success because a Start that failed to publish should still
+	// have its eventual Complete observed for symmetric accounting.
 	if tracker != nil {
 		switch event.Phase {
 		case ToolCallStart:
@@ -311,6 +422,7 @@ func EmitToolCall(ctx context.Context, event ToolCallEvent) {
 			tracker.clearInFlight(event)
 		}
 	}
+	return emitErr
 }
 
 func emittedToolCallNameForContext(ctx context.Context, toolName, fullArgs, output string) string {
@@ -357,9 +469,7 @@ func (t *toolCallTracker) reset() {
 		return
 	}
 	t.mu.Lock()
-	clear(t.pending)
-	clear(t.preannounced)
-	clear(t.completed)
+	clear(t.lifecycles)
 	t.mu.Unlock()
 }
 
@@ -369,7 +479,12 @@ func (t *toolCallTracker) observeChunk(ctx context.Context, chunk *providers.Str
 	}
 
 	t.mu.Lock()
-	state := t.ensurePendingLocked(chunk.ToolCall)
+	state, err := t.ensurePendingLocked(chunk.ToolCall)
+	if err != nil {
+		t.mu.Unlock()
+		logMissingToolCallID(ctx, "observe_chunk", chunk.ToolCall.Name, err)
+		return
+	}
 	if state == nil {
 		t.mu.Unlock()
 		return
@@ -406,9 +521,11 @@ func (t *toolCallTracker) observeChunk(ctx context.Context, chunk *providers.Str
 		state.StartedAt = startedAt
 	}
 	if wantWebSearchComplete {
-		delete(t.preannounced, startCall.ID)
-		delete(t.pending, startCall.ID)
-		t.completed[startCall.ID] = struct{}{}
+		if lc, ok := t.lifecycles[startCall.ID]; ok {
+			lc.stream = nil
+			lc.preannouncedAt = time.Time{}
+			lc.completed = true
+		}
 	}
 	t.mu.Unlock()
 
@@ -470,12 +587,16 @@ func (t *toolCallTracker) preannounceToolCallStart(
 		state.StartedAt = startedAt
 	}
 	state.Announced = true
-	t.preannounced[call.ID] = startedAt
+	t.mu.Lock()
+	if lc := t.ensureLifecycleLocked(call.ID); lc != nil {
+		lc.preannouncedAt = startedAt
+	}
+	t.mu.Unlock()
 
 	// Acquire the session and emit Start through it so the
 	// preannounce/TimedToolCall handoff cannot duplicate the Start
-	// emission. acquireToolCallSession registers in t.sessions; Start is
-	// idempotent on subsequent calls.
+	// emission. acquireToolCallSession registers the session on the
+	// lifecycle; Start is idempotent on subsequent calls.
 	session := acquireToolCallSession(ctx, "", call)
 	session.Start(call, startedAt, interAgent)
 	return true
@@ -490,19 +611,22 @@ func genericInterAgentToolRequiresResolvedArgs(toolName string) bool {
 	}
 }
 
-func (t *toolCallTracker) ensurePendingLocked(chunk *providers.ToolCallChunk) *streamedToolCallState {
+// ensurePendingLocked returns the streaming state for chunk.ID on its
+// lifecycle, creating the lifecycle (and its stream state) if needed.
+// Returns (nil, error) when the chunk is missing the required lifecycle
+// ID — the caller (observeChunk) logs with ctx metadata and drops the chunk
+// so the turn stays alive.
+func (t *toolCallTracker) ensurePendingLocked(chunk *providers.ToolCallChunk) (*streamedToolCallState, error) {
 	if chunk == nil {
-		return nil
+		return nil, nil
 	}
 	id := strings.TrimSpace(chunk.ID)
 	if id == "" {
-		// Every tool-call chunk must carry a non-empty ID stamped at the
-		// provider adapter boundary (see providers.EnsureToolCallID). Missing
-		// IDs break UI pairing and are a programming defect.
-		panic(fmt.Sprintf("ToolCallChunk missing required ID (name=%q)", chunk.Name))
+		return nil, fmt.Errorf("tool call chunk: %w (tool=%q)", ErrMissingToolCallID, chunk.Name)
 	}
-	if state, ok := t.pending[id]; ok {
-		return state
+	lc := t.ensureLifecycleLocked(id)
+	if lc.stream != nil {
+		return lc.stream, nil
 	}
 	state := &streamedToolCallState{
 		ID:   id,
@@ -512,8 +636,8 @@ func (t *toolCallTracker) ensurePendingLocked(chunk *providers.ToolCallChunk) *s
 	if state.Kind == "" && state.Name == "web_search" {
 		state.Kind = providers.ToolKindNativeWebSearch
 	}
-	t.pending[id] = state
-	return state
+	lc.stream = state
+	return state, nil
 }
 
 func chunkTimestampOrNow(chunk *providers.StreamChunk) time.Time {
@@ -534,12 +658,13 @@ func (t *toolCallTracker) consumePreannounced(call providers.ToolCall) (time.Tim
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	startedAt, ok := t.preannounced[id]
-	if !ok {
+	lc, ok := t.lifecycles[id]
+	if !ok || lc.preannouncedAt.IsZero() {
 		return time.Time{}, false
 	}
-	delete(t.preannounced, id)
-	delete(t.pending, id)
+	startedAt := lc.preannouncedAt
+	lc.preannouncedAt = time.Time{}
+	lc.stream = nil
 	return startedAt, true
 }
 
@@ -553,8 +678,8 @@ func (t *toolCallTracker) wasCompleted(call providers.ToolCall) bool {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	_, ok := t.completed[id]
-	return ok
+	lc, ok := t.lifecycles[id]
+	return ok && lc.completed
 }
 
 // toolCallEventKey returns the tool call's lifecycle ID, which is the single,
@@ -566,13 +691,15 @@ func (t *toolCallTracker) wasCompleted(call providers.ToolCall) bool {
 // programming defect that must be fixed at the source, not papered over with
 // args/name-based fallbacks — those fallbacks previously caused UI rows to
 // hang in the "active" state when accumulated args drifted between Start and
-// Complete emissions.
-func toolCallEventKey(call providers.ToolCall) string {
+// Complete emissions. Returning ErrMissingToolCallID (wrapped with the tool
+// name) lets the caller log the violation with full context instead of
+// crashing the agent.
+func toolCallEventKey(call providers.ToolCall) (string, error) {
 	id := strings.TrimSpace(call.ID)
 	if id == "" {
-		panic(fmt.Sprintf("providers.ToolCall missing required ID (name=%q)", call.Name))
+		return "", fmt.Errorf("tool call event key: %w (tool=%q)", ErrMissingToolCallID, call.Name)
 	}
-	return id
+	return id, nil
 }
 
 // ToolCallSession is the canonical owner of a tool call's emission lifecycle.
@@ -610,55 +737,70 @@ type ToolCallSession struct {
 }
 
 // acquireToolCallSession returns the canonical session for call.ID, creating
-// one if none exists. Two callers requesting a session for the same ID
-// receive the same handle. When no tracker is on the context (ad-hoc emit
-// paths used in tests) a fresh session is returned that is not registered
-// anywhere — single-use, no idempotency cross-caller, but still idempotent
-// within the returned handle.
+// one if none exists on the lifecycle. Two callers requesting a session for
+// the same ID receive the same handle from the lifecycle. When no tracker is
+// on the context (ad-hoc emit paths used in tests) a fresh session is
+// returned that is not registered anywhere — single-use, no idempotency
+// cross-caller, but still idempotent within the returned handle.
 func acquireToolCallSession(ctx context.Context, agentID string, call providers.ToolCall) *ToolCallSession {
-	key := toolCallEventKey(call)
+	key, err := toolCallEventKey(call)
+	if err != nil {
+		// Session with empty toolCallKey is a sentinel that no-ops in Start /
+		// Complete. Callers do not need to nil-check; the violation is logged
+		// once here so the producer gap is visible exactly at the site that
+		// broke the invariant.
+		logMissingToolCallID(ctx, "acquire_tool_call_session", call.Name, err)
+		return &ToolCallSession{ctx: ctx, agentID: agentID}
+	}
 	tracker := toolCallTrackerFromContext(ctx)
 	if tracker == nil {
 		return &ToolCallSession{ctx: ctx, agentID: agentID, toolCallKey: key}
 	}
 	tracker.mu.Lock()
-	if existing, ok := tracker.sessions[key]; ok {
+	lc := tracker.ensureLifecycleLocked(key)
+	if lc.session != nil {
 		// Update ctx/agentID on every acquire — later callers may carry
 		// richer logging metadata than the streaming preannounce did. The
 		// emission-state fields (started/completed/startedAt) stay pinned
 		// to the first caller's state.
-		existing.ctx = ctx
-		if strings.TrimSpace(existing.agentID) == "" {
-			existing.agentID = agentID
+		lc.session.ctx = ctx
+		if strings.TrimSpace(lc.session.agentID) == "" {
+			lc.session.agentID = agentID
 		}
+		existing := lc.session
 		tracker.mu.Unlock()
 		return existing
 	}
 	sess := &ToolCallSession{ctx: ctx, agentID: agentID, toolCallKey: key}
-	tracker.sessions[key] = sess
+	lc.session = sess
 	tracker.mu.Unlock()
 	return sess
 }
 
-// releaseToolCallSession removes a finalized session from the tracker so
-// subsequent acquires for the same call.ID create a fresh handle. Called
-// from Complete after the terminal event is emitted. Without this a
-// long-lived agent context would accumulate session entries indefinitely.
+// releaseToolCallSession clears the session handle from its lifecycle so
+// subsequent acquires for the same call.ID create a fresh handle. The
+// lifecycle itself remains in the tracker so wasCompleted can still answer
+// "was a terminal event emitted for this ID" after the session is gone —
+// that flag lives on lc.completed, not on the session.
 func releaseToolCallSession(ctx context.Context, key string) {
 	tracker := toolCallTrackerFromContext(ctx)
 	if tracker == nil {
 		return
 	}
 	tracker.mu.Lock()
-	delete(tracker.sessions, key)
+	if lc, ok := tracker.lifecycles[key]; ok {
+		lc.session = nil
+		lc.completed = true
+	}
 	tracker.mu.Unlock()
 }
 
 // Start emits a ToolCallStart event the first time it is invoked. Returns
 // true on the first call (event emitted) and false on every subsequent call
-// (no-op — Start already fired). Safe to call from multiple goroutines.
+// (no-op — Start already fired, or this is a sentinel session acquired for a
+// call with an empty lifecycle ID). Safe to call from multiple goroutines.
 func (s *ToolCallSession) Start(call providers.ToolCall, startedAt time.Time, startInterAgentOverride *InterAgentToolEvent) bool {
-	if s == nil {
+	if s == nil || strings.TrimSpace(s.toolCallKey) == "" {
 		return false
 	}
 	s.mu.Lock()
@@ -683,7 +825,7 @@ func (s *ToolCallSession) Start(call providers.ToolCall, startedAt time.Time, st
 	if interAgent == nil {
 		interAgent = DeriveInterAgentToolEvent(emittedToolName, fullArgs, "", ToolCallStart, false, "")
 	}
-	EmitToolCall(s.ctx, ToolCallEvent{
+	if err := EmitToolCall(s.ctx, ToolCallEvent{
 		ToolCallKey: s.toolCallKey,
 		Phase:       ToolCallStart,
 		ToolName:    emittedToolName,
@@ -692,7 +834,9 @@ func (s *ToolCallSession) Start(call providers.ToolCall, startedAt time.Time, st
 		AgentID:     s.agentID,
 		StartedAt:   startedAt,
 		InterAgent:  interAgent,
-	})
+	}); err != nil {
+		logMissingToolCallID(s.ctx, "session_start", call.Name, err)
+	}
 	return true
 }
 
@@ -715,7 +859,7 @@ func (s *ToolCallSession) Complete(call providers.ToolCall, output string, err e
 }
 
 func (s *ToolCallSession) completeInternal(call providers.ToolCall, output string, err error, completedAt time.Time) bool {
-	if s == nil {
+	if s == nil || strings.TrimSpace(s.toolCallKey) == "" {
 		return false
 	}
 	s.mu.Lock()
@@ -744,7 +888,7 @@ func (s *ToolCallSession) completeInternal(call providers.ToolCall, output strin
 			duration = d
 		}
 	}
-	EmitToolCall(s.ctx, ToolCallEvent{
+	if err := EmitToolCall(s.ctx, ToolCallEvent{
 		ToolCallKey: s.toolCallKey,
 		Phase:       ToolCallComplete,
 		ToolName:    emittedToolName,
@@ -757,7 +901,9 @@ func (s *ToolCallSession) completeInternal(call providers.ToolCall, output strin
 		Success:     success,
 		ErrorMsg:    errorMsg,
 		InterAgent:  DeriveInterAgentToolEvent(emittedToolName, fullArgs, outputStr, ToolCallComplete, success, errorMsg),
-	})
+	}); err != nil {
+		logMissingToolCallID(s.ctx, "session_complete", call.Name, err)
+	}
 	releaseToolCallSession(s.ctx, s.toolCallKey)
 	return true
 }
@@ -792,12 +938,21 @@ func (s *ToolCallSession) HasStarted() bool {
 // ToolCallSession: a streaming preannounce may have already started the
 // session for this call.ID, in which case our Start call is a no-op and we
 // only contribute the Complete.
+//
+// Complete is emitted via defer so the UI row closes even when execute panics
+// or otherwise unwinds abnormally. We do NOT call recover() — panics are
+// invariant violations in this codebase and must surface to the goroutine
+// boundary so they appear in logs. The deferred function detects abnormal
+// exit via the executeReturned flag (set only on the normal return path) and
+// stamps the row with a panic-attributed error so the UI reflects the failure
+// instead of a misleading "success" finalization. The panic then continues
+// to propagate after Complete runs.
 func TimedToolCall(
 	ctx context.Context,
 	agentID string,
 	call providers.ToolCall,
 	execute func() (string, error),
-) (string, error) {
+) (result string, err error) {
 	if err := WaitWhileExecutionPaused(ctx); err != nil {
 		return "", err
 	}
@@ -815,8 +970,16 @@ func TimedToolCall(
 	}
 	session.Start(call, startedAt, nil)
 
-	result, err := execute()
-	session.Complete(call, result, err)
+	executeReturned := false
+	defer func() {
+		if !executeReturned && err == nil {
+			err = fmt.Errorf("tool %q unwound abnormally without returning", call.Name)
+		}
+		session.Complete(call, result, err)
+	}()
+
+	result, err = execute()
+	executeReturned = true
 	return result, err
 }
 

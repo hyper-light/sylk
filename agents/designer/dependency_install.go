@@ -111,13 +111,22 @@ func (d *Designer) researchDependencyInstall(
 
 func (d *Designer) installDependencyTooling(ctx context.Context, plan *designerDependencyInstallPlan) (map[string]any, error) {
 	return agentshared.ExecuteDependencyInstallPlan(ctx, agentshared.DependencyInstallSkillConfig{
-		SkillName:      "install_dependency_tooling",
-		ResearchSkill:  "research_dependency_install",
-		AgentType:      "designer",
-		AgentID:        func() string { return d.id },
-		SessionID:      func() string { return d.config.SessionID },
-		WorkingDir:     d.effectiveWorkingDirectory,
-		DefaultTimeout: func() time.Duration { return d.config.DesignerConfig.DefaultTimeout },
+		SkillName:       "install_dependency_tooling",
+		ResearchSkill:   "research_dependency_install",
+		AgentType:       "designer",
+		AgentID:         func() string { return d.id },
+		SessionID:       func() string { return d.config.SessionID },
+		WorkingDir:      d.effectiveWorkingDirectory,
+		DefaultTimeout:  func() time.Duration { return d.config.DesignerConfig.DefaultTimeout },
+		ExecutionBroker: func() purevfs.ExecutionBroker { return d.executionBroker },
+		PrepareExecution: func(ctx context.Context, workingDir string) (agentshared.CommandExecContext, error) {
+			execCtx, err := d.commandExecutionContext(ctx, workingDir)
+			if err != nil {
+				return agentshared.CommandExecContext{}, err
+			}
+			return agentshared.CommandExecContext{WorkDir: execCtx.workDir, Plan: execCtx.plan}, nil
+		},
+		ExecutionWorkspace: d.executionWorkspace,
 	}, plan)
 }
 

@@ -4,11 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"os"
-	"os/exec"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/core/commandapproval"
@@ -20,24 +16,26 @@ import (
 const dependencyInstallMaxOutputBytes = 10 * 1024 * 1024
 
 type DependencyInstallSkillConfig struct {
-	SkillName       string
-	Description     string
-	Domain          string
-	Keywords        []string
-	Priority        int
-	Usage           string
-	Requirement     string
-	Satisfies       string
-	Avoid           string
-	ResearchSkill   string
-	AgentType       string
-	AgentID         func() string
-	SessionID       func() string
-	WorkingDir      func() string
-	CommandsEnabled func() bool
-	DefaultTimeout  func() time.Duration
-	ValidatePlan    func(*DependencyInstallPlan) error
-	ExecuteCommand  func(context.Context, DependencyInstallCommandRequest) (*DependencyInstallCommandResult, error)
+	SkillName          string
+	Description        string
+	Domain             string
+	Keywords           []string
+	Priority           int
+	Usage              string
+	Requirement        string
+	Satisfies          string
+	Avoid              string
+	ResearchSkill      string
+	AgentType          string
+	AgentID            func() string
+	SessionID          func() string
+	WorkingDir         func() string
+	CommandsEnabled    func() bool
+	DefaultTimeout     func() time.Duration
+	ValidatePlan       func(*DependencyInstallPlan) error
+	ExecutionBroker    func() purevfs.ExecutionBroker
+	PrepareExecution   func(context.Context, string) (CommandExecContext, error)
+	ExecutionWorkspace func(allowWrites bool) purevfs.ExecutionFS
 }
 
 type DependencyInstallCommandRequest struct {
@@ -61,7 +59,7 @@ type DependencyInstallCommandResult struct {
 
 func NewDependencyInstallExecutionSkill(cfg DependencyInstallSkillConfig) *skills.Skill {
 	stepProps := map[string]*skills.Property{
-		"command": {Type: "string", Description: "Single install command to run against the real disk workspace. No pipes, chaining, or shell control operators."},
+		"command": {Type: "string", Description: "Single install command to run inside the strict-disk execution sandbox against the agent's workspace view. No pipes, chaining, or shell control operators."},
 		"reason":  {Type: "string", Description: "Why the step is needed."},
 	}
 	type params struct {
@@ -90,14 +88,14 @@ func NewDependencyInstallExecutionSkill(cfg DependencyInstallSkillConfig) *skill
 		Requirement(cfg.Requirement).
 		Satisfies(cfg.Satisfies).
 		Avoid(cfg.Avoid).
-		BestPractice("These commands execute against the real disk workspace, not the VFS overlay, so successful installs persist to disk for later agent turns.").
+		BestPractice("These commands execute inside the strict-disk sandbox against the agent's active workspace view. Writes are classified by the workspace-mutation policy; installation artifacts live in the VFS overlay and never touch host disk outside it.").
 		BestPractice("Each install or validation step uses exact approval semantics through the same approval flow as command execution tools.").
 		BestPractice("When you include validation_command, make it a simple non-mutating availability check such as '--version' or an import probe, not a project test run or repo-wide audit.").
 		BestPractice(fmt.Sprintf("If you cannot determine the correct install command with significant confidence, call `%s` first instead of guessing.", researchSkill)).
 		StringParam("summary", "Short explanation of the install plan.", true).
 		StringParam("missing_tool", "Missing dependency, tool, or utility this plan remedies.", false).
 		StringParam("framework", "Framework or ecosystem context for the install plan.", false).
-		StringParam("validation_command", "Optional non-mutating command to verify the disk-backed install succeeded.", false).
+		StringParam("validation_command", "Optional non-mutating command to verify the install succeeded.", false).
 		ArrayParam("notes", "Important caveats or assumptions.", "string", false).
 		ArrayObjectParam("steps", "Concrete single-command install steps to execute after approval.", stepProps, []string{"command"}, true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -229,11 +227,7 @@ func runDependencyInstallCommandWithOptions(
 		return nil, WrapApprovalDenied(strings.TrimSpace(req.ToolName), err)
 	}
 
-	runner := cfg.ExecuteCommand
-	if runner == nil {
-		runner = executeDependencyInstallCommandOnDisk
-	}
-	runResult, err := runner(ctx, req)
+	runResult, err := executeDependencyInstallCommand(ctx, cfg, req)
 	if err != nil {
 		return nil, err
 	}
@@ -253,65 +247,48 @@ func runDependencyInstallCommandWithOptions(
 	return runResult, nil
 }
 
-func executeDependencyInstallCommandOnDisk(ctx context.Context, req DependencyInstallCommandRequest) (*DependencyInstallCommandResult, error) {
+// executeDependencyInstallCommand runs an approved install command through the
+// strict-disk execution broker. Dependency installs are never routed to host
+// disk — package-manager caches, lockfile updates, and downloaded archives all
+// land in the FUSE-projected workspace overlay (classified by the
+// workspace-mutation policy), so a command like `pip install` cannot leak
+// state outside the VFS. No fallback path exists: if the broker or the
+// execution-preparation hook is not wired, the install fails loudly.
+func executeDependencyInstallCommand(ctx context.Context, cfg DependencyInstallSkillConfig, req DependencyInstallCommandRequest) (*DependencyInstallCommandResult, error) {
 	argv := purevfs.ShellCommandArgv(req.Command)
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("missing install command")
 	}
+	if cfg.ExecutionBroker == nil || cfg.PrepareExecution == nil || cfg.ExecutionWorkspace == nil {
+		return nil, purevfs.ErrStrictExecutionUnavailable
+	}
+	broker := cfg.ExecutionBroker()
+	if broker == nil {
+		return nil, purevfs.ErrStrictExecutionUnavailable
+	}
+	execCtx, err := cfg.PrepareExecution(ctx, dependencyInstallRequestDir(req))
+	if err != nil {
+		return nil, fmt.Errorf("prepare execution workspace: %w", err)
+	}
 	callCtx, cancel := context.WithTimeout(ctx, req.Timeout)
 	defer cancel()
-
-	cmd := exec.CommandContext(callCtx, argv[0], argv[1:]...)
-	cmd.Dir = dependencyInstallRequestDir(req)
-	cmd.Env = os.Environ()
-
-	stdoutPipe, err := cmd.StdoutPipe()
+	runResult, err := broker.Run(callCtx, purevfs.BrokerRunRequest{
+		Plan:      execCtx.Plan,
+		Argv:      argv,
+		Workspace: cfg.ExecutionWorkspace(true),
+	})
 	if err != nil {
-		return nil, fmt.Errorf("stdout pipe for %s: %w", req.Command, err)
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stderr pipe for %s: %w", req.Command, err)
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start %s: %w", req.Command, err)
-	}
-
-	var (
-		stdout []byte
-		stderr []byte
-		wg     sync.WaitGroup
-	)
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		stdout, _ = io.ReadAll(io.LimitReader(stdoutPipe, dependencyInstallMaxOutputBytes))
-	}()
-	go func() {
-		defer wg.Done()
-		stderr, _ = io.ReadAll(io.LimitReader(stderrPipe, dependencyInstallMaxOutputBytes))
-	}()
-
-	waitErr := cmd.Wait()
-	wg.Wait()
-
-	exitCode := 0
-	if waitErr != nil {
-		if exitErr, ok := waitErr.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else if callCtx.Err() != nil {
+		if callCtx.Err() != nil {
 			return nil, fmt.Errorf("%s timed out after %v: %w", req.Command, req.Timeout, callCtx.Err())
-		} else {
-			return nil, waitErr
 		}
+		return nil, fmt.Errorf("failed to execute %s: %w", req.Command, err)
 	}
-
 	return &DependencyInstallCommandResult{
-		Stdout:          stdout,
-		Stderr:          stderr,
-		ExitCode:        exitCode,
-		StdoutTruncated: len(stdout) >= dependencyInstallMaxOutputBytes,
-		StderrTruncated: len(stderr) >= dependencyInstallMaxOutputBytes,
+		Stdout:          runResult.Stdout,
+		Stderr:          runResult.Stderr,
+		ExitCode:        runResult.ExitCode,
+		StdoutTruncated: runResult.StdoutTruncated,
+		StderrTruncated: runResult.StderrTruncated,
 	}, nil
 }
 

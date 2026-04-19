@@ -101,16 +101,15 @@ func (e *Engineer) requestConsultSync(ctx context.Context, req *guide.RouteReque
 	waitCtx, release := shared.WithoutDeadlineCancellation(ctx)
 	defer release()
 
-	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, req.TargetAgentID, req.Input, req.Metadata)
-	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
+	req.Metadata = shared.InheritedBranchMetadata(waitCtx, req.Metadata)
 	if req.ParentCorrelationID == "" {
-		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+		if stream, ok := shared.StreamMetadataFromContext(waitCtx); ok {
 			req.ParentCorrelationID = stream.CorrelationID
 		}
 	}
-	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
+	req.Metadata = shared.RouteMetadataWithInterAgentBranch(waitCtx, req.Metadata)
 	req.ExplicitTarget = strings.TrimSpace(req.TargetAgentID) != ""
-	response, err := shared.RetryBusyRouteRequest(branchCtx, req.TargetAgentID, shared.DefaultBusyRetryPolicy(req.TargetAgentID), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+	response, err := shared.RetryBusyRouteRequest(waitCtx, req.TargetAgentID, shared.DefaultBusyRetryPolicy(req.TargetAgentID), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
 		req.CorrelationID = "corr_" + uuid.NewString()
 		wait := e.registerPendingConsult(req.CorrelationID)
 		defer e.clearPendingConsult(req.CorrelationID)
@@ -134,10 +133,8 @@ func (e *Engineer) requestConsultSync(ctx context.Context, req *guide.RouteReque
 		return response, nil
 	})
 	if err != nil {
-		branch.Complete(branchCtx, "", "", err)
 		return nil, err
 	}
-	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }
 
@@ -166,7 +163,7 @@ func (e *Engineer) requestConsultationWithMetadata(
 		return failedConsultEvidence(target, query, scope, "", shared.ConsultationAdmissionError(admission)), nil
 	}
 	researchDepth := shared.ConsultationResearchDepth(req.Metadata)
-	branchCtx, branch := shared.BeginInterAgentBranch(ctx, shared.InterAgentBranchSpec{
+	spec := shared.InterAgentBranchSpec{
 		Kind:       shared.InterAgentToolEventKindConsult,
 		ToolName:   "consult_" + strings.ReplaceAll(strings.TrimSpace(target), "-", "_"),
 		AgentTypes: []string{target},
@@ -177,11 +174,13 @@ func (e *Engineer) requestConsultationWithMetadata(
 			"scope":  scope,
 			"depth":  string(researchDepth),
 		},
+	}
+	response, err := shared.WithInterAgentBranchMessage(ctx, spec, func(branchCtx context.Context, branch shared.InterAgentBranchHandle) (*guide.Message, error) {
+		req.Metadata = branch.ApplyMetadata(branchCtx, admission.Metadata)
+		resp, err := e.requestConsultSync(branchCtx, req)
+		shared.RecordConsultationOutcome(branchCtx, admission.AttemptID, err == nil, shared.ConsultationDataFromMessage(resp), err)
+		return resp, err
 	})
-	req.Metadata = branch.ApplyMetadata(branchCtx, admission.Metadata)
-	response, err := e.requestConsultSync(branchCtx, req)
-	shared.RecordConsultationOutcome(branchCtx, admission.AttemptID, err == nil, shared.ConsultationDataFromMessage(response), err)
-	branch.CompleteFromMessage(branchCtx, response, err)
 	if err != nil {
 		if shared.IsAgentBusyError(err) {
 			return failedConsultEvidence(target, query, scope, req.CorrelationID, err), shared.ConsultationBusyDelegatedError(target, err)

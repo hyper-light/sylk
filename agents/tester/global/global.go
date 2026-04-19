@@ -174,6 +174,14 @@ func (gt *GlobalTester) getProvider() globalTesterProvider {
 	return gt.provider
 }
 
+// Ready implements shared.ReadinessReporter.
+func (gt *GlobalTester) Ready() (bool, string) {
+	if gt.getProvider() == nil {
+		return false, "LLM provider not yet wired (authenticate with OpenAI to enable)"
+	}
+	return true, ""
+}
+
 // ProviderType implements container.AuthRefreshable.
 func (gt *GlobalTester) ProviderType() string {
 	return string(container.ProviderForModel(gt.CurrentModel()))
@@ -366,6 +374,10 @@ func (gt *GlobalTester) registerCoreSkills() {
 	}) {
 		gt.skills.Register(skill)
 	}
+	// TODO: wire DecisionManifestSkills onto the global tester once it
+	// gains a pending-wait infrastructure (registerPendingWait /
+	// clearPendingWait equivalent). The screenshot bug is in the pipeline
+	// tester path so phase 1 ships without global-tester wiring.
 
 	// Diagnostics
 	gt.skills.Register(agentshared.NewSelfDiagnosticSkill(&globalTesterDiag{gt: gt}))
@@ -525,7 +537,7 @@ func (gt *GlobalTester) Handle(ctx context.Context, fwd *guide.ForwardedRequest)
 // handleTaskRequest processes task-oriented requests through the full LLM tool loop.
 func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	if gt.getProvider() == nil {
-		return nil, fmt.Errorf("global tester: no LLM provider configured — authenticate with OpenAI to enable")
+		return nil, fmt.Errorf("global tester: %w: LLM provider not yet wired — authenticate with OpenAI to enable", agentshared.ErrAgentNotReady)
 	}
 
 	hadGlobalReviewState := agentshared.GlobalReviewStateFromContext(ctx) != nil
@@ -692,11 +704,25 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
-		gt.publishStreamError(ctx, err)
-		gt.publishStreamComplete(ctx, "", usageAcc.Total(), nil)
+		if streamErr := gt.publishStreamError(ctx, err); streamErr != nil {
+			gt.logger.Warn("global_tester_stream_error_publish_failed",
+				"correlation_id", fwd.CorrelationID,
+				"underlying_error", err.Error(),
+				"publish_error", streamErr.Error())
+		}
+		if completeErr := gt.publishStreamComplete(ctx, "", usageAcc.Total(), nil); completeErr != nil {
+			gt.logger.Warn("global_tester_stream_complete_publish_failed",
+				"correlation_id", fwd.CorrelationID,
+				"publish_error", completeErr.Error())
+		}
 		resp.Error = err.Error()
 		respMsg := guide.NewResponseMessage(gt.generateMessageID(), resp)
-		_ = gt.bus.Publish(gt.channels.Responses, respMsg)
+		if pubErr := gt.bus.Publish(gt.channels.Responses, respMsg); pubErr != nil {
+			gt.logger.Warn("global_tester_error_response_publish_failed",
+				"correlation_id", fwd.CorrelationID,
+				"underlying_error", err.Error(),
+				"publish_error", pubErr.Error())
+		}
 		errMsg := guide.NewErrorMessage(
 			gt.generateMessageID(),
 			fwd.CorrelationID,

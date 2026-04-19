@@ -130,15 +130,14 @@ func New(cfg shared.GlobalInspectorConfig, provider providers.ProviderAdapter) (
 		executionBroker:   purevfs.DefaultExecutionBroker(),
 	}
 	gi.toolRunner = shared.NewToolRunner(shared.ToolRunnerConfig{
-		WorkingDir:    ".",
-		Timeout:       cfg.DefaultTimeout,
-		Logger:        slog.Default(),
-		AgentID:       inspectorID,
-		AgentType:     "inspector",
-		SessionID:     func() string { return gi.config.SessionID },
-		FileAccess:    func() versioning.FileAccess { return gi.fileAccess },
-		Broker:        func() purevfs.ExecutionBroker { return gi.executionBroker },
-		RequireBroker: true,
+		WorkingDir: ".",
+		Timeout:    cfg.DefaultTimeout,
+		Logger:     slog.Default(),
+		AgentID:    inspectorID,
+		AgentType:  "inspector",
+		SessionID:  func() string { return gi.config.SessionID },
+		FileAccess: func() versioning.FileAccess { return gi.fileAccess },
+		Broker:     func() purevfs.ExecutionBroker { return gi.executionBroker },
 	})
 
 	gi.factory = cfg.Factory
@@ -179,6 +178,14 @@ func (gi *GlobalInspector) getProvider() inspectorProvider {
 	gi.mu.RLock()
 	defer gi.mu.RUnlock()
 	return gi.provider
+}
+
+// Ready implements shared.ReadinessReporter.
+func (gi *GlobalInspector) Ready() (bool, string) {
+	if gi.getProvider() == nil {
+		return false, "LLM provider not yet wired (post-init / pre-auth window)"
+	}
+	return true, ""
 }
 
 // ProviderType implements container.AuthRefreshable.

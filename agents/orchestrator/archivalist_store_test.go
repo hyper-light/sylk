@@ -42,8 +42,9 @@ func TestSubmitEventToArchivalist_NestsArchivalistStoreUnderParentTurn(t *testin
 
 	var events []shared.ToolCallEvent
 	ctx := shared.WithStreamContext(context.Background(), "corr-parent", "tui")
-	ctx = shared.WithToolCallEmitter(ctx, func(ev shared.ToolCallEvent) {
+	ctx = shared.WithToolCallEmitter(ctx, func(ev shared.ToolCallEvent) error {
 		events = append(events, ev)
+		return nil
 	})
 
 	if err := o.SubmitEventToArchivalist(ctx, &TaskEvent{Type: "task_completed", TaskID: "task-1"}); err != nil {

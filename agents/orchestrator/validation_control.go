@@ -535,7 +535,12 @@ func (o *Orchestrator) broadcastControlPlaneStatus(message, level string) {
 		},
 		Timestamp: time.Now(),
 	}
-	_ = o.bus.Publish("orchestrator.status", msg)
+	if err := o.bus.Publish("orchestrator.status", msg); err != nil {
+		o.logWarnMsg("orchestrator_control_plane_status_publish_failed",
+			"level", level,
+			"message_preview", truncateForLog(message, 120),
+			"error", err.Error())
+	}
 }
 
 func (o *Orchestrator) publishValidationActivity(eventType events.EventType, content string, data map[string]any) {

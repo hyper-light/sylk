@@ -187,7 +187,86 @@ const (
 	// creates a synthetic pending synchronously before any subsequent
 	// stream events, guaranteeing race-free routing to the TUI.
 	StreamEventPush StreamEventType = "push"
+
+	// StreamEventAgentState declares an explicit activity-state transition for
+	// the agent handling the current request. This is orthogonal to text
+	// chunks: state events describe *what the agent is doing* (reasoning,
+	// consulting a peer, awaiting a peer response, composing the final
+	// answer) while text chunks carry user-visible output. The UI renders
+	// state as a persistent indicator so the user never sees a silent gap
+	// when the agent is actively working. Every transition must be
+	// announced; missing transitions are observable via telemetry, not
+	// papered over with a default state.
+	StreamEventAgentState StreamEventType = "agent_state"
 )
+
+// AgentActivityState enumerates the user-facing states an agent can be in
+// while handling a request. Transitions are explicit and announced via
+// PublishAgentState. The set is extensible but callers should prefer the
+// existing states so UI rendering and LLM-observability stay consistent.
+type AgentActivityState string
+
+const (
+	// AgentStateReceiving: a request has arrived and the agent is preparing
+	// to work on it (decoding input, loading skills, mounting context).
+	AgentStateReceiving AgentActivityState = "receiving"
+	// AgentStateReasoning: an LLM call is in flight for this agent.
+	AgentStateReasoning AgentActivityState = "reasoning"
+	// AgentStateToolExecuting: a tool is currently running. Redundant with
+	// tool-call events but keeps the activity channel complete so a missing
+	// tool-call event does not produce a UI gap.
+	AgentStateToolExecuting AgentActivityState = "tool_executing"
+	// AgentStateConsultingPeer: the agent has opened an inter-agent consult
+	// or challenge and is waiting synchronously for a peer response.
+	AgentStateConsultingPeer AgentActivityState = "consulting_peer"
+	// AgentStateDispatchingToPeer: the agent is sending a request to another
+	// agent as part of pipeline progression (not a sync consult).
+	AgentStateDispatchingToPeer AgentActivityState = "dispatching_to_peer"
+	// AgentStateAwaitingPeerResponse: the agent has handed off work and is
+	// idle while the peer processes. Pipelines and orchestrator publish this
+	// during routing hops so the chat never has a silent gap between
+	// hand-offs.
+	AgentStateAwaitingPeerResponse AgentActivityState = "awaiting_peer_response"
+	// AgentStateComposingResponse: the agent is assembling its final text
+	// response (post tool-loop, pre user-visible stream).
+	AgentStateComposingResponse AgentActivityState = "composing_response"
+	// AgentStateComplete: the agent has finished its work for this request.
+	AgentStateComplete AgentActivityState = "complete"
+	// AgentStateErrored: the agent has terminated this request with an
+	// error. Paired with an explicit error stream event.
+	AgentStateErrored AgentActivityState = "errored"
+)
+
+// AgentStateEvent is the payload carried in a StreamEvent of type
+// StreamEventAgentState. It carries enough identity for the UI to route
+// the state indicator to the right chat entry and for an observing LLM
+// to reason about peer activity.
+type AgentStateEvent struct {
+	// State is the agent's current activity state. Required.
+	State AgentActivityState `json:"state"`
+	// Detail is a short human-readable description ("running pytest suite",
+	// "asking tester for verification"). Optional but recommended — this is
+	// what the UI surfaces to the user.
+	Detail string `json:"detail,omitempty"`
+	// AgentID / AgentType identify the agent publishing the transition.
+	// The UI keys indicators by these; multiple concurrent requests on the
+	// same agent are distinguished by CorrelationID.
+	AgentID   string `json:"agent_id,omitempty"`
+	AgentType string `json:"agent_type,omitempty"`
+	// CorrelationID is the request this transition belongs to. When the
+	// state publishes during a peer-wait, CorrelationID remains the owning
+	// agent's request; PeerCorrelationID references the dispatched work.
+	CorrelationID string `json:"correlation_id,omitempty"`
+	// TransitionID is a monotonically increasing sequence within a single
+	// correlation id so the UI can order transitions deterministically even
+	// under concurrent delivery.
+	TransitionID int64 `json:"transition_id,omitempty"`
+	// PeerAgentType / PeerCorrelationID describe the peer when State is
+	// ConsultingPeer, DispatchingToPeer, or AwaitingPeerResponse. Empty
+	// for self-contained states (Reasoning, ToolExecuting, etc.).
+	PeerAgentType     string `json:"peer_agent_type,omitempty"`
+	PeerCorrelationID string `json:"peer_correlation_id,omitempty"`
+}
 
 // PushType classifies the push intent.
 type PushType string

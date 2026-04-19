@@ -3,14 +3,42 @@ package shared
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/ci/zeroleak"
 	"github.com/adalundhe/sylk/core/commandapproval"
+	"github.com/adalundhe/sylk/core/purevfs"
 )
+
+type stubInstallBroker struct {
+	caps purevfs.ExecutionCapabilities
+	run  func(context.Context, purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error)
+}
+
+func (s stubInstallBroker) Capabilities(context.Context) (purevfs.ExecutionCapabilities, error) {
+	return s.caps, nil
+}
+
+func (s stubInstallBroker) Run(ctx context.Context, req purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error) {
+	if s.run == nil {
+		return &purevfs.BrokerRunResult{ExitCode: 0}, nil
+	}
+	return s.run(ctx, req)
+}
+
+func strictNoDiskInstallConfig(broker purevfs.ExecutionBroker, workspaceRoot string) (func() purevfs.ExecutionBroker, func(context.Context, string) (CommandExecContext, error), func(bool) purevfs.ExecutionFS) {
+	prepare := func(ctx context.Context, workingDir string) (CommandExecContext, error) {
+		return CommandExecContext{
+			WorkDir: workspaceRoot,
+			Plan:    purevfs.ExecutionPlan{Mode: purevfs.ExecutionModeStrictNoDisk, WorkingDir: workspaceRoot},
+		}, nil
+	}
+	workspace := func(allowWrites bool) purevfs.ExecutionFS { return nil }
+	return func() purevfs.ExecutionBroker { return broker }, prepare, workspace
+}
 
 type captureInstallGate struct {
 	requests []commandapproval.Request
@@ -224,32 +252,61 @@ Validation: ` + "`python -m pytest --version`" + `
 	}
 }
 
-func TestExecuteDependencyInstallPlan_WritesToDiskWithExactApproval(t *testing.T) {
+// TestExecuteDependencyInstallPlan_RoutesInstallsThroughBrokerWithoutDiskWrites
+// verifies the strict no-disk invariant: an install plan drives the broker
+// only, never `exec.CommandContext` on host disk. The test asserts (1) the
+// broker is invoked for every approved step and the validation command, (2)
+// each broker request carries the approved argv, and (3) nothing the test
+// did landed in the working directory as a side effect.
+func TestExecuteDependencyInstallPlan_RoutesInstallsThroughBrokerWithoutDiskWrites(t *testing.T) {
 	root := t.TempDir()
+	zeroleak.Guard(t, root)
 	gate := &captureInstallGate{}
 	ctx := commandapproval.WithGate(context.Background(), gate)
 
+	var captured []purevfs.BrokerRunRequest
+	broker := stubInstallBroker{
+		run: func(_ context.Context, req purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error) {
+			captured = append(captured, req)
+			return &purevfs.BrokerRunResult{ExitCode: 0}, nil
+		},
+	}
+	brokerFn, prepare, workspace := strictNoDiskInstallConfig(broker, root)
+
 	result, err := ExecuteDependencyInstallPlan(ctx, DependencyInstallSkillConfig{
-		SkillName:     "install_dependency_tooling",
-		ResearchSkill: "research_dependency_install",
-		AgentType:     "tester-pipeline",
-		AgentID:       func() string { return "tester-1" },
-		SessionID:     func() string { return "sess-1" },
-		WorkingDir:    func() string { return root },
+		SkillName:          "install_dependency_tooling",
+		ResearchSkill:      "research_dependency_install",
+		AgentType:          "tester-pipeline",
+		AgentID:            func() string { return "tester-1" },
+		SessionID:          func() string { return "sess-1" },
+		WorkingDir:         func() string { return root },
+		ExecutionBroker:    brokerFn,
+		PrepareExecution:   prepare,
+		ExecutionWorkspace: workspace,
 	}, &DependencyInstallPlan{
 		Summary:           "Install a marker utility",
 		MissingTool:       "marker",
-		ValidationCommand: "test -f .install-marker",
+		ValidationCommand: "marker --version",
 		Steps: []DependencyInstallStep{
-			{Command: "touch .install-marker", Reason: "prove installs write to disk rather than VFS"},
+			{Command: "python -m pip install marker", Reason: "install the package"},
 		},
 	})
 	if err != nil {
 		t.Fatalf("ExecuteDependencyInstallPlan() error = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, ".install-marker")); err != nil {
-		t.Fatalf("disk marker missing: %v", err)
+
+	if got := len(captured); got != 2 {
+		t.Fatalf("broker invocations = %d, want 2 (install step + validation)", got)
 	}
+	// ShellCommandArgv wraps plain commands as `/bin/sh -c "<command>"`; the
+	// user-approved command text lives in Argv[2].
+	if got := captured[0].Argv; len(got) != 3 || got[0] != "/bin/sh" || !strings.Contains(got[2], "pip install marker") {
+		t.Fatalf("install argv = %#v, want [/bin/sh -c \"... pip install marker\"]", got)
+	}
+	if got := captured[1].Argv; len(got) != 3 || got[0] != "/bin/sh" || !strings.Contains(got[2], "marker --version") {
+		t.Fatalf("validation argv = %#v, want [/bin/sh -c \"marker --version\"]", got)
+	}
+
 	if got := len(gate.requests); got != 2 {
 		t.Fatalf("approval requests = %d, want 2", got)
 	}
@@ -264,26 +321,52 @@ func TestExecuteDependencyInstallPlan_WritesToDiskWithExactApproval(t *testing.T
 	if installed, _ := result["installed"].(bool); !installed {
 		t.Fatalf("result installed = %v, want true", result["installed"])
 	}
+	// Zero-leak invariant is enforced by the zeroleak.Guard above, which
+	// fires on t.Cleanup and fails the test if any inode appeared under
+	// root during the install.
 }
 
+// TestExecuteDependencyInstallPlan_DoesNotFailWhenValidationCommandFails
+// verifies that a non-zero validation exit is recorded but does not propagate
+// as an error — the validation command runs through the broker with
+// AllowNonZeroExit semantics preserved under the broker-routed fallback.
 func TestExecuteDependencyInstallPlan_DoesNotFailWhenValidationCommandFails(t *testing.T) {
 	root := t.TempDir()
 	gate := &captureInstallGate{}
 	ctx := commandapproval.WithGate(context.Background(), gate)
 
+	broker := stubInstallBroker{
+		run: func(_ context.Context, req purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error) {
+			// Install command succeeds; validation fails with exit 1. Commands
+			// are shell-wrapped, so the user command text lives in Argv[2].
+			shellCmd := ""
+			if len(req.Argv) >= 3 {
+				shellCmd = req.Argv[2]
+			}
+			if strings.Contains(shellCmd, "nonexistent-tool") {
+				return &purevfs.BrokerRunResult{ExitCode: 1, Stderr: []byte("not installed")}, nil
+			}
+			return &purevfs.BrokerRunResult{ExitCode: 0}, nil
+		},
+	}
+	brokerFn, prepare, workspace := strictNoDiskInstallConfig(broker, root)
+
 	result, err := ExecuteDependencyInstallPlan(ctx, DependencyInstallSkillConfig{
-		SkillName:     "install_dependency_tooling",
-		ResearchSkill: "research_dependency_install",
-		AgentType:     "tester-pipeline",
-		AgentID:       func() string { return "tester-1" },
-		SessionID:     func() string { return "sess-1" },
-		WorkingDir:    func() string { return root },
+		SkillName:          "install_dependency_tooling",
+		ResearchSkill:      "research_dependency_install",
+		AgentType:          "tester-pipeline",
+		AgentID:            func() string { return "tester-1" },
+		SessionID:          func() string { return "sess-1" },
+		WorkingDir:         func() string { return root },
+		ExecutionBroker:    brokerFn,
+		PrepareExecution:   prepare,
+		ExecutionWorkspace: workspace,
 	}, &DependencyInstallPlan{
 		Summary:           "Install a marker utility",
 		MissingTool:       "marker",
-		ValidationCommand: "test -f .missing-marker",
+		ValidationCommand: "nonexistent-tool --version",
 		Steps: []DependencyInstallStep{
-			{Command: "touch .install-marker", Reason: "prove install succeeded"},
+			{Command: "python -m pip install marker", Reason: "prove install succeeded"},
 		},
 	})
 	if err != nil {
@@ -300,6 +383,38 @@ func TestExecuteDependencyInstallPlan_DoesNotFailWhenValidationCommandFails(t *t
 		t.Fatalf("validation_passed = true, want false")
 	}
 }
+
+// TestExecuteDependencyInstallPlan_RefusesWhenBrokerUnavailable locks in the
+// no-silent-fallback invariant: if the broker wiring is missing, the install
+// fails loudly rather than silently executing on host disk.
+func TestExecuteDependencyInstallPlan_RefusesWhenBrokerUnavailable(t *testing.T) {
+	root := t.TempDir()
+	gate := &captureInstallGate{}
+	ctx := commandapproval.WithGate(context.Background(), gate)
+
+	_, err := ExecuteDependencyInstallPlan(ctx, DependencyInstallSkillConfig{
+		SkillName:     "install_dependency_tooling",
+		ResearchSkill: "research_dependency_install",
+		AgentType:     "tester-pipeline",
+		AgentID:       func() string { return "tester-1" },
+		SessionID:     func() string { return "sess-1" },
+		WorkingDir:    func() string { return root },
+		// Intentionally leave ExecutionBroker/PrepareExecution/ExecutionWorkspace nil.
+	}, &DependencyInstallPlan{
+		Summary:     "Install a marker utility",
+		MissingTool: "marker",
+		Steps: []DependencyInstallStep{
+			{Command: "python -m pip install marker", Reason: "install the package"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected ErrStrictExecutionUnavailable when broker wiring missing, got nil")
+	}
+}
+
+// _ forces filepath to stay imported — it is referenced by other tests in
+// this package when they construct paths.
+var _ = filepath.Join
 
 func TestExecuteDependencyInstallPlan_RespectsValidatePlanHook(t *testing.T) {
 	_, err := ExecuteDependencyInstallPlan(context.Background(), DependencyInstallSkillConfig{

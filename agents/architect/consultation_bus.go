@@ -135,17 +135,16 @@ func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteReques
 	waitCtx, release := shared.WithoutDeadlineCancellation(ctx)
 	defer release()
 
-	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, req.TargetAgentID, req.Input, req.Metadata)
-	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
+	req.Metadata = shared.InheritedBranchMetadata(waitCtx, req.Metadata)
 	req.CorrelationID = ensureCorrelationID(req.CorrelationID)
 	req.SourceAgentID = a.id
 	req.SourceAgentName = "architect"
 	if req.ParentCorrelationID == "" {
-		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+		if stream, ok := shared.StreamMetadataFromContext(waitCtx); ok {
 			req.ParentCorrelationID = stream.CorrelationID
 		}
 	}
-	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
+	req.Metadata = shared.RouteMetadataWithInterAgentBranch(waitCtx, req.Metadata)
 	if req.TargetAgentID != "" {
 		req.ExplicitTarget = true
 	}
@@ -153,10 +152,10 @@ func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteReques
 	// Propagate the hop count from the incoming ForwardedRequest so the
 	// Guide's structural loop detection spans the full request chain.
 	if req.Hops == 0 {
-		req.Hops = routeHopsFromContext(branchCtx)
+		req.Hops = routeHopsFromContext(waitCtx)
 	}
 
-	response, err := shared.RetryBusyRouteRequest(branchCtx, req.TargetAgentID, shared.DefaultBusyRetryPolicy(req.TargetAgentID), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+	response, err := shared.RetryBusyRouteRequest(waitCtx, req.TargetAgentID, shared.DefaultBusyRetryPolicy(req.TargetAgentID), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
 		req.CorrelationID = ensureCorrelationID("")
 		req.Timestamp = time.Now()
 
@@ -212,10 +211,8 @@ func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteReques
 		return response, nil
 	})
 	if err != nil {
-		branch.Complete(branchCtx, "", "", err)
 		return nil, err
 	}
-	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }
 
@@ -282,7 +279,7 @@ func (a *Architect) requestConsultationWithMetadata(
 		return failedConsultation(target, query, scope, "", shared.ConsultationAdmissionError(admission)), nil
 	}
 	researchDepth := shared.ConsultationResearchDepth(req.Metadata)
-	branchCtx, branch := shared.BeginInterAgentBranch(ctx, shared.InterAgentBranchSpec{
+	spec := shared.InterAgentBranchSpec{
 		Kind:       shared.InterAgentToolEventKindConsult,
 		ToolName:   "consult_" + strings.ReplaceAll(strings.TrimSpace(target), "-", "_"),
 		AgentTypes: []string{target},
@@ -293,17 +290,19 @@ func (a *Architect) requestConsultationWithMetadata(
 			"scope":  scope,
 			"depth":  string(researchDepth),
 		},
-	})
-	req.Metadata = branch.ApplyMetadata(branchCtx, admission.Metadata)
+	}
 	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventConsultationSent,
 		a.id, sessionID, "", "info",
 		&agentlog.ConsultPayload{Target: target})
 
 	consultStart := time.Now()
-	response, err := a.requestRouteSync(branchCtx, req)
-	shared.RecordConsultationOutcome(branchCtx, admission.AttemptID, err == nil, shared.ConsultationDataFromMessage(response), err)
+	response, err := shared.WithInterAgentBranchMessage(ctx, spec, func(branchCtx context.Context, branch shared.InterAgentBranchHandle) (*guide.Message, error) {
+		req.Metadata = branch.ApplyMetadata(branchCtx, admission.Metadata)
+		resp, reqErr := a.requestRouteSync(branchCtx, req)
+		shared.RecordConsultationOutcome(branchCtx, admission.AttemptID, reqErr == nil, shared.ConsultationDataFromMessage(resp), reqErr)
+		return resp, reqErr
+	})
 	elapsed := time.Since(consultStart)
-	branch.CompleteFromMessage(branchCtx, response, err)
 
 	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventConsultationRecv,
 		a.id, sessionID, req.CorrelationID, "info",

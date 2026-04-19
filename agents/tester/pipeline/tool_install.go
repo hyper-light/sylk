@@ -148,13 +148,22 @@ func formatTestToolInstallPlan(plan *testToolInstallPlan) string {
 
 func (pt *PipelineTester) installTestTooling(ctx context.Context, plan *testToolInstallPlan) (map[string]any, error) {
 	return agentshared.ExecuteDependencyInstallPlan(ctx, agentshared.DependencyInstallSkillConfig{
-		SkillName:      "install_test_tooling",
-		ResearchSkill:  "research_test_tool_install",
-		AgentType:      "tester-pipeline",
-		AgentID:        func() string { return pt.id },
-		SessionID:      func() string { return pt.config.SessionID },
-		WorkingDir:     pt.workingDir,
-		DefaultTimeout: func() time.Duration { return pt.config.DefaultTimeout },
+		SkillName:       "install_test_tooling",
+		ResearchSkill:   "research_test_tool_install",
+		AgentType:       "tester-pipeline",
+		AgentID:         func() string { return pt.id },
+		SessionID:       func() string { return pt.config.SessionID },
+		WorkingDir:      pt.workingDir,
+		DefaultTimeout:  func() time.Duration { return pt.config.DefaultTimeout },
+		ExecutionBroker: func() purevfs.ExecutionBroker { return pt.executionBroker },
+		PrepareExecution: func(ctx context.Context, workingDir string) (agentshared.CommandExecContext, error) {
+			execCtx, err := pt.commandExecutionContext(ctx, workingDir)
+			if err != nil {
+				return agentshared.CommandExecContext{}, err
+			}
+			return agentshared.CommandExecContext{WorkDir: execCtx.workDir, Plan: execCtx.plan}, nil
+		},
+		ExecutionWorkspace: pt.executionWorkspace,
 	}, plan)
 }
 

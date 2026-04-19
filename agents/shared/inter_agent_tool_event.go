@@ -349,7 +349,14 @@ func deriveInterAgentOriginUpdate(toolName string, args, output map[string]any, 
 	}
 }
 
-func interAgentResponseThreadKey(toolName string, args, output map[string]any, challengeID string) string {
+// interAgentResponseThreadKey computes the ThreadKey for a challenge-response
+// tool event from explicit identifiers on args/output. Producers must supply
+// `protocol_scope` explicitly (see pipeline_protocol.go validate_work /
+// process_validation handlers and global_review_protocol.go equivalents);
+// when scope is missing the function returns empty so the producer gap is
+// surfaced via downstream origin-update logging rather than silently routed
+// to the wrong scope prefix.
+func interAgentResponseThreadKey(_ string, args, output map[string]any, challengeID string) string {
 	if explicit := firstNonEmptyInline(
 		stringFromAnyMap(output, "thread_key"),
 		stringFromAnyMap(args, "thread_key"),
@@ -366,10 +373,7 @@ func interAgentResponseThreadKey(toolName string, args, output map[string]any, c
 	case pipelineProtocolNamespace:
 		return pipelineThreadPrefix + challengeID
 	}
-	if toolName == "validate_work" || toolName == "process_validation" {
-		return pipelineThreadPrefix + challengeID
-	}
-	return globalReviewThreadPrefix + challengeID
+	return ""
 }
 
 func isInterAgentConsultToolName(toolName string, args map[string]any) bool {
@@ -397,13 +401,27 @@ func isNestedInterAgentKind(kind string) bool {
 	}
 }
 
-func isInterAgentResponseToolName(toolName string) bool {
-	switch toolName {
+// IsInterAgentResponseToolName reports whether a tool name belongs to the
+// set of response-kind tools (validate_work, process_validation, and their
+// global-review analogs). Response tools emit origin-update events on Phase 1
+// that patch an existing challenge row; they do NOT open new rows of their
+// own. Emission-side classification (DeriveInterAgentToolEvent) and UI-side
+// classification (eventIsInterAgentOriginUpdate Phase 0 fallback) must agree —
+// this exported helper is the single source of truth so the two sides cannot
+// drift (that drift was the mechanism behind the duplicate-agent-row bug
+// class where a new response tool added to one list without the other would
+// silently misclassify).
+func IsInterAgentResponseToolName(toolName string) bool {
+	switch strings.TrimSpace(toolName) {
 	case "validate_global_review", "process_global_validation", "validate_work", "process_validation":
 		return true
 	default:
 		return false
 	}
+}
+
+func isInterAgentResponseToolName(toolName string) bool {
+	return IsInterAgentResponseToolName(toolName)
 }
 
 func interAgentConsultationTargets(toolName string, args map[string]any) []string {
@@ -565,6 +583,12 @@ func normalizePipelineChallengeAgentType(value string) string {
 	}
 }
 
+// interAgentChallengeThreadKey computes the ThreadKey for a challenge-dispatch
+// tool event from explicit identifiers on args/output/streamMetadata.
+// Producers must supply `protocol_scope` or a pre-computed `thread_key` —
+// tool-name guessing is deliberately absent. When scope is missing the
+// function returns empty so the producer gap surfaces rather than routing
+// to the wrong scope prefix.
 func interAgentChallengeThreadKey(toolName string, args, output, streamMetadata map[string]any) string {
 	if explicit := firstNonEmptyInline(
 		stringFromAnyMap(output, "thread_key"),
@@ -586,10 +610,7 @@ func interAgentChallengeThreadKey(toolName string, args, output, streamMetadata 
 	case pipelineProtocolNamespace:
 		return pipelineThreadPrefix + challengeID
 	}
-	if toolName == "challenge_agent" {
-		return pipelineThreadPrefix + challengeID
-	}
-	return globalReviewThreadPrefix + challengeID
+	return ""
 }
 
 func interAgentConsultationFailed(success bool, output map[string]any, errorMsg string) bool {

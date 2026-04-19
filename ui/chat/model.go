@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/google/uuid"
 )
 
@@ -304,6 +305,35 @@ type Model struct {
 	// View cache: avoids re-rendering when no visible state changed.
 	viewCache string
 	viewDirty bool
+
+	// Agent activity state: the canonical "what is happening now" signal.
+	// agentStates maps correlationID to the most recent AgentStateMsg so the
+	// renderer can surface per-entry indicators for streaming entries and
+	// an inter-stream bridge indicator for correlations that are between
+	// text-stream boundaries but not yet terminated.
+	agentStates map[string]*agentActivityState
+	// latestAgentState is the most recently observed non-terminal state
+	// across all correlations, used as the inter-stream bridge indicator
+	// when no entry is currently streaming. Reset to nil when the owning
+	// correlation terminates (complete/errored).
+	latestAgentState *agentActivityState
+}
+
+// agentActivityState captures the last observed state transition for a
+// correlation so the chat renderer can surface activity even between
+// text-stream boundaries. TransitionID orders late-arriving transitions
+// deterministically so an out-of-order delivery cannot overwrite a newer
+// state with a stale one.
+type agentActivityState struct {
+	CorrelationID     string
+	AgentID           string
+	AgentType         string
+	State             string
+	Detail            string
+	PeerAgentType     string
+	PeerCorrelationID string
+	TransitionID      int64
+	ObservedAt        time.Time
 }
 
 func progressPriority(toolDerived, watchdog bool) int {
@@ -542,6 +572,7 @@ func New(th *theme.Theme, historyCapacity int) *Model {
 		resumableChildOwners: make(map[string]string),
 		thinkingGradient:     th.Palette.ThinkingGradient(),
 		steeringGradient:     th.Palette.GroupGradient(),
+		agentStates:          make(map[string]*agentActivityState),
 	}
 }
 
@@ -585,6 +616,9 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	case msg.ToolCallEventMsg:
 		m.viewDirty = true
 		return m, m.handleToolCallEvent(typed)
+	case msg.AgentStateMsg:
+		m.viewDirty = true
+		return m, m.handleAgentState(typed)
 	case tea.KeyMsg:
 		m.viewDirty = true
 		return m, m.handleKey(typed)
@@ -601,9 +635,68 @@ func (m *Model) View() string {
 	if !m.viewDirty && m.viewCache != "" {
 		return m.viewCache
 	}
-	m.viewCache = m.viewport.View()
+	base := m.viewport.View()
+	// Inter-stream activity bridge: when an agent has announced a
+	// non-terminal state but no chat entry is currently streaming for that
+	// correlation, surface the state at the bottom of the panel so the UI
+	// never goes silent during routing hops (orchestrator → pipeline →
+	// orchestrator). Streaming entries handle the state inline via their
+	// ThinkingStatus field, so we only render the bridge when no streaming
+	// entry owns the latest state.
+	if bridge := m.renderActivityBridge(); bridge != "" {
+		if base != "" {
+			base = base + "\n" + bridge
+		} else {
+			base = bridge
+		}
+	}
+	m.viewCache = base
 	m.viewDirty = false
 	return m.viewCache
+}
+
+// renderActivityBridge returns a one-line italic indicator showing the
+// latest non-terminal agent-activity state when no currently-streaming
+// entry is surfacing it inline. Returns "" when no bridge is needed
+// (either there is no active state, or the state's correlation already has
+// a streaming entry that is rendering it as a ThinkingStatus trailing
+// line). The bridge exists specifically to cover the gap between one
+// agent's stream complete and the next agent's stream start — the case the
+// explicit agent-state channel was designed to eliminate.
+func (m *Model) renderActivityBridge() string {
+	state := m.latestAgentState
+	if state == nil {
+		return ""
+	}
+	if slot, ok := m.streams[state.CorrelationID]; ok && slot != nil && slot.accumulator != nil {
+		// A streaming entry owns this correlation; the trailing activity
+		// indicator on that entry is already rendering the state inline.
+		return ""
+	}
+	detail := state.Detail
+	if detail == "" {
+		detail = humanizeAgentState(state.State)
+	}
+	if strings.TrimSpace(detail) == "" {
+		return ""
+	}
+	label := strings.TrimSpace(state.AgentType)
+	if label == "" {
+		label = strings.TrimSpace(state.AgentID)
+	}
+	if label == "" {
+		label = "agent"
+	}
+	text := thinkingSummaryGlyph + " " + label + " — " + detail
+	width := m.viewport.viewWidth
+	if width <= 0 {
+		width = m.width
+	}
+	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted).Italic(true)
+	if width > 0 {
+		return style.Render(truncateToWidth(text, width))
+	}
+	return style.Render(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,6 +1216,122 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	return nil
 }
 
+// handleAgentState applies an explicit agent-activity state transition.
+//
+// State events are the canonical source of "what is happening now" for the
+// UI activity indicator. Each correlation's most recent state is retained
+// (ordered by TransitionID to survive out-of-order delivery). Terminal
+// states (complete, errored) evict the correlation's record so a late
+// non-terminal state cannot resurrect a finished request. When the entry
+// for this correlation is still streaming, the state is attached to that
+// entry; otherwise the latest non-terminal state becomes the inter-stream
+// bridge indicator surfaced beneath the viewport.
+func (m *Model) handleAgentState(state msg.AgentStateMsg) tea.Cmd {
+	cid := strings.TrimSpace(state.CorrelationID)
+	if cid == "" {
+		return nil
+	}
+	if m.agentStates == nil {
+		m.agentStates = make(map[string]*agentActivityState)
+	}
+	// Preserve per-correlation monotonicity: reject any transition whose
+	// TransitionID is not strictly greater than what we already observed
+	// for this correlation. The publisher's counter is monotonic across
+	// the entire process, so equal/lesser IDs on the same correlation
+	// indicate out-of-order delivery.
+	if existing, ok := m.agentStates[cid]; ok && existing != nil {
+		if state.TransitionID > 0 && existing.TransitionID > state.TransitionID {
+			return nil
+		}
+	}
+	record := &agentActivityState{
+		CorrelationID:     cid,
+		AgentID:           strings.TrimSpace(state.AgentID),
+		AgentType:         strings.TrimSpace(state.AgentType),
+		State:             strings.TrimSpace(state.State),
+		Detail:            strings.TrimSpace(state.Detail),
+		PeerAgentType:     strings.TrimSpace(state.PeerAgentType),
+		PeerCorrelationID: strings.TrimSpace(state.PeerCorrelationID),
+		TransitionID:      state.TransitionID,
+		ObservedAt:        state.Timestamp,
+	}
+	if record.ObservedAt.IsZero() {
+		record.ObservedAt = time.Now()
+	}
+	terminal := isTerminalAgentState(record.State)
+	if terminal {
+		// Terminal states evict the correlation from the active map.
+		delete(m.agentStates, cid)
+		if m.latestAgentState != nil && m.latestAgentState.CorrelationID == cid {
+			m.latestAgentState = nil
+		}
+	} else {
+		m.agentStates[cid] = record
+		// Promote to latestAgentState for bridge rendering only when no
+		// newer state from a different correlation is already there.
+		if m.latestAgentState == nil || m.latestAgentState.TransitionID < record.TransitionID {
+			m.latestAgentState = record
+		}
+	}
+
+	// Attach the state detail to the entry currently holding this
+	// correlation's stream (if any) so the existing thinking-status
+	// rendering path surfaces the transition without the caller having to
+	// emit a separate progress event. Terminal states clear the status so
+	// the finalized entry doesn't show stale activity.
+	if slot, ok := m.streams[cid]; ok && slot.accumulator != nil {
+		if entry := m.history.Get(slot.accumulator.EntryIndex()); entry != nil {
+			if terminal {
+				entry.ThinkingStatus = ""
+			} else if detail := record.Detail; detail != "" {
+				entry.ThinkingStatus = detail
+			} else {
+				entry.ThinkingStatus = humanizeAgentState(record.State)
+			}
+			entry.Height = -1
+		}
+	}
+	return nil
+}
+
+// humanizeAgentState maps a canonical state string to a short user-facing
+// phrase. Used when the publisher didn't supply a detail — e.g., when the
+// state was auto-emitted by PublishStreamStart/Complete. Consistent
+// phrasing across agents keeps the UI indicator readable.
+func humanizeAgentState(state string) string {
+	switch state {
+	case "receiving":
+		return "Receiving request..."
+	case "reasoning":
+		return "Reasoning..."
+	case "tool_executing":
+		return "Executing tool..."
+	case "consulting_peer":
+		return "Consulting peer..."
+	case "dispatching_to_peer":
+		return "Dispatching to peer..."
+	case "awaiting_peer_response":
+		return "Awaiting peer response..."
+	case "composing_response":
+		return "Composing response..."
+	default:
+		return ""
+	}
+}
+
+// isTerminalAgentState reports whether the named state ends the
+// correlation's activity for bridge-indicator purposes. Kept as a string
+// comparison so the chat model does not take a dependency on the guide
+// package's enum.
+func isTerminalAgentState(state string) bool {
+	switch state {
+	case "complete", "errored":
+		return true
+	default:
+		return false
+	}
+}
+
 // handleStreamComplete finalizes a single streaming entry by correlationID.
 func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 	m.clearExplicitTopLevelTransferState(done.CorrelationID, done.ParentCorrelationID, done.BranchRef, done.TopLevelTransfer)
@@ -1169,9 +1378,21 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 
 	m.finalizeCompletedStreamSlot(cid, slot, true, "")
 
+	// If this slot owned the global thinking indicator and no streams remain,
+	// the thinking phase is over — resolve the placeholder and clear
+	// m.thinkingIdx. Without this, the last progress message ("Plan is ready
+	// for your review.", etc.) renders as a live spinner indefinitely even
+	// after the stream finished. handleStreamError has the symmetric guard;
+	// this restores parity after commit 4eb0d6e5 dropped it from the Complete
+	// path.
+	if m.thinkingIdx >= 0 && len(m.streams) == 0 {
+		m.resolveThinkingEntry()
+	}
+
 	chatDebugLog().Info("chat.handleStreamComplete: DONE",
 		"correlation_id", cid,
-		"remaining_streams", len(m.streams))
+		"remaining_streams", len(m.streams),
+		"thinking_idx", m.thinkingIdx)
 	return nil
 }
 
@@ -1700,7 +1921,7 @@ func (m *Model) PushEntry(entry *ChatEntry) {
 func (m *Model) handleInterAgentToolCallEvent(idx int, currentAgentType string, ev msg.ToolCallEventMsg) bool {
 	switch ev.Phase {
 	case 0:
-		if isInterAgentResponseTool(ev.ToolName) {
+		if eventIsInterAgentOriginUpdate(ev) {
 			return true
 		}
 		record, ok := buildInterAgentStartRecord(ev)
@@ -1721,8 +1942,25 @@ func (m *Model) handleInterAgentToolCallEvent(idx int, currentAgentType string, 
 			m.syncAllNestedInterAgentStreams()
 			return true
 		}
-		if m.applyInterAgentOriginUpdate(ev, currentAgentType) {
-			m.syncAllNestedInterAgentStreams()
+		// Origin-updates are identity-addressed (ThreadKey) cross-scope
+		// patches to an existing row. They must never fall through to
+		// buildInterAgentCompletionFallback — that path synthesizes a
+		// phantom row and is the root cause of duplicate-agent-row bugs.
+		// On miss we log and drop; a missing originator row is a routing
+		// defect upstream, not a display problem to paper over.
+		if eventIsInterAgentOriginUpdate(ev) {
+			if m.applyInterAgentOriginUpdateAnywhere(ev, currentAgentType) {
+				m.syncAllNestedInterAgentStreams()
+				return true
+			}
+			threadKey := ""
+			if ev.InterAgent != nil {
+				threadKey = strings.TrimSpace(ev.InterAgent.ThreadKey)
+			}
+			chatDebugLog().Warn("interAgent origin-update dropped: no row with matching ThreadKey",
+				"tool_name", ev.ToolName,
+				"thread_key", threadKey,
+				"correlation_id", ev.CorrelationID)
 			return true
 		}
 		record, ok := buildInterAgentCompletionFallback(ev, currentAgentType)
@@ -1808,6 +2046,88 @@ func (m *Model) applyInterAgentOriginUpdate(ev msg.ToolCallEventMsg, currentAgen
 	})
 	m.syncPendingInterAgentEntry(entryIdx)
 	return true
+}
+
+// applyInterAgentOriginUpdateAnywhere is the unified cross-scope handler for
+// origin-update events. An origin-update semantically targets the *challenger's*
+// row (e.g. validate_work from tester → inspector's challenge_agent row). That
+// row can live in a top-level entry's ToolCalls, in a nested stream slot's
+// activity.ToolCalls, or in the recursive children of either. Scanning only one
+// scope — which is what the legacy list-scoped helpers did — silently missed
+// matches in the other scopes and the fallback-append path synthesized phantom
+// duplicate rows to fill the gap. This helper searches all three scopes by
+// ThreadKey and returns true if any row was updated.
+func (m *Model) applyInterAgentOriginUpdateAnywhere(ev msg.ToolCallEventMsg, currentAgentType string) bool {
+	if m.applyInterAgentOriginUpdate(ev, currentAgentType) {
+		return true
+	}
+	row, ok := interAgentOriginUpdate(ev, currentAgentType)
+	if !ok || row == nil || strings.TrimSpace(row.ThreadKey) == "" {
+		return false
+	}
+	threadKey := strings.TrimSpace(row.ThreadKey)
+	for _, slot := range m.nestedStreams {
+		if slot == nil {
+			continue
+		}
+		if applyInterAgentOriginUpdateToList(&slot.activity.ToolCalls, threadKey, row) {
+			m.syncPendingNestedStream(slot)
+			return true
+		}
+	}
+	// After a nested slot is merged into its parent row and the slot is
+	// cleared, the only remaining scope holding the ThreadKey is inside
+	// entry.ToolCalls[i].InterAgent.Children[j].ToolCalls[k]. findInterAgentThread
+	// only inspects top-level entry.ToolCalls, so we walk each entry's calls
+	// recursively here as the final scope before giving up.
+	matched := false
+	for idx := m.history.Len() - 1; idx >= 0 && !matched; idx-- {
+		entryIdx := idx
+		m.history.UpdateAt(entryIdx, func(e *ChatEntry) {
+			if applyInterAgentOriginUpdateToList(&e.ToolCalls, threadKey, row) {
+				invalidateChatEntryRender(e)
+				matched = true
+			}
+		})
+		if matched {
+			m.syncPendingInterAgentEntry(entryIdx)
+			return true
+		}
+	}
+	return false
+}
+
+// applyInterAgentOriginUpdateToList walks a tool-call list (including its
+// InterAgent children recursively) looking for a row whose ThreadKey matches.
+// Returns true on the first match after updating it in place.
+func applyInterAgentOriginUpdateToList(calls *[]ToolCallRecord, threadKey string, row *InterAgentTool) bool {
+	if calls == nil || row == nil {
+		return false
+	}
+	for i := range *calls {
+		tc := &(*calls)[i]
+		if tc.InterAgent == nil {
+			continue
+		}
+		if strings.TrimSpace(tc.InterAgent.ThreadKey) == threadKey {
+			if len(row.AgentTypes) > 0 {
+				tc.InterAgent.AgentTypes = append([]string(nil), row.AgentTypes...)
+			}
+			tc.InterAgent.Summary = row.Summary
+			tc.InterAgent.Status = row.Status
+			tc.InterAgent.ThreadKey = row.ThreadKey
+			tc.Success = row.Status != InterAgentToolFailed
+			tc.Completed = true
+			return true
+		}
+		for j := range tc.InterAgent.Children {
+			child := &tc.InterAgent.Children[j]
+			if applyInterAgentOriginUpdateToList(&child.ToolCalls, threadKey, row) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m *Model) findInterAgentThread(threadKey string) (int, int, bool) {
@@ -2020,7 +2340,12 @@ func (m *Model) handleNestedToolCallEvent(ev msg.ToolCallEventMsg) bool {
 		}
 	}
 	currentAgentType := nestedActivityAgentType(&slot.activity)
-	if handleInterAgentToolCallInList(&slot.activity.ToolCalls, currentAgentType, ev) {
+	cb := interAgentDispatchCallbacks{
+		crossScopeOriginUpdate: func(ev msg.ToolCallEventMsg) bool {
+			return m.applyInterAgentOriginUpdateAnywhere(ev, currentAgentType)
+		},
+	}
+	if handleInterAgentToolCallInList(&slot.activity.ToolCalls, currentAgentType, ev, cb) {
 		m.reconcileToolDerivedNestedProgress(slot)
 		m.syncPendingNestedStream(slot)
 		return true
@@ -3063,13 +3388,26 @@ func populateClonedInterAgentTree(root any) {
 	}
 }
 
-func handleInterAgentToolCallInList(calls *[]ToolCallRecord, currentAgentType string, ev msg.ToolCallEventMsg) bool {
+// interAgentDispatchCallbacks gives a list-scoped handler a way to reach
+// outside its list when it encounters an event that is semantically
+// cross-scope (origin-updates, primarily). Without these, the list-scoped
+// handler would fall through to buildInterAgentCompletionFallback and
+// synthesize a phantom duplicate row — the root cause of the duplicate-
+// agent-row bug class we're trying to eliminate.
+type interAgentDispatchCallbacks struct {
+	// crossScopeOriginUpdate attempts to apply an origin-update to any row
+	// in the history (top-level entries, nested stream slots, or nested
+	// child activities). Returns true if some row was patched.
+	crossScopeOriginUpdate func(ev msg.ToolCallEventMsg) bool
+}
+
+func handleInterAgentToolCallInList(calls *[]ToolCallRecord, currentAgentType string, ev msg.ToolCallEventMsg, cb interAgentDispatchCallbacks) bool {
 	if calls == nil {
 		return false
 	}
 	switch ev.Phase {
 	case 0:
-		if isInterAgentResponseTool(ev.ToolName) {
+		if eventIsInterAgentOriginUpdate(ev) {
 			return true
 		}
 		record, ok := buildInterAgentStartRecord(ev)
@@ -3128,6 +3466,25 @@ func handleInterAgentToolCallInList(calls *[]ToolCallRecord, currentAgentType st
 				return true
 			}
 		}
+		// Origin-updates are identity-addressed (ThreadKey) and must route
+		// cross-scope when the local list doesn't contain the originator.
+		// Falling through to buildInterAgentCompletionFallback here was
+		// creating duplicate phantom rows in the nested stream's
+		// activity.ToolCalls (e.g. an "inspector-pipeline" row appearing
+		// as a child of the tester-pipeline nested slot). The caller's
+		// crossScopeOriginUpdate callback walks every scope by ThreadKey;
+		// on miss we log + drop because a missing originator row is a
+		// routing defect upstream, not a display problem to paper over.
+		if eventIsInterAgentOriginUpdate(ev) {
+			if cb.crossScopeOriginUpdate != nil && cb.crossScopeOriginUpdate(ev) {
+				return true
+			}
+			chatDebugLog().Warn("interAgent origin-update dropped from list scope: no row with matching ThreadKey",
+				"tool_name", ev.ToolName,
+				"thread_key", interAgentEventThreadKey(ev),
+				"correlation_id", ev.CorrelationID)
+			return true
+		}
 		record, ok := buildInterAgentCompletionFallback(ev, currentAgentType)
 		if !ok {
 			return false
@@ -3137,6 +3494,15 @@ func handleInterAgentToolCallInList(calls *[]ToolCallRecord, currentAgentType st
 	default:
 		return false
 	}
+}
+
+// interAgentEventThreadKey extracts the ThreadKey carried on an event's
+// InterAgent metadata, trimmed. Used for telemetry on origin-update misses.
+func interAgentEventThreadKey(ev msg.ToolCallEventMsg) string {
+	if ev.InterAgent == nil {
+		return ""
+	}
+	return strings.TrimSpace(ev.InterAgent.ThreadKey)
 }
 
 func invalidateChatEntryRender(e *ChatEntry) {

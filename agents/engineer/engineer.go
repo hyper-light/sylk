@@ -241,6 +241,14 @@ func (e *Engineer) getProvider() engineerProvider {
 	return e.provider
 }
 
+// Ready implements shared.ReadinessReporter.
+func (e *Engineer) Ready() (bool, string) {
+	if e.getProvider() == nil {
+		return false, "LLM provider not yet wired (post-init / pre-auth window)"
+	}
+	return true, ""
+}
+
 // ProviderType implements container.AuthRefreshable.
 func (e *Engineer) ProviderType() string {
 	return string(container.ProviderForModel(e.CurrentModel()))

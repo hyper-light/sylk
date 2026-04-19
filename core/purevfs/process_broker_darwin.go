@@ -36,8 +36,8 @@ func strictExecutionProbe() error {
 	switch {
 	case !commandAvailable("sandbox-exec"):
 		return fmt.Errorf("%w: sandbox-exec not installed", ErrStrictExecutionUnavailable)
-	case !darwinProjectionAvailable():
-		return fmt.Errorf("%w: macFUSE is not installed", ErrStrictExecutionUnavailable)
+	case detectDarwinFUSEBackend() == darwinFUSEBackendNone:
+		return fmt.Errorf("%w: no FUSE backend installed; install FUSE-T (https://www.fuse-t.org) or macFUSE (https://macfuse.github.io)", ErrStrictExecutionUnavailable)
 	case !darwinVolumesRootAvailable():
 		return fmt.Errorf("%w: /Volumes unavailable for projected mounts", ErrStrictExecutionUnavailable)
 	default:
@@ -45,12 +45,24 @@ func strictExecutionProbe() error {
 	}
 }
 
+// detectDarwinFUSEBackend returns the first FUSE userland it finds installed
+// in the order cgofuse dlopens them at runtime: macFUSE (v4+) → osxfuse
+// (legacy macFUSE) → FUSE-T. Returns darwinFUSEBackendNone when none are
+// available; callers treat that as strict-execution-unavailable.
+//
+// Thin wrapper around classifyDarwinFUSEBackend — the detection logic is
+// factored into that pure function (no direct filesystem references) so the
+// selection behavior can be tested cross-platform in CI without requiring a
+// live darwin host.
+func detectDarwinFUSEBackend() darwinFUSEBackend {
+	return classifyDarwinFUSEBackend(func(path string) bool {
+		_, err := os.Stat(path)
+		return err == nil
+	})
+}
+
 func darwinProjectionAvailable() bool {
-	if _, err := os.Stat("/Library/Filesystems/macfuse.fs"); err == nil {
-		return true
-	}
-	_, err := os.Stat("/Library/Filesystems/osxfuse.fs")
-	return err == nil
+	return detectDarwinFUSEBackend() != darwinFUSEBackendNone
 }
 
 func mountExecutionRoot(_ context.Context, _ BrokerRunRequest, root *projectedRoot) (mountedExecutionRoot, error) {

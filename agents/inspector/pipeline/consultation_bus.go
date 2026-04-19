@@ -75,7 +75,6 @@ func (pi *PipelineInspector) requestRouteSync(ctx context.Context, target, paylo
 	waitCtx, release := shared.WithoutDeadlineCancellation(ctx)
 	defer release()
 
-	branchCtx, branch := shared.BeginAutoInterAgentRouteBranch(waitCtx, target, payload, nil)
 	req := &guide.RouteRequest{
 		Input:           payload,
 		SourceAgentID:   pi.id,
@@ -84,13 +83,13 @@ func (pi *PipelineInspector) requestRouteSync(ctx context.Context, target, paylo
 		ExplicitTarget:  strings.TrimSpace(target) != "",
 	}
 	if req.ParentCorrelationID == "" {
-		if stream, ok := shared.StreamMetadataFromContext(branchCtx); ok {
+		if stream, ok := shared.StreamMetadataFromContext(waitCtx); ok {
 			req.ParentCorrelationID = stream.CorrelationID
 		}
 	}
-	req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
-	req.Metadata = shared.RouteMetadataWithInterAgentBranch(branchCtx, req.Metadata)
-	response, err := shared.RetryBusyRouteRequest(branchCtx, target, shared.DefaultBusyRetryPolicy(target), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
+	req.Metadata = shared.InheritedBranchMetadata(waitCtx, req.Metadata)
+	req.Metadata = shared.RouteMetadataWithInterAgentBranch(waitCtx, req.Metadata)
+	response, err := shared.RetryBusyRouteRequest(waitCtx, target, shared.DefaultBusyRetryPolicy(target), func(attemptCtx context.Context, _ int) (*guide.Message, error) {
 		req.CorrelationID = fmt.Sprintf("pi_corr_%s", uuid.New().String()[:8])
 		wait := pi.registerPendingWait(req.CorrelationID)
 		defer pi.clearPendingWait(req.CorrelationID)
@@ -117,9 +116,7 @@ func (pi *PipelineInspector) requestRouteSync(ctx context.Context, target, paylo
 		return response, nil
 	})
 	if err != nil {
-		branch.Complete(branchCtx, "", "", err)
 		return nil, err
 	}
-	branch.CompleteFromMessage(branchCtx, response, nil)
 	return response, nil
 }

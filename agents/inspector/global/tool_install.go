@@ -117,14 +117,23 @@ func (gi *GlobalInspector) researchDependencyInstall(
 
 func (gi *GlobalInspector) installDependencyTooling(ctx context.Context, plan *globalInspectorDependencyInstallPlan) (map[string]any, error) {
 	return agentshared.ExecuteDependencyInstallPlan(ctx, agentshared.DependencyInstallSkillConfig{
-		SkillName:      "install_dependency_tooling",
-		ResearchSkill:  "research_dependency_install",
-		AgentType:      "inspector",
-		AgentID:        func() string { return gi.id },
-		SessionID:      func() string { return gi.config.SessionID },
-		WorkingDir:     gi.toolRunner.WorkingDir,
-		DefaultTimeout: func() time.Duration { return gi.config.DefaultTimeout },
-		ValidatePlan:   inspectorshared.InspectorRejectTestDependencyInstallPlan,
+		SkillName:       "install_dependency_tooling",
+		ResearchSkill:   "research_dependency_install",
+		AgentType:       "inspector",
+		AgentID:         func() string { return gi.id },
+		SessionID:       func() string { return gi.config.SessionID },
+		WorkingDir:      gi.toolRunner.WorkingDir,
+		DefaultTimeout:  func() time.Duration { return gi.config.DefaultTimeout },
+		ValidatePlan:    inspectorshared.InspectorRejectTestDependencyInstallPlan,
+		ExecutionBroker: func() purevfs.ExecutionBroker { return gi.executionBroker },
+		PrepareExecution: func(ctx context.Context, workingDir string) (agentshared.CommandExecContext, error) {
+			execCtx, err := gi.commandExecutionContext(ctx, workingDir)
+			if err != nil {
+				return agentshared.CommandExecContext{}, err
+			}
+			return agentshared.CommandExecContext{WorkDir: execCtx.workDir, Plan: execCtx.plan}, nil
+		},
+		ExecutionWorkspace: gi.executionWorkspace,
 	}, plan)
 }
 

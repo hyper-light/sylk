@@ -117,14 +117,23 @@ func (pi *PipelineInspector) researchDependencyInstall(
 
 func (pi *PipelineInspector) installDependencyTooling(ctx context.Context, plan *pipelineInspectorDependencyInstallPlan) (map[string]any, error) {
 	return agentshared.ExecuteDependencyInstallPlan(ctx, agentshared.DependencyInstallSkillConfig{
-		SkillName:      "install_dependency_tooling",
-		ResearchSkill:  "research_dependency_install",
-		AgentType:      "inspector-pipeline",
-		AgentID:        func() string { return pi.id },
-		SessionID:      func() string { return pi.config.SessionID },
-		WorkingDir:     pi.toolRunner.WorkingDir,
-		DefaultTimeout: func() time.Duration { return pi.config.DefaultTimeout },
-		ValidatePlan:   inspectorshared.InspectorRejectTestDependencyInstallPlan,
+		SkillName:       "install_dependency_tooling",
+		ResearchSkill:   "research_dependency_install",
+		AgentType:       "inspector-pipeline",
+		AgentID:         func() string { return pi.id },
+		SessionID:       func() string { return pi.config.SessionID },
+		WorkingDir:      pi.toolRunner.WorkingDir,
+		DefaultTimeout:  func() time.Duration { return pi.config.DefaultTimeout },
+		ValidatePlan:    inspectorshared.InspectorRejectTestDependencyInstallPlan,
+		ExecutionBroker: func() purevfs.ExecutionBroker { return pi.executionBroker },
+		PrepareExecution: func(ctx context.Context, workingDir string) (agentshared.CommandExecContext, error) {
+			execCtx, err := pi.commandExecutionContext(ctx, workingDir)
+			if err != nil {
+				return agentshared.CommandExecContext{}, err
+			}
+			return agentshared.CommandExecContext{WorkDir: execCtx.workDir, Plan: execCtx.plan}, nil
+		},
+		ExecutionWorkspace: pi.executionWorkspace,
 	}, plan)
 }
 

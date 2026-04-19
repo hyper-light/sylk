@@ -118,6 +118,14 @@ func renderToolCalls(calls []ToolCallRecord, width int, th *theme.Theme) ([]stri
 type interAgentRenderedChildRow struct {
 	lines      []string
 	subregions []ToolCallSubregion
+	// failed is true when the underlying ToolCallRecord finished with
+	// Success=false. capInterAgentChildRows uses this to pin failed rows in
+	// the visible window so the user can see which calls failed even when
+	// the call list is large enough to spill into the overflow bucket.
+	// Without this, an orchestrator consult that aborts after several
+	// failures shows only the most recent (often successful) calls and the
+	// failure status reads as a parent-row X with no visible cause.
+	failed bool
 }
 
 type interAgentRenderedChildSection struct {
@@ -415,6 +423,7 @@ func renderInterAgentChildToolCall(tc ToolCallRecord, width int, th *theme.Theme
 			ChildPath:        cloneIntSlice(childPath),
 			InterAgentPath:   cloneIntSlice(interAgentPath),
 		}},
+		failed: tc.Completed && !tc.Success,
 	}
 }
 
@@ -520,21 +529,69 @@ func capInterAgentChildRows(rows []interAgentRenderedChildRow, width int, th *th
 	if expanded || len(rows) <= maxInterAgentChildLines {
 		return rows
 	}
-	overflow := len(rows) - (maxInterAgentChildLines - 1)
+
+	// Build the visible set: always include the most recent (maxInterAgentChildLines-1)
+	// rows, plus any failed rows that would otherwise be hidden in the
+	// overflow bucket. The historical "show only the last N" policy made
+	// failure-status invisible when the parent inter-agent row aborted —
+	// e.g., an orchestrator consult that errors after several failed tool
+	// calls would render as a parent X with no visible cause because the
+	// failed children all sat in the hidden bucket. Pinning them keeps
+	// failure-attribution legible regardless of call-list length.
+	tailStart := len(rows) - (maxInterAgentChildLines - 1)
+	if tailStart < 0 {
+		tailStart = 0
+	}
+	pinned := make([]int, 0, len(rows))
+	for i := 0; i < tailStart; i++ {
+		if rows[i].failed {
+			pinned = append(pinned, i)
+		}
+	}
+	hiddenCount := tailStart - len(pinned)
+	hiddenFailedCount := 0
+	// hiddenFailedCount is informational for the overflow label even when
+	// pinning has hoisted every failure into the visible window — readers
+	// shouldn't see "(0 failed)" when nothing is hidden, so we only annotate
+	// when there are still hidden failures (which only happens if we hit
+	// the unlikely cap below).
+
+	// Cap the number of pinned-rows we hoist into the visible window so a
+	// pathological history (every call failed) doesn't blow up the row.
+	maxPinned := maxInterAgentChildLines * 2
+	if len(pinned) > maxPinned {
+		// Keep the most recent failed rows; demote older failures back into
+		// the overflow bucket and surface their count in the label.
+		dropped := len(pinned) - maxPinned
+		hiddenFailedCount += dropped
+		hiddenCount += dropped
+		pinned = pinned[len(pinned)-maxPinned:]
+	}
+
 	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	out := make([]interAgentRenderedChildRow, 0, maxInterAgentChildLines)
-	out = append(out, interAgentRenderedChildRow{
-		lines: []string{truncateStyledWithDots(mutedStyle.Render(fmt.Sprintf("… %d earlier event%s", overflow, pluralSuffix(overflow))), width)},
-		subregions: []ToolCallSubregion{{
-			Start:          0,
-			End:            1,
-			Kind:           ToolCallSubregionOverflow,
-			ChildIndex:     leafChildIndex(childPath),
-			ChildPath:      cloneIntSlice(childPath),
-			InterAgentPath: cloneIntSlice(interAgentPath),
-		}},
-	})
-	out = append(out, rows[len(rows)-(maxInterAgentChildLines-1):]...)
+	overflowLabel := fmt.Sprintf("… %d earlier event%s", hiddenCount, pluralSuffix(hiddenCount))
+	if hiddenFailedCount > 0 {
+		overflowLabel += fmt.Sprintf(" (%d failed)", hiddenFailedCount)
+	}
+
+	out := make([]interAgentRenderedChildRow, 0, len(pinned)+maxInterAgentChildLines)
+	if hiddenCount > 0 {
+		out = append(out, interAgentRenderedChildRow{
+			lines: []string{truncateStyledWithDots(mutedStyle.Render(overflowLabel), width)},
+			subregions: []ToolCallSubregion{{
+				Start:          0,
+				End:            1,
+				Kind:           ToolCallSubregionOverflow,
+				ChildIndex:     leafChildIndex(childPath),
+				ChildPath:      cloneIntSlice(childPath),
+				InterAgentPath: cloneIntSlice(interAgentPath),
+			}},
+		})
+	}
+	for _, idx := range pinned {
+		out = append(out, rows[idx])
+	}
+	out = append(out, rows[tailStart:]...)
 	return out
 }
 
@@ -564,8 +621,9 @@ type interAgentNestedBlockItem struct {
 	child            InterAgentChildActivity
 	toolCall         ToolCallRecord
 	childToolCallIdx int
-	overflowCount    int
-	overflowExpanded bool
+	overflowCount      int
+	overflowExpanded   bool
+	overflowFailedHint int
 	rootSummary      string
 	anchorToolCall   bool
 	anchorChildPath  []int
@@ -737,6 +795,28 @@ func renderInterAgentNestedBlock(stack []interAgentNestedBlockItem, width int, t
 			if item.child.ToolCallsExpanded {
 				renderStart = 0
 			}
+			// Pin failed tool calls from the to-be-hidden range so the user
+			// can see what failed even when the call list is long enough to
+			// spill into the overflow bucket. Without this pinning the
+			// parent inter-agent row's terminal X is uncorroborated by any
+			// visible child failure — the historical "orchestrator
+			// conversation: tool calls failed N consecutive turns" report
+			// where the screen showed only successful child rows.
+			pinnedHidden := []int(nil)
+			hiddenFailedCount := 0
+			if !item.child.ToolCallsExpanded {
+				for i := 0; i < renderStart; i++ {
+					tc := item.child.ToolCalls[i]
+					if tc.Completed && !tc.Success {
+						pinnedHidden = append(pinnedHidden, i)
+					}
+				}
+				if len(pinnedHidden) > maxInterAgentChildLines*2 {
+					dropped := len(pinnedHidden) - maxInterAgentChildLines*2
+					hiddenFailedCount += dropped
+					pinnedHidden = pinnedHidden[len(pinnedHidden)-(maxInterAgentChildLines*2):]
+				}
+			}
 			for i := len(item.child.ToolCalls) - 1; i >= renderStart; i-- {
 				stack = append(stack, interAgentNestedBlockItem{
 					kind:             interAgentNestedBlockItemToolCall,
@@ -749,15 +829,31 @@ func renderInterAgentNestedBlock(stack []interAgentNestedBlockItem, width int, t
 					childToolCallIdx: i,
 				})
 			}
+			// Push pinned failed-rows in reverse so they emerge above the
+			// tail (most-recent-failure-first ordering preserved).
+			for k := len(pinnedHidden) - 1; k >= 0; k-- {
+				i := pinnedHidden[k]
+				stack = append(stack, interAgentNestedBlockItem{
+					kind:             interAgentNestedBlockItemToolCall,
+					isLast:           false,
+					ancestors:        cloneBoolSlice(nextAncestors),
+					childIndex:       item.childIndex,
+					childPath:        cloneIntSlice(item.childPath),
+					interAgentPath:   cloneIntSlice(item.interAgentPath),
+					toolCall:         item.child.ToolCalls[i],
+					childToolCallIdx: i,
+				})
+			}
 			stack = append(stack, interAgentNestedBlockItem{
-				kind:             interAgentNestedBlockItemOverflow,
-				isLast:           false,
-				ancestors:        cloneBoolSlice(nextAncestors),
-				childIndex:       item.childIndex,
-				childPath:        cloneIntSlice(item.childPath),
-				interAgentPath:   cloneIntSlice(item.interAgentPath),
-				overflowCount:    visibleStart,
-				overflowExpanded: item.child.ToolCallsExpanded,
+				kind:               interAgentNestedBlockItemOverflow,
+				isLast:             false,
+				ancestors:          cloneBoolSlice(nextAncestors),
+				childIndex:         item.childIndex,
+				childPath:          cloneIntSlice(item.childPath),
+				interAgentPath:     cloneIntSlice(item.interAgentPath),
+				overflowCount:      visibleStart - len(pinnedHidden),
+				overflowFailedHint: hiddenFailedCount,
+				overflowExpanded:   item.child.ToolCallsExpanded,
 			})
 		case interAgentNestedBlockItemToolCall:
 			if item.toolCall.InterAgent != nil && interAgentToolHasVisibleChildren(item.toolCall.InterAgent) {
@@ -806,8 +902,15 @@ func renderInterAgentNestedBlock(stack []interAgentNestedBlockItem, width int, t
 				InterAgentPath:   cloneIntSlice(item.interAgentPath),
 			})
 		case interAgentNestedBlockItemOverflow:
+			// When pinning hoisted every hidden row into the visible window,
+			// the overflow indicator has nothing left to count — skip it.
+			// Otherwise the user sees a control that, when clicked,
+			// "expands" zero additional rows.
+			if item.overflowCount <= 0 && item.overflowFailedHint <= 0 && !item.overflowExpanded {
+				continue
+			}
 			rowStart := len(blockLines)
-			label := renderInterAgentOverflowControlLabel(item.overflowCount, item.overflowExpanded, th)
+			label := renderInterAgentOverflowControlLabel(item.overflowCount, item.overflowFailedHint, item.overflowExpanded, th)
 			prefix := interAgentOverflowControlPrefix(item.root, item.ancestors, mutedStyle)
 			blockLines = append(blockLines, truncateStyledWithDots(prefix+truncateStyledWithDots(label, max(width-lipgloss.Width(prefix), 0)), width))
 			subregions = append(subregions, ToolCallSubregion{
@@ -823,11 +926,24 @@ func renderInterAgentNestedBlock(stack []interAgentNestedBlockItem, width int, t
 	return blockLines, subregions
 }
 
-func renderInterAgentOverflowControlLabel(hiddenCount int, expanded bool, th *theme.Theme) string {
+// renderInterAgentOverflowControlLabel formats the collapse/expand control for
+// a child's hidden tool-call rows. When hiddenFailed > 0 the label includes a
+// "(N failed)" annotation so the user can see at a glance that expanding the
+// overflow will reveal failure-status rows that the visible window missed.
+// hiddenFailed is non-zero only when the failure-pinning cap kicked in
+// (extremely long history of failures); in the common case all failures are
+// already visible and the label reads as the historical "▸ Show N earlier
+// events".
+func renderInterAgentOverflowControlLabel(hiddenCount, hiddenFailed int, expanded bool, th *theme.Theme) string {
+	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	if expanded {
-		return lipgloss.NewStyle().Foreground(th.Palette.Muted).Render("▾ hide")
+		return mutedStyle.Render("▾ hide")
 	}
-	return lipgloss.NewStyle().Foreground(th.Palette.Muted).Render(fmt.Sprintf("▸ Show %d earlier event%s", hiddenCount, pluralSuffix(hiddenCount)))
+	label := fmt.Sprintf("▸ Show %d earlier event%s", hiddenCount, pluralSuffix(hiddenCount))
+	if hiddenFailed > 0 {
+		label += fmt.Sprintf(" (%d failed)", hiddenFailed)
+	}
+	return mutedStyle.Render(label)
 }
 
 func interAgentNestedBlockPrefixes(root bool, ancestors []bool, isLast bool, mutedStyle lipgloss.Style) (string, string, string) {

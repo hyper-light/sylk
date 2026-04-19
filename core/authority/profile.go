@@ -96,15 +96,22 @@ var profiles = map[string]Profile{
 	"librarian": {
 		AgentType: "librarian",
 		FileScope: FileScopeDiskRead,
-		// Librarian needs to inspect both committed disk state and the
-		// in-flight global VFS overlay. read_file stays disk-only by design;
-		// the workspace-aware skills (read_workspace_file, workspace_glob,
-		// workspace_grep, inspect_workspace_state, summarize_workspace_state)
-		// are how the librarian reaches the global VFS — pipeline-local
-		// overlays remain off limits because the librarian operates above
-		// any single pipeline's scope.
-		WorkspaceViews: []versioning.WorkspaceView{versioning.WorkspaceViewDisk, versioning.WorkspaceViewGlobal},
-		ExecScope:      ExecScopeDisk,
+		// Librarian reads across all three layers — disk (committed source
+		// of truth), global (in-flight session overlay), and pipeline-local
+		// drafts (engineer/tester work in progress). Originally the
+		// librarian was strictly disk-only as a hack to prevent confusion
+		// about "what actually exists." Practice exposed that confusion is
+		// avoided more robustly by *naming the layer* on every read tool
+		// (read_workspace_file requires a `view` param) and requiring
+		// layer attribution in every response (see prompts/librarian).
+		// FileScope stays at FileScopeDiskRead so writes remain blocked
+		// across all layers — librarian is read-only by role.
+		WorkspaceViews: []versioning.WorkspaceView{
+			versioning.WorkspaceViewDisk,
+			versioning.WorkspaceViewGlobal,
+			versioning.WorkspaceViewPipeline,
+		},
+		ExecScope: ExecScopeDisk,
 	},
 	"orchestrator": {
 		AgentType:      "orchestrator",

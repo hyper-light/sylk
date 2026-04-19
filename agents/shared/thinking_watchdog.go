@@ -101,26 +101,30 @@ func ProgressPublisherFromContext(ctx context.Context) *ProgressPublisher {
 	return pp
 }
 
-// Publish sends a progress message to the UI via the bus.
-func (pp *ProgressPublisher) Publish(message string) {
-	pp.publishProgress(events.AgentUIStateNone, message, false)
+// Publish sends a progress message to the UI via the bus. Returns the
+// underlying publish error so the agent's loop can surface a delivery
+// failure; nil on success or when no publisher is configured.
+func (pp *ProgressPublisher) Publish(message string) error {
+	return pp.publishProgress(events.AgentUIStateNone, message, false)
 }
 
-// PublishState sends a progress message with an explicit UI state.
-func (pp *ProgressPublisher) PublishState(state events.AgentUIState, message string) {
-	pp.publishProgress(state, message, false)
+// PublishState sends a progress message with an explicit UI state. Returns
+// the underlying publish error for the agent's loop to surface.
+func (pp *ProgressPublisher) PublishState(state events.AgentUIState, message string) error {
+	return pp.publishProgress(state, message, false)
 }
 
-// PublishWatchdog sends a low-priority watchdog progress message.
-func (pp *ProgressPublisher) PublishWatchdog(message string) {
-	pp.publishProgress(events.AgentUIStateNone, message, true)
+// PublishWatchdog sends a low-priority watchdog progress message. Returns
+// the underlying publish error for the agent's loop to surface.
+func (pp *ProgressPublisher) PublishWatchdog(message string) error {
+	return pp.publishProgress(events.AgentUIStateNone, message, true)
 }
 
-func (pp *ProgressPublisher) publishProgress(state events.AgentUIState, message string, watchdog bool) {
+func (pp *ProgressPublisher) publishProgress(state events.AgentUIState, message string, watchdog bool) error {
 	if pp == nil || pp.Bus == nil || pp.Channels == nil {
-		return
+		return nil
 	}
-	pp.publishEvent(&guide.StreamEvent{
+	return pp.publishEvent(&guide.StreamEvent{
 		Type: guide.StreamEventProgress,
 		Data: &guide.ProgressData{
 			Message:  message,
@@ -131,32 +135,32 @@ func (pp *ProgressPublisher) publishProgress(state events.AgentUIState, message 
 	})
 }
 
-func (pp *ProgressPublisher) PublishChunk(text string) {
+func (pp *ProgressPublisher) PublishChunk(text string) error {
 	if pp == nil || pp.Bus == nil || pp.Channels == nil || strings.TrimSpace(text) == "" {
-		return
+		return nil
 	}
-	pp.publishEvent(&guide.StreamEvent{
+	return pp.publishEvent(&guide.StreamEvent{
 		Type:      guide.StreamEventData,
 		Text:      text,
 		Timestamp: time.Now(),
 	})
 }
 
-func (pp *ProgressPublisher) PublishStart() {
+func (pp *ProgressPublisher) PublishStart() error {
 	if pp == nil || pp.Bus == nil || pp.Channels == nil {
-		return
+		return nil
 	}
-	pp.publishEvent(&guide.StreamEvent{
+	return pp.publishEvent(&guide.StreamEvent{
 		Type:      guide.StreamEventStart,
 		Timestamp: time.Now(),
 	})
 }
 
-func (pp *ProgressPublisher) PublishRetry(status providers.RetryEvent) {
+func (pp *ProgressPublisher) PublishRetry(status providers.RetryEvent) error {
 	if pp == nil || pp.Bus == nil || pp.Channels == nil {
-		return
+		return nil
 	}
-	pp.publishEvent(&guide.StreamEvent{
+	return pp.publishEvent(&guide.StreamEvent{
 		Type: guide.StreamEventRetry,
 		Data: guide.RetryStatus{
 			Attempt:     status.Attempt,
@@ -168,9 +172,9 @@ func (pp *ProgressPublisher) PublishRetry(status providers.RetryEvent) {
 	})
 }
 
-func (pp *ProgressPublisher) publishEvent(event *guide.StreamEvent) {
+func (pp *ProgressPublisher) publishEvent(event *guide.StreamEvent) error {
 	if pp == nil || pp.Bus == nil || pp.Channels == nil || event == nil {
-		return
+		return nil
 	}
 	stream := &guide.StreamResponse{
 		CorrelationID:     pp.CorrelationID,
@@ -191,11 +195,20 @@ func (pp *ProgressPublisher) publishEvent(event *guide.StreamEvent) {
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
 	}
-	publishWithLifecycleState(pp.lifecycle, event.Type, func() {
-		_ = pp.Bus.Publish(pp.Channels.Responses, msg)
-	}) // discard (delivered, lateBypass) — watchdog progress events are
-	// gated normally; tool-call bypass telemetry only matters at the
-	// publishWithStreamLifecycle entry point that has ctx for logging.
+	// (delivered, lateBypass) discarded here — watchdog progress events are
+	// gated normally and have no ctx for tool-call bypass telemetry; the
+	// publishWithStreamLifecycle entry point handles that.
+	_, _, publishErr := publishWithLifecycleState(pp.lifecycle, event.Type, func() error {
+		return pp.Bus.Publish(pp.Channels.Responses, msg)
+	})
+	if publishErr != nil {
+		// Watchdog publishers carry no agent EventLogger, so we can only
+		// propagate. The caller (thinking watchdog tick) is responsible for
+		// surfacing this — typically by abandoning the watchdog cycle and
+		// letting the underlying LLM call complete on its own.
+		return fmt.Errorf("publish watchdog event %s: %w", event.Type, publishErr)
+	}
+	return nil
 }
 
 // CompleteWithWatchdog wraps a provider Complete call with a TTFT watchdog.
@@ -225,6 +238,14 @@ func CompleteWithWatchdog(
 	if err := WaitWhileExecutionPaused(ctx); err != nil {
 		return nil, err
 	}
+	// Announce `reasoning` at the start of every LLM call — this is the
+	// canonical "agent is thinking" transition that feeds the chat activity
+	// indicator. Emitting from this single choke point covers every agent
+	// that uses CompleteWithWatchdog without per-agent instrumentation. The
+	// agent's `receiving` state (from PublishStreamStart) is superseded by
+	// this one; the next transition (tool_executing or composing_response)
+	// supersedes this one in turn.
+	publishAgentStateFromWatchdog(ctx, displayName, guide.AgentStateReasoning, "")
 	start := time.Now()
 	if shouldLiveStreamTurn(ctx) {
 		if sp, ok := p.(streamingCompletionProvider); ok {
@@ -249,6 +270,31 @@ func CompleteWithWatchdog(
 
 	LogLLMCallFromContext(ctx, req.Model, resp, time.Since(start), err)
 	return resp, err
+}
+
+// publishAgentStateFromWatchdog emits an AgentStateEvent routed through the
+// ProgressPublisher that the caller installed on ctx. We cannot call
+// shared.PublishAgentState directly here without a bus reference, and we
+// want the same identity (agent id + source) that the progress publisher
+// already captures; routing via the publisher keeps the state events on
+// the same response channel as chunks/progress. A nil publisher is a
+// legitimate no-op (test contexts, sub-agents with no user-visible
+// channel).
+func publishAgentStateFromWatchdog(ctx context.Context, displayName string, state guide.AgentActivityState, detail string) {
+	pp := ProgressPublisherFromContext(ctx)
+	if pp == nil || pp.Bus == nil || pp.Channels == nil {
+		return
+	}
+	if err := PublishAgentState(pp.Bus, pp.Channels, ctx, pp.AgentID, strings.ToLower(strings.TrimSpace(displayName)), state, strings.TrimSpace(detail), nil); err != nil {
+		if lm := LogMetaFromContext(ctx); lm.EventLogger != nil {
+			LogWarning(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+				"agent_state_reasoning_publish_failed", map[string]any{
+					"agent_id": pp.AgentID,
+					"state":    string(state),
+					"error":    err.Error(),
+				})
+		}
+	}
 }
 
 func shouldLiveStreamTurn(ctx context.Context) bool {

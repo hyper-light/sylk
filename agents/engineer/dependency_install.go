@@ -7,6 +7,7 @@ import (
 	"time"
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -108,5 +109,14 @@ func (e *Engineer) installDependencyTooling(ctx context.Context, plan *dependenc
 		WorkingDir:      e.effectiveWorkingDirectory,
 		CommandsEnabled: func() bool { return e.config.EngineerConfig.EnableCommands },
 		DefaultTimeout:  func() time.Duration { return e.config.EngineerConfig.CommandTimeout },
+		ExecutionBroker: func() purevfs.ExecutionBroker { return e.executionBroker },
+		PrepareExecution: func(ctx context.Context, workingDir string) (agentshared.CommandExecContext, error) {
+			execCtx, err := e.commandExecutionContext(ctx, workingDir)
+			if err != nil {
+				return agentshared.CommandExecContext{}, err
+			}
+			return agentshared.CommandExecContext{WorkDir: execCtx.workDir, Plan: execCtx.plan}, nil
+		},
+		ExecutionWorkspace: e.executionWorkspace,
 	}, plan)
 }

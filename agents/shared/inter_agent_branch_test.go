@@ -7,30 +7,30 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 )
 
-func TestBeginAutoInterAgentRouteBranch_DoesNotSynthesizeWithoutExistingBranch(t *testing.T) {
+func TestInheritedBranchMetadata_ReturnsOriginalMetadataWithoutBranch(t *testing.T) {
 	var events []ToolCallEvent
 	ctx := WithStreamContext(context.Background(), "corr-parent", "tui")
-	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) {
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) error {
 		events = append(events, ev)
+		return nil
 	})
 
-	branchCtx, branch := BeginAutoInterAgentRouteBranch(ctx, "guardian", `{"action":"preflight_task","task_id":"task-1"}`, nil)
-	metadata := branch.ApplyMetadata(branchCtx, nil)
+	metadata := InheritedBranchMetadata(ctx, nil)
 
 	if len(metadata) != 0 {
 		t.Fatalf("metadata = %#v, want empty", metadata)
 	}
-	branch.Complete(branchCtx, "ignored", "", nil)
 	if len(events) != 0 {
-		t.Fatalf("emitted events = %d, want 0", len(events))
+		t.Fatalf("emitted events = %d, want 0 (InheritedBranchMetadata must never emit)", len(events))
 	}
 }
 
-func TestBeginAutoInterAgentRouteBranch_ReusesExplicitBranchMetadata(t *testing.T) {
+func TestInheritedBranchMetadata_PropagatesExplicitBranchMetadata(t *testing.T) {
 	var events []ToolCallEvent
 	ctx := WithStreamContext(context.Background(), "corr-parent", "tui")
-	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) {
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) error {
 		events = append(events, ev)
+		return nil
 	})
 
 	existing := map[string]any{
@@ -41,8 +41,7 @@ func TestBeginAutoInterAgentRouteBranch_ReusesExplicitBranchMetadata(t *testing.
 		streamMetadataInterAgentKind:    InterAgentToolEventKindChallenge,
 	}
 
-	branchCtx, branch := BeginAutoInterAgentRouteBranch(ctx, "tester-pipeline", "ignored", existing)
-	metadata := branch.ApplyMetadata(branchCtx, nil)
+	metadata := InheritedBranchMetadata(ctx, existing)
 
 	if got, _ := metadata[streamMetadataParentCorrelation].(string); got != "corr-root" {
 		t.Fatalf("parent correlation = %q, want %q", got, "corr-root")
@@ -53,14 +52,12 @@ func TestBeginAutoInterAgentRouteBranch_ReusesExplicitBranchMetadata(t *testing.
 	if got, _ := metadata[streamMetadataInterAgentThread].(string); got != "pipeline:challenge-1" {
 		t.Fatalf("thread key = %q, want %q", got, "pipeline:challenge-1")
 	}
-
-	branch.Complete(branchCtx, "done", "", nil)
 	if len(events) != 0 {
-		t.Fatalf("emitted events = %d, want 0 for reused branch metadata", len(events))
+		t.Fatalf("emitted events = %d, want 0 for metadata-only propagation", len(events))
 	}
 }
 
-func TestBeginAutoInterAgentRouteBranch_ReusesInheritedStreamBranchMetadata(t *testing.T) {
+func TestInheritedBranchMetadata_PropagatesInheritedStreamBranch(t *testing.T) {
 	existing := map[string]any{
 		streamMetadataNestedBranch:      true,
 		streamMetadataParentCorrelation: "corr-root",
@@ -70,8 +67,7 @@ func TestBeginAutoInterAgentRouteBranch_ReusesInheritedStreamBranchMetadata(t *t
 	}
 	ctx := WithForwardedStreamContext(context.Background(), "corr-child", "librarian", "corr-root", existing)
 
-	branchCtx, branch := BeginAutoInterAgentRouteBranch(ctx, "academic", "ignored", nil)
-	metadata := branch.ApplyMetadata(branchCtx, nil)
+	metadata := InheritedBranchMetadata(ctx, nil)
 
 	if got, _ := metadata[streamMetadataParentCorrelation].(string); got != "corr-root" {
 		t.Fatalf("parent correlation = %q, want %q", got, "corr-root")
@@ -100,8 +96,9 @@ func TestRouteResponseSummary_GuardianPayloadPrefersHumanMessage(t *testing.T) {
 func TestInterAgentBranchCompleteFromMessage_TreatsTerminalGuideErrorAsFailure(t *testing.T) {
 	var events []ToolCallEvent
 	ctx := WithStreamContext(context.Background(), "corr-parent", "inspector")
-	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) {
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) error {
 		events = append(events, ev)
+		return nil
 	})
 
 	branchCtx, branch := BeginInterAgentBranch(ctx, InterAgentBranchSpec{

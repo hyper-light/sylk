@@ -133,18 +133,39 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme, cache *codeBlockC
 		}
 	}
 
+	// Phase 2c: Trailing activity indicator. When the stream is still open
+	// and the agent has announced an activity state (receiving, reasoning,
+	// awaiting_peer_response, composing_response, etc.), render the status
+	// as a subtle italic line below the content so the user sees that work
+	// is ongoing even after text has started streaming. This is the
+	// canonical "between LLM turns" indicator — the same ThinkingStatus
+	// field that drives Phase 1 when Content is empty; the difference here
+	// is that we surface it alongside content so inter-turn gaps are
+	// visually bridged without introducing a separate event channel.
+	var trailingActivityLines []string
+	if entry.Streaming && strings.TrimSpace(entry.Content) != "" {
+		if status := strings.TrimSpace(entry.ThinkingStatus); status != "" {
+			activityStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted).Italic(true)
+			trailingActivityLines = wrapLine(thinkingSummaryGlyph+" "+status, width, activityStyle)
+			if len(trailingActivityLines) > thinkingStatusMaxLines {
+				trailingActivityLines = capLines(trailingActivityLines, thinkingStatusMaxLines, width, activityStyle)
+			}
+		}
+	}
+
 	// Phase 2b: Inline tool call visualization.
 	toolCallLines, toolCallRegions := renderToolCalls(entry.ToolCalls, width, th)
 
 	contentLines, codeRegions := renderContent(entry.Content, width, bodyStyle, th, cache)
 
 	// Pre-allocate: 1 header + summary + tool calls + content lines + 1 trailing spacer.
-	lines := make([]string, 0, 2+len(summaryLines)+len(toolCallLines)+len(progressOnlyStatusLines)+len(contentLines))
+	lines := make([]string, 0, 2+len(summaryLines)+len(toolCallLines)+len(progressOnlyStatusLines)+len(contentLines)+len(trailingActivityLines))
 	lines = append(lines, header)
 	lines = append(lines, summaryLines...)
 	lines = append(lines, toolCallLines...)
 	lines = append(lines, progressOnlyStatusLines...)
 	lines = append(lines, contentLines...)
+	lines = append(lines, trailingActivityLines...)
 	lines = append(lines, "")
 
 	// Offset code region indices to account for the header + summary + tool call lines.

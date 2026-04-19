@@ -31,11 +31,12 @@ func (pt *PipelineTester) executeToolLoopWithSurface(
 ) (string, error) {
 	seen := make(map[shared.ToolCallSignature]int, pt.config.MaxToolRuns)
 	consecutiveErrors := 0
+	reportShapeGraceTurns := 0
 	if surface == nil {
 		surface = pt.toolRuntime()
 	}
 
-	for turn := 0; turn <= pt.config.MaxToolRuns; turn++ {
+	for turn := 0; turn <= pt.config.MaxToolRuns+reportShapeGraceTurns; turn++ {
 		if pt.toolDefsDirty {
 			req.Tools = pt.buildToolDefinitionsWithSurface(surface)
 			pt.toolDefsDirty = false
@@ -131,6 +132,29 @@ func (pt *PipelineTester) executeToolLoopWithSurface(
 					Content: err.Error() +
 						"\nDo not conclude or release the scope yet. Continue the required testing protocol now.",
 				})
+				continue
+			}
+			// Enforce the tester report shape contract. The terminal
+			// assistant text must follow the structured markdown format
+			// defined in the system prompt — first line a heading, the
+			// required sections present, and no wall-of-text paragraphs.
+			// Re-prompt up to the bounded grace budget if the model drifts;
+			// graceful degradation after that (return whatever the model
+			// produced rather than holding the user's turn hostage).
+			if err := shared.ValidateAgentReportShape(resp.Content, shared.TesterTurnReportShapeProfile); err != nil {
+				logPipelineTesterRetry(ctx, turn, "report_shape_invalid", err, resp)
+				pt.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: err.Error() +
+						"\nRe-emit your terminal response strictly using the report format defined in the system prompt: start with a `## Tester Turn Report` heading, then include the required sections (`### Summary`, `### Findings`, `### Next`) using bullet/numbered lists and code spans for paths. Do not write narrative prose paragraphs.",
+				})
+				reportShapeGraceTurns = shared.ExtendReportShapeGrace(reportShapeGraceTurns)
 				continue
 			}
 			pt.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)

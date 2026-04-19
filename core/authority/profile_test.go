@@ -32,13 +32,20 @@ func TestRestrictFileAccessDeniesKnowledgeWrites(t *testing.T) {
 	}
 }
 
-// TestRestrictWorkspaceViewsLibrarianAllowsDiskAndGlobalDeniesPipeline pins
-// the librarian's read scope: disk and global are reachable through the
-// workspace-aware skills (so files staged in the global VFS but not yet
-// promoted to disk no longer surface as phantom "no such file" errors); the
-// pipeline-local view stays denied because the librarian operates above any
-// single pipeline.
-func TestRestrictWorkspaceViewsLibrarianAllowsDiskAndGlobalDeniesPipeline(t *testing.T) {
+// TestRestrictWorkspaceViewsLibrarianAllowsAllThreeViews pins the
+// post-refactor authority surface: librarian gets read access to disk,
+// global, AND pipeline. The original disk-only restriction was a hack to
+// prevent the librarian from confusing "what actually exists" across
+// layers; that confusion is now prevented structurally by requiring every
+// read tool to name its layer via the `view` parameter and requiring every
+// response to attribute its sources to a layer. With layer attribution in
+// place, denying the librarian access to pipeline state needlessly cripples
+// comparison queries ("is the engineer's draft consistent with the plan?")
+// that the librarian is the natural agent to answer.
+//
+// Writes remain blocked (FileScope=FileScopeDiskRead) — librarian is
+// read-only across all layers.
+func TestRestrictWorkspaceViewsLibrarianAllowsAllThreeViews(t *testing.T) {
 	root := t.TempDir()
 	views := versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
 		DefaultView:  versioning.WorkspaceViewDisk,
@@ -49,18 +56,23 @@ func TestRestrictWorkspaceViewsLibrarianAllowsDiskAndGlobalDeniesPipeline(t *tes
 	if restricted == nil {
 		t.Fatal("restricted workspace views should not be nil")
 	}
-	// Disk and global must NOT short-circuit with permission-denied — they
-	// reach the delegate, which may then return a different error (such as
-	// "no active session VFS" in this test fixture). The important thing is
+	// All three views must NOT short-circuit with permission-denied. They
+	// reach the delegate, which may return a different error (such as "no
+	// active session VFS" in this test fixture). The important thing is
 	// that the authority layer no longer blocks the call.
-	if _, err := restricted.ReadFile(context.Background(), versioning.WorkspaceViewDisk, "missing.txt", ""); err == versioning.ErrPermissionDenied {
-		t.Fatal("disk view must be reachable for librarian")
-	}
-	if _, err := restricted.ReadFile(context.Background(), versioning.WorkspaceViewGlobal, "missing.txt", ""); err == versioning.ErrPermissionDenied {
-		t.Fatal("global view must be reachable for librarian")
-	}
-	if _, err := restricted.ReadFile(context.Background(), versioning.WorkspaceViewPipeline, "missing.txt", "task_1"); err != versioning.ErrPermissionDenied {
-		t.Fatalf("pipeline view ReadFile error = %v, want %v", err, versioning.ErrPermissionDenied)
+	for _, view := range []versioning.WorkspaceView{
+		versioning.WorkspaceViewDisk,
+		versioning.WorkspaceViewGlobal,
+		versioning.WorkspaceViewPipeline,
+	} {
+		pipelineID := ""
+		if view == versioning.WorkspaceViewPipeline {
+			pipelineID = "task_1"
+		}
+		_, err := restricted.ReadFile(context.Background(), view, "missing.txt", pipelineID)
+		if err == versioning.ErrPermissionDenied {
+			t.Errorf("view %q must be reachable for librarian (got permission-denied)", view)
+		}
 	}
 }
 

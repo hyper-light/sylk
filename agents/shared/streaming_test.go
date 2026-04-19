@@ -250,13 +250,13 @@ func TestPublishWithLifecycleState_ToolCallBypassesTerminalGate(t *testing.T) {
 
 	// Drive the stream to its terminal state.
 	chunkPublished := false
-	if delivered, _ := publishWithLifecycleState(lifecycle, guide.StreamEventData, func() { chunkPublished = true }); !delivered {
+	if delivered, _, _ := publishWithLifecycleState(lifecycle, guide.StreamEventData, func() error { chunkPublished = true; return nil }); !delivered {
 		t.Fatal("pre-terminal chunk must be delivered")
 	}
 	if !chunkPublished {
 		t.Fatal("expected chunk publish to fire")
 	}
-	if delivered, _ := publishWithLifecycleState(lifecycle, guide.StreamEventComplete, func() {}); !delivered {
+	if delivered, _, _ := publishWithLifecycleState(lifecycle, guide.StreamEventComplete, func() error { return nil }); !delivered {
 		t.Fatal("StreamComplete must be delivered")
 	}
 
@@ -264,7 +264,7 @@ func TestPublishWithLifecycleState_ToolCallBypassesTerminalGate(t *testing.T) {
 	// still pass through and the lateBypass signal MUST fire so callers can
 	// log telemetry.
 	lateChunkPublished := false
-	if delivered, late := publishWithLifecycleState(lifecycle, guide.StreamEventData, func() { lateChunkPublished = true }); delivered {
+	if delivered, late, _ := publishWithLifecycleState(lifecycle, guide.StreamEventData, func() error { lateChunkPublished = true; return nil }); delivered {
 		t.Fatal("post-terminal chunk must be suppressed")
 	} else if late {
 		t.Fatal("post-terminal chunk must not flag lateBypass")
@@ -275,7 +275,7 @@ func TestPublishWithLifecycleState_ToolCallBypassesTerminalGate(t *testing.T) {
 
 	for _, eventType := range []guide.StreamEventType{guide.StreamEventToolCall} {
 		published := false
-		delivered, late := publishWithLifecycleState(lifecycle, eventType, func() { published = true })
+		delivered, late, _ := publishWithLifecycleState(lifecycle, eventType, func() error { published = true; return nil })
 		if !delivered {
 			t.Fatalf("%s must bypass the terminal gate", eventType)
 		}
@@ -294,7 +294,7 @@ func TestPublishWithLifecycleState_ToolCallBypassesTerminalGate(t *testing.T) {
 // no telemetry noise.
 func TestPublishWithLifecycleState_ToolCallBeforeTerminalDoesNotFlagBypass(t *testing.T) {
 	lifecycle := &streamLifecycleState{}
-	delivered, late := publishWithLifecycleState(lifecycle, guide.StreamEventToolCall, func() {})
+	delivered, late, _ := publishWithLifecycleState(lifecycle, guide.StreamEventToolCall, func() error { return nil })
 	if !delivered {
 		t.Fatal("pre-terminal tool-call must be delivered")
 	}
@@ -308,7 +308,7 @@ func TestPublishWithLifecycleState_ToolCallBeforeTerminalDoesNotFlagBypass(t *te
 // without flagging bypass.
 func TestPublishWithLifecycleState_NilLifecycleAlwaysPublishes(t *testing.T) {
 	published := false
-	delivered, late := publishWithLifecycleState(nil, guide.StreamEventToolCall, func() { published = true })
+	delivered, late, _ := publishWithLifecycleState(nil, guide.StreamEventToolCall, func() error { published = true; return nil })
 	if !delivered || !published {
 		t.Fatal("nil lifecycle must deliver the publish")
 	}

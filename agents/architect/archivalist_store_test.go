@@ -39,8 +39,9 @@ func TestPublishDeclaration_NestsArchivalistStoreUnderParentTurn(t *testing.T) {
 
 	var events []shared.ToolCallEvent
 	ctx := shared.WithStreamContext(context.Background(), "corr-parent", "tui")
-	ctx = shared.WithToolCallEmitter(ctx, func(ev shared.ToolCallEvent) {
+	ctx = shared.WithToolCallEmitter(ctx, func(ev shared.ToolCallEvent) error {
 		events = append(events, ev)
+		return nil
 	})
 
 	a.publishDeclaration(ctx, &PreDelegationDeclaration{ID: "decl-1"}, "sess-1")

@@ -118,6 +118,7 @@ func TestFinalizePipeline_RequiresImmediateHandoffToOT(t *testing.T) {
 	skills := PipelineProtocolSkills(PipelineProtocolSkillConfig{
 		AgentType:   func() string { return PipelineAgentInspector },
 		InspectorOT: true,
+		Committer:   func() PipelineCommitter { return testNoopPipelineCommitter{} },
 	})
 
 	result, err := callSkill(t, ctx, skills, "finalize_pipeline", map[string]any{
@@ -1737,6 +1738,7 @@ func TestPipelineProtocolSkills_FinalizePipelineSignalsReadinessAndHandoffToOTPu
 		AgentType:   func() string { return PipelineAgentInspector },
 		AgentID:     func() string { return "inspector-ot-1" },
 		InspectorOT: true,
+		Committer:   func() PipelineCommitter { return testNoopPipelineCommitter{} },
 		Route: PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return bus },
 			SessionID:   func() string { return task.SessionID },
@@ -1841,6 +1843,7 @@ func TestPipelineProtocolSkills_HandoffToOTPublishesTerminalUpdateWithoutBoundPi
 		AgentType:   func() string { return PipelineAgentInspector },
 		AgentID:     func() string { return "inspector-fallback-1" },
 		InspectorOT: true,
+		Committer:   func() PipelineCommitter { return testNoopPipelineCommitter{} },
 		Route: PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return bus },
 			SessionID:   func() string { return "session-fallback" },
@@ -2009,3 +2012,17 @@ func callSkill(t *testing.T, ctx context.Context, skills []*skills.Skill, name s
 	t.Fatalf("skill %s not found", name)
 	return nil, nil
 }
+
+// testNoopPipelineCommitter satisfies PipelineCommitter for tests that
+// exercise the inspector handoff_to_ot / discard_pipeline skills without a
+// real SessionVFS. Real wiring (cmd/tui.go) installs a SessionVFS-backed
+// committer; here we just want the skill to succeed past its committer
+// gate so the test can observe protocol-state mutations and published
+// updates.
+type testNoopPipelineCommitter struct{}
+
+func (testNoopPipelineCommitter) ExtractReviewCandidate(_ context.Context, _ string) (string, bool, versioning.SemanticVersion, error) {
+	return "", false, versioning.SemanticVersion{}, nil
+}
+
+func (testNoopPipelineCommitter) Rollback(_ context.Context, _ string) error { return nil }

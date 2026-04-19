@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -33,28 +34,52 @@ Never include:
 - Information not directly relevant to the query`
 
 // Synthesizer provides RAG synthesis using a provider-based LLM.
+//
+// The provider is accessed via a lookup function rather than a stored value
+// so the synthesizer always sees the live provider on the archivalist —
+// historically a value snapshot here produced the "synthesis: no LLM
+// provider configured" error after auth-then-swap, because the synthesizer
+// was constructed before the provider was wired and never refreshed when
+// SetProvider/SwapModel updated the archivalist's field. Codebase rule:
+// any component that depends on a hot-swappable external dependency MUST
+// hold a getter, never a snapshot. See agents/shared/PROVIDER_LOOKUP.md
+// for the discipline.
 type Synthesizer struct {
-	provider   archivalistProvider
-	model      string
-	retriever  *SemanticRetriever
-	queryCache *QueryCache
+	providerLookup func() archivalistProvider
+	model          string
+	retriever      *SemanticRetriever
+	queryCache     *QueryCache
 
 	systemPrompt string
 	maxTokens    int
 }
 
-// SynthesizerConfig configures the synthesizer
+// SynthesizerConfig configures the synthesizer.
 type SynthesizerConfig struct {
-	Provider     archivalistProvider
-	Model        string
-	Retriever    *SemanticRetriever
-	QueryCache   *QueryCache
-	SystemPrompt string
-	MaxTokens    int
+	// ProviderLookup returns the live LLM provider from the owning agent.
+	// Resolved per call so a SetProvider / SwapModel on the agent is
+	// observed immediately without the synthesizer having to be re-bound.
+	// Required — see NewSynthesizer.
+	ProviderLookup func() archivalistProvider
+	Model          string
+	Retriever      *SemanticRetriever
+	QueryCache     *QueryCache
+	SystemPrompt   string
+	MaxTokens      int
 }
 
-// NewSynthesizer creates a new synthesizer
+// NewSynthesizer creates a new synthesizer. Panics if ProviderLookup is nil
+// — half-constructed synthesizers that pass nil-checks but cannot deliver
+// are the worst possible failure mode (the caller advertises RAG capability
+// but every call fails at the deepest layer with a confusing error). If the
+// archivalist legitimately has no provider configured, DO NOT construct a
+// synthesizer at all; consumers check `archivalist.synthesizer == nil` for
+// "RAG not enabled" semantics.
 func NewSynthesizer(cfg SynthesizerConfig) *Synthesizer {
+	if cfg.ProviderLookup == nil {
+		panic("archivalist.NewSynthesizer: ProviderLookup is required (a half-constructed synthesizer that pretends RAG is enabled but cannot synthesize is worse than no synthesizer at all — see synthesis.go for rationale)")
+	}
+
 	systemPrompt := cfg.SystemPrompt
 	if systemPrompt == "" {
 		systemPrompt = SynthesisSystemPrompt
@@ -71,12 +96,12 @@ func NewSynthesizer(cfg SynthesizerConfig) *Synthesizer {
 	}
 
 	return &Synthesizer{
-		provider:     cfg.Provider,
-		model:        model,
-		retriever:    cfg.Retriever,
-		queryCache:   cfg.QueryCache,
-		systemPrompt: systemPrompt,
-		maxTokens:    maxTokens,
+		providerLookup: cfg.ProviderLookup,
+		model:          model,
+		retriever:      cfg.Retriever,
+		queryCache:     cfg.QueryCache,
+		systemPrompt:   systemPrompt,
+		maxTokens:      maxTokens,
 	}
 }
 
@@ -152,8 +177,13 @@ func (s *Synthesizer) retrieveContext(ctx context.Context, query string) ([]*Ret
 }
 
 func (s *Synthesizer) synthesize(ctx context.Context, prompt string) (*providers.Response, error) {
-	if s.provider == nil {
-		return nil, fmt.Errorf("synthesis: no LLM provider configured")
+	provider := s.providerLookup()
+	if provider == nil {
+		// Per-call live lookup. Returning ErrAgentNotReady (transient,
+		// retryable) lets the calling tool loop know this is a startup
+		// race rather than a permanent misconfiguration — see agents/
+		// shared/agent_errors.go for the error-kind discipline.
+		return nil, fmt.Errorf("synthesis: %w: LLM provider not yet wired", agentshared.ErrAgentNotReady)
 	}
 	req := &providers.Request{
 		SystemPrompt: s.systemPrompt,
@@ -163,7 +193,7 @@ func (s *Synthesizer) synthesize(ctx context.Context, prompt string) (*providers
 	}
 	s.applySynthesisRuntimeProfile(req)
 
-	resp, err := s.provider.Complete(ctx, req)
+	resp, err := provider.Complete(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("synthesis failed: %w", err)
 	}

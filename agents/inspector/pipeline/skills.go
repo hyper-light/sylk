@@ -88,6 +88,12 @@ func (pi *PipelineInspector) registerCoreSkills() {
 		AgentID:        func() string { return pi.id },
 		InspectorOT:    true,
 		WorkspaceViews: func() versioning.WorkspaceViewAccess { return pi.workspaceViews },
+		// Inspector-owned VFS authority — handoff_to_ot and discard_pipeline
+		// invoke this committer directly so the orchestrator no longer reacts
+		// to "succeeded" / "failed" pipeline broadcasts to mutate VFS state.
+		// Lazy because the wiring code (cmd/tui.go) calls SetPipelineCommitter
+		// after agent construction.
+		Committer: func() agentShared.PipelineCommitter { return pi.pipelineCommitter },
 		Route: agentShared.PipelineProtocolRouteConfig{
 			BusProvider: func() guide.EventBus { return pi.bus },
 			SessionID:   func() string { return pi.config.SessionID },

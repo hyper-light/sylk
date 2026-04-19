@@ -12,6 +12,14 @@ type PipelineRoutingFileAccess struct {
 	lookup     func() *SessionVFS
 	pipelineID string
 	workingDir string
+	// rebindCfg is the BeginPipeline config used when resolve() finds the
+	// session has no entry for pipelineID. This is defense-in-depth: under
+	// the new authority discipline (inspector-owned commit/rollback), the
+	// pipeline VFS should never disappear during legitimate work, but if a
+	// race or a stray cleanup path destroys it, this lets the next write
+	// silently rebind rather than failing with ErrVFSNotFound. Set via
+	// WithRebindConfig.
+	rebindCfg *BeginPipelineConfig
 }
 
 // NewPipelineRoutingFileAccess creates a file-access router that resolves
@@ -28,6 +36,24 @@ func NewPipelineRoutingFileAccess(
 		pipelineID: pipelineID,
 		workingDir: workingDir,
 	}
+}
+
+// WithRebindConfig enables auto-rebind on miss. If the resolve() lookup
+// finds no pipeline draft for this access's pipelineID, it calls
+// BeginPipeline with the supplied config to recreate one. The config is
+// copied so the caller can mutate the original. Returns the same access
+// pointer for fluent chaining.
+func (p *PipelineRoutingFileAccess) WithRebindConfig(cfg BeginPipelineConfig) *PipelineRoutingFileAccess {
+	if p == nil {
+		return nil
+	}
+	cfgCopy := cfg
+	cfgCopy.PipelineID = p.pipelineID
+	if cfgCopy.WorkingDir == "" {
+		cfgCopy.WorkingDir = p.workingDir
+	}
+	p.rebindCfg = &cfgCopy
+	return p
 }
 
 func (p *PipelineRoutingFileAccess) ReadFile(ctx context.Context, path string) ([]byte, error) {
@@ -132,10 +158,29 @@ func (p *PipelineRoutingFileAccess) resolve() (FileAccess, error) {
 	if svfs == nil {
 		return nil, ErrNoActiveSessionVFS
 	}
-	if p.readOnly {
-		return svfs.ReadOnlyPipelineFileAccess(p.pipelineID)
+	resolveOnce := func() (FileAccess, error) {
+		if p.readOnly {
+			return svfs.ReadOnlyPipelineFileAccess(p.pipelineID)
+		}
+		return svfs.PipelineFileAccess(p.pipelineID)
 	}
-	return svfs.PipelineFileAccess(p.pipelineID)
+	fa, err := resolveOnce()
+	if err == nil {
+		return fa, nil
+	}
+	// Defense-in-depth: under the new inspector-owned-commit discipline the
+	// pipeline VFS should not disappear mid-work, but if a race or stray
+	// cleanup destroyed it AND the caller pre-configured a rebind, recover
+	// silently rather than blocking writes. Without this, the historical
+	// "edit_pipeline_file failed: VFS not found" path would re-emerge any
+	// time the orchestrator's old commit-on-broadcast behavior is briefly
+	// re-introduced or a custom pipeline lifecycle differs.
+	if err == ErrVFSNotFound && p.rebindCfg != nil {
+		if _, beginErr := svfs.BeginPipeline(*p.rebindCfg); beginErr == nil {
+			return resolveOnce()
+		}
+	}
+	return nil, err
 }
 
 func (p *PipelineRoutingFileAccess) resolveSession() *SessionVFS {

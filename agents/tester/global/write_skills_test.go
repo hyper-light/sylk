@@ -121,8 +121,9 @@ func TestGlobalTesterWriteTestAutoRenewsExpiredLeaseWithVisibleInternalToolSteps
 	gt, _, baseCtx := newGlobalTesterWriteHarness(t)
 
 	var emitted []agentshared.ToolCallEvent
-	ctx := agentshared.WithToolCallEmitter(baseCtx, func(event agentshared.ToolCallEvent) {
+	ctx := agentshared.WithToolCallEmitter(baseCtx, func(event agentshared.ToolCallEvent) error {
 		emitted = append(emitted, event)
+		return nil
 	})
 
 	basis := prepareGlobalWriteBasis(t, gt, ctx, "pkg/service/service_test.go")

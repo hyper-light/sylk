@@ -15,10 +15,12 @@ import (
 
 func TestWithToolCallEmitter_RoundTrip(t *testing.T) {
 	var received []ToolCallEvent
-	emitter := func(ev ToolCallEvent) { received = append(received, ev) }
+	emitter := func(ev ToolCallEvent) error { received = append(received, ev); return nil }
 
 	ctx := WithToolCallEmitter(context.Background(), emitter)
-	EmitToolCall(ctx, ToolCallEvent{ToolCallKey: "tc-1", ToolName: "read_file", Phase: ToolCallStart})
+	if err := EmitToolCall(ctx, ToolCallEvent{ToolCallKey: "tc-1", ToolName: "read_file", Phase: ToolCallStart}); err != nil {
+		t.Fatalf("EmitToolCall: %v", err)
+	}
 
 	if len(received) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(received))
@@ -32,26 +34,49 @@ func TestWithToolCallEmitter_RoundTrip(t *testing.T) {
 }
 
 func TestEmitToolCall_NilEmitter(t *testing.T) {
-	// Must not panic with a bare context (assuming event carries the required ID).
-	EmitToolCall(context.Background(), ToolCallEvent{ToolCallKey: "tc-nil", ToolName: "test"})
+	// Must not fail with a bare context (assuming event carries the required ID).
+	if err := EmitToolCall(context.Background(), ToolCallEvent{ToolCallKey: "tc-nil", ToolName: "test"}); err != nil {
+		t.Fatalf("EmitToolCall with no emitter: %v", err)
+	}
 }
 
-func TestEmitToolCall_PanicsOnEmptyToolCallKey(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("expected panic on empty ToolCallKey; got none")
-		}
-	}()
-	EmitToolCall(context.Background(), ToolCallEvent{ToolName: "read_file", Phase: ToolCallStart})
+func TestEmitToolCall_ReturnsErrorOnEmptyToolCallKey(t *testing.T) {
+	var received []ToolCallEvent
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { received = append(received, ev); return nil })
+
+	err := EmitToolCall(ctx, ToolCallEvent{ToolName: "read_file", Phase: ToolCallStart})
+	if err == nil {
+		t.Fatal("expected error on empty ToolCallKey; got nil")
+	}
+	if !errors.Is(err, ErrMissingToolCallID) {
+		t.Fatalf("expected errors.Is(%v, ErrMissingToolCallID) to be true", err)
+	}
+	if len(received) != 0 {
+		t.Fatalf("expected event with empty ToolCallKey to be dropped, got %d: %#v", len(received), received)
+	}
 }
 
-func TestToolCallEventKey_PanicsOnEmptyID(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("expected panic on empty call.ID; got none")
-		}
-	}()
-	_ = toolCallEventKey(providers.ToolCall{Name: "read_file"})
+func TestToolCallEventKey_ReturnsErrorOnEmptyID(t *testing.T) {
+	key, err := toolCallEventKey(providers.ToolCall{Name: "read_file"})
+	if err == nil {
+		t.Fatal("expected error on empty call.ID; got nil")
+	}
+	if !errors.Is(err, ErrMissingToolCallID) {
+		t.Fatalf("expected errors.Is(%v, ErrMissingToolCallID) to be true", err)
+	}
+	if key != "" {
+		t.Fatalf("expected empty key on error, got %q", key)
+	}
+}
+
+func TestToolCallEventKey_ReturnsIDOnSuccess(t *testing.T) {
+	key, err := toolCallEventKey(providers.ToolCall{ID: "tc_abc", Name: "read_file"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if key != "tc_abc" {
+		t.Fatalf("key = %q, want %q", key, "tc_abc")
+	}
 }
 
 func TestEmitToolCall_AttachesStreamMetadata(t *testing.T) {
@@ -62,7 +87,7 @@ func TestEmitToolCall_AttachesStreamMetadata(t *testing.T) {
 		"pipeline_task": true,
 		"task_id":       "task-1",
 	})
-	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { received = append(received, ev) })
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) error { received = append(received, ev); return nil })
 
 	EmitToolCall(ctx, ToolCallEvent{ToolCallKey: "tc-meta", ToolName: "read_file", Phase: ToolCallStart})
 
@@ -79,7 +104,7 @@ func TestEmitToolCall_AttachesStreamMetadata(t *testing.T) {
 
 func TestEmitToolCall_NormalizesPartialInterAgentConsultStartMetadata(t *testing.T) {
 	var received []ToolCallEvent
-	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { received = append(received, ev) })
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { received = append(received, ev); return nil })
 
 	EmitToolCall(ctx, ToolCallEvent{
 		ToolCallKey: "tc-consult",
@@ -112,7 +137,7 @@ func TestTimedToolCall_GlobalReviewChallengeEmitsTargetSpecificToolName(t *testi
 	ctx = WithStreamContextMetadata(ctx, map[string]any{
 		"agent_type": "inspector",
 	})
-	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	call := providers.ToolCall{
 		ID:        "call-global-review-challenge",
@@ -152,7 +177,7 @@ func TestObserveProviderToolCallChunk_PreAnnouncesWithoutDuplicateTimedStart(t *
 		"agent_type": "engineer",
 		"task_id":    "task-1",
 	})
-	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
 		Type: providers.ChunkTypeToolStart,
@@ -226,7 +251,7 @@ func TestObserveProviderToolCallChunk_PreAnnouncesWithoutDuplicateTimedStart(t *
 func TestObserveProviderToolCallChunk_AnnouncesStartOnToolStartWhenIDIsKnown(t *testing.T) {
 	var events []ToolCallEvent
 	startedAt := time.Now().Add(-150 * time.Millisecond)
-	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
 		Type:      providers.ChunkTypeToolStart,
@@ -264,7 +289,7 @@ func TestObserveProviderToolCallChunk_AnnouncesStartOnToolStartWhenIDIsKnown(t *
 
 func TestObserveProviderToolCallChunk_GenericConsultWaitsForResolvableArgsBeforePreannounce(t *testing.T) {
 	var events []ToolCallEvent
-	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
 		Type: providers.ChunkTypeToolStart,
@@ -324,7 +349,7 @@ func TestObserveProviderToolCallChunk_GenericConsultWaitsForResolvableArgsBefore
 
 func TestObserveProviderToolCallChunk_GenericConsultCanPreannounceAtToolEndWhenArgsArriveLate(t *testing.T) {
 	var events []ToolCallEvent
-	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
 		Type: providers.ChunkTypeToolStart,
@@ -363,7 +388,7 @@ func TestObserveProviderToolCallChunk_GenericConsultCanPreannounceAtToolEndWhenA
 
 func TestObserveProviderToolCallChunk_StreamedChunksShareIDKeyAcrossPhases(t *testing.T) {
 	var events []ToolCallEvent
-	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
 		Type: providers.ChunkTypeToolStart,
@@ -411,7 +436,7 @@ func TestObserveProviderToolCallChunk_StreamedChunksShareIDKeyAcrossPhases(t *te
 
 func TestTimedToolCall_PreannouncedCompletionPreservesStartTime(t *testing.T) {
 	var events []ToolCallEvent
-	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
 		Type: providers.ChunkTypeToolStart,
@@ -464,7 +489,7 @@ func TestTimedToolCall_PreannouncedCompletionPreservesStartTime(t *testing.T) {
 
 func TestObserveProviderToolCallChunk_NativeWebSearchCompletesAtToolEndWithoutDuplicateFallback(t *testing.T) {
 	var events []ToolCallEvent
-	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 	startedAt := time.Now().Add(-250 * time.Millisecond)
 	completedAt := startedAt.Add(250 * time.Millisecond)
 
@@ -532,10 +557,10 @@ func TestObserveProviderToolCallChunk_NativeWebSearchCompletesAtToolEndWithoutDu
 func TestEmitToolCall_DeliversLateEventsAfterStreamComplete(t *testing.T) {
 	var events []ToolCallEvent
 	ctx := WithStreamContext(context.Background(), "corr-complete", "tui")
-	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
-	if !publishWithStreamLifecycle(ctx, guide.StreamEventComplete, func() {}) {
-		t.Fatal("expected stream complete lifecycle transition to succeed")
+	if err := publishWithStreamLifecycle(ctx, guide.StreamEventComplete, func() error { return nil }); err != nil {
+		t.Fatalf("expected stream complete lifecycle transition to succeed: %v", err)
 	}
 
 	EmitToolCall(ctx, ToolCallEvent{
@@ -555,7 +580,7 @@ func TestEmitToolCall_DeliversLateEventsAfterStreamComplete(t *testing.T) {
 
 func TestTimedToolCall_Success(t *testing.T) {
 	var events []ToolCallEvent
-	emitter := func(ev ToolCallEvent) { events = append(events, ev) }
+	emitter := func(ev ToolCallEvent) error { events = append(events, ev); return nil }
 	ctx := WithToolCallEmitter(context.Background(), emitter)
 
 	call := providers.ToolCall{ID: "1", Name: "grep", Arguments: `{"pattern":"foo"}`}
@@ -643,7 +668,7 @@ func TestTimedToolCall_WaitsWhilePaused(t *testing.T) {
 
 func TestTimedToolCall_Error(t *testing.T) {
 	var events []ToolCallEvent
-	emitter := func(ev ToolCallEvent) { events = append(events, ev) }
+	emitter := func(ev ToolCallEvent) error { events = append(events, ev); return nil }
 	ctx := WithToolCallEmitter(context.Background(), emitter)
 
 	call := providers.ToolCall{ID: "2", Name: "run_command", Arguments: `{"command":"make"}`}
@@ -669,7 +694,7 @@ func TestTimedToolCall_Error(t *testing.T) {
 
 func TestTimedToolCall_PipelineHandoffIsControlOutcome(t *testing.T) {
 	var events []ToolCallEvent
-	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	call := providers.ToolCall{ID: "4", Name: "handoff_next", Arguments: `{"target_agents":["tester"]}`}
 	result, err := TimedToolCall(ctx, "inspector-pipeline", call, func() (string, error) {
@@ -700,7 +725,7 @@ func TestTimedToolCall_PipelineHandoffIsControlOutcome(t *testing.T) {
 
 func TestTimedToolCall_RerouteIsControlOutcome(t *testing.T) {
 	var events []ToolCallEvent
-	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	call := providers.ToolCall{ID: "5", Name: "reroute_request", Arguments: `{"suggested_target":"guide"}`}
 	_, err := TimedToolCall(ctx, "engineer", call, func() (string, error) {
@@ -846,7 +871,7 @@ func TestTimedToolCall_ReusesPinnedEventKeyFromPreannounce(t *testing.T) {
 		"agent_type":  "inspector-pipeline",
 		"pipeline_id": "task_1",
 	})
-	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	preannounceArgs := `{"target_agents":["tester"],"reason":"need"}`
 	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
@@ -907,7 +932,7 @@ func TestTimedToolCall_ReusesPinnedEventKeyFromPreannounce(t *testing.T) {
 func TestObserveProviderToolCallChunk_NativeWebSearchPairsStartAndEndDespiteArgDrift(t *testing.T) {
 	var events []ToolCallEvent
 	ctx := WithStreamContext(context.Background(), "corr-web-search", "tui")
-	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx = WithToolCallEmitter(ctx, func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	ObserveProviderToolCallChunk(ctx, &providers.StreamChunk{
 		Type: providers.ChunkTypeToolStart,
@@ -960,7 +985,7 @@ func TestObserveProviderToolCallChunk_NativeWebSearchPairsStartAndEndDespiteArgD
 // only the unmatched Starts, sorted by StartedAt ascending so the oldest
 // (most-likely-stuck) calls appear first.
 func TestToolCallTracker_InFlightSnapshotReflectsStartCompletePairs(t *testing.T) {
-	emitter := func(ev ToolCallEvent) {}
+	emitter := func(ev ToolCallEvent) error { return nil }
 	ctx := WithToolCallEmitter(context.Background(), emitter)
 	tracker := toolCallTrackerFromContext(ctx)
 	if tracker == nil {
@@ -1011,7 +1036,7 @@ func TestToolCallTracker_InFlightSnapshotReflectsStartCompletePairs(t *testing.T
 // log doesn't continue surfacing the same call after every subsequent
 // terminal event.
 func TestToolCallTracker_LateCompleteClearsInFlight(t *testing.T) {
-	emitter := func(ev ToolCallEvent) {}
+	emitter := func(ev ToolCallEvent) error { return nil }
 	ctx := WithStreamContext(context.Background(), "corr-late", "tui")
 	ctx = WithToolCallEmitter(ctx, emitter)
 	tracker := toolCallTrackerFromContext(ctx)
@@ -1024,7 +1049,9 @@ func TestToolCallTracker_LateCompleteClearsInFlight(t *testing.T) {
 	})
 
 	// Drive stream to terminal.
-	publishWithStreamLifecycle(ctx, guide.StreamEventComplete, func() {})
+	if err := publishWithStreamLifecycle(ctx, guide.StreamEventComplete, func() error { return nil }); err != nil {
+		t.Fatalf("publishWithStreamLifecycle: %v", err)
+	}
 
 	if got := len(tracker.snapshotInFlightToolCalls()); got != 1 {
 		t.Fatalf("expected 1 in-flight call before late Complete, got %d", got)
@@ -1052,7 +1079,7 @@ func TestToolCallTracker_LateCompleteClearsInFlight(t *testing.T) {
 // make the invariant structural.
 func TestToolCallSession_StartIsIdempotentAcrossAcquires(t *testing.T) {
 	var events []ToolCallEvent
-	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	call := providers.ToolCall{ID: "shared-id", Name: "read_file", Arguments: `{"path":"a.go"}`}
 
@@ -1080,7 +1107,7 @@ func TestToolCallSession_StartIsIdempotentAcrossAcquires(t *testing.T) {
 // Completes for the same key and the second clobbers the first's state.
 func TestToolCallSession_CompleteIsIdempotentAcrossPaths(t *testing.T) {
 	var events []ToolCallEvent
-	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) { events = append(events, ev) })
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { events = append(events, ev); return nil })
 
 	call := providers.ToolCall{ID: "complete-id", Name: "summarize_workspace_state", Arguments: `{"paths":["a"]}`}
 
@@ -1108,7 +1135,7 @@ func TestToolCallSession_CompleteIsIdempotentAcrossPaths(t *testing.T) {
 // agent reissuing a tool call) gets a fresh session, not a stuck "already
 // completed" handle that would silently swallow the new emissions.
 func TestToolCallSession_CompleteReleasesTrackerEntry(t *testing.T) {
-	emitter := func(ev ToolCallEvent) {}
+	emitter := func(ev ToolCallEvent) error { return nil }
 	ctx := WithToolCallEmitter(context.Background(), emitter)
 
 	call := providers.ToolCall{ID: "reuse-id", Name: "read_file", Arguments: `{"path":"a.go"}`}

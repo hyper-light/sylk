@@ -2,6 +2,7 @@ package shared
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -11,8 +12,38 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/commandapproval"
+	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/versioning"
 )
+
+type allowAllApprovalGate struct{}
+
+func (allowAllApprovalGate) Authorize(_ context.Context, _ commandapproval.Request) (commandapproval.Evaluation, error) {
+	return commandapproval.Evaluation{Decision: commandapproval.DecisionAllow}, nil
+}
+
+// TestToolRunnerExecRefusesWhenBrokerMissing locks in the no-disk invariant:
+// a ToolRunner constructed without a Broker must fail loudly rather than
+// silently running commands against host disk. This replaces the former
+// execDirect() escape hatch with a compile-time guarantee.
+func TestToolRunnerExecRefusesWhenBrokerMissing(t *testing.T) {
+	root := t.TempDir()
+	runner := NewToolRunner(ToolRunnerConfig{
+		WorkingDir: root,
+		Timeout:    5 * time.Second,
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// Broker intentionally omitted.
+	})
+	ctx := commandapproval.WithGate(context.Background(), allowAllApprovalGate{})
+	_, err := runner.Exec(ctx, "echo", "leak")
+	if err == nil {
+		t.Fatal("expected Exec to refuse without a broker, got nil error")
+	}
+	if !errors.Is(err, purevfs.ErrStrictExecutionUnavailable) {
+		t.Fatalf("want ErrStrictExecutionUnavailable, got %v", err)
+	}
+}
 
 func TestToolRunnerWorkingDirUsesFileAccessWorkingDir(t *testing.T) {
 	root := t.TempDir()

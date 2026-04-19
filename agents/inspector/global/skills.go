@@ -356,7 +356,7 @@ func requestArchitectResearchSkill(gi *GlobalInspector) *skills.Skill {
 					"source":      gi.id,
 				}
 				payloadJSON, _ := json.Marshal(payload)
-				branchCtx, branch := agentShared.BeginInterAgentBranch(ctx, agentShared.InterAgentBranchSpec{
+				spec := agentShared.InterAgentBranchSpec{
 					Kind:       agentShared.InterAgentToolEventKindConsult,
 					ToolName:   "request_architect_research",
 					AgentTypes: []string{"architect"},
@@ -366,20 +366,21 @@ func requestArchitectResearchSkill(gi *GlobalInspector) *skills.Skill {
 						"description": params.Description,
 						"context":     params.Context,
 					},
-				})
-				metadata := branch.ApplyMetadata(branchCtx, map[string]any{
-					"consultation_kind": "architect_research",
-				})
-				msg, err := gi.requestRouteSync(branchCtx, "architect", string(payloadJSON), metadata)
-				if err != nil {
-					branch.CompleteFromMessage(branchCtx, msg, err)
-					return nil, err
 				}
-				response, err = extractConsultationResponse(msg)
-				branch.CompleteFromMessage(branchCtx, msg, err)
-				if err != nil {
-					return nil, err
+				msg, branchErr := agentShared.WithInterAgentBranchMessage(ctx, spec, func(branchCtx context.Context, branch agentShared.InterAgentBranchHandle) (*guide.Message, error) {
+					metadata := branch.ApplyMetadata(branchCtx, map[string]any{
+						"consultation_kind": "architect_research",
+					})
+					return gi.requestRouteSync(branchCtx, "architect", string(payloadJSON), metadata)
+				})
+				if branchErr != nil {
+					return nil, branchErr
 				}
+				extracted, extractErr := extractConsultationResponse(msg)
+				if extractErr != nil {
+					return nil, extractErr
+				}
+				response = extracted
 			}
 
 			return map[string]any{
@@ -449,7 +450,7 @@ func escalateFindingsSkill(gi *GlobalInspector) *skills.Skill {
 		BoolParam("blocking", "Whether findings are blocking", true).
 		StringParam("summary", "Optional finding summary", false).
 		StringParam("details", "Optional additional details", false).
-		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				DAGID    string `json:"dag_id"`
 				LayerIdx int    `json:"layer_idx"`
@@ -504,7 +505,17 @@ func escalateFindingsSkill(gi *GlobalInspector) *skills.Skill {
 						"layer_idx":          params.LayerIdx,
 					},
 				}
-				_ = gi.bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage(gi.generateMessageID(), req))
+				if err := gi.bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage(gi.generateMessageID(), req)); err != nil {
+					if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+						agentShared.LogWarning(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+							"global_inspector_escalation_publish_failed", map[string]any{
+								"dag_id":    params.DAGID,
+								"layer_idx": params.LayerIdx,
+								"error":     err.Error(),
+							})
+					}
+					return nil, fmt.Errorf("publish validation verdict escalation: %w", err)
+				}
 			}
 
 			return map[string]any{
