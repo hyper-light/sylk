@@ -23,6 +23,9 @@ func (l *Librarian) processForwardedRequest(ctx context.Context, fwd *guide.Forw
 }
 
 // processViaLLM builds an LLM request with tools and runs the tool loop.
+// Returns a typed *shared.ConsultResponsePayload so downstream consumers
+// (chat UI, protocol logs) read declared fields rather than defensively
+// parsing the LLM's raw text. See agents/shared/interagent_response.go.
 func (l *Librarian) processViaLLM(ctx context.Context, fwd *guide.ForwardedRequest, bundle *librarianToolBundle) (any, error) {
 	llmReq := l.buildLLMRequestWithBundle(fwd, bundle)
 
@@ -43,7 +46,7 @@ func (l *Librarian) processViaLLM(ctx context.Context, fwd *guide.ForwardedReque
 		return nil, fmt.Errorf("librarian: generated empty response for query %q", fwd.Input)
 	}
 
-	return result, nil
+	return shared.DecodeConsultResponsePayloadFromLLM(result), nil
 }
 
 // buildLLMRequest constructs a providers.Request for the tool loop.

@@ -8,10 +8,16 @@ import (
 )
 
 // SummarizeInterAgentPayload extracts a short human-facing summary from a
-// routed inter-agent payload. It prefers explicit user-facing fields and
-// recursively unwraps common result containers before falling back to a compact
-// scalar summary.
+// routed inter-agent payload. Typed payloads (implementers of
+// InterAgentResponsePayload) short-circuit to their declared Summary
+// field, bypassing all the defensive JSON / map inspection below. The
+// fallback path is retained for untyped data from agents that have not
+// yet migrated to typed payloads; those paths are scheduled for deletion
+// once all producers emit typed responses.
 func SummarizeInterAgentPayload(payload any) string {
+	if summary := InterAgentPayloadSummary(payload); summary != "" {
+		return summary
+	}
 	return summarizeInterAgentPayload(payload, 0)
 }
 
@@ -19,6 +25,13 @@ func summarizeInterAgentPayload(payload any, depth int) string {
 	if depth > 6 || payload == nil {
 		return ""
 	}
+	// Second typed check: pointers unwrapped from a map[string]any after
+	// re-marshal/unmarshal cycles (bus-serialized paths) reach us here as
+	// map[string]any even when the producer emitted a typed struct. The
+	// typed union check at the top handles the in-process path; this
+	// preserves correct summary extraction for the serialized path once
+	// all producers emit typed structs (the JSON keys will match the
+	// struct's `summary` tag).
 
 	switch typed := payload.(type) {
 	case string:

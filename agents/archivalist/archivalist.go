@@ -1176,7 +1176,10 @@ func (a *Archivalist) processViaLLM(ctx context.Context, fwd *guide.ForwardedReq
 		return nil, fmt.Errorf("archivalist failed: %w", err)
 	}
 
-	return result, nil
+	// Typed inter-agent response: parse the LLM output into the canonical
+	// ConsultResponsePayload so consumers (chat UI, protocol logs) read
+	// declared fields rather than defensively parsing raw JSON.
+	return shared.DecodeConsultResponsePayloadFromLLM(result), nil
 }
 
 type forwardedHandler func(context.Context, *guide.ForwardedRequest) (any, error)

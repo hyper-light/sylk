@@ -76,11 +76,11 @@ func TestAcademicProcessForwardedRequest_AgentConsultUsesConsultationMode(t *tes
 	if err != nil {
 		t.Fatalf("processForwardedRequest: %v", err)
 	}
-	conv, ok := result.(*ConversationResult)
+	consult, ok := result.(*shared.ConsultResponsePayload)
 	if !ok {
-		t.Fatalf("result type = %T, want *ConversationResult", result)
+		t.Fatalf("result type = %T, want *shared.ConsultResponsePayload", result)
 	}
-	if conv.Response == "" {
+	if consult.Summary == "" && consult.Details == "" {
 		t.Fatal("expected non-empty consultation response")
 	}
 	if provider.lastReq == nil {
@@ -347,11 +347,11 @@ func TestAcademicProcessForwardedRequest_ChildConsultSearchOnlyCanFinalize(t *te
 	if err != nil {
 		t.Fatalf("processForwardedRequest: %v", err)
 	}
-	conv, ok := result.(*ConversationResult)
+	consult, ok := result.(*shared.ConsultResponsePayload)
 	if !ok {
-		t.Fatalf("result type = %T, want *ConversationResult", result)
+		t.Fatalf("result type = %T, want *shared.ConsultResponsePayload", result)
 	}
-	if strings.TrimSpace(conv.Response) == "" {
+	if strings.TrimSpace(consult.Summary) == "" && strings.TrimSpace(consult.Details) == "" {
 		t.Fatal("expected non-empty consultation response")
 	}
 }

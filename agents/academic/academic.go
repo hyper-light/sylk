@@ -1001,9 +1001,8 @@ func (a *Academic) handleConsultation(ctx context.Context, fwd *guide.ForwardedR
 	ctx = a.withConsultationTurnState(ctx, fwd)
 	query := strings.TrimSpace(fwd.Input)
 	if query == "" {
-		return &ConversationResult{
-			Response: "Tell me what you want researched or checked, and I’ll work through it.",
-			Intent:   fwd.Intent,
+		return &shared.ConsultResponsePayload{
+			Summary: "Tell me what you want researched or checked, and I’ll work through it.",
 		}, nil
 	}
 
@@ -1026,10 +1025,14 @@ func (a *Academic) handleConsultation(ctx context.Context, fwd *guide.ForwardedR
 	if err != nil {
 		return nil, fmt.Errorf("academic consultation failed: %w", err)
 	}
-	return &ConversationResult{
-		Response: result,
-		Intent:   fwd.Intent,
-	}, nil
+	// Typed inter-agent response: parse the LLM output into the canonical
+	// ConsultResponsePayload struct so downstream consumers (chat UI row
+	// renderer, protocol validators, archivalist loggers) read declared
+	// fields instead of defensively parsing JSON. Falls back to Summary=
+	// raw text when the LLM emitted prose rather than JSON — that case
+	// still renders meaningfully in the chat row and keeps the migration
+	// backwards-compatible with older prompts.
+	return shared.DecodeConsultResponsePayloadFromLLM(result), nil
 }
 
 type academicConversationHandoff struct {
