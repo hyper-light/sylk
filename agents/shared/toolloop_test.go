@@ -9,6 +9,7 @@ import (
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
+	"github.com/adalundhe/sylk/core/skills"
 )
 
 // --- MarshalToolOutput ---
@@ -597,5 +598,65 @@ func TestToolErrorPayload_TrimsWhitespace(t *testing.T) {
 	errMsg := parsed["error"].(string)
 	if errMsg != "padded error" {
 		t.Fatalf("expected trimmed error, got %q", errMsg)
+	}
+}
+
+func TestToolErrorPayload_ProjectsProtocolErrorFields(t *testing.T) {
+	pe := NewPipelineProtocolError(
+		"pipeline.completion.no_terminal_action",
+		"",
+		"Before ending this turn, record the next protocol step.",
+		"choose one of challenge_agent, handoff_next, or validate_work",
+	)
+	got := ToolErrorPayload(pe)
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("payload is not valid JSON: %v", err)
+	}
+	if parsed["error_kind"] != "protocol_violation" {
+		t.Fatalf("expected error_kind=protocol_violation, got %v", parsed["error_kind"])
+	}
+	if parsed["recovery_action"] != "choose one of challenge_agent, handoff_next, or validate_work" {
+		t.Fatalf("expected recovery_action from ProtocolError, got %v", parsed["recovery_action"])
+	}
+	protocolErr, ok := parsed["protocol_error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected protocol_error object, got %T", parsed["protocol_error"])
+	}
+	if protocolErr["rule_id"] != "pipeline.completion.no_terminal_action" {
+		t.Fatalf("expected rule_id in protocol_error, got %v", protocolErr["rule_id"])
+	}
+	if protocolErr["scope"] != "pipeline" {
+		t.Fatalf("expected scope=pipeline, got %v", protocolErr["scope"])
+	}
+}
+
+func TestToolErrorPayload_ProjectsContractViolationFields(t *testing.T) {
+	cv := &skills.ContractViolation{
+		SkillName:      "finalize_pipeline",
+		Kind:           "consumes",
+		ArtifactName:   "test_snapshot",
+		RecoveryAction: "call run_test_suite first",
+		HumanMessage:   "finalize_pipeline requires test_snapshot",
+	}
+	got := ToolErrorPayload(cv)
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("payload is not valid JSON: %v", err)
+	}
+	if parsed["error_kind"] != "contract_violation" {
+		t.Fatalf("expected error_kind=contract_violation, got %v", parsed["error_kind"])
+	}
+	if parsed["recovery_action"] != "call run_test_suite first" {
+		t.Fatalf("expected recovery_action from ContractViolation, got %v", parsed["recovery_action"])
+	}
+	contractErr, ok := parsed["contract_violation"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected contract_violation object, got %T", parsed["contract_violation"])
+	}
+	if contractErr["artifact_name"] != "test_snapshot" {
+		t.Fatalf("expected artifact_name=test_snapshot, got %v", contractErr["artifact_name"])
 	}
 }

@@ -614,14 +614,25 @@ func (s *PipelineProtocolState) setTerminalAction(action *PipelineTurnAction) er
 	}
 	s.mu.Lock()
 	if s.requiredAction != "" && action.Type != s.requiredAction {
-		msg := requiredPipelineActionMessageLocked(s.requiredAction, s.requiredReason)
+		required := s.requiredAction
+		reason := s.requiredReason
 		s.mu.Unlock()
-		return fmt.Errorf("%s", msg)
+		return NewPipelineProtocolError(
+			"pipeline.terminal.required_action_mismatch",
+			string(action.Type),
+			requiredPipelineActionMessageLocked(required, reason),
+			fmt.Sprintf("invoke %s to satisfy the required terminal action", required),
+		)
 	}
 	if s.terminalAction != nil {
 		terminal := s.terminalAction.Type
 		s.mu.Unlock()
-		return fmt.Errorf("pipeline turn already selected %s", terminal)
+		return NewPipelineProtocolError(
+			"pipeline.terminal.second_action_rejected",
+			string(action.Type),
+			fmt.Sprintf("pipeline turn already selected %s", terminal),
+			fmt.Sprintf("do not invoke a second terminal action this turn; %s already landed", terminal),
+		)
 	}
 	s.terminalAction = clonePipelineTurnAction(action)
 	if s.requiredAction != "" && action.Type == s.requiredAction {
@@ -643,10 +654,20 @@ func (s *PipelineProtocolState) validateTerminalAction(action *PipelineTurnActio
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.requiredAction != "" && action.Type != s.requiredAction {
-		return fmt.Errorf("%s", requiredPipelineActionMessageLocked(s.requiredAction, s.requiredReason))
+		return NewPipelineProtocolError(
+			"pipeline.terminal.required_action_mismatch",
+			string(action.Type),
+			requiredPipelineActionMessageLocked(s.requiredAction, s.requiredReason),
+			fmt.Sprintf("invoke %s to satisfy the required terminal action", s.requiredAction),
+		)
 	}
 	if s.terminalAction != nil {
-		return fmt.Errorf("pipeline turn already selected %s", s.terminalAction.Type)
+		return NewPipelineProtocolError(
+			"pipeline.terminal.second_action_rejected",
+			string(action.Type),
+			fmt.Sprintf("pipeline turn already selected %s", s.terminalAction.Type),
+			fmt.Sprintf("do not invoke a second terminal action this turn; %s already landed", s.terminalAction.Type),
+		)
 	}
 	return nil
 }
@@ -863,7 +884,12 @@ func ValidatePipelineProtocolCompletion(ctx context.Context, role string) error 
 	projection := state.Projection()
 	if required := PipelineProtocolActionType(projection.RequiredAction); required != "" {
 		if projection.TerminalAction == "" || PipelineProtocolActionType(projection.TerminalAction) != required {
-			return fmt.Errorf("%s", requiredPipelineActionMessage(required, projection.RequiredActionReason))
+			return NewPipelineProtocolError(
+				"pipeline.completion.required_action_pending",
+				"",
+				requiredPipelineActionMessage(required, projection.RequiredActionReason),
+				fmt.Sprintf("invoke %s before ending this turn", required),
+			)
 		}
 	}
 	if projection.TerminalAction != "" {
@@ -872,11 +898,26 @@ func ValidatePipelineProtocolCompletion(ctx context.Context, role string) error 
 	role = normalizePipelineAgentType(role)
 	if role == PipelineAgentInspector {
 		if PipelinePostValidationDecisionOutstanding(ctx) {
-			return fmt.Errorf("Before ending this inspector pipeline turn, you already called `process_validation`. Finish any remaining direct audit you still need, then record the next protocol step with `challenge_agent`, `handoff_next`, `finalize_pipeline`, or `handoff_to_ot`.")
+			return NewPipelineProtocolError(
+				"pipeline.completion.inspector_post_validation_outstanding",
+				"",
+				"Before ending this inspector pipeline turn, you already called `process_validation`. Finish any remaining direct audit you still need, then record the next protocol step.",
+				"choose one of challenge_agent, handoff_next, finalize_pipeline, or handoff_to_ot",
+			)
 		}
-		return fmt.Errorf("Before ending this pipeline turn, use `challenge_agent`, `handoff_next`, `validate_work`, `finalize_pipeline`, or `handoff_to_ot` to record the next protocol step.")
+		return NewPipelineProtocolError(
+			"pipeline.completion.inspector_no_terminal_action",
+			"",
+			"Before ending this pipeline turn, record the next protocol step.",
+			"choose one of challenge_agent, handoff_next, validate_work, finalize_pipeline, or handoff_to_ot",
+		)
 	}
-	return fmt.Errorf("Before ending this pipeline turn, use `challenge_agent`, `handoff_next`, or `validate_work` to record the next protocol step.")
+	return NewPipelineProtocolError(
+		"pipeline.completion.no_terminal_action",
+		"",
+		"Before ending this pipeline turn, record the next protocol step.",
+		"choose one of challenge_agent, handoff_next, or validate_work",
+	)
 }
 
 func PipelineProtocolSkills(cfg PipelineProtocolSkillConfig) []*skills.Skill {

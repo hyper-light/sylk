@@ -53,6 +53,13 @@ func MarshalToolOutput(data any) (string, error) {
 
 // ToolErrorPayload returns a JSON-encoded error payload for a tool execution failure.
 // Returns an empty string when err is nil.
+//
+// Typed protocol errors (ProtocolError, skills.ContractViolation) project
+// their structured fields into the payload so the LLM reads
+// {rule_id, scope, missing_artifact, recovery_action, human_message}
+// instead of parsing English prose. The prose from err.Error() still
+// lands in "error" as a fallback for consumers that don't inspect
+// typed fields yet.
 func ToolErrorPayload(err error) string {
 	if err == nil {
 		return ""
@@ -69,6 +76,21 @@ func ToolErrorPayload(err error) string {
 	}
 	if detail.Retryable {
 		payload["retryable"] = true
+	}
+	if pe, ok := AsProtocolError(err); ok && pe != nil {
+		payload["protocol_error"] = pe
+		payload["error_kind"] = "protocol_violation"
+		if pe.RecoveryAction != "" {
+			payload["recovery_action"] = pe.RecoveryAction
+		}
+	}
+	var cv *skills.ContractViolation
+	if errors.As(err, &cv) && cv != nil {
+		payload["contract_violation"] = cv
+		payload["error_kind"] = "contract_violation"
+		if cv.RecoveryAction != "" {
+			payload["recovery_action"] = cv.RecoveryAction
+		}
 	}
 	payloadJSON, marshalErr := json.Marshal(payload)
 	if marshalErr != nil {

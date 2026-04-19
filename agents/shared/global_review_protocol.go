@@ -437,14 +437,25 @@ func (s *GlobalReviewState) setTerminalAction(action *GlobalReviewTurnAction) er
 	}
 	s.mu.Lock()
 	if s.requiredAction != "" && action.Type != s.requiredAction {
-		msg := requiredGlobalReviewActionMessageLocked(s.requiredAction, s.requiredReason)
+		required := s.requiredAction
+		reason := s.requiredReason
 		s.mu.Unlock()
-		return fmt.Errorf("%s", msg)
+		return NewGlobalReviewProtocolError(
+			"global_review.terminal.required_action_mismatch",
+			string(action.Type),
+			requiredGlobalReviewActionMessageLocked(required, reason),
+			fmt.Sprintf("invoke %s to satisfy the required terminal action", required),
+		)
 	}
 	if s.terminalAction != nil {
 		terminal := s.terminalAction.Type
 		s.mu.Unlock()
-		return fmt.Errorf("global review turn already selected %s", terminal)
+		return NewGlobalReviewProtocolError(
+			"global_review.terminal.second_action_rejected",
+			string(action.Type),
+			fmt.Sprintf("global review turn already selected %s", terminal),
+			fmt.Sprintf("do not invoke a second terminal action this turn; %s already landed", terminal),
+		)
 	}
 	s.terminalAction = cloneGlobalReviewTurnAction(action)
 	if s.requiredAction != "" && action.Type == s.requiredAction {
@@ -501,7 +512,12 @@ func ValidateGlobalReviewCompletion(ctx context.Context, agentType string) error
 	}
 	projection := state.Projection()
 	if action := GlobalReviewActionType(projection.RequiredAction); action != "" {
-		return fmt.Errorf("%s", requiredGlobalReviewActionMessageLocked(action, projection.RequiredActionReason))
+		return NewGlobalReviewProtocolError(
+			"global_review.completion.required_action_pending",
+			"",
+			requiredGlobalReviewActionMessageLocked(action, projection.RequiredActionReason),
+			fmt.Sprintf("invoke %s before ending this turn", action),
+		)
 	}
 	if projection.TerminalAction != "" {
 		return nil
@@ -510,24 +526,54 @@ func ValidateGlobalReviewCompletion(ctx context.Context, agentType string) error
 	agentType = normalizeGlobalReviewAgent(agentType)
 	if projection.PendingChallenge != nil &&
 		normalizeGlobalReviewAgent(projection.PendingChallenge.TargetAgent) == agentType {
-		return fmt.Errorf("Before ending this global review turn, answer the active challenge with `validate_work`.")
+		return NewGlobalReviewProtocolError(
+			"global_review.completion.pending_challenge_outstanding",
+			"",
+			"Before ending this global review turn, answer the active challenge.",
+			"invoke validate_work to answer the active challenge",
+		)
 	}
 	switch agentType {
 	case GlobalReviewAgentInspector:
 		if projection.PendingValidation != nil {
-			return fmt.Errorf("Before ending this global inspector turn, call `process_validation` and then decide whether the next move is `challenge_global_tester`, `challenge_architect`, `challenge_orchestrator`, `handoff_next`, `finalize_global_review`, `accept_checkpoint`, or `commit_to_disk`.")
+			return NewGlobalReviewProtocolError(
+				"global_review.completion.inspector_pending_validation",
+				"",
+				"Before ending this global inspector turn, call process_validation and then decide the next move.",
+				"call process_validation, then choose one of challenge_global_tester, challenge_architect, challenge_orchestrator, handoff_next, finalize_global_review, accept_checkpoint, or commit_to_disk",
+			)
 		}
-		return fmt.Errorf("Before ending this global inspector turn, use `challenge_global_tester`, `challenge_architect`, `challenge_orchestrator`, `handoff_next`, `validate_work`, `process_validation`, `finalize_global_review`, `accept_checkpoint`, or `commit_to_disk` to record the next review step.")
+		return NewGlobalReviewProtocolError(
+			"global_review.completion.inspector_no_terminal_action",
+			"",
+			"Before ending this global inspector turn, record the next review step.",
+			"choose one of challenge_global_tester, challenge_architect, challenge_orchestrator, handoff_next, validate_work, process_validation, finalize_global_review, accept_checkpoint, or commit_to_disk",
+		)
 	case GlobalReviewAgentTester:
 		if projection.PendingValidation != nil &&
 			normalizeGlobalReviewAgent(projection.PendingValidation.RequestingAgent) == agentType {
-			return fmt.Errorf("Before ending this global tester turn, call `process_validation` before choosing the next handoff or challenge.")
+			return NewGlobalReviewProtocolError(
+				"global_review.completion.tester_pending_validation",
+				"",
+				"Before ending this global tester turn, call process_validation before choosing the next handoff or challenge.",
+				"call process_validation first",
+			)
 		}
-		return fmt.Errorf("Before ending this global tester turn, use `challenge_inspector`, `handoff_next`, `validate_work`, or `process_validation` to record the next review step.")
+		return NewGlobalReviewProtocolError(
+			"global_review.completion.tester_no_terminal_action",
+			"",
+			"Before ending this global tester turn, record the next review step.",
+			"choose one of challenge_inspector, handoff_next, validate_work, or process_validation",
+		)
 	case GlobalReviewAgentArchitect, GlobalReviewAgentOrchestrator:
 		if projection.PendingValidation != nil &&
 			normalizeGlobalReviewAgent(projection.PendingValidation.RequestingAgent) == agentType {
-			return fmt.Errorf("Before ending this global review turn, call `process_validation` before choosing another challenge or handoff.")
+			return NewGlobalReviewProtocolError(
+				"global_review.completion.pending_validation_outstanding",
+				"",
+				"Before ending this global review turn, call process_validation before choosing another challenge or handoff.",
+				"call process_validation first",
+			)
 		}
 	}
 	return nil
