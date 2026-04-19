@@ -13,7 +13,7 @@ import (
 // SummaryGenerator creates hierarchical summaries from entries
 type SummaryGenerator struct {
 	client              *Client
-	archive             *Archive
+	archive             *SessionArchives
 	factExtractor       *FactExtractor
 	maxEntriesPerSpan   int
 	targetTokensPerSpan int
@@ -22,7 +22,7 @@ type SummaryGenerator struct {
 // SummaryGeneratorConfig configures the summary generator
 type SummaryGeneratorConfig struct {
 	Client              *Client
-	Archive             *Archive
+	Archive             *SessionArchives
 	MaxEntriesPerSpan   int // Default: 20
 	TargetTokensPerSpan int // Default: 2000
 }

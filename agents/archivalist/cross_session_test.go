@@ -40,7 +40,7 @@ func TestCrossSessionIndex_QueryCrossSession(t *testing.T) {
 
 func TestCrossSessionIndex_QuerySessions(t *testing.T) {
 	store := NewStore(StoreConfig{})
-	archive := (*Archive)(nil)
+	archive := (*SessionArchives)(nil)
 	index := NewCrossSessionIndex(store, archive, nil)
 
 	_, err := store.InsertEntryInSession("session-1", &Entry{

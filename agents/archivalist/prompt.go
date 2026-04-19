@@ -2,17 +2,28 @@ package archivalist
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/adalundhe/sylk/prompts"
 )
 
 var (
-	DefaultSystemPrompt              = prompts.MustLoad("archivalist", "system")
+	archivalistBaseSystem            = prompts.MustLoad("archivalist", "system")
+	archivalistFabricAwareness       = prompts.MustLoad("shared", "fabric_awareness")
+	archivalistFabricAdvisory        = prompts.MustLoad("shared", "fabric_knowledge_advisory")
 	SummaryPromptTemplate            = prompts.MustLoad("archivalist", "summary")
 	MultiSourceSummaryPromptTemplate = prompts.MustLoad("archivalist", "multi_source_summary")
 	AgentBriefingTemplate            = prompts.MustLoad("archivalist", "briefing")
 	ClassificationSystemPrompt       = prompts.MustLoad("archivalist", "classification")
 	ClassificationExamples           = prompts.MustLoad("archivalist", "classification_examples")
+
+	// DefaultSystemPrompt composes the archivalist's base persona with
+	// the uniform fabric awareness + knowledge-agent advisory clause.
+	DefaultSystemPrompt = strings.Join([]string{
+		archivalistBaseSystem,
+		archivalistFabricAwareness,
+		archivalistFabricAdvisory,
+	}, "\n\n---\n\n")
 )
 
 func FormatSummaryPrompt(content string) string {

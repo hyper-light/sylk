@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -46,9 +47,37 @@ func detectTestHarnessSkill(pt *PipelineTester) *skills.Skill {
 			if err != nil {
 				return nil, err
 			}
+			// Activity Fabric auto-publish: emit a Tentative
+			// test_framework decision for the detected harness so
+			// peer pipelines see the choice in their ambient
+			// context. Side-effect of normal work; does not gate.
+			if state != nil && state.FrameworkID != "" {
+				agentshared.AutoPublishTentative(ctx, agentshared.AutoPublishInput{
+					SessionID:        pt.config.SessionID,
+					AuthorAgentID:    pt.id,
+					AuthorAgentType:  "tester-pipeline",
+					AuthorPipelineID: pt.pipelineID,
+					TriggerSkill:     "detect_test_harness",
+					Domain:           "test_framework",
+					Value:            string(state.FrameworkID),
+					Scope:            firstHarnessFile(p.Files),
+					Evidence:         []string{"harness detection from project files"},
+				})
+			}
 			return state, nil
 		}).
 		Build()
+}
+
+// firstHarnessFile returns a path-prefix scope for the auto-publish
+// from the file list. Empty when no files are provided.
+func firstHarnessFile(files []string) string {
+	for _, f := range files {
+		if f != "" {
+			return f
+		}
+	}
+	return ""
 }
 
 func prepareTestHarnessSkill(pt *PipelineTester) *skills.Skill {
@@ -250,6 +279,24 @@ func writeTestSkill(pt *PipelineTester) *skills.Skill {
 			writtenPath, err := pt.writeTestArtifact(ctx, harness, p.TestCase, p.OutputFile, p.Content, &p.Basis)
 			if err != nil {
 				return nil, err
+			}
+			// Activity Fabric auto-publish: write_test promotes the
+			// test_framework choice to Committed — the work is done,
+			// the file exists. The fabric's amplifier reconciliation
+			// surfaces this as a promotion of any prior Tentative
+			// declaration with the same value at overlapping scope.
+			if harness != nil && harness.FrameworkID != "" {
+				agentshared.AutoPublishCommitted(ctx, agentshared.AutoPublishInput{
+					SessionID:        pt.config.SessionID,
+					AuthorAgentID:    pt.id,
+					AuthorAgentType:  "tester-pipeline",
+					AuthorPipelineID: pt.pipelineID,
+					TriggerSkill:     "write_test",
+					Domain:           "test_framework",
+					Value:            string(harness.FrameworkID),
+					Scope:            writtenPath,
+					Evidence:         []string{"test file authored: " + writtenPath},
+				})
 			}
 			return map[string]any{
 				"written":     true,

@@ -242,10 +242,22 @@ func (s *Scribe) storeCommentaryInArchivalist(ctx context.Context, commentary st
 	branchCtx, branch := shared.BeginArchivalistStoreBranch(branchCtx, "stored scribe commentary", map[string]any{
 		"parent_agent": s.parentAgentType,
 	})
+
+	// Deterministic archivalist entry ID per SCRIBE_FABRIC.md §9.4
+	// Option B. Lets us reference the entry from the fabric activity
+	// without a synchronous round-trip to the archivalist.
+	archivalEntryID := fmt.Sprintf(
+		"scribe_%s_rep%d_%d",
+		s.parentAgentType, s.replicaGeneration, time.Now().UnixNano(),
+	)
+
 	metadata := branch.ApplyMetadata(branchCtx, map[string]any{
-		"source_type":  "scribe",
-		"parent_agent": s.parentAgentType,
-		"scribe_id":    s.id,
+		"source_type":        "scribe",
+		"parent_agent":       s.parentAgentType,
+		"scribe_id":          s.id,
+		"replica_generation": s.replicaGeneration,
+		"session_id":         s.sessionID,
+		"entry_id":           archivalEntryID,
 	})
 
 	req := &guide.RouteRequest{
@@ -267,6 +279,11 @@ func (s *Scribe) storeCommentaryInArchivalist(ctx context.Context, commentary st
 		return fmt.Errorf("publish archivalist store request: %w", err)
 	}
 	branch.Complete(branchCtx, "stored scribe commentary", "", nil)
+
+	// Activity Fabric narration projection (SCRIBE_FABRIC.md Phase 3).
+	// Best-effort — emission failures must not fail the archivalist
+	// publish, which already succeeded above.
+	s.emitNarrationActivity(ctx, commentary, archivalEntryID, parentCorrelationID)
 	return nil
 }
 

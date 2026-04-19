@@ -11,6 +11,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -82,6 +83,34 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	}
 	gi.skills.Register(researchDependencyInstallSkill(gi))
 	gi.skills.Register(installDependencyToolingSkill(gi))
+
+	// Activity Fabric: uniform awareness skills + cross-pipeline
+	// primitives + audit-time inspect_open_activity. Global inspector
+	// audits at session level; the audit skill returns conflicts
+	// across the whole session when called with empty scope.
+	for _, skill := range agentShared.AwarenessSkills(agentShared.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return gi.config.SessionID },
+		AgentID:        func() string { return gi.id },
+		AgentType:      func() string { return "inspector" },
+	}) {
+		gi.skills.Register(skill)
+	}
+	for _, skill := range agentShared.CrossPipelineSkills(agentShared.CrossPipelineSkillConfig{
+		SessionID: func() string { return gi.config.SessionID },
+		AgentID:   func() string { return gi.id },
+		AgentType: func() string { return "inspector" },
+	}) {
+		gi.skills.Register(skill)
+	}
+	for _, skill := range agentShared.InspectorAuditSkills(agentShared.InspectorAuditSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return gi.config.SessionID },
+		AgentID:        func() string { return gi.id },
+		AgentType:      func() string { return "inspector" },
+	}) {
+		gi.skills.Register(skill)
+	}
 
 	// Diagnostics
 	gi.skills.Register(agentShared.NewSelfDiagnosticSkill(&globalInspectorDiag{gi: gi}))

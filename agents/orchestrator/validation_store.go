@@ -103,6 +103,7 @@ func (s *Store) CreateValidationEpoch(record *ValidationEpochRecord) error {
 	}); err != nil {
 		return fmt.Errorf("create validation epoch: %w", err)
 	}
+	emitValidationStarted(context.Background(), record)
 	return nil
 }
 
@@ -132,6 +133,7 @@ func (s *Store) UpdateValidationEpoch(record *ValidationEpochRecord) error {
 	}); err != nil {
 		return fmt.Errorf("update validation epoch: %w", err)
 	}
+	emitValidationCompleted(context.Background(), record)
 	return nil
 }
 
@@ -199,6 +201,7 @@ func (s *Store) CreateExecutionHold(record *ExecutionHoldRecord) error {
 	}); err != nil {
 		return fmt.Errorf("create execution hold: %w", err)
 	}
+	emitHoldAcquired(context.Background(), record)
 	return nil
 }
 
@@ -224,6 +227,9 @@ func (s *Store) UpdateExecutionHold(record *ExecutionHoldRecord) error {
 		return err
 	}); err != nil {
 		return fmt.Errorf("update execution hold: %w", err)
+	}
+	if record.Status == ExecutionHoldStatusResolved || record.Status == ExecutionHoldStatusAborted {
+		emitHoldReleased(context.Background(), record)
 	}
 	return nil
 }
@@ -288,6 +294,7 @@ func (s *Store) CreateRemediationCase(record *RemediationCaseRecord) error {
 	}); err != nil {
 		return fmt.Errorf("create remediation case: %w", err)
 	}
+	emitRemediationOpened(context.Background(), record)
 	return nil
 }
 
@@ -313,6 +320,10 @@ func (s *Store) UpdateRemediationCase(record *RemediationCaseRecord) error {
 		return err
 	}); err != nil {
 		return fmt.Errorf("update remediation case: %w", err)
+	}
+	switch record.Status {
+	case RemediationCaseStatusApplied, RemediationCaseStatusRejected:
+		emitRemediationResolved(context.Background(), record)
 	}
 	return nil
 }

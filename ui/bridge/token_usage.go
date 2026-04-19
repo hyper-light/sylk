@@ -1,33 +1,51 @@
 package bridge
 
 import (
+	"context"
 	"encoding/json"
-	"sync"
+	"sync/atomic"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/ui/agentidentity"
 	"github.com/adalundhe/sylk/ui/msg"
 )
 
-const tokenUsageBridgeName = "bridge.token_usage"
+const (
+	tokenUsageBridgeName = "bridge.token_usage"
+	// Zero uses the scope's max lifetime; the bridge runs for the full TUI
+	// session and is torn down by scope cancellation at exit.
+	tokenUsageBridgeDrainTimeout = 0
+)
 
 // TokenUsageBridge subscribes to EventTypeLLMResponse activity events on the
 // ChannelBus and forwards token deltas to the Bubble Tea program as
 // TokenUsageMsg. Unlike the ActivityBridge (which filters to VisibilityUser),
 // this bridge accepts all visibility levels so that background agent LLM calls
 // are counted in the status bar totals.
+//
+// UI-12: scope-tracked lifecycle; Stop is idempotent via an atomic flag so
+// the former sync.Once is redundant — Unsubscribe is itself atomic.
 type TokenUsageBridge struct {
-	id       string
-	bus      guide.EventBus
-	sub      guide.Subscription
-	stopOnce sync.Once
+	id      string
+	bus     guide.EventBus
+	scope   *concurrency.GoroutineScope
+	sub     guide.Subscription
+	done    chan struct{}
+	stopped atomic.Bool
 }
 
 // NewTokenUsageBridge creates a bridge that converts LLM response events into
-// token-usage messages for the TUI status bar.
-func NewTokenUsageBridge(id string, bus guide.EventBus) *TokenUsageBridge {
-	return &TokenUsageBridge{id: id, bus: bus}
+// token-usage messages for the TUI status bar. scope may be nil for tests
+// that only exercise Start/Stop without scope-tracked goroutines.
+func NewTokenUsageBridge(id string, bus guide.EventBus, scope *concurrency.GoroutineScope) *TokenUsageBridge {
+	return &TokenUsageBridge{
+		id:    id,
+		bus:   bus,
+		scope: scope,
+		done:  make(chan struct{}),
+	}
 }
 
 func (b *TokenUsageBridge) Start(program TeaProgram) error {
@@ -41,15 +59,43 @@ func (b *TokenUsageBridge) Start(program TeaProgram) error {
 		return err
 	}
 	b.sub = sub
+	if b.scope != nil {
+		if err := b.scope.Go(tokenUsageBridgeName, tokenUsageBridgeDrainTimeout, b.scopeWatcher()); err != nil {
+			_ = sub.Unsubscribe()
+			b.sub = nil
+			return err
+		}
+	}
 	return nil
 }
 
 func (b *TokenUsageBridge) Stop() {
-	b.stopOnce.Do(func() {
-		if b.sub != nil {
-			_ = b.sub.Unsubscribe()
+	if !b.stopped.CompareAndSwap(false, true) {
+		return
+	}
+	close(b.done)
+	b.teardown()
+}
+
+func (b *TokenUsageBridge) teardown() {
+	if b.sub != nil {
+		_ = b.sub.Unsubscribe()
+	}
+}
+
+func (b *TokenUsageBridge) scopeWatcher() concurrency.WorkFunc {
+	return func(ctx context.Context) error {
+		select {
+		case <-b.done:
+			return nil
+		case <-ctx.Done():
+			if b.stopped.CompareAndSwap(false, true) {
+				close(b.done)
+				b.teardown()
+			}
+			return ctx.Err()
 		}
-	})
+	}
 }
 
 func (b *TokenUsageBridge) Name() string        { return tokenUsageBridgeName }

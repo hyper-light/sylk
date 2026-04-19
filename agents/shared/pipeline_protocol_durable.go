@@ -3,6 +3,7 @@ package shared
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -251,6 +252,15 @@ func (s *PipelineProtocolState) appendEvent(ctx context.Context, kind string, pa
 		payload,
 	)
 	if err != nil {
+		// DUR-03: a duplicate correlation indicates this event was already
+		// appended and projected in a prior turn or crash-recovery. The
+		// projection and mailboxes are already in the expected post-event
+		// state, so downstream work would be a no-op at best and a
+		// double-apply at worst. Treat as success — the protocol step's
+		// external contract (event recorded, state advanced) is satisfied.
+		if errors.Is(err, ErrDurableProtocolDuplicate) {
+			return nil
+		}
 		return err
 	}
 	if err := s.applyEvent(seq, event); err != nil {

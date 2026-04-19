@@ -31,18 +31,21 @@ type Sink interface {
 	Append(ctx context.Context, activity AgentActivity)
 }
 
-// ─── Default sink registry ────────────────────────────────────────────
+// ─── Default sink + source registry ────────────────────────────────
 //
-// The fabric uses a process-wide default sink because chokepoint
-// instrumentation lives inside packages (database, events, providers,
-// versioning, purevfs, commandapproval) that cannot be expected to
-// thread a sink through every call signature. Tests substitute a sink
-// via SetDefaultSink with deferred restoration.
+// The fabric uses a process-wide default sink and source because
+// chokepoint instrumentation and skill registries live inside packages
+// (database, events, providers, versioning, purevfs, commandapproval,
+// agents/shared/...) that cannot be expected to thread these through
+// every call signature. Tests substitute via SetDefaultSink /
+// SetDefaultSource with deferred restoration.
 
 var (
-	defaultSinkMu sync.RWMutex
-	defaultSink   Sink = discardSink{}
-	emissionsTot  atomic.Uint64
+	defaultSinkMu   sync.RWMutex
+	defaultSink     Sink = discardSink{}
+	defaultSourceMu sync.RWMutex
+	defaultSource   Source
+	emissionsTot    atomic.Uint64
 )
 
 // DefaultSink returns the currently-installed process-wide sink. Never
@@ -80,6 +83,29 @@ func SetDefaultSink(sink Sink) (previous Sink) {
 // telemetry and as a smoke-test signal that capture is wired up.
 func EmissionCount() uint64 {
 	return emissionsTot.Load()
+}
+
+// DefaultSource returns the currently-installed process-wide read
+// Source. Returns nil if nothing has been installed; callers must
+// gracefully handle nil (skills typically degrade to empty results
+// when the source isn't yet wired).
+func DefaultSource() Source {
+	defaultSourceMu.RLock()
+	s := defaultSource
+	defaultSourceMu.RUnlock()
+	return s
+}
+
+// SetDefaultSource installs source as the process-wide default and
+// returns the previous source for defer-restore in tests. Production
+// wiring (cmd/tui.go) calls this once at startup with the
+// orchestrator's activitystore.SQLiteStore.
+func SetDefaultSource(source Source) (previous Source) {
+	defaultSourceMu.Lock()
+	previous = defaultSource
+	defaultSource = source
+	defaultSourceMu.Unlock()
+	return previous
 }
 
 // Append routes an activity to the default sink. Increments the

@@ -53,7 +53,7 @@ type committedKnowledgeWriter interface {
 type Archivalist struct {
 	id           string
 	store        *Store
-	archive      *Archive
+	archive      *SessionArchives
 	agentContext *AgentContext
 	config       Config
 	logger       *slog.Logger
@@ -262,7 +262,7 @@ func applyConfigDefaults(cfg Config) Config {
 
 // archivalistComponents holds intermediate components for assembly
 type archivalistComponents struct {
-	archive          *Archive
+	archive          *SessionArchives
 	store            *Store
 	agentContext     *AgentContext
 	registry         *Registry
@@ -294,15 +294,25 @@ func createComponents(cfg Config) (*archivalistComponents, error) {
 	}, nil
 }
 
-func createArchive(cfg Config) (*Archive, error) {
+// createArchive constructs the per-session archive manager. cfg.ArchivePath
+// is interpreted as a project root (the directory containing .sylk/) — its
+// historical role as a single sqlite file location is gone; per-session
+// DBs are opened lazily under {root}/.sylk/sessions/{sid}/agents/archivalist/.
+// Empty ArchivePath defaults to "." (current working directory).
+func createArchive(cfg Config) (*SessionArchives, error) {
 	if !cfg.EnableArchive {
 		return nil, nil
 	}
-	archive, err := NewArchive(ArchiveConfig{Path: cfg.ArchivePath})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create archive: %w", err)
+	workDir := strings.TrimSpace(cfg.ArchivePath)
+	if workDir == "" {
+		workDir = "."
+	} else if strings.HasSuffix(workDir, ".db") {
+		workDir = filepath.Dir(filepath.Dir(workDir))
+		if workDir == "" {
+			workDir = "."
+		}
 	}
-	return archive, nil
+	return NewSessionArchives(SessionArchivesConfig{WorkDir: workDir}), nil
 }
 
 func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {

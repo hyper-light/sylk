@@ -1278,18 +1278,21 @@ func (m *Model) handleAgentState(state msg.AgentStateMsg) tea.Cmd {
 	// correlation's stream (if any) so the existing thinking-status
 	// rendering path surfaces the transition without the caller having to
 	// emit a separate progress event. Terminal states clear the status so
-	// the finalized entry doesn't show stale activity.
+	// the finalized entry doesn't show stale activity. The mutation is
+	// done under History.UpdateAt so it's race-free with concurrent
+	// renders and invalidates cached render lines.
 	if slot, ok := m.streams[cid]; ok && slot.accumulator != nil {
-		if entry := m.history.Get(slot.accumulator.EntryIndex()); entry != nil {
+		entryIdx := slot.accumulator.EntryIndex()
+		m.history.UpdateAt(entryIdx, func(e *ChatEntry) {
 			if terminal {
-				entry.ThinkingStatus = ""
+				e.ThinkingStatus = ""
 			} else if detail := record.Detail; detail != "" {
-				entry.ThinkingStatus = detail
+				e.ThinkingStatus = detail
 			} else {
-				entry.ThinkingStatus = humanizeAgentState(record.State)
+				e.ThinkingStatus = humanizeAgentState(record.State)
 			}
-			entry.Height = -1
-		}
+			invalidateChatEntryRender(e)
+		})
 	}
 	return nil
 }
@@ -4843,7 +4846,47 @@ func (m *Model) renderThinkingEntry(idx int, agentID, retryText string, start, n
 	}
 	elapsed := thinkingElapsed(start, now)
 	text := fmt.Sprintf("%s  %s", spinnerFrames[thinkingFrameAt(elapsed)], formatToolDuration(elapsed))
-	return m.writeThinkingEntry(idx, text, thinkingStatusFor(agentID, retryText, elapsed), m.thinkingColorFor(elapsed))
+	// Agent-state detail (explicit activity transition from the agent) takes
+	// precedence over the rotating placeholder messages — when present, the
+	// user sees exactly what the agent is doing instead of a generic phrase.
+	// Retry text still wins over state detail because retries indicate a
+	// transient failure the user should see first.
+	status := thinkingStatusFor(agentID, retryText, elapsed)
+	if retryText == "" {
+		if detail := m.agentStateDetailForEntry(idx); detail != "" {
+			status = detail
+		}
+	}
+	return m.writeThinkingEntry(idx, text, status, m.thinkingColorFor(elapsed))
+}
+
+// agentStateDetailForEntry returns the current agent-state detail for the
+// entry at idx, or "" if no non-terminal state is attached. Looks up the
+// entry's correlation via the stream slot map and consults m.agentStates.
+// The detail comes from the most recent PublishAgentState call; terminal
+// states (complete/errored) have already been evicted.
+func (m *Model) agentStateDetailForEntry(idx int) string {
+	if idx < 0 || m.agentStates == nil || len(m.agentStates) == 0 {
+		return ""
+	}
+	// Find the correlation id owning this entry index.
+	for cid, slot := range m.streams {
+		if slot == nil || slot.accumulator == nil {
+			continue
+		}
+		if slot.accumulator.EntryIndex() != idx {
+			continue
+		}
+		state, ok := m.agentStates[cid]
+		if !ok || state == nil {
+			return ""
+		}
+		if detail := strings.TrimSpace(state.Detail); detail != "" {
+			return detail
+		}
+		return humanizeAgentState(state.State)
+	}
+	return ""
 }
 
 func (m *Model) setThinkingEntryNow(idx int, start time.Time, message string) bool {

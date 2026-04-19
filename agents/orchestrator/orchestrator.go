@@ -243,9 +243,17 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 			return nil, err
 		}
 		o.steering.InitLazy("orchestrator", activityPub)
-		// Orchestrator has SylkDir at construction — pre-bind using legacy path
-		// until session binding occurs on first request.
-		o.steering.InitJournal("orchestrator", activityPub, sd.AgentSteeringPath("orchestrator"))
+		// Pre-bind the steering journal under the bootstrap session
+		// directory. Per-request handleBusRequest calls BindSession again
+		// with the request's actual session ID — when the session matches
+		// the pre-bind, BindSession is a no-op; on first session change it
+		// re-binds. The pre-bind exists so the journal is open before
+		// any request arrives.
+		sid := strings.TrimSpace(cfg.SessionID)
+		if sid == "" {
+			sid = "default"
+		}
+		o.steering.InitJournal("orchestrator", activityPub, sd.SessionAgentWALPath(sid, "orchestrator"))
 	}
 
 	o.registerCoreSkills()
@@ -273,8 +281,17 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 
 // initDataPlane initializes the persistent data plane: SQLite, WAL, BufferRegistry, DAG Bridge.
 func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPub events.ActivityPublisher) error {
+	// Session-scoped data plane: orchestrator persistent state lives with
+	// the session that owns the orchestrated work. cfg.SessionID is set by
+	// the bootstrap (ui.app via the session manager); empty falls back to
+	// the bootstrap default so single-session operation still works.
+	sid := strings.TrimSpace(cfg.SessionID)
+	if sid == "" {
+		sid = "default"
+	}
+
 	// SQLite store
-	store, err := OpenStore(DefaultStoreConfig(sd.OrchestratorDBPath()))
+	store, err := OpenStore(DefaultStoreConfig(sd.SessionOrchestratorDBPath(sid)))
 	if err != nil {
 		return fmt.Errorf("orchestrator: open store: %w", err)
 	}
@@ -284,8 +301,16 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 	}
 	o.store = store
 
+	// Install the Activity Fabric sink + source as the process-wide
+	// defaults. Every chokepoint emission flows into the SubscribingSink;
+	// every awareness skill / inspector audit / lens reads from the
+	// SQLite-backed Source. Bleve and Memory Forest subscribers attach
+	// to the SubscribingSink so they see the same stream the durable
+	// store sees. See docs/FABRIC.md.
+	installActivityFabric(o.store, sid)
+
 	// WAL journal
-	journal, err := OpenOrchestratorJournal(sd.OrchestratorWALPath())
+	journal, err := OpenOrchestratorJournal(sd.SessionOrchestratorWALPath(sid))
 	if err != nil {
 		store.Close()
 		return fmt.Errorf("orchestrator: open journal: %w", err)

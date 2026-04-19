@@ -36,6 +36,11 @@ var (
 
 	// Conversation mode prompt for chat intents.
 	TesterConversationPrompt = prompts.MustLoad("tester", "conversation")
+
+	// Activity Fabric awareness — uniform section appended to every
+	// tester variant's system prompt. Pipeline tester and global
+	// tester both compose this in.
+	TesterFabricAwareness = prompts.MustLoad("shared", "fabric_awareness")
 )
 
 // PipelineTesterSystemPrompt composes the full pipeline tester system prompt.
@@ -45,7 +50,8 @@ func PipelineTesterSystemPrompt() string {
 		TestPlanningStrategy + "\n\n" +
 		HarnessDesign + "\n\n" +
 		TesterSkillsPolicy + "\n\n" +
-		TesterGuardrails
+		TesterGuardrails + "\n\n" +
+		TesterFabricAwareness
 }
 
 // PipelineTesterSystemPromptForWorker composes the pipeline tester system prompt,
@@ -74,6 +80,7 @@ func PipelineTesterSystemPromptForWorkerAndContract(workerType string, contract 
 		HarnessDesign,
 		TestCategoryDescriptions,
 		TesterGuardrails,
+		TesterFabricAwareness,
 	)
 	if workerType == "designer" {
 		return base + "\n\n" + pipelineDesignValidation
@@ -89,6 +96,7 @@ func GlobalTesterSystemPrompt() string {
 		HarnessDesign + "\n\n" +
 		TesterSkillsPolicy + "\n\n" +
 		TesterGuardrails + "\n\n" +
+		TesterFabricAwareness + "\n\n" +
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView: versioning.WorkspaceViewGlobal,
 		})
@@ -109,6 +117,7 @@ func GlobalTesterSystemPromptForContract(contract *agentshared.GlobalExecutionCo
 		HarnessDesign,
 		TestCategoryDescriptions,
 		TesterGuardrails,
+		TesterFabricAwareness,
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView: versioning.WorkspaceViewGlobal,
 		}),

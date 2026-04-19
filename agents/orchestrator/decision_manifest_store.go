@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/database"
 	"github.com/adalundhe/sylk/core/manifest"
 	"github.com/dgraph-io/ristretto"
@@ -221,7 +222,116 @@ func (s *DecisionManifestStore) Declare(ctx context.Context, sessionID string, a
 		s.unmarkTentativeAlive(result.Conflict.Existing.ID)
 	}
 
+	// Activity Fabric amplifier: emit a decision_declared activity
+	// (Coarse resolution — durable + Bleve + vectorgraphdb). The
+	// emission is post-commit so the manifest write is the source of
+	// truth; if emission fails, the manifest still works. The fabric
+	// row carries SourceTable=decision_manifest + SourceID for
+	// back-reference to the canonical row.
+	emitDecisionActivity(ctx, declared, sessionID, "decision_manifest")
+	if result.Conflict != nil && result.Conflict.Kind == manifest.ConflictEquivalent && result.Conflict.Existing != nil {
+		emitDecisionPromoted(ctx, result.Conflict.Existing, sessionID, declared.ID)
+	}
+
 	return result, nil
+}
+
+// emitDecisionActivity publishes a decision_declared activity for a
+// just-persisted manifest decision. Coarse resolution → durable in
+// SQLite, indexed in Bleve, embedded in vectorgraphdb. The activity's
+// SourceTable + SourceID provide the back-reference to the canonical
+// manifest row.
+func emitDecisionActivity(ctx context.Context, d *manifest.Decision, sessionID string, sourceTable string) {
+	if d == nil {
+		return
+	}
+	subject := activity.Subject{
+		Domain:         d.Domain,
+		Coordinates:    map[string]string{},
+		PathPrefix:     d.Scope[manifest.DimensionPath],
+		TargetArtifact: d.ID,
+	}
+	for k, v := range d.Scope {
+		subject.Coordinates[string(k)] = v
+	}
+	confidence := mapManifestConfidence(d.Confidence)
+	payload, _ := json.Marshal(map[string]any{
+		"value":      d.Value,
+		"author":     fmt.Sprintf("%s/%s", d.Author.AgentType, d.Author.AgentID),
+		"evidence":   d.Evidence,
+		"supersedes": d.Supersedes,
+	})
+	act := activity.AgentActivity{
+		ID:         activity.NewActivityID(),
+		SessionID:  activity.SessionID(sessionID),
+		Timestamp:  d.DeclaredAt,
+		Resolution: activity.ResolutionFor(activity.ActionDecisionDeclared),
+		Action:     activity.ActionDecisionDeclared,
+		Actor: activity.Actor{
+			AgentID:   d.Author.AgentID,
+			AgentType: d.Author.AgentType,
+		},
+		Subject:     subject,
+		Payload:     payload,
+		State:       activity.StatePoint,
+		Confidence:  confidence,
+		SourceTable: sourceTable,
+		SourceID:    d.ID,
+	}
+	activity.Append(ctx, act)
+}
+
+// emitDecisionPromoted publishes a decision_promoted activity that
+// resolves the prior decision_declared via Caused. The triggerActivityID
+// is the just-emitted declaration whose corroboration drove the promotion.
+func emitDecisionPromoted(ctx context.Context, promoted *manifest.Decision, sessionID string, _ string) {
+	if promoted == nil {
+		return
+	}
+	confidence := mapManifestConfidence(promoted.Confidence)
+	payload, _ := json.Marshal(map[string]any{
+		"new_confidence": string(promoted.Confidence),
+		"value":          promoted.Value,
+		"id":             promoted.ID,
+	})
+	act := activity.AgentActivity{
+		ID:         activity.NewActivityID(),
+		SessionID:  activity.SessionID(sessionID),
+		Timestamp:  time.Now(),
+		Resolution: activity.ResolutionFor(activity.ActionDecisionPromoted),
+		Action:     activity.ActionDecisionPromoted,
+		Actor: activity.Actor{
+			AgentID:   promoted.Author.AgentID,
+			AgentType: promoted.Author.AgentType,
+		},
+		Subject: activity.Subject{
+			Domain:         promoted.Domain,
+			TargetArtifact: promoted.ID,
+		},
+		Payload:     payload,
+		State:       activity.StatePoint,
+		Confidence:  confidence,
+		SourceTable: "decision_manifest",
+		SourceID:    promoted.ID,
+	}
+	activity.Append(ctx, act)
+}
+
+// mapManifestConfidence translates the manifest's confidence type to
+// the fabric's. The two are intentionally aligned — the fabric
+// confidence model was carried over from the manifest's design.
+func mapManifestConfidence(c manifest.Confidence) activity.Confidence {
+	switch c {
+	case manifest.ConfidenceHint:
+		return activity.ConfidenceHint
+	case manifest.ConfidenceTentative:
+		return activity.ConfidenceTentative
+	case manifest.ConfidenceCommitted:
+		return activity.ConfidenceCommitted
+	case manifest.ConfidenceConsensus:
+		return activity.ConfidenceConsensus
+	}
+	return ""
 }
 
 // markTentativeAlive records a Tentative decision ID in the live cache

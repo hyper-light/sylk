@@ -13,9 +13,6 @@ import (
 )
 
 const (
-	// DefaultArchivePath is the default location for the SQLite database
-	DefaultArchivePath = ".sylk/archive.db"
-
 	// Schema version for migrations
 	schemaVersion = 2
 )
@@ -31,11 +28,15 @@ type ArchiveConfig struct {
 	Path string // Path to SQLite database file
 }
 
-// NewArchive creates a new archive storage instance
+// NewArchive opens a single per-session archive at cfg.Path. Production
+// callers should not invoke this directly — use SessionArchives.For(sid)
+// so writes/reads dispatch to the correct per-session DB. NewArchive
+// remains exported for tests and the Exporter/Importer utilities that
+// operate on a single archive at a known path.
 func NewArchive(cfg ArchiveConfig) (*Archive, error) {
-	path := cfg.Path
+	path := strings.TrimSpace(cfg.Path)
 	if path == "" {
-		path = DefaultArchivePath
+		return nil, fmt.Errorf("archive: path is required (per-session archives must specify a session-scoped path)")
 	}
 
 	// Ensure directory exists

@@ -13,6 +13,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/activity/activitystore"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
@@ -35,6 +36,16 @@ type Config struct {
 	Forest          shared.MemoryForestService
 	MaxMessages     int // 0 = default (50 turn pairs per workstream)
 	MaxToolRuns     int // 0 = default bounded tool-loop budget
+
+	// SessionID identifies the per-session scope this scribe runs
+	// under. Surfaced onto archivalist + fabric narration metadata.
+	SessionID string
+
+	// SessionDir is the per-session storage directory used to persist
+	// the replica-generation counter and surface it onto narrations.
+	// When empty, replica generation stays at zero and consumers
+	// treat it as "unknown" (the scribe still functions).
+	SessionDir string
 }
 
 // defaultMaxMessages is the default ring buffer capacity in turn pairs.
@@ -87,6 +98,26 @@ type Scribe struct {
 
 	// Feed channel: bounded, non-blocking ingest from parent agent.
 	feedCh chan shared.ScribeFeed
+
+	// replicaGeneration is the monotonic counter for this scribe's
+	// (sessionID, parentAgentType) tuple. Acquired in New(); surfaced
+	// on every narration's metadata so cross-replica queries can
+	// distinguish "this current life" from "prior lives" of the same
+	// logical agent. Zero when SessionDir is empty (test fixtures).
+	replicaGeneration int
+	sessionID         string
+	sessionDir        string
+
+	// batchMapPtr / batchMapInit hold the per-workstream fabric batch
+	// buffers (keyed by pipeline_id or actor agent_id). Lazily
+	// initialized in fabricBatches() so test fixtures that never
+	// trigger Receive don't allocate.
+	batchMapPtr  *sync.Map
+	batchMapInit sync.Once
+
+	// fabricUnsubscribe releases this scribe's Subscriber registration
+	// against the SubscribingSink. Set by Start; called by Stop.
+	fabricUnsubscribe func()
 }
 
 type scribeWorkstream struct {
@@ -115,20 +146,40 @@ func New(cfg Config) *Scribe {
 	if maxToolRuns == 0 {
 		maxToolRuns = defaultMaxToolRuns
 	}
+	// Acquire the replica generation immediately at construction so
+	// every narration this instance produces is correctly attributed
+	// to its specific replica life. Best-effort — empty session dir
+	// (test fixtures) yields generation 0.
+	replicaGen, _ := AcquireReplicaGeneration(cfg.SessionDir, cfg.ParentAgentType)
+
 	return &Scribe{
-		id:              id,
-		parentAgentType: cfg.ParentAgentType,
-		provider:        cfg.Provider,
-		model:           cfg.Model,
-		bus:             cfg.Bus,
-		logger:          cfg.Logger,
-		scope:           cfg.Scope,
-		config:          cfg,
-		workstreams:     make(map[string]*scribeWorkstream),
-		maxMessages:     maxMsgs,
-		maxToolRuns:     maxToolRuns,
-		feedCh:          make(chan shared.ScribeFeed, feedBufferSize),
+		id:                id,
+		parentAgentType:   cfg.ParentAgentType,
+		provider:          cfg.Provider,
+		model:             cfg.Model,
+		bus:               cfg.Bus,
+		logger:            cfg.Logger,
+		scope:             cfg.Scope,
+		config:            cfg,
+		workstreams:       make(map[string]*scribeWorkstream),
+		maxMessages:       maxMsgs,
+		maxToolRuns:       maxToolRuns,
+		feedCh:            make(chan shared.ScribeFeed, feedBufferSize),
+		replicaGeneration: replicaGen,
+		sessionID:         cfg.SessionID,
+		sessionDir:        cfg.SessionDir,
 	}
+}
+
+// ReplicaGeneration returns this scribe's replica generation. Zero
+// when no session dir was wired (test fixtures). Used by tests and
+// by the fabric narration emitter to surface the value on activity
+// payloads + metadata.
+func (s *Scribe) ReplicaGeneration() int {
+	if s == nil {
+		return 0
+	}
+	return s.replicaGeneration
 }
 
 // Start begins the Scribe's feed processing loop and bus subscriptions.
@@ -161,10 +212,21 @@ func (s *Scribe) Start() error {
 			s.feedLoop(ctx)
 			return nil
 		})
-		return nil
+		_ = s.scope.Go("scribe-"+s.parentAgentType+"-periodic", 0, func(ctx context.Context) error {
+			s.periodicSynthesisLoop(ctx)
+			return nil
+		})
+	} else {
+		go s.feedLoop(s.runCtx)
+		go s.periodicSynthesisLoop(s.runCtx)
 	}
 
-	go s.feedLoop(s.runCtx)
+	// Register with the Activity Fabric SubscribingSink (Phase 1 of
+	// SCRIBE_FABRIC.md). When the production sink isn't a
+	// SubscribingSink (test fixtures with a TestCollector), this is
+	// a silent no-op — the FeedScribe push path stays operational
+	// for that environment.
+	s.fabricUnsubscribe = activitystore.SubscribeToDefault(s)
 	return nil
 }
 
@@ -172,6 +234,10 @@ func (s *Scribe) Start() error {
 func (s *Scribe) Stop() error {
 	if !s.running.Swap(false) {
 		return nil
+	}
+	if s.fabricUnsubscribe != nil {
+		s.fabricUnsubscribe()
+		s.fabricUnsubscribe = nil
 	}
 	if s.runCancel != nil {
 		s.runCancel()

@@ -255,6 +255,14 @@ const (
 	// agents to push a notification to a specific peer + scope.
 	ActionNotificationEmitted ActionKind = "notification_emitted"
 
+	// ActionNarrationEmitted is emitted by per-agent scribe sidecars
+	// when they produce a batch narration over the activity stream of
+	// their parent agent. The narration's payload mirrors the
+	// commentary persisted to the archivalist; SourceTable +
+	// SourceID back-reference the canonical archivalist Entry. See
+	// docs/SCRIBE_FABRIC.md.
+	ActionNarrationEmitted ActionKind = "narration_emitted"
+
 	// ActionPrecedentEmitted is emitted by Memory Forest harvest
 	// candidates — typically promoted from Consensus + accepted
 	// artifacts with a complete causal chain.
@@ -333,7 +341,8 @@ func ResolutionFor(kind ActionKind) Resolution {
 		ActionScopePartitioned,
 		ActionEscalationRequested,
 		ActionProactiveAdvisory,
-		ActionPrecedentEmitted:
+		ActionPrecedentEmitted,
+		ActionNarrationEmitted:
 		return ResolutionCoarse
 	}
 

@@ -352,6 +352,67 @@ func TestConcurrentStreamThinkingAnimatesSecondaryPipelineEntry(t *testing.T) {
 	}
 }
 
+func TestAgentStateMsg_SurfacesReasoningOnStreamingEntry(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+
+	// Open a stream for the engineer — this creates the entry and sets the
+	// default thinking indicator (spinner + rotating placeholder).
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "c1",
+		AgentID:       "engineer",
+		AgentType:     "engineer",
+	})
+	m = comp.(*Model)
+
+	// Simulate CompleteWithWatchdog firing an AgentStateReasoning transition
+	// at the start of an LLM call. The UI bridge turns that into this msg.
+	comp, _ = m.Update(msg.AgentStateMsg{
+		SessionID:     "s1",
+		CorrelationID: "c1",
+		AgentID:       "engineer",
+		AgentType:     "engineer",
+		State:         "reasoning",
+		TransitionID:  1,
+	})
+	m = comp.(*Model)
+
+	// The streaming entry's ThinkingStatus must now reflect the reasoning
+	// state. Without this the user sees the rotating placeholder until the
+	// watchdog threshold (15+ s) fires a progress event — the exact gap the
+	// activity channel was added to eliminate.
+	last := m.history.Last()
+	if last == nil {
+		t.Fatal("expected streaming entry")
+	}
+	if last.ThinkingStatus != "Reasoning..." {
+		t.Fatalf("ThinkingStatus = %q, want \"Reasoning...\"", last.ThinkingStatus)
+	}
+
+	// Run one tick to mimic the 100ms spinner loop. The render loop's
+	// rotating placeholder MUST NOT clobber the state-driven status.
+	m.tickThinking(time.Now())
+	last = m.history.Last()
+	if last.ThinkingStatus != "Reasoning..." {
+		t.Fatalf("after tick: ThinkingStatus = %q, want \"Reasoning...\" (rotating placeholder clobbered state)", last.ThinkingStatus)
+	}
+
+	// A terminal state should evict the correlation's record and clear the
+	// entry's status so the finalized row doesn't show stale activity.
+	comp, _ = m.Update(msg.AgentStateMsg{
+		SessionID:     "s1",
+		CorrelationID: "c1",
+		AgentID:       "engineer",
+		AgentType:     "engineer",
+		State:         "complete",
+		TransitionID:  2,
+	})
+	m = comp.(*Model)
+	if _, ok := m.agentStates["c1"]; ok {
+		t.Fatal("agentStates still holds correlation after terminal state")
+	}
+}
+
 func TestStreamStartUsesAgentTypeForPipelineBadge(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 

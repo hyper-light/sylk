@@ -123,13 +123,6 @@ type leftPanelSections struct {
 	selectorY     int
 }
 
-// shutdownGrace is the grace period for goroutine shutdown.
-// Derived from: once contexts are cancelled, goroutines exit within ms.
-const shutdownGrace = 1 * time.Second
-
-// shutdownHard is the hard deadline for goroutine shutdown after force cancel.
-const shutdownHard = 2 * time.Second
-
 // lspDebounceInterval is the delay after the last keystroke before sending
 // a didChange notification. Derived from: typical typing speed ~5 chars/sec
 // = 200ms between keystrokes; 300ms batches rapid edits while staying
@@ -2091,12 +2084,17 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 	}),
 	reflect.TypeFor[msg.AccountingSnapshotMsg](): appMsgStateRoute(func(m *AppModel, typed msg.AccountingSnapshotMsg) {
 		// Item 52: status bar reads accountant-aggregated totals via
-		// accountant.Billable() snapshots published on each tick.
+		// accountant.Billable() snapshots published on each tick. These
+		// are the canonical session-wide totals, aggregating every
+		// provider × agent × replica × task under a typed
+		// AccountingKey. updateTokenDisplay consumes them in preference
+		// to the legacy stream-derived counters.
 		m.accountantTotalInput = typed.TotalInput
 		m.accountantTotalOutput = typed.TotalOutput
 		m.accountantTotalReasoning = typed.TotalReasoning
 		m.accountantTotalRequests = typed.TotalRequests
 		m.accountantTotalErrors = typed.TotalErrors
+		m.updateTokenDisplay()
 	}),
 	reflect.TypeFor[msg.TokenDeltaMsg](): appMsgStateRoute(func(m *AppModel, typed msg.TokenDeltaMsg) {
 		// Typed-identity delta path (item 50). Consumers read
@@ -2391,9 +2389,13 @@ func (m *AppModel) Shutdown() error {
 	if err := m.stopChatDebugCapture(); err != nil {
 		errs = append(errs, err)
 	}
-	if err := m.deps.Scope.Shutdown(shutdownGrace, shutdownHard); err != nil {
-		errs = append(errs, err)
-	}
+	// NOTE: m.deps.Scope.Shutdown is intentionally NOT called here. The
+	// scope is owned by cmd/tui.go's bootstrap and must outlive the UI's
+	// shutdown so that per-component Close() calls registered in the
+	// cmd cleanup function (knowledgeSync, knowledgeStore, forest, etc.)
+	// can drain their scope-tracked workers via cooperative cancellation
+	// before the scope itself reports a leak. The cmd cleanup function
+	// invokes scope.Shutdown after every per-component Close has fired.
 	return errors.Join(errs...)
 }
 

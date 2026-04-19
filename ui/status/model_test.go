@@ -22,11 +22,12 @@ func TestStatusBarPreservesTokenDisplayUnderTightWidth(t *testing.T) {
 	m.SetAuthStatus("google", true)
 	m.SetAuthStatus("anthropic", true)
 	m.SetAuthStatus("openai", true)
+	// prompt=12345 completion=6789. Display convention: ↓=output, ↑=input.
 	m.SetTokens(12345, 6789, 0, 0)
 
 	view := stripANSI(m.View())
-	if !strings.Contains(view, "↓12.3k/↑6.8k") {
-		t.Fatalf("status bar lost token display: %q", view)
+	if !strings.Contains(view, "↓6.8k/↑12.3k") {
+		t.Fatalf("status bar lost token display (expected ↓out/↑in): %q", view)
 	}
 }
 

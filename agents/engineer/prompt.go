@@ -16,6 +16,7 @@ var (
 	EngineerSystemGuardrailsPrompt = prompts.MustLoad("engineer", "system_guardrails")
 	EngineerSystemAuditPrompt      = prompts.MustLoad("engineer", "system_audit")
 	EngineerSystemCollabPrompt     = prompts.MustLoad("engineer", "system_collaboration")
+	EngineerFabricAwarenessPrompt  = prompts.MustLoad("shared", "fabric_awareness")
 
 	// DefaultEngineerSystemPrompt composes all modules with separators.
 	DefaultEngineerSystemPrompt = strings.Join([]string{
@@ -26,6 +27,7 @@ var (
 		EngineerSystemGuardrailsPrompt,
 		EngineerSystemAuditPrompt,
 		EngineerSystemCollabPrompt,
+		EngineerFabricAwarenessPrompt,
 	}, "\n\n---\n\n")
 
 	// DefaultSystemPrompt is the composed system prompt (alias for backward compat).
@@ -47,6 +49,7 @@ func EngineerSystemPromptForContract(contract *shared.TaskExecutionContract) str
 		EngineerSystemGuardrailsPrompt,
 		EngineerSystemAuditPrompt,
 		EngineerSystemCollabPrompt,
+		EngineerFabricAwarenessPrompt,
 	}, "\n\n---\n\n")
 }
 

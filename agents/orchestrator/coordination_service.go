@@ -153,6 +153,7 @@ func (s *CoordinationService) ClaimScope(
 		return nil, err
 	}
 	s.invalidateTask(claim.TaskID)
+	emitClaimAcquired(ctx, claim, actor)
 	return claim, nil
 }
 
@@ -217,6 +218,7 @@ func (s *CoordinationService) ReleaseScope(
 		return nil, err
 	}
 	s.invalidateTask(claim.TaskID)
+	emitClaimReleased(ctx, claim, actor)
 	return claim, nil
 }
 
@@ -261,6 +263,7 @@ func (s *CoordinationService) PublishArtifact(
 		return artifact, nil
 	}
 	s.invalidateTask(artifact.TaskID)
+	emitArtifactPublished(ctx, artifact, actor)
 	s.emitArchival(ctx, &coordination.ArchivalEvent{
 		Type:     "coordination_artifact_published",
 		TaskID:   artifact.TaskID,
@@ -311,6 +314,7 @@ func (s *CoordinationService) RequestReview(
 		return review, nil
 	}
 	s.invalidateTask(review.TaskID)
+	emitReviewRequested(ctx, review, actor)
 	return review, nil
 }
 
@@ -377,6 +381,13 @@ func (s *CoordinationService) ResolveArtifact(
 		return nil, err
 	}
 	s.invalidateTask(strings.TrimSpace(input.TaskID))
+	if reviewID := strings.TrimSpace(input.ReviewID); reviewID != "" {
+		status := input.ReviewStatus
+		if status == "" {
+			status = coordination.ReviewStatusAccepted
+		}
+		emitReviewCompleted(ctx, strings.TrimSpace(input.TaskID), reviewID, actor, string(status), strings.TrimSpace(input.ResolutionSummary))
+	}
 	s.emitArchival(ctx, &coordination.ArchivalEvent{
 		Type:      "coordination_resolution",
 		TaskID:    strings.TrimSpace(input.TaskID),

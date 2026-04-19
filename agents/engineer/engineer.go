@@ -743,7 +743,7 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		ProcessingTime:      time.Since(startTime),
 		Data:                respData,
 	}
-	e.publishActivity(events.EventTypeAgentAction, "Implementation task completed")
+	e.publishActivity(events.EventTypeSuccess, "Implementation task completed")
 
 	respMsg := guide.NewResponseMessage(e.generateMessageID(), resp)
 	if e.agentPod != nil {

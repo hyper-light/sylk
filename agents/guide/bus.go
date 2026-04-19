@@ -171,6 +171,30 @@ type Message struct {
 	// to the originator's session topic, removing Guide from the
 	// response hot path. Guide can still observe via ObserverTopics.
 	ReplyTo *ReplyTo `json:"reply_to,omitempty"`
+
+	// FabricTrace is the W3C-Trace-Context-style causal carrier the
+	// Activity Fabric propagates with every cross-agent message. The
+	// publisher copies its current FabricContext (TraceID, SpanID,
+	// CausalChain, Baggage) into the message; the receiver restores
+	// it onto the handler's context.Context so any chokepoint or
+	// per-system amplifier emission downstream from the message is
+	// causally linked to the publisher's span.
+	//
+	// Empty FabricTrace is fine — the receiver just doesn't inherit a
+	// trace and emits a fresh root chain. See docs/FABRIC.md
+	// §"FabricContext as ambient causality".
+	FabricTrace *FabricTrace `json:"fabric_trace,omitempty"`
+}
+
+// FabricTrace is the over-the-wire serialization of an
+// activity.FabricContext attached to a bus message. Kept as a flat
+// JSON-friendly shape so it survives bus reroutes and queue durability.
+type FabricTrace struct {
+	TraceID      string            `json:"trace_id,omitempty"`
+	SpanID       string            `json:"span_id,omitempty"`
+	ParentSpanID string            `json:"parent_span_id,omitempty"`
+	CausalChain  []string          `json:"causal_chain,omitempty"`
+	Baggage      map[string]string `json:"baggage,omitempty"`
 }
 
 // maxObserverTopics caps the number of observer topics on ReplyTo

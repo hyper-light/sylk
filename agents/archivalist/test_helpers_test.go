@@ -23,20 +23,17 @@ func newTestStore(t *testing.T) *Store {
 	})
 }
 
-func newTestStoreWithArchive(t *testing.T) (*Store, *Archive) {
+func newTestStoreWithArchive(t *testing.T) (*Store, *SessionArchives) {
 	t.Helper()
 	tmpDir := t.TempDir()
-	archive, err := NewArchive(ArchiveConfig{Path: tmpDir + "/test.db"})
-	if err != nil {
-		t.Fatalf("failed to create archive: %v", err)
-	}
-	t.Cleanup(func() { archive.Close() })
+	archives := NewSessionArchives(SessionArchivesConfig{WorkDir: tmpDir})
+	t.Cleanup(func() { archives.Close() })
 
 	store := NewStore(StoreConfig{
 		TokenThreshold: 100000,
-		Archive:        archive,
+		Archive:        archives,
 	})
-	return store, archive
+	return store, archives
 }
 
 func newTestRegistry(t *testing.T) *Registry {

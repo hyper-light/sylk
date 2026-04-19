@@ -7,11 +7,11 @@ type CrossSessionResult struct {
 
 type CrossSessionIndex struct {
 	store    *Store
-	archive  *Archive
+	archive  *SessionArchives
 	eventLog *EventLog
 }
 
-func NewCrossSessionIndex(store *Store, archive *Archive, eventLog *EventLog) *CrossSessionIndex {
+func NewCrossSessionIndex(store *Store, archive *SessionArchives, eventLog *EventLog) *CrossSessionIndex {
 	return &CrossSessionIndex{
 		store:    store,
 		archive:  archive,

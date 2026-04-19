@@ -6,7 +6,7 @@ import (
 
 type SessionStore struct {
 	store     *Store
-	archive   *Archive
+	archive   *SessionArchives
 	cache     *QueryCache
 	sessionID string
 }
@@ -16,7 +16,7 @@ type SessionSummary struct {
 	Stats   StorageStats `json:"stats"`
 }
 
-func NewSessionStore(store *Store, archive *Archive, cache *QueryCache, sessionID string) *SessionStore {
+func NewSessionStore(store *Store, archive *SessionArchives, cache *QueryCache, sessionID string) *SessionStore {
 	return &SessionStore{
 		store:     store,
 		archive:   archive,

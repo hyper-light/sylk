@@ -120,6 +120,16 @@ func resolveProjectRoot() string {
 	return cwd
 }
 
+// shutdownGrace and shutdownHard bound the GoroutineScope drain at the
+// end of cleanup. Derived from: once parent ctx is cancelled, well-behaved
+// workers exit within milliseconds; we allow a grace period for
+// owners (e.g. KnowledgeSyncService.Close) to land their cooperative
+// cancellation, then force-cancel any laggards.
+const (
+	shutdownGrace = 1 * time.Second
+	shutdownHard  = 2 * time.Second
+)
+
 // shutdownTimeout bounds total cleanup time. Derived from the longest
 // possible graceful stop (60s for max-context agents) + headroom.
 const shutdownTimeout = 90 * time.Second
@@ -605,6 +615,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		phase1.quota,
 		phase1.budget,
 		&phase1.identityFactory,
+		phase1.defaultSession.ID(),
 	)
 
 	slog.Info("bootstrap phase 1 complete", "elapsed", time.Since(start))
@@ -1495,6 +1506,20 @@ func buildBootstrapCleanup(
 		if err := phase1.guideBus.Close(); err != nil {
 			errs = append(errs, err)
 		}
+		// Drain the scope LAST. Every long-running worker registered with
+		// phase1.scope (librarian-knowledge-sync, phase4 background tasks,
+		// orchestrator/architect helpers) must be cancellable via the
+		// scope's parent ctx. Calling Shutdown here — after each owner's
+		// Close has fired — gives those workers a clean handoff: their
+		// owners' Close cancels their local ctx, scope.Shutdown's parent
+		// cancel reinforces it, and the wg.Wait drains in-flight work
+		// within the grace window. Doing it earlier (e.g. inside the UI's
+		// Shutdown) would race the per-component Close calls and cause
+		// the scope to report leaks that aren't actually leaks — just
+		// not-yet-cancelled workers waiting on their owner's Close.
+		if err := phase1.scope.Shutdown(shutdownGrace, shutdownHard); err != nil {
+			errs = append(errs, err)
+		}
 		return errors.Join(errs...)
 	}
 }
@@ -1624,6 +1649,7 @@ func registerAgentCreators(
 	quota *container.ResourceQuota,
 	budget *concurrency.GoroutineBudget,
 	factoryRef *atomic.Pointer[identity.Factory],
+	defaultSessionID string,
 ) {
 	// Guide — Gemini with rule-based fallback.
 	// First call blocks on hydrateOnce; subsequent calls (daemon restart)
@@ -1645,7 +1671,7 @@ func registerAgentCreators(
 	// overlay when a session is active, falling back to read-only disk access.
 	architectID, _ := ids.Get("architect")
 	reg.Register("architect", func(ctx context.Context) (container.ContainerAgent, error) {
-		return bootstrapArchitect(ctx, architectID, bus, actPub, projectRoot, anthropicGw, authRegistry, actCtrlRef, planStore, forest, func(sessionID string) *versioning.SessionVFS {
+		return bootstrapArchitect(ctx, architectID, defaultSessionID, bus, actPub, projectRoot, anthropicGw, authRegistry, actCtrlRef, planStore, forest, func(sessionID string) *versioning.SessionVFS {
 			if orch := orchRef.Load(); orch != nil {
 				return orch.GetSessionVFS(sessionID)
 			}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -63,6 +64,23 @@ func (d *Designer) registerCoreSkills() {
 		CurrentTaskID:   func() string { return d.pipelineID },
 		CurrentTaskName: func() string { return firstNonEmptyCoordinationName(d.pipelineName, d.pipelineSlug) },
 		WorkerType:      func() string { return "designer" },
+	}) {
+		d.skills.Register(skill)
+	}
+	// Activity Fabric: uniform awareness skills + cross-pipeline primitives.
+	for _, skill := range shared.AwarenessSkills(shared.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return d.config.SessionID },
+		AgentID:        func() string { return d.id },
+		AgentType:      func() string { return "designer" },
+	}) {
+		d.skills.Register(skill)
+	}
+	for _, skill := range shared.CrossPipelineSkills(shared.CrossPipelineSkillConfig{
+		SessionID:  func() string { return d.config.SessionID },
+		AgentID:    func() string { return d.id },
+		AgentType:  func() string { return "designer" },
+		PipelineID: func() string { return d.pipelineID },
 	}) {
 		d.skills.Register(skill)
 	}
@@ -402,6 +420,22 @@ func componentCreateSkill(d *Designer) *skills.Skill {
 					filepath.Join(targetPath, params.Name+".module.css"),
 				},
 			}
+
+			// Activity Fabric auto-publish: component_create commits
+			// a ui_framework choice (react/vue/svelte/etc.) for the
+			// scope. Peers see the framework in their ambient
+			// context and align if compatible.
+			shared.AutoPublishCommitted(ctx, shared.AutoPublishInput{
+				SessionID:        d.config.SessionID,
+				AuthorAgentID:    d.id,
+				AuthorAgentType:  "designer",
+				AuthorPipelineID: d.pipelineID,
+				TriggerSkill:     "component_create",
+				Domain:           "ui_framework",
+				Value:            componentType,
+				Scope:            targetPath,
+				Evidence:         []string{"component scaffold: " + params.Name},
+			})
 
 			return result, nil
 		}).

@@ -11,7 +11,7 @@ import (
 // Compactor manages the compaction of entries into facts and summaries
 type Compactor struct {
 	store            *Store
-	archive          *Archive
+	archive          *SessionArchives
 	factExtractor    *FactExtractor
 	summaryGenerator *SummaryGenerator
 
@@ -24,7 +24,7 @@ type Compactor struct {
 // CompactorConfig configures the compactor
 type CompactorConfig struct {
 	Store               *Store
-	Archive             *Archive
+	Archive             *SessionArchives
 	Client              *Client
 	TokenThreshold      int  // Default: 500000 (500K tokens)
 	MinEntriesForSpan   int  // Default: 10
@@ -324,7 +324,7 @@ func (c *Compactor) saveFileChangeFacts(facts *ExtractedFacts) error {
 	return saveFactFileChanges(c.archive, facts.FileChanges)
 }
 
-func saveFactDecisions(archive *Archive, decisions []*FactDecision) error {
+func saveFactDecisions(archive *SessionArchives, decisions []*FactDecision) error {
 	for _, decision := range decisions {
 		if err := archive.SaveFactDecision(decision); err != nil {
 			return err
@@ -333,7 +333,7 @@ func saveFactDecisions(archive *Archive, decisions []*FactDecision) error {
 	return nil
 }
 
-func saveFactPatterns(archive *Archive, patterns []*FactPattern) error {
+func saveFactPatterns(archive *SessionArchives, patterns []*FactPattern) error {
 	for _, pattern := range patterns {
 		if err := archive.SaveFactPattern(pattern); err != nil {
 			return err
@@ -342,7 +342,7 @@ func saveFactPatterns(archive *Archive, patterns []*FactPattern) error {
 	return nil
 }
 
-func saveFactFailures(archive *Archive, failures []*FactFailure) error {
+func saveFactFailures(archive *SessionArchives, failures []*FactFailure) error {
 	for _, failure := range failures {
 		if err := archive.SaveFactFailure(failure); err != nil {
 			return err
@@ -351,7 +351,7 @@ func saveFactFailures(archive *Archive, failures []*FactFailure) error {
 	return nil
 }
 
-func saveFactFileChanges(archive *Archive, changes []*FactFileChange) error {
+func saveFactFileChanges(archive *SessionArchives, changes []*FactFileChange) error {
 	for _, change := range changes {
 		if err := archive.SaveFactFileChange(change); err != nil {
 			return err

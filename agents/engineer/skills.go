@@ -13,6 +13,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/detect"
@@ -76,6 +77,23 @@ func (e *Engineer) registerCoreSkills() {
 		CurrentTaskID:   func() string { return e.pipelineID },
 		CurrentTaskName: func() string { return firstNonEmptyCoordinationName(e.pipelineName, e.pipelineSlug) },
 		WorkerType:      func() string { return "engineer" },
+	}) {
+		e.skills.Register(skill)
+	}
+	// Activity Fabric: uniform awareness skills + cross-pipeline primitives.
+	for _, skill := range shared.AwarenessSkills(shared.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return e.config.SessionID },
+		AgentID:        func() string { return e.id },
+		AgentType:      func() string { return "engineer" },
+	}) {
+		e.skills.Register(skill)
+	}
+	for _, skill := range shared.CrossPipelineSkills(shared.CrossPipelineSkillConfig{
+		SessionID:  func() string { return e.config.SessionID },
+		AgentID:    func() string { return e.id },
+		AgentType:  func() string { return "engineer" },
+		PipelineID: func() string { return e.pipelineID },
 	}) {
 		e.skills.Register(skill)
 	}
@@ -828,6 +846,20 @@ func formatSkill(e *Engineer) *skills.Skill {
 			if err != nil {
 				return map[string]any{"success": false, "formatter": string(f.ID), "error": err.Error()}, nil
 			}
+			// Activity Fabric auto-publish: format apply commits a
+			// code_style choice. Other agents see the convention
+			// in their ambient context.
+			shared.AutoPublishCommitted(ctx, shared.AutoPublishInput{
+				SessionID:        e.config.SessionID,
+				AuthorAgentID:    e.id,
+				AuthorAgentType:  "engineer",
+				AuthorPipelineID: e.pipelineID,
+				TriggerSkill:     "format",
+				Domain:           "code_style",
+				Value:            string(f.ID),
+				Scope:            p.File,
+				Evidence:         []string{"formatter applied: " + string(f.ID)},
+			})
 			return map[string]any{"success": true, "formatter": string(f.ID)}, nil
 		},
 		"detect": func(_ context.Context, p *formatInput) (any, error) {
@@ -952,6 +984,24 @@ func lintSkill(e *Engineer) *skills.Skill {
 					output = parts[1]
 				}
 			}
+			// Activity Fabric auto-publish: lint commits a
+			// linter_backend choice for the project — peers see
+			// which linter is in play in their ambient context.
+			scope := ""
+			if len(p.Paths) > 0 {
+				scope = p.Paths[0]
+			}
+			shared.AutoPublishCommitted(ctx, shared.AutoPublishInput{
+				SessionID:        e.config.SessionID,
+				AuthorAgentID:    e.id,
+				AuthorAgentType:  "engineer",
+				AuthorPipelineID: e.pipelineID,
+				TriggerSkill:     "lint",
+				Domain:           "linter_backend",
+				Value:            linter.id,
+				Scope:            scope,
+				Evidence:         []string{"linter run: " + linter.id},
+			})
 			return map[string]any{"linter": linter.id, "output": output, "fix": p.Fix}, nil
 		},
 		"detect": func(_ context.Context, _ *lintInput) (any, error) {

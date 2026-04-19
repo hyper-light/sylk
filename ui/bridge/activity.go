@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -9,12 +10,16 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/ui/msg"
 )
 
 const (
 	activityBridgeName = "bridge.activity"
+	// Zero uses the scope's max lifetime; the activity bridge runs for the
+	// entire TUI session and is torn down by scope cancellation at exit.
+	activityBridgeDrainTimeout = 0
 )
 
 var (
@@ -41,21 +46,33 @@ func bridgeEventDebugLog() *slog.Logger {
 // ActivityBridge subscribes to ChannelBus TopicActivity and forwards
 // activity events as msg.ActivityEventMsg to the Bubble Tea program.
 // Events are filtered (UserVisible only) and deduplicated before delivery.
+//
+// UI-12: the bridge accepts a GoroutineScope so its shutdown-watch goroutine
+// is tracked alongside every other UI scope consumer. Scope cancellation
+// causes a clean unsubscribe + debouncer stop, so no goroutine leaks past
+// the TUI's scope lifecycle. Stop() is idempotent via an atomic flag — the
+// former sync.Once is no longer needed because Unsubscribe is itself atomic
+// and the debouncer's Stop is idempotent by the same pattern.
 type ActivityBridge struct {
 	id        string
 	bus       guide.EventBus
+	scope     *concurrency.GoroutineScope
 	sub       guide.Subscription
 	debouncer *guide.DebouncedMessageHandler
 	dropped   atomic.Int64
-	stopOnce  sync.Once
+	done      chan struct{}
+	stopped   atomic.Bool
 }
 
 // NewActivityBridge creates a bridge that converts ChannelBus activity
-// messages into Bubble Tea messages.
-func NewActivityBridge(id string, bus guide.EventBus) *ActivityBridge {
+// messages into Bubble Tea messages. scope may be nil for tests that
+// exercise only Start/Stop without requiring scope-tracked goroutines.
+func NewActivityBridge(id string, bus guide.EventBus, scope *concurrency.GoroutineScope) *ActivityBridge {
 	return &ActivityBridge{
-		id:  id,
-		bus: bus,
+		id:    id,
+		bus:   bus,
+		scope: scope,
+		done:  make(chan struct{}),
 	}
 }
 
@@ -75,19 +92,61 @@ func (b *ActivityBridge) Start(program TeaProgram) error {
 		return err
 	}
 	b.sub = sub
+	if b.scope != nil {
+		if err := b.scope.Go(activityBridgeName, activityBridgeDrainTimeout, b.scopeWatcher()); err != nil {
+			_ = sub.Unsubscribe()
+			b.debouncer.Stop()
+			b.sub = nil
+			b.debouncer = nil
+			return err
+		}
+	}
 	return nil
 }
 
 // Stop unsubscribes from the ChannelBus and releases the debouncer.
+// Idempotent via the stopped atomic flag.
 func (b *ActivityBridge) Stop() {
-	b.stopOnce.Do(func() {
-		if b.sub != nil {
-			_ = b.sub.Unsubscribe()
+	if !b.stopped.CompareAndSwap(false, true) {
+		return
+	}
+	close(b.done)
+	b.teardown()
+}
+
+// teardown unsubscribes and stops the debouncer. Safe to call multiple times
+// — Unsubscribe and debouncer.Stop are both atomic no-ops after the first
+// invocation.
+func (b *ActivityBridge) teardown() {
+	if b.sub != nil {
+		_ = b.sub.Unsubscribe()
+	}
+	if b.debouncer != nil {
+		b.debouncer.Stop()
+	}
+}
+
+// scopeWatcher is the WorkFunc run inside the GoroutineScope. It blocks
+// until either Stop() is called or the scope context cancels, then tears
+// down the subscription. This guarantees the bridge unsubscribes as part
+// of scope shutdown rather than leaking past it.
+func (b *ActivityBridge) scopeWatcher() concurrency.WorkFunc {
+	return func(ctx context.Context) error {
+		select {
+		case <-b.done:
+			return nil
+		case <-ctx.Done():
+			// Scope cancellation fires before user-initiated Stop. Mark
+			// stopped so a subsequent Stop() is a no-op, tear down in
+			// place, and surface ctx.Err so the scope logs a clean
+			// cancellation reason.
+			if b.stopped.CompareAndSwap(false, true) {
+				close(b.done)
+				b.teardown()
+			}
+			return ctx.Err()
 		}
-		if b.debouncer != nil {
-			b.debouncer.Stop()
-		}
-	})
+	}
 }
 
 // Name returns the bridge identifier.

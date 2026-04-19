@@ -104,12 +104,65 @@ func TestBridge_StartStop(t *testing.T) {
 		t.Error("bridge should be started after RegisterAgent")
 	}
 
+	// HAND-01 regression: the bridge must also start the HandoffManager's
+	// background evaluation loop. Before this wiring, the manager was
+	// constructed but IsRunning() stayed false because no caller invoked
+	// Start() on it, leaving automatic handoff evaluation dark.
+	if !bridge.manager.IsRunning() {
+		t.Error("HandoffManager should be running after Bridge.Start — HAND-01 regression")
+	}
+
 	// Stop and verify.
 	if err := bridge.Stop(); err != nil {
 		t.Fatalf("bridge.Stop: %v", err)
 	}
 	if bridge.started.Load() {
 		t.Error("bridge should not be started after Stop")
+	}
+	if bridge.manager.IsRunning() {
+		t.Error("HandoffManager should be stopped after Bridge.Stop")
+	}
+}
+
+// TestBridge_RecordTurn_PreparedContextGrowsMonotonically is the HAND-03
+// integration regression. After each RecordTurn call, PreparedContext's
+// RecentMessages buffer must contain one more entry than before and the
+// version counter must advance. Prior to this wiring the prepared context
+// was constructed but never updated during normal operation — the handoff
+// system would hand off stale or empty context.
+func TestBridge_RecordTurn_PreparedContextGrowsMonotonically(t *testing.T) {
+	desc := AgentDescriptor{
+		AgentType:     "engineer",
+		ModelID:       "opus-4.7",
+		ContextWindow: 200_000,
+		Category:      CategoryStandalone,
+	}
+	agent := newTestBridgeAgent("engineer-1", "engineer", desc)
+	_, bridge := setupBridgeTest(t, agent)
+
+	baselineMessages := len(bridge.prepared.RecentMessages())
+	baselineVersion := bridge.prepared.Version()
+
+	const turnCount = 5
+	for i := 0; i < turnCount; i++ {
+		bridge.RecordTurn(TurnRecord{
+			TurnNumber:    i + 1,
+			ContextSize:   1000 * (i + 1),
+			OutputTokens:  100,
+			ToolCalls:     1,
+			ToolSuccesses: 1,
+			Timestamp:     time.Now(),
+		})
+		// Each turn must leave RecentMessages strictly larger (up to buffer
+		// cap) and bump Version().
+		if got := len(bridge.prepared.RecentMessages()); got <= baselineMessages {
+			t.Fatalf("turn %d: RecentMessages did not grow (got %d, baseline %d) — HAND-03 regression", i+1, got, baselineMessages)
+		}
+		if got := bridge.prepared.Version(); got <= baselineVersion {
+			t.Fatalf("turn %d: Version did not advance (got %d, baseline %d)", i+1, got, baselineVersion)
+		}
+		baselineMessages = len(bridge.prepared.RecentMessages())
+		baselineVersion = bridge.prepared.Version()
 	}
 }
 

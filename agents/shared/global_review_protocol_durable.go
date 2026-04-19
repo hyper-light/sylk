@@ -3,6 +3,7 @@ package shared
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -169,6 +170,13 @@ func (s *GlobalReviewState) appendEvent(ctx context.Context, kind string, payloa
 	stream, _ := StreamMetadataFromContext(ctx)
 	seq, event, err := s.store.Append(kind, globalReviewAgentTypeFromContext(ctx), streamCorrelationID(stream), streamParentCorrelationID(stream), payload)
 	if err != nil {
+		// DUR-03: duplicate-correlation Append is a no-op (event was
+		// already applied by a prior turn or crash-recovery). State is
+		// already consistent — return success so the caller's contract
+		// ("event recorded") holds without double-apply.
+		if errors.Is(err, ErrDurableProtocolDuplicate) {
+			return nil
+		}
 		return err
 	}
 	if err := s.applyEvent(seq, event); err != nil {

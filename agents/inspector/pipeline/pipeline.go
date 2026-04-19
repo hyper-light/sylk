@@ -743,7 +743,7 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	if fwd.FireAndForget {
 		return nil
 	}
-	pi.publishActivity(events.EventTypeAgentAction, "Inspection task completed")
+	pi.publishActivity(events.EventTypeSuccess, "Inspection task completed")
 
 	respData := result
 	if protocolTask != nil {

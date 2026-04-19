@@ -8,8 +8,19 @@ import (
 	uimsg "github.com/adalundhe/sylk/ui/msg"
 )
 
+// TestActivityBridge_StopIsIdempotent locks the UI-12 invariant that Stop
+// can be called multiple times without a panic. Before UI-12, sync.Once
+// served this role; after, the atomic stopped flag does.
+func TestActivityBridge_StopIsIdempotent(t *testing.T) {
+	b := NewActivityBridge("test", nil, nil)
+	// Call Stop twice. The second must be a no-op; if the atomic-guard
+	// regressed to a naive close(done), the double-close would panic.
+	b.Stop()
+	b.Stop()
+}
+
 func TestActivityBridgeForwardHandler_CanonicalizesReplicaIdentityForUI(t *testing.T) {
-	b := NewActivityBridge("test", nil)
+	b := NewActivityBridge("test", nil, nil)
 	program := &recordingProgram{}
 	handler := b.forwardHandler(program)
 

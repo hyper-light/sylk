@@ -202,6 +202,10 @@ func NewHandoffBridge(cfg BridgeConfig, agent HandoffableAgent, sup *HandoffSupe
 }
 
 // Start launches the bridge's monitor loop and starts the context check hook.
+// HAND-01: also starts the HandoffManager's background evaluation loop. The
+// manager's automatic periodic evaluation never ran in production before this
+// because NewHandoffBridge constructed the manager but nothing called Start()
+// on it; the bridge's monitor loop alone does not drive manager.EvaluateAndExecute.
 func (b *HandoffBridge) Start() error {
 	if b.started.Swap(true) {
 		return nil
@@ -220,12 +224,22 @@ func (b *HandoffBridge) Start() error {
 		}
 	}
 
+	if err := b.manager.Start(); err != nil {
+		if b.parallelBuffer != nil {
+			_ = b.parallelBuffer.Stop()
+		}
+		_ = b.contextCheck.Stop()
+		b.started.Store(false)
+		return fmt.Errorf("start handoff manager: %w", err)
+	}
+
 	go b.monitorLoop()
 	return nil
 }
 
 // Stop shuts down the bridge, stopping the monitor loop, parallel buffer,
-// and context check.
+// manager background loop, and context check. Stop() on HandoffManager is
+// idempotent and honors GracefulShutdownTimeout.
 func (b *HandoffBridge) Stop() error {
 	if !b.started.Swap(false) {
 		return nil
@@ -243,6 +257,7 @@ func (b *HandoffBridge) Stop() error {
 		b.overlapCoord.abortInternal("bridge stopped")
 	}
 
+	_ = b.manager.Stop()
 	return b.contextCheck.Stop()
 }
 

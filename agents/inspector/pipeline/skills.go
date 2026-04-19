@@ -10,6 +10,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -80,6 +81,34 @@ func (pi *PipelineInspector) registerCoreSkills() {
 		CurrentTaskID:   func() string { return pi.pipelineID },
 		CurrentTaskName: func() string { return firstNonEmptyCoordinationName(pi.pipelineName, pi.pipelineSlug) },
 		WorkerType:      func() string { return "inspector-pipeline" },
+	}) {
+		pi.skills.Register(skill)
+	}
+	// Activity Fabric: uniform awareness skills + cross-pipeline
+	// primitives + audit-time inspect_open_activity. The audit skill
+	// is inspector-only — it's how the inspector detects unresolved
+	// cross-pipeline disputes blocking acceptance.
+	for _, skill := range agentShared.AwarenessSkills(agentShared.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return pi.config.SessionID },
+		AgentID:        func() string { return pi.id },
+		AgentType:      func() string { return "inspector-pipeline" },
+	}) {
+		pi.skills.Register(skill)
+	}
+	for _, skill := range agentShared.CrossPipelineSkills(agentShared.CrossPipelineSkillConfig{
+		SessionID:  func() string { return pi.config.SessionID },
+		AgentID:    func() string { return pi.id },
+		AgentType:  func() string { return "inspector-pipeline" },
+		PipelineID: func() string { return pi.pipelineID },
+	}) {
+		pi.skills.Register(skill)
+	}
+	for _, skill := range agentShared.InspectorAuditSkills(agentShared.InspectorAuditSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return pi.config.SessionID },
+		AgentID:        func() string { return pi.id },
+		AgentType:      func() string { return "inspector-pipeline" },
 	}) {
 		pi.skills.Register(skill)
 	}

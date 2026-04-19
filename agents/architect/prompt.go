@@ -15,6 +15,7 @@ var (
 	ArchitectSystemGuardrailsPrompt = prompts.MustLoad("architect", "system_guardrails")
 	ArchitectSystemSkillsPrompt     = prompts.MustLoad("architect", "system_skills")
 	ArchitectConversationPrompt     = prompts.MustLoad("architect", "conversation")
+	ArchitectFabricAwareness        = prompts.MustLoad("shared", "fabric_awareness")
 	DefaultSystemPrompt             = strings.Join([]string{
 		ArchitectSystemCorePrompt,
 		ArchitectSystemProtocolPrompt,
@@ -23,6 +24,7 @@ var (
 		ArchitectSystemOutputPrompt,
 		ArchitectSystemGuardrailsPrompt,
 		ArchitectSystemSkillsPrompt,
+		ArchitectFabricAwareness,
 	}, "\n\n---\n\n")
 	RequirementsAnalysisPrompt = prompts.MustLoad("architect", "requirements")
 	ArchitectureDesignPrompt   = prompts.MustLoad("architect", "design")
@@ -71,6 +73,7 @@ func plannerPromptModules(stage string) []string {
 			ArchitectSystemOutputPrompt,
 			ArchitectSystemGuardrailsPrompt,
 			ArchitectSystemSkillsPrompt,
+			ArchitectFabricAwareness,
 		}
 	}
 }

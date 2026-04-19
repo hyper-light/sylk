@@ -69,7 +69,9 @@ func OpenOrchestratorJournalSession(sessionDir string) (*OrchestratorJournal, er
 }
 
 // openJournalInDir creates a journal directly in the specified directory.
-// Used for backward compatibility with the existing OrchestratorWALPath.
+// Used by OpenOrchestratorJournal so callers can pass any session-scoped
+// data-WAL path (e.g. SessionOrchestratorWALPath) without this layer
+// owning the directory layout.
 func openJournalInDir(dir string) (*agentlog.AgentJournal, error) {
 	return agentlog.OpenJournalDirect(dir, agentlog.JournalConfig{
 		WALName:    "dag",

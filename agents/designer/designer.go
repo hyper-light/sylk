@@ -662,7 +662,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}
 	resp.Data = respData
 	shared.PublishStreamComplete(d.bus, d.channels, ctx, d.id, "", usageAcc.Total())
-	d.publishActivity(events.EventTypeAgentAction, "Design task completed")
+	d.publishActivity(events.EventTypeSuccess, "Design task completed")
 
 	respMsg := guide.NewResponseMessage(d.generateMessageID(), resp)
 	if d.agentPod != nil {

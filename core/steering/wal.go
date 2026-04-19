@@ -26,7 +26,8 @@ func OpenSteeringJournal(cfg agentlog.JournalConfig) (*SteeringJournal, error) {
 }
 
 // OpenSteeringJournalDirect opens a steering journal in an explicit directory.
-// Used when the caller manages directory layout (e.g., SylkDir.AgentSteeringPath).
+// Used when the caller manages directory layout (typically the session-scoped
+// SylkDir.SessionAgentWALPath).
 func OpenSteeringJournalDirect(dir string) (*SteeringJournal, error) {
 	j, err := agentlog.OpenJournalDirect(dir, agentlog.JournalConfig{
 		WALName: "steering",

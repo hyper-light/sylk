@@ -102,8 +102,6 @@ func (s *SylkDir) Init() error {
 		filepath.Join(s.GlobalDataPath(), "chunks"),
 		s.GlobalEdgeDataPath(),
 		s.GlobalCanonicalIndexPath(),
-		s.OrchestratorPath(),
-		s.OrchestratorWALPath(),
 	}
 
 	for _, dir := range dirs {
@@ -401,30 +399,36 @@ func (s *SylkDir) CachePath() string {
 	return filepath.Join(s.RootPath(), "cache")
 }
 
-// OrchestratorPath returns the path to the orchestrator data directory.
-func (s *SylkDir) OrchestratorPath() string {
-	return filepath.Join(s.RootPath(), "orchestrator")
+// SessionOrchestratorPath returns the session-scoped orchestrator data
+// directory. Per-session because the orchestrator's persistent state
+// (BufferRegistry, DAG bookkeeping, decision manifests) is session-scoped
+// per the architecture spec — a session is the unit of orchestrated work,
+// so its orchestrator state lives with it.
+// Structure: .sylk/sessions/{sessionID}/agents/orchestrator/
+func (s *SylkDir) SessionOrchestratorPath(sessionID string) string {
+	return filepath.Join(s.SessionPath(sessionID), "agents", "orchestrator")
 }
 
-// OrchestratorWALPath returns the path to the orchestrator WAL directory.
-func (s *SylkDir) OrchestratorWALPath() string {
-	return filepath.Join(s.OrchestratorPath(), "wal")
+// SessionOrchestratorDBPath returns the session-scoped orchestrator
+// SQLite database path.
+// Structure: .sylk/sessions/{sessionID}/agents/orchestrator/orchestrator.db
+func (s *SylkDir) SessionOrchestratorDBPath(sessionID string) string {
+	return filepath.Join(s.SessionOrchestratorPath(sessionID), "orchestrator.db")
 }
 
-// OrchestratorDBPath returns the path to the orchestrator SQLite database.
-func (s *SylkDir) OrchestratorDBPath() string {
-	return filepath.Join(s.OrchestratorPath(), "orchestrator.db")
+// SessionOrchestratorWALPath returns the session-scoped orchestrator WAL
+// directory. Distinct from SessionAgentWALPath, which holds per-request
+// event journals; this directory holds the orchestrator's data-plane WAL
+// (DAG operation log) consumed by OpenOrchestratorJournal.
+// Structure: .sylk/sessions/{sessionID}/agents/orchestrator/data_wal/
+func (s *SylkDir) SessionOrchestratorWALPath(sessionID string) string {
+	return filepath.Join(s.SessionOrchestratorPath(sessionID), "data_wal")
 }
 
-// AgentSteeringPath returns the path to an agent's steering WAL directory.
-// Structure: .sylk/agents/{agentType}/steering/
-//
-// Deprecated: Use SessionAgentWALPath for session-scoped WAL storage.
-func (s *SylkDir) AgentSteeringPath(agentType string) string {
-	return filepath.Join(s.RootPath(), "agents", agentType, "steering")
-}
-
-// SessionAgentWALPath returns the session-scoped WAL directory for an agent.
+// SessionAgentWALPath returns the session-scoped per-request event
+// journal directory for an agent. This is the binary WAL written by
+// SteeringManager.BindSession and SessionEventLogger; it is distinct
+// from data-plane WALs like SessionOrchestratorWALPath.
 // Structure: .sylk/sessions/{sessionID}/agents/{agentName}/wal/
 func (s *SylkDir) SessionAgentWALPath(sessionID, agentName string) string {
 	return filepath.Join(s.SessionPath(sessionID), "agents", agentName, "wal")

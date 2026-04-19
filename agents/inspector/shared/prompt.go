@@ -12,6 +12,12 @@ import (
 var (
 	InspectorSkillsPolicy = prompts.MustLoad("inspector", "system_skills")
 	InspectorGuardrails   = prompts.MustLoad("inspector", "system_guardrails")
+
+	// Activity Fabric awareness — uniform across all agents — plus the
+	// inspector audit-clause extension. Pipeline inspector and global
+	// inspector both compose both in.
+	InspectorFabricAwareness = prompts.MustLoad("shared", "fabric_awareness")
+	InspectorFabricAudit     = prompts.MustLoad("shared", "fabric_inspector_audit")
 )
 
 // Pipeline inspector prompts.
@@ -39,6 +45,8 @@ func PipelineInspectorSystemPrompt() string {
 		pipelineProtocol + promptSeparator +
 		InspectorSkillsPolicy + promptSeparator +
 		InspectorGuardrails + promptSeparator +
+		InspectorFabricAwareness + promptSeparator +
+		InspectorFabricAudit + promptSeparator +
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView:     versioning.WorkspaceViewPipeline,
 			IncludePipeline: true,
@@ -54,6 +62,8 @@ func PipelineInspectorSystemPromptForContract(contract *agentshared.TaskExecutio
 		parts = append(parts, pipelineProtocol)
 	}
 	parts = append(parts, InspectorSkillsPolicy, InspectorGuardrails,
+		InspectorFabricAwareness,
+		InspectorFabricAudit,
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView:     versioning.WorkspaceViewPipeline,
 			IncludePipeline: true,
@@ -97,6 +107,8 @@ func GlobalInspectorSystemPrompt() string {
 		globalAudit + promptSeparator +
 		InspectorSkillsPolicy + promptSeparator +
 		InspectorGuardrails + promptSeparator +
+		InspectorFabricAwareness + promptSeparator +
+		InspectorFabricAudit + promptSeparator +
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView: versioning.WorkspaceViewGlobal,
 		})
@@ -116,6 +128,8 @@ func GlobalInspectorSystemPromptForContract(contract *agentshared.GlobalExecutio
 		globalAudit,
 		InspectorSkillsPolicy,
 		InspectorGuardrails,
+		InspectorFabricAwareness,
+		InspectorFabricAudit,
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView: versioning.WorkspaceViewGlobal,
 		}),

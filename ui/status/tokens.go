@@ -73,8 +73,13 @@ func (td *TokenDisplay) IsAnimating() bool {
 	return td.phase != PhaseIdle
 }
 
-// View renders the token display as "Sτ ↓in/↑out". Input (prompt) tokens
-// are shown net of cache hits; output (completion) tokens point upward.
+// View renders the token display as "Sτ ↓out/↑in". Arrow glyphs follow the
+// standard data-flow convention: ↓ is what flows *down* to us (the LLM's
+// response — output/completion tokens), ↑ is what we send *up* to the model
+// (the prompt — input tokens, shown net of cache hits). An earlier version
+// of this file swapped the arrows, which made the status bar's "↑" column
+// appear to grow faster than "↓" during an LLM reply — the opposite of
+// every other tool a developer sees.
 func (td *TokenDisplay) View() string {
 	netInput := td.promptTokens - td.cacheReadTokens
 	if netInput < 0 {
@@ -104,10 +109,10 @@ func (td *TokenDisplay) View() string {
 	gap := td.idleStyle.Render(" ")
 	sym := td.idleStyle.Render(tokenSymbol + " ")
 	sep := td.idleStyle.Render("/")
-	inPart := inStyle.Render("↓" + in)
-	outPart := outStyle.Render("↑" + out)
+	outPart := outStyle.Render("↓" + out)
+	inPart := inStyle.Render("↑" + in)
 
-	return spinPart + gap + sym + inPart + sep + outPart
+	return spinPart + gap + sym + outPart + sep + inPart
 }
 
 // formatTokenCount renders a token count using compact "k" notation when the

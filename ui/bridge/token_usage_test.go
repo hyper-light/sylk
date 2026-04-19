@@ -8,8 +8,18 @@ import (
 	"github.com/adalundhe/sylk/ui/msg"
 )
 
+// TestTokenUsageBridge_StopIsIdempotent locks the UI-12 invariant: Stop
+// can be called multiple times without a panic. The atomic stopped flag
+// replaces the former sync.Once; a regression to naive close(done) would
+// double-close and crash.
+func TestTokenUsageBridge_StopIsIdempotent(t *testing.T) {
+	b := NewTokenUsageBridge("test", nil, nil)
+	b.Stop()
+	b.Stop()
+}
+
 func TestTokenUsageBridgeForwardHandlerAcceptsNumericVariants(t *testing.T) {
-	b := NewTokenUsageBridge("test", nil)
+	b := NewTokenUsageBridge("test", nil, nil)
 	program := &recordingProgram{}
 	handler := b.forwardHandler(program)
 
@@ -78,7 +88,7 @@ func TestTokenUsageBridgeForwardHandlerAcceptsNumericVariants(t *testing.T) {
 }
 
 func TestTokenUsageBridgeForwardHandler_CanonicalizesReplicaAgentIdentity(t *testing.T) {
-	b := NewTokenUsageBridge("test", nil)
+	b := NewTokenUsageBridge("test", nil, nil)
 	program := &recordingProgram{}
 	handler := b.forwardHandler(program)
 

@@ -36,14 +36,15 @@ type Store struct {
 	totalTokens    int
 	tokenThreshold int
 
-	// Archive reference (L2 cold storage)
-	archive *Archive
+	// Archive reference (L2 cold storage). Per-session sqlite manager —
+	// reads fan out across sessions, writes dispatch by entry.SessionID.
+	archive *SessionArchives
 }
 
 // StoreConfig configures the in-memory store
 type StoreConfig struct {
 	TokenThreshold int
-	Archive        *Archive
+	Archive        *SessionArchives
 }
 
 // NewStore creates a new in-memory store

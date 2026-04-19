@@ -16,6 +16,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
@@ -378,6 +379,23 @@ func (gt *GlobalTester) registerCoreSkills() {
 	// gains a pending-wait infrastructure (registerPendingWait /
 	// clearPendingWait equivalent). The screenshot bug is in the pipeline
 	// tester path so phase 1 ships without global-tester wiring.
+
+	// Activity Fabric: uniform awareness skills + cross-pipeline primitives.
+	for _, skill := range agentshared.AwarenessSkills(agentshared.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return gt.config.SessionID },
+		AgentID:        func() string { return gt.id },
+		AgentType:      func() string { return "tester" },
+	}) {
+		gt.skills.Register(skill)
+	}
+	for _, skill := range agentshared.CrossPipelineSkills(agentshared.CrossPipelineSkillConfig{
+		SessionID: func() string { return gt.config.SessionID },
+		AgentID:   func() string { return gt.id },
+		AgentType: func() string { return "tester" },
+	}) {
+		gt.skills.Register(skill)
+	}
 
 	// Diagnostics
 	gt.skills.Register(agentshared.NewSelfDiagnosticSkill(&globalTesterDiag{gt: gt}))

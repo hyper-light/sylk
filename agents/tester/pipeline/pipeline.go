@@ -17,6 +17,7 @@ import (
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester"
 	"github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
@@ -284,6 +285,28 @@ func (pt *PipelineTester) registerCoreSkills() {
 			ClearPending:    pt.clearPendingWait,
 			Timeout:         agentshared.DefaultConsultationTimeout,
 		},
+	}) {
+		pt.skills.Register(skill)
+	}
+	// Activity Fabric: uniform awareness skills + cross-pipeline
+	// primitives. Available to every pipeline agent. The fabric
+	// SourceProvider lazily resolves to the orchestrator-owned
+	// activity store; gracefully returns empty results when the
+	// store isn't yet wired (test fixtures, startup ordering).
+	awareCfg := agentshared.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return pt.config.SessionID },
+		AgentID:        func() string { return pt.id },
+		AgentType:      func() string { return "tester-pipeline" },
+	}
+	for _, skill := range agentshared.AwarenessSkills(awareCfg) {
+		pt.skills.Register(skill)
+	}
+	for _, skill := range agentshared.CrossPipelineSkills(agentshared.CrossPipelineSkillConfig{
+		SessionID:  func() string { return pt.config.SessionID },
+		AgentID:    func() string { return pt.id },
+		AgentType:  func() string { return "tester-pipeline" },
+		PipelineID: func() string { return pt.pipelineID },
 	}) {
 		pt.skills.Register(skill)
 	}
@@ -759,7 +782,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	}
 	resp.Data = agentshared.BuildPipelineTurnResponse(ctx, respData)
 	agentshared.PublishStreamComplete(pt.bus, pt.channels, ctx, pt.id, "", usageAcc.Total())
-	pt.publishActivity(events.EventTypeAgentAction, "Validation task completed")
+	pt.publishActivity(events.EventTypeSuccess, "Validation task completed")
 
 	if pt.agentPod != nil {
 		pt.agentPod.FeedScribe("tester-pipeline", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)

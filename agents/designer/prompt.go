@@ -15,9 +15,10 @@ var (
 	A11yAuditPrompt         = prompts.MustLoad("designer", "a11y")
 	TokenValidationPrompt   = prompts.MustLoad("designer", "token")
 
-	DesignerSkillsPolicy  = prompts.MustLoad("designer", "system_skills")
-	DesignerGuardrails    = prompts.MustLoad("designer", "system_guardrails")
-	DesignerCollaboration = prompts.MustLoad("designer", "collaboration")
+	DesignerSkillsPolicy   = prompts.MustLoad("designer", "system_skills")
+	DesignerGuardrails     = prompts.MustLoad("designer", "system_guardrails")
+	DesignerCollaboration  = prompts.MustLoad("designer", "collaboration")
+	DesignerFabricAwareness = prompts.MustLoad("shared", "fabric_awareness")
 )
 
 // DesignerSystemPrompt composes the full system prompt from all prompt sections.
@@ -30,6 +31,8 @@ func DesignerSystemPrompt() string {
 	b.WriteString(DesignerCollaboration)
 	b.WriteString("\n\n")
 	b.WriteString(DesignerGuardrails)
+	b.WriteString("\n\n")
+	b.WriteString(DesignerFabricAwareness)
 	return b.String()
 }
 
@@ -45,6 +48,7 @@ func DesignerSystemPromptForContract(contract *shared.TaskExecutionContract) str
 		TaskSystemPrompt,
 		DesignerCollaboration,
 		DesignerGuardrails,
+		DesignerFabricAwareness,
 	)
 }
 

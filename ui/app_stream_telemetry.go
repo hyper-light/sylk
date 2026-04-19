@@ -872,19 +872,43 @@ func (m *AppModel) applyRealStreamUsage(done msg.StreamCompleteMsg) {
 }
 
 // updateTokenDisplay pushes cumulative token counts to the status bar.
-// Prefer the live stream totals so usage keeps accumulating across follow-on
-// streams within the same request. Bus totals are retained as a fallback for
-// paths that report token usage outside the visible stream lifecycle.
+//
+// The accountant (core/llm/accounting) is the canonical session-wide source:
+// it aggregates every provider call across every agent, every replica, every
+// model generation, and every task under a typed AccountingKey. When the
+// AccountantBridge has delivered at least one snapshot (any non-zero field),
+// the status bar reads those totals directly — they are correct across the
+// full session regardless of which agent or provider generated them.
+//
+// The stream-derived `totalPrompt*` / `background*` counters are retained for
+// two reasons: (1) they drive the per-stream *phase* animation (the spinner
+// needs to know which direction is active mid-stream, which the accountant's
+// periodic snapshot does not capture in real time); (2) they serve as a cold-
+// start fallback for the first few hundred milliseconds before the
+// accountant snapshot arrives, or when the accountant is disabled (tests).
 func (m *AppModel) updateTokenDisplay() {
 	if m.statusBar == nil {
 		return
 	}
-	m.statusBar.SetTokens(
-		m.totalPromptTokens+m.backgroundPromptTokens,
-		m.totalCompletionTokens+m.backgroundCompletionTokens,
-		m.totalCacheReadTokens+m.backgroundCacheReadTokens,
-		m.totalReasoningTokens+m.backgroundReasoningTokens,
-	)
+	prompt := m.totalPromptTokens + m.backgroundPromptTokens
+	completion := m.totalCompletionTokens + m.backgroundCompletionTokens
+	cacheRead := m.totalCacheReadTokens + m.backgroundCacheReadTokens
+	reasoning := m.totalReasoningTokens + m.backgroundReasoningTokens
+
+	// Accountant-aggregated totals (canonical). Preferred whenever the
+	// bridge has delivered a snapshot — any non-zero field confirms the
+	// accountant is live. The accountant's Input/Output/Reasoning figures
+	// already fold in cache-read separately (see AggregatedUsage.Add), so
+	// we pass CacheRead through from the legacy counters; the net-input
+	// rendering in TokenDisplay.View subtracts it from Input at display
+	// time.
+	if m.accountantTotalInput != 0 || m.accountantTotalOutput != 0 || m.accountantTotalReasoning != 0 {
+		prompt = int(m.accountantTotalInput)
+		completion = int(m.accountantTotalOutput)
+		reasoning = int(m.accountantTotalReasoning)
+	}
+
+	m.statusBar.SetTokens(prompt, completion, cacheRead, reasoning)
 }
 
 func normalizeAgentID(raw string) string {

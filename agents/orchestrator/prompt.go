@@ -13,6 +13,7 @@ var (
 	OrchestratorSystemSkillsPrompt     = prompts.MustLoad("orchestrator", "system_skills")
 	OrchestratorConversationPrompt     = prompts.MustLoad("orchestrator", "conversation")
 	OrchestratorSelfResponsePrompt     = prompts.MustLoad("orchestrator", "self_response")
+	OrchestratorFabricAwareness        = prompts.MustLoad("shared", "fabric_awareness")
 
 	// DefaultSystemPrompt is the full system prompt for event processing (LLM loop).
 	// Includes all modules: core identity, protocol, guardrails, and skill strategy.
@@ -21,6 +22,7 @@ var (
 		OrchestratorSystemProtocolPrompt,
 		OrchestratorSystemGuardrailsPrompt,
 		OrchestratorSystemSkillsPrompt,
+		OrchestratorFabricAwareness,
 	}), "\n\n---\n\n")
 
 	// ConversationPrompt is the legacy alias used by existing callers.
