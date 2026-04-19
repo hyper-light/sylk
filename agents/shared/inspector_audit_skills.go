@@ -57,10 +57,10 @@ func InspectorAuditSkills(cfg InspectorAuditSkillConfig) []*skills.Skill {
 
 func inspectOpenActivitySkill(cfg InspectorAuditSkillConfig) *skills.Skill {
 	return skills.NewSkill("inspect_open_activity").
-		Description("Audit-time fabric inspection. Returns ALL in-flight activity in the audited scope: open challenges (in_flight, awaiting response), unresolved consults past their deadline, stalled validation holds, hot scopes (contested), and unresolved decision conflicts. Use BEFORE accepting or grading a pipeline's work — open conflicts in scope are blocking quality issues even when the work itself looks good in isolation.").
+		Description("REQUIRED audit-time fabric inspection. Returns ALL in-flight activity in the audited scope: open challenges (in_flight, awaiting response), unresolved consults past their deadline, stalled validation holds, hot scopes (contested), and unresolved decision conflicts. CALL THIS as the FIRST step of every audit/grade/finalize cycle — open conflicts in scope are blocking quality issues even when the work itself looks good in isolation. SUPERSEDES the older `coord_query_view` for general orientation; use coord_query_view only for specific coord-table reads after this skill surfaces what's contested.").
 		Domain("audit").
-		Keywords("audit", "fabric", "inspector", "conflicts", "open").
-		Priority(96).
+		Keywords("audit", "fabric", "inspector", "conflicts", "open", "first", "orient", "before grading", "before accept").
+		Priority(99).
 		Usage("Call BEFORE finalize / accept / grade. Pass the scope you're auditing (the pipeline's working area). Returns a structured digest the inspector reasons over to decide accept / request_correction / escalate.").
 		Requirement("Always call at finalize time. Cost is a few indexed reads; the cost of skipping is silent cross-pipeline divergence reaching production.").
 		Satisfies("Returns a structured digest: open challenges, stalled holds, unresolved consults, hotness signal, recent decisions in scope.").

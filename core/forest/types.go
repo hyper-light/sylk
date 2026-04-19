@@ -2,7 +2,10 @@
 // multi-tree memory projection and retrieval.
 package forest
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // TreeFamily identifies the specialized tree a branch belongs to.
 type TreeFamily string
@@ -239,6 +242,18 @@ type LearnedPrediction struct {
 }
 
 // BranchPacket is the agent-facing retrieval unit.
+//
+// MEM-05: every packet carries three first-class dimensions the Architect
+// and other consumers must interpret:
+//
+//   - Provenance (via ProvenanceRefs on each Support item). Origin chain
+//     for every supporting observation, keyed by source-record IDs.
+//   - Confidence (via Branch.Confidence and Score.Confidence). The
+//     branch-level posterior confidence and the packet's scoring-layer
+//     confidence; helper methods below expose a rolled-up view.
+//   - Conflicts (via Conflicts). Unresolved contradictions with
+//     severities so the consumer can escalate, discard, or route for
+//     review rather than trust every packet equally.
 type BranchPacket struct {
 	Branch          *Branch            `json:"branch"`
 	Support         []PacketEvidence   `json:"support,omitempty"`
@@ -247,6 +262,75 @@ type BranchPacket struct {
 	NextActions     []PacketAction     `json:"next_actions,omitempty"`
 	Score           PacketScore        `json:"score"`
 	Prediction      *LearnedPrediction `json:"prediction,omitempty"`
+}
+
+// ProvenanceRefs returns the union of provenance refs across every
+// supporting evidence item on the packet, deduplicated and in a stable
+// order (first-seen wins). Consumers use this to trace a packet back to
+// its source observations without walking Support themselves.
+func (p *BranchPacket) ProvenanceRefs() []string {
+	if p == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	refs := make([]string, 0)
+	for _, ev := range p.Support {
+		for _, ref := range ev.ProvenanceRefs {
+			if ref == "" {
+				continue
+			}
+			if _, already := seen[ref]; already {
+				continue
+			}
+			seen[ref] = struct{}{}
+			refs = append(refs, ref)
+		}
+	}
+	return refs
+}
+
+// RolledUpConfidence returns a single-number confidence view that
+// combines the branch-level confidence (from Branch.Confidence) with
+// the packet-scoring-layer confidence (Score.Confidence). Returns 0
+// when the packet carries no branch.
+//
+// The combination is the geometric mean — it rewards agreement between
+// the two signals and penalizes disagreement. When either is zero the
+// rolled-up value is zero (conservative), mirroring the "weakest link"
+// intuition consumers expect.
+func (p *BranchPacket) RolledUpConfidence() float64 {
+	if p == nil || p.Branch == nil {
+		return 0
+	}
+	if p.Branch.Confidence <= 0 || p.Score.Confidence <= 0 {
+		return 0
+	}
+	product := p.Branch.Confidence * p.Score.Confidence
+	return math.Sqrt(product)
+}
+
+// MaxConflictSeverity returns the highest conflict severity attached to
+// the packet, or 0 if there are no conflicts. Consumers use this as a
+// quick gating signal — a packet with severity > threshold should be
+// routed for architect review before being acted upon.
+func (p *BranchPacket) MaxConflictSeverity() float64 {
+	if p == nil {
+		return 0
+	}
+	var max float64
+	for _, c := range p.Conflicts {
+		if c.Severity > max {
+			max = c.Severity
+		}
+	}
+	return max
+}
+
+// HasUnresolvedConflicts reports whether the packet carries any conflict
+// with non-zero severity. Convenience for the common "do I need to
+// escalate this packet?" check.
+func (p *BranchPacket) HasUnresolvedConflicts() bool {
+	return p.MaxConflictSeverity() > 0
 }
 
 // Query configures a forest retrieval request.

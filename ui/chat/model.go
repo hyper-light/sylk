@@ -12,7 +12,6 @@ import (
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/google/uuid"
 )
 
@@ -308,15 +307,12 @@ type Model struct {
 
 	// Agent activity state: the canonical "what is happening now" signal.
 	// agentStates maps correlationID to the most recent AgentStateMsg so the
-	// renderer can surface per-entry indicators for streaming entries and
-	// an inter-stream bridge indicator for correlations that are between
-	// text-stream boundaries but not yet terminated.
+	// renderer can surface per-entry indicators for primary streaming
+	// entries (via ThinkingStatus) and for nested inter-agent branch rows
+	// (via the branch's Summary/Status fields). Terminal states evict the
+	// correlation; concurrent pipelines each own their own entry so their
+	// states remain independent.
 	agentStates map[string]*agentActivityState
-	// latestAgentState is the most recently observed non-terminal state
-	// across all correlations, used as the inter-stream bridge indicator
-	// when no entry is currently streaming. Reset to nil when the owning
-	// correlation terminates (complete/errored).
-	latestAgentState *agentActivityState
 }
 
 // agentActivityState captures the last observed state transition for a
@@ -635,141 +631,9 @@ func (m *Model) View() string {
 	if !m.viewDirty && m.viewCache != "" {
 		return m.viewCache
 	}
-	base := m.viewport.View()
-	// Inter-stream activity bridge: when an agent has announced a
-	// non-terminal state but no chat entry is currently streaming for that
-	// correlation, surface the state at the bottom of the panel so the UI
-	// never goes silent during routing hops (orchestrator → pipeline →
-	// orchestrator). Streaming entries handle the state inline via their
-	// ThinkingStatus field, so we only render the bridge when no streaming
-	// entry owns the latest state. The bridge REPLACES the viewport's last
-	// line (the trailing spacer every chat entry emits) rather than appending
-	// a new line — appending would push the panel past its allocated height
-	// and break the enclosing pane's bottom border. Chat-entry renderers
-	// already reserve a blank trailing line, so overlay is lossless.
-	if bridge := m.renderActivityBridge(); bridge != "" {
-		base = overlayBridgeOnLastLine(base, bridge)
-	}
-	m.viewCache = base
+	m.viewCache = m.viewport.View()
 	m.viewDirty = false
 	return m.viewCache
-}
-
-// overlayBridgeOnLastLine overlays N bridge lines onto the last N lines of
-// the viewport output, preserving total line count so the enclosing pane's
-// bottom border stays aligned. Chat-entry renderers always reserve a blank
-// trailing spacer, so single-line overlays are lossless; multi-line
-// overlays (concurrent pending states) replace additional lines from the
-// bottom of the content area. When the bridge has more lines than the
-// viewport (extreme case: many concurrent pending states with a near-empty
-// viewport), we truncate the bridge to fit so the pane height invariant
-// holds.
-func overlayBridgeOnLastLine(base, bridge string) string {
-	if base == "" {
-		return bridge
-	}
-	bridgeLines := strings.Split(bridge, "\n")
-	baseLines := strings.Split(base, "\n")
-	if len(bridgeLines) == 0 {
-		return base
-	}
-	if len(bridgeLines) >= len(baseLines) {
-		// Bridge alone fills the viewport. Keep only the last len(baseLines)
-		// bridge rows so we preserve the pane height exactly.
-		start := len(bridgeLines) - len(baseLines)
-		return strings.Join(bridgeLines[start:], "\n")
-	}
-	// Replace the trailing N lines of the viewport with the bridge rows.
-	replaceStart := len(baseLines) - len(bridgeLines)
-	for i, line := range bridgeLines {
-		baseLines[replaceStart+i] = line
-	}
-	return strings.Join(baseLines, "\n")
-}
-
-// renderActivityBridge returns a multi-line italic indicator showing every
-// non-terminal agent-activity state whose correlation has no currently-
-// streaming entry to surface it inline. Each concurrent pending state gets
-// its own line so multiple parallel pipelines don't clobber one another.
-// Returns "" when there are no bridgeable states (every non-terminal state
-// is already owned by a streaming entry whose thinking status renders it).
-//
-// The bridge exists specifically to cover the gap between one agent's
-// stream complete and the next agent's stream start — the case the
-// explicit agent-state channel was designed to eliminate. The color cycles
-// through the same holographic thinking gradient used by streaming
-// entries' thinking indicator so the visual language is uniform.
-//
-// Lines are ordered by TransitionID so the most recently-transitioned
-// agent sits last (the typical "what just changed" spot), giving the eye a
-// stable reading order even as states update.
-func (m *Model) renderActivityBridge() string {
-	if len(m.agentStates) == 0 {
-		return ""
-	}
-	pending := make([]*agentActivityState, 0, len(m.agentStates))
-	for cid, state := range m.agentStates {
-		if state == nil {
-			continue
-		}
-		if slot, ok := m.streams[cid]; ok && slot != nil && slot.accumulator != nil {
-			// A streaming entry owns this correlation; the trailing
-			// activity indicator on that entry renders the state inline.
-			continue
-		}
-		pending = append(pending, state)
-	}
-	if len(pending) == 0 {
-		return ""
-	}
-	sort.Slice(pending, func(i, j int) bool {
-		return pending[i].TransitionID < pending[j].TransitionID
-	})
-	width := m.viewport.viewWidth
-	if width <= 0 {
-		width = m.width
-	}
-	now := time.Now()
-	lines := make([]string, 0, len(pending))
-	for _, state := range pending {
-		if line := m.renderBridgeLine(state, width, now); line != "" {
-			lines = append(lines, line)
-		}
-	}
-	if len(lines) == 0 {
-		return ""
-	}
-	return strings.Join(lines, "\n")
-}
-
-// renderBridgeLine renders a single non-terminal state as one bridge line
-// with spinner + elapsed + label + detail, all sharing the holographic
-// gradient style. Returns "" when the state has no renderable detail.
-func (m *Model) renderBridgeLine(state *agentActivityState, width int, now time.Time) string {
-	detail := state.Detail
-	if detail == "" {
-		detail = humanizeAgentState(state.State)
-	}
-	if strings.TrimSpace(detail) == "" {
-		return ""
-	}
-	label := strings.TrimSpace(state.AgentType)
-	if label == "" {
-		label = strings.TrimSpace(state.AgentID)
-	}
-	if label == "" {
-		label = "agent"
-	}
-	elapsed := thinkingElapsed(state.ObservedAt, now)
-	spinner := spinnerFrames[thinkingFrameAt(elapsed)]
-	elapsedStr := formatToolDuration(elapsed)
-	text := fmt.Sprintf("%s  %s  %s — %s", spinner, elapsedStr, label, detail)
-	color := lipgloss.Color(m.thinkingColorFor(elapsed))
-	style := lipgloss.NewStyle().Foreground(color).Italic(true)
-	if width > 0 {
-		return style.Render(truncateToWidth(text, width))
-	}
-	return style.Render(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -858,6 +722,15 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 		}
 		return nil
 	}
+	// Parent-correlation preservation: when this event is from a child
+	// (guardian approval, peer consult activity, pipeline challenge
+	// activity), touch the parent's slot to keep its thinking
+	// indicator alive. This runs before the suppression check so the
+	// parent's spinner refreshes even if the child's own row would be
+	// suppressed from the main chat timeline.
+	if parentCID := strings.TrimSpace(ev.Event.ParentCorrelationID); parentCID != "" {
+		m.keepParentThinkingAliveForActivity(parentCID, ev)
+	}
 	if shouldSuppressActivity(ev) {
 		return nil
 	}
@@ -877,6 +750,39 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 	}
 	m.PushEntry(entry)
 	return nil
+}
+
+// keepParentThinkingAliveForActivity mirrors keepParentThinkingAliveForChild
+// for activity events. When guardian publishes an approval activity or
+// a peer publishes a consult activity, the parent's thinking spinner
+// would otherwise go quiet because no event lands on the parent's
+// correlation. Touching the parent slot here refreshes its indicator
+// so the user sees continuous "in progress" feedback.
+func (m *Model) keepParentThinkingAliveForActivity(parentCID string, ev msg.ActivityEventMsg) {
+	slot, ok := m.streams[parentCID]
+	if !ok || slot == nil || slot.accumulator == nil {
+		return
+	}
+	entryIdx := slot.accumulator.EntryIndex()
+	if entryIdx < 0 {
+		return
+	}
+	if slot.thinkingStart.IsZero() {
+		slot.thinkingStart = time.Now()
+	}
+	// Surface the child's content as the parent's thinking status so
+	// the user sees "Command approval allowed" etc. inline on the
+	// parent's row. The parent's own next progress/state event will
+	// overwrite this when it arrives.
+	status := sanitizeThinkingMessage(strings.TrimSpace(ev.Event.Content))
+	if status == "" {
+		return
+	}
+	m.history.UpdateAt(entryIdx, func(e *ChatEntry) {
+		e.ThinkingStatus = status
+		invalidateChatEntryRender(e)
+	})
+	m.viewDirty = true
 }
 
 func shouldSuppressActivity(ev msg.ActivityEventMsg) bool {
@@ -1333,18 +1239,11 @@ func (m *Model) handleAgentState(state msg.AgentStateMsg) tea.Cmd {
 	}
 	terminal := isTerminalAgentState(record.State)
 	if terminal {
-		// Terminal states evict the correlation from the active map.
+		// Terminal states evict the correlation from the active map so
+		// stale activity does not persist after the request finishes.
 		delete(m.agentStates, cid)
-		if m.latestAgentState != nil && m.latestAgentState.CorrelationID == cid {
-			m.latestAgentState = nil
-		}
 	} else {
 		m.agentStates[cid] = record
-		// Promote to latestAgentState for bridge rendering only when no
-		// newer state from a different correlation is already there.
-		if m.latestAgentState == nil || m.latestAgentState.TransitionID < record.TransitionID {
-			m.latestAgentState = record
-		}
 	}
 
 	// Attach the state detail to the entry currently holding this
@@ -1367,7 +1266,90 @@ func (m *Model) handleAgentState(state msg.AgentStateMsg) tea.Cmd {
 			invalidateChatEntryRender(e)
 		})
 	}
+	// When the correlation matches a nested inter-agent branch slot (consult
+	// or challenge rendered as a child tool row inside the parent's entry),
+	// write the state detail to the child activity's ThinkingStatus. The
+	// existing tickNestedStreamThinking path picks it up and renders the
+	// status inline beneath the child's spinner + elapsed — no bottom
+	// bridge needed, no duplication. Terminal states clear the status to
+	// avoid stale activity lingering after the peer finishes.
+	if nested := m.nestedStream(cid); nested != nil {
+		if terminal {
+			nested.activity.ThinkingStatus = ""
+		} else if detail := record.Detail; detail != "" {
+			nested.activity.ThinkingStatus = detail
+		} else {
+			nested.activity.ThinkingStatus = humanizeAgentState(record.State)
+		}
+		m.syncPendingNestedStream(nested)
+	}
+	// Parent-correlation preservation: when this state event is from a
+	// child (guardian approval, pipeline challenge, peer consult), look
+	// up the parent slot and keep its thinking indicator alive. Without
+	// this, the parent's spinner goes stale the moment a child event
+	// publishes on its own correlation.
+	//
+	// Non-terminal: bump parent's thinkingStart so the elapsed timer
+	// keeps running (no visible reset because we only bump when it's
+	// already zero); surface the child's status on the parent's entry
+	// so the user sees "Waiting on guardian..." instead of a dead row.
+	//
+	// Terminal: intentionally do NOT evict the parent — only the child
+	// has finished. The parent's own state event (complete/errored)
+	// retires its indicator.
+	if parentCID := strings.TrimSpace(state.ParentCorrelationID); parentCID != "" && parentCID != cid {
+		m.keepParentThinkingAliveForChild(parentCID, record, terminal)
+	}
 	return nil
+}
+
+// keepParentThinkingAliveForChild refreshes the parent's thinking
+// indicator when a child publishes an agent state event. Preserves
+// ownership through child lifecycle so the parent's row stays active
+// until the parent itself completes.
+func (m *Model) keepParentThinkingAliveForChild(parentCID string, child *agentActivityState, childTerminal bool) {
+	if parentCID == "" || child == nil {
+		return
+	}
+	slot, ok := m.streams[parentCID]
+	if !ok || slot == nil || slot.accumulator == nil {
+		return
+	}
+	entryIdx := slot.accumulator.EntryIndex()
+	if entryIdx < 0 {
+		return
+	}
+	// Start the per-slot thinking timer if it's dormant, so the
+	// spinner keeps rendering while the child runs.
+	if slot.thinkingStart.IsZero() {
+		slot.thinkingStart = time.Now()
+	}
+	m.history.UpdateAt(entryIdx, func(e *ChatEntry) {
+		if childTerminal {
+			// Clear the child-derived status; the parent's own state
+			// will drive its indicator from here. Don't clear if the
+			// parent has its own active state record that should win.
+			if existing, ok := m.agentStates[parentCID]; ok && existing != nil {
+				if existing.Detail != "" {
+					e.ThinkingStatus = existing.Detail
+				} else {
+					e.ThinkingStatus = humanizeAgentState(existing.State)
+				}
+			} else {
+				e.ThinkingStatus = ""
+			}
+		} else {
+			detail := strings.TrimSpace(child.Detail)
+			if detail == "" {
+				detail = humanizeAgentState(child.State)
+			}
+			if detail != "" {
+				e.ThinkingStatus = detail
+			}
+		}
+		invalidateChatEntryRender(e)
+	})
+	m.viewDirty = true
 }
 
 // humanizeAgentState maps a canonical state string to a short user-facing
@@ -2877,6 +2859,17 @@ func (m *Model) renderNestedStreamThinking(slot *nestedStreamSlot, now time.Time
 	elapsed := thinkingElapsed(slot.thinkingStart, now)
 	text := fmt.Sprintf("%s  %s", spinnerFrames[thinkingFrameAt(elapsed)], formatToolDuration(elapsed))
 	status := thinkingStatusFor(nestedActivityAgentType(&slot.activity), slot.progress.retryText, elapsed)
+	// Agent-state detail (explicit transition from the peer agent) takes
+	// precedence over the rotating placeholder. Matches the primary-stream
+	// path in renderThinkingEntry so peers narrate identically inline and
+	// nested, with no silent gaps during their reasoning / tool-execution
+	// phases. Retry text still wins because transient-failure messaging
+	// is more urgent than ordinary state progress.
+	if strings.TrimSpace(slot.progress.retryText) == "" {
+		if detail := m.agentStateDetailForNestedCorrelation(slot.correlationID); detail != "" {
+			status = detail
+		}
+	}
 	color := m.thinkingColorFor(elapsed)
 	if slot.activity.ThinkingText == text &&
 		slot.activity.ThinkingStatus == status &&
@@ -2888,6 +2881,27 @@ func (m *Model) renderNestedStreamThinking(slot *nestedStreamSlot, now time.Time
 	slot.activity.ThinkingStatus = status
 	slot.activity.ThinkingColor = color
 	return true
+}
+
+// agentStateDetailForNestedCorrelation returns the agent-state detail for
+// a nested child correlation so tickNestedStreamThinking surfaces the
+// peer's current state in the inline inter-agent row. Returns "" when no
+// non-terminal state is attached to the correlation; callers then fall
+// back to the rotating placeholder message. Mirrors the primary-stream
+// equivalent, agentStateDetailForEntry.
+func (m *Model) agentStateDetailForNestedCorrelation(correlationID string) string {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" || m.agentStates == nil || len(m.agentStates) == 0 {
+		return ""
+	}
+	state, ok := m.agentStates[correlationID]
+	if !ok || state == nil {
+		return ""
+	}
+	if detail := strings.TrimSpace(state.Detail); detail != "" {
+		return detail
+	}
+	return humanizeAgentState(state.State)
 }
 
 func nestedActivityAgentType(activity *InterAgentChildActivity) string {
@@ -4217,38 +4231,9 @@ func (m *Model) tickThinking(now time.Time) {
 	if m.tickPendingInterAgentHistory(now) {
 		updated = true
 	}
-	// Keep the inter-stream bridge animating at the same cadence as the
-	// Phase 1 thinking indicator: when a non-terminal state exists and no
-	// streaming entry owns it, each tick advances the spinner frame and
-	// elapsed counter. Marking viewDirty triggers re-render via renderActivityBridge,
-	// which samples the gradient and spinner fresh each frame.
-	if m.bridgeActive() {
-		updated = true
-	}
 	if updated {
 		m.viewDirty = true
 	}
-}
-
-// bridgeActive reports whether at least one non-terminal state has no
-// streaming entry to surface it, so the inter-stream bridge should
-// animate this tick. Used by tickThinking to flag viewDirty every 100ms
-// whenever the bridge rows are visible — each tick advances spinner frame,
-// elapsed counter, and gradient color.
-func (m *Model) bridgeActive() bool {
-	if len(m.agentStates) == 0 {
-		return false
-	}
-	for cid, state := range m.agentStates {
-		if state == nil {
-			continue
-		}
-		if slot, ok := m.streams[cid]; ok && slot != nil && slot.accumulator != nil {
-			continue
-		}
-		return true
-	}
-	return false
 }
 
 // ---------------------------------------------------------------------------

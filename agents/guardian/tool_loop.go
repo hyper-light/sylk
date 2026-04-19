@@ -267,6 +267,13 @@ func (g *Guardian) applyToolCalls(
 		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && !isError {
 			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
+		// Activity Fabric ambient_context envelope.
+		result = shared.AppendAmbientContext(ctx, shared.AmbientEnvelopeConfig{
+			SessionID:  func() string { return g.config.SessionID },
+			AgentID:    func() string { return g.id },
+			AgentType:  func() string { return "guardian" },
+			PipelineID: func() string { return "" },
+		}, result)
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,

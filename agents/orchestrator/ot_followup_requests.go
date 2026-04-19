@@ -31,7 +31,7 @@ type globalReviewProgress struct {
 }
 
 func (o *Orchestrator) publishOTGlobalFollowupRequest(
-	_ context.Context,
+	ctx context.Context,
 	task *TaskRecord,
 	update *PipelineUpdate,
 	checkpointVersion versioning.SemanticVersion,
@@ -48,6 +48,27 @@ func (o *Orchestrator) publishOTGlobalFollowupRequest(
 	req := o.buildOTGlobalFollowupRequest(task, update, reviewerType, checkpointVersion, hadDraft, reviewCandidateID)
 	if req == nil {
 		return nil
+	}
+	// Announce `dispatching_to_peer` on the supervisor session BEFORE the
+	// route publishes. The peer correlation is the request's CID so when
+	// the inspector's stream eventually starts and publishes its own
+	// `receiving` state on that same correlation, the chat panel seamlessly
+	// transitions from the bridge row to the streaming entry without a
+	// silent gap. This is the fix for the 13+ second disappearance
+	// between a pipeline's terminal update and the next agent's stream.
+	if session := agentshared.ActivitySessionFromContext(ctx); session != nil {
+		peer := &guide.AgentStateEvent{
+			PeerAgentType:     reviewerType,
+			PeerCorrelationID: strings.TrimSpace(req.CorrelationID),
+		}
+		detail := fmt.Sprintf("dispatching %s follow-up to %s", strings.TrimSpace(task.ID), reviewerType)
+		if err := agentshared.PublishAgentState(o.bus, o.channels, ctx, o.config.AgentID, "orchestrator",
+			guide.AgentStateDispatchingToPeer, detail, peer); err != nil {
+			o.logWarnMsg("orchestrator_ot_followup_dispatch_state_publish_failed",
+				"task_id", task.ID,
+				"reviewer", reviewerType,
+				"error", err.Error())
+		}
 	}
 	if err := o.publishUserVisibleFollowupRoute(req); err != nil {
 		return fmt.Errorf("publish OT global follow-up for %s: %w", task.ID, err)

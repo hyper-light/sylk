@@ -94,7 +94,14 @@ func (cb *CircularBuffer[T]) pushLocked(item T) bool {
 func (cb *CircularBuffer[T]) Pop() (T, bool) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	return cb.popLocked()
+}
 
+// popLocked is the internal implementation of Pop. Caller must hold the
+// appropriate serialization (either cb.mu write lock, or a higher-level
+// mutex that singly-threads access to this buffer, as PreparedContext
+// does with pc.mu). Mirrors pushLocked's contract.
+func (cb *CircularBuffer[T]) popLocked() (T, bool) {
 	var zero T
 	if cb.count == 0 {
 		return zero, false

@@ -163,6 +163,13 @@ func (o *Orchestrator) applyToolCalls(
 		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && !isError {
 			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
+		// Activity Fabric ambient_context envelope.
+		result = shared.AppendAmbientContext(ctx, shared.AmbientEnvelopeConfig{
+			SessionID:  func() string { return o.SessionID() },
+			AgentID:    func() string { return o.config.AgentID },
+			AgentType:  func() string { return "orchestrator" },
+			PipelineID: func() string { return "" },
+		}, result)
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,

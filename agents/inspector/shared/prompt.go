@@ -40,13 +40,19 @@ var (
 const promptSeparator = "\n\n---\n\n"
 
 // PipelineInspectorSystemPrompt composes the full pipeline inspector system prompt.
+//
+// IMPORTANT ORDERING: the fabric awareness + audit clauses come
+// BEFORE the workflow protocol so the LLM sees fabric context as
+// framing for its work, not as an afterthought. Without this
+// ordering the LLM follows the workflow it reads first and never
+// reaches for fabric skills.
 func PipelineInspectorSystemPrompt() string {
 	return pipelineSystem + promptSeparator +
+		InspectorFabricAwareness + promptSeparator +
+		InspectorFabricAudit + promptSeparator +
 		pipelineProtocol + promptSeparator +
 		InspectorSkillsPolicy + promptSeparator +
 		InspectorGuardrails + promptSeparator +
-		InspectorFabricAwareness + promptSeparator +
-		InspectorFabricAudit + promptSeparator +
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView:     versioning.WorkspaceViewPipeline,
 			IncludePipeline: true,
@@ -57,13 +63,15 @@ func PipelineInspectorSystemPrompt() string {
 // protocol block when the task is still in pre-implementation contract
 // synthesis mode.
 func PipelineInspectorSystemPromptForContract(contract *agentshared.TaskExecutionContract) string {
-	parts := []string{pipelineSystem}
+	parts := []string{
+		pipelineSystem,
+		InspectorFabricAwareness, // promote ahead of workflow
+		InspectorFabricAudit,
+	}
 	if contract == nil || !contract.PreImplementation {
 		parts = append(parts, pipelineProtocol)
 	}
 	parts = append(parts, InspectorSkillsPolicy, InspectorGuardrails,
-		InspectorFabricAwareness,
-		InspectorFabricAudit,
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView:     versioning.WorkspaceViewPipeline,
 			IncludePipeline: true,
@@ -101,14 +109,19 @@ func PipelineCorrectionPrompt() string {
 }
 
 // GlobalInspectorSystemPrompt composes the full global inspector system prompt.
+//
+// Same ordering rationale as PipelineInspectorSystemPrompt: fabric
+// awareness + audit clauses before the workflow protocol so the LLM
+// reaches for inspect_open_activity / query_peer_activity as
+// orientation tools, not as bolted-on extras.
 func GlobalInspectorSystemPrompt() string {
 	return globalSystem + promptSeparator +
+		InspectorFabricAwareness + promptSeparator +
+		InspectorFabricAudit + promptSeparator +
 		globalProtocol + promptSeparator +
 		globalAudit + promptSeparator +
 		InspectorSkillsPolicy + promptSeparator +
 		InspectorGuardrails + promptSeparator +
-		InspectorFabricAwareness + promptSeparator +
-		InspectorFabricAudit + promptSeparator +
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView: versioning.WorkspaceViewGlobal,
 		})
@@ -124,12 +137,12 @@ func GlobalInspectorSystemPromptForContract(contract *agentshared.GlobalExecutio
 	}
 	return joinNonEmpty([]string{
 		globalSystem,
+		InspectorFabricAwareness,
+		InspectorFabricAudit,
 		globalProtocol,
 		globalAudit,
 		InspectorSkillsPolicy,
 		InspectorGuardrails,
-		InspectorFabricAwareness,
-		InspectorFabricAudit,
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView: versioning.WorkspaceViewGlobal,
 		}),

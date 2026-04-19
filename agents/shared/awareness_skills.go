@@ -57,10 +57,10 @@ func AwarenessSkills(cfg AwarenessSkillConfig) []*skills.Skill {
 
 func queryPeerActivitySkill(cfg AwarenessSkillConfig) *skills.Skill {
 	return skills.NewSkill("query_peer_activity").
-		Description("See what peer agents in other pipelines have been doing in a scope recently. Returns the most recent typed activities (decisions, claims, validations, advisories) by other agents in the queried scope. Filter by ActionKind when you only care about specific kinds. Auto-publishes a `consulted` activity for causal traceability. Never blocks your primary work — purely informational.").
+		Description("PREFERRED orientation tool. See what peer agents in other pipelines have been doing in a scope recently. Returns the most recent typed activities (decisions, claims, validations, advisories) by other agents in the queried scope. Filter by ActionKind when you only care about specific kinds. Auto-publishes a `consulted` activity for causal traceability. Never blocks your primary work — purely informational. SUPERSEDES the narrower `query_decisions` and partially supersedes `coord_query_view` for general orientation; use those only for their domain-specific shape when you've already established context.").
 		Domain("fabric").
-		Keywords("awareness", "peers", "fabric", "cross-pipeline", "query").
-		Priority(94).
+		Keywords("awareness", "peers", "fabric", "cross-pipeline", "query", "orientation", "context", "decisions", "coordinate").
+		Priority(99).
 		Usage("Use when ambient context shows activity in your scope and you want to dig deeper. Pass scope (path prefix) and optionally specific kinds (e.g. \"decision_declared\", \"claim_acquired\"). The default lookback is the last 5 minutes; pass `since_minutes` for a wider window.").
 		Requirement("Call when you want to inspect peer pipeline state. Cost is one indexed read on the fabric.").
 		Satisfies("Returns recent peer activity in scope, ordered by recency.").
@@ -101,10 +101,10 @@ func queryPeerActivitySkill(cfg AwarenessSkillConfig) *skills.Skill {
 
 func causalTraceSkill(cfg AwarenessSkillConfig) *skills.Skill {
 	return skills.NewSkill("causal_trace").
-		Description("Walk the cause/caused DAG anchored at a specific activity. Returns the chain of ancestors (root → parent → target) and immediate descendants. Useful for understanding 'what led to this state' — e.g., why a decision exists, what triggered an inspector hold, what chain produced a given artifact.").
+		Description("Walk the cause/caused DAG anchored at a specific activity. Returns the chain of ancestors (root → parent → target) and immediate descendants. Useful for understanding 'what led to this state' — e.g., why a decision exists, what triggered an inspector hold, what chain produced a given artifact. CALL THIS when ambient_context shows an activity you don't recognize, when investigating unexpected state, or before responding to an inbound dispute.").
 		Domain("fabric").
-		Keywords("awareness", "causal", "audit", "fabric", "trace").
-		Priority(91).
+		Keywords("awareness", "causal", "audit", "fabric", "trace", "investigate", "why", "lineage").
+		Priority(95).
 		Usage("Use when you need to understand the lineage of an activity. Pass the activity_id (commonly surfaced in ambient_context). Returns ancestors in oldest-first order and direct children.").
 		Requirement("Call when investigating why state exists or who triggered which work.").
 		Satisfies("Returns ancestors + direct descendants of the targeted activity.").
@@ -126,10 +126,10 @@ func causalTraceSkill(cfg AwarenessSkillConfig) *skills.Skill {
 
 func findRelatedActivitySkill(cfg AwarenessSkillConfig) *skills.Skill {
 	return skills.NewSkill("find_related_activity").
-		Description("Find activities matching a free-text query OR a target scope. The current implementation falls back to a scope-prefix search (full-text via Bleve and semantic search via vectorgraphdb come online when those subscribers ship; see docs/FABRIC.md Tier 10). Returns matching activities ordered by recency.").
+		Description("Find activities matching a free-text query OR a target scope. Searches the whole fabric stream — broader than `query_peer_activity` (which is scoped) or `query_decisions` (which is domain-narrow). Returns matching activities ordered by recency. CALL THIS when you suspect related work has happened that might inform your current decision but you don't know exactly where to look.").
 		Domain("fabric").
-		Keywords("awareness", "search", "fabric", "related").
-		Priority(89).
+		Keywords("awareness", "search", "fabric", "related", "find", "discover").
+		Priority(93).
 		Usage("Use when you want a broader sweep than query_peer_activity — e.g., 'find every activity touching services/billing/auth.go in the last hour' or 'show me what's been happening across this session that involves pytest.'").
 		Requirement("Call to broaden investigation beyond a specific scope.").
 		Satisfies("Returns matching activities ordered by recency.").
@@ -190,10 +190,10 @@ func findRelatedActivitySkill(cfg AwarenessSkillConfig) *skills.Skill {
 
 func inspectOpenConflictsSkill(cfg AwarenessSkillConfig) *skills.Skill {
 	return skills.NewSkill("inspect_open_conflicts").
-		Description("Return what is currently contested in your scope: open challenges (in_flight, awaiting response), unanswered consults past their deadline, and stalled validation holds. Use to decide whether to challenge, adopt, or proceed without knowing.").
+		Description("Return what is currently contested in your scope: open challenges (in_flight, awaiting response), unanswered consults past their deadline, and stalled validation holds. CALL THIS when ambient_context shows a hotness_advisory, when you're about to introduce a divergent commitment, or BEFORE issuing your own challenge in a contested scope (you may want to adopt an existing thread instead).").
 		Domain("fabric").
-		Keywords("awareness", "conflicts", "fabric", "challenge").
-		Priority(90).
+		Keywords("awareness", "conflicts", "fabric", "challenge", "contested", "hot", "dispute").
+		Priority(96).
 		Usage("Use when ambient context surfaced a conflict marker, or proactively before introducing a divergent commitment in a scope you suspect is contested.").
 		Requirement("Call to understand current contention before acting on a contested scope.").
 		Satisfies("Returns open challenges, unresolved consults, and stalled holds in scope.").

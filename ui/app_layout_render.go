@@ -97,6 +97,9 @@ func (m *AppModel) inputMaxVisualLines() int {
 // The result is further constrained to ensure the main area retains
 // at least 1 row — the input grows upward, never beyond available space.
 func (m *AppModel) inputHeight() int {
+	if m.planApproval != nil {
+		return m.planApprovalHeight()
+	}
 	if m.commandApproval != nil {
 		return m.commandApprovalHeight()
 	}
@@ -1638,6 +1641,9 @@ func (m *AppModel) renderDirtySlots() {
 }
 
 func (m *AppModel) inputPanelView() string {
+	if m.planApproval != nil {
+		return m.renderPlanApprovalView()
+	}
 	if m.commandApproval != nil {
 		return m.renderCommandApprovalView()
 	}

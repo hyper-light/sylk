@@ -21,18 +21,24 @@ var (
 	DesignerFabricAwareness = prompts.MustLoad("shared", "fabric_awareness")
 )
 
-// DesignerSystemPrompt composes the full system prompt from all prompt sections.
+// DesignerSystemPrompt composes the full system prompt from all
+// prompt sections.
+//
+// IMPORTANT ORDERING: DesignerFabricAwareness comes RIGHT AFTER the
+// agent identity prompt, BEFORE skills/collaboration/guardrails.
+// The screenshot review showed the LLM follows the workflow it
+// reads first; fabric must be framing, not a footer.
 func DesignerSystemPrompt() string {
 	var b strings.Builder
 	b.WriteString(DefaultSystemPrompt)
+	b.WriteString("\n\n")
+	b.WriteString(DesignerFabricAwareness)
 	b.WriteString("\n\n")
 	b.WriteString(DesignerSkillsPolicy)
 	b.WriteString("\n\n")
 	b.WriteString(DesignerCollaboration)
 	b.WriteString("\n\n")
 	b.WriteString(DesignerGuardrails)
-	b.WriteString("\n\n")
-	b.WriteString(DesignerFabricAwareness)
 	return b.String()
 }
 
@@ -46,9 +52,9 @@ func DesignerSystemPromptForContract(contract *shared.TaskExecutionContract) str
 	}
 	return joinPromptSections(
 		TaskSystemPrompt,
+		DesignerFabricAwareness, // promoted ahead of workflow
 		DesignerCollaboration,
 		DesignerGuardrails,
-		DesignerFabricAwareness,
 	)
 }
 

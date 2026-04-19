@@ -5,6 +5,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/commandapproval"
+	"github.com/adalundhe/sylk/core/planapproval"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/lsp"
 	"github.com/adalundhe/sylk/core/search/git"
@@ -24,6 +25,22 @@ type ActivityEventMsg struct {
 // SessionEventMsg wraps a session lifecycle event.
 type SessionEventMsg struct {
 	Event *session.Event
+}
+
+// SessionSwitchedMsg is the narrowed UI-13 signal emitted whenever
+// the session manager switches the active session (EventSwitched).
+// AppModel subscribes to this instead of filtering every
+// SessionEventMsg because switch is the only event that invalidates
+// the in-memory editor / chat buffers — other lifecycle transitions
+// (paused, resumed, completed, failed) leave the surface intact.
+//
+// The PreviousID is empty on the very first activation. ActiveID is
+// always populated — the msg is never sent for a switch that
+// couldn't activate a target.
+type SessionSwitchedMsg struct {
+	PreviousID string
+	ActiveID   string
+	Event      *session.Event
 }
 
 // ---------------------------------------------------------------------------
@@ -201,16 +218,17 @@ type StreamErrorMsg struct {
 // UI regardless of text-stream lifecycle (see StreamEventAgentState in
 // agents/guide).
 type AgentStateMsg struct {
-	SessionID         string
-	CorrelationID     string
-	AgentID           string
-	AgentType         string
-	State             string
-	Detail            string
-	TransitionID      int64
-	PeerAgentType     string
-	PeerCorrelationID string
-	Timestamp         time.Time
+	SessionID           string
+	CorrelationID       string
+	ParentCorrelationID string
+	AgentID             string
+	AgentType           string
+	State               string
+	Detail              string
+	TransitionID        int64
+	PeerAgentType       string
+	PeerCorrelationID   string
+	Timestamp           time.Time
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +256,29 @@ type CommandApprovalCommitMsg struct {
 }
 
 type CommandApprovalResolvedMsg struct{}
+
+// PlanApprovalRequestMsg carries a plan acceptance proposal from the bus
+// to the AppModel. Triggers the input panel to substitute the editor
+// with the three-button (Approve / Modify / Reject) dialog. Mirrors
+// CommandApprovalRequestMsg's role for command approvals.
+type PlanApprovalRequestMsg struct {
+	Proposal *planapproval.Proposal
+}
+
+// PlanApprovalCommitMsg is produced when the user clicks one of the
+// three dialog buttons. The AppModel handler publishes the structured
+// Decision back to Guardian (via TopicResponses("guardian", g.id)) so
+// Guardian's pending channel unblocks and returns the verdict to the
+// architect's continuation handler.
+type PlanApprovalCommitMsg struct {
+	Proposal *planapproval.Proposal
+	Verdict  planapproval.Verdict
+}
+
+// PlanApprovalResolvedMsg signals that the dialog has been dismissed
+// (verdict committed, response published). Triggers AppModel to clear
+// its planApproval state and restore the input panel to the editor.
+type PlanApprovalResolvedMsg struct{}
 
 // StreamRerouteMsg signals that an agent-initiated reroute is occurring.
 // The Guide broadcasts this when an agent invokes the reroute_request skill

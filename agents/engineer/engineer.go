@@ -577,7 +577,6 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	shared.EmitDispatchACK(e.bus, fwd.Metadata, e.id, "engineer", fwd.CorrelationID)
-	e.publishActivity(events.EventTypeAgentAction, "Processing implementation task")
 
 	if e.config.RequestGuard != nil {
 		release := e.config.RequestGuard()
@@ -646,6 +645,7 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	}))
 	ctx = shared.WithOwnedStreamIdentity(ctx, "engineer", "Engineer")
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
+	e.publishActivity(ctx, events.EventTypeAgentAction, "Processing implementation task")
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
@@ -714,7 +714,7 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		if fwd.FireAndForget {
 			return nil
 		}
-		e.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
+		e.publishActivity(ctx, events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
 			e.generateMessageID(),
 			fwd.CorrelationID,
@@ -743,7 +743,7 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		ProcessingTime:      time.Since(startTime),
 		Data:                respData,
 	}
-	e.publishActivity(events.EventTypeSuccess, "Implementation task completed")
+	e.publishActivity(ctx, events.EventTypeSuccess, "Implementation task completed")
 
 	respMsg := guide.NewResponseMessage(e.generateMessageID(), resp)
 	if e.agentPod != nil {
@@ -1044,13 +1044,20 @@ func (e *Engineer) setStatus(status AgentStatus) {
 }
 
 // publishActivity emits a user-visible activity event so the UI agent panel
-// tracks this engineer's lifecycle.
-func (e *Engineer) publishActivity(eventType events.EventType, content string) {
+// tracks this engineer's lifecycle. ctx carries the engineer's stream
+// correlation and the parent correlation (orchestrator dispatch,
+// pipeline challenger) so the UI keeps the parent's thinking indicator
+// alive while the engineer runs.
+func (e *Engineer) publishActivity(ctx context.Context, eventType events.EventType, content string) {
 	if e.activityPub == nil {
 		return
 	}
 	evt := events.NewActivityEvent(eventType, e.config.SessionID, content)
 	evt.AgentID = e.id
+	if stream, ok := shared.StreamMetadataFromContext(ctx); ok {
+		evt.CorrelationID = strings.TrimSpace(stream.CorrelationID)
+	}
+	evt.ParentCorrelationID = shared.ParentCorrelationIDFromContext(ctx)
 	evt.Visibility = events.VisibilityUser
 	evt.Data["agent_type"] = "engineer"
 	evt.Data["agent_name"] = "Engineer"

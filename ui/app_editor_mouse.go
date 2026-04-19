@@ -1686,6 +1686,7 @@ var appMouseHandlers = []appMouseHandler{
 	(*AppModel).handleCommitTreeHoverMouse,
 	(*AppModel).handleSelectorHoverMouse,
 	(*AppModel).handleCommandApprovalMouse,
+	(*AppModel).handlePlanApprovalMouse,
 	(*AppModel).handleLayerDecisionMouse,
 	(*AppModel).handleInputWheelMouse,
 	(*AppModel).handleMouseButtonMouse,
@@ -1959,6 +1960,49 @@ func (m *AppModel) commandApprovalOptionAt(contentX, contentY int) (int, bool) {
 	}
 	layout := m.commandApprovalLayout(max(m.width-2, 1))
 	return layout.optionAt(contentX, contentY)
+}
+
+// handlePlanApprovalMouse mirrors handleCommandApprovalMouse for the
+// plan-acceptance dialog: hover changes the highlighted option, left-
+// click activates it (which fires the verdict commit through the
+// 75ms tick → PlanApprovalCommitMsg → commitPlanApproval flow).
+//
+// Returns handled=true when the dialog is up and the click lands in
+// the input panel, so terminal mouse events never leak through to
+// the chat input field.
+func (m *AppModel) handlePlanApprovalMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if m.planApproval == nil {
+		return nil, false
+	}
+	inputTop := m.height - m.prevInputH - statusBarHeight
+	if mouse.Y < inputTop || mouse.Y >= inputTop+m.prevInputH {
+		return nil, false
+	}
+	contentX := mouse.X - 1
+	contentY := mouse.Y - inputTop - 1
+	if contentX < 0 {
+		return nil, true
+	}
+	layout := m.planApprovalLayout(max(m.width-2, 1))
+	switch mouse.Action {
+	case tea.MouseActionMotion:
+		if idx, ok := layout.optionAt(contentX, contentY); ok {
+			m.planApproval.selected = idx
+			m.planApproval.activated = -1
+			m.markSlotDirty(compositor.SlotInput)
+			m.viewDirty = true
+		}
+		return nil, true
+	case tea.MouseActionPress:
+		if mouse.Button == tea.MouseButtonLeft {
+			if idx, ok := layout.optionAt(contentX, contentY); ok {
+				return m.activatePlanApprovalOption(idx), true
+			}
+		}
+		return nil, true
+	default:
+		return nil, true
+	}
 }
 
 func (m *AppModel) handleLayerDecisionMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {

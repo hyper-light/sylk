@@ -2276,6 +2276,26 @@ func (o *Orchestrator) handlePipelineUpdate(msg *guide.Message) error {
 		}
 	}
 
+	// Open a supervisor activity session for this pipeline update so the
+	// UI bridge can render "orchestrator — processing pipeline update"
+	// during the otherwise-silent window between an agent's stream complete
+	// and the next agent's stream start. The session is scoped to the
+	// handler and closed (via `complete` state) once dispatch is decided.
+	ctx := o.supervisorCtx(update)
+	session := shared.ActivitySessionFromContext(ctx)
+	terminal := isTerminalStatus(update.Status)
+	if terminal && session != nil {
+		// Narrate receipt of the agent's terminal update.
+		detail := fmt.Sprintf("processing %s result for %s", strings.TrimSpace(update.AgentType), strings.TrimSpace(update.TaskID))
+		if err := shared.PublishAgentState(o.bus, o.channels, ctx, o.config.AgentID, "orchestrator",
+			guide.AgentStateReasoning, detail, nil); err != nil {
+			o.logWarnMsg("orchestrator_supervisor_processing_state_publish_failed",
+				"task_id", update.TaskID,
+				"agent_type", update.AgentType,
+				"error", err.Error())
+		}
+	}
+
 	entry := TaskUpdateEntry{
 		ID:        msg.ID,
 		DAGID:     update.DAGID,
@@ -2304,12 +2324,24 @@ func (o *Orchestrator) handlePipelineUpdate(msg *guide.Message) error {
 		}
 	}
 
-	if isTerminalStatus(update.Status) {
-		deferNodeCompletion := o.finalizePipelineUpdate(update)
+	if terminal {
+		deferNodeCompletion := o.finalizePipelineUpdateCtx(ctx, update)
 		if !deferNodeCompletion {
 			result := convertPipelineToNodeResult(update)
 			o.dagBridge.NotifyNodeComplete(update.NodeID, result)
 			o.releaseAcceptedPipelineResources(update)
+		}
+		// Close the supervisor session. The actual dispatch of next work
+		// (if any) publishes `dispatching_to_peer` on its own branch
+		// before we land here; this terminal keeps the bridge row from
+		// lingering after the supervisor finished its part.
+		if session != nil {
+			if err := shared.PublishAgentState(o.bus, o.channels, ctx, o.config.AgentID, "orchestrator",
+				guide.AgentStateComplete, "", nil); err != nil {
+				o.logWarnMsg("orchestrator_supervisor_complete_state_publish_failed",
+					"task_id", update.TaskID,
+					"error", err.Error())
+			}
 		}
 	}
 
@@ -2321,6 +2353,35 @@ func (o *Orchestrator) handlePipelineUpdate(msg *guide.Message) error {
 	})
 
 	return nil
+}
+
+// supervisorCtx returns a context carrying an ActivitySession scoped to
+// this pipeline update's supervisor work. The session id is derived from
+// the pipeline + task so concurrent pipelines get distinct sessions (the
+// bridge then renders one row per concurrent pipeline). LogMeta is
+// attached so state publishes that log on failure have agent/session
+// identity.
+func (o *Orchestrator) supervisorCtx(update *PipelineUpdate) context.Context {
+	ctx := context.Background()
+	if o != nil && o.runCtx != nil {
+		ctx = o.runCtx
+	}
+	session := shared.NewActivitySession(shared.ActivitySession{
+		ID:             "pipe_sup_" + strings.TrimSpace(update.DAGID) + "_" + strings.TrimSpace(update.TaskID),
+		OwnerAgentType: "orchestrator",
+		OwnerAgentID:   o.config.AgentID,
+		SessionID:      o.config.SessionID,
+		PipelineID:     strings.TrimSpace(update.TaskID),
+		CorrelationID:  "pipe_sup_" + strings.TrimSpace(update.TaskID),
+	})
+	ctx = shared.WithActivitySession(ctx, session)
+	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
+		EventLogger: o.steering.EventLogger(),
+		AgentID:     o.config.AgentID,
+		SessionID:   o.config.SessionID,
+		CorrID:      session.CorrelationID,
+	})
+	return ctx
 }
 
 func (o *Orchestrator) releaseAcceptedPipelineResources(update *PipelineUpdate) {

@@ -17,11 +17,27 @@ import (
 )
 
 // MemoryForestService captures the forest methods agents use directly.
+//
+// MEM-01/MEM-02: the Project* methods expose family-typed views so
+// agents can pull the slice of the forest they actually need before
+// they hit the LLM, rather than having the LLM call generic Retrieve
+// and cross-filter during its tool loop. ProjectionInput mirrors
+// ResolveIntentInput; see core/forest/projections.go for the bucket
+// partitioning rules each method applies.
 type MemoryForestService interface {
 	ResolveIntent(ctx context.Context, input forest.ResolveIntentInput) (*forest.IntentResolution, error)
 	Retrieve(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
 	PredictNextBranches(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
 	RecordOutcome(ctx context.Context, record forest.OutcomeRecord) error
+
+	ProjectIntent(ctx context.Context, input forest.ProjectionInput) (*forest.IntentProjection, error)
+	ProjectConstraints(ctx context.Context, input forest.ProjectionInput) (*forest.ConstraintProjection, error)
+	ProjectEvidence(ctx context.Context, input forest.ProjectionInput) (*forest.EvidenceProjection, error)
+	ProjectDecisions(ctx context.Context, input forest.ProjectionInput) (*forest.DecisionProjection, error)
+	ProjectOutcomes(ctx context.Context, input forest.ProjectionInput) (*forest.OutcomeProjection, error)
+	ProjectPreferences(ctx context.Context, input forest.ProjectionInput) (*forest.PreferenceProjection, error)
+	ProjectCapabilities(ctx context.Context, input forest.ProjectionInput) (*forest.CapabilityProjection, error)
+	ProjectOpportunities(ctx context.Context, input forest.ProjectionInput) (*forest.OpportunityProjection, error)
 }
 
 type ForestOutcomeClassification struct {

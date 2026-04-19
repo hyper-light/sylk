@@ -110,6 +110,38 @@ func (s *Store) UpdateDAGProgress(dagID string, currentLayer, succeeded, failed,
 	return nil
 }
 
+// GetDAGExecutionsByPlan returns all DAG executions tied to a plan_id,
+// newest first. The architect's plan-state query reads this to answer
+// "is the orchestrator currently executing the plan?" — there can be
+// multiple historical DAG rows per plan (re-dispatches across resumes
+// or retries) so the caller picks the most recent active row when
+// determining current state.
+func (s *Store) GetDAGExecutionsByPlan(planID string) ([]*DAGExecutionRow, error) {
+	const q = `SELECT id, plan_id, session_id, name, state, policy_json, dag_json,
+		current_layer, total_layers, nodes_total, nodes_succeeded, nodes_failed, nodes_skipped,
+		COALESCE(error, ''), created_at, started_at, completed_at
+		FROM dag_executions WHERE plan_id = ? ORDER BY created_at DESC`
+	rows, err := s.db.Query(q, planID)
+	if err != nil {
+		return nil, fmt.Errorf("get dag executions by plan: %w", err)
+	}
+	defer rows.Close()
+	var out []*DAGExecutionRow
+	for rows.Next() {
+		row := &DAGExecutionRow{}
+		if err := rows.Scan(
+			&row.ID, &row.PlanID, &row.SessionID, &row.Name, &row.State,
+			&row.PolicyJSON, &row.DAGJSON, &row.CurrentLayer, &row.TotalLayers,
+			&row.NodesTotal, &row.NodesSucceeded, &row.NodesFailed, &row.NodesSkipped,
+			&row.Error, &row.CreatedAt, &row.StartedAt, &row.CompletedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan dag execution: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
 // GetDAGExecution retrieves a DAG execution by ID.
 func (s *Store) GetDAGExecution(dagID string) (*DAGExecutionRow, error) {
 	const q = `SELECT id, plan_id, session_id, name, state, policy_json, dag_json,

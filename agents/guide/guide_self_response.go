@@ -460,6 +460,12 @@ func (r *GuideResponder) applyToolCallsTracked(
 			Duration:    time.Since(start),
 			Success:     !isError,
 		})
+		// NOTE: Activity Fabric ambient_context envelope deferred for the
+		// guide self-response loop due to the agents/shared ↔ agents/guide
+		// import cycle (shared/ack.go imports guide). Importing
+		// shared.AppendAmbientContext here would re-introduce the cycle.
+		// When the awareness helpers are moved out of agents/shared (or
+		// shared/ack.go is moved out), call AppendAmbientContext here.
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,

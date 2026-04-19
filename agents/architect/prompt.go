@@ -16,15 +16,19 @@ var (
 	ArchitectSystemSkillsPrompt     = prompts.MustLoad("architect", "system_skills")
 	ArchitectConversationPrompt     = prompts.MustLoad("architect", "conversation")
 	ArchitectFabricAwareness        = prompts.MustLoad("shared", "fabric_awareness")
-	DefaultSystemPrompt             = strings.Join([]string{
+	// IMPORTANT ORDERING: ArchitectFabricAwareness comes RIGHT
+	// AFTER core identity, BEFORE protocol/skills. The screenshot
+	// review showed the LLM follows the workflow it reads first;
+	// fabric must be framing, not a footer.
+	DefaultSystemPrompt = strings.Join([]string{
 		ArchitectSystemCorePrompt,
+		ArchitectFabricAwareness,
 		ArchitectSystemProtocolPrompt,
 		ArchitectSystemConsultPrompt,
 		ArchitectSystemDelegationPrompt,
 		ArchitectSystemOutputPrompt,
 		ArchitectSystemGuardrailsPrompt,
 		ArchitectSystemSkillsPrompt,
-		ArchitectFabricAwareness,
 	}, "\n\n---\n\n")
 	RequirementsAnalysisPrompt = prompts.MustLoad("architect", "requirements")
 	ArchitectureDesignPrompt   = prompts.MustLoad("architect", "design")
@@ -67,13 +71,13 @@ func plannerPromptModules(stage string) []string {
 	default:
 		return []string{
 			ArchitectSystemCorePrompt,
+			ArchitectFabricAwareness, // promoted ahead of workflow
 			ArchitectSystemProtocolPrompt,
 			ArchitectSystemConsultPrompt,
 			ArchitectSystemDelegationPrompt,
 			ArchitectSystemOutputPrompt,
 			ArchitectSystemGuardrailsPrompt,
 			ArchitectSystemSkillsPrompt,
-			ArchitectFabricAwareness,
 		}
 	}
 }

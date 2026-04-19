@@ -102,6 +102,10 @@ func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPack
 	if err != nil {
 		return nil, err
 	}
+	relayCofire, err := m.loadRelayCofire(ctx, branchIDs)
+	if err != nil {
+		return nil, err
+	}
 	depths := computeBranchDepths(branches)
 
 	canopyRoots := make(map[string]struct{}, len(canopy.RootIDs))
@@ -178,6 +182,7 @@ func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPack
 			packets[i].CounterEvidence,
 			scores[i].Base,
 			relayMass[packetBranches[i].ID],
+			relayCofire[packetBranches[i].ID],
 			depths[packetBranches[i].ID],
 			retrievalSubstrateSignal(packetBranches[i], structuralSubstrate[packetBranches[i].ID], queryScores[packetBranches[i].ID], canopyRoots),
 		)

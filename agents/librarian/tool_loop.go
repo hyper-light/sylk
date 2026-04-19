@@ -147,6 +147,14 @@ func (l *Librarian) applyToolCalls(
 			searchLedger.Record(turn, call.Name, call.Arguments, result)
 		}
 
+		// Activity Fabric ambient_context envelope.
+		result = shared.AppendAmbientContext(ctx, shared.AmbientEnvelopeConfig{
+			SessionID:  func() string { return l.config.SessionID },
+			AgentID:    func() string { return l.id },
+			AgentType:  func() string { return "librarian" },
+			PipelineID: func() string { return "" },
+		}, result)
+
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,

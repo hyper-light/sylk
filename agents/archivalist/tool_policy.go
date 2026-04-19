@@ -26,10 +26,9 @@ func archivalistVisibleSkillNames() []string {
 }
 
 func archivalistVisibleSkillNamesForRegistry(registry *skills.Registry) []string {
-	return shared.FilterRegisteredSkillNames(
-		registry,
-		shared.AppendMemoryForestVisibleSkillNames(archivalistVisibleSkillNames(), "archivalist"),
-	)
+	withForest := shared.AppendMemoryForestVisibleSkillNames(archivalistVisibleSkillNames(), "archivalist")
+	withFabric := shared.AppendFabricAwarenessSkillNames(withForest)
+	return shared.FilterRegisteredSkillNames(registry, withFabric)
 }
 
 func archivalistMutatingSkillNames() []string {

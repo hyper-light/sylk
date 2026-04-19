@@ -29,8 +29,8 @@ func EmitDispatchACK(bus guide.EventBus, metadata map[string]any, agentID, agent
 		CorrelationID: correlationID,
 		Payload: map[string]any{
 			"responding_agent_id": agentID,
-			"agent_type":         agentType,
-			"acked_at":           time.Now(),
+			"agent_type":          agentType,
+			"acked_at":            time.Now(),
 		},
 		Timestamp: time.Now(),
 	}

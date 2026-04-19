@@ -39,8 +39,10 @@ func architectToolManifestForRegistry(registry *skills.Registry) *toolruntime.Po
 		toolruntime.NewToolPolicy("validate_pre_delegation", toolruntime.EffectReadOnly, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("monitor_execution", toolruntime.EffectReadOnly, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("validate_work", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("query_global_review_state", toolruntime.EffectReadOnly, toolruntime.DomainControl, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("route_plan_acceptance", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("handle_plan_acceptance_result", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("present_plan_approval_dialog", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("ask_user_question", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("route_requirements_research", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("read_research_paper", toolruntime.EffectReadOnly, toolruntime.DomainKnowledge, toolruntime.ExecutionModeLocal),
@@ -49,6 +51,7 @@ func architectToolManifestForRegistry(registry *skills.Registry) *toolruntime.Po
 		toolruntime.NewToolPolicy(toolruntime.SearchToolName, toolruntime.EffectReadOnly, toolruntime.DomainDiscovery, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault(), toolruntime.WithSearchable(false)),
 	}
 	policies = shared.AppendMemoryForestToolPolicies(policies, registry, "architect")
+	policies = shared.AppendFabricAwarenessToolPolicies(policies, registry)
 	return toolruntime.ApplyAuthorityProfile("architect", toolruntime.NewManifest("architect", "architect.default", policies...))
 }
 

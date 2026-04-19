@@ -12,6 +12,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/commandapproval"
+	"github.com/adalundhe/sylk/core/planapproval"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/detect"
@@ -368,6 +369,20 @@ type commandApprovalState struct {
 	returnInput bool
 }
 
+// planApprovalState is the AppModel-side state for the plan acceptance
+// dialog. Mirrors commandApprovalState's shape so the same render +
+// input-handling primitives can be reused with minimal duplication.
+// Three options (Approve / Modify / Reject) instead of the four-button
+// command-approval set; planScroll tracks the user's position when the
+// plan markdown exceeds the visible area.
+type planApprovalState struct {
+	proposal    *planapproval.Proposal
+	selected    int
+	activated   int
+	returnFocus component.FocusID
+	returnInput bool
+}
+
 type layerDecisionState struct {
 	request     *msg.LayerDecisionMsg
 	selected    int
@@ -410,6 +425,17 @@ var layerDecisionOptions = []commandApprovalOption{
 	{label: "Retry Layer", hint: "rerun failed nodes", decision: "retry"},
 	{label: "Skip Layer", hint: "continue past failures", decision: "skip"},
 	{label: "Abort DAG", hint: "cancel this workflow", decision: "abort"},
+}
+
+// planApprovalOptions is the three-button option set for the plan
+// acceptance dialog. Per the agentic design (skill code is mechanism,
+// not policy), the dialog produces an explicit verdict the architect
+// can act on directly — no Guide-classifier interpretation of
+// free-form text. Reject is also the cancel verb (no separate dismiss).
+var planApprovalOptions = []commandApprovalOption{
+	{label: "Approve", hint: "launch the plan", decision: "approve"},
+	{label: "Modify", hint: "ask for changes", decision: "modify"},
+	{label: "Reject", hint: "scrap, choose different direction", decision: "reject"},
 }
 
 // AppModel is the root Bubble Tea model that composes all TUI components.
@@ -619,6 +645,8 @@ type AppModel struct {
 	pendingClosePrompt bool
 	commandApproval    *commandApprovalState
 	commandApprovalQ   []*commandapproval.Proposal
+	planApproval       *planApprovalState
+	planApprovalQ      []*planapproval.Proposal
 	layerDecision      *layerDecisionState
 	layerDecisionQ     []*msg.LayerDecisionMsg
 	// pendingPaneClose is non-zero when the save prompt is for a pane close
@@ -2046,6 +2074,17 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 		m.resolveCommandApproval()
 		return nil
 	}),
+	reflect.TypeFor[msg.PlanApprovalRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.PlanApprovalRequestMsg) tea.Cmd {
+		m.handlePlanApprovalRequest(typed)
+		return nil
+	}),
+	reflect.TypeFor[msg.PlanApprovalCommitMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.PlanApprovalCommitMsg) tea.Cmd {
+		return m.commitPlanApproval(typed)
+	}),
+	reflect.TypeFor[msg.PlanApprovalResolvedMsg](): appMsgCmdRoute(func(m *AppModel, _ msg.PlanApprovalResolvedMsg) tea.Cmd {
+		m.resolvePlanApproval()
+		return nil
+	}),
 	reflect.TypeFor[msg.LayerDecisionMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.LayerDecisionMsg) tea.Cmd {
 		m.handleLayerDecisionRequest(typed)
 		return nil
@@ -2563,6 +2602,12 @@ var appKeyDispatchRoutes = []appKeyDispatchRoute{
 		},
 	),
 	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, _ string) bool { return m.planApproval != nil },
+		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			return m.handlePlanApprovalKey(key)
+		},
+	),
+	keyPredicateRoute(
 		func(m *AppModel, _ tea.KeyMsg, _ string) bool { return m.layerDecision != nil },
 		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
 			return m.handleLayerDecisionKey(key)
@@ -2800,6 +2845,20 @@ var appKeyDispatchRoutes = []appKeyDispatchRoute{
 		m.toggleFieldManual()
 		return m, nil
 	}),
+	// UI-06: `?` is the conventional help key. Routes to the field
+	// manual only when the editor is NOT focused — inside a vim-mode
+	// editor, `?` performs a reverse search and must not be
+	// intercepted. The AUDIT spec calls for `?`; this predicate
+	// coexists with Alt+H so both entry points work.
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return shouldRouteHelpKey(ks, m.viewMode == ViewEdit, m.isEditorFocused())
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			m.toggleFieldManual()
+			return m, nil
+		},
+	),
 	keyPredicateRoute(
 		func(m *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "esc" && m.overlay == overlayNone },
 		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {

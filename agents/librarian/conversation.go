@@ -29,6 +29,11 @@ func (l *Librarian) processForwardedRequest(ctx context.Context, fwd *guide.Forw
 func (l *Librarian) processViaLLM(ctx context.Context, fwd *guide.ForwardedRequest, bundle *librarianToolBundle) (any, error) {
 	llmReq := l.buildLLMRequestWithBundle(fwd, bundle)
 
+	// MEM-01: preload family-typed forest projections into the system
+	// prompt before the tool loop starts. Best-effort: a preload error
+	// degrades silently; memory is assist, not gate.
+	l.injectForestPreload(ctx, llmReq, fwd)
+
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
@@ -46,8 +51,29 @@ func (l *Librarian) processViaLLM(ctx context.Context, fwd *guide.ForwardedReque
 		return nil, fmt.Errorf("librarian: generated empty response for query %q", fwd.Input)
 	}
 
-	return shared.DecodeConsultResponsePayloadFromLLM(result), nil
+	payload := shared.DecodeConsultResponsePayloadFromLLM(result)
+	if payload != nil {
+		payload.FreshnessHorizon = librarianConsultFreshnessHorizon
+	}
+	return payload, nil
 }
+
+// librarianConsultFreshnessHorizon is the validity window the
+// librarian commits for cached re-use of its consultation answers.
+// Derived from the librarian's data domain: librarian answers are
+// grounded in workspace state (file existence, package layouts,
+// import graphs). Workspace files can change at developer typing
+// cadence, so this horizon is set short enough that an answer
+// drafted before a meaningful edit doesn't get re-served stale,
+// long enough that rapid back-to-back consults during a single
+// reasoning pass benefit from cache reuse. 15 minutes matches the
+// dev-tempo "active edit window" — the time scale over which an
+// engineer typically completes a focused change before pausing.
+//
+// The architect's session cache uses this value as the upper bound
+// on cache validity for librarian responses; entries past their
+// StoredAt + horizon force a fresh consult.
+const librarianConsultFreshnessHorizon = 15 * time.Minute
 
 // buildLLMRequest constructs a providers.Request for the tool loop.
 func (l *Librarian) buildLLMRequest(fwd *guide.ForwardedRequest) *providers.Request {
@@ -69,6 +95,28 @@ func (l *Librarian) buildLLMRequestWithBundle(fwd *guide.ForwardedRequest, bundl
 	}
 	l.applyConversationRuntimeProfile(req, fwd.SessionID)
 	return req
+}
+
+// injectForestPreload pulls librarian-lane projections and prepends
+// the rendered block to the existing system prompt. See
+// agents/shared/forest_preload.go for the family selection rationale.
+func (l *Librarian) injectForestPreload(ctx context.Context, req *providers.Request, fwd *guide.ForwardedRequest) {
+	if req == nil || fwd == nil || l.config.Forest == nil {
+		return
+	}
+	preload, err := shared.PreloadFor(ctx, l.config.Forest, shared.ForestPreloadInput{
+		AgentType: "librarian",
+		Query:     fwd.Input,
+		SessionID: fwd.SessionID,
+	})
+	if err != nil || preload == nil {
+		return
+	}
+	rendered := preload.Render()
+	if rendered == "" {
+		return
+	}
+	req.SystemPrompt = rendered + "\n\n---\n\n" + req.SystemPrompt
 }
 
 // processViaIntentDispatch is the legacy path that routes by intent without LLM.

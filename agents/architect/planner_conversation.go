@@ -38,6 +38,15 @@ type plannerConversationRequest struct {
 	FirstTask               string                   `json:"first_task,omitempty"`
 	PlanSummary             string                   `json:"plan_summary,omitempty"`
 	ApprovalRequired        bool                     `json:"approval_required,omitempty"`
+	// FreshnessSummary, DriftSignals, OrchestratorStateHint surface
+	// the freshness audit's findings to the LLM so it can include them
+	// in the narrative response. Populated by the architect's compose
+	// path before the LLM runs; the dialog itself shows only buttons,
+	// so the chat narrative is the only place this information lives.
+	FreshnessSummary       string   `json:"freshness_summary,omitempty"`
+	FreshnessDriftSignals  []string `json:"freshness_drift_signals,omitempty"`
+	OrchestratorStateHint  string   `json:"orchestrator_state_hint,omitempty"`
+	FreshnessRecommendation string  `json:"freshness_recommendation,omitempty"`
 	RecentContextSummary    string                   `json:"recent_context_summary,omitempty"`
 	RecentContextFocus      []string                 `json:"recent_context_focus,omitempty"`
 	SessionID               string                   `json:"session_id,omitempty"`
@@ -193,6 +202,7 @@ func (a *Architect) composeUserFacingResponseWithTools(
 		Tools:        tools,
 	}
 	a.applyConversationRuntimeProfile(req, mode, request.SessionID)
+	a.injectForestPreload(ctx, req, request.UserQuery, request.SessionID)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	text, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
@@ -335,38 +345,43 @@ func normalizePlannerConversationList(values []string) []string {
 func plannerConversationModeInstructions(mode plannerConversationMode) string {
 	switch mode {
 	case plannerConversationModeReady:
-		return `Write the next user-facing response.
+		return `Write the next user-facing response for a Ready plan.
+
+The system has already published an Approve / Modify / Reject dialog in the
+input panel — you do NOT need to invoke any acceptance tool yourself. Your
+job is the narrative summary that accompanies the dialog.
 
 Requirements:
 - Sound like a principal engineer, not a workflow bot.
 - Summarize the plan in plain language and include why it is a good default.
 - Mention one critical tradeoff or risk the user should validate.
-- Check the "approval_required" field in the context JSON:
-  - If true: ask the user whether to refine or proceed. End by inviting the user
-    to approve or request changes. Use your own natural phrasing — do NOT use a
-    scripted template or repeat the same wording each time.
-    Make it explicit that they are reviewing the plan, not starting implementation
-    in this turn.
-    Do NOT imply that work is already beginning or will begin immediately if they
-    reply. Avoid phrases like "kick it off", "start building", "start implementing",
-    "get started", or "ship it".
-    Do NOT use robotic phrasing like "Do you approve this plan?" or "Please confirm."
-    Do NOT automatically invoke route_plan_acceptance, you must receive a response from
-    the user.
-  - If false: invoke route_plan_acceptance immediately with the plan details.
-    Do not ask for approval.
-  - Do not use canned lead-ins or protocol labels.`
+- Do NOT ask the user to "approve in chat" or "type yes" — the dialog buttons
+  ARE the decision mechanism. Trust them; let the buttons speak for themselves.
+- Do NOT imply that work is already beginning. Avoid phrases like "kick it
+  off", "start building", "start implementing", "get started", or "ship it".
+- Do NOT invoke route_plan_acceptance — the dialog routes the verdict directly.
+- Do not use canned lead-ins or protocol labels.
+
+When approval_required is false (auto-approve), still skip route_plan_acceptance
+here; the system handles acceptance automatically in that mode.`
 	case plannerConversationModeExistingReady:
 		return `The user has a previously prepared ready plan available. The plan_id, prior_query, and plan summary are in the context JSON.
 
-If the user's message clearly accepts or resumes that ready plan (for example "go ahead", "resume it", "ship it", or "use the previous plan"):
-1. Invoke route_plan_acceptance with the plan_id from the context JSON and the user's verbatim response.
-2. After invoking route_plan_acceptance, STOP. Do not write a text reply first.
+The system automatically publishes an Approve / Modify / Reject dialog
+whenever a Ready plan is being presented — including this one. Drift signals
+and execution-state hints from the freshness audit appear in the dialog body.
+You do NOT need to invoke any acceptance tool yourself; just write the
+narrative that surrounds the dialog.
+
+If the user's message clearly accepts or resumes that ready plan (for example
+"go ahead", "resume it", "ship it", or "use the previous plan"):
+- Acknowledge briefly. Trust the dialog buttons; do NOT invoke
+  route_plan_acceptance.
 
 If the user is asking what the earlier plan covered, why it was structured this way, or whether it is still a good idea:
 - Answer naturally using the recovered plan context.
 - Call out one meaningful risk or stale assumption if it matters.
-- Only suggest resume, revise, or start fresh when it is actually helpful.
+- Trust the dialog to handle the verdict — do not ask the user to "type yes".
 
 If the user wants changes or a fresh direction:
 - Explain whether the existing plan can be revised cleanly or whether a new plan is the better move.
@@ -409,9 +424,13 @@ Planning flow:
 2. After start_planning returns, it gives you a plan_id and protocol instructions. Follow those
    instructions: invoke plan(analyze), consult(pre_planning), plan(design), plan(generate_tasks)
    in order, passing the plan_id to each.
-3. After generate_tasks completes, the system renders the plan structure separately in the UI —
-   the user already sees it. Do NOT repeat, re-render, or include the plan structure, task list,
-   acceptance criteria, file lists, or implementation guides in your text.
+3. After generate_tasks completes, the plan reaches Ready and the system
+   automatically publishes the Approve / Modify / Reject dialog. The system
+   also renders the plan structure separately in the UI — the user already
+   sees it. Do NOT repeat, re-render, or include the plan structure, task
+   list, acceptance criteria, file lists, or implementation guides in your
+   text. Do NOT invoke route_plan_acceptance — wait for the user's click on
+   the dialog buttons.
    Write ONLY a brief assessment (2-4 sentences):
    - Highlight one critical tradeoff or risk.
    - Sound like a principal engineer, not a workflow bot.
@@ -457,37 +476,40 @@ Requirements:
 - Keep a natural, collaborative tone.
 - Do not use canned lead-ins or boilerplate.`
 	case plannerConversationModeFeedback:
-		return `The user is responding to a plan you presented. The plan_id and plan summary are in the context JSON.
+		return `The user is responding to a plan you previously presented. The
+plan_id and plan summary are in the context JSON, along with freshness audit
+findings (freshness_summary, freshness_drift_signals, orchestrator_state_hint,
+freshness_recommendation) when present.
 
-CRITICAL — Approval check:
-If the user's response signals acceptance (e.g., "yes", "yep", "looks good", "go ahead", "do it",
-"approved", "ship it", or similar affirmative):
-1. Invoke route_plan_acceptance with the plan_id from the context JSON and the user's verbatim
-   response as user_response. Do NOT write a text reply first — invoke the tool immediately.
-2. After invoking route_plan_acceptance, STOP. The acceptance evaluation and any follow-on
-   orchestrator handoff resume asynchronously — do not wait in the current turn for a verdict.
+The system has automatically published the Approve / Modify / Reject dialog
+in the input panel. Your job is the chat narrative that surrounds it; do NOT
+invoke route_plan_acceptance and do NOT ask the user to "type yes" — the
+dialog handles their verdict.
 
-If the user is requesting MODIFICATIONS (e.g., "swap steps 2 and 3", "add error handling",
-"change the agent type for task 2"):
-- Do NOT invoke route_plan_acceptance for modification requests.
-- Acknowledge the specific changes they want.
-- Reason through the impact on dependencies, ordering, and acceptance criteria.
-- Describe exactly what will change and why the modified plan is sound.
-- Re-present the updated plan summary (tasks, ordering, key changes) so the user can review.
-- End by inviting the user to approve the revised plan or request further changes.
+If the freshness audit fields are populated:
+- Surface freshness_summary as your opening line ("Re-checking the plan: ...").
+- Quote each entry in freshness_drift_signals as a bullet so the user sees
+  what changed since the plan was drafted ("- [WARNING] auth.go no longer
+  exists ...").
+- If orchestrator_state_hint is non-empty, mention it in plain language so
+  the user knows what state the orchestration is in ("The orchestrator
+  reports this plan is already running (3/8 nodes done).").
+- If freshness_recommendation is "revise" or "replan", say so plainly —
+  the user should know the audit thinks this plan needs work, not just
+  re-approval.
 
-If the user is asking QUESTIONS (e.g., "why did you choose X?", "what about Y?",
-"how does task 3 handle Z?"):
-- Do NOT invoke route_plan_acceptance for questions.
-- Answer concisely with architectural reasoning — be opinionated and specific.
-- If the answer reveals a gap in the plan, note what you would adjust.
-- Re-present the plan summary only if the answer changes the plan.
-- End by inviting the user to approve or continue discussing.
+For any other response (questions about the plan, requests for clarification,
+modification suggestions, or general acknowledgement):
+- Answer naturally and substantively.
+- If the user is asking about the plan structure, focus on what's relevant.
+- If the user wants modifications, describe what would change and why; do
+  NOT invoke route_plan_acceptance.
 
-General rules for non-approval responses:
+General rules:
 - Maintain a collaborative tone — the plan is a proposal, not a decree.
-- Do not dump the full plan structure — focus on what is relevant to their feedback.
-- Use natural phrasing, not templates.`
+- Do not dump the full plan structure — the dialog is the decision surface,
+  the chat is the explanation surface.
+- Do not use canned lead-ins or boilerplate.`
 	default:
 		return `Write the next user-facing response.
 
@@ -622,20 +644,24 @@ var planningConversationTools = []string{
 	"route_requirements_research",
 	"start_planning",
 	"plan",
-	"route_plan_acceptance",
 }
 
 // toolsForConversationMode returns the allowed tool names for a given mode.
 // Conversation modes that can enter or resume planning must include the tools
-// needed to finish the planning protocol in the same turn after start_planning
-// or a recovered ready-plan acceptance decision. Feedback/ready modes restrict
-// to acceptance tools.
+// needed to finish the planning protocol in the same turn after start_planning.
+// Feedback/ready modes restrict to chat-only tools.
+//
+// Note: route_plan_acceptance and present_plan_approval_dialog are
+// intentionally NOT in any whitelist. The dialog publish is unconditional in
+// feedbackReadyDirective so the LLM can't bypass it, and the verdict routes
+// from Guardian → architect continuation directly. Exposing those tools to
+// the LLM would let it auto-dispatch the plan ahead of the user's click.
 func toolsForConversationMode(mode plannerConversationMode) []string {
 	switch mode {
 	case plannerConversationModeConverse, plannerConversationModeExistingReady, plannerConversationModeClarification:
 		return planningConversationTools
 	case plannerConversationModeFeedback, plannerConversationModeReady:
-		return []string{"route_plan_acceptance", "ask_user_question", "recall_recent"}
+		return []string{"ask_user_question", "recall_recent"}
 	default:
 		return planningConversationTools
 	}

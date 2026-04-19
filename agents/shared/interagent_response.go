@@ -3,6 +3,7 @@ package shared
 import (
 	"encoding/json"
 	"strings"
+	"time"
 )
 
 // ConsultResponsePayload is the canonical typed response shape returned by
@@ -41,6 +42,17 @@ type ConsultResponsePayload struct {
 	// traces, etc.) that don't fit the core fields. Consumers generally
 	// ignore this except for telemetry.
 	Metadata map[string]any `json:"metadata,omitempty"`
+
+	// FreshnessHorizon is the agent-self-reported window over which
+	// this answer remains valid for cached re-use. Required for
+	// SessionConsultationCache eligibility — answers without a horizon
+	// are stored but never served back. Each agent commits a horizon
+	// derived from its own data-volatility characteristics: librarian
+	// (workspace mtime), archivalist (commit cadence), academic
+	// (research half-life). Producers SHOULD set this on every response
+	// they want eligible for cross-turn dedup; consumers SHOULD NOT
+	// guess defaults.
+	FreshnessHorizon time.Duration `json:"freshness_horizon,omitempty"`
 }
 
 // ConsultCitation names a single source the consulted agent referenced.

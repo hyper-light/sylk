@@ -12,6 +12,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/commandapproval"
+	"github.com/adalundhe/sylk/core/planapproval"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/fetch"
@@ -356,6 +357,14 @@ func (b *GuideBridge) dispatch(busMsg *guide.Message, program TeaProgram) {
 	if busMsg == nil {
 		return
 	}
+	// Plan approval proposals are checked BEFORE the generic command
+	// approval decoder because they share the MessageTypeProposal kind
+	// but carry a planapproval.Proposal payload that must not fall
+	// through to the command-approval decoder's lossy json fallback.
+	if proposal, ok := decodePlanApprovalProposal(busMsg); ok {
+		program.Send(msg.PlanApprovalRequestMsg{Proposal: proposal})
+		return
+	}
 	if proposal, ok := decodeCommandApprovalProposal(busMsg); ok {
 		program.Send(msg.CommandApprovalRequestMsg{Proposal: proposal})
 		return
@@ -383,6 +392,47 @@ func (b *GuideBridge) dispatch(busMsg *guide.Message, program TeaProgram) {
 			BranchRef:     parseInterAgentBranchRefFromMetadata(busMsg.Metadata),
 		})
 	}
+}
+
+// decodePlanApprovalProposal extracts a planapproval.Proposal payload
+// from a MessageTypeProposal bus message. Tries typed pointer/value
+// payloads first (fast path for in-process publishers like Guardian)
+// then falls back to JSON decode for cross-process delivery. The
+// proposal's PlanID + CorrelationID + non-empty PlanText are required
+// to consider the decode successful — partial payloads (which would
+// produce a broken dialog) return false so the caller can try the
+// next decoder.
+func decodePlanApprovalProposal(busMsg *guide.Message) (*planapproval.Proposal, bool) {
+	if busMsg == nil || busMsg.Type != guide.MessageTypeProposal || busMsg.Payload == nil {
+		return nil, false
+	}
+	if typed, ok := busMsg.Payload.(*planapproval.Proposal); ok && typed != nil {
+		return validatePlanApprovalProposal(*typed)
+	}
+	if typed, ok := busMsg.Payload.(planapproval.Proposal); ok {
+		return validatePlanApprovalProposal(typed)
+	}
+	raw, err := json.Marshal(busMsg.Payload)
+	if err != nil {
+		return nil, false
+	}
+	var proposal planapproval.Proposal
+	if err := json.Unmarshal(raw, &proposal); err != nil {
+		return nil, false
+	}
+	return validatePlanApprovalProposal(proposal)
+}
+
+// validatePlanApprovalProposal enforces the dialog's minimum
+// content contract (PlanID, CorrelationID, PlanText). A proposal
+// missing any of these would produce an unrenderable dialog; returning
+// false lets the bridge skip it cleanly.
+func validatePlanApprovalProposal(proposal planapproval.Proposal) (*planapproval.Proposal, bool) {
+	if proposal.PlanID == "" || proposal.CorrelationID == "" || proposal.PlanText == "" {
+		return nil, false
+	}
+	out := proposal
+	return &out, true
 }
 
 func decodeCommandApprovalProposal(busMsg *guide.Message) (*commandapproval.Proposal, bool) {
@@ -1642,6 +1692,7 @@ func parseAgentStateMsg(sessionID, correlationID string, stream *guide.StreamRes
 		result.TransitionID = payload.TransitionID
 		result.PeerAgentType = strings.TrimSpace(payload.PeerAgentType)
 		result.PeerCorrelationID = strings.TrimSpace(payload.PeerCorrelationID)
+		result.ParentCorrelationID = strings.TrimSpace(payload.ParentCorrelationID)
 		if agentID := strings.TrimSpace(payload.AgentID); agentID != "" {
 			result.AgentID = agentID
 		}
@@ -1674,6 +1725,9 @@ func parseAgentStateMsg(sessionID, correlationID string, stream *guide.StreamRes
 		}
 		if v, ok := data["peer_correlation_id"].(string); ok {
 			result.PeerCorrelationID = strings.TrimSpace(v)
+		}
+		if v, ok := data["parent_correlation_id"].(string); ok {
+			result.ParentCorrelationID = strings.TrimSpace(v)
 		}
 		if v, ok := data["transition_id"].(float64); ok {
 			result.TransitionID = int64(v)

@@ -257,6 +257,13 @@ type AgentStateEvent struct {
 	// state publishes during a peer-wait, CorrelationID remains the owning
 	// agent's request; PeerCorrelationID references the dispatched work.
 	CorrelationID string `json:"correlation_id,omitempty"`
+	// ParentCorrelationID names the correlation this transition is a
+	// child of — set when an agent publishes state as part of work
+	// dispatched by another agent (e.g., guardian approval during an
+	// engineer turn, pipeline challenge response). The UI uses this to
+	// keep the parent's thinking indicator alive while the child runs.
+	// Empty for top-level requests.
+	ParentCorrelationID string `json:"parent_correlation_id,omitempty"`
 	// TransitionID is a monotonically increasing sequence within a single
 	// correlation id so the UI can order transitions deterministically even
 	// under concurrent delivery.

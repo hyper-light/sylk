@@ -265,6 +265,48 @@ func ensureSchema(db *sql.DB) error {
 		return err
 	}
 
+	if err := ensureForestEventsAppendOnly(db); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ensureForestEventsAppendOnly installs the SQLite trigger that enforces
+// MEM-03: the Soil / Evidence layer of the memory forest is append-only.
+// Every observation persists an immutable audit record; later opinions
+// about that observation are expressed as NEW rows (supersedes /
+// contradicts) rather than in-place edits. An in-place UPDATE would
+// silently rewrite history and break every downstream learner that
+// assumes the WAL is monotonic.
+//
+// The trigger raises an ABORT on any UPDATE attempt, reverting the
+// transaction. DELETEs are also forbidden for the same reason — retention
+// and compaction are handled by archival workflows that move rows to
+// cold storage, not by in-place mutation.
+//
+// The trigger definitions are idempotent via `CREATE TRIGGER IF NOT
+// EXISTS`; re-running ensureSchema on an existing DB is a no-op.
+func ensureForestEventsAppendOnly(db *sql.DB) error {
+	triggers := []string{
+		`CREATE TRIGGER IF NOT EXISTS forest_events_no_update
+			BEFORE UPDATE ON forest_events
+			BEGIN
+				SELECT RAISE(ABORT,
+					'forest_events is append-only (MEM-03); use supersedes/contradicts columns on a new row');
+			END;`,
+		`CREATE TRIGGER IF NOT EXISTS forest_events_no_delete
+			BEFORE DELETE ON forest_events
+			BEGIN
+				SELECT RAISE(ABORT,
+					'forest_events is append-only (MEM-03); archival must go through cold-storage migration, not DELETE');
+			END;`,
+	}
+	for _, stmt := range triggers {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("install forest_events append-only trigger: %w", err)
+		}
+	}
 	return nil
 }
 

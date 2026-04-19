@@ -5,6 +5,8 @@ import (
 	"math"
 	"sort"
 	"strings"
+
+	"github.com/viterin/vek/vek32"
 )
 
 const (
@@ -53,6 +55,14 @@ const (
 	featureSourceLibrarian
 	featureSourceArchivalist
 	featureSourceOther
+	// MEM-04: relay co-fire count as a lifetime-evidence signal. Distinct
+	// from featureRelayMass (which uses decay-sensitive weight, capped at
+	// 2.0) — cofire_count is unbounded monotonic history, so a branch
+	// that has co-fired 50 times over months ranks higher than one that
+	// spiked in the last hour, even if current weights match. Fed through
+	// log1p normalization so a single blockbuster co-fire doesn't
+	// dominate the vector; see loadRelayCofire for the math.
+	featureRelayCofire
 	featureCount
 )
 
@@ -102,6 +112,7 @@ var forestFeatureNames = [...]string{
 	"source_librarian",
 	"source_archivalist",
 	"source_other",
+	"relay_cofire",
 }
 
 func buildFeatureVector(
@@ -112,33 +123,41 @@ func buildFeatureVector(
 	counter []PacketEvidence,
 	baseScore float64,
 	relayMass float64,
+	relayCofire float64,
 	depth int,
 	substrate substrateSignal,
 ) []float32 {
+	// Populate the vector with raw (possibly out-of-range) values, then
+	// apply a single SIMD-accelerated clamp pass at the end. vek32's
+	// MaximumNumber_Inplace and MinimumNumber_Inplace use AVX2 on amd64
+	// and NEON on arm64 (falling back to scalar elsewhere), so a single
+	// end-of-function clamp beats scattering 23 scalar clamp01 calls
+	// across the body — both in cycles and cache-line writes.
 	vector := make([]float32, featureCount)
-	vector[featureQueryMatch] = float32(clamp01(input.QueryMatch))
-	vector[featureEvidence] = float32(clamp01(input.Evidence))
-	vector[featureCanopy] = float32(clamp01(input.Canopy))
-	vector[featureConfidence] = float32(clamp01(input.Confidence))
-	vector[featureRecency] = float32(clamp01(input.Recency))
-	vector[featureWarmth] = float32(clamp01(input.Warmth))
-	vector[featureUtility] = float32(clamp01(input.Utility))
-	vector[featureSalience] = float32(clamp01(input.Salience))
-	vector[featureConflictSafety] = float32(clamp01(input.ConflictSafety))
-	vector[featureScopeSafety] = float32(clamp01(input.ScopeSafety))
-	vector[featureBaseScore] = float32(clamp01(baseScore))
-	vector[featureSupportDensity] = float32(clamp01(float64(len(support)) / 4.0))
-	vector[featureCounterDensity] = float32(clamp01(float64(len(counter)) / 4.0))
+	vector[featureQueryMatch] = float32(input.QueryMatch)
+	vector[featureEvidence] = float32(input.Evidence)
+	vector[featureCanopy] = float32(input.Canopy)
+	vector[featureConfidence] = float32(input.Confidence)
+	vector[featureRecency] = float32(input.Recency)
+	vector[featureWarmth] = float32(input.Warmth)
+	vector[featureUtility] = float32(input.Utility)
+	vector[featureSalience] = float32(input.Salience)
+	vector[featureConflictSafety] = float32(input.ConflictSafety)
+	vector[featureScopeSafety] = float32(input.ScopeSafety)
+	vector[featureBaseScore] = float32(baseScore)
+	vector[featureSupportDensity] = float32(float64(len(support)) / 4.0)
+	vector[featureCounterDensity] = float32(float64(len(counter)) / 4.0)
 	vector[featureSuccessBalance] = float32(successBalance(branch))
 	vector[featureFailurePressure] = float32(failurePressure(branch))
 	vector[featureAccessPressure] = float32(accessPressure(branch))
-	vector[featureRelayMass] = float32(clamp01(relayMass))
+	vector[featureRelayMass] = float32(relayMass)
+	vector[featureRelayCofire] = float32(relayCofire)
 	vector[featureSessionAffinity] = float32(sessionAffinity(query.SessionID, branch.SessionID))
 	vector[featureAgentFamilyAffinity] = float32(agentFamilyAffinity(query.AgentType, branch.Family))
-	vector[featureBranchDepth] = float32(clamp01(float64(depth) / 6.0))
-	vector[featureSubstratePotential] = float32(clamp01(substrate.Potential))
-	vector[featureFrontierScore] = float32(clamp01(substrate.Frontier))
-	vector[featureInhibitionSafety] = float32(clamp01(1 - substrate.Inhibition))
+	vector[featureBranchDepth] = float32(float64(depth) / 6.0)
+	vector[featureSubstratePotential] = float32(substrate.Potential)
+	vector[featureFrontierScore] = float32(substrate.Frontier)
+	vector[featureInhibitionSafety] = float32(1 - substrate.Inhibition)
 
 	switch branch.Scope {
 	case ScopeWorking:
@@ -193,6 +212,16 @@ func buildFeatureVector(
 	default:
 		vector[featureSourceOther] = 1
 	}
+
+	// Single SIMD clamp pass over the whole vector. The flag-style slots
+	// (scope / family / source) already hold values in {0, 1}; the
+	// numeric-input slots may be outside [0, 1] (e.g. substrate signals
+	// can overshoot under unusual inputs). Two vek32 inplace passes on a
+	// 44-float vector fit in a single AVX2 register pair, so the whole
+	// operation is a handful of SIMD instructions vs 23 scalar clamp01
+	// calls that each wrapped two conditional branches.
+	vek32.MaximumNumber_Inplace(vector, 0)
+	vek32.MinimumNumber_Inplace(vector, 1)
 
 	return vector
 }

@@ -1,13 +1,14 @@
 package academic
 
 import (
+	"github.com/adalundhe/sylk/agents/shared"
 	contextskills "github.com/adalundhe/sylk/core/context/skills"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 func academicVisibleSkillNames() []string {
-	return []string{
+	base := []string{
 		"knowledge_query",
 		"consult",
 		"web_search",
@@ -15,6 +16,7 @@ func academicVisibleSkillNames() []string {
 		"web_fetch",
 		"fetch_document",
 	}
+	return shared.AppendFabricAwarenessSkillNames(base)
 }
 
 func academicMutatingSkillNames() []string {

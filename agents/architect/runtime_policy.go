@@ -1,9 +1,35 @@
 package architect
 
 import (
+	"context"
+
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
+
+// injectForestPreload prepends architect-lane forest projections
+// (Intent + Constraint + Decision) to the LLM system prompt so the
+// planner enters its tool loop with memory context as framing rather
+// than as a mid-loop skill call. MEM-01.
+func (a *Architect) injectForestPreload(ctx context.Context, req *providers.Request, query, sessionID string) {
+	if req == nil || a.config.Forest == nil {
+		return
+	}
+	preload, err := shared.PreloadFor(ctx, a.config.Forest, shared.ForestPreloadInput{
+		AgentType: "architect",
+		Query:     query,
+		SessionID: sessionID,
+	})
+	if err != nil || preload == nil {
+		return
+	}
+	rendered := preload.Render()
+	if rendered == "" {
+		return
+	}
+	req.SystemPrompt = rendered + "\n\n---\n\n" + req.SystemPrompt
+}
 
 func (a *Architect) applyConversationRuntimeProfile(req *providers.Request, mode plannerConversationMode, sessionID string) {
 	llmruntime.ApplyStage(req, a.conversationStageProfile(mode), llmruntime.ApplyOptions{

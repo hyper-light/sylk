@@ -1248,6 +1248,12 @@ func (g *Guardian) publishActivityStateWithVisibility(
 	evt := events.NewActivityEvent(eventType, sessionID, content)
 	evt.AgentID = g.AgentID()
 	evt.CorrelationID = strings.TrimSpace(logMeta.CorrID)
+	// Guardian always runs as a child of the requesting agent (engineer,
+	// designer, tester, etc.). Stamp the parent correlation so the UI
+	// keeps the requester's thinking spinner alive while the approval
+	// flows. Without this, the requester's row goes stale whenever a
+	// guardian event publishes on its own correlation.
+	evt.ParentCorrelationID = shared.ParentCorrelationIDFromContext(ctx)
 	evt.Visibility = visibility
 	evt.Data["agent_type"] = "guardian"
 	evt.Data["agent_name"] = "Guardian"

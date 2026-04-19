@@ -1178,9 +1178,27 @@ func (a *Archivalist) processViaLLM(ctx context.Context, fwd *guide.ForwardedReq
 
 	// Typed inter-agent response: parse the LLM output into the canonical
 	// ConsultResponsePayload so consumers (chat UI, protocol logs) read
-	// declared fields rather than defensively parsing raw JSON.
-	return shared.DecodeConsultResponsePayloadFromLLM(result), nil
+	// declared fields rather than defensively parsing raw JSON. Stamp
+	// the agent's freshness horizon so the architect's session cache
+	// can re-use this answer for similar follow-up queries within the
+	// validity window.
+	payload := shared.DecodeConsultResponsePayloadFromLLM(result)
+	if payload != nil {
+		payload.FreshnessHorizon = archivalistConsultFreshnessHorizon
+	}
+	return payload, nil
 }
+
+// archivalistConsultFreshnessHorizon is the validity window the
+// archivalist commits for cached re-use of its consultation answers.
+// Derived from the archivalist's data domain: answers are grounded
+// in git history, prior decisions, and preserved preferences. These
+// change at commit cadence — typically multiple hours between
+// commits during steady-state work, longer between materially
+// different decisions. 2 hours captures the typical inter-commit
+// gap during active development without re-asking after every
+// micro-edit.
+const archivalistConsultFreshnessHorizon = 2 * time.Hour
 
 type forwardedHandler func(context.Context, *guide.ForwardedRequest) (any, error)
 

@@ -507,7 +507,6 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	shared.EmitDispatchACK(d.bus, fwd.Metadata, d.id, "designer", fwd.CorrelationID)
-	d.publishActivity(events.EventTypeAgentAction, "Processing design task")
 
 	if d.config.RequestGuard != nil {
 		release := d.config.RequestGuard()
@@ -572,6 +571,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}))
 	ctx = shared.WithOwnedStreamIdentity(ctx, "designer", "Designer")
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
+	d.publishActivity(ctx, events.EventTypeAgentAction, "Processing design task")
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
@@ -646,7 +646,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		shared.PublishStreamError(d.bus, d.channels, ctx, d.id, err)
 		shared.PublishStreamComplete(d.bus, d.channels, ctx, d.id, "", usageAcc.Total())
 		resp.Error = err.Error()
-		d.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
+		d.publishActivity(ctx, events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
 			d.generateMessageID(),
 			fwd.CorrelationID,
@@ -662,7 +662,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}
 	resp.Data = respData
 	shared.PublishStreamComplete(d.bus, d.channels, ctx, d.id, "", usageAcc.Total())
-	d.publishActivity(events.EventTypeSuccess, "Design task completed")
+	d.publishActivity(ctx, events.EventTypeSuccess, "Design task completed")
 
 	respMsg := guide.NewResponseMessage(d.generateMessageID(), resp)
 	if d.agentPod != nil {
@@ -901,13 +901,20 @@ func (d *Designer) setStatus(status AgentStatus) {
 }
 
 // publishActivity emits a user-visible activity event so the UI agent panel
-// tracks this designer's lifecycle.
-func (d *Designer) publishActivity(eventType events.EventType, content string) {
+// tracks this designer's lifecycle. ctx carries the designer's stream
+// correlation and the parent correlation (orchestrator dispatch,
+// pipeline challenger) so the UI keeps the parent's thinking indicator
+// alive while the designer runs.
+func (d *Designer) publishActivity(ctx context.Context, eventType events.EventType, content string) {
 	if d.activityPub == nil {
 		return
 	}
 	evt := events.NewActivityEvent(eventType, d.config.SessionID, content)
 	evt.AgentID = d.id
+	if stream, ok := shared.StreamMetadataFromContext(ctx); ok {
+		evt.CorrelationID = strings.TrimSpace(stream.CorrelationID)
+	}
+	evt.ParentCorrelationID = shared.ParentCorrelationIDFromContext(ctx)
 	evt.Visibility = events.VisibilityUser
 	evt.Data["agent_type"] = "designer"
 	evt.Data["agent_name"] = "Designer"

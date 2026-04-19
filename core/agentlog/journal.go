@@ -47,9 +47,14 @@ type AgentJournal struct {
 	checkpointSeq uint64
 
 	syncInterval time.Duration
-	syncTimer    *time.Timer
-	dirty        atomic.Bool
-	closed       atomic.Bool
+	// syncTimer is assigned once from startSyncTimer and then read from
+	// timerSync (Reset) and Close (Stop). The timer's own callback
+	// begins executing before AfterFunc's return value is assigned, so
+	// the callback may observe the pointer mid-write — an atomic
+	// pointer is the minimum correct synchronization.
+	syncTimer atomic.Pointer[time.Timer]
+	dirty     atomic.Bool
+	closed    atomic.Bool
 }
 
 // OpenJournal opens or creates a segment-based WAL journal.
@@ -219,8 +224,8 @@ func (j *AgentJournal) Close() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	if j.syncTimer != nil {
-		j.syncTimer.Stop()
+	if t := j.syncTimer.Load(); t != nil {
+		t.Stop()
 	}
 
 	if j.currentSeg == nil {
@@ -540,7 +545,7 @@ func (j *AgentJournal) segmentOlderThan(segNum uint64, before time.Time) bool {
 // --- Batched sync ---
 
 func (j *AgentJournal) startSyncTimer() {
-	j.syncTimer = time.AfterFunc(j.syncInterval, j.timerSync)
+	j.syncTimer.Store(time.AfterFunc(j.syncInterval, j.timerSync))
 }
 
 func (j *AgentJournal) timerSync() {
@@ -556,7 +561,13 @@ func (j *AgentJournal) timerSync() {
 		j.mu.Unlock()
 	}
 
-	j.syncTimer.Reset(j.syncInterval)
+	// The timer pointer is only ever nil during the brief window between
+	// startSyncTimer's call to AfterFunc and the atomic Store. AfterFunc
+	// runs on its own goroutine — if it fires before that Store, we
+	// must not crash: the next iteration's Reset will schedule normally.
+	if t := j.syncTimer.Load(); t != nil {
+		t.Reset(j.syncInterval)
+	}
 }
 
 // OpenJournalDirect opens a journal in an explicit directory path.

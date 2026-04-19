@@ -414,6 +414,12 @@ type ActivityEvent struct {
 	Timestamp     time.Time               `json:"timestamp"`
 	SessionID     string                  `json:"session_id"`
 	CorrelationID string                  `json:"correlation_id,omitempty"`
+	// ParentCorrelationID names the correlation this event is a child
+	// of (e.g., guardian approval dispatched by an engineer turn). The
+	// UI uses this to keep the parent's thinking spinner/status alive
+	// while the child is running — without it, a child event with its
+	// own correlation orphans the parent's activity indicator.
+	ParentCorrelationID string                  `json:"parent_correlation_id,omitempty"`
 	AgentID       string                  `json:"agent_id,omitempty"`
 	Content       string                  `json:"content"`
 	Summary       string                  `json:"summary,omitempty"`

@@ -44,6 +44,12 @@ type pipelineProtocolCheckpoint struct {
 	RequiredAction  string                                `json:"required_action,omitempty"`
 	RequiredReason  string                                `json:"required_reason,omitempty"`
 	QueuedArtifacts map[string]PipelineHandoffArtifactRef `json:"queued_artifacts,omitempty"`
+	// TerminalAction persists the single-shot terminal-action guard.
+	// DUR-02 (parallel with globalReviewCheckpoint): losing this on
+	// resume would let a crashed-mid-turn state select a second
+	// terminal action on restart, which the in-memory guard was
+	// supposed to prevent.
+	TerminalAction *PipelineTurnAction `json:"terminal_action,omitempty"`
 }
 
 type pipelineProtocolObligation struct {
@@ -80,6 +86,7 @@ func newPipelineProtocolStateForTask(task *PipelineTaskInput) (*PipelineProtocol
 		state.requiredAction = PipelineProtocolActionType(strings.TrimSpace(checkpoint.RequiredAction))
 		state.requiredReason = strings.TrimSpace(checkpoint.RequiredReason)
 		state.queuedArtifacts = clonePipelineHandoffArtifactMap(checkpoint.QueuedArtifacts)
+		state.terminalAction = clonePipelineTurnAction(checkpoint.TerminalAction)
 		if err := state.replayFrom(seq); err != nil {
 			return state, err
 		}
@@ -379,6 +386,7 @@ func (s *PipelineProtocolState) persistProjection() error {
 		RequiredAction:  strings.TrimSpace(string(s.requiredAction)),
 		RequiredReason:  strings.TrimSpace(s.requiredReason),
 		QueuedArtifacts: clonePipelineHandoffArtifactMap(s.queuedArtifacts),
+		TerminalAction:  clonePipelineTurnAction(s.terminalAction),
 	}
 	return s.store.SaveSnapshot(s.store.journal.LastSequence(), checkpoint)
 }

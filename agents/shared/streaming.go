@@ -177,6 +177,31 @@ func StreamMetadataFromContext(ctx context.Context) (StreamContext, bool) {
 	return metadata, true
 }
 
+// ParentCorrelationIDFromContext returns the upstream/parent correlation
+// id recorded in stream metadata via streamMetadataParentCorrelation, or
+// empty when the current context has no parent (top-level request).
+//
+// Activity publishers (guardian approvals, pipeline challenges, any
+// agent publishActivity) call this to stamp ParentCorrelationID on
+// outgoing events so the UI can keep the parent's thinking indicator
+// alive while the child runs. A non-empty return value means "I am a
+// child of this correlation"; an empty return means "I am top-level."
+func ParentCorrelationIDFromContext(ctx context.Context) string {
+	stream, ok := StreamMetadataFromContext(ctx)
+	if !ok || stream.Metadata == nil {
+		return ""
+	}
+	raw, ok := stream.Metadata[streamMetadataParentCorrelation]
+	if !ok {
+		return ""
+	}
+	v, ok := raw.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(v)
+}
+
 // WithStreamEventVisibility forces shared stream lifecycle/progress publishers
 // to emit the supplied visibility for events emitted from ctx.
 func WithStreamEventVisibility(ctx context.Context, visibility events.EventVisibility) context.Context {
@@ -742,6 +767,14 @@ func PublishStreamProgress(bus guide.EventBus, channels *guide.AgentChannels, ct
 // a filled AgentStateEvent with only PeerAgentType and/or PeerCorrelationID
 // populated when the transition involves a peer.
 //
+// Correlation resolution: the payload's CorrelationID is taken from (in
+// order) the provided `peer` override, the ActivitySession on ctx, or the
+// stream metadata on ctx. Sessions are the canonical identity — bus
+// handlers and async dispatchers open a session before calling this so
+// the event routes cleanly even without a stream. When both are present
+// the session wins so nested work attributes to the session it was
+// opened under, not an inherited stream.
+//
 // Returns the underlying publish error so callers surface delivery failures
 // the same way they do for any other stream event. No retries, no fallbacks
 // — a failed state publish is an observable event, not a paper-over moment.
@@ -760,14 +793,28 @@ func PublishAgentState(
 	}
 	transitionID := nextAgentStateTransitionID()
 	payload := &guide.AgentStateEvent{
-		State:         state,
-		Detail:        strings.TrimSpace(detail),
-		AgentID:       strings.TrimSpace(agentID),
-		AgentType:     strings.TrimSpace(agentType),
-		TransitionID:  transitionID,
+		State:        state,
+		Detail:       strings.TrimSpace(detail),
+		AgentID:      strings.TrimSpace(agentID),
+		AgentType:    strings.TrimSpace(agentType),
+		TransitionID: transitionID,
 	}
-	if stream, ok := StreamMetadataFromContext(ctx); ok {
+	// Correlation precedence: session > stream metadata. Sessions are the
+	// canonical identity for bus-handler emissions; stream metadata is the
+	// fallback for in-stream emissions (where a session was never opened
+	// because the stream lifecycle already carries the identity).
+	if session := ActivitySessionFromContext(ctx); session != nil {
+		payload.CorrelationID = session.CorrelationID
+	} else if stream, ok := StreamMetadataFromContext(ctx); ok {
 		payload.CorrelationID = stream.CorrelationID
+	}
+	// Stamp the parent correlation whenever ctx names one (guardian
+	// approvals, pipeline challenges, any child-of-another-agent work).
+	// The UI uses this to keep the parent's thinking indicator alive
+	// while the child runs so the spinner doesn't orphan when the child
+	// publishes under its own correlation.
+	if parent := ParentCorrelationIDFromContext(ctx); parent != "" && parent != payload.CorrelationID {
+		payload.ParentCorrelationID = parent
 	}
 	if peer != nil {
 		payload.PeerAgentType = strings.TrimSpace(peer.PeerAgentType)
@@ -780,11 +827,74 @@ func PublishAgentState(
 	// context.
 	recordAgentStateTransition(ctx, state)
 	logAgentStateTransitionToWAL(ctx, payload)
-	return PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
+	event := &guide.StreamEvent{
 		Type:      guide.StreamEventAgentState,
 		Data:      payload,
 		Timestamp: time.Now(),
-	})
+	}
+	// When ctx carries stream metadata (the in-stream path), route through
+	// PublishStreamEvent so the standard lifecycle-gate telemetry and
+	// metadata cloning apply. When ctx carries only an ActivitySession
+	// (bus-handler path), route via the low-level bus publish so the event
+	// is not gated on stream metadata the handler intentionally does not
+	// own.
+	if _, ok := StreamMetadataFromContext(ctx); ok {
+		return PublishStreamEvent(bus, channels, ctx, agentID, event)
+	}
+	return publishAgentStateWithoutStream(bus, channels, ctx, agentID, payload, event)
+}
+
+// publishAgentStateWithoutStream emits an AgentStateEvent on the agent's
+// response channel without requiring stream metadata on ctx. Used by bus
+// handlers and async dispatchers that open an ActivitySession instead of
+// a stream. The event rides the same response-channel the UI bridge is
+// subscribed to, so the chat panel picks it up as a bridge row exactly
+// like any other state event. A failed publish is logged (same canonical
+// error-surfacing pattern as PublishStreamEvent) and returned to caller.
+func publishAgentStateWithoutStream(
+	bus guide.EventBus,
+	channels *guide.AgentChannels,
+	ctx context.Context,
+	agentID string,
+	payload *guide.AgentStateEvent,
+	event *guide.StreamEvent,
+) error {
+	if bus == nil || channels == nil || payload == nil {
+		return nil
+	}
+	if visibility, ok := streamEventVisibilityFromContext(ctx); ok {
+		cloned := *event
+		cloned.Visibility = visibility
+		event = &cloned
+	}
+	stream := &guide.StreamResponse{
+		CorrelationID:     payload.CorrelationID,
+		RespondingAgentID: strings.TrimSpace(agentID),
+		TargetAgentID:     "",
+		Metadata:          nil,
+		Event:             event,
+	}
+	msg := &guide.Message{
+		ID:            fmt.Sprintf("%s_astate_%d", strings.TrimSpace(agentID), time.Now().UnixNano()),
+		CorrelationID: payload.CorrelationID,
+		Type:          guide.MessageTypeStream,
+		Payload:       stream,
+		SourceAgentID: strings.TrimSpace(agentID),
+		Timestamp:     time.Now(),
+	}
+	if err := bus.Publish(channels.Responses, msg); err != nil {
+		if lm := LogMetaFromContext(ctx); lm.EventLogger != nil {
+			LogWarning(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
+				"agent_state_publish_failed_no_stream", map[string]any{
+					"state":          string(payload.State),
+					"agent_id":       agentID,
+					"correlation_id": payload.CorrelationID,
+					"error":          err.Error(),
+				})
+		}
+		return fmt.Errorf("publish agent state %s: %w", payload.State, err)
+	}
+	return nil
 }
 
 // logAgentStateTransitionToWAL mirrors every PublishAgentState call into

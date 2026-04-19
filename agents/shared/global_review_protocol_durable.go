@@ -41,6 +41,13 @@ type globalReviewCheckpoint struct {
 	Processed      []GlobalReviewValidationProcessing `json:"processed,omitempty"`
 	RequiredAction string                             `json:"required_action,omitempty"`
 	RequiredReason string                             `json:"required_reason,omitempty"`
+	// TerminalAction persists the single-shot terminal-action guard.
+	// DUR-02: without this, a crash between TryApplyTurnAction setting
+	// terminalAction and the next turn boundary would let the resumed
+	// state select a second terminal action — a protocol violation
+	// the in-memory guard was supposed to prevent. Persist it so the
+	// guard survives process restarts.
+	TerminalAction *GlobalReviewTurnAction `json:"terminal_action,omitempty"`
 }
 
 func (s *GlobalReviewState) loadDurableProjection() error {
@@ -55,6 +62,7 @@ func (s *GlobalReviewState) loadDurableProjection() error {
 		s.processed = cloneGlobalReviewValidationProcessingList(checkpoint.Processed)
 		s.requiredAction = GlobalReviewActionType(strings.TrimSpace(checkpoint.RequiredAction))
 		s.requiredReason = strings.TrimSpace(checkpoint.RequiredReason)
+		s.terminalAction = cloneGlobalReviewTurnAction(checkpoint.TerminalAction)
 		return s.replayFrom(seq)
 	}
 	if err := s.replayFrom(0); err != nil {
@@ -332,6 +340,7 @@ func (s *GlobalReviewState) persistProjection() error {
 		Processed:      cloneGlobalReviewValidationProcessingList(s.processed),
 		RequiredAction: strings.TrimSpace(string(s.requiredAction)),
 		RequiredReason: strings.TrimSpace(s.requiredReason),
+		TerminalAction: cloneGlobalReviewTurnAction(s.terminalAction),
 	})
 }
 

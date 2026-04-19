@@ -30,6 +30,34 @@ func (s *testMemoryForestService) RecordOutcome(_ context.Context, record forest
 	return nil
 }
 
+// Project* stubs — MEM-01 widened MemoryForestService with family
+// projections; preserve zero-behavior here since this stub only
+// exercises RecordOutcome paths.
+func (s *testMemoryForestService) ProjectIntent(context.Context, forest.ProjectionInput) (*forest.IntentProjection, error) {
+	return nil, nil
+}
+func (s *testMemoryForestService) ProjectConstraints(context.Context, forest.ProjectionInput) (*forest.ConstraintProjection, error) {
+	return nil, nil
+}
+func (s *testMemoryForestService) ProjectEvidence(context.Context, forest.ProjectionInput) (*forest.EvidenceProjection, error) {
+	return nil, nil
+}
+func (s *testMemoryForestService) ProjectDecisions(context.Context, forest.ProjectionInput) (*forest.DecisionProjection, error) {
+	return nil, nil
+}
+func (s *testMemoryForestService) ProjectOutcomes(context.Context, forest.ProjectionInput) (*forest.OutcomeProjection, error) {
+	return nil, nil
+}
+func (s *testMemoryForestService) ProjectPreferences(context.Context, forest.ProjectionInput) (*forest.PreferenceProjection, error) {
+	return nil, nil
+}
+func (s *testMemoryForestService) ProjectCapabilities(context.Context, forest.ProjectionInput) (*forest.CapabilityProjection, error) {
+	return nil, nil
+}
+func (s *testMemoryForestService) ProjectOpportunities(context.Context, forest.ProjectionInput) (*forest.OpportunityProjection, error) {
+	return nil, nil
+}
+
 func TestMemoryForestTrackerPrunesStaleAndExcessEntries(t *testing.T) {
 	tracker := NewMemoryForestTracker()
 	now := time.Now()

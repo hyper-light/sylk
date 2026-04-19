@@ -155,13 +155,17 @@ func TestToolsForConversationMode_ConverseIncludesPlanningProtocolTools(t *testi
 		"route_requirements_research",
 		"start_planning",
 		"plan",
-		"route_plan_acceptance",
 	} {
 		if !containsToolName(tools, want) {
 			t.Fatalf("converse tools missing %q: %v", want, tools)
 		}
 	}
+	// route_plan_acceptance is intentionally excluded — the dialog
+	// publish in feedbackReadyDirective is now the canonical
+	// acceptance path. Exposing the tool would let the LLM
+	// auto-dispatch ahead of the user's clicked verdict.
 	for _, blocked := range []string{
+		"route_plan_acceptance",
 		"plan_workflow",
 		"pre_delegation_declare",
 		"validate_pre_delegation",
@@ -228,10 +232,15 @@ func TestPlannerConversationModeConverse_ToolSurfaceMatchesProtocolInstructions(
 		}
 	}
 	tools := toolsForConversationMode(plannerConversationModeConverse)
-	for _, wantTool := range []string{"plan", "consult", "recall_recent", "route_plan_acceptance"} {
+	for _, wantTool := range []string{"plan", "consult", "recall_recent"} {
 		if !containsToolName(tools, wantTool) {
 			t.Fatalf("converse tools missing protocol-required tool %q: %v", wantTool, tools)
 		}
+	}
+	// route_plan_acceptance is intentionally absent — see
+	// TestToolsForConversationMode_ConverseIncludesPlanningProtocolTools.
+	if containsToolName(tools, "route_plan_acceptance") {
+		t.Fatalf("converse tools must not expose route_plan_acceptance: %v", tools)
 	}
 }
 

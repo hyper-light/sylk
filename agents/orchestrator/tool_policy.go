@@ -19,16 +19,21 @@ func orchestratorMutatingSkillNames() []string {
 		"modify_dag",
 		"ingest_plan",
 		"validate_work",
+		"cancel_orchestration",
+		"resume_orchestration",
 	})
 }
 
 func orchestratorVisibleSkillNames() []string {
-	return shared.AppendMemoryForestVisibleSkillNames([]string{
+	base := shared.AppendMemoryForestVisibleSkillNames([]string{
 		"query_task",
 		"query_workflow",
 		"query_dag_status",
 		"query_pipeline_state",
 		"query_buffer",
+		"plan_state_query",
+		"cancel_orchestration",
+		"resume_orchestration",
 		"generate_summary",
 		"push_status",
 		"ingest_plan",
@@ -42,6 +47,7 @@ func orchestratorVisibleSkillNames() []string {
 		"summarize_workspace_state",
 		"diff_workspace_file",
 	}, "orchestrator")
+	return shared.AppendFabricAwarenessSkillNames(base)
 }
 
 func orchestratorToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {

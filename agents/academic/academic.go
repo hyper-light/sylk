@@ -982,6 +982,7 @@ func (a *Academic) handleConversation(ctx context.Context, fwd *guide.ForwardedR
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
 	a.applyLLMRuntimeProfile(ctx, llmReq, "conversation")
+	a.injectForestPreload(ctx, llmReq, fwd)
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
@@ -1016,6 +1017,7 @@ func (a *Academic) handleConsultation(ctx context.Context, fwd *guide.ForwardedR
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
 	a.applyLLMRuntimeProfile(ctx, llmReq, "conversation")
+	a.injectForestPreload(ctx, llmReq, fwd)
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
@@ -1031,9 +1033,26 @@ func (a *Academic) handleConsultation(ctx context.Context, fwd *guide.ForwardedR
 	// fields instead of defensively parsing JSON. Falls back to Summary=
 	// raw text when the LLM emitted prose rather than JSON — that case
 	// still renders meaningfully in the chat row and keeps the migration
-	// backwards-compatible with older prompts.
-	return shared.DecodeConsultResponsePayloadFromLLM(result), nil
+	// backwards-compatible with older prompts. Stamp the agent's
+	// freshness horizon so the architect's session cache can re-use
+	// this answer for similar follow-up queries.
+	payload := shared.DecodeConsultResponsePayloadFromLLM(result)
+	if payload != nil {
+		payload.FreshnessHorizon = academicConsultFreshnessHorizon
+	}
+	return payload, nil
 }
+
+// academicConsultFreshnessHorizon is the validity window the
+// academic commits for cached re-use of its consultation answers.
+// Derived from the academic's data domain: answers are grounded in
+// research literature, best practices, and tradeoff analysis. The
+// underlying knowledge changes at days-to-weeks scale — papers are
+// published, conventions evolve, but a recommendation made at noon
+// is almost always still valid at midnight. 24 hours captures
+// "current understanding" without forcing re-research on every
+// downstream follow-up.
+const academicConsultFreshnessHorizon = 24 * time.Hour
 
 type academicConversationHandoff struct {
 	Kind             string
@@ -1043,6 +1062,27 @@ type academicConversationHandoff struct {
 	ConversationHist string
 	KnownContext     []string
 	MissingQuestions []string
+}
+
+// injectForestPreload prepends academic-lane forest projections
+// (Evidence + Outcome + Intent) to the LLM system prompt. MEM-01.
+func (a *Academic) injectForestPreload(ctx context.Context, req *providers.Request, fwd *guide.ForwardedRequest) {
+	if req == nil || fwd == nil || a.config.Forest == nil {
+		return
+	}
+	preload, err := shared.PreloadFor(ctx, a.config.Forest, shared.ForestPreloadInput{
+		AgentType: "academic",
+		Query:     fwd.Input,
+		SessionID: fwd.SessionID,
+	})
+	if err != nil || preload == nil {
+		return
+	}
+	rendered := preload.Render()
+	if rendered == "" {
+		return
+	}
+	req.SystemPrompt = rendered + "\n\n---\n\n" + req.SystemPrompt
 }
 
 func academicConversationHandoffFromForwarded(fwd *guide.ForwardedRequest) *academicConversationHandoff {

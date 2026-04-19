@@ -75,8 +75,19 @@ func (b *SessionBridge) enqueue(event *session.Event) {
 }
 
 // drainFunc returns the WorkFunc that drains the buffer and sends tea messages.
+//
+// UI-13: every session event publishes as SessionEventMsg for the
+// generic subscriber set (status bar, session picker). When the
+// event is EventSwitched, the drain additionally fan-outs a typed
+// SessionSwitchedMsg so the AppModel can react to the buffer-
+// invalidating transition without filtering every event. Both
+// messages land on the same program in a deterministic order
+// (event-first, switch-second) — subscribers that handle both see
+// the generic update first, preserving backwards compatibility with
+// code that only watches SessionEventMsg.
 func (b *SessionBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 	return func(ctx context.Context) error {
+		var previousActiveID string
 		for {
 			if stop, err := shouldStop(b.done, ctx); stop {
 				return err
@@ -84,6 +95,10 @@ func (b *SessionBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 			select {
 			case event := <-b.buffer:
 				program.Send(msg.SessionEventMsg{Event: event})
+				if switchMsg, ok := sessionSwitchedMsgFromEvent(event, previousActiveID); ok {
+					program.Send(switchMsg)
+					previousActiveID = switchMsg.ActiveID
+				}
 			case <-b.done:
 				return nil
 			case <-ctx.Done():
@@ -91,4 +106,22 @@ func (b *SessionBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 			}
 		}
 	}
+}
+
+// sessionSwitchedMsgFromEvent returns a typed SessionSwitchedMsg
+// when event carries a session switch, or (_, false) otherwise.
+// Extracted so tests can exercise the filter without constructing a
+// live bridge + drain goroutine.
+func sessionSwitchedMsgFromEvent(event *session.Event, previousActiveID string) (msg.SessionSwitchedMsg, bool) {
+	if event == nil || event.Type != session.EventSwitched {
+		return msg.SessionSwitchedMsg{}, false
+	}
+	if event.SessionID == "" {
+		return msg.SessionSwitchedMsg{}, false
+	}
+	return msg.SessionSwitchedMsg{
+		PreviousID: previousActiveID,
+		ActiveID:   event.SessionID,
+		Event:      event,
+	}, true
 }

@@ -34,6 +34,7 @@ type HandoffSupervisor struct {
 	config           *SupervisorConfig
 	priorHierarchy   *PriorHierarchy
 	profileLearner   *ProfileLearner
+	paramBlender     *HierarchicalParamBlender
 	baselineRegistry *BaselineRegistry
 	wal              *HandoffWAL
 	factory          *AgentFactory
@@ -49,6 +50,11 @@ type HandoffSupervisor struct {
 	// Brief source — propagated to all bridges so handoffs can request
 	// Archivalist-backed summaries instead of falling back to raw snapshots.
 	briefSource BriefSource
+
+	// archivePublisher — HAND-05. Fire-and-forget sink for
+	// ArchiveRequests the bridge emits at lifecycle transitions. When
+	// unset, the bridge skips archival (cold-start / test paths).
+	archivePublisher ArchivePublisher
 
 	// Traffic shift callbacks — wired by bootstrap.
 	onShiftBegin func(oldID string, newAgent HandoffableAgent)
@@ -82,11 +88,63 @@ func NewHandoffSupervisor(config *SupervisorConfig) *HandoffSupervisor {
 		config:           config,
 		priorHierarchy:   hierarchy,
 		profileLearner:   learner,
+		paramBlender:     NewHierarchicalParamBlender(nil),
 		baselineRegistry: baselineReg,
 		factory:          factory,
 		factoryAdapter:   adapter,
 		descriptors:      descriptors,
 		bridges:          make(map[string]*HandoffBridge),
+	}
+}
+
+// HAND-02 parameter key constants. The blender stores *LearnedWeight
+// values keyed by ParamName — we define canonical names so lookups
+// and updates agree across the codebase.
+const (
+	// BlenderParamHandoffThreshold names the learned handoff threshold
+	// posterior in the blender. Profile.OptimalHandoffThreshold is the
+	// per-(agent,model) source; the blender maintains the hierarchical
+	// view across instance / agent-model / model / global levels.
+	BlenderParamHandoffThreshold = "handoff_threshold"
+)
+
+// Blender returns the supervisor's HierarchicalParamBlender.
+// Nil is never returned — the supervisor always owns a live blender
+// so callers can register and query parameters unconditionally.
+func (s *HandoffSupervisor) Blender() *HierarchicalParamBlender {
+	return s.paramBlender
+}
+
+// SyncBlenderFromProfile registers the supplied profile's learned
+// handoff threshold into the blender at both the instance level
+// (keyed on instanceUID) and the agent-model level (keyed on
+// agentType + modelID). Called after every RecordObservation so the
+// blender's posterior stays in step with the profile learner.
+//
+// Callers that bypass the bridge (tests, recovery paths) invoke this
+// directly to populate the blender from a restored profile; the
+// bridge runtime calls it automatically on each observation.
+func (s *HandoffSupervisor) SyncBlenderFromProfile(agentType, modelID, instanceUID string, profile *AgentHandoffProfile) {
+	if s == nil || s.paramBlender == nil || profile == nil {
+		return
+	}
+	if profile.OptimalHandoffThreshold == nil {
+		return
+	}
+	// Register at agent-model level always — every profile belongs to
+	// exactly one (agentType, modelID) pair. Copy the learned weight by
+	// value so later blender mutations never leak back into the profile
+	// (LearnedWeight is a plain struct with no nested pointers).
+	agentModelCopy := *profile.OptimalHandoffThreshold
+	s.paramBlender.RegisterAgentModel(agentType, modelID, BlenderParamHandoffThreshold, &agentModelCopy)
+
+	// Register at instance level when the caller has an identity —
+	// bridge.go passes the agent's UID, dispatcher code can pass an
+	// empty string when the concept of "instance" collapses to the
+	// (agent, model) pair.
+	if instanceUID != "" {
+		instanceCopy := *profile.OptimalHandoffThreshold
+		s.paramBlender.RegisterInstance(agentType, modelID, instanceUID, BlenderParamHandoffThreshold, &instanceCopy)
 	}
 }
 
@@ -266,6 +324,80 @@ func (s *HandoffSupervisor) SetBriefSource(source BriefSource) {
 		}
 		b.mu.Unlock()
 	}
+}
+
+// SetArchivePublisher wires the ArchivePublisher that bridges use to
+// fire ArchiveRequests at handoff / eviction / terminate transitions.
+// Propagated to all existing and future bridges. Passing nil clears
+// the publisher — subsequent lifecycle transitions will not emit
+// archive requests (the Archivalist retains any already-published
+// state, so this is a clean "disable going forward" switch, not a
+// history wipe).
+//
+// HAND-05 entry point — supervisor-level so bootstrap code can flip a
+// single switch during startup rather than threading the publisher
+// through every BridgeConfig.
+func (s *HandoffSupervisor) SetArchivePublisher(pub ArchivePublisher) {
+	s.mu.Lock()
+	s.archivePublisher = pub
+	bridges := make([]*HandoffBridge, 0, len(s.bridges))
+	for _, b := range s.bridges {
+		bridges = append(bridges, b)
+	}
+	s.mu.Unlock()
+
+	for _, b := range bridges {
+		b.mu.Lock()
+		b.archivePublisher = pub
+		b.mu.Unlock()
+	}
+}
+
+// ArchivePublisher returns the supervisor's currently-installed
+// archive publisher, or nil when none is set. Intended for
+// tests and diagnostics only — the bridge reads the publisher
+// through its own field, not this accessor.
+func (s *HandoffSupervisor) ArchivePublisher() ArchivePublisher {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.archivePublisher
+}
+
+// MaybeCheckpointProfiles writes a WAL checkpoint for every
+// registered bridge's profile + GP snapshot if the profile learner's
+// persistence interval has elapsed. HAND-07: prior behavior only
+// wrote checkpoints at Stop(), which meant a crash mid-session lost
+// all profile learning since the last observation replay boundary.
+// Periodic checkpointing caps that loss at PersistenceInterval
+// without spamming fsyncs on every turn.
+//
+// Returns the number of checkpoints written — useful for tests.
+// The caller is expected to invoke this from the bridge's per-turn
+// hook; cost is amortized by ShouldPersist's time gate.
+func (s *HandoffSupervisor) MaybeCheckpointProfiles() int {
+	if s == nil || s.wal == nil || s.profileLearner == nil {
+		return 0
+	}
+	if !s.profileLearner.ShouldPersist() {
+		return 0
+	}
+	s.mu.RLock()
+	bridges := make([]*HandoffBridge, 0, len(s.bridges))
+	for _, b := range s.bridges {
+		bridges = append(bridges, b)
+	}
+	s.mu.RUnlock()
+
+	written := 0
+	for _, b := range bridges {
+		if err := s.wal.WriteCheckpoint(b.profile, b.gp); err == nil {
+			written++
+		}
+	}
+	if written > 0 {
+		s.profileLearner.MarkPersisted()
+	}
+	return written
 }
 
 // SetQualityPublisher sets the callback that bridges use to publish

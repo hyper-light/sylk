@@ -55,10 +55,10 @@ func RecallSkills(cfg RecallSkillConfig) []*skills.Skill {
 
 func recallMyHistorySkill(cfg RecallSkillConfig) *skills.Skill {
 	return skills.NewSkill("recall_my_history").
-		Description("Ask your scribe (your dedicated biographer) for a structured digest of your prior work this session — what you decided, why, what you tried, what worked, what didn't. Useful when about to make a decision you may have made before, when you suspect you're repeating yourself, or when the prior reasoning behind a current state matters. Backed by the Activity Fabric's narration_emitted stream filtered to your agent type. Never blocks — returns an empty digest when the fabric isn't yet wired.").
+		Description("Ask your scribe (your dedicated biographer) for a structured digest of your prior work this session — what you decided, why, what you tried, what worked, what didn't. CALL THIS when about to make a decision you may have made before, when revisiting a state you remember reasoning about earlier, or when a new replica of you boots and needs to know its own past. Backed by the Activity Fabric's narration_emitted stream filtered to your agent type. Never blocks — returns an empty digest when the fabric isn't yet wired.").
 		Domain("memory").
-		Keywords("memory", "history", "biography", "prior", "self", "scribe", "recall").
-		Priority(85).
+		Keywords("memory", "history", "biography", "prior", "self", "scribe", "recall", "remember", "previous").
+		Priority(94).
 		Usage("Use when you suspect you've covered ground before, want to confirm a prior decision, or need to reconstruct the reasoning that led to a state you're now revisiting. Pass an optional scope to narrow recall.").
 		Requirement("Call when investigating prior work; cost is one indexed fabric read.").
 		Satisfies("Returns a chronologically-ordered digest of prior scribe narrations about this agent's work.").

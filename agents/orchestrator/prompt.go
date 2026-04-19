@@ -15,14 +15,19 @@ var (
 	OrchestratorSelfResponsePrompt     = prompts.MustLoad("orchestrator", "self_response")
 	OrchestratorFabricAwareness        = prompts.MustLoad("shared", "fabric_awareness")
 
-	// DefaultSystemPrompt is the full system prompt for event processing (LLM loop).
-	// Includes all modules: core identity, protocol, guardrails, and skill strategy.
+	// DefaultSystemPrompt is the full system prompt for event
+	// processing (LLM loop).
+	//
+	// IMPORTANT ORDERING: OrchestratorFabricAwareness comes RIGHT
+	// AFTER core identity, BEFORE protocol/skills. The screenshot
+	// review showed the LLM follows the workflow it reads first;
+	// fabric must be framing, not a footer.
 	DefaultSystemPrompt = strings.Join(nonEmptyOrchestratorSections([]string{
 		OrchestratorSystemCorePrompt,
+		OrchestratorFabricAwareness,
 		OrchestratorSystemProtocolPrompt,
 		OrchestratorSystemGuardrailsPrompt,
 		OrchestratorSystemSkillsPrompt,
-		OrchestratorFabricAwareness,
 	}), "\n\n---\n\n")
 
 	// ConversationPrompt is the legacy alias used by existing callers.

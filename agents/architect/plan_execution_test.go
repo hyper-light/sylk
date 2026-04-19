@@ -73,6 +73,34 @@ func (m *captureArchitectForest) RecordOutcome(ctx context.Context, record fores
 	return nil
 }
 
+// MEM-01: family projection stubs. This capture double doesn't assert
+// on projection calls; no-op implementations keep the interface
+// contract without changing test semantics.
+func (m *captureArchitectForest) ProjectIntent(context.Context, forest.ProjectionInput) (*forest.IntentProjection, error) {
+	return nil, nil
+}
+func (m *captureArchitectForest) ProjectConstraints(context.Context, forest.ProjectionInput) (*forest.ConstraintProjection, error) {
+	return nil, nil
+}
+func (m *captureArchitectForest) ProjectEvidence(context.Context, forest.ProjectionInput) (*forest.EvidenceProjection, error) {
+	return nil, nil
+}
+func (m *captureArchitectForest) ProjectDecisions(context.Context, forest.ProjectionInput) (*forest.DecisionProjection, error) {
+	return nil, nil
+}
+func (m *captureArchitectForest) ProjectOutcomes(context.Context, forest.ProjectionInput) (*forest.OutcomeProjection, error) {
+	return nil, nil
+}
+func (m *captureArchitectForest) ProjectPreferences(context.Context, forest.ProjectionInput) (*forest.PreferenceProjection, error) {
+	return nil, nil
+}
+func (m *captureArchitectForest) ProjectCapabilities(context.Context, forest.ProjectionInput) (*forest.CapabilityProjection, error) {
+	return nil, nil
+}
+func (m *captureArchitectForest) ProjectOpportunities(context.Context, forest.ProjectionInput) (*forest.OpportunityProjection, error) {
+	return nil, nil
+}
+
 func (p *captureConversationPlanner) AnalyzeRequirements(context.Context, string, map[string]any) (*Requirements, error) {
 	return nil, errors.New("unexpected AnalyzeRequirements call")
 }

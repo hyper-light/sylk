@@ -44,6 +44,7 @@ func guardianToolManifestForRegistry(registry *skills.Registry) *toolruntime.Pol
 		toolruntime.NewToolPolicy("quarantine_status", toolruntime.EffectReadOnly, toolruntime.DomainValidation, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("tool_execution_control", toolruntime.EffectReadOnly, toolruntime.DomainControl, toolruntime.ExecutionModeLocal, toolruntime.WithSearchable(false)),
 		toolruntime.NewToolPolicy("command_execution_control", toolruntime.EffectReadOnly, toolruntime.DomainControl, toolruntime.ExecutionModeLocal, toolruntime.WithSearchable(false)),
+		toolruntime.NewToolPolicy("plan_approval_gate", toolruntime.EffectReadOnly, toolruntime.DomainControl, toolruntime.ExecutionModeLocal, toolruntime.WithSearchable(false)),
 		toolruntime.NewToolPolicy("read_file", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("glob", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("grep", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
@@ -59,6 +60,7 @@ func guardianToolManifestForRegistry(registry *skills.Registry) *toolruntime.Pol
 		toolruntime.NewToolPolicy(toolruntime.SearchToolName, toolruntime.EffectReadOnly, toolruntime.DomainDiscovery, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault(), toolruntime.WithSearchable(false)),
 	}
 	policies = shared.AppendMemoryForestToolPolicies(policies, registry, "guardian")
+	policies = shared.AppendFabricAwarenessToolPolicies(policies, registry)
 	return toolruntime.ApplyAuthorityProfile("guardian", toolruntime.NewManifest("guardian", "guardian.control", policies...))
 }
 

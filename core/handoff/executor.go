@@ -804,6 +804,19 @@ func (he *HandoffExecutor) attemptHandoff(
 	return newSessionID, nil
 }
 
+// applyPreparedContextSessionMetadata forwards agent/session/task/
+// correlation identity keys from the PreparedContext into the new
+// session's config metadata. HAND-06: correlation_id is included so
+// the replacement agent's first turn inherits the originating user
+// turn's correlation scope — the trace chain that starts at the user
+// request persists across the handoff boundary instead of breaking
+// into two unrelated halves.
+//
+// parent_correlation_id is included for cross-agent chains where the
+// current correlation is already a continuation of an upstream one
+// (consultation → delegation → handoff sequences). Keeping both
+// lets downstream consumers choose: the active correlation for
+// direct threading, the parent for multi-hop provenance.
 func applyPreparedContextSessionMetadata(preparedCtx *PreparedContext, metadata map[string]interface{}) {
 	if preparedCtx == nil || metadata == nil {
 		return
@@ -815,6 +828,8 @@ func applyPreparedContextSessionMetadata(preparedCtx *PreparedContext, metadata 
 		"pipeline_id",
 		"task_id",
 		"task_slug",
+		"correlation_id",
+		"parent_correlation_id",
 	} {
 		if value, ok := preparedCtx.GetMetadata(key); ok && value != "" {
 			metadata[key] = value

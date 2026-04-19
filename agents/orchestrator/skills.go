@@ -11,6 +11,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -43,6 +44,9 @@ func (o *Orchestrator) registerCoreSkills() {
 	o.skills.Register(queryBufferSkill(o))
 	o.skills.Register(queryPipelineStateSkill(o))
 	o.skills.Register(queryDAGStatusSkill(o))
+	o.skills.Register(planStateQuerySkill(o))
+	o.skills.Register(cancelOrchestrationSkill(o))
+	o.skills.Register(resumeOrchestrationSkill(o))
 
 	// Plan ingestion and analysis skills
 	o.skills.Register(ingestPlanSkill(o))
@@ -65,8 +69,42 @@ func (o *Orchestrator) registerCoreSkills() {
 	// Diagnostics
 	o.skills.Register(shared.NewSelfDiagnosticSkill(&orchestratorDiag{o: o}))
 
+	// Activity Fabric: uniform awareness skills + recall + cross-pipeline.
+	o.registerFabricSkills()
+
 	for _, name := range orchestratorPinnedSkillNames() {
 		o.skills.Load(name)
+	}
+}
+
+func (o *Orchestrator) registerFabricSkills() {
+	sessionID := func() string { return o.SessionID() }
+	agentID := func() string { return o.config.AgentID }
+	agentType := func() string { return "orchestrator" }
+
+	for _, skill := range shared.AwarenessSkills(shared.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}) {
+		o.skills.Register(skill)
+	}
+	for _, skill := range shared.RecallSkills(shared.RecallSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}) {
+		o.skills.Register(skill)
+	}
+	for _, skill := range shared.CrossPipelineSkills(shared.CrossPipelineSkillConfig{
+		SessionID:  sessionID,
+		AgentID:    agentID,
+		AgentType:  agentType,
+		PipelineID: func() string { return "" },
+	}) {
+		o.skills.Register(skill)
 	}
 }
 

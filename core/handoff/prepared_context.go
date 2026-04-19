@@ -316,6 +316,53 @@ func (pc *PreparedContext) TokenCount() int {
 	return pc.tokenCount
 }
 
+// TrimToTokenBudget drops the oldest messages until the token count fits
+// within maxTokens, or the buffer is empty. Returns the number of
+// messages dropped. HAND-09 applies this at handoff time using
+// ProfileLearner.OptimalPreparedSize.Mean() so the context transferred
+// to the new agent is sized by the learned posterior, not an arbitrary
+// constant.
+//
+// The summary and tool-state contributions are preserved (they survive
+// across handoffs by design); only the recent-messages tail is trimmed.
+// If the summary + tool-state contributions alone exceed the budget, no
+// trimming occurs — the caller's downstream pipeline handles the
+// over-budget case.
+func (pc *PreparedContext) TrimToTokenBudget(maxTokens int) int {
+	if maxTokens <= 0 {
+		return 0
+	}
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	if pc.tokenCount <= maxTokens {
+		return 0
+	}
+
+	dropped := 0
+	// Pop oldest messages until the token count fits. Stop if the buffer
+	// empties out before we hit the budget — the remaining summary +
+	// tool-state contribution is the floor.
+	for pc.tokenCount > maxTokens {
+		msg, ok := pc.recentMessages.popLocked()
+		if !ok {
+			break
+		}
+		// Subtract the popped message's tokens directly; a full
+		// recalculate is also correct but costs O(N) per pop.
+		pc.tokenCount -= msg.TokenCount
+		if pc.tokenCount < 0 {
+			pc.tokenCount = 0
+		}
+		dropped++
+	}
+	if dropped > 0 {
+		pc.lastUpdated = time.Now()
+		pc.version++
+	}
+	return dropped
+}
+
 // recalculateTokenCountLocked updates the total token count.
 // Caller must hold pc.mu write lock.
 func (pc *PreparedContext) recalculateTokenCountLocked() {

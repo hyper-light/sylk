@@ -70,12 +70,19 @@ func isUpperAlpha(r rune) bool { return r >= 'A' && r <= 'Z' }
 func isDigit(r rune) bool      { return r >= '0' && r <= '9' }
 
 // Store holds all vim registers with thread-safe access.
+//
+// UI-11b: the "* and "+ clipboard registers are routed through a
+// ClipboardProvider when one is installed via SetClipboard. Without a
+// provider the Store falls back to the in-memory `special` map —
+// headless tests and environments without clipboard tooling still get
+// correct semantics, they just don't bridge to the system clipboard.
 type Store struct {
-	mu       sync.RWMutex
-	named    map[rune]Entry
-	numbered [numberedRegisterCount]Entry
-	special  map[rune]Entry
-	unnamed  Entry
+	mu        sync.RWMutex
+	named     map[rune]Entry
+	numbered  [numberedRegisterCount]Entry
+	special   map[rune]Entry
+	unnamed   Entry
+	clipboard ClipboardProvider
 }
 
 // NewStore creates an empty register store.
@@ -113,9 +120,20 @@ var getterTable = map[RegisterType]getterFunc{
 	TypeNumbered:  getNumbered,
 	TypeSmallDel:  getSpecial,
 	TypeUnnamed:   getUnnamed,
-	TypeClipboard: getSpecial,
+	TypeClipboard: getClipboard,
 	TypeReadOnly:  getSpecial,
 	TypeSearch:    getSpecial,
+}
+
+// SetClipboard installs the system-clipboard provider used by the
+// "* and "+ registers. UI-11b: yank-to-clipboard and paste-from-
+// clipboard now round-trip through the OS when a provider is wired.
+// Passing nil reverts to the in-memory fallback. Safe to call at any
+// point in the store's lifetime.
+func (s *Store) SetClipboard(cb ClipboardProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clipboard = cb
 }
 
 func getNamed(s *Store, name rune) (string, bool) {
@@ -137,6 +155,32 @@ func getNumbered(s *Store, name rune) (string, bool) {
 func getSpecial(s *Store, name rune) (string, bool) {
 	e, ok := s.special[name]
 	return e.Content, ok && e.Linewise
+}
+
+// getClipboard reads the "* / "+ clipboard register. Prefers the
+// system clipboard provider when wired; falls back to the in-memory
+// `special` cache on provider errors or when no provider is set so
+// semantics stay consistent in the headless case.
+//
+// Linewise-ness never round-trips through the OS clipboard (vim uses
+// an out-of-band convention the system clipboard doesn't preserve),
+// so we mirror the local cache's flag when available and default to
+// charwise otherwise.
+func getClipboard(s *Store, name rune) (string, bool) {
+	cb := s.clipboard
+	cached, hasCache := s.special[name]
+	if cb == nil {
+		return cached.Content, hasCache && cached.Linewise
+	}
+	content, err := cb.Get()
+	if err != nil {
+		return cached.Content, hasCache && cached.Linewise
+	}
+	linewise := false
+	if hasCache && cached.Content == content {
+		linewise = cached.Linewise
+	}
+	return content, linewise
 }
 
 func getUnnamed(s *Store, _ rune) (string, bool) {
@@ -172,7 +216,7 @@ var setterTable = map[RegisterType]setterFunc{
 	TypeNumbered:  setNumbered,
 	TypeSmallDel:  setSpecial,
 	TypeUnnamed:   setUnnamed,
-	TypeClipboard: setSpecial,
+	TypeClipboard: setClipboard,
 	TypeSearch:    setSpecial,
 }
 
@@ -197,6 +241,20 @@ func setNumbered(s *Store, name rune, entry Entry) {
 
 func setSpecial(s *Store, name rune, entry Entry) {
 	s.special[name] = entry
+}
+
+// setClipboard writes to the "* / "+ clipboard register. Updates the
+// in-memory cache (preserves linewise flag for getClipboard) AND,
+// when a provider is wired, pushes the content to the OS clipboard.
+// Provider errors are swallowed intentionally — cache is still
+// updated so a subsequent Get returns the intended content, and
+// clipboard operations are not the kind of failure that should
+// cascade through the editor's key handler.
+func setClipboard(s *Store, name rune, entry Entry) {
+	s.special[name] = entry
+	if s.clipboard != nil {
+		_ = s.clipboard.Set(entry.Content)
+	}
 }
 
 func setUnnamed(s *Store, _ rune, entry Entry) {

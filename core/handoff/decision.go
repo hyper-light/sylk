@@ -312,6 +312,13 @@ type HandoffController struct {
 
 	// lastDecision caches the most recent decision.
 	lastDecision *HandoffDecision
+
+	// HAND-02: blenderLookup returns the hierarchically-blended handoff
+	// threshold for the controller's (agentType, modelID, instanceUID)
+	// triple, plus an ok flag when a blend is available. Assigned by
+	// SetBlenderLookup; nil when the controller runs standalone
+	// (supervisor-less tests, cold-start paths).
+	blenderLookup func() (float64, bool)
 }
 
 // NewHandoffController creates a new controller with the given components.
@@ -579,9 +586,42 @@ func (hc *HandoffController) createNoHandoffDecision(
 	)
 }
 
+// SetBlenderLookup installs a lookup closure that returns the
+// hierarchically-blended handoff threshold whenever the blender has
+// enough data to produce one. HAND-02: the controller now prefers
+// the blended value over the local profile mean when both are
+// available, closing the loop between cross-(agent,model) learning
+// at the supervisor and the per-agent decision path.
+//
+// Passing nil clears the lookup and reverts the controller to the
+// profile-only threshold — useful in tests that want to isolate the
+// single-level decision logic.
+func (hc *HandoffController) SetBlenderLookup(fn func() (float64, bool)) {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+	hc.blenderLookup = fn
+}
+
 // getEffectiveThreshold returns the threshold to use for decisions.
-// Uses learned profile threshold if confidence is sufficient, otherwise default.
+//
+// HAND-02 ordering:
+//  1. If the blender lookup yields a value, use it — it represents
+//     the cross-level posterior (instance + agent-model + model +
+//     global) and dominates any single-level reading.
+//  2. Otherwise, if the profile confidence clears the decision
+//     threshold, use the profile's single-level mean.
+//  3. Otherwise, fall back to the static config default.
+//
+// The three steps are layered deliberately: the blender already does
+// its own confidence weighting (see HierarchicalParamBlender.
+// blendParams), so gating it on profile confidence would double-gate
+// the blended signal and bias toward the static default.
 func (hc *HandoffController) getEffectiveThreshold() float64 {
+	if hc.blenderLookup != nil {
+		if blended, ok := hc.blenderLookup(); ok {
+			return blended
+		}
+	}
 	if hc.profile.Confidence() >= hc.config.MinConfidenceForDecision {
 		return hc.profile.GetHandoffThresholdMean()
 	}

@@ -2,6 +2,10 @@
 
 Use this guidance when you are actively driving or closing a pipeline turn.
 
+- **REQUIRED FIRST STEP — orient against the fabric.** At the start of EVERY pipeline turn, BEFORE reading workspace state or `coord_query_view`, call `inspect_open_activity(scope=<your task scope>)`. This single call returns open challenges, hot scopes, advisories, validation holds, and recent decisions in scope. Open conflicts are blocking quality issues you cannot resolve by inspecting workspace files alone. The fabric tells you in one call what would otherwise require many `coord_query_view` + `read_workspace_file` calls to reconstruct partially.
+- **REQUIRED SECOND STEP — pull peer activity context.** Immediately after `inspect_open_activity`, call `query_peer_activity(scope=<your task scope>)` to see what other agents (testers, engineers, designers) have been doing in adjacent or overlapping scopes. Peer commitments shape what your audit considers acceptable. SUPERSEDES `coord_query_view` for general orientation.
+- **Before grading or accepting** (`validate_criteria`, `grade_task_quality`, `finalize_pipeline`): re-run `inspect_open_activity` to confirm the audited scope is still clean. If it returns a non-empty `open_challenges` or `stalled_holds` set, you MUST drive resolution via `request_correction` (carrying the activity_id in evidence) before accepting.
+- **When ambient_context shows hotness or inbound disputes**, call `inspect_open_conflicts(scope=…)` to surface the contested set, then either adopt an existing thread or escalate via `request_override` to architect.
 - Start every pipeline by inspecting the task, defining or refining criteria, and choosing the first top-level handoff.
 - Default to TDD: after criteria are clear, use `handoff_next` to send Tester the initial test-authoring turn unless the task is strictly inspection-only.
 - When Tester hands back those initial tests with `handoff_next`, audit the test artifacts yourself. If the tests are off-spec, low-signal, or incomplete, issue `challenge_agent` to Tester. If the tests satisfy the contract, use `handoff_next` to activate Engineer and/or Designer for implementation.

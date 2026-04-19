@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -54,6 +56,40 @@ func (a *Archivalist) registerCoreSkills() {
 		SessionID: func() string { return a.defaultSessionID },
 		Publish:   a.publishRerouteRequest,
 	}))
+
+	// Activity Fabric: uniform awareness skills + recall.
+	a.registerFabricSkills()
+}
+
+func (a *Archivalist) registerFabricSkills() {
+	sessionID := func() string { return strings.TrimSpace(a.defaultSessionID) }
+	agentID := func() string { return a.id }
+	agentType := func() string { return "archivalist" }
+
+	for _, skill := range shared.AwarenessSkills(shared.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}) {
+		a.skills.Register(skill)
+	}
+	for _, skill := range shared.RecallSkills(shared.RecallSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}) {
+		a.skills.Register(skill)
+	}
+	for _, skill := range shared.CrossPipelineSkills(shared.CrossPipelineSkillConfig{
+		SessionID:  sessionID,
+		AgentID:    agentID,
+		AgentType:  agentType,
+		PipelineID: func() string { return "" },
+	}) {
+		a.skills.Register(skill)
+	}
 }
 
 type archivalistDiag struct{ a *Archivalist }

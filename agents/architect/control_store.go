@@ -21,6 +21,13 @@ type continuationKind string
 const (
 	continuationKindGuardianApproval continuationKind = "guardian_tool_approval"
 	continuationKindAcceptanceEval   continuationKind = "plan_acceptance_eval"
+	// continuationKindPlanApproval is the architect's pending state while
+	// Guardian's plan_approval_gate is awaiting the user's clicked verdict
+	// in the dialog. Unblocks when Guardian publishes the Decision
+	// response back to the architect; the verdict handler routes the
+	// result to actOnAccept / "ask what to change" / "ask what to do
+	// instead" based on the Verdict value.
+	continuationKindPlanApproval     continuationKind = "plan_approval_dialog"
 	continuationKindPlanHandoff      continuationKind = "plan_handoff"
 	continuationKindAcademicHandoff  continuationKind = "academic_requirements_handoff"
 )

@@ -478,6 +478,8 @@ func (a *Architect) handleContinuationResponse(msg *guide.Message) error {
 		return a.handleGuardianApprovalContinuation(msg, record)
 	case continuationKindAcceptanceEval:
 		return a.handleAcceptanceEvaluationContinuation(msg, record)
+	case continuationKindPlanApproval:
+		return a.handlePlanApprovalContinuation(msg, record)
 	case continuationKindPlanHandoff:
 		return a.handlePlanHandoffContinuation(msg, record)
 	case continuationKindAcademicHandoff:

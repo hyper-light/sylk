@@ -615,7 +615,6 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	}
 
 	agentShared.EmitDispatchACK(pi.bus, fwd.Metadata, pi.id, "inspector-pipeline", fwd.CorrelationID)
-	pi.publishActivity(events.EventTypeAgentAction, "Validating implementation quality")
 
 	reqCtx, cancel := context.WithCancel(pi.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
@@ -661,6 +660,7 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	}))
 	ctx = agentShared.WithOwnedStreamIdentity(ctx, "inspector-pipeline", "Inspector")
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
+	pi.publishActivity(ctx, events.EventTypeAgentAction, "Validating implementation quality")
 	startTime := time.Now()
 
 	// Create steering ledger for this request.
@@ -735,7 +735,7 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 		if fwd.FireAndForget {
 			return nil
 		}
-		pi.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
+		pi.publishActivity(ctx, events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(pi.generateMessageID(), fwd.CorrelationID, pi.id, err.Error())
 		return pi.bus.Publish(pi.channels.Errors, errMsg)
 	}
@@ -746,7 +746,7 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	if fwd.FireAndForget {
 		return nil
 	}
-	pi.publishActivity(events.EventTypeSuccess, "Inspection task completed")
+	pi.publishActivity(ctx, events.EventTypeSuccess, "Inspection task completed")
 
 	respData := result
 	if protocolTask != nil {
@@ -1084,12 +1084,22 @@ func (pi *PipelineInspector) SetActivityPublisher(pub events.ActivityPublisher) 
 
 // publishActivity emits a user-visible activity event so the UI agent panel
 // tracks this pipeline inspector's lifecycle.
-func (pi *PipelineInspector) publishActivity(eventType events.EventType, content string) {
+//
+// ctx is read for the inspector's current stream correlation and its
+// parent correlation (the orchestrator/dispatcher that sent the pipeline
+// task). Stamping both on the event lets the UI associate the activity
+// with the inspector's row AND keep the parent's thinking indicator
+// alive — see ParentCorrelationIDFromContext for the rationale.
+func (pi *PipelineInspector) publishActivity(ctx context.Context, eventType events.EventType, content string) {
 	if pi.activityPub == nil {
 		return
 	}
 	evt := events.NewActivityEvent(eventType, pi.config.SessionID, content)
 	evt.AgentID = pi.id
+	if stream, ok := agentShared.StreamMetadataFromContext(ctx); ok {
+		evt.CorrelationID = strings.TrimSpace(stream.CorrelationID)
+	}
+	evt.ParentCorrelationID = agentShared.ParentCorrelationIDFromContext(ctx)
 	evt.Visibility = events.VisibilityUser
 	evt.Data["agent_type"] = "inspector-pipeline"
 	evt.Data["agent_name"] = "Inspector"

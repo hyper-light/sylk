@@ -86,6 +86,17 @@ func NewLearnedWeight(alpha, beta float64) *LearnedWeight {
 	}
 }
 
+// Clone returns a deep copy of the learned weight. Callers (e.g.
+// the parameter blender) hold references that must not mutate the
+// underlying profile, so they Clone before registering.
+func (lw *LearnedWeight) Clone() *LearnedWeight {
+	if lw == nil {
+		return nil
+	}
+	cp := *lw
+	return &cp
+}
+
 // Mean returns the expected value of the Beta distribution.
 // This is the best point estimate for the learned parameter.
 func (lw *LearnedWeight) Mean() float64 {

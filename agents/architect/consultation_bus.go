@@ -274,6 +274,30 @@ func (a *Architect) requestConsultationWithMetadata(
 		SessionID:     sessionID,
 		Metadata:      shared.CloneMetadataMap(metadata),
 	}
+
+	// Session cache lookup BEFORE the live bus round-trip. Three gates
+	// (pressure dedup, freshness, coverage) must all pass for a hit;
+	// if any gate fails we fall through to a real consultation. The
+	// gates are derived from observable quantities — no thresholds.
+	// See agents/shared/consultation_cache.go for the full rationale.
+	if cacheHit := shared.LookupSessionConsultationCache(
+		shared.DefaultSessionConsultationCache,
+		sessionID,
+		target,
+		query,
+		shared.ConsultationResearchDepth(req.Metadata),
+		shared.ConsultationDepthFromMetadata(req.Metadata)+1,
+	); cacheHit.Hit {
+		a.logInfo("requestConsultation: SERVED_FROM_SESSION_CACHE",
+			"target", target,
+			"query", truncateString(query, 120),
+			"cached_query", truncateString(cacheHit.Query, 120),
+			"age", time.Since(cacheHit.StoredAt).String(),
+			"horizon", cacheHit.FreshnessHorizon.String(),
+			"reason", cacheHit.Reason)
+		return cachedConsultationEvidence(target, query, scope, cacheHit), nil
+	}
+
 	admission := shared.AdmitConsultation(ctx, target, query, req.Metadata)
 	if !admission.Allowed {
 		return failedConsultation(target, query, scope, "", shared.ConsultationAdmissionError(admission)), nil
@@ -322,7 +346,26 @@ func (a *Architect) requestConsultationWithMetadata(
 		"target", target,
 		"elapsed", elapsed.String(),
 		"correlation_id", req.CorrelationID)
-	return buildConsultationEvidence(target, query, scope, req.CorrelationID, response), nil
+	evidence := buildConsultationEvidence(target, query, scope, req.CorrelationID, response)
+
+	// Write the response into the per-session cache so future
+	// near-duplicate consults can be served without a bus round-trip.
+	// FreshnessHorizon is read from the response's freshness_horizon
+	// field — agents that want their answers cacheable commit to a
+	// validity window. Missing/zero ⇒ cache stores the entry but the
+	// lookup gate refuses to serve it (explicit contract).
+	if evidence != nil {
+		shared.StoreSessionConsultationCache(
+			shared.DefaultSessionConsultationCache,
+			sessionID,
+			target,
+			query,
+			evidence.Data,
+			shared.ExtractFreshnessHorizon(evidence.Data),
+			0, // reward: not yet computed at write time; cache uses similarity, not reward, for serve decisions
+		)
+	}
+	return evidence, nil
 }
 
 // isAgentRegistered checks whether the target agent has announced itself
@@ -337,6 +380,34 @@ func (a *Architect) isAgentRegistered(target string) bool {
 	_, ok := a.knownAgents[normalized]
 	a.knownAgentsMu.RUnlock()
 	return ok
+}
+
+// cachedConsultationEvidence wraps a session-cache hit as a fully
+// formed ConsultationEvidence so callers can't tell the answer
+// came from cache versus fresh bus call (other than via debug logs
+// and the "cached" correlation prefix). Reuses the cached payload
+// and timestamps the new evidence with the original storage time
+// for staleness telemetry.
+func cachedConsultationEvidence(target, query, scope string, hit shared.SessionCacheLookupResult) *ConsultationEvidence {
+	now := time.Now()
+	return &ConsultationEvidence{
+		Target:      target,
+		Query:       query,
+		Scope:       scope,
+		Correlation: "cached:" + uuidShortFromTime(hit.StoredAt),
+		Success:     true,
+		Data:        hit.Response,
+		RequestedAt: now,
+		ReceivedAt:  hit.StoredAt,
+	}
+}
+
+// uuidShortFromTime renders a stable short identifier from the
+// cached entry's storage timestamp. Used as the synthetic
+// Correlation prefix for cache-served evidence so logs / telemetry
+// can trace which prior consultation an answer was reused from.
+func uuidShortFromTime(t time.Time) string {
+	return t.UTC().Format("20060102T150405.000000")
 }
 
 func failedConsultation(target, query, scope, corr string, err error) *ConsultationEvidence {

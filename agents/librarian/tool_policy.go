@@ -7,7 +7,7 @@ import (
 )
 
 func librarianVisibleSkillNames() []string {
-	return shared.AppendMemoryForestVisibleSkillNames([]string{
+	base := shared.AppendMemoryForestVisibleSkillNames([]string{
 		"search_codebase",
 		"find_pattern",
 		"consult",
@@ -27,6 +27,7 @@ func librarianVisibleSkillNames() []string {
 		"summarize_workspace_state",
 		"knowledge_search",
 	}, "librarian")
+	return shared.AppendFabricAwarenessSkillNames(base)
 }
 
 func librarianMutatingSkillNames() []string {

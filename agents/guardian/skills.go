@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -39,12 +41,47 @@ func (g *Guardian) registerCoreSkills() {
 	g.skills.Register(quarantineStatusSkill(g))
 	g.skills.Register(toolExecutionControlSkill(g))
 	g.skills.Register(commandExecutionControlSkill(g))
+	g.skills.Register(planApprovalGateSkill(g))
 	g.skills.Register(shared.NewSelfDiagnosticSkill(&guardianDiag{g: g}))
 	g.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "guardian",
 		SessionID: func() string { return "" },
 		Publish:   g.publishRerouteRequest,
 	}))
+
+	// Activity Fabric: uniform awareness skills + recall.
+	g.registerFabricSkills()
+}
+
+func (g *Guardian) registerFabricSkills() {
+	sessionID := func() string { return strings.TrimSpace(g.config.SessionID) }
+	agentID := func() string { return g.id }
+	agentType := func() string { return "guardian" }
+
+	for _, skill := range shared.AwarenessSkills(shared.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}) {
+		g.skills.Register(skill)
+	}
+	for _, skill := range shared.RecallSkills(shared.RecallSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}) {
+		g.skills.Register(skill)
+	}
+	for _, skill := range shared.CrossPipelineSkills(shared.CrossPipelineSkillConfig{
+		SessionID:  sessionID,
+		AgentID:    agentID,
+		AgentType:  agentType,
+		PipelineID: func() string { return "" },
+	}) {
+		g.skills.Register(skill)
+	}
 }
 
 type guardianDiag struct{ g *Guardian }

@@ -550,6 +550,14 @@ func (m *HandoffManager) executeHandoff(
 		}
 	}()
 
+	// HAND-09: trim the prepared context to the learned optimal size
+	// before transfer. The profile learner's OptimalPreparedSize posterior
+	// is updated after every handoff outcome (see
+	// AgentHandoffProfile.updatePreparedSize); using Mean() here closes
+	// the loop so each handoff transfers a size the learner has found
+	// historically-successful for this (agent, model) pair.
+	m.applyOptimalSizeTrim(preparedCtx)
+
 	// Prepare transfer
 	transfer, err := m.executor.PrepareTransfer(decision, preparedCtx)
 	if err != nil {
@@ -899,4 +907,35 @@ func (m *HandoffManager) UnmarshalJSON(data []byte) error {
 	m.contextMu.Unlock()
 
 	return nil
+}
+
+// =============================================================================
+// HAND-09: Optimal prepared size trim
+// =============================================================================
+
+// applyOptimalSizeTrim consults the profile learner for the current
+// (agent, model) posterior mean of OptimalPreparedSize and asks the
+// PreparedContext to trim to that budget. A nil learner, missing
+// profile, or non-positive posterior is a no-op — the handoff proceeds
+// with the full context rather than incorrectly shrinking it. Callers
+// hold no locks during this call; the learner and PreparedContext each
+// manage their own synchronization.
+func (m *HandoffManager) applyOptimalSizeTrim(preparedCtx *PreparedContext) {
+	if preparedCtx == nil || m.learner == nil || m.config == nil {
+		return
+	}
+	agentID := m.config.AgentID
+	modelName := m.config.ModelName
+	if agentID == "" || modelName == "" {
+		return
+	}
+	profile := m.learner.GetProfile(agentID, modelName)
+	if profile == nil || profile.OptimalPreparedSize == nil {
+		return
+	}
+	budget := profile.OptimalPreparedSize.Mean()
+	if budget <= 0 {
+		return
+	}
+	preparedCtx.TrimToTokenBudget(budget)
 }

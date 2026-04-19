@@ -43,15 +43,23 @@ var (
 	TesterFabricAwareness = prompts.MustLoad("shared", "fabric_awareness")
 )
 
-// PipelineTesterSystemPrompt composes the full pipeline tester system prompt.
+// PipelineTesterSystemPrompt composes the full pipeline tester
+// system prompt.
+//
+// IMPORTANT ORDERING: TesterFabricAwareness is now positioned RIGHT
+// AFTER the agent identity prompt, BEFORE methodology and workflow.
+// This is the structural fix per the screenshot review — when the
+// fabric section was at the end, the LLM followed the workflow it
+// read first and never reached for fabric tools. At the top, fabric
+// awareness becomes framing for the work.
 func PipelineTesterSystemPrompt() string {
 	return PipelineSystemPrompt + "\n\n" +
+		TesterFabricAwareness + "\n\n" +
 		DiagnosisMethodology + "\n\n" +
 		TestPlanningStrategy + "\n\n" +
 		HarnessDesign + "\n\n" +
 		TesterSkillsPolicy + "\n\n" +
-		TesterGuardrails + "\n\n" +
-		TesterFabricAwareness
+		TesterGuardrails
 }
 
 // PipelineTesterSystemPromptForWorker composes the pipeline tester system prompt,
@@ -75,12 +83,12 @@ func PipelineTesterSystemPromptForWorkerAndContract(workerType string, contract 
 	}
 	base := joinPromptSections(
 		TesterTaskSystem,
+		TesterFabricAwareness, // promoted ahead of workflow
 		DiagnosisMethodology,
 		TestPlanningStrategy,
 		HarnessDesign,
 		TestCategoryDescriptions,
 		TesterGuardrails,
-		TesterFabricAwareness,
 	)
 	if workerType == "designer" {
 		return base + "\n\n" + pipelineDesignValidation
@@ -88,15 +96,17 @@ func PipelineTesterSystemPromptForWorkerAndContract(workerType string, contract 
 	return base
 }
 
-// GlobalTesterSystemPrompt composes the full global tester system prompt.
+// GlobalTesterSystemPrompt composes the full global tester system
+// prompt. Same ordering rationale as PipelineTesterSystemPrompt:
+// fabric awareness is framing, not footer.
 func GlobalTesterSystemPrompt() string {
 	return GlobalSystemPrompt + "\n\n" +
+		TesterFabricAwareness + "\n\n" +
 		DiagnosisMethodology + "\n\n" +
 		TestPlanningStrategy + "\n\n" +
 		HarnessDesign + "\n\n" +
 		TesterSkillsPolicy + "\n\n" +
 		TesterGuardrails + "\n\n" +
-		TesterFabricAwareness + "\n\n" +
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView: versioning.WorkspaceViewGlobal,
 		})
@@ -112,12 +122,12 @@ func GlobalTesterSystemPromptForContract(contract *agentshared.GlobalExecutionCo
 	}
 	return joinPromptSections(
 		TesterGlobalTaskSystem,
+		TesterFabricAwareness, // promoted ahead of workflow
 		DiagnosisMethodology,
 		TestPlanningStrategy,
 		HarnessDesign,
 		TestCategoryDescriptions,
 		TesterGuardrails,
-		TesterFabricAwareness,
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView: versioning.WorkspaceViewGlobal,
 		}),

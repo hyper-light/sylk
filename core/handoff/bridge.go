@@ -114,6 +114,12 @@ type HandoffBridge struct {
 	// Optional activity publisher for UI-facing handoff state updates.
 	activityPub events.ActivityPublisher
 
+	// archivePublisher — HAND-05. Fire-and-forget sink for
+	// ArchiveRequests the bridge emits at lifecycle transitions.
+	// Propagated from HandoffSupervisor.SetArchivePublisher; nil when
+	// the supervisor has no publisher configured (archival disabled).
+	archivePublisher ArchivePublisher
+
 	// Latest per-request trace metadata for async handoff recommendations.
 	lastTrace bridgeTraceMeta
 
@@ -145,6 +151,25 @@ func NewHandoffBridge(cfg BridgeConfig, agent HandoffableAgent, sup *HandoffSupe
 	profile := NewAgentHandoffProfile(desc.AgentType, desc.ModelID, agent.AgentID())
 	controller := NewHandoffController(gp, profile, nil)
 
+	// HAND-02: install the blender-lookup closure so getEffectiveThreshold
+	// prefers the supervisor's hierarchical blended view over the local
+	// profile when one is available. Captures identity triple by value
+	// — bridges do not move between (agentType, modelID, agentID).
+	agentType := desc.AgentType
+	modelID := desc.ModelID
+	instanceUID := agent.AgentID()
+	controller.SetBlenderLookup(func() (float64, bool) {
+		blender := sup.Blender()
+		if blender == nil {
+			return 0, false
+		}
+		blended, ok := blender.GetBlended(agentType, modelID, instanceUID, BlenderParamHandoffThreshold)
+		if !ok || blended == nil {
+			return 0, false
+		}
+		return blended.Value, true
+	})
+
 	qualityHook := NewDefaultQualityAssessorHook(cfg.QualityConfig, sup.profileLearner)
 	contextCheck := NewContextCheckHook(controller, cfg.ContextConfig)
 	prepared := NewPreparedContextDefault()
@@ -164,19 +189,20 @@ func NewHandoffBridge(cfg BridgeConfig, agent HandoffableAgent, sup *HandoffSupe
 	)
 
 	b := &HandoffBridge{
-		config:       cfg,
-		agent:        agent,
-		supervisor:   sup,
-		manager:      manager,
-		qualityHook:  qualityHook,
-		gp:           gp,
-		profile:      profile,
-		contextCheck: contextCheck,
-		eviction:     eviction,
-		prepared:     prepared,
-		fuser:        fuser,
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan struct{}),
+		config:           cfg,
+		agent:            agent,
+		supervisor:       sup,
+		manager:          manager,
+		qualityHook:      qualityHook,
+		gp:               gp,
+		profile:          profile,
+		contextCheck:     contextCheck,
+		eviction:         eviction,
+		prepared:         prepared,
+		fuser:            fuser,
+		archivePublisher: sup.ArchivePublisher(),
+		stopCh:           make(chan struct{}),
+		doneCh:           make(chan struct{}),
 	}
 
 	// Standalone and pipeline agents get a parallel buffer for async
@@ -308,6 +334,19 @@ func (b *HandoffBridge) RecordTurn(rec TurnRecord) {
 		},
 	)
 
+	// HAND-02: push the updated profile's threshold posterior into the
+	// hierarchical blender at the instance + agent-model levels, so
+	// downstream callers (controllers on this or sibling bridges) can
+	// consult a cross-bridge blended view. SyncBlenderFromProfile is
+	// cheap (three clones + two map writes) and fail-safe on nil
+	// anywhere in the chain.
+	b.supervisor.SyncBlenderFromProfile(
+		b.config.Descriptor.AgentType,
+		b.config.Descriptor.ModelID,
+		b.agent.AgentID(),
+		b.profile,
+	)
+
 	ctxState := &ContextState{
 		AgentID:        b.agent.AgentID(),
 		AgentType:      b.agent.AgentType(),
@@ -332,6 +371,11 @@ func (b *HandoffBridge) RecordTurn(rec TurnRecord) {
 			},
 			gpObs,
 		)
+		// HAND-07: rate-limited profile checkpoint. Internal ShouldPersist
+		// gate in ProfileLearner ensures at most one flush per
+		// PersistenceInterval across the supervisor, so per-turn calls
+		// amortize to near-zero cost outside the flush window.
+		_ = b.supervisor.MaybeCheckpointProfiles()
 	}
 
 	// Feed parallel buffer with optional stress sideband.
@@ -974,7 +1018,16 @@ func (b *HandoffBridge) handleHandoffResult(result *HandoffResult) error {
 
 	b.mu.RLock()
 	oldID := b.agent.AgentID()
+	outgoing := b.agent
 	b.mu.RUnlock()
+
+	// HAND-05: emit an ArchiveRequest for the outgoing agent BEFORE the
+	// replacement swap. The request carries the extracted state plus the
+	// identity/task triple; the Archivalist consumes asynchronously so
+	// this call does not block the handoff's critical path. Publishing
+	// before ReplaceAgent means ExtractArchivableState still sees the
+	// outgoing agent's final state rather than an empty replacement.
+	b.publishArchiveRequest(outgoing, ArchiveReasonHandoffComplete)
 
 	// Notify supervisor of replacement.
 	if b.supervisor.onAgentReplaced != nil {
@@ -1004,6 +1057,36 @@ func (b *HandoffBridge) handleHandoffResult(result *HandoffResult) error {
 	}
 
 	return nil
+}
+
+// publishArchiveRequest fires an ArchiveRequest at the installed
+// publisher. HAND-05 contract: fire-and-forget — the publisher must
+// return quickly and any errors are recorded on the trace but never
+// propagated to the handoff's critical path. A nil publisher is a
+// valid configuration (archival disabled); the method becomes a
+// no-op in that case.
+func (b *HandoffBridge) publishArchiveRequest(agent HandoffableAgent, reason ArchiveReason) {
+	b.mu.RLock()
+	publisher := b.archivePublisher
+	meta := b.lastTrace
+	b.mu.RUnlock()
+	if publisher == nil {
+		return
+	}
+	req := newArchiveRequestFromBridge(agent, reason, meta.SessionID, meta.CorrelationID)
+	if req == nil {
+		return
+	}
+	// Use a detached context — the publisher may outlive the handoff's
+	// ctx when it buffers or batches, and we never want archival writes
+	// cancelled because the triggering ctx finished.
+	if err := publisher.PublishArchive(context.Background(), req); err != nil {
+		b.emitHandoffTrace("archive_publish_failed", "warn", err, map[string]any{
+			"reason":    string(reason),
+			"agent_id":  req.SourceAgentID,
+			"agent_typ": req.AgentType,
+		})
+	}
 }
 
 func (b *HandoffBridge) observeContextEvaluation(ctx *ContextState, recommendation *HandoffRecommendation) {

@@ -329,6 +329,16 @@ func pipelineTaskStateForUpdate(status, stage string) taskstate.Status {
 // pipeline VFS here, which destroyed it while the inspector still had
 // follow-up work queued — that path is now removed.
 func (o *Orchestrator) finalizePipelineUpdate(update *PipelineUpdate) bool {
+	return o.finalizePipelineUpdateCtx(context.Background(), update)
+}
+
+// finalizePipelineUpdateCtx mirrors finalizePipelineUpdate but accepts an
+// explicit ctx so the orchestrator's pipeline supervisor session (opened
+// in handlePipelineUpdate) threads through the dispatch path. Followup
+// routes published here then carry the supervisor session's correlation
+// and can emit dispatching_to_peer state that the UI bridge renders as
+// the "what's happening during the handoff" indicator.
+func (o *Orchestrator) finalizePipelineUpdateCtx(ctx context.Context, update *PipelineUpdate) bool {
 	if update == nil || strings.TrimSpace(update.TaskID) == "" || !isPipelineCommitAgent(update.AgentType) {
 		return false
 	}
@@ -351,7 +361,7 @@ func (o *Orchestrator) finalizePipelineUpdate(update *PipelineUpdate) bool {
 			checkpointReader = svfs
 		}
 		checkpointVersion, reviewCandidateID, hadDraft := readInspectorHandoffOutcome(update, checkpointReader)
-		err := o.publishOTGlobalFollowupRequest(context.Background(), task, update, checkpointVersion, hadDraft, reviewCandidateID)
+		err := o.publishOTGlobalFollowupRequest(ctx, task, update, checkpointVersion, hadDraft, reviewCandidateID)
 		if err != nil {
 			if reviewCandidateID != "" {
 				if svfs := o.GetSessionVFS(task.SessionID); svfs != nil {

@@ -121,6 +121,24 @@ type Architect struct {
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
 	requestSerializer *shared.RequestSerializer
+
+	// Plan presentation audit cache: keyed by plan.ID, holds the most
+	// recent freshness audit (with reconsult evidence already folded
+	// in). Both the dialog publish path and the conversation context
+	// enrichment path read from this so the audit runs ONCE per
+	// presentation event rather than once per consumer. Entries
+	// expire after planAuditCacheTTL.
+	planAuditCacheMu sync.Mutex
+	planAuditCache   map[string]*planAuditCacheEntry
+}
+
+// planAuditCacheEntry holds a freshness audit cached for the duration
+// of a single plan presentation. Stored on the architect (not on the
+// plan itself) so it stays a transient runtime concern, not part of
+// the plan's persisted state.
+type planAuditCacheEntry struct {
+	audit     *PlanFreshnessAudit
+	timestamp time.Time
 }
 
 // Config holds configuration for the Architect agent
@@ -576,6 +594,7 @@ func (a *Architect) initSkills() error {
 	a.skills = skills.NewRegistry()
 	a.hooks = skills.NewHookRegistry()
 	a.registerCoreSkills()
+	a.registerFabricSkills()
 	if err := shared.RegisterMemoryForestSkills(a.skills, "architect", a.config.Forest, a.forestTracker); err != nil {
 		return fmt.Errorf("register architect forest skills: %w", err)
 	}
@@ -1631,6 +1650,16 @@ func (a *Architect) handlePlanFeedback(ctx context.Context, fwd *guide.Forwarded
 			a.publishPlanStreamChunk(ctx, text)
 		},
 	}
+	// handlePlanFeedback is always a resume — the user is responding to
+	// a plan that was previously presented. Pass isResume=true so the
+	// reconsult fan-out covers every originally-engaged knowledge agent
+	// regardless of drift signals.
+	a.applyFreshnessAuditToConversation(ctx, plan, true, func(summary string, signals []string, hint string, recommendation string) {
+		request.FreshnessSummary = summary
+		request.FreshnessDriftSignals = signals
+		request.OrchestratorStateHint = hint
+		request.FreshnessRecommendation = recommendation
+	})
 
 	response, err := a.composeUserFacingResponse(ctx, request)
 	if err != nil {
@@ -1744,11 +1773,30 @@ var approvalDisqualifiers = []string{
 	"question", "why ", "?",
 }
 
+// feedbackReadyDirective returns the ResponseDirective for a Ready plan AND
+// (as a side-effect) ensures the Approve / Modify / Reject dialog has been
+// published. Every code path that presents a Ready plan to the user routes
+// through this single chokepoint, so triggering the dialog here makes
+// publication unconditional regardless of what the LLM says or does in its
+// narrative response.
+//
+// Idempotent — presentPlanApprovalDialogBestEffort is itself a no-op when a
+// pending plan-approval continuation already exists for the plan, so calling
+// this on every turn is safe. Async-safe — the dialog publish is fire-and-
+// forget so even if Guardian is momentarily unreachable we still return the
+// directive to keep the conversation flowing.
 func (a *Architect) feedbackReadyDirective(plan *DesignPlan) *guide.ResponseDirective {
 	if plan == nil {
 		return nil
 	}
-	return plan.ReadyDirective()
+	directive := plan.ReadyDirective()
+	if directive != nil {
+		// Best-effort dialog publish. Uses background context so a
+		// cancelled request doesn't strand the dialog; the dialog has
+		// its own 10-minute Guardian-side timeout.
+		a.presentPlanApprovalDialogBestEffort(context.Background(), plan)
+	}
+	return directive
 }
 
 // handleExecute processes explicit execution intents classified by the Guide.
@@ -2655,7 +2703,7 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 	// Inject session plan context so the LLM has continuity even when
 	// conversation history is degraded (e.g. prior protocols hung and
 	// never delivered agent replies back to the Guide).
-	a.enrichConversationWithPlanContext(&request, req)
+	a.enrichConversationWithPlanContext(ctx, &request, req)
 	a.enrichConversationWithRecentRecall(ctx, &request, req)
 	a.logInfo("executeConversation: calling composeUserFacingResponse",
 		"has_plan_summary", request.PlanSummary != "",
@@ -2677,13 +2725,21 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 		}
 		// If a ready plan now exists (e.g. the tool loop called planning
 		// skills that created one), arm the Guide's phase gate so the
-		// next user message gets plan-approval classification.
+		// next user message gets plan-approval classification AND
+		// publish the plan acceptance dialog through Guardian. The
+		// dialog is the canonical decision mechanism for plan
+		// acceptance — three explicit buttons (Approve / Modify /
+		// Reject) replace the brittle free-form-text classification
+		// path. The phase-gate directive remains as a fallback so
+		// users who type a response in chat instead of clicking the
+		// dialog still get classified routing.
 		if plan := a.latestReadyPlan(req.SessionID); plan != nil {
 			result.Directive = a.feedbackReadyDirective(plan)
 			architectDebugLog().Info("executeConversation: DIRECTIVE_SET",
 				"plan_id", plan.ID,
 				"session_id", req.SessionID,
 				"phase", string(result.Directive.Phase))
+			a.presentPlanApprovalDialogBestEffort(ctx, plan)
 		} else if stalled := a.latestStalledPlanForRequest(req.SessionID, requestCorrelationID); stalled != nil {
 			// The tool loop started a plan (via start_planning) but
 			// couldn't complete it — e.g. API overloaded mid-protocol.
@@ -2691,6 +2747,7 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 			a.recoverStalledPlan(ctx, stalled)
 			if plan := a.latestReadyPlan(req.SessionID); plan != nil {
 				result.Directive = a.feedbackReadyDirective(plan)
+				a.presentPlanApprovalDialogBestEffort(ctx, plan)
 			}
 		} else {
 			architectDebugLog().Info("executeConversation: NO_READY_PLAN",
@@ -2738,8 +2795,18 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 // planner requests. It prefers an explicitly recovered ready plan from request
 // params so conversations remain grounded even after architect cold-start or
 // session drift. Otherwise it falls back to the latest historical plan for the
-// current session.
-func (a *Architect) enrichConversationWithPlanContext(request *plannerConversationRequest, req *ArchitectRequest) {
+// current session — but ONLY if that plan is in Ready state (resumable). For
+// Executing / Completed / Failed / Superseded plans, injecting the summary
+// would mislead the LLM into thinking "we already have a plan for this" when
+// the user is making a brand new request, suppressing start_planning calls.
+//
+// When a recovered Ready plan is attached, also runs the audit chokepoint
+// in resume mode so the LLM's narrative context includes the freshness
+// summary, drift signals, orchestrator state hint, and re-consultation
+// evidence. Without this the LLM would render the plan from stale context;
+// the dialog would still be auto-published but the chat narrative would
+// have no audit findings to reference.
+func (a *Architect) enrichConversationWithPlanContext(ctx context.Context, request *plannerConversationRequest, req *ArchitectRequest) {
 	if request == nil || req == nil {
 		return
 	}
@@ -2748,10 +2815,23 @@ func (a *Architect) enrichConversationWithPlanContext(request *plannerConversati
 		if request.normalizedMode() == plannerConversationModeConverse {
 			request.Mode = plannerConversationModeExistingReady
 		}
+		a.applyFreshnessAuditToConversation(ctx, plan, true, func(summary string, signals []string, hint string, recommendation string) {
+			request.FreshnessSummary = summary
+			request.FreshnessDriftSignals = signals
+			request.OrchestratorStateHint = hint
+			request.FreshnessRecommendation = recommendation
+		})
 		return
 	}
 	plan := a.latestHistoricalPlanForSession(req.SessionID)
 	if plan == nil {
+		return
+	}
+	// Only inject if the plan is Ready (resumable). Executing/terminal
+	// plans are NOT actionable context for a fresh request — surfacing
+	// them as PlanSummary causes the LLM to chat about the existing
+	// plan instead of invoking start_planning for the user's new ask.
+	if plan.SM().State() != PlanStatusReady {
 		return
 	}
 	populatePlannerConversationRequestFromPlan(request, plan)

@@ -652,7 +652,6 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	}
 
 	agentshared.EmitDispatchACK(pt.bus, fwd.Metadata, pt.id, "tester-pipeline", fwd.CorrelationID)
-	pt.publishActivity(events.EventTypeAgentAction, "Validating implementation quality")
 
 	reqCtx, cancel := context.WithCancel(pt.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
@@ -681,6 +680,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	}))
 	ctx = agentshared.WithOwnedStreamIdentity(ctx, "tester-pipeline", "Tester")
 	ctx, usageAcc := agentshared.WithUsageAccumulator(ctx)
+	pt.publishActivity(ctx, events.EventTypeAgentAction, "Validating implementation quality")
 	ctx = agentshared.WithSteeringLedger(ctx, ledger)
 	ctx = agentshared.WithLogMeta(ctx, agentshared.LogMeta{
 		EventLogger: pt.steering.EventLogger(),
@@ -775,7 +775,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 		agentshared.PublishStreamError(pt.bus, pt.channels, ctx, pt.id, err)
 		agentshared.PublishStreamComplete(pt.bus, pt.channels, ctx, pt.id, "", usageAcc.Total())
 		resp.Error = err.Error()
-		pt.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
+		pt.publishActivity(ctx, events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
 			pt.generateMessageID(),
 			fwd.CorrelationID,
@@ -795,7 +795,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	}
 	resp.Data = agentshared.BuildPipelineTurnResponse(ctx, respData)
 	agentshared.PublishStreamComplete(pt.bus, pt.channels, ctx, pt.id, "", usageAcc.Total())
-	pt.publishActivity(events.EventTypeSuccess, "Validation task completed")
+	pt.publishActivity(ctx, events.EventTypeSuccess, "Validation task completed")
 
 	if pt.agentPod != nil {
 		pt.agentPod.FeedScribe("tester-pipeline", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
@@ -926,12 +926,22 @@ func (pt *PipelineTester) SetActivityPublisher(pub events.ActivityPublisher) {
 
 // publishActivity emits a user-visible activity event so the UI agent panel
 // tracks this pipeline tester's lifecycle.
-func (pt *PipelineTester) publishActivity(eventType events.EventType, content string) {
+//
+// ctx carries the tester's stream correlation and the parent
+// correlation (the orchestrator/dispatcher that dispatched the
+// pipeline task). Stamping both lets the UI route activity to the
+// right row AND keep the parent's thinking indicator alive while the
+// tester runs.
+func (pt *PipelineTester) publishActivity(ctx context.Context, eventType events.EventType, content string) {
 	if pt.activityPub == nil {
 		return
 	}
 	evt := events.NewActivityEvent(eventType, pt.config.SessionID, content)
 	evt.AgentID = pt.id
+	if stream, ok := agentshared.StreamMetadataFromContext(ctx); ok {
+		evt.CorrelationID = strings.TrimSpace(stream.CorrelationID)
+	}
+	evt.ParentCorrelationID = agentshared.ParentCorrelationIDFromContext(ctx)
 	evt.Visibility = events.VisibilityUser
 	evt.Data["agent_type"] = "tester-pipeline"
 	evt.Data["agent_name"] = "Tester"

@@ -4,6 +4,14 @@ Drive implementation through the task contract, the coordination ledger, workspa
 
 This pipeline is TDD-aware. Treat inspector criteria and tester outputs as executable task context, not as background noise.
 
+## Required Fabric Orientation (BEFORE you do anything else this turn)
+
+1. Call `query_peer_activity(scope=<your task scope>)` first. See what other agents (testers, designers, other engineers) have committed to in your scope or adjacent scopes. PREFER this over `coord_query_view` for general orientation — the fabric covers more in one call.
+2. If `query_peer_activity` surfaces a `decision_declared` or `decision_promoted` for `build_backend`, `module_layout`, `code_style`, `linter_backend`, or `import_strategy` overlapping your scope, ADOPT IT. Do not declare your own conflicting choice.
+3. If your `ambient_context` shows `inbound_disputes` or `inbound_consults`, address them THIS TURN via `validate_work` (for disputes) or by responding to the consult.
+4. If `ambient_context` shows a `hotness_advisory` for your scope, call `inspect_open_conflicts(scope=…)` before declaring anything new — adopt an existing thread when possible.
+5. Use `recall_my_history(scope=…)` when you suspect you've covered ground before in this session — your scribe holds the longitudinal view.
+
 ## Core Flow
 
 - Validate scope before you start mutating code.

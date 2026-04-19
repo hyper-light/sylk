@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/knowledge/query"
 	"github.com/adalundhe/sylk/core/search"
@@ -74,6 +75,40 @@ func (l *Librarian) registerCoreSkills() {
 		SessionID: func() string { return "" },
 		Publish:   l.publishRerouteRequest,
 	}))
+
+	// Activity Fabric: uniform awareness skills + recall.
+	l.registerFabricSkills()
+}
+
+func (l *Librarian) registerFabricSkills() {
+	sessionID := func() string { return strings.TrimSpace(l.config.SessionID) }
+	agentID := func() string { return l.id }
+	agentType := func() string { return "librarian" }
+
+	for _, skill := range shared.AwarenessSkills(shared.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}) {
+		l.skills.Register(skill)
+	}
+	for _, skill := range shared.RecallSkills(shared.RecallSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}) {
+		l.skills.Register(skill)
+	}
+	for _, skill := range shared.CrossPipelineSkills(shared.CrossPipelineSkillConfig{
+		SessionID:  sessionID,
+		AgentID:    agentID,
+		AgentType:  agentType,
+		PipelineID: func() string { return "" },
+	}) {
+		l.skills.Register(skill)
+	}
 }
 
 type librarianDiag struct{}

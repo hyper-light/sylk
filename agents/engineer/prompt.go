@@ -19,15 +19,20 @@ var (
 	EngineerFabricAwarenessPrompt  = prompts.MustLoad("shared", "fabric_awareness")
 
 	// DefaultEngineerSystemPrompt composes all modules with separators.
+	//
+	// IMPORTANT ORDERING: EngineerFabricAwarenessPrompt comes RIGHT
+	// AFTER core identity, BEFORE protocol/skills. The screenshot
+	// review showed the LLM follows the workflow it reads first;
+	// fabric must be framing, not a footer.
 	DefaultEngineerSystemPrompt = strings.Join([]string{
 		EngineerSystemCorePrompt,
+		EngineerFabricAwarenessPrompt,
 		EngineerSystemProtocolPrompt,
 		EngineerSystemConsultPrompt,
 		EngineerSystemSkillsPrompt,
 		EngineerSystemGuardrailsPrompt,
 		EngineerSystemAuditPrompt,
 		EngineerSystemCollabPrompt,
-		EngineerFabricAwarenessPrompt,
 	}, "\n\n---\n\n")
 
 	// DefaultSystemPrompt is the composed system prompt (alias for backward compat).
@@ -44,12 +49,12 @@ func EngineerSystemPromptForContract(contract *shared.TaskExecutionContract) str
 	}
 	return strings.Join([]string{
 		EngineerSystemCorePrompt,
+		EngineerFabricAwarenessPrompt, // promoted ahead of workflow
 		EngineerSystemConsultPrompt,
 		EngineerSystemSkillsPrompt,
 		EngineerSystemGuardrailsPrompt,
 		EngineerSystemAuditPrompt,
 		EngineerSystemCollabPrompt,
-		EngineerFabricAwarenessPrompt,
 	}, "\n\n---\n\n")
 }
 

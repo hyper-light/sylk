@@ -870,6 +870,84 @@ func outcomeLabels(status OutcomeStatus) (float64, float64) {
 	}
 }
 
+// loadRelayCofire returns the normalized lifetime co-fire evidence for each
+// supplied branch. MEM-04: the Booster model consumes this in addition to
+// the decay-sensitive relay weight so a branch that has been historically
+// relevant (many cofires over time) ranks higher than one that happens to
+// have a high current weight but little history.
+//
+// Normalization: SUM(cofire_count) across both source and target edges,
+// passed through log1p to damp blockbuster edges, then divided by the
+// batch max to produce a [0, 1] feature. This matches the shape of
+// loadRelayMass so the downstream combine is monotonic.
+func (m *MemoryForest) loadRelayCofire(ctx context.Context, branchIDs []string) (map[string]float64, error) {
+	branchIDs = dedupeStrings(branchIDs)
+	result := make(map[string]float64, len(branchIDs))
+	if len(branchIDs) == 0 {
+		return result, nil
+	}
+
+	placeholders := make([]string, 0, len(branchIDs))
+	args := make([]any, 0, len(branchIDs)*2)
+	for _, branchID := range branchIDs {
+		placeholders = append(placeholders, "?")
+		args = append(args, branchID)
+	}
+	for _, branchID := range branchIDs {
+		args = append(args, branchID)
+	}
+
+	rows, err := m.db.QueryContext(ctx, `
+		SELECT branch_id, SUM(cofire_count)
+		FROM (
+			SELECT source_branch_id AS branch_id, cofire_count
+			FROM forest_relay_edges
+			WHERE source_branch_id IN (`+strings.Join(placeholders, ",")+`)
+			UNION ALL
+			SELECT target_branch_id AS branch_id, cofire_count
+			FROM forest_relay_edges
+			WHERE target_branch_id IN (`+strings.Join(placeholders, ",")+`)
+		)
+		GROUP BY branch_id
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query relay cofire: %w", err)
+	}
+	defer rows.Close()
+
+	// First pass: gather raw sums, applying log1p so a branch with 100
+	// cofires doesn't dominate the feature vector ×10 over one with 10.
+	raw := make(map[string]float64, len(branchIDs))
+	var maxScaled float64
+	for rows.Next() {
+		var (
+			branchID string
+			count    int64
+		)
+		if err := rows.Scan(&branchID, &count); err != nil {
+			return nil, fmt.Errorf("scan relay cofire: %w", err)
+		}
+		scaled := math.Log1p(float64(count))
+		raw[branchID] = scaled
+		if scaled > maxScaled {
+			maxScaled = scaled
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Second pass: divide by batch max so the feature is always in [0, 1].
+	// If every branch has zero cofires, result map stays empty (which is
+	// the correct signal — no learned association).
+	if maxScaled > 0 {
+		for branchID, scaled := range raw {
+			result[branchID] = scaled / maxScaled
+		}
+	}
+	return result, nil
+}
+
 func (m *MemoryForest) loadRelayMass(ctx context.Context, branchIDs []string) (map[string]float64, error) {
 	branchIDs = dedupeStrings(branchIDs)
 	result := make(map[string]float64, len(branchIDs))

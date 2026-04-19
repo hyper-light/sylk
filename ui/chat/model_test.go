@@ -352,72 +352,6 @@ func TestConcurrentStreamThinkingAnimatesSecondaryPipelineEntry(t *testing.T) {
 	}
 }
 
-func TestRenderActivityBridge_MultipleConcurrentPendingStates(t *testing.T) {
-	m := New(theme.DefaultDark(), 16)
-	m.SetSize(120, 24)
-
-	// Two concurrent pipelines each publish a non-terminal state with no
-	// streaming entry to own them (the routing gap between complete of
-	// agent A and start of agent B). Both should render as bridge rows —
-	// the single-bridge model clobbered one with the other before this
-	// test existed.
-	comp, _ := m.Update(msg.AgentStateMsg{
-		SessionID:     "s1",
-		CorrelationID: "pipeline-A-cid",
-		AgentID:       "engineer-A",
-		AgentType:     "engineer",
-		State:         "reasoning",
-		TransitionID:  10,
-	})
-	m = comp.(*Model)
-
-	comp, _ = m.Update(msg.AgentStateMsg{
-		SessionID:     "s1",
-		CorrelationID: "pipeline-B-cid",
-		AgentID:       "tester-B",
-		AgentType:     "tester-pipeline",
-		State:         "awaiting_peer_response",
-		Detail:        "awaiting engineer handoff",
-		TransitionID:  11,
-	})
-	m = comp.(*Model)
-
-	rendered := m.renderActivityBridge()
-	if rendered == "" {
-		t.Fatal("expected bridge to render for pending concurrent states")
-	}
-	lines := strings.Split(rendered, "\n")
-	if len(lines) != 2 {
-		t.Fatalf("bridge line count = %d, want 2 (one per concurrent state); got:\n%s", len(lines), rendered)
-	}
-	if !strings.Contains(lines[0], "engineer") {
-		t.Fatalf("first bridge line missing engineer label: %q", lines[0])
-	}
-	if !strings.Contains(lines[1], "tester-pipeline") {
-		t.Fatalf("second bridge line missing tester-pipeline label: %q", lines[1])
-	}
-
-	// A terminal state on the first correlation evicts it; only the
-	// second bridge row should remain.
-	comp, _ = m.Update(msg.AgentStateMsg{
-		SessionID:     "s1",
-		CorrelationID: "pipeline-A-cid",
-		AgentID:       "engineer-A",
-		AgentType:     "engineer",
-		State:         "complete",
-		TransitionID:  12,
-	})
-	m = comp.(*Model)
-	rendered = m.renderActivityBridge()
-	lines = strings.Split(rendered, "\n")
-	if len(lines) != 1 {
-		t.Fatalf("after terminal on A: line count = %d, want 1; got:\n%s", len(lines), rendered)
-	}
-	if !strings.Contains(lines[0], "tester-pipeline") {
-		t.Fatalf("remaining bridge line missing tester-pipeline label: %q", lines[0])
-	}
-}
-
 func TestAgentStateMsg_SurfacesReasoningOnStreamingEntry(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 
@@ -476,6 +410,81 @@ func TestAgentStateMsg_SurfacesReasoningOnStreamingEntry(t *testing.T) {
 	m = comp.(*Model)
 	if _, ok := m.agentStates["c1"]; ok {
 		t.Fatal("agentStates still holds correlation after terminal state")
+	}
+}
+
+func TestAgentStateMsg_ChildEventKeepsParentThinkingAlive(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+
+	// Open a parent stream (tester-pipeline).
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "parent",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+	})
+	m = comp.(*Model)
+
+	// Parent begins reasoning.
+	comp, _ = m.Update(msg.AgentStateMsg{
+		SessionID:     "s1",
+		CorrelationID: "parent",
+		AgentID:       "tester-pipeline",
+		AgentType:     "tester-pipeline",
+		State:         "reasoning",
+		TransitionID:  1,
+	})
+	m = comp.(*Model)
+
+	parentEntry := m.history.Last()
+	if parentEntry == nil {
+		t.Fatal("expected parent streaming entry")
+	}
+	if parentEntry.ThinkingStatus != "Reasoning..." {
+		t.Fatalf("parent ThinkingStatus = %q, want \"Reasoning...\"", parentEntry.ThinkingStatus)
+	}
+
+	// Guardian approval lands on its own correlation but carries
+	// ParentCorrelationID. The parent's row must surface the child
+	// detail as its status so the spinner doesn't go stale.
+	comp, _ = m.Update(msg.AgentStateMsg{
+		SessionID:           "s1",
+		CorrelationID:       "guardian-approval",
+		ParentCorrelationID: "parent",
+		AgentID:             "guardian",
+		AgentType:           "guardian",
+		State:               "reasoning",
+		Detail:              "Reviewing command",
+		TransitionID:        2,
+	})
+	m = comp.(*Model)
+
+	parentEntry = m.history.Last()
+	if parentEntry == nil {
+		t.Fatal("expected parent entry to still be present")
+	}
+	if parentEntry.ThinkingStatus != "Reviewing command" {
+		t.Fatalf("parent ThinkingStatus after child non-terminal = %q, want \"Reviewing command\"", parentEntry.ThinkingStatus)
+	}
+
+	// Child terminal must NOT clear the parent's indicator — only the
+	// child finished. The parent's own last state (reasoning) wins.
+	comp, _ = m.Update(msg.AgentStateMsg{
+		SessionID:           "s1",
+		CorrelationID:       "guardian-approval",
+		ParentCorrelationID: "parent",
+		AgentID:             "guardian",
+		AgentType:           "guardian",
+		State:               "complete",
+		TransitionID:        3,
+	})
+	m = comp.(*Model)
+	if _, ok := m.agentStates["parent"]; !ok {
+		t.Fatal("parent state evicted on child terminal — ownership lost")
+	}
+	parentEntry = m.history.Last()
+	if parentEntry.ThinkingStatus != "Reasoning..." {
+		t.Fatalf("parent ThinkingStatus after child terminal = %q, want \"Reasoning...\" (parent's own state)", parentEntry.ThinkingStatus)
 	}
 }
 

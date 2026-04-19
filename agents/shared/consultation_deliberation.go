@@ -34,6 +34,38 @@ type consultationObservation struct {
 	Reward       float64 `json:"reward,omitempty"`
 	Allowed      bool    `json:"allowed,omitempty"`
 	OutcomeKnown bool    `json:"outcome_known,omitempty"`
+
+	// SessionID enables cross-turn cache lookup via
+	// SessionConsultationCache. Carried from the request that
+	// produced the attempt so the cache can scope hits to the
+	// correct session without scraping context.
+	SessionID string `json:"session_id,omitempty"`
+
+	// Query is the verbatim user-facing query string. The fingerprint
+	// is derived from it but we keep the original for telemetry, debug,
+	// and reconstruction of cached evidence at serve-time.
+	Query string `json:"query,omitempty"`
+
+	// Response payload from a successful consultation. Stored at
+	// outcome-record time so the session cache can serve the answer
+	// back without a fresh bus round-trip when the existing pressure
+	// math says re-asking would be denied. Nil when the consultation
+	// failed or the cache layer was disabled.
+	Response any `json:"response,omitempty"`
+
+	// FreshnessHorizon is the agent-self-reported duration over
+	// which this answer remains valid. Cache lookups treat entries
+	// older than (StoredAt + FreshnessHorizon) as stale and force a
+	// re-ask. A zero or unset horizon is treated as "expires
+	// immediately" — the cache will not serve it. This makes the
+	// freshness contract explicit: agents either commit to a
+	// horizon or their answers are not eligible for cached re-use.
+	FreshnessHorizon time.Duration `json:"freshness_horizon,omitempty"`
+
+	// StoredAt is the wall-clock time the response was recorded
+	// (post-RecordConsultationOutcome). Used together with
+	// FreshnessHorizon for staleness checks.
+	StoredAt time.Time `json:"stored_at,omitempty"`
 }
 
 type consultationTargetStats struct {
@@ -86,6 +118,67 @@ func ConsultationPressureRecovery(err error) []string {
 	return append([]string(nil), pressureErr.Recovery...)
 }
 
+// admissionInputs captures the per-attempt quantities the pressure
+// math operates over. Extracted as a value type so the cache layer
+// can synthesize a virtual ledger view of "what would admission say
+// if the cached observations were the only history?" without
+// duplicating the math.
+type admissionInputs struct {
+	Target          string
+	Fingerprint     string
+	Tokens          map[string]struct{}
+	NextDepth       int
+	ResearchDepth   ResearchDepth
+	Similarity      float64
+	TargetCount     int
+	ConsultCount    int
+	DistinctTargets int
+	GlobalReward    float64
+	TargetReward    float64
+}
+
+// admissionVerdict is the pure-math output of evaluateAdmission. It
+// mirrors the subset of ConsultationAdmission that doesn't require
+// ledger mutation, so callers can compare "would this be admitted?"
+// without recording an attempt.
+type admissionVerdict struct {
+	Allowed      bool
+	Novelty      float64
+	Penalty      float64
+	ExpectedGain float64
+}
+
+// evaluateAdmission is the pure pressure decision: takes the
+// per-attempt inputs and returns the verdict. Both AdmitConsultation
+// (live throttling, mutating the per-request ledger) and the cache
+// layer (non-mutating dedup against the per-session cache) call this
+// so the "should we consult?" decision uses exactly one math path.
+//
+// Why pure: cache lookup needs to ask "if these cached entries WERE
+// the ledger, would re-asking be admitted?" without recording a new
+// attempt against the live ledger. Returning a verdict struct (not
+// taking the ledger as a side-effect parameter) keeps the dedup
+// query free of throttling state mutation.
+func evaluateAdmission(in admissionInputs) admissionVerdict {
+	priorCredit := consultationDepthCredit(in.ResearchDepth)
+	novelty := clamp01(1 - in.Similarity)
+	depthBudget := 1 + priorCredit + in.GlobalReward
+	volumeBudget := 1 + priorCredit + float64(in.DistinctTargets) + in.GlobalReward
+	repeatBudget := 1 + (priorCredit / 2) + in.TargetReward
+	depthExcess := positivePart(float64(in.NextDepth) - depthBudget)
+	volumeExcess := positivePart(float64(in.ConsultCount) - volumeBudget)
+	repeatExcess := positivePart(float64(in.TargetCount) - repeatBudget)
+	questionPenalty := in.Similarity * float64(in.TargetCount)
+	penalty := (depthExcess * depthExcess) + (volumeExcess * volumeExcess) + (repeatExcess * repeatExcess) + questionPenalty
+	expectedGain := novelty * (1 + priorCredit + in.GlobalReward + in.TargetReward)
+	return admissionVerdict{
+		Allowed:      penalty <= expectedGain,
+		Novelty:      novelty,
+		Penalty:      penalty,
+		ExpectedGain: expectedGain,
+	}
+}
+
 func AdmitConsultation(ctx context.Context, target, query string, metadata map[string]any) ConsultationAdmission {
 	target = strings.ToLower(strings.TrimSpace(target))
 	query = strings.TrimSpace(query)
@@ -120,64 +213,56 @@ func AdmitConsultation(ctx context.Context, target, query string, metadata map[s
 	ledger := consultationLedgerForRoot(snapshot.RootCorrelationID)
 
 	fingerprint, tokens := normalizeConsultationQuery(query)
-	similarity := ledger.maxSimilarity(target, fingerprint, tokens)
-	novelty := clamp01(1 - similarity)
-	targetCount := ledger.targetCount(target) + 1
-	consultCount := ledger.count() + 1
-	nextDepth := snapshot.CurrentDepth + 1
-
-	priorCredit := consultationDepthCredit(researchDepth)
-	globalReward := ledger.reward()
-	targetReward := ledger.targetReward(target)
-	distinctTargets := ledger.distinctTargetCount()
-
-	depthBudget := 1 + priorCredit + globalReward
-	volumeBudget := 1 + priorCredit + float64(distinctTargets) + globalReward
-	repeatBudget := 1 + (priorCredit / 2) + targetReward
-
-	depthExcess := positivePart(float64(nextDepth) - depthBudget)
-	volumeExcess := positivePart(float64(consultCount) - volumeBudget)
-	repeatExcess := positivePart(float64(targetCount) - repeatBudget)
-	questionPenalty := similarity * float64(targetCount)
-	penalty := (depthExcess * depthExcess) + (volumeExcess * volumeExcess) + (repeatExcess * repeatExcess) + questionPenalty
-	expectedGain := novelty * (1 + priorCredit + globalReward + targetReward)
-	allowed := penalty <= expectedGain
+	inputs := admissionInputs{
+		Target:          target,
+		Fingerprint:     fingerprint,
+		Tokens:          tokens,
+		NextDepth:       snapshot.CurrentDepth + 1,
+		ResearchDepth:   researchDepth,
+		Similarity:      ledger.maxSimilarity(target, fingerprint, tokens),
+		TargetCount:     ledger.targetCount(target) + 1,
+		ConsultCount:    ledger.count() + 1,
+		DistinctTargets: ledger.distinctTargetCount(),
+		GlobalReward:    ledger.reward(),
+		TargetReward:    ledger.targetReward(target),
+	}
+	verdict := evaluateAdmission(inputs)
 
 	attemptID := newDeliberationAttemptID()
 	ledger.recordAttempt(consultationObservation{
 		AttemptID:   attemptID,
 		Target:      target,
 		Fingerprint: fingerprint,
-		Novelty:     novelty,
-		Allowed:     allowed,
+		Novelty:     verdict.Novelty,
+		Allowed:     verdict.Allowed,
 	})
 
 	admission := ConsultationAdmission{
 		AttemptID:       attemptID,
-		Allowed:         allowed,
+		Allowed:         verdict.Allowed,
 		RootCorrelation: snapshot.RootCorrelationID,
 		ResearchDepth:   researchDepth,
-		Depth:           nextDepth,
-		ConsultCount:    consultCount,
-		TargetCount:     targetCount,
-		Similarity:      similarity,
-		Novelty:         novelty,
-		Penalty:         penalty,
-		ExpectedGain:    expectedGain,
+		Depth:           inputs.NextDepth,
+		ConsultCount:    inputs.ConsultCount,
+		TargetCount:     inputs.TargetCount,
+		Similarity:      inputs.Similarity,
+		Novelty:         verdict.Novelty,
+		Penalty:         verdict.Penalty,
+		ExpectedGain:    verdict.ExpectedGain,
 	}
-	if !allowed {
+	if !verdict.Allowed {
 		admission.Guidance = fmt.Sprintf(
 			"Consultation pressure is too high for this branch. Expected gain %.2f is below penalty %.2f at depth %d with %d total consults. Synthesize current evidence, materially change the question, or switch to a more informative target before consulting again.",
-			expectedGain,
-			penalty,
-			nextDepth,
-			consultCount,
+			verdict.ExpectedGain,
+			verdict.Penalty,
+			inputs.NextDepth,
+			inputs.ConsultCount,
 		)
 		return admission
 	}
 
 	childSnapshot := snapshot
-	childSnapshot.CurrentDepth = nextDepth
+	childSnapshot.CurrentDepth = inputs.NextDepth
 	childSnapshot.ResearchDepth = string(researchDepth)
 	admission.Metadata = consultationSnapshotIntoMetadata(metadata, childSnapshot)
 	return admission

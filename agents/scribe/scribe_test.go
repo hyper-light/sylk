@@ -164,6 +164,34 @@ func (m *mockForest) RecordOutcome(_ context.Context, record forest.OutcomeRecor
 	return nil
 }
 
+// MEM-01: MemoryForestService widened with family projections. Scribe
+// doesn't exercise these; minimal no-op stubs keep the stub a valid
+// interface implementation.
+func (m *mockForest) ProjectIntent(context.Context, forest.ProjectionInput) (*forest.IntentProjection, error) {
+	return nil, nil
+}
+func (m *mockForest) ProjectConstraints(context.Context, forest.ProjectionInput) (*forest.ConstraintProjection, error) {
+	return nil, nil
+}
+func (m *mockForest) ProjectEvidence(context.Context, forest.ProjectionInput) (*forest.EvidenceProjection, error) {
+	return nil, nil
+}
+func (m *mockForest) ProjectDecisions(context.Context, forest.ProjectionInput) (*forest.DecisionProjection, error) {
+	return nil, nil
+}
+func (m *mockForest) ProjectOutcomes(context.Context, forest.ProjectionInput) (*forest.OutcomeProjection, error) {
+	return nil, nil
+}
+func (m *mockForest) ProjectPreferences(context.Context, forest.ProjectionInput) (*forest.PreferenceProjection, error) {
+	return nil, nil
+}
+func (m *mockForest) ProjectCapabilities(context.Context, forest.ProjectionInput) (*forest.CapabilityProjection, error) {
+	return nil, nil
+}
+func (m *mockForest) ProjectOpportunities(context.Context, forest.ProjectionInput) (*forest.OpportunityProjection, error) {
+	return nil, nil
+}
+
 func (m *mockForest) recordedOutcomes() []forest.OutcomeRecord {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -81,7 +81,17 @@ When the user approves, confirms, or requests execution of a plan, route to `arc
 Do NOT classify these as `chat` or `plan` — they are explicit execution approvals.
 
 ## Pending Plan Context
-When a `Pending Plan Approval` block is present in the system prompt:
+
+Plan acceptance is now driven by an **explicit Approve / Modify / Reject dialog**
+rendered in the input panel when a plan reaches Ready. The user's click on
+that dialog is the canonical decision and is delivered to the architect
+directly — classification is NOT involved on the dialog path.
+
+Free-form text classification only fires as a fallback when the user types
+in chat instead of clicking the dialog (e.g., the dialog timed out, or the
+user replied to a notification). When a `Pending Plan Approval` block is
+present in the system prompt:
+
 - Bare affirmatives ("yes", "ok", "sure", "lgtm", "okay") MUST route to the
   `pending_plan_agent` with `intent="execute"`, `domain="tasks"`.
 - Affirmatives with conditions ("yes, but...", "ok, however...") MUST route
@@ -89,6 +99,11 @@ When a `Pending Plan Approval` block is present in the system prompt:
 - Explicit negation ("no", "scrap it") MUST route to the `pending_plan_agent`
   with `intent="plan"`, `domain="design"`.
 - Off-topic messages should be routed normally, ignoring the pending plan.
+
+If the architect has just published a Modify or Reject prompt asking the
+user "what would you like changed?" or "what would you like to do instead?",
+treat the user's reply as a normal planning request — do NOT re-classify
+as another acceptance verdict.
 
 ## General Chat Default
 `guide` handles ONLY pure social conversation and Sylk meta questions. If the user mentions ANY concrete work, project, technology, or deliverable, it is NOT general chat.

@@ -95,6 +95,18 @@ func (s *SecretSanitizer) createStub(filename string) []byte {
 	return []byte("# " + filename + "\n(contents not indexed for security)")
 }
 
+// SanitizeString is the exported text-in / text-out surface for
+// sanitization. Thin wrapper over sanitizeContent that avoids
+// forcing UI callers to manage []byte ↔ string conversions on the
+// hot path (chat streams invoke this per chunk).
+func (s *SecretSanitizer) SanitizeString(input string) (string, *SanitizeResult) {
+	if input == "" {
+		return "", &SanitizeResult{}
+	}
+	sanitized, result := s.sanitizeContent([]byte(input))
+	return string(sanitized), result
+}
+
 func (s *SecretSanitizer) sanitizeContent(content []byte) ([]byte, *SanitizeResult) {
 	result := &SanitizeResult{}
 	text := string(content)
