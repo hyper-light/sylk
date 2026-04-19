@@ -97,20 +97,25 @@ type StoreResponsePayload struct {
 	Summary  string `json:"summary"`
 }
 
-// InterAgentResponsePayload is the sealed union of typed inter-agent
-// response shapes. RouteResponse.Data values that match this interface
-// are rendered/validated using their typed fields; data that does not is
-// treated as untyped fallback (string / map), and the defensive-parse
-// code paths are the only place those fallbacks appear. Making the
-// interface sealed via an unexported method prevents accidental
-// widening by new agents.
+// InterAgentResponsePayload is the interface any typed inter-agent
+// response value implements. RouteResponse.Data values matching this
+// interface are rendered/validated using their declared Summary
+// field; untyped values fall back to defensive parsing (scheduled for
+// deletion once every producer has migrated).
+//
+// The interface is intentionally open — any package can satisfy it by
+// declaring `InterAgentSummary() string`. An earlier design used an
+// unexported sealed marker, which would have forced every participating
+// type (archivalist SubmissionResult, pipeline PipelineValidationResult,
+// per-agent result types) to live in the shared package or be wrapped.
+// Both added ceremony without meaningful safety: accidental widening is
+// caught by the summarizer's InterAgentPayloadSummary short-circuit
+// test matrix.
 type InterAgentResponsePayload interface {
 	// InterAgentSummary returns the one-line summary for UI rendering.
 	// Required; the chat panel reads this field and never inspects the
 	// underlying struct.
 	InterAgentSummary() string
-	// isInterAgentResponsePayload is the sealed-marker method.
-	isInterAgentResponsePayload()
 }
 
 // InterAgentSummary returns the summary field. Implements InterAgentResponsePayload.
@@ -121,8 +126,6 @@ func (p *ConsultResponsePayload) InterAgentSummary() string {
 	return strings.TrimSpace(p.Summary)
 }
 
-func (p *ConsultResponsePayload) isInterAgentResponsePayload() {}
-
 // InterAgentSummary returns the challenge summary. Implements InterAgentResponsePayload.
 func (p *ChallengeResponsePayload) InterAgentSummary() string {
 	if p == nil {
@@ -131,8 +134,6 @@ func (p *ChallengeResponsePayload) InterAgentSummary() string {
 	return strings.TrimSpace(p.Summary)
 }
 
-func (p *ChallengeResponsePayload) isInterAgentResponsePayload() {}
-
 // InterAgentSummary returns the store summary. Implements InterAgentResponsePayload.
 func (p *StoreResponsePayload) InterAgentSummary() string {
 	if p == nil {
@@ -140,8 +141,6 @@ func (p *StoreResponsePayload) InterAgentSummary() string {
 	}
 	return strings.TrimSpace(p.Summary)
 }
-
-func (p *StoreResponsePayload) isInterAgentResponsePayload() {}
 
 // DecodeConsultResponsePayloadFromLLM parses an LLM-produced JSON string
 // into a ConsultResponsePayload. Producers that ask the LLM for structured

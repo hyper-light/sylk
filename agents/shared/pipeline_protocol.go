@@ -1268,6 +1268,42 @@ func intToString(n int) string {
 	return string(buf[i:])
 }
 
+// PipelineValidationResult is the typed return of the validate_work skill.
+// Replaces the previous ad-hoc map[string]any return shape. Implements
+// InterAgentResponsePayload so the inter-agent dispatch layer and chat
+// UI can read the summary field directly without defensive JSON
+// parsing. All legacy field names are preserved as JSON tags so
+// existing consumers (inter_agent_tool_event.go, downstream parsers)
+// continue to work unchanged.
+type PipelineValidationResult struct {
+	Validated         bool   `json:"validated"`
+	ChallengeID       string `json:"challenge_id"`
+	RequestingAgent   string `json:"requesting_agent"`
+	RequestingAgentID string `json:"requesting_agent_id,omitempty"`
+	RespondingAgent   string `json:"responding_agent"`
+	RespondingAgentID string `json:"responding_agent_id,omitempty"`
+	Status            string `json:"status"`
+	Summary           string `json:"summary,omitempty"`
+	Forwarded         bool   `json:"forwarded,omitempty"`
+	CorrelationID     string `json:"correlation_id,omitempty"`
+	TargetAgentID     string `json:"target_agent_id,omitempty"`
+	ProtocolScope     string `json:"protocol_scope,omitempty"`
+}
+
+// InterAgentSummary implements InterAgentResponsePayload.
+func (r *PipelineValidationResult) InterAgentSummary() string {
+	if r == nil {
+		return ""
+	}
+	if r.Summary != "" {
+		return r.Summary
+	}
+	// Fall back to a constructed summary when the handler didn't supply
+	// one explicitly — keeps the chat row non-empty while preserving
+	// typed-field access for other consumers.
+	return "pipeline validation " + r.Status
+}
+
 func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 	return skills.NewSkill("validate_work").
 		Description("Respond to an active concrete challenge from another pipeline agent with a structured validation result and evidence.").
@@ -1391,18 +1427,19 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 				if err := state.setTerminalAction(terminalAction); err != nil {
 					return nil, err
 				}
-				return map[string]any{
-					"validated":           true,
-					"challenge_id":        record.ChallengeID,
-					"requesting_agent":    record.RequestingAgent,
-					"requesting_agent_id": record.RequestingAgentID,
-					"responding_agent":    record.RespondingAgent,
-					"responding_agent_id": record.RespondingAgentID,
-					"status":              record.Status,
-					"forwarded":           true,
-					"correlation_id":      correlationID,
-					"target_agent_id":     strings.TrimSpace(nextTask.TargetAgentID),
-					"protocol_scope":      pipelineProtocolNamespace,
+				return &PipelineValidationResult{
+					Validated:         true,
+					ChallengeID:       record.ChallengeID,
+					RequestingAgent:   record.RequestingAgent,
+					RequestingAgentID: record.RequestingAgentID,
+					RespondingAgent:   record.RespondingAgent,
+					RespondingAgentID: record.RespondingAgentID,
+					Status:            record.Status,
+					Summary:           record.Summary,
+					Forwarded:         true,
+					CorrelationID:     correlationID,
+					TargetAgentID:     strings.TrimSpace(nextTask.TargetAgentID),
+					ProtocolScope:     pipelineProtocolNamespace,
 				}, nil
 			}
 			if err := state.setTerminalAction(terminalAction); err != nil {
@@ -1411,15 +1448,16 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 			if err := state.recordValidation(ctx, record); err != nil {
 				return nil, err
 			}
-			return map[string]any{
-				"validated":           true,
-				"challenge_id":        record.ChallengeID,
-				"requesting_agent":    record.RequestingAgent,
-				"requesting_agent_id": record.RequestingAgentID,
-				"responding_agent":    record.RespondingAgent,
-				"responding_agent_id": record.RespondingAgentID,
-				"status":              record.Status,
-				"protocol_scope":      pipelineProtocolNamespace,
+			return &PipelineValidationResult{
+				Validated:         true,
+				ChallengeID:       record.ChallengeID,
+				RequestingAgent:   record.RequestingAgent,
+				RequestingAgentID: record.RequestingAgentID,
+				RespondingAgent:   record.RespondingAgent,
+				RespondingAgentID: record.RespondingAgentID,
+				Status:            record.Status,
+				Summary:           record.Summary,
+				ProtocolScope:     pipelineProtocolNamespace,
 			}, nil
 		}).
 		Build()
@@ -1490,15 +1528,37 @@ func pipelineProcessValidationSkill(cfg PipelineProtocolSkillConfig) *skills.Ski
 			if err := state.recordValidationProcessing(ctx, entry); err != nil {
 				return nil, err
 			}
-			return map[string]any{
-				"processed":      true,
-				"challenge_id":   challengeID,
-				"decision":       string(decision),
-				"next_targets":   normalizeStringList(params.NextTargets),
-				"protocol_scope": pipelineProtocolNamespace,
+			return &PipelineValidationProcessingResult{
+				Processed:     true,
+				ChallengeID:   challengeID,
+				Decision:      string(decision),
+				Summary:       summary,
+				NextTargets:   normalizeStringList(params.NextTargets),
+				ProtocolScope: pipelineProtocolNamespace,
 			}, nil
 		}).
 		Build()
+}
+
+// PipelineValidationProcessingResult is the typed return of
+// process_validation. Implements InterAgentResponsePayload.
+type PipelineValidationProcessingResult struct {
+	Processed     bool     `json:"processed"`
+	ChallengeID   string   `json:"challenge_id"`
+	Decision      string   `json:"decision"`
+	Summary       string   `json:"summary,omitempty"`
+	NextTargets   []string `json:"next_targets,omitempty"`
+	ProtocolScope string   `json:"protocol_scope,omitempty"`
+}
+
+func (r *PipelineValidationProcessingResult) InterAgentSummary() string {
+	if r == nil {
+		return ""
+	}
+	if r.Summary != "" {
+		return r.Summary
+	}
+	return "validation " + r.Decision
 }
 
 func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {

@@ -158,6 +158,24 @@ type SubmissionResult struct {
 	Error   error  `json:"error,omitempty"`
 }
 
+// InterAgentSummary implements shared.InterAgentResponsePayload so the
+// chat UI row for archivalist store operations renders a concise phrase
+// instead of defensively parsing a map. The summary preserves the
+// success/failure distinction so rows render green/red via the status
+// glyph without extra parsing.
+func (r SubmissionResult) InterAgentSummary() string {
+	if r.Success {
+		if r.ID != "" {
+			return "stored " + r.ID
+		}
+		return "stored"
+	}
+	if r.Error != nil {
+		return "store failed: " + r.Error.Error()
+	}
+	return "store failed"
+}
+
 // MarshalJSON custom marshaler for SubmissionResult to handle error
 func (r SubmissionResult) MarshalJSON() ([]byte, error) {
 	type Alias SubmissionResult

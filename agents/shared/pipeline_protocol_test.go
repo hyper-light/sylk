@@ -1071,9 +1071,9 @@ func TestPipelineProtocolSkills_ValidateWorkPublishesGuideRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validate_work error = %v", err)
 	}
-	resultMap, _ := result.(map[string]any)
-	if resultMap == nil || resultMap["forwarded"] != true {
-		t.Fatalf("validate_work result = %#v, want forwarded=true", result)
+	typed, ok := result.(*PipelineValidationResult)
+	if !ok || typed == nil || !typed.Forwarded {
+		t.Fatalf("validate_work result = %#v, want *PipelineValidationResult with Forwarded=true", result)
 	}
 
 	req := waitForRouteRequest(t, routeCh)
