@@ -1377,7 +1377,15 @@ func formatToolCallStatus(tc ToolCallRecord, th *theme.Theme, grad *theme.Gradie
 }
 
 // formatToolDuration formats a duration as a compact string.
-// Examples: "3ms", "120ms", "1.2s", "12.4s", "1m03s".
+// Examples: "3ms", "120ms", "1.2s", "12.4s", "1m03s", "1h02m03s".
+//
+// Used by both the tool-call timer (one-shot completed durations and live
+// in-flight elapsed) and the thinking-text timer (live agent-activity
+// elapsed). Keeping them on a single formatter ensures both use the same
+// visual format — under-a-minute as decimal seconds, sub-hour with
+// minute/second segments, and an hour segment when execution stretches
+// past 60 minutes (build runs, long retrieval-augmented generation, large
+// test suites).
 func formatToolDuration(d time.Duration) string {
 	switch {
 	case d > 0 && d < time.Millisecond:
@@ -1386,10 +1394,15 @@ func formatToolDuration(d time.Duration) string {
 		return fmt.Sprintf("%dms", d.Milliseconds())
 	case d < time.Minute:
 		return fmt.Sprintf("%.1fs", d.Seconds())
-	default:
+	case d < time.Hour:
 		mins := int(d.Minutes())
 		secs := int(d.Seconds()) % 60
 		return fmt.Sprintf("%dm%02ds", mins, secs)
+	default:
+		hours := int(d.Hours())
+		mins := int(d.Minutes()) % 60
+		secs := int(d.Seconds()) % 60
+		return fmt.Sprintf("%dh%02dm%02ds", hours, mins, secs)
 	}
 }
 

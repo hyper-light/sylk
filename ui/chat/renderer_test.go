@@ -794,6 +794,38 @@ func TestFormatToolDuration_SubMillisecondUsesLessThanOneMillisecond(t *testing.
 	}
 }
 
+// TestFormatToolDuration_RangeBoundaries pins the visual format used by both
+// the tool-call timer and the thinking-text timer (which now share this
+// formatter). Sub-minute durations show as decimal seconds, sub-hour with
+// minute/second segments, and hours appear once execution stretches past 60
+// minutes — long-running suites and retrieval-augmented passes used to
+// display as "165.8s" in the thinking text while the tool-call ticker said
+// "1m06s"; both now agree.
+func TestFormatToolDuration_RangeBoundaries(t *testing.T) {
+	cases := []struct {
+		name string
+		d    time.Duration
+		want string
+	}{
+		{"sub-millisecond", 750 * time.Microsecond, "<1ms"},
+		{"two-digit ms", 47 * time.Millisecond, "47ms"},
+		{"sub-minute decimal", 12*time.Second + 400*time.Millisecond, "12.4s"},
+		{"sub-minute over hundred seconds", 165*time.Second + 800*time.Millisecond, "2m45s"},
+		{"exact minute", time.Minute, "1m00s"},
+		{"minute and seconds", time.Minute + 6*time.Second, "1m06s"},
+		{"sub-hour", 59*time.Minute + 59*time.Second, "59m59s"},
+		{"exact hour", time.Hour, "1h00m00s"},
+		{"hour minute seconds", 2*time.Hour + 13*time.Minute + 7*time.Second, "2h13m07s"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := formatToolDuration(c.d); got != c.want {
+				t.Fatalf("formatToolDuration(%v) = %q, want %q", c.d, got, c.want)
+			}
+		})
+	}
+}
+
 func TestFormatToolCallDuration_ChallengePendingUsesLiveElapsedAfterDispatchCompletion(t *testing.T) {
 	// Challenge rows deliberately stay Pending after Complete=true while the
 	// challenged agent is still composing its response, so the duration must

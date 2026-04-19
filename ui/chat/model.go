@@ -2771,7 +2771,7 @@ func tickPendingInterAgentHistoryChild(
 		}
 	}
 	elapsed := thinkingElapsed(child.ThinkingStartedAt, now)
-	text := fmt.Sprintf("%s  %.1fs", spinnerFrames[thinkingFrameAt(elapsed)], elapsed.Seconds())
+	text := fmt.Sprintf("%s  %s", spinnerFrames[thinkingFrameAt(elapsed)], formatToolDuration(elapsed))
 	color := colorFor(elapsed)
 	if child.ThinkingText == text && child.ThinkingColor == color {
 		return false
@@ -2799,7 +2799,7 @@ func (m *Model) renderNestedStreamThinking(slot *nestedStreamSlot, now time.Time
 		return true
 	}
 	elapsed := thinkingElapsed(slot.thinkingStart, now)
-	text := fmt.Sprintf("%s  %.1fs", spinnerFrames[thinkingFrameAt(elapsed)], elapsed.Seconds())
+	text := fmt.Sprintf("%s  %s", spinnerFrames[thinkingFrameAt(elapsed)], formatToolDuration(elapsed))
 	status := thinkingStatusFor(nestedActivityAgentType(&slot.activity), slot.progress.retryText, elapsed)
 	color := m.thinkingColorFor(elapsed)
 	if slot.activity.ThinkingText == text &&
@@ -4842,7 +4842,7 @@ func (m *Model) renderThinkingEntry(idx int, agentID, retryText string, start, n
 		return false
 	}
 	elapsed := thinkingElapsed(start, now)
-	text := fmt.Sprintf("%s  %.1fs", spinnerFrames[thinkingFrameAt(elapsed)], elapsed.Seconds())
+	text := fmt.Sprintf("%s  %s", spinnerFrames[thinkingFrameAt(elapsed)], formatToolDuration(elapsed))
 	return m.writeThinkingEntry(idx, text, thinkingStatusFor(agentID, retryText, elapsed), m.thinkingColorFor(elapsed))
 }
 
@@ -4853,7 +4853,7 @@ func (m *Model) setThinkingEntryNow(idx int, start time.Time, message string) bo
 	}
 	now := time.Now()
 	elapsed := thinkingElapsed(start, now)
-	text := fmt.Sprintf("%s  %.1fs", spinnerFrames[thinkingFrameAt(elapsed)], elapsed.Seconds())
+	text := fmt.Sprintf("%s  %s", spinnerFrames[thinkingFrameAt(elapsed)], formatToolDuration(elapsed))
 	return m.writeThinkingEntry(idx, text, message, m.thinkingColorFor(elapsed))
 }
 
