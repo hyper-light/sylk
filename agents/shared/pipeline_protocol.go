@@ -261,6 +261,79 @@ type PipelineProtocolState struct {
 	requiredAction  PipelineProtocolActionType
 	requiredReason  string
 	queuedArtifacts map[string]PipelineHandoffArtifactRef
+
+	// subscribersMu / subscribers form the in-process projection
+	// subscription layer. Every mutation fires notifyProjectionSubscribers
+	// which feeds the latest Projection to each subscriber. This is the
+	// authoritative signal — callers that care about state (UI bridge,
+	// telemetry, protocol validators) observe the projection rather than
+	// re-deriving it from parallel event streams.
+	subscribersMu   sync.Mutex
+	subscribers     []pipelineProjectionSubscription
+	subscriberIDSeq int64
+}
+
+// pipelineProjectionSubscription carries the subscriber callback plus a
+// stable id so removal via unsubscribe doesn't rely on function-pointer
+// equality (not well-defined for closures in Go).
+type pipelineProjectionSubscription struct {
+	id int64
+	fn PipelineProjectionSubscriber
+}
+
+// PipelineProjectionSubscriber observes projection snapshots as the
+// state evolves. Returned unsubscribe closure removes the subscriber
+// and is safe to call more than once; nil functions are ignored.
+type PipelineProjectionSubscriber func(*PipelineProjection)
+
+// SubscribeProjection registers fn to receive a Projection snapshot on
+// every state change (new challenge, validation recorded, terminal
+// action set, etc.). The initial call fires synchronously with the
+// current projection so subscribers observe the starting point without
+// having to poll. Returns an unsubscribe function.
+func (s *PipelineProtocolState) SubscribeProjection(fn PipelineProjectionSubscriber) func() {
+	if s == nil || fn == nil {
+		return func() {}
+	}
+	s.subscribersMu.Lock()
+	s.subscriberIDSeq++
+	id := s.subscriberIDSeq
+	s.subscribers = append(s.subscribers, pipelineProjectionSubscription{id: id, fn: fn})
+	s.subscribersMu.Unlock()
+	// Fire immediately with the current projection so subscribers don't
+	// miss state that's already present. Invocation outside the lock
+	// prevents subscriber callbacks from blocking other subscribers.
+	fn(s.Projection())
+	return func() {
+		s.subscribersMu.Lock()
+		defer s.subscribersMu.Unlock()
+		for i, existing := range s.subscribers {
+			if existing.id == id {
+				s.subscribers = append(s.subscribers[:i], s.subscribers[i+1:]...)
+				return
+			}
+		}
+	}
+}
+
+// notifyProjectionSubscribers fires the current projection to every
+// registered subscriber. Called after every mutating method on
+// PipelineProtocolState. Runs synchronously — subscribers must not
+// block for long.
+func (s *PipelineProtocolState) notifyProjectionSubscribers() {
+	if s == nil {
+		return
+	}
+	projection := s.Projection()
+	s.subscribersMu.Lock()
+	subs := append([]pipelineProjectionSubscription(nil), s.subscribers...)
+	s.subscribersMu.Unlock()
+	for _, sub := range subs {
+		if sub.fn == nil {
+			continue
+		}
+		sub.fn(projection)
+	}
 }
 
 // PipelineTesterFinalizeFn is the agent-supplied finalize callback. The tester
@@ -507,18 +580,26 @@ func (s *PipelineProtocolState) setTerminalAction(action *PipelineTurnAction) er
 		return nil
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.requiredAction != "" && action.Type != s.requiredAction {
-		return fmt.Errorf("%s", requiredPipelineActionMessageLocked(s.requiredAction, s.requiredReason))
+		msg := requiredPipelineActionMessageLocked(s.requiredAction, s.requiredReason)
+		s.mu.Unlock()
+		return fmt.Errorf("%s", msg)
 	}
 	if s.terminalAction != nil {
-		return fmt.Errorf("pipeline turn already selected %s", s.terminalAction.Type)
+		terminal := s.terminalAction.Type
+		s.mu.Unlock()
+		return fmt.Errorf("pipeline turn already selected %s", terminal)
 	}
 	s.terminalAction = clonePipelineTurnAction(action)
 	if s.requiredAction != "" && action.Type == s.requiredAction {
 		s.requiredAction = ""
 		s.requiredReason = ""
 	}
+	s.mu.Unlock()
+	// Fire projection subscribers outside the mutation lock so they
+	// can't re-enter the state (and can read a fresh Projection via its
+	// own RLock without deadlocking on our Lock).
+	s.notifyProjectionSubscribers()
 	return nil
 }
 
@@ -586,8 +667,9 @@ func (s *PipelineProtocolState) addProcessedValidation(entry PipelineValidationP
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.processed = append(s.processed, clonePipelineValidationProcessing(entry))
+	s.mu.Unlock()
+	s.notifyProjectionSubscribers()
 }
 
 func (s *PipelineProtocolState) requireTerminalAction(action PipelineProtocolActionType, reason string) {
@@ -595,9 +677,10 @@ func (s *PipelineProtocolState) requireTerminalAction(action PipelineProtocolAct
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.requiredAction = action
 	s.requiredReason = strings.TrimSpace(reason)
+	s.mu.Unlock()
+	s.notifyProjectionSubscribers()
 }
 
 func (s *PipelineProtocolState) HydrateTask(task *PipelineTaskInput) {
@@ -733,18 +816,24 @@ func ApplyPipelineTurnResponse(ctx context.Context, response *PipelineTurnRespon
 	return nil
 }
 
+// ValidatePipelineProtocolCompletion is the authoritative end-of-turn
+// gate. It reads the projection — never the internal state fields
+// directly — so there is a single source of truth for every consumer
+// (validator, LLM query skill, UI). Any drift between "what the LLM
+// sees via query_pipeline_state" and "what the validator enforces"
+// surfaces as a Projection bug rather than two competing readers.
 func ValidatePipelineProtocolCompletion(ctx context.Context, role string) error {
 	state := PipelineProtocolStateFromContext(ctx)
 	if state == nil {
 		return nil
 	}
-	if required, reason := state.RequiredAction(); required != "" {
-		action := state.TerminalAction()
-		if action == nil || action.Type != required {
-			return fmt.Errorf("%s", requiredPipelineActionMessage(required, reason))
+	projection := state.Projection()
+	if required := PipelineProtocolActionType(projection.RequiredAction); required != "" {
+		if projection.TerminalAction == "" || PipelineProtocolActionType(projection.TerminalAction) != required {
+			return fmt.Errorf("%s", requiredPipelineActionMessage(required, projection.RequiredActionReason))
 		}
 	}
-	if state.TerminalAction() != nil {
+	if projection.TerminalAction != "" {
 		return nil
 	}
 	role = normalizePipelineAgentType(role)

@@ -546,11 +546,11 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		return nil, fmt.Errorf("pipeline tester: %w: LLM provider not yet wired", agentshared.ErrAgentNotReady)
 	}
 
-	hadProtocolState := agentshared.PipelineProtocolStateFromContext(ctx) != nil
-	ctx = agentshared.WithPipelineTaskProtocolState(ctx, task)
-	if !hadProtocolState {
-		defer agentshared.ClosePipelineProtocolState(ctx)
-	}
+	var closeProtocolState func()
+	ctx, closeProtocolState = agentshared.OpenPipelineTaskProtocolStateWithPublisher(
+		ctx, task, pt.bus, fwd.SessionID, "tester-pipeline",
+	)
+	defer closeProtocolState()
 	prevRuntime := pt.swapTaskRuntime(task)
 	defer pt.restoreTaskRuntime(prevRuntime)
 	userMessage := fwd.Input
@@ -721,8 +721,11 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 		Scribe:        pt.agentPod,
 	})
 	protocolTask := agentshared.DecodePipelineTaskInput(fwd.Input)
-	ctx = agentshared.WithPipelineTaskProtocolState(ctx, protocolTask)
-	defer agentshared.ClosePipelineProtocolState(ctx)
+	var closeProtocolState func()
+	ctx, closeProtocolState = agentshared.OpenPipelineTaskProtocolStateWithPublisher(
+		ctx, protocolTask, pt.bus, fwd.SessionID, "tester-pipeline",
+	)
+	defer closeProtocolState()
 	startTime := time.Now()
 	toolEmitter := agentshared.NewToolCallEmitter(pt.bus, pt.channels, pt.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)

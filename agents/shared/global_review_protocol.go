@@ -189,6 +189,74 @@ type GlobalReviewState struct {
 	requiredAction GlobalReviewActionType
 	requiredReason string
 	baseMetadata   map[string]any
+
+	// subscribersMu / subscribers form the in-process projection
+	// subscription layer. Mirrors PipelineProtocolState: every mutation
+	// notifies subscribers with the fresh Projection. Consumers that
+	// care about state changes (UI bridge, validators, telemetry)
+	// observe the projection rather than re-deriving it from event
+	// streams.
+	subscribersMu   sync.Mutex
+	subscribers     []globalReviewProjectionSubscription
+	subscriberIDSeq int64
+}
+
+// globalReviewProjectionSubscription carries a subscriber callback plus
+// a stable id so unsubscribe doesn't rely on function-pointer equality
+// (not well-defined for closures in Go).
+type globalReviewProjectionSubscription struct {
+	id int64
+	fn GlobalReviewProjectionSubscriber
+}
+
+// GlobalReviewProjectionSubscriber observes projection snapshots as the
+// state evolves.
+type GlobalReviewProjectionSubscriber func(*GlobalReviewProjection)
+
+// SubscribeProjection registers fn to receive a Projection snapshot on
+// every state change. The initial call fires synchronously with the
+// current projection so subscribers observe the starting point without
+// polling. Returns an unsubscribe function.
+func (s *GlobalReviewState) SubscribeProjection(fn GlobalReviewProjectionSubscriber) func() {
+	if s == nil || fn == nil {
+		return func() {}
+	}
+	s.subscribersMu.Lock()
+	s.subscriberIDSeq++
+	id := s.subscriberIDSeq
+	s.subscribers = append(s.subscribers, globalReviewProjectionSubscription{id: id, fn: fn})
+	s.subscribersMu.Unlock()
+	fn(s.Projection())
+	return func() {
+		s.subscribersMu.Lock()
+		defer s.subscribersMu.Unlock()
+		for i, existing := range s.subscribers {
+			if existing.id == id {
+				s.subscribers = append(s.subscribers[:i], s.subscribers[i+1:]...)
+				return
+			}
+		}
+	}
+}
+
+// notifyProjectionSubscribers fires the current projection to every
+// registered subscriber. Called after every mutating method; must be
+// invoked outside the state mutex so subscriber callbacks can read the
+// projection without deadlocking.
+func (s *GlobalReviewState) notifyProjectionSubscribers() {
+	if s == nil {
+		return
+	}
+	projection := s.Projection()
+	s.subscribersMu.Lock()
+	subs := append([]globalReviewProjectionSubscription(nil), s.subscribers...)
+	s.subscribersMu.Unlock()
+	for _, sub := range subs {
+		if sub.fn == nil {
+			continue
+		}
+		sub.fn(projection)
+	}
 }
 
 type GlobalReviewRouteConfig struct {
@@ -368,18 +436,23 @@ func (s *GlobalReviewState) setTerminalAction(action *GlobalReviewTurnAction) er
 		return nil
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.requiredAction != "" && action.Type != s.requiredAction {
-		return fmt.Errorf("%s", requiredGlobalReviewActionMessageLocked(s.requiredAction, s.requiredReason))
+		msg := requiredGlobalReviewActionMessageLocked(s.requiredAction, s.requiredReason)
+		s.mu.Unlock()
+		return fmt.Errorf("%s", msg)
 	}
 	if s.terminalAction != nil {
-		return fmt.Errorf("global review turn already selected %s", s.terminalAction.Type)
+		terminal := s.terminalAction.Type
+		s.mu.Unlock()
+		return fmt.Errorf("global review turn already selected %s", terminal)
 	}
 	s.terminalAction = cloneGlobalReviewTurnAction(action)
 	if s.requiredAction != "" && action.Type == s.requiredAction {
 		s.requiredAction = ""
 		s.requiredReason = ""
 	}
+	s.mu.Unlock()
+	s.notifyProjectionSubscribers()
 	return nil
 }
 
@@ -388,8 +461,9 @@ func (s *GlobalReviewState) addProcessedValidation(entry GlobalReviewValidationP
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.processed = append(s.processed, cloneGlobalReviewValidationProcessing(entry))
+	s.mu.Unlock()
+	s.notifyProjectionSubscribers()
 }
 
 func (s *GlobalReviewState) requireTerminalAction(action GlobalReviewActionType, reason string) {
@@ -397,9 +471,10 @@ func (s *GlobalReviewState) requireTerminalAction(action GlobalReviewActionType,
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.requiredAction = action
 	s.requiredReason = strings.TrimSpace(reason)
+	s.mu.Unlock()
+	s.notifyProjectionSubscribers()
 }
 
 func requiredGlobalReviewActionMessageLocked(action GlobalReviewActionType, reason string) string {
@@ -415,39 +490,43 @@ func GlobalReviewTurnTerminated(ctx context.Context) bool {
 	return state != nil && state.TerminalAction() != nil
 }
 
+// ValidateGlobalReviewCompletion reads the projection rather than
+// internal state fields. Single source of truth: whatever the LLM sees
+// via query_global_review_state is exactly what this validator
+// evaluates.
 func ValidateGlobalReviewCompletion(ctx context.Context, agentType string) error {
 	state := GlobalReviewStateFromContext(ctx)
 	if state == nil {
 		return nil
 	}
-	if action, reason := state.RequiredAction(); action != "" {
-		return fmt.Errorf("%s", requiredGlobalReviewActionMessageLocked(action, reason))
+	projection := state.Projection()
+	if action := GlobalReviewActionType(projection.RequiredAction); action != "" {
+		return fmt.Errorf("%s", requiredGlobalReviewActionMessageLocked(action, projection.RequiredActionReason))
 	}
-	if state.TerminalAction() != nil {
+	if projection.TerminalAction != "" {
 		return nil
 	}
 
-	snapshot := materializeGlobalReviewSnapshot(state)
 	agentType = normalizeGlobalReviewAgent(agentType)
-	if snapshot != nil && snapshot.PendingChallenge != nil &&
-		normalizeGlobalReviewAgent(snapshot.PendingChallenge.TargetAgent) == agentType {
+	if projection.PendingChallenge != nil &&
+		normalizeGlobalReviewAgent(projection.PendingChallenge.TargetAgent) == agentType {
 		return fmt.Errorf("Before ending this global review turn, answer the active challenge with `validate_work`.")
 	}
 	switch agentType {
 	case GlobalReviewAgentInspector:
-		if snapshot != nil && snapshot.PendingValidation != nil {
+		if projection.PendingValidation != nil {
 			return fmt.Errorf("Before ending this global inspector turn, call `process_validation` and then decide whether the next move is `challenge_global_tester`, `challenge_architect`, `challenge_orchestrator`, `handoff_next`, `finalize_global_review`, `accept_checkpoint`, or `commit_to_disk`.")
 		}
 		return fmt.Errorf("Before ending this global inspector turn, use `challenge_global_tester`, `challenge_architect`, `challenge_orchestrator`, `handoff_next`, `validate_work`, `process_validation`, `finalize_global_review`, `accept_checkpoint`, or `commit_to_disk` to record the next review step.")
 	case GlobalReviewAgentTester:
-		if snapshot != nil && snapshot.PendingValidation != nil &&
-			normalizeGlobalReviewAgent(snapshot.PendingValidation.RequestingAgent) == agentType {
+		if projection.PendingValidation != nil &&
+			normalizeGlobalReviewAgent(projection.PendingValidation.RequestingAgent) == agentType {
 			return fmt.Errorf("Before ending this global tester turn, call `process_validation` before choosing the next handoff or challenge.")
 		}
 		return fmt.Errorf("Before ending this global tester turn, use `challenge_inspector`, `handoff_next`, `validate_work`, or `process_validation` to record the next review step.")
 	case GlobalReviewAgentArchitect, GlobalReviewAgentOrchestrator:
-		if snapshot != nil && snapshot.PendingValidation != nil &&
-			normalizeGlobalReviewAgent(snapshot.PendingValidation.RequestingAgent) == agentType {
+		if projection.PendingValidation != nil &&
+			normalizeGlobalReviewAgent(projection.PendingValidation.RequestingAgent) == agentType {
 			return fmt.Errorf("Before ending this global review turn, call `process_validation` before choosing another challenge or handoff.")
 		}
 	}

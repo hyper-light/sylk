@@ -685,11 +685,11 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		AgentID: e.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
 	protocolTask := shared.DecodePipelineTaskInput(fwd.Input)
-	hadProtocolState := shared.PipelineProtocolStateFromContext(ctx) != nil
-	ctx = shared.WithPipelineTaskProtocolState(ctx, protocolTask)
-	if !hadProtocolState {
-		defer shared.ClosePipelineProtocolState(ctx)
-	}
+	var closeProtocolState func()
+	ctx, closeProtocolState = shared.OpenPipelineTaskProtocolStateWithPublisher(
+		ctx, protocolTask, e.bus, fwd.SessionID, "engineer",
+	)
+	defer closeProtocolState()
 	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
 	if publishStreamLifecycle {
 		shared.PublishStreamStart(e.bus, e.channels, ctx, e.id)
@@ -907,11 +907,15 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (_ *Enginee
 	if req == nil {
 		return nil, fmt.Errorf("request cannot be nil")
 	}
-	hadProtocolState := shared.PipelineProtocolStateFromContext(ctx) != nil
-	ctx = shared.WithPipelineTaskProtocolState(ctx, req.PipelineTask)
-	if !hadProtocolState {
-		defer shared.ClosePipelineProtocolState(ctx)
+	sessionID := ""
+	if req.PipelineTask != nil {
+		sessionID = req.PipelineTask.SessionID
 	}
+	var closeProtocolState func()
+	ctx, closeProtocolState = shared.OpenPipelineTaskProtocolStateWithPublisher(
+		ctx, req.PipelineTask, e.bus, sessionID, "engineer",
+	)
+	defer closeProtocolState()
 	ctx = shared.WithPipelineTurnBaseline(ctx)
 
 	startTime := time.Now()

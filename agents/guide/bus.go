@@ -449,6 +449,12 @@ const (
 
 	// MessageTypeSignalAck wraps a signal.SignalAck routed through the ChannelBus.
 	MessageTypeSignalAck MessageType = "signal_ack"
+
+	// MessageTypeProtocolProjection wraps a typed protocol projection
+	// snapshot (pipeline or global review) emitted whenever a protocol
+	// state mutates. Carried on TopicProtocolProjection for UI /
+	// telemetry consumption.
+	MessageTypeProtocolProjection MessageType = "protocol_projection"
 )
 
 // =============================================================================
@@ -544,6 +550,16 @@ const (
 	// TopicActivity is where activity events are published after migration
 	// from the standalone ActivityEventBus to the Guide ChannelBus.
 	TopicActivity = "activity.events"
+
+	// TopicProtocolProjection carries typed protocol projection snapshots
+	// (pipeline + global review). Consumers that need live protocol state
+	// — the UI chat panel for challenge/validation rows, telemetry, the
+	// long-lived protocol observer — subscribe here. Producers are the
+	// per-task protocol states: each mutation fires a fresh projection
+	// through SubscribeProjection, an adapter forwards it here. Using one
+	// topic instead of parallel InterAgentToolEvent streams eliminates the
+	// drift class that produced phantom-challenge / missing-snapshot bugs.
+	TopicProtocolProjection = "protocol.projection"
 
 	// TopicSignalPrefix is the prefix for signal topics routed through the ChannelBus.
 	TopicSignalPrefix = "signal."

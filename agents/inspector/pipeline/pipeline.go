@@ -496,11 +496,11 @@ func inspectorContractSynthesisMode(contract *agentShared.TaskExecutionContract,
 func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	// Decode structured pipeline task from orchestrator dispatch.
 	task := decodePipelineTask(fwd.Input)
-	hadProtocolState := agentShared.PipelineProtocolStateFromContext(ctx) != nil
-	ctx = agentShared.WithPipelineTaskProtocolState(ctx, task)
-	if !hadProtocolState {
-		defer agentShared.ClosePipelineProtocolState(ctx)
-	}
+	var closeProtocolState func()
+	ctx, closeProtocolState = agentShared.OpenPipelineTaskProtocolStateWithPublisher(
+		ctx, task, pi.bus, fwd.SessionID, "inspector-pipeline",
+	)
+	defer closeProtocolState()
 	ctx = agentShared.WithPipelineTurnBaseline(ctx)
 
 	// Only try static/conversational replies for non-pipeline inputs.
@@ -687,8 +687,11 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 		Scribe:        pi.agentPod,
 	})
 	protocolTask := decodePipelineTask(fwd.Input)
-	ctx = agentShared.WithPipelineTaskProtocolState(ctx, protocolTask)
-	defer agentShared.ClosePipelineProtocolState(ctx)
+	var closeProtocolState func()
+	ctx, closeProtocolState = agentShared.OpenPipelineTaskProtocolStateWithPublisher(
+		ctx, protocolTask, pi.bus, fwd.SessionID, "inspector-pipeline",
+	)
+	defer closeProtocolState()
 
 	toolEmitter := agentShared.NewToolCallEmitter(pi.bus, pi.channels, pi.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentShared.WithToolCallEmitter(ctx, toolEmitter)

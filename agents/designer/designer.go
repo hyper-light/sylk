@@ -609,11 +609,11 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		AgentID: d.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
 	protocolTask := shared.DecodePipelineTaskInput(fwd.Input)
-	hadProtocolState := shared.PipelineProtocolStateFromContext(ctx) != nil
-	ctx = shared.WithPipelineTaskProtocolState(ctx, protocolTask)
-	if !hadProtocolState {
-		defer shared.ClosePipelineProtocolState(ctx)
-	}
+	var closeProtocolState func()
+	ctx, closeProtocolState = shared.OpenPipelineTaskProtocolStateWithPublisher(
+		ctx, protocolTask, d.bus, fwd.SessionID, "designer",
+	)
+	defer closeProtocolState()
 	if !fwd.FireAndForget {
 		shared.PublishStreamStart(d.bus, d.channels, ctx, d.id)
 		if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
@@ -735,11 +735,11 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 
 	userMessage := fwd.Input
 	task := shared.DecodePipelineTaskInput(fwd.Input)
-	hadProtocolState := shared.PipelineProtocolStateFromContext(ctx) != nil
-	ctx = shared.WithPipelineTaskProtocolState(ctx, task)
-	if !hadProtocolState {
-		defer shared.ClosePipelineProtocolState(ctx)
-	}
+	var closeProtocolState func()
+	ctx, closeProtocolState = shared.OpenPipelineTaskProtocolStateWithPublisher(
+		ctx, task, d.bus, fwd.SessionID, "designer",
+	)
+	defer closeProtocolState()
 	ctx = shared.WithPipelineTurnBaseline(ctx)
 	contract := (*shared.TaskExecutionContract)(nil)
 	if task != nil {
