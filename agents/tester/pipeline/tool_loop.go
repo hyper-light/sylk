@@ -108,10 +108,14 @@ func (pt *PipelineTester) executeToolLoopWithSurface(
 					Content:  strings.TrimSpace(resp.Content),
 					Metadata: resp.ProviderMetadata,
 				})
+				content := err.Error() +
+					"\nRespond to the active challenge with validate_work, or use challenge_agent or handoff_next explicitly."
+				if hint := pendingChallengeHint(ctx); hint != "" {
+					content += "\n" + hint
+				}
 				req.Messages = append(req.Messages, providers.Message{
-					Role: providers.RoleUser,
-					Content: err.Error() +
-						"\nRespond to the active challenge with validate_work, or use challenge_agent or handoff_next explicitly.",
+					Role:    providers.RoleUser,
+					Content: content,
 				})
 				continue
 			}
@@ -520,6 +524,27 @@ func pipelineTesterToolNames(calls []providers.ToolCall) []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// pendingChallengeHint returns a one-line hint with the active challenge_id
+// and requesting_agent so the tester's re-prompt carries the exact values
+// the LLM needs for validate_work, eliminating the loop where the model
+// fishes for the id via find_related_activity / inspect_open_conflicts.
+func pendingChallengeHint(ctx context.Context) string {
+	state := shared.PipelineProtocolStateFromContext(ctx)
+	if state == nil {
+		return ""
+	}
+	proj := state.Projection()
+	if proj == nil || proj.PendingChallenge == nil {
+		return ""
+	}
+	id := strings.TrimSpace(proj.PendingChallenge.ID)
+	requester := strings.TrimSpace(proj.PendingChallenge.RequestingAgent)
+	if id == "" || requester == "" {
+		return ""
+	}
+	return fmt.Sprintf("Active challenge: challenge_id=%q from %q. End the turn with validate_work(challenge_id=%q, requesting_agent=%q, status:\"...\", summary:\"...\").", id, requester, id, requester)
 }
 
 func pipelineTesterPreview(text string) string {

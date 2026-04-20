@@ -1984,6 +1984,23 @@ func (m *AppModel) handlePlanApprovalMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
 		return nil, true
 	}
 	layout := m.planApprovalLayout(max(m.width-2, 1))
+	if mouse.Button == tea.MouseButtonWheelUp || mouse.Button == tea.MouseButtonWheelDown {
+		if !layout.commandApprovalCodeContains(contentX, contentY) {
+			return nil, true
+		}
+		delta := 0
+		switch mouse.Button {
+		case tea.MouseButtonWheelUp:
+			delta = -1
+		case tea.MouseButtonWheelDown:
+			delta = 1
+		}
+		if m.scrollPlanApprovalBody(layout, delta) {
+			m.markSlotDirty(compositor.SlotInput)
+			m.viewDirty = true
+		}
+		return nil, true
+	}
 	switch mouse.Action {
 	case tea.MouseActionMotion:
 		if idx, ok := layout.optionAt(contentX, contentY); ok {

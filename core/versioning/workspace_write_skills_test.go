@@ -591,3 +591,76 @@ func (s stubWorkspaceViewAccess) SummarizePaths(context.Context, []string, strin
 func (s stubWorkspaceViewAccess) DefaultView() WorkspaceView {
 	return WorkspaceViewPipeline
 }
+
+// TestCanRebindWorkspaceMutationBasis_NestedCreateDirectoryAllowed is
+// a regression test for a bug where create_pipeline_directory would
+// fail with `basis path "X" does not match "X/Y"` when the agent
+// tried to create a nested subdirectory (e.g. "hello_cli/tests")
+// after already creating the parent ("hello_cli").
+//
+// The rebind predicate's argument order was inverted — it was asking
+// "is the basis a descendant of the target" instead of "is the target
+// a descendant of the basis". The former is false when the target is
+// the nested path; the latter is the correct question for allowing
+// a nested CreateDirectory to reuse the already-prepared basis.
+func TestCanRebindWorkspaceMutationBasis_NestedCreateDirectoryAllowed(t *testing.T) {
+	cases := []struct {
+		name       string
+		op         workspaceWriteOperation
+		targetPath string
+		basisPath  string
+		want       bool
+	}{
+		{
+			name:       "nested create-directory allowed",
+			op:         workspaceWriteOperationCreateDirectory,
+			targetPath: "hello_cli/tests",
+			basisPath:  "hello_cli",
+			want:       true,
+		},
+		{
+			name:       "deeply nested create-directory allowed",
+			op:         workspaceWriteOperationCreateDirectory,
+			targetPath: "a/b/c/d",
+			basisPath:  "a",
+			want:       true,
+		},
+		{
+			name:       "sibling path refused",
+			op:         workspaceWriteOperationCreateDirectory,
+			targetPath: "sibling",
+			basisPath:  "hello_cli",
+			want:       false,
+		},
+		{
+			name:       "parent path allowed (target is ancestor of basis)",
+			op:         workspaceWriteOperationCreateDirectory,
+			targetPath: "hello_cli",
+			basisPath:  "hello_cli/tests",
+			want:       true,
+		},
+		{
+			name:       "identical path refused",
+			op:         workspaceWriteOperationCreateDirectory,
+			targetPath: "hello_cli",
+			basisPath:  "hello_cli",
+			want:       false,
+		},
+		{
+			name:       "non-directory op refused even when nested",
+			op:         workspaceWriteOperationWriteFile,
+			targetPath: "hello_cli/tests",
+			basisPath:  "hello_cli",
+			want:       false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := canRebindWorkspaceMutationBasis(tc.op, tc.targetPath, tc.basisPath)
+			if got != tc.want {
+				t.Errorf("canRebindWorkspaceMutationBasis(%s, %q, %q) = %v, want %v",
+					tc.op, tc.targetPath, tc.basisPath, got, tc.want)
+			}
+		})
+	}
+}

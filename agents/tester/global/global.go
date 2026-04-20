@@ -352,6 +352,13 @@ func (gt *GlobalTester) registerCoreSkills() {
 	gt.skills.Register(versioning.NewEditGlobalFileSkill(writeCfg))
 	gt.skills.Register(versioning.NewDeleteGlobalFileSkill(writeCfg))
 	gt.skills.Register(versioning.NewCreateGlobalDirectorySkill(writeCfg))
+	gt.skills.Register(agentshared.BuildAskUserClarificationSkill(agentshared.AskUserClarificationConfig{
+		Bus:          gt.bus,
+		AgentID:      gt.id,
+		AgentName:    "tester",
+		SessionID:    gt.config.SessionID,
+		NewMessageID: gt.generateMessageID,
+	}))
 
 	// Global-tester-specific skills.
 	gt.skills.Register(analyzeBatchSkill(gt))

@@ -437,6 +437,39 @@ func (b *Builder) ObjectParam(name, description string, properties map[string]*P
 	return b
 }
 
+// RequireNestedFields marks one or more sub-properties of a previously-added
+// object parameter as required at the schema level. The provider serializes
+// these into the JSON schema's nested `required` array so the LLM treats
+// them as mandatory rather than optional, eliminating the failure class
+// where the model satisfies the outer object but omits a sub-field the
+// runtime handler enforces (`commentary.summary is required`,
+// `payload.id is required`, etc.).
+//
+// No-op when paramName has not been registered as an object parameter.
+func (b *Builder) RequireNestedFields(paramName string, fields ...string) *Builder {
+	prop, ok := b.skill.InputSchema.Properties[paramName]
+	if !ok || prop == nil || prop.Type != "object" {
+		return b
+	}
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		seen := false
+		for _, existing := range prop.Required {
+			if existing == field {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			prop.Required = append(prop.Required, field)
+		}
+	}
+	return b
+}
+
 // Handler sets the skill handler
 func (b *Builder) Handler(h Handler) *Builder {
 	b.skill.Handler = h

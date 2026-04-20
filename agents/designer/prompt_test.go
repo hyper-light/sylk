@@ -7,6 +7,31 @@ import (
 	shared "github.com/adalundhe/sylk/agents/shared"
 )
 
+// TestDesignerSystemPrompts_IncludeLanguageToolingPreference locks
+// the wiring of the shared language-tooling preference snippet into
+// both designer prompt assemblies. The snippet encodes the priority
+// order — task spec → fabric → codebase — that designer reads
+// before reaching for write or edit skills.
+func TestDesignerSystemPrompts_IncludeLanguageToolingPreference(t *testing.T) {
+	required := []string{
+		"LANGUAGE, FRAMEWORK, AND TOOLING SELECTION",
+		"task specification",
+		"Activity Fabric",
+		"existing codebase",
+		"ask_user_clarification",
+	}
+	for name, prompt := range map[string]string{
+		"DesignerSystemPrompt":            DesignerSystemPrompt(),
+		"DesignerSystemPromptForContract": DesignerSystemPromptForContract(&shared.TaskExecutionContract{TaskID: "task_x"}),
+	} {
+		for _, want := range required {
+			if !strings.Contains(prompt, want) {
+				t.Errorf("%s missing %q", name, want)
+			}
+		}
+	}
+}
+
 func TestDesignerSystemPromptForContract_UsesTaskModePrompt(t *testing.T) {
 	prompt := DesignerSystemPromptForContract(&shared.TaskExecutionContract{TaskID: "task_1"})
 	if strings.Contains(prompt, "## 6-PHASE LLM-DRIVEN PROTOCOL") {

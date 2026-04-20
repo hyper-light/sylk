@@ -413,81 +413,6 @@ func TestAgentStateMsg_SurfacesReasoningOnStreamingEntry(t *testing.T) {
 	}
 }
 
-func TestAgentStateMsg_ChildEventKeepsParentThinkingAlive(t *testing.T) {
-	m := New(theme.DefaultDark(), 16)
-
-	// Open a parent stream (tester-pipeline).
-	comp, _ := m.Update(msg.StreamStartMsg{
-		SessionID:     "s1",
-		CorrelationID: "parent",
-		AgentID:       "tester-pipeline",
-		AgentType:     "tester-pipeline",
-	})
-	m = comp.(*Model)
-
-	// Parent begins reasoning.
-	comp, _ = m.Update(msg.AgentStateMsg{
-		SessionID:     "s1",
-		CorrelationID: "parent",
-		AgentID:       "tester-pipeline",
-		AgentType:     "tester-pipeline",
-		State:         "reasoning",
-		TransitionID:  1,
-	})
-	m = comp.(*Model)
-
-	parentEntry := m.history.Last()
-	if parentEntry == nil {
-		t.Fatal("expected parent streaming entry")
-	}
-	if parentEntry.ThinkingStatus != "Reasoning..." {
-		t.Fatalf("parent ThinkingStatus = %q, want \"Reasoning...\"", parentEntry.ThinkingStatus)
-	}
-
-	// Guardian approval lands on its own correlation but carries
-	// ParentCorrelationID. The parent's row must surface the child
-	// detail as its status so the spinner doesn't go stale.
-	comp, _ = m.Update(msg.AgentStateMsg{
-		SessionID:           "s1",
-		CorrelationID:       "guardian-approval",
-		ParentCorrelationID: "parent",
-		AgentID:             "guardian",
-		AgentType:           "guardian",
-		State:               "reasoning",
-		Detail:              "Reviewing command",
-		TransitionID:        2,
-	})
-	m = comp.(*Model)
-
-	parentEntry = m.history.Last()
-	if parentEntry == nil {
-		t.Fatal("expected parent entry to still be present")
-	}
-	if parentEntry.ThinkingStatus != "Reviewing command" {
-		t.Fatalf("parent ThinkingStatus after child non-terminal = %q, want \"Reviewing command\"", parentEntry.ThinkingStatus)
-	}
-
-	// Child terminal must NOT clear the parent's indicator — only the
-	// child finished. The parent's own last state (reasoning) wins.
-	comp, _ = m.Update(msg.AgentStateMsg{
-		SessionID:           "s1",
-		CorrelationID:       "guardian-approval",
-		ParentCorrelationID: "parent",
-		AgentID:             "guardian",
-		AgentType:           "guardian",
-		State:               "complete",
-		TransitionID:        3,
-	})
-	m = comp.(*Model)
-	if _, ok := m.agentStates["parent"]; !ok {
-		t.Fatal("parent state evicted on child terminal — ownership lost")
-	}
-	parentEntry = m.history.Last()
-	if parentEntry.ThinkingStatus != "Reasoning..." {
-		t.Fatalf("parent ThinkingStatus after child terminal = %q, want \"Reasoning...\" (parent's own state)", parentEntry.ThinkingStatus)
-	}
-}
-
 func TestStreamStartUsesAgentTypeForPipelineBadge(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 
@@ -4106,8 +4031,22 @@ func TestGuardianApprovalCompletionClearsTopLevelProgressFooter(t *testing.T) {
 	if entry == nil {
 		t.Fatal("expected top-level guardian approval entry")
 	}
-	if strings.TrimSpace(entry.ThinkingText) != "" || strings.TrimSpace(entry.ThinkingStatus) != "" {
-		t.Fatalf("expected guardian approval footer to clear after approval completion, got text=%q status=%q", entry.ThinkingText, entry.ThinkingStatus)
+	// The guardian approval's inline row is resolved — but the parent
+	// agent's stream is still open (it's about to run the approved
+	// command). The footer spinner must REMAIN, just without the
+	// redundant "Guardian approval received" status text. Clearing the
+	// spinner here was the canonical bug that made parent agents'
+	// thinking indicators vanish after every approval cycle.
+	if strings.TrimSpace(entry.ThinkingText) == "" {
+		t.Fatalf("parent spinner cleared after guardian approval — thinking indicator must survive child lifecycle (status=%q)", entry.ThinkingStatus)
+	}
+	// Status may be empty (the stale guardian text was suppressed) or
+	// the default rotating placeholder; both are fine. What's NOT fine
+	// is the status carrying the stale "Guardian approval received"
+	// phrase since that's already rendered on the inline approval row.
+	if strings.Contains(strings.ToLower(entry.ThinkingStatus), "guardian") &&
+		strings.Contains(strings.ToLower(entry.ThinkingStatus), "approval") {
+		t.Fatalf("stale guardian approval text leaked into parent's thinking status: %q", entry.ThinkingStatus)
 	}
 	if len(entry.ToolCalls) != 1 || !entry.ToolCalls[0].Completed || entry.ToolCalls[0].InterAgent == nil {
 		t.Fatalf("expected completed guardian approval tool call, got %+v", entry.ToolCalls)
@@ -4226,8 +4165,12 @@ func TestGuardianApprovalCompletionClearsNestedChildProgressFooter(t *testing.T)
 		t.Fatalf("expected one nested child activity, got %+v", row.Children)
 	}
 	child := row.Children[0]
-	if strings.TrimSpace(child.ThinkingText) != "" || strings.TrimSpace(child.ThinkingStatus) != "" {
-		t.Fatalf("expected nested guardian approval footer to clear after approval completion, got text=%q status=%q", child.ThinkingText, child.ThinkingStatus)
+	// The nested child's own stream is still active — only the
+	// guardian approval sub-row inside it has resolved. Spinner stays;
+	// stale guardian text must not leak into the child's status.
+	if strings.Contains(strings.ToLower(child.ThinkingStatus), "guardian") &&
+		strings.Contains(strings.ToLower(child.ThinkingStatus), "approval") {
+		t.Fatalf("stale guardian approval text leaked into nested child status: %q", child.ThinkingStatus)
 	}
 	if len(child.ToolCalls) != 1 || !child.ToolCalls[0].Completed || child.ToolCalls[0].InterAgent == nil {
 		t.Fatalf("expected completed nested guardian approval tool call, got %+v", child.ToolCalls)

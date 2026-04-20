@@ -683,6 +683,87 @@ func TestPipelineTesterPrepareHarnessRequiresWriteContexts(t *testing.T) {
 	}
 }
 
+// TestPipelineTesterDetectHarness_PrefersPlannerSpecOverLLMTargetExt
+// locks the agentic fix for the failure mode where the LLM-tester
+// invented a Python target_files path inside an established Go
+// project. Pre-fix, the .py extension drove the harness pick to
+// pytest. Post-fix, the planner's structured task spec wins: when
+// affected_files / workspace.write_set carry .go paths, harness
+// selection is "go" with language_source="task_spec" and a
+// language_note that flags the .py target_files conflict so the LLM
+// sees why its supplied paths were overridden.
+func TestPipelineTesterDetectHarness_PrefersPlannerSpecOverLLMTargetExt(t *testing.T) {
+	root := t.TempDir()
+	mustWriteTestFile(t, filepath.Join(root, "go.mod"), "module example.com/hellocli\n\ngo 1.24.0\n")
+	mustWriteTestFile(t, filepath.Join(root, "hello_cli/cli.go"), "package hello_cli\n\nfunc Run() {}\n")
+
+	pt, err := New(testershared.PipelineTesterConfig{Factory: newTestFactory(t)}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	pt.SetFileAccess(versioning.NewDiskFileAccess(root, false))
+
+	pt.swapTaskRuntime(&agentshared.PipelineTaskInput{
+		TaskID:    "task_2",
+		NodeID:    "task_2-tester",
+		AgentType: "tester-pipeline",
+		Context: map[string]any{
+			"affected_files": []any{"hello_cli/cli.go", "hello_cli/main.go"},
+			"workspace": map[string]any{
+				"write_set":    []any{"hello_cli/cli.go", "hello_cli/main.go"},
+				"test_surface": []any{"hello_cli/cli_test.go"},
+			},
+		},
+	})
+
+	// LLM-tester supplies a .py target — the failure-mode signal that
+	// triggered the original bug. Selection must ignore the extension
+	// because the planner spec resolves to Go.
+	state, err := pt.detectHarness(context.Background(), []string{"hello_cli/tests/test_cli.py"}, "Write pytest spec tests for hello_cli", "engineer")
+	if err != nil {
+		t.Fatalf("detectHarness: %v", err)
+	}
+	if state.FrameworkID != coretest.FrameworkGoTest {
+		t.Fatalf("framework = %s, want %s", state.FrameworkID, coretest.FrameworkGoTest)
+	}
+	if state.LanguageSource != "task_spec" {
+		t.Fatalf("language_source = %q, want %q", state.LanguageSource, "task_spec")
+	}
+	if !strings.Contains(state.LanguageNote, "python") {
+		t.Fatalf("language_note %q must surface the python target_files conflict", state.LanguageNote)
+	}
+}
+
+// TestPipelineTesterDetectHarness_FallsBackToTargetFilesWhenSpecSilent
+// keeps the planner-spec preference from over-reaching. When the task
+// has no structured paths (no affected_files / workspace / worker
+// packets), the LLM-supplied target_files become the language signal —
+// otherwise harness detection would refuse work for tasks the
+// planner did not paint with paths (e.g., scratch testing flows).
+func TestPipelineTesterDetectHarness_FallsBackToTargetFilesWhenSpecSilent(t *testing.T) {
+	root := t.TempDir()
+	mustWriteTestFile(t, filepath.Join(root, "pyproject.toml"), "[project]\nname = \"x\"\nversion = \"0.1.0\"\n")
+	mustWriteTestFile(t, filepath.Join(root, "app/service.py"), "def f():\n    pass\n")
+
+	pt, err := New(testershared.PipelineTesterConfig{Factory: newTestFactory(t)}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	pt.SetFileAccess(versioning.NewDiskFileAccess(root, false))
+	// No swapTaskRuntime — currentTask stays nil, so spec language is empty.
+
+	state, err := pt.detectHarness(context.Background(), []string{"app/service.py"}, "Write tests for service.py", "engineer")
+	if err != nil {
+		t.Fatalf("detectHarness: %v", err)
+	}
+	if state.FrameworkID != coretest.FrameworkPytest {
+		t.Fatalf("framework = %s, want %s", state.FrameworkID, coretest.FrameworkPytest)
+	}
+	if state.LanguageSource != "target_files" {
+		t.Fatalf("language_source = %q, want %q", state.LanguageSource, "target_files")
+	}
+}
+
 func mustWriteTestFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {

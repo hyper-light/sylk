@@ -230,10 +230,10 @@ func writeTestSkill(pt *PipelineTester) *skills.Skill {
 		Domain("testing").
 		Keywords("write", "test", "file", "append", "concrete").
 		Priority(94).
-		Usage("Use to materialize executable tests after you know the intended case. Prepare the output path with prepare_pipeline_write_context first, pass the basis in, and reuse next_basis for follow-up writes to the same file.").
-		Requirement("Provide a concrete test_case, executable content, and a matching pipeline write basis for the target output file.").
+		Usage("Use to materialize executable tests after you know the intended case. Prepare the output path with prepare_pipeline_write_context first, pass the basis in, and reuse next_basis for follow-up writes to the same file. Confirm the test framework, language, and conventions match the priority order in the system prompt before authoring: the task spec governs language and framework choice, in-flight peer work in the Activity Fabric defines test conventions on this surface, and the existing codebase governs test placement and runner integration. detect_test_harness already returns language_source / language_note for this surface — read those before writing.").
+		Requirement("Provide a concrete test_case, executable content, and a matching pipeline write basis for the target output file. Test code language must match the output_file extension and the harness selected for this surface; do not write Go syntax in a .py file or pytest fixtures in a .go file.").
 		Satisfies("Creates real test artifacts and advances the authoring deliverable for the task. After writing, run_test_suite should gather execution evidence before terminal reporting.").
-		Avoid("Do not use for placeholders, TODOs, skipped tests, or speculative writes detached from the requested behavior. write_test alone is not a terminal handoff step.").
+		Avoid("Do not use for placeholders, TODOs, skipped tests, or speculative writes detached from the requested behavior. write_test alone is not a terminal handoff step. Do not introduce a test framework that disagrees with the harness language reported by detect_test_harness — reconcile the language signal first (re-read the task spec, query peer activity, or invoke ask_user_clarification or a knowledge-agent consult) before writing.").
 		ObjectParam("test_case", "Structured planned test case metadata", testCaseProps, true).
 		StringParam("target_file", "Source file under test", true).
 		StringParam("output_file", "Destination test file path", false).

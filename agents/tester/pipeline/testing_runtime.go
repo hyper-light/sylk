@@ -46,6 +46,8 @@ type testHarnessState struct {
 	FrameworkID        coretest.TestFrameworkID `json:"framework_id"`
 	FrameworkName      string                   `json:"framework_name"`
 	Language           string                   `json:"language"`
+	LanguageSource     string                   `json:"language_source,omitempty"`
+	LanguageNote       string                   `json:"language_note,omitempty"`
 	RunCommand         string                   `json:"run_command"`
 	CoverageCommand    string                   `json:"coverage_command"`
 	ConfigFiles        []string                 `json:"config_files,omitempty"`
@@ -175,10 +177,17 @@ func (pt *PipelineTester) detectHarness(ctx context.Context, files []string, tas
 
 	root := pt.workingDir()
 	projectRuntime := purevfs.DefaultCatalog().DetectProject(root)
-	language := inferLanguage(targetFiles, workerType)
-	def := selectFrameworkDefinition(root, language, projectRuntime)
+
+	pt.mu.RLock()
+	task := pt.currentTask
+	pt.mu.RUnlock()
+
+	def, _, languageSource, languageNote := selectHarnessLanguage(
+		root, task, targetFiles, workerType, projectRuntime,
+	)
 	if def == nil {
-		return nil, fmt.Errorf("no supported test framework detected for %s", language)
+		return nil, fmt.Errorf("no supported test framework detected (task_spec=%q files=%v project=%q)",
+			languageFromPlannerSpec(task), summarizeExtensions(targetFiles), projectRuntime.PrimaryLanguage)
 	}
 
 	existingTests := pt.findExistingTestFiles(ctx, def, targetFiles)
@@ -191,6 +200,8 @@ func (pt *PipelineTester) detectHarness(ctx context.Context, files []string, tas
 		FrameworkID:        def.ID,
 		FrameworkName:      def.Name,
 		Language:           def.Language,
+		LanguageSource:     languageSource,
+		LanguageNote:       languageNote,
 		RunCommand:         def.RunCommand,
 		CoverageCommand:    def.CoverageCommand,
 		ConfigFiles:        append([]string(nil), def.ConfigFiles...),
@@ -204,6 +215,120 @@ func (pt *PipelineTester) detectHarness(ctx context.Context, files []string, tas
 	state.SetupRequired, state.SetupReason = harnessSetupRequirement(def, state.MissingConfigFiles)
 	pt.setHarnessState(state)
 	return state, nil
+}
+
+// selectHarnessLanguage chooses the test framework by walking three
+// language candidates in priority order:
+//
+//  1. task_spec — language inferred from paths the planner declared
+//     in the task: affected_files, workspace.{read,write,test_surface},
+//     and worker_packets[].{read,write}. This is the planner's
+//     authoritative description of what is being built. Preferring it
+//     prevents the failure mode where the LLM tester invents a target
+//     path with the wrong extension (e.g., a .py path for a Go task)
+//     and biases harness selection toward the wrong runtime.
+//  2. target_files — file-extension inference on the LLM-supplied
+//     target_files parameter. Used when the planner spec is silent on
+//     paths.
+//  3. project_primary — the project's detected primary language as a
+//     last-resort signal.
+//
+// Returns the chosen framework definition, the chosen language string,
+// the source label ("task_spec" / "target_files" / "project_primary"),
+// and a note that flags conflicts between candidates so the LLM sees
+// why a particular framework was selected.
+func selectHarnessLanguage(
+	root string,
+	task *agentshared.PipelineTaskInput,
+	targetFiles []string,
+	workerType string,
+	projectRuntime purevfs.ProjectRuntimeSummary,
+) (*coretest.TestFrameworkDefinition, string, string, string) {
+	specLanguage := languageFromPlannerSpec(task)
+	inferredLanguage := inferLanguage(targetFiles, workerType)
+	primary := strings.TrimSpace(projectRuntime.PrimaryLanguage)
+
+	type candidate struct {
+		lang   string
+		source string
+	}
+	candidates := []candidate{
+		{specLanguage, "task_spec"},
+		{inferredLanguage, "target_files"},
+		{primary, "project_primary"},
+	}
+
+	for _, c := range candidates {
+		if strings.TrimSpace(c.lang) == "" {
+			continue
+		}
+		if def := selectFrameworkDefinition(root, c.lang, projectRuntime); def != nil {
+			note := buildLanguageNote(c.source, c.lang, specLanguage, inferredLanguage, primary)
+			return def, c.lang, c.source, note
+		}
+	}
+	return nil, "", "", ""
+}
+
+// buildLanguageNote returns a one-line note describing language-source
+// conflicts when the chosen source disagrees with another candidate.
+// Surfaced to the LLM in the harness state so it can self-correct
+// when, e.g., its supplied target_files implied Python but the planner
+// task spec implied Go.
+func buildLanguageNote(chosenSource, chosenLang, specLang, inferredLang, primary string) string {
+	conflicts := make([]string, 0, 2)
+	if chosenSource != "task_spec" && specLang != "" && specLang != chosenLang {
+		conflicts = append(conflicts, fmt.Sprintf("planner task spec implies %q", specLang))
+	}
+	if chosenSource != "target_files" && inferredLang != "" && inferredLang != chosenLang {
+		conflicts = append(conflicts, fmt.Sprintf("supplied target_files imply %q", inferredLang))
+	}
+	if chosenSource != "project_primary" && primary != "" && primary != chosenLang {
+		conflicts = append(conflicts, fmt.Sprintf("project primary language is %q", primary))
+	}
+	if len(conflicts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("chose %q from %s (%s)", chosenLang, chosenSource, strings.Join(conflicts, "; "))
+}
+
+// languageFromPlannerSpec returns the dominant language implied by the
+// planner's structured task specification — file extensions on
+// affected_files, workspace.{read,write,test_surface}, and
+// worker_packets[].{read,write}. The LLM-tester's free-form
+// task_spec parameter and target_files parameter are NOT consulted
+// here; they have been observed to fabricate paths whose extensions
+// disagree with the project's actual language and bias the harness
+// toward the wrong framework.
+func languageFromPlannerSpec(task *agentshared.PipelineTaskInput) string {
+	if task == nil {
+		return ""
+	}
+	files := taskContextFiles(task)
+	if len(files) == 0 {
+		return ""
+	}
+	return purevfs.InferPrimaryLanguage(files, "")
+}
+
+// summarizeExtensions returns a sorted list of unique file extensions
+// from a slice of paths. Used in the no-framework error so the LLM
+// can see which extensions failed to resolve.
+func summarizeExtensions(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		ext := strings.ToLower(filepath.Ext(p))
+		if ext == "" {
+			continue
+		}
+		seen[ext] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for ext := range seen {
+		out = append(out, ext)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func selectFrameworkDefinition(root, language string, runtime purevfs.ProjectRuntimeSummary) *coretest.TestFrameworkDefinition {

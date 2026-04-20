@@ -2026,3 +2026,135 @@ func (testNoopPipelineCommitter) ExtractReviewCandidate(_ context.Context, _ str
 }
 
 func (testNoopPipelineCommitter) Rollback(_ context.Context, _ string) error { return nil }
+
+// The following tests lock in the schema-level routing contract for
+// finalize_pipeline when a challenge is pending. Historically the
+// handler required the LLM to specify target=<challenger> and
+// rejected with challenge_target_mismatch when the LLM supplied the
+// previous-handoff target (engineer/designer) instead. The fix makes
+// target optional when a challenge is pending and auto-derives it
+// from PendingChallenge.RequestingAgent — the LLM cannot misroute
+// if it follows the new "omit target when challenged" guidance.
+
+func TestReconcileChallengeFinalizeTarget_EmptyTargetAutoDerived(t *testing.T) {
+	specs := []PipelineTesterFinalizeTargetSpec{
+		{Target: "", Summary: "verified", EvidenceRefs: []string{"tests/foo_test.go"}},
+	}
+	snapshot := &PipelineProtocolSnapshot{
+		PendingChallenge: &PipelineProtocolChallenge{
+			ID:              "chal-1",
+			RequestingAgent: PipelineAgentInspector,
+		},
+	}
+	if err := reconcileChallengeFinalizeTarget(specs, snapshot); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if specs[0].Target != PipelineAgentInspector {
+		t.Errorf("target = %q, want %q (auto-derived from challenger)", specs[0].Target, PipelineAgentInspector)
+	}
+}
+
+func TestReconcileChallengeFinalizeTarget_MatchingTargetAccepted(t *testing.T) {
+	specs := []PipelineTesterFinalizeTargetSpec{
+		{Target: PipelineAgentInspector, Summary: "verified"},
+	}
+	snapshot := &PipelineProtocolSnapshot{
+		PendingChallenge: &PipelineProtocolChallenge{
+			ID:              "chal-1",
+			RequestingAgent: PipelineAgentInspector,
+		},
+	}
+	if err := reconcileChallengeFinalizeTarget(specs, snapshot); err != nil {
+		t.Fatalf("unexpected error for explicit-matching target: %v", err)
+	}
+	if specs[0].Target != PipelineAgentInspector {
+		t.Errorf("target = %q, should be preserved", specs[0].Target)
+	}
+}
+
+func TestReconcileChallengeFinalizeTarget_WrongTargetRejectedWithRecovery(t *testing.T) {
+	// This is the bug from the reported screenshot: LLM supplied
+	// target=engineer while the inspector challenge was pending.
+	specs := []PipelineTesterFinalizeTargetSpec{
+		{Target: PipelineAgentEngineer, Summary: "verified", EvidenceRefs: []string{"tests/foo_test.go"}},
+	}
+	snapshot := &PipelineProtocolSnapshot{
+		PendingChallenge: &PipelineProtocolChallenge{
+			ID:              "chal-1",
+			RequestingAgent: PipelineAgentInspector,
+		},
+	}
+	err := reconcileChallengeFinalizeTarget(specs, snapshot)
+	if err == nil {
+		t.Fatal("expected error for explicit wrong target")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "challenge_target_mismatch") {
+		t.Errorf("error code missing: %v", err)
+	}
+	if !strings.Contains(msg, "omit target") {
+		t.Errorf("error recovery should tell the LLM it may omit target; got: %v", err)
+	}
+	// Original spec should NOT have been silently overwritten — the
+	// substrate surfaces the LLM's mistake rather than hiding it.
+	if specs[0].Target != PipelineAgentEngineer {
+		t.Errorf("spec was mutated on error; got target %q", specs[0].Target)
+	}
+}
+
+func TestReconcileChallengeFinalizeTarget_MultiTargetRejected(t *testing.T) {
+	specs := []PipelineTesterFinalizeTargetSpec{
+		{Target: PipelineAgentEngineer, Summary: "x"},
+		{Target: PipelineAgentDesigner, Summary: "y"},
+	}
+	snapshot := &PipelineProtocolSnapshot{
+		PendingChallenge: &PipelineProtocolChallenge{
+			ID:              "chal-1",
+			RequestingAgent: PipelineAgentInspector,
+		},
+	}
+	err := reconcileChallengeFinalizeTarget(specs, snapshot)
+	if err == nil {
+		t.Fatal("expected error for len(specs) != 1 while challenged")
+	}
+	if !strings.Contains(err.Error(), "challenge_target_mismatch") {
+		t.Errorf("error code missing: %v", err)
+	}
+}
+
+func TestReconcileChallengeFinalizeTarget_ChallengerMissingIdentity(t *testing.T) {
+	specs := []PipelineTesterFinalizeTargetSpec{{Summary: "x"}}
+	snapshot := &PipelineProtocolSnapshot{
+		PendingChallenge: &PipelineProtocolChallenge{ID: "chal-1"},
+	}
+	err := reconcileChallengeFinalizeTarget(specs, snapshot)
+	if err == nil {
+		t.Fatal("expected error when challenger has no identity")
+	}
+	if !strings.Contains(err.Error(), "no requesting agent identity") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestRequireExplicitFinalizeTargets_RejectsEmpty(t *testing.T) {
+	specs := []PipelineTesterFinalizeTargetSpec{
+		{Target: "", Summary: "x"},
+	}
+	err := requireExplicitFinalizeTargets(specs)
+	if err == nil {
+		t.Fatal("expected error for empty target when no challenge")
+	}
+	if !strings.Contains(err.Error(), "targets[0].target is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestRequireExplicitFinalizeTargets_AcceptsPopulated(t *testing.T) {
+	specs := []PipelineTesterFinalizeTargetSpec{
+		{Target: PipelineAgentEngineer, Summary: "x"},
+		{Target: PipelineAgentDesigner, Summary: "y"},
+	}
+	if err := requireExplicitFinalizeTargets(specs); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

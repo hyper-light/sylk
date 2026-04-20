@@ -31,6 +31,7 @@ func engineerVisibleSkillNames() []string {
 		"format",
 		"lint",
 		"consult",
+		"ask_user_clarification",
 		"research_dependency_install",
 		"install_dependency_tooling",
 		"coord_query_view",

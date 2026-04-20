@@ -57,17 +57,27 @@ type ProtocolError struct {
 // Error implements the error interface. Formats the typed fields into a
 // compact prose string for callers that consume error.Error(). Typed
 // consumers should type-assert and read fields directly.
+//
+// Convention: every RuleID carries its scope as a prefix
+// ("pipeline.finalize.challenge_target_mismatch"). The Error()
+// output prepends Scope only when RuleID does not already include
+// it — otherwise the rendered string would double up
+// ("pipeline.pipeline.finalize.challenge_target_mismatch") as a
+// pure cosmetic artifact that confuses log consumers and LLM
+// readers.
 func (e *ProtocolError) Error() string {
 	if e == nil {
 		return ""
 	}
 	var b strings.Builder
-	if e.Scope != "" {
-		b.WriteString(e.Scope)
-		b.WriteString(".")
-	}
 	if e.RuleID != "" {
+		if e.Scope != "" && !strings.HasPrefix(e.RuleID, e.Scope+".") {
+			b.WriteString(e.Scope)
+			b.WriteString(".")
+		}
 		b.WriteString(e.RuleID)
+	} else if e.Scope != "" {
+		b.WriteString(e.Scope)
 	}
 	if e.HumanMessage != "" {
 		if b.Len() > 0 {

@@ -381,6 +381,12 @@ type planApprovalState struct {
 	activated   int
 	returnFocus component.FocusID
 	returnInput bool
+	// bodyScroll tracks scroll position within the markdown-rendered
+	// plan-name body, matching the guardian command-approval dialog's
+	// codeScroll pattern. When the rendered body exceeds the visible
+	// budget the user can scroll; when it fits the value is clamped
+	// to zero by visiblePlanApprovalBodyLines.
+	bodyScroll int
 }
 
 type layerDecisionState struct {

@@ -32,6 +32,29 @@ func TestDefaultEngineerSystemPrompt_ComposesModulesOnceInOrder(t *testing.T) {
 	}
 }
 
+// TestDefaultEngineerSystemPrompt_IncludesLanguageToolingPreference
+// locks the wiring of the shared language-tooling preference snippet.
+// The snippet encodes the priority order — task spec → fabric →
+// codebase — that engineer reads before reaching for write or edit
+// skills. Pre-fix, agents drifted into the codebase's primary
+// language even when the task explicitly asked for a different
+// language; the snippet plus the harness's language_source signal is
+// the corrective.
+func TestDefaultEngineerSystemPrompt_IncludesLanguageToolingPreference(t *testing.T) {
+	required := []string{
+		"LANGUAGE, FRAMEWORK, AND TOOLING SELECTION",
+		"task specification",
+		"Activity Fabric",
+		"existing codebase",
+		"ask_user_clarification",
+	}
+	for _, want := range required {
+		if !strings.Contains(DefaultEngineerSystemPrompt, want) {
+			t.Errorf("DefaultEngineerSystemPrompt missing %q", want)
+		}
+	}
+}
+
 func TestEngineerSystemCorePrompt_DoesNotDuplicateModuleHeadings(t *testing.T) {
 	disallowed := []string{
 		"# Engineer Agent — Implementation Guidance",

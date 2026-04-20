@@ -256,6 +256,13 @@ func (pt *PipelineTester) registerCoreSkills() {
 	pt.skills.Register(versioning.NewEditPipelineFileSkill(writeCfg))
 	pt.skills.Register(versioning.NewDeletePipelineFileSkill(writeCfg))
 	pt.skills.Register(versioning.NewCreatePipelineDirectorySkill(writeCfg))
+	pt.skills.Register(agentshared.BuildAskUserClarificationSkill(agentshared.AskUserClarificationConfig{
+		Bus:          pt.bus,
+		AgentID:      pt.id,
+		AgentName:    "tester-pipeline",
+		SessionID:    pt.config.SessionID,
+		NewMessageID: pt.generateMessageID,
+	}))
 	for _, skill := range agentshared.CoordinationSkills(agentshared.CoordinationSkillConfig{
 		Client: agentshared.CoordinationClient{
 			BusProvider:     func() guide.EventBus { return pt.bus },
@@ -571,6 +578,18 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		if workspaceContext := agentshared.BuildTaskWorkspaceRuntimeContext(ctx, pt.workspaceViews, task); workspaceContext != "" {
 			userMessage += "\n\n" + workspaceContext
 		}
+	}
+	// Surface the active pipeline state BEFORE the LLM makes its first
+	// tool call. The tester's target-selection decision for
+	// finalize_pipeline depends on whether a challenge is pending, and
+	// the state lives in PipelineProtocolStateFromContext — not visible
+	// to the LLM unless we project it into the user message. Without
+	// this, the LLM applies general-world reasoning ("tests about
+	// engineer's code → hand off to engineer") instead of protocol
+	// reasoning ("answer the challenger"), producing challenge_target_
+	// mismatch on every inspector-initiated verification turn.
+	if preamble := agentshared.PipelineProtocolStatePreamble(ctx); preamble != "" {
+		userMessage = preamble + "\n\n" + userMessage
 	}
 
 	systemPrompt := shared.PipelineTesterSystemPromptForWorkerAndContract(wt, contract)

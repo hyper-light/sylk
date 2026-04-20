@@ -63,6 +63,36 @@ func TestGlobalTesterSystemPromptForContract_UsesTaskModePrompt(t *testing.T) {
 	}
 }
 
+// TestTesterSystemPrompts_IncludeLanguageToolingPreference locks the
+// wiring of the shared language-tooling preference snippet into both
+// pipeline and global tester prompt assemblies. The snippet encodes
+// the priority order — task spec → fabric → codebase — that tester
+// reads before reaching for write_test, edit_pipeline_file, or
+// write_global_file. Pre-fix, tester drifted into the codebase's
+// primary language even when the task's path-shaped spec implied a
+// different framework (e.g., wrote pytest in a Go project).
+func TestTesterSystemPrompts_IncludeLanguageToolingPreference(t *testing.T) {
+	required := []string{
+		"LANGUAGE, FRAMEWORK, AND TOOLING SELECTION",
+		"task specification",
+		"Activity Fabric",
+		"existing codebase",
+		"ask_user_clarification",
+	}
+	for name, prompt := range map[string]string{
+		"PipelineTesterSystemPrompt":               PipelineTesterSystemPrompt(),
+		"GlobalTesterSystemPrompt":                 GlobalTesterSystemPrompt(),
+		"PipelineTesterSystemPromptForContract":    PipelineTesterSystemPromptForWorkerAndContract("engineer", &agentshared.TaskExecutionContract{TaskID: "task_x"}),
+		"GlobalTesterSystemPromptForContract":      GlobalTesterSystemPromptForContract(&agentshared.GlobalExecutionContract{Role: "tester-global", Mode: agentshared.GlobalExecutionModeExecute}),
+	} {
+		for _, want := range required {
+			if !strings.Contains(prompt, want) {
+				t.Errorf("%s missing %q", name, want)
+			}
+		}
+	}
+}
+
 func TestGlobalTesterSystemPrompt_IncludesGlobalReviewProtocolGuidance(t *testing.T) {
 	prompt := GlobalTesterSystemPrompt()
 	for _, want := range []string{

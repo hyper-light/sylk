@@ -48,6 +48,7 @@ func pipelineTesterVisibleSkillNames() []string {
 		"coord_resolve_artifact",
 		"query_decisions",
 		"declare_decision",
+		"ask_user_clarification",
 	}, "tester-pipeline")
 	// Activity Fabric: awareness + cross-pipeline + recall must be
 	// in the LLM's default tool catalog so the ambient model is

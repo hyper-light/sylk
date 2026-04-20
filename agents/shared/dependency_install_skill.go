@@ -3,6 +3,7 @@ package shared
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +11,9 @@ import (
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/substrate/ecosystem"
+	"github.com/adalundhe/sylk/core/substrate/provisioner"
+	"github.com/adalundhe/sylk/core/substrate/recipe"
 	"github.com/adalundhe/sylk/core/versioning"
 )
 
@@ -28,6 +32,7 @@ type DependencyInstallSkillConfig struct {
 	ResearchSkill      string
 	AgentType          string
 	AgentID            func() string
+	PipelineID         func() string
 	SessionID          func() string
 	WorkingDir         func() string
 	CommandsEnabled    func() bool
@@ -36,6 +41,26 @@ type DependencyInstallSkillConfig struct {
 	ExecutionBroker    func() purevfs.ExecutionBroker
 	PrepareExecution   func(context.Context, string) (CommandExecContext, error)
 	ExecutionWorkspace func(allowWrites bool) purevfs.ExecutionFS
+
+	// Provisioner, when wired together with Ecosystems, lets the install
+	// skill route recognized package-manager commands through the
+	// substrate (content-addressed fetch + verify + manifest registration
+	// + lockfile pin) instead of shelling out to pip/npm/cargo/etc. via
+	// the strict-disk broker. When either field is nil, every step falls
+	// through to the legacy broker path.
+	Provisioner provisioner.Provisioner
+
+	// Ecosystems is the language-agnostic plugin registry the skill
+	// consults to translate free-form install commands ("pip install
+	// foo", "npm install bar@1.2.3", "cargo install baz") into
+	// structured (ecosystem, name, version) coordinates. Plugins live in
+	// core/substrate/ecosystem/<lang>/; the substrate itself ships none.
+	Ecosystems *ecosystem.Registry
+
+	// PlatformOverride lets composition roots pin a specific platform
+	// tuple for substrate provisioning. Empty means the substrate runtime
+	// uses the host's detected platform.
+	PlatformOverride recipe.Platform
 }
 
 type DependencyInstallCommandRequest struct {
@@ -139,7 +164,7 @@ func ExecuteDependencyInstallPlan(ctx context.Context, cfg DependencyInstallSkil
 
 	stepResults := make([]map[string]any, 0, len(plan.Steps))
 	for _, step := range plan.Steps {
-		runResult, err := runDependencyInstallCommand(ctx, cfg, DependencyInstallCommandRequest{
+		req := DependencyInstallCommandRequest{
 			ToolName:      cfg.SkillName,
 			Command:       step.Command,
 			WorkingDir:    workspaceRoot,
@@ -148,7 +173,14 @@ func ExecuteDependencyInstallPlan(ctx context.Context, cfg DependencyInstallSkil
 			AgentType:     strings.TrimSpace(cfg.AgentType),
 			SessionID:     dependencyInstallSessionID(ctx, cfg),
 			Timeout:       timeout,
-		})
+		}
+		if substrateResult, routed, err := tryRouteDependencyInstallStepViaSubstrate(ctx, cfg, req); err != nil {
+			return nil, err
+		} else if routed {
+			stepResults = append(stepResults, dependencyInstallStepResult(step, substrateResult))
+			continue
+		}
+		runResult, err := runDependencyInstallCommand(ctx, cfg, req)
 		if err != nil {
 			return nil, err
 		}
@@ -349,4 +381,109 @@ func dependencyInstallStepResult(step DependencyInstallStep, runResult *Dependen
 		"stderr":    string(runResult.Stderr),
 		"truncated": runResult.StdoutTruncated || runResult.StderrTruncated,
 	}
+}
+
+// tryRouteDependencyInstallStepViaSubstrate attempts to satisfy req
+// through the substrate's content-addressed provisioning path instead
+// of shelling out to a host package manager.
+//
+// Three return values, treated independently by the caller:
+//
+//   - (result, true,  nil): the command was recognized by the
+//     ecosystem registry, the substrate provisioner ran successfully,
+//     and result is a synthesized DependencyInstallCommandResult that
+//     looks (to the agent) like a successful broker run.
+//   - (nil,    false, nil): the substrate is not wired (no provisioner
+//     or no registry), or no plugin in the registry recognized the
+//     command. The caller should fall through to the legacy broker
+//     path.
+//   - (nil,    false, err): the substrate claimed responsibility for
+//     the command (a plugin recognized it) but provisioning failed.
+//     The caller surfaces the error — falling back to the broker here
+//     would defeat the substrate's no-disk invariant by silently
+//     reverting to a host-package-manager install.
+//
+// The "claimed responsibility" semantics are deliberate: if pip is
+// registered and the command is `pip install foo`, we never shell out
+// to the host's pip. Either the substrate provisions it or the install
+// fails loudly.
+func tryRouteDependencyInstallStepViaSubstrate(
+	ctx context.Context,
+	cfg DependencyInstallSkillConfig,
+	req DependencyInstallCommandRequest,
+) (*DependencyInstallCommandResult, bool, error) {
+	if cfg.Provisioner == nil || cfg.Ecosystems == nil || cfg.Ecosystems.Len() == 0 {
+		return nil, false, nil
+	}
+	coords, ok := cfg.Ecosystems.Parse(req.Command)
+	if !ok {
+		return nil, false, nil
+	}
+	pipelineID := dependencyInstallPipelineID(cfg)
+	provisionReq := provisioner.ProvisionRequest{
+		Ecosystem:  coords.Ecosystem,
+		Name:       coords.Name,
+		Version:    coords.Version,
+		Constraint: coords.Constraint,
+		Platform:   cfg.PlatformOverride,
+		SessionID:  strings.TrimSpace(req.SessionID),
+		PipelineID: pipelineID,
+	}
+	result, err := cfg.Provisioner.Provision(ctx, provisionReq)
+	if err != nil {
+		// ErrUnsupportedEcosystem from the provisioner means a parser
+		// matched but no plugin is actually registered under that name
+		// — that is a wiring inconsistency between the parser registry
+		// and the provisioner registry, not a routing miss. Surface it
+		// so the misconfiguration is visible rather than silently
+		// fronting an install through the host.
+		if errors.Is(err, provisioner.ErrUnsupportedEcosystem) {
+			return nil, false, fmt.Errorf("substrate routing of %q: %w", req.Command, err)
+		}
+		return nil, false, fmt.Errorf("substrate provision %s/%s: %w", coords.Ecosystem, coords.Name, err)
+	}
+	stdout := formatSubstrateProvisionStdout(req.Command, coords, result)
+	return &DependencyInstallCommandResult{
+		Stdout:   []byte(stdout),
+		ExitCode: 0,
+	}, true, nil
+}
+
+func formatSubstrateProvisionStdout(command string, coords ecosystem.Coordinates, result *provisioner.ProvisionResult) string {
+	version := strings.TrimSpace(coords.Version)
+	if version == "" && result != nil {
+		version = strings.TrimSpace(result.PackageID.Version)
+	}
+	if version == "" {
+		version = "latest"
+	}
+	state := "provisioned"
+	if result != nil && result.AlreadyProvisioned {
+		state = "already-provisioned"
+	}
+	witness := "no"
+	if result != nil && result.WitnessAdded {
+		witness = "yes"
+	}
+	manifest := ""
+	if result != nil {
+		manifest = result.ManifestID.String()
+	}
+	return fmt.Sprintf(
+		"[substrate] %s %s/%s@%s manifest=%s witness_added=%s (original-command: %s)",
+		state,
+		coords.Ecosystem,
+		coords.Name,
+		version,
+		manifest,
+		witness,
+		strings.TrimSpace(command),
+	)
+}
+
+func dependencyInstallPipelineID(cfg DependencyInstallSkillConfig) string {
+	if cfg.PipelineID == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.PipelineID())
 }

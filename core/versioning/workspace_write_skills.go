@@ -588,10 +588,11 @@ func newListChangesSkill(name string, scope WorkspaceWriteScope, getFA FileAcces
 }
 
 func prepareWriteContextDescription(scope WorkspaceWriteScope) string {
+	base := "Read %s state for one target path before mutating the %s VFS. Returns a write basis plus diffs so the agent can reason about committed versus in-progress state explicitly. Use the returned diffs to confirm the target path's existing language and conventions before authoring a write — the task spec governs language choice on this surface; in-flight peer work in the Activity Fabric and the existing codebase tell you which conventions to match."
 	if scope == WorkspaceWriteScopePipeline {
-		return "Read disk, global, and pipeline state for one target path before mutating the pipeline VFS. Returns a write basis plus diffs so the agent can reason about committed versus in-progress state explicitly."
+		return fmt.Sprintf(base, "disk, global, and pipeline", "pipeline")
 	}
-	return "Read disk and global state for one target path before mutating the global VFS. Returns a write basis plus diffs so the agent can reason about committed versus in-progress state explicitly."
+	return fmt.Sprintf(base, "disk and global", "global")
 }
 
 func prepareWriteContextUsage(scope WorkspaceWriteScope) string {
@@ -746,17 +747,19 @@ func createDirectoryAvoid(scope WorkspaceWriteScope) string {
 }
 
 func writeFileDescription(scope WorkspaceWriteScope) string {
+	base := "Write full file content into the %s VFS only. Requires a fresh or still-leased basis from prepare_%s_write_context and returns a refreshed next_basis on success. Before writing, confirm the file's language and conventions match the priority order in the system prompt: task spec wins on language and framework choice, in-flight peer work in the Activity Fabric defines conventions, and the existing codebase governs placement and integration. The file extension must agree with the language the task and the path imply."
 	if scope == WorkspaceWriteScopePipeline {
-		return "Write full file content into the pipeline VFS only. Requires a fresh or still-leased basis from prepare_pipeline_write_context and returns a refreshed next_basis on success."
+		return fmt.Sprintf(base, "pipeline", "pipeline")
 	}
-	return "Write full file content into the global VFS only. Requires a fresh or still-leased basis from prepare_global_write_context and returns a refreshed next_basis on success."
+	return fmt.Sprintf(base, "global", "global")
 }
 
 func editFileDescription(scope WorkspaceWriteScope) string {
+	base := "Apply precise search/replace edits inside the %s VFS only. Each edit item must include exact old_text and new_text. Requires a fresh or still-leased basis from prepare_%s_write_context and returns a refreshed next_basis on success. Edits must keep the file consistent with the language and conventions the task spec, in-flight peer work, and the existing codebase agree on; do not introduce constructs from a different language than the file's existing content."
 	if scope == WorkspaceWriteScopePipeline {
-		return "Apply precise search/replace edits inside the pipeline VFS only. Each edit item must include exact old_text and new_text. Requires a fresh or still-leased basis from prepare_pipeline_write_context and returns a refreshed next_basis on success."
+		return fmt.Sprintf(base, "pipeline", "pipeline")
 	}
-	return "Apply precise search/replace edits inside the global VFS only. Each edit item must include exact old_text and new_text. Requires a fresh or still-leased basis from prepare_global_write_context and returns a refreshed next_basis on success."
+	return fmt.Sprintf(base, "global", "global")
 }
 
 func editFileBestPractice(scope WorkspaceWriteScope) string {
@@ -922,11 +925,38 @@ func refreshWorkspaceMutationBasis(
 	}), nil
 }
 
+// canRebindWorkspaceMutationBasis reports whether the current basis
+// can be transparently rebound to a CreateDirectory target without
+// forcing the caller back through prepare_pipeline_write_context.
+//
+// Rebind is allowed only for CreateDirectory: the basis carries a
+// read-modify-write view keyed to its prepared path, and reusing it
+// for a write at a different path would silently commit against
+// stale context. CreateDirectory is the exception — it mutates only
+// the directory's existence, not its contents, so any basis whose
+// path shares an ancestor/descendant relationship with the target
+// is in the same scope subtree and can be safely refreshed.
+//
+// Both directions are permitted:
+//
+//   - basis is a descendant of target (e.g. basis prepared for
+//     "src/hello_world/__init__.py", target is "src/hello_world"):
+//     the agent prepared context for a nested file and now wants to
+//     ensure the parent directory exists before writing.
+//   - target is a descendant of basis (e.g. basis prepared for
+//     "hello_cli", target is "hello_cli/tests"): the agent created
+//     a parent directory and now wants to create a nested
+//     subdirectory.
+//
+// Sibling paths (no ancestor relationship) still require a fresh
+// prepare_pipeline_write_context — rebinding across siblings would
+// skip context refresh for genuinely unrelated scope changes.
 func canRebindWorkspaceMutationBasis(op workspaceWriteOperation, targetPath, basisPath string) bool {
 	if op != workspaceWriteOperationCreateDirectory {
 		return false
 	}
-	return workspacePathIsDescendant(targetPath, basisPath)
+	return workspacePathIsDescendant(basisPath, targetPath) ||
+		workspacePathIsDescendant(targetPath, basisPath)
 }
 
 func workspacePathIsDescendant(parentPath, childPath string) bool {

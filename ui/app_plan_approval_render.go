@@ -1,18 +1,44 @@
-// Plan acceptance dialog render — buttons only.
+// Plan acceptance dialog render.
 //
-// The dialog is intentionally minimal: a one-line prompt header plus
-// the three Approve / Modify / Reject buttons. The plan body, freshness
-// summary, drift signals, and orchestrator state hint live in the
-// architect's chat narrative (where the user can scroll them); the
-// dialog is purely a verdict-collection surface so it never crowds out
-// the chat panel or breaks the input border.
+// Matches the guardian command-approval dialog's layout pattern:
+//
+//   1. A short fixed prompt line ("Approve, modify, or reject this
+//      plan:") — never contains variable content, so never truncates.
+//   2. A markdown-rendered, height-budgeted, scrollable body showing
+//      the plan name (and, when space permits, the plan summary).
+//      Word-wrapping is handled by the same RenderMarkdown path
+//      command approval uses for its code block.
+//   3. The three Approve / Modify / Reject option buttons.
+//
+// Previously the dialog concatenated the plan name directly into the
+// prompt header and relied on hard truncation to fit a single line.
+// That failed for two cases the guardian dialog gets right:
+//
+//   - Multi-line PlanName values (the architect's derivePlanName
+//     pulls the user's original query, which routinely contains
+//     newlines). lipgloss.Width measures the widest line, not total
+//     length, so the truncation check would pass for a multi-line
+//     string whose widest line fit; the border then rendered the
+//     additional lines, the layout's line count underestimated the
+//     visual height, and subsequent rows (the ellipsis tail, a blank
+//     spacer, sometimes the start of the first option) clipped at
+//     the bottom of the panel — surfacing as the "Re..." fragment
+//     the user reported.
+//   - Long single-line PlanName values that wrap at render time.
+//     Same underlying bug: one layout line vs. multiple visual rows.
+//
+// Delegating body rendering to RenderMarkdown (with the same height
+// budgeting and scroll state the guardian dialog uses) eliminates
+// the mismatch — len(layout.lines) now equals the visible row count.
 package ui
 
 import (
 	"strings"
 
 	"github.com/adalundhe/sylk/core/planapproval"
+	markdownpkg "github.com/adalundhe/sylk/ui/markdown"
 	"github.com/adalundhe/sylk/ui/component"
+	"github.com/adalundhe/sylk/ui/theme"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -42,11 +68,15 @@ func (m *AppModel) renderPlanApprovalView() string {
 	return enforceLineCountToHeight(style.Width(contentWidth).Render(body), m.planApprovalHeight())
 }
 
-// planApprovalLayout composes the buttons-only layout: a one-line
-// prompt header followed by the three option rows. No scrollable
-// body, no drift signals — the chat panel carries that context.
-// Returns commandApprovalViewLayout (reused) so mouse hit testing
-// shares the existing optionAt path.
+// planApprovalMaxVisibleBodyLines mirrors commandApprovalMaxVisibleCodeLines:
+// caps the scrollable plan-body at a size that keeps the dialog from
+// dominating the chat panel. Agents summarize the full plan elsewhere;
+// the dialog is purely a verdict surface.
+const planApprovalMaxVisibleBodyLines = 8
+
+// planApprovalLayout composes: prompt + (height-budgeted, scrollable)
+// body + option buttons. Returns commandApprovalViewLayout so mouse
+// hit testing and scroll handling share the existing optionAt path.
 func (m *AppModel) planApprovalLayout(width int) commandApprovalViewLayout {
 	if width <= 0 {
 		width = 1
@@ -62,13 +92,36 @@ func (m *AppModel) planApprovalLayout(width int) commandApprovalViewLayout {
 		codeStartY: -1,
 		codeEndY:   -1,
 	}
-	layout.lines = append(layout.lines, promptStyle.Render(planApprovalHeaderText(m.planApproval.proposal, width)), "")
+	layout.lines = append(layout.lines,
+		promptStyle.Render(planApprovalPromptLine()),
+		"",
+	)
 
-	for idx, option := range planApprovalOptions {
+	optionLines, optionHitboxes, optionLineCount := m.renderPlanApprovalOptions(width)
+	bodyLines := renderPlanApprovalBody(m.planApproval.proposal, width, th)
+	maxBodyLines := max(m.height-statusBarHeight-mainMinContentHeight-inputBorderSize, 1)
+	availableForBody := max(maxBodyLines-len(layout.lines)-optionLineCount, 0)
+	bodySpacerLines := 0
+	if availableForBody > 1 && len(bodyLines) > 0 {
+		bodySpacerLines = 1
+	}
+	bodyBudget := min(max(availableForBody-bodySpacerLines, 0), planApprovalMaxVisibleBodyLines)
+	visibleBodyLines, appliedScroll := visibleCommandApprovalCodeLines(bodyLines, bodyBudget, m.planApproval.bodyScroll)
+	layout.codeTotalLines = len(bodyLines)
+	layout.codeVisibleLines = len(visibleBodyLines)
+	layout.codeScroll = appliedScroll
+	if len(visibleBodyLines) > 0 {
+		layout.codeStartY = len(layout.lines)
+		layout.lines = append(layout.lines, visibleBodyLines...)
+		layout.codeEndY = len(layout.lines)
+		if bodySpacerLines > 0 {
+			layout.lines = append(layout.lines, "")
+		}
+	}
+	for idx := range planApprovalOptions {
 		baseY := len(layout.lines)
-		renderedLines, hitboxes := m.renderPlanApprovalOption(idx, option, width)
-		layout.lines = append(layout.lines, renderedLines...)
-		for _, hitbox := range hitboxes {
+		layout.lines = append(layout.lines, optionLines[idx]...)
+		for _, hitbox := range optionHitboxes[idx] {
 			hitbox.y += baseY
 			layout.hitboxes = append(layout.hitboxes, hitbox)
 		}
@@ -76,54 +129,84 @@ func (m *AppModel) planApprovalLayout(width int) commandApprovalViewLayout {
 	return layout
 }
 
-// planApprovalHeaderText is the single prompt line at the top of the
-// dialog. Truncated to fit the available width with a trailing
-// ellipsis when the plan name pushes total length past one row —
-// without this guard the long plan-query name wraps to multiple
-// terminal rows, the layout's bodyLines underestimates the rendered
-// height, and the option buttons spill below the input border.
-func planApprovalHeaderText(proposal *planapproval.Proposal, width int) string {
-	const fallback = "Approve, modify, or reject this plan"
-	if proposal == nil {
-		return truncateHeaderToWidth(fallback, width)
+func (m *AppModel) renderPlanApprovalOptions(width int) ([][]string, [][]commandApprovalHitbox, int) {
+	optionLines := make([][]string, len(planApprovalOptions))
+	optionHitboxes := make([][]commandApprovalHitbox, len(planApprovalOptions))
+	optionLineCount := 0
+	for idx, option := range planApprovalOptions {
+		renderedLines, hitboxes := m.renderPlanApprovalOption(idx, option, width)
+		optionLines[idx] = renderedLines
+		optionHitboxes[idx] = hitboxes
+		optionLineCount += len(renderedLines)
 	}
-	name := strings.TrimSpace(proposal.PlanName)
-	if name == "" {
-		return truncateHeaderToWidth(fallback, width)
-	}
-	return truncateHeaderToWidth("Approve, modify, or reject plan: "+name, width)
+	return optionLines, optionHitboxes, optionLineCount
 }
 
-// truncateHeaderToWidth caps a header string to the visible terminal
-// column budget so the dialog header always renders on a single row.
-// Width comes from the layout's content width (panel inner width);
-// when the full text fits it's returned untouched, otherwise the
-// trailing ellipsis is appended after a trim that leaves room for it.
-// Operates on runes (display cells) rather than bytes so multi-byte
-// characters in the header don't overshoot the column budget.
-func truncateHeaderToWidth(text string, width int) string {
-	if width <= 0 {
-		return ""
+// planApprovalPromptLine is the fixed prompt header. No variable
+// content — matches commandApprovalPromptLine's "<agent> wants
+// approval for:" invariant.
+func planApprovalPromptLine() string {
+	return "Approve, modify, or reject this plan:"
+}
+
+// renderPlanApprovalBody produces the scrollable body lines shown
+// between the prompt and the option buttons. Mirrors
+// renderCommandApprovalCodeBlock: uses the shared markdown renderer
+// so word wrapping is consistent with the rest of the chat UI, and
+// returns a proper []string whose length equals the visual row count.
+//
+// Body content (in priority order, joined by blank lines when the
+// budget permits):
+//
+//   1. The plan name (collapsed to single-line whitespace so any
+//      embedded newlines from a multi-line user query don't survive
+//      into the rendered form). Emitted as a bold heading.
+//   2. The plan summary, when non-empty.
+//
+// Empty body (no name, no summary) returns nil so the dialog degrades
+// gracefully to prompt + buttons.
+func renderPlanApprovalBody(proposal *planapproval.Proposal, width int, th *theme.Theme) []string {
+	markdown := buildPlanApprovalMarkdown(proposal)
+	if markdown == "" {
+		return nil
 	}
-	if lipgloss.Width(text) <= width {
-		return text
+	rendered := markdownpkg.RenderMarkdown(markdown, width, th)
+	return trimApprovalMarkdownBorders(rendered)
+}
+
+func buildPlanApprovalMarkdown(proposal *planapproval.Proposal) string {
+	name := collapseWhitespace(proposal.PlanName)
+	summary := collapseWhitespace(proposal.PlanSummary)
+	parts := []string{}
+	if name != "" {
+		parts = append(parts, "**"+name+"**")
 	}
-	const ellipsis = "…"
-	if width <= 1 {
-		return ellipsis
+	if summary != "" && summary != name {
+		parts = append(parts, summary)
 	}
-	runes := []rune(text)
-	// Drop trailing runes one at a time until the (text + ellipsis)
-	// width fits the budget. Linear in over-length but bounded by the
-	// header itself (worst case ~120 chars per derivePlanName cap).
-	for len(runes) > 0 {
-		candidate := string(runes) + ellipsis
-		if lipgloss.Width(candidate) <= width {
-			return candidate
-		}
-		runes = runes[:len(runes)-1]
+	return strings.Join(parts, "\n\n")
+}
+
+// collapseWhitespace replaces any run of whitespace (including
+// embedded newlines from multi-line queries) with a single space and
+// trims. Prevents newlines in the plan name from being interpreted as
+// markdown paragraph breaks the body block can't height-budget for.
+func collapseWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// trimApprovalMarkdownBorders strips leading/trailing empty lines the
+// markdown renderer sometimes emits around block content. Matches
+// the guardian dialog's renderCommandApprovalCodeBlock behavior so
+// the visual height matches the logical line count.
+func trimApprovalMarkdownBorders(lines []string) []string {
+	for len(lines) >= 2 && commandApprovalMarkdownLineEmpty(lines[0]) {
+		lines = lines[1:]
 	}
-	return ellipsis
+	for len(lines) >= 2 && commandApprovalMarkdownLineEmpty(lines[len(lines)-1]) {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }
 
 func (m *AppModel) renderPlanApprovalOption(index int, option commandApprovalOption, width int) ([]string, []commandApprovalHitbox) {
@@ -142,4 +225,21 @@ func (m *AppModel) renderPlanApprovalOption(index int, option commandApprovalOpt
 		})
 	}
 	return renderedLines, hitboxes
+}
+
+// scrollPlanApprovalBody adjusts the plan body scroll by delta.
+// Mirrors scrollCommandApprovalCode so mouse-wheel and keyboard
+// scroll events on the plan approval dialog work identically to the
+// command approval dialog.
+func (m *AppModel) scrollPlanApprovalBody(layout commandApprovalViewLayout, delta int) bool {
+	if m.planApproval == nil || delta == 0 || layout.codeVisibleLines <= 0 || layout.codeTotalLines <= layout.codeVisibleLines {
+		return false
+	}
+	maxScroll := layout.codeTotalLines - layout.codeVisibleLines
+	next := clampInt(layout.codeScroll+delta, 0, maxScroll)
+	if next == m.planApproval.bodyScroll {
+		return false
+	}
+	m.planApproval.bodyScroll = next
+	return true
 }

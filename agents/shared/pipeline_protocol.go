@@ -1468,6 +1468,133 @@ func (r *PipelineValidationResult) InterAgentSummary() string {
 	return "pipeline validation " + r.Status
 }
 
+// autoDispatchValidationFromFinalize is the dispatch path that
+// finalize_pipeline runs internally when a challenge is pending. It
+// mirrors the validate_work handler's dispatch sequence (lines
+// 1556+) so the protocol's behavior is identical whether the LLM
+// called validate_work directly or finalize_pipeline auto-dispatched.
+//
+// Why this exists: empirical reproduction (TestPipelineTester_*)
+// showed that splitting "package the artifact" (finalize_pipeline)
+// from "dispatch the response" (validate_work) into two LLM tool
+// calls created a structural gap. The validate_work parameters
+// (challenge_id, requesting_agent) are fully determined by protocol
+// state — the LLM was being asked to re-state identity that the
+// protocol already owned, after a tool result that did not include
+// the identity the model needed to assemble the next call. Models
+// dead-ended in production. Auto-dispatch removes the LLM from the
+// loop on identity it cannot meaningfully decide.
+//
+// validate_work remains an LLM-callable skill for non-tester agents
+// (inspector, engineer, designer responding to challenges). Only the
+// tester's package-then-dispatch flow is collapsed here.
+func autoDispatchValidationFromFinalize(
+	ctx context.Context,
+	cfg PipelineProtocolSkillConfig,
+	state *PipelineProtocolState,
+	snapshot *PipelineProtocolSnapshot,
+	spec PipelineTesterFinalizeTargetSpec,
+	queuedRef PipelineHandoffArtifactRef,
+	agentType string,
+) (map[string]any, error) {
+	challenge := snapshot.PendingChallenge
+	if challenge == nil {
+		return nil, fmt.Errorf("auto-dispatch validation: pending challenge unexpectedly nil")
+	}
+	requestingAgent := normalizePipelineAgentType(challenge.RequestingAgent)
+	requestingAgentID := strings.TrimSpace(challenge.RequestingAgentID)
+	if requestingAgentID == "" {
+		return nil, fmt.Errorf("auto-dispatch validation: pending challenge has no requesting agent id")
+	}
+	respondingAgent := agentType
+	respondingAgentID := pipelineProtocolAgentID(ctx, cfg)
+	if respondingAgentID == "" {
+		return nil, fmt.Errorf("auto-dispatch validation: responding agent id unavailable")
+	}
+
+	// Status derivation: failure_focus on the spec is the LLM's
+	// signal that something needs the recipient's attention. Empty
+	// failure_focus + non-empty evidence means the suite passed; a
+	// populated failure_focus means the tester is reporting a
+	// problem to the challenger. This mirrors the LLM-supplied
+	// status field on validate_work without requiring the LLM to
+	// re-derive what the spec already encoded.
+	status := string(PipelineValidationPassed)
+	if len(spec.FailureFocus) > 0 {
+		status = string(PipelineValidationFailed)
+	}
+
+	record := &PipelineValidationRecord{
+		ChallengeID:         challenge.ID,
+		RequestingAgent:     requestingAgent,
+		RequestingAgentID:   requestingAgentID,
+		RespondingAgent:     respondingAgent,
+		RespondingAgentID:   respondingAgentID,
+		Status:              status,
+		Summary:             strings.TrimSpace(spec.Summary),
+		ChallengeRequest:    strings.TrimSpace(challenge.Request),
+		ChallengeReferences: normalizeStringList(challenge.References),
+		EvidenceRefs:        normalizeStringList(spec.EvidenceRefs),
+		MissingInputs:       normalizeStringList(spec.FailureFocus),
+	}
+	terminalAction := &PipelineTurnAction{
+		Type:        PipelineProtocolActionValidate,
+		AgentType:   record.RespondingAgent,
+		AgentID:     record.RespondingAgentID,
+		ChallengeID: challenge.ID,
+		Validation:  record,
+	}
+	if err := state.validateTerminalAction(terminalAction); err != nil {
+		return nil, err
+	}
+	task := PipelineTaskFromContext(ctx)
+	if task == nil {
+		return nil, fmt.Errorf("auto-dispatch validation: pipeline task context missing")
+	}
+	nextTask, err := buildPipelineValidationTask(state, task, record)
+	if err != nil {
+		return nil, err
+	}
+	correlationID, err := dispatchPipelineProtocolTaskWithOptions(
+		ctx,
+		cfg,
+		nextTask,
+		record.Summary,
+		pipelineValidationRouteOptions(ctx),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := state.consumeQueuedArtifacts(ctx, []string{requestingAgent}); err != nil {
+		return nil, err
+	}
+	if err := state.recordValidation(ctx, record); err != nil {
+		return nil, err
+	}
+	if err := state.setTerminalAction(terminalAction); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"finalize_pipeline":     true,
+		"agent_type":            agentType,
+		"suite_id":              strings.TrimSpace(queuedRef.SuiteID),
+		"queued_targets":        []string{requestingAgent},
+		"queued_artifacts":      []map[string]any{pipelineHandoffArtifactRefMap(queuedRef)},
+		"validation_dispatched": true,
+		"validation": map[string]any{
+			"challenge_id":        record.ChallengeID,
+			"requesting_agent":    record.RequestingAgent,
+			"requesting_agent_id": record.RequestingAgentID,
+			"responding_agent":    record.RespondingAgent,
+			"responding_agent_id": record.RespondingAgentID,
+			"status":              record.Status,
+			"summary":             record.Summary,
+			"correlation_id":      correlationID,
+			"target_agent_id":     strings.TrimSpace(nextTask.TargetAgentID),
+		},
+	}, nil
+}
+
 func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 	return skills.NewSkill("validate_work").
 		Description("Respond to an active concrete challenge from another pipeline agent with a structured validation result and evidence.").
@@ -1512,18 +1639,40 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 			if challenge == nil {
 				return nil, fmt.Errorf("no active pipeline challenge is waiting for validation")
 			}
+			activeID := strings.TrimSpace(challenge.ID)
+			activeRequester := normalizePipelineAgentType(challenge.RequestingAgent)
 			if strings.TrimSpace(params.ChallengeID) == "" {
-				return nil, fmt.Errorf("challenge_id is required")
+				return nil, NewPipelineProtocolError(
+					"pipeline.validate_work.missing_challenge_id",
+					"validate_work",
+					fmt.Sprintf("validate_work requires challenge_id; the active pipeline challenge is %q from %q", activeID, activeRequester),
+					fmt.Sprintf("retry validate_work with challenge_id=%q, requesting_agent=%q, status:\"...\", summary:\"...\"", activeID, activeRequester),
+				)
 			}
-			if strings.TrimSpace(params.ChallengeID) != strings.TrimSpace(challenge.ID) {
-				return nil, fmt.Errorf("challenge_id %q does not match the active pipeline challenge", strings.TrimSpace(params.ChallengeID))
+			if strings.TrimSpace(params.ChallengeID) != activeID {
+				return nil, NewPipelineProtocolError(
+					"pipeline.validate_work.challenge_id_mismatch",
+					"validate_work",
+					fmt.Sprintf("challenge_id %q does not match the active pipeline challenge %q from %q", strings.TrimSpace(params.ChallengeID), activeID, activeRequester),
+					fmt.Sprintf("retry validate_work with challenge_id=%q (the only active challenge); call query_pipeline_state to re-confirm if needed", activeID),
+				)
 			}
 			requestingAgent := normalizePipelineAgentType(params.RequestingAgent)
 			if requestingAgent == "" {
-				return nil, fmt.Errorf("requesting_agent is required")
+				return nil, NewPipelineProtocolError(
+					"pipeline.validate_work.missing_requesting_agent",
+					"validate_work",
+					fmt.Sprintf("validate_work requires requesting_agent; the active challenge %q is from %q", activeID, activeRequester),
+					fmt.Sprintf("retry validate_work with challenge_id=%q, requesting_agent=%q", activeID, activeRequester),
+				)
 			}
-			if normalizePipelineAgentType(challenge.RequestingAgent) != requestingAgent {
-				return nil, fmt.Errorf("requesting_agent %q does not match the active pipeline challenge", params.RequestingAgent)
+			if activeRequester != requestingAgent {
+				return nil, NewPipelineProtocolError(
+					"pipeline.validate_work.requester_mismatch",
+					"validate_work",
+					fmt.Sprintf("requesting_agent %q does not match the active pipeline challenge requester %q (challenge_id=%q)", params.RequestingAgent, activeRequester, activeID),
+					fmt.Sprintf("retry validate_work with requesting_agent=%q", activeRequester),
+				)
 			}
 			status := strings.TrimSpace(params.Status)
 			if !isPipelineValidationStatus(status) {
@@ -2077,16 +2226,17 @@ func pipelineTesterFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skill
 		Domain("pipeline").
 		Keywords("finalize", "verification", "handoff", "tester", "pipeline").
 		Priority(100).
-		Usage("Use after run_test_suite when the turn is ready to hand verification work to one or more downstream recipients. Provide one targets entry per recipient (engineer, designer, or both); each entry carries the recipient-specific summary, evidence refs, and optional failure focus. The artifact references this returns are auto-attached to the next handoff_next or validate_work — you do not need to pass them again.").
-		Requirement("Requires that run_test_suite has produced a snapshot during this turn. The targets you list determine the only legal terminal action: a finalize for {engineer, designer} requires a cohort handoff_next to that exact set; a finalize for the challenger requires validate_work. Re-finalize is rejected unless a fresh run_test_suite has produced a new snapshot since the prior finalize.").
-		Avoid("Do not use as a substitute for handoff_next; this skill packages artifacts but does not route the turn. Do not finalize for a target you are not actually handing work to. Do not finalize twice for the same target without running a fresh suite first.").
+		Usage("Use after run_test_suite when the turn is ready to hand verification work downstream. Target selection has EXACTLY TWO forms — pick by protocol state, not by intuition: (A) If a challenge is pending (the reason this tester-pipeline turn was entered), targets MUST list exactly one entry whose target is the challenger agent type (typically inspector-pipeline); the only legal terminal action in that case is validate_work. (B) If no challenge is pending, targets lists the downstream cohort that will act on the verification — engineer, designer, or both — and the terminal action must be handoff_next to that exact set. Providing engineer/designer while a challenge is pending is a protocol violation (pipeline.finalize.challenge_target_mismatch).").
+		Requirement("Requires that run_test_suite has produced a snapshot during this turn. The targets you list determine the only legal terminal action: a finalize for {engineer, designer} requires a cohort handoff_next to that exact set; a finalize while a challenge is pending requires validate_work. Re-finalize is rejected unless a fresh run_test_suite has produced a new snapshot since the prior finalize.").
+		BestPractice("When a challenge is pending (PendingChallenge is non-nil in the pipeline snapshot), provide exactly one targets entry and OMIT the target field — the substrate auto-routes the verification artifact to PendingChallenge.RequestingAgent. You may also explicitly specify target equal to the challenger; any other value is rejected because the routing is structurally determined by the challenge state. When no challenge is pending, the target field is required: use engineer/designer for self-initiated verification cohort handoffs.").
+		Avoid("Do not use as a substitute for handoff_next; this skill packages artifacts but does not route the turn. Do not specify target=engineer or target=designer while a challenge is pending — that produces challenge_target_mismatch because the challenger is the one expecting your verification result. Do not finalize twice for the same target without running a fresh suite first.").
 		Consumes(ArtifactTestSnapshot).
 		Produces(ArtifactVerificationArtifact).
-		ArrayObjectParam("targets", "Per-recipient verification specs. Provide one entry per recipient.",
+		ArrayObjectParam("targets", "Per-recipient verification specs. When a challenge is pending, provide exactly one entry and omit the target field (the substrate auto-routes to the challenger). When no challenge is pending, include target on every entry.",
 			map[string]*skills.Property{
 				"target": {
 					Type:        "string",
-					Description: "Canonical recipient agent type: engineer or designer (or inspector when answering an inspector challenge).",
+					Description: "Canonical recipient agent type: engineer or designer for self-initiated handoff. Omit when responding to a pending challenge — the substrate routes the artifact to PendingChallenge.RequestingAgent automatically. Required when no challenge is pending.",
 				},
 				"summary": {
 					Type:        "string",
@@ -2103,7 +2253,7 @@ func pipelineTesterFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skill
 					Items:       &skills.Property{Type: "string"},
 				},
 			},
-			[]string{"target", "summary"},
+			[]string{"summary"},
 			true,
 		).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -2130,21 +2280,17 @@ func pipelineTesterFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skill
 			}
 			snapshot := state.Snapshot()
 			if snapshot != nil && snapshot.PendingChallenge != nil {
-				challenger := normalizePipelineAgentType(snapshot.PendingChallenge.RequestingAgent)
-				if challenger == "" {
-					return nil, fmt.Errorf("active challenge has no requesting agent identity")
+				if err := reconcileChallengeFinalizeTarget(specs, snapshot); err != nil {
+					return nil, err
 				}
-				if len(specs) != 1 || normalizePipelineAgentType(specs[0].Target) != challenger {
-					return nil, NewPipelineProtocolError(
-						"pipeline.finalize.challenge_target_mismatch",
-						"finalize_pipeline",
-						fmt.Sprintf("a pending challenge from %q is awaiting your response — finalize_pipeline must list exactly one targets entry for %q so the verification artifact threads into validate_work", challenger, challenger),
-						fmt.Sprintf("call finalize_pipeline with targets=[{target:%q,...}] so the verification artifact threads into validate_work", challenger),
-					)
+			} else {
+				if err := requireExplicitFinalizeTargets(specs); err != nil {
+					return nil, err
 				}
-			} else if len(specs) > 1 {
-				if !pipelineFinalizeTargetsAreCohort(specs) {
-					return nil, fmt.Errorf("finalize_pipeline targets must be distinct downstream recipients")
+				if len(specs) > 1 {
+					if !pipelineFinalizeTargetsAreCohort(specs) {
+						return nil, fmt.Errorf("finalize_pipeline targets must be distinct downstream recipients")
+					}
 				}
 			}
 			suiteID := ""
@@ -2196,6 +2342,28 @@ func pipelineTesterFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skill
 			if err := state.recordTesterFinalize(ctx, normalized); err != nil {
 				return nil, err
 			}
+			// When a challenge is pending, finalize_pipeline auto-
+			// dispatches validate_work atomically. Pre-fix, the LLM
+			// had to make TWO terminal calls (finalize then
+			// validate_work) and was empirically observed to dead-end
+			// after finalize because the validate_work parameters
+			// (challenge_id, requesting_agent) lived in the system
+			// prompt at turn start, far from the model's attention
+			// when the result came back. Splitting the operation
+			// across two LLM tool calls created a structural gap the
+			// LLM kept falling into. The dispatch identity is fully
+			// determined by protocol state — the LLM's role in
+			// re-stating it was redundant — so the protocol now does
+			// the dispatch itself. Mirrors the validate_work handler
+			// at line 1556+ to keep both paths in sync; any change to
+			// the validate_work dispatch path must update this too.
+			if snapshot != nil && snapshot.PendingChallenge != nil && pipelineProtocolRouteEnabled(ctx, cfg) {
+				dispatched, dErr := autoDispatchValidationFromFinalize(ctx, cfg, state, snapshot, specs[0], normalized[0], agentType)
+				if dErr != nil {
+					return nil, dErr
+				}
+				return dispatched, nil
+			}
 			result := map[string]any{
 				"finalize_pipeline":    true,
 				"agent_type":           agentType,
@@ -2209,6 +2377,91 @@ func pipelineTesterFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skill
 		Build()
 }
 
+// reconcileChallengeFinalizeTarget enforces the schema-level routing
+// contract when a challenge is pending.
+//
+// The substrate already knows the correct recipient —
+// snapshot.PendingChallenge.RequestingAgent — so the LLM is not
+// required to specify it. Three cases, all structurally safe:
+//
+//   1. len(specs) == 1 and spec[0].Target is empty: auto-derive the
+//      target from the challenger. This is the common path under the
+//      schema where the skill description tells the LLM it may omit
+//      target while challenged.
+//
+//   2. len(specs) == 1 and spec[0].Target equals the challenger:
+//      explicit agreement with the derivation; proceed.
+//
+//   3. len(specs) == 1 and spec[0].Target contradicts the challenger:
+//      the LLM's explicit intent disagrees with the protocol state.
+//      We surface the mismatch rather than silently override — the
+//      LLM picked a recipient we know is wrong, and the error recovery
+//      text tells it to either omit target or specify the challenger.
+//
+// len(specs) != 1 while challenged is a substantive protocol
+// misunderstanding (one challenger, one artifact, one answer) and
+// remains a hard error regardless of target values.
+//
+// Mutates specs in place when auto-derivation applies; on error the
+// spec list is untouched.
+func reconcileChallengeFinalizeTarget(specs []PipelineTesterFinalizeTargetSpec, snapshot *PipelineProtocolSnapshot) error {
+	challenger := normalizePipelineAgentType(snapshot.PendingChallenge.RequestingAgent)
+	if challenger == "" {
+		return fmt.Errorf("active challenge has no requesting agent identity")
+	}
+	challengeID := strings.TrimSpace(snapshot.PendingChallenge.ID)
+	if len(specs) != 1 {
+		provided := pipelineFinalizeTargetsSummary(specs)
+		return NewPipelineProtocolError(
+			"pipeline.finalize.challenge_target_mismatch",
+			"finalize_pipeline",
+			fmt.Sprintf("a pending challenge (challenge_id=%q) from %q is awaiting your response — finalize_pipeline must list exactly one targets entry (target may be omitted; the substrate auto-routes to %q); you provided %s", challengeID, challenger, challenger, provided),
+			fmt.Sprintf("retry finalize_pipeline with targets=[{summary:\"...\", evidence_refs:[...]}] — the substrate auto-routes to %q — and then end the turn with validate_work(challenge_id=%q, requesting_agent=%q, status:\"...\", summary:\"...\"). Call query_pipeline_state if you need to re-confirm the active challenge.", challenger, challengeID, challenger),
+		)
+	}
+	specTarget := normalizePipelineAgentType(specs[0].Target)
+	switch {
+	case specTarget == "":
+		// Auto-derive: the common, correct path.
+		specs[0].Target = challenger
+		return nil
+	case specTarget == challenger:
+		// Explicit agreement; proceed.
+		return nil
+	}
+	// Explicit disagreement — surface, don't silently override.
+	provided := pipelineFinalizeTargetsSummary(specs)
+	return NewPipelineProtocolError(
+		"pipeline.finalize.challenge_target_mismatch",
+		"finalize_pipeline",
+		fmt.Sprintf("a pending challenge (challenge_id=%q) from %q is awaiting your response — you specified target=%q but while challenged the artifact must thread back to %q (or simply omit target and the substrate will route it); you provided %s", challengeID, challenger, specTarget, challenger, provided),
+		fmt.Sprintf("retry finalize_pipeline with targets=[{summary:\"...\", evidence_refs:[...]}] — omit target; the substrate auto-routes to %q — and then end the turn with validate_work(challenge_id=%q, requesting_agent=%q, status:\"...\", summary:\"...\").", challenger, challengeID, challenger),
+	)
+}
+
+// requireExplicitFinalizeTargets enforces that every spec has a
+// non-empty target when no challenge is pending. There's no challenge
+// state to derive from, so the LLM must name each recipient
+// explicitly.
+func requireExplicitFinalizeTargets(specs []PipelineTesterFinalizeTargetSpec) error {
+	for i := range specs {
+		if normalizePipelineAgentType(specs[i].Target) == "" {
+			return fmt.Errorf("targets[%d].target is required", i)
+		}
+	}
+	return nil
+}
+
+// normalizeTesterFinalizeSpecs normalizes the raw spec list. It does
+// NOT enforce "target is required" at this layer — whether a missing
+// target is legal depends on runtime challenge state (see the
+// finalize_pipeline handler). Empty targets fall through to the
+// handler, which auto-derives from the pending challenge when one
+// exists, or rejects with a targeted error when not.
+//
+// Other per-spec validations (tester-finalizing-for-itself,
+// duplicate target, missing summary) remain here because they are
+// always invariants regardless of challenge state.
 func normalizeTesterFinalizeSpecs(in []PipelineTesterFinalizeTargetSpec) ([]PipelineTesterFinalizeTargetSpec, error) {
 	if len(in) == 0 {
 		return nil, fmt.Errorf("targets is required: provide at least one per-recipient verification spec")
@@ -2217,16 +2470,15 @@ func normalizeTesterFinalizeSpecs(in []PipelineTesterFinalizeTargetSpec) ([]Pipe
 	seen := make(map[string]struct{}, len(in))
 	for i, spec := range in {
 		target := normalizePipelineAgentType(spec.Target)
-		if target == "" {
-			return nil, fmt.Errorf("targets[%d].target is required", i)
-		}
 		if target == PipelineAgentTester {
 			return nil, fmt.Errorf("targets[%d].target %q is invalid: the tester cannot finalize for itself", i, target)
 		}
-		if _, dup := seen[target]; dup {
-			return nil, fmt.Errorf("targets[%d].target %q is duplicated", i, target)
+		if target != "" {
+			if _, dup := seen[target]; dup {
+				return nil, fmt.Errorf("targets[%d].target %q is duplicated", i, target)
+			}
+			seen[target] = struct{}{}
 		}
-		seen[target] = struct{}{}
 		summary := strings.TrimSpace(spec.Summary)
 		if summary == "" {
 			return nil, fmt.Errorf("targets[%d].summary is required", i)
@@ -2251,6 +2503,26 @@ func pipelineFinalizeTargetsAreCohort(specs []PipelineTesterFinalizeTargetSpec) 
 		}
 	}
 	return true
+}
+
+// pipelineFinalizeTargetsSummary renders the target set the tester
+// supplied as a compact human-readable phrase for inclusion in the
+// challenge_target_mismatch error. The LLM reads the error prose
+// when deciding how to retry; echoing back "you provided targets=[x,
+// y]" makes the mismatch concrete instead of abstract.
+func pipelineFinalizeTargetsSummary(specs []PipelineTesterFinalizeTargetSpec) string {
+	if len(specs) == 0 {
+		return "targets=[]"
+	}
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		name := strings.TrimSpace(normalizePipelineAgentType(spec.Target))
+		if name == "" {
+			name = "(empty)"
+		}
+		names = append(names, name)
+	}
+	return "targets=[" + strings.Join(names, ", ") + "]"
 }
 
 func pipelineTesterRequiredNextAction(snapshot *PipelineProtocolSnapshot) string {

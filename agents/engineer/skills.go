@@ -62,6 +62,13 @@ func (e *Engineer) registerCoreSkills() {
 	e.skills.Register(consultSkill(e))
 	e.skills.Register(researchDependencyInstallSkill(e))
 	e.skills.Register(installDependencyToolingSkill(e))
+	e.skills.Register(shared.BuildAskUserClarificationSkill(shared.AskUserClarificationConfig{
+		Bus:          e.bus,
+		AgentID:      e.id,
+		AgentName:    "engineer",
+		SessionID:    e.config.SessionID,
+		NewMessageID: e.generateMessageID,
+	}))
 
 	for _, skill := range shared.CoordinationSkills(shared.CoordinationSkillConfig{
 		Client: shared.CoordinationClient{

@@ -41,6 +41,12 @@ var (
 	// tester variant's system prompt. Pipeline tester and global
 	// tester both compose this in.
 	TesterFabricAwareness = prompts.MustLoad("shared", "fabric_awareness")
+
+	// Language, framework, and tooling selection guidance — shared
+	// across pipeline and global tester variants. Sits next to fabric
+	// awareness in the prompt assembly so the LLM reads the
+	// preference order before reaching for write/test skills.
+	TesterLanguageToolingPreference = prompts.MustLoad("shared", "language_tooling_preference")
 )
 
 // PipelineTesterSystemPrompt composes the full pipeline tester
@@ -55,6 +61,7 @@ var (
 func PipelineTesterSystemPrompt() string {
 	return PipelineSystemPrompt + "\n\n" +
 		TesterFabricAwareness + "\n\n" +
+		TesterLanguageToolingPreference + "\n\n" +
 		DiagnosisMethodology + "\n\n" +
 		TestPlanningStrategy + "\n\n" +
 		HarnessDesign + "\n\n" +
@@ -84,6 +91,7 @@ func PipelineTesterSystemPromptForWorkerAndContract(workerType string, contract 
 	base := joinPromptSections(
 		TesterTaskSystem,
 		TesterFabricAwareness, // promoted ahead of workflow
+		TesterLanguageToolingPreference,
 		DiagnosisMethodology,
 		TestPlanningStrategy,
 		HarnessDesign,
@@ -102,6 +110,7 @@ func PipelineTesterSystemPromptForWorkerAndContract(workerType string, contract 
 func GlobalTesterSystemPrompt() string {
 	return GlobalSystemPrompt + "\n\n" +
 		TesterFabricAwareness + "\n\n" +
+		TesterLanguageToolingPreference + "\n\n" +
 		DiagnosisMethodology + "\n\n" +
 		TestPlanningStrategy + "\n\n" +
 		HarnessDesign + "\n\n" +
@@ -123,6 +132,7 @@ func GlobalTesterSystemPromptForContract(contract *agentshared.GlobalExecutionCo
 	return joinPromptSections(
 		TesterGlobalTaskSystem,
 		TesterFabricAwareness, // promoted ahead of workflow
+		TesterLanguageToolingPreference,
 		DiagnosisMethodology,
 		TestPlanningStrategy,
 		HarnessDesign,

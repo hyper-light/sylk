@@ -35,6 +35,7 @@ func globalTesterVisibleSkillNames() []string {
 		"diagnose_failure",
 		"research_test_tool_install",
 		"install_test_tooling",
+		"ask_user_clarification",
 	}, "tester")
 	return fabric.AppendFabricAwarenessSkillNames(base)
 }

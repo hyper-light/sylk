@@ -171,7 +171,7 @@ func (s *Scribe) storeArchivalistSkill(runState *scribeRunState) *skills.Skill {
 		Usage("Call exactly once after any needed forest lookups. Do not return free text instead of calling this tool.").
 		BestPractice("Keep the commentary compact, factual, and archival. Preserve only the details that will matter in later retrieval, replay, or handoff.").
 		ObjectParam("commentary", "Structured commentary object for the current observed turn", map[string]*skills.Property{
-			"summary":          {Type: "string", Description: "What happened this turn"},
+			"summary":          {Type: "string", Description: "REQUIRED. One-sentence factual description of what happened this turn. Must be non-empty."},
 			"progress":         {Type: "string", Description: "Overall task progress after this turn"},
 			"decisions":        {Type: "string", Description: "Key decisions or tradeoffs made this turn"},
 			"state":            {Type: "string", Description: "Current working state after this turn"},
@@ -181,6 +181,7 @@ func (s *Scribe) storeArchivalistSkill(runState *scribeRunState) *skills.Skill {
 			"precedent_worthy": {Type: "boolean", Description: "Optional: true when this batch's pattern is precedent-quality and should be harvested by Memory Forest. Reserve for genuinely high-signal patterns (successful cross-pipeline reconciliations, unusual failures with clean recoveries, etc.)."},
 			"precedent_why":    {Type: "string", Description: "Optional: short prose explaining why this pattern is precedent-worthy. Required when precedent_worthy=true."},
 		}, true).
+		RequireNestedFields("commentary", "summary").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			commentary, err := parseScribeCommentary(input)
 			if err != nil {

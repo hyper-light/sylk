@@ -64,7 +64,9 @@ func newGlobalTestWriteSkill(gt *GlobalTester, cfg globalTestWriteSkillConfig) *
 		StringParam("output_file", "Destination test file path in the global workspace.", true).
 		StringParam("content", "Concrete executable test code for the output file.", true).
 		ObjectParam("basis", "Global write basis returned by prepare_global_write_context for the output_file.", globalWriteBasisProperties(), true).
-		Usage("Call prepare_global_write_context for the target output file first, pass the returned basis into this skill, and reuse the next_basis returned by each successful write while the lease remains active.").
+		Usage("Call prepare_global_write_context for the target output file first, pass the returned basis into this skill, and reuse the next_basis returned by each successful write while the lease remains active. Confirm the test framework, language, and conventions match the priority order in the system prompt before authoring: the task spec governs language and framework choice, in-flight peer work in the Activity Fabric defines test conventions on this surface, and the existing codebase governs test placement and runner integration.").
+		Requirement("Test code language must match the output_file extension and the harness selected for this surface; do not introduce constructs from a language different than the file's existing content.").
+		Avoid("Do not introduce a test framework that disagrees with the existing harness or codebase conventions on this surface — reconcile the language signal first (re-read the task spec, query peer activity, or invoke ask_user_clarification or a knowledge-agent consult) before writing.").
 		BestPractice("If the same test file needs multiple writes, keep feeding the returned next_basis back into the next call instead of repreparing immediately.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			params, err := decodeGlobalTestWriteParams(input)

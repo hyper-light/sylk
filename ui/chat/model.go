@@ -728,9 +728,6 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 	// indicator alive. This runs before the suppression check so the
 	// parent's spinner refreshes even if the child's own row would be
 	// suppressed from the main chat timeline.
-	if parentCID := strings.TrimSpace(ev.Event.ParentCorrelationID); parentCID != "" {
-		m.keepParentThinkingAliveForActivity(parentCID, ev)
-	}
 	if shouldSuppressActivity(ev) {
 		return nil
 	}
@@ -750,39 +747,6 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 	}
 	m.PushEntry(entry)
 	return nil
-}
-
-// keepParentThinkingAliveForActivity mirrors keepParentThinkingAliveForChild
-// for activity events. When guardian publishes an approval activity or
-// a peer publishes a consult activity, the parent's thinking spinner
-// would otherwise go quiet because no event lands on the parent's
-// correlation. Touching the parent slot here refreshes its indicator
-// so the user sees continuous "in progress" feedback.
-func (m *Model) keepParentThinkingAliveForActivity(parentCID string, ev msg.ActivityEventMsg) {
-	slot, ok := m.streams[parentCID]
-	if !ok || slot == nil || slot.accumulator == nil {
-		return
-	}
-	entryIdx := slot.accumulator.EntryIndex()
-	if entryIdx < 0 {
-		return
-	}
-	if slot.thinkingStart.IsZero() {
-		slot.thinkingStart = time.Now()
-	}
-	// Surface the child's content as the parent's thinking status so
-	// the user sees "Command approval allowed" etc. inline on the
-	// parent's row. The parent's own next progress/state event will
-	// overwrite this when it arrives.
-	status := sanitizeThinkingMessage(strings.TrimSpace(ev.Event.Content))
-	if status == "" {
-		return
-	}
-	m.history.UpdateAt(entryIdx, func(e *ChatEntry) {
-		e.ThinkingStatus = status
-		invalidateChatEntryRender(e)
-	})
-	m.viewDirty = true
 }
 
 func shouldSuppressActivity(ev msg.ActivityEventMsg) bool {
@@ -1179,9 +1143,9 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	}
 	now := time.Now()
 	if entry := m.history.Get(m.thinkingIdx); entry != nil && staleGuardianInterAgentProgress(message, entry.ToolCalls) {
-		if m.clearPrimaryThinkingDisplay(m.thinkingIdx, now) {
-			m.viewDirty = true
-		}
+		// Redundant guardian progress text; inline guardian row
+		// already surfaces it. Suppress the message, preserve the
+		// spinner. See applySlotProgress for the full rationale.
 		return nil
 	}
 	if m.thinkingStart.IsZero() {
@@ -1297,59 +1261,7 @@ func (m *Model) handleAgentState(state msg.AgentStateMsg) tea.Cmd {
 	// Terminal: intentionally do NOT evict the parent — only the child
 	// has finished. The parent's own state event (complete/errored)
 	// retires its indicator.
-	if parentCID := strings.TrimSpace(state.ParentCorrelationID); parentCID != "" && parentCID != cid {
-		m.keepParentThinkingAliveForChild(parentCID, record, terminal)
-	}
 	return nil
-}
-
-// keepParentThinkingAliveForChild refreshes the parent's thinking
-// indicator when a child publishes an agent state event. Preserves
-// ownership through child lifecycle so the parent's row stays active
-// until the parent itself completes.
-func (m *Model) keepParentThinkingAliveForChild(parentCID string, child *agentActivityState, childTerminal bool) {
-	if parentCID == "" || child == nil {
-		return
-	}
-	slot, ok := m.streams[parentCID]
-	if !ok || slot == nil || slot.accumulator == nil {
-		return
-	}
-	entryIdx := slot.accumulator.EntryIndex()
-	if entryIdx < 0 {
-		return
-	}
-	// Start the per-slot thinking timer if it's dormant, so the
-	// spinner keeps rendering while the child runs.
-	if slot.thinkingStart.IsZero() {
-		slot.thinkingStart = time.Now()
-	}
-	m.history.UpdateAt(entryIdx, func(e *ChatEntry) {
-		if childTerminal {
-			// Clear the child-derived status; the parent's own state
-			// will drive its indicator from here. Don't clear if the
-			// parent has its own active state record that should win.
-			if existing, ok := m.agentStates[parentCID]; ok && existing != nil {
-				if existing.Detail != "" {
-					e.ThinkingStatus = existing.Detail
-				} else {
-					e.ThinkingStatus = humanizeAgentState(existing.State)
-				}
-			} else {
-				e.ThinkingStatus = ""
-			}
-		} else {
-			detail := strings.TrimSpace(child.Detail)
-			if detail == "" {
-				detail = humanizeAgentState(child.State)
-			}
-			if detail != "" {
-				e.ThinkingStatus = detail
-			}
-		}
-		invalidateChatEntryRender(e)
-	})
-	m.viewDirty = true
 }
 
 // humanizeAgentState maps a canonical state string to a short user-facing
@@ -2283,9 +2195,8 @@ func (m *Model) handleNestedStreamProgress(progress msg.StreamProgressMsg) bool 
 	}
 	message := sanitizeThinkingMessage(progress.Message)
 	if staleGuardianInterAgentProgress(message, slot.activity.ToolCalls) {
-		if m.clearNestedThinkingDisplay(slot, time.Now()) {
-			m.syncPendingNestedStream(slot)
-		}
+		// Suppress redundant guardian progress text; preserve the
+		// nested child's spinner. See applySlotProgress for rationale.
 		return true
 	}
 	if message == "" &&
@@ -2391,6 +2302,14 @@ func (m *Model) handleNestedToolCallEvent(ev msg.ToolCallEventMsg) bool {
 	if slot == nil {
 		return false
 	}
+	// Parent-correlation preservation: every nested tool-call event
+	// (guardian approval start/complete, consult lifecycle, challenge
+	// roundtrip) carries the parent correlation via BranchRef. Refresh
+	// the parent's thinking indicator so the spinner stays alive for
+	// the full duration of the child's work, not just during the
+	// parent's own LLM streaming windows. Without this, the parent's
+	// row goes dark the moment its LLM stops streaming — even though
+	// the turn is still in progress via the child.
 	if ev.AgentID != "" {
 		slot.activity.AgentID = strings.TrimSpace(ev.AgentID)
 		if strings.TrimSpace(slot.activity.AgentType) == "" {
@@ -4665,9 +4584,12 @@ func (m *Model) applySlotProgress(slot *streamSlot, message string, sequence int
 	}
 	now := time.Now()
 	if entry := m.history.Get(slot.thinkingIdx); entry != nil && staleGuardianInterAgentProgress(message, entry.ToolCalls) {
-		if m.clearSlotThinkingDisplay(slot, now) {
-			m.viewDirty = true
-		}
+		// Stale guardian-mention progress text: the inline guardian row
+		// already shows this to the user, so surfacing it again on the
+		// parent's thinking bar is redundant. Drop the MESSAGE only —
+		// do not clear the spinner. Zeroing slot.thinkingStart here is
+		// the canonical cause of parent agents' thinking indicators
+		// vanishing after every guardian approval.
 		return
 	}
 	if slot.thinkingStart.IsZero() {
@@ -4828,7 +4750,16 @@ func (m *Model) reconcileToolDerivedThinkingProgress(idx int) {
 	}
 	if staleGuardianInterAgentProgress(m.progress.retryText, entry.ToolCalls) ||
 		staleGuardianInterAgentProgress(m.progress.pendingRetryText, entry.ToolCalls) {
-		if m.clearPrimaryThinkingDisplay(idx, now) {
+		// Stored progress text became stale (guardian row now shows it
+		// inline). Clear the text so the thinking bar stops repeating
+		// it, but KEEP the spinner alive — the parent agent's turn
+		// hasn't ended.
+		changed := m.progress.clearPendingDisplayed()
+		if m.progress.clearDisplayed(now) {
+			changed = true
+		}
+		if changed {
+			m.renderThinkingEntry(idx, m.thinkingAgentID, "", m.thinkingStart, now)
 			m.viewDirty = true
 		}
 	}
@@ -4857,7 +4788,13 @@ func (m *Model) reconcileToolDerivedSlotProgress(slot *streamSlot) {
 	}
 	if staleGuardianInterAgentProgress(slot.progress.retryText, entry.ToolCalls) ||
 		staleGuardianInterAgentProgress(slot.progress.pendingRetryText, entry.ToolCalls) {
-		if m.clearSlotThinkingDisplay(slot, now) {
+		// Clear stale guardian-mention text; keep the spinner alive.
+		changed := slot.progress.clearPendingDisplayed()
+		if slot.progress.clearDisplayed(now) {
+			changed = true
+		}
+		if changed {
+			m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, "", slot.thinkingStart, now)
 			m.viewDirty = true
 		}
 	}
@@ -4877,7 +4814,13 @@ func (m *Model) reconcileToolDerivedNestedProgress(slot *nestedStreamSlot) {
 	}
 	if staleGuardianInterAgentProgress(slot.progress.retryText, slot.activity.ToolCalls) ||
 		staleGuardianInterAgentProgress(slot.progress.pendingRetryText, slot.activity.ToolCalls) {
-		if m.clearNestedThinkingDisplay(slot, now) {
+		// Clear stale guardian text on nested slot; keep spinner alive.
+		changed := slot.progress.clearPendingDisplayed()
+		if slot.progress.clearDisplayed(now) {
+			changed = true
+		}
+		if changed {
+			m.renderNestedStreamThinking(slot, now)
 			m.syncPendingNestedStream(slot)
 		}
 	}
