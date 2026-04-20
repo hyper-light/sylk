@@ -2,6 +2,7 @@ package engineer
 
 import (
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -51,7 +52,7 @@ func engineerVisibleSkillNames() []string {
 	}, "engineer")
 	// Activity Fabric: ambient awareness primitives must be visible
 	// by default. See docs/SCRIBE_FABRIC.md.
-	return shared.AppendFabricAwarenessSkillNames(base)
+	return fabric.AppendFabricAwarenessSkillNames(base)
 }
 
 func engineerMutatingSkillNames() []string {

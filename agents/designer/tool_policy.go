@@ -2,6 +2,7 @@ package designer
 
 import (
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -42,7 +43,7 @@ func designerVisibleSkillNames() []string {
 		"coord_request_review",
 		"coord_resolve_artifact",
 	}, "designer")
-	return shared.AppendFabricAwarenessSkillNames(base)
+	return fabric.AppendFabricAwarenessSkillNames(base)
 }
 
 func designerMutatingSkillNames() []string {

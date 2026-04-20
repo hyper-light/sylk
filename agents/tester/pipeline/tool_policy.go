@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -54,7 +55,7 @@ func pipelineTesterVisibleSkillNames() []string {
 	// the screenshot review — without this, agents default to the
 	// older direct skills (query_decisions, coord_query_view) and
 	// never reach the fabric.
-	return agentshared.AppendFabricAwarenessSkillNames(base)
+	return fabric.AppendFabricAwarenessSkillNames(base)
 }
 
 func pipelineTesterMutatingSkillNames() []string {

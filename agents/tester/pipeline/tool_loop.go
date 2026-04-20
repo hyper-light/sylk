@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -268,7 +269,7 @@ func (pt *PipelineTester) applyToolCalls(
 		// advisories on every tool result. Bounded; rate-limited;
 		// best-effort. See docs/SCRIBE_FABRIC.md and
 		// agents/shared/ambient_envelope.go.
-		result = shared.AppendAmbientContext(ctx, shared.AmbientEnvelopeConfig{
+		result = fabric.AppendAmbientContext(ctx, fabric.AmbientEnvelopeConfig{
 			SessionID:  func() string { return pt.config.SessionID },
 			AgentID:    func() string { return pt.id },
 			AgentType:  func() string { return "tester-pipeline" },

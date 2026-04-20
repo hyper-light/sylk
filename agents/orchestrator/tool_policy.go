@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -47,7 +48,7 @@ func orchestratorVisibleSkillNames() []string {
 		"summarize_workspace_state",
 		"diff_workspace_file",
 	}, "orchestrator")
-	return shared.AppendFabricAwarenessSkillNames(base)
+	return fabric.AppendFabricAwarenessSkillNames(base)
 }
 
 func orchestratorToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {

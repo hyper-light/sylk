@@ -15,6 +15,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
@@ -381,7 +382,7 @@ func (gt *GlobalTester) registerCoreSkills() {
 	// tester path so phase 1 ships without global-tester wiring.
 
 	// Activity Fabric: uniform awareness skills + cross-pipeline primitives.
-	for _, skill := range agentshared.AwarenessSkills(agentshared.AwarenessSkillConfig{
+	for _, skill := range fabric.AwarenessSkills(fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,
 		SessionID:      func() string { return gt.config.SessionID },
 		AgentID:        func() string { return gt.id },
@@ -397,7 +398,7 @@ func (gt *GlobalTester) registerCoreSkills() {
 		gt.skills.Register(skill)
 	}
 	// Phase 5 of SCRIBE_FABRIC.md: recall_my_history.
-	for _, skill := range agentshared.RecallSkills(agentshared.RecallSkillConfig{
+	for _, skill := range fabric.RecallSkills(fabric.RecallSkillConfig{
 		SourceProvider: activity.DefaultSource,
 		SessionID:      func() string { return gt.config.SessionID },
 		AgentID:        func() string { return gt.id },

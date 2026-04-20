@@ -120,6 +120,13 @@ func (m *Model) SetResults(entries []ResultEntry) {
 	m.resultScroll = 0
 }
 
+// ResultCount returns the number of active results. Exposed for
+// the UI-05 dispatch stitch so callers can assert the panel was
+// populated without reaching into the private slice.
+func (m *Model) ResultCount() int {
+	return len(m.results)
+}
+
 // SetDocumentContent loads content into the document viewer and switches
 // to DocumentMode.
 func (m *Model) SetDocumentContent(content, filePath string) {

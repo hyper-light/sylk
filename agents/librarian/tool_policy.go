@@ -2,6 +2,7 @@ package librarian
 
 import (
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -27,7 +28,7 @@ func librarianVisibleSkillNames() []string {
 		"summarize_workspace_state",
 		"knowledge_search",
 	}, "librarian")
-	return shared.AppendFabricAwarenessSkillNames(base)
+	return fabric.AppendFabricAwarenessSkillNames(base)
 }
 
 func librarianMutatingSkillNames() []string {

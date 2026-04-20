@@ -15,6 +15,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/agents/tester"
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/activity"
@@ -293,13 +294,13 @@ func (pt *PipelineTester) registerCoreSkills() {
 	// SourceProvider lazily resolves to the orchestrator-owned
 	// activity store; gracefully returns empty results when the
 	// store isn't yet wired (test fixtures, startup ordering).
-	awareCfg := agentshared.AwarenessSkillConfig{
+	awareCfg := fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,
 		SessionID:      func() string { return pt.config.SessionID },
 		AgentID:        func() string { return pt.id },
 		AgentType:      func() string { return "tester-pipeline" },
 	}
-	for _, skill := range agentshared.AwarenessSkills(awareCfg) {
+	for _, skill := range fabric.AwarenessSkills(awareCfg) {
 		pt.skills.Register(skill)
 	}
 	for _, skill := range agentshared.CrossPipelineSkills(agentshared.CrossPipelineSkillConfig{
@@ -312,7 +313,7 @@ func (pt *PipelineTester) registerCoreSkills() {
 	}
 	// Phase 5 of SCRIBE_FABRIC.md: recall_my_history lets the agent
 	// consult its own scribe biographer.
-	for _, skill := range agentshared.RecallSkills(agentshared.RecallSkillConfig{
+	for _, skill := range fabric.RecallSkills(fabric.RecallSkillConfig{
 		SourceProvider: activity.DefaultSource,
 		SessionID:      func() string { return pt.config.SessionID },
 		AgentID:        func() string { return pt.id },

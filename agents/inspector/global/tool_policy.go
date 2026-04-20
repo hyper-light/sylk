@@ -2,6 +2,7 @@ package global
 
 import (
 	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -47,7 +48,7 @@ func globalInspectorVisibleSkillNames() []string {
 	}, "inspector")
 	// Global inspector audits at session level — gets the full
 	// fabric awareness + audit skill bundle.
-	return agentShared.AppendFabricInspectorSkillNames(base)
+	return fabric.AppendFabricInspectorSkillNames(base)
 }
 
 func globalInspectorMutatingSkillNames() []string {

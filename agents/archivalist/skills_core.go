@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
@@ -66,7 +67,7 @@ func (a *Archivalist) registerFabricSkills() {
 	agentID := func() string { return a.id }
 	agentType := func() string { return "archivalist" }
 
-	for _, skill := range shared.AwarenessSkills(shared.AwarenessSkillConfig{
+	for _, skill := range fabric.AwarenessSkills(fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,
 		SessionID:      sessionID,
 		AgentID:        agentID,
@@ -74,7 +75,7 @@ func (a *Archivalist) registerFabricSkills() {
 	}) {
 		a.skills.Register(skill)
 	}
-	for _, skill := range shared.RecallSkills(shared.RecallSkillConfig{
+	for _, skill := range fabric.RecallSkills(fabric.RecallSkillConfig{
 		SourceProvider: activity.DefaultSource,
 		SessionID:      sessionID,
 		AgentID:        agentID,

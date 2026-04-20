@@ -13,6 +13,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/commandapproval"
@@ -81,7 +82,7 @@ func (e *Engineer) registerCoreSkills() {
 		e.skills.Register(skill)
 	}
 	// Activity Fabric: uniform awareness skills + cross-pipeline primitives.
-	for _, skill := range shared.AwarenessSkills(shared.AwarenessSkillConfig{
+	for _, skill := range fabric.AwarenessSkills(fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,
 		SessionID:      func() string { return e.config.SessionID },
 		AgentID:        func() string { return e.id },
@@ -98,7 +99,7 @@ func (e *Engineer) registerCoreSkills() {
 		e.skills.Register(skill)
 	}
 	// Phase 5 of SCRIBE_FABRIC.md: recall_my_history.
-	for _, skill := range shared.RecallSkills(shared.RecallSkillConfig{
+	for _, skill := range fabric.RecallSkills(fabric.RecallSkillConfig{
 		SourceProvider: activity.DefaultSource,
 		SessionID:      func() string { return e.config.SessionID },
 		AgentID:        func() string { return e.id },

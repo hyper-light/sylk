@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -164,7 +165,7 @@ func (o *Orchestrator) applyToolCalls(
 			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
 		// Activity Fabric ambient_context envelope.
-		result = shared.AppendAmbientContext(ctx, shared.AmbientEnvelopeConfig{
+		result = fabric.AppendAmbientContext(ctx, fabric.AmbientEnvelopeConfig{
 			SessionID:  func() string { return o.SessionID() },
 			AgentID:    func() string { return o.config.AgentID },
 			AgentType:  func() string { return "orchestrator" },

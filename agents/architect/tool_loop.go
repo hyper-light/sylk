@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -410,7 +411,7 @@ func (a *Architect) applyToolCalls(
 			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
 		// Activity Fabric ambient_context envelope.
-		result = shared.AppendAmbientContext(ctx, shared.AmbientEnvelopeConfig{
+		result = fabric.AppendAmbientContext(ctx, fabric.AmbientEnvelopeConfig{
 			SessionID:  func() string { return architectSessionIDFromContext(ctx) },
 			AgentID:    func() string { return a.id },
 			AgentType:  func() string { return "architect" },

@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -54,6 +56,39 @@ func (g *Guide) registerCoreSkills() {
 	g.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
 	g.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
 	g.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
+
+	// Activity Fabric: uniform awareness skills + recall. Now safe to
+	// wire here because the awareness/recall helpers live in
+	// core/fabric — the prior agents/shared ↔ agents/guide cycle that
+	// blocked this is gone.
+	g.registerFabricSkills()
+}
+
+// registerFabricSkills wires the guide into the Activity Fabric so it
+// can introspect peer activity, surface causal traces, and recall its
+// own prior routing decisions across turns. Kept in a separate method
+// so the wiring stays self-contained and easy to read.
+func (g *Guide) registerFabricSkills() {
+	sessionID := func() string { return strings.TrimSpace(g.sessionID) }
+	agentID := func() string { return "guide" }
+	agentType := func() string { return "guide" }
+
+	for _, skill := range fabric.AwarenessSkills(fabric.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}) {
+		g.skills.Register(skill)
+	}
+	for _, skill := range fabric.RecallSkills(fabric.RecallSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}) {
+		g.skills.Register(skill)
+	}
 }
 
 func (g *Guide) registerExtendedSkills() {

@@ -111,7 +111,7 @@ func selectPriorReplicaEntries(rows []activity.AgentActivity, currentGeneration 
 }
 
 // parseInheritanceGeneration is a local copy of the shared parser to
-// avoid pulling shared.RecallSkillConfig dependencies — we just need
+// avoid pulling fabric.RecallSkillConfig dependencies — we just need
 // the integer extraction. Returns 0 for missing/invalid coordinates.
 func parseInheritanceGeneration(coords map[string]string) int {
 	if coords == nil {

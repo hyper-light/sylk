@@ -10,10 +10,12 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/resources"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/adalundhe/sylk/prompts"
 )
 
@@ -460,12 +462,17 @@ func (r *GuideResponder) applyToolCallsTracked(
 			Duration:    time.Since(start),
 			Success:     !isError,
 		})
-		// NOTE: Activity Fabric ambient_context envelope deferred for the
-		// guide self-response loop due to the agents/shared ↔ agents/guide
-		// import cycle (shared/ack.go imports guide). Importing
-		// shared.AppendAmbientContext here would re-introduce the cycle.
-		// When the awareness helpers are moved out of agents/shared (or
-		// shared/ack.go is moved out), call AppendAmbientContext here.
+		// Activity Fabric ambient_context envelope. Now safe to call from
+		// the guide tool loop because the awareness helpers live in
+		// core/fabric (no peer-package dependency); the previous
+		// agents/shared ↔ agents/guide cycle that forced this to be
+		// deferred is gone.
+		result = fabric.AppendAmbientContext(ctx, fabric.AmbientEnvelopeConfig{
+			SessionID:  func() string { return versioning.SessionIDFromContext(ctx) },
+			AgentID:    func() string { return "guide" },
+			AgentType:  func() string { return "guide" },
+			PipelineID: func() string { return "" },
+		}, result)
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,

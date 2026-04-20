@@ -2,6 +2,7 @@ package global
 
 import (
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -35,7 +36,7 @@ func globalTesterVisibleSkillNames() []string {
 		"research_test_tool_install",
 		"install_test_tooling",
 	}, "tester")
-	return agentshared.AppendFabricAwarenessSkillNames(base)
+	return fabric.AppendFabricAwarenessSkillNames(base)
 }
 
 func globalTesterMutatingSkillNames() []string {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	contextskills "github.com/adalundhe/sylk/core/context/skills"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -72,6 +73,12 @@ func guideToolManifestForRegistry(registry *skills.Registry) *toolruntime.Policy
 			toolruntime.ExecutionModeLocalWorker,
 		))
 	}
+	// Activity Fabric awareness skills must be visible-by-default so the
+	// guide's classifier can introspect peer activity (who's busy, who
+	// challenged whom) without keyword-based progressive loading missing
+	// the catalog. AppendFabricAwarenessToolPolicies registers the
+	// uniform fabric.* skill set with read-only, local-execution policy.
+	policies = fabric.AppendFabricAwarenessToolPolicies(policies, registry)
 	return toolruntime.ApplyAuthorityProfile("guide", toolruntime.NewManifest("guide", "guide.routing", policies...))
 }
 

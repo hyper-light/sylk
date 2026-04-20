@@ -10,6 +10,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -239,7 +240,7 @@ func (gi *GlobalInspector) applyToolCalls(
 			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
 		// Activity Fabric ambient_context envelope.
-		result = agentShared.AppendAmbientContext(ctx, agentShared.AmbientEnvelopeConfig{
+		result = fabric.AppendAmbientContext(ctx, fabric.AmbientEnvelopeConfig{
 			SessionID: func() string { return gi.config.SessionID },
 			AgentID:   func() string { return gi.id },
 			AgentType: func() string { return "inspector" },

@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -43,7 +44,7 @@ func pipelineInspectorVisibleSkillNames() []string {
 	// inspect_open_activity. The audit skill is what makes the
 	// inspector's role at finalize time actually inspect open
 	// fabric activity (challenges, holds, hot scopes, decisions).
-	return agentShared.AppendFabricInspectorSkillNames(base)
+	return fabric.AppendFabricInspectorSkillNames(base)
 }
 
 func pipelineInspectorMutatingSkillNames() []string {

@@ -10,6 +10,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
@@ -88,7 +89,7 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	// primitives + audit-time inspect_open_activity. The audit skill
 	// is inspector-only — it's how the inspector detects unresolved
 	// cross-pipeline disputes blocking acceptance.
-	for _, skill := range agentShared.AwarenessSkills(agentShared.AwarenessSkillConfig{
+	for _, skill := range fabric.AwarenessSkills(fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,
 		SessionID:      func() string { return pi.config.SessionID },
 		AgentID:        func() string { return pi.id },
@@ -104,7 +105,7 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	}) {
 		pi.skills.Register(skill)
 	}
-	for _, skill := range agentShared.InspectorAuditSkills(agentShared.InspectorAuditSkillConfig{
+	for _, skill := range fabric.InspectorAuditSkills(fabric.InspectorAuditSkillConfig{
 		SourceProvider: activity.DefaultSource,
 		SessionID:      func() string { return pi.config.SessionID },
 		AgentID:        func() string { return pi.id },
@@ -113,7 +114,7 @@ func (pi *PipelineInspector) registerCoreSkills() {
 		pi.skills.Register(skill)
 	}
 	// Phase 5 of SCRIBE_FABRIC.md: recall_my_history.
-	for _, skill := range agentShared.RecallSkills(agentShared.RecallSkillConfig{
+	for _, skill := range fabric.RecallSkills(fabric.RecallSkillConfig{
 		SourceProvider: activity.DefaultSource,
 		SessionID:      func() string { return pi.config.SessionID },
 		AgentID:        func() string { return pi.id },

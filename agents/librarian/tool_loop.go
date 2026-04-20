@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -148,7 +149,7 @@ func (l *Librarian) applyToolCalls(
 		}
 
 		// Activity Fabric ambient_context envelope.
-		result = shared.AppendAmbientContext(ctx, shared.AmbientEnvelopeConfig{
+		result = fabric.AppendAmbientContext(ctx, fabric.AmbientEnvelopeConfig{
 			SessionID:  func() string { return l.config.SessionID },
 			AgentID:    func() string { return l.id },
 			AgentType:  func() string { return "librarian" },

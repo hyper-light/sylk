@@ -2,6 +2,7 @@ package archivalist
 
 import (
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -27,7 +28,7 @@ func archivalistVisibleSkillNames() []string {
 
 func archivalistVisibleSkillNamesForRegistry(registry *skills.Registry) []string {
 	withForest := shared.AppendMemoryForestVisibleSkillNames(archivalistVisibleSkillNames(), "archivalist")
-	withFabric := shared.AppendFabricAwarenessSkillNames(withForest)
+	withFabric := fabric.AppendFabricAwarenessSkillNames(withForest)
 	return shared.FilterRegisteredSkillNames(registry, withFabric)
 }
 

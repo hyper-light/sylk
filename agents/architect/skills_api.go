@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
@@ -51,7 +52,7 @@ func architectToolManifestForRegistry(registry *skills.Registry) *toolruntime.Po
 		toolruntime.NewToolPolicy(toolruntime.SearchToolName, toolruntime.EffectReadOnly, toolruntime.DomainDiscovery, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault(), toolruntime.WithSearchable(false)),
 	}
 	policies = shared.AppendMemoryForestToolPolicies(policies, registry, "architect")
-	policies = shared.AppendFabricAwarenessToolPolicies(policies, registry)
+	policies = fabric.AppendFabricAwarenessToolPolicies(policies, registry)
 	return toolruntime.ApplyAuthorityProfile("architect", toolruntime.NewManifest("architect", "architect.default", policies...))
 }
 

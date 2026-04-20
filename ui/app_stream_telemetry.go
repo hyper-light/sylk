@@ -1189,6 +1189,11 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 	m.updateTokenDisplay()
 	m.statusBar.SetTokenPhase(status.PhaseIdle)
 	m.publishResponseActivity(r, source, content, streamEntry)
+	// UI-05 dispatch stitch: route librarian/academic responses into
+	// the knowledge panel. No-op for non-knowledge agents, errored
+	// responses, or responses whose content cannot be adapted into
+	// ResultEntry rows.
+	m.pushKnowledgeResponseToPanel(r)
 	if effectiveBranchRef != nil || hasPendingChatCorrelation {
 		entryAgentID := strings.TrimSpace(r.AgentID)
 		entryAgentType := strings.TrimSpace(r.AgentType)

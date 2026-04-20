@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -60,7 +61,7 @@ func guardianToolManifestForRegistry(registry *skills.Registry) *toolruntime.Pol
 		toolruntime.NewToolPolicy(toolruntime.SearchToolName, toolruntime.EffectReadOnly, toolruntime.DomainDiscovery, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault(), toolruntime.WithSearchable(false)),
 	}
 	policies = shared.AppendMemoryForestToolPolicies(policies, registry, "guardian")
-	policies = shared.AppendFabricAwarenessToolPolicies(policies, registry)
+	policies = fabric.AppendFabricAwarenessToolPolicies(policies, registry)
 	return toolruntime.ApplyAuthorityProfile("guardian", toolruntime.NewManifest("guardian", "guardian.control", policies...))
 }
 
