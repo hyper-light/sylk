@@ -65,6 +65,15 @@ func (a *Academic) registerFabricSkills() {
 		AgentID:    agentID,
 		AgentType:  agentType,
 		PipelineID: func() string { return "" },
+		RouteSync: shared.RouteSyncFromBus(
+			func() guide.EventBus { return a.bus },
+			func() string {
+				if a.channels == nil {
+					return ""
+				}
+				return a.channels.Responses
+			},
+		),
 	}) {
 		a.skills.Register(skill)
 	}

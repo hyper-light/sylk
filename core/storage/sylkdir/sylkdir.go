@@ -440,6 +440,16 @@ func (s *SylkDir) SessionAgentLogsPath(sessionID, agentName string) string {
 	return filepath.Join(s.SessionPath(sessionID), "agents", agentName, "logs")
 }
 
+// SessionFabricPath returns the session-scoped directory for the
+// Activity Fabric observability log. The fabric log is session-global
+// (not per-agent) because the fabric IS the cross-agent surface —
+// per-agent fragmentation would lose the interaction graph. The
+// StreamWriter anchored here writes
+// .sylk/sessions/{sessionID}/fabric/{YYYY-MM-DD}/fabric.{nnn}.jsonl.
+func (s *SylkDir) SessionFabricPath(sessionID string) string {
+	return filepath.Join(s.SessionPath(sessionID), "fabric")
+}
+
 // CreateGlobalVersion creates a global version directory with subdirectories.
 // Structure: .sylk/versions/v1.0.0/{nodes,vectors,docs,chunks,bleve}
 func (s *SylkDir) CreateGlobalVersion(version SemanticVersion) error {

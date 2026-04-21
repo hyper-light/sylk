@@ -19,21 +19,37 @@ type LoggerStats struct {
 	LastError  time.Time `json:"last_error,omitempty"`
 }
 
-// SessionEventLogger is a unified entry point that owns both a WAL journal
-// and a JSONL writer for a single agent within a session. Supports lazy
-// binding: created before the session exists, bound when the first request
-// arrives carrying a session ID.
+// SessionEventLogger is the unified per-agent logging entry point. It
+// owns a binary WAL journal (recovery), a per-day JSONL event stream
+// (the primary structured log — events.{nnn}.jsonl), a per-day tool
+// stream (tools.{nnn}.jsonl, written via ToolRecorder), a per-day LLM
+// stream (llm.{nnn}.jsonl, written via LLMRecorder), an optional bus
+// trace stream, a prompt corpus for content-addressed payloads, and
+// an in-memory ring buffer for zero-I/O diagnostics.
 //
-// It also maintains an in-memory ring buffer of recent entries and running
-// statistics, enabling zero-I/O diagnostics via RecentEntries and Stats.
+// Supports lazy binding: created before the session exists, bound
+// when the first request arrives carrying a session ID. A nil logger
+// is safe to call methods on — every method short-circuits when the
+// receiver is nil or the logger is unbound.
 type SessionEventLogger struct {
 	mu        sync.Mutex
 	agentName string
 	walName   string
 	bound     atomic.Bool
-	journal   *AgentJournal
-	jsonl     *JSONLWriter
 	sessionID string
+
+	config SessionLoggerConfig
+
+	// Persistent handles.
+	journal *AgentJournal
+	events  *StreamWriter
+	toolsW  *StreamWriter
+	llmW    *StreamWriter
+	busW    *StreamWriter
+	corpus  *PromptCorpus
+
+	toolRec *ToolRecorder
+	llmRec  *LLMRecorder
 
 	// Ring buffer: fixed-size circular buffer written inside LogEvent.
 	ring    [ringSize]JSONLEntry
@@ -41,18 +57,31 @@ type SessionEventLogger struct {
 	ringLen atomic.Uint32 // tracks how many slots have been written (capped at ringSize)
 
 	// Running stats: updated inside LogEvent via atomics.
-	totalCount   atomic.Int64
-	errorCount   atomic.Int64
-	warnCount    atomic.Int64
-	lastErrNano  atomic.Int64
+	totalCount  atomic.Int64
+	errorCount  atomic.Int64
+	warnCount   atomic.Int64
+	lastErrNano atomic.Int64
 
 	// Broadcast callback: optional, called inside LogEvent after write.
 	broadcastMu sync.RWMutex
 	broadcast   func(JSONLEntry)
 }
 
+// SessionLoggerConfig controls which streams are enabled and how they
+// rotate. Zero values resolve to the design-doc defaults: events on,
+// tools on, llm on, bus off, 64 MiB per-file, local TZ. A nil
+// Redactor is replaced with a no-op redactor.
+type SessionLoggerConfig struct {
+	StreamWriterConfig  StreamWriterConfig
+	Redactor            Redactor
+	EnableBusStream     bool
+	DisableToolStream   bool
+	DisableLLMStream    bool
+	LLMRecorderConfig   LLMRecorderConfig
+}
+
 // NewSessionEventLogger creates an unbound logger. Call BindSession to
-// activate WAL and JSONL writing.
+// activate the writers and content-addressed corpus.
 func NewSessionEventLogger(agentName, walName string) *SessionEventLogger {
 	return &SessionEventLogger{
 		agentName: agentName,
@@ -60,15 +89,26 @@ func NewSessionEventLogger(agentName, walName string) *SessionEventLogger {
 	}
 }
 
-// BindSession opens the WAL journal and JSONL writer at the session-scoped
-// directory. Idempotent for the same sessionID. Closes old writers on
-// session switch.
+// SetConfig overrides the default SessionLoggerConfig. Must be called
+// before BindSession — after binding, the config is captured and new
+// values are ignored.
+func (s *SessionEventLogger) SetConfig(cfg SessionLoggerConfig) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.config = cfg
+}
+
+// BindSession opens the WAL journal, event/tool/llm/bus stream writers,
+// and prompt corpus at the session-scoped directory. Idempotent for
+// the same sessionID. Closes old handles on session switch.
 func (s *SessionEventLogger) BindSession(sessionDir, sessionID string) error {
 	if s == nil {
 		return nil
 	}
 
-	// Fast path: already bound to this session.
 	if s.bound.Load() {
 		s.mu.Lock()
 		same := s.sessionID == sessionID
@@ -76,35 +116,83 @@ func (s *SessionEventLogger) BindSession(sessionDir, sessionID string) error {
 		if same {
 			return nil
 		}
-		// Session switch — close old writers.
 		s.closeWriters()
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	cfg := s.config
+	if cfg.Redactor == nil {
+		cfg.Redactor = noopRedactor{}
+	}
+
 	walDir := filepath.Join(sessionDir, "agents", s.agentName, "wal")
 	logsDir := filepath.Join(sessionDir, "agents", s.agentName, "logs")
+	promptDir := filepath.Join(sessionDir, "prompts")
 
-	journal, err := OpenJournalDirect(walDir, JournalConfig{
-		WALName: s.walName,
-	})
+	journal, err := OpenJournalDirect(walDir, JournalConfig{WALName: s.walName})
 	if err != nil {
 		slog.Warn("session_logger: journal open failed",
 			"agent", s.agentName, "session", sessionID, "err", err)
 		return fmt.Errorf("session_logger: open journal: %w", err)
 	}
 
-	jsonl, err := NewJSONLWriter(logsDir, "activity", DefaultRotationPolicy(), defaultSyncInterval)
+	events, err := NewStreamWriter(logsDir, "events", cfg.StreamWriterConfig, cfg.Redactor)
 	if err != nil {
 		journal.Close()
-		slog.Warn("session_logger: jsonl writer open failed",
-			"agent", s.agentName, "session", sessionID, "err", err)
-		return fmt.Errorf("session_logger: open jsonl writer: %w", err)
+		return fmt.Errorf("session_logger: events writer: %w", err)
 	}
 
+	var toolsW *StreamWriter
+	if !cfg.DisableToolStream {
+		toolsW, err = NewStreamWriter(logsDir, "tools", cfg.StreamWriterConfig, cfg.Redactor)
+		if err != nil {
+			events.Close()
+			journal.Close()
+			return fmt.Errorf("session_logger: tools writer: %w", err)
+		}
+	}
+
+	var llmW *StreamWriter
+	if !cfg.DisableLLMStream {
+		llmW, err = NewStreamWriter(logsDir, "llm", cfg.StreamWriterConfig, cfg.Redactor)
+		if err != nil {
+			if toolsW != nil {
+				toolsW.Close()
+			}
+			events.Close()
+			journal.Close()
+			return fmt.Errorf("session_logger: llm writer: %w", err)
+		}
+	}
+
+	var busW *StreamWriter
+	if cfg.EnableBusStream {
+		busW, err = NewStreamWriter(logsDir, "bus", cfg.StreamWriterConfig, cfg.Redactor)
+		if err != nil {
+			if llmW != nil {
+				llmW.Close()
+			}
+			if toolsW != nil {
+				toolsW.Close()
+			}
+			events.Close()
+			journal.Close()
+			return fmt.Errorf("session_logger: bus writer: %w", err)
+		}
+	}
+
+	corpus := NewPromptCorpus(promptDir, cfg.Redactor)
+
 	s.journal = journal
-	s.jsonl = jsonl
+	s.events = events
+	s.toolsW = toolsW
+	s.llmW = llmW
+	s.busW = busW
+	s.corpus = corpus
+	s.toolRec = NewToolRecorder(toolsW)
+	s.llmRec = NewLLMRecorder(llmW, corpus, cfg.LLMRecorderConfig)
 	s.sessionID = sessionID
 	s.bound.Store(true)
 	return nil
@@ -136,9 +224,9 @@ func (s *SessionEventLogger) LogWALJSON(eventType EventType, v any) {
 	}
 }
 
-// LogEvent writes a structured entry to the JSONL file, appends to the
-// in-memory ring buffer, updates running stats, and fires the broadcast
-// callback. The ring buffer and stats are always updated even if the JSONL
+// LogEvent writes a structured entry to the events stream, appends to
+// the in-memory ring buffer, updates running stats, and fires the
+// broadcast callback. Ring buffer and stats update even if the JSONL
 // write fails. No-op if unbound.
 func (s *SessionEventLogger) LogEvent(entry JSONLEntry) {
 	if s == nil || !s.bound.Load() {
@@ -162,14 +250,13 @@ func (s *SessionEventLogger) LogEvent(entry JSONLEntry) {
 		s.warnCount.Add(1)
 	}
 
-	// JSONL write.
 	s.mu.Lock()
-	j := s.jsonl
+	w := s.events
 	s.mu.Unlock()
 
-	if j != nil {
-		if err := j.Write(entry); err != nil {
-			slog.Warn("session_logger: JSONL write failed",
+	if w != nil {
+		if err := w.Write(entry); err != nil {
+			slog.Warn("session_logger: events write failed",
 				"event", entry.Event, "err", err)
 		}
 	}
@@ -181,6 +268,55 @@ func (s *SessionEventLogger) LogEvent(entry JSONLEntry) {
 	if fn != nil {
 		fn(entry)
 	}
+}
+
+// ToolRecorder returns the recorder for tool-call lifecycle records.
+// Returns a nil-safe recorder if the logger is unbound or the tool
+// stream is disabled — callers can invoke Start/Complete without
+// guards.
+func (s *SessionEventLogger) ToolRecorder() *ToolRecorder {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.toolRec
+}
+
+// LLMRecorder returns the recorder for LLM round-trip records.
+// Returns a nil-safe recorder if the logger is unbound or the llm
+// stream is disabled.
+func (s *SessionEventLogger) LLMRecorder() *LLMRecorder {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.llmRec
+}
+
+// BusStream returns the optional bus wire-trace writer. Nil when the
+// bus stream is disabled (the default) or the logger is unbound.
+// Callers must check for nil before writing.
+func (s *SessionEventLogger) BusStream() *StreamWriter {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.busW
+}
+
+// Corpus returns the content-addressed prompt corpus bound to this
+// session, or nil when unbound. Callers that want to persist custom
+// content-addressed payloads (other than LLM prompts) can use this.
+func (s *SessionEventLogger) Corpus() *PromptCorpus {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.corpus
 }
 
 // RecentEntries returns the last n entries from the ring buffer (newest first).
@@ -224,8 +360,8 @@ func (s *SessionEventLogger) Stats() LoggerStats {
 }
 
 // SetBroadcast wires a callback that is invoked for every LogEvent call
-// after the JSONL write. Used to publish log entries to the bus for
-// archivalist ingest. Pass nil to clear.
+// after the events-stream write. Used to publish log entries to the bus
+// for archivalist ingest. Pass nil to clear.
 func (s *SessionEventLogger) SetBroadcast(fn func(JSONLEntry)) {
 	if s == nil {
 		return
@@ -235,7 +371,7 @@ func (s *SessionEventLogger) SetBroadcast(fn func(JSONLEntry)) {
 	s.broadcastMu.Unlock()
 }
 
-// Close closes both the WAL journal and JSONL writer. Idempotent.
+// Close closes the WAL journal and every stream writer. Idempotent.
 func (s *SessionEventLogger) Close() error {
 	if s == nil {
 		return nil
@@ -247,16 +383,34 @@ func (s *SessionEventLogger) Close() error {
 func (s *SessionEventLogger) closeWriters() {
 	s.mu.Lock()
 	journal := s.journal
-	jsonl := s.jsonl
+	events := s.events
+	toolsW := s.toolsW
+	llmW := s.llmW
+	busW := s.busW
 	s.journal = nil
-	s.jsonl = nil
+	s.events = nil
+	s.toolsW = nil
+	s.llmW = nil
+	s.busW = nil
+	s.toolRec = nil
+	s.llmRec = nil
+	s.corpus = nil
 	s.bound.Store(false)
 	s.mu.Unlock()
 
 	if journal != nil {
 		journal.Close()
 	}
-	if jsonl != nil {
-		jsonl.Close()
+	if events != nil {
+		events.Close()
+	}
+	if toolsW != nil {
+		toolsW.Close()
+	}
+	if llmW != nil {
+		llmW.Close()
+	}
+	if busW != nil {
+		busW.Close()
 	}
 }

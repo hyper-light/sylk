@@ -77,7 +77,9 @@ func TestGlobalTesterCoreSkillsProduceConcreteOutputs(t *testing.T) {
 	}
 	integrationRiskAreas := decodeRiskAreas(t, integrationRiskResult["risk_areas"])
 
-	integrationPlanResult := invokeGlobalSkill(t, gt, ctx, "plan_integration_tests", map[string]any{
+	// Phase 2.K / GT-B: plan_integration_tests → plan_tests(level=integration).
+	integrationPlanResult := invokeGlobalSkill(t, gt, ctx, "plan_tests", map[string]any{
+		"level":      "integration",
 		"risk_areas": integrationRiskAreas,
 		"batch_context": map[string]any{
 			"pipeline_ids":  []string{"task-1", "task-2"},
@@ -85,7 +87,7 @@ func TestGlobalTesterCoreSkillsProduceConcreteOutputs(t *testing.T) {
 		},
 	})
 	if caseCount := intFromMap(t, integrationPlanResult, "case_count"); caseCount == 0 {
-		t.Fatalf("plan_integration_tests case_count = %d, want > 0", caseCount)
+		t.Fatalf("plan_tests(level=integration) case_count = %d, want > 0", caseCount)
 	}
 
 	buildHarnessResult := invokeGlobalSkill(t, gt, ctx, "build_harness", map[string]any{
@@ -104,14 +106,16 @@ func TestGlobalTesterCoreSkillsProduceConcreteOutputs(t *testing.T) {
 		t.Fatalf("framework_id = %q, want go-test", got)
 	}
 
-	e2ePlanResult := invokeGlobalSkill(t, gt, ctx, "plan_e2e_tests", map[string]any{
+	// Phase 2.K / GT-B: plan_e2e_tests → plan_tests(level=e2e).
+	e2ePlanResult := invokeGlobalSkill(t, gt, ctx, "plan_tests", map[string]any{
+		"level":      "e2e",
 		"risk_areas": integrationRiskAreas,
 		"harness_needs": []map[string]any{
 			{"type": "fixture", "description": "Provide merged inputs", "target": "pkg/service/service.go"},
 		},
 	})
 	if caseCount := intFromMap(t, e2ePlanResult, "case_count"); caseCount == 0 {
-		t.Fatalf("plan_e2e_tests case_count = %d, want > 0", caseCount)
+		t.Fatalf("plan_tests(level=e2e) case_count = %d, want > 0", caseCount)
 	}
 
 	basis := prepareGlobalWriteBasis(t, gt, ctx, "pkg/service/service_test.go")

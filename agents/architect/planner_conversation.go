@@ -66,7 +66,7 @@ func (a *Architect) composeUserFacingResponse(
 	request plannerConversationRequest,
 ) (string, error) {
 	// Try tool-loop path first — enables the LLM to invoke skills like
-	// route_plan_acceptance during conversation.
+	// plan_acceptance during conversation.
 	text, err := a.composeUserFacingResponseWithTools(ctx, request)
 	if err == nil {
 		architectDebugLog().Info("composeUserFacingResponse: TOOL_LOOP_SUCCESS",
@@ -143,7 +143,7 @@ func (a *Architect) composeUserFacingResponse(
 
 // composeUserFacingResponseWithTools builds a request with tool definitions
 // and runs the tool dispatch loop, enabling the LLM to invoke architect skills
-// (e.g. route_plan_acceptance, consult_librarian) during conversation turns.
+// (e.g. plan_acceptance, consult_peer) during conversation turns.
 func (a *Architect) composeUserFacingResponseWithTools(
 	ctx context.Context,
 	request plannerConversationRequest,
@@ -359,10 +359,10 @@ Requirements:
   ARE the decision mechanism. Trust them; let the buttons speak for themselves.
 - Do NOT imply that work is already beginning. Avoid phrases like "kick it
   off", "start building", "start implementing", "get started", or "ship it".
-- Do NOT invoke route_plan_acceptance — the dialog routes the verdict directly.
+- Do NOT invoke plan_acceptance — the dialog routes the verdict directly.
 - Do not use canned lead-ins or protocol labels.
 
-When approval_required is false (auto-approve), still skip route_plan_acceptance
+When approval_required is false (auto-approve), still skip plan_acceptance
 here; the system handles acceptance automatically in that mode.`
 	case plannerConversationModeExistingReady:
 		return `The user has a previously prepared ready plan available. The plan_id, prior_query, and plan summary are in the context JSON.
@@ -376,7 +376,7 @@ narrative that surrounds the dialog.
 If the user's message clearly accepts or resumes that ready plan (for example
 "go ahead", "resume it", "ship it", or "use the previous plan"):
 - Acknowledge briefly. Trust the dialog buttons; do NOT invoke
-  route_plan_acceptance.
+  plan_acceptance.
 
 If the user is asking what the earlier plan covered, why it was structured this way, or whether it is still a good idea:
 - Answer naturally using the recovered plan context.
@@ -385,8 +385,8 @@ If the user is asking what the earlier plan covered, why it was structured this 
 
 If the user wants changes or a fresh direction:
 - Explain whether the existing plan can be revised cleanly or whether a new plan is the better move.
-- If the new direction is concrete enough, you may start_planning.
-- If the request is still too underspecified to plan responsibly, ask focused questions or invoke route_requirements_research.
+- If the new direction is concrete enough, you may invoke plan(action=start).
+- If the request is still too underspecified to plan responsibly, ask focused questions or invoke academic_research(action=request).
 
 General rules:
 - Treat the previous plan as available context, not as a commitment the user already made.
@@ -401,36 +401,37 @@ Planning flow:
    recovered recent_context fields, invoke recall_recent before claiming the earlier discussion is
    unavailable.
 0a. If the request is still too vague or underspecified to start responsible planning,
-   invoke route_requirements_research instead of start_planning. Use that tool when the
-   user first needs help shaping the problem, scope, constraints, or success criteria.
-   Use ask_user_question only for one or two narrow decisions after the plan is already
-   mostly understood.
-0b. During discussion before planning, use consult(mode=knowledge, target=librarian),
-    consult(mode=knowledge, target=archivalist), and consult(mode=knowledge, target=academic)
-    as new material information arrives. Do not wait until start_planning to gather obvious
+   invoke academic_research(action=request) instead of plan(action=start). Use that tool
+   when the user first needs help shaping the problem, scope, constraints, or success
+   criteria. Use ask_user_clarification only for one or two narrow decisions after the
+   plan is already mostly understood.
+0b. During discussion before planning, use consult_peer(target_agent_type="librarian"),
+    consult_peer(target_agent_type="archivalist"), and consult_peer(target_agent_type="academic")
+    as new material information arrives. Do not wait until plan(action=start) to gather obvious
     codebase, historical, or Academic evidence. Consult the Librarian for codebase reality and
     local patterns, the Archivalist for precedent and preserved preferences, and the Academic for
     stronger alternatives, best practices, correctness, performance, testing, infrastructure, and
     tradeoffs. On the first substantive implementation, planning, or architecture turn on a new
     problem, start with the most relevant knowledge agent and the narrowest question that can
-    materially reduce the next uncertainty. Prefer repeated targeted consults over one broad
-    omnibus consult. Re-evaluate Academic depth as the user's constraints evolve and your own
-    understanding improves: begin with minimal/quick for narrow validation, and escalate only when
-    broader corroboration could materially change the decision. Continue consulting as the user's
-    constraints or direction materially change.
-1. When the user confirms they want to proceed with planning, invoke start_planning with a
+    materially reduce the next uncertainty. Prefer repeated targeted consult_peer calls over one
+    broad omnibus consult. Re-evaluate Academic depth as the user's constraints evolve and your
+    own understanding improves: begin with minimal/quick for narrow validation, and escalate only
+    when broader corroboration could materially change the decision. Continue consulting as the
+    user's constraints or direction materially change.
+1. When the user confirms they want to proceed with planning, invoke plan(action=start) with a
    comprehensive query synthesizing all gathered requirements and the consultation evidence you
    accumulated during discussion.
-2. After start_planning returns, it gives you a plan_id and protocol instructions. Follow those
-   instructions: invoke plan(analyze), consult(pre_planning), plan(design), plan(generate_tasks)
-   in order, passing the plan_id to each.
+2. After plan(action=start) returns, it gives you a plan_id and protocol instructions. Follow
+   those instructions: invoke plan(action=analyze), then any further consult_peer calls needed
+   for pre-planning evidence, then plan(action=design), then plan(action=generate_tasks) in
+   order, passing the plan_id to each.
 3. After generate_tasks completes, the plan reaches Ready and the system
    automatically publishes the Approve / Modify / Reject dialog. The system
    also renders the plan structure separately in the UI — the user already
    sees it. Do NOT repeat, re-render, or include the plan structure, task
    list, acceptance criteria, file lists, or implementation guides in your
-   text. Do NOT invoke route_plan_acceptance — wait for the user's click on
-   the dialog buttons.
+   text. Do NOT invoke plan_acceptance — wait for the user's click on the
+   dialog buttons.
    Write ONLY a brief assessment (2-4 sentences):
    - Highlight one critical tradeoff or risk.
    - Sound like a principal engineer, not a workflow bot.
@@ -440,13 +441,13 @@ Planning flow:
    is already starting or that their reply will immediately start work in this turn.
    Avoid phrases like "kick it off", "start building", "start implementing",
    "get started", or "ship it".
-   Do NOT invoke route_plan_acceptance — wait for the user's next message.
+   Do NOT invoke plan_acceptance — wait for the user's next message.
 
 CRITICAL — Affirmative detection:
 If the user's message is an affirmative response to a prior offer to plan (e.g., "yes", "yep",
-"go ahead", "do it", "sure", "sounds good", "let's do it"), you MUST invoke start_planning
-immediately. Do NOT write text about planning — call the tool. The start_planning query must
-synthesize the full conversation context including the original request from prior turns.
+"go ahead", "do it", "sure", "sounds good", "let's do it"), you MUST invoke plan(action=start)
+immediately. Do NOT write text about planning — call the tool. The plan query must synthesize
+the full conversation context including the original request from prior turns.
 
 The user is in conversation with you — an expert software architect. They may be:
 - Requesting implementation — gather requirements and clarify constraints first
@@ -462,17 +463,18 @@ Requirements:
 - For general conversation (no planning intent), engage naturally. If the conversation
   leads to a concrete task, ask if they'd like you to create a plan.
 - If the conversation reveals that the problem is too underspecified to plan safely,
-  hand the user to the Academic via route_requirements_research instead of pretending
-  the missing requirements are already known.
+  hand the user to the Academic via academic_research(action=request) instead of
+  pretending the missing requirements are already known.
 - If recent_context_summary or recent_context_focus are present in the context JSON, treat them as
   recovered preserved session context and continue naturally from them instead of claiming the prior
   discussion is missing.
 - If the conversation is concrete enough to keep discussing but still lacks codebase,
-  historical, or architectural evidence, stay in the Architect and consult the relevant
-  knowledge agents instead of waiting for the formal planning phase.
+  historical, or architectural evidence, stay in the Architect and invoke
+  consult_peer(target_agent_type=...) against the relevant knowledge agent instead of
+  waiting for the formal planning phase.
 - If the blocker is missing repository evidence or historical context inside this codebase,
-  stay in the Architect and consult the Librarian or Archivalist instead of handing the
-  user to the Academic.
+  stay in the Architect and consult_peer the Librarian or Archivalist instead of handing
+  the user to the Academic.
 - Keep a natural, collaborative tone.
 - Do not use canned lead-ins or boilerplate.`
 	case plannerConversationModeFeedback:
@@ -483,8 +485,8 @@ freshness_recommendation) when present.
 
 The system has automatically published the Approve / Modify / Reject dialog
 in the input panel. Your job is the chat narrative that surrounds it; do NOT
-invoke route_plan_acceptance and do NOT ask the user to "type yes" — the
-dialog handles their verdict.
+invoke plan_acceptance and do NOT ask the user to "type yes" — the dialog
+handles their verdict.
 
 If the freshness audit fields are populated:
 - Surface freshness_summary as your opening line ("Re-checking the plan: ...").
@@ -503,7 +505,7 @@ modification suggestions, or general acknowledgement):
 - Answer naturally and substantively.
 - If the user is asking about the plan structure, focus on what's relevant.
 - If the user wants modifications, describe what would change and why; do
-  NOT invoke route_plan_acceptance.
+  NOT invoke plan_acceptance.
 
 General rules:
 - Maintain a collaborative tone — the plan is a proposal, not a decree.
@@ -524,7 +526,7 @@ Requirements:
 
 // textOnlyModeInstructions returns tool-safe instructions for the text-only
 // fallback path. When tools aren't available via the API, the normal mode
-// instructions reference tool invocations (start_planning, route_plan_acceptance,
+// instructions reference tool invocations (plan(action=start), plan_acceptance,
 // etc.) which causes the LLM to generate text-based "[tool_call:]" content.
 // These instructions preserve the conversational intent without tool language.
 func textOnlyModeInstructions(mode plannerConversationMode) string {
@@ -629,39 +631,46 @@ General rules:
 	}
 }
 
+// Phase 1/2.K refactor (docs/PIPELINE_SKILL_REFACTOR.md):
+// consult → consult_peer, ask_user_question → ask_user_clarification,
+// route_requirements_research → academic_research(action=request),
+// start_planning → plan(action=start).
+// The four read-side forest skills collapsed into a single `forest(op=…)`
+// so the conversation allowlists now reach for `forest` (the planner
+// typically wants op=recall_recent, but op=resolve_intent and op=recall
+// are harmless reads on the same tool).
 var discussionConversationTools = []string{
-	"consult",
-	"recall_recent",
-	"ask_user_question",
-	"route_requirements_research",
-	"start_planning",
+	"consult_peer",
+	"forest",
+	"ask_user_clarification",
+	"academic_research",
+	"plan",
 }
 
 var planningConversationTools = []string{
-	"consult",
-	"recall_recent",
-	"ask_user_question",
-	"route_requirements_research",
-	"start_planning",
+	"consult_peer",
+	"forest",
+	"ask_user_clarification",
+	"academic_research",
 	"plan",
 }
 
 // toolsForConversationMode returns the allowed tool names for a given mode.
 // Conversation modes that can enter or resume planning must include the tools
-// needed to finish the planning protocol in the same turn after start_planning.
+// needed to finish the planning protocol in the same turn after plan(action=start).
 // Feedback/ready modes restrict to chat-only tools.
 //
-// Note: route_plan_acceptance and present_plan_approval_dialog are
-// intentionally NOT in any whitelist. The dialog publish is unconditional in
-// feedbackReadyDirective so the LLM can't bypass it, and the verdict routes
-// from Guardian → architect continuation directly. Exposing those tools to
-// the LLM would let it auto-dispatch the plan ahead of the user's click.
+// Note: plan_acceptance is intentionally NOT in any whitelist. The dialog
+// publish is unconditional in feedbackReadyDirective so the LLM can't bypass
+// it, and the verdict routes from Guardian → architect continuation directly.
+// Exposing plan_acceptance to the LLM would let it auto-dispatch the plan
+// ahead of the user's click.
 func toolsForConversationMode(mode plannerConversationMode) []string {
 	switch mode {
 	case plannerConversationModeConverse, plannerConversationModeExistingReady, plannerConversationModeClarification:
 		return planningConversationTools
 	case plannerConversationModeFeedback, plannerConversationModeReady:
-		return []string{"ask_user_question", "recall_recent"}
+		return []string{"ask_user_clarification", "forest"}
 	default:
 		return planningConversationTools
 	}

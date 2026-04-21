@@ -1,6 +1,9 @@
 package cmd
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRootCommandIsTheTUIEntryPoint(t *testing.T) {
 	if rootCmd.Use != "sylk" {
@@ -9,8 +12,13 @@ func TestRootCommandIsTheTUIEntryPoint(t *testing.T) {
 	if rootCmd.RunE == nil {
 		t.Fatal("expected root command to execute the TUI")
 	}
-	if len(rootCmd.Commands()) != 0 {
-		t.Fatalf("expected no subcommands, got %d", len(rootCmd.Commands()))
+	// Subcommands beyond the default TUI entry point are allowed; we only
+	// require that each registered command carries a non-empty Use so it
+	// surfaces in `sylk --help`.
+	for _, sub := range rootCmd.Commands() {
+		if strings.TrimSpace(sub.Use) == "" {
+			t.Fatalf("subcommand missing Use: %#v", sub)
+		}
 	}
 	if flag := rootCmd.Flags().Lookup("theme"); flag == nil {
 		t.Fatal("expected root theme flag to be registered")

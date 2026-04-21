@@ -18,55 +18,109 @@ type pipelineWriteContextInput struct {
 	Basis versioning.WorkspaceWriteBasis `json:"basis"`
 }
 
-func detectTestHarnessSkill(pt *PipelineTester) *skills.Skill {
+// testHarnessSkill unifies the former detect_test_harness +
+// prepare_test_harness pair into one action-dispatched skill.
+// action=detect inspects the project for framework / config / run
+// commands; action=prepare materializes missing config or
+// boilerplate using caller-supplied write contexts. Two verbs of
+// the same lifecycle collapsed so the LLM selects the phase via an
+// enum rather than choosing between two near-identical tool names.
+func testHarnessSkill(pt *PipelineTester) *skills.Skill {
 	type params struct {
+		Action        string                      `json:"action"`
 		Files         []string                    `json:"files,omitempty"`
 		TaskSpec      string                      `json:"task_spec,omitempty"`
 		WorkerType    string                      `json:"worker_type,omitempty"`
 		WriteContexts []pipelineWriteContextInput `json:"write_contexts,omitempty"`
 	}
 
-	return skills.NewSkill("detect_test_harness").
-		Description("Detect the appropriate test framework, config, run commands, and default output paths for the current task.").
+	return skills.NewSkill("test_harness").
+		Description("Inspect or set up the pipeline's test harness. action=detect reports the framework, config, run commands, and default output paths for the current task. action=prepare materializes missing framework config/boilerplate — requires explicit pipeline write contexts for each file it will create.").
 		Domain("testing").
-		Keywords("harness", "framework", "tooling", "test setup", "config").
+		Keywords("harness", "framework", "tooling", "test setup", "config", "prepare", "bootstrap", "boilerplate", "detect").
 		Priority(98).
-		Usage("Use after understanding the current criteria and challenge to discover the real test surface, output paths, and execution commands for the requested work.").
-		Requirement("Provide the target files or task specification so the harness decision is scoped to the requested behavior.").
-		Satisfies("Identifies the harness and output-path context needed for planning, harness prep, writes, and execution.").
-		Avoid("Do not hardcode a framework or output path when this skill can derive it from the project and task context.").
+		Usage("Call action=detect first to discover the test surface, execution commands, and whether setup is required. Only call action=prepare when detect reports setup_required=true; prepare each harness path with workspace_read(op=prepare_write, …) beforehand and pass those write contexts in.").
+		Requirement("action=detect: provide target files or task specification. action=prepare: run detect first and gather explicit write_contexts for every harness file this skill may create.").
+		Satisfies("Produces runnable harness state and the output-path context needed for planning, writes, and execution.").
+		Avoid("Do not hardcode framework or output paths when detect can derive them. Do not call action=prepare when the detected harness is already usable or when write contexts are missing.").
+		EnumParam("action", "Harness lifecycle verb", []string{"detect", "prepare"}, true).
 		ArrayParam("files", "Source files that need tests", "string", false).
 		StringParam("task_spec", "Task brief and acceptance criteria", false).
 		StringParam("worker_type", "Primary worker type such as engineer or designer", false).
+		ArrayObjectParam("write_contexts", "Pipeline write contexts returned by workspace_read(op=prepare_write) for each harness file (action=prepare only).", pipelineWriteContextProperties(), []string{"path", "basis"}, false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var p params
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			state, err := pt.detectHarness(ctx, p.Files, p.TaskSpec, p.WorkerType)
-			if err != nil {
-				return nil, err
+			switch strings.TrimSpace(p.Action) {
+			case "detect", "":
+				return runHarnessDetect(ctx, pt, p.Files, p.TaskSpec, p.WorkerType)
+			case "prepare":
+				return runHarnessPrepare(ctx, pt, p.Files, p.TaskSpec, p.WorkerType, p.WriteContexts)
+			default:
+				return nil, fmt.Errorf("unknown test_harness action: %q (expected detect|prepare)", p.Action)
 			}
-			// Activity Fabric auto-publish: emit a Tentative
-			// test_framework decision for the detected harness so
-			// peer pipelines see the choice in their ambient
-			// context. Side-effect of normal work; does not gate.
-			if state != nil && state.FrameworkID != "" {
-				agentshared.AutoPublishTentative(ctx, agentshared.AutoPublishInput{
-					SessionID:        pt.config.SessionID,
-					AuthorAgentID:    pt.id,
-					AuthorAgentType:  "tester-pipeline",
-					AuthorPipelineID: pt.pipelineID,
-					TriggerSkill:     "detect_test_harness",
-					Domain:           "test_framework",
-					Value:            string(state.FrameworkID),
-					Scope:            firstHarnessFile(p.Files),
-					Evidence:         []string{"harness detection from project files"},
-				})
-			}
-			return state, nil
 		}).
 		Build()
+}
+
+// runHarnessDetect performs the detect phase and auto-publishes a
+// Tentative test_framework decision so peer pipelines observe the
+// selected framework in ambient context.
+func runHarnessDetect(ctx context.Context, pt *PipelineTester, files []string, taskSpec, workerType string) (any, error) {
+	state, err := pt.detectHarness(ctx, files, taskSpec, workerType)
+	if err != nil {
+		return nil, err
+	}
+	if state != nil && state.FrameworkID != "" {
+		agentshared.AutoPublishTentative(ctx, agentshared.AutoPublishInput{
+			SessionID:        pt.config.SessionID,
+			AuthorAgentID:    pt.id,
+			AuthorAgentType:  "tester-pipeline",
+			AuthorPipelineID: pt.pipelineID,
+			TriggerSkill:     "test_harness",
+			Domain:           "test_framework",
+			Value:            string(state.FrameworkID),
+			Scope:            firstHarnessFile(files),
+			Evidence:         []string{"harness detection from project files"},
+		})
+	}
+	return state, nil
+}
+
+// runHarnessPrepare performs the prepare phase: runs detect if the
+// current state is unknown, then materializes missing harness files
+// against the caller-supplied write contexts.
+func runHarnessPrepare(ctx context.Context, pt *PipelineTester, files []string, taskSpec, workerType string, writeContexts []pipelineWriteContextInput) (any, error) {
+	state := pt.currentHarnessState()
+	if state == nil {
+		var err error
+		state, err = pt.detectHarness(ctx, files, taskSpec, workerType)
+		if err != nil {
+			return nil, err
+		}
+	}
+	planned := pt.harnessWritePlans(state)
+	contexts, err := indexPipelineWriteContexts(writeContexts)
+	if err != nil {
+		return nil, err
+	}
+	if len(planned) > 0 && len(contexts) == 0 {
+		return nil, fmt.Errorf("workspace_read(op=prepare_write) is required for harness files: %s", joinPipelineWritePlanPaths(planned))
+	}
+	created, err := pt.prepareHarness(ctx, state, contexts)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"prepared":       true,
+		"framework":      state.FrameworkID,
+		"created_files":  created,
+		"planned_files":  writePlanPaths(planned),
+		"setup_required": state.SetupRequired,
+		"setup_reason":   state.SetupReason,
+	}, nil
 }
 
 // firstHarnessFile returns a path-prefix scope for the auto-publish
@@ -78,64 +132,6 @@ func firstHarnessFile(files []string) string {
 		}
 	}
 	return ""
-}
-
-func prepareTestHarnessSkill(pt *PipelineTester) *skills.Skill {
-	type params struct {
-		Files         []string                    `json:"files,omitempty"`
-		TaskSpec      string                      `json:"task_spec,omitempty"`
-		WorkerType    string                      `json:"worker_type,omitempty"`
-		WriteContexts []pipelineWriteContextInput `json:"write_contexts,omitempty"`
-	}
-
-	return skills.NewSkill("prepare_test_harness").
-		Description("Create any missing framework config or boilerplate required before tests can be written and executed. Requires explicit pipeline write contexts for each file it will create.").
-		Domain("testing").
-		Keywords("prepare", "harness", "bootstrap", "config", "boilerplate").
-		Priority(96).
-		Usage("Use only when the harness is missing config or bootstrap files. Prepare each harness path with prepare_pipeline_write_context first and pass those write contexts in.").
-		Requirement("Run detect_test_harness first and gather explicit write contexts for every harness file this skill may create.").
-		Satisfies("Produces runnable harness/config state so subsequent write_test and run_test_suite calls operate on the right framework.").
-		Avoid("Do not call when the detected harness is already usable or when you have not prepared the needed write contexts.").
-		ArrayParam("files", "Source files that need tests", "string", false).
-		StringParam("task_spec", "Task brief and acceptance criteria", false).
-		StringParam("worker_type", "Primary worker type such as engineer or designer", false).
-		ArrayObjectParam("write_contexts", "Pipeline write contexts returned by prepare_pipeline_write_context for each harness file that may be created.", pipelineWriteContextProperties(), []string{"path", "basis"}, false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var p params
-			if err := json.Unmarshal(input, &p); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			state := pt.currentHarnessState()
-			if state == nil {
-				var err error
-				state, err = pt.detectHarness(ctx, p.Files, p.TaskSpec, p.WorkerType)
-				if err != nil {
-					return nil, err
-				}
-			}
-			planned := pt.harnessWritePlans(state)
-			contexts, err := indexPipelineWriteContexts(p.WriteContexts)
-			if err != nil {
-				return nil, err
-			}
-			if len(planned) > 0 && len(contexts) == 0 {
-				return nil, fmt.Errorf("prepare_pipeline_write_context is required for harness files: %s", joinPipelineWritePlanPaths(planned))
-			}
-			created, err := pt.prepareHarness(ctx, state, contexts)
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{
-				"prepared":       true,
-				"framework":      state.FrameworkID,
-				"created_files":  created,
-				"planned_files":  writePlanPaths(planned),
-				"setup_required": state.SetupRequired,
-				"setup_reason":   state.SetupReason,
-			}, nil
-		}).
-		Build()
 }
 
 func analyzeRiskSkill(pt *PipelineTester) *skills.Skill {
@@ -165,6 +161,25 @@ func analyzeRiskSkill(pt *PipelineTester) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 			risks := pt.analyzeRisks(ctx, p.Files, joinTaskSpecAndDiff(p.TaskSpec, p.DiffPatch), p.WorkerType)
+			// Phase 4 refactor: publish the risk map so engineer
+			// sees the hypothesis before implementing.
+			evidence := make([]string, 0, len(risks))
+			for _, r := range risks {
+				evidence = append(evidence, r.Description)
+			}
+			agentshared.AutoPublishArtifactPublished(ctx, agentshared.AutoPublishArtifactInput{
+				SessionID:        pt.config.SessionID,
+				AuthorAgentID:    pt.id,
+				AuthorAgentType:  "tester-pipeline",
+				AuthorPipelineID: pt.pipelineID,
+				TriggerSkill:     "analyze_risk",
+				Kind:             "risk_map",
+				Title:            fmt.Sprintf("risk map: %d files", len(p.Files)),
+				Summary:          fmt.Sprintf("%d risk areas identified", len(risks)),
+				Scope:            firstHarnessFile(p.Files),
+				Evidence:         evidence,
+				Payload:          map[string]any{"risks": risks},
+			})
 			return map[string]any{
 				"files_analyzed": len(pt.normalizeTargetFiles(p.Files, p.TaskSpec)),
 				"risk_areas":     risks,
@@ -191,13 +206,27 @@ func planTestsSkill(pt *PipelineTester) *skills.Skill {
 		Avoid("Do not treat the plan as completion. A terminal tester handoff still requires write_test, run_test_suite, and finalize_pipeline before handoff_next.").
 		ArrayParam("files", "Source files that need test coverage", "string", false).
 		StringParam("task_spec", "Task brief and acceptance criteria", false).
-		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var p params
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 			harness := pt.currentHarnessState()
 			plan := pt.buildPlan(p.Files, p.TaskSpec, p.RiskAreas, harness)
+			// Phase 4 refactor: publish the test plan so peers see
+			// the planned coverage before test code is authored.
+			agentshared.AutoPublishArtifactPublished(ctx, agentshared.AutoPublishArtifactInput{
+				SessionID:        pt.config.SessionID,
+				AuthorAgentID:    pt.id,
+				AuthorAgentType:  "tester-pipeline",
+				AuthorPipelineID: pt.pipelineID,
+				TriggerSkill:     "plan_tests",
+				Kind:             "test_plan",
+				Title:            fmt.Sprintf("test plan: %d cases", len(plan.PlannedCase)),
+				Summary:          fmt.Sprintf("%d risk areas, %d planned cases", len(plan.RiskAreas), len(plan.PlannedCase)),
+				Scope:            firstHarnessFile(p.Files),
+				Payload:          map[string]any{"plan": plan},
+			})
 			return map[string]any{
 				"plan":       plan,
 				"risk_count": len(plan.RiskAreas),
@@ -341,8 +370,36 @@ func runTestSuiteSkill(pt *PipelineTester) *skills.Skill {
 			}
 			harness := pt.currentHarnessState()
 			start := time.Now()
+			// Phase 4 refactor: emit validation_started before the
+			// suite runs so peers see execution is in progress.
+			epochID := pt.pipelineID
+			if epochID == "" {
+				epochID = fmt.Sprintf("suite-%d", start.UnixNano())
+			}
+			startedID := agentshared.AutoPublishValidationStarted(ctx, agentshared.AutoPublishValidationInput{
+				SessionID:       pt.config.SessionID,
+				ActorAgentID:    pt.id,
+				ActorAgentType:  "tester-pipeline",
+				ActorPipelineID: pt.pipelineID,
+				TriggerSkill:    "run_test_suite",
+				EpochID:         epochID,
+				Scope:           firstHarnessFile(p.Files),
+				Summary:         fmt.Sprintf("running suite for %d packages / %d files", len(p.Packages), len(p.Files)),
+			})
 			result, err := pt.executeSuite(ctx, harness, p.Packages, p.Files, p.TestNames, p.Race, p.Verbose, p.Timeout)
 			if err != nil {
+				// Suite execution errored (not a test failure).
+				// Treat as rejected so the fabric reflects reality.
+				agentshared.AutoPublishValidationRejected(ctx, agentshared.AutoPublishValidationInput{
+					SessionID:       pt.config.SessionID,
+					ActorAgentID:    pt.id,
+					ActorAgentType:  "tester-pipeline",
+					ActorPipelineID: pt.pipelineID,
+					TriggerSkill:    "run_test_suite",
+					EpochID:         epochID,
+					Scope:           firstHarnessFile(p.Files),
+					Summary:         fmt.Sprintf("suite execution error: %v", err),
+				}, startedID)
 				return nil, err
 			}
 			suite := suiteResultFromExecution(result, start)
@@ -353,6 +410,31 @@ func runTestSuiteSkill(pt *PipelineTester) *skills.Skill {
 			// single authoritative location.
 			if state := agentshared.PipelineProtocolStateFromContext(ctx); state != nil && suite != nil {
 				state.RecordTesterSuiteID(suite.SuiteID)
+			}
+			// Phase 4 refactor: emit validation outcome so peers
+			// see the pass/fail verdict in ambient context.
+			failureCount := 0
+			passCount := 0
+			if suite != nil {
+				failureCount = suite.Failed
+				passCount = suite.Passed
+			}
+			validationInput := agentshared.AutoPublishValidationInput{
+				SessionID:       pt.config.SessionID,
+				ActorAgentID:    pt.id,
+				ActorAgentType:  "tester-pipeline",
+				ActorPipelineID: pt.pipelineID,
+				TriggerSkill:    "run_test_suite",
+				EpochID:         epochID,
+				Scope:           firstHarnessFile(p.Files),
+				FailureCount:    failureCount,
+			}
+			if suite != nil && failureCount == 0 && passCount > 0 {
+				validationInput.Summary = fmt.Sprintf("passed=%d", passCount)
+				agentshared.AutoPublishValidationAccepted(ctx, validationInput, startedID)
+			} else if suite != nil {
+				validationInput.Summary = fmt.Sprintf("passed=%d failed=%d", passCount, failureCount)
+				agentshared.AutoPublishValidationRejected(ctx, validationInput, startedID)
 			}
 			return result, nil
 		}).

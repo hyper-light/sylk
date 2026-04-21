@@ -509,108 +509,35 @@ func buildAstGrepArgs(params astGrepParams) []string {
 // lsp (consolidated: goto_definition, find_references, hover, symbols, call_hierarchy)
 // ---------------------------------------------------------------------------
 
-type lspInput struct {
-	Action    string `json:"action"`
-	File      string `json:"file,omitempty"`
-	Line      int    `json:"line,omitempty"`
-	Column    int    `json:"column,omitempty"`
-	Query     string `json:"query,omitempty"`
-	Direction string `json:"direction,omitempty"`
-}
-
+// lspSkill wires the architect's LSP skill with a composite backend:
+// gopls as a Go-specific accelerator layered over a polyglot
+// treesitter backend reading through the architect's FileAccess. The
+// treesitter path sees VFS overlays directly, which matters during
+// planning when in-flight edits have not yet been committed to disk.
 func lspSkill(a *Architect) *skills.Skill {
-	type handler = func(context.Context, *lspInput) (any, error)
-
-	locationAction := func(subcommand string) handler {
-		return func(ctx context.Context, p *lspInput) (any, error) {
-			if strings.TrimSpace(p.File) == "" {
-				return nil, fmt.Errorf("file is required for %s", subcommand)
-			}
-			loc := lspLocation(p.File, p.Line, p.Column)
-			output, status := runGoplsCommand(ctx, a.config.WorkingDirectory, subcommand, loc)
-			if status != "ok" {
-				return map[string]any{"status": status, "reason": output}, nil
-			}
-			return map[string]any{"status": "ok", "output": output}, nil
-		}
-	}
-
-	dispatch := map[string]handler{
-		"goto_definition": locationAction("definition"),
-		"find_references": locationAction("references"),
-		"hover":           locationAction("hover"),
-		"symbols": func(ctx context.Context, p *lspInput) (any, error) {
-			argument := strings.TrimSpace(p.Query)
-			if argument == "" {
-				argument = strings.TrimSpace(p.File)
-			}
-			if argument == "" {
-				argument = "."
-			}
-			output, status := runGoplsCommand(ctx, a.config.WorkingDirectory, "symbols", argument)
-			if status != "ok" {
-				return map[string]any{"status": status, "reason": output}, nil
-			}
-			return map[string]any{"status": "ok", "output": output}, nil
+	backend := &shared.CompositeBackend{
+		Primary: &shared.GoplsBackend{
+			Run:        runGoplsCommand,
+			GetWorkDir: func() string { return a.config.WorkingDirectory },
 		},
-		"call_hierarchy": func(ctx context.Context, p *lspInput) (any, error) {
-			loc := lspLocation(p.File, p.Line, p.Column)
-			refs, refsStatus := runGoplsCommand(ctx, a.config.WorkingDirectory, "references", loc)
-			defn, defStatus := runGoplsCommand(ctx, a.config.WorkingDirectory, "definition", loc)
-			if refsStatus != "ok" && defStatus != "ok" {
-				return map[string]any{"status": "unavailable", "reason": refs}, nil
-			}
-			return map[string]any{
-				"status":     "ok",
-				"direction":  p.Direction,
-				"references": refs,
-				"definition": defn,
-			}, nil
+		Secondary: &shared.TreesitterBackend{
+			Tool:          shared.SharedTreeSitter(),
+			FileAccess:    func() versioning.FileAccess { return a.fileAccess },
+			WorkspaceRoot: func() string { return a.config.WorkingDirectory },
 		},
+		GoFirst: true,
 	}
-
-	return skills.NewSkill("lsp").
-		Description("Query gopls language server for code intelligence.\n\n"+
-			"Actions:\n"+
-			"- goto_definition: Navigate to symbol definition (params: file, line, column)\n"+
-			"- find_references: Find all references to a symbol (params: file, line, column)\n"+
-			"- hover: Get type info and documentation for a symbol (params: file, line, column)\n"+
-			"- symbols: List symbols in a file or search workspace (params: file or query)\n"+
-			"- call_hierarchy: Trace callers/callees of a symbol (params: file, line, column, direction)").
-		Domain("lsp").
-		Keywords("lsp", "symbol", "definition", "references", "hover",
-			"outline", "structure", "call hierarchy", "callers", "callees").
-		Priority(60).
-		TokenEstimate(400).
-		EnumParam("action", "LSP action to execute", []string{
-			"goto_definition", "find_references", "hover", "symbols", "call_hierarchy",
-		}, true).
-		StringParam("file", "File path", false).
-		IntParam("line", "Line number (1-based)", false).
-		IntParam("column", "Column number (1-based)", false).
-		StringParam("query", "Symbol query for workspace search", false).
-		StringParam("direction", "Call hierarchy direction: incoming|outgoing|both", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params lspInput
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			fn, ok := dispatch[params.Action]
-			if !ok {
-				return nil, fmt.Errorf("unknown lsp action: %q", params.Action)
-			}
-			return fn(ctx, &params)
-		}).
-		Build()
+	return shared.NewLSPSkill(shared.LSPSkillConfig{
+		Backend:       backend,
+		Priority:      60,
+		Domain:        "lsp",
+		TokenEstimate: 400,
+	})
 }
 
 // ---------------------------------------------------------------------------
 // Shared utilities
 // ---------------------------------------------------------------------------
-
-func lspLocation(file string, line, column int) string {
-	return fmt.Sprintf("%s:%d:%d", file, line, column)
-}
 
 func runGoplsCommand(ctx context.Context, workDir string, subcommand string, arg string) (string, string) {
 	output, err := runCommandInDir(ctx, workDir, "gopls", subcommand, arg)

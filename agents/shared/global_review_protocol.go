@@ -642,34 +642,22 @@ func NewGlobalReviewProtocolSkills(cfg GlobalReviewProtocolSkillConfig) []*skill
 	switch normalizeGlobalReviewAgent(globalReviewAgentType(context.Background(), cfg)) {
 	case GlobalReviewAgentInspector:
 		return []*skills.Skill{
-			globalReviewChallengeSkill(
-				cfg,
-				"challenge_global_tester",
-				GlobalReviewAgentTester,
-				"Send a targeted global-review challenge to the global tester when merged-state validation, negative testing, or concrete test evidence needs a direct tester response.",
-				"Use when a specific merged-state validation gap needs a direct response from the global tester. Use `handoff_next` for ordinary top-level Inspector -> Tester progression; reserve this skill for narrower follow-up on a concrete tester question or test obligation.",
-			),
-			globalReviewChallengeSkill(
-				cfg,
-				"challenge_architect",
-				GlobalReviewAgentArchitect,
-				"Send a targeted global-review challenge to the architect when plan rationale, architecture tradeoffs, or checkpoint alignment needs direct architect input.",
-				"Use when plan quality, rationale, or checkpoint alignment needs a direct architect response. Do not use this for broad merged-state testing; use `challenge_global_tester` or `handoff_next` when the tester should own the next review pass.",
-			),
-			globalReviewChallengeSkill(
-				cfg,
-				"challenge_orchestrator",
-				GlobalReviewAgentOrchestrator,
-				"Send a targeted global-review challenge to the orchestrator when DAG, workflow, task, pipeline, or execution-state authority needs direct orchestrator input.",
-				"Use when authoritative workflow or execution-state context is required before you can resolve the current review. Do not use this for plan critique or merged-state testing; use `challenge_architect` or `challenge_global_tester` for those.",
-			),
+			// Phase 2.K / GI-D refactor (docs/PIPELINE_SKILL_REFACTOR.md):
+			// challenge_global_tester + challenge_architect +
+			// challenge_orchestrator collapsed into
+			// challenge_global_agent(target ∈ {global-tester, architect,
+			// orchestrator}).
+			globalReviewChallengeGlobalAgentSkill(cfg),
 			globalReviewHandoffNextSkill(cfg),
 			globalReviewValidateWorkSkill(cfg),
 			globalReviewProcessValidationSkill(cfg),
-			globalReviewFinalizeSkill(cfg),
-			globalReviewAcceptCheckpointSkill(cfg),
-			globalReviewCommitToDiskSkill(cfg),
-			globalReviewDiscardCheckpointSkill(cfg),
+			// Phase 2.K / CR-1 refactor: finalize_global_review +
+			// accept_checkpoint + discard_checkpoint + commit_to_disk
+			// collapsed into global_review(action=…). The 4 state-machine
+			// mutations now share one primitive. query_global_review_state
+			// stays separate since it's shared across all 3 agent types
+			// and is semantically distinct (introspection vs mutation).
+			globalReviewActionSkill(cfg),
 			// query_global_review_state surfaces the authoritative
 			// protocol projection so the LLM reasons about pending
 			// challenges and required actions before committing.
@@ -752,6 +740,78 @@ func globalReviewChallengeSkill(
 			return issueGlobalReviewSelection(ctx, cfg, action)
 		}).
 		Build()
+}
+
+// globalReviewChallengeGlobalAgentSkill is the Phase 2.K / GI-D
+// collapse of challenge_global_tester + challenge_architect +
+// challenge_orchestrator. One skill, target enum selects the
+// recipient. Registered only on global inspector.
+func globalReviewChallengeGlobalAgentSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
+	const (
+		targetGlobalTester  = "global-tester"
+		targetArchitect     = "architect"
+		targetOrchestrator  = "orchestrator"
+	)
+	return skills.NewSkill("challenge_global_agent").
+		Description("Issue a targeted global-review challenge to one of the three peers the global inspector can direct. One primitive for every challenge target.\n\n" +
+			"Targets:\n" +
+			"- global-tester: merged-state validation, negative testing, or concrete test evidence needs a direct tester response.\n" +
+			"- architect: plan rationale, architecture tradeoffs, or checkpoint alignment needs direct architect input.\n" +
+			"- orchestrator: DAG, workflow, task, pipeline, or execution-state authority is required.").
+		Domain("global_review").
+		Keywords("global", "review", "challenge", "validation", "route", "target").
+		Priority(100).
+		Usage("Pick the target based on what's blocking the current review: tester for validation gaps, architect for plan critique, orchestrator for execution-state authority. Use `handoff_next` for ordinary top-level phase progression; reserve this for narrower follow-up on a concrete question or obligation.").
+		Requirement("Provide the target, the concrete concern, the exact request, and any required evidence the challenged agent must return.").
+		Satisfies("Creates an explicit targeted challenge and routes it to the named global-review agent.").
+		EnumParam("target", "Target agent for the challenge", []string{targetGlobalTester, targetArchitect, targetOrchestrator}, true).
+		StringParam("reason", "Why this challenge is necessary now", true).
+		StringParam("request", "Concrete validation work or clarification the challenged agent must perform", true).
+		ArrayParam("required_output", "What the challenged agent must return", "string", false).
+		ArrayParam("references", "Relevant files, evidence, or criteria", "string", false).
+		Produces(ArtifactPendingChallenge).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Target         string   `json:"target"`
+				Reason         string   `json:"reason"`
+				Request        string   `json:"request"`
+				RequiredOutput []string `json:"required_output"`
+				References     []string `json:"references"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			target := normalizeChallengeGlobalAgentTarget(params.Target)
+			if target == "" {
+				return nil, fmt.Errorf("target is required (expected global-tester, architect, or orchestrator)")
+			}
+			action := &GlobalReviewTurnAction{
+				Type:             GlobalReviewActionChallenge,
+				AgentType:        normalizeGlobalReviewAgent(globalReviewAgentType(ctx, cfg)),
+				AgentID:          globalReviewAgentID(ctx, cfg),
+				TargetAgent:      target,
+				TargetAgentID:    globalReviewResolveTargetAgentID(cfg, target),
+				CreatesChallenge: true,
+				Reason:           strings.TrimSpace(params.Reason),
+				Request:          strings.TrimSpace(params.Request),
+				RequiredOutput:   normalizeStringList(params.RequiredOutput),
+				References:       normalizeStringList(params.References),
+			}
+			return issueGlobalReviewSelection(ctx, cfg, action)
+		}).
+		Build()
+}
+
+func normalizeChallengeGlobalAgentTarget(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "global-tester", "global_tester", "tester", "global tester":
+		return GlobalReviewAgentTester
+	case "architect":
+		return GlobalReviewAgentArchitect
+	case "orchestrator":
+		return GlobalReviewAgentOrchestrator
+	}
+	return ""
 }
 
 func globalReviewHandoffNextSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
@@ -1425,6 +1485,74 @@ func globalReviewProcessValidationSkill(cfg GlobalReviewProtocolSkillConfig) *sk
 				"protocol_scope": globalReviewNamespace,
 				"thread_key":     globalReviewThreadPrefix + challengeID,
 			}, nil
+		}).
+		Build()
+}
+
+// Phase 2.K / CR-1 refactor (docs/PIPELINE_SKILL_REFACTOR.md §10.K.3):
+// globalReviewActionSkill collapses finalize_global_review +
+// accept_checkpoint + discard_checkpoint + commit_to_disk into one
+// skill dispatched by the action parameter. All four are
+// inspector-only state-machine mutations. query_global_review_state
+// stays separate because it's a shared introspection primitive.
+const (
+	globalReviewActionFinalize = "finalize"
+	globalReviewActionAccept   = "accept"
+	globalReviewActionDiscard  = "discard"
+	globalReviewActionCommit   = "commit"
+)
+
+func globalReviewActionNames() []string {
+	return []string{
+		globalReviewActionFinalize,
+		globalReviewActionAccept,
+		globalReviewActionDiscard,
+		globalReviewActionCommit,
+	}
+}
+
+func globalReviewActionSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skill {
+	finalize := globalReviewFinalizeSkill(cfg)
+	accept := globalReviewAcceptCheckpointSkill(cfg)
+	discard := globalReviewDiscardCheckpointSkill(cfg)
+	commit := globalReviewCommitToDiskSkill(cfg)
+	return skills.NewSkill("global_review").
+		Description("Run one of the global inspector's state-machine mutations on the active global review: finalize, accept, discard, or commit. Collapses finalize_global_review + accept_checkpoint + discard_checkpoint + commit_to_disk into one primitive dispatched by the action enum. Global inspector only — other agents may still call `query_global_review_state` for introspection.").
+		Domain("global_review").
+		Keywords("global", "review", "finalize", "accept", "checkpoint", "commit", "discard", "rollback").
+		Priority(100).
+		Usage("action=finalize runs or recognizes the current audit cycle (requires summary). action=accept promotes the current checkpoint candidate into dependency-visible state (requires summary; checkpoint stage only). action=discard rolls back the active candidate without promoting (requires reason). action=commit is the terminal disk promotion after a passing final-stage review (requires summary; routes through Guardian approval). The state machine dictates sequence — if a prior action returned ready_for_checkpoint, action=accept is the only legal next move; if it returned ready_for_commit, action=commit is the only legal next move.").
+		Requirement("action=finalize + action=accept + action=commit require summary. action=discard requires reason. action=commit requires a passing tester-backed review first. action=accept is valid only during checkpoint-stage review; action=commit is valid only for the final whole-plan stage.").
+		Satisfies("Issues the tester challenge for the current review stage (finalize), promotes the candidate to the shared checkpoint (accept), rolls back an unsalvageable candidate (discard), or commits the merged draft to disk (commit).").
+		Avoid("Do not pick an action the state machine is not requesting. Do not call action=accept during a final whole-plan review — use action=commit instead. Do not call action=commit before a passing tester-backed review has processed.").
+		EnumParam("action", "Global review action", globalReviewActionNames(), true).
+		StringParam("summary", "Terminal-action summary (required for action=finalize, accept, commit)", false).
+		ArrayParam("evidence_refs", "Files, tests, and artifacts supporting the audit (action=finalize)", "string", false).
+		StringParam("reason", "Why the checkpoint must be discarded (action=discard)", false).
+		StringParam("candidate_id", "Optional explicit review candidate id for discard; defaults to the active candidate (action=discard)", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Action string `json:"action"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			action := strings.ToLower(strings.TrimSpace(params.Action))
+			if action == "" {
+				return nil, fmt.Errorf("action is required (expected one of: finalize, accept, discard, commit)")
+			}
+			switch action {
+			case globalReviewActionFinalize:
+				return finalize.Handler(ctx, input)
+			case globalReviewActionAccept:
+				return accept.Handler(ctx, input)
+			case globalReviewActionDiscard:
+				return discard.Handler(ctx, input)
+			case globalReviewActionCommit:
+				return commit.Handler(ctx, input)
+			default:
+				return nil, fmt.Errorf("unknown action: %q (expected one of: finalize, accept, discard, commit)", params.Action)
+			}
 		}).
 		Build()
 }

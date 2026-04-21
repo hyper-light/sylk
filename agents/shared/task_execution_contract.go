@@ -229,9 +229,13 @@ func (s *TaskExecutionState) recordSuccess(toolName string, input map[string]any
 			s.mutatedPaths[target] = struct{}{}
 		}
 	}
-	if toolName == "coord_resolve_artifact" {
-		if reviewID := resolvedReviewID(input, output); reviewID != "" {
-			s.resolvedReviews[reviewID] = struct{}{}
+	// Phase 1/2 refactor: coord_resolve_artifact folded into
+	// publish_work_event with kind=review_completion.
+	if toolName == "publish_work_event" {
+		if kind := stringInput(input, "kind"); kind == "review_completion" {
+			if reviewID := resolvedReviewID(input, output); reviewID != "" {
+				s.resolvedReviews[reviewID] = struct{}{}
+			}
 		}
 	}
 }

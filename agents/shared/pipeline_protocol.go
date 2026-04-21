@@ -759,7 +759,12 @@ func (s *PipelineProtocolState) HydrateTask(task *PipelineTaskInput) {
 func requiredPipelineActionMessage(action PipelineProtocolActionType, reason string) string {
 	required := strings.TrimSpace(string(action))
 	if required == string(PipelineProtocolActionOT) {
-		message := "Before ending this pipeline turn, `finalize_pipeline` already determined the pipeline is ready for OT, so you must invoke `handoff_to_ot` now. Do not summarize the handoff, start another audit loop, choose a different terminal action, or continue with other queued work or other pipelines first."
+		// Name the tool the LLM actually invoked (pipeline_protocol with
+		// action=finalize) rather than the underlying delegate skill —
+		// finalize_pipeline is registered but not LLM-visible, so naming
+		// it in an error the LLM re-reads leaves the model looking for a
+		// tool that isn't in its catalog.
+		message := "Before ending this pipeline turn, `pipeline_protocol(action=finalize)` already determined the pipeline is ready for OT, so you must invoke `handoff_to_ot` now. Do not summarize the handoff, start another audit loop, choose a different terminal action, or continue with other queued work or other pipelines first."
 		if strings.TrimSpace(reason) != "" {
 			return message + " " + strings.TrimSpace(reason)
 		}
@@ -901,52 +906,299 @@ func ValidatePipelineProtocolCompletion(ctx context.Context, role string) error 
 			return NewPipelineProtocolError(
 				"pipeline.completion.inspector_post_validation_outstanding",
 				"",
-				"Before ending this inspector pipeline turn, you already called `process_validation`. Finish any remaining direct audit you still need, then record the next protocol step.",
-				"choose one of challenge_agent, handoff_next, finalize_pipeline, or handoff_to_ot",
+				"Before ending this inspector pipeline turn, you already called `pipeline_protocol(action=process_validation)`. Finish any remaining direct audit you still need, then record the next protocol step.",
+				"invoke pipeline_protocol(action=challenge|handoff|finalize) or handoff_to_ot",
 			)
 		}
 		return NewPipelineProtocolError(
 			"pipeline.completion.inspector_no_terminal_action",
 			"",
 			"Before ending this pipeline turn, record the next protocol step.",
-			"choose one of challenge_agent, handoff_next, validate_work, finalize_pipeline, or handoff_to_ot",
+			"invoke pipeline_protocol(action=challenge|handoff|validate|process_validation|finalize) or handoff_to_ot",
 		)
 	}
 	return NewPipelineProtocolError(
 		"pipeline.completion.no_terminal_action",
 		"",
 		"Before ending this pipeline turn, record the next protocol step.",
-		"choose one of challenge_agent, handoff_next, or validate_work",
+		"invoke pipeline_protocol(action=challenge|handoff|validate)",
 	)
 }
 
 func PipelineProtocolSkills(cfg PipelineProtocolSkillConfig) []*skills.Skill {
+	// Per-action skills — registered so internal deterministic callers
+	// can invoke by their original names (many state-machine paths,
+	// WAL emitters, activity filters, and tests reference these names
+	// directly). The LLM-facing catalog exposes `pipeline_protocol`
+	// instead; see the VisibleByDefault lists in each agent's
+	// tool_policy.go.
+	challenge := pipelineChallengeAgentSkill(cfg)
+	handoff := pipelineHandoffNextSkill(cfg)
+	validate := pipelineValidateWorkSkill(cfg)
+	process := pipelineProcessValidationSkill(cfg)
+
+	var finalize *skills.Skill
+	var finalizeHandoffOT *skills.Skill
+	var discardPipeline *skills.Skill
+	if cfg.InspectorOT {
+		finalize = pipelineFinalizePipelineSkill(cfg)
+		finalizeHandoffOT = pipelineHandoffOTSkill(cfg)
+		discardPipeline = pipelineDiscardPipelineSkill(cfg)
+	}
+	var testerFinalize *skills.Skill
+	if cfg.TesterFinalize != nil {
+		testerFinalize = pipelineTesterFinalizePipelineSkill(cfg)
+	}
+
 	out := []*skills.Skill{
-		pipelineChallengeAgentSkill(cfg),
-		pipelineHandoffNextSkill(cfg),
-		pipelineValidateWorkSkill(cfg),
-		pipelineProcessValidationSkill(cfg),
+		// The per-verb skills stay registered for internal callers and
+		// for tests that invoke them directly. VisibleByDefault omits
+		// them on every agent — the LLM sees only pipeline_protocol.
+		challenge,
+		handoff,
+		validate,
+		process,
+		// pipeline_protocol dispatches to the four per-verb handlers
+		// above (and to finalize variants below) via an action enum.
+		// One LLM-facing tool; the state-machine / WAL / activity-
+		// filter plumbing continues to key off the underlying verb.
+		newPipelineProtocolUnifiedSkill(cfg, challenge, handoff, validate, process, finalize, testerFinalize),
 		// discard_queued_artifacts is the explicit-recovery affordance
-		// surfaced to every pipeline agent. The protocol passes artifacts
-		// through and auto-discards at age threshold; this skill lets the
-		// LLM converge faster when it knows an artifact is stale before
-		// the threshold trips.
+		// surfaced to every pipeline agent. The protocol passes
+		// artifacts through and auto-discards at age threshold; this
+		// skill lets the LLM converge faster when it knows an artifact
+		// is stale before the threshold trips.
 		pipelineDiscardQueuedArtifactsSkill(cfg),
 		// query_pipeline_state surfaces the authoritative protocol
 		// projection — pending challenges, queued artifacts, required
-		// terminal action, tester snapshot status — to the LLM so it
-		// reasons about state instead of hitting validation gates blind.
-		// Eliminates the class of bugs where finalize_pipeline fails
-		// with "phantom" errors the LLM had no way to anticipate.
+		// terminal action, tester snapshot status — so the LLM reasons
+		// about state instead of hitting validation gates blind.
 		QueryPipelineStateSkill(cfg),
 	}
 	if cfg.InspectorOT {
-		out = append(out, pipelineFinalizePipelineSkill(cfg), pipelineHandoffOTSkill(cfg), pipelineDiscardPipelineSkill(cfg))
+		out = append(out, finalize, finalizeHandoffOT, discardPipeline)
 	}
 	if cfg.TesterFinalize != nil {
-		out = append(out, pipelineTesterFinalizePipelineSkill(cfg))
+		out = append(out, testerFinalize)
 	}
 	return out
+}
+
+// newPipelineProtocolUnifiedSkill returns the `pipeline_protocol`
+// dispatcher — one LLM-facing tool whose action enum routes to the
+// per-verb handlers. Keeps every underlying handler's parameter
+// validation, activity emission, and state-machine gate intact; the
+// skill is a thin façade so the agent catalog carries one verb
+// instead of five. Action enum:
+//
+//   - challenge          → pipelineChallengeAgentSkill
+//   - handoff            → pipelineHandoffNextSkill
+//   - validate           → pipelineValidateWorkSkill
+//   - process_validation → pipelineProcessValidationSkill
+//   - finalize           → pipelineFinalizePipelineSkill (inspector OT)
+//                          or pipelineTesterFinalizePipelineSkill (tester)
+//
+// When the caller's cfg doesn't populate a finalize variant, action=
+// finalize returns an error directing the caller to the appropriate
+// separate skill (e.g. handoff_to_ot for inspector terminal, or
+// rejection for agents that have no finalize role).
+func newPipelineProtocolUnifiedSkill(
+	cfg PipelineProtocolSkillConfig,
+	challenge, handoff, validate, process *skills.Skill,
+	inspectorFinalize, testerFinalize *skills.Skill,
+) *skills.Skill {
+	builder := skills.NewSkill("pipeline_protocol").
+		Description(buildPipelineProtocolDescription(challenge, handoff, validate, process, inspectorFinalize, testerFinalize)).
+		Domain("pipeline").
+		Keywords("protocol", "challenge", "handoff", "validate", "process_validation", "finalize", "pipeline", "phase", "route", "review").
+		Priority(100).
+		Usage("Pick the action based on where you are in the turn: returned peer work needs a targeted follow-up → challenge; ordinary phase progression → handoff; answering an active challenge → validate; a peer just answered one of yours → process_validation; audit cycle settled → finalize.").
+		EnumParam("action", "Protocol action", pipelineProtocolActionEnum(inspectorFinalize, testerFinalize), true).
+		// Every delegate's parameter schema is inherited automatically.
+		// InheritSchemaFrom copies each delegate's params and prefixes
+		// their descriptions with the action scope — so when the LLM
+		// reads the tool definition, every per-action param's
+		// applicability is visible inline. Drift between façade and
+		// delegate is eliminated because the façade is regenerated from
+		// delegate schemas on every build.
+		InheritSchemaFrom(challenge, "challenge").
+		InheritSchemaFrom(handoff, "handoff").
+		InheritSchemaFrom(validate, "validate").
+		InheritSchemaFrom(process, "process_validation")
+
+	if inspectorFinalize != nil {
+		builder = builder.
+			InheritSchemaFrom(inspectorFinalize, "finalize").
+			ActionRequires("finalize", inspectorFinalize.InputSchema.Required...)
+	}
+	if testerFinalize != nil {
+		builder = builder.
+			InheritSchemaFrom(testerFinalize, "finalize").
+			ActionRequires("finalize", testerFinalize.InputSchema.Required...)
+	}
+	// Challenge, handoff, validate, process_validation all have
+	// handler-enforced required fields that the JSON Schema framework
+	// can't mark conditional. Mirror them into ActionRequirements so the
+	// façade's pre-dispatch validator emits a schema-echoing error
+	// BEFORE the delegate sees the input — giving the LLM the exact
+	// missing-field list plus the expected shape on the first failure.
+	builder = builder.
+		ActionRequires("challenge", challenge.InputSchema.Required...).
+		ActionRequires("handoff", handoff.InputSchema.Required...).
+		ActionRequires("validate", validate.InputSchema.Required...).
+		ActionRequires("process_validation", process.InputSchema.Required...)
+
+	// Build a pointer the handler closure can reference, then rebuild
+	// the handler so it can call ValidateActionRequirements on the
+	// façade itself. Go's builder pattern doesn't give us a
+	// self-reference mid-chain; this two-step avoids it.
+	var facade *skills.Skill
+	facade = builder.
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			if facade != nil {
+				if err := facade.ValidateActionRequirements(pipelineProtocolActionFromInput(input), input); err != nil {
+					return nil, err
+				}
+			}
+			return dispatchPipelineProtocolAction(
+				ctx, cfg, input,
+				challenge, handoff, validate, process,
+				inspectorFinalize, testerFinalize,
+			)
+		}).
+		Build()
+	return facade
+}
+
+// pipelineProtocolActionFromInput pulls the `action` discriminator out of
+// the raw tool input so the façade's pre-validator can look up the
+// per-action required fields before dispatch. Returns an empty string on
+// decode failure; the dispatcher below produces its own invalid-input
+// error in that case.
+func pipelineProtocolActionFromInput(input json.RawMessage) string {
+	var probe struct {
+		Action string `json:"action"`
+	}
+	if err := json.Unmarshal(input, &probe); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(probe.Action)
+}
+
+// pipelineProtocolActionEnum builds the `action` parameter's enum set,
+// omitting `finalize` when no finalize variant is wired so the LLM's tool
+// schema accurately reflects this agent's capabilities.
+func pipelineProtocolActionEnum(inspectorFinalize, testerFinalize *skills.Skill) []string {
+	actions := []string{"challenge", "handoff", "validate", "process_validation"}
+	if inspectorFinalize != nil || testerFinalize != nil {
+		actions = append(actions, "finalize")
+	}
+	return actions
+}
+
+// dispatchPipelineProtocolAction resolves the action and delegates to the
+// matching per-verb handler. The façade's ValidateActionRequirements has
+// already run in the Handler wrapper above — this function is pure
+// dispatch, so any pre-validation failure would have returned before
+// reaching here.
+//
+// Delegate errors pass through enrichPipelineProtocolError: when a
+// delegate returns a typed ProtocolError (state-precondition rejection),
+// the error is augmented with the current PipelineProtocolSnapshot and
+// the set of actions that would pass their state preconditions against
+// that snapshot — so the LLM's recovery turn has the authoritative "what
+// is the pipeline actually in right now" context without needing a
+// separate query_pipeline_state call.
+func dispatchPipelineProtocolAction(
+	ctx context.Context,
+	cfg PipelineProtocolSkillConfig,
+	input json.RawMessage,
+	challenge, handoff, validate, process *skills.Skill,
+	inspectorFinalize, testerFinalize *skills.Skill,
+) (any, error) {
+	action := pipelineProtocolActionFromInput(input)
+	if action == "" {
+		return nil, fmt.Errorf("invalid parameters: action is required (one of challenge|handoff|validate|process_validation|finalize)")
+	}
+	result, err := dispatchPipelineProtocolDelegate(
+		ctx, action, input,
+		challenge, handoff, validate, process,
+		inspectorFinalize, testerFinalize,
+	)
+	if err != nil {
+		err = enrichPipelineProtocolError(ctx, cfg, action, err)
+	}
+	return result, err
+}
+
+// dispatchPipelineProtocolDelegate is the pure switch from action →
+// delegate. Split out from dispatchPipelineProtocolAction so the
+// error-enrichment wrapper above has a single return point to hook.
+func dispatchPipelineProtocolDelegate(
+	ctx context.Context,
+	action string,
+	input json.RawMessage,
+	challenge, handoff, validate, process *skills.Skill,
+	inspectorFinalize, testerFinalize *skills.Skill,
+) (any, error) {
+	switch action {
+	case "challenge":
+		return challenge.Handler(ctx, input)
+	case "handoff":
+		return handoff.Handler(ctx, input)
+	case "validate":
+		return validate.Handler(ctx, input)
+	case "process_validation":
+		return process.Handler(ctx, input)
+	case "finalize":
+		switch {
+		case inspectorFinalize != nil:
+			return inspectorFinalize.Handler(ctx, input)
+		case testerFinalize != nil:
+			return testerFinalize.Handler(ctx, input)
+		default:
+			return nil, fmt.Errorf("pipeline_protocol: action=finalize is not available for this agent; use handoff or the agent-specific terminal skill")
+		}
+	default:
+		return nil, fmt.Errorf("unknown pipeline_protocol action: %q (expected challenge|handoff|validate|process_validation|finalize)", action)
+	}
+}
+
+// buildPipelineProtocolDescription assembles a structured action-by-action
+// description from the delegate skills, so the LLM's tool definition
+// carries an accurate per-action summary (purpose, required fields,
+// usage, and every load-bearing Requirement / Satisfies / Avoid /
+// BestPractice) rendered from the delegates themselves. Drift between
+// the façade's description and the delegates' own documentation is
+// impossible because the description is regenerated from the delegates
+// on each build.
+//
+// History note: an earlier version of this helper rendered only
+// purpose + required fields + the first usage sentence, which silently
+// dropped delegate Requirements. The finalize delegate's post-condition
+// ("if ready_for_ot is true, call handoff_to_ot next") vanished from
+// the LLM's tool catalog, the inspector wedged in a finalize loop
+// after a passing audit, and the orchestrator's inbound request
+// hung. The fix routes every delegate through skills.RenderActionBlock
+// so no instructional field can be lost in translation again.
+func buildPipelineProtocolDescription(
+	challenge, handoff, validate, process *skills.Skill,
+	inspectorFinalize, testerFinalize *skills.Skill,
+) string {
+	var sb strings.Builder
+	sb.WriteString("Pipeline protocol — one verb for every protocol move. `action` selects the kind of turn you're taking.\n\nActions:\n")
+	sb.WriteString(skills.RenderActionBlock(challenge, "challenge"))
+	sb.WriteString(skills.RenderActionBlock(handoff, "handoff"))
+	sb.WriteString(skills.RenderActionBlock(validate, "validate"))
+	sb.WriteString(skills.RenderActionBlock(process, "process_validation"))
+	switch {
+	case inspectorFinalize != nil:
+		sb.WriteString(skills.RenderActionBlock(inspectorFinalize, "finalize"))
+	case testerFinalize != nil:
+		sb.WriteString(skills.RenderActionBlock(testerFinalize, "finalize"))
+	}
+	sb.WriteString("\nEvery parameter in the tool schema is prefixed with the action(s) it applies to (e.g. `[action=finalize] ...`). Required fields for the chosen action are pre-validated at the façade before dispatch; a missing field returns a schema-echoing error with the exact expected shape.")
+	return sb.String()
 }
 
 type pipelineTurnSelectionParams struct {
@@ -1637,7 +1889,12 @@ func pipelineValidateWorkSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 			snapshot := state.Snapshot()
 			challenge := snapshot.PendingChallenge
 			if challenge == nil {
-				return nil, fmt.Errorf("no active pipeline challenge is waiting for validation")
+				return nil, NewPipelineProtocolError(
+					"pipeline.validate_work.no_pending_challenge",
+					"validate_work",
+					"no active pipeline challenge is waiting for validation",
+					"action=validate is only legal when PendingChallenge is non-nil. Call query_pipeline_state to inspect current state; if no challenge is pending, use action=handoff for ordinary phase progression or action=challenge to raise a new issue",
+				)
 			}
 			activeID := strings.TrimSpace(challenge.ID)
 			activeRequester := normalizePipelineAgentType(challenge.RequestingAgent)
@@ -1815,7 +2072,12 @@ func pipelineProcessValidationSkill(cfg PipelineProtocolSkillConfig) *skills.Ski
 			snapshot := state.Snapshot()
 			pending := snapshot.PendingValidation
 			if pending == nil {
-				return nil, fmt.Errorf("no pending validation response is waiting to be processed")
+				return nil, NewPipelineProtocolError(
+					"pipeline.process_validation.no_pending_response",
+					"process_validation",
+					"no pending validation response is waiting to be processed",
+					"action=process_validation is only legal when PendingValidation is non-nil (a peer has just answered one of your challenges). Call query_pipeline_state to inspect current state; if nothing is pending, proceed with action=handoff, action=challenge, or (for inspector/tester) action=finalize",
+				)
 			}
 			challengeID := strings.TrimSpace(params.ChallengeID)
 			if challengeID == "" {
@@ -2862,6 +3124,68 @@ func pipelineChallengeRouteOptions(task *PipelineTaskInput, action *PipelineTurn
 	}
 }
 
+// pipelineForwardHandoffRouteOptions builds the dispatch options for an
+// ordinary (non-challenge) pipeline_protocol(action=handoff) that
+// transfers top-level turn ownership from the current agent to a peer of
+// a different type (engineer → inspector-pipeline, inspector → tester,
+// etc.). The TUI must render the recipient as a NEW top-level chat entry
+// below the current agent's entry, not as a continuation of the current
+// agent's tool stream — otherwise the recipient's post-handoff activity
+// gets nested under the handoff-issuing agent's entry forever.
+//
+// The mechanism is ForwardHandoffParentCID: when set, dispatchPipeline-
+// ProtocolTaskWithOptions stamps RouteMetadataWithExplicitTopLevelTransfer
+// onto the outbound route request, which sets TopLevelTransfer=true on the
+// resulting StreamStartMsg; the chat model then uses
+// reusableResumablePrimaryEntry's "explicit top-level transfer" branch to
+// create a new entry for the recipient.
+//
+// This is intentionally decoupled from:
+//
+//   - Challenges (pipelineChallengeRouteOptions): challenges are
+//     subordinate interactions that render as NESTED rows under the
+//     challenger's tool call, not as new top-level entries. They use
+//     InterAgentBranch, never ForwardHandoffParentCID.
+//   - Validation returns (pipelineValidationRouteOptions): responses flow
+//     BACK to the originator and resume its existing entry via
+//     OriginatorContinuationCID. They explicitly must NOT create a new
+//     top-level entry (would split the originator's turn).
+//   - Guardian / consult interactions: handled outside pipeline_protocol
+//     entirely; no forward-handoff metadata applies.
+//
+// Returns empty options when there is no stream context (fall back to a
+// plain route — matches prior behavior for the edge case where the
+// dispatcher is invoked outside a live tool loop).
+func pipelineForwardHandoffRouteOptions(ctx context.Context, action *PipelineTurnAction) pipelineProtocolRouteOptions {
+	if action == nil || action.CreatesChallenge {
+		return pipelineProtocolRouteOptions{}
+	}
+	stream, ok := StreamMetadataFromContext(ctx)
+	if !ok {
+		return pipelineProtocolRouteOptions{}
+	}
+	parentCID := strings.TrimSpace(stream.CorrelationID)
+	if parentCID == "" {
+		return pipelineProtocolRouteOptions{}
+	}
+	return pipelineProtocolRouteOptions{
+		ForwardHandoffParentCID: parentCID,
+	}
+}
+
+// pipelineDispatchHandoffOptions picks the right route options for a
+// dispatch leg: challenges use InterAgentBranch for nested rendering,
+// ordinary handoffs use ForwardHandoffParentCID for new-top-level
+// rendering. Exactly one of the two is set per leg — never both — so the
+// routing intents remain mutually exclusive as documented on
+// pipelineProtocolRouteOptions.
+func pipelineDispatchHandoffOptions(ctx context.Context, task *PipelineTaskInput, action *PipelineTurnAction) pipelineProtocolRouteOptions {
+	if action != nil && action.CreatesChallenge {
+		return pipelineChallengeRouteOptions(task, action)
+	}
+	return pipelineForwardHandoffRouteOptions(ctx, action)
+}
+
 // pipelineValidationRouteOptions builds the dispatch options for a
 // validate_work response routed from the challenged agent back to the
 // originator (inspector). The originator should resume its existing chat
@@ -2931,7 +3255,7 @@ func dispatchPipelineHandoffSelection(
 			cfg,
 			nextTask,
 			action.Request,
-			pipelineChallengeRouteOptions(nextTask, action),
+			pipelineDispatchHandoffOptions(ctx, nextTask, action),
 		)
 		if err != nil {
 			return nil, err

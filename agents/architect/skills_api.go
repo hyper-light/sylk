@@ -30,23 +30,27 @@ func architectToolManifest() *toolruntime.PolicyManifest {
 
 func architectToolManifestForRegistry(registry *skills.Registry) *toolruntime.PolicyManifest {
 	policies := []toolruntime.ToolPolicy{
+		// Phase 2.K / CR-4 refactor: start_planning + plan_workflow
+		// folded into plan (action=start|workflow).
 		toolruntime.NewToolPolicy("plan", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("plan_workflow", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("start_planning", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("consult", toolruntime.EffectReadOnly, toolruntime.DomainKnowledge, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
+		// Phase 1 refactor: `consult`, `monitor_execution`,
+		// `ask_user_question` removed. `consult_peer` (fabric) and
+		// `ask_user_clarification` (shared) replace them;
+		// `monitor_execution` uses `query_peer_activity`.
 		toolruntime.NewToolPolicy("plan_mode", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("interrupt_handler", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
-		toolruntime.NewToolPolicy("pre_delegation_declare", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("validate_pre_delegation", toolruntime.EffectReadOnly, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("monitor_execution", toolruntime.EffectReadOnly, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
+		// Phase 2.4 refactor: pre_delegation_declare + validate_pre_delegation
+		// collapsed into delegation(action=declare|validate).
+		toolruntime.NewToolPolicy("delegation", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("validate_work", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("query_global_review_state", toolruntime.EffectReadOnly, toolruntime.DomainControl, toolruntime.ExecutionModeLocal),
-		toolruntime.NewToolPolicy("route_plan_acceptance", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("handle_plan_acceptance_result", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
-		toolruntime.NewToolPolicy("present_plan_approval_dialog", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("ask_user_question", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("route_requirements_research", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("read_research_paper", toolruntime.EffectReadOnly, toolruntime.DomainKnowledge, toolruntime.ExecutionModeLocal),
+		// Phase 2.3 refactor: route_plan_acceptance + handle_plan_acceptance_result
+		// + present_plan_approval_dialog collapsed into plan_acceptance.
+		toolruntime.NewToolPolicy("plan_acceptance", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("ask_user_clarification", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
+		// Phase 2.6 refactor: route_requirements_research + read_research_paper
+		// collapsed into academic_research(action=request|read).
+		toolruntime.NewToolPolicy("academic_research", toolruntime.EffectMutating, toolruntime.DomainKnowledge, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("reroute_request", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("self_diagnostic", toolruntime.EffectReadOnly, toolruntime.DomainSystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy(toolruntime.SearchToolName, toolruntime.EffectReadOnly, toolruntime.DomainDiscovery, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault(), toolruntime.WithSearchable(false)),
@@ -486,7 +490,7 @@ func architectPinnedSkills(req *ArchitectRequest) []string {
 	}
 	pinned := []string{}
 	if shouldPinResearchSkill(req) {
-		pinned = append(pinned, "read_research_paper", "consult")
+		pinned = append(pinned, "academic_research", "consult_peer")
 	}
 	if shouldPinFilesystemSkills(req) {
 		pinned = append(pinned, "read_file", "glob", "grep")

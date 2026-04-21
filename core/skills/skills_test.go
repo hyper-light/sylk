@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -609,5 +610,175 @@ func TestBuilder_EnumParam(t *testing.T) {
 	}
 	if len(prop.Enum) != 4 {
 		t.Errorf("expected 4 enum values, got %d", len(prop.Enum))
+	}
+}
+
+// TestBuilder_InheritSchemaFrom_CopiesParamsWithActionScope verifies that a
+// façade that inherits from two delegates ends up with the union of their
+// params, each tagged with the action(s) that use it. The delegates'
+// structural fields (type, nested properties, enum) must survive the copy.
+func TestBuilder_InheritSchemaFrom_CopiesParamsWithActionScope(t *testing.T) {
+	finalize := NewSkill("finalize_pipeline").
+		ArrayObjectParam(
+			"targets",
+			"Per-recipient verification specs.",
+			map[string]*Property{
+				"target":  {Type: "string", Description: "Recipient agent."},
+				"summary": {Type: "string", Description: "What the recipient should know."},
+			},
+			[]string{"summary"},
+			true,
+		).
+		Build()
+
+	challenge := NewSkill("challenge_agent").
+		StringParam("reason", "Why the challenge is being issued.", false).
+		EnumArrayParam("target_agents", "Challenge targets.", "string", []string{"engineer", "designer"}, false).
+		Build()
+
+	facade := NewSkill("pipeline_protocol").
+		EnumParam("action", "Protocol action", []string{"finalize", "challenge"}, true).
+		InheritSchemaFrom(finalize, "finalize").
+		InheritSchemaFrom(challenge, "challenge").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			return nil, nil
+		}).
+		Build()
+
+	targets := facade.InputSchema.Properties["targets"]
+	if targets == nil {
+		t.Fatal("expected façade to inherit `targets` from finalize delegate")
+	}
+	if targets.Type != "array" {
+		t.Errorf("expected `targets` type array, got %s", targets.Type)
+	}
+	if targets.Items == nil || targets.Items.Type != "object" {
+		t.Fatal("expected `targets` items to be objects")
+	}
+	if _, ok := targets.Items.Properties["summary"]; !ok {
+		t.Error("expected nested `summary` property to survive inheritance")
+	}
+	if !strings.HasPrefix(targets.Description, "[action=finalize] ") {
+		t.Errorf("expected targets description to start with action scope tag; got %q", targets.Description)
+	}
+
+	reason := facade.InputSchema.Properties["reason"]
+	if reason == nil {
+		t.Fatal("expected façade to inherit `reason` from challenge delegate")
+	}
+	if !strings.HasPrefix(reason.Description, "[action=challenge] ") {
+		t.Errorf("expected reason description to start with action scope tag; got %q", reason.Description)
+	}
+
+	targetAgents := facade.InputSchema.Properties["target_agents"]
+	if targetAgents == nil || len(targetAgents.Items.Enum) != 2 {
+		t.Fatalf("expected target_agents enum of 2 values, got %+v", targetAgents)
+	}
+}
+
+// TestBuilder_InheritSchemaFrom_MergesSharedParamScopes verifies that when a
+// param name exists on two delegates (e.g. `summary` shared by validate and
+// process_validation), the scope tag merges into a pipe-separated list.
+func TestBuilder_InheritSchemaFrom_MergesSharedParamScopes(t *testing.T) {
+	validate := NewSkill("validate_work").
+		StringParam("summary", "Validation summary.", false).
+		Build()
+	process := NewSkill("process_validation").
+		StringParam("summary", "Response summary.", false).
+		Build()
+
+	facade := NewSkill("pipeline_protocol").
+		EnumParam("action", "Protocol action", []string{"validate", "process_validation"}, true).
+		InheritSchemaFrom(validate, "validate").
+		InheritSchemaFrom(process, "process_validation").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			return nil, nil
+		}).
+		Build()
+
+	summary := facade.InputSchema.Properties["summary"]
+	if summary == nil {
+		t.Fatal("expected façade to inherit `summary`")
+	}
+	wantPrefix := "[action=validate|process_validation] "
+	if !strings.HasPrefix(summary.Description, wantPrefix) {
+		t.Errorf("expected merged action scope prefix %q, got %q", wantPrefix, summary.Description)
+	}
+	// Re-inheriting the same action should not duplicate it.
+	facade2 := NewSkill("pipeline_protocol").
+		InheritSchemaFrom(validate, "validate").
+		InheritSchemaFrom(validate, "validate").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			return nil, nil
+		}).
+		Build()
+	sum2 := facade2.InputSchema.Properties["summary"]
+	if !strings.HasPrefix(sum2.Description, "[action=validate] ") {
+		t.Errorf("expected de-duplicated single action tag, got %q", sum2.Description)
+	}
+}
+
+// TestSkill_ValidateActionRequirements verifies the façade-level
+// pre-validator: missing required fields for the chosen action return an
+// error whose message names the action, lists the missing fields, and
+// echoes each field's Property shape so the LLM can recover on retry.
+func TestSkill_ValidateActionRequirements(t *testing.T) {
+	finalize := NewSkill("finalize_pipeline").
+		ArrayObjectParam(
+			"targets",
+			"Per-recipient verification specs.",
+			map[string]*Property{
+				"target":  {Type: "string"},
+				"summary": {Type: "string"},
+			},
+			[]string{"summary"},
+			true,
+		).
+		Build()
+
+	facade := NewSkill("pipeline_protocol").
+		EnumParam("action", "Protocol action", []string{"finalize", "handoff"}, true).
+		InheritSchemaFrom(finalize, "finalize").
+		ActionRequires("finalize", "targets").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			return nil, nil
+		}).
+		Build()
+
+	// Missing targets: should error with shape description.
+	err := facade.ValidateActionRequirements("finalize", json.RawMessage(`{"action":"finalize"}`))
+	if err == nil {
+		t.Fatal("expected ValidateActionRequirements to reject missing targets")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"tool \"pipeline_protocol\"",
+		"action=finalize",
+		"missing required field(s): targets",
+		"array of object",
+		"summary",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message missing marker %q; got: %s", want, msg)
+		}
+	}
+
+	// Empty array: treated as missing (isJSONEmpty check).
+	err = facade.ValidateActionRequirements("finalize", json.RawMessage(`{"action":"finalize","targets":[]}`))
+	if err == nil {
+		t.Error("expected empty targets array to be rejected")
+	}
+
+	// Populated targets: passes.
+	err = facade.ValidateActionRequirements("finalize",
+		json.RawMessage(`{"action":"finalize","targets":[{"target":"engineer","summary":"x"}]}`))
+	if err != nil {
+		t.Errorf("expected populated targets to pass; got: %v", err)
+	}
+
+	// Action with no requirements declared: passes trivially.
+	err = facade.ValidateActionRequirements("handoff", json.RawMessage(`{"action":"handoff"}`))
+	if err != nil {
+		t.Errorf("expected handoff to pass when no requirements declared; got: %v", err)
 	}
 }

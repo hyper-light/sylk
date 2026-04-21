@@ -1170,12 +1170,11 @@ func intermediateToolAction(agentType string, contract *TaskExecutionContract, t
 		return "checking the available skills"
 	case "check_inspector_gate":
 		return "checking the inspector gate before test work begins"
-	case "coord_query_view":
-		return "reviewing coordination state and prior task artifacts"
-	case "coord_claim_scope":
-		return "claiming " + intermediateScopePhrase(agentType)
-	case "coord_release_scope":
-		return "releasing the claimed surface"
+	case "manage_claim":
+		// Phase 2 refactor: absorbs coord_claim_scope + coord_release_scope.
+		return "managing the scope claim for " + intermediateScopePhrase(agentType)
+	case "query_peer_activity":
+		return "reviewing peer activity and prior task artifacts"
 	case "read_workspace_file":
 		return readWorkspaceAction(agentType)
 	case "inspect_workspace_state":
@@ -1198,9 +1197,9 @@ func intermediateToolAction(agentType string, contract *TaskExecutionContract, t
 		return "running the relevant test suite against the current task state"
 	case "define_criteria":
 		return "defining explicit success criteria from the task contract"
-	case "get_validation_status":
-		return "confirming the current validation status"
-	case "coord_publish_artifact":
+	case "publish_work_event":
+		// Phase 2 refactor: absorbs coord_publish_artifact +
+		// coord_request_review + coord_resolve_artifact.
 		return "publishing " + intermediateArtifactPhrase(agentType, contract)
 	case "validate_criteria":
 		return "validating the implementation against the defined criteria"

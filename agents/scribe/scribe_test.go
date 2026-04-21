@@ -302,7 +302,7 @@ func TestScribe_Feed_ProcessesAndForwards(t *testing.T) {
 	if !containsTool(req.Tools, scribeStoreArchivalistSkillName) {
 		t.Fatalf("provider request tools missing %q", scribeStoreArchivalistSkillName)
 	}
-	if containsTool(req.Tools, "scribe_forest_get_capture_targets") {
+	if containsTool(req.Tools, "scribe_forest_consult") {
 		t.Fatal("forest skills should not be exposed when forest is disabled")
 	}
 
@@ -356,8 +356,8 @@ func TestScribe_GenerateCommentary_UsesForestSkillAndRecordsOutcome(t *testing.T
 			{
 				ToolCalls: []providers.ToolCall{{
 					ID:        "call-1",
-					Name:      "scribe_forest_get_capture_targets",
-					Arguments: `{"query":"preserve handoff context"}`,
+					Name:      "scribe_forest_consult",
+					Arguments: `{"purpose":"get_capture_targets","query":"preserve handoff context"}`,
 				}},
 				StopReason: providers.StopReasonToolUse,
 			},
@@ -395,7 +395,7 @@ func TestScribe_GenerateCommentary_UsesForestSkillAndRecordsOutcome(t *testing.T
 	if firstReq == nil {
 		t.Fatal("expected first provider request")
 	}
-	if !containsTool(firstReq.Tools, "scribe_forest_get_capture_targets") {
+	if !containsTool(firstReq.Tools, "scribe_forest_consult") {
 		t.Fatal("forest capture tool was not exposed to scribe")
 	}
 	if !containsTool(firstReq.Tools, scribeStoreArchivalistSkillName) {
@@ -646,7 +646,7 @@ func TestScribeSystemPrompt_IsSpecializedByAgent(t *testing.T) {
 	if !strings.Contains(engineerPrompt, scribeStoreArchivalistSkillName) {
 		t.Fatalf("engineer prompt missing store skill guidance: %s", engineerPrompt)
 	}
-	if !strings.Contains(engineerPrompt, "scribe_forest_get_capture_targets") {
+	if !strings.Contains(engineerPrompt, "scribe_forest_consult(purpose=get_capture_targets") {
 		t.Fatalf("engineer prompt missing forest guidance when enabled: %s", engineerPrompt)
 	}
 
@@ -654,7 +654,7 @@ func TestScribeSystemPrompt_IsSpecializedByAgent(t *testing.T) {
 	if !strings.Contains(academicPrompt, `"thesis"`) || !strings.Contains(academicPrompt, `"handoff_delta"`) {
 		t.Fatalf("academic prompt missing research fields: %s", academicPrompt)
 	}
-	if strings.Contains(academicPrompt, "scribe_forest_get_capture_targets") {
+	if strings.Contains(academicPrompt, "scribe_forest_consult") {
 		t.Fatalf("academic prompt should not mention forest skill when forest is disabled: %s", academicPrompt)
 	}
 }

@@ -12,78 +12,83 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
-// ValidateTokenUsageSkill returns a skill that checks for hardcoded color
-// literals not referencing the theme/palette system.
-func ValidateTokenUsageSkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("validate_token_usage").
-		Description("Check Go files for hardcoded hex color literals not using theme/palette tokens.").
-		Domain("design").
-		Keywords("token", "color", "palette", "theme", "design").
-		Priority(90).
-		Usage("Use during implementation-validation when a design task changed colors, tokens, or themed styling and you need evidence that token discipline was preserved.").
-		Satisfies("Produces design-token findings that support inspector validation or designer review.").
-		ArrayParam("paths", "Go files to validate", "string", true).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			paths := extractPaths(input)
-			issues := validateTokenUsage(paths)
-			return analysisResult("validate_token_usage", issues), nil
-		}).
-		Build()
+// Phase 2.K / 10.B refactor (docs/PIPELINE_SKILL_REFACTOR.md §10.B):
+// validate_token_usage + validate_accessibility + validate_component_api
+// + validate_design_consistency collapsed into
+// validate_ui_compliance(aspect=…). One primitive, same underlying
+// scanners, one enum parameter tells it which compliance aspect to
+// evaluate. The old per-aspect skill names are gone; downstream
+// callers (quality-gate evaluation, validation plan) route legacy
+// names through aspect via legacyUIComplianceAspectForTool.
+const (
+	uiComplianceAspectTokens       = "tokens"
+	uiComplianceAspectAccessibility = "a11y"
+	uiComplianceAspectComponentAPI = "component_api"
+	uiComplianceAspectConsistency  = "consistency"
+)
+
+func uiComplianceAspects() []string {
+	return []string{
+		uiComplianceAspectTokens,
+		uiComplianceAspectAccessibility,
+		uiComplianceAspectComponentAPI,
+		uiComplianceAspectConsistency,
+	}
 }
 
-// ValidateAccessibilitySkill returns a skill that checks lipgloss foreground/
-// background pairs for WCAG AA contrast ratio compliance.
-func ValidateAccessibilitySkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("validate_accessibility").
-		Description("Check lipgloss color pairs for WCAG AA contrast ratio compliance (4.5:1 normal, 3:1 large).").
+// ValidateUIComplianceSkill returns a single primitive that dispatches
+// to the token, accessibility, component-API, or spacing-consistency
+// scanner based on the aspect parameter. Replaces the previous four
+// validate_* skills.
+func ValidateUIComplianceSkill(runner *ToolRunner) *skills.Skill {
+	return skills.NewSkill("validate_ui_compliance").
+		Description("Scan engineer-authored Go UI code for design-system compliance in the requested aspect. Collapses validate_token_usage, validate_accessibility, validate_component_api, and validate_design_consistency into one primitive dispatched by the aspect enum.").
 		Domain("design").
-		Keywords("accessibility", "wcag", "contrast", "a11y", "design").
+		Keywords("design", "token", "palette", "a11y", "accessibility", "wcag", "contrast", "component", "bubbletea", "consistency", "spacing", "margin").
 		Priority(90).
-		Usage("Use during implementation-validation when the task changed UI presentation and accessibility evidence is required.").
-		Satisfies("Produces accessibility findings that feed validation reports and design feedback.").
+		Usage("Set aspect=tokens|a11y|component_api|consistency. Run on the concrete UI scope under review, not the whole repo by default. Use during implementation-validation when the task changed UI code or design-system surfaces.").
+		Satisfies("Produces design-compliance findings for validation reports, quality gates, and downstream designer/engineer fixes.").
+		Avoid("Do not use during pre-implementation contract synthesis. Aspect must match the concern you actually have evidence for — a11y needs lipgloss fg/bg pairs, component_api needs BubbleTea model files, tokens/consistency need lipgloss styling code.").
+		EnumParam("aspect", "UI compliance aspect", uiComplianceAspects(), true).
 		ArrayParam("paths", "Go files to validate", "string", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			paths := extractPaths(input)
-			issues := validateAccessibility(paths)
-			return analysisResult("validate_accessibility", issues), nil
-		}).
-		Build()
-}
+			var params struct {
+				Aspect string   `json:"aspect"`
+				Paths  []string `json:"paths"`
+			}
+			_ = json.Unmarshal(input, &params)
+			aspect := strings.ToLower(strings.TrimSpace(params.Aspect))
+			if aspect == "" {
+				return nil, fmt.Errorf("aspect is required (expected one of: tokens, a11y, component_api, consistency)")
+			}
+			paths := params.Paths
+			if len(paths) == 0 {
+				return nil, fmt.Errorf("paths is required")
+			}
 
-// ValidateComponentAPISkill returns a skill that AST-scans BubbleTea components
-// for correct Init/Update/View signatures.
-func ValidateComponentAPISkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("validate_component_api").
-		Description("Scan BubbleTea components for Init/Update/View method signatures and tea.WindowSizeMsg handling.").
-		Domain("design").
-		Keywords("bubbletea", "component", "model", "update", "view", "design").
-		Priority(90).
-		Usage("Use during implementation-validation when component API correctness or framework conventions are part of the quality bar.").
-		Satisfies("Produces component-API findings for validation reports and downstream designer fixes.").
-		ArrayParam("paths", "Go files to validate", "string", true).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			paths := extractPaths(input)
-			issues := validateComponentAPI(paths)
-			return analysisResult("validate_component_api", issues), nil
-		}).
-		Build()
-}
-
-// ValidateDesignConsistencySkill returns a skill that checks for magic number
-// spacing/margin values in lipgloss calls.
-func ValidateDesignConsistencySkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("validate_design_consistency").
-		Description("Check for inconsistent spacing/margin magic numbers in lipgloss Padding/Margin calls.").
-		Domain("design").
-		Keywords("consistency", "spacing", "margin", "padding", "design").
-		Priority(90).
-		Usage("Use during implementation-validation when you need evidence that visual spacing and layout changes stayed aligned with the design system.").
-		Satisfies("Produces design-consistency findings for validation and review artifacts.").
-		ArrayParam("paths", "Go files to validate", "string", true).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			paths := extractPaths(input)
-			issues := validateDesignConsistency(paths)
-			return analysisResult("validate_design_consistency", issues), nil
+			var (
+				issues []ValidationIssue
+				label  string
+			)
+			switch aspect {
+			case uiComplianceAspectTokens:
+				label = "validate_token_usage"
+				issues = validateTokenUsage(paths)
+			case uiComplianceAspectAccessibility:
+				label = "validate_accessibility"
+				issues = validateAccessibility(paths)
+			case uiComplianceAspectComponentAPI:
+				label = "validate_component_api"
+				issues = validateComponentAPI(paths)
+			case uiComplianceAspectConsistency:
+				label = "validate_design_consistency"
+				issues = validateDesignConsistency(paths)
+			default:
+				return nil, fmt.Errorf("unknown aspect: %q (expected one of: tokens, a11y, component_api, consistency)", params.Aspect)
+			}
+			result := analysisResult(label, issues)
+			result["aspect"] = aspect
+			return result, nil
 		}).
 		Build()
 }

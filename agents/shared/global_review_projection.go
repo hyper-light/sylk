@@ -77,7 +77,7 @@ func QueryGlobalReviewStateSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Sk
 		Domain("global_review").
 		Keywords("state", "status", "review", "pending", "challenge", "introspect").
 		Priority(30).
-		Usage("Use whenever you need to decide between finalize_global_review, challenge_architect / challenge_global_tester / challenge_orchestrator / challenge_inspector, handoff_next, or process_validation — the projection shows which is legal right now.").
+		Usage("Use whenever you need to decide between finalize_global_review, challenge_global_agent(target=…), challenge_inspector, handoff_next, or process_validation — the projection shows which is legal right now.").
 		Satisfies("Surfaces the authoritative global review protocol state as a typed projection so the LLM sees the same facts the validator will evaluate.").
 		Handler(func(ctx context.Context, _ json.RawMessage) (any, error) {
 			state := GlobalReviewStateFromContext(ctx)

@@ -108,7 +108,20 @@
       "Bash(awk 'NR>=1500 && NR<=1656 && /^func/' /home/alundhe/Projects/sylk/cmd/tui.go)",
       "Bash(go clean *)",
       "Bash(awk '{print $2}')",
-      "WebFetch(domain:devblogs.microsoft.com)"
+      "WebFetch(domain:devblogs.microsoft.com)",
+      "Bash(awk 'NR<246 || NR>=542' agents/shared/pipeline_coordination.go)",
+      "Bash(mv /tmp/pipeline_coordination.go.new agents/shared/pipeline_coordination.go)",
+      "Bash(awk 'NR<482 || \\(NR>=534 && NR<567\\) || NR>=607' agents/inspector/pipeline/skills.go)",
+      "Bash(mv /tmp/isp.new agents/inspector/pipeline/skills.go)",
+      "Bash(mv agents/shared/fabric_claim_skill.go /tmp/)",
+      "Bash(mv agents/shared/fabric_work_event_skill.go /tmp/)",
+      "Bash(mv /tmp/fabric_claim_skill.go agents/shared/)",
+      "Bash(mv /tmp/fabric_work_event_skill.go agents/shared/)",
+      "Bash(awk '{print $NF}')",
+      "Bash(awk *)",
+      "Bash(perl -pi -e 's/`handoff_next`/`pipeline_protocol\\(action=handoff\\)`/g; s/`challenge_agent`/`pipeline_protocol\\(action=challenge\\)`/g; s/`validate_work`/`pipeline_protocol\\(action=validate\\)`/g; s/`process_validation`/`pipeline_protocol\\(action=process_validation\\)`/g; s/`finalize_pipeline`/`pipeline_protocol\\(action=finalize\\)`/g' /Users/adalundhe/Projects/sylk/prompts/inspector/system_skills.md /Users/adalundhe/Projects/sylk/prompts/inspector/system_protocol.md /Users/adalundhe/Projects/sylk/prompts/inspector/system.md /Users/adalundhe/Projects/sylk/prompts/tester/system_skills.md /Users/adalundhe/Projects/sylk/prompts/tester/system_guardrails.md /Users/adalundhe/Projects/sylk/prompts/tester/global_task_system.md /Users/adalundhe/Projects/sylk/prompts/tester/system.md)",
+      "Bash(perl -pi -e 's/`handoff_next`/`pipeline_protocol\\(action=handoff\\)`/g; s/`challenge_agent`/`pipeline_protocol\\(action=challenge\\)`/g; s/`validate_work`/`pipeline_protocol\\(action=validate\\)`/g; s/`process_validation`/`pipeline_protocol\\(action=process_validation\\)`/g; s/`finalize_pipeline`/`pipeline_protocol\\(action=finalize\\)`/g' /Users/adalundhe/Projects/sylk/agents/tester/shared/prompt_test.go)",
+      "Bash(perl -pi -e 's/`pipeline_protocol\\\\\\(action=validate\\\\\\)`/`validate_work`/g; s/`pipeline_protocol\\\\\\(action=process_validation\\\\\\)`/`process_validation`/g; s/`pipeline_protocol\\\\\\(action=handoff\\\\\\)`/`handoff_next`/g; s/`pipeline_protocol\\\\\\(action=challenge\\\\\\)`/`challenge_agent`/g; s/`pipeline_protocol\\\\\\(action=finalize\\\\\\)`/`finalize_pipeline`/g' /Users/adalundhe/Projects/sylk/prompts/architect/system.md /Users/adalundhe/Projects/sylk/prompts/architect/system_skills.md)"
     ]
   }
 }

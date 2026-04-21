@@ -46,7 +46,7 @@ func BuildWorkspaceViewContext(opts WorkspacePromptOptions) string {
 		b.WriteString("- Pipeline VFS: task-scoped unmerged in-progress work for the active pipeline.\n")
 	}
 	b.WriteString(fmt.Sprintf("\nDefault read/write tools for this agent operate on the `%s` view unless a tool explicitly says otherwise.\n", defaultView))
-	b.WriteString("Brokered execution tools such as `run_command` and `run_shell_script` execute against that same layered workspace view when strict execution is available, so they can read VFS-backed files before those changes are committed to disk.\n")
+	b.WriteString("The brokered `bash` execution tool runs against that same layered workspace view when strict execution is available, so scripts can read VFS-backed files before those changes are committed to disk.\n")
 	b.WriteString("Install/remediation tools such as `install_dependency_tooling` and `install_test_tooling` are the exception: they execute approved commands against the real disk workspace so dependencies and utilities persist outside VFS overlays.\n")
 	b.WriteString("Use `read_workspace_file`, `workspace_glob`, `workspace_grep`, `inspect_workspace_state`, and `summarize_workspace_state` whenever you need to compare disk against merged or task-local in-progress work.\n")
 	b.WriteString("If live disk and overlay state disagree, reconcile that path before recreating work or issuing another validation loop.\n")

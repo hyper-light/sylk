@@ -3,23 +3,18 @@ package designer
 import "testing"
 
 func TestDesignerVisibleSkillsIncludeDependencyInstallRemediation(t *testing.T) {
-	for _, want := range []string{
-		"research_dependency_install",
-		"install_dependency_tooling",
-		"run_command",
-		"run_shell_script",
-	} {
+	// Phase 2.K / GT-4 + GI-5 refactor: research_dependency_install +
+	// install_dependency_tooling collapsed into dependency(action=…).
+	for _, want := range []string{"dependency", "bash"} {
 		if !containsDesignerName(designerVisibleSkillNames(), want) {
 			t.Fatalf("designer visible skills missing %q", want)
 		}
 	}
-	if !containsDesignerName(designerMutatingSkillNames(), "install_dependency_tooling") {
-		t.Fatal("designer mutating skills missing install_dependency_tooling")
+	if !containsDesignerName(designerMutatingSkillNames(), "dependency") {
+		t.Fatal("designer mutating skills missing dependency")
 	}
-	for _, want := range []string{"run_command", "run_shell_script"} {
-		if !containsDesignerName(designerMutatingSkillNames(), want) {
-			t.Fatalf("designer mutating skills missing %q", want)
-		}
+	if !containsDesignerName(designerMutatingSkillNames(), "bash") {
+		t.Fatal("designer mutating skills missing bash")
 	}
 }
 

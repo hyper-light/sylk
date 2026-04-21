@@ -104,6 +104,15 @@ func (o *Orchestrator) registerFabricSkills() {
 		AgentID:    agentID,
 		AgentType:  agentType,
 		PipelineID: func() string { return "" },
+		RouteSync: shared.RouteSyncFromBus(
+			func() guide.EventBus { return o.bus },
+			func() string {
+				if o.channels == nil {
+					return ""
+				}
+				return o.channels.Responses
+			},
+		),
 	}) {
 		o.skills.Register(skill)
 	}

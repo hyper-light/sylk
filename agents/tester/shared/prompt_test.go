@@ -22,13 +22,13 @@ func TestPipelineTesterSystemPromptForWorkerAndContract_UsesTaskModePrompt(t *te
 		"# THE PIPELINE TESTER",
 		"Use them as the source of workflow truth.",
 		"## Core Testing Principles",
-		"If Inspector's criteria are ambiguous or untestable on a normal top-level turn, use `challenge_agent` to ask for clarification instead of guessing.",
-		"Your first `challenge_agent` call to Engineer, Designer, or Inspector is allowed.",
+		"If Inspector's criteria are ambiguous or untestable on a normal top-level turn, use `pipeline_protocol(action=challenge)` to ask for clarification instead of guessing.",
+		"Your first `pipeline_protocol(action=challenge)` call to Engineer, Designer, or Inspector is allowed.",
 		"Re-challenge Inspector only after Inspector answered your prior challenge and you then changed pipeline VFS state yourself based on that answer.",
-		"`handoff_next` is the normal top-level transport step.",
-		"`validate_work` is the challenge-response transport step.",
-		"`tester_forest_get_test_targets`",
-		"`tester_forest_get_failure_clusters`",
+		"`pipeline_protocol(action=handoff)` is the normal top-level transport step",
+		"`pipeline_protocol(action=validate)`",
+		"`tester_forest_consult(purpose=get_test_targets, query=…)`",
+		"`tester_forest_consult(purpose=get_failure_clusters, query=…)`",
 		"Test Categories:",
 		"## SAFETY CONSTRAINTS AND RULES",
 	} {
@@ -52,8 +52,8 @@ func TestGlobalTesterSystemPromptForContract_UsesTaskModePrompt(t *testing.T) {
 	for _, want := range []string{
 		"# THE GLOBAL TESTER",
 		"Use it as the source of workflow truth.",
-		"`tester_forest_get_test_targets`",
-		"`tester_forest_get_failure_clusters`",
+		"`tester_forest_consult(purpose=get_test_targets, query=…)`",
+		"`tester_forest_consult(purpose=get_failure_clusters, query=…)`",
 		"## Core Global Testing Principles",
 		"## SAFETY CONSTRAINTS AND RULES",
 	} {
@@ -98,8 +98,8 @@ func TestGlobalTesterSystemPrompt_IncludesGlobalReviewProtocolGuidance(t *testin
 	for _, want := range []string{
 		"## GLOBAL REVIEW PROTOCOL",
 		"Treat normal top-level global testing turns as ordinary handoffs.",
-		"Treat active challenge turns as narrower follow-up work. Answer those turns with `validate_work`",
-		"`tester_forest_get_test_targets`",
+		"Treat active challenge turns as narrower follow-up work. Answer those turns with `pipeline_protocol(action=validate)`",
+		"`tester_forest_consult(purpose=get_test_targets, query=…)`",
 		"### When Responding To The Global Inspector",
 	} {
 		if !strings.Contains(prompt, want) {

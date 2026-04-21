@@ -8,19 +8,21 @@ import (
 )
 
 func archivalistVisibleSkillNames() []string {
+	// Post-consolidation visible surface:
+	//   archivalist_query   — briefing / patterns / failures / context /
+	//                         file_state / conflicts (6 verbs → 1)
+	//   archivalist_record  — pattern / failure (2 verbs → 1)
+	//   archivalist_intent  — declare / complete (2 verbs → 1)
+	// The legacy per-verb names (ToolGetBriefing, ToolQueryPatterns, …)
+	// remain registered skills so internal callers and tests can keep
+	// exercising them by name; they are intentionally not exposed to
+	// the LLM catalog — the LLM picks kind/action on the façade.
 	return []string{
-		ToolGetBriefing,
-		ToolQueryPatterns,
-		ToolQueryFailures,
-		ToolQueryContext,
-		ToolQueryFileState,
+		ToolArchivalistQuery,
+		ToolArchivalistRecord,
+		ToolArchivalistIntent,
 		"consult",
-		ToolRecordPattern,
-		ToolRecordFailure,
 		ToolUpdateFileState,
-		ToolDeclareIntent,
-		ToolCompleteIntent,
-		ToolGetConflicts,
 		"knowledge_query",
 		"knowledge_memory",
 	}
@@ -35,11 +37,9 @@ func archivalistVisibleSkillNamesForRegistry(registry *skills.Registry) []string
 func archivalistMutatingSkillNames() []string {
 	return shared.AppendMemoryForestMutatingSkillNames([]string{
 		"store",
-		ToolRecordPattern,
-		ToolRecordFailure,
+		ToolArchivalistRecord,
+		ToolArchivalistIntent,
 		ToolUpdateFileState,
-		ToolDeclareIntent,
-		ToolCompleteIntent,
 		"store_research_paper",
 		"route_to",
 		"reply_to",

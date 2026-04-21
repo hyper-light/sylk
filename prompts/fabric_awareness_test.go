@@ -39,7 +39,7 @@ func TestFabricInspectorAuditPromptIsLoadable(t *testing.T) {
 	}
 	for _, want := range []string{
 		"inspect_open_activity",
-		"request_correction",
+		"challenge_peer",
 		"request_override",
 	} {
 		if !strings.Contains(got, want) {

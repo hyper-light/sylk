@@ -157,17 +157,18 @@ func (gi *GlobalInspector) buildAuditPrompt(req *shared.LayerAuditRequest) strin
 	}
 
 	prompt += "\nRun the analysis tools you actually need on the modified files, " +
-		"check cross-file coherence with `cross_reference_changes`, " +
-		"validate plan adherence with `validate_plan_adherence`, and " +
-		"grade the layer with `grade_layer_quality` once you have the evidence. " +
+		"check cross-file coherence with `audit(aspect=cross_references)`, " +
+		"validate plan adherence with `audit(aspect=plan_adherence)`, and " +
+		"grade the layer with `audit(aspect=layer_quality)` once you have the evidence. " +
+		"Use `audit(aspect=context_load)` to recover missing plan context from disk when needed. " +
 		"Escalate any blocking findings.\n\n" +
 		"## Terminal Action\n\n" +
 		"This audit turn ends with a global-review protocol action — never with prose alone. " +
 		"Once you have enough evidence to decide, choose exactly one:\n" +
 		"- `handoff_next` to `tester-global` for tester-backed validation of the merged surface (the normal exit path).\n" +
-		"- `challenge_global_tester`, `challenge_architect`, or `challenge_orchestrator` for a targeted, narrower follow-up question.\n" +
-		"- `finalize_global_review` only when this is the final whole-plan stage and the audit is closure-ready.\n" +
-		"- `commit_to_disk` only after `finalize_global_review` has returned ready-for-commit on a passing tester-backed review.\n\n" +
+		"- `challenge_global_agent` (target ∈ {global-tester, architect, orchestrator}) for a targeted, narrower follow-up question.\n" +
+		"- `global_review(action=finalize)` only when this is the final whole-plan stage and the audit is closure-ready.\n" +
+		"- `global_review(action=commit)` only after `global_review(action=finalize)` has returned ready-for-commit on a passing tester-backed review.\n\n" +
 		"Do not loop on additional analysis tools after you already have enough evidence to take one of these actions. " +
 		"Do not narrate the handoff in place of invoking it."
 

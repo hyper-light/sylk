@@ -477,16 +477,24 @@ func (a *Architect) handleReadResearchAction(ctx context.Context, req *guide.Act
 	if req == nil {
 		return nil
 	}
-	payload, err := json.Marshal(req.Data)
+	// Phase 2.6 refactor: read_research_paper collapsed into
+	// academic_research(action=read). Inject the action field into
+	// the incoming payload and invoke the merged skill.
+	data, _ := req.Data.(map[string]any)
+	if data == nil {
+		data = map[string]any{}
+	}
+	data["action"] = "read"
+	payload, err := json.Marshal(data)
 	if err != nil {
 		return a.publishActionFailure(req, err)
 	}
-	result := a.InvokeSkill(ctx, "read_research_paper", payload)
+	result := a.InvokeSkill(ctx, "academic_research", payload)
 	if req.FireAndForget {
 		return nil
 	}
 	if result == nil {
-		return a.publishActionFailure(req, fmt.Errorf("read_research_paper returned nil result"))
+		return a.publishActionFailure(req, fmt.Errorf("academic_research returned nil result"))
 	}
 	if !result.Success {
 		return a.publishActionFailure(req, errors.New(result.Error))

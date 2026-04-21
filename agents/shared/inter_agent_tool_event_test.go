@@ -2,6 +2,75 @@ package shared
 
 import "testing"
 
+func TestDeriveInterAgentToolEvent_ConsultPeerResolvesTargetFromTargetAgentType(t *testing.T) {
+	// consult_peer names its addressee via `target_agent_type`. Prior to
+	// this classifier fix the derivation returned nil (the switch fell
+	// through firstKnownAgentInName("peer") with no match), the tool call
+	// carried no InterAgent metadata, and the UI rendered it as a plain
+	// tool-call row without nested children — visible in the chat panel
+	// as a 1–2 ms dispatch with no stitching path.
+	start := DeriveInterAgentToolEvent(
+		"consult_peer",
+		`{"target_agent_type":"librarian","query":"Any prior art for quota enforcement in this codebase?"}`,
+		"",
+		ToolCallStart,
+		false,
+		"",
+	)
+	if start == nil {
+		t.Fatal("expected consult_peer start metadata")
+	}
+	if start.Kind != InterAgentToolEventKindConsult {
+		t.Fatalf("consult_peer start kind = %q", start.Kind)
+	}
+	if len(start.AgentTypes) != 1 || start.AgentTypes[0] != "librarian" {
+		t.Fatalf("consult_peer start targets = %#v", start.AgentTypes)
+	}
+	if start.Status != InterAgentToolEventStatusPending {
+		t.Fatalf("consult_peer start status = %q", start.Status)
+	}
+	if start.Summary != "Any prior art for quota enforcement in this codebase?" {
+		t.Fatalf("consult_peer start summary = %q", start.Summary)
+	}
+
+	done := DeriveInterAgentToolEvent(
+		"consult_peer",
+		`{"target_agent_type":"librarian","query":"Any prior art?"}`,
+		`{"consult_id":"act-123","status":"completed","response":{"user_message":"Found two related modules."}}`,
+		ToolCallComplete,
+		true,
+		"",
+	)
+	if done == nil {
+		t.Fatal("expected consult_peer completion metadata")
+	}
+	if len(done.AgentTypes) != 1 || done.AgentTypes[0] != "librarian" {
+		t.Fatalf("consult_peer done targets = %#v", done.AgentTypes)
+	}
+	if done.Status != InterAgentToolEventStatusDone {
+		t.Fatalf("consult_peer done status = %q", done.Status)
+	}
+}
+
+func TestDeriveInterAgentToolEvent_ConsultPeerCrossPipelineTargetAgentType(t *testing.T) {
+	// target_pipeline_id is an addressing parameter, not an agent type;
+	// AgentTypes should still resolve to target_agent_type alone.
+	meta := DeriveInterAgentToolEvent(
+		"consult_peer",
+		`{"target_agent_type":"engineer","target_pipeline_id":"pipe-42","query":"How are you handling retry semantics?"}`,
+		"",
+		ToolCallStart,
+		false,
+		"",
+	)
+	if meta == nil {
+		t.Fatal("expected consult_peer cross-pipeline metadata")
+	}
+	if len(meta.AgentTypes) != 1 || meta.AgentTypes[0] != "engineer" {
+		t.Fatalf("cross-pipeline targets = %#v", meta.AgentTypes)
+	}
+}
+
 func TestDeriveInterAgentToolEvent_ConsultSingleAndPrePlanning(t *testing.T) {
 	start := DeriveInterAgentToolEvent(
 		"consult",

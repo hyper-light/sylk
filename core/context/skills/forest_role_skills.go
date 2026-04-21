@@ -388,10 +388,18 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	},
 }
 
+// roleForestSkillNames returns the collapsed `<role>_forest_consult`
+// skill names — one per role domain — that replace the historical
+// per-purpose `<role>_forest_*` skills. Phase 2.K / 10.G refactor.
 func roleForestSkillNames() []string {
+	seen := make(map[string]struct{}, len(forestRoleSkillSpecs))
 	names := make([]string, 0, len(forestRoleSkillSpecs))
 	for _, spec := range forestRoleSkillSpecs {
-		names = append(names, spec.Name)
+		if _, ok := seen[spec.Domain]; ok {
+			continue
+		}
+		seen[spec.Domain] = struct{}{}
+		names = append(names, collapsedRoleForestSkillName(spec.Domain))
 	}
 	return names
 }
@@ -409,16 +417,29 @@ func roleForestDomains() []string {
 	return domains
 }
 
+// RegisterRoleForestSkills registers the collapsed per-role
+// `<role>_forest_consult(purpose=…)` skills for every role that has
+// specs. Phase 2.K / 10.G: replaces the pre-collapse loop that
+// registered each spec under its own name. Keeps the same entry point
+// used by RegisterAdaptiveRetrievalSkills.
 func RegisterRoleForestSkills(registry *skills.Registry, deps *RetrievalDependencies) error {
 	if registry == nil || deps == nil || deps.Forest == nil {
 		return nil
 	}
+	roleSpecs := make(map[string][]forestRoleSkillSpec)
+	roleOrder := make([]string, 0)
 	for _, spec := range forestRoleSkillSpecs {
-		skill := NewRoleForestSkill(deps, spec)
-		if err := registry.Register(skill); err != nil {
-			return fmt.Errorf("failed to register %s: %w", spec.Name, err)
+		if _, ok := roleSpecs[spec.Domain]; !ok {
+			roleOrder = append(roleOrder, spec.Domain)
 		}
-		registry.Load(spec.Name)
+		roleSpecs[spec.Domain] = append(roleSpecs[spec.Domain], spec)
+	}
+	for _, role := range roleOrder {
+		skill := NewRoleForestConsultSkill(deps, role, roleSpecs[role])
+		if err := registry.Register(skill); err != nil {
+			return fmt.Errorf("failed to register %s: %w", skill.Name, err)
+		}
+		registry.Load(skill.Name)
 	}
 	return nil
 }
@@ -432,17 +453,48 @@ func registerRoleForestSkillsForAgentIntegration(
 		return nil
 	}
 	agentType = NormalizeAdaptiveAgentType(agentType)
+	// Phase 2.K / 10.G refactor (docs/PIPELINE_SKILL_REFACTOR.md §10.G):
+	// group the per-role specs by domain and emit ONE collapsed skill
+	// per role — `<role>_forest_consult(purpose=…)`. The purpose enum
+	// values are the spec name suffixes (e.g. "get_test_targets",
+	// "get_failure_clusters") so semantic cueing is preserved. Handler
+	// bodies for all specs were already identical (declarative over
+	// forestRoleSkillSpec); the collapse simply shifts enum dispatch
+	// from name-based to parameter-based.
+	roleSpecs := make(map[string][]forestRoleSkillSpec)
+	roleOrder := make([]string, 0)
 	for _, spec := range forestRoleSkillSpecs {
 		if !roleForestSpecMatchesAgent(spec, agentType) {
 			continue
 		}
-		skill := NewRoleForestSkill(deps, spec)
-		if err := registry.Register(skill); err != nil {
-			return fmt.Errorf("failed to register %s: %w", spec.Name, err)
+		if _, ok := roleSpecs[spec.Domain]; !ok {
+			roleOrder = append(roleOrder, spec.Domain)
 		}
-		registry.Load(spec.Name)
+		roleSpecs[spec.Domain] = append(roleSpecs[spec.Domain], spec)
+	}
+	for _, role := range roleOrder {
+		specs := roleSpecs[role]
+		skill := NewRoleForestConsultSkill(deps, role, specs)
+		if err := registry.Register(skill); err != nil {
+			return fmt.Errorf("failed to register %s: %w", skill.Name, err)
+		}
+		registry.Load(skill.Name)
 	}
 	return nil
+}
+
+// collapsedRoleForestSkillName returns the unified `<role>_forest_consult`
+// skill name for a given role family.
+func collapsedRoleForestSkillName(role string) string {
+	return role + "_forest_consult"
+}
+
+// forestConsultPurposeForSpec returns the purpose enum value for a given
+// per-spec skill — the original skill name with the role prefix stripped.
+// e.g. "tester_forest_get_test_targets" → "get_test_targets".
+func forestConsultPurposeForSpec(spec forestRoleSkillSpec) string {
+	prefix := spec.Domain + "_forest_"
+	return strings.TrimPrefix(spec.Name, prefix)
 }
 
 func roleForestSpecMatchesAgent(spec forestRoleSkillSpec, agentType string) bool {
@@ -451,6 +503,181 @@ func roleForestSpecMatchesAgent(spec forestRoleSkillSpec, agentType string) bool
 		return true
 	}
 	return spec.Domain == AgentTypeScribe && strings.HasPrefix(agentType, AgentTypeScribe)
+}
+
+// NewRoleForestConsultSkill builds the collapsed per-role
+// `<role>_forest_consult(purpose=…)` skill that replaces the
+// historical per-spec `<role>_forest_<action>` skills. Each spec's
+// descriptive metadata becomes one enum value of `purpose`; the
+// handler dispatches to the same underlying code path as the original
+// NewRoleForestSkill handler (which was already declarative over
+// forestRoleSkillSpec — see the pre-§10.G code).
+func NewRoleForestConsultSkill(deps *RetrievalDependencies, role string, specs []forestRoleSkillSpec) *skills.Skill {
+	name := collapsedRoleForestSkillName(role)
+	purposeEnum := make([]string, 0, len(specs))
+	specByPurpose := make(map[string]forestRoleSkillSpec, len(specs))
+	var purposeLines strings.Builder
+	keywordSet := map[string]struct{}{"forest": {}, "consult": {}, role: {}}
+	keywordOrder := []string{"forest", "consult", role}
+	for _, spec := range specs {
+		purpose := forestConsultPurposeForSpec(spec)
+		purposeEnum = append(purposeEnum, purpose)
+		specByPurpose[purpose] = spec
+		fmt.Fprintf(&purposeLines, "  - purpose=%q: %s\n", purpose, spec.Description)
+		for _, kw := range spec.Keywords {
+			if _, ok := keywordSet[kw]; !ok {
+				keywordSet[kw] = struct{}{}
+				keywordOrder = append(keywordOrder, kw)
+			}
+		}
+	}
+	description := fmt.Sprintf(
+		"Memory Forest consultation for the %s role. Run a retrieval or prediction query against the per-role tree families, selected by the purpose enum. Collapses the historical per-purpose %s_forest_* skills into one primitive.\n\nPurposes:\n%s",
+		role, role, purposeLines.String(),
+	)
+	b := skills.NewSkill(name).
+		Description(description).
+		Domain(role).
+		Keywords(keywordOrder...).
+		Priority(95).
+		EnumParam("purpose", "Which role-specific forest query to run.", purposeEnum, true).
+		StringParam("query", "Natural language description of the current task or concern", true).
+		StringParam("session_id", "Optional session identifier for session-scoped retrieval", false).
+		StringParam("task_id", "Optional task identifier for task-scoped retrieval", false).
+		StringParam("agent_id", "Optional concrete agent identifier", false).
+		StringParam("intent_id", "Optional explicit intent identifier", false).
+		EnumParam("horizon", "Optional canopy horizon: turn, task, session, user, or project.", []string{
+			string(forest.CanopyHorizonTurn),
+			string(forest.CanopyHorizonSession),
+			string(forest.CanopyHorizonTask),
+			string(forest.CanopyHorizonUser),
+			string(forest.CanopyHorizonProject),
+		}, false).
+		IntParam("limit", "Maximum number of branch packets to return", false).
+		BoolParam("include_counter_evidence", "Whether to include contradictory evidence in the returned packets (retrieval purposes only; ignored for predict purposes)", false)
+
+	usageParts := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		if spec.Usage != "" {
+			usageParts = append(usageParts, fmt.Sprintf("purpose=%s: %s", forestConsultPurposeForSpec(spec), spec.Usage))
+		}
+	}
+	if len(usageParts) > 0 {
+		b = b.Usage(strings.Join(usageParts, " // "))
+	}
+	for _, spec := range specs {
+		for _, practice := range spec.BestPractices {
+			b = b.BestPractice(fmt.Sprintf("[purpose=%s] %s", forestConsultPurposeForSpec(spec), practice))
+		}
+	}
+
+	return b.Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+		if deps == nil || deps.Forest == nil {
+			return nil, fmt.Errorf("forest is not configured")
+		}
+
+		var params struct {
+			Purpose                string `json:"purpose"`
+			Query                  string `json:"query"`
+			SessionID              string `json:"session_id,omitempty"`
+			TaskID                 string `json:"task_id,omitempty"`
+			AgentID                string `json:"agent_id,omitempty"`
+			IntentID               string `json:"intent_id,omitempty"`
+			Horizon                string `json:"horizon,omitempty"`
+			Limit                  int    `json:"limit,omitempty"`
+			IncludeCounterEvidence *bool  `json:"include_counter_evidence,omitempty"`
+		}
+		if err := json.Unmarshal(input, &params); err != nil {
+			return nil, fmt.Errorf("invalid input: %w", err)
+		}
+		purpose := strings.TrimSpace(params.Purpose)
+		if purpose == "" {
+			return nil, fmt.Errorf("purpose is required (expected one of: %s)", strings.Join(purposeEnum, ", "))
+		}
+		spec, ok := specByPurpose[purpose]
+		if !ok {
+			return nil, fmt.Errorf("unknown purpose %q (expected one of: %s)", params.Purpose, strings.Join(purposeEnum, ", "))
+		}
+		if strings.TrimSpace(params.Query) == "" {
+			return nil, fmt.Errorf("query is required")
+		}
+		sessionID, taskID := resolveForestSkillScope(ctx, params.SessionID, params.TaskID)
+
+		horizon, err := resolveForestSkillHorizon(params.Horizon, sessionID, taskID)
+		if err != nil {
+			return nil, err
+		}
+
+		query := forest.Query{
+			Query:                  strings.TrimSpace(params.Query),
+			SessionID:              sessionID,
+			TaskID:                 taskID,
+			AgentID:                strings.TrimSpace(params.AgentID),
+			AgentType:              spec.Domain,
+			IntentID:               strings.TrimSpace(params.IntentID),
+			Horizon:                horizon,
+			Limit:                  resolveRoleForestLimit(params.Limit, spec.DefaultLimit),
+			Families:               append([]forest.TreeFamily(nil), spec.Families...),
+			IncludeCounterEvidence: resolveRoleCounterEvidence(params.IncludeCounterEvidence, spec.IncludeCounterEvidence),
+		}
+		intentInput := forest.ResolveIntentInput{
+			Query:     query.Query,
+			SessionID: query.SessionID,
+			TaskID:    query.TaskID,
+			AgentID:   query.AgentID,
+			AgentType: spec.Domain,
+			IntentID:  query.IntentID,
+			Limit:     query.Limit,
+			Horizon:   query.Horizon,
+		}
+
+		var (
+			intent   *forest.IntentResolution
+			packets  []*forest.BranchPacket
+			firstErr error
+			mu       sync.Mutex
+			wg       sync.WaitGroup
+		)
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			resolution, resolveErr := deps.Forest.ResolveIntent(ctx, intentInput)
+			mu.Lock()
+			defer mu.Unlock()
+			if resolveErr != nil && firstErr == nil {
+				firstErr = resolveErr
+				return
+			}
+			intent = resolution
+		}()
+		go func() {
+			defer wg.Done()
+			var packetsErr error
+			if spec.Predict {
+				packets, packetsErr = deps.Forest.PredictNextBranches(ctx, query)
+			} else {
+				packets, packetsErr = deps.Forest.Retrieve(ctx, query)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if packetsErr != nil && firstErr == nil {
+				firstErr = packetsErr
+			}
+		}()
+		wg.Wait()
+		if firstErr != nil {
+			return nil, firstErr
+		}
+
+		return &ForestRoleOutput{
+			Role:    spec.Domain,
+			Intent:  intent,
+			Packets: packets,
+			Focus:   buildRoleForestFocus(intent, packets),
+		}, nil
+	}).
+		Build()
 }
 
 // NewRoleForestSkill creates a role-appropriate forest skill from a declarative spec.

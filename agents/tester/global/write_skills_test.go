@@ -16,19 +16,23 @@ import (
 func TestGlobalTesterWriteSkillsUseLeasedGlobalWrites(t *testing.T) {
 	gt, fa, ctx := newGlobalTesterWriteHarness(t)
 
+	// Phase 2.K / GT-2 refactor: write_integration_test + write_e2e_test
+	// collapsed into write_test(level=…).
 	cases := []struct {
-		skillName string
-		output    string
+		name   string
+		level  string
+		output string
 	}{
-		{skillName: "write_test", output: "pkg/service/service_test.go"},
-		{skillName: "write_integration_test", output: "pkg/service/service_integration_test.go"},
-		{skillName: "write_e2e_test", output: "pkg/service/service_e2e_test.go"},
+		{name: "write_test_unit", level: "unit", output: "pkg/service/service_test.go"},
+		{name: "write_test_integration", level: "integration", output: "pkg/service/service_integration_test.go"},
+		{name: "write_test_e2e", level: "e2e", output: "pkg/service/service_e2e_test.go"},
 	}
 
 	for _, tc := range cases {
-		t.Run(tc.skillName, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			basis := prepareGlobalWriteBasis(t, gt, ctx, tc.output)
 			input, err := json.Marshal(map[string]any{
+				"level": tc.level,
 				"test_case": map[string]any{
 					"name":        "TestService",
 					"target_file": "pkg/service/service.go",
@@ -42,9 +46,9 @@ func TestGlobalTesterWriteSkillsUseLeasedGlobalWrites(t *testing.T) {
 				t.Fatalf("Marshal: %v", err)
 			}
 
-			result := gt.skills.Invoke(ctx, tc.skillName, input)
+			result := gt.skills.Invoke(ctx, "write_test", input)
 			if !result.Success {
-				t.Fatalf("%s failed: %s", tc.skillName, result.Error)
+				t.Fatalf("write_test(level=%s) failed: %s", tc.level, result.Error)
 			}
 
 			data, ok := result.Data.(map[string]any)
@@ -53,7 +57,7 @@ func TestGlobalTesterWriteSkillsUseLeasedGlobalWrites(t *testing.T) {
 			}
 			nextBasisRaw, ok := data["next_basis"]
 			if !ok {
-				t.Fatalf("%s result missing next_basis", tc.skillName)
+				t.Fatalf("write_test(level=%s) result missing next_basis", tc.level)
 			}
 			nextBasis, ok := nextBasisRaw.(*versioning.WorkspaceWriteBasis)
 			if !ok {
@@ -62,13 +66,16 @@ func TestGlobalTesterWriteSkillsUseLeasedGlobalWrites(t *testing.T) {
 			if nextBasis.Scope != versioning.WorkspaceWriteScopeGlobal {
 				t.Fatalf("next_basis scope = %q, want %q", nextBasis.Scope, versioning.WorkspaceWriteScopeGlobal)
 			}
+			if gotLevel, _ := data["level"].(string); gotLevel != tc.level {
+				t.Fatalf("result level = %q, want %q", gotLevel, tc.level)
+			}
 
 			content, err := fa.ReadFile(ctx, tc.output)
 			if err != nil {
 				t.Fatalf("ReadFile: %v", err)
 			}
 			if string(content) == "" {
-				t.Fatalf("%s wrote empty content", tc.skillName)
+				t.Fatalf("write_test(level=%s) wrote empty content", tc.level)
 			}
 		})
 	}
@@ -149,17 +156,20 @@ func TestGlobalTesterWriteTestAutoRenewsExpiredLeaseWithVisibleInternalToolSteps
 		t.Fatalf("write_test failed: %s", result.Error)
 	}
 
-	if !hasGlobalToolEvent(emitted, "write_global_file", agentshared.ToolCallStart, false) {
-		t.Fatalf("expected write_global_file start event, got %#v", emitted)
+	// prepare_write_context folded into workspace_read(op=prepare_write);
+	// both the prep and the write now emit under workspace_read /
+	// workspace_write tool names.
+	if !hasGlobalToolEvent(emitted, "workspace_write", agentshared.ToolCallStart, false) {
+		t.Fatalf("expected workspace_write start event, got %#v", emitted)
 	}
-	if !hasGlobalToolEvent(emitted, "prepare_global_write_context", agentshared.ToolCallStart, false) {
-		t.Fatalf("expected prepare_global_write_context start event, got %#v", emitted)
+	if !hasGlobalToolEvent(emitted, "workspace_read", agentshared.ToolCallStart, false) {
+		t.Fatalf("expected workspace_read(op=prepare_write) start event, got %#v", emitted)
 	}
-	if !hasGlobalToolEvent(emitted, "prepare_global_write_context", agentshared.ToolCallComplete, true) {
-		t.Fatalf("expected successful prepare_global_write_context completion event, got %#v", emitted)
+	if !hasGlobalToolEvent(emitted, "workspace_read", agentshared.ToolCallComplete, true) {
+		t.Fatalf("expected successful workspace_read(op=prepare_write) completion event, got %#v", emitted)
 	}
-	if !hasGlobalToolEvent(emitted, "write_global_file", agentshared.ToolCallComplete, true) {
-		t.Fatalf("expected successful write_global_file completion after refresh, got %#v", emitted)
+	if !hasGlobalToolEvent(emitted, "workspace_write", agentshared.ToolCallComplete, true) {
+		t.Fatalf("expected successful workspace_write completion after refresh, got %#v", emitted)
 	}
 }
 
@@ -210,13 +220,19 @@ func prepareGlobalWriteBasis(
 ) versioning.WorkspaceWriteBasis {
 	t.Helper()
 
-	input, err := json.Marshal(map[string]any{"path": path})
+	// Phase 2.K / CR-2: route through workspace_read(op=prepare_write)
+	// which carries the write preflight after the fold.
+	input, err := json.Marshal(map[string]any{
+		"op":    "prepare_write",
+		"scope": string(versioning.WorkspaceWriteScopeGlobal),
+		"path":  path,
+	})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	result := gt.skills.Invoke(ctx, "prepare_global_write_context", input)
+	result := gt.skills.Invoke(ctx, "workspace_read", input)
 	if !result.Success {
-		t.Fatalf("prepare_global_write_context failed: %s", result.Error)
+		t.Fatalf("workspace_read(op=prepare_write) failed: %s", result.Error)
 	}
 	prepared, ok := result.Data.(versioning.PreparedWorkspaceWriteContext)
 	if !ok {

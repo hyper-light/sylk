@@ -7,13 +7,18 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
+// genericForestSkillNames lists the forest query surface for every
+// agent's visible catalog. The four read-side verbs collapsed into a
+// single `forest(op=resolve_intent|recall|recall_recent|predict_next)`
+// so the LLM sees one name and selects the op.
 var genericForestSkillNames = []string{
-	"forest_resolve_intent",
-	"forest_recall",
-	"recall_recent",
-	"forest_predict_next_branches",
+	"forest",
 }
 
+// forestMutatingSkillNames lists the write-side forest skill.
+// forest_record_outcome stays a distinct name — the write semantics
+// deserve their own catalog entry rather than hiding inside the
+// read verb's op enum.
 var forestMutatingSkillNames = []string{
 	"forest_record_outcome",
 }
@@ -40,11 +45,11 @@ func registerGenericForestSkills(registry *skills.Registry, deps *RetrievalDepen
 	if registry == nil || deps == nil || deps.Forest == nil {
 		return nil
 	}
+	// Consolidated read-side verb + the single write-side verb. The
+	// per-op builders above stay exported for direct programmatic use
+	// but are no longer registered on the LLM-visible catalog.
 	for _, skill := range []*skills.Skill{
-		NewForestResolveIntentSkill(deps),
-		NewForestRecallSkill(deps),
-		NewRecallRecentSkill(deps),
-		NewForestPredictNextSkill(deps),
+		NewForestSkill(deps),
 		NewForestRecordOutcomeSkill(deps),
 	} {
 		if err := registry.Register(skill); err != nil {
@@ -77,13 +82,24 @@ func RegisterForestSkillsForAgent(
 
 // ForestSkillNamesForAgent returns the Memory Forest skills that should be
 // exposed to an agent with the given runtime type.
+//
+// Phase 2.K / 10.G refactor: the per-role skill-per-purpose pattern
+// collapsed into a single `<role>_forest_consult(purpose=…)` skill.
+// This helper now returns the collapsed name for each matching role
+// domain rather than one entry per historical spec.
 func ForestSkillNamesForAgent(agentType string) []string {
 	normalizedType := NormalizeAdaptiveAgentType(agentType)
 	names := append([]string(nil), genericForestSkillNames...)
+	seenRoles := make(map[string]struct{})
 	for _, spec := range forestRoleSkillSpecs {
-		if roleForestSpecMatchesAgent(spec, normalizedType) {
-			names = append(names, spec.Name)
+		if !roleForestSpecMatchesAgent(spec, normalizedType) {
+			continue
 		}
+		if _, ok := seenRoles[spec.Domain]; ok {
+			continue
+		}
+		seenRoles[spec.Domain] = struct{}{}
+		names = append(names, collapsedRoleForestSkillName(spec.Domain))
 	}
 	return names
 }

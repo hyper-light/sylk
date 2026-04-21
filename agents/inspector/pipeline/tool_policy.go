@@ -10,35 +10,24 @@ import (
 func pipelineInspectorVisibleSkillNames() []string {
 	base := agentShared.AppendMemoryForestVisibleSkillNames([]string{
 		"search_skills",
-		"read_file",
-		"diff_workspace_file",
-		"list_pipeline_changes",
-		"read_workspace_file",
-		"glob",
-		"workspace_glob",
-		"grep",
-		"workspace_grep",
-		"inspect_workspace_state",
-		"summarize_workspace_state",
-		"run_command",
-		"run_shell_script",
+		// Phase 2.K / CR-2: workspace read-side collapsed into workspace_read.
+		// Inspector does not get workspace_write or prepare_write_context —
+		// inspector's role is read + audit, not mutation. The safety hook
+		// in skills.go blocks mutation attempts.
+		"workspace_read",
+		"bash",
 		"define_criteria",
-		"get_validation_status",
-		"research_dependency_install",
-		"install_dependency_tooling",
-		"challenge_agent",
-		"handoff_next",
-		"validate_work",
-		"process_validation",
-		"finalize_pipeline",
+		// Phase 1 refactor: get_validation_status removed — derive from
+		// query_peer_activity(kinds=["validation_*"]) + query_pipeline_state.
+		// Phase 2.K / GT-4 + GI-5: collapsed into dependency(action=…).
+		"dependency",
+		// challenge_agent / handoff_next / validate_work /
+		// process_validation / finalize_pipeline collapsed into
+		// pipeline_protocol(action=challenge|handoff|validate|
+		// process_validation|finalize). handoff_to_ot remains distinct —
+		// it's inspector-only, the terminal commit-to-OT action.
+		"pipeline_protocol",
 		"handoff_to_ot",
-		"coord_query_view",
-		"coord_watch_updates",
-		"coord_claim_scope",
-		"coord_release_scope",
-		"coord_publish_artifact",
-		"coord_request_review",
-		"coord_resolve_artifact",
 	}, "inspector-pipeline")
 	// Inspector gets BOTH the awareness skills AND the audit-time
 	// inspect_open_activity. The audit skill is what makes the
@@ -49,26 +38,22 @@ func pipelineInspectorVisibleSkillNames() []string {
 
 func pipelineInspectorMutatingSkillNames() []string {
 	return agentShared.AppendMemoryForestMutatingSkillNames([]string{
-		"run_command",
-		"run_shell_script",
+		"bash",
 		"define_criteria",
-		"request_correction",
+		// Phase 1 refactor: request_correction removed. Use
+		// challenge_peer(target_activity_id=<failing artifact/decision>).
 		"request_override",
-		"install_dependency_tooling",
+		"dependency",
 		"challenge_agent",
 		"handoff_next",
 		"validate_work",
 		"process_validation",
 		"finalize_pipeline",
 		"handoff_to_ot",
-		"coord_claim_scope",
-		"coord_release_scope",
-		"coord_publish_artifact",
-		"coord_request_review",
-		"coord_resolve_artifact",
 		"reroute_request",
 	})
 }
+
 
 func pipelineInspectorToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {
 	return toolruntime.BuildManifestFromRegistry(toolruntime.ManifestBuildConfig{

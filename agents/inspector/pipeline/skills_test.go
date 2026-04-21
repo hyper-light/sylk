@@ -205,10 +205,10 @@ func TestStageInstructions_ImplementationPrefersSingleAuditCycle(t *testing.T) {
 
 	for _, want := range []string{
 		"Audit the returned work yourself before choosing the next protocol step",
-		"`handoff_next` for ordinary phase progression and `challenge_agent` only when a specific returned deliverable is unclear",
-		"`process_validation` immediately before choosing any next handoff, challenge, or closure action",
-		"Do not use `finalize_pipeline` as a substitute for that targeted audit work",
-		"When you do call `finalize_pipeline`, pass the strongest criteria, implementation, test, and challenge evidence",
+		"`pipeline_protocol(action=handoff)` for ordinary phase progression and `pipeline_protocol(action=challenge)` only when a specific returned deliverable is unclear",
+		"`pipeline_protocol(action=process_validation)` immediately before choosing any next handoff, challenge, or closure action",
+		"Do not use `pipeline_protocol(action=finalize)` as a substitute for that targeted audit work",
+		"When you do call `pipeline_protocol(action=finalize)`, pass the strongest criteria, implementation, test, and challenge evidence",
 		"Do not fan out into repeated audit or grading passes on unchanged workspace state",
 	} {
 		if !strings.Contains(instructions, want) {
@@ -229,12 +229,21 @@ func TestPipelineInspectorDefaultToolDefinitionsExcludeValidationAndGradeTools(t
 	})
 
 	names := toolDefinitionNames(pi.buildToolDefinitions())
-	for _, want := range []string{"search_skills", "define_criteria", "get_validation_status", "process_validation", "finalize_pipeline"} {
+	// Phase 1 refactor: get_validation_status removed — derive via
+	// query_peer_activity(kinds=["validation_*"]) + query_pipeline_state.
+	// process_validation and finalize_pipeline collapsed into
+	// pipeline_protocol(action=…); the per-verb skills stay in the
+	// registry but no longer surface on the default tool catalog.
+	for _, want := range []string{"search_skills", "define_criteria", "pipeline_protocol"} {
 		if !containsName(names, want) {
 			t.Fatalf("tool definitions missing %q: %v", want, names)
 		}
 	}
-	for _, blocked := range []string{"validate_criteria", "grade_task_quality", "run_linter", "run_type_checker", "run_security_scan", "prepare_pipeline_write_context", "write_pipeline_file", "edit_pipeline_file", "delete_pipeline_file", "create_pipeline_directory"} {
+	// Phase 2.K / CR-2 refactor: prepare_pipeline_write_context +
+	// write_*_pipeline_file / edit / delete / create_pipeline_directory
+	// collapsed into prepare_write_context + workspace_write. The old
+	// names are no longer registered on inspector-pipeline.
+	for _, blocked := range []string{"validate_criteria", "grade_task_quality", "run_linter", "run_type_checker", "run_security_scan", "prepare_pipeline_write_context", "write_pipeline_file", "edit_pipeline_file", "delete_pipeline_file", "create_pipeline_directory", "prepare_write_context", "workspace_write"} {
 		if containsName(names, blocked) {
 			t.Fatalf("default tool definitions unexpectedly exposed %q: %v", blocked, names)
 		}
@@ -252,19 +261,11 @@ func TestPipelineInspectorToolDefinitionsIncludeCoordinationTools(t *testing.T) 
 		}
 	})
 
+	// manage_claim + publish_work_event removed; coordination now flows
+	// through the Fabric's ambient_context + claims board + consult_peer.
 	names := toolDefinitionNames(pi.buildToolDefinitions())
-	for _, want := range []string{
-		"coord_query_view",
-		"coord_watch_updates",
-		"coord_claim_scope",
-		"coord_release_scope",
-		"coord_publish_artifact",
-		"coord_request_review",
-		"coord_resolve_artifact",
-	} {
-		if !containsName(names, want) {
-			t.Fatalf("tool definitions missing %q: %v", want, names)
-		}
+	if !containsName(names, "query_peer_activity") {
+		t.Fatalf("tool definitions missing %q: %v", "query_peer_activity", names)
 	}
 }
 
@@ -324,15 +325,19 @@ func TestPipelineInspectorSafetyHookBlocksPreparePipelineWriteContext(t *testing
 		}
 	})
 
+	// Phase 2.K / CR-2: prepare_pipeline_write_context collapsed into
+	// prepare_write_context. The old name is no longer in the active
+	// tool set; the safety hook now blocks prepare_write_context for
+	// inspector-pipeline via the not-permitted-to-execute path.
 	_, err = pi.executeToolCall(context.Background(), providers.ToolCall{
 		ID:        "tool_prepare_1",
-		Name:      "prepare_pipeline_write_context",
-		Arguments: `{"path":"audit/findings.md"}`,
+		Name:      "prepare_write_context",
+		Arguments: `{"scope":"pipeline","path":"audit/findings.md"}`,
 	})
 	if err == nil {
-		t.Fatal("expected prepare_pipeline_write_context to be blocked for pipeline inspector")
+		t.Fatal("expected prepare_write_context to be blocked for pipeline inspector")
 	}
-	if !strings.Contains(err.Error(), "not permitted for pipeline inspector") &&
+	if !strings.Contains(err.Error(), "not permitted") &&
 		!strings.Contains(err.Error(), "outside the active tool set") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -353,15 +358,10 @@ func newStubValidationPipelineInspector(t *testing.T, currentTaskID string) *Pip
 		steering:   agentShared.NewSteeringManager(),
 	}
 
-	for _, name := range []string{
-		"run_linter",
-		"run_type_checker",
-		"run_formatter_check",
-		"run_security_scan",
-		"analyze_complexity",
-	} {
-		registerStubPipelineInspectorSkill(t, pi.skills, name, "validation")
-	}
+	// Phase 2.K / GI-C: single run_analyzer stub replaces the five
+	// per-kind stubs. runValidationTool routes every legacy analyzer
+	// name through run_analyzer(kind=…).
+	registerStubPipelineInspectorSkill(t, pi.skills, "run_analyzer", "validation")
 	for _, name := range pipelineInspectorVisibleSkillNames() {
 		registerStubPipelineInspectorSkill(t, pi.skills, name, "system")
 	}

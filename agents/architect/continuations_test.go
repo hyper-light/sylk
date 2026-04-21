@@ -242,7 +242,7 @@ func TestGuardianControlPlane_RequestGrantQueuesGuideRoutedContinuation(t *testi
 		"guardian": {AgentID: "guardian-1", AgentType: "guardian"},
 	}
 	controlPlane := newArchitectGuardianControlPlane(a)
-	policy, ok := architectToolManifest().Policy("route_plan_acceptance")
+	policy, ok := architectToolManifest().Policy("plan_acceptance")
 	if !ok {
 		t.Fatal("expected route_plan_acceptance policy")
 	}
@@ -251,7 +251,7 @@ func TestGuardianControlPlane_RequestGrantQueuesGuideRoutedContinuation(t *testi
 		AgentID:           a.id,
 		CorrelationID:     "corr-1",
 		CapabilityScope:   architectToolManifest().CapabilityScope,
-		ToolName:          "route_plan_acceptance",
+		ToolName:          "plan_acceptance",
 		ToolID:            "tool-1",
 		Arguments:         `{"plan_id":"plan-1","user_response":"looks good"}`,
 		Input:             map[string]any{"plan_id": "plan-1", "user_response": "looks good"},

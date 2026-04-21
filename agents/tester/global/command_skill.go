@@ -9,12 +9,8 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
-func runCommandSkill(gt *GlobalTester) *skills.Skill {
-	return agentshared.NewRunCommandSkill(globalTesterCommandSkillConfig(gt))
-}
-
-func runShellScriptSkill(gt *GlobalTester) *skills.Skill {
-	return agentshared.NewRunShellScriptSkill(globalTesterCommandSkillConfig(gt))
+func bashSkill(gt *GlobalTester) *skills.Skill {
+	return agentshared.NewBashSkill(globalTesterCommandSkillConfig(gt))
 }
 
 func globalTesterCommandSkillConfig(gt *GlobalTester) agentshared.CommandSkillConfig {

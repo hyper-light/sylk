@@ -9,32 +9,36 @@ import (
 
 func librarianVisibleSkillNames() []string {
 	base := shared.AppendMemoryForestVisibleSkillNames([]string{
-		"search_codebase",
-		"find_pattern",
+		// Unified search verb covers search_codebase / find_pattern /
+		// find_symbol. The underlying builders stay registered for
+		// internal callers; the LLM picks `kind` to select the engine.
+		"search",
 		"consult",
-		"find_symbol",
-		// Layered reads only — every read tool requires a `view` parameter
-		// (disk / global / pipeline) so layer attribution is captured at
-		// the tool boundary. The bare read_file / glob / grep skills used
-		// to live alongside these as disk-only convenience wrappers, but
-		// LLM tool-name bias defeated the prompt's "use workspace_* for
-		// in-flight state" guidance every time and caused phantom
-		// "file not found" reports for files staged in the pipeline VFS.
-		// Removing the bare skills makes the wrong choice unrepresentable.
-		"read_workspace_file",
-		"workspace_glob",
-		"workspace_grep",
-		"inspect_workspace_state",
-		"summarize_workspace_state",
+		// Layered reads only — workspace_read always requires an explicit
+		// `view` parameter (disk / global / pipeline), so layer attribution
+		// is captured at the tool boundary. The bare read_file / glob /
+		// grep skills used to live alongside the per-op workspace reads
+		// as disk-only convenience wrappers, but LLM tool-name bias
+		// defeated the prompt's "use workspace_* for in-flight state"
+		// guidance every time and caused phantom "file not found"
+		// reports for files staged in the pipeline VFS. Collapsing the
+		// per-op surfaces into a single workspace_read verb makes the
+		// layerless choice unrepresentable.
+		"workspace_read",
 		"knowledge_search",
+		// Unified package verb covers clone_repository / list_packages /
+		// remove_package. `action` selects clone/list/remove.
+		"package",
 	}, "librarian")
 	return fabric.AppendFabricAwarenessSkillNames(base)
 }
 
 func librarianMutatingSkillNames() []string {
 	return shared.AppendMemoryForestMutatingSkillNames([]string{
-		"clone_repository",
-		"remove_package",
+		// The `package` façade's clone/remove actions write to disk;
+		// `list` does not, but the unified verb is marked mutating to
+		// match the most-permissive underlying action.
+		"package",
 		"reroute_request",
 	})
 }

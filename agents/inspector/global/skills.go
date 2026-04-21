@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
@@ -24,32 +23,24 @@ func (gi *GlobalInspector) registerCoreSkills() {
 		GetViews:      func() versioning.WorkspaceViewAccess { return gi.workspaceViews },
 	}
 
-	// Shared analysis skills.
-	gi.skills.Register(shared.RunLinterSkill(gi.toolRunner))
-	gi.skills.Register(shared.RunTypeCheckerSkill(gi.toolRunner))
-	gi.skills.Register(shared.RunFormatterCheckSkill(gi.toolRunner))
-	gi.skills.Register(shared.RunSecurityScanSkill(gi.toolRunner))
-	gi.skills.Register(shared.AnalyzeComplexitySkill(gi.toolRunner))
-	gi.skills.Register(shared.DetectDeadlocksSkill(gi.toolRunner))
-	gi.skills.Register(shared.DetectMemoryLeaksSkill(gi.toolRunner))
-	gi.skills.Register(runCommandSkill(gi))
-	gi.skills.Register(runShellScriptSkill(gi))
-	faFunc := func() shared.FileAccess { return gi.fileAccess }
-	gi.skills.Register(shared.ReadFileSkill(faFunc))
-	gi.skills.Register(shared.GlobSkill(faFunc))
-	gi.skills.Register(shared.GrepSkill(faFunc))
-	gi.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
-	gi.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
-	gi.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
-	gi.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
-	gi.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
-	gi.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil, nil))
-	gi.skills.Register(versioning.NewPrepareGlobalWriteContextSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
-	gi.skills.Register(versioning.NewListGlobalChangesSkill(func() versioning.FileAccess { return gi.fileAccess }))
-	gi.skills.Register(versioning.NewWriteGlobalFileSkill(writeCfg))
-	gi.skills.Register(versioning.NewEditGlobalFileSkill(writeCfg))
-	gi.skills.Register(versioning.NewDeleteGlobalFileSkill(writeCfg))
-	gi.skills.Register(versioning.NewCreateGlobalDirectorySkill(writeCfg))
+	// Phase 2.K / GI-C refactor: run_linter + run_type_checker +
+	// run_formatter_check + run_security_scan + analyze_complexity +
+	// detect_deadlocks + detect_memory_leaks collapsed into
+	// run_analyzer(kind=…).
+	gi.skills.Register(shared.RunAnalyzerSkill(gi.toolRunner))
+	gi.skills.Register(bashSkill(gi))
+	// read_file / glob / grep dropped — workspace_read covers all
+	// three via op=read|glob|grep with explicit view selection.
+	// Phase 2.K / CR-2 refactor: 12 workspace skills collapsed to 3
+	// verb-dispatched primitives.
+	inspectorGlobalGetViews := func() versioning.WorkspaceViewAccess { return gi.workspaceViews }
+	inspectorGlobalGetFA := func() versioning.FileAccess { return gi.fileAccess }
+	// prepare_write_context folded into workspace_read(op=prepare_write).
+	gi.skills.Register(versioning.NewWorkspaceReadSkill(versioning.WorkspaceReadSkillConfig{
+		GetViews:      inspectorGlobalGetViews,
+		GetFileAccess: inspectorGlobalGetFA,
+	}))
+	gi.skills.Register(versioning.NewWorkspaceWriteSkill(writeCfg))
 
 	// Global-specific skills. audit_layer is intentionally NOT registered as
 	// an LLM tool: it is the entry point of the inspector's own LLM tool
@@ -59,17 +50,34 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	// again. The audit prepass also requires NodeDiffs/NodeResults that the
 	// LLM cannot supply, so the LLM-callable form was always functionally
 	// degenerate.
-	gi.skills.Register(validatePlanAdherenceSkill(gi))
-	gi.skills.Register(crossReferenceChangesSkill(gi))
-	gi.skills.Register(gradeLayerQualitySkill(gi))
+	// Phase 2.K / GI-1 refactor (docs/PIPELINE_SKILL_REFACTOR.md §10.K.1):
+	// validate_plan_adherence + cross_reference_changes + grade_layer_quality
+	// + load_plan_context collapsed into audit(aspect=…). determine_audit_depth
+	// stays named because tool_loop.go enforces it as the MANDATORY first
+	// tool call on every fresh audit branch — keeping that gate robust
+	// means keeping the landmark visible under its own name.
+	gi.skills.Register(auditSkill(gi))
 	gi.skills.Register(determineAuditDepthSkill(gi))
-	gi.skills.Register(loadPlanContextSkill(gi))
-	gi.skills.Register(consultLibrarianStyleSkill(gi))
-	gi.skills.Register(consultAcademicApproachSkill(gi))
-	gi.skills.Register(consultArchivalistContextSkill(gi))
-	gi.skills.Register(requestArchitectResearchSkill(gi))
-	gi.skills.Register(requestUserClarificationSkill(gi))
-	gi.skills.Register(escalateFindingsSkill(gi))
+	// Phase 2.K / GI-A refactor (docs/PIPELINE_SKILL_REFACTOR.md §10.K.1):
+	// consult_librarian_style + consult_academic_approach +
+	// consult_archivalist_context + request_architect_research all route
+	// through the shared consult_peer(target_agent_type=…) primitive
+	// registered below via CrossPipelineSkills.
+	// Phase 2.K / GI-B refactor: request_user_clarification folds into
+	// shared ask_user_clarification, escalate_findings folds into
+	// publish_work_event(kind=artifact, artifact_kind="audit_finding").
+	gi.skills.Register(agentShared.BuildAskUserClarificationSkill(agentShared.AskUserClarificationConfig{
+		Bus:          gi.bus,
+		AgentID:      gi.id,
+		AgentName:    "inspector",
+		SessionID:    gi.config.SessionID,
+		NewMessageID: gi.generateMessageID,
+	}))
+	// publish_work_event was removed alongside manage_claim — the global
+	// inspector previously posted audit findings through it, but the
+	// Fabric's ambient_context + consult_peer + challenge_peer cover the
+	// needed visibility, and audit findings can also go through the
+	// Claims Board when the claims model is wired end-to-end.
 	for _, skill := range agentShared.NewGlobalReviewProtocolSkills(agentShared.GlobalReviewProtocolSkillConfig{
 		AgentType:      func() string { return "inspector" },
 		AgentID:        func() string { return gi.id },
@@ -82,8 +90,8 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	}) {
 		gi.skills.Register(skill)
 	}
-	gi.skills.Register(researchDependencyInstallSkill(gi))
-	gi.skills.Register(installDependencyToolingSkill(gi))
+	// Phase 2.K / GT-4 + GI-5 refactor: collapsed into dependency(action=…).
+	gi.skills.Register(dependencySkill(gi))
 
 	// Activity Fabric: uniform awareness skills + cross-pipeline
 	// primitives + audit-time inspect_open_activity. Global inspector
@@ -101,6 +109,15 @@ func (gi *GlobalInspector) registerCoreSkills() {
 		SessionID: func() string { return gi.config.SessionID },
 		AgentID:   func() string { return gi.id },
 		AgentType: func() string { return "inspector" },
+		RouteSync: agentShared.RouteSyncFromBus(
+			func() guide.EventBus { return gi.bus },
+			func() string {
+				if gi.channels == nil {
+					return ""
+				}
+				return gi.channels.Responses
+			},
+		),
 	}) {
 		gi.skills.Register(skill)
 	}
@@ -148,6 +165,79 @@ func (d *globalInspectorDiag) RecoveryHints() []string         { return nil }
 
 func (d *globalInspectorDiag) AgentSpecificDiagnostics() map[string]any {
 	return map[string]any{}
+}
+
+// Phase 2.K / GI-1 refactor (docs/PIPELINE_SKILL_REFACTOR.md §10.K.1):
+// auditSkill collapses validate_plan_adherence, cross_reference_changes,
+// grade_layer_quality, and load_plan_context into one skill dispatched
+// by the aspect parameter. determine_audit_depth is deliberately kept
+// as its own skill because tool_loop.go enforces it as the first tool
+// call on every fresh audit branch — collapsing that landmark would
+// weaken the deterministic gate.
+const (
+	auditAspectPlanAdherence   = "plan_adherence"
+	auditAspectCrossReferences = "cross_references"
+	auditAspectLayerQuality    = "layer_quality"
+	auditAspectContextLoad     = "context_load"
+)
+
+func auditAspects() []string {
+	return []string{
+		auditAspectPlanAdherence,
+		auditAspectCrossReferences,
+		auditAspectLayerQuality,
+		auditAspectContextLoad,
+	}
+}
+
+func auditSkill(gi *GlobalInspector) *skills.Skill {
+	planAdherence := validatePlanAdherenceSkill(gi)
+	crossRefs := crossReferenceChangesSkill(gi)
+	grade := gradeLayerQualitySkill(gi)
+	contextLoad := loadPlanContextSkill(gi)
+	return skills.NewSkill("audit").
+		Description("Run a global-inspector audit operation selected by aspect. Collapses validate_plan_adherence, cross_reference_changes, grade_layer_quality, and load_plan_context into one primitive dispatched by the aspect enum. (determine_audit_depth stays named because the tool loop enforces it as the mandatory first call on every fresh audit branch.)").
+		Domain("audit").
+		Keywords("audit", "plan", "adherence", "cross-file", "interface", "grade", "quality", "layer", "context").
+		Priority(100).
+		Usage("Set aspect=plan_adherence for whole-plan coverage checks, aspect=cross_references for multi-file interface/import/style drift analysis, aspect=layer_quality to produce the final DAG-layer quality grade, aspect=context_load to recover missing plan context from disk. The required parameters depend on aspect — see each aspect's Requirement guidance.").
+		Requirement("aspect=plan_adherence requires plan_snapshot; aspect=cross_references requires files; aspect=layer_quality requires dag_id and layer_idx; aspect=context_load requires either plan_file_path or (plan_id + session_id).").
+		Satisfies("Produces the audit evidence the global inspector uses for plan-adherence judgments, cross-file architectural findings, layer quality grades, and plan-context recovery.").
+		Avoid("Do not pick an aspect you don't have evidence for. Grade before the relevant audit evidence exists is meaningless; cross_references on a single file is degenerate; plan_adherence needs the concrete implemented_tasks list.").
+		EnumParam("aspect", "Audit aspect", auditAspects(), true).
+		StringParam("plan_snapshot", "Serialized plan to validate against (aspect=plan_adherence or aspect=context_load)", false).
+		ArrayParam("implemented_tasks", "List of implemented task IDs (aspect=plan_adherence)", "string", false).
+		ArrayParam("files", "Files to cross-reference (aspect=cross_references)", "string", false).
+		StringParam("dag_id", "DAG identifier (aspect=layer_quality)", false).
+		IntParam("layer_idx", "Layer index (aspect=layer_quality)", false).
+		StringParam("plan_id", "Architect plan ID (aspect=context_load)", false).
+		StringParam("plan_file_path", "Architect plan file path (aspect=context_load)", false).
+		StringParam("session_id", "Session identifier (aspect=context_load)", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Aspect string `json:"aspect"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			aspect := strings.ToLower(strings.TrimSpace(params.Aspect))
+			if aspect == "" {
+				return nil, fmt.Errorf("aspect is required (expected one of: plan_adherence, cross_references, layer_quality, context_load)")
+			}
+			switch aspect {
+			case auditAspectPlanAdherence:
+				return planAdherence.Handler(ctx, input)
+			case auditAspectCrossReferences:
+				return crossRefs.Handler(ctx, input)
+			case auditAspectLayerQuality:
+				return grade.Handler(ctx, input)
+			case auditAspectContextLoad:
+				return contextLoad.Handler(ctx, input)
+			default:
+				return nil, fmt.Errorf("unknown aspect: %q (expected one of: plan_adherence, cross_references, layer_quality, context_load)", params.Aspect)
+			}
+		}).
+		Build()
 }
 
 func validatePlanAdherenceSkill(_ *GlobalInspector) *skills.Skill {
@@ -365,204 +455,3 @@ func normalizeTaskIDs(taskIDs []string) []string {
 	return result
 }
 
-func requestArchitectResearchSkill(gi *GlobalInspector) *skills.Skill {
-	return skills.NewSkill("request_architect_research").
-		Description("Request the architect to perform additional research on an issue.").
-		Domain("audit").
-		Keywords("architect", "research", "escalate").
-		Priority(90).
-		Usage("Use when a global inspection finding requires deeper architectural research or plan-level clarification before a confident verdict.").
-		Requirement("Provide a concrete research question and the context that made the issue ambiguous or risky.").
-		Satisfies("Opens an architect-side research loop that can unblock the global audit with better architectural evidence.").
-		Avoid("Do not use for questions you can answer directly from the available plan, code, or audit evidence.").
-		StringParam("description", "What to research", true).
-		StringParam("context", "Relevant context for the research", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Description string `json:"description"`
-				Context     string `json:"context"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-
-			response := ""
-			if gi.bus != nil {
-				payload := map[string]any{
-					"type":        "architect_research",
-					"description": params.Description,
-					"context":     params.Context,
-					"source":      gi.id,
-				}
-				payloadJSON, _ := json.Marshal(payload)
-				spec := agentShared.InterAgentBranchSpec{
-					Kind:       agentShared.InterAgentToolEventKindConsult,
-					ToolName:   "request_architect_research",
-					AgentTypes: []string{"architect"},
-					Summary:    params.Description,
-					Args: map[string]any{
-						"target":      "architect",
-						"description": params.Description,
-						"context":     params.Context,
-					},
-				}
-				msg, branchErr := agentShared.WithInterAgentBranchMessage(ctx, spec, func(branchCtx context.Context, branch agentShared.InterAgentBranchHandle) (*guide.Message, error) {
-					metadata := branch.ApplyMetadata(branchCtx, map[string]any{
-						"consultation_kind": "architect_research",
-					})
-					return gi.requestRouteSync(branchCtx, "architect", string(payloadJSON), metadata)
-				})
-				if branchErr != nil {
-					return nil, branchErr
-				}
-				extracted, extractErr := extractConsultationResponse(msg)
-				if extractErr != nil {
-					return nil, extractErr
-				}
-				response = extracted
-			}
-
-			return map[string]any{
-				"requested":   true,
-				"target":      "architect",
-				"description": params.Description,
-				"response":    response,
-			}, nil
-		}).
-		Build()
-}
-
-func requestUserClarificationSkill(gi *GlobalInspector) *skills.Skill {
-	return skills.NewSkill("request_user_clarification").
-		Description("Ask the user a direct clarification question and end the current audit turn so the answer can come back through the normal Guide conversation flow.").
-		Domain("audit").
-		Keywords("clarification", "user", "question").
-		Priority(85).
-		Usage("Use when the audit is blocked on missing product intent or a user decision that cannot be responsibly inferred from the existing evidence.").
-		Requirement("Ask a concrete, decision-relevant question that explains what ambiguity is blocking the audit.").
-		Satisfies("Returns a user-facing clarification prompt and stops the current audit turn so the user can answer directly.").
-		Avoid("Do not use when the answer is already available in the plan, diffs, or existing task context.").
-		StringParam("question", "Question for the user", true).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Question string `json:"question"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			question := strings.TrimSpace(params.Question)
-			if question == "" {
-				return nil, fmt.Errorf("question is required")
-			}
-
-			payload := map[string]any{
-				"status":       "clarification_requested",
-				"question":     question,
-				"user_message": question,
-				"agent_type":   "inspector",
-			}
-			if gi != nil {
-				if trimmed := strings.TrimSpace(gi.id); trimmed != "" {
-					payload["agent_id"] = trimmed
-				}
-				if trimmed := strings.TrimSpace(gi.config.SessionID); trimmed != "" {
-					payload["session_id"] = trimmed
-				}
-			}
-			return nil, skills.NewDelegatedError(payload, question)
-		}).
-		Build()
-}
-
-func escalateFindingsSkill(gi *GlobalInspector) *skills.Skill {
-	return skills.NewSkill("escalate_findings").
-		Description("Submit blocking or corrective audit findings to the Orchestrator validation control plane.").
-		Domain("audit").
-		Keywords("escalate", "publish", "findings").
-		Priority(95).
-		Usage("Use when the global audit has reached a concrete verdict that needs orchestration-level validation handling or remediation routing.").
-		Requirement("Requires a real summary, blocking flag, DAG scope, and enough details for downstream remediation to act on the findings.").
-		Satisfies("Publishes the global inspection verdict into the orchestration validation control plane.").
-		Avoid("Do not escalate vague suspicions or unresolved research questions as final findings.").
-		StringParam("dag_id", "DAG identifier", true).
-		IntParam("layer_idx", "Layer index", true).
-		BoolParam("blocking", "Whether findings are blocking", true).
-		StringParam("summary", "Optional finding summary", false).
-		StringParam("details", "Optional additional details", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				DAGID    string `json:"dag_id"`
-				LayerIdx int    `json:"layer_idx"`
-				Blocking bool   `json:"blocking"`
-				Summary  string `json:"summary"`
-				Details  string `json:"details"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-
-			if gi.bus != nil {
-				kind := agentShared.ValidationVerdictPassWithFindings
-				severity := agentShared.ValidationSeverityWarning
-				if params.Blocking {
-					kind = agentShared.ValidationVerdictNeedsArchitectRemediation
-					severity = agentShared.ValidationSeverityHigh
-				}
-				summary := strings.TrimSpace(params.Summary)
-				if summary == "" {
-					if params.Blocking {
-						summary = fmt.Sprintf("Global inspector found blocking issues in DAG %s layer %d.", params.DAGID, params.LayerIdx)
-					} else {
-						summary = fmt.Sprintf("Global inspector reported follow-up findings for DAG %s layer %d.", params.DAGID, params.LayerIdx)
-					}
-				}
-				payload := &agentShared.ValidationVerdictPayload{
-					Kind:               kind,
-					Severity:           severity,
-					ValidatorAgentID:   gi.id,
-					ValidatorType:      "global-inspector",
-					SessionID:          gi.config.SessionID,
-					DAGIDs:             []string{params.DAGID},
-					ShouldPause:        params.Blocking,
-					Summary:            summary,
-					Details:            strings.TrimSpace(params.Details),
-					RecommendedActions: []string{"architect_remediation"},
-					CreatedAt:          time.Now().UTC(),
-				}
-				body, _ := json.Marshal(payload)
-				req := &guide.RouteRequest{
-					Input:           string(body),
-					SourceAgentID:   gi.id,
-					SourceAgentName: "inspector",
-					TargetAgentID:   "orchestrator",
-					ExplicitTarget:  true,
-					FireAndForget:   true,
-					SessionID:       gi.config.SessionID,
-					Timestamp:       time.Now(),
-					Metadata: map[string]any{
-						"control_plane_kind": agentShared.ControlPlaneKindValidationVerdict,
-						"layer_idx":          params.LayerIdx,
-					},
-				}
-				if err := gi.bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage(gi.generateMessageID(), req)); err != nil {
-					if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-						agentShared.LogWarning(lm.EventLogger, lm.AgentID, lm.SessionID, lm.CorrID,
-							"global_inspector_escalation_publish_failed", map[string]any{
-								"dag_id":    params.DAGID,
-								"layer_idx": params.LayerIdx,
-								"error":     err.Error(),
-							})
-					}
-					return nil, fmt.Errorf("publish validation verdict escalation: %w", err)
-				}
-			}
-
-			return map[string]any{
-				"escalated": true,
-				"dag_id":    params.DAGID,
-				"layer_idx": params.LayerIdx,
-				"blocking":  params.Blocking,
-			}, nil
-		}).
-		Build()
-}

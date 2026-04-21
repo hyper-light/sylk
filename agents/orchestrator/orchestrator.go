@@ -14,6 +14,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/activity/activitystore"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
@@ -307,7 +308,12 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 	// SQLite-backed Source. Bleve and Memory Forest subscribers attach
 	// to the SubscribingSink so they see the same stream the durable
 	// store sees. See docs/FABRIC.md.
-	installActivityFabric(o.store, sid)
+	//
+	// Observability: wraps the installed sink+source with
+	// fabriclog.RecordingSink / fabriclog.RecordingSource so every
+	// publish and every lens call emits a session-global JSONL record
+	// under .sylk/sessions/{sid}/fabric/. See docs/FABRIC_OBSERVABILITY.md.
+	installActivityFabric(o.store, sid, sd)
 
 	// WAL journal
 	journal, err := OpenOrchestratorJournal(sd.SessionOrchestratorWALPath(sid))
@@ -366,6 +372,13 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 		return fmt.Errorf("orchestrator: migrate decision manifest: %w", err)
 	}
 	o.decisionManifest = manifestStore
+
+	// Phase 3 refactor: subscribe the manifest store to fabric-native
+	// ActionDecisionDeclared events. Pipeline agents' declare_decision
+	// skill now emits directly via AutoPublishDecision (no bus RPC);
+	// this subscriber persists the resulting activities into the
+	// canonical SQL table.
+	activitystore.SubscribeToDefault(NewDecisionManifestFabricSubscriber(manifestStore))
 
 	// DAG Bridge
 	o.dagBridge = NewDAGBridge(cfg.DAGConfig, DAGBridgeDeps{
@@ -823,6 +836,10 @@ func (o *Orchestrator) Stop() error {
 	if o.store != nil {
 		o.store.Close()
 	}
+	// Drain the fabric observability logger so any pending async
+	// writes land on disk before the process exits. Close is
+	// idempotent and safe when observability wasn't installed.
+	uninstallFabricObservability()
 	if o.scope != nil {
 		o.scope.Shutdown(5*time.Second, 10*time.Second)
 	}

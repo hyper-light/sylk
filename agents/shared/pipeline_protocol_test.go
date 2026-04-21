@@ -2158,3 +2158,78 @@ func TestRequireExplicitFinalizeTargets_AcceptsPopulated(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// TestPipelineDispatchHandoffOptions_ForwardHandoffSetsParentCID locks in
+// the fix for the chat-panel grouping bug where Engineer→Inspector handoffs
+// were appended under the engineer's entry instead of spawning a new
+// inspector-pipeline entry. When action.CreatesChallenge is false, the
+// dispatcher MUST stamp ForwardHandoffParentCID with the current stream
+// correlation ID so the route request carries TopLevelTransfer=true and
+// the chat model creates a new primary entry for the recipient.
+func TestPipelineDispatchHandoffOptions_ForwardHandoffSetsParentCID(t *testing.T) {
+	action := &PipelineTurnAction{
+		AgentType:        PipelineAgentInspector,
+		CreatesChallenge: false,
+		Request:          "Audit the implementation.",
+	}
+	task := &PipelineTaskInput{AgentType: PipelineAgentInspector, TaskID: "task_1"}
+	ctx := WithStreamContext(context.Background(), "pipe_engineer_abc", "engineer_1")
+
+	opts := pipelineDispatchHandoffOptions(ctx, task, action)
+
+	if opts.ForwardHandoffParentCID != "pipe_engineer_abc" {
+		t.Fatalf("ForwardHandoffParentCID = %q, want pipe_engineer_abc", opts.ForwardHandoffParentCID)
+	}
+	if opts.InterAgentBranch != nil {
+		t.Errorf("InterAgentBranch must be nil for ordinary handoffs; got %+v", opts.InterAgentBranch)
+	}
+	if opts.OriginatorContinuationCID != "" {
+		t.Errorf("OriginatorContinuationCID must be empty for forward handoffs; got %q", opts.OriginatorContinuationCID)
+	}
+}
+
+// TestPipelineDispatchHandoffOptions_ChallengeStaysNested locks the
+// anti-regression constraint: challenges MUST continue to use
+// InterAgentBranch (nested rendering under the challenger's tool call)
+// and MUST NOT receive ForwardHandoffParentCID. Re-introducing that on
+// challenges would break the earlier fix where every consult/challenge
+// started spawning its own top-level chat entry.
+func TestPipelineDispatchHandoffOptions_ChallengeStaysNested(t *testing.T) {
+	action := &PipelineTurnAction{
+		AgentType:        PipelineAgentTester,
+		CreatesChallenge: true,
+		Request:          "Explain why test_cli has no assertion.",
+	}
+	task := &PipelineTaskInput{AgentType: PipelineAgentTester, TaskID: "challenge_1"}
+	ctx := WithStreamContext(context.Background(), "pipe_engineer_abc", "engineer_1")
+
+	opts := pipelineDispatchHandoffOptions(ctx, task, action)
+
+	if opts.ForwardHandoffParentCID != "" {
+		t.Fatalf("challenges must NOT set ForwardHandoffParentCID; got %q — would regress the consult/challenge top-level-continuity fix", opts.ForwardHandoffParentCID)
+	}
+	if opts.InterAgentBranch == nil {
+		t.Fatal("challenges must set InterAgentBranch for nested rendering")
+	}
+	if opts.InterAgentBranch.Kind != InterAgentToolEventKindChallenge {
+		t.Errorf("InterAgentBranch.Kind = %q, want %q", opts.InterAgentBranch.Kind, InterAgentToolEventKindChallenge)
+	}
+}
+
+// TestPipelineDispatchHandoffOptions_NoStreamContext covers the defensive
+// path: when there is no stream metadata on ctx (dispatcher invoked
+// outside a live tool loop), options are empty and dispatch falls back
+// to plain routing — matches prior behaviour, no regression.
+func TestPipelineDispatchHandoffOptions_NoStreamContext(t *testing.T) {
+	action := &PipelineTurnAction{AgentType: PipelineAgentInspector, CreatesChallenge: false}
+	task := &PipelineTaskInput{AgentType: PipelineAgentInspector}
+
+	opts := pipelineDispatchHandoffOptions(context.Background(), task, action)
+
+	if opts.ForwardHandoffParentCID != "" {
+		t.Errorf("expected empty ForwardHandoffParentCID without stream context; got %q", opts.ForwardHandoffParentCID)
+	}
+	if opts.InterAgentBranch != nil {
+		t.Errorf("expected nil InterAgentBranch without stream context; got %+v", opts.InterAgentBranch)
+	}
+}

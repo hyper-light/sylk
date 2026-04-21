@@ -80,6 +80,15 @@ func (g *Guardian) registerFabricSkills() {
 		AgentID:    agentID,
 		AgentType:  agentType,
 		PipelineID: func() string { return "" },
+		RouteSync: shared.RouteSyncFromBus(
+			func() guide.EventBus { return g.bus },
+			func() string {
+				if g.channels == nil {
+					return ""
+				}
+				return g.channels.Responses
+			},
+		),
 	}) {
 		g.skills.Register(skill)
 	}

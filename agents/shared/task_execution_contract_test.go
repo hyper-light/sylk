@@ -166,13 +166,16 @@ func TestValidateTaskExecutionCall_EngineerAllowsReleaseAndReviewResolutionWitho
 		},
 	})
 
-	if err := ValidateTaskExecutionCall(ctx, "engineer", "coord_resolve_artifact", map[string]any{"review_id": "rev-1"}); err != nil {
-		t.Fatalf("coord_resolve_artifact blocked by runtime gate: %v", err)
+	// Phase 1/2 refactor: coord_resolve_artifact folded into
+	// publish_work_event kind=review_completion; coord_release_scope
+	// folded into manage_claim action=release.
+	if err := ValidateTaskExecutionCall(ctx, "engineer", "publish_work_event", map[string]any{"kind": "review_completion", "review_id": "rev-1"}); err != nil {
+		t.Fatalf("publish_work_event blocked by runtime gate: %v", err)
 	}
-	if err := ValidateTaskExecutionCall(ctx, "engineer", "coord_release_scope", nil); err != nil {
-		t.Fatalf("coord_release_scope blocked by runtime gate: %v", err)
+	if err := ValidateTaskExecutionCall(ctx, "engineer", "manage_claim", map[string]any{"action": "release"}); err != nil {
+		t.Fatalf("manage_claim blocked by runtime gate: %v", err)
 	}
-	RecordTaskExecutionSuccess(ctx, "coord_resolve_artifact", map[string]any{"review_id": "rev-1"}, "")
+	RecordTaskExecutionSuccess(ctx, "publish_work_event", map[string]any{"kind": "review_completion", "review_id": "rev-1"}, "")
 	if err := ValidateTaskExecutionCompletion(ctx, "engineer"); err != nil {
 		t.Fatalf("engineer completion blocked by runtime gate: %v", err)
 	}
@@ -191,7 +194,7 @@ func TestRecordTaskExecutionSuccess_ResolvesReviewFromToolOutput(t *testing.T) {
 		},
 	})
 
-	RecordTaskExecutionSuccess(ctx, "coord_resolve_artifact", map[string]any{"artifact_id": "art-1"}, `{"review_id":"rev-1"}`)
+	RecordTaskExecutionSuccess(ctx, "publish_work_event", map[string]any{"kind": "review_completion", "artifact_id": "art-1"}, `{"review_id":"rev-1"}`)
 
 	state := TaskExecutionStateFromContext(ctx)
 	if state == nil || !state.resolvedReview("rev-1") {
@@ -213,19 +216,21 @@ func TestValidateTaskExecutionCompletion_DesignerAllowsIterationEndWithoutRuntim
 	})
 
 	RecordTaskExecutionSuccess(ctx, "component_search", nil, "")
-	RecordTaskExecutionSuccess(ctx, "coord_publish_artifact", nil, "")
+	RecordTaskExecutionSuccess(ctx, "publish_work_event", map[string]any{"kind": "artifact"}, "")
 	if err := ValidateTaskExecutionCompletion(ctx, "designer"); err != nil {
 		t.Fatalf("designer completion blocked by runtime gate: %v", err)
 	}
-	if err := ValidateTaskExecutionCall(ctx, "designer", "coord_resolve_artifact", map[string]any{"review_id": "rev-2"}); err != nil {
-		t.Fatalf("coord_resolve_artifact blocked by runtime gate: %v", err)
+	if err := ValidateTaskExecutionCall(ctx, "designer", "publish_work_event", map[string]any{"kind": "review_completion", "review_id": "rev-2"}); err != nil {
+		t.Fatalf("publish_work_event blocked by runtime gate: %v", err)
 	}
 }
 
 func TestValidateTaskExecutionCall_TesterAllowsIterationWithoutRuntimePrerequisiteLattice(t *testing.T) {
 	ctx := taskExecutionContext(&TaskExecutionContract{Stage: "test"})
 
-	for _, toolName := range []string{"write_test", "run_test_suite", "report_to_engineer", "coord_release_scope"} {
+	// Phase 1/2 refactor: report_to_engineer removed (use handoff_next);
+	// coord_release_scope folded into manage_claim.
+	for _, toolName := range []string{"write_test", "run_test_suite", "handoff_next", "manage_claim"} {
 		if err := ValidateTaskExecutionCall(ctx, "tester-pipeline", toolName, nil); err != nil {
 			t.Fatalf("%s blocked by runtime prerequisite lattice: %v", toolName, err)
 		}

@@ -16,7 +16,6 @@ import (
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
-	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
@@ -320,18 +319,9 @@ func (d *Designer) initSkills() error {
 	); err != nil {
 		return fmt.Errorf("attach designer forest handoff outcome: %w", err)
 	}
-	if err := shared.AttachForestOutcomeRecorder(
-		d.skills,
-		"report_to_orchestrator",
-		d.forestTracker,
-		d.config.Forest,
-		func() string { return d.id },
-		"designer",
-		func() string { return d.config.SessionID },
-		shared.OutcomeAlways(forest.OutcomeStatusFailed, "designer escalated a design failure to the orchestrator"),
-	); err != nil {
-		return fmt.Errorf("attach designer forest escalation outcome: %w", err)
-	}
+	// Phase 1 refactor: report_to_orchestrator removed. Designer uses
+	// handoff_next(target="orchestrator",…). The forest-outcome recorder
+	// for that path is attached via the shared handoff skill hook.
 
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = designerVisibleSkillNames()

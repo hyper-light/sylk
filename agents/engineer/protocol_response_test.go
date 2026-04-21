@@ -36,8 +36,9 @@ func TestHandleBusRequest_PipelineResponsePreservesRecordedAction(t *testing.T) 
 				ToolCalls: []providers.ToolCall{
 					{
 						ID:   "call-1",
-						Name: "handoff_next",
+						Name: "pipeline_protocol",
 						Arguments: `{
+							"action":"handoff",
 							"target_agents":["inspector"],
 							"reason":"implementation is complete and ready for audit",
 							"request":"Inspect the implementation changes and validate them against the criteria.",

@@ -291,7 +291,9 @@ func (gt *GlobalTester) initSkills() error {
 	); err != nil {
 		return fmt.Errorf("attach global tester forest review outcome: %w", err)
 	}
-	for _, skillName := range []string{"report_to_orchestrator", "report_to_architect", "escalate_failure"} {
+	// Phase 2.K / GT-A refactor: three routes collapsed into one
+	// escalate_failure(targets=[…]) skill.
+	for _, skillName := range []string{"escalate_failure"} {
 		if err := agentshared.AttachForestOutcomeRecorder(
 			gt.skills,
 			skillName,
@@ -329,29 +331,32 @@ func (gt *GlobalTester) registerCoreSkills() {
 		GetViews:      func() versioning.WorkspaceViewAccess { return gt.workspaceViews },
 	}
 
-	// Shared skills.
-	gt.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return gt.fileAccess }))
-	gt.skills.Register(runCommandSkill(gt))
-	gt.skills.Register(runShellScriptSkill(gt))
+	// Shared skills. read_file dropped — workspace_read(op=read) is
+	// the single reader with explicit view selection and the tester's
+	// missing-file-tolerant override installed below.
+	gt.skills.Register(bashSkill(gt))
 	gt.skills.Register(shared.AnalyzeRiskSkill(gt))
-	gt.skills.Register(shared.PlanTestsSkill(gt))
+	// Phase 2.K / GT-B refactor: plan_tests (shared unit) +
+	// plan_integration_tests + plan_e2e_tests collapsed into
+	// plan_tests(level ∈ {unit, integration, e2e}).
+	gt.skills.Register(planTestsSkill(gt))
 	gt.skills.Register(writeTestSkill(gt))
 	gt.skills.Register(shared.RunTestSuiteSkill(gt))
 	gt.skills.Register(shared.DiagnoseFailureSkill(gt.diagEngine))
-	gt.skills.Register(researchTestToolInstallSkill(gt))
-	gt.skills.Register(installTestToolingSkill(gt))
-	gt.skills.Register(shared.NewTesterReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
-	gt.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
-	gt.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
-	gt.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
-	gt.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
-	gt.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil, nil))
-	gt.skills.Register(versioning.NewPrepareGlobalWriteContextSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
-	gt.skills.Register(versioning.NewListGlobalChangesSkill(func() versioning.FileAccess { return gt.fileAccess }))
-	gt.skills.Register(versioning.NewWriteGlobalFileSkill(writeCfg))
-	gt.skills.Register(versioning.NewEditGlobalFileSkill(writeCfg))
-	gt.skills.Register(versioning.NewDeleteGlobalFileSkill(writeCfg))
-	gt.skills.Register(versioning.NewCreateGlobalDirectorySkill(writeCfg))
+	// Phase 2.K / GT-4 + GI-5 refactor: collapsed into dependency(action=…, category=test).
+	gt.skills.Register(dependencySkill(gt))
+	// Phase 2.K / CR-2 refactor: 12 workspace skills collapsed to 3
+	// verb-dispatched primitives. Tester installs a missing-file-tolerant
+	// read for red-phase semantics.
+	globalTesterGetViews := func() versioning.WorkspaceViewAccess { return gt.workspaceViews }
+	globalTesterGetFA := func() versioning.FileAccess { return gt.fileAccess }
+	// prepare_write_context folded into workspace_read(op=prepare_write).
+	gt.skills.Register(versioning.NewWorkspaceReadSkill(versioning.WorkspaceReadSkillConfig{
+		GetViews:          globalTesterGetViews,
+		GetFileAccess:     globalTesterGetFA,
+		ReadSkillOverride: shared.NewTesterReadWorkspaceFileSkill(globalTesterGetViews, nil),
+	}))
+	gt.skills.Register(versioning.NewWorkspaceWriteSkill(writeCfg))
 	gt.skills.Register(agentshared.BuildAskUserClarificationSkill(agentshared.AskUserClarificationConfig{
 		Bus:          gt.bus,
 		AgentID:      gt.id,
@@ -363,13 +368,14 @@ func (gt *GlobalTester) registerCoreSkills() {
 	// Global-tester-specific skills.
 	gt.skills.Register(analyzeBatchSkill(gt))
 	gt.skills.Register(analyzeIntegrationRisksSkill(gt))
-	gt.skills.Register(planIntegrationTestsSkill(gt))
-	gt.skills.Register(planE2ETestsSkill(gt))
+	// Phase 2.K / GT-B refactor: plan_integration_tests + plan_e2e_tests
+	// folded into plan_tests(level=…) above; individual wrappers removed.
 	gt.skills.Register(buildHarnessSkill(gt))
-	gt.skills.Register(writeIntegrationTestSkill(gt))
-	gt.skills.Register(writeE2ETestSkill(gt))
-	gt.skills.Register(reportToOrchestratorSkill(gt))
-	gt.skills.Register(reportToArchitectSkill(gt))
+	// Phase 2.K / GT-2 refactor: write_integration_test +
+	// write_e2e_test collapsed into write_test(level=…).
+	// Phase 2.K / GT-A refactor: report_to_orchestrator +
+	// report_to_architect + escalate_failure collapsed into one
+	// escalate_failure(targets=[…]) skill.
 	gt.skills.Register(escalateFailureSkill(gt))
 	for _, skill := range agentshared.NewGlobalReviewProtocolSkills(agentshared.GlobalReviewProtocolSkillConfig{
 		AgentType:      func() string { return "tester" },
@@ -401,6 +407,15 @@ func (gt *GlobalTester) registerCoreSkills() {
 		SessionID: func() string { return gt.config.SessionID },
 		AgentID:   func() string { return gt.id },
 		AgentType: func() string { return "tester" },
+		RouteSync: agentshared.RouteSyncFromBus(
+			func() guide.EventBus { return gt.bus },
+			func() string {
+				if gt.channels == nil {
+					return ""
+				}
+				return gt.channels.Responses
+			},
+		),
 	}) {
 		gt.skills.Register(skill)
 	}

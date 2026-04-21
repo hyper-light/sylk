@@ -79,13 +79,13 @@ func TestRunCommandRejectsPipelineVFSWritesWithoutStrictBroker(t *testing.T) {
 	e.SetFileAccess(fa)
 	e.SetExecutionBroker(stubExecutionBroker{})
 
-	input := json.RawMessage(`{"command":"cat hello.py"}`)
-	result := e.skills.Invoke(context.Background(), "run_command", input)
+	input := json.RawMessage(`{"script":"cat hello.py"}`)
+	result := e.skills.Invoke(context.Background(), "bash", input)
 	if result.Success {
-		t.Fatal("run_command unexpectedly succeeded without a strict execution broker")
+		t.Fatal("bash unexpectedly succeeded without a strict execution broker")
 	}
 	if !strings.Contains(result.Error, purevfs.ErrStrictExecutionUnavailable.Error()) {
-		t.Fatalf("run_command error = %q, want %q", result.Error, purevfs.ErrStrictExecutionUnavailable)
+		t.Fatalf("bash error = %q, want %q", result.Error, purevfs.ErrStrictExecutionUnavailable)
 	}
 }
 
@@ -135,14 +135,14 @@ func TestRunCommandUsesStrictBrokerOverlayWorkspace(t *testing.T) {
 		},
 	})
 
-	input := json.RawMessage(`{"command":"python hello.py"}`)
-	result := e.skills.Invoke(context.Background(), "run_command", input)
+	input := json.RawMessage(`{"script":"python hello.py"}`)
+	result := e.skills.Invoke(context.Background(), "bash", input)
 	if !result.Success {
-		t.Fatalf("run_command error = %v", result.Error)
+		t.Fatalf("bash error = %v", result.Error)
 	}
 	execResult, ok := result.Data.(*CommandExecution)
 	if !ok {
-		t.Fatalf("run_command data = %T, want *CommandExecution", result.Data)
+		t.Fatalf("bash data = %T, want *CommandExecution", result.Data)
 	}
 	if got := execResult.Stdout; !strings.Contains(got, "broker view") {
 		t.Fatalf("stdout = %q, want broker overlay content", got)
@@ -180,9 +180,9 @@ func TestRunCommandWrapsDiskWorkspaceReadOnly(t *testing.T) {
 		},
 	})
 
-	input := json.RawMessage(`{"command":"python hello.py"}`)
-	result := e.skills.Invoke(context.Background(), "run_command", input)
+	input := json.RawMessage(`{"script":"python hello.py"}`)
+	result := e.skills.Invoke(context.Background(), "bash", input)
 	if !result.Success {
-		t.Fatalf("run_command error = %v", result.Error)
+		t.Fatalf("bash error = %v", result.Error)
 	}
 }

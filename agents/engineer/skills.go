@@ -34,34 +34,39 @@ func (e *Engineer) registerCoreSkills() {
 		WritesEnabledCheck: func() bool { return e.config.EngineerConfig.EnableFileWrites },
 	}
 
-	// File operations
-	e.skills.Register(readFileSkill(e))
-	e.skills.Register(runCommandSkill(e))
-	e.skills.Register(runShellScriptSkill(e))
-	e.skills.Register(globSkill(e))
-	e.skills.Register(grepSkill(e))
-	e.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
-	e.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
-	e.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
-	e.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
-	e.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
-	e.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }, nil))
-	e.skills.Register(versioning.NewPreparePipelineWriteContextSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }, nil))
-	e.skills.Register(versioning.NewListPipelineChangesSkill(func() versioning.FileAccess { return e.fileAccess }))
-	e.skills.Register(versioning.NewWritePipelineFileSkill(writeCfg))
-	e.skills.Register(versioning.NewEditPipelineFileSkill(writeCfg))
-	e.skills.Register(versioning.NewDeletePipelineFileSkill(writeCfg))
-	e.skills.Register(versioning.NewCreatePipelineDirectorySkill(writeCfg))
+	// File operations. read_file / glob / grep dropped — workspace_read
+	// covers all three via op=read|glob|grep with explicit view
+	// selection (disk | global | pipeline). Single reader skill in the
+	// catalog, one fewer ambiguity for the LLM to resolve per turn.
+	e.skills.Register(bashSkill(e))
+	// Phase 2.K / CR-2 refactor: 12 workspace skills collapsed to 3
+	// verb-dispatched primitives. Internal deterministic callers and
+	// the LLM catalog both route through these three.
+	getViews := func() versioning.WorkspaceViewAccess { return e.workspaceViews }
+	getFA := func() versioning.FileAccess { return e.fileAccess }
+	defaultPipelineID := func() string { return e.pipelineID }
+	// prepare_write_context folded into workspace_read(op=prepare_write).
+	e.skills.Register(versioning.NewWorkspaceReadSkill(versioning.WorkspaceReadSkillConfig{
+		GetViews:          getViews,
+		GetFileAccess:     getFA,
+		DefaultPipelineID: defaultPipelineID,
+	}))
+	e.skills.Register(versioning.NewWorkspaceWriteSkill(writeCfg))
 
 	// Code analysis & quality
 	e.skills.Register(lspSkill(e))
 	e.skills.Register(formatSkill(e))
 	e.skills.Register(lintSkill(e))
 
-	// Consultation
-	e.skills.Register(consultSkill(e))
-	e.skills.Register(researchDependencyInstallSkill(e))
-	e.skills.Register(installDependencyToolingSkill(e))
+	// Phase 1 refactor:
+	//   - consult removed. Use consult_peer (fabric async) with
+	//     target_agent_type="librarian"|"archivalist"|"academic".
+	//     When blocking is needed Phase 3 will add sync=true to
+	//     consult_peer; until then callers await the
+	//     ActionConsultResponse via the ambient envelope.
+	// Phase 2.K / GT-4 + GI-5 refactor: research_dependency_install +
+	// install_dependency_tooling collapsed into dependency(action=…).
+	e.skills.Register(dependencySkill(e))
 	e.skills.Register(shared.BuildAskUserClarificationSkill(shared.AskUserClarificationConfig{
 		Bus:          e.bus,
 		AgentID:      e.id,
@@ -102,6 +107,15 @@ func (e *Engineer) registerCoreSkills() {
 		AgentID:    func() string { return e.id },
 		AgentType:  func() string { return "engineer" },
 		PipelineID: func() string { return e.pipelineID },
+		RouteSync: shared.RouteSyncFromBus(
+			func() guide.EventBus { return e.bus },
+			func() string {
+				if e.channels == nil {
+					return ""
+				}
+				return e.channels.Responses
+			},
+		),
 	}) {
 		e.skills.Register(skill)
 	}
@@ -137,8 +151,11 @@ func (e *Engineer) registerCoreSkills() {
 	e.skills.Register(auditSkill(e))
 	e.skills.Register(reportConfidenceSkill(e))
 
-	// Communication
-	e.skills.Register(signalOrchestratorSkill(e))
+	// Phase 1 refactor:
+	//   - signal_orchestrator removed. The orchestrator consumes
+	//     fabric activities via amplifiers; engineer-emitted work
+	//     (format, lint, audit) already surfaces there. For a
+	//     blocked-state signal, emit ActionRemediationOpened.
 
 	// Diagnostics
 	e.skills.Register(shared.NewSelfDiagnosticSkill(&engineerDiag{e: e}))
@@ -259,28 +276,62 @@ func consultSkill(e *Engineer) *skills.Skill {
 
 func auditSkill(e *Engineer) *skills.Skill {
 	return skills.NewSkill("audit").
-		Description("Self-audit code for quality issues against readability, correctness, performance, and maintainability standards. Returns a structured verdict with quality score and issues.").
+		Description("Run a grounded self-audit: the formatter and linter are executed deterministically on the given files, and the LLM interprets the tool output in context to catch issues the tools cannot see (missed edge cases, hidden invariants, scope creep, subtle correctness defects). Returns a verdict whose pass signal combines both layers — tool findings + reflective analysis — so the score reflects observable evidence, not self-reported confidence.").
 		Domain("quality").
-		Keywords("audit", "review", "quality", "check", "validate", "standards", "code").
+		Keywords("audit", "review", "quality", "check", "validate", "standards", "code", "format", "lint").
 		Priority(85).
-		StringParam("code", "The code or implementation output to audit", true).
+		ArrayParam("files", "Paths (workspace-relative) of files to audit. Format-check and lint run per file.", "string", true).
+		StringParam("implementation", "Optional implementation narrative or snippet to review alongside the tool output. Leave empty to audit only against the files on disk.", false).
 		StringParam("criteria", "Acceptance criteria or standards to audit against", false).
-		Usage("Call after completing implementation to self-review. If audit fails, fix issues and re-audit.").
-		BestPractice("Always audit before reporting completion. If audit fails, fix issues and re-audit.").
+		Usage("Call after completing implementation to self-review. Format issues drop the quality score; lint errors or reflective defects fail the audit. Fix the surfaced issues and re-audit until pass.").
+		BestPractice("Always audit before reporting completion. Pass the exact files you changed — a passing audit on the wrong files is no signal.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
-				Code     string `json:"code"`
-				Criteria string `json:"criteria"`
+				Files          []string `json:"files"`
+				Implementation string   `json:"implementation"`
+				Criteria       string   `json:"criteria"`
 			}
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			if params.Code == "" {
-				return nil, fmt.Errorf("code is required")
+			files := normalizeAuditFiles(params.Files)
+			if len(files) == 0 && strings.TrimSpace(params.Implementation) == "" {
+				return nil, fmt.Errorf("at least one file or an implementation narrative is required")
 			}
-			verdict, err := e.selfAudit(ctx, params.Code, params.Criteria)
+			verdict, err := e.selfAudit(ctx, files, params.Implementation, params.Criteria)
 			if err != nil {
 				return nil, err
+			}
+			// Publish self-audit outcome so inspector sees the engineer's
+			// own verdict before grading. Evidence now includes
+			// deterministic tool outcomes alongside reflective issues.
+			if verdict != nil {
+				evidence := make([]string, 0, len(verdict.Issues)+len(verdict.ToolFindings))
+				for _, finding := range verdict.ToolFindings {
+					status := "clean"
+					if !finding.Clean {
+						status = "issues"
+					}
+					evidence = append(evidence, fmt.Sprintf("%s[%s] %s: %s", finding.Tool, finding.Backend, finding.File, status))
+				}
+				for _, issue := range verdict.Issues {
+					evidence = append(evidence, issue.Description)
+				}
+				value := "pass"
+				if !verdict.Pass {
+					value = "fail"
+				}
+				shared.AutoPublishAdvisory(ctx, shared.AutoPublishAdvisoryInput{
+					SessionID:        e.config.SessionID,
+					AuthorAgentID:    e.id,
+					AuthorAgentType:  "engineer",
+					AuthorPipelineID: e.pipelineID,
+					TriggerSkill:     "audit",
+					Domain:           "self_audit",
+					Value:            value,
+					Summary:          fmt.Sprintf("quality_score=%.2f tools=%d issues=%d", verdict.QualityScore, len(verdict.ToolFindings), len(verdict.Issues)),
+					Evidence:         evidence,
+				})
 			}
 			return verdict, nil
 		}).
@@ -371,6 +422,22 @@ func reportConfidenceSkill(e *Engineer) *skills.Skill {
 			composite := conf.Composite(escalation.DefaultWeights())
 			category := escalation.CategorizeConfidence(composite)
 
+			// Phase 4 refactor: publish engineer confidence as a typed
+			// fabric decision so inspector sees the self-assessment in
+			// ambient context before grading.
+			shared.AutoPublishCommitted(ctx, shared.AutoPublishInput{
+				SessionID:        e.config.SessionID,
+				AuthorAgentID:    e.id,
+				AuthorAgentType:  "engineer",
+				AuthorPipelineID: e.pipelineID,
+				TriggerSkill:     "report_confidence",
+				Domain:           "engineer_confidence",
+				Value:            category.String(),
+				Scope:            params.TaskID,
+				Coordinates:      map[string]string{"composite": fmt.Sprintf("%.3f", composite)},
+				Evidence:         []string{params.Reasoning},
+			})
+
 			result := map[string]any{
 				"composite": composite,
 				"category":  category.String(),
@@ -415,56 +482,13 @@ func (e *Engineer) publishRerouteRequest(reason, originalInput, suggestedTarget 
 	return e.bus.Publish(guide.TopicGuideRequests, guide.NewRerouteMessage("", reroute))
 }
 
-// =============================================================================
-// read_file - Read file contents
-// =============================================================================
 
-type readFileParams struct {
-	Path   string `json:"path"`
-	Offset int    `json:"offset,omitempty"`
-	Limit  int    `json:"limit,omitempty"`
-}
-
-func readFileSkill(e *Engineer) *skills.Skill {
-	return skills.NewSkill("read_file").
-		Description("Read the contents of a file. Returns file content with optional offset and limit for large files.").
-		Domain("filesystem").
-		Keywords("read", "file", "content", "view", "cat").
-		Priority(100).
-		Usage("Use to inspect the current implementation before mutating unfamiliar code or when disk-level context is needed beyond the workspace overlay views.").
-		Satisfies("Provides concrete file evidence for planning, implementation, and self-audit.").
-		StringParam("path", "Path to the file to read (relative to working directory)", true).
-		IntParam("offset", "Line offset to start reading from (0-based)", false).
-		IntParam("limit", "Maximum number of lines to read (default: 1000)", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params readFileParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-
-			if params.Path == "" {
-				return nil, fmt.Errorf("path is required")
-			}
-
-			if e.fileAccess == nil {
-				return nil, fmt.Errorf("file access not configured")
-			}
-
-			result, err := versioning.ReadFileToolResult(ctx, e.fileAccess, params.Path, params.Offset, params.Limit)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read file: %w", err)
-			}
-			return result, nil
-		}).
-		Build()
-}
-
-func runCommandSkill(e *Engineer) *skills.Skill {
-	return shared.NewRunCommandSkill(engineerCommandSkillConfig(e))
-}
-
-func runShellScriptSkill(e *Engineer) *skills.Skill {
-	return shared.NewRunShellScriptSkill(engineerCommandSkillConfig(e))
+// Phase: run_command + run_shell_script merged into the unified bash
+// skill. Single skill, single script param, dynamic approval policy
+// based on script shape (plain command = default/fast-path, compound
+// script = exact approval). See shared.NewBashSkill.
+func bashSkill(e *Engineer) *skills.Skill {
+	return shared.NewBashSkill(engineerCommandSkillConfig(e))
 }
 
 func engineerCommandSkillConfig(e *Engineer) shared.CommandSkillConfig {
@@ -523,223 +547,34 @@ func commandHasUnsafeShellSyntax(command string) bool {
 }
 
 // =============================================================================
-// glob - Find files by pattern
-// =============================================================================
-
-type globParams struct {
-	Pattern string   `json:"pattern"`
-	Exclude []string `json:"exclude,omitempty"`
-}
-
-func globSkill(e *Engineer) *skills.Skill {
-	return skills.NewSkill("glob").
-		Description("Find files matching a glob pattern. Supports ** for recursive matching.").
-		Domain("filesystem").
-		Keywords("glob", "find", "files", "pattern", "match").
-		Priority(90).
-		StringParam("pattern", "Glob pattern (e.g., '**/*.go', 'src/**/*.ts')", true).
-		ArrayParam("exclude", "Patterns to exclude (e.g., 'vendor/**', 'node_modules/**')", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params globParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-
-			if params.Pattern == "" {
-				return nil, fmt.Errorf("pattern is required")
-			}
-
-			if e.fileAccess == nil {
-				return nil, fmt.Errorf("file access not configured")
-			}
-
-			workDir := e.config.EngineerConfig.WorkingDirectory
-			if workDir == "" {
-				workDir = "."
-			}
-
-			matches, err := e.fileAccess.Glob(ctx, workDir, params.Pattern, params.Exclude)
-			if err != nil {
-				return nil, fmt.Errorf("glob failed: %w", err)
-			}
-
-			return map[string]any{
-				"pattern": params.Pattern,
-				"matches": matches,
-				"count":   len(matches),
-			}, nil
-		}).
-		Build()
-}
-
-// =============================================================================
-// grep - Search file contents
-// =============================================================================
-
-type grepParams struct {
-	Pattern      string `json:"pattern"`
-	Path         string `json:"path,omitempty"`
-	Include      string `json:"include,omitempty"`
-	ContextLines int    `json:"context_lines,omitempty"`
-	MaxMatches   int    `json:"max_matches,omitempty"`
-}
-
-func grepSkill(e *Engineer) *skills.Skill {
-	return skills.NewSkill("grep").
-		Description("Search file contents using regular expressions. Returns matching lines with optional context.").
-		Domain("code").
-		Keywords("grep", "search", "find", "regex", "pattern").
-		Priority(90).
-		StringParam("pattern", "Regular expression pattern to search for", true).
-		StringParam("path", "Directory path to search in (default: working directory)", false).
-		StringParam("include", "File pattern to include (e.g., '*.go', '*.ts')", false).
-		IntParam("context_lines", "Number of context lines to include before/after match", false).
-		IntParam("max_matches", "Maximum number of matches to return (default: 100)", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params grepParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-
-			if params.Pattern == "" {
-				return nil, fmt.Errorf("pattern is required")
-			}
-
-			if e.fileAccess == nil {
-				return nil, fmt.Errorf("file access not configured")
-			}
-
-			searchPath := params.Path
-			if searchPath == "" {
-				searchPath = e.config.EngineerConfig.WorkingDirectory
-			}
-			if searchPath == "" {
-				searchPath = "."
-			}
-
-			maxMatches := params.MaxMatches
-			if maxMatches <= 0 {
-				maxMatches = 100
-			}
-
-			faMatches, err := e.fileAccess.Grep(ctx, searchPath, params.Pattern, params.Include, params.ContextLines, maxMatches)
-			if err != nil {
-				return nil, fmt.Errorf("search failed: %w", err)
-			}
-
-			return map[string]any{
-				"pattern":   params.Pattern,
-				"matches":   faMatches,
-				"count":     len(faMatches),
-				"truncated": len(faMatches) >= maxMatches,
-			}, nil
-		}).
-		Build()
-}
-
-// =============================================================================
 // lsp - Language Server Protocol code intelligence
 // =============================================================================
 
-type lspInput struct {
-	Action    string `json:"action"`
-	File      string `json:"file,omitempty"`
-	Line      int    `json:"line,omitempty"`
-	Column    int    `json:"column,omitempty"`
-	Query     string `json:"query,omitempty"`
-	Direction string `json:"direction,omitempty"`
-}
-
+// lspSkill wires the engineer's LSP skill with a composite backend:
+// gopls (Go-only cross-file accelerator, executed through the
+// broker-aware runner so in-flight VFS content is visible) layered
+// over a polyglot treesitter backend (reads through versioning.FileAccess
+// so VFS overlays appear, works across 20+ grammars). Non-Go files
+// skip gopls entirely and resolve through treesitter.
 func lspSkill(e *Engineer) *skills.Skill {
-	type handler = func(context.Context, *lspInput) (any, error)
-
-	locationAction := func(subcommand string) handler {
-		return func(ctx context.Context, p *lspInput) (any, error) {
-			if strings.TrimSpace(p.File) == "" {
-				return nil, fmt.Errorf("file is required for %s", subcommand)
-			}
-			loc := lspLocation(p.File, p.Line, p.Column)
-			output, status := e.runGoplsCommand(ctx, e.effectiveWorkingDirectory(), subcommand, loc)
-			if status != "ok" {
-				return map[string]any{"status": status, "reason": output}, nil
-			}
-			return map[string]any{"status": "ok", "output": output}, nil
-		}
-	}
-
-	dispatch := map[string]handler{
-		"goto_definition": locationAction("definition"),
-		"find_references": locationAction("references"),
-		"hover":           locationAction("hover"),
-		"symbols": func(ctx context.Context, p *lspInput) (any, error) {
-			argument := strings.TrimSpace(p.Query)
-			if argument == "" {
-				argument = strings.TrimSpace(p.File)
-			}
-			if argument == "" {
-				argument = "."
-			}
-			output, status := e.runGoplsCommand(ctx, e.effectiveWorkingDirectory(), "symbols", argument)
-			if status != "ok" {
-				return map[string]any{"status": status, "reason": output}, nil
-			}
-			return map[string]any{"status": "ok", "output": output}, nil
+	backend := &shared.CompositeBackend{
+		Primary: &shared.GoplsBackend{
+			Run:        e.runGoplsCommand,
+			GetWorkDir: e.effectiveWorkingDirectory,
 		},
-		"call_hierarchy": func(ctx context.Context, p *lspInput) (any, error) {
-			loc := lspLocation(p.File, p.Line, p.Column)
-			refs, refsStatus := e.runGoplsCommand(ctx, e.effectiveWorkingDirectory(), "references", loc)
-			defn, defStatus := e.runGoplsCommand(ctx, e.effectiveWorkingDirectory(), "definition", loc)
-			if refsStatus != "ok" && defStatus != "ok" {
-				return map[string]any{"status": "unavailable", "reason": refs}, nil
-			}
-			return map[string]any{
-				"status":     "ok",
-				"direction":  p.Direction,
-				"references": refs,
-				"definition": defn,
-			}, nil
+		Secondary: &shared.TreesitterBackend{
+			Tool:          shared.SharedTreeSitter(),
+			FileAccess:    func() versioning.FileAccess { return e.fileAccess },
+			WorkspaceRoot: e.effectiveWorkingDirectory,
 		},
+		GoFirst: true,
 	}
-
-	return skills.NewSkill("lsp").
-		Description("Query gopls language server for code intelligence.\n\n"+
-			"Actions:\n"+
-			"- goto_definition: Navigate to symbol definition (params: file, line, column)\n"+
-			"- find_references: Find all references to a symbol (params: file, line, column)\n"+
-			"- hover: Get type info and documentation for a symbol (params: file, line, column)\n"+
-			"- symbols: List symbols in a file or search workspace (params: file or query)\n"+
-			"- call_hierarchy: Trace callers/callees of a symbol (params: file, line, column, direction)").
-		Domain("code_analysis").
-		Keywords("lsp", "symbol", "definition", "references", "hover",
-			"outline", "structure", "call hierarchy", "callers", "callees").
-		Priority(95).
-		Usage("Use to navigate unfamiliar code, confirm symbol relationships, and limit mutation scope before editing.").
-		Satisfies("Provides symbol-level evidence for implementation planning and safe code changes.").
-		Avoid("Do not guess symbol relationships when the language server can answer them directly.").
-		EnumParam("action", "LSP action to execute", []string{
-			"goto_definition", "find_references", "hover", "symbols", "call_hierarchy",
-		}, true).
-		StringParam("file", "File path", false).
-		IntParam("line", "Line number (1-based)", false).
-		IntParam("column", "Column number (1-based)", false).
-		StringParam("query", "Symbol query for workspace search", false).
-		StringParam("direction", "Call hierarchy direction: incoming|outgoing|both", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params lspInput
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			fn, ok := dispatch[params.Action]
-			if !ok {
-				return nil, fmt.Errorf("unknown lsp action: %q", params.Action)
-			}
-			return fn(ctx, &params)
-		}).
-		Build()
-}
-
-func lspLocation(file string, line, column int) string {
-	return fmt.Sprintf("%s:%d:%d", file, line, column)
+	return shared.NewLSPSkill(shared.LSPSkillConfig{
+		Backend:  backend,
+		Priority: 95,
+		Domain:   "code_analysis",
+		Usage:    "Reach for lsp before grep when you need a symbol's identity (who defines it, who calls it, what type it has). VFS-aware reads mean the answer reflects your in-flight edits, not stale disk state. Polyglot via treesitter; Go files get a gopls-backed accelerator for cross-file lookups.",
+	})
 }
 
 func (e *Engineer) runGoplsCommand(ctx context.Context, workDir, subcommand, arg string) (string, string) {

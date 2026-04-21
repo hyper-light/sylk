@@ -18,54 +18,50 @@ import (
 )
 
 func (pi *PipelineInspector) registerCoreSkills() {
-	writeCfg := versioning.WorkspaceWriteSkillConfig{
-		GetFileAccess:     func() versioning.FileAccess { return pi.fileAccess },
-		GetViews:          func() versioning.WorkspaceViewAccess { return pi.workspaceViews },
-		DefaultPipelineID: func() string { return pi.pipelineID },
-	}
+	// Phase 2.K / CR-2: Inspector-pipeline is read-only — writeCfg
+	// removed because it no longer registers workspace_write.
+	// Phase 2.K / GI-C refactor: run_linter + run_type_checker +
+	// run_formatter_check + run_security_scan + analyze_complexity +
+	// detect_deadlocks + detect_memory_leaks collapsed into
+	// run_analyzer(kind=…).
+	pi.skills.Register(shared.RunAnalyzerSkill(pi.toolRunner))
+	pi.skills.Register(bashSkill(pi))
+	// read_file / glob / grep dropped — workspace_read covers all
+	// three via op=read|glob|grep with explicit view selection.
+	// Phase 2.K / CR-2 refactor: 12 workspace skills collapsed to 3
+	// verb-dispatched primitives. Inspector-pipeline is read-only —
+	// it gets workspace_read but NOT prepare_write_context or
+	// workspace_write (its role is audit, not mutation).
+	inspectorPipelineGetViews := func() versioning.WorkspaceViewAccess { return pi.workspaceViews }
+	inspectorPipelineGetFA := func() versioning.FileAccess { return pi.fileAccess }
+	inspectorPipelineDefaultPipelineID := func() string { return pi.pipelineID }
+	pi.skills.Register(versioning.NewWorkspaceReadSkill(versioning.WorkspaceReadSkillConfig{
+		GetViews:          inspectorPipelineGetViews,
+		GetFileAccess:     inspectorPipelineGetFA,
+		DefaultPipelineID: inspectorPipelineDefaultPipelineID,
+	}))
 
-	// Shared analysis skills.
-	pi.skills.Register(shared.RunLinterSkill(pi.toolRunner))
-	pi.skills.Register(shared.RunTypeCheckerSkill(pi.toolRunner))
-	pi.skills.Register(shared.RunFormatterCheckSkill(pi.toolRunner))
-	pi.skills.Register(shared.RunSecurityScanSkill(pi.toolRunner))
-	pi.skills.Register(shared.AnalyzeComplexitySkill(pi.toolRunner))
-	pi.skills.Register(shared.DetectDeadlocksSkill(pi.toolRunner))
-	pi.skills.Register(shared.DetectMemoryLeaksSkill(pi.toolRunner))
-	pi.skills.Register(runCommandSkill(pi))
-	pi.skills.Register(runShellScriptSkill(pi))
-	faFunc := func() shared.FileAccess { return pi.fileAccess }
-	pi.skills.Register(shared.ReadFileSkill(faFunc))
-	pi.skills.Register(shared.GlobSkill(faFunc))
-	pi.skills.Register(shared.GrepSkill(faFunc))
-	pi.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
-	pi.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
-	pi.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
-	pi.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
-	pi.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
-	pi.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }, nil))
-	pi.skills.Register(versioning.NewPreparePipelineWriteContextSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }, nil))
-	pi.skills.Register(versioning.NewListPipelineChangesSkill(func() versioning.FileAccess { return pi.fileAccess }))
-	pi.skills.Register(versioning.NewWritePipelineFileSkill(writeCfg))
-	pi.skills.Register(versioning.NewEditPipelineFileSkill(writeCfg))
-	pi.skills.Register(versioning.NewDeletePipelineFileSkill(writeCfg))
-	pi.skills.Register(versioning.NewCreatePipelineDirectorySkill(writeCfg))
-
-	// Design validation skills (always registered — LLM selects based on context).
-	pi.skills.Register(shared.ValidateTokenUsageSkill(pi.toolRunner))
-	pi.skills.Register(shared.ValidateAccessibilitySkill(pi.toolRunner))
-	pi.skills.Register(shared.ValidateComponentAPISkill(pi.toolRunner))
-	pi.skills.Register(shared.ValidateDesignConsistencySkill(pi.toolRunner))
+	// Phase 2.K / 10.B refactor: validate_token_usage +
+	// validate_accessibility + validate_component_api +
+	// validate_design_consistency collapsed into
+	// validate_ui_compliance(aspect=…).
+	pi.skills.Register(shared.ValidateUIComplianceSkill(pi.toolRunner))
 
 	// Pipeline-specific skills.
 	pi.skills.Register(defineCriteriaSkill(pi))
 	pi.skills.Register(validateCriteriaSkill(pi))
 	pi.skills.Register(gradeTaskQualitySkill(pi))
-	pi.skills.Register(requestCorrectionSkill(pi))
 	pi.skills.Register(requestOverrideSkill(pi))
-	pi.skills.Register(getValidationStatusSkill(pi))
-	pi.skills.Register(researchDependencyInstallSkill(pi))
-	pi.skills.Register(installDependencyToolingSkill(pi))
+	// Phase 1 refactor:
+	//   - request_correction removed. Inspector uses challenge_peer
+	//     with target_activity_id = offending artifact_published /
+	//     validation_rejected fabric activity ID.
+	//   - get_validation_status removed. Derived from
+	//     query_peer_activity(kinds=["validation_started",
+	//     "validation_accepted","validation_rejected"]) +
+	//     query_pipeline_state.
+	// Phase 2.K / GT-4 + GI-5 refactor: collapsed into dependency(action=…).
+	pi.skills.Register(dependencySkill(pi))
 
 	for _, skill := range agentShared.CoordinationSkills(agentShared.CoordinationSkillConfig{
 		Client: agentShared.CoordinationClient{
@@ -102,6 +98,15 @@ func (pi *PipelineInspector) registerCoreSkills() {
 		AgentID:    func() string { return pi.id },
 		AgentType:  func() string { return "inspector-pipeline" },
 		PipelineID: func() string { return pi.pipelineID },
+		RouteSync: agentShared.RouteSyncFromBus(
+			func() guide.EventBus { return pi.bus },
+			func() string {
+				if pi.channels == nil {
+					return ""
+				}
+				return pi.channels.Responses
+			},
+		),
 	}) {
 		pi.skills.Register(skill)
 	}
@@ -245,6 +250,24 @@ func defineCriteriaSkill(pi *PipelineInspector) *skills.Skill {
 
 			pi.DefineCriteria(taskID, criteria)
 
+			// Phase 4 refactor: emit a charter-style decision so
+			// tester/engineer see the quality contract in their
+			// ambient context. Previously the criteria lived only in
+			// inspector-local memory.
+			summary := fmt.Sprintf("%d criteria, %d gates, %d constraints", len(criteria.SuccessCriteria), len(criteria.QualityGates), len(criteria.Constraints))
+			agentShared.AutoPublishCommitted(ctx, agentShared.AutoPublishInput{
+				SessionID:        pi.config.SessionID,
+				AuthorAgentID:    pi.id,
+				AuthorAgentType:  "inspector-pipeline",
+				AuthorPipelineID: pi.pipelineID,
+				TriggerSkill:     "define_criteria",
+				Domain:           "success_criteria",
+				Value:            summary,
+				Scope:            taskID,
+				Coordinates:      map[string]string{"task_id": taskID},
+				Evidence:         []string{summary},
+			})
+
 			response := map[string]any{
 				"task_id":           taskID,
 				"criteria_defined":  true,
@@ -387,9 +410,46 @@ func validateCriteriaSkill(pi *PipelineInspector) *skills.Skill {
 			if len(params.Files) > 0 {
 				files = params.Files
 			}
+			// Phase 4 refactor: wrap validation with fabric
+			// activities so peer pipelines see the pass/fail outcome
+			// in ambient context. Emit started before running, then
+			// accepted/rejected based on result.Passed.
+			startedID := agentShared.AutoPublishValidationStarted(ctx, agentShared.AutoPublishValidationInput{
+				SessionID:       pi.config.SessionID,
+				ActorAgentID:    pi.id,
+				ActorAgentType:  "inspector-pipeline",
+				ActorPipelineID: pi.pipelineID,
+				TriggerSkill:    "validate_criteria",
+				EpochID:         taskID,
+				Scope:           taskID,
+				Summary:         fmt.Sprintf("validating %d files against %d criteria", len(files), len(criteria.SuccessCriteria)),
+			})
 			result, err := pi.ValidateAgainstCriteria(ctx, taskID, files, workerType)
 			if err != nil {
 				return nil, err
+			}
+			validationSummary := fmt.Sprintf("passed=%t issues=%d met=%d failed=%d", result.Passed, len(result.Issues), len(result.CriteriaMet), len(result.CriteriaFailed))
+			evidence := make([]string, 0, len(result.Issues))
+			for _, issue := range result.Issues {
+				evidence = append(evidence, issue.Message)
+			}
+			validationInput := agentShared.AutoPublishValidationInput{
+				SessionID:       pi.config.SessionID,
+				ActorAgentID:    pi.id,
+				ActorAgentType:  "inspector-pipeline",
+				ActorPipelineID: pi.pipelineID,
+				TriggerSkill:    "validate_criteria",
+				EpochID:         taskID,
+				Scope:           taskID,
+				Summary:         validationSummary,
+				Evidence:        evidence,
+				IssueCount:      len(result.Issues),
+				FailureCount:    len(result.CriteriaFailed),
+			}
+			if result.Passed {
+				agentShared.AutoPublishValidationAccepted(ctx, validationInput, startedID)
+			} else {
+				agentShared.AutoPublishValidationRejected(ctx, validationInput, startedID)
 			}
 			response := map[string]any{
 				"task_id":              taskID,
@@ -458,10 +518,26 @@ func gradeTaskQualitySkill(pi *PipelineInspector) *skills.Skill {
 
 			grade := qualityGradeForResult(result, workerType)
 
+			// Phase 4 refactor: emit grade as a decision so peers
+			// see the inspector's judgment in ambient context.
+			overall := grade.OverallForDomain(shared.ValidationDomainFromWorkerType(workerType))
+			agentShared.AutoPublishCommitted(ctx, agentShared.AutoPublishInput{
+				SessionID:        pi.config.SessionID,
+				AuthorAgentID:    pi.id,
+				AuthorAgentType:  "inspector-pipeline",
+				AuthorPipelineID: pi.pipelineID,
+				TriggerSkill:     "grade_task_quality",
+				Domain:           "quality_grade",
+				Value:            fmt.Sprintf("%v", overall),
+				Scope:            taskID,
+				Coordinates:      map[string]string{"task_id": taskID},
+				Evidence:         []string{fmt.Sprintf("issues=%d", len(result.Issues))},
+			})
+
 			response := map[string]any{
 				"task_id":        taskID,
 				"grade":          grade,
-				"overall":        grade.OverallForDomain(shared.ValidationDomainFromWorkerType(workerType)),
+				"overall":        overall,
 				"issue_count":    len(result.Issues),
 				"validation_ran": validationRan,
 			}
@@ -469,58 +545,6 @@ func gradeTaskQualitySkill(pi *PipelineInspector) *skills.Skill {
 				response["requested_task_id"] = strings.TrimSpace(params.TaskID)
 			}
 			return response, nil
-		}).
-		Build()
-}
-
-func requestCorrectionSkill(pi *PipelineInspector) *skills.Skill {
-	return skills.NewSkill("request_correction").
-		Description("Route corrections back to the responsible agent for fixing.").
-		Domain("validation").
-		Keywords("correction", "fix", "feedback").
-		Priority(95).
-		Usage("Use after you have concrete validation findings that require Engineer or Designer follow-up.").
-		Requirement("Requires specific corrections grounded in criteria failures or validation findings.").
-		Satisfies("Creates a downstream correction request for the responsible agent.").
-		Avoid("Do not use for vague concerns that have not been turned into explicit corrections.").
-		StringParam("target_agent", "Agent to send corrections to (engineer/designer)", true).
-		ArrayParam("corrections", "List of corrections to apply", "object", true).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				TargetAgent string              `json:"target_agent"`
-				Corrections []shared.Correction `json:"corrections"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			if params.TargetAgent == "" {
-				return nil, fmt.Errorf("target_agent is required")
-			}
-			if len(params.Corrections) == 0 {
-				return nil, fmt.Errorf("at least one correction is required")
-			}
-
-			// Route via sync bus RPC if available
-			if pi.bus != nil {
-				correctionPayload := map[string]any{
-					"type":        "correction_request",
-					"corrections": params.Corrections,
-					"source":      pi.id,
-				}
-				payload, _ := json.Marshal(correctionPayload)
-
-				resp, err := pi.requestRouteSync(ctx, params.TargetAgent, string(payload))
-				if err != nil {
-					pi.logger.Warn("correction routing failed", "target", params.TargetAgent, "error", err)
-				}
-				_ = resp
-			}
-
-			return map[string]any{
-				"routed":           true,
-				"target":           params.TargetAgent,
-				"correction_count": len(params.Corrections),
-			}, nil
 		}).
 		Build()
 }
@@ -558,43 +582,3 @@ func requestOverrideSkill(pi *PipelineInspector) *skills.Skill {
 		Build()
 }
 
-func getValidationStatusSkill(pi *PipelineInspector) *skills.Skill {
-	return skills.NewSkill("get_validation_status").
-		Description("Return the current task validation status, including whether validation is still pending or implementation evidence is available.").
-		Domain("validation").
-		Keywords("status", "state", "result").
-		Priority(75).
-		Usage("Use to make the current inspection mode explicit: pending contract synthesis versus implementation validation with real evidence.").
-		Satisfies("Provides reusable pending-validation or implementation-evidence state for coordination artifacts and final reporting.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			taskID, _ := pi.resolveTaskID("")
-			criteriaDefined := false
-			validationResultAvailable := false
-			if taskID != "" {
-				criteriaDefined = pi.hasCriteria(taskID)
-				validationResultAvailable = pi.hasValidationResult(taskID)
-			}
-			contract := agentShared.TaskExecutionContractFromContext(ctx)
-			pendingValidation := !validationResultAvailable
-			hasImplementationEvidence := false
-			if contract != nil {
-				pendingValidation = contract.PreImplementation
-				hasImplementationEvidence = contract.HasImplementationEvidence
-				if taskID == "" {
-					criteriaDefined = contract.CriteriaDefined
-					validationResultAvailable = contract.ValidationResultAvailable
-				}
-			}
-			state := pi.getState()
-			return map[string]any{
-				"task_id":                     taskID,
-				"state":                       state,
-				"running":                     pi.running,
-				"criteria_defined":            criteriaDefined,
-				"validation_result_available": validationResultAvailable,
-				"pending_validation":          pendingValidation,
-				"has_implementation_evidence": hasImplementationEvidence,
-			}, nil
-		}).
-		Build()
-}

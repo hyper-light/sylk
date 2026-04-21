@@ -22,17 +22,29 @@ func DefaultRotationPolicy() RotationPolicy {
 }
 
 // JSONLEntry is a single structured log record written to the JSONL file.
+//
+// Design-doc fields (pipeline_id, tool_call_key, llm_call_id, agent_id,
+// msg, fields) were added on top of the original shape to support the
+// unified logging scheme — see docs/LOGGING.md. Existing callers that
+// only populate the original fields continue to work; sylk trace and
+// newer emitters read the additional fields when present.
 type JSONLEntry struct {
-	Timestamp  time.Time `json:"ts"`
-	Level      string    `json:"level"`
-	Agent      string    `json:"agent"`
-	SessionID  string    `json:"session_id"`
-	Event      string    `json:"event"`
-	EventCode  EventType `json:"event_code"`
-	CorrID     string    `json:"corr_id,omitempty"`
-	DurationNs int64     `json:"dur_ns,omitempty"`
-	Data       any       `json:"data,omitempty"`
-	Error      string    `json:"err,omitempty"`
+	Timestamp   time.Time `json:"ts"`
+	Level       string    `json:"level"`
+	Agent       string    `json:"agent"`
+	AgentID     string    `json:"agent_id,omitempty"`
+	PipelineID  string    `json:"pipeline_id,omitempty"`
+	SessionID   string    `json:"session_id"`
+	Event       string    `json:"event"`
+	EventCode   EventType `json:"event_code"`
+	Message     string    `json:"msg,omitempty"`
+	CorrID      string    `json:"corr_id,omitempty"`
+	ToolCallKey string    `json:"tool_call_key,omitempty"`
+	LLMCallID   string    `json:"llm_call_id,omitempty"`
+	DurationNs  int64     `json:"dur_ns,omitempty"`
+	Data        any       `json:"data,omitempty"`
+	Fields      any       `json:"fields,omitempty"`
+	Error       string    `json:"err,omitempty"`
 }
 
 // JSONLWriter is a time-rotated, buffered JSONL file writer with coalesced sync.

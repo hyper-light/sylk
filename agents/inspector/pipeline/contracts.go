@@ -300,11 +300,25 @@ func (pi *PipelineInspector) runValidationTool(
 	if pi.toolRuntime() == nil {
 		return nil, fmt.Errorf("tool runtime is not configured")
 	}
-	if _, err := pi.toolRuntime().Activate(toolName); err != nil {
+
+	// Phase 2.K / GI-C: all legacy analyzer names route through
+	// run_analyzer(kind=…).
+	// Phase 2.K / 10.B: all legacy UI-compliance names route through
+	// validate_ui_compliance(aspect=…).
+	// The gate result map still keys off the logical tool name so
+	// evaluateQualityGates stays unchanged.
+	invocationName := toolName
+	args := map[string]any{"paths": paths}
+	if kind, ok := legacyAnalyzerKindForTool(toolName); ok {
+		invocationName = "run_analyzer"
+		args["kind"] = kind
+	} else if aspect, ok := legacyUIComplianceAspectForTool(toolName); ok {
+		invocationName = "validate_ui_compliance"
+		args["aspect"] = aspect
+	}
+	if _, err := pi.toolRuntime().Activate(invocationName); err != nil {
 		return nil, err
 	}
-
-	args := map[string]any{"paths": paths}
 	switch toolName {
 	case "check_coverage":
 		args["threshold"] = defaultCoverageThreshold
@@ -325,7 +339,7 @@ func (pi *PipelineInspector) runValidationTool(
 	result, err := pi.toolRuntime().ExecuteRaw(ctx, toolruntime.Invocation{
 		ToolCall: providers.ToolCall{
 			ID:        "invoke_" + uuid.NewString(),
-			Name:      toolName,
+			Name:      invocationName,
 			Arguments: string(rawArgs),
 		},
 		AgentID:         pi.toolRuntime().AgentID(),
@@ -337,6 +351,54 @@ func (pi *PipelineInspector) runValidationTool(
 	}
 
 	return decodeValidationIssues(result.Data)
+}
+
+// legacyAnalyzerKindForTool maps the pre-§10.K analyzer skill names to
+// the run_analyzer kind enum. Returns ok=false when toolName is not an
+// analyzer (e.g., validate_token_usage), so the caller can invoke it
+// directly.
+func legacyAnalyzerKindForTool(toolName string) (string, bool) {
+	switch toolName {
+	case "run_linter":
+		return "lint", true
+	case "run_type_checker":
+		return "typecheck", true
+	case "run_formatter_check":
+		return "format_check", true
+	case "run_security_scan":
+		return "security", true
+	case "check_coverage":
+		return "coverage", true
+	case "analyze_complexity":
+		return "complexity", true
+	case "detect_race_conditions":
+		return "race", true
+	case "detect_deadlocks":
+		return "deadlock", true
+	case "detect_memory_leaks":
+		return "memory_leak", true
+	default:
+		return "", false
+	}
+}
+
+// legacyUIComplianceAspectForTool maps the pre-§10.B UI-compliance skill
+// names to the validate_ui_compliance aspect enum. Returns ok=false
+// when toolName is not a UI-compliance scan, so the caller can invoke
+// it directly.
+func legacyUIComplianceAspectForTool(toolName string) (string, bool) {
+	switch toolName {
+	case "validate_token_usage":
+		return "tokens", true
+	case "validate_accessibility":
+		return "a11y", true
+	case "validate_component_api":
+		return "component_api", true
+	case "validate_design_consistency":
+		return "consistency", true
+	default:
+		return "", false
+	}
 }
 
 func decodeValidationIssues(data any) ([]shared.ValidationIssue, error) {

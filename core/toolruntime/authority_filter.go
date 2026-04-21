@@ -2,15 +2,21 @@ package toolruntime
 
 import "github.com/adalundhe/sylk/core/authority"
 
+// workspaceViewToolNames retains the per-op underlying builders (which
+// workspace_read dispatches to internally) so authority classification
+// still recognizes them if they ever flow through the filter. The
+// consolidated workspace_read skill itself is classified by domain
+// (filesystem → disk-read) at the policy level — it isn't in this
+// registry because its op space covers both reads and the write
+// preflight; authority checks against workspace_read happen at the
+// policy level rather than by name.
 var workspaceViewToolNames = map[string]struct{}{
-	"read_workspace_file":            {},
-	"workspace_glob":                 {},
-	"workspace_grep":                 {},
-	"inspect_workspace_state":        {},
-	"summarize_workspace_state":      {},
-	"diff_workspace_file":            {},
-	"prepare_pipeline_write_context": {},
-	"prepare_global_write_context":   {},
+	"read_workspace_file":       {},
+	"workspace_glob":            {},
+	"workspace_grep":            {},
+	"inspect_workspace_state":   {},
+	"summarize_workspace_state": {},
+	"diff_workspace_file":       {},
 }
 
 var diskWriteToolNames = map[string]struct{}{
@@ -21,21 +27,18 @@ var diskWriteToolNames = map[string]struct{}{
 }
 
 var executionToolNames = map[string]struct{}{
-	"ast_grep_search":        {},
-	"check_coverage":         {},
-	"detect_deadlocks":       {},
-	"detect_memory_leaks":    {},
-	"detect_race_conditions": {},
-	"format":                 {},
-	"git":                    {},
-	"lint":                   {},
-	"lsp":                    {},
-	"run_command":            {},
-	"run_formatter_check":    {},
-	"run_linter":             {},
-	"run_security_scan":      {},
-	"run_test_suite":         {},
-	"run_type_checker":       {},
+	"ast_grep_search": {},
+	"bash":            {},
+	"format":          {},
+	"git":             {},
+	"lint":            {},
+	"lsp":             {},
+	// Phase 2.K / GI-C: run_linter + run_type_checker +
+	// run_formatter_check + run_security_scan + check_coverage +
+	// analyze_complexity + detect_race_conditions + detect_deadlocks +
+	// detect_memory_leaks collapsed into run_analyzer(kind=…).
+	"run_analyzer":   {},
+	"run_test_suite": {},
 }
 
 func ApplyAuthorityProfile(agentType string, manifest *PolicyManifest) *PolicyManifest {

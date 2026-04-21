@@ -71,20 +71,24 @@ func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToOT(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
+	// Phase 1 refactor: get_validation_status removed. The grace-turn
+	// flow now exercises query_pipeline_state for the same purpose
+	// (surfacing protocol-lifecycle state before finalize).
 	provider := &scriptedPipelineProvider{
 		responses: []*providers.Response{
 			{
 				ToolCalls: []providers.ToolCall{{
 					ID:        "tool-1",
-					Name:      "get_validation_status",
+					Name:      "query_pipeline_state",
 					Arguments: `{}`,
 				}},
 			},
 			{
 				ToolCalls: []providers.ToolCall{{
 					ID:   "tool-2",
-					Name: "finalize_pipeline",
+					Name: "pipeline_protocol",
 					Arguments: `{
+						"action":"finalize",
 						"summary":"Tester-backed audit passed.",
 						"evidence_refs":["artifact:inspector"]
 					}`,
@@ -208,8 +212,9 @@ func TestHandle_UsesFinalizePipelineToolResultToDriveImmediateHandoffToOT(t *tes
 			{
 				ToolCalls: []providers.ToolCall{{
 					ID:   "tool-finalize",
-					Name: "finalize_pipeline",
+					Name: "pipeline_protocol",
 					Arguments: `{
+						"action":"finalize",
 						"summary":"Tester-backed audit passed.",
 						"evidence_refs":["artifact:inspector"]
 					}`,
@@ -324,8 +329,9 @@ func TestHandle_PostValidationAuditContinuesFromToolResultsWithoutInjectedUserPr
 			{
 				ToolCalls: []providers.ToolCall{{
 					ID:   "tool-process",
-					Name: "process_validation",
+					Name: "pipeline_protocol",
 					Arguments: `{
+						"action":"process_validation",
 						"challenge_id":"challenge-post-validation",
 						"decision":"accept",
 						"summary":"Accepted tester validation and will perform a direct audit before closure."
@@ -333,17 +339,20 @@ func TestHandle_PostValidationAuditContinuesFromToolResultsWithoutInjectedUserPr
 				}},
 			},
 			{
+				// Phase 2.K / CR-2: inspect_workspace_state collapsed
+				// into workspace_read(op=inspect).
 				ToolCalls: []providers.ToolCall{{
 					ID:        "tool-inspect",
-					Name:      "inspect_workspace_state",
-					Arguments: `{"path":"examples/hello-py/pyproject.toml"}`,
+					Name:      "workspace_read",
+					Arguments: `{"op":"inspect","path":"examples/hello-py/pyproject.toml"}`,
 				}},
 			},
 			{
 				ToolCalls: []providers.ToolCall{{
 					ID:   "tool-finalize",
-					Name: "finalize_pipeline",
+					Name: "pipeline_protocol",
 					Arguments: `{
+						"action":"finalize",
 						"summary":"The direct audit confirms the implementation is correct and the remaining failures were environmental.",
 						"evidence_refs":["examples/hello-py/pyproject.toml","examples/hello-py/tests/test_pyproject.py"]
 					}`,
@@ -376,10 +385,10 @@ func TestHandle_PostValidationAuditContinuesFromToolResultsWithoutInjectedUserPr
 				}
 				last := req.Messages[len(req.Messages)-1]
 				if last.Role != providers.RoleTool {
-					return fmt.Errorf("last message role = %q, want tool after process_validation", last.Role)
+					return fmt.Errorf("last message role = %q, want tool after pipeline_protocol(action=process_validation)", last.Role)
 				}
-				if last.ToolName != "process_validation" {
-					return fmt.Errorf("last tool name = %q, want process_validation", last.ToolName)
+				if last.ToolName != "pipeline_protocol" {
+					return fmt.Errorf("last tool name = %q, want pipeline_protocol", last.ToolName)
 				}
 				return nil
 			},
@@ -391,8 +400,8 @@ func TestHandle_PostValidationAuditContinuesFromToolResultsWithoutInjectedUserPr
 				if last.Role != providers.RoleTool {
 					return fmt.Errorf("last message role = %q, want tool after direct audit", last.Role)
 				}
-				if last.ToolName != "inspect_workspace_state" {
-					return fmt.Errorf("last tool name = %q, want inspect_workspace_state", last.ToolName)
+				if last.ToolName != "workspace_read" {
+					return fmt.Errorf("last tool name = %q, want workspace_read (formerly inspect_workspace_state)", last.ToolName)
 				}
 				return nil
 			},

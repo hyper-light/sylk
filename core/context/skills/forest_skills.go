@@ -72,6 +72,70 @@ type ForestOutcomeOutput struct {
 	Recorded bool `json:"recorded"`
 }
 
+// NewForestSkill returns the consolidated `forest(op=…)` skill that
+// replaces the four separate read-side forest skills
+// (forest_resolve_intent, forest_recall, recall_recent,
+// forest_predict_next_branches) in the LLM catalog. Op dispatch routes
+// to the existing per-op builders so behavior is unchanged; the
+// surface the agent sees is one verb with four ops.
+//
+// forest_record_outcome stays a distinct skill — it's the only
+// mutating entry point in the forest surface and its name makes the
+// write semantics obvious to the model.
+func NewForestSkill(deps *RetrievalDependencies) *skills.Skill {
+	resolveIntent := NewForestResolveIntentSkill(deps)
+	recall := NewForestRecallSkill(deps)
+	recallRecent := NewRecallRecentSkill(deps)
+	predictNext := NewForestPredictNextSkill(deps)
+
+	return skills.NewSkill("forest").
+		Description("Query the Memory Forest. One primitive for every read-side operation across session/task/project horizons.\n\n"+
+			"Ops:\n"+
+			"- resolve_intent: Resolve the active user intent, constraints, preferences, and likely outcome hints (params: query, horizon?, limit?)\n"+
+			"- recall: Retrieve ranked branch packets with support, conflicts, and next-action hints (params: query, horizon?, families?, limit?, include_counter_evidence?)\n"+
+			"- recall_recent: Recover recent preserved context so a terse follow-up can continue from earlier discussion (params: query?, horizon?, limit?, include_counter_evidence?)\n"+
+			"- predict_next: Predict low-risk adjacent branches that could safely improve the current work (params: query, horizon?, limit?)").
+		Domain(RetrievalDomain).
+		Keywords("forest", "memory", "recall", "intent", "constraint", "preference", "precedent", "branch", "history", "continuity", "predict", "adjacent").
+		Priority(100).
+		EnumParam("op", "Forest query operation", []string{"resolve_intent", "recall", "recall_recent", "predict_next"}, true).
+		StringParam("query", "Natural language query (required for resolve_intent/recall/predict_next; optional for recall_recent)", false).
+		StringParam("session_id", "Optional session identifier", false).
+		StringParam("task_id", "Optional task identifier for task-scoped queries", false).
+		StringParam("intent_id", "Optional explicit intent identifier", false).
+		EnumParam("horizon", "Optional canopy horizon: turn, task, session, user, or project.", []string{
+			string(forest.CanopyHorizonTurn),
+			string(forest.CanopyHorizonTask),
+			string(forest.CanopyHorizonSession),
+			string(forest.CanopyHorizonUser),
+			string(forest.CanopyHorizonProject),
+		}, false).
+		ArrayParam("families", "Optional tree families to constrain recall/recall_recent", "string", false).
+		IntParam("limit", "Maximum number of packets to return", false).
+		BoolParam("include_counter_evidence", "Whether to include contradictory evidence (recall/recall_recent)", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var probe struct {
+				Op string `json:"op"`
+			}
+			if err := json.Unmarshal(input, &probe); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			switch strings.TrimSpace(probe.Op) {
+			case "resolve_intent":
+				return resolveIntent.Handler(ctx, input)
+			case "recall":
+				return recall.Handler(ctx, input)
+			case "recall_recent", "":
+				return recallRecent.Handler(ctx, input)
+			case "predict_next":
+				return predictNext.Handler(ctx, input)
+			default:
+				return nil, fmt.Errorf("unknown forest op: %q (expected resolve_intent|recall|recall_recent|predict_next)", probe.Op)
+			}
+		}).
+		Build()
+}
+
 // NewForestResolveIntentSkill creates the forest_resolve_intent skill.
 func NewForestResolveIntentSkill(deps *RetrievalDependencies) *skills.Skill {
 	return skills.NewSkill("forest_resolve_intent").

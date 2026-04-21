@@ -261,16 +261,97 @@ func decodePlanHandoffStatusRequest(raw string) (*agentshared.PlanHandoffStatusR
 func (o *Orchestrator) handlePlanHandoffStatusForward(_ context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	req, err := decodePlanHandoffStatusRequest(fwd.Input)
 	if err != nil {
+		o.logTrace("plan_handoff_status_forward_decode_failed", agentlog.EventError, map[string]any{
+			"input_len": len(fwd.Input),
+			"error":     err.Error(),
+		})
 		return nil, err
 	}
+	o.logInfo("handlePlanHandoffStatusForward: lookup requested by architect",
+		"plan_id", req.PlanID,
+		"session_id", req.SessionID,
+		"revision", req.Revision)
 	normalized, found, err := o.lookupNormalizedPlanHandoffReceipt(req)
 	if err != nil {
+		o.logTrace("plan_handoff_status_forward_lookup_failed", agentlog.EventError, map[string]any{
+			"plan_id":    req.PlanID,
+			"session_id": req.SessionID,
+			"revision":   req.Revision,
+			"error":      err.Error(),
+		})
 		return nil, err
 	}
+	o.logPlanHandoffStatusLookupResult(req, normalized, found)
 	return &agentshared.PlanHandoffStatusResponse{
 		Found:   found,
 		Receipt: payloadFromPlanHandoffReceipt(normalized),
 	}, nil
+}
+
+func (o *Orchestrator) logPlanHandoffStatusLookupResult(
+	req *agentshared.PlanHandoffStatusRequest,
+	receipt *PlanHandoffReceiptRecord,
+	found bool,
+) {
+	fields := map[string]any{
+		"plan_id":     req.PlanID,
+		"session_id":  req.SessionID,
+		"revision":    req.Revision,
+		"found":       found,
+		"receipt_nil": receipt == nil,
+	}
+	dagAlive := false
+	if receipt != nil {
+		fields["receipt_id"] = receipt.ReceiptID
+		fields["receipt_status"] = string(receipt.Status)
+		fields["dag_id"] = receipt.DAGID
+		fields["workflow_id"] = receipt.WorkflowID
+		fields["task_count"] = receipt.TaskCount
+		fields["layer_count"] = receipt.LayerCount
+		fields["error_text"] = receipt.ErrorText
+		fields["updated_at"] = receipt.UpdatedAt
+		if o.store != nil && strings.TrimSpace(receipt.DAGID) != "" {
+			row, rowErr := o.store.GetDAGExecution(receipt.DAGID)
+			if rowErr == nil && row != nil {
+				dagAlive = true
+				fields["dag_state"] = row.State
+			}
+			if rowErr != nil {
+				fields["dag_lookup_error"] = rowErr.Error()
+			}
+			fields["dag_alive"] = dagAlive
+		}
+	}
+	o.logInfo("handlePlanHandoffStatusForward: returning receipt to architect",
+		"plan_id", req.PlanID,
+		"session_id", req.SessionID,
+		"found", found,
+		"receipt_status", receiptRecordStatusForLog(receipt),
+		"dag_id", receiptRecordDAGIDForLog(receipt),
+		"dag_alive", dagAlive)
+	o.logTrace("plan_handoff_status_forward_result", agentlog.EventTaskDispatched, fields)
+	if receipt != nil && strings.TrimSpace(receipt.DAGID) != "" && !dagAlive {
+		o.logWarnMsg("handlePlanHandoffStatusForward: GHOST RECEIPT — returning receipt with dag_id that no longer exists in DAGExecution store; architect will falsely announce 'DAG X is now running'",
+			"plan_id", req.PlanID,
+			"session_id", req.SessionID,
+			"dag_id", receipt.DAGID,
+			"receipt_status", string(receipt.Status),
+			"receipt_updated_at", receipt.UpdatedAt)
+	}
+}
+
+func receiptRecordStatusForLog(r *PlanHandoffReceiptRecord) string {
+	if r == nil {
+		return ""
+	}
+	return string(r.Status)
+}
+
+func receiptRecordDAGIDForLog(r *PlanHandoffReceiptRecord) string {
+	if r == nil {
+		return ""
+	}
+	return r.DAGID
 }
 
 func (o *Orchestrator) lookupNormalizedPlanHandoffReceipt(

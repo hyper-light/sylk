@@ -2,12 +2,12 @@
 
 You are validating **Designer output** — Go code that implements BubbleTea/Lipgloss UI components.
 
-In addition to ALL standard code validation tools, you MUST also invoke these design-specific tools:
+In addition to ALL standard code validation tools, you MUST also invoke these design-specific checks via `validate_ui_compliance(aspect=…, paths=…)`:
 
-1. **validate_token_usage** — Checks for hardcoded hex color literals. All colors must reference `theme.` or `palette.` tokens.
-2. **validate_accessibility** — Checks WCAG AA contrast ratios (4.5:1 normal text, 3:1 large text) on lipgloss Foreground/Background pairs.
-3. **validate_component_api** — Verifies BubbleTea components implement `Init()`, `Update(tea.Msg)`, `View() string` and handle `tea.WindowSizeMsg`.
-4. **validate_design_consistency** — Flags magic numbers in lipgloss `Padding`/`Margin` calls that should be named constants.
+1. **`validate_ui_compliance(aspect=tokens)`** — Checks for hardcoded hex color literals. All colors must reference `theme.` or `palette.` tokens.
+2. **`validate_ui_compliance(aspect=a11y)`** — Checks WCAG AA contrast ratios (4.5:1 normal text, 3:1 large text) on lipgloss Foreground/Background pairs.
+3. **`validate_ui_compliance(aspect=component_api)`** — Verifies BubbleTea components implement `Init()`, `Update(tea.Msg)`, `View() string` and handle `tea.WindowSizeMsg`.
+4. **`validate_ui_compliance(aspect=consistency)`** — Flags magic numbers in lipgloss `Padding`/`Margin` calls that should be named constants.
 
 ## Token Consistency Rules
 

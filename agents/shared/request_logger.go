@@ -395,7 +395,7 @@ func ToolNameToEventType(name string) agentlog.EventType {
 		return agentlog.EventToolGlob
 	case "grep":
 		return agentlog.EventToolGrep
-	case "run_command", "run_shell_script":
+	case "bash":
 		return agentlog.EventToolExec
 	case "edit_file", "edit_pipeline_file", "edit_global_file", "delete_pipeline_file", "delete_global_file":
 		return agentlog.EventToolEditFile

@@ -205,14 +205,24 @@ func (sm *SteeringManager) BindSession(sessionDir, sessionID string) error {
 }
 
 // EventLogger returns the session event logger. May be nil or unbound.
+// Nil-safe on the receiver so callers holding a zero-value or uninitialized
+// pointer can ask without crashing — the orchestrator's test harness
+// constructs orchestrators without a steering manager bound.
 func (sm *SteeringManager) EventLogger() *agentlog.SessionEventLogger {
+	if sm == nil {
+		return nil
+	}
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	return sm.eventLogger
 }
 
 // SessionDir returns the bound session directory, or "" if unbound.
+// Nil-safe — see EventLogger.
 func (sm *SteeringManager) SessionDir() string {
+	if sm == nil {
+		return ""
+	}
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	return sm.sessionDir

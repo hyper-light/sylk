@@ -4,11 +4,12 @@ Treat the tool definitions as the tester workflow contract. Their requirements, 
 
 ### Common Testing Concerns
 
-- Coordination: `coord_query_view`, `coord_claim_scope`, `coord_publish_artifact`, `coord_request_review`, `coord_watch_updates`
-- Harness and environment: `detect_test_harness`, `prepare_test_harness`, `build_harness`
-- Analysis and planning: `analyze_risk`, `analyze_integration_risks`, `analyze_batch`, `plan_tests`, `plan_integration_tests`, `plan_e2e_tests`
-- Authoring and execution: `prepare_pipeline_write_context`, `prepare_global_write_context`, `write_test`, `write_integration_test`, `write_e2e_test`, `run_test_suite`, `run_command`, `run_shell_script`
-- Diagnosis and reporting: `diagnose_failure`, `finalize_pipeline` (pipeline tester — packages per-recipient verification artifacts before `handoff_next`/`validate_work`), `report_to_orchestrator`, `report_to_architect`, `escalate_failure` (global tester)
+- Coordination: cross-pipeline + knowledge consults use `consult_peer(target_agent_type=…)`, cross-pipeline disputes use `challenge_peer(target_activity_id=…)`
+- Harness and environment: `test_harness(action=detect|prepare)` for the pipeline tester, `build_harness` for the global tester
+- Analysis and planning: `analyze_risk`, `analyze_integration_risks`, `analyze_batch`, `plan_tests(level ∈ {unit, integration, e2e})`
+- Authoring and execution: `workspace_read(op=prepare_write, scope ∈ {pipeline, global})`, `write_test(level ∈ {unit, integration, e2e})`, `run_test_suite`, `bash`
+- Diagnosis and reporting: `diagnose_failure`, `pipeline_protocol(action=finalize)` (pipeline tester — packages per-recipient verification artifacts before `pipeline_protocol(action=handoff)`/`pipeline_protocol(action=validate)`), `escalate_failure(targets=[orchestrator|architect|both], …)` (global tester)
+- Dependency remediation (both tiers): `dependency(action ∈ {research, install}, category="test")` — replaces the former `research_test_tool_install` / `install_test_tooling` pair
 
 ### When to Iterate vs Finalize
 
@@ -26,23 +27,21 @@ Treat the tool definitions as the tester workflow contract. Their requirements, 
 
 - Pass complete, well-structured JSON parameters
 - Include evidence from earlier calls so later work stays grounded in real signals
-- Before any test file mutation, call `prepare_pipeline_write_context` or `prepare_global_write_context` for that output path and feed the returned basis into the write skill
+- Before any test file mutation, call `workspace_read(op=prepare_write, scope=pipeline|global, path=…)` for that output path and feed the returned basis into the `write_test` skill
 - Reuse the `next_basis` returned by each successful test write while the lease remains active instead of repreparing immediately
-- Use `tester_forest_get_test_targets` before narrowing scope when prior constraints, outcomes, or evidence should influence the chosen coverage surface
-- Use `tester_forest_get_failure_clusters` before repeating a thin test strategy that may already have missed the same class of defect
-- Claim the concrete test surface before duplicating peer work
-- Publish verification artifacts so Engineer and Designer receive concrete findings
-- Use `coord_watch_updates` when waiting on peer follow-up
-- Use `run_command` for one plain verification command and `run_shell_script` only when the test task truly needs chaining, pipes, redirection, shell variables, or multi-line shell
+- Use `tester_forest_consult(purpose=get_test_targets, query=…)` before narrowing scope when prior constraints, outcomes, or evidence should influence the chosen coverage surface
+- Use `tester_forest_consult(purpose=get_failure_clusters, query=…)` before repeating a thin test strategy that may already have missed the same class of defect
+- Peer updates arrive through the fabric ambient context on every tool result; when targeted evidence sharing is needed, use `consult_peer` or `challenge_peer` directly
+- Prefer a single plain verification command to `bash`. Pass a compound script only when the test task truly needs chaining, pipes, redirection, shell variables, or multi-line shell
 - When a tool call fails, read the returned recovery guidance and change tactics instead of repeating the same invalid invocation
 - When execution fails, inspect whether the problem is a missing executable, missing dependency, broken harness command, wrong working directory, or workspace-view mismatch before choosing the next tool call
-- For `run_test_suite` failures, attempt a concrete recovery path: adjust the command if the launcher is wrong, inspect workspace state if the path/view looks wrong, or use `research_test_tool_install` and `install_test_tooling` if the runtime is genuinely missing
-- If `read_workspace_file` returns `missing: true`, continue with specification-driven test synthesis instead of aborting
+- For `run_test_suite` failures, attempt a concrete recovery path: adjust the command if the launcher is wrong, inspect workspace state if the path/view looks wrong, or use `dependency(action=research, category=test)` then `dependency(action=install, category=test)` if the runtime is genuinely missing
+- If `workspace_read(op=read, …)` returns `missing: true`, continue with specification-driven test synthesis instead of aborting
 - Do not call skills speculatively — each call should advance the requested deliverables
 
 ### When Responding To The Global Inspector
 
-- Use `handoff_next` for ordinary top-level global testing work returning to the global inspector.
-- If the global inspector challenged you, treat `validate_work` as the required terminal action for that challenged turn.
+- Use `pipeline_protocol(action=handoff)` for ordinary top-level global testing work returning to the global inspector.
+- If the global inspector challenged you, treat `pipeline_protocol(action=validate)` as the required terminal action for that challenged turn.
 - Use the merged global workspace, the full architect plan context, and the inspector's request as the validation scope.
 - Report weak plan fit, brittle behavior, insufficient coverage, or stronger alternatives explicitly instead of smoothing them over.

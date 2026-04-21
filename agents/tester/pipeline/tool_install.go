@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -16,62 +15,15 @@ import (
 type testToolInstallStep = agentshared.DependencyInstallStep
 type testToolInstallPlan = agentshared.DependencyInstallPlan
 
-func researchTestToolInstallSkill(pt *PipelineTester) *skills.Skill {
-	type params struct {
-		MissingTool string   `json:"missing_tool,omitempty"`
-		Failure     string   `json:"failure,omitempty"`
-		FrameworkID string   `json:"framework_id,omitempty"`
-		RunCommand  string   `json:"run_command,omitempty"`
-		Files       []string `json:"files,omitempty"`
-		TaskSpec    string   `json:"task_spec,omitempty"`
-		WorkerType  string   `json:"worker_type,omitempty"`
-	}
-
-	return skills.NewSkill("research_test_tool_install").
-		Description("Ask Academic to research concrete installation steps for missing test tooling, then synthesize the result into an executable step plan.").
-		Domain("testing").
-		Keywords("install", "tooling", "missing dependency", "academic", "pytest", "vitest").
-		Priority(91).
-		Usage("Use when run_test_suite or harness preparation is blocked by missing test tooling. Pass the failing command/output so Academic can research concrete, project-aware install steps.").
-		Requirement("Provide the missing tool or the failing output that proves the current test command cannot run.").
-		Satisfies("Produces a concrete install plan that can be explained to the user and then executed through install_test_tooling with standard approval prompts.").
-		Avoid("Do not guess package-manager commands when this skill can research them first. Do not use it for ordinary test failures that are not missing-tool problems.").
-		StringParam("missing_tool", "Name of the missing executable or package if already known.", false).
-		StringParam("failure", "The failing test output or error that indicates missing tooling.", false).
-		StringParam("framework_id", "Detected framework identifier such as pytest or vitest.", false).
-		StringParam("run_command", "The test command that failed or is expected to fail.", false).
-		ArrayParam("files", "Relevant source or test files for project context.", "string", false).
-		StringParam("task_spec", "Task brief and acceptance criteria.", false).
-		StringParam("worker_type", "Primary worker type such as engineer or designer.", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var p params
-			if err := json.Unmarshal(input, &p); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			return pt.researchTestToolInstall(ctx, p.MissingTool, p.Failure, p.FrameworkID, p.RunCommand, p.Files, p.TaskSpec, p.WorkerType)
-		}).
-		Build()
-}
-
-func installTestToolingSkill(pt *PipelineTester) *skills.Skill {
-	return agentshared.NewDependencyInstallExecutionSkill(agentshared.DependencyInstallSkillConfig{
-		SkillName:     "install_test_tooling",
-		Description:   "Execute an approved test-tool installation plan step-by-step using the existing command-approval dialogue.",
-		Domain:        "testing",
-		Keywords:      []string{"install", "tooling", "dependency", "pytest", "vitest", "approval"},
-		Priority:      89,
-		Usage:         "Use after research_test_tool_install once you have a concrete plan to show the user. Each command goes through the existing approval dialogue and executes against the real disk workspace.",
-		Requirement:   "Provide a concrete summary and a list of single install commands. Each step must be one command without chaining or shell control operators.",
-		Satisfies:     "Installs missing test tooling to disk, captures command output, and optionally validates that the toolchain is now runnable.",
-		Avoid:         "Do not use for speculative dependency changes or for arbitrary shell work unrelated to restoring the test toolchain.",
-		ResearchSkill: "research_test_tool_install",
-		AgentType:     "tester-pipeline",
-		AgentID:       func() string { return pt.id },
-		SessionID:     func() string { return pt.config.SessionID },
-		WorkingDir:    pt.workingDir,
-		DefaultTimeout: func() time.Duration {
-			return pt.config.DefaultTimeout
+// Phase 2.K / GT-4 + GI-5 refactor: research_test_tool_install +
+// install_test_tooling collapsed into dependency(action=…, category="test").
+func dependencySkill(pt *PipelineTester) *skills.Skill {
+	return agentshared.NewDependencyManagementSkill(agentshared.DependencyManagementSkillConfig{
+		Category: "test",
+		ResearchHandler: func(ctx context.Context, missingTool, failure, frameworkID, runCommand string, files []string, taskSpec string) (*testToolInstallPlan, error) {
+			return pt.researchTestToolInstall(ctx, missingTool, failure, frameworkID, runCommand, files, taskSpec, "")
 		},
+		InstallHandler: pt.installTestTooling,
 	})
 }
 
@@ -148,8 +100,10 @@ func formatTestToolInstallPlan(plan *testToolInstallPlan) string {
 
 func (pt *PipelineTester) installTestTooling(ctx context.Context, plan *testToolInstallPlan) (map[string]any, error) {
 	return agentshared.ExecuteDependencyInstallPlan(ctx, agentshared.DependencyInstallSkillConfig{
-		SkillName:       "install_test_tooling",
-		ResearchSkill:   "research_test_tool_install",
+		// Phase 2.K: ToolName surfaces in the approval dialogue —
+		// keep it specific so operators see what's being installed.
+		SkillName:       "dependency",
+		ResearchSkill:   "dependency",
 		AgentType:       "tester-pipeline",
 		AgentID:         func() string { return pt.id },
 		SessionID:       func() string { return pt.config.SessionID },

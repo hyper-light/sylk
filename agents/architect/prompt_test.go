@@ -77,8 +77,8 @@ func TestDefaultSystemPrompt_IncludesDiscussionTimeConsultationGuidance(t *testi
 		"Prefer repeated, targeted consults over one broad omnibus consult.",
 		"Re-evaluate Academic research depth continuously based on the user's latest input",
 		"Do not treat the Academic as a rare keyword-triggered escalation.",
-		"`architect_forest_get_plan_precedents`",
-		"`architect_forest_compare_plan_branches`",
+		"`architect_forest_consult(purpose=get_plan_precedents, query=…)`",
+		"`architect_forest_consult(purpose=compare_plan_branches, query=…)`",
 		"During discussion before planning:",
 		"start with the most relevant knowledge agent and the narrowest question that can materially reduce the next uncertainty",
 		"do not wait for keywords like \"research\" or \"benchmark\" to consult the Academic",
@@ -107,7 +107,7 @@ func TestPlannerConversationModeConverse_InsistsOnDiscussionTimeConsultation(t *
 	text := compactPromptWhitespace(plannerConversationModeInstructions(plannerConversationModeConverse))
 	for _, want := range []string{
 		"start with the most relevant knowledge agent and the narrowest question that can materially reduce the next uncertainty.",
-		"Prefer repeated targeted consults over one broad omnibus consult.",
+		"Prefer repeated targeted consult_peer calls over one broad omnibus consult.",
 		"Re-evaluate Academic depth as the user's constraints evolve and your own understanding improves:",
 		"invoke recall_recent before claiming the earlier discussion is unavailable",
 		"recent_context_summary or recent_context_focus are present",
@@ -138,7 +138,7 @@ func TestBuildPlannerConversationSystemPrompt_IncludesConsultationAndSkillsPolic
 	for _, want := range []string{
 		"## Consultation Policy",
 		"## Skill Use Policy",
-		"`architect_forest_get_plan_precedents`",
+		"`architect_forest_consult(purpose=get_plan_precedents, query=…)`",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("conversation system prompt missing %q", want)
@@ -149,24 +149,31 @@ func TestBuildPlannerConversationSystemPrompt_IncludesConsultationAndSkillsPolic
 func TestToolsForConversationMode_ConverseIncludesPlanningProtocolTools(t *testing.T) {
 	tools := toolsForConversationMode(plannerConversationModeConverse)
 	for _, want := range []string{
-		"consult",
-		"recall_recent",
-		"ask_user_question",
-		"route_requirements_research",
-		"start_planning",
+		// Phase 1/2.K refactor: consult → consult_peer,
+		// ask_user_question → ask_user_clarification,
+		// route_requirements_research → academic_research,
+		// start_planning → plan(action=start).
+		"consult_peer",
+		"forest",
+		"ask_user_clarification",
+		"academic_research",
 		"plan",
 	} {
 		if !containsToolName(tools, want) {
 			t.Fatalf("converse tools missing %q: %v", want, tools)
 		}
 	}
-	// route_plan_acceptance is intentionally excluded — the dialog
-	// publish in feedbackReadyDirective is now the canonical
-	// acceptance path. Exposing the tool would let the LLM
-	// auto-dispatch ahead of the user's clicked verdict.
+	// plan_acceptance is intentionally excluded — the dialog publish
+	// in feedbackReadyDirective is now the canonical acceptance path.
+	// Exposing the tool would let the LLM auto-dispatch ahead of the
+	// user's clicked verdict.
 	for _, blocked := range []string{
-		"route_plan_acceptance",
+		"plan_acceptance",
+		// Phase 2.K / CR-4 refactor: plan_workflow folded into plan.
 		"plan_workflow",
+		"start_planning",
+		// Phase 2.4 refactor: pre_delegation_declare +
+		// validate_pre_delegation folded into delegation.
 		"pre_delegation_declare",
 		"validate_pre_delegation",
 		"monitor_execution",
@@ -220,10 +227,13 @@ func TestToolsForConversationModeWithContext_DoesNotExposeValidateWorkWithoutArc
 }
 
 func TestPlannerConversationModeConverse_ToolSurfaceMatchesProtocolInstructions(t *testing.T) {
+	// Phase 1/2.K refactor: consult → consult_peer,
+	// route_plan_acceptance → plan_acceptance(action=route),
+	// start_planning → plan(action=start).
 	text := compactPromptWhitespace(plannerConversationModeInstructions(plannerConversationModeConverse))
 	for _, want := range []string{
-		"invoke plan(analyze), consult(pre_planning), plan(design), plan(generate_tasks)",
-		"Do NOT invoke route_plan_acceptance — wait for the user's next message.",
+		"invoke plan(action=analyze), then any further consult_peer calls needed for pre-planning evidence, then plan(action=design), then plan(action=generate_tasks)",
+		"Do NOT invoke plan_acceptance — wait for the user's next message.",
 		"Frame it as plan review, not execution kickoff.",
 		"Avoid phrases like \"kick it off\", \"start building\", \"start implementing\", \"get started\", or \"ship it\".",
 	} {
@@ -232,15 +242,15 @@ func TestPlannerConversationModeConverse_ToolSurfaceMatchesProtocolInstructions(
 		}
 	}
 	tools := toolsForConversationMode(plannerConversationModeConverse)
-	for _, wantTool := range []string{"plan", "consult", "recall_recent"} {
+	for _, wantTool := range []string{"plan", "consult_peer", "forest"} {
 		if !containsToolName(tools, wantTool) {
 			t.Fatalf("converse tools missing protocol-required tool %q: %v", wantTool, tools)
 		}
 	}
-	// route_plan_acceptance is intentionally absent — see
+	// plan_acceptance is intentionally absent — see
 	// TestToolsForConversationMode_ConverseIncludesPlanningProtocolTools.
-	if containsToolName(tools, "route_plan_acceptance") {
-		t.Fatalf("converse tools must not expose route_plan_acceptance: %v", tools)
+	if containsToolName(tools, "plan_acceptance") {
+		t.Fatalf("converse tools must not expose plan_acceptance: %v", tools)
 	}
 }
 
@@ -249,7 +259,7 @@ func TestGenerateTasksNextAction_UsesPlanReviewNotExecutionKickoff(t *testing.T)
 	for _, want := range []string{
 		"Frame it as plan review, not execution kickoff.",
 		"Avoid phrases like \"kick it off\", \"start building\", \"start implementing\", \"get started\", or \"ship it\".",
-		"Do NOT invoke route_plan_acceptance — wait for the user's response.",
+		"Do NOT invoke plan_acceptance — wait for the user's response.",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generateTasksNextAction(false) missing %q", want)

@@ -76,12 +76,15 @@ func TestDefaultEngineerSystemPrompt_UsesCurrentSkillNames(t *testing.T) {
 	required := []string{
 		"`discover_project_tools`",
 		"`discover_code_patterns`",
-		"`consult`",
-		"`engineer_forest_select_implementation_branch`",
-		"`engineer_forest_get_failure_precedents`",
+		// consult_peer is the single consultation entry point; the old
+		// `consult` + `target:` surface was removed in the Phase 1/2.K
+		// refactor and replaced with consult_peer + target_agent_type.
+		"consult_peer",
+		"target_agent_type",
+		"`engineer_forest_consult(purpose=select_implementation_branch, query=…)`",
+		"`engineer_forest_consult(purpose=get_failure_precedents, query=…)`",
 		"`audit`",
-		"`run_command`",
-		"`run_shell_script`",
+		"`bash`",
 	}
 	for _, marker := range required {
 		if !strings.Contains(DefaultEngineerSystemPrompt, marker) {
@@ -95,6 +98,11 @@ func TestDefaultEngineerSystemPrompt_UsesCurrentSkillNames(t *testing.T) {
 		"consult_academic",
 		"audit_implementation",
 		"run_tests",
+		// The pre-refactor `consult` skill with a bare `target:` param
+		// is no longer registered on the engineer's visible surface;
+		// the prompt must not direct the LLM to call it.
+		"consult` with `target",
+		"`consult`",
 	}
 	for _, marker := range legacyAliases {
 		if strings.Contains(DefaultEngineerSystemPrompt, marker) {
@@ -104,11 +112,15 @@ func TestDefaultEngineerSystemPrompt_UsesCurrentSkillNames(t *testing.T) {
 }
 
 func TestDefaultEngineerSystemPrompt_IncludesExactEditContract(t *testing.T) {
+	// The per-scope write tools (write_pipeline_file / edit_pipeline_file)
+	// were collapsed into workspace_write(op=write|edit, scope=pipeline),
+	// and prepare_pipeline_write_context into workspace_read(op=prepare_write,
+	// scope=pipeline). The edit contract now applies to workspace_write op=edit.
 	required := []string{
-		"`edit_pipeline_file`",
+		"`op=edit`",
 		"`old_text`",
 		"`new_text`",
-		"use `write_pipeline_file` instead",
+		"`op=write`",
 	}
 	for _, want := range required {
 		if !strings.Contains(DefaultEngineerSystemPrompt, want) {
@@ -141,10 +153,10 @@ func TestEngineerSystemCollabPrompt_RoutesImplementationBackToInspector(t *testi
 		"`inspector-pipeline`",
 		"`inspector -> tester -> engineer/designer -> inspector`",
 		"Do not hand off directly to `tester-pipeline` after implementation",
-		"Use `handoff_next` to route back to `inspector-pipeline` when you are handing off fresh top-level implementation evidence.",
-		"Use `validate_work` only when you are answering an active challenge from Inspector, Tester, or Designer.",
-		"Only Inspector may run `finalize_pipeline` and decide whether to invoke `handoff_to_ot`.",
-		"Your first `challenge_agent` call to Tester, Designer, or Inspector is allowed.",
+		"Use `pipeline_protocol(action=handoff)` to route back to `inspector-pipeline` when you are handing off fresh top-level implementation evidence.",
+		"Use `pipeline_protocol(action=validate)` only when you are answering an active challenge from Inspector, Tester, or Designer.",
+		"Only Inspector may run `pipeline_protocol(action=finalize)` and decide whether to invoke `handoff_to_ot`.",
+		"Your first `pipeline_protocol(action=challenge)` call to Tester, Designer, or Inspector is allowed.",
 		"Re-challenge Inspector only after Inspector answered your previous challenge and you then changed pipeline VFS state yourself based on that answer.",
 		"Do not reinterpret a targeted challenge turn as permission to restart the broad top-level implementation flow.",
 	}

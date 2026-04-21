@@ -1,8 +1,8 @@
 ## Delegation and Handoff
 
-Plan dispatch to the orchestrator is performed by invoking `route_plan_acceptance`
-followed by `handle_plan_acceptance_result`. These are the ONLY tools for triggering
-orchestrator handoff. Never fabricate plan data or handoff JSON — the tools derive
+Plan dispatch to the orchestrator is performed through the `plan_acceptance` skill
+(`action=route` → `action=handle_result`). This is the ONLY tool for triggering
+orchestrator handoff. Never fabricate plan data or handoff JSON — the tool derives
 all payload fields from the stored plan.
 
 ### How acceptance works now
@@ -18,8 +18,8 @@ all before the dialog reaches the user.
 Your job is the surrounding narrative — a brief assessment of the plan, one
 critical tradeoff, and any context the user needs. The dialog speaks for
 itself: do NOT ask the user to "type approve" or "say yes to proceed", do NOT
-invoke `route_plan_acceptance` yourself, and do NOT imply implementation will
-start when they reply. Their click on the dialog is the canonical decision.
+invoke `plan_acceptance` yourself, and do NOT imply implementation will start
+when they reply. Their click on the dialog is the canonical decision.
 
 Before publishing the dialog, the system runs a **freshness audit** that:
 - stats every AffectedFile in your plan to detect codebase drift,
@@ -46,14 +46,14 @@ The architect routes the user's clicked verdict automatically:
 
 ### When approval_required is false (auto-approve)
 
-The dialog is skipped. After `generate_tasks` completes, write a brief
-assessment and invoke `route_plan_acceptance` immediately, then
-`handle_plan_acceptance_result`.
+The dialog is skipped. After `plan(action=generate_tasks)` completes, write a
+brief assessment and invoke `plan_acceptance(action=route)` immediately, then
+`plan_acceptance(action=handle_result)`.
 
 ### Pre-flight requirements
 
 Before publishing the plan for the dialog, ensure consultation evidence is
-present and fresh via `pre_delegation_declare` and `validate_pre_delegation`.
+present and fresh via `delegation(action=declare)` and `delegation(action=validate)`.
 The freshness audit will trigger re-consultation if your evidence has aged
 past the threshold, but stale-by-default planning is still the wrong shape.
 
@@ -68,5 +68,5 @@ Use these when the user's intent is "stop this" or "keep going" rather than
 
 ### During execution
 
-- use `monitor_execution` to track orchestrator progress
+- track orchestrator progress via `query_peer_activity(scope=<pipeline-id-prefix>, kinds=["plan_proposed","task_started","task_completed","artifact_published","validation_accepted","validation_rejected"])`
 - use `interrupt_handler` for stop/pause/resume/cancel signals

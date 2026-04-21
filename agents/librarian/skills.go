@@ -26,6 +26,10 @@ func (l *Librarian) registerCoreSkills() {
 		l.skills.Register(findPatternSkill(l))
 		l.skills.Register(locateSymbolSkill(l))
 	}
+	// Unified search façade: search_codebase + find_pattern + find_symbol
+	// collapse into `search(kind=…)` on the visible surface. The
+	// per-kind builders stay available for internal callers above.
+	l.skills.Register(searchFacadeSkill(l))
 	l.skills.Register(consultSkill(l))
 	l.skills.Register(assessHealthSkill(l))
 	l.skills.Register(queryStructureSkill(l))
@@ -41,10 +45,10 @@ func (l *Librarian) registerCoreSkills() {
 	// the prose instructions in the prompt — every "librarian opened a
 	// disk file that exists only in the pipeline VFS and reported it
 	// missing" trace traced to that tool-name bias. The fix is structural:
-	// every read goes through a layer-explicit tool. The LLM cannot pick
-	// a layerless read because there isn't one to pick. Disk reads use
-	// `read_workspace_file view=disk`; in-flight overlay reads use
-	// `read_workspace_file view=global` or `view=pipeline`.
+	// every read goes through the unified `workspace_read(op=…, view=…)`
+	// verb below. The LLM cannot pick a layerless read because there
+	// isn't one to pick. Disk reads use `view=disk`; in-flight overlay
+	// reads use `view=global` or `view=pipeline`.
 	l.skills.Register(findSymbolSkill(l))
 	l.skills.Register(gitSkill(l))
 	l.skills.Register(lspSkill(l))
@@ -53,21 +57,30 @@ func (l *Librarian) registerCoreSkills() {
 	// Workspace-aware reads. The librarian's authority profile permits all
 	// three views (Disk, Global, Pipeline). The view parameter is required
 	// on every call so layer attribution is captured at the tool boundary.
+	// All read ops collapse into the unified workspace_read(op=…) verb
+	// registered by core/versioning — the librarian uses only the
+	// observation ops (read/glob/grep/inspect/summarize); the write-lease
+	// ops (prepare_write) and cross-view change listings (list_changes)
+	// are unused for this read-only authority but remain reachable via
+	// the same skill if the librarian's profile is ever widened.
 	viewsFn := func() versioning.WorkspaceViewAccess { return l.workspaceViews }
 	noPipelineFn := func() string { return "" }
-	l.skills.Register(versioning.NewReadWorkspaceFileSkill(viewsFn, noPipelineFn))
-	l.skills.Register(versioning.NewWorkspaceGlobSkill(viewsFn, noPipelineFn))
-	l.skills.Register(versioning.NewWorkspaceGrepSkill(viewsFn, noPipelineFn))
-	l.skills.Register(versioning.NewInspectWorkspaceStateSkill(viewsFn, noPipelineFn))
-	l.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(viewsFn, noPipelineFn))
+	l.skills.Register(versioning.NewWorkspaceReadSkill(versioning.WorkspaceReadSkillConfig{
+		GetViews:          viewsFn,
+		DefaultPipelineID: noPipelineFn,
+	}))
 
 	// Knowledge graph search (available when knowledge store is wired).
 	l.skills.Register(knowledgeSearchSkill(l))
 
-	// Remote package cloning (always available).
+	// Remote package cloning (always available). clone_repository +
+	// list_packages + remove_package collapse into `package(action=…)`
+	// on the visible surface; the per-action builders stay registered
+	// so internal tests can continue to exercise them directly.
 	l.skills.Register(cloneRepositorySkill(l))
 	l.skills.Register(listPackagesSkill(l))
 	l.skills.Register(removePackageSkill(l))
+	l.skills.Register(packageFacadeSkill(l))
 
 	// Infrastructure skills.
 	l.skills.Register(shared.NewSelfDiagnosticSkill(&librarianDiag{}))
@@ -107,6 +120,15 @@ func (l *Librarian) registerFabricSkills() {
 		AgentID:    agentID,
 		AgentType:  agentType,
 		PipelineID: func() string { return "" },
+		RouteSync: shared.RouteSyncFromBus(
+			func() guide.EventBus { return l.bus },
+			func() string {
+				if l.channels == nil {
+					return ""
+				}
+				return l.channels.Responses
+			},
+		),
 	}) {
 		l.skills.Register(skill)
 	}

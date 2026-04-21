@@ -688,6 +688,15 @@ func consultationTargets(toolName string, args map[string]any) []string {
 	if target := stringFromMap(args, "target"); target != "" {
 		return []string{target}
 	}
+	// Mirror the emission-side classifier in
+	// agents/shared/inter_agent_tool_event.go:interAgentConsultationTargets.
+	// This path runs only as a fallback when the event arrives without
+	// stamped inter-agent metadata, but if the two sides diverge the
+	// fallback misclassifies silently — consult_peer was invisible in the
+	// chat for exactly this reason.
+	if target := stringFromMap(args, "target_agent_type"); target != "" {
+		return []string{target}
+	}
 	switch strings.TrimSpace(toolName) {
 	case "consult_librarian_style":
 		return []string{"librarian"}
@@ -695,9 +704,37 @@ func consultationTargets(toolName string, args map[string]any) []string {
 		return []string{"academic"}
 	case "consult_archivalist_context":
 		return []string{"archivalist"}
+	case "request_architect_research":
+		return []string{"architect"}
+	case "validate_approach":
+		return []string{"librarian"}
+	case "consult":
+		if strings.TrimSpace(stringFromMap(args, "mode")) != "pre_planning" {
+			return nil
+		}
+		targets := []string{"librarian", "archivalist"}
+		if boolFromMap(args, "include_academic") {
+			targets = append(targets, "academic")
+		}
+		return targets
 	default:
+		if target := firstKnownChallengeAgentInName(strings.TrimPrefix(toolName, "consult_")); target != "" {
+			return []string{target}
+		}
 		return nil
 	}
+}
+
+func boolFromMap(m map[string]any, key string) bool {
+	if m == nil {
+		return false
+	}
+	value, ok := m[key]
+	if !ok || value == nil {
+		return false
+	}
+	typed, ok := value.(bool)
+	return ok && typed
 }
 
 func challengeTargets(toolName string, args, output map[string]any, currentAgentType, pipelineID string) []string {

@@ -7,22 +7,70 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
 // CrossPipelineSkillConfig wires the cross-pipeline primitives onto
-// per-agent identity. The skills are pure fabric emitters — they
-// produce challenge_emitted / consult_emitted activities and let the
-// fabric handle delivery (via ambient context envelope on the
-// addressee's next tool result).
+// per-agent identity.
+//
+// challenge_peer is fire-and-forget: it writes a challenge_emitted
+// activity and returns. Delivery is handled by the fabric via ambient
+// context envelopes.
+//
+// consult_peer has two modes governed by RouteSync:
+//   - When RouteSync is non-nil, the skill dispatches the consult
+//     synchronously via the provided transport, waits for the
+//     terminal response, and renders the target's stream events as
+//     nested children of the caller's consult_peer row. This is the
+//     primary mode for interactive agents that need the answer to
+//     proceed.
+//   - When RouteSync is nil, the skill degrades to fire-and-forget:
+//     it writes a consult_emitted activity and returns the consult_id
+//     without waiting. The addressee is expected to observe the
+//     emitted activity via ambient context and respond on its own
+//     cadence. This preserves audit flow for agents that either lack
+//     a route transport or explicitly want the async semantics.
 //
 // See docs/FABRIC.md Part 3: cross-pipeline collaboration.
 type CrossPipelineSkillConfig struct {
-	SessionID func() string
-	AgentID   func() string
-	AgentType func() string
+	SessionID  func() string
+	AgentID    func() string
+	AgentType  func() string
 	PipelineID func() string
+
+	// RouteSync dispatches a RouteRequest to the target peer agent and
+	// waits for the terminal response. Nil ⇒ consult_peer runs in
+	// fire-and-forget mode (see type doc).
+	RouteSync func(ctx context.Context, req *guide.RouteRequest) (*guide.Message, error)
+}
+
+// RouteSyncFromBus builds a RouteSync using the caller-provided bus
+// and response topic. Pass the agent's live bus and Responses topic
+// (typically accessed via closures so nil-at-registration-time is
+// tolerated). Returns a RouteSync that errors early when the bus or
+// topic is unavailable, so the consult surfaces a real failure
+// instead of silently blocking.
+func RouteSyncFromBus(busFn func() guide.EventBus, topicFn func() string) func(ctx context.Context, req *guide.RouteRequest) (*guide.Message, error) {
+	return func(ctx context.Context, req *guide.RouteRequest) (*guide.Message, error) {
+		if busFn == nil || topicFn == nil {
+			return nil, fmt.Errorf("consult_peer: route transport is not configured")
+		}
+		bus := busFn()
+		topic := strings.TrimSpace(topicFn())
+		if bus == nil {
+			return nil, fmt.Errorf("consult_peer: bus is not ready")
+		}
+		if topic == "" {
+			return nil, fmt.Errorf("consult_peer: response topic is not configured")
+		}
+		return RequestGuideRouteSync(ctx, GuideRouteSyncRequest{
+			Bus:           bus,
+			ResponseTopic: topic,
+			Request:       req,
+		})
+	}
 }
 
 // CrossPipelineSkills returns challenge_peer and consult_peer.
@@ -120,13 +168,13 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig) *skills.Skill {
 
 func consultPeerSkill(cfg CrossPipelineSkillConfig) *skills.Skill {
 	return skills.NewSkill("consult_peer").
-		Description("Ask a peer agent (cross-pipeline specialist or knowledge agent) for their evidence on a shared concern. Asynchronous — the addressee sees your consult in their next ambient_context envelope and responds at their own cadence. Returns a consult_id you can causal_trace later to find the response. PREFER THIS over guessing when peer state matters.").
+		Description("Ask a peer agent (cross-pipeline specialist or knowledge agent) for their evidence on a shared concern. When a route transport is configured for the calling agent, this blocks on the peer's terminal response and renders their work as nested children of this tool call — the normal mode for interactive consultation. Without a transport, it degrades to fire-and-forget: an activity is emitted, the addressee responds via their own ambient_context envelope, and the caller gets a consult_id to causal_trace later. PREFER THIS over guessing when peer state matters.").
 		Domain("fabric").
 		Keywords("consult", "fabric", "cross-pipeline", "peer", "knowledge-agent", "ask", "question").
 		Priority(91).
 		Usage("Use when ambient context shows a peer working in adjacent or overlapping scope and you'd benefit from their live state — e.g., 'how are you handling fixtures for shared models?' Pass target_agent_type and (optional) target_pipeline_id; without pipeline_id the consult routes to the natural same-pipeline peer or knowledge agent.").
 		Requirement("Frame the question concretely. Vague consults waste both parties' attention budget.").
-		Satisfies("Records a consult_emitted activity addressed to the target; the addressee sees it in their next ambient_context envelope.").
+		Satisfies("Records a consult_emitted activity addressed to the target; returns the peer's response inline when the route transport is available.").
 		StringParam("target_agent_type", "Agent type to address (e.g., \"librarian\", \"academic\", \"tester-pipeline\", \"engineer\").", true).
 		StringParam("target_pipeline_id", "Specific pipeline_id to address (cross-pipeline routing). Empty = natural same-pipeline peer or knowledge agent.", false).
 		StringParam("scope", "Path scope context (e.g., \"services/billing/tests/\").", false).
@@ -183,11 +231,90 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig) *skills.Skill {
 				State:   activity.StateInFlight,
 			}
 			activity.Append(ctx, act)
-			return map[string]any{
-				"consult_id":  act.ID,
-				"deadline_at": time.Now().Add(deadline),
-				"status":      "in_flight",
-			}, nil
+
+			// Fire-and-forget fallback — no transport configured for this
+			// caller. The addressee is expected to pick up the activity
+			// from their ambient context and respond on its own cadence.
+			if cfg.RouteSync == nil {
+				return map[string]any{
+					"consult_id":  string(act.ID),
+					"deadline_at": time.Now().Add(deadline),
+					"status":      "in_flight",
+				}, nil
+			}
+
+			// Synchronous path. WithInterAgentBranchMessage reuses the
+			// active tool call on ctx (stamped by the tool loop's
+			// WithActiveToolCall + DeriveInterAgentToolEvent pair), so no
+			// duplicate parent row is emitted. branch.ApplyMetadata then
+			// stamps ParentCorrelationID + ParentToolCallKey onto the
+			// outgoing route request metadata — the UI stitches the
+			// target's stream events into children of this consult_peer
+			// row via that key.
+			spec := InterAgentBranchSpec{
+				Kind:       InterAgentToolEventKindConsult,
+				ToolName:   "consult_peer",
+				AgentTypes: []string{strings.TrimSpace(params.TargetAgentType)},
+				Summary:    params.Query,
+				Args: map[string]any{
+					"target_agent_type":  params.TargetAgentType,
+					"target_pipeline_id": params.TargetPipelineID,
+					"scope":              params.Scope,
+					"query":              params.Query,
+				},
+			}
+			response, err := WithInterAgentBranchMessage(ctx, spec, func(branchCtx context.Context, branch InterAgentBranchHandle) (*guide.Message, error) {
+				req := &guide.RouteRequest{
+					Input:           params.Query,
+					TargetAgentID:   strings.TrimSpace(params.TargetAgentType),
+					SessionID:       safeCallString(cfg.SessionID),
+					SourceAgentID:   safeCallString(cfg.AgentID),
+					SourceAgentName: safeCallString(cfg.AgentType),
+					ExplicitTarget:  true,
+				}
+				req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
+				if pipe := strings.TrimSpace(params.TargetPipelineID); pipe != "" {
+					if req.Metadata == nil {
+						req.Metadata = map[string]any{}
+					}
+					req.Metadata["target_pipeline_id"] = pipe
+				}
+				return cfg.RouteSync(branchCtx, req)
+			})
+			if err != nil {
+				return nil, fmt.Errorf("consult_peer: %w", err)
+			}
+
+			result := map[string]any{
+				"consult_id": string(act.ID),
+				"status":     "completed",
+			}
+			if response != nil {
+				if resp, ok := response.GetRouteResponse(); ok && resp != nil {
+					// Target-side failure: propagate as a handler error so
+					// the tool loop's Phase 1 InterAgent completion renders
+					// the consult_peer row as Failed. Returning the data
+					// payload alongside a non-nil error is not part of the
+					// skill contract, so on failure we surface the error
+					// text only — matching how architect's consult path
+					// treats resp.Success=false.
+					if !resp.Success {
+						errText := strings.TrimSpace(resp.Error)
+						if errText == "" {
+							errText = "peer consultation failed"
+						}
+						return nil, fmt.Errorf("consult_peer: %s", errText)
+					}
+					result["response"] = resp.Data
+				} else if errText, ok := response.GetError(); ok {
+					trimmed := strings.TrimSpace(errText)
+					if trimmed == "" {
+						trimmed = "peer consultation failed"
+					}
+					return nil, fmt.Errorf("consult_peer: %s", trimmed)
+				}
+			}
+			return result, nil
 		}).
 		Build()
 }

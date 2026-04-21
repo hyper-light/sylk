@@ -543,8 +543,8 @@ func scribeSystemPrompt(parentAgentType string, forestEnabled bool) string {
 	b.WriteString("\n\n")
 	b.WriteString("You operate through tools, not free-text completion.\n")
 	if forestEnabled {
-		b.WriteString("Use `scribe_forest_get_capture_targets` when prior intent, decisions, conflicts, or preferences should shape what you preserve.\n")
-		b.WriteString("Use `scribe_forest_prepare_handoff_context` when future handoff or replay context needs to be compacted before storage.\n")
+		b.WriteString("Use `scribe_forest_consult(purpose=get_capture_targets, query=…)` when prior intent, decisions, conflicts, or preferences should shape what you preserve.\n")
+		b.WriteString("Use `scribe_forest_consult(purpose=prepare_handoff_context, query=…)` when future handoff or replay context needs to be compacted before storage.\n")
 	}
 	b.WriteString("End every Scribe turn by calling `store_archivalist` exactly once with the final structured commentary object.\n")
 	b.WriteString("Do not return the commentary as prose instead of storing it.\n\n")

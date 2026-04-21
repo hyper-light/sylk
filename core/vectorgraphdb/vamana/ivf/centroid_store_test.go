@@ -285,13 +285,20 @@ func TestCentroidStore_LargeK(t *testing.T) {
 		}
 
 		expected := float32(i*1000) * 0.0001
-		if math.Abs(float64(loaded[0]-expected)) > 1e-6 {
-			t.Errorf("centroid[%d][0]: got %v, want %v", i, loaded[0], expected)
+		// Tolerance must scale with magnitude: float32 has ~7 decimal
+		// digits of precision, so an absolute 1e-6 bound fails for
+		// larger values (centroid[400] has magnitude 40, pushing the
+		// representation error past 1e-6). Allow either abs 1e-6 OR
+		// 1 ULP ≈ 1e-7 * |expected|.
+		absErr := math.Abs(float64(loaded[0] - expected))
+		if absErr > 1e-6 && absErr > math.Abs(float64(expected))*1e-6 {
+			t.Errorf("centroid[%d][0]: got %v, want %v (delta %g)", i, loaded[0], expected, absErr)
 		}
 
 		loadedNorm := store.GetNorm(i)
-		if math.Abs(loadedNorm-norms[i]) > 1e-6 {
-			t.Errorf("norm[%d]: got %v, want %v", i, loadedNorm, norms[i])
+		normErr := math.Abs(loadedNorm - norms[i])
+		if normErr > 1e-6 && normErr > math.Abs(norms[i])*1e-6 {
+			t.Errorf("norm[%d]: got %v, want %v (delta %g)", i, loadedNorm, norms[i], normErr)
 		}
 	}
 }

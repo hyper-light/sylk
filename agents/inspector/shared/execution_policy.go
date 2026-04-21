@@ -42,7 +42,7 @@ func InspectorRejectTestDependencyResearch(missingTool, frameworkID, runCommand,
 		inspectorValueLooksLikeTestTool(frameworkID) ||
 		inspectorCommandLooksLikeTestExecution(runCommand) ||
 		inspectorFailureLooksLikeTestTooling(failure) {
-		return fmt.Errorf("%w: research_dependency_install is not permitted for inspector when the missing dependency is for test execution; route test tooling requests to Tester instead", agentshared.ErrRouteTestToolingToTester)
+		return fmt.Errorf("%w: dependency(action=research) is not permitted for inspector when the missing dependency is for test execution; route test tooling requests to Tester instead", agentshared.ErrRouteTestToolingToTester)
 	}
 	return nil
 }
@@ -52,14 +52,14 @@ func InspectorRejectTestDependencyInstallPlan(plan *agentshared.DependencyInstal
 		return nil
 	}
 	if inspectorValueLooksLikeTestTool(plan.MissingTool) || inspectorValueLooksLikeTestTool(plan.Framework) {
-		return fmt.Errorf("%w: install_dependency_tooling is not permitted for inspector when the plan targets test tooling; route test tooling installs to Tester instead", agentshared.ErrRouteTestToolingToTester)
+		return fmt.Errorf("%w: dependency(action=install) is not permitted for inspector when the plan targets test tooling; route test tooling installs to Tester instead", agentshared.ErrRouteTestToolingToTester)
 	}
 	if inspectorCommandLooksLikeTestExecution(plan.ValidationCommand) {
-		return fmt.Errorf("%w: install_dependency_tooling is not permitted for inspector when validation_command executes tests; route test validation to Tester instead", agentshared.ErrRouteTestToolingToTester)
+		return fmt.Errorf("%w: dependency(action=install) is not permitted for inspector when validation_command executes tests; route test validation to Tester instead", agentshared.ErrRouteTestToolingToTester)
 	}
 	for _, step := range plan.Steps {
 		if inspectorInstallStepTargetsTestTooling(step.Command) {
-			return fmt.Errorf("%w: install_dependency_tooling is not permitted for inspector when the plan installs test tooling; route test tooling installs to Tester instead", agentshared.ErrRouteTestToolingToTester)
+			return fmt.Errorf("%w: dependency(action=install) is not permitted for inspector when the plan installs test tooling; route test tooling installs to Tester instead", agentshared.ErrRouteTestToolingToTester)
 		}
 	}
 	return nil

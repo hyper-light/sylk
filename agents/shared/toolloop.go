@@ -413,13 +413,12 @@ func toolErrorDetail(err error) toolErrorDetailPayload {
 			},
 		}
 	case strings.Contains(message, "only accepts one plain command"),
-		strings.Contains(message, "shell control operators are not allowed in run_command"):
+		strings.Contains(message, "shell control operators are not allowed"):
 		return toolErrorDetailPayload{
 			Kind: "single_command_only",
 			Recovery: []string{
 				"Use working_dir instead of cd when you only need a different directory",
-				"Split chained work into separate run_command calls",
-				"Use run_shell_script for &&, ||, ;, pipes, redirection, shell variables, or multi-line shell",
+				"For compound scripts (chaining, pipes, redirection, shell variables, multi-line) pass the full script to bash; the approval policy adapts automatically",
 			},
 		}
 	case strings.Contains(message, staleWriteBasisMarker),

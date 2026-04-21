@@ -1254,16 +1254,19 @@ func (pt *PipelineTester) invokePipelineWriteSkill(
 	if basis == nil {
 		return fmt.Errorf("basis is required")
 	}
+	// Phase 2.K / CR-2: route through the unified workspace_write skill.
 	payload, err := json.Marshal(map[string]any{
+		"op":      "write",
+		"scope":   string(versioning.WorkspaceWriteScopePipeline),
 		"path":    path,
 		"content": content,
 		"basis":   *basis,
 	})
 	if err != nil {
-		return fmt.Errorf("marshal write_pipeline_file payload: %w", err)
+		return fmt.Errorf("marshal workspace_write payload: %w", err)
 	}
-	result := pt.skills.Invoke(ctx, "write_pipeline_file", payload)
-	if err := pipelineWriteSkillError("write_pipeline_file", result); err != nil {
+	result := pt.skills.Invoke(ctx, "workspace_write", payload)
+	if err := pipelineWriteSkillError("workspace_write", result); err != nil {
 		return err
 	}
 	if nextBasis, ok := pipelineNextBasis(result.Data); ok {
@@ -1717,7 +1720,8 @@ func (pt *PipelineTester) detectHarnessWithTools(
 	taskSpec string,
 	workerType string,
 ) (*testHarnessState, error) {
-	result, err := pt.runDeterministicToolCall(ctx, "detect_test_harness", map[string]any{
+	result, err := pt.runDeterministicToolCall(ctx, "test_harness", map[string]any{
+		"action":      "detect",
 		"files":       files,
 		"task_spec":   taskSpec,
 		"worker_type": workerType,
@@ -1813,22 +1817,28 @@ func (pt *PipelineTester) prepareHarnessWithTools(
 		if err := pt.registerWritablePath(plan.Path); err != nil {
 			return err
 		}
-		prepared, err := pt.runDeterministicToolCall(ctx, "prepare_pipeline_write_context", map[string]any{
-			"path": plan.Path,
+		// Phase 2.K / CR-2: route through workspace_read(op=prepare_write)
+		// which now carries the write preflight (formerly the standalone
+		// prepare_write_context skill).
+		prepared, err := pt.runDeterministicToolCall(ctx, "workspace_read", map[string]any{
+			"op":    "prepare_write",
+			"scope": string(versioning.WorkspaceWriteScopePipeline),
+			"path":  plan.Path,
 		})
 		if err != nil {
 			return err
 		}
 		var writeCtx versioning.PreparedWorkspaceWriteContext
 		if err := json.Unmarshal([]byte(prepared), &writeCtx); err != nil {
-			return fmt.Errorf("decode prepare_pipeline_write_context: %w", err)
+			return fmt.Errorf("decode workspace_read(op=prepare_write): %w", err)
 		}
 		contexts = append(contexts, map[string]any{
 			"path":  plan.Path,
 			"basis": writeCtx.Basis,
 		})
 	}
-	_, err := pt.runDeterministicToolCall(ctx, "prepare_test_harness", map[string]any{
+	_, err := pt.runDeterministicToolCall(ctx, "test_harness", map[string]any{
+		"action":         "prepare",
 		"files":          files,
 		"task_spec":      taskSpec,
 		"worker_type":    workerType,
@@ -1854,15 +1864,19 @@ func (pt *PipelineTester) writeDeterministicTestWithTools(
 		if err := pt.registerWritablePath(outputFile); err != nil {
 			return versioning.WorkspaceWriteBasis{}, err
 		}
-		prepared, err := pt.runDeterministicToolCall(ctx, "prepare_pipeline_write_context", map[string]any{
-			"path": outputFile,
+		// Phase 2.K / CR-2: route through workspace_read(op=prepare_write)
+		// which now carries the write preflight.
+		prepared, err := pt.runDeterministicToolCall(ctx, "workspace_read", map[string]any{
+			"op":    "prepare_write",
+			"scope": string(versioning.WorkspaceWriteScopePipeline),
+			"path":  outputFile,
 		})
 		if err != nil {
 			return versioning.WorkspaceWriteBasis{}, err
 		}
 		var writeCtx versioning.PreparedWorkspaceWriteContext
 		if err := json.Unmarshal([]byte(prepared), &writeCtx); err != nil {
-			return versioning.WorkspaceWriteBasis{}, fmt.Errorf("decode prepare_pipeline_write_context: %w", err)
+			return versioning.WorkspaceWriteBasis{}, fmt.Errorf("decode workspace_read(op=prepare_write): %w", err)
 		}
 		basis = writeCtx.Basis
 	}
@@ -2218,7 +2232,7 @@ func (pt *PipelineTester) runGenericSuite(ctx context.Context, harness *testHarn
 	command = strings.ReplaceAll(command, "{test}", strings.Join(testNames, "|"))
 
 	if issue, ok := agentshared.DetectShellControlOperator(command); ok {
-		return nil, fmt.Errorf("run_test_suite generated unsupported shell syntax (%s); use run_shell_script only if the harness truly requires compound shell execution", issue)
+		return nil, fmt.Errorf("run_test_suite generated unsupported shell syntax (%s); use bash with the compound script only if the harness truly requires compound shell execution", issue)
 	}
 	args, err := commandapproval.SplitCommand(command)
 	if err != nil {

@@ -26,26 +26,26 @@ func (d *Designer) registerCoreSkills() {
 		WritesEnabledCheck: func() bool { return d.config.DesignerConfig.EnableFileWrites },
 	}
 
-	d.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return d.fileAccess }))
-	d.skills.Register(runCommandSkill(d))
-	d.skills.Register(runShellScriptSkill(d))
+	// read_file dropped — workspace_read(op=read) is the single reader
+	// with explicit view (disk | global | pipeline) selection.
+	d.skills.Register(bashSkill(d))
 	d.skills.Register(componentSearchSkill(d))
 	d.skills.Register(componentCreateSkill(d))
 	d.skills.Register(componentModifySkill(d))
-	d.skills.Register(researchDependencyInstallSkill(d))
-	d.skills.Register(installDependencyToolingSkill(d))
-	d.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
-	d.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
-	d.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
-	d.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
-	d.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
-	d.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }, nil))
-	d.skills.Register(versioning.NewPreparePipelineWriteContextSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }, nil))
-	d.skills.Register(versioning.NewListPipelineChangesSkill(func() versioning.FileAccess { return d.fileAccess }))
-	d.skills.Register(versioning.NewWritePipelineFileSkill(writeCfg))
-	d.skills.Register(versioning.NewEditPipelineFileSkill(writeCfg))
-	d.skills.Register(versioning.NewDeletePipelineFileSkill(writeCfg))
-	d.skills.Register(versioning.NewCreatePipelineDirectorySkill(writeCfg))
+	// Phase 2.K / GT-4 + GI-5 refactor: collapsed into dependency(action=…).
+	d.skills.Register(dependencySkill(d))
+	// Phase 2.K / CR-2 refactor: 12 workspace skills collapsed to 3
+	// verb-dispatched primitives.
+	designerGetViews := func() versioning.WorkspaceViewAccess { return d.workspaceViews }
+	designerGetFA := func() versioning.FileAccess { return d.fileAccess }
+	designerDefaultPipelineID := func() string { return d.pipelineID }
+	// prepare_write_context folded into workspace_read(op=prepare_write).
+	d.skills.Register(versioning.NewWorkspaceReadSkill(versioning.WorkspaceReadSkillConfig{
+		GetViews:          designerGetViews,
+		GetFileAccess:     designerGetFA,
+		DefaultPipelineID: designerDefaultPipelineID,
+	}))
+	d.skills.Register(versioning.NewWorkspaceWriteSkill(writeCfg))
 	d.skills.Register(tokenValidateSkill(d))
 	d.skills.Register(tokenSuggestSkill(d))
 	d.skills.Register(a11yAuditSkill(d))
@@ -82,6 +82,15 @@ func (d *Designer) registerCoreSkills() {
 		AgentID:    func() string { return d.id },
 		AgentType:  func() string { return "designer" },
 		PipelineID: func() string { return d.pipelineID },
+		RouteSync: shared.RouteSyncFromBus(
+			func() guide.EventBus { return d.bus },
+			func() string {
+				if d.channels == nil {
+					return ""
+				}
+				return d.channels.Responses
+			},
+		),
 	}) {
 		d.skills.Register(skill)
 	}
@@ -109,13 +118,12 @@ func (d *Designer) registerCoreSkills() {
 		d.skills.Register(skill)
 	}
 
-	// Collaboration skills (feedback.go)
-	d.skills.Register(requestEngineerReviewSkill(d))
-	d.skills.Register(requestInspectorCheckSkill(d))
-	d.skills.Register(requestTesterValidationSkill(d))
+	// Collaboration skills (feedback.go).
+	// Phase 1 refactor: per-target peer skills (request_engineer_review,
+	// request_inspector_check, request_tester_validation,
+	// report_to_engineer, report_to_orchestrator) removed in favor of
+	// generic Fabric primitives consult_peer / handoff_next.
 	d.skills.Register(askUserClarificationSkill(d))
-	d.skills.Register(reportToEngineerSkill(d))
-	d.skills.Register(reportToOrchestratorSkill(d))
 
 	// Diagnostics
 	d.skills.Register(shared.NewSelfDiagnosticSkill(&designerDiag{d: d}))
@@ -201,6 +209,22 @@ func componentSearchSkill(d *Designer) *skills.Skill {
 			matches, err := searchComponents(ctx, d.fileAccess, searchPath, params.Query, params.IncludeVariants)
 			if err != nil {
 				return nil, fmt.Errorf("component search failed: %w", err)
+			}
+
+			// Phase 4 refactor: publish found components as hints so
+			// engineer sees the design convention when wiring.
+			for _, m := range matches {
+				shared.AutoPublishHint(ctx, shared.AutoPublishInput{
+					SessionID:        d.config.SessionID,
+					AuthorAgentID:    d.id,
+					AuthorAgentType:  "designer",
+					AuthorPipelineID: d.pipelineID,
+					TriggerSkill:     "component_search",
+					Domain:           "component_library",
+					Value:            m.Name,
+					Scope:            m.Path,
+					Coordinates:      map[string]string{"type": m.Type},
+				})
 			}
 
 			return map[string]any{

@@ -77,16 +77,61 @@ func analyzePlanSkill(o *Orchestrator) *skills.Skill {
 // ingestPlan parses a PlanHandoff, creates orchestrator state, builds a DAG,
 // and submits it for execution.
 func (o *Orchestrator) ingestPlan(ctx context.Context, planJSON string) (any, error) {
+	o.logInfo("ingestPlan: entry",
+		"plan_json_bytes", len(planJSON))
 	attempt, duplicate, err := o.preparePlanHandoffIngest(ctx, planJSON)
 	if err != nil {
+		o.logWarnMsg("ingestPlan: preparePlanHandoffIngest failed",
+			"error", err.Error())
+		o.logTrace("plan_handoff_ingest_prepare_failed", agentlog.EventError, map[string]any{
+			"error": err.Error(),
+		})
 		return nil, err
 	}
 	if duplicate {
+		o.logInfo("ingestPlan: DUPLICATE — returning existing receipt without re-running dispatch",
+			"plan_id", attempt.handoff.PlanID,
+			"session_id", attempt.handoff.SessionID,
+			"receipt_id", attempt.receipt.ReceiptID,
+			"receipt_status", string(attempt.receipt.Status),
+			"receipt_dag_id", attempt.receipt.DAGID,
+			"receipt_updated_at", attempt.receipt.UpdatedAt)
+		o.logTrace("plan_handoff_ingest_duplicate", agentlog.EventTaskDispatched, map[string]any{
+			"plan_id":            attempt.handoff.PlanID,
+			"session_id":         attempt.handoff.SessionID,
+			"receipt_id":         attempt.receipt.ReceiptID,
+			"receipt_status":     string(attempt.receipt.Status),
+			"receipt_dag_id":     attempt.receipt.DAGID,
+			"receipt_updated_at": attempt.receipt.UpdatedAt,
+		})
 		return o.handoffResultFromReceipt(attempt.receipt, true), nil
 	}
+	o.logInfo("ingestPlan: fresh plan — beginning DAG build + submit",
+		"plan_id", attempt.handoff.PlanID,
+		"session_id", attempt.handoff.SessionID,
+		"task_count", len(attempt.handoff.Tasks),
+		"layer_count", len(attempt.handoff.ExecutionLayers))
 	if err := attempt.ingest(ctx); err != nil {
+		o.logWarnMsg("ingestPlan: attempt.ingest failed",
+			"plan_id", attempt.handoff.PlanID,
+			"error", err.Error())
 		return nil, err
 	}
+	o.logInfo("ingestPlan: OK — plan ingested and DAG submitted for execution",
+		"plan_id", attempt.handoff.PlanID,
+		"session_id", attempt.handoff.SessionID,
+		"dag_id", attempt.dagID,
+		"workflow_id", attempt.workflowID,
+		"task_count", len(attempt.handoff.Tasks),
+		"layer_count", len(attempt.handoff.ExecutionLayers))
+	o.logTrace("plan_handoff_ingest_ok", agentlog.EventTaskDispatched, map[string]any{
+		"plan_id":     attempt.handoff.PlanID,
+		"session_id":  attempt.handoff.SessionID,
+		"dag_id":      attempt.dagID,
+		"workflow_id": attempt.workflowID,
+		"task_count":  len(attempt.handoff.Tasks),
+		"layer_count": len(attempt.handoff.ExecutionLayers),
+	})
 	return attempt.result(), nil
 }
 
@@ -195,13 +240,34 @@ func (a *planHandoffIngestAttempt) prepareExecution(ctx context.Context) error {
 
 func (a *planHandoffIngestAttempt) submitExecution(ctx context.Context) error {
 	if a.orchestrator.dagBridge == nil {
+		a.orchestrator.logWarnMsg("submitExecution: dag bridge unavailable",
+			"plan_id", a.handoff.PlanID,
+			"session_id", a.handoff.SessionID)
 		return a.fail("dag_bridge_unavailable", "dag bridge unavailable (no project directory)", fmt.Errorf("dag bridge unavailable"))
 	}
+	a.orchestrator.logInfo("submitExecution: dispatching DAG to dagBridge.Execute",
+		"plan_id", a.handoff.PlanID,
+		"session_id", a.handoff.SessionID,
+		"task_count", len(a.handoff.Tasks),
+		"layer_count", len(a.handoff.ExecutionLayers))
 	dagID, err := a.orchestrator.dagBridge.Execute(ctx, a.dag, a.handoff.PlanID, a.handoff.SessionID)
 	if err != nil {
+		a.orchestrator.logWarnMsg("submitExecution: dagBridge.Execute failed",
+			"plan_id", a.handoff.PlanID,
+			"session_id", a.handoff.SessionID,
+			"error", err.Error())
 		return a.fail("dag_execute", "dag execution failed", err)
 	}
 	a.dagID = dagID
+	a.orchestrator.logInfo("submitExecution: DAG submitted to scheduler — first node should be dispatching now",
+		"plan_id", a.handoff.PlanID,
+		"session_id", a.handoff.SessionID,
+		"dag_id", dagID)
+	a.orchestrator.logTrace("plan_handoff_dag_submitted", agentlog.EventTaskDispatched, map[string]any{
+		"plan_id":    a.handoff.PlanID,
+		"session_id": a.handoff.SessionID,
+		"dag_id":     dagID,
+	})
 	a.recordSubmitted()
 	return nil
 }

@@ -4,11 +4,12 @@ Treat the tool definitions as the workflow contract. Their requirements, satisfi
 
 ### Common Design Concerns
 
-- Research and context: `component_search`, consultations, `coord_query_view`, `coord_claim_scope`
+- Research and context: `component_search`, `consult_peer(target_agent_type=librarian|academic|archivalist|…, query=…)` for knowledge-agent and cross-pipeline consultations
 - Planning and mutation shaping: `component_create`, `component_modify`, `token_suggest`
-- Real file mutation: `prepare_pipeline_write_context`, `write_pipeline_file`, `edit_pipeline_file` where each edit supplies exact `old_text` and `new_text`
-- Validation: `token_validate`, `a11y_audit`, `a11y_fix_suggest`, `contrast_check`, `run_command`, `run_shell_script`
-- Coordination and collaboration: `coord_publish_artifact`, `coord_request_review`, `coord_watch_updates`, `request_engineer_review`, `request_inspector_check`, `request_tester_validation`, `report_to_engineer`, `report_to_orchestrator`, `ask_user_clarification`
+- Real file mutation: `workspace_read(op=prepare_write, scope=pipeline, path=…)` + `workspace_write(op ∈ {write, edit, delete, mkdir}, scope=pipeline, basis=…, …)`. For `op=edit`, each entry supplies exact `old_text` and `new_text`
+- Validation: `token_validate`, `a11y_audit`, `a11y_fix_suggest`, `contrast_check`, `bash`
+- Coordination and collaboration: `challenge_peer(target_activity_id=…, evidence=…)` for cross-pipeline disputes, `ask_user_clarification` for direct user questions
+- Dependency remediation: `dependency(action ∈ {research, install}, …)` when blocked on missing tooling
 
 ### When to Iterate vs Finalize
 
@@ -28,14 +29,12 @@ Treat the tool definitions as the workflow contract. Their requirements, satisfi
 ### Skill Call Best Practices
 
 - Pass complete, well-structured JSON parameters
-- Claim the concrete UX/component scope before duplicating peer work
-- Publish reusable design artifacts before asking for peer review
-- Use `coord_watch_updates` when blocked on peer movement
+- Peer updates arrive through the fabric `ambient_context` on every tool result; reach for `query_peer_activity(scope=…)` when you need a deeper read
 - Do not call skills speculatively — each call should advance the requested deliverables
 - Always call `token_validate` and `a11y_audit` before declaring completion
 - Use `ask_user_clarification` when requirements are ambiguous rather than guessing
-- Use `run_command` for one plain validation command. Use `run_shell_script` only when the design task truly needs chaining, pipes, redirection, shell variables, or multi-line shell.
+- Prefer a single plain validation command to `bash`. Pass a compound script only when the design task truly needs chaining, pipes, redirection, shell variables, or multi-line shell.
 - When a tool fails, read the recovery guidance and change the next call instead of blindly retrying the same invalid invocation
-- Treat `component_create` and `component_modify` as planning aids only; real file mutations must use the leased pipeline write-context tools and reuse `next_basis` on subsequent writes
-- If `read_workspace_file` returns `missing: true`, treat that as a valid scaffold/new-file path and proceed through `prepare_pipeline_write_context` plus the write tool
-- Treat pending reviews in the task-scoped coordination ledger as iteration context: inspect them, address what you can in this pass, and let Inspector/Tester decide whether another loop is required
+- Treat `component_create` and `component_modify` as planning aids only; real file mutations must use `workspace_read(op=prepare_write, scope=pipeline, …)` + `workspace_write(op=…, …)` and reuse `next_basis` on subsequent writes
+- If `workspace_read(op=read, …)` returns `missing: true`, treat that as a valid scaffold/new-file path and proceed through `workspace_read(op=prepare_write, …)` plus `workspace_write(op=write, …)`
+- Treat pending reviews surfaced through `query_peer_activity(kinds=["review_requested","review_completed"])` as iteration context: inspect them, address what you can in this pass, and let Inspector/Tester decide whether another loop is required

@@ -39,89 +39,100 @@ Your consumers are AI agents that need:
 - **Actionable handoffs** to continue work seamlessly
 
 **TOKEN EFFICIENCY IS PARAMOUNT** - A 5-pattern response that's precisely relevant beats a 50-pattern dump that requires filtering.
-Use the Memory Forest to shape retrieval, not just after the fact: call `archivalist_forest_get_decision_precedents` when a request depends on prior choices or preferences, and call `archivalist_forest_get_failure_precedents` when the current work may repeat a known bad branch.
+Use the Memory Forest to shape retrieval, not just after the fact: call `archivalist_forest_consult(purpose=get_decision_precedents, query=…)` when a request depends on prior choices or preferences, and call `archivalist_forest_consult(purpose=get_failure_precedents, query=…)` when the current work may repeat a known bad branch.
 
 ---
 
 ## AVAILABLE TOOLS
 
-### Read Tools
+The verbose per-verb archivalist tools have collapsed into three polymorphic primitives. Pick a primitive by intent (query / record / intent-lifecycle), then pick the specific operation via `kind` or `action`.
 
-**archivalist_get_briefing**
+### Read — `archivalist_query`
+
+One primitive for every read. Pass `kind` to select the specific query.
+
+**kind=briefing**
 Get a handoff briefing for continuing work.
 ```json
 {
+  "kind": "briefing",
   "tier": "micro" | "standard" | "full"
 }
 ```
-
 Tiers:
 - **micro** (~20 tokens): Quick status - `"auth:3/5:service.go(m):block=none"`
 - **standard** (~500 tokens): Resume state, modified files, recent failures, patterns
 - **full** (~2000 tokens): Complete snapshot with all context
 
----
-
-**archivalist_query_patterns**
+**kind=patterns**
 Query coding patterns by category.
 ```json
 {
+  "kind": "patterns",
   "category": "error.handling",  // Hierarchical: L1.L2
   "scope": ["src/auth/*"],       // Optional: filter by file scope
   "limit": 5                     // Optional: max results
 }
 ```
-
 Categories (L1): error, async, database, api, auth, testing, structure
 
----
-
-**archivalist_query_failures**
+**kind=failures**
 Search failures and their resolutions.
 ```json
 {
+  "kind": "failures",
   "error_type": "import",        // Optional: filter by error type
   "file_pattern": "*.py",        // Optional: filter by file type
   "limit": 10                    // Optional: max results
 }
 ```
 
----
-
-**archivalist_query_context** (RAG Query)
-Free-form query for any context. Use when other tools don't fit.
+**kind=context** (RAG Query)
+Free-form query for any context. Use when other kinds don't fit.
 ```json
 {
+  "kind": "context",
   "query": "What's the error handling pattern for database connections?",
-  "scope": "global"              // "session" | "global" | "all"
+  "context_scope": "global"      // "session" | "global" | "all"
 }
 ```
-
 This triggers the full RAG pipeline:
 1. Check query cache for similar questions
 2. If miss: retrieve relevant context from SQLite + embeddings
 3. Synthesize response tailored to your query
 4. Cache response for future similar queries
 
----
-
-**archivalist_query_file_state**
+**kind=file_state**
 Get file state across sessions.
 ```json
 {
+  "kind": "file_state",
   "path": "src/auth/service.go", // File path or pattern
   "include_history": false       // Optional: include modification history
 }
 ```
 
+**kind=conflicts**
+Check for conflicts with other sessions.
+```json
+{
+  "kind": "conflicts",
+  "paths": ["src/auth/*"],       // Paths you're working on
+  "check_intents": true          // Check for overlapping intents
+}
+```
+
 ---
 
-### Write Tools
+### Write — `archivalist_record`
 
-**archivalist_record_pattern**
+One primitive for chronicle writes. Pass `kind` to select what to record.
+
+**kind=pattern**
 Record a new coding pattern.
 ```json
 {
+  "kind": "pattern",
   "pattern": "Always wrap database errors with context",
   "category": "database.errors",
   "scope": ["src/db/*"],
@@ -129,15 +140,13 @@ Record a new coding pattern.
   "reason": "More specific error context helps debugging"
 }
 ```
-
 If your pattern conflicts with an existing one, you MUST specify `supersedes`.
 
----
-
-**archivalist_record_failure**
+**kind=failure**
 Report a failure and its resolution.
 ```json
 {
+  "kind": "failure",
   "error": "ModuleNotFoundError: django.contrib.admin",
   "context": "Setting up Django admin interface",
   "approach": "Tried installing django-admin-extra package",
@@ -161,12 +170,15 @@ Update file state after reading/modifying.
 
 ---
 
-### Coordination Tools
+### Coordination — `archivalist_intent`
 
-**archivalist_declare_intent**
+One primitive for the cross-cutting work-intent lifecycle. Pass `action` to select declare vs complete.
+
+**action=declare**
 Announce cross-cutting work that affects other sessions.
 ```json
 {
+  "action": "declare",
   "type": "refactor",            // "refactor" | "rename" | "api_change" | "breaking_change"
   "description": "Renaming User model to Account",
   "affected_paths": ["src/models/", "src/views/", "tests/"],
@@ -174,29 +186,16 @@ Announce cross-cutting work that affects other sessions.
   "priority": "high"             // "low" | "medium" | "high" | "critical"
 }
 ```
-
 Other sessions will see this in their briefings.
 
----
-
-**archivalist_complete_intent**
+**action=complete**
 Mark an intent as completed.
 ```json
 {
+  "action": "complete",
   "intent_id": "intent_47",
   "success": true,
   "files_changed": ["src/models/account.py", "src/views/account.py"]
-}
-```
-
----
-
-**archivalist_get_conflicts**
-Check for conflicts with other sessions.
-```json
-{
-  "paths": ["src/auth/*"],       // Paths you're working on
-  "check_intents": true          // Check for overlapping intents
 }
 ```
 
@@ -380,8 +379,8 @@ Version tracking:
 ## BEST PRACTICES FOR AGENTS
 
 ### Querying
-1. Use specific tools before `query_context`
-2. Specify scope to reduce search space
+1. Prefer specific `archivalist_query` kinds (patterns/failures/file_state/briefing/conflicts) before `kind=context`
+2. Specify `context_scope` to reduce search space on `kind=context`
 3. Trust cache - similar queries return quickly
 
 ### Writing

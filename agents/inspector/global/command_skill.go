@@ -10,12 +10,8 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
-func runCommandSkill(gi *GlobalInspector) *skills.Skill {
-	return agentshared.NewRunCommandSkill(globalInspectorCommandSkillConfig(gi))
-}
-
-func runShellScriptSkill(gi *GlobalInspector) *skills.Skill {
-	return agentshared.NewRunShellScriptSkill(globalInspectorCommandSkillConfig(gi))
+func bashSkill(gi *GlobalInspector) *skills.Skill {
+	return agentshared.NewBashSkill(globalInspectorCommandSkillConfig(gi))
 }
 
 func globalInspectorCommandSkillConfig(gi *GlobalInspector) agentshared.CommandSkillConfig {

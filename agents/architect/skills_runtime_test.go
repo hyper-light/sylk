@@ -17,14 +17,18 @@ func TestArchitect_SkillsLoaded(t *testing.T) {
 	if len(defs) == 0 {
 		t.Fatal("expected loaded skill definitions")
 	}
-	if !toolDefsContain(defs, "consult") {
-		t.Fatal("expected consult to be loaded")
+	// Phase 1 refactor: `consult` removed in favor of consult_peer.
+	if !toolDefsContain(defs, "consult_peer") {
+		t.Fatal("expected consult_peer to be loaded")
 	}
-	if !toolDefsContain(defs, "pre_delegation_declare") {
-		t.Fatal("expected pre_delegation_declare to be loaded")
+	// Phase 2.4 refactor: pre_delegation_declare → delegation(action=declare).
+	if !toolDefsContain(defs, "delegation") {
+		t.Fatal("expected delegation skill to be loaded")
 	}
-	if toolDefsContain(defs, "read_research_paper") {
-		t.Fatal("expected read_research_paper to be lazy-loaded, not core-loaded")
+	// Phase 2.6 refactor: read_research_paper → academic_research(action=read).
+	// academic_research is visible-by-default (not lazy-loaded).
+	if !toolDefsContain(defs, "academic_research") {
+		t.Fatal("expected academic_research to be loaded")
 	}
 }
 
@@ -58,6 +62,8 @@ func TestArchitect_PlanningWithoutBusStillResponds(t *testing.T) {
 }
 
 func TestArchitect_ReadResearchPaperSkill(t *testing.T) {
+	// Phase 2.6 refactor: read_research_paper folded into
+	// academic_research(action=read).
 	root := t.TempDir()
 	paperPath := filepath.Join(root, "research.md")
 	if err := os.WriteFile(paperPath, []byte("# Research\nUse cache-aside with redis."), 0644); err != nil {
@@ -69,6 +75,7 @@ func TestArchitect_ReadResearchPaperSkill(t *testing.T) {
 		WorkingDirectory:                 root,
 	})
 	input := map[string]any{
+		"action":        "read",
 		"research_slug": "redis-caching",
 		"paper_path":    paperPath,
 		"summary":       "Redis cache-aside recommendation",
@@ -78,9 +85,9 @@ func TestArchitect_ReadResearchPaperSkill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("json marshal failed: %v", err)
 	}
-	result := a.InvokeSkill(context.Background(), "read_research_paper", payload)
+	result := a.InvokeSkill(context.Background(), "academic_research", payload)
 	if result == nil || !result.Success {
-		t.Fatalf("read_research_paper failed: %+v", result)
+		t.Fatalf("academic_research(action=read) failed: %+v", result)
 	}
 	data, ok := result.Data.(map[string]any)
 	if !ok {
@@ -140,8 +147,9 @@ func TestArchitect_PrepareToolDefinitionsForRequest_LazyLoadsResearchTools(t *te
 	if len(defs) == 0 {
 		t.Fatal("expected tool definitions after prepare")
 	}
-	if !toolDefsContain(defs, "read_research_paper") {
-		t.Fatal("expected read_research_paper to be loaded for research request")
+	// Phase 2.6 refactor: read_research_paper folded into academic_research.
+	if !toolDefsContain(defs, "academic_research") {
+		t.Fatal("expected academic_research to be loaded for research request")
 	}
 }
 
@@ -209,14 +217,15 @@ func TestArchitect_StartPlanning_ReusesRequestScopedPlan(t *testing.T) {
 
 	ctx := withArchitectSessionID(context.Background(), "sess-reuse")
 	ctx = withArchitectStreamContext(ctx, "corr-reuse", "tui")
-	payload, err := json.Marshal(map[string]any{"query": "Create a hello world CLI"})
+	// Phase 2.K / CR-4 refactor: start_planning → plan(action=start).
+	payload, err := json.Marshal(map[string]any{"action": "start", "query": "Create a hello world CLI"})
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
 
-	first := a.InvokeSkill(ctx, "start_planning", payload)
+	first := a.InvokeSkill(ctx, "plan", payload)
 	if first == nil || !first.Success {
-		t.Fatalf("first start_planning failed: %+v", first)
+		t.Fatalf("first plan(action=start) failed: %+v", first)
 	}
 	firstData, ok := first.Data.(map[string]any)
 	if !ok {
@@ -227,9 +236,9 @@ func TestArchitect_StartPlanning_ReusesRequestScopedPlan(t *testing.T) {
 		t.Fatal("first plan_id is empty")
 	}
 
-	second := a.InvokeSkill(ctx, "start_planning", payload)
+	second := a.InvokeSkill(ctx, "plan", payload)
 	if second == nil || !second.Success {
-		t.Fatalf("second start_planning failed: %+v", second)
+		t.Fatalf("second plan(action=start) failed: %+v", second)
 	}
 	secondData, ok := second.Data.(map[string]any)
 	if !ok {
@@ -240,7 +249,7 @@ func TestArchitect_StartPlanning_ReusesRequestScopedPlan(t *testing.T) {
 		t.Fatalf("second plan_id = %q, want %q", secondPlanID, firstPlanID)
 	}
 	if reused, _ := secondData["reused"].(bool); !reused {
-		t.Fatal("expected second start_planning call to report reused=true")
+		t.Fatal("expected second plan(action=start) call to report reused=true")
 	}
 }
 
@@ -294,15 +303,17 @@ func TestArchitect_GenerateTasks_ReusesReadyPlanArtifacts(t *testing.T) {
 func TestArchitect_PlanDesign_AllowsAnalyzeWithoutConsultHop(t *testing.T) {
 	a := newTestArchitect(t, Config{AllowPlanningWithoutConsultation: true})
 
+	// Phase 2.K / CR-4 refactor: start_planning → plan(action=start).
 	startPayload, err := json.Marshal(map[string]any{
-		"query": "Create a minimal Python hello world CLI application.",
+		"action": "start",
+		"query":  "Create a minimal Python hello world CLI application.",
 	})
 	if err != nil {
 		t.Fatalf("marshal start payload: %v", err)
 	}
-	startResult := a.InvokeSkill(context.Background(), "start_planning", startPayload)
+	startResult := a.InvokeSkill(context.Background(), "plan", startPayload)
 	if startResult == nil || !startResult.Success {
-		t.Fatalf("start_planning failed: %+v", startResult)
+		t.Fatalf("plan(action=start) failed: %+v", startResult)
 	}
 	startData, ok := startResult.Data.(map[string]any)
 	if !ok {
@@ -495,29 +506,31 @@ func TestArchitect_PlanSkillDispatch(t *testing.T) {
 }
 
 func TestArchitect_PlanWorkflowSkillDispatch(t *testing.T) {
+	// Phase 2.K / CR-4 refactor: plan_workflow folded into
+	// plan(action=workflow, workflow_type=…).
 	a := newTestArchitect(t, Config{
 		AllowPlanningWithoutConsultation: true,
 	})
 
 	// standard without tasks returns error
-	payload, _ := json.Marshal(map[string]any{"type": "standard"})
-	result := a.InvokeSkill(context.Background(), "plan_workflow", payload)
+	payload, _ := json.Marshal(map[string]any{"action": "workflow", "workflow_type": "standard"})
+	result := a.InvokeSkill(context.Background(), "plan", payload)
 	if result != nil && result.Success {
-		t.Fatal("expected plan_workflow standard without tasks to fail")
+		t.Fatal("expected plan(action=workflow, workflow_type=standard) without tasks to fail")
 	}
 
 	// fix without corrections returns error
-	payload, _ = json.Marshal(map[string]any{"type": "fix"})
-	result = a.InvokeSkill(context.Background(), "plan_workflow", payload)
+	payload, _ = json.Marshal(map[string]any{"action": "workflow", "workflow_type": "fix"})
+	result = a.InvokeSkill(context.Background(), "plan", payload)
 	if result != nil && result.Success {
-		t.Fatal("expected plan_workflow fix without corrections to fail")
+		t.Fatal("expected plan(action=workflow, workflow_type=fix) without corrections to fail")
 	}
 
 	// unknown type returns error
-	payload, _ = json.Marshal(map[string]any{"type": "unknown"})
-	result = a.InvokeSkill(context.Background(), "plan_workflow", payload)
+	payload, _ = json.Marshal(map[string]any{"action": "workflow", "workflow_type": "unknown"})
+	result = a.InvokeSkill(context.Background(), "plan", payload)
 	if result != nil && result.Success {
-		t.Fatal("expected plan_workflow unknown type to fail")
+		t.Fatal("expected plan(action=workflow) with unknown workflow_type to fail")
 	}
 }
 

@@ -261,13 +261,13 @@ func TestGetSkillsForAgentIncludesSupplementalDomains(t *testing.T) {
 	if !containsSkill(engineerSkills, "pipeline_get_implementation_context") {
 		t.Fatal("engineer should inherit pipeline skills via supplemental domains")
 	}
-	if !containsSkill(engineerSkills, "engineer_forest_select_implementation_branch") {
-		t.Fatal("engineer should receive engineer forest skills")
+	if !containsSkill(engineerSkills, "engineer_forest_consult") {
+		t.Fatal("engineer should receive collapsed engineer_forest_consult skill")
 	}
 
 	scribeSkills := GetSkillsForAgent(registry, "scribe-engineer")
-	if !containsSkill(scribeSkills, "scribe_forest_get_capture_targets") {
-		t.Fatal("scribe-engineer should inherit scribe forest skills")
+	if !containsSkill(scribeSkills, "scribe_forest_consult") {
+		t.Fatal("scribe-engineer should inherit collapsed scribe_forest_consult skill")
 	}
 }
 

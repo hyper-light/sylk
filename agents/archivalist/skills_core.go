@@ -45,6 +45,16 @@ func (a *Archivalist) registerCoreSkills() {
 	a.skills.Register(declareIntentToolSkill(a))
 	a.skills.Register(completeIntentToolSkill(a))
 	a.skills.Register(getConflictsToolSkill(a))
+	// Façades: the 10 verbose per-verb tools above collapse into three
+	// polymorphic primitives for the LLM catalog — archivalist_query
+	// (6 read kinds → 1), archivalist_record (2 write kinds → 1),
+	// archivalist_intent (2 lifecycle actions → 1). The per-verb
+	// skills stay registered for internal callers (handlers.go, the
+	// legacy protocol endpoints, and tests); only the visible surface
+	// collapses. See skills_facade.go for the dispatch handlers.
+	a.skills.Register(archivalistQueryFacadeSkill(a))
+	a.skills.Register(archivalistRecordFacadeSkill(a))
+	a.skills.Register(archivalistIntentFacadeSkill(a))
 	a.skills.Register(routeToSkill(a))
 	a.skills.Register(replyToSkill(a))
 	a.skills.Register(consultSkill(a))
@@ -88,6 +98,15 @@ func (a *Archivalist) registerFabricSkills() {
 		AgentID:    agentID,
 		AgentType:  agentType,
 		PipelineID: func() string { return "" },
+		RouteSync: shared.RouteSyncFromBus(
+			func() guide.EventBus { return a.bus },
+			func() string {
+				if a.channels == nil {
+					return ""
+				}
+				return a.channels.Responses
+			},
+		),
 	}) {
 		a.skills.Register(skill)
 	}

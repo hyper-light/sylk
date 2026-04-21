@@ -11,21 +11,10 @@ func globalTesterVisibleSkillNames() []string {
 	base := agentshared.AppendMemoryForestVisibleSkillNames([]string{
 		"analyze_risk",
 		"plan_tests",
-		"read_file",
-		"prepare_global_write_context",
-		"diff_workspace_file",
-		"list_global_changes",
-		"write_global_file",
-		"edit_global_file",
-		"delete_global_file",
-		"create_global_directory",
-		"read_workspace_file",
-		"workspace_glob",
-		"workspace_grep",
-		"inspect_workspace_state",
-		"summarize_workspace_state",
-		"run_command",
-		"run_shell_script",
+		// Phase 2.K / CR-2: 12 workspace skills collapsed into 3 verbs.
+		"workspace_read",
+		"workspace_write",
+		"bash",
 		"challenge_inspector",
 		"handoff_next",
 		"validate_work",
@@ -33,8 +22,10 @@ func globalTesterVisibleSkillNames() []string {
 		"write_test",
 		"run_test_suite",
 		"diagnose_failure",
-		"research_test_tool_install",
-		"install_test_tooling",
+		// Phase 2.K / GT-4 + GI-5: collapsed into dependency(action=…, category=test).
+		"dependency",
+		// Phase 2.K / GT-A: single unified escalation primitive.
+		"escalate_failure",
 		"ask_user_clarification",
 	}, "tester")
 	return fabric.AppendFabricAwarenessSkillNames(base)
@@ -42,24 +33,21 @@ func globalTesterVisibleSkillNames() []string {
 
 func globalTesterMutatingSkillNames() []string {
 	return agentshared.AppendMemoryForestMutatingSkillNames([]string{
-		"write_global_file",
-		"edit_global_file",
-		"delete_global_file",
-		"create_global_directory",
-		"run_command",
-		"run_shell_script",
+		// Phase 2.K / CR-2: 4 write skills collapsed into workspace_write.
+		"workspace_write",
+		"bash",
 		"challenge_inspector",
 		"handoff_next",
 		"validate_work",
 		"process_validation",
+		// Phase 2.K / GT-2 refactor: write_integration_test +
+		// write_e2e_test collapsed into write_test(level=…).
 		"write_test",
 		"run_test_suite",
 		"build_harness",
-		"install_test_tooling",
-		"write_integration_test",
-		"write_e2e_test",
-		"report_to_orchestrator",
-		"report_to_architect",
+		"dependency",
+		// Phase 2.K / GT-A: report_to_orchestrator + report_to_architect
+		// + escalate_failure collapsed into escalate_failure(targets=[…]).
 		"escalate_failure",
 		"reroute_request",
 	})

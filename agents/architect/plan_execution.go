@@ -331,6 +331,20 @@ func (a *Architect) dispatchPlanExecution(
 		// to a fresh dispatch so the user's resume actually executes
 		// instead of getting "already being handed off" forever.
 		if plan.PendingWork.ExpiresAt.IsZero() || time.Now().UTC().Before(plan.PendingWork.ExpiresAt) {
+			a.logInfo("dispatchPlanExecution: short-circuit — plan already has fresh plan_handoff continuation; NOT publishing a new handoff",
+				"plan_id", plan.ID,
+				"session_id", plan.SessionID,
+				"continuation_corr_id", plan.PendingWork.CorrelationID,
+				"continuation_expires_at", plan.PendingWork.ExpiresAt,
+				"continuation_message", plan.PendingWork.Message)
+			a.logTrace("architect_plan_handoff_dispatch_idempotent_skip", "warn", plan.SessionID, plan.PendingWork.CorrelationID, agentlog.EventTaskDispatched, map[string]any{
+				"plan_id":                 plan.ID,
+				"continuation_corr_id":    plan.PendingWork.CorrelationID,
+				"continuation_expires_at": plan.PendingWork.ExpiresAt,
+				"continuation_kind":       plan.PendingWork.Kind,
+				"source":                  "dispatchPlanExecution",
+				"reason":                  "fresh_plan_handoff_continuation_present",
+			})
 			return &ConversationResult{
 				Response: "The plan is already being handed off to the orchestrator. I'll update you when it confirms ingestion.",
 				Intent:   IntentExecute,
@@ -338,8 +352,15 @@ func (a *Architect) dispatchPlanExecution(
 		}
 		a.logInfo("dispatchPlanExecution: clearing stale plan_handoff continuation",
 			"plan_id", plan.ID,
+			"session_id", plan.SessionID,
 			"continuation_corr_id", plan.PendingWork.CorrelationID,
 			"expired_at", plan.PendingWork.ExpiresAt)
+		a.logTrace("architect_plan_handoff_clearing_stale_continuation", "info", plan.SessionID, plan.PendingWork.CorrelationID, agentlog.EventTaskDispatched, map[string]any{
+			"plan_id":              plan.ID,
+			"continuation_corr_id": plan.PendingWork.CorrelationID,
+			"expired_at":           plan.PendingWork.ExpiresAt,
+			"source":               "dispatchPlanExecution",
+		})
 		plan.PendingWork = nil
 	}
 

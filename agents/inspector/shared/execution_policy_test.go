@@ -9,7 +9,7 @@ import (
 )
 
 func TestInspectorRejectTestExecution_RejectsPytest(t *testing.T) {
-	err := InspectorRejectTestExecution("python3 -m pytest tests/test_cli.py", "run_command")
+	err := InspectorRejectTestExecution("python3 -m pytest tests/test_cli.py", "bash")
 	if err == nil {
 		t.Fatal("expected pytest execution to be rejected for inspector")
 	}
@@ -22,7 +22,7 @@ func TestInspectorRejectTestExecution_RejectsPytest(t *testing.T) {
 }
 
 func TestInspectorRejectTestExecution_AllowsLinterCommand(t *testing.T) {
-	if err := InspectorRejectTestExecution("golangci-lint run ./...", "run_command"); err != nil {
+	if err := InspectorRejectTestExecution("golangci-lint run ./...", "bash"); err != nil {
 		t.Fatalf("expected linter execution to be allowed, got %v", err)
 	}
 }

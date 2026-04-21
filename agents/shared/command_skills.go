@@ -58,56 +58,57 @@ type runShellScriptParams struct {
 	TimeoutMs  int    `json:"timeout_ms,omitempty"`
 }
 
-func NewRunCommandSkill(cfg CommandSkillConfig) *skills.Skill {
-	return skills.NewSkill("run_command").
-		Description("Execute exactly one plain shell command against the agent's current workspace view. Pre-approved commands run directly; other commands are routed through Guardian approval.").
-		Domain("code").
-		Keywords("run", "execute", "command", "shell", "verify").
-		Priority(80).
-		Usage("Use when one plain command is enough to verify behavior, run tooling, or gather execution evidence. Prefer this over run_shell_script whenever you do not need shell chaining or redirection.").
-		Requirement("Each invocation must contain exactly one plain command. Do not use shell control operators, pipes, redirection, shell expansion, or multi-line shell.").
-		Satisfies("Produces concrete execution evidence for validation, diagnosis, and reporting.").
-		Avoid("Do not chain setup steps, use cd, or pack multiple logical operations into one call.").
-		BestPractice("Use working_dir instead of prefixing the command with cd.").
-		BestPractice("When strict execution is available, this command reads the same disk/global/pipeline workspace view the agent is operating on; it is not limited to already-committed files on disk.").
-		BestPractice("working_dir may point at a directory from that active workspace view, including directories that currently exist only in VFS-backed task state.").
-		BestPractice("If the task needs &&, ||, ;, pipes, redirection, shell variables, or multi-line shell, use run_shell_script instead.").
-		StringParam("command", "Single command to execute", true).
-		StringParam("working_dir", "Working directory for command execution", false).
-		IntParam("timeout_ms", "Command timeout in milliseconds", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params runCommandParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			return executeCommandLike(ctx, cfg, "run_command", strings.TrimSpace(params.Command), params.WorkingDir, params.TimeoutMs, commandapproval.ApprovalPolicyDefault, false)
-		}).
-		Build()
+type bashParams struct {
+	Script     string `json:"script"`
+	WorkingDir string `json:"working_dir,omitempty"`
+	TimeoutMs  int    `json:"timeout_ms,omitempty"`
 }
 
-func NewRunShellScriptSkill(cfg CommandSkillConfig) *skills.Skill {
-	return skills.NewSkill("run_shell_script").
-		Description("Execute a shell script or compound shell command against the agent's current workspace view when the task requires chaining, pipes, redirection, shell variables, or multi-line shell.").
+// NewBashSkill returns the unified `bash` execution skill that supersedes
+// run_command + run_shell_script. One skill, one parameter (`script`),
+// dynamic approval policy:
+//
+//   - scripts that parse as a single plain command (no shell operators,
+//     no redirection, no pipes, no multi-line) use the default approval
+//     policy — pre-approved patterns can fast-path, matching the old
+//     run_command ergonomics.
+//   - anything with shell syntax (&&, ||, ;, |, >, <, `, $(), newlines)
+//     uses the exact-command approval policy — pre-approval does not
+//     apply, matching the old run_shell_script semantics.
+//
+// The agent sees one tool; Guardian gating is unchanged.
+func NewBashSkill(cfg CommandSkillConfig) *skills.Skill {
+	return skills.NewSkill("bash").
+		Description("Execute a shell command or script against the agent's current workspace view. Pass a single plain command for fast-path approval; pass a compound script (&&, ||, pipes, redirection, multi-line) when the task needs shell features. One tool for both — the approval policy adapts to the script shape automatically.").
 		Domain("code").
-		Keywords("run", "shell", "script", "compound", "pipe", "redirect").
-		Priority(78).
-		Usage("Use only when a single plain command is insufficient and the task genuinely requires shell features such as chaining, pipes, redirection, shell expansion, or multi-line setup.").
-		Requirement("Prefer run_command first. Use this only for shell workflows that cannot be expressed as one plain command.").
-		Satisfies("Provides controlled execution for compound shell workflows that need exact user approval semantics.").
-		Avoid("Do not use run_shell_script for simple commands that fit in run_command, and do not use it as a shortcut around write tools.").
-		BestPractice("Keep the script minimal and purpose-built for the current task.").
-		BestPractice("When strict execution is available, the script runs against the same disk/global/pipeline workspace view the agent is operating on, including VFS-backed files that are not committed to disk yet.").
+		Keywords("run", "execute", "command", "shell", "script", "bash", "pipe", "redirect", "verify").
+		Priority(80).
+		Usage("Use for any shell execution: verifying behavior, running tooling, gathering execution evidence, setting up test fixtures. For simple commands (ls, go test, pytest), just pass the command. When chaining or piping is genuinely needed, write the full script inline — don't fight the tool.").
+		Satisfies("Produces concrete execution evidence for validation, diagnosis, and reporting.").
+		Avoid("Do not use bash as a shortcut around the workspace write tools — use those for file edits. Do not pack unrelated steps into one script; keep each invocation purpose-built.").
+		BestPractice("Use working_dir instead of prefixing the script with cd.").
+		BestPractice("When strict execution is available, scripts run against the same disk/global/pipeline workspace view the agent is operating on, including VFS-backed files that are not committed to disk yet.").
 		BestPractice("working_dir may point at a directory from that active workspace view, including directories that currently exist only in VFS-backed task state.").
-		BestPractice("This tool uses exact-command approval only; broad pre-approval does not apply.").
-		StringParam("script", "Shell script or compound shell command to execute", true).
+		BestPractice("Simple single-command invocations (no shell operators) can fast-path through pre-approval; compound scripts always require exact-command approval.").
+		StringParam("script", "Shell command or script to execute. Single plain command for fast-path approval; compound script (operators, pipes, redirection, multi-line) for full shell features.", true).
 		StringParam("working_dir", "Working directory for script execution", false).
 		IntParam("timeout_ms", "Script timeout in milliseconds", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params runShellScriptParams
+			var params bashParams
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			return executeCommandLike(ctx, cfg, "run_shell_script", strings.TrimSpace(params.Script), params.WorkingDir, params.TimeoutMs, commandapproval.ApprovalPolicyExact, true)
+			script := strings.TrimSpace(params.Script)
+			// Script shape determines approval policy. Plain commands
+			// keep the old run_command fast-path; anything with shell
+			// syntax falls back to exact approval like run_shell_script.
+			policy := commandapproval.ApprovalPolicyDefault
+			allowShellSyntax := false
+			if _, hasOperator := DetectShellControlOperator(script); hasOperator {
+				policy = commandapproval.ApprovalPolicyExact
+				allowShellSyntax = true
+			}
+			return executeCommandLike(ctx, cfg, "bash", script, params.WorkingDir, params.TimeoutMs, policy, allowShellSyntax)
 		}).
 		Build()
 }

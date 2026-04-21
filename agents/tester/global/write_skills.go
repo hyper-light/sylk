@@ -15,7 +15,14 @@ import (
 	"github.com/google/uuid"
 )
 
+// Phase 2.K / GT-2 refactor (docs/PIPELINE_SKILL_REFACTOR.md):
+// write_test + write_integration_test + write_e2e_test collapsed into
+// one write_test skill with level ∈ {unit, integration, e2e}. The
+// underlying builder already dispatched on test type; the three
+// skill names just re-exposed the same enum.
+
 type globalTestWriteParams struct {
+	Level      string                         `json:"level,omitempty"`
 	TestCase   testershared.PlannedTestCase   `json:"test_case"`
 	TargetFile string                         `json:"target_file"`
 	OutputFile string                         `json:"output_file"`
@@ -23,48 +30,21 @@ type globalTestWriteParams struct {
 	Basis      versioning.WorkspaceWriteBasis `json:"basis"`
 }
 
-type globalTestWriteSkillConfig struct {
-	skillName   string
-	description string
-	testType    string
-}
-
+// writeTestSkill is the single primitive the global tester uses to
+// author any test kind (unit / integration / e2e) into the shared VFS.
 func writeTestSkill(gt *GlobalTester) *skills.Skill {
-	return newGlobalTestWriteSkill(gt, globalTestWriteSkillConfig{
-		skillName:   "write_test",
-		description: "Write a global test file into the shared VFS. Requires a fresh or still-leased global write basis for the output_file, auto-renews on lease expiry, and returns a refreshed next_basis.",
-		testType:    "test",
-	})
-}
-
-func writeIntegrationTestSkill(gt *GlobalTester) *skills.Skill {
-	return newGlobalTestWriteSkill(gt, globalTestWriteSkillConfig{
-		skillName:   "write_integration_test",
-		description: "Write a cross-component integration test into the shared VFS. Requires a fresh or still-leased global write basis for the output_file, auto-renews on lease expiry, and returns a refreshed next_basis.",
-		testType:    "integration",
-	})
-}
-
-func writeE2ETestSkill(gt *GlobalTester) *skills.Skill {
-	return newGlobalTestWriteSkill(gt, globalTestWriteSkillConfig{
-		skillName:   "write_e2e_test",
-		description: "Write an end-to-end system test into the shared VFS. Requires a fresh or still-leased global write basis for the output_file, auto-renews on lease expiry, and returns a refreshed next_basis.",
-		testType:    "e2e",
-	})
-}
-
-func newGlobalTestWriteSkill(gt *GlobalTester, cfg globalTestWriteSkillConfig) *skills.Skill {
-	return skills.NewSkill(cfg.skillName).
-		Description(cfg.description).
+	return skills.NewSkill("write_test").
+		Description("Write a test file into the shared VFS. One primitive for unit, integration, and end-to-end tests selected via the `level` parameter. Requires a fresh or still-leased global write basis for the output_file, auto-renews on lease expiry, and returns a refreshed next_basis.").
 		Domain("testing").
-		Keywords("write", cfg.testType, "test", "global", "vfs", "basis").
+		Keywords("write", "test", "unit", "integration", "e2e", "end-to-end", "global", "vfs", "basis").
 		Priority(88).
+		EnumParam("level", "Test level (default: unit)", []string{"unit", "integration", "e2e"}, false).
 		ObjectParam("test_case", "Structured planned test case metadata.", globalTestCaseProperties(), true).
 		StringParam("target_file", "Source file or subsystem under test.", true).
 		StringParam("output_file", "Destination test file path in the global workspace.", true).
 		StringParam("content", "Concrete executable test code for the output file.", true).
 		ObjectParam("basis", "Global write basis returned by prepare_global_write_context for the output_file.", globalWriteBasisProperties(), true).
-		Usage("Call prepare_global_write_context for the target output file first, pass the returned basis into this skill, and reuse the next_basis returned by each successful write while the lease remains active. Confirm the test framework, language, and conventions match the priority order in the system prompt before authoring: the task spec governs language and framework choice, in-flight peer work in the Activity Fabric defines test conventions on this surface, and the existing codebase governs test placement and runner integration.").
+		Usage("Set level to match the test kind: \"unit\" for focused per-component tests, \"integration\" for cross-component tests, \"e2e\" for full end-to-end system tests. Call prepare_global_write_context for the target output file first, pass the returned basis into this skill, and reuse the next_basis returned by each successful write while the lease remains active. Confirm the test framework, language, and conventions match the priority order in the system prompt before authoring: the task spec governs language and framework choice, in-flight peer work in the Activity Fabric defines test conventions on this surface, and the existing codebase governs test placement and runner integration.").
 		Requirement("Test code language must match the output_file extension and the harness selected for this surface; do not introduce constructs from a language different than the file's existing content.").
 		Avoid("Do not introduce a test framework that disagrees with the existing harness or codebase conventions on this surface — reconcile the language signal first (re-read the task spec, query peer activity, or invoke ask_user_clarification or a knowledge-agent consult) before writing.").
 		BestPractice("If the same test file needs multiple writes, keep feeding the returned next_basis back into the next call instead of repreparing immediately.").
@@ -73,19 +53,36 @@ func newGlobalTestWriteSkill(gt *GlobalTester, cfg globalTestWriteSkillConfig) *
 			if err != nil {
 				return nil, err
 			}
+			level := normalizeGlobalTestLevel(params.Level)
 			result, err := gt.writeGlobalTestFile(ctx, params.OutputFile, params.Content, &params.Basis)
 			if err != nil {
 				return nil, err
 			}
 			result["output_file"] = params.OutputFile
 			result["written"] = true
-			result["type"] = cfg.testType
+			result["type"] = level
+			result["level"] = level
 			if name := strings.TrimSpace(params.TestCase.Name); name != "" {
 				result["test_name"] = name
 			}
 			return result, nil
 		}).
 		Build()
+}
+
+// normalizeGlobalTestLevel trims and defaults the level enum so an
+// omitted / empty value behaves as the original write_test.
+func normalizeGlobalTestLevel(level string) string {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "integration":
+		return "integration"
+	case "e2e", "end-to-end", "end_to_end":
+		return "e2e"
+	case "unit", "", "test":
+		return "unit"
+	default:
+		return "unit"
+	}
 }
 
 func decodeGlobalTestWriteParams(input json.RawMessage) (globalTestWriteParams, error) {
@@ -170,7 +167,10 @@ func (gt *GlobalTester) invokeGlobalWriteSkill(
 	path, content string,
 	basis versioning.WorkspaceWriteBasis,
 ) (*skills.Result, error) {
-	return gt.runDeterministicGlobalSkillCall(ctx, "write_global_file", map[string]any{
+	// Phase 2.K / CR-2: route through the unified workspace_write skill.
+	return gt.runDeterministicGlobalSkillCall(ctx, "workspace_write", map[string]any{
+		"op":      "write",
+		"scope":   string(versioning.WorkspaceWriteScopeGlobal),
 		"path":    path,
 		"content": content,
 		"basis":   basis,
@@ -185,8 +185,13 @@ func (gt *GlobalTester) refreshGlobalWriteBasis(
 	if basis == nil {
 		return nil
 	}
-	result, err := gt.runDeterministicGlobalSkillCall(ctx, "prepare_global_write_context", map[string]any{
-		"path": path,
+	// Phase 2.K / CR-2: route through workspace_read(op=prepare_write)
+	// which now carries the write preflight (formerly the standalone
+	// prepare_write_context skill).
+	result, err := gt.runDeterministicGlobalSkillCall(ctx, "workspace_read", map[string]any{
+		"op":    "prepare_write",
+		"scope": string(versioning.WorkspaceWriteScopeGlobal),
+		"path":  path,
 	})
 	if err != nil {
 		return err

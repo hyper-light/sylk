@@ -158,7 +158,7 @@ func TestBuildAuditPrompt_ContainsCriteria(t *testing.T) {
 	criteria := "Must handle edge cases"
 	implementation := "func main() {}"
 
-	prompt := buildAuditPrompt(implementation, criteria)
+	prompt := buildAuditPrompt(nil, implementation, criteria, nil)
 
 	if !strings.Contains(prompt, "Criteria:") {
 		t.Error("prompt should contain 'Criteria:' header when criteria is non-empty")
@@ -172,7 +172,7 @@ func TestBuildAuditPrompt_ContainsCriteria(t *testing.T) {
 func TestBuildAuditPrompt_OmitsCriteriaWhenEmpty(t *testing.T) {
 	implementation := "func main() {}"
 
-	prompt := buildAuditPrompt(implementation, "")
+	prompt := buildAuditPrompt(nil, implementation, "", nil)
 
 	if strings.Contains(prompt, "Criteria:") {
 		t.Error("prompt should not contain 'Criteria:' header when criteria is empty")
@@ -183,13 +183,37 @@ func TestBuildAuditPrompt_OmitsCriteriaWhenEmpty(t *testing.T) {
 func TestBuildAuditPrompt_ContainsImplementation(t *testing.T) {
 	implementation := "func Calculate(x, y int) int { return x + y }"
 
-	prompt := buildAuditPrompt(implementation, "")
+	prompt := buildAuditPrompt(nil, implementation, "", nil)
 
 	if !strings.Contains(prompt, "Implementation:") {
 		t.Error("prompt should contain 'Implementation:' header")
 	}
 	if !strings.Contains(prompt, implementation) {
 		t.Error("prompt should contain the implementation text")
+	}
+}
+
+// TestBuildAuditPrompt_IncludesToolFindings verifies tool findings
+// reach the reflective prompt so the LLM does not duplicate
+// deterministic issues.
+func TestBuildAuditPrompt_IncludesToolFindings(t *testing.T) {
+	findings := []AuditToolFinding{
+		{Tool: "format", File: "x.go", Backend: "gofmt", Clean: false, Output: "diff: -foo +bar"},
+		{Tool: "lint", File: "x.go", Backend: "golangci-lint", Clean: true},
+	}
+	prompt := buildAuditPrompt([]string{"x.go"}, "func main() {}", "", findings)
+
+	if !strings.Contains(prompt, "Deterministic tool findings") {
+		t.Error("prompt should call out tool findings section")
+	}
+	if !strings.Contains(prompt, "format[gofmt]") {
+		t.Error("prompt should include the format tool finding with backend id")
+	}
+	if !strings.Contains(prompt, "lint[golangci-lint]") {
+		t.Error("prompt should include the lint tool finding with backend id")
+	}
+	if !strings.Contains(prompt, "do not re-report") {
+		t.Error("prompt should instruct the model not to re-report tool issues")
 	}
 }
 

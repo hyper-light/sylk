@@ -258,12 +258,12 @@ func otGlobalFollowupPrompt(
 			}
 		}
 		lines = append(lines,
-			"If the architect plan or criteria context appears incomplete, immediately call `load_plan_context` using the provided plan metadata before concluding.",
+			"If the architect plan or criteria context appears incomplete, immediately call `audit(aspect=context_load)` using the provided plan metadata before concluding.",
 			"This follow-up is scoped to the just-accepted pipeline only. Do not branch into other completed pipelines in this turn; additional completed pipelines, if any, will arrive as separate follow-ups in merge receipt order.",
-			"Consult `consult_librarian_style` to verify codebase style, naming, layering, and established local patterns.",
-			"Consult `consult_academic_approach` to challenge the current implementation and architect approach against stronger or more elegant alternatives.",
-			"Consult `consult_archivalist_context` to check past failure modes, preserved user preferences, and earlier remediation history before signing off.",
-			"Use `request_user_clarification` proactively whenever user intent, preserved behavior, or desired tradeoffs remain ambiguous.",
+			"Consult `consult_peer(target_agent_type=librarian, query=…)` to verify codebase style, naming, layering, and established local patterns.",
+			"Consult `consult_peer(target_agent_type=academic, query=…)` to challenge the current implementation and architect approach against stronger or more elegant alternatives.",
+			"Consult `consult_peer(target_agent_type=archivalist, query=…)` to check past failure modes, preserved user preferences, and earlier remediation history before signing off.",
+			"Use `ask_user_clarification` proactively whenever user intent, preserved behavior, or desired tradeoffs remain ambiguous.",
 			"Be adversarial: treat the merged work as guilty until it proves correctness, robustness, elegance, performance, and clear alignment with the entire plan.",
 		)
 	} else if requirements := taskMetadataStringList(task, "test_requirements"); len(requirements) > 0 {

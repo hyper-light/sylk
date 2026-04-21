@@ -10,12 +10,8 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
-func runCommandSkill(pi *PipelineInspector) *skills.Skill {
-	return agentshared.NewRunCommandSkill(pipelineInspectorCommandSkillConfig(pi))
-}
-
-func runShellScriptSkill(pi *PipelineInspector) *skills.Skill {
-	return agentshared.NewRunShellScriptSkill(pipelineInspectorCommandSkillConfig(pi))
+func bashSkill(pi *PipelineInspector) *skills.Skill {
+	return agentshared.NewBashSkill(pipelineInspectorCommandSkillConfig(pi))
 }
 
 func pipelineInspectorCommandSkillConfig(pi *PipelineInspector) agentshared.CommandSkillConfig {

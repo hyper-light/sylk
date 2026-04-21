@@ -378,7 +378,7 @@ func (gt *GlobalTester) runGenericSuite(ctx context.Context, harness *globalTest
 	}
 	command = strings.ReplaceAll(command, "{test}", strings.Join(testNames, "|"))
 	if issue, ok := agentshared.DetectShellControlOperator(command); ok {
-		return nil, fmt.Errorf("run_test_suite generated unsupported shell syntax (%s); use run_shell_script only if the harness truly requires compound shell execution", issue)
+		return nil, fmt.Errorf("run_test_suite generated unsupported shell syntax (%s); use bash with the compound script only if the harness truly requires compound shell execution", issue)
 	}
 
 	args, err := commandapproval.SplitCommand(command)

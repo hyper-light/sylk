@@ -232,30 +232,35 @@ func (pt *PipelineTester) registerCoreSkills() {
 		DefaultPipelineID: func() string { return pt.pipelineID },
 	}
 
-	pt.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return pt.fileAccess }))
-	pt.skills.Register(runCommandSkill(pt))
-	pt.skills.Register(runShellScriptSkill(pt))
-	pt.skills.Register(detectTestHarnessSkill(pt))
-	pt.skills.Register(prepareTestHarnessSkill(pt))
+	// read_file dropped — workspace_read(op=read) is the single reader
+	// with explicit view selection and the missing-file-tolerant
+	// override installed below for red-phase semantics.
+	pt.skills.Register(bashSkill(pt))
+	// detect_test_harness + prepare_test_harness collapsed into
+	// test_harness(action=detect|prepare).
+	pt.skills.Register(testHarnessSkill(pt))
 	pt.skills.Register(analyzeRiskSkill(pt))
 	pt.skills.Register(planTestsSkill(pt))
-	pt.skills.Register(researchTestToolInstallSkill(pt))
-	pt.skills.Register(installTestToolingSkill(pt))
+	// Phase 2.K / GT-4 + GI-5 refactor: collapsed into dependency(action=…, category=test).
+	pt.skills.Register(dependencySkill(pt))
 	pt.skills.Register(writeTestSkill(pt))
 	pt.skills.Register(runTestSuiteSkill(pt))
 	pt.skills.Register(shared.DiagnoseFailureSkill(pt.diagEngine))
-	pt.skills.Register(shared.NewTesterReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
-	pt.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
-	pt.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
-	pt.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
-	pt.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
-	pt.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }, nil))
-	pt.skills.Register(versioning.NewPreparePipelineWriteContextSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }, nil))
-	pt.skills.Register(versioning.NewListPipelineChangesSkill(func() versioning.FileAccess { return pt.fileAccess }))
-	pt.skills.Register(versioning.NewWritePipelineFileSkill(writeCfg))
-	pt.skills.Register(versioning.NewEditPipelineFileSkill(writeCfg))
-	pt.skills.Register(versioning.NewDeletePipelineFileSkill(writeCfg))
-	pt.skills.Register(versioning.NewCreatePipelineDirectorySkill(writeCfg))
+	// Phase 2.K / CR-2 refactor: 12 workspace skills collapsed to 3
+	// verb-dispatched primitives. Tester installs a missing-file-tolerant
+	// read so test synthesis continues when the target file doesn't exist
+	// yet (red-phase).
+	pipelineTesterGetViews := func() versioning.WorkspaceViewAccess { return pt.workspaceViews }
+	pipelineTesterGetFA := func() versioning.FileAccess { return pt.fileAccess }
+	pipelineTesterDefaultPipelineID := func() string { return pt.pipelineID }
+	// prepare_write_context folded into workspace_read(op=prepare_write).
+	pt.skills.Register(versioning.NewWorkspaceReadSkill(versioning.WorkspaceReadSkillConfig{
+		GetViews:          pipelineTesterGetViews,
+		GetFileAccess:     pipelineTesterGetFA,
+		DefaultPipelineID: pipelineTesterDefaultPipelineID,
+		ReadSkillOverride: shared.NewTesterReadWorkspaceFileSkill(pipelineTesterGetViews, pipelineTesterDefaultPipelineID),
+	}))
+	pt.skills.Register(versioning.NewWorkspaceWriteSkill(writeCfg))
 	pt.skills.Register(agentshared.BuildAskUserClarificationSkill(agentshared.AskUserClarificationConfig{
 		Bus:          pt.bus,
 		AgentID:      pt.id,
@@ -293,6 +298,13 @@ func (pt *PipelineTester) registerCoreSkills() {
 			ClearPending:    pt.clearPendingWait,
 			Timeout:         agentshared.DefaultConsultationTimeout,
 		},
+		// Phase 3 refactor: wire the actor identity so the
+		// declare_decision handler's AutoPublishDecision carries the
+		// right author onto the emitted fabric activity.
+		SessionID:        func() string { return pt.config.SessionID },
+		AuthorAgentID:    func() string { return pt.id },
+		AuthorAgentType:  func() string { return "tester-pipeline" },
+		AuthorPipelineID: func() string { return pt.pipelineID },
 	}) {
 		pt.skills.Register(skill)
 	}
@@ -315,6 +327,15 @@ func (pt *PipelineTester) registerCoreSkills() {
 		AgentID:    func() string { return pt.id },
 		AgentType:  func() string { return "tester-pipeline" },
 		PipelineID: func() string { return pt.pipelineID },
+		RouteSync: agentshared.RouteSyncFromBus(
+			func() guide.EventBus { return pt.bus },
+			func() string {
+				if pt.channels == nil {
+					return ""
+				}
+				return pt.channels.Responses
+			},
+		),
 	}) {
 		pt.skills.Register(skill)
 	}

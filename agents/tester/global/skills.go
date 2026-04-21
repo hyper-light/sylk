@@ -93,75 +93,75 @@ func analyzeIntegrationRisksSkill(gt *GlobalTester) *skills.Skill {
 		Build()
 }
 
-// planIntegrationTestsSkill creates a skill for planning integration tests.
-func planIntegrationTestsSkill(gt *GlobalTester) *skills.Skill {
+// Phase 2.K / GT-B refactor (docs/PIPELINE_SKILL_REFACTOR.md):
+// plan_tests (shared unit) + plan_integration_tests + plan_e2e_tests
+// collapsed into one plan_tests(level ∈ {unit, integration, e2e}) skill.
+// The three underlying handlers stay; the outer skill routes on level.
+func planTestsSkill(gt *GlobalTester) *skills.Skill {
 	type params struct {
-		RiskAreas []shared.RiskArea `json:"risk_areas"`
-		BatchCtx  map[string]any    `json:"batch_context,omitempty"`
-	}
-
-	return skills.NewSkill("plan_integration_tests").
-		Description("Design integration test strategy based on cross-pipeline risk analysis.").
-		Domain("testing").
-		Keywords("plan", "integration", "strategy", "test plan").
-		Priority(90).
-		Usage("Use when the task needs an integration-test plan grounded in identified system risks and shared behavior boundaries.").
-		Requirement("Prefer to supply concrete risk areas or an already assembled batch context so the resulting plan maps to real integration concerns.").
-		Satisfies("Produces an integration test plan that can guide global write tools, harness work, and downstream execution.").
-		Avoid("Do not treat the plan as completion when the requested deliverable still requires authored tests or suite execution.").
-		ArrayObjectParam("risk_areas", "Integration risks that should directly drive the planned cases.", sharedRiskAreaProperties(), []string{"file", "category", "level", "description"}, false).
-		ObjectParam("batch_context", "Optional batch context returned by analyze_batch.", batchContextProperties(), false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var p params
-			if err := json.Unmarshal(input, &p); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			plan, err := gt.planIntegrationTests(ctx, p.RiskAreas, p.BatchCtx)
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{
-				"plan":       plan,
-				"risk_count": len(plan.RiskAreas),
-				"case_count": len(plan.PlannedCase),
-			}, nil
-		}).
-		Build()
-}
-
-// planE2ETestsSkill creates a skill for planning end-to-end tests.
-func planE2ETestsSkill(gt *GlobalTester) *skills.Skill {
-	type params struct {
+		Level        string               `json:"level"`
 		RiskAreas    []shared.RiskArea    `json:"risk_areas"`
+		TaskSpec     string               `json:"task_spec,omitempty"`
+		Files        []string             `json:"files,omitempty"`
+		BatchCtx     map[string]any       `json:"batch_context,omitempty"`
 		HarnessNeeds []shared.HarnessNeed `json:"harness_needs,omitempty"`
 	}
 
-	return skills.NewSkill("plan_e2e_tests").
-		Description("Design end-to-end test strategy covering full system flows and user scenarios.").
+	// Delegate to the shared unit planner for level=unit. Built once.
+	unitPlanner := shared.PlanTestsSkill(gt)
+
+	return skills.NewSkill("plan_tests").
+		Description("Design a test strategy. One primitive for every test level — select via `level`.\n\n"+
+			"Levels:\n"+
+			"- unit: focused per-component plans from risk analysis (params: risk_areas, task_spec?, files?).\n"+
+			"- integration: cross-pipeline integration plans rooted in shared-state risks (params: risk_areas?, batch_context?).\n"+
+			"- e2e: end-to-end flow plans covering full system scenarios (params: risk_areas?, harness_needs?).").
 		Domain("testing").
-		Keywords("plan", "e2e", "end-to-end", "strategy", "test plan").
-		Priority(90).
-		Usage("Use when the request calls for user-flow, end-to-end, or full-system scenario planning rather than narrow integration edges alone.").
-		Requirement("Supply the known risk areas and harness needs so the E2E plan reflects realistic flows and environment constraints.").
-		Satisfies("Produces the end-to-end test plan that should drive harness preparation, authored scenarios, and global execution.").
-		Avoid("Do not substitute this plan for actually writing or running the requested global tests.").
-		ArrayObjectParam("risk_areas", "Risk areas that should drive end-to-end flows.", sharedRiskAreaProperties(), []string{"file", "category", "level", "description"}, false).
-		ArrayObjectParam("harness_needs", "Harness needs that affect end-to-end setup.", harnessNeedProperties(), []string{"type", "description", "target"}, false).
+		Keywords("plan", "test plan", "unit", "integration", "e2e", "end-to-end", "strategy", "hypothesis").
+		Priority(95).
+		Usage("Choose level based on the test surface: unit for per-component, integration for cross-component, e2e for full-system flows. Run after risk analysis so the plan maps to real defects.").
+		Satisfies("Produces deliberate test-case structure and satisfies the tester planning stage at the requested level.").
+		Avoid("Do not treat the plan itself as completion when the requested deliverable still requires test artifacts or suite execution.").
+		EnumParam("level", "Test level (default: unit)", []string{"unit", "integration", "e2e"}, false).
+		ArrayObjectParam("risk_areas", "Risk areas that should directly inform the planned coverage.", sharedRiskAreaProperties(), []string{"file", "category", "level", "description"}, false).
+		StringParam("task_spec", "Task specification for context (level=unit)", false).
+		ArrayParam("files", "Source files under test (level=unit)", "string", false).
+		ObjectParam("batch_context", "Optional batch context returned by analyze_batch (level=integration)", batchContextProperties(), false).
+		ArrayObjectParam("harness_needs", "Harness needs that affect end-to-end setup (level=e2e)", harnessNeedProperties(), []string{"type", "description", "target"}, false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var p params
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			plan, err := gt.planE2ETests(ctx, p.RiskAreas, p.HarnessNeeds)
-			if err != nil {
-				return nil, err
+			switch strings.ToLower(strings.TrimSpace(p.Level)) {
+			case "", "unit":
+				return unitPlanner.Handler(ctx, input)
+			case "integration":
+				plan, err := gt.planIntegrationTests(ctx, p.RiskAreas, p.BatchCtx)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]any{
+					"plan":       plan,
+					"level":      "integration",
+					"risk_count": len(plan.RiskAreas),
+					"case_count": len(plan.PlannedCase),
+				}, nil
+			case "e2e", "end-to-end", "end_to_end":
+				plan, err := gt.planE2ETests(ctx, p.RiskAreas, p.HarnessNeeds)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]any{
+					"plan":          plan,
+					"level":         "e2e",
+					"risk_count":    len(plan.RiskAreas),
+					"case_count":    len(plan.PlannedCase),
+					"harness_needs": len(p.HarnessNeeds),
+				}, nil
+			default:
+				return nil, fmt.Errorf("unknown plan_tests level: %q (expected unit|integration|e2e)", p.Level)
 			}
-			return map[string]any{
-				"plan":          plan,
-				"risk_count":    len(plan.RiskAreas),
-				"case_count":    len(plan.PlannedCase),
-				"harness_needs": len(p.HarnessNeeds),
-			}, nil
 		}).
 		Build()
 }
@@ -927,120 +927,15 @@ func cloneStringMap(values map[string]string) map[string]string {
 	return cloned
 }
 
-// reportToOrchestratorSkill creates a skill that sends failure escalation to the Orchestrator.
-func reportToOrchestratorSkill(gt *GlobalTester) *skills.Skill {
-	type params struct {
-		TestName      string   `json:"test_name"`
-		Confidence    float64  `json:"confidence"`
-		IsProductBug  bool     `json:"is_product_bug"`
-		RootCause     string   `json:"root_cause"`
-		AffectedTasks []string `json:"affected_tasks"`
-	}
-
-	return skills.NewSkill("report_to_orchestrator").
-		Description("Escalate a test failure to the Orchestrator to pause new work dispatching.").
-		Domain("testing").
-		Keywords("report", "orchestrator", "escalate", "pause").
-		Priority(85).
-		Usage("Use when a global testing result proves a systemic failure that should pause new work or trigger orchestration-level intervention.").
-		Requirement("Requires a real failure signal, concrete root cause, confidence level, and affected task scope.").
-		Satisfies("Publishes a durable orchestrator escalation that can pause further work and preserve the diagnosis context.").
-		Avoid("Do not use for speculative concerns or local issues that do not warrant orchestration-level intervention.").
-		StringParam("test_name", "Name of the failing test", true).
-		FloatParam("confidence", "Confidence in the diagnosis (0-1)", true).
-		BoolParam("is_product_bug", "Whether the failure is a product bug", true).
-		StringParam("root_cause", "Root cause description", true).
-		ArrayParam("affected_tasks", "Task IDs affected by the failure", "string", false).
-		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
-			var p params
-			if err := json.Unmarshal(input, &p); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-
-			report := &shared.DiagnosisReport{
-				TestName:     p.TestName,
-				Confidence:   p.Confidence,
-				IsProductBug: p.IsProductBug,
-				RootCauses: []shared.RootCause{{
-					Description: p.RootCause,
-				}},
-				CreatedAt: time.Now(),
-			}
-
-			if err := gt.reportToOrchestrator(report, p.AffectedTasks); err != nil {
-				return nil, fmt.Errorf("report to orchestrator: %w", err)
-			}
-
-			return map[string]any{
-				"reported":  true,
-				"target":    "orchestrator",
-				"test_name": p.TestName,
-			}, nil
-		}).
-		Build()
-}
-
-// reportToArchitectSkill creates a skill that sends failure reports to the Architect.
-func reportToArchitectSkill(gt *GlobalTester) *skills.Skill {
-	type params struct {
-		TestName      string   `json:"test_name"`
-		Confidence    float64  `json:"confidence"`
-		IsProductBug  bool     `json:"is_product_bug"`
-		RootCause     string   `json:"root_cause"`
-		SuggestedFix  string   `json:"suggested_fix"`
-		AffectedTasks []string `json:"affected_tasks"`
-	}
-
-	return skills.NewSkill("report_to_architect").
-		Description("Report a test failure to the Architect with root cause and suggested plan modification.").
-		Domain("testing").
-		Keywords("report", "architect", "plan", "modification").
-		Priority(85).
-		Usage("Use when a global testing result shows the current plan, architecture, or sequencing should be reconsidered.").
-		Requirement("Requires a real diagnosis with root cause, confidence, suggested fix, and affected task scope.").
-		Satisfies("Publishes a plan-level escalation the Architect can use to adjust workflow, dependencies, or design direction.").
-		Avoid("Do not use when the finding is purely local implementation debt that should go straight to an engineer or designer fix path.").
-		StringParam("test_name", "Name of the failing test", true).
-		FloatParam("confidence", "Confidence in the diagnosis (0-1)", true).
-		BoolParam("is_product_bug", "Whether the failure is a product bug", true).
-		StringParam("root_cause", "Root cause description", true).
-		StringParam("suggested_fix", "Suggested fix approach", true).
-		ArrayParam("affected_tasks", "Task IDs affected by the failure", "string", false).
-		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
-			var p params
-			if err := json.Unmarshal(input, &p); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-
-			report := &shared.DiagnosisReport{
-				TestName:     p.TestName,
-				Confidence:   p.Confidence,
-				IsProductBug: p.IsProductBug,
-				RootCauses: []shared.RootCause{{
-					Description: p.RootCause,
-				}},
-				SuggestedFix: []shared.SuggestedFix{{
-					Description: p.SuggestedFix,
-				}},
-				CreatedAt: time.Now(),
-			}
-
-			if err := gt.reportToArchitect(report, p.AffectedTasks); err != nil {
-				return nil, fmt.Errorf("report to architect: %w", err)
-			}
-
-			return map[string]any{
-				"reported":  true,
-				"target":    "architect",
-				"test_name": p.TestName,
-			}, nil
-		}).
-		Build()
-}
-
-// escalateFailureSkill creates a skill that escalates to both Orchestrator and Architect.
+// Phase 2.K / GT-A refactor (docs/PIPELINE_SKILL_REFACTOR.md):
+// report_to_orchestrator + report_to_architect + escalate_failure
+// collapsed into one escalate_failure skill with a targets enum array.
+// All three underlying routing paths (gt.reportToOrchestrator,
+// gt.reportToArchitect, gt.escalateFailure) stay — the skill handler
+// dispatches based on the targets array.
 func escalateFailureSkill(gt *GlobalTester) *skills.Skill {
 	type params struct {
+		Targets       []string `json:"targets"`
 		TestName      string   `json:"test_name"`
 		Confidence    float64  `json:"confidence"`
 		IsProductBug  bool     `json:"is_product_bug"`
@@ -1050,49 +945,109 @@ func escalateFailureSkill(gt *GlobalTester) *skills.Skill {
 	}
 
 	return skills.NewSkill("escalate_failure").
-		Description("Escalate a critical test failure to BOTH Orchestrator (pause) and Architect (plan fix).").
+		Description("Escalate a test failure to the orchestrator, the architect, or both. One primitive for every failure escalation path.\n\n" +
+			"Targets:\n" +
+			"- [\"orchestrator\"]: pause new work dispatching while the failure is investigated.\n" +
+			"- [\"architect\"]: request plan-level correction with a suggested fix.\n" +
+			"- [\"orchestrator\",\"architect\"]: critical failures that need both pause and plan fix.").
 		Domain("testing").
-		Keywords("escalate", "failure", "critical", "orchestrator", "architect").
+		Keywords("escalate", "failure", "report", "orchestrator", "architect", "pause", "plan").
 		Priority(95).
-		Usage("Use only for critical global failures that require both orchestration control and plan-level correction.").
-		Requirement("Requires a high-confidence systemic diagnosis with a concrete root cause, suggested fix, and affected task scope.").
-		Satisfies("Creates the combined orchestrator-plus-architect escalation for severe global failures.").
-		Avoid("Do not use when a single-target report is sufficient or when the evidence is still tentative.").
+		Usage("Choose targets based on the failure's scope: orchestrator-only for dispatch pause, architect-only for plan revision, both for critical systemic failures.").
+		Requirement("targets + test_name + confidence + is_product_bug + root_cause required. suggested_fix required when targets includes architect.").
+		Satisfies("Publishes the failure escalation to each named target and returns the set of actually-routed targets.").
+		Avoid("Do not use for speculative concerns or tentative evidence.").
+		EnumArrayParam("targets", "Where to route the escalation", "string", []string{"orchestrator", "architect"}, true).
 		StringParam("test_name", "Name of the failing test", true).
 		FloatParam("confidence", "Confidence in the diagnosis (0-1)", true).
 		BoolParam("is_product_bug", "Whether the failure is a product bug", true).
 		StringParam("root_cause", "Root cause description", true).
-		StringParam("suggested_fix", "Suggested fix approach", true).
+		StringParam("suggested_fix", "Suggested fix approach (required when architect is targeted)", false).
 		ArrayParam("affected_tasks", "Task IDs affected by the failure", "string", false).
 		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
 			var p params
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-
-			report := &shared.DiagnosisReport{
-				TestName:     p.TestName,
-				Confidence:   p.Confidence,
-				IsProductBug: p.IsProductBug,
-				RootCauses: []shared.RootCause{{
-					Description: p.RootCause,
-				}},
-				SuggestedFix: []shared.SuggestedFix{{
-					Description: p.SuggestedFix,
-				}},
-				CreatedAt: time.Now(),
+			targets := normalizeEscalateFailureTargets(p.Targets)
+			if len(targets) == 0 {
+				return nil, fmt.Errorf("targets is required (expected any of: orchestrator, architect)")
+			}
+			wantArchitect := escalateFailureHasTarget(targets, "architect")
+			wantOrchestrator := escalateFailureHasTarget(targets, "orchestrator")
+			if wantArchitect && strings.TrimSpace(p.SuggestedFix) == "" {
+				return nil, fmt.Errorf("suggested_fix is required when targets includes architect")
 			}
 
-			if err := gt.escalateFailure(report, p.AffectedTasks); err != nil {
-				return nil, fmt.Errorf("escalate failure: %w", err)
+			base := func() *shared.DiagnosisReport {
+				r := &shared.DiagnosisReport{
+					TestName:     p.TestName,
+					Confidence:   p.Confidence,
+					IsProductBug: p.IsProductBug,
+					RootCauses: []shared.RootCause{{
+						Description: p.RootCause,
+					}},
+					CreatedAt: time.Now(),
+				}
+				if strings.TrimSpace(p.SuggestedFix) != "" {
+					r.SuggestedFix = []shared.SuggestedFix{{
+						Description: p.SuggestedFix,
+					}}
+				}
+				return r
+			}
+
+			switch {
+			case wantOrchestrator && wantArchitect:
+				if err := gt.escalateFailure(base(), p.AffectedTasks); err != nil {
+					return nil, fmt.Errorf("escalate failure: %w", err)
+				}
+			case wantOrchestrator:
+				if err := gt.reportToOrchestrator(base(), p.AffectedTasks); err != nil {
+					return nil, fmt.Errorf("report to orchestrator: %w", err)
+				}
+			case wantArchitect:
+				if err := gt.reportToArchitect(base(), p.AffectedTasks); err != nil {
+					return nil, fmt.Errorf("report to architect: %w", err)
+				}
 			}
 
 			return map[string]any{
 				"escalated":      true,
-				"targets":        []string{"orchestrator", "architect"},
+				"targets":        targets,
 				"test_name":      p.TestName,
 				"affected_tasks": p.AffectedTasks,
 			}, nil
 		}).
 		Build()
+}
+
+// normalizeEscalateFailureTargets dedupes + lowercases the enum array
+// and keeps stable ordering (orchestrator-first) for result reporting.
+func normalizeEscalateFailureTargets(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	for _, t := range in {
+		t = strings.ToLower(strings.TrimSpace(t))
+		switch t {
+		case "orchestrator", "architect":
+			seen[t] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	if _, ok := seen["orchestrator"]; ok {
+		out = append(out, "orchestrator")
+	}
+	if _, ok := seen["architect"]; ok {
+		out = append(out, "architect")
+	}
+	return out
+}
+
+func escalateFailureHasTarget(targets []string, target string) bool {
+	for _, t := range targets {
+		if t == target {
+			return true
+		}
+	}
+	return false
 }

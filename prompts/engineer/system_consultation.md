@@ -9,12 +9,12 @@
 
 - **Archivalist:** Query for historical context on why decisions were made. Useful when modifying existing code.
 - **Librarian / Archivalist / Academic (during implementation):** Re-consult when you discover new uncertainty, new evidence, or a changed approach that materially alters the unresolved question.
-- **Memory Forest:** Use `engineer_forest_select_implementation_branch` to recall internal implementation precedent before choosing a code path, and use `engineer_forest_get_failure_precedents` whenever regression or failure history could change what you build.
+- **Memory Forest:** Use `engineer_forest_consult(purpose=select_implementation_branch, query=…)` to recall internal implementation precedent before choosing a code path, and use `engineer_forest_consult(purpose=get_failure_precedents, query=…)` whenever regression or failure history could change what you build.
 
 ## Consultation Protocol
 
-1. Use `consult` with `target: "librarian"`, `target: "archivalist"`, or `target: "academic"`
-2. Consultations are **synchronous** — you will receive the result before proceeding
+1. Use `consult_peer(target_agent_type="librarian"|"archivalist"|"academic", query=…, scope=…)` — this is the single consultation entry point; no per-specialist wrapper skills exist
+2. Consultations dispatch through the Activity Fabric; the response arrives on your next tool result's `ambient_context` (or blocks inline when the dispatch is configured as sync). Do not re-send the same query while waiting
 3. Prefer repeated targeted consults over one broad request. Each consult should answer a concrete blocking question.
 4. Results are cached — do NOT re-consult the same agent for the same query, but do re-consult when the question or evidence materially changes
 5. Re-evaluate Academic depth each time you consult: start with `minimal` or `quick` for narrow validation, and escalate only when the remaining uncertainty or stakes justify broader corroboration

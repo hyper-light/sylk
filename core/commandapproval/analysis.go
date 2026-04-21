@@ -128,7 +128,11 @@ func Analyze(req Request) (Analysis, error) {
 	templateKey := strings.Join(templateParts, "|")
 	exactKey := "exact:" + hashCommand(strings.Join([]string{strings.Join(tokens, " "), req.WorkingDir}, "\n"))
 	exactLabel := "this exact command"
-	if strings.TrimSpace(req.ToolName) == "run_shell_script" {
+	// The unified bash skill carries both single commands and compound
+	// scripts under one tool name. Detect shape from the command itself
+	// so the approval dialog still reads "shell script" when that's
+	// what the user is authorizing.
+	if commandIsShellScript(command) {
 		exactLabel = "this exact shell script"
 	}
 	persistKey, persistLabel := derivePersistRule(policy, exactLabel, program, verb, templateKey, exactKey, workingDirScope, workingDirZone, paths)
@@ -718,6 +722,25 @@ var defaultAllowPatternStrings = []string{
 	`^sh\s+[A-Za-z0-9_./-]+\.sh(?:\s+.*)?$`,
 	`^gopls(?:\s+.*)?$`,
 	`^(ls|cat|head|tail|grep|find|wc)(?:\s+.*)?$`,
+}
+
+// commandIsShellScript heuristically identifies commands that use
+// shell features beyond a single plain invocation — pipes, chaining,
+// redirection, command substitution, or multi-line. The check scans
+// for the same operators the agents/shared detector handles, but
+// without its quote-awareness (analysis.go runs at the approval
+// boundary and must stay free of agent-layer dependencies). False
+// positives only affect the label shown in the approval dialog.
+func commandIsShellScript(command string) bool {
+	if strings.ContainsAny(command, "\n\r`") {
+		return true
+	}
+	for _, op := range []string{"|", "&&", "||", ";", ">", "<", "$(", "${"} {
+		if strings.Contains(command, op) {
+			return true
+		}
+	}
+	return false
 }
 
 var defaultDenyPatternStrings = []string{

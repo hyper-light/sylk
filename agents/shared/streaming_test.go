@@ -201,36 +201,40 @@ func TestIntermediateToolTurnText_FallsBackToToolSummary(t *testing.T) {
 }
 
 func TestIntermediateToolTurnText_UsesAgentAwareNarrationForTester(t *testing.T) {
+	// Phase 1/2 refactor: coord_query_view removed (use
+	// query_peer_activity), coord_claim_scope folded into manage_claim.
 	ctx := WithStreamContext(context.Background(), "corr-3", "tui")
 	ctx = WithStreamContextMetadata(ctx, map[string]any{"agent_type": "tester-pipeline"})
 
 	got := IntermediateToolTurnTextWithContext(ctx, &providers.Response{
 		ToolCalls: []providers.ToolCall{
 			{ID: "tool-1", Name: "check_inspector_gate", Arguments: `{}`},
-			{ID: "tool-2", Name: "coord_query_view", Arguments: `{}`},
-			{ID: "tool-3", Name: "coord_claim_scope", Arguments: `{}`},
+			{ID: "tool-2", Name: "query_peer_activity", Arguments: `{}`},
+			{ID: "tool-3", Name: "manage_claim", Arguments: `{"action":"acquire"}`},
 		},
 	})
 
-	want := "Checking the inspector gate before test work begins, reviewing coordination state and prior task artifacts, and claiming the test surface for this task.\n\n"
+	want := "Checking the inspector gate before test work begins, reviewing peer activity and prior task artifacts, and managing the scope claim for the test surface for this task.\n\n"
 	if got != want {
 		t.Fatalf("IntermediateToolTurnText tester narration = %q, want %q", got, want)
 	}
 }
 
 func TestIntermediateToolTurnText_UsesAgentAwareNarrationForInspector(t *testing.T) {
+	// Phase 1/2 refactor: coord_publish_artifact folded into
+	// publish_work_event.
 	ctx := WithStreamContext(context.Background(), "corr-4", "tui")
 	ctx = WithStreamContextMetadata(ctx, map[string]any{"agent_type": "inspector-pipeline"})
 
 	got := IntermediateToolTurnTextWithContext(ctx, &providers.Response{
 		ToolCalls: []providers.ToolCall{
-			{ID: "tool-1", Name: "coord_query_view", Arguments: `{}`},
+			{ID: "tool-1", Name: "query_peer_activity", Arguments: `{}`},
 			{ID: "tool-2", Name: "read_workspace_file", Arguments: `{"path":"src/hello/cli.py"}`},
-			{ID: "tool-3", Name: "coord_publish_artifact", Arguments: `{}`},
+			{ID: "tool-3", Name: "publish_work_event", Arguments: `{"kind":"artifact"}`},
 		},
 	})
 
-	want := "Reviewing coordination state and prior task artifacts, reading the relevant workspace files to compare the requested contract with the current implementation, and publishing the handoff artifact for downstream implementation.\n\n"
+	want := "Reviewing peer activity and prior task artifacts, reading the relevant workspace files to compare the requested contract with the current implementation, and publishing the handoff artifact for downstream implementation.\n\n"
 	if got != want {
 		t.Fatalf("IntermediateToolTurnText inspector narration = %q, want %q", got, want)
 	}

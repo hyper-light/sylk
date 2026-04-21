@@ -7,6 +7,56 @@ import (
 	"github.com/adalundhe/sylk/ui/msg"
 )
 
+func TestConsultationTargets_ConsultPeerReadsTargetAgentType(t *testing.T) {
+	targets := consultationTargets("consult_peer", map[string]any{
+		"target_agent_type": "librarian",
+		"query":             "Any prior art?",
+	})
+	if len(targets) != 1 || targets[0] != "librarian" {
+		t.Fatalf("consult_peer targets = %#v, want [librarian]", targets)
+	}
+}
+
+func TestConsultationTargets_ConsultPrePlanningExpandsTargets(t *testing.T) {
+	targets := consultationTargets("consult", map[string]any{
+		"mode":             "pre_planning",
+		"query":            "Build the plan",
+		"include_academic": true,
+	})
+	if len(targets) != 3 || targets[0] != "librarian" || targets[1] != "archivalist" || targets[2] != "academic" {
+		t.Fatalf("pre-planning targets = %#v", targets)
+	}
+
+	// Without include_academic, only librarian+archivalist.
+	targets = consultationTargets("consult", map[string]any{
+		"mode":  "pre_planning",
+		"query": "Build the plan",
+	})
+	if len(targets) != 2 || targets[0] != "librarian" || targets[1] != "archivalist" {
+		t.Fatalf("pre-planning (no academic) targets = %#v", targets)
+	}
+
+	// Non-pre_planning consult without a target arg falls through to nil.
+	targets = consultationTargets("consult", map[string]any{
+		"mode":  "single",
+		"query": "Build the plan",
+	})
+	if targets != nil {
+		t.Fatalf("consult mode=single without target should be nil, got %#v", targets)
+	}
+}
+
+func TestConsultationTargets_RequestArchitectResearchAndValidateApproach(t *testing.T) {
+	// Emission-side recognizes these, UI fallback must match to avoid
+	// silent misclassification when metadata is absent.
+	if targets := consultationTargets("request_architect_research", nil); len(targets) != 1 || targets[0] != "architect" {
+		t.Fatalf("request_architect_research targets = %#v", targets)
+	}
+	if targets := consultationTargets("validate_approach", nil); len(targets) != 1 || targets[0] != "librarian" {
+		t.Fatalf("validate_approach targets = %#v", targets)
+	}
+}
+
 func TestConsultationResponseSummary_GuardianPayloadPrefersHumanMessage(t *testing.T) {
 	summary := consultationResponseSummary(map[string]any{
 		"target": "guardian",

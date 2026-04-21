@@ -236,6 +236,14 @@ func NewCreateDirectorySkillFunc(getFA FileAccessProvider) *skills.Skill {
 
 // NewGlobSkill creates a glob skill backed by the given FileAccess.
 func NewGlobSkill(fa FileAccess) *skills.Skill {
+	return NewGlobSkillFunc(func() FileAccess { return fa })
+}
+
+// NewGlobSkillFunc creates a glob skill backed by a late-bound FileAccess.
+// Phase 2.K / 10.H refactor: the Func variant lets agents inject their own
+// FileAccess provider (which may be VFS-backed, disk-only, or overlay-
+// aware) while sharing the handler body.
+func NewGlobSkillFunc(getFA FileAccessProvider) *skills.Skill {
 	return skills.NewSkill("glob").
 		Description("Find files matching a glob pattern. Supports ** for recursive matching.").
 		Domain("filesystem").
@@ -253,6 +261,11 @@ func NewGlobSkill(fa FileAccess) *skills.Skill {
 			}
 			if params.Pattern == "" {
 				return nil, fmt.Errorf("pattern is required")
+			}
+
+			fa, err := resolveSkillFileAccess(getFA)
+			if err != nil {
+				return nil, err
 			}
 
 			root := fa.WorkingDir()
@@ -287,6 +300,13 @@ func resolveSkillFileAccess(getFA FileAccessProvider) (FileAccess, error) {
 
 // NewGrepSkill creates a grep skill backed by the given FileAccess.
 func NewGrepSkill(fa FileAccess) *skills.Skill {
+	return NewGrepSkillFunc(func() FileAccess { return fa })
+}
+
+// NewGrepSkillFunc creates a grep skill backed by a late-bound FileAccess.
+// Phase 2.K / 10.H refactor: the Func variant lets agents inject their own
+// FileAccess provider while sharing the handler body.
+func NewGrepSkillFunc(getFA FileAccessProvider) *skills.Skill {
 	return skills.NewSkill("grep").
 		Description("Search file contents using regular expressions. Returns matching lines with optional context.").
 		Domain("code").
@@ -310,6 +330,11 @@ func NewGrepSkill(fa FileAccess) *skills.Skill {
 			}
 			if params.Pattern == "" {
 				return nil, fmt.Errorf("pattern is required")
+			}
+
+			fa, err := resolveSkillFileAccess(getFA)
+			if err != nil {
+				return nil, err
 			}
 
 			searchPath := params.Path

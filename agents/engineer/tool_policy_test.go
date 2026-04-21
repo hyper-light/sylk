@@ -18,19 +18,21 @@ func TestEngineerBuildToolDefinitions_IncludeDiscoveryAndQualityTools(t *testing
 		names[tool.Name] = struct{}{}
 	}
 
+	// Phase 1 refactor: `consult` and `signal_orchestrator` removed.
+	// `consult_peer` replaces `consult`; the orchestrator consumes
+	// fabric activities without a dedicated signal skill.
 	for _, want := range []string{
 		"search_skills",
 		"discover_project_tools",
 		"discover_code_patterns",
-		"research_dependency_install",
-		"install_dependency_tooling",
+		// Phase 2.K / GT-4 + GI-5: collapsed into dependency(action=…).
+		"dependency",
 		"lsp",
 		"format",
 		"lint",
-		"consult",
+		"consult_peer",
 		"audit",
 		"report_confidence",
-		"signal_orchestrator",
 	} {
 		if _, ok := names[want]; !ok {
 			t.Fatalf("expected tool definitions to include %q; got %v", want, names)

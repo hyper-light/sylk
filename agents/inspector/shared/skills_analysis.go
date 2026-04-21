@@ -25,209 +25,120 @@ type FileAccess = versioning.FileAccess
 // returned value reflects whatever was injected via SetFileAccess().
 type FileAccessFunc func() FileAccess
 
-// RunLinterSkill returns a skill that runs a language-appropriate linter.
-func RunLinterSkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("run_linter").
-		Description("Run a language-appropriate linter to detect code issues, style violations, and likely bugs.").
+// Phase 2.K / GI-C refactor (docs/PIPELINE_SKILL_REFACTOR.md §10.A +
+// §10.K.1 GI-4): run_linter + run_type_checker + run_formatter_check +
+// run_security_scan + check_coverage + analyze_complexity +
+// detect_race_conditions + detect_deadlocks + detect_memory_leaks all
+// collapsed into run_analyzer(kind=…). One primitive, same underlying
+// dispatchers, one enum parameter tells it which analysis to run.
+const (
+	analyzerKindLint        = "lint"
+	analyzerKindTypecheck   = "typecheck"
+	analyzerKindFormatCheck = "format_check"
+	analyzerKindSecurity    = "security"
+	analyzerKindCoverage    = "coverage"
+	analyzerKindComplexity  = "complexity"
+	analyzerKindRace        = "race"
+	analyzerKindDeadlock    = "deadlock"
+	analyzerKindMemoryLeak  = "memory_leak"
+)
+
+func analyzerKinds() []string {
+	return []string{
+		analyzerKindLint,
+		analyzerKindTypecheck,
+		analyzerKindFormatCheck,
+		analyzerKindSecurity,
+		analyzerKindCoverage,
+		analyzerKindComplexity,
+		analyzerKindRace,
+		analyzerKindDeadlock,
+		analyzerKindMemoryLeak,
+	}
+}
+
+// RunAnalyzerSkill returns a single primitive that dispatches to the
+// language-appropriate linter, type checker, formatter check, security
+// scan, coverage runner, complexity analyzer, race detector, deadlock
+// analyzer, or memory-leak analyzer based on the kind parameter.
+func RunAnalyzerSkill(runner *ToolRunner) *skills.Skill {
+	return skills.NewSkill("run_analyzer").
+		Description("Run a language-appropriate static analysis pass selected by kind. Collapses run_linter, run_type_checker, run_formatter_check, run_security_scan, check_coverage, analyze_complexity, detect_race_conditions, detect_deadlocks, and detect_memory_leaks into one primitive dispatched by the kind enum.").
 		Domain("analysis").
-		Keywords("lint", "check", "style", "analysis").
+		Keywords("lint", "type", "format", "security", "coverage", "complexity", "race", "deadlock", "memory", "analysis").
 		Priority(95).
-		Usage("Use during implementation-validation mode after you understand the target files and criteria. Run it on the concrete scope under review, not the entire repo by default.").
+		Usage("Set kind=lint|typecheck|format_check|security|coverage|complexity|race|deadlock|memory_leak. Run on the concrete scope under review — not the whole repo by default. Use during implementation-validation mode after you understand the target files and criteria.").
 		Requirement("Requires implementation evidence and the relevant target paths.").
-		Satisfies("Produces code-quality findings that support criteria evaluation and final grading.").
+		Satisfies("Produces analysis findings (type, security, coverage, complexity, concurrency, memory) for criteria evaluation and final grading.").
 		Avoid("Do not use during pre-implementation contract synthesis when there is no implementation evidence to validate.").
-		ArrayParam("paths", "Paths to lint (default: ./...)", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			paths := extractPaths(input)
-			issues := runLinterAnalysis(ctx, runner, paths)
-			logAnalysisFindings(ctx, "run_linter", issues)
-			return analysisResult("run_linter", issues), nil
-		}).
-		Build()
-}
-
-// RunTypeCheckerSkill returns a skill that runs a language-appropriate type checker.
-func RunTypeCheckerSkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("run_type_checker").
-		Description("Run a language-appropriate type checker or static analyzer for the requested files.").
-		Domain("analysis").
-		Keywords("type", "check", "static", "analysis").
-		Priority(95).
-		Usage("Use early in implementation-validation mode to detect structural correctness issues in the actual changed scope.").
-		Requirement("Requires implementation evidence and the relevant target paths.").
-		Satisfies("Produces type/static-analysis evidence for criteria evaluation and validation reporting.").
-		Avoid("Do not use during pre-implementation contract synthesis.").
-		ArrayParam("paths", "Paths to check (default: ./...)", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			paths := extractPaths(input)
-			issues := runTypeCheckerAnalysis(ctx, runner, paths)
-			logAnalysisFindings(ctx, "run_type_checker", issues)
-			return analysisResult("run_type_checker", issues), nil
-		}).
-		Build()
-}
-
-// RunFormatterCheckSkill returns a skill that checks formatting using the target language rules.
-func RunFormatterCheckSkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("run_formatter_check").
-		Description("Check code formatting without modifying files, using the requested language's formatting rules.").
-		Domain("analysis").
-		Keywords("format", "style", "whitespace").
-		Priority(90).
-		Usage("Use in implementation-validation mode when formatting compliance is part of the quality bar or when findings need to distinguish formatting drift from real logic defects.").
-		Satisfies("Produces formatting findings that contribute to quality judgment without mutating the workspace.").
-		Avoid("Do not treat formatting-only findings as a substitute for type, security, or criteria validation.").
-		ArrayParam("paths", "Paths to check (default: ./...)", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			paths := extractPaths(input)
-			issues := runFormatterAnalysis(ctx, runner, paths)
-			logAnalysisFindings(ctx, "run_formatter_check", issues)
-			return analysisResult("run_formatter_check", issues), nil
-		}).
-		Build()
-}
-
-// RunSecurityScanSkill returns a skill that runs a language-appropriate security analysis pass.
-func RunSecurityScanSkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("run_security_scan").
-		Description("Run a language-appropriate security analysis pass to detect likely vulnerabilities.").
-		Domain("analysis").
-		Keywords("security", "vulnerability", "audit").
-		Priority(95).
-		Usage("Use during implementation-validation mode when security-sensitive behavior exists or when the quality bar requires security validation.").
-		Requirement("Requires implementation evidence and the relevant target paths.").
-		Satisfies("Produces security findings that directly affect validation outcome and severity reporting.").
-		Avoid("Do not use during pre-implementation contract synthesis.").
-		ArrayParam("paths", "Paths to scan (default: ./...)", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			paths := extractPaths(input)
-			issues := runSecurityAnalysis(ctx, runner, paths)
-			criticalCount := countBySeverity(issues, Critical)
-			highCount := countBySeverity(issues, High)
-			result := analysisResult("run_security_scan", issues)
-			result["critical_count"] = criticalCount
-			result["high_count"] = highCount
-			logAnalysisFindings(ctx, "run_security_scan", issues)
-			return result, nil
-		}).
-		Build()
-}
-
-// CheckCoverageSkill returns a skill that analyzes test coverage.
-func CheckCoverageSkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("check_coverage").
-		Description("Analyze test coverage and flag functions below the requested threshold when a compatible coverage runner exists.").
-		Domain("analysis").
-		Keywords("coverage", "test", "threshold").
-		Priority(85).
-		Usage("Use in implementation-validation mode when the task or quality gates require coverage evidence.").
-		Satisfies("Produces coverage evidence for quality gates and final grading.").
-		Avoid("Do not manufacture blocking findings when the project lacks a compatible coverage runner; report tool availability honestly.").
-		ArrayParam("paths", "Paths to check coverage for (default: ./...)", "string", false).
-		IntParam("threshold", "Minimum coverage percentage (default: 80)", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Paths     []string `json:"paths"`
-				Threshold float64  `json:"threshold"`
-			}
-			_ = json.Unmarshal(input, &params)
-			if len(params.Paths) == 0 {
-				params.Paths = []string{"./..."}
-			}
-			issues := runCoverageAnalysis(ctx, runner, params.Paths, params.Threshold)
-			logAnalysisFindings(ctx, "check_coverage", issues)
-			return analysisResult("check_coverage", issues), nil
-		}).
-		Build()
-}
-
-// AnalyzeComplexitySkill returns a skill that checks language-appropriate complexity limits.
-func AnalyzeComplexitySkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("analyze_complexity").
-		Description("Analyze cyclomatic and cognitive complexity of functions using the requested language rules.").
-		Domain("analysis").
-		Keywords("complexity", "cyclomatic", "cognitive").
-		Priority(85).
-		Usage("Use in implementation-validation mode when readability, maintainability, or explicit complexity gates matter for the requested scope.").
-		Satisfies("Produces complexity findings that contribute to quality judgment and review artifacts.").
-		Avoid("Do not use as the first validation step when correctness or security evidence is still missing.").
+		EnumParam("kind", "Analyzer kind", analyzerKinds(), true).
 		ArrayParam("paths", "Paths to analyze (default: ./...)", "string", false).
-		IntParam("max_cyclomatic", "Max cyclomatic complexity (default: 4 per CLAUDE.md)", false).
-		IntParam("max_cognitive", "Max cognitive complexity (default: 8)", false).
+		IntParam("threshold", "Coverage threshold percentage (kind=coverage; default: 80)", false).
+		IntParam("max_cyclomatic", "Max cyclomatic complexity (kind=complexity; default: 4 per CLAUDE.md)", false).
+		IntParam("max_cognitive", "Max cognitive complexity (kind=complexity; default: 8)", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
+				Kind          string   `json:"kind"`
 				Paths         []string `json:"paths"`
+				Threshold     float64  `json:"threshold"`
 				MaxCyclomatic int      `json:"max_cyclomatic"`
 				MaxCognitive  int      `json:"max_cognitive"`
 			}
 			_ = json.Unmarshal(input, &params)
-			if len(params.Paths) == 0 {
-				params.Paths = []string{"./..."}
+			kind := strings.ToLower(strings.TrimSpace(params.Kind))
+			if kind == "" {
+				return nil, fmt.Errorf("kind is required (expected one of: lint, typecheck, format_check, security, coverage, complexity, race, deadlock, memory_leak)")
 			}
-			issues := runComplexityAnalysis(ctx, runner, params.Paths, params.MaxCyclomatic, params.MaxCognitive)
-			logAnalysisFindings(ctx, "analyze_complexity", issues)
-			return analysisResult("analyze_complexity", issues), nil
-		}).
-		Build()
-}
+			paths := params.Paths
+			if len(paths) == 0 {
+				paths = []string{"./..."}
+			}
 
-// DetectRaceConditionsSkill returns a skill that runs go test with race detection.
-func DetectRaceConditionsSkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("detect_race_conditions").
-		Description("Run go test with race detector to find data races.").
-		Domain("analysis").
-		Keywords("race", "concurrency", "data race").
-		Priority(95).
-		Usage("Use in implementation-validation mode when concurrency behavior is present or when a task explicitly risks races.").
-		Requirement("Requires runnable implementation/test evidence for the target scope.").
-		Satisfies("Produces concurrency-safety evidence for validation findings and severity reporting.").
-		Avoid("Do not use during pre-implementation inspection or on obviously non-runnable placeholder code.").
-		ArrayParam("paths", "Paths to test (default: ./...)", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			paths := extractPaths(input)
-			issues := RunRaceDetector(ctx, runner, paths)
-			logAnalysisFindings(ctx, "detect_race_conditions", issues)
-			return analysisResult("detect_race_conditions", issues), nil
-		}).
-		Build()
-}
-
-// DetectDeadlocksSkill returns a skill that performs AST-based deadlock analysis.
-func DetectDeadlocksSkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("detect_deadlocks").
-		Description("Analyze Go source for potential deadlocks via lock ordering analysis.").
-		Domain("analysis").
-		Keywords("deadlock", "lock", "mutex").
-		Priority(90).
-		Usage("Use in implementation-validation mode when the target code includes locks, shared state, or orchestration paths that could block.").
-		Satisfies("Produces deadlock-risk findings for validation and grading.").
-		Avoid("Do not use during pre-implementation synthesis or as a replacement for broader criteria validation.").
-		ArrayParam("paths", "Paths to analyze (default: ./...)", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			paths := extractPaths(input)
-			issues := RunDeadlockDetector(ctx, runner, paths)
-			logAnalysisFindings(ctx, "detect_deadlocks", issues)
-			return analysisResult("detect_deadlocks", issues), nil
-		}).
-		Build()
-}
-
-// DetectMemoryLeaksSkill returns a skill that runs escape analysis.
-func DetectMemoryLeaksSkill(runner *ToolRunner) *skills.Skill {
-	return skills.NewSkill("detect_memory_leaks").
-		Description("Run escape analysis to detect memory leaks and unnecessary heap allocations.").
-		Domain("analysis").
-		Keywords("memory", "leak", "escape", "heap").
-		Priority(90).
-		Usage("Use in implementation-validation mode when the task risks unbounded growth, retention bugs, or performance regressions.").
-		Satisfies("Produces memory-behavior evidence for validation findings and quality grading.").
-		Avoid("Do not use during pre-implementation synthesis or as a stand-in for correctness validation.").
-		ArrayParam("paths", "Paths to analyze (default: ./...)", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			paths := extractPaths(input)
-			issues := RunMemoryAnalyzer(ctx, runner, paths)
-			logAnalysisFindings(ctx, "detect_memory_leaks", issues)
-			return analysisResult("detect_memory_leaks", issues), nil
+			var (
+				issues []ValidationIssue
+				label  string
+			)
+			switch kind {
+			case analyzerKindLint:
+				label = "run_linter"
+				issues = runLinterAnalysis(ctx, runner, paths)
+			case analyzerKindTypecheck:
+				label = "run_type_checker"
+				issues = runTypeCheckerAnalysis(ctx, runner, paths)
+			case analyzerKindFormatCheck:
+				label = "run_formatter_check"
+				issues = runFormatterAnalysis(ctx, runner, paths)
+			case analyzerKindSecurity:
+				label = "run_security_scan"
+				issues = runSecurityAnalysis(ctx, runner, paths)
+				result := analysisResult(label, issues)
+				result["kind"] = kind
+				result["critical_count"] = countBySeverity(issues, Critical)
+				result["high_count"] = countBySeverity(issues, High)
+				logAnalysisFindings(ctx, label, issues)
+				return result, nil
+			case analyzerKindCoverage:
+				label = "check_coverage"
+				issues = runCoverageAnalysis(ctx, runner, paths, params.Threshold)
+			case analyzerKindComplexity:
+				label = "analyze_complexity"
+				issues = runComplexityAnalysis(ctx, runner, paths, params.MaxCyclomatic, params.MaxCognitive)
+			case analyzerKindRace:
+				label = "detect_race_conditions"
+				issues = RunRaceDetector(ctx, runner, paths)
+			case analyzerKindDeadlock:
+				label = "detect_deadlocks"
+				issues = RunDeadlockDetector(ctx, runner, paths)
+			case analyzerKindMemoryLeak:
+				label = "detect_memory_leaks"
+				issues = RunMemoryAnalyzer(ctx, runner, paths)
+			default:
+				return nil, fmt.Errorf("unknown kind: %q (expected one of: lint, typecheck, format_check, security, coverage, complexity, race, deadlock, memory_leak)", params.Kind)
+			}
+			logAnalysisFindings(ctx, label, issues)
+			result := analysisResult(label, issues)
+			result["kind"] = kind
+			return result, nil
 		}).
 		Build()
 }

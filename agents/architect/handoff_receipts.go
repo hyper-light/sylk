@@ -113,6 +113,64 @@ func decodePlanHandoffStatusResponse(data any) (*agentshared.PlanHandoffReceipt,
 	return decoded.Receipt, decoded.Found, nil
 }
 
+func (a *Architect) logDecodedPlanHandoffStatus(
+	plan *DesignPlan,
+	correlationID string,
+	receipt *agentshared.PlanHandoffReceipt,
+	found bool,
+) {
+	if a == nil || plan == nil {
+		return
+	}
+	receiptFields := map[string]any{
+		"plan_id":     plan.ID,
+		"session_id":  plan.SessionID,
+		"revision":    plan.Revision,
+		"found":       found,
+		"receipt_nil": receipt == nil,
+	}
+	if receipt != nil {
+		receiptFields["receipt_id"] = receipt.ReceiptID
+		receiptFields["receipt_status"] = string(receipt.Status)
+		receiptFields["dag_id"] = receipt.DAGID
+		receiptFields["workflow_id"] = receipt.WorkflowID
+		receiptFields["task_count"] = receipt.TaskCount
+		receiptFields["layer_count"] = receipt.LayerCount
+		receiptFields["error_text"] = receipt.ErrorText
+		receiptFields["updated_at"] = receipt.UpdatedAt
+	}
+	a.logInfo("planHandoffStatusLookup: orchestrator response decoded",
+		"plan_id", plan.ID,
+		"session_id", plan.SessionID,
+		"found", found,
+		"receipt_nil", receipt == nil,
+		"receipt_status", receiptStatusStringForLog(receipt),
+		"dag_id", receiptDAGIDForLog(receipt),
+		"receipt_id", receiptIDForLog(receipt))
+	a.logTrace("architect_plan_handoff_status_decoded", "debug", plan.SessionID, correlationID, agentlog.EventTaskDispatched, receiptFields)
+}
+
+func receiptStatusStringForLog(r *agentshared.PlanHandoffReceipt) string {
+	if r == nil {
+		return ""
+	}
+	return string(r.Status)
+}
+
+func receiptDAGIDForLog(r *agentshared.PlanHandoffReceipt) string {
+	if r == nil {
+		return ""
+	}
+	return r.DAGID
+}
+
+func receiptIDForLog(r *agentshared.PlanHandoffReceipt) string {
+	if r == nil {
+		return ""
+	}
+	return r.ReceiptID
+}
+
 func (a *Architect) requestOpenPlanHandoffReceiptResyncs(reason string) {
 	if !canRequestOpenPlanHandoffReceiptResyncs(a) {
 		return
@@ -206,12 +264,24 @@ func (a *Architect) reconcileDurablePlanHandoff(
 	if !canReconcileDurablePlanHandoff(a, plan) {
 		return false
 	}
+	a.logInfo("reconcileDurablePlanHandoff: looking up receipt from orchestrator",
+		"plan_id", plan.ID,
+		"session_id", plan.SessionID,
+		"correlation_id", correlationID,
+		"reason", reason,
+		"plan_state", plan.SM().State().String())
 	receipt, found, err := a.lookupPlanHandoffReceipt(ctx, plan)
 	if err != nil {
 		a.logPlanHandoffReceiptLookupFailure(plan, correlationID, reason, err)
 		return false
 	}
+	a.logDecodedPlanHandoffStatus(plan, correlationID, receipt, found)
 	if isMissingPlanHandoffReceipt(found, receipt) {
+		a.logInfo("reconcileDurablePlanHandoff: no receipt found; scheduling retry",
+			"plan_id", plan.ID,
+			"session_id", plan.SessionID,
+			"correlation_id", correlationID,
+			"reason", reason)
 		a.recoverPlanHandoffForRetry(plan, correlationID, reason)
 		return true
 	}
@@ -347,6 +417,45 @@ func (a *Architect) promotePlanExecutingFromReceipt(
 		return
 	}
 	message := firstNonEmpty(pendingMessageForExecutingReceipt(receipt), "Plan dispatched to the orchestrator.")
+	receiptAge := time.Duration(0)
+	if !receipt.UpdatedAt.IsZero() {
+		receiptAge = time.Since(receipt.UpdatedAt)
+	}
+	staleSuspect := receiptAge > 5*time.Minute
+	a.logInfo("promotePlanExecutingFromReceipt: ABOUT TO EMIT 'Plan dispatched' message from DURABLE RECEIPT (not a fresh dispatch)",
+		"plan_id", plan.ID,
+		"session_id", plan.SessionID,
+		"correlation_id", correlationID,
+		"receipt_id", receipt.ReceiptID,
+		"receipt_status", string(receipt.Status),
+		"receipt_dag_id", receipt.DAGID,
+		"receipt_workflow_id", receipt.WorkflowID,
+		"receipt_updated_at", receipt.UpdatedAt,
+		"receipt_age_seconds", receiptAge.Seconds(),
+		"stale_suspect", staleSuspect,
+		"plan_state_before", plan.SM().State().String(),
+		"notification_message", message,
+		"source", "durable_receipt_promotion")
+	a.logTrace("architect_plan_handoff_promote_from_durable_receipt", "info", plan.SessionID, correlationID, agentlog.EventTaskDispatched, map[string]any{
+		"plan_id":              plan.ID,
+		"receipt_id":           receipt.ReceiptID,
+		"receipt_status":       string(receipt.Status),
+		"receipt_dag_id":       receipt.DAGID,
+		"receipt_workflow_id":  receipt.WorkflowID,
+		"receipt_updated_at":   receipt.UpdatedAt,
+		"receipt_age_seconds":  receiptAge.Seconds(),
+		"stale_suspect":        staleSuspect,
+		"plan_state_before":    plan.SM().State().String(),
+		"notification_message": message,
+		"source":               "durable_receipt_promotion",
+	})
+	if staleSuspect {
+		a.logWarn("promotePlanExecutingFromReceipt: STALE-RECEIPT SUSPECTED — receipt is older than 5 minutes but status claims Executing; the orchestrator may be returning a ghost receipt",
+			"plan_id", plan.ID,
+			"receipt_dag_id", receipt.DAGID,
+			"receipt_age_seconds", receiptAge.Seconds(),
+			"receipt_updated_at", receipt.UpdatedAt)
+	}
 	if err := a.finalizePlanHandoffExecution(
 		plan,
 		nil,
@@ -424,7 +533,19 @@ func (a *Architect) finalizePlanHandoffExecution(
 	if a == nil || plan == nil {
 		return nil
 	}
+	a.logInfo("finalizePlanHandoffExecution: entry",
+		"plan_id", plan.ID,
+		"session_id", plan.SessionID,
+		"correlation_id", correlationID,
+		"plan_state_before", plan.SM().State().String(),
+		"notification_message", notification,
+		"persist_reason", persistReason,
+		"has_continuation_record", record != nil)
 	if err := a.transitionPlanToExecutingFromHandoff(plan, correlationID); err != nil {
+		a.logWarn("finalizePlanHandoffExecution: transition to Executing failed",
+			"plan_id", plan.ID,
+			"error", err.Error(),
+			"persist_reason", persistReason)
 		return err
 	}
 	plan.Status = plan.SM().State()
@@ -443,7 +564,28 @@ func (a *Architect) finalizePlanHandoffExecution(
 		return err
 	}
 	if outcome.completed || !outcome.found {
+		a.logInfo("finalizePlanHandoffExecution: publishing 'Plan dispatched' notification to user",
+			"plan_id", plan.ID,
+			"session_id", plan.SessionID,
+			"correlation_id", correlationID,
+			"notification_message", notification,
+			"persist_reason", persistReason,
+			"continuation_completed", outcome.completed,
+			"continuation_found", outcome.found)
+		a.logTrace("architect_plan_handoff_notification_published", "info", plan.SessionID, correlationID, agentlog.EventTaskDispatched, map[string]any{
+			"plan_id":                plan.ID,
+			"notification_message":   notification,
+			"persist_reason":         persistReason,
+			"continuation_completed": outcome.completed,
+			"continuation_found":     outcome.found,
+		})
 		a.publishNotificationPush(notification)
+	} else {
+		a.logInfo("finalizePlanHandoffExecution: skipping notification (continuation already handled the push)",
+			"plan_id", plan.ID,
+			"correlation_id", correlationID,
+			"continuation_completed", outcome.completed,
+			"continuation_found", outcome.found)
 	}
 	return nil
 }

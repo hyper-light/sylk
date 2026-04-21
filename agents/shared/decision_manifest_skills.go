@@ -11,10 +11,25 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
-// DecisionManifestSkillConfig wires the LLM-facing manifest skills onto a
-// DecisionManifestClient. Provided once per agent during skill setup.
+// DecisionManifestSkillConfig wires the LLM-facing declare_decision
+// skill. Phase 3 refactor: the handler now emits an
+// ActionDecisionDeclared fabric activity via AutoPublishDecision
+// directly — the orchestrator's manifest fabric subscriber ingests it
+// and persists the canonical SQL row. The DecisionManifestClient
+// field remains for callers that still need the bus-RPC path (e.g.
+// tester decision-manifest gate helpers), but the skill no longer
+// touches it.
 type DecisionManifestSkillConfig struct {
 	Client DecisionManifestClient
+
+	// Phase 3 fabric-native wiring — required so AutoPublishDecision
+	// carries the right actor identity onto the emitted activity.
+	// All four getters are optional (fall back to empty string when
+	// nil), but pipeline agents should wire all four.
+	SessionID        func() string
+	AuthorAgentID    func() string
+	AuthorAgentType  func() string
+	AuthorPipelineID func() string
 }
 
 // DecisionManifestSkills returns the cross-pipeline manifest skills:
@@ -28,12 +43,20 @@ type DecisionManifestSkillConfig struct {
 // conflicts against existing decisions and returns adopt/align/challenge
 // guidance.
 func DecisionManifestSkills(cfg DecisionManifestSkillConfig) []*skills.Skill {
+	// Phase 1 refactor (docs/PIPELINE_SKILL_REFACTOR.md):
+	// query_decisions is subsumed by query_peer_activity with
+	// kinds=["decision_declared"]. declare_decision stays for now;
+	// Phase 3 rewrites its body to route through the Activity Fabric
+	// via AutoPublishDecision.
 	return []*skills.Skill{
-		queryDecisionsSkill(cfg),
 		declareDecisionSkill(cfg),
 	}
 }
 
+// queryDecisionsSkill is retained for reference during the refactor
+// but no longer registered. Remove once Phase 3 verification completes.
+//
+//nolint:unused // retained during refactor for code archaeology
 func queryDecisionsSkill(cfg DecisionManifestSkillConfig) *skills.Skill {
 	return skills.NewSkill("query_decisions").
 		Description("Look up cross-pipeline decisions a peer (or this pipeline earlier) has declared in a typed domain. Use BEFORE picking a test framework, build backend, lint config, or any other choice that parallel pipelines must coordinate on. Returns the resolved winner plus all matching decisions.").
@@ -100,18 +123,37 @@ func declareDecisionSkill(cfg DecisionManifestSkillConfig) *skills.Skill {
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			result, err := cfg.Client.Declare(ctx, manifest.DeclareDecisionInput{
-				Domain:     strings.TrimSpace(params.Domain),
-				Scope:      normalizeManifestScope(params.Scope),
-				Value:      strings.TrimSpace(params.Value),
-				Evidence:   params.Evidence,
-				Confidence: params.Confidence,
-				Supersedes: strings.TrimSpace(params.Supersedes),
-			})
-			if err != nil {
-				return nil, err
+			scope := normalizeManifestScope(params.Scope)
+			// Phase 3 refactor: emit fabric-native. The orchestrator's
+			// manifest fabric subscriber tails ActionDecisionDeclared
+			// and writes the canonical SQL row. No orchestrator bus
+			// RPC on the skill path.
+			coords := map[string]string{}
+			for k, v := range scope {
+				coords[string(k)] = v
 			}
-			return result, nil
+			if s := strings.TrimSpace(params.Supersedes); s != "" {
+				coords["supersedes"] = s
+			}
+			AutoPublishDecision(ctx, AutoPublishInput{
+				SessionID:        safeCallString(cfg.SessionID),
+				AuthorAgentID:    safeCallString(cfg.AuthorAgentID),
+				AuthorAgentType:  safeCallString(cfg.AuthorAgentType),
+				AuthorPipelineID: safeCallString(cfg.AuthorPipelineID),
+				TriggerSkill:     "declare_decision",
+				Domain:           strings.TrimSpace(params.Domain),
+				Value:            strings.TrimSpace(params.Value),
+				Scope:            scope[manifest.DimensionPath],
+				Confidence:       string(params.Confidence),
+				Coordinates:      coords,
+				Evidence:         params.Evidence,
+			})
+			return map[string]any{
+				"accepted": true,
+				"domain":   strings.TrimSpace(params.Domain),
+				"value":    strings.TrimSpace(params.Value),
+				"scope":    scope,
+			}, nil
 		}).
 		Build()
 }

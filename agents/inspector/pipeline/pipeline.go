@@ -20,7 +20,6 @@ import (
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
-	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
@@ -220,18 +219,9 @@ func (pi *PipelineInspector) initSkills() error {
 	); err != nil {
 		return fmt.Errorf("attach pipeline inspector forest OT outcome: %w", err)
 	}
-	if err := agentShared.AttachForestOutcomeRecorder(
-		pi.skills,
-		"request_correction",
-		pi.forestTracker,
-		pi.config.Forest,
-		func() string { return pi.id },
-		"inspector-pipeline",
-		func() string { return pi.config.SessionID },
-		agentShared.OutcomeAlways(forest.OutcomeStatusFailed, "pipeline inspector requested a correction"),
-	); err != nil {
-		return fmt.Errorf("attach pipeline inspector forest correction outcome: %w", err)
-	}
+	// Phase 1 refactor: request_correction removed. challenge_peer is
+	// the replacement; its forest outcome is recorded by the generic
+	// fabric-skill hook.
 	pi.registerSafetyHook()
 
 	loaderCfg := skills.DefaultLoaderConfig()
@@ -476,12 +466,12 @@ func stageInstructions(contract *agentShared.TaskExecutionContract, stage string
 	}
 	return "### Instructions\n\n" +
 		"Implementation evidence exists. Audit the returned work yourself before choosing the next protocol step.\n" +
-		"Use `handoff_next` for ordinary phase progression and `challenge_agent` only when a specific returned deliverable is unclear, off-spec, incomplete, or otherwise needs targeted follow-up.\n" +
-		"If another agent has already returned a response to one of your challenges, call `process_validation` immediately before choosing any next handoff, challenge, or closure action.\n" +
-		"After `process_validation`, you may perform any final direct audit you still need in the same turn, but you must not end that turn without a concrete protocol tool call: `challenge_agent`, `handoff_next`, `finalize_pipeline`, or `handoff_to_ot`.\n" +
-		"Do not use `finalize_pipeline` as a substitute for that targeted audit work. Call it only after the current inspector audit is complete and any challenge responses needed for that audit have already been processed.\n" +
-		"When you do call `finalize_pipeline`, pass the strongest criteria, implementation, test, and challenge evidence from the current audit so it can determine whether the final tester-backed acceptance step is still needed or OT handoff is now justified.\n" +
-		"If `finalize_pipeline` reports `ready_for_ot: true` or `must_handoff_to_ot: true`, immediately call `handoff_to_ot` as the next tool call. Do not answer in prose first.\n" +
+		"Use `pipeline_protocol(action=handoff)` for ordinary phase progression and `pipeline_protocol(action=challenge)` only when a specific returned deliverable is unclear, off-spec, incomplete, or otherwise needs targeted follow-up.\n" +
+		"If another agent has already returned a response to one of your challenges, call `pipeline_protocol(action=process_validation)` immediately before choosing any next handoff, challenge, or closure action.\n" +
+		"After `pipeline_protocol(action=process_validation)`, you may perform any final direct audit you still need in the same turn, but you must not end that turn without a concrete protocol tool call: `pipeline_protocol(action=challenge|handoff|finalize)` or `handoff_to_ot`.\n" +
+		"Do not use `pipeline_protocol(action=finalize)` as a substitute for that targeted audit work. Call it only after the current inspector audit is complete and any challenge responses needed for that audit have already been processed.\n" +
+		"When you do call `pipeline_protocol(action=finalize)`, pass the strongest criteria, implementation, test, and challenge evidence from the current audit so it can determine whether the final tester-backed acceptance step is still needed or OT handoff is now justified.\n" +
+		"If `pipeline_protocol(action=finalize)` reports `ready_for_ot: true` or `must_handoff_to_ot: true`, immediately call `handoff_to_ot` as the next tool call. Do not answer in prose first.\n" +
 		"Do not fan out into repeated audit or grading passes on unchanged workspace state. Use additional local validation tools only when a specific concrete gap remains that the current tester response or protocol state does not already answer.\n"
 }
 

@@ -41,16 +41,17 @@ func TestNewGlobalReviewProtocolSkills_AgentSpecificOwnership(t *testing.T) {
 			name:      "inspector owns global handoff challenge and commit path",
 			agentType: GlobalReviewAgentInspector,
 			want: []string{
-				"challenge_global_tester",
-				"challenge_architect",
-				"challenge_orchestrator",
+				// Phase 2.K / GI-D: challenge_global_tester +
+				// challenge_architect + challenge_orchestrator collapsed
+				// into challenge_global_agent(target=…).
+				"challenge_global_agent",
 				"handoff_next",
 				"validate_work",
 				"process_validation",
-				"finalize_global_review",
-				"accept_checkpoint",
-				"commit_to_disk",
-				"discard_checkpoint",
+				// Phase 2.K / CR-1: finalize_global_review +
+				// accept_checkpoint + discard_checkpoint + commit_to_disk
+				// collapsed into global_review(action=…).
+				"global_review",
 				"query_global_review_state",
 			},
 		},
@@ -139,11 +140,12 @@ func TestGlobalReviewOrchestratorChallenge_CarriesExecutionStateGuard(t *testing
 			SessionID: func() string { return "sess-1" },
 		},
 	})
-	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_orchestrator", map[string]any{
+	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_global_agent", map[string]any{
+		"target":  "orchestrator",
 		"reason":  "Need authoritative workflow progress before deciding whether the checkpoint is on track.",
 		"request": "Report DAG/workflow progress, remaining tasks, and any blockers for the current merged checkpoint.",
 	}); err != nil {
-		t.Fatalf("challenge_orchestrator: %v", err)
+		t.Fatalf("challenge_global_agent(orchestrator): %v", err)
 	}
 
 	select {
@@ -210,11 +212,12 @@ func TestGlobalReviewChallengePublishesUserVisibleRoute(t *testing.T) {
 			SessionID: func() string { return "sess-1" },
 		},
 	})
-	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_global_tester", map[string]any{
+	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_global_agent", map[string]any{
+		"target":  "global-tester",
 		"reason":  "Need merged-state adversarial validation.",
 		"request": "Run the full tester audit against the merged plan.",
 	}); err != nil {
-		t.Fatalf("challenge_global_tester: %v", err)
+		t.Fatalf("challenge_global_agent(global-tester): %v", err)
 	}
 
 	select {
@@ -725,11 +728,12 @@ func TestGlobalReviewArchitectChallenge_CarriesCheckpointGuard(t *testing.T) {
 			SessionID: func() string { return "sess-1" },
 		},
 	})
-	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_architect", map[string]any{
+	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_global_agent", map[string]any{
+		"target":  "architect",
 		"reason":  "Need plan-level clarification for this checkpoint review.",
 		"request": "Explain whether the current checkpoint is still aligned with the plan.",
 	}); err != nil {
-		t.Fatalf("challenge_architect: %v", err)
+		t.Fatalf("challenge_global_agent(architect): %v", err)
 	}
 
 	select {
@@ -784,11 +788,12 @@ func TestFinalizeGlobalReview_CheckpointChallengeUsesProgressiveRequest(t *testi
 			SessionID: func() string { return "sess-1" },
 		},
 	})
-	resultAny, err := invokeGlobalReviewSkill(t, ctx, skills, "finalize_global_review", map[string]any{
+	resultAny, err := invokeGlobalReviewSkill(t, ctx, skills, "global_review", map[string]any{
+		"action":  "finalize",
 		"summary": "Current merged checkpoint looks healthy enough for tester challenge.",
 	})
 	if err != nil {
-		t.Fatalf("finalize_global_review: %v", err)
+		t.Fatalf("global_review(action=finalize): %v", err)
 	}
 	result, ok := resultAny.(map[string]any)
 	if !ok {
@@ -860,11 +865,12 @@ func TestFinalizeGlobalReview_TesterRouteIsHandoffNotChallenge(t *testing.T) {
 			SessionID: func() string { return "sess-finalize-handoff" },
 		},
 	})
-	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "finalize_global_review", map[string]any{
+	if _, err := invokeGlobalReviewSkill(t, ctx, skills, "global_review", map[string]any{
+		"action":        "finalize",
 		"summary":       "Closure-round verification ready for the global tester.",
 		"evidence_refs": []string{"docs/review.md"},
 	}); err != nil {
-		t.Fatalf("finalize_global_review: %v", err)
+		t.Fatalf("global_review(action=finalize): %v", err)
 	}
 
 	action := GlobalReviewStateFromContext(ctx).TerminalAction()
@@ -922,11 +928,12 @@ func TestFinalizeGlobalReview_CheckpointRequiresAcceptAfterAcceptedTesterValidat
 	skills := NewGlobalReviewProtocolSkills(GlobalReviewProtocolSkillConfig{
 		AgentType: func() string { return GlobalReviewAgentInspector },
 	})
-	resultAny, err := invokeGlobalReviewSkill(t, ctx, skills, "finalize_global_review", map[string]any{
+	resultAny, err := invokeGlobalReviewSkill(t, ctx, skills, "global_review", map[string]any{
+		"action":  "finalize",
 		"summary": "Final merged review is ready to commit.",
 	})
 	if err != nil {
-		t.Fatalf("finalize_global_review: %v", err)
+		t.Fatalf("global_review(action=finalize): %v", err)
 	}
 	result, ok := resultAny.(map[string]any)
 	if !ok {
@@ -962,11 +969,12 @@ func TestFinalizeGlobalReview_FinalStageRequiresCommitAfterAcceptedTesterValidat
 	skills := NewGlobalReviewProtocolSkills(GlobalReviewProtocolSkillConfig{
 		AgentType: func() string { return GlobalReviewAgentInspector },
 	})
-	resultAny, err := invokeGlobalReviewSkill(t, ctx, skills, "finalize_global_review", map[string]any{
+	resultAny, err := invokeGlobalReviewSkill(t, ctx, skills, "global_review", map[string]any{
+		"action":  "finalize",
 		"summary": "Final merged review is ready to commit.",
 	})
 	if err != nil {
-		t.Fatalf("finalize_global_review: %v", err)
+		t.Fatalf("global_review(action=finalize): %v", err)
 	}
 	result, ok := resultAny.(map[string]any)
 	if !ok {
@@ -1139,12 +1147,13 @@ func TestGlobalReviewChallengeRefusedOnIdenticalRequestText(t *testing.T) {
 	ctx = WithStreamContext(ctx, "corr-text", "orchestrator")
 
 	skills := NewGlobalReviewProtocolSkills(cfg)
-	result, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_architect", map[string]any{
+	result, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_global_agent", map[string]any{
+		"target":  "architect",
 		"reason":  "Same concern, fresh file state.",
 		"request": requestText, // byte-identical
 	})
 	if err != nil {
-		t.Fatalf("challenge_architect error = %v", err)
+		t.Fatalf("challenge_global_agent(architect) error = %v", err)
 	}
 	m, _ := result.(map[string]any)
 	if m == nil || m["refused"] != true {
@@ -1275,12 +1284,13 @@ func TestGlobalReviewAuditLock_AllowsInspectorChallengeDuringFinalize(t *testing
 	ctx = WithStreamContext(ctx, "corr-lock-inspector", "orchestrator")
 
 	skills := NewGlobalReviewProtocolSkills(cfg)
-	result, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_global_tester", map[string]any{
+	result, err := invokeGlobalReviewSkill(t, ctx, skills, "challenge_global_agent", map[string]any{
+		"target":  "global-tester",
 		"reason":  "Final audit surfaced a regression; tester must re-verify.",
 		"request": "Re-run the merged-state test suite and confirm the regression is resolved.",
 	})
 	if err != nil {
-		t.Fatalf("challenge_global_tester error = %v", err)
+		t.Fatalf("challenge_global_agent(global-tester) error = %v", err)
 	}
 	m, _ := result.(map[string]any)
 	if m == nil || m["selected"] != true {

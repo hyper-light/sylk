@@ -13,24 +13,39 @@ import (
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/google/uuid"
 )
 
 func (a *Architect) registerCoreSkills() {
+	// Phase 2.K / CR-4 refactor: start_planning + plan_workflow folded
+	// into plan as plan(action=start) + plan(action=workflow, workflow_type=…).
 	a.skills.Register(planSkill(a))
-	a.skills.Register(planWorkflowSkill(a))
-	a.skills.Register(startPlanningSkill(a))
-	a.skills.Register(consultSkill(a))
 	a.skills.Register(planModeSkill(a))
-	a.skills.Register(routePlanAcceptanceSkill(a))
-	a.skills.Register(handlePlanAcceptanceResultSkill(a))
-	a.skills.Register(presentPlanApprovalDialogSkill(a))
-	a.skills.Register(preDelegationDeclareSkill(a))
-	a.skills.Register(validatePreDelegationSkill(a))
-	a.skills.Register(monitorExecutionSkill(a))
+	// Phase 2.3 refactor: route_plan_acceptance +
+	// handle_plan_acceptance_result + present_plan_approval_dialog
+	// collapsed into plan_acceptance(action=route|handle_result|present).
+	a.skills.Register(planAcceptanceSkill(a))
+	// Phase 2.4 refactor: pre_delegation_declare + validate_pre_delegation
+	// collapsed into delegation(action=declare|validate).
+	a.skills.Register(delegationSkill(a))
 	a.skills.Register(interruptHandlerSkill(a))
-	a.skills.Register(askUserQuestionSkill(a))
-	a.skills.Register(routeRequirementsResearchSkill(a))
-	a.skills.Register(readResearchPaperSkill(a))
+	// Phase 2.6 refactor: route_requirements_research + read_research_paper
+	// collapsed into academic_research(action=request|read).
+	a.skills.Register(academicResearchSkill(a))
+	// Phase 1 refactor (docs/PIPELINE_SKILL_REFACTOR.md):
+	//   - consult removed. Use consult_peer (fabric async) with
+	//     target_agent_type="librarian"|"archivalist"|"academic".
+	//   - ask_user_question removed. Use ask_user_clarification
+	//     (shared builder) for the same purpose.
+	//   - monitor_execution removed. Use query_peer_activity(scope=
+	//     <pipeline-id-prefix>, kinds=[...]) to observe delegated work.
+	a.skills.Register(shared.BuildAskUserClarificationSkill(shared.AskUserClarificationConfig{
+		Bus:          a.bus,
+		AgentID:      a.id,
+		AgentName:    "architect",
+		SessionID:    a.config.SessionID,
+		NewMessageID: func() string { return uuid.New().String() },
+	}))
 	for _, skill := range shared.NewGlobalReviewProtocolSkills(shared.GlobalReviewProtocolSkillConfig{
 		AgentType:     func() string { return "architect" },
 		AgentID:       func() string { return a.id },
@@ -80,6 +95,22 @@ func (a *Architect) registerFabricSkills() {
 		AgentID:    agentID,
 		AgentType:  agentType,
 		PipelineID: func() string { return "" },
+		// Architect already has a sync-route path via requestRouteSync,
+		// but the shared bus-based helper achieves the same thing and
+		// keeps the wiring uniform with every other caller. The architect's
+		// own requestConsultationWithMetadata continues to use its
+		// per-agent pending-bus-wait path for targeted consultations
+		// with admission/cache integration; consult_peer via this skill
+		// is the fabric-level primitive that any agent can call.
+		RouteSync: shared.RouteSyncFromBus(
+			func() guide.EventBus { return a.bus },
+			func() string {
+				if a.channels == nil {
+					return ""
+				}
+				return a.channels.Responses
+			},
+		),
 	}) {
 		a.skills.Register(skill)
 	}
@@ -215,27 +246,42 @@ type planInput struct {
 	PlanID           string                `json:"plan_id,omitempty"`
 	Reason           string                `json:"reason,omitempty"`
 	Updates          map[string]any        `json:"updates,omitempty"`
+
+	// Phase 2.K / CR-4 refactor: start_planning + plan_workflow folded
+	// into plan. Keep their typed fields directly on the input struct
+	// so callers don't need to build a nested object.
+	SessionID      string        `json:"session_id,omitempty"`       // start
+	WorkflowType   string        `json:"workflow_type,omitempty"`    // workflow: standard|fix
+	Tasks          []*AtomicTask `json:"tasks,omitempty"`            // workflow=standard
+	Policy         string        `json:"policy,omitempty"`           // workflow=standard
+	MaxConcurrency int           `json:"max_concurrency,omitempty"`  // workflow=standard
+	Corrections    []any         `json:"corrections,omitempty"`      // workflow=fix
 }
 
 func planSkill(a *Architect) *skills.Skill {
 	return skills.NewSkill("plan").
-		Description("Plan operations for synthesizing discussion and consultation evidence into requirements, architecture, tasks, estimates, and revisions.\n\n"+
+		Description("Plan lifecycle operations. One primitive for every phase from kickoff to revision.\n\n"+
 			"Actions:\n"+
-			"- analyze: Synthesize project requirements from the user discussion, existing evidence, and known constraints (params: query [required], scope, goals, constraints)\n"+
-			"- design: Synthesize system architecture from requirements and consultation evidence (params: requirements [required], patterns)\n"+
-			"- generate_tasks: Synthesize atomic tasks from architecture (params: architecture [required], max_tasks_per_agent, allow_parallel)\n"+
+			"- start: Create a new plan and return plan_id + protocol instructions (params: query [required], session_id)\n"+
+			"- analyze: Synthesize project requirements from the user discussion, existing evidence, and known constraints (params: query [required], scope, goals, constraints, plan_id)\n"+
+			"- design: Synthesize system architecture from requirements and consultation evidence (params: requirements [required] OR plan_id, patterns)\n"+
+			"- generate_tasks: Synthesize atomic tasks from architecture (params: architecture [required] OR plan_id, max_tasks_per_agent, allow_parallel)\n"+
+			"- workflow: Build workflow DAG from tasks (workflow_type=standard: tasks [required], policy, max_concurrency) or from corrections (workflow_type=fix: corrections [required], plan_id, session_id)\n"+
 			"- estimate: Estimate task complexity and token usage (params: description [required], context)\n"+
 			"- revise: Revise an existing plan (params: plan_id, reason [required], updates)").
 		Domain("planning").
-		Keywords("analyze", "requirements", "understand", "goals", "constraints",
+		Keywords("start", "create plan", "formalize", "generate plan",
+			"analyze", "requirements", "understand", "goals", "constraints",
 			"design", "architecture", "system", "components", "structure",
 			"generate", "tasks", "atomic", "decompose", "breakdown",
+			"workflow", "dag", "dependency graph", "task order", "plan structure",
+			"fix dag", "corrections", "repair structure", "remediation tasks",
 			"estimate", "complexity", "tokens", "effort", "size",
 			"revise", "replan", "update plan", "change workflow").
 		Priority(100).
-		TokenEstimate(600).
-		EnumParam("action", "Planning action to execute", []string{
-			"analyze", "design", "generate_tasks", "estimate", "revise",
+		TokenEstimate(700).
+		EnumParam("action", "Plan lifecycle action to perform", []string{
+			"start", "analyze", "design", "generate_tasks", "workflow", "estimate", "revise",
 		}, true).
 		StringParam("query", "Requirement or task to analyze (for analyze)", false).
 		StringParam("scope", "Scope of analysis (for analyze)", false).
@@ -273,9 +319,15 @@ func planSkill(a *Architect) *skills.Skill {
 			"involves_tests":    {Type: "boolean", Description: "Whether task includes testing"},
 			"involves_refactor": {Type: "boolean", Description: "Whether task involves refactoring"},
 		}, false).
-		StringParam("plan_id", "Plan identifier for protocol-driven operations (analyze, design, generate_tasks, revise)", false).
+		StringParam("plan_id", "Plan identifier for protocol-driven operations (analyze, design, generate_tasks, workflow, revise)", false).
+		StringParam("session_id", "Session identifier (for start, workflow=fix)", false).
 		StringParam("reason", "Reason for revision (for revise)", false).
 		ObjectParam("updates", "Optional update payload (for revise)", map[string]*skills.Property{}, false).
+		EnumParam("workflow_type", "Workflow variant (for workflow)", []string{"standard", "fix"}, false).
+		ArrayParam("tasks", "Atomic tasks for workflow=standard", "object", false).
+		EnumParam("policy", "Execution policy (for workflow=standard)", []string{"fail_fast", "continue"}, false).
+		IntParam("max_concurrency", "Maximum concurrent tasks (for workflow=standard, default 10)", false).
+		ArrayParam("corrections", "Correction list from inspector/tester feedback (for workflow=fix)", "object", false).
 		Usage("Use this skill to formalize and synthesize what the architect has already learned from the user discussion and consultations. The goal is a high-quality planning artifact, not a replacement for live discovery. If material evidence is still missing, perform the targeted consultation first or immediately after the relevant planning step instead of guessing.").
 		BestPractice("For action=analyze, synthesize the whole conversation and consultation evidence into the query and inputs — do not treat analyze as the first moment to discover obvious requirements.").
 		BestPractice("For action=design and action=generate_tasks, preserve the current output shape while grounding the result in the strongest evidence already gathered. Additional targeted research is still allowed when a real gap remains.").
@@ -298,11 +350,120 @@ func planSkill(a *Architect) *skills.Skill {
 type planSkillHandler func(*Architect, context.Context, *planInput) (any, error)
 
 var planSkillHandlers = map[string]planSkillHandler{
+	"start":          handlePlanSkillStart,
 	"analyze":        handlePlanSkillAnalyze,
 	"design":         handlePlanSkillDesign,
 	"generate_tasks": handlePlanSkillGenerateTasks,
+	"workflow":       handlePlanSkillWorkflow,
 	"estimate":       handlePlanSkillEstimate,
 	"revise":         handlePlanSkillRevise,
+}
+
+// handlePlanSkillStart absorbs the former start_planning skill. Creates a
+// new plan, returns its plan_id, and emits the protocol-driver instructions
+// the LLM uses to sequence analyze → consult → design → generate_tasks.
+func handlePlanSkillStart(a *Architect, ctx context.Context, p *planInput) (any, error) {
+	query := strings.TrimSpace(p.Query)
+	if query == "" {
+		return nil, fmt.Errorf("query is required for action=start")
+	}
+	sessionID := architectSessionIDFromContext(ctx)
+	if sessionID == "" {
+		sessionID = normalizeSessionID(p.SessionID)
+	}
+	requestCorrelationID := originalCIDFromContext(ctx)
+	if reusable := a.reusablePlanForRequest(sessionID, requestCorrelationID); reusable != nil {
+		a.supersedeDuplicateRequestPlans(sessionID, requestCorrelationID, reusable.ID)
+		a.logInfo("plan(start): reusing request-scoped plan",
+			"plan_id", reusable.ID,
+			"session_id", sessionID,
+			"request_correlation_id", requestCorrelationID,
+			"status", reusable.SM().State().String())
+		return map[string]any{
+			"plan_id":    reusable.ID,
+			"session_id": sessionID,
+			"status":     reusable.SM().State().String(),
+			"protocol":   startPlanningProtocolInstructions(a.config.AutoApprove),
+			"reused":     true,
+		}, nil
+	}
+	req := &ArchitectRequest{
+		ID:        uuid.NewString(),
+		Intent:    IntentPlan,
+		Query:     query,
+		SessionID: sessionID,
+		Timestamp: time.Now(),
+	}
+	req = a.enrichPlanningRequest(req)
+	plan := newProtocolPlan(req, requestCorrelationID)
+	if err := a.persistPlanState(plan); err != nil {
+		return nil, err
+	}
+	a.supersedeDuplicateRequestPlans(sessionID, requestCorrelationID, plan.ID)
+	a.logInfo("plan(start): plan created",
+		"plan_id", plan.ID,
+		"session_id", sessionID,
+		"request_correlation_id", requestCorrelationID,
+		"query", truncateString(query, 120))
+	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventPlanCreated,
+		a.id, sessionID, "", "info",
+		&agentlog.PlanPayload{PlanID: plan.ID, Status: plan.Status.String()})
+	return map[string]any{
+		"plan_id":    plan.ID,
+		"session_id": sessionID,
+		"status":     plan.Status.String(),
+		"protocol":   startPlanningProtocolInstructions(a.config.AutoApprove),
+		"reused":     false,
+	}, nil
+}
+
+// handlePlanSkillWorkflow absorbs the former plan_workflow skill. Builds
+// a workflow DAG from either atomic tasks (workflow_type=standard) or
+// corrections (workflow_type=fix).
+func handlePlanSkillWorkflow(a *Architect, ctx context.Context, p *planInput) (any, error) {
+	switch strings.TrimSpace(p.WorkflowType) {
+	case "standard":
+		if len(p.Tasks) == 0 {
+			return nil, fmt.Errorf("tasks are required for workflow_type=standard")
+		}
+		workflow, err := a.createWorkflowDAG(ctx, p.Tasks)
+		if err != nil {
+			return nil, err
+		}
+		executionOrder := [][]string{}
+		if workflow.DAG != nil {
+			executionOrder = workflow.DAG.ExecutionOrder()
+		}
+		return map[string]any{
+			"workflow": map[string]any{
+				"dag_id":           workflow.DAG.ID(),
+				"total_tasks":      workflow.TotalTasks,
+				"estimated_tokens": workflow.EstimatedTokens,
+				"execution_order":  executionOrder,
+				"layer_count":      len(executionOrder),
+			},
+		}, nil
+	case "fix":
+		if len(p.Corrections) == 0 {
+			return nil, fmt.Errorf("corrections are required for workflow_type=fix")
+		}
+		tasks := buildFixTasks(p.Corrections)
+		workflow, err := a.createWorkflowDAG(ctx, tasks)
+		if err != nil {
+			return nil, err
+		}
+		linkedPlanID := a.attachFixWorkflow(p.PlanID, workflow, tasks)
+		return map[string]any{
+			"plan_id":      linkedPlanID,
+			"session_id":   normalizeSessionID(p.SessionID),
+			"workflow":     workflow,
+			"task_count":   len(tasks),
+			"corrections":  len(p.Corrections),
+			"workflow_tag": "fix",
+		}, nil
+	default:
+		return nil, fmt.Errorf("workflow_type is required (standard|fix)")
+	}
 }
 
 func handlePlanSkillAnalyze(a *Architect, ctx context.Context, p *planInput) (any, error) {
@@ -467,6 +628,22 @@ func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInpu
 		lm.GrantReadyLease(plan)
 	}
 	a.publishPlanSnapshot(ctx, plan)
+	// Phase 4 refactor: emit plan_ratified so pipeline agents see the
+	// ratified plan in ambient context. Individual tasks are projected
+	// via the existing DAG dispatch flow; the plan-level activity is
+	// what was missing.
+	shared.AutoPublishCommitted(ctx, shared.AutoPublishInput{
+		SessionID:        a.config.SessionID,
+		AuthorAgentID:    a.id,
+		AuthorAgentType:  "architect",
+		AuthorPipelineID: "",
+		TriggerSkill:     "plan",
+		Domain:           "plan_ratified",
+		Value:            plan.ID,
+		Scope:            plan.ID,
+		Coordinates:      map[string]string{"plan_id": plan.ID, "status": plan.SM().State().String()},
+		Evidence:         []string{fmt.Sprintf("%d tasks, %d layers", len(plan.Tasks), planLayerCount(plan))},
+	})
 	result["plan_status"] = plan.SM().State().String()
 	result["layer_count"] = planLayerCount(plan)
 	result["task_summary"] = firstTaskName(plan)
@@ -706,8 +883,8 @@ func estimateTaskComplexity(description string, context map[string]any) *Complex
 
 // generateTasksNextAction returns the LLM instruction for what to do after
 // generate_tasks completes and the plan reaches Ready. When auto-approve is
-// enabled, the LLM must invoke route_plan_acceptance immediately. When
-// approval is required, it must wait for the user's response.
+// enabled, the LLM must invoke plan_acceptance(action=route) immediately.
+// When approval is required, it must wait for the user's response.
 func generateTasksNextAction(autoApprove bool) string {
 	const base = "PROTOCOL COMPLETE. The plan is ready. The system renders " +
 		"the plan structure separately in the UI — the user already sees it. " +
@@ -717,7 +894,7 @@ func generateTasksNextAction(autoApprove bool) string {
 		"architectural tradeoff and the primary risk. Sound like a principal engineer."
 
 	if autoApprove {
-		return base + " Then invoke route_plan_acceptance with the plan_id " +
+		return base + " Then invoke plan_acceptance(action=route) with the plan_id " +
 			"and a brief summary as user_response. After invoking it, STOP. " +
 			"The approval and orchestrator handoff continue asynchronously."
 	}
@@ -727,5 +904,5 @@ func generateTasksNextAction(autoApprove bool) string {
 		"implementation is already starting or that their reply will immediately " +
 		"start work in this turn. Avoid phrases like \"kick it off\", " +
 		"\"start building\", \"start implementing\", \"get started\", or \"ship it\". " +
-		"Do NOT invoke route_plan_acceptance — wait for the user's response."
+		"Do NOT invoke plan_acceptance — wait for the user's response."
 }

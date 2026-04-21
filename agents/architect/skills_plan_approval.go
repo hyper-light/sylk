@@ -1,18 +1,11 @@
-// LLM-callable trigger for the plan acceptance dialog.
+// Phase 2.3 refactor (docs/PIPELINE_SKILL_REFACTOR.md):
+// plan_acceptance absorbs route_plan_acceptance, handle_plan_acceptance_result,
+// and present_plan_approval_dialog into a single verb-typed primitive.
 //
-// The dialog is normally fired automatically by executeConversation
-// after the tool loop produces a Ready plan, but that path is fragile
-// when the LLM completes its turn through a non-canonical return
-// (recovery branches, cached protocol completion, mid-stream context
-// hand-offs). Exposing the dialog as a first-class skill lets the
-// LLM trigger it explicitly: after start_planning reports Ready, the
-// LLM calls present_plan_approval_dialog(plan_id) before composing
-// its narrative summary, so the user sees BOTH the prose AND the
-// Approve/Modify/Reject buttons.
-//
-// Idempotent — if a pending plan-approval continuation already exists
-// for the plan, the call is a no-op. Best-effort — never errors out
-// the tool loop; failures are surfaced in the result map and logged.
+// The three underlying handlers stay — routePlanAcceptanceSkill,
+// handlePlanAcceptanceResultSkill, and presentPlanApprovalDialogSkill
+// remain as private helpers in skills_planning.go — but the LLM only
+// sees plan_acceptance with action ∈ {present, route, handle_result}.
 package architect
 
 import (
@@ -24,54 +17,149 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
-type presentPlanApprovalDialogRequest struct {
+type planAcceptanceInput struct {
+	Action string `json:"action"`
 	PlanID string `json:"plan_id"`
+	// Route / handle_result fields.
+	UserResponse  string   `json:"user_response,omitempty"`
+	Result        string   `json:"result,omitempty"`
+	Modifications []string `json:"modifications,omitempty"`
 }
 
-func presentPlanApprovalDialogSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("present_plan_approval_dialog").
-		Description("Publish the Approve / Modify / Reject dialog to the user for a Ready plan. Call this AFTER start_planning reports the plan reached Ready and BEFORE composing your narrative summary. Idempotent — safe to call repeatedly; the dialog only publishes once per pending continuation.").
-		Domain("planning").
-		Keywords("plan", "approval", "dialog", "approve", "present").
-		Priority(75).
-		Usage("Direct-skill. Invoke once per Ready plan to give the user the explicit verdict buttons. The dialog renders in the input panel and routes the user's clicked verdict (Approve / Modify / Reject) directly to the architect — replacing free-form text classification for the primary acceptance path. After calling, you can still write a narrative summary; the dialog appears alongside it.").
-		StringParam("plan_id", "Plan identifier to publish the dialog for. Must reference a plan in PlanStatusReady.", true).
+// planAcceptanceSkill is the single LLM-facing primitive for the plan
+// approval lifecycle. It routes to action-specific handlers that map
+// 1:1 onto the pre-Phase-2 skills (present / route / handle_result).
+func planAcceptanceSkill(a *Architect) *skills.Skill {
+	type handler = func(context.Context, *planAcceptanceInput) (any, error)
+	dispatch := map[string]handler{
+		"present":        planAcceptancePresent(a),
+		"route":          planAcceptanceRoute(a),
+		"handle_result":  planAcceptanceHandleResult(a),
+	}
+
+	return skills.NewSkill("plan_acceptance").
+		Description("Manage the plan approval handshake. Actions:\n" +
+			"- present: Publish the Approve/Modify/Reject dialog for a Ready plan (params: plan_id [required]).\n" +
+			"- route: Route the user's verbatim response to the Guide's evaluate-plan-acceptance skill (params: plan_id, user_response [required]).\n" +
+			"- handle_result: Act on the Guide's verdict — dispatch, revise, or request clarification (params: plan_id, result [required: accept|modify|reject], user_response [required], modifications).").
+		Domain("coordination").
+		Keywords("plan", "acceptance", "approval", "dialog", "approve", "modify", "reject", "verdict", "dispatch").
+		Priority(100).
+		Usage("Drive the post-Ready acceptance flow in order: plan_acceptance(action=present, plan_id=<id>) after start_planning reports Ready, then plan_acceptance(action=route, plan_id=<id>, user_response=<verbatim>) after the user responds, then plan_acceptance(action=handle_result, plan_id=<id>, result=<verdict>, user_response=<verbatim>, modifications=<list>) once the Guide returns a verdict.").
+		BestPractice("Never skip any action — present without route leaves the user waiting; route without handle_result strands the verdict.").
+		Example(`{"action": "present", "plan_id": "plan_abc"}`).
+		Example(`{"action": "route", "plan_id": "plan_abc", "user_response": "Looks good."}`).
+		Example(`{"action": "handle_result", "plan_id": "plan_abc", "result": "modify", "user_response": "Swap steps 2 and 3", "modifications": ["Reorder task 2 and task 3"]}`).
+		EnumParam("action", "Acceptance action to perform", []string{"present", "route", "handle_result"}, true).
+		StringParam("plan_id", "Plan identifier (uses latest Ready plan if omitted for route/handle_result)", false).
+		StringParam("user_response", "The user's verbatim response (route / handle_result)", false).
+		EnumParam("result", "The Guide's verdict (handle_result)", []string{"accept", "modify", "reject"}, false).
+		ArrayParam("modifications", "Modification notes from the Guide (handle_result when result=modify|reject)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var req presentPlanApprovalDialogRequest
-			if err := json.Unmarshal(input, &req); err != nil {
-				return nil, fmt.Errorf("invalid present_plan_approval_dialog payload: %w", err)
+			var params planAcceptanceInput
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			req.PlanID = strings.TrimSpace(req.PlanID)
-			if req.PlanID == "" {
-				return nil, fmt.Errorf("present_plan_approval_dialog: plan_id is required")
+			fn, ok := dispatch[strings.TrimSpace(params.Action)]
+			if !ok {
+				return nil, fmt.Errorf("unknown plan_acceptance action: %q (expected present|route|handle_result)", params.Action)
 			}
-			plan := a.planStore.Get(req.PlanID)
-			if plan == nil {
-				return map[string]any{
-					"published": false,
-					"plan_id":   req.PlanID,
-					"error":     "plan not found in active plan store",
-				}, nil
-			}
-			if plan.PendingWork != nil && plan.PendingWork.Kind == string(continuationKindPlanApproval) {
-				return map[string]any{
-					"published":      false,
-					"plan_id":        req.PlanID,
-					"already_pending": true,
-					"correlation_id": plan.PendingWork.CorrelationID,
-				}, nil
-			}
-			if err := a.requestPlanApprovalDialog(ctx, plan); err != nil {
-				return map[string]any{
-					"published": false,
-					"plan_id":   req.PlanID,
-					"error":     err.Error(),
-				}, nil
-			}
-			return map[string]any{
-				"published": true,
-				"plan_id":   req.PlanID,
-			}, nil
+			return fn(ctx, &params)
 		}).
 		Build()
+}
+
+// planAcceptancePresent mirrors presentPlanApprovalDialogSkill's handler
+// body. We reuse the private per-action handlers defined in
+// skills_planning.go / (this file) rather than duplicating the logic.
+func planAcceptancePresent(a *Architect) func(context.Context, *planAcceptanceInput) (any, error) {
+	return func(ctx context.Context, params *planAcceptanceInput) (any, error) {
+		planID := strings.TrimSpace(params.PlanID)
+		if planID == "" {
+			return nil, fmt.Errorf("plan_id is required for action=present")
+		}
+		plan := a.planStore.Get(planID)
+		if plan == nil {
+			return map[string]any{
+				"published": false,
+				"plan_id":   planID,
+				"error":     "plan not found in active plan store",
+			}, nil
+		}
+		if plan.PendingWork != nil && plan.PendingWork.Kind == string(continuationKindPlanApproval) {
+			return map[string]any{
+				"published":      false,
+				"plan_id":        planID,
+				"already_pending": true,
+				"correlation_id": plan.PendingWork.CorrelationID,
+			}, nil
+		}
+		if err := a.requestPlanApprovalDialog(ctx, plan); err != nil {
+			return map[string]any{
+				"published": false,
+				"plan_id":   planID,
+				"error":     err.Error(),
+			}, nil
+		}
+		return map[string]any{
+			"published": true,
+			"plan_id":   planID,
+		}, nil
+	}
+}
+
+// planAcceptanceRoute forwards the user response to the Guide for
+// evaluation. Extracted from routePlanAcceptanceSkill.
+func planAcceptanceRoute(a *Architect) func(context.Context, *planAcceptanceInput) (any, error) {
+	return func(ctx context.Context, params *planAcceptanceInput) (any, error) {
+		if strings.TrimSpace(params.UserResponse) == "" {
+			return nil, fmt.Errorf("user_response is required for action=route")
+		}
+		sessionID := architectSessionIDFromContext(ctx)
+		plan, statusReport, err := a.resolveReadyPlanForAcceptance(params.PlanID, sessionID)
+		if err != nil {
+			return nil, err
+		}
+		if statusReport != nil {
+			return statusReport, nil
+		}
+		payload := buildPlanAcceptancePayload(plan, params.UserResponse)
+		result, err := a.submitPlanAcceptanceEvaluation(ctx, plan, payload)
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+}
+
+// planAcceptanceHandleResult acts on the Guide's verdict. Extracted
+// from handlePlanAcceptanceResultSkill.
+func planAcceptanceHandleResult(a *Architect) func(context.Context, *planAcceptanceInput) (any, error) {
+	return func(ctx context.Context, params *planAcceptanceInput) (any, error) {
+		if strings.TrimSpace(params.Result) == "" {
+			return nil, fmt.Errorf("result is required for action=handle_result")
+		}
+		if strings.TrimSpace(params.UserResponse) == "" {
+			return nil, fmt.Errorf("user_response is required for action=handle_result")
+		}
+		sessionID := architectSessionIDFromContext(ctx)
+		plan, statusReport, err := a.resolveReadyPlanForAcceptance(params.PlanID, sessionID)
+		if err != nil {
+			return nil, err
+		}
+		if statusReport != nil {
+			return statusReport, nil
+		}
+		verdict := acceptanceVerdict(params.Result)
+		switch verdict {
+		case verdictAccept:
+			return a.actOnAccept(ctx, plan)
+		case verdictModify:
+			return a.actOnModify(ctx, plan, params.UserResponse, params.Modifications)
+		case verdictReject:
+			return a.actOnReject(ctx, plan, params.UserResponse, params.Modifications)
+		default:
+			return nil, fmt.Errorf("unknown verdict: %q", params.Result)
+		}
+	}
 }

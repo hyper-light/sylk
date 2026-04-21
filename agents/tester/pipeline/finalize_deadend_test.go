@@ -106,8 +106,8 @@ func TestPipelineTester_DeadEndsAfterFinalizeWithPendingChallenge(t *testing.T) 
 			{
 				ToolCalls: []providers.ToolCall{{
 					ID:   "finalize-1",
-					Name: "finalize_pipeline",
-					Arguments: `{"targets":[{"target":"inspector-pipeline","summary":"All red-phase tests pass.","evidence_refs":["tests/test_hello.py"]}]}`,
+					Name: "pipeline_protocol",
+					Arguments: `{"action":"finalize","targets":[{"target":"inspector-pipeline","summary":"All red-phase tests pass.","evidence_refs":["tests/test_hello.py"]}]}`,
 				}},
 			},
 			// Turn 2: model emits text only — the dead-end. We

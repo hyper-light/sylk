@@ -3,7 +3,6 @@ package global
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -64,151 +63,14 @@ func loadPlanContextSkill(gi *GlobalInspector) *skills.Skill {
 		Build()
 }
 
-func consultLibrarianStyleSkill(gi *GlobalInspector) *skills.Skill {
-	return skills.NewSkill("consult_librarian_style").
-		Description("Consult the Librarian about established code style, local patterns, naming, layering, and codebase-specific conventions.").
-		Domain("audit").
-		Keywords("librarian", "style", "pattern", "convention", "codebase").
-		Priority(95).
-		Usage("Use only when direct file inspection leaves a specific unanswered style or pattern question that adjacent repository evidence does not already answer.").
-		Requirement("Provide the concrete style or pattern question, plus the relevant files or context.").
-		Satisfies("Adds codebase-specific evidence about how work should look in this repository, not just in the abstract.").
-		Avoid("Do not rely on your own generic style instincts when the codebase already establishes a stronger local pattern, and do not consult just to reaffirm an obvious local convention.").
-		StringParam("question", "Style or pattern question for the Librarian", true).
-		StringParam("context", "Optional surrounding context", false).
-		ArrayParam("files", "Relevant files or packages", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Question string   `json:"question"`
-				Context  string   `json:"context"`
-				Files    []string `json:"files"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			content, err := gi.consultAgent(ctx, "librarian", buildLibrarianConsultationPrompt(params.Question, params.Context, params.Files), consultationMetadataWithAuditDepth(ctx, map[string]any{
-				"consultation_kind": "librarian_style",
-				"files":             params.Files,
-			}, ""))
-			if err != nil {
-				var pressureErr *agentShared.ConsultationPressureError
-				if errors.As(err, &pressureErr) {
-					return consultationBlockedResult("librarian", pressureErr), nil
-				}
-				return nil, err
-			}
-			return map[string]any{
-				"consulted": true,
-				"target":    "librarian",
-				"depth":     string(effectiveAuditResearchDepth(ctx, "")),
-				"response":  content,
-			}, nil
-		}).
-		Build()
-}
-
-func consultAcademicApproachSkill(gi *GlobalInspector) *skills.Skill {
-	return skills.NewSkill("consult_academic_approach").
-		Description("Consult the Academic about one concrete stronger alternative, correctness tradeoff, performance implication, or whether the architect's approach should be challenged on a specific point.").
-		Domain("audit").
-		Keywords("academic", "alternative", "approach", "performance", "correctness", "tradeoff").
-		Priority(95).
-		Usage("Use only when direct evidence leaves one specific unresolved concern where a stronger alternative or tradeoff analysis could change the verdict. Prefer one focused comparison over a broad second opinion on the whole implementation or plan.").
-		Requirement("Provide the current approach, the concrete concern, and enough context for the Academic to compare alternatives.").
-		Satisfies("Adds principled comparative evidence about whether the current implementation and overall approach are actually the best available fit.").
-		Avoid("Do not ask for a broad re-review of the entire implementation or plan, and do not re-consult just to restate the same concern in different words.").
-		StringParam("question", "Alternative-implementation or tradeoff question", true).
-		StringParam("current_approach", "Current implementation or plan approach being evaluated", false).
-		StringParam("context", "Optional surrounding context", false).
-		EnumParam("depth", "Research depth for the Academic consultation", agentShared.ResearchDepthEnumValues(), false).
-		ArrayParam("files", "Relevant files or packages", "string", false).
-		BestPractice("Ask one concrete challenge question at a time. Re-consult when the audit focus changes, the prior answer exposes a new concern, or the implementation evidence shifts materially.").
-		BestPractice("Default to the branch audit depth. Use `minimal` or `quick` for a fast challenge to a local implementation choice, `standard` for a normal audit-time tradeoff check, `deep` when the verdict hinges on stronger alternatives or deeper correctness/performance reasoning, and `comprehensive` only when the review truly needs research-grade corroboration. Re-evaluate that depth each time the audit question changes.").
-		BestPractice("Do not escalate to `comprehensive` just because the code is large. Escalate when the risk, architectural reach, or decision cost is high enough that broader corroboration could change the verdict.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Question        string   `json:"question"`
-				CurrentApproach string   `json:"current_approach"`
-				Context         string   `json:"context"`
-				Depth           string   `json:"depth"`
-				Files           []string `json:"files"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			depth := effectiveAuditResearchDepth(ctx, params.Depth)
-			content, err := gi.consultAgent(ctx, "academic", buildAcademicConsultationPrompt(params.Question, params.CurrentApproach, params.Context, params.Files), consultationMetadataWithAuditDepth(ctx, map[string]any{
-				"consultation_kind": "academic_approach",
-				"files":             params.Files,
-			}, string(depth)))
-			if err != nil {
-				var pressureErr *agentShared.ConsultationPressureError
-				if errors.As(err, &pressureErr) {
-					return consultationBlockedResult("academic", pressureErr), nil
-				}
-				return nil, err
-			}
-			return map[string]any{
-				"consulted": true,
-				"target":    "academic",
-				"depth":     string(depth),
-				"response":  content,
-			}, nil
-		}).
-		Build()
-}
-
-func consultArchivalistContextSkill(gi *GlobalInspector) *skills.Skill {
-	return skills.NewSkill("consult_archivalist_context").
-		Description("Consult the Archivalist about past failure modes, historical decisions, user preferences, and prior remediation that should shape the audit.").
-		Domain("audit").
-		Keywords("archivalist", "history", "preferences", "failures", "precedent").
-		Priority(95).
-		Usage("Use only when there is a specific reason to believe prior failures, preserved preferences, or earlier remediation might materially change the current verdict.").
-		Requirement("Provide the historical question plus any plan, DAG, task, or file context that will help the Archivalist find the right precedent.").
-		Satisfies("Adds historical and preference-preservation evidence so the global inspector can stop repeating known failure modes.").
-		Avoid("Do not assume the current implementation is acceptable if similar work failed before or if the user has already expressed contrary preferences, but do not consult just because history might exist in the abstract.").
-		StringParam("question", "Historical or precedent question", true).
-		StringParam("context", "Optional surrounding context", false).
-		StringParam("plan_id", "Plan identifier", false).
-		StringParam("dag_id", "DAG identifier", false).
-		StringParam("task_id", "Task identifier", false).
-		ArrayParam("files", "Relevant files or packages", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Question string   `json:"question"`
-				Context  string   `json:"context"`
-				PlanID   string   `json:"plan_id"`
-				DAGID    string   `json:"dag_id"`
-				TaskID   string   `json:"task_id"`
-				Files    []string `json:"files"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			content, err := gi.consultAgent(ctx, "archivalist", buildArchivalistConsultationPrompt(params.Question, params.Context, params.PlanID, params.DAGID, params.TaskID, params.Files), consultationMetadataWithAuditDepth(ctx, map[string]any{
-				"consultation_kind": "archivalist_context",
-				"plan_id":           strings.TrimSpace(params.PlanID),
-				"dag_id":            strings.TrimSpace(params.DAGID),
-				"task_id":           strings.TrimSpace(params.TaskID),
-				"files":             params.Files,
-			}, ""))
-			if err != nil {
-				var pressureErr *agentShared.ConsultationPressureError
-				if errors.As(err, &pressureErr) {
-					return consultationBlockedResult("archivalist", pressureErr), nil
-				}
-				return nil, err
-			}
-			return map[string]any{
-				"consulted": true,
-				"target":    "archivalist",
-				"depth":     string(effectiveAuditResearchDepth(ctx, "")),
-				"response":  content,
-			}, nil
-		}).
-		Build()
-}
+// Phase 2.K / GI-A refactor (docs/PIPELINE_SKILL_REFACTOR.md §10.K.1):
+// consult_librarian_style + consult_academic_approach +
+// consult_archivalist_context + request_architect_research folded into
+// shared consult_peer(target_agent_type=…). The consultAgent helper
+// below stays because the request_architect_research programmatic
+// surface and existing tests exercise its sync bus path; knowledge-
+// agent routing now flows through the fabric-backed consult_peer
+// primitive registered via CrossPipelineSkills.
 
 func (gi *GlobalInspector) consultAgent(ctx context.Context, target, prompt string, metadata map[string]any) (string, error) {
 	prompt = strings.TrimSpace(prompt)
@@ -261,78 +123,6 @@ func consultationBlockedResult(target string, err *agentShared.ConsultationPress
 		result["recovery"] = recovery
 	}
 	return result
-}
-
-func buildLibrarianConsultationPrompt(question, context string, files []string) string {
-	var b strings.Builder
-	b.WriteString("Global inspector style consultation.\n")
-	b.WriteString("Focus only on the specific repository-specific style, naming, layering, or implementation-pattern question needed for the current audit verdict.\n")
-	fmt.Fprintf(&b, "Question: %s\n", strings.TrimSpace(question))
-	if trimmed := strings.TrimSpace(context); trimmed != "" {
-		fmt.Fprintf(&b, "Context: %s\n", trimmed)
-	}
-	if len(files) > 0 {
-		b.WriteString("Relevant files:\n")
-		for _, file := range files {
-			if trimmed := strings.TrimSpace(file); trimmed != "" {
-				fmt.Fprintf(&b, "- %s\n", trimmed)
-			}
-		}
-	}
-	b.WriteString("Return the concrete local conventions, precedents, and any style or pattern mismatches the global inspector should enforce for this exact question.")
-	return b.String()
-}
-
-func buildAcademicConsultationPrompt(question, currentApproach, context string, files []string) string {
-	var b strings.Builder
-	b.WriteString("Global inspector focused approach consultation.\n")
-	b.WriteString("Evaluate the specific concern below. Compare the current approach against the strongest realistic alternative only if that comparison could change the audit verdict.\n")
-	fmt.Fprintf(&b, "Question: %s\n", strings.TrimSpace(question))
-	if trimmed := strings.TrimSpace(currentApproach); trimmed != "" {
-		fmt.Fprintf(&b, "Current approach: %s\n", trimmed)
-	}
-	if trimmed := strings.TrimSpace(context); trimmed != "" {
-		fmt.Fprintf(&b, "Context: %s\n", trimmed)
-	}
-	if len(files) > 0 {
-		b.WriteString("Relevant files:\n")
-		for _, file := range files {
-			if trimmed := strings.TrimSpace(file); trimmed != "" {
-				fmt.Fprintf(&b, "- %s\n", trimmed)
-			}
-		}
-	}
-	b.WriteString("Return whether the concern is real, whether a materially stronger alternative exists, and which tradeoffs matter most for this exact audit question.")
-	return b.String()
-}
-
-func buildArchivalistConsultationPrompt(question, context, planID, dagID, taskID string, files []string) string {
-	var b strings.Builder
-	b.WriteString("Global inspector historical-context consultation.\n")
-	b.WriteString("Look only for prior failures, prior user preferences, earlier remediation, and relevant precedent that materially bear on this exact audit question.\n")
-	fmt.Fprintf(&b, "Question: %s\n", strings.TrimSpace(question))
-	if trimmed := strings.TrimSpace(planID); trimmed != "" {
-		fmt.Fprintf(&b, "Plan ID: %s\n", trimmed)
-	}
-	if trimmed := strings.TrimSpace(dagID); trimmed != "" {
-		fmt.Fprintf(&b, "DAG ID: %s\n", trimmed)
-	}
-	if trimmed := strings.TrimSpace(taskID); trimmed != "" {
-		fmt.Fprintf(&b, "Task ID: %s\n", trimmed)
-	}
-	if trimmed := strings.TrimSpace(context); trimmed != "" {
-		fmt.Fprintf(&b, "Context: %s\n", trimmed)
-	}
-	if len(files) > 0 {
-		b.WriteString("Relevant files:\n")
-		for _, file := range files {
-			if trimmed := strings.TrimSpace(file); trimmed != "" {
-				fmt.Fprintf(&b, "- %s\n", trimmed)
-			}
-		}
-	}
-	b.WriteString("Return the most relevant prior failures, preserved user preferences, and historical constraints the global inspector should enforce for this exact question.")
-	return b.String()
 }
 
 func extractConsultationResponse(msg *guide.Message) (string, error) {

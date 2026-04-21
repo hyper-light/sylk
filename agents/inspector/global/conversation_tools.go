@@ -8,10 +8,10 @@ import "github.com/adalundhe/sylk/core/providers"
 func conversationAllowedSkills() []string {
 	return []string{
 		"search_skills",
-		"read_file",
-		"glob",
-		"grep",
-		"escalate_findings",
+		// read_file / glob / grep collapsed into workspace_read
+		// (op=read|glob|grep). workspace_read is read-only and
+		// conversation-safe.
+		"workspace_read",
 		"reroute_request",
 	}
 }

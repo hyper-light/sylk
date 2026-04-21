@@ -9,12 +9,8 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
-func runCommandSkill(d *Designer) *skills.Skill {
-	return agentshared.NewRunCommandSkill(designerCommandSkillConfig(d))
-}
-
-func runShellScriptSkill(d *Designer) *skills.Skill {
-	return agentshared.NewRunShellScriptSkill(designerCommandSkillConfig(d))
+func bashSkill(d *Designer) *skills.Skill {
+	return agentshared.NewBashSkill(designerCommandSkillConfig(d))
 }
 
 func designerCommandSkillConfig(d *Designer) agentshared.CommandSkillConfig {

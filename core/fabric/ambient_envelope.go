@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/activity/lenses"
+	"github.com/adalundhe/sylk/core/fabriclog"
 )
 
 // AmbientEnvelopeConfig describes the per-agent context the
@@ -60,25 +61,71 @@ func AppendAmbientContext(ctx context.Context, cfg AmbientEnvelopeConfig, result
 	if agentID == "" {
 		return result
 	}
+	agentType := strings.TrimSpace(cfg.AgentType())
+
+	pipelineID := ""
+	if cfg.PipelineID != nil {
+		pipelineID = strings.TrimSpace(cfg.PipelineID())
+	}
+
+	// Observability: emit a fabric_ambient record regardless of
+	// whether the envelope ends up attached. When the rate limiter
+	// throttles, the record is still emitted with RateLimited=true
+	// so downstream analysis sees the throttle shape.
+	logger := fabriclog.Default()
+	reader := fabriclog.AgentRef{
+		AgentID:    agentID,
+		AgentType:  agentType,
+		PipelineID: pipelineID,
+	}
+	// Attach reader identity + lens alias so any Source reads the
+	// ambient lens performs are attributed to this agent.
+	attributedCtx := fabriclog.WithReader(ctx, reader)
+	attributedCtx = fabriclog.WithLensAlias(attributedCtx, "AmbientFor")
+
 	if !ambientRateLimit(agentID) {
+		if logger != nil {
+			logger.RecordAmbient(attributedCtx, &fabriclog.AmbientBody{
+				Scope:       strings.TrimSpace(scopeFromCfg(cfg)),
+				RateLimited: true,
+			})
+		}
 		return result
 	}
 
-	scope := ""
-	if cfg.ScopeHint != nil {
-		scope = strings.TrimSpace(cfg.ScopeHint())
-	}
+	scope := strings.TrimSpace(scopeFromCfg(cfg))
 
-	envelope, err := lenses.AmbientFor(ctx, src, lenses.AmbientQuery{
+	start := time.Now()
+	envelope, err := lenses.AmbientFor(attributedCtx, src, lenses.AmbientQuery{
 		SessionID: activity.SessionID(strings.TrimSpace(cfg.SessionID())),
 		AgentID:   agentID,
-		AgentType: strings.TrimSpace(cfg.AgentType()),
+		AgentType: agentType,
 		Scope:     scope,
 	})
+	elapsed := time.Since(start)
 	if err != nil {
+		if logger != nil {
+			logger.RecordAmbient(attributedCtx, &fabriclog.AmbientBody{
+				Scope:         scope,
+				ElapsedMicros: elapsed.Microseconds(),
+			})
+		}
 		return result
 	}
 	rendered := envelope.Render()
+
+	if logger != nil {
+		body := &fabriclog.AmbientBody{
+			Scope:         scope,
+			ActivityIDs:   collectEnvelopeActivityIDs(envelope),
+			ConflictCount: len(envelope.InboundDisputes) + len(envelope.OutboundPending),
+			AdvisoryCount: len(envelope.Advisories),
+			Bytes:         len(rendered),
+			ElapsedMicros: elapsed.Microseconds(),
+		}
+		logger.RecordAmbient(attributedCtx, body)
+	}
+
 	if rendered == "" {
 		return result
 	}
@@ -86,6 +133,55 @@ func AppendAmbientContext(ctx context.Context, cfg AmbientEnvelopeConfig, result
 		return rendered
 	}
 	return result + "\n\n" + rendered
+}
+
+// scopeFromCfg extracts the scope hint safely (cfg.ScopeHint is
+// optional and may be nil).
+func scopeFromCfg(cfg AmbientEnvelopeConfig) string {
+	if cfg.ScopeHint == nil {
+		return ""
+	}
+	return cfg.ScopeHint()
+}
+
+// collectEnvelopeActivityIDs flattens the envelope's categorized
+// activity slices into a single deduplicated ID list. Order is
+// stable: in-flight → commitments → disputes → consults → outbound →
+// advisories, matching the render ordering so log entries line up
+// with what the LLM saw.
+func collectEnvelopeActivityIDs(e lenses.AmbientEnvelope) []string {
+	total := len(e.InFlightActivities) +
+		len(e.RecentPeerCommitments) +
+		len(e.InboundDisputes) +
+		len(e.InboundConsults) +
+		len(e.OutboundPending) +
+		len(e.Advisories)
+	if total == 0 {
+		return nil
+	}
+	ids := make([]string, 0, total)
+	seen := make(map[string]struct{}, total)
+	for _, src := range [][]activity.AgentActivity{
+		e.InFlightActivities,
+		e.RecentPeerCommitments,
+		e.InboundDisputes,
+		e.InboundConsults,
+		e.OutboundPending,
+		e.Advisories,
+	} {
+		for _, a := range src {
+			id := string(a.ID)
+			if id == "" {
+				continue
+			}
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // ─── Rate limiting ────────────────────────────────────────────────────

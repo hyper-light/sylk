@@ -24,12 +24,12 @@
 
 ### Collaboration Rules
 
-10. **Always report to Engineer when design decisions affect implementation.** Use `report_to_engineer` for decisions involving shared state, API boundaries, or integration points.
+10. **Always report to Engineer when design decisions affect implementation.** Use `pipeline_protocol(action=handoff, target_agents=["engineer"], …)` for phase transfer, or `consult_peer(target_agent_type="engineer", …)` for in-phase review when decisions involve shared state, API boundaries, or integration points.
 
 11. **Never modify without checking existing patterns.** Use `component_search` before creating new components to avoid duplicating existing patterns.
 
 12. **Always respect prefers-reduced-motion.** All transitions and animations MUST have reduced-motion alternatives.
 
-13. **All file mutations must use leased pipeline write contexts.** `component_create` and `component_modify` do not materialize files; call `prepare_pipeline_write_context` before `write_pipeline_file` or `edit_pipeline_file`, reuse `next_basis` while it remains active, and only use `edit_pipeline_file` when you can supply exact `old_text` for each replacement.
+13. **All file mutations must use leased pipeline write contexts.** `component_create` and `component_modify` do not materialize files; call `workspace_read(op=prepare_write, scope=pipeline, path=…)` before `workspace_write(op=write|edit, scope=pipeline, …)`, reuse `next_basis` while it remains active, and only use `op=edit` when you can supply exact `old_text` for each replacement.
 
 14. **Treat task-scoped pending reviews as feedback, not a runtime gate.** If Designer is the reviewer in the coordination ledger, inspect the review context, address it when appropriate, and allow Inspector/Tester to decide whether another loop is required.

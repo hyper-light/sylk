@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -45,7 +46,29 @@ func discoverProjectToolsSkill(e *Engineer) *skills.Skill {
 			if root == "" {
 				root = "."
 			}
-			return scanProjectTools(root)
+			result, err := scanProjectTools(root)
+			if err != nil || result == nil {
+				return result, err
+			}
+			// Phase 4 refactor: publish detected tools as hints so
+			// peers skip rediscovery. Emit one hint per detected tool
+			// keyed by its category domain.
+			if detected, ok := result["detected"].([]map[string]string); ok {
+				for _, tool := range detected {
+					shared.AutoPublishHint(ctx, shared.AutoPublishInput{
+						SessionID:        e.config.SessionID,
+						AuthorAgentID:    e.id,
+						AuthorAgentType:  "engineer",
+						AuthorPipelineID: e.pipelineID,
+						TriggerSkill:     "discover_project_tools",
+						Domain:           tool["category"],
+						Value:            tool["tool"],
+						Scope:            root,
+						Evidence:         []string{"detected via " + tool["file"]},
+					})
+				}
+			}
+			return result, err
 		}).
 		Build()
 }
@@ -75,7 +98,34 @@ func discoverCodePatternsSkill(e *Engineer) *skills.Skill {
 			if root == "" {
 				root = "."
 			}
-			return scanCodePatterns(root, params.Language)
+			result, err := scanCodePatterns(root, params.Language)
+			if err != nil || result == nil {
+				return result, err
+			}
+			// Phase 4 refactor: publish discovered conventions as
+			// hints so downstream work (designer components, tester
+			// test shape) can adopt them without rediscovery.
+			publishPatternHints := func(domain string, values []string) {
+				for _, v := range values {
+					shared.AutoPublishHint(ctx, shared.AutoPublishInput{
+						SessionID:        e.config.SessionID,
+						AuthorAgentID:    e.id,
+						AuthorAgentType:  "engineer",
+						AuthorPipelineID: e.pipelineID,
+						TriggerSkill:     "discover_code_patterns",
+						Domain:           domain,
+						Value:            v,
+						Scope:            root,
+					})
+				}
+			}
+			if patterns, ok := result["error_handling"].([]string); ok {
+				publishPatternHints("error_handling_convention", patterns)
+			}
+			if patterns, ok := result["test_patterns"].([]string); ok {
+				publishPatternHints("test_convention", patterns)
+			}
+			return result, err
 		}).
 		Build()
 }

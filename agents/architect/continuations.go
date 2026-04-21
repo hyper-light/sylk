@@ -645,6 +645,20 @@ func (a *Architect) handlePlanHandoffContinuation(
 		if summary == "" {
 			summary = summarizeAutoHandoffResponse(msg)
 		}
+		a.logWarn("handlePlanHandoffContinuation: orchestrator reported failure",
+			"plan_id", plan.ID,
+			"session_id", plan.SessionID,
+			"correlation_id", record.ResponseCorrelationID,
+			"resp_success", resp.Success,
+			"handoff_success", isHandoffSuccess(msg),
+			"summary", summary)
+		a.logTrace("architect_plan_handoff_continuation_failed", "warn", plan.SessionID, record.ResponseCorrelationID, agentlog.EventError, map[string]any{
+			"plan_id":         plan.ID,
+			"resp_success":    resp.Success,
+			"handoff_success": isHandoffSuccess(msg),
+			"summary":         summary,
+			"source":          "fresh_handoff_continuation",
+		})
 		a.recoverPlanHandoffForRetry(plan, record.ResponseCorrelationID, summary)
 		a.publishNotificationPush("I couldn't dispatch the plan to the orchestrator: " + summary)
 		return nil
@@ -654,6 +668,19 @@ func (a *Architect) handlePlanHandoffContinuation(
 	if strings.TrimSpace(summary) != "" {
 		message = fmt.Sprintf("Plan dispatched to the orchestrator. %s", summary)
 	}
+	a.logInfo("handlePlanHandoffContinuation: FRESH orchestrator ack received; proceeding to finalize",
+		"plan_id", plan.ID,
+		"session_id", plan.SessionID,
+		"correlation_id", record.ResponseCorrelationID,
+		"notification_message", message,
+		"summary", summary,
+		"source", "fresh_handoff_continuation")
+	a.logTrace("architect_plan_handoff_continuation_ok", "info", plan.SessionID, record.ResponseCorrelationID, agentlog.EventTaskDispatched, map[string]any{
+		"plan_id":              plan.ID,
+		"notification_message": message,
+		"summary":              summary,
+		"source":               "fresh_handoff_continuation",
+	})
 	return a.finalizePlanHandoffExecution(
 		plan,
 		record,

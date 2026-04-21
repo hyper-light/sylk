@@ -82,8 +82,8 @@ func TestBuildWorkspaceViewContext_ExplainsBrokeredCommandAccessToVFS(t *testing
 
 	for _, needle := range []string{
 		"Default read/write tools for this agent operate on the `pipeline` view unless a tool explicitly says otherwise.",
-		"`run_command` and `run_shell_script` execute against that same layered workspace view",
-		"they can read VFS-backed files before those changes are committed to disk",
+		"The brokered `bash` execution tool runs against that same layered workspace view",
+		"scripts can read VFS-backed files before those changes are committed to disk",
 		"reconcile that path before recreating work or issuing another validation loop",
 	} {
 		if !strings.Contains(got, needle) {

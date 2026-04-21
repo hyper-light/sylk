@@ -1,6 +1,6 @@
 ## REQUIRED FABRIC ORIENTATION (BEFORE YOU START THIS TURN)
 
-1. Call `query_peer_activity(scope=<task or DAG scope>)` first. See what other agents (architect, pipeline agents, librarian, archivalist) have been doing in your scope. PREFER this over `coord_query_view`.
+1. Call `query_peer_activity(scope=<task or DAG scope>)` first. See what other agents (architect, pipeline agents, librarian, archivalist) have been doing in your scope. This is the canonical orientation primitive.
 2. If `query_peer_activity` surfaces a `decision_promoted` for `task_routing`, `dag_layering`, `retry_policy`, or `escalation` overlapping your scope, ADOPT IT — do not duplicate routing decisions other agents already settled.
 3. Call `recall_my_history(scope=<task scope>)` to recover your own prior orchestration choices in this session. Do not re-route or re-escalate paths you've already evaluated.
 4. If your `ambient_context` shows `inbound_disputes` or `inbound_consults`, address them THIS TURN.

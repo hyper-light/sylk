@@ -1026,17 +1026,172 @@ func TimedToolCall(
 	}
 	session.Start(call, startedAt, nil)
 
+	// Structured tool-call record (Phase 0): decoupled from the session
+	// emission. The session path feeds the UI; the recorder feeds the
+	// per-day JSONL stream that sylk trace reads. Both are fed from the
+	// same pair of call sites so they stay in lockstep with lifecycle.
+	callStart := time.Now()
+	if !startedAt.IsZero() {
+		callStart = startedAt
+	}
+	emitToolStartRecord(ctx, agentID, call, callStart)
+
 	executeReturned := false
 	defer func() {
 		if !executeReturned && err == nil {
 			err = fmt.Errorf("tool %q unwound abnormally without returning", call.Name)
 		}
 		session.Complete(call, result, err)
+		emitToolCompleteRecord(ctx, agentID, call, result, err, time.Since(callStart))
 	}()
 
 	result, err = execute()
 	executeReturned = true
 	return result, err
+}
+
+// emitToolStartRecord writes a Phase 0 record to the structured tool
+// stream when a ToolRecorder is reachable via the EventLogger bound
+// to ctx. Nil-safe at every step — an agent running without an
+// EventLogger or with the tool stream disabled silently skips.
+func emitToolStartRecord(ctx context.Context, agentID string, call providers.ToolCall, startedAt time.Time) {
+	lm := LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	recorder := lm.EventLogger.ToolRecorder()
+	if recorder == nil {
+		return
+	}
+	active, _ := ActiveToolCallFromContext(ctx)
+	record := agentlog.ToolStartRecord{
+		ToolCallKey:   toolCallKeyForRecord(active, call),
+		CorrelationID: lm.CorrID,
+		LLMCallID:     LLMCallIDFromContext(ctx),
+		AgentID:       lm.AgentID,
+		SessionID:     lm.SessionID,
+		ToolName:      toolNameForRecord(active, call),
+		Args:          agentlog.MarshalToolArgs(toolArgsForRecord(active, call)),
+		InterAgent:    interAgentRefForRecord(active),
+		StartedAt:     startedAt,
+	}
+	if record.AgentID == "" {
+		record.AgentID = agentID
+	}
+	_ = recorder.Start(record)
+}
+
+// emitToolCompleteRecord mirrors emitToolStartRecord on the Phase 1
+// side. duration is the wall-clock elapsed between Start and return;
+// result/err are forwarded verbatim (redaction happens at write
+// time through the recorder's stream writer).
+func emitToolCompleteRecord(ctx context.Context, agentID string, call providers.ToolCall, result string, err error, duration time.Duration) {
+	lm := LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	recorder := lm.EventLogger.ToolRecorder()
+	if recorder == nil {
+		return
+	}
+	active, _ := ActiveToolCallFromContext(ctx)
+
+	output := agentlog.MarshalToolArgs(asRawOutput(result))
+	output, truncatedFrom := agentlog.TruncateOutput(output, defaultToolOutputCap)
+
+	success := err == nil
+	errStr := ""
+	if err != nil {
+		errStr = err.Error()
+	}
+
+	record := agentlog.ToolCompleteRecord{
+		ToolCallKey:         toolCallKeyForRecord(active, call),
+		CorrelationID:       lm.CorrID,
+		LLMCallID:           LLMCallIDFromContext(ctx),
+		AgentID:             lm.AgentID,
+		SessionID:           lm.SessionID,
+		ToolName:            toolNameForRecord(active, call),
+		Output:              output,
+		OutputTruncatedFrom: truncatedFrom,
+		DurationMs:          duration.Milliseconds(),
+		Success:             success,
+		Error:               errStr,
+		InterAgent:          interAgentRefForRecord(active),
+	}
+	if record.AgentID == "" {
+		record.AgentID = agentID
+	}
+	_ = recorder.Complete(record)
+}
+
+const defaultToolOutputCap = 64 * 1024
+
+// toolCallKeyForRecord prefers the active-tool-call context's key
+// (stamped by the provider adapter at tool emit time) and falls back
+// to the call's own ID if the context is unset.
+func toolCallKeyForRecord(active ActiveToolCallContext, call providers.ToolCall) string {
+	if strings.TrimSpace(active.ToolCallKey) != "" {
+		return active.ToolCallKey
+	}
+	return strings.TrimSpace(call.ID)
+}
+
+func toolNameForRecord(active ActiveToolCallContext, call providers.ToolCall) string {
+	if strings.TrimSpace(active.ToolName) != "" {
+		return active.ToolName
+	}
+	return call.Name
+}
+
+// toolArgsForRecord returns a JSON-serializable value for the tool's
+// arguments. Prefers the pretty-printed FullArgs on ActiveToolCall
+// context (already validated upstream); falls back to parsing the
+// call's raw argument string.
+func toolArgsForRecord(active ActiveToolCallContext, call providers.ToolCall) any {
+	raw := strings.TrimSpace(active.FullArgs)
+	if raw == "" {
+		raw = strings.TrimSpace(call.Arguments)
+	}
+	if raw == "" {
+		return nil
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+		return parsed
+	}
+	return raw
+}
+
+// interAgentRefForRecord lifts the inter-agent metadata from the
+// active tool call context into the record-shape expected by the
+// structured tool stream. Returns nil when no inter-agent info is
+// attached (the common case for plain read/write/run tool calls).
+func interAgentRefForRecord(active ActiveToolCallContext) *agentlog.ToolInterAgentRef {
+	if active.InterAgent == nil {
+		return nil
+	}
+	return &agentlog.ToolInterAgentRef{
+		Kind:       active.InterAgent.Kind,
+		AgentTypes: append([]string(nil), active.InterAgent.AgentTypes...),
+		ThreadKey:  active.InterAgent.ThreadKey,
+		Status:     active.InterAgent.Status,
+	}
+}
+
+// asRawOutput returns a value suitable for JSON marshaling. A JSON
+// string input is returned as a parsed value; a non-JSON input is
+// wrapped in a single-string object so the stream stays valid JSONL.
+func asRawOutput(result string) any {
+	trimmed := strings.TrimSpace(result)
+	if trimmed == "" {
+		return nil
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err == nil {
+		return parsed
+	}
+	return trimmed
 }
 
 // CompleteProviderNativeToolCall emits a terminal tool-call event for a

@@ -292,13 +292,15 @@ func TestPipelineTesterCreateTestsDeterministically_EmitsWriteToolCalls(t *testi
 	if err := pt.createTestsDeterministically(ctx, req, req.Files); err != nil {
 		t.Fatalf("createTestsDeterministically: %v", err)
 	}
-	for _, want := range []string{"detect_test_harness", "analyze_risk", "plan_tests"} {
+	for _, want := range []string{"test_harness", "analyze_risk", "plan_tests"} {
 		if !containsName(toolNames, want) {
 			t.Fatalf("expected %s tool call, got %v", want, toolNames)
 		}
 	}
-	if !containsName(toolNames, "prepare_pipeline_write_context") {
-		t.Fatalf("expected prepare_pipeline_write_context tool call, got %v", toolNames)
+	// prepare_write_context folded into workspace_read(op=prepare_write)
+	// — the tool name emitted is now workspace_read.
+	if !containsName(toolNames, "workspace_read") {
+		t.Fatalf("expected workspace_read(op=prepare_write) tool call, got %v", toolNames)
 	}
 	if !containsName(toolNames, "write_test") {
 		t.Fatalf("expected write_test tool call, got %v", toolNames)
@@ -306,22 +308,22 @@ func TestPipelineTesterCreateTestsDeterministically_EmitsWriteToolCalls(t *testi
 }
 
 func TestPipelineTesterVisibleSkills_IncludeHarnessAndReportingTools(t *testing.T) {
+	// workspace_read absorbs the write preflight (op=prepare_write)
+	// alongside workspace_write; prepare_write_context is no longer a
+	// standalone skill in the LLM catalog.
 	for _, want := range []string{
-		"detect_test_harness",
-		"prepare_test_harness",
-		"research_test_tool_install",
-		"install_test_tooling",
-		"prepare_pipeline_write_context",
-		"write_pipeline_file",
-		"list_pipeline_changes",
+		"test_harness",
+		// Phase 2.K / GT-4 + GI-5: collapsed into dependency(action=…, category=test).
+		"dependency",
+		"workspace_read",
+		"workspace_write",
 		"write_test",
 		"run_test_suite",
-		"run_command",
-		"run_shell_script",
-		"handoff_next",
-		"validate_work",
-		"process_validation",
-		"finalize_pipeline",
+		"bash",
+		// challenge_agent / handoff_next / validate_work /
+		// process_validation / finalize_pipeline collapsed into
+		// pipeline_protocol(action=…) on the LLM-visible list.
+		"pipeline_protocol",
 	} {
 		if !containsName(pipelineTesterVisibleSkillNames(), want) {
 			t.Fatalf("visible skills missing %q", want)
@@ -669,8 +671,9 @@ func TestPipelineTesterPrepareHarnessRequiresWriteContexts(t *testing.T) {
 	}))
 	pt.pipelineID = "task-1"
 
-	skill := prepareTestHarnessSkill(pt)
+	skill := testHarnessSkill(pt)
 	input, _ := json.Marshal(map[string]any{
+		"action":      "prepare",
 		"files":       []string{"app/service.py"},
 		"worker_type": "engineer",
 	})
@@ -678,8 +681,8 @@ func TestPipelineTesterPrepareHarnessRequiresWriteContexts(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected write context error")
 	}
-	if !strings.Contains(err.Error(), "prepare_pipeline_write_context") {
-		t.Fatalf("error = %v, want prepare_pipeline_write_context guidance", err)
+	if !strings.Contains(err.Error(), "workspace_read(op=prepare_write)") {
+		t.Fatalf("error = %v, want workspace_read(op=prepare_write) guidance", err)
 	}
 }
 

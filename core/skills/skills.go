@@ -68,6 +68,16 @@ type Skill struct {
 	// Nil for skills that have no protocol-state side effects (the
 	// common case — ordinary read/search/compute skills).
 	Contract *SkillContract `json:"contract,omitempty"`
+
+	// ActionRequirements is the action→required-fields map populated by
+	// Builder.ActionRequires. Used by façade skills whose underlying
+	// delegates have per-action required fields that the JSON Schema
+	// framework cannot express structurally (no if/then/else).
+	// ValidateActionRequirements consults this map before a façade
+	// handler dispatches to its delegate, returning a schema-echoing
+	// error that tells the LLM exactly which fields are required for the
+	// chosen action and where in the tool definition to look.
+	ActionRequirements map[string][]string `json:"action_requirements,omitempty"`
 }
 
 // SkillContract declares the protocol-state artifacts a skill produces
@@ -470,6 +480,192 @@ func (b *Builder) RequireNestedFields(paramName string, fields ...string) *Build
 	return b
 }
 
+// InheritSchemaFrom copies parameter definitions from a delegate skill
+// onto this builder's skill, prefixing each inherited parameter's
+// description with an action-scope tag. Used by façade skills that
+// dispatch to multiple delegate handlers based on an action
+// discriminator: the façade's schema automatically tracks each delegate's
+// parameter shape, eliminating drift between façade and delegate.
+//
+// When the same parameter name exists on multiple delegates (e.g.
+// `summary` shared across validate and process_validation), the action
+// scopes merge — the description accumulates actions into a single
+// `[action=X|Y]` prefix without duplicating the rest. The first inherited
+// copy wins for structural fields (Type, Enum, Items, nested Properties);
+// subsequent inheritances only extend the scope tag. Pass the canonical
+// parameter shape first if you have a preference.
+//
+// Delegate-required fields are NOT promoted to the façade's top-level
+// `required` array: the JSON Schema framework cannot express "required
+// when action=X" structurally. Use PreDispatchValidator / ActionRequires
+// to enforce action-scoped required fields at handler boundary.
+func (b *Builder) InheritSchemaFrom(delegate *Skill, actionScope string) *Builder {
+	if b == nil || delegate == nil || delegate.InputSchema == nil {
+		return b
+	}
+	scope := strings.TrimSpace(actionScope)
+	if scope == "" {
+		return b
+	}
+	if b.skill.InputSchema == nil {
+		b.skill.InputSchema = &InputSchema{
+			Type:       "object",
+			Properties: make(map[string]*Property),
+		}
+	}
+	if b.skill.InputSchema.Properties == nil {
+		b.skill.InputSchema.Properties = make(map[string]*Property)
+	}
+	for name, prop := range delegate.InputSchema.Properties {
+		if prop == nil {
+			continue
+		}
+		if existing, ok := b.skill.InputSchema.Properties[name]; ok && existing != nil {
+			existing.Description = addActionScopeTag(existing.Description, scope)
+			continue
+		}
+		clone := clonePropertyForInheritance(prop)
+		clone.Description = addActionScopeTag(stripActionScopeTag(clone.Description), scope)
+		b.skill.InputSchema.Properties[name] = clone
+	}
+	return b
+}
+
+// clonePropertyForInheritance returns a deep copy of a Property so the
+// inheriting builder cannot mutate the delegate's schema in place. Nested
+// Items, Properties, Enum, and Required slices are all duplicated.
+func clonePropertyForInheritance(src *Property) *Property {
+	if src == nil {
+		return nil
+	}
+	dst := &Property{
+		Type:        src.Type,
+		Description: src.Description,
+		Default:     src.Default,
+	}
+	if len(src.Enum) > 0 {
+		dst.Enum = append([]string(nil), src.Enum...)
+	}
+	if src.Items != nil {
+		dst.Items = clonePropertyForInheritance(src.Items)
+	}
+	if len(src.Properties) > 0 {
+		dst.Properties = make(map[string]*Property, len(src.Properties))
+		for k, v := range src.Properties {
+			dst.Properties[k] = clonePropertyForInheritance(v)
+		}
+	}
+	if len(src.Required) > 0 {
+		dst.Required = append([]string(nil), src.Required...)
+	}
+	return dst
+}
+
+// actionScopeTagPrefix / actionScopeTagSuffix frame the tag so it can be
+// parsed back out of a description without regexp. The convention is:
+// `[action=X|Y|Z] rest of description`.
+const (
+	actionScopeTagPrefix = "[action="
+	actionScopeTagSuffix = "] "
+)
+
+// addActionScopeTag inserts or extends the `[action=...]` prefix on a
+// description. If the description already starts with a scope tag, the
+// new action is appended to it (deduplicated, pipe-separated). Otherwise
+// the tag is prepended.
+func addActionScopeTag(description, action string) string {
+	action = strings.TrimSpace(action)
+	if action == "" {
+		return description
+	}
+	existing, rest := splitActionScopeTag(description)
+	merged := mergeActionList(existing, action)
+	if rest == "" {
+		return actionScopeTagPrefix + merged + actionScopeTagSuffix[:1] + actionScopeTagSuffix[1:]
+	}
+	return actionScopeTagPrefix + merged + actionScopeTagSuffix + rest
+}
+
+// stripActionScopeTag removes any leading `[action=...] ` prefix.
+func stripActionScopeTag(description string) string {
+	_, rest := splitActionScopeTag(description)
+	return rest
+}
+
+// splitActionScopeTag splits a description into (actions, rest) where
+// `actions` is the pipe-separated action list from the tag (empty if no
+// tag present) and `rest` is the unprefixed description body.
+func splitActionScopeTag(description string) (string, string) {
+	if !strings.HasPrefix(description, actionScopeTagPrefix) {
+		return "", description
+	}
+	remainder := description[len(actionScopeTagPrefix):]
+	closeIdx := strings.Index(remainder, actionScopeTagSuffix)
+	if closeIdx < 0 {
+		// Tag open but no terminator — treat as untagged.
+		return "", description
+	}
+	actions := remainder[:closeIdx]
+	rest := remainder[closeIdx+len(actionScopeTagSuffix):]
+	return actions, rest
+}
+
+// mergeActionList adds a new action to a pipe-separated list, preserving
+// the existing order and dropping duplicates.
+func mergeActionList(existing, add string) string {
+	add = strings.TrimSpace(add)
+	if existing == "" {
+		return add
+	}
+	parts := strings.Split(existing, "|")
+	for _, p := range parts {
+		if strings.TrimSpace(p) == add {
+			return existing
+		}
+	}
+	parts = append(parts, add)
+	return strings.Join(parts, "|")
+}
+
+// ActionRequires declares that the named parameters are required when
+// the façade is invoked with the given action. The skills framework has
+// no native support for conditional required fields in JSON Schema, so
+// this metadata drives the pre-dispatch validator attached via
+// DispatchByAction: the façade rejects calls that omit the fields with
+// a schema-echoing error before the delegate handler sees the input.
+//
+// Callable repeatedly — each call appends to the per-action set.
+func (b *Builder) ActionRequires(action string, fields ...string) *Builder {
+	if b == nil {
+		return b
+	}
+	action = strings.TrimSpace(action)
+	if action == "" || len(fields) == 0 {
+		return b
+	}
+	if b.skill.ActionRequirements == nil {
+		b.skill.ActionRequirements = make(map[string][]string)
+	}
+	existing := b.skill.ActionRequirements[action]
+	seen := make(map[string]struct{}, len(existing)+len(fields))
+	for _, f := range existing {
+		seen[f] = struct{}{}
+	}
+	for _, f := range fields {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		if _, dup := seen[f]; dup {
+			continue
+		}
+		seen[f] = struct{}{}
+		existing = append(existing, f)
+	}
+	b.skill.ActionRequirements[action] = existing
+	return b
+}
+
 // Handler sets the skill handler
 func (b *Builder) Handler(h Handler) *Builder {
 	b.skill.Handler = h
@@ -486,6 +682,134 @@ func (b *Builder) ProviderTool(tool ProviderTool) *Builder {
 // Build returns the constructed skill
 func (b *Builder) Build() *Skill {
 	return b.skill
+}
+
+// ValidateActionRequirements checks that the raw input JSON contains every
+// field listed in the skill's ActionRequirements map for the given action.
+// Returns nil when all required fields for the action are present (or when
+// no requirements are declared). Returns a schema-echoing error otherwise
+// whose message includes the action, the missing fields, and the exact
+// Property definitions the façade exposes for those fields — so the LLM
+// sees the expected shape in the error, not just the field name.
+//
+// Usage pattern inside a façade handler:
+//
+//	if err := skill.ValidateActionRequirements(action, input); err != nil {
+//	    return nil, err
+//	}
+//	return delegate.Handler(ctx, input)
+func (s *Skill) ValidateActionRequirements(action string, input json.RawMessage) error {
+	if s == nil {
+		return nil
+	}
+	action = strings.TrimSpace(action)
+	if action == "" {
+		return nil
+	}
+	required := s.ActionRequirements[action]
+	if len(required) == 0 {
+		return nil
+	}
+	provided := map[string]json.RawMessage{}
+	if len(input) > 0 {
+		if err := json.Unmarshal(input, &provided); err != nil {
+			return fmt.Errorf("invalid parameters: %w", err)
+		}
+	}
+	var missing []string
+	for _, field := range required {
+		raw, ok := provided[field]
+		if !ok || isJSONEmpty(raw) {
+			missing = append(missing, field)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s", s.formatActionRequirementsError(action, missing))
+}
+
+// formatActionRequirementsError builds a schema-echoing error message for
+// the given action + missing-fields set. For each missing field it
+// includes the Property definition (type, enum, items, nested required)
+// so the LLM can see the exact shape it should pass on retry.
+func (s *Skill) formatActionRequirementsError(action string, missing []string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "tool %q (action=%s): missing required field(s): %s", s.Name, action, strings.Join(missing, ", "))
+	if s.InputSchema == nil || len(s.InputSchema.Properties) == 0 {
+		return sb.String()
+	}
+	sb.WriteString(". Expected shape for this action:")
+	for _, field := range missing {
+		prop := s.InputSchema.Properties[field]
+		if prop == nil {
+			fmt.Fprintf(&sb, "\n  - %s: <field is declared required for action=%s but has no schema on the façade; this is a wiring bug>", field, action)
+			continue
+		}
+		fmt.Fprintf(&sb, "\n  - %s: %s", field, describePropertyForError(prop))
+	}
+	return sb.String()
+}
+
+// describePropertyForError renders a Property into a compact shape
+// description suitable for an error message. Focuses on the structural
+// spine (type, enum, item type, required nested fields) rather than
+// recapitulating the full description prose.
+func describePropertyForError(prop *Property) string {
+	if prop == nil {
+		return "<nil>"
+	}
+	var sb strings.Builder
+	sb.WriteString(prop.Type)
+	switch prop.Type {
+	case "array":
+		if prop.Items != nil {
+			sb.WriteString(" of ")
+			sb.WriteString(describePropertyForError(prop.Items))
+		}
+	case "object":
+		if len(prop.Properties) > 0 {
+			sb.WriteString(" {")
+			first := true
+			requiredSet := make(map[string]struct{}, len(prop.Required))
+			for _, r := range prop.Required {
+				requiredSet[r] = struct{}{}
+			}
+			for name, sub := range prop.Properties {
+				if !first {
+					sb.WriteString(", ")
+				}
+				first = false
+				sb.WriteString(name)
+				if _, req := requiredSet[name]; !req {
+					sb.WriteString("?")
+				}
+				sb.WriteString(": ")
+				sb.WriteString(sub.Type)
+			}
+			sb.WriteString("}")
+		}
+	}
+	if len(prop.Enum) > 0 {
+		fmt.Fprintf(&sb, " ∈ {%s}", strings.Join(prop.Enum, "|"))
+	}
+	if strings.TrimSpace(prop.Description) != "" {
+		fmt.Fprintf(&sb, " — %s", strings.TrimSpace(prop.Description))
+	}
+	return sb.String()
+}
+
+// isJSONEmpty reports whether the raw JSON value is empty (null, empty
+// string, empty array, empty object). Used by ValidateActionRequirements
+// so a caller that passes `"targets": []` is treated as missing, not as
+// satisfied.
+func isJSONEmpty(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	switch trimmed {
+	case "", "null", "\"\"", "[]", "{}":
+		return true
+	}
+	return false
 }
 
 // =============================================================================

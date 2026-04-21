@@ -428,6 +428,14 @@ func interAgentConsultationTargets(toolName string, args map[string]any) []strin
 	if target := stringFromAnyMap(args, "target"); target != "" {
 		return []string{target}
 	}
+	// consult_peer (and any future cross-pipeline consult primitive) names
+	// the addressee in target_agent_type rather than target. Without this
+	// lookup the classifier returns an empty target set and the tool drops
+	// out of the InterAgent render path entirely — the row appears as a
+	// plain tool-call line without nested children.
+	if target := stringFromAnyMap(args, "target_agent_type"); target != "" {
+		return []string{target}
+	}
 	switch toolName {
 	case "request_architect_research":
 		return []string{"architect"}
@@ -460,6 +468,14 @@ func interAgentChallengeTargets(toolName string, args, output map[string]any) []
 	if target := firstNonEmptyInline(
 		stringFromAnyMap(args, "target_agent"),
 		stringFromAnyMap(output, "target_agent"),
+	); target != "" {
+		return []string{target}
+	}
+	// Phase 2.K / GI-D: challenge_global_agent carries the recipient in
+	// the singular `target` arg rather than encoded in the tool name.
+	if target := firstNonEmptyInline(
+		stringFromAnyMap(args, "target"),
+		stringFromAnyMap(output, "target"),
 	); target != "" {
 		return []string{target}
 	}
