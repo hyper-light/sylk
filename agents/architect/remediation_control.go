@@ -75,7 +75,13 @@ func (a *Architect) handleRemediationRequest(ctx context.Context, fwd *guide.For
 		req.CreatedAt = time.Now().UTC()
 	}
 
-	a.publishPlanStreamChunk(ctx, "Reviewing validator findings and preparing a remediation workflow...")
+	// Surface the ACTUAL rejection reason to the user before any
+	// workflow preparation work runs. The prior version emitted a
+	// generic "Reviewing validator findings..." placeholder which left
+	// users staring at a spinner with zero context about WHY their
+	// work was rejected. The validator already supplied req.Summary
+	// (headline) and req.Findings (itemized reasons); render both.
+	a.publishPlanStreamChunk(ctx, formatRemediationRejectionPreamble(&req))
 
 	corrections := remediationCorrections(&req)
 	if len(corrections) == 0 {
@@ -119,18 +125,155 @@ func (a *Architect) handleRemediationRequest(ctx context.Context, fwd *guide.For
 		return nil, fmt.Errorf("marshal remediation dag: %w", err)
 	}
 
-	a.publishPlanStreamChunk(ctx, fmt.Sprintf("Prepared a remediation workflow with %d corrective tasks.", len(tasks)))
+	// Stream the concrete plan: list each prepared task by name so
+	// users see the mapping from finding → corrective task without
+	// having to click into the pipelines.
+	a.publishPlanStreamChunk(ctx, formatRemediationWorkflowSummary(tasks))
 
 	return &shared.RemediationResult{
 		CaseID:             req.CaseID,
 		SessionID:          req.SessionID,
 		PlanID:             planID,
 		Resolution:         shared.RemediationResolutionFixWorkflow,
-		Summary:            fmt.Sprintf("Prepared a remediation workflow with %d corrective tasks.", len(tasks)),
-		UserMessage:        "I prepared a corrective workflow based on the validator findings and attached it to the current plan.",
+		Summary:            formatRemediationWorkflowSummary(tasks),
+		UserMessage:        formatRemediationUserMessage(&req, tasks),
 		FixWorkflowDAGJSON: string(dagJSON),
 		FixTaskCount:       len(tasks),
 		Corrections:        append([]shared.ValidationFinding(nil), req.Findings...),
 		CreatedAt:          time.Now().UTC(),
 	}, nil
+}
+
+// formatRemediationRejectionPreamble renders the rejection reason as a
+// multi-line chat chunk: a headline sentence naming who rejected the
+// work, the validator's summary, and a bulleted list of findings with
+// file/line context when present. This is the first thing the user
+// sees after a rejection — it must answer "why" at a glance.
+func formatRemediationRejectionPreamble(req *shared.RemediationRequest) string {
+	var b strings.Builder
+	b.WriteString(rejectionHeadline(req))
+	summary := strings.TrimSpace(req.Summary)
+	if summary != "" {
+		b.WriteString("\n")
+		b.WriteString(summary)
+	}
+	if details := strings.TrimSpace(req.Details); details != "" && details != summary {
+		b.WriteString("\n")
+		b.WriteString(details)
+	}
+	if len(req.Findings) > 0 {
+		b.WriteString("\n\nFindings:")
+		for _, finding := range req.Findings {
+			b.WriteString("\n")
+			b.WriteString(formatFindingLine(finding))
+		}
+	}
+	if len(req.RecommendedActions) > 0 {
+		b.WriteString("\n\nRecommended actions:")
+		for _, action := range req.RecommendedActions {
+			if a := strings.TrimSpace(action); a != "" {
+				b.WriteString("\n • ")
+				b.WriteString(a)
+			}
+		}
+	}
+	return b.String()
+}
+
+// rejectionHeadline names the source of the rejection so the user knows
+// which validator weighed in. Falls back to a neutral phrasing when the
+// request lacks a validator identity (should be rare in production but
+// keeps the message readable in tests and edge cases).
+func rejectionHeadline(req *shared.RemediationRequest) string {
+	// The RemediationRequest doesn't carry the validator's agent type
+	// explicitly — it comes in via the control-plane forwarding layer.
+	// We can't reliably attribute the rejection to "global inspector"
+	// vs "global tester" from the payload alone, but we can still
+	// frame the message as a rejection with actionable context.
+	return "Validator rejected the work — preparing corrective tasks."
+}
+
+// formatFindingLine renders a single finding as a bulleted line with
+// severity, file/line locator, and the summary text. Example:
+//
+//	 • [high] tests/test_init.py:12 — invalid merged test artifact
+//
+// Designed to be scan-readable so a user can take in a 3-finding
+// rejection at a glance.
+func formatFindingLine(f shared.ValidationFinding) string {
+	var parts []string
+	if severity := strings.TrimSpace(string(f.Severity)); severity != "" {
+		parts = append(parts, "["+severity+"]")
+	}
+	if loc := formatFindingLocator(f); loc != "" {
+		parts = append(parts, loc)
+	}
+	summary := strings.TrimSpace(firstNonEmpty(f.Summary, f.Detail, f.Recommendation))
+	if summary == "" {
+		summary = "(no summary provided)"
+	}
+	prefix := strings.Join(parts, " ")
+	if prefix == "" {
+		return " • " + summary
+	}
+	return " • " + prefix + " — " + summary
+}
+
+// formatFindingLocator builds a compact file:line string when a finding
+// includes filesystem anchor fields. Empty string when absent so the
+// line stays clean.
+func formatFindingLocator(f shared.ValidationFinding) string {
+	file := strings.TrimSpace(f.File)
+	if file == "" {
+		return ""
+	}
+	if f.Line > 0 {
+		return fmt.Sprintf("%s:%d", file, f.Line)
+	}
+	return file
+}
+
+// formatRemediationWorkflowSummary renders the list of corrective tasks
+// so the user sees what each fix pipeline will address. Used both as
+// the chat stream chunk after workflow construction and as the
+// RemediationResult.Summary field (consumed by downstream UI code).
+func formatRemediationWorkflowSummary(tasks []*AtomicTask) string {
+	if len(tasks) == 0 {
+		return "No corrective tasks were needed."
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Prepared %d corrective task", len(tasks))
+	if len(tasks) != 1 {
+		b.WriteString("s")
+	}
+	b.WriteString(":")
+	for _, task := range tasks {
+		b.WriteString("\n • ")
+		b.WriteString(strings.TrimSpace(task.Name))
+	}
+	return b.String()
+}
+
+// formatRemediationUserMessage is the UserMessage field on the result —
+// a concise single-paragraph form for callers (like the orchestrator's
+// follow-up request flow) that want a brief explanation rather than the
+// full stream-chunk preamble. Includes the leading rejection reason so
+// the UserMessage is self-contained.
+func formatRemediationUserMessage(req *shared.RemediationRequest, tasks []*AtomicTask) string {
+	reason := strings.TrimSpace(firstNonEmpty(req.Summary, req.Details))
+	if reason == "" && len(req.Findings) > 0 {
+		reason = strings.TrimSpace(req.Findings[0].Summary)
+	}
+	if reason == "" {
+		reason = "validator reported blocking issues"
+	}
+	count := len(tasks)
+	if count == 0 {
+		return fmt.Sprintf("I received a rejection (%s) but could not prepare corrective work from the findings.", reason)
+	}
+	verb := "a corrective task"
+	if count != 1 {
+		verb = fmt.Sprintf("%d corrective tasks", count)
+	}
+	return fmt.Sprintf("I prepared %s to address the rejection: %s.", verb, reason)
 }

@@ -17,6 +17,11 @@ import (
 // it and drain the async buffer before the process exits.
 var installedFabricLogger atomic.Pointer[fabriclog.FabricLogger]
 
+// installedForestBridge holds the forest-fabric bridge. Retained
+// primarily for diagnostics; the bridge is naturally torn down when
+// the underlying FabricLogger closes.
+var installedForestBridge atomic.Pointer[fabriclog.ForestFabricBridge]
+
 // installActivityFabric wires the Activity Fabric onto this
 // orchestrator's BunSQLite handle and installs the resulting sink +
 // source as process-wide defaults. Idempotent — safe to call multiple
@@ -64,15 +69,18 @@ func installActivityFabric(store *Store, sessionID string, sd *sylkdir.SylkDir) 
 	// Forest subscriber: harvest candidates land in the orchestrator's
 	// log for now. Wiring into a real Memory Forest persistence path
 	// is the explicit Tier 11 follow-up.
-	forest := activitystore.NewForestSubscriber(func(_ context.Context, c activitystore.ForestCandidate) error {
+	harvestFn := func(_ context.Context, a activity.AgentActivity, reason string) error {
 		slog.Info("fabric: forest candidate",
-			"session_id", string(c.Activity.SessionID),
-			"action_kind", string(c.Activity.Action),
-			"reason", c.Reason,
-			"actor_agent_id", c.Activity.Actor.AgentID,
-			"actor_agent_type", c.Activity.Actor.AgentType,
+			"session_id", string(a.SessionID),
+			"action_kind", string(a.Action),
+			"reason", reason,
+			"actor_agent_id", a.Actor.AgentID,
+			"actor_agent_type", a.Actor.AgentType,
 		)
 		return nil
+	}
+	forest := activitystore.NewForestSubscriber(func(ctx context.Context, c activitystore.ForestCandidate) error {
+		return harvestFn(ctx, c.Activity, c.Reason)
 	})
 	sink.Subscribe(forest)
 
@@ -109,6 +117,18 @@ func installActivityFabric(store *Store, sessionID string, sd *sylkdir.SylkDir) 
 			fabriclog.SetDefault(logger)
 			finalSink = fabriclog.NewRecordingSink(sink, logger)
 			finalSource = fabriclog.NewRecordingSource(sqliteSink, logger)
+
+			// Forest-fabric bridge: route fabric_consume and
+			// fabric_resolve records into the forest harvest path
+			// so the forest learns which activities actually got
+			// consumed (reinforcement precedent) and how lifecycle
+			// edges resolved (outcome precedent). The bridge
+			// applies the same ActionKind allowlist as
+			// ForestSubscriber to avoid flooding the forest.
+			bridge := fabriclog.NewForestFabricBridge(logger, harvestFn)
+			bridge.Wire()
+			installedForestBridge.Store(bridge)
+
 			slog.Info("fabric: observability installed",
 				"session_id", sessionID,
 				"path", fabricDir,
@@ -125,6 +145,7 @@ func installActivityFabric(store *Store, sessionID string, sd *sylkdir.SylkDir) 
 // FabricLogger. Called from the orchestrator's Stop path so the
 // async write buffer is flushed before exit.
 func uninstallFabricObservability() {
+	installedForestBridge.Store(nil)
 	if prev := installedFabricLogger.Swap(nil); prev != nil {
 		fabriclog.SetDefault(nil)
 		if err := prev.Close(); err != nil {

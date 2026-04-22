@@ -40,6 +40,7 @@ type BusNodeDispatcher struct {
 	bus                guide.EventBus
 	agentID            string
 	sessionID          string
+	planID             string
 	dagID              string
 	buffers            *BufferRegistry
 	activator          guide.PodActivator // fallback when pod is nil
@@ -51,8 +52,8 @@ type BusNodeDispatcher struct {
 	ackResults         sync.Map // nodeID → *ACKResult
 	ackWaiters         sync.Map // nodeID → chan *ACKResult
 	nodePods           sync.Map // nodeID → *shared.AgentPod
-	waitDispatchPermit func(context.Context, string, string) error
-	isExecutionHeld    func(string, string, string) bool
+	waitDispatchPermit func(ctx context.Context, sessionID, planID, dagID string) error
+	isExecutionHeld    func(sessionID, planID, dagID, nodeID string) bool
 	eventLogger        *agentlog.SessionEventLogger
 	lastActivity       sync.Map // nodeID → time.Time
 	activityGrace      time.Duration
@@ -93,15 +94,22 @@ func (d *BusNodeDispatcher) SetACKTimeout(timeout time.Duration) {
 	d.ackTimeout = timeout
 }
 
+// SetPlanID records the plan that owns this DAG. The dispatch permit
+// waiter uses (sessionID, planID) to scope execution-hold lookups;
+// holds opened under a different plan must not block this DAG.
+func (d *BusNodeDispatcher) SetPlanID(planID string) {
+	d.planID = strings.TrimSpace(planID)
+}
+
 // SetDispatchPermitWaiter installs a callback that may block before new node
 // dispatches are published. Used to enforce orchestrator execution holds.
-func (d *BusNodeDispatcher) SetDispatchPermitWaiter(fn func(context.Context, string, string) error) {
+func (d *BusNodeDispatcher) SetDispatchPermitWaiter(fn func(ctx context.Context, sessionID, planID, dagID string) error) {
 	d.waitDispatchPermit = fn
 }
 
 // SetExecutionHoldChecker installs a callback used to determine whether a
 // node belongs to a DAG currently paused by an execution hold.
-func (d *BusNodeDispatcher) SetExecutionHoldChecker(fn func(sessionID, dagID, nodeID string) bool) {
+func (d *BusNodeDispatcher) SetExecutionHoldChecker(fn func(sessionID, planID, dagID, nodeID string) bool) {
 	d.isExecutionHeld = fn
 }
 
@@ -184,7 +192,7 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 
 	if d.waitDispatchPermit != nil {
 		d.logNodeTrace(node, "dispatch_permit_wait_begin", agentlog.EventTaskDispatched, nil)
-		if err := d.waitDispatchPermit(ctx, d.sessionID, d.dagID); err != nil {
+		if err := d.waitDispatchPermit(ctx, d.sessionID, d.planID, d.dagID); err != nil {
 			d.logNodeTrace(node, "dispatch_permit_wait_failed", agentlog.EventError, map[string]any{
 				"error": err.Error(),
 			})
@@ -333,7 +341,7 @@ func (d *BusNodeDispatcher) executionHoldActive(nodeID string) bool {
 	if d == nil || d.isExecutionHeld == nil {
 		return false
 	}
-	return d.isExecutionHeld(d.sessionID, d.dagID, strings.TrimSpace(nodeID))
+	return d.isExecutionHeld(d.sessionID, d.planID, d.dagID, strings.TrimSpace(nodeID))
 }
 
 func activityPollEvery(activityWindow time.Duration) time.Duration {

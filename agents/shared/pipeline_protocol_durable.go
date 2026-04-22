@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"time"
@@ -81,16 +82,32 @@ func newPipelineProtocolStateForTask(task *PipelineTaskInput) (*PipelineProtocol
 	if seq, ok, err := store.LoadSnapshot(&checkpoint); err != nil {
 		return state, err
 	} else if ok {
-		state.snapshot = clonePipelineProtocolSnapshot(checkpoint.Snapshot)
+		// Historical fields come from the persisted checkpoint — the
+		// WAL is the authoritative record of what has happened on
+		// this scope. These fields are never in task.Context, so
+		// there is no merge conflict for them.
 		state.processed = clonePipelineValidationProcessingList(checkpoint.Processed)
 		state.requiredAction = PipelineProtocolActionType(strings.TrimSpace(checkpoint.RequiredAction))
 		state.requiredReason = strings.TrimSpace(checkpoint.RequiredReason)
 		state.queuedArtifacts = clonePipelineHandoffArtifactMap(checkpoint.QueuedArtifacts)
 		state.terminalAction = clonePipelineTurnAction(checkpoint.TerminalAction)
+
+		// In-flight fields require a merge: the checkpoint's snapshot
+		// may be stale relative to task.Context, which carries the
+		// dispatcher's most-recent view of the wire. Merge both
+		// sources; baseSnapshot wins on in-flight fields when
+		// present, but WAL resolutions in `processed` still trump
+		// any stale PendingChallenge/Validation the baseSnapshot
+		// may carry. See mergePipelineSnapshots for the exact
+		// field-by-field rules.
+		state.snapshot = mergePipelineSnapshots(checkpoint.Snapshot, baseSnapshot, state.processed)
+
 		if err := state.replayFrom(seq); err != nil {
 			return state, err
 		}
 	} else {
+		// No checkpoint on disk — baseSnapshot is the only source.
+		// Replay applies any events written since open.
 		if err := state.replayFrom(0); err != nil {
 			return state, err
 		}
@@ -102,6 +119,230 @@ func newPipelineProtocolStateForTask(task *PipelineTaskInput) (*PipelineProtocol
 		return state, err
 	}
 	return state, nil
+}
+
+// mergePipelineSnapshots reconciles two sources of truth for pipeline
+// protocol state:
+//
+//   - checkpoint: the persisted snapshot from the durable log. Authoritative
+//     for historical facts (what events have been processed, what is
+//     queued, what terminal action was recorded).
+//
+//   - base: the fresh snapshot that rode along on task.Context from the
+//     dispatcher. Authoritative for in-flight facts (which challenge is
+//     pending right now, what validation just arrived, which agents are
+//     active in the current turn).
+//
+// The merge rules, in order:
+//
+//  1. Start with the checkpoint's snapshot. Historical fields are already
+//     correct there.
+//  2. Replace in-flight fields (PendingChallenge, PendingValidation,
+//     AuditLock, CurrentRequest, ActiveAgents, RequestedBy, Mode) with
+//     values from `base` when `base` has them populated. `base` is
+//     newer by construction — the dispatcher stamped it at dispatch
+//     time, the checkpoint was captured earlier.
+//  3. WAL resolutions trump stale in-flight state: if `processed`
+//     contains a resolution for a ChallengeID that `base` still shows
+//     as pending, drop the pending entry. The WAL's record of
+//     resolution is historical and final; a stale in-flight entry
+//     cannot resurrect it.
+//
+// Edge cases:
+//
+//   - base == nil: the task arrived without a pipeline_protocol snapshot
+//     in its context (edge case; indicates a dispatcher bug or a
+//     non-dispatched state open). Return the checkpoint verbatim.
+//   - checkpoint == nil: first-ever open for this scope. Return `base`
+//     verbatim.
+//   - both nil: empty state.
+//
+// When the merge produces a divergence — a field where both sources have
+// non-empty values and they disagree — a structured log event
+// (pipeline_protocol.snapshot_merge_diverged) is emitted so observability
+// can track whether this path is the load-bearing defense or just
+// redundant belt-and-suspenders.
+func mergePipelineSnapshots(
+	checkpoint *PipelineProtocolSnapshot,
+	base *PipelineProtocolSnapshot,
+	processed []PipelineValidationProcessing,
+) *PipelineProtocolSnapshot {
+	if checkpoint == nil && base == nil {
+		return nil
+	}
+	if base == nil {
+		return clonePipelineProtocolSnapshot(checkpoint)
+	}
+	if checkpoint == nil {
+		merged := clonePipelineProtocolSnapshot(base)
+		applyProcessedResolutionsToMerged(merged, processed)
+		return merged
+	}
+
+	merged := clonePipelineProtocolSnapshot(checkpoint)
+	baseClone := clonePipelineProtocolSnapshot(base)
+
+	divergedFields := make([]string, 0, 4)
+
+	// PendingChallenge: base wins when present; checkpoint wins only
+	// when base has none. Either way, if `processed` has a matching
+	// resolution, the result is nil (WAL resolution trumps stale
+	// pending).
+	if baseClone.PendingChallenge != nil {
+		if merged.PendingChallenge != nil &&
+			!pipelineChallengeEqual(merged.PendingChallenge, baseClone.PendingChallenge) {
+			divergedFields = append(divergedFields, "PendingChallenge")
+			logSnapshotRescue("PendingChallenge", baseClone.PendingChallenge.ID, merged.PendingChallenge.ID)
+		} else if merged.PendingChallenge == nil {
+			// The critical case: checkpoint lacked the challenge the
+			// dispatcher just committed. Rescue emits its own log
+			// so the Fix-B defense is observable.
+			logSnapshotRescue("PendingChallenge", baseClone.PendingChallenge.ID, "")
+		}
+		merged.PendingChallenge = baseClone.PendingChallenge
+	}
+
+	// PendingValidation: same rule as PendingChallenge.
+	if baseClone.PendingValidation != nil {
+		if merged.PendingValidation != nil &&
+			!pipelineValidationEqual(merged.PendingValidation, baseClone.PendingValidation) {
+			divergedFields = append(divergedFields, "PendingValidation")
+		}
+		merged.PendingValidation = baseClone.PendingValidation
+	}
+
+	// AuditLock: base wins when non-empty phase.
+	if baseClone.AuditLock != nil && strings.TrimSpace(baseClone.AuditLock.Phase) != "" {
+		if merged.AuditLock != nil &&
+			strings.TrimSpace(merged.AuditLock.Phase) != "" &&
+			merged.AuditLock.Phase != baseClone.AuditLock.Phase {
+			divergedFields = append(divergedFields, "AuditLock")
+		}
+		merged.AuditLock = baseClone.AuditLock
+	}
+
+	// CurrentRequest: base wins when non-empty.
+	if strings.TrimSpace(baseClone.CurrentRequest) != "" {
+		if strings.TrimSpace(merged.CurrentRequest) != "" &&
+			merged.CurrentRequest != baseClone.CurrentRequest {
+			divergedFields = append(divergedFields, "CurrentRequest")
+		}
+		merged.CurrentRequest = baseClone.CurrentRequest
+	}
+
+	// ActiveAgents: base wins when non-empty.
+	if len(baseClone.ActiveAgents) > 0 {
+		merged.ActiveAgents = append([]string(nil), baseClone.ActiveAgents...)
+	}
+
+	// RequestedBy: base wins when non-empty.
+	if strings.TrimSpace(baseClone.RequestedBy) != "" {
+		merged.RequestedBy = baseClone.RequestedBy
+	}
+
+	// Mode: base wins when non-empty.
+	if strings.TrimSpace(baseClone.Mode) != "" {
+		merged.Mode = baseClone.Mode
+	}
+
+	// Apply WAL resolutions LAST so they trump any stale pending
+	// entries that survived the above copies.
+	applyProcessedResolutionsToMerged(merged, processed)
+
+	if len(divergedFields) > 0 {
+		logSnapshotDiverged(divergedFields, checkpoint, base)
+	}
+
+	return merged
+}
+
+// applyProcessedResolutionsToMerged drops any PendingChallenge or
+// PendingValidation whose ChallengeID is in the processed list. The WAL's
+// record of resolution is final; the merged snapshot must not carry
+// contradicting stale-pending state forward.
+func applyProcessedResolutionsToMerged(
+	merged *PipelineProtocolSnapshot,
+	processed []PipelineValidationProcessing,
+) {
+	if merged == nil || len(processed) == 0 {
+		return
+	}
+	resolvedIDs := make(map[string]struct{}, len(processed))
+	for _, entry := range processed {
+		id := strings.TrimSpace(entry.ChallengeID)
+		if id != "" {
+			resolvedIDs[id] = struct{}{}
+		}
+	}
+	if len(resolvedIDs) == 0 {
+		return
+	}
+	if merged.PendingChallenge != nil {
+		if _, resolved := resolvedIDs[strings.TrimSpace(merged.PendingChallenge.ID)]; resolved {
+			merged.PendingChallenge = nil
+		}
+	}
+	if merged.PendingValidation != nil {
+		if _, resolved := resolvedIDs[strings.TrimSpace(merged.PendingValidation.ChallengeID)]; resolved {
+			merged.PendingValidation = nil
+		}
+	}
+}
+
+// pipelineChallengeEqual compares two PipelineProtocolChallenge values for
+// equivalence on the fields that identify a single logical challenge (ID
+// + requesting agent). Two challenges with matching ID+requester are the
+// same logical event even if metadata differs slightly between the
+// checkpoint view and the dispatcher view.
+func pipelineChallengeEqual(a, b *PipelineProtocolChallenge) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return strings.TrimSpace(a.ID) == strings.TrimSpace(b.ID) &&
+		normalizePipelineAgentType(a.RequestingAgent) == normalizePipelineAgentType(b.RequestingAgent)
+}
+
+// pipelineValidationEqual compares two PipelineValidationRecord values
+// for equivalence on the identifying fields (ChallengeID + responding
+// agent + status).
+func pipelineValidationEqual(a, b *PipelineValidationRecord) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return strings.TrimSpace(a.ChallengeID) == strings.TrimSpace(b.ChallengeID) &&
+		normalizePipelineAgentType(a.RespondingAgent) == normalizePipelineAgentType(b.RespondingAgent) &&
+		strings.TrimSpace(a.Status) == strings.TrimSpace(b.Status)
+}
+
+// logSnapshotRescue emits the Fix-B-specific observability signal: the
+// baseSnapshot carried an in-flight item the checkpoint lacked (or had a
+// different version of). Direct telemetry on how often the merge is the
+// last line of defense.
+func logSnapshotRescue(field, baseID, checkpointID string) {
+	slog.Info("pipeline_protocol.snapshot_rescued_from_task_context",
+		"field", field,
+		"base_id", strings.TrimSpace(baseID),
+		"checkpoint_id", strings.TrimSpace(checkpointID),
+	)
+}
+
+// logSnapshotDiverged emits a signal when both sources have non-empty
+// values and they disagree. This is a weaker signal than
+// snapshot_rescued_from_task_context — it means the merge had a genuine
+// choice to make. In a healthy system this fires rarely.
+func logSnapshotDiverged(fields []string, checkpoint, base *PipelineProtocolSnapshot) {
+	slog.Info("pipeline_protocol.snapshot_merge_diverged",
+		"diverging_fields", fields,
+		"checkpoint_pending_challenge_id", pendingChallengeID(checkpoint),
+		"base_pending_challenge_id", pendingChallengeID(base),
+	)
+}
+
+func pendingChallengeID(snapshot *PipelineProtocolSnapshot) string {
+	if snapshot == nil || snapshot.PendingChallenge == nil {
+		return ""
+	}
+	return strings.TrimSpace(snapshot.PendingChallenge.ID)
 }
 
 func pipelineProtocolSessionDir(task *PipelineTaskInput) string {
@@ -287,26 +528,41 @@ func (s *PipelineProtocolState) appendEvent(ctx context.Context, kind string, pa
 		})
 	}
 	stream, _ := StreamMetadataFromContext(ctx)
-	seq, event, err := s.store.Append(
-		kind,
-		pipelineProtocolAgentTypeFromContext(ctx),
-		streamCorrelationID(stream),
-		streamParentCorrelationID(stream),
-		payload,
-	)
+	result, err := s.store.Append(AppendRequest{
+		Kind:                kind,
+		AgentType:           pipelineProtocolAgentTypeFromContext(ctx),
+		CorrelationID:       streamCorrelationID(stream),
+		ParentCorrelationID: streamParentCorrelationID(stream),
+		// IdempotencyKey is intentionally left empty — the
+		// three-layer dedupe (kind, correlation_id, payload
+		// fingerprint) composed by the durable log is sufficient
+		// for pipeline protocol events. Distinct PipelineTurnActions
+		// differ in their ChallengeID / target / request / payload,
+		// so their fingerprints differ; retries of the exact same
+		// logical event produce identical fingerprints and are
+		// correctly deduped.
+		Payload: payload,
+	})
 	if err != nil {
-		// DUR-03: a duplicate correlation indicates this event was already
-		// appended and projected in a prior turn or crash-recovery. The
-		// projection and mailboxes are already in the expected post-event
-		// state, so downstream work would be a no-op at best and a
-		// double-apply at worst. Treat as success — the protocol step's
-		// external contract (event recorded, state advanced) is satisfied.
+		// DUR-03: a duplicate fingerprint indicates this event was
+		// already appended and projected in a prior turn or crash-
+		// recovery. The projection and mailboxes are already in the
+		// expected post-event state, so downstream work would be a
+		// no-op at best and a double-apply at worst. Treat as
+		// success — the protocol step's external contract (event
+		// recorded, state advanced) is satisfied.
+		//
+		// The durableProtocolLog emits a structured
+		// pipeline_protocol.dedupe_hit log line on every dedupe so
+		// observability catches unexpected same-payload repeats
+		// (caller bugs) while silently absorbing the expected
+		// crash-recovery case.
 		if errors.Is(err, ErrDurableProtocolDuplicate) {
 			return nil
 		}
 		return err
 	}
-	if err := s.applyEvent(seq, event); err != nil {
+	if err := s.applyEvent(result.Seq, result.Event); err != nil {
 		return err
 	}
 	if err := s.persistProjection(); err != nil {

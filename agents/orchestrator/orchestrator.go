@@ -47,6 +47,13 @@ type Orchestrator struct {
 	identity *identity.AgentIdentity
 	factory  *identity.Factory
 
+	// sylkdir + resolvedSessionID capture the data-plane location
+	// and session identifier captured during initDataPlane so later
+	// Start paths can install per-session observability (bus log,
+	// future per-session trackers) without re-resolving.
+	sylkdir           *sylkdir.SylkDir
+	resolvedSessionID string
+
 	bus         guide.EventBus
 	channels    *guide.AgentChannels
 	requestSub  guide.Subscription
@@ -206,7 +213,6 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 		steering:                 shared.NewSteeringManager(),
 		requestSerializer:        shared.NewRequestSerializer(),
 		pendingBus:               make(map[string]*shared.PendingSyncWait),
-		dispatchGate:             newDispatchHoldGate(),
 		pipelinePanelState:       make(map[string]pipelinePanelSnapshot),
 		pipelinePanelRegistered:  make(map[string]struct{}),
 		pendingCheckpointReviews: make(map[string]*pendingCheckpointReview),
@@ -270,6 +276,11 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 		Hooks:    o.hooks,
 		Manifest: orchestratorToolManifest(o.skills),
 		State:    toolruntime.NewState(),
+		// Share the orchestrator's own GoroutineScope so tool-invocation
+		// workers (batched workspace ops, concurrent peer lookups, etc.)
+		// land on the same budget + leak-attribution as the orchestrator's
+		// own goroutines. See core/concurrency/scope_context.go.
+		Scope: o.scope,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("initialize orchestrator tool runtime: %w", err)
@@ -301,6 +312,7 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 		return fmt.Errorf("orchestrator: migrate store: %w", err)
 	}
 	o.store = store
+	o.dispatchGate = newDispatchHoldGate(store)
 
 	// Install the Activity Fabric sink + source as the process-wide
 	// defaults. Every chokepoint emission flows into the SubscribingSink;
@@ -314,6 +326,13 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 	// publish and every lens call emits a session-global JSONL record
 	// under .sylk/sessions/{sid}/fabric/. See docs/FABRIC_OBSERVABILITY.md.
 	installActivityFabric(o.store, sid, sd)
+
+	// Capture sylkdir + resolved session ID so Start can install
+	// per-session bus observability once it receives the bus
+	// reference. Bus arrives in Start (not initDataPlane) because
+	// the TUI bootstrap wires it late.
+	o.sylkdir = sd
+	o.resolvedSessionID = sid
 
 	// WAL journal
 	journal, err := OpenOrchestratorJournal(sd.SessionOrchestratorWALPath(sid))
@@ -391,17 +410,17 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 		SessionID:    cfg.SessionID,
 		AgentID:      cfg.AgentID,
 	})
-	o.dagBridge.SetDispatchPermitWaiter(func(ctx context.Context, sessionID, dagID string) error {
+	o.dagBridge.SetDispatchPermitWaiter(func(ctx context.Context, sessionID, planID, dagID string) error {
 		if o.dispatchGate == nil {
 			return nil
 		}
-		return o.dispatchGate.wait(ctx, sessionID, dagID)
+		return o.dispatchGate.wait(ctx, sessionID, planID, dagID)
 	})
-	o.dagBridge.SetExecutionHoldChecker(func(sessionID, dagID, nodeID string) bool {
+	o.dagBridge.SetExecutionHoldChecker(func(sessionID, planID, dagID, nodeID string) bool {
 		if o.dispatchGate == nil {
 			return false
 		}
-		return o.dispatchGate.isHeld(sessionID, dagID)
+		return o.dispatchGate.isHeld(sessionID, planID, dagID)
 	})
 
 	return nil
@@ -669,6 +688,13 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 	o.channels = guide.NewAgentChannels(o.config.AgentID, o.config.AgentID)
 	o.runCtx, o.runCancel = context.WithCancel(context.Background())
 
+	// Install per-session bus observability: every publish,
+	// delivery, subscribe, and overflow on the ChannelBus now
+	// writes a record to .sylk/sessions/{sid}/bus/. Wrapped after
+	// o.bus assignment and before the first SubscribeAsync so the
+	// first subscriptions are captured too.
+	installBusObservability(bus, o.sylkdir, o.resolvedSessionID)
+
 	var err error
 	o.requestSub, err = bus.SubscribeAsync(o.channels.Requests, o.handleBusRequest)
 	if err != nil {
@@ -715,11 +741,13 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 
 	// Wire data plane if available
 	if o.dagBridge != nil {
-		if o.store != nil && o.dispatchGate != nil {
-			if hold, holdErr := o.store.GetActiveExecutionHold(o.config.SessionID); holdErr == nil && hold != nil {
-				o.dispatchGate.activate(o.config.SessionID)
-			}
-		}
+		// Bootstrap intentionally does NOT re-arm the dispatch gate
+		// from the store. The gate is a projection — it queries
+		// store.DAGIsHeld on every wait() and subscribes to
+		// HoldsNotifyChannel for changes. Any legacy active holds
+		// lacking plan_id are superseded by ensureExecutionHoldSchema
+		// during Migrate(), so there is nothing for bootstrap to
+		// restore. See docs/EXECUTION_HOLDS.md.
 		o.dagBridge.SetBus(bus)
 		o.subscribePipelineTopics()
 		o.subscribeDAGTopics()
@@ -840,6 +868,10 @@ func (o *Orchestrator) Stop() error {
 	// writes land on disk before the process exits. Close is
 	// idempotent and safe when observability wasn't installed.
 	uninstallFabricObservability()
+	// Drain the bus observability logger and clear the hook on
+	// the ChannelBus so the bus publish/delivery path returns to
+	// its un-instrumented fast path after shutdown.
+	uninstallBusObservability(o.bus)
 	if o.scope != nil {
 		o.scope.Shutdown(5*time.Second, 10*time.Second)
 	}
@@ -1522,9 +1554,16 @@ func (o *Orchestrator) handleTaskFailed(msg *guide.Message) error {
 	}
 	o.mu.Unlock()
 
-	if rollbackErr := o.rollbackTaskDraft(task); rollbackErr != nil {
-		errorMsg = firstNonEmpty(errorMsg, rollbackErr.Error())
-	}
+	// Parallel-global-VFS design: task failure does NOT roll back the
+	// pipeline draft. Under the new design, a pipeline's work either
+	// already lives in green (if the pipeline's inspector accepted and
+	// called MergePipelineIntoGreen) or was never committed (pipeline
+	// VFS closed on discard_pipeline). Either way, there is no "draft"
+	// to roll back on arbitrary task failure — the pipeline's
+	// accept/discard path is the authoritative lifecycle boundary.
+	// Task failure is orthogonal; dropping it here preserves any
+	// committed-to-green work for remediation pipelines to read.
+	// See docs/PARALLEL_GLOBAL_VFS.md.
 
 	o.mu.Lock()
 	defer o.mu.Unlock()

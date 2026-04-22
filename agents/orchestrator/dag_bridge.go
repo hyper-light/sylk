@@ -92,8 +92,8 @@ type DAGBridge struct {
 	quota              *container.ResourceQuota
 	specReg            *container.AgentSpecRegistry
 	sessionVFS         func(sessionID string) *versioning.SessionVFS
-	waitDispatchPermit func(ctx context.Context, sessionID, dagID string) error
-	isExecutionHeld    func(sessionID, dagID, nodeID string) bool
+	waitDispatchPermit func(ctx context.Context, sessionID, planID, dagID string) error
+	isExecutionHeld    func(sessionID, planID, dagID, nodeID string) bool
 	sessionID          string
 	agentID            string
 	logger             *slog.Logger
@@ -147,6 +147,73 @@ func (b *DAGBridge) SetBus(bus guide.EventBus) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.bus = bus
+	b.subscribeGlobalReviewEvents(bus)
+}
+
+// subscribeGlobalReviewEvents subscribes to global review lifecycle
+// events so the DAG bridge can unblock layer progression without the
+// orchestrator mediating the global review path. The global inspector
+// publishes these events after accepting or rejecting a checkpoint.
+func (b *DAGBridge) subscribeGlobalReviewEvents(bus guide.EventBus) {
+	if bus == nil {
+		return
+	}
+	_, _ = bus.SubscribeAsync(shared.TopicGlobalReviewComplete, func(msg *guide.Message) error {
+		if msg == nil || msg.Payload == nil {
+			return nil
+		}
+		event, ok := msg.Payload.(*shared.GlobalReviewCompleteEvent)
+		if !ok {
+			// Try JSON decode for cross-process messages.
+			raw, jsonOk := msg.Payload.(json.RawMessage)
+			if !jsonOk {
+				return nil
+			}
+			var decoded shared.GlobalReviewCompleteEvent
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				return nil
+			}
+			event = &decoded
+		}
+		nodeID := strings.TrimSpace(event.NodeID)
+		if nodeID == "" {
+			return nil
+		}
+		b.NotifyNodeComplete(nodeID, &dag.NodeResult{
+			NodeID:  nodeID,
+			State:   dag.NodeStateSucceeded,
+			EndTime: time.Now().UTC(),
+		})
+		return nil
+	})
+	_, _ = bus.SubscribeAsync(shared.TopicGlobalReviewFailed, func(msg *guide.Message) error {
+		if msg == nil || msg.Payload == nil {
+			return nil
+		}
+		event, ok := msg.Payload.(*shared.GlobalReviewFailedEvent)
+		if !ok {
+			raw, jsonOk := msg.Payload.(json.RawMessage)
+			if !jsonOk {
+				return nil
+			}
+			var decoded shared.GlobalReviewFailedEvent
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				return nil
+			}
+			event = &decoded
+		}
+		nodeID := strings.TrimSpace(event.NodeID)
+		if nodeID == "" {
+			return nil
+		}
+		b.NotifyNodeComplete(nodeID, &dag.NodeResult{
+			NodeID:  nodeID,
+			State:   dag.NodeStateFailed,
+			Error:   fmt.Errorf("%s", strings.TrimSpace(event.Reason)),
+			EndTime: time.Now().UTC(),
+		})
+		return nil
+	})
 }
 
 // SetActivator sets the on-demand agent activator after construction.
@@ -188,7 +255,7 @@ func (b *DAGBridge) SetContextQuota(quota *container.ResourceQuota) {
 // SetDispatchPermitWaiter installs a callback invoked before a node dispatch
 // is published onto the bus. Used by the orchestrator control plane to pause
 // new pipeline work while validation/remediation holds are active.
-func (b *DAGBridge) SetDispatchPermitWaiter(fn func(ctx context.Context, sessionID, dagID string) error) {
+func (b *DAGBridge) SetDispatchPermitWaiter(fn func(ctx context.Context, sessionID, planID, dagID string) error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.waitDispatchPermit = fn
@@ -196,7 +263,7 @@ func (b *DAGBridge) SetDispatchPermitWaiter(fn func(ctx context.Context, session
 
 // SetExecutionHoldChecker installs a callback used to shield active nodes from
 // timeout cancellation while the orchestrator has paused a DAG.
-func (b *DAGBridge) SetExecutionHoldChecker(fn func(sessionID, dagID, nodeID string) bool) {
+func (b *DAGBridge) SetExecutionHoldChecker(fn func(sessionID, planID, dagID, nodeID string) bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.isExecutionHeld = fn
@@ -319,6 +386,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 
 	// 3b. Create BusNodeDispatcher with node-aware task-pod activation.
 	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, activator, nil)
+	dispatcher.SetPlanID(planID)
 	dispatcher.activityGrace = b.config.DefaultNodeTimeout
 	dispatcher.SetEventLogger(b.eventLogger)
 	dispatcher.SetDispatchPermitWaiter(waitDispatchPermit)
@@ -1143,7 +1211,16 @@ func (b *DAGBridge) dagEventForwarder(dagID, planID string) dag.EventHandler {
 			b.journal.LogNodeResult(dagID, event.NodeID, "failed", errMsg)
 			b.updateProgressFromScheduler(dagID)
 			b.publishFailedTaskPipelineState(dagID, event.NodeID)
-			b.markTaskPodResetPending(dagID, event.NodeID)
+			// Parallel-global-VFS design: do NOT mark the task pod for
+			// reset on node failure. Pod reset is driven solely by the
+			// orchestrator's explicit DecisionRetry path (for infra-
+			// class retries) or by DAG-terminal cleanup. A node failure
+			// that maps to a pipeline rejection (inspector reject,
+			// global-review refusal, audit rejection) is resolved by
+			// the architect dispatching a remediation DAG whose fix
+			// tasks have their own pods; the original pipeline's pod
+			// has already released at pipeline-inspector-accept
+			// boundary. See docs/PARALLEL_GLOBAL_VFS.md.
 			shared.LogAgentEvent(el, agentlog.EventNodeFailed,
 				b.agentID, b.sessionID, "", "error",
 				&agentlog.DAGPayload{DAGID: dagID, NodeID: event.NodeID, State: "failed", Err: errMsg})

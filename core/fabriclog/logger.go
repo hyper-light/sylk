@@ -56,6 +56,13 @@ type FabricLogger struct {
 	recentOrder []string // FIFO eviction order
 	recentCap   int
 
+	// Subscribers fanout. The drain goroutine is the single reader;
+	// registration uses an atomic swap pattern to avoid locking on
+	// the hot path. A nil slice means no subscribers — the common
+	// case before bridges install.
+	subsMu      sync.Mutex
+	subscribers []Subscriber
+
 	// Periodicity for KindDrop emissions — one drop record per 1024
 	// drops by default so the log doesn't amplify pressure.
 	dropReportEvery int64
@@ -117,6 +124,36 @@ type publishMeta struct {
 	ActionKind string
 	AgentID    string
 	AgentType  string
+	// FullActivity retains the complete activity payload so
+	// subscribers (e.g., the forest bridge) can reason over
+	// consumed/resolved activities without an extra SQLite lookup.
+	// Bounded by the same LRU cap as the rest of the cache — roughly
+	// 500B × RecentPublishLRU memory cost.
+	FullActivity activity.AgentActivity
+}
+
+// Subscriber is invoked once per record as it flows through the
+// logger. Subscribers run on the drain goroutine — they must not
+// block indefinitely, and must not call back into FabricLogger
+// methods that enqueue (risking recursion). Forest bridging, UI
+// telemetry, and custom analysis tools implement this interface.
+type Subscriber interface {
+	// OnRecord fires exactly once per record, after the record has
+	// been written to disk. Subscribers run in-order (registration
+	// order) and synchronously in the drain goroutine, so all
+	// subscribers should keep per-record work bounded. Errors are
+	// logged; they do not stop delivery to other subscribers.
+	OnRecord(record FabricLogRecord)
+}
+
+// SubscriberFunc adapts a function to the Subscriber interface.
+type SubscriberFunc func(record FabricLogRecord)
+
+// OnRecord satisfies Subscriber.
+func (f SubscriberFunc) OnRecord(record FabricLogRecord) {
+	if f != nil {
+		f(record)
+	}
 }
 
 // NewFabricLogger constructs a logger anchored at cfg.BaseDir/fabric.
@@ -251,11 +288,12 @@ func (l *FabricLogger) RecordPublish(a activity.AgentActivity) {
 		Publish: body,
 	}
 	l.cacheRecent(string(a.ID), publishMeta{
-		Seq:        publishSeq,
-		Timestamp:  a.Timestamp,
-		ActionKind: string(a.Action),
-		AgentID:    a.Actor.AgentID,
-		AgentType:  a.Actor.AgentType,
+		Seq:          publishSeq,
+		Timestamp:    a.Timestamp,
+		ActionKind:   string(a.Action),
+		AgentID:      a.Actor.AgentID,
+		AgentType:    a.Actor.AgentType,
+		FullActivity: a,
 	})
 	l.enqueue(rec)
 
@@ -453,7 +491,10 @@ func (l *FabricLogger) enqueue(r FabricLogRecord) {
 }
 
 // drain is the single consumer of the write channel. It terminates
-// when the channel is closed by Close.
+// when the channel is closed by Close. After each successful write,
+// it fans out to any registered subscribers in registration order
+// so bridges (forest, telemetry, etc.) can react to records as they
+// land on disk.
 func (l *FabricLogger) drain() {
 	defer close(l.done)
 	for r := range l.ch {
@@ -462,9 +503,58 @@ func (l *FabricLogger) drain() {
 			continue
 		}
 		l.written.Add(1)
+		l.fanoutLocked(r)
 	}
 	// Final flush on shutdown.
 	_ = l.writer.Flush()
+}
+
+// fanoutLocked dispatches r to every registered subscriber. Runs on
+// the drain goroutine; subscribers must keep per-record work bounded.
+// A panicking subscriber is recovered so it cannot take down the
+// drain loop.
+func (l *FabricLogger) fanoutLocked(r FabricLogRecord) {
+	l.subsMu.Lock()
+	subs := make([]Subscriber, len(l.subscribers))
+	copy(subs, l.subscribers)
+	l.subsMu.Unlock()
+	for _, s := range subs {
+		func() {
+			defer func() {
+				_ = recover() // subscriber panics do not break the drain
+			}()
+			s.OnRecord(r)
+		}()
+	}
+}
+
+// Subscribe registers a subscriber that receives every record after
+// it is written. Call once at orchestrator startup; the registration
+// is permanent for the logger's lifetime. Safe to call concurrently
+// with writes — new subscribers start receiving on the next record.
+func (l *FabricLogger) Subscribe(s Subscriber) {
+	if l == nil || s == nil {
+		return
+	}
+	l.subsMu.Lock()
+	l.subscribers = append(l.subscribers, s)
+	l.subsMu.Unlock()
+}
+
+// LookupRecent returns the full AgentActivity for the given ID if
+// it is still present in the recent-publish cache, and a boolean
+// indicating presence. Subscribers use this to resolve consume and
+// resolve records back to the original publisher's activity without
+// round-tripping through the SQLite store.
+func (l *FabricLogger) LookupRecent(activityID string) (activity.AgentActivity, bool) {
+	if l == nil {
+		return activity.AgentActivity{}, false
+	}
+	meta, ok := l.lookupRecent(activityID)
+	if !ok {
+		return activity.AgentActivity{}, false
+	}
+	return meta.FullActivity, true
 }
 
 // cacheRecent inserts (or refreshes) an entry in the recent-publish

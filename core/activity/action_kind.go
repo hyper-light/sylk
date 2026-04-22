@@ -271,6 +271,16 @@ const (
 	// ActionConsulted is emitted on every awareness-skill query so
 	// causal traceability captures who-asked-what.
 	ActionConsulted ActionKind = "consulted"
+
+	// ActionForestConsultEmitted is emitted by a `*_forest_consult`
+	// skill handler every time an agent queries the Memory Forest.
+	// The payload carries the purpose, query, returned branch IDs,
+	// and retrieval confidence. Subsequent agent publishes within a
+	// proximity window get linked back to this activity by the
+	// outcome harvester so the forest learns which consulted
+	// branches actually produced successful outcomes. See Tier 5 of
+	// docs/FOREST_FABRIC_INTEGRATION.md.
+	ActionForestConsultEmitted ActionKind = "forest_consult_emitted"
 )
 
 // ResolutionFor returns the canonical Resolution for the given
@@ -326,7 +336,8 @@ func ResolutionFor(kind ActionKind) Resolution {
 		ActionConsultResponse,
 		ActionConsultUnanswered,
 		ActionAdvisoryEmitted,
-		ActionNotificationEmitted:
+		ActionNotificationEmitted,
+		ActionForestConsultEmitted:
 		return ResolutionMedium
 
 	case ActionDecisionDeclared,

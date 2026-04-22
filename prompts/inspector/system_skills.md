@@ -9,7 +9,7 @@ Use this when implementation evidence is absent or the task is explicitly pre-im
 
 Priority:
 1. `define_criteria`
-2. `workspace_read(op ∈ {read, inspect, summarize, list_changes}, scope=pipeline, …)` — one primitive covers file reads, workspace inspection, summarization, and change listing
+2. `workspace_read(op ∈ {read, batch, inspect, summarize, list_changes}, scope=pipeline, …)` — one primitive covers file reads (single-path `read` or multi-path `batch`), workspace inspection, summarization, and change listing. Prefer `op=batch, paths=[…]` when inspecting multiple known files in one shot
 3. `query_peer_activity(kinds=["validation_started","validation_accepted","validation_rejected"])` plus `query_pipeline_state` to derive validation status
 4. Peer coordination arrives through fabric `ambient_context` on every tool result; use `consult_peer` or `challenge_peer` when a direct exchange is needed
 

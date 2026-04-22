@@ -450,6 +450,15 @@ func (s *SylkDir) SessionFabricPath(sessionID string) string {
 	return filepath.Join(s.SessionPath(sessionID), "fabric")
 }
 
+// SessionBusPath returns the session-scoped directory for the
+// inter-agent message-bus observability log. Session-global
+// because the bus IS cross-agent; fragmenting by subscriber or
+// publisher would lose the interaction graph. The StreamWriter
+// writes .sylk/sessions/{sessionID}/bus/{YYYY-MM-DD}/bus.{nnn}.jsonl.
+func (s *SylkDir) SessionBusPath(sessionID string) string {
+	return filepath.Join(s.SessionPath(sessionID), "bus")
+}
+
 // CreateGlobalVersion creates a global version directory with subdirectories.
 // Structure: .sylk/versions/v1.0.0/{nodes,vectors,docs,chunks,bleve}
 func (s *SylkDir) CreateGlobalVersion(version SemanticVersion) error {

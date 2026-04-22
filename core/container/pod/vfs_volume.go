@@ -19,20 +19,31 @@ type VFSVolumeConfig struct {
 	Files       []string
 	EventLogger *agentlog.SessionEventLogger
 	AgentID     string
+
+	// BaseCopyVersion, when non-zero, pins the pipeline's VFS to a
+	// specific historical Copy via byte-for-byte materialization.
+	// Used by remediation dispatch to seed the fix task's VFS from
+	// the failing Copy so the fix task sees exactly the state that
+	// was audited. See docs/PARALLEL_GLOBAL_VFS.md §3.5 / §3.6.
+	//
+	// Zero value means "use current green as the read base," which
+	// is the legacy behavior for normal pipeline dispatch.
+	BaseCopyVersion versioning.SemanticVersion
 }
 
 // VFSVolume wraps a PipelineVFS with pod-lifecycle-aware mount/unmount.
 // Mount creates a per-pipeline VFS via the CVS; Unmount closes it via
 // the VFSManager.
 type VFSVolume struct {
-	name        string
-	pipelineID  string
-	sessionID   versioning.SessionID
-	workingDir  string
-	sessionVFS  *versioning.SessionVFS
-	files       []string
-	eventLogger *agentlog.SessionEventLogger
-	agentID     string
+	name            string
+	pipelineID      string
+	sessionID       versioning.SessionID
+	workingDir      string
+	sessionVFS      *versioning.SessionVFS
+	files           []string
+	eventLogger     *agentlog.SessionEventLogger
+	agentID         string
+	baseCopyVersion versioning.SemanticVersion
 
 	mu          sync.Mutex
 	pipelineFA  versioning.FileAccess
@@ -45,14 +56,15 @@ type VFSVolume struct {
 // NewVFSVolume creates a VFS-backed volume for a pipeline pod.
 func NewVFSVolume(cfg VFSVolumeConfig) *VFSVolume {
 	return &VFSVolume{
-		name:        cfg.Name,
-		pipelineID:  cfg.PipelineID,
-		sessionID:   cfg.SessionID,
-		workingDir:  cfg.WorkingDir,
-		sessionVFS:  cfg.SessionVFS,
-		files:       append([]string(nil), cfg.Files...),
-		eventLogger: cfg.EventLogger,
-		agentID:     cfg.AgentID,
+		name:            cfg.Name,
+		pipelineID:      cfg.PipelineID,
+		sessionID:       cfg.SessionID,
+		workingDir:      cfg.WorkingDir,
+		sessionVFS:      cfg.SessionVFS,
+		files:           append([]string(nil), cfg.Files...),
+		eventLogger:     cfg.EventLogger,
+		agentID:         cfg.AgentID,
+		baseCopyVersion: cfg.BaseCopyVersion,
 	}
 }
 
@@ -260,10 +272,11 @@ func (v *VFSVolume) ensureBindingLocked(reason string) error {
 
 func (v *VFSVolume) rebindLocked(reason string) error {
 	pipelineVFS, err := v.sessionVFS.BeginPipeline(versioning.BeginPipelineConfig{
-		PipelineID: v.pipelineID,
-		SessionID:  v.sessionID,
-		WorkingDir: v.workingDir,
-		Files:      append([]string(nil), v.files...),
+		PipelineID:      v.pipelineID,
+		SessionID:       v.sessionID,
+		WorkingDir:      v.workingDir,
+		Files:           append([]string(nil), v.files...),
+		BaseCopyVersion: v.baseCopyVersion,
 	})
 	if err != nil {
 		v.logTrace("vfs_volume_rebind_failed", "error", agentlog.EventError, map[string]any{
@@ -286,10 +299,11 @@ func (v *VFSVolume) rebindLocked(reason string) error {
 		v.pipelineFA = versioning.NewPipelineRoutingFileAccess(false, func() *versioning.SessionVFS {
 			return v.sessionVFS
 		}, v.pipelineID, v.workingDir).WithRebindConfig(versioning.BeginPipelineConfig{
-			PipelineID: v.pipelineID,
-			SessionID:  v.sessionID,
-			WorkingDir: v.workingDir,
-			Files:      append([]string(nil), v.files...),
+			PipelineID:      v.pipelineID,
+			SessionID:       v.sessionID,
+			WorkingDir:      v.workingDir,
+			Files:           append([]string(nil), v.files...),
+			BaseCopyVersion: v.baseCopyVersion,
 		})
 	}
 	if v.workspace == nil {

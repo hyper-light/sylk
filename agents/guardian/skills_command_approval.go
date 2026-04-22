@@ -374,6 +374,61 @@ func firstNonEmptyApprovalValue(values ...string) string {
 	return ""
 }
 
+// commandApprovalHoldSummary renders a one-line user-visible summary of
+// what happened at the coordination layer, used as the Content of the
+// paired system_coordination activity event. Phrasing is intentionally
+// short so the resulting chat row fits on one line:
+//
+//	"DAG 05b288e6 paused · awaiting approval for bash"
+//	"DAG 05b288e6 resumed"
+//
+// When dag_id is unknown (rare but possible in edge cases) the summary
+// falls back to a pipeline/task-scoped phrasing so the row still
+// communicates scope.
+func commandApprovalHoldSummary(req *shared.CommandApprovalHoldRequest) string {
+	if req == nil {
+		return "system coordination"
+	}
+	scope := firstNonEmptyApprovalValue(
+		shortID(req.DAGID, "DAG"),
+		shortID(req.PipelineID, "pipeline"),
+		shortID(req.TaskID, "task"),
+	)
+	switch req.Action {
+	case shared.CommandApprovalHoldBegin:
+		tool := strings.TrimSpace(req.ToolName)
+		if tool == "" {
+			tool = "command"
+		}
+		if scope == "" {
+			return fmt.Sprintf("Pipeline paused · awaiting approval for %s", tool)
+		}
+		return fmt.Sprintf("%s paused · awaiting approval for %s", scope, tool)
+	case shared.CommandApprovalHoldResolve:
+		if scope == "" {
+			return "Pipeline resumed"
+		}
+		return fmt.Sprintf("%s resumed", scope)
+	default:
+		return fmt.Sprintf("system coordination: %s", req.Action)
+	}
+}
+
+// shortID returns a compact form of an ID suitable for human-facing
+// summaries — kind label + first 8 chars (e.g., "DAG 05b288e6"). Empty
+// input yields empty output so callers can fall through to a coarser
+// scope.
+func shortID(id, kind string) string {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return ""
+	}
+	if len(trimmed) > 8 {
+		trimmed = trimmed[:8]
+	}
+	return fmt.Sprintf("%s %s", kind, trimmed)
+}
+
 func (g *Guardian) beginCommandApprovalHold(ctx context.Context, proposal *commandapproval.Proposal) (string, error) {
 	if proposal == nil {
 		return "", nil
@@ -464,8 +519,7 @@ func (g *Guardian) requestCommandApprovalHold(ctx context.Context, req *shared.C
 		return nil, fmt.Errorf("encode command approval hold request: %w", err)
 	}
 	routeMetadata := shared.InheritedBranchMetadata(ctx, map[string]any{
-		"control_plane_kind": shared.ControlPlaneKindCommandApprovalHold,
-		"summary":            req.Command,
+		"summary": req.Command,
 	})
 	routeReq := &guide.RouteRequest{
 		CorrelationID:   correlationID,
@@ -484,7 +538,27 @@ func (g *Guardian) requestCommandApprovalHold(ctx context.Context, req *shared.C
 		}
 	}
 	routeReq.Metadata = shared.RouteMetadataWithInterAgentBranch(ctx, routeReq.Metadata)
-	if err := g.bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage("", routeReq)); err != nil {
+	// Atomic pair: the route (which pauses/resolves DAG state on the
+	// orchestrator) ships alongside a system_coordination activity
+	// event (which renders as a SourceSystem chat row describing what
+	// happened). The helper stamps `control_plane_kind` on the route
+	// so the UI stream bridge suppresses the transient orchestrator
+	// top-level entry the stream would otherwise produce.
+	if err := guide.EmitControlPlaneCoordination(g.bus, g.activityPub, guide.ControlPlaneEmission{
+		Kind:          shared.ControlPlaneKindCommandApprovalHold,
+		Summary:       commandApprovalHoldSummary(req),
+		SessionID:     strings.TrimSpace(req.SessionID),
+		CorrelationID: strings.TrimSpace(req.HoldID),
+		Related: map[string]any{
+			"hold_id":     strings.TrimSpace(req.HoldID),
+			"dag_id":      strings.TrimSpace(req.DAGID),
+			"pipeline_id": strings.TrimSpace(req.PipelineID),
+			"task_id":     strings.TrimSpace(req.TaskID),
+			"action":      string(req.Action),
+			"tool_name":   strings.TrimSpace(req.ToolName),
+		},
+		Route: routeReq,
+	}); err != nil {
 		return nil, fmt.Errorf("publish command approval hold request: %w", err)
 	}
 

@@ -1647,28 +1647,6 @@ const bounceMaxVel = 25.0
 // natural exponential decay fully ease the bounce to rest.
 const bounceSettleThreshold = 0.01
 
-// ---------------------------------------------------------------------------
-// Horizontal swipe (ring cycling)
-// ---------------------------------------------------------------------------
-
-// swipeThreshold is the accumulated horizontal scroll ticks required to
-// trigger a ring cycle.
-// Derived from: 6 ticks requires a deliberate gesture (trackpads emit
-// 10-20 events per swipe), preventing accidental triggers.
-const swipeThreshold = 6.0
-
-// swipeDecay is the duration after which stale swipe accumulation resets.
-// Derived from: 300ms is long enough for a continuous trackpad gesture
-// but short enough that separate flicks don't combine.
-const swipeDecay = 300 * time.Millisecond
-
-// swipeCooldown is the dead period after a cycle fires during which
-// further swipe events are ignored. Prevents the tail end of a single
-// scroll gesture from immediately triggering a second cycle.
-// Derived from: 500ms exceeds a typical trackpad gesture duration (~300ms)
-// while feeling responsive for intentional repeated swipes.
-const swipeCooldown = 500 * time.Millisecond
-
 // handleMouse routes mouse wheel events to the panel under the cursor
 // using spring-based scrolling, handles click-to-copy on chat messages,
 // and handles text selection in the code panel.
@@ -2099,24 +2077,18 @@ func (m *AppModel) handleInputWheelMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
 func (m *AppModel) handleMouseButtonMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
 	switch mouse.Button {
 	case tea.MouseButtonWheelUp:
-		if mouse.Alt {
-			m.applySwipeImpulse(mouse.X, -1)
-		} else {
-			m.applyScrollImpulse(mouse.X, mouse.Y, -scrollImpulse)
-		}
+		m.applyScrollImpulse(mouse.X, mouse.Y, -scrollImpulse)
 		return nil, true
 	case tea.MouseButtonWheelDown:
-		if mouse.Alt {
-			m.applySwipeImpulse(mouse.X, 1)
-		} else {
-			m.applyScrollImpulse(mouse.X, mouse.Y, scrollImpulse)
-		}
+		m.applyScrollImpulse(mouse.X, mouse.Y, scrollImpulse)
 		return nil, true
-	case tea.MouseButtonWheelLeft:
-		m.applySwipeImpulse(mouse.X, -1)
-		return nil, true
-	case tea.MouseButtonWheelRight:
-		m.applySwipeImpulse(mouse.X, 1)
+	case tea.MouseButtonWheelLeft, tea.MouseButtonWheelRight:
+		// Horizontal trackpad/wheel scroll events are intentionally
+		// ignored — they used to cycle view slots (chat → edit → git,
+		// etc.) via applySwipeImpulse, but that behavior was too easy
+		// to trigger accidentally during normal two-finger scrolling
+		// on macOS trackpads and was removed. Users cycle view slots
+		// via the Alt+V keyboard chord instead (see cycleViewSlot).
 		return nil, true
 	case tea.MouseButtonLeft:
 		return m.handleLeftClick(mouse), true
@@ -2868,42 +2840,12 @@ func clampFloat(v, lo, hi float64) float64 {
 	return math.Max(lo, math.Min(v, hi))
 }
 
-// ---------------------------------------------------------------------------
-// Horizontal swipe (ring cycling via mouse wheel)
-// ---------------------------------------------------------------------------
-
-// applySwipeImpulse accumulates horizontal scroll delta and triggers a
-// view slot cycle (identical to Alt+V chord) when the accumulated magnitude
-// reaches swipeThreshold. In TwoColumn mode both rings cycle in lockstep;
-// in other modes the single active ring cycles.
-func (m *AppModel) applySwipeImpulse(x int, delta float64) {
-	now := time.Now()
-	if now.Before(m.swipe.cooldownUntil) {
-		return
-	}
-	if m.leftRing.empty() && m.rightRing.empty() {
-		return
-	}
-	m.swipe.accum += delta
-	m.swipe.stamp = now
-	if math.Abs(m.swipe.accum) >= swipeThreshold {
-		direction := 1
-		if m.swipe.accum < 0 {
-			direction = -1
-		}
-		m.cycleViewSlot(direction)
-		m.swipe.accum = 0
-		m.swipe.cooldownUntil = now.Add(swipeCooldown)
-	}
-}
-
-// tickSwipeDecay resets stale swipe accumulation after swipeDecay elapses
-// since the last horizontal scroll event.
-func (m *AppModel) tickSwipeDecay() {
-	if m.swipe.accum != 0 && time.Since(m.swipe.stamp) > swipeDecay {
-		m.swipe.accum = 0
-	}
-}
+// Horizontal-swipe ring cycling (applySwipeImpulse / tickSwipeDecay /
+// swipeState / swipeThreshold / swipeDecay / swipeCooldown) was
+// intentionally removed. Trackpad horizontal scroll accidentally
+// triggered view-slot cycles far too often during normal two-finger
+// scrolling on macOS. View cycling is now keyboard-only via the Alt+V
+// chord — see cycleViewSlot in app_modes_git.go.
 
 // isFileTreeVisible reports whether the FileTree panel is currently rendered on screen.
 func (m *AppModel) isFileTreeVisible() bool {

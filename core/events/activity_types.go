@@ -59,6 +59,17 @@ const (
 
 	// Agent lifecycle events
 	EventTypeAgentRegistered EventType = 23
+
+	// System coordination events. Carry infrastructure-level notifications
+	// that aren't tied to any specific agent's conversational turn: DAG
+	// pause/resume for command approval holds, plan-handoff receipt
+	// lookups, protocol reconciliation events, etc. Rendered as
+	// SourceSystem chat rows alongside agent turns — they tell the user
+	// what's happening at the coordination layer without promoting a
+	// transient routing waypoint (e.g. an orchestrator receiving a
+	// guardian approval-hold control message) into a fake conversational
+	// turn.
+	EventTypeSystemCoordination EventType = 24
 )
 
 // ValidEventTypes returns all valid EventType values.
@@ -88,6 +99,7 @@ func ValidEventTypes() []EventType {
 		EventTypeSteeringRollback,
 		EventTypeSteeringCheckpoint,
 		EventTypeAgentRegistered,
+		EventTypeSystemCoordination,
 	}
 }
 
@@ -151,6 +163,8 @@ func (et EventType) String() string {
 		return "steering_checkpoint"
 	case EventTypeAgentRegistered:
 		return "agent_registered"
+	case EventTypeSystemCoordination:
+		return "system_coordination"
 	default:
 		return fmt.Sprintf("event_type(%d)", et)
 	}
@@ -206,6 +220,8 @@ func ParseEventType(value string) (EventType, bool) {
 		return EventTypeSteeringCheckpoint, true
 	case "agent_registered":
 		return EventTypeAgentRegistered, true
+	case "system_coordination":
+		return EventTypeSystemCoordination, true
 	default:
 		return EventType(0), false
 	}
@@ -486,6 +502,8 @@ func defaultImportance(eventType EventType) float64 {
 		return 0.35
 	case EventTypeAgentRegistered:
 		return 0.20
+	case EventTypeSystemCoordination:
+		return 0.25
 	default:
 		return 0.50
 	}

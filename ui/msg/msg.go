@@ -137,6 +137,16 @@ type StreamStartMsg struct {
 	TaskSlug                    string
 	Visibility                  events.EventVisibility
 	BranchRef                   *InterAgentBranchRefMsg
+	// ControlPlane is true when the stream was synthesized from a route
+	// bearing a non-empty `control_plane_kind` metadata — i.e., internal
+	// coordination (plan-handoff receipt lookup, command-approval-hold
+	// begin/resolve, protocol reconciliation) that should NOT materialize
+	// as a user-visible agent entry. The chat model's handleStreamStart
+	// early-returns when this is true; the paired system_coordination
+	// activity event (published by the sender via
+	// guide.EmitControlPlaneCoordination) carries the user-visible
+	// semantic meaning as a SourceSystem chat row instead.
+	ControlPlane bool
 }
 
 // StreamChunkMsg carries a streaming text chunk from an LLM response.

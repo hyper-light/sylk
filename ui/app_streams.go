@@ -1440,7 +1440,6 @@ func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
 		m.tickScrollMomentum()
 		m.viewDirty = true
 	}
-	m.tickSwipeDecay()
 
 	// Drain pending commands from scroll-triggered pagination.
 	var cmds []tea.Cmd

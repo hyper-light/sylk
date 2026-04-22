@@ -56,6 +56,10 @@ const (
 	EventResponseCorrelated EventType = 0x0107
 	EventStreamStarted      EventType = 0x0108
 	EventStreamCompleted    EventType = 0x0109
+	// EventGuideStarted anchors the guide's session boot in the WAL
+	// so `sylk trace` can find the start of routing activity even
+	// before any route requests arrive. Emitted once per BindSession.
+	EventGuideStarted EventType = 0x010A
 )
 
 // Orchestrator events (0x0200–0x02FF) — dag.wal, pipeline.wal.
@@ -336,6 +340,7 @@ func init() {
 	eventNames[EventResponseCorrelated] = "ResponseCorrelated"
 	eventNames[EventStreamStarted] = "StreamStarted"
 	eventNames[EventStreamCompleted] = "StreamCompleted"
+	eventNames[EventGuideStarted] = "GuideStarted"
 
 	// Orchestrator — DAG
 	eventNames[EventDAGStarted] = "DAGStarted"

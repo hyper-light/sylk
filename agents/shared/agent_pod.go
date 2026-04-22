@@ -225,6 +225,20 @@ func (p *AgentPod) FileAccessFor(agentType string) versioning.FileAccess {
 	return p.volumes.FileAccessFor(agentType)
 }
 
+// Scope returns the pod's tracked-goroutine scope so member agents can
+// pass it into their tool runtime Config.Scope. Sharing the pod's scope
+// means every tool-invocation goroutine counts against the same budget
+// as the pod's own goroutines and shows up in the pod's leak-detection
+// output. Returns nil when the pod was constructed without a scope
+// (some test harnesses) — callers treat nil as "fall back to the
+// tool runtime's auto-created scope."
+func (p *AgentPod) Scope() *concurrency.GoroutineScope {
+	if p == nil {
+		return nil
+	}
+	return p.scope
+}
+
 // WorkspaceViewsFor returns the layered workspace view access for the given
 // member type when this pod is backed by mounted volumes.
 func (p *AgentPod) WorkspaceViewsFor(agentType string) versioning.WorkspaceViewAccess {

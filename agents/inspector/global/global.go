@@ -612,6 +612,18 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 		AgentID: gi.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
 
+	// Activate the global tester as a peer: dispatch a fire-and-forget
+	// route so the tester works concurrently against the same merged
+	// checkpoint. The tester publishes its findings to the shared
+	// GlobalReviewSnapshot; the inspector reads them via
+	// query_global_review_state during its tool loop.
+	if agentShared.IsGlobalReviewRequest(fwd.Metadata) {
+		testerReq := agentShared.BuildGlobalReviewTesterRouteRequest(fwd, gi.id)
+		if testerReq != nil {
+			_ = gi.bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage("", testerReq))
+		}
+	}
+
 	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
 	if publishStreamLifecycle {
 		shared.PublishStreamStart(gi.bus, gi.channels, ctx, gi.id)

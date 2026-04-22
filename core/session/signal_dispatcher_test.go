@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -113,28 +114,33 @@ func TestSignalDispatcher_MultipleHandlers(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	handler1Called := false
-	handler2Called := false
+	// atomic.Bool instead of plain bool: although wg.Wait() does
+	// establish a happens-before with the handler's wg.Done() (so the
+	// subsequent reads are technically safe under Go's memory model),
+	// the -race detector is conservative about cross-goroutine writes
+	// to the same variable even when they're disjoint. Using atomic
+	// makes the ordering explicit and keeps the test race-free under
+	// every run mode.
+	var handler1Called atomic.Bool
+	var handler2Called atomic.Bool
 
 	dispatcher.RegisterHandler(SignalShutdown, func(sig CrossSessionSignal) {
-		handler1Called = true
+		handler1Called.Store(true)
 		wg.Done()
 	})
 
 	dispatcher.RegisterHandler(SignalShutdown, func(sig CrossSessionSignal) {
-		handler2Called = true
+		handler2Called.Store(true)
 		wg.Done()
 	})
 
 	ctx := t.Context()
 
+	// Watch blocks until the watch goroutine is fully inside its select
+	// loop (via readyChan rendezvous), so the subsequent file write is
+	// guaranteed to be observed — no Sleep, no timing-based readiness
+	// guess, no race window regardless of load.
 	require.NoError(t, dispatcher.Watch(ctx))
-
-	// Let the fsnotify goroutine enter its select loop before writing the
-	// signal file. 50ms is enough on an idle machine but flakes under
-	// concurrent test load; 250ms gives a comfortable margin without slowing
-	// the common path noticeably.
-	time.Sleep(250 * time.Millisecond)
 
 	signalFile := filepath.Join(baseDir, "test-session", "shutdown-123.signal")
 	data := `{"type":"shutdown","from_session":"other","timestamp":"2024-01-01T00:00:00Z"}`
@@ -148,8 +154,8 @@ func TestSignalDispatcher_MultipleHandlers(t *testing.T) {
 
 	select {
 	case <-done:
-		assert.True(t, handler1Called)
-		assert.True(t, handler2Called)
+		assert.True(t, handler1Called.Load())
+		assert.True(t, handler2Called.Load())
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for handlers")
 	}

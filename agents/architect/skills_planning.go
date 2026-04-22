@@ -766,7 +766,7 @@ func buildFixTasks(corrections []any) []*AtomicTask {
 		description := extractCorrectionText(entry, idx)
 		task := &AtomicTask{
 			ID:              fmt.Sprintf("fix_task_%d", idx+1),
-			Name:            fmt.Sprintf("Apply fix %d", idx+1),
+			Name:            buildFixTaskName(entry, description, idx),
 			Description:     description,
 			AgentType:       "engineer",
 			SuccessCriteria: []string{"Correction applied", "Regression risk addressed"},
@@ -790,6 +790,136 @@ func extractCorrectionText(entry any, idx int) string {
 		}
 	}
 	return fmt.Sprintf("Resolve correction item %d", idx+1)
+}
+
+// buildFixTaskName produces a human-readable task title that reflects
+// WHAT the fix addresses, not just its ordinal. The chat panel's pipeline
+// header shows task.Name (e.g. "Apply Fix 2: Inspector"), so a purely
+// ordinal name leaves users reading the spinner with no idea which
+// rejection caused which fix. We prefer, in order:
+//
+//  1. A correction-supplied `title`/`name` field (if the validator
+//     authored one explicitly — the richest signal).
+//  2. The first sentence of the `description`/`message` content,
+//     truncated to fit a chat header row (~60 chars). Prefixed with
+//     "Fix: " so the user can scan the pipeline list and immediately
+//     see that this is a corrective pipeline, not primary work.
+//  3. The `file:line` locator with severity when finding metadata is
+//     present but prose is not (e.g. "Fix: tests/test_init.py:12").
+//  4. Finally, the old ordinal fallback so tasks always have a name
+//     even when validators emit completely unstructured corrections.
+func buildFixTaskName(entry any, description string, idx int) string {
+	if payload, ok := entry.(map[string]any); ok {
+		if title := firstNonEmptyString(payload["title"], payload["name"]); title != "" {
+			return truncateFixTitle("Fix: " + title)
+		}
+	}
+	// Description is the strongest signal ONLY when it contains real
+	// prose. The upstream extractCorrectionText returns a generic
+	// "Resolve correction item N" placeholder when the payload has no
+	// description/message/issue fields — we must not surface that
+	// placeholder as a fix title because it's indistinguishable from
+	// the ordinal fallback we're trying to avoid. Fall through to the
+	// locator tier instead so a file:line reference surfaces.
+	if !isOrdinalCorrectionFallback(description) {
+		if summary := firstSentenceOfFixDescription(description); summary != "" {
+			return truncateFixTitle("Fix: " + summary)
+		}
+	}
+	if payload, ok := entry.(map[string]any); ok {
+		if locator := fixTaskLocatorFromCorrection(payload); locator != "" {
+			return truncateFixTitle("Fix: " + locator)
+		}
+	}
+	return fmt.Sprintf("Apply fix %d", idx+1)
+}
+
+// isOrdinalCorrectionFallback reports whether a description is the
+// "Resolve correction item N" placeholder emitted by
+// extractCorrectionText when the correction payload has no prose.
+// Treating this placeholder as real prose would defeat the whole
+// point of the descriptive-name feature — we'd end up with titles
+// like "Fix: Resolve correction item 1" which is the ordinal
+// rebranded, not the fix content.
+func isOrdinalCorrectionFallback(description string) bool {
+	return strings.HasPrefix(strings.TrimSpace(description), "Resolve correction item ")
+}
+
+// firstSentenceOfFixDescription returns the first sentence of a
+// correction description so a multi-paragraph finding renders as a
+// one-line title without losing the headline. Splits on the first
+// sentence terminator (`. `, `! `, `? `, or newline).
+func firstSentenceOfFixDescription(description string) string {
+	trimmed := strings.TrimSpace(description)
+	if trimmed == "" {
+		return ""
+	}
+	// Find the earliest sentence boundary; stop at first newline if it
+	// arrives before sentence-end punctuation.
+	boundaries := []string{". ", "! ", "? ", "\n"}
+	best := -1
+	for _, boundary := range boundaries {
+		if idx := strings.Index(trimmed, boundary); idx > 0 && (best < 0 || idx < best) {
+			best = idx
+		}
+	}
+	if best > 0 {
+		return strings.TrimSpace(trimmed[:best])
+	}
+	return trimmed
+}
+
+// fixTaskLocatorFromCorrection renders a compact file:line locator
+// from a finding payload when prose is unavailable. E.g. a finding of
+// {file: "tests/test_init.py", line: 12, severity: "high"} becomes
+// "tests/test_init.py:12 (high)". Empty output when no locator fields.
+func fixTaskLocatorFromCorrection(payload map[string]any) string {
+	file, _ := payload["file"].(string)
+	file = strings.TrimSpace(file)
+	if file == "" {
+		return ""
+	}
+	var line int
+	switch v := payload["line"].(type) {
+	case int:
+		line = v
+	case int64:
+		line = int(v)
+	case float64:
+		line = int(v)
+	}
+	severity, _ := payload["severity"].(string)
+	severity = strings.TrimSpace(severity)
+
+	locator := file
+	if line > 0 {
+		locator = fmt.Sprintf("%s:%d", file, line)
+	}
+	if severity != "" {
+		locator = fmt.Sprintf("%s (%s)", locator, severity)
+	}
+	return locator
+}
+
+// truncateFixTitle caps the title at a length that fits comfortably in
+// the chat-panel's pipeline-header row. 72 runes (not bytes) is the
+// practical width for a single-line header after the icon + agent
+// badge + timestamp columns are accounted for; longer titles get an
+// ellipsis. Operates in rune space so multi-byte characters (e.g. the
+// "…" ellipsis itself, which is 3 bytes in UTF-8) don't push the
+// rendered width past the column budget — and so that validator
+// findings with non-ASCII file paths truncate correctly.
+const fixTitleMaxLen = 72
+
+func truncateFixTitle(title string) string {
+	trimmed := strings.TrimSpace(title)
+	runes := []rune(trimmed)
+	if len(runes) <= fixTitleMaxLen {
+		return trimmed
+	}
+	// Keep fixTitleMaxLen-1 runes + single-rune ellipsis = fixTitleMaxLen total.
+	truncated := strings.TrimRight(string(runes[:fixTitleMaxLen-1]), " ")
+	return truncated + "…"
 }
 
 func firstNonEmptyString(values ...any) string {

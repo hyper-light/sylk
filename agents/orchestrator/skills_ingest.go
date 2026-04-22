@@ -200,6 +200,26 @@ func (o *Orchestrator) beginPlanHandoffReceiptForAttempt(
 		return nil, false, fmt.Errorf("begin handoff receipt: %w", err)
 	}
 	if !duplicate {
+		// A genuinely-fresh plan is taking over the session.
+		// Prior-plan execution holds carry remediation context that
+		// no longer applies, so supersede them atomically before any
+		// DAG from this plan is submitted. Duplicates skip this step
+		// — they re-use the existing receipt and (by definition)
+		// belong to the same plan_id whose holds should remain.
+		if o.store != nil {
+			superseded, supErr := o.store.SupersedePriorPlans(ctx, attempt.handoff.SessionID, attempt.handoff.PlanID)
+			if supErr != nil {
+				o.logWarnMsg("supersede prior-plan holds failed",
+					"session_id", attempt.handoff.SessionID,
+					"new_plan_id", attempt.handoff.PlanID,
+					"error", supErr.Error())
+			} else if superseded > 0 {
+				o.logInfo("superseded prior-plan execution holds",
+					"session_id", attempt.handoff.SessionID,
+					"new_plan_id", attempt.handoff.PlanID,
+					"superseded", superseded)
+			}
+		}
 		o.publishPlanHandoffReceiptUpdate(receipt, "accepted")
 		return receipt, false, nil
 	}

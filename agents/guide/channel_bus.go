@@ -52,6 +52,17 @@ type ChannelBus struct {
 	// events to telemetry, alerting, or their own bus topic. The listener
 	// must be fast — it runs in the publish path. See SetOverflowListener.
 	overflowListener atomic.Value // of OverflowListener (may be nil)
+
+	// eventHook is the unified observability surface. Publish,
+	// delivery, subscribe, unsubscribe, overflow, and expired events
+	// are routed through a single hook installed via SetEventHook.
+	// Nil is the no-hook default.
+	eventHook atomic.Value // of *busEventHookHolder
+
+	// subIDCounter stamps each new subscription with a bus-unique,
+	// monotonic ID so observability records can reference subscriptions
+	// by a stable identifier.
+	subIDCounter atomic.Int64
 }
 
 // BusCloseTimeoutError wraps ErrBusCloseTimeout with a list of subscriptions
@@ -109,6 +120,141 @@ func (b *ChannelBus) loadOverflowListener() OverflowListener {
 	}
 	fn, _ := v.(OverflowListener)
 	return fn
+}
+
+// BusEventHook is the observability surface for the bus. Every
+// method is called from the bus's hot paths — implementations must
+// return quickly and must not panic. A panic is recovered by the
+// bus, but the handler's cost is paid in the hot path, so keep work
+// bounded (e.g., enqueue to an async writer, don't do synchronous
+// disk IO).
+//
+// Implementations satisfy the interface by providing any subset of
+// hooks they care about — unused methods can be empty. The buslog
+// package provides a ready-made adapter that writes every event to
+// the session-global bus log.
+type BusEventHook interface {
+	// OnPublish fires at the end of Publish, after subscribers
+	// have been enumerated. subscriberCount is the combined
+	// exact-match + wildcard-match total. err is non-nil when
+	// Publish returned an error (ErrBusClosed, ErrMessageExpired,
+	// etc.).
+	OnPublish(topic string, msg *Message, subscriberCount int, err error)
+
+	// OnDelivery fires once per subscriber delivery, immediately
+	// before the handler runs. queueLatencyMicros is the elapsed
+	// time between enqueue and handler invocation (zero for
+	// synchronous deliveries, positive for async-buffered).
+	OnDelivery(publishTopic, subscriberTopic string, subscriberID int64, async bool, queueLatencyMicros int64, msg *Message, handlerErr error)
+
+	// OnSubscribe fires when a new subscription is registered.
+	// wildcard is true when topic contains wildcard characters;
+	// matchPattern is populated for wildcard subs (the original
+	// pattern text).
+	OnSubscribe(topic string, subscriberID int64, async, wildcard bool, matchPattern string)
+
+	// OnUnsubscribe fires when a subscription is removed. duration
+	// is the wall-clock lifetime of the subscription.
+	OnUnsubscribe(topic string, subscriberID int64, duration time.Duration)
+
+	// OnOverflow mirrors OverflowEvent. Fires synchronously in the
+	// publish critical path when a subscriber's queue drops
+	// messages.
+	OnOverflow(event OverflowEvent)
+
+	// OnExpired fires when Publish rejects a message because it's
+	// already past its Deadline/TTL. expiredAt is the absolute
+	// expiration time.
+	OnExpired(topic string, msg *Message, expiredAt time.Time)
+}
+
+// SetEventHook installs the observability hook. Pass nil to clear.
+// Safe to call at any time — hook invocation uses an atomic load.
+func (b *ChannelBus) SetEventHook(h BusEventHook) {
+	if h == nil {
+		b.eventHook.Store((*busEventHookHolder)(nil))
+		return
+	}
+	b.eventHook.Store(&busEventHookHolder{hook: h})
+}
+
+// busEventHookHolder is a small indirection so nil interface values
+// can be stored atomically. atomic.Value requires the stored type
+// to be consistent; boxing the interface keeps the type stable.
+type busEventHookHolder struct {
+	hook BusEventHook
+}
+
+// loadEventHook returns the installed hook or nil. The nil-check
+// path is the common case — most bus operations run without a hook
+// installed in tests.
+func (b *ChannelBus) loadEventHook() BusEventHook {
+	v := b.eventHook.Load()
+	if v == nil {
+		return nil
+	}
+	holder, _ := v.(*busEventHookHolder)
+	if holder == nil {
+		return nil
+	}
+	return holder.hook
+}
+
+// invokePublishHook runs the installed hook with panic recovery.
+// Used from the Publish path so a misbehaving hook doesn't take the
+// bus down.
+func (b *ChannelBus) invokePublishHook(topic string, msg *Message, subscriberCount int, err error) {
+	hook := b.loadEventHook()
+	if hook == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	hook.OnPublish(topic, msg, subscriberCount, err)
+}
+
+func (b *ChannelBus) invokeDeliveryHook(publishTopic, subscriberTopic string, subscriberID int64, async bool, queueLatencyMicros int64, msg *Message, handlerErr error) {
+	hook := b.loadEventHook()
+	if hook == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	hook.OnDelivery(publishTopic, subscriberTopic, subscriberID, async, queueLatencyMicros, msg, handlerErr)
+}
+
+func (b *ChannelBus) invokeSubscribeHook(topic string, subscriberID int64, async, wildcard bool, matchPattern string) {
+	hook := b.loadEventHook()
+	if hook == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	hook.OnSubscribe(topic, subscriberID, async, wildcard, matchPattern)
+}
+
+func (b *ChannelBus) invokeUnsubscribeHook(topic string, subscriberID int64, duration time.Duration) {
+	hook := b.loadEventHook()
+	if hook == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	hook.OnUnsubscribe(topic, subscriberID, duration)
+}
+
+func (b *ChannelBus) invokeOverflowHook(event OverflowEvent) {
+	hook := b.loadEventHook()
+	if hook == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	hook.OnOverflow(event)
+}
+
+func (b *ChannelBus) invokeExpiredHook(topic string, msg *Message, expiredAt time.Time) {
+	hook := b.loadEventHook()
+	if hook == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	hook.OnExpired(topic, msg, expiredAt)
 }
 
 // defaultCloseTimeout is the maximum time Close() waits for subscription
@@ -178,6 +324,7 @@ func (b *ChannelBus) Publish(topic string, msg *Message) error {
 
 	if b.closed.Load() {
 		span.EndWithError(ErrBusClosed)
+		b.invokePublishHook(topic, msg, 0, ErrBusClosed)
 		return ErrBusClosed
 	}
 	// SCH-02: routing middleware rejects messages that have already missed
@@ -187,6 +334,12 @@ func (b *ChannelBus) Publish(topic string, msg *Message) error {
 	if msg != nil && msg.IsExpired() {
 		err := newExpiredMessageError(topic, msg)
 		span.EndWithError(err)
+		expiredAt := time.Time{}
+		if exp := msg.ExpiresAt(); exp != nil {
+			expiredAt = *exp
+		}
+		b.invokeExpiredHook(topic, msg, expiredAt)
+		b.invokePublishHook(topic, msg, 0, err)
 		return err
 	}
 
@@ -213,7 +366,9 @@ func (b *ChannelBus) Publish(topic string, msg *Message) error {
 	span.SetAttribute("subscriber_count", totalSubs)
 
 	// Wildcard-match subscribers.
-	b.publishToWildcardMatches(topic, msg)
+	totalSubs += b.publishToWildcardMatches(topic, msg)
+
+	b.invokePublishHook(topic, msg, totalSubs, nil)
 
 	return nil
 }
@@ -245,21 +400,27 @@ func newExpiredMessageError(topic string, msg *Message) *ExpiredMessageError {
 
 // publishToWildcardMatches queries the TopicRouter for wildcard patterns
 // matching topic and delivers msg to matched channelSubscriptions.
-func (b *ChannelBus) publishToWildcardMatches(topic string, msg *Message) {
+// Returns the number of matched subscriptions actually reached so
+// callers can include wildcard recipients in their aggregate
+// subscriber counts.
+func (b *ChannelBus) publishToWildcardMatches(topic string, msg *Message) int {
 	matches := b.wildcardRouter.Match(topic)
 	if len(matches) == 0 {
-		return
+		return 0
 	}
 
 	b.wildcardMu.RLock()
 	defer b.wildcardMu.RUnlock()
 
+	reached := 0
 	for _, topicSub := range matches {
 		channelSub, ok := b.wildcardIndex[topicSub.id]
 		if ok {
 			b.publishToSubscriber(channelSub, msg)
+			reached++
 		}
 	}
+	return reached
 }
 
 // isStreamComplete returns true if the message carries a StreamEventComplete.
@@ -313,11 +474,14 @@ func (b *ChannelBus) publishToSubscriber(sub *channelSubscription, msg *Message)
 			"correlation_id", msg.CorrelationID)
 		return
 	}
+	enqueueTime := time.Now()
 	sub.mu.Lock()
 	// SCH-01: insert in priority order. Higher priority goes ahead of any
 	// lower-priority messages already queued, but stably preserves FIFO
-	// order within the same priority class.
-	sub.queue = insertByPriority(sub.queue, msg)
+	// order within the same priority class. The parallel
+	// queueEnqueuedAt slice tracks each message's wall-clock enqueue
+	// time so observability can report per-delivery queue latency.
+	sub.queue, sub.queueEnqueuedAt = insertByPriorityWithTime(sub.queue, sub.queueEnqueuedAt, msg, enqueueTime)
 	dropped := 0
 	var droppedCorrelations []string
 	if len(sub.queue) > maxQueueSize {
@@ -328,6 +492,9 @@ func (b *ChannelBus) publishToSubscriber(sub *channelSubscription, msg *Message)
 		remaining := make([]*Message, maxQueueSize)
 		copy(remaining, sub.queue[dropped:])
 		sub.queue = remaining
+		remainingTimes := make([]time.Time, maxQueueSize)
+		copy(remainingTimes, sub.queueEnqueuedAt[dropped:])
+		sub.queueEnqueuedAt = remainingTimes
 	}
 	queueLen := len(sub.queue)
 	sub.mu.Unlock()
@@ -340,15 +507,17 @@ func (b *ChannelBus) publishToSubscriber(sub *channelSubscription, msg *Message)
 			"queue_len", queueLen,
 			"dropped_correlations", droppedCorrelations,
 			"total_dropped", total)
-		if listener := b.loadOverflowListener(); listener != nil {
-			listener(OverflowEvent{
-				Topic:          sub.topic,
-				Dropped:        dropped,
-				TotalDropped:   total,
-				Correlations:   droppedCorrelations,
-				QueueRemaining: queueLen,
-			})
+		event := OverflowEvent{
+			Topic:          sub.topic,
+			Dropped:        dropped,
+			TotalDropped:   total,
+			Correlations:   droppedCorrelations,
+			QueueRemaining: queueLen,
 		}
+		if listener := b.loadOverflowListener(); listener != nil {
+			listener(event)
+		}
+		b.invokeOverflowHook(event)
 	}
 
 	// Diagnostic: confirm enqueue for stream-complete events.
@@ -384,21 +553,31 @@ func (b *ChannelBus) subscribe(topic string, handler MessageHandler, async bool)
 		return nil, ErrInvalidHandler
 	}
 
+	subID := b.subIDCounter.Add(1)
 	sub := &channelSubscription{
-		bus:     b,
-		topic:   topic,
-		notify:  make(chan struct{}, 1),
-		done:    make(chan struct{}),
-		handler: handler,
-		async:   async,
+		bus:       b,
+		topic:     topic,
+		notify:    make(chan struct{}, 1),
+		done:      make(chan struct{}),
+		handler:   handler,
+		async:     async,
+		subID:     subID,
+		createdAt: time.Now(),
 	}
 	sub.active.Store(true)
 
-	if hasWildcard(topic) {
+	wildcard := hasWildcard(topic)
+	if wildcard {
 		b.registerWildcardSub(topic, sub)
 	} else {
 		b.registerExactSub(topic, sub)
 	}
+
+	matchPattern := ""
+	if wildcard {
+		matchPattern = topic
+	}
+	b.invokeSubscribeHook(topic, subID, async, wildcard, matchPattern)
 
 	b.wg.Add(1)
 	go sub.run(&b.wg)
@@ -547,6 +726,21 @@ type channelSubscription struct {
 	done       chan struct{} // closed on unsubscribe/bus-close to wake consumer
 	topicShard *topicSubscriptions
 
+	// subID is the bus-unique monotonic identifier stamped at
+	// subscribe time. Used by observability records to join
+	// delivery events back to the subscription lifecycle.
+	subID int64
+
+	// createdAt records wall-clock subscription time so
+	// OnUnsubscribe can report the subscription lifetime.
+	createdAt time.Time
+
+	// queueEnqueuedAt stores the wall-clock time the oldest
+	// currently-queued message was enqueued. Used to compute
+	// per-delivery queue latency for observability.
+	// Accessed under s.mu together with s.queue.
+	queueEnqueuedAt []time.Time
+
 	// panicCount tallies handler panics for this subscription so operators can
 	// detect chronic misbehavior without tailing logs. Panics are recovered —
 	// the worker keeps serving subsequent messages.
@@ -606,6 +800,45 @@ func insertByPriority(queue []*Message, msg *Message) []*Message {
 	return queue
 }
 
+// insertByPriorityWithTime mirrors insertByPriority but maintains a
+// parallel slice of wall-clock enqueue timestamps so the delivery
+// path can report per-message queue latency for observability.
+// Callers must pass matched-length queue + times slices; the
+// returned pair is likewise parallel.
+func insertByPriorityWithTime(queue []*Message, times []time.Time, msg *Message, t time.Time) ([]*Message, []time.Time) {
+	// Align times to queue length if caller didn't maintain it.
+	if len(times) != len(queue) {
+		aligned := make([]time.Time, len(queue))
+		copy(aligned, times)
+		times = aligned
+	}
+	if msg == nil {
+		return append(queue, nil), append(times, time.Time{})
+	}
+	insertAt := len(queue)
+	for i := len(queue) - 1; i >= 0; i-- {
+		if queue[i] == nil {
+			continue
+		}
+		if queue[i].Priority >= msg.Priority {
+			break
+		}
+		insertAt = i
+	}
+	if insertAt == len(queue) {
+		return append(queue, msg), append(times, t)
+	}
+	queue = append(queue, nil)
+	copy(queue[insertAt+1:], queue[insertAt:])
+	queue[insertAt] = msg
+
+	times = append(times, time.Time{})
+	copy(times[insertAt+1:], times[insertAt:])
+	times[insertAt] = t
+
+	return queue, times
+}
+
 // collectCorrelations pulls up to max correlation IDs from msgs. Safe for
 // nil messages (treated as empty correlation).
 func collectCorrelations(msgs []*Message, max int) []string {
@@ -647,6 +880,14 @@ func (s *channelSubscription) Unsubscribe() error {
 	}
 
 	s.close()
+
+	lifetime := time.Duration(0)
+	if !s.createdAt.IsZero() {
+		lifetime = time.Since(s.createdAt)
+	}
+	if s.bus != nil {
+		s.bus.invokeUnsubscribeHook(s.topic, s.subID, lifetime)
+	}
 
 	return nil
 }
@@ -706,40 +947,77 @@ func (s *channelSubscription) run(wg *sync.WaitGroup) {
 func (s *channelSubscription) processBatch(wg *sync.WaitGroup, asyncLimiter chan struct{}) {
 	s.mu.Lock()
 	batch := s.queue
+	batchTimes := s.queueEnqueuedAt
 	s.queue = nil
+	s.queueEnqueuedAt = nil
 	s.mu.Unlock()
 
-	for _, msg := range batch {
+	for i, msg := range batch {
 		if !s.active.Load() {
 			continue
+		}
+		var enqueuedAt time.Time
+		if i < len(batchTimes) {
+			enqueuedAt = batchTimes[i]
 		}
 		if s.async {
 			asyncLimiter <- struct{}{}
 			wg.Add(1)
-			go s.handleMessageAsync(wg, asyncLimiter, msg)
+			go s.handleMessageAsync(wg, asyncLimiter, msg, enqueuedAt)
 		} else {
-			s.handleMessage(msg)
+			s.handleMessage(msg, enqueuedAt)
 		}
 	}
 }
 
 // handleMessageAsync wraps handleMessage with WaitGroup tracking for async handlers.
 // This ensures the bus waits for all async handlers to complete during shutdown.
-func (s *channelSubscription) handleMessageAsync(wg *sync.WaitGroup, limiter chan struct{}, msg *Message) {
+func (s *channelSubscription) handleMessageAsync(wg *sync.WaitGroup, limiter chan struct{}, msg *Message, enqueuedAt time.Time) {
 	defer wg.Done()
 	defer func() {
 		<-limiter
 	}()
-	s.handleMessage(msg)
+	s.handleMessage(msg, enqueuedAt)
 }
 
-func (s *channelSubscription) handleMessage(msg *Message) {
-	defer func() {
-		if r := recover(); r != nil {
-			s.recordPanic(msg, r)
-		}
+func (s *channelSubscription) handleMessage(msg *Message, enqueuedAt time.Time) {
+	var queueLatencyMicros int64
+	if !enqueuedAt.IsZero() {
+		queueLatencyMicros = time.Since(enqueuedAt).Microseconds()
+	}
+	var handlerErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.recordPanic(msg, r)
+				handlerErr = fmt.Errorf("handler panic: %v", r)
+			}
+		}()
+		handlerErr = s.handler(msg)
 	}()
-	_ = s.handler(msg)
+	if s.bus != nil {
+		publishTopic := s.topic
+		if msg != nil {
+			// Wildcard subscriptions receive messages whose topic
+			// differs from the subscription's registered pattern;
+			// include both so observability can distinguish
+			// exact-match from wildcard deliveries.
+			if msg.Metadata != nil {
+				if topicFromMsg, ok := msg.Metadata["publish_topic"].(string); ok && topicFromMsg != "" {
+					publishTopic = topicFromMsg
+				}
+			}
+		}
+		s.bus.invokeDeliveryHook(
+			publishTopic,
+			s.topic,
+			s.subID,
+			s.async,
+			queueLatencyMicros,
+			msg,
+			handlerErr,
+		)
+	}
 }
 
 // recordPanic increments the subscription's panic counter and logs a

@@ -1123,8 +1123,12 @@ func (m *AppModel) nextIdleAgentDecorDelay(now time.Time) time.Duration {
 // needsSlowTick reports whether any non-blink, non-LSP debounce needs
 // slow-rate ticking. Cursor blink is handled by BlinkMsg; LSP flush by
 // LSPFlushMsg.
+//
+// Currently nothing triggers a slow tick — swipe decay used to. Kept as
+// a hook point so future debounce work can opt in without rewiring the
+// tick-rate state machine.
 func (m *AppModel) needsSlowTick() bool {
-	return m.swipe.accum != 0 // Swipe decay pending.
+	return false
 }
 
 // ensureTick starts or upgrades the tick chain. Returns a tea.Cmd only when

@@ -6,7 +6,7 @@ Treat the tool definitions as the workflow contract. Their requirements, satisfi
 
 - Research and context: `component_search`, `consult_peer(target_agent_type=librarian|academic|archivalist|…, query=…)` for knowledge-agent and cross-pipeline consultations
 - Planning and mutation shaping: `component_create`, `component_modify`, `token_suggest`
-- Real file mutation: `workspace_read(op=prepare_write, scope=pipeline, path=…)` + `workspace_write(op ∈ {write, edit, delete, mkdir}, scope=pipeline, basis=…, …)`. For `op=edit`, each entry supplies exact `old_text` and `new_text`
+- Real file mutation: for a single file, `workspace_read(op=prepare_write, scope=pipeline, path=…)` + `workspace_write(op ∈ {write, edit, delete, mkdir}, scope=pipeline, basis=…, …)`. For multiple coordinated mutations (a new component + styles + story, or any multi-file scaffold), prefer one call to `workspace_write(op=batch, scope=pipeline, operations=[…])` — the runtime orders mkdir → writes and acquires leases automatically. For `op=edit` (individual or inside a batch), each entry supplies exact `old_text` and `new_text`
 - Validation: `token_validate`, `a11y_audit`, `a11y_fix_suggest`, `contrast_check`, `bash`
 - Coordination and collaboration: `challenge_peer(target_activity_id=…, evidence=…)` for cross-pipeline disputes, `ask_user_clarification` for direct user questions
 - Dependency remediation: `dependency(action ∈ {research, install}, …)` when blocked on missing tooling

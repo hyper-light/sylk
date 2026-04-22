@@ -351,31 +351,16 @@ func (o *Orchestrator) finalizePipelineUpdateCtx(ctx context.Context, update *Pi
 	deferNodeCompletion := false
 
 	if update.Status == "succeeded" && strings.TrimSpace(update.AgentType) == agentshared.PipelineAgentInspector {
-		// The inspector already extracted the review candidate inside
-		// handoff_to_ot. Read the candidate id and version it published
-		// in the update output and route the global review followup.
-		// Guard against the typed-nil-interface trap by passing nil when
-		// the session lookup returns a nil pointer.
-		var checkpointReader SessionVFSCheckpointReader
-		if svfs := o.GetSessionVFS(task.SessionID); svfs != nil {
-			checkpointReader = svfs
-		}
-		checkpointVersion, reviewCandidateID, hadDraft := readInspectorHandoffOutcome(update, checkpointReader)
-		err := o.publishOTGlobalFollowupRequest(ctx, task, update, checkpointVersion, hadDraft, reviewCandidateID)
-		if err != nil {
-			if reviewCandidateID != "" {
-				if svfs := o.GetSessionVFS(task.SessionID); svfs != nil {
-					svfs.DiscardReviewCandidate(reviewCandidateID)
-				}
-			}
-			update.Status = "failed"
-			update.Error = err.Error()
-			update.Message = firstNonEmpty(update.Message, "global followup publish failed")
-			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", taskstate.StatusFailed, update.AgentType)
-		} else {
-			deferNodeCompletion = true
-			o.recordPendingCheckpointReview(task, update, convertPipelineToNodeResult(update))
-		}
+		// The pipeline inspector's handoff_to_ot skill now routes the
+		// global review directly to the global inspector via the Guide's
+		// agent-to-agent protocol — the orchestrator no longer dispatches
+		// the global review or tracks pending checkpoint reviews.
+		//
+		// The DAG node stays pending (deferNodeCompletion = true). The
+		// DAG bridge subscribes to global_review.complete/failed bus
+		// events and calls NotifyNodeComplete when the global inspector
+		// publishes its outcome.
+		deferNodeCompletion = true
 	}
 
 	if o.coordination != nil {

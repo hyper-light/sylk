@@ -763,7 +763,7 @@ func TestDispatch_NoDeadlineShieldsInactivityWhileExecutionHoldActive(t *testing
 	dispatcher.activityGrace = 80 * time.Millisecond
 	var held atomic.Bool
 	held.Store(true)
-	dispatcher.SetExecutionHoldChecker(func(sessionID, dagID, nodeID string) bool {
+	dispatcher.SetExecutionHoldChecker(func(sessionID, planID, dagID, nodeID string) bool {
 		return sessionID == "sess" && dagID == "dag-1" && held.Load()
 	})
 

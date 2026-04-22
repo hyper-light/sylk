@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -1123,6 +1124,158 @@ func emitToolCompleteRecord(ctx context.Context, agentID string, call providers.
 		record.AgentID = agentID
 	}
 	_ = recorder.Complete(record)
+
+	// Fabric emission: mirror the tool completion into the activity
+	// stream so Memory Forest harvest, lenses, and the fabric
+	// observability log can see tool-shape × outcome precedent. The
+	// per-day JSONL stream above is per-agent telemetry; this is the
+	// cross-agent signal source the forest needs. Emit at
+	// ResolutionFine (the canonical ToolCallCompleted tier) —
+	// ForestSubscriber elects it regardless of tier.
+	emitToolCallActivity(ctx, record, call, duration)
+}
+
+// emitToolCallActivity appends an ActionToolCallCompleted activity
+// mirroring the tool-completion record. Carries the tool name as
+// TargetArtifact, an extracted scope hint as PathPrefix, and a
+// compact payload of outcome metadata. Safe to call unconditionally:
+// activity.Append is backed by a best-effort sink and never blocks
+// the tool-complete path.
+func emitToolCallActivity(
+	ctx context.Context,
+	record agentlog.ToolCompleteRecord,
+	call providers.ToolCall,
+	duration time.Duration,
+) {
+	actor := activity.Actor{
+		AgentID:   record.AgentID,
+		AgentType: agentTypeFromBaggage(ctx),
+	}
+	if actor.AgentType == "" {
+		actor.AgentType = agentTypeFromLogContext(ctx)
+	}
+	subject := activity.Subject{
+		TargetArtifact: record.ToolName,
+		PathPrefix:     extractToolScope(call),
+	}
+	state := activity.ActivityState(activity.StatePoint)
+
+	payload := map[string]any{
+		"tool_call_key": record.ToolCallKey,
+		"duration_ms":   duration.Milliseconds(),
+		"success":       record.Success,
+	}
+	if record.Error != "" {
+		payload["error"] = record.Error
+	}
+	if record.LLMCallID != "" {
+		payload["llm_call_id"] = record.LLMCallID
+	}
+	if record.CorrelationID != "" {
+		payload["correlation_id"] = record.CorrelationID
+	}
+	payloadJSON, _ := json.Marshal(payload)
+
+	a := activity.AgentActivity{
+		ID:         activity.ActivityID(activity.NewID()),
+		SessionID:  activity.SessionID(record.SessionID),
+		Timestamp:  time.Now(),
+		Resolution: activity.ResolutionFor(activity.ActionToolCallCompleted),
+		Actor:      actor,
+		Action:     activity.ActionToolCallCompleted,
+		Subject:    subject,
+		Payload:    payloadJSON,
+		State:      state,
+	}
+	// Tier 5 linkage: if the agent issued a forest consult in the
+	// recent TTL window, auto-populate Caused so the forest bridge
+	// can join this outcome back to the consult that shaped it.
+	// The ctx-carried helper takes precedence when present
+	// (explicit > implicit); falls back to the process-wide
+	// tracker otherwise.
+	if caused := recentForestConsultID(ctx); caused != "" {
+		c := activity.ActivityID(caused)
+		a.Caused = &c
+	} else {
+		activity.EnrichCausationFromConsult(&a)
+	}
+	activity.Append(ctx, a)
+}
+
+// extractToolScope pulls a workspace-ish scope hint from the tool
+// call's arguments if present. The fabric uses PathPrefix for scope
+// matching across activities, so threading a path here enables
+// queries like "every tool call in services/billing/".
+func extractToolScope(call providers.ToolCall) string {
+	if strings.TrimSpace(call.Arguments) == "" {
+		return ""
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+		return ""
+	}
+	for _, key := range []string{"path", "file_path", "scope", "target"} {
+		if v, ok := args[key]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+// agentTypeFromBaggage reads the fabric baggage for agent_type. The
+// fabric context is the canonical carrier for actor identity across
+// chokepoints; chokepoint emissions use it via activity.StartSpan.
+func agentTypeFromBaggage(ctx context.Context) string {
+	fc := activity.FabricContextFromContext(ctx)
+	if fc.Baggage == nil {
+		return ""
+	}
+	return fc.Baggage["agent_type"]
+}
+
+// agentTypeFromLogContext falls back to LogMeta when fabric baggage
+// is empty. Not every entry path installs baggage; LogMeta is
+// populated on every steering-manager-bound turn.
+func agentTypeFromLogContext(_ context.Context) string {
+	// LogMeta currently has no AgentType field. The fabric baggage
+	// path is the authoritative source; this helper is a stub so
+	// callers don't have to branch on presence.
+	return ""
+}
+
+// recentForestConsultID pulls the most recent forest consult ID
+// attached to this ctx. Populated by the forest_consult handler so
+// subsequent activity emissions within the same call stack can
+// declare Caused back to the consult. Returns empty string when no
+// consult is attached.
+func recentForestConsultID(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(forestConsultIDCtxKey{}).(string)
+	return v
+}
+
+// forestConsultIDCtxKey attaches the most-recent forest-consult
+// activity ID to ctx so downstream chokepoints can link their
+// emissions back as Caused. Set by the `*_forest_consult` skill
+// handler.
+type forestConsultIDCtxKey struct{}
+
+// WithForestConsultID returns a context carrying the consult
+// activity ID so downstream tool/LLM/decision emissions link back.
+// Callers should not typically set this manually — the
+// `*_forest_consult` skill handler plumbs it automatically.
+func WithForestConsultID(ctx context.Context, id string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(id) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, forestConsultIDCtxKey{}, id)
 }
 
 const defaultToolOutputCap = 64 * 1024

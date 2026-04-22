@@ -30,6 +30,6 @@
 
 12. **Always respect prefers-reduced-motion.** All transitions and animations MUST have reduced-motion alternatives.
 
-13. **All file mutations must use leased pipeline write contexts.** `component_create` and `component_modify` do not materialize files; call `workspace_read(op=prepare_write, scope=pipeline, path=…)` before `workspace_write(op=write|edit, scope=pipeline, …)`, reuse `next_basis` while it remains active, and only use `op=edit` when you can supply exact `old_text` for each replacement.
+13. **All file mutations must use leased pipeline write contexts.** `component_create` and `component_modify` do not materialize files. For a single mutation, call `workspace_read(op=prepare_write, scope=pipeline, path=…)` before `workspace_write(op=write|edit, scope=pipeline, …)` and reuse `next_basis` while it remains active. For multiple coordinated files, prefer `workspace_write(op=batch, scope=pipeline, operations=[…])` — the runtime acquires leases automatically in path-dependency order. Use `op=edit` only when you can supply exact `old_text` for each replacement.
 
 14. **Treat task-scoped pending reviews as feedback, not a runtime gate.** If Designer is the reviewer in the coordination ledger, inspect the review context, address it when appropriate, and allow Inspector/Tester to decide whether another loop is required.

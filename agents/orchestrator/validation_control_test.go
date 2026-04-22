@@ -28,7 +28,7 @@ func TestHandleValidationVerdictForwardCreatesHoldAndRemediationCase(t *testing.
 		bus:          bus,
 		running:      true,
 		pendingBus:   make(map[string]*agentshared.PendingSyncWait),
-		dispatchGate: newDispatchHoldGate(),
+		dispatchGate: newDispatchHoldGate(store),
 		channels:     guide.NewAgentChannels("orchestrator", "orch-1234"),
 		knownAgents: map[string]*guide.AgentAnnouncement{
 			"arch-1234": {AgentID: "arch-1234", AgentType: "architect"},
@@ -109,8 +109,11 @@ func TestHandleValidationVerdictForwardCreatesHoldAndRemediationCase(t *testing.
 	if hold == nil {
 		t.Fatal("expected active execution hold")
 	}
-	if !orch.dispatchGate.isActive("sess") {
-		t.Fatal("expected dispatch gate to be active")
+	// Gate state is a projection over the store — a persisted active
+	// hold for (sess, planID) means the gate will block any DAG in
+	// that plan that isn't exempted.
+	if !orch.dispatchGate.isHeld("sess", hold.PlanID, "dag-blocked") {
+		t.Fatal("expected dispatch gate to report blocked for plan-scoped DAG")
 	}
 	caseRecord, err := store.GetRemediationCase(hold.RemediationCaseID)
 	if err != nil {
@@ -164,6 +167,7 @@ func TestHandleValidationVerdictForwardPassDoesNotReleaseActiveHold(t *testing.T
 	hold := &ExecutionHoldRecord{
 		HoldID:             "hold_existing",
 		SessionID:          "sess",
+		PlanID:             "plan-existing",
 		EpochID:            "epoch_existing",
 		Status:             ExecutionHoldStatusActive,
 		Reason:             "blocking_failure",
@@ -180,9 +184,8 @@ func TestHandleValidationVerdictForwardPassDoesNotReleaseActiveHold(t *testing.T
 		config:       Config{SessionID: "sess", AgentID: "orchestrator"},
 		store:        store,
 		running:      true,
-		dispatchGate: newDispatchHoldGate(),
+		dispatchGate: newDispatchHoldGate(store),
 	}
-	orch.dispatchGate.activate("sess")
 
 	payload := &agentshared.ValidationVerdictPayload{
 		Kind:             agentshared.ValidationVerdictPass,
@@ -224,16 +227,19 @@ func TestHandleValidationVerdictForwardPassDoesNotReleaseActiveHold(t *testing.T
 	if storedHold == nil {
 		t.Fatal("expected hold to remain active")
 	}
-	if !orch.dispatchGate.isActive("sess") {
-		t.Fatal("expected dispatch gate to remain active")
+	if !orch.dispatchGate.isHeld("sess", "plan-existing", "dag-any") {
+		t.Fatal("expected gate to still project the plan-scoped hold")
 	}
 }
 
 func TestHandleCommandApprovalHoldForwardPausesAndResumesDAG(t *testing.T) {
+	// Approval holds are in-memory only — no store needed for this
+	// test path. newDispatchHoldGate(nil) is safe; isHeld short-
+	// circuits its store lookup when store is nil.
 	orch := &Orchestrator{
 		config:       Config{SessionID: "sess", AgentID: "orchestrator"},
 		running:      true,
-		dispatchGate: newDispatchHoldGate(),
+		dispatchGate: newDispatchHoldGate(nil),
 	}
 
 	beginPayload := &agentshared.CommandApprovalHoldRequest{
@@ -270,7 +276,7 @@ func TestHandleCommandApprovalHoldForwardPausesAndResumesDAG(t *testing.T) {
 	if result.State != "active" {
 		t.Fatalf("begin result state = %q, want active", result.State)
 	}
-	if !orch.dispatchGate.isHeld("sess", "dag-1") {
+	if !orch.dispatchGate.isHeld("sess", "", "dag-1") {
 		t.Fatal("expected dag hold to be active")
 	}
 
@@ -296,7 +302,7 @@ func TestHandleCommandApprovalHoldForwardPausesAndResumesDAG(t *testing.T) {
 	if _, err := orch.handleCommandApprovalHoldForward(context.Background(), resolveFwd); err != nil {
 		t.Fatalf("resolve approval hold: %v", err)
 	}
-	if orch.dispatchGate.isHeld("sess", "dag-1") {
+	if orch.dispatchGate.isHeld("sess", "", "dag-1") {
 		t.Fatal("expected dag hold to be resolved")
 	}
 }

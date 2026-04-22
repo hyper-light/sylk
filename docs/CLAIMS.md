@@ -1292,3 +1292,431 @@ Add `StatusImplementing` replacing `StatusDefiningCriteria` + `StatusCreatingTes
 | Skills: Phase gating | run_test_suite blocked during implementation |
 | Skills: Disposition | Protocol skills absent for claims pipelines, claims skills present |
 | Recovery: Crash resilience | Kill mid-mutation -> WAL replay -> consistent state |
+
+---
+
+## 13. Full System Conversion Plan
+
+Every component, every agent, every interaction converted to claims-based execution. No exceptions.
+
+### 13.1 Conversion Tiers
+
+The conversion is structured in dependency order. Each tier builds on the prior tier. No tier is optional.
+
+```
+Tier 0: Core claims infrastructure (types, board, WAL, amplifier)
+Tier 1: Fabric integration (ActionKinds, ambient context, lenses)
+Tier 2: Pipeline agent conversion (Inspector, Tester, Engineer, Designer)
+Tier 3: Architect conversion (claim generation replaces task generation)
+Tier 4: Guide conversion (routing becomes action dispatch)
+Tier 5: Knowledge agent conversion (Librarian, Academic, Archivalist)
+Tier 6: Infrastructure agent conversion (Scribe, Guardian)
+Tier 7: Orchestrator conversion (DAG nodes become actions, remove mediation)
+Tier 8: Sovereign system retirement (protocol, coordination service, decision manifest)
+Tier 9: System infrastructure conversion (handoff, session, VFS, error handling)
+Tier 10: TUI conversion (render claims/testaments/artifacts)
+Tier 11: Boot and lifecycle conversion
+```
+
+---
+
+### 13.2 Tier 0: Core Claims Infrastructure
+
+**What**: The foundational types, board, persistence, and amplifier. Everything else depends on this.
+
+**Components:**
+
+| Deliverable | Package | Description |
+|---|---|---|
+| Claims types | `core/claims/types.go` | Relation, StatusChange, ClaimScopeEntry, Action, Claim, Testament, Artifact, Validation, ClaimProgressUpdate, all enums. The 9 universal base fields + per-type semantic fields. |
+| ClaimsBoard | `core/claims/board.go` | Sovereign store: PostAction, SubmitTestaments, EvaluateValidation, RejectClaim, phase transitions, queries, projection, subscription. Flat maps for all 5 entity types. |
+| WAL persistence | `core/claims/board_durable.go` | 10 WAL event types, checkpoint struct, apply handlers, recovery via replay. Same `durableProtocolLog` pattern. |
+| Board amplifier | `core/claims/board_amplifier.go` | Fabric activity emission for every board mutation. All 12 ActionKinds. |
+| Corrective claims engine | `core/claims/corrective.go` | Intercepts skill precondition failures, generates corrective claim sets instead of errors. Registered as a pre-skill hook. |
+| Claims skill factories | `core/claims/skills.go` | `query_claims_board`, `post_action`, `submit_testaments`, `update_claim_progress`, `evaluate_validation`, `post_remediation_claims`, `inspect_claim_conflicts`. Shared by all agents. |
+
+**Note:** The package moves from `core/pipeline/claims/` to `core/claims/` — claims are system-wide, not pipeline-specific.
+
+---
+
+### 13.3 Tier 1: Fabric Integration
+
+**What**: The Fabric learns to observe and surface claims, testaments, and artifacts.
+
+| Deliverable | Package | Description |
+|---|---|---|
+| ActionKind constants | `core/activity/action_kind.go` | 12 new kinds: `claim_issued`, `claim_updated`, `testament_submitted`, `claim_artifact_published`, `claim_validated`, `claim_accepted`, `claim_rejected`, `claim_superseded`, `action_posted`, `corrective_issued`, `board_phase_changed`, `board_complete`. Wire into ResolutionFor, IsTerminal, paired kinds. |
+| ClaimsBoardDigest | `core/activity/lenses/ambient.go` | Extend AmbientEnvelope with claims board state: my claims, peer progress, recent testaments, blocked claims, board phase. |
+| Claims awareness skills | `core/fabric/claim_awareness_skills.go` | `query_claims_board` (Fabric lens), `query_peer_claims`, `inspect_claim_conflicts`. Register in FabricAwarenessSkillNames. |
+| Claim-scoped communication | `core/fabric/awareness_skills.go` | `consult_peer` and `challenge_peer` retired as separate skills. Challenges and consultations are actions posted via `post_action`. Existing Fabric lenses query these like any other claim activity. |
+
+---
+
+### 13.4 Tier 2: Pipeline Agent Conversion
+
+**What**: The 4 pipeline agent types (Inspector, Tester, Engineer, Designer) convert from the protocol state machine to claims. This is the largest single tier.
+
+#### 2a. Pipeline Inspector
+
+| Change | File(s) | Description |
+|---|---|---|
+| Retire protocol skills | `agents/inspector/pipeline/pipeline.go` | Remove: `challenge_agent`, `handoff_next`, `validate_work`, `process_validation`, `finalize_pipeline`, `handoff_to_ot`, `discard_pipeline`, `discard_queued_artifacts`, `query_pipeline_state`, `challenge_peer`, `consult_peer`, `inspect_open_conflicts` (12 skills) |
+| Add claims skills | `agents/inspector/pipeline/pipeline.go` | Register: `query_claims_board`, `post_action`, `evaluate_validation`, `post_remediation_claims`, `inspect_claim_conflicts` (5 skills) |
+| Issue claims on board creation | `agents/inspector/pipeline/pipeline.go` | When the board is populated from architect's assembly, the inspector is the formal issuer. Claims carry inspector's AgentID in the issuer Relation. |
+| Evaluate testaments | `agents/inspector/pipeline/pipeline.go` | During validation phase, inspector evaluates each testament's artifacts against each claim's validations. Uses `evaluate_validation` skill. |
+| Post remediation claims | `agents/inspector/pipeline/pipeline.go` | When validations fail, issues new corrective/remediation claims via `post_remediation_claims`. |
+| VFS commit on board complete | `agents/inspector/pipeline/pipeline.go` | On `MarkComplete`, inspector calls `PipelineCommitter.MergePipelineIntoGreen()` and publishes bus event. |
+
+#### 2b. Pipeline Tester
+
+| Change | File(s) | Description |
+|---|---|---|
+| Retire protocol skills | `agents/tester/pipeline/pipeline.go` | Remove 9 protocol + challenge/consult skills. |
+| Add claims skills | `agents/tester/pipeline/pipeline.go` | Register same 5 claims skills as inspector + `submit_testaments`, `update_claim_progress`. |
+| Phase-gate run_test_suite | `agents/tester/pipeline/pipeline.go` | Blocked during implementation phase. Returns corrective claim directing tester to `write_test`. |
+| Submit testaments for test authoring | `agents/tester/pipeline/pipeline.go` | During implementation: submits testaments with test file artifacts. During validation: submits testaments with test execution artifacts. |
+| Post remediation claims for test failures | `agents/tester/pipeline/pipeline.go` | When tests fail, issues claims against engineer with failure artifacts. |
+
+#### 2c. Engineer
+
+| Change | File(s) | Description |
+|---|---|---|
+| Retire protocol skills | `agents/engineer/skills.go` | Remove 8 protocol + challenge/consult skills. |
+| Add claims skills | `agents/engineer/skills.go` | Register: `query_claims_board`, `post_action`, `submit_testaments`, `update_claim_progress`, `inspect_claim_conflicts`. |
+| Work against claims | `agents/engineer/skills.go` | Every file write, every tool invocation produces an `update_claim_progress`. Completion produces a testament with code reference + diff artifacts. |
+| Corrective claims on scope violation | `core/claims/corrective.go` | Engineer calling `write_pipeline_file` without scope claim triggers corrective action, not error. |
+
+#### 2d. Designer
+
+| Change | File(s) | Description |
+|---|---|---|
+| Same pattern as Engineer | `agents/designer/skills.go` | Retire 8 protocol skills, add 5 claims skills. Testaments carry design_asset, a11y_audit, token mapping artifacts. |
+
+#### 2e. Pipeline Protocol Retirement
+
+| Change | File(s) | Description |
+|---|---|---|
+| Remove protocol state machine | `agents/shared/pipeline_protocol.go` | The entire `PipelineProtocolSnapshot`, `PipelineTurnAction`, `PipelineProtocolState`, reducer, mailbox obligations, terminal action guards — all replaced by the claims board. |
+| Remove durable protocol events | `agents/shared/pipeline_protocol_durable.go` | `handoff_selected`, `validation_submitted`, `validation_processed`, `ready_for_ot`, `handoff_to_ot`, `tester_finalize`, `tester_artifact_consumed` — all replaced by claims WAL events. |
+| Remove pipeline projection | `agents/shared/pipeline_projection.go` | Replaced by `ClaimsBoardProjection`. |
+| Remove pipeline expand | `agents/orchestrator/pipeline_expand.go` | Sub-node expansion (StageInspect/StageTest/StageExecute) replaced by claims dispatch. |
+| Remove pipeline runtime protocol path | `agents/orchestrator/pipeline_runtime.go` | `routeProtocolPipelineTask`, `pipelineProtocolEligible`, initial protocol snapshot — all replaced by claims dispatch. |
+
+---
+
+### 13.5 Tier 3: Architect Conversion
+
+**What**: The Architect stops generating vague task descriptions and produces precise, atomic claims with validations.
+
+| Change | File(s) | Description |
+|---|---|---|
+| TaskClaim types | `agents/architect/types.go` | Add `TaskClaim` (with Relations, validations) to `HandoffTask` and `AtomicTask`. Remove `AcceptanceCriteria`, `SuccessCriteria` as separate fields — they become validations on claims. |
+| LLM prompt rewrite | `agents/architect/planner_anthropic.go` | Instruct the LLM to produce precise, atomic claims: not "implement JWT middleware" but "implement HS256 JWK deserialization" with validations like "JWK with valid key deserializes" / "returns typed struct, no silent fallbacks". |
+| Claim generation in toTask | `agents/architect/planner_anthropic.go` | `toTask()` converts `claimPayload` to `TaskClaim`. Owner normalization, ID generation, validation type inference. |
+| Handoff wiring | `agents/architect/skills_planning.go` | `atomicTaskToHandoff()` and `buildPlanHandoff()` carry claims through to the orchestrator. |
+| Plan as action | `agents/architect/skills_planning.go` | The entire plan handoff becomes an action. The plan's tasks become claims within that action. The architect assembles; the inspector issues. |
+
+---
+
+### 13.6 Tier 4: Guide Conversion
+
+**What**: The Guide's intent classification and direct communication protocol are preserved and enhanced — they are sound routing infrastructure. What changes is that the Guide stops being a **context carrier** and the session gains a **claims board** as persistent conversational state. The Guide routes requests; the board carries context.
+
+**What stays (adapt and enhance):**
+- **Intent classification** — determines which agent handles a request. Unchanged. Enhanced: the classification result is recorded as a testament on the session board (artifact: intent, confidence, target agent), making routing decisions auditable and reusable.
+- **Direct communication protocol** (`RequestGuideRouteSync`, `InterAgentBranchSpec`, `ForwardedRequest`) — the transport mechanism for agent-to-agent routing. Unchanged. Claims travel through this protocol, not around it.
+- **Direct address detection** (`@architect`, `@librarian`) — unchanged. The detected target is still used for routing. The address also generates a Relation on the resulting claim (relationship: `direct_addressed`).
+- **Session routing preferences** — per-session agent preferences, LFU eviction, classification caching. Unchanged.
+
+**What changes (context moves to the board):**
+- `ConversationHistory` on `ForwardedRequest` is no longer the source of truth for prior context. It may still be populated as a convenience hint, but agents read the session board for authoritative context.
+- The Guide posts every user prompt as an action on the session board before routing. The target agent sees the action's claims on the board when it receives the forwarded request.
+- The Guide's classification result is a testament on the board — walking from any agent's work back to the user prompt that triggered it is a Relation traversal, not a `ConversationHistory` lookup.
+
+| Change | File(s) | Description |
+|---|---|---|
+| User prompt as action on session board | `agents/guide/session_routing.go` | Every user input becomes a prompt action with claims posted to the session's claims board BEFORE the Guide routes the request. The target agent receives the forwarded request via the existing direct communication protocol AND reads the session board for full context. |
+| Classification as testament | `agents/guide/classification.go` | The Guide's classifier produces a testament with classification artifacts (intent, confidence, target agent, routing rationale). Posted to the session board. Makes routing decisions auditable and queryable. |
+| Context on the board, not in transit | `agents/guide/` | `ConversationHistory` on `ForwardedRequest` becomes a best-effort hint, not the source of truth. Prior conversation context lives on the session board — the target agent reads testaments from prior actions. This fixes the conversation history loss bug permanently. |
+| Direct address preserved | `agents/guide/direct_address.go` | `@architect` still routes to the architect via the existing direct communication protocol. Additionally, a `direct_addressed` Relation is added to the claim for auditability. |
+| Session-scoped board | `agents/guide/` | Each session gets a root claims board. All user interactions, agent responses, and cross-agent communications are actions on this board. The board IS the conversation history. |
+| ForwardedRequest carries board reference | `agents/guide/` | `ForwardedRequest.Metadata` gains a `session_board_id` key so the target agent can locate the session board. The existing metadata mechanism is reused — no structural change to `ForwardedRequest`. |
+
+---
+
+### 13.7 Tier 5: Knowledge Agent Conversion
+
+**What**: Librarian, Academic, and Archivalist become claims participants. Consultations are actions; responses are testaments.
+
+#### 5a. Librarian
+
+| Change | File(s) | Description |
+|---|---|---|
+| `consult` skill retirement | `agents/librarian/` | The standalone `consult` skill is retired. Agents issue consultation actions against the Librarian. |
+| Consultation claims | `agents/librarian/` | Librarian receives claims like "Identify project formatters for Go modules", "Verify naming conventions in services/auth/". |
+| Knowledge testaments | `agents/librarian/` | Librarian responds with testaments: "Identified gofumpt as project formatter" with artifacts: `reference_links` (config file path), `code_reference` (existing formatted files). |
+| Proactive claims | `agents/librarian/` | When Librarian observes work in a scope it has knowledge about (via Fabric), it issues proactive consultation claims with testaments preemptively. |
+
+#### 5b. Academic
+
+| Change | File(s) | Description |
+|---|---|---|
+| Research as claims | `agents/academic/` | Research requests become claims: "Research best practices for HS256 JWK implementation". Academic responds with testaments containing research_paper, reference_links, knowledge_graph_vectors artifacts. |
+| Librarian validation | `agents/academic/` | Academic's recommendations carry a validation: "Recommendation aligns with codebase patterns" — Librarian evaluates this by checking the testament's recommendations against actual project patterns. |
+
+#### 5c. Archivalist
+
+| Change | File(s) | Description |
+|---|---|---|
+| Ingestion as claims | `agents/archivalist/` | Every ingestion request is a claim: "Ingest architect context window summary". Archivalist responds with testament containing ingestion_response artifacts (document DB IDs, KG vector IDs, entry IDs). |
+| Memory retrieval as claims | `agents/archivalist/` | "Retrieve prior failure modes for services/auth/" is a claim. Archivalist responds with testament containing document_db_snippet and knowledge_graph_vectors artifacts. |
+
+---
+
+### 13.8 Tier 6: Infrastructure Agent Conversion
+
+#### 6a. Scribe
+
+| Change | File(s) | Description |
+|---|---|---|
+| Summarization as claims | `agents/scribe/` | "Summarize architect's last context window" is a claim issued against the Scribe. Scribe responds with testament: "Submitted architect context summary at 2:01AM" with artifacts: archivalist receipt, document DB ingestion response, KG vector storage response. |
+| Per-agent narration as claims | `agents/scribe/` | The Scribe's continuous narration stream becomes a series of archival actions with claims against itself and the Archivalist. Each narration cycle produces testaments with ingestion artifacts. |
+
+#### 6b. Guardian
+
+| Change | File(s) | Description |
+|---|---|---|
+| Command approval as claims | `agents/guardian/`, `core/commandapproval/` | An agent needing to execute a mutating command issues a claim against the Guardian: "Approve execution of `go test ./...` in services/auth/". Validation: "Command is safe, scoped, and authorized". Guardian evaluates, responds with testament: "Approved `go test` execution" with artifacts: approval receipt, scope verification, safety assessment. |
+| Content validation as claims | `agents/guardian/` | Guardian's content scanning becomes claims: "Validate output contains no credentials" with validations against the content. Testament contains scan results. |
+| Corrective claims on denial | `agents/guardian/` | Instead of returning an error on command denial, Guardian issues corrective claims: "Modify command to exclude sensitive paths", "Request user authorization for elevated access". |
+
+---
+
+### 13.9 Tier 7: Orchestrator Conversion
+
+**What**: The Orchestrator stops mediating agent interactions. It manages DAG execution by monitoring claims boards. It does not dispatch global reviews, carry conversation context, or track pending checkpoint reviews.
+
+| Change | File(s) | Description |
+|---|---|---|
+| DAG nodes as actions | `agents/orchestrator/dag_bridge.go` | Each DAG node dispatch creates an action on the pipeline's claims board. The node's task prompt becomes claims. Node completion = board `MarkComplete`. |
+| Remove pipeline dispatch mediation | `agents/orchestrator/pipeline_runtime.go` | Remove `routeProtocolPipelineTask`, `publishOTGlobalFollowupRequest`, `recordPendingCheckpointReview`. Pipeline inspector routes directly to global inspector. |
+| Remove checkpoint review tracking | `agents/orchestrator/checkpoint_review.go` | Delete `pendingCheckpointReview`, `HandleCheckpointReviewTerminal`, `completePendingCheckpointReview`, `failPendingCheckpointReview`. DAG bridge subscribes to `global_review.complete` bus events. |
+| Task dispatch as action | `agents/orchestrator/task_dispatch.go` | `handleTaskDispatch` creates a claims board, posts the architect's claims as an action, and dispatches subjects. No protocol handshake. |
+| Health monitoring via claims | `agents/orchestrator/` | Agent health checks become periodic claims: "Report health status". Agents respond with testaments containing health artifacts. |
+| Coordination via claims | `agents/orchestrator/` | The orchestrator's coordination service (scope claims, artifacts, reviews) becomes part of the claims board. Scope claims are claims. Artifact publishing is a testament. Review requests are consultation actions. |
+
+---
+
+### 13.10 Tier 8: Sovereign System Retirement
+
+**What**: The three existing sovereign systems (Pipeline Protocol, Coordination Service, Decision Manifest) are subsumed by the claims board.
+
+#### 8a. Pipeline Protocol → Claims Board
+
+| What's Retired | Replaced By |
+|---|---|
+| `PipelineProtocolSnapshot` | `ClaimsBoardProjection` |
+| `PipelineTurnAction` | `Action` with claims |
+| `PipelineProtocolState` (reducer, WAL, mailbox) | `ClaimsBoard` (WAL, projection, subscription) |
+| `handoff_selected`, `validation_submitted`, etc. | `action_posted`, `testament_submitted`, etc. |
+| Terminal action guards | Board phase transitions |
+| Audit lock | Eliminated — peers coordinate via claims |
+
+#### 8b. Coordination Service → Claims Board
+
+| What's Retired | Replaced By |
+|---|---|
+| `coord_claim_scope` | Scope claim: claim with scope entries, issuer=requesting agent, subject=coordinator |
+| `coord_publish_artifact` | Testament with artifact: agent publishes work as testament |
+| `coord_request_review` | Consultation action: agent issues review claim against peer |
+| `coord_resolve_artifact` | `evaluate_validation`: reviewer evaluates testament artifacts |
+| `coord_query_view` | `query_claims_board`: full board state including scope claims |
+| `coord_watch_updates` | Board subscription: reactive projection updates |
+| `ClaimMode` (exclusive/shared/review) | Relation types on scope claims: `exclusive_scope`, `shared_scope`, `review_scope` |
+
+#### 8c. Decision Manifest → Claims Board
+
+| What's Retired | Replaced By |
+|---|---|
+| `declare_decision` | Claim: "Declare test_framework=pytest" with testament containing detection artifacts |
+| `query_decisions` | `query_claims_board` filtered by decision-type claims |
+| Decision confidence (Hint/Tentative/Committed/Consensus) | Testament `Confidence` field (hint/tentative/committed/consensus) |
+| Auto-publish on skill invocation | Skill amplifiers emit claims: `detect_test_harness` → claim "test_framework detected" with testament |
+| Manifest reconciliation | `inspect_claim_conflicts`: surface conflicting decision claims across pipelines |
+
+---
+
+### 13.11 Tier 9: System Infrastructure Conversion
+
+#### 9a. Handoff Protocol → Claims Board
+
+| Change | File(s) | Description |
+|---|---|---|
+| Handoff state is the board | `core/handoff/` | When an agent's context fills and triggers handoff, the new instance reads the claims board — all prior claims, testaments, artifacts, and progress are there. No separate handoff state transfer needed. |
+| Remove `BuildHandoffState` / `InjectHandoffState` | `core/concurrency/pipeline_handoff_integration.go` | The `HandoffableAgent` interface is simplified: the board IS the handoff state. |
+| Handoff as claim | `core/handoff/` | The handoff itself becomes a claim: "Continue work on claims [X, Y, Z]" issued against the new agent instance. The new instance submits testaments proving it resumed correctly. |
+
+#### 9b. Session Management → Session Board
+
+| Change | File(s) | Description |
+|---|---|---|
+| Session-scoped root board | `core/session/` | Every session gets a root claims board. User prompts, agent responses, cross-agent interactions — all are actions on this board. The board IS the conversation history. |
+| Pipeline boards as children | `core/session/` | Pipeline-scoped boards are children of the session board. The session board provides the "global context" that the Guide currently fails to carry between turns. |
+| Session persistence | `core/session/` | Session boards persist to `.sylk/sessions/<id>/claims/`. Recovery restores the full conversation state. |
+
+#### 9c. VFS Integration
+
+| Change | File(s) | Description |
+|---|---|---|
+| File scope as claim prerequisite | `core/versioning/`, `core/claims/corrective.go` | Every `write_pipeline_file`, `edit_pipeline_file`, `delete_pipeline_file` requires a validated scope claim. If missing, a corrective claim is issued instead of an error. |
+| File writes produce artifacts | `agents/shared/` | Every VFS write automatically produces an artifact (kind: `diff`, reference: the changed file path + line range) attached to the active claim's progress. |
+| VFS commit as testament | `core/versioning/` | `MergePipelineIntoGreen` success produces a testament with merge artifacts (paths merged, version, base version). |
+
+#### 9d. Error Handling → Corrective Claims
+
+| Change | File(s) | Description |
+|---|---|---|
+| Skill precondition failures | `core/claims/corrective.go` | Every skill that currently returns an error for a precondition (missing scope, wrong phase, insufficient context) instead generates a corrective action with claims that guide the agent to satisfy the precondition. |
+| LLM failures | `core/providers/` | Provider errors (timeout, rate limit, context canceled) produce corrective claims: "Retry with reduced context", "Wait for rate limit reset", "Simplify the request". |
+| Tool failures | `core/toolruntime/` | Tool execution failures produce claims against the agent: "Diagnose tool failure", "Retry with adjusted parameters". |
+
+#### 9e. Steering Ledger → Claims
+
+| Change | File(s) | Description |
+|---|---|---|
+| Steering as claims | `core/steering/`, `agents/shared/` | "Focus on security-critical paths" becomes a claim from the user/inspector against the engineer. The steering ledger's priority hints become claim `Priority` fields. Quality gates become validations. |
+
+---
+
+### 13.12 Tier 10: TUI Conversion
+
+**What**: The terminal UI renders claims, testaments, and artifacts instead of protocol state and task prompts.
+
+| Change | File(s) | Description |
+|---|---|---|
+| Agent panel | `ui/agent/` | Shows claims board state per pipeline: claims in progress, testified, accepted/rejected. Replaces the sequential phase display (defining criteria → creating tests → executing → validating). |
+| Pipeline visualization | `ui/` | Pipeline panel shows claim progress bars, testament counts, artifact counts. Color-coded by status. |
+| Chat rendering | `ui/chat/` | Testaments rendered as structured responses with collapsible artifact lists. Claims rendered as task cards. |
+| Claims board view | `ui/` (new) | Dedicated claims board panel: full board state, filterable by agent/status/action type. Shows the claim → testament → validation chain. |
+| Conversation context | `ui/chat/` | The conversation IS the session board. Prior turns are visible as prior actions with their testaments. No lost context between turns. |
+
+---
+
+### 13.13 Tier 11: Boot and Lifecycle Conversion
+
+| Change | File(s) | Description |
+|---|---|---|
+| Boot as claims | `core/boot/` | Boot pipeline phases (setup → detect → allocate → ingest → commit → finalize) become claims on a boot board. Each phase submits a testament with success artifacts. Boot completes when all claims are accepted. |
+| Agent activation as claims | `core/container/` | Agent activation is a claim: "Activate engineer for session X". The container responds with a testament containing the agent ID, readiness status. |
+| Shutdown as claims | `core/container/` | Graceful shutdown issues claims against each active agent: "Persist state and terminate". Agents respond with shutdown testaments. |
+
+---
+
+### 13.14 Conversion Summary
+
+| Tier | Components | Claims Board Scope | Replaces |
+|---|---|---|---|
+| 0 | Core types, board, WAL, amplifier, corrective engine, skills | System-wide | Nothing (new) |
+| 1 | Fabric ActionKinds, ambient context, awareness skills | System-wide | Partial Fabric integration |
+| 2 | Inspector, Tester, Engineer, Designer (pipeline) | Per-pipeline | Pipeline Protocol |
+| 3 | Architect | Per-plan | AcceptanceCriteria, SuccessCriteria, task prompts |
+| 4 | Guide | Per-session | ConversationHistory, ForwardedRequest routing |
+| 5 | Librarian, Academic, Archivalist | Per-session | `consult` skill, consultation cache |
+| 6 | Scribe, Guardian | Per-session | Narration stream, command approval gates |
+| 7 | Orchestrator | Per-DAG | Pipeline dispatch, checkpoint review, health monitoring |
+| 8 | Protocol, Coordination, Decision Manifest | N/A (retired) | Three sovereign systems → one claims board |
+| 9 | Handoff, Session, VFS, Errors, Steering | Per-session | Handoff state, conversation context, error returns |
+| 10 | TUI | N/A (rendering) | Protocol state display, sequential phase panels |
+| 11 | Boot, Container lifecycle | Per-boot | Boot pipeline phases |
+
+---
+
+### 13.15 Tier 12: Persistence and Reasoning Infrastructure
+
+These are the systems that store, index, retrieve, and reason over knowledge. Claims don't just flow through them — claims, testaments, and artifacts ARE the data they persist and reason over.
+
+#### 12a. Memory Forest
+
+The Memory Forest is the long-term cross-session precedent store. Currently it harvests "successful causal chains" from the Fabric's Coarse-resolution activities. With claims, the harvest material is richer and more structured.
+
+| Change | File(s) | Description |
+|---|---|---|
+| Harvest claims, not activities | `core/forest/` | The Memory Forest subscriber shifts from harvesting raw `decision_declared` / `validation_accepted` activities to harvesting **accepted claims with their full testament+artifact chains**. An accepted claim is a proven assertion — its testament is the evidence, its artifacts are the proof. This is strictly richer than a raw activity. |
+| Claims as forest branches | `core/forest/` | Each accepted claim becomes a forest branch. The branch carries: the claim's description, the testament's summary, all artifact references, the validation verdicts and their quality bars. Semantic retrieval queries match against claim descriptions and testament summaries. |
+| Testament artifacts as leaf nodes | `core/forest/` | Artifacts (code references, test outputs, research papers, design assets) become leaf nodes on the branch. Retrieval returns the full claim → testament → artifact chain, not just a disembodied precedent. |
+| Cross-session claim lineage | `core/forest/` | When a claim in session B is similar to an accepted claim from session A, the forest surfaces the prior claim's testament and artifacts as a precedent. The agent sees exactly what was done before, how it was validated, and what artifacts proved it. |
+| `forest_recall` returns claims | `core/forest/` | The `forest_recall`, `forest_resolve_intent`, and `forest_predict_next_branches` skills return prior claims with their testaments, not raw decision records. Agents see structured precedent: "Last time someone claimed X, the testament was Y with artifacts Z, and it was accepted." |
+| Rejection precedents | `core/forest/` | Rejected claims are also harvested — they're anti-precedents. "Last time someone tried X, it was rejected because Y." The rejection reason (from the StatusHistory) and the failing validation verdicts are preserved. |
+
+#### 12b. Knowledge Graph (VectorGraphDB)
+
+The knowledge graph stores semantic embeddings and causal edges. With claims, the graph gains structured nodes for every entity type.
+
+| Change | File(s) | Description |
+|---|---|---|
+| Claims as graph nodes | `core/vectorgraphdb/` | Every claim becomes a node with an embedding of its description. The node carries the claim's Relations, status, and testament reference. |
+| Testaments as graph nodes | `core/vectorgraphdb/` | Every testament becomes a node with an embedding of its summary. Edges connect testaments to their claims (Relation: `claim`) and to their artifacts. |
+| Artifacts as graph nodes | `core/vectorgraphdb/` | Artifacts that carry semantic content (research papers, code references, diagnosis reports) become nodes. Artifacts that are purely structural (ingestion receipts, approval tokens) are stored as metadata on the testament node, not as separate nodes. |
+| Causal edges from Relations | `core/vectorgraphdb/` | The Relation system maps directly to graph edges: `supersedes`, `depends_on`, `caused_by`, `refines`, `derived_from` all become first-class edge types. The graph can walk from any artifact back through its testament, claim, and action to the original user prompt. |
+| Validation verdicts as edge weights | `core/vectorgraphdb/` | Edges from claims to testaments carry the validation verdict as weight. Accepted testaments have high-confidence edges. Rejected testaments have low-confidence edges with the failure reason as edge metadata. |
+| Semantic search over claims | `core/vectorgraphdb/` | "Find prior work similar to HS256 JWK deserialization" searches claim descriptions. Returns the full chain: matching claims, their testaments, and their artifacts. Richer than searching raw activities. |
+| Cross-pipeline claim graphs | `core/vectorgraphdb/` | Claims from different pipelines that share scope entries (same files, same symbols) are connected by `conflicts_with` or `refines` edges. The graph surfaces cross-pipeline interactions. |
+
+#### 12c. Document DB
+
+The document DB stores full-text searchable documents (Scribe narrations, Archivalist entries, research outputs). With claims, documents are anchored to specific claims and testaments.
+
+| Change | File(s) | Description |
+|---|---|---|
+| Testaments as documents | `core/knowledge/` | Every testament with a non-trivial summary becomes a document in the DB. The document carries the testament's ID, claim reference, artifacts, and the full Relation chain. Full-text search over testament summaries. |
+| Artifacts as document attachments | `core/knowledge/` | Artifact references are indexed as attachments on testament documents. Searching for "JWK deserialization" finds testaments whose artifacts reference JWK-related files. |
+| Claim-scoped retrieval | `core/knowledge/` | "Show me all documents related to claim X" retrieves the claim's testament, all related artifacts, any narrations the Scribe produced during the claim's implementation, and any Archivalist entries generated from those narrations. |
+| Ingestion receipts as artifacts | `core/knowledge/` | When the Archivalist ingests a document, its ingestion receipt is an artifact on the Scribe's testament. The document DB entry links back to the specific claim that generated it through the artifact → testament → claim chain. |
+
+#### 12d. Fabric
+
+The Fabric itself is the observation/coordination substrate. With claims as the universal primitive, the Fabric's role evolves from "observe sovereign systems and project" to "observe the claims board and project."
+
+| Change | File(s) | Description |
+|---|---|---|
+| Single sovereign source | `core/activity/` | The Fabric currently observes 3+ sovereign systems (Decision Manifest, Coordination Service, Pipeline Protocol) via separate amplifiers. With claims, there is ONE sovereign source: the claims board. One amplifier, one projection path. All other sovereign systems are retired (Tier 8). |
+| Activity → Claim mapping | `core/activity/` | Every Fabric activity maps to a claims entity. `claim_issued` → Claim. `testament_submitted` → Testament. `claim_artifact_published` → Artifact. `claim_validated` → Validation StatusChange. The activity stream becomes a projection of the claims board, not a parallel record. |
+| Richer causal chains | `core/activity/` | Current causal chains link activities by `Caused` / `Resolves`. With claims, the causal chain is explicit in Relations: claim `caused_by` action, testament `caused_by` claim, artifact `caused_by` testament. The Fabric's `causal_trace` lens walks Relations, not ad-hoc `Caused` pointers. |
+| Ambient context = board digest | `core/activity/lenses/ambient.go` | The ambient context envelope stops aggregating from multiple sovereign projections and reads directly from the claims board projection. One source of truth, not a merge of three. |
+| Lens queries = board queries | `core/activity/lenses/` | `query_peer_activity` becomes `query_claims_board` filtered by peer. `inspect_open_conflicts` becomes `inspect_claim_conflicts`. `find_related_activity` searches claim/testament descriptions. The lens layer thins — it's querying one store, not correlating across three. |
+| Resolution tiers still apply | `core/activity/` | Atomic/Fine/Medium/Coarse resolution tiers still determine storage lifetime. Claim progress updates (Medium) evict faster than accepted claims (Coarse, permanent). Artifacts tagged `Ephemeral` evict after iteration; durable artifacts persist to Coarse tier. |
+| Chokepoint instrumentation simplified | `core/activity/span.go` | Currently, 10+ chokepoints emit raw activities and 6+ amplifiers project sovereign state. With one sovereign source, the amplifier count drops to 1 (the claims board amplifier). Chokepoints still emit infrastructure activities (LLM calls, file writes, command executions) but semantic activities all flow through claims. |
+
+#### 12e. Bleve (Full-Text Search)
+
+| Change | File(s) | Description |
+|---|---|---|
+| Index claims and testaments | Bleve subscriber | The Bleve full-text index currently indexes Fabric activities. With claims, it indexes claim descriptions, testament summaries, validation descriptions, quality bars, and artifact references. Searching "HS256 deserialization" returns claims AND testaments AND their artifacts. |
+| Faceted search by entity type | Bleve subscriber | Search results faceted by: claims (what was asked), testaments (what was done), artifacts (what proof exists), validations (what was checked). Currently facets are by ActionKind — claims give semantic facets. |
+
+---
+
+### 13.16 Tier Summary (Updated)
+
+| Tier | Components | Replaces |
+|---|---|---|
+| 0 | Core types, board, WAL, amplifier, corrective engine, skills | Nothing (new) |
+| 1 | Fabric ActionKinds, ambient context, awareness skills | Partial Fabric integration |
+| 2 | Inspector, Tester, Engineer, Designer (pipeline) | Pipeline Protocol |
+| 3 | Architect | AcceptanceCriteria, SuccessCriteria, task prompts |
+| 4 | Guide | ConversationHistory, ForwardedRequest routing |
+| 5 | Librarian, Academic, Archivalist | `consult` skill, consultation cache |
+| 6 | Scribe, Guardian | Narration stream, command approval gates |
+| 7 | Orchestrator | Pipeline dispatch, checkpoint review, health monitoring |
+| 8 | Protocol, Coordination, Decision Manifest | Three sovereign systems → one claims board |
+| 9 | Handoff, Session, VFS, Errors, Steering | Handoff state, conversation context, error returns |
+| 10 | TUI | Protocol state display, sequential phase panels |
+| 11 | Boot, Container lifecycle | Boot pipeline phases |
+| 12 | Memory Forest, Knowledge Graph, Document DB, Fabric, Bleve | Raw activity harvesting, multi-source projection, unanchored search |
+
+**Total agents converted: 12**
+**Total sovereign systems retired: 3** (Pipeline Protocol, Coordination Service, Decision Manifest)
+**Total persistence systems converted: 5** (Memory Forest, Knowledge Graph, Document DB, Fabric projection, Bleve index)
+**Total interaction patterns unified: 6** → all become claim → testament
+**Fabric amplifiers reduced: 6+ → 1** (claims board amplifier)
+**Bugs fixed by design: conversation history loss** (context lives on the board, not in transit)

@@ -127,11 +127,26 @@ CREATE TABLE IF NOT EXISTS validation_epochs (
 CREATE TABLE IF NOT EXISTS execution_holds (
     hold_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
+    -- plan_id scopes the hold to the workflow that opened it. A hold
+    -- from plan A cannot block a DAG submitted under plan B in the
+    -- same session: DAGIsHeld queries include plan_id. Nullable for
+    -- legacy rows; the ensure-schema migration backfills existing
+    -- active rows by marking them superseded (plan context unknown).
+    plan_id TEXT,
     epoch_id TEXT,
     remediation_case_id TEXT,
     status TEXT NOT NULL,
     reason TEXT NOT NULL,
     summary TEXT,
+    -- blocks_dag_ids is a JSON array of DAG IDs this hold blocks.
+    -- NULL or '[]' = blocks every DAG inside the hold's plan_id (the
+    -- typical validation-hold case). A non-empty list constrains the
+    -- blocking scope to the named DAGs (used by future per-DAG holds).
+    blocks_dag_ids TEXT,
+    -- exempt_dag_ids is a JSON array of DAG IDs that may run despite
+    -- this hold — e.g., the remediation DAG the architect launches to
+    -- address the hold's concern. Empty/NULL = no exemptions.
+    exempt_dag_ids TEXT,
     created_by_agent_id TEXT NOT NULL,
     created_by_agent_type TEXT NOT NULL,
     released_at DATETIME,
@@ -155,10 +170,16 @@ CREATE TABLE IF NOT EXISTS remediation_cases (
 );
 
 -- Indexes derived from query patterns
-CREATE INDEX IF NOT EXISTS idx_dag_exec_plan ON dag_executions(plan_id);
+-- idx_dag_exec_plan is created after ensureDAGExecutionsSchema adds the
+-- plan_id column to legacy tables. Placing it here fails when
+-- CREATE TABLE IF NOT EXISTS sees an existing table that predates the
+-- plan_id column addition.
+-- CREATE INDEX IF NOT EXISTS idx_dag_exec_plan ON dag_executions(plan_id);
 CREATE INDEX IF NOT EXISTS idx_dag_exec_session ON dag_executions(session_id);
 CREATE INDEX IF NOT EXISTS idx_dag_exec_state ON dag_executions(state);
-CREATE INDEX IF NOT EXISTS idx_handoff_receipts_plan ON plan_handoff_receipts(session_id, plan_id, revision);
+-- idx_handoff_receipts_plan is likewise created after the plan_id
+-- column migration in ensurePlanHandoffReceiptSchema.
+-- CREATE INDEX IF NOT EXISTS idx_handoff_receipts_plan ON plan_handoff_receipts(session_id, plan_id, revision);
 CREATE INDEX IF NOT EXISTS idx_handoff_receipts_status ON plan_handoff_receipts(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_dag_revisions_dag ON dag_revisions(dag_id);
 CREATE INDEX IF NOT EXISTS idx_task_updates_dag ON task_updates(dag_id);
@@ -169,6 +190,11 @@ CREATE INDEX IF NOT EXISTS idx_pipeline_state_dag ON pipeline_state(dag_id);
 CREATE INDEX IF NOT EXISTS idx_plan_versions_session ON plan_versions(session_id);
 CREATE INDEX IF NOT EXISTS idx_validation_epochs_session ON validation_epochs(session_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_execution_holds_session ON execution_holds(session_id, status, updated_at);
+-- idx_execution_holds_plan is created after ensureExecutionHoldSchema
+-- adds the plan_id column to legacy tables. Placing it in schema.sql
+-- fails when CREATE TABLE IF NOT EXISTS sees an existing table that
+-- predates the plan_id column addition.
+-- CREATE INDEX IF NOT EXISTS idx_execution_holds_plan ON execution_holds(session_id, plan_id, status);
 CREATE INDEX IF NOT EXISTS idx_remediation_cases_session ON remediation_cases(session_id, status, updated_at);
 
 -- Task coordination ledger (authoritative per-task coordination state)

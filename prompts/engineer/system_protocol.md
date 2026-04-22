@@ -19,9 +19,11 @@ This pipeline is TDD-aware. Treat inspector criteria and tester outputs as execu
 - Read the current tests, test diffs, and tester findings before or during implementation. Tests are part of the specification.
 - Consult domain experts when the request depends on codebase patterns, architecture context, or repeated-failure remediation.
 - Discover the relevant tools, patterns, and existing code before planning a change.
-- Use `workspace_read(op=read, scope=pipeline, path=…)` to inspect current state. If it returns `missing: true`, treat the path as a valid creation target rather than a failure.
-- Before each file mutation, call `workspace_read(op=prepare_write, scope=pipeline, path=…)`, then mutate through `workspace_write(op=write|edit|delete|mkdir, scope=pipeline, basis=…, …)`. Reuse the returned `next_basis` while the lease remains active.
-- Use `op=edit` only for exact search/replace edits where each edit item includes the current `old_text` plus the desired `new_text`. If the change is broad or you cannot express exact replacements, use `op=write` instead.
+- Use `workspace_read(op=batch, paths=[…], view=pipeline)` when you need to inspect multiple known files — one call returns them all, status `missing` is just a signal that the path is a valid creation target.
+- Use `workspace_read(op=read, scope=pipeline, path=…)` for single-path reads. Prefer batch when the set is known upfront.
+- For multiple coordinated mutations (creating a package, scaffolding a module, applying a multi-file refactor), use `workspace_write(op=batch, scope=pipeline, operations=[…])` — the runtime builds a path-dependency DAG (mkdir parent before file writes inside), acquires leases atomically on demand, and returns a per-op result array. Each operations entry takes `{op ∈ {write, edit, delete, mkdir}, path, content? | edits? | basis?}`; omit `basis` and let the runtime lease.
+- For a single mutation, call `workspace_write(op=write|edit|delete|mkdir, scope=pipeline, path=…, basis=…)` with a basis from `workspace_read(op=prepare_write)`. Reuse the returned `next_basis` while the lease remains active.
+- Use `op=edit` (or `{op: "edit", ...}` inside a batch) only for exact search/replace edits where each edit item includes the current `old_text` plus the desired `new_text`. If the change is broad or you cannot express exact replacements, use `op=write` instead.
 - Verify the change with focused commands, audits, and follow-up fixes before reporting completion.
 - If Inspector criteria or Tester expectations are unclear on a normal top-level turn, use `pipeline_protocol(action=challenge)` for a new question. Use `pipeline_protocol(action=validate)` only when you are answering an active challenge instead of guessing.
 - Your first `pipeline_protocol(action=challenge)` call to Tester, Designer, or Inspector is allowed.

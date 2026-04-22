@@ -859,6 +859,7 @@ func parseStreamStartMsg(sessionID, correlationID string, stream *guide.StreamRe
 	result.TaskName = streamMetadataString(stream, "task_name")
 	result.TaskSlug = streamMetadataString(stream, "task_slug")
 	result.BranchRef = parseInterAgentBranchRef(stream)
+	result.ControlPlane = streamControlPlane(stream)
 	if stream.Event != nil {
 		result.Visibility = stream.Event.Visibility
 	}
@@ -1109,6 +1110,19 @@ func streamParentCorrelationID(stream *guide.StreamResponse) string {
 
 func streamTopLevelTransfer(stream *guide.StreamResponse) bool {
 	return metadataBool(effectiveStreamMetadata(stream), streamMetadataTopLevelTransfer)
+}
+
+// streamControlPlane reports whether the stream's routing metadata
+// carries a non-empty `control_plane_kind` marker — i.e., whether this
+// stream was synthesized from an internal coordination route
+// (plan-handoff status lookup, command-approval hold begin/resolve,
+// protocol reconciliation) rather than a conversational turn. The chat
+// model uses this to suppress the errant top-level agent entry the
+// stream would otherwise produce; the paired system_coordination
+// activity event carries the user-visible semantic meaning as a
+// SourceSystem chat row instead.
+func streamControlPlane(stream *guide.StreamResponse) bool {
+	return strings.TrimSpace(streamMetadataString(stream, "control_plane_kind")) != ""
 }
 
 func metadataString(metadata map[string]any, key string) string {

@@ -566,6 +566,15 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 	routing.RegisterAgent(GuideRoutingInfo())
 
 	guideEventLogger := agentlog.NewSessionEventLogger("guide", "routing")
+	// Configure the logger up front so subsequent BindSession calls
+	// open every stream (events, tools, llm, bus) with redaction.
+	// Without this, the logger used zero-value defaults which left
+	// the bus stream disabled and created writers without a
+	// configured redactor — functional but silent in practice.
+	guideEventLogger.SetConfig(agentlog.SessionLoggerConfig{
+		Redactor:        agentlog.NewRedactor(agentlog.RedactorConfig{}, nil),
+		EnableBusStream: true,
+	})
 
 	parser := NewParserWithRouting(cfg.RouterConfig.DSLPrefix, routing)
 	llmClassifier := NewLLMClassifier(provider, model, cfg.RouterConfig)
@@ -5437,6 +5446,38 @@ func (g *Guide) logEvent(eventType agentlog.EventType, corrID, level string, dat
 // EventLogger returns the Guide's session event logger.
 func (g *Guide) EventLogger() *agentlog.SessionEventLogger {
 	return g.eventLogger
+}
+
+// BindSession eagerly binds the Guide's event logger to the given
+// session directory so the WAL and event stream start capturing
+// state transitions from the moment the session is known, not just
+// from the first route request. Callers (e.g. the TUI bootstrap)
+// invoke this once the default or active session ID is resolved.
+//
+// Idempotent for the same sessionID. Safe to call on a nil Guide
+// (returns nil). The method also emits a synthetic "guide_started"
+// WAL entry so the first segment is never empty — this both
+// confirms the bind landed on disk and gives `sylk trace` a
+// deterministic anchor for session boot.
+func (g *Guide) BindSession(sessionDir, sessionID string) error {
+	if g == nil || g.eventLogger == nil {
+		return nil
+	}
+	if err := g.eventLogger.BindSession(sessionDir, sessionID); err != nil {
+		return fmt.Errorf("guide: bind session %q: %w", sessionID, err)
+	}
+	// Record the bind so the WAL and events stream have at least
+	// one entry right after creation. Timestamp-sorted traces look
+	// for a session-boot anchor on the guide; this is it. The
+	// guide's sessionID field has no lock — it's written once at
+	// bind and read read-only elsewhere, so a plain assignment is
+	// sufficient.
+	g.sessionID = sessionID
+	g.logEvent(agentlog.EventGuideStarted, "", "info", map[string]any{
+		"session_dir": sessionDir,
+		"session_id":  sessionID,
+	})
+	return nil
 }
 
 // RegisterSkill registers a skill with the Guide's skill registry

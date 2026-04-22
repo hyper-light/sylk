@@ -190,3 +190,69 @@ func TestForestSubscriber_HarvestesConsensusDecision(t *testing.T) {
 		t.Fatalf("Consensus decision must be harvested; got %d", fs.HarvestedCount())
 	}
 }
+
+// TestForestSubscriber_HarvestsWidenedAllowlist verifies that the
+// post-Tier-1+2 election covers lifecycle closures, knowledge
+// pushes, artifacts, operational primitives, and forest consult
+// emissions. One test case per widened kind so regressions show up
+// precisely.
+func TestForestSubscriber_HarvestsWidenedAllowlist(t *testing.T) {
+	cases := []struct {
+		name string
+		kind activity.ActionKind
+	}{
+		// Lifecycle closures
+		{"consult_response", activity.ActionConsultResponse},
+		{"challenge_response", activity.ActionChallengeResponse},
+		{"validation_rejected", activity.ActionValidationRejected},
+		{"remediation_resolved", activity.ActionRemediationResolved},
+		// Acceptance + ratification + knowledge push
+		{"plan_ratified", activity.ActionPlanRatified},
+		{"decision_declared", activity.ActionDecisionDeclared},
+		{"advisory_emitted", activity.ActionAdvisoryEmitted},
+		{"proactive_advisory", activity.ActionProactiveAdvisory},
+		{"narration_emitted", activity.ActionNarrationEmitted},
+		// Artifacts + review
+		{"artifact_published", activity.ActionArtifactPublished},
+		{"review_completed", activity.ActionReviewCompleted},
+		// Operational primitives
+		{"tool_call_completed", activity.ActionToolCallCompleted},
+		{"llm_response_completed", activity.ActionLLMResponseCompleted},
+		// Tier 5
+		{"forest_consult_emitted", activity.ActionForestConsultEmitted},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fs := NewForestSubscriber(func(context.Context, ForestCandidate) error { return nil })
+			fs.Receive(context.Background(), sampleActivity(c.kind, "s1", "scope/"))
+			if fs.HarvestedCount() != 1 {
+				t.Fatalf("kind %s not harvested under widened allowlist", c.kind)
+			}
+		})
+	}
+}
+
+// TestForestSubscriber_StillSkipsAtomicAndFineNoise verifies the
+// allowlist did not over-correct: truly high-volume infrastructural
+// kinds still skip. File reads and LLM chunks must not reach the
+// forest even with the widened allowlist.
+func TestForestSubscriber_StillSkipsAtomicAndFineNoise(t *testing.T) {
+	cases := []activity.ActionKind{
+		activity.ActionFileRead,
+		activity.ActionLLMChunkReceived,
+		activity.ActionCacheHit,
+		activity.ActionCacheMiss,
+	}
+	for _, k := range cases {
+		t.Run(string(k), func(t *testing.T) {
+			fs := NewForestSubscriber(func(context.Context, ForestCandidate) error { return nil })
+			fs.Receive(context.Background(), sampleActivity(k, "s1", "scope/"))
+			if fs.HarvestedCount() != 0 {
+				t.Fatalf("noise kind %s should not be harvested", k)
+			}
+			if fs.SkippedCount() != 1 {
+				t.Fatalf("skip counter should advance; got %d", fs.SkippedCount())
+			}
+		})
+	}
+}

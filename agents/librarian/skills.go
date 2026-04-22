@@ -54,19 +54,25 @@ func (l *Librarian) registerCoreSkills() {
 	l.skills.Register(lspSkill(l))
 	l.skills.Register(astGrepSearchSkill(l))
 
-	// Workspace-aware reads. The librarian's authority profile permits all
-	// three views (Disk, Global, Pipeline). The view parameter is required
-	// on every call so layer attribution is captured at the tool boundary.
-	// All read ops collapse into the unified workspace_read(op=…) verb
-	// registered by core/versioning — the librarian uses only the
-	// observation ops (read/glob/grep/inspect/summarize); the write-lease
-	// ops (prepare_write) and cross-view change listings (list_changes)
-	// are unused for this read-only authority but remain reachable via
-	// the same skill if the librarian's profile is ever widened.
+	// Workspace-aware reads. The librarian's authority profile permits
+	// all three views (Disk, Global, Pipeline) — see
+	// core/authority/profile.go. Views resolve live overlays via the
+	// SessionVFS attached through SetSessionVFS; the FileAccess is a
+	// read-only session-routing wrapper so list_changes and similar
+	// overlay-introspection ops work. Authority restriction
+	// (`RestrictFileAccess("librarian", …)`) enforces read-only in
+	// the plumbing layer too, so even if the underlying FileAccess
+	// is writable, the librarian's handle is not.
 	viewsFn := func() versioning.WorkspaceViewAccess { return l.workspaceViews }
+	getFileAccessFn := func() versioning.FileAccess {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		return l.fileAccess
+	}
 	noPipelineFn := func() string { return "" }
 	l.skills.Register(versioning.NewWorkspaceReadSkill(versioning.WorkspaceReadSkillConfig{
 		GetViews:          viewsFn,
+		GetFileAccess:     getFileAccessFn,
 		DefaultPipelineID: noPipelineFn,
 	}))
 

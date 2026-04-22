@@ -172,9 +172,7 @@ func (ar *AdaptiveRetrieval) Start(ctx context.Context) error {
 		return ErrAdaptiveRetrievalAlreadyStarted
 	}
 
-	ar.ctx, ar.cancel = context.WithCancel(ctx)
-
-	if err := ar.initializeComponents(); err != nil {
+	if err := ar.initializeComponents(ctx); err != nil {
 		ar.state.Store(int32(stateUninitialized))
 		return err
 	}
@@ -183,10 +181,18 @@ func (ar *AdaptiveRetrieval) Start(ctx context.Context) error {
 	return nil
 }
 
-func (ar *AdaptiveRetrieval) initializeComponents() error {
+// initializeComponents owns ALL writes to the dispatcher's mutable
+// state under ar.mu — including ar.ctx and ar.cancel. Previously the
+// ctx/cancel assignment happened outside the mutex in Start, which
+// raced concurrent Stop() calls that read ar.cancel under the mutex.
+// Folding the assignment into this mu-protected section makes the
+// init→stop happens-before relationship explicit and leaves no read
+// path unsynchronized.
+func (ar *AdaptiveRetrieval) initializeComponents(ctx context.Context) error {
 	ar.mu.Lock()
 	defer ar.mu.Unlock()
 
+	ar.ctx, ar.cancel = context.WithCancel(ctx)
 	ar.initScope()
 	ar.initHotCache()
 	ar.initSearcher()

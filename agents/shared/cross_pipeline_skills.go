@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -73,7 +74,14 @@ func RouteSyncFromBus(busFn func() guide.EventBus, topicFn func() string) func(c
 	}
 }
 
-// CrossPipelineSkills returns challenge_peer and consult_peer.
+// CrossPipelineSkills returns challenge_peer and consult_peer,
+// gated by the caller's authority.Profile. The caller's agent type
+// (from cfg.AgentType()) drives which targets appear in the skill's
+// target_agent_type enum AND which the runtime handler will accept.
+// Both skills are OMITTED when the authority profile's corresponding
+// list is empty — knowledge agents (reactive by design) and the
+// orchestrator/guardian/guide (non-initiators) simply don't see
+// these tools in their catalog.
 //
 // challenge_peer generalizes today's challenge_agent — targets a fabric
 // activity (not an agent directly), routes through the activity's
@@ -82,16 +90,26 @@ func RouteSyncFromBus(busFn func() guide.EventBus, topicFn func() string) func(c
 // new path.
 //
 // consult_peer generalizes today's knowledge-agent consults — targets
-// any peer agent in the session, including knowledge agents and
-// cross-pipeline specialists.
+// any peer agent in the session that the authority profile permits.
+//
+// See docs/COMMS_MATRIX.md for the per-agent target matrix.
 func CrossPipelineSkills(cfg CrossPipelineSkillConfig) []*skills.Skill {
-	return []*skills.Skill{
-		challengePeerSkill(cfg),
-		consultPeerSkill(cfg),
+	callerType := safeCallString(cfg.AgentType)
+	consultTargets := authority.PermittedConsultTargets(callerType)
+	challengeTargets := authority.PermittedChallengeTargets(callerType)
+	crossPipelineAllowed := authority.ProfileFor(callerType).AllowsCrossPipelineConsult
+
+	out := make([]*skills.Skill, 0, 2)
+	if len(challengeTargets) > 0 {
+		out = append(out, challengePeerSkill(cfg, challengeTargets))
 	}
+	if len(consultTargets) > 0 {
+		out = append(out, consultPeerSkill(cfg, consultTargets, crossPipelineAllowed))
+	}
+	return out
 }
 
-func challengePeerSkill(cfg CrossPipelineSkillConfig) *skills.Skill {
+func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string) *skills.Skill {
 	return skills.NewSkill("challenge_peer").
 		Description("Dispute a peer agent's commitment with concrete evidence. Targets a specific fabric activity (not an agent directly). The challenged peer will see your challenge in their next ambient_context envelope and respond with defend / yield / scope-split / escalate. Asynchronous — neither pipeline blocks. The dispute lives durably until resolved or it passes its deadline. PREFER THIS over silent divergence — adopt-or-challenge is the binary; never just diverge. SUPERSEDES the narrower `challenge_agent` for cross-pipeline disputes (challenge_agent stays for same-pipeline protocol).").
 		Domain("fabric").
@@ -103,6 +121,12 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig) *skills.Skill {
 		Avoid("Don't challenge the same activity multiple times. Don't issue a challenge without evidence — the system requires concrete grounds.").
 		StringParam("target_activity_id", "The activity ID being challenged (commonly from ambient_context).", true).
 		StringParam("evidence", "Concrete evidence supporting your alternative position (file paths, prior conventions, downstream constraints, etc.).", true).
+		// target_agent_type is an authority-gated enum: each agent
+		// only sees targets its authority.Profile permits it to
+		// challenge. Self-targeting is already excluded by
+		// authority.PermittedChallengeTargets. See
+		// docs/COMMS_MATRIX.md.
+		EnumParam("target_agent_type", "Agent type of the peer whose commitment you are challenging. Must be one of the permitted targets for your role.", permittedTargets, false).
 		StringParam("alternative", "The alternative commitment you propose. Optional — challenges that surface evidence without proposing an alternative are still valuable.", false).
 		StringParam("resolution_hint", "Optional hint to guide the responder: \"yield\", \"scope-split\", or \"escalate\". Empty = let them choose freely.", false).
 		IntParam("deadline_seconds", "How long the challenge stays open before fabric emits a challenge_unresolved activity. Default 600 (10 min).", false).
@@ -110,6 +134,7 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig) *skills.Skill {
 			var params struct {
 				TargetActivityID string `json:"target_activity_id"`
 				Evidence         string `json:"evidence"`
+				TargetAgentType  string `json:"target_agent_type"`
 				Alternative      string `json:"alternative"`
 				ResolutionHint   string `json:"resolution_hint"`
 				DeadlineSeconds  int    `json:"deadline_seconds"`
@@ -123,10 +148,50 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig) *skills.Skill {
 			if strings.TrimSpace(params.Evidence) == "" {
 				return nil, fmt.Errorf("evidence is required")
 			}
+			// Runtime authority guard. The enum at the schema layer
+			// already constrains target_agent_type; this is defense-
+			// in-depth for cached schemas, manual JSON, or future
+			// bus-level injection. When target_agent_type is
+			// explicitly passed, it must be in the caller's
+			// authority.PermittedChallengeTargets list. When it's
+			// omitted we resolve it below from the target activity's
+			// author and re-check.
+			callerType := safeCallString(cfg.AgentType)
+			if explicit := strings.TrimSpace(params.TargetAgentType); explicit != "" {
+				if !authority.CanChallenge(callerType, explicit) {
+					return nil, unauthorizedChallengeError(callerType, explicit, permittedTargets)
+				}
+			}
 			deadline := time.Duration(params.DeadlineSeconds) * time.Second
 			if deadline <= 0 {
 				deadline = 10 * time.Minute
 			}
+
+			// Resolve the challenged activity's author so the UI's
+			// inter-agent-branch derivation has a target agent to hang
+			// the child row on. Without this, interAgentChallengeTargets
+			// can't extract a recipient from challenge_peer's args
+			// (target_activity_id is an opaque UUID, not an agent
+			// identifier) and the completion event gets silently
+			// dropped. Graceful when the activity isn't retrievable —
+			// the surrounding fabric append still runs, and the caller
+			// gets the same challenge_id it would have gotten before.
+			targetActivityID := activity.ActivityID(strings.TrimSpace(params.TargetActivityID))
+			resolvedAgentType := ""
+			resolvedPipelineID := ""
+			if target := lookupTargetActivity(ctx, targetActivityID); target != nil {
+				resolvedAgentType = strings.TrimSpace(target.Actor.AgentType)
+				resolvedPipelineID = strings.TrimSpace(target.Actor.PipelineID)
+			}
+			// Second authority gate: even if the caller didn't
+			// explicitly name target_agent_type, the resolved author
+			// of the challenged activity must still be a permitted
+			// target. Prevents silent hops into a disallowed scope
+			// via an opaque target_activity_id.
+			if resolvedAgentType != "" && !authority.CanChallenge(callerType, resolvedAgentType) {
+				return nil, unauthorizedChallengeError(callerType, resolvedAgentType, permittedTargets)
+			}
+
 			payload, _ := json.Marshal(map[string]any{
 				"target_activity_id": params.TargetActivityID,
 				"evidence":           params.Evidence,
@@ -134,7 +199,7 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig) *skills.Skill {
 				"resolution_hint":    params.ResolutionHint,
 				"deadline_at":        time.Now().Add(deadline),
 			})
-			caused := activity.ActivityID(strings.TrimSpace(params.TargetActivityID))
+			caused := targetActivityID
 			act := activity.AgentActivity{
 				ID:         activity.NewActivityID(),
 				SessionID:  activity.SessionID(safeCallString(cfg.SessionID)),
@@ -157,16 +222,47 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig) *skills.Skill {
 				},
 			}
 			activity.Append(ctx, act)
-			return map[string]any{
+			result := map[string]any{
 				"challenge_id": act.ID,
 				"deadline_at":  time.Now().Add(deadline),
 				"status":       "in_flight",
-			}, nil
+			}
+			if resolvedAgentType != "" {
+				// Read by interAgentChallengeTargets so the UI derivation
+				// can attach the completion event to the right agent row.
+				result["target_agent_type"] = resolvedAgentType
+			}
+			if resolvedPipelineID != "" {
+				result["target_pipeline_id"] = resolvedPipelineID
+			}
+			return result, nil
 		}).
 		Build()
 }
 
-func consultPeerSkill(cfg CrossPipelineSkillConfig) *skills.Skill {
+// lookupTargetActivity resolves the challenged activity from the
+// ambient activity source. Returns nil when the source is unavailable,
+// when the ID doesn't parse, when the activity isn't present, or when
+// the lookup errors — every failure path is silent because the
+// downstream challenge append still needs to succeed (the challenge's
+// usefulness doesn't depend on UI attribution). Callers should treat a
+// nil return as "no resolved target" and fall through.
+func lookupTargetActivity(ctx context.Context, id activity.ActivityID) *activity.AgentActivity {
+	if strings.TrimSpace(string(id)) == "" {
+		return nil
+	}
+	source := activity.DefaultSource()
+	if source == nil {
+		return nil
+	}
+	target, err := source.GetActivity(ctx, id)
+	if err != nil || target == nil {
+		return nil
+	}
+	return target
+}
+
+func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, allowsCrossPipeline bool) *skills.Skill {
 	return skills.NewSkill("consult_peer").
 		Description("Ask a peer agent (cross-pipeline specialist or knowledge agent) for their evidence on a shared concern. When a route transport is configured for the calling agent, this blocks on the peer's terminal response and renders their work as nested children of this tool call — the normal mode for interactive consultation. Without a transport, it degrades to fire-and-forget: an activity is emitted, the addressee responds via their own ambient_context envelope, and the caller gets a consult_id to causal_trace later. PREFER THIS over guessing when peer state matters.").
 		Domain("fabric").
@@ -175,7 +271,12 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig) *skills.Skill {
 		Usage("Use when ambient context shows a peer working in adjacent or overlapping scope and you'd benefit from their live state — e.g., 'how are you handling fixtures for shared models?' Pass target_agent_type and (optional) target_pipeline_id; without pipeline_id the consult routes to the natural same-pipeline peer or knowledge agent.").
 		Requirement("Frame the question concretely. Vague consults waste both parties' attention budget.").
 		Satisfies("Records a consult_emitted activity addressed to the target; returns the peer's response inline when the route transport is available.").
-		StringParam("target_agent_type", "Agent type to address (e.g., \"librarian\", \"academic\", \"tester-pipeline\", \"engineer\").", true).
+		// target_agent_type is an authority-gated enum: each agent
+		// only sees targets its authority.Profile permits it to
+		// consult. Self-targeting is already excluded by
+		// authority.PermittedConsultTargets. See
+		// docs/COMMS_MATRIX.md.
+		EnumParam("target_agent_type", "Agent type to address. Must be one of the permitted targets for your role.", permittedTargets, true).
 		StringParam("target_pipeline_id", "Specific pipeline_id to address (cross-pipeline routing). Empty = natural same-pipeline peer or knowledge agent.", false).
 		StringParam("scope", "Path scope context (e.g., \"services/billing/tests/\").", false).
 		StringParam("query", "Your concrete question.", true).
@@ -196,6 +297,30 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig) *skills.Skill {
 			}
 			if strings.TrimSpace(params.TargetAgentType) == "" {
 				return nil, fmt.Errorf("target_agent_type is required")
+			}
+			// Runtime authority guard. The enum at the schema layer
+			// already constrains target_agent_type; this is defense-
+			// in-depth for cached schemas, manual JSON, or future
+			// bus-level injection.
+			callerType := safeCallString(cfg.AgentType)
+			targetType := strings.TrimSpace(params.TargetAgentType)
+			if !authority.CanConsult(callerType, targetType) {
+				return nil, unauthorizedConsultError(callerType, targetType, permittedTargets)
+			}
+			// Cross-pipeline gate: if the caller names a specific
+			// target_pipeline_id that differs from its own pipeline,
+			// its role must allow cross-pipeline consults. Without
+			// this, a global agent could hop into per-task pipelines
+			// through the pipeline_id parameter.
+			targetPipelineID := strings.TrimSpace(params.TargetPipelineID)
+			if targetPipelineID != "" && !allowsCrossPipeline {
+				ownPipelineID := strings.TrimSpace(safeCallString(cfg.PipelineID))
+				if targetPipelineID != ownPipelineID {
+					return nil, fmt.Errorf(
+						"consult_peer: %q is not permitted to cross-pipeline consult (own pipeline=%q, requested=%q); leave target_pipeline_id empty to route to the natural same-scope peer",
+						callerType, ownPipelineID, targetPipelineID,
+					)
+				}
 			}
 			deadline := time.Duration(params.DeadlineSeconds) * time.Second
 			if deadline <= 0 {
@@ -410,4 +535,38 @@ func RespondToConsult(ctx context.Context, cfg CrossPipelineSkillConfig, consult
 	}
 	activity.Append(ctx, act)
 	return act.ID, nil
+}
+
+// unauthorizedConsultError formats a role-aware rejection message for
+// consult_peer. The error explains why the target is denied and lists
+// the actual permitted targets so the LLM can pick a valid one on
+// retry. For reactive roles (empty permitted list) the message calls
+// out the role's pattern explicitly.
+func unauthorizedConsultError(callerType, targetType string, permitted []string) error {
+	if len(permitted) == 0 {
+		return fmt.Errorf(
+			"consult_peer: role %q is reactive — it does not initiate peer consults. Respond to incoming consults via the role's natural channels (knowledge queries, advisory emissions, etc.) instead",
+			callerType,
+		)
+	}
+	return fmt.Errorf(
+		"consult_peer: %q is not permitted to consult %q. Permitted targets for %q: %s",
+		callerType, targetType, callerType, strings.Join(permitted, ", "),
+	)
+}
+
+// unauthorizedChallengeError is the challenge_peer analogue.
+// Challenges are higher-stakes than consults, so the error spells
+// this out explicitly to discourage escalation attempts.
+func unauthorizedChallengeError(callerType, targetType string, permitted []string) error {
+	if len(permitted) == 0 {
+		return fmt.Errorf(
+			"challenge_peer: role %q may not initiate challenges. Challenges cast doubt on peer commitments and belong to inspectors / quality roles; if you have disagreement to surface, respond on an existing consult or emit an advisory instead",
+			callerType,
+		)
+	}
+	return fmt.Errorf(
+		"challenge_peer: %q is not permitted to challenge %q. Permitted targets for %q: %s",
+		callerType, targetType, callerType, strings.Join(permitted, ", "),
+	)
 }

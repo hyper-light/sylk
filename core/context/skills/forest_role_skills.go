@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -31,6 +33,14 @@ type ForestRoleOutput struct {
 	Intent  *forest.IntentResolution `json:"intent,omitempty"`
 	Packets []*forest.BranchPacket   `json:"packets,omitempty"`
 	Focus   []string                 `json:"focus,omitempty"`
+	// ConsultActivityID is the fabric activity ID emitted by the
+	// handler when the consult ran. Populated on every successful
+	// return. Downstream activity emissions that want to declare
+	// causation back to this consult can use the ID as a Caused
+	// pointer — the forest bridge then joins outcome to consult
+	// during harvest. See Tier 5 of
+	// docs/FOREST_FABRIC_INTEGRATION.md.
+	ConsultActivityID string `json:"consult_activity_id,omitempty"`
 }
 
 type forestRoleSkillSpec struct {
@@ -670,11 +680,18 @@ func NewRoleForestConsultSkill(deps *RetrievalDependencies, role string, specs [
 			return nil, firstErr
 		}
 
+		// Tier 5: emit ActionForestConsultEmitted so downstream
+		// activities within this call stack can declare causation
+		// back to this consult. The forest bridge joins the
+		// resulting outcomes to the consult record during harvest.
+		consultID := emitForestConsultActivity(ctx, spec, purpose, query, intent, packets)
+
 		return &ForestRoleOutput{
-			Role:    spec.Domain,
-			Intent:  intent,
-			Packets: packets,
-			Focus:   buildRoleForestFocus(intent, packets),
+			Role:              spec.Domain,
+			Intent:            intent,
+			Packets:           packets,
+			Focus:             buildRoleForestFocus(intent, packets),
+			ConsultActivityID: consultID,
 		}, nil
 	}).
 		Build()
@@ -790,14 +807,113 @@ func NewRoleForestSkill(deps *RetrievalDependencies, spec forestRoleSkillSpec) *
 			return nil, firstErr
 		}
 
+		// Tier 5: forest consult emission for causation threading.
+		// See the collapsed-skill handler above for rationale.
+		// The single-purpose per-role skill uses the spec's default
+		// purpose string since the handler params don't carry one.
+		consultID := emitForestConsultActivity(ctx, spec, defaultPurposeForSpec(spec), query, intent, packets)
+
 		return &ForestRoleOutput{
-			Role:    spec.Domain,
-			Intent:  intent,
-			Packets: packets,
-			Focus:   buildRoleForestFocus(intent, packets),
+			Role:              spec.Domain,
+			Intent:            intent,
+			Packets:           packets,
+			Focus:             buildRoleForestFocus(intent, packets),
+			ConsultActivityID: consultID,
 		}, nil
 	}).
 		Build()
+}
+
+// defaultPurposeForSpec returns a stable "purpose" string for the
+// per-role forest skill variant. Single-purpose skills don't accept
+// a purpose parameter, so we derive one from the spec name to keep
+// the emitted ActionForestConsultEmitted payload consistent with
+// the collapsed-skill path.
+func defaultPurposeForSpec(spec forestRoleSkillSpec) string {
+	if idx := strings.LastIndex(spec.Name, "forest_"); idx >= 0 {
+		trimmed := strings.TrimPrefix(spec.Name[idx:], "forest_")
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return spec.Name
+}
+
+// emitForestConsultActivity records the fact of a forest consult
+// into the fabric. Payload captures purpose, query, branch IDs, and
+// intent confidence so the forest bridge's consume/resolve harvest
+// can join subsequent outcomes back to the consult that shaped
+// them. Returns the emitted activity ID so the handler can include
+// it in the skill output.
+func emitForestConsultActivity(
+	ctx context.Context,
+	spec forestRoleSkillSpec,
+	purpose string,
+	query forest.Query,
+	intent *forest.IntentResolution,
+	packets []*forest.BranchPacket,
+) string {
+	actorID := strings.TrimSpace(query.AgentID)
+	if actorID == "" {
+		actorID = activity.FabricContextFromContext(ctx).Baggage["agent_id"]
+	}
+	actor := activity.Actor{
+		AgentID:   actorID,
+		AgentType: spec.Domain,
+	}
+
+	branchIDs := make([]string, 0, len(packets))
+	for _, p := range packets {
+		if p == nil || p.Branch == nil {
+			continue
+		}
+		branchIDs = append(branchIDs, p.Branch.ID)
+	}
+
+	payload := map[string]any{
+		"purpose":    purpose,
+		"query":      query.Query,
+		"horizon":    query.Horizon,
+		"limit":      query.Limit,
+		"branch_ids": branchIDs,
+	}
+	if intent != nil {
+		if intent.PrimaryIntent != "" {
+			payload["primary_intent"] = intent.PrimaryIntent
+		}
+		if len(intent.ActiveRoots) > 0 {
+			payload["active_roots"] = intent.ActiveRoots
+		}
+	}
+	payloadJSON, _ := json.Marshal(payload)
+
+	id := activity.ActivityID(activity.NewID())
+	a := activity.AgentActivity{
+		ID:         id,
+		SessionID:  activity.SessionID(string(query.SessionID)),
+		Timestamp:  time.Now(),
+		Resolution: activity.ResolutionFor(activity.ActionForestConsultEmitted),
+		Actor:      actor,
+		Action:     activity.ActionForestConsultEmitted,
+		Subject: activity.Subject{
+			Domain: spec.Domain,
+			Coordinates: map[string]string{
+				"purpose": purpose,
+			},
+		},
+		Payload: payloadJSON,
+		State:   activity.StatePoint,
+	}
+	activity.Append(ctx, a)
+
+	// Tier 5: register the consult in the process-wide tracker so
+	// subsequent emissions by the same (sessionID, agentID) can
+	// auto-populate their Caused pointer back to this consult. The
+	// tracker has a bounded TTL; stale entries do not cross-link.
+	if actor.AgentID != "" {
+		activity.RecordForestConsult(string(query.SessionID), actor.AgentID, id)
+	}
+	return string(id)
 }
 
 func supplementalDomainsForAgent(agentType string) []string {

@@ -27,6 +27,12 @@ const (
 	ExecutionHoldStatusActive   ExecutionHoldStatus = "active"
 	ExecutionHoldStatusResolved ExecutionHoldStatus = "resolved"
 	ExecutionHoldStatusAborted  ExecutionHoldStatus = "aborted"
+	// ExecutionHoldStatusSuperseded is a terminal state applied when
+	// a new plan takes over the session. Any active hold from a
+	// prior plan_id transitions here; the remediation context of the
+	// prior plan is, by definition, no longer the right context to
+	// resolve it in. See SupersedePriorPlans.
+	ExecutionHoldStatusSuperseded ExecutionHoldStatus = "superseded"
 )
 
 type RemediationCaseStatus string
@@ -60,11 +66,25 @@ type ValidationEpochRecord struct {
 type ExecutionHoldRecord struct {
 	HoldID             string
 	SessionID          string
+	// PlanID scopes the hold to the workflow that opened it. See
+	// schema.sql and docs/EXECUTION_HOLDS.md. A hold with plan_id=A
+	// does not block DAGs submitted under plan_id=B.
+	PlanID             string
 	EpochID            string
 	RemediationCaseID  string
 	Status             ExecutionHoldStatus
 	Reason             string
 	Summary            string
+	// BlocksDAGIDs constrains the blocking scope. Empty/nil means
+	// "block every DAG inside this hold's PlanID" (the common
+	// validation-hold case). A non-empty list constrains to the
+	// named DAGs (per-DAG scoped holds). Stored as JSON in the
+	// blocks_dag_ids column.
+	BlocksDAGIDs       []string
+	// ExemptDAGIDs lists DAGs that may run despite this hold — the
+	// remediation DAG the architect launches to address the hold's
+	// concern. Stored as JSON in the exempt_dag_ids column.
+	ExemptDAGIDs       []string
 	CreatedByAgentID   string
 	CreatedByAgentType string
 	ReleasedAt         *time.Time

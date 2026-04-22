@@ -65,8 +65,10 @@ import (
 // Derived from: 1000ms / 60fps ≈ 16ms.
 const tickFastInterval = 16 * time.Millisecond
 
-// tickSlowInterval drives transient slow-rate work (swipe decay).
-// Derived from: swipe decay timeout is 300ms; 200ms provides ≥1 sample.
+// tickSlowInterval drives transient slow-rate work. Currently unused
+// (swipe decay was the original driver; swipe gestures were removed),
+// but retained so future debounce work can opt into the slow-tick
+// chain without reintroducing the rate state machine.
 const tickSlowInterval = 200 * time.Millisecond
 
 // decorTickActiveInterval drives high-frequency low-cost UI effects
@@ -99,7 +101,7 @@ type tickRate int
 
 const (
 	tickIdle tickRate = iota // No tick scheduled.
-	tickSlow                 // 200ms — swipe decay.
+	tickSlow                 // 200ms — transient slow-rate debounce (reserved).
 	tickFast                 // 16ms — scroll, bounce, flash, spinner.
 )
 
@@ -515,7 +517,6 @@ type AppModel struct {
 	scroll                scrollState      // Current scroll animation state.
 	bounceSpring          harmonica.Spring // Underdamped spring for overscroll bounce.
 	bounce                bounceState      // Current bounce animation state.
-	swipe                 swipeState       // Horizontal scroll accumulation for ring cycling.
 
 	// View mode state machine — exactly one of ViewChat/ViewMemory/ViewEdit/ViewGit.
 	viewMode            ViewMode
@@ -973,13 +974,6 @@ type bounceState struct {
 	pos   float64           // Current visual offset (fractional lines).
 	vel   float64           // Current spring velocity.
 	panel component.FocusID // Which panel is bouncing.
-}
-
-// swipeState tracks horizontal scroll accumulation for ring cycling.
-type swipeState struct {
-	accum         float64   // Accumulated horizontal ticks (+right, -left).
-	stamp         time.Time // Time of last horizontal scroll event.
-	cooldownUntil time.Time // Events are ignored until this time (post-cycle dead zone).
 }
 
 // New creates a root AppModel from configuration and dependencies.

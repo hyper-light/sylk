@@ -518,13 +518,132 @@ func TestExecutor_ContinueOnFailure(t *testing.T) {
 	require.NoError(t, err)
 	// DAG should fail (at least one node failed)
 	assert.Equal(t, dag.DAGStateFailed, result.State)
-	// The failed node and its blocked dependent should both count as failed.
+	// node-1 failed and node-3 (its dependent) is blocked — blocked
+	// counts as failed.
 	assert.Equal(t, 2, result.NodesFailed)
-	assert.Equal(t, 0, result.NodesSkipped)
+	// node-2 is a sibling in layer 0. Its outcome depends on the
+	// non-deterministic iteration order of the DAG layer:
+	//   - If node-2 is iterated before node-1 (MaxConcurrency=1 makes
+	//     them serialize), node-2 completes normally and counts as
+	//     Succeeded. Mid-layer cancellation finds nothing still in
+	//     flight to halt.
+	//   - If node-1 is iterated first, node-1's unrecoverable failure
+	//     cancels layerCtx before node-2 acquires its slot; node-2 is
+	//     recorded as Cancelled (which tallies as Skipped).
+	// Both outcomes are valid — the invariant the test enforces is
+	// that every node ends in a terminal state and the overall DAG
+	// fails. See TestExecutor_MidLayerCancellationHaltsSiblings for
+	// the dedicated concurrent-sibling scenario.
+	node2State := result.NodeResults["node-2"].State
+	assert.Contains(t,
+		[]dag.NodeState{dag.NodeStateSucceeded, dag.NodeStateCancelled},
+		node2State,
+		"node-2 must finish as either Succeeded (iterated first) or Cancelled (iterated after node-1 failed)")
 	assert.Equal(t, dag.NodeStateFailed, result.NodeResults["node-1"].State)
 	assert.Equal(t, dag.NodeStateBlocked, result.NodeResults["node-3"].State)
-	// Total nodes processed should equal node count
+	// Total nodes processed must equal node count regardless of which
+	// path node-2 took.
 	assert.Equal(t, 3, result.NodesSucceeded+result.NodesFailed+result.NodesSkipped)
+}
+
+// TestExecutor_MidLayerCancellationHaltsSiblings exercises the
+// user-facing bug fix: when a node in a layer fails unrecoverably and
+// downstream is blocked, sibling nodes still executing MUST be halted
+// so the retry/abort/skip decision dialog surfaces promptly instead of
+// waiting for every sibling to drain. A real GoroutineScope is required
+// — without one, executeNodeInline runs each node synchronously on the
+// main goroutine and siblings can't be "in flight" to be halted.
+// cancelLayerOnBlockingFailure fires the instant the failing node's
+// result lands, layerCtx cancels, and the slow siblings' dispatcher
+// context.Done() case fires inside their select.
+func TestExecutor_MidLayerCancellationHaltsSiblings(t *testing.T) {
+	scope := concurrency.NewGoroutineScope(context.Background(), "dag-test", nil)
+	defer func() { _ = scope.Shutdown(500*time.Millisecond, 2*time.Second) }()
+
+	d, _ := dag.NewBuilder("mid-layer-halt").
+		WithPolicy(dag.ExecutionPolicy{
+			FailurePolicy:  dag.FailurePolicyContinue,
+			MaxConcurrency: 4, // allow siblings to run concurrently
+		}).
+		AddNode(dag.NodeConfig{ID: "fast-fail"}).
+		AddNode(dag.NodeConfig{ID: "slow-sibling-1"}).
+		AddNode(dag.NodeConfig{ID: "slow-sibling-2"}).
+		// Downstream that depends on fast-fail — this is what makes
+		// the failure classifier return Blocking: with fast-fail
+		// failed, downstream has no viable path.
+		AddNode(dag.NodeConfig{ID: "downstream", Dependencies: []string{"fast-fail"}}).
+		Build()
+
+	// Per-node dispatcher behavior: fast-fail returns immediately
+	// with a failure; slow siblings block for 2s or until ctx is
+	// cancelled. The built-in mockDispatcher.executionTime is a single
+	// global value and can't distinguish, so we use a custom
+	// implementation.
+	dispatcher := &midLayerCancelDispatcher{
+		failID:   "fast-fail",
+		slowDur:  2 * time.Second,
+		slowIDs:  map[string]bool{"slow-sibling-1": true, "slow-sibling-2": true},
+	}
+
+	executor := dag.NewExecutor(d.Policy(), scope)
+	start := time.Now()
+	result, err := executor.Execute(context.Background(), d, dispatcher)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	// Must return far sooner than the 2s sibling execution time — the
+	// mid-layer cancel breaks them out of the dispatcher's timeout
+	// select. A generous 1s ceiling still proves the fix without
+	// being timing-brittle.
+	assert.Less(t, elapsed, time.Second,
+		"mid-layer cancellation should halt siblings before their 2s dispatcher wait elapses; got %v", elapsed)
+	// fast-fail: genuinely failed.
+	assert.Equal(t, dag.NodeStateFailed, result.NodeResults["fast-fail"].State)
+	// Slow siblings: cancelled by mid-layer halt — either via
+	// ctx.Done() inside the dispatcher (dispatcher returns a Cancelled
+	// result) or via the post-layer recordMidLayerCancellations sweep
+	// for siblings that never got a slot. Both yield NodeStateCancelled.
+	for _, sib := range []string{"slow-sibling-1", "slow-sibling-2"} {
+		state := result.NodeResults[sib].State
+		assert.Equal(t, dag.NodeStateCancelled, state,
+			"%s must be cancelled by mid-layer halt (got %s)", sib, state)
+	}
+	// downstream: blocked because fast-fail failed.
+	assert.Equal(t, dag.NodeStateBlocked, result.NodeResults["downstream"].State)
+}
+
+// midLayerCancelDispatcher differentiates fast-fail from slow siblings
+// so the mid-layer-halt test can observe the race window where the
+// failing node completes immediately and siblings are still waiting.
+type midLayerCancelDispatcher struct {
+	failID  string
+	slowDur time.Duration
+	slowIDs map[string]bool
+}
+
+func (d *midLayerCancelDispatcher) Dispatch(ctx context.Context, node *dag.Node, _ map[string]*dag.NodeResult) (*dag.NodeResult, error) {
+	if node.ID() == d.failID {
+		return &dag.NodeResult{
+			NodeID:  node.ID(),
+			State:   dag.NodeStateFailed,
+			Error:   errors.New("planned failure"),
+			EndTime: time.Now(),
+		}, errors.New("planned failure")
+	}
+	if d.slowIDs[node.ID()] {
+		select {
+		case <-time.After(d.slowDur):
+			return &dag.NodeResult{NodeID: node.ID(), State: dag.NodeStateSucceeded, EndTime: time.Now()}, nil
+		case <-ctx.Done():
+			return &dag.NodeResult{
+				NodeID:  node.ID(),
+				State:   dag.NodeStateCancelled,
+				Error:   ctx.Err(),
+				EndTime: time.Now(),
+			}, ctx.Err()
+		}
+	}
+	return &dag.NodeResult{NodeID: node.ID(), State: dag.NodeStateSucceeded, EndTime: time.Now()}, nil
 }
 
 func TestExecutor_BlockedNodeEmitsFailedEvent(t *testing.T) {

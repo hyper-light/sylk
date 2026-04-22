@@ -34,6 +34,22 @@ type Executor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// layerCtx is derived from ctx for the currently-executing layer.
+	// When a node in the layer fails unrecoverably and the failure would
+	// block downstream work, the mid-layer classifier cancels layerCtx to
+	// halt sibling nodes that are still executing — so the user-facing
+	// retry/abort/skip dialog fires promptly instead of waiting for every
+	// sibling to finish (potentially 10+ minutes of wasted engineer/tester
+	// work per layer). Sibling goroutines observe layerCtx.Done() via
+	// nodeContext() / acquireLayerSlot() / prepareAttempt() and exit with
+	// a context-cancelled NodeResult, which resetLayerForRetry treats the
+	// same as a natural failure on retry.
+	//
+	// layerCtx is reset (fresh ctx + cancel) at the start of each layer
+	// iteration in executeAndCheckLayer. It is never shared across layers.
+	layerCtx    context.Context
+	layerCancel context.CancelFunc
+
 	sem chan struct{}
 
 	handlersMu sync.RWMutex
@@ -194,10 +210,37 @@ func (e *Executor) executeLayers() *DAGResult {
 func (e *Executor) executeAndCheckLayer(layerIdx int, layer []string) layerOutcome {
 	e.mu.Lock()
 	e.currentLayer = layerIdx
+	// Fresh layer context derived from the DAG ctx so mid-layer
+	// cancellation (triggered by an unrecoverable blocking failure)
+	// halts in-flight siblings without polluting e.ctx for the rest
+	// of the DAG. The previous layer's cancel was already deferred at
+	// the end of this function's last invocation, so no stale state.
+	e.layerCtx, e.layerCancel = context.WithCancel(e.ctx)
+	layerCancel := e.layerCancel
 	e.mu.Unlock()
+	defer func() {
+		// Release layerCtx resources. Doing this at end-of-layer is safe
+		// because the next iteration stamps a new pair before any node
+		// inspects them, and invokeLayerGate (called via
+		// evaluateGateResult below) uses e.ctx not layerCtx for its
+		// gate invocation.
+		layerCancel()
+		e.mu.Lock()
+		e.layerCtx, e.layerCancel = nil, nil
+		e.mu.Unlock()
+	}()
 
 	e.emitLayerStarted(layerIdx, len(layer))
 	err := e.executeLayer(layer)
+	// If the layer was cancelled mid-flight by
+	// cancelLayerOnBlockingFailure (because a sibling's unrecoverable
+	// failure blocks downstream), sweep any same-layer nodes that
+	// didn't get a chance to record a result. Marking them Cancelled
+	// keeps the DAGResult counters (NodesSucceeded + NodesFailed +
+	// NodesSkipped + NodesCancelled) consistent with len(layer) and
+	// makes their final state visible to the decision-gate dialog so
+	// the user knows what was interrupted.
+	e.recordMidLayerCancellations(layer)
 	e.emitLayerCompleted(layerIdx)
 
 	if err != nil && e.policy.FailurePolicy == FailurePolicyFailFast {
@@ -208,6 +251,39 @@ func (e *Executor) executeAndCheckLayer(layerIdx int, layer []string) layerOutco
 	}
 
 	return e.evaluateGateResult(layerIdx)
+}
+
+// recordMidLayerCancellations walks the layer at end-of-execution and
+// marks any node that never recorded a result as Cancelled. This
+// happens when cancelLayerOnBlockingFailure fires: sibling nodes that
+// hadn't acquired their semaphore slot yet observe layerCtx.Done() in
+// acquireLayerSlot and exit without recording a NodeResult. Without
+// this sweep, those nodes stay Pending forever, the counters drift,
+// and the decision gate's FailedNodes list misses them.
+//
+// Nodes with an existing terminal result (Completed, Failed, Skipped,
+// Cancelled) are left untouched — we only rescue the ones that truly
+// never ran.
+func (e *Executor) recordMidLayerCancellations(layer []string) {
+	e.mu.RLock()
+	snapshot := make(map[string]*NodeResult, len(e.nodeResults))
+	for k, v := range e.nodeResults {
+		snapshot[k] = v
+	}
+	e.mu.RUnlock()
+	for _, nodeID := range layer {
+		if existing, ok := snapshot[nodeID]; ok && existing != nil {
+			continue
+		}
+		node, ok := e.dag.GetNode(nodeID)
+		if !ok {
+			continue
+		}
+		if node.State().IsTerminal() {
+			continue
+		}
+		e.markNodeCancelled(node)
+	}
 }
 
 func (e *Executor) evaluateGateResult(layerIdx int) layerOutcome {
@@ -455,11 +531,31 @@ func (e *Executor) acquireLayerSlot() error {
 		return nil
 	}
 
+	parent := e.activeNodeParentContext()
+	// Fast-path cancellation check: if the layer is already cancelled,
+	// never claim a slot. This is load-bearing for the mid-layer
+	// cancel semantics — without it, a sibling that was already
+	// blocked on `e.sem <- struct{}{}` when cancellation fires has a
+	// 50/50 chance of winning the select (Go picks pseudo-randomly
+	// when multiple cases are ready). Checking up-front closes that
+	// race window for the already-cancelled case.
+	if err := parent.Err(); err != nil {
+		return err
+	}
+
 	select {
 	case e.sem <- struct{}{}:
+		// Re-check after acquiring: the layer may have been cancelled
+		// between the fast-path check above and the select winning.
+		// Release the slot back and report the cancellation so the
+		// slot is never held by a cancelled node.
+		if err := parent.Err(); err != nil {
+			<-e.sem
+			return err
+		}
 		return nil
-	case <-e.ctx.Done():
-		return e.ctx.Err()
+	case <-parent.Done():
+		return parent.Err()
 	}
 }
 
@@ -485,6 +581,7 @@ func (e *Executor) executeNodeInline(wg *sync.WaitGroup, node *Node, errState *l
 	defer e.releaseLayerSlot()
 
 	errState.record(e.executeNode(node))
+	e.cancelLayerOnBlockingFailure(node)
 }
 
 func (e *Executor) executeNodeScoped(wg *sync.WaitGroup, node *Node, errState *layerErrorState) {
@@ -499,6 +596,7 @@ func (e *Executor) executeNodeScoped(wg *sync.WaitGroup, node *Node, errState *l
 		defer e.releaseLayerSlot()
 
 		errState.record(e.executeNode(node))
+		e.cancelLayerOnBlockingFailure(node)
 		return nil
 	})
 	if err == nil {
@@ -512,6 +610,61 @@ func (e *Executor) executeNodeScoped(wg *sync.WaitGroup, node *Node, errState *l
 	e.releaseLayerSlot()
 	e.recordNodeResult(node, failedDispatchResult(node.ID(), err, 0))
 	errState.record(err)
+	e.cancelLayerOnBlockingFailure(node)
+}
+
+// cancelLayerOnBlockingFailure checks whether the just-finished node
+// left the DAG in a state where remaining work is structurally blocked.
+// When it did, the layer-scoped cancel signal fires so sibling
+// goroutines still executing (or retrying) wake up and exit promptly
+// instead of burning wall-clock time on work the user will have to
+// re-approve or discard anyway.
+//
+// Classification semantics:
+//
+//   - The just-finished node must be in NodeStateFailed — success,
+//     cancellation-already-observed, or budget-deferred nodes don't
+//     warrant escalation.
+//   - We classify against the full nodeResults snapshot using the
+//     existing ClassifyLayerFailures. Mid-layer siblings that are
+//     still running aren't in nodeResults yet, which is fine: the
+//     classifier only looks at whether DOWNSTREAM layers remain
+//     viable. A blocking failure of the current node propagates to
+//     downstream regardless of same-layer siblings' eventual
+//     outcomes, so the classification is stable.
+//   - FailureClassNone / FailureClassNonBlocking: don't cancel. The
+//     remaining siblings may still produce useful work, and the
+//     end-of-layer gate will handle non-blocking failures on its own
+//     via the existing onNonBlocking callback path.
+//
+// Thread-safety: the nodeResults read uses e.mu for consistency with
+// the rest of the executor. layerCancel is idempotent — multiple
+// sibling failures all calling it produce the same observable effect.
+func (e *Executor) cancelLayerOnBlockingFailure(node *Node) {
+	if node == nil {
+		return
+	}
+	e.mu.RLock()
+	result, ok := e.nodeResults[node.ID()]
+	cancel := e.layerCancel
+	dag := e.dag
+	layerIdx := e.currentLayer
+	resultsCopy := make(map[string]*NodeResult, len(e.nodeResults))
+	for k, v := range e.nodeResults {
+		resultsCopy[k] = v
+	}
+	e.mu.RUnlock()
+	if !ok || result == nil || result.State != NodeStateFailed {
+		return
+	}
+	if cancel == nil || dag == nil {
+		return
+	}
+	class := ClassifyLayerFailures(dag, resultsCopy, layerIdx)
+	if class != FailureClassBlocking {
+		return
+	}
+	cancel()
 }
 
 func (e *Executor) executeNode(node *Node) error {
@@ -574,12 +727,16 @@ func (e *Executor) prepareAttempt(node *Node, nodeID string, attempt int) error 
 }
 
 func (e *Executor) waitRetryBackoff(node *Node) error {
+	// Wait on the layer-aware context so that mid-layer cancellation
+	// (triggered by a sibling's unrecoverable failure) breaks us out of
+	// a retry backoff without waiting for the RetryBackoff deadline.
+	parent := e.activeNodeParentContext()
 	select {
 	case <-time.After(e.policy.RetryBackoff):
 		return nil
-	case <-e.ctx.Done():
+	case <-parent.Done():
 		e.markNodeCancelled(node)
-		return e.ctx.Err()
+		return parent.Err()
 	}
 }
 
@@ -620,6 +777,31 @@ func (e *Executor) resolveNodeRetries(node *Node) int {
 
 func (e *Executor) handleDispatchResult(result *NodeResult, err error) (bool, error) {
 	if result != nil && result.State == NodeStateCancelled {
+		// A cancelled node result has three possible origins:
+		//
+		//   (1) external DAG cancel — user abort, parent ctx cancel,
+		//       global shutdown. Propagate: mark e.cancelled, cancel
+		//       e.ctx, short-circuit remaining layers.
+		//   (2) dispatcher unilaterally declared the node cancelled
+		//       (without any ctx cancellation observed on its side) —
+		//       this is a deliberate external signal that the work must
+		//       not proceed. Historical behavior: propagate as a DAG
+		//       cancel. Preserved to avoid surprising existing callers.
+		//   (3) mid-layer halt — the node's dispatcher observed
+		//       layerCtx.Done() because cancelLayerOnBlockingFailure
+		//       fired when a SIBLING failed unrecoverably with blocking
+		//       downstream. In this case the DAG is NOT being cancelled
+		//       — we WANT the executor to proceed to the next layer so
+		//       downstream nodes are marked Blocked and the
+		//       decision-gate dialog can surface. Promoting this to a
+		//       DAG cancel would skip those layers entirely.
+		//
+		// Distinguishing case (3) from (1)+(2) requires checking BOTH
+		// e.ctx (if cancelled → case 1) AND layerCtx (if cancelled but
+		// e.ctx is not → case 3). If neither is cancelled, it's case 2.
+		if e.isMidLayerHalt() {
+			return true, nil
+		}
 		e.cancelled.Store(true)
 		if e.cancel != nil {
 			e.cancel()
@@ -766,10 +948,50 @@ func (e *Executor) markNodeStarted(node *Node, nodeID string) {
 }
 
 func (e *Executor) nodeContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	parent := e.activeNodeParentContext()
 	if timeout <= 0 || timeout == NoTimeout {
-		return e.ctx, func() {}
+		return parent, func() {}
 	}
-	return context.WithTimeout(e.ctx, timeout)
+	return context.WithTimeout(parent, timeout)
+}
+
+// activeNodeParentContext returns the context that node-level waits
+// should derive from. During layer execution it's layerCtx (so mid-
+// layer cancellation can halt siblings); outside layer execution (e.g.
+// during budget deferrals, gate evaluation, or initialization), it
+// falls back to the DAG-scoped e.ctx. Always non-nil once the executor
+// is initialized.
+func (e *Executor) activeNodeParentContext() context.Context {
+	e.mu.RLock()
+	layer := e.layerCtx
+	e.mu.RUnlock()
+	if layer != nil {
+		return layer
+	}
+	return e.ctx
+}
+
+// isMidLayerHalt reports whether the current dispatched node's
+// cancelled outcome was caused by the mid-layer halt machinery
+// (cancelLayerOnBlockingFailure fired on layerCtx) rather than an
+// external DAG cancel or a dispatcher's unilateral Cancel return.
+//
+// True IFF layerCtx exists and is cancelled AND e.ctx is still alive.
+// The two-pointer check is critical: layerCtx is derived from e.ctx,
+// so if e.ctx is cancelled layerCtx will also show Err() != nil. We
+// must distinguish "layer halted, DAG still alive" from "DAG being
+// shut down (cancels layer as a side effect)."
+func (e *Executor) isMidLayerHalt() bool {
+	if e.ctx != nil && e.ctx.Err() != nil {
+		return false
+	}
+	e.mu.RLock()
+	layer := e.layerCtx
+	e.mu.RUnlock()
+	if layer == nil {
+		return false
+	}
+	return layer.Err() != nil
 }
 
 func failedDispatchResult(nodeID string, err error, duration time.Duration) *NodeResult {

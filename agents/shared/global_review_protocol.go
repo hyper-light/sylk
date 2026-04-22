@@ -1629,40 +1629,17 @@ func globalReviewFinalizeSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skil
 					"challenge_id":           strings.TrimSpace(snapshot.PendingChallenge.ID),
 				}, nil
 			}
-			action := &GlobalReviewTurnAction{
-				// Mirror pipeline finalize_pipeline: typed as Handoff (the
-				// protocol-level intent) with CreatesChallenge=true (the
-				// dispatch-level fact that the responder still returns via
-				// validate_work over a branch ref + audit lock). Type and
-				// CreatesChallenge are deliberately orthogonal — Type drives
-				// downstream protocol/orchestrator routing decisions; the
-				// flag drives wire-side branch creation.
-				Type:             GlobalReviewActionHandoff,
-				AgentType:        GlobalReviewAgentInspector,
-				AgentID:          globalReviewAgentID(ctx, cfg),
-				TargetAgent:      GlobalReviewAgentTester,
-				TargetAgentID:    globalReviewResolveTargetAgentID(cfg, GlobalReviewAgentTester),
-				CreatesChallenge: true,
-				// Engage the inspector-owned audit lock for the duration of
-				// the finalize round. Peers can no longer challenge the
-				// inspector back until the lock clears on commit_to_disk
-				// (or accept_checkpoint for checkpoint stages).
-				AuditLockPhase: GlobalReviewAuditPhaseFinalizing,
-				Reason:         globalReviewFinalizeReason(finalWholePlanReview),
-				Request:        globalReviewFinalizeRequest(finalWholePlanReview),
-				RequiredOutput: []string{
-					globalReviewFinalizeRequiredOutput(finalWholePlanReview),
-					"Call out correctness, robustness, performance, style-fit, and regression risks.",
-					"Identify stronger alternative implementations if the current one is not the best fit.",
-					"State whether the work should be handed back for more changes instead of committed to disk.",
-				},
-				// Marker is required for the wire tool name resolver, the
-				// responder prompt branch, and the pending classifier to
-				// recognize this as the closure-round handoff rather than an
-				// ordinary peer-targeted challenge.
-				References: append([]string{finalizeGlobalReviewVerificationReference}, evidenceRefs...),
-			}
-			return issueGlobalReviewSelection(ctx, cfg, action)
+			// The global tester is a peer agent — it was activated
+			// alongside the inspector when the global review started.
+			// The inspector does not spawn the tester as a child
+			// challenge. Instead, consult the tester's findings from
+			// the shared review state. If the tester hasn't published
+			// findings yet, ask the inspector to wait.
+			return map[string]any{
+				"finalize_global_review":  false,
+				"awaiting_tester_findings": true,
+				"message":                "The global tester is working as a peer. Wait for tester findings in the shared review state before finalizing. Use query_global_review_state to check tester progress.",
+			}, nil
 		}).
 		Build()
 }
@@ -1724,6 +1701,26 @@ func globalReviewAcceptCheckpointSkill(cfg GlobalReviewProtocolSkillConfig) *ski
 			if err := state.setTerminalAction(action); err != nil {
 				return nil, err
 			}
+
+			// Publish global review completion event so the DAG bridge
+			// can unblock layer progression without orchestrator mediation.
+			if bus := cfg.Route.eventBus(); bus != nil {
+				nodeID := pipelineTaskMetadataString(state.BaseMetadata(), "node_id")
+				_ = bus.Publish(TopicGlobalReviewComplete, &guide.Message{
+					ID:        uuid.NewString(),
+					Type:      guide.MessageTypeAction,
+					Payload: &GlobalReviewCompleteEvent{
+						TaskID:    pipelineTaskMetadataString(state.BaseMetadata(), "task_id"),
+						NodeID:    nodeID,
+						DAGID:     pipelineTaskMetadataString(state.BaseMetadata(), "dag_id"),
+						SessionID: pipelineTaskMetadataString(state.BaseMetadata(), "session_id"),
+						ReviewID:  strings.TrimSpace(state.Snapshot().ReviewID),
+						Summary:   summary,
+					},
+					Timestamp: time.Now().UTC(),
+				})
+			}
+
 			return map[string]any{
 				"accepted_checkpoint": true,
 				"summary":             summary,
@@ -1862,6 +1859,25 @@ func globalReviewCommitToDiskSkill(cfg GlobalReviewProtocolSkillConfig) *skills.
 			}); err != nil {
 				return nil, err
 			}
+			// Publish global review completion event so the DAG bridge
+			// can unblock layer progression without orchestrator mediation.
+			if bus := cfg.Route.eventBus(); bus != nil {
+				nodeID := pipelineTaskMetadataString(state.BaseMetadata(), "node_id")
+				_ = bus.Publish(TopicGlobalReviewComplete, &guide.Message{
+					ID:        uuid.NewString(),
+					Type:      guide.MessageTypeAction,
+					Payload: &GlobalReviewCompleteEvent{
+						TaskID:    pipelineTaskMetadataString(state.BaseMetadata(), "task_id"),
+						NodeID:    nodeID,
+						DAGID:     pipelineTaskMetadataString(state.BaseMetadata(), "dag_id"),
+						SessionID: pipelineTaskMetadataString(state.BaseMetadata(), "session_id"),
+						ReviewID:  strings.TrimSpace(state.Snapshot().ReviewID),
+						Summary:   summary,
+					},
+					Timestamp: time.Now().UTC(),
+				})
+			}
+
 			return map[string]any{
 				"committed":     true,
 				"files_written": result.FilesWritten,

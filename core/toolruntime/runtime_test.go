@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -551,6 +552,83 @@ func newRuntimeTestSkill(name, description string) *skills.Skill {
 			return map[string]any{"name": name}, nil
 		}).
 		Build()
+}
+
+// TestRuntime_InjectsGoroutineScopeIntoHandlerContext locks the
+// invariant that every skill handler invoked through the tool runtime
+// sees a non-nil GoroutineScope on its ctx — so handlers that want to
+// dispatch tracked parallel work (batched workspace ops, concurrent
+// peer lookups, etc.) never have to check-and-fallback to sequential
+// at the Runtime boundary. When Config.Scope is nil, the runtime
+// auto-creates one; when Config.Scope is set, that exact scope is
+// propagated.
+func TestRuntime_InjectsGoroutineScopeIntoHandlerContext(t *testing.T) {
+	captured := make(chan *concurrency.GoroutineScope, 1)
+	capturing := skills.NewSkill("captures_scope").
+		Description("Captures the scope its handler receives on ctx.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			captured <- concurrency.ScopeFromContext(ctx)
+			return map[string]any{"ok": true}, nil
+		}).
+		Build()
+
+	t.Run("auto_created_when_config_scope_nil", func(t *testing.T) {
+		registry := skills.NewRegistry()
+		mustRegisterSkill(t, registry, capturing)
+		rt, err := New(Config{
+			Registry: registry,
+			Manifest: NewManifest("agent", "agent.default",
+				NewToolPolicy("captures_scope", EffectReadOnly, DomainFilesystem, ExecutionModeLocal, WithVisibleByDefault()),
+			),
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer rt.Close()
+		if _, err := rt.Execute(context.Background(), Invocation{
+			ToolCall:        providers.ToolCall{ID: "c1", Name: "captures_scope", Arguments: "{}"},
+			AgentID:         "agent",
+			CorrelationID:   "corr-1",
+			CapabilityScope: "agent.default",
+		}); err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		scope := <-captured
+		if scope == nil {
+			t.Fatal("expected runtime to auto-create a GoroutineScope and stamp it onto ctx when Config.Scope is nil")
+		}
+	})
+
+	t.Run("respects_caller_supplied_scope", func(t *testing.T) {
+		registry := skills.NewRegistry()
+		mustRegisterSkill(t, registry, capturing)
+		supplied := concurrency.NewGoroutineScope(context.Background(), "injected", nil)
+		defer func() { _ = supplied.Shutdown(100*time.Millisecond, 500*time.Millisecond) }()
+
+		rt, err := New(Config{
+			Registry: registry,
+			Manifest: NewManifest("agent", "agent.default",
+				NewToolPolicy("captures_scope", EffectReadOnly, DomainFilesystem, ExecutionModeLocal, WithVisibleByDefault()),
+			),
+			Scope: supplied,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer rt.Close()
+		if _, err := rt.Execute(context.Background(), Invocation{
+			ToolCall:        providers.ToolCall{ID: "c2", Name: "captures_scope", Arguments: "{}"},
+			AgentID:         "agent",
+			CorrelationID:   "corr-1",
+			CapabilityScope: "agent.default",
+		}); err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		scope := <-captured
+		if scope != supplied {
+			t.Errorf("expected caller-supplied scope to be propagated; got %p, want %p", scope, supplied)
+		}
+	})
 }
 
 func newPanickingRuntimeTestSkill(name string) *skills.Skill {

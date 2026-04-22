@@ -13,6 +13,7 @@ import (
 type SessionVFSPipelineCommitterBackend interface {
 	HasPipeline(pipelineID string) bool
 	ExtractReviewCandidate(pipelineID string) (*versioning.ReviewCandidate, error)
+	MergePipelineIntoGreen(ctx context.Context, pipelineID string) (versioning.MergePipelineResult, error)
 	RollbackPipelineIfTracked(pipelineID string) (bool, error)
 	CurrentVersion() versioning.SemanticVersion
 }
@@ -46,6 +47,25 @@ func (c *sessionVFSPipelineCommitter) lookupSession(ctx context.Context) Session
 		return nil
 	}
 	return c.sessionLookup(sessionID)
+}
+
+func (c *sessionVFSPipelineCommitter) MergePipelineIntoGreen(ctx context.Context, pipelineID string) (versioning.MergePipelineResult, error) {
+	pipelineID = strings.TrimSpace(pipelineID)
+	svfs := c.lookupSession(ctx)
+	if svfs == nil {
+		return versioning.MergePipelineResult{PipelineID: pipelineID}, nil
+	}
+	if !svfs.HasPipeline(pipelineID) {
+		// Idempotent: pipeline already merged or never created. Return a
+		// zero-draft result with the current green version so the caller
+		// can record the handoff without treating a retry as an error.
+		return versioning.MergePipelineResult{
+			PipelineID:    pipelineID,
+			HadDraft:      false,
+			MergedVersion: svfs.CurrentVersion(),
+		}, nil
+	}
+	return svfs.MergePipelineIntoGreen(ctx, pipelineID)
 }
 
 func (c *sessionVFSPipelineCommitter) ExtractReviewCandidate(ctx context.Context, pipelineID string) (string, bool, versioning.SemanticVersion, error) {

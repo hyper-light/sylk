@@ -23,6 +23,10 @@ import (
 // gate so the test can observe the published update.
 type noopPipelineCommitter struct{}
 
+func (noopPipelineCommitter) MergePipelineIntoGreen(_ context.Context, pipelineID string) (versioning.MergePipelineResult, error) {
+	return versioning.MergePipelineResult{PipelineID: pipelineID}, nil
+}
+
 func (noopPipelineCommitter) ExtractReviewCandidate(_ context.Context, _ string) (string, bool, versioning.SemanticVersion, error) {
 	return "", false, versioning.SemanticVersion{}, nil
 }

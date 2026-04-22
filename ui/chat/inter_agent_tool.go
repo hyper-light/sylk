@@ -294,8 +294,26 @@ func mergeInterAgentStartRecord(record *ToolCallRecord, fallback ToolCallRecord,
 }
 
 func updateInterAgentCompletion(record *ToolCallRecord, ev msg.ToolCallEventMsg) bool {
-	if record == nil || record.InterAgent == nil {
+	if record == nil {
 		return false
+	}
+
+	// Promotion path: the Start event could not resolve inter-agent
+	// metadata (args lacked a target identifier the derivation could
+	// read), so a regular tool-call row was created. The Complete event
+	// for tools like challenge_peer carries resolved metadata in the
+	// output (the handler does an activity lookup and stamps
+	// target_agent_type into its result map). Attach that metadata to
+	// the matching record instead of refusing the update — otherwise
+	// the caller falls through to buildInterAgentCompletionFallback,
+	// which appends a *second* row with the same ToolCallKey while
+	// leaving the original row incomplete forever.
+	if record.InterAgent == nil {
+		if row, ok := interAgentRowFromMetadata(ev.InterAgent); ok && !ev.InterAgent.UpdateOrigin {
+			record.InterAgent = row
+		} else {
+			return false
+		}
 	}
 
 	if row, ok := interAgentRowFromMetadata(ev.InterAgent); ok && !ev.InterAgent.UpdateOrigin {

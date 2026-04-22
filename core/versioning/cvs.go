@@ -136,6 +136,22 @@ type BeginPipelineConfig struct {
 	AgentRole   string
 	WorkingDir  string
 	Files       []string
+
+	// BaseCopyVersion, when set, pins the new pipeline's starting state
+	// to a specific historical Copy (see docs/PARALLEL_GLOBAL_VFS.md).
+	// The pipeline VFS is seeded byte-for-byte from that Copy at
+	// dispatch time so the pipeline owns a fully independent view of
+	// the green state at that version.
+	//
+	// The zero value means "use current green as the read base," which
+	// is the legacy behavior for pipelines that do not need Copy
+	// pinning (initial task dispatch, etc.).
+	//
+	// The primary consumer of a non-zero BaseCopyVersion is remediation
+	// dispatch: architect-composed fix tasks pin to the Copy of the
+	// failing merge so the remediation sees exactly the state that was
+	// audited.
+	BaseCopyVersion SemanticVersion
 }
 
 type CVSConfig struct {

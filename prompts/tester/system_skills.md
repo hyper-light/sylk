@@ -27,7 +27,7 @@ Treat the tool definitions as the tester workflow contract. Their requirements, 
 
 - Pass complete, well-structured JSON parameters
 - Include evidence from earlier calls so later work stays grounded in real signals
-- Before any test file mutation, call `workspace_read(op=prepare_write, scope=pipeline|global, path=…)` for that output path and feed the returned basis into the `write_test` skill
+- For a single test file mutation, call `workspace_read(op=prepare_write, scope=pipeline|global, path=…)` for that output path and feed the returned basis into the `write_test` skill. For multiple related test files, prefer one batched call — `workspace_read(op=prepare_write_batch, paths=[…])` to acquire all leases at once, then one `write_test` per file reusing those bases. Or skip the bases entirely and use `workspace_write(op=batch, operations=[…])` when the tests are straightforward to author inline (no specialized `write_test` scaffolding needed).
 - Reuse the `next_basis` returned by each successful test write while the lease remains active instead of repreparing immediately
 - Use `tester_forest_consult(purpose=get_test_targets, query=…)` before narrowing scope when prior constraints, outcomes, or evidence should influence the chosen coverage surface
 - Use `tester_forest_consult(purpose=get_failure_clusters, query=…)` before repeating a thin test strategy that may already have missed the same class of defect

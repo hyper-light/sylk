@@ -371,11 +371,27 @@ type PipelineTesterSuiteIDFn func() string
 // interface — invoked from the inspector's own skill handlers — keeps
 // authority where the protocol says it belongs.
 type PipelineCommitter interface {
-	// ExtractReviewCandidate closes the named pipeline draft, stashes its
-	// modifications as a review candidate for the global review tier, and
-	// removes the pipeline VFS from the session map. Returns the
-	// candidate's ID (empty when no modifications existed), whether a
-	// draft was actually present, and the resulting checkpoint version.
+	// MergePipelineIntoGreen merges the pipeline's accumulated modifications
+	// directly into the session's global ("green") VFS via MergePipe/OT.
+	// The pipeline VFS is closed and removed from the session map.
+	//
+	// This is the authoritative pipeline-inspector-accept handoff under the
+	// parallel-global-VFS design (see docs/PARALLEL_GLOBAL_VFS.md). After
+	// this call, the pipeline's work is visible to sibling pipelines and
+	// to any subsequently-dispatched pipeline (including remediation) that
+	// opens a new pipeline VFS against green.
+	//
+	// Returns MergePipelineResult describing the merge event (base/merged
+	// versions, path count, had-draft flag). Callers propagate this
+	// downstream for audit replica dispatch and observability.
+	MergePipelineIntoGreen(ctx context.Context, pipelineID string) (versioning.MergePipelineResult, error)
+
+	// ExtractReviewCandidate is the legacy pipeline-accept path that
+	// stashed mods in the review-candidate map. Retained for backward
+	// compatibility during the parallel-global-VFS transition; new
+	// callers should use MergePipelineIntoGreen instead.
+	//
+	// Deprecated: use MergePipelineIntoGreen.
 	ExtractReviewCandidate(ctx context.Context, pipelineID string) (candidateID string, hadDraft bool, version versioning.SemanticVersion, err error)
 
 	// Rollback discards a pipeline draft without merging it. Used by the
@@ -2362,9 +2378,19 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 			if task != nil {
 				pipelineID = strings.TrimSpace(task.TaskID)
 			}
-			candidateID := ""
+			// Parallel-global-VFS design: handoff_to_ot merges the
+			// pipeline's accumulated modifications directly into the
+			// session's green global VFS via MergePipe/OT. After this
+			// call, the pipeline's work is visible to:
+			//   - sibling pipelines reading through the base reader
+			//   - any subsequently-dispatched pipeline (including
+			//     remediation) that opens its own pipeline VFS
+			// The legacy ReviewCandidate intermediate is retired on this
+			// path; see docs/PARALLEL_GLOBAL_VFS.md.
 			hadDraft := false
-			var checkpointVersion versioning.SemanticVersion
+			var baseVersion versioning.SemanticVersion
+			var mergedVersion versioning.SemanticVersion
+			pathCount := 0
 			if pipelineID != "" {
 				if cfg.Committer == nil {
 					return nil, fmt.Errorf("handoff_to_ot requires a configured pipeline committer (inspector misconfiguration)")
@@ -2373,13 +2399,14 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 				if committer == nil {
 					return nil, fmt.Errorf("handoff_to_ot requires a configured pipeline committer (inspector misconfiguration)")
 				}
-				cid, hd, ver, extractErr := committer.ExtractReviewCandidate(ctx, pipelineID)
-				if extractErr != nil {
-					return nil, fmt.Errorf("extract pipeline review candidate %s: %w", pipelineID, extractErr)
+				result, mergeErr := committer.MergePipelineIntoGreen(ctx, pipelineID)
+				if mergeErr != nil {
+					return nil, fmt.Errorf("merge pipeline %s into green: %w", pipelineID, mergeErr)
 				}
-				candidateID = cid
-				hadDraft = hd
-				checkpointVersion = ver
+				hadDraft = result.HadDraft
+				baseVersion = result.BaseVersion
+				mergedVersion = result.MergedVersion
+				pathCount = result.PathCount
 			}
 
 			if task != nil {
@@ -2389,21 +2416,75 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 					task,
 					summary,
 					map[string]any{
-						"summary":             summary,
-						"evidence_refs":       evidenceRefs,
-						"review_candidate_id": candidateID,
-						"had_draft":           hadDraft,
-						"checkpoint_version":  checkpointVersion.String(),
+						"summary":         summary,
+						"evidence_refs":   evidenceRefs,
+						"had_draft":       hadDraft,
+						"base_version":    baseVersion.String(),
+						"merged_version":  mergedVersion.String(),
+						"paths_merged":    pathCount,
+						// Legacy key preserved for any residual consumer.
+						// Empty under the parallel-global-VFS design; the
+						// review-candidate ID intermediate is retired.
+						"review_candidate_id": "",
+						"checkpoint_version":  mergedVersion.String(),
 					},
 					PipelineTaskAttempt(task),
 				)
 			}
+
+			// Direct route to global inspector — no orchestrator mediation.
+			// The pipeline inspector owns the handoff: it merged the VFS and
+			// now routes the global review directly using the Guide's
+			// synchronous agent-to-agent protocol. The global inspector and
+			// global tester are activated as peers in the review snapshot.
+			if bus := cfg.Route.eventBus(); bus != nil && task != nil {
+				reviewCtx := GlobalReviewContext{
+					TaskID:            strings.TrimSpace(task.TaskID),
+					TaskName:          pipelineTaskMetadataString(task.Context, "task_name"),
+					TaskSlug:          pipelineTaskMetadataString(task.Context, "task_slug"),
+					NodeID:            strings.TrimSpace(task.NodeID),
+					DAGID:             strings.TrimSpace(task.DAGID),
+					SessionID:         strings.TrimSpace(task.SessionID),
+					HadDraft:          hadDraft,
+					CheckpointVersion: mergedVersion,
+					SessionDir:        pipelineTaskMetadataString(task.Context, "session_dir"),
+					AcceptanceSummary: summary,
+					EvidenceRefs:      evidenceRefs,
+					PipelineAgentType: agentType,
+					PlanID:            pipelineTaskMetadataString(task.Context, "plan_id"),
+					PlanFilePath:      pipelineTaskMetadataString(task.Context, "plan_file_path"),
+					TaskDescription:   strings.TrimSpace(task.Prompt),
+					AffectedFiles:     decodeAnyStringList(task.Context["affected_files"]),
+				}
+				if planSnapshot := pipelineTaskMetadataString(task.Context, "plan_snapshot"); planSnapshot != "" {
+					reviewCtx.PlanSnapshot = planSnapshot
+				}
+				if criteria := pipelineTaskMetadataString(task.Context, "task_criteria_snapshot"); criteria != "" {
+					reviewCtx.TaskCriteriaSnapshot = criteria
+				}
+				reviewCtx.AcceptanceCriteria = decodeAnyStringList(task.Context["acceptance_criteria"])
+				reviewCtx.SuccessCriteria = decodeAnyStringList(task.Context["success_criteria"])
+				reviewCtx.TestRequirements = decodeAnyStringList(task.Context["test_requirements"])
+
+				req := BuildGlobalReviewRouteRequest(reviewCtx, pipelineProtocolAgentID(ctx, cfg))
+				if req != nil {
+					// Fire-and-forget: the global inspector handles the
+					// review lifecycle independently. The DAG bridge
+					// subscribes to global_review.complete/failed events
+					// to advance the layer gate.
+					_ = bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage("", req))
+				}
+			}
+
 			return map[string]any{
 				"handoff_to_ot":       true,
 				"agent_type":          agentType,
 				"evidence_refs":       evidenceRefs,
-				"review_candidate_id": candidateID,
 				"had_draft":           hadDraft,
+				"base_version":        baseVersion.String(),
+				"merged_version":      mergedVersion.String(),
+				"paths_merged":        pathCount,
+				"review_candidate_id": "",
 			}, nil
 		}).
 		Build()
@@ -2705,10 +2786,26 @@ func reconcileChallengeFinalizeTarget(specs []PipelineTesterFinalizeTargetSpec, 
 // non-empty target when no challenge is pending. There's no challenge
 // state to derive from, so the LLM must name each recipient
 // explicitly.
+//
+// Returns a ProtocolError (not a bare fmt.Errorf) so the pipeline
+// protocol dispatcher's enrichPipelineProtocolError wrapper attaches
+// the current snapshot state and the list of currently-legal actions
+// to the recovery hint. Without that enrichment, the LLM sees only
+// "targets[i].target is required" — no indication that the reason is
+// the absence of a pending challenge, and no pointer at the right
+// per-state shape of the call. With enrichment, the LLM sees the full
+// "pending_challenge: none → you must name target per entry or switch
+// to action=handoff/challenge" context and can self-correct on the
+// next turn instead of wedging the circuit-breaker after two retries.
 func requireExplicitFinalizeTargets(specs []PipelineTesterFinalizeTargetSpec) error {
 	for i := range specs {
 		if normalizePipelineAgentType(specs[i].Target) == "" {
-			return fmt.Errorf("targets[%d].target is required", i)
+			return NewPipelineProtocolError(
+				"pipeline.finalize.target_required",
+				"finalize_pipeline",
+				fmt.Sprintf("targets[%d].target is required when no challenge is pending", i),
+				"No PendingChallenge is set in the pipeline snapshot, so the substrate has no challenger to auto-route the verification artifact to. Supply `target` on every targets entry (engineer, designer, or both for a cohort) to name each recipient explicitly. If verification isn't ready yet, switch to action=handoff for ordinary phase progression instead.",
+			)
 		}
 	}
 	return nil
@@ -2726,24 +2823,44 @@ func requireExplicitFinalizeTargets(specs []PipelineTesterFinalizeTargetSpec) er
 // always invariants regardless of challenge state.
 func normalizeTesterFinalizeSpecs(in []PipelineTesterFinalizeTargetSpec) ([]PipelineTesterFinalizeTargetSpec, error) {
 	if len(in) == 0 {
-		return nil, fmt.Errorf("targets is required: provide at least one per-recipient verification spec")
+		return nil, NewPipelineProtocolError(
+			"pipeline.finalize.targets_required",
+			"finalize_pipeline",
+			"targets is required: provide at least one per-recipient verification spec",
+			"Supply a `targets` array with at least one entry. If no PendingChallenge is set, each entry must include `target` (engineer, designer, or both for a cohort) plus `summary`. If a PendingChallenge IS set, provide exactly one entry with `summary` and omit `target` — the substrate auto-routes to the challenger.",
+		)
 	}
 	out := make([]PipelineTesterFinalizeTargetSpec, 0, len(in))
 	seen := make(map[string]struct{}, len(in))
 	for i, spec := range in {
 		target := normalizePipelineAgentType(spec.Target)
 		if target == PipelineAgentTester {
-			return nil, fmt.Errorf("targets[%d].target %q is invalid: the tester cannot finalize for itself", i, target)
+			return nil, NewPipelineProtocolError(
+				"pipeline.finalize.self_target",
+				"finalize_pipeline",
+				fmt.Sprintf("targets[%d].target %q is invalid: the tester cannot finalize for itself", i, target),
+				"finalize_pipeline packages a verification artifact for a DOWNSTREAM recipient. Use target=engineer or target=designer (or both in a cohort entry) for self-initiated cohort handoffs, or omit `target` entirely when answering a pending challenge from inspector.",
+			)
 		}
 		if target != "" {
 			if _, dup := seen[target]; dup {
-				return nil, fmt.Errorf("targets[%d].target %q is duplicated", i, target)
+				return nil, NewPipelineProtocolError(
+					"pipeline.finalize.duplicate_target",
+					"finalize_pipeline",
+					fmt.Sprintf("targets[%d].target %q is duplicated", i, target),
+					"Each targets entry must name a distinct recipient. Collapse duplicate recipients into one entry combining the relevant evidence and failure focus.",
+				)
 			}
 			seen[target] = struct{}{}
 		}
 		summary := strings.TrimSpace(spec.Summary)
 		if summary == "" {
-			return nil, fmt.Errorf("targets[%d].summary is required", i)
+			return nil, NewPipelineProtocolError(
+				"pipeline.finalize.summary_required",
+				"finalize_pipeline",
+				fmt.Sprintf("targets[%d].summary is required", i),
+				"Every targets entry needs a concrete summary describing what this recipient should know about the verification result and why it matters to their work — not a filler string.",
+			)
 		}
 		out = append(out, PipelineTesterFinalizeTargetSpec{
 			Target:       target,

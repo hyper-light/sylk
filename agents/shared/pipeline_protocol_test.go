@@ -2021,6 +2021,10 @@ func callSkill(t *testing.T, ctx context.Context, skills []*skills.Skill, name s
 // updates.
 type testNoopPipelineCommitter struct{}
 
+func (testNoopPipelineCommitter) MergePipelineIntoGreen(_ context.Context, pipelineID string) (versioning.MergePipelineResult, error) {
+	return versioning.MergePipelineResult{PipelineID: pipelineID}, nil
+}
+
 func (testNoopPipelineCommitter) ExtractReviewCandidate(_ context.Context, _ string) (string, bool, versioning.SemanticVersion, error) {
 	return "", false, versioning.SemanticVersion{}, nil
 }

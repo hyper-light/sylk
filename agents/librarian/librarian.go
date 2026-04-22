@@ -109,6 +109,14 @@ type Librarian struct {
 	cloneStore     *CloneStore
 	sessionVFS     *versioning.SessionVFS
 	workspaceViews versioning.WorkspaceViewAccess
+	// fileAccess is a read-only session-routing FileAccess used by
+	// ops that need overlay-modification introspection (list_changes,
+	// prepare_write, etc.). Populated by SetSessionVFS; nil until a
+	// SessionVFS is attached. The authority profile
+	// (core/authority/profile.go) enforces read-only across all
+	// three layers, so even a writable underlying FileAccess is
+	// prevented from mutating anything through this handle.
+	fileAccess versioning.FileAccess
 
 	// State mutex (guards id during handoff swap).
 	mu sync.Mutex
@@ -193,6 +201,13 @@ func New(cfg Config, provider ...LibrarianProvider) (*Librarian, error) {
 		knownAgents:      make(map[string]*guide.AgentAnnouncement),
 		knowledgeBackend: cfg.KnowledgeBackend,
 		steering:         shared.NewSteeringManager(),
+		// workspaceViews and fileAccess are bootstrapped here with a
+		// disk-only fallback; SetSessionVFS swaps them for the real
+		// session-routing implementations once the VFS is attached.
+		// Pre-bind: view=global / view=pipeline fall back to disk
+		// (silently) and list_changes returns "file access
+		// unavailable" until SetSessionVFS runs. That's expected
+		// until the orchestrator wires the session.
 		workspaceViews: authority.RestrictWorkspaceViews("librarian", versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
 			DefaultView:      versioning.WorkspaceViewDisk,
 			DefaultSessionID: cfg.SessionID,
@@ -1064,18 +1079,52 @@ func (l *Librarian) Terminate(_ context.Context) error {
 	return l.Stop()
 }
 
-// SetSessionVFS is intentionally a no-op. The librarian reads committed disk
-// state only and does not consume the global or pipeline VFS layers.
-func (l *Librarian) SetSessionVFS(_ *versioning.SessionVFS) {
+// SetSessionVFS wires the librarian's workspace-view and file-access
+// layers to the live SessionVFS. Unlike earlier behavior (which
+// deliberately discarded the argument and collapsed every read to
+// disk), the librarian now genuinely honors its authority profile:
+//
+//   - WorkspaceViews permits reads across disk / global / pipeline
+//     (core/authority/profile.go:96) but blocks writes.
+//   - The attached FileAccess is session-routing + read-only, wrapped
+//     by authority.RestrictFileAccess so list_changes /
+//     prepare_write and similar ops work, while writes remain
+//     blocked at the authority layer.
+//
+// Called with nil to tear the wiring down (session close, test
+// cleanup); subsequent `workspace_read(op=…)` calls that need
+// overlay access then surface the standard "file access is
+// unavailable" error until a live SessionVFS is reattached.
+func (l *Librarian) SetSessionVFS(svfs *versioning.SessionVFS) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.sessionVFS = nil
+	l.sessionVFS = svfs
+	diskFallback := versioning.NewDiskFileAccess(l.config.WorkingDirectory, true)
 	l.workspaceViews = authority.RestrictWorkspaceViews("librarian", versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
 		DefaultView:      versioning.WorkspaceViewDisk,
 		DefaultSessionID: l.config.SessionID,
 		WorkingDir:       l.config.WorkingDirectory,
-		DiskFallback:     versioning.NewDiskFileAccess(l.config.WorkingDirectory, true),
+		Session:          svfs,
+		DiskFallback:     diskFallback,
 	}))
+	if svfs != nil {
+		// The read-only global overlay FileAccess: VFSFileAccess
+		// implements the overlayModificationReader interface the
+		// list_changes skill looks for, so
+		// workspace_read(op=list_changes) returns the session's
+		// staged-but-uncommitted modifications. A routing wrapper
+		// (e.g. NewSessionRoutingFileAccess) would re-route the API
+		// but NOT expose Modifications(), so list_changes would
+		// silently return an empty summary. We pick the overlay
+		// handle directly and wrap it in the librarian authority
+		// profile so writes stay blocked (RestrictFileAccess
+		// enforces FileScopeDiskRead at the plumbing layer — even a
+		// writable underlying FA cannot mutate through this handle).
+		overlay := svfs.NewGlobalFileAccess(true)
+		l.fileAccess = authority.RestrictFileAccess("librarian", overlay)
+	} else {
+		l.fileAccess = nil
+	}
 }
 
 // SetKnowledgeStore wires the librarian to the progressive knowledge store.

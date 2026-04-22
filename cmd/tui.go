@@ -861,6 +861,21 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 	}
 	phase1.guideRef.Store(g)
 
+	// Bind the Guide's event logger to the default session directory
+	// eagerly. Without this the logger binds lazily on the first
+	// incoming route request — which means if the user never routes
+	// anything, the guide's WAL + events.jsonl never get written.
+	// Binding here guarantees a "GuideStarted" anchor lands on disk
+	// and every subsequent logEvent call reaches the per-day stream.
+	if phase1.defaultSession != nil {
+		sessionID := phase1.defaultSession.ID()
+		sessionDir := filepath.Join(".sylk", "sessions", sessionID)
+		if err := g.BindSession(sessionDir, sessionID); err != nil {
+			slog.Warn("guide: eager BindSession failed",
+				"session_id", sessionID, "error", err)
+		}
+	}
+
 	orch, err := extractAgent[*orchestrator.Orchestrator](phase1.containerReg, "orchestrator")
 	if err != nil {
 		return bootstrapPhase3{}, fmt.Errorf("extract orchestrator: %w", err)
@@ -1147,6 +1162,25 @@ func registerPhase4Librarian(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) er
 	}
 	_ = registerAgentWithGuide(phase3.guide, lib, "librarian")
 	wireGlobalAgentPod(lib, "librarian", phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
+
+	// Attach the session VFS so the librarian can see the live
+	// global overlay (and through the workspace-view layer, pipeline
+	// overlays too). Without this the librarian's authority profile
+	// (which permits disk / global / pipeline reads) is silently
+	// reduced to disk-only by the SetSessionVFS default, and
+	// workspace_read(op=list_changes) fails with "file access is
+	// unavailable". The librarian is a singleton across sessions;
+	// we bind it to the default session's VFS at registration time.
+	// Multi-session deployments that want per-session binding would
+	// re-attach on session switch.
+	if phase1.defaultSession != nil {
+		if orch := phase1.orchRef.Load(); orch != nil {
+			sessionID := phase1.defaultSession.ID()
+			if svfs := orch.EnsureSessionVFS(sessionID, phase1.projectRoot); svfs != nil {
+				lib.SetSessionVFS(svfs)
+			}
+		}
+	}
 	return nil
 }
 

@@ -490,3 +490,79 @@ func TestEnsureInterAgentTerminalStatus_SuccessfulChallengeStaysPending(t *testi
 		t.Fatalf("status = %q, want still Pending for dispatched challenge", record.InterAgent.Status)
 	}
 }
+
+// TestHandleInterAgentToolCallInList_ChallengePeerPromotesRegularRow is the
+// regression guard for the "challenge_peer shows no child agent row" bug.
+//
+// challenge_peer takes target_activity_id (an opaque UUID) and resolves
+// the activity's author inside its handler, stamping target_agent_type
+// into the *output* map. At Start time, args have no agent identifier,
+// so the emission-side derivation returns nil InterAgent metadata and
+// the UI builds a regular tool-call row. At Complete time, the event
+// finally carries InterAgent metadata. If the UI refuses to promote
+// the existing regular row, the Complete either synthesizes a
+// duplicate inter-agent row (via buildInterAgentCompletionFallback)
+// while leaving the original regular row stuck in-flight, or — when
+// deduplication upstream suppresses the duplicate — produces no
+// child row at all. Either failure mode was visible to users of
+// librarian/archivalist/engineer invocations of challenge_peer.
+//
+// Under the fix, updateInterAgentCompletion promotes the regular row
+// to inter-agent using the Complete event's InterAgent metadata, so
+// the final list contains exactly one row with a populated
+// InterAgent, Completed=true, and AgentTypes matching the resolved
+// target author.
+func TestHandleInterAgentToolCallInList_ChallengePeerPromotesRegularRow(t *testing.T) {
+	// Start emitted challenge_peer as a regular (non-inter-agent) row —
+	// the emission-side DeriveInterAgentToolEvent returned nil because
+	// args lacks target_agent_type (it's only in output after the
+	// handler's activity lookup).
+	calls := []ToolCallRecord{{
+		ToolCallKey: "challenge_peer_abc",
+		ToolName:    "challenge_peer",
+		FullArgs:    `{"target_activity_id":"target-activity-1","evidence":"x"}`,
+		StartedAt:   time.Now(),
+		InterAgent:  nil,
+	}}
+
+	// Complete event carries the resolved metadata: the handler looked
+	// up target-activity-1, found its author was tester-pipeline, and
+	// stamped target_agent_type into the output. The emission side
+	// derived Kind=challenge, AgentTypes=[tester-pipeline].
+	complete := msg.ToolCallEventMsg{
+		ToolCallKey: "challenge_peer_abc",
+		ToolName:    "challenge_peer",
+		Phase:       1,
+		Success:     true,
+		Duration:    50 * time.Millisecond,
+		Output:      `{"challenge_id":"ch-1","target_agent_type":"tester-pipeline","target_pipeline_id":"task_1"}`,
+		InterAgent: &msg.InterAgentToolEventMsg{
+			Kind:       "challenge",
+			AgentTypes: []string{"tester-pipeline"},
+			Summary:    "disputed commitment",
+			Status:     "pending",
+		},
+	}
+	if !handleInterAgentToolCallInList(&calls, "librarian", complete, interAgentDispatchCallbacks{}) {
+		t.Fatal("expected Complete event to be consumed by the inter-agent handler")
+	}
+	if len(calls) != 1 {
+		t.Fatalf("calls len = %d, want 1 (the regular row must be promoted in-place, not duplicated): %#v", len(calls), calls)
+	}
+	record := calls[0]
+	if record.InterAgent == nil {
+		t.Fatal("regular row was not promoted — InterAgent is nil after Complete")
+	}
+	if record.InterAgent.Kind != InterAgentToolChallenge {
+		t.Fatalf("InterAgent.Kind = %q, want %q", record.InterAgent.Kind, InterAgentToolChallenge)
+	}
+	if len(record.InterAgent.AgentTypes) != 1 || record.InterAgent.AgentTypes[0] != "tester-pipeline" {
+		t.Fatalf("InterAgent.AgentTypes = %#v, want [tester-pipeline]", record.InterAgent.AgentTypes)
+	}
+	if !record.Completed {
+		t.Fatal("promoted row must be Completed after a Complete event")
+	}
+	if !record.Success {
+		t.Fatal("promoted row must be Success=true for a successful Complete")
+	}
+}

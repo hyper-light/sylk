@@ -780,6 +780,26 @@ func appendChatBranchRefLogAttrs(attrs []any, prefix string, ref *msg.InterAgent
 // it is reused; otherwise a new entry is pushed. Multiple concurrent streams
 // are tracked in the streams map keyed by correlationID.
 func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
+	// Control-plane routes (plan-handoff receipt lookups, command-
+	// approval-hold begin/resolve, protocol reconciliation) synthesize
+	// a StreamStartMsg as a side effect of their guide.RouteRequest
+	// delivery. The route serves a real coordination purpose — pausing
+	// a DAG, resyncing a receipt — but its UI echo MUST NOT materialize
+	// as a user-visible agent entry, nested or top-level, because the
+	// target agent (typically the orchestrator) isn't taking a
+	// conversational turn. The paired system_coordination ActivityEvent
+	// published by the sender via guide.EmitControlPlaneCoordination
+	// renders the semantic meaning as a SourceSystem chat row instead.
+	//
+	// Early-return drops the stream before any slot allocation or
+	// history mutation so there's no ghost entry to clean up later.
+	if start.ControlPlane {
+		chatDebugLog().Info("chat.handleStreamStart: SUPPRESSED_CONTROL_PLANE",
+			"correlation_id", start.CorrelationID,
+			"agent_id", start.AgentID,
+			"agent_type", start.AgentType)
+		return nil
+	}
 	m.clearExplicitTopLevelTransferState(start.CorrelationID, start.ParentCorrelationID, start.BranchRef, start.TopLevelTransfer)
 	if start.BranchRef == nil {
 		if slot := m.nestedStream(start.CorrelationID); slot != nil {
@@ -935,6 +955,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 	}
 	willEvict := m.history.Full()
 	m.history.Push(entry)
+	m.evictStaleResumablePrimariesForAppend(cid)
 	m.viewport.OnNewEntry()
 	if willEvict {
 		m.viewport.AdjustSelectionForEviction()
@@ -1856,6 +1877,9 @@ func (m *Model) pushPlanEntry(id, content string, update msg.PlanUpdateMsg) {
 func (m *Model) PushEntry(entry *ChatEntry) {
 	willEvict := m.history.Full()
 	m.history.Push(entry)
+	if entry != nil {
+		m.evictStaleResumablePrimariesForAppend(entry.CorrelationID)
+	}
 	m.viewport.OnNewEntry()
 	if willEvict {
 		m.viewport.AdjustSelectionForEviction()
@@ -5264,6 +5288,68 @@ func (m *Model) clearResumablePrimary(correlationID string) {
 	delete(m.resumablePrimaries, correlationID)
 }
 
+// evictStaleResumablePrimariesForAppend is invoked immediately after
+// a new top-level entry is pushed onto history. It clears any
+// resumable primary whose recorded entry now sits strictly above the
+// newly-appended entry AND whose children set does not contain the
+// new entry's correlation ID. The purpose is to preserve within-turn
+// continuity — consult/challenge responses still correctly resume
+// the parent agent's block because those children are recorded in
+// state.children / resumableChildOwners before the respondent's
+// entry lands — while preventing the "jump back" behavior when a
+// genuinely new top-level turn from another agent (or a fresh
+// same-agent re-invocation via pipeline handoff) appears below.
+//
+// Concretely: in Inspector → Tester → Inspector, the Tester's
+// entry arrives here. Tester's correlation ID is not in the
+// Inspector's resumable-primary children (Tester's top-level turn
+// is not a consult/challenge child of the Inspector), so the
+// Inspector's primary is evicted. The second Inspector turn then
+// falls through reusableResumablePrimaryEntry and appends a new
+// block at the tail instead of jumping back to the original
+// Inspector entry.
+func (m *Model) evictStaleResumablePrimariesForAppend(newCorrelationID string) {
+	if m == nil || len(m.resumablePrimaries) == 0 {
+		return
+	}
+	newCorrelationID = strings.TrimSpace(newCorrelationID)
+	if newCorrelationID == "" {
+		return
+	}
+	// Collect victims first so we don't mutate the map while walking.
+	// Eviction is rare (bounded by active resumable primaries, which
+	// is typically ≤ one per active agent turn), so a small fixed
+	// allocation is fine.
+	var stale []string
+	for ownerCID, state := range m.resumablePrimaries {
+		if ownerCID == newCorrelationID {
+			// The new entry IS the primary (shouldn't happen via
+			// push — resume uses UpdateAt — but guard anyway).
+			continue
+		}
+		if _, isChild := state.children[newCorrelationID]; isChild {
+			// Legitimate child (consult/challenge branch). Keep the
+			// primary so its round-trip continuation can still
+			// resume the parent block.
+			continue
+		}
+		if owner := strings.TrimSpace(m.resumableChildOwners[newCorrelationID]); owner == ownerCID {
+			// Same as above, via the owner-side linkage.
+			continue
+		}
+		// Sibling top-level entry. The primary is now behind a
+		// non-child entry in history; reusing it would produce the
+		// "jump back to the previous instance" bug.
+		stale = append(stale, ownerCID)
+	}
+	for _, ownerCID := range stale {
+		chatDebugLog().Info("chat.evictStaleResumablePrimary",
+			"owner_correlation_id", ownerCID,
+			"new_correlation_id", newCorrelationID)
+		m.clearResumablePrimary(ownerCID)
+	}
+}
+
 func (m *Model) resumablePrimaryMatches(correlationID string, start msg.StreamStartMsg) bool {
 	state, entry, ok := m.loadResumablePrimaryMatch(correlationID)
 	if !ok {
@@ -5453,15 +5539,16 @@ type activitySourceMap map[string]ChatSource
 
 func activitySourceTable() activitySourceMap {
 	return activitySourceMap{
-		"user_prompt":        SourceUser,
-		"user_clarification": SourceUser,
-		"agent_action":       SourceAgent,
-		"agent_decision":     SourceAgent,
-		"agent_error":        SourceError,
-		"tool_call":          SourceTool,
-		"tool_result":        SourceTool,
-		"tool_timeout":       SourceError,
-		"failure":            SourceError,
+		"user_prompt":         SourceUser,
+		"user_clarification":  SourceUser,
+		"agent_action":        SourceAgent,
+		"agent_decision":      SourceAgent,
+		"agent_error":         SourceError,
+		"tool_call":           SourceTool,
+		"tool_result":         SourceTool,
+		"tool_timeout":        SourceError,
+		"failure":             SourceError,
+		"system_coordination": SourceSystem,
 	}
 }
 

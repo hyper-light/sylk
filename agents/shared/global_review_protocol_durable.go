@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 )
 
@@ -54,21 +55,187 @@ func (s *GlobalReviewState) loadDurableProjection() error {
 	if s == nil || s.store == nil {
 		return nil
 	}
+	// baseSnapshot captures the in-flight view that was seeded into
+	// s.snapshot from metadata when the state was constructed (see
+	// NewGlobalReviewState). This is the freshness-authoritative source
+	// for in-flight fields; the checkpoint is the historical-authoritative
+	// source. Fix B applies the same merge-never-clobber rule the
+	// pipeline protocol now uses.
+	baseSnapshot := cloneGlobalReviewSnapshot(s.snapshot)
 	var checkpoint globalReviewCheckpoint
 	if seq, ok, err := s.store.LoadSnapshot(&checkpoint); err != nil {
 		return err
 	} else if ok {
-		s.snapshot = cloneGlobalReviewSnapshot(checkpoint.Snapshot)
 		s.processed = cloneGlobalReviewValidationProcessingList(checkpoint.Processed)
 		s.requiredAction = GlobalReviewActionType(strings.TrimSpace(checkpoint.RequiredAction))
 		s.requiredReason = strings.TrimSpace(checkpoint.RequiredReason)
 		s.terminalAction = cloneGlobalReviewTurnAction(checkpoint.TerminalAction)
+		s.snapshot = mergeGlobalReviewSnapshots(checkpoint.Snapshot, baseSnapshot, s.processed)
 		return s.replayFrom(seq)
 	}
 	if err := s.replayFrom(0); err != nil {
 		return err
 	}
 	return s.persistProjection()
+}
+
+// mergeGlobalReviewSnapshots is the global-review analog of
+// mergePipelineSnapshots. It reconciles two sources of truth for
+// global review protocol state:
+//
+//   - checkpoint: the persisted snapshot from the durable log. Authoritative
+//     for historical facts (ReviewID, RecentEvents).
+//
+//   - base: the fresh snapshot that rode along on task metadata from the
+//     dispatcher. Authoritative for in-flight facts (PendingChallenge,
+//     PendingValidation, AuditLock, ActiveAgents, RequestedBy,
+//     CurrentRequest).
+//
+// Same field-class rules as the pipeline variant: historical fields come
+// from the checkpoint, in-flight fields come from base when present, and
+// WAL resolutions (processed) trump stale pending entries.
+func mergeGlobalReviewSnapshots(
+	checkpoint *GlobalReviewSnapshot,
+	base *GlobalReviewSnapshot,
+	processed []GlobalReviewValidationProcessing,
+) *GlobalReviewSnapshot {
+	if checkpoint == nil && base == nil {
+		return nil
+	}
+	if base == nil {
+		return cloneGlobalReviewSnapshot(checkpoint)
+	}
+	if checkpoint == nil {
+		merged := cloneGlobalReviewSnapshot(base)
+		applyGlobalReviewProcessedResolutionsToMerged(merged, processed)
+		return merged
+	}
+
+	merged := cloneGlobalReviewSnapshot(checkpoint)
+	baseClone := cloneGlobalReviewSnapshot(base)
+
+	divergedFields := make([]string, 0, 4)
+
+	if baseClone.PendingChallenge != nil {
+		if merged.PendingChallenge != nil &&
+			!globalReviewChallengeEqual(merged.PendingChallenge, baseClone.PendingChallenge) {
+			divergedFields = append(divergedFields, "PendingChallenge")
+			logGlobalReviewSnapshotRescue("PendingChallenge", baseClone.PendingChallenge.ID, merged.PendingChallenge.ID)
+		} else if merged.PendingChallenge == nil {
+			logGlobalReviewSnapshotRescue("PendingChallenge", baseClone.PendingChallenge.ID, "")
+		}
+		merged.PendingChallenge = baseClone.PendingChallenge
+	}
+
+	if baseClone.PendingValidation != nil {
+		if merged.PendingValidation != nil &&
+			!globalReviewValidationEqual(merged.PendingValidation, baseClone.PendingValidation) {
+			divergedFields = append(divergedFields, "PendingValidation")
+		}
+		merged.PendingValidation = baseClone.PendingValidation
+	}
+
+	if baseClone.AuditLock != nil && strings.TrimSpace(baseClone.AuditLock.Phase) != "" {
+		if merged.AuditLock != nil &&
+			strings.TrimSpace(merged.AuditLock.Phase) != "" &&
+			merged.AuditLock.Phase != baseClone.AuditLock.Phase {
+			divergedFields = append(divergedFields, "AuditLock")
+		}
+		merged.AuditLock = baseClone.AuditLock
+	}
+
+	if strings.TrimSpace(baseClone.CurrentRequest) != "" {
+		if strings.TrimSpace(merged.CurrentRequest) != "" &&
+			merged.CurrentRequest != baseClone.CurrentRequest {
+			divergedFields = append(divergedFields, "CurrentRequest")
+		}
+		merged.CurrentRequest = baseClone.CurrentRequest
+	}
+
+	if len(baseClone.ActiveAgents) > 0 {
+		merged.ActiveAgents = append([]string(nil), baseClone.ActiveAgents...)
+	}
+
+	if strings.TrimSpace(baseClone.RequestedBy) != "" {
+		merged.RequestedBy = baseClone.RequestedBy
+	}
+
+	applyGlobalReviewProcessedResolutionsToMerged(merged, processed)
+
+	if len(divergedFields) > 0 {
+		logGlobalReviewSnapshotDiverged(divergedFields, checkpoint, base)
+	}
+
+	return merged
+}
+
+func applyGlobalReviewProcessedResolutionsToMerged(
+	merged *GlobalReviewSnapshot,
+	processed []GlobalReviewValidationProcessing,
+) {
+	if merged == nil || len(processed) == 0 {
+		return
+	}
+	resolvedIDs := make(map[string]struct{}, len(processed))
+	for _, entry := range processed {
+		id := strings.TrimSpace(entry.ChallengeID)
+		if id != "" {
+			resolvedIDs[id] = struct{}{}
+		}
+	}
+	if len(resolvedIDs) == 0 {
+		return
+	}
+	if merged.PendingChallenge != nil {
+		if _, resolved := resolvedIDs[strings.TrimSpace(merged.PendingChallenge.ID)]; resolved {
+			merged.PendingChallenge = nil
+		}
+	}
+	if merged.PendingValidation != nil {
+		if _, resolved := resolvedIDs[strings.TrimSpace(merged.PendingValidation.ChallengeID)]; resolved {
+			merged.PendingValidation = nil
+		}
+	}
+}
+
+func globalReviewChallengeEqual(a, b *GlobalReviewChallenge) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return strings.TrimSpace(a.ID) == strings.TrimSpace(b.ID) &&
+		normalizeGlobalReviewAgent(a.RequestingAgent) == normalizeGlobalReviewAgent(b.RequestingAgent)
+}
+
+func globalReviewValidationEqual(a, b *GlobalReviewValidationRecord) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return strings.TrimSpace(a.ChallengeID) == strings.TrimSpace(b.ChallengeID) &&
+		normalizeGlobalReviewAgent(a.RespondingAgent) == normalizeGlobalReviewAgent(b.RespondingAgent) &&
+		strings.TrimSpace(a.Status) == strings.TrimSpace(b.Status)
+}
+
+func logGlobalReviewSnapshotRescue(field, baseID, checkpointID string) {
+	slog.Info("global_review_protocol.snapshot_rescued_from_task_context",
+		"field", field,
+		"base_id", strings.TrimSpace(baseID),
+		"checkpoint_id", strings.TrimSpace(checkpointID),
+	)
+}
+
+func logGlobalReviewSnapshotDiverged(fields []string, checkpoint, base *GlobalReviewSnapshot) {
+	slog.Info("global_review_protocol.snapshot_merge_diverged",
+		"diverging_fields", fields,
+		"checkpoint_pending_challenge_id", globalReviewPendingChallengeID(checkpoint),
+		"base_pending_challenge_id", globalReviewPendingChallengeID(base),
+	)
+}
+
+func globalReviewPendingChallengeID(snapshot *GlobalReviewSnapshot) string {
+	if snapshot == nil || snapshot.PendingChallenge == nil {
+		return ""
+	}
+	return strings.TrimSpace(snapshot.PendingChallenge.ID)
 }
 
 func (s *GlobalReviewState) recordChallenge(ctx context.Context, action *GlobalReviewTurnAction) error {
@@ -176,18 +343,32 @@ func (s *GlobalReviewState) appendEvent(ctx context.Context, kind string, payloa
 		})
 	}
 	stream, _ := StreamMetadataFromContext(ctx)
-	seq, event, err := s.store.Append(kind, globalReviewAgentTypeFromContext(ctx), streamCorrelationID(stream), streamParentCorrelationID(stream), payload)
+	result, err := s.store.Append(AppendRequest{
+		Kind:                kind,
+		AgentType:           globalReviewAgentTypeFromContext(ctx),
+		CorrelationID:       streamCorrelationID(stream),
+		ParentCorrelationID: streamParentCorrelationID(stream),
+		// Same rationale as the pipeline variant: distinct global-
+		// review events carry distinct payloads (different
+		// challenge_ids, summaries, targets, review IDs), so the
+		// payload fingerprint is a sufficient discriminator without
+		// a caller-supplied idempotency key.
+		Payload: payload,
+	})
 	if err != nil {
-		// DUR-03: duplicate-correlation Append is a no-op (event was
-		// already applied by a prior turn or crash-recovery). State is
-		// already consistent — return success so the caller's contract
-		// ("event recorded") holds without double-apply.
+		// DUR-03: duplicate-fingerprint Append is a no-op (event was
+		// already applied by a prior turn or crash-recovery). State
+		// is already consistent — return success so the caller's
+		// contract ("event recorded") holds without double-apply.
+		// The durable log emits a pipeline_protocol.dedupe_hit log
+		// line on every dedupe so unexpected same-payload repeats
+		// (caller bugs) surface in observability.
 		if errors.Is(err, ErrDurableProtocolDuplicate) {
 			return nil
 		}
 		return err
 	}
-	if err := s.applyEvent(seq, event); err != nil {
+	if err := s.applyEvent(result.Seq, result.Event); err != nil {
 		return err
 	}
 	if err := s.persistProjection(); err != nil {

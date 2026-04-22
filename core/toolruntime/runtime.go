@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -26,6 +27,16 @@ type Config struct {
 	State                *State
 	SearchLimit          int
 	GuardianControlPlane GuardianControlPlane
+	// Scope is the agent's tracked-goroutine scope. When set, the
+	// runtime stamps it onto every tool-invocation context via
+	// concurrency.WithScope so skill handlers that want to dispatch
+	// parallel work (e.g. batched workspace reads/writes) can do so
+	// through the same primitive the agent uses for its own
+	// goroutines — leak detection, budgeting, and lifetime enforcement
+	// still apply. Handlers that don't need parallelism ignore it;
+	// tests or unwired callers leave it nil and the batched paths fall
+	// back to sequential execution.
+	Scope *concurrency.GoroutineScope
 }
 
 type ExecutionResult struct {
@@ -50,6 +61,12 @@ type Runtime struct {
 	searchLimit  int
 	worker       *SerialWorker
 	controlPlane GuardianControlPlane
+	scope        *concurrency.GoroutineScope
+	// ownsScope is true when the runtime constructed its own scope
+	// (because the caller didn't supply one). Close() shuts down an
+	// owned scope; an injected scope is left alone — it belongs to
+	// whoever passed it in and has its own lifecycle.
+	ownsScope bool
 }
 
 // Surface is the tool-runtime execution/build surface for a single request
@@ -107,19 +124,50 @@ func New(cfg Config) (*Runtime, error) {
 		worker:       NewSerialWorker(16),
 		controlPlane: cfg.GuardianControlPlane,
 	}
+	runtime.scope, runtime.ownsScope = resolveToolRuntimeScope(cfg)
 	if err := runtime.manifest.Validate(runtime.registry, runtime.controlPlane != nil); err != nil {
 		runtime.worker.Close()
+		if runtime.ownsScope && runtime.scope != nil {
+			_ = runtime.scope.Shutdown(time.Second, 2*time.Second)
+		}
 		return nil, err
 	}
 	runtime.state.Activate(runtime.manifest.DefaultVisibleNames()...)
 	return runtime, nil
 }
 
+// resolveToolRuntimeScope returns the scope the runtime should use and
+// whether it owns the scope (for Close-time cleanup). Caller-supplied
+// scope takes precedence: the agent owns shutdown, we just borrow. When
+// no scope is supplied, we construct one rooted at context.Background()
+// with the manifest's CapabilityScope as the agent ID so per-runtime
+// goroutines remain attributable in leak diagnostics even for agents
+// that haven't explicitly wired a scope yet. Budget is nil (unlimited)
+// unless the caller opts in by passing their own pre-budgeted scope.
+func resolveToolRuntimeScope(cfg Config) (*concurrency.GoroutineScope, bool) {
+	if cfg.Scope != nil {
+		return cfg.Scope, false
+	}
+	name := "toolruntime"
+	if cfg.Manifest != nil && strings.TrimSpace(cfg.Manifest.CapabilityScope) != "" {
+		name = strings.TrimSpace(cfg.Manifest.CapabilityScope)
+	}
+	return concurrency.NewGoroutineScope(context.Background(), name, nil), true
+}
+
 func (r *Runtime) Close() {
-	if r == nil || r.worker == nil {
+	if r == nil {
 		return
 	}
-	r.worker.Close()
+	if r.worker != nil {
+		r.worker.Close()
+	}
+	if r.ownsScope && r.scope != nil {
+		// Graceful → forced shutdown of any in-flight tool workers so
+		// an agent's Close() path never leaks tracked goroutines. Most
+		// tool workers are sub-second; 1s grace + 2s hard is generous.
+		_ = r.scope.Shutdown(time.Second, 2*time.Second)
+	}
 }
 
 func (r *Runtime) CapabilityScope() string {
@@ -300,6 +348,16 @@ func (r *Runtime) executeRaw(
 ) (RawExecutionResult, error) {
 	if r == nil {
 		return RawExecutionResult{}, fmt.Errorf("tool runtime is not configured")
+	}
+	// Stamp the runtime's GoroutineScope onto ctx so skill handlers
+	// that want tracked parallelism (batched workspace ops, concurrent
+	// peer lookups, etc.) can reach for the scope via
+	// concurrency.ScopeFromContext without having to receive it through
+	// every skill-config boundary. Every Runtime has a scope: either
+	// the one the caller passed in Config.Scope (shared agent scope),
+	// or one the runtime constructed for itself (auto-created).
+	if r.scope != nil {
+		ctx = concurrency.WithScope(ctx, r.scope)
 	}
 	name, policy, err := r.validateInvocation(inv)
 	if err != nil {

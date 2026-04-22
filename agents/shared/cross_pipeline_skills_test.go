@@ -133,7 +133,11 @@ func TestConsultPeerSkill_RouteSyncCrossPipelineMetadata(t *testing.T) {
 	}
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
 
-	input := json.RawMessage(`{"target_agent_type":"engineer","target_pipeline_id":"pipe-42","query":"How are you handling retries?"}`)
+	// Cross-pipeline consult: engineer in pipe-origin asking the
+	// tester-pipeline in pipe-42 about shared fixture state. Per the
+	// authority matrix (see docs/COMMS_MATRIX.md), engineer may
+	// consult tester-pipeline and holds AllowsCrossPipelineConsult.
+	input := json.RawMessage(`{"target_agent_type":"tester-pipeline","target_pipeline_id":"pipe-42","query":"How are you handling retries?"}`)
 	if _, err := skill.Handler(context.Background(), input); err != nil {
 		t.Fatalf("handler err = %v", err)
 	}

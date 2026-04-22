@@ -5,11 +5,11 @@
 Treat each skill description as part of the implementation protocol. The tool definitions tell you when a skill belongs in the flow, what it satisfies, and what it must not substitute for.
 
 ### Understanding (Priority 100–95)
-- `workspace_read(op ∈ {read, glob, grep, inspect, summarize, diff, list_changes, prepare_write}, scope=pipeline, …)` — Read the current pipeline workspace view, including overlay state; also glob/grep, summarize, diff, and obtain a leased write basis through the same primitive
+- `workspace_read(op ∈ {read, batch, glob, grep, inspect, summarize, diff, list_changes, prepare_write, prepare_write_batch}, scope=pipeline, …)` — Read pipeline workspace state. Use `op=batch, paths=[…]` to fetch multiple files in one call; individual `op=read` for single paths; glob/grep/summarize/diff/list_changes for discovery; `op=prepare_write` (or `prepare_write_batch`) for leased bases when you intend to write
 - `lsp` — Polyglot, VFS-aware code intelligence (goto_definition, find_references, hover, symbols, call_hierarchy) via treesitter, with gopls as a Go-specific accelerator
 
 ### Workspace Mutation (Priority 90)
-- `workspace_write(op ∈ {write, edit, delete, mkdir}, scope=pipeline, basis=…, …)` — One verb handles creating, overwriting, search/replace editing, deleting, and directory creation. Each op consumes the leased basis from `workspace_read(op=prepare_write, …)` and returns a fresh `next_basis` you reuse for subsequent edits on the same path
+- `workspace_write(op ∈ {write, edit, delete, mkdir, batch}, scope=pipeline, …)` — One verb handles every mutation shape. Use `op=batch, operations=[…]` for multi-file flows (creating a package, scaffolding a module, coordinated refactor): the runtime orders mkdir → writes by path, acquires leases atomically, returns per-op results. Use individual `op=write|edit|delete|mkdir` for single mutations, passing the leased `basis` from `workspace_read(op=prepare_write, …)` and chaining `next_basis` for follow-up writes on the same path
 
 ### Search & Quality Tools (Priority 90)
 - `glob` — Find files by pattern
@@ -34,11 +34,11 @@ Treat each skill description as part of the implementation protocol. The tool de
 
 ## Best Practices
 
-1. **Read before writing.** Always read a file before editing it.
-2. **Prepare every mutation path first.** Call `workspace_read(op=prepare_write, scope=pipeline, path=…)` before the first write, edit, delete, or directory creation for a path.
-3. **Reuse `next_basis` while the lease is active.** Feed the returned `next_basis` from each `workspace_write` call into the next mutation on that same path.
-4. **Use `workspace_write(op=edit, …)` only for precise replacements.** Read the file first, copy the exact current `old_text` for each edit, and use `workspace_write(op=write, …)` instead when the change is effectively a full rewrite.
-5. **Treat missing workspace reads as creation signals.** If `workspace_read(op=read, …)` returns `missing: true`, continue by preparing and creating the file instead of aborting.
+1. **Prefer batched reads and writes.** When the set of paths you need is known, use `workspace_read(op=batch, paths=[…])` and `workspace_write(op=batch, operations=[…])`. One call covers the whole set; the runtime handles dependency ordering (mkdir before children), acquires leases on demand, and returns a per-path result array.
+2. **Read before editing only when the edit depends on current content.** For full overwrites (`op=write` or a batch entry with `op=write`), skip the preceding read — the write is authoritative. Read first only when you need the current content to compose the edit.
+3. **Use `op=edit` only for precise replacements.** Copy the exact current `old_text` for each edit; use `op=write` when the change is effectively a full rewrite.
+4. **Treat missing workspace reads as creation signals.** If a read returns `missing: true`, the path is a valid creation target, not a failure — continue by writing.
+5. **Reuse `next_basis` while the lease is active** (individual-op path). The returned `next_basis` from each `workspace_write` call chains into the next mutation on that same path. `op=batch` manages this internally — you don't need to thread basis between ops in the same batch.
 6. **Use LSP for navigation.** Goto definition and find references before modifying unfamiliar code.
 7. **Format after changes.** Run format check/apply after modifying source files.
 8. **Lint after changes.** Run lint to catch issues before reporting completion.

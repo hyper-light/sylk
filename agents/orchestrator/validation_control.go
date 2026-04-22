@@ -240,9 +240,10 @@ func (o *Orchestrator) handleValidationVerdictForward(ctx context.Context, fwd *
 	if err != nil {
 		return nil, err
 	}
-	if o.dispatchGate != nil {
-		o.dispatchGate.activate(payload.SessionID)
-	}
+	// No explicit gate activation: ensureExecutionHold writes the
+	// hold to the store, which broadcasts on HoldsNotifyChannel.
+	// The dispatch gate's wait() re-queries DAGIsHeld on wake and
+	// will see the new row for (sessionID, planID).
 	if o.taskRouter != nil {
 		o.taskRouter.PauseActiveRoutes(
 			payload.SessionID,
@@ -367,6 +368,11 @@ func (o *Orchestrator) ensureExecutionHold(payload *agentshared.ValidationVerdic
 	hold := &ExecutionHoldRecord{
 		HoldID:             "hold_" + uuid.NewString(),
 		SessionID:          payload.SessionID,
+		// PlanID scopes this hold to the workflow that triggered it.
+		// A subsequent plan submitted under a different plan_id must
+		// not inherit this block — SupersedePriorPlans enforces that
+		// on plan_handoff_ingest.
+		PlanID:             payload.PlanID,
 		EpochID:            epoch.EpochID,
 		Status:             ExecutionHoldStatusActive,
 		Reason:             string(payload.Kind),
@@ -379,6 +385,36 @@ func (o *Orchestrator) ensureExecutionHold(payload *agentshared.ValidationVerdic
 		return nil, err
 	}
 	return hold, nil
+}
+
+// exemptDAGFromHold adds dagID to the hold's ExemptDAGIDs list.
+// Called before launching a remediation DAG inside an active hold —
+// the exemption is what lets the remediation DAG pass the dispatch
+// gate while the hold still blocks every other DAG in the plan.
+// Idempotent; a no-op if dagID is already exempted.
+func (o *Orchestrator) exemptDAGFromHold(holdID, dagID string) error {
+	if o.store == nil {
+		return nil
+	}
+	holdID = strings.TrimSpace(holdID)
+	dagID = strings.TrimSpace(dagID)
+	if holdID == "" || dagID == "" {
+		return nil
+	}
+	hold, err := o.store.GetExecutionHold(holdID)
+	if err != nil {
+		return err
+	}
+	if hold == nil {
+		return fmt.Errorf("exempt dag: hold %s not found", holdID)
+	}
+	for _, existing := range hold.ExemptDAGIDs {
+		if existing == dagID {
+			return nil
+		}
+	}
+	hold.ExemptDAGIDs = append(hold.ExemptDAGIDs, dagID)
+	return o.store.UpdateExecutionHold(hold)
 }
 
 func (o *Orchestrator) requestArchitectRemediation(ctx context.Context, req *agentshared.RemediationRequest) (*agentshared.RemediationResult, error) {
@@ -426,8 +462,13 @@ func (o *Orchestrator) applyRemediationResult(
 		if err := remediationDAG.UnmarshalJSON([]byte(result.FixWorkflowDAGJSON)); err != nil {
 			return fmt.Errorf("decode remediation dag: %w", err)
 		}
-		if o.dispatchGate != nil {
-			o.dispatchGate.allowDAG(sessionID, remediationDAG.ID())
+		// Exempt the remediation DAG from the hold that spawned it
+		// before launching. Without this, the gate would block the
+		// very DAG meant to resolve the hold. Writing to the store
+		// triggers HoldsNotifyChannel so the gate picks up the
+		// exemption on the next wait iteration.
+		if err := o.exemptDAGFromHold(caseRecord.HoldID, remediationDAG.ID()); err != nil {
+			return fmt.Errorf("exempt remediation dag from hold: %w", err)
 		}
 		if _, err := o.dagBridge.Execute(ctx, remediationDAG, firstNonEmpty(result.PlanID, req.PlanID), sessionID); err != nil {
 			return fmt.Errorf("execute remediation dag: %w", err)

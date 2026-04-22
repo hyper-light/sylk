@@ -479,6 +479,18 @@ func interAgentChallengeTargets(toolName string, args, output map[string]any) []
 	); target != "" {
 		return []string{target}
 	}
+	// challenge_peer addresses a fabric activity ID rather than a peer
+	// agent directly; its handler resolves the target activity's author
+	// and writes target_agent_type into the result map so the UI
+	// derivation has a recipient to hang the child row on. Checked
+	// after the more specific keys above so direct-target callers still
+	// win when both are set.
+	if target := firstNonEmptyInline(
+		stringFromAnyMap(args, "target_agent_type"),
+		stringFromAnyMap(output, "target_agent_type"),
+	); target != "" {
+		return []string{target}
+	}
 	if toolName == "challenge_agent" {
 		return nil
 	}

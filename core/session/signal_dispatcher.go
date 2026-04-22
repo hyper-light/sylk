@@ -42,6 +42,15 @@ type CrossSessionSignalDispatcher struct {
 
 	stopChan chan struct{}
 	doneChan chan struct{}
+
+	// readyChan closes once the watch goroutine is fully inside its
+	// select loop and ready to receive fsnotify events. Watch() blocks
+	// on this before returning so callers can write signal files
+	// immediately after Watch() returns without racing the goroutine's
+	// entry into its select. Eliminates the previous time.Sleep-based
+	// readiness hack in tests; races of any kind are not tolerated
+	// regardless of environment load.
+	readyChan chan struct{}
 }
 
 func NewCrossSessionSignalDispatcher(cfg CrossSessionSignalDispatcherConfig) (*CrossSessionSignalDispatcher, error) {
@@ -65,6 +74,7 @@ func NewCrossSessionSignalDispatcher(cfg CrossSessionSignalDispatcherConfig) (*C
 		handlers:  make(map[SignalType][]SignalHandler),
 		stopChan:  make(chan struct{}),
 		doneChan:  make(chan struct{}),
+		readyChan: make(chan struct{}),
 	}, nil
 }
 
@@ -88,19 +98,55 @@ func (d *CrossSessionSignalDispatcher) Watch(ctx context.Context) error {
 		d.mu.Unlock()
 		return ErrDispatcherClosed
 	}
-	if d.watching {
-		d.mu.Unlock()
-		return nil
-	}
+	alreadyWatching := d.watching
 	d.watching = true
 	d.mu.Unlock()
 
+	// Idempotent entry: a second concurrent Watch() call still waits on
+	// the first call's readiness rendezvous so BOTH callers return with
+	// the same post-condition ("dispatcher is receiving events"). This
+	// avoids a subtle race where a caller that races the first Watch()
+	// setup could get `nil` back before the goroutine is listening.
+	if alreadyWatching {
+		select {
+		case <-d.readyChan:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-d.stopChan:
+			return ErrDispatcherClosed
+		}
+	}
+
 	if err := d.watcher.Add(d.signalDir); err != nil {
+		// Roll back the watching flag so a retry can succeed. Close
+		// readyChan so any concurrent idempotent callers unblock (with
+		// the error surfaced via their own subsequent Watch invocation).
+		d.mu.Lock()
+		d.watching = false
+		d.mu.Unlock()
 		return fmt.Errorf("failed to watch directory: %w", err)
 	}
 
 	go d.watchLoop(ctx)
-	return nil
+	// Block until the watch goroutine is fully inside its select loop
+	// and able to receive events. Without this, a caller that writes a
+	// signal file immediately after Watch() returns could race the
+	// goroutine's startup — fsnotify would buffer the event on its own
+	// channel, but reliance on that buffering is fragile under load and
+	// has caused test flakiness. An explicit rendezvous makes the
+	// post-Watch() state unambiguous: the dispatcher is reading events.
+	//
+	// We also respect ctx.Done() and stopChan so a Watch() invoked on an
+	// already-cancelled context returns promptly instead of hanging.
+	select {
+	case <-d.readyChan:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-d.stopChan:
+		return ErrDispatcherClosed
+	}
 }
 
 func (d *CrossSessionSignalDispatcher) watchLoop(ctx context.Context) {
@@ -108,6 +154,14 @@ func (d *CrossSessionSignalDispatcher) watchLoop(ctx context.Context) {
 
 	done, cleanup := d.mergeStopChannels(ctx)
 	defer cleanup()
+
+	// Signal readiness AFTER mergeStopChannels is fully wired (its own
+	// inner goroutine is running and `done` is a live channel) and
+	// BEFORE the first processNextEvent call enters its select. Once
+	// readyChan closes, a caller that wrote a signal file will have its
+	// event observed by the very first select iteration — no missed
+	// events, no timing races.
+	close(d.readyChan)
 
 	for {
 		if d.processNextEvent(done) {

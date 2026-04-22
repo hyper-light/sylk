@@ -622,6 +622,94 @@ func TestStreamCompletePreservesExplicitProgressForProgressOnlyEntry(t *testing.
 	}
 }
 
+// TestHandleStreamStart_SuppressesControlPlane locks the invariant that
+// a StreamStartMsg synthesized from a control-plane route (bearing
+// ControlPlane=true, populated upstream from the route's
+// `control_plane_kind` metadata) never creates a top-level chat entry.
+// The paired system_coordination activity event (published separately
+// by guide.EmitControlPlaneCoordination) is what the user sees.
+func TestHandleStreamStart_SuppressesControlPlane(t *testing.T) {
+	m := New(theme.DefaultDark(), 32)
+	m.SetSize(80, 20)
+
+	// Feed a control-plane stream-start: target is orchestrator,
+	// imitating a command-approval-hold route from the guardian.
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "sess-1",
+		CorrelationID: "cmd_approval_hold_xyz",
+		AgentID:       "orchestrator",
+		AgentType:     "orchestrator",
+		AgentName:     "Orchestrator",
+		ControlPlane:  true,
+	})
+	m = comp.(*Model)
+
+	if got := m.history.Len(); got != 0 {
+		entry := m.history.Last()
+		var content string
+		if entry != nil {
+			content = entry.Content
+		}
+		t.Fatalf("control-plane stream must not create a chat entry; got %d entries (last.Content=%q)", got, content)
+	}
+}
+
+// TestHandleStreamStart_DoesNotSuppressNormalStreams is the
+// anti-regression sibling: ordinary conversational streams (without
+// ControlPlane=true) must still create entries as they did before.
+func TestHandleStreamStart_DoesNotSuppressNormalStreams(t *testing.T) {
+	m := New(theme.DefaultDark(), 32)
+	m.SetSize(80, 20)
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "sess-1",
+		CorrelationID: "cid-normal",
+		AgentID:       "engineer",
+		AgentType:     "engineer",
+		AgentName:     "Engineer",
+		// ControlPlane deliberately unset (false).
+	})
+	m = comp.(*Model)
+
+	if got := m.history.Len(); got == 0 {
+		t.Fatal("normal stream must still produce a top-level chat entry")
+	}
+}
+
+// TestHandleActivity_SystemCoordinationRendersAsSystemRow verifies that
+// an ActivityEventMsg with EventTypeSystemCoordination becomes a
+// SourceSystem chat entry — the same visual class as the existing
+// "Pipeline agent registered" rows. This is the user-visible half of
+// the control-plane coordination pair.
+func TestHandleActivity_SystemCoordinationRendersAsSystemRow(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+
+	comp, _ := m.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt-sys-1",
+			EventType: events.EventTypeSystemCoordination,
+			Timestamp: time.Now(),
+			Content:   "DAG abc123 paused · awaiting approval for bash",
+			Data: map[string]any{
+				"control_plane_kind": "command_approval_hold",
+				"dag_id":             "abc123",
+			},
+		},
+	})
+	m = comp.(*Model)
+
+	last := m.history.Last()
+	if last == nil {
+		t.Fatal("expected chat entry for system_coordination event")
+	}
+	if last.Source != SourceSystem {
+		t.Errorf("source = %v, want SourceSystem", last.Source)
+	}
+	if !strings.Contains(last.Content, "DAG abc123 paused") {
+		t.Errorf("content = %q, want DAG abc123 paused phrasing", last.Content)
+	}
+}
+
 func TestHandleActivity_AllowsChatVisibleSuccessEvents(t *testing.T) {
 	m := New(theme.DefaultDark(), 16)
 
