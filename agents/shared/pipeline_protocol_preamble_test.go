@@ -70,10 +70,10 @@ func TestPipelineProtocolStatePreamble_RequiredActionWithReason(t *testing.T) {
 	// because Snapshot() returns a clone. We construct a preamble-
 	// only projection and assert against the renderer directly.
 	line := renderRequiredActionLine(&PipelineProjection{
-		RequiredAction:       "handoff_to_ot",
+		RequiredAction:       "handoff_to_green",
 		RequiredActionReason: "finalize_pipeline locked ready_for_ot",
 	})
-	want := "required_terminal_action: handoff_to_ot — finalize_pipeline locked ready_for_ot"
+	want := "required_terminal_action: handoff_to_green — finalize_pipeline locked ready_for_ot"
 	if line != want {
 		t.Errorf("required-action line = %q, want %q", line, want)
 	}

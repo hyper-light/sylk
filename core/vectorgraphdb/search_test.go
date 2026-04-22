@@ -47,13 +47,6 @@ func (m *mockVectorIndexSearcher) setResults(results []VectorIndexSearchResult) 
 	m.results = results
 }
 
-// Backward compatibility aliases for tests
-type mockHNSWSearcher = mockVectorIndexSearcher
-
-func newMockHNSWSearcher() *mockVectorIndexSearcher {
-	return newMockVectorIndexSearcher()
-}
-
 func TestVectorSearcherSearch(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
@@ -70,7 +63,7 @@ func TestVectorSearcherSearch(t *testing.T) {
 		NodeType: NodeTypeFunction,
 	}, []float32{0.9, 0.2, 0.1})
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	mock.setResults([]VectorIndexSearchResult{
 		{ID: "node1", Similarity: 0.95, Domain: DomainCode, NodeType: NodeTypeFile},
 		{ID: "node2", Similarity: 0.85, Domain: DomainCode, NodeType: NodeTypeFunction},
@@ -103,7 +96,7 @@ func TestVectorSearcherSearchWithMinSimilarity(t *testing.T) {
 		NodeType: NodeTypeFunction,
 	}, []float32{0.5, 0.5, 0.5})
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	mock.setResults([]VectorIndexSearchResult{
 		{ID: "node1", Similarity: 0.95},
 		{ID: "node2", Similarity: 0.4},
@@ -134,7 +127,7 @@ func TestVectorSearcherSearchByDomain(t *testing.T) {
 		NodeType: NodeTypeFile,
 	}, []float32{1, 0.1, 0.1})
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	mock.setResults([]VectorIndexSearchResult{
 		{ID: "code1", Similarity: 0.9, Domain: DomainCode},
 	})
@@ -164,7 +157,7 @@ func TestVectorSearcherSearchByNodeType(t *testing.T) {
 		NodeType: NodeTypeFunction,
 	}, []float32{1, 0.1, 0.1})
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	mock.setResults([]VectorIndexSearchResult{
 		{ID: "func1", Similarity: 0.88, NodeType: NodeTypeFunction},
 	})
@@ -188,7 +181,7 @@ func TestVectorSearcherSearchMultiDomain(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "code1", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "hist1", Domain: DomainHistory, NodeType: NodeTypeSession}, []float32{0.8, 0.2, 0.1})
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	mock.setResults([]VectorIndexSearchResult{
 		{ID: "code1", Similarity: 0.9, Domain: DomainCode},
 		{ID: "hist1", Similarity: 0.7, Domain: DomainHistory},
@@ -218,7 +211,7 @@ func TestVectorSearcherFindSimilar(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "node1", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0.1, 0.1})
 	ns.InsertNode(&GraphNode{ID: "node2", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0.9, 0.2, 0.1})
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	mock.addVector("node1", []float32{1, 0.1, 0.1})
 	mock.setResults([]VectorIndexSearchResult{
 		{ID: "node1", Similarity: 1.0},
@@ -242,7 +235,7 @@ func TestVectorSearcherSearchEmptyResults(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	mock.setResults([]VectorIndexSearchResult{})
 
 	vs := NewVectorSearcher(db, mock)
@@ -263,7 +256,7 @@ func TestVectorSearcherSearchDefaultOptions(t *testing.T) {
 	ns := NewNodeStore(db, nil)
 	ns.InsertNode(&GraphNode{ID: "node1", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0.1, 0.1})
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	mock.setResults([]VectorIndexSearchResult{{ID: "node1", Similarity: 0.9}})
 
 	vs := NewVectorSearcher(db, mock)
@@ -282,7 +275,7 @@ func TestVectorSearcherConcurrent(t *testing.T) {
 	defer cleanupDB(db, path)
 
 	ns := NewNodeStore(db, nil)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		ns.InsertNode(&GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -290,7 +283,7 @@ func TestVectorSearcherConcurrent(t *testing.T) {
 		}, []float32{float32(i + 1), 0.1, 0.1})
 	}
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	mock.setResults([]VectorIndexSearchResult{
 		{ID: nodeID(0), Similarity: 0.9},
 		{ID: nodeID(1), Similarity: 0.8},
@@ -301,7 +294,7 @@ func TestVectorSearcherConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	errChan := make(chan error, 10)
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -324,7 +317,7 @@ func TestVectorSearcherFindSimilarNotFound(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	vs := NewVectorSearcher(db, mock)
 
 	_, err := vs.FindSimilar("nonexistent", 5)
@@ -341,7 +334,7 @@ func TestVectorSearcherBatchLoading(t *testing.T) {
 
 	// Insert many nodes to test batch loading
 	nodeCount := 50
-	for i := 0; i < nodeCount; i++ {
+	for i := range nodeCount {
 		ns.InsertNode(&GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -350,9 +343,9 @@ func TestVectorSearcherBatchLoading(t *testing.T) {
 	}
 
 	// Setup mock with results for all nodes
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	results := make([]VectorIndexSearchResult, nodeCount)
-	for i := 0; i < nodeCount; i++ {
+	for i := range nodeCount {
 		results[i] = VectorIndexSearchResult{
 			ID:         nodeID(i),
 			Similarity: float64(nodeCount-i) / float64(nodeCount),
@@ -393,7 +386,7 @@ func TestVectorSearcherBatchLoadingWithMinSimilarity(t *testing.T) {
 	ns := NewNodeStore(db, nil)
 
 	// Insert nodes
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		ns.InsertNode(&GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -402,7 +395,7 @@ func TestVectorSearcherBatchLoadingWithMinSimilarity(t *testing.T) {
 	}
 
 	// Setup mock with varying similarity scores
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	results := []VectorIndexSearchResult{
 		{ID: nodeID(0), Similarity: 0.9},
 		{ID: nodeID(1), Similarity: 0.8},
@@ -443,7 +436,7 @@ func TestVectorSearcherBatchLoadingPreservesOrder(t *testing.T) {
 	ns := NewNodeStore(db, nil)
 
 	// Insert nodes
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		ns.InsertNode(&GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -452,7 +445,7 @@ func TestVectorSearcherBatchLoadingPreservesOrder(t *testing.T) {
 	}
 
 	// Setup mock with specific order
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	results := []VectorIndexSearchResult{
 		{ID: nodeID(2), Similarity: 0.95},
 		{ID: nodeID(0), Similarity: 0.9},
@@ -469,7 +462,7 @@ func TestVectorSearcherBatchLoadingPreservesOrder(t *testing.T) {
 		t.Fatalf("Search: %v", err)
 	}
 
-	// Verify order is preserved from HNSW results
+	// Verify order is preserved from vector index results
 	expectedOrder := []string{nodeID(2), nodeID(0), nodeID(4), nodeID(1), nodeID(3)}
 	for i, r := range searchResults {
 		if r.Node.ID != expectedOrder[i] {

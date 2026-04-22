@@ -66,7 +66,7 @@ func TestGlobalReviewCheckpoint_NilTerminalActionOmitted(t *testing.T) {
 // the global-review test, different protocol.
 func TestPipelineProtocolCheckpoint_SerializesTerminalAction(t *testing.T) {
 	original := pipelineProtocolCheckpoint{
-		RequiredAction: "handoff_to_ot",
+		RequiredAction: "handoff_to_green",
 		TerminalAction: &PipelineTurnAction{
 			Type:      PipelineProtocolActionHandoff,
 			AgentType: "tester-pipeline",

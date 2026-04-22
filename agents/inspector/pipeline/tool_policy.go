@@ -24,10 +24,10 @@ func pipelineInspectorVisibleSkillNames() []string {
 		// challenge_agent / handoff_next / validate_work /
 		// process_validation / finalize_pipeline collapsed into
 		// pipeline_protocol(action=challenge|handoff|validate|
-		// process_validation|finalize). handoff_to_ot remains distinct —
-		// it's inspector-only, the terminal commit-to-OT action.
+		// process_validation|finalize). handoff_to_green remains distinct —
+		// it's inspector-only, the terminal commit-to-green action.
 		"pipeline_protocol",
-		"handoff_to_ot",
+		"handoff_to_green",
 	}, "inspector-pipeline")
 	// Inspector gets BOTH the awareness skills AND the audit-time
 	// inspect_open_activity. The audit skill is what makes the
@@ -49,7 +49,7 @@ func pipelineInspectorMutatingSkillNames() []string {
 		"validate_work",
 		"process_validation",
 		"finalize_pipeline",
-		"handoff_to_ot",
+		"handoff_to_green",
 		"reroute_request",
 	})
 }

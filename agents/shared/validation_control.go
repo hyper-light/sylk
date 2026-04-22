@@ -1,6 +1,10 @@
 package shared
 
-import "time"
+import (
+	"time"
+
+	"github.com/adalundhe/sylk/core/versioning"
+)
 
 const (
 	ControlPlaneKindValidationVerdict  = "validation_verdict"
@@ -74,6 +78,23 @@ type RemediationRequest struct {
 	RecommendedActions []string            `json:"recommended_actions,omitempty"`
 	SuggestedFixes     []string            `json:"suggested_fixes,omitempty"`
 	CreatedAt          time.Time           `json:"created_at,omitempty"`
+
+	// RemediatesVersion is the MergedVersion of the rejected merge the
+	// fix workflow targets. Populated when the rejection source is a
+	// global audit replica (per docs/PARALLEL_GLOBAL_VFS.md §3.8). The
+	// architect threads this onto each fix task's Context as
+	// "remediates_version"; the orchestrator's pipeline dispatch
+	// translates it into BeginPipelineConfig.BaseCopyVersion so the
+	// fix pipeline materializes byte-for-byte from the rejected merge's
+	// Copy. Zero-value when the rejection originated from a non-audit
+	// validator (no Copy to target).
+	RemediatesVersion versioning.SemanticVersion `json:"remediates_version,omitempty"`
+
+	// RejectedReplicaID is the deterministic ID of the audit replica
+	// whose decision produced this remediation request. Carried for
+	// observability + steering-ledger correlation on the fix pipeline.
+	// Empty when the source is a non-audit validator.
+	RejectedReplicaID string `json:"rejected_replica_id,omitempty"`
 }
 
 type RemediationResolution string

@@ -80,10 +80,6 @@ type VectorSimilaritySearcher interface {
 	GetVector(id string) ([]float32, error)
 }
 
-// HNSWSimilaritySearcher is an alias for VectorSimilaritySearcher for backward compatibility.
-// Deprecated: Use VectorSimilaritySearcher instead.
-type HNSWSimilaritySearcher = VectorSimilaritySearcher
-
 // ConflictDetector detects contradictions between stored information.
 type ConflictDetector struct {
 	db              *vectorgraphdb.VectorGraphDB

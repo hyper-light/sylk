@@ -9,13 +9,13 @@ func TestBatchStoreInsertNodes(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
 
-	hnsw := newMockHNSW()
-	bs := NewBatchStore(db, hnsw)
+	vectorIndex := newMockVectorIndex()
+	bs := NewBatchStore(db, vectorIndex)
 	ns := NewNodeStore(db, nil)
 
 	nodes := make([]*GraphNode, 10)
 	embeddings := make([][]float32, 10)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		nodes[i] = &GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -29,7 +29,7 @@ func TestBatchStoreInsertNodes(t *testing.T) {
 		t.Fatalf("BatchInsertNodes: %v", err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		node, err := ns.GetNode(nodeID(i))
 		if err != nil {
 			t.Errorf("Node %s not found: %v", nodeID(i), err)
@@ -40,9 +40,9 @@ func TestBatchStoreInsertNodes(t *testing.T) {
 		}
 	}
 
-	for i := 0; i < 10; i++ {
-		if !hnsw.inserted[nodeID(i)] {
-			t.Errorf("Node %s not inserted to HNSW", nodeID(i))
+	for i := range 10 {
+		if !vectorIndex.inserted[nodeID(i)] {
+			t.Errorf("Node %s not inserted to vector index", nodeID(i))
 		}
 	}
 }
@@ -55,7 +55,7 @@ func TestBatchStoreInsertNodesWithProgress(t *testing.T) {
 
 	nodes := make([]*GraphNode, 5)
 	embeddings := make([][]float32, 5)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		nodes[i] = &GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -102,7 +102,7 @@ func TestBatchStoreInsertEdges(t *testing.T) {
 	bs := NewBatchStore(db, nil)
 	es := NewEdgeStore(db)
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		ns.InsertNode(&GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -111,7 +111,7 @@ func TestBatchStoreInsertEdges(t *testing.T) {
 	}
 
 	edges := make([]*GraphEdge, 4)
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		edges[i] = &GraphEdge{
 			SourceID: nodeID(i),
 			TargetID: nodeID(i + 1),
@@ -124,7 +124,7 @@ func TestBatchStoreInsertEdges(t *testing.T) {
 		t.Fatalf("BatchInsertEdges: %v", err)
 	}
 
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		edgeID := edges[i].ID
 		edge, err := es.GetEdge(edgeID)
 		if err != nil {
@@ -143,7 +143,7 @@ func TestBatchStoreInsertEdgesWithProgress(t *testing.T) {
 	ns := NewNodeStore(db, nil)
 	bs := NewBatchStore(db, nil)
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		ns.InsertNode(&GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -152,7 +152,7 @@ func TestBatchStoreInsertEdgesWithProgress(t *testing.T) {
 	}
 
 	edges := make([]*GraphEdge, 2)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		edges[i] = &GraphEdge{
 			SourceID: nodeID(i),
 			TargetID: nodeID(i + 1),
@@ -179,11 +179,11 @@ func TestBatchStoreDeleteNodes(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
 
-	hnsw := newMockHNSW()
-	ns := NewNodeStore(db, hnsw)
-	bs := NewBatchStore(db, hnsw)
+	vectorIndex := newMockVectorIndex()
+	ns := NewNodeStore(db, vectorIndex)
+	bs := NewBatchStore(db, vectorIndex)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		ns.InsertNode(&GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -198,8 +198,8 @@ func TestBatchStoreDeleteNodes(t *testing.T) {
 	}
 
 	for _, id := range idsToDelete {
-		if !hnsw.deleted[id] {
-			t.Errorf("Node %s not deleted from HNSW", id)
+		if !vectorIndex.deleted[id] {
+			t.Errorf("Node %s not deleted from vector index", id)
 		}
 		_, err := ns.GetNode(id)
 		if err != ErrNodeNotFound {
@@ -223,7 +223,7 @@ func TestBatchStoreDeleteNodesWithProgress(t *testing.T) {
 	ns := NewNodeStore(db, nil)
 	bs := NewBatchStore(db, nil)
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		ns.InsertNode(&GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -259,7 +259,7 @@ func TestBatchStoreLargeBatch(t *testing.T) {
 
 	nodes := make([]*GraphNode, batchSize)
 	embeddings := make([][]float32, batchSize)
-	for i := 0; i < batchSize; i++ {
+	for i := range batchSize {
 		nodes[i] = &GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -299,7 +299,7 @@ func TestBatchStoreConcurrentInserts(t *testing.T) {
 	var wg sync.WaitGroup
 	errChan := make(chan error, 10)
 
-	for batch := 0; batch < 10; batch++ {
+	for batch := range 10 {
 		wg.Add(1)
 		go func(batchNum int) {
 			defer wg.Done()
@@ -307,7 +307,7 @@ func TestBatchStoreConcurrentInserts(t *testing.T) {
 
 			nodes := make([]*GraphNode, 10)
 			embeddings := make([][]float32, 10)
-			for i := 0; i < 10; i++ {
+			for i := range 10 {
 				nodeIdx := batchNum*10 + i
 				nodes[i] = &GraphNode{
 					ID:       nodeID(nodeIdx),
@@ -330,7 +330,7 @@ func TestBatchStoreConcurrentInserts(t *testing.T) {
 		t.Errorf("Concurrent insert error: %v", err)
 	}
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		_, err := ns.GetNode(nodeID(i))
 		if err != nil {
 			t.Errorf("Node %s not found after concurrent insert: %v", nodeID(i), err)

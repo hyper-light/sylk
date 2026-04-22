@@ -509,7 +509,7 @@ coordination
 `protocol`
 - process_validation
 - finalize_pipeline
-- handoff_to_ot
+- handoff_to_green
 - global review equivalents
 
 `awareness`

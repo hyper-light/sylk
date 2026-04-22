@@ -145,6 +145,14 @@ func AmbientFor(ctx context.Context, src activity.Source, q AmbientQuery) (Ambie
 		envelope.Advisories = append(envelope.Advisories, ad)
 	}
 
+	// Claims board digest: surface claim/testament activity for this agent.
+	if q.AgentID != "" {
+		digest, digestErr := computeClaimsBoardDigest(ctx, src, q, since)
+		if digestErr == nil && !digest.isEmpty() {
+			envelope.ClaimsBoardDigest = &digest
+		}
+	}
+
 	// Hotness signal for the scope.
 	hot, err := ScopeHotness(ctx, src, ScopeHotnessQuery{
 		SessionID: q.SessionID,
@@ -232,6 +240,33 @@ type AmbientEnvelope struct {
 	Advisories            []activity.AgentActivity
 	Hotness               ScopeHotnessResult
 	OverflowAdvisory      string
+
+	// ClaimsBoardDigest surfaces claims board state: this agent's claims,
+	// peer progress, recent testaments, blocked claims, and board phase.
+	// Populated from claim_issued/testament_submitted/claim_accepted
+	// activities in the Fabric stream.
+	ClaimsBoardDigest *ClaimsBoardDigest
+}
+
+// ClaimsBoardDigest is the claims-specific section of the ambient
+// context envelope. Computed from Fabric claim activities.
+type ClaimsBoardDigest struct {
+	// MyClaims are claims where this agent is the subject, currently
+	// in_progress or pending.
+	MyClaims []activity.AgentActivity
+
+	// PeerClaimsInProgress shows what peers are actively working on.
+	PeerClaimsInProgress []activity.AgentActivity
+
+	// RecentTestaments shows testaments submitted in the lookback window.
+	RecentTestaments []activity.AgentActivity
+
+	// CompletedClaims shows recently accepted claims.
+	CompletedClaims []activity.AgentActivity
+
+	// BoardProgress is a compact summary string: "8/12 claims testified,
+	// 2 accepted, 1 rejected"
+	BoardProgress string
 }
 
 // IsEmpty reports whether the envelope has nothing to surface.
@@ -241,7 +276,8 @@ func (e AmbientEnvelope) IsEmpty() bool {
 		len(e.InboundDisputes) == 0 &&
 		len(e.InboundConsults) == 0 &&
 		len(e.OutboundPending) == 0 &&
-		len(e.Advisories) == 0
+		len(e.Advisories) == 0 &&
+		(e.ClaimsBoardDigest == nil || e.ClaimsBoardDigest.isEmpty())
 }
 
 // Render produces the user-facing string the agent sees attached to
@@ -288,6 +324,34 @@ func (e AmbientEnvelope) Render() string {
 			fmt.Fprintf(&b, "    • %s: %s\n", a.Actor.AgentType, a.Subject.PathPrefix)
 		}
 	}
+	if e.ClaimsBoardDigest != nil && !e.ClaimsBoardDigest.isEmpty() {
+		d := e.ClaimsBoardDigest
+		b.WriteString("  claims_board:\n")
+		if d.BoardProgress != "" {
+			fmt.Fprintf(&b, "    progress: %s\n", d.BoardProgress)
+		}
+		if len(d.MyClaims) > 0 {
+			fmt.Fprintf(&b, "    my_claims: %d\n", len(d.MyClaims))
+			for _, a := range d.MyClaims {
+				fmt.Fprintf(&b, "      - %s (claim_id=%s, %s)\n", a.Subject.TargetArtifact, a.ID, summarizeAge(e.ComputedAt, a.Timestamp))
+			}
+		}
+		if len(d.PeerClaimsInProgress) > 0 {
+			fmt.Fprintf(&b, "    peer_claims: %d in_progress\n", len(d.PeerClaimsInProgress))
+			for _, a := range d.PeerClaimsInProgress {
+				fmt.Fprintf(&b, "      - %s/%s: %s (%s)\n", a.Actor.AgentType, a.Actor.AgentID, a.Subject.TargetArtifact, summarizeAge(e.ComputedAt, a.Timestamp))
+			}
+		}
+		if len(d.RecentTestaments) > 0 {
+			fmt.Fprintf(&b, "    recent_testaments: %d\n", len(d.RecentTestaments))
+			for _, a := range d.RecentTestaments {
+				fmt.Fprintf(&b, "      - %s submitted testament (%s)\n", a.Actor.AgentID, summarizeAge(e.ComputedAt, a.Timestamp))
+			}
+		}
+		if len(d.CompletedClaims) > 0 {
+			fmt.Fprintf(&b, "    completed_claims: %d\n", len(d.CompletedClaims))
+		}
+	}
 	if e.OverflowAdvisory != "" {
 		fmt.Fprintf(&b, "  hotness_advisory: %s\n", e.OverflowAdvisory)
 	}
@@ -316,6 +380,86 @@ func summarizeAge(now, then time.Time) string {
 	default:
 		return fmt.Sprintf("%dh ago", int(d.Hours()))
 	}
+}
+
+func (d ClaimsBoardDigest) isEmpty() bool {
+	return len(d.MyClaims) == 0 &&
+		len(d.PeerClaimsInProgress) == 0 &&
+		len(d.RecentTestaments) == 0 &&
+		len(d.CompletedClaims) == 0
+}
+
+func computeClaimsBoardDigest(ctx context.Context, src activity.Source, q AmbientQuery, since time.Time) (ClaimsBoardDigest, error) {
+	var d ClaimsBoardDigest
+
+	// My claims: claims where this agent is the subject (via TargetAgent).
+	myClaims, err := src.FilterActivities(ctx, activity.QueryFilter{
+		SessionID:          q.SessionID,
+		ActionKinds:        []activity.ActionKind{activity.ActionClaimIssued, activity.ActionClaimUpdated},
+		SubjectTargetAgent: q.AgentID,
+		Since:              since,
+		Limit:              5,
+	})
+	if err != nil {
+		return d, err
+	}
+	d.MyClaims = myClaims
+
+	// Peer claims in progress: claims where someone else is the subject.
+	peerClaims, err := src.FilterActivities(ctx, activity.QueryFilter{
+		SessionID:   q.SessionID,
+		ActionKinds: []activity.ActionKind{activity.ActionClaimUpdated},
+		Since:       since,
+		Limit:       5,
+	})
+	if err != nil {
+		return d, err
+	}
+	for _, a := range peerClaims {
+		if a.Actor.AgentID != q.AgentID {
+			d.PeerClaimsInProgress = append(d.PeerClaimsInProgress, a)
+		}
+	}
+
+	// Recent testaments.
+	testaments, err := src.FilterActivities(ctx, activity.QueryFilter{
+		SessionID:   q.SessionID,
+		ActionKinds: []activity.ActionKind{activity.ActionTestamentSubmitted},
+		Since:       since,
+		Limit:       5,
+	})
+	if err != nil {
+		return d, err
+	}
+	d.RecentTestaments = testaments
+
+	// Completed claims (accepted).
+	completed, err := src.FilterActivities(ctx, activity.QueryFilter{
+		SessionID:   q.SessionID,
+		ActionKinds: []activity.ActionKind{activity.ActionClaimAccepted},
+		Since:       since,
+		Limit:       5,
+	})
+	if err != nil {
+		return d, err
+	}
+	d.CompletedClaims = completed
+
+	// Board progress summary.
+	total := len(myClaims) + len(peerClaims)
+	testified := len(testaments)
+	accepted := len(completed)
+	if total > 0 || testified > 0 || accepted > 0 {
+		d.BoardProgress = fmt.Sprintf("%d claims visible, %d testaments, %d accepted", total, testified, accepted)
+	}
+
+	// Sort by recency.
+	sortByRecencyDesc(d.MyClaims)
+	sortByRecencyDesc(d.PeerClaimsInProgress)
+	sortByRecencyDesc(d.RecentTestaments)
+	sortByRecencyDesc(d.CompletedClaims)
+
+	return d, nil
 }
 
 func buildOverflowAdvisory(h ScopeHotnessResult) string {

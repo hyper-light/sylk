@@ -319,11 +319,11 @@ func pipelineTaskStateForUpdate(status, stage string) taskstate.Status {
 //
 // Authority discipline (post-refactor): the orchestrator NO LONGER mutates
 // pipeline VFS state from this handler. The pipeline inspector's
-// handoff_to_ot and discard_pipeline skills perform the SessionVFS
+// handoff_to_green and discard_pipeline skills perform the SessionVFS
 // extract/rollback themselves via PipelineCommitter so the agent that
 // actually decided the lifecycle transition is the one performing it.
 // This handler is now purely observational: it routes the inspector's
-// post-handoff_to_ot work into the global review followup and clears
+// post-handoff_to_green work into the global review followup and clears
 // coordination claims. Per-agent intermediate "succeeded" / "failed"
 // updates from engineer/designer/tester used to commit or rollback the
 // pipeline VFS here, which destroyed it while the inspector still had
@@ -351,7 +351,7 @@ func (o *Orchestrator) finalizePipelineUpdateCtx(ctx context.Context, update *Pi
 	deferNodeCompletion := false
 
 	if update.Status == "succeeded" && strings.TrimSpace(update.AgentType) == agentshared.PipelineAgentInspector {
-		// The pipeline inspector's handoff_to_ot skill now routes the
+		// The pipeline inspector's handoff_to_green skill now routes the
 		// global review directly to the global inspector via the Guide's
 		// agent-to-agent protocol — the orchestrator no longer dispatches
 		// the global review or tracks pending checkpoint reviews.
@@ -370,7 +370,7 @@ func (o *Orchestrator) finalizePipelineUpdateCtx(ctx context.Context, update *Pi
 }
 
 // readInspectorHandoffOutcome extracts the review-candidate id, draft flag,
-// and checkpoint version that the inspector's handoff_to_ot skill published
+// and checkpoint version that the inspector's handoff_to_green skill published
 // in its update output. Falls back to the session's current version when
 // the output is absent (legacy publishers, test fixtures).
 func readInspectorHandoffOutcome(update *PipelineUpdate, svfs SessionVFSCheckpointReader) (versioning.SemanticVersion, string, bool) {

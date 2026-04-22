@@ -17,18 +17,14 @@ import (
 )
 
 // noopPipelineCommitter satisfies agentShared.PipelineCommitter without a
-// real SessionVFS so handoff_to_ot / discard_pipeline tests can run without
+// real SessionVFS so handoff_to_green / discard_pipeline tests can run without
 // fixturing a session. Real wiring (cmd/tui.go) installs a SessionVFS-backed
 // committer; here we just want the skill to succeed past its committer
 // gate so the test can observe the published update.
 type noopPipelineCommitter struct{}
 
-func (noopPipelineCommitter) MergePipelineIntoGreen(_ context.Context, pipelineID string) (versioning.MergePipelineResult, error) {
+func (noopPipelineCommitter) MergePipelineIntoGreen(_ context.Context, pipelineID string, _ versioning.PipelineInspectorCertificate) (versioning.MergePipelineResult, error) {
 	return versioning.MergePipelineResult{PipelineID: pipelineID}, nil
-}
-
-func (noopPipelineCommitter) ExtractReviewCandidate(_ context.Context, _ string) (string, bool, versioning.SemanticVersion, error) {
-	return "", false, versioning.SemanticVersion{}, nil
 }
 
 func (noopPipelineCommitter) Rollback(_ context.Context, _ string) error { return nil }
@@ -70,7 +66,7 @@ func (p *scriptedPipelineProvider) Complete(_ context.Context, req *providers.Re
 	return &cloned, nil
 }
 
-func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToOT(t *testing.T) {
+func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToGreen(t *testing.T) {
 	sessionDir := t.TempDir()
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
@@ -101,7 +97,7 @@ func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToOT(t *testing.T) {
 			{
 				ToolCalls: []providers.ToolCall{{
 					ID:   "tool-3",
-					Name: "handoff_to_ot",
+					Name: "handoff_to_green",
 					Arguments: `{
 						"summary":"Ready for OT merge.",
 						"evidence_refs":["artifact:tester"]
@@ -206,7 +202,7 @@ func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToOT(t *testing.T) {
 	}
 }
 
-func TestHandle_UsesFinalizePipelineToolResultToDriveImmediateHandoffToOT(t *testing.T) {
+func TestHandle_UsesFinalizePipelineToolResultToDriveImmediateHandoffToGreen(t *testing.T) {
 	sessionDir := t.TempDir()
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
@@ -227,7 +223,7 @@ func TestHandle_UsesFinalizePipelineToolResultToDriveImmediateHandoffToOT(t *tes
 			{
 				ToolCalls: []providers.ToolCall{{
 					ID:   "tool-ot",
-					Name: "handoff_to_ot",
+					Name: "handoff_to_green",
 					Arguments: `{
 						"summary":"Ready for OT merge.",
 						"evidence_refs":["artifact:inspector","artifact:tester"]
@@ -253,8 +249,8 @@ func TestHandle_UsesFinalizePipelineToolResultToDriveImmediateHandoffToOT(t *tes
 				if last.Role != providers.RoleTool {
 					return fmt.Errorf("last message role = %q, want tool", last.Role)
 				}
-				if !strings.Contains(last.Content, "handoff_to_ot") {
-					return fmt.Errorf("last tool result = %q, want handoff_to_ot guidance", last.Content)
+				if !strings.Contains(last.Content, "handoff_to_green") {
+					return fmt.Errorf("last tool result = %q, want handoff_to_green guidance", last.Content)
 				}
 				return nil
 			},
@@ -365,7 +361,7 @@ func TestHandle_PostValidationAuditContinuesFromToolResultsWithoutInjectedUserPr
 			{
 				ToolCalls: []providers.ToolCall{{
 					ID:   "tool-ot",
-					Name: "handoff_to_ot",
+					Name: "handoff_to_green",
 					Arguments: `{
 						"summary":"Ready for OT merge.",
 						"evidence_refs":["examples/hello-py/pyproject.toml","examples/hello-py/tests/test_pyproject.py"]

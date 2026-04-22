@@ -50,7 +50,7 @@ func setupTCQueryEngine(t *testing.T) (*TCQueryEngine, *VectorGraphDB, string) {
 
 	tcIndex := relations.NewVersionedIntervalIndex(graph, tcData)
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	mock.setResults([]VectorIndexSearchResult{
 		{ID: "A", Similarity: 1.0},
 		{ID: "B", Similarity: 0.9},
@@ -106,7 +106,7 @@ func TestTCQueryEngine_IsReachable_NilIndex(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0.9, 0.2, 0.1})
 	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	vs := NewVectorSearcher(db, mock)
 	gt := NewGraphTraverser(db)
 
@@ -205,7 +205,7 @@ func TestTCQueryEngine_BatchLookup_NilIndex(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0.9, 0.2, 0.1})
 	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	vs := NewVectorSearcher(db, mock)
 	gt := NewGraphTraverser(db)
 	tce := NewTCQueryEngine(db, vs, gt, nil)
@@ -308,7 +308,7 @@ func TestTCQueryEngine_GetReachabilityStats_NilIndex(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	vs := NewVectorSearcher(db, mock)
 	gt := NewGraphTraverser(db)
 	tce := NewTCQueryEngine(db, vs, gt, nil)
@@ -324,7 +324,7 @@ func TestTCQueryEngine_SetTCIndex(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
 
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	vs := NewVectorSearcher(db, mock)
 	gt := NewGraphTraverser(db)
 	tce := NewTCQueryEngine(db, vs, gt, nil)
@@ -357,12 +357,12 @@ func TestTCQueryEngine_ConcurrentReachability(t *testing.T) {
 	var wg sync.WaitGroup
 	var errors atomic.Int64
 
-	for i := 0; i < numGoroutines; i++ {
+	for range numGoroutines {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			for j := 0; j < iterations; j++ {
+			for j := range iterations {
 				// Mix of different operations
 				switch j % 4 {
 				case 0:
@@ -406,12 +406,12 @@ func TestTCQueryEngine_ConcurrentQueriesWithIndexRebuild(t *testing.T) {
 	stop := make(chan struct{})
 
 	// Start readers
-	for i := 0; i < numReaders; i++ {
+	for range numReaders {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			for j := 0; j < readsPerReader; j++ {
+			for range readsPerReader {
 				select {
 				case <-stop:
 					return
@@ -451,7 +451,7 @@ func TestTCQueryEngine_ConcurrentQueriesWithIndexRebuild(t *testing.T) {
 			"C": {"D": true},
 		}
 
-		for i := 0; i < numRebuilds; i++ {
+		for range numRebuilds {
 			_ = tce.tcIndex.Rebuild(graph, tcData)
 			time.Sleep(time.Millisecond)
 		}
@@ -484,7 +484,7 @@ func BenchmarkTCQueryEngine_IsReachable(b *testing.B) {
 	}
 
 	tcIndex := relations.NewVersionedIntervalIndex(graph, tcData)
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	vs := NewVectorSearcher(db, mock)
 	gt := NewGraphTraverser(db)
 	tce := NewTCQueryEngine(db, vs, gt, tcIndex)
@@ -492,7 +492,7 @@ func BenchmarkTCQueryEngine_IsReachable(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = tce.IsReachable("A", "D")
 	}
 }
@@ -515,7 +515,7 @@ func BenchmarkTCQueryEngine_GetAllReachable(b *testing.B) {
 	}
 
 	tcIndex := relations.NewVersionedIntervalIndex(graph, tcData)
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	vs := NewVectorSearcher(db, mock)
 	gt := NewGraphTraverser(db)
 	tce := NewTCQueryEngine(db, vs, gt, tcIndex)
@@ -523,7 +523,7 @@ func BenchmarkTCQueryEngine_GetAllReachable(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = tce.GetAllReachable("A")
 	}
 }
@@ -546,7 +546,7 @@ func BenchmarkTCQueryEngine_BatchLookup(b *testing.B) {
 	}
 
 	tcIndex := relations.NewVersionedIntervalIndex(graph, tcData)
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	vs := NewVectorSearcher(db, mock)
 	gt := NewGraphTraverser(db)
 	tce := NewTCQueryEngine(db, vs, gt, tcIndex)
@@ -563,7 +563,7 @@ func BenchmarkTCQueryEngine_BatchLookup(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = tce.BatchLookup(pairs)
 	}
 }
@@ -586,7 +586,7 @@ func BenchmarkTCQueryEngine_ConcurrentReachability(b *testing.B) {
 	}
 
 	tcIndex := relations.NewVersionedIntervalIndex(graph, tcData)
-	mock := newMockHNSWSearcher()
+	mock := newMockVectorIndexSearcher()
 	vs := NewVectorSearcher(db, mock)
 	gt := NewGraphTraverser(db)
 	tce := NewTCQueryEngine(db, vs, gt, tcIndex)

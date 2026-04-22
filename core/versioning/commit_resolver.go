@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 // CommitResolver drives the commit queue head forward in FIFO arrival
@@ -70,13 +72,21 @@ func NewCommitResolver(cfg CommitResolverConfig) *CommitResolver {
 	}
 }
 
-// Start begins the resolver's background loop. Idempotent; subsequent
-// calls are no-ops while the loop is running.
-func (r *CommitResolver) Start(ctx context.Context) {
+// Start begins the resolver's background loop under the ctx's
+// GoroutineScope (CLAUDE.md tracked-goroutine invariant). Returns an
+// error if no scope is attached so misconfiguration surfaces rather
+// than silently spawning an untracked goroutine. Idempotent;
+// subsequent calls while running return nil.
+func (r *CommitResolver) Start(ctx context.Context) error {
 	r.mu.Lock()
 	if r.stopCh != nil {
 		r.mu.Unlock()
-		return
+		return nil
+	}
+	scope := concurrency.ScopeFromContext(ctx)
+	if scope == nil {
+		r.mu.Unlock()
+		return fmt.Errorf("commit resolver: Start requires a GoroutineScope on ctx")
 	}
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
@@ -84,7 +94,10 @@ func (r *CommitResolver) Start(ctx context.Context) {
 	r.doneCh = doneCh
 	r.mu.Unlock()
 
-	go r.loop(ctx, stopCh, doneCh)
+	return scope.Go("commit-resolver:loop", 0, func(runCtx context.Context) error {
+		r.loop(ctx, stopCh, doneCh)
+		return nil
+	})
 }
 
 // Stop halts the loop and waits for it to finish. Idempotent.
@@ -177,6 +190,7 @@ func (r *CommitResolver) processHead(ctx context.Context, queue *CommitQueue, he
 				"pipeline_id", popped.Descriptor.PipelineID,
 				"path_count", popped.Descriptor.PathCount,
 			)
+			r.advanceWaterLineTo(popped.Descriptor.MergedVersion)
 		}
 		return ok, nil
 
@@ -209,6 +223,12 @@ func (r *CommitResolver) processHead(ctx context.Context, queue *CommitQueue, he
 				"rejected_pipeline", popped.Descriptor.PipelineID,
 				"supersedor_pipeline", supersedor.Descriptor.PipelineID,
 			)
+			// Water line advances to the supersedor's version — the
+			// supersedor IS what reached disk. The rejected slot's
+			// version is no longer referenced; if the rejected
+			// version itself was a lower seq, it gets collected by
+			// the GC pass triggered by AdvanceWaterLine.
+			r.advanceWaterLineTo(supersedor.Descriptor.MergedVersion)
 		}
 		return ok, nil
 
@@ -220,6 +240,10 @@ func (r *CommitResolver) processHead(ctx context.Context, queue *CommitQueue, he
 				"pipeline_id", popped.Descriptor.PipelineID,
 				"reason", popped.RejectionReason,
 			)
+			// Abandoned versions never touched disk; water line
+			// still advances past them so retention can release
+			// their Copy bytes.
+			r.advanceWaterLineTo(popped.Descriptor.MergedVersion)
 		}
 		return ok, nil
 
@@ -248,4 +272,33 @@ func (r *CommitResolver) flushToDisk(ctx context.Context, desc MergeDescriptor) 
 		return err
 	}
 	return nil
+}
+
+// advanceWaterLineTo pushes the retention's water line forward after
+// a successful commit / supersession / abandon pop. Known versions
+// come from the merge log; retention releases any Copies below the
+// new water line that have zero refcount. Failure to persist the
+// water-line advance is logged; the in-memory pop already happened
+// and the next tick will retry the advance on the next commit. This
+// is safe because AdvanceWaterLine is monotonic — double-writes of
+// the same water line are no-ops.
+func (r *CommitResolver) advanceWaterLineTo(ver SemanticVersion) {
+	if r.session == nil || r.session.copyRetention == nil {
+		return
+	}
+	known := r.session.knownCopyVersions()
+	released, err := r.session.copyRetention.AdvanceWaterLine(ver, known)
+	if err != nil {
+		r.logger.Warn("commit resolver: advance water line",
+			"version", ver.String(),
+			"error", err.Error(),
+		)
+		return
+	}
+	if len(released) > 0 {
+		r.logger.Info("parallel_global_vfs.copies_released",
+			"count", len(released),
+			"water_line", ver.String(),
+		)
+	}
 }

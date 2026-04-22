@@ -234,7 +234,7 @@ func TestIntegration_RRF_AllSourcesFusedCorrectly(t *testing.T) {
 		switch r.Source {
 		case SourceBleve:
 			hasTextOnly = true
-		case SourceHNSW:
+		case SourceVector:
 			hasSemanticOnly = true
 		case SourceGraph:
 			hasGraphOnly = true

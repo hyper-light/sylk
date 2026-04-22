@@ -42,8 +42,15 @@ const (
 
 // LibrarianProvider is the minimal interface the Librarian needs from its LLM.
 // Satisfied by any provider wrapped through gateway.GatewayProvider.
+// LibrarianProvider is the LLM interface the librarian requires.
+// Streaming is mandatory — live chunks are how a chattable agent
+// surfaces thought and text to the user; the tool loop always uses
+// Stream. Complete is retained because the non-LLM callers on this
+// interface (validation harnesses, some fabric consult paths) still
+// use it; the tool loop itself does not.
 type LibrarianProvider interface {
 	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
+	Stream(ctx context.Context, req *providers.Request) (<-chan *providers.StreamChunk, error)
 }
 
 // Librarian is the code search and pattern detection agent for the Sylk system.

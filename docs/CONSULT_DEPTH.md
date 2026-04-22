@@ -48,7 +48,7 @@ Academic also has an adaptive native `web_search` learner.
 ### Not Currently Covered
 
 - Pipeline Inspector consult/challenge/correction paths are not yet routed through this consult gate.
-- Pipeline protocol actions such as `challenge_agent`, `request_correction`, `handoff_next`, and `handoff_to_ot` are intentionally not treated as ordinary consults.
+- Pipeline protocol actions such as `challenge_agent`, `request_correction`, `handoff_next`, and `handoff_to_green` are intentionally not treated as ordinary consults.
 - The consult admission model is adaptive, but it is not yet a fully learned hierarchical posterior the way Academic `web_search` is. Today it combines learned branch reward with fixed structural priors.
 
 ## Shared Consultation Admission

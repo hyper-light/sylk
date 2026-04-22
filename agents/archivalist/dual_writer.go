@@ -16,7 +16,7 @@ import (
 // It specifies which stores to write to, what fields to index, and whether to aggregate.
 type DualWriteStrategy struct {
 	WriteBleve    bool     // Write to Bleve document database
-	WriteVector   bool     // Write to Vector database (HNSW)
+	WriteVector   bool     // Write to the vector ANN database (Vamana/DiskANN + IVF/BBQ)
 	BleveFields   []string // Which ActivityEvent fields to index in Bleve
 	VectorContent string   // What to embed: "full", "summary", "keywords"
 	Aggregate     bool     // Aggregate with similar recent events

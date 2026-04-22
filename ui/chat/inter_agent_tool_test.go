@@ -566,3 +566,57 @@ func TestHandleInterAgentToolCallInList_ChallengePeerPromotesRegularRow(t *testi
 		t.Fatal("promoted row must be Success=true for a successful Complete")
 	}
 }
+
+// TestChallengeThreadKey_FallsBackToBareChallengeID is the regression
+// guard for the "orchestrator consult keeps spinning despite having
+// completed" bug. A challenge dispatch that emits only `challenge_id`
+// (no protocol_scope, no pre-computed thread_key) must still produce a
+// non-empty ThreadKey so the response-side origin-update can find the
+// row and flip its Status from Pending to Done.
+//
+// Pre-fix, the row had ThreadKey="", the response's origin-update
+// couldn't match, and the row's timer kept ticking even after the peer
+// had responded.
+func TestChallengeThreadKey_FallsBackToBareChallengeID(t *testing.T) {
+	// Explicit thread_key wins.
+	got := challengeThreadKey("challenge_peer",
+		map[string]any{"thread_key": "explicit-key"},
+		nil,
+	)
+	if got != "explicit-key" {
+		t.Fatalf("explicit thread_key = %q, want explicit-key", got)
+	}
+
+	// challenge_id + protocol_scope=pipeline → scoped.
+	got = challengeThreadKey("challenge_peer",
+		map[string]any{"challenge_id": "c-1", "protocol_scope": "pipeline"},
+		nil,
+	)
+	if got != pipelineThreadPrefix+"c-1" {
+		t.Fatalf("pipeline-scoped = %q, want %q", got, pipelineThreadPrefix+"c-1")
+	}
+
+	// challenge_id + protocol_scope=global_review → scoped.
+	got = challengeThreadKey("challenge_peer",
+		map[string]any{"challenge_id": "c-1", "protocol_scope": "global_review"},
+		nil,
+	)
+	if got != globalReviewThreadPrefix+"c-1" {
+		t.Fatalf("global-review-scoped = %q, want %q", got, globalReviewThreadPrefix+"c-1")
+	}
+
+	// Bare challenge_id (no protocol_scope) — fallback path.
+	got = challengeThreadKey("challenge_peer",
+		map[string]any{"challenge_id": "c-2"},
+		nil,
+	)
+	if got != "c-2" {
+		t.Fatalf("bare challenge_id = %q, want c-2 (fallback must produce a non-empty ThreadKey so the response origin-update can match)", got)
+	}
+
+	// No challenge_id at all — legitimately empty (nothing to route to).
+	got = challengeThreadKey("challenge_peer", nil, nil)
+	if got != "" {
+		t.Fatalf("no challenge id = %q, want empty (nothing to route to)", got)
+	}
+}

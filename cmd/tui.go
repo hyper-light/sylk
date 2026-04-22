@@ -956,7 +956,6 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 		Scope:                  phase1.scope,
 		AgentID:                orch.AgentID(),
 		SessionID:              "default",
-		OnVisibleRoutePublish:  orch.ActivatePublishedReviewCandidate,
 		OnVisibleRouteTerminal: orch.HandleCheckpointReviewTerminal,
 	}))
 	if phase3.activator != nil {
@@ -1154,6 +1153,80 @@ func registerPhase4Tester(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) error
 	wireGlobalAgentPod(testerAgent, "tester", phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
 	return nil
 }
+
+// registerSessionAuditWiringHooks attaches per-session hooks on the
+// orchestrator so every SessionVFS that opens gets a
+// MergeAuditCoordinator + AuditRejectionSLATracker spun up against
+// the registered global inspector + global tester spawners. The
+// tear-down hook stops the wiring before the session's WALs close.
+//
+// Hook-time agent lookup: inspector / tester are looked up via the
+// container registry each time a session opens. If either is not yet
+// registered (phase-4 activation ordering), the wiring is skipped
+// for that session and a warning logged — the session still runs,
+// just without audit dispatch, which is the pre-existing fallback
+// behavior.
+func registerSessionAuditWiringHooks(phase1 *bootstrapPhase1, orch *orchestrator.Orchestrator) {
+	registry := agentShared.NewSessionAuditWiringRegistry()
+
+	orch.RegisterSessionOpenHook(func(svfs *versioning.SessionVFS) {
+		inspectorAgent, inspectorErr := extractAgent[*inspectorGlobal.GlobalInspector](phase1.containerReg, "inspector")
+		if inspectorErr != nil {
+			slog.Warn("session audit wiring: inspector lookup failed",
+				"session_id", string(svfs.SessionID()),
+				"error", inspectorErr.Error(),
+			)
+			return
+		}
+		testerAgent, testerErr := extractAgent[*globaltester.GlobalTester](phase1.containerReg, "tester")
+		if testerErr != nil {
+			slog.Warn("session audit wiring: tester lookup failed",
+				"session_id", string(svfs.SessionID()),
+				"error", testerErr.Error(),
+			)
+			return
+		}
+		// Parent scope: use phase1.scope so the wiring's goroutines
+		// are tracked under the top-level tui scope and torn down
+		// with it. Without this, StartSessionAuditWiring would
+		// create a standalone scope disconnected from cmd/tui.go's
+		// shutdown lifecycle, leaking goroutines if the session
+		// closes without firing the close hook (crash path).
+		wiring, err := agentShared.StartSessionAuditWiring(context.Background(), agentShared.SessionAuditWiringConfig{
+			Session:      svfs,
+			Inspector:    inspectorAgent,
+			Tester:       testerAgent,
+			Bus:          phase1.guideBus,
+			Logger:       slog.Default(),
+			Scope:        phase1.scope,
+			SLAThreshold: sessionAuditSLAThreshold,
+		})
+		if err != nil {
+			slog.Warn("session audit wiring: start failed",
+				"session_id", string(svfs.SessionID()),
+				"error", err.Error(),
+			)
+			return
+		}
+		registry.Register(svfs.SessionID(), wiring)
+		slog.Info("session audit wiring: started",
+			"session_id", string(svfs.SessionID()),
+		)
+	})
+
+	orch.RegisterSessionCloseHook(func(svfs *versioning.SessionVFS) {
+		registry.RemoveAndStop(svfs.SessionID())
+		slog.Info("session audit wiring: stopped",
+			"session_id", string(svfs.SessionID()),
+		)
+	})
+}
+
+// sessionAuditSLAThreshold is the default rejection→remediation SLA
+// window applied to every session. Beyond this without a remediation
+// dispatched, the tracker emits an escalation event. Set to a
+// practical default; can be exposed as a config knob in a later pass.
+const sessionAuditSLAThreshold = 15 * time.Minute
 
 func registerPhase4Librarian(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) error {
 	lib, err := extractAgent[*librarian.Librarian](phase1.containerReg, "librarian")
@@ -1373,6 +1446,16 @@ func startBootstrapPhase4(
 		})
 	} else {
 		close(activationsDone)
+	}
+
+	// Register per-session audit-loop wiring hooks on the orchestrator.
+	// Each session's MergeAuditCoordinator + AuditRejectionSLATracker
+	// are created here at session-open time and torn down at
+	// session-close. The hooks look up inspector / tester agents
+	// lazily at fire time so they don't depend on phase-4 ordering.
+	// See docs/PARALLEL_GLOBAL_VFS.md §6.4.
+	if orchRef := phase1.orchRef.Load(); orchRef != nil {
+		registerSessionAuditWiringHooks(phase1, orchRef)
 	}
 
 	schedulePhase4Task(phase1.scope, "phase4-handoff-supervisor", 0, &phase4Remaining, phase4Finish, func(context.Context) error {
@@ -1804,17 +1887,9 @@ func (d onDemandAgentCreatorDeps) defaultSessionID() string {
 }
 
 func (d onDemandAgentCreatorDeps) workspaceViews(defaultView versioning.WorkspaceView) *versioning.SessionWorkspaceViews {
-	return d.workspaceViewsWithGlobalSource(defaultView, versioning.WorkspaceGlobalSourceCheckpoint)
-}
-
-func (d onDemandAgentCreatorDeps) workspaceViewsWithGlobalSource(
-	defaultView versioning.WorkspaceView,
-	globalSource versioning.WorkspaceGlobalSource,
-) *versioning.SessionWorkspaceViews {
 	return versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
 		DefaultView:      defaultView,
 		DefaultSessionID: d.defaultSessionID(),
-		GlobalSource:     globalSource,
 		WorkingDir:       d.projectRoot,
 		SessionLookup:    d.sessionLookup,
 		DiskFallback:     versioning.NewDiskFileAccess(d.projectRoot, true),
@@ -2028,15 +2103,12 @@ func registerGlobalInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 		if err != nil {
 			return nil, err
 		}
-		gi.SetFileAccess(versioning.NewSessionReviewRoutingFileAccess(
+		gi.SetFileAccess(versioning.NewSessionRoutingFileAccess(
 			false,
 			deps.sessionLookup,
 			versioning.NewDiskFileAccess(deps.projectRoot, false),
 		))
-		gi.SetWorkspaceViews(deps.workspaceViewsWithGlobalSource(
-			versioning.WorkspaceViewGlobal,
-			versioning.WorkspaceGlobalSourceReview,
-		))
+		gi.SetWorkspaceViews(deps.workspaceViews(versioning.WorkspaceViewGlobal))
 		gi.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation))
 		if startErr := gi.Start(deps.bus); startErr != nil {
 			return nil, startErr
@@ -2058,7 +2130,7 @@ func registerPipelineInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 			return nil, err
 		}
 		pi.SetActivityPublisher(deps.actPub)
-		// Inspector-owned pipeline VFS authority — handoff_to_ot and
+		// Inspector-owned pipeline VFS authority — handoff_to_green and
 		// discard_pipeline call this committer instead of the orchestrator
 		// reacting to "succeeded" / "failed" pipeline broadcasts. The
 		// session is resolved per-call via ctx so a single inspector pod
@@ -2094,15 +2166,12 @@ func registerGlobalTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 		if err != nil {
 			return nil, err
 		}
-		gt.SetFileAccess(versioning.NewSessionReviewRoutingFileAccess(
+		gt.SetFileAccess(versioning.NewSessionRoutingFileAccess(
 			false,
 			deps.sessionLookup,
 			versioning.NewDiskFileAccess(deps.projectRoot, false),
 		))
-		gt.SetWorkspaceViews(deps.workspaceViewsWithGlobalSource(
-			versioning.WorkspaceViewGlobal,
-			versioning.WorkspaceGlobalSourceReview,
-		))
+		gt.SetWorkspaceViews(deps.workspaceViews(versioning.WorkspaceViewGlobal))
 		gt.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation))
 		if startErr := gt.Start(deps.bus); startErr != nil {
 			return nil, startErr

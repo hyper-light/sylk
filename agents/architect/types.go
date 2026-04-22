@@ -367,6 +367,11 @@ type AtomicTask struct {
 	WorkerPackets       []WorkerPacket
 	ExecutionContracts  []AgentExecutionContract
 
+	// Claims: precise, atomic assertions with validations. The primary
+	// work specification — replaces vague task descriptions with
+	// structured claims that agents work against.
+	Claims []TaskClaim
+
 	// Co-tenancy fields for compound node dispatch.
 	CoAgents          []string
 	CollaborationMode dag.CollaborationMode
@@ -385,6 +390,37 @@ type AcceptanceCriterion struct {
 	When     string // Action or trigger
 	Then     string // Expected outcome
 	Priority string // "must" | "should" | "could"
+}
+
+// TaskClaim is the Architect's representation of a claim. Converted to
+// the claims package's Claim type when the orchestrator populates the
+// board. Each claim is precise and atomic — not "implement JWT
+// middleware" but "implement HS256 JWK deserialization."
+type TaskClaim struct {
+	ID          string                `json:"id"`
+	Title       string                `json:"title"`
+	Description string                `json:"description"`
+	Subject     string                `json:"subject"`  // agent type: "engineer", "designer", "tester-pipeline"
+	Scope       []TaskClaimScope      `json:"scope,omitempty"`
+	Validations []TaskClaimValidation `json:"validations"`
+	DependsOn   []string              `json:"depends_on,omitempty"` // other claim IDs
+	Priority    int                   `json:"priority,omitempty"`
+	Tags        []string              `json:"tags,omitempty"`
+}
+
+// TaskClaimScope identifies one element of a claim's affected scope.
+type TaskClaimScope struct {
+	Kind string `json:"kind"` // "file", "symbol", "api", "test_surface", "component"
+	Key  string `json:"key"`
+}
+
+// TaskClaimValidation is a single precise, atomic means of verifying a
+// claim, paired with a quality bar statement.
+type TaskClaimValidation struct {
+	ID          string `json:"id,omitempty"`
+	Description string `json:"description"` // precise, atomic validation method
+	QualityBar  string `json:"quality_bar"` // standards/expectations statement
+	Type        string `json:"type"`        // "test", "inspection", "integration", "contract", "design", "regression", "receipt"
 }
 
 // AgentScope defines a single agent's responsibilities within a compound task.
@@ -641,4 +677,7 @@ type HandoffTask struct {
 	CollaborationMode   string                   `json:"collaboration_mode,omitempty"`
 	MaxReviewRounds     int                      `json:"max_review_rounds,omitempty"`
 	AgentScopes         []AgentScope             `json:"agent_scopes,omitempty"`
+
+	// Claims: precise, atomic assertions with validations.
+	Claims []TaskClaim `json:"claims,omitempty"`
 }

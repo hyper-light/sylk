@@ -26,12 +26,16 @@ const defaultSubscriberBuffer = 1024
 
 // Config configures an Accountant.
 type Config struct {
-	// Namespace scopes the accountant to a single session. All
-	// events must carry matching identity.Namespace.
+	// Namespace scopes the accountant for this run. All events must
+	// carry matching identity.Namespace. Namespace does not persist
+	// state across restarts — the in-memory aggregate is per-run.
 	Namespace identity.Namespace
-	// WAL (optional) persists deltas. A nil WAL is acceptable for
-	// tests and short-lived runs; in production cmd/tui.go wires a
-	// file-backed WAL at .sylk/sessions/{namespace}/accounting/.
+	// WAL (optional) persists deltas to a durable log for offline
+	// audit and billing analysis. It is NOT replayed on startup:
+	// in-memory buckets begin empty every run so UI consumers like
+	// the status bar reflect live spend, not all-time totals.
+	// Callers that want historical reconstruction invoke
+	// Accountant.ReplayFromWAL() explicitly.
 	WAL WAL
 	// Clock is optional; defaults to time.Now.
 	Clock func() time.Time
@@ -112,14 +116,31 @@ func New(cfg Config) (*Accountant, error) {
 		buckets:       make(map[AccountingKey]*AggregatedUsage),
 		containerMeta: make(map[identity.UID]containerSnapshot),
 	}
-	// Best-effort replay: a corrupt record is logged and skipped
-	// rather than aborting startup.
-	if a.wal != nil {
-		if err := a.wal.Replay(a.replayDelta); err != nil {
-			a.logger.Warn("accounting: WAL replay partial", "error", err)
-		}
-	}
+	// WAL replay is NOT performed here. The WAL is a durable audit
+	// log, not a source of truth for live UI state: the status bar
+	// shows this run's spend, not all-time totals across restarts.
+	// Offline tools that want historical reconstruction call
+	// ReplayFromWAL() explicitly.
 	return a, nil
+}
+
+// ReplayFromWAL rehydrates in-memory aggregate state from the
+// configured WAL. Intended for offline analysis (e.g., a future
+// `sylk bill` command) and for tests that verify WAL round-trip
+// semantics. Production bootstrap does not invoke this — the
+// status bar intentionally reflects live per-run spend.
+//
+// Returns nil when no WAL is configured. A partial/corrupt WAL is
+// tolerated: bad records are logged and skipped.
+func (a *Accountant) ReplayFromWAL() error {
+	if a == nil || a.wal == nil {
+		return nil
+	}
+	if err := a.wal.Replay(a.replayDelta); err != nil {
+		a.logger.Warn("accounting: WAL replay partial", "error", err)
+		return err
+	}
+	return nil
 }
 
 // Namespace returns the session the accountant is bound to.

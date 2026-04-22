@@ -80,7 +80,7 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 		}
 
 		turnStart := time.Now()
-		resp, err := agentshared.CompleteWithWatchdog(ctx, provider, req, agentshared.AgentDisplayName("tester"))
+		resp, err := gt.runTurn(ctx, provider, req)
 		if err != nil {
 			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -93,7 +93,6 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 		if gov := agentshared.ContextGovernorFromContext(ctx); gov != nil {
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
-		agentshared.PublishIntermediateToolTurn(gt.bus, gt.channels, ctx, gt.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
 			if err := agentshared.ValidateGlobalReviewCompletion(ctx, "tester"); err != nil {
@@ -184,6 +183,19 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 			&agentlog.ErrorPayload{Error: "exhausted tool-call loop"})
 	}
 	return "", fmt.Errorf("global tester exhausted tool-call loop")
+}
+
+// runTurn streams one LLM turn. globalTesterProvider requires the
+// Stream method, so the compiler enforces this path — no runtime
+// fallback. Thinking + text chunks flow to the chat panel; tool
+// calls are surfaced by the helper via PublishIntermediateToolTurn.
+func (gt *GlobalTester) runTurn(ctx context.Context, provider globalTesterProvider, req *providers.Request) (*providers.Response, error) {
+	return agentshared.StreamLLMTurn(ctx, agentshared.StreamingLLMTurnConfig{
+		Bus:              gt.bus,
+		Channels:         gt.channels,
+		AgentID:          gt.id,
+		AgentDisplayName: agentshared.AgentDisplayName("tester"),
+	}, provider, req)
 }
 
 // applyToolCalls appends the assistant message and tool results to the request.

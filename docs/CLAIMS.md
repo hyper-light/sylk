@@ -9,7 +9,7 @@ The current pipeline system uses a state machine protocol (`PipelineProtocolSnap
 3. Engineer/Designer implements (`StatusExecuting`)
 4. Inspector + Tester validate (`StatusValidating`)
 
-Each transition requires a durable event append to the WAL, reducer replay to reconstruct state, mailbox obligation derivation to determine the next required action, and single-terminal-action guards to prevent double-dispatch. The protocol's reducer state machine cycles through seven states (`Idle -> ChallengeIssued -> ValidationPending -> ValidationProcessed -> FinalizeRequired -> ReadyForOT -> HandoffToOTRequired -> Completed`), with each agent turn constrained by a `PipelineTurnAction` that must match the `requiredAction` lock.
+Each transition requires a durable event append to the WAL, reducer replay to reconstruct state, mailbox obligation derivation to determine the next required action, and single-terminal-action guards to prevent double-dispatch. The protocol's reducer state machine cycles through seven states (`Idle -> ChallengeIssued -> ValidationPending -> ValidationProcessed -> FinalizeRequired -> ReadyForOT -> HandoffToGreenRequired -> Completed`), with each agent turn constrained by a `PipelineTurnAction` that must match the `requiredAction` lock.
 
 This architecture is fundamentally sequential. Only one agent acts at a time. The Inspector must handoff to the Tester, who must handoff to the Engineer, who must handoff back. Every transition is a durable protocol event. Every handoff is a full Guide route request. Every phase boundary is a terminal-action guard. The result is high latency for work that should be collaborative and parallel.
 
@@ -60,7 +60,7 @@ You can walk from any testament back to: its testament action, the specific clai
 | Corrective | System/Inspector | Misbehaving agent | "Acquire file scope before writing — here are the claims" |
 | Archival | Any agent | Scribe/knowledge agent | "Summarize architect's last context window" |
 
-Actions unify what were previously separate mechanisms (task dispatch, `challenge_peer`, `consult_peer`, error handling). A challenge is just an action whose claims assert a problem. A consultation is just an action whose claims request information. A corrective is just an action whose claims guide an agent back on track. They all flow through the same machinery.
+Actions unify what were previously separate mechanisms (task dispatch, `challenge_agent`, `challenge_peer`, `consult_peer`, coordination skills). A challenge is just an action whose claims assert a problem. A consultation is just an action whose claims request information. They all flow through `post_action` with the appropriate action type.
 
 ### 2.3 Claim
 
@@ -118,12 +118,15 @@ The testament is a concrete statement of what was done:
 
 ### 2.6 Artifact
 
-An **Artifact** is a piece of evidence attached to a testament. Artifacts are polymorphic — the `Kind` field discriminates how to interpret the reference:
+An **Artifact** is a piece of evidence attached to a testament. Artifacts are polymorphic — the `Kind` field discriminates how to interpret the reference. **Errors are artifacts.** A failed operation does not return an error to the caller — it produces a testament with error artifacts. The issuer evaluates the testament, sees the error artifacts, and decides what to do. Nothing is silently dropped because every outcome — success or failure — is a testament with proof.
 
 | Kind | Example | Used By |
 |---|---|---|
 | `code_reference` | `services/auth/jwk.go:47-89` | Engineer, Designer |
 | `test_output` | `TestDeserializeHS256JWK_ValidKey PASS` | Tester |
+| `error` | `ErrUnsupportedAlgorithm: HS384 not supported` | Any — captures operation failures |
+| `error_trace` | Stack trace from panicked operation | Any — captures crash context |
+| `error_diagnostic` | `timeout after 30s waiting for DB connection` | Any — captures environmental failures |
 | `research_paper` | Academic research output on JWK best practices | Academic |
 | `reference_links` | URLs to RFC 7517, stdlib `crypto/hmac` docs | Academic, Librarian |
 | `knowledge_graph_vectors` | Embedding IDs from vector store | Knowledge agents |
@@ -137,16 +140,15 @@ An **Artifact** is a piece of evidence attached to a testament. Artifacts are po
 
 The system does not constrain what artifact kinds exist — new kinds can be added without schema changes. The `Kind` field is a string, not an enum.
 
-### 2.7 Corrective Claims
+**Errors-as-artifacts principle:** When an operation fails — a test execution crashes, a file write is denied, an LLM call times out, an ingestion returns an error — the agent captures the failure as an artifact on the testament it submits. The testament's `Summary` describes what happened ("Attempted HS256 deserialization but encountered unsupported algorithm"), and the artifacts carry the error details (`kind: "error"`, `reference: "ErrUnsupportedAlgorithm: HS384"`). The issuer evaluates the testament, sees the error artifacts, and decides: remediate with new claims, retry, or escalate. No error is ever silently dropped — every failure is durable, auditable, and visible on the board.
 
-When an agent acts out of order — invokes a skill without sufficient validated claims backing the invocation, works outside its claimed scope, attempts an operation that requires prerequisite claims — the system does NOT return an error. Instead, it issues the agent a **corrective action**: a set of claims that guide the agent toward the desired behavior.
+### 2.7 Claims as Constraints
 
-For example, if an Engineer calls `write_pipeline_file` before acquiring a file scope claim:
+If the claims and their validations are precise enough, and agents can see the board state via `query_claims_board` and ambient context, agents naturally do the right thing. The claims ARE the constraints. The board IS the state machine. The validations define what must be true.
 
-- **Instead of**: error "insufficient scope claim"
-- **The system issues**: a corrective action with claims like "Acquire exclusive scope on `services/auth/middleware.go`" and "Verify no peer claims overlap with target scope" — the Engineer processes these claims, acquires scope via `coord_claim_scope`, submits testaments with the scope receipt artifacts, and then proceeds to write the file.
+There is no separate enforcement engine or corrective claims machinery. An agent acting "out of order" means the claims weren't specific enough or the agent couldn't see the board — fix the claims or fix the visibility, not bolt on an enforcement layer. Adding enforcement on top of claims reimplements the protocol state machine that claims replace.
 
-This makes the system self-healing. Misbehavior produces more claims, not failures. The agent always has a path forward.
+**Design principle:** The Architect produces claims specific enough that the agents' work is fully constrained by the claims themselves. The Inspector's validations are precise enough that the quality bar is unambiguous. The board's phase is visible enough that agents know what to do. No additional machinery is needed.
 
 ### 2.8 The Validation Flow
 
@@ -155,13 +157,16 @@ The claim's issuer (the claimant) validates the testament and its artifacts agai
 ```
 1. Issuer creates Claim (with validations) against Subject
 2. Subject does work
-3. Subject issues Testament (with artifacts) back to Issuer
+3a. Work succeeds → Subject issues Testament with success artifacts
+3b. Work fails → Subject issues Testament with error artifacts
 4. Issuer evaluates each Validation against the Testament's Artifacts
 5a. All validations pass → Claim accepted
-5b. Validation fails → Issuer may issue new corrective/remediation claims
+5b. Validation fails (including error artifacts) → Issuer posts remediation claims
 ```
 
-For initial task claims, the Inspector is the issuer. The Inspector evaluates testaments from Engineer/Designer/Tester against each claim's validations. The Tester may also validate test-type validations by running tests and submitting their own evaluation. If validations fail, the Inspector or Tester issues new claims (remediation or corrective).
+Both success and failure produce testaments. A testament with error artifacts is not a system error — it's a structured report of what went wrong, with the error details as auditable proof. The issuer sees exactly what failed and can issue precise remediation claims targeting the specific failure.
+
+For initial task claims, the Inspector is the issuer. The Inspector evaluates testaments from Engineer/Designer/Tester against each claim's validations. The Tester may also validate test-type validations by running tests and submitting their own evaluation. If validations fail, the Inspector or Tester issues new claims (remediation).
 
 ---
 
@@ -421,6 +426,12 @@ type Claim struct {
     // Iteration records which implementation-validation cycle created
     // this claim. 0 = initial, 1+ = remediation/corrective.
     Iteration int `json:"iteration"`
+
+    // Validations are the quality gates for this claim. Structural
+    // ownership — each Validation belongs to exactly one Claim.
+    // Relations encode cross-cutting relationships (evaluator, etc.);
+    // this field encodes parent-child ownership.
+    Validations []*Validation `json:"validations"`
 }
 ```
 
@@ -467,6 +478,10 @@ type Testament struct {
     // submission. Useful for capacity planning, identifying claims
     // scoped too broadly, and agent performance tracking.
     Duration time.Duration `json:"duration,omitempty"`
+
+    // Artifacts are the proof attached to this testament. Structural
+    // ownership — each Artifact belongs to exactly one Testament.
+    Artifacts []*Artifact `json:"artifacts"`
 }
 ```
 
@@ -485,6 +500,12 @@ An Artifact is evidence attached to a testament. Once created, never modified �
 type Artifact struct {
     // ── Universal base (9 fields) ──
     ID         string     `json:"id"`
+
+    // TestamentID is the structural parent — the testament this
+    // artifact belongs to. Every Artifact has exactly one parent
+    // Testament.
+    TestamentID string    `json:"testament_id"`
+
     AgentID    string     `json:"agent_id"`
     SessionID  string     `json:"session_id"`
     PipelineID string     `json:"pipeline_id"`
@@ -547,6 +568,11 @@ A Validation is a quality gate on a claim. Validations have a lifecycle tracked 
 type Validation struct {
     // ── Universal base (9 fields) ──
     ID         string     `json:"id"`
+
+    // ClaimID is the structural parent — the claim this validation
+    // belongs to. Every Validation has exactly one parent Claim.
+    ClaimID    string     `json:"claim_id"`
+
     AgentID    string     `json:"agent_id"`
     SessionID  string     `json:"session_id"`
     PipelineID string     `json:"pipeline_id"`
@@ -941,6 +967,53 @@ The Inspector (as issuer of the initial claims) validates each testament's artif
 | Validation -> Complete | Orchestrator observes board state | All non-superseded claims `accepted` |
 | Any -> Failed | Orchestrator detects bound exceeded | `iteration >= MaxReviewRounds` with failing validations |
 
+### 5.5 Pipeline-to-Global Handoff
+
+When the pipeline board completes (all claims accepted), the pipeline inspector calls `handoff_to_green` which triggers the pipeline-to-global review chain. Per `PARALLEL_GLOBAL_VFS.md`, this is a three-stage trigger chain:
+
+```
+Stage 1: Pipeline Inspector → handoff_to_green
+  → MergePipelineIntoGreen
+      - Produces Copy_N at arrival_seq N
+      - Serializes pipeline claims (with testaments + artifacts)
+        onto the MergeDescriptor
+  → Publishes bus handoff message: "new work for seq N"
+
+Stage 2: Global Inspector + Global Tester receive bus message
+  → Both begin watching for: VFS Copy_N materialized + claims ready
+
+Stage 3: VFS Copy_N ready + Claims on descriptor ready
+  → Global Inspector replica starts auditing against Copy_N + claims
+  → Global Tester waits for inspector outcome
+
+Stage 4: Global Inspector accepts
+  → Global Tester replica starts testing against Copy_N + claims
+  (If inspector rejects → tester does not run, rejection flows
+   to architect for remediation)
+
+Stage 5: Global Tester accepts
+  → Tester posts acceptance claims (test results, coverage artifacts)
+  → These claims trigger the Global Inspector
+
+Stage 6: Global Inspector consumes tester's acceptance claims
+  → Validates tester's testaments
+  → Triggers disk commit on the commit queue for seq N
+
+Stage 7: Commit queue advances → water line moves → next layer
+```
+
+**Key design points:**
+
+- **Claims travel on the MergeDescriptor.** The pipeline's accepted claims with their testaments and artifacts are serialized onto the descriptor at handoff time. The global inspector replica reads them from the descriptor, not from a live board reference.
+
+- **The bus handoff message is the alert, not the dispatch.** It tells global agents "prepare — work is coming for seq N." The actual work starts when the VFS Copy and claims are both confirmed ready.
+
+- **Inspector gates tester.** Both are autonomous peers (not parent-child), but the inspector goes first. Its acceptance is the prerequisite for the tester to start.
+
+- **The global inspector is the sole authority for disk commit.** The tester provides evidence (claims with testaments and artifacts), but the inspector consuming and validating that evidence is what triggers the commit.
+
+- **Global agents are always-on.** They subscribe to handoff events on the bus. The orchestrator is not involved in the global review dispatch — the pipeline inspector publishes directly.
+
 ---
 
 ## 6. Comparison with Current System
@@ -949,24 +1022,24 @@ The Inspector (as issuer of the initial claims) validates each testament's artif
 |---|---|---|
 | **Execution model** | Sequential: Inspector -> Tester -> Worker -> Verify | Parallel: all subjects work simultaneously |
 | **State representation** | `PipelineProtocolSnapshot` with 7 reducer states | `ClaimsBoard` with 2 phases |
-| **Agent coordination** | Turn-based handoffs via `handoff_next`, `challenge_agent` | Actions: challenges and consultations are claim sets |
+| **Agent coordination** | Turn-based handoffs via `handoff_next`, `challenge_agent` | Actions via `post_action`: challenges and consultations are claim sets |
 | **Work tracking** | Single task prompt per agent | Granular claims with atomic updates + testaments |
 | **Response mechanism** | Handoff with status update | Testament with artifacts (proof of work) |
 | **Validation** | Inspector challenges agent, processes response | Issuer validates testament artifacts against validations |
 | **Error handling** | Errors returned to agent | Corrective claims issued — agent always has a path forward |
 | **Quality gates** | Inspector's `grade_task_quality` (holistic) | Per-claim, per-validation quality bar statements |
-| **Cross-agent communication** | Separate `challenge_peer`, `consult_peer` skills | Uniform: challenge and consult are action types |
+| **Cross-agent communication** | Separate `challenge_peer`, `consult_peer` skills | Uniform via `post_action`: challenge and consultation are action types |
 | **Test execution** | Tester runs tests in sequential phase | Tester writes tests in Implementation, runs in Validation |
-| **Pipeline terminal** | Inspector's `handoff_to_ot` -> PipelineCommitter | Board `MarkComplete` -> PipelineCommitter |
+| **Pipeline terminal** | Inspector's `handoff_to_green` -> MergePipelineIntoGreen | Board complete -> inspector calls `handoff_to_green` -> MergePipelineIntoGreen -> claims serialized onto MergeDescriptor -> bus handoff message -> global review chain |
 | **Scope** | Pipeline agents only | Universal — works for any agent (scribe, academic, etc.) |
 
 ---
 
 ## 7. Complete Pipeline Agent Skills Audit
 
-### 7.1 Pipeline Inspector (69 skills currently -> 60 after)
+### 7.1 Pipeline Inspector (post-refactor baseline -> claims conversion)
 
-**RETIRE (12 skills) — protocol handoff/challenge/consult machinery replaced by claims/actions:**
+**RETIRE (11 skills) — protocol handoff/challenge/consult machinery replaced by claims/actions:**
 
 | Skill | Current Purpose | Replacement |
 |---|---|---|
@@ -974,8 +1047,7 @@ The Inspector (as issuer of the initial claims) validates each testament's artif
 | `handoff_next` | Route to next agent in sequence | Eliminated — no sequential handoffs |
 | `validate_work` | Validate peer work and return findings | `evaluate_validation` — evaluate testament artifacts against validations |
 | `process_validation` | Process validation responses | Board tracks testament/validation results directly |
-| `finalize_pipeline` | Final accept/reject + tester handoff | Board completion triggers PipelineCommitter |
-| `handoff_to_ot` | Terminal handoff to orchestrator | Board `MarkComplete` triggers extract |
+| `finalize_pipeline` | Final accept/reject + tester handoff | Board completion; inspector calls `handoff_to_green` when board is complete |
 | `discard_pipeline` | Discard after quality decision | Board bounded-failure triggers rollback |
 | `discard_queued_artifacts` | Drop stale verification artifacts | Artifacts live on testaments, not a separate queue |
 | `query_pipeline_state` | Protocol projection query | `query_claims_board` |
@@ -993,17 +1065,27 @@ The Inspector (as issuer of the initial claims) validates each testament's artif
 | `post_remediation_claims` | Reject a claim and post replacement claims | Validation |
 | `inspect_claim_conflicts` | Surface overlapping claims, competing testaments | Both |
 
-**MODIFY (3 skills):**
+**MODIFY (4 skills):**
 
 | Skill | Change |
 |---|---|
+| `handoff_to_green` | Stays as the terminal pipeline skill. Gains: serializes pipeline claims (with testaments + artifacts) onto the MergeDescriptor. Gated by board phase = complete (inspector must accept all claims first). |
 | `define_criteria` | Generates claims (via `post_action`) rather than standalone criteria |
 | `validate_criteria` | Subsumed into `evaluate_validation` workflow |
 | `inspect_open_activity` | Surfaces claim/testament conflicts from Fabric |
 
-**KEEP UNCHANGED (51 skills):**
+**KEEP UNCHANGED (post-refactor names):**
 
-- Analysis/linting (7), Design validation (4), VFS/workspace (15), Command execution (2), Coordination (7), Memory forest (7), Fabric awareness (4: `query_peer_activity`, `causal_trace`, `find_related_activity`, `recall_my_history`), Validation support (3), Dependency (2), Diagnostics (2), Status (1)
+- **Analysis**: `run_analyzer(kind=...)` (1 skill, replaces 9 individual analyzer skills)
+- **Design validation**: `validate_ui_compliance(aspect=...)` (1 skill, replaces 4)
+- **VFS/workspace**: `workspace_read(op=...)`, `workspace_write(op=...)`, `prepare_write_context` (3 skills, replaces 12)
+- **Command execution**: `bash` (1 skill)
+- **Coordination**: `manage_claim(action=...)`, `publish_work_event(kind=...)` (2 skills, replaces 7 `coord_*`)
+- **Memory forest**: generic (5) + inspector-specific (2)
+- **Fabric awareness**: `query_peer_activity`, `causal_trace`, `find_related_activity`, `recall_my_history` (4)
+- **Validation support**: `grade_task_quality`, `request_override` (2)
+- **Dependency**: `dependency(action=research|install)` (1)
+- **Diagnostics**: `self_diagnostic`, `reroute_request` (2)
 
 ### 7.2 Pipeline Tester (51 skills currently -> 45 after)
 
@@ -1165,11 +1247,26 @@ Inspector evaluates each testament's artifacts against validations:
 
 **5. Re-entry:**
 
-Engineer receives corrective claim, refactors test, submits testament with artifacts (code diff, test output showing consistent pass). Inspector validates — all pass.
+Engineer receives remediation claim, refactors test, submits testament with artifacts (code diff, test output showing consistent pass). Inspector validates — all pass.
 
-**6. Complete:**
+**6. Pipeline Complete → Handoff:**
 
-`MarkComplete()`. `PipelineCommitter.ExtractReviewCandidate()` promotes VFS overlay.
+Board reaches `complete` (all claims accepted). Pipeline inspector calls `handoff_to_green`:
+- `MergePipelineIntoGreen` merges the pipeline's VFS into green, producing Copy_N at arrival_seq N
+- Pipeline claims (with testaments and artifacts) serialized onto the MergeDescriptor
+- Bus handoff message published: "new work for seq N"
+- Pipeline VFS and pod released
+
+**7. Global Review:**
+
+Global Inspector and Global Tester receive the bus handoff message and begin watching for Copy_N:
+
+- Copy_N materializes (byte-for-byte VFS replica)
+- Global Inspector replica starts: audits Copy_N against the pipeline's claims — checks that each testament's artifacts actually exist in the VFS, meet the validation quality bars, cohere architecturally
+- Inspector accepts → Global Tester replica starts: runs integration tests against Copy_N, validates test-type claims
+- Tester accepts → posts acceptance claims with test result artifacts
+- Tester's acceptance claims trigger the Global Inspector → inspector validates tester's testaments → triggers disk commit on commit queue for seq N
+- Commit queue advances, water line moves, next DAG layer proceeds
 
 ---
 
@@ -1194,7 +1291,6 @@ const (
     eventClaimAccepted       = "claim_accepted"
     eventClaimRejected       = "claim_rejected"
     eventClaimSuperseded     = "claim_superseded"
-    eventCorrectiveIssued    = "corrective_issued"
     eventPhaseTransition     = "phase_transition"
     eventBoardComplete       = "board_complete"
 )
@@ -1257,14 +1353,15 @@ Add `StatusImplementing` replacing `StatusDefiningCriteria` + `StatusCreatingTes
 | 5 | Board amplifier: emit activities for claims, testaments, artifacts |
 | 6 | Agent skills: 7 new skill factories |
 | 7 | Architect claim generation: types, planner, handoff wiring |
-| 8 | Orchestrator: ClaimsPipelineController, claims dispatch path |
+| 8 | Pipeline agent conversion: unconditional claims skills on all 4 agents |
 | 9 | Task context rendering: claims board section |
 | 10 | Fabric ambient context: ClaimsBoardDigest with testaments |
 | 11 | Fabric awareness skills: query_claims_board, inspect_claim_conflicts |
-| 12 | Phase gating: tester run_test_suite blocked during implementation |
-| 13 | Agent skill registration: conditional claims vs protocol skills |
-| 14 | Task state: StatusImplementing |
-| 15 | Corrective claims: skill invocation guards that issue claims instead of errors |
+| 12 | MergeDescriptor claims serialization: pipeline claims travel on the descriptor at handoff |
+| 13 | Pipeline-to-global handoff: bus message → VFS Copy watch → global inspector replica |
+| 14 | Global review chain: inspector audits → tester tests → tester posts acceptance claims → inspector validates → disk commit |
+| 15 | Task state: StatusImplementing |
+| 16 | Pipeline protocol retirement: remove state machine, durable events, projection, sub-node expansion |
 
 ---
 
@@ -1280,18 +1377,20 @@ Add `StatusImplementing` replacing `StatusDefiningCriteria` + `StatusCreatingTes
 | Unit: Projection | Counts, action/testament/artifact summaries, all five entity collections |
 | Unit: Immutability | Testament and Artifact cannot be mutated after creation; corrections produce new objects with supersedes Relation |
 | Unit: Testament model | Testament with multiple artifacts, artifact kind polymorphism, ContentHash integrity |
-| Integration: End-to-end | Architect claims -> board -> subjects work -> testaments -> validation -> complete |
-| Integration: Remediation | Validation fails -> corrective claims -> re-implement -> pass |
-| Integration: Corrective | Agent acts out of order -> corrective claims issued -> agent adjusts -> succeeds |
+| Integration: End-to-end pipeline | Architect claims -> board -> subjects work -> testaments -> validation -> complete -> handoff_to_green |
+| Integration: Remediation | Validation fails -> remediation claims -> re-implement -> pass |
 | Integration: Bounded iteration | MaxReviewRounds exceeded -> rollback |
 | Integration: Consultation | Engineer posts consultation action -> Designer responds with testament |
 | Integration: Challenge | Inspector posts challenge action -> Engineer responds with testament |
+| Integration: Pipeline-to-global handoff | Board complete -> handoff_to_green -> MergeDescriptor with claims -> bus handoff message |
+| Integration: Global review chain | Bus message -> VFS Copy watch -> inspector audits -> accepts -> tester tests -> tester posts claims -> inspector validates -> disk commit |
+| Integration: Global inspector rejection | Inspector rejects -> tester does not run -> rejection to architect -> remediation DAG |
+| Integration: Global tester rejection | Inspector accepts -> tester rejects -> tester posts rejection claims -> architect remediates |
 | Fabric: Activity emission | Claims, testaments, artifacts all emit correct ActionKinds |
 | Fabric: Ambient context | ClaimsBoardDigest shows testaments and artifacts |
 | Fabric: Cross-pipeline | Claims/testaments from pipeline A visible to pipeline B |
-| Skills: Phase gating | run_test_suite blocked during implementation |
-| Skills: Disposition | Protocol skills absent for claims pipelines, claims skills present |
 | Recovery: Crash resilience | Kill mid-mutation -> WAL replay -> consistent state |
+| Recovery: Global review restart | Replica crash -> descriptor state returns to auditing -> fresh replica relaunches |
 
 ---
 
@@ -1332,7 +1431,6 @@ Tier 11: Boot and lifecycle conversion
 | ClaimsBoard | `core/claims/board.go` | Sovereign store: PostAction, SubmitTestaments, EvaluateValidation, RejectClaim, phase transitions, queries, projection, subscription. Flat maps for all 5 entity types. |
 | WAL persistence | `core/claims/board_durable.go` | 10 WAL event types, checkpoint struct, apply handlers, recovery via replay. Same `durableProtocolLog` pattern. |
 | Board amplifier | `core/claims/board_amplifier.go` | Fabric activity emission for every board mutation. All 12 ActionKinds. |
-| Corrective claims engine | `core/claims/corrective.go` | Intercepts skill precondition failures, generates corrective claim sets instead of errors. Registered as a pre-skill hook. |
 | Claims skill factories | `core/claims/skills.go` | `query_claims_board`, `post_action`, `submit_testaments`, `update_claim_progress`, `evaluate_validation`, `post_remediation_claims`, `inspect_claim_conflicts`. Shared by all agents. |
 
 **Note:** The package moves from `core/pipeline/claims/` to `core/claims/` — claims are system-wide, not pipeline-specific.
@@ -1360,7 +1458,7 @@ Tier 11: Boot and lifecycle conversion
 
 | Change | File(s) | Description |
 |---|---|---|
-| Retire protocol skills | `agents/inspector/pipeline/pipeline.go` | Remove: `challenge_agent`, `handoff_next`, `validate_work`, `process_validation`, `finalize_pipeline`, `handoff_to_ot`, `discard_pipeline`, `discard_queued_artifacts`, `query_pipeline_state`, `challenge_peer`, `consult_peer`, `inspect_open_conflicts` (12 skills) |
+| Retire protocol skills | `agents/inspector/pipeline/pipeline.go` | Remove: `challenge_agent`, `handoff_next`, `validate_work`, `process_validation`, `finalize_pipeline`, `handoff_to_green`, `discard_pipeline`, `discard_queued_artifacts`, `query_pipeline_state`, `challenge_peer`, `consult_peer`, `inspect_open_conflicts` (12 skills) |
 | Add claims skills | `agents/inspector/pipeline/pipeline.go` | Register: `query_claims_board`, `post_action`, `evaluate_validation`, `post_remediation_claims`, `inspect_claim_conflicts` (5 skills) |
 | Issue claims on board creation | `agents/inspector/pipeline/pipeline.go` | When the board is populated from architect's assembly, the inspector is the formal issuer. Claims carry inspector's AgentID in the issuer Relation. |
 | Evaluate testaments | `agents/inspector/pipeline/pipeline.go` | During validation phase, inspector evaluates each testament's artifacts against each claim's validations. Uses `evaluate_validation` skill. |
@@ -1384,7 +1482,7 @@ Tier 11: Boot and lifecycle conversion
 | Retire protocol skills | `agents/engineer/skills.go` | Remove 8 protocol + challenge/consult skills. |
 | Add claims skills | `agents/engineer/skills.go` | Register: `query_claims_board`, `post_action`, `submit_testaments`, `update_claim_progress`, `inspect_claim_conflicts`. |
 | Work against claims | `agents/engineer/skills.go` | Every file write, every tool invocation produces an `update_claim_progress`. Completion produces a testament with code reference + diff artifacts. |
-| Corrective claims on scope violation | `core/claims/corrective.go` | Engineer calling `write_pipeline_file` without scope claim triggers corrective action, not error. |
+| Scope defined by claims | N/A | Engineer's claims define scope entries — the claims ARE the authorization. No separate enforcement. |
 
 #### 2d. Designer
 
@@ -1397,7 +1495,7 @@ Tier 11: Boot and lifecycle conversion
 | Change | File(s) | Description |
 |---|---|---|
 | Remove protocol state machine | `agents/shared/pipeline_protocol.go` | The entire `PipelineProtocolSnapshot`, `PipelineTurnAction`, `PipelineProtocolState`, reducer, mailbox obligations, terminal action guards — all replaced by the claims board. |
-| Remove durable protocol events | `agents/shared/pipeline_protocol_durable.go` | `handoff_selected`, `validation_submitted`, `validation_processed`, `ready_for_ot`, `handoff_to_ot`, `tester_finalize`, `tester_artifact_consumed` — all replaced by claims WAL events. |
+| Remove durable protocol events | `agents/shared/pipeline_protocol_durable.go` | `handoff_selected`, `validation_submitted`, `validation_processed`, `ready_for_ot`, `handoff_to_green`, `tester_finalize`, `tester_artifact_consumed` — all replaced by claims WAL events. |
 | Remove pipeline projection | `agents/shared/pipeline_projection.go` | Replaced by `ClaimsBoardProjection`. |
 | Remove pipeline expand | `agents/orchestrator/pipeline_expand.go` | Sub-node expansion (StageInspect/StageTest/StageExecute) replaced by claims dispatch. |
 | Remove pipeline runtime protocol path | `agents/orchestrator/pipeline_runtime.go` | `routeProtocolPipelineTask`, `pipelineProtocolEligible`, initial protocol snapshot — all replaced by claims dispatch. |
@@ -1526,12 +1624,10 @@ Tier 11: Boot and lifecycle conversion
 
 | What's Retired | Replaced By |
 |---|---|
-| `coord_claim_scope` | Scope claim: claim with scope entries, issuer=requesting agent, subject=coordinator |
-| `coord_publish_artifact` | Testament with artifact: agent publishes work as testament |
-| `coord_request_review` | Consultation action: agent issues review claim against peer |
-| `coord_resolve_artifact` | `evaluate_validation`: reviewer evaluates testament artifacts |
-| `coord_query_view` | `query_claims_board`: full board state including scope claims |
-| `coord_watch_updates` | Board subscription: reactive projection updates |
+| `manage_claim(action=acquire\|release)` | Scope relations on claims: the claim's scope entries define file/symbol/API boundaries |
+| `publish_work_event(kind=artifact\|review_request\|review_completion)` | Testaments with artifacts: agent publishes work as testament |
+| `query_claims_board` | Full board state including scope claims |
+| Board subscription | Reactive projection updates |
 | `ClaimMode` (exclusive/shared/review) | Relation types on scope claims: `exclusive_scope`, `shared_scope`, `review_scope` |
 
 #### 8c. Decision Manifest → Claims Board
@@ -1568,7 +1664,7 @@ Tier 11: Boot and lifecycle conversion
 
 | Change | File(s) | Description |
 |---|---|---|
-| File scope as claim prerequisite | `core/versioning/`, `core/claims/corrective.go` | Every `write_pipeline_file`, `edit_pipeline_file`, `delete_pipeline_file` requires a validated scope claim. If missing, a corrective claim is issued instead of an error. |
+| File scope as claim prerequisite | `core/versioning/` | Every `workspace_write(op=write|edit|delete)` operates within the scope defined by the agent's claims. The claims' scope entries define what files the agent is allowed to touch. |
 | File writes produce artifacts | `agents/shared/` | Every VFS write automatically produces an artifact (kind: `diff`, reference: the changed file path + line range) attached to the active claim's progress. |
 | VFS commit as testament | `core/versioning/` | `MergePipelineIntoGreen` success produces a testament with merge artifacts (paths merged, version, base version). |
 
@@ -1616,7 +1712,7 @@ Tier 11: Boot and lifecycle conversion
 
 | Tier | Components | Claims Board Scope | Replaces |
 |---|---|---|---|
-| 0 | Core types, board, WAL, amplifier, corrective engine, skills | System-wide | Nothing (new) |
+| 0 | Core types, board, WAL, amplifier, skills | System-wide | Nothing (new) |
 | 1 | Fabric ActionKinds, ambient context, awareness skills | System-wide | Partial Fabric integration |
 | 2 | Inspector, Tester, Engineer, Designer (pipeline) | Per-pipeline | Pipeline Protocol |
 | 3 | Architect | Per-plan | AcceptanceCriteria, SuccessCriteria, task prompts |
@@ -1683,7 +1779,7 @@ The Fabric itself is the observation/coordination substrate. With claims as the 
 | Activity → Claim mapping | `core/activity/` | Every Fabric activity maps to a claims entity. `claim_issued` → Claim. `testament_submitted` → Testament. `claim_artifact_published` → Artifact. `claim_validated` → Validation StatusChange. The activity stream becomes a projection of the claims board, not a parallel record. |
 | Richer causal chains | `core/activity/` | Current causal chains link activities by `Caused` / `Resolves`. With claims, the causal chain is explicit in Relations: claim `caused_by` action, testament `caused_by` claim, artifact `caused_by` testament. The Fabric's `causal_trace` lens walks Relations, not ad-hoc `Caused` pointers. |
 | Ambient context = board digest | `core/activity/lenses/ambient.go` | The ambient context envelope stops aggregating from multiple sovereign projections and reads directly from the claims board projection. One source of truth, not a merge of three. |
-| Lens queries = board queries | `core/activity/lenses/` | `query_peer_activity` becomes `query_claims_board` filtered by peer. `inspect_open_conflicts` becomes `inspect_claim_conflicts`. `find_related_activity` searches claim/testament descriptions. The lens layer thins — it's querying one store, not correlating across three. |
+| Lens queries = board queries | `core/activity/lenses/` | `query_peer_activity` supplements with `query_claims_board` filtered by peer. `inspect_claim_conflicts` replaces `inspect_open_conflicts` for claims-specific conflict detection. `find_related_activity` searches claim/testament descriptions. The lens layer thins — the claims board is the primary coordination surface. |
 | Resolution tiers still apply | `core/activity/` | Atomic/Fine/Medium/Coarse resolution tiers still determine storage lifetime. Claim progress updates (Medium) evict faster than accepted claims (Coarse, permanent). Artifacts tagged `Ephemeral` evict after iteration; durable artifacts persist to Coarse tier. |
 | Chokepoint instrumentation simplified | `core/activity/span.go` | Currently, 10+ chokepoints emit raw activities and 6+ amplifiers project sovereign state. With one sovereign source, the amplifier count drops to 1 (the claims board amplifier). Chokepoints still emit infrastructure activities (LLM calls, file writes, command executions) but semantic activities all flow through claims. |
 
@@ -1700,7 +1796,7 @@ The Fabric itself is the observation/coordination substrate. With claims as the 
 
 | Tier | Components | Replaces |
 |---|---|---|
-| 0 | Core types, board, WAL, amplifier, corrective engine, skills | Nothing (new) |
+| 0 | Core types, board, WAL, amplifier, skills | Nothing (new) |
 | 1 | Fabric ActionKinds, ambient context, awareness skills | Partial Fabric integration |
 | 2 | Inspector, Tester, Engineer, Designer (pipeline) | Pipeline Protocol |
 | 3 | Architect | AcceptanceCriteria, SuccessCriteria, task prompts |

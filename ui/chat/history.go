@@ -156,6 +156,13 @@ type ChatEntry struct {
 	Source                   ChatSource
 	AgentType                string
 	AgentID                  string
+	// RuntimeAgentID is the replica-scoped identity of the agent that
+	// produced this entry, when one is in play (e.g. librarian
+	// "librarian#replica-corr-1"). Empty when the emitter is a
+	// singleton. The resumable-primary matcher requires RuntimeAgentID
+	// equality so two concurrent replicas of the same parent agent
+	// never consolidate onto the same chat row.
+	RuntimeAgentID           string
 	TaskID                   string
 	TaskName                 string
 	TaskSlug                 string
@@ -316,14 +323,55 @@ func (h *History) Full() bool {
 	return h.count == h.capacity
 }
 
-// logicalToPhysical converts a logical index (0 = oldest) to a physical
-// ring buffer index. Caller must hold at least a read lock.
-func (h *History) logicalToPhysical(logical int) int {
-	// When buffer is not full, oldest is at index 0.
-	// When full, oldest is at head (the next to be overwritten).
+// OldestIsStreaming reports whether the entry that the next Push
+// would evict is still actively receiving stream chunks. Callers
+// (handleStreamStart) use this to decide whether to grow the buffer
+// rather than silently drop in-flight work — the same "don't tear
+// down before commit" principle we apply to pipeline state. Returns
+// false when the buffer isn't full (no eviction is imminent).
+func (h *History) OldestIsStreaming() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.count < h.capacity {
+		return false
+	}
+	physical := h.logicalToPhysical(0)
+	return h.entries[physical].Streaming
+}
+
+// Grow expands the buffer capacity by delta (minimum 1) without
+// losing any existing entries. Called when an eviction would drop an
+// actively-streaming entry. Growth is a safety valve — the buffer
+// trims back down implicitly as later eviction cycles overwrite the
+// non-streaming gaps. Safe to call on an empty buffer.
+func (h *History) Grow(delta int) {
+	if delta < 1 {
+		delta = 1
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	newCap := h.capacity + delta
+	expanded := make([]ChatEntry, newCap)
+	for i := 0; i < h.count; i++ {
+		expanded[i] = h.entries[(h.logicalToPhysicalLocked(i))]
+	}
+	h.entries = expanded
+	h.head = h.count
+	h.capacity = newCap
+}
+
+// logicalToPhysicalLocked assumes caller holds h.mu. Extracted so
+// Grow can call it without re-locking.
+func (h *History) logicalToPhysicalLocked(logical int) int {
 	start := 0
 	if h.count == h.capacity {
 		start = h.head
 	}
 	return (start + logical) % h.capacity
+}
+
+// logicalToPhysical converts a logical index (0 = oldest) to a physical
+// ring buffer index. Caller must hold at least a read lock.
+func (h *History) logicalToPhysical(logical int) int {
+	return h.logicalToPhysicalLocked(logical)
 }

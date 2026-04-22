@@ -8,15 +8,15 @@ import (
 )
 
 // =============================================================================
-// Mock HNSW Index
+// Mock VectorIndex
 // =============================================================================
 
-// mockHNSWIndex implements HNSWIndex for testing.
-type mockHNSWIndex struct {
+// mockVectorIndex implements VectorIndex for testing.
+type mockVectorIndex struct {
 	searchFunc func(vector []float32, k int) (ids []string, distances []float32, err error)
 }
 
-func (m *mockHNSWIndex) Search(vector []float32, k int) (ids []string, distances []float32, err error) {
+func (m *mockVectorIndex) Search(vector []float32, k int) (ids []string, distances []float32, err error) {
 	if m.searchFunc != nil {
 		return m.searchFunc(vector, k)
 	}
@@ -28,7 +28,7 @@ func (m *mockHNSWIndex) Search(vector []float32, k int) (ids []string, distances
 // =============================================================================
 
 func TestNewVectorSearcher(t *testing.T) {
-	mock := &mockHNSWIndex{}
+	mock := &mockVectorIndex{}
 	searcher := NewVectorSearcher(mock)
 
 	if searcher == nil {
@@ -57,7 +57,7 @@ func TestNewVectorSearcher_NilIndex(t *testing.T) {
 // =============================================================================
 
 func TestVectorSearcher_Execute_Success(t *testing.T) {
-	mock := &mockHNSWIndex{
+	mock := &mockVectorIndex{
 		searchFunc: func(vector []float32, k int) ([]string, []float32, error) {
 			return []string{"node1", "node2", "node3"},
 				[]float32{0.1, 0.2, 0.5},
@@ -120,7 +120,7 @@ func TestVectorSearcher_Execute_NilIndex(t *testing.T) {
 }
 
 func TestVectorSearcher_Execute_EmptyVector(t *testing.T) {
-	mock := &mockHNSWIndex{}
+	mock := &mockVectorIndex{}
 	searcher := NewVectorSearcher(mock)
 	ctx := context.Background()
 
@@ -135,7 +135,7 @@ func TestVectorSearcher_Execute_EmptyVector(t *testing.T) {
 }
 
 func TestVectorSearcher_Execute_NilVector(t *testing.T) {
-	mock := &mockHNSWIndex{}
+	mock := &mockVectorIndex{}
 	searcher := NewVectorSearcher(mock)
 	ctx := context.Background()
 
@@ -151,7 +151,7 @@ func TestVectorSearcher_Execute_NilVector(t *testing.T) {
 
 func TestVectorSearcher_Execute_ZeroLimit(t *testing.T) {
 	searchCalled := false
-	mock := &mockHNSWIndex{
+	mock := &mockVectorIndex{
 		searchFunc: func(vector []float32, k int) ([]string, []float32, error) {
 			searchCalled = true
 			// With zero limit, should default to 10
@@ -178,7 +178,7 @@ func TestVectorSearcher_Execute_ZeroLimit(t *testing.T) {
 
 func TestVectorSearcher_Execute_NegativeLimit(t *testing.T) {
 	searchCalled := false
-	mock := &mockHNSWIndex{
+	mock := &mockVectorIndex{
 		searchFunc: func(vector []float32, k int) ([]string, []float32, error) {
 			searchCalled = true
 			// With negative limit, should default to 10
@@ -204,9 +204,9 @@ func TestVectorSearcher_Execute_NegativeLimit(t *testing.T) {
 }
 
 func TestVectorSearcher_Execute_SearchError_GracefulDegradation(t *testing.T) {
-	mock := &mockHNSWIndex{
+	mock := &mockVectorIndex{
 		searchFunc: func(vector []float32, k int) ([]string, []float32, error) {
-			return nil, nil, errors.New("HNSW search failed")
+			return nil, nil, errors.New("vector index search failed")
 		},
 	}
 
@@ -227,7 +227,7 @@ func TestVectorSearcher_Execute_SearchError_GracefulDegradation(t *testing.T) {
 }
 
 func TestVectorSearcher_Execute_ContextCancelled(t *testing.T) {
-	mock := &mockHNSWIndex{}
+	mock := &mockVectorIndex{}
 	searcher := NewVectorSearcher(mock)
 	vector := []float32{0.1, 0.2, 0.3}
 
@@ -246,7 +246,7 @@ func TestVectorSearcher_Execute_ContextCancelled(t *testing.T) {
 }
 
 func TestVectorSearcher_Execute_ContextTimeout(t *testing.T) {
-	mock := &mockHNSWIndex{
+	mock := &mockVectorIndex{
 		searchFunc: func(vector []float32, k int) ([]string, []float32, error) {
 			// Simulate slow search
 			time.Sleep(100 * time.Millisecond)
@@ -273,7 +273,7 @@ func TestVectorSearcher_Execute_ContextTimeout(t *testing.T) {
 }
 
 func TestVectorSearcher_Execute_EmptyResults(t *testing.T) {
-	mock := &mockHNSWIndex{
+	mock := &mockVectorIndex{
 		searchFunc: func(vector []float32, k int) ([]string, []float32, error) {
 			return []string{}, []float32{}, nil
 		},
@@ -294,7 +294,7 @@ func TestVectorSearcher_Execute_EmptyResults(t *testing.T) {
 }
 
 func TestVectorSearcher_Execute_MismatchedArrays(t *testing.T) {
-	mock := &mockHNSWIndex{
+	mock := &mockVectorIndex{
 		searchFunc: func(vector []float32, k int) ([]string, []float32, error) {
 			// Return mismatched arrays - more IDs than distances
 			return []string{"node1", "node2", "node3"}, []float32{0.1}, nil
@@ -393,16 +393,16 @@ func TestVectorSearcher_DistanceToScore(t *testing.T) {
 func TestVectorSearcher_IsReady(t *testing.T) {
 	tests := []struct {
 		name     string
-		hnsw     HNSWIndex
+		index    VectorIndex
 		expected bool
 	}{
-		{"with_index", &mockHNSWIndex{}, true},
+		{"with_index", &mockVectorIndex{}, true},
 		{"nil_index", nil, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			searcher := NewVectorSearcher(tt.hnsw)
+			searcher := NewVectorSearcher(tt.index)
 			if got := searcher.IsReady(); got != tt.expected {
 				t.Errorf("IsReady() = %v, want %v", got, tt.expected)
 			}
@@ -428,7 +428,7 @@ func TestVectorSearcher_Execute_LimitPropagation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mock := &mockHNSWIndex{
+			mock := &mockVectorIndex{
 				searchFunc: func(vector []float32, k int) ([]string, []float32, error) {
 					if k != tt.expectedLimit {
 						t.Errorf("k = %d, want %d", k, tt.expectedLimit)

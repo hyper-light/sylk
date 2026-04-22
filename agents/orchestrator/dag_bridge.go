@@ -588,6 +588,12 @@ type pipelineTaskPodDef struct {
 	TaskID   string
 	TaskSlug string
 	Files    []string
+	// RemediatesVersion, when non-zero, tells the pipeline dispatch
+	// layer to pin the task's VFS to this Copy (byte-for-byte
+	// materialization from the rejected merge's state). Populated by
+	// the architect on fix-workflow tasks per docs/PARALLEL_GLOBAL_VFS.md
+	// §3.8.
+	RemediatesVersion versioning.SemanticVersion
 }
 
 func collectPipelineTaskPods(d *dag.DAG) []pipelineTaskPodDef {
@@ -612,6 +618,13 @@ func collectPipelineTaskPods(d *dag.DAG) []pipelineTaskPodDef {
 			def.TaskSlug = taskSlug
 		}
 		def.Files = appendUniqueStrings(def.Files, extractAffectedFiles(node.Context())...)
+		if ver, ok := extractRemediatesVersion(node.Context()); ok {
+			// Multiple nodes in the same task-pod should carry the
+			// same remediates_version (they all belong to one
+			// remediation task). Keep the newest non-zero read so a
+			// stray zero-valued node does not clobber it.
+			def.RemediatesVersion = ver
+		}
 	}
 
 	taskIDs := slices.Sorted(maps.Keys(byTask))
@@ -692,6 +705,36 @@ func extractAffectedFiles(ctx map[string]any) []string {
 	return files
 }
 
+// extractRemediatesVersion reads the "remediates_version" key from a
+// task/node context map. The architect writes this key on fix-workflow
+// tasks produced via audit-rejection remediation (see
+// docs/PARALLEL_GLOBAL_VFS.md §3.8). The value is the string form of a
+// SemanticVersion (e.g. "0.5"). Returns ok=false when the key is
+// absent, empty, or unparseable — the caller treats that as "not a
+// remediation task, dispatch against current green."
+func extractRemediatesVersion(ctx map[string]any) (versioning.SemanticVersion, bool) {
+	if len(ctx) == 0 {
+		return versioning.SemanticVersion{}, false
+	}
+	raw, ok := ctx["remediates_version"]
+	if !ok {
+		return versioning.SemanticVersion{}, false
+	}
+	str, ok := raw.(string)
+	if !ok {
+		return versioning.SemanticVersion{}, false
+	}
+	str = strings.TrimSpace(str)
+	if str == "" {
+		return versioning.SemanticVersion{}, false
+	}
+	ver, err := versioning.ParseSemanticVersion(str)
+	if err != nil || ver.IsZero() {
+		return versioning.SemanticVersion{}, false
+	}
+	return ver, true
+}
+
 func appendUniqueStrings(dst []string, values ...string) []string {
 	if len(values) == 0 {
 		return dst
@@ -740,14 +783,15 @@ func buildTaskAgentPod(
 	volumeManager := containerpod.NewVolumeManager(containerpod.VolumeManagerConfig{
 		Volumes: []containerpod.ManagedVolume{
 			containerpod.NewVFSVolume(containerpod.VFSVolumeConfig{
-				Name:        "workspace",
-				PipelineID:  task.TaskID,
-				SessionID:   versioning.SessionID(sessionID),
-				WorkingDir:  svfs.WorkingDir(),
-				SessionVFS:  svfs,
-				Files:       task.Files,
-				EventLogger: eventLogger,
-				AgentID:     agentID,
+				Name:            "workspace",
+				PipelineID:      task.TaskID,
+				SessionID:       versioning.SessionID(sessionID),
+				WorkingDir:      svfs.WorkingDir(),
+				SessionVFS:      svfs,
+				Files:           task.Files,
+				EventLogger:     eventLogger,
+				AgentID:         agentID,
+				BaseCopyVersion: task.RemediatesVersion,
 			}),
 		},
 		Mounts: map[string]string{

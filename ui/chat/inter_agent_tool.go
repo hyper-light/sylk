@@ -815,12 +815,22 @@ func normalizeChallengeTargetsForScope(targets []string, scope string) []string 
 }
 
 // challengeThreadKey computes a challenge-dispatch ThreadKey from explicit
-// values on the event payload. It requires either a pre-computed `thread_key`
-// or an explicit `protocol_scope` — no tool-name-based guessing. Producers
-// stamp protocol_scope onto challenge dispatch outputs (see
-// pipelineTurnSelectionResult, global_review_protocol.go); empty return
-// means the event is missing the scope and the UI falls back to
-// non-ThreadKey-based consolidation.
+// values on the event payload. Priority:
+//
+//  1. Pre-computed `thread_key` on args or output.
+//  2. `challenge_id` + known `protocol_scope` (pipeline / global_review)
+//     → produces the scoped key matching the response side.
+//  3. Bare `challenge_id` → used as the ThreadKey directly (last-resort
+//     fallback for challenges that omit protocol_scope — e.g., generic
+//     cross-agent challenges like challenge_peer). Without this
+//     fallback the challenge row has no ThreadKey and the response-side
+//     origin-update cannot find it, leaving the row's timer ticking
+//     forever even after the peer has responded.
+//
+// Producers SHOULD stamp protocol_scope on challenge dispatch outputs
+// (see pipelineTurnSelectionResult, global_review_protocol.go) so the
+// scoped branch matches; the bare-challenge_id fallback exists as a
+// correctness safety net, not as the canonical path.
 func challengeThreadKey(_ string, args, output map[string]any) string {
 	if explicit := firstNonEmptyString(stringFromMap(output, "thread_key"), stringFromMap(args, "thread_key")); explicit != "" {
 		return explicit
@@ -835,7 +845,7 @@ func challengeThreadKey(_ string, args, output map[string]any) string {
 	case "pipeline":
 		return pipelineThreadPrefix + challengeID
 	}
-	return ""
+	return challengeID
 }
 
 func firstKnownChallengeAgentInName(name string) string {

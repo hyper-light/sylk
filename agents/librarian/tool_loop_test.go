@@ -28,6 +28,54 @@ func (m *mockProvider) Complete(_ context.Context, _ *providers.Request) (*provi
 	return resp, nil
 }
 
+// Stream adapts the canned responses into a single-shot stream so
+// the mock satisfies LibrarianProvider (which now requires Stream
+// because the tool loop always streams). Text and tool calls are
+// decomposed into the chunk sequence StreamAccumulator expects:
+// ChunkTypeStart → text chunks → tool-call start/delta pairs →
+// ChunkTypeEnd (with usage). The collector reconstructs a Response
+// indistinguishable from Complete.
+func (m *mockProvider) Stream(_ context.Context, _ *providers.Request) (<-chan *providers.StreamChunk, error) {
+	if m.calls >= len(m.responses) {
+		return nil, fmt.Errorf("mock provider: no more responses (called %d times)", m.calls+1)
+	}
+	resp := m.responses[m.calls]
+	m.calls++
+	ch := make(chan *providers.StreamChunk, 8)
+	go func() {
+		defer close(ch)
+		ch <- &providers.StreamChunk{Type: providers.ChunkTypeStart}
+		if resp == nil {
+			ch <- &providers.StreamChunk{Type: providers.ChunkTypeEnd}
+			return
+		}
+		if resp.Content != "" {
+			ch <- &providers.StreamChunk{Type: providers.ChunkTypeText, Text: resp.Content}
+		}
+		for _, tc := range resp.ToolCalls {
+			ch <- &providers.StreamChunk{
+				Type: providers.ChunkTypeToolStart,
+				ToolCall: &providers.ToolCallChunk{
+					ID:   tc.ID,
+					Name: tc.Name,
+				},
+			}
+			ch <- &providers.StreamChunk{
+				Type: providers.ChunkTypeToolDelta,
+				ToolCall: &providers.ToolCallChunk{
+					ID:             tc.ID,
+					ArgumentsDelta: tc.Arguments,
+				},
+			}
+		}
+		ch <- &providers.StreamChunk{
+			Type:  providers.ChunkTypeEnd,
+			Usage: &resp.Usage,
+		}
+	}()
+	return ch, nil
+}
+
 // newTestLibrarian creates a minimal Librarian with a mock provider and
 // an echo skill for tool loop testing.
 func newTestLibrarian(provider LibrarianProvider) *Librarian {

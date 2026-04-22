@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/llmruntime"
 )
 
@@ -50,6 +51,12 @@ type conversationFlowState struct {
 	agents        map[string]conversationAgentState
 	pending       *pendingPlan // Architect plan awaiting user approval.
 	work          sessionWorkState
+
+	// Session-scoped claims board. Holds conversation-level actions
+	// (user prompts, routing classifications). Created lazily on
+	// first user input. Projects to the Fabric via the standard
+	// BoardAmplifier path.
+	claimsBoard *claims.ClaimsBoard
 }
 
 // pendingPlan tracks an architect plan awaiting user approval.
@@ -507,6 +514,71 @@ func (m *ConversationFlowManager) HistoryForSession(sessionID string) []Conversa
 // HistoryForSessionAgent returns a chronological copy of turns for the specified
 // agent within a session. If agentID is empty or non-conversational, the active
 // session agent is used.
+// SessionClaimsBoard returns the claims board for the given session,
+// creating it lazily on first access. The board persists for the
+// session's lifetime and projects to the Fabric via the standard
+// amplifier path.
+// SessionClaimsBoard returns the claims board for the given session,
+// creating it lazily on first access. The board persists for the
+// session's lifetime and projects to the Fabric via the standard
+// amplifier path.
+// SessionClaimsBoard returns the claims board for the given session,
+// creating it lazily on first access. The scope is used for async
+// subscriber notifications on the board.
+func (m *ConversationFlowManager) SessionClaimsBoard(sessionID string, scope claims.ScopeProvider) *claims.ClaimsBoard {
+	trimmedSession := strings.TrimSpace(sessionID)
+	if trimmedSession == "" {
+		return nil
+	}
+
+	// Fast path: read lock check.
+	m.mu.RLock()
+	state, ok := m.sessions[trimmedSession]
+	if ok && state.claimsBoard != nil {
+		board := state.claimsBoard
+		m.mu.RUnlock()
+		return board
+	}
+	m.mu.RUnlock()
+
+	// Slow path: write lock, create board.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	state, ok = m.sessions[trimmedSession]
+	if !ok {
+		state = conversationFlowState{
+			agents: make(map[string]conversationAgentState),
+		}
+	}
+	if state.claimsBoard == nil {
+		state.claimsBoard = claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+			BoardID:   "session-" + trimmedSession,
+			SessionID: trimmedSession,
+			TaskID:    "session",
+			Scope:     scope,
+		})
+	}
+	m.sessions[trimmedSession] = state
+	return state.claimsBoard
+}
+
+// SessionClaimsBoardID returns the board ID for the session, or empty
+// if no board exists yet. Does not create the board.
+func (m *ConversationFlowManager) SessionClaimsBoardID(sessionID string) string {
+	trimmedSession := strings.TrimSpace(sessionID)
+	if trimmedSession == "" {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	state, ok := m.sessions[trimmedSession]
+	if !ok || state.claimsBoard == nil {
+		return ""
+	}
+	return state.claimsBoard.BoardID()
+}
+
 func (m *ConversationFlowManager) HistoryForSessionAgent(sessionID, agentID string) []ConversationTurn {
 	if m == nil {
 		return nil

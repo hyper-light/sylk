@@ -1678,17 +1678,6 @@ func globalReviewAcceptCheckpointSkill(cfg GlobalReviewProtocolSkillConfig) *ski
 			if _, ok := finalizeGlobalReviewValidationReady(state.Snapshot(), state.ProcessedValidations()); !ok {
 				return nil, fmt.Errorf("accept_checkpoint requires a passing tester-backed global review first")
 			}
-			views := cfg.WorkspaceViews()
-			if views == nil {
-				return nil, fmt.Errorf("workspace views are unavailable")
-			}
-			svfs := versioning.SessionForWorkspaceViews(ctx, views)
-			if svfs == nil {
-				return nil, fmt.Errorf("session VFS is unavailable for accept_checkpoint")
-			}
-			if _, _, err := svfs.AcceptActiveReviewCandidate(ctx, "global-review"); err != nil {
-				return nil, err
-			}
 			action := &GlobalReviewTurnAction{
 				Type:      GlobalReviewActionAccept,
 				AgentType: GlobalReviewAgentInspector,
@@ -1762,16 +1751,7 @@ func globalReviewDiscardCheckpointSkill(cfg GlobalReviewProtocolSkillConfig) *sk
 			if reason == "" {
 				return nil, fmt.Errorf("reason is required")
 			}
-			views := cfg.WorkspaceViews()
-			if views == nil {
-				return nil, fmt.Errorf("workspace views are unavailable")
-			}
-			svfs := versioning.SessionForWorkspaceViews(ctx, views)
-			if svfs == nil {
-				return nil, fmt.Errorf("session VFS is unavailable for discard_checkpoint")
-			}
 			candidateID := strings.TrimSpace(params.CandidateID)
-			svfs.DiscardReviewCandidate(candidateID)
 			return map[string]any{
 				"discarded":    true,
 				"candidate_id": candidateID,
@@ -1819,9 +1799,6 @@ func globalReviewCommitToDiskSkill(cfg GlobalReviewProtocolSkillConfig) *skills.
 			svfs := versioning.SessionForWorkspaceViews(ctx, views)
 			if svfs == nil {
 				return nil, fmt.Errorf("session VFS is unavailable for commit_to_disk")
-			}
-			if _, _, err := svfs.AcceptActiveReviewCandidate(ctx, "global-review"); err != nil {
-				return nil, err
 			}
 			authReq := commandapproval.Request{
 				Command:        fmt.Sprintf("commit_to_disk --reason %q", summary),

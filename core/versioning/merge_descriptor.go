@@ -41,6 +41,56 @@ type MergeDescriptor struct {
 
 	// MergedAt is the wall-clock timestamp of merge completion.
 	MergedAt time.Time
+
+	// PipelineCertificate is the pipeline inspector's declaration of
+	// its local review result — what scope the pipeline accepted,
+	// which concerns it surfaced, its summary, and the tester
+	// verdict it relied on. The global audit replica reads this
+	// alongside the diff to decide whether the pipeline's local
+	// attestation aligns with the cross-pipeline coherence picture.
+	// Empty when the pipeline inspector did not emit a certificate
+	// (legacy paths; not expected under the handoff_to_green flow).
+	PipelineCertificate PipelineInspectorCertificate
+
+	// AuditAddendum is true when this descriptor was produced by a
+	// ReplicaVFS seal, not by a pipeline inspector handoff. Per
+	// docs/PARALLEL_GLOBAL_VFS.md §3.7, audit-addendum merges
+	// carry the inspector + tester writes that accompany a merge.
+	// The audit coordinator checks this flag and does NOT spawn
+	// replicas for addenda (they're already audited — the verdict
+	// that produced the addendum IS the audit decision).
+	AuditAddendum bool
+
+	// SupersedesVersion is the MergedVersion of a previously-rejected
+	// merge whose slot this descriptor claims. Populated when the
+	// producing pipeline was dispatched as a remediation: its
+	// BeginPipelineConfig.BaseCopyVersion pinned to the rejected
+	// merge's Copy and the commit queue still tracks that entry in
+	// Rejected state. When this descriptor's audit accepts, the
+	// coordinator calls CommitQueue.MarkSuperseded(SupersedesVersion,
+	// MergedVersion) to transition the rejected slot and advance the
+	// commit resolver. See docs/PARALLEL_GLOBAL_VFS.md §3.8.
+	//
+	// Zero-value when this descriptor is not a remediation (the
+	// normal-dispatch path).
+	SupersedesVersion SemanticVersion
+}
+
+// PipelineInspectorCertificate is the pipeline inspector's structured
+// attestation accompanying handoff_to_green. Design §6.3.
+type PipelineInspectorCertificate struct {
+	// DeclaredScope summarizes what the pipeline accepts as "done"
+	// (e.g. "implemented fn A in pkg/x", "added tests for case Y").
+	DeclaredScope string
+	// OpenConcerns are issues the pipeline inspector flagged but did
+	// not treat as blocking (e.g. "minor lint warnings in pkg/y").
+	OpenConcerns []string
+	// Summary is the pipeline inspector's prose review summary.
+	Summary string
+	// TesterVerdict records the pipeline-level tester's outcome (if
+	// one ran). Values: "pass", "skip", "fail" (fail shouldn't reach
+	// handoff; included for completeness).
+	TesterVerdict string
 }
 
 // mergeLog is the in-memory ordered log of MergeDescriptors for a

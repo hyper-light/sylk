@@ -39,7 +39,7 @@ func TestParseSource(t *testing.T) {
 		expectOk  bool
 	}{
 		{"bleve", "bleve", SourceBleve, true},
-		{"hnsw", "hnsw", SourceHNSW, true},
+		{"vector", "vector", SourceVector, true},
 		{"graph", "graph", SourceGraph, true},
 		{"combined", "combined", SourceCombined, true},
 		{"invalid", "invalid", Source(0), false},
@@ -65,7 +65,7 @@ func TestSource_IsValid(t *testing.T) {
 		expected bool
 	}{
 		{"valid_bleve", SourceBleve, true},
-		{"valid_hnsw", SourceHNSW, true},
+		{"valid_vector", SourceVector, true},
 		{"valid_graph", SourceGraph, true},
 		{"valid_combined", SourceCombined, true},
 		{"invalid", Source(99), false},

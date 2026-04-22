@@ -14,13 +14,9 @@ type Source int
 
 const (
 	SourceBleve    Source = 0
-	SourceVector   Source = 1 // Vector similarity search (IVF+BBQ+Vamana)
+	SourceVector   Source = 1 // Vector similarity search (Vamana/DiskANN + IVF/BBQ)
 	SourceGraph    Source = 2
 	SourceCombined Source = 3
-
-	// SourceHNSW is an alias for SourceVector for backward compatibility.
-	// Deprecated: Use SourceVector instead.
-	SourceHNSW = SourceVector
 )
 
 // ValidSources returns all valid Source values.
@@ -62,7 +58,7 @@ func ParseSource(value string) (Source, bool) {
 	switch value {
 	case "bleve":
 		return SourceBleve, true
-	case "vector", "hnsw": // "hnsw" for backward compatibility
+	case "vector":
 		return SourceVector, true
 	case "graph":
 		return SourceGraph, true

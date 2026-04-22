@@ -10,8 +10,9 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -81,33 +82,16 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	}) {
 		pi.skills.Register(skill)
 	}
-	// Activity Fabric: uniform awareness skills + cross-pipeline
-	// primitives + audit-time inspect_open_activity. The audit skill
-	// is inspector-only — it's how the inspector detects unresolved
-	// cross-pipeline disputes blocking acceptance.
-	for _, skill := range fabric.AwarenessSkills(fabric.AwarenessSkillConfig{
+	// Activity Fabric: uniform awareness skills + audit-time
+	// inspect_open_activity. These are registered regardless of whether
+	// the pipeline is claims-based or protocol-based.
+	fabricCfg := fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,
 		SessionID:      func() string { return pi.config.SessionID },
 		AgentID:        func() string { return pi.id },
 		AgentType:      func() string { return "inspector-pipeline" },
-	}) {
-		pi.skills.Register(skill)
 	}
-	for _, skill := range agentShared.CrossPipelineSkills(agentShared.CrossPipelineSkillConfig{
-		SessionID:  func() string { return pi.config.SessionID },
-		AgentID:    func() string { return pi.id },
-		AgentType:  func() string { return "inspector-pipeline" },
-		PipelineID: func() string { return pi.pipelineID },
-		RouteSync: agentShared.RouteSyncFromBus(
-			func() guide.EventBus { return pi.bus },
-			func() string {
-				if pi.channels == nil {
-					return ""
-				}
-				return pi.channels.Responses
-			},
-		),
-	}) {
+	for _, skill := range fabric.AwarenessSkills(fabricCfg) {
 		pi.skills.Register(skill)
 	}
 	for _, skill := range fabric.InspectorAuditSkills(fabric.InspectorAuditSkillConfig{
@@ -127,27 +111,22 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	}) {
 		pi.skills.Register(skill)
 	}
-	for _, skill := range agentShared.PipelineProtocolSkills(agentShared.PipelineProtocolSkillConfig{
-		AgentType:      func() string { return "inspector-pipeline" },
-		AgentID:        func() string { return pi.id },
-		InspectorOT:    true,
-		WorkspaceViews: func() versioning.WorkspaceViewAccess { return pi.workspaceViews },
-		// Inspector-owned VFS authority — handoff_to_ot and discard_pipeline
-		// invoke this committer directly so the orchestrator no longer reacts
-		// to "succeeded" / "failed" pipeline broadcasts to mutate VFS state.
-		// Lazy because the wiring code (cmd/tui.go) calls SetPipelineCommitter
-		// after agent construction.
-		Committer: func() agentShared.PipelineCommitter { return pi.pipelineCommitter },
-		Route: agentShared.PipelineProtocolRouteConfig{
-			BusProvider: func() guide.EventBus { return pi.bus },
-			SessionID:   func() string { return pi.config.SessionID },
-			PublishReroute: func(ctx context.Context, toAgentID, reason, newCorrelationID string) {
-				agentShared.PublishPipelineHandoffReroute(pi.bus, pi.channels, ctx, "inspector-pipeline", toAgentID, reason, newCorrelationID)
-			},
-		},
-	}) {
+
+	// ── Claims skills (unconditional) ──────────────────────────────
+	//
+	// Every pipeline uses claims. No legacy protocol path.
+	boardProvider := func() *claims.ClaimsBoard { return pi.claimsBoard }
+	pi.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	pi.skills.Register(claims.PostActionSkill(boardProvider))
+	pi.skills.Register(claims.EvaluateValidationSkill(boardProvider))
+	pi.skills.Register(claims.PostRemediationClaimsSkill(boardProvider))
+	pi.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+
+	// Fabric claims awareness skills (cross-pipeline visibility).
+	for _, skill := range fabric.ClaimsAwarenessSkills(fabricCfg) {
 		pi.skills.Register(skill)
 	}
+
 
 	// Diagnostics
 	pi.skills.Register(agentShared.NewSelfDiagnosticSkill(&pipelineInspectorDiag{pi: pi}))

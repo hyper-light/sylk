@@ -771,7 +771,9 @@ func TestFileWAL_AppendReplayRoundtrip(t *testing.T) {
 		t.Fatalf("close first: %v", err)
 	}
 
-	// Reopen and verify state is restored.
+	// Reopen and verify state is restored. New() intentionally does
+	// NOT replay; callers that want historical reconstruction invoke
+	// ReplayFromWAL() explicitly.
 	w2, err := OpenFileWAL(path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -781,6 +783,10 @@ func TestFileWAL_AppendReplayRoundtrip(t *testing.T) {
 		t.Fatalf("restore: %v", err)
 	}
 	t.Cleanup(func() { _ = a2.Close() })
+
+	if err := a2.ReplayFromWAL(); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
 
 	gotA := a2.ByKey(AccountingKey{Container: g.Key(), Task: tkA.UID()})
 	if gotA.Input != 100 || gotA.Output != 50 || gotA.ErrorCount != 1 {
@@ -824,12 +830,20 @@ func TestFileWAL_SkipsCorruptLines(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = a.Close() })
 
-	// No records loaded — state is clean.
+	// New() does not replay, so state starts empty even when the
+	// backing file contains (garbage) records.
 	if len(a.All()) != 0 {
-		t.Fatalf("replayed corrupt lines: %+v", a.All())
+		t.Fatalf("unexpected state before explicit replay: %+v", a.All())
+	}
+	// Explicit replay must tolerate and skip the corrupt lines.
+	if err := a.ReplayFromWAL(); err != nil {
+		t.Fatalf("replay tolerated corrupt lines but returned error: %v", err)
+	}
+	if len(a.All()) != 0 {
+		t.Fatalf("corrupt-line replay produced state: %+v", a.All())
 	}
 
-	// Append a real record; subsequent replay should see it.
+	// Append a real record; a fresh accountant's ReplayFromWAL should see it.
 	f, _ := newTestFactory(t, "sess-1")
 	g := mustMint(t, f, identity.AgentTypeGuide, "guide", identity.PodTypeDaemon, "")
 	tk := mustNewTask(t, f, "c", nil, "")
@@ -847,6 +861,9 @@ func TestFileWAL_SkipsCorruptLines(t *testing.T) {
 		t.Fatalf("new2: %v", err)
 	}
 	t.Cleanup(func() { _ = a2.Close() })
+	if err := a2.ReplayFromWAL(); err != nil {
+		t.Fatalf("replay2: %v", err)
+	}
 	if got := a2.ByKey(AccountingKey{Container: g.Key(), Task: tk.UID()}); got.Input != 10 {
 		t.Fatalf("after corrupt skip: %+v", got)
 	}

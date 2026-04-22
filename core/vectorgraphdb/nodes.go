@@ -52,14 +52,6 @@ type VectorIndexInserter interface {
 	DeleteBatch(ids []string) error
 }
 
-// HNSWInsertError is an alias for VectorIndexInsertError for backward compatibility.
-// Deprecated: Use VectorIndexInsertError instead.
-type HNSWInsertError = VectorIndexInsertError
-
-// HNSWInserter is an alias for VectorIndexInserter for backward compatibility.
-// Deprecated: Use VectorIndexInserter instead.
-type HNSWInserter = VectorIndexInserter
-
 // NodeStore provides CRUD operations for graph nodes in VectorGraphDB.
 // It manages both the SQLite persistence and vector index synchronization.
 //

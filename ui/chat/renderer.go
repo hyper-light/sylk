@@ -135,20 +135,52 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme, cache *codeBlockC
 
 	// Phase 2c: Trailing activity indicator. When the stream is still open
 	// and the agent has announced an activity state (receiving, reasoning,
-	// awaiting_peer_response, composing_response, etc.), render the status
-	// as a subtle italic line below the content so the user sees that work
-	// is ongoing even after text has started streaming. This is the
-	// canonical "between LLM turns" indicator — the same ThinkingStatus
-	// field that drives Phase 1 when Content is empty; the difference here
-	// is that we surface it alongside content so inter-turn gaps are
-	// visually bridged without introducing a separate event channel.
+	// awaiting_peer_response, composing_response, etc.), render the
+	// "agent is working" line below the content so the user sees that
+	// work is ongoing even after text has started streaming. This is
+	// the canonical "between LLM turns" indicator — the same
+	// ThinkingText + ThinkingStatus fields that drive Phase 1 when
+	// Content is empty; the difference here is that we surface them
+	// alongside content so inter-turn gaps are visually bridged
+	// without introducing a separate event channel.
+	//
+	// The indicator uses the SAME animated style as Phase 1 — the
+	// spinner frame and elapsed timer embedded in ThinkingText, with
+	// ThinkingColor sampled from the gradient each tick — so the user
+	// sees a live animation, not a static gray bullet. Previously this
+	// path used the Muted palette + a static summary glyph, which made
+	// the parent agent look idle while it was actively working
+	// (parent-engineer bug: no animation, gray text, no timer while
+	// inter-agent children were still pending).
 	var trailingActivityLines []string
 	if entry.Streaming && strings.TrimSpace(entry.Content) != "" {
-		if status := strings.TrimSpace(entry.ThinkingStatus); status != "" {
-			activityStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted).Italic(true)
-			trailingActivityLines = wrapLine(thinkingSummaryGlyph+" "+status, width, activityStyle)
-			if len(trailingActivityLines) > thinkingStatusMaxLines {
-				trailingActivityLines = capLines(trailingActivityLines, thinkingStatusMaxLines, width, activityStyle)
+		status := strings.TrimSpace(entry.ThinkingStatus)
+		spinnerAndTimer := strings.TrimSpace(entry.ThinkingText)
+		if status != "" || spinnerAndTimer != "" {
+			color := th.Palette.Info
+			if entry.ThinkingColor != "" {
+				color = lipgloss.Color(entry.ThinkingColor)
+			}
+			activityStyle := lipgloss.NewStyle().Foreground(color).Italic(true)
+
+			// Render "<spinner>  <elapsed>  <status>" as the parent
+			// agent's active-work indicator. spinner+timer comes from
+			// ThinkingText (tickThinking updates it each frame);
+			// status is the explicit activity message.
+			indicatorText := ""
+			switch {
+			case spinnerAndTimer != "" && status != "":
+				indicatorText = spinnerAndTimer + "  " + status
+			case spinnerAndTimer != "":
+				indicatorText = spinnerAndTimer
+			case status != "":
+				indicatorText = thinkingSummaryGlyph + " " + status
+			}
+			if indicatorText != "" {
+				trailingActivityLines = wrapLine(indicatorText, width, activityStyle)
+				if len(trailingActivityLines) > thinkingStatusMaxLines {
+					trailingActivityLines = capLines(trailingActivityLines, thinkingStatusMaxLines, width, activityStyle)
+				}
 			}
 		}
 	}

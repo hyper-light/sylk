@@ -22,6 +22,7 @@ import (
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
@@ -34,8 +35,12 @@ import (
 
 // globalTesterProvider is the minimal interface the GlobalTester needs.
 // Satisfied by *providers.OpenAIProvider and *gateway.GatewayProvider.
+// Streaming is mandatory — the global tester is a chattable full-LLM
+// agent; its tool loop calls Stream on every turn so thinking + text
+// chunks surface in the chat panel as they arrive.
 type globalTesterProvider interface {
 	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
+	Stream(ctx context.Context, req *providers.Request) (<-chan *providers.StreamChunk, error)
 }
 
 // GlobalTester architects and runs integration/e2e/cross-cutting tests
@@ -77,6 +82,9 @@ type GlobalTester struct {
 	running       bool
 	knownAgentsMu sync.RWMutex
 	knownAgents   map[string]*guide.AgentAnnouncement
+	// sessionVFSGetter resolves the current session VFS at audit
+	// time. Mirrors the global inspector's pattern.
+	sessionVFSGetter func() *versioning.SessionVFS
 
 	// Handoff integration.
 	handoffBridge *handoff.HandoffBridge
@@ -101,6 +109,13 @@ type GlobalTester struct {
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
 	requestSerializer *agentshared.RequestSerializer
+
+	// activityPub is the chat-panel activity stream. Mirrors the
+	// librarian/academic pattern: the global tester emits
+	// VisibilityUser activity at user-relevant lifecycle points
+	// (request received, completion, error) so its work shows up in
+	// the TUI chat panel alongside the knowledge-tier agents.
+	activityPub events.ActivityPublisher
 }
 
 // New creates a new GlobalTester instance.
@@ -124,6 +139,7 @@ func New(cfg shared.GlobalTesterConfig, provider providers.ProviderAdapter) (*Gl
 		steering:          agentshared.NewSteeringManager(),
 		requestSerializer: agentshared.NewRequestSerializer(),
 		executionBroker:   purevfs.DefaultExecutionBroker(),
+		activityPub:       cfg.ActivityPub,
 	}
 
 	gt.factory = cfg.Factory
@@ -429,6 +445,28 @@ func (gt *GlobalTester) registerCoreSkills() {
 		gt.skills.Register(skill)
 	}
 
+	// Per-merge audit skills (docs/PARALLEL_GLOBAL_VFS.md §6.4):
+	// emit_audit_decision is the terminal tool the tester calls at
+	// the end of a per-merge audit; merges_after lets it see
+	// concurrent merges landing in parallel.
+	gt.skills.Register(agentshared.NewEmitAuditDecisionSkill(agentshared.EmitAuditDecisionSkillConfig{
+		ContextResolver: func(ctx context.Context) (agentshared.AuditMergeContext, bool) {
+			return agentshared.AuditMergeContextFromContext(ctx)
+		},
+	}))
+	gt.skills.Register(agentshared.NewMergesAfterSkill(agentshared.MergesAfterSkillConfig{
+		LogReader: func() agentshared.MergeLogReader {
+			if gt.sessionVFSGetter == nil {
+				return nil
+			}
+			sess := gt.sessionVFSGetter()
+			if sess == nil {
+				return nil
+			}
+			return sess
+		},
+	}))
+
 	// Diagnostics
 	gt.skills.Register(agentshared.NewSelfDiagnosticSkill(&globalTesterDiag{gt: gt}))
 
@@ -501,6 +539,11 @@ func (gt *GlobalTester) Start(bus guide.EventBus) error {
 		return fmt.Errorf("subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
+	// Per-merge audit dispatch is direct: the session's
+	// MergeAuditCoordinator calls gt.SpawnAuditReplica(ctx, req)
+	// for every merge completed by MergePipelineIntoGreen. No bus
+	// subscription for AuditMergeRequest.
+
 	gt.running = true
 	gt.logger.Info("global tester started", "id", gt.id)
 	return nil
@@ -560,6 +603,15 @@ func (gt *GlobalTester) unsubRegistry() error {
 	err := gt.registrySub.Unsubscribe()
 	gt.registrySub = nil
 	return err
+}
+
+// SetSessionVFS wires the tester to its session's versioning
+// subsystem. Called by the orchestrator during bootstrap. Mirrors
+// the global inspector's SetSessionVFS. The getter pattern keeps
+// SessionVFS optional until assigned — audits buffered by the bus
+// before bootstrap drain once the subscription activates.
+func (gt *GlobalTester) SetSessionVFS(getter func() *versioning.SessionVFS) {
+	gt.sessionVFSGetter = getter
 }
 
 // Handle processes a forwarded request, dispatching by intent.
@@ -732,6 +784,7 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	if !fwd.FireAndForget {
 		gt.publishStreamStart(ctx)
 	}
+	gt.publishChatActivity(fwd.SessionID, events.EventTypeAgentAction, "Processing validation request")
 
 	result, err := gt.Handle(ctx, fwd)
 	agentshared.LogResponse(gt.steering.EventLogger(), fwd.CorrelationID, gt.id, fwd.SessionID, time.Since(startTime), err)
@@ -754,6 +807,7 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
+		gt.publishChatActivity(fwd.SessionID, events.EventTypeAgentError, fmt.Sprintf("Validation failed: %s", err.Error()))
 		if streamErr := gt.publishStreamError(ctx, err); streamErr != nil {
 			gt.logger.Warn("global_tester_stream_error_publish_failed",
 				"correlation_id", fwd.CorrelationID,
@@ -790,6 +844,7 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 		completeText = ""
 	}
 	gt.publishStreamComplete(ctx, completeText, usageAcc.Total(), directive)
+	gt.publishChatActivity(fwd.SessionID, events.EventTypeSuccess, "Validation task completed")
 
 	result = agentshared.WrapGlobalReviewTurnResult(ctx, result)
 	resp.Data = result
@@ -835,6 +890,22 @@ func (gt *GlobalTester) handleRegistryAnnouncement(msg *guide.Message) error {
 
 func (gt *GlobalTester) generateMessageID() string {
 	return fmt.Sprintf("gt_msg_%s", uuid.New().String()[:8])
+}
+
+// publishChatActivity emits a user-facing activity event for the chat
+// panel. Mirrors librarian.publishReplicaActivityForSession — the
+// global tester is a singleton (no replica pool) so it omits the
+// pool-snapshot metadata that knowledge agents include.
+func (gt *GlobalTester) publishChatActivity(sessionID string, eventType events.EventType, content string) {
+	if gt == nil || gt.activityPub == nil {
+		return
+	}
+	evt := events.NewActivityEvent(eventType, strings.TrimSpace(sessionID), content)
+	evt.AgentID = gt.id
+	evt.Visibility = events.VisibilityUser
+	evt.Data["agent_type"] = "tester"
+	evt.Data["agent_name"] = "Tester"
+	gt.activityPub.PublishActivity(evt)
 }
 
 func (gt *GlobalTester) knownAgentIDByType(agentType, fallback string) string {

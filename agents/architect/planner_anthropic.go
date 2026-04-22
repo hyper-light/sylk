@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/adalundhe/sylk/core/dag"
+	"github.com/google/uuid"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	promptskill "github.com/adalundhe/sylk/core/promptskills"
 	"github.com/adalundhe/sylk/core/providers"
@@ -1393,7 +1394,10 @@ type taskPayload struct {
 	MaxReviewRounds   int                 `json:"max_review_rounds,omitempty"`
 	AgentScopes       []agentScopePayload `json:"agent_scopes,omitempty"`
 
-	// Rich specification fields.
+	// Claims: precise, atomic assertions with validations.
+	Claims []claimPayload `json:"claims,omitempty"`
+
+	// Rich specification fields (legacy — claims supersede these).
 	AcceptanceCriteria  []acceptanceCriterionPayload `json:"acceptance_criteria"`
 	Guidelines          []string                     `json:"guidelines"`
 	ImplementationGuide string                       `json:"implementation_guide"`
@@ -1424,6 +1428,30 @@ type taskFileTargetPayload struct {
 	Path      string `json:"path"`
 	Operation string `json:"operation"`
 	Reason    string `json:"reason"`
+}
+
+type claimPayload struct {
+	ID          string                    `json:"id,omitempty"`
+	Title       string                    `json:"title"`
+	Description string                    `json:"description"`
+	Subject     string                    `json:"subject"`
+	Scope       []claimScopePayload       `json:"scope,omitempty"`
+	Validations []claimValidationPayload  `json:"validations"`
+	DependsOn   []string                  `json:"depends_on,omitempty"`
+	Priority    int                       `json:"priority,omitempty"`
+	Tags        []string                  `json:"tags,omitempty"`
+}
+
+type claimScopePayload struct {
+	Kind string `json:"kind"`
+	Key  string `json:"key"`
+}
+
+type claimValidationPayload struct {
+	ID          string `json:"id,omitempty"`
+	Description string `json:"description"`
+	QualityBar  string `json:"quality_bar"`
+	Type        string `json:"type"`
 }
 
 type agentScopePayload struct {
@@ -1500,7 +1528,102 @@ func (p taskPayload) toTask(index int) *AtomicTask {
 		task.AgentScopes = toAgentScopes(p.AgentScopes)
 	}
 
+	// Convert claims when present.
+	task.Claims = toTaskClaims(p.Claims)
+
 	return task
+}
+
+func toTaskClaims(payloads []claimPayload) []TaskClaim {
+	if len(payloads) == 0 {
+		return nil
+	}
+	claims := make([]TaskClaim, 0, len(payloads))
+	for _, p := range payloads {
+		id := strings.TrimSpace(p.ID)
+		if id == "" {
+			id = uuid.NewString()
+		}
+		subject := normalizeClaimSubject(p.Subject)
+		c := TaskClaim{
+			ID:          id,
+			Title:       strings.TrimSpace(p.Title),
+			Description: strings.TrimSpace(p.Description),
+			Subject:     subject,
+			DependsOn:   nonEmptySlice(p.DependsOn),
+			Priority:    p.Priority,
+			Tags:        nonEmptySlice(p.Tags),
+		}
+		for _, sp := range p.Scope {
+			kind := strings.TrimSpace(sp.Kind)
+			key := strings.TrimSpace(sp.Key)
+			if kind != "" && key != "" {
+				c.Scope = append(c.Scope, TaskClaimScope{Kind: kind, Key: key})
+			}
+		}
+		for _, vp := range p.Validations {
+			vid := strings.TrimSpace(vp.ID)
+			if vid == "" {
+				vid = uuid.NewString()
+			}
+			c.Validations = append(c.Validations, TaskClaimValidation{
+				ID:          vid,
+				Description: strings.TrimSpace(vp.Description),
+				QualityBar:  strings.TrimSpace(vp.QualityBar),
+				Type:        normalizeValidationType(vp.Type),
+			})
+		}
+		if len(c.Validations) == 0 {
+			slog.Warn("architect_claim_no_validations",
+				"claim_id", c.ID,
+				"title", c.Title,
+				"subject", c.Subject,
+			)
+		}
+		claims = append(claims, c)
+	}
+	return claims
+}
+
+func normalizeClaimSubject(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "eng", "engineer":
+		return "engineer"
+	case "design", "designer":
+		return "designer"
+	case "test", "tester", "tester-pipeline":
+		return "tester-pipeline"
+	default:
+		return strings.TrimSpace(raw)
+	}
+}
+
+func normalizeValidationType(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "test":
+		return "test"
+	case "inspection", "inspect", "review":
+		return "inspection"
+	case "integration":
+		return "integration"
+	case "contract", "api":
+		return "contract"
+	case "design", "ux":
+		return "design"
+	case "regression":
+		return "regression"
+	case "receipt":
+		return "receipt"
+	default:
+		// Pass through unknown types — ValidationType is a string,
+		// not a closed enum. Unknown values are valid; the evaluator
+		// handles them based on the description and quality bar.
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return "inspection"
+		}
+		return trimmed
+	}
 }
 
 func parseCollaborationMode(raw string) dag.CollaborationMode {

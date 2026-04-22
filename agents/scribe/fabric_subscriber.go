@@ -133,7 +133,7 @@ func (s *Scribe) batchAdmit(a activity.AgentActivity) {
 //   - emphasized kind: any activity matching profile.EmphasizeKinds
 //   - turn boundary: terminal protocol activities (handoff_next,
 //     finalize_pipeline, validate_work, finalize_global_review,
-//     handoff_to_ot, etc.)
+//     handoff_to_green, etc.)
 //   - causal closing: a *_completed/*_resolved/*_accepted/*_response
 //     activity that closes a previously-in-flight one this batch saw
 //   - batch size: len(batch.activities) >= profile.BatchSize

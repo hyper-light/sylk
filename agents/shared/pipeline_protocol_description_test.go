@@ -11,7 +11,7 @@ import (
 // is the regression guard against the exact bug that wedged a live
 // pipeline: the `finalize_pipeline` delegate's load-bearing
 // post-condition (*after finalize returns ready_for_ot, call
-// handoff_to_ot next*) was silently dropped when the unified skill's
+// handoff_to_green next*) was silently dropped when the unified skill's
 // description was assembled, because the builder only rendered
 // purpose + required + first-usage-sentence.
 //
@@ -29,7 +29,7 @@ func TestPipelineProtocolUnifiedSkill_DescriptionCarriesFinalizePostCondition(t 
 
 	mustContain := []string{
 		"ready_for_ot: true",
-		"handoff_to_ot",
+		"handoff_to_green",
 		"next terminal protocol action in this turn must be",
 	}
 	for _, want := range mustContain {

@@ -11,8 +11,9 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -77,23 +78,6 @@ func (d *Designer) registerCoreSkills() {
 	}) {
 		d.skills.Register(skill)
 	}
-	for _, skill := range shared.CrossPipelineSkills(shared.CrossPipelineSkillConfig{
-		SessionID:  func() string { return d.config.SessionID },
-		AgentID:    func() string { return d.id },
-		AgentType:  func() string { return "designer" },
-		PipelineID: func() string { return d.pipelineID },
-		RouteSync: shared.RouteSyncFromBus(
-			func() guide.EventBus { return d.bus },
-			func() string {
-				if d.channels == nil {
-					return ""
-				}
-				return d.channels.Responses
-			},
-		),
-	}) {
-		d.skills.Register(skill)
-	}
 	// Phase 5 of SCRIBE_FABRIC.md: recall_my_history.
 	for _, skill := range fabric.RecallSkills(fabric.RecallSkillConfig{
 		SourceProvider: activity.DefaultSource,
@@ -103,20 +87,27 @@ func (d *Designer) registerCoreSkills() {
 	}) {
 		d.skills.Register(skill)
 	}
-	for _, skill := range shared.PipelineProtocolSkills(shared.PipelineProtocolSkillConfig{
-		AgentType:      func() string { return "designer" },
+
+	// ── Claims skills (unconditional) ──────────────────────────────
+	//
+	// Every pipeline uses claims. No legacy protocol path.
+	boardProvider := func() *claims.ClaimsBoard { return d.claimsBoard }
+	d.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	d.skills.Register(claims.PostActionSkill(boardProvider))
+	d.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	d.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
+	d.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+
+	fabricCfg := fabric.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return d.config.SessionID },
 		AgentID:        func() string { return d.id },
-		WorkspaceViews: func() versioning.WorkspaceViewAccess { return d.workspaceViews },
-		Route: shared.PipelineProtocolRouteConfig{
-			BusProvider: func() guide.EventBus { return d.bus },
-			SessionID:   func() string { return d.config.SessionID },
-			PublishReroute: func(ctx context.Context, toAgentID, reason, newCorrelationID string) {
-				shared.PublishPipelineHandoffReroute(d.bus, d.channels, ctx, "designer", toAgentID, reason, newCorrelationID)
-			},
-		},
-	}) {
+		AgentType:      func() string { return "designer" },
+	}
+	for _, skill := range fabric.ClaimsAwarenessSkills(fabricCfg) {
 		d.skills.Register(skill)
 	}
+
 
 	// Collaboration skills (feedback.go).
 	// Phase 1 refactor: per-target peer skills (request_engineer_review,

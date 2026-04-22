@@ -115,6 +115,13 @@ type Architect struct {
 	// Heartbeat subscription for executing plan lease renewal.
 	heartbeatSub guide.Subscription
 
+	// auditRejectionBridge subscribes to AuditMergeResultTopic and
+	// translates Rejected audit verdicts into RemediationRequests,
+	// closing the docs/PARALLEL_GLOBAL_VFS.md §3.8 rejection-→-
+	// remediation loop without routing through the orchestrator.
+	// Started alongside the other bus subscriptions in Start.
+	auditRejectionBridge *AuditRejectionBridge
+
 	// Steering ledger management.
 	steering *shared.SteeringManager
 
@@ -763,6 +770,21 @@ func (a *Architect) Start(bus guide.EventBus) error {
 
 	// Subscribe to heartbeat topic for executing plan lease renewal.
 	a.heartbeatSub, _ = bus.SubscribeAsync("plan.heartbeat", a.handlePlanHeartbeat)
+
+	// Audit-rejection bridge: direct AuditMergeResultTopic subscriber
+	// that translates Rejected verdicts into RemediationRequests and
+	// hands them to processRemediationRequest. Closes the §3.8 loop
+	// without an orchestrator round-trip. Accepts any session — the
+	// result payload carries its own session ID.
+	a.auditRejectionBridge = NewAuditRejectionBridge(AuditRejectionBridgeConfig{
+		Bus:       bus,
+		Submitter: a,
+		Logger:    a.logger,
+	})
+	if err := a.auditRejectionBridge.Start(a.processingContext()); err != nil {
+		a.logger.Warn("audit rejection bridge start failed", "error", err.Error())
+	}
+
 	go a.requestOpenPlanHandoffReceiptResyncs("architect startup")
 
 	a.logger.Info("architect started", "channels", a.channels)
@@ -807,6 +829,12 @@ func (a *Architect) Stop() error {
 			errs = append(errs, err)
 		}
 		a.heartbeatSub = nil
+	}
+
+	// Stop the audit-rejection bridge.
+	if a.auditRejectionBridge != nil {
+		a.auditRejectionBridge.Stop()
+		a.auditRejectionBridge = nil
 	}
 
 	if len(errs) > 0 {
@@ -2524,6 +2552,25 @@ func (a *Architect) createWorkflowDAG(ctx context.Context, tasks []*AtomicTask) 
 
 	// Add nodes for each task, populating compound node fields when present.
 	for _, task := range tasks {
+		nodeCtx := map[string]any{
+			"task_name":        task.Name,
+			"success_criteria": task.SuccessCriteria,
+			"complexity":       task.Complexity.String(),
+		}
+		// Propagate remediation metadata (architect-supplied) onto the
+		// DAG node context so the orchestrator's pipeline dispatch can
+		// read "remediates_version" / "rejected_replica_id" when
+		// constructing the pipeline VFS. See docs/PARALLEL_GLOBAL_VFS.md
+		// §3.8 and agents/orchestrator/dag_bridge.go:extractRemediatesVersion.
+		if v, ok := task.Context["remediates_version"]; ok {
+			nodeCtx["remediates_version"] = v
+		}
+		if v, ok := task.Context["rejected_replica_id"]; ok {
+			nodeCtx["rejected_replica_id"] = v
+		}
+		if v, ok := task.Context["affected_files"]; ok {
+			nodeCtx["affected_files"] = v
+		}
 		nodeConfig := dag.NodeConfig{
 			ID:                task.ID,
 			AgentType:         task.AgentType,
@@ -2532,11 +2579,7 @@ func (a *Architect) createWorkflowDAG(ctx context.Context, tasks []*AtomicTask) 
 			Priority:          taskPriority(task),
 			CoAgents:          task.CoAgents,
 			CollaborationMode: task.CollaborationMode,
-			Context: map[string]any{
-				"task_name":        task.Name,
-				"success_criteria": task.SuccessCriteria,
-				"complexity":       task.Complexity.String(),
-			},
+			Context:           nodeCtx,
 			Metadata: map[string]any{
 				"estimated_tokens": task.EstimatedTokens,
 			},

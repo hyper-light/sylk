@@ -73,7 +73,7 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		}
 
 		turnStart := time.Now()
-		resp, err := agentShared.CompleteWithWatchdog(ctx, p, req, agentShared.AgentDisplayName("inspector"))
+		resp, err := gi.runTurn(ctx, p, req)
 		if err != nil {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -88,7 +88,6 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		}
 
 		shared.AccumulateUsage(ctx, &resp.Usage)
-		agentShared.PublishIntermediateToolTurn(gi.bus, gi.channels, ctx, gi.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
 			if auditDepthRequired(ctx) {
@@ -173,6 +172,20 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 			&agentlog.ErrorPayload{Error: "exhausted tool-call loop"})
 	}
 	return "", fmt.Errorf("global inspector exhausted tool-call loop")
+}
+
+// runTurn streams one LLM turn. Thinking + text chunks reach the
+// chat panel as they arrive; tool calls are surfaced by the helper
+// via PublishIntermediateToolTurn. inspectorProvider requires the
+// Stream method, so the compiler enforces this path — no runtime
+// fallback.
+func (gi *GlobalInspector) runTurn(ctx context.Context, p inspectorProvider, req *providers.Request) (*providers.Response, error) {
+	return agentShared.StreamLLMTurn(ctx, agentShared.StreamingLLMTurnConfig{
+		Bus:              gi.bus,
+		Channels:         gi.channels,
+		AgentID:          gi.id,
+		AgentDisplayName: agentShared.AgentDisplayName("inspector"),
+	}, p, req)
 }
 
 func (gi *GlobalInspector) applyToolCalls(

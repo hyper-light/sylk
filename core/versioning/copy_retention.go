@@ -24,6 +24,7 @@ type CopyRetention struct {
 	waterLine  SemanticVersion
 	waterAt    time.Time
 	gcCallback func(released []SemanticVersion)
+	wal        *ControlWAL
 }
 
 // CopyRetentionConfig configures a CopyRetention.
@@ -32,6 +33,12 @@ type CopyRetentionConfig struct {
 	// released by a GC pass. Used to flush observability events and
 	// (in future stages) compact WAL segments.
 	OnRelease func(released []SemanticVersion)
+	// WAL, if set, persists every Retain / Release /
+	// AdvanceWaterLine event durably before the in-memory state is
+	// mutated. Replay on Open reconstructs the full retention
+	// topology from the log, so a crash mid-transition cannot lose a
+	// holder or skip a water-line advance.
+	WAL *ControlWAL
 }
 
 // NewCopyRetention returns a fresh retention tracker.
@@ -40,6 +47,7 @@ func NewCopyRetention(cfg CopyRetentionConfig) *CopyRetention {
 		refs:       make(map[SemanticVersion]int),
 		holders:    make(map[string]SemanticVersion),
 		gcCallback: cfg.OnRelease,
+		wal:        cfg.WAL,
 	}
 }
 
@@ -47,32 +55,47 @@ func NewCopyRetention(cfg CopyRetentionConfig) *CopyRetention {
 // free-form identifier for debuggability (e.g., "replica-abc123",
 // "remediation-dispatch-task_a_fix"). Duplicate retains with the same
 // holderID and version are a no-op; duplicates with different versions
-// panic because that's a bookkeeping error at the caller.
-func (r *CopyRetention) Retain(ver SemanticVersion, holderID string) {
+// release the prior hold implicitly before acquiring the new one.
+// Write-ahead to ControlWAL before mutating in-memory state.
+func (r *CopyRetention) Retain(ver SemanticVersion, holderID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if existing, ok := r.holders[holderID]; ok && existing == ver {
+		return nil
+	}
+	if err := r.walAppend(ControlKindRetentionRetain, ControlEntryPayload{
+		RetentionVersion:  ver,
+		RetentionHolderID: holderID,
+	}); err != nil {
+		return err
+	}
 	if existing, ok := r.holders[holderID]; ok {
-		if existing == ver {
-			return
-		}
-		// Release the prior hold implicitly before acquiring the new
-		// one. Could panic instead; chose leniency.
 		if r.refs[existing] > 0 {
 			r.refs[existing]--
+			if r.refs[existing] == 0 {
+				delete(r.refs, existing)
+			}
 		}
 	}
 	r.refs[ver]++
 	r.holders[holderID] = ver
+	return nil
 }
 
 // Release releases a reference by holderID. No-op if the holder isn't
-// tracked.
-func (r *CopyRetention) Release(holderID string) {
+// tracked. Write-ahead to ControlWAL before mutating in-memory state.
+func (r *CopyRetention) Release(holderID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ver, ok := r.holders[holderID]
 	if !ok {
-		return
+		return nil
+	}
+	if err := r.walAppend(ControlKindRetentionRelease, ControlEntryPayload{
+		RetentionVersion:  ver,
+		RetentionHolderID: holderID,
+	}); err != nil {
+		return err
 	}
 	if n := r.refs[ver]; n > 0 {
 		r.refs[ver] = n - 1
@@ -81,6 +104,7 @@ func (r *CopyRetention) Release(holderID string) {
 		}
 	}
 	delete(r.holders, holderID)
+	return nil
 }
 
 // RefCount returns the current number of references on a Copy version.
@@ -101,12 +125,18 @@ func (r *CopyRetention) WaterLine() SemanticVersion {
 // AdvanceWaterLine updates the water line to a newer MergedVersion.
 // Only advances if the new version is strictly greater; no-op
 // otherwise. Returns the list of versions released as a side effect
-// (if any).
-func (r *CopyRetention) AdvanceWaterLine(newLine SemanticVersion, knownVersions []SemanticVersion) []SemanticVersion {
+// (if any). Write-ahead to ControlWAL before mutating in-memory state.
+func (r *CopyRetention) AdvanceWaterLine(newLine SemanticVersion, knownVersions []SemanticVersion) ([]SemanticVersion, error) {
 	r.mu.Lock()
 	if newLine.Compare(r.waterLine) <= 0 {
 		r.mu.Unlock()
-		return nil
+		return nil, nil
+	}
+	if err := r.walAppend(ControlKindRetentionAdvanceWaterLine, ControlEntryPayload{
+		WaterLine: newLine,
+	}); err != nil {
+		r.mu.Unlock()
+		return nil, err
 	}
 	r.waterLine = newLine
 	r.waterAt = time.Now().UTC()
@@ -117,7 +147,7 @@ func (r *CopyRetention) AdvanceWaterLine(newLine SemanticVersion, knownVersions 
 	if callback != nil && len(released) > 0 {
 		callback(released)
 	}
-	return released
+	return released, nil
 }
 
 // collectReleasableLocked returns versions that are (a) strictly below
@@ -159,5 +189,63 @@ func (r *CopyRetention) Snapshot() CopyRetentionSnapshot {
 		TrackedCopies: len(r.refs),
 		Holders:       len(r.holders),
 		RefsByVersion: refs,
+	}
+}
+
+// walAppend persists a retention transition to the ControlWAL. Caller
+// holds r.mu when invoking. Returns the WAL failure (if any) so the
+// transition aborts before mutating in-memory state.
+func (r *CopyRetention) walAppend(kind ControlEntryKind, payload ControlEntryPayload) error {
+	if r.wal == nil {
+		return nil
+	}
+	_, err := r.wal.Append(kind, payload)
+	return err
+}
+
+// ApplyControlEntry rehydrates a single durable retention event into
+// in-memory state without re-writing it to the WAL. Used by
+// SessionVFS.Open replay. Unknown kinds are ignored (the dispatcher
+// routes them to the correct subsystem).
+func (r *CopyRetention) ApplyControlEntry(entry *ControlEntry) {
+	if entry == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch entry.Kind {
+	case ControlKindRetentionRetain:
+		holderID := entry.Payload.RetentionHolderID
+		ver := entry.Payload.RetentionVersion
+		if existing, ok := r.holders[holderID]; ok && existing != ver {
+			if r.refs[existing] > 0 {
+				r.refs[existing]--
+				if r.refs[existing] == 0 {
+					delete(r.refs, existing)
+				}
+			}
+		}
+		if existing, ok := r.holders[holderID]; !ok || existing != ver {
+			r.refs[ver]++
+			r.holders[holderID] = ver
+		}
+	case ControlKindRetentionRelease:
+		holderID := entry.Payload.RetentionHolderID
+		if ver, ok := r.holders[holderID]; ok {
+			if n := r.refs[ver]; n > 0 {
+				r.refs[ver] = n - 1
+				if r.refs[ver] == 0 {
+					delete(r.refs, ver)
+				}
+			}
+			delete(r.holders, holderID)
+		}
+	case ControlKindRetentionAdvanceWaterLine:
+		if entry.Payload.WaterLine.Compare(r.waterLine) > 0 {
+			r.waterLine = entry.Payload.WaterLine
+			r.waterAt = entry.Timestamp
+		}
+	default:
+		// Not a retention kind — caller dispatches elsewhere.
 	}
 }

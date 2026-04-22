@@ -19,6 +19,7 @@ import (
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
@@ -31,8 +32,12 @@ import (
 
 // inspectorProvider is the minimal interface the GlobalInspector needs from its LLM.
 // Satisfied by *providers.AnthropicProvider and *gateway.GatewayProvider.
+// Streaming is mandatory — the global inspector is a chattable
+// full-LLM agent; its tool loop calls Stream on every turn so
+// thinking + text chunks surface in the chat panel as they arrive.
 type inspectorProvider interface {
 	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
+	Stream(ctx context.Context, req *providers.Request) (<-chan *providers.StreamChunk, error)
 	StreamWithHandler(ctx context.Context, req *providers.Request, handler providers.StreamHandler) error
 }
 
@@ -68,6 +73,12 @@ type GlobalInspector struct {
 	running       bool
 	knownAgentsMu sync.RWMutex
 	knownAgents   map[string]*guide.AgentAnnouncement
+	// sessionVFSGetter resolves the current session VFS at audit
+	// time. Injected by the orchestrator via SetSessionVFS on
+	// bootstrap — keeps the global inspector decoupled from the
+	// orchestrator package while still reaching the MergesAfter /
+	// CopyAt / MergeDescriptors machinery a per-merge audit needs.
+	sessionVFSGetter func() *versioning.SessionVFS
 
 	// Sync RPC (for architect escalation).
 	pendingMu  sync.Mutex
@@ -99,6 +110,13 @@ type GlobalInspector struct {
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
 	requestSerializer *agentShared.RequestSerializer
+
+	// activityPub is the chat-panel activity stream. Mirrors the
+	// librarian/academic pattern: the global inspector emits
+	// VisibilityUser activity at user-relevant lifecycle points
+	// (request received, completion, error) so its work is visible
+	// in the TUI chat panel alongside the knowledge-tier agents.
+	activityPub events.ActivityPublisher
 }
 
 // New creates a new GlobalInspector instance. The provider must implement
@@ -128,6 +146,7 @@ func New(cfg shared.GlobalInspectorConfig, provider providers.ProviderAdapter) (
 		steering:          agentShared.NewSteeringManager(),
 		requestSerializer: agentShared.NewRequestSerializer(),
 		executionBroker:   purevfs.DefaultExecutionBroker(),
+		activityPub:       cfg.ActivityPub,
 	}
 	gi.toolRunner = shared.NewToolRunner(shared.ToolRunnerConfig{
 		WorkingDir: ".",
@@ -385,6 +404,13 @@ func (gi *GlobalInspector) Start(bus guide.EventBus) error {
 		return fmt.Errorf("subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
+	// Per-merge audit dispatch is direct: the session's
+	// MergeAuditCoordinator calls gi.SpawnAuditReplica(ctx, req)
+	// for every merge completed by MergePipelineIntoGreen. There is
+	// no bus subscription for AuditMergeRequest — the whole
+	// pipeline-inspector → OT → replica-spawn chain is direct
+	// method calls and durable WAL records.
+
 	gi.running = true
 	gi.logger.Info("global inspector started", "id", gi.id)
 	return nil
@@ -444,6 +470,16 @@ func (gi *GlobalInspector) unsubRegistry() error {
 	err := gi.registrySub.Unsubscribe()
 	gi.registrySub = nil
 	return err
+}
+
+// SetSessionVFS wires the inspector to its session's versioning
+// subsystem. Called by the orchestrator during bootstrap (phase4+
+// wiring). The getter pattern keeps SessionVFS optional until
+// assigned — audits published before bootstrap completes are
+// buffered by the bus's subscriber queue and drained once the
+// subscription is live.
+func (gi *GlobalInspector) SetSessionVFS(getter func() *versioning.SessionVFS) {
+	gi.sessionVFSGetter = getter
 }
 
 // Handle processes a forwarded request with intent dispatch.
@@ -628,6 +664,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 	if publishStreamLifecycle {
 		shared.PublishStreamStart(gi.bus, gi.channels, ctx, gi.id)
 	}
+	gi.publishChatActivity(fwd.SessionID, events.EventTypeAgentAction, "Processing audit request")
 
 	result, err := gi.Handle(ctx, fwd)
 	agentShared.LogResponse(gi.steering.EventLogger(), fwd.CorrelationID, gi.id, fwd.SessionID, time.Since(startTime), err)
@@ -642,6 +679,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 			shared.PublishStreamError(gi.bus, gi.channels, ctx, gi.id, err)
 			shared.PublishStreamComplete(gi.bus, gi.channels, ctx, gi.id, "", usageAcc.Total())
 		}
+		gi.publishChatActivity(fwd.SessionID, events.EventTypeAgentError, fmt.Sprintf("Audit failed: %s", err.Error()))
 		if fwd.FireAndForget {
 			return nil
 		}
@@ -662,6 +700,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 			Timestamp: time.Now(),
 		})
 	}
+	gi.publishChatActivity(fwd.SessionID, events.EventTypeSuccess, "Audit task completed")
 	if fwd.FireAndForget {
 		return nil
 	}
@@ -715,6 +754,22 @@ func (gi *GlobalInspector) handleRegistryAnnouncement(msg *guide.Message) error 
 
 func (gi *GlobalInspector) generateMessageID() string {
 	return fmt.Sprintf("gi_msg_%s", uuid.New().String()[:8])
+}
+
+// publishChatActivity emits a user-facing activity event for the chat
+// panel. Mirrors librarian.publishReplicaActivityForSession — the
+// global inspector is a singleton (no replica pool) so it omits the
+// pool-snapshot metadata that knowledge agents include.
+func (gi *GlobalInspector) publishChatActivity(sessionID string, eventType events.EventType, content string) {
+	if gi == nil || gi.activityPub == nil {
+		return
+	}
+	evt := events.NewActivityEvent(eventType, strings.TrimSpace(sessionID), content)
+	evt.AgentID = gi.id
+	evt.Visibility = events.VisibilityUser
+	evt.Data["agent_type"] = "inspector"
+	evt.Data["agent_name"] = "Inspector"
+	gi.activityPub.PublishActivity(evt)
 }
 
 func (gi *GlobalInspector) getState() *shared.InspectorState {

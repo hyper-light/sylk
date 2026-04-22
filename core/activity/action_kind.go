@@ -281,6 +281,57 @@ const (
 	// branches actually produced successful outcomes. See Tier 5 of
 	// docs/FOREST_FABRIC_INTEGRATION.md.
 	ActionForestConsultEmitted ActionKind = "forest_consult_emitted"
+
+	// ─── Claims system kinds (sovereign amplifier) ──────────────────
+
+	// ActionClaimIssued is emitted when a claim is posted to a claims
+	// board — by the orchestrator during plan decomposition, or by
+	// validators when posting remediation claims.
+	ActionClaimIssued ActionKind = "claim_issued"
+
+	// ActionClaimUpdated is emitted on every atomic claim progress
+	// update (evidence added, summary appended, files changed).
+	ActionClaimUpdated ActionKind = "claim_updated"
+
+	// ActionTestamentSubmitted is emitted when a subject submits a
+	// testament with artifacts proving a claim is satisfied.
+	ActionTestamentSubmitted ActionKind = "testament_submitted"
+
+	// ActionClaimArtifactPublished is emitted when an artifact is
+	// attached to a testament as proof of work.
+	ActionClaimArtifactPublished ActionKind = "claim_artifact_published"
+
+	// ActionClaimValidated is emitted when an issuer evaluates a
+	// validation against a testament's artifacts.
+	ActionClaimValidated ActionKind = "claim_validated"
+
+	// ActionClaimAccepted is emitted when all validations on a claim
+	// pass and the claim transitions to accepted.
+	ActionClaimAccepted ActionKind = "claim_accepted"
+
+	// ActionClaimRejected is emitted when a validator rejects a claim
+	// and posts replacement claims.
+	ActionClaimRejected ActionKind = "claim_rejected"
+
+	// ActionClaimSuperseded is emitted when a claim is replaced by a
+	// newer claim.
+	ActionClaimSuperseded ActionKind = "claim_superseded"
+
+	// ActionActionPosted is emitted when an action (set of claims) is
+	// posted to a board.
+	ActionActionPosted ActionKind = "action_posted"
+
+	// ActionCorrectiveIssued is emitted when the system issues
+	// corrective claims instead of returning an error.
+	ActionCorrectiveIssued ActionKind = "corrective_issued"
+
+	// ActionBoardPhaseChanged is emitted on board phase transitions
+	// (implementation → validation, validation → implementation).
+	ActionBoardPhaseChanged ActionKind = "board_phase_changed"
+
+	// ActionBoardComplete is emitted when all claims are accepted and
+	// the board transitions to complete. Terminal event.
+	ActionBoardComplete ActionKind = "board_complete"
 )
 
 // ResolutionFor returns the canonical Resolution for the given
@@ -337,7 +388,12 @@ func ResolutionFor(kind ActionKind) Resolution {
 		ActionConsultUnanswered,
 		ActionAdvisoryEmitted,
 		ActionNotificationEmitted,
-		ActionForestConsultEmitted:
+		ActionForestConsultEmitted,
+		// Claims system — Medium tier.
+		ActionClaimUpdated,
+		ActionClaimArtifactPublished,
+		ActionClaimSuperseded,
+		ActionBoardPhaseChanged:
 		return ResolutionMedium
 
 	case ActionDecisionDeclared,
@@ -353,7 +409,16 @@ func ResolutionFor(kind ActionKind) Resolution {
 		ActionEscalationRequested,
 		ActionProactiveAdvisory,
 		ActionPrecedentEmitted,
-		ActionNarrationEmitted:
+		ActionNarrationEmitted,
+		// Claims system — Coarse tier.
+		ActionClaimIssued,
+		ActionTestamentSubmitted,
+		ActionClaimValidated,
+		ActionClaimAccepted,
+		ActionClaimRejected,
+		ActionActionPosted,
+		ActionCorrectiveIssued,
+		ActionBoardComplete:
 		return ResolutionCoarse
 	}
 
@@ -383,7 +448,11 @@ func (k ActionKind) IsTerminal() bool {
 		ActionConsultUnanswered,
 		ActionScopePartitioned,
 		ActionEscalationRequested,
-		ActionStoreWriteFailed:
+		ActionStoreWriteFailed,
+		// Claims system terminals.
+		ActionClaimAccepted,
+		ActionClaimRejected,
+		ActionBoardComplete:
 		return true
 	}
 	return false

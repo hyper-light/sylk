@@ -9,65 +9,41 @@ import (
 	"testing"
 )
 
-type mockHNSW struct {
-	inserted map[string]bool
-	deleted  map[string]bool
-}
+// mockVectorIndex + newMockVectorIndex live in session_view_test.go
+// — that richer fixture already satisfies the Insert/Delete/DeleteBatch
+// interface these tests need, plus tracks vectors/domains/nodeTypes
+// for snapshot-view tests. Kept single-source-of-truth there.
 
-func newMockHNSW() *mockHNSW {
-	return &mockHNSW{
-		inserted: make(map[string]bool),
-		deleted:  make(map[string]bool),
-	}
-}
-
-func (m *mockHNSW) Insert(id string, vector []float32, domain Domain, nodeType NodeType) error {
-	m.inserted[id] = true
-	return nil
-}
-
-func (m *mockHNSW) Delete(id string) error {
-	m.deleted[id] = true
-	return nil
-}
-
-func (m *mockHNSW) DeleteBatch(ids []string) error {
-	for _, id := range ids {
-		m.deleted[id] = true
-	}
-	return nil
-}
-
-// failingHNSW is a mock that fails on Insert for testing rollback.
-type failingHNSW struct {
+// failingVectorIndex is a mock that fails on Insert for testing rollback.
+type failingVectorIndex struct {
 	insertErr error
 	inserted  map[string]bool
 	deleted   map[string]bool
 	mu        sync.Mutex
 }
 
-func newFailingHNSW(err error) *failingHNSW {
-	return &failingHNSW{
+func newFailingVectorIndex(err error) *failingVectorIndex {
+	return &failingVectorIndex{
 		insertErr: err,
 		inserted:  make(map[string]bool),
 		deleted:   make(map[string]bool),
 	}
 }
 
-func (m *failingHNSW) Insert(id string, vector []float32, domain Domain, nodeType NodeType) error {
+func (m *failingVectorIndex) Insert(id string, vector []float32, domain Domain, nodeType NodeType) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.insertErr
 }
 
-func (m *failingHNSW) Delete(id string) error {
+func (m *failingVectorIndex) Delete(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.deleted[id] = true
 	return nil
 }
 
-func (m *failingHNSW) DeleteBatch(ids []string) error {
+func (m *failingVectorIndex) DeleteBatch(ids []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, id := range ids {
@@ -76,29 +52,29 @@ func (m *failingHNSW) DeleteBatch(ids []string) error {
 	return nil
 }
 
-// conditionalFailHNSW fails on specific node IDs.
-type conditionalFailHNSW struct {
+// conditionalFailVectorIndex fails on specific node IDs.
+type conditionalFailVectorIndex struct {
 	failOnIDs map[string]error
 	inserted  map[string]bool
 	deleted   map[string]bool
 	mu        sync.Mutex
 }
 
-func newConditionalFailHNSW() *conditionalFailHNSW {
-	return &conditionalFailHNSW{
+func newConditionalFailVectorIndex() *conditionalFailVectorIndex {
+	return &conditionalFailVectorIndex{
 		failOnIDs: make(map[string]error),
 		inserted:  make(map[string]bool),
 		deleted:   make(map[string]bool),
 	}
 }
 
-func (m *conditionalFailHNSW) SetFailure(id string, err error) {
+func (m *conditionalFailVectorIndex) SetFailure(id string, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.failOnIDs[id] = err
 }
 
-func (m *conditionalFailHNSW) Insert(id string, vector []float32, domain Domain, nodeType NodeType) error {
+func (m *conditionalFailVectorIndex) Insert(id string, vector []float32, domain Domain, nodeType NodeType) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err, exists := m.failOnIDs[id]; exists {
@@ -108,14 +84,14 @@ func (m *conditionalFailHNSW) Insert(id string, vector []float32, domain Domain,
 	return nil
 }
 
-func (m *conditionalFailHNSW) Delete(id string) error {
+func (m *conditionalFailVectorIndex) Delete(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.deleted[id] = true
 	return nil
 }
 
-func (m *conditionalFailHNSW) DeleteBatch(ids []string) error {
+func (m *conditionalFailVectorIndex) DeleteBatch(ids []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, id := range ids {
@@ -144,8 +120,8 @@ func TestNodeStoreInsertAndGet(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
 
-	hnsw := newMockHNSW()
-	ns := NewNodeStore(db, hnsw)
+	vectorIndex := newMockVectorIndex()
+	ns := NewNodeStore(db, vectorIndex)
 
 	node := &GraphNode{
 		ID:       "node1",
@@ -160,8 +136,8 @@ func TestNodeStoreInsertAndGet(t *testing.T) {
 		t.Fatalf("InsertNode: %v", err)
 	}
 
-	if !hnsw.inserted["node1"] {
-		t.Error("HNSW insert not called")
+	if !vectorIndex.inserted["node1"] {
+		t.Error("vector index insert not called")
 	}
 
 	retrieved, err := ns.GetNode("node1")
@@ -276,8 +252,8 @@ func TestNodeStoreDelete(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
 
-	hnsw := newMockHNSW()
-	ns := NewNodeStore(db, hnsw)
+	vectorIndex := newMockVectorIndex()
+	ns := NewNodeStore(db, vectorIndex)
 
 	node := &GraphNode{
 		ID:       "node1",
@@ -291,8 +267,8 @@ func TestNodeStoreDelete(t *testing.T) {
 		t.Fatalf("DeleteNode: %v", err)
 	}
 
-	if !hnsw.deleted["node1"] {
-		t.Error("HNSW delete not called")
+	if !vectorIndex.deleted["node1"] {
+		t.Error("vector index delete not called")
 	}
 
 	_, err = ns.GetNode("node1")
@@ -319,7 +295,7 @@ func TestNodeStoreGetByType(t *testing.T) {
 
 	ns := NewNodeStore(db, nil)
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		node := &GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -360,7 +336,7 @@ func TestNodeStoreGetByTypeWithLimit(t *testing.T) {
 
 	ns := NewNodeStore(db, nil)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		node := &GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -519,7 +495,7 @@ func TestNodeStoreGetNodesBatch(t *testing.T) {
 	ns := NewNodeStore(db, nil)
 
 	// Insert test nodes
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		node := &GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -571,7 +547,7 @@ func TestNodeStoreGetNodesBatchMissingNodes(t *testing.T) {
 	ns := NewNodeStore(db, nil)
 
 	// Insert only some nodes
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		node := &GraphNode{
 			ID:       nodeID(i),
 			Domain:   DomainCode,
@@ -609,7 +585,7 @@ func TestNodeStoreGetNodesBatchLarge(t *testing.T) {
 
 	// Insert 200 nodes to test batching beyond default batch size (100)
 	ids := make([]string, 200)
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		id := "node" + string(rune('a'+i/26)) + string(rune('a'+i%26))
 		ids[i] = id
 		node := &GraphNode{
@@ -632,16 +608,16 @@ func TestNodeStoreGetNodesBatchLarge(t *testing.T) {
 }
 
 // =============================================================================
-// HNSW Insert Failure Rollback Tests
+// Vector Index Insert Failure Rollback Tests
 // =============================================================================
 
-func TestNodeStoreInsertHNSWFailureRollback(t *testing.T) {
+func TestNodeStoreInsertVectorIndexFailureRollback(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
 
-	hnswErr := errors.New("HNSW index full")
-	hnsw := newFailingHNSW(hnswErr)
-	ns := NewNodeStore(db, hnsw)
+	injectedErr := errors.New("vector index full")
+	vectorIndex := newFailingVectorIndex(injectedErr)
+	ns := NewNodeStore(db, vectorIndex)
 
 	node := &GraphNode{
 		ID:       "node1",
@@ -658,20 +634,20 @@ func TestNodeStoreInsertHNSWFailureRollback(t *testing.T) {
 		t.Fatal("InsertNode should have returned an error")
 	}
 
-	// Verify it's an HNSWInsertError
-	var hnswInsertErr *HNSWInsertError
-	if !errors.As(err, &hnswInsertErr) {
-		t.Fatalf("expected HNSWInsertError, got %T: %v", err, err)
+	// Verify it's a VectorIndexInsertError.
+	var insertErr *VectorIndexInsertError
+	if !errors.As(err, &insertErr) {
+		t.Fatalf("expected VectorIndexInsertError, got %T: %v", err, err)
 	}
 
 	// Verify error details
-	if hnswInsertErr.NodeID != "node1" {
-		t.Errorf("NodeID = %s, want node1", hnswInsertErr.NodeID)
+	if insertErr.NodeID != "node1" {
+		t.Errorf("NodeID = %s, want node1", insertErr.NodeID)
 	}
-	if !errors.Is(hnswInsertErr.IndexErr, hnswErr) {
-		t.Errorf("HNSWErr = %v, want %v", hnswInsertErr.IndexErr, hnswErr)
+	if !errors.Is(insertErr.IndexErr, injectedErr) {
+		t.Errorf("IndexErr = %v, want %v", insertErr.IndexErr, injectedErr)
 	}
-	if hnswInsertErr.RollbackFailed {
+	if insertErr.RollbackFailed {
 		t.Error("RollbackFailed should be false")
 	}
 
@@ -682,12 +658,12 @@ func TestNodeStoreInsertHNSWFailureRollback(t *testing.T) {
 	}
 }
 
-func TestNodeStoreInsertHNSWSuccessNoRollback(t *testing.T) {
+func TestNodeStoreInsertVectorIndexSuccessNoRollback(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
 
-	hnsw := newMockHNSW()
-	ns := NewNodeStore(db, hnsw)
+	vectorIndex := newMockVectorIndex()
+	ns := NewNodeStore(db, vectorIndex)
 
 	node := &GraphNode{
 		ID:       "node1",
@@ -702,9 +678,9 @@ func TestNodeStoreInsertHNSWSuccessNoRollback(t *testing.T) {
 		t.Fatalf("InsertNode: %v", err)
 	}
 
-	// Verify HNSW insert was called
-	if !hnsw.inserted["node1"] {
-		t.Error("HNSW insert not called")
+	// Verify vector index insert was called
+	if !vectorIndex.inserted["node1"] {
+		t.Error("vector index insert not called")
 	}
 
 	// Verify node exists in DB
@@ -717,13 +693,13 @@ func TestNodeStoreInsertHNSWSuccessNoRollback(t *testing.T) {
 	}
 }
 
-func TestNodeStoreInsertPartialFailureWithConditionalHNSW(t *testing.T) {
+func TestNodeStoreInsertPartialFailureWithConditionalVectorIndex(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
 
-	hnsw := newConditionalFailHNSW()
-	hnsw.SetFailure("node2", errors.New("HNSW insert failed for node2"))
-	ns := NewNodeStore(db, hnsw)
+	vectorIndex := newConditionalFailVectorIndex()
+	vectorIndex.SetFailure("node2", errors.New("vector index insert failed for node2"))
+	ns := NewNodeStore(db, vectorIndex)
 
 	// Insert first node - should succeed
 	node1 := &GraphNode{
@@ -818,18 +794,18 @@ func TestNodeStoreInsertConcurrentWithFailures(t *testing.T) {
 	db, path := setupTestDB(t)
 	defer cleanupDB(db, path)
 
-	hnsw := newConditionalFailHNSW()
+	vectorIndex := newConditionalFailVectorIndex()
 	// Set failures for even-numbered nodes
 	for i := 0; i < 20; i += 2 {
-		hnsw.SetFailure(nodeID(i), errors.New("simulated HNSW failure"))
+		vectorIndex.SetFailure(nodeID(i), errors.New("simulated vector index failure"))
 	}
-	ns := NewNodeStore(db, hnsw)
+	ns := NewNodeStore(db, vectorIndex)
 
 	var wg sync.WaitGroup
 	var successCount atomic.Int32
 	var failCount atomic.Int32
 
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -858,7 +834,7 @@ func TestNodeStoreInsertConcurrentWithFailures(t *testing.T) {
 	}
 
 	// Verify only odd nodes exist in DB
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		_, err := ns.GetNode(nodeID(i))
 		if i%2 == 0 {
 			// Even nodes should have been rolled back

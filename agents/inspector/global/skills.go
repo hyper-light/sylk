@@ -139,6 +139,29 @@ func (gi *GlobalInspector) registerCoreSkills() {
 		gi.skills.Register(skill)
 	}
 
+	// Per-merge audit skills (docs/PARALLEL_GLOBAL_VFS.md §6.4):
+	// emit_audit_decision is the terminal tool the inspector calls
+	// at the end of a per-merge audit; merges_after lets it see
+	// concurrent merges landing in parallel and decide whether to
+	// rebase, continue, or reject-with-hint.
+	gi.skills.Register(agentShared.NewEmitAuditDecisionSkill(agentShared.EmitAuditDecisionSkillConfig{
+		ContextResolver: func(ctx context.Context) (agentShared.AuditMergeContext, bool) {
+			return agentShared.AuditMergeContextFromContext(ctx)
+		},
+	}))
+	gi.skills.Register(agentShared.NewMergesAfterSkill(agentShared.MergesAfterSkillConfig{
+		LogReader: func() agentShared.MergeLogReader {
+			if gi.sessionVFSGetter == nil {
+				return nil
+			}
+			sess := gi.sessionVFSGetter()
+			if sess == nil {
+				return nil
+			}
+			return sess
+		},
+	}))
+
 	// Diagnostics
 	gi.skills.Register(agentShared.NewSelfDiagnosticSkill(&globalInspectorDiag{gi: gi}))
 

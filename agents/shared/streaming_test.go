@@ -38,6 +38,126 @@ func TestStreamUsageAccumulatorTotalsAllUsageFields(t *testing.T) {
 	}
 }
 
+// TestPublishStreamChunkDeliversTextToBus pins the agent-side
+// emission contract: when a tool loop calls PublishStreamChunk, the
+// bus delivers a StreamResponse carrying the chunk text, the
+// caller's correlation + target identity, and a StreamEventData
+// event. This is the invariant the bridge and chat model downstream
+// rely on for streamed text to reach the terminal.
+func TestPublishStreamChunkDeliversTextToBus(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	channels := guide.NewAgentChannels("librarian", "librarian-1")
+	streamCh := make(chan *guide.StreamResponse, 4)
+	sub, err := bus.SubscribeAsync(channels.Responses, func(m *guide.Message) error {
+		stream, ok := m.GetStreamResponse()
+		if ok && stream != nil {
+			streamCh <- stream
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	ctx := WithStreamContext(context.Background(), "corr-chunk", "tui")
+	// Start is required by publishWithStreamLifecycle's gate — data
+	// chunks emitted before Start are suppressed as a correctness
+	// feature, not a regression. Match the real tool-loop ordering.
+	if err := PublishStreamStart(bus, channels, ctx, "librarian-1"); err != nil {
+		t.Fatalf("PublishStreamStart: %v", err)
+	}
+	if err := PublishStreamChunk(bus, channels, ctx, "librarian-1", "searching the index"); err != nil {
+		t.Fatalf("PublishStreamChunk: %v", err)
+	}
+
+	var data *guide.StreamResponse
+	deadline := time.After(2 * time.Second)
+	for data == nil {
+		select {
+		case stream := <-streamCh:
+			if stream.Event != nil && stream.Event.Type == guide.StreamEventData {
+				data = stream
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for StreamEventData delivery")
+		}
+	}
+	if data.Event.Text != "searching the index" {
+		t.Fatalf("chunk text = %q, want %q", data.Event.Text, "searching the index")
+	}
+	if data.CorrelationID != "corr-chunk" {
+		t.Fatalf("correlation = %q, want corr-chunk", data.CorrelationID)
+	}
+	if data.RespondingAgentID != "librarian-1" {
+		t.Fatalf("responding agent = %q, want librarian-1", data.RespondingAgentID)
+	}
+	if data.TargetAgentID != "tui" {
+		t.Fatalf("target agent = %q, want tui", data.TargetAgentID)
+	}
+}
+
+// TestPublishStreamChunkPropagatesReplicaIdentity pins the
+// multi-replica contract: a replica whose context metadata carries
+// runtime_agent_id (via AttachReplicaHandoffBridge) emits chunks
+// whose StreamResponse.Metadata includes that runtime ID, so the
+// bridge can stamp RuntimeAgentID on the downstream message and the
+// chat model can render distinct per-replica rows.
+func TestPublishStreamChunkPropagatesReplicaIdentity(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	channels := guide.NewAgentChannels("librarian", "librarian-parent")
+	streamCh := make(chan *guide.StreamResponse, 4)
+	sub, err := bus.SubscribeAsync(channels.Responses, func(m *guide.Message) error {
+		stream, ok := m.GetStreamResponse()
+		if ok && stream != nil {
+			streamCh <- stream
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	ctx := WithStreamContext(context.Background(), "corr-replica", "tui")
+	ctx = WithStreamContextMetadata(ctx, map[string]any{
+		"runtime_agent_id":   "librarian#replica-corr-replica",
+		"handoff_replica_id": "librarian#replica-corr-replica",
+		"agent_type":         "librarian",
+		"agent_name":         "Librarian",
+	})
+	if err := PublishStreamStart(bus, channels, ctx, "librarian-parent"); err != nil {
+		t.Fatalf("PublishStreamStart: %v", err)
+	}
+	if err := PublishStreamChunk(bus, channels, ctx, "librarian-parent", "replica text"); err != nil {
+		t.Fatalf("PublishStreamChunk: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	var data *guide.StreamResponse
+	for data == nil {
+		select {
+		case stream := <-streamCh:
+			if stream.Event != nil && stream.Event.Type == guide.StreamEventData {
+				data = stream
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for replica chunk")
+		}
+	}
+	runtime, _ := data.Metadata["runtime_agent_id"].(string)
+	if runtime != "librarian#replica-corr-replica" {
+		t.Fatalf("metadata.runtime_agent_id = %q, want librarian#replica-corr-replica", runtime)
+	}
+	if data.Event.Text != "replica text" {
+		t.Fatalf("chunk text = %q", data.Event.Text)
+	}
+}
+
 func TestPublishStreamLifecycleUsesContextMetadata(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
@@ -199,6 +201,10 @@ type Guide struct {
 	// Session-scoped conversation flow tracking for interactive handoffs.
 	conversation   *ConversationFlowManager
 	workspaceViews versioning.WorkspaceViewAccess
+
+	// Tracked goroutine scope for async dispatch (prompt recording,
+	// subscriber notifications, non-blocking side effects).
+	scope *concurrency.GoroutineScope
 
 	// Handoff bridge for context-exhaustion lifecycle management
 	handoffBridge *handoff.HandoffBridge
@@ -2071,6 +2077,16 @@ func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *Rou
 		g.conversationWorkMetadata(request.SessionID),
 		mergeForwardMetadata(classification.PhaseMetadata, request.Metadata),
 	)
+
+	// Post the user prompt on the session claims board and inject the
+	// board ID into metadata. Dispatched async via scope.
+	if board := g.sessionClaimsBoard(request.SessionID); board != nil {
+		metadata = mergeForwardMetadata(metadata, map[string]any{
+			"session_board_id": board.BoardID(),
+		})
+		g.dispatchPromptAction(board, request, classification)
+	}
+
 	fwd := &ForwardedRequest{
 		CorrelationID:        correlationID,
 		ParentCorrelationID:  request.ParentCorrelationID,
@@ -2121,6 +2137,83 @@ func (g *Guide) conversationHistory(sessionID string, targetAgentID string) []Co
 		return nil
 	}
 	return g.conversation.HistoryForSessionAgent(sessionID, targetAgentID)
+}
+
+func (g *Guide) sessionClaimsBoard(sessionID string) *claims.ClaimsBoard {
+	if g.conversation == nil || strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	return g.conversation.SessionClaimsBoard(sessionID, adaptScope(g.scope))
+}
+
+// dispatchPromptAction posts the user prompt to the session board
+// asynchronously via the Guide's goroutine scope.
+func (g *Guide) dispatchPromptAction(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) {
+	reqCopy := *request
+	var classCopy *RouteResult
+	if classification != nil {
+		c := *classification
+		classCopy = &c
+	}
+
+	if err := g.scope.Go("guide_post_prompt_action", 5*time.Second, func(_ context.Context) error {
+		return postUserPromptAction(board, &reqCopy, classCopy)
+	}); err != nil {
+		slog.Error("guide_prompt_dispatch_failed", "session", request.SessionID, "error", err.Error())
+	}
+}
+
+// postUserPromptAction records the user's input on the session claims
+// board as a prompt action. Returns the error from the board write.
+func postUserPromptAction(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) error {
+	input := strings.TrimSpace(request.Input)
+	if input == "" {
+		return nil
+	}
+
+	targetAgent := ""
+	intent := ""
+	confidence := 0.0
+	if classification != nil {
+		targetAgent = string(classification.TargetAgent)
+		intent = string(classification.Intent)
+		confidence = classification.Confidence
+	}
+
+	action := claims.Action{AgentID: "guide", Type: claims.ActionTypePrompt}
+	promptClaim := claims.Claim{
+		Title:       truncateForClaim(input, 80),
+		Description: input,
+		ActionType:  claims.ActionTypePrompt,
+		Relations: []claims.Relation{
+			{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+		},
+		Tags: []string{"user_prompt"},
+	}
+	if targetAgent != "" {
+		promptClaim.Relations = append(promptClaim.Relations, claims.Relation{
+			Related: targetAgent, RelatedType: claims.RelatedTypeAgent,
+			Relationship: claims.RelationshipSubject,
+		})
+	}
+	if intent != "" {
+		promptClaim.Validations = append(promptClaim.Validations, &claims.Validation{
+			Description: fmt.Sprintf("Classified as intent=%s target=%s confidence=%.2f", intent, targetAgent, confidence),
+			QualityBar:  "Classification recorded for auditability",
+			Type:        claims.ValidationType("receipt"),
+			Status:      claims.ValidationStatusPassed,
+			Required:    false,
+		})
+	}
+
+	return board.PostAction(context.Background(), action, []claims.Claim{promptClaim})
+}
+
+func truncateForClaim(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
 
 func (g *Guide) attachEnrichment(
@@ -5552,6 +5645,11 @@ func (g *Guide) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	if bridge != nil {
 		bridge.SetActivityPublisher(g.activityPub)
 	}
+}
+
+// SetScope injects the goroutine scope for tracked async dispatch.
+func (g *Guide) SetScope(scope *concurrency.GoroutineScope) {
+	g.scope = scope
 }
 
 // SetCanonicalID overwrites the Guide's internal ID so a replacement

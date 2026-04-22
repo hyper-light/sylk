@@ -2,6 +2,7 @@ package pod
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -271,6 +272,17 @@ func (v *VFSVolume) ensureBindingLocked(reason string) error {
 }
 
 func (v *VFSVolume) rebindLocked(reason string) error {
+	// Honor the session's dispatch-gate backpressure before creating
+	// the pipeline VFS. docs/PARALLEL_GLOBAL_VFS.md §5.1. Pass-through
+	// when the session has no gate configured.
+	if err := v.sessionVFS.AcquireDispatchSlot(context.Background()); err != nil {
+		v.logTrace("vfs_volume_dispatch_gate_blocked", "warn", agentlog.EventError, map[string]any{
+			"pipeline_id": v.pipelineID,
+			"reason":      reason,
+			"error":       err.Error(),
+		})
+		return fmt.Errorf("vfs volume: dispatch gate: %w", err)
+	}
 	pipelineVFS, err := v.sessionVFS.BeginPipeline(versioning.BeginPipelineConfig{
 		PipelineID:      v.pipelineID,
 		SessionID:       v.sessionID,

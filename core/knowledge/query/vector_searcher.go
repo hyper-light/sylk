@@ -34,10 +34,6 @@ type VectorIndex interface {
 	Search(vector []float32, k int) (ids []string, distances []float32, err error)
 }
 
-// HNSWIndex is an alias for VectorIndex for backward compatibility.
-// Deprecated: Use VectorIndex instead.
-type HNSWIndex = VectorIndex
-
 // =============================================================================
 // Vector Searcher
 // =============================================================================

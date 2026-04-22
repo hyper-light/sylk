@@ -20,6 +20,7 @@ import (
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
@@ -56,6 +57,9 @@ type PipelineTester struct {
 	pipelineSlug string
 	pipelineName string
 
+	// Claims board (nil for non-claims pipelines).
+	claimsBoard *claims.ClaimsBoard
+
 	// State.
 	currentPlan     *shared.TestPlan
 	currentTask     *agentshared.PipelineTaskInput
@@ -70,6 +74,7 @@ type PipelineTester struct {
 	// Skills.
 	skills        *skills.Registry
 	skillLoader   *skills.Loader
+	hooks         *skills.HookRegistry
 	tools         *toolruntime.Runtime
 	toolDefsDirty bool
 
@@ -175,6 +180,7 @@ func applyConfigDefaults(cfg shared.PipelineTesterConfig) shared.PipelineTesterC
 
 func (pt *PipelineTester) initSkills() error {
 	pt.skills = skills.NewRegistry()
+	pt.hooks = skills.NewHookRegistry()
 
 	pt.registerCoreSkills()
 	if err := agentshared.RegisterMemoryForestSkills(pt.skills, "tester-pipeline", pt.config.Forest, pt.forestTracker); err != nil {
@@ -214,6 +220,7 @@ func (pt *PipelineTester) initSkills() error {
 	pt.skillLoader = skills.NewLoader(pt.skills, loaderCfg)
 	tools, err := toolruntime.New(toolruntime.Config{
 		Registry: pt.skills,
+		Hooks:    pt.hooks,
 		Manifest: pipelineTesterToolManifest(pt.skills),
 		State:    toolruntime.NewState(),
 	})
@@ -322,23 +329,6 @@ func (pt *PipelineTester) registerCoreSkills() {
 	for _, skill := range fabric.AwarenessSkills(awareCfg) {
 		pt.skills.Register(skill)
 	}
-	for _, skill := range agentshared.CrossPipelineSkills(agentshared.CrossPipelineSkillConfig{
-		SessionID:  func() string { return pt.config.SessionID },
-		AgentID:    func() string { return pt.id },
-		AgentType:  func() string { return "tester-pipeline" },
-		PipelineID: func() string { return pt.pipelineID },
-		RouteSync: agentshared.RouteSyncFromBus(
-			func() guide.EventBus { return pt.bus },
-			func() string {
-				if pt.channels == nil {
-					return ""
-				}
-				return pt.channels.Responses
-			},
-		),
-	}) {
-		pt.skills.Register(skill)
-	}
 	// Phase 5 of SCRIBE_FABRIC.md: recall_my_history lets the agent
 	// consult its own scribe biographer.
 	for _, skill := range fabric.RecallSkills(fabric.RecallSkillConfig{
@@ -349,22 +339,24 @@ func (pt *PipelineTester) registerCoreSkills() {
 	}) {
 		pt.skills.Register(skill)
 	}
-	for _, skill := range agentshared.PipelineProtocolSkills(agentshared.PipelineProtocolSkillConfig{
-		AgentType:      func() string { return "tester-pipeline" },
-		AgentID:        func() string { return pt.id },
-		WorkspaceViews: func() versioning.WorkspaceViewAccess { return pt.workspaceViews },
-		Route: agentshared.PipelineProtocolRouteConfig{
-			BusProvider: func() guide.EventBus { return pt.bus },
-			SessionID:   func() string { return pt.config.SessionID },
-			PublishReroute: func(ctx context.Context, toAgentID, reason, newCorrelationID string) {
-				agentshared.PublishPipelineHandoffReroute(pt.bus, pt.channels, ctx, "tester-pipeline", toAgentID, reason, newCorrelationID)
-			},
-		},
-		TesterFinalize:       pt.finalizeForTargets,
-		TesterCurrentSuiteID: pt.currentSuiteID,
-	}) {
+
+	// ── Claims skills (unconditional) ──────────────────────────────
+	//
+	// Every pipeline uses claims. No legacy protocol path.
+	boardProvider := func() *claims.ClaimsBoard { return pt.claimsBoard }
+	pt.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	pt.skills.Register(claims.PostActionSkill(boardProvider))
+	pt.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	pt.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
+	pt.skills.Register(claims.EvaluateValidationSkill(boardProvider))
+	pt.skills.Register(claims.PostRemediationClaimsSkill(boardProvider))
+	pt.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+
+	// Fabric claims awareness skills.
+	for _, skill := range fabric.ClaimsAwarenessSkills(awareCfg) {
 		pt.skills.Register(skill)
 	}
+
 	pt.skills.Register(agentshared.NewSelfDiagnosticSkill(&pipelineTesterDiag{pt: pt}))
 	pt.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   pt.id,
@@ -575,11 +567,6 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		return nil, fmt.Errorf("pipeline tester: %w: LLM provider not yet wired", agentshared.ErrAgentNotReady)
 	}
 
-	var closeProtocolState func()
-	ctx, closeProtocolState = agentshared.OpenPipelineTaskProtocolStateWithPublisher(
-		ctx, task, pt.bus, fwd.SessionID, "tester-pipeline",
-	)
-	defer closeProtocolState()
 	prevRuntime := pt.swapTaskRuntime(task)
 	defer pt.restoreTaskRuntime(prevRuntime)
 	userMessage := fwd.Input
@@ -609,9 +596,9 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 	// engineer's code → hand off to engineer") instead of protocol
 	// reasoning ("answer the challenger"), producing challenge_target_
 	// mismatch on every inspector-initiated verification turn.
-	if preamble := agentshared.PipelineProtocolStatePreamble(ctx); preamble != "" {
-		userMessage = preamble + "\n\n" + userMessage
-	}
+	// Surface claims board state to the LLM so it knows what claims
+	// it owns, what phase the board is in, and which skills to use.
+	userMessage = claims.PrependBoardPreamble(userMessage, pt.claimsBoard, "tester-pipeline")
 
 	systemPrompt := shared.PipelineTesterSystemPromptForWorkerAndContract(wt, contract)
 	if task != nil {
@@ -762,11 +749,6 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 		Scribe:        pt.agentPod,
 	})
 	protocolTask := agentshared.DecodePipelineTaskInput(fwd.Input)
-	var closeProtocolState func()
-	ctx, closeProtocolState = agentshared.OpenPipelineTaskProtocolStateWithPublisher(
-		ctx, protocolTask, pt.bus, fwd.SessionID, "tester-pipeline",
-	)
-	defer closeProtocolState()
 	startTime := time.Now()
 	toolEmitter := agentshared.NewToolCallEmitter(pt.bus, pt.channels, pt.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
@@ -1062,6 +1044,14 @@ func (pt *PipelineTester) SetWorkspaceViews(views versioning.WorkspaceViewAccess
 // SetExecutionBroker overrides the strict execution broker.
 func (pt *PipelineTester) SetExecutionBroker(broker purevfs.ExecutionBroker) {
 	pt.executionBroker = broker
+}
+
+// SetClaimsBoard injects the claims board for claims-based pipelines.
+// Must be called before initSkills. When set, the tester registers
+// claims skills instead of protocol skills, and run_test_suite is
+// phase-gated via the corrective hook.
+func (pt *PipelineTester) SetClaimsBoard(board *claims.ClaimsBoard) {
+	pt.claimsBoard = board
 }
 
 // SetHandoffBridge assigns the handoff bridge.

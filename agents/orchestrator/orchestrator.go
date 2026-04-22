@@ -115,6 +115,16 @@ type Orchestrator struct {
 	sessionVFS   map[string]*versioning.SessionVFS
 	sessionVFSMu sync.RWMutex
 
+	// sessionLifecycleHooks are invoked after SessionVFS creation
+	// (open hook) and before SessionVFS.Close (close hook). Used by
+	// cmd/tui.go to attach the MergeAuditCoordinator, AuditRejection-
+	// SLATracker, and any other session-scoped audit-loop machinery
+	// — the orchestrator itself remains audit-loop-agnostic per
+	// docs/PARALLEL_GLOBAL_VFS.md §0.
+	sessionHooksMu      sync.RWMutex
+	sessionOpenHooks    []func(*versioning.SessionVFS)
+	sessionCloseHooks   []func(*versioning.SessionVFS)
+
 	// Auth credential change subscription.
 	authSub guide.Subscription
 
@@ -169,6 +179,12 @@ func (o *Orchestrator) logInfo(msg string, args ...any) {
 func (o *Orchestrator) logWarnMsg(msg string, args ...any) {
 	if o != nil && o.logger != nil {
 		o.logger.Warn(msg, args...)
+	}
+}
+
+func (o *Orchestrator) logErrorMsg(msg string, args ...any) {
+	if o != nil && o.logger != nil {
+		o.logger.Error(msg, args...)
 	}
 }
 
@@ -603,7 +619,113 @@ func (o *Orchestrator) EnsureSessionVFS(sessionID, workingDir string) *versionin
 		return nil
 	}
 	o.sessionVFS[sessionID] = svfs
+	// Fire registered open hooks so cmd/tui.go can attach the
+	// audit coordinator + SLA tracker. Hook ordering: the audit
+	// coordinator must Start BEFORE the state resync publishes so
+	// any pending merges in the WAL that fire callbacks on replay
+	// land in a coordinator that's listening.
+	o.fireSessionOpenHooks(svfs)
+	// Broadcast the session's post-open state so observers (TUI,
+	// architect remediation resume) can rebuild their views of
+	// audit queue state, in-flight replicas, and accumulated open
+	// clock. See docs/PARALLEL_GLOBAL_VFS.md §11 stage 5 and
+	// agents/shared/session_state_sync.go.
+	if o.bus != nil {
+		if err := shared.PublishSessionStateResync(o.bus, svfs); err != nil {
+			o.logWarnMsg("publish session state resync", "session_id", sessionID, "error", err)
+		}
+	}
 	return svfs
+}
+
+// RegisterSessionOpenHook registers a callback invoked after every
+// successful SessionVFS open. Used by the session-lifecycle wiring
+// (cmd/tui.go) to instantiate per-session audit-loop machinery:
+// MergeAuditCoordinator, AuditRejectionSLATracker, etc. The hooks
+// fire synchronously; long-running setup should return promptly.
+//
+// The orchestrator does not participate in the audit loop — these
+// hooks are the only coupling point, and the orchestrator calls them
+// generically without knowing what they do (docs/PARALLEL_GLOBAL_VFS.md
+// §0 "The orchestrator has no role").
+func (o *Orchestrator) RegisterSessionOpenHook(fn func(*versioning.SessionVFS)) {
+	if fn == nil {
+		return
+	}
+	o.sessionHooksMu.Lock()
+	defer o.sessionHooksMu.Unlock()
+	o.sessionOpenHooks = append(o.sessionOpenHooks, fn)
+}
+
+// RegisterSessionCloseHook registers a callback invoked BEFORE
+// SessionVFS.Close. Pair with RegisterSessionOpenHook to tear down
+// the audit-loop machinery cleanly (coordinator.Stop, tracker.Stop,
+// bridge.Stop, etc.) before the session's WALs close.
+func (o *Orchestrator) RegisterSessionCloseHook(fn func(*versioning.SessionVFS)) {
+	if fn == nil {
+		return
+	}
+	o.sessionHooksMu.Lock()
+	defer o.sessionHooksMu.Unlock()
+	o.sessionCloseHooks = append(o.sessionCloseHooks, fn)
+}
+
+func (o *Orchestrator) fireSessionOpenHooks(svfs *versioning.SessionVFS) {
+	o.sessionHooksMu.RLock()
+	var hooks []func(*versioning.SessionVFS)
+	hooks = append(hooks, o.sessionOpenHooks...)
+	o.sessionHooksMu.RUnlock()
+	sessionID := ""
+	if svfs != nil {
+		sessionID = string(svfs.SessionID())
+	}
+	for i, hook := range hooks {
+		func(idx int) {
+			defer func() {
+				if r := recover(); r != nil {
+					// A panicking open hook leaves the session
+					// half-wired (e.g. coordinator unstarted, SLA
+					// tracker missing). Log at Error with stack-
+					// traceable context so operators can diagnose
+					// without losing the panic value.
+					o.logErrorMsg("session open hook panicked — isolated",
+						"session_id", sessionID,
+						"hook_index", idx,
+						"panic", fmt.Sprintf("%v", r),
+					)
+				}
+			}()
+			hook(svfs)
+		}(i)
+	}
+}
+
+func (o *Orchestrator) fireSessionCloseHooks(svfs *versioning.SessionVFS) {
+	o.sessionHooksMu.RLock()
+	var hooks []func(*versioning.SessionVFS)
+	hooks = append(hooks, o.sessionCloseHooks...)
+	o.sessionHooksMu.RUnlock()
+	sessionID := ""
+	if svfs != nil {
+		sessionID = string(svfs.SessionID())
+	}
+	for i, hook := range hooks {
+		func(idx int) {
+			defer func() {
+				if r := recover(); r != nil {
+					// A panicking close hook may leave goroutines
+					// running past session shutdown. Log at Error
+					// so leaks don't go unnoticed.
+					o.logErrorMsg("session close hook panicked — isolated",
+						"session_id", sessionID,
+						"hook_index", idx,
+						"panic", fmt.Sprintf("%v", r),
+					)
+				}
+			}()
+			hook(svfs)
+		}(i)
+	}
 }
 
 // CloseSessionVFS tears down the VFS infrastructure for a session.
@@ -618,6 +740,10 @@ func (o *Orchestrator) CloseSessionVFS(sessionID string) error {
 	if !ok || svfs == nil {
 		return nil
 	}
+	// Stop audit-loop machinery BEFORE the session's WALs close so
+	// close hooks can quiesce in-flight finalizers that still need
+	// to touch the commit queue / retention / lifecycle log.
+	o.fireSessionCloseHooks(svfs)
 	return svfs.Close()
 }
 
@@ -1480,7 +1606,7 @@ func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 	o.mu.Unlock()
 
 	// Authority discipline: the orchestrator does not commit task drafts.
-	// The pipeline inspector's handoff_to_ot already extracted the review
+	// The pipeline inspector's handoff_to_green already extracted the review
 	// candidate (or discard_pipeline rolled back) inside its skill handler.
 	// This handler is now strictly task-bookkeeping. See
 	// finalizePipelineUpdate for the rationale.

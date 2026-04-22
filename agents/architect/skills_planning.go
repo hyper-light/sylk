@@ -618,6 +618,7 @@ func atomicTaskToHandoff(t *AtomicTask) *HandoffTask {
 	if t.CollaborationMode != 0 {
 		h.CollaborationMode = t.CollaborationMode.String()
 	}
+	h.Claims = t.Claims
 	return h
 }
 

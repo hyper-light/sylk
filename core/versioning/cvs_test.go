@@ -9,7 +9,8 @@ import (
 
 func TestNewCVS(t *testing.T) {
 	cfg := createTestCVSConfig()
-	cvs := NewCVS(cfg)
+	cvs, err := NewCVS(cfg)
+	if err != nil { t.Fatalf("NewCVS: %v", err) }
 
 	if cvs == nil {
 		t.Fatal("expected non-nil CVS")
@@ -24,7 +25,8 @@ func TestNewCVS_CustomLockTTL(t *testing.T) {
 	cfg := createTestCVSConfig()
 	cfg.LockTTL = 10 * time.Second
 
-	cvs := NewCVS(cfg)
+	cvs, err := NewCVS(cfg)
+	if err != nil { t.Fatalf("NewCVS: %v", err) }
 
 	if cvs.defaultLockTTL != 10*time.Second {
 		t.Errorf("expected lock TTL 10s, got %v", cvs.defaultLockTTL)
@@ -777,7 +779,9 @@ func createTestCVSConfig() CVSConfig {
 func createTestCVS(t *testing.T) *DefaultCVS {
 	t.Helper()
 	cfg := createTestCVSConfig()
-	return NewCVS(cfg)
+	cvs, err := NewCVS(cfg)
+	if err != nil { t.Fatalf("NewCVS: %v", err) }
+	return cvs
 }
 
 type dagStoreAdapter struct {

@@ -3,7 +3,38 @@ package versioning
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 )
+
+// ParseSemanticVersion parses the canonical "Major.Minor" String()
+// representation back into a SemanticVersion. Accepts leading /
+// trailing whitespace but otherwise expects exactly two
+// dot-separated unsigned-integer components (e.g. "0.5", "1.12").
+// Returns an error on malformed input.
+//
+// Used by the orchestrator's pipeline-dispatch plumbing to parse the
+// "remediates_version" string the architect attaches to fix-workflow
+// tasks (docs/PARALLEL_GLOBAL_VFS.md §3.8).
+func ParseSemanticVersion(s string) (SemanticVersion, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return SemanticVersion{}, fmt.Errorf("parse semantic version: empty input")
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) != 2 {
+		return SemanticVersion{}, fmt.Errorf("parse semantic version %q: expected Major.Minor", s)
+	}
+	major, err := strconv.ParseUint(parts[0], 10, 32)
+	if err != nil {
+		return SemanticVersion{}, fmt.Errorf("parse semantic version %q: invalid major: %w", s, err)
+	}
+	minor, err := strconv.ParseUint(parts[1], 10, 32)
+	if err != nil {
+		return SemanticVersion{}, fmt.Errorf("parse semantic version %q: invalid minor: %w", s, err)
+	}
+	return SemanticVersion{Major: uint32(major), Minor: uint32(minor)}, nil
+}
 
 // SemanticVersion represents a two-component version: Major.Minor.
 // Major bumps on disk flushes (checkpoints), Minor bumps on pipeline merges (deltas).

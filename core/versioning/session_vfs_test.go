@@ -217,81 +217,6 @@ func TestSessionVFS_GlobalDraftWritesAdvanceWAL(t *testing.T) {
 	}
 }
 
-func TestSessionVFS_ReviewCandidateStaysOutOfCheckpointUntilAccepted(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "hello.txt")
-	if err := os.WriteFile(target, []byte("disk"), 0644); err != nil {
-		t.Fatalf("seed disk: %v", err)
-	}
-
-	svfs, err := NewSessionVFS(SessionVFSConfig{
-		SessionID:  "test-session",
-		WorkingDir: dir,
-	})
-	if err != nil {
-		t.Fatalf("NewSessionVFS: %v", err)
-	}
-	defer svfs.Close()
-
-	ctx := context.Background()
-	pipe, err := svfs.BeginPipeline(BeginPipelineConfig{
-		PipelineID: "task-1",
-		SessionID:  "test-session",
-		WorkingDir: dir,
-		Files:      []string{"hello.txt"},
-	})
-	if err != nil {
-		t.Fatalf("BeginPipeline: %v", err)
-	}
-	if err := pipe.Write(ctx, target, []byte("candidate")); err != nil {
-		t.Fatalf("pipeline write: %v", err)
-	}
-
-	candidate, err := svfs.ExtractReviewCandidate("task-1")
-	if err != nil {
-		t.Fatalf("ExtractReviewCandidate: %v", err)
-	}
-	if candidate == nil {
-		t.Fatal("expected extracted review candidate")
-	}
-	if svfs.HasPipeline("task-1") {
-		t.Fatal("expected pipeline to be closed after extraction")
-	}
-
-	globalContent, err := svfs.NewGlobalFileAccess(true).ReadFile(ctx, "hello.txt")
-	if err != nil {
-		t.Fatalf("global read before accept: %v", err)
-	}
-	if got := string(globalContent); got != "disk" {
-		t.Fatalf("global content before accept = %q, want %q", got, "disk")
-	}
-
-	if err := svfs.ActivateReviewCandidate(ctx, candidate.ID); err != nil {
-		t.Fatalf("ActivateReviewCandidate: %v", err)
-	}
-	reviewContent, err := svfs.NewReviewFileAccess(true).ReadFile(ctx, "hello.txt")
-	if err != nil {
-		t.Fatalf("review read: %v", err)
-	}
-	if got := string(reviewContent); got != "candidate" {
-		t.Fatalf("review content = %q, want %q", got, "candidate")
-	}
-
-	if _, changed, err := svfs.AcceptActiveReviewCandidate(ctx, "task-1"); err != nil {
-		t.Fatalf("AcceptActiveReviewCandidate: %v", err)
-	} else if !changed {
-		t.Fatal("expected accept to promote the candidate")
-	}
-
-	globalContent, err = svfs.NewGlobalFileAccess(true).ReadFile(ctx, "hello.txt")
-	if err != nil {
-		t.Fatalf("global read after accept: %v", err)
-	}
-	if got := string(globalContent); got != "candidate" {
-		t.Fatalf("global content after accept = %q, want %q", got, "candidate")
-	}
-}
-
 func TestSessionVFS_FlushCommitsDraftAndSeedsNextPipelineFromDisk(t *testing.T) {
 	dir := t.TempDir()
 	svfs, err := NewSessionVFS(SessionVFSConfig{
@@ -394,18 +319,6 @@ func dirEntryNamesFS(entries []os.DirEntry) []string {
 		names = append(names, entry.Name())
 	}
 	return names
-}
-
-func TestNewSessionVFS_RejectsPersistentSessionState(t *testing.T) {
-	dir := t.TempDir()
-	_, err := NewSessionVFS(SessionVFSConfig{
-		SessionID:           "test-session",
-		WorkingDir:          dir,
-		PersistSessionState: true,
-	})
-	if !errors.Is(err, ErrPersistentSessionStateDisabled) {
-		t.Fatalf("NewSessionVFS error = %v, want %v", err, ErrPersistentSessionStateDisabled)
-	}
 }
 
 func TestSessionVFS_BeginAndCommitPipeline(t *testing.T) {
@@ -522,11 +435,9 @@ func TestSessionVFS_CommitPipelineSkipsTransientExecutionArtifacts(t *testing.T)
 //     at green.
 //  5. Pipeline B's workspace_read sees Pipeline A's files.
 //
-// Before stage 1, Pipeline A's mods went into the ReviewCandidate map
-// on handoff_to_ot and were never promoted to green on rejection, so
-// Pipeline B's workspace_read returned empty for A's paths. Under
-// stage 1, MergePipelineIntoGreen lands the work in green directly, so
-// Pipeline B sees it.
+// Under stage 1, MergePipelineIntoGreen lands the work in green
+// directly, so Pipeline B sees Pipeline A's mods even when A's audit
+// rejects.
 func TestSessionVFS_MergePipelineIntoGreen_RemediationSeesPredecessorWork(t *testing.T) {
 	dir := t.TempDir()
 	svfs, err := NewSessionVFS(SessionVFSConfig{
@@ -560,7 +471,7 @@ func TestSessionVFS_MergePipelineIntoGreen_RemediationSeesPredecessorWork(t *tes
 	}
 
 	// Pipeline A's inspector accepts: merge directly into green.
-	res, err := svfs.MergePipelineIntoGreen(ctx, "task_a")
+	res, err := svfs.MergePipelineIntoGreen(ctx, "task_a", PipelineInspectorCertificate{})
 	if err != nil {
 		t.Fatalf("MergePipelineIntoGreen A: %v", err)
 	}
@@ -644,7 +555,7 @@ func TestSessionVFS_MergePipelineIntoGreen_EmptyDraftRollback(t *testing.T) {
 	}
 
 	pre := svfs.CurrentVersion()
-	res, err := svfs.MergePipelineIntoGreen(context.Background(), "task_empty")
+	res, err := svfs.MergePipelineIntoGreen(context.Background(), "task_empty", PipelineInspectorCertificate{})
 	if err != nil {
 		t.Fatalf("MergePipelineIntoGreen: %v", err)
 	}

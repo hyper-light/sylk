@@ -40,7 +40,7 @@ const finalizePipelineVerificationReference = "finalize_pipeline_verification"
 
 const (
 	PipelineAuditPhaseFinalizing  = "finalize_pipeline"
-	PipelineAuditPhaseHandoffToOT = "handoff_to_ot"
+	PipelineAuditPhaseHandoffToGreen = "handoff_to_green"
 )
 
 type PipelineTurnMode string
@@ -56,7 +56,7 @@ const (
 	PipelineProtocolActionHandoff  PipelineProtocolActionType = "handoff"
 	PipelineProtocolActionRefusal  PipelineProtocolActionType = "refusal"
 	PipelineProtocolActionValidate PipelineProtocolActionType = "validation"
-	PipelineProtocolActionOT       PipelineProtocolActionType = "handoff_to_ot"
+	PipelineProtocolActionOT       PipelineProtocolActionType = "handoff_to_green"
 )
 
 type PipelineValidationStatus string
@@ -354,22 +354,21 @@ type PipelineTesterFinalizeFn func(ctx context.Context, suiteID string, specs []
 type PipelineTesterSuiteIDFn func() string
 
 // PipelineCommitter is the inspector-owned authority that mutates the
-// pipeline VFS lifecycle. The pipeline inspector's handoff_to_ot and
+// pipeline VFS lifecycle. The pipeline inspector's handoff_to_green and
 // discard_pipeline skills call into this interface so the actual extract /
 // rollback operation is performed by the agent that decided it should
 // happen. Other pipeline agents (engineer, designer, tester) leave this
 // nil — they have no authority to commit or rollback.
 //
 // Background: the orchestrator used to react to "succeeded" / "failed"
-// pipeline-update broadcasts and call SessionVFS.ExtractReviewCandidate /
-// CommitPipeline / RollbackPipeline itself. That made the orchestrator the
-// effective owner of pipeline VFS lifecycle even though the protocol
-// designates the inspector as the only authorized terminator. The
-// resulting "edit_pipeline_file failed: VFS not found" reports were the
-// inspector seeing the orchestrator silently destroy the VFS while it
-// still had follow-up work queued. Moving the operations behind this
-// interface — invoked from the inspector's own skill handlers — keeps
-// authority where the protocol says it belongs.
+// pipeline-update broadcasts and call SessionVFS merge / rollback methods
+// itself. That made the orchestrator the effective owner of pipeline VFS
+// lifecycle even though the protocol designates the inspector as the only
+// authorized terminator. The resulting "edit_pipeline_file failed: VFS not
+// found" reports were the inspector seeing the orchestrator silently
+// destroy the VFS while it still had follow-up work queued. Moving the
+// operations behind this interface — invoked from the inspector's own
+// skill handlers — keeps authority where the protocol says it belongs.
 type PipelineCommitter interface {
 	// MergePipelineIntoGreen merges the pipeline's accumulated modifications
 	// directly into the session's global ("green") VFS via MergePipe/OT.
@@ -381,18 +380,17 @@ type PipelineCommitter interface {
 	// to any subsequently-dispatched pipeline (including remediation) that
 	// opens a new pipeline VFS against green.
 	//
+	// cert is the pipeline inspector's PipelineInspectorCertificate —
+	// declared scope, open concerns, summary, tester verdict. It is
+	// attached to the resulting MergeDescriptor so per-merge audit
+	// replicas can reason about the pipeline's local attestation
+	// alongside the cross-pipeline coherence picture. See
+	// docs/PARALLEL_GLOBAL_VFS.md §6.5.
+	//
 	// Returns MergePipelineResult describing the merge event (base/merged
 	// versions, path count, had-draft flag). Callers propagate this
 	// downstream for audit replica dispatch and observability.
-	MergePipelineIntoGreen(ctx context.Context, pipelineID string) (versioning.MergePipelineResult, error)
-
-	// ExtractReviewCandidate is the legacy pipeline-accept path that
-	// stashed mods in the review-candidate map. Retained for backward
-	// compatibility during the parallel-global-VFS transition; new
-	// callers should use MergePipelineIntoGreen instead.
-	//
-	// Deprecated: use MergePipelineIntoGreen.
-	ExtractReviewCandidate(ctx context.Context, pipelineID string) (candidateID string, hadDraft bool, version versioning.SemanticVersion, err error)
+	MergePipelineIntoGreen(ctx context.Context, pipelineID string, cert versioning.PipelineInspectorCertificate) (versioning.MergePipelineResult, error)
 
 	// Rollback discards a pipeline draft without merging it. Used by the
 	// inspector's discard_pipeline skill when work is judged
@@ -407,7 +405,7 @@ type PipelineProtocolSkillConfig struct {
 	WorkspaceViews func() versioning.WorkspaceViewAccess
 	Route          PipelineProtocolRouteConfig
 	// Committer returns the inspector-only VFS lifecycle authority.
-	// Required when InspectorOT is true (handoff_to_ot needs it); ignored
+	// Required when InspectorOT is true (handoff_to_green needs it); ignored
 	// otherwise. Lazy because the inspector's committer is wired after
 	// skill registration runs (the SessionVFS isn't available yet at
 	// agent construction). Returning nil from the lookup at call time is
@@ -780,7 +778,7 @@ func requiredPipelineActionMessage(action PipelineProtocolActionType, reason str
 		// finalize_pipeline is registered but not LLM-visible, so naming
 		// it in an error the LLM re-reads leaves the model looking for a
 		// tool that isn't in its catalog.
-		message := "Before ending this pipeline turn, `pipeline_protocol(action=finalize)` already determined the pipeline is ready for OT, so you must invoke `handoff_to_ot` now. Do not summarize the handoff, start another audit loop, choose a different terminal action, or continue with other queued work or other pipelines first."
+		message := "Before ending this pipeline turn, `pipeline_protocol(action=finalize)` already determined the pipeline is ready for OT, so you must invoke `handoff_to_green` now. Do not summarize the handoff, start another audit loop, choose a different terminal action, or continue with other queued work or other pipelines first."
 		if strings.TrimSpace(reason) != "" {
 			return message + " " + strings.TrimSpace(reason)
 		}
@@ -923,14 +921,14 @@ func ValidatePipelineProtocolCompletion(ctx context.Context, role string) error 
 				"pipeline.completion.inspector_post_validation_outstanding",
 				"",
 				"Before ending this inspector pipeline turn, you already called `pipeline_protocol(action=process_validation)`. Finish any remaining direct audit you still need, then record the next protocol step.",
-				"invoke pipeline_protocol(action=challenge|handoff|finalize) or handoff_to_ot",
+				"invoke pipeline_protocol(action=challenge|handoff|finalize) or handoff_to_green",
 			)
 		}
 		return NewPipelineProtocolError(
 			"pipeline.completion.inspector_no_terminal_action",
 			"",
 			"Before ending this pipeline turn, record the next protocol step.",
-			"invoke pipeline_protocol(action=challenge|handoff|validate|process_validation|finalize) or handoff_to_ot",
+			"invoke pipeline_protocol(action=challenge|handoff|validate|process_validation|finalize) or handoff_to_green",
 		)
 	}
 	return NewPipelineProtocolError(
@@ -1016,7 +1014,7 @@ func PipelineProtocolSkills(cfg PipelineProtocolSkillConfig) []*skills.Skill {
 //
 // When the caller's cfg doesn't populate a finalize variant, action=
 // finalize returns an error directing the caller to the appropriate
-// separate skill (e.g. handoff_to_ot for inspector terminal, or
+// separate skill (e.g. handoff_to_green for inspector terminal, or
 // rejection for agents that have no finalize role).
 func newPipelineProtocolUnifiedSkill(
 	cfg PipelineProtocolSkillConfig,
@@ -1192,7 +1190,7 @@ func dispatchPipelineProtocolDelegate(
 // History note: an earlier version of this helper rendered only
 // purpose + required fields + the first usage sentence, which silently
 // dropped delegate Requirements. The finalize delegate's post-condition
-// ("if ready_for_ot is true, call handoff_to_ot next") vanished from
+// ("if ready_for_ot is true, call handoff_to_green next") vanished from
 // the LLM's tool catalog, the inspector wedged in a finalize loop
 // after a passing audit, and the orchestrator's inbound request
 // hung. The fix routes every delegate through skills.RenderActionBlock
@@ -2162,8 +2160,8 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 		Priority(100).
 		Usage("Invoke this only after you have completed the current inspector audit of the returned implementation and processed any challenge responses needed for that audit. Pass the strongest criteria, implementation, test, and challenge evidence into the call. This tool is the closure gate: it may request or recognize the final tester-backed acceptance audit, and if that audit has already passed it means the pipeline is ready for OT. Do not use it as the default replacement for a targeted challenge or an ordinary top-level handoff.").
 		Requirement("Do not use ad hoc prose, local re-grading, or direct reroutes as a substitute for the closure path. If returned work is still unclear, challenge the responsible agent first. Once the current inspector audit is actually settled and any needed challenge responses have been consumed with `process_validation`, use `finalize_pipeline` to determine whether another loop is truly required or the pipeline is ready for OT.").
-		Requirement("If this tool returns `ready_for_ot: true` or `must_handoff_to_ot: true`, your next terminal protocol action in this turn must be `handoff_to_ot`. Do not end the turn, summarize the handoff, pick another terminal action, or continue with other queued work or other pipelines first. This completed pipeline takes priority until `handoff_to_ot` is invoked.").
-		Satisfies("Runs the pipeline closure gate, using the current audit evidence to issue or recognize the final tester-backed acceptance audit and, when that gate passes, requiring the inspector to call `handoff_to_ot` next.").
+		Requirement("If this tool returns `ready_for_ot: true` or `must_handoff_to_green: true`, your next terminal protocol action in this turn must be `handoff_to_green`. Do not end the turn, summarize the handoff, pick another terminal action, or continue with other queued work or other pipelines first. This completed pipeline takes priority until `handoff_to_green` is invoked.").
+		Satisfies("Runs the pipeline closure gate, using the current audit evidence to issue or recognize the final tester-backed acceptance audit and, when that gate passes, requiring the inspector to call `handoff_to_green` next.").
 		StringParam("summary", "The inspector's current closure judgment and why the pipeline is or is not ready to move toward OT", true).
 		ArrayParam("evidence_refs", "Criteria, tests, challenge responses, artifacts, and files the inspector used in the current closure decision", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -2195,11 +2193,11 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 				return map[string]any{
 					"finalize_pipeline":         true,
 					"ready_for_ot":              true,
-					"must_handoff_to_ot":        true,
-					"must_invoke_now":           "handoff_to_ot",
-					"required_next_action":      "handoff_to_ot",
+					"must_handoff_to_green":     true,
+					"must_invoke_now":           "handoff_to_green",
+					"required_next_action":      "handoff_to_green",
 					"required_next_action_only": true,
-					"next_required_action":      "handoff_to_ot",
+					"next_required_action":      "handoff_to_green",
 					"agent_type":                agentType,
 					"challenge_id":              strings.TrimSpace(record.ChallengeID),
 					"evidence_refs":             normalizeStringList(append(append([]string(nil), evidenceRefs...), record.EvidenceRefs...)),
@@ -2307,27 +2305,31 @@ func pipelineFinalizePipelineSkill(cfg PipelineProtocolSkillConfig) *skills.Skil
 }
 
 func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
-	return skills.NewSkill("handoff_to_ot").
-		Description("Finalize an accepted pipeline and hand the result to Operational Transform for merge. Inspector only.").
+	return skills.NewSkill("handoff_to_green").
+		Description("Finalize an accepted pipeline and hand the result to Operational Transform for merge into green. Inspector only.").
 		Domain("pipeline").
-		Keywords("ot", "merge", "accept", "finalize", "pipeline").
+		Keywords("green", "ot", "merge", "accept", "finalize", "pipeline").
 		Priority(100).
-		Usage("Use immediately after `finalize_pipeline` reports `ready_for_ot: true` / `must_handoff_to_ot: true`, or when the inspector has otherwise already determined the latest audit cycle passed and the pipeline should terminate successfully.").
+		Usage("Use immediately after `finalize_pipeline` reports `ready_for_ot: true` / `must_handoff_to_green: true`, or when the inspector has otherwise already determined the latest audit cycle passed and the pipeline should terminate successfully.").
 		Requirement("When `finalize_pipeline` says the pipeline is ready for OT, invoke this immediately as the next terminal protocol action. Do not narrate the handoff instead of calling the tool, and do not continue with other queued work or other pipelines before invoking it.").
 		Satisfies("Marks the pipeline as accepted and ready for OT merge, including the required terminal step after a passing `finalize_pipeline` result.").
 		StringParam("summary", "Why the pipeline is ready for OT merge", true).
+		StringParam("declared_scope", "What this pipeline accepted as done (e.g. 'implemented fn A in pkg/x', 'added tests for case Y'). Surfaced to global audit replicas via the MergeDescriptor's PipelineInspectorCertificate.", false).
+		ArrayParam("open_concerns", "Non-blocking issues the pipeline inspector flagged but accepted anyway (e.g. 'minor lint warnings in pkg/y'). Surfaced to global audit replicas on the certificate.", "string", false).
 		ArrayParam("evidence_refs", "Criteria, tests, artifacts, and files supporting acceptance", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
-				Summary      string   `json:"summary"`
-				EvidenceRefs []string `json:"evidence_refs"`
+				Summary       string   `json:"summary"`
+				DeclaredScope string   `json:"declared_scope"`
+				OpenConcerns  []string `json:"open_concerns"`
+				EvidenceRefs  []string `json:"evidence_refs"`
 			}
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 			agentType := pipelineProtocolAgentType(ctx, cfg)
 			if agentType != PipelineAgentInspector {
-				return nil, fmt.Errorf("handoff_to_ot is only permitted for the pipeline inspector")
+				return nil, fmt.Errorf("handoff_to_green is only permitted for the pipeline inspector")
 			}
 			summary := strings.TrimSpace(params.Summary)
 			if summary == "" {
@@ -2338,6 +2340,8 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 				return nil, fmt.Errorf("pipeline protocol state not available")
 			}
 			evidenceRefs := normalizeStringList(params.EvidenceRefs)
+			openConcerns := normalizeStringList(params.OpenConcerns)
+			declaredScope := strings.TrimSpace(params.DeclaredScope)
 			action := &PipelineTurnAction{
 				Type:         PipelineProtocolActionOT,
 				AgentType:    agentType,
@@ -2345,7 +2349,7 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 				Summary:      summary,
 				EvidenceRefs: evidenceRefs,
 			}
-			if err := state.recordHandoffToOT(ctx, action); err != nil {
+			if err := state.recordHandoffToGreen(ctx, action); err != nil {
 				return nil, err
 			}
 			if err := state.setTerminalAction(&PipelineTurnAction{
@@ -2358,48 +2362,50 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 				return nil, err
 			}
 
-			// Inspector-owned VFS authority: extract the review candidate
-			// here, where the inspector decided the pipeline is done. The
-			// orchestrator no longer reacts to "succeeded" status broadcasts
-			// to mutate the VFS — that previously made the orchestrator the
-			// effective owner of pipeline lifecycle and produced
-			// "edit_pipeline_file failed: VFS not found" reports when the
-			// orchestrator destroyed the VFS while the inspector still had
-			// follow-up work queued. If the committer is missing the inspector
-			// is misconfigured at registration; fail loudly rather than
-			// silently broadcasting success without the side effect.
+			// Inspector-owned VFS authority: the inspector calls the
+			// committer here. The orchestrator does not observe
+			// pipeline-update broadcasts to mutate the VFS — that prior
+			// split authority produced "edit_pipeline_file failed: VFS
+			// not found" reports when the orchestrator destroyed the
+			// VFS while the inspector still had follow-up work queued.
+			// If the committer is missing the inspector is misconfigured
+			// at registration; fail loudly.
 			//
-			// When no pipeline task is bound (protocol-only tests, fallback
-			// contexts), the extract is a no-op and we just publish the
-			// protocol state change — matching the prior behavior for this
-			// pre-refactor edge case.
+			// When no pipeline task is bound (protocol-only tests), the
+			// merge is skipped and the protocol state change is still
+			// published.
 			task := pipelineTerminalUpdateTask(ctx, cfg)
 			pipelineID := ""
 			if task != nil {
 				pipelineID = strings.TrimSpace(task.TaskID)
 			}
-			// Parallel-global-VFS design: handoff_to_ot merges the
+			// Parallel-global-VFS design: handoff_to_green merges the
 			// pipeline's accumulated modifications directly into the
 			// session's green global VFS via MergePipe/OT. After this
 			// call, the pipeline's work is visible to:
 			//   - sibling pipelines reading through the base reader
 			//   - any subsequently-dispatched pipeline (including
 			//     remediation) that opens its own pipeline VFS
-			// The legacy ReviewCandidate intermediate is retired on this
-			// path; see docs/PARALLEL_GLOBAL_VFS.md.
+			// See docs/PARALLEL_GLOBAL_VFS.md.
 			hadDraft := false
 			var baseVersion versioning.SemanticVersion
 			var mergedVersion versioning.SemanticVersion
 			pathCount := 0
 			if pipelineID != "" {
 				if cfg.Committer == nil {
-					return nil, fmt.Errorf("handoff_to_ot requires a configured pipeline committer (inspector misconfiguration)")
+					return nil, fmt.Errorf("handoff_to_green requires a configured pipeline committer (inspector misconfiguration)")
 				}
 				committer := cfg.Committer()
 				if committer == nil {
-					return nil, fmt.Errorf("handoff_to_ot requires a configured pipeline committer (inspector misconfiguration)")
+					return nil, fmt.Errorf("handoff_to_green requires a configured pipeline committer (inspector misconfiguration)")
 				}
-				result, mergeErr := committer.MergePipelineIntoGreen(ctx, pipelineID)
+				cert := versioning.PipelineInspectorCertificate{
+					DeclaredScope: declaredScope,
+					OpenConcerns:  openConcerns,
+					Summary:       summary,
+					TesterVerdict: derivePipelineTesterVerdict(state),
+				}
+				result, mergeErr := committer.MergePipelineIntoGreen(ctx, pipelineID, cert)
 				if mergeErr != nil {
 					return nil, fmt.Errorf("merge pipeline %s into green: %w", pipelineID, mergeErr)
 				}
@@ -2416,17 +2422,15 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 					task,
 					summary,
 					map[string]any{
-						"summary":         summary,
-						"evidence_refs":   evidenceRefs,
-						"had_draft":       hadDraft,
-						"base_version":    baseVersion.String(),
-						"merged_version":  mergedVersion.String(),
-						"paths_merged":    pathCount,
-						// Legacy key preserved for any residual consumer.
-						// Empty under the parallel-global-VFS design; the
-						// review-candidate ID intermediate is retired.
-						"review_candidate_id": "",
-						"checkpoint_version":  mergedVersion.String(),
+						"summary":            summary,
+						"evidence_refs":      evidenceRefs,
+						"declared_scope":     declaredScope,
+						"open_concerns":      openConcerns,
+						"had_draft":          hadDraft,
+						"base_version":       baseVersion.String(),
+						"merged_version":     mergedVersion.String(),
+						"paths_merged":       pathCount,
+						"checkpoint_version": mergedVersion.String(),
 					},
 					PipelineTaskAttempt(task),
 				)
@@ -2477,7 +2481,7 @@ func pipelineHandoffOTSkill(cfg PipelineProtocolSkillConfig) *skills.Skill {
 			}
 
 			return map[string]any{
-				"handoff_to_ot":       true,
+				"handoff_to_green":    true,
 				"agent_type":          agentType,
 				"evidence_refs":       evidenceRefs,
 				"had_draft":           hadDraft,
@@ -3089,6 +3093,48 @@ func normalizeStringList(values []string) []string {
 		out = append(out, trimmed)
 	}
 	return out
+}
+
+// derivePipelineTesterVerdict maps the pipeline protocol state's most
+// recent tester-originated validation to one of the three verdict
+// strings the PipelineInspectorCertificate carries: "pass", "fail",
+// "skip". See docs/PARALLEL_GLOBAL_VFS.md §6.5.
+//
+// The inspector reaches handoff_to_green only after finalize_pipeline
+// has resolved any pending tester challenges, so the latest
+// tester-agent validation in the state's processed log is the tester's
+// verdict on this pipeline. Absence of any tester validation means the
+// pipeline did not require a tester audit (skip).
+func derivePipelineTesterVerdict(state *PipelineProtocolState) string {
+	if state == nil {
+		return "skip"
+	}
+	// Walk processed validations newest-first and return the decision
+	// of the most recent tester-agent entry.
+	processed := state.ProcessedValidations()
+	for i := len(processed) - 1; i >= 0; i-- {
+		entry := processed[i]
+		if entry.AgentType != PipelineAgentTester {
+			continue
+		}
+		switch entry.Decision {
+		case PipelineValidationDecisionAccept:
+			return "pass"
+		case PipelineValidationDecisionReject:
+			return "fail"
+		case PipelineValidationDecisionClarify:
+			// A clarify outcome means the tester asked for more
+			// information — the inspector would not reach
+			// handoff_to_green while a clarify is open. If we see one
+			// as the latest recorded entry it was already resolved
+			// through a subsequent accept the inspector saw in
+			// finalize_pipeline; treat it as a skip from the
+			// certificate's point of view so the audit replica sees
+			// the tester-verdict field as informational only.
+			return "skip"
+		}
+	}
+	return "skip"
 }
 
 func pipelineProtocolRouteEnabled(ctx context.Context, cfg PipelineProtocolSkillConfig) bool {

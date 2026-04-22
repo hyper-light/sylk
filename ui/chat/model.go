@@ -250,6 +250,12 @@ type nestedStreamSlot struct {
 type resumablePrimaryState struct {
 	visibleAgentID string
 	agentType      string
+	// runtimeAgentID pins this primary to a specific replica of its
+	// parent agent. Two concurrent librarian replicas share
+	// visibleAgentID/agentType but carry distinct RuntimeAgentID
+	// values; requiring match here keeps their rows independent so
+	// one never resumes into another.
+	runtimeAgentID string
 	sessionID      string
 	taskID         string
 	children       map[string]struct{}
@@ -943,6 +949,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		Source:         SourceAgent,
 		AgentType:      streamAgentType,
 		AgentID:        start.AgentID,
+		RuntimeAgentID: strings.TrimSpace(start.RuntimeAgentID),
 		TaskID:         strings.TrimSpace(start.TaskID),
 		TaskName:       strings.TrimSpace(start.TaskName),
 		TaskSlug:       strings.TrimSpace(start.TaskSlug),
@@ -952,6 +959,16 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		Streaming:      true,
 		ThinkingText:   spinnerFrames[0] + "  0.0s",
 		ThinkingStatus: thinkingMessagesForAgent(streamAgentType)[0],
+	}
+	// If the buffer is full and the entry about to be evicted is
+	// still streaming, grow the buffer instead of dropping in-flight
+	// chunks. Same principle as the pipeline-lifecycle-disk-commit
+	// rule: work isn't safe to tear down until it completes. Growth
+	// is bounded in practice because streams finish in seconds and
+	// the newly-expanded slots get re-used by subsequent evictions
+	// once the streaming entries complete.
+	for m.history.Full() && m.history.OldestIsStreaming() {
+		m.history.Grow(1)
 	}
 	willEvict := m.history.Full()
 	m.history.Push(entry)
@@ -1051,6 +1068,11 @@ func (m *Model) resumablePrimaryMatchesChildOwner(correlationID string, start ms
 		return false
 	}
 	if agentType := streamEntryAgentType(start); agentType != "" && badgeAgentType(entry) != agentType {
+		return false
+	}
+	// Replica scoping (see resumablePrimaryMatches): mismatched
+	// runtime IDs must not cross-consolidate.
+	if runtimeID := strings.TrimSpace(start.RuntimeAgentID); runtimeID != "" && state.runtimeAgentID != "" && state.runtimeAgentID != runtimeID {
 		return false
 	}
 	if sessionID := strings.TrimSpace(start.SessionID); sessionID != "" && state.sessionID != "" && state.sessionID != sessionID {
@@ -5185,6 +5207,7 @@ func (m *Model) recordResumableCompletedPrimary(correlationID string, slot *stre
 	state := resumablePrimaryState{
 		visibleAgentID: entryVisibleAgentID(entry),
 		agentType:      badgeAgentType(entry),
+		runtimeAgentID: strings.TrimSpace(entry.RuntimeAgentID),
 		sessionID:      strings.TrimSpace(entry.SessionID),
 		taskID:         strings.TrimSpace(entry.TaskID),
 		children:       make(map[string]struct{}),
@@ -5359,6 +5382,12 @@ func (m *Model) resumablePrimaryMatches(correlationID string, start msg.StreamSt
 		return false
 	}
 	if agentType := streamEntryAgentType(start); agentType != "" && badgeAgentType(entry) != agentType {
+		return false
+	}
+	// Replica scoping: if either side names a runtime agent, both
+	// must agree. Keeps parallel librarian replicas on independent
+	// rows even though they share visibleAgentID + agentType.
+	if runtimeID := strings.TrimSpace(start.RuntimeAgentID); runtimeID != "" && state.runtimeAgentID != "" && state.runtimeAgentID != runtimeID {
 		return false
 	}
 	if sessionID := strings.TrimSpace(start.SessionID); sessionID != "" && state.sessionID != "" && state.sessionID != sessionID {

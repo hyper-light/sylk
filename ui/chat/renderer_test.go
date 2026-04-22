@@ -2218,3 +2218,127 @@ func TestRenderInterAgentOverflowControlLabel_AnnotatesHiddenFailures(t *testing
 		t.Fatalf("overflow label without hidden failures must not annotate, got %q", plain)
 	}
 }
+
+// TestRenderEntry_Phase2cTrailingActivity_UsesAnimatedStyle is the
+// regression guard for the "engineer's animation has stopped / thinking
+// text is gray / no bottom spinner+timer" bug class. When the parent
+// agent is still streaming (Streaming=true) and has content PLUS a
+// pending inter-agent child (ThinkingStatus carries the "working
+// through..." message), the Phase 2c trailing activity line must
+// render with:
+//
+//   1. An animated spinner frame (from entry.ThinkingText, which
+//      tickThinking updates each frame with spinner+elapsed).
+//   2. An elapsed timer (part of ThinkingText).
+//   3. The animated thinking color (entry.ThinkingColor), NOT the
+//      muted palette.
+//
+// Pre-fix behavior rendered the line as a static "<summary-glyph>
+// <status>" in the muted palette — the parent agent looked idle while
+// inter-agent children were still pending.
+func TestRenderEntry_Phase2cTrailingActivity_UsesAnimatedStyle(t *testing.T) {
+	th := theme.DefaultDark()
+	entry := &ChatEntry{
+		ID:             "trail-1",
+		Timestamp:      time.Now(),
+		Source:         SourceAgent,
+		AgentType:      "engineer",
+		Streaming:      true,
+		Content:        "I have started implementing the fix.",
+		ThinkingText:   "⠋  1m20s",
+		ThinkingStatus: "Working through this with challenge agent.",
+		ThinkingColor:  "#AABBCC",
+	}
+
+	lines, _ := RenderEntry(entry, 80, th, nil)
+	// Find the line that carries the trailing activity indicator.
+	// Strip ANSI so we can match on text.
+	var indicatorLine string
+	for _, line := range lines {
+		stripped := stripANSITest(line)
+		if strings.Contains(stripped, "Working through this with challenge agent.") {
+			indicatorLine = line
+			break
+		}
+	}
+	if indicatorLine == "" {
+		t.Fatal("Phase 2c trailing activity line not rendered")
+	}
+
+	// The indicator must include BOTH the spinner+timer segment from
+	// ThinkingText AND the status text.
+	stripped := stripANSITest(indicatorLine)
+	if !strings.Contains(stripped, "1m20s") {
+		t.Fatalf("trailing activity line = %q, want it to include the elapsed timer from ThinkingText", stripped)
+	}
+	if !strings.Contains(stripped, "Working through this with challenge agent.") {
+		t.Fatalf("trailing activity line = %q, want it to include the status text", stripped)
+	}
+
+	// The indicator must render both the spinner+timer prefix AND the
+	// status — verifying the animated style composition. We cannot
+	// assert on ANSI escape codes because lipgloss degrades to plain
+	// text when no TTY is attached (test environment), but the
+	// text composition itself proves the fix: pre-fix rendering used
+	// a static summary glyph with ONLY the status and never the
+	// spinner-frame+timer segment.
+	if !strings.Contains(stripped, "⠋") {
+		t.Fatalf("trailing activity line = %q, want it to include the animated spinner frame", stripped)
+	}
+}
+
+// TestRenderEntry_Phase2cTrailingActivity_FallbackWhenOnlyStatus
+// verifies that if ThinkingText is empty (early state before
+// tickThinking has fired) but ThinkingStatus is present, the indicator
+// still renders — falling back to the summary glyph prefix instead
+// of hiding the line entirely. This preserves the pre-fix behavior
+// for the fallback path.
+func TestRenderEntry_Phase2cTrailingActivity_FallbackWhenOnlyStatus(t *testing.T) {
+	th := theme.DefaultDark()
+	entry := &ChatEntry{
+		ID:             "trail-2",
+		Timestamp:      time.Now(),
+		Source:         SourceAgent,
+		AgentType:      "engineer",
+		Streaming:      true,
+		Content:        "Making progress.",
+		ThinkingStatus: "Consulting the architect.",
+	}
+
+	lines, _ := RenderEntry(entry, 80, th, nil)
+	var found bool
+	for _, line := range lines {
+		if strings.Contains(stripANSITest(line), "Consulting the architect.") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("trailing activity line must render when ThinkingStatus is the only indicator")
+	}
+}
+
+// TestRenderEntry_Phase2cTrailingActivity_HiddenWhenNotStreaming
+// verifies that once the stream completes, the trailing activity line
+// no longer renders. This protects against an infinite "working on it"
+// indicator on completed entries.
+func TestRenderEntry_Phase2cTrailingActivity_HiddenWhenNotStreaming(t *testing.T) {
+	th := theme.DefaultDark()
+	entry := &ChatEntry{
+		ID:             "trail-3",
+		Timestamp:      time.Now(),
+		Source:         SourceAgent,
+		AgentType:      "engineer",
+		Streaming:      false,
+		Content:        "I am done.",
+		ThinkingText:   "⠋  1m20s",
+		ThinkingStatus: "Working...",
+	}
+
+	lines, _ := RenderEntry(entry, 80, th, nil)
+	for _, line := range lines {
+		if strings.Contains(stripANSITest(line), "Working...") {
+			t.Fatalf("trailing activity line rendered on a non-streaming entry: %q", line)
+		}
+	}
+}

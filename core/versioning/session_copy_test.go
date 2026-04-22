@@ -42,7 +42,7 @@ func TestSessionVFS_MergeDescriptors_RecordedOnEachMerge(t *testing.T) {
 	if err := svfs.NewPipelineFileAccess(pipeA).WriteFile(ctx, pathA, []byte("a\n")); err != nil {
 		t.Fatalf("WriteFile A: %v", err)
 	}
-	resA, err := svfs.MergePipelineIntoGreen(ctx, "task_a")
+	resA, err := svfs.MergePipelineIntoGreen(ctx, "task_a", PipelineInspectorCertificate{})
 	if err != nil {
 		t.Fatalf("MergePipelineIntoGreen A: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestSessionVFS_MergeDescriptors_RecordedOnEachMerge(t *testing.T) {
 	if err := svfs.NewPipelineFileAccess(pipeB).WriteFile(ctx, pathB, []byte("b\n")); err != nil {
 		t.Fatalf("WriteFile B: %v", err)
 	}
-	resB, err := svfs.MergePipelineIntoGreen(ctx, "task_b")
+	resB, err := svfs.MergePipelineIntoGreen(ctx, "task_b", PipelineInspectorCertificate{})
 	if err != nil {
 		t.Fatalf("MergePipelineIntoGreen B: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestSessionVFS_CopyAt_MaterializesHistoricalState(t *testing.T) {
 	if err := svfs.NewPipelineFileAccess(pipeA).WriteFile(ctx, pathA, []byte("v1")); err != nil {
 		t.Fatalf("WriteFile A: %v", err)
 	}
-	resA, err := svfs.MergePipelineIntoGreen(ctx, "task_a")
+	resA, err := svfs.MergePipelineIntoGreen(ctx, "task_a", PipelineInspectorCertificate{})
 	if err != nil {
 		t.Fatalf("MergePipelineIntoGreen A: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestSessionVFS_CopyAt_MaterializesHistoricalState(t *testing.T) {
 	if err := svfs.NewPipelineFileAccess(pipeB).WriteFile(ctx, pathA, []byte("v2")); err != nil {
 		t.Fatalf("WriteFile B: %v", err)
 	}
-	resB, err := svfs.MergePipelineIntoGreen(ctx, "task_b")
+	resB, err := svfs.MergePipelineIntoGreen(ctx, "task_b", PipelineInspectorCertificate{})
 	if err != nil {
 		t.Fatalf("MergePipelineIntoGreen B: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestSessionVFS_BeginPipeline_WithBaseCopyVersion_PinsIsolation(t *testing.T
 	if err := svfs.NewPipelineFileAccess(pipeA).WriteFile(ctx, sharedPath, []byte("v1")); err != nil {
 		t.Fatalf("WriteFile A: %v", err)
 	}
-	resA, err := svfs.MergePipelineIntoGreen(ctx, "task_a")
+	resA, err := svfs.MergePipelineIntoGreen(ctx, "task_a", PipelineInspectorCertificate{})
 	if err != nil {
 		t.Fatalf("MergePipelineIntoGreen A: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestSessionVFS_BeginPipeline_WithBaseCopyVersion_PinsIsolation(t *testing.T
 	if err := svfs.NewPipelineFileAccess(pipeC).WriteFile(ctx, sharedPath, []byte("v-from-C")); err != nil {
 		t.Fatalf("WriteFile C: %v", err)
 	}
-	if _, err := svfs.MergePipelineIntoGreen(ctx, "task_c"); err != nil {
+	if _, err := svfs.MergePipelineIntoGreen(ctx, "task_c", PipelineInspectorCertificate{}); err != nil {
 		t.Fatalf("MergePipelineIntoGreen C: %v", err)
 	}
 

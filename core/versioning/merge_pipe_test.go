@@ -5,7 +5,17 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
+
+func newMergePipeTestCtx(t *testing.T) context.Context {
+	t.Helper()
+	scope := concurrency.NewGoroutineScope(context.Background(), "merge-pipe-test", nil)
+	t.Cleanup(func() { _ = scope.Shutdown(100*time.Millisecond, 2*time.Second) })
+	return concurrency.WithScope(context.Background(), scope)
+}
 
 func TestMergePipe_SinglePipeline(t *testing.T) {
 	dir := t.TempDir()
@@ -26,7 +36,9 @@ func TestMergePipe_SinglePipeline(t *testing.T) {
 		WAL:       wal,
 		OTEngine:  NewOTEngine(),
 	})
-	mp.Start()
+	if err := mp.Start(newMergePipeTestCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	defer mp.Stop()
 
 	if err := mp.RegisterPipeline("pipe1"); err != nil {
@@ -68,7 +80,9 @@ func TestMergePipe_TwoPipelines(t *testing.T) {
 		WAL:       wal,
 		OTEngine:  NewOTEngine(),
 	})
-	mp.Start()
+	if err := mp.Start(newMergePipeTestCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	defer mp.Stop()
 
 	mp.RegisterPipeline("pipe1")
@@ -109,7 +123,9 @@ func TestMergePipe_StopCleanup(t *testing.T) {
 		WAL:       wal,
 		OTEngine:  NewOTEngine(),
 	})
-	mp.Start()
+	if err := mp.Start(newMergePipeTestCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	mp.Stop()
 
 	// After stop, Merge should fail.
@@ -174,7 +190,9 @@ func TestMergePipe_PreciseDisjointSameFileMerges(t *testing.T) {
 		WAL:       wal,
 		OTEngine:  NewOTEngine(),
 	})
-	mp.Start()
+	if err := mp.Start(newMergePipeTestCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	defer mp.Stop()
 
 	if err := mp.RegisterPipeline("pipe1"); err != nil {

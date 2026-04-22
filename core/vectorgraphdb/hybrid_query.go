@@ -112,12 +112,12 @@ type VectorGraphDBHybridAdapterConfig struct {
 	// DB is the VectorGraphDB instance to wrap.
 	DB *VectorGraphDB
 
-	// VectorIndex is the vector index for vector search.
+	// VectorIndex is the ANN index used for vector search. The
+	// production implementation is the Vamana (DiskANN) graph plus
+	// IVF partitioning with BBQ/sharded quantization (see
+	// core/vectorgraphdb/vamana). The field is named generically so
+	// alternate indexes can be swapped in without touching callers.
 	VectorIndex VectorIndexSearcher
-
-	// HNSW is an alias for VectorIndex for backward compatibility.
-	// Deprecated: Use VectorIndex instead.
-	HNSW VectorIndexSearcher
 
 	// DomainHint is an optional domain to filter results.
 	DomainHint *Domain
@@ -129,15 +129,9 @@ func NewVectorGraphDBHybridAdapter(config VectorGraphDBHybridAdapterConfig) *Vec
 		return nil
 	}
 
-	// Support both new VectorIndex and deprecated HNSW field
-	vectorIndex := config.VectorIndex
-	if vectorIndex == nil {
-		vectorIndex = config.HNSW
-	}
-
 	adapter := &VectorGraphDBHybridAdapter{
 		db:          config.DB,
-		vectorIndex: vectorIndex,
+		vectorIndex: config.VectorIndex,
 		nodeStore:   NewNodeStore(config.DB, nil),
 		edgeStore:   NewEdgeStore(config.DB),
 		traverser:   NewGraphTraverser(config.DB),
@@ -600,12 +594,6 @@ func (a *VectorGraphDBHybridAdapter) SetVectorIndex(vectorIndex VectorIndexSearc
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.vectorIndex = vectorIndex
-}
-
-// SetHNSW updates the vector index.
-// Deprecated: Use SetVectorIndex instead.
-func (a *VectorGraphDBHybridAdapter) SetHNSW(vectorIndex VectorIndexSearcher) {
-	a.SetVectorIndex(vectorIndex)
 }
 
 // IsReady returns true if the adapter is properly configured.

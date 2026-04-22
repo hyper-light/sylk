@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sync"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 const DefaultMergeBuffer = 64
@@ -88,9 +91,24 @@ func NewMergePipe(cfg MergePipeConfig) *MergePipe {
 	}
 }
 
-// Start launches the single merge goroutine.
-func (mp *MergePipe) Start() {
-	go mp.mergeLoop()
+// Start launches the single merge goroutine under the supplied
+// GoroutineScope. Requires a scope — raw untracked goroutines are
+// forbidden per CLAUDE.md. Callers pass either a scope directly or
+// a ctx with one attached via concurrency.WithScope. Returns an
+// error if no scope is available so the misconfiguration surfaces
+// rather than silently leaking a goroutine.
+func (mp *MergePipe) Start(ctx context.Context) error {
+	if mp == nil {
+		return nil
+	}
+	scope := concurrency.ScopeFromContext(ctx)
+	if scope == nil {
+		return fmt.Errorf("merge pipe: Start requires a GoroutineScope on ctx")
+	}
+	return scope.Go("merge-pipe:mergeLoop", 0, func(runCtx context.Context) error {
+		mp.mergeLoop()
+		return nil
+	})
 }
 
 // RegisterPipeline records the current WAL version as the pipeline's base.

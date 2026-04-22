@@ -1,8 +1,6 @@
 package orchestrator
 
 import (
-	"context"
-	"fmt"
 	"strings"
 	"time"
 
@@ -90,28 +88,6 @@ func (o *Orchestrator) peekPendingCheckpointReview(taskID string) *pendingCheckp
 	o.checkpointReviewMu.Lock()
 	defer o.checkpointReviewMu.Unlock()
 	return o.pendingCheckpointReviews[taskID]
-}
-
-func (o *Orchestrator) ActivatePublishedReviewCandidate(req *guide.RouteRequest) error {
-	if o == nil || req == nil {
-		return nil
-	}
-	if !metadataBool(req.Metadata, "global_review") {
-		return nil
-	}
-	candidateID := strings.TrimSpace(metadataString(req.Metadata, "review_candidate_id"))
-	if candidateID == "" {
-		return nil
-	}
-	sessionID := firstNonEmpty(strings.TrimSpace(req.SessionID), metadataString(req.Metadata, "session_id"))
-	if sessionID == "" {
-		return fmt.Errorf("activate review candidate %s: session_id is required", candidateID)
-	}
-	svfs := o.GetSessionVFS(sessionID)
-	if svfs == nil {
-		return fmt.Errorf("activate review candidate %s: session VFS %q is unavailable", candidateID, sessionID)
-	}
-	return svfs.ActivateReviewCandidate(context.Background(), candidateID)
 }
 
 func (o *Orchestrator) HandleCheckpointReviewTerminal(_ string, metadata map[string]any, resp *guide.RouteResponse) {

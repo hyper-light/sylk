@@ -51,3 +51,56 @@ func AppendFabricInspectorSkillNames(base []string) []string {
 	out := AppendFabricAwarenessSkillNames(base)
 	return append(out, FabricInspectorAuditSkillNames()...)
 }
+
+// ClaimsAwarenessSkillNames returns the claims-specific awareness skill
+// names that should be visible by default on agents participating in
+// claims-based execution. These supplement the base Fabric awareness
+// skills — agents on claims-based pipelines get both.
+func ClaimsAwarenessSkillNames() []string {
+	return []string{
+		"query_claims_board",
+		"post_action",
+		"inspect_claim_conflicts",
+	}
+}
+
+// ClaimsSubjectSkillNames returns the skills that claims subjects
+// (Engineer, Designer, Tester-during-implementation) use.
+func ClaimsSubjectSkillNames() []string {
+	return []string{
+		"submit_testaments",
+		"update_claim_progress",
+	}
+}
+
+// ClaimsIssuerSkillNames returns the skills that claims issuers
+// (Inspector, Tester-during-validation) use.
+func ClaimsIssuerSkillNames() []string {
+	return []string{
+		"evaluate_validation",
+		"post_remediation_claims",
+	}
+}
+
+// AppendClaimsAwarenessSkillNames appends claims awareness skills to
+// a base list. Use on all agents participating in claims-based execution.
+func AppendClaimsAwarenessSkillNames(base []string) []string {
+	out := make([]string, 0, len(base)+len(ClaimsAwarenessSkillNames()))
+	out = append(out, base...)
+	out = append(out, ClaimsAwarenessSkillNames()...)
+	return out
+}
+
+// AppendClaimsSubjectSkillNames appends claims subject skills to the
+// base + awareness list.
+func AppendClaimsSubjectSkillNames(base []string) []string {
+	out := AppendClaimsAwarenessSkillNames(base)
+	return append(out, ClaimsSubjectSkillNames()...)
+}
+
+// AppendClaimsIssuerSkillNames appends claims issuer skills to the
+// base + awareness list.
+func AppendClaimsIssuerSkillNames(base []string) []string {
+	out := AppendClaimsAwarenessSkillNames(base)
+	return append(out, ClaimsIssuerSkillNames()...)
+}

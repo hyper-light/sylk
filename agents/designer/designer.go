@@ -13,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
@@ -53,12 +54,15 @@ type Designer struct {
 	pipelineName  string
 	usageAccum    *designerUsageAccumulator
 
+	claimsBoard *claims.ClaimsBoard
+
 	state    *DesignerState
 	stateMu  sync.RWMutex
 	failures map[string]*FailureRecord
 
 	skills        *skills.Registry
 	skillLoader   *skills.Loader
+	hooks         *skills.HookRegistry
 	tools         *toolruntime.Runtime
 	toolDefsDirty bool
 
@@ -303,6 +307,7 @@ func applyConfigDefaults(cfg Config) Config {
 
 func (d *Designer) initSkills() error {
 	d.skills = skills.NewRegistry()
+	d.hooks = skills.NewHookRegistry()
 	d.registerCoreSkills()
 	if err := shared.RegisterMemoryForestSkills(d.skills, "designer", d.config.Forest, d.forestTracker); err != nil {
 		return fmt.Errorf("register designer forest skills: %w", err)
@@ -330,6 +335,7 @@ func (d *Designer) initSkills() error {
 
 	tools, err := toolruntime.New(toolruntime.Config{
 		Registry: d.skills,
+		Hooks:    d.hooks,
 		Manifest: designerToolManifest(d.skills),
 		State:    toolruntime.NewState(),
 	})
@@ -598,12 +604,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		Bus: d.bus, Channels: d.channels,
 		AgentID: d.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
-	protocolTask := shared.DecodePipelineTaskInput(fwd.Input)
-	var closeProtocolState func()
-	ctx, closeProtocolState = shared.OpenPipelineTaskProtocolStateWithPublisher(
-		ctx, protocolTask, d.bus, fwd.SessionID, "designer",
-	)
-	defer closeProtocolState()
+	ctx = withClaimsBoardContext(ctx, d.claimsBoard)
 	if !fwd.FireAndForget {
 		shared.PublishStreamStart(d.bus, d.channels, ctx, d.id)
 		if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
@@ -646,11 +647,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		return d.bus.Publish(d.channels.Errors, errMsg)
 	}
 
-	respData := result
-	if protocolTask != nil {
-		respData = shared.BuildPipelineTurnResponse(ctx, result)
-	}
-	resp.Data = respData
+	resp.Data = result
 	shared.PublishStreamComplete(d.bus, d.channels, ctx, d.id, "", usageAcc.Total())
 	d.publishActivity(ctx, events.EventTypeSuccess, "Design task completed")
 
@@ -725,12 +722,10 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 
 	userMessage := fwd.Input
 	task := shared.DecodePipelineTaskInput(fwd.Input)
-	var closeProtocolState func()
-	ctx, closeProtocolState = shared.OpenPipelineTaskProtocolStateWithPublisher(
-		ctx, task, d.bus, fwd.SessionID, "designer",
-	)
-	defer closeProtocolState()
-	ctx = shared.WithPipelineTurnBaseline(ctx)
+
+	// Claims-based execution context.
+	ctx = withClaimsBoardContext(ctx, d.claimsBoard)
+
 	contract := (*shared.TaskExecutionContract)(nil)
 	if task != nil {
 		contract = shared.BuildTaskExecutionContract(task)
@@ -739,6 +734,7 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 			userMessage += "\n\n" + workspaceContext
 		}
 	}
+	userMessage = claims.PrependBoardPreamble(userMessage, d.claimsBoard, "designer")
 	systemPrompt := d.systemPromptForContract(contract)
 	if task != nil {
 		systemPrompt = shared.AppendPipelineSystemContext(systemPrompt, task)
@@ -1095,6 +1091,11 @@ func (d *Designer) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
 // SetExecutionBroker overrides the strict execution broker.
 func (d *Designer) SetExecutionBroker(broker purevfs.ExecutionBroker) {
 	d.executionBroker = broker
+}
+
+// SetClaimsBoard injects the claims board for claims-based pipelines.
+func (d *Designer) SetClaimsBoard(board *claims.ClaimsBoard) {
+	d.claimsBoard = board
 }
 
 // Terminate gracefully shuts down the designer agent.

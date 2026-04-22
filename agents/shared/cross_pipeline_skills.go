@@ -109,6 +109,19 @@ func CrossPipelineSkills(cfg CrossPipelineSkillConfig) []*skills.Skill {
 	return out
 }
 
+// ClaimsCrossPipelineSkills returns an empty slice — on claims-based
+// pipelines, challenges and consultations are issued via post_action
+// with ActionTypeChallenge or ActionTypeConsultation, not via dedicated
+// challenge_peer/consult_peer skills. The claims board replaces the
+// direct peer-dispatch mechanism with a uniform claim→testament flow.
+//
+// Agents on claims-based pipelines call this instead of CrossPipelineSkills
+// during skill registration. The existing CrossPipelineSkills function
+// is preserved for non-claims agents during the transition.
+func ClaimsCrossPipelineSkills(_ CrossPipelineSkillConfig) []*skills.Skill {
+	return nil
+}
+
 func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string) *skills.Skill {
 	return skills.NewSkill("challenge_peer").
 		Description("Dispute a peer agent's commitment with concrete evidence. Targets a specific fabric activity (not an agent directly). The challenged peer will see your challenge in their next ambient_context envelope and respond with defend / yield / scope-split / escalate. Asynchronous — neither pipeline blocks. The dispute lives durably until resolved or it passes its deadline. PREFER THIS over silent divergence — adopt-or-challenge is the binary; never just diverge. SUPERSEDES the narrower `challenge_agent` for cross-pipeline disputes (challenge_agent stays for same-pipeline protocol).").

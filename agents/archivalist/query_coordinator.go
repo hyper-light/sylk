@@ -110,7 +110,8 @@ func buildQueryCoordinator(cfg QueryCoordinatorConfig) *query.HybridQueryCoordin
 
 	var vectorSearcher *query.VectorSearcher
 	if cfg.GraphAdapter != nil {
-		// Prefer graph adapter's vector search (backed by HNSW via VectorGraphDB)
+		// Prefer the graph adapter's vector search (backed by the
+		// Vamana/DiskANN + IVF/BBQ index via VectorGraphDB).
 		vectorSearcher = query.NewVectorSearcher(cfg.GraphAdapter)
 	} else if cfg.EmbeddingStore != nil {
 		vectorSearcher = query.NewVectorSearcher(&embeddingVectorAdapter{store: cfg.EmbeddingStore})

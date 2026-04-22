@@ -91,12 +91,6 @@ func (m *hybridTestVectorIndexSearcher) setVector(id string, vector []float32) {
 	m.vectors[id] = vector
 }
 
-// Backward compatibility aliases
-type hybridTestHNSWSearcher = hybridTestVectorIndexSearcher
-
-func newHybridTestHNSWSearcher() *hybridTestVectorIndexSearcher {
-	return newHybridTestVectorIndexSearcher()
-}
 
 // =============================================================================
 // Test Helper Functions for Hybrid Query Tests
@@ -113,18 +107,18 @@ func setupHybridTestDB(t *testing.T) (*VectorGraphDB, func()) {
 	return db, func() { db.Close() }
 }
 
-func setupTestAdapter(t *testing.T) (*VectorGraphDBHybridAdapter, *hybridTestHNSWSearcher, func()) {
+func setupTestAdapter(t *testing.T) (*VectorGraphDBHybridAdapter, *hybridTestVectorIndexSearcher, func()) {
 	t.Helper()
 
 	db, cleanup := setupHybridTestDB(t)
-	hnsw := newHybridTestHNSWSearcher()
+	vectorIndex := newHybridTestVectorIndexSearcher()
 
 	adapter := NewVectorGraphDBHybridAdapter(VectorGraphDBHybridAdapterConfig{
-		DB:   db,
-		HNSW: hnsw,
+		DB:          db,
+		VectorIndex: vectorIndex,
 	})
 
-	return adapter, hnsw, cleanup
+	return adapter, vectorIndex, cleanup
 }
 
 func insertHybridTestNode(t *testing.T, db *VectorGraphDB, id string, domain Domain, nodeType NodeType) {
@@ -176,12 +170,12 @@ func TestNewVectorGraphDBHybridAdapter(t *testing.T) {
 	db, cleanup := setupHybridTestDB(t)
 	defer cleanup()
 
-	hnsw := newHybridTestHNSWSearcher()
+	vectorIndex := newHybridTestVectorIndexSearcher()
 
 	t.Run("creates adapter with valid config", func(t *testing.T) {
 		adapter := NewVectorGraphDBHybridAdapter(VectorGraphDBHybridAdapterConfig{
 			DB:   db,
-			HNSW: hnsw,
+			VectorIndex: vectorIndex,
 		})
 
 		if adapter == nil {
@@ -196,7 +190,7 @@ func TestNewVectorGraphDBHybridAdapter(t *testing.T) {
 	t.Run("returns nil with nil DB", func(t *testing.T) {
 		adapter := NewVectorGraphDBHybridAdapter(VectorGraphDBHybridAdapterConfig{
 			DB:   nil,
-			HNSW: hnsw,
+			VectorIndex: vectorIndex,
 		})
 
 		if adapter != nil {
@@ -207,8 +201,8 @@ func TestNewVectorGraphDBHybridAdapter(t *testing.T) {
 	t.Run("creates adapter with domain hint", func(t *testing.T) {
 		domain := DomainCode
 		adapter := NewVectorGraphDBHybridAdapter(VectorGraphDBHybridAdapterConfig{
-			DB:         db,
-			HNSW:       hnsw,
+			DB:          db,
+			VectorIndex: vectorIndex,
 			DomainHint: &domain,
 		})
 
@@ -226,7 +220,7 @@ func TestNewVectorGraphDBHybridAdapter(t *testing.T) {
 	})
 
 	t.Run("simple constructor works", func(t *testing.T) {
-		adapter := NewVectorGraphDBHybridAdapterSimple(db, hnsw)
+		adapter := NewVectorGraphDBHybridAdapterSimple(db, vectorIndex)
 
 		if adapter == nil {
 			t.Fatal("expected adapter, got nil")
@@ -243,13 +237,13 @@ func TestNewVectorGraphDBHybridAdapter(t *testing.T) {
 // =============================================================================
 
 func TestAdapter_Search(t *testing.T) {
-	adapter, hnsw, cleanup := setupTestAdapter(t)
+	adapter, vectorIndex, cleanup := setupTestAdapter(t)
 	defer cleanup()
 
 	// Add test results to mock
-	hnsw.addResult("node1", 0.95, DomainCode, NodeTypeFunction)
-	hnsw.addResult("node2", 0.85, DomainCode, NodeTypeStruct)
-	hnsw.addResult("node3", 0.75, DomainHistory, NodeTypeSession)
+	vectorIndex.addResult("node1", 0.95, DomainCode, NodeTypeFunction)
+	vectorIndex.addResult("node2", 0.85, DomainCode, NodeTypeStruct)
+	vectorIndex.addResult("node3", 0.75, DomainHistory, NodeTypeSession)
 
 	t.Run("returns results for valid vector", func(t *testing.T) {
 		vector := make([]float32, EmbeddingDimension)
@@ -321,12 +315,12 @@ func TestAdapter_Search(t *testing.T) {
 }
 
 func TestAdapter_SearchVector(t *testing.T) {
-	adapter, hnsw, cleanup := setupTestAdapter(t)
+	adapter, vectorIndex, cleanup := setupTestAdapter(t)
 	defer cleanup()
 
-	hnsw.addResult("node1", 0.95, DomainCode, NodeTypeFunction)
-	hnsw.addResult("node2", 0.85, DomainCode, NodeTypeStruct)
-	hnsw.addResult("node3", 0.75, DomainHistory, NodeTypeSession)
+	vectorIndex.addResult("node1", 0.95, DomainCode, NodeTypeFunction)
+	vectorIndex.addResult("node2", 0.85, DomainCode, NodeTypeStruct)
+	vectorIndex.addResult("node3", 0.75, DomainHistory, NodeTypeSession)
 
 	ctx := context.Background()
 	vector := make([]float32, EmbeddingDimension)
@@ -719,7 +713,7 @@ func TestAdapter_TraverseGraph(t *testing.T) {
 // =============================================================================
 
 func TestAdapter_ExecuteHybridQuery(t *testing.T) {
-	adapter, hnsw, cleanup := setupTestAdapter(t)
+	adapter, vectorIndex, cleanup := setupTestAdapter(t)
 	defer cleanup()
 
 	db := adapter.DB()
@@ -732,8 +726,8 @@ func TestAdapter_ExecuteHybridQuery(t *testing.T) {
 	insertHybridTestEdge(t, db, "vec-node1", "graph-node", EdgeTypeCalls)
 
 	// Add vector search results
-	hnsw.addResult("vec-node1", 0.9, DomainCode, NodeTypeFunction)
-	hnsw.addResult("vec-node2", 0.8, DomainCode, NodeTypeStruct)
+	vectorIndex.addResult("vec-node1", 0.9, DomainCode, NodeTypeFunction)
+	vectorIndex.addResult("vec-node2", 0.8, DomainCode, NodeTypeStruct)
 
 	ctx := context.Background()
 
@@ -864,13 +858,13 @@ func TestAdapter_Configuration(t *testing.T) {
 		}
 	})
 
-	t.Run("SetHNSW", func(t *testing.T) {
-		newHNSW := newHybridTestHNSWSearcher()
-		newHNSW.addResult("new-node", 0.99, DomainCode, NodeTypeFunction)
+	t.Run("SetVectorIndex", func(t *testing.T) {
+		newIndex := newHybridTestVectorIndexSearcher()
+		newIndex.addResult("new-node", 0.99, DomainCode, NodeTypeFunction)
 
-		adapter.SetHNSW(newHNSW)
+		adapter.SetVectorIndex(newIndex)
 
-		// Verify new HNSW is used
+		// Verify new vector index is used
 		vector := make([]float32, EmbeddingDimension)
 		ids, _, err := adapter.Search(vector, 10)
 		if err != nil {
@@ -878,7 +872,7 @@ func TestAdapter_Configuration(t *testing.T) {
 		}
 
 		if len(ids) != 1 || ids[0] != "new-node" {
-			t.Error("new HNSW not being used")
+			t.Error("new vector index not being used")
 		}
 	})
 
@@ -887,14 +881,14 @@ func TestAdapter_Configuration(t *testing.T) {
 			t.Error("expected adapter to be ready")
 		}
 
-		// Create adapter without HNSW
+		// Create adapter without a vector index.
 		db := adapter.DB()
-		adapterNoHNSW := NewVectorGraphDBHybridAdapter(VectorGraphDBHybridAdapterConfig{
+		adapterNoIndex := NewVectorGraphDBHybridAdapter(VectorGraphDBHybridAdapterConfig{
 			DB: db,
 		})
 
-		if adapterNoHNSW.IsReady() {
-			t.Error("expected adapter without HNSW to not be ready")
+		if adapterNoIndex.IsReady() {
+			t.Error("expected adapter without vector index to not be ready")
 		}
 	})
 }
@@ -979,12 +973,12 @@ func TestMatchWildcard(t *testing.T) {
 // =============================================================================
 
 func TestAdapter_ConcurrentAccess(t *testing.T) {
-	adapter, hnsw, cleanup := setupTestAdapter(t)
+	adapter, vectorIndex, cleanup := setupTestAdapter(t)
 	defer cleanup()
 
 	db := adapter.DB()
 	insertHybridTestNode(t, db, "concurrent-test", DomainCode, NodeTypeFunction)
-	hnsw.addResult("concurrent-test", 0.9, DomainCode, NodeTypeFunction)
+	vectorIndex.addResult("concurrent-test", 0.9, DomainCode, NodeTypeFunction)
 
 	ctx := context.Background()
 	vector := make([]float32, EmbeddingDimension)
@@ -992,11 +986,11 @@ func TestAdapter_ConcurrentAccess(t *testing.T) {
 	const numGoroutines = 10
 	done := make(chan bool, numGoroutines)
 
-	for i := 0; i < numGoroutines; i++ {
+	for range numGoroutines {
 		go func() {
 			defer func() { done <- true }()
 
-			for j := 0; j < 100; j++ {
+			for range 100 {
 				// Perform various operations
 				_, _, _ = adapter.Search(vector, 5)
 				_, _ = adapter.SearchVector(ctx, vector, 5, nil)
@@ -1014,7 +1008,7 @@ func TestAdapter_ConcurrentAccess(t *testing.T) {
 
 	// Wait for all goroutines with timeout
 	timeout := time.After(10 * time.Second)
-	for i := 0; i < numGoroutines; i++ {
+	for range numGoroutines {
 		select {
 		case <-done:
 			// Continue

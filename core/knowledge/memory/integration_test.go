@@ -1006,7 +1006,7 @@ func TestHybridQueryWithMemory_Integration(t *testing.T) {
 
 		// 1. Simulate initial query with no memory
 		results := []query.HybridResult{
-			{ID: "int-a", Score: 0.8, Source: query.SourceHNSW},
+			{ID: "int-a", Score: 0.8, Source: query.SourceVector},
 			{ID: "int-b", Score: 0.7, Source: query.SourceBleve},
 			{ID: "int-c", Score: 0.6, Source: query.SourceGraph},
 			{ID: "int-d", Score: 0.5, Source: query.SourceCombined},

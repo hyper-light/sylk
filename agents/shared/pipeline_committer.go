@@ -12,8 +12,7 @@ import (
 // an interface so the committer can be unit-tested without a full session.
 type SessionVFSPipelineCommitterBackend interface {
 	HasPipeline(pipelineID string) bool
-	ExtractReviewCandidate(pipelineID string) (*versioning.ReviewCandidate, error)
-	MergePipelineIntoGreen(ctx context.Context, pipelineID string) (versioning.MergePipelineResult, error)
+	MergePipelineIntoGreen(ctx context.Context, pipelineID string, cert versioning.PipelineInspectorCertificate) (versioning.MergePipelineResult, error)
 	RollbackPipelineIfTracked(pipelineID string) (bool, error)
 	CurrentVersion() versioning.SemanticVersion
 }
@@ -23,7 +22,7 @@ type SessionVFSPipelineCommitterBackend interface {
 // the active session ID extracted from the handler's request context and
 // returns the matching SessionVFS (nil if the session no longer exists).
 //
-// The pipeline inspector wires this at construction time so handoff_to_ot
+// The pipeline inspector wires this at construction time so handoff_to_green
 // and discard_pipeline perform the lifecycle mutation themselves rather
 // than broadcasting status and waiting for an out-of-process actor (the
 // orchestrator, historically) to react.
@@ -49,7 +48,7 @@ func (c *sessionVFSPipelineCommitter) lookupSession(ctx context.Context) Session
 	return c.sessionLookup(sessionID)
 }
 
-func (c *sessionVFSPipelineCommitter) MergePipelineIntoGreen(ctx context.Context, pipelineID string) (versioning.MergePipelineResult, error) {
+func (c *sessionVFSPipelineCommitter) MergePipelineIntoGreen(ctx context.Context, pipelineID string, cert versioning.PipelineInspectorCertificate) (versioning.MergePipelineResult, error) {
 	pipelineID = strings.TrimSpace(pipelineID)
 	svfs := c.lookupSession(ctx)
 	if svfs == nil {
@@ -65,31 +64,7 @@ func (c *sessionVFSPipelineCommitter) MergePipelineIntoGreen(ctx context.Context
 			MergedVersion: svfs.CurrentVersion(),
 		}, nil
 	}
-	return svfs.MergePipelineIntoGreen(ctx, pipelineID)
-}
-
-func (c *sessionVFSPipelineCommitter) ExtractReviewCandidate(ctx context.Context, pipelineID string) (string, bool, versioning.SemanticVersion, error) {
-	pipelineID = strings.TrimSpace(pipelineID)
-	svfs := c.lookupSession(ctx)
-	if svfs == nil {
-		return "", false, versioning.SemanticVersion{}, nil
-	}
-	if !svfs.HasPipeline(pipelineID) {
-		// No-op: pipeline already extracted or never created. Returning
-		// nil here is intentional — the inspector should not see a hard
-		// failure when the work was already promoted (e.g. a retry of the
-		// same handoff_to_ot). Surfacing the current version lets the
-		// caller record the publish even if no draft existed.
-		return "", false, svfs.CurrentVersion(), nil
-	}
-	candidate, err := svfs.ExtractReviewCandidate(pipelineID)
-	if err != nil {
-		return "", false, versioning.SemanticVersion{}, err
-	}
-	if candidate == nil {
-		return "", false, svfs.CurrentVersion(), nil
-	}
-	return strings.TrimSpace(candidate.ID), true, svfs.CurrentVersion(), nil
+	return svfs.MergePipelineIntoGreen(ctx, pipelineID, cert)
 }
 
 func (c *sessionVFSPipelineCommitter) Rollback(ctx context.Context, pipelineID string) error {

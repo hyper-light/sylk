@@ -13,8 +13,9 @@ import "fmt"
 type SignalKind uint8
 
 const (
-	// SignalVector is the similarity score from the vector (HNSW) index —
-	// the core semantic retrieval signal. Priority: High.
+	// SignalVector is the similarity score from the vector ANN index
+	// (Vamana/DiskANN + IVF/BBQ) — the core semantic retrieval
+	// signal. Priority: High.
 	SignalVector SignalKind = iota
 
 	// SignalGraph is the graph-centrality / relational signal: how many

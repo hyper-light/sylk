@@ -31,8 +31,8 @@ type ArchiveConfig struct {
 // NewArchive opens a single per-session archive at cfg.Path. Production
 // callers should not invoke this directly — use SessionArchives.For(sid)
 // so writes/reads dispatch to the correct per-session DB. NewArchive
-// remains exported for tests and the Exporter/Importer utilities that
-// operate on a single archive at a known path.
+// remains exported for tests that operate on a single archive at a
+// known path.
 func NewArchive(cfg ArchiveConfig) (*Archive, error) {
 	path := strings.TrimSpace(cfg.Path)
 	if path == "" {

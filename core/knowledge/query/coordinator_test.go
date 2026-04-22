@@ -59,14 +59,14 @@ func (m *mockBleveIndexForCoordinator) SearchInContext(ctx context.Context, req 
 	}, nil
 }
 
-// mockHNSWIndexForCoordinator provides a configurable mock HNSW index.
-type mockHNSWIndexForCoordinator struct {
+// mockVectorIndexForCoordinator provides a configurable mock vector index.
+type mockVectorIndexForCoordinator struct {
 	results []VectorResult
 	err     error
 	delay   time.Duration
 }
 
-func (m *mockHNSWIndexForCoordinator) Search(vector []float32, k int) ([]string, []float32, error) {
+func (m *mockVectorIndexForCoordinator) Search(vector []float32, k int) ([]string, []float32, error) {
 	if m.delay > 0 {
 		time.Sleep(m.delay)
 	}
@@ -136,7 +136,7 @@ func (m *mockEdgeQuerierForCoordinator) GetNodesByPattern(pattern *NodeMatcher) 
 
 func TestNewHybridQueryCoordinator(t *testing.T) {
 	bleve := NewBleveSearcher(&mockBleveIndexForCoordinator{})
-	vector := NewVectorSearcher(&mockHNSWIndexForCoordinator{})
+	vector := NewVectorSearcher(&mockVectorIndexForCoordinator{})
 	graph := NewGraphTraverser(&mockEdgeQuerierForCoordinator{})
 
 	coord := NewHybridQueryCoordinator(bleve, vector, graph)
@@ -179,7 +179,7 @@ func TestNewHybridQueryCoordinator_NilComponents(t *testing.T) {
 
 func TestNewHybridQueryCoordinatorWithOptions(t *testing.T) {
 	bleve := NewBleveSearcher(&mockBleveIndexForCoordinator{})
-	vector := NewVectorSearcher(&mockHNSWIndexForCoordinator{})
+	vector := NewVectorSearcher(&mockVectorIndexForCoordinator{})
 	graph := NewGraphTraverser(&mockEdgeQuerierForCoordinator{})
 	rrf := NewRRFFusion(100)
 	weights := NewLearnedQueryWeights()
@@ -329,13 +329,13 @@ func TestExecute_TextSearchOnly(t *testing.T) {
 }
 
 func TestExecute_SemanticSearchOnly(t *testing.T) {
-	mockHNSW := &mockHNSWIndexForCoordinator{
+	mockIndex := &mockVectorIndexForCoordinator{
 		results: []VectorResult{
 			{ID: "vec1", Score: 0.95, Distance: 0.1},
 			{ID: "vec2", Score: 0.80, Distance: 0.25},
 		},
 	}
-	vector := NewVectorSearcher(mockHNSW)
+	vector := NewVectorSearcher(mockIndex)
 	coord := NewHybridQueryCoordinator(nil, vector, nil)
 	ctx := context.Background()
 
@@ -406,7 +406,7 @@ func TestExecute_ParallelExecution(t *testing.T) {
 		},
 	}
 
-	mockHNSW := &mockHNSWIndexForCoordinator{
+	mockIndex := &mockVectorIndexForCoordinator{
 		results: []VectorResult{{ID: "vec1", Score: 0.85}},
 		delay:   10 * time.Millisecond,
 	}
@@ -418,7 +418,7 @@ func TestExecute_ParallelExecution(t *testing.T) {
 	}
 
 	bleve := NewBleveSearcher(mockBleve)
-	vector := NewVectorSearcher(mockHNSW)
+	vector := NewVectorSearcher(mockIndex)
 	graph := NewGraphTraverser(mockEdge)
 	coord := NewHybridQueryCoordinator(bleve, vector, graph)
 	coord.SetTimeout(1 * time.Second)
@@ -476,13 +476,13 @@ func TestExecute_TimeoutReturnsPartialResults(t *testing.T) {
 	}
 
 	// Slow semantic search (should timeout)
-	mockHNSW := &mockHNSWIndexForCoordinator{
+	mockIndex := &mockVectorIndexForCoordinator{
 		results: []VectorResult{{ID: "slow1", Score: 0.85}},
 		delay:   500 * time.Millisecond,
 	}
 
 	bleve := NewBleveSearcher(mockBleve)
-	vector := NewVectorSearcher(mockHNSW)
+	vector := NewVectorSearcher(mockIndex)
 	coord := NewHybridQueryCoordinator(bleve, vector, nil)
 	coord.SetTimeout(50 * time.Millisecond)
 	ctx := context.Background()
@@ -549,12 +549,12 @@ func TestExecute_TextSearchError_GracefulDegradation(t *testing.T) {
 	mockBleve := &mockBleveIndexForCoordinator{
 		err: errors.New("bleve error"),
 	}
-	mockHNSW := &mockHNSWIndexForCoordinator{
+	mockIndex := &mockVectorIndexForCoordinator{
 		results: []VectorResult{{ID: "vec1", Score: 0.9}},
 	}
 
 	bleve := NewBleveSearcher(mockBleve)
-	vector := NewVectorSearcher(mockHNSW)
+	vector := NewVectorSearcher(mockIndex)
 	coord := NewHybridQueryCoordinator(bleve, vector, nil)
 	ctx := context.Background()
 
@@ -579,12 +579,12 @@ func TestExecute_AllSearchersError_ReturnsEmptyResults(t *testing.T) {
 	mockBleve := &mockBleveIndexForCoordinator{
 		err: errors.New("bleve error"),
 	}
-	mockHNSW := &mockHNSWIndexForCoordinator{
-		err: errors.New("hnsw error"),
+	mockIndex := &mockVectorIndexForCoordinator{
+		err: errors.New("vector index error"),
 	}
 
 	bleve := NewBleveSearcher(mockBleve)
-	vector := NewVectorSearcher(mockHNSW)
+	vector := NewVectorSearcher(mockIndex)
 	coord := NewHybridQueryCoordinator(bleve, vector, nil)
 	ctx := context.Background()
 
@@ -617,7 +617,7 @@ func TestExecute_ResultFusion_CombinedScores(t *testing.T) {
 			{ID: "text-only", Score: 0.8, Content: "text only"},
 		},
 	}
-	mockHNSW := &mockHNSWIndexForCoordinator{
+	mockIndex := &mockVectorIndexForCoordinator{
 		results: []VectorResult{
 			{ID: "common", Score: 0.85, Distance: 0.15},
 			{ID: "vec-only", Score: 0.75, Distance: 0.25},
@@ -625,7 +625,7 @@ func TestExecute_ResultFusion_CombinedScores(t *testing.T) {
 	}
 
 	bleve := NewBleveSearcher(mockBleve)
-	vector := NewVectorSearcher(mockHNSW)
+	vector := NewVectorSearcher(mockIndex)
 	coord := NewHybridQueryCoordinator(bleve, vector, nil)
 	ctx := context.Background()
 
@@ -676,12 +676,12 @@ func TestExecute_ResultFusion_ExplicitWeights(t *testing.T) {
 	mockBleve := &mockBleveIndexForCoordinator{
 		results: []TextResult{{ID: "text1", Score: 0.9}},
 	}
-	mockHNSW := &mockHNSWIndexForCoordinator{
+	mockIndex := &mockVectorIndexForCoordinator{
 		results: []VectorResult{{ID: "vec1", Score: 0.9}},
 	}
 
 	bleve := NewBleveSearcher(mockBleve)
-	vector := NewVectorSearcher(mockHNSW)
+	vector := NewVectorSearcher(mockIndex)
 	coord := NewHybridQueryCoordinator(bleve, vector, nil)
 	ctx := context.Background()
 
@@ -746,7 +746,7 @@ func TestExecute_LimitApplied(t *testing.T) {
 
 func TestExecute_DefaultLimitWhenZero(t *testing.T) {
 	results := make([]TextResult, 20)
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		results[i] = TextResult{ID: string(rune('a' + i)), Score: float64(20-i) / 20.0}
 	}
 
@@ -897,7 +897,7 @@ func TestIsReady(t *testing.T) {
 		},
 		{
 			name:     "vector_only",
-			vector:   NewVectorSearcher(&mockHNSWIndexForCoordinator{}),
+			vector:   NewVectorSearcher(&mockVectorIndexForCoordinator{}),
 			expected: true,
 		},
 		{
@@ -908,7 +908,7 @@ func TestIsReady(t *testing.T) {
 		{
 			name:     "all_present",
 			bleve:    NewBleveSearcher(&mockBleveIndexForCoordinator{}),
-			vector:   NewVectorSearcher(&mockHNSWIndexForCoordinator{}),
+			vector:   NewVectorSearcher(&mockVectorIndexForCoordinator{}),
 			graph:    NewGraphTraverser(&mockEdgeQuerierForCoordinator{}),
 			expected: true,
 		},
@@ -926,7 +926,7 @@ func TestIsReady(t *testing.T) {
 
 func TestReadySearchers(t *testing.T) {
 	bleve := NewBleveSearcher(&mockBleveIndexForCoordinator{})
-	vector := NewVectorSearcher(&mockHNSWIndexForCoordinator{})
+	vector := NewVectorSearcher(&mockVectorIndexForCoordinator{})
 	coord := NewHybridQueryCoordinator(bleve, vector, nil)
 
 	ready := coord.ReadySearchers()
@@ -960,7 +960,7 @@ func TestReadySearchers(t *testing.T) {
 
 func TestComponentAccessors(t *testing.T) {
 	bleve := NewBleveSearcher(&mockBleveIndexForCoordinator{})
-	vector := NewVectorSearcher(&mockHNSWIndexForCoordinator{})
+	vector := NewVectorSearcher(&mockVectorIndexForCoordinator{})
 	graph := NewGraphTraverser(&mockEdgeQuerierForCoordinator{})
 	coord := NewHybridQueryCoordinator(bleve, vector, graph)
 
@@ -1303,7 +1303,7 @@ func TestDomainDetectionConfig_ConcurrentAccess(t *testing.T) {
 	done := make(chan bool, numGoroutines*2)
 
 	// Writers
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		go func(id int) {
 			cfg := DomainDetectionConfig{
 				FallbackMode:  DomainFallbackMode(id % 3),
@@ -1316,7 +1316,7 @@ func TestDomainDetectionConfig_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Readers
-	for i := 0; i < numGoroutines; i++ {
+	for range numGoroutines {
 		go func() {
 			_ = coord.GetDomainDetectionConfig()
 			done <- true
@@ -1324,7 +1324,7 @@ func TestDomainDetectionConfig_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Wait for all operations
-	for i := 0; i < numGoroutines*2; i++ {
+	for range numGoroutines * 2 {
 		<-done
 	}
 	// Should complete without race conditions
@@ -1449,12 +1449,12 @@ func TestQueryMetrics_SourceContribution(t *testing.T) {
 	mockBleve := &mockBleveIndexForCoordinator{
 		results: []TextResult{{ID: "doc1", Score: 0.9}},
 	}
-	mockHNSW := &mockHNSWIndexForCoordinator{
+	mockIndex := &mockVectorIndexForCoordinator{
 		results: []VectorResult{}, // Empty results
 	}
 
 	bleve := NewBleveSearcher(mockBleve)
-	vector := NewVectorSearcher(mockHNSW)
+	vector := NewVectorSearcher(mockIndex)
 	coord := NewHybridQueryCoordinator(bleve, vector, nil)
 	ctx := context.Background()
 
@@ -1494,7 +1494,7 @@ func TestConcurrentExecute(t *testing.T) {
 	const numQueries = 10
 	done := make(chan bool, numQueries)
 
-	for i := 0; i < numQueries; i++ {
+	for i := range numQueries {
 		go func(id int) {
 			query := &HybridQuery{
 				TextQuery: "test",
@@ -1509,7 +1509,7 @@ func TestConcurrentExecute(t *testing.T) {
 	}
 
 	// Wait for all queries to complete
-	for i := 0; i < numQueries; i++ {
+	for range numQueries {
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
@@ -1526,7 +1526,7 @@ func TestConcurrentSetTimeout(t *testing.T) {
 	const numUpdates = 100
 	done := make(chan bool, numUpdates)
 
-	for i := 0; i < numUpdates; i++ {
+	for i := range numUpdates {
 		go func(ms int) {
 			coord.SetTimeout(time.Duration(ms) * time.Millisecond)
 			_ = coord.GetTimeout()
@@ -1534,7 +1534,7 @@ func TestConcurrentSetTimeout(t *testing.T) {
 		}(i + 1)
 	}
 
-	for i := 0; i < numUpdates; i++ {
+	for range numUpdates {
 		<-done
 	}
 
@@ -1598,7 +1598,7 @@ func TestMetricsTracker_MaxEntriesEviction(t *testing.T) {
 	defer mt.Close()
 
 	// Record more entries than max
-	for i := 0; i < maxEntries+10; i++ {
+	for i := range maxEntries + 10 {
 		mt.Record(
 			string(rune('a'+i)),
 			&QueryMetrics{TotalLatency: time.Duration(i) * time.Millisecond},
@@ -1657,7 +1657,7 @@ func TestMetricsTracker_BoundedGrowth(t *testing.T) {
 	defer mt.Close()
 
 	// Record many entries
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		mt.Record(
 			string(rune(i)),
 			&QueryMetrics{TotalLatency: time.Duration(i) * time.Millisecond},
@@ -1681,7 +1681,7 @@ func TestMetricsTracker_AggregatesPreserved(t *testing.T) {
 	defer mt.Close()
 
 	// Record entries that will be evicted
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		mt.Record(
 			string(rune('a'+i)),
 			&QueryMetrics{
@@ -1717,10 +1717,10 @@ func TestMetricsTracker_ConcurrentAccess(t *testing.T) {
 	wg.Add(numGoroutines * 2) // Writers + readers
 
 	// Writers
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		go func(goroutineID int) {
 			defer wg.Done()
-			for i := 0; i < opsPerGoroutine; i++ {
+			for i := range opsPerGoroutine {
 				queryID := string(rune(goroutineID*1000 + i))
 				mt.Record(queryID, &QueryMetrics{
 					TotalLatency: time.Duration(i) * time.Millisecond,
@@ -1730,10 +1730,10 @@ func TestMetricsTracker_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Readers
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		go func(goroutineID int) {
 			defer wg.Done()
-			for i := 0; i < opsPerGoroutine; i++ {
+			for i := range opsPerGoroutine {
 				queryID := string(rune(goroutineID*1000 + i))
 				mt.GetMetrics(queryID)
 				mt.GetAverageMetrics()

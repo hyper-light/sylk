@@ -5,7 +5,16 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
+
+func newResolverTestCtx(t *testing.T, parent context.Context) context.Context {
+	t.Helper()
+	scope := concurrency.NewGoroutineScope(parent, "resolver-test", nil)
+	t.Cleanup(func() { _ = scope.Shutdown(100*time.Millisecond, 2*time.Second) })
+	return concurrency.WithScope(parent, scope)
+}
 
 // TestCommitResolver_AcceptAdvancesHeadAndFlushesDisk verifies the
 // happy-path flow: pipeline merge → enqueue → mark accepted → resolver
@@ -35,7 +44,7 @@ func TestCommitResolver_AcceptAdvancesHeadAndFlushesDisk(t *testing.T) {
 	if err := svfs.NewPipelineFileAccess(pipe).WriteFile(ctx, path, []byte("print('ok')\n")); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	res, err := svfs.MergePipelineIntoGreen(ctx, "task_x")
+	res, err := svfs.MergePipelineIntoGreen(ctx, "task_x", PipelineInspectorCertificate{})
 	if err != nil {
 		t.Fatalf("MergePipelineIntoGreen: %v", err)
 	}
@@ -57,9 +66,11 @@ func TestCommitResolver_AcceptAdvancesHeadAndFlushesDisk(t *testing.T) {
 		Session:      svfs,
 		PollInterval: 10 * time.Millisecond,
 	})
-	rctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	rctx, cancel := context.WithTimeout(newResolverTestCtx(t, context.Background()), 2*time.Second)
 	defer cancel()
-	resolver.Start(rctx)
+	if err := resolver.Start(rctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	defer resolver.Stop()
 
 	// Wait for resolver to advance the head.
@@ -102,7 +113,7 @@ func TestCommitResolver_RejectedBlocksFIFO(t *testing.T) {
 		if err := svfs.NewPipelineFileAccess(pipe).WriteFile(ctx, path, []byte(name)); err != nil {
 			t.Fatalf("WriteFile %s: %v", name, err)
 		}
-		if _, err := svfs.MergePipelineIntoGreen(ctx, name); err != nil {
+		if _, err := svfs.MergePipelineIntoGreen(ctx, name, PipelineInspectorCertificate{}); err != nil {
 			t.Fatalf("MergePipelineIntoGreen %s: %v", name, err)
 		}
 	}
@@ -131,9 +142,11 @@ func TestCommitResolver_RejectedBlocksFIFO(t *testing.T) {
 		Session:      svfs,
 		PollInterval: 10 * time.Millisecond,
 	})
-	rctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	rctx, cancel := context.WithTimeout(newResolverTestCtx(t, context.Background()), 1*time.Second)
 	defer cancel()
-	resolver.Start(rctx)
+	if err := resolver.Start(rctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	defer resolver.Stop()
 
 	// Give the resolver time to realize it can't make progress.
@@ -176,7 +189,7 @@ func TestCommitResolver_SupersessionUnblocksQueue(t *testing.T) {
 	if err := svfs.NewPipelineFileAccess(pipeA).WriteFile(ctx, filepath.Join(dir, "a.py"), []byte("a1")); err != nil {
 		t.Fatal(err)
 	}
-	resA, err := svfs.MergePipelineIntoGreen(ctx, "task_a")
+	resA, err := svfs.MergePipelineIntoGreen(ctx, "task_a", PipelineInspectorCertificate{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +207,7 @@ func TestCommitResolver_SupersessionUnblocksQueue(t *testing.T) {
 	if err := svfs.NewPipelineFileAccess(pipeR).WriteFile(ctx, filepath.Join(dir, "a.py"), []byte("a1-fixed")); err != nil {
 		t.Fatal(err)
 	}
-	resR, err := svfs.MergePipelineIntoGreen(ctx, "task_a_fix")
+	resR, err := svfs.MergePipelineIntoGreen(ctx, "task_a_fix", PipelineInspectorCertificate{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,9 +232,11 @@ func TestCommitResolver_SupersessionUnblocksQueue(t *testing.T) {
 		Session:      svfs,
 		PollInterval: 10 * time.Millisecond,
 	})
-	rctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	rctx, cancel := context.WithTimeout(newResolverTestCtx(t, context.Background()), 2*time.Second)
 	defer cancel()
-	resolver.Start(rctx)
+	if err := resolver.Start(rctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	defer resolver.Stop()
 
 	deadline := time.After(1500 * time.Millisecond)

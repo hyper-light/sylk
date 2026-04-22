@@ -40,7 +40,6 @@ type TaskRouterConfig struct {
 	StreamMirrorTargetAgentID string
 	EventLogger               *agentlog.SessionEventLogger
 	OnNodeActivity            func(string, string)
-	OnVisibleRoutePublish     func(*guide.RouteRequest) error
 	OnVisibleRouteTerminal    func(string, map[string]any, *guide.RouteResponse)
 }
 
@@ -57,7 +56,6 @@ type TaskRouter struct {
 	streamMirrorTargetID   string
 	eventLogger            *agentlog.SessionEventLogger
 	onNodeActivity         func(string, string)
-	onVisibleRoutePublish  func(*guide.RouteRequest) error
 	onVisibleRouteTerminal func(string, map[string]any, *guide.RouteResponse)
 
 	pendingMu sync.Mutex
@@ -106,7 +104,6 @@ func NewTaskRouter(cfg TaskRouterConfig) *TaskRouter {
 		streamMirrorTargetID:   defaultStreamMirrorTarget(cfg.StreamMirrorTargetAgentID),
 		eventLogger:            cfg.EventLogger,
 		onNodeActivity:         cfg.OnNodeActivity,
-		onVisibleRoutePublish:  cfg.OnVisibleRoutePublish,
 		onVisibleRouteTerminal: cfg.OnVisibleRouteTerminal,
 		pending:                make(map[string]*pendingRoute),
 		visible:                make(map[string]*visibleRoute),
@@ -248,12 +245,6 @@ func (r *TaskRouter) publishVisibleRouteNow(req *guide.RouteRequest) error {
 		req.CorrelationID = corrID
 	}
 	r.trackVisibleRoute(corrID, visibleRouteFromRequest(req))
-	if r.onVisibleRoutePublish != nil {
-		if err := r.onVisibleRoutePublish(cloneRouteRequest(req)); err != nil {
-			r.clearVisibleRoute(corrID)
-			return err
-		}
-	}
 
 	msg := guide.NewRequestMessage(generateMessageID(), req)
 	msg.Metadata = cloneMetadata(req.Metadata)

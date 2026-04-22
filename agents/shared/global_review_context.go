@@ -32,7 +32,6 @@ type GlobalReviewContext struct {
 	SessionID string
 
 	// VFS state.
-	ReviewCandidateID string
 	HadDraft          bool
 	CheckpointVersion versioning.SemanticVersion
 	SessionDir        string
@@ -122,9 +121,6 @@ func buildGlobalReviewContextMetadata(ctx GlobalReviewContext, reviewID string) 
 	}
 	if v := globalReviewMergeVersionString(ctx.CheckpointVersion, ctx.HadDraft); v != "" {
 		metadata["global_vfs_version"] = v
-	}
-	if candidateID := strings.TrimSpace(ctx.ReviewCandidateID); candidateID != "" {
-		metadata["review_candidate_id"] = candidateID
 	}
 	if sessionDir := strings.TrimSpace(ctx.SessionDir); sessionDir != "" {
 		metadata["session_dir"] = sessionDir

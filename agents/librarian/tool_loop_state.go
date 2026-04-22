@@ -135,7 +135,12 @@ func (s *toolLoopState) applyCheckpoint(sc shared.SteeringResult) int {
 
 func (s *toolLoopState) completeTurn(provider LibrarianProvider) (*providers.Response, time.Time, error) {
 	turnStart := time.Now()
-	resp, err := shared.CompleteWithWatchdog(s.ctx, provider, s.req, shared.AgentDisplayName("librarian"))
+	resp, err := shared.StreamLLMTurn(s.ctx, shared.StreamingLLMTurnConfig{
+		Bus:              s.librarian.bus,
+		Channels:         s.librarian.channels,
+		AgentID:          s.librarian.id,
+		AgentDisplayName: shared.AgentDisplayName("librarian"),
+	}, provider, s.req)
 	if err != nil {
 		if ctxErr := s.ctx.Err(); ctxErr != nil {
 			return nil, time.Time{}, ctxErr
@@ -152,7 +157,6 @@ func (s *toolLoopState) completeTurn(provider LibrarianProvider) (*providers.Res
 		gov.Calibrate(s.ctx, resp, s.req.Messages)
 	}
 	shared.AccumulateUsage(s.ctx, &resp.Usage)
-	shared.PublishIntermediateToolTurn(s.librarian.bus, s.librarian.channels, s.ctx, s.librarian.id, resp)
 	return resp, turnStart, nil
 }
 

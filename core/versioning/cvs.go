@@ -3,9 +3,12 @@ package versioning
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 var (
@@ -162,6 +165,18 @@ type CVSConfig struct {
 	WAL        WriteAheadLog
 	OTEngine   OTEngine
 	LockTTL    time.Duration
+
+	// DispatcherScope, when non-nil, runs the subscription-callback
+	// dispatcher goroutine as a tracked worker. When nil, NewCVS
+	// dispatches callbacks synchronously from notifySubscribers
+	// (blocking the writer until each callback returns). Production
+	// callers (SessionVFS) supply a scope; legacy in-memory tests
+	// that don't care about async fan-out leave it nil.
+	DispatcherScope *concurrency.GoroutineScope
+	// DispatcherBuffer caps the fan-out queue. Defaults to 64 when
+	// DispatcherScope is set and DispatcherBuffer is zero. Ignored
+	// when DispatcherScope is nil.
+	DispatcherBuffer int
 }
 
 type DefaultCVS struct {
@@ -187,8 +202,26 @@ type DefaultCVS struct {
 	stats   CVSStats
 	statsMu sync.RWMutex
 
+	// Tracked dispatcher for subscription callbacks. Replaces the
+	// prior `go cb(event)` fan-out that spawned one untracked
+	// goroutine per callback per publish. A single dispatcher
+	// goroutine (scope-tracked) drains cbDispatch and invokes
+	// callbacks sequentially — misbehaving subscribers slow the
+	// queue but never leak goroutines. cbDispatch is bounded;
+	// when full, notifySubscribers falls back to synchronous
+	// invocation (never drops an event).
+	cbDispatch   chan cvsCallbackInvocation
+	cbWorkerDone chan struct{}
+
 	closed   bool
 	closedMu sync.RWMutex
+}
+
+// cvsCallbackInvocation is one fan-out unit enqueued by
+// notifySubscribers and drained by the dispatcher goroutine.
+type cvsCallbackInvocation struct {
+	cb    FileChangeCallback
+	event FileChangeEvent
 }
 
 type pipelineEntry struct {
@@ -197,13 +230,13 @@ type pipelineEntry struct {
 	createdAt time.Time
 }
 
-func NewCVS(cfg CVSConfig) *DefaultCVS {
+func NewCVS(cfg CVSConfig) (*DefaultCVS, error) {
 	lockTTL := cfg.LockTTL
 	if lockTTL == 0 {
 		lockTTL = 5 * time.Minute
 	}
 
-	return &DefaultCVS{
+	c := &DefaultCVS{
 		vfsManager:     cfg.VFSManager,
 		blobStore:      cfg.BlobStore,
 		opLog:          cfg.OpLog,
@@ -216,6 +249,49 @@ func NewCVS(cfg CVSConfig) *DefaultCVS {
 		pipelines:      make(map[string]*pipelineEntry),
 		fileTracker:    make(map[string]int64),
 	}
+
+	// Tracked callback dispatcher. A bounded channel fans out
+	// callback invocations to a single scope-tracked goroutine that
+	// invokes them sequentially. Replaces the prior untracked
+	// `go cb(event)` fan-out.
+	if cfg.DispatcherScope != nil {
+		buf := cfg.DispatcherBuffer
+		if buf <= 0 {
+			buf = 64
+		}
+		c.cbDispatch = make(chan cvsCallbackInvocation, buf)
+		c.cbWorkerDone = make(chan struct{})
+		if err := cfg.DispatcherScope.Go("cvs:callback-dispatcher", 0, func(ctx context.Context) error {
+			c.runCallbackDispatcher()
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return c, nil
+}
+
+// runCallbackDispatcher drains the callback queue until Close is
+// called. Callbacks are invoked sequentially; a panicking callback
+// is isolated (recovered + logged) so one misbehaving subscriber
+// does not terminate the dispatcher.
+func (c *DefaultCVS) runCallbackDispatcher() {
+	defer close(c.cbWorkerDone)
+	for inv := range c.cbDispatch {
+		c.invokeCallbackSafely(inv)
+	}
+}
+
+func (c *DefaultCVS) invokeCallbackSafely(inv cvsCallbackInvocation) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Default().Error("cvs: subscription callback panicked — isolated",
+				"file_path", inv.event.FilePath,
+				"panic", r,
+			)
+		}
+	}()
+	inv.cb(inv.event)
 }
 
 func (c *DefaultCVS) Read(ctx context.Context, filePath string) ([]byte, error) {
@@ -1109,8 +1185,30 @@ func (c *DefaultCVS) notifySubscribers(filePath string, newVer, oldVer VersionID
 		Timestamp:  time.Now(),
 	}
 
+	// Check the CVS-closed flag under closedMu so we don't try to
+	// enqueue on a channel that Close is concurrently draining.
+	c.closedMu.RLock()
+	closedNow := c.closed
+	dispatch := c.cbDispatch
+	c.closedMu.RUnlock()
 	for _, cb := range callbacks {
-		go cb(event)
+		if closedNow || dispatch == nil {
+			// No tracked dispatcher or CVS is shutting down — invoke
+			// synchronously. Subscribers must be fast under this
+			// mode or they block the writer.
+			c.invokeCallbackSafely(cvsCallbackInvocation{cb: cb, event: event})
+			continue
+		}
+		// Enqueue for the tracked dispatcher. Non-blocking select with
+		// a synchronous-invocation fallback when the queue is full —
+		// we never drop events. A persistently-full queue indicates
+		// an unhealthy subscriber and will surface as dispatcher-side
+		// slowness in operator metrics.
+		select {
+		case dispatch <- cvsCallbackInvocation{cb: cb, event: event}:
+		default:
+			c.invokeCallbackSafely(cvsCallbackInvocation{cb: cb, event: event})
+		}
 	}
 }
 
@@ -1149,6 +1247,24 @@ func (c *DefaultCVS) Close() error {
 	c.subMu.Lock()
 	c.subscriptions = nil
 	c.subMu.Unlock()
+
+	// Close the callback dispatcher channel so the worker drains and
+	// exits. The field is NOT nilled — nilling would race with the
+	// dispatcher's range over the channel pointer. Instead, close
+	// signals the range to exit, and notifySubscribers detects the
+	// closed dispatcher via the c.closed flag guarded by closedMu.
+	// Bounded wait: if a subscriber hangs, the scope's maxLifetime
+	// backstops. Skipped entirely when no dispatcher was configured.
+	if c.cbDispatch != nil {
+		close(c.cbDispatch)
+		if c.cbWorkerDone != nil {
+			select {
+			case <-c.cbWorkerDone:
+			case <-time.After(5 * time.Second):
+				slog.Default().Error("cvs: callback dispatcher did not drain within close deadline")
+			}
+		}
+	}
 
 	if c.wal != nil {
 		c.wal.Close()

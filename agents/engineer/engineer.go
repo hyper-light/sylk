@@ -13,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/escalation"
@@ -51,6 +52,9 @@ type Engineer struct {
 	provider  engineerProvider
 	refresher container.ProviderRefresher
 
+	// Claims board (nil for non-claims pipelines).
+	claimsBoard *claims.ClaimsBoard
+
 	// State management
 	state    *EngineerState
 	stateMu  sync.RWMutex
@@ -59,6 +63,7 @@ type Engineer struct {
 	// Skills system
 	skills        *skills.Registry
 	skillLoader   *skills.Loader
+	hooks         *skills.HookRegistry
 	tools         *toolruntime.Runtime
 	toolDefsDirty bool
 
@@ -348,6 +353,7 @@ func applyConfigDefaults(cfg Config) Config {
 
 func (e *Engineer) initSkills() error {
 	e.skills = skills.NewRegistry()
+	e.hooks = skills.NewHookRegistry()
 	e.registerCoreSkills()
 	if err := shared.RegisterMemoryForestSkills(e.skills, "engineer", e.config.Forest, e.forestTracker); err != nil {
 		return fmt.Errorf("register engineer forest skills: %w", err)
@@ -384,6 +390,7 @@ func (e *Engineer) initSkills() error {
 
 	tools, err := toolruntime.New(toolruntime.Config{
 		Registry: e.skills,
+		Hooks:    e.hooks,
 		Manifest: engineerToolManifest(e.skills),
 		State:    toolruntime.NewState(),
 	})
@@ -684,12 +691,6 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		Bus: e.bus, Channels: e.channels,
 		AgentID: e.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
-	protocolTask := shared.DecodePipelineTaskInput(fwd.Input)
-	var closeProtocolState func()
-	ctx, closeProtocolState = shared.OpenPipelineTaskProtocolStateWithPublisher(
-		ctx, protocolTask, e.bus, fwd.SessionID, "engineer",
-	)
-	defer closeProtocolState()
 	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
 	if publishStreamLifecycle {
 		shared.PublishStreamStart(e.bus, e.channels, ctx, e.id)
@@ -725,9 +726,6 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	respData := result
-	if protocolTask != nil {
-		respData = shared.BuildPipelineTurnResponse(ctx, result)
-	}
 	if publishStreamLifecycle {
 		shared.PublishStreamComplete(e.bus, e.channels, ctx, e.id, "", usageAcc.Total())
 	}
@@ -907,17 +905,6 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (_ *Enginee
 	if req == nil {
 		return nil, fmt.Errorf("request cannot be nil")
 	}
-	sessionID := ""
-	if req.PipelineTask != nil {
-		sessionID = req.PipelineTask.SessionID
-	}
-	var closeProtocolState func()
-	ctx, closeProtocolState = shared.OpenPipelineTaskProtocolStateWithPublisher(
-		ctx, req.PipelineTask, e.bus, sessionID, "engineer",
-	)
-	defer closeProtocolState()
-	ctx = shared.WithPipelineTurnBaseline(ctx)
-
 	startTime := time.Now()
 	e.setStatus(AgentStatusBusy)
 	defer e.setStatus(AgentStatusIdle)
@@ -938,13 +925,14 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (_ *Enginee
 	}
 
 	// Step 3: Build LLM request with tools
-	e.prepareSkillsForInput(req.Prompt)
+	userMessage := claims.PrependBoardPreamble(req.Prompt, e.claimsBoard, "engineer")
+	e.prepareSkillsForInput(userMessage)
 	surface := e.toolRuntime()
 	ctx = shared.WithTaskExecutionContract(ctx, contract)
 	ctx = shared.WithTaskExecutionState(ctx, shared.NewTaskExecutionState())
 	llmReq := &providers.Request{
 		SystemPrompt: systemPrompt,
-		Messages:     []providers.Message{{Role: providers.RoleUser, Content: req.Prompt}},
+		Messages:     []providers.Message{{Role: providers.RoleUser, Content: userMessage}},
 		Tools:        e.buildToolDefinitionsWithSurface(surface),
 		Model:        e.config.EngineerConfig.Model,
 		MaxTokens:    e.config.EngineerConfig.MaxTokens,
@@ -1233,6 +1221,11 @@ func (e *Engineer) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
 // SetExecutionBroker overrides the strict execution broker.
 func (e *Engineer) SetExecutionBroker(broker purevfs.ExecutionBroker) {
 	e.executionBroker = broker
+}
+
+// SetClaimsBoard injects the claims board for claims-based pipelines.
+func (e *Engineer) SetClaimsBoard(board *claims.ClaimsBoard) {
+	e.claimsBoard = board
 }
 
 // SetEscalator injects the confidence-based escalation evaluator.

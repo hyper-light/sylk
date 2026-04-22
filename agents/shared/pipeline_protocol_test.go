@@ -100,7 +100,7 @@ func TestValidatePipelineProtocolCompletion_RequiresTurnAction(t *testing.T) {
 	}
 }
 
-func TestFinalizePipeline_RequiresImmediateHandoffToOT(t *testing.T) {
+func TestFinalizePipeline_RequiresImmediateHandoffToGreen(t *testing.T) {
 	snapshot := &PipelineProtocolSnapshot{
 		PendingValidation: &PipelineValidationRecord{
 			ChallengeID:         "challenge-ready",
@@ -132,36 +132,36 @@ func TestFinalizePipeline_RequiresImmediateHandoffToOT(t *testing.T) {
 	if !ok {
 		t.Fatalf("finalize_pipeline result = %#v, want map", result)
 	}
-	if resultMap["must_handoff_to_ot"] != true {
-		t.Fatalf("finalize_pipeline result = %#v, want must_handoff_to_ot=true", result)
+	if resultMap["must_handoff_to_green"] != true {
+		t.Fatalf("finalize_pipeline result = %#v, want must_handoff_to_green=true", result)
 	}
-	if resultMap["required_next_action"] != "handoff_to_ot" {
-		t.Fatalf("finalize_pipeline result = %#v, want required_next_action=handoff_to_ot", result)
+	if resultMap["required_next_action"] != "handoff_to_green" {
+		t.Fatalf("finalize_pipeline result = %#v, want required_next_action=handoff_to_green", result)
 	}
 
 	if _, err := callSkill(t, ctx, skills, "handoff_next", map[string]any{
 		"target_agents": []string{"tester"},
 		"reason":        "try another audit anyway",
 		"request":       "this should be blocked",
-	}); err == nil || !strings.Contains(err.Error(), "must invoke `handoff_to_ot` now") {
-		t.Fatalf("handoff_next error = %v, want immediate handoff_to_ot requirement", err)
+	}); err == nil || !strings.Contains(err.Error(), "must invoke `handoff_to_green` now") {
+		t.Fatalf("handoff_next error = %v, want immediate handoff_to_green requirement", err)
 	}
 
-	if err := ValidatePipelineProtocolCompletion(ctx, PipelineAgentInspector); err == nil || !strings.Contains(err.Error(), "must invoke `handoff_to_ot` now") {
-		t.Fatalf("ValidatePipelineProtocolCompletion error = %v, want immediate handoff_to_ot requirement", err)
+	if err := ValidatePipelineProtocolCompletion(ctx, PipelineAgentInspector); err == nil || !strings.Contains(err.Error(), "must invoke `handoff_to_green` now") {
+		t.Fatalf("ValidatePipelineProtocolCompletion error = %v, want immediate handoff_to_green requirement", err)
 	}
 
-	runSkill(t, ctx, skills, "handoff_to_ot", map[string]any{
+	runSkill(t, ctx, skills, "handoff_to_green", map[string]any{
 		"summary":       "ready for OT merge",
 		"evidence_refs": []string{"artifact:inspector", "artifact:tester"},
 	})
 
 	if err := ValidatePipelineProtocolCompletion(ctx, PipelineAgentInspector); err != nil {
-		t.Fatalf("ValidatePipelineProtocolCompletion after handoff_to_ot = %v", err)
+		t.Fatalf("ValidatePipelineProtocolCompletion after handoff_to_green = %v", err)
 	}
 }
 
-func TestFinalizePipeline_RequiresImmediateHandoffToOT_BlocksHandoffDispatch(t *testing.T) {
+func TestFinalizePipeline_RequiresImmediateHandoffToGreen_BlocksHandoffDispatch(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
@@ -231,13 +231,13 @@ func TestFinalizePipeline_RequiresImmediateHandoffToOT_BlocksHandoffDispatch(t *
 		"target_agents": []string{"tester"},
 		"reason":        "try another audit anyway",
 		"request":       "this should be blocked",
-	}); err == nil || !strings.Contains(err.Error(), "must invoke `handoff_to_ot` now") {
-		t.Fatalf("handoff_next error = %v, want immediate handoff_to_ot requirement", err)
+	}); err == nil || !strings.Contains(err.Error(), "must invoke `handoff_to_green` now") {
+		t.Fatalf("handoff_next error = %v, want immediate handoff_to_green requirement", err)
 	}
 
 	select {
 	case req := <-routeCh:
-		t.Fatalf("unexpected route published while handoff_to_ot was required: %+v", req)
+		t.Fatalf("unexpected route published while handoff_to_green was required: %+v", req)
 	case <-time.After(200 * time.Millisecond):
 	}
 }
@@ -291,11 +291,11 @@ func TestFinalizePipeline_ReadyAfterAcceptedProcessValidation(t *testing.T) {
 	if resultMap["ready_for_ot"] != true {
 		t.Fatalf("finalize_pipeline result = %#v, want ready_for_ot=true", result)
 	}
-	if resultMap["must_handoff_to_ot"] != true {
-		t.Fatalf("finalize_pipeline result = %#v, want must_handoff_to_ot=true", result)
+	if resultMap["must_handoff_to_green"] != true {
+		t.Fatalf("finalize_pipeline result = %#v, want must_handoff_to_green=true", result)
 	}
-	if resultMap["required_next_action"] != "handoff_to_ot" {
-		t.Fatalf("finalize_pipeline result = %#v, want required_next_action=handoff_to_ot", result)
+	if resultMap["required_next_action"] != "handoff_to_green" {
+		t.Fatalf("finalize_pipeline result = %#v, want required_next_action=handoff_to_green", result)
 	}
 }
 
@@ -339,11 +339,11 @@ func TestFinalizePipeline_ReadyAfterAcceptedPartialProcessValidation(t *testing.
 	if resultMap["ready_for_ot"] != true {
 		t.Fatalf("finalize_pipeline result = %#v, want ready_for_ot=true", result)
 	}
-	if resultMap["must_handoff_to_ot"] != true {
-		t.Fatalf("finalize_pipeline result = %#v, want must_handoff_to_ot=true", result)
+	if resultMap["must_handoff_to_green"] != true {
+		t.Fatalf("finalize_pipeline result = %#v, want must_handoff_to_green=true", result)
 	}
-	if resultMap["required_next_action"] != "handoff_to_ot" {
-		t.Fatalf("finalize_pipeline result = %#v, want required_next_action=handoff_to_ot", result)
+	if resultMap["required_next_action"] != "handoff_to_green" {
+		t.Fatalf("finalize_pipeline result = %#v, want required_next_action=handoff_to_green", result)
 	}
 }
 
@@ -1680,7 +1680,7 @@ func TestBuildPipelineHandoffTasks_PreservesAuditLockAcrossWorkerHandoff(t *test
 	}
 }
 
-func TestPipelineProtocolSkills_FinalizePipelineSignalsReadinessAndHandoffToOTPublishesTerminalUpdate(t *testing.T) {
+func TestPipelineProtocolSkills_FinalizePipelineSignalsReadinessAndHandoffToGreenPublishesTerminalUpdate(t *testing.T) {
 	sessionDir := t.TempDir()
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
@@ -1759,11 +1759,11 @@ func TestPipelineProtocolSkills_FinalizePipelineSignalsReadinessAndHandoffToOTPu
 	if resultMap["finalize_pipeline"] != true {
 		t.Fatalf("finalize_pipeline result = %#v, want finalize_pipeline=true after passing tester audit", result)
 	}
-	if resultMap["must_handoff_to_ot"] != true {
-		t.Fatalf("finalize_pipeline result = %#v, want must_handoff_to_ot=true", result)
+	if resultMap["must_handoff_to_green"] != true {
+		t.Fatalf("finalize_pipeline result = %#v, want must_handoff_to_green=true", result)
 	}
-	if resultMap["next_required_action"] != "handoff_to_ot" {
-		t.Fatalf("finalize_pipeline result = %#v, want next_required_action=handoff_to_ot", result)
+	if resultMap["next_required_action"] != "handoff_to_green" {
+		t.Fatalf("finalize_pipeline result = %#v, want next_required_action=handoff_to_green", result)
 	}
 
 	state := PipelineProtocolStateFromContext(ctx)
@@ -1771,16 +1771,16 @@ func TestPipelineProtocolSkills_FinalizePipelineSignalsReadinessAndHandoffToOTPu
 		t.Fatal("pipeline protocol state missing from context")
 	}
 	if action := state.TerminalAction(); action != nil {
-		t.Fatalf("terminal action = %#v, want nil before handoff_to_ot", action)
+		t.Fatalf("terminal action = %#v, want nil before handoff_to_green", action)
 	}
 
-	runSkill(t, ctx, skills, "handoff_to_ot", map[string]any{
+	runSkill(t, ctx, skills, "handoff_to_green", map[string]any{
 		"summary":       "Criteria satisfied and pipeline is ready for merge.",
 		"evidence_refs": []string{"tests/auth_test.go", "cli.py"},
 	})
 
 	if action := state.TerminalAction(); action == nil || action.Type != PipelineProtocolActionOT {
-		t.Fatalf("terminal action = %#v, want handoff_to_ot", action)
+		t.Fatalf("terminal action = %#v, want handoff_to_green", action)
 	}
 
 	update := waitForPipelineUpdate(t, updateCh)
@@ -1802,7 +1802,7 @@ func TestPipelineProtocolSkills_FinalizePipelineSignalsReadinessAndHandoffToOTPu
 	}
 }
 
-func TestPipelineProtocolSkills_HandoffToOTPublishesTerminalUpdateWithoutBoundPipelineTask(t *testing.T) {
+func TestPipelineProtocolSkills_HandoffToGreenPublishesTerminalUpdateWithoutBoundPipelineTask(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
@@ -1850,7 +1850,7 @@ func TestPipelineProtocolSkills_HandoffToOTPublishesTerminalUpdateWithoutBoundPi
 		},
 	})
 
-	runSkill(t, ctx, skills, "handoff_to_ot", map[string]any{
+	runSkill(t, ctx, skills, "handoff_to_green", map[string]any{
 		"summary":       "Fallback OT handoff should still publish the terminal update.",
 		"evidence_refs": []string{"artifact:fallback"},
 	})
@@ -2014,19 +2014,15 @@ func callSkill(t *testing.T, ctx context.Context, skills []*skills.Skill, name s
 }
 
 // testNoopPipelineCommitter satisfies PipelineCommitter for tests that
-// exercise the inspector handoff_to_ot / discard_pipeline skills without a
+// exercise the inspector handoff_to_green / discard_pipeline skills without a
 // real SessionVFS. Real wiring (cmd/tui.go) installs a SessionVFS-backed
 // committer; here we just want the skill to succeed past its committer
 // gate so the test can observe protocol-state mutations and published
 // updates.
 type testNoopPipelineCommitter struct{}
 
-func (testNoopPipelineCommitter) MergePipelineIntoGreen(_ context.Context, pipelineID string) (versioning.MergePipelineResult, error) {
+func (testNoopPipelineCommitter) MergePipelineIntoGreen(_ context.Context, pipelineID string, _ versioning.PipelineInspectorCertificate) (versioning.MergePipelineResult, error) {
 	return versioning.MergePipelineResult{PipelineID: pipelineID}, nil
-}
-
-func (testNoopPipelineCommitter) ExtractReviewCandidate(_ context.Context, _ string) (string, bool, versioning.SemanticVersion, error) {
-	return "", false, versioning.SemanticVersion{}, nil
 }
 
 func (testNoopPipelineCommitter) Rollback(_ context.Context, _ string) error { return nil }

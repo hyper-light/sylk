@@ -33,11 +33,6 @@ const (
 	// ArtifactPendingValidation names the validation response waiting
 	// to be consumed by process_validation on the originator.
 	ArtifactPendingValidation = "pending_validation"
-
-	// ArtifactReviewCandidate names the review candidate the inspector
-	// extracts during handoff_to_ot. Consumed by the orchestrator's
-	// global-review followup dispatch.
-	ArtifactReviewCandidate = "review_candidate"
 )
 
 // recoveryForArtifact returns a short prose hint naming the canonical
@@ -54,8 +49,6 @@ func recoveryForArtifact(artifact string) string {
 		return "call finalize_pipeline (tester variant) to package the verification artifact"
 	case ArtifactPendingValidation:
 		return "wait for the peer's validate_work response to arrive"
-	case ArtifactReviewCandidate:
-		return "call handoff_to_ot to extract the review candidate"
 	default:
 		return "produce the missing artifact before retrying"
 	}

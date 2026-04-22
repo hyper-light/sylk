@@ -333,7 +333,7 @@ func TestRRFFusion_Fuse_SingleSource_Semantic(t *testing.T) {
 
 	require.Len(t, results, 2)
 	assert.Equal(t, "doc1", results[0].ID)
-	assert.Equal(t, SourceHNSW, results[0].Source)
+	assert.Equal(t, SourceVector, results[0].Source)
 	assert.Equal(t, 0.95, results[0].SemanticScore)
 }
 
