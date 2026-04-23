@@ -638,7 +638,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 				shared.PublishStreamStart(l.bus, l.channels, ctx, l.id)
 				streamStarted = true
 			}
-			l.publishReplicaActivityForSession(fwd.SessionID, events.EventTypeAgentAction, "Waiting for an available search replica", snapshot)
+			l.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentAction, "Waiting for an available search replica", snapshot)
 			if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
 				pp.PublishState(events.AgentUIStateSearching, shared.KnowledgeQueueProgressMessage("librarian", snapshot, queuePosition))
 			}
@@ -653,7 +653,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 				shared.PublishStreamStart(l.bus, l.channels, ctx, l.id)
 				streamStarted = true
 			}
-			l.publishReplicaActivityForSession(fwd.SessionID, events.EventTypeAgentAction, "Processing search request", snapshot)
+			l.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentAction, "Processing search request", snapshot)
 		},
 	})
 	if stopQueueKeepalive != nil {
@@ -742,7 +742,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		if fwd.FireAndForget {
 			return nil
 		}
-		l.publishReplicaActivityForSession(fwd.SessionID, events.EventTypeAgentError, fmt.Sprintf("Search failed: %s", err.Error()), snapshot)
+		l.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentError, fmt.Sprintf("Search failed: %s", err.Error()), snapshot)
 		errMsg := guide.NewErrorMessage(
 			l.generateMessageID(),
 			fwd.CorrelationID,
@@ -767,7 +767,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		ProcessingTime:      time.Since(startTime),
 		Data:                result,
 	}
-	l.publishReplicaActivityForSession(fwd.SessionID, events.EventTypeSuccess, "Search task completed", snapshot)
+	l.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeSuccess, "Search task completed", snapshot)
 
 	if l.agentPod != nil {
 		l.agentPod.FeedScribe("librarian", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)

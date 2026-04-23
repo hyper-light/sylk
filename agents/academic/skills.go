@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
@@ -60,21 +61,23 @@ func (a *Academic) registerFabricSkills() {
 	}) {
 		a.skills.Register(skill)
 	}
-	for _, skill := range shared.CrossPipelineSkills(shared.CrossPipelineSkillConfig{
-		SessionID:  sessionID,
-		AgentID:    agentID,
-		AgentType:  agentType,
-		PipelineID: func() string { return "" },
-		RouteSync: shared.RouteSyncFromBus(
-			func() guide.EventBus { return a.bus },
-			func() string {
-				if a.channels == nil {
-					return ""
-				}
-				return a.channels.Responses
-			},
-		),
-	}) {
+	// Claims skills.
+	boardProvider := func() *claims.ClaimsBoard {
+		return claims.DefaultSessionBoardRegistry().Lookup(a.config.SessionID)
+	}
+	a.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	a.skills.Register(claims.PostActionSkill(boardProvider))
+	a.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	a.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
+	a.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+
+	fabricCfg := fabric.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}
+	for _, skill := range fabric.ClaimsAwarenessSkills(fabricCfg) {
 		a.skills.Register(skill)
 	}
 }

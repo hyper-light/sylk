@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/knowledge/query"
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/skills"
@@ -121,21 +122,26 @@ func (l *Librarian) registerFabricSkills() {
 	}) {
 		l.skills.Register(skill)
 	}
-	for _, skill := range shared.CrossPipelineSkills(shared.CrossPipelineSkillConfig{
-		SessionID:  sessionID,
-		AgentID:    agentID,
-		AgentType:  agentType,
-		PipelineID: func() string { return "" },
-		RouteSync: shared.RouteSyncFromBus(
-			func() guide.EventBus { return l.bus },
-			func() string {
-				if l.channels == nil {
-					return ""
-				}
-				return l.channels.Responses
-			},
-		),
-	}) {
+	// Claims skills: knowledge agents are full participants — they
+	// receive direct user prompts, issue consultation claims against
+	// peers, and respond with testaments containing artifacts.
+	boardProvider := func() *claims.ClaimsBoard {
+		return claims.DefaultSessionBoardRegistry().Lookup(l.config.SessionID)
+	}
+	l.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	l.skills.Register(claims.PostActionSkill(boardProvider))
+	l.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	l.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
+	l.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+
+	// Fabric claims awareness for cross-pipeline visibility.
+	fabricCfg := fabric.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}
+	for _, skill := range fabric.ClaimsAwarenessSkills(fabricCfg) {
 		l.skills.Register(skill)
 	}
 }

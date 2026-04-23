@@ -119,8 +119,8 @@ func (b *librarianToolBundle) toolInvocations(ctx context.Context, agentID strin
 	return invocations
 }
 
-func (l *Librarian) publishReplicaActivityForSession(
-	sessionID string,
+func (l *Librarian) publishReplicaActivityForRequest(
+	sessionID, correlationID string,
 	eventType events.EventType,
 	content string,
 	snapshot shared.RequestReplicaPoolSnapshot,
@@ -129,6 +129,7 @@ func (l *Librarian) publishReplicaActivityForSession(
 		return
 	}
 	evt := events.NewActivityEvent(eventType, strings.TrimSpace(sessionID), content)
+	evt.CorrelationID = strings.TrimSpace(correlationID)
 	evt.AgentID = l.id
 	evt.Visibility = events.VisibilityUser
 	evt.Data["agent_type"] = "librarian"

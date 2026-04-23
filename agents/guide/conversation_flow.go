@@ -558,6 +558,9 @@ func (m *ConversationFlowManager) SessionClaimsBoard(sessionID string, scope cla
 			TaskID:    "session",
 			Scope:     scope,
 		})
+		// Register in the global registry so knowledge agents and
+		// other agents can resolve the board from their session ID.
+		claims.DefaultSessionBoardRegistry().Register(trimmedSession, state.claimsBoard)
 	}
 	m.sessions[trimmedSession] = state
 	return state.claimsBoard
