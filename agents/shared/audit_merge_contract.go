@@ -24,7 +24,7 @@ func jsonEncodeResult(r *AuditMergeResult) ([]byte, error) {
 // context is the Copy immediately preceding this merge
 // (Descriptor.BaseVersion → materialized via SessionVFS.CopyAt).
 // The replica reads both, plus the PipelineCertificate the pipeline
-// inspector attached at handoff_to_green, and emits Accepted or
+// inspector attached at handoff_to_ot, and emits Accepted or
 // Rejected.
 type AuditMergeRequest struct {
 	// SessionID identifies the session whose commit queue the merge
@@ -69,6 +69,13 @@ type AuditMergeRequest struct {
 	// get the descriptor via the AuditMergeResult topic with no VFS
 	// handle.
 	ReplicaVFS *versioning.ReplicaVFS `json:"-"`
+
+	// Session is a direct reference to the SessionVFS that owns
+	// this merge. The per-replica audit runtime uses it for
+	// merges_after queries and any other session-scoped reads the
+	// audit needs. Excluded from JSON — it's an in-process object,
+	// never serialized across the bus.
+	Session *versioning.SessionVFS `json:"-"`
 
 	// SteeringJournalDir, when non-empty, is the session-scoped
 	// directory under which the replica should open its steering

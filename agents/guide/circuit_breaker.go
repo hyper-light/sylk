@@ -274,8 +274,14 @@ type CircuitBreakerStats struct {
 
 // CircuitBreakerRegistry manages circuit breakers for multiple agents
 type CircuitBreakerRegistry struct {
-	breakers *ShardedMap[string, *CircuitBreaker]
-	config   CircuitBreakerConfig
+	breakers      *ShardedMap[string, *CircuitBreaker]
+	config        CircuitBreakerConfig
+	onStateChange func(agentID string, from, to CircuitState)
+}
+
+// SetOnStateChange sets a registry-wide callback for circuit state transitions.
+func (r *CircuitBreakerRegistry) SetOnStateChange(fn func(agentID string, from, to CircuitState)) {
+	r.onStateChange = fn
 }
 
 // NewCircuitBreakerRegistry creates a new registry
@@ -293,8 +299,20 @@ func (r *CircuitBreakerRegistry) Get(agentID string) *CircuitBreaker {
 		return cb
 	}
 
-	// Create new breaker
-	newCB := NewCircuitBreaker(r.config)
+	// Create new breaker with registry-level state change callback.
+	cfg := r.config
+	if r.onStateChange != nil {
+		registryCb := r.onStateChange
+		aid := agentID
+		priorCb := cfg.OnStateChange
+		cfg.OnStateChange = func(from, to CircuitState) {
+			registryCb(aid, from, to)
+			if priorCb != nil {
+				priorCb(from, to)
+			}
+		}
+	}
+	newCB := NewCircuitBreaker(cfg)
 	existing, loaded := r.breakers.GetOrSet(agentID, newCB)
 	if loaded {
 		return existing

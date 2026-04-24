@@ -11,7 +11,7 @@ import (
 // regression guard against the class of bug where enum-dispatched
 // façades silently drop delegate Requirements. The pipeline_protocol
 // façade wedged because finalize's "if ready_for_ot is true, call
-// handoff_to_green next" Requirement never reached the LLM's tool
+// handoff_to_ot next" Requirement never reached the LLM's tool
 // catalog. Every field type on the delegate must render under its own
 // tagged line so the LLM binds each rule to the action enum value.
 func TestRenderActionBlock_PropagatesLoadBearingRequirements(t *testing.T) {
@@ -21,8 +21,8 @@ func TestRenderActionBlock_PropagatesLoadBearingRequirements(t *testing.T) {
 		Description("Run the inspector closure gate. Returns ready_for_ot when accepted.").
 		Domain("pipeline").
 		Usage("Invoke only after the audit is settled and any challenge responses have been consumed.").
-		Requirement("If this tool returns ready_for_ot: true, the next terminal action must be handoff_to_green.").
-		Requirement("Do not end the turn or continue with other work until handoff_to_green has been invoked.").
+		Requirement("If this tool returns ready_for_ot: true, the next terminal action must be handoff_to_ot.").
+		Requirement("Do not end the turn or continue with other work until handoff_to_ot has been invoked.").
 		Satisfies("Produces the closure verdict that gates OT handoff.").
 		Avoid("Do not use as a substitute for a targeted challenge when returned work is still unclear.").
 		BestPractice("Pass the strongest criteria and challenge evidence into the call.").
@@ -43,9 +43,9 @@ func TestRenderActionBlock_PropagatesLoadBearingRequirements(t *testing.T) {
 		"usage:",
 		// The load-bearing post-condition — the exact bug this test
 		// guards. If this assertion ever fails, the LLM stops seeing
-		// the "must call handoff_to_green next" rule.
-		"requirement: If this tool returns ready_for_ot: true, the next terminal action must be handoff_to_green.",
-		"requirement: Do not end the turn or continue with other work until handoff_to_green has been invoked.",
+		// the "must call handoff_to_ot next" rule.
+		"requirement: If this tool returns ready_for_ot: true, the next terminal action must be handoff_to_ot.",
+		"requirement: Do not end the turn or continue with other work until handoff_to_ot has been invoked.",
 		"satisfies: Produces the closure verdict that gates OT handoff.",
 		"avoid: Do not use as a substitute for a targeted challenge when returned work is still unclear.",
 		"best_practice: Pass the strongest criteria and challenge evidence into the call.",

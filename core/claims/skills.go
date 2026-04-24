@@ -12,6 +12,10 @@ import (
 // BoardProvider returns the active ClaimsBoard for the current context.
 type BoardProvider func() *ClaimsBoard
 
+// InboxProvider returns the active ClaimsInbox for the current agent.
+// Used by PostActionSkill to auto-register expectations after commit.
+type InboxProvider func() *ClaimsInbox
+
 // ── Shared skills (all agents) ──────────────────────────────────────
 
 func QueryClaimsBoardSkill(bp BoardProvider) *skills.Skill {
@@ -30,9 +34,18 @@ func QueryClaimsBoardSkill(bp BoardProvider) *skills.Skill {
 		Build()
 }
 
-func PostActionSkill(bp BoardProvider) *skills.Skill {
+// PostActionSkill creates the post_action LLM-callable skill. The
+// optional InboxProvider enables automatic expectation registration:
+// after PostAction commits, every directed claim gets an expectation
+// registered on the inbox so the issuer's OnResolved fires when the
+// subject responds with a testament.
+func PostActionSkill(bp BoardProvider, ip ...InboxProvider) *skills.Skill {
+	var inboxFn InboxProvider
+	if len(ip) > 0 {
+		inboxFn = ip[0]
+	}
 	return skills.NewSkill("post_action").
-		Description("Issue an action (set of claims) against one or more subjects. Each claim carries its validations. Covers task, challenge, consultation, corrective, and archival actions.").
+		Description("Issue an action (set of claims) against one or more subjects. Each claim carries its validations. Returns the committed action_id and claim_ids. The issuer's inbox automatically watches for testament responses — no manual expectation registration needed.").
 		Domain("claims").
 		Keywords("action", "claim", "issue", "challenge", "consult").
 		Priority(97).
@@ -56,7 +69,8 @@ func PostActionSkill(bp BoardProvider) *skills.Skill {
 				return nil, fmt.Errorf("invalid claims_json: %w", err)
 			}
 
-			var claims []Claim
+			actionType := ActionType(strings.TrimSpace(params.ActionType))
+			postedClaims := make([]Claim, 0, len(claimInputs))
 			for _, ci := range claimInputs {
 				c := Claim{
 					Title:       ci.Title,
@@ -66,7 +80,6 @@ func PostActionSkill(bp BoardProvider) *skills.Skill {
 						{Related: ci.Subject, RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
 					},
 				}
-				// Validations live ON the claim.
 				for _, vi := range ci.Validations {
 					c.Validations = append(c.Validations, &Validation{
 						Description: vi.Description,
@@ -75,13 +88,75 @@ func PostActionSkill(bp BoardProvider) *skills.Skill {
 						Required:    true,
 					})
 				}
-				claims = append(claims, c)
+				postedClaims = append(postedClaims, c)
 			}
 
-			action := Action{Type: ActionType(strings.TrimSpace(params.ActionType))}
-			return nil, board.PostAction(ctx, action, claims)
+			action := Action{Type: actionType}
+			if err := board.PostAction(ctx, action, postedClaims); err != nil {
+				return nil, err
+			}
+
+			// Auto-register expectations: for each directed claim, the
+			// issuer expects a TestamentDelta when the subject responds.
+			claimIDs := make([]string, 0, len(postedClaims))
+			for idx := range postedClaims {
+				claimIDs = append(claimIDs, postedClaims[idx].ID)
+			}
+			if inboxFn != nil {
+				if inbox := inboxFn(); inbox != nil {
+					expectedDelta := expectedDeltaForActionType(actionType)
+					priority := expectedPriorityForActionType(actionType)
+					for idx := range postedClaims {
+						inbox.Expect(&Expectation{
+							ClaimID:       postedClaims[idx].ID,
+							ExpectedDelta: expectedDelta,
+							ActionID:      action.ID,
+							IssuedAt:      postedClaims[idx].Created,
+							Priority:      priority,
+						})
+					}
+				}
+			}
+
+			return map[string]any{
+				"action_id": action.ID,
+				"claim_ids": claimIDs,
+				"count":     len(claimIDs),
+			}, nil
 		}).
 		Build()
+}
+
+// expectedDeltaForActionType returns the delta kind the issuer should
+// expect in response to an action of the given type.
+func expectedDeltaForActionType(t ActionType) string {
+	switch t {
+	case ActionTypeChallenge:
+		return DeltaKindTestament
+	case ActionTypeConsultation:
+		return DeltaKindTestament
+	case ActionTypeTask:
+		return DeltaKindTestament
+	case ActionTypeCorrective:
+		return DeltaKindTestament
+	}
+	return DeltaKindTestament
+}
+
+// expectedPriorityForActionType returns the priority the issuer
+// should assign to the response expectation.
+func expectedPriorityForActionType(t ActionType) WorkUnitPriority {
+	switch t {
+	case ActionTypeChallenge:
+		return PriorityChallenge
+	case ActionTypeCorrective:
+		return PriorityRemediation
+	case ActionTypeConsultation:
+		return PriorityResponse
+	case ActionTypeTask:
+		return PriorityResponse
+	}
+	return PriorityResponse
 }
 
 func InspectClaimConflictsSkill(bp BoardProvider) *skills.Skill {

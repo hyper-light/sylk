@@ -14,6 +14,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
@@ -218,7 +219,45 @@ func consultSkill(a *Architect) *skills.Skill {
 			if !ok {
 				return nil, fmt.Errorf("unknown consult mode: %q", params.Mode)
 			}
-			return fn(ctx, &params)
+
+			// Consultation claim.
+			target := strings.TrimSpace(params.Target)
+			if target == "" {
+				target = "multi"
+			}
+			a.architectPostClaim(ctx,
+				architectClaimAction(claims.ActionTypeConsultation),
+				architectClaimWithSubject(
+					"Consult "+target+": "+truncateArchitectString(params.Query, 60),
+					"Evidence gathering via consultation",
+					target,
+					[]claims.ClaimScopeEntry{{Kind: "consultation", Key: target}},
+					claims.ActionTypeConsultation,
+					[]*claims.Validation{
+						architectValidation(claims.ValidationTypeReceipt, true, "Consultation succeeded and is fresh", "evidence.Success == true"),
+					},
+				),
+			)
+
+			result, err := fn(ctx, &params)
+
+			// Consultation testament.
+			if err != nil {
+				a.architectSubmitTestament(ctx, a.architectTestamentWithSubject(
+					"Consultation with "+target+" failed: "+err.Error(), "committed", target,
+					[]*claims.Artifact{a.architectArtifact("error", err.Error())},
+				))
+			} else {
+				a.architectSubmitTestament(ctx, a.architectTestamentWithSubject(
+					"Consultation with "+target+": "+params.Mode, "committed", target,
+					[]*claims.Artifact{
+						a.architectArtifact("target", target),
+						a.architectArtifact("mode", params.Mode),
+						a.architectArtifact("query", truncateArchitectString(params.Query, 200)),
+					},
+				))
+			}
+			return result, err
 		}).
 		Build()
 }
@@ -263,12 +302,48 @@ func preDelegationDeclareSkill(a *Architect) *skills.Skill {
 			if err != nil {
 				return nil, err
 			}
+
+			// Pre-delegation claim.
+			a.architectPostClaim(ctx,
+				architectClaimAction(claims.ActionTypeTask),
+				architectClaimWithSubject(
+					"Declare delegation to "+params.TargetAgent,
+					"Formal pre-delegation declaration with consultation evidence",
+					params.TargetAgent,
+					[]claims.ClaimScopeEntry{
+						{Kind: "plan", Key: plan.ID},
+						{Kind: "delegation", Key: params.TargetAgent},
+					},
+					claims.ActionTypeTask,
+					[]*claims.Validation{
+						architectValidation(claims.ValidationTypeInspection, true, "All attached consultations are successful and fresh", "declaration.ConsultationChecks all pass"),
+						architectValidation(claims.ValidationTypeInspection, true, "Failure criteria explicitly stated", "len(declaration.FailureCriteria) > 0"),
+					},
+				),
+			)
+
 			declaration := buildPreDelegationDeclaration(plan, params)
 			if err := a.validateDeclaration(declaration); err != nil {
+				a.architectSubmitTestament(ctx, a.architectTestamentWithSubject(
+					"Declaration validation failed: "+err.Error(), "committed", params.TargetAgent,
+					[]*claims.Artifact{a.architectArtifact("error", err.Error())},
+				))
 				return nil, err
 			}
 			a.persistDeclaration(plan, declaration)
 			a.publishDeclaration(ctx, declaration, plan.SessionID)
+
+			// Declaration testament.
+			a.architectSubmitTestament(ctx, a.architectTestamentWithSubject(
+				"Declaration: delegate to "+params.TargetAgent, "committed", params.TargetAgent,
+				[]*claims.Artifact{
+					a.architectArtifact("target_agent", params.TargetAgent),
+					a.architectArtifact("expected_outcome", truncateArchitectString(params.ExpectedOutcome, 200)),
+					a.architectArtifact("failure_criteria", truncateArchitectString(params.FailureCriteria, 200)),
+					a.architectArtifact("required_skills", fmt.Sprintf("%d", len(params.RequiredSkills))),
+				},
+			))
+
 			return declaration, nil
 		}).
 		Build()
@@ -664,6 +739,19 @@ func monitorExecutionSkill(a *Architect) *skills.Skill {
 					"error":       "no registered orchestrator agent id is available",
 				}, nil
 			}
+			a.architectPostClaim(ctx,
+				architectClaimAction(claims.ActionTypeConsultation),
+				architectClaimWithSubject(
+					"Monitor execution: "+truncateArchitectString(plan.ID, 40),
+					"Execution status query via orchestrator",
+					req.TargetAgentID,
+					[]claims.ClaimScopeEntry{{Kind: "consultation", Key: "orchestrator"}},
+					claims.ActionTypeConsultation,
+					[]*claims.Validation{
+						architectValidation(claims.ValidationTypeReceipt, false, "Orchestrator returns execution status", "response != nil"),
+					},
+				),
+			)
 			msg, err := a.requestRouteSync(ctx, req)
 			if err != nil {
 				return map[string]any{
@@ -704,6 +792,18 @@ func (a *Architect) applyPlanRevision(plan *DesignPlan, reason string, updates m
 	if err := a.planStore.Upsert(current); err != nil {
 		a.logger.Warn("failed to persist revised plan snapshot", "plan_id", current.ID, "error", err)
 	}
+
+	// Plan revision testament.
+	a.architectSubmitTestament(context.Background(), a.architectTestament(
+		fmt.Sprintf("Plan %s revised to r%d: %s", current.ID, current.Revision, truncateArchitectString(reason, 100)),
+		"committed",
+		[]*claims.Artifact{
+			a.architectArtifact("plan_id", current.ID),
+			a.architectArtifact("new_revision", fmt.Sprintf("%d", current.Revision)),
+			a.architectArtifact("reason", reason),
+		},
+	))
+
 	return current
 }
 

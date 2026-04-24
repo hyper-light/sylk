@@ -237,6 +237,14 @@ type HealthMonitor struct {
 	// Callbacks
 	onUnhealthy func(agentID string, status HealthStatus)
 	onRecovered func(agentID string)
+	onDegraded  func(agentID string)
+}
+
+// SetOnDegraded sets the callback invoked when an agent is marked degraded.
+func (m *HealthMonitor) SetOnDegraded(fn func(agentID string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onDegraded = fn
 }
 
 // HealthMonitorConfig configures the health monitor
@@ -366,6 +374,12 @@ func (m *HealthMonitor) SetDegradedByQuality(agentID string) {
 	health, ok := m.agents.Get(agentID)
 	if ok {
 		health.SetDegraded()
+	}
+	m.mu.Lock()
+	cb := m.onDegraded
+	m.mu.Unlock()
+	if cb != nil {
+		cb(agentID)
 	}
 }
 

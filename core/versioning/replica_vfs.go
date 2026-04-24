@@ -89,6 +89,19 @@ type ReplicaVFS struct {
 	// fine in practice.
 	readCache map[string][]byte
 
+	// chainReads is the set of paths THIS audit resolved via chain
+	// walk or disk (i.e. paths the audit CONSULTED from ancestors,
+	// not just paths it wrote). Used by the §3.8 re-audit scan:
+	// when a supersession lands, the coordinator checks whether
+	// the supersedor touched any of these paths — if so, this
+	// audit's context is substantively stale and a re-audit is
+	// required. Purely additive; unbounded within the audit's
+	// lifetime (released when the ReplicaVFS is released). Reads
+	// that hit the local writes/deletes set do NOT populate
+	// chainReads — those are "paths this replica OWNS," not paths
+	// it consulted from an ancestor.
+	chainReads map[string]struct{}
+
 	// sealed is true after Seal() has been called. Further writes
 	// return ErrReplicaVFSSealed.
 	sealed atomic.Bool
@@ -215,35 +228,116 @@ func (r *ReplicaVFS) Read(path string) ([]byte, error) {
 	if r == nil {
 		return nil, ErrFileNotFound
 	}
+	// Abandoned layers are chain-bypassed for THEIR descendants, but
+	// direct reads on self also skip the local overlay — the layer
+	// has been disowned, so even its owner must fall through to
+	// whatever the bypassed view resolves to. Same contract
+	// readThroughChain enforces for descendants.
+	if !r.abandoned.Load() {
+		// Local-write fast path: if THIS replica owns the path and
+		// the layer is still live, return our own content. No
+		// chain-read tracking here — this is own content, not an
+		// ancestor consultation.
+		if content, local := r.lookupLocal(path); local {
+			return content, nil
+		}
+	}
 	// Fast path: JIT read-cache hit. Skips chain walk entirely.
 	// Cached content is a defensive copy so callers can't mutate the
-	// cache through the returned slice.
+	// cache through the returned slice. Cached reads are still
+	// chain/disk-origin, so we count them as audited-context reads.
 	if cached, ok := r.lookupReadCache(path); ok {
+		r.recordChainRead(path)
 		return cached, nil
 	}
 	content, state := r.readThroughChain(path)
 	switch state {
 	case readResolveHit:
-		// Cache the resolved content for subsequent hits. §3.6.
+		// Resolved via parent chain. Record as audited-context read
+		// (§3.8) + cache for subsequent hits (§3.6).
+		r.recordChainRead(path)
 		r.populateReadCache(path, content)
 		return content, nil
 	case readResolveShadowed:
-		// Deleted upstream — don't fall through to disk. Don't cache
-		// a "not found" sentinel either; subsequent reads re-walk
-		// and re-discover the shadow via the same path. (Writing a
-		// nil to readCache would conflate "cached not-found" with
-		// "cached empty file.")
+		// Deleted upstream — don't fall through to disk. Record as
+		// a chain read too: the audit CONSULTED the ancestor's
+		// delete-shadow state, which is still audited context.
+		r.recordChainRead(path)
 		return nil, ErrFileNotFound
 	default:
 		if r.diskBase != nil {
 			raw, err := r.diskBase.ReadFile(path)
 			if err == nil {
+				r.recordChainRead(path)
 				r.populateReadCache(path, raw)
+			} else if errors.Is(err, ErrFileNotFound) {
+				// Disk miss — the audit still consulted disk state.
+				r.recordChainRead(path)
 			}
 			return raw, err
 		}
 		return nil, ErrFileNotFound
 	}
+}
+
+// lookupLocal checks only this replica's owned writes/deletes (no
+// chain traversal, no disk). Returns (content, true) when the path
+// is locally owned; (nil, false) otherwise. A local delete returns
+// (nil, false) here so the outer Read continues into the chain —
+// the shadow semantics are preserved by readThroughChain's
+// delete-check. This split is purely to keep chainReads pristine:
+// local writes are never ancestor consultations.
+func (r *ReplicaVFS) lookupLocal(path string) ([]byte, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if _, deleted := r.deletes[path]; deleted {
+		return nil, false
+	}
+	content, ok := r.writes[path]
+	if !ok {
+		return nil, false
+	}
+	out := make([]byte, len(content))
+	copy(out, content)
+	return out, true
+}
+
+// recordChainRead adds path to the chainReads set. Called by Read
+// after the path resolves via chain or disk. Safe on abandoned /
+// sealed replicas (still adds to the set — callers may still want
+// to inspect reads that happened before the seal). Skipped when
+// path is empty (defensive; should never happen but avoids a
+// useless entry).
+func (r *ReplicaVFS) recordChainRead(path string) {
+	if path == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.chainReads == nil {
+		r.chainReads = make(map[string]struct{})
+	}
+	r.chainReads[path] = struct{}{}
+}
+
+// ChainReads returns a snapshot of paths this replica consulted via
+// chain walk or disk fallback. Used by the §3.8 re-audit scan to
+// compute "audited-context paths touched by a supersedor." Empty
+// when the replica has not yet read anything beyond its own overlay.
+func (r *ReplicaVFS) ChainReads() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.chainReads) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(r.chainReads))
+	for path := range r.chainReads {
+		out = append(out, path)
+	}
+	return out
 }
 
 // readCacheMaxPaths caps the JIT read cache. When the cache reaches

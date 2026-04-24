@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -193,6 +194,20 @@ func (a *Archivalist) StoreResearchPaper(ctx context.Context, params *storeResea
 	}
 
 	result := a.StoreEntry(ctx, entry)
+
+	// Research paper testament (distinct from generic store — carries research metadata).
+	if result.Success {
+		a.archivalistSubmitTestament(ctx, a.archivalistTestament(
+			"Research paper stored: "+truncateArchivalist(params.Title, 80), "committed",
+			[]*claims.Artifact{
+				a.archivalistArtifact("research_slug", params.ResearchSlug),
+				a.archivalistArtifact("title", params.Title),
+				a.archivalistArtifact("version", fmt.Sprintf("%d", params.Version)),
+				a.archivalistArtifact("entry_id", result.ID),
+			},
+		))
+	}
+
 	if result.Success && result.ID != "" && strings.TrimSpace(params.ID) != "" {
 		_ = a.UpdateEntry(ctx, result.ID, func(existing *Entry) {
 			if existing.Metadata == nil {

@@ -1,12 +1,15 @@
 package pipeline
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/claims"
 )
 
 func (pt *PipelineTester) recordSuccessfulToolOutput(toolName, output string) {
@@ -34,11 +37,22 @@ func (pt *PipelineTester) storeDiagnosis(report *testershared.DiagnosisReport) {
 	copyReport.SuggestedFix = append([]testershared.SuggestedFix(nil), report.SuggestedFix...)
 
 	pt.mu.Lock()
-	defer pt.mu.Unlock()
 	if pt.diagnoses == nil {
 		pt.diagnoses = make(map[string]*testershared.DiagnosisReport)
 	}
 	pt.diagnoses[strings.TrimSpace(report.TestName)] = &copyReport
+	pt.mu.Unlock()
+
+	// Failure diagnosis testament.
+	pt.testerSubmitTestament(context.Background(), pt.testerTestament(
+		"Failure diagnosed: "+truncateTester(report.TestName, 80), "committed",
+		[]*claims.Artifact{
+			pt.testerArtifact("test_name", report.TestName),
+			pt.testerArtifact("is_product_bug", fmt.Sprintf("%t", report.IsProductBug)),
+			pt.testerArtifact("root_cause_count", fmt.Sprintf("%d", len(report.RootCauses))),
+			pt.testerArtifact("confidence", fmt.Sprintf("%.2f", report.Confidence)),
+		},
+	))
 }
 
 func (pt *PipelineTester) diagnosisSnapshots() []*testershared.DiagnosisReport {

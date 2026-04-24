@@ -57,6 +57,16 @@ type PendingCleanup struct {
 
 	// Stats
 	totalExpired int64
+
+	// Claims callback.
+	onCleanup func(expiredCount int, correlationIDs []string)
+}
+
+// SetOnCleanup sets the callback invoked per cleanup cycle with expired count.
+func (c *PendingCleanup) SetOnCleanup(fn func(expiredCount int, correlationIDs []string)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onCleanup = fn
 }
 
 // PendingCleanupConfig configures the pending cleanup
@@ -151,6 +161,14 @@ func (c *PendingCleanup) cleanup() {
 	// Process expired entries
 	for _, entry := range expired {
 		c.handleExpired(entry)
+	}
+
+	if len(expired) > 0 && c.onCleanup != nil {
+		ids := make([]string, len(expired))
+		for i, e := range expired {
+			ids[i] = e.CorrelationID
+		}
+		c.onCleanup(len(expired), ids)
 	}
 }
 

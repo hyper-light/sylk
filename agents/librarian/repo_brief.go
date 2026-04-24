@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/search/codebase"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -58,7 +59,15 @@ func repoBriefSkill(l *Librarian) *skills.Skill {
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			return l.buildRepositoryBrief(ctx, params)
+			result, err := l.buildRepositoryBrief(ctx, params)
+			if err == nil && result != nil {
+				if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+					acc.Record("repo_brief_focus", params.Focus)
+					acc.RecordJSON("repo_brief_summary", result)
+					acc.Note("Repo brief generated")
+				}
+			}
+			return result, err
 		}).
 		Build()
 }

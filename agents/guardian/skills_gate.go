@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -133,7 +134,38 @@ func reviewGateSkill(g *Guardian) *skills.Skill {
 			if !ok {
 				return nil, fmt.Errorf("unknown review_gate action: %q", params.Action)
 			}
-			return fn(ctx, &params)
+
+			// Post claim: review gate evaluation.
+			sessionID := g.activeSessionID
+			g.guardianPostClaim(ctx,
+				guardianClaimAction(claims.ActionTypeTask),
+				guardianClaim(
+					"Review gate: "+params.Action,
+					"Diff review or pre-commit gating evaluation",
+					"guardian",
+					[]claims.ClaimScopeEntry{{Kind: "gate", Key: params.Action}},
+					claims.ActionTypeTask,
+					[]*claims.Validation{
+						guardianValidation(claims.ValidationTypeInspection, true, "No suspicious patterns in staged changes", "Zero findings in diff review"),
+					},
+				),
+			)
+
+			result, err := fn(ctx, &params)
+
+			// Submit testament with results.
+			if err != nil {
+				g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+					sessionID, "Review gate "+params.Action+" failed: "+err.Error(), "committed", "",
+					[]*claims.Artifact{guardianArtifact(sessionID, "error", err.Error())},
+				))
+			} else {
+				g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+					sessionID, "Review gate "+params.Action+" complete", "committed", "",
+					[]*claims.Artifact{guardianJSONArtifact(sessionID, "gate_results", result)},
+				))
+			}
+			return result, err
 		}).
 		Build()
 }

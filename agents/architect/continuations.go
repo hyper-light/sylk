@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/toolruntime"
@@ -162,6 +163,15 @@ func (a *Architect) reconcilePendingContinuations(ctx context.Context) {
 		a.reconcilePendingContinuationRecord(record)
 	}
 	a.recoverAllSessionPendingWork(ctx, now)
+
+	// Reconciliation testament.
+	a.architectSubmitTestament(ctx, a.architectTestament(
+		fmt.Sprintf("Reconciled %d pending continuations", len(records)),
+		"committed",
+		[]*claims.Artifact{
+			a.architectArtifact("total_continuations", fmt.Sprintf("%d", len(records))),
+		},
+	))
 }
 
 func canReconcilePendingContinuations(a *Architect) bool {
@@ -553,6 +563,17 @@ func (a *Architect) handleGuardianApprovalContinuation(
 			a.publishNotificationPush(message)
 		}
 	}
+
+	// Guardian approval relay testament.
+	a.architectSubmitTestament(context.Background(), a.architectTestament(
+		"Received guardian approval for "+record.ToolName+": executed",
+		"committed",
+		[]*claims.Artifact{
+			a.architectArtifact("tool_name", record.ToolName),
+			a.architectArtifact("approval_status", "approved"),
+			a.architectArtifact("execution_status", "success"),
+		},
+	))
 	return nil
 }
 
@@ -595,7 +616,18 @@ func (a *Architect) handleAcceptanceEvaluationContinuation(
 		a.publishNotificationPush("The plan changed before acceptance evaluation completed.")
 		return nil
 	}
-	switch acceptanceVerdict(strings.TrimSpace(strings.ToLower(result.Result))) {
+	// Acceptance evaluation relay testament.
+	verdict := acceptanceVerdict(strings.TrimSpace(strings.ToLower(result.Result)))
+	a.architectSubmitTestament(context.Background(), a.architectTestament(
+		"Acceptance evaluation received: "+string(verdict),
+		"committed",
+		[]*claims.Artifact{
+			a.architectArtifact("verdict", string(verdict)),
+			a.architectArtifact("plan_id", plan.ID),
+		},
+	))
+
+	switch verdict {
 	case verdictAccept:
 		dispatchResult, _ := a.dispatchPlanExecution(context.Background(), &ArchitectRequest{
 			ID:        uuid.NewString(),
@@ -681,6 +713,17 @@ func (a *Architect) handlePlanHandoffContinuation(
 		"summary":              summary,
 		"source":               "fresh_handoff_continuation",
 	})
+	// Plan handoff continuation relay testament.
+	a.architectSubmitTestament(context.Background(), a.architectTestament(
+		"Plan handoff acknowledged by orchestrator",
+		"committed",
+		[]*claims.Artifact{
+			a.architectArtifact("plan_id", plan.ID),
+			a.architectArtifact("orchestrator_response", "success"),
+			a.architectArtifact("summary", summary),
+		},
+	))
+
 	return a.finalizePlanHandoffExecution(
 		plan,
 		record,
@@ -717,6 +760,16 @@ func (a *Architect) handleAcademicRequirementsHandoffContinuation(
 		a.publishNotificationPush("I couldn't complete the Academic handoff: " + summary)
 		return nil
 	}
+	// Academic handoff relay testament.
+	a.architectSubmitTestament(context.Background(), a.architectTestament(
+		"Academic requirements handoff completed",
+		"committed",
+		[]*claims.Artifact{
+			a.architectArtifact("handoff_status", "completed"),
+			a.architectArtifact("correlation_id", record.ResponseCorrelationID),
+		},
+	))
+
 	return a.controlStore.CompleteContinuation(record, continuationStatusCompleted, respJSON, "")
 }
 

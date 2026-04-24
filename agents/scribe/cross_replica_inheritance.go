@@ -10,6 +10,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -53,6 +54,39 @@ func (s *Scribe) inheritPriorReplicaNarrative(ctx context.Context) {
 	if len(digest) == 0 {
 		return
 	}
+
+	// Post inheritance claim: this replica inherits continuity from prior ones.
+	priorGens := make([]claims.Relation, 0, len(digest)+2)
+	priorGens = append(priorGens,
+		claims.Relation{Related: s.scribeAgentID(), RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+		claims.Relation{Related: s.parentAgentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+	)
+	for _, entry := range digest {
+		priorGens = append(priorGens, claims.Relation{
+			Related:      fmt.Sprintf("replica_gen_%d", entry.replicaGeneration),
+			RelatedType:  claims.RelatedTypeAgent,
+			Relationship: claims.RelationshipDerivedFrom,
+		})
+	}
+	inheritClaim := claims.Claim{
+		Title:       fmt.Sprintf("Replica %d inherited narration context from %d prior replicas", s.replicaGeneration, len(digest)),
+		Description: "Cross-replica continuity established via fabric narration_emitted activity query",
+		Scope:       []claims.ClaimScopeEntry{{Kind: "replica", Key: fmt.Sprintf("gen_%d", s.replicaGeneration)}},
+		ActionType:  claims.ActionTypeArchival,
+		Relations:   priorGens,
+	}
+	s.scribePostClaim(ctx, s.scribeClaimAction(claims.ActionTypeArchival), inheritClaim)
+
+	// Submit inheritance testament with digest summary.
+	entryRefs := make([]string, 0, len(digest))
+	for _, e := range digest {
+		entryRefs = append(entryRefs, fmt.Sprintf("gen_%d@%s", e.replicaGeneration, e.timestamp.Format(time.RFC3339)))
+	}
+	s.scribeSubmitTestament(ctx, s.scribeTestament(
+		fmt.Sprintf("Inherited %d narrations from prior replicas", len(digest)),
+		"committed",
+		[]*claims.Artifact{s.scribeJSONArtifact("inherited_entries", entryRefs)},
+	))
 
 	// Inject as a synthetic seed message under the dedicated
 	// workstream key so it doesn't conflict with active per-

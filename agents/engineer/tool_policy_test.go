@@ -30,7 +30,7 @@ func TestEngineerBuildToolDefinitions_IncludeDiscoveryAndQualityTools(t *testing
 		"lsp",
 		"format",
 		"lint",
-		"consult_peer",
+		"fabric_query_claims_board",
 		"audit",
 		"report_confidence",
 	} {

@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
@@ -86,6 +87,10 @@ func (o *Orchestrator) ingestPlan(ctx context.Context, planJSON string) (any, er
 		o.logTrace("plan_handoff_ingest_prepare_failed", agentlog.EventError, map[string]any{
 			"error": err.Error(),
 		})
+		o.orchestratorSubmitTestament(ctx, o.orchestratorTestament(
+			"Plan ingestion failed: "+truncateOrchestrator(err.Error(), 60), "committed",
+			[]*claims.Artifact{o.orchestratorArtifact("error", err.Error())},
+		))
 		return nil, err
 	}
 	if duplicate {
@@ -115,6 +120,13 @@ func (o *Orchestrator) ingestPlan(ctx context.Context, planJSON string) (any, er
 		o.logWarnMsg("ingestPlan: attempt.ingest failed",
 			"plan_id", attempt.handoff.PlanID,
 			"error", err.Error())
+		o.orchestratorSubmitTestament(ctx, o.orchestratorTestament(
+			"Plan ingest failed: "+truncateOrchestrator(attempt.handoff.PlanID, 40), "committed",
+			[]*claims.Artifact{
+				o.orchestratorArtifact("plan_id", attempt.handoff.PlanID),
+				o.orchestratorArtifact("error", err.Error()),
+			},
+		))
 		return nil, err
 	}
 	o.logInfo("ingestPlan: OK — plan ingested and DAG submitted for execution",
@@ -132,6 +144,15 @@ func (o *Orchestrator) ingestPlan(ctx context.Context, planJSON string) (any, er
 		"task_count":  len(attempt.handoff.Tasks),
 		"layer_count": len(attempt.handoff.ExecutionLayers),
 	})
+	o.orchestratorSubmitTestament(ctx, o.orchestratorTestament(
+		"Plan ingested and DAG submitted", "committed",
+		[]*claims.Artifact{
+			o.orchestratorArtifact("plan_id", attempt.handoff.PlanID),
+			o.orchestratorArtifact("dag_id", attempt.dagID),
+			o.orchestratorArtifact("task_count", fmt.Sprintf("%d", len(attempt.handoff.Tasks))),
+			o.orchestratorArtifact("layer_count", fmt.Sprintf("%d", len(attempt.handoff.ExecutionLayers))),
+		},
+	))
 	return attempt.result(), nil
 }
 
@@ -659,6 +680,18 @@ func (o *Orchestrator) guardianPreflightPlan(ctx context.Context, handoff *archi
 			"guidelines":           task.Guidelines,
 			"implementation_guide": task.ImplementationGuide,
 		}
+		o.orchestratorPostClaim(ctx,
+			claims.Action{AgentID: "orchestrator", Type: claims.ActionTypeTask},
+			orchestratorTaskClaim(
+				"Preflight gate: guardian review for "+task.ID,
+				"Guardian preflight review of task before dispatch",
+				"guardian",
+				[]claims.ClaimScopeEntry{{Kind: "preflight", Key: task.ID}},
+				[]*claims.Validation{
+					orchestratorValidation(claims.ValidationTypeReceipt, true, "Guardian completes preflight review", "response.success"),
+				},
+			),
+		)
 		respMsg, err := o.requestRouteSync(ctx, "guardian", payload, map[string]any{
 			"direct_skill": "review_gate",
 			"plan_id":      handoff.PlanID,

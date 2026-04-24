@@ -13,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/resources"
 	"github.com/google/uuid"
@@ -143,12 +144,26 @@ func (a *Architect) runDeterministicProtocol(
 	diag.log("deterministic protocol start plan=%s", plan.ID)
 
 	transition := func(status PlanStatus) error {
+		prior := plan.SM().State()
 		if err := plan.SM().TransitionTo(status, plan); err != nil {
 			return err
 		}
 		plan.Status = plan.SM().State()
 		plan.Epoch = plan.SM().Epoch()
 		plan.UpdatedAt = time.Now()
+
+		// State transition testament.
+		a.architectSubmitTestament(ctx, a.architectTestament(
+			fmt.Sprintf("Plan %s: %s → %s", plan.ID, prior.String(), plan.Status.String()),
+			"committed",
+			[]*claims.Artifact{
+				a.architectArtifact("plan_id", plan.ID),
+				a.architectArtifact("from_status", prior.String()),
+				a.architectArtifact("to_status", plan.Status.String()),
+				a.architectArtifact("epoch", fmt.Sprintf("%d", plan.Epoch)),
+			},
+		))
+
 		return a.planStore.Upsert(plan)
 	}
 
@@ -156,7 +171,10 @@ func (a *Architect) runDeterministicProtocol(
 	if err := transition(PlanStatusAnalyzing); err != nil {
 		return a.failAndPersistPlan(plan, err)
 	}
+	completeAnalyze := a.architectStageClaim(ctx, plan.ID, "Analyze requirements", "Extract goals, constraints, dependencies from user query")
 	requirements, err := a.analyzeRequirements(ctx, req.Query, req.Params)
+	completeAnalyze(fmt.Sprintf("Extracted %d goals", len(requirements.Goals)),
+		[]*claims.Artifact{a.architectJSONArtifact("requirements", requirements)}, err)
 	if err != nil {
 		return a.failAndPersistPlan(plan, err)
 	}
@@ -171,7 +189,10 @@ func (a *Architect) runDeterministicProtocol(
 	if err := transition(PlanStatusDesigning); err != nil {
 		return a.failAndPersistPlan(plan, err)
 	}
+	completeDesign := a.architectStageClaim(ctx, plan.ID, "Design solution architecture", "Produce components, interfaces, layers from requirements")
 	architecture, err := a.designArchitecture(ctx, requirements, nil)
+	completeDesign(fmt.Sprintf("Designed %d-component architecture", len(architecture.Components)),
+		[]*claims.Artifact{a.architectJSONArtifact("architecture", architecture)}, err)
 	if err != nil {
 		return a.failAndPersistPlan(plan, err)
 	}
@@ -181,7 +202,15 @@ func (a *Architect) runDeterministicProtocol(
 	if err := transition(PlanStatusGenerating); err != nil {
 		return a.failAndPersistPlan(plan, err)
 	}
+	completeGenerate := a.architectStageClaim(ctx, plan.ID, "Generate atomic tasks with claims", "Produce tasks with claims and validations from architecture")
 	tasks, err := a.generateAtomicTasks(ctx, architecture, plan.Constraints)
+	taskClaimCount := 0
+	for _, t := range tasks {
+		taskClaimCount += len(t.Claims)
+	}
+	completeGenerate(fmt.Sprintf("Generated %d tasks with %d claims", len(tasks), taskClaimCount),
+		[]*claims.Artifact{a.architectArtifact("task_count", fmt.Sprintf("%d", len(tasks))),
+			a.architectArtifact("claim_count", fmt.Sprintf("%d", taskClaimCount))}, err)
 	if err != nil {
 		return a.failAndPersistPlan(plan, err)
 	}
@@ -191,7 +220,14 @@ func (a *Architect) runDeterministicProtocol(
 	if err := transition(PlanStatusOrchestrating); err != nil {
 		return a.failAndPersistPlan(plan, err)
 	}
+	completeDAG := a.architectStageClaim(ctx, plan.ID, "Build execution workflow DAG", "Produce execution layers and critical path from tasks")
 	workflow, err := a.createWorkflowDAG(ctx, tasks)
+	layerCount := 0
+	if workflow != nil {
+		layerCount = len(workflow.ExecutionLayers)
+	}
+	completeDAG(fmt.Sprintf("DAG with %d layers", layerCount),
+		[]*claims.Artifact{a.architectArtifact("layer_count", fmt.Sprintf("%d", layerCount))}, err)
 	if err != nil {
 		return a.failAndPersistPlan(plan, err)
 	}

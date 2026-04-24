@@ -11,6 +11,7 @@ import (
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	testerShared "github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/steering"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -35,55 +36,38 @@ func (gt *GlobalTester) SpawnAuditReplica(ctx context.Context, req *agentshared.
 	if f := agentshared.AuditDecisionFinalizerFromContext(ctx); f != nil {
 		carryCtx = agentshared.WithAuditDecisionFinalizer(carryCtx, f)
 	}
-	go func() {
+	// Run the per-merge audit under a tracked GoroutineScope — same
+	// rationale as the inspector counterpart. Refuses spawn without
+	// a scope so CLAUDE.md's no-untracked-goroutines invariant holds.
+	scope := concurrency.ScopeFromContext(ctx)
+	if scope == nil {
+		scope = concurrency.ScopeFromContext(runCtx)
+	}
+	if scope == nil {
+		return fmt.Errorf("tester: SpawnAuditReplica: no GoroutineScope on ctx or runCtx — cannot dispatch audit")
+	}
+	return scope.Go("tester-audit-merge:"+req.ReplicaID, 0, func(workCtx context.Context) error {
 		if err := gt.handleAuditMerge(carryCtx, req); err != nil {
 			gt.logger.Warn("audit_merge: handler error",
 				"replica_id", req.ReplicaID,
 				"merged_version", req.Descriptor.MergedVersion.String(),
 				"error", err.Error(),
 			)
+			return err
 		}
-	}()
-	return nil
+		return nil
+	})
 }
 
-// handleAuditMerge runs one per-merge audit to completion. Mirror of
-// the global inspector's handleAuditMerge — scoped differently at
-// the prompt level (tests pass/fail rather than architectural
-// coherence) but structurally identical.
+// handleAuditMerge runs one per-merge audit to completion. Delegates
+// to the Stage-3 AuditReplicaRuntime so N parallel merges produce N
+// fully parallel audits — no requestSerializer, no shared
+// skillLoader mutation, no shared toolRuntime. See
+// docs/PARALLEL_GLOBAL_VFS.md §3.
 func (gt *GlobalTester) handleAuditMerge(ctx context.Context, req *agentshared.AuditMergeRequest) error {
 	if gt.getProvider() == nil {
 		return gt.emitFallbackRejection(ctx, req, "tester provider not available")
 	}
-	if !gt.requestSerializer.Acquire(ctx) {
-		return ctx.Err()
-	}
-	defer gt.requestSerializer.Release()
-
-	ctx = agentshared.WithAuditMergeContext(ctx, agentshared.AuditMergeContext{
-		SessionID:     req.SessionID,
-		ReplicaID:     req.ReplicaID,
-		AgentType:     req.AgentType,
-		MergedVersion: req.Descriptor.MergedVersion,
-		BaseVersion:   req.Descriptor.BaseVersion,
-	})
-
-	systemPrompt := buildAuditMergeSystemPrompt(req)
-	userPrompt := buildAuditMergeUserPrompt(req)
-
-	gt.prepareSkillsForInput(userPrompt)
-	tools := gt.buildToolDefinitions()
-
-	providerReq := &providers.Request{
-		SystemPrompt: systemPrompt,
-		Messages: []providers.Message{
-			{Role: providers.RoleUser, Content: userPrompt},
-		},
-		Model:     gt.config.Model,
-		MaxTokens: gt.config.MaxTokens,
-		Tools:     tools,
-	}
-	gt.applyLLMRuntimeProfile(providerReq, "audit_merge")
 
 	// Open a session-scoped steering journal when the coordinator
 	// supplied a path so the ledger persists across Close/Open
@@ -102,7 +86,6 @@ func (gt *GlobalTester) handleAuditMerge(ctx context.Context, req *agentshared.A
 	}
 	ledger := gt.steering.Create(req.ReplicaID, gt.id, req.SessionID, nil, journal)
 	defer gt.steering.Close(req.ReplicaID, ctx.Err() != nil)
-	ctx = agentshared.WithSteeringLedger(ctx, ledger)
 	ctx = agentshared.WithLogMeta(ctx, agentshared.LogMeta{
 		EventLogger: gt.steering.EventLogger(),
 		CorrID:      req.ReplicaID,
@@ -110,21 +93,51 @@ func (gt *GlobalTester) handleAuditMerge(ctx context.Context, req *agentshared.A
 		SessionID:   req.SessionID,
 	})
 
-	emitted, err := gt.runAuditToolLoop(ctx, providerReq, ledger)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		if !emitted {
-			_ = gt.emitFallbackRejection(ctx, req,
-				fmt.Sprintf("audit tool loop failed: %v", err))
-		}
+	if req.Session == nil {
+		return gt.emitFallbackRejection(ctx, req,
+			fmt.Sprintf("audit request for %s missing SessionVFS reference", req.ReplicaID))
+	}
+
+	responseTopic := ""
+	if gt.channels != nil {
+		responseTopic = gt.channels.Responses
+	}
+	runtime, err := agentshared.NewAuditReplicaRuntime(agentshared.AuditReplicaConfig{
+		ReplicaID:        req.ReplicaID,
+		AgentType:        req.AgentType,
+		SessionID:        req.SessionID,
+		MergedVersion:    req.Descriptor.MergedVersion,
+		BaseVersion:      req.Descriptor.BaseVersion,
+		IsReAudit:        req.IsReAudit,
+		Request:          req,
+		Session:          req.Session,
+		ReplicaVFS:       req.ReplicaVFS,
+		Finalizer:        agentshared.AuditDecisionFinalizerFromContext(ctx),
+		Ledger:           ledger,
+		Provider:         gt.getProvider(),
+		Model:            gt.config.Model,
+		MaxTokens:        gt.config.MaxTokens,
+		MaxToolRuns:      gt.config.MaxToolRuns,
+		ThinkingBudget:   0,
+		Bus:              gt.bus,
+		Channels:         gt.channels,
+		AgentID:          gt.id,
+		AgentDisplayName: agentshared.AgentDisplayName("tester"),
+		ResponseTopic:    responseTopic,
+		Logger:           gt.logger,
+		SystemPrompt:     buildAuditMergeSystemPrompt(req),
+		UserPrompt:       buildAuditMergeUserPrompt(req),
+	})
+	if err != nil {
+		return gt.emitFallbackRejection(ctx, req, fmt.Sprintf("construct audit runtime: %v", err))
+	}
+	if err := runtime.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("audit merge: %v", err)})
 		}
 		return err
-	}
-	if !emitted {
-		return gt.emitFallbackRejection(ctx, req, "tester tool loop terminated without emitting a decision")
 	}
 	return nil
 }

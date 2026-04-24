@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/llmruntime"
 )
@@ -119,6 +120,9 @@ type HandoffBridge struct {
 	// Propagated from HandoffSupervisor.SetArchivePublisher; nil when
 	// the supervisor has no publisher configured (archival disabled).
 	archivePublisher ArchivePublisher
+
+	// Claims board provider for handoff lifecycle claims.
+	boardProvider BoardProvider
 
 	// Latest per-request trace metadata for async handoff recommendations.
 	lastTrace bridgeTraceMeta
@@ -614,6 +618,13 @@ func (b *HandoffBridge) SetActivityPublisher(pub events.ActivityPublisher) {
 	b.activityPub = pub
 }
 
+// SetBoardProvider injects the claims board provider for handoff claims.
+func (b *HandoffBridge) SetBoardProvider(bp BoardProvider) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.boardProvider = bp
+}
+
 // RecordQualitySignal records external quality feedback.
 func (b *HandoffBridge) RecordQualitySignal(sig QualitySignal) {
 	// Inject behavior signals into fuser so the next Flush incorporates them.
@@ -752,6 +763,33 @@ func (b *HandoffBridge) triggerHandoff(rec *HandoffRecommendation) {
 		"quality_uncertainty": rec.Metrics.QualityUncertainty,
 	})
 	b.emitHandoffActivity(events.EventTypeAgentDecision, "Context handoff triggered", events.OutcomePending, "triggered", rec.Metrics.ContextUtilization)
+
+	// Post handoff trigger claim with failed validation.
+	b.mu.RLock()
+	bp := b.boardProvider
+	agentID := ""
+	if b.agent != nil {
+		agentID = b.agent.AgentID()
+	}
+	b.mu.RUnlock()
+
+	handoffPostClaim(bp, context.Background(),
+		claims.Action{AgentID: "handoff_bridge", Type: claims.ActionTypeTask},
+		handoffClaim(
+			"Handoff "+agentID+" — "+rec.Trigger.String(),
+			rec.Reason,
+			agentID,
+			[]claims.ClaimScopeEntry{
+				{Kind: "agent", Key: agentID},
+				{Kind: "resource", Key: "context_window"},
+			},
+			[]*claims.Validation{
+				handoffFailedValidation(claims.ValidationTypeInspection, true,
+					fmt.Sprintf("Context usage at %.0f%%, trigger: %s", rec.Metrics.ContextUtilization*100, rec.Trigger.String()),
+					"Context usage below critical threshold"),
+			},
+		),
+	)
 
 	b.mu.RLock()
 	category := b.config.Descriptor.Category
@@ -1019,14 +1057,26 @@ func (b *HandoffBridge) handleHandoffResult(result *HandoffResult) error {
 	b.mu.RLock()
 	oldID := b.agent.AgentID()
 	outgoing := b.agent
+	bp := b.boardProvider
+	sessionID := ""
+	if b.lastTrace.SessionID != "" {
+		sessionID = b.lastTrace.SessionID
+	}
 	b.mu.RUnlock()
 
+	// Old agent testament: state extracted.
+	handoffSubmitTestament(bp, context.Background(), handoffTestament(
+		sessionID, oldID,
+		"Extracted archivable state for handoff",
+		"committed",
+		[]*claims.Artifact{
+			handoffArtifact(sessionID, oldID, "context_metrics", fmt.Sprintf("turns=%d, session=%s", b.turnCount.Load(), result.NewSessionID)),
+			handoffJSONArtifact(sessionID, oldID, "transfer_metrics", result.Metrics),
+		},
+	))
+
 	// HAND-05: emit an ArchiveRequest for the outgoing agent BEFORE the
-	// replacement swap. The request carries the extracted state plus the
-	// identity/task triple; the Archivalist consumes asynchronously so
-	// this call does not block the handoff's critical path. Publishing
-	// before ReplaceAgent means ExtractArchivableState still sees the
-	// outgoing agent's final state rather than an empty replacement.
+	// replacement swap.
 	b.publishArchiveRequest(outgoing, ArchiveReasonHandoffComplete)
 
 	// Notify supervisor of replacement.
@@ -1037,6 +1087,18 @@ func (b *HandoffBridge) handleHandoffResult(result *HandoffResult) error {
 	}
 
 	b.ReplaceAgent(newAgent)
+
+	// New agent testament: context injected and ready.
+	handoffSubmitTestament(bp, context.Background(), handoffTestament(
+		sessionID, newAgent.AgentID(),
+		"Injected prepared context, resuming work",
+		"tentative",
+		[]*claims.Artifact{
+			handoffArtifact(sessionID, newAgent.AgentID(), "new_session_id", result.NewSessionID),
+			handoffArtifact(sessionID, newAgent.AgentID(), "tokens_transferred", fmt.Sprintf("%d", result.Metrics.TokensTransferred)),
+		},
+	))
+
 	b.emitHandoffTrace("handoff_execute_completed", "info", nil, map[string]any{
 		"new_agent_id": newAgent.AgentID(),
 		"session_id":   result.NewSessionID,

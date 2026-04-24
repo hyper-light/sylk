@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
@@ -56,6 +57,27 @@ func (s *Scribe) newToolBundle(feed shared.ScribeFeed) (*scribeToolBundle, *scri
 	}
 	for _, name := range shared.AppendMemoryForestMutatingSkillNames(nil) {
 		registry.Unload(name)
+	}
+
+	// Claims skills — the scribe is a full claims participant. It can
+	// query board state for context-aware narration, submit testaments
+	// about narration work, and post actions about precedent patterns.
+	boardProvider := func() *claims.ClaimsBoard {
+		return claims.DefaultSessionBoardRegistry().Lookup(s.sessionID)
+	}
+	inboxProvider := func() *claims.ClaimsInbox { return s.claimsInbox }
+	for _, skill := range []*skills.Skill{
+		claims.QueryClaimsBoardSkill(boardProvider),
+		claims.PostActionSkill(boardProvider, inboxProvider),
+		claims.SubmitTestamentsSkill(boardProvider),
+		claims.EvaluateValidationSkill(boardProvider),
+		claims.UpdateClaimProgressSkill(boardProvider),
+		claims.InspectClaimConflictsSkill(boardProvider),
+		claims.TraverseSkill(boardProvider),
+	} {
+		if err := registry.Register(skill); err != nil {
+			return nil, nil, fmt.Errorf("register scribe claims skill %q: %w", skill.Name, err)
+		}
 	}
 
 	loaderCfg := skills.DefaultLoaderConfig()
@@ -207,11 +229,22 @@ func (s *Scribe) storeArchivalistSkill(runState *scribeRunState) *skills.Skill {
 			runState.stored = true
 			runState.commentary = string(payload)
 
-			// Phase 7 — precedent emission. When the LLM marked this
-			// batch as precedent-worthy, emit a separate
-			// ActionPrecedentEmitted activity. The ForestSubscriber
-			// already harvests these as Memory Forest candidates
-			// (see Tier 11 of FABRIC.md).
+			// Submit narration as testament to the session claims board.
+			// The archivalist publish (above) is long-term storage. The
+			// testament puts the narration on the session board so other
+			// agents can see it, the inspector can verify narration
+			// accuracy, and cross-replica queries can reference it.
+			archivalEntryID := fmt.Sprintf(
+				"scribe_%s_rep%d_%d",
+				s.parentAgentType, s.replicaGeneration, time.Now().UnixNano(),
+			)
+			s.submitNarrationTestament(ctx, summary, string(payload), archivalEntryID, commentary, runState.feed)
+
+			// Phase 7 — precedent emission. Fabric activity emitted
+			// via the board amplifier when the precedent validation is
+			// recorded on the narration testament (above). The legacy
+			// direct emission is kept as a fallback for boards without
+			// amplifiers (test fixtures).
 			if precedentWorthyFromCommentary(commentary) {
 				s.emitPrecedentActivity(ctx, commentary, runState.feed)
 			}
@@ -330,7 +363,83 @@ func (s *Scribe) storeCommentaryInArchivalist(ctx context.Context, commentary st
 func scribeVisibleSkillNames(agentType string) []string {
 	return shared.AppendMemoryForestVisibleSkillNames([]string{
 		scribeStoreArchivalistSkillName,
+		// Claims skills: read-only board introspection is Local (visible).
+		"query_claims_board",
+		"inspect_claim_conflicts",
+		"traverse",
+		// Claims skills: mutating operations are also visible for the scribe.
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 	}, agentType)
+}
+
+// submitNarrationTestament posts the narration to the session claims board
+// as a testament with the commentary as an artifact. If precedent detection
+// triggered, the precedent flag is a validation on the testament.
+//
+// Best-effort: board unavailability does not fail the narration. The
+// archivalist publish already succeeded — the testament is supplementary
+// visibility for the session board.
+func (s *Scribe) submitNarrationTestament(
+	ctx context.Context,
+	summary, payload, archivalEntryID string,
+	commentary map[string]any,
+	feed shared.ScribeFeed,
+) {
+	board := claims.DefaultSessionBoardRegistry().Lookup(s.sessionID)
+	if board == nil {
+		return
+	}
+
+	testament := claims.Testament{
+		AgentID:    "scribe-" + s.parentAgentType,
+		SessionID:  s.sessionID,
+		Summary:    summary,
+		Confidence: "committed",
+		Artifacts: []*claims.Artifact{
+			{
+				AgentID:   "scribe-" + s.parentAgentType,
+				SessionID: s.sessionID,
+				Kind:      "narration",
+				Reference: payload,
+			},
+			{
+				AgentID:   "scribe-" + s.parentAgentType,
+				SessionID: s.sessionID,
+				Kind:      "archivalist_receipt",
+				Reference: archivalEntryID,
+			},
+		},
+		Relations: []claims.Relation{
+			{Related: "scribe-" + s.parentAgentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			{Related: s.parentAgentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+		},
+	}
+
+	// Precedent detection as validation on the testament.
+	if precedentWorthyFromCommentary(commentary) {
+		why := strings.TrimSpace(scribeStringFromAny(commentary["precedent_why"]))
+		if why == "" {
+			why = "LLM flagged as precedent-worthy"
+		}
+		testament.Artifacts = append(testament.Artifacts, &claims.Artifact{
+			AgentID:   "scribe-" + s.parentAgentType,
+			SessionID: s.sessionID,
+			Kind:      "precedent",
+			Reference: why,
+		})
+	}
+
+	action := claims.Action{
+		AgentID: "scribe-" + s.parentAgentType,
+		Type:    claims.ActionTypeTestament,
+	}
+
+	if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
+		board.RecordNotificationError("scribe narration testament: " + err.Error())
+	}
 }
 
 func scribeVisibleSkillNamesForRegistry(registry *skills.Registry, agentType string) []string {
@@ -340,6 +449,11 @@ func scribeVisibleSkillNamesForRegistry(registry *skills.Registry, agentType str
 func scribeMutatingSkillNames(agentType string) []string {
 	return shared.AppendMemoryForestMutatingSkillNames([]string{
 		scribeStoreArchivalistSkillName,
+		// Claims skills: mutating operations need LocalWorker policy.
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 	})
 }
 

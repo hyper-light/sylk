@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/google/uuid"
 )
 
@@ -87,6 +88,20 @@ func (a *Architect) cancelOrchestrationViaOrchestrator(ctx context.Context, plan
 		return nil, fmt.Errorf("encode cancel_orchestration payload: %w", err)
 	}
 
+	a.architectPostClaim(ctx,
+		architectClaimAction(claims.ActionTypeTask),
+		architectClaimWithSubject(
+			"Cancel orchestration: "+truncateArchitectString(planID, 40),
+			"Cancel orchestration via orchestrator: "+reason,
+			"orchestrator",
+			[]claims.ClaimScopeEntry{{Kind: "orchestration", Key: planID}},
+			claims.ActionTypeTask,
+			[]*claims.Validation{
+				architectValidation(claims.ValidationTypeReceipt, true, "Orchestrator acknowledges cancellation", "result != nil"),
+			},
+		),
+	)
+
 	correlationID := "cancel_orch_" + uuid.NewString()
 	req := &guide.RouteRequest{
 		CorrelationID: correlationID,
@@ -142,6 +157,20 @@ func (a *Architect) resumeOrchestrationViaOrchestrator(ctx context.Context, plan
 	if err != nil {
 		return nil, fmt.Errorf("encode resume_orchestration payload: %w", err)
 	}
+
+	a.architectPostClaim(ctx,
+		architectClaimAction(claims.ActionTypeTask),
+		architectClaimWithSubject(
+			"Resume orchestration: "+truncateArchitectString(planID, 40),
+			"Resume orchestration via orchestrator",
+			"orchestrator",
+			[]claims.ClaimScopeEntry{{Kind: "orchestration", Key: planID}},
+			claims.ActionTypeTask,
+			[]*claims.Validation{
+				architectValidation(claims.ValidationTypeReceipt, true, "Orchestrator acknowledges resume", "result != nil"),
+			},
+		),
+	)
 
 	correlationID := "resume_orch_" + uuid.NewString()
 	req := &guide.RouteRequest{

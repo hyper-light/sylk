@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -146,6 +147,13 @@ func (l *Librarian) applyToolCalls(
 		// Record successful search results into the ledger.
 		if !isError {
 			searchLedger.Record(turn, call.Name, call.Arguments, result)
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("search_tool_"+call.Name, truncateLibrarian(call.Arguments, 200))
+				if searchLedger.IsSaturated() {
+					acc.Record("search_saturated", fmt.Sprintf("turn=%d tool=%s", turn, call.Name))
+					acc.Note("Search saturated — no new files discovered")
+				}
+			}
 		}
 
 		// Activity Fabric ambient_context envelope.

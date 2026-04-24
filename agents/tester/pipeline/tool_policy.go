@@ -30,6 +30,10 @@ func pipelineTesterVisibleSkillNames() []string {
 		"pipeline_protocol",
 		"declare_decision",
 		"ask_user_clarification",
+		// Claims skills: read-only board introspection is Local (visible).
+		"query_claims_board",
+		"inspect_claim_conflicts",
+		"traverse",
 	}, "tester-pipeline")
 	// Activity Fabric: awareness + cross-pipeline + recall must be
 	// in the LLM's default tool catalog so the ambient model is
@@ -55,6 +59,11 @@ func pipelineTesterMutatingSkillNames() []string {
 		"process_validation",
 		"declare_decision",
 		"reroute_request",
+		// Claims skills: mutating operations need LocalWorker policy.
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 	})
 }
 

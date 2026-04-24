@@ -23,6 +23,7 @@ import (
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
@@ -115,6 +116,16 @@ type PipelineTester struct {
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
 	requestSerializer *agentshared.RequestSerializer
+
+	// Tracked goroutine scope for async claims dispatch.
+	scope *concurrency.GoroutineScope
+
+	claimsInbox *claims.ClaimsInbox
+}
+
+// SetScope injects the goroutine scope for async claims dispatch.
+func (pt *PipelineTester) SetScope(scope *concurrency.GoroutineScope) {
+	pt.scope = scope
 }
 
 // New creates a new PipelineTester instance.
@@ -344,13 +355,15 @@ func (pt *PipelineTester) registerCoreSkills() {
 	//
 	// Every pipeline uses claims. No legacy protocol path.
 	boardProvider := func() *claims.ClaimsBoard { return pt.claimsBoard }
+	inboxProvider := func() *claims.ClaimsInbox { return pt.claimsInbox }
 	pt.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
-	pt.skills.Register(claims.PostActionSkill(boardProvider))
+	pt.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	pt.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	pt.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
 	pt.skills.Register(claims.EvaluateValidationSkill(boardProvider))
 	pt.skills.Register(claims.PostRemediationClaimsSkill(boardProvider))
 	pt.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+	pt.skills.Register(claims.TraverseSkill(boardProvider))
 
 	// Fabric claims awareness skills.
 	for _, skill := range fabric.ClaimsAwarenessSkills(awareCfg) {
@@ -496,8 +509,31 @@ func (pt *PipelineTester) Start(bus guide.EventBus) error {
 		return fmt.Errorf("subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
+	// Claims intake: event-driven delta processing.
+	if inbox := agentshared.WireClaimsIntake(agentshared.ClaimsIntakeConfig{
+		AgentID:      pt.id,
+		SessionID:    pt.config.SessionID,
+		Bus:          bus,
+		Board:        pt.claimsBoard,
+		Scope:        pt.scope,
+		ProcessEntry: pt.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("pipeline_tester_claims_inbox_start_failed", "error", err.Error())
+		}
+		pt.claimsInbox = inbox
+	}
+
 	pt.running = true
 	pt.logger.Info("pipeline tester started", "id", pt.id)
+
+	pt.testerSubmitTestament(pt.runCtx, pt.testerTestament(
+		"Pipeline tester started", "committed",
+		[]*claims.Artifact{
+			pt.testerArtifact("agent_id", pt.id),
+			pt.testerArtifact("pipeline_id", pt.pipelineID),
+		},
+	))
 	return nil
 }
 
@@ -505,6 +541,16 @@ func (pt *PipelineTester) Start(bus guide.EventBus) error {
 func (pt *PipelineTester) Stop() error {
 	if !pt.running {
 		return nil
+	}
+
+	pt.testerSubmitTestament(context.Background(), pt.testerTestament(
+		"Pipeline tester stopped", "committed",
+		[]*claims.Artifact{pt.testerArtifact("pipeline_id", pt.pipelineID)},
+	))
+
+	if pt.claimsInbox != nil {
+		_ = pt.claimsInbox.Close()
+		pt.claimsInbox = nil
 	}
 
 	pt.steering.CloseAll()
@@ -640,6 +686,15 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		return nil, fmt.Errorf("pipeline tester tool loop: %w", err)
 	}
 
+	// Conversation response testament.
+	pt.testerSubmitTestament(ctx, pt.testerTestament(
+		"Pipeline tester responded", "committed",
+		[]*claims.Artifact{
+			pt.testerArtifact("response_length", fmt.Sprintf("%d", len(result))),
+			pt.testerArtifact("pipeline_id", pt.pipelineID),
+		},
+	))
+
 	return result, nil
 }
 
@@ -684,6 +739,13 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	reqCtx, cancel := context.WithCancel(pt.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
 	reqCtx = agentshared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
+
+	// Lifecycle-scoped accumulator for per-request observations.
+	acc := claims.NewTestamentAccumulator("tester-pipeline", fwd.SessionID)
+	reqCtx = claims.WithTestamentAccumulator(reqCtx, acc)
+	defer func() {
+		acc.Flush(reqCtx, pt.testerBoard(), pt.testerScope())
+	}()
 	reqCtx = agentshared.WithGuardianCommandGate(reqCtx, agentshared.GuardianCommandGateConfig{
 		BusProvider:     func() guide.EventBus { return pt.bus },
 		SourceAgentID:   func() string { return pt.id },

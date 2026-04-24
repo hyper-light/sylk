@@ -1662,6 +1662,7 @@ var appMouseHandlers = []appMouseHandler{
 	(*AppModel).handleDiffViewMotionMouse,
 	(*AppModel).handleConflictViewMotionMouse,
 	(*AppModel).handleCommitTreeHoverMouse,
+	(*AppModel).handleMemoryCanvasHoverMouse,
 	(*AppModel).handleSelectorHoverMouse,
 	(*AppModel).handleCommandApprovalMouse,
 	(*AppModel).handlePlanApprovalMouse,

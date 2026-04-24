@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -120,7 +121,28 @@ func gitSafetySkill(g *Guardian) *skills.Skill {
 			if !ok {
 				return nil, fmt.Errorf("unknown git_safety action: %q", params.Action)
 			}
-			return fn(ctx, &params)
+
+			sessionID := g.activeSessionID
+			g.guardianPostClaim(ctx,
+				guardianClaimAction(claims.ActionTypeArchival),
+				guardianClaim("Git safety: "+params.Action, "Git safety operation", "guardian",
+					[]claims.ClaimScopeEntry{{Kind: "git", Key: params.Action}},
+					claims.ActionTypeArchival, nil),
+			)
+
+			result, err := fn(ctx, &params)
+			if err != nil {
+				g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+					sessionID, "Git safety "+params.Action+" failed: "+err.Error(), "committed", "",
+					[]*claims.Artifact{guardianArtifact(sessionID, "error", err.Error())},
+				))
+			} else {
+				g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+					sessionID, "Git safety "+params.Action+" complete", "committed", "",
+					[]*claims.Artifact{guardianJSONArtifact(sessionID, "safety_result", result)},
+				))
+			}
+			return result, err
 		}).
 		Build()
 }
@@ -194,7 +216,31 @@ func rollbackSkill(g *Guardian) *skills.Skill {
 			if !ok {
 				return nil, fmt.Errorf("unknown rollback action: %q", params.Action)
 			}
-			return fn(ctx, &params)
+
+			sessionID := g.activeSessionID
+			g.guardianPostClaim(ctx,
+				guardianClaimAction(claims.ActionTypeCorrective),
+				guardianClaim("Rollback: "+params.Action, "Rollback operation", "guardian",
+					[]claims.ClaimScopeEntry{{Kind: "git", Key: "rollback"}},
+					claims.ActionTypeCorrective,
+					[]*claims.Validation{
+						guardianValidation(claims.ValidationTypeInspection, true, "User authorizes rollback", "User clicks Approve in rollback dialog"),
+					}),
+			)
+
+			result, err := fn(ctx, &params)
+			if err != nil {
+				g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+					sessionID, "Rollback "+params.Action+" failed: "+err.Error(), "committed", "",
+					[]*claims.Artifact{guardianArtifact(sessionID, "error", err.Error())},
+				))
+			} else {
+				g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+					sessionID, "Rollback "+params.Action+" complete", "committed", "",
+					[]*claims.Artifact{guardianJSONArtifact(sessionID, "rollback_result", result)},
+				))
+			}
+			return result, err
 		}).
 		Build()
 }

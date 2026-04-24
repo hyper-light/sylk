@@ -6,6 +6,8 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 type workerResult struct {
@@ -25,15 +27,28 @@ type SerialWorker struct {
 	closeOnce sync.Once
 }
 
-func NewSerialWorker(queueSize int) *SerialWorker {
+// NewSerialWorker constructs a serial worker whose run loop is
+// tracked by the given GoroutineScope. The scope is required
+// (untracked goroutines are forbidden per CLAUDE.md); callers
+// without a scope should use NewSerialWorkerDetached for in-memory
+// test configurations that accept the leak risk.
+func NewSerialWorker(scope *concurrency.GoroutineScope, queueSize int) (*SerialWorker, error) {
 	if queueSize <= 0 {
 		queueSize = 16
 	}
 	worker := &SerialWorker{
 		queue: make(chan workerRequest, queueSize),
 	}
-	go worker.run()
-	return worker
+	if scope == nil {
+		return nil, fmt.Errorf("serial worker: NewSerialWorker requires a GoroutineScope (untracked goroutines are forbidden)")
+	}
+	if err := scope.Go("toolruntime:serial-worker", 0, func(ctx context.Context) error {
+		worker.run()
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("serial worker: scope.Go: %w", err)
+	}
+	return worker, nil
 }
 
 func (w *SerialWorker) run() {

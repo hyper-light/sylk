@@ -27,6 +27,10 @@ func globalTesterVisibleSkillNames() []string {
 		// Phase 2.K / GT-A: single unified escalation primitive.
 		"escalate_failure",
 		"ask_user_clarification",
+		// Claims skills: read-only board introspection is Local (visible).
+		"query_claims_board",
+		"inspect_claim_conflicts",
+		"traverse",
 	}, "tester")
 	return fabric.AppendFabricAwarenessSkillNames(base)
 }
@@ -50,6 +54,11 @@ func globalTesterMutatingSkillNames() []string {
 		// + escalate_failure collapsed into escalate_failure(targets=[…]).
 		"escalate_failure",
 		"reroute_request",
+		// Claims skills: mutating operations need LocalWorker policy.
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 	})
 }
 

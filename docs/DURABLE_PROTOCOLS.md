@@ -180,7 +180,7 @@ Current durable event kinds:
 - `validation_submitted`
 - `validation_processed`
 - `ready_for_ot`
-- `handoff_to_green`
+- `handoff_to_ot`
 
 ### Global Review Events
 
@@ -215,8 +215,8 @@ stateDiagram-v2
     ValidationPending --> ValidationProcessed: validation_processed
     ValidationProcessed --> FinalizeRequired: accepted tester result or handoff back to inspector
     FinalizeRequired --> ReadyForOT: ready_for_ot
-    ReadyForOT --> HandoffToGreenRequired
-    HandoffToGreenRequired --> Completed: handoff_to_green
+    ReadyForOT --> HandoffToOTRequired
+    HandoffToOTRequired --> Completed: handoff_to_ot
 ```
 
 ### Global Review Reducer
@@ -279,8 +279,8 @@ sequenceDiagram
     R->>M: derive finalize_pipeline obligation
     I->>P: append ready_for_ot
     P->>R: replay/apply
-    R->>M: derive handoff_to_green obligation
-    I->>P: append handoff_to_green
+    R->>M: derive handoff_to_ot obligation
+    I->>P: append handoff_to_ot
     P->>R: replay/apply
     R->>M: clear prior obligations
 ```
@@ -323,7 +323,7 @@ their existing protocol skills:
   - `validate_work`
   - `process_validation`
   - `finalize_pipeline`
-  - `handoff_to_green`
+  - `handoff_to_ot`
 - global review:
   - `challenge_global_tester`
   - `challenge_architect`

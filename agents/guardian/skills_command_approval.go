@@ -10,6 +10,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/skills"
@@ -42,10 +43,62 @@ func (g *Guardian) evaluateCommandApproval(ctx context.Context, req *commandappr
 	if commandapproval.IsFetchToolName(req.ToolName) {
 		return g.evaluateFetchApproval(ctx, req)
 	}
+
+	// Post claim: requesting agent asks guardian to approve command.
+	sessionID := g.activeSessionID
+	g.guardianPostClaim(ctx,
+		guardianClaimAction(claims.ActionTypeTask),
+		guardianExternalClaim(
+			"Approve execution of `"+truncateCommandForClaim(req.Command, 60)+"`",
+			"Agent "+req.AgentID+" requests command execution approval",
+			firstNonEmptyApprovalValue(req.AgentID, "unknown"),
+			[]claims.ClaimScopeEntry{
+				{Kind: "command", Key: req.ToolName + ":" + truncateCommandForClaim(req.Command, 80)},
+			},
+			claims.ActionTypeTask,
+			[]*claims.Validation{
+				guardianValidation(claims.ValidationTypeInspection, true, "Command contains no destructive operations", "Zero destructive patterns detected"),
+				guardianValidation(claims.ValidationTypeInspection, true, "Command is scoped to authorized paths", "All referenced paths within agent's declared scope"),
+				guardianValidation(claims.ValidationTypeInspection, true, "Agent has permission for this operation class", "Stored rule or user authorization grants access"),
+			},
+		),
+	)
+
+	// Submit testament on exit with the final evaluation result.
+	var eval commandapproval.Evaluation
+	var evalErr error
+	defer func() {
+		if evalErr != nil {
+			g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+				sessionID,
+				"Command approval failed: "+evalErr.Error(),
+				"committed",
+				firstNonEmptyApprovalValue(req.AgentID, "unknown"),
+				[]*claims.Artifact{
+					guardianArtifact(sessionID, "error", evalErr.Error()),
+				},
+			))
+			return
+		}
+		summary := "Command approval " + string(eval.Decision)
+		if eval.Reason != "" {
+			summary += " — " + eval.Reason
+		}
+		g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+			sessionID,
+			summary,
+			"committed",
+			firstNonEmptyApprovalValue(req.AgentID, "unknown"),
+			[]*claims.Artifact{
+				guardianJSONArtifact(sessionID, "approval_evaluation", eval),
+			},
+		))
+	}()
+
 	evaluator := commandapproval.NewEvaluator(g.commandRules)
-	eval, err := evaluator.Evaluate(*req)
-	if err != nil {
-		return commandapproval.Evaluation{}, err
+	eval, evalErr = evaluator.Evaluate(*req)
+	if evalErr != nil {
+		return commandapproval.Evaluation{}, evalErr
 	}
 	// Approval outcome state is reported back to the agent-panel with
 	// System visibility — the chat panel's view of the approval lifecycle
@@ -65,9 +118,10 @@ func (g *Guardian) evaluateCommandApproval(ctx context.Context, req *commandappr
 	}
 	g.publishActivityStateWithVisibility(ctx, events.EventTypeAgentAction, events.VisibilitySystem, "Validating command approval request", events.AgentUIStateValidating)
 
-	result, err := g.requestCommandApproval(ctx, g.commandApprovalProposal(*req, eval.Analysis))
-	if err != nil {
-		return commandapproval.Evaluation{}, err
+	var result ApprovalResult
+	result, evalErr = g.requestCommandApproval(ctx, g.commandApprovalProposal(*req, eval.Analysis))
+	if evalErr != nil {
+		return commandapproval.Evaluation{}, evalErr
 	}
 	persistNote := ""
 	if result.Decision == ApprovalAllowAlways || result.Decision == ApprovalDenyAlways {
@@ -141,33 +195,86 @@ func (g *Guardian) evaluateFetchApproval(ctx context.Context, req *commandapprov
 		return commandapproval.Evaluation{}, fmt.Errorf("fetch approval domain is required")
 	}
 
+	// Post claim: requesting agent asks guardian to approve fetch.
+	sessionID := g.activeSessionID
+	g.guardianPostClaim(ctx,
+		guardianClaimAction(claims.ActionTypeTask),
+		guardianExternalClaim(
+			"Approve fetch of "+truncateCommandForClaim(fetchURL, 60),
+			"Agent "+req.AgentID+" requests external HTTP fetch",
+			firstNonEmptyApprovalValue(req.AgentID, "unknown"),
+			[]claims.ClaimScopeEntry{
+				{Kind: "domain", Key: domain},
+				{Kind: "url", Key: truncateCommandForClaim(fetchURL, 120)},
+			},
+			claims.ActionTypeTask,
+			[]*claims.Validation{
+				guardianValidation(claims.ValidationTypeInspection, true, "Domain is known/trusted or user-authorized", "DomainReputation.TrustLevel >= TrustKnown or stored allow rule"),
+				guardianValidation(claims.ValidationTypeInspection, false, "Response content contains no credential leaks", "Zero credential findings in response body"),
+			},
+		),
+	)
+
+	// Submit testament on exit with the final evaluation result.
+	var eval commandapproval.Evaluation
+	var evalErr error
+	defer func() {
+		if evalErr != nil {
+			g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+				sessionID, "Fetch approval failed: "+evalErr.Error(), "committed",
+				firstNonEmptyApprovalValue(req.AgentID, "unknown"),
+				[]*claims.Artifact{guardianArtifact(sessionID, "error", evalErr.Error())},
+			))
+			return
+		}
+		artifacts := []*claims.Artifact{
+			guardianJSONArtifact(sessionID, "approval_evaluation", eval),
+		}
+		if g.domainReputation != nil {
+			if rep := g.domainReputation.Get(domain); rep != nil {
+				artifacts = append(artifacts, guardianJSONArtifact(sessionID, "domain_reputation", rep))
+			}
+		}
+		summary := "Fetch " + string(eval.Decision) + " for " + domain
+		if eval.Reason != "" {
+			summary += " — " + eval.Reason
+		}
+		g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+			sessionID, summary, "committed",
+			firstNonEmptyApprovalValue(req.AgentID, "unknown"), artifacts,
+		))
+	}()
+
 	analysis := fetchApprovalAnalysis(fetchURL, domain, req)
 
 	if rule, ok := g.commandRules.Lookup(analysis.PersistKey); ok {
 		switch rule.Action {
 		case commandapproval.RuleActionAllow:
 			g.publishActivityStateWithVisibility(ctx, events.EventTypeSuccess, events.VisibilitySystem, "Fetch approval allowed", events.AgentUIStateAllowed)
-			return commandapproval.Evaluation{
+			eval = commandapproval.Evaluation{
 				Decision: commandapproval.DecisionAllow,
 				Source:   commandapproval.MatchSourceStoredAllow,
 				Reason:   firstNonEmptyApprovalReason(rule.Summary, "fetch allowed by saved approval rule"),
 				Analysis: analysis,
 				Rule:     &rule,
-			}, nil
+			}
+			return eval, nil
 		case commandapproval.RuleActionDeny:
 			g.publishActivityStateWithVisibility(ctx, events.EventTypeAgentError, events.VisibilitySystem, "Fetch approval blocked", events.AgentUIStateBlocked)
-			return commandapproval.Evaluation{
+			eval = commandapproval.Evaluation{
 				Decision: commandapproval.DecisionDeny,
 				Source:   commandapproval.MatchSourceStoredDeny,
 				Reason:   firstNonEmptyApprovalReason(rule.Summary, "fetch denied by saved approval rule"),
 				Analysis: analysis,
 				Rule:     &rule,
-			}, nil
+			}
+			return eval, nil
 		}
 	}
 	g.publishActivityStateWithVisibility(ctx, events.EventTypeAgentAction, events.VisibilitySystem, "Validating fetch approval request", events.AgentUIStateValidating)
 
-	result, err := g.requestCommandApproval(ctx, g.commandApprovalProposal(commandapproval.Request{
+	var result ApprovalResult
+	result, evalErr = g.requestCommandApproval(ctx, g.commandApprovalProposal(commandapproval.Request{
 		Command:       fetchURL,
 		ToolName:      firstNonEmptyApprovalValue(strings.TrimSpace(req.ToolName), "web_fetch"),
 		Domain:        domain,
@@ -180,8 +287,8 @@ func (g *Guardian) evaluateFetchApproval(ctx context.Context, req *commandapprov
 		TaskID:        req.TaskID,
 		PipelineID:    req.PipelineID,
 	}, analysis))
-	if err != nil {
-		return commandapproval.Evaluation{}, err
+	if evalErr != nil {
+		return commandapproval.Evaluation{}, evalErr
 	}
 
 	persistNote := ""
@@ -202,23 +309,25 @@ func (g *Guardian) evaluateFetchApproval(ctx context.Context, req *commandapprov
 	}
 	if !result.Approved {
 		g.publishActivityStateWithVisibility(ctx, events.EventTypeAgentError, events.VisibilitySystem, "Fetch approval blocked", events.AgentUIStateBlocked)
-		return commandapproval.Evaluation{
+		eval = commandapproval.Evaluation{
 			Decision:     commandapproval.DecisionDeny,
 			Source:       commandapproval.MatchSourceInteractive,
 			Reason:       firstNonEmptyApprovalReason(result.Reason, "fetch approval denied") + persistNote,
 			UserDecision: string(result.Decision),
 			Analysis:     analysis,
-		}, nil
+		}
+		return eval, nil
 	}
 
 	g.publishActivityStateWithVisibility(ctx, events.EventTypeSuccess, events.VisibilitySystem, "Fetch approval allowed", events.AgentUIStateAllowed)
-	return commandapproval.Evaluation{
+	eval = commandapproval.Evaluation{
 		Decision:     commandapproval.DecisionAllow,
 		Source:       commandapproval.MatchSourceInteractive,
 		Reason:       firstNonEmptyApprovalReason(result.Reason, "fetch approved by user") + persistNote,
 		UserDecision: string(result.Decision),
 		Analysis:     analysis,
-	}, nil
+	}
+	return eval, nil
 }
 
 func fetchApprovalAnalysis(fetchURL, domain string, req *commandapproval.Request) commandapproval.Analysis {

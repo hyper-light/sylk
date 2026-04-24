@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -65,6 +66,17 @@ func (rl *RefactorLoop) Run(ctx context.Context, taskID, initialResult string) (
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
 					&agentlog.GenerationPayload{Phase: "completed", ToolRuns: iteration})
 			}
+
+			// Refactor quality decision testament.
+			rl.engineer.engineerSubmitTestament(ctx, rl.engineer.engineerTestament(
+				fmt.Sprintf("Refactor quality met at iteration %d", iteration), "committed",
+				[]*claims.Artifact{
+					rl.engineer.engineerArtifact("iteration", fmt.Sprintf("%d", iteration)),
+					rl.engineer.engineerArtifact("pass_count", fmt.Sprintf("%d", feedback.PassCount)),
+					rl.engineer.engineerArtifact("fail_count", fmt.Sprintf("%d", feedback.FailCount)),
+				},
+			))
+
 			return result, nil
 		}
 
@@ -93,6 +105,15 @@ func (rl *RefactorLoop) Run(ctx context.Context, taskID, initialResult string) (
 		}
 	}
 
+	// Refactor exhaustion testament.
+	rl.engineer.engineerSubmitTestament(ctx, rl.engineer.engineerTestament(
+		fmt.Sprintf("Refactor loop exhausted after %d iterations", rl.config.MaxIterations), "committed",
+		[]*claims.Artifact{
+			rl.engineer.engineerArtifact("max_iterations", fmt.Sprintf("%d", rl.config.MaxIterations)),
+			rl.engineer.engineerArtifact("error", "iteration budget exhausted"),
+		},
+	))
+
 	return result, fmt.Errorf("refactor loop exhausted after %d iterations", rl.config.MaxIterations)
 }
 
@@ -110,6 +131,19 @@ func (rl *RefactorLoop) requestTesterValidation(
 
 	ctx, cancel := context.WithTimeout(ctx, rl.config.TesterTimeout)
 	defer cancel()
+
+	rl.engineer.engineerPostClaim(ctx,
+		claims.Action{AgentID: "engineer", Type: claims.ActionTypeConsultation},
+		engineerConsultClaim(
+			"Consult tester-pipeline: validate implementation for "+taskID,
+			"Refactor loop validation request",
+			"tester-pipeline",
+			[]claims.ClaimScopeEntry{{Kind: "consultation", Key: "tester-pipeline"}},
+			[]*claims.Validation{
+				engineerValidation(claims.ValidationTypeReceipt, true, "Tester validates implementation", "feedback.received"),
+			},
+		),
+	)
 
 	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 		shared.LogAgentEvent(lm.EventLogger, agentlog.EventConsultationSent,

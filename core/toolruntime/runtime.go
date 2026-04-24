@@ -121,10 +121,20 @@ func New(cfg Config) (*Runtime, error) {
 		manifest:     cfg.Manifest,
 		state:        state,
 		searchLimit:  searchLimit,
-		worker:       NewSerialWorker(16),
 		controlPlane: cfg.GuardianControlPlane,
 	}
 	runtime.scope, runtime.ownsScope = resolveToolRuntimeScope(cfg)
+	// SerialWorker is now scope-tracked — no raw `go worker.run()`
+	// spawns. Construction requires a scope; runtime always has one
+	// (either caller-supplied or self-owned via resolveToolRuntimeScope).
+	worker, workerErr := NewSerialWorker(runtime.scope, 16)
+	if workerErr != nil {
+		if runtime.ownsScope && runtime.scope != nil {
+			_ = runtime.scope.Shutdown(time.Second, 2*time.Second)
+		}
+		return nil, fmt.Errorf("tool runtime: init serial worker: %w", workerErr)
+	}
+	runtime.worker = worker
 	if err := runtime.manifest.Validate(runtime.registry, runtime.controlPlane != nil); err != nil {
 		runtime.worker.Close()
 		if runtime.ownsScope && runtime.scope != nil {

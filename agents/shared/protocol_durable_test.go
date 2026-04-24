@@ -125,7 +125,7 @@ func TestPipelineProtocolDurableProjectionAndMailbox(t *testing.T) {
 		t.Fatalf("inspector mailbox pending after ready_for_ot: %v", err)
 	}
 	if len(inspectorItems) != 1 || inspectorItems[0].Action != string(PipelineProtocolActionOT) {
-		t.Fatalf("inspector mailbox after ready_for_ot = %#v, want handoff_to_green obligation", inspectorItems)
+		t.Fatalf("inspector mailbox after ready_for_ot = %#v, want handoff_to_ot obligation", inspectorItems)
 	}
 
 	if err := state.Close(); err != nil {

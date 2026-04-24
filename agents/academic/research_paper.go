@@ -13,6 +13,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/storage"
@@ -149,6 +150,20 @@ func (a *Academic) authorResearchPaper(ctx context.Context, params *authorResear
 			handoffDispatched = true
 		}
 	}
+
+	// Research paper testament.
+	a.academicSubmitTestament(ctx, a.academicTestament(
+		"Authored research paper: "+truncateAcademic(paper.Title, 80),
+		"committed",
+		[]*claims.Artifact{
+			a.academicArtifact("paper_id", paper.ID),
+			a.academicArtifact("paper_path", paper.PaperPath),
+			a.academicArtifact("title", paper.Title),
+			a.academicArtifact("stored", fmt.Sprintf("%t", stored)),
+			a.academicArtifact("handoff_dispatched", fmt.Sprintf("%t", handoffDispatched)),
+			a.academicArtifact("sources_cited", fmt.Sprintf("%d", len(paper.SourcesCited))),
+		},
+	))
 
 	return map[string]any{
 		"paper_id":                paper.ID,
@@ -358,6 +373,18 @@ func (a *Academic) bestEffortConsultation(
 	if a.bus == nil || !a.running {
 		return nil
 	}
+	a.academicPostClaim(ctx,
+		claims.Action{AgentID: "academic", Type: claims.ActionTypeConsultation},
+		academicConsultClaim(
+			"Consult "+target+": "+truncateAcademic(query, 60),
+			"Best-effort consultation for research",
+			target,
+			[]claims.ClaimScopeEntry{{Kind: "consultation", Key: target}},
+			[]*claims.Validation{
+				academicValidation(claims.ValidationTypeReceipt, false, "Consultation response received", "evidence != nil"),
+			},
+		),
+	)
 	evidence, err := a.requestConsultation(ctx, target, query, scope, sessionID)
 	if err != nil {
 		return failedConsultEvidence(target, query, scope, "", err)

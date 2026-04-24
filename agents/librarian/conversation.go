@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/google/uuid"
 )
@@ -55,6 +56,21 @@ func (l *Librarian) processViaLLM(ctx context.Context, fwd *guide.ForwardedReque
 	if payload != nil {
 		payload.FreshnessHorizon = librarianConsultFreshnessHorizon
 	}
+
+	// Consultation response testament.
+	summary := "Librarian responded (LLM path)"
+	if payload != nil && payload.Summary != "" {
+		summary = "Librarian: " + truncateLibrarian(payload.Summary, 100)
+	}
+	l.librarianSubmitTestament(ctx, l.librarianTestamentWithSubject(
+		summary, "committed", fwd.SourceAgentID,
+		[]*claims.Artifact{
+			l.librarianJSONArtifact("response_payload", payload),
+			l.librarianArtifact("source_agent", fwd.SourceAgentID),
+			l.librarianArtifact("intent", string(fwd.Intent)),
+		},
+	))
+
 	return payload, nil
 }
 
@@ -125,7 +141,27 @@ func (l *Librarian) processViaIntentDispatch(ctx context.Context, fwd *guide.For
 	if err != nil {
 		return nil, err
 	}
-	return handler(ctx, fwd)
+	result, handlerErr := handler(ctx, fwd)
+
+	// Intent dispatch response testament.
+	if handlerErr != nil {
+		l.librarianSubmitTestament(ctx, l.librarianTestament(
+			"Librarian intent dispatch failed: "+handlerErr.Error(), "committed",
+			[]*claims.Artifact{
+				l.librarianArtifact("intent", string(fwd.Intent)),
+				l.librarianArtifact("error", handlerErr.Error()),
+			},
+		))
+	} else {
+		l.librarianSubmitTestament(ctx, l.librarianTestamentWithSubject(
+			"Librarian responded (intent: "+string(fwd.Intent)+")", "committed", fwd.SourceAgentID,
+			[]*claims.Artifact{
+				l.librarianArtifact("intent", string(fwd.Intent)),
+				l.librarianArtifact("source_agent", fwd.SourceAgentID),
+			},
+		))
+	}
+	return result, handlerErr
 }
 
 type forwardedHandler func(context.Context, *guide.ForwardedRequest) (any, error)

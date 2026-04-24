@@ -25,6 +25,10 @@ func archivalistVisibleSkillNames() []string {
 		ToolUpdateFileState,
 		"knowledge_query",
 		"knowledge_memory",
+		// Claims skills: read-only board introspection is Local (visible).
+		"query_claims_board",
+		"inspect_claim_conflicts",
+		"traverse",
 	}
 }
 
@@ -45,6 +49,11 @@ func archivalistMutatingSkillNames() []string {
 		"reply_to",
 		"knowledge_memory",
 		"reroute_request",
+		// Claims skills: mutating operations need LocalWorker policy.
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 	})
 }
 

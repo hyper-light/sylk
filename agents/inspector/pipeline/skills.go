@@ -116,17 +116,28 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	//
 	// Every pipeline uses claims. No legacy protocol path.
 	boardProvider := func() *claims.ClaimsBoard { return pi.claimsBoard }
+	inboxProvider := func() *claims.ClaimsInbox { return pi.claimsInbox }
 	pi.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
-	pi.skills.Register(claims.PostActionSkill(boardProvider))
+	pi.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	pi.skills.Register(claims.EvaluateValidationSkill(boardProvider))
 	pi.skills.Register(claims.PostRemediationClaimsSkill(boardProvider))
 	pi.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+	pi.skills.Register(claims.TraverseSkill(boardProvider))
 
 	// Fabric claims awareness skills (cross-pipeline visibility).
 	for _, skill := range fabric.ClaimsAwarenessSkills(fabricCfg) {
 		pi.skills.Register(skill)
 	}
 
+
+	// Terminal commit skill: handoff_to_ot. Always registered — the
+	// handler validates the committer at invocation time. This ensures
+	// the skill is in the manifest and the safety hook allows it.
+	pi.skills.Register(agentShared.PipelineHandoffOTSkill(agentShared.PipelineProtocolSkillConfig{
+		AgentType: func() string { return "inspector-pipeline" },
+		AgentID:   func() string { return pi.id },
+		Committer: func() agentShared.PipelineCommitter { return pi.pipelineCommitter },
+	}))
 
 	// Diagnostics
 	pi.skills.Register(agentShared.NewSelfDiagnosticSkill(&pipelineInspectorDiag{pi: pi}))
@@ -551,6 +562,16 @@ func requestOverrideSkill(pi *PipelineInspector) *skills.Skill {
 			if params.IssueID == "" || params.Reason == "" {
 				return nil, fmt.Errorf("issue_id and reason are required")
 			}
+
+			// Override request testament.
+			pi.inspectorSubmitTestament(ctx, pi.inspectorTestament(
+				"Override requested: "+params.IssueID, "committed",
+				[]*claims.Artifact{
+					pi.inspectorArtifact("issue_id", params.IssueID),
+					pi.inspectorArtifact("reason", params.Reason),
+					pi.inspectorArtifact("status", "pending"),
+				},
+			))
 
 			return map[string]any{
 				"issue_id":                params.IssueID,

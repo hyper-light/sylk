@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 )
 
@@ -16,7 +17,11 @@ type goroutineScopeAdapter struct {
 	scope *concurrency.GoroutineScope
 }
 
-func adaptScope(scope *concurrency.GoroutineScope) *goroutineScopeAdapter {
+// adaptScope returns a claims.ScopeProvider. When scope is nil the
+// return is an untyped nil interface — callers can safely compare it
+// against nil, avoiding the typed-nil-interface pitfall that would
+// otherwise cause downstream ScopeProvider.Go calls to panic.
+func adaptScope(scope *concurrency.GoroutineScope) claims.ScopeProvider {
 	if scope == nil {
 		return nil
 	}
@@ -24,5 +29,8 @@ func adaptScope(scope *concurrency.GoroutineScope) *goroutineScopeAdapter {
 }
 
 func (a *goroutineScopeAdapter) Go(description string, timeout time.Duration, fn func(context.Context) error) error {
+	if a == nil || a.scope == nil {
+		return nil
+	}
 	return a.scope.Go(description, timeout, concurrency.WorkFunc(fn))
 }

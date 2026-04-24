@@ -15,6 +15,7 @@ import (
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/escalation"
 	"github.com/adalundhe/sylk/core/events"
@@ -126,6 +127,16 @@ type Engineer struct {
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
 	requestSerializer *shared.RequestSerializer
+
+	// Tracked goroutine scope for async claims dispatch.
+	scope *concurrency.GoroutineScope
+
+	claimsInbox *claims.ClaimsInbox
+}
+
+// SetScope injects the goroutine scope for async claims dispatch.
+func (e *Engineer) SetScope(scope *concurrency.GoroutineScope) {
+	e.scope = scope
 }
 
 // Config holds configuration for the Engineer agent
@@ -462,10 +473,33 @@ func (e *Engineer) Start(bus guide.EventBus) error {
 		return fmt.Errorf("failed to subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
+	// Claims intake: event-driven delta processing.
+	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
+		AgentID:      e.id,
+		SessionID:    e.config.SessionID,
+		Bus:          bus,
+		Board:        e.engineerBoard(),
+		Scope:        e.scope,
+		ProcessEntry: e.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("engineer_claims_inbox_start_failed", "error", err.Error())
+		}
+		e.claimsInbox = inbox
+	}
+
 	e.runCtx, e.runCancel = context.WithCancel(context.Background())
 	e.requestCancels = make(map[string]context.CancelFunc)
 	e.running = true
 	e.logger.Info("engineer started", "id", e.id, "channels", e.channels)
+
+	e.engineerSubmitTestament(e.runCtx, e.engineerTestament(
+		"Engineer agent started", "committed",
+		[]*claims.Artifact{
+			e.engineerArtifact("agent_id", e.id),
+			e.engineerArtifact("pipeline_id", e.pipelineID),
+		},
+	))
 	return nil
 }
 
@@ -473,6 +507,16 @@ func (e *Engineer) Start(bus guide.EventBus) error {
 func (e *Engineer) Stop() error {
 	if !e.running {
 		return nil
+	}
+
+	e.engineerSubmitTestament(context.Background(), e.engineerTestament(
+		"Engineer agent stopped", "committed",
+		[]*claims.Artifact{e.engineerArtifact("pipeline_id", e.pipelineID)},
+	))
+
+	if e.claimsInbox != nil {
+		_ = e.claimsInbox.Close()
+		e.claimsInbox = nil
 	}
 
 	e.steering.CloseAll()
@@ -594,6 +638,13 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	reqCtx, cancel := context.WithCancel(e.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
 	reqCtx = shared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
+
+	// Lifecycle-scoped accumulator for per-request observations.
+	acc := claims.NewTestamentAccumulator("engineer", fwd.SessionID)
+	reqCtx = claims.WithTestamentAccumulator(reqCtx, acc)
+	defer func() {
+		acc.Flush(reqCtx, e.engineerBoard(), e.engineerScope())
+	}()
 	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
 		BusProvider:     func() guide.EventBus { return e.bus },
 		SourceAgentID:   func() string { return e.id },
@@ -958,6 +1009,16 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (_ *Enginee
 	shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventGenerationCompleted,
 		e.id, "", "", "info", &agentlog.GenerationPayload{Phase: "completed"})
 
+	// Conversation response testament.
+	e.engineerSubmitTestament(ctx, e.engineerTestament(
+		"Engineer responded", "committed",
+		[]*claims.Artifact{
+			e.engineerArtifact("response_length", fmt.Sprintf("%d", len(result))),
+			e.engineerArtifact("pipeline_id", e.pipelineID),
+			e.engineerArtifact("task_id", req.TaskID),
+		},
+	))
+
 	return &EngineerResponse{
 		ID:        uuid.New().String(),
 		RequestID: req.ID,
@@ -1061,7 +1122,6 @@ func (e *Engineer) publishActivity(ctx context.Context, eventType events.EventTy
 
 func (e *Engineer) recordFailure(taskID, errorMsg, approach string) {
 	e.stateMu.Lock()
-	defer e.stateMu.Unlock()
 
 	existing, ok := e.failures[taskID]
 	if ok {
@@ -1080,12 +1140,32 @@ func (e *Engineer) recordFailure(taskID, errorMsg, approach string) {
 	}
 
 	e.state.FailedCount++
+	e.stateMu.Unlock()
+
+	// Failure recording testament.
+	e.engineerSubmitTestament(context.Background(), e.engineerTestament(
+		"Failure recorded: "+truncateEngineer(errorMsg, 80), "committed",
+		[]*claims.Artifact{
+			e.engineerArtifact("task_id", taskID),
+			e.engineerArtifact("error", errorMsg),
+			e.engineerArtifact("approach", approach),
+		},
+	))
 }
 
 func (e *Engineer) recordConsultation(c Consultation) {
 	e.consultMu.Lock()
-	defer e.consultMu.Unlock()
 	e.consultations = append(e.consultations, c)
+	e.consultMu.Unlock()
+
+	// Consultation recording testament.
+	e.engineerSubmitTestament(context.Background(), e.engineerTestament(
+		"Consultation recorded: "+truncateEngineer(string(c.Target), 40), "committed",
+		[]*claims.Artifact{
+			e.engineerArtifact("target", string(c.Target)),
+			e.engineerArtifact("query", truncateEngineer(c.Query, 200)),
+		},
+	))
 }
 
 // GetState returns the current engineer state

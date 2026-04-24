@@ -65,11 +65,14 @@ func (a *Academic) registerFabricSkills() {
 	boardProvider := func() *claims.ClaimsBoard {
 		return claims.DefaultSessionBoardRegistry().Lookup(a.config.SessionID)
 	}
+	inboxProvider := func() *claims.ClaimsInbox { return a.claimsInbox }
 	a.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
-	a.skills.Register(claims.PostActionSkill(boardProvider))
+	a.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	a.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	a.skills.Register(claims.EvaluateValidationSkill(boardProvider))
 	a.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
 	a.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+	a.skills.Register(claims.TraverseSkill(boardProvider))
 
 	fabricCfg := fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,
@@ -157,6 +160,18 @@ func cloneViaLibrarianSkill(a *Academic) *skills.Skill {
 			}
 
 			cloneQuery := fmt.Sprintf("Clone repository %s for analysis: %s", params.URL, params.Reason)
+			a.academicPostClaim(ctx,
+				claims.Action{AgentID: "academic", Type: claims.ActionTypeConsultation},
+				academicConsultClaim(
+					"Consult librarian: clone "+truncateAcademic(params.URL, 40),
+					"Request librarian to clone repository for analysis",
+					"librarian",
+					[]claims.ClaimScopeEntry{{Kind: "consultation", Key: "librarian"}},
+					[]*claims.Validation{
+						academicValidation(claims.ValidationTypeReceipt, true, "Repository cloned", "evidence.Success == true"),
+					},
+				),
+			)
 			evidence, err := a.requestConsultation(ctx, "librarian", cloneQuery, "", "")
 			if err != nil {
 				if errors.Is(err, skills.ErrDelegatedRequested) {
@@ -229,9 +244,30 @@ func consultSkill(a *Academic) *skills.Skill {
 			if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
 				if err := execState.recordConsultAttempt(params.Target, params.Query, params.Scope); err != nil {
 					academicLogDuplicateConsultationBlocked(ctx, params.Target, params.Query, params.Scope)
+					a.academicSubmitTestament(ctx, a.academicTestament(
+						"Duplicate consultation blocked: "+params.Target,
+						"committed",
+						[]*claims.Artifact{
+							a.academicArtifact("target", params.Target),
+							a.academicArtifact("query", truncateAcademic(params.Query, 200)),
+							a.academicArtifact("reason", err.Error()),
+						},
+					))
 					return academicConsultFailureResult(params.Target, params.Query, params.Scope, err), nil
 				}
 			}
+			a.academicPostClaim(ctx,
+				claims.Action{AgentID: "academic", Type: claims.ActionTypeConsultation},
+				academicConsultClaim(
+					"Consult "+params.Target+": "+truncateAcademic(params.Query, 60),
+					"Knowledge consultation",
+					params.Target,
+					[]claims.ClaimScopeEntry{{Kind: "consultation", Key: params.Target}},
+					[]*claims.Validation{
+						academicValidation(claims.ValidationTypeReceipt, true, "Consultation succeeded", "evidence.Success == true"),
+					},
+				),
+			)
 			evidence, err := a.requestConsultation(ctx, params.Target, params.Query, params.Scope, "")
 			if err != nil {
 				if errors.Is(err, skills.ErrDelegatedRequested) {
@@ -609,6 +645,18 @@ func (a *Academic) validateApproach(ctx context.Context, approach string, filesA
 	}
 
 	// Consult Librarian for codebase context
+	a.academicPostClaim(ctx,
+		claims.Action{AgentID: "academic", Type: claims.ActionTypeConsultation},
+		academicConsultClaim(
+			"Consult librarian: validate approach compatibility",
+			"Approach validation via librarian consultation",
+			"librarian",
+			[]claims.ClaimScopeEntry{{Kind: "consultation", Key: "librarian"}},
+			[]*claims.Validation{
+				academicValidation(claims.ValidationTypeReceipt, true, "Librarian validates approach", "evidence.Success == true"),
+			},
+		),
+	)
 	evidence, err := a.requestConsultation(ctx, "librarian",
 		fmt.Sprintf("Validate approach compatibility: %s", approach),
 		"", a.config.SessionID)

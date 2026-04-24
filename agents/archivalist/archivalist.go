@@ -15,6 +15,8 @@ import (
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
@@ -129,6 +131,11 @@ type Archivalist struct {
 
 	// Handoff integration
 	handoffBridge *handoff.HandoffBridge
+
+	// Tracked goroutine scope for async claims dispatch.
+	scope *concurrency.GoroutineScope
+
+	claimsInbox *claims.ClaimsInbox
 
 	// Log ingest store: bounded per-agent ring buffers for cross-agent log querying.
 	logIngest *LogIngestStore
@@ -574,8 +581,31 @@ func (a *Archivalist) Start(bus guide.EventBus) error {
 	// Subscribe to knowledge readiness for telemetry and cache warming.
 	a.knowledgeSub, _ = bus.SubscribeAsync(guide.TopicKnowledgeReady, a.handleKnowledgeReady)
 
+	// Claims intake: event-driven delta processing.
+	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
+		AgentID:      a.id,
+		SessionID:    a.defaultSessionID,
+		Bus:          bus,
+		Board:        a.archivalistBoard(),
+		Scope:        a.scope,
+		ProcessEntry: a.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("archivalist_claims_inbox_start_failed", "error", err.Error())
+		}
+		a.claimsInbox = inbox
+	}
+
 	a.running = true
 	a.logger.Info("archivalist started", "id", a.id, "channels", a.channels)
+
+	a.archivalistSubmitTestament(a.runCtx, a.archivalistTestament(
+		"Archivalist agent started", "committed",
+		[]*claims.Artifact{
+			a.archivalistArtifact("session_id", a.defaultSessionID),
+			a.archivalistArtifact("agent_id", a.id),
+		},
+	))
 	return nil
 }
 
@@ -583,6 +613,16 @@ func (a *Archivalist) Start(bus guide.EventBus) error {
 func (a *Archivalist) Stop() error {
 	if !a.running {
 		return nil
+	}
+
+	a.archivalistSubmitTestament(context.Background(), a.archivalistTestament(
+		"Archivalist agent stopped", "committed",
+		[]*claims.Artifact{a.archivalistArtifact("session_id", a.defaultSessionID)},
+	))
+
+	if a.claimsInbox != nil {
+		_ = a.claimsInbox.Close()
+		a.claimsInbox = nil
 	}
 
 	a.steering.CloseAll()
@@ -745,6 +785,14 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	reqCtx, cancel := context.WithCancel(a.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
 	reqCtx = shared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
+
+	// Lifecycle-scoped accumulator for per-request observations.
+	acc := claims.NewTestamentAccumulator("archivalist", fwd.SessionID)
+	reqCtx = claims.WithTestamentAccumulator(reqCtx, acc)
+	defer func() {
+		acc.Flush(reqCtx, a.archivalistBoard(), a.archivalistScope())
+	}()
+
 	a.registerRequestCancel(fwd.CorrelationID, cancel)
 	a.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer a.clearRequestCancel(fwd.CorrelationID)
@@ -1416,7 +1464,21 @@ func (a *Archivalist) StoreEntry(ctx context.Context, entry *Entry) SubmissionRe
 
 	storeResult, err := a.insertStoreEntry(storeEntry)
 	hookErr := a.runPostStoreHooks(ctx, storeData, storeResult, err)
-	return finalizeStoreResult(storeResult, err, hookErr)
+	finalResult := finalizeStoreResult(storeResult, err, hookErr)
+
+	// Store entry testament.
+	if finalResult.Success {
+		a.archivalistSubmitTestament(ctx, a.archivalistTestament(
+			"Stored entry: "+truncateArchivalist(storeEntry.Title, 80),
+			"committed",
+			[]*claims.Artifact{
+				a.archivalistArtifact("entry_id", finalResult.ID),
+				a.archivalistArtifact("category", string(storeEntry.Category)),
+				a.archivalistArtifact("source", string(storeEntry.Source)),
+			},
+		))
+	}
+	return finalResult
 }
 
 func validateStoreEntry(entry *Entry) error {
@@ -1587,6 +1649,22 @@ func (a *Archivalist) Query(ctx context.Context, query ArchiveQuery) ([]*Entry, 
 	hookErr := a.runPostQueryHooks(ctx, queryData, entries, err)
 	if hookErr != nil && err == nil {
 		return nil, hookErr
+	}
+
+	// Query testament.
+	if err == nil {
+		if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+			acc.Record("query", fmt.Sprintf("results=%d search=%q", len(entries), truncateArchivalist(query.SearchText, 60)))
+		} else {
+			a.archivalistSubmitTestament(ctx, a.archivalistTestament(
+				fmt.Sprintf("Query: %d results for %q", len(entries), truncateArchivalist(query.SearchText, 60)),
+				"committed",
+				[]*claims.Artifact{
+					a.archivalistArtifact("result_count", fmt.Sprintf("%d", len(entries))),
+					a.archivalistArtifact("search_text", truncateArchivalist(query.SearchText, 200)),
+				},
+			))
+		}
 	}
 	return entries, err
 }
@@ -1831,11 +1909,21 @@ func (a *Archivalist) GetSnapshot(ctx context.Context) *ChronicleSnapshot {
 
 // EndSession ends the current session and archives its data
 func (a *Archivalist) EndSession(ctx context.Context, summary string, primaryFocus string) error {
+	oldSessionID := a.defaultSessionID
 	err := a.store.EndSession(summary, primaryFocus)
 	if err != nil {
 		return err
 	}
 	a.defaultSessionID = a.store.GetCurrentSession().ID
+
+	a.archivalistSubmitTestament(ctx, a.archivalistTestament(
+		"Session ended: "+truncateArchivalist(summary, 80), "committed",
+		[]*claims.Artifact{
+			a.archivalistArtifact("ended_session", oldSessionID),
+			a.archivalistArtifact("new_session", a.defaultSessionID),
+			a.archivalistArtifact("primary_focus", primaryFocus),
+		},
+	))
 	return nil
 }
 
@@ -1939,6 +2027,13 @@ func (a *Archivalist) SubmitPromptResponse(ctx context.Context, prompt, response
 // RecordFileRead records that a file has been read by an agent
 func (a *Archivalist) RecordFileRead(path, summary string, agent SourceModel) {
 	a.agentContext.RecordFileRead(path, summary, agent)
+	a.archivalistSubmitTestament(context.Background(), a.archivalistTestament(
+		"File read: "+truncateArchivalist(path, 80), "committed",
+		[]*claims.Artifact{
+			a.archivalistArtifact("path", path),
+			a.archivalistArtifact("agent", string(agent)),
+		},
+	))
 }
 
 // RecordFileModified records that a file has been modified
@@ -1948,11 +2043,26 @@ func (a *Archivalist) RecordFileModified(path string, startLine, endLine int, de
 		EndLine:     endLine,
 		Description: description,
 	}, agent)
+	a.archivalistSubmitTestament(context.Background(), a.archivalistTestament(
+		"File modified: "+truncateArchivalist(path, 80), "committed",
+		[]*claims.Artifact{
+			a.archivalistArtifact("path", path),
+			a.archivalistArtifact("agent", string(agent)),
+			a.archivalistArtifact("lines", fmt.Sprintf("%d-%d", startLine, endLine)),
+		},
+	))
 }
 
 // RecordFileCreated records that a file has been created
 func (a *Archivalist) RecordFileCreated(path, summary string, agent SourceModel) {
 	a.agentContext.RecordFileCreated(path, summary, agent)
+	a.archivalistSubmitTestament(context.Background(), a.archivalistTestament(
+		"File created: "+truncateArchivalist(path, 80), "committed",
+		[]*claims.Artifact{
+			a.archivalistArtifact("path", path),
+			a.archivalistArtifact("agent", string(agent)),
+		},
+	))
 }
 
 // WasFileRead checks if a file has already been read this session
@@ -1979,6 +2089,14 @@ func (a *Archivalist) RegisterPattern(category, name, description, example strin
 		Example:     example,
 		Source:      agent,
 	})
+	a.archivalistSubmitTestament(context.Background(), a.archivalistTestament(
+		"Pattern registered: "+name, "committed",
+		[]*claims.Artifact{
+			a.archivalistArtifact("category", category),
+			a.archivalistArtifact("name", name),
+			a.archivalistArtifact("agent", string(agent)),
+		},
+	))
 }
 
 // GetPatterns returns all registered patterns
@@ -1994,11 +2112,28 @@ func (a *Archivalist) GetPatternsByCategory(category string) []*Pattern {
 // RecordFailure records an approach that failed
 func (a *Archivalist) RecordFailure(approach, reason, taskContext string, agent SourceModel) {
 	a.agentContext.RecordFailure(approach, reason, taskContext, agent)
+	a.archivalistSubmitTestament(context.Background(), a.archivalistTestament(
+		"Failure recorded: "+truncateArchivalist(approach, 80), "committed",
+		[]*claims.Artifact{
+			a.archivalistArtifact("approach", approach),
+			a.archivalistArtifact("reason", reason),
+			a.archivalistArtifact("agent", string(agent)),
+		},
+	))
 }
 
 // RecordFailureWithResolution records a failure and what worked instead
 func (a *Archivalist) RecordFailureWithResolution(approach, reason, taskContext, resolution string, agent SourceModel) {
 	a.agentContext.RecordFailureWithResolution(approach, reason, taskContext, resolution, agent)
+	a.archivalistSubmitTestament(context.Background(), a.archivalistTestament(
+		"Failure+resolution recorded: "+truncateArchivalist(approach, 60), "committed",
+		[]*claims.Artifact{
+			a.archivalistArtifact("approach", approach),
+			a.archivalistArtifact("reason", reason),
+			a.archivalistArtifact("resolution", resolution),
+			a.archivalistArtifact("agent", string(agent)),
+		},
+	))
 }
 
 // CheckFailure checks if an approach has been tried and failed
@@ -2157,6 +2292,17 @@ func (a *Archivalist) buildContextBrief(agentType string, contextSize, turnNumbe
 	} else {
 		result.ActiveState = strings.Join(activeStateParts, " ")
 	}
+
+	// Handoff context brief testament.
+	a.archivalistSubmitTestament(context.Background(), a.archivalistTestament(
+		"Context brief built for "+agentType, "committed",
+		[]*claims.Artifact{
+			a.archivalistArtifact("agent_type", agentType),
+			a.archivalistArtifact("context_size", fmt.Sprintf("%d", contextSize)),
+			a.archivalistArtifact("turn_number", fmt.Sprintf("%d", turnNumber)),
+			a.archivalistArtifact("task_summary", truncateArchivalist(result.TaskSummary, 200)),
+		},
+	))
 
 	return result
 }
@@ -2446,6 +2592,20 @@ func (a *Archivalist) detectAndRecordConflict(scope Scope, key string, req *Requ
 	result := a.conflictDetector.DetectConflict(scope, key, req.Write.Data, req.Version, req.AgentID)
 	if result.Type != ConflictTypeNone {
 		a.recordConflict(scope, key, req, result)
+
+		// Conflict detection testament.
+		a.archivalistSubmitTestament(context.Background(), a.archivalistTestament(
+			fmt.Sprintf("Conflict detected: %s on %s/%s", result.Type, scope, key),
+			"committed",
+			[]*claims.Artifact{
+				a.archivalistArtifact("conflict_type", string(result.Type)),
+				a.archivalistArtifact("scope", string(scope)),
+				a.archivalistArtifact("key", key),
+				a.archivalistArtifact("strategy", string(result.Strategy)),
+				a.archivalistArtifact("resolved", fmt.Sprintf("%t", result.Resolved)),
+				a.archivalistArtifact("agent", req.AgentID),
+			},
+		))
 	}
 	return result
 }
@@ -2600,16 +2760,27 @@ func resolveBriefingTier(tier BriefingTier) BriefingTier {
 }
 
 func (a *Archivalist) dispatchBriefing(tier BriefingTier) Response {
+	var resp Response
 	switch tier {
 	case BriefingMicro:
-		return a.getMicroBriefing()
+		resp = a.getMicroBriefing()
 	case BriefingStandard:
-		return a.getStandardBriefing()
+		resp = a.getStandardBriefing()
 	case BriefingFull:
-		return a.getFullBriefing()
+		resp = a.getFullBriefing()
 	default:
-		return a.getStandardBriefing()
+		resp = a.getStandardBriefing()
 	}
+
+	// Briefing testament.
+	a.archivalistSubmitTestament(context.Background(), a.archivalistTestament(
+		"Briefing generated: tier="+string(tier), "committed",
+		[]*claims.Artifact{
+			a.archivalistArtifact("tier", string(tier)),
+			a.archivalistArtifact("status", string(resp.Status)),
+		},
+	))
+	return resp
 }
 
 func (a *Archivalist) getMicroBriefing() Response {
@@ -3071,6 +3242,16 @@ func (a *Archivalist) QueryCrossSession(ctx context.Context, query ArchiveQuery)
 			Entry:     entry,
 		})
 	}
+	// Cross-session query testament.
+	a.archivalistSubmitTestament(ctx, a.archivalistTestament(
+		fmt.Sprintf("Cross-session query: %d results for %q", len(cross), truncateArchivalist(query.SearchText, 60)),
+		"committed",
+		[]*claims.Artifact{
+			a.archivalistArtifact("result_count", fmt.Sprintf("%d", len(cross))),
+			a.archivalistArtifact("search_text", truncateArchivalist(query.SearchText, 200)),
+		},
+	))
+
 	return cross, nil
 }
 

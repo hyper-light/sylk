@@ -5,40 +5,35 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/ui/theme"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 )
 
+// Layout tuning — kept as constants so tests can reason about spacing
+// invariants without reaching into private helpers.
 const (
 	minAnchorMargin  = 8
 	treeLaneGap      = 12
 	laneInnerPadding = 3
 	minLaneWidth     = 12
 	maxVisibleTrees  = 3
-	rootAnchorGlyph  = "<⟡>"
-	localLeafStep    = 5
-	localRootGap     = 3
 	virtualSlotScale = 4
 )
 
-type styleClass int
-
-const (
-	styleBack styleClass = iota
-	styleMid
-	styleFront
-	styleSelected
-	styleRoot
-)
-
+// point is a (col, row) cell coordinate within the canvas. (0,0) is
+// top-left; x grows right, y grows down — matching tea.MouseMsg.
 type point struct {
 	x int
 	y int
 }
 
+// canvasTree is a ViewTree bundled with its position in the snapshot's
+// family ordering. globalIndex is used for deterministic color assignment
+// so a Decision tree always looks the same regardless of how many
+// families happen to be non-empty in a given snapshot.
 type canvasTree struct {
 	tree        forest.ViewTree
 	globalIndex int
@@ -57,7 +52,9 @@ type Section struct {
 	Entries []SectionEntry
 }
 
-// Model holds the synchronized state for the memory index and canvas.
+// Model owns all state for the memory panel: the left index, the
+// right canvas, hover, and the ambient animation pool. Exported
+// methods form the stable UI-facing API.
 type Model struct {
 	theme *theme.Theme
 
@@ -78,6 +75,22 @@ type Model struct {
 	positions    map[string]point
 	treeByBranch map[string]int
 	errorState   *viewErrorState
+
+	// Frame state: cached forest geometry + per-tick animation.
+	staticGrid      *canvasGrid
+	staticGridAt    time.Time
+	staticDirty     bool
+	lastTrees       []canvasTree
+	lastLayouts     []canopyLayout
+	lastSelectedSet map[string]struct{}
+
+	hover     hoverState
+	animation *animationState
+
+	// Session identity drives the deterministic RNG and placement
+	// salt. Tracked separately from snapshot.SessionID so a hover
+	// clear / reseed happens at the right moment.
+	currentSessionID string
 }
 
 type viewErrorState struct {
@@ -86,7 +99,9 @@ type viewErrorState struct {
 	err    string
 }
 
-// New constructs a memory view model.
+// New constructs a memory view model. The animation pool is created
+// eagerly so the first frame renders with ground dust already in
+// place; reseed() happens on the first snapshot.
 func New(th *theme.Theme) *Model {
 	return &Model{
 		theme:        th,
@@ -94,6 +109,9 @@ func New(th *theme.Theme) *Model {
 		parentByID:   make(map[string]string),
 		positions:    make(map[string]point),
 		treeByBranch: make(map[string]int),
+		hover:        newHoverState(),
+		animation:    newAnimationState(""),
+		staticDirty:  true,
 	}
 }
 
@@ -104,13 +122,24 @@ func (m *Model) SetIndexSize(width, height int) {
 	m.ensureIndexSelectionVisible()
 }
 
-// SetCanvasSize updates the memory canvas dimensions.
+// SetCanvasSize updates the memory canvas dimensions. Invalidates the
+// static grid so the next frame rebuilds; clears hover state so a
+// stale node reference doesn't outlive a resize.
 func (m *Model) SetCanvasSize(width, height int) {
-	m.canvasW = max(width, 0)
-	m.canvasH = max(height, 0)
+	newW := max(width, 0)
+	newH := max(height, 0)
+	if newW != m.canvasW || newH != m.canvasH {
+		m.staticDirty = true
+		m.hover.clear()
+	}
+	m.canvasW = newW
+	m.canvasH = newH
 }
 
-// SetSnapshot replaces the current forest snapshot while preserving selection when possible.
+// SetSnapshot replaces the current forest snapshot while preserving
+// selection when possible. The static grid is invalidated so the next
+// frame rebuilds tree geometry; the animation pool is reseeded on
+// session change.
 func (m *Model) SetSnapshot(snapshot *forest.ViewSnapshot) {
 	if snapshot == nil {
 		snapshot = &forest.ViewSnapshot{}
@@ -120,6 +149,14 @@ func (m *Model) SetSnapshot(snapshot *forest.ViewSnapshot) {
 	m.rebuildIndex()
 	m.rebuildParents()
 	m.reconcileSelection(snapshot.SelectedBranchID)
+	m.staticDirty = true
+	if snapshot.SessionID != m.currentSessionID {
+		m.currentSessionID = snapshot.SessionID
+		if m.animation != nil {
+			m.animation.reseed(snapshot.SessionID)
+		}
+		m.hover.clear()
+	}
 }
 
 // SetError replaces the current snapshot with an explicit error state.
@@ -142,6 +179,8 @@ func (m *Model) SetError(title, detail string, err error) {
 	m.parentByID = make(map[string]string)
 	m.positions = make(map[string]point)
 	m.treeByBranch = make(map[string]int)
+	m.staticDirty = true
+	m.hover.clear()
 }
 
 // ErrorState returns the active memory-view error strings, when present.
@@ -183,7 +222,60 @@ func (m *Model) SelectBranch(branchID string) bool {
 	}
 	m.selectedID = branchID
 	m.ensureIndexSelectionVisible()
+	m.staticDirty = true
 	return true
+}
+
+// SetHoverCell updates the mouse hover position in canvas-local
+// coordinates. Negative values clear the hover. Returns true when
+// the hover moved to a different node (caller can force redraw).
+func (m *Model) SetHoverCell(x, y int) bool {
+	if x < 0 || y < 0 || x >= m.canvasW || y >= m.canvasH {
+		if m.hover.cellX == -1 && m.hover.cellY == -1 {
+			return false
+		}
+		m.hover.clear()
+		return true
+	}
+	if !m.hover.setCell(x, y) {
+		return false
+	}
+	previous := m.hover.hitNodeID
+	m.hover.hitNodeID = m.resolveHover()
+	return m.hover.hitNodeID != previous
+}
+
+// HoveredNode returns the currently hovered node ID (empty if none).
+func (m *Model) HoveredNode() string {
+	return m.hover.hitNodeID
+}
+
+// DisableAnimation turns the ambient / tick loop off. Keep the
+// geometry and hover paths intact; useful for headless tests and for
+// a reduced-motion preference.
+func (m *Model) DisableAnimation() {
+	if m.animation != nil {
+		m.animation.enabled = false
+	}
+}
+
+// AnimationEnabled reports whether the tick loop is scheduling new
+// frames. Used by the host to decide whether to wire a ticker.
+func (m *Model) AnimationEnabled() bool {
+	return m.animation != nil && m.animation.enabled
+}
+
+// Tick advances the animation state by one frame. Call once per
+// ~60ms from the host app's tick handler. Safe to call when
+// animation is disabled (no-op).
+func (m *Model) Tick() {
+	if m.animation == nil || !m.animation.enabled {
+		return
+	}
+	// Advance particle state using the most recently rendered
+	// layout. If no render has happened yet, advance() still runs
+	// ground-dust spawning so the first paint isn't empty.
+	m.animation.advance(m.snapshot, m.canvasW, m.canvasH, m.lastTrees, m.lastLayouts)
 }
 
 // HandleIndexKey moves selection through the grouped node list.
@@ -232,12 +324,20 @@ func (m *Model) HandleCanvasKey(key tea.KeyMsg) bool {
 	}
 }
 
-// ViewCanvas renders the right-panel memory forest.
+// ViewCanvas renders the right-panel memory forest. The pipeline:
+//  1. Error / empty shortcuts.
+//  2. Rebuild static grid (forest geometry + ground plane) if dirty.
+//  3. Clone the static grid and overlay animation + shimmer.
+//  4. Overlay tooltip (if hovering a node).
+//  5. Encode to a styled string.
+//
+// Steps 2 is the only O(total node count) step; it only runs when
+// snapshot, canvas size, or selection has changed. Steps 3–5 are
+// O(canvas cells + particles + tooltip bytes).
 func (m *Model) ViewCanvas() string {
 	if m.canvasW <= 0 || m.canvasH <= 0 {
 		return ""
 	}
-	m.positions = make(map[string]point)
 	if m.errorState != nil {
 		return m.renderMessageCanvas(m.errorState.title, m.errorState.detail, m.errorState.err)
 	}
@@ -245,20 +345,207 @@ func (m *Model) ViewCanvas() string {
 		return m.renderEmptyCanvas()
 	}
 
+	if m.staticDirty {
+		m.rebuildStaticGrid()
+	}
+	if m.staticGrid == nil {
+		return m.renderEmptyCanvas()
+	}
+
+	frame := m.staticGrid.clone()
+	m.animation.paint(frame)
+	m.animation.paintShimmer(frame, m.lastTrees, m.lastLayouts, m.lastSelectedSet)
+	// Tooltip resolution uses the latest hover state so movement
+	// within the same node doesn't stutter.
+	if m.hover.hitNodeID == "" {
+		m.hover.hitNodeID = m.resolveHover()
+	}
+	m.paintTooltip(frame)
+	return frame.render(m.theme)
+}
+
+// rebuildStaticGrid regenerates the forest geometry cache. Runs only
+// when dirty; the cost is proportional to total node count across
+// the visible trees.
+func (m *Model) rebuildStaticGrid() {
+	m.positions = make(map[string]point)
 	grid := newCanvasGrid(m.canvasW, m.canvasH)
+
 	trees := visibleTreesForCanvas(orderedTreesForCanvas(m.snapshot.Trees), m.selectedID, m.canvasW)
 	if len(trees) == 0 {
-		return m.renderEmptyCanvas()
+		m.staticGrid = grid
+		m.staticDirty = false
+		m.lastTrees = nil
+		m.lastLayouts = nil
+		m.lastSelectedSet = nil
+		m.animation.refreshGroundDust(m.canvasW, m.canvasH)
+		m.animation.paint(grid)
+		return
 	}
 	selectedPath := m.selectedPathSet()
 
 	placements := distributeTreePlacements(m.canvasW, m.snapshot.SessionID, trees)
+	layouts := make([]canopyLayout, len(trees))
 	for idx, tree := range trees {
-		planeClass := planeStyle(idx, len(trees))
-		placement := placements[idx]
-		m.renderTree(grid, tree.tree, placement.anchorX, placement.lane.x0, placement.lane.x1, idx, len(trees), planeClass, selectedPath)
+		params := canopyParams{
+			trunkX:      placements[idx].anchorX,
+			laneMin:     placements[idx].lane.x0,
+			laneMax:     placements[idx].lane.x1,
+			bottomY:     m.canvasH - 2, // one row reserved for ground anchor
+			maxHeight:   m.canvasH - 4,
+			depthRatio:  depthRatioForTree(idx, len(trees)),
+			sessionSalt: sessionSeed(m.snapshot.SessionID),
+			treeSalt:    treeSeed(m.snapshot.SessionID, tree.tree),
+		}
+		layout := computeCanopyLayout(tree.tree, params)
+		layouts[idx] = layout
+		m.paintTree(grid, tree.tree, layout, selectedPath)
 	}
-	return grid.render(m.theme)
+
+	// Ground anchor glyphs on the very bottom row.
+	for idx, tree := range trees {
+		_ = tree
+		trunkX := placements[idx].anchorX
+		y := m.canvasH - 1
+		style := styleRoot
+		if rootID := layouts[idx].rootID; rootID != "" {
+			if _, ok := selectedPath[rootID]; ok {
+				style = styleSelected
+			}
+		}
+		// Center the 3-char glyph on the trunk column.
+		grid.drawString(trunkX-1, y, rootAnchorGlyph, style)
+	}
+
+	m.staticGrid = grid
+	m.staticDirty = false
+	m.lastTrees = trees
+	m.lastLayouts = layouts
+	m.lastSelectedSet = selectedPath
+}
+
+// paintTree draws a single tree's trunk, branches, and nodes onto the
+// grid using the precomputed layout. Connectors are drawn before
+// nodes so canvas.set's layering rules keep node glyphs on top.
+func (m *Model) paintTree(
+	grid *canvasGrid,
+	tree forest.ViewTree,
+	layout canopyLayout,
+	selectedPath map[string]struct{},
+) {
+	// Record positions on the Model for spatial navigation + hover.
+	for id, pos := range layout.positions {
+		m.positions[id] = pos
+	}
+
+	// Draw trunk: vertical spine from root up to trunk top.
+	trunkStyle := styleMid
+	if rootID := layout.rootID; rootID != "" {
+		if _, sel := selectedPath[rootID]; sel {
+			trunkStyle = styleSelected
+		}
+	}
+	grid.drawVertical(layout.trunkX, layout.trunkTopY, layout.trunkBase-1, trunkStyle)
+
+	// Draw connectors. Crown leaves visually spoke from the trunk
+	// top (even if their data parent is deeper in the tree) so the
+	// silhouette reads as a plant. Everything else routes from the
+	// actual data parent.
+	trunkTopPos, hasTrunkTop := layout.positions[layout.trunkTopID]
+	for _, node := range tree.Nodes {
+		if node.ParentID == "" {
+			continue
+		}
+		childPos, ok := layout.positions[node.ID]
+		if !ok {
+			continue
+		}
+		style := connectorStyleFor(layout, node.ID, selectedPath)
+		if _, crown := layout.crownLeafSet[node.ID]; crown && hasTrunkTop {
+			drawBranch(grid, trunkTopPos, childPos, style)
+			continue
+		}
+		parentPos, ok := layout.positions[node.ParentID]
+		if !ok {
+			continue
+		}
+		drawBranch(grid, parentPos, childPos, style)
+	}
+
+	// Paint nodes (except root — root is represented by the ground anchor).
+	for _, node := range tree.Nodes {
+		pos, ok := layout.positions[node.ID]
+		if !ok {
+			continue
+		}
+		if node.ID == layout.rootID {
+			continue
+		}
+		_, selected := selectedPath[node.ID]
+		tier := layout.tiers[node.ID]
+		glyph := nodeGlyph(tier, selected)
+		style := tierStyle(tier, selected)
+		grid.set(pos.x, pos.y, glyph, style)
+	}
+}
+
+// drawBranch picks the right connector style for a parent→child edge.
+// Vertical edges draw as a straight │. Near-diagonal edges up from a
+// trunk node to a crown leaf draw as angled dashes. Lateral drops
+// (internal side-branches) use the rounded-elbow drawConnector path.
+func drawBranch(grid *canvasGrid, parent, child point, style styleClass) {
+	if parent == child {
+		return
+	}
+	if parent.x == child.x {
+		grid.drawVertical(parent.x, min(parent.y, child.y), max(parent.y, child.y), style)
+		return
+	}
+	dy := parent.y - child.y
+	if dy <= 0 {
+		// Child below parent (side branch hanging down). Use
+		// rounded-elbow connector for readability.
+		grid.drawConnector(parent, child, connectorJoinY(parent, child, 0, 1), style)
+		return
+	}
+	dx := child.x - parent.x
+	if abs(dx) > dy {
+		// Near-horizontal span — prefer elbow to avoid visual noise.
+		grid.drawConnector(parent, child, connectorJoinY(parent, child, 0, 1), style)
+		return
+	}
+	// True diagonal branch: crown spoke from trunk top to a leaf.
+	grid.drawDiagonal(parent, child, style)
+}
+
+func connectorStyleFor(layout canopyLayout, childID string, selectedPath map[string]struct{}) styleClass {
+	if _, sel := selectedPath[childID]; sel {
+		return styleSelected
+	}
+	tier := layout.tiers[childID]
+	return tierStyle(tier, false)
+}
+
+// depthRatioForTree returns the parallax depth for tree index i of n.
+// 0.0 = farthest (dimmest); 1.0 = frontmost. Single trees render as
+// frontmost.
+func depthRatioForTree(i, n int) float64 {
+	if n <= 1 {
+		return 1
+	}
+	return float64(i) / float64(n-1)
+}
+
+func treeSeed(sessionID string, tree forest.ViewTree) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(sessionID))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(string(tree.Family)))
+	if len(tree.Roots) > 0 {
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(tree.Roots[0]))
+	}
+	return h.Sum64()
 }
 
 func (m *Model) rebuildIndex() {
@@ -339,6 +626,7 @@ func (m *Model) moveFlatSelection(delta int) bool {
 	}
 	m.selectedID = m.flatOrder[next]
 	m.ensureIndexSelectionVisible()
+	m.staticDirty = true
 	return true
 }
 
@@ -352,6 +640,7 @@ func (m *Model) setFlatSelection(idx int) bool {
 	}
 	m.selectedID = m.flatOrder[idx]
 	m.ensureIndexSelectionVisible()
+	m.staticDirty = true
 	return true
 }
 
@@ -411,6 +700,7 @@ func (m *Model) moveSpatial(dx, dy int) bool {
 	}
 	m.selectedID = bestID
 	m.ensureIndexSelectionVisible()
+	m.staticDirty = true
 	return true
 }
 
@@ -613,265 +903,14 @@ func distributedSlot(rank, count, lastSlot int) int {
 	if count <= 1 || lastSlot <= 1 {
 		return lastSlot / 2
 	}
-	return int(math.Round(float64(rank) * float64(lastSlot) / float64(count-1)))
+	return int(roundHalfUp(float64(rank) * float64(lastSlot) / float64(count-1)))
 }
 
 func interpolateSlot(leftEdge, rightEdge, slot, lastSlot int) int {
 	if rightEdge <= leftEdge || lastSlot <= 0 {
 		return leftEdge
 	}
-	return leftEdge + int(math.Round(float64(rightEdge-leftEdge)*float64(slot)/float64(lastSlot)))
-}
-
-func planeStyle(idx, total int) styleClass {
-	if total <= 1 {
-		return styleFront
-	}
-	ratio := float64(idx) / float64(total-1)
-	switch {
-	case ratio < 0.34:
-		return styleBack
-	case ratio < 0.67:
-		return styleMid
-	default:
-		return styleFront
-	}
-}
-
-func (m *Model) renderTree(
-	grid *canvasGrid,
-	tree forest.ViewTree,
-	anchorX int,
-	laneMin int,
-	laneMax int,
-	treeIndex int,
-	treeCount int,
-	baseClass styleClass,
-	selectedPath map[string]struct{},
-) {
-	nodeByID := make(map[string]forest.ViewNode, len(tree.Nodes))
-	children := make(map[string][]string, len(tree.Nodes))
-	roots := append([]string(nil), tree.Roots...)
-	if len(roots) == 0 {
-		for _, node := range tree.Nodes {
-			if node.ParentID == "" {
-				roots = append(roots, node.ID)
-			}
-		}
-	}
-	for _, node := range tree.Nodes {
-		nodeByID[node.ID] = node
-		if node.ParentID != "" {
-			children[node.ParentID] = append(children[node.ParentID], node.ID)
-		}
-	}
-	for parentID := range children {
-		sort.SliceStable(children[parentID], func(i, j int) bool {
-			left := nodeByID[children[parentID][i]]
-			right := nodeByID[children[parentID][j]]
-			if !left.CreatedAt.Equal(right.CreatedAt) {
-				return left.CreatedAt.Before(right.CreatedAt)
-			}
-			return left.ID < right.ID
-		})
-	}
-
-	layout := make(map[string]point, len(tree.Nodes))
-	nextLeaf := 0
-	var maxDepth int
-	var walk func(id string, depth int) float64
-	walk = func(id string, depth int) float64 {
-		if depth > maxDepth {
-			maxDepth = depth
-		}
-		kids := children[id]
-		if len(kids) == 0 {
-			x := float64(nextLeaf)
-			nextLeaf += localLeafStep
-			layout[id] = point{x: int(math.Round(x)), y: depth}
-			return x
-		}
-		minX := math.MaxFloat64
-		maxX := -math.MaxFloat64
-		for _, childID := range kids {
-			childX := walk(childID, depth+1)
-			if childX < minX {
-				minX = childX
-			}
-			if childX > maxX {
-				maxX = childX
-			}
-		}
-		x := (minX + maxX) / 2
-		layout[id] = point{x: int(math.Round(x)), y: depth}
-		return x
-	}
-	for i, rootID := range roots {
-		walk(rootID, 0)
-		if i < len(roots)-1 {
-			nextLeaf += localRootGap
-		}
-	}
-	if len(layout) == 0 {
-		return
-	}
-
-	minLocalX, maxLocalX := math.MaxFloat64, -math.MaxFloat64
-	for _, pos := range layout {
-		x := float64(pos.x)
-		if x < minLocalX {
-			minLocalX = x
-		}
-		if x > maxLocalX {
-			maxLocalX = x
-		}
-	}
-	centerX := (minLocalX + maxLocalX) / 2
-	localWidth := maxLocalX - minLocalX + 1
-	depthRatio := 1.0
-	if treeCount > 1 {
-		depthRatio = float64(treeIndex) / float64(treeCount-1)
-	}
-	contentMin := min(laneMin+laneInnerPadding, laneMax)
-	contentMax := max(laneMax-laneInnerPadding, laneMin)
-	if contentMin >= contentMax {
-		contentMin, contentMax = laneMin, laneMax
-	}
-	availableWidth := max(contentMax-contentMin+1, minLaneWidth)
-	fitScaleX := float64(availableWidth-2) / math.Max(localWidth, 1)
-	scaleX := math.Min(math.Max(fitScaleX*(0.92+0.08*depthRatio), 1.0), 1.8)
-	availableHeight := max(m.canvasH-6, 6)
-	fitScaleY := float64(availableHeight) / math.Max(float64(maxDepth+2), 1)
-	scaleY := math.Min(math.Max(fitScaleY*(0.48+0.32*depthRatio), 1.4), 4.2)
-	shear := 0.22 * (1.0 - depthRatio)
-	parallaxLift := 0.45 * (1.0 - depthRatio)
-	bottom := m.canvasH - 1
-
-	for _, rootID := range roots {
-		rootLocal := layout[rootID]
-		rootX := anchorX + int(math.Round((float64(rootLocal.x)-centerX)*scaleX))
-		rootX = clamp(rootX, max(contentMin+1, 0), min(contentMax-1, m.canvasW-1))
-		rootPos := point{x: rootX, y: bottom}
-		m.positions[rootID] = rootPos
-
-		rootChildren := children[rootID]
-		for childIdx, childID := range rootChildren {
-			m.renderSubtree(contentMin, contentMax, rootPos, float64(rootLocal.x), scaleX, scaleY, shear, parallaxLift, layout, nodeByID, children, childID, rootPos, childIdx, len(rootChildren), grid, baseClass, selectedPath)
-		}
-
-		rootStyle := styleRoot
-		if _, ok := selectedPath[rootID]; ok {
-			rootStyle = styleSelected
-		}
-		grid.drawString(rootX-1, bottom, rootAnchorGlyph, rootStyle)
-	}
-}
-
-func (m *Model) projectNode(
-	laneMin int,
-	laneMax int,
-	root point,
-	rootLocalX float64,
-	scaleX, scaleY, shear, parallaxLift float64,
-	layout map[string]point,
-	node forest.ViewNode,
-	parent point,
-	siblingIndex int,
-	siblingCount int,
-	grid *canvasGrid,
-	baseClass styleClass,
-	selectedPath map[string]struct{},
-) point {
-	local := layout[node.ID]
-	localX := float64(local.x) - rootLocalX
-	localDepth := float64(local.y)
-	screenX := root.x + int(math.Round(localX*scaleX-localDepth*shear))
-	screenY := root.y - int(math.Round(localDepth*scaleY+localDepth*parallaxLift))
-	if siblingCount == 1 && parent.y != screenY {
-		screenX = nudgeSingletonBranch(screenX, parent.x, parent.x, laneMin, laneMax, local.y)
-	}
-	screenX = clamp(screenX, max(laneMin+1, 0), min(laneMax-1, m.canvasW-1))
-	screenY = clamp(screenY, 0, max(root.y-1, 0))
-	pos := point{x: screenX, y: screenY}
-	m.positions[node.ID] = pos
-
-	style := baseClass
-	if _, ok := selectedPath[node.ID]; ok {
-		style = styleSelected
-	}
-	nodeGlyph := '⬡'
-	if baseClass != styleBack {
-		nodeGlyph = '⬢'
-	}
-	if style == styleSelected {
-		nodeGlyph = '◈'
-	}
-
-	grid.drawConnector(parent, pos, connectorJoinY(parent, pos, siblingIndex, siblingCount), style)
-	grid.set(pos.x, pos.y, nodeGlyph, style)
-	return pos
-}
-
-func nudgeSingletonBranch(screenX, parentX, anchorX, laneMin, laneMax, depth int) int {
-	left := max(laneMin+1, 0)
-	right := laneMax - 1
-	if right <= left {
-		return screenX
-	}
-	offset := 3
-	preferRight := false
-	switch {
-	case parentX < anchorX:
-		preferRight = true
-	case parentX > anchorX:
-		preferRight = false
-	default:
-		preferRight = depth%2 == 0
-	}
-	if preferRight {
-		candidate := min(screenX+offset, right)
-		if candidate != parentX {
-			return candidate
-		}
-		candidate = max(screenX-offset, left)
-		if candidate != parentX {
-			return candidate
-		}
-		return screenX
-	}
-	candidate := max(screenX-offset, left)
-	if candidate != parentX {
-		return candidate
-	}
-	candidate = min(screenX+offset, right)
-	if candidate != parentX {
-		return candidate
-	}
-	return screenX
-}
-
-func (m *Model) renderSubtree(
-	laneMin int,
-	laneMax int,
-	root point,
-	rootLocalX float64,
-	scaleX, scaleY, shear, parallaxLift float64,
-	layout map[string]point,
-	nodeByID map[string]forest.ViewNode,
-	children map[string][]string,
-	nodeID string,
-	parent point,
-	siblingIndex int,
-	siblingCount int,
-	grid *canvasGrid,
-	baseClass styleClass,
-	selectedPath map[string]struct{},
-) {
-	node := nodeByID[nodeID]
-	pos := m.projectNode(laneMin, laneMax, root, rootLocalX, scaleX, scaleY, shear, parallaxLift, layout, node, parent, siblingIndex, siblingCount, grid, baseClass, selectedPath)
-	for childIdx, childID := range children[nodeID] {
-		m.renderSubtree(laneMin, laneMax, root, rootLocalX, scaleX, scaleY, shear, parallaxLift, layout, nodeByID, children, childID, pos, childIdx, len(children[nodeID]), grid, baseClass, selectedPath)
-	}
+	return leftEdge + int(roundHalfUp(float64(rightEdge-leftEdge)*float64(slot)/float64(lastSlot)))
 }
 
 func (m *Model) renderEmptyCanvas() string {
@@ -926,151 +965,6 @@ func directionalScore(current, candidate point, dx, dy int) float64 {
 	}
 }
 
-type canvasCell struct {
-	ch    rune
-	style styleClass
-}
-
-type canvasGrid struct {
-	w     int
-	h     int
-	cells [][]canvasCell
-}
-
-func newCanvasGrid(w, h int) *canvasGrid {
-	cells := make([][]canvasCell, h)
-	for y := range cells {
-		cells[y] = make([]canvasCell, w)
-		for x := range cells[y] {
-			cells[y][x] = canvasCell{ch: ' ', style: styleBack}
-		}
-	}
-	return &canvasGrid{w: w, h: h, cells: cells}
-}
-
-func (g *canvasGrid) set(x, y int, ch rune, style styleClass) {
-	if x < 0 || x >= g.w || y < 0 || y >= g.h || ch == ' ' {
-		return
-	}
-	current := g.cells[y][x]
-	if current.ch != ' ' && isConnector(current.ch) && !isConnector(ch) {
-		g.cells[y][x] = canvasCell{ch: ch, style: style}
-		return
-	}
-	if current.ch != ' ' && !isConnector(current.ch) && isConnector(ch) {
-		return
-	}
-	if current.ch == ' ' || current.style != styleSelected {
-		g.cells[y][x] = canvasCell{ch: ch, style: style}
-	}
-}
-
-func (g *canvasGrid) drawString(x, y int, s string, style styleClass) {
-	runes := []rune(s)
-	for i, ch := range runes {
-		g.set(x+i, y, ch, style)
-	}
-}
-
-func (g *canvasGrid) drawVertical(x, y0, y1 int, style styleClass) {
-	if x < 0 || x >= g.w {
-		return
-	}
-	if y0 > y1 {
-		y0, y1 = y1, y0
-	}
-	for y := max(y0, 0); y <= min(y1, g.h-1); y++ {
-		g.set(x, y, '│', style)
-	}
-}
-
-func connectorJoinY(parent, child point, siblingIndex, siblingCount int) int {
-	if child.y >= parent.y {
-		return child.y
-	}
-	upper := child.y + 1
-	lower := parent.y - 1
-	if lower <= upper {
-		return upper
-	}
-	if siblingCount <= 1 {
-		return upper + max((lower-upper)/2, 1)
-	}
-	span := lower - upper
-	offset := int(math.Round(float64(span) * float64(siblingIndex+1) / float64(siblingCount+1)))
-	return clamp(upper+offset, upper, lower)
-}
-
-func (g *canvasGrid) drawConnector(parent, child point, joinY int, style styleClass) {
-	if parent == child {
-		return
-	}
-	if child.y >= parent.y {
-		g.drawVertical(parent.x, parent.y, child.y, style)
-		return
-	}
-	joinY = clamp(joinY, child.y+1, max(parent.y-1, child.y+1))
-	g.drawVertical(child.x, child.y+1, joinY-1, style)
-	if child.x < parent.x {
-		g.set(child.x, joinY, '╰', style)
-		for x := child.x + 1; x < parent.x; x++ {
-			g.set(x, joinY, '─', style)
-		}
-		g.set(parent.x, joinY, '╮', style)
-	} else if child.x > parent.x {
-		g.set(child.x, joinY, '╯', style)
-		for x := parent.x + 1; x < child.x; x++ {
-			g.set(x, joinY, '─', style)
-		}
-		g.set(parent.x, joinY, '╭', style)
-	}
-	g.drawVertical(parent.x, joinY+1, parent.y-1, style)
-}
-
-func (g *canvasGrid) render(th *theme.Theme) string {
-	if g.h == 0 || g.w == 0 {
-		return ""
-	}
-	backStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	midStyle := lipgloss.NewStyle().Foreground(th.Palette.Secondary)
-	frontStyle := lipgloss.NewStyle().Foreground(th.Palette.Primary)
-	selectedStyle := lipgloss.NewStyle().Foreground(th.Palette.Warning).Bold(true)
-	rootStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
-
-	var b strings.Builder
-	for y := 0; y < g.h; y++ {
-		for x := 0; x < g.w; x++ {
-			cell := g.cells[y][x]
-			ch := string(cell.ch)
-			switch cell.style {
-			case styleSelected:
-				b.WriteString(selectedStyle.Render(ch))
-			case styleFront:
-				b.WriteString(frontStyle.Render(ch))
-			case styleMid:
-				b.WriteString(midStyle.Render(ch))
-			case styleRoot:
-				b.WriteString(rootStyle.Render(ch))
-			default:
-				b.WriteString(backStyle.Render(ch))
-			}
-		}
-		if y < g.h-1 {
-			b.WriteByte('\n')
-		}
-	}
-	return b.String()
-}
-
-func isConnector(ch rune) bool {
-	switch ch {
-	case '│', '─', '╰', '╮', '╭', '╯':
-		return true
-	default:
-		return false
-	}
-}
-
 func clamp(value, low, high int) int {
 	if value < low {
 		return low
@@ -1106,4 +1000,15 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func abs(a int) int {
+	if a < 0 {
+		return -a
+	}
+	return a
+}
+
+func roundHalfUp(v float64) float64 {
+	return math.Floor(v + 0.5)
 }

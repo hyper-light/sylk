@@ -307,6 +307,14 @@ func (c *MergeAuditCoordinator) unwindReplica(replicaID string) {
 // Returns the deterministic replica ID on success so the caller can
 // unwind it if the sibling fails.
 func (c *MergeAuditCoordinator) spawnReplica(ctx context.Context, agentType string, spawner AuditReplicaSpawner, sessionID string, desc versioning.MergeDescriptor) (string, error) {
+	return c.spawnReplicaWithFlags(ctx, agentType, spawner, sessionID, desc, false)
+}
+
+// spawnReplicaWithFlags is the common spawn path. isReAudit=true is
+// used by the supersession-re-audit flow so the spawned replica's
+// AuditMergeRequest.IsReAudit is set; the spawner then knows to
+// rehydrate steering state under the deterministic replica ID.
+func (c *MergeAuditCoordinator) spawnReplicaWithFlags(ctx context.Context, agentType string, spawner AuditReplicaSpawner, sessionID string, desc versioning.MergeDescriptor, isReAudit bool) (string, error) {
 	replicaID := MergeReplicaAgentID(agentType, sessionID, desc.MergedVersion)
 	retention := c.session.CopyRetention()
 	if retention != nil {
@@ -350,8 +358,10 @@ func (c *MergeAuditCoordinator) spawnReplica(ctx context.Context, agentType stri
 		AgentType:          agentType,
 		Descriptor:         desc,
 		DispatchedAt:       time.Now().UTC(),
+		IsReAudit:          isReAudit,
 		ReplicaVFS:         replicaVFS,
 		SteeringJournalDir: c.session.SteeringJournalDir(),
+		Session:            c.session,
 	}
 	replicaCtx := WithAuditDecisionFinalizer(ctx, c.finalizeDecision)
 	if err := spawner.SpawnAuditReplica(replicaCtx, req); err != nil {
@@ -790,13 +800,34 @@ func (c *MergeAuditCoordinator) triggerReAuditAfterSupersession(ctx context.Cont
 		if entry == nil || entry.State != versioning.CommitStateAuditing {
 			continue
 		}
-		if !pathsOverlap(supersedorPaths, desc.Paths) {
+		// §3.8 substantive-change detection: the intermediate merge's
+		// audited context includes (a) the paths the merge itself
+		// touched AND (b) the paths the replica consulted from its
+		// parent chain during the audit ("audited-context paths").
+		// M is substantively changing the intermediate's audit if its
+		// path set overlaps with EITHER. Using descriptor.Paths alone
+		// (the prior heuristic) missed cases where a replica READ an
+		// ancestor file that M then rewrites — the replica's audit
+		// conclusions were based on stale content.
+		var reason string
+		if pathsOverlap(supersedorPaths, desc.Paths) {
+			reason = "descriptor-path overlap"
+		} else {
+			if vfs := c.session.LookupAuditReplicaVFS(desc.MergedVersion); vfs != nil {
+				reads := vfs.ChainReads()
+				if pathsOverlap(supersedorPaths, reads) {
+					reason = "audited-context path overlap"
+				}
+			}
+		}
+		if reason == "" {
 			continue
 		}
 		c.logger.Info("merge audit finalize: re-audit triggered by supersession",
 			"merged_version", desc.MergedVersion.String(),
 			"supersedor_version", supersedor.MergedVersion.String(),
 			"rejected_version", rejectedVer.String(),
+			"reason", reason,
 		)
 		c.spawnReAudit(ctx, sessionID, desc)
 	}
@@ -807,7 +838,23 @@ func (c *MergeAuditCoordinator) triggerReAuditAfterSupersession(ctx context.Cont
 // replica IDs are the same deterministic identity the original pair
 // used; the spawners see IsReAudit=true on the request and are
 // expected to rehydrate steering state under that ID.
+//
+// Before spawning, any still-in-flight replica for the same
+// (agent-type, merged-version) pair is recorded as Crashed with
+// reason "superseded by re-audit" so the lifecycle log reflects
+// the supersession relationship AND the coordinator's partial-
+// verdict map is reset. Without this, the in-flight replica's
+// eventual decision would race the re-audit's decision; under
+// AND-accept semantics we'd see one of:
+//   - Stale accept from the in-flight replica fires first,
+//     finalizer resolves, re-audit's decision is ignored.
+//   - Re-audit rejects; partial-verdict map still carries the
+//     in-flight replica's Accepted, which satisfies AND-accept
+//     with a stale half.
+// Resetting the partial verdicts + marking crashed prevents both
+// races.
 func (c *MergeAuditCoordinator) spawnReAudit(ctx context.Context, sessionID string, desc versioning.MergeDescriptor) {
+	c.markInFlightCrashedForReAudit(sessionID, desc.MergedVersion)
 	for _, spec := range []struct {
 		agentType string
 		spawner   AuditReplicaSpawner
@@ -815,34 +862,51 @@ func (c *MergeAuditCoordinator) spawnReAudit(ctx context.Context, sessionID stri
 		{AgentTypeInspectorGlobal, c.inspector},
 		{AgentTypeTesterGlobal, c.tester},
 	} {
-		replicaID := MergeReplicaAgentID(spec.agentType, sessionID, desc.MergedVersion)
-		mergeVFSID := mergeReplicaVFSKey(sessionID, desc.MergedVersion)
-		replicaVFS, err := c.session.BeginAuditReplicaVFS(desc.MergedVersion, mergeVFSID)
-		if err != nil {
-			c.logger.Warn("re-audit spawn: begin replica vfs failed",
-				"replica_id", replicaID,
-				"error", err.Error(),
-			)
-			continue
-		}
-		req := &AuditMergeRequest{
-			SessionID:          sessionID,
-			ReplicaID:          replicaID,
-			AgentType:          spec.agentType,
-			Descriptor:         desc,
-			DispatchedAt:       time.Now().UTC(),
-			IsReAudit:          true,
-			ReplicaVFS:         replicaVFS,
-			SteeringJournalDir: c.session.SteeringJournalDir(),
-		}
-		replicaCtx := WithAuditDecisionFinalizer(ctx, c.finalizeDecision)
-		if err := spec.spawner.SpawnAuditReplica(replicaCtx, req); err != nil {
+		if _, err := c.spawnReplicaWithFlags(ctx, spec.agentType, spec.spawner, sessionID, desc, true); err != nil {
 			c.logger.Warn("re-audit spawn failed",
-				"replica_id", replicaID,
+				"agent_type", spec.agentType,
+				"merged_version", desc.MergedVersion.String(),
 				"error", err.Error(),
 			)
 		}
 	}
+}
+
+// markInFlightCrashedForReAudit records every still-in-flight
+// replica for the given merged version as Crashed with reason
+// "superseded by re-audit", and clears the coordinator's
+// partial-verdict bookkeeping so the re-audit starts from a clean
+// state. Both roles (inspector + tester) are handled uniformly —
+// if only one side is in-flight, only that one is marked; if
+// neither is, this is a no-op.
+func (c *MergeAuditCoordinator) markInFlightCrashedForReAudit(sessionID string, mergedVersion versioning.SemanticVersion) {
+	lifecycle := c.session.ReplicaLifecycleLog()
+	retention := c.session.CopyRetention()
+	inspectorID := MergeReplicaAgentID(AgentTypeInspectorGlobal, sessionID, mergedVersion)
+	testerID := MergeReplicaAgentID(AgentTypeTesterGlobal, sessionID, mergedVersion)
+	reason := "superseded by re-audit"
+	for _, replicaID := range []string{inspectorID, testerID} {
+		c.mu.Lock()
+		_, wasInFlight := c.inFlight[replicaID]
+		delete(c.inFlight, replicaID)
+		c.mu.Unlock()
+		if !wasInFlight {
+			continue
+		}
+		if lifecycle != nil {
+			c.recordCrashedOrLog(lifecycle, replicaID, reason)
+		}
+		if retention != nil {
+			c.releaseRetentionOrLog(retention, replicaID, "re-audit supersession")
+		}
+	}
+	// Reset partial verdicts so the old replica's verdict (if any
+	// finalizer arrives after this point) is treated as stale: the
+	// finalizer's finalizeIfReady creates a fresh partial entry,
+	// effectively discarding the old half.
+	c.mu.Lock()
+	delete(c.partials, mergedVersion)
+	c.mu.Unlock()
 }
 
 // pathSet turns a path slice into a set for O(1) overlap checks.
@@ -920,6 +984,7 @@ func (c *MergeAuditCoordinator) ResumeInFlightReplicas(ctx context.Context) erro
 			IsReAudit:          true,
 			ReplicaVFS:         replicaVFS,
 			SteeringJournalDir: c.session.SteeringJournalDir(),
+		Session:            c.session,
 		}
 		replicaCtx := WithAuditDecisionFinalizer(ctx, c.finalizeDecision)
 		if err := spawner.SpawnAuditReplica(replicaCtx, req); err != nil {

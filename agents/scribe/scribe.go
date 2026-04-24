@@ -14,6 +14,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/activity/activitystore"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
@@ -73,6 +74,7 @@ type Scribe struct {
 	channels        *guide.AgentChannels
 	logger          *slog.Logger
 	scope           *concurrency.GoroutineScope
+	claimsInbox     *claims.ClaimsInbox
 	config          Config
 
 	// Workstream state is isolated by parent correlation ID so concurrent
@@ -251,6 +253,32 @@ func (s *Scribe) Start() error {
 	// for that environment.
 	s.fabricUnsubscribe = activitystore.SubscribeToDefault(s)
 
+	// Claims intake: event-driven delta processing.
+	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
+		AgentID:      s.id,
+		SessionID:    s.sessionID,
+		Bus:          s.bus,
+		Board:        s.scribeBoard(),
+		Scope:        s.scope,
+		ProcessEntry: s.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("scribe_claims_inbox_start_failed", "error", err.Error())
+		}
+		s.claimsInbox = inbox
+	}
+
+	// Lifecycle claim: replica started.
+	s.scribeSubmitTestament(s.runCtx, s.scribeTestament(
+		fmt.Sprintf("Scribe replica %d started for %s", s.replicaGeneration, s.parentAgentType),
+		"committed",
+		[]*claims.Artifact{
+			s.scribeArtifact("session_id", s.sessionID),
+			s.scribeArtifact("replica_generation", fmt.Sprintf("%d", s.replicaGeneration)),
+			s.scribeArtifact("scribe_id", s.id),
+		},
+	))
+
 	// Phase 8: cross-replica continuity via fabric query. Best-effort
 	// — when no prior replica produced narrations or the fabric
 	// source isn't yet wired, the scribe boots cold. The handoff
@@ -265,6 +293,27 @@ func (s *Scribe) Stop() error {
 	if !s.running.Swap(false) {
 		return nil
 	}
+
+	// Lifecycle testament: replica stopping. Posted before context
+	// cancel so the board operation can complete.
+	s.workstreamsMu.Lock()
+	wsCount := len(s.workstreams)
+	s.workstreamsMu.Unlock()
+	// Use background context — runCtx may be cancelled already.
+	s.scribeSubmitTestament(context.Background(), s.scribeTestament(
+		fmt.Sprintf("Scribe replica %d stopped — %d workstreams", s.replicaGeneration, wsCount),
+		"committed",
+		[]*claims.Artifact{
+			s.scribeArtifact("replica_generation", fmt.Sprintf("%d", s.replicaGeneration)),
+			s.scribeArtifact("workstream_count", fmt.Sprintf("%d", wsCount)),
+		},
+	))
+
+	if s.claimsInbox != nil {
+		_ = s.claimsInbox.Close()
+		s.claimsInbox = nil
+	}
+
 	if s.fabricUnsubscribe != nil {
 		s.fabricUnsubscribe()
 		s.fabricUnsubscribe = nil
@@ -663,6 +712,25 @@ func (s *Scribe) InjectPreparedContext(pc *handoff.PreparedContext) error {
 		},
 	}
 	s.handoffMu.Unlock()
+
+	// Lifecycle claim: handoff context injected.
+	s.scribePostClaim(context.Background(),
+		s.scribeClaimAction(claims.ActionTypeArchival),
+		s.scribeClaim(
+			"Scribe handoff: prior replica context injected",
+			"Prepared context from prior scribe instance seeded into workstream",
+			[]claims.ClaimScopeEntry{{Kind: "workstream", Key: workstreamKey}},
+			claims.ActionTypeArchival, nil,
+		),
+	)
+	s.scribeSubmitTestament(context.Background(), s.scribeTestament(
+		"Handoff context injected from prior scribe replica",
+		"committed",
+		[]*claims.Artifact{
+			s.scribeArtifact("correlation_id", correlationID),
+			s.scribeArtifact("workstream_key", workstreamKey),
+		},
+	))
 
 	return nil
 }

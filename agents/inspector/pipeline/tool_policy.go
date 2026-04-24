@@ -24,10 +24,14 @@ func pipelineInspectorVisibleSkillNames() []string {
 		// challenge_agent / handoff_next / validate_work /
 		// process_validation / finalize_pipeline collapsed into
 		// pipeline_protocol(action=challenge|handoff|validate|
-		// process_validation|finalize). handoff_to_green remains distinct —
+		// process_validation|finalize). handoff_to_ot remains distinct —
 		// it's inspector-only, the terminal commit-to-green action.
 		"pipeline_protocol",
-		"handoff_to_green",
+		"handoff_to_ot",
+		// Claims skills: read-only board introspection is Local (visible).
+		"query_claims_board",
+		"inspect_claim_conflicts",
+		"traverse",
 	}, "inspector-pipeline")
 	// Inspector gets BOTH the awareness skills AND the audit-time
 	// inspect_open_activity. The audit skill is what makes the
@@ -49,8 +53,13 @@ func pipelineInspectorMutatingSkillNames() []string {
 		"validate_work",
 		"process_validation",
 		"finalize_pipeline",
-		"handoff_to_green",
+		"handoff_to_ot",
 		"reroute_request",
+		// Claims skills: mutating operations need LocalWorker policy.
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 	})
 }
 

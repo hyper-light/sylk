@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -320,6 +321,17 @@ func (a *Academic) executeToolLoop(
 				if reminder, fields := execState.finalizationBlock(); reminder != "" {
 					fields["content_preview"] = truncateStr(strings.TrimSpace(resp.Content), 200)
 					academicLogResearchStateEvent(ctx, "finalization_blocked", fields)
+
+					// Finalization block testament: research incomplete.
+					a.academicSubmitTestament(ctx, a.academicTestament(
+						"Research finalization blocked",
+						"committed",
+						[]*claims.Artifact{
+							a.academicArtifact("blocking_reason", truncateAcademic(reminder, 300)),
+							a.academicJSONArtifact("blocking_fields", fields),
+						},
+					))
+
 					req.Messages = append(req.Messages, providers.Message{
 						Role:    providers.RoleUser,
 						Content: reminder,
@@ -829,6 +841,14 @@ func (a *Academic) streamLLMTurn(
 					fields["streamed_text_suppressed"] = true
 					fields["content_preview"] = truncateStr(strings.TrimSpace(text), 200)
 					academicLogResearchStateEvent(ctx, "finalization_blocked", fields)
+					a.academicSubmitTestament(ctx, a.academicTestament(
+						"Research finalization blocked (streamed)",
+						"committed",
+						[]*claims.Artifact{
+							a.academicArtifact("blocking_reason", truncateAcademic(reminder, 300)),
+							a.academicJSONArtifact("blocking_fields", fields),
+						},
+					))
 				} else {
 					streamedText = true
 					shared.PublishStreamChunk(a.bus, a.channels, ctx, a.id, text)

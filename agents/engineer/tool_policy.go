@@ -29,6 +29,10 @@ func engineerVisibleSkillNames() []string {
 		"audit",
 		"bash",
 		"report_confidence",
+		// Claims skills: read-only board introspection is Local (visible).
+		"query_claims_board",
+		"inspect_claim_conflicts",
+		"traverse",
 	}, "engineer")
 	// Activity Fabric: ambient awareness primitives must be visible
 	// by default. See docs/SCRIBE_FABRIC.md.
@@ -48,6 +52,11 @@ func engineerMutatingSkillNames() []string {
 		"process_validation",
 		"report_confidence",
 		"reroute_request",
+		// Claims skills: mutating operations need LocalWorker policy.
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 	})
 }
 

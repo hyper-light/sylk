@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/google/uuid"
@@ -51,19 +52,64 @@ func (g *Guardian) evaluateToolExecutionControl(
 	if req == nil {
 		return nil, fmt.Errorf("guardian tool control request is required")
 	}
+
+	sessionID := g.activeSessionID
+	requester := strings.TrimSpace(req.AgentID)
+
+	// Post claim: agent requests guardian-controlled tool grant.
+	g.guardianPostClaim(context.Background(),
+		guardianClaimAction(claims.ActionTypeTask),
+		guardianExternalClaim(
+			"Grant execution of `"+req.ToolName+"` for "+requester,
+			"Agent requests guardian-controlled tool execution grant",
+			requester,
+			[]claims.ClaimScopeEntry{
+				{Kind: "tool", Key: req.ToolName},
+				{Kind: "agent", Key: requester},
+			},
+			claims.ActionTypeTask,
+			[]*claims.Validation{
+				guardianValidation(claims.ValidationTypeInspection, true, "Tool execution mode is guardian-controlled", "ToolPolicy.ExecutionMode == GuardianControlled"),
+				guardianValidation(claims.ValidationTypeInspection, true, "Requester identity matches declared agent", "SourceAgentID matches or aliases to request agent"),
+				guardianValidation(claims.ValidationTypeInspection, true, "Tool is flagged approval-sensitive", "ToolPolicy.ApprovalSensitive == true"),
+			},
+		),
+	)
+
 	if strings.TrimSpace(req.AgentID) == "" || strings.TrimSpace(req.CorrelationID) == "" || strings.TrimSpace(req.CapabilityScope) == "" {
-		return nil, fmt.Errorf("guardian tool control request is missing invocation identity")
+		err := fmt.Errorf("guardian tool control request is missing invocation identity")
+		g.guardianSubmitTestament(context.Background(), guardianTestamentAction(), guardianTestament(
+			sessionID, "Tool grant denied: "+err.Error(), "committed", requester,
+			[]*claims.Artifact{guardianArtifact(sessionID, "error", err.Error())},
+		))
+		return nil, err
 	}
 	if trimmedSource := strings.TrimSpace(sourceAgentID); trimmedSource != "" && !g.matchesToolControlRequester(trimmedSource, req.AgentID) {
-		return nil, fmt.Errorf("guardian tool control source mismatch: %q != %q", req.AgentID, trimmedSource)
+		err := fmt.Errorf("guardian tool control source mismatch: %q != %q", req.AgentID, trimmedSource)
+		g.guardianSubmitTestament(context.Background(), guardianTestamentAction(), guardianTestament(
+			sessionID, "Tool grant denied: "+err.Error(), "committed", requester,
+			[]*claims.Artifact{guardianArtifact(sessionID, "error", err.Error())},
+		))
+		return nil, err
 	}
 	if req.Policy.Execution != toolruntime.ExecutionModeGuardian {
-		return nil, fmt.Errorf("tool %q is not marked for guardian-controlled execution", req.ToolName)
+		err := fmt.Errorf("tool %q is not marked for guardian-controlled execution", req.ToolName)
+		g.guardianSubmitTestament(context.Background(), guardianTestamentAction(), guardianTestament(
+			sessionID, "Tool grant denied: "+err.Error(), "committed", requester,
+			[]*claims.Artifact{guardianArtifact(sessionID, "error", err.Error())},
+		))
+		return nil, err
 	}
 	if !req.Policy.ApprovalSensitive {
-		return nil, fmt.Errorf("tool %q is not marked approval-sensitive", req.ToolName)
+		err := fmt.Errorf("tool %q is not marked approval-sensitive", req.ToolName)
+		g.guardianSubmitTestament(context.Background(), guardianTestamentAction(), guardianTestament(
+			sessionID, "Tool grant denied: "+err.Error(), "committed", requester,
+			[]*claims.Artifact{guardianArtifact(sessionID, "error", err.Error())},
+		))
+		return nil, err
 	}
-	return &toolruntime.GuardianControlGrant{
+
+	grant := &toolruntime.GuardianControlGrant{
 		GrantID:           uuid.New().String(),
 		AgentID:           req.AgentID,
 		CorrelationID:     req.CorrelationID,
@@ -74,7 +120,14 @@ func (g *Guardian) evaluateToolExecutionControl(
 		Approved:          true,
 		Reason:            "guardian-approved deterministic control-plane grant",
 		ExpiresAt:         time.Now().Add(30 * time.Second),
-	}, nil
+	}
+	g.guardianSubmitTestament(context.Background(), guardianTestamentAction(), guardianTestament(
+		sessionID,
+		"Granted `"+req.ToolName+"` for "+requester+" (30s TTL)",
+		"committed", requester,
+		[]*claims.Artifact{guardianJSONArtifact(sessionID, "execution_grant", grant)},
+	))
+	return grant, nil
 }
 
 func (g *Guardian) matchesToolControlRequester(sourceAgentID, requester string) bool {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -102,6 +103,19 @@ func (l *Librarian) executeClone(ctx context.Context, repoURL, branch string) (a
 	}
 
 	l.publishActivity(events.EventTypeSuccess, fmt.Sprintf("Cloned %s/%s (%d files)", entry.Owner, entry.RepoName, entry.FileCount))
+
+	// Clone testament.
+	l.librarianSubmitTestament(ctx, l.librarianTestament(
+		fmt.Sprintf("Cloned %s/%s: %d files", entry.Owner, entry.RepoName, entry.FileCount),
+		"committed",
+		[]*claims.Artifact{
+			l.librarianArtifact("url", entry.URL),
+			l.librarianArtifact("owner", entry.Owner),
+			l.librarianArtifact("repo", entry.RepoName),
+			l.librarianArtifact("commit", entry.CommitHash),
+			l.librarianArtifact("file_count", fmt.Sprintf("%d", entry.FileCount)),
+		},
+	))
 
 	return map[string]any{
 		"success":     true,

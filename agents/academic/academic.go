@@ -19,6 +19,8 @@ import (
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/fetch"
@@ -133,6 +135,16 @@ type Academic struct {
 
 	// Handoff integration
 	handoffBridge *handoff.HandoffBridge
+
+	// Tracked goroutine scope for async claims dispatch.
+	scope *concurrency.GoroutineScope
+
+	claimsInbox *claims.ClaimsInbox
+}
+
+// SetScope injects the goroutine scope for async claims dispatch.
+func (a *Academic) SetScope(scope *concurrency.GoroutineScope) {
+	a.scope = scope
 }
 
 // routeHopsKey carries the incoming ForwardedRequest's hop count through the
@@ -498,6 +510,21 @@ func (a *Academic) Start(bus guide.EventBus) error {
 		return fmt.Errorf("failed to subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
+	// Claims intake: event-driven delta processing.
+	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
+		AgentID:      a.id,
+		SessionID:    a.config.SessionID,
+		Bus:          bus,
+		Board:        a.academicBoard(),
+		Scope:        a.scope,
+		ProcessEntry: a.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("academic_claims_inbox_start_failed", "error", err.Error())
+		}
+		a.claimsInbox = inbox
+	}
+
 	a.runCtx, a.runCancel = context.WithCancel(context.Background())
 	a.requestCancels = make(map[string]context.CancelFunc)
 	a.running = true
@@ -505,6 +532,17 @@ func (a *Academic) Start(bus guide.EventBus) error {
 		"request_channel", a.channels.Requests,
 		"response_channel", a.channels.Responses,
 	)
+
+	// Lifecycle testament: started.
+	a.academicSubmitTestament(a.runCtx, a.academicTestament(
+		"Academic agent started",
+		"committed",
+		[]*claims.Artifact{
+			a.academicArtifact("session_id", a.config.SessionID),
+			a.academicArtifact("agent_id", a.id),
+		},
+	))
+
 	return nil
 }
 
@@ -512,6 +550,20 @@ func (a *Academic) Start(bus guide.EventBus) error {
 func (a *Academic) Stop() error {
 	if !a.running {
 		return nil
+	}
+
+	// Lifecycle testament: stopping.
+	a.academicSubmitTestament(context.Background(), a.academicTestament(
+		"Academic agent stopped",
+		"committed",
+		[]*claims.Artifact{
+			a.academicArtifact("session_id", a.config.SessionID),
+		},
+	))
+
+	if a.claimsInbox != nil {
+		_ = a.claimsInbox.Close()
+		a.claimsInbox = nil
 	}
 
 	a.steering.CloseAll()
@@ -992,6 +1044,17 @@ func (a *Academic) handleConversation(ctx context.Context, fwd *guide.ForwardedR
 	if err != nil {
 		return nil, fmt.Errorf("academic conversation failed: %w", err)
 	}
+
+	// Conversation response testament.
+	a.academicSubmitTestament(ctx, a.academicTestament(
+		"Academic responded: intent="+string(fwd.Intent),
+		"committed",
+		[]*claims.Artifact{
+			a.academicArtifact("response_text", truncateAcademic(result, 500)),
+			a.academicArtifact("intent", string(fwd.Intent)),
+		},
+	))
+
 	return &ConversationResult{
 		Response: result,
 		Intent:   fwd.Intent,
@@ -1040,6 +1103,20 @@ func (a *Academic) handleConsultation(ctx context.Context, fwd *guide.ForwardedR
 	if payload != nil {
 		payload.FreshnessHorizon = academicConsultFreshnessHorizon
 	}
+
+	// Consultation response testament.
+	summary := "Consultation response"
+	if payload != nil {
+		summary = "Consultation response: " + truncateAcademic(payload.Summary, 100)
+	}
+	a.academicSubmitTestament(ctx, a.academicTestamentWithSubject(
+		summary, "committed", fwd.SourceAgentID,
+		[]*claims.Artifact{
+			a.academicJSONArtifact("consultation_payload", payload),
+			a.academicArtifact("source_agent", fwd.SourceAgentID),
+		},
+	))
+
 	return payload, nil
 }
 
@@ -1895,6 +1972,52 @@ func (a *Academic) PublishRequest(req *guide.RouteRequest) error {
 
 // Research performs research on a topic via the LLM tool loop.
 func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*ResearchResult, error) {
+	// Research claim at entry.
+	queryText := ""
+	if query != nil {
+		queryText = query.Query
+	}
+	a.academicPostClaim(ctx,
+		claims.Action{AgentID: "academic", Type: claims.ActionTypeTask},
+		academicClaim(
+			"Research: "+truncateAcademic(queryText, 60),
+			"Comprehensive research via LLM tool loop",
+			[]claims.ClaimScopeEntry{{Kind: "research", Key: truncateAcademic(queryText, 80)}},
+			claims.ActionTypeTask,
+			[]*claims.Validation{
+				academicValidation(claims.ValidationTypeInspection, true, "Research completes with findings", "ResearchResult.Findings non-empty"),
+			},
+		),
+	)
+
+	// Deferred testament at exit.
+	var researchResult *ResearchResult
+	var researchErr error
+	defer func() {
+		if researchErr != nil {
+			a.academicSubmitTestament(ctx, a.academicTestament(
+				"Research failed: "+researchErr.Error(), "committed",
+				[]*claims.Artifact{
+					a.academicArtifact("query", truncateAcademic(queryText, 200)),
+					a.academicArtifact("error", researchErr.Error()),
+				},
+			))
+			return
+		}
+		if researchResult != nil {
+			a.academicSubmitTestament(ctx, a.academicTestament(
+				"Research complete: "+truncateAcademic(queryText, 60),
+				"committed",
+				[]*claims.Artifact{
+					a.academicArtifact("query", truncateAcademic(queryText, 200)),
+					a.academicArtifact("query_id", researchResult.QueryID),
+					a.academicArtifact("finding_count", fmt.Sprintf("%d", len(researchResult.Findings))),
+					a.academicArtifact("confidence", string(researchResult.Confidence)),
+				},
+			))
+		}
+	}()
+
 	ctx = WithAcademicResearchDepth(ctx, academicResearchDepthFromQuery(query))
 	if contract := AcademicCompletionContractFromContext(ctx); contract == nil {
 		if derived := academicCompletionContractForResearchQuery(query); derived != nil {
@@ -1912,6 +2035,16 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 	cacheKey := a.cacheKey(query)
 	if cached := a.getCached(cacheKey); cached != nil {
 		a.logger.Debug("cache hit for research query", "query", query.Query)
+		a.academicSubmitTestament(ctx, a.academicTestament(
+			"Research cache hit: "+truncateAcademic(query.Query, 60),
+			"committed",
+			[]*claims.Artifact{
+				a.academicArtifact("query", truncateAcademic(query.Query, 200)),
+				a.academicArtifact("cache_key", cacheKey),
+				a.academicArtifact("served_from", "cache"),
+			},
+		))
+		researchResult = cached // set for deferred testament
 		return cached, nil
 	}
 
@@ -1950,13 +2083,14 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 		return a.executeToolLoop(ctx, llmReq, ledger, a.toolRuntime())
 	})
 	if err != nil {
-		return nil, fmt.Errorf("research failed: %w", err)
+		researchErr = fmt.Errorf("research failed: %w", err)
+		return nil, researchErr
 	}
 
 	queryID := uuid.New().String()
 	now := time.Now()
 
-	researchResult := &ResearchResult{
+	researchResult = &ResearchResult{
 		QueryID:     queryID,
 		Confidence:  a.config.DefaultConfidence,
 		GeneratedAt: now,
@@ -2349,6 +2483,17 @@ func (a *Academic) RecordOutcome(recommendationID string, success bool, notes st
 		Notes:            notes,
 	}
 	a.outcomeHistory.Record(outcome)
+
+	// Outcome recording testament.
+	a.academicSubmitTestament(context.Background(), a.academicTestament(
+		"Outcome recorded: "+recommendationID+" success="+fmt.Sprintf("%t", success),
+		"committed",
+		[]*claims.Artifact{
+			a.academicArtifact("recommendation_id", recommendationID),
+			a.academicArtifact("success", fmt.Sprintf("%t", success)),
+			a.academicArtifact("notes", notes),
+		},
+	))
 }
 
 // =============================================================================

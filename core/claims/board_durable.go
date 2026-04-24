@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -338,6 +337,7 @@ func (db *DurableBoard) replayWAL(afterSeq uint64) error {
 
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 	var seq uint64
+	var corruptEntries []string
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -347,10 +347,9 @@ func (db *DurableBoard) replayWAL(afterSeq uint64) error {
 
 		var event walEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			slog.Warn("claims_wal_corrupt_entry",
-				"seq", seq, "error", err.Error(),
-				"line_prefix", truncateForLog(line, 100),
-			)
+			corruptEntries = append(corruptEntries, fmt.Sprintf(
+				"WAL seq %d: %s (prefix: %s)", seq, err.Error(), truncateForLog(line, 80),
+			))
 			continue
 		}
 
@@ -369,6 +368,15 @@ func (db *DurableBoard) replayWAL(afterSeq uint64) error {
 		}
 	}
 	db.seq = seq
+
+	// Surface corruption as notification errors on the board so the
+	// first projection query exposes them to agents. Agents can then
+	// record them as testament error artifacts.
+	if len(corruptEntries) > 0 && db.board != nil {
+		db.board.mu.Lock()
+		db.board.notificationErrors = append(db.board.notificationErrors, corruptEntries...)
+		db.board.mu.Unlock()
+	}
 	return nil
 }
 

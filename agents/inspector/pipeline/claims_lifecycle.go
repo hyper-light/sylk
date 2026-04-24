@@ -11,12 +11,12 @@ import (
 // pipeline lifecycle events when all claims are accepted.
 //
 // IMPORTANT: Per PARALLEL_GLOBAL_VFS.md, the VFS merge into green
-// happens at pipeline-accept time (handoff_to_green), NOT at
+// happens at pipeline-accept time (handoff_to_ot), NOT at
 // board-complete time. The pipeline's work is already in green
 // when the board completes. Board completion signals that all claims
 // are accepted — the pipeline's obligation is fulfilled.
 //
-// The DAG node advancement is handled by the existing handoff_to_green
+// The DAG node advancement is handled by the existing handoff_to_ot
 // flow which publishes the pipeline success update. The global review
 // (per-merge audit replicas) runs independently on the MergeDescriptor
 // produced by the merge, and is a separate concern from the pipeline's
@@ -41,9 +41,9 @@ func (pi *PipelineInspector) wireClaimsBoardLifecycle() {
 			"iteration", p.Iteration,
 		)
 
-		// The VFS merge already happened at handoff_to_green time.
+		// The VFS merge already happened at handoff_to_ot time.
 		// Board complete = all claims accepted = pipeline work is done.
-		// The handoff_to_green flow handles DAG node advancement and
+		// The handoff_to_ot flow handles DAG node advancement and
 		// global review dispatch. Nothing else to do here.
 		return nil
 	})

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
@@ -779,7 +780,10 @@ func buildGuideResponsePrompt(request GuideSelfResponseRequest) string {
 	}
 	lines = append(lines, guideConversationPromptLines(request)...)
 	lines = append(lines, "", "User request:", strings.TrimSpace(request.Input))
-	return strings.Join(lines, "\n")
+	prompt := strings.Join(lines, "\n")
+
+	board := claims.DefaultSessionBoardRegistry().Lookup(request.SessionID)
+	return claims.PrependBoardPreamble(prompt, board, "guide")
 }
 
 func formatGuideAgentsForPrompt(agentIDs []string) string {

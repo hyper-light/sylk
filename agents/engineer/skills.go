@@ -117,11 +117,14 @@ func (e *Engineer) registerCoreSkills() {
 	//
 	// Every pipeline uses claims. No legacy protocol path.
 	boardProvider := func() *claims.ClaimsBoard { return e.claimsBoard }
+	inboxProvider := func() *claims.ClaimsInbox { return e.claimsInbox }
 	e.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
-	e.skills.Register(claims.PostActionSkill(boardProvider))
+	e.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	e.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	e.skills.Register(claims.EvaluateValidationSkill(boardProvider))
 	e.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
 	e.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+	e.skills.Register(claims.TraverseSkill(boardProvider))
 
 	fabricCfg := fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,
@@ -238,6 +241,18 @@ func consultSkill(e *Engineer) *skills.Skill {
 			if sessionID == "" {
 				sessionID = e.config.SessionID
 			}
+			e.engineerPostClaim(ctx,
+				claims.Action{AgentID: "engineer", Type: claims.ActionTypeConsultation},
+				engineerConsultClaim(
+					"Consult "+params.Target+": "+truncateEngineer(params.Query, 60),
+					"Evidence gathering via consultation",
+					params.Target,
+					[]claims.ClaimScopeEntry{{Kind: "consultation", Key: params.Target}},
+					[]*claims.Validation{
+						engineerValidation(claims.ValidationTypeReceipt, true, "Consultation succeeded", "evidence.Success == true"),
+					},
+				),
+			)
 			evidence, err := e.requestConsultationWithMetadata(
 				ctx,
 				params.Target,

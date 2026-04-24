@@ -9,7 +9,7 @@ The current pipeline system uses a state machine protocol (`PipelineProtocolSnap
 3. Engineer/Designer implements (`StatusExecuting`)
 4. Inspector + Tester validate (`StatusValidating`)
 
-Each transition requires a durable event append to the WAL, reducer replay to reconstruct state, mailbox obligation derivation to determine the next required action, and single-terminal-action guards to prevent double-dispatch. The protocol's reducer state machine cycles through seven states (`Idle -> ChallengeIssued -> ValidationPending -> ValidationProcessed -> FinalizeRequired -> ReadyForOT -> HandoffToGreenRequired -> Completed`), with each agent turn constrained by a `PipelineTurnAction` that must match the `requiredAction` lock.
+Each transition requires a durable event append to the WAL, reducer replay to reconstruct state, mailbox obligation derivation to determine the next required action, and single-terminal-action guards to prevent double-dispatch. The protocol's reducer state machine cycles through seven states (`Idle -> ChallengeIssued -> ValidationPending -> ValidationProcessed -> FinalizeRequired -> ReadyForOT -> HandoffToOTRequired -> Completed`), with each agent turn constrained by a `PipelineTurnAction` that must match the `requiredAction` lock.
 
 This architecture is fundamentally sequential. Only one agent acts at a time. The Inspector must handoff to the Tester, who must handoff to the Engineer, who must handoff back. Every transition is a durable protocol event. Every handoff is a full Guide route request. Every phase boundary is a terminal-action guard. The result is high latency for work that should be collaborative and parallel.
 
@@ -892,13 +892,474 @@ type ClaimProgressUpdate struct {
 }
 ```
 
+### 4.15 TestamentAccumulator
+
+High-frequency processes (search tool calls, route cache lookups, replica pool admissions, conversation flow observations) fire per-event — potentially dozens per request. Individual testaments per event flood the board with noise. Skipping them entirely leaves audit gaps.
+
+The `TestamentAccumulator` solves this by collecting observations within any bounded lifecycle and flushing them as a single composite testament when the lifecycle completes:
+
+```go
+// Create at lifecycle start
+acc := claims.NewTestamentAccumulator("librarian", sessionID)
+ctx = claims.WithTestamentAccumulator(ctx, acc)
+defer acc.Flush(ctx, board, scope) // ONE testament at lifecycle end
+
+// Anywhere in the call chain — no board interaction, no async dispatch
+if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+    acc.Record("search_result", "grep foo → 12 files")
+    acc.Record("search_saturated", "2 consecutive searches returned only seen files")
+    acc.Note("Health assessed: DISCIPLINED")
+}
+```
+
+The lifecycle boundary is defined by the caller, not the type:
+- **Request lifecycle**: Librarian creates one per forwarded request. Accumulates search results, health assessments, repo briefs, saturation events, replica admission state. Flushes one testament per request.
+- **Route lifecycle**: Guide creates one per route request. Accumulates route cache hits, enrichment fanouts, conversation flow routing. Flushes one testament per route.
+- **Session lifecycle**: Could accumulate session-scoped observations (session creation, model swaps, preference changes). Flushes on session close.
+- **Planning lifecycle**: Architect could accumulate per-stage observations within a planning protocol. Flushes when the protocol completes.
+
+Properties:
+- **Thread-safe**: `Record`, `RecordJSON`, `Note` are mutex-guarded. Concurrent tool calls accumulate safely.
+- **Zero-cost when empty**: `Flush` is a no-op if no artifacts were recorded.
+- **Async flush**: When a `ScopeProvider` is passed, the flush dispatches via a tracked goroutine.
+- **One testament per lifecycle**: The board sees one composite entry, not N individual entries.
+- **Context-propagated**: `WithTestamentAccumulator` / `AccumulatorFromContext` — any code in the call chain can record without knowing who created the accumulator or when it flushes.
+
 ---
 
-## 5. Two-Phase Execution Model (Pipeline Context)
+## 5. Agent Intake and Processing
+
+The intake and processing mechanics are the universal shape every agent in the system shares. Every directed interaction an agent receives or emits flows through one discipline regardless of agent role, phase, or board scope.
+
+### 5.1 Three Sources, One Discipline
+
+Agents draw information from exactly three sources, each with a distinct role:
+
+| Source | Role | Access pattern |
+|---|---|---|
+| **Event Bus** | Delivers explicit, authoritative delta records the moment a board mutation commits. Each delta fully describes the mutation that occurred. | Subscription-based, fire-and-forget, dimensioned topic keys. |
+| **ClaimsBoard** | Durable archive and relational graph. Queried on-demand for adjacent context the event did not carry. | Named query skills with sharp signatures; indexed by `Relations`. |
+| **Fabric Lens** | Cross-cutting projections over the activity stream. Queried for context that crosses session, pipeline, or task boundaries. | Named lens queries; backed by `AmbientFor` / peer lenses. |
+
+Every directed emission an agent performs is one of four async skills; every read an agent performs is `pull_work()` (the turn envelope) plus on-demand named queries into the board or the fabric. There is no fourth source and no fifth emission.
+
+### 5.2 Async Emission
+
+The four board-mutating skills are strictly asynchronous. Each returns the committed IDs and nothing else; the issuer never blocks waiting for a peer response.
+
+```
+post_action(Action, []Claim)              -> {action_id, claim_ids[]}
+update_claim_progress(claim_id, update)   -> {sequence}
+submit_testaments(Action, []Testament)    -> {action_id, testament_ids[]}
+evaluate_validation(validation_id, ...)   -> {sequence}
+```
+
+The LLM's mental model collapses to:
+
+1. **Post is always fire-and-forget.** The issuer receives the committed ID; the peer responds on its own schedule.
+2. **Continue or end the turn is the LLM's choice.** If the agent has independent work (progress updates on its other claims, conflict inspection, context pre-reads), it continues. If not, it ends the turn.
+3. **Next `pull_work` sees everything.** That is the only synchronization point the LLM touches, and it is a runtime-owned read of already-durable state.
+
+Removing the in-tool wait eliminates deadline tuning, subscription leaks on tool cancel, and partial-deadline ambiguity. The only durability fence that matters is durable-before-transient emission inside the amplifier.
+
+### 5.3 Deltas
+
+Every board mutation emits exactly one delta record. Four shapes cover every possible mutation.
+
+```go
+package claims
+
+// InboxDelta is emitted when an Action posts claims directed at an
+// agent. The receiver learns everything it needs about the mutation
+// without re-reading the board.
+type InboxDelta struct {
+    // Dedup + ordering.
+    ActionID  string    `json:"action_id"`
+    ClaimID   string    `json:"claim_id"`
+    Sequence  uint64    `json:"sequence"`
+    EmittedAt time.Time `json:"emitted_at"`
+
+    // Explicit description of the mutation.
+    Relationship    string            `json:"relationship"`    // "subject" | "evaluator" | "consulted" | "blocked_on"
+    ActionKind      ActionType        `json:"action_kind"`     // matches Action.Type
+    Priority        uint8             `json:"priority"`
+    Scope           []ClaimScopeEntry `json:"scope"`
+    ValidationCount int               `json:"validation_count"`
+    DependsOn       []string          `json:"depends_on"`
+    IssuerAgentID   string            `json:"issuer_agent_id"`
+    IssuerAgentType string            `json:"issuer_agent_type"`
+    Deadline        time.Time         `json:"deadline,omitempty"`
+}
+
+// TestamentDelta is emitted when a testament is submitted against a
+// claim. Delivered to the claim's issuer and any evaluators.
+type TestamentDelta struct {
+    ClaimID     string    `json:"claim_id"`
+    TestamentID string    `json:"testament_id"`
+    Sequence    uint64    `json:"sequence"`
+    EmittedAt   time.Time `json:"emitted_at"`
+
+    Verdict        string   `json:"verdict"`          // "work_complete" | "error" | "partial"
+    ArtifactKinds  []string `json:"artifact_kinds"`   // e.g. ["code_reference", "test_output"]
+    AutoAccepted   bool     `json:"auto_accepted"`
+    EvaluatorAgent string   `json:"evaluator_agent,omitempty"`
+    SubjectAgentID string   `json:"subject_agent_id"`
+}
+
+// ValidationDelta is emitted when a validation is evaluated
+// (passed / failed / skipped). Delivered to the claim's subject and
+// issuer.
+type ValidationDelta struct {
+    ClaimID      string    `json:"claim_id"`
+    ValidationID string    `json:"validation_id"`
+    Sequence     uint64    `json:"sequence"`
+    EmittedAt    time.Time `json:"emitted_at"`
+
+    Verdict             string   `json:"verdict"` // "passed" | "failed" | "skipped"
+    EvaluatorAgentID    string   `json:"evaluator_agent_id"`
+    RemainingOnClaim    int      `json:"remaining_on_claim"`
+    FailedCountOnClaim  int      `json:"failed_count_on_claim"`
+    RemediationClaimIDs []string `json:"remediation_claim_ids,omitempty"`
+}
+
+// PhaseDelta is emitted on board phase transitions. Delivered to every
+// subscriber on the board's phase topic.
+type PhaseDelta struct {
+    BoardID   string    `json:"board_id"`
+    TaskID    string    `json:"task_id"`
+    Sequence  uint64    `json:"sequence"`
+    EmittedAt time.Time `json:"emitted_at"`
+
+    FromPhase BoardPhase `json:"from_phase"`
+    ToPhase   BoardPhase `json:"to_phase"`
+    Iteration int        `json:"iteration"`
+    Reason    string     `json:"reason"`
+}
+```
+
+**Deltas are not hints.** Each delta is the full, explicit description of what was committed to the board. Receivers act on the delta directly; they do not re-query the board to verify or expand the event. The board is consulted only when the receiver needs context beyond the event itself (§5.8).
+
+### 5.4 Event Bus Topic Grammar
+
+Deltas are published to the existing `ChannelBus` under dimensioned topic keys. The router's wildcard matching (`TopicRouter`) allows subscribers to narrow their channel to the dimensions they care about without receiver-side filtering.
+
+```
+claims.<session_id>.inbox.<agent_id>.<relationship>.<action_kind>
+claims.<session_id>.claim.<claim_id>.<status>
+claims.<session_id>.validation.<validation_id>.<verdict>
+claims.<session_id>.phase.<phase>
+```
+
+Example subscription patterns:
+
+| Subscriber | Pattern | Delivers |
+|---|---|---|
+| Engineer waiting for directed work | `claims.*.inbox.eng-a3f2.subject.*` | Claims where I am the subject |
+| Inspector evaluating testaments | `claims.*.claim.*.testified` | Any claim that just received a testament |
+| Guardian evaluating guardrails | `claims.*.inbox.guardian.evaluator.*` | Claims directing Guardian to evaluate |
+| Orchestrator watching phase | `claims.<sid>.phase.*` | Phase transitions on this session's boards |
+| Agent awaiting remediation | `claims.*.claim.*.rejected` | Rejected claims requiring remediation |
+
+Overflow, subscription tracking, and cancellation follow existing `ChannelBus` semantics. No new transport primitives are introduced.
+
+### 5.5 Amplifier Dual Emission
+
+The `ClaimsBoardAmplifier` grows one responsibility beyond its existing fabric projection: publishing the matching delta to the bus. Each mutation executes under a strict ordering fence.
+
+```
+1. board.mu.Lock()
+2. apply mutation in memory
+3. build delta from committed state
+4. durableProtocolLog.Append(delta record)   // durable-before-transient
+5. board.mu.Unlock()
+6. amplifier.PublishFabricActivity(...)      // cross-cutting projection
+7. amplifier.PublishBusDelta(delta)          // transient notification
+```
+
+Step 4 must succeed before steps 6 or 7 run. A crash between steps 4 and 7 replays deterministically on restart: WAL recovery reconstructs the same delta records the bus would have delivered, and subscribers whose cursors lag behind `durableProtocolLog`'s tail receive the missing records on their next read.
+
+**Recovery equivalence**: the WAL-replayed delta stream is byte-identical to the live-published delta stream. This is what keeps crashed and live subscribers converged.
+
+### 5.6 ClaimsInbox — Event-Driven Expectation-Matching Engine
+
+`ClaimsInbox` is a runtime type (not an LLM surface) attached to every agent replica. It is an **event-driven expectation-matching engine**: when a delta arrives on the bus and matches, the agent's processing function fires immediately from the bus subscription handler — no polling, no pull loop, no goroutine sitting on a channel.
+
+An agent's inbox receives deltas from two sources, both fully determined:
+
+1. **Explicit expectations** — registered at emission time. When the agent calls `post_action(kind=consultation, claim{subject=academic})`, the inbox registers an expectation: "when `TestamentDelta{claim_id=c-42}` arrives, resolve it and call my handler." The return path is known the moment the claim is issued.
+2. **Standing subscriptions** — derived from the agent's identity. An engineer is `subject` on claims directed at it; an inspector is `evaluator` on validations it must judge. These are computed from the agent's `agentID`, not from explicit registration.
+
+Together, explicit expectations + standing subscriptions define the **complete set of deltas the agent will ever receive**. Nothing else enters the inbox. No stale work, no unrelated deltas.
+
+**Event-driven dispatch.** When `Ingest` matches a delta, it resolves the delta into a `GraphEntryPoint` and calls the agent's `OnResolved` callback directly — on the bus subscriber's goroutine. The `OnResolved` implementation dispatches into the agent's `GoroutineScope` for tracked, async execution. No intermediate queue, no consumer goroutine, no pull loop.
+
+```go
+package claims
+
+// ClaimsInbox is the per-replica event-driven intake surface.
+//
+// Deltas arrive from bus subscriptions. The inbox matches each
+// against registered expectations (from emissions) or standing
+// subscriptions (from the agent's identity). Matched deltas are
+// resolved into GraphEntryPoints and dispatched to the agent's
+// OnResolved callback immediately. Unmatched deltas are discarded.
+type ClaimsInbox struct {
+    mu sync.Mutex
+
+    agentID    string
+    sessionID  string
+
+    // Bus subscription handles.
+    subscriptions []DeltaSubscription
+
+    // Explicit expectations: claim_id → *Expectation.
+    expectations map[string]*Expectation
+
+    // Dedup: DeltaKey → highest Sequence applied.
+    seen map[string]uint64
+
+    // Board handle for graph resolution.
+    board *ClaimsBoard
+
+    // OnResolved is called when a delta matches. Runs on the bus
+    // subscriber's goroutine — the implementation MUST dispatch
+    // into the agent's scope for tracked execution.
+    onResolved func(entry *GraphEntryPoint)
+}
+
+// InboxConfig bundles construction parameters.
+type InboxConfig struct {
+    AgentID    string
+    SessionID  string
+    Subscriber DeltaSubscriber
+    Board      *ClaimsBoard
+
+    // OnResolved is called when a delta matches an expectation or
+    // standing subscription. The resolved GraphEntryPoint is passed
+    // directly. The handler runs on the bus subscriber's goroutine
+    // — it MUST dispatch into the agent's GoroutineScope for
+    // tracked, async execution of the agent's tool loop.
+    OnResolved func(entry *GraphEntryPoint)
+}
+
+// Expectation is registered at post_action time.
+type Expectation struct {
+    ClaimID       string
+    ExpectedDelta string           // DeltaKindTestament | DeltaKindValidation
+    ActionID      string
+    IssuedAt      time.Time
+    Priority      WorkUnitPriority
+}
+
+// WorkUnitPriority determines delivery order.
+type WorkUnitPriority int
+
+const (
+    PriorityRemediation WorkUnitPriority = 1
+    PriorityChallenge   WorkUnitPriority = 2
+    PriorityDirected    WorkUnitPriority = 3
+    PriorityResponse    WorkUnitPriority = 4
+    PriorityEvaluation  WorkUnitPriority = 5
+    PriorityPhase       WorkUnitPriority = 6
+    PriorityAdvisory    WorkUnitPriority = 7
+)
+
+func (i *ClaimsInbox) Expect(e *Expectation)
+func (i *ClaimsInbox) Ingest(d Delta)  // match → resolve → OnResolved
+```
+
+**Flow:**
+
+```
+Bus delta arrives
+    → Ingest(delta)
+        → dedup check
+        → match against expectations (O(1) by claim_id)
+        → match against standing subscriptions (by agentID)
+        → if matched: ResolveEntryPoint(board, delta) → OnResolved(entry)
+        → if unmatched: discard
+```
+
+**Agent wiring:**
+
+```go
+inbox := NewClaimsInbox(InboxConfig{
+    AgentID:   agent.ID(),
+    SessionID: sessionID,
+    Board:     board,
+    OnResolved: func(entry *GraphEntryPoint) {
+        agent.scope.Go("process_claim", 0, func(ctx context.Context) error {
+            return agent.processClaimsEntry(ctx, entry)
+        })
+    },
+})
+```
+
+Properties:
+
+- **Event-driven.** No polling, no pull loop, no consumer goroutine. The bus subscription is the trigger. The `OnResolved` callback fires on match.
+- **Expectation-driven.** Explicit expectations from emissions + standing subscriptions from identity = the complete delta set. No stale or unrelated work.
+- **Tracked execution.** `OnResolved` dispatches into the agent's `GoroutineScope`. Every claims-triggered turn is a tracked goroutine with timeout, panic recovery, and budget enforcement.
+- **Dedup by `(DeltaKey, Sequence)`.** Re-deliveries, reconnect replays, and bus duplicates collapse to a single logical entry.
+- **No intermediate buffer.** The `ChannelBus` already provides per-subscription bounded queues (4096 capacity). No second queue needed.
+
+### 5.7 Graph Entry Points and Agent-Driven Traversal
+
+The claims board is a graph. Actions, Claims, Testaments, Validations, and Artifacts are nodes connected by typed `Relations` edges (`caused_by`, `supersedes`, `claim_action`, `issuer`, `subject`, `evaluator`, `derived_from`, `amends`, `refines`, etc.). When a delta resolves in the inbox, the runtime delivers the **entry point** — the immediate node the delta references — plus the delta itself. The agent decides how far to traverse from there.
+
+```go
+// GraphEntryPoint is the unit of work delivered to the agent's turn
+// loop. It contains the triggering delta and the immediate graph
+// node that delta references (depth-1). The agent traverses deeper
+// via the traverse tool (§5.8).
+type GraphEntryPoint struct {
+    // The delta that triggered this entry point.
+    Delta Delta
+
+    // The immediate node referenced by the delta.
+    // For InboxDelta: the Claim where I am subject.
+    // For TestamentDelta: the Testament submitted against my claim.
+    // For ValidationDelta: the Validation verdict on my testament.
+    // For PhaseDelta: the board's current phase record.
+    Node GraphNode
+
+    // Priority derived from the delta kind and any deadline.
+    Priority WorkUnitPriority
+
+    // The expectation this entry resolved (nil for standing subscriptions).
+    Expectation *Expectation
+}
+
+// GraphNode is the depth-1 view of a single node in the claims
+// graph. Contains the node's own data and the IDs of its immediate
+// neighbors — enough for the agent to decide whether to traverse
+// deeper, without pre-loading the full subgraph.
+type GraphNode struct {
+    // Exactly one of these is set, matching the delta kind.
+    Action     *Action
+    Claim      *Claim
+    Testament  *Testament
+    Validation *Validation
+
+    // Immediate neighbor IDs — not resolved, just their IDs and
+    // relationship types. The agent calls traverse() to load any
+    // of these it needs.
+    Edges []GraphEdge
+}
+
+// GraphEdge is a typed pointer to an adjacent node.
+type GraphEdge struct {
+    TargetID     string           // the neighbor's ID
+    TargetType   RelatedType      // Action | Claim | Testament | Validation | Artifact | Agent
+    Relationship RelationshipType // caused_by | supersedes | claim_action | issuer | subject | ...
+}
+```
+
+**Event-driven processing.** There is no turn loop polling for entries. The inbox's `OnResolved` callback fires when a delta matches. The agent's callback dispatches into its `GoroutineScope`:
+
+```go
+// OnResolved fires on the bus subscriber's goroutine.
+// It dispatches into the agent's scope for tracked execution.
+func (a *Agent) onClaimsResolved(entry *GraphEntryPoint) {
+    a.scope.Go("process_claim", 0, func(ctx context.Context) error {
+        return a.processClaimsEntry(ctx, entry)
+    })
+}
+
+// processClaimsEntry handles one causally coherent concern.
+func (a *Agent) processClaimsEntry(ctx context.Context, entry *GraphEntryPoint) error {
+    // Build prompt from entry point + traverse for context
+    // Run tool loop
+    // Emit testaments/claims
+}
+```
+
+Each `processClaimsEntry` call handles **one causally coherent concern**. The agent processes a consultation answer, then a challenge, then a directed claim — never mixed into one prompt. If the agent needs serialization (one entry at a time), it uses its existing `requestSerializer`. If it can handle concurrent entries, it processes them in parallel under the scope's budget.
+
+The graph structure ensures that when the agent needs more context, it asks for exactly what it needs via traversal, rather than receiving a pre-assembled grab-bag.
+
+### 5.8 Graph Traversal
+
+The agent's only read path into the claims board is **traversal from an entry point**. A single tool replaces the nine named query skills that previously existed as independent board reads.
+
+```
+traverse(node_id, edge_filter?, max_depth?)
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `node_id` | string | required | The starting node (any Action, Claim, Testament, Validation, or Artifact ID) |
+| `edge_filter` | string | all edges | Relationship type filter: `caused_by`, `supersedes`, `claim_action`, `issuer`, `subject`, `amends`, `refines`, `derived_from`, etc. |
+| `max_depth` | int | 1 | How many hops to traverse. Each hop returns the next ring of `GraphNode` records. |
+
+Returns: `[]GraphNode` — the nodes reachable from `node_id` along the filtered edges, up to `max_depth` hops. Each returned node includes its own `Edges` so the agent can decide whether to traverse further.
+
+The nine former named queries are now traversal patterns:
+
+| Former query | Traversal equivalent |
+|---|---|
+| `trace_claim_ancestry(claim_id)` | `traverse(claim_id, "supersedes\|amends\|refines")` |
+| `list_action_claims(action_id)` | `traverse(action_id, "claim_action")` |
+| `trace_action_causality(action_id)` | `traverse(action_id, "caused_by")` |
+| `find_overlapping_claims(scope)` | `traverse(scope_node_id, "scope")` — scope entries are nodes in the graph |
+| `show_validation_history(claim_id)` | `traverse(claim_id, "claim_action", 2)` — claim → validation nodes |
+| `list_testaments_for_claim(claim_id)` | `traverse(claim_id, "testament")` |
+| `recall_artifact(artifact_id)` | `traverse(artifact_id)` — depth-0, returns the artifact node itself |
+| `show_phase_history()` | `traverse(board_id, "phase")` |
+| `inspect_claim_conflicts(scope)` | `traverse(scope_node_id, "scope")` + check for overlapping `ClaimScopeEntry` |
+
+The board maintains secondary indexes over `Relations` — `(RelatedType, Relationship) -> []ObjectID` — so each traversal hop resolves in O(1) lookup + O(fan-out) reads. Indexes mutate inside the same write lock as the primary maps; traversal reads run under RLock.
+
+**Why one tool instead of nine.** Named queries committed the board to fixed access patterns and required the LLM to know which query matched its intent. Traversal is the primitive — the agent starts at a known node and walks edges. The LLM's mental model is: "I have a node. I can see its neighbors. If I need more context, I follow an edge." No query taxonomy to learn. New relationship types don't require new skills.
+
+### 5.9 Fabric Lens Context Queries
+
+Fabric lens queries serve cross-cutting context that crosses board, pipeline, or session boundaries. They are thin named wrappers over the existing `AmbientFor` / `WhatAreTheyDoing` / peer-oriented lenses.
+
+| Skill | Returns |
+|---|---|
+| `query_peer_claims(peer_agent_type, scope?)` | Claim state across boards for peers of a given type |
+| `query_peer_activity(peer_agent_id, time_window?)` | Recent activities produced by a peer |
+| `query_advisories(scope?)` | Knowledge-agent advisories and guardian notes in scope |
+| `query_challenge_history(peer_agent_type)` | Past challenge outcomes with peers of a given type |
+
+These skills do not touch the board. They read the `activity` stream, filtered by `SessionID`, `ActorAgentID`, `SubjectPathPrefix`, or `ActionKind`.
+
+### 5.10 How Existing Primitives Collapse
+
+Every directed interaction in the existing system maps to a claims emission. Legacy skill names remain as aliases that translate to `post_action` with the correct `ActionType` and `Relations` — LLMs do not relearn nomenclature; the wire format collapses underneath.
+
+| Existing primitive | Under the claims model |
+|---|---|
+| `consult_peer(target, query)` | `post_action(kind=consultation, claim{subject=peer, validations=["answer addresses question"]})`. The peer's testament lands in the issuer's inbox as a `TestamentDelta`. |
+| `challenge_peer` / `challenge_agent` | `post_action(kind=challenge, claim{subject=peer, validations=["defends or remediates the flagged behavior"]})`. `challenge_id ≡ claim_id`; the thread is the claim's testament lineage via `Relations`. |
+| `validate_work` / `process_validation` | `submit_testaments(...)` by the challenged peer plus `evaluate_validation(...)` by the challenger. The validation lifecycle is the thread; no separate state machine. |
+| `handoff_next` (turn-based) | Closing `submit_testaments` on the outgoing agent's claim set plus `post_action(kind=handoff, Relations=[handoff_from])` that seeds the successor's inbox. `HandoffManager` continues to drive the context-threshold trigger; semantic handoff flows through the board. |
+| `handoff_to_ot` (pipeline → global) | Already aligned: pipeline claims serialize onto the `MergeDescriptor`. The global inspector reads them as directed claims on its per-merge replica board. |
+| Guardian gate | Guardian evaluates `validation_kind=guardrail` on testaments an agent attempts to submit. Denial surfaces as a rejected claim with `evaluator=guardian` via a standard `ValidationDelta`. No separate approval envelope. |
+| Coordination `manage_claim` | Re-expressed directly as claims whose `ClaimScopeEntry` populates scope. Release = testament "scope work concluded". Review request = claim with `subject=reviewer`. |
+
+### 5.11 Correctness Invariants
+
+- **Event-driven intake.** Delta arrival triggers processing directly via `OnResolved`. No polling, no pull loop, no consumer goroutine. The bus subscription handler is the trigger. Processing runs under the agent's `GoroutineScope`.
+- **Expectation-driven matching.** Every delta the agent processes is either (a) the fulfillment of an explicit expectation registered at emission time or (b) a match against a standing subscription derived from the agent's identity. No stale, unrelated, or speculative deltas reach the agent.
+- **Graph entry point + agent-driven traversal.** Each resolved delta delivers one entry point — the immediate graph node the delta references (depth-1). The agent decides traversal depth via the `traverse` tool. No pre-assembled grab-bags; no runtime heuristics about what context the agent might need.
+- **One concern per dispatch.** Each `OnResolved` call delivers one causally coherent entry point. The agent processes a consultation answer, then a challenge, then a directed claim — never mixed. Serialization via `requestSerializer` when the agent requires single-entry processing.
+- **Deltas are authoritative.** Each delta fully describes its mutation; receivers act on the delta directly. The board is consulted only when the agent traverses deeper than the entry point (§5.8).
+- **Durable-before-transient.** `durableProtocolLog.Append` commits before the amplifier publishes the fabric activity or the bus delta. Crashes replay deterministically; subscriber cursors converge to live state via WAL read.
+- **Exactly-once per mutation.** `(DeltaKey, Sequence)` is the dedup key at the inbox seam. Re-emissions, reconnect replays, and WAL recoveries are idempotent.
+- **Bus is the transport.** The `ChannelBus` provides per-subscription bounded queues (4096 capacity) and async handler fan-out. No second buffer needed. Dropped messages degrade to WAL catch-up on next board read.
+- **Tracked goroutines only.** `OnResolved` dispatches into the agent's `GoroutineScope`. Amplifier emission, subscriber dispatch, inbox ingestion, accumulator flush — all tracked. No bare `go`.
+- **Errors as artifacts.** Guardian denials, test failures, tool timeouts, and LLM outages surface as `kind=error*` artifacts on the testament in flight. The issuer decides remediation; the board's audit trail is complete.
+- **OT / replica symmetry.** A per-merge audit replica's inbox is `ClaimsInbox` filtered by the replica's `agent_id`. Global review operates via the same primitives as pipeline execution — same intake, same emission, same traversal.
+
+---
+
+## 6. Two-Phase Execution Model (Pipeline Context)
 
 Within pipelines, the claims model operates in two phases. This is the pipeline-specific application of the universal claims model.
 
-### 5.1 Implementation Phase
+### 6.1 Implementation Phase
 
 All non-inspector pipeline agents work simultaneously against their assigned claims.
 
@@ -910,7 +1371,7 @@ All non-inspector pipeline agents work simultaneously against their assigned cla
 6. **Corrective claims instead of errors.** Out-of-order actions produce corrective claims, not errors.
 7. **Phase ends when all claims reach `testified`.** Every subject has submitted a testament.
 
-### 5.2 Validation Phase
+### 6.2 Validation Phase
 
 The Inspector (as issuer of the initial claims) validates each testament's artifacts against each claim's validations. The Tester may also validate test-type validations.
 
@@ -921,7 +1382,7 @@ The Inspector (as issuer of the initial claims) validates each testament's artif
 5. **New claims trigger re-entry to Implementation.** Only new claims need resolution.
 6. **Bounded by `MaxReviewRounds`.**
 
-### 5.3 Phase Transition Diagram
+### 6.3 Phase Transition Diagram
 
 ```
                     ┌───────────────────────────────────────────┐
@@ -957,7 +1418,7 @@ The Inspector (as issuer of the initial claims) validates each testament's artif
                     (bounded by MaxReviewRounds)
 ```
 
-### 5.4 Phase Transition Control
+### 6.4 Phase Transition Control
 
 | Transition | Trigger | Precondition |
 |---|---|---|
@@ -967,12 +1428,12 @@ The Inspector (as issuer of the initial claims) validates each testament's artif
 | Validation -> Complete | Orchestrator observes board state | All non-superseded claims `accepted` |
 | Any -> Failed | Orchestrator detects bound exceeded | `iteration >= MaxReviewRounds` with failing validations |
 
-### 5.5 Pipeline-to-Global Handoff
+### 6.5 Pipeline-to-Global Handoff
 
-When the pipeline board completes (all claims accepted), the pipeline inspector calls `handoff_to_green` which triggers the pipeline-to-global review chain. Per `PARALLEL_GLOBAL_VFS.md`, this is a three-stage trigger chain:
+When the pipeline board completes (all claims accepted), the pipeline inspector calls `handoff_to_ot` which triggers the pipeline-to-global review chain. Per `PARALLEL_GLOBAL_VFS.md`, this is a three-stage trigger chain:
 
 ```
-Stage 1: Pipeline Inspector → handoff_to_green
+Stage 1: Pipeline Inspector → handoff_to_ot
   → MergePipelineIntoGreen
       - Produces Copy_N at arrival_seq N
       - Serializes pipeline claims (with testaments + artifacts)
@@ -1016,7 +1477,7 @@ Stage 7: Commit queue advances → water line moves → next layer
 
 ---
 
-## 6. Comparison with Current System
+## 7. Comparison with Current System
 
 | Aspect | Current (Protocol State Machine) | New (Claims + Testaments) |
 |---|---|---|
@@ -1030,14 +1491,14 @@ Stage 7: Commit queue advances → water line moves → next layer
 | **Quality gates** | Inspector's `grade_task_quality` (holistic) | Per-claim, per-validation quality bar statements |
 | **Cross-agent communication** | Separate `challenge_peer`, `consult_peer` skills | Uniform via `post_action`: challenge and consultation are action types |
 | **Test execution** | Tester runs tests in sequential phase | Tester writes tests in Implementation, runs in Validation |
-| **Pipeline terminal** | Inspector's `handoff_to_green` -> MergePipelineIntoGreen | Board complete -> inspector calls `handoff_to_green` -> MergePipelineIntoGreen -> claims serialized onto MergeDescriptor -> bus handoff message -> global review chain |
+| **Pipeline terminal** | Inspector's `handoff_to_ot` -> MergePipelineIntoGreen | Board complete -> inspector calls `handoff_to_ot` -> MergePipelineIntoGreen -> claims serialized onto MergeDescriptor -> bus handoff message -> global review chain |
 | **Scope** | Pipeline agents only | Universal — works for any agent (scribe, academic, etc.) |
 
 ---
 
-## 7. Complete Pipeline Agent Skills Audit
+## 8. Complete Pipeline Agent Skills Audit
 
-### 7.1 Pipeline Inspector (post-refactor baseline -> claims conversion)
+### 8.1 Pipeline Inspector (post-refactor baseline -> claims conversion)
 
 **RETIRE (11 skills) — protocol handoff/challenge/consult machinery replaced by claims/actions:**
 
@@ -1047,7 +1508,7 @@ Stage 7: Commit queue advances → water line moves → next layer
 | `handoff_next` | Route to next agent in sequence | Eliminated — no sequential handoffs |
 | `validate_work` | Validate peer work and return findings | `evaluate_validation` — evaluate testament artifacts against validations |
 | `process_validation` | Process validation responses | Board tracks testament/validation results directly |
-| `finalize_pipeline` | Final accept/reject + tester handoff | Board completion; inspector calls `handoff_to_green` when board is complete |
+| `finalize_pipeline` | Final accept/reject + tester handoff | Board completion; inspector calls `handoff_to_ot` when board is complete |
 | `discard_pipeline` | Discard after quality decision | Board bounded-failure triggers rollback |
 | `discard_queued_artifacts` | Drop stale verification artifacts | Artifacts live on testaments, not a separate queue |
 | `query_pipeline_state` | Protocol projection query | `query_claims_board` |
@@ -1069,7 +1530,7 @@ Stage 7: Commit queue advances → water line moves → next layer
 
 | Skill | Change |
 |---|---|
-| `handoff_to_green` | Stays as the terminal pipeline skill. Gains: serializes pipeline claims (with testaments + artifacts) onto the MergeDescriptor. Gated by board phase = complete (inspector must accept all claims first). |
+| `handoff_to_ot` | Stays as the terminal pipeline skill. Gains: serializes pipeline claims (with testaments + artifacts) onto the MergeDescriptor. Gated by board phase = complete (inspector must accept all claims first). |
 | `define_criteria` | Generates claims (via `post_action`) rather than standalone criteria |
 | `validate_criteria` | Subsumed into `evaluate_validation` workflow |
 | `inspect_open_activity` | Surfaces claim/testament conflicts from Fabric |
@@ -1087,7 +1548,7 @@ Stage 7: Commit queue advances → water line moves → next layer
 - **Dependency**: `dependency(action=research|install)` (1)
 - **Diagnostics**: `self_diagnostic`, `reroute_request` (2)
 
-### 7.2 Pipeline Tester (51 skills currently -> 45 after)
+### 8.2 Pipeline Tester (51 skills currently -> 45 after)
 
 **RETIRE (9 skills):** Same 9 protocol + challenge/consult skills as Inspector minus inspector-only skills.
 
@@ -1097,7 +1558,7 @@ Stage 7: Commit queue advances → water line moves → next layer
 
 **KEEP UNCHANGED (39 skills):** Test authoring (8), VFS/workspace (13), Command (2), Coordination (7), Fabric awareness (4), Decision manifest (2), Other (3).
 
-### 7.3 Engineer (52 skills currently -> 49 after)
+### 8.3 Engineer (52 skills currently -> 49 after)
 
 **RETIRE (8 skills):** Protocol skills + challenge/consult.
 
@@ -1113,7 +1574,7 @@ Stage 7: Commit queue advances → water line moves → next layer
 
 **KEEP UNCHANGED (43 skills):** File I/O (17), Code analysis (3), Consultation (4), Coordination (7), Fabric awareness (4), Discovery (2), Decision manifest (2), Quality (2), Communication (1), Other (3).
 
-### 7.4 Designer (53 skills currently -> 50 after)
+### 8.4 Designer (53 skills currently -> 50 after)
 
 **RETIRE (8 skills):** Same as Engineer.
 
@@ -1121,7 +1582,7 @@ Stage 7: Commit queue advances → water line moves → next layer
 
 **KEEP UNCHANGED (44 skills):** File I/O (15), Component management (3), Design tokens/a11y (5), Coordination (7), Fabric awareness (4), Decision manifest (2), Communication (6), Other (2).
 
-### 7.5 Skills Summary
+### 8.5 Skills Summary
 
 | Agent | Before | Retire | Add | Phase-Gate | After |
 |---|---|---|---|---|---|
@@ -1137,9 +1598,9 @@ Stage 7: Commit queue advances → water line moves → next layer
 
 ---
 
-## 8. Fabric Integration
+## 9. Fabric Integration
 
-### 8.1 New ActionKinds
+### 9.1 New ActionKinds
 
 ```go
 // ─── Claims system kinds (sovereign amplifier) ─────────────────────
@@ -1158,7 +1619,7 @@ ActionBoardPhaseChanged      ActionKind = "board_phase_changed"      // phase tr
 ActionBoardComplete          ActionKind = "board_complete"           // pipeline terminal
 ```
 
-### 8.2 Resolution Mapping
+### 9.2 Resolution Mapping
 
 | ActionKind | Resolution | Rationale |
 |---|---|---|
@@ -1175,13 +1636,13 @@ ActionBoardComplete          ActionKind = "board_complete"           // pipeline
 | `board_phase_changed` | Medium | Lifecycle |
 | `board_complete` | Coarse | Pipeline terminal |
 
-### 8.3 Terminal and Paired Kinds
+### 9.3 Terminal and Paired Kinds
 
 Terminal: `ActionClaimAccepted`, `ActionClaimRejected`, `ActionBoardComplete`
 
 Paired: `ActionClaimIssued` -> `ActionClaimAccepted` (default), error -> `ActionClaimRejected`
 
-### 8.4 Ambient Context
+### 9.4 Ambient Context
 
 ```
 claims_board:
@@ -1205,7 +1666,7 @@ claims_board:
 
 ---
 
-## 9. End-to-End Example
+## 10. End-to-End Example
 
 ### Scenario: Add JWT authentication to an API service
 
@@ -1251,7 +1712,7 @@ Engineer receives remediation claim, refactors test, submits testament with arti
 
 **6. Pipeline Complete → Handoff:**
 
-Board reaches `complete` (all claims accepted). Pipeline inspector calls `handoff_to_green`:
+Board reaches `complete` (all claims accepted). Pipeline inspector calls `handoff_to_ot`:
 - `MergePipelineIntoGreen` merges the pipeline's VFS into green, producing Copy_N at arrival_seq N
 - Pipeline claims (with testaments and artifacts) serialized onto the MergeDescriptor
 - Bus handoff message published: "new work for seq N"
@@ -1270,9 +1731,9 @@ Global Inspector and Global Tester receive the bus handoff message and begin wat
 
 ---
 
-## 10. Changes by Component
+## 11. Changes by Component
 
-### 10.1 New Package: `core/pipeline/claims/`
+### 11.1 New Package: `core/pipeline/claims/`
 
 | File | Contents |
 |---|---|
@@ -1296,7 +1757,7 @@ const (
 )
 ```
 
-### 10.2 Architect: Claim Generation
+### 11.2 Architect: Claim Generation
 
 **Files:** `agents/architect/types.go`, `planner_anthropic.go`, `skills_planning.go`
 
@@ -1305,7 +1766,7 @@ const (
 - Extend LLM prompt to produce precise, atomic claims (not vague task descriptions)
 - Claims assembled by Architect, formally issued by Inspector
 
-### 10.3 Orchestrator: Claims Pipeline Controller
+### 11.3 Orchestrator: Claims Pipeline Controller
 
 **New file:** `agents/orchestrator/claims_pipeline.go`
 
@@ -1316,7 +1777,7 @@ const (
 - Handles remediation loop
 - Calls PipelineCommitter on completion/failure
 
-### 10.4 Agent Skills
+### 11.4 Agent Skills
 
 **New file:** `agents/shared/claims_skills.go`
 
@@ -1328,13 +1789,13 @@ const (
 - `post_remediation_claims` — reject + post replacements
 - `inspect_claim_conflicts` — overlapping claims, competing testaments
 
-### 10.5 Task Context Rendering
+### 11.5 Task Context Rendering
 
 **File:** `agents/shared/pipeline_task_context.go`
 
 Claims board section showing claims, testaments, artifacts, peer progress.
 
-### 10.6 Task State
+### 11.6 Task State
 
 **File:** `core/pipeline/taskstate/state.go`
 
@@ -1342,7 +1803,7 @@ Add `StatusImplementing` replacing `StatusDefiningCriteria` + `StatusCreatingTes
 
 ---
 
-## 11. Implementation Order
+## 12. Implementation Order
 
 | Step | Deliverable |
 |---|---|
@@ -1365,7 +1826,7 @@ Add `StatusImplementing` replacing `StatusDefiningCriteria` + `StatusCreatingTes
 
 ---
 
-## 12. Verification
+## 13. Verification
 
 | Test | What it verifies |
 |---|---|
@@ -1377,12 +1838,12 @@ Add `StatusImplementing` replacing `StatusDefiningCriteria` + `StatusCreatingTes
 | Unit: Projection | Counts, action/testament/artifact summaries, all five entity collections |
 | Unit: Immutability | Testament and Artifact cannot be mutated after creation; corrections produce new objects with supersedes Relation |
 | Unit: Testament model | Testament with multiple artifacts, artifact kind polymorphism, ContentHash integrity |
-| Integration: End-to-end pipeline | Architect claims -> board -> subjects work -> testaments -> validation -> complete -> handoff_to_green |
+| Integration: End-to-end pipeline | Architect claims -> board -> subjects work -> testaments -> validation -> complete -> handoff_to_ot |
 | Integration: Remediation | Validation fails -> remediation claims -> re-implement -> pass |
 | Integration: Bounded iteration | MaxReviewRounds exceeded -> rollback |
 | Integration: Consultation | Engineer posts consultation action -> Designer responds with testament |
 | Integration: Challenge | Inspector posts challenge action -> Engineer responds with testament |
-| Integration: Pipeline-to-global handoff | Board complete -> handoff_to_green -> MergeDescriptor with claims -> bus handoff message |
+| Integration: Pipeline-to-global handoff | Board complete -> handoff_to_ot -> MergeDescriptor with claims -> bus handoff message |
 | Integration: Global review chain | Bus message -> VFS Copy watch -> inspector audits -> accepts -> tester tests -> tester posts claims -> inspector validates -> disk commit |
 | Integration: Global inspector rejection | Inspector rejects -> tester does not run -> rejection to architect -> remediation DAG |
 | Integration: Global tester rejection | Inspector accepts -> tester rejects -> tester posts rejection claims -> architect remediates |
@@ -1394,11 +1855,11 @@ Add `StatusImplementing` replacing `StatusDefiningCriteria` + `StatusCreatingTes
 
 ---
 
-## 13. Full System Conversion Plan
+## 14. Full System Conversion Plan
 
 Every component, every agent, every interaction converted to claims-based execution. No exceptions.
 
-### 13.1 Conversion Tiers
+### 14.1 Conversion Tiers
 
 The conversion is structured in dependency order. Each tier builds on the prior tier. No tier is optional.
 
@@ -1419,7 +1880,7 @@ Tier 11: Boot and lifecycle conversion
 
 ---
 
-### 13.2 Tier 0: Core Claims Infrastructure
+### 14.2 Tier 0: Core Claims Infrastructure
 
 **What**: The foundational types, board, persistence, and amplifier. Everything else depends on this.
 
@@ -1437,7 +1898,7 @@ Tier 11: Boot and lifecycle conversion
 
 ---
 
-### 13.3 Tier 1: Fabric Integration
+### 14.3 Tier 1: Fabric Integration
 
 **What**: The Fabric learns to observe and surface claims, testaments, and artifacts.
 
@@ -1450,7 +1911,7 @@ Tier 11: Boot and lifecycle conversion
 
 ---
 
-### 13.4 Tier 2: Pipeline Agent Conversion
+### 14.4 Tier 2: Pipeline Agent Conversion
 
 **What**: The 4 pipeline agent types (Inspector, Tester, Engineer, Designer) convert from the protocol state machine to claims. This is the largest single tier.
 
@@ -1458,7 +1919,7 @@ Tier 11: Boot and lifecycle conversion
 
 | Change | File(s) | Description |
 |---|---|---|
-| Retire protocol skills | `agents/inspector/pipeline/pipeline.go` | Remove: `challenge_agent`, `handoff_next`, `validate_work`, `process_validation`, `finalize_pipeline`, `handoff_to_green`, `discard_pipeline`, `discard_queued_artifacts`, `query_pipeline_state`, `challenge_peer`, `consult_peer`, `inspect_open_conflicts` (12 skills) |
+| Retire protocol skills | `agents/inspector/pipeline/pipeline.go` | Remove: `challenge_agent`, `handoff_next`, `validate_work`, `process_validation`, `finalize_pipeline`, `handoff_to_ot`, `discard_pipeline`, `discard_queued_artifacts`, `query_pipeline_state`, `challenge_peer`, `consult_peer`, `inspect_open_conflicts` (12 skills) |
 | Add claims skills | `agents/inspector/pipeline/pipeline.go` | Register: `query_claims_board`, `post_action`, `evaluate_validation`, `post_remediation_claims`, `inspect_claim_conflicts` (5 skills) |
 | Issue claims on board creation | `agents/inspector/pipeline/pipeline.go` | When the board is populated from architect's assembly, the inspector is the formal issuer. Claims carry inspector's AgentID in the issuer Relation. |
 | Evaluate testaments | `agents/inspector/pipeline/pipeline.go` | During validation phase, inspector evaluates each testament's artifacts against each claim's validations. Uses `evaluate_validation` skill. |
@@ -1495,14 +1956,14 @@ Tier 11: Boot and lifecycle conversion
 | Change | File(s) | Description |
 |---|---|---|
 | Remove protocol state machine | `agents/shared/pipeline_protocol.go` | The entire `PipelineProtocolSnapshot`, `PipelineTurnAction`, `PipelineProtocolState`, reducer, mailbox obligations, terminal action guards — all replaced by the claims board. |
-| Remove durable protocol events | `agents/shared/pipeline_protocol_durable.go` | `handoff_selected`, `validation_submitted`, `validation_processed`, `ready_for_ot`, `handoff_to_green`, `tester_finalize`, `tester_artifact_consumed` — all replaced by claims WAL events. |
+| Remove durable protocol events | `agents/shared/pipeline_protocol_durable.go` | `handoff_selected`, `validation_submitted`, `validation_processed`, `ready_for_ot`, `handoff_to_ot`, `tester_finalize`, `tester_artifact_consumed` — all replaced by claims WAL events. |
 | Remove pipeline projection | `agents/shared/pipeline_projection.go` | Replaced by `ClaimsBoardProjection`. |
 | Remove pipeline expand | `agents/orchestrator/pipeline_expand.go` | Sub-node expansion (StageInspect/StageTest/StageExecute) replaced by claims dispatch. |
 | Remove pipeline runtime protocol path | `agents/orchestrator/pipeline_runtime.go` | `routeProtocolPipelineTask`, `pipelineProtocolEligible`, initial protocol snapshot — all replaced by claims dispatch. |
 
 ---
 
-### 13.5 Tier 3: Architect Conversion
+### 14.5 Tier 3: Architect Conversion
 
 **What**: The Architect stops generating vague task descriptions and produces precise, atomic claims with validations.
 
@@ -1516,7 +1977,7 @@ Tier 11: Boot and lifecycle conversion
 
 ---
 
-### 13.6 Tier 4: Guide Conversion
+### 14.6 Tier 4: Guide Conversion
 
 **What**: The Guide's intent classification and direct communication protocol are preserved and enhanced — they are sound routing infrastructure. What changes is that the Guide stops being a **context carrier** and the session gains a **claims board** as persistent conversational state. The Guide routes requests; the board carries context.
 
@@ -1542,7 +2003,7 @@ Tier 11: Boot and lifecycle conversion
 
 ---
 
-### 13.7 Tier 5: Knowledge Agent Conversion
+### 14.7 Tier 5: Knowledge Agent Conversion
 
 **What**: Librarian, Academic, and Archivalist become claims participants. Consultations are actions; responses are testaments.
 
@@ -1571,26 +2032,484 @@ Tier 11: Boot and lifecycle conversion
 
 ---
 
-### 13.8 Tier 6: Infrastructure Agent Conversion
+### 14.8 Tier 6: Infrastructure Agent Conversion
 
-#### 6a. Scribe
+#### 6a. Scribe — Narration as Testimony
+
+The scribe's core output — structured commentary about its parent agent's work — IS testimony. Each narration cycle is an archival action containing a testament with the commentary as an artifact. The scribe doesn't just *have* claims skills as optional tools; its entire pipeline flows *through* the claims board.
+
+**Narration-as-testament pipeline:**
+
+```
+Parent Agent Activity (Fabric)
+  → Scribe batch trigger
+  → LLM narrates
+  → store_archivalist skill (existing)
+  → ALSO: board.SubmitTestaments() with:
+      Testament:
+        summary: commentary.summary
+        confidence: "committed"
+        artifacts:
+          - kind: "narration", reference: full commentary JSON
+          - kind: "archivalist_receipt", reference: deterministic entry ID
+        relations:
+          - issuer: scribe-{parentAgentType}
+          - subject: {parentAgentType} (who the narration is ABOUT)
+          - caused_by: batch trigger activity ID
+```
+
+The archivalist publish (fire-and-forget bus message) remains for long-term storage. The testament submission adds the narration to the session's claims board so other agents can see it — the inspector can verify narration accuracy, the guide can reference it during conversation, cross-replica inheritance can query testaments instead of raw fabric activities.
+
+**Precedent detection as validation:**
+
+When the LLM flags a narration as precedent-worthy, this is a validation on the testament — not a separate fabric activity. The `precedent_worthy` flag and `precedent_why` become a validation with type `"precedent"` and status `passed`. The existing `ActionPrecedentEmitted` fabric activity is emitted by the board amplifier automatically when the validation is recorded.
+
+**Handoff as claims:**
+
+Agent handoff (context exhaustion, quality degradation, transport retry failure) is expressed as claims with validations:
+
+```
+Action (ActionTypeTask, agentID: "handoff_bridge")
+  Claim: "Handoff {agent} due to {trigger}"
+    scope: [{kind: "agent", key: old-agent-id}]
+    relations:
+      - issuer: handoff_bridge
+      - subject: old-agent-id
+    validations:
+      - type: "context_budget", required: true
+        description: "Context usage at {pct}%, zone: {zone}"
+        quality_bar: "Context must be below critical threshold"
+      - type: "quality_prediction", required: false
+        description: "GP predicts quality drop to {score} within {turns} turns"
+
+  Testament (old agent shutdown):
+    summary: "Extracted archivable state for handoff"
+    artifacts:
+      - kind: "archivable_state", reference: JSON(ArchivableState)
+      - kind: "prepared_context", reference: JSON(PreparedContext summary)
+
+  Testament (new agent ready):
+    summary: "Injected prepared context, resuming work"
+    artifacts:
+      - kind: "context_injection", reference: JSON({newAgentID, tokenCount, status})
+    validations:
+      - type: "integration", status: pending
+        description: "New agent produces comparable quality"
+        quality_bar: "First 3 turns must not regress quality metrics"
+```
+
+The handoff claim transitions: `pending` → `in_progress` (transfer executing) → `testified` (both testaments submitted) → `accepted` (quality validation passes) or `rejected` (quality validation fails → new handoff claim with `supersedes` relation).
 
 | Change | File(s) | Description |
 |---|---|---|
-| Summarization as claims | `agents/scribe/` | "Summarize architect's last context window" is a claim issued against the Scribe. Scribe responds with testament: "Submitted architect context summary at 2:01AM" with artifacts: archivalist receipt, document DB ingestion response, KG vector storage response. |
-| Per-agent narration as claims | `agents/scribe/` | The Scribe's continuous narration stream becomes a series of archival actions with claims against itself and the Archivalist. Each narration cycle produces testaments with ingestion artifacts. |
+| Narration as testament | `agents/scribe/skills.go` | `store_archivalist` handler also submits testament with narration artifact to session claims board. Archivalist publish remains for long-term storage. |
+| Precedent as validation | `agents/scribe/skills.go` | `precedent_worthy` flag becomes a validation on the narration testament. `ActionPrecedentEmitted` emitted via amplifier. |
+| Board preamble | `agents/scribe/tool_loop.go` | System prompt prepended with board state so LLM narrates with claims context. |
+| Claims skills | `agents/scribe/skills.go` | Full claims participant — query, post, submit, update, inspect. |
+| Handoff claims | `core/handoff/bridge.go`, `agents/shared/context_governor.go` | Handoff triggers post claims to session board. State extraction/injection produce testaments with artifacts. |
+| GoroutineScope | `agents/scribe/scribe.go` | All goroutines tracked via scope. Scope passed to board for async subscriber dispatch. |
 
-#### 6b. Guardian
+#### 6b. Guardian — Every Process as Claims
+
+Every guardian process — command approval, content scanning, git gating, health monitoring, plan approval, tool grants, diff review, checkpoints, reputation tracking, conversation response — is expressed as a uniform Action → Claim (with Relations, Scope, Validations) → Testament (with Artifacts, Relations, Confidence) exchange. No field omissions, no structural shortcuts.
+
+##### Command Approval (`command_execution_control`)
+
+```
+Action (type: task, agent_id: requesting_agent)
+  Claim:
+    title: "Approve execution of `go test ./...` in services/auth/"
+    description: "Engineer requests bash command execution"
+    scope: [{kind: "command", key: "bash:go test"}, {kind: "path", key: "services/auth/"}]
+    action_type: task
+    relations:
+      - related: requesting_agent, related_type: agent, relationship: issuer
+      - related: guardian, related_type: agent, relationship: subject
+    validations:
+      - type: inspection, required: true
+        description: "Command contains no destructive operations (rm -rf, drop, truncate)"
+        quality_bar: "Zero destructive patterns detected"
+      - type: inspection, required: true
+        description: "Command is scoped to authorized paths"
+        quality_bar: "All referenced paths within agent's declared scope"
+      - type: inspection, required: true
+        description: "Agent has permission for this operation class"
+        quality_bar: "Stored rule or user authorization grants access"
+
+  Testament (agent_id: guardian):
+    summary: "Approved `go test ./...` — safe, scoped, authorized"
+    confidence: committed
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+      - related: requesting_agent, related_type: agent, relationship: subject
+    artifacts:
+      - kind: "safety_assessment", reference: JSON(CommandAnalysis)
+      - kind: "scope_verification", reference: JSON(matched_rule or path_analysis)
+      - kind: "approval_grant", reference: JSON(commandapproval.Evaluation)
+```
+
+On denial: testament summary states denial reason, `kind:"error"` artifact carries the denial, guardian posts a corrective action with claims like "Modify command to exclude `/etc/`" or "Request user authorization for elevated access".
+
+##### Fetch Approval (`evaluateFetchApproval`)
+
+```
+Action (type: task, agent_id: requesting_agent)
+  Claim:
+    title: "Approve fetch of https://api.example.com/data"
+    description: "Agent requests external HTTP fetch"
+    scope: [{kind: "domain", key: "api.example.com"}, {kind: "url", key: "https://api.example.com/data"}]
+    action_type: task
+    relations:
+      - related: requesting_agent, related_type: agent, relationship: issuer
+      - related: guardian, related_type: agent, relationship: subject
+    validations:
+      - type: inspection, required: true
+        description: "Domain is known/trusted or user-authorized"
+        quality_bar: "DomainReputation.TrustLevel >= TrustKnown or stored allow rule"
+      - type: inspection, required: false
+        description: "Response content contains no credential leaks"
+        quality_bar: "Zero credential findings in response body"
+
+  Testament (agent_id: guardian):
+    summary: "Approved fetch of api.example.com — domain trusted (12 clean fetches)"
+    confidence: committed
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+      - related: requesting_agent, related_type: agent, relationship: subject
+    artifacts:
+      - kind: "domain_reputation", reference: JSON(DomainReputation)
+      - kind: "approval_grant", reference: JSON(commandapproval.Evaluation)
+      - kind: "matched_rule", reference: JSON(stored_rule) // if rule-based decision
+```
+
+##### Plan Approval (`plan_approval_gate`)
+
+```
+Action (type: task, agent_id: architect)
+  Claim:
+    title: "Accept plan: Implement JWT middleware"
+    description: "Architect requests user acceptance of implementation plan"
+    scope: [{kind: "plan", key: plan_id}]
+    action_type: task
+    relations:
+      - related: architect, related_type: agent, relationship: issuer
+      - related: guardian, related_type: agent, relationship: subject
+    validations:
+      - type: inspection, required: true
+        description: "User approves plan scope and approach"
+        quality_bar: "User clicks Approve in the TUI dialog"
+      - type: inspection, required: false
+        description: "Plan reflects current codebase state"
+        quality_bar: "Freshness summary shows no stale references"
+      - type: inspection, required: false
+        description: "No significant codebase drift since planning"
+        quality_bar: "Drift signals below threshold"
+
+  Testament (agent_id: guardian):
+    summary: "Plan approved by user"
+    confidence: committed
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+      - related: architect, related_type: agent, relationship: subject
+    artifacts:
+      - kind: "verdict", reference: "approve" | "reject" | "modify"
+      - kind: "user_reason", reference: reason text
+      - kind: "freshness_analysis", reference: JSON(freshness_summary)
+      - kind: "drift_analysis", reference: JSON(drift_signals)
+```
+
+##### Tool Execution Control (`tool_execution_control`)
+
+```
+Action (type: task, agent_id: requesting_agent)
+  Claim:
+    title: "Grant execution of `workspace_write` for engineer-1"
+    description: "Agent requests guardian-controlled tool execution grant"
+    scope: [{kind: "tool", key: "workspace_write"}, {kind: "agent", key: "engineer-1"}]
+    action_type: task
+    relations:
+      - related: requesting_agent, related_type: agent, relationship: issuer
+      - related: guardian, related_type: agent, relationship: subject
+    validations:
+      - type: inspection, required: true
+        description: "Tool execution mode is guardian-controlled"
+        quality_bar: "ToolPolicy.ExecutionMode == GuardianControlled"
+      - type: inspection, required: true
+        description: "Requester identity matches declared agent"
+        quality_bar: "SourceAgentID matches or aliases to request agent"
+      - type: inspection, required: true
+        description: "Tool is flagged approval-sensitive"
+        quality_bar: "ToolPolicy.ApprovalSensitive == true"
+
+  Testament (agent_id: guardian):
+    summary: "Granted `workspace_write` for engineer-1 (30s TTL)"
+    confidence: committed
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+      - related: requesting_agent, related_type: agent, relationship: subject
+    artifacts:
+      - kind: "execution_grant", reference: JSON(GuardianControlGrant)
+```
+
+##### Content Scanning (`content_scan`)
+
+```
+Action (type: task, agent_id: guardian)
+  Claim:
+    title: "Validate content contains no credentials or injection patterns"
+    description: "Scan agent output for security violations"
+    scope: [{kind: "content", key: correlation_id}]
+    action_type: task
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+      - related: guardian, related_type: agent, relationship: subject
+    validations:
+      - type: inspection, required: true
+        description: "No secrets, API keys, or tokens detected"
+        quality_bar: "SecretSanitizer returns zero credential findings"
+      - type: inspection, required: true
+        description: "No prompt injection or code injection patterns"
+        quality_bar: "InjectionScanner returns zero findings"
+
+  Testament (agent_id: guardian):
+    summary: "Content clean — 0 findings across 2 scans"
+    confidence: committed
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+    artifacts:
+      - kind: "credential_scan", reference: JSON([]Finding) // empty or populated
+      - kind: "injection_scan", reference: JSON([]Finding)
+```
+
+When findings exist: artifacts carry the findings, testament summary states the count and severity, and the guardian posts a corrective action against the producing agent.
+
+##### Git Mutation Gating (`GitObserver.GateCheck`)
+
+```
+Action (type: task, agent_id: guardian)
+  Claim:
+    title: "Gate push to protected branch `main`"
+    description: "Pre-mutation hook on protected branch"
+    scope: [{kind: "branch", key: "main"}, {kind: "operation", key: "push"}]
+    action_type: task
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+      - related: guardian, related_type: agent, relationship: subject
+    validations:
+      - type: inspection, required: true
+        description: "Branch matches protected pattern"
+        quality_bar: "Glob match against config.ProtectedBranches"
+      - type: inspection, required: true
+        description: "User explicitly authorizes protected branch mutation"
+        quality_bar: "User clicks Approve in approval dialog"
+
+  Testament (agent_id: guardian):
+    summary: "Push to main approved by user"
+    confidence: committed
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+    artifacts:
+      - kind: "branch_protection", reference: JSON(matched_patterns)
+      - kind: "user_authorization", reference: JSON(ApprovalResult)
+      - kind: "operation_context", reference: JSON(git_event_params)
+```
+
+##### Safety Checkpoints (`CheckpointManager`, periodic)
+
+```
+Action (type: archival, agent_id: guardian)
+  Claim:
+    title: "Create safety checkpoint — 12 dirty files exceed threshold of 10"
+    description: "Periodic dirty file threshold evaluation"
+    scope: [{kind: "git", key: "checkpoint"}]
+    action_type: archival
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+      - related: guardian, related_type: agent, relationship: subject
+    validations:
+      - type: inspection, required: true, status: passed
+        description: "Dirty file count exceeds safety threshold"
+        quality_bar: "getDirtyFileCount() >= config.DirtyThreshold"
+      - type: inspection, required: true
+        description: "User approves checkpoint creation"
+        quality_bar: "User clicks Approve in checkpoint dialog"
+
+  Testament (agent_id: guardian):
+    summary: "Safety checkpoint created at abc1234"
+    confidence: committed
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+    artifacts:
+      - kind: "checkpoint_record", reference: JSON(CheckpointRecord)
+      - kind: "dirty_file_count", reference: "12"
+      - kind: "user_authorization", reference: JSON(ApprovalResult)
+```
+
+##### Health Monitoring (`HealthMonitor`, periodic)
+
+```
+Action (type: archival, agent_id: guardian)
+  Claim:
+    title: "System health check — periodic evaluation"
+    description: "Detect unresponsive agents and budget violations"
+    scope: [{kind: "system", key: "health"}]
+    action_type: archival
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+      - related: guardian, related_type: agent, relationship: subject
+    validations:
+      - type: inspection, required: true
+        description: "All agents responsive within 3x heartbeat interval"
+        quality_bar: "Zero unresponsive agents detected"
+      - type: inspection, required: true
+        description: "Token/cost usage below 80% warning threshold"
+        quality_bar: "BudgetStatus.WarningExceeded == false"
+
+  Testament (agent_id: guardian):
+    summary: "1 anomaly: engineer-1 unresponsive for 90s"
+    confidence: committed
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+    artifacts:
+      - kind: "health_snapshot", reference: JSON([]AgentHealthSnapshot)
+      - kind: "budget_status", reference: JSON(BudgetStatus)
+      - kind: "anomaly", reference: "engineer-1 unresponsive for 90s" // one per anomaly
+```
+
+When health is clean: all validations pass, testament summary states "System healthy", no anomaly artifacts.
+
+##### Diff Review (`DiffGate`)
+
+```
+Action (type: task, agent_id: guardian)
+  Claim:
+    title: "Review staged diff for suspicious patterns"
+    description: "Pre-commit diff scan for hardcoded credentials, debug code"
+    scope: [{kind: "git", key: "staged_diff"}]
+    action_type: task
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+      - related: guardian, related_type: agent, relationship: subject
+    validations:
+      - type: inspection, required: true
+        description: "No hardcoded credentials in staged changes"
+        quality_bar: "Zero credential patterns in diff hunks"
+      - type: inspection, required: true
+        description: "No debug/test-only code in production paths"
+        quality_bar: "Zero suspicious pattern matches"
+
+  Testament (agent_id: guardian):
+    summary: "Staged diff clean — 0 findings in 4 files"
+    confidence: committed
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+    artifacts:
+      - kind: "diff_findings", reference: JSON([]DiffFinding)
+      - kind: "files_reviewed", reference: JSON(file_paths)
+```
+
+##### Rollback (`rollback` skill)
+
+```
+Action (type: corrective, agent_id: guardian)
+  Claim:
+    title: "Rollback to snapshot abc1234"
+    description: "Revert to prior safety checkpoint"
+    scope: [{kind: "git", key: "rollback"}, {kind: "snapshot", key: "abc1234"}]
+    action_type: corrective
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+      - related: guardian, related_type: agent, relationship: subject
+    validations:
+      - type: inspection, required: true
+        description: "User authorizes rollback"
+        quality_bar: "User clicks Approve in rollback dialog"
+
+  Testament (agent_id: guardian):
+    summary: "Rolled back to checkpoint abc1234"
+    confidence: committed
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+    artifacts:
+      - kind: "rollback_target", reference: "abc1234"
+      - kind: "user_authorization", reference: JSON(ApprovalResult)
+```
+
+##### Conversation Response
+
+```
+Action (type: testament, agent_id: guardian)
+  Testament:
+    summary: "Responded to user: system health report requested"
+    confidence: committed
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+      - related: user, related_type: agent, relationship: subject
+    artifacts:
+      - kind: "intent_classification", reference: "report"
+      - kind: "response_text", reference: response content
+      - kind: "tool_calls", reference: JSON([]{name, result_summary})
+      - kind: "usage", reference: JSON(StreamUsage)
+```
+
+##### Context Budget / Handoff
+
+```
+Action (type: task, agent_id: guardian)
+  Claim:
+    title: "Context budget critical — guardian at 96% usage"
+    description: "Context governor detected critical zone"
+    scope: [{kind: "agent", key: "guardian"}, {kind: "resource", key: "context_window"}]
+    action_type: task
+    relations:
+      - related: guardian, related_type: agent, relationship: issuer
+      - related: guardian, related_type: agent, relationship: subject
+    validations:
+      - type: inspection, required: true, status: failed
+        description: "Context usage below critical threshold (95%)"
+        quality_bar: "ContextGovernor.Zone < Critical"
+
+  Testament (old agent):
+    summary: "Extracted archivable state for handoff"
+    confidence: committed
+    artifacts:
+      - kind: "archivable_state", reference: JSON(ArchivableState)
+      - kind: "prepared_context", reference: JSON(PreparedContext summary)
+      - kind: "context_usage", reference: "96%"
+
+  Testament (new agent):
+    summary: "Injected prepared context, resuming work"
+    confidence: tentative
+    artifacts:
+      - kind: "context_injection", reference: JSON({newAgentID, tokenCount})
+    validations:
+      - type: integration, required: true, status: pending
+        description: "New agent produces comparable quality"
+        quality_bar: "First 3 turns must not regress quality metrics"
+```
 
 | Change | File(s) | Description |
 |---|---|---|
-| Command approval as claims | `agents/guardian/`, `core/commandapproval/` | An agent needing to execute a mutating command issues a claim against the Guardian: "Approve execution of `go test ./...` in services/auth/". Validation: "Command is safe, scoped, and authorized". Guardian evaluates, responds with testament: "Approved `go test` execution" with artifacts: approval receipt, scope verification, safety assessment. |
-| Content validation as claims | `agents/guardian/` | Guardian's content scanning becomes claims: "Validate output contains no credentials" with validations against the content. Testament contains scan results. |
-| Corrective claims on denial | `agents/guardian/` | Instead of returning an error on command denial, Guardian issues corrective claims: "Modify command to exclude sensitive paths", "Request user authorization for elevated access". |
+| Claims skills | `agents/guardian/skills.go` | Full claims participant replacing `CrossPipelineSkills`. Board resolved from `activeSessionID` per-request under `requestSerializer`. |
+| Board preamble | `agents/guardian/conversation.go` | User message prepended with board state. |
+| Tool manifest | `agents/guardian/skills_api.go` | Claims skills in manifest with correct execution modes (read-only: local, mutating: local_worker). |
+| Command approval as claims | `agents/guardian/skills_command_approval.go` | Evaluation flow posts action with claim, guardian responds with testament. Denial produces corrective action. |
+| Fetch approval as claims | `agents/guardian/skills_command_approval.go` | Fetch evaluation posts claim with domain reputation validation, responds with testament. |
+| Plan approval as claims | `agents/guardian/skills_plan_approval.go` | Plan posted as claim against guardian, user verdict is testament with artifacts. |
+| Tool grants as claims | `agents/guardian/skills_control.go` | Grant request is claim, grant response is testament with execution_grant artifact. |
+| Content scan as claims | `agents/guardian/content_validator.go` | Scan invocation is claim with inspection validations, results are testament with finding artifacts. |
+| Git gating as claims | `agents/guardian/git_observer.go` | Pre-mutation gate is claim with branch protection + user authorization validations. |
+| Checkpoints as claims | `agents/guardian/git_checkpoint.go` | Periodic threshold check is claim, checkpoint creation is testament. |
+| Health monitoring as claims | `agents/guardian/health_monitor.go` | Periodic health check is claim with responsiveness + budget validations, snapshot is testament. |
+| Diff review as claims | `agents/guardian/diff_gate.go` | Staged diff review is claim, findings are testament artifacts. |
+| Rollback as claims | `agents/guardian/skills.go` | Rollback request is corrective claim, execution is testament. |
+| Conversation as testament | `agents/guardian/conversation.go` | Every guardian response submits testament with intent, response, tool calls, usage artifacts. |
+| Context budget as claims | `agents/guardian/guardian.go`, `agents/shared/context_governor.go` | Budget zone transitions post claims, handoff produces testaments. |
+| GoroutineScope | `agents/guardian/guardian.go` | All subsystem goroutines (health monitor, checkpoint manager) tracked via scope. |
 
 ---
 
-### 13.9 Tier 7: Orchestrator Conversion
+### 14.9 Tier 7: Orchestrator Conversion
 
 **What**: The Orchestrator stops mediating agent interactions. It manages DAG execution by monitoring claims boards. It does not dispatch global reviews, carry conversation context, or track pending checkpoint reviews.
 
@@ -1605,7 +2524,7 @@ Tier 11: Boot and lifecycle conversion
 
 ---
 
-### 13.10 Tier 8: Sovereign System Retirement
+### 14.10 Tier 8: Sovereign System Retirement
 
 **What**: The three existing sovereign systems (Pipeline Protocol, Coordination Service, Decision Manifest) are subsumed by the claims board.
 
@@ -1642,7 +2561,7 @@ Tier 11: Boot and lifecycle conversion
 
 ---
 
-### 13.11 Tier 9: System Infrastructure Conversion
+### 14.11 Tier 9: System Infrastructure Conversion
 
 #### 9a. Handoff Protocol → Claims Board
 
@@ -1684,7 +2603,7 @@ Tier 11: Boot and lifecycle conversion
 
 ---
 
-### 13.12 Tier 10: TUI Conversion
+### 14.12 Tier 10: TUI Conversion
 
 **What**: The terminal UI renders claims, testaments, and artifacts instead of protocol state and task prompts.
 
@@ -1698,7 +2617,7 @@ Tier 11: Boot and lifecycle conversion
 
 ---
 
-### 13.13 Tier 11: Boot and Lifecycle Conversion
+### 14.13 Tier 11: Boot and Lifecycle Conversion
 
 | Change | File(s) | Description |
 |---|---|---|
@@ -1708,7 +2627,7 @@ Tier 11: Boot and lifecycle conversion
 
 ---
 
-### 13.14 Conversion Summary
+### 14.14 Conversion Summary
 
 | Tier | Components | Claims Board Scope | Replaces |
 |---|---|---|---|
@@ -1727,7 +2646,7 @@ Tier 11: Boot and lifecycle conversion
 
 ---
 
-### 13.15 Tier 12: Persistence and Reasoning Infrastructure
+### 14.15 Tier 12: Persistence and Reasoning Infrastructure
 
 These are the systems that store, index, retrieve, and reason over knowledge. Claims don't just flow through them — claims, testaments, and artifacts ARE the data they persist and reason over.
 
@@ -1792,7 +2711,7 @@ The Fabric itself is the observation/coordination substrate. With claims as the 
 
 ---
 
-### 13.16 Tier Summary (Updated)
+### 14.16 Tier Summary (Updated)
 
 | Tier | Components | Replaces |
 |---|---|---|
@@ -1802,7 +2721,7 @@ The Fabric itself is the observation/coordination substrate. With claims as the 
 | 3 | Architect | AcceptanceCriteria, SuccessCriteria, task prompts |
 | 4 | Guide | ConversationHistory, ForwardedRequest routing |
 | 5 | Librarian, Academic, Archivalist | `consult` skill, consultation cache |
-| 6 | Scribe, Guardian | Narration stream, command approval gates |
+| 6 | Scribe, Guardian, Handoff Bridge | Narration stream, command approval gates, handoff triggers |
 | 7 | Orchestrator | Pipeline dispatch, checkpoint review, health monitoring |
 | 8 | Protocol, Coordination, Decision Manifest | Three sovereign systems → one claims board |
 | 9 | Handoff, Session, VFS, Errors, Steering | Handoff state, conversation context, error returns |

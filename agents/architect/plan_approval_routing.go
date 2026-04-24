@@ -34,6 +34,8 @@ package architect
 import (
 	"context"
 	"fmt"
+
+	"github.com/adalundhe/sylk/core/claims"
 )
 
 // approvalRoutingAction is the discrete decision the routing step
@@ -137,6 +139,17 @@ func (a *Architect) routeApprovedPlanByOrchestratorState(ctx context.Context, pl
 		"status", status,
 		"action", string(decision.Action))
 
+	// Approval routing testament.
+	a.architectSubmitTestament(ctx, a.architectTestament(
+		fmt.Sprintf("Routing approved plan %s: %s (orch status: %s)", plan.ID, decision.Action, status),
+		"committed",
+		[]*claims.Artifact{
+			a.architectArtifact("orchestrator_status", status),
+			a.architectArtifact("routing_action", string(decision.Action)),
+			a.architectArtifact("notice", decision.Notice),
+		},
+	))
+
 	if decision.Notice != "" {
 		a.publishNotificationPush(decision.Notice)
 	}
@@ -164,12 +177,36 @@ func (a *Architect) resumeOrFallbackDispatch(ctx context.Context, plan *DesignPl
 	reason := fmt.Sprintf("user-approved resume after %s", priorStatus)
 	result, err := a.resumeOrchestrationViaOrchestrator(ctx, plan.ID, "auto", reason)
 	if err != nil {
+		a.architectSubmitTestament(ctx, a.architectTestament(
+			fmt.Sprintf("Resume failed for plan %s — falling back to dispatch", plan.ID),
+			"committed",
+			[]*claims.Artifact{
+				a.architectArtifact("prior_status", priorStatus),
+				a.architectArtifact("error", err.Error()),
+				a.architectArtifact("fell_back_to_dispatch", "true"),
+			},
+		))
 		architectDebugLog().Info("resumeOrFallbackDispatch: RESUME_FAILED_FALLBACK",
 			"plan_id", plan.ID,
 			"prior_status", priorStatus,
 			"error", err.Error())
 		return a.dispatchAfterApproval(ctx, plan)
 	}
+	// Resume testament.
+	resumeAction := "unknown"
+	if result != nil {
+		resumeAction = result.Action
+	}
+	a.architectSubmitTestament(ctx, a.architectTestamentWithSubject(
+		fmt.Sprintf("Resume result: %s for plan %s", resumeAction, plan.ID),
+		"committed", "orchestrator",
+		[]*claims.Artifact{
+			a.architectArtifact("prior_status", priorStatus),
+			a.architectArtifact("resume_action", resumeAction),
+			a.architectArtifact("fell_back_to_dispatch", "false"),
+		},
+	))
+
 	switch result.Action {
 	case "redispatched":
 		architectDebugLog().Info("resumeOrFallbackDispatch: REDISPATCHED",

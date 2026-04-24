@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/domain"
 	"github.com/adalundhe/sylk/core/knowledge/coldstart"
 	"github.com/adalundhe/sylk/core/knowledge/memory"
@@ -46,7 +47,11 @@ func knowledgeMemorySkill(a *Archivalist) *skills.Skill {
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, err
 			}
-			return a.dispatchKnowledgeMemory(ctx, &p)
+			result, err := a.dispatchKnowledgeMemory(ctx, &p)
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("knowledge_memory_"+p.Action, p.NodeID)
+			}
+			return result, err
 		}).
 		Build()
 }
@@ -230,16 +235,22 @@ func knowledgeQuerySkill(a *Archivalist) *skills.Skill {
 				return nil, err
 			}
 
+			var result any
+			var err error
 			switch p.Action {
 			case "search":
-				return a.knowledgeSearch(ctx, p.Text, p.Domain, p.Limit, p.Explore, p.ApplyMemory, p.FilterRetrieval)
+				result, err = a.knowledgeSearch(ctx, p.Text, p.Domain, p.Limit, p.Explore, p.ApplyMemory, p.FilterRetrieval)
 			case "search_feedback":
-				return a.knowledgeSearchFeedback(ctx, p.AgentType, p.ResultIDs, p.WasUseful)
+				result, err = a.knowledgeSearchFeedback(ctx, p.AgentType, p.ResultIDs, p.WasUseful)
 			case "readiness":
-				return a.knowledgeReadiness()
+				result, err = a.knowledgeReadiness()
 			default:
 				return nil, fmt.Errorf("unknown knowledge_query action: %s", p.Action)
 			}
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("knowledge_query_"+p.Action, truncateArchivalist(p.Text, 60))
+			}
+			return result, err
 		}).
 		Build()
 }

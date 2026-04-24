@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/planapproval"
 )
 
@@ -281,6 +282,20 @@ func (a *Architect) auditPlanFreshnessWithContext(ctx context.Context, plan *Des
 	}
 	audit.Summary = composeFreshnessSummary(audit, checked, age)
 	audit.Recommendation = pickFreshnessRecommendation(audit.Signals)
+
+	// Freshness audit testament.
+	a.architectSubmitTestament(ctx, a.architectTestament(
+		fmt.Sprintf("Plan %s freshness: %s", plan.ID, audit.Recommendation),
+		"committed",
+		[]*claims.Artifact{
+			a.architectArtifact("recommendation", string(audit.Recommendation)),
+			a.architectJSONArtifact("drift_signals", audit.Signals),
+			a.architectArtifact("orchestrator_state", audit.OrchestratorStateHint),
+			a.architectArtifact("files_checked", fmt.Sprintf("%d", checked)),
+			a.architectArtifact("fresh", fmt.Sprintf("%t", audit.Fresh)),
+		},
+	))
+
 	return audit
 }
 

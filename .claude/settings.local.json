@@ -131,7 +131,11 @@
       "Bash(ps -A -o pid,etime,stat,command)",
       "Bash(kill 1326 1693)",
       "Bash(ps -A -o pid,command)",
-      "Bash(head -50 /Users/adalundhe/Projects/sylk/core/events/*.go)"
+      "Bash(head -50 /Users/adalundhe/Projects/sylk/core/events/*.go)",
+      "Bash(cat)",
+      "Bash(chmod +x /tmp/check_agent.sh)",
+      "Bash([ -f \"/Users/adalundhe/Projects/sylk/agents/$agent/skills_api.go\" ])",
+      "Bash([ -f \"/Users/adalundhe/Projects/sylk/agents/$agent/tool_policy.go\" ])"
     ]
   }
 }

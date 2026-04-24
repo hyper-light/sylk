@@ -128,7 +128,7 @@ func TestRenderCard_KnowledgeReplicaSuffixPreservesWidth(t *testing.T) {
 
 	card := RenderCard(agent, width, th, false, false, "", AnimState{})
 	plain := stripANSI(card)
-	if !strings.Contains(plain, "Academic x3 q2") {
+	if !strings.Contains(plain, "Academic ⁺³") {
 		t.Fatalf("card = %q, want knowledge replica suffix", plain)
 	}
 	if got := displayWidth(card, false); got != width {
@@ -147,7 +147,7 @@ func TestRenderCard_GlobalPendingSuperscriptPreservesWidth(t *testing.T) {
 		Status:         StatusThinking,
 		TaskSummary:    "Cross-checking queued validation work against recent handoffs.",
 		ContextUsage:   0.06,
-		QueuedRequests: 4,
+		ActiveReplicas: 4,
 	}
 
 	card := RenderCard(agent, width, th, false, false, "", AnimState{})

@@ -13,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -138,6 +139,19 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	}) {
 		gi.skills.Register(skill)
 	}
+
+	// Claims skills: global inspector is a full claims participant —
+	// it audits merged work, posts validation actions, and inspects
+	// cross-pipeline claim conflicts.
+	boardProvider := func() *claims.ClaimsBoard { return gi.globalInspectorBoard() }
+	inboxProvider := func() *claims.ClaimsInbox { return gi.claimsInbox }
+	gi.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	gi.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
+	gi.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	gi.skills.Register(claims.EvaluateValidationSkill(boardProvider))
+	gi.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
+	gi.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+	gi.skills.Register(claims.TraverseSkill(boardProvider))
 
 	// Per-merge audit skills (docs/PARALLEL_GLOBAL_VFS.md §6.4):
 	// emit_audit_decision is the terminal tool the inspector calls

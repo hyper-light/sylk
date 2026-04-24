@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -53,6 +54,29 @@ func (a *ArchivalistBriefSource) RequestBrief(ctx context.Context, agentType str
 		req.SessionID = sessionID
 	}
 
+	// Issuing-side claim: brief requester posts consultation claim against archivalist.
+	if sessionID := versioning.SessionIDFromContext(ctx); sessionID != "" {
+		if board := claims.DefaultSessionBoardRegistry().Lookup(sessionID); board != nil {
+			if err := board.PostAction(ctx, claims.Action{AgentID: "brief-requester", Type: claims.ActionTypeConsultation}, []claims.Claim{{
+				Title:       "Request brief from archivalist for " + agentType,
+				Description: "Handoff briefing request to archivalist",
+				Scope:       []claims.ClaimScopeEntry{{Kind: "consultation", Key: "archivalist"}},
+				ActionType:  claims.ActionTypeConsultation,
+				Relations: []claims.Relation{
+					{Related: "brief-requester", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+					{Related: "archivalist", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+				},
+				Validations: []*claims.Validation{{
+					Type: claims.ValidationTypeReceipt, Required: false,
+					Description: "Archivalist returns context brief", QualityBar: "brief != nil",
+					Status: claims.ValidationStatusPending,
+				}},
+			}}); err != nil {
+				// Best-effort: brief request proceeds even if claim fails.
+				_ = err
+			}
+		}
+	}
 	msg, err := RequestGuideRouteSync(ctx, GuideRouteSyncRequest{
 		Bus:               a.bus,
 		ResponseTopic:     guide.TopicResponses("brief-requester", "brief-requester"),

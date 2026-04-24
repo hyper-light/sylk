@@ -53,7 +53,7 @@ type PipelineProjection struct {
 	ProcessedValidations []PipelineValidationProcessing `json:"processed_validations,omitempty"`
 	// RequiredAction, when non-empty, names the action this agent MUST
 	// call next before any other terminal skill is legal. Set by the
-	// protocol when a specific closure is forced (e.g., handoff_to_green
+	// protocol when a specific closure is forced (e.g., handoff_to_ot
 	// after finalize_pipeline ready_for_ot=true).
 	RequiredAction string `json:"required_action,omitempty"`
 	// RequiredActionReason explains why RequiredAction is mandatory so

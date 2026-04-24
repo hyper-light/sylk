@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/search/git"
 )
@@ -23,6 +24,7 @@ type GitObserver struct {
 	protectedBranches []string
 	activityPub       events.ActivityPublisher
 	requestApproval   ApprovalFunc
+	boardProvider     func() *claims.ClaimsBoard
 
 	unsubscribe func()
 	mu          sync.Mutex
@@ -36,6 +38,13 @@ func (o *GitObserver) SetOnEvent(fn OnEventFunc) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.onEvent = fn
+}
+
+// SetBoardProvider injects the claims board lookup for git gating claims.
+func (o *GitObserver) SetBoardProvider(bp func() *claims.ClaimsBoard) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.boardProvider = bp
 }
 
 type observerStats struct {
@@ -148,6 +157,9 @@ func (o *GitObserver) GateCheck(ctx context.Context, op git.GitOp, params any) e
 		Timestamp:    time.Now(),
 	}
 
+	// Post claim: gate mutation on protected branch.
+	o.postGitGatingClaim(ctx, op, branch)
+
 	approved, err := o.requestApproval(ctx, proposal)
 	o.mu.Lock()
 	onEvt := o.onEvent
@@ -161,6 +173,7 @@ func (o *GitObserver) GateCheck(ctx context.Context, op git.GitOp, params any) e
 				Verdict: "approval_failed", Reason: err.Error(),
 			})
 		}
+		o.submitGitGatingTestament(ctx, branch, op, "Approval request failed: "+err.Error(), "error", err.Error())
 		return fmt.Errorf("guardian: approval request failed: %w", err)
 	}
 	if !approved {
@@ -172,6 +185,7 @@ func (o *GitObserver) GateCheck(ctx context.Context, op git.GitOp, params any) e
 				Verdict: "denied", Reason: fmt.Sprintf("%s on %q", opName(op), branch),
 			})
 		}
+		o.submitGitGatingTestament(ctx, branch, op, "User denied mutation", "denial", fmt.Sprintf("%s on %q denied", opName(op), branch))
 		return fmt.Errorf("guardian: user denied mutation %s on protected branch %q", opName(op), branch)
 	}
 
@@ -183,6 +197,7 @@ func (o *GitObserver) GateCheck(ctx context.Context, op git.GitOp, params any) e
 			Verdict: "approved", Reason: fmt.Sprintf("%s on %q", opName(op), branch),
 		})
 	}
+	o.submitGitGatingTestament(ctx, branch, op, "Mutation approved by user", "user_authorization", fmt.Sprintf("%s on %q approved", opName(op), branch))
 	return nil
 }
 
@@ -261,4 +276,60 @@ func extractBranchFromParams(params any) string {
 
 func opName(op git.GitOp) string {
 	return strings.ReplaceAll(fmt.Sprintf("%d", op), " ", "_")
+}
+
+func (o *GitObserver) postGitGatingClaim(ctx context.Context, op git.GitOp, branch string) {
+	o.mu.Lock()
+	bp := o.boardProvider
+	o.mu.Unlock()
+	if bp == nil {
+		return
+	}
+	board := bp()
+	if board == nil {
+		return
+	}
+	claim := guardianClaim(
+		fmt.Sprintf("Gate %s on protected branch `%s`", opName(op), branch),
+		"Pre-mutation hook on protected branch",
+		"guardian",
+		[]claims.ClaimScopeEntry{
+			{Kind: "branch", Key: branch},
+			{Kind: "operation", Key: opName(op)},
+		},
+		claims.ActionTypeTask,
+		[]*claims.Validation{
+			guardianValidation(claims.ValidationTypeInspection, true, "Branch matches protected pattern", "Glob match against config.ProtectedBranches"),
+			guardianValidation(claims.ValidationTypeInspection, true, "User explicitly authorizes protected branch mutation", "User clicks Approve in approval dialog"),
+		},
+	)
+	action := guardianClaimAction(claims.ActionTypeTask)
+	if err := board.PostAction(ctx, action, []claims.Claim{claim}); err != nil {
+		board.RecordNotificationError("git gating claim: " + err.Error())
+	}
+}
+
+func (o *GitObserver) submitGitGatingTestament(ctx context.Context, branch string, op git.GitOp, summary, artifactKind, artifactRef string) {
+	o.mu.Lock()
+	bp := o.boardProvider
+	o.mu.Unlock()
+	if bp == nil {
+		return
+	}
+	board := bp()
+	if board == nil {
+		return
+	}
+	testament := guardianTestament(
+		"", summary, "committed", "",
+		[]*claims.Artifact{
+			guardianArtifact("", artifactKind, artifactRef),
+			guardianArtifact("", "branch", branch),
+			guardianArtifact("", "operation", opName(op)),
+		},
+	)
+	action := guardianTestamentAction()
+	if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
+		board.RecordNotificationError("git gating testament: " + err.Error())
+	}
 }

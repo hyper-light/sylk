@@ -269,6 +269,8 @@ type Guide struct {
 	streamReroutes   map[string]string
 
 	classifyGroup singleflight.Group
+
+	claimsInbox *claims.ClaimsInbox
 }
 
 type completedPendingRoute struct {
@@ -471,7 +473,8 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 	pendingCfg := resolvePendingConfig(cfg)
 	agentID := resolveAgentID(cfg)
 	cacheCfg := resolveRouteCacheConfig(cfg)
-	circuits := NewCircuitBreakerRegistry(DefaultCircuitBreakerConfig())
+	cbConfig := DefaultCircuitBreakerConfig()
+	circuits := NewCircuitBreakerRegistry(cbConfig)
 	dlq := NewDeadLetterQueue(DeadLetterQueueConfig{MaxSize: 10000})
 	pendingCleanup := NewPendingCleanup(PendingCleanupConfig{
 		CheckInterval:  1 * time.Second,
@@ -538,6 +541,7 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		return nil, err
 	}
 
+	guide.wireClaimsCallbacks()
 	return guide, nil
 }
 
@@ -597,7 +601,8 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 	pendingCfg := resolvePendingConfig(cfg)
 	agentID := resolveAgentID(cfg)
 	cacheCfg := resolveRouteCacheConfig(cfg)
-	circuits := NewCircuitBreakerRegistry(DefaultCircuitBreakerConfig())
+	cbConfig := DefaultCircuitBreakerConfig()
+	circuits := NewCircuitBreakerRegistry(cbConfig)
 	dlq := NewDeadLetterQueue(DeadLetterQueueConfig{MaxSize: 10000})
 	pendingCleanup := NewPendingCleanup(PendingCleanupConfig{
 		CheckInterval:  1 * time.Second,
@@ -665,6 +670,7 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 		return nil, err
 	}
 
+	guide.wireClaimsCallbacks()
 	return guide, nil
 }
 
@@ -896,6 +902,21 @@ func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedReq
 		DurNs:       time.Since(classStart).Nanoseconds(),
 		Model:       classification.ClassificationMethod,
 	})
+
+	// Classification testament: every routing decision is auditable.
+	g.guideSubmitTestamentAsync(request.SessionID, guideTestament(
+		request.SessionID,
+		"Classified: intent="+string(classification.Intent)+" target="+targetAgentID+" confidence="+formatConfidence(classification.Confidence),
+		"committed", targetAgentID,
+		[]*claims.Artifact{
+			guideArtifact(request.SessionID, "intent", string(classification.Intent)),
+			guideArtifact(request.SessionID, "domain", string(classification.Domain)),
+			guideArtifact(request.SessionID, "target_agent", targetAgentID),
+			guideArtifact(request.SessionID, "confidence", formatConfidence(classification.Confidence)),
+			guideArtifact(request.SessionID, "method", classification.ClassificationMethod),
+		},
+	))
+
 	g.applyPendingPlanMetadata(request.SessionID, classification)
 
 	corrID := g.resolveCorrelationID(request)
@@ -1004,6 +1025,9 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		} else {
 			g.observeRoutedConversationTarget(request, classification, targetAgentID)
 		}
+		if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+			acc.Record("conversation_routed", targetAgentID)
+		}
 		return classification, targetAgentID, nil
 	}
 
@@ -1018,6 +1042,9 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		guideFileLog().Info("DEBUG: finalize_start", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
 		classification, targetAgentID = g.finalizeClassification(ctx, request.Input, classification, targetAgentID)
 		g.persistLearnedClassification(request, classification)
+		if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+			acc.Record("route_cache_set", string(classification.TargetAgent))
+		}
 		classification, targetAgentID = g.applyExcludedTargetFallback(ctx, classification, targetAgentID)
 		guideFileLog().Info("DEBUG: finalize_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
 		classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
@@ -1032,9 +1059,16 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 			TargetAgent: targetAgentID,
 			Confidence:  classification.Confidence,
 		})
+		if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+			acc.Record("route_cache_hit", targetAgentID)
+			acc.Note("Classification from cache → " + targetAgentID)
+		}
 		classification = g.applyDomainHints(classification, domainCtx)
 		classification, targetAgentID = g.finalizeClassification(ctx, request.Input, classification, targetAgentID)
 		g.persistLearnedClassification(request, classification)
+		if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+			acc.Record("route_cache_set", string(classification.TargetAgent))
+		}
 		classification, targetAgentID = g.applyExcludedTargetFallback(ctx, classification, targetAgentID)
 		classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
 		return classification, targetAgentID, nil
@@ -1092,6 +1126,20 @@ func (g *Guide) tryConversationFastPath(ctx context.Context, request *RouteReque
 	// must not boost its own ACT-R activation — otherwise each hit refreshes
 	// UpdatedAt and increments Turns, creating a self-reinforcing loop that
 	// prevents the score from ever decaying below threshold.
+
+	// Follow-up claim: conversational continuity decision.
+	g.guidePostClaimAsync(request.SessionID,
+		claims.Action{AgentID: "guide", Type: claims.ActionTypeTask},
+		guideRouteClaim(
+			"Continue with "+activeAgentID+" — follow-up detected",
+			"Conversation fast-path: ACT-R activation above threshold",
+			activeAgentID, request.SessionID, request.CorrelationID,
+			[]*claims.Validation{
+				guidePassedValidation(claims.ValidationTypeInspection, true, "ACT-R activation score above threshold", "score > ACTRThreshold"),
+			},
+		),
+	)
+
 	return result, activeAgentID, true
 }
 
@@ -1602,6 +1650,18 @@ func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID str
 		guideFileLog().Info("DEBUG: guide_ensure_active_ok",
 			"target", targetAgentID,
 			"elapsed_ms", time.Since(activateStart).Milliseconds())
+
+		// Activation testament.
+		g.guideSubmitTestamentAsync(g.sessionID, guideTestament(
+			g.sessionID,
+			"Activated "+activationType+" pod for "+targetAgentID,
+			"committed", targetAgentID,
+			[]*claims.Artifact{
+				guideArtifact(g.sessionID, "pod_id", podID),
+				guideArtifact(g.sessionID, "agent_type", activationType),
+				guideArtifact(g.sessionID, "activation_ms", fmt.Sprintf("%d", time.Since(activateStart).Milliseconds())),
+			},
+		))
 	}
 	if g.agentRegistrar != nil {
 		g.agentRegistrar(podID, activationType)
@@ -2156,10 +2216,56 @@ func (g *Guide) dispatchPromptAction(board *claims.ClaimsBoard, request *RouteRe
 		classCopy = &c
 	}
 
-	if err := g.scope.Go("guide_post_prompt_action", 5*time.Second, func(_ context.Context) error {
-		return postUserPromptAction(board, &reqCopy, classCopy)
+	if g.scope == nil {
+		// No goroutine scope (test fixtures). Run synchronously.
+		if err := postUserPromptAction(board, &reqCopy, classCopy); err != nil {
+			recordPromptActionFailure(context.Background(), board, request.SessionID, err)
+		}
+		return
+	}
+	if err := g.scope.Go("guide_post_prompt_action", 5*time.Second, func(ctx context.Context) error {
+		if err := postUserPromptAction(board, &reqCopy, classCopy); err != nil {
+			recordPromptActionFailure(ctx, board, reqCopy.SessionID, err)
+			return err
+		}
+		return nil
 	}); err != nil {
-		slog.Error("guide_prompt_dispatch_failed", "session", request.SessionID, "error", err.Error())
+		recordPromptActionFailure(context.Background(), board, request.SessionID, err)
+	}
+}
+
+// recordPromptActionFailure submits a testament with an error artifact
+// when the guide fails to record a user prompt on the claims board.
+// Errors are artifacts, not log lines. ctx is the scope-provided
+// context in async paths — honors the goroutine's timeout.
+func recordPromptActionFailure(ctx context.Context, board *claims.ClaimsBoard, sessionID string, actionErr error) {
+	testament := claims.Testament{
+		AgentID:   "guide",
+		SessionID: sessionID,
+		Summary:   "Failed to record user prompt classification on claims board",
+		Artifacts: []*claims.Artifact{{
+			AgentID:   "guide",
+			SessionID: sessionID,
+			Kind:      "error",
+			Reference: actionErr.Error(),
+		}},
+		Relations: []claims.Relation{{
+			Related:      "guide",
+			RelatedType:  claims.RelatedTypeAgent,
+			Relationship: claims.RelationshipIssuer,
+		}},
+	}
+	action := claims.Action{
+		AgentID: "guide",
+		Type:    claims.ActionTypeTestament,
+	}
+	if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
+		// Board itself rejected the testament — last resort, log it.
+		slog.Error("guide_prompt_failure_testament_rejected",
+			"session", sessionID,
+			"original_error", actionErr.Error(),
+			"testament_error", err.Error(),
+		)
 	}
 }
 
@@ -2233,6 +2339,9 @@ func (g *Guide) attachEnrichment(
 		return
 	}
 	forwarded.Entities = mergeEnrichmentEntities(forwarded.Entities, payloads)
+	if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+		acc.Record("enrichment_attached", fmt.Sprintf("%d payloads", len(payloads)))
+	}
 }
 
 func mergeEnrichmentEntities(
@@ -2384,6 +2493,18 @@ func (g *Guide) RecordCorrection(input string, wrong, correct *RouteResult, reas
 	}
 	g.router.AddCorrection(correction)
 	g.persistCorrectionToArchivalist(correction)
+
+	// Correction testament: routing model changed by user.
+	g.guideSubmitTestamentAsync(g.sessionID, guideTestament(
+		g.sessionID,
+		"Correction: "+string(wrong.TargetAgent)+" → "+string(correct.TargetAgent),
+		"committed", string(correct.TargetAgent),
+		[]*claims.Artifact{
+			guideArtifact(g.sessionID, "wrong_target", string(wrong.TargetAgent)),
+			guideArtifact(g.sessionID, "correct_target", string(correct.TargetAgent)),
+			guideArtifact(g.sessionID, "reason", reason),
+		},
+	))
 }
 
 func (g *Guide) persistCorrectionToArchivalist(correction CorrectionRecord) {
@@ -2661,6 +2782,17 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 		Action:    "registered",
 	})
 
+	// Registration testament.
+	g.guideSubmitTestamentAsync(g.sessionID, guideTestament(
+		g.sessionID, "Agent registered: "+info.Type+" ("+info.ID+")",
+		"committed", info.ID,
+		[]*claims.Artifact{
+			guideArtifact(g.sessionID, "agent_id", info.ID),
+			guideArtifact(g.sessionID, "agent_type", info.Type),
+			guideArtifact(g.sessionID, "action", "registered"),
+		},
+	))
+
 	return nil
 }
 
@@ -2769,6 +2901,17 @@ func (g *Guide) Unregister(id string) {
 			)
 		}
 	}
+
+	// Unregistration testament.
+	g.guideSubmitTestamentAsync(g.sessionID, guideTestament(
+		g.sessionID, "Agent unregistered: "+agentName+" ("+id+")",
+		"committed", id,
+		[]*claims.Artifact{
+			guideArtifact(g.sessionID, "agent_id", id),
+			guideArtifact(g.sessionID, "agent_name", agentName),
+			guideArtifact(g.sessionID, "action", "unregistered"),
+		},
+	))
 }
 
 // RegisterAgent registers an agent with just its capabilities (legacy).
@@ -2879,6 +3022,37 @@ func (g *Guide) Start(ctx context.Context) error {
 		}
 	}
 
+	// Claims intake: event-driven delta processing.
+	if inbox, inboxErr := claims.NewClaimsInbox(claims.InboxConfig{
+		AgentID:    g.agentID,
+		SessionID:  g.sessionID,
+		Subscriber: &guideDeltaSubscriber{bus: g.bus},
+		Board:      guideBoard(g.sessionID),
+		OnResolved: func(entry *claims.GraphEntryPoint) {
+			if entry == nil {
+				return
+			}
+			if g.scope != nil {
+				if err := g.scope.Go("process_claim", 0, func(ctx context.Context) error {
+					return g.processClaimsEntry(ctx, entry)
+				}); err != nil {
+					slog.Error("guide_claims_intake_dispatch_failed", "error", err.Error())
+				}
+				return
+			}
+			if err := g.processClaimsEntry(context.Background(), entry); err != nil {
+				slog.Error("guide_claims_intake_process_failed", "error", err.Error())
+			}
+		},
+	}); inboxErr != nil {
+		slog.Warn("guide_claims_inbox_create_failed", "error", inboxErr.Error())
+	} else if inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("guide_claims_inbox_start_failed", "error", err.Error())
+		}
+		g.claimsInbox = inbox
+	}
+
 	g.running = true
 	if err := g.subscribeRegisteredAgentChannels(); err != nil {
 		_ = g.requestSub.Unsubscribe()
@@ -2945,6 +3119,11 @@ func (g *Guide) unsubscribeAgentSubsBatch(subs []*agentSubscriptions) {
 func (g *Guide) Stop() error {
 	if !g.running {
 		return nil
+	}
+
+	if g.claimsInbox != nil {
+		_ = g.claimsInbox.Close()
+		g.claimsInbox = nil
 	}
 
 	err := g.stopComponents()
@@ -3160,6 +3339,14 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 
 	reqCtx = g.withIdentityDispatch(reqCtx, correlationID)
 
+	// Request-scoped testament accumulator for high-frequency observations
+	// (conversation flow, route cache, streams, enrichment).
+	acc := claims.NewTestamentAccumulator("guide", req.SessionID)
+	reqCtx = claims.WithTestamentAccumulator(reqCtx, acc)
+	defer func() {
+		acc.Flush(reqCtx, guideBoard(req.SessionID), g.guideScope())
+	}()
+
 	reqCtx = providers.WithRetryObserver(reqCtx, func(event providers.RetryEvent) {
 		g.publishRetryStatus(correlationID, req.SourceAgentID, RetryStatus{
 			Attempt:     event.Attempt,
@@ -3263,6 +3450,20 @@ func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
 		TargetAgent: reroute.SuggestedTarget,
 		InputLen:    len(reroute.OriginalInput),
 	})
+
+	// Corrective claim: reroute supersedes original route.
+	newTarget := reroute.SuggestedTarget
+	if newTarget == "" {
+		newTarget = "unresolved"
+	}
+	g.guidePostClaimAsync(reroute.SessionID,
+		claims.Action{AgentID: "guide", Type: claims.ActionTypeCorrective},
+		guideCorrectiveClaim(
+			"Reroute from "+reroute.SourceAgentID+" to "+newTarget,
+			"Agent declined: "+reroute.Reason,
+			newTarget, reroute.SessionID, msg.CorrelationID,
+		),
+	)
 
 	// Break conversation stickiness so the fast-path won't fire.
 	if g.conversation != nil && reroute.SessionID != "" {
@@ -3458,13 +3659,27 @@ func (g *Guide) evaluateRouterHook(targetAgentID string, fwd *ForwardedRequest) 
 		return nil, false
 	}
 	// Emit the escalation event so operators can see what the hook flagged.
+	reason := routerHookReason(decision)
 	g.publishUserEscalation(UserEscalationPayload{
 		SessionID:     g.sessionID,
 		SourceAgentID: fwd.SourceAgentID,
 		OriginalInput: fwd.Input,
-		Reason:        routerHookReason(decision),
+		Reason:        reason,
 	})
-	return fmt.Errorf("router hook denied dispatch to %q: %s", targetAgentID, routerHookReason(decision)), true
+
+	// Router hook denial testament.
+	g.guideSubmitTestamentAsync(g.sessionID, guideTestament(
+		g.sessionID,
+		"Router hook denied dispatch to "+targetAgentID,
+		"committed", targetAgentID,
+		[]*claims.Artifact{
+			guideArtifact(g.sessionID, "target_agent", targetAgentID),
+			guideArtifact(g.sessionID, "denial_reason", reason),
+			guideArtifact(g.sessionID, "source_agent", fwd.SourceAgentID),
+		},
+	))
+
+	return fmt.Errorf("router hook denied dispatch to %q: %s", targetAgentID, reason), true
 }
 
 func routerHookReason(d escalation.RouterHookDecision) string {
@@ -3634,6 +3849,21 @@ func (g *Guide) respondToGuideRequest(ctx context.Context, pending *PendingReque
 		resp.Data = reply
 		g.publishGuideStreamComplete(pending.CorrelationID, pending.SourceAgentID, usage)
 	}
+
+	// Self-response testament.
+	selfArtifacts := []*claims.Artifact{
+		guideArtifact(req.SessionID, "response_text", truncateForGuide(fmt.Sprintf("%v", resp.Data), 500)),
+	}
+	if err != nil {
+		selfArtifacts = append(selfArtifacts, guideArtifact(req.SessionID, "error", err.Error()))
+	}
+	if usage != nil {
+		selfArtifacts = append(selfArtifacts, guideJSONArtifact(req.SessionID, "usage", usage))
+	}
+	g.guideSubmitTestamentAsync(req.SessionID, guideTestament(
+		req.SessionID, "Guide responded directly to user", "committed", "user", selfArtifacts,
+	))
+
 	resolved, handleErr := g.HandleResponse(ctx, resp)
 	if handleErr != nil {
 		return nil
@@ -3864,6 +4094,18 @@ func (g *Guide) SwapModel(_ context.Context, modelID string, provider providers.
 	if g.sessionRouter != nil {
 		g.sessionRouter.ClearClassificationCaches()
 	}
+
+	// Model swap testament.
+	g.guideSubmitTestamentAsync(g.sessionID, guideTestament(
+		g.sessionID,
+		"Model swapped to "+modelID,
+		"committed", "",
+		[]*claims.Artifact{
+			guideArtifact(g.sessionID, "new_model", modelID),
+			guideArtifact(g.sessionID, "caches_cleared", "true"),
+			guideArtifact(g.sessionID, "stickiness_cleared", "true"),
+		},
+	))
 
 	return nil
 }
@@ -4251,6 +4493,14 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 	}
 
 	ctx := g.processingContext()
+
+	// Response-lifecycle accumulator: collects stream and conversation
+	// observations during response relay. Flushed as ONE testament.
+	responseAcc := claims.NewTestamentAccumulator("guide", g.sessionID)
+	ctx = claims.WithTestamentAccumulator(ctx, responseAcc)
+	defer func() {
+		responseAcc.Flush(ctx, guideBoard(g.sessionID), g.guideScope())
+	}()
 	if err := ctx.Err(); err != nil {
 		DebugFileLog().Warn("handleResponseMessage: PROCESSING_CTX_CANCELLED",
 			"msg_type", string(msg.Type),
@@ -4298,9 +4548,25 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 			return nil
 		}
 		g.observeConversationResponse(pending, resp)
+		if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+			acc.Record("conversation_response_observed", resp.RespondingAgentID)
+		}
 		if resp.RespondingAgentName == "" {
 			resp.RespondingAgentName = g.resolveAgentDisplayName(resp.RespondingAgentID)
 		}
+
+		// Response relay testament: agent responded, guide relaying.
+		sessionID := g.resolveSessionID(pending)
+		g.guideSubmitTestamentAsync(sessionID, guideTestament(
+			sessionID,
+			"Response relayed from "+resp.RespondingAgentID,
+			"committed", resp.RespondingAgentID,
+			[]*claims.Artifact{
+				guideArtifact(sessionID, "responding_agent", resp.RespondingAgentID),
+				guideArtifact(sessionID, "correlation_id", resp.CorrelationID),
+				guideArtifact(sessionID, "success", fmt.Sprintf("%t", resp.Success)),
+			},
+		))
 
 		return g.publishResponseToSource(pending.SourceAgentID, resp, pending)
 	case MessageTypeStream:
@@ -4332,6 +4598,9 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 		}
 		if pending != nil {
 			g.ensureTrackedStream(streamResp.CorrelationID, g.resolveSessionID(pending))
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("stream_tracked", streamResp.CorrelationID)
+			}
 		}
 
 		g.recordIncomingStreamEvent(streamResp)
@@ -4350,6 +4619,9 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 				publishErr := g.publishStreamToSource(fallbackTarget, streamResp)
 				if streamResp.Event != nil && streamResp.Event.Type == StreamEventComplete && g.streams != nil {
 					g.streams.CloseStream(streamResp.CorrelationID)
+					if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+						acc.Record("stream_closed", streamResp.CorrelationID)
+					}
 				}
 				return publishErr
 			}
@@ -4374,6 +4646,9 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 			g.forgetCompletedPending(streamResp.CorrelationID)
 			if g.streams != nil {
 				g.streams.CloseStream(streamResp.CorrelationID)
+				if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+					acc.Record("stream_closed", streamResp.CorrelationID)
+				}
 			}
 		}
 		return errors.Join(publishErr, mirrorErr)
@@ -4395,6 +4670,18 @@ func (g *Guide) handleAgentPush(streamResp *StreamResponse, msg *Message) error 
 		"agent_id", push.AgentID,
 		"push_type", string(push.PushType),
 		"source_agent", msg.SourceAgentID)
+
+	// Agent push testament.
+	g.guideSubmitTestamentAsync(g.sessionID, guideTestament(
+		g.sessionID,
+		"Agent push received: "+string(push.PushType)+" from "+push.AgentID,
+		"committed", push.AgentID,
+		[]*claims.Artifact{
+			guideArtifact(g.sessionID, "push_type", string(push.PushType)),
+			guideArtifact(g.sessionID, "agent_id", push.AgentID),
+			guideArtifact(g.sessionID, "push_id", push.PushID),
+		},
+	))
 
 	switch push.PushType {
 	case PushTypeStream:
@@ -4640,6 +4927,28 @@ func (g *Guide) handleSessionInterrupt(req *UserInterruptRequest) {
 	}
 
 	pendings := g.pending.GetBySession(sessionID)
+
+	// Corrective claim: user interrupt cancels all pending work.
+	cancelledIDs := make([]string, 0, len(pendings))
+	for _, snapshot := range pendings {
+		if snapshot != nil && strings.TrimSpace(snapshot.CorrelationID) != "" {
+			cancelledIDs = append(cancelledIDs, snapshot.CorrelationID)
+		}
+	}
+	g.guidePostClaimAsync(sessionID,
+		claims.Action{AgentID: "guide", Type: claims.ActionTypeCorrective},
+		guideCorrectiveClaim(
+			fmt.Sprintf("User interrupt — cancel %d pending requests", len(cancelledIDs)),
+			"User interrupted session, all pending work cancelled",
+			"guide", sessionID, "",
+		),
+	)
+	g.guideSubmitTestamentAsync(sessionID, guideTestament(
+		sessionID, fmt.Sprintf("Cancelled %d pending requests for session interrupt", len(cancelledIDs)),
+		"committed", "",
+		[]*claims.Artifact{guideJSONArtifact(sessionID, "cancelled_correlations", cancelledIDs)},
+	))
+
 	for _, snapshot := range pendings {
 		if snapshot == nil {
 			continue
@@ -4799,6 +5108,19 @@ func (g *Guide) handleErrorMessage(msg *Message) error {
 		return nil
 	}
 
+	// Error relay testament.
+	sessionID := g.resolveSessionID(pending)
+	g.guideSubmitTestamentAsync(sessionID, guideTestament(
+		sessionID,
+		"Error relayed from "+msg.SourceAgentID+": "+truncateForGuide(errStr, 100),
+		"committed", msg.SourceAgentID,
+		[]*claims.Artifact{
+			guideArtifact(sessionID, "error", errStr),
+			guideArtifact(sessionID, "source_agent", msg.SourceAgentID),
+			guideArtifact(sessionID, "correlation_id", msg.CorrelationID),
+		},
+	))
+
 	return g.publishErrorToSource(pending.SourceAgentID, msg.CorrelationID, msg.SourceAgentID, errStr, pending)
 }
 
@@ -4920,6 +5242,19 @@ func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *Forward
 		InputLen:    len(forwarded.Input),
 		Intent:      string(forwarded.Intent),
 	})
+
+	// Route claim: "this request should go to {agent}."
+	g.guidePostClaimAsync(forwarded.SessionID,
+		claims.Action{AgentID: "guide", Type: claims.ActionTypeTask},
+		guideRouteClaim(
+			"Route to "+resolvedTarget,
+			"Forward request: intent="+string(forwarded.Intent)+" domain="+string(forwarded.Domain),
+			resolvedTarget, forwarded.SessionID, forwarded.CorrelationID,
+			[]*claims.Validation{
+				guideValidation(claims.ValidationTypeReceipt, true, "Target agent processes request", "RouteResponse.Success == true"),
+			},
+		),
+	)
 
 	fwdMsg := g.forwardMessage(resolvedTarget, forwarded, replyTo)
 	return g.bus.Publish(g.agentRequestTopic(resolvedTarget), fwdMsg)

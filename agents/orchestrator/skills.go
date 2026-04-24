@@ -14,6 +14,7 @@ import (
 	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -116,6 +117,19 @@ func (o *Orchestrator) registerFabricSkills() {
 	}) {
 		o.skills.Register(skill)
 	}
+
+	// Claims skills: orchestrator is a full claims participant — it
+	// coordinates pipeline execution, observes board state, and posts
+	// actions about execution lifecycle events.
+	boardProvider := func() *claims.ClaimsBoard { return o.orchestratorBoard() }
+	inboxProvider := func() *claims.ClaimsInbox { return o.claimsInbox }
+	o.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	o.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
+	o.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	o.skills.Register(claims.EvaluateValidationSkill(boardProvider))
+	o.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
+	o.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+	o.skills.Register(claims.TraverseSkill(boardProvider))
 }
 
 // orchestratorPinnedSkillNames returns the minimal set of skills always loaded

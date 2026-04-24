@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/adalundhe/sylk/core/claims"
 )
 
 // =============================================================================
@@ -147,6 +149,18 @@ func (sr *SessionRouter) RemoveSession(sessionID string) {
 	delete(sr.sessionCaches, sessionID)
 	delete(sr.sessionPrefs, sessionID)
 	sr.stats.ActiveSessions--
+
+	// Session removal testament.
+	if sr.guide != nil {
+		sr.guide.guideSubmitTestamentAsync(sessionID, guideTestament(
+			sessionID, "Session removed: "+sessionID,
+			"committed", "",
+			[]*claims.Artifact{
+				guideArtifact(sessionID, "session_id", sessionID),
+				guideArtifact(sessionID, "action", "removed"),
+			},
+		))
+	}
 }
 
 // ClearClassificationCaches removes all per-session classification caches

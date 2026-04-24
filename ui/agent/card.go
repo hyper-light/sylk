@@ -113,14 +113,7 @@ func agentDisplayName(agent AgentState) string {
 	if name == "" {
 		name = strings.TrimSpace(agent.AgentType)
 	}
-	if suffix := knowledgeReplicaSuffix(agent); suffix != "" {
-		if name == "" {
-			name = suffix
-		} else {
-			name += " " + suffix
-		}
-	}
-	if suffix := globalPendingSuperscriptSuffix(agent); suffix != "" {
+	if suffix := replicaSuperscriptSuffix(agent); suffix != "" {
 		if name == "" {
 			name = suffix
 		} else {
@@ -130,30 +123,27 @@ func agentDisplayName(agent AgentState) string {
 	return name
 }
 
-func knowledgeReplicaSuffix(agent AgentState) string {
-	if agent.Category != "knowledge" {
+// replicaSuperscriptSuffix returns a "⁺N" suffix when the agent has
+// more than one active replica. Applies to knowledge agents (librarian,
+// academic, archivalist) and global inspector/tester.
+func replicaSuperscriptSuffix(agent AgentState) string {
+	if agent.ActiveReplicas <= 1 {
 		return ""
 	}
-	parts := make([]string, 0, 2)
-	if agent.ActiveReplicas > 1 {
-		parts = append(parts, fmt.Sprintf("x%d", agent.ActiveReplicas))
-	}
-	if agent.QueuedRequests > 0 {
-		parts = append(parts, fmt.Sprintf("q%d", agent.QueuedRequests))
-	}
-	return strings.Join(parts, " ")
-}
-
-func globalPendingSuperscriptSuffix(agent AgentState) string {
-	if agent.QueuedRequests <= 0 || strings.TrimSpace(agent.PipelineID) != "" {
-		return ""
-	}
-	switch strings.TrimSpace(agent.AgentType) {
-	case "inspector", "tester":
-		return "⁺" + superscriptNumber(agent.QueuedRequests)
+	switch {
+	case agent.Category == "knowledge":
+		// Librarian, Academic, Archivalist.
+	case strings.TrimSpace(agent.PipelineID) == "":
+		switch strings.TrimSpace(agent.AgentType) {
+		case "inspector", "tester":
+			// Global inspector/tester (not pipeline-scoped).
+		default:
+			return ""
+		}
 	default:
 		return ""
 	}
+	return "⁺" + superscriptNumber(agent.ActiveReplicas)
 }
 
 func superscriptNumber(value int) string {

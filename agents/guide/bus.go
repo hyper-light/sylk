@@ -455,6 +455,12 @@ const (
 	// state mutates. Carried on TopicProtocolProjection for UI /
 	// telemetry consumption.
 	MessageTypeProtocolProjection MessageType = "protocol_projection"
+
+	// MessageTypeClaimsDelta wraps a claims.Delta published by a
+	// ClaimsBoardAmplifier. Carries the full, authoritative
+	// description of a board mutation — receivers act on the delta
+	// directly without consulting the board. See docs/CLAIMS_BUS.md.
+	MessageTypeClaimsDelta MessageType = "claims_delta"
 )
 
 // =============================================================================

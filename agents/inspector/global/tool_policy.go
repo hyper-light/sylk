@@ -47,6 +47,10 @@ func globalInspectorVisibleSkillNames() []string {
 		"ask_user_clarification",
 		// Phase 2.K / GT-4 + GI-5: collapsed into dependency(action=…).
 		"dependency",
+		// Claims skills: read-only board introspection is Local (visible).
+		"query_claims_board",
+		"inspect_claim_conflicts",
+		"traverse",
 	}, "inspector")
 	// Global inspector audits at session level — gets the full
 	// fabric awareness + audit skill bundle.
@@ -78,6 +82,11 @@ func globalInspectorMutatingSkillNames() []string {
 		// publish_work_event(kind=artifact, artifact_kind=audit_finding).
 		"ask_user_clarification",
 		"reroute_request",
+		// Claims skills: mutating operations need LocalWorker policy.
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 	})
 }
 

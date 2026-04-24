@@ -16,7 +16,7 @@ import (
 // description. Per-delegate constraints that live on Requirement /
 // Satisfies / Avoid / BestPractice strings must propagate into the
 // façade's description text — otherwise load-bearing post-conditions
-// ("after action=finalize returns ready_for_ot, call handoff_to_green
+// ("after action=finalize returns ready_for_ot, call handoff_to_ot
 // next") become invisible and the protocol silently wedges.
 //
 // The rendered block is stable in layout (same field order for every
@@ -52,7 +52,7 @@ func RenderActionBlock(delegate *Skill, action string) string {
 
 	// Requirements are the critical propagation target: this is where
 	// load-bearing post-conditions live (e.g. "if ready_for_ot is true,
-	// call handoff_to_green next"). Every entry gets its own line so the
+	// call handoff_to_ot next"). Every entry gets its own line so the
 	// LLM cannot accidentally gloss over a rule.
 	for _, req := range delegate.Requirements {
 		if trimmed := collapseWhitespace(req); trimmed != "" {

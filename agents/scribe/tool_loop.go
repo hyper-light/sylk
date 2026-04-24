@@ -7,12 +7,16 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
 const scribeMaxTokens = 512
 
 func (s *Scribe) generateCommentary(ctx context.Context, history []providers.Message, feed shared.ScribeFeed) (string, error) {
+	if s.provider == nil {
+		return "", fmt.Errorf("scribe provider is not configured")
+	}
 	bundle, state, err := s.newToolBundle(feed)
 	if err != nil {
 		return "", err
@@ -23,10 +27,14 @@ func (s *Scribe) generateCommentary(ctx context.Context, history []providers.Mes
 		bundle.prepareSkillsForInput(input)
 	}
 
+	systemPrompt := scribeSystemPrompt(s.parentAgentType, s.config.Forest != nil)
+	board := claims.DefaultSessionBoardRegistry().Lookup(s.sessionID)
+	systemPrompt = claims.PrependBoardPreamble(systemPrompt, board, "scribe")
+
 	req := &providers.Request{
 		Model:                  s.model,
 		MaxTokens:              scribeMaxTokens,
-		SystemPrompt:           scribeSystemPrompt(s.parentAgentType, s.config.Forest != nil),
+		SystemPrompt:           systemPrompt,
 		Messages:               append([]providers.Message(nil), history...),
 		ToolChoice:             "any",
 		DisableParallelToolUse: true,

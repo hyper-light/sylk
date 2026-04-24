@@ -23,6 +23,12 @@ func FabricAwarenessSkillNames() []string {
 		"consult_peer",
 		"challenge_peer",
 		"recall_my_history",
+		// Claims-aware fabric lenses (only visible when registered).
+		"fabric_query_claims_board",
+		"fabric_query_peer_claims",
+		"fabric_inspect_claim_conflicts",
+		"query_advisories",
+		"query_challenge_history",
 	}
 }
 

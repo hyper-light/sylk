@@ -12,6 +12,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -88,6 +89,18 @@ func (gi *GlobalInspector) consultAgent(ctx context.Context, target, prompt stri
 			"query":  prompt,
 		},
 	}
+	gi.globalInspectorPostClaim(ctx,
+		claims.Action{AgentID: "inspector", Type: claims.ActionTypeConsultation},
+		globalInspectorConsultClaim(
+			"Consult "+target+": "+truncateGlobalInspector(prompt, 60),
+			"Global inspector peer consultation",
+			target,
+			[]claims.ClaimScopeEntry{{Kind: "consultation", Key: target}},
+			[]*claims.Validation{
+				globalInspectorValidation(claims.ValidationTypeReceipt, true, "Peer responds to consultation", "response.success"),
+			},
+		),
+	)
 	msg, err := agentShared.WithInterAgentBranchMessage(ctx, spec, func(branchCtx context.Context, branch agentShared.InterAgentBranchHandle) (*guide.Message, error) {
 		branchMetadata := branch.ApplyMetadata(branchCtx, admission.Metadata)
 		resp, routeErr := gi.requestRouteSync(branchCtx, target, prompt, branchMetadata)

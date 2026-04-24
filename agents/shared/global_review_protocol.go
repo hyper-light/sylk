@@ -11,7 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"log/slog"
+
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -967,6 +970,39 @@ func issueGlobalReviewSelection(
 	if action.CreatesChallenge {
 		action.ChallengeID = nextGlobalReviewChallengeID(snapshot)
 	}
+	// Issuing-side claim: the agent posts a challenge or handoff claim
+	// against the target agent.
+	sessionID := safeCallString(cfg.Route.SessionID)
+	if sessionID != "" {
+		if board := claims.DefaultSessionBoardRegistry().Lookup(sessionID); board != nil {
+			claimAction := claims.ActionTypeChallenge
+			claimTitle := "Challenge " + action.TargetAgent + ": " + truncateSharedClaim(action.Reason, 60)
+			if action.Type == GlobalReviewActionHandoff {
+				claimAction = claims.ActionTypeTask
+				claimTitle = "Handoff to " + action.TargetAgent + ": " + truncateSharedClaim(action.Reason, 60)
+			}
+			agentType := normalizeGlobalReviewAgent(action.AgentType)
+			targetType := normalizeGlobalReviewAgent(action.TargetAgent)
+			if err := board.PostAction(ctx, claims.Action{AgentID: agentType, Type: claimAction}, []claims.Claim{{
+				Title:       claimTitle,
+				Description: "Global review " + string(action.Type) + ": " + action.Request,
+				Scope:       []claims.ClaimScopeEntry{{Kind: string(action.Type), Key: targetType}},
+				ActionType:  claimAction,
+				Relations: []claims.Relation{
+					{Related: agentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+					{Related: targetType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+				},
+				Validations: []*claims.Validation{{
+					Type: claims.ValidationTypeReceipt, Required: true,
+					Description: "Target agent processes global review action", QualityBar: "response.received",
+					Status: claims.ValidationStatusPending,
+				}},
+			}}); err != nil {
+				slog.Error("global_review_issuing_claim_failed", "error", err.Error(), "action_type", string(action.Type))
+			}
+		}
+	}
+
 	dispatch, err := dispatchGlobalReviewSelection(ctx, cfg, state, action)
 	if err != nil {
 		return nil, err
@@ -1629,17 +1665,30 @@ func globalReviewFinalizeSkill(cfg GlobalReviewProtocolSkillConfig) *skills.Skil
 					"challenge_id":           strings.TrimSpace(snapshot.PendingChallenge.ID),
 				}, nil
 			}
-			// The global tester is a peer agent — it was activated
-			// alongside the inspector when the global review started.
-			// The inspector does not spawn the tester as a child
-			// challenge. Instead, consult the tester's findings from
-			// the shared review state. If the tester hasn't published
-			// findings yet, ask the inspector to wait.
-			return map[string]any{
-				"finalize_global_review":  false,
-				"awaiting_tester_findings": true,
-				"message":                "The global tester is working as a peer. Wait for tester findings in the shared review state before finalizing. Use query_global_review_state to check tester progress.",
-			}, nil
+			// Audit-closure leg: hand off to the global tester for the
+			// tester-backed verification round. This is NOT a
+			// peer-targeted challenge — it's the inspector closing out
+			// its audit with a Handoff that carries CreatesChallenge=true
+			// and the finalize-marker on References, mirroring
+			// pipeline finalize_pipeline's symmetry. Downstream tooling
+			// surfaces this as "finalize_global_review" via
+			// globalReviewToolNameForAction so the chat panel +
+			// responder prompt can distinguish closure-round handoffs
+			// from peer challenges.
+			isFinal := finalWholePlanReview
+			action := &GlobalReviewTurnAction{
+				Type:             GlobalReviewActionHandoff,
+				AgentType:        GlobalReviewAgentInspector,
+				AgentID:          globalReviewAgentID(ctx, cfg),
+				TargetAgent:      GlobalReviewAgentTester,
+				TargetAgentID:    globalReviewResolveTargetAgentID(cfg, GlobalReviewAgentTester),
+				Reason:           globalReviewFinalizeReason(isFinal),
+				Request:          globalReviewFinalizeRequest(isFinal),
+				RequiredOutput:   []string{globalReviewFinalizeRequiredOutput(isFinal)},
+				References:       normalizeStringList(append(append([]string(nil), evidenceRefs...), finalizeGlobalReviewVerificationReference)),
+				CreatesChallenge: true,
+			}
+			return issueGlobalReviewSelection(ctx, cfg, action)
 		}).
 		Build()
 }

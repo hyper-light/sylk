@@ -7,6 +7,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -125,7 +126,39 @@ func contentScanSkill(g *Guardian) *skills.Skill {
 			if !ok {
 				return nil, fmt.Errorf("unknown content_scan action: %q", params.Action)
 			}
-			return fn(ctx, &params)
+
+			// Post claim: content validation request.
+			sessionID := g.activeSessionID
+			g.guardianPostClaim(ctx,
+				guardianClaimAction(claims.ActionTypeTask),
+				guardianClaim(
+					"Validate content: "+params.Action,
+					"Content scan for credentials and injection patterns",
+					"guardian",
+					[]claims.ClaimScopeEntry{{Kind: "content", Key: params.Action}},
+					claims.ActionTypeTask,
+					[]*claims.Validation{
+						guardianValidation(claims.ValidationTypeInspection, true, "No secrets, API keys, or tokens detected", "SecretSanitizer returns zero credential findings"),
+						guardianValidation(claims.ValidationTypeInspection, true, "No prompt injection or code injection patterns", "InjectionScanner returns zero findings"),
+					},
+				),
+			)
+
+			result, err := fn(ctx, &params)
+
+			// Submit testament with scan results.
+			if err != nil {
+				g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+					sessionID, "Content scan failed: "+err.Error(), "committed", "",
+					[]*claims.Artifact{guardianArtifact(sessionID, "error", err.Error())},
+				))
+			} else {
+				g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+					sessionID, fmt.Sprintf("Content scan %s complete", params.Action), "committed", "",
+					[]*claims.Artifact{guardianJSONArtifact(sessionID, "scan_results", result)},
+				))
+			}
+			return result, err
 		}).
 		Build()
 }

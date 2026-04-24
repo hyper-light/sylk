@@ -1,11 +1,13 @@
 package orchestrator
 
 import (
+	"context"
 	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/dag"
 )
 
@@ -128,6 +130,13 @@ func (o *Orchestrator) completePendingCheckpointReview(taskID string) {
 		o.dagBridge.NotifyNodeComplete(pending.nodeID, pending.result)
 	}
 	o.releaseAcceptedPipelineResources(pending.update)
+	o.orchestratorSubmitTestament(context.Background(), o.orchestratorTestament(
+		"Checkpoint review accepted: "+truncateOrchestrator(taskID, 40), "committed",
+		[]*claims.Artifact{
+			o.orchestratorArtifact("task_id", taskID),
+			o.orchestratorArtifact("node_id", pending.nodeID),
+		},
+	))
 }
 
 func (o *Orchestrator) failPendingCheckpointReview(taskID, errText string) {
@@ -144,4 +153,12 @@ func (o *Orchestrator) failPendingCheckpointReview(taskID, errText string) {
 			EndTime: time.Now().UTC(),
 		})
 	}
+	o.orchestratorSubmitTestament(context.Background(), o.orchestratorTestament(
+		"Checkpoint review failed: "+truncateOrchestrator(taskID, 40), "committed",
+		[]*claims.Artifact{
+			o.orchestratorArtifact("task_id", taskID),
+			o.orchestratorArtifact("node_id", pending.nodeID),
+			o.orchestratorArtifact("error", errText),
+		},
+	))
 }

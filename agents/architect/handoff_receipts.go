@@ -10,6 +10,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/google/uuid"
 )
 
@@ -71,6 +72,19 @@ func (a *Architect) requestPlanHandoffStatus(
 	if err != nil {
 		return nil, err
 	}
+	a.architectPostClaim(ctx,
+		architectClaimAction(claims.ActionTypeConsultation),
+		architectClaimWithSubject(
+			"Handoff status: "+truncateArchitectString(plan.ID, 40),
+			"Plan handoff status lookup",
+			targetAgentID,
+			[]claims.ClaimScopeEntry{{Kind: "consultation", Key: targetAgentID}},
+			claims.ActionTypeConsultation,
+			[]*claims.Validation{
+				architectValidation(claims.ValidationTypeReceipt, false, "Target returns handoff status", "response != nil"),
+			},
+		),
+	)
 	lookupCtx, cancel := context.WithTimeout(nonNilContext(ctx), planHandoffStatusLookupTimeout)
 	defer cancel()
 	return a.requestRouteSync(lookupCtx, &guide.RouteRequest{
@@ -337,19 +351,34 @@ func (a *Architect) applyPlanHandoffReceipt(
 	correlationID string,
 	reason string,
 ) bool {
+	applied := false
 	if isPendingPlanHandoffReceiptStatus(receipt.Status) {
 		a.refreshPlanPendingFromReceipt(plan, receipt, correlationID)
-		return true
-	}
-	if isExecutingPlanHandoffReceiptStatus(receipt.Status) {
+		applied = true
+	} else if isExecutingPlanHandoffReceiptStatus(receipt.Status) {
 		a.promotePlanExecutingFromReceipt(plan, receipt, correlationID)
-		return true
-	}
-	if receipt.Status == agentshared.PlanHandoffReceiptStatusFailed {
+		applied = true
+	} else if receipt.Status == agentshared.PlanHandoffReceiptStatusFailed {
 		a.recoverPlanHandoffForRetry(plan, correlationID, firstNonEmpty(strings.TrimSpace(receipt.ErrorText), reason))
-		return true
+		applied = true
 	}
-	return false
+
+	if applied {
+		planID := ""
+		if plan != nil {
+			planID = plan.ID
+		}
+		a.architectSubmitTestament(context.Background(), a.architectTestament(
+			fmt.Sprintf("Applied receipt for plan %s: %s", planID, receipt.Status),
+			"committed",
+			[]*claims.Artifact{
+				a.architectArtifact("receipt_status", string(receipt.Status)),
+				a.architectArtifact("plan_id", planID),
+				a.architectArtifact("dag_id", receipt.DAGID),
+			},
+		))
+	}
+	return applied
 }
 
 func isPendingPlanHandoffReceiptStatus(status agentshared.PlanHandoffReceiptStatus) bool {
@@ -587,6 +616,18 @@ func (a *Architect) finalizePlanHandoffExecution(
 			"continuation_completed", outcome.completed,
 			"continuation_found", outcome.found)
 	}
+
+	// Handoff finalization testament.
+	a.architectSubmitTestament(context.Background(), a.architectTestament(
+		fmt.Sprintf("Plan %s execution finalized", plan.ID),
+		"committed",
+		[]*claims.Artifact{
+			a.architectArtifact("plan_id", plan.ID),
+			a.architectArtifact("source", persistReason),
+			a.architectArtifact("notification", notification),
+		},
+	))
+
 	return nil
 }
 

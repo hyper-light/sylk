@@ -128,11 +128,14 @@ func (l *Librarian) registerFabricSkills() {
 	boardProvider := func() *claims.ClaimsBoard {
 		return claims.DefaultSessionBoardRegistry().Lookup(l.config.SessionID)
 	}
+	inboxProvider := func() *claims.ClaimsInbox { return l.claimsInbox }
 	l.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
-	l.skills.Register(claims.PostActionSkill(boardProvider))
+	l.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	l.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	l.skills.Register(claims.EvaluateValidationSkill(boardProvider))
 	l.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
 	l.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+	l.skills.Register(claims.TraverseSkill(boardProvider))
 
 	// Fabric claims awareness for cross-pipeline visibility.
 	fabricCfg := fabric.AwarenessSkillConfig{
@@ -381,6 +384,12 @@ func assessHealthSkill(l *Librarian) *skills.Skill {
 
 			if params.IncludeRecommendations {
 				assessment.Recommendations = l.generateRecommendations(assessment)
+			}
+
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("health_maturity", assessment.Maturity)
+				acc.Record("health_confidence", fmt.Sprintf("%.2f", assessment.Confidence))
+				acc.Note("Health: " + assessment.Maturity)
 			}
 
 			return assessment, nil
@@ -637,6 +646,15 @@ func knowledgeSearchSkill(l *Librarian) *skills.Skill {
 							"related_symbols": hit.RelatedSymbols,
 						})
 					}
+					l.librarianSubmitTestament(ctx, l.librarianTestament(
+						fmt.Sprintf("Knowledge search: %d results for %q", len(entries), truncateLibrarian(params.Query, 60)),
+						"committed",
+						[]*claims.Artifact{
+							l.librarianArtifact("query", truncateLibrarian(params.Query, 200)),
+							l.librarianArtifact("result_count", fmt.Sprintf("%d", len(entries))),
+							l.librarianArtifact("source", "committed_backend"),
+						},
+					))
 					return map[string]any{
 						"results":      entries,
 						"count":        len(entries),
@@ -670,6 +688,15 @@ func knowledgeSearchSkill(l *Librarian) *skills.Skill {
 					"source":  r.Source.String(),
 				})
 			}
+			l.librarianSubmitTestament(ctx, l.librarianTestament(
+				fmt.Sprintf("Knowledge search: %d results for %q", len(entries), truncateLibrarian(params.Query, 60)),
+				"committed",
+				[]*claims.Artifact{
+					l.librarianArtifact("query", truncateLibrarian(params.Query, 200)),
+					l.librarianArtifact("result_count", fmt.Sprintf("%d", len(entries))),
+					l.librarianArtifact("source", "coordinator"),
+				},
+			))
 			return map[string]any{
 				"results": entries,
 				"count":   len(entries),

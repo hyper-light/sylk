@@ -356,6 +356,15 @@ type DecorTickMsg struct {
 	Gen  uint64 // Tick chain generation; stale ticks are dropped.
 }
 
+// MemoryCanvasTickMsg drives the memory-view ambient animation loop
+// (particle drift, shimmer, pollen). Only live while ViewMemory is
+// active; stale ticks (mismatched Gen) are dropped so exiting the
+// mode cleanly terminates the chain.
+type MemoryCanvasTickMsg struct {
+	Time time.Time
+	Gen  uint64
+}
+
 // BlinkMsg fires on a one-shot timer at the next phase boundary.
 // The handler computes the correct blink phase from the wall clock,
 // so delayed messages cannot cause phase inversion.

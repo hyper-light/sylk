@@ -19,7 +19,7 @@ const (
 	pipelineProtocolEventValidation       = "validation_submitted"
 	pipelineProtocolEventProcessed        = "validation_processed"
 	pipelineProtocolEventReadyForOT       = "ready_for_ot"
-	pipelineProtocolEventHandoffToGreen   = "handoff_to_green"
+	pipelineProtocolEventHandoffToOT   = "handoff_to_ot"
 	pipelineProtocolEventTesterFinalize   = "tester_finalize"
 	pipelineProtocolEventArtifactConsumed = "tester_artifact_consumed"
 	pipelineMailboxItemKindObligation     = "protocol_obligation"
@@ -395,11 +395,11 @@ func (s *PipelineProtocolState) recordReadyForOT(ctx context.Context, summary st
 	})
 }
 
-func (s *PipelineProtocolState) recordHandoffToGreen(ctx context.Context, action *PipelineTurnAction) error {
+func (s *PipelineProtocolState) recordHandoffToOT(ctx context.Context, action *PipelineTurnAction) error {
 	if s == nil || action == nil {
 		return nil
 	}
-	return s.appendEvent(ctx, pipelineProtocolEventHandoffToGreen, action)
+	return s.appendEvent(ctx, pipelineProtocolEventHandoffToOT, action)
 }
 
 // recordTesterFinalize appends the per-recipient verification artifact refs
@@ -609,12 +609,12 @@ func (s *PipelineProtocolState) applyEvent(seq uint64, event *durableProtocolEve
 			return err
 		}
 		s.applyReadyForOTEvent(ready)
-	case pipelineProtocolEventHandoffToGreen:
+	case pipelineProtocolEventHandoffToOT:
 		var action PipelineTurnAction
 		if err := decodeProtocolPayload(event.Payload, &action); err != nil {
 			return err
 		}
-		s.applyHandoffToGreenEvent(&action)
+		s.applyHandoffToOTEvent(&action)
 	case pipelineProtocolEventTesterFinalize:
 		var finalize pipelineTesterFinalizeEvent
 		if err := decodeProtocolPayload(event.Payload, &finalize); err != nil {
@@ -779,7 +779,7 @@ func (s *PipelineProtocolState) applyProcessedValidationEvent(entry PipelineVali
 
 func (s *PipelineProtocolState) applyReadyForOTEvent(ready pipelineReadyForOTEvent) {
 	s.requiredAction = PipelineProtocolActionOT
-	s.requiredReason = "The audit already passed; `handoff_to_green` is the only valid way to end this inspector turn."
+	s.requiredReason = "The audit already passed; `handoff_to_ot` is the only valid way to end this inspector turn."
 	if s.snapshot == nil {
 		s.snapshot = &PipelineProtocolSnapshot{}
 	}
@@ -791,7 +791,7 @@ func (s *PipelineProtocolState) applyReadyForOTEvent(ready pipelineReadyForOTEve
 	})
 }
 
-func (s *PipelineProtocolState) applyHandoffToGreenEvent(action *PipelineTurnAction) {
+func (s *PipelineProtocolState) applyHandoffToOTEvent(action *PipelineTurnAction) {
 	s.requiredAction = ""
 	s.requiredReason = ""
 	if s.snapshot == nil {

@@ -9,7 +9,10 @@ import (
 	"reflect"
 	"strings"
 
+	"log/slog"
+
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/versioning"
 )
 
@@ -64,6 +67,32 @@ func ResearchDependencyInstallPlan(ctx context.Context, req DependencyInstallRes
 			"missing_tool": strings.TrimSpace(req.MissingTool),
 			"framework":    strings.TrimSpace(req.FrameworkID),
 		},
+	}
+	// Issuing-side claim: caller posts consultation claim against academic.
+	if sessionID := strings.TrimSpace(req.SessionID); sessionID != "" {
+		if board := claims.DefaultSessionBoardRegistry().Lookup(sessionID); board != nil {
+			agentType := strings.TrimSpace(req.SourceAgentName)
+			if agentType == "" {
+				agentType = "unknown"
+			}
+			if err := board.PostAction(ctx, claims.Action{AgentID: agentType, Type: claims.ActionTypeConsultation}, []claims.Claim{{
+				Title:       "Consult academic: dependency install plan for " + summary,
+				Description: "Research dependency install steps via academic agent",
+				Scope:       []claims.ClaimScopeEntry{{Kind: "consultation", Key: "academic"}},
+				ActionType:  claims.ActionTypeConsultation,
+				Relations: []claims.Relation{
+					{Related: agentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+					{Related: "academic", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+				},
+				Validations: []*claims.Validation{{
+					Type: claims.ValidationTypeReceipt, Required: true,
+					Description: "Academic returns install plan", QualityBar: "plan.steps.length > 0",
+					Status: claims.ValidationStatusPending,
+				}},
+			}}); err != nil {
+				slog.Error("dependency_install_issuing_claim_failed", "error", err.Error())
+			}
+		}
 	}
 	msg, err := WithInterAgentBranchMessage(ctx, spec, func(branchCtx context.Context, branch InterAgentBranchHandle) (*guide.Message, error) {
 		return RequestGuideRouteSync(branchCtx, GuideRouteSyncRequest{

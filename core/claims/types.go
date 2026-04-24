@@ -123,6 +123,7 @@ const (
 	ActionTypeCorrective   ActionType = "corrective"   // guide misbehaving agent back on track
 	ActionTypeArchival     ActionType = "archival"     // summarize, ingest, record
 	ActionTypePrompt       ActionType = "prompt"       // user prompt classification/decomposition
+	ActionTypeTestament    ActionType = "testament"    // agent testifying about work performed, findings, or failures
 )
 
 // ActionStatus tracks an action's aggregate lifecycle.
@@ -440,6 +441,12 @@ type ClaimsBoardProjection struct {
 	TotalTestaments int `json:"total_testaments"`
 	TotalArtifacts  int `json:"total_artifacts"`
 
+	// NotificationErrors contains subscriber notification failures
+	// accumulated since the last projection read. Non-empty signals
+	// that board state changes were not fully propagated — agents
+	// should record these as testament error artifacts.
+	NotificationErrors []string `json:"notification_errors,omitempty"`
+
 	Updated time.Time `json:"updated"`
 }
 
@@ -464,6 +471,12 @@ type ClaimsBoardConfig struct {
 	// notifications, amplifier emissions). Required in production.
 	// When nil, notifications and emissions run synchronously (tests).
 	Scope ScopeProvider
+
+	// DeltaBus publishes every board mutation as a structured Delta
+	// (see deltas.go). Nil-safe — when unset, the amplifier uses a
+	// NoopDeltaBus and bus publication is a silent no-op. Inboxes
+	// that want to subscribe need a real DeltaBus wired here.
+	DeltaBus DeltaBus
 }
 
 // ScopeProvider launches tracked goroutines. Matches the signature of

@@ -155,7 +155,7 @@ func TestEngineerSystemCollabPrompt_RoutesImplementationBackToInspector(t *testi
 		"Do not hand off directly to `tester-pipeline` after implementation",
 		"Use `pipeline_protocol(action=handoff)` to route back to `inspector-pipeline` when you are handing off fresh top-level implementation evidence.",
 		"Use `pipeline_protocol(action=validate)` only when you are answering an active challenge from Inspector, Tester, or Designer.",
-		"Only Inspector may run `pipeline_protocol(action=finalize)` and decide whether to invoke `handoff_to_green`.",
+		"Only Inspector may run `pipeline_protocol(action=finalize)` and decide whether to invoke `handoff_to_ot`.",
 		"Your first `pipeline_protocol(action=challenge)` call to Tester, Designer, or Inspector is allowed.",
 		"Re-challenge Inspector only after Inspector answered your previous challenge and you then changed pipeline VFS state yourself based on that answer.",
 		"Do not reinterpret a targeted challenge turn as permission to restart the broad top-level implementation flow.",

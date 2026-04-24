@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/adalundhe/sylk/core/claims"
 	knowledgedomain "github.com/adalundhe/sylk/core/domain"
 	knowledgequery "github.com/adalundhe/sylk/core/knowledge/query"
 	"github.com/adalundhe/sylk/core/search"
@@ -170,6 +171,17 @@ func (a *Academic) knowledgeSearch(ctx context.Context, text, domainStr string, 
 	sort.SliceStable(merged, func(i, j int) bool {
 		return academicKnowledgeAnyFloat(merged[i]["score"]) > academicKnowledgeAnyFloat(merged[j]["score"])
 	})
+
+	// Knowledge query testament.
+	a.academicSubmitTestament(ctx, a.academicTestament(
+		fmt.Sprintf("Knowledge query: %d results for %q", len(merged), truncateAcademic(text, 60)),
+		"committed",
+		[]*claims.Artifact{
+			a.academicArtifact("query", truncateAcademic(text, 200)),
+			a.academicArtifact("result_count", fmt.Sprintf("%d", len(merged))),
+			a.academicJSONArtifact("metrics", metrics),
+		},
+	))
 
 	return map[string]any{
 		"results": merged,

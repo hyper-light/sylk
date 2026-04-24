@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1220,6 +1221,44 @@ func registerSessionAuditWiringHooks(phase1 *bootstrapPhase1, orch *orchestrator
 			"session_id", string(svfs.SessionID()),
 		)
 	})
+
+	// Stage 5 TUI state-resync consumer: subscribe to the session-
+	// open resync topic so the chat / status surfaces can rebuild
+	// their views after the session hooks have landed. The handler
+	// is intentionally lightweight — it logs + lets downstream UI
+	// components (that hook the bus topic directly if they want
+	// richer projection) respond on their own cadence.
+	if phase1.guideBus != nil {
+		_, subErr := phase1.guideBus.SubscribeAsync(agentShared.SessionStateResyncTopic, func(msg *guide.Message) error {
+			raw, ok := msg.Payload.([]byte)
+			if !ok {
+				return nil
+			}
+			var notif agentShared.SessionStateResyncNotification
+			if err := json.Unmarshal(raw, &notif); err != nil {
+				slog.Warn("tui: session state resync decode failed",
+					"error", err.Error(),
+				)
+				return nil
+			}
+			slog.Info("tui: session state resync",
+				"session_id", notif.SessionID,
+				"green_version", notif.GreenVersion.String(),
+				"commit_queue_depth", notif.CommitQueueDepth,
+				"blocked_count", notif.BlockedCount,
+				"auditing_count", notif.AuditingCount,
+				"in_flight_replicas", notif.InFlightReplicas,
+				"merge_descriptors", notif.MergeDescriptors,
+				"elapsed_open_seconds", notif.ElapsedOpenSecs,
+			)
+			return nil
+		})
+		if subErr != nil {
+			slog.Warn("tui: subscribe session state resync failed",
+				"error", subErr.Error(),
+			)
+		}
+	}
 }
 
 // sessionAuditSLAThreshold is the default rejection→remediation SLA
@@ -2130,7 +2169,7 @@ func registerPipelineInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 			return nil, err
 		}
 		pi.SetActivityPublisher(deps.actPub)
-		// Inspector-owned pipeline VFS authority — handoff_to_green and
+		// Inspector-owned pipeline VFS authority — handoff_to_ot and
 		// discard_pipeline call this committer instead of the orchestrator
 		// reacting to "succeeded" / "failed" pipeline broadcasts. The
 		// session is resolved per-call via ctx so a single inspector pod

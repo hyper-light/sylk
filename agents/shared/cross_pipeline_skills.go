@@ -7,9 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"log/slog"
+
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -235,6 +238,36 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 				},
 			}
 			activity.Append(ctx, act)
+
+			// Issuing-side claim: the challenging agent posts a challenge
+			// claim against the target agent.
+			challengeTarget := resolvedAgentType
+			if challengeTarget == "" {
+				challengeTarget = strings.TrimSpace(params.TargetAgentType)
+			}
+			if challengeTarget != "" {
+				if board := claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID)); board != nil {
+					agentType := safeCallString(cfg.AgentType)
+					if err := board.PostAction(ctx, claims.Action{AgentID: agentType, Type: claims.ActionTypeChallenge}, []claims.Claim{{
+						Title:       "Challenge " + challengeTarget + ": " + truncateSharedClaim(params.Evidence, 60),
+						Description: "Cross-pipeline peer challenge",
+						Scope:       []claims.ClaimScopeEntry{{Kind: "challenge", Key: challengeTarget}},
+						ActionType:  claims.ActionTypeChallenge,
+						Relations: []claims.Relation{
+							{Related: agentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+							{Related: challengeTarget, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+						},
+						Validations: []*claims.Validation{{
+							Type: claims.ValidationTypeInspection, Required: true,
+							Description: "Challenged peer responds (defend/yield/scope-split/escalate)", QualityBar: "resolution.received",
+							Status: claims.ValidationStatusPending,
+						}},
+					}}); err != nil {
+						slog.Error("challenge_peer_issuing_claim_failed", "error", err.Error())
+					}
+				}
+			}
+
 			result := map[string]any{
 				"challenge_id": act.ID,
 				"deadline_at":  time.Now().Add(deadline),
@@ -369,6 +402,29 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 				State:   activity.StateInFlight,
 			}
 			activity.Append(ctx, act)
+
+			// Issuing-side claim: the consulting agent posts a consultation
+			// claim against the target agent.
+			if board := claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID)); board != nil {
+				agentType := safeCallString(cfg.AgentType)
+				if err := board.PostAction(ctx, claims.Action{AgentID: agentType, Type: claims.ActionTypeConsultation}, []claims.Claim{{
+					Title:       "Consult peer " + targetAddress + ": " + truncateSharedClaim(params.Query, 60),
+					Description: "Cross-pipeline peer consultation",
+					Scope:       []claims.ClaimScopeEntry{{Kind: "consultation", Key: targetAddress}},
+					ActionType:  claims.ActionTypeConsultation,
+					Relations: []claims.Relation{
+						{Related: agentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+						{Related: strings.TrimSpace(params.TargetAgentType), RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+					},
+					Validations: []*claims.Validation{{
+						Type: claims.ValidationTypeReceipt, Required: true,
+						Description: "Peer responds to consultation", QualityBar: "response.received",
+						Status: claims.ValidationStatusPending,
+					}},
+				}}); err != nil {
+					slog.Error("consult_peer_issuing_claim_failed", "error", err.Error())
+				}
+			}
 
 			// Fire-and-forget fallback — no transport configured for this
 			// caller. The addressee is expected to pick up the activity
@@ -582,4 +638,13 @@ func unauthorizedChallengeError(callerType, targetType string, permitted []strin
 		"challenge_peer: %q is not permitted to challenge %q. Permitted targets for %q: %s",
 		callerType, targetType, callerType, strings.Join(permitted, ", "),
 	)
+}
+
+// truncateSharedClaim truncates a string for shared claim titles.
+func truncateSharedClaim(s string, max int) string {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) <= max {
+		return trimmed
+	}
+	return trimmed[:max] + "..."
 }

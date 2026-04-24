@@ -3,13 +3,21 @@ package claims
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
+)
+
+// Tunable defaults. No magic numbers scattered through the code —
+// everything with a policy implication lives here and can be adjusted
+// in one place.
+const (
+	defaultMaxIterations      = 3
+	subscriberNotifyTimeout   = 5 * time.Second
+	subscriberNotifyTaskLabel = "claims_board_notify"
 )
 
 // ClaimsBoard is the per-pipeline (or per-session) sovereign store that
@@ -35,6 +43,13 @@ type ClaimsBoard struct {
 	claims     map[string]*Claim
 	testaments map[string]*Testament
 	claimOrder []string
+	phaseLog   []StatusChange
+
+	// relationsIdx is a secondary index over every Relation carried
+	// by every object. Serves the named board-context queries
+	// (trace_claim_ancestry, list_action_claims, find_overlapping_claims,
+	// etc.) in O(1) lookup instead of full-table scans.
+	relationsIdx *relationsIndex
 
 	seq atomic.Uint64
 
@@ -44,6 +59,13 @@ type ClaimsBoard struct {
 	subscribersMu sync.Mutex
 	subscribers   []boardSubscription
 	subscriberSeq int64
+
+	// notificationErrors accumulates subscriber notification + emission
+	// failures. Exposed in the projection so agents see them on the
+	// next board query and can record them as testament error
+	// artifacts. Drained on read (projection) to prevent unbounded
+	// growth.
+	notificationErrors []string
 }
 
 type boardSubscription struct {
@@ -51,19 +73,17 @@ type boardSubscription struct {
 	fn ClaimsBoardSubscriber
 }
 
-// NewClaimsBoard creates a new board. If SessionID is provided, a
-// BoardAmplifier is created for Fabric emission.
+// NewClaimsBoard creates a new board. Amplifier, scope, and delta bus
+// are wired from cfg; each is independently optional — a test board
+// can run with none. A production board passes Scope + DeltaBus to
+// get tracked goroutines and bus projection.
 func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 	boardID := firstNonEmpty(cfg.BoardID, uuid.NewString())
-	var amp *BoardAmplifier
-	if cfg.SessionID != "" {
-		amp = NewBoardAmplifier(cfg.SessionID, cfg.TaskID, boardID)
-	}
 	maxIter := cfg.MaxIterations
 	if maxIter <= 0 {
-		maxIter = 3 // default bound
+		maxIter = defaultMaxIterations
 	}
-	return &ClaimsBoard{
+	b := &ClaimsBoard{
 		boardID:       boardID,
 		pipelineID:    cfg.PipelineID,
 		taskID:        cfg.TaskID,
@@ -73,9 +93,17 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		actions:       make(map[string]*Action),
 		claims:        make(map[string]*Claim),
 		testaments:    make(map[string]*Testament),
-		amplifier:     amp,
+		relationsIdx:  newRelationsIndex(),
 		scope:         cfg.Scope,
 	}
+	if cfg.SessionID != "" {
+		amp := NewBoardAmplifier(cfg.SessionID, cfg.TaskID, boardID).
+			WithDeltaBus(cfg.DeltaBus).
+			WithScope(cfg.Scope).
+			WithErrorSink(b.RecordNotificationError)
+		b.amplifier = amp
+	}
+	return b
 }
 
 // ── Accessors ───────────────────────────────────────────────────────
@@ -92,6 +120,12 @@ func (b *ClaimsBoard) TaskID() string {
 	return b.taskID
 }
 
+func (b *ClaimsBoard) SessionID() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.sessionID
+}
+
 func (b *ClaimsBoard) Phase() BoardPhase {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -102,6 +136,13 @@ func (b *ClaimsBoard) Iteration() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.iteration
+}
+
+// Amplifier exposes the board's amplifier for callers that need to
+// publish derived deltas (e.g. the inbox bootstrap replay). nil when
+// the board was constructed without a session.
+func (b *ClaimsBoard) Amplifier() *BoardAmplifier {
+	return b.amplifier
 }
 
 // ── PostAction ──────────────────────────────────────────────────────
@@ -118,25 +159,57 @@ func (b *ClaimsBoard) PostAction(_ context.Context, action Action, inputClaims [
 
 	now := time.Now().UTC()
 
-	// Validate: no duplicate IDs in batch or existing.
+	if err := b.validatePostActionLocked(inputClaims); err != nil {
+		b.mu.Unlock()
+		return err
+	}
+
+	b.stampActionLocked(&action, now)
+	b.indexRelations(action.ID, action.Relations)
+
+	for i := range inputClaims {
+		c := &inputClaims[i]
+		b.stampClaimLocked(c, &action, now)
+		b.claims[c.ID] = c
+		b.claimOrder = append(b.claimOrder, c.ID)
+		b.indexRelations(c.ID, c.Relations)
+		b.relationsIdx.addScope(c.ID, c.Scope)
+	}
+
+	// Release lock BEFORE notifying subscribers (prevents deadlock).
+	b.mu.Unlock()
+
+	// Amplify: fabric + bus.
+	ctx := context.Background()
+	b.amplifier.EmitActionPosted(ctx, &action)
+	for i := range inputClaims {
+		b.amplifier.EmitClaimIssued(ctx, &inputClaims[i])
+		b.amplifier.PublishInboxDeltas(ctx, &action, &inputClaims[i])
+	}
+
+	b.notifySubscribers()
+	return nil
+}
+
+func (b *ClaimsBoard) validatePostActionLocked(inputClaims []Claim) error {
 	for i := range inputClaims {
 		id := inputClaims[i].ID
 		if id == "" {
-			continue // will be generated
+			continue // will be generated on stamp
 		}
 		if _, exists := b.claims[id]; exists {
-			b.mu.Unlock()
 			return fmt.Errorf("duplicate claim ID %q", id)
 		}
 		for j := 0; j < i; j++ {
 			if inputClaims[j].ID == id {
-				b.mu.Unlock()
 				return fmt.Errorf("duplicate claim ID %q in batch", id)
 			}
 		}
 	}
+	return nil
+}
 
-	// Stamp action.
+func (b *ClaimsBoard) stampActionLocked(action *Action, now time.Time) {
 	if action.ID == "" {
 		action.ID = uuid.NewString()
 	}
@@ -150,72 +223,67 @@ func (b *ClaimsBoard) PostAction(_ context.Context, action Action, inputClaims [
 		action.Status = ActionStatusPending
 	}
 	action.StatusHistory = append(action.StatusHistory, StatusChange{
-		To: string(action.Status), Reason: "action posted",
-		AgentID: action.AgentID, Changed: now,
+		To:      string(action.Status),
+		Reason:  "action posted",
+		AgentID: action.AgentID,
+		Changed: now,
 	})
-	b.actions[action.ID] = &action
+	b.actions[action.ID] = action
+}
 
-	// Stamp and insert claims + their validations.
-	for i := range inputClaims {
-		c := &inputClaims[i]
-		if c.ID == "" {
-			c.ID = uuid.NewString()
-		}
-		c.SessionID = b.sessionID
-		c.PipelineID = b.pipelineID
-		c.TaskID = b.taskID
-		c.Sequence = b.nextSeq()
-		c.Created = now
-		c.Accessed = now
-		c.Status = ClaimStatusPending
-		c.ActionType = action.Type
-		c.StatusHistory = append(c.StatusHistory, StatusChange{
-			To: string(ClaimStatusPending), Reason: "claim posted",
-			AgentID: action.AgentID, Changed: now,
+func (b *ClaimsBoard) stampClaimLocked(c *Claim, action *Action, now time.Time) {
+	if c.ID == "" {
+		c.ID = uuid.NewString()
+	}
+	c.SessionID = b.sessionID
+	c.PipelineID = b.pipelineID
+	c.TaskID = b.taskID
+	c.Sequence = b.nextSeq()
+	c.Created = now
+	c.Accessed = now
+	c.Status = ClaimStatusPending
+	c.ActionType = action.Type
+	c.StatusHistory = append(c.StatusHistory, StatusChange{
+		To:      string(ClaimStatusPending),
+		Reason:  "claim posted",
+		AgentID: action.AgentID,
+		Changed: now,
+	})
+	if !HasRelation(c.Relations, RelationshipClaimAction, action.ID) {
+		c.Relations = append(c.Relations, Relation{
+			Related:      action.ID,
+			RelatedType:  RelatedTypeAction,
+			Relationship: RelationshipClaimAction,
 		})
-		if !HasRelation(c.Relations, RelationshipClaimAction, action.ID) {
-			c.Relations = append(c.Relations, Relation{
-				Related: action.ID, RelatedType: RelatedTypeAction,
-				Relationship: RelationshipClaimAction,
-			})
-		}
-		// Stamp validations with parent ClaimID.
-		for _, v := range c.Validations {
-			if v.ID == "" {
-				v.ID = uuid.NewString()
-			}
-			v.ClaimID = c.ID
-			v.SessionID = b.sessionID
-			v.PipelineID = b.pipelineID
-			v.TaskID = b.taskID
-			v.Sequence = b.nextSeq()
-			v.Created = now
-			v.Accessed = now
-			if v.Status == "" {
-				v.Status = ValidationStatusPending
-			}
-		}
-		b.claims[c.ID] = c
-		b.claimOrder = append(b.claimOrder, c.ID)
 	}
+	b.stampValidationsLocked(c, now)
+}
 
-	// Release lock BEFORE notifying subscribers (prevents deadlock).
-	b.mu.Unlock()
-
-	// Amplify.
-	ctx := context.Background()
-	b.amplifier.EmitActionPosted(ctx, &action)
-	for i := range inputClaims {
-		b.amplifier.EmitClaimIssued(ctx, &inputClaims[i])
+func (b *ClaimsBoard) stampValidationsLocked(c *Claim, now time.Time) {
+	for _, v := range c.Validations {
+		if v.ID == "" {
+			v.ID = uuid.NewString()
+		}
+		v.ClaimID = c.ID
+		v.SessionID = b.sessionID
+		v.PipelineID = b.pipelineID
+		v.TaskID = b.taskID
+		v.Sequence = b.nextSeq()
+		v.Created = now
+		v.Accessed = now
+		if v.Status == "" {
+			v.Status = ValidationStatusPending
+		}
 	}
+}
 
-	b.notifySubscribers()
-	return nil
+func (b *ClaimsBoard) indexRelations(objID string, relations []Relation) {
+	b.relationsIdx.addRelations(objID, relations)
 }
 
 // ── UpdateClaimProgress ─────────────────────────────────────────────
 
-func (b *ClaimsBoard) UpdateClaimProgress(_ context.Context, claimID string, update ClaimProgressUpdate, agentID string) error {
+func (b *ClaimsBoard) UpdateClaimProgress(_ context.Context, claimID string, _ ClaimProgressUpdate, agentID string) error {
 	b.mu.Lock()
 
 	c, ok := b.claims[claimID]
@@ -229,18 +297,40 @@ func (b *ClaimsBoard) UpdateClaimProgress(_ context.Context, claimID string, upd
 	}
 
 	now := time.Now().UTC()
+	fromStatus := c.Status
+	statusChanged := false
 	c.Accessed = now
 	if c.Status == ClaimStatusPending {
 		c.StatusHistory = append(c.StatusHistory, StatusChange{
-			From: string(ClaimStatusPending), To: string(ClaimStatusInProgress),
-			Reason: "work started", AgentID: agentID, Changed: now,
+			From:    string(ClaimStatusPending),
+			To:      string(ClaimStatusInProgress),
+			Reason:  "work started",
+			AgentID: agentID,
+			Changed: now,
 		})
 		c.Status = ClaimStatusInProgress
+		statusChanged = true
 	}
 
 	b.mu.Unlock()
 
-	b.amplifier.EmitClaimUpdated(context.Background(), c, agentID)
+	ctx := context.Background()
+	b.amplifier.EmitClaimUpdated(ctx, c, agentID)
+	if statusChanged {
+		b.amplifier.PublishClaimStatusDelta(ctx, ClaimStatusDelta{
+			SessionID:      b.sessionID,
+			BoardID:        b.boardID,
+			ClaimID:        c.ID,
+			Sequence:       b.seq.Load(),
+			EmittedAt:      now,
+			FromStatus:     fromStatus,
+			ToStatus:       c.Status,
+			Reason:         "work started",
+			AgentID:        agentID,
+			SubjectAgentID: SubjectAgentID(c.Relations),
+			IssuerAgentID:  IssuerAgentID(c.Relations),
+		})
+	}
 	b.notifySubscribers()
 	return nil
 }
@@ -256,10 +346,37 @@ func (b *ClaimsBoard) SubmitTestaments(_ context.Context, action Action, testame
 	}
 
 	b.mu.Lock()
-
 	now := time.Now().UTC()
+	b.stampTestamentActionLocked(&action, now)
 
-	// Stamp testament action.
+	// Capture post-stamp claim snapshots so the amplifier gets
+	// authoritative references once the lock is released. We resolve
+	// the claim referenced by each testament BEFORE unlocking.
+	claimRefs := make([]*Claim, len(testaments))
+	for i := range testaments {
+		b.stampTestamentLocked(&testaments[i], &action, now)
+		claimRefs[i] = b.resolveClaimForTestamentLocked(&testaments[i], now)
+	}
+
+	b.mu.Unlock()
+
+	// Amplify.
+	ctx := context.Background()
+	for i := range testaments {
+		b.amplifier.EmitTestamentSubmitted(ctx, &testaments[i])
+		for _, artifact := range testaments[i].Artifacts {
+			b.amplifier.EmitArtifactPublished(ctx, artifact)
+		}
+		if claimRefs[i] != nil {
+			b.amplifier.PublishTestamentDelta(ctx, &testaments[i], claimRefs[i])
+		}
+	}
+
+	b.notifySubscribers()
+	return nil
+}
+
+func (b *ClaimsBoard) stampTestamentActionLocked(action *Action, now time.Time) {
 	if action.ID == "" {
 		action.ID = uuid.NewString()
 	}
@@ -272,70 +389,71 @@ func (b *ClaimsBoard) SubmitTestaments(_ context.Context, action Action, testame
 	if action.Status == "" {
 		action.Status = ActionStatusComplete
 	}
-	b.actions[action.ID] = &action
+	b.actions[action.ID] = action
+	b.indexRelations(action.ID, action.Relations)
+}
 
-	for i := range testaments {
-		t := &testaments[i]
-		if t.ID == "" {
-			t.ID = uuid.NewString()
-		}
-		t.SessionID = b.sessionID
-		t.PipelineID = b.pipelineID
-		t.TaskID = b.taskID
-		t.Sequence = b.nextSeq()
-		t.Created = now
-		t.Accessed = now
+func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now time.Time) {
+	if t.ID == "" {
+		t.ID = uuid.NewString()
+	}
+	t.SessionID = b.sessionID
+	t.PipelineID = b.pipelineID
+	t.TaskID = b.taskID
+	t.Sequence = b.nextSeq()
+	t.Created = now
+	t.Accessed = now
 
-		if !HasRelation(t.Relations, RelationshipTestamentAction, action.ID) {
-			t.Relations = append(t.Relations, Relation{
-				Related: action.ID, RelatedType: RelatedTypeAction,
-				Relationship: RelationshipTestamentAction,
-			})
-		}
-
-		// Stamp artifacts with parent TestamentID.
-		for _, a := range t.Artifacts {
-			if a.ID == "" {
-				a.ID = uuid.NewString()
-			}
-			a.TestamentID = t.ID
-			a.SessionID = b.sessionID
-			a.PipelineID = b.pipelineID
-			a.TaskID = b.taskID
-			a.Sequence = b.nextSeq()
-			a.Created = now
-			a.Accessed = now
-		}
-
-		b.testaments[t.ID] = t
-
-		// Transition the referenced claim to testified.
-		claimRel := FindRelation(t.Relations, RelationshipClaim)
-		if claimRel != nil {
-			if c, ok := b.claims[claimRel.Related]; ok && !c.Status.IsTerminal() && c.Status != ClaimStatusTestified {
-				c.StatusHistory = append(c.StatusHistory, StatusChange{
-					From: string(c.Status), To: string(ClaimStatusTestified),
-					Reason: "testament submitted", AgentID: t.AgentID, Changed: now,
-				})
-				c.Status = ClaimStatusTestified
-				c.Accessed = now
-			}
-		}
+	if !HasRelation(t.Relations, RelationshipTestamentAction, action.ID) {
+		t.Relations = append(t.Relations, Relation{
+			Related:      action.ID,
+			RelatedType:  RelatedTypeAction,
+			Relationship: RelationshipTestamentAction,
+		})
 	}
 
-	b.mu.Unlock()
-
-	// Amplify.
-	ampCtx := context.Background()
-	for i := range testaments {
-		b.amplifier.EmitTestamentSubmitted(ampCtx, &testaments[i])
-		for _, a := range testaments[i].Artifacts {
-			b.amplifier.EmitArtifactPublished(ampCtx, a)
+	for _, artifact := range t.Artifacts {
+		if artifact.ID == "" {
+			artifact.ID = uuid.NewString()
 		}
+		artifact.TestamentID = t.ID
+		artifact.SessionID = b.sessionID
+		artifact.PipelineID = b.pipelineID
+		artifact.TaskID = b.taskID
+		artifact.Sequence = b.nextSeq()
+		artifact.Created = now
+		artifact.Accessed = now
 	}
 
-	b.notifySubscribers()
-	return nil
+	b.testaments[t.ID] = t
+	b.indexRelations(t.ID, t.Relations)
+}
+
+// resolveClaimForTestamentLocked returns the Claim referenced by the
+// testament's "claim" Relation and transitions it to Testified. Nil
+// when the relation is absent or the target claim no longer exists.
+// Caller holds b.mu (write-locked).
+func (b *ClaimsBoard) resolveClaimForTestamentLocked(t *Testament, now time.Time) *Claim {
+	claimRel := FindRelation(t.Relations, RelationshipClaim)
+	if claimRel == nil {
+		return nil
+	}
+	c, ok := b.claims[claimRel.Related]
+	if !ok {
+		return nil
+	}
+	if !c.Status.IsTerminal() && c.Status != ClaimStatusTestified {
+		c.StatusHistory = append(c.StatusHistory, StatusChange{
+			From:    string(c.Status),
+			To:      string(ClaimStatusTestified),
+			Reason:  "testament submitted",
+			AgentID: t.AgentID,
+			Changed: now,
+		})
+		c.Status = ClaimStatusTestified
+		c.Accessed = now
+	}
+	return c
 }
 
 // ── EvaluateValidation ──────────────────────────────────────────────
@@ -351,13 +469,7 @@ func (b *ClaimsBoard) EvaluateValidation(_ context.Context, claimID, validationI
 		return fmt.Errorf("claim %q not found", claimID)
 	}
 
-	var v *Validation
-	for _, candidate := range c.Validations {
-		if candidate.ID == validationID {
-			v = candidate
-			break
-		}
-	}
+	v := findValidationOnClaim(c, validationID)
 	if v == nil {
 		b.mu.Unlock()
 		return fmt.Errorf("validation %q not found on claim %q", validationID, claimID)
@@ -373,23 +485,68 @@ func (b *ClaimsBoard) EvaluateValidation(_ context.Context, claimID, validationI
 	accepted := c.AllValidationsPassed()
 	if accepted {
 		c.StatusHistory = append(c.StatusHistory, StatusChange{
-			From: string(c.Status), To: string(ClaimStatusAccepted),
-			Reason: "all required validations passed", AgentID: change.AgentID, Changed: now,
+			From:    string(c.Status),
+			To:      string(ClaimStatusAccepted),
+			Reason:  "all required validations passed",
+			AgentID: change.AgentID,
+			Changed: now,
 		})
 		c.Status = ClaimStatusAccepted
 		c.Accessed = now
 	}
 
+	validationDelta := b.buildValidationDeltaLocked(c, v, change, accepted, now)
+
 	b.mu.Unlock()
 
-	ampCtx := context.Background()
-	b.amplifier.EmitClaimValidated(ampCtx, v, change.AgentID)
+	ctx := context.Background()
+	b.amplifier.EmitClaimValidated(ctx, v, change.AgentID)
 	if accepted {
-		b.amplifier.EmitClaimAccepted(ampCtx, c)
+		b.amplifier.EmitClaimAccepted(ctx, c)
 	}
-
+	b.amplifier.PublishValidationDelta(ctx, validationDelta)
 	b.notifySubscribers()
 	return nil
+}
+
+func findValidationOnClaim(c *Claim, validationID string) *Validation {
+	for _, candidate := range c.Validations {
+		if candidate.ID == validationID {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func (b *ClaimsBoard) buildValidationDeltaLocked(c *Claim, v *Validation, change StatusChange, accepted bool, now time.Time) ValidationDelta {
+	remaining := c.PendingValidationCount()
+	failed := countFailedValidations(c)
+	return ValidationDelta{
+		SessionID:          b.sessionID,
+		BoardID:            b.boardID,
+		ClaimID:            c.ID,
+		ValidationID:       v.ID,
+		Sequence:           v.Sequence,
+		EmittedAt:          now,
+		Verdict:            change.To,
+		EvaluatorAgentID:   change.AgentID,
+		Reason:             change.Reason,
+		RemainingOnClaim:   remaining,
+		FailedCountOnClaim: failed,
+		ClaimAutoAccepted:  accepted,
+		SubjectAgentID:     SubjectAgentID(c.Relations),
+		IssuerAgentID:      IssuerAgentID(c.Relations),
+	}
+}
+
+func countFailedValidations(c *Claim) int {
+	count := 0
+	for _, v := range c.Validations {
+		if v.Status == ValidationStatusFailed {
+			count++
+		}
+	}
+	return count
 }
 
 // ── RejectClaim ─────────────────────────────────────────────────────
@@ -408,6 +565,7 @@ func (b *ClaimsBoard) RejectClaim(_ context.Context, claimID string, change Stat
 	}
 
 	now := time.Now().UTC()
+	fromStatus := c.Status
 	change.From = string(c.Status)
 	change.To = string(ClaimStatusRejected)
 	change.Changed = now
@@ -415,83 +573,118 @@ func (b *ClaimsBoard) RejectClaim(_ context.Context, claimID string, change Stat
 	c.Status = ClaimStatusRejected
 	c.Accessed = now
 
-	if replacements != nil && len(replacementClaims) > 0 {
-		if replacements.ID == "" {
-			replacements.ID = uuid.NewString()
-		}
-		replacements.SessionID = b.sessionID
-		replacements.PipelineID = b.pipelineID
-		replacements.TaskID = b.taskID
-		replacements.Sequence = b.nextSeq()
-		replacements.Created = now
-		replacements.Accessed = now
-		if replacements.Status == "" {
-			replacements.Status = ActionStatusPending
-		}
-		replacements.StatusHistory = append(replacements.StatusHistory, StatusChange{
-			To: string(replacements.Status),
-			Reason: "remediation for rejected claim " + claimID,
-			AgentID: change.AgentID, Changed: now,
-		})
-		b.actions[replacements.ID] = replacements
+	remediationIDs := b.applyRemediationLocked(claimID, replacements, replacementClaims, change.AgentID, now)
 
-		for i := range replacementClaims {
-			rc := &replacementClaims[i]
-			if rc.ID == "" {
-				rc.ID = uuid.NewString()
-			}
-			rc.SessionID = b.sessionID
-			rc.PipelineID = b.pipelineID
-			rc.TaskID = b.taskID
-			rc.Sequence = b.nextSeq()
-			rc.Created = now
-			rc.Accessed = now
-			rc.Status = ClaimStatusPending
-			rc.Iteration = b.iteration + 1
-			rc.ActionType = replacements.Type
-			rc.StatusHistory = append(rc.StatusHistory, StatusChange{
-				To: string(ClaimStatusPending),
-				Reason: "remediation for rejected claim " + claimID,
-				AgentID: change.AgentID, Changed: now,
-			})
-			if !HasRelation(rc.Relations, RelationshipSupersedes, claimID) {
-				rc.Relations = append(rc.Relations, Relation{
-					Related: claimID, RelatedType: RelatedTypeClaim,
-					Relationship: RelationshipSupersedes,
-				})
-			}
-			if !HasRelation(rc.Relations, RelationshipClaimAction, replacements.ID) {
-				rc.Relations = append(rc.Relations, Relation{
-					Related: replacements.ID, RelatedType: RelatedTypeAction,
-					Relationship: RelationshipClaimAction,
-				})
-			}
-			// Stamp validations on replacement claims.
-			for _, v := range rc.Validations {
-				if v.ID == "" {
-					v.ID = uuid.NewString()
-				}
-				v.ClaimID = rc.ID
-				v.SessionID = b.sessionID
-				v.PipelineID = b.pipelineID
-				v.TaskID = b.taskID
-				v.Sequence = b.nextSeq()
-				v.Created = now
-				v.Accessed = now
-				if v.Status == "" {
-					v.Status = ValidationStatusPending
-				}
-			}
-			b.claims[rc.ID] = rc
-			b.claimOrder = append(b.claimOrder, rc.ID)
-		}
+	rejectedDelta := ClaimStatusDelta{
+		SessionID:           b.sessionID,
+		BoardID:             b.boardID,
+		ClaimID:             c.ID,
+		Sequence:            c.Sequence,
+		EmittedAt:           now,
+		FromStatus:          fromStatus,
+		ToStatus:            ClaimStatusRejected,
+		Reason:              change.Reason,
+		AgentID:             change.AgentID,
+		SubjectAgentID:      SubjectAgentID(c.Relations),
+		IssuerAgentID:       IssuerAgentID(c.Relations),
+		RemediationClaimIDs: remediationIDs,
 	}
 
 	b.mu.Unlock()
 
-	b.amplifier.EmitClaimRejected(context.Background(), c)
+	ctx := context.Background()
+	b.amplifier.EmitClaimRejected(ctx, c)
+	b.amplifier.PublishClaimStatusDelta(ctx, rejectedDelta)
+
+	// Emit InboxDeltas for each replacement claim so their subjects
+	// see the remediation.
+	if replacements != nil && len(replacementClaims) > 0 {
+		b.amplifier.EmitCorrectiveIssued(ctx, replacements)
+		for i := range replacementClaims {
+			b.amplifier.EmitClaimIssued(ctx, &replacementClaims[i])
+			b.amplifier.PublishInboxDeltas(ctx, replacements, &replacementClaims[i])
+		}
+	}
+
 	b.notifySubscribers()
 	return nil
+}
+
+func (b *ClaimsBoard) applyRemediationLocked(rejectedClaimID string, replacements *Action, replacementClaims []Claim, agentID string, now time.Time) []string {
+	if replacements == nil || len(replacementClaims) == 0 {
+		return nil
+	}
+	b.stampRemediationActionLocked(replacements, rejectedClaimID, agentID, now)
+	ids := make([]string, 0, len(replacementClaims))
+	for i := range replacementClaims {
+		rc := &replacementClaims[i]
+		b.stampRemediationClaimLocked(rc, replacements, rejectedClaimID, agentID, now)
+		b.claims[rc.ID] = rc
+		b.claimOrder = append(b.claimOrder, rc.ID)
+		b.indexRelations(rc.ID, rc.Relations)
+		b.relationsIdx.addScope(rc.ID, rc.Scope)
+		ids = append(ids, rc.ID)
+	}
+	return ids
+}
+
+func (b *ClaimsBoard) stampRemediationActionLocked(action *Action, rejectedID, agentID string, now time.Time) {
+	if action.ID == "" {
+		action.ID = uuid.NewString()
+	}
+	action.SessionID = b.sessionID
+	action.PipelineID = b.pipelineID
+	action.TaskID = b.taskID
+	action.Sequence = b.nextSeq()
+	action.Created = now
+	action.Accessed = now
+	if action.Status == "" {
+		action.Status = ActionStatusPending
+	}
+	action.StatusHistory = append(action.StatusHistory, StatusChange{
+		To:      string(action.Status),
+		Reason:  "remediation for rejected claim " + rejectedID,
+		AgentID: agentID,
+		Changed: now,
+	})
+	b.actions[action.ID] = action
+	b.indexRelations(action.ID, action.Relations)
+}
+
+func (b *ClaimsBoard) stampRemediationClaimLocked(rc *Claim, replacements *Action, rejectedID, agentID string, now time.Time) {
+	if rc.ID == "" {
+		rc.ID = uuid.NewString()
+	}
+	rc.SessionID = b.sessionID
+	rc.PipelineID = b.pipelineID
+	rc.TaskID = b.taskID
+	rc.Sequence = b.nextSeq()
+	rc.Created = now
+	rc.Accessed = now
+	rc.Status = ClaimStatusPending
+	rc.Iteration = b.iteration + 1
+	rc.ActionType = replacements.Type
+	rc.StatusHistory = append(rc.StatusHistory, StatusChange{
+		To:      string(ClaimStatusPending),
+		Reason:  "remediation for rejected claim " + rejectedID,
+		AgentID: agentID,
+		Changed: now,
+	})
+	if !HasRelation(rc.Relations, RelationshipSupersedes, rejectedID) {
+		rc.Relations = append(rc.Relations, Relation{
+			Related:      rejectedID,
+			RelatedType:  RelatedTypeClaim,
+			Relationship: RelationshipSupersedes,
+		})
+	}
+	if !HasRelation(rc.Relations, RelationshipClaimAction, replacements.ID) {
+		rc.Relations = append(rc.Relations, Relation{
+			Related:      replacements.ID,
+			RelatedType:  RelatedTypeAction,
+			Relationship: RelationshipClaimAction,
+		})
+	}
+	b.stampValidationsLocked(rc, now)
 }
 
 // ── Phase Transitions ───────────────────────────────────────────────
@@ -502,19 +695,29 @@ func (b *ClaimsBoard) TransitionToValidation(_ context.Context) error {
 		b.mu.Unlock()
 		return fmt.Errorf("cannot transition to validation from %s", b.phase)
 	}
-	for _, c := range b.claims {
-		if c.Status == ClaimStatusSuperseded {
-			continue
-		}
-		if c.Status != ClaimStatusTestified && c.Status != ClaimStatusAccepted {
-			b.mu.Unlock()
-			return fmt.Errorf("claim %q has status %s, expected testified or accepted", c.ID, c.Status)
-		}
+	if err := b.ensureAllTestifiedLocked(); err != nil {
+		b.mu.Unlock()
+		return err
 	}
+	fromPhase := b.phase
 	b.phase = BoardPhaseValidation
+	b.logPhaseTransitionLocked(fromPhase, b.phase, "all claims testified", "")
 	phase, iteration := b.phase, b.iteration
 	b.mu.Unlock()
-	b.amplifier.EmitBoardPhaseChanged(context.Background(), phase, iteration, "")
+
+	ctx := context.Background()
+	b.amplifier.EmitBoardPhaseChanged(ctx, phase, iteration, "")
+	b.amplifier.PublishPhaseDelta(ctx, PhaseDelta{
+		SessionID: b.sessionID,
+		BoardID:   b.boardID,
+		TaskID:    b.taskID,
+		Sequence:  b.seq.Load(),
+		EmittedAt: time.Now().UTC(),
+		FromPhase: fromPhase,
+		ToPhase:   phase,
+		Iteration: iteration,
+		Reason:    "all claims testified",
+	})
 	b.notifySubscribers()
 	return nil
 }
@@ -525,26 +728,34 @@ func (b *ClaimsBoard) TransitionToImplementation(_ context.Context) error {
 		b.mu.Unlock()
 		return fmt.Errorf("cannot transition to implementation from %s", b.phase)
 	}
-	hasPending := false
-	for _, c := range b.claims {
-		if c.Status == ClaimStatusPending {
-			hasPending = true
-			break
-		}
-	}
-	if !hasPending {
+	if err := b.requirePendingClaimLocked(); err != nil {
 		b.mu.Unlock()
-		return fmt.Errorf("no pending claims exist for re-entry to implementation")
+		return err
 	}
 	if b.iteration >= b.maxIterations {
 		b.mu.Unlock()
 		return fmt.Errorf("max iterations (%d) reached, cannot re-enter implementation", b.maxIterations)
 	}
+	fromPhase := b.phase
 	b.iteration++
 	b.phase = BoardPhaseImplementation
+	b.logPhaseTransitionLocked(fromPhase, b.phase, "remediation re-entry", "")
 	phase, iteration := b.phase, b.iteration
 	b.mu.Unlock()
-	b.amplifier.EmitBoardPhaseChanged(context.Background(), phase, iteration, "")
+
+	ctx := context.Background()
+	b.amplifier.EmitBoardPhaseChanged(ctx, phase, iteration, "")
+	b.amplifier.PublishPhaseDelta(ctx, PhaseDelta{
+		SessionID: b.sessionID,
+		BoardID:   b.boardID,
+		TaskID:    b.taskID,
+		Sequence:  b.seq.Load(),
+		EmittedAt: time.Now().UTC(),
+		FromPhase: fromPhase,
+		ToPhase:   phase,
+		Iteration: iteration,
+		Reason:    "remediation re-entry",
+	})
 	b.notifySubscribers()
 	return nil
 }
@@ -555,28 +766,95 @@ func (b *ClaimsBoard) MarkComplete(_ context.Context) error {
 		b.mu.Unlock()
 		return fmt.Errorf("cannot mark complete from %s", b.phase)
 	}
+	if err := b.ensureAllAcceptedLocked(); err != nil {
+		b.mu.Unlock()
+		return err
+	}
+	fromPhase := b.phase
+	b.phase = BoardPhaseComplete
+	b.logPhaseTransitionLocked(fromPhase, b.phase, "all claims accepted", "")
+	phase, iteration := b.phase, b.iteration
+	b.mu.Unlock()
+
+	ctx := context.Background()
+	b.amplifier.EmitBoardComplete(ctx, "")
+	b.amplifier.PublishPhaseDelta(ctx, PhaseDelta{
+		SessionID: b.sessionID,
+		BoardID:   b.boardID,
+		TaskID:    b.taskID,
+		Sequence:  b.seq.Load(),
+		EmittedAt: time.Now().UTC(),
+		FromPhase: fromPhase,
+		ToPhase:   phase,
+		Iteration: iteration,
+		Reason:    "all claims accepted",
+	})
+	b.notifySubscribers()
+	return nil
+}
+
+func (b *ClaimsBoard) ensureAllTestifiedLocked() error {
+	for _, c := range b.claims {
+		if c.Status == ClaimStatusSuperseded {
+			continue
+		}
+		if c.Status != ClaimStatusTestified && c.Status != ClaimStatusAccepted {
+			return fmt.Errorf("claim %q has status %s, expected testified or accepted", c.ID, c.Status)
+		}
+	}
+	return nil
+}
+
+func (b *ClaimsBoard) requirePendingClaimLocked() error {
+	for _, c := range b.claims {
+		if c.Status == ClaimStatusPending {
+			return nil
+		}
+	}
+	return fmt.Errorf("no pending claims exist for re-entry to implementation")
+}
+
+func (b *ClaimsBoard) ensureAllAcceptedLocked() error {
 	for _, c := range b.claims {
 		if c.Status == ClaimStatusSuperseded {
 			continue
 		}
 		if c.Status != ClaimStatusAccepted {
-			b.mu.Unlock()
 			return fmt.Errorf("claim %q has status %s, expected accepted", c.ID, c.Status)
 		}
 	}
-	b.phase = BoardPhaseComplete
-	b.mu.Unlock()
-	b.amplifier.EmitBoardComplete(context.Background(), "")
-	b.notifySubscribers()
 	return nil
+}
+
+func (b *ClaimsBoard) logPhaseTransitionLocked(from, to BoardPhase, reason, agentID string) {
+	b.phaseLog = append(b.phaseLog, StatusChange{
+		From:    string(from),
+		To:      string(to),
+		Reason:  reason,
+		AgentID: agentID,
+		Changed: time.Now().UTC(),
+	})
 }
 
 // ── Queries ─────────────────────────────────────────────────────────
 
 func (b *ClaimsBoard) Projection() *ClaimsBoardProjection {
 	b.mu.RLock()
-	p := b.projectionLocked()
+	hasErrors := len(b.notificationErrors) > 0
 	b.mu.RUnlock()
+
+	if !hasErrors {
+		b.mu.RLock()
+		p := b.projectionLocked()
+		b.mu.RUnlock()
+		return p
+	}
+
+	// Slow path: projection + drain atomically under write lock.
+	b.mu.Lock()
+	p := b.projectionLocked()
+	b.notificationErrors = b.notificationErrors[:0]
+	b.mu.Unlock()
 	return p
 }
 
@@ -589,6 +867,19 @@ func (b *ClaimsBoard) projectionLocked() *ClaimsBoardProjection {
 		Updated:   time.Now().UTC(),
 	}
 
+	b.populateClaimsProjectionLocked(p)
+	b.populateActionsProjectionLocked(p)
+	b.populateTestamentsProjectionLocked(p)
+
+	if len(b.notificationErrors) > 0 {
+		p.NotificationErrors = make([]string, len(b.notificationErrors))
+		copy(p.NotificationErrors, b.notificationErrors)
+	}
+
+	return p
+}
+
+func (b *ClaimsBoard) populateClaimsProjectionLocked(p *ClaimsBoardProjection) {
 	for _, id := range b.claimOrder {
 		c, ok := b.claims[id]
 		if !ok {
@@ -597,45 +888,55 @@ func (b *ClaimsBoard) projectionLocked() *ClaimsBoardProjection {
 		clone := *c
 		p.Claims = append(p.Claims, clone)
 		p.TotalClaims++
-		switch c.Status {
-		case ClaimStatusPending:
-			p.PendingCount++
-		case ClaimStatusInProgress:
-			p.InProgressCount++
-		case ClaimStatusTestified:
-			p.TestifiedCount++
-		case ClaimStatusAccepted:
-			p.AcceptedCount++
-		case ClaimStatusRejected:
-			p.RejectedCount++
-		}
-		for _, v := range c.Validations {
-			p.TotalValidations++
-			switch v.Status {
-			case ValidationStatusPassed:
-				p.PassedValidations++
-			case ValidationStatusFailed:
-				p.FailedValidations++
-			case ValidationStatusSkipped:
-				p.SkippedValidations++
-			}
+		incrementClaimStatusCount(p, c.Status)
+		incrementValidationCounts(p, c.Validations)
+	}
+}
+
+func incrementClaimStatusCount(p *ClaimsBoardProjection, status ClaimStatus) {
+	switch status {
+	case ClaimStatusPending:
+		p.PendingCount++
+	case ClaimStatusInProgress:
+		p.InProgressCount++
+	case ClaimStatusTestified:
+		p.TestifiedCount++
+	case ClaimStatusAccepted:
+		p.AcceptedCount++
+	case ClaimStatusRejected:
+		p.RejectedCount++
+	}
+}
+
+func incrementValidationCounts(p *ClaimsBoardProjection, validations []*Validation) {
+	for _, v := range validations {
+		p.TotalValidations++
+		switch v.Status {
+		case ValidationStatusPassed:
+			p.PassedValidations++
+		case ValidationStatusFailed:
+			p.FailedValidations++
+		case ValidationStatusSkipped:
+			p.SkippedValidations++
 		}
 	}
+}
 
+func (b *ClaimsBoard) populateActionsProjectionLocked(p *ClaimsBoardProjection) {
 	for _, a := range b.actions {
 		clone := *a
 		p.Actions = append(p.Actions, clone)
 		p.TotalClaimActions++
 	}
+}
 
+func (b *ClaimsBoard) populateTestamentsProjectionLocked(p *ClaimsBoardProjection) {
 	for _, t := range b.testaments {
 		clone := *t
 		p.Testaments = append(p.Testaments, clone)
 		p.TotalTestaments++
 		p.TotalArtifacts += len(t.Artifacts)
 	}
-
-	return p
 }
 
 func (b *ClaimsBoard) ReadyForValidation() bool {
@@ -737,6 +1038,19 @@ func (b *ClaimsBoard) FailedValidations() []*Validation {
 	return out
 }
 
+// PhaseHistory returns a defensive copy of the phase transition log.
+// Used by the show_phase_history skill.
+func (b *ClaimsBoard) PhaseHistory() []StatusChange {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if len(b.phaseLog) == 0 {
+		return nil
+	}
+	out := make([]StatusChange, len(b.phaseLog))
+	copy(out, b.phaseLog)
+	return out
+}
+
 // ── Subscription ────────────────────────────────────────────────────
 
 func (b *ClaimsBoard) SubscribeProjection(fn ClaimsBoardSubscriber) func() {
@@ -769,8 +1083,9 @@ func (b *ClaimsBoard) SubscribeProjection(fn ClaimsBoardSubscriber) func() {
 // concurrently via tracked goroutines. When scope is nil (tests),
 // subscribers are notified synchronously.
 //
-// Subscriber errors are logged but do not block the mutation.
-// Panics are NOT recovered — they are bugs.
+// Subscriber errors are accumulated on notificationErrors and
+// surfaced in the next Projection() call. They do not block the
+// mutation. Panics are NOT recovered — they are bugs.
 func (b *ClaimsBoard) notifySubscribers() {
 	b.mu.RLock()
 	proj := b.projectionLocked()
@@ -788,27 +1103,83 @@ func (b *ClaimsBoard) notifySubscribers() {
 	}
 
 	for _, fn := range subs {
-		fn := fn // capture for goroutine
-		if b.scope != nil {
-			if err := b.scope.Go("claims_board_notify", 5*time.Second, func(_ context.Context) error {
-				return fn(proj)
-			}); err != nil {
-				slog.Error("claims_board_notify_dispatch_failed",
-					"board_id", b.boardID,
-					"error", err.Error(),
-				)
-			}
-		} else {
-			// Synchronous fallback (tests, standalone).
-			if err := fn(proj); err != nil {
-				slog.Error("claims_board_subscriber_error",
-					"board_id", b.boardID,
-					"error", err.Error(),
-				)
-			}
-		}
+		b.dispatchSubscriber(fn, proj)
 	}
 }
+
+func (b *ClaimsBoard) dispatchSubscriber(fn ClaimsBoardSubscriber, proj *ClaimsBoardProjection) {
+	if b.scope == nil {
+		if err := fn(proj); err != nil {
+			b.RecordNotificationError("subscriber callback: " + err.Error())
+		}
+		return
+	}
+	err := b.scope.Go(subscriberNotifyTaskLabel, subscriberNotifyTimeout, func(_ context.Context) error {
+		if cbErr := fn(proj); cbErr != nil {
+			b.RecordNotificationError("subscriber callback: " + cbErr.Error())
+			return cbErr
+		}
+		return nil
+	})
+	if err != nil {
+		b.RecordNotificationError("dispatch: " + err.Error())
+	}
+}
+
+// RecordNotificationError appends a notification or operational failure
+// to the board. Surfaced in the next Projection() call so agents can
+// record them as testament error artifacts. Thread-safe.
+func (b *ClaimsBoard) RecordNotificationError(msg string) {
+	b.mu.Lock()
+	b.notificationErrors = append(b.notificationErrors, msg)
+	b.mu.Unlock()
+}
+
+// ── Read-path accessors used by pull_work / context queries ─────────
+
+// CloneClaim returns a defensive copy of the claim by id. ok=false
+// when the claim isn't on the board.
+func (b *ClaimsBoard) CloneClaim(id string) (*Claim, bool) {
+	return b.ClaimByID(id)
+}
+
+// CloneAction returns a defensive copy of the action by id.
+func (b *ClaimsBoard) CloneAction(id string) (*Action, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	a, ok := b.actions[id]
+	if !ok {
+		return nil, false
+	}
+	clone := *a
+	return &clone, true
+}
+
+// CloneTestament returns a defensive copy of the testament by id.
+func (b *ClaimsBoard) CloneTestament(id string) (*Testament, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	t, ok := b.testaments[id]
+	if !ok {
+		return nil, false
+	}
+	clone := *t
+	return &clone, true
+}
+
+// ObjectIDsWithRelation returns every object ID whose Relations
+// contain the queried (RelatedType, Relationship, RelatedID) triple.
+// Backed by the relationsIdx so the query is O(1) + hits in index.
+func (b *ClaimsBoard) ObjectIDsWithRelation(relatedType, relationship, relatedID string) []string {
+	return b.relationsIdx.objectsWithRelation(relatedType, relationship, relatedID)
+}
+
+// ClaimIDsWithScope returns claim IDs whose Scope matches.
+func (b *ClaimsBoard) ClaimIDsWithScope(scopeKind, key string) []string {
+	return b.relationsIdx.claimsWithScope(scopeKind, key)
+}
+
+// ── Internal helpers ────────────────────────────────────────────────
 
 func (b *ClaimsBoard) nextSeq() uint64 {
 	return b.seq.Add(1)

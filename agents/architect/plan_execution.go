@@ -2,12 +2,14 @@ package architect
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/google/uuid"
 )
 
@@ -285,6 +287,20 @@ func (a *Architect) dispatchPlanExecution(
 	_ *ArchitectRequest,
 	plan *DesignPlan,
 ) (*ConversationResult, bool) {
+	// Post dispatch claim: architect handing off plan to orchestrator.
+	a.architectPostClaim(ctx,
+		architectClaimAction(claims.ActionTypeTask),
+		architectClaim(
+			"Dispatch plan "+plan.ID+" to orchestrator",
+			fmt.Sprintf("Plan with %d tasks ready for execution", len(plan.Tasks)),
+			[]claims.ClaimScopeEntry{{Kind: "plan", Key: plan.ID}},
+			claims.ActionTypeTask,
+			[]*claims.Validation{
+				architectValidation(claims.ValidationTypeReceipt, true, "Orchestrator acknowledges plan receipt", "PlanHandoffReceipt.Status >= Accepted"),
+			},
+		),
+	)
+
 	a.logInfo("dispatchPlanExecution: entry",
 		"plan_id", plan.ID,
 		"plan_status", plan.SM().State().String(),

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -33,9 +35,17 @@ type HealthMonitor struct {
 	agentUsage map[string]*usageEntry
 	modelUsage map[string]*usageEntry
 
-	running bool
-	cancel  context.CancelFunc
-	onEvent OnEventFunc
+	running       bool
+	cancel        context.CancelFunc
+	onEvent       OnEventFunc
+	boardProvider func() *claims.ClaimsBoard
+}
+
+// SetBoardProvider injects the claims board lookup for health monitoring claims.
+func (hm *HealthMonitor) SetBoardProvider(bp func() *claims.ClaimsBoard) {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+	hm.boardProvider = bp
 }
 
 // usageEntry tracks token and cost usage for a single agent or model.
@@ -90,7 +100,8 @@ func NewHealthMonitor(interval, agentTimeout time.Duration, tokenBudget, costBud
 	}
 }
 
-// Start begins periodic health checks.
+// Start begins periodic health checks. Prefer StartWithScope when a
+// GoroutineScope is available to track the ticker goroutine.
 func (hm *HealthMonitor) Start(ctx context.Context) {
 	hm.mu.Lock()
 	if hm.running {
@@ -103,6 +114,28 @@ func (hm *HealthMonitor) Start(ctx context.Context) {
 	hm.mu.Unlock()
 
 	go hm.tickerLoop(tickCtx)
+}
+
+// StartWithScope begins periodic health checks with the goroutine
+// tracked via the provided scope.
+func (hm *HealthMonitor) StartWithScope(ctx context.Context, scope *concurrency.GoroutineScope) {
+	hm.mu.Lock()
+	if hm.running {
+		hm.mu.Unlock()
+		return
+	}
+	hm.running = true
+	tickCtx, cancel := context.WithCancel(ctx)
+	hm.cancel = cancel
+	hm.mu.Unlock()
+
+	if err := scope.Go("guardian_health_monitor", 0, func(_ context.Context) error {
+		hm.tickerLoop(tickCtx)
+		return nil
+	}); err != nil {
+		// Scope rejected — fall back to untracked goroutine.
+		go hm.tickerLoop(tickCtx)
+	}
 }
 
 // Stop halts health monitoring.
@@ -389,6 +422,7 @@ func (hm *HealthMonitor) tickerLoop(ctx context.Context) {
 			anomalies := hm.DetectAnomalies()
 			hm.mu.RLock()
 			onEvt := hm.onEvent
+			bp := hm.boardProvider
 			hm.mu.RUnlock()
 			if onEvt != nil && len(anomalies) > 0 {
 				onEvt(agentlog.EventHealthAlert, "warn", &agentlog.HealthPayload{
@@ -396,6 +430,35 @@ func (hm *HealthMonitor) tickerLoop(ctx context.Context) {
 					Metric: fmt.Sprintf("%d health anomalies detected", len(anomalies)),
 				})
 			}
+			hm.submitHealthTestament(ctx, bp, anomalies)
 		}
+	}
+}
+
+func (hm *HealthMonitor) submitHealthTestament(ctx context.Context, bp func() *claims.ClaimsBoard, anomalies []Finding) {
+	if bp == nil {
+		return
+	}
+	board := bp()
+	if board == nil {
+		return
+	}
+
+	summary := "System healthy — 0 anomalies"
+	if n := len(anomalies); n > 0 {
+		summary = fmt.Sprintf("%d health anomalies detected", n)
+	}
+
+	artifacts := []*claims.Artifact{
+		guardianJSONArtifact("", "health_snapshot", hm.AllSnapshots()),
+		guardianJSONArtifact("", "budget_status", hm.BudgetSnapshot()),
+	}
+	for _, a := range anomalies {
+		artifacts = append(artifacts, guardianArtifact("", "anomaly", a.Title))
+	}
+
+	testament := guardianTestament("", summary, "committed", "", artifacts)
+	if err := board.SubmitTestaments(ctx, guardianTestamentAction(), []claims.Testament{testament}); err != nil {
+		board.RecordNotificationError("health testament: " + err.Error())
 	}
 }

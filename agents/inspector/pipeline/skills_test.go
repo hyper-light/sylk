@@ -234,7 +234,7 @@ func TestPipelineInspectorDefaultToolDefinitionsExcludeValidationAndGradeTools(t
 	// process_validation and finalize_pipeline collapsed into
 	// pipeline_protocol(action=…); the per-verb skills stay in the
 	// registry but no longer surface on the default tool catalog.
-	for _, want := range []string{"search_skills", "define_criteria", "pipeline_protocol"} {
+	for _, want := range []string{"search_skills", "define_criteria", "fabric_query_claims_board"} {
 		if !containsName(names, want) {
 			t.Fatalf("tool definitions missing %q: %v", want, names)
 		}

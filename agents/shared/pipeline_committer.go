@@ -22,7 +22,7 @@ type SessionVFSPipelineCommitterBackend interface {
 // the active session ID extracted from the handler's request context and
 // returns the matching SessionVFS (nil if the session no longer exists).
 //
-// The pipeline inspector wires this at construction time so handoff_to_green
+// The pipeline inspector wires this at construction time so handoff_to_ot
 // and discard_pipeline perform the lifecycle mutation themselves rather
 // than broadcasting status and waiting for an out-of-process actor (the
 // orchestrator, historically) to react.

@@ -17,6 +17,7 @@ import (
 	"github.com/adalundhe/sylk/core/activity/activitystore"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
@@ -95,6 +96,7 @@ type Orchestrator struct {
 	// in-flight commitments before producing incompatible work.
 	decisionManifest *DecisionManifestStore
 	scope            *concurrency.GoroutineScope
+	claimsInbox      *claims.ClaimsInbox
 
 	// Pipeline subscriptions
 	pipelineSubs []guide.Subscription
@@ -859,10 +861,21 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 	if o.provider != nil && o.eventCh != nil {
 		o.llmCtx, o.llmCancel = context.WithCancel(context.Background())
 		o.llmWg.Add(1)
-		go func() {
-			defer o.llmWg.Done()
-			o.runLLMLoop(o.llmCtx)
-		}()
+		if o.scope != nil {
+			if err := o.scope.Go("orchestrator_llm_loop", 0, func(_ context.Context) error {
+				defer o.llmWg.Done()
+				o.runLLMLoop(o.llmCtx)
+				return nil
+			}); err != nil {
+				o.llmWg.Done()
+				slog.Error("orchestrator_llm_loop_launch_failed", "error", err.Error())
+			}
+		} else {
+			go func() {
+				defer o.llmWg.Done()
+				o.runLLMLoop(o.llmCtx)
+			}()
+		}
 	}
 
 	// Wire data plane if available
@@ -885,6 +898,21 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 		// expiry — no reaper goroutine needed; cache eviction handles it.
 	}
 
+	// Claims intake: event-driven delta processing.
+	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
+		AgentID:      o.config.AgentID,
+		SessionID:    o.SessionID(),
+		Bus:          o.bus,
+		Board:        o.orchestratorBoard(),
+		Scope:        o.scope,
+		ProcessEntry: o.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("orchestrator_claims_inbox_start_failed", "error", err.Error())
+		}
+		o.claimsInbox = inbox
+	}
+
 	o.running = true
 	hasProvider := o.provider != nil
 	o.mu.Unlock()
@@ -894,6 +922,10 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 		llmStatus = "Gemini Flash active"
 	}
 	o.publishActivity(events.EventTypeSuccess, "Orchestrator started ("+llmStatus+")")
+	o.orchestratorSubmitTestament(context.Background(), o.orchestratorTestament(
+		"Orchestrator started ("+llmStatus+")", "committed",
+		[]*claims.Artifact{o.orchestratorArtifact("llm_status", llmStatus)},
+	))
 
 	return nil
 }
@@ -939,6 +971,16 @@ func (o *Orchestrator) Stop() error {
 	o.running = false
 	llmCancel := o.llmCancel
 	o.mu.Unlock()
+
+	if o.claimsInbox != nil {
+		_ = o.claimsInbox.Close()
+		o.claimsInbox = nil
+	}
+
+	// Submit stop testament before resources are torn down.
+	o.orchestratorSubmitTestament(context.Background(), o.orchestratorTestament(
+		"Orchestrator stopping", "committed", nil,
+	))
 
 	o.steering.CloseAll()
 
@@ -1205,6 +1247,13 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	ctx := reqCtx
 	startTime := time.Now()
 
+	// TestamentAccumulator: collects per-request observations, flushed as one
+	// composite testament when handleBusRequest exits.
+	acc := claims.NewTestamentAccumulator("orchestrator", fwd.SessionID)
+	defer acc.Flush(ctx, o.orchestratorBoard(), o.orchestratorScope())
+	acc.Note("Request received from " + fwd.SourceAgentID)
+	ctx = claims.WithTestamentAccumulator(ctx, acc)
+
 	if o.factory != nil && o.identity != nil {
 		task, taskErr := o.factory.NewTask(identity.TaskOptions{
 			DisplayID:   fwd.CorrelationID,
@@ -1261,6 +1310,10 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	gov := shared.NewContextGovernor(o.config.Model, o.config.MaxOutputTokens, 0)
 	if o.handoffBridge != nil && shared.AutomaticHandoffEnabled(ctx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			o.orchestratorSubmitTestament(bctx, o.orchestratorTestament(
+				"Context budget exhausted — forcing handoff", "committed",
+				[]*claims.Artifact{o.orchestratorArtifact("error", "context budget exhausted")},
+			))
 			bridge := shared.EffectiveHandoffBridge(bctx, o.handoffBridge)
 			if bridge == nil {
 				return shared.ErrContextBudgetExhausted
@@ -1304,6 +1357,16 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 		"duration", time.Since(startTime))
 
 	if err != nil {
+		acc.Record("error", err.Error())
+		acc.Note("Request failed: " + truncateOrchestrator(err.Error(), 80))
+		o.orchestratorSubmitTestament(ctx, o.orchestratorTestament(
+			"Request failed: "+truncateOrchestrator(err.Error(), 60), "committed",
+			[]*claims.Artifact{
+				o.orchestratorArtifact("error", err.Error()),
+				o.orchestratorArtifact("correlation_id", fwd.CorrelationID),
+				o.orchestratorArtifact("processing_time_ms", fmt.Sprintf("%d", time.Since(startTime).Milliseconds())),
+			},
+		))
 		if publishStreamLifecycle {
 			o.publishStreamError(ctx, err)
 			o.publishStreamComplete(ctx, "", usageAcc.Total())
@@ -1357,6 +1420,15 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	if o.agentPod != nil {
 		o.agentPod.FeedScribe("orchestrator", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
 	}
+
+	acc.Note("Request completed successfully")
+	o.orchestratorSubmitTestament(ctx, o.orchestratorTestament(
+		"Request completed", "committed",
+		[]*claims.Artifact{
+			o.orchestratorArtifact("correlation_id", fwd.CorrelationID),
+			o.orchestratorArtifact("processing_time_ms", fmt.Sprintf("%d", time.Since(startTime).Milliseconds())),
+		},
+	))
 
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
@@ -1437,6 +1509,13 @@ func (o *Orchestrator) handleRegistryAnnouncement(msg *guide.Message) error {
 			Summary:   fmt.Sprintf("Agent %q registered", ann.AgentID),
 			Data:      map[string]any{"agent_id": ann.AgentID},
 		})
+		o.orchestratorSubmitTestament(context.Background(), o.orchestratorTestament(
+			"Observed agent registration: "+ann.AgentID, "committed",
+			[]*claims.Artifact{
+				o.orchestratorArtifact("agent_id", ann.AgentID),
+				o.orchestratorArtifact("agent_type", ann.AgentType),
+			},
+		))
 	case guide.MessageTypeAgentUnregistered:
 		delete(o.knownAgents, ann.AgentID)
 		o.healthMonitor.UnregisterAgent(ann.AgentID)
@@ -1447,6 +1526,13 @@ func (o *Orchestrator) handleRegistryAnnouncement(msg *guide.Message) error {
 			Summary:   fmt.Sprintf("Agent %q unregistered", ann.AgentID),
 			Data:      map[string]any{"agent_id": ann.AgentID},
 		})
+		o.orchestratorSubmitTestament(context.Background(), o.orchestratorTestament(
+			"Observed agent unregistration: "+ann.AgentID, "committed",
+			[]*claims.Artifact{
+				o.orchestratorArtifact("agent_id", ann.AgentID),
+				o.orchestratorArtifact("agent_type", ann.AgentType),
+			},
+		))
 	}
 
 	return nil
@@ -1500,6 +1586,15 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 		"agent_type":      dispatch.agentType,
 		"pipeline_status": pipelineStatus,
 	})
+	o.orchestratorSubmitTestament(context.Background(), o.orchestratorTestament(
+		"Task dispatched: "+dispatch.agentType+" for "+truncateOrchestrator(dispatch.taskSlug, 40), "committed",
+		[]*claims.Artifact{
+			o.orchestratorArtifact("task_id", dispatch.taskID),
+			o.orchestratorArtifact("node_id", dispatch.nodeID),
+			o.orchestratorArtifact("dag_id", dispatch.dagID),
+			o.orchestratorArtifact("agent_type", dispatch.agentType),
+		},
+	))
 	o.enrichTaskDispatchCoordination(dispatch)
 	o.routeTaskDispatch(router, dispatch)
 	o.warmTaskDispatchCoordination(dispatch)
@@ -1606,7 +1701,7 @@ func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 	o.mu.Unlock()
 
 	// Authority discipline: the orchestrator does not commit task drafts.
-	// The pipeline inspector's handoff_to_green already extracted the review
+	// The pipeline inspector's handoff_to_ot already extracted the review
 	// candidate (or discard_pipeline rolled back) inside its skill handler.
 	// This handler is now strictly task-bookkeeping. See
 	// finalizePipelineUpdate for the rationale.
@@ -1638,6 +1733,14 @@ func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 	if o.coordination != nil {
 		_ = o.coordination.ReleaseTaskClaims(context.Background(), taskID)
 	}
+	o.orchestratorSubmitTestament(context.Background(), o.orchestratorTestament(
+		"Task completed: "+truncateOrchestrator(taskID, 40), "committed",
+		[]*claims.Artifact{
+			o.orchestratorArtifact("task_id", taskID),
+			o.orchestratorArtifact("agent_id", task.AssignedAgentID),
+			o.orchestratorArtifact("workflow_id", task.WorkflowID),
+		},
+	))
 
 	o.pushEvent(&busEvent{
 		Topic:     "tasks.complete",
@@ -1717,6 +1820,15 @@ func (o *Orchestrator) handleTaskFailed(msg *guide.Message) error {
 	if o.coordination != nil {
 		_ = o.coordination.ReleaseTaskClaims(context.Background(), taskID)
 	}
+	o.orchestratorSubmitTestament(context.Background(), o.orchestratorTestament(
+		"Task failed: "+truncateOrchestrator(taskID, 40), "committed",
+		[]*claims.Artifact{
+			o.orchestratorArtifact("task_id", taskID),
+			o.orchestratorArtifact("agent_id", task.AssignedAgentID),
+			o.orchestratorArtifact("error", errorMsg),
+			o.orchestratorArtifact("workflow_id", task.WorkflowID),
+		},
+	))
 
 	o.pushEvent(&busEvent{
 		Topic:     "tasks.failed",

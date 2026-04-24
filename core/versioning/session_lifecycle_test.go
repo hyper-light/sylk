@@ -111,6 +111,139 @@ func TestSessionLifecycle_CleanCloseAndReopenPreservesCommitQueue(t *testing.T) 
 	}
 }
 
+// TestSessionLifecycle_OverlayWritesSurviveReopen verifies §3.6
+// durability: a ReplicaVFS that received writes through the
+// overlay-WAL layer reconstructs that content on session reopen.
+// This is Stage 5's "full Open replay: commit queue, retention,
+// lifecycle, chain, overlays" — the overlay leg specifically.
+func TestSessionLifecycle_OverlayWritesSurviveReopen(t *testing.T) {
+	dir := t.TempDir()
+	workDir := filepath.Join(dir, "work")
+	storageRoot := filepath.Join(dir, "session")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := SessionVFSConfig{
+		SessionID:   "sess-overlay-replay",
+		WorkingDir:  workDir,
+		StorageRoot: storageRoot,
+	}
+
+	// Session 1: create merge descriptor + ReplicaVFS + write overlay.
+	sess1, err := NewSessionVFS(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ver := SemanticVersion{Minor: 1}
+	desc := MergeDescriptor{
+		PipelineID:    "p1",
+		BaseVersion:   SemanticVersion{},
+		MergedVersion: ver,
+		Paths:         []string{"audit-authored.md"},
+	}
+	sess1.RecordMergeDescriptorForTest(desc)
+	vfs1, err := sess1.BeginAuditReplicaVFS(ver, "replica-holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Inspector + tester each write different content.
+	if err := vfs1.Write("inspector-replica", "audit-authored.md", []byte("inspector notes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := vfs1.Write("tester-replica", "tests/audit.spec", []byte("tester-authored test")); err != nil {
+		t.Fatal(err)
+	}
+	if err := vfs1.Delete("inspector-replica", "stale.md"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := sess1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Session 2: reopen. Overlay state must be reconstructed from
+	// the WAL so a session that crashed mid-audit doesn't lose
+	// writes / deletes.
+	sess2, err := NewSessionVFS(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess2.Close()
+
+	vfs2 := sess2.LookupAuditReplicaVFS(ver)
+	if vfs2 == nil {
+		t.Fatal("reopen: ReplicaVFS for ver 0.1 not reconstructed from WAL")
+	}
+	got, err := vfs2.Read("audit-authored.md")
+	if err != nil {
+		t.Fatalf("reopen read inspector write: %v", err)
+	}
+	if string(got) != "inspector notes" {
+		t.Errorf("inspector write post-reopen = %q, want %q", got, "inspector notes")
+	}
+	got, err = vfs2.Read("tests/audit.spec")
+	if err != nil {
+		t.Fatalf("reopen read tester write: %v", err)
+	}
+	if string(got) != "tester-authored test" {
+		t.Errorf("tester write post-reopen = %q, want %q", got, "tester-authored test")
+	}
+	if _, err := vfs2.Read("stale.md"); err == nil {
+		t.Error("stale.md readable post-reopen — delete shadow lost")
+	}
+}
+
+// TestSessionLifecycle_OverlaySealAndAbandonSurviveReopen confirms
+// that Seal + Abandon terminal markers are also replayed.
+func TestSessionLifecycle_OverlaySealAndAbandonSurviveReopen(t *testing.T) {
+	dir := t.TempDir()
+	workDir := filepath.Join(dir, "work")
+	storageRoot := filepath.Join(dir, "session")
+	_ = os.MkdirAll(workDir, 0o755)
+	cfg := SessionVFSConfig{
+		SessionID:   "sess-overlay-terminal",
+		WorkingDir:  workDir,
+		StorageRoot: storageRoot,
+	}
+	sess1, err := NewSessionVFS(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealedVer := SemanticVersion{Minor: 1}
+	abandonedVer := SemanticVersion{Minor: 2}
+	for _, d := range []MergeDescriptor{
+		{PipelineID: "p1", MergedVersion: sealedVer},
+		{PipelineID: "p2", MergedVersion: abandonedVer},
+	} {
+		sess1.RecordMergeDescriptorForTest(d)
+	}
+	sealed, _ := sess1.BeginAuditReplicaVFS(sealedVer, "holder-seal")
+	abandoned, _ := sess1.BeginAuditReplicaVFS(abandonedVer, "holder-abandon")
+	_ = sealed.Write("r", "x.go", []byte("seal content"))
+	if _, err := sealed.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := abandoned.Abandon(); err != nil {
+		t.Fatal(err)
+	}
+	_ = sess1.Close()
+
+	sess2, err := NewSessionVFS(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess2.Close()
+
+	s := sess2.LookupAuditReplicaVFS(sealedVer)
+	if s == nil || !s.IsSealed() {
+		t.Errorf("sealed ver: IsSealed=%v (vfs=%v)", s != nil && s.IsSealed(), s)
+	}
+	a := sess2.LookupAuditReplicaVFS(abandonedVer)
+	if a == nil || !a.IsAbandoned() {
+		t.Errorf("abandoned ver: IsAbandoned=%v (vfs=%v)", a != nil && a.IsAbandoned(), a)
+	}
+}
+
 // TestSessionLifecycle_ClockSurvivesReopen verifies the session
 // clock's accumulated open-time is preserved across Close/Open
 // boundaries — critical for SLA timers that must measure in

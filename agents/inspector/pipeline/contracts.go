@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/inspector/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/toolruntime"
@@ -59,6 +60,20 @@ func (pi *PipelineInspector) seedCriteriaFromTask(task *pipelineTaskFields) {
 	criteria := compileCriteriaFromTask(task)
 	if criteria != nil {
 		pi.DefineCriteria(task.TaskID, criteria)
+
+		// Criteria seeding testament.
+		criteriaCount := len(criteria.SuccessCriteria)
+		gateCount := len(criteria.QualityGates)
+		pi.inspectorSubmitTestament(context.Background(), pi.inspectorTestament(
+			fmt.Sprintf("Criteria seeded from task: %d criteria, %d gates", criteriaCount, gateCount),
+			"committed",
+			[]*claims.Artifact{
+				pi.inspectorArtifact("task_id", task.TaskID),
+				pi.inspectorArtifact("criteria_count", fmt.Sprintf("%d", criteriaCount)),
+				pi.inspectorArtifact("gate_count", fmt.Sprintf("%d", gateCount)),
+				pi.inspectorArtifact("source", "task_contract"),
+			},
+		))
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
@@ -116,6 +117,11 @@ type GlobalTester struct {
 	// (request received, completion, error) so its work shows up in
 	// the TUI chat panel alongside the knowledge-tier agents.
 	activityPub events.ActivityPublisher
+
+	// Tracked goroutine scope for async claims dispatch.
+	scope *concurrency.GoroutineScope
+
+	claimsInbox *claims.ClaimsInbox
 }
 
 // New creates a new GlobalTester instance.
@@ -445,6 +451,21 @@ func (gt *GlobalTester) registerCoreSkills() {
 		gt.skills.Register(skill)
 	}
 
+	// Claims skills: global tester is a full claims participant —
+	// it validates merged work, posts actions about test results,
+	// and inspects cross-pipeline claim conflicts.
+	boardProvider := func() *claims.ClaimsBoard {
+		return claims.DefaultSessionBoardRegistry().Lookup(gt.config.SessionID)
+	}
+	inboxProvider := func() *claims.ClaimsInbox { return gt.claimsInbox }
+	gt.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	gt.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
+	gt.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	gt.skills.Register(claims.EvaluateValidationSkill(boardProvider))
+	gt.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
+	gt.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+	gt.skills.Register(claims.TraverseSkill(boardProvider))
+
 	// Per-merge audit skills (docs/PARALLEL_GLOBAL_VFS.md §6.4):
 	// emit_audit_decision is the terminal tool the tester calls at
 	// the end of a per-merge audit; merges_after lets it see
@@ -544,6 +565,21 @@ func (gt *GlobalTester) Start(bus guide.EventBus) error {
 	// for every merge completed by MergePipelineIntoGreen. No bus
 	// subscription for AuditMergeRequest.
 
+	// Claims intake: event-driven delta processing.
+	if inbox := agentshared.WireClaimsIntake(agentshared.ClaimsIntakeConfig{
+		AgentID:      gt.id,
+		SessionID:    gt.config.SessionID,
+		Bus:          bus,
+		Board:        claims.DefaultSessionBoardRegistry().Lookup(gt.config.SessionID),
+		Scope:        nil,
+		ProcessEntry: gt.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("global_tester_claims_inbox_start_failed", "error", err.Error())
+		}
+		gt.claimsInbox = inbox
+	}
+
 	gt.running = true
 	gt.logger.Info("global tester started", "id", gt.id)
 	return nil
@@ -553,6 +589,11 @@ func (gt *GlobalTester) Start(bus guide.EventBus) error {
 func (gt *GlobalTester) Stop() error {
 	if !gt.running {
 		return nil
+	}
+
+	if gt.claimsInbox != nil {
+		_ = gt.claimsInbox.Close()
+		gt.claimsInbox = nil
 	}
 
 	gt.steering.CloseAll()

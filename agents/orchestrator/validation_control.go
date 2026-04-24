@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/google/uuid"
@@ -365,6 +366,14 @@ func (o *Orchestrator) ensureExecutionHold(payload *agentshared.ValidationVerdic
 	if hold, err := o.store.GetActiveExecutionHold(payload.SessionID); err == nil && hold != nil {
 		return hold, nil
 	}
+	o.orchestratorSubmitTestament(context.Background(), o.orchestratorTestament(
+		"Execution hold created for "+payload.SessionID, "committed",
+		[]*claims.Artifact{
+			o.orchestratorArtifact("epoch_id", epoch.EpochID),
+			o.orchestratorArtifact("reason", string(payload.Kind)),
+			o.orchestratorArtifact("plan_id", payload.PlanID),
+		},
+	))
 	hold := &ExecutionHoldRecord{
 		HoldID:             "hold_" + uuid.NewString(),
 		SessionID:          payload.SessionID,
@@ -422,6 +431,18 @@ func (o *Orchestrator) requestArchitectRemediation(ctx context.Context, req *age
 	if targetAgentID == "" {
 		return nil, fmt.Errorf("no registered architect agent id is available")
 	}
+	o.orchestratorPostClaim(ctx,
+		claims.Action{AgentID: "orchestrator", Type: claims.ActionTypeCorrective},
+		orchestratorCorrectiveClaim(
+			"Remediation request to architect: "+req.CaseID,
+			"Validation failure requires architect remediation",
+			targetAgentID,
+			[]claims.ClaimScopeEntry{{Kind: "remediation", Key: req.CaseID}},
+			[]*claims.Validation{
+				orchestratorValidation(claims.ValidationTypeReceipt, true, "Architect processes remediation", "result != nil"),
+			},
+		),
+	)
 	respMsg, err := o.requestRouteSync(ctx, targetAgentID, req, map[string]any{
 		"control_plane_kind": agentshared.ControlPlaneKindRemediationRequest,
 		"remediation_case":   req.CaseID,
@@ -451,6 +472,13 @@ func (o *Orchestrator) applyRemediationResult(
 
 	switch result.Resolution {
 	case agentshared.RemediationResolutionFixWorkflow:
+		o.orchestratorSubmitTestament(ctx, o.orchestratorTestament(
+			"Remediation: fix workflow for "+caseRecord.CaseID, "committed",
+			[]*claims.Artifact{
+				o.orchestratorArtifact("case_id", caseRecord.CaseID),
+				o.orchestratorArtifact("resolution", string(result.Resolution)),
+			},
+		))
 		caseRecord.Status = RemediationCaseStatusAwaitingApply
 		if err := o.store.UpdateRemediationCase(caseRecord); err != nil {
 			return err
@@ -494,6 +522,13 @@ func (o *Orchestrator) applyRemediationResult(
 		)
 		return nil
 	case agentshared.RemediationResolutionCancelAndReplan:
+		o.orchestratorSubmitTestament(ctx, o.orchestratorTestament(
+			"Remediation: cancel and replan for "+caseRecord.CaseID, "committed",
+			[]*claims.Artifact{
+				o.orchestratorArtifact("case_id", caseRecord.CaseID),
+				o.orchestratorArtifact("resolution", string(result.Resolution)),
+			},
+		))
 		for _, dagID := range req.DAGIDs {
 			_ = o.dagBridge.Cancel(strings.TrimSpace(dagID), "architect remediation requested cancel and replan")
 		}
@@ -516,6 +551,13 @@ func (o *Orchestrator) applyRemediationResult(
 		)
 		return nil
 	case agentshared.RemediationResolutionNeedsUserInput:
+		o.orchestratorSubmitTestament(ctx, o.orchestratorTestament(
+			"Remediation: needs user input for "+caseRecord.CaseID, "committed",
+			[]*claims.Artifact{
+				o.orchestratorArtifact("case_id", caseRecord.CaseID),
+				o.orchestratorArtifact("resolution", string(result.Resolution)),
+			},
+		))
 		caseRecord.Status = RemediationCaseStatusNeedsUserInput
 		caseRecord.CompletedAt = &now
 		if err := o.store.UpdateRemediationCase(caseRecord); err != nil {
@@ -535,6 +577,14 @@ func (o *Orchestrator) applyRemediationResult(
 		)
 		return nil
 	case agentshared.RemediationResolutionUnrecoverable:
+		o.orchestratorSubmitTestament(ctx, o.orchestratorTestament(
+			"Remediation: unrecoverable for "+caseRecord.CaseID, "committed",
+			[]*claims.Artifact{
+				o.orchestratorArtifact("case_id", caseRecord.CaseID),
+				o.orchestratorArtifact("resolution", string(result.Resolution)),
+				o.orchestratorArtifact("error", "unrecoverable"),
+			},
+		))
 		caseRecord.Status = RemediationCaseStatusRejected
 		caseRecord.CompletedAt = &now
 		if err := o.store.UpdateRemediationCase(caseRecord); err != nil {

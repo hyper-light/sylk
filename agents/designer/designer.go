@@ -15,6 +15,7 @@ import (
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
@@ -55,6 +56,8 @@ type Designer struct {
 	usageAccum    *designerUsageAccumulator
 
 	claimsBoard *claims.ClaimsBoard
+	scope       *concurrency.GoroutineScope
+	claimsInbox *claims.ClaimsInbox
 
 	state    *DesignerState
 	stateMu  sync.RWMutex
@@ -387,6 +390,21 @@ func (d *Designer) Start(bus guide.EventBus) error {
 		return fmt.Errorf("failed to subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
+	// Claims intake: event-driven delta processing.
+	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
+		AgentID:      d.id,
+		SessionID:    d.config.SessionID,
+		Bus:          bus,
+		Board:        d.designerBoard(),
+		Scope:        d.scope,
+		ProcessEntry: d.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("designer_claims_inbox_start_failed", "error", err.Error())
+		}
+		d.claimsInbox = inbox
+	}
+
 	d.runCtx, d.runCancel = context.WithCancel(context.Background())
 	d.requestCancels = make(map[string]context.CancelFunc)
 	d.running = true
@@ -397,6 +415,11 @@ func (d *Designer) Start(bus guide.EventBus) error {
 func (d *Designer) Stop() error {
 	if !d.running {
 		return nil
+	}
+
+	if d.claimsInbox != nil {
+		_ = d.claimsInbox.Close()
+		d.claimsInbox = nil
 	}
 
 	d.steering.CloseAll()
@@ -503,6 +526,13 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	shared.EmitDispatchACK(d.bus, fwd.Metadata, d.id, "designer", fwd.CorrelationID)
+	d.designerSubmitTestament(d.runCtx, d.designerTestament(
+		"Dispatch ACK: "+truncateDesigner(fwd.CorrelationID, 40), "committed",
+		[]*claims.Artifact{
+			d.designerArtifact("correlation_id", fwd.CorrelationID),
+			d.designerArtifact("source", fwd.SourceAgentID),
+		},
+	))
 
 	if d.config.RequestGuard != nil {
 		release := d.config.RequestGuard()
@@ -592,6 +622,10 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	gov := shared.NewContextGovernor(d.config.DesignerConfig.Model, d.config.DesignerConfig.MaxTokens, 0)
 	if d.handoffBridge != nil && shared.AutomaticHandoffEnabled(ctx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			d.designerSubmitTestament(bctx, d.designerTestament(
+				"Context budget exhausted — forcing handoff", "committed",
+				[]*claims.Artifact{d.designerArtifact("error", "context budget exhausted")},
+			))
 			bridge := shared.EffectiveHandoffBridge(bctx, d.handoffBridge)
 			if bridge == nil {
 				return shared.ErrContextBudgetExhausted
@@ -638,6 +672,14 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		shared.PublishStreamComplete(d.bus, d.channels, ctx, d.id, "", usageAcc.Total())
 		resp.Error = err.Error()
 		d.publishActivity(ctx, events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
+		d.designerSubmitTestament(ctx, d.designerTestament(
+			"Design request failed: "+truncateDesigner(err.Error(), 60), "committed",
+			[]*claims.Artifact{
+				d.designerArtifact("error", err.Error()),
+				d.designerArtifact("correlation_id", fwd.CorrelationID),
+				d.designerArtifact("processing_time_ms", fmt.Sprintf("%d", resp.ProcessingTime.Milliseconds())),
+			},
+		))
 		errMsg := guide.NewErrorMessage(
 			d.generateMessageID(),
 			fwd.CorrelationID,
@@ -650,6 +692,13 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	resp.Data = result
 	shared.PublishStreamComplete(d.bus, d.channels, ctx, d.id, "", usageAcc.Total())
 	d.publishActivity(ctx, events.EventTypeSuccess, "Design task completed")
+	d.designerSubmitTestament(ctx, d.designerTestament(
+		"Design request completed", "committed",
+		[]*claims.Artifact{
+			d.designerArtifact("correlation_id", fwd.CorrelationID),
+			d.designerArtifact("processing_time_ms", fmt.Sprintf("%d", resp.ProcessingTime.Milliseconds())),
+		},
+	))
 
 	respMsg := guide.NewResponseMessage(d.generateMessageID(), resp)
 	if d.agentPod != nil {
@@ -716,9 +765,17 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 	d.setStatus(AgentStatusBusy)
 	defer d.setStatus(AgentStatusIdle)
 
+	// TestamentAccumulator: collects per-turn observations, flushed as one
+	// composite testament when handleDesign exits.
+	acc := claims.NewTestamentAccumulator("designer", d.config.SessionID)
+	defer acc.Flush(ctx, d.designerBoard(), d.designerScope())
+
 	timeout := d.config.DesignerConfig.DefaultTimeout
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
+	ctx = claims.WithTestamentAccumulator(ctx, acc)
+	acc.Note("Design task started")
 
 	userMessage := fwd.Input
 	task := shared.DecodePipelineTaskInput(fwd.Input)
@@ -733,6 +790,13 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 		if workspaceContext := shared.BuildTaskWorkspaceRuntimeContext(ctx, d.workspaceViews, task); workspaceContext != "" {
 			userMessage += "\n\n" + workspaceContext
 		}
+		// Hydrate pipeline protocol state so the LLM can use
+		// pipeline_protocol(action=handoff|challenge|validate_work|…).
+		var closePipelineState func()
+		ctx, closePipelineState = shared.OpenPipelineTaskProtocolStateWithPublisher(
+			ctx, task, d.bus, fwd.SessionID, "designer",
+		)
+		defer closePipelineState()
 	}
 	userMessage = claims.PrependBoardPreamble(userMessage, d.claimsBoard, "designer")
 	systemPrompt := d.systemPromptForContract(contract)
@@ -782,10 +846,16 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 				&agentlog.ErrorPayload{Error: err.Error()})
 		}
 		d.recordFailure(fwd.CorrelationID, err.Error(), fwd.Input)
+		acc.Record("error", err.Error())
+		acc.Note("Design task failed: " + truncateDesigner(err.Error(), 80))
 		return nil, err
 	}
 
 	inTok, outTok := d.usageAccum.Total()
+
+	acc.Record("input_tokens", fmt.Sprintf("%d", inTok))
+	acc.Record("output_tokens", fmt.Sprintf("%d", outTok))
+	acc.Note("Design task completed successfully")
 
 	return map[string]any{
 		"response":      result,
@@ -828,6 +898,13 @@ func (d *Designer) handleRegistryAnnouncement(msg *guide.Message) error {
 			d.id, "", "", "info", &agentlog.RegistryPayload{
 				AgentID: ann.AgentID, AgentType: ann.AgentType, Action: "registered",
 			})
+		d.designerSubmitTestament(context.Background(), d.designerTestament(
+			"Observed agent registration: "+ann.AgentID, "committed",
+			[]*claims.Artifact{
+				d.designerArtifact("agent_id", ann.AgentID),
+				d.designerArtifact("agent_type", ann.AgentType),
+			},
+		))
 	case guide.MessageTypeAgentUnregistered:
 		delete(d.knownAgents, ann.AgentID)
 		d.logger.Debug("agent unregistered", "agent_id", ann.AgentID)
@@ -835,6 +912,13 @@ func (d *Designer) handleRegistryAnnouncement(msg *guide.Message) error {
 			d.id, "", "", "info", &agentlog.RegistryPayload{
 				AgentID: ann.AgentID, AgentType: ann.AgentType, Action: "unregistered",
 			})
+		d.designerSubmitTestament(context.Background(), d.designerTestament(
+			"Observed agent unregistration: "+ann.AgentID, "committed",
+			[]*claims.Artifact{
+				d.designerArtifact("agent_id", ann.AgentID),
+				d.designerArtifact("agent_type", ann.AgentType),
+			},
+		))
 	}
 
 	return nil
@@ -1096,6 +1180,11 @@ func (d *Designer) SetExecutionBroker(broker purevfs.ExecutionBroker) {
 // SetClaimsBoard injects the claims board for claims-based pipelines.
 func (d *Designer) SetClaimsBoard(board *claims.ClaimsBoard) {
 	d.claimsBoard = board
+}
+
+// SetScope injects the goroutine scope for async claims dispatch.
+func (d *Designer) SetScope(scope *concurrency.GoroutineScope) {
+	d.scope = scope
 }
 
 // Terminate gracefully shuts down the designer agent.

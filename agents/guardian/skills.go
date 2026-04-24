@@ -8,9 +8,10 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -55,7 +56,7 @@ func (g *Guardian) registerCoreSkills() {
 }
 
 func (g *Guardian) registerFabricSkills() {
-	sessionID := func() string { return strings.TrimSpace(g.config.SessionID) }
+	sessionID := func() string { return strings.TrimSpace(g.activeSessionID) }
 	agentID := func() string { return g.id }
 	agentType := func() string { return "guardian" }
 
@@ -75,21 +76,35 @@ func (g *Guardian) registerFabricSkills() {
 	}) {
 		g.skills.Register(skill)
 	}
-	for _, skill := range shared.CrossPipelineSkills(shared.CrossPipelineSkillConfig{
-		SessionID:  sessionID,
-		AgentID:    agentID,
-		AgentType:  agentType,
-		PipelineID: func() string { return "" },
-		RouteSync: shared.RouteSyncFromBus(
-			func() guide.EventBus { return g.bus },
-			func() string {
-				if g.channels == nil {
-					return ""
-				}
-				return g.channels.Responses
-			},
-		),
-	}) {
+	// ── Claims skills (unconditional) ──────────────────────────────
+	//
+	// Guardian is a full safety sidecar — it observes, gates, and
+	// validates. Claims replace challenge_peer / consult_peer with
+	// post_action (issuing claims about safety violations, gating
+	// decisions, etc.) and submit_testaments (recording findings).
+	//
+	// Board is resolved from activeSessionID, which is set per-request
+	// in handleForwardBusRequest under the requestSerializer (single-
+	// writer guarantee — no race).
+	boardProvider := func() *claims.ClaimsBoard {
+		return claims.DefaultSessionBoardRegistry().Lookup(g.activeSessionID)
+	}
+	inboxProvider := func() *claims.ClaimsInbox { return g.claimsInbox }
+	g.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	g.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
+	g.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	g.skills.Register(claims.EvaluateValidationSkill(boardProvider))
+	g.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
+	g.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+	g.skills.Register(claims.TraverseSkill(boardProvider))
+
+	fabricCfg := fabric.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      sessionID,
+		AgentID:        agentID,
+		AgentType:      agentType,
+	}
+	for _, skill := range fabric.ClaimsAwarenessSkills(fabricCfg) {
 		g.skills.Register(skill)
 	}
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -54,6 +55,18 @@ func consultSkill(a *Archivalist) *skills.Skill {
 			if strings.TrimSpace(params.Target) == "academic" {
 				metadata = shared.ConsultationMetadataWithResearchDepth(nil, params.Depth)
 			}
+			a.archivalistPostClaim(ctx,
+				claims.Action{AgentID: "archivalist", Type: claims.ActionTypeConsultation},
+				archivalistConsultClaim(
+					"Consult "+params.Target+": "+truncateArchivalist(params.Query, 60),
+					"Knowledge consultation",
+					params.Target,
+					[]claims.ClaimScopeEntry{{Kind: "consultation", Key: params.Target}},
+					[]*claims.Validation{
+						archivalistValidation(claims.ValidationTypeReceipt, true, "Consultation succeeded", "evidence.Success == true"),
+					},
+				),
+			)
 			evidence, err := a.requestConsultationWithMetadata(ctx, params.Target, params.Query, params.Scope, params.SessionID, metadata)
 			if err != nil {
 				return nil, err

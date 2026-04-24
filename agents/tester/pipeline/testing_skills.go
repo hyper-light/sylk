@@ -9,6 +9,7 @@ import (
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -53,14 +54,25 @@ func testHarnessSkill(pt *PipelineTester) *skills.Skill {
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			switch strings.TrimSpace(p.Action) {
+			action := strings.TrimSpace(p.Action)
+			var result any
+			var err error
+			switch action {
 			case "detect", "":
-				return runHarnessDetect(ctx, pt, p.Files, p.TaskSpec, p.WorkerType)
+				result, err = runHarnessDetect(ctx, pt, p.Files, p.TaskSpec, p.WorkerType)
 			case "prepare":
-				return runHarnessPrepare(ctx, pt, p.Files, p.TaskSpec, p.WorkerType, p.WriteContexts)
+				result, err = runHarnessPrepare(ctx, pt, p.Files, p.TaskSpec, p.WorkerType, p.WriteContexts)
 			default:
-				return nil, fmt.Errorf("unknown test_harness action: %q (expected detect|prepare)", p.Action)
+				return nil, fmt.Errorf("unknown test_harness action: %q (expected detect|prepare)", action)
 			}
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				if action == "" {
+					action = "detect"
+				}
+				acc.Record("test_harness_"+action, fmt.Sprintf("err=%v", err != nil))
+				acc.Note("Harness " + action)
+			}
+			return result, err
 		}).
 		Build()
 }

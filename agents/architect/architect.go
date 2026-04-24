@@ -19,6 +19,8 @@ import (
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	contextskills "github.com/adalundhe/sylk/core/context/skills"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/domain"
@@ -91,6 +93,12 @@ type Architect struct {
 	pendingBus    map[string]*shared.PendingSyncWait
 	inFlightMu    sync.Mutex
 	inFlight      map[string]context.CancelFunc
+
+	// Tracked goroutine scope for async claims dispatch and
+	// background operations (receipt resyncs, plan reaper).
+	scope *concurrency.GoroutineScope
+
+	claimsInbox *claims.ClaimsInbox
 
 	// Handoff bridge integration
 	handoffBridge *handoff.HandoffBridge
@@ -785,7 +793,29 @@ func (a *Architect) Start(bus guide.EventBus) error {
 		a.logger.Warn("audit rejection bridge start failed", "error", err.Error())
 	}
 
-	go a.requestOpenPlanHandoffReceiptResyncs("architect startup")
+	// Claims intake: event-driven delta processing.
+	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
+		AgentID:      a.id,
+		SessionID:    a.config.SessionID,
+		Bus:          bus,
+		Board:        a.architectBoard(),
+		Scope:        a.scope,
+		ProcessEntry: a.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("architect_claims_inbox_start_failed", "error", err.Error())
+		}
+		a.claimsInbox = inbox
+	}
+
+	if a.scope != nil {
+		_ = a.scope.Go("architect_receipt_resync", 0, func(_ context.Context) error {
+			a.requestOpenPlanHandoffReceiptResyncs("architect startup")
+			return nil
+		})
+	} else {
+		go a.requestOpenPlanHandoffReceiptResyncs("architect startup")
+	}
 
 	a.logger.Info("architect started", "channels", a.channels)
 	return nil
@@ -800,6 +830,11 @@ func (a *Architect) Stop() error {
 	}
 	a.running = false
 	a.runMu.Unlock()
+
+	if a.claimsInbox != nil {
+		_ = a.claimsInbox.Close()
+		a.claimsInbox = nil
+	}
 
 	a.steering.CloseAll()
 
@@ -933,13 +968,34 @@ func (a *Architect) dispatchBusRequest(ctx context.Context, msg *guide.Message) 
 	a.logInfo("dispatchBusRequest: routing",
 		"msg_type", string(msg.Type),
 		"correlation_id", msg.CorrelationID)
+
+	// Bus dispatch testament: which handler was selected.
+	handler := "unhandled"
+	defer func() {
+		sessionID := a.config.SessionID
+		a.architectSubmitTestament(ctx, a.architectTestament(
+			"Bus dispatch: "+string(msg.Type)+" → "+handler,
+			"committed",
+			[]*claims.Artifact{
+				a.architectArtifact("message_type", string(msg.Type)),
+				a.architectArtifact("handler", handler),
+				a.architectArtifact("correlation_id", msg.CorrelationID),
+				a.architectArtifact("source_agent", msg.SourceAgentID),
+			},
+		))
+		_ = sessionID // used by architectArtifact via receiver
+	}()
+
 	if msg.Type == guide.MessageTypeForward {
+		handler = "handleForward"
 		return a.handleForwardBusRequest(ctx, msg)
 	}
 	if msg.Type == guide.MessageTypeAction {
+		handler = "handleAction"
 		return a.handleActionBusRequest(ctx, msg)
 	}
 	if msg.Type == guide.MessageTypeProposal {
+		handler = "handleProposal"
 		return a.handleProposalBusRequest(ctx, msg)
 	}
 	a.logInfo("dispatchBusRequest: unhandled message type", "msg_type", string(msg.Type))
@@ -2013,12 +2069,31 @@ func (a *Architect) handleBusResponse(msg *guide.Message) error {
 			"message_type": messageTypeString(msg),
 			"error":        err.Error(),
 		})
+		a.architectSubmitTestament(context.Background(), a.architectTestament(
+			"Bus response continuation failed: "+err.Error(),
+			"committed",
+			[]*claims.Artifact{
+				a.architectArtifact("correlation_id", msg.CorrelationID),
+				a.architectArtifact("error", err.Error()),
+			},
+		))
 		return err
 	}
 	a.logger.Debug("received response", "correlation_id", msg.CorrelationID, "type", msg.Type)
 	a.logTrace("architect_bus_response_continuation_ok", "debug", sessionIDFromMessage(msg), messageCorrelationID(msg), agentlog.EventTaskDispatched, map[string]any{
 		"message_type": messageTypeString(msg),
 	})
+
+	// Bus response testament: continuation processed successfully.
+	a.architectSubmitTestament(context.Background(), a.architectTestament(
+		"Bus response routed: "+messageTypeString(msg),
+		"committed",
+		[]*claims.Artifact{
+			a.architectArtifact("message_type", messageTypeString(msg)),
+			a.architectArtifact("correlation_id", msg.CorrelationID),
+			a.architectArtifact("source_agent", msg.SourceAgentID),
+		},
+	))
 	return nil
 }
 
@@ -2260,6 +2335,19 @@ func (a *Architect) consultLibrarian(ctx context.Context, requirements *Requirem
 		return emptyCodebasePatterns(), nil
 	}
 	query := fmt.Sprintf("Find patterns related to: %s", requirements.Query)
+	a.architectPostClaim(ctx,
+		architectClaimAction(claims.ActionTypeConsultation),
+		architectClaimWithSubject(
+			"Consult librarian: "+truncateArchitectString(requirements.Query, 60),
+			"Codebase pattern discovery via librarian",
+			"librarian",
+			[]claims.ClaimScopeEntry{{Kind: "consultation", Key: "librarian"}},
+			claims.ActionTypeConsultation,
+			[]*claims.Validation{
+				architectValidation(claims.ValidationTypeReceipt, true, "Librarian returns codebase patterns", "evidence.Success == true"),
+			},
+		),
+	)
 	evidence, err := a.requestConsultation(ctx, "librarian", query, requirements.Scope, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to consult librarian: %w", err)
@@ -2762,6 +2850,18 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 	if composeErr == nil {
 		a.logInfo("executeConversation: LLM compose succeeded",
 			"response_len", len(response))
+
+		// Conversation response testament.
+		a.architectSubmitTestament(ctx, a.architectTestamentWithSubject(
+			"Architect responded: intent="+string(req.Intent),
+			"committed", "user",
+			[]*claims.Artifact{
+				a.architectArtifact("response_text", truncateArchitectString(response, 500)),
+				a.architectArtifact("intent", string(req.Intent)),
+				a.architectArtifact("plan_context_injected", fmt.Sprintf("%t", request.PlanSummary != "")),
+			},
+		))
+
 		result := &ConversationResult{
 			Response: response,
 			Intent:   req.Intent,
@@ -2864,6 +2964,18 @@ func (a *Architect) enrichConversationWithPlanContext(ctx context.Context, reque
 			request.OrchestratorStateHint = hint
 			request.FreshnessRecommendation = recommendation
 		})
+
+		// Plan context injection testament.
+		a.architectSubmitTestament(ctx, a.architectTestament(
+			fmt.Sprintf("Injected plan %s context for conversation", plan.ID),
+			"committed",
+			[]*claims.Artifact{
+				a.architectArtifact("plan_id", plan.ID),
+				a.architectArtifact("plan_age_seconds", fmt.Sprintf("%d", int(time.Since(plan.UpdatedAt).Seconds()))),
+				a.architectArtifact("audit_applied", "true"),
+				a.architectArtifact("freshness_recommendation", request.FreshnessRecommendation),
+			},
+		))
 		return
 	}
 	plan := a.latestHistoricalPlanForSession(req.SessionID)
@@ -3172,6 +3284,19 @@ func (a *Architect) handleDomainQuery(ctx context.Context, d domain.Domain, quer
 	if !a.running || a.bus == nil {
 		return localDomainResult(d, query), nil
 	}
+	a.architectPostClaim(ctx,
+		architectClaimAction(claims.ActionTypeConsultation),
+		architectClaimWithSubject(
+			"Consult "+target+": "+truncateArchitectString(query, 60),
+			"Cross-domain consultation",
+			target,
+			[]claims.ClaimScopeEntry{{Kind: "consultation", Key: target}},
+			claims.ActionTypeConsultation,
+			[]*claims.Validation{
+				architectValidation(claims.ValidationTypeReceipt, true, "Domain agent responds", "evidence.Success == true"),
+			},
+		),
+	)
 	evidence, err := a.requestConsultation(ctx, target, query, "", "")
 	if err != nil {
 		return nil, err
@@ -3354,6 +3479,12 @@ func (a *Architect) GetAllActivePlans() []*DesignPlan {
 // =============================================================================
 // HandoffableAgent + ContextEvictable Implementation
 // =============================================================================
+
+// SetScope injects the goroutine scope for async claims dispatch and
+// background operations. Must be called before Start().
+func (a *Architect) SetScope(scope *concurrency.GoroutineScope) {
+	a.scope = scope
+}
 
 // SetHandoffBridge sets the handoff bridge for the architect agent.
 func (a *Architect) SetHandoffBridge(bridge *handoff.HandoffBridge) {

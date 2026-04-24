@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -52,6 +53,21 @@ func (g *Guardian) executeConversation(ctx context.Context, fwd *guide.Forwarded
 		g.conversationHistory = g.conversationHistory[len(g.conversationHistory)-DefaultConversationBuffer:]
 	}
 	g.conversationMu.Unlock()
+
+	// Submit conversation testament.
+	sessionID := g.activeSessionID
+	artifacts := []*claims.Artifact{
+		guardianArtifact(sessionID, "intent_classification", string(intent)),
+		guardianArtifact(sessionID, "response_text", truncateCommandForClaim(response.Response, 500)),
+	}
+	if response.Usage != nil {
+		artifacts = append(artifacts, guardianJSONArtifact(sessionID, "usage", response.Usage))
+	}
+	g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+		sessionID,
+		"Responded to user: "+string(intent),
+		"committed", "user", artifacts,
+	))
 
 	return response, nil
 }
@@ -142,6 +158,8 @@ func (g *Guardian) buildConversationMessages(req *guardianConversationRequest) [
 	if req.Intent != IntentConverse {
 		userContent = fmt.Sprintf("[intent: %s] %s", req.Intent, req.Input)
 	}
+	board := claims.DefaultSessionBoardRegistry().Lookup(req.SessionID)
+	userContent = claims.PrependBoardPreamble(userContent, board, "guardian")
 	messages = append(messages, providers.Message{
 		Role:    providers.RoleUser,
 		Content: userContent,

@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -57,6 +58,18 @@ func (pi *PipelineInspector) runFeedbackLoop(
 				"corrections": corrections,
 				"loop":        loop + 1,
 			})
+			pi.inspectorPostClaim(ctx,
+				claims.Action{AgentID: "inspector-pipeline", Type: claims.ActionTypeCorrective},
+				inspectorCorrectiveClaim(
+					fmt.Sprintf("Correction request to engineer (loop %d)", loop+1),
+					fmt.Sprintf("Inspector found %d blocking issues requiring engineer correction", len(corrections)),
+					"engineer",
+					[]claims.ClaimScopeEntry{{Kind: "correction", Key: "engineer"}},
+					[]*claims.Validation{
+						inspectorValidation(claims.ValidationTypeReceipt, false, "Engineer acknowledges corrections", "response.received"),
+					},
+				),
+			)
 			resp, err := pi.requestRouteSync(ctx, "engineer", string(payload))
 			if err != nil {
 				pi.logger.Warn("correction routing failed", "loop", loop+1, "error", err)
@@ -123,6 +136,18 @@ func (pi *PipelineInspector) runFeedbackLoop(
 	result.Issues = currentIssues
 	result.FeedbackHistory = feedbackHistory
 	result.LoopCount = len(feedbackHistory)
+
+	// Feedback loop testament.
+	pi.inspectorSubmitTestament(ctx, pi.inspectorTestament(
+		fmt.Sprintf("Feedback loop: %d iterations, passed=%t", result.LoopCount, result.Passed),
+		"committed",
+		[]*claims.Artifact{
+			pi.inspectorArtifact("loop_count", fmt.Sprintf("%d", result.LoopCount)),
+			pi.inspectorArtifact("passed", fmt.Sprintf("%t", result.Passed)),
+			pi.inspectorArtifact("issue_count", fmt.Sprintf("%d", len(result.Issues))),
+		},
+	))
+
 	return result, nil
 }
 

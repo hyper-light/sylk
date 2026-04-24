@@ -49,7 +49,7 @@ type MergeDescriptor struct {
 	// alongside the diff to decide whether the pipeline's local
 	// attestation aligns with the cross-pipeline coherence picture.
 	// Empty when the pipeline inspector did not emit a certificate
-	// (legacy paths; not expected under the handoff_to_green flow).
+	// (legacy paths; not expected under the handoff_to_ot flow).
 	PipelineCertificate PipelineInspectorCertificate
 
 	// AuditAddendum is true when this descriptor was produced by a
@@ -77,7 +77,7 @@ type MergeDescriptor struct {
 }
 
 // PipelineInspectorCertificate is the pipeline inspector's structured
-// attestation accompanying handoff_to_green. Design §6.3.
+// attestation accompanying handoff_to_ot. Design §6.3.
 type PipelineInspectorCertificate struct {
 	// DeclaredScope summarizes what the pipeline accepts as "done"
 	// (e.g. "implemented fn A in pkg/x", "added tests for case Y").

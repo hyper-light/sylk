@@ -109,7 +109,7 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 				req.Messages = append(req.Messages, providers.Message{
 					Role: providers.RoleUser,
 					Content: err.Error() +
-						"\nUse the pipeline protocol now. If you are still evaluating a peer response, invoke `pipeline_protocol(action=process_validation)` first and then `pipeline_protocol(action=challenge|handoff|finalize)` or `handoff_to_green`.",
+						"\nUse the pipeline protocol now. If you are still evaluating a peer response, invoke `pipeline_protocol(action=process_validation)` first and then `pipeline_protocol(action=challenge|handoff|finalize)` or `handoff_to_ot`.",
 				})
 				requiredActionGraceTurns = agentShared.ExtendRequiredProtocolGrace(ctx, requiredActionGraceTurns)
 				continue

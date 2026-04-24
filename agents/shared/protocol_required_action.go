@@ -4,7 +4,7 @@ import "context"
 
 // RequiredProtocolGraceTurns reserves a small number of extra completion turns
 // when a protocol tool forces an immediate follow-up action such as
-// `handoff_to_green` or `commit_to_disk`. One turn lets the model issue the
+// `handoff_to_ot` or `commit_to_disk`. One turn lets the model issue the
 // required tool call; the second covers a single narrated/non-tool retry.
 const RequiredProtocolGraceTurns = 2
 

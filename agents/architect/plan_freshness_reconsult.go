@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/planapproval"
 )
 
@@ -241,6 +242,19 @@ func (a *Architect) runReconsultationsForAudit(ctx context.Context, plan *Design
 			})
 			continue
 		}
+		a.architectPostClaim(budgetCtx,
+			architectClaimAction(claims.ActionTypeConsultation),
+			architectClaimWithSubject(
+				"Re-consult "+candidate.Target+": "+truncateArchitectString(candidate.Reason, 50),
+				"Freshness re-consultation for plan drift detection",
+				candidate.Target,
+				[]claims.ClaimScopeEntry{{Kind: "consultation", Key: candidate.Target}},
+				claims.ActionTypeConsultation,
+				[]*claims.Validation{
+					architectValidation(claims.ValidationTypeReceipt, false, "Re-consultation response received", "evidence != nil"),
+				},
+			),
+		)
 		evidence, err := a.requestConsultation(budgetCtx, candidate.Target, candidate.Query, "", plan.SessionID)
 		if err != nil || evidence == nil || !evidence.Success {
 			audit.Signals = append(audit.Signals, planapproval.DriftSignal{

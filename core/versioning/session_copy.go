@@ -123,6 +123,86 @@ func (s *SessionVFS) copyAtLocked(version SemanticVersion) (*CopyMaterialization
 	return copyAtWithWAL(s.wal, version)
 }
 
+// MaterializePipelineFromCopy seeds the pipeline VFS's base-reader
+// and base-FS from the Copy at baseVersion. Named per
+// docs/PARALLEL_GLOBAL_VFS.md Stage 2. Extracted from BeginPipeline
+// so the materialization semantics are independently testable and
+// can be invoked by any future surface (rebind after crash, audit
+// replica scaffolding, etc.).
+//
+// Semantics:
+//   - Materialize the Copy via CopyAt(baseVersion) — full path→content
+//     snapshot at that version.
+//   - Install the Copy as the pipeline's read base: reads hit the
+//     Copy's files first, falling through to the session's
+//     disk-backed baseFS for paths the Copy didn't capture (paths
+//     unchanged since disk).
+//   - The pipeline VFS retains exclusive ownership of the returned
+//     materialization — isolation from subsequent green advancement
+//     is guaranteed by the Copy's immutability post-return.
+//
+// Concurrency: acquires s.mu around the CopyAt step, then installs
+// the readers on the supplied pipelineVFS outside the session lock.
+// pipelineVFS's own mutexes serialize the install with concurrent
+// readers.
+func (s *SessionVFS) MaterializePipelineFromCopy(pipelineVFS *PipelineVFS, baseVersion SemanticVersion) error {
+	if s == nil {
+		return fmt.Errorf("session vfs: MaterializePipelineFromCopy: nil receiver")
+	}
+	if pipelineVFS == nil {
+		return fmt.Errorf("session vfs: MaterializePipelineFromCopy: nil pipelineVFS")
+	}
+	if baseVersion.IsZero() {
+		return fmt.Errorf("session vfs: MaterializePipelineFromCopy: base version is zero (use current-green dispatch instead)")
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrVFSClosed
+	}
+	s.mu.Unlock()
+	mat, err := s.CopyAt(baseVersion)
+	if err != nil {
+		return fmt.Errorf("session vfs: materialize base copy %s: %w", baseVersion.String(), err)
+	}
+	installCopyMaterializationOnPipelineVFS(pipelineVFS, mat, s.baseFS)
+	return nil
+}
+
+// materializePipelineFromCopyLocked is the s.mu-held variant called
+// from BeginPipeline. Shares the installation logic with
+// MaterializePipelineFromCopy but reuses the already-held session
+// lock for the CopyAt replay. Caller owns error handling (closing
+// the pipeline VFS on failure, etc.).
+func (s *SessionVFS) materializePipelineFromCopyLocked(pipelineVFS *PipelineVFS, baseVersion SemanticVersion) error {
+	if baseVersion.IsZero() {
+		return fmt.Errorf("session vfs: materializePipelineFromCopyLocked: base version is zero")
+	}
+	mat, err := s.copyAtLocked(baseVersion)
+	if err != nil {
+		return fmt.Errorf("session vfs: materialize base copy %s: %w", baseVersion.String(), err)
+	}
+	installCopyMaterializationOnPipelineVFS(pipelineVFS, mat, s.baseFS)
+	return nil
+}
+
+// installCopyMaterializationOnPipelineVFS wires the Copy as the
+// pipeline's base read surface. Split out so the locked and
+// exported variants share exactly the same installation — any
+// future change to how pipelines consume Copies touches one site.
+func installCopyMaterializationOnPipelineVFS(pipelineVFS *PipelineVFS, mat *CopyMaterialization, diskBase vfsBaseFS) {
+	pipelineVFS.SetBaseReader(func(path string) ([]byte, error) {
+		if content, ok := mat.Read(path); ok {
+			return content, nil
+		}
+		if diskBase == nil {
+			return nil, ErrFileNotFound
+		}
+		return diskBase.ReadFile(path)
+	})
+	pipelineVFS.SetBaseFS(&copyBackedBaseFS{mat: mat, fallback: diskBase})
+}
+
 // copyAtWithWAL does the actual materialization given a WAL reference.
 // Shared implementation between the locked and unlocked entry points.
 func copyAtWithWAL(wal SemanticWAL, version SemanticVersion) (*CopyMaterialization, error) {

@@ -597,6 +597,11 @@ type AppModel struct {
 	decorOn      bool         // Whether decor tick chain is active.
 	decorCadence decorCadence // Current decor cadence (idle vs active).
 
+	// Memory-view ambient animation tick chain. Generation bump
+	// invalidates any in-flight ticks when exiting memory mode.
+	memoryTickGen uint64
+	memoryTickOn  bool
+
 	// Centralized cursor blink timer (one-shot at blinkHalfPeriod).
 	blinkGen   uint64    // Generation counter; bumped on interactive events to reset blink.
 	blinkEpoch time.Time // Wall-clock reference: cursor visible at epoch, phase derived from elapsed time.
@@ -1123,8 +1128,9 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 	}),
 	reflect.TypeFor[msg.InterruptMsg]():    appMsgCmdRoute(func(m *AppModel, _ msg.InterruptMsg) tea.Cmd { return m.handleInterrupt() }),
 	reflect.TypeFor[msg.QuitConfirmMsg]():  appMsgCmdRoute(func(m *AppModel, _ msg.QuitConfirmMsg) tea.Cmd { return m.handleQuit() }),
-	reflect.TypeFor[msg.TickMsg]():         appMsgCmdRoute((*AppModel).handleTick),
-	reflect.TypeFor[msg.DecorTickMsg]():    appMsgCmdRoute((*AppModel).handleDecorTick),
+	reflect.TypeFor[msg.TickMsg]():              appMsgCmdRoute((*AppModel).handleTick),
+	reflect.TypeFor[msg.DecorTickMsg]():         appMsgCmdRoute((*AppModel).handleDecorTick),
+	reflect.TypeFor[msg.MemoryCanvasTickMsg](): appMsgCmdRoute((*AppModel).handleMemoryCanvasTick),
 	reflect.TypeFor[msg.BlinkMsg]():        appMsgCmdRoute((*AppModel).handleBlink),
 	reflect.TypeFor[msg.LSPFlushMsg]():     appMsgCmdRoute((*AppModel).handleLSPFlush),
 	reflect.TypeFor[msg.QueueAdvanceMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.QueueAdvanceMsg) tea.Cmd { return m.dispatchQueueEntries(typed.EntryIDs) }),

@@ -53,19 +53,42 @@ func (d *Designer) registerCoreSkills() {
 	d.skills.Register(a11yFixSuggestSkill(d))
 	d.skills.Register(contrastCheckSkill(d))
 
-	for _, skill := range shared.CoordinationSkills(shared.CoordinationSkillConfig{
-		Client: shared.CoordinationClient{
-			BusProvider:     func() guide.EventBus { return d.bus },
-			SourceAgentID:   func() string { return d.id },
-			SourceAgentType: func() string { return "designer" },
-			SessionID:       func() string { return d.config.SessionID },
-			RegisterPending: d.registerPendingWait,
-			ClearPending:    d.clearPendingWait,
-			Timeout:         shared.DefaultConsultationTimeout,
+	// ── Cross-pipeline peer skills (consult_peer + challenge_peer) ───
+	//
+	// Provides synchronous consultation with any permitted peer agent
+	// and challenge dispatch. Both carry issuing-side claims via the
+	// shared infrastructure in cross_pipeline_skills.go.
+	for _, skill := range shared.CrossPipelineSkills(shared.CrossPipelineSkillConfig{
+		SessionID:  func() string { return d.config.SessionID },
+		AgentID:    func() string { return d.id },
+		AgentType:  func() string { return "designer" },
+		PipelineID: func() string { return d.pipelineID },
+		RouteSync: shared.RouteSyncFromBus(
+			func() guide.EventBus { return d.bus },
+			func() string {
+				if d.channels == nil {
+					return ""
+				}
+				return d.channels.Responses
+			},
+		),
+	}) {
+		d.skills.Register(skill)
+	}
+
+	// ── Pipeline protocol skills (handoff_next, challenge_agent, etc.) ──
+	//
+	// Provides the full pipeline protocol surface: handoff_next,
+	// challenge_agent, validate_work, process_validation, finalize_pipeline.
+	// All handoff/challenge dispatches carry issuing-side claims via
+	// issuePipelineTurnSelection in pipeline_protocol.go.
+	for _, skill := range shared.PipelineProtocolSkills(shared.PipelineProtocolSkillConfig{
+		AgentType: func() string { return "designer" },
+		AgentID:   func() string { return d.id },
+		Route: shared.PipelineProtocolRouteConfig{
+			BusProvider: func() guide.EventBus { return d.bus },
+			SessionID:   func() string { return d.config.SessionID },
 		},
-		CurrentTaskID:   func() string { return d.pipelineID },
-		CurrentTaskName: func() string { return firstNonEmptyCoordinationName(d.pipelineName, d.pipelineSlug) },
-		WorkerType:      func() string { return "designer" },
 	}) {
 		d.skills.Register(skill)
 	}
@@ -93,10 +116,13 @@ func (d *Designer) registerCoreSkills() {
 	// Every pipeline uses claims. No legacy protocol path.
 	boardProvider := func() *claims.ClaimsBoard { return d.claimsBoard }
 	d.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
-	d.skills.Register(claims.PostActionSkill(boardProvider))
+	inboxProvider := func() *claims.ClaimsInbox { return d.claimsInbox }
+	d.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	d.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	d.skills.Register(claims.EvaluateValidationSkill(boardProvider))
 	d.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
 	d.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+	d.skills.Register(claims.TraverseSkill(boardProvider))
 
 	fabricCfg := fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,
@@ -151,6 +177,13 @@ func (d *Designer) publishRerouteRequest(reason, originalInput, suggestedTarget 
 	if d.bus == nil {
 		return fmt.Errorf("designer bus not available")
 	}
+	d.designerSubmitTestament(context.Background(), d.designerTestament(
+		"Reroute requested: "+truncateDesigner(reason, 60), "committed",
+		[]*claims.Artifact{
+			d.designerArtifact("reason", reason),
+			d.designerArtifact("suggested_target", suggestedTarget),
+		},
+	))
 	reroute := &guide.RerouteRequest{
 		OriginalInput:   originalInput,
 		Reason:          reason,
@@ -199,7 +232,13 @@ func componentSearchSkill(d *Designer) *skills.Skill {
 
 			matches, err := searchComponents(ctx, d.fileAccess, searchPath, params.Query, params.IncludeVariants)
 			if err != nil {
+				if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+					acc.Record("skill_error", "component_search: "+err.Error())
+				}
 				return nil, fmt.Errorf("component search failed: %w", err)
+			}
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("component_search", fmt.Sprintf("query=%s matches=%d", params.Query, len(matches)))
 			}
 
 			// Phase 4 refactor: publish found components as hints so
@@ -430,6 +469,10 @@ func componentCreateSkill(d *Designer) *skills.Skill {
 				targetPath = filepath.Join(d.config.DesignerConfig.WorkingDirectory, "src", "components")
 			}
 
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("component_create", fmt.Sprintf("name=%s type=%s path=%s", params.Name, componentType, targetPath))
+			}
+
 			result := map[string]any{
 				"name":          params.Name,
 				"type":          componentType,
@@ -529,6 +572,10 @@ func componentModifySkill(d *Designer) *skills.Skill {
 				}
 			}
 
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("component_modify", fmt.Sprintf("path=%s", params.Path))
+			}
+
 			return map[string]any{
 				"path":        params.Path,
 				"changes":     params.Changes,
@@ -577,6 +624,9 @@ func tokenValidateSkill(d *Designer) *skills.Skill {
 			}
 
 			validation := validateDesignTokens(string(content), params.Path)
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("token_validate", fmt.Sprintf("path=%s valid=%t", params.Path, validation.Valid))
+			}
 
 			return validation, nil
 		}).
@@ -687,6 +737,9 @@ func tokenSuggestSkill(d *Designer) *skills.Skill {
 			}
 
 			suggestion := suggestToken(params.Value, params.Property)
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("token_suggest", fmt.Sprintf("value=%s property=%s", params.Value, params.Property))
+			}
 
 			return suggestion, nil
 		}).
@@ -785,6 +838,10 @@ func a11yAuditSkill(d *Designer) *skills.Skill {
 			}
 
 			audit := runAccessibilityAudit(string(content), params.Path, level)
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("a11y_audit", fmt.Sprintf("path=%s level=%s passed=%t issues=%d",
+					params.Path, level, audit.Passed, len(audit.Checks)))
+			}
 
 			return audit, nil
 		}).
@@ -895,6 +952,9 @@ func a11yFixSuggestSkill(d *Designer) *skills.Skill {
 			}
 
 			fix := suggestA11yFix(params.IssueType, params.Element, params.Context)
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("a11y_fix_suggest", fmt.Sprintf("issue=%s element=%s", params.IssueType, params.Element))
+			}
 
 			return fix, nil
 		}).
@@ -1008,6 +1068,9 @@ func contrastCheckSkill(d *Designer) *skills.Skill {
 			}
 
 			result := checkContrast(params.Foreground, params.Background, size)
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("contrast_check", fmt.Sprintf("fg=%s bg=%s size=%s", params.Foreground, params.Background, size))
+			}
 
 			return result, nil
 		}).

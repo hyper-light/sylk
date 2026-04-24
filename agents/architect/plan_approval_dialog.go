@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/planapproval"
 	"github.com/google/uuid"
 )
@@ -218,6 +219,21 @@ func (a *Architect) handlePlanApprovalContinuation(
 	}
 
 	a.completeContinuationBestEffort(record, continuationStatusCompleted, respJSON, "", "plan approval verdict received")
+
+	// Submit verdict testament to claims board.
+	planID := ""
+	if plan != nil {
+		planID = plan.ID
+	}
+	a.architectSubmitTestament(context.Background(), a.architectTestament(
+		fmt.Sprintf("Plan %s verdict: %s", planID, verdict),
+		"committed",
+		[]*claims.Artifact{
+			a.architectArtifact("verdict", string(verdict)),
+			a.architectArtifact("reason", reason),
+			a.architectArtifact("plan_id", planID),
+		},
+	))
 
 	if plan == nil {
 		// Plan no longer exists in the active plan store (e.g. demoted

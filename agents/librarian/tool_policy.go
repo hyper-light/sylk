@@ -29,6 +29,10 @@ func librarianVisibleSkillNames() []string {
 		// Unified package verb covers clone_repository / list_packages /
 		// remove_package. `action` selects clone/list/remove.
 		"package",
+		// Claims skills: read-only board introspection is Local (visible).
+		"query_claims_board",
+		"inspect_claim_conflicts",
+		"traverse",
 	}, "librarian")
 	return fabric.AppendFabricAwarenessSkillNames(base)
 }
@@ -40,6 +44,11 @@ func librarianMutatingSkillNames() []string {
 		// match the most-permissive underlying action.
 		"package",
 		"reroute_request",
+		// Claims skills: mutating operations need LocalWorker policy.
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 	})
 }
 

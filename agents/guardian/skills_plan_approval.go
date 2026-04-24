@@ -18,9 +18,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/planapproval"
 	"github.com/adalundhe/sylk/core/skills"
@@ -97,6 +99,59 @@ func (g *Guardian) requestPlanApproval(ctx context.Context, req *planApprovalReq
 		return nil, fmt.Errorf("plan approval request is required")
 	}
 
+	// Post claim: architect asks guardian to present plan for user acceptance.
+	sessionID := g.activeSessionID
+	planTitle := strings.TrimSpace(req.PlanName)
+	if planTitle == "" {
+		planTitle = req.PlanID
+	}
+	g.guardianPostClaim(ctx,
+		guardianClaimAction(claims.ActionTypeTask),
+		guardianExternalClaim(
+			"Accept plan: "+truncateCommandForClaim(planTitle, 60),
+			"Architect requests user acceptance of implementation plan",
+			"architect",
+			[]claims.ClaimScopeEntry{{Kind: "plan", Key: req.PlanID}},
+			claims.ActionTypeTask,
+			[]*claims.Validation{
+				guardianValidation(claims.ValidationTypeInspection, true, "User approves plan scope and approach", "User clicks Approve in TUI dialog"),
+				guardianValidation(claims.ValidationTypeInspection, false, "Plan reflects current codebase state", "Freshness summary shows no stale references"),
+				guardianValidation(claims.ValidationTypeInspection, false, "No significant codebase drift since planning", "Drift signals below threshold"),
+			},
+		),
+	)
+
+	// Submit testament on exit.
+	var planResult *planApprovalResult
+	var planErr error
+	defer func() {
+		if planErr != nil {
+			g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+				sessionID, "Plan approval failed: "+planErr.Error(), "committed", "architect",
+				[]*claims.Artifact{guardianArtifact(sessionID, "error", planErr.Error())},
+			))
+			return
+		}
+		if planResult == nil {
+			return
+		}
+		artifacts := []*claims.Artifact{
+			guardianArtifact(sessionID, "verdict", string(planResult.Verdict)),
+		}
+		if planResult.Reason != "" {
+			artifacts = append(artifacts, guardianArtifact(sessionID, "user_reason", planResult.Reason))
+		}
+		if req.FreshnessSummary != "" {
+			artifacts = append(artifacts, guardianArtifact(sessionID, "freshness_analysis", req.FreshnessSummary))
+		}
+		if len(req.DriftSignals) > 0 {
+			artifacts = append(artifacts, guardianJSONArtifact(sessionID, "drift_analysis", req.DriftSignals))
+		}
+		g.guardianSubmitTestament(ctx, guardianTestamentAction(), guardianTestament(
+			sessionID, "Plan "+string(planResult.Verdict)+": "+planTitle, "committed", "architect", artifacts,
+		))
+	}()
+
 	correlationID := uuid.New().String()
 	proposal := &planapproval.Proposal{
 		PlanID:                req.PlanID,
@@ -138,7 +193,8 @@ func (g *Guardian) requestPlanApproval(ctx context.Context, req *planApprovalReq
 		Timestamp:     time.Now(),
 	}
 	if err := g.bus.Publish(guide.TopicResponses("tui", "tui"), msg); err != nil {
-		return nil, fmt.Errorf("publish plan approval proposal: %w", err)
+		planErr = fmt.Errorf("publish plan approval proposal: %w", err)
+		return nil, planErr
 	}
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, planApprovalControlTimeout)
@@ -148,23 +204,23 @@ func (g *Guardian) requestPlanApproval(ctx context.Context, req *planApprovalReq
 	case result := <-ch:
 		verdict := planapproval.Verdict(result.Decision)
 		if !verdict.IsValid() {
-			// Fallback: derive from approved boolean if Decision was
-			// not set explicitly — keeps the path resilient if a
-			// future caller sends a plain approved/denied payload.
 			if result.Approved {
 				verdict = planapproval.VerdictApprove
 			} else {
 				verdict = planapproval.VerdictReject
 			}
 		}
-		return &planApprovalResult{
+		planResult = &planApprovalResult{
 			PlanID:  req.PlanID,
 			Verdict: verdict,
 			Reason:  result.Reason,
-		}, nil
+		}
+		return planResult, nil
 	case <-timeoutCtx.Done():
-		return nil, fmt.Errorf("plan approval timed out after %s waiting for user decision", planApprovalControlTimeout)
+		planErr = fmt.Errorf("plan approval timed out after %s waiting for user decision", planApprovalControlTimeout)
+		return nil, planErr
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		planErr = ctx.Err()
+		return nil, planErr
 	}
 }

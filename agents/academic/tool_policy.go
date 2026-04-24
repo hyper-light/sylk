@@ -15,6 +15,10 @@ func academicVisibleSkillNames() []string {
 		"ground_source",
 		"web_fetch",
 		"fetch_document",
+		// Claims skills: read-only board introspection is Local (visible).
+		"query_claims_board",
+		"inspect_claim_conflicts",
+		"traverse",
 	}
 	return fabric.AppendFabricAwarenessSkillNames(base)
 }
@@ -24,6 +28,11 @@ func academicMutatingSkillNames() []string {
 		"author_research_paper",
 		"clone_via_librarian",
 		"reroute_request",
+		// Claims skills: mutating operations need LocalWorker policy.
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 	}
 }
 

@@ -11,16 +11,23 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-func TestViewCanvasSpacesTreesAndUsesRoundedElbows(t *testing.T) {
+func TestViewCanvasSpacesTreesAndUsesBranchConnectors(t *testing.T) {
 	t.Parallel()
 
 	model := New(theme.DefaultDark())
+	model.DisableAnimation()
 	model.SetCanvasSize(96, 24)
 	model.SetSnapshot(sampleSnapshot())
 
 	canvas := ansi.Strip(model.ViewCanvas())
-	if !strings.Contains(canvas, "╭") && !strings.Contains(canvas, "╮") && !strings.Contains(canvas, "╰") && !strings.Contains(canvas, "╯") {
-		t.Fatalf("canvas missing rounded elbows:\n%s", canvas)
+	// The trunk+canopy layout uses diagonals for crown spokes and
+	// rounded elbows for lateral side-branches. At least one branch
+	// glyph category must be present when any tree has non-trivial
+	// structure.
+	hasDiagonals := strings.ContainsAny(canvas, "╱╲")
+	hasElbows := strings.ContainsAny(canvas, "╭╮╰╯")
+	if !hasDiagonals && !hasElbows {
+		t.Fatalf("canvas missing branch connectors (neither diagonals nor elbows):\n%s", canvas)
 	}
 
 	lines := strings.Split(canvas, "\n")
@@ -52,15 +59,21 @@ func TestViewCanvasSpacesTreesAndUsesRoundedElbows(t *testing.T) {
 	}
 }
 
-func TestViewCanvasDoesNotDuplicateRootNodes(t *testing.T) {
+func TestViewCanvasRendersEveryNonRootNode(t *testing.T) {
 	t.Parallel()
 
 	model := New(theme.DefaultDark())
+	model.DisableAnimation()
 	model.SetCanvasSize(96, 24)
 	model.SetSnapshot(sampleSnapshot())
 
 	canvas := ansi.Strip(model.ViewCanvas())
-	totalNodeGlyphs := strings.Count(canvas, "⬡") + strings.Count(canvas, "⬢") + strings.Count(canvas, "◈")
+	// Count every glyph in the tiered node ramp plus the selected
+	// glyph. Any non-root node must surface as exactly one of these.
+	var totalNodeGlyphs int
+	for _, glyph := range []string{"⬡", "⬢", "◆", "◇", "◈", "▣"} {
+		totalNodeGlyphs += strings.Count(canvas, glyph)
+	}
 	totalRoots := 0
 	for _, tree := range sampleSnapshot().Trees {
 		totalRoots += len(tree.Roots)
@@ -75,10 +88,131 @@ func TestViewCanvasDoesNotDuplicateRootNodes(t *testing.T) {
 	}
 }
 
-func TestViewCanvasSingletonBranchUsesCurvedConnector(t *testing.T) {
+func TestTickSpawnsAndAgesParticles(t *testing.T) {
 	t.Parallel()
 
 	model := New(theme.DefaultDark())
+	model.SetCanvasSize(96, 24)
+	model.SetSnapshot(sampleSnapshot())
+	if !model.AnimationEnabled() {
+		t.Fatal("animation should be enabled by default")
+	}
+
+	// First render seeds the static grid and invokes the first
+	// particle spawn. Ground dust fills to target on every advance().
+	baseline := model.ViewCanvas()
+	initialStripped := ansi.Strip(baseline)
+
+	// Run several ticks to allow particles to drift.
+	for i := 0; i < 10; i++ {
+		model.Tick()
+	}
+	after := ansi.Strip(model.ViewCanvas())
+	if initialStripped == after {
+		t.Fatal("canvas unchanged after 10 animation ticks — particles not drifting")
+	}
+}
+
+func TestDisableAnimationStopsParticleUpdates(t *testing.T) {
+	t.Parallel()
+
+	model := New(theme.DefaultDark())
+	model.DisableAnimation()
+	model.SetCanvasSize(96, 24)
+	model.SetSnapshot(sampleSnapshot())
+
+	before := ansi.Strip(model.ViewCanvas())
+	for i := 0; i < 10; i++ {
+		model.Tick()
+	}
+	after := ansi.Strip(model.ViewCanvas())
+	if before != after {
+		t.Fatal("canvas changed after ticks despite DisableAnimation")
+	}
+}
+
+func TestHoverResolvesNodeAndRendersTooltip(t *testing.T) {
+	t.Parallel()
+
+	model := New(theme.DefaultDark())
+	model.DisableAnimation()
+	model.SetCanvasSize(96, 24)
+	model.SetSnapshot(sampleSnapshot())
+
+	// Build static grid by rendering once.
+	_ = model.ViewCanvas()
+
+	// Pick a known node's cell coordinates and hover exactly on it.
+	pos, ok := model.positions["decision-2"]
+	if !ok {
+		t.Fatal("expected decision-2 to have a rendered position")
+	}
+	if changed := model.SetHoverCell(pos.x, pos.y); !changed {
+		t.Fatal("expected hover to resolve a new node")
+	}
+	if got := model.HoveredNode(); got != "decision-2" {
+		t.Fatalf("HoveredNode = %q, want decision-2", got)
+	}
+
+	canvas := ansi.Strip(model.ViewCanvas())
+	// Tooltip must surface the node's title.
+	if !strings.Contains(canvas, "Pool Reuse") {
+		t.Fatalf("tooltip did not render node title 'Pool Reuse':\n%s", canvas)
+	}
+	// Tooltip border must be drawn — at least one rounded-corner glyph.
+	if !strings.ContainsAny(canvas, "╭╮╰╯") {
+		t.Fatalf("tooltip border missing from canvas:\n%s", canvas)
+	}
+}
+
+func TestHoverOutsideAnyNodeClearsTooltip(t *testing.T) {
+	t.Parallel()
+
+	model := New(theme.DefaultDark())
+	model.DisableAnimation()
+	model.SetCanvasSize(96, 24)
+	model.SetSnapshot(sampleSnapshot())
+	_ = model.ViewCanvas()
+
+	// Hover far from any node.
+	model.SetHoverCell(0, 0)
+	if got := model.HoveredNode(); got != "" {
+		t.Fatalf("HoveredNode = %q, want empty when no node is under cursor", got)
+	}
+	canvas := ansi.Strip(model.ViewCanvas())
+	// No node title should appear in the tooltip position.
+	for _, title := range []string{"Pool Reuse", "Timeout Cap", "Scope", "Branch"} {
+		if strings.Contains(canvas, title) {
+			t.Fatalf("tooltip unexpectedly rendered %q when no node is hovered:\n%s", title, canvas)
+		}
+	}
+}
+
+func TestHoverOffCanvasClearsHover(t *testing.T) {
+	t.Parallel()
+
+	model := New(theme.DefaultDark())
+	model.DisableAnimation()
+	model.SetCanvasSize(96, 24)
+	model.SetSnapshot(sampleSnapshot())
+	_ = model.ViewCanvas()
+
+	pos := model.positions["decision-2"]
+	model.SetHoverCell(pos.x, pos.y)
+	if got := model.HoveredNode(); got == "" {
+		t.Fatal("expected a node to be hovered before off-canvas clear")
+	}
+	model.SetHoverCell(-1, -1)
+	if got := model.HoveredNode(); got != "" {
+		t.Fatalf("HoveredNode = %q, want empty after off-canvas clear", got)
+	}
+}
+
+func TestViewCanvasSingletonCrownUsesDiagonalBranch(t *testing.T) {
+	t.Parallel()
+
+	model := New(theme.DefaultDark())
+	model.DisableAnimation()
 	model.SetCanvasSize(64, 20)
 	model.SetSnapshot(&forest.ViewSnapshot{
 		SelectedBranchID: "intent-2",
@@ -98,8 +232,12 @@ func TestViewCanvasSingletonBranchUsesCurvedConnector(t *testing.T) {
 	})
 
 	canvas := ansi.Strip(model.ViewCanvas())
-	if !strings.ContainsAny(canvas, "╭╮╰╯") {
-		t.Fatalf("singleton branch rendered without curved connector:\n%s", canvas)
+	// With trunk+canopy layout, a linear chain still surfaces as a
+	// tree: the longest path forms the spine and the terminal leaf
+	// is displaced laterally into the crown, yielding a diagonal
+	// branch glyph (╱ or ╲). No straight pole should be acceptable.
+	if !strings.ContainsAny(canvas, "╱╲") {
+		t.Fatalf("singleton chain rendered without a diagonal crown branch:\n%s", canvas)
 	}
 }
 

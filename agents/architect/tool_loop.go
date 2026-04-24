@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -41,6 +42,34 @@ func (a *Architect) executeToolLoop(
 	if override, ok := ctx.Value(toolRunsOverrideKey{}).(int); ok && override > 0 {
 		maxRuns = override
 	}
+
+	// Tool loop claim + deferred testament.
+	loopStart := time.Now()
+	a.architectPostClaim(ctx,
+		architectClaimAction(claims.ActionTypeTask),
+		architectClaim(
+			"Execute architect tool loop (stage: "+stage+")",
+			"Multi-turn LLM reasoning with tool invocations",
+			[]claims.ClaimScopeEntry{{Kind: "session", Key: a.config.SessionID}},
+			claims.ActionTypeTask, nil),
+	)
+	var toolCallCount, toolErrors int
+	var turnCount int
+	defer func() {
+		a.architectSubmitTestament(ctx, a.architectTestament(
+			fmt.Sprintf("Tool loop complete: %d turns, %d tool calls", turnCount, toolCallCount),
+			"committed",
+			[]*claims.Artifact{
+				a.architectArtifact("stage", stage),
+				a.architectArtifact("turn_count", fmt.Sprintf("%d", turnCount)),
+				a.architectArtifact("max_turns", fmt.Sprintf("%d", maxRuns)),
+				a.architectArtifact("tools_called", fmt.Sprintf("%d", toolCallCount)),
+				a.architectArtifact("tool_errors", fmt.Sprintf("%d", toolErrors)),
+				a.architectArtifact("duration_ms", fmt.Sprintf("%d", time.Since(loopStart).Milliseconds())),
+			},
+		))
+	}()
+
 	seen := make(map[shared.ToolCallSignature]int, maxRuns)
 	consecutiveErrors := 0
 
@@ -71,8 +100,8 @@ func (a *Architect) executeToolLoop(
 		"tools_count", len(req.Tools),
 		"messages_count", len(req.Messages))
 
-	loopStart := time.Now()
-	for turn := 0; turn <= maxRuns; turn++ {
+	for turn := 0; turn <= maxRuns; turn++ { //nolint:intrange
+		turnCount = turn
 		if ctx.Err() != nil {
 			a.logWarn("executeToolLoop: context cancelled before turn",
 				"stage", stage, "turn", turn, "ctx_err", ctx.Err())
@@ -275,6 +304,8 @@ func (a *Architect) executeToolLoop(
 
 		toolStart := time.Now()
 		errCount, rerouted, delegated, delegatedMessage := a.applyToolCalls(ctx, req, resp)
+		toolCallCount += len(resp.ToolCalls)
+		toolErrors += errCount
 		a.logInfo("executeToolLoop: tool calls applied",
 			"stage", stage,
 			"turn", turn,

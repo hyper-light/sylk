@@ -11,6 +11,76 @@ import (
 	"github.com/adalundhe/sylk/core/concurrency"
 )
 
+// captureArchiver records every ArchiveReleased invocation so the
+// forensic-hook test can assert on the release stream.
+type captureArchiver struct {
+	calls []ForensicReleaseInfo
+}
+
+func (a *captureArchiver) ArchiveReleased(info ForensicReleaseInfo) error {
+	a.calls = append(a.calls, info)
+	return nil
+}
+
+// TestAuditLifecycle_ForensicArchiverFiresOnRelease verifies §5.2
+// forensic retention: when a ReplicaVFS is released by water-line
+// advance, the configured archiver receives the release info
+// (including sealed diff when present) BEFORE the VFS is abandoned,
+// so the archiver can persist whatever it needs.
+func TestAuditLifecycle_ForensicArchiverFiresOnRelease(t *testing.T) {
+	dir := t.TempDir()
+	workDir := filepath.Join(dir, "work")
+	_ = os.MkdirAll(workDir, 0o755)
+
+	archiver := &captureArchiver{}
+	sess, err := NewSessionVFS(SessionVFSConfig{
+		SessionID:        "sess-archive",
+		WorkingDir:       workDir,
+		StorageRoot:      filepath.Join(dir, "session"),
+		ForensicArchiver: archiver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	ver := SemanticVersion{Minor: 1}
+	sess.RecordMergeDescriptorForTest(MergeDescriptor{
+		PipelineID:    "p",
+		MergedVersion: ver,
+	})
+	vfs, err := sess.BeginAuditReplicaVFS(ver, "holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = vfs.Write("r", "x.go", []byte("seal me"))
+	if _, err := vfs.Seal(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance the water line past ver so the GC callback fires.
+	if _, err := sess.CopyRetention().AdvanceWaterLine(SemanticVersion{Minor: 2}, []SemanticVersion{ver}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(archiver.calls) != 1 {
+		t.Fatalf("archiver calls = %d, want 1", len(archiver.calls))
+	}
+	info := archiver.calls[0]
+	if info.MergedVersion != ver {
+		t.Errorf("info.MergedVersion = %v, want %v", info.MergedVersion, ver)
+	}
+	if !info.Sealed {
+		t.Error("info.Sealed = false, want true")
+	}
+	if info.SealedDiff == nil {
+		t.Fatal("SealedDiff nil for sealed replica")
+	}
+	if _, ok := info.SealedDiff.Writes["x.go"]; !ok {
+		t.Errorf("SealedDiff missing x.go write; got %v", info.SealedDiff.Writes)
+	}
+}
+
 // TestAuditLifecycle_ReplicaVFSReleasedOnWaterLineAdvance verifies
 // the §5 refcount+water-line cleanup path end-to-end:
 //

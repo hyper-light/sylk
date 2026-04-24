@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -43,6 +44,10 @@ func (d *Designer) executeToolLoopWithSurface(
 			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: "no LLM provider configured"})
+		}
+		if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+			acc.Record("error", "no LLM provider configured")
+			acc.Note("Tool loop aborted: no LLM provider")
 		}
 		return "", fmt.Errorf("designer: %w: LLM provider not yet wired", shared.ErrAgentNotReady)
 	}
@@ -100,6 +105,10 @@ func (d *Designer) executeToolLoopWithSurface(
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
 					&agentlog.ErrorPayload{Error: fmt.Sprintf("llm: %v", err)})
 			}
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("error", fmt.Sprintf("llm: %v", err))
+				acc.Note("LLM completion failed")
+			}
 			return "", fmt.Errorf("designer llm: %w", err)
 		}
 
@@ -151,6 +160,10 @@ func (d *Designer) executeToolLoopWithSurface(
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
 					&agentlog.DesignPayload{Phase: "completed", DurNs: time.Since(turnStart).Nanoseconds()})
 			}
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("tool_loop_turns", fmt.Sprintf("%d", turn))
+				acc.Note(fmt.Sprintf("Tool loop completed in %d turns", turn))
+			}
 			return strings.TrimSpace(resp.Content), nil
 		}
 
@@ -164,12 +177,21 @@ func (d *Designer) executeToolLoopWithSurface(
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
 					&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s", sig.Name)})
 			}
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("error", fmt.Sprintf("repeated tool call: %s", sig.Name))
+				acc.Note("Tool loop aborted: duplicate tool call")
+			}
 			return "", fmt.Errorf("designer repeated tool call: %s", sig.Name)
 		}
 
 		errCount, controlErr := d.applyToolCalls(ctx, req, resp, surface)
 
 		d.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+			acc.RecordJSON("turn_metrics", map[string]any{
+				"turn": turn, "tool_calls": len(resp.ToolCalls), "errors": errCount,
+			})
+		}
 
 		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			shared.LogAgentEvent(lm.EventLogger, agentlog.EventDesignIteration,
@@ -183,6 +205,10 @@ func (d *Designer) executeToolLoopWithSurface(
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
 					&agentlog.DesignPayload{Phase: "rerouted"})
 			}
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("reroute", "true")
+				acc.Note("Design rerouted to different agent")
+			}
 			return "", controlErr
 		}
 		if shared.PipelineTurnTerminated(ctx) {
@@ -195,6 +221,10 @@ func (d *Designer) executeToolLoopWithSurface(
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
 					&agentlog.ErrorPayload{Error: fmt.Sprintf("tool calls failed %d consecutive turns", consecutiveErrors)})
 			}
+			if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+				acc.Record("error", fmt.Sprintf("tool calls failed %d consecutive turns", consecutiveErrors))
+				acc.Note("Tool loop aborted: consecutive tool errors")
+			}
 			return "", fmt.Errorf("designer tool calls failed %d consecutive turns", consecutiveErrors)
 		}
 	}
@@ -203,6 +233,10 @@ func (d *Designer) executeToolLoopWithSurface(
 		shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 			lm.AgentID, lm.SessionID, lm.CorrID, "error",
 			&agentlog.ErrorPayload{Error: "exhausted tool-call loop"})
+	}
+	if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+		acc.Record("error", "exhausted tool-call loop")
+		acc.Note("Tool loop exhausted maximum iterations")
 	}
 	return "", fmt.Errorf("designer exhausted tool-call loop")
 }

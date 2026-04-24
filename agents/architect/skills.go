@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -114,6 +115,21 @@ func (a *Architect) registerFabricSkills() {
 	}) {
 		a.skills.Register(skill)
 	}
+
+	// Claims skills: architect is a full claims participant — it can
+	// query board state for planning context, post actions about plan
+	// lifecycle events, and submit testaments about design decisions.
+	boardProvider := func() *claims.ClaimsBoard {
+		return claims.DefaultSessionBoardRegistry().Lookup(a.config.SessionID)
+	}
+	inboxProvider := func() *claims.ClaimsInbox { return a.claimsInbox }
+	a.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	a.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
+	a.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	a.skills.Register(claims.EvaluateValidationSkill(boardProvider))
+	a.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
+	a.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+	a.skills.Register(claims.TraverseSkill(boardProvider))
 }
 
 type architectDiag struct{ a *Architect }

@@ -110,7 +110,7 @@ func TestBuildPipelineSystemContext_IncludesPipelineProtocol(t *testing.T) {
 		"Engineer and Designer should hand completed implementation turns back to Inspector",
 		"After Engineer or Designer hand work back, Inspector audits the implementation first.",
 		"Use finalize_pipeline only after the current inspector audit is complete",
-		"Inspector must immediately invoke handoff_to_green instead of starting another audit loop",
+		"Inspector must immediately invoke handoff_to_ot instead of starting another audit loop",
 		"Challenges to Inspector are refused while this lock is active.",
 		"stop work until Inspector challenges you directly or your preceding agent hands off to you",
 	} {

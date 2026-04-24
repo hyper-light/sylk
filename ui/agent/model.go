@@ -122,7 +122,7 @@ type AgentState struct {
 	// replicaUIDs is the set of active replica UIDs bound to this
 	// canonical row. Len(replicaUIDs) == ActiveReplicas. Replicas do
 	// not get their own panel rows — they accumulate here so the
-	// knowledgeReplicaSuffix display can show "x3" / "q2" counts.
+	// replicaSuperscriptSuffix display can show "⁺³" counts.
 	replicaUIDs map[identity.UID]struct{}
 
 	// SupportedModels is the raw per-agent model list from the backend.

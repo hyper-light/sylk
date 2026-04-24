@@ -16,11 +16,24 @@ import (
 // activities — they complement the direct board query skills in
 // core/claims/skills.go by providing cross-pipeline visibility through
 // the Fabric lens.
+//
+// Per docs/CLAIMS_BUS.md §11, the canonical fabric lens query set is:
+//
+//   - query_peer_activity   (defined in awareness_skills.go)
+//   - query_peer_claims     (fabricQueryPeerClaimsSkill)
+//   - query_advisories      (fabricQueryAdvisoriesSkill)
+//   - query_challenge_history (fabricQueryChallengeHistorySkill)
+//
+// query_peer_activity is registered from the base AwarenessSkills
+// factory and remains there; the three claim-adjacent queries are
+// provided here and must be registered alongside.
 func ClaimsAwarenessSkills(cfg AwarenessSkillConfig) []*skills.Skill {
 	return []*skills.Skill{
 		fabricQueryClaimsBoardSkill(cfg),
 		fabricQueryPeerClaimsSkill(cfg),
 		fabricInspectClaimConflictsSkill(cfg),
+		fabricQueryAdvisoriesSkill(cfg),
+		fabricQueryChallengeHistorySkill(cfg),
 	}
 }
 
@@ -239,4 +252,153 @@ func fabricInspectClaimConflictsSkill(cfg AwarenessSkillConfig) *skills.Skill {
 			}, nil
 		}).
 		Build()
+}
+
+// ────────────────────────────────────────────────────────────────────
+// query_advisories
+// ────────────────────────────────────────────────────────────────────
+
+// fabricQueryAdvisoriesSkill surfaces knowledge-agent and guardian
+// advisories filtered by scope. Queries the Fabric activity stream
+// for ActionAdvisoryEmitted records — these are the notes the
+// knowledge tier (librarian, academic, archivalist, guardian)
+// publishes as ambient guidance, captured in the ambient envelope
+// and surfaced for explicit per-scope recall.
+func fabricQueryAdvisoriesSkill(cfg AwarenessSkillConfig) *skills.Skill {
+	return skills.NewSkill("query_advisories").
+		Description("List knowledge-agent and guardian advisories in scope. Returns every advisory the fabric has captured (ambient guidance, hotness notes, safety cautions) for the queried path prefix within the lookback window.").
+		Domain("claims").
+		Keywords("advisory", "knowledge", "guardian", "ambient", "guidance").
+		Priority(89).
+		StringParam("scope", "Path prefix to filter advisories", false).
+		IntParam("since_minutes", "Lookback window (default "+defaultAdvisoryLookbackStr+")", false).
+		IntParam("limit", "Max results (default "+defaultAdvisoryLimitStr+")", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			src := cfg.source()
+			if src == nil {
+				return map[string]any{"advisories": []any{}, "count": 0, "note": "Fabric source not available"}, nil
+			}
+			var params struct {
+				Scope        string `json:"scope"`
+				SinceMinutes int    `json:"since_minutes"`
+				Limit        int    `json:"limit"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			lookback := durationOrDefault(params.SinceMinutes, defaultAdvisoryLookback)
+			limit := intOrDefault(params.Limit, defaultAdvisoryLimit)
+
+			filter := activity.QueryFilter{
+				SessionID:   activity.SessionID(cfg.SessionID()),
+				ActionKinds: []activity.ActionKind{activity.ActionAdvisoryEmitted},
+				Since:       time.Now().Add(-lookback),
+				Limit:       limit,
+			}
+			if scope := strings.TrimSpace(params.Scope); scope != "" {
+				filter.SubjectPathPrefix = scope
+			}
+
+			activities, err := src.FilterActivities(ctx, filter)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"advisories": activities,
+				"count":      len(activities),
+				"scope":      params.Scope,
+			}, nil
+		}).
+		Build()
+}
+
+// ────────────────────────────────────────────────────────────────────
+// query_challenge_history
+// ────────────────────────────────────────────────────────────────────
+
+// fabricQueryChallengeHistorySkill returns past challenge outcomes
+// with peers of a given type. Walks both the emission kind
+// (ActionChallengeEmitted) and the paired response/unresolved kinds
+// so a challenge's full lifecycle is visible.
+func fabricQueryChallengeHistorySkill(cfg AwarenessSkillConfig) *skills.Skill {
+	return skills.NewSkill("query_challenge_history").
+		Description("List past challenge outcomes with peers of a given agent type. Returns each challenge's emission, response, and resolution so you can spot recurring contention patterns before issuing a new one.").
+		Domain("claims").
+		Keywords("challenge", "history", "peer", "resolution").
+		Priority(88).
+		StringParam("peer_agent_type", "Agent type whose challenge history to surface", true).
+		IntParam("since_minutes", "Lookback window (default "+defaultChallengeLookbackStr+")", false).
+		IntParam("limit", "Max results (default "+defaultChallengeLimitStr+")", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			src := cfg.source()
+			if src == nil {
+				return map[string]any{"challenges": []any{}, "count": 0, "note": "Fabric source not available"}, nil
+			}
+			var params struct {
+				PeerAgentType string `json:"peer_agent_type"`
+				SinceMinutes  int    `json:"since_minutes"`
+				Limit         int    `json:"limit"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			peerType := strings.TrimSpace(params.PeerAgentType)
+			if peerType == "" {
+				return nil, fmt.Errorf("peer_agent_type is required")
+			}
+			lookback := durationOrDefault(params.SinceMinutes, defaultChallengeLookback)
+			limit := intOrDefault(params.Limit, defaultChallengeLimit)
+
+			filter := activity.QueryFilter{
+				SessionID: activity.SessionID(cfg.SessionID()),
+				ActionKinds: []activity.ActionKind{
+					activity.ActionChallengeEmitted,
+					activity.ActionChallengeResponse,
+					activity.ActionChallengeUnresolved,
+				},
+				ActorAgentType: peerType,
+				Since:          time.Now().Add(-lookback),
+				Limit:          limit,
+			}
+
+			activities, err := src.FilterActivities(ctx, filter)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"challenges":      activities,
+				"count":           len(activities),
+				"peer_agent_type": peerType,
+			}, nil
+		}).
+		Build()
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Tunable defaults
+// ────────────────────────────────────────────────────────────────────
+
+const (
+	defaultAdvisoryLookback     = 30 * time.Minute
+	defaultAdvisoryLookbackStr  = "30"
+	defaultAdvisoryLimit        = 20
+	defaultAdvisoryLimitStr     = "20"
+	defaultChallengeLookback    = 60 * time.Minute
+	defaultChallengeLookbackStr = "60"
+	defaultChallengeLimit       = 20
+	defaultChallengeLimitStr    = "20"
+)
+
+func durationOrDefault(minutes int, fallback time.Duration) time.Duration {
+	if minutes <= 0 {
+		return fallback
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+func intOrDefault(v, fallback int) int {
+	if v <= 0 {
+		return fallback
+	}
+	return v
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/pipeline/coordination"
 )
 
@@ -52,6 +53,18 @@ func (o *Orchestrator) queryCoordinationPrecedents(
 			"limit":       coordinationPrecedentLimit,
 		},
 	}
+	o.orchestratorPostClaim(ctx,
+		claims.Action{AgentID: "orchestrator", Type: claims.ActionTypeConsultation},
+		orchestratorConsultClaim(
+			"Query archivalist: coordination precedents for "+firstNonEmpty(taskName, taskSlug),
+			"Historical coordination precedent lookup",
+			"archivalist",
+			[]claims.ClaimScopeEntry{{Kind: "consultation", Key: "archivalist"}},
+			[]*claims.Validation{
+				orchestratorValidation(claims.ValidationTypeReceipt, false, "Archivalist returns precedents", "response.success"),
+			},
+		),
+	)
 	respMsg, err := shared.WithInterAgentBranchMessage(queryCtx, spec, func(branchCtx context.Context, branch shared.InterAgentBranchHandle) (*guide.Message, error) {
 		return o.requestRouteSync(branchCtx, "archivalist",
 			query,

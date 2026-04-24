@@ -65,7 +65,7 @@ type SessionVFS struct {
 	// MergePipelineIntoGreen immediately after the descriptor is
 	// enqueued on the commit queue. This is the direct dispatch
 	// path per docs/PARALLEL_GLOBAL_VFS.md §3.3 — the flow is
-	// pipeline-inspector handoff_to_green → MergePipelineIntoGreen →
+	// pipeline-inspector handoff_to_ot → MergePipelineIntoGreen →
 	// callback → replica spawn. No bus broadcast, no orchestrator
 	// involvement. Session-lifecycle wiring registers the audit
 	// coordinator's callback at bootstrap.
@@ -101,6 +101,12 @@ type SessionVFS struct {
 	// invariant per CLAUDE.md.
 	backgroundScope     *concurrency.GoroutineScope
 	ownsBackgroundScope bool
+
+	// forensicArchiver, when non-nil, fires on every ReplicaVFS
+	// release on water-line advance so operators can persist
+	// sealed diffs / abandon markers outside the session's in-RAM
+	// state (§5.2).
+	forensicArchiver ForensicArchiver
 
 	closed bool
 }
@@ -169,6 +175,40 @@ type SessionVFSConfig struct {
 	// Close. All session-owned goroutines run under this scope so
 	// they are tracked per CLAUDE.md.
 	BackgroundScope *concurrency.GoroutineScope
+
+	// ForensicArchiver, when non-nil, receives every ReplicaVFS the
+	// retention-driven cleanup releases on water-line advance
+	// (§5.2). The archiver inspects the sealed diff (if the VFS
+	// was accepted) or the abandon marker (if rejected) and
+	// persists whatever forensic detail the operator has opted
+	// into — typically sealed writes + deletes to a TTL-bounded
+	// directory. Fires synchronously BEFORE the in-RAM release so
+	// the archiver can safely hold the handle. Errors are logged
+	// at Error and do not block release.
+	ForensicArchiver ForensicArchiver
+}
+
+// ForensicArchiver records the sealed diff / abandon outcome of a
+// released ReplicaVFS. Called by the retention GC pass on water-
+// line advance for every version whose refcount dropped to zero.
+// Implementations are responsible for their own durability + TTL.
+type ForensicArchiver interface {
+	ArchiveReleased(info ForensicReleaseInfo) error
+}
+
+// ForensicReleaseInfo is the payload an archiver receives for a
+// released ReplicaVFS. The SealedDiff is nil when the VFS was
+// abandoned (rejected audit) — only accepted audits have a diff to
+// archive. Paths is populated from the sealed diff when present so
+// the archiver does not need to re-walk the VFS.
+type ForensicReleaseInfo struct {
+	SessionID      SessionID
+	MergedVersion  SemanticVersion
+	ReleasedAt     time.Time
+	Sealed         bool
+	Abandoned      bool
+	SealedDiff     *ReplicaVFSDiff
+	ChainReadPaths []string
 }
 
 // NewSessionVFS creates an isolated set of versioning subsystems for a session.
@@ -323,6 +363,7 @@ func NewSessionVFS(cfg SessionVFSConfig) (*SessionVFS, error) {
 		steeringJournalPath: steeringJournalDir(cfg.StorageRoot),
 		backgroundScope:     backgroundScope,
 		ownsBackgroundScope: ownsBackgroundScope,
+		forensicArchiver:    cfg.ForensicArchiver,
 	}
 
 	sessionRef = s
@@ -444,22 +485,10 @@ func (s *SessionVFS) BeginPipeline(cfg BeginPipelineConfig) (*PipelineVFS, error
 	// since disk). The materialization is owned by this pipeline's
 	// dispatch and isolates it from subsequent green advancement.
 	if !cfg.BaseCopyVersion.IsZero() {
-		mat, matErr := s.copyAtLocked(cfg.BaseCopyVersion)
-		if matErr != nil {
+		if err := s.materializePipelineFromCopyLocked(pipelineVFS, cfg.BaseCopyVersion); err != nil {
 			_ = s.vfsManager.ClosePipelineVFS(cfg.PipelineID)
-			return nil, fmt.Errorf("session vfs: materialize base copy %s: %w", cfg.BaseCopyVersion.String(), matErr)
+			return nil, err
 		}
-		baseFS := s.baseFS
-		pipelineVFS.SetBaseReader(func(path string) ([]byte, error) {
-			if content, ok := mat.Read(path); ok {
-				return content, nil
-			}
-			if baseFS == nil {
-				return nil, ErrFileNotFound
-			}
-			return baseFS.ReadFile(path)
-		})
-		pipelineVFS.SetBaseFS(&copyBackedBaseFS{mat: mat, fallback: baseFS})
 	} else {
 		pipelineVFS.SetBaseReader(func(path string) ([]byte, error) {
 			return s.globalVFS.Read(context.Background(), path)
@@ -553,7 +582,7 @@ type MergePipelineResult struct {
 // observability events.
 //
 // cert is the PipelineInspectorCertificate the pipeline inspector
-// attached at handoff_to_green time (declared scope, open concerns,
+// attached at handoff_to_ot time (declared scope, open concerns,
 // summary, tester verdict). It is stored on the resulting
 // MergeDescriptor so per-merge audit replicas can reason about the
 // pipeline's local attestation alongside the cross-pipeline coherence
@@ -1084,6 +1113,16 @@ func (s *SessionVFS) replayControlWAL() error {
 			ControlKindReplicaCrashed:
 			s.replicaLifecycleLog.ApplyControlEntry(e)
 			return nil
+		case ControlKindReplicaOverlayWrite,
+			ControlKindReplicaOverlayDelete,
+			ControlKindReplicaOverlaySealed,
+			ControlKindReplicaOverlayAbandoned:
+			// Overlay entries rehydrate the per-merge ReplicaVFS so
+			// a session that crashed mid-audit recovers its overlay
+			// state on next open. §3.6 durability: "in-flight
+			// ReplicaVFS writes are durable via the ControlWAL; a
+			// crash mid-write replays on next open."
+			return s.applyOverlayControlEntryLocked(e)
 		case ControlKindSessionOpenEpoch:
 			priorOpenAt = e.Timestamp
 			priorOpenValid = true
@@ -1117,6 +1156,60 @@ func (s *SessionVFS) replayControlWAL() error {
 			)
 		}
 	}
+	return nil
+}
+
+// applyOverlayControlEntryLocked rehydrates a single overlay WAL
+// entry into the session's replicaVFSByVersion map. Lazily
+// constructs the target ReplicaVFS the first time an entry is seen
+// for its MergedVersion. Called only from replayControlWAL (which
+// holds no lock because NewSessionVFS is single-threaded at this
+// stage — no other goroutine can see s yet). Chain-parent wiring
+// matches BeginAuditReplicaVFS's behavior: walk the merge log
+// backwards for the most recent non-abandoned replica.
+func (s *SessionVFS) applyOverlayControlEntryLocked(e *ControlEntry) error {
+	if e == nil {
+		return nil
+	}
+	ver := e.Payload.ReplicaMergeVersion
+	if s.replicaVFSByVersion == nil {
+		s.replicaVFSByVersion = make(map[SemanticVersion]*ReplicaVFS)
+	}
+	vfs, ok := s.replicaVFSByVersion[ver]
+	if !ok {
+		// Chain-parent lookup identical to BeginAuditReplicaVFS:
+		// walk merges backward, pick the most recent live replica.
+		var parent *ReplicaVFS
+		if s.merges != nil {
+			descs := s.merges.snapshot()
+			for i := len(descs) - 1; i >= 0; i-- {
+				d := descs[i]
+				if d.MergedVersion.Compare(ver) >= 0 {
+					continue
+				}
+				if r, tracked := s.replicaVFSByVersion[d.MergedVersion]; tracked && r != nil && !r.IsAbandoned() {
+					parent = r
+					break
+				}
+			}
+		}
+		var err error
+		vfs, err = NewReplicaVFS(ReplicaVFSConfig{
+			MergedVersion: ver,
+			ReplicaID:     e.Payload.ReplicaID,
+			Parent:        parent,
+			DiskBase:      s.baseFS,
+			// WAL nil during replay: re-applying the WAL to the
+			// WAL would double-record every entry on next close.
+			// ApplyControlEntry does not write to WAL regardless.
+			WAL: nil,
+		})
+		if err != nil {
+			return fmt.Errorf("session vfs: rehydrate replica vfs %s: %w", ver.String(), err)
+		}
+		s.replicaVFSByVersion[ver] = vfs
+	}
+	vfs.ApplyControlEntry(e)
 	return nil
 }
 
@@ -1370,15 +1463,51 @@ func (s *SessionVFS) releaseAuditReplicaVFSBatch(released []SemanticVersion) {
 	if s == nil || len(released) == 0 {
 		return
 	}
+	type pair struct {
+		ver SemanticVersion
+		vfs *ReplicaVFS
+	}
 	s.mu.Lock()
-	toRelease := make([]*ReplicaVFS, 0, len(released))
+	toRelease := make([]pair, 0, len(released))
 	for _, ver := range released {
 		if vfs, ok := s.replicaVFSByVersion[ver]; ok && vfs != nil {
-			toRelease = append(toRelease, vfs)
+			toRelease = append(toRelease, pair{ver: ver, vfs: vfs})
 			delete(s.replicaVFSByVersion, ver)
 		}
 	}
+	archiver := s.forensicArchiver
+	sessionID := s.sessionID
 	s.mu.Unlock()
+
+	// Forensic archive (§5.2). Fires BEFORE Abandon so the archiver
+	// can read the sealed diff if present. Archive failures are
+	// logged but do not block release — a blocked release would
+	// stall the water line and corrupt the retention invariant.
+	if archiver != nil {
+		now := time.Now().UTC()
+		for _, p := range toRelease {
+			info := ForensicReleaseInfo{
+				SessionID:      sessionID,
+				MergedVersion:  p.ver,
+				ReleasedAt:     now,
+				Sealed:         p.vfs.IsSealed(),
+				Abandoned:      p.vfs.IsAbandoned(),
+				ChainReadPaths: p.vfs.ChainReads(),
+			}
+			if p.vfs.IsSealed() {
+				info.SealedDiff = p.vfs.sealedDiff
+			}
+			if err := archiver.ArchiveReleased(info); err != nil {
+				slog.Default().Error("session vfs: forensic archive failed",
+					"session_id", string(sessionID),
+					"merged_version", p.ver.String(),
+					"sealed", info.Sealed,
+					"abandoned", info.Abandoned,
+					"error", err.Error(),
+				)
+			}
+		}
+	}
 	// Abandon outside the lock is safe by construction:
 	//   - Map mutations (the delete above) are serialized under s.mu,
 	//     so concurrent BeginAuditReplicaVFS / LookupAuditReplicaVFS
@@ -1393,16 +1522,16 @@ func (s *SessionVFS) releaseAuditReplicaVFSBatch(released []SemanticVersion) {
 	//     torn writes.
 	// Holding s.mu across Abandon would just serialize the release
 	// with other session operations unnecessarily.
-	for _, vfs := range toRelease {
-		if vfs.IsSealed() || vfs.IsAbandoned() {
+	for _, p := range toRelease {
+		if p.vfs.IsSealed() || p.vfs.IsAbandoned() {
 			continue
 		}
-		if err := vfs.Abandon(); err != nil {
+		if err := p.vfs.Abandon(); err != nil {
 			// The only failure mode of Abandon is "already sealed"
 			// (which our IsSealed check above filters), so a non-nil
 			// err here is unexpected. Log at Error so operators see
 			// inconsistency in state transitions.
-			s.logAbandonFailure(vfs, err)
+			s.logAbandonFailure(p.vfs, err)
 		}
 	}
 }

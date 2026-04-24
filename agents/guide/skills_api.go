@@ -73,6 +73,17 @@ func guideToolManifestForRegistry(registry *skills.Registry) *toolruntime.Policy
 			toolruntime.ExecutionModeLocalWorker,
 		))
 	}
+	// Claims skills: query and inspect are read-only + visible-by-default;
+	// mutation skills use local_worker execution mode.
+	policies = append(policies,
+		toolruntime.NewToolPolicy("query_claims_board", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("post_action", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("submit_testaments", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("update_claim_progress", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("inspect_claim_conflicts", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("evaluate_validation", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("traverse", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal),
+	)
 	// Activity Fabric awareness skills must be visible-by-default so the
 	// guide's classifier can introspect peer activity (who's busy, who
 	// challenged whom) without keyword-based progressive loading missing

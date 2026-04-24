@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -62,6 +63,34 @@ func (g *Guide) registerCoreSkills() {
 	// core/fabric — the prior agents/shared ↔ agents/guide cycle that
 	// blocked this is gone.
 	g.registerFabricSkills()
+
+	// ── Claims skills (unconditional) ──────────────────────────────
+	//
+	// The Guide is a full conversational agent — it classifies intent,
+	// routes, and responds. It needs to see and interact with the
+	// session claims board, not just create it. Board resolved via
+	// session registry at invocation time (session-scoped, not static).
+	boardProvider := func() *claims.ClaimsBoard {
+		return claims.DefaultSessionBoardRegistry().Lookup(g.sessionID)
+	}
+	inboxProvider := func() *claims.ClaimsInbox { return g.claimsInbox }
+	g.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	g.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
+	g.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
+	g.skills.Register(claims.EvaluateValidationSkill(boardProvider))
+	g.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
+	g.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
+	g.skills.Register(claims.TraverseSkill(boardProvider))
+
+	fabricCfg := fabric.AwarenessSkillConfig{
+		SourceProvider: activity.DefaultSource,
+		SessionID:      func() string { return strings.TrimSpace(g.sessionID) },
+		AgentID:        func() string { return "guide" },
+		AgentType:      func() string { return "guide" },
+	}
+	for _, skill := range fabric.ClaimsAwarenessSkills(fabricCfg) {
+		g.skills.Register(skill)
+	}
 }
 
 // registerFabricSkills wires the guide into the Activity Fabric so it

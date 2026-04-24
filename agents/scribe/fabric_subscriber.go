@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/activity/lenses"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -133,7 +135,7 @@ func (s *Scribe) batchAdmit(a activity.AgentActivity) {
 //   - emphasized kind: any activity matching profile.EmphasizeKinds
 //   - turn boundary: terminal protocol activities (handoff_next,
 //     finalize_pipeline, validate_work, finalize_global_review,
-//     handoff_to_green, etc.)
+//     handoff_to_ot, etc.)
 //   - causal closing: a *_completed/*_resolved/*_accepted/*_response
 //     activity that closes a previously-in-flight one this batch saw
 //   - batch size: len(batch.activities) >= profile.BatchSize
@@ -226,28 +228,46 @@ func (s *Scribe) dispatchBatchNarration(ctx context.Context, key, trigger string
 	batch.firstSeenAt = time.Time{}
 	batch.mu.Unlock()
 
-	go func() {
-		// Defensive recover: a bad scribe state (uninitialized
-		// workstreams map, missing provider) must never crash the
-		// process. The dispatch goroutine is fire-and-forget; a panic
-		// here would propagate up the goroutine scope and could take
-		// down the SubscribingSink fan-out.
-		defer func() {
-			if r := recover(); r != nil && s.logger != nil {
-				s.logger.Warn("scribe narration dispatch panicked",
-					"parent", s.parentAgentType,
-					"key", key,
-					"trigger", trigger,
-					"panic", r,
-				)
-			}
-		}()
-		dispatchCtx := ctx
-		if dispatchCtx == nil {
-			dispatchCtx = context.Background()
+	// Post trigger claim before dispatching narration. The narration
+	// testament (submitted inside store_archivalist) relates back to
+	// this trigger via the workstream key.
+	s.scribePostClaim(ctx,
+		s.scribeClaimAction(claims.ActionTypeArchival),
+		s.scribeClaim(
+			"Narration triggered: "+trigger,
+			fmt.Sprintf("Batch of %d activities dispatched for narration", len(dispatched)),
+			[]claims.ClaimScopeEntry{{Kind: "workstream", Key: key}},
+			claims.ActionTypeArchival,
+			[]*claims.Validation{
+				scribeValidation(claims.ValidationTypeReceipt, true, "Narration testament submitted", "store_archivalist called successfully"),
+			},
+		),
+	)
+
+	// Dispatch narration via tracked goroutine scope. Panics surface
+	// as errors on the scope — we do not recover them.
+	work := func(gctx context.Context) error {
+		s.narrateBatch(gctx, key, trigger, dispatched)
+		return nil
+	}
+	if s.scope != nil {
+		if err := s.scope.Go("scribe_narrate_batch", 0, work); err != nil {
+			slog.Error("scribe_narrate_dispatch_failed",
+				"parent", s.parentAgentType, "key", key,
+				"trigger", trigger, "error", err.Error())
+			s.scribeSubmitTestament(ctx, s.scribeTestament(
+				"Narration dispatch failed: "+err.Error(), "committed",
+				[]*claims.Artifact{s.scribeArtifact("error", err.Error())},
+			))
 		}
-		s.narrateBatch(dispatchCtx, key, trigger, dispatched)
-	}()
+		return
+	}
+	// No scope (test fixtures). Run synchronously.
+	dispatchCtx := ctx
+	if dispatchCtx == nil {
+		dispatchCtx = context.Background()
+	}
+	s.narrateBatch(dispatchCtx, key, trigger, dispatched)
 }
 
 // narrateBatch is the batched-narration entry point. It synthesizes a

@@ -14,6 +14,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -177,12 +178,12 @@ func (s *academicResearchExecutionState) observeToolResult(ctx context.Context, 
 	case "ground_source", "web_fetch", "fetch_document", "crawl_links":
 		s.recordFetchResult(ctx, a, result)
 	case "consult", "clone_via_librarian":
-		s.recordConsultationResult(ctx, call, result)
+		s.recordConsultationResult(ctx, a, call, result)
 	case "author_research_paper":
 		s.recordPaperOutput(ctx, result)
 	default:
 		if strings.HasPrefix(strings.TrimSpace(call.Name), "consult_") {
-			s.recordConsultationResult(ctx, call, result)
+			s.recordConsultationResult(ctx, a, call, result)
 		}
 	}
 }
@@ -478,9 +479,24 @@ func (s *academicResearchExecutionState) recordFetchResult(ctx context.Context, 
 		"persistence_job_id": stringValue(payload["persistence_job_id"]),
 		"source_type":        source.Type,
 	})
+
+	// Source grounding testament.
+	if a != nil {
+		a.academicSubmitTestament(ctx, a.academicTestament(
+			"Source grounded: "+truncateAcademic(title, 80),
+			"committed",
+			[]*claims.Artifact{
+				a.academicArtifact("url", rawURL),
+				a.academicArtifact("title", title),
+				a.academicArtifact("word_count", fmt.Sprintf("%d", intValue(payload["word_count"]))),
+				a.academicArtifact("source_type", string(source.Type)),
+				a.academicArtifact("grounded", fmt.Sprintf("%t", boolValue(payload["grounded"]))),
+			},
+		))
+	}
 }
 
-func (s *academicResearchExecutionState) recordConsultationResult(ctx context.Context, call providers.ToolCall, result string) {
+func (s *academicResearchExecutionState) recordConsultationResult(ctx context.Context, a *Academic, call providers.ToolCall, result string) {
 	payload := parseResearchJSONPayload(result)
 	if !payloadSuccess(payload) {
 		return
@@ -502,18 +518,32 @@ func (s *academicResearchExecutionState) recordConsultationResult(ctx context.Co
 		Error:       stringValue(payload["error"]),
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	switch target {
 	case "librarian":
 		s.librarianEvidence = evidence
 	case "archivalist":
 		s.archivalEvidence = evidence
 	}
+	s.mu.Unlock()
+
 	academicLogResearchStateEvent(ctx, "consultation_recorded", map[string]any{
 		"target": target,
 		"query":  query,
 		"scope":  scope,
 	})
+
+	// Peer consultation testament.
+	if a != nil {
+		a.academicSubmitTestament(ctx, a.academicTestamentWithSubject(
+			"Consulted "+target+": "+truncateAcademic(query, 80),
+			"committed", target,
+			[]*claims.Artifact{
+				a.academicArtifact("target", target),
+				a.academicArtifact("query", truncateAcademic(query, 200)),
+				a.academicArtifact("success", "true"),
+			},
+		))
+	}
 }
 
 func (s *academicResearchExecutionState) recordPaperOutput(ctx context.Context, result string) {
@@ -1266,6 +1296,13 @@ func (a *Academic) runArchitectResearchProtocol(
 	if params == nil || strings.TrimSpace(params.Query) == "" {
 		return nil, fmt.Errorf("query is required")
 	}
+
+	// Architect research protocol claim.
+	queryText := strings.TrimSpace(params.Query)
+	completeFn := a.academicStageClaim(ctx,
+		"Architect research protocol: "+truncateAcademic(queryText, 60),
+		"4-phase research (Gather → Ground → Consult → Synthesize) with paper output",
+	)
 	sessionID := strings.TrimSpace(params.SessionID)
 	if sessionID == "" {
 		sessionID = versioningSessionIDOrDefault(ctx, a.config.SessionID)
@@ -1300,9 +1337,27 @@ func (a *Academic) runArchitectResearchProtocol(
 		return a.executeToolLoop(ctx, llmReq, ledger, surface)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("architect research protocol: %w", err)
+		protocolErr := fmt.Errorf("architect research protocol: %w", err)
+		completeFn("Protocol failed", nil, protocolErr)
+		return nil, protocolErr
 	}
-	return finalizeArchitectResearchProtocolResult(ctx, state, text)
+	result, finalizeErr := finalizeArchitectResearchProtocolResult(ctx, state, text)
+
+	// Protocol completion testament.
+	state.mu.RLock()
+	sourceCount := len(state.sources)
+	hasPaper := len(state.paperOutput) > 0
+	state.mu.RUnlock()
+	completeFn(
+		fmt.Sprintf("Protocol complete: %d sources, paper=%t", sourceCount, hasPaper),
+		[]*claims.Artifact{
+			a.academicArtifact("source_count", fmt.Sprintf("%d", sourceCount)),
+			a.academicArtifact("paper_generated", fmt.Sprintf("%t", hasPaper)),
+			a.academicArtifact("query", truncateAcademic(queryText, 200)),
+		},
+		finalizeErr,
+	)
+	return result, finalizeErr
 }
 
 func finalizeArchitectResearchProtocolResult(

@@ -22,6 +22,11 @@ func orchestratorMutatingSkillNames() []string {
 		"validate_work",
 		"cancel_orchestration",
 		"resume_orchestration",
+		// Claims skills: mutating operations need LocalWorker policy.
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 	})
 }
 
@@ -47,6 +52,10 @@ func orchestratorVisibleSkillNames() []string {
 		"inspect_workspace_state",
 		"summarize_workspace_state",
 		"diff_workspace_file",
+		// Claims skills: read-only board introspection is Local (visible).
+		"query_claims_board",
+		"inspect_claim_conflicts",
+		"traverse",
 	}, "orchestrator")
 	return fabric.AppendFabricAwarenessSkillNames(base)
 }

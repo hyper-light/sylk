@@ -10,6 +10,7 @@ import (
 	"github.com/adalundhe/sylk/core/forest"
 	chatpkg "github.com/adalundhe/sylk/ui/chat"
 	"github.com/adalundhe/sylk/ui/component"
+	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -20,6 +21,12 @@ const (
 	memoryIngestTimeout      = 650 * time.Millisecond
 	memoryWriteRetryBase     = 15 * time.Millisecond
 	memoryWriteRetryAttempts = 5
+
+	// memoryCanvasTickInterval is the ambient animation cadence for
+	// the memory view. ~60ms matches memoryview.animationTickInterval.
+	// Chosen so particle drift and shimmer read as smooth without
+	// burning CPU — outside memory mode, no tick is scheduled.
+	memoryCanvasTickInterval = 60 * time.Millisecond
 )
 
 // MemoryViewService exposes the structural forest snapshot consumed by the TUI.
@@ -37,6 +44,63 @@ func (m *AppModel) toggleMemoryMode() tea.Cmd {
 		return nil
 	}
 	return m.enterMemoryMode()
+}
+
+// startMemoryCanvasTick bumps the generation counter and fires the
+// first tick cmd. Subsequent ticks self-chain via continueMemoryCanvasTick
+// until exitMemoryMode bumps the counter and orphans the live chain.
+func (m *AppModel) startMemoryCanvasTick() tea.Cmd {
+	if m.memoryView == nil || !m.memoryView.AnimationEnabled() {
+		return nil
+	}
+	m.memoryTickGen++
+	m.memoryTickOn = true
+	gen := m.memoryTickGen
+	return tea.Tick(memoryCanvasTickInterval, func(t time.Time) tea.Msg {
+		return msg.MemoryCanvasTickMsg{Time: t, Gen: gen}
+	})
+}
+
+// continueMemoryCanvasTick schedules the next tick if memory mode is
+// still the active view. Returns nil when the mode has been exited or
+// the generation has been superseded — stops the chain naturally.
+func (m *AppModel) continueMemoryCanvasTick(gen uint64) tea.Cmd {
+	if gen != m.memoryTickGen {
+		return nil
+	}
+	if m.viewMode != ViewMemory || m.memoryView == nil || !m.memoryView.AnimationEnabled() {
+		m.memoryTickOn = false
+		return nil
+	}
+	return tea.Tick(memoryCanvasTickInterval, func(t time.Time) tea.Msg {
+		return msg.MemoryCanvasTickMsg{Time: t, Gen: gen}
+	})
+}
+
+// stopMemoryCanvasTick invalidates any pending ticks. Called from
+// exitMemoryMode so the animation chain goes silent immediately when
+// the user switches away from memory mode.
+func (m *AppModel) stopMemoryCanvasTick() {
+	m.memoryTickGen++
+	m.memoryTickOn = false
+}
+
+// handleMemoryCanvasTick advances the memory view's animation state
+// by one frame and schedules the next tick. Stale ticks (whose gen
+// doesn't match) are dropped silently so old chains can't interfere
+// with a newly-started one.
+func (m *AppModel) handleMemoryCanvasTick(typed msg.MemoryCanvasTickMsg) tea.Cmd {
+	if typed.Gen != m.memoryTickGen {
+		return nil
+	}
+	if m.memoryView == nil || m.viewMode != ViewMemory {
+		m.memoryTickOn = false
+		return nil
+	}
+	m.memoryView.Tick()
+	m.markSlotDirty(m.chatSlot())
+	m.viewDirty = true
+	return m.continueMemoryCanvasTick(typed.Gen)
 }
 
 func (m *AppModel) enterMemoryMode() tea.Cmd {
@@ -67,10 +131,11 @@ func (m *AppModel) enterMemoryMode() tea.Cmd {
 	m.syncFocusState()
 	m.refreshMemoryView(true)
 	m.statusBar.SetFlash("Memory view")
-	return nil
+	return m.startMemoryCanvasTick()
 }
 
 func (m *AppModel) exitMemoryMode() {
+	m.stopMemoryCanvasTick()
 	m.leftRing.index = m.savedMemoryLeftIdx
 	m.rightRing.index = m.savedMemoryRightIdx
 	m.viewMode = ViewChat

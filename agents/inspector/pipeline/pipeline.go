@@ -19,6 +19,7 @@ import (
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
@@ -101,7 +102,7 @@ type PipelineInspector struct {
 	workspaceViews versioning.WorkspaceViewAccess
 
 	// pipelineCommitter is the inspector-only VFS lifecycle authority.
-	// handoff_to_green and discard_pipeline call into it; all other agents
+	// handoff_to_ot and discard_pipeline call into it; all other agents
 	// (engineer, designer, tester) leave their PipelineProtocolSkillConfig
 	// without one. See agents/shared/pipeline_committer.go for context on
 	// why this lives at the inspector rather than the orchestrator.
@@ -119,6 +120,15 @@ type PipelineInspector struct {
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
 	requestSerializer *agentShared.RequestSerializer
+
+	// Tracked goroutine scope for async claims dispatch.
+	scope       *concurrency.GoroutineScope
+	claimsInbox *claims.ClaimsInbox
+}
+
+// SetScope injects the goroutine scope for async claims dispatch.
+func (pi *PipelineInspector) SetScope(scope *concurrency.GoroutineScope) {
+	pi.scope = scope
 }
 
 // New creates a new PipelineInspector instance.
@@ -216,7 +226,7 @@ func (pi *PipelineInspector) initSkills() error {
 	}
 	if err := agentShared.AttachForestOutcomeRecorder(
 		pi.skills,
-		"handoff_to_green",
+		"handoff_to_ot",
 		pi.forestTracker,
 		pi.config.Forest,
 		func() string { return pi.id },
@@ -367,8 +377,31 @@ func (pi *PipelineInspector) Start(bus guide.EventBus) error {
 		return fmt.Errorf("subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
+	// Claims intake: event-driven delta processing.
+	if inbox := agentShared.WireClaimsIntake(agentShared.ClaimsIntakeConfig{
+		AgentID:      pi.id,
+		SessionID:    pi.config.SessionID,
+		Bus:          bus,
+		Board:        pi.claimsBoard,
+		Scope:        pi.scope,
+		ProcessEntry: pi.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("pipeline_inspector_claims_inbox_start_failed", "error", err.Error())
+		}
+		pi.claimsInbox = inbox
+	}
+
 	pi.running = true
 	pi.logger.Info("pipeline inspector started", "id", pi.id)
+
+	pi.inspectorSubmitTestament(pi.runCtx, pi.inspectorTestament(
+		"Pipeline inspector started", "committed",
+		[]*claims.Artifact{
+			pi.inspectorArtifact("agent_id", pi.id),
+			pi.inspectorArtifact("pipeline_id", pi.pipelineID),
+		},
+	))
 	return nil
 }
 
@@ -378,6 +411,15 @@ func (pi *PipelineInspector) Stop() error {
 		return nil
 	}
 
+	pi.inspectorSubmitTestament(context.Background(), pi.inspectorTestament(
+		"Pipeline inspector stopped", "committed",
+		[]*claims.Artifact{pi.inspectorArtifact("pipeline_id", pi.pipelineID)},
+	))
+
+	if pi.claimsInbox != nil {
+		_ = pi.claimsInbox.Close()
+		pi.claimsInbox = nil
+	}
 	pi.steering.CloseAll()
 	if pi.runCancel != nil {
 		pi.runCancel()
@@ -475,10 +517,10 @@ func stageInstructions(contract *agentShared.TaskExecutionContract, stage string
 		"Implementation evidence exists. Audit the returned work yourself before choosing the next protocol step.\n" +
 		"Use `pipeline_protocol(action=handoff)` for ordinary phase progression and `pipeline_protocol(action=challenge)` only when a specific returned deliverable is unclear, off-spec, incomplete, or otherwise needs targeted follow-up.\n" +
 		"If another agent has already returned a response to one of your challenges, call `pipeline_protocol(action=process_validation)` immediately before choosing any next handoff, challenge, or closure action.\n" +
-		"After `pipeline_protocol(action=process_validation)`, you may perform any final direct audit you still need in the same turn, but you must not end that turn without a concrete protocol tool call: `pipeline_protocol(action=challenge|handoff|finalize)` or `handoff_to_green`.\n" +
+		"After `pipeline_protocol(action=process_validation)`, you may perform any final direct audit you still need in the same turn, but you must not end that turn without a concrete protocol tool call: `pipeline_protocol(action=challenge|handoff|finalize)` or `handoff_to_ot`.\n" +
 		"Do not use `pipeline_protocol(action=finalize)` as a substitute for that targeted audit work. Call it only after the current inspector audit is complete and any challenge responses needed for that audit have already been processed.\n" +
 		"When you do call `pipeline_protocol(action=finalize)`, pass the strongest criteria, implementation, test, and challenge evidence from the current audit so it can determine whether the final tester-backed acceptance step is still needed or OT handoff is now justified.\n" +
-		"If `pipeline_protocol(action=finalize)` reports `ready_for_ot: true` or `must_handoff_to_green: true`, immediately call `handoff_to_green` as the next tool call. Do not answer in prose first.\n" +
+		"If `pipeline_protocol(action=finalize)` reports `ready_for_ot: true` or `must_handoff_to_ot: true`, immediately call `handoff_to_ot` as the next tool call. Do not answer in prose first.\n" +
 		"Do not fan out into repeated audit or grading passes on unchanged workspace state. Use additional local validation tools only when a specific concrete gap remains that the current tester response or protocol state does not already answer.\n"
 }
 
@@ -570,6 +612,15 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 		return nil, fmt.Errorf("pipeline inspector tool loop: %w", err)
 	}
 
+	// Conversation response testament.
+	pi.inspectorSubmitTestament(ctx, pi.inspectorTestament(
+		"Pipeline inspector responded", "committed",
+		[]*claims.Artifact{
+			pi.inspectorArtifact("response_length", fmt.Sprintf("%d", len(result))),
+			pi.inspectorArtifact("pipeline_id", pi.pipelineID),
+		},
+	))
+
 	return result, nil
 }
 
@@ -615,6 +666,13 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	reqCtx, cancel := context.WithCancel(pi.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
 	reqCtx = agentShared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
+
+	// Lifecycle-scoped accumulator for per-request observations.
+	acc := claims.NewTestamentAccumulator("inspector-pipeline", fwd.SessionID)
+	reqCtx = claims.WithTestamentAccumulator(reqCtx, acc)
+	defer func() {
+		acc.Flush(reqCtx, pi.inspectorBoard(), pi.inspectorScope())
+	}()
 	reqCtx = agentShared.WithGuardianCommandGate(reqCtx, agentShared.GuardianCommandGateConfig{
 		BusProvider:     func() guide.EventBus { return pi.bus },
 		SourceAgentID:   func() string { return pi.id },
@@ -1148,7 +1206,7 @@ func (pi *PipelineInspector) SetWorkspaceViews(views versioning.WorkspaceViewAcc
 }
 
 // SetPipelineCommitter installs the VFS lifecycle authority used by
-// handoff_to_green and discard_pipeline. Wiring code that has access to the
+// handoff_to_ot and discard_pipeline. Wiring code that has access to the
 // SessionVFS (the agent host, e.g. cmd/tui.go) is responsible for
 // constructing this and injecting it before the inspector handles its
 // first request. Without it the inspector's terminal skills fail with a

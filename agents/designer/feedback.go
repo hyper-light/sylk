@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -60,6 +61,19 @@ func askUserClarificationSkill(d *Designer) *skills.Skill {
 				SessionID:       d.config.SessionID,
 				Timestamp:       time.Now(),
 			}
+
+			d.designerPostClaim(ctx,
+				claims.Action{AgentID: "designer", Type: claims.ActionTypeConsultation},
+				designerConsultClaim(
+					"Ask user clarification via orchestrator: "+truncateDesigner(p.Question, 60),
+					"Clarification request routed through orchestrator to user",
+					"orchestrator",
+					[]claims.ClaimScopeEntry{{Kind: "consultation", Key: "orchestrator"}},
+					[]*claims.Validation{
+						designerValidation(claims.ValidationTypeReceipt, false, "Clarification published", "message.published"),
+					},
+				),
+			)
 
 			msg := guide.NewRequestMessage(d.generateMessageID(), req)
 			msg.Metadata = map[string]any{

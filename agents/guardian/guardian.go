@@ -17,7 +17,9 @@ import (
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/commandapproval"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/fetch"
@@ -70,6 +72,16 @@ type Guardian struct {
 
 	// Activity publisher — emit events, never maintain own journal.
 	activityPub events.ActivityPublisher
+
+	// Tracked goroutine scope for subsystem goroutines (health monitor,
+	// checkpoint manager) and async claims board subscriber dispatch.
+	scope *concurrency.GoroutineScope
+
+	// activeSessionID is the session ID of the request currently being
+	// processed. Updated at the start of handleForwardBusRequest under
+	// the requestSerializer, which guarantees single-writer access.
+	// The claims boardProvider closure reads this at invocation time.
+	activeSessionID string
 
 	// Bus integration (standard agent pattern).
 	bus         guide.EventBus
@@ -129,6 +141,8 @@ type Guardian struct {
 
 	// Agent pod for Scribe feed.
 	agentPod *shared.AgentPod
+
+	claimsInbox *claims.ClaimsInbox
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +275,7 @@ func (g *Guardian) initSubsystems() {
 	g.healthMon.SetOnEvent(func(evt agentlog.EventType, level string, payload any) {
 		shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
 	})
+	g.healthMon.SetBoardProvider(g.guardianBoard)
 	g.diffGate = NewDiffGate(g.config.Sanitizer, g.config.SuspiciousDiffPatterns)
 }
 
@@ -303,6 +318,12 @@ func (g *Guardian) Descriptor() handoff.AgentDescriptor {
 // SetAgentPod injects the agent pod for Scribe feed integration.
 func (g *Guardian) SetAgentPod(pod *shared.AgentPod) {
 	g.agentPod = pod
+}
+
+// SetScope injects the goroutine scope for tracked subsystem goroutines
+// (health monitor, checkpoint manager). Must be called before Start().
+func (g *Guardian) SetScope(scope *concurrency.GoroutineScope) {
+	g.scope = scope
 }
 
 // SetHandoffBridge stores the bridge for handoff context tracking.
@@ -442,6 +463,7 @@ func (g *Guardian) SetGitSubsystems(gitBus *git.GitBus, watcher *git.StatusWatch
 	g.gitObserver.SetOnEvent(func(evt agentlog.EventType, level string, payload any) {
 		shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
 	})
+	g.gitObserver.SetBoardProvider(g.guardianBoard)
 	g.gitObserver.Start()
 
 	if watcher != nil {
@@ -456,6 +478,7 @@ func (g *Guardian) SetGitSubsystems(gitBus *git.GitBus, watcher *git.StatusWatch
 		g.checkpointMgr.SetOnEvent(func(evt agentlog.EventType, level string, payload any) {
 			shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
 		})
+		g.checkpointMgr.SetBoardProvider(g.guardianBoard)
 		g.checkpointMgr.Start(g.runCtx)
 	}
 }
@@ -569,6 +592,7 @@ func (g *Guardian) Start(bus guide.EventBus) error {
 		g.gitObserver.SetOnEvent(func(evt agentlog.EventType, level string, payload any) {
 			shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
 		})
+		g.gitObserver.SetBoardProvider(g.guardianBoard)
 		g.gitObserver.Start()
 
 		if g.config.GitWatcher != nil {
@@ -583,12 +607,36 @@ func (g *Guardian) Start(bus guide.EventBus) error {
 			g.checkpointMgr.SetOnEvent(func(evt agentlog.EventType, level string, payload any) {
 				shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
 			})
-			g.checkpointMgr.Start(ctx)
+			g.checkpointMgr.SetBoardProvider(g.guardianBoard)
+			if g.scope != nil {
+				g.checkpointMgr.StartWithScope(ctx, g.scope)
+			} else {
+				g.checkpointMgr.Start(ctx)
+			}
 		}
 	}
 
 	// Start health monitor.
-	g.healthMon.Start(ctx)
+	if g.scope != nil {
+		g.healthMon.StartWithScope(ctx, g.scope)
+	} else {
+		g.healthMon.Start(ctx)
+	}
+
+	// Claims intake: event-driven delta processing.
+	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
+		AgentID:      g.id,
+		SessionID:    g.activeSessionID,
+		Bus:          bus,
+		Board:        g.guardianBoard(),
+		Scope:        g.scope,
+		ProcessEntry: g.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("guardian_claims_inbox_start_failed", "error", err.Error())
+		}
+		g.claimsInbox = inbox
+	}
 
 	g.publishActivityWithVisibility(events.EventTypeAgentAction, events.VisibilitySystem, "Guardian agent started")
 	g.logger.Info("guardian started", "id", g.id)
@@ -603,6 +651,11 @@ func (g *Guardian) Stop() error {
 	}
 	g.running = false
 	g.runMu.Unlock()
+
+	if g.claimsInbox != nil {
+		_ = g.claimsInbox.Close()
+		g.claimsInbox = nil
+	}
 
 	g.steering.CloseAll()
 	g.inFlightMu.Lock()
@@ -720,6 +773,7 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 		return fmt.Errorf("invalid forward request payload")
 	}
 
+	g.activeSessionID = fwd.SessionID
 	g.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
 	shared.LogIncomingRequest(g.steering.EventLogger(), fwd, g.id)
 
@@ -776,6 +830,23 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 	gov := shared.NewContextGovernor(DefaultGuardianModel, DefaultMaxOutputTokens, 0)
 	if g.handoffBridge != nil && shared.AutomaticHandoffEnabled(reqCtx) {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			// Post handoff claim to board before triggering handoff.
+			g.guardianPostClaim(bctx,
+				guardianClaimAction(claims.ActionTypeTask),
+				guardianClaim(
+					"Context budget critical — guardian handoff required",
+					"Context governor detected critical zone, triggering handoff",
+					"guardian",
+					[]claims.ClaimScopeEntry{
+						{Kind: "agent", Key: "guardian"},
+						{Kind: "resource", Key: "context_window"},
+					},
+					claims.ActionTypeTask,
+					[]*claims.Validation{
+						guardianFailedValidation(claims.ValidationTypeInspection, true, "Context usage below critical threshold (95%)", "ContextGovernor.Zone < Critical"),
+					},
+				),
+			)
 			bridge := shared.EffectiveHandoffBridge(bctx, g.handoffBridge)
 			if bridge == nil {
 				return shared.ErrContextBudgetExhausted

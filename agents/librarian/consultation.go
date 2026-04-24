@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -54,6 +55,18 @@ func consultSkill(l *Librarian) *skills.Skill {
 			if strings.TrimSpace(params.Target) == "academic" {
 				metadata = shared.ConsultationMetadataWithResearchDepth(nil, params.Depth)
 			}
+			l.librarianPostClaim(ctx,
+				claims.Action{AgentID: "librarian", Type: claims.ActionTypeConsultation},
+				librarianConsultClaim(
+					"Consult "+params.Target+": "+truncateLibrarian(params.Query, 60),
+					"Knowledge consultation",
+					params.Target,
+					[]claims.ClaimScopeEntry{{Kind: "consultation", Key: params.Target}},
+					[]*claims.Validation{
+						librarianValidation(claims.ValidationTypeReceipt, true, "Consultation succeeded", "evidence.Success == true"),
+					},
+				),
+			)
 			evidence, err := l.requestConsultationWithMetadata(ctx, params.Target, params.Query, params.Scope, params.SessionID, metadata)
 			if err != nil {
 				return nil, err

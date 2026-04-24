@@ -60,6 +60,18 @@ func guardianToolManifestForRegistry(registry *skills.Registry) *toolruntime.Pol
 		toolruntime.NewToolPolicy("self_diagnostic", toolruntime.EffectReadOnly, toolruntime.DomainSystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy(toolruntime.SearchToolName, toolruntime.EffectReadOnly, toolruntime.DomainDiscovery, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault(), toolruntime.WithSearchable(false)),
 	}
+	// Claims skills: query is read-only + visible-by-default; mutation
+	// skills (post_action, submit_testaments, update_claim_progress)
+	// are mutating and must use local_worker execution mode.
+	policies = append(policies,
+		toolruntime.NewToolPolicy("query_claims_board", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("post_action", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("submit_testaments", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("update_claim_progress", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("inspect_claim_conflicts", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("evaluate_validation", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("traverse", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal),
+	)
 	policies = shared.AppendMemoryForestToolPolicies(policies, registry, "guardian")
 	policies = fabric.AppendFabricAwarenessToolPolicies(policies, registry)
 	return toolruntime.ApplyAuthorityProfile("guardian", toolruntime.NewManifest("guardian", "guardian.control", policies...))

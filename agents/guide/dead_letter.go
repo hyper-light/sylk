@@ -83,6 +83,13 @@ func NewDeadLetterQueue(cfg DeadLetterQueueConfig) *DeadLetterQueue {
 	}
 }
 
+// SetOnEnqueue sets the callback invoked when a letter is added.
+func (q *DeadLetterQueue) SetOnEnqueue(fn func(*DeadLetter)) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.onAdd = fn
+}
+
 // Add adds a dead letter to the queue
 func (q *DeadLetterQueue) Add(letter *DeadLetter) {
 	q.mu.Lock()

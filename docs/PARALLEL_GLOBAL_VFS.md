@@ -24,7 +24,7 @@ The orchestrator's role is unchanged from its existing responsibilities — agen
 The flow is:
 
 ```
-pipeline inspector handoff_to_green   (direct protocol message)
+pipeline inspector handoff_to_ot   (direct protocol message)
     ↓ direct method call
 SessionVFS.MergePipelineIntoGreen     (MergePipe does OT, descriptor enqueued)
     ↓ synchronous callback (RegisterMergeCallback)
@@ -103,7 +103,7 @@ Chain depth is bounded by the queue-depth backpressure cap (§5). Water-line adv
 
 ### 3.2 Pipeline-inspector-accept merges directly into green via direct protocol
 
-The pipeline inspector's `handoff_to_green` (renamed from `handoff_to_ot`) is a **direct protocol message** — a method call through the `PipelineCommitter` interface, resolving to `SessionVFS.MergePipelineIntoGreen(ctx, pipelineID)`. No bus broadcast. No orchestrator hop.
+The pipeline inspector's `handoff_to_ot` (renamed from `handoff_to_ot`) is a **direct protocol message** — a method call through the `PipelineCommitter` interface, resolving to `SessionVFS.MergePipelineIntoGreen(ctx, pipelineID)`. No bus broadcast. No orchestrator hop.
 
 `MergePipelineIntoGreen`:
 1. Runs MergePipe to OT-transform the pipeline's overlay against current green.
@@ -228,7 +228,7 @@ When either replica emits Rejected, the first rejection short-circuits (the sibl
 The architect subscribes to `AuditMergeResultTopic` (observability bus — the only bus touchpoint in this design) for rejections and composes a remediation DAG. Each fix task declares `remediates_seq = K` (the rejected merge's arrival_seq). When the architect dispatches the fix pipeline:
 - `BeginPipelineConfig.BaseCopyVersion = K` (byte-for-byte materialization from the rejected merge's Copy — which is the state the remediation fixes).
 
-The remediation pipeline runs, writes its fixes, its pipeline inspector handoffs via `handoff_to_green`. MergePipe merges it as `M`. `M`'s `MergeDescriptor.SupersedesSeq = K`.
+The remediation pipeline runs, writes its fixes, its pipeline inspector handoffs via `handoff_to_ot`. MergePipe merges it as `M`. `M`'s `MergeDescriptor.SupersedesSeq = K`.
 
 When `M`'s audit accepts, the coordinator calls `CommitQueue.MarkSuperseded(K, M)`. The commit resolver, on reaching K's slot, sees `state=superseded, superseded_by=M`. It flushes M's diff in K's slot and pops both entries atomically.
 
@@ -260,7 +260,7 @@ SessionVFS.BeginPipeline(cfg)
     cfg.BaseCopyVersion = failing_merge_seq          [remediation dispatch — from architect]
     pipelineVFS byte-materialized from Copy at cfg.BaseCopyVersion
 pipeline runs, pipeline inspector audits locally
-pipeline inspector calls handoff_to_green                 [DIRECT PROTOCOL MESSAGE]
+pipeline inspector calls handoff_to_ot                 [DIRECT PROTOCOL MESSAGE]
     ↓ direct method (PipelineCommitter interface)
 SessionVFS.MergePipelineIntoGreen(ctx, pipelineID)
     - MergePipe OT transforms overlay against current green
@@ -328,7 +328,7 @@ Architect composes remediation DAG (fix tasks declare remediates_seq = K)
 Architect dispatches through its normal route    [orchestrator is in its normal role here]
     ↓ pipeline is dispatched with BeginPipelineConfig.BaseCopyVersion = K
 Remediation pipeline materializes byte-for-byte from Copy at K
-Remediation pipeline runs, pipeline inspector handoff_to_green
+Remediation pipeline runs, pipeline inspector handoff_to_ot
     ↓ SessionVFS.MergePipelineIntoGreen produces descriptor M with SupersedesSeq = K
     ↓ MergeAuditCoordinator.onMerge spawns replicas for M
     ↓ Both replicas audit M against its progressive context
@@ -466,7 +466,7 @@ The coordinator is NOT the orchestrator. The coordinator has NO relationship to 
 
 Changes from legacy:
 
-- `handoff_to_ot` renamed to `handoff_to_green` (no alias). Semantic: "I have reviewed this pipeline's work and assert it is ready for global integration."
+- `handoff_to_ot` renamed to `handoff_to_ot` (no alias). Semantic: "I have reviewed this pipeline's work and assert it is ready for global integration."
 - Emits a `PipelineInspectorCertificate` alongside the handoff: declared-scope, open-concerns, summary, tester-verdict. Attached to the `MergeDescriptor`.
 - The handoff itself is a direct protocol method call through `PipelineCommitter.MergePipelineIntoGreen`. No bus publish. No orchestrator route.
 
@@ -561,7 +561,7 @@ Files:
 - `core/versioning/session_vfs.go` — `MergePipelineIntoGreen` is the direct protocol endpoint.
 - `core/versioning/session_review.go` — deprecate / remove `ExtractReviewCandidate`.
 - `agents/shared/pipeline_committer.go` — rename path in the committer interface.
-- `agents/shared/pipeline_protocol.go` — `handoff_to_green` skill invokes the new path.
+- `agents/shared/pipeline_protocol.go` — `handoff_to_ot` skill invokes the new path.
 - `agents/inspector/pipeline/**` — skill renamed from `handoff_to_ot` (no alias).
 
 ### Stage 2 — MergeDescriptor, Copy addressing, byte-for-byte pipeline dispatch materialization.

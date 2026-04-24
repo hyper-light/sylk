@@ -222,22 +222,27 @@ func TestBuildOTGlobalFollowupRequest_PreservesSessionMetadataForDurableReviewSt
 	}
 }
 
-func TestFinalizePipelineUpdate_InspectorSuccessPublishesGlobalInspectorFollowup(t *testing.T) {
+// TestFinalizePipelineUpdate_InspectorSuccessDefersNodeCompletion verifies
+// that when the pipeline inspector succeeds, the orchestrator defers DAG
+// node completion (returns true) and releases coordination claims, but does
+// NOT publish a global follow-up request — the pipeline inspector routes
+// directly to the global inspector via handoff_to_ot.
+func TestFinalizePipelineUpdate_InspectorSuccessDefersNodeCompletion(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	t.Cleanup(func() { _ = bus.Close() })
 
-	reqCh := make(chan *guide.RouteRequest, 2)
+	// Subscribe to verify NO follow-up is published.
+	reqCh := make(chan *guide.RouteRequest, 1)
 	sub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
 		req, ok := msg.GetRouteRequest()
 		if !ok || req == nil {
 			return nil
 		}
-		if req.Metadata["ot_handoff_followup"] != true {
-			return nil
-		}
-		select {
-		case reqCh <- req:
-		default:
+		if req.Metadata["ot_handoff_followup"] == true {
+			select {
+			case reqCh <- req:
+			default:
+			}
 		}
 		return nil
 	})
@@ -259,14 +264,9 @@ func TestFinalizePipelineUpdate_InspectorSuccessPublishesGlobalInspectorFollowup
 		Name:        "Session Recovery",
 		Description: "Ensure session recovery survives transient failures.",
 		SessionID:   "sess-1",
-		Metadata: map[string]any{
-			"affected_files":      []string{"pkg/session/recovery.go"},
-			"acceptance_criteria": []string{"Recovered sessions preserve auth state."},
-			"test_requirements":   []string{"Run regression coverage for session recovery."},
-		},
 	}
 
-	o.finalizePipelineUpdate(&PipelineUpdate{
+	deferred := o.finalizePipelineUpdate(&PipelineUpdate{
 		DAGID:     "dag-1",
 		NodeID:    "task-9",
 		TaskID:    "task-9",
@@ -279,34 +279,17 @@ func TestFinalizePipelineUpdate_InspectorSuccessPublishesGlobalInspectorFollowup
 		Timestamp: time.Date(2026, 3, 23, 12, 30, 0, 0, time.UTC),
 	})
 
-	collected := make(map[string]*guide.RouteRequest, 1)
-	timeout := time.After(2 * time.Second)
-	for len(collected) < 1 {
-		select {
-		case req := <-reqCh:
-			collected[req.TargetAgentID] = req
-		case <-timeout:
-			t.Fatalf("timed out waiting for OT follow-up requests, collected=%v", mapsKeys(collected))
-		}
+	if !deferred {
+		t.Fatal("expected deferNodeCompletion=true for inspector success")
 	}
 
-	inspectorReq := collected["inspector"]
-	if inspectorReq == nil {
-		t.Fatal("missing global inspector follow-up request")
-	}
-	if !strings.Contains(inspectorReq.Input, "Operational Transform has accepted this completed pipeline") {
-		t.Fatalf("inspector input = %q, want OT merged-state prompt", inspectorReq.Input)
-	}
-	if inspectorReq.Metadata["global_review"] != true {
-		t.Fatalf("metadata global_review = %#v, want true", inspectorReq.Metadata["global_review"])
-	}
-	if _, ok := inspectorReq.Metadata["global_review_protocol"]; !ok {
-		t.Fatal("missing seeded global review protocol metadata on inspector follow-up")
-	}
+	// No OT follow-up should be published — the pipeline inspector
+	// routes directly to the global inspector.
 	select {
 	case req := <-reqCh:
-		t.Fatalf("unexpected additional OT follow-up request: target=%s", req.TargetAgentID)
-	case <-time.After(150 * time.Millisecond):
+		t.Fatalf("unexpected OT follow-up published: target=%s", req.TargetAgentID)
+	case <-time.After(200 * time.Millisecond):
+		// Expected — no follow-up.
 	}
 }
 

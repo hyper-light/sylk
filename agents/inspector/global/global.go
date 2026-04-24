@@ -16,8 +16,10 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/forest"
@@ -117,6 +119,11 @@ type GlobalInspector struct {
 	// (request received, completion, error) so its work is visible
 	// in the TUI chat panel alongside the knowledge-tier agents.
 	activityPub events.ActivityPublisher
+
+	// Tracked goroutine scope for async claims dispatch.
+	scope *concurrency.GoroutineScope
+
+	claimsInbox *claims.ClaimsInbox
 }
 
 // New creates a new GlobalInspector instance. The provider must implement
@@ -175,6 +182,11 @@ func New(cfg shared.GlobalInspectorConfig, provider providers.ProviderAdapter) (
 		return nil, err
 	}
 	return gi, nil
+}
+
+// SetScope injects the goroutine scope for async claims dispatch.
+func (gi *GlobalInspector) SetScope(scope *concurrency.GoroutineScope) {
+	gi.scope = scope
 }
 
 // SetProvider sets or replaces the LLM provider at runtime. Thread-safe.
@@ -411,6 +423,21 @@ func (gi *GlobalInspector) Start(bus guide.EventBus) error {
 	// pipeline-inspector → OT → replica-spawn chain is direct
 	// method calls and durable WAL records.
 
+	// Claims intake: event-driven delta processing.
+	if inbox := agentShared.WireClaimsIntake(agentShared.ClaimsIntakeConfig{
+		AgentID:      gi.id,
+		SessionID:    gi.config.SessionID,
+		Bus:          bus,
+		Board:        gi.globalInspectorBoard(),
+		Scope:        gi.scope,
+		ProcessEntry: gi.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("global_inspector_claims_inbox_start_failed", "error", err.Error())
+		}
+		gi.claimsInbox = inbox
+	}
+
 	gi.running = true
 	gi.logger.Info("global inspector started", "id", gi.id)
 	return nil
@@ -420,6 +447,11 @@ func (gi *GlobalInspector) Start(bus guide.EventBus) error {
 func (gi *GlobalInspector) Stop() error {
 	if !gi.running {
 		return nil
+	}
+
+	if gi.claimsInbox != nil {
+		_ = gi.claimsInbox.Close()
+		gi.claimsInbox = nil
 	}
 
 	gi.steering.CloseAll()

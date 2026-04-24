@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/google/uuid"
 )
 
@@ -97,6 +98,19 @@ func (a *Architect) queryOrchestratorPlanState(ctx context.Context, planID strin
 			"plan_id":      planID,
 		},
 	}
+	a.architectPostClaim(ctx,
+		architectClaimAction(claims.ActionTypeConsultation),
+		architectClaimWithSubject(
+			"Query orchestrator plan state: "+truncateArchitectString(planID, 40),
+			"Plan state query via orchestrator",
+			"orchestrator",
+			[]claims.ClaimScopeEntry{{Kind: "consultation", Key: "orchestrator"}},
+			claims.ActionTypeConsultation,
+			[]*claims.Validation{
+				architectValidation(claims.ValidationTypeReceipt, false, "Orchestrator returns plan state", "state != nil"),
+			},
+		),
+	)
 	resp, err := a.requestRouteSync(queryCtx, req)
 	if err != nil || resp == nil {
 		architectDebugLog().Info("queryOrchestratorPlanState: ROUTE_SYNC_FAILED",

@@ -275,3 +275,116 @@ func TestSessionVFS_BeginPipeline_WithBaseCopyVersion_PinsIsolation(t *testing.T
 		t.Fatalf("Pipeline B sees shared.py = %q; want %q (pinned to A's Copy, must not see C's later advancement)", string(got), "v1")
 	}
 }
+
+// TestMaterializePipelineFromCopy_InstallsCopyAsBaseReader verifies
+// the extracted Stage-2 function: given a live pipelineVFS and a
+// baseVersion, the pipeline's BaseReader returns byte-for-byte
+// content at that Copy's version and falls through to disk for
+// paths the Copy didn't capture.
+func TestMaterializePipelineFromCopy_InstallsCopyAsBaseReader(t *testing.T) {
+	dir := t.TempDir()
+	svfs, err := NewSessionVFS(SessionVFSConfig{
+		SessionID:       "materialize-test",
+		WorkingDir:      dir,
+		AllowDiskExport: true,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	defer svfs.Close()
+	ctx := context.Background()
+
+	// Merge A: write shared.py v1.
+	pipeA, err := svfs.BeginPipeline(BeginPipelineConfig{
+		PipelineID: "A",
+		SessionID:  "materialize-test",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedPath := filepath.Join(dir, "shared.py")
+	if err := svfs.NewPipelineFileAccess(pipeA).WriteFile(ctx, sharedPath, []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	resA, err := svfs.MergePipelineIntoGreen(ctx, "A", PipelineInspectorCertificate{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Merge B: advance green with shared.py v2.
+	pipeB, err := svfs.BeginPipeline(BeginPipelineConfig{
+		PipelineID: "B",
+		SessionID:  "materialize-test",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svfs.NewPipelineFileAccess(pipeB).WriteFile(ctx, sharedPath, []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svfs.MergePipelineIntoGreen(ctx, "B", PipelineInspectorCertificate{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Construct an uninitialized pipeline VFS (no base reader yet)
+	// and call the extracted MaterializePipelineFromCopy directly.
+	pipeC, err := svfs.BeginPipeline(BeginPipelineConfig{
+		PipelineID:      "C",
+		SessionID:       "materialize-test",
+		WorkingDir:      dir,
+		BaseCopyVersion: resA.MergedVersion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Re-materialize via the exported entry point (idempotent: BeginPipeline
+	// already materialized this pipeline; calling again installs the same
+	// Copy-backed readers).
+	if err := svfs.MaterializePipelineFromCopy(pipeC, resA.MergedVersion); err != nil {
+		t.Fatalf("MaterializePipelineFromCopy: %v", err)
+	}
+
+	// Pipeline C must see shared.py as v1 (A's Copy), NOT v2 (B's
+	// later merge). This is the pinning invariant the extracted
+	// function is responsible for.
+	content, err := svfs.NewPipelineFileAccess(pipeC).ReadFile(ctx, sharedPath)
+	if err != nil {
+		t.Fatalf("ReadFile shared.py through C: %v", err)
+	}
+	if string(content) != "v1" {
+		t.Errorf("materialized C sees shared.py = %q, want %q (pinned to A's Copy)", string(content), "v1")
+	}
+}
+
+// TestMaterializePipelineFromCopy_RejectsInvalidInputs pins the
+// precondition contract: nil pipelineVFS and zero baseVersion are
+// errors, not silent no-ops.
+func TestMaterializePipelineFromCopy_RejectsInvalidInputs(t *testing.T) {
+	dir := t.TempDir()
+	svfs, err := NewSessionVFS(SessionVFSConfig{
+		SessionID:  "materialize-rejects",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svfs.Close()
+
+	if err := svfs.MaterializePipelineFromCopy(nil, SemanticVersion{Minor: 1}); err == nil {
+		t.Error("accepted nil pipelineVFS")
+	}
+
+	pipe, err := svfs.BeginPipeline(BeginPipelineConfig{
+		PipelineID: "probe",
+		SessionID:  "materialize-rejects",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svfs.MaterializePipelineFromCopy(pipe, SemanticVersion{}); err == nil {
+		t.Error("accepted zero baseVersion (callers should use current-green dispatch for that case)")
+	}
+}

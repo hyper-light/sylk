@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -174,6 +175,10 @@ func (e *Engineer) executeToolLoopWithSurface(
 		e.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if controlErr != nil {
 			if errors.Is(controlErr, skills.ErrDelegatedRequested) {
+				if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+					acc.Record("delegation", truncateEngineer(delegatedMessage, 100))
+					acc.Note("Delegated to peer agent")
+				}
 				return strings.TrimSpace(delegatedMessage), nil
 			}
 			return "", controlErr

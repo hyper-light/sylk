@@ -11,6 +11,7 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/steering"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -44,29 +45,42 @@ func (gi *GlobalInspector) SpawnAuditReplica(ctx context.Context, req *agentShar
 	if f := agentShared.AuditDecisionFinalizerFromContext(ctx); f != nil {
 		carryCtx = agentShared.WithAuditDecisionFinalizer(carryCtx, f)
 	}
-	go func() {
+	// Run the per-merge audit under a tracked GoroutineScope. The
+	// scope is sourced from the coordinator's ctx first, then the
+	// agent's run ctx — either must provide one. Refuses the spawn
+	// if no scope is available so we never silently leak a goroutine
+	// (CLAUDE.md "no untracked goroutines").
+	scope := concurrency.ScopeFromContext(ctx)
+	if scope == nil {
+		scope = concurrency.ScopeFromContext(runCtx)
+	}
+	if scope == nil {
+		return fmt.Errorf("inspector: SpawnAuditReplica: no GoroutineScope on ctx or runCtx — cannot dispatch audit")
+	}
+	return scope.Go("inspector-audit-merge:"+req.ReplicaID, 0, func(workCtx context.Context) error {
 		if err := gi.handleAuditMerge(carryCtx, req); err != nil {
 			gi.logger.Warn("audit_merge: handler error",
 				"replica_id", req.ReplicaID,
 				"merged_version", req.Descriptor.MergedVersion.String(),
 				"error", err.Error(),
 			)
+			return err
 		}
-	}()
-	return nil
+		return nil
+	})
 }
 
-// handleAuditMerge runs one per-merge audit to completion. Mirrors
-// the shape of handleTaskRequest but scoped to an AuditMergeRequest:
-//   - Session / task scope set from the request.
-//   - AuditMergeContext attached so emit_audit_decision can resolve
-//     the replica ID / merged version at call time.
-//   - Tool loop invoked with an audit-scoped prompt that instructs
-//     the LLM to inspect the diff, consult peers as needed, and
-//     terminate via emit_audit_decision.
-//   - If the tool loop exits without emitting a decision (model
-//     declined, context cancelled, etc.), synthesize a rejection
-//     with the failure reason so the commit queue does not stall.
+// handleAuditMerge runs one per-merge audit to completion.
+// Stage 3 per-replica parallelism: each audit instantiates its own
+// AuditReplicaRuntime with per-replica state — no requestSerializer,
+// no shared skillLoader / toolRuntime mutation. N concurrent merges
+// produce N fully parallel audit runtimes.
+//
+// The only remaining agent-level shared state is the Provider, the
+// Bus, and the SteeringManager — all thread-safe by construction.
+// Per-replica state (ReplicaVFS, ledger, request, finalizer) is
+// captured once in the AuditReplicaConfig and never mutated from
+// outside.
 func (gi *GlobalInspector) handleAuditMerge(ctx context.Context, req *agentShared.AuditMergeRequest) error {
 	if gi.getProvider() == nil {
 		// Provider not yet wired — emit a rejection so the queue
@@ -74,41 +88,6 @@ func (gi *GlobalInspector) handleAuditMerge(ctx context.Context, req *agentShare
 		// lands.
 		return gi.emitFallbackRejection(ctx, req, "inspector provider not available")
 	}
-	if !gi.requestSerializer.Acquire(ctx) {
-		return ctx.Err()
-	}
-	defer gi.requestSerializer.Release()
-
-	// Scope ctx with the audit context so emit_audit_decision and
-	// any future audit-scoped skills can resolve the replica ID /
-	// merged version without needing per-call parameters.
-	ctx = agentShared.WithAuditMergeContext(ctx, agentShared.AuditMergeContext{
-		SessionID:     req.SessionID,
-		ReplicaID:     req.ReplicaID,
-		AgentType:     req.AgentType,
-		MergedVersion: req.Descriptor.MergedVersion,
-		BaseVersion:   req.Descriptor.BaseVersion,
-	})
-
-	// Build an audit-scoped system prompt + user input that tells
-	// the LLM its sole purpose for this turn-loop is to audit the
-	// named merge and terminate by calling emit_audit_decision.
-	systemPrompt := buildAuditMergeSystemPrompt(req)
-	userPrompt := buildAuditMergeUserPrompt(req)
-
-	gi.prepareSkillsForInput(userPrompt)
-	tools := gi.buildToolDefinitions()
-
-	providerReq := &providers.Request{
-		SystemPrompt: systemPrompt,
-		Messages: []providers.Message{
-			{Role: providers.RoleUser, Content: userPrompt},
-		},
-		Model:     gi.config.Model,
-		MaxTokens: gi.config.MaxTokens,
-		Tools:     tools,
-	}
-	gi.applyLLMRuntimeProfile(providerReq, "audit_merge")
 
 	// Wire the steering ledger to this replica's deterministic ID so
 	// the ledger rehydrates correctly if the session resumes. When
@@ -129,7 +108,6 @@ func (gi *GlobalInspector) handleAuditMerge(ctx context.Context, req *agentShare
 	}
 	ledger := gi.steering.Create(req.ReplicaID, gi.id, req.SessionID, nil, journal)
 	defer gi.steering.Close(req.ReplicaID, ctx.Err() != nil)
-	ctx = agentShared.WithSteeringLedger(ctx, ledger)
 	ctx = agentShared.WithLogMeta(ctx, agentShared.LogMeta{
 		EventLogger: gi.steering.EventLogger(),
 		CorrID:      req.ReplicaID,
@@ -137,26 +115,54 @@ func (gi *GlobalInspector) handleAuditMerge(ctx context.Context, req *agentShare
 		SessionID:   req.SessionID,
 	})
 
-	emitted, err := gi.runAuditToolLoop(ctx, providerReq, ledger)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		// Tool loop failed mechanically — synthesize a rejection
-		// referencing the failure so the queue is not stranded.
-		if !emitted {
-			_ = gi.emitFallbackRejection(ctx, req,
-				fmt.Sprintf("audit tool loop failed: %v", err))
-		}
+	// Session reference travels on the request — the coordinator put
+	// it there in spawnReplica. The runtime needs it for the
+	// merges_after tool.
+	if req.Session == nil {
+		return gi.emitFallbackRejection(ctx, req,
+			fmt.Sprintf("audit request for %s missing SessionVFS reference", req.ReplicaID))
+	}
+
+	responseTopic := ""
+	if gi.channels != nil {
+		responseTopic = gi.channels.Responses
+	}
+	runtime, err := agentShared.NewAuditReplicaRuntime(agentShared.AuditReplicaConfig{
+		ReplicaID:        req.ReplicaID,
+		AgentType:        req.AgentType,
+		SessionID:        req.SessionID,
+		MergedVersion:    req.Descriptor.MergedVersion,
+		BaseVersion:      req.Descriptor.BaseVersion,
+		IsReAudit:        req.IsReAudit,
+		Request:          req,
+		Session:          req.Session,
+		ReplicaVFS:       req.ReplicaVFS,
+		Finalizer:        agentShared.AuditDecisionFinalizerFromContext(ctx),
+		Ledger:           ledger,
+		Provider:         gi.getProvider(),
+		Model:            gi.config.Model,
+		MaxTokens:        gi.config.MaxTokens,
+		MaxToolRuns:      gi.config.MaxToolRuns,
+		ThinkingBudget:   0,
+		Bus:              gi.bus,
+		Channels:         gi.channels,
+		AgentID:          gi.id,
+		AgentDisplayName: agentShared.AgentDisplayName("inspector"),
+		ResponseTopic:    responseTopic,
+		Logger:           gi.logger,
+		SystemPrompt:     buildAuditMergeSystemPrompt(req),
+		UserPrompt:       buildAuditMergeUserPrompt(req),
+	})
+	if err != nil {
+		return gi.emitFallbackRejection(ctx, req, fmt.Sprintf("construct audit runtime: %v", err))
+	}
+	if err := runtime.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("audit merge: %v", err)})
 		}
 		return err
-	}
-	if !emitted {
-		// Loop exited cleanly but the LLM did not call
-		// emit_audit_decision. Synthesize a rejection — a missing
-		// decision is not an acceptance.
-		return gi.emitFallbackRejection(ctx, req, "inspector tool loop terminated without emitting a decision")
 	}
 	return nil
 }

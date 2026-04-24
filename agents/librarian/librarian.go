@@ -16,6 +16,8 @@ import (
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
@@ -130,6 +132,16 @@ type Librarian struct {
 
 	// Handoff integration
 	handoffBridge *handoff.HandoffBridge
+
+	// Tracked goroutine scope for async claims dispatch.
+	scope *concurrency.GoroutineScope
+
+	claimsInbox *claims.ClaimsInbox
+}
+
+// SetScope injects the goroutine scope for async claims dispatch.
+func (l *Librarian) SetScope(scope *concurrency.GoroutineScope) {
+	l.scope = scope
 }
 
 // Config holds configuration for the Librarian agent.
@@ -471,10 +483,36 @@ func (l *Librarian) Start(bus guide.EventBus) error {
 	// Subscribe to knowledge readiness for telemetry.
 	l.knowledgeSub, _ = bus.SubscribeAsync(guide.TopicKnowledgeReady, l.handleKnowledgeReady)
 
+	// Claims intake: event-driven delta processing.
+	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
+		AgentID:      l.id,
+		SessionID:    l.config.SessionID,
+		Bus:          bus,
+		Board:        l.librarianBoard(),
+		Scope:        l.scope,
+		ProcessEntry: l.processClaimsEntry,
+	}); inbox != nil {
+		if err := inbox.Start(nil); err != nil {
+			slog.Warn("librarian_claims_inbox_start_failed", "error", err.Error())
+		}
+		l.claimsInbox = inbox
+	}
+
 	l.runCtx, l.runCancel = context.WithCancel(context.Background())
 	l.requestCancels = make(map[string]context.CancelFunc)
 	l.running = true
 	l.logger.Info("librarian started", "channels", l.channels, "llm_enabled", l.config.EnableLLM)
+
+	// Lifecycle testament: started.
+	l.librarianSubmitTestament(l.runCtx, l.librarianTestament(
+		"Librarian agent started", "committed",
+		[]*claims.Artifact{
+			l.librarianArtifact("session_id", l.config.SessionID),
+			l.librarianArtifact("agent_id", l.id),
+			l.librarianArtifact("llm_enabled", fmt.Sprintf("%t", l.config.EnableLLM)),
+		},
+	))
+
 	return nil
 }
 
@@ -482,6 +520,17 @@ func (l *Librarian) Start(bus guide.EventBus) error {
 func (l *Librarian) Stop() error {
 	if !l.running {
 		return nil
+	}
+
+	// Lifecycle testament: stopping.
+	l.librarianSubmitTestament(context.Background(), l.librarianTestament(
+		"Librarian agent stopped", "committed",
+		[]*claims.Artifact{l.librarianArtifact("session_id", l.config.SessionID)},
+	))
+
+	if l.claimsInbox != nil {
+		_ = l.claimsInbox.Close()
+		l.claimsInbox = nil
 	}
 
 	l.steering.CloseAll()
@@ -584,9 +633,18 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 
 	startTime := time.Now()
 
+	// Request-scoped testament accumulator: collects per-search,
+	// per-tool, and per-event observations. Flushed as ONE composite
+	// testament when the request completes.
+	acc := claims.NewTestamentAccumulator("librarian", fwd.SessionID)
+	defer func() {
+		acc.Flush(reqCtx, l.librarianBoard(), l.librarianScope())
+	}()
+
 	// Wire tool call emitter for inline visualization.
 	emitter := shared.NewToolCallEmitter(l.bus, l.channels, l.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
+	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	ctx = shared.WithOwnedStreamIdentity(ctx, "librarian", "Librarian")
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
@@ -642,6 +700,9 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 			if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
 				pp.PublishState(events.AgentUIStateSearching, shared.KnowledgeQueueProgressMessage("librarian", snapshot, queuePosition))
 			}
+			acc.Record("replica_queued", fmt.Sprintf("position=%d active=%d/%d queued=%d/%d",
+				queuePosition, snapshot.Active, snapshot.MaxActive, snapshot.Queued, snapshot.MaxQueued))
+			acc.Note(fmt.Sprintf("Queued at position %d", queuePosition))
 			stopQueueKeepalive = l.startQueueKeepalive(ctx, queuePosition)
 		},
 		OnGranted: func(snapshot shared.RequestReplicaPoolSnapshot, _ bool) {
@@ -654,6 +715,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 				streamStarted = true
 			}
 			l.publishReplicaActivityForRequest(fwd.SessionID, fwd.CorrelationID, events.EventTypeAgentAction, "Processing search request", snapshot)
+			acc.Record("replica_granted", fmt.Sprintf("active=%d/%d", snapshot.Active, snapshot.MaxActive))
 		},
 	})
 	if stopQueueKeepalive != nil {

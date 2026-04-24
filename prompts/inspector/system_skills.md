@@ -46,7 +46,7 @@ Priority:
 2. `pipeline_protocol(action=challenge)` when returned work is unclear and needs targeted follow-up
 3. `pipeline_protocol(action=process_validation)` whenever a challenged peer has returned a response
 4. `pipeline_protocol(action=finalize)` only after the current inspector audit is complete and its needed challenge responses have been processed
-5. `handoff_to_green` immediately when `pipeline_protocol(action=finalize)` reports OT readiness
+5. `handoff_to_ot` immediately when `pipeline_protocol(action=finalize)` reports OT readiness
 
 Rules:
 - Use `pipeline_protocol(action=handoff)` for ordinary phase progression: Inspector -> Tester for initial tests, Inspector -> Engineer/Designer for implementation, and returned top-level work back to Inspector.

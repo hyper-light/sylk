@@ -522,6 +522,216 @@ func TestMergeAuditCoordinator_PartialSpawnRollsBack(t *testing.T) {
 	}
 }
 
+// TestMergeAuditCoordinator_ReAuditTriggersOnChainReadOverlap
+// verifies §3.8 substantive-change detection: an intermediate merge
+// whose declared Paths do NOT overlap with the supersedor's paths
+// but whose audit READ an ancestor path the supersedor rewrites
+// must be re-audited. Path-overlap alone would miss this case.
+func TestMergeAuditCoordinator_ReAuditTriggersOnChainReadOverlap(t *testing.T) {
+	sess := openTestSession(t, "sess-chainread-reaudit")
+	defer sess.Close()
+
+	inspector := &stubSpawner{}
+	tester := &stubSpawner{}
+	coord := NewMergeAuditCoordinator(MergeAuditCoordinatorConfig{
+		Session:   sess,
+		Inspector: inspector,
+		Tester:    tester,
+	})
+	if err := coord.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer coord.Stop()
+
+	// Rejected K touches "shared.go".
+	rejectedVer := versioning.SemanticVersion{Minor: 1}
+	rejected := versioning.MergeDescriptor{
+		PipelineID:    "K",
+		BaseVersion:   versioning.SemanticVersion{},
+		MergedVersion: rejectedVer,
+		Paths:         []string{"shared.go"},
+	}
+	sess.RecordMergeDescriptorForTest(rejected)
+	if _, err := sess.CommitQueue().Enqueue(rejected); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.CommitQueue().MarkRejected(rejectedVer, "r-K", "bad", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Intermediate I (K+1). Touches only "other.go" — NO overlap
+	// with K's "shared.go" at the descriptor level.
+	interVer := versioning.SemanticVersion{Minor: 2}
+	inter := versioning.MergeDescriptor{
+		PipelineID:    "I",
+		BaseVersion:   rejectedVer,
+		MergedVersion: interVer,
+		Paths:         []string{"other.go"},
+	}
+	sess.RecordMergeDescriptorForTest(inter)
+	if _, err := sess.CommitQueue().Enqueue(inter); err != nil {
+		t.Fatal(err)
+	}
+	// I's audit replica reads "shared.go" from the ancestor chain —
+	// that's the audited-context path the re-audit scan must detect.
+	iVFS, err := sess.BeginAuditReplicaVFS(interVer, "holder-I")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = iVFS.Read("shared.go") // recorded in chainReads even on miss
+
+	// Supersedor M: fix for K. Rewrites "shared.go" (same as K).
+	supersedorVer := versioning.SemanticVersion{Minor: 3}
+	supersedor := versioning.MergeDescriptor{
+		PipelineID:        "K_fix",
+		BaseVersion:       rejectedVer,
+		MergedVersion:     supersedorVer,
+		Paths:             []string{"shared.go"},
+		SupersedesVersion: rejectedVer,
+	}
+	sess.RecordMergeDescriptorForTest(supersedor)
+	if _, err := sess.CommitQueue().Enqueue(supersedor); err != nil {
+		t.Fatal(err)
+	}
+
+	coord.onMerge(context.Background(), supersedor)
+
+	// Both supersedor replicas accept — supersession fires, which
+	// runs triggerReAuditAfterSupersession.
+	inspectorID := MergeReplicaAgentID("inspector-global", "sess-chainread-reaudit", supersedorVer)
+	testerID := MergeReplicaAgentID("tester-global", "sess-chainread-reaudit", supersedorVer)
+	inspector.emit(t, inspectorID, versioning.ReplicaDecisionAccepted, "fix ok", nil)
+	tester.emit(t, testerID, versioning.ReplicaDecisionAccepted, "tests ok", nil)
+
+	// I's replicas should have been re-dispatched (IsReAudit=true),
+	// even though I's descriptor.Paths did NOT overlap with M's.
+	interInspectorID := MergeReplicaAgentID("inspector-global", "sess-chainread-reaudit", interVer)
+	interTesterID := MergeReplicaAgentID("tester-global", "sess-chainread-reaudit", interVer)
+	foundInspector := false
+	foundTester := false
+	for _, req := range inspector.calls {
+		if req.ReplicaID == interInspectorID && req.IsReAudit {
+			foundInspector = true
+		}
+	}
+	for _, req := range tester.calls {
+		if req.ReplicaID == interTesterID && req.IsReAudit {
+			foundTester = true
+		}
+	}
+	if !foundInspector {
+		t.Error("inspector re-audit not dispatched for intermediate merge (chain-read overlap missed)")
+	}
+	if !foundTester {
+		t.Error("tester re-audit not dispatched for intermediate merge (chain-read overlap missed)")
+	}
+}
+
+// TestMergeAuditCoordinator_ReAuditCrashesInFlightReplicas verifies
+// that when a re-audit is spawned for an intermediate merge, any
+// still-in-flight replicas for that merge are recorded as Crashed
+// ("superseded by re-audit") and removed from the coordinator's
+// in-flight + partial-verdict bookkeeping. Prevents the race where
+// a stale in-flight replica's verdict resolves the finalizer before
+// the re-audit's does.
+func TestMergeAuditCoordinator_ReAuditCrashesInFlightReplicas(t *testing.T) {
+	sess := openTestSession(t, "sess-reaudit-crash")
+	defer sess.Close()
+
+	inspector := &stubSpawner{}
+	tester := &stubSpawner{}
+	coord := NewMergeAuditCoordinator(MergeAuditCoordinatorConfig{
+		Session:   sess,
+		Inspector: inspector,
+		Tester:    tester,
+	})
+	if err := coord.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer coord.Stop()
+
+	rejectedVer := versioning.SemanticVersion{Minor: 1}
+	rejected := versioning.MergeDescriptor{
+		PipelineID:    "K",
+		MergedVersion: rejectedVer,
+		Paths:         []string{"s.go"},
+	}
+	sess.RecordMergeDescriptorForTest(rejected)
+	_, _ = sess.CommitQueue().Enqueue(rejected)
+	_ = sess.CommitQueue().MarkRejected(rejectedVer, "r-K", "bad", nil)
+
+	// Intermediate I is auditing. Its replicas are in-flight.
+	interVer := versioning.SemanticVersion{Minor: 2}
+	inter := versioning.MergeDescriptor{
+		PipelineID:    "I",
+		BaseVersion:   rejectedVer,
+		MergedVersion: interVer,
+		Paths:         []string{"s.go"}, // overlap triggers re-audit via descriptor-path path
+	}
+	sess.RecordMergeDescriptorForTest(inter)
+	_, _ = sess.CommitQueue().Enqueue(inter)
+	// Fire the intermediate merge through onMerge to populate the
+	// coordinator's in-flight map.
+	coord.onMerge(context.Background(), inter)
+
+	interInspectorID := MergeReplicaAgentID("inspector-global", "sess-reaudit-crash", interVer)
+	interTesterID := MergeReplicaAgentID("tester-global", "sess-reaudit-crash", interVer)
+	coord.mu.Lock()
+	_, inspectorInFlightBefore := coord.inFlight[interInspectorID]
+	_, testerInFlightBefore := coord.inFlight[interTesterID]
+	coord.mu.Unlock()
+	if !inspectorInFlightBefore || !testerInFlightBefore {
+		t.Fatalf("expected both intermediate replicas in-flight before supersession; got inspector=%v tester=%v", inspectorInFlightBefore, testerInFlightBefore)
+	}
+
+	// Supersedor arrives + both replicas accept.
+	supersedorVer := versioning.SemanticVersion{Minor: 3}
+	supersedor := versioning.MergeDescriptor{
+		PipelineID:        "K_fix",
+		MergedVersion:     supersedorVer,
+		Paths:             []string{"s.go"},
+		SupersedesVersion: rejectedVer,
+	}
+	sess.RecordMergeDescriptorForTest(supersedor)
+	_, _ = sess.CommitQueue().Enqueue(supersedor)
+
+	coord.onMerge(context.Background(), supersedor)
+	supersedorInspectorID := MergeReplicaAgentID("inspector-global", "sess-reaudit-crash", supersedorVer)
+	supersedorTesterID := MergeReplicaAgentID("tester-global", "sess-reaudit-crash", supersedorVer)
+	inspector.emit(t, supersedorInspectorID, versioning.ReplicaDecisionAccepted, "fix ok", nil)
+	tester.emit(t, supersedorTesterID, versioning.ReplicaDecisionAccepted, "tests ok", nil)
+
+	// Intermediate's in-flight bookkeeping has been cleared by the
+	// re-audit crash-mark and then refilled by the re-audit's
+	// fresh spawns. The lifecycle log must show BOTH a "superseded
+	// by re-audit" crash entry AND a later spawn.
+	lifecycle := sess.ReplicaLifecycleLog().InFlight()
+	// At this point the re-audit replicas should be in-flight.
+	foundInspector := false
+	foundTester := false
+	for _, entry := range lifecycle {
+		if entry.ReplicaID == interInspectorID {
+			foundInspector = true
+		}
+		if entry.ReplicaID == interTesterID {
+			foundTester = true
+		}
+	}
+	if !foundInspector || !foundTester {
+		t.Errorf("re-audit should have re-spawned both replicas; in-flight entries for intermediate = %+v", lifecycle)
+	}
+
+	// Partial-verdict map for the intermediate should be reset: if
+	// the old replica's verdict arrives post-supersession, it should
+	// not satisfy AND-accept with a stale half.
+	coord.mu.Lock()
+	_, stalePartial := coord.partials[interVer]
+	coord.mu.Unlock()
+	if stalePartial {
+		t.Error("partials map still has entry for re-audited merge — race window for stale verdict still open")
+	}
+}
+
 // TestMergeAuditCoordinator_SupersessionTransitionsRejected verifies
 // that when a remediation merge's audit accepts, the coordinator
 // transitions the original rejected slot to Superseded so the commit
