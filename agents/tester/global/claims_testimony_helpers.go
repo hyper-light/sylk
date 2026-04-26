@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	testerShared "github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -16,13 +18,38 @@ func (gt *GlobalTester) globalTesterBoard() *claims.ClaimsBoard {
 	return claims.DefaultSessionBoardRegistry().Lookup(gt.config.SessionID)
 }
 
-// globalTesterSubmitTestament submits a testament. Best-effort.
+// globalTesterScope adapts *concurrency.GoroutineScope to claims.ScopeProvider.
+func (gt *GlobalTester) globalTesterScope() claims.ScopeProvider {
+	if gt.scope == nil {
+		return nil
+	}
+	return &globalTesterScopeAdapter{scope: gt.scope}
+}
+
+type globalTesterScopeAdapter struct {
+	scope *concurrency.GoroutineScope
+}
+
+func (a *globalTesterScopeAdapter) Go(desc string, timeout time.Duration, fn func(context.Context) error) error {
+	return a.scope.Go(desc, timeout, concurrency.WorkFunc(fn))
+}
+
+// globalTesterSubmitTestament submits a testament async via scope. Best-effort.
 func (gt *GlobalTester) globalTesterSubmitTestament(ctx context.Context, testament claims.Testament) {
 	board := gt.globalTesterBoard()
 	if board == nil {
 		return
 	}
 	action := claims.Action{AgentID: "tester", Type: claims.ActionTypeTestament}
+	if gt.scope != nil {
+		if err := gt.scope.Go("global_tester_submit_testament", 5*time.Second, func(gctx context.Context) error {
+			return board.SubmitTestaments(gctx, action, []claims.Testament{testament})
+		}); err != nil {
+			slog.Error("global_tester_submit_testament_dispatch_failed", "error", err.Error())
+			board.RecordNotificationError("global tester testament dispatch: " + err.Error())
+		}
+		return
+	}
 	if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
 		slog.Error("global_tester_submit_testament_failed", "error", err.Error())
 		board.RecordNotificationError("global tester testament: " + err.Error())
@@ -59,7 +86,7 @@ func (gt *GlobalTester) processClaimsEntry(ctx context.Context, entry *claims.Gr
 	}
 
 	acc := claims.NewTestamentAccumulator("tester", gt.config.SessionID)
-	defer acc.Flush(ctx, gt.globalTesterBoard(), nil)
+	defer acc.Flush(ctx, gt.globalTesterBoard(), gt.globalTesterScope())
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
 

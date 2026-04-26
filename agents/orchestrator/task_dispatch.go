@@ -337,11 +337,18 @@ func (o *Orchestrator) warmTaskDispatchCoordination(dispatch *taskDispatchContex
 	if o.runCtx != nil {
 		parentCtx = o.runCtx
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(parentCtx, coordinationPrecedentTimeout+time.Second)
-		defer cancel()
-		_ = warm(ctx)
-	}()
+	if o.scope != nil {
+		_ = o.scope.Go("warm-coordination-precedents", coordinationPrecedentTimeout+time.Second, func(gctx context.Context) error {
+			_ = warm(gctx)
+			return nil
+		})
+	} else {
+		go func() {
+			ctx, cancel := context.WithTimeout(parentCtx, coordinationPrecedentTimeout+time.Second)
+			defer cancel()
+			_ = warm(ctx)
+		}()
+	}
 }
 
 func (o *Orchestrator) publishTaskDispatchAgents(dispatch *taskDispatchContext, pipelineStatus string) {

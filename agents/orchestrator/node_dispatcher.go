@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/google/uuid"
@@ -65,6 +66,10 @@ type BusNodeDispatcher struct {
 	onACK func(nodeID string, ack *ACKResult)
 	// onGuardReleased is called after the node's guard/pod lease is released.
 	onGuardReleased func(nodeID string)
+
+	// nodeClaimIDs tracks the claim ID posted for each node dispatch
+	// so OnNodeComplete can submit a testament against it.
+	nodeClaimIDs sync.Map // nodeID → string (claimID)
 }
 
 // compile-time assertion
@@ -170,6 +175,7 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	defer d.pending.Delete(node.ID())
 	defer d.dispatchDone.Delete(node.ID())
 	defer d.ackWaiters.Delete(node.ID())
+	defer d.nodeClaimIDs.Delete(node.ID())
 	defer close(done)
 	defer d.releaseContextLease(node.ID())
 
@@ -199,6 +205,39 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 			return nil, err
 		}
 		d.logNodeTrace(node, "dispatch_permit_wait_ok", agentlog.EventTaskDispatched, nil)
+	}
+
+	// Post Action+Claim on session claims board for this DAG node.
+	if board := claims.DefaultSessionBoardRegistry().Lookup(d.sessionID); board != nil {
+		action := claims.Action{
+			AgentID: d.agentID,
+			Type:    claims.ActionTypeTask,
+		}
+		nodeClaim := claims.Claim{
+			Title:       "DAG node dispatch: " + node.ID(),
+			Description: node.Prompt(),
+			ActionType:  claims.ActionTypeTask,
+			Scope: []claims.ClaimScopeEntry{
+				{Kind: "dag_node", Key: node.ID()},
+				{Kind: "dag", Key: d.dagID},
+			},
+			Relations: []claims.Relation{
+				{Related: d.agentID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: node.AgentType(), RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{
+				Type: claims.ValidationTypeReceipt, Required: true,
+				Description: "Node execution completed",
+				QualityBar:  "agent acknowledges and completes work",
+				Status:      claims.ValidationStatusPending,
+			}},
+		}
+		postedClaims := []claims.Claim{nodeClaim}
+		if err := board.PostAction(ctx, action, postedClaims); err != nil {
+			slog.Warn("node_dispatch_post_claim_failed", "node_id", node.ID(), "error", err.Error())
+		} else if len(postedClaims) > 0 {
+			d.nodeClaimIDs.Store(node.ID(), postedClaims[0].ID)
+		}
 	}
 
 	// Build and publish dispatch message with ACK topic.
@@ -758,6 +797,46 @@ func (d *BusNodeDispatcher) DispatchDone(nodeID string) <-chan struct{} {
 func (d *BusNodeDispatcher) OnNodeComplete(nodeID string, result *dag.NodeResult) {
 	d.releaseContextLease(nodeID)
 	d.ReleaseGuard(nodeID)
+
+	// Submit testament against the claim posted during dispatch.
+	if claimIDVal, ok := d.nodeClaimIDs.LoadAndDelete(nodeID); ok {
+		claimID, isStr := claimIDVal.(string)
+		if !isStr || claimID == "" {
+			slog.Warn("node_claim_id_invalid_type", "node_id", nodeID)
+		} else if board := claims.DefaultSessionBoardRegistry().Lookup(d.sessionID); board != nil {
+			state := "succeeded"
+			var artifacts []*claims.Artifact
+			if result != nil {
+				state = result.State.String()
+				artifacts = append(artifacts, &claims.Artifact{
+					AgentID: d.agentID, SessionID: d.sessionID,
+					Kind: "node_result", Reference: state,
+				})
+				if result.Error != nil {
+					artifacts = append(artifacts, &claims.Artifact{
+						AgentID: d.agentID, SessionID: d.sessionID,
+						Kind: "error", Reference: result.Error.Error(),
+					})
+				}
+			}
+			testament := claims.Testament{
+				AgentID:   d.agentID,
+				SessionID: d.sessionID,
+				Summary:   "Node completed: " + nodeID + " state=" + state,
+				Relations: []claims.Relation{
+					{Related: claimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipTestament},
+					{Related: d.agentID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				},
+				Artifacts: artifacts,
+			}
+			action := claims.Action{AgentID: d.agentID, Type: claims.ActionTypeTestament}
+			tctx, tcancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer tcancel()
+			if err := board.SubmitTestaments(tctx, action, []claims.Testament{testament}); err != nil {
+				slog.Warn("node_complete_testament_failed", "node_id", nodeID, "error", err.Error())
+			}
+		}
+	}
 
 	val, ok := d.pending.Load(nodeID)
 	if !ok {

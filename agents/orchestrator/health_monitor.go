@@ -2,10 +2,14 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/google/uuid"
 )
 
@@ -21,6 +25,9 @@ type HealthMonitor struct {
 
 	errorWindow   []errorWindowEntry
 	errorWindowMu sync.RWMutex
+
+	scope     *concurrency.GoroutineScope
+	sessionID string
 
 	stopCh  chan struct{}
 	stopped int32
@@ -54,6 +61,13 @@ func (m *HealthMonitor) SetResultCallback(fn func(*HealthCheckResult)) {
 }
 
 func (m *HealthMonitor) Start(ctx context.Context) {
+	if m.scope != nil {
+		_ = m.scope.Go("health-monitor", 0, func(gctx context.Context) error {
+			m.monitorLoop(gctx)
+			return nil
+		})
+		return
+	}
 	go m.monitorLoop(ctx)
 }
 
@@ -86,6 +100,69 @@ func (m *HealthMonitor) checkHealthStatus() {
 	// Lock ordering: o.mu → m.mu is safe; callback must never acquire m.mu.
 	if m.onResult != nil {
 		m.onResult(result)
+	}
+
+	m.postHealthClaims(result)
+}
+
+// postHealthClaims posts consultation claims for degraded/unhealthy/critical agents
+// and submits an overall health summary testament.
+func (m *HealthMonitor) postHealthClaims(result *HealthCheckResult) {
+	if result == nil || m.sessionID == "" {
+		return
+	}
+	board := claims.DefaultSessionBoardRegistry().Lookup(m.sessionID)
+	if board == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Post consultation claims for agents that are degraded/unhealthy/critical.
+	for _, ar := range result.AgentResults {
+		if ar.Level == HealthLevelHealthy || ar.Level == HealthLevelUnknown {
+			continue
+		}
+		consultClaim := orchestratorConsultClaim(
+			fmt.Sprintf("Health alert: %s is %s", ar.AgentID, ar.Level),
+			fmt.Sprintf("Agent %s health degraded: level=%s, missed_heartbeats=%d, error_rate=%.2f, active_alerts=%d",
+				ar.AgentID, ar.Level, ar.MissedHeartbeats, ar.ErrorRate, ar.ActiveAlertCount),
+			ar.AgentID,
+			[]claims.ClaimScopeEntry{{Kind: "agent", Key: ar.AgentID}},
+			[]*claims.Validation{
+				orchestratorValidation(claims.ValidationTypeReceipt, false, "Agent returns to healthy status", "agent.health == healthy"),
+			},
+		)
+		action := claims.Action{AgentID: "orchestrator", Type: claims.ActionTypeConsultation}
+		if err := board.PostAction(ctx, action, []claims.Claim{consultClaim}); err != nil {
+			slog.Error("health_monitor_claim_post_failed", "agent_id", ar.AgentID, "error", err.Error())
+			board.RecordNotificationError("health monitor claim: " + err.Error())
+		}
+	}
+
+	// Submit overall health summary testament.
+	summary := result.Summary
+	confidence := "committed"
+	if summary.UnhealthyAgents > 0 {
+		confidence = "low"
+	} else if summary.DegradedAgents > 0 {
+		confidence = "medium"
+	}
+	testament := claims.Testament{
+		AgentID:   "orchestrator",
+		SessionID: m.sessionID,
+		Summary: fmt.Sprintf("Health check: %s (agents=%d healthy=%d degraded=%d unhealthy=%d alerts=%d)",
+			summary.OverallStatus, summary.AgentCount, summary.HealthyAgents, summary.DegradedAgents, summary.UnhealthyAgents, len(summary.ActiveAlerts)),
+		Confidence: confidence,
+		Relations: []claims.Relation{
+			{Related: "orchestrator", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+		},
+	}
+	testamentAction := claims.Action{AgentID: "orchestrator", Type: claims.ActionTypeTestament}
+	if err := board.SubmitTestaments(ctx, testamentAction, []claims.Testament{testament}); err != nil {
+		slog.Error("health_monitor_testament_failed", "error", err.Error())
+		board.RecordNotificationError("health monitor testament: " + err.Error())
 	}
 }
 

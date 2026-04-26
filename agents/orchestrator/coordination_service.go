@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/pipeline/coordination"
 	"github.com/dgraph-io/ristretto"
 	"github.com/google/uuid"
@@ -28,6 +30,7 @@ type CoordinationService struct {
 	store        *Store
 	cache        *ristretto.Cache
 	archiveEvent func(context.Context, *coordination.ArchivalEvent)
+	sessionID    string
 	watchersMu   sync.Mutex
 	watchers     map[string]map[chan struct{}]struct{}
 }
@@ -56,6 +59,10 @@ func NewCoordinationService(store *Store, cfg CoordinationServiceConfig) (*Coord
 
 func (s *CoordinationService) SetArchiveEmitter(fn func(context.Context, *coordination.ArchivalEvent)) {
 	s.archiveEvent = fn
+}
+
+func (s *CoordinationService) SetSessionID(sessionID string) {
+	s.sessionID = sessionID
 }
 
 func (s *CoordinationService) Close() {
@@ -154,6 +161,20 @@ func (s *CoordinationService) ClaimScope(
 	}
 	s.invalidateTask(claim.TaskID)
 	emitClaimAcquired(ctx, claim, actor)
+	if board := claims.DefaultSessionBoardRegistry().Lookup(s.sessionID); board != nil {
+		action := claims.Action{AgentID: actor.AgentID, Type: claims.ActionTypeTask}
+		scopeClaim := claims.Claim{
+			Title:       "Coordination scope: " + string(input.ScopeKind) + ":" + input.ScopeKey,
+			Description: input.Purpose,
+			ActionType:  claims.ActionTypeTask,
+			Scope:       []claims.ClaimScopeEntry{{Kind: string(input.ScopeKind), Key: input.ScopeKey}},
+			Relations:   []claims.Relation{{Related: actor.AgentID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer}},
+		}
+		if err := board.PostAction(ctx, action, []claims.Claim{scopeClaim}); err != nil {
+				slog.Error("coordination_scope_claim_post_failed", "error", err.Error())
+				board.RecordNotificationError("coordination scope claim: " + err.Error())
+			}
+	}
 	return claim, nil
 }
 
@@ -219,6 +240,22 @@ func (s *CoordinationService) ReleaseScope(
 	}
 	s.invalidateTask(claim.TaskID)
 	emitClaimReleased(ctx, claim, actor)
+	if board := claims.DefaultSessionBoardRegistry().Lookup(s.sessionID); board != nil {
+		testament := claims.Testament{
+			AgentID:   actor.AgentID,
+			SessionID: s.sessionID,
+			Summary:   fmt.Sprintf("Released coordination scope %s:%s for task %s", claim.ScopeKind, claim.ScopeKey, claim.TaskID),
+			Confidence: "committed",
+			Relations: []claims.Relation{
+				{Related: actor.AgentID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			},
+		}
+		action := claims.Action{AgentID: actor.AgentID, Type: claims.ActionTypeTestament}
+		if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
+				slog.Error("coordination_release_testament_failed", "error", err.Error())
+				board.RecordNotificationError("coordination release testament: " + err.Error())
+			}
+	}
 	return claim, nil
 }
 
@@ -264,6 +301,25 @@ func (s *CoordinationService) PublishArtifact(
 	}
 	s.invalidateTask(artifact.TaskID)
 	emitArtifactPublished(ctx, artifact, actor)
+	if board := claims.DefaultSessionBoardRegistry().Lookup(s.sessionID); board != nil {
+		testament := claims.Testament{
+			AgentID:   actor.AgentID,
+			SessionID: s.sessionID,
+			Summary:   fmt.Sprintf("Published coordination artifact %s (%s) for task %s", artifact.Kind, artifact.Title, artifact.TaskID),
+			Confidence: "committed",
+			Relations: []claims.Relation{
+				{Related: actor.AgentID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			},
+			Artifacts: []*claims.Artifact{
+				{AgentID: actor.AgentID, SessionID: s.sessionID, Kind: string(artifact.Kind), Reference: artifact.ID},
+			},
+		}
+		action := claims.Action{AgentID: actor.AgentID, Type: claims.ActionTypeTestament}
+		if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
+				slog.Error("coordination_artifact_testament_failed", "error", err.Error())
+				board.RecordNotificationError("coordination artifact testament: " + err.Error())
+			}
+	}
 	s.emitArchival(ctx, &coordination.ArchivalEvent{
 		Type:     "coordination_artifact_published",
 		TaskID:   artifact.TaskID,
@@ -315,6 +371,23 @@ func (s *CoordinationService) RequestReview(
 	}
 	s.invalidateTask(review.TaskID)
 	emitReviewRequested(ctx, review, actor)
+	if board := claims.DefaultSessionBoardRegistry().Lookup(s.sessionID); board != nil {
+		consultClaim := claims.Claim{
+			Title:       fmt.Sprintf("Review requested: %s for artifact %s", review.ReviewerType, review.ArtifactID),
+			Description: review.Summary,
+			ActionType:  claims.ActionTypeConsultation,
+			Scope:       []claims.ClaimScopeEntry{{Kind: "task", Key: review.TaskID}, {Kind: "artifact", Key: review.ArtifactID}},
+			Relations: []claims.Relation{
+				{Related: actor.AgentID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: review.ReviewerType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+		}
+		action := claims.Action{AgentID: actor.AgentID, Type: claims.ActionTypeConsultation}
+		if err := board.PostAction(ctx, action, []claims.Claim{consultClaim}); err != nil {
+				slog.Error("coordination_review_claim_post_failed", "error", err.Error())
+				board.RecordNotificationError("coordination review claim: " + err.Error())
+			}
+	}
 	return review, nil
 }
 

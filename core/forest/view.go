@@ -125,7 +125,8 @@ func (m *MemoryForest) loadViewBranchesWithScope(ctx context.Context, sessionID 
 		SELECT id, root_id, parent_id, family, scope, state, session_id, task_id, agent_id, agent_type,
 		       intent_id, title, summary, confidence, salience, utility, success_rate,
 		       scope_risk, conflict_score, support_count, counter_count, success_count,
-		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata
+		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata,
+		       last_applied_seq
 		FROM forest_branches
 		WHERE state != ?
 	`

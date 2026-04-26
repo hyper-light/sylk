@@ -247,6 +247,43 @@ func ensureSchema(db *sql.DB) error {
 
 		CREATE INDEX IF NOT EXISTS idx_forest_substrate_frontiers_lookup
 			ON forest_substrate_frontiers(context_key, frontier_score DESC);
+
+		-- ─────────────────────────────────────────────────────────────────
+		-- CQRS sequencing layer (forest event sourcing).
+		--
+		-- forest_event_seq_log provides monotonic ordering over the
+		-- forest_events ledger. The events table stays append-only
+		-- (MEM-03 trigger forbids in-place updates), so seq lives in
+		-- a sibling table. AUTOINCREMENT supplies atomic seq
+		-- allocation under any concurrent writer; UNIQUE(event_id)
+		-- makes appends idempotent.
+		-- ─────────────────────────────────────────────────────────────────
+		CREATE TABLE IF NOT EXISTS forest_event_seq_log (
+			seq INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_id TEXT NOT NULL UNIQUE,
+			appended_at INTEGER NOT NULL
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_forest_event_seq_log_event
+			ON forest_event_seq_log(event_id);
+
+		-- ─────────────────────────────────────────────────────────────────
+		-- Projector state — lease coordination + watermark per logical
+		-- projector. Multi-process safety relies on the atomic UPDATE
+		-- WHERE clause on leader_lease_until.
+		-- ─────────────────────────────────────────────────────────────────
+		CREATE TABLE IF NOT EXISTS forest_projector_state (
+			projector_name TEXT PRIMARY KEY,
+			last_applied_seq INTEGER NOT NULL DEFAULT 0,
+			last_applied_at INTEGER NOT NULL DEFAULT 0,
+			leader_holder TEXT NOT NULL DEFAULT '',
+			leader_lease_until INTEGER NOT NULL DEFAULT 0,
+			schema_version INTEGER NOT NULL DEFAULT 1,
+			health_status TEXT NOT NULL DEFAULT 'idle',
+			last_error TEXT NOT NULL DEFAULT '',
+			last_error_at INTEGER NOT NULL DEFAULT 0,
+			updated_at INTEGER NOT NULL DEFAULT 0
+		);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -269,6 +306,90 @@ func ensureSchema(db *sql.DB) error {
 		return err
 	}
 
+	if err := ensureForestProjectorColumns(db); err != nil {
+		return err
+	}
+
+	if err := ensureForestEventSeqBackfilled(db); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ensureForestProjectorColumns adds the last_applied_seq watermark
+// columns to projection tables. Idempotent — uses PRAGMA table_info
+// to introspect existing columns and skip ALTERs that already ran.
+func ensureForestProjectorColumns(db *sql.DB) error {
+	additions := []struct {
+		table  string
+		column string
+		decl   string
+	}{
+		{"forest_branches", "last_applied_seq", "INTEGER NOT NULL DEFAULT 0"},
+		{"forest_relay_edges", "last_applied_seq", "INTEGER NOT NULL DEFAULT 0"},
+		{"forest_canopies", "last_applied_seq", "INTEGER NOT NULL DEFAULT 0"},
+		{"forest_substrate_sessions", "last_applied_seq", "INTEGER NOT NULL DEFAULT 0"},
+	}
+	for _, a := range additions {
+		if err := addColumnIfMissing(db, a.table, a.column, a.decl); err != nil {
+			return fmt.Errorf("add %s.%s: %w", a.table, a.column, err)
+		}
+	}
+	return nil
+}
+
+// addColumnIfMissing adds a column to a SQLite table only if it
+// doesn't already exist. Idempotent via PRAGMA table_info.
+func addColumnIfMissing(db *sql.DB, table, column, decl string) error {
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return fmt.Errorf("introspect %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			deflt   sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &deflt, &pk); err != nil {
+			return fmt.Errorf("scan column info: %w", err)
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate columns: %w", err)
+	}
+	stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, decl)
+	if _, err := db.Exec(stmt); err != nil {
+		return fmt.Errorf("alter %s: %w", table, err)
+	}
+	return nil
+}
+
+// ensureForestEventSeqBackfilled populates forest_event_seq_log from
+// forest_events for events that don't yet have a seq. Idempotent —
+// UNIQUE(event_id) constraint silently skips rows already present.
+// Backfill ordering is (timestamp, id) which preserves causal-ish
+// ordering with deterministic id-based tiebreak.
+func ensureForestEventSeqBackfilled(db *sql.DB) error {
+	_, err := db.Exec(`
+		INSERT OR IGNORE INTO forest_event_seq_log (event_id, appended_at)
+		SELECT e.id, e.timestamp
+		FROM   forest_events e
+		LEFT JOIN forest_event_seq_log s ON s.event_id = e.id
+		WHERE  s.event_id IS NULL
+		ORDER BY e.timestamp ASC, e.id ASC
+	`)
+	if err != nil {
+		return fmt.Errorf("backfill forest_event_seq_log: %w", err)
+	}
 	return nil
 }
 

@@ -17,6 +17,7 @@ import (
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	containerpod "github.com/adalundhe/sylk/core/container/pod"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/pipeline/taskstate"
@@ -1554,6 +1555,18 @@ func (b *DAGBridge) onDAGComplete(dagID, planID string) {
 	b.cleanupDAG(dagID)
 	b.publishDAGStatusToBus(dagID, "succeeded", "")
 	b.publishActivity(events.EventTypeSuccess, fmt.Sprintf("DAG %s completed successfully", dagID))
+
+	// Attempt to mark the session's claims board complete. MarkComplete
+	// validates atomically under its own lock that all claims are accepted;
+	// a non-nil error means the board isn't ready (expected during
+	// progressive checkpoint reviews where not all claims resolve at once).
+	if board := claims.DefaultSessionBoardRegistry().Lookup(b.sessionID); board != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := board.MarkComplete(ctx); err != nil {
+			slog.Debug("dag_complete_board_not_ready", "dag_id", dagID, "reason", err.Error())
+		}
+	}
 }
 
 func (b *DAGBridge) onDAGFailed(dagID, planID, errMsg string) {

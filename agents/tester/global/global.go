@@ -22,6 +22,7 @@ import (
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/forest"
@@ -170,6 +171,11 @@ func New(cfg shared.GlobalTesterConfig, provider providers.ProviderAdapter) (*Gl
 // Called by the auth-push mechanism when the user provides credentials after
 // initial activation. A nil provider disables LLM features (static
 // conversation replies continue to work).
+// SetScope injects the goroutine scope for async claims dispatch.
+func (gt *GlobalTester) SetScope(scope *concurrency.GoroutineScope) {
+	gt.scope = scope
+}
+
 func (gt *GlobalTester) SetProvider(p providers.Provider) {
 	gt.mu.Lock()
 	defer gt.mu.Unlock()
@@ -571,7 +577,7 @@ func (gt *GlobalTester) Start(bus guide.EventBus) error {
 		SessionID:    gt.config.SessionID,
 		Bus:          bus,
 		Board:        claims.DefaultSessionBoardRegistry().Lookup(gt.config.SessionID),
-		Scope:        nil,
+		Scope:        gt.scope,
 		ProcessEntry: gt.processClaimsEntry,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {

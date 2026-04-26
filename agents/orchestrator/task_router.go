@@ -136,10 +136,6 @@ func (r *TaskRouter) Route(task *PipelineTask) error {
 // preventing goroutine leaks under FailurePolicyContinue.
 // A nil done channel blocks forever in select — correct for the non-lifecycle case.
 func (r *TaskRouter) RouteWithLifecycle(task *PipelineTask, done <-chan struct{}) error {
-	if protocolPipelineTaskEligible(task) {
-		return r.routeProtocolPipelineTask(task, done)
-	}
-
 	corrID := "pipe_" + uuid.NewString()[:12]
 	waitCh := r.registerPending(corrID, task)
 	r.logTrace("task_router_pending_registered", "debug", agentlog.EventTaskDispatched, corrID, routeTraceData(task))

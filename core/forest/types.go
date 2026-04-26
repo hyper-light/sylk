@@ -129,6 +129,12 @@ type Event struct {
 	Contradicts      []string       `json:"contradicts,omitempty"`
 	RelatedBranchIDs []string       `json:"related_branch_ids,omitempty"`
 	Payload          map[string]any `json:"payload,omitempty"`
+
+	// Seq is the monotonic sequence assigned by forest_event_seq_log
+	// on append. Zero on construction; populated by AppendEvent and
+	// every projector read. Projectors consume events strictly in
+	// Seq order to maintain a deterministic projection.
+	Seq int64 `json:"seq,omitempty"`
 }
 
 // Branch is the materialized branch projection stored by the forest.
@@ -161,6 +167,12 @@ type Branch struct {
 	CreatedAt      time.Time      `json:"created_at"`
 	UpdatedAt      time.Time      `json:"updated_at"`
 	Metadata       map[string]any `json:"metadata,omitempty"`
+
+	// LastAppliedSeq is the highest event Seq the branch projection
+	// has consumed. Maintained by the branch projector inside the
+	// same transaction that updates the rest of the projection.
+	// Readers detect projection freshness via this field.
+	LastAppliedSeq int64 `json:"last_applied_seq,omitempty"`
 }
 
 // Canopy is the active root set for a specific horizon.

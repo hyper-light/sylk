@@ -957,7 +957,7 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 		Scope:                  phase1.scope,
 		AgentID:                orch.AgentID(),
 		SessionID:              "default",
-		OnVisibleRouteTerminal: orch.HandleCheckpointReviewTerminal,
+		OnVisibleRouteTerminal: nil,
 	}))
 	if phase3.activator != nil {
 		orch.SetActivator(phase3.activator)

@@ -148,8 +148,6 @@ type Orchestrator struct {
 	pipelinePanelMu          sync.Mutex
 	pipelinePanelState       map[string]pipelinePanelSnapshot
 	pipelinePanelRegistered  map[string]struct{}
-	checkpointReviewMu       sync.Mutex
-	pendingCheckpointReviews map[string]*pendingCheckpointReview
 
 	// Request lifecycle: runCtx is cancelled in Stop() and serves as parent
 	// for per-request contexts, enabling graceful cancellation.
@@ -202,6 +200,13 @@ func (o *Orchestrator) SessionID() string {
 	return firstNonEmpty(strings.TrimSpace(o.config.SessionID), orchestratorStateSessionID(o), "default")
 }
 
+func orchestratorStateSessionID(o *Orchestrator) string {
+	if o == nil || o.state == nil {
+		return ""
+	}
+	return strings.TrimSpace(o.state.SessionID)
+}
+
 // New creates a new Orchestrator agent. The optional GoogleProvider enables
 // LLM-driven event analysis. When nil, the orchestrator runs in deterministic
 // fallback mode (critical events auto-escalate without model involvement).
@@ -233,7 +238,6 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 		pendingBus:               make(map[string]*shared.PendingSyncWait),
 		pipelinePanelState:       make(map[string]pipelinePanelSnapshot),
 		pipelinePanelRegistered:  make(map[string]struct{}),
-		pendingCheckpointReviews: make(map[string]*pendingCheckpointReview),
 	}
 
 	if provider != nil {
@@ -279,6 +283,11 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 			sid = "default"
 		}
 		o.steering.InitJournal("orchestrator", activityPub, sd.SessionAgentWALPath(sid, "orchestrator"))
+
+		// Wire scope and sessionID into subsystems that were created before initDataPlane.
+		o.healthMonitor.scope = o.scope
+		o.healthMonitor.sessionID = sid
+		o.coordination.SetSessionID(sid)
 	}
 
 	o.registerCoreSkills()
@@ -861,20 +870,13 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 	if o.provider != nil && o.eventCh != nil {
 		o.llmCtx, o.llmCancel = context.WithCancel(context.Background())
 		o.llmWg.Add(1)
-		if o.scope != nil {
-			if err := o.scope.Go("orchestrator_llm_loop", 0, func(_ context.Context) error {
-				defer o.llmWg.Done()
-				o.runLLMLoop(o.llmCtx)
-				return nil
-			}); err != nil {
-				o.llmWg.Done()
-				slog.Error("orchestrator_llm_loop_launch_failed", "error", err.Error())
-			}
-		} else {
-			go func() {
-				defer o.llmWg.Done()
-				o.runLLMLoop(o.llmCtx)
-			}()
+		if err := o.scope.Go("orchestrator_llm_loop", 0, func(_ context.Context) error {
+			defer o.llmWg.Done()
+			o.runLLMLoop(o.llmCtx)
+			return nil
+		}); err != nil {
+			o.llmWg.Done()
+			slog.Error("orchestrator_llm_loop_launch_failed", "error", err.Error())
 		}
 	}
 
@@ -1586,6 +1588,21 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 		"agent_type":      dispatch.agentType,
 		"pipeline_status": pipelineStatus,
 	})
+	o.orchestratorPostClaim(context.Background(),
+		claims.Action{AgentID: "orchestrator", Type: claims.ActionTypeTask},
+		orchestratorTaskClaim(
+			"Task dispatch: "+dispatch.agentType+" for "+truncateOrchestrator(dispatch.taskSlug, 40),
+			dispatch.prompt,
+			dispatch.agentType,
+			[]claims.ClaimScopeEntry{
+				{Kind: "task", Key: dispatch.taskID},
+				{Kind: "dag_node", Key: dispatch.nodeID},
+			},
+			[]*claims.Validation{
+				orchestratorValidation(claims.ValidationTypeReceipt, true, "Agent acknowledges and completes the dispatched task", "task.completed || task.failed"),
+			},
+		),
+	)
 	o.orchestratorSubmitTestament(context.Background(), o.orchestratorTestament(
 		"Task dispatched: "+dispatch.agentType+" for "+truncateOrchestrator(dispatch.taskSlug, 40), "committed",
 		[]*claims.Artifact{

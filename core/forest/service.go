@@ -29,6 +29,18 @@ type Config struct {
 	ReplayBatchSize     int
 	SubstrateLimit      int
 	TrainingMaxExamples int
+
+	// SynchronousProjection forces AppendEvent to run the branch
+	// projection inline (single transaction, single connection) and
+	// disables the async projector goroutine. Used by tests and any
+	// caller that needs read-your-writes semantics on the branch
+	// projection without WaitForBranchSeq.
+	//
+	// Production deployments leave this false; the async projector
+	// is what makes CQRS valuable (decoupled write throughput, lease-
+	// coordinated multi-process safety). Tests typically set it true
+	// to avoid lock-contention with shared-memory SQLite.
+	SynchronousProjection bool
 }
 
 // MemoryForest provides forest projection, retrieval, and learning services.
@@ -58,6 +70,20 @@ type MemoryForest struct {
 	replayDue        time.Time
 	trainingWork     scheduledForestWork
 	trainingDirty    bool
+
+	// CQRS branch projector — single tracked goroutine consumes
+	// events from forest_event_seq_log in seq order and applies
+	// them to the Branch projection (and downstream relay edges,
+	// canopy, substrate-dirty marker, replay queue, warmth, training
+	// labels). Lease-coordinated for multi-process safety.
+	projectorWake         chan struct{}
+	projectorID           string
+	synchronousProjection bool
+
+	// seqNotify broadcasts projection watermark advances so
+	// WaitForBranchSeq is event-driven (no DB polling). Updated
+	// after every successful apply; Halt fires on projector failure.
+	seqNotify *seqNotifier
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -98,12 +124,19 @@ func New(cfg Config) (*MemoryForest, error) {
 		replayBatchSize:     resolveForestReplayBatchSize(cfg.ReplayBatchSize),
 		substrateLimit:      resolveForestSubstrateLimit(cfg.SubstrateLimit),
 		trainingMaxExamples: resolveForestTrainingExamples(cfg.TrainingMaxExamples),
-		maintenanceWake:     make(chan struct{}, 1),
-		pendingSubstrate:    make(map[string]scheduledForestWork),
-		stopCh:              make(chan struct{}),
+		maintenanceWake:       make(chan struct{}, 1),
+		pendingSubstrate:      make(map[string]scheduledForestWork),
+		projectorWake:         make(chan struct{}, 1),
+		projectorID:           generateProjectorID(),
+		synchronousProjection: cfg.SynchronousProjection,
+		seqNotify:             newSeqNotifier(),
+		stopCh:                make(chan struct{}),
 	}
 
 	service.startMaintenance()
+	if !service.synchronousProjection {
+		service.startBranchProjector()
+	}
 	return service, nil
 }
 
@@ -203,16 +236,103 @@ func (m *MemoryForest) RecordOutcome(ctx context.Context, record OutcomeRecord) 
 	return m.AppendEvent(ctx, event)
 }
 
-// AppendEvent records an event and updates branch projections.
+// AppendEvent records an event in the append-only ledger and assigns
+// it a monotonic sequence. The event is durable on return; projections
+// (Branch, RelayEdges, Canopy, Substrate-dirty, ReplayQueue, warmth,
+// training labels) update asynchronously via the branch projector —
+// or synchronously when Config.SynchronousProjection is set.
+//
+// CQRS write path: a single INSERT into forest_events plus a sibling
+// INSERT into forest_event_seq_log for sequencing. No read-modify-
+// write on any projection. Idempotent — re-appending the same event
+// ID is a no-op that returns the canonical seq, so bus duplicates and
+// WAL recovery converge cleanly.
 func (m *MemoryForest) AppendEvent(ctx context.Context, event *Event) error {
 	prepared := prepareEvent(event)
+	if err := m.appendEventLedger(ctx, prepared); err != nil {
+		slog.Error("forest_append_event_failed",
+			"event_id", prepared.ID,
+			"branch_id", prepared.BranchID,
+			"err", err.Error(),
+		)
+		return err
+	}
+	if m.synchronousProjection {
+		if err := m.projectInlineForTests(ctx, prepared); err != nil {
+			slog.Error("forest_inline_projection_failed",
+				"event_id", prepared.ID,
+				"branch_id", prepared.BranchID,
+				"err", err.Error(),
+			)
+			return err
+		}
+		return nil
+	}
+	m.notifyProjector()
+	return nil
+}
+
+// projectInlineForTests applies the projection synchronously inside
+// AppendEvent. Used only when Config.SynchronousProjection is true.
+// Mirrors the apply step the branch projector would run, including
+// the watermark update on forest_projector_state and seq-notifier
+// advance so WaitForBranchSeq callers wake correctly even in sync
+// mode (relevant when test code dispatches across goroutines).
+func (m *MemoryForest) projectInlineForTests(ctx context.Context, event *Event) error {
+	if err := m.ensureProjectorRow(projectorBranchName); err != nil {
+		return err
+	}
+
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin inline projection tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	branch, created, replayDue, applyErr := m.projectBranchTx(ctx, tx, event)
+	if applyErr != nil {
+		return applyErr
+	}
+	if err := setProjectorWatermarkTx(ctx, tx, projectorBranchName, event.Seq, event.Timestamp); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit inline projection tx: %w", err)
+	}
+
+	if m.seqNotify != nil {
+		m.seqNotify.Advance(event.Seq)
+	}
+	m.runProjectorPostCommit(event, branch, created, replayDue)
+	return nil
+}
+
+// appendEventLedger writes to forest_events + forest_event_seq_log
+// inside a single transaction. SQLite serializes writers at the file
+// lock and AUTOINCREMENT supplies an atomic monotonic seq, so plain
+// BEGIN DEFERRED is sufficient for correctness:
+//
+//   - Concurrent appends of distinct event IDs each get a unique seq.
+//   - Concurrent appends of the same event ID — whichever transaction
+//     commits first wins; the other sees ON CONFLICT (id) DO NOTHING
+//     on forest_events and falls through to fetch the existing seq.
+//
+// event.Seq is assigned ONLY after Commit succeeds. If Commit fails,
+// the in-memory event keeps its prior Seq (typically zero) so the
+// caller never observes a seq that doesn't correspond to durable
+// state.
+func (m *MemoryForest) appendEventLedger(ctx context.Context, event *Event) error {
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin forest tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	branch, created, replayDue, err := m.projectEventTx(ctx, tx, prepared)
+	inserted, err := insertEventIfAbsentTx(ctx, tx, event)
+	if err != nil {
+		return err
+	}
+	seq, err := allocateOrFetchEventSeqTx(ctx, tx, event.ID, event.Timestamp, inserted)
 	if err != nil {
 		return err
 	}
@@ -220,63 +340,40 @@ func (m *MemoryForest) AppendEvent(ctx context.Context, event *Event) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit forest tx: %w", err)
 	}
-
-	if created {
-		_ = m.warmth.RecordAccess(ctx, branch.ID, memory.AccessCreation, string(prepared.EventType))
-	}
-	switch prepared.EventType {
-	case EventTypeRecall:
-		_ = m.warmth.RecordAccess(ctx, branch.ID, memory.AccessRetrieval, prepared.Title)
-	case EventTypeValidation, EventTypeOutcomeRecorded, EventTypeReplayConsolidated:
-		_ = m.warmth.RecordAccess(ctx, branch.ID, memory.AccessReinforcement, prepared.Title)
-	}
-
-	var labeledCount int64
-	recordLabels := func(changed int64, err error) {
-		if err != nil {
-			if m.logger != nil {
-				m.logger.Debug("forest: label examples failed", "error", err)
-			}
-			return
-		}
-		labeledCount += changed
-	}
-	switch prepared.EventType {
-	case EventTypeOutcomeRecorded:
-		status := OutcomeStatusMixed
-		if raw, ok := prepared.Payload["status"].(OutcomeStatus); ok {
-			status = raw
-		} else if raw, ok := prepared.Payload["status"].(string); ok {
-			status = OutcomeStatus(raw)
-		}
-		recordLabels(m.labelExamplesForOutcome(ctx, branch.ID, prepared.SessionID, status))
-	case EventTypeValidation:
-		recordLabels(m.labelExamplesForOutcome(ctx, branch.ID, prepared.SessionID, OutcomeStatusSucceeded))
-	case EventTypeContradiction:
-		recordLabels(m.labelExamplesForOutcome(ctx, branch.ID, prepared.SessionID, OutcomeStatusFailed))
-	}
-
-	m.scheduleSubstrateRefresh(prepared.SessionID)
-	if !replayDue.IsZero() {
-		m.scheduleReplayAt(replayDue)
-	}
-	if labeledCount > 0 {
-		m.scheduleTraining()
-	}
+	event.Seq = seq
 	return nil
 }
 
-func (m *MemoryForest) projectEventTx(ctx context.Context, tx *sql.Tx, event *Event) (*Branch, bool, time.Time, error) {
-	if err := insertEventTx(ctx, tx, event); err != nil {
-		return nil, false, time.Time{}, err
+// notifyProjector signals the branch projector that new work is
+// available. Non-blocking — the wake channel is buffered to size 1,
+// so a pending wake collapses with subsequent ones.
+func (m *MemoryForest) notifyProjector() {
+	if m == nil || m.projectorWake == nil {
+		return
 	}
+	select {
+	case m.projectorWake <- struct{}{}:
+	default:
+	}
+}
 
+// projectBranchTx applies a single durable event to the branch
+// projection (branch row, relay edges, canopy, replay queue,
+// substrate-dirty marker). The event must already exist in the
+// ledger and have a non-zero Seq — this function projects, it does
+// not append.
+//
+// Called exclusively from the branch projector under its single-
+// leader lease, so there is no concurrent contention on any
+// projection row.
+func (m *MemoryForest) projectBranchTx(ctx context.Context, tx *sql.Tx, event *Event) (*Branch, bool, time.Time, error) {
 	branch, err := getBranchTx(ctx, tx, event.BranchID)
 	if err != nil {
 		return nil, false, time.Time{}, err
 	}
 	created := branch == nil
 	branch = applyEvent(branch, event)
+	branch.LastAppliedSeq = event.Seq
 
 	if err := upsertBranchTx(ctx, tx, branch); err != nil {
 		return nil, false, time.Time{}, err
@@ -614,22 +711,59 @@ func computeSuccessRate(branch *Branch) float64 {
 	return float64(branch.SuccessCount) / float64(total)
 }
 
-func insertEventTx(ctx context.Context, tx *sql.Tx, event *Event) error {
-	_, err := tx.ExecContext(ctx, `
-		INSERT OR REPLACE INTO forest_events
+// insertEventIfAbsentTx inserts the event into forest_events. Returns
+// inserted=true when a new row was written; false when the event ID
+// was already present (idempotent replay). Never updates an existing
+// row — forest_events is append-only (MEM-03).
+func insertEventIfAbsentTx(ctx context.Context, tx *sql.Tx, event *Event) (bool, error) {
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO forest_events
 		(id, session_id, task_id, agent_id, agent_type, event_type, family, scope, root_id, branch_id,
 		 parent_branch_id, intent_id, content_id, source_id, confidence, salience, timestamp,
 		 title, summary, provenance_refs, supersedes, contradicts, related_branch_ids, payload)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO NOTHING
 	`, event.ID, event.SessionID, nullStringValue(event.TaskID), event.AgentID, event.AgentType, string(event.EventType), string(event.Family),
 		string(event.Scope), event.RootID, event.BranchID, nullStringValue(event.ParentBranchID), nullStringValue(event.IntentID),
 		nullStringValue(event.ContentID), nullStringValue(event.SourceID), event.Confidence, event.Salience,
 		event.Timestamp.Unix(), event.Title, event.Summary, marshalJSON(event.ProvenanceRefs), marshalJSON(event.Supersedes),
 		marshalJSON(event.Contradicts), marshalJSON(event.RelatedBranchIDs), marshalJSON(event.Payload))
 	if err != nil {
-		return fmt.Errorf("insert forest event: %w", err)
+		return false, fmt.Errorf("insert forest event: %w", err)
 	}
-	return nil
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected for forest event insert: %w", err)
+	}
+	return affected == 1, nil
+}
+
+// allocateOrFetchEventSeqTx assigns the monotonic seq for the event.
+// When inserted=true, a new row is appended to forest_event_seq_log
+// (AUTOINCREMENT supplies the seq atomically). When inserted=false
+// (duplicate event), the existing seq is returned. Either way the
+// caller gets the canonical seq for this event.
+func allocateOrFetchEventSeqTx(ctx context.Context, tx *sql.Tx, eventID string, timestamp time.Time, inserted bool) (int64, error) {
+	if inserted {
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO forest_event_seq_log (event_id, appended_at)
+			VALUES (?, ?)
+		`, eventID, timestamp.Unix())
+		if err != nil {
+			return 0, fmt.Errorf("insert seq log: %w", err)
+		}
+		seq, err := res.LastInsertId()
+		if err != nil {
+			return 0, fmt.Errorf("seq log last insert id: %w", err)
+		}
+		return seq, nil
+	}
+	var seq int64
+	row := tx.QueryRowContext(ctx, `SELECT seq FROM forest_event_seq_log WHERE event_id = ?`, eventID)
+	if err := row.Scan(&seq); err != nil {
+		return 0, fmt.Errorf("fetch existing seq: %w", err)
+	}
+	return seq, nil
 }
 
 func getBranchTx(ctx context.Context, tx *sql.Tx, branchID string) (*Branch, error) {
@@ -637,7 +771,8 @@ func getBranchTx(ctx context.Context, tx *sql.Tx, branchID string) (*Branch, err
 		SELECT id, root_id, parent_id, family, scope, state, session_id, task_id, agent_id, agent_type,
 		       intent_id, title, summary, confidence, salience, utility, success_rate,
 		       scope_risk, conflict_score, support_count, counter_count, success_count,
-		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata
+		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata,
+		       last_applied_seq
 		FROM forest_branches
 		WHERE id = ?
 	`, branchID)
@@ -649,7 +784,8 @@ func (m *MemoryForest) getBranch(ctx context.Context, branchID string) (*Branch,
 		SELECT id, root_id, parent_id, family, scope, state, session_id, task_id, agent_id, agent_type,
 		       intent_id, title, summary, confidence, salience, utility, success_rate,
 		       scope_risk, conflict_score, support_count, counter_count, success_count,
-		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata
+		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata,
+		       last_applied_seq
 		FROM forest_branches
 		WHERE id = ?
 	`, branchID)
@@ -668,6 +804,7 @@ func scanBranch(row rowScanner) (*Branch, error) {
 		createdAt      int64
 		updatedAt      int64
 		metadataRaw    sql.NullString
+		lastAppliedSeq int64
 	)
 	err := row.Scan(
 		&branch.ID, &branch.RootID, &parentID, &branch.Family, &branch.Scope, &branch.State,
@@ -675,6 +812,7 @@ func scanBranch(row rowScanner) (*Branch, error) {
 		&branch.Confidence, &branch.Salience, &branch.Utility, &branch.SuccessRate, &branch.ScopeRisk,
 		&branch.ConflictScore, &branch.SupportCount, &branch.CounterCount, &branch.SuccessCount,
 		&branch.FailureCount, &branch.AccessCount, &lastAccessedAt, &createdAt, &updatedAt, &metadataRaw,
+		&lastAppliedSeq,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -695,6 +833,7 @@ func scanBranch(row rowScanner) (*Branch, error) {
 	if metadataRaw.Valid {
 		_ = unmarshalJSON(metadataRaw.String, &branch.Metadata)
 	}
+	branch.LastAppliedSeq = lastAppliedSeq
 	return &branch, nil
 }
 
@@ -708,8 +847,8 @@ func upsertBranchTx(ctx context.Context, tx *sql.Tx, branch *Branch) error {
 		(id, root_id, parent_id, family, scope, state, session_id, task_id, agent_id, agent_type,
 		 intent_id, title, summary, confidence, salience, utility, success_rate, scope_risk,
 		 conflict_score, support_count, counter_count, success_count, failure_count,
-		 access_count, last_accessed_at, created_at, updated_at, metadata)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 access_count, last_accessed_at, created_at, updated_at, metadata, last_applied_seq)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			root_id = excluded.root_id,
 			parent_id = excluded.parent_id,
@@ -736,13 +875,14 @@ func upsertBranchTx(ctx context.Context, tx *sql.Tx, branch *Branch) error {
 			access_count = excluded.access_count,
 			last_accessed_at = excluded.last_accessed_at,
 			updated_at = excluded.updated_at,
-			metadata = excluded.metadata
+			metadata = excluded.metadata,
+			last_applied_seq = excluded.last_applied_seq
 	`, branch.ID, branch.RootID, nullStringValue(branch.ParentID), string(branch.Family), string(branch.Scope),
 		string(branch.State), branch.SessionID, nullStringValue(branch.TaskID), nullStringValue(branch.AgentID), nullStringValue(branch.AgentType),
 		nullStringValue(branch.IntentID), branch.Title, branch.Summary, branch.Confidence, branch.Salience, branch.Utility,
 		branch.SuccessRate, branch.ScopeRisk, branch.ConflictScore, branch.SupportCount, branch.CounterCount,
 		branch.SuccessCount, branch.FailureCount, branch.AccessCount, branch.LastAccessedAt.Unix(), branch.CreatedAt.Unix(),
-		branch.UpdatedAt.Unix(), marshalJSON(branch.Metadata))
+		branch.UpdatedAt.Unix(), marshalJSON(branch.Metadata), branch.LastAppliedSeq)
 	if err != nil {
 		return fmt.Errorf("upsert branch: %w", err)
 	}

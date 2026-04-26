@@ -38,6 +38,11 @@ func newTestForestWithConfig(t *testing.T, cfg Config) (*MemoryForest, *sql.DB) 
 	}
 
 	cfg.DB = db
+	// Tests assume read-your-writes semantics on the branch
+	// projection: AppendEvent → immediate query. The async CQRS
+	// projector is correct for production but breaks that
+	// assumption, so tests run with inline projection.
+	cfg.SynchronousProjection = true
 	forest, err := New(cfg)
 	if err != nil {
 		t.Fatalf("new forest: %v", err)
