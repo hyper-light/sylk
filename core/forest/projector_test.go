@@ -16,6 +16,23 @@ import (
 // explicit PRAGMA busy_timeout so concurrent writers don't see
 // SQLITE_BUSY when the projector loop and AppendEvent overlap.
 func newAsyncTestForest(t *testing.T) (*MemoryForest, *sql.DB) {
+	return newAsyncTestForestWithConfig(t, Config{})
+}
+
+// newAsyncTestForestWithExploration constructs an async test forest
+// with deterministic ε-greedy exploration. Used by selection-bias
+// tests that need reproducible exploration behavior.
+func newAsyncTestForestWithExploration(t *testing.T, rate float64, seed int64) (*MemoryForest, *sql.DB) {
+	return newAsyncTestForestWithConfig(t, Config{
+		ExplorationRate: rate,
+		ExplorationSeed: seed,
+		// Sweeper interval kept short so tests don't have to wait for
+		// the default 5 minutes.
+		ImplicitNegativeSweepInterval: 50 * time.Millisecond,
+	})
+}
+
+func newAsyncTestForestWithConfig(t *testing.T, cfg Config) (*MemoryForest, *sql.DB) {
 	t.Helper()
 
 	dsn := fmt.Sprintf(
@@ -47,7 +64,8 @@ func newAsyncTestForest(t *testing.T) (*MemoryForest, *sql.DB) {
 		t.Fatalf("seed nodes table: %v", err)
 	}
 
-	forest, err := New(Config{DB: db})
+	cfg.DB = db
+	forest, err := New(cfg)
 	if err != nil {
 		t.Fatalf("new forest: %v", err)
 	}

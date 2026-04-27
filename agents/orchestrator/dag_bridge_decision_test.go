@@ -136,7 +136,7 @@ func TestResetPendingTaskPods_ReplacesPodAndPublishesPendingState(t *testing.T) 
 	select {
 	case evt := <-gotCh:
 		require.Equal(t, "task_1", evt.PipelineID)
-		require.Equal(t, "auth-checkout", evt.TaskLabel)
+		require.Equal(t, "auth-checkout", evt.TaskSlug)
 		require.Equal(t, taskstate.StatusPending, evt.Status)
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for pending task pipeline state")

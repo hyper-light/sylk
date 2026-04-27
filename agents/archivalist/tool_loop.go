@@ -8,8 +8,9 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -39,7 +40,8 @@ func (a *Archivalist) executeToolLoopWithBundle(ctx context.Context, req *provid
 			return "", ctx.Err()
 		}
 
-		sc := shared.DrainAndCheckpoint(ledger, req, turn, "executing", nil)
+		sc := shared.DrainAndCheckpoint(ledger, req, turn, "executing", nil,
+			shared.WithBoardProvider(func() *claims.ClaimsBoard { return a.archivalistBoard() }, a.id))
 		if sc.Rollback != nil || sc.EditReplay != nil {
 			cp := sc.Rollback
 			if cp == nil {

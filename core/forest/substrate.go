@@ -34,10 +34,31 @@ func substrateContextKey(sessionID string) string {
 	return stableID("substrate", normalizeForestSessionID(sessionID))
 }
 
+// loadSubstrateSignals dispatches by SubstrateMode:
+//
+//   - SubstrateModeFull (default) reads the projector-maintained
+//     forest_substrate_state via loadStoredSubstrateState — the
+//     pre-Issue#7 path, unchanged.
+//   - SubstrateModePageRank computes (or reuses cached) personalized
+//     PageRank over the relay graph.
+//   - SubstrateModeWarmthOnly returns an empty map so scoring falls
+//     back to the other 11 components (no substrate / frontier
+//     contribution).
+//
+// Empty / unrecognized modes route to the default path so a typo or
+// pre-Issue#7 retrieval still gets a signal.
 func (m *MemoryForest) loadSubstrateSignals(
 	ctx context.Context,
+	mode SubstrateMode,
 	branches []*Branch,
+	canopy *Canopy,
 ) (map[string]substrateSignal, error) {
+	switch mode {
+	case SubstrateModeWarmthOnly:
+		return map[string]substrateSignal{}, nil
+	case SubstrateModePageRank:
+		return m.loadPageRankSubstrateSignals(ctx, branches, canopy)
+	}
 	return m.loadStoredSubstrateState(ctx, branches)
 }
 
@@ -423,11 +444,13 @@ func (m *MemoryForest) refreshSubstrateState(
 	`, contextKey, structuralSubstrateAgentType); err != nil {
 		return nil, SubstrateResult{}, fmt.Errorf("clear substrate frontiers: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM forest_substrate_edges
-		WHERE session_id = ?
-	`, sessionID); err != nil {
-		return nil, SubstrateResult{}, fmt.Errorf("clear substrate edges: %w", err)
+	// Issue #10 Phase C: replaced the DELETE-all-then-INSERT-all
+	// pattern with a diff-based update. Load current edges, build
+	// a desired set, UPSERT changed/added rows, DELETE the orphans
+	// that no longer appear. Bounded by actual change, not by the
+	// graph's full size.
+	if err := applySubstrateEdgeDiffTx(ctx, tx, sessionID, contextKey, updatedEdges, now); err != nil {
+		return nil, SubstrateResult{}, err
 	}
 
 	for branchID, signal := range result {
@@ -454,16 +477,9 @@ func (m *MemoryForest) refreshSubstrateState(
 		}
 	}
 
-	for _, edge := range updatedEdges {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO forest_substrate_edges
-			(session_id, source_branch_id, target_branch_id, conductance, flux, redundancy, inhibition, updated_at, metadata)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, sessionID, edge.SourceID, edge.TargetID, edge.Conductance, edge.Flux, edge.Redundancy, edge.Inhibition,
-			now.Unix(), marshalJSON(map[string]any{"context_key": contextKey})); err != nil {
-			return nil, SubstrateResult{}, fmt.Errorf("insert substrate edge: %w", err)
-		}
-	}
+	// Edges already applied via applySubstrateEdgeDiffTx above; the
+	// previous unconditional INSERT loop is replaced by the diff
+	// path so we don't redo the work here.
 
 	for _, frontier := range frontiers {
 		if _, err := tx.ExecContext(ctx, `
@@ -718,7 +734,7 @@ func substrateInhibition(branch *Branch, byID map[string]*Branch, edges []substr
 		return 0
 	}
 	inhibition := (0.45 * branch.ScopeRisk) + (0.35 * branch.ConflictScore)
-	if strings.EqualFold(branch.AgentType, "guardian") || branch.Family == TreeFamilyConstraint || branch.Family == TreeFamilyConflict {
+	if strings.EqualFold(branch.AgentType, "guardian") || branch.Family == TreeFamilyConstraint || branch.Family == TreeFamilyAntiPattern {
 		inhibition += 0.15
 	}
 	guardianNeighborMass := 0.0
@@ -734,7 +750,7 @@ func substrateInhibition(branch *Branch, byID map[string]*Branch, edges []substr
 		if other == nil {
 			continue
 		}
-		if strings.EqualFold(other.AgentType, "guardian") || other.Family == TreeFamilyConstraint || other.Family == TreeFamilyConflict {
+		if strings.EqualFold(other.AgentType, "guardian") || other.Family == TreeFamilyConstraint || other.Family == TreeFamilyAntiPattern {
 			guardianNeighborMass += edge.Conductance
 		}
 	}

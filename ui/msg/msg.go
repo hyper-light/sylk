@@ -837,12 +837,23 @@ type PipelineStateMsg struct {
 	PipelineID        string
 	RuntimePipelineID string
 	TaskID            string
+	TaskSlug          string
 	TaskLabel         string
 	Status            string // TDD phase or lifecycle status.
 	WorkerType        string // Agent type running the pipeline.
 	LoopCount         int
 	MaxLoops          int
 	Timestamp         time.Time
+}
+
+// ClaimsProjectionMsg carries claims board projection updates for the
+// pipeline counter display (accepted/total).
+type ClaimsProjectionMsg struct {
+	SessionID     string
+	BoardID       string
+	TaskID        string
+	AcceptedCount int
+	TotalClaims   int
 }
 
 // VariantStateMsg carries a variant state update for the agent panel.

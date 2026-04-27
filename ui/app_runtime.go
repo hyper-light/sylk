@@ -358,6 +358,11 @@ func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 			return err
 		}
 	}
+	if m.claimsBridge != nil {
+		if err := m.claimsBridge.Start(program); err != nil {
+			return err
+		}
+	}
 	m.startIndexProgressObserver(program)
 	return nil
 }

@@ -41,12 +41,22 @@ const (
 	featureFamilyIntent
 	featureFamilyConstraint
 	featureFamilyEvidence
-	featureFamilyDecision
+	// Removed: featureFamilyDecision (Issue #11 Phase 3 — Decision
+	// merged into Intent). Index slot retained as a reserved
+	// placeholder so persisted base-score model weights don't
+	// have to be retrained on a different feature length.
+	featureReservedDecision
 	featureFamilyOutcome
-	featureFamilyPreference
-	featureFamilyCapability
-	featureFamilyOpportunity
-	featureFamilyConflict
+	// Removed: featureFamilyPreference (merged into Constraint via
+	// severity field), featureFamilyCapability (merged into Intent),
+	// featureFamilyOpportunity (merged into Intent),
+	// featureFamilyConflict (replaced by AntiPattern + relations).
+	// Reserved slots retained so the feature vector length is
+	// stable across migrations.
+	featureReservedPreference
+	featureReservedCapability
+	featureReservedOpportunity
+	featureFamilyAntiPattern
 	featureSourceGuardian
 	featureSourceScribe
 	featureSourceEngineer
@@ -98,12 +108,12 @@ var forestFeatureNames = [...]string{
 	"family_intent",
 	"family_constraint",
 	"family_evidence",
-	"family_decision",
+	"reserved_decision",
 	"family_outcome",
-	"family_preference",
-	"family_capability",
-	"family_opportunity",
-	"family_conflict",
+	"reserved_preference",
+	"reserved_capability",
+	"reserved_opportunity",
+	"family_antipattern",
 	"source_guardian",
 	"source_scribe",
 	"source_engineer",
@@ -179,18 +189,10 @@ func buildFeatureVector(
 		vector[featureFamilyConstraint] = 1
 	case TreeFamilyEvidence:
 		vector[featureFamilyEvidence] = 1
-	case TreeFamilyDecision:
-		vector[featureFamilyDecision] = 1
 	case TreeFamilyOutcome:
 		vector[featureFamilyOutcome] = 1
-	case TreeFamilyPreference:
-		vector[featureFamilyPreference] = 1
-	case TreeFamilyCapability:
-		vector[featureFamilyCapability] = 1
-	case TreeFamilyOpportunity:
-		vector[featureFamilyOpportunity] = 1
-	case TreeFamilyConflict:
-		vector[featureFamilyConflict] = 1
+	case TreeFamilyAntiPattern:
+		vector[featureFamilyAntiPattern] = 1
 	}
 
 	agentType := strings.ToLower(strings.TrimSpace(branch.AgentType))
@@ -269,12 +271,16 @@ func sessionAffinity(querySessionID, branchSessionID string) float64 {
 
 func agentFamilyAffinity(agentType string, family TreeFamily) float64 {
 	normalized := strings.ToLower(strings.TrimSpace(agentType))
+	// Issue #11 Phase 3 — collapsed taxonomy. The five remaining
+	// families (Intent, Constraint, Evidence, Outcome, AntiPattern)
+	// cover the same operator-facing semantics as the prior nine via
+	// the documented invariants (types.go) + ConstraintSeverity.
 	switch {
 	case normalized == "engineer":
 		switch family {
-		case TreeFamilyCapability, TreeFamilyDecision, TreeFamilyEvidence, TreeFamilyOutcome:
+		case TreeFamilyIntent, TreeFamilyEvidence, TreeFamilyOutcome:
 			return 1.0
-		case TreeFamilyConstraint, TreeFamilyConflict:
+		case TreeFamilyConstraint, TreeFamilyAntiPattern:
 			return 0.85
 		default:
 			return 0.55
@@ -283,51 +289,49 @@ func agentFamilyAffinity(agentType string, family TreeFamily) float64 {
 		switch family {
 		case TreeFamilyIntent, TreeFamilyConstraint, TreeFamilyEvidence, TreeFamilyOutcome:
 			return 1.0
-		case TreeFamilyPreference, TreeFamilyDecision:
-			return 0.85
 		default:
 			return 0.5
 		}
 	case normalized == "guardian":
 		switch family {
-		case TreeFamilyConstraint, TreeFamilyConflict, TreeFamilyOutcome:
+		case TreeFamilyConstraint, TreeFamilyAntiPattern, TreeFamilyOutcome:
 			return 1.0
-		case TreeFamilyDecision, TreeFamilyEvidence:
+		case TreeFamilyIntent, TreeFamilyEvidence:
 			return 0.8
 		default:
 			return 0.35
 		}
 	case strings.HasPrefix(normalized, "scribe"):
 		switch family {
-		case TreeFamilyEvidence, TreeFamilyDecision, TreeFamilyOutcome:
+		case TreeFamilyEvidence, TreeFamilyIntent, TreeFamilyOutcome:
 			return 1.0
 		default:
 			return 0.6
 		}
 	case normalized == "academic":
 		switch family {
-		case TreeFamilyEvidence, TreeFamilyConflict, TreeFamilyConstraint:
+		case TreeFamilyEvidence, TreeFamilyAntiPattern, TreeFamilyConstraint:
 			return 1.0
 		default:
 			return 0.55
 		}
 	case normalized == "librarian":
 		switch family {
-		case TreeFamilyEvidence, TreeFamilyCapability, TreeFamilyDecision:
+		case TreeFamilyEvidence, TreeFamilyIntent:
 			return 1.0
 		default:
 			return 0.55
 		}
 	case normalized == "archivalist":
 		switch family {
-		case TreeFamilyOutcome, TreeFamilyDecision, TreeFamilyPreference:
+		case TreeFamilyOutcome, TreeFamilyIntent, TreeFamilyConstraint:
 			return 1.0
 		default:
 			return 0.55
 		}
 	case normalized == "guide", normalized == "orchestrator":
 		switch family {
-		case TreeFamilyIntent, TreeFamilyConstraint, TreeFamilyCapability, TreeFamilyOutcome:
+		case TreeFamilyIntent, TreeFamilyConstraint, TreeFamilyOutcome:
 			return 1.0
 		default:
 			return 0.6

@@ -24,6 +24,8 @@ const (
 	EntityKindStruct    EntityKind = 7
 	EntityKindPackage   EntityKind = 8
 	EntityKindFile      EntityKind = 9
+	EntityKindClaim     EntityKind = 10
+	EntityKindTestament EntityKind = 11
 )
 
 // ValidEntityKinds returns all valid EntityKind values.
@@ -39,6 +41,8 @@ func ValidEntityKinds() []EntityKind {
 		EntityKindStruct,
 		EntityKindPackage,
 		EntityKindFile,
+		EntityKindClaim,
+		EntityKindTestament,
 	}
 }
 
@@ -74,6 +78,10 @@ func (ek EntityKind) String() string {
 		return "package"
 	case EntityKindFile:
 		return "file"
+	case EntityKindClaim:
+		return "claim"
+	case EntityKindTestament:
+		return "testament"
 	default:
 		return fmt.Sprintf("entity_kind(%d)", ek)
 	}
@@ -101,6 +109,10 @@ func ParseEntityKind(value string) (EntityKind, bool) {
 		return EntityKindPackage, true
 	case "file":
 		return EntityKindFile, true
+	case "claim":
+		return EntityKindClaim, true
+	case "testament":
+		return EntityKindTestament, true
 	default:
 		return EntityKind(0), false
 	}

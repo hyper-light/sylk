@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -55,9 +56,10 @@ type Designer struct {
 	pipelineName  string
 	usageAccum    *designerUsageAccumulator
 
-	claimsBoard *claims.ClaimsBoard
-	scope       *concurrency.GoroutineScope
-	claimsInbox *claims.ClaimsInbox
+	claimsBoard     *claims.ClaimsBoard
+	activeSessionID atomic.Value // string — set per-request from fwd.SessionID
+	scope           *concurrency.GoroutineScope
+	claimsInbox     *claims.ClaimsInbox
 
 	state    *DesignerState
 	stateMu  sync.RWMutex
@@ -513,6 +515,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	d.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	d.activeSessionID.Store(fwd.SessionID)
 	shared.LogIncomingRequest(d.steering.EventLogger(), fwd, d.id)
 
 	if taskID, _ := fwd.Metadata["task_id"].(string); taskID != "" {
@@ -790,13 +793,6 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 		if workspaceContext := shared.BuildTaskWorkspaceRuntimeContext(ctx, d.workspaceViews, task); workspaceContext != "" {
 			userMessage += "\n\n" + workspaceContext
 		}
-		// Hydrate pipeline protocol state so the LLM can use
-		// pipeline_protocol(action=handoff|challenge|validate_work|…).
-		var closePipelineState func()
-		ctx, closePipelineState = shared.OpenPipelineTaskProtocolStateWithPublisher(
-			ctx, task, d.bus, fwd.SessionID, "designer",
-		)
-		defer closePipelineState()
 	}
 	userMessage = claims.PrependBoardPreamble(userMessage, d.claimsBoard, "designer")
 	systemPrompt := d.systemPromptForContract(contract)

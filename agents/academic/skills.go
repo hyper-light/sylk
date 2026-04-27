@@ -62,8 +62,16 @@ func (a *Academic) registerFabricSkills() {
 		a.skills.Register(skill)
 	}
 	// Claims skills.
-	boardProvider := func() *claims.ClaimsBoard {
-		return claims.DefaultSessionBoardRegistry().Lookup(a.config.SessionID)
+	boardProvider := func() (*claims.ClaimsBoard, error) {
+		sid := a.config.SessionID
+		if sid == "" {
+			return nil, fmt.Errorf("academic: no session ID configured")
+		}
+		board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+		if board == nil {
+			return nil, fmt.Errorf("academic: session %q has no claims board registered", sid)
+		}
+		return board, nil
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return a.claimsInbox }
 	a.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))

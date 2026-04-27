@@ -1,6 +1,7 @@
 package claims
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,7 +11,10 @@ import (
 )
 
 // BoardProvider returns the active ClaimsBoard for the current context.
-type BoardProvider func() *ClaimsBoard
+// Returns an error with a diagnostic message when the board is unavailable
+// (e.g., no active session). The error propagates to the LLM as a tool
+// failure so the agent and user see the specific reason.
+type BoardProvider func() (*ClaimsBoard, error)
 
 // InboxProvider returns the active ClaimsInbox for the current agent.
 // Used by PostActionSkill to auto-register expectations after commit.
@@ -25,9 +29,12 @@ func QueryClaimsBoardSkill(bp BoardProvider) *skills.Skill {
 		Keywords("claims", "board", "status", "progress").
 		Priority(98).
 		Handler(func(ctx context.Context, _ json.RawMessage) (any, error) {
-			board := bp()
+			board, err := bp()
+			if err != nil {
+				return nil, fmt.Errorf("claims board: %w", err)
+			}
 			if board == nil {
-				return nil, fmt.Errorf("claims board not available")
+				return nil, fmt.Errorf("claims board not available (no error returned)")
 			}
 			return board.Projection(), nil
 		}).
@@ -45,16 +52,19 @@ func PostActionSkill(bp BoardProvider, ip ...InboxProvider) *skills.Skill {
 		inboxFn = ip[0]
 	}
 	return skills.NewSkill("post_action").
-		Description("Issue an action (set of claims) against one or more subjects. Each claim carries its validations. Returns the committed action_id and claim_ids. The issuer's inbox automatically watches for testament responses — no manual expectation registration needed.").
+		Description("Issue an action (set of claims) against one or more target agents. Each claim names its target via the `subject` field — this is the agent who must respond with a testament. Covers task, challenge, consultation, corrective, and archival actions. Returns the committed action_id and claim_ids. The issuer's inbox automatically watches for testament responses from the subject agents.").
 		Domain("claims").
 		Keywords("action", "claim", "issue", "challenge", "consult").
 		Priority(97).
 		StringParam("action_type", "Type: task, challenge, consultation, corrective, archival, prompt", true).
 		StringParam("claims_json", "JSON array of claims with title, description, subject, scope, and validations", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			board := bp()
+			board, err := bp()
+			if err != nil {
+				return nil, fmt.Errorf("claims board: %w", err)
+			}
 			if board == nil {
-				return nil, fmt.Errorf("claims board not available")
+				return nil, fmt.Errorf("claims board not available (no error returned)")
 			}
 			var params struct {
 				ActionType string          `json:"action_type"`
@@ -64,8 +74,9 @@ func PostActionSkill(bp BoardProvider, ip ...InboxProvider) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
+			claimsRaw := unwrapStringEncodedJSON(params.ClaimsJSON)
 			var claimInputs []claimInput
-			if err := json.Unmarshal(params.ClaimsJSON, &claimInputs); err != nil {
+			if err := json.Unmarshal(claimsRaw, &claimInputs); err != nil {
 				return nil, fmt.Errorf("invalid claims_json: %w", err)
 			}
 
@@ -166,9 +177,12 @@ func InspectClaimConflictsSkill(bp BoardProvider) *skills.Skill {
 		Keywords("conflicts", "overlap", "competing", "blocked").
 		Priority(94).
 		Handler(func(ctx context.Context, _ json.RawMessage) (any, error) {
-			board := bp()
+			board, err := bp()
+			if err != nil {
+				return nil, fmt.Errorf("claims board: %w", err)
+			}
 			if board == nil {
-				return nil, fmt.Errorf("claims board not available")
+				return nil, fmt.Errorf("claims board not available (no error returned)")
 			}
 			p := board.Projection()
 			var conflicts []map[string]any
@@ -197,15 +211,18 @@ func InspectClaimConflictsSkill(bp BoardProvider) *skills.Skill {
 
 func SubmitTestamentsSkill(bp BoardProvider) *skills.Skill {
 	return skills.NewSkill("submit_testaments").
-		Description("Submit testaments with artifacts proving claims are satisfied or recording failures. Each testament references a claim and carries artifacts as proof. When work FAILS, submit a testament with kind='error' artifacts containing the error details — never silently drop errors. A testament with error artifacts is not a system failure; it is a structured report the issuer evaluates.").
+		Description("Submit testaments responding to specific claims. Each testament's `claim_id` field names the claim being answered — this is how you respond to work directed at you. Carry artifacts as proof of completion or error details. When work FAILS, submit a testament with kind='error' artifacts — never silently drop errors. Error artifacts are structured reports the issuer evaluates, not system failures.").
 		Domain("claims").
 		Keywords("testament", "submit", "proof", "artifacts", "done", "error").
 		Priority(96).
 		StringParam("testaments_json", "JSON array of testaments. Each has claim_id, summary, confidence, and artifacts. Artifact kinds include 'code_reference', 'test_output', 'diff', 'error' (for failures), 'error_trace' (stack traces), 'error_diagnostic' (environmental failures).", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			board := bp()
+			board, err := bp()
+			if err != nil {
+				return nil, fmt.Errorf("claims board: %w", err)
+			}
 			if board == nil {
-				return nil, fmt.Errorf("claims board not available")
+				return nil, fmt.Errorf("claims board not available (no error returned)")
 			}
 			var params struct {
 				TestamentsJSON json.RawMessage `json:"testaments_json"`
@@ -214,8 +231,9 @@ func SubmitTestamentsSkill(bp BoardProvider) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
+			testamentsRaw := unwrapStringEncodedJSON(params.TestamentsJSON)
 			var testamentInputs []testamentInput
-			if err := json.Unmarshal(params.TestamentsJSON, &testamentInputs); err != nil {
+			if err := json.Unmarshal(testamentsRaw, &testamentInputs); err != nil {
 				return nil, fmt.Errorf("invalid testaments_json: %w", err)
 			}
 
@@ -254,9 +272,12 @@ func UpdateClaimProgressSkill(bp BoardProvider) *skills.Skill {
 		StringParam("claim_id", "ID of the claim to update", true).
 		StringParam("work_summary", "Description of work done", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			board := bp()
+			board, err := bp()
+			if err != nil {
+				return nil, fmt.Errorf("claims board: %w", err)
+			}
 			if board == nil {
-				return nil, fmt.Errorf("claims board not available")
+				return nil, fmt.Errorf("claims board not available (no error returned)")
 			}
 			var params struct {
 				ClaimID     string `json:"claim_id"`
@@ -283,9 +304,12 @@ func EvaluateValidationSkill(bp BoardProvider) *skills.Skill {
 		StringParam("status", "Verdict: passed, failed, or skipped", true).
 		StringParam("reason", "Explanation", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			board := bp()
+			board, err := bp()
+			if err != nil {
+				return nil, fmt.Errorf("claims board: %w", err)
+			}
 			if board == nil {
-				return nil, fmt.Errorf("claims board not available")
+				return nil, fmt.Errorf("claims board not available (no error returned)")
 			}
 			var params struct {
 				ClaimID      string `json:"claim_id"`
@@ -317,9 +341,12 @@ func PostRemediationClaimsSkill(bp BoardProvider) *skills.Skill {
 		StringParam("reason", "Why the claim is being rejected", true).
 		StringParam("replacements_json", "JSON array of replacement claims", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			board := bp()
+			board, err := bp()
+			if err != nil {
+				return nil, fmt.Errorf("claims board: %w", err)
+			}
 			if board == nil {
-				return nil, fmt.Errorf("claims board not available")
+				return nil, fmt.Errorf("claims board not available (no error returned)")
 			}
 			var params struct {
 				ClaimID          string          `json:"claim_id"`
@@ -330,8 +357,9 @@ func PostRemediationClaimsSkill(bp BoardProvider) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
+			replacementsRaw := unwrapStringEncodedJSON(params.ReplacementsJSON)
 			var claimInputs []claimInput
-			if err := json.Unmarshal(params.ReplacementsJSON, &claimInputs); err != nil {
+			if err := json.Unmarshal(replacementsRaw, &claimInputs); err != nil {
 				return nil, fmt.Errorf("invalid replacements_json: %w", err)
 			}
 
@@ -391,4 +419,24 @@ type artifactInput struct {
 	Reference string         `json:"reference"`
 	Metadata  map[string]any `json:"metadata,omitempty"`
 	Ephemeral bool           `json:"ephemeral,omitempty"`
+}
+
+// unwrapStringEncodedJSON handles the common LLM behavior of double-encoding
+// JSON parameters: sending `"[{...}]"` (a JSON string containing JSON) instead
+// of `[{...}]` (raw JSON). When the input is a JSON string, it unquotes it
+// and returns the inner JSON. When the input is already raw JSON (array or
+// object), it returns it unchanged.
+func unwrapStringEncodedJSON(raw json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return raw
+	}
+	// If it starts with a quote, it's a JSON string — unquote to get the inner JSON.
+	if trimmed[0] == '"' {
+		var inner string
+		if err := json.Unmarshal(trimmed, &inner); err == nil {
+			return json.RawMessage(inner)
+		}
+	}
+	return raw
 }

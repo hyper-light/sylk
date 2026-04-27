@@ -29,7 +29,12 @@ func TestRoleForestSkillEngineerImplementationBranch(t *testing.T) {
 				if query.AgentType != AgentTypeEngineer {
 					t.Fatalf("retrieve agent_type = %q, want %q", query.AgentType, AgentTypeEngineer)
 				}
-				if !hasFamily(query.Families, forest.TreeFamilyCapability) || !hasFamily(query.Families, forest.TreeFamilyConstraint) {
+				// Issue #11 Phase 3: engineer's plan-precedent surface
+				// dropped explicit Capability — agent affordances roll up
+				// into Intent, alongside Decision (also collapsed). The
+				// canonical engineer query must still constrain to the
+				// merged Intent + Constraint axis.
+				if !hasFamily(query.Families, forest.TreeFamilyIntent) || !hasFamily(query.Families, forest.TreeFamilyConstraint) {
 					t.Fatalf("unexpected families: %#v", query.Families)
 				}
 				if !query.IncludeCounterEvidence {
@@ -39,7 +44,7 @@ func TestRoleForestSkillEngineerImplementationBranch(t *testing.T) {
 					{
 						Branch: &forest.Branch{
 							ID:      "branch-1",
-							Family:  forest.TreeFamilyDecision,
+							Family:  forest.TreeFamilyIntent,
 							Summary: "Reuse the existing retry worker path",
 						},
 						Conflicts: []forest.PacketConflict{{Summary: "Prior branch failed without timeout coverage"}},
@@ -94,7 +99,7 @@ func TestRoleForestSkillDesignerPredictsAdjacentValue(t *testing.T) {
 					{
 						Branch: &forest.Branch{
 							ID:      "branch-2",
-							Family:  forest.TreeFamilyOpportunity,
+							Family:  forest.TreeFamilyIntent,
 							Summary: "Expose the primary status earlier in the flow",
 						},
 					},

@@ -9,17 +9,259 @@ import (
 	"time"
 
 	ctxpkg "github.com/adalundhe/sylk/core/context"
-	"github.com/adalundhe/sylk/core/knowledge/memory"
+	"github.com/google/uuid"
 )
 
 // Retrieve returns ranked branch packets for the supplied query.
+//
+// Emits a retrieval audit event after returning to the caller — the
+// audit captures the full ranked candidate set (not just top-K) so
+// counterfactual training can label every candidate against later
+// outcome events. Audit emission is best-effort; failure logs but
+// never affects the retrieval result.
 func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPacket, error) {
-	var err error
-	query, err = normalizeQuery(query)
-	if err != nil {
-		return nil, err
+	start := time.Now()
+	auditQuery := query
+	packets, audit, err := m.retrieveWithAudit(ctx, query, start)
+	finalizeRetrievalAudit(audit, auditQuery, start, err)
+	m.emitRetrievalAudit(ctx, audit)
+	return packets, err
+}
+
+// retrieveWithAudit runs the core retrieval pipeline and returns
+// (top-K packets, audit event in-progress, err). The audit event has
+// the full candidate set populated; finalizeRetrievalAudit fills in
+// the remaining operational fields once the caller has the response.
+func (m *MemoryForest) retrieveWithAudit(ctx context.Context, query Query, start time.Time) ([]*BranchPacket, *RetrievalAuditEvent, error) {
+	audit := newRetrievalAuditEvent(query, start, m.currentBranchProjectionSeq(ctx))
+	// Issue #7: pick the substrate mode for this retrieval up-front so
+	// the same mode flows into staged loading + the audit row.
+	audit.SubstrateMode = m.resolveRetrieveSubstrateMode()
+	// Issue #8: pick the base-score variant up-front. The chosen model
+	// (champion / challenger / nil-for-hardcoded) drives scoreBatch's
+	// weight vector; the variant + version land on the audit row.
+	variant, scorer := m.resolveRetrieveBaseScoreVariant()
+	audit.BaseScoreVariant = variant
+	if scorer != nil {
+		audit.BaseScoreVersion = scorer.Version
 	}
 
+	normalized, err := normalizeQuery(query)
+	if err != nil {
+		return nil, audit, err
+	}
+	audit.Query = normalized.Query
+
+	staged, err := m.loadRetrievalStage(ctx, normalized, audit.SubstrateMode)
+	if err != nil {
+		return nil, audit, err
+	}
+	if len(staged.branches) == 0 {
+		// Issue #5 cold-start path: primary stage returned no
+		// branches at all (fresh session, narrow query, empty
+		// forest). Fall through to global priors so the caller
+		// gets *something* rather than nothing. Tagged
+		// RetrievalSourceGlobalPrior so the audit captures
+		// cold-start frequency.
+		fallback := m.fillWithGlobalPriors(ctx, normalized, nil, normalized.Limit)
+		populateAuditCandidates(audit, fallback, nil, normalized.Limit)
+		return fallback, audit, nil
+	}
+
+	scored, err := m.scoreRetrievalStage(ctx, normalized, staged, scorer)
+	if err != nil {
+		return nil, audit, err
+	}
+
+	m.applyLearnedPredictions(normalized, scored.packets, scored.featuresByBranch)
+
+	// Issue #4 mechanism C: knock down branches that appeared in the
+	// last N retrievals for this session. Applied to base scores so
+	// the subsequent sort + MMR see the cooldown-adjusted ordering.
+	m.applyRetrievalCooldownPenalty(ctx, normalized.SessionID, scored.packets)
+
+	sortPackets(scored.packets)
+
+	// Decide exploration BEFORE recording examples so the retrieval-
+	// example rows carry the correct retrieval_mode/label_weight
+	// (exploration outcomes are unbiased and trained higher) and so
+	// the audit event's exploration_mode is accurate.
+	exploring := m.shouldExplore()
+	retrievalMode := ""
+	exampleWeight := 1.0
+	if exploring {
+		retrievalMode = string(RetrievalModeExploration)
+		exampleWeight = m.explorationLabelWeight
+	}
+	if recordErr := m.recordRetrievalExamplesWithSource(
+		ctx, normalized, scored.packets, scored.featuresByBranch,
+		retrievalMode, exampleWeight, audit.ID,
+	); recordErr != nil && m.logger != nil {
+		m.logger.Debug("forest: record retrieval examples failed", "error", recordErr)
+	}
+
+	populateAuditCandidates(audit, scored.packets, scored.featuresByBranch, normalized.Limit)
+
+	// ε-greedy exploration: with probability explorationRate, replace
+	// the model-ranked top-K with a random sample from the broader
+	// candidate pool. Audit captures the flag so training can weight
+	// outcomes from exploration retrievals higher (unbiased data).
+	//
+	// Issue #4 mechanism B: in the non-exploration path, MMR rerank
+	// the candidate pool to penalize near-duplicates of already-picked
+	// branches. Runs over the cooldown-adjusted scores from above.
+	// Skipped when exploring (random sample is its own diversity).
+	if exploring {
+		audit.ExplorationMode = true
+		scored.packets = m.explorationShuffleAndPick(scored.packets, normalized.Limit)
+	} else {
+		scored.packets = m.applyMMRReranking(scored.packets, scored.featuresByBranch, normalized.Limit)
+		if len(scored.packets) > normalized.Limit {
+			scored.packets = scored.packets[:normalized.Limit]
+		}
+	}
+	tagPrimaryRetrievalSource(scored.packets)
+
+	// Issue #5 / RetrievalSourcePrimed: promote Primary → Primed for
+	// packets whose branches came in via a primed canopy (see
+	// PrimeSession). Lets operators distinguish "this came from the
+	// session bootstrap" from "this came from active session work."
+	// Runs BEFORE fill/quota so the Primed → Primary fall-through
+	// from those tags doesn't get reverted.
+	tagPrimedRetrievalSource(scored.packets, staged.canopy, normalized.SessionID)
+
+	// Issue #5 mechanism A: when primary retrieval came up short
+	// (cold-start, narrow query), backfill with global priors scoped
+	// to the requested family / agent_type. Tagged with
+	// RetrievalSourceGlobalPrior so the audit captures cold-start
+	// frequency. Skipped while exploring — exploration is its own
+	// answer to "primary set is suspect."
+	if !exploring {
+		scored.packets = m.fillWithGlobalPriors(ctx, normalized, scored.packets, normalized.Limit)
+	}
+
+	// Issue #6: reserve up to defaultAntiPrecedentMaxSlots of the
+	// bottom-K for matching anti-precedents (Failed-outcome or
+	// AntiPattern). Always runs (even when IncludeCounterEvidence is
+	// false) so agents always see negative space when it exists.
+	// Skipped under exploration — random sampling is the diversity
+	// answer for that path.
+	if !exploring {
+		scored.packets = m.reserveAntiPrecedentSlots(ctx, normalized, scored.packets, normalized.Limit)
+	}
+
+	// Issue #4 mechanism A: warmth is reinforced ONLY on outcome /
+	// validation / replay events (the AccessReinforcement path in the
+	// branch projector), never on retrieval. Retrieval is observation;
+	// warmth tracks *use*, not *consideration*. The previous loop
+	// here fed retrieval back into warmth and produced a positive
+	// feedback runaway (retrieved → warmer → retrieved more).
+
+	// Issue #9 Phase B.4: stamp the active model's calibration onto
+	// every returned packet so callers see "the model behind these
+	// scores has been verified at this confidence level" alongside
+	// the scores themselves. Read once per Retrieve (cached); the
+	// inner cache refreshes lazily.
+	annotateModelCalibration(scored.packets, m.activeModelCalibration(ctx))
+
+	return scored.packets, audit, nil
+}
+
+// annotateModelCalibration writes the active-model calibration value
+// into every packet's PacketScore.ModelCalibration. Nil-tolerant:
+// nil packet entries are skipped without panicking.
+func annotateModelCalibration(packets []*BranchPacket, calibration float64) {
+	for _, p := range packets {
+		if p == nil {
+			continue
+		}
+		p.Score.ModelCalibration = calibration
+	}
+}
+
+// retrievalStage bundles the parallel-loaded inputs to scoring.
+type retrievalStage struct {
+	branches            []*Branch
+	queryScores         map[string]float64
+	evidenceByBranch    map[string][]PacketEvidence
+	canopy              *Canopy
+	canopyRoots         map[string]struct{}
+	relayMass           map[string]float64
+	relayCofire         map[string]float64
+	depths              map[string]int
+	structuralSubstrate map[string]substrateSignal
+	warmth              map[string]float64
+}
+
+// scoredRetrieval bundles the result of the scoring stage so the
+// outer Retrieve flow stays flat.
+type scoredRetrieval struct {
+	packets          []*BranchPacket
+	featuresByBranch map[string][]float32
+}
+
+// loadRetrievalStage runs branch / evidence / canopy loads in
+// parallel via tracked goroutines (see retrievalParallelLoad) plus
+// the dependent-after-load steps (relay, depth, substrate, warmth)
+// sequentially. The substrate mode parameter selects between the
+// pre-Issue#7 stored projection, the Issue#7 PageRank alternative,
+// and the warmth-only baseline; canopy feeds PageRank's
+// personalization vector.
+func (m *MemoryForest) loadRetrievalStage(ctx context.Context, query Query, mode SubstrateMode) (retrievalStage, error) {
+	branches, queryScores, evidenceByBranch, canopy, err := m.retrievalParallelLoad(ctx, query)
+	if err != nil {
+		return retrievalStage{}, err
+	}
+	branches, err = m.hydrateMissingEvidenceBranches(ctx, branches, evidenceByBranch)
+	if err != nil {
+		return retrievalStage{}, err
+	}
+	if len(branches) == 0 {
+		return retrievalStage{}, nil
+	}
+
+	branchIDs := branchIDList(branches)
+	relayMass, err := m.loadRelayMass(ctx, branchIDs)
+	if err != nil {
+		return retrievalStage{}, err
+	}
+	relayCofire, err := m.loadRelayCofire(ctx, branchIDs)
+	if err != nil {
+		return retrievalStage{}, err
+	}
+	structuralSubstrate, err := m.loadSubstrateSignals(ctx, mode, branches, canopy)
+	if err != nil {
+		return retrievalStage{}, err
+	}
+	keys := branchKeyList(branches)
+	warmth, err := m.warmth.BatchActivation(ctx, keys, time.Now().UTC())
+	if err != nil {
+		return retrievalStage{}, err
+	}
+
+	return retrievalStage{
+		branches:            branches,
+		queryScores:         queryScores,
+		evidenceByBranch:    evidenceByBranch,
+		canopy:              canopy,
+		canopyRoots:         canopyRootSet(canopy),
+		relayMass:           relayMass,
+		relayCofire:         relayCofire,
+		depths:              computeBranchDepths(branches),
+		structuralSubstrate: structuralSubstrate,
+		warmth:              warmth,
+	}, nil
+}
+
+// retrievalParallelLoad fans out the three independent loads onto a
+// local WaitGroup. Goroutines complete before this function returns
+// (wg.Wait below), so they don't outlive the call.
+//
+// No defensive recover: each loaded function (loadCandidateBranches,
+// searchEvidence, resolveCanopy) returns errors explicitly through
+// storeErr. A runtime panic in any of them is a real bug — surface
+// it as a crash so the root cause gets fixed.
+func (m *MemoryForest) retrievalParallelLoad(ctx context.Context, query Query) ([]*Branch, map[string]float64, map[string][]PacketEvidence, *Canopy, error) {
 	var (
 		branches         []*Branch
 		queryScores      map[string]float64
@@ -29,138 +271,93 @@ func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPack
 		mu               sync.Mutex
 		wg               sync.WaitGroup
 	)
+	storeErr := func(err error) {
+		if err == nil {
+			return
+		}
+		mu.Lock()
+		if loadErr == nil {
+			loadErr = err
+		}
+		mu.Unlock()
+	}
 
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		loadedBranches, loadedScores, err := m.loadCandidateBranches(ctx, query)
 		mu.Lock()
-		defer mu.Unlock()
-		if err != nil && loadErr == nil {
-			loadErr = err
-			return
-		}
-		branches = loadedBranches
-		queryScores = loadedScores
+		branches, queryScores = loadedBranches, loadedScores
+		mu.Unlock()
+		storeErr(err)
 	}()
 	go func() {
 		defer wg.Done()
-		loadedEvidence, err := m.searchEvidence(ctx, query)
+		loaded, err := m.searchEvidence(ctx, query)
 		mu.Lock()
-		defer mu.Unlock()
-		if err != nil && loadErr == nil {
-			loadErr = err
-			return
-		}
-		evidenceByBranch = loadedEvidence
+		evidenceByBranch = loaded
+		mu.Unlock()
+		storeErr(err)
 	}()
 	go func() {
 		defer wg.Done()
-		loadedCanopy, err := m.resolveCanopy(ctx, query)
+		loaded, err := m.resolveCanopy(ctx, query)
 		mu.Lock()
-		defer mu.Unlock()
-		if err != nil && loadErr == nil {
-			loadErr = err
-			return
-		}
-		canopy = loadedCanopy
+		canopy = loaded
+		mu.Unlock()
+		storeErr(err)
 	}()
 	wg.Wait()
-	if loadErr != nil {
-		return nil, loadErr
-	}
+	return branches, queryScores, evidenceByBranch, canopy, loadErr
+}
 
-	if len(evidenceByBranch) > 0 {
-		byID := make(map[string]*Branch, len(branches))
-		for _, branch := range branches {
-			byID[branch.ID] = branch
-		}
-		var missing []string
-		for branchID := range evidenceByBranch {
-			if _, ok := byID[branchID]; !ok {
-				missing = append(missing, branchID)
-			}
-		}
-		if len(missing) > 0 {
-			extra, err := m.loadBranchesByID(ctx, missing)
-			if err != nil {
-				return nil, err
-			}
-			branches = append(branches, extra...)
-		}
+func (m *MemoryForest) hydrateMissingEvidenceBranches(ctx context.Context, branches []*Branch, evidenceByBranch map[string][]PacketEvidence) ([]*Branch, error) {
+	if len(evidenceByBranch) == 0 {
+		return branches, nil
 	}
-
-	if len(branches) == 0 {
-		return nil, nil
-	}
-
-	branchIDs := make([]string, 0, len(branches))
+	byID := make(map[string]*Branch, len(branches))
 	for _, branch := range branches {
-		branchIDs = append(branchIDs, branch.ID)
+		byID[branch.ID] = branch
 	}
-	relayMass, err := m.loadRelayMass(ctx, branchIDs)
+	var missing []string
+	for branchID := range evidenceByBranch {
+		if _, ok := byID[branchID]; !ok {
+			missing = append(missing, branchID)
+		}
+	}
+	if len(missing) == 0 {
+		return branches, nil
+	}
+	extra, err := m.loadBranchesByID(ctx, missing)
 	if err != nil {
 		return nil, err
 	}
-	relayCofire, err := m.loadRelayCofire(ctx, branchIDs)
-	if err != nil {
-		return nil, err
-	}
-	depths := computeBranchDepths(branches)
+	return append(branches, extra...), nil
+}
 
-	canopyRoots := make(map[string]struct{}, len(canopy.RootIDs))
-	for _, rootID := range canopy.RootIDs {
-		canopyRoots[rootID] = struct{}{}
-	}
-	structuralSubstrate, err := m.loadSubstrateSignals(ctx, branches)
-	if err != nil {
-		return nil, err
-	}
-
-	keys := make([]branchKey, 0, len(branches))
-	for _, branch := range branches {
-		keys = append(keys, branchKey{ID: branch.ID, Family: branch.Family})
-	}
-	warmth, err := m.warmth.BatchActivation(ctx, keys, time.Now().UTC())
-	if err != nil {
-		return nil, err
-	}
-
+// scoreRetrievalStage produces packets + per-branch feature vectors
+// from the loaded stage. The packets carry component scores already;
+// learned predictions are applied separately by the caller. The
+// supplied scorer model determines the weight vector + bias used to
+// aggregate the 13 components into a Base score; nil falls back to
+// hardcoded defaults via scoreBatch's own validation.
+func (m *MemoryForest) scoreRetrievalStage(ctx context.Context, query Query, stage retrievalStage, scorer *BaseScoreModel) (scoredRetrieval, error) {
 	now := time.Now().UTC()
-	packets := make([]*BranchPacket, 0, len(branches))
-	inputs := make([]scoreInput, 0, len(branches))
-	packetBranches := make([]*Branch, 0, len(branches))
-	featureByBranch := make(map[string][]float32, len(branches))
-	for _, branch := range branches {
+	packets := make([]*BranchPacket, 0, len(stage.branches))
+	inputs := make([]scoreInput, 0, len(stage.branches))
+	packetBranches := make([]*Branch, 0, len(stage.branches))
+	features := make(map[string][]float32, len(stage.branches))
+
+	for _, branch := range stage.branches {
 		support, counter, err := m.loadBranchEvidencePacket(ctx, branch.ID, 4, query.IncludeCounterEvidence)
 		if err != nil {
-			return nil, err
+			return scoredRetrieval{}, err
 		}
-		if extra := evidenceByBranch[branch.ID]; len(extra) > 0 {
+		if extra := stage.evidenceByBranch[branch.ID]; len(extra) > 0 {
 			support = mergeEvidence(extra, support)
 		}
-		canopyScore := 0.0
-		if _, ok := canopyRoots[branch.RootID]; ok {
-			canopyScore = 1.0
-		}
-		evidenceScore := evidenceSignal(support)
-		structural := structuralSubstrate[branch.ID]
-		substrate := retrievalSubstrateSignal(branch, structural, queryScores[branch.ID], canopyRoots)
-		inputs = append(inputs, scoreInput{
-			QueryMatch:       queryScores[branch.ID],
-			Evidence:         evidenceScore,
-			Canopy:           canopyScore,
-			Substrate:        substrate.Potential,
-			Frontier:         substrate.Frontier,
-			Confidence:       branch.Confidence,
-			Recency:          branchRecency(branch, now),
-			Warmth:           warmth[branch.ID],
-			Utility:          clamp01((branch.Utility + branch.SuccessRate) / 2),
-			Salience:         branch.Salience,
-			ConflictSafety:   1 - branch.ConflictScore,
-			ScopeSafety:      1 - branch.ScopeRisk,
-			InhibitionSafety: 1 - substrate.Inhibition,
-		})
+		input := buildScoreInput(branch, stage, support, now)
+		inputs = append(inputs, input)
 		packetBranches = append(packetBranches, branch)
 		packets = append(packets, &BranchPacket{
 			Branch:          branch,
@@ -171,37 +368,250 @@ func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPack
 		})
 	}
 
-	scores := scoreBatch(inputs, now, packetBranches)
+	weights, bias := baseScoreWeightsForModel(scorer)
+	scores := scoreBatch(inputs, now, packetBranches, weights, bias)
 	for i := range packets {
 		packets[i].Score = scores[i]
-		featureByBranch[packetBranches[i].ID] = buildFeatureVector(
+		features[packetBranches[i].ID] = buildFeatureVector(
 			query,
 			packetBranches[i],
 			inputs[i],
 			packets[i].Support,
 			packets[i].CounterEvidence,
 			scores[i].Base,
-			relayMass[packetBranches[i].ID],
-			relayCofire[packetBranches[i].ID],
-			depths[packetBranches[i].ID],
-			retrievalSubstrateSignal(packetBranches[i], structuralSubstrate[packetBranches[i].ID], queryScores[packetBranches[i].ID], canopyRoots),
+			stage.relayMass[packetBranches[i].ID],
+			stage.relayCofire[packetBranches[i].ID],
+			stage.depths[packetBranches[i].ID],
+			retrievalSubstrateSignal(packetBranches[i], stage.structuralSubstrate[packetBranches[i].ID], stage.queryScores[packetBranches[i].ID], stage.canopyRoots),
 		)
 	}
-	m.applyLearnedPredictions(query, packets, featureByBranch)
-	sortPackets(packets)
+	return scoredRetrieval{packets: packets, featuresByBranch: features}, nil
+}
 
-	if err := m.recordRetrievalExamples(ctx, query, packets, featureByBranch); err != nil && m.logger != nil {
-		m.logger.Debug("forest: record retrieval examples failed", "error", err)
+func buildScoreInput(branch *Branch, stage retrievalStage, support []PacketEvidence, now time.Time) scoreInput {
+	canopyScore := 0.0
+	if _, ok := stage.canopyRoots[branch.RootID]; ok {
+		canopyScore = 1.0
 	}
-	if len(packets) > query.Limit {
-		packets = packets[:query.Limit]
+	substrate := retrievalSubstrateSignal(branch, stage.structuralSubstrate[branch.ID], stage.queryScores[branch.ID], stage.canopyRoots)
+	return scoreInput{
+		QueryMatch:       stage.queryScores[branch.ID],
+		Evidence:         evidenceSignal(support),
+		Canopy:           canopyScore,
+		Substrate:        substrate.Potential,
+		Frontier:         substrate.Frontier,
+		Confidence:       branch.Confidence,
+		Recency:          branchRecency(branch, now),
+		Warmth:           stage.warmth[branch.ID],
+		Utility:          clamp01((branch.Utility + branch.SuccessRate) / 2),
+		Salience:         branch.Salience,
+		ConflictSafety:   1 - severityAdjustedConflict(branch),
+		ScopeSafety:      1 - severityAdjustedScopeRisk(branch),
+		InhibitionSafety: 1 - substrate.Inhibition,
 	}
+}
 
-	for _, packet := range packets {
-		_ = m.warmth.RecordAccess(ctx, packet.Branch.ID, memory.AccessRetrieval, query.Query)
+// severityAdjustedConflict scales a Constraint-family branch's
+// ConflictScore by its severity (Phase 1 of Issue #11). Hard rules
+// keep full effect (violation is an error); soft rules halve effect
+// (violation is suboptimal). Non-Constraint families pass through
+// unchanged.
+func severityAdjustedConflict(branch *Branch) float64 {
+	if branch == nil {
+		return 0
 	}
+	if branch.Family != TreeFamilyConstraint {
+		return branch.ConflictScore
+	}
+	if branch.ConstraintSeverity == ConstraintSeveritySoft {
+		return branch.ConflictScore * 0.5
+	}
+	return branch.ConflictScore
+}
 
-	return packets, nil
+// severityAdjustedScopeRisk scales a Constraint-family branch's
+// ScopeRisk by its severity. Same intent as severityAdjustedConflict
+// — hard constraint risks count fully; soft constraint risks are
+// bounded penalty rather than blocking signal.
+func severityAdjustedScopeRisk(branch *Branch) float64 {
+	if branch == nil {
+		return 0
+	}
+	if branch.Family != TreeFamilyConstraint {
+		return branch.ScopeRisk
+	}
+	if branch.ConstraintSeverity == ConstraintSeveritySoft {
+		return branch.ScopeRisk * 0.5
+	}
+	return branch.ScopeRisk
+}
+
+func branchIDList(branches []*Branch) []string {
+	out := make([]string, 0, len(branches))
+	for _, branch := range branches {
+		out = append(out, branch.ID)
+	}
+	return out
+}
+
+func branchKeyList(branches []*Branch) []branchKey {
+	out := make([]branchKey, 0, len(branches))
+	for _, branch := range branches {
+		out = append(out, branchKey{ID: branch.ID, Family: branch.Family})
+	}
+	return out
+}
+
+func canopyRootSet(canopy *Canopy) map[string]struct{} {
+	if canopy == nil {
+		return map[string]struct{}{}
+	}
+	out := make(map[string]struct{}, len(canopy.RootIDs))
+	for _, rootID := range canopy.RootIDs {
+		out[rootID] = struct{}{}
+	}
+	return out
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Audit bookkeeping
+// ────────────────────────────────────────────────────────────────────
+
+// newRetrievalAuditEvent constructs the audit shell. The ID is
+// generated up front so downstream side-effects (training-example
+// rows, retrieval-candidate projection) can use it as a stable join
+// key even before the audit row hits disk. prepareRetrievalAuditEvent
+// preserves any pre-set ID and only fills in when empty, so this
+// remains backwards-compatible with callers that mutate the audit.
+func newRetrievalAuditEvent(query Query, start time.Time, projectionSeq int64) *RetrievalAuditEvent {
+	return &RetrievalAuditEvent{
+		ID:                     "retrieval_" + uuid.NewString(),
+		SessionID:              query.SessionID,
+		TaskID:                 query.TaskID,
+		AgentID:                query.AgentID,
+		AgentType:              query.AgentType,
+		IntentID:               query.IntentID,
+		Query:                  query.Query,
+		Horizon:                query.Horizon,
+		Families:               append([]TreeFamily(nil), query.Families...),
+		RequestedLimit:         query.Limit,
+		IncludeCounterEvidence: query.IncludeCounterEvidence,
+		RequestedAt:            start,
+		BranchProjectionSeq:    projectionSeq,
+		Candidates:             []RetrievalAuditCandidate{},
+	}
+}
+
+func finalizeRetrievalAudit(audit *RetrievalAuditEvent, query Query, start time.Time, err error) {
+	if audit == nil {
+		return
+	}
+	audit.Duration = time.Since(start)
+	if err != nil {
+		audit.ErrorMessage = err.Error()
+	}
+	audit.RequestedLimit = query.Limit
+}
+
+// populateAuditCandidates fills audit.Candidates with the full ranked
+// set BEFORE truncation to top-K. Each candidate's RankPosition is
+// 1..K for those that will be returned; 0 for candidates that fall
+// outside the requested limit. Called after sortPackets so order
+// reflects the final ranking.
+func populateAuditCandidates(audit *RetrievalAuditEvent, packets []*BranchPacket, features map[string][]float32, limit int) {
+	if audit == nil {
+		return
+	}
+	audit.CandidateCount = len(packets)
+	if limit < 0 {
+		limit = 0
+	}
+	returned := len(packets)
+	if returned > limit {
+		returned = limit
+	}
+	audit.ReturnedCount = returned
+
+	candidates := make([]RetrievalAuditCandidate, 0, len(packets))
+	for i, packet := range packets {
+		entry := RetrievalAuditCandidate{
+			BranchID:         packet.Branch.ID,
+			RankPosition:     0,
+			Returned:         false,
+			BaseScore:        packet.Score.Base,
+			FinalScore:       packet.Score.Total,
+			PredictedUtility: predictedUtilityOrZero(packet.Prediction),
+			PredictedRisk:    predictedRiskOrZero(packet.Prediction),
+			Components:       scoreComponentsMap(packet.Score),
+			FeatureVector:    cloneFeatureVector(features[packet.Branch.ID]),
+		}
+		if i < returned {
+			entry.RankPosition = i + 1
+			entry.Returned = true
+		}
+		candidates = append(candidates, entry)
+	}
+	audit.Candidates = candidates
+}
+
+func scoreComponentsMap(score PacketScore) map[string]float64 {
+	return map[string]float64{
+		"query_match":       score.QueryMatch,
+		"evidence":          score.Evidence,
+		"canopy":            score.Canopy,
+		"substrate":         score.Substrate,
+		"frontier":          score.Frontier,
+		"confidence":        score.Confidence,
+		"recency":           score.Recency,
+		"warmth":            score.Warmth,
+		"utility":           score.Utility,
+		"salience":          score.Salience,
+		"conflict_safety":   score.Conflict,
+		"scope_safety":      score.ScopeSafety,
+		"inhibition_safety": score.InhibitionSafety,
+	}
+}
+
+func cloneFeatureVector(src []float32) []float32 {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]float32, len(src))
+	copy(dst, src)
+	return dst
+}
+
+func predictedUtilityOrZero(p *LearnedPrediction) float64 {
+	if p == nil {
+		return 0
+	}
+	return p.Utility
+}
+
+func predictedRiskOrZero(p *LearnedPrediction) float64 {
+	if p == nil {
+		return 0
+	}
+	return p.Risk
+}
+
+// currentBranchProjectionSeq reads the current branch projector
+// watermark for audit replayability. Returns 0 if unavailable
+// (synchronous-projection mode, schema not yet migrated).
+func (m *MemoryForest) currentBranchProjectionSeq(ctx context.Context) int64 {
+	if m == nil || m.db == nil {
+		return 0
+	}
+	row := m.db.QueryRowContext(ctx, `
+		SELECT last_applied_seq
+		FROM   forest_projector_state
+		WHERE  projector_name = ?
+	`, projectorBranchName)
+	var seq int64
+	if err := row.Scan(&seq); err != nil {
+		return 0
+	}
+	return seq
 }
 
 // ResolveIntent returns the active intent frontier for the caller.
@@ -234,7 +644,6 @@ func (m *MemoryForest) ResolveIntent(ctx context.Context, input ResolveIntentInp
 		Families: []TreeFamily{
 			TreeFamilyIntent,
 			TreeFamilyConstraint,
-			TreeFamilyPreference,
 			TreeFamilyOutcome,
 		},
 		IncludeCounterEvidence: true,
@@ -255,9 +664,15 @@ func (m *MemoryForest) ResolveIntent(ctx context.Context, input ResolveIntentInp
 				resolution.PrimaryIntent = packet.Branch.Summary
 			}
 		case TreeFamilyConstraint:
-			resolution.Constraints = append(resolution.Constraints, *packet)
-		case TreeFamilyPreference:
-			resolution.Preferences = append(resolution.Preferences, *packet)
+			// Issue #11 Phase 3: Preference is now Constraint with
+			// severity=soft. Route soft-severity constraints into the
+			// Preferences slot for the operator-facing IntentResolution
+			// surface; hard-severity into Constraints.
+			if packet.Branch.ConstraintSeverity == ConstraintSeveritySoft {
+				resolution.Preferences = append(resolution.Preferences, *packet)
+			} else {
+				resolution.Constraints = append(resolution.Constraints, *packet)
+			}
 		case TreeFamilyOutcome:
 			resolution.OutcomeHints = append(resolution.OutcomeHints, *packet)
 		}
@@ -272,11 +687,12 @@ func (m *MemoryForest) PredictNextBranches(ctx context.Context, query Query) ([]
 	if err != nil {
 		return nil, err
 	}
+	// Issue #11 Phase 3: Opportunity, Capability, Decision merged
+	// into Intent. PredictNextBranches now scans the consolidated
+	// Intent + Outcome surface to find adjacent-value branches.
 	query.Families = []TreeFamily{
-		TreeFamilyOpportunity,
-		TreeFamilyCapability,
+		TreeFamilyIntent,
 		TreeFamilyOutcome,
-		TreeFamilyDecision,
 	}
 	query.IncludeCounterEvidence = true
 	return m.Retrieve(ctx, query)
@@ -312,6 +728,14 @@ func normalizeQuery(query Query) (Query, error) {
 	}
 	if len(query.Families) == 0 {
 		query.Families = defaultFamilies()
+	} else {
+		// Canonicalize legacy family filters so callers using
+		// TreeFamilyDecision/Preference/Capability/Opportunity/Conflict
+		// retrieve from the consolidated families they were merged
+		// into. Deprecated families never surface as branch.Family
+		// post-migration, so without this rewrite the filter would
+		// match nothing.
+		query.Families = canonicalizeFamilies(query.Families)
 	}
 	return query, nil
 }
@@ -378,7 +802,7 @@ func (m *MemoryForest) queryBranches(ctx context.Context, sessionID, taskID stri
 		       intent_id, title, summary, confidence, salience, utility, success_rate,
 		       scope_risk, conflict_score, support_count, counter_count, success_count,
 		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata,
-		       last_applied_seq
+		       last_applied_seq, constraint_severity
 		FROM forest_branches
 		WHERE state != ?
 	`
@@ -443,7 +867,7 @@ func (m *MemoryForest) loadBranchesByID(ctx context.Context, ids []string) ([]*B
 		       intent_id, title, summary, confidence, salience, utility, success_rate,
 		       scope_risk, conflict_score, support_count, counter_count, success_count,
 		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata,
-		       last_applied_seq
+		       last_applied_seq, constraint_severity
 		FROM forest_branches
 		WHERE id IN (`+strings.Join(placeholders, ",")+`)
 	`, args...)
@@ -833,25 +1257,23 @@ func buildConflicts(branch *Branch, counter []PacketEvidence) []PacketConflict {
 }
 
 func buildNextActions(branch *Branch) []PacketAction {
-	switch branch.Family {
+	// Canonicalize so any branch row that slipped through with a
+	// deprecated family (e.g. external writer pre-migration) still
+	// gets a sensible action for its post-Phase-3 successor.
+	switch canonicalizeFamily(branch.Family) {
 	case TreeFamilyIntent:
 		return []PacketAction{{Label: "refine", Description: "refine the active intent into stronger constraints or subgoals"}}
 	case TreeFamilyConstraint:
+		if branch.ConstraintSeverity == ConstraintSeveritySoft {
+			return []PacketAction{{Label: "adapt", Description: "adjust tone, scope, or tradeoffs to match this preference"}}
+		}
 		return []PacketAction{{Label: "respect", Description: "use this branch as a hard constraint during planning and execution"}}
 	case TreeFamilyEvidence:
 		return []PacketAction{{Label: "ground", Description: "use this evidence to justify or challenge the current branch"}}
-	case TreeFamilyDecision:
-		return []PacketAction{{Label: "compare", Description: "compare this decision against alternatives and record the outcome"}}
 	case TreeFamilyOutcome:
-		return []PacketAction{{Label: "learn", Description: "feed this outcome back into capability and preference priors"}}
-	case TreeFamilyPreference:
-		return []PacketAction{{Label: "adapt", Description: "adjust tone, scope, or tradeoffs to match this preference"}}
-	case TreeFamilyCapability:
-		return []PacketAction{{Label: "route", Description: "choose the agent, tool, or workflow path that best matches this precedent"}}
-	case TreeFamilyOpportunity:
-		return []PacketAction{{Label: "propose", Description: "offer this as a safe surplus-quality upgrade if scope risk stays low"}}
-	case TreeFamilyConflict:
-		return []PacketAction{{Label: "resolve", Description: "surface the contradiction and gather evidence before proceeding"}}
+		return []PacketAction{{Label: "learn", Description: "feed this outcome back into intent and constraint priors"}}
+	case TreeFamilyAntiPattern:
+		return []PacketAction{{Label: "avoid", Description: "treat this branch as a known anti-pattern; prefer alternative approaches"}}
 	default:
 		return nil
 	}

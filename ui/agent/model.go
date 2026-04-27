@@ -161,16 +161,19 @@ type listRow struct {
 
 // PipelineState holds the current state of a TDD pipeline.
 type PipelineState struct {
-	ID         string
-	TaskID     string
-	TaskLabel  string
-	Status     string
-	LoopCount  int
-	MaxLoops   int
-	WorkerType string
-	Members    []string // Agent IDs belonging to this pipeline.
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ID               string
+	TaskID           string
+	TaskSlug         string
+	TaskLabel        string
+	Status           string
+	LoopCount        int
+	MaxLoops         int
+	WorkerType       string
+	ClaimsAccepted   int
+	ClaimsTotalCount int
+	Members          []string // Agent IDs belonging to this pipeline.
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // VariantState holds the current state of a pipeline variant.
@@ -383,7 +386,12 @@ var eventTypeToStatus = map[events.EventType]AgentStatus{
 	events.EventTypeLLMResponse:     StatusIdle,
 	events.EventTypeSuccess:         StatusSuccess,
 	events.EventTypeFailure:         StatusError,
-	events.EventTypeAgentRegistered: StatusWaiting,
+	events.EventTypeAgentRegistered:    StatusWaiting,
+	events.EventTypeClaimReceived:      StatusWaiting,
+	events.EventTypeTestamentSubmitted: StatusSuccess,
+	events.EventTypeValidationPassed:   StatusSuccess,
+	events.EventTypeClaimAccepted:      StatusSuccess,
+	events.EventTypeValidationFailed:   StatusError,
 }
 
 // viewState represents which view the agent panel is currently showing.
@@ -592,6 +600,8 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 		return m, m.handleStreamComplete(typed)
 	case msg.ToolCallEventMsg:
 		return m, m.handleToolCallEvent(typed)
+	case msg.ClaimsProjectionMsg:
+		return m, m.handleClaimsProjection(typed)
 	case tea.KeyMsg:
 		return m, m.handleKey(typed)
 	default:
@@ -2189,6 +2199,9 @@ func (m *Model) handlePipelineState(ps msg.PipelineStateMsg) tea.Cmd {
 	if ps.TaskID != "" {
 		pl.TaskID = ps.TaskID
 	}
+	if ps.TaskSlug != "" {
+		pl.TaskSlug = ps.TaskSlug
+	}
 	if ps.TaskLabel != "" {
 		pl.TaskLabel = ps.TaskLabel
 	} else {
@@ -2202,6 +2215,22 @@ func (m *Model) handlePipelineState(ps msg.PipelineStateMsg) tea.Cmd {
 	applyPipelineStateUpdate(pl, ps)
 	m.rowsDirty = true
 
+	return nil
+}
+
+func (m *Model) handleClaimsProjection(proj msg.ClaimsProjectionMsg) tea.Cmd {
+	taskID := strings.TrimSpace(proj.TaskID)
+	if taskID == "" {
+		return nil
+	}
+	for _, pl := range m.pipelines {
+		if pl.TaskID == taskID || pl.ID == taskID {
+			pl.ClaimsAccepted = proj.AcceptedCount
+			pl.ClaimsTotalCount = proj.TotalClaims
+			m.rowsDirty = true
+			return nil
+		}
+	}
 	return nil
 }
 
@@ -4151,8 +4180,16 @@ func pipelineDisplayLabel(pl *PipelineState) string {
 	if pl == nil {
 		return ""
 	}
-	if strings.TrimSpace(pl.TaskLabel) != "" {
-		return pl.TaskLabel
+	slug := strings.TrimSpace(pl.TaskSlug)
+	label := strings.TrimSpace(pl.TaskLabel)
+	if slug != "" && label != "" && slug != label {
+		return slug + " " + label
+	}
+	if slug != "" {
+		return slug
+	}
+	if label != "" {
+		return label
 	}
 	if strings.TrimSpace(pl.TaskID) != "" {
 		return pl.TaskID

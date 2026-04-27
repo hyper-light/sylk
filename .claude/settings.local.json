@@ -135,7 +135,9 @@
       "Bash(cat)",
       "Bash(chmod +x /tmp/check_agent.sh)",
       "Bash([ -f \"/Users/adalundhe/Projects/sylk/agents/$agent/skills_api.go\" ])",
-      "Bash([ -f \"/Users/adalundhe/Projects/sylk/agents/$agent/tool_policy.go\" ])"
+      "Bash([ -f \"/Users/adalundhe/Projects/sylk/agents/$agent/tool_policy.go\" ])",
+      "Read(//private/tmp/**)",
+      "Bash(bash /tmp/complexity_check.sh)"
     ]
   }
 }

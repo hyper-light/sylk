@@ -224,6 +224,7 @@ func toTaskPipelineStateMsg(evt taskstate.Event) msg.PipelineStateMsg {
 	return msg.PipelineStateMsg{
 		PipelineID: pipelineID,
 		TaskID:     firstNonEmpty(evt.TaskID, pipelineID),
+		TaskSlug:   evt.TaskSlug,
 		TaskLabel:  evt.TaskLabel,
 		Status:     string(evt.Status),
 		WorkerType: evt.WorkerType,
@@ -246,6 +247,7 @@ func extractTaskStateEvent(data map[string]any) (taskstate.Event, bool) {
 	var evt taskstate.Event
 	evt.PipelineID, _ = data["pipeline_id"].(string)
 	evt.TaskID, _ = data["task_id"].(string)
+	evt.TaskSlug, _ = data["task_slug"].(string)
 	evt.TaskLabel, _ = data["task_label"].(string)
 	if status, _ := data["status"].(string); status != "" {
 		evt.Status = taskstate.Status(status)

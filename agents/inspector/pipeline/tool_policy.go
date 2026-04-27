@@ -21,12 +21,6 @@ func pipelineInspectorVisibleSkillNames() []string {
 		// query_peer_activity(kinds=["validation_*"]) + query_pipeline_state.
 		// Phase 2.K / GT-4 + GI-5: collapsed into dependency(action=…).
 		"dependency",
-		// challenge_agent / handoff_next / validate_work /
-		// process_validation / finalize_pipeline collapsed into
-		// pipeline_protocol(action=challenge|handoff|validate|
-		// process_validation|finalize). handoff_to_ot remains distinct —
-		// it's inspector-only, the terminal commit-to-green action.
-		"pipeline_protocol",
 		"handoff_to_ot",
 		// Claims skills: read-only board introspection is Local (visible).
 		"query_claims_board",
@@ -48,10 +42,6 @@ func pipelineInspectorMutatingSkillNames() []string {
 		// challenge_peer(target_activity_id=<failing artifact/decision>).
 		"request_override",
 		"dependency",
-		"challenge_agent",
-		"handoff_next",
-		"validate_work",
-		"process_validation",
 		"finalize_pipeline",
 		"handoff_to_ot",
 		"reroute_request",

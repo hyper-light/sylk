@@ -95,8 +95,16 @@ func (a *Archivalist) registerFabricSkills() {
 		a.skills.Register(skill)
 	}
 	// Claims skills.
-	boardProvider := func() *claims.ClaimsBoard {
-		return claims.DefaultSessionBoardRegistry().Lookup(a.defaultSessionID)
+	boardProvider := func() (*claims.ClaimsBoard, error) {
+		sid := a.defaultSessionID
+		if sid == "" {
+			return nil, fmt.Errorf("archivalist: no session ID configured")
+		}
+		board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+		if board == nil {
+			return nil, fmt.Errorf("archivalist: session %q has no claims board registered", sid)
+		}
+		return board, nil
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return a.claimsInbox }
 	a.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))

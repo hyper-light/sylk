@@ -70,8 +70,16 @@ func (g *Guide) registerCoreSkills() {
 	// routes, and responds. It needs to see and interact with the
 	// session claims board, not just create it. Board resolved via
 	// session registry at invocation time (session-scoped, not static).
-	boardProvider := func() *claims.ClaimsBoard {
-		return claims.DefaultSessionBoardRegistry().Lookup(g.sessionID)
+	boardProvider := func() (*claims.ClaimsBoard, error) {
+		sid := g.sessionID
+		if sid == "" {
+			return nil, fmt.Errorf("guide: no session ID configured")
+		}
+		board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+		if board == nil {
+			return nil, fmt.Errorf("guide: session %q has no claims board registered", sid)
+		}
+		return board, nil
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return g.claimsInbox }
 	g.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))

@@ -1,6 +1,10 @@
 package shared
 
 import (
+	"log/slog"
+	"strings"
+
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/steering"
@@ -28,6 +32,24 @@ type SteeringResult struct {
 	ShouldPause bool
 }
 
+// DrainOption configures optional behavior for DrainAndCheckpoint.
+type DrainOption func(*drainConfig)
+
+type drainConfig struct {
+	boardProvider func() *claims.ClaimsBoard
+	agentID       string
+}
+
+// WithBoardProvider configures DrainAndCheckpoint to check the claims
+// board for pending corrective claims directed at this agent and convert
+// them to steering commands.
+func WithBoardProvider(bp func() *claims.ClaimsBoard, agentID string) DrainOption {
+	return func(cfg *drainConfig) {
+		cfg.boardProvider = bp
+		cfg.agentID = agentID
+	}
+}
+
 // DrainAndCheckpoint is the single integration point for steering in all
 // agent tool loops. Called once per turn, before the LLM call.
 //
@@ -44,6 +66,7 @@ func DrainAndCheckpoint(
 	turn int,
 	phase string,
 	snap steering.StateSnapshotter,
+	opts ...DrainOption,
 ) SteeringResult {
 	if ledger == nil {
 		return SteeringResult{}
@@ -54,11 +77,71 @@ func DrainAndCheckpoint(
 
 	// Drain all pending commands.
 	cmds := ledger.Mailbox.Drain()
+
+	// If a board provider is set, check for pending corrective claims
+	// and convert them to steering commands.
+	var cfg drainConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.boardProvider != nil && cfg.agentID != "" {
+		if boardCmds := drainCorrectiveClaimsAsCommands(cfg.boardProvider, cfg.agentID); len(boardCmds) > 0 {
+			cmds = append(cmds, boardCmds...)
+		}
+	}
+
 	if len(cmds) == 0 {
 		return checkPace(ledger)
 	}
 
 	return processCommands(ledger, req, cmds)
+}
+
+// drainCorrectiveClaimsAsCommands checks the board for pending
+// corrective claims directed at the given agent and converts them
+// to steering steer commands.
+func drainCorrectiveClaimsAsCommands(bp func() *claims.ClaimsBoard, agentID string) []steering.Command {
+	if bp == nil {
+		return nil
+	}
+	board := bp()
+	if board == nil {
+		return nil
+	}
+	// Find corrective claims where this agent is the subject.
+	ids := board.ObjectIDsWithRelation(claims.RelatedTypeAgent, claims.RelationshipSubject, agentID)
+	if len(ids) == 0 {
+		return nil
+	}
+	var cmds []steering.Command
+	for _, id := range ids {
+		c, ok := board.ClaimByID(id)
+		if !ok || c == nil {
+			continue
+		}
+		if c.ActionType != claims.ActionTypeCorrective {
+			continue
+		}
+		if c.Status != claims.ClaimStatusPending {
+			continue
+		}
+		text := strings.TrimSpace(c.Title)
+		if desc := strings.TrimSpace(c.Description); desc != "" {
+			text += ": " + desc
+		}
+		if text == "" {
+			continue
+		}
+		cmds = append(cmds, steering.Command{
+			Type: steering.CommandSteer,
+			Text: text,
+		})
+		// Mark the claim as in-progress so it's not re-consumed.
+		if err := board.UpdateClaimProgress(nil, c.ID, claims.ClaimProgressUpdate{}, "steering_drain"); err != nil {
+			slog.Debug("steering_drain_claim_progress_failed", "claim_id", c.ID, "error", err.Error())
+		}
+	}
+	return cmds
 }
 
 func processCommands(

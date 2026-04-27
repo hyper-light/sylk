@@ -28,10 +28,10 @@ func ExtendReportShapeGrace(current int) int {
 // rule-based, not heuristic: every check is deterministic and produces a
 // precise violation message the model can act on when re-prompted.
 //
-// This is the per-agent counterpart to ValidatePipelineProtocolCompletion /
-// ValidateGlobalReviewCompletion: a contract gate enforced at the tool-loop
-// terminal exit point. The model's text is never rewritten — only re-prompted
-// when it fails to match the contract.
+// This is the per-agent counterpart to ValidateGlobalReviewCompletion:
+// a contract gate enforced at the tool-loop terminal exit point. The
+// model's text is never rewritten -- only re-prompted when it fails to
+// match the contract.
 type AgentReportShapeProfile struct {
 	// Name identifies the profile in error messages (e.g. "tester turn report").
 	Name string

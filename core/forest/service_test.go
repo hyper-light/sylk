@@ -24,6 +24,11 @@ func newTestForestWithConfig(t *testing.T, cfg Config) (*MemoryForest, *sql.DB) 
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
+	// Set busy_timeout so the audit drainer goroutine and the test's
+	// own writes don't deadlock on the shared-cache file lock.
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		t.Fatalf("busy_timeout: %v", err)
+	}
 
 	schema := `
 		CREATE TABLE nodes (
@@ -120,7 +125,7 @@ func TestMemoryForest_RecordContentAndRetrieve(t *testing.T) {
 		Query:     "retry jitter api client",
 		SessionID: "session-1",
 		Limit:     4,
-		Families:  []TreeFamily{TreeFamilyDecision},
+		Families:  []TreeFamily{TreeFamilyIntent},
 	})
 	if err != nil {
 		t.Fatalf("retrieve: %v", err)
@@ -128,7 +133,7 @@ func TestMemoryForest_RecordContentAndRetrieve(t *testing.T) {
 	if len(packets) == 0 {
 		t.Fatal("expected at least one packet")
 	}
-	if packets[0].Branch.Family != TreeFamilyDecision {
+	if packets[0].Branch.Family != TreeFamilyIntent {
 		t.Fatalf("unexpected family: %s", packets[0].Branch.Family)
 	}
 	if packets[0].Score.Total <= 0 {
@@ -184,7 +189,7 @@ func TestMemoryForest_TaskHorizonIsTaskScoped(t *testing.T) {
 		TaskID:    "task-a",
 		Horizon:   CanopyHorizonTask,
 		Limit:     8,
-		Families:  []TreeFamily{TreeFamilyDecision},
+		Families:  []TreeFamily{TreeFamilyIntent},
 	})
 	if err != nil {
 		t.Fatalf("retrieve task-scoped packets: %v", err)
@@ -350,7 +355,7 @@ func TestMemoryForest_TrainModelsAndPredict(t *testing.T) {
 		SessionID: "session-train",
 		AgentType: "engineer",
 		Limit:     20,
-		Families:  []TreeFamily{TreeFamilyDecision},
+		Families:  []TreeFamily{TreeFamilyIntent},
 	})
 	if err != nil {
 		t.Fatalf("initial retrieve: %v", err)
@@ -391,7 +396,7 @@ func TestMemoryForest_TrainModelsAndPredict(t *testing.T) {
 		SessionID: "session-train",
 		AgentType: "engineer",
 		Limit:     8,
-		Families:  []TreeFamily{TreeFamilyDecision},
+		Families:  []TreeFamily{TreeFamilyIntent},
 	})
 	if err != nil {
 		t.Fatalf("retrieve with learned model: %v", err)
@@ -461,7 +466,7 @@ func TestMemoryForest_TrainModelsEventDriven(t *testing.T) {
 		SessionID: "session-train-event",
 		AgentType: "engineer",
 		Limit:     20,
-		Families:  []TreeFamily{TreeFamilyDecision},
+		Families:  []TreeFamily{TreeFamilyIntent},
 	})
 	if err != nil {
 		t.Fatalf("initial retrieve: %v", err)
@@ -500,7 +505,7 @@ func TestMemoryForest_TrainModelsEventDriven(t *testing.T) {
 		SessionID: "session-train-event",
 		AgentType: "engineer",
 		Limit:     8,
-		Families:  []TreeFamily{TreeFamilyDecision},
+		Families:  []TreeFamily{TreeFamilyIntent},
 	})
 	if err != nil {
 		t.Fatalf("retrieve with learned model: %v", err)

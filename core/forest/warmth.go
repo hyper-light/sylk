@@ -190,12 +190,16 @@ func domainIndexForFamily(family TreeFamily) int {
 	switch family {
 	case TreeFamilyEvidence:
 		return 0 // librarian-style evidence
-	case TreeFamilyOutcome, TreeFamilyConflict:
-		return 2 // archivalist-style outcome memory
-	case TreeFamilyOpportunity, TreeFamilyCapability:
-		return 4 // engineer-style task utility
+	case TreeFamilyOutcome, TreeFamilyAntiPattern:
+		return 2 // archivalist-style outcome memory (incl. negative-evidence trees)
 	default:
-		return 3 // architect-style planning / intent structure
+		// Intent + Constraint route here (architect-style planning /
+		// intent structure). Issue #11 Phase 3 collapsed
+		// Capability/Opportunity into Intent and Conflict into
+		// AntiPattern, so the prior task-utility (4) bucket is
+		// no longer reachable; the architect bucket subsumes the
+		// planning + capability semantics.
+		return 3
 	}
 }
 

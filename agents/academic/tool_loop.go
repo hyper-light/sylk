@@ -202,7 +202,8 @@ func (a *Academic) executeToolLoop(
 		}
 
 		// ── STEERING CHECKPOINT ──
-		sc := shared.DrainAndCheckpoint(ledger, req, turn, "researching", nil)
+		sc := shared.DrainAndCheckpoint(ledger, req, turn, "researching", nil,
+			shared.WithBoardProvider(func() *claims.ClaimsBoard { return a.academicBoard() }, a.id))
 		if sc.Rollback != nil || sc.EditReplay != nil {
 			cp := sc.Rollback
 			if cp == nil {

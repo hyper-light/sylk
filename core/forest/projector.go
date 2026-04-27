@@ -237,42 +237,8 @@ func (m *MemoryForest) startBranchProjector() {
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		defer m.recoverProjectorPanic()
 		m.runBranchProjectorLoop()
 	}()
-}
-
-// recoverProjectorPanic is the deferred panic guard for the branch
-// projector goroutine. Captures the panic value + stack trace, logs
-// loudly, and persists a halt marker on forest_projector_state so the
-// next operator query (ProjectorStatus / Health) sees the failure.
-func (m *MemoryForest) recoverProjectorPanic() {
-	r := recover()
-	if r == nil {
-		return
-	}
-	stack := debugStackTruncated(projectorErrTruncate)
-	slog.Error("forest_projector_panic",
-		"holder", m.projectorID,
-		"panic", fmt.Sprintf("%v", r),
-		"stack", stack,
-	)
-	if m.runCtx == nil || m.runCtx.Err() != nil {
-		return
-	}
-	msg := fmt.Sprintf("panic: %v\nstack: %s", r, stack)
-	now := time.Now().UTC().Unix()
-	if _, err := m.db.ExecContext(m.runCtx, `
-		UPDATE forest_projector_state
-		SET    health_status = ?,
-		       last_error    = ?,
-		       last_error_at = ?,
-		       updated_at    = ?
-		WHERE  projector_name = ?
-	`, string(ProjectorHealthHalted), truncateError(msg, projectorErrTruncate), now, now, projectorBranchName); err != nil {
-		slog.Error("forest_projector_panic_persist_failed",
-			"holder", m.projectorID, "err", err.Error())
-	}
 }
 
 // runBranchProjectorLoop is the projector's outer loop. Acquires the
@@ -334,7 +300,7 @@ func (m *MemoryForest) runProjectorSession(state *projectorState, backoff *proje
 			continue
 		}
 
-		if err := m.waitForProjectorWork(renewTicker, state); err != nil {
+		if err := m.waitForProjectorWork(renewTicker, state, m.projectorWake); err != nil {
 			return err
 		}
 	}
@@ -459,13 +425,14 @@ func (m *MemoryForest) recordProjectorWarmth(event *Event, branch *Branch, creat
 				"branch_id", branch.ID, "phase", "creation", "err", err.Error())
 		}
 	}
+	// Issue #4 mechanism A: warmth fires only on AccessCreation (above)
+	// and AccessReinforcement (below) — never on AccessRetrieval. Recall
+	// events are explicit *use* of a branch by an agent (the agent
+	// deliberately invoked it), so they fold into the reinforcement
+	// case alongside validation/outcome/replay. AccessRetrieval is
+	// reserved for query-result observation, which doesn't reinforce.
 	switch event.EventType {
-	case EventTypeRecall:
-		if err := m.warmth.RecordAccess(m.runCtx, branch.ID, memory.AccessRetrieval, event.Title); err != nil {
-			slog.Debug("forest_projector_warmth_failed",
-				"branch_id", branch.ID, "phase", "retrieval", "err", err.Error())
-		}
-	case EventTypeValidation, EventTypeOutcomeRecorded, EventTypeReplayConsolidated:
+	case EventTypeRecall, EventTypeValidation, EventTypeOutcomeRecorded, EventTypeReplayConsolidated:
 		if err := m.warmth.RecordAccess(m.runCtx, branch.ID, memory.AccessReinforcement, event.Title); err != nil {
 			slog.Debug("forest_projector_warmth_failed",
 				"branch_id", branch.ID, "phase", "reinforcement", "err", err.Error())
@@ -486,14 +453,18 @@ func (m *MemoryForest) recordProjectorLabels(event *Event, branchID string) int6
 	return 0
 }
 
+// applyOutcomeLabel writes the explicit outcome label AND the
+// counterfactual labels for co-candidates from recent retrievals.
+// Returns the total label count (explicit + counterfactual) for the
+// "schedule training" decision in runProjectorPostCommit.
 func (m *MemoryForest) applyOutcomeLabel(branchID, sessionID string, status OutcomeStatus) int64 {
-	changed, err := m.labelExamplesForOutcome(m.runCtx, branchID, sessionID, status)
+	result, err := m.labelExamplesForOutcomeWithCounterfactuals(m.runCtx, branchID, sessionID, status)
 	if err != nil {
 		slog.Debug("forest_projector_label_failed",
 			"branch_id", branchID, "status", string(status), "err", err.Error())
 		return 0
 	}
-	return changed
+	return result.Explicit + result.Counterfactual
 }
 
 func outcomeStatusFromPayload(payload map[string]any) OutcomeStatus {
@@ -845,11 +816,15 @@ func (m *MemoryForest) sleepProjector(d time.Duration) bool {
 	}
 }
 
-func (m *MemoryForest) waitForProjectorWork(renew *time.Ticker, state *projectorState) error {
+// waitForProjectorWork blocks until: a wake signal arrives on the
+// supplied wake channel, the poll interval elapses, the lease is due
+// for renewal, or shutdown is requested. Each projector passes its
+// own wake channel so wakes aren't stolen by sibling projectors.
+func (m *MemoryForest) waitForProjectorWork(renew *time.Ticker, state *projectorState, wake <-chan struct{}) error {
 	timer := time.NewTimer(projectorPollInterval)
 	defer timer.Stop()
 	select {
-	case <-m.projectorWake:
+	case <-wake:
 		return nil
 	case <-timer.C:
 		return nil

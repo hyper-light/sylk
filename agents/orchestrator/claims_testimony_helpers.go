@@ -31,13 +31,27 @@ func (a *orchestratorScopeAdapter) Go(desc string, timeout time.Duration, fn fun
 }
 
 // orchestratorBoard resolves the claims board for the session.
-func (o *Orchestrator) orchestratorBoard() *claims.ClaimsBoard {
-	return claims.DefaultSessionBoardRegistry().Lookup(o.SessionID())
+func (o *Orchestrator) orchestratorBoard() (*claims.ClaimsBoard, error) {
+	sid := o.SessionID()
+	if sid == "" {
+		return nil, fmt.Errorf("orchestrator: no session ID configured")
+	}
+	board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+	if board == nil {
+		return nil, fmt.Errorf("orchestrator: session %q has no claims board registered", sid)
+	}
+	return board, nil
+}
+
+// orchestratorBoardOrNil returns the board or nil (for best-effort callers).
+func (o *Orchestrator) orchestratorBoardOrNil() *claims.ClaimsBoard {
+	board, _ := o.orchestratorBoard()
+	return board
 }
 
 // orchestratorPostClaim posts a claim async via scope. Best-effort.
 func (o *Orchestrator) orchestratorPostClaim(ctx context.Context, action claims.Action, claim claims.Claim) {
-	board := o.orchestratorBoard()
+	board := o.orchestratorBoardOrNil()
 	if board == nil {
 		return
 	}
@@ -58,7 +72,7 @@ func (o *Orchestrator) orchestratorPostClaim(ctx context.Context, action claims.
 
 // orchestratorSubmitTestament submits a testament async via scope. Best-effort.
 func (o *Orchestrator) orchestratorSubmitTestament(ctx context.Context, testament claims.Testament) {
-	board := o.orchestratorBoard()
+	board := o.orchestratorBoardOrNil()
 	if board == nil {
 		return
 	}
@@ -172,12 +186,12 @@ func (o *Orchestrator) processClaimsEntry(ctx context.Context, entry *claims.Gra
 	}
 
 	acc := claims.NewTestamentAccumulator("orchestrator", o.SessionID())
-	defer acc.Flush(ctx, o.orchestratorBoard(), o.orchestratorScope())
+	defer acc.Flush(ctx, o.orchestratorBoardOrNil(), o.orchestratorScope())
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
 
 	userMessage := shared.ComposeClaimsEntryPrompt(entry)
-	board := o.orchestratorBoard()
+	board := o.orchestratorBoardOrNil()
 	userMessage = claims.PrependBoardPreamble(userMessage, board, "orchestrator")
 	o.prepareSkillsForInput(userMessage)
 

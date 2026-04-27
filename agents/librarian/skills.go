@@ -125,8 +125,16 @@ func (l *Librarian) registerFabricSkills() {
 	// Claims skills: knowledge agents are full participants — they
 	// receive direct user prompts, issue consultation claims against
 	// peers, and respond with testaments containing artifacts.
-	boardProvider := func() *claims.ClaimsBoard {
-		return claims.DefaultSessionBoardRegistry().Lookup(l.config.SessionID)
+	boardProvider := func() (*claims.ClaimsBoard, error) {
+		sid := l.config.SessionID
+		if sid == "" {
+			return nil, fmt.Errorf("librarian: no session ID configured")
+		}
+		board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+		if board == nil {
+			return nil, fmt.Errorf("librarian: session %q has no claims board registered", sid)
+		}
+		return board, nil
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return l.claimsInbox }
 	l.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))

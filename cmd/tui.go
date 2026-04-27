@@ -37,6 +37,7 @@ import (
 	"github.com/adalundhe/sylk/core/agents/identity"
 	identityregistries "github.com/adalundhe/sylk/core/agents/identity/registries"
 	"github.com/adalundhe/sylk/core/boot"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
@@ -662,12 +663,19 @@ func startActivationControllerBootstrap(phase1 *bootstrapPhase1, ch chan<- activ
 			ch <- activationCtrlResult{err: err}
 			return
 		}
+		sessMgr := phase1.sessionMgr
 		ctrl, err := activation.NewActivationController(activation.ActivationControllerConfig{
 			Runtime:    phase1.runtime,
 			Registry:   phase1.containerReg,
 			Scope:      phase1.scope,
 			Policies:   activationPolicies,
 			StorageDir: storageDir,
+			BoardProvider: func() *claims.ClaimsBoard {
+				if sess, ok := sessMgr.GetActive(); ok {
+					return claims.DefaultSessionBoardRegistry().Lookup(sess.ID())
+				}
+				return nil
+			},
 		})
 		if err != nil {
 			ch <- activationCtrlResult{err: err}
@@ -1221,6 +1229,36 @@ func registerSessionAuditWiringHooks(phase1 *bootstrapPhase1, orch *orchestrator
 			"session_id", string(svfs.SessionID()),
 		)
 	})
+
+	// Issue #5 wiring: prime the new session's forest canopy with
+	// the most-active branches from the most-recent prior session of
+	// any agent type. Best-effort — a missing prior session
+	// (errPrimingNoPriorSession) is expected on day-zero and logged
+	// at debug, not warn. The call is synchronous because it's one
+	// query + one tx (~ms) and shouldn't outrun session open.
+	if phase1.forest != nil {
+		orch.RegisterSessionOpenHook(func(svfs *versioning.SessionVFS) {
+			sessionID := string(svfs.SessionID())
+			result, err := phase1.forest.PrimeSession(context.Background(), forestsvc.SessionPrimingRequest{
+				SessionID: sessionID,
+			})
+			if err != nil {
+				slog.Debug("forest session priming skipped",
+					"session_id", sessionID,
+					"err", err.Error(),
+				)
+				return
+			}
+			if result.BranchesCopied > 0 {
+				slog.Info("forest session primed",
+					"session_id", sessionID,
+					"source_session", result.SourceSessionID,
+					"branches", result.BranchesCopied,
+					"canopy_key", result.CanopyKey,
+				)
+			}
+		})
+	}
 
 	// Stage 5 TUI state-resync consumer: subscribe to the session-
 	// open resync topic so the chat / status surfaces can rebuild

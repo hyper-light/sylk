@@ -3,9 +3,13 @@ package handoff
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/adalundhe/sylk/core/claims"
 )
 
 // AgentCreator creates a new agent instance. Implementations are closures
@@ -108,6 +112,9 @@ func (a *FactorySessionAdapter) CreateSession(ctx context.Context, cfg SessionCo
 }
 
 // TransferContext injects the prepared context into the pending agent.
+// Board-first: if the agent implements HandoffBoardInjectable and the
+// transfer carries session metadata, attempt injection from the claims
+// board before falling through to PreparedContext.
 func (a *FactorySessionAdapter) TransferContext(ctx context.Context, sessionID string, transfer *ContextTransfer) error {
 	val, ok := a.pendingAgents.Load(sessionID)
 	if !ok {
@@ -115,6 +122,22 @@ func (a *FactorySessionAdapter) TransferContext(ctx context.Context, sessionID s
 	}
 	agent := val.(HandoffableAgent)
 
+	// Board-first injection path.
+	if boardInjectable, ok := agent.(HandoffBoardInjectable); ok {
+		if sid := transfer.Metadata["session_id"]; sid != "" {
+			if board := claims.DefaultSessionBoardRegistry().Lookup(sid); board != nil {
+				claimIDsStr := transfer.Metadata["active_claim_ids"]
+				claimIDs := strings.Split(claimIDsStr, ",")
+				if err := boardInjectable.InjectFromBoard(board, claimIDs); err == nil {
+					return nil // Board injection succeeded.
+				} else {
+					slog.Warn("handoff_board_injection_failed", "error", err.Error())
+				}
+			}
+		}
+	}
+
+	// Fall through to PreparedContext injection.
 	injectable, ok := agent.(HandoffInjectable)
 	if !ok {
 		// Agent doesn't accept context injection — not an error.

@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/google/uuid"
 )
 
@@ -52,6 +53,11 @@ type Session struct {
 	currentDAGID string
 	currentPhase string
 	progress     float64
+
+	// Claims board — the session's root board. All user prompts,
+	// agent responses, and cross-agent interactions are actions and
+	// testaments on this board.
+	claimsBoard *claims.ClaimsBoard
 
 	// Closed flag
 	closed atomic.Bool
@@ -122,6 +128,18 @@ func NewSession(cfg Config) *Session {
 // ID returns the unique identifier for this session
 func (s *Session) ID() string {
 	return s.id
+}
+
+// ClaimsBoard returns the session's root claims board (may be nil if
+// the session was created without claims infrastructure).
+func (s *Session) ClaimsBoard() *claims.ClaimsBoard {
+	return s.claimsBoard
+}
+
+// SetClaimsBoard sets the session's root claims board. Called during
+// session creation when the board is wired.
+func (s *Session) SetClaimsBoard(board *claims.ClaimsBoard) {
+	s.claimsBoard = board
 }
 
 // Name returns the human-readable name

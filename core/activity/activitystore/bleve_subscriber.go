@@ -2,6 +2,7 @@ package activitystore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -77,6 +78,7 @@ func (b *BleveSubscriber) Receive(_ context.Context, a activity.AgentActivity) {
 		"timestamp":               a.Timestamp.Unix(),
 		"confidence":              string(a.Confidence),
 	}
+	enrichClaimsFields(doc, a)
 	if err := b.index.Index(string(a.ID), doc); err == nil {
 		b.indexed.Add(1)
 	}
@@ -135,12 +137,28 @@ func activityIndexMapping() mapping.IndexMapping {
 		"subject_target_artifact",
 		"subject_domain",
 		"confidence",
+		"entity_type",
+		"claim_id",
+		"testament_id",
+		"artifact_kind",
+		"claim_action_type",
+		"validation_type",
+		"board_phase",
 	} {
 		f := bleve.NewKeywordFieldMapping()
 		doc.AddFieldMappingsAt(name, f)
 	}
 	// Text (tokenized) fields.
-	for _, name := range []string{"subject_path_prefix", "payload"} {
+	for _, name := range []string{
+		"subject_path_prefix",
+		"payload",
+		"claim_title",
+		"claim_description",
+		"testament_summary",
+		"validation_description",
+		"quality_bar",
+		"artifact_reference",
+	} {
 		f := bleve.NewTextFieldMapping()
 		doc.AddFieldMappingsAt(name, f)
 	}
@@ -151,6 +169,59 @@ func activityIndexMapping() mapping.IndexMapping {
 	idx.AddDocumentMapping("activity", doc)
 	idx.DefaultMapping = doc
 	return idx
+}
+
+// enrichClaimsFields extracts structured claims data from the activity
+// payload and sets named fields for faceted search. No-op for non-claims
+// activities.
+func enrichClaimsFields(doc map[string]any, a activity.AgentActivity) {
+	entityType := deriveEntityType(a.Action)
+	if entityType == "" {
+		return
+	}
+	doc["entity_type"] = entityType
+
+	var payload map[string]any
+	if err := json.Unmarshal(a.Payload, &payload); err != nil {
+		return
+	}
+	setIfPresent(doc, payload, "title", "claim_title")
+	setIfPresent(doc, payload, "description", "claim_description")
+	setIfPresent(doc, payload, "summary", "testament_summary")
+	setIfPresent(doc, payload, "action_type", "claim_action_type")
+	setIfPresent(doc, payload, "kind", "artifact_kind")
+	setIfPresent(doc, payload, "reference", "artifact_reference")
+	setIfPresent(doc, payload, "type", "validation_type")
+	setIfPresent(doc, payload, "phase", "board_phase")
+	setIfPresent(doc, payload, "status", "validation_description")
+}
+
+func deriveEntityType(kind activity.ActionKind) string {
+	switch kind {
+	case activity.ActionClaimIssued, activity.ActionClaimUpdated,
+		activity.ActionClaimAccepted, activity.ActionClaimRejected:
+		return "claim"
+	case activity.ActionTestamentSubmitted:
+		return "testament"
+	case activity.ActionClaimArtifactPublished:
+		return "artifact"
+	case activity.ActionClaimValidated:
+		return "validation"
+	case activity.ActionActionPosted:
+		return "action"
+	case activity.ActionBoardPhaseChanged, activity.ActionBoardComplete:
+		return "board"
+	default:
+		return ""
+	}
+}
+
+func setIfPresent(doc, payload map[string]any, srcKey, dstKey string) {
+	if v, ok := payload[srcKey]; ok {
+		if s, isStr := v.(string); isStr && s != "" {
+			doc[dstKey] = s
+		}
+	}
 }
 
 var _ Subscriber = (*BleveSubscriber)(nil)

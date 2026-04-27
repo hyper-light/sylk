@@ -72,10 +72,19 @@ func resolveTestamentNode(board *ClaimsBoard, testamentID string) GraphNode {
 	if !ok {
 		return GraphNode{}
 	}
-	return GraphNode{
+	node := GraphNode{
 		Testament: t,
 		Edges:     edgesFromRelations(t.Relations),
 	}
+	// Populate the parent claim so the agent sees its validations
+	// alongside the testament artifacts. The testament's Relations
+	// carry a RelationshipClaim edge to the parent claim ID.
+	if claimRel := FindRelation(t.Relations, RelationshipClaim); claimRel != nil {
+		if c, ok := board.CloneClaim(claimRel.Related); ok {
+			node.Claim = c
+		}
+	}
+	return node
 }
 
 func resolveValidationNode(board *ClaimsBoard, claimID, validationID string) GraphNode {

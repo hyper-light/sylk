@@ -251,7 +251,7 @@ func (o *Orchestrator) publishTaskDispatchPipelineState(dispatch *taskDispatchCo
 		if pipelineProtocolEligible(dispatch) {
 			workerType = agentshared.PipelineAgentInspector
 		}
-		publishTaskPipelineState(o.bus, o.config.AgentID, dispatch.pipelineTaskID, dispatch.pipelineTaskSlug, pipelineStatus, workerType)
+		publishTaskPipelineState(o.bus, o.config.AgentID, dispatch.pipelineTaskID, dispatch.pipelineTaskSlug, dispatch.coordinationTask, pipelineStatus, workerType)
 	}
 	return string(pipelineStatus)
 }

@@ -16,7 +16,7 @@ func contextSkillBoard(t *testing.T) *ClaimsBoard {
 }
 
 func newContextSkillBoardProvider(board *ClaimsBoard) BoardProvider {
-	return func() *ClaimsBoard { return board }
+	return func() (*ClaimsBoard, error) { return board, nil }
 }
 
 func invokeSkill(t *testing.T, s interface {

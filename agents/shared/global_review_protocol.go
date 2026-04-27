@@ -45,10 +45,10 @@ const (
 )
 
 // GlobalReviewAuditPhase* are the phases the global inspector can enter that
-// block peer → inspector challenges. Mirrors PipelineAuditPhase* on the
-// pipeline side: once the inspector has called finalize_global_review (which
-// dispatches the tester-backed closure challenge), peers cannot bounce the
-// inspector back into mid-cycle audit work. The lock is one-way — the
+// block peer -> inspector challenges. Once the inspector has called
+// finalize_global_review (which dispatches the tester-backed closure
+// challenge), peers cannot bounce the inspector back into mid-cycle audit
+// work. The lock is one-way -- the
 // inspector can still issue challenges to peers during this window.
 const (
 	GlobalReviewAuditPhaseFinalizing = "finalize_global_review"
@@ -159,8 +159,7 @@ type GlobalReviewTurnAction struct {
 	CreatesChallenge   bool
 	// AuditLockPhase, when non-empty on an inspector-owned challenge,
 	// engages the review-phase lock via nextGlobalReviewAuditLock. Only
-	// finalize_global_review currently sets this — mirrors the pipeline's
-	// PipelineTurnAction.AuditLockPhase.
+	// finalize_global_review currently sets this.
 	AuditLockPhase     string
 	Reason             string
 	Request            string
@@ -194,11 +193,10 @@ type GlobalReviewState struct {
 	baseMetadata   map[string]any
 
 	// subscribersMu / subscribers form the in-process projection
-	// subscription layer. Mirrors PipelineProtocolState: every mutation
-	// notifies subscribers with the fresh Projection. Consumers that
-	// care about state changes (UI bridge, validators, telemetry)
-	// observe the projection rather than re-deriving it from event
-	// streams.
+	// subscription layer. Every mutation notifies subscribers with the
+	// fresh Projection. Consumers that care about state changes (UI
+	// bridge, validators, telemetry) observe the projection rather than
+	// re-deriving it from event streams.
 	subscribersMu   sync.Mutex
 	subscribers     []globalReviewProjectionSubscription
 	subscriberIDSeq int64

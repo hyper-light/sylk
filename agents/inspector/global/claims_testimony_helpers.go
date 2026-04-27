@@ -16,13 +16,27 @@ import (
 )
 
 // globalInspectorBoard resolves the claims board for the session.
-func (gi *GlobalInspector) globalInspectorBoard() *claims.ClaimsBoard {
-	return claims.DefaultSessionBoardRegistry().Lookup(gi.config.SessionID)
+func (gi *GlobalInspector) globalInspectorBoard() (*claims.ClaimsBoard, error) {
+	sid := gi.config.SessionID
+	if sid == "" {
+		return nil, fmt.Errorf("inspector-global: no session ID configured")
+	}
+	board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+	if board == nil {
+		return nil, fmt.Errorf("inspector-global: session %q has no claims board registered", sid)
+	}
+	return board, nil
+}
+
+// globalInspectorBoardOrNil returns the board or nil (for best-effort callers).
+func (gi *GlobalInspector) globalInspectorBoardOrNil() *claims.ClaimsBoard {
+	board, _ := gi.globalInspectorBoard()
+	return board
 }
 
 // globalInspectorPostClaim posts a claim async via scope. Best-effort.
 func (gi *GlobalInspector) globalInspectorPostClaim(ctx context.Context, action claims.Action, claim claims.Claim) {
-	board := gi.globalInspectorBoard()
+	board := gi.globalInspectorBoardOrNil()
 	if board == nil {
 		return
 	}
@@ -82,7 +96,7 @@ func globalInspectorValidation(vtype claims.ValidationType, required bool, descr
 
 // globalInspectorSubmitTestament submits a testament async via scope. Best-effort.
 func (gi *GlobalInspector) globalInspectorSubmitTestament(ctx context.Context, testament claims.Testament) {
-	board := gi.globalInspectorBoard()
+	board := gi.globalInspectorBoardOrNil()
 	if board == nil {
 		return
 	}
@@ -150,12 +164,12 @@ func (gi *GlobalInspector) processClaimsEntry(ctx context.Context, entry *claims
 	}
 
 	acc := claims.NewTestamentAccumulator("inspector", gi.config.SessionID)
-	defer acc.Flush(ctx, gi.globalInspectorBoard(), nil)
+	defer acc.Flush(ctx, gi.globalInspectorBoardOrNil(), nil)
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
 
 	userMessage := agentShared.ComposeClaimsEntryPrompt(entry)
-	board := gi.globalInspectorBoard()
+	board := gi.globalInspectorBoardOrNil()
 	userMessage = claims.PrependBoardPreamble(userMessage, board, "inspector")
 	gi.prepareSkillsForInput(userMessage)
 

@@ -65,8 +65,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		Keywords:         []string{"architect", "plan", "precedent", "constraint", "outcome"},
 		QueryDescription: "Architectural plan, decomposition, or design direction to ground in precedent",
 		Families: []forest.TreeFamily{
-			forest.TreeFamilyDecision,
-			forest.TreeFamilyCapability,
+			forest.TreeFamilyIntent,
 			forest.TreeFamilyOutcome,
 			forest.TreeFamilyEvidence,
 			forest.TreeFamilyConstraint,
@@ -97,7 +96,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyEvidence,
 			forest.TreeFamilyOutcome,
-			forest.TreeFamilyCapability,
+			forest.TreeFamilyIntent,
 		},
 		DefaultLimit:           6,
 		IncludeCounterEvidence: true,
@@ -109,7 +108,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		Keywords:         []string{"academic", "contradiction", "counterevidence", "constraint"},
 		QueryDescription: "Claim or proposal that needs contradiction and counterevidence review",
 		Families: []forest.TreeFamily{
-			forest.TreeFamilyConflict,
+			forest.TreeFamilyAntiPattern,
 			forest.TreeFamilyEvidence,
 			forest.TreeFamilyConstraint,
 		},
@@ -124,8 +123,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		QueryDescription: "Code problem, implementation pattern, or touched-file concern to ground in repo precedent",
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyEvidence,
-			forest.TreeFamilyDecision,
-			forest.TreeFamilyCapability,
+			forest.TreeFamilyIntent,
 		},
 		DefaultLimit:           6,
 		IncludeCounterEvidence: true,
@@ -137,7 +135,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		Keywords:         []string{"librarian", "risk", "implementation", "failure", "conflict"},
 		QueryDescription: "Implementation area that may have hidden repo-local risks or conflict precedent",
 		Families: []forest.TreeFamily{
-			forest.TreeFamilyConflict,
+			forest.TreeFamilyAntiPattern,
 			forest.TreeFamilyOutcome,
 			forest.TreeFamilyConstraint,
 		},
@@ -151,9 +149,9 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		Keywords:         []string{"archivalist", "decision", "precedent", "history", "outcome"},
 		QueryDescription: "Problem or decision area that should be grounded in prior historical choices",
 		Families: []forest.TreeFamily{
-			forest.TreeFamilyDecision,
+			forest.TreeFamilyIntent,
 			forest.TreeFamilyOutcome,
-			forest.TreeFamilyPreference,
+			forest.TreeFamilyConstraint,
 		},
 		DefaultLimit:           6,
 		IncludeCounterEvidence: true,
@@ -166,8 +164,8 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		QueryDescription: "Failure mode, repeated issue, or risky area to compare against prior outcomes",
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyOutcome,
-			forest.TreeFamilyConflict,
-			forest.TreeFamilyDecision,
+			forest.TreeFamilyAntiPattern,
+			forest.TreeFamilyIntent,
 		},
 		DefaultLimit:           6,
 		IncludeCounterEvidence: true,
@@ -180,7 +178,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		QueryDescription: "User request or confusion point that needs longitudinal intent context",
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyIntent,
-			forest.TreeFamilyPreference,
+			forest.TreeFamilyConstraint,
 			forest.TreeFamilyOutcome,
 		},
 		DefaultLimit:           5,
@@ -194,7 +192,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		QueryDescription: "Concept, tutorial need, or explanation path that should use prior successful teaching branches",
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyEvidence,
-			forest.TreeFamilyCapability,
+			forest.TreeFamilyIntent,
 			forest.TreeFamilyOutcome,
 		},
 		DefaultLimit:           5,
@@ -207,10 +205,9 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		Keywords:         []string{"orchestrator", "coordination", "precedent", "handoff", "workflow"},
 		QueryDescription: "Coordination problem, workflow state, or multi-agent objective to ground in precedent",
 		Families: []forest.TreeFamily{
-			forest.TreeFamilyCapability,
-			forest.TreeFamilyDecision,
+			forest.TreeFamilyIntent,
 			forest.TreeFamilyOutcome,
-			forest.TreeFamilyConflict,
+			forest.TreeFamilyAntiPattern,
 		},
 		DefaultLimit:           6,
 		IncludeCounterEvidence: true,
@@ -231,8 +228,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		Keywords:         []string{"engineer", "implementation", "branch", "constraint", "capability"},
 		QueryDescription: "Implementation task or coding problem to ground in branch precedent",
 		Families: []forest.TreeFamily{
-			forest.TreeFamilyDecision,
-			forest.TreeFamilyCapability,
+			forest.TreeFamilyIntent,
 			forest.TreeFamilyEvidence,
 			forest.TreeFamilyConstraint,
 			forest.TreeFamilyOutcome,
@@ -249,7 +245,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		QueryDescription: "Implementation area that may have hidden regression or failure precedent",
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyOutcome,
-			forest.TreeFamilyConflict,
+			forest.TreeFamilyAntiPattern,
 			forest.TreeFamilyConstraint,
 		},
 		DefaultLimit:           6,
@@ -262,7 +258,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		Keywords:         []string{"designer", "preference", "intent", "style", "outcome"},
 		QueryDescription: "Design problem or UX direction to ground in user preference precedent",
 		Families: []forest.TreeFamily{
-			forest.TreeFamilyPreference,
+			forest.TreeFamilyConstraint,
 			forest.TreeFamilyIntent,
 			forest.TreeFamilyOutcome,
 		},
@@ -286,9 +282,9 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		QueryDescription: "Action or plan that should be checked for scope, policy, or authority risk",
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyConstraint,
-			forest.TreeFamilyConflict,
+			forest.TreeFamilyAntiPattern,
 			forest.TreeFamilyOutcome,
-			forest.TreeFamilyDecision,
+			forest.TreeFamilyIntent,
 		},
 		DefaultLimit:           6,
 		IncludeCounterEvidence: true,
@@ -300,7 +296,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		Keywords:         []string{"guardian", "approval", "precedent", "governance", "decision"},
 		QueryDescription: "Governance or approval decision that should be checked against precedent",
 		Families: []forest.TreeFamily{
-			forest.TreeFamilyDecision,
+			forest.TreeFamilyIntent,
 			forest.TreeFamilyOutcome,
 			forest.TreeFamilyConstraint,
 		},
@@ -315,10 +311,9 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		QueryDescription: "Work in progress that the scribe should capture with the highest downstream value",
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyIntent,
-			forest.TreeFamilyDecision,
 			forest.TreeFamilyOutcome,
-			forest.TreeFamilyConflict,
-			forest.TreeFamilyPreference,
+			forest.TreeFamilyAntiPattern,
+			forest.TreeFamilyConstraint,
 		},
 		DefaultLimit:           6,
 		IncludeCounterEvidence: true,
@@ -330,10 +325,9 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		Keywords:         []string{"scribe", "handoff", "replay", "context", "preserve"},
 		QueryDescription: "Workstream or handoff target that needs compact high-signal forest context",
 		Families: []forest.TreeFamily{
-			forest.TreeFamilyDecision,
+			forest.TreeFamilyIntent,
 			forest.TreeFamilyOutcome,
-			forest.TreeFamilyPreference,
-			forest.TreeFamilyCapability,
+			forest.TreeFamilyConstraint,
 		},
 		DefaultLimit:           6,
 		IncludeCounterEvidence: true,
@@ -346,7 +340,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		QueryDescription: "Inspection target, suspected regression, or review concern to ground in precedent",
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyOutcome,
-			forest.TreeFamilyConflict,
+			forest.TreeFamilyAntiPattern,
 			forest.TreeFamilyEvidence,
 		},
 		DefaultLimit:           6,
@@ -361,7 +355,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyConstraint,
 			forest.TreeFamilyOutcome,
-			forest.TreeFamilyDecision,
+			forest.TreeFamilyIntent,
 			forest.TreeFamilyEvidence,
 		},
 		DefaultLimit:           6,
@@ -375,7 +369,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		QueryDescription: "Implementation or behavior that needs a strong testing target set",
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyConstraint,
-			forest.TreeFamilyCapability,
+			forest.TreeFamilyIntent,
 			forest.TreeFamilyOutcome,
 			forest.TreeFamilyEvidence,
 		},
@@ -390,7 +384,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		QueryDescription: "Failure mode or risky behavior that should be checked against clustered precedent",
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyOutcome,
-			forest.TreeFamilyConflict,
+			forest.TreeFamilyAntiPattern,
 			forest.TreeFamilyEvidence,
 		},
 		DefaultLimit:           6,

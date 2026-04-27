@@ -10,6 +10,8 @@ const (
 	InterAgentToolEventKindChallenge = "challenge"
 	InterAgentToolEventKindApproval  = "approval"
 	InterAgentToolEventKindStore     = "store"
+	InterAgentToolEventKindClaim     = "claim"
+	InterAgentToolEventKindTestament = "testament"
 
 	InterAgentToolEventStatusPending = "pending"
 	InterAgentToolEventStatusDone    = "done"
@@ -121,17 +123,21 @@ func interAgentToolEventPublishable(meta *InterAgentToolEvent, phase ToolCallPha
 	switch phase {
 	case ToolCallStart:
 		switch meta.Kind {
-		case InterAgentToolEventKindConsult, InterAgentToolEventKindChallenge, InterAgentToolEventKindApproval:
+		case InterAgentToolEventKindConsult, InterAgentToolEventKindChallenge, InterAgentToolEventKindApproval,
+			InterAgentToolEventKindStore, InterAgentToolEventKindClaim:
 			return len(meta.AgentTypes) > 0
-		case InterAgentToolEventKindStore:
-			return len(meta.AgentTypes) > 0
+		case InterAgentToolEventKindTestament:
+			return true // testament agent identity comes from the calling agent, not args
 		default:
 			return false
 		}
 	case ToolCallComplete:
 		switch meta.Kind {
-		case InterAgentToolEventKindConsult, InterAgentToolEventKindChallenge, InterAgentToolEventKindApproval, InterAgentToolEventKindStore:
+		case InterAgentToolEventKindConsult, InterAgentToolEventKindChallenge, InterAgentToolEventKindApproval,
+			InterAgentToolEventKindStore, InterAgentToolEventKindClaim:
 			return len(meta.AgentTypes) > 0
+		case InterAgentToolEventKindTestament:
+			return true
 		default:
 			return false
 		}
@@ -168,6 +174,8 @@ func DeriveInterAgentToolEvent(
 			return deriveInterAgentChallengeStart(toolName, args)
 		}
 		return deriveInterAgentChallengeCompletion(toolName, args, out, success, errorMsg)
+	case isClaimsActionToolName(toolName):
+		return deriveClaimsActionEvent(toolName, args, out, phase, success, errorMsg)
 	default:
 		return nil
 	}
@@ -380,6 +388,9 @@ func isInterAgentConsultToolName(toolName string, args map[string]any) bool {
 	if strings.HasPrefix(toolName, "consult_") {
 		return true
 	}
+	if strings.Contains(toolName, "_consult") {
+		return true
+	}
 	switch toolName {
 	case "consult", "request_architect_research", "validate_approach":
 		return true
@@ -394,7 +405,8 @@ func isInterAgentChallengeToolName(toolName string) bool {
 
 func isNestedInterAgentKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case InterAgentToolEventKindConsult, InterAgentToolEventKindChallenge, InterAgentToolEventKindApproval, InterAgentToolEventKindStore:
+	case InterAgentToolEventKindConsult, InterAgentToolEventKindChallenge, InterAgentToolEventKindApproval, InterAgentToolEventKindStore,
+		InterAgentToolEventKindClaim, InterAgentToolEventKindTestament:
 		return true
 	default:
 		return false
@@ -873,4 +885,91 @@ func firstNonEmptyInline(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// isClaimsActionToolName returns true for claims board skill tool names.
+func isClaimsActionToolName(toolName string) bool {
+	switch toolName {
+	case "post_action", "submit_testaments":
+		return true
+	default:
+		return false
+	}
+}
+
+// deriveClaimsActionEvent classifies post_action and submit_testaments as
+// inter-agent tree rows so they render in the chat's tool call tree.
+func deriveClaimsActionEvent(
+	toolName string,
+	args, out map[string]any,
+	phase ToolCallPhase,
+	success bool,
+	errorMsg string,
+) *InterAgentToolEvent {
+	switch toolName {
+	case "post_action":
+		return derivePostActionEvent(args, out, phase, success, errorMsg)
+	case "submit_testaments":
+		return deriveSubmitTestamentsEvent(args, out, phase, success, errorMsg)
+	default:
+		return nil
+	}
+}
+
+func derivePostActionEvent(args, out map[string]any, phase ToolCallPhase, success bool, errorMsg string) *InterAgentToolEvent {
+	subject := firstNonEmptyInline(stringFromAnyMap(args, "subject"), stringFromAnyMap(args, "target"))
+	title := firstNonEmptyInline(stringFromAnyMap(args, "title"), stringFromAnyMap(args, "description"))
+	status := InterAgentToolEventStatusPending
+	if phase == ToolCallComplete {
+		status = InterAgentToolEventStatusDone
+		if !success || strings.TrimSpace(errorMsg) != "" {
+			status = InterAgentToolEventStatusFailed
+		}
+	}
+	targets := []string{subject}
+	if subject == "" {
+		targets = nil
+	}
+	return &InterAgentToolEvent{
+		Kind:       InterAgentToolEventKindClaim,
+		AgentTypes: normalizeAgentTypeList(targets),
+		Summary:    normalizeInlineString(title),
+		ThreadKey:  "claim:" + firstNonEmptyInline(stringFromAnyMap(out, "action_id"), stringFromAnyMap(args, "title")),
+		Status:     status,
+	}
+}
+
+func deriveSubmitTestamentsEvent(args, out map[string]any, phase ToolCallPhase, success bool, errorMsg string) *InterAgentToolEvent {
+	// testaments_json is the skill's single arg; extract summary from first entry.
+	summary := extractTestamentSummaryFromArgs(args)
+	status := InterAgentToolEventStatusPending
+	if phase == ToolCallComplete {
+		status = InterAgentToolEventStatusDone
+		if !success || strings.TrimSpace(errorMsg) != "" {
+			status = InterAgentToolEventStatusFailed
+		}
+	}
+	return &InterAgentToolEvent{
+		Kind:      InterAgentToolEventKindTestament,
+		Summary:   normalizeInlineString(summary),
+		ThreadKey: "testament:" + firstNonEmptyInline(stringFromAnyMap(out, "testament_id"), summary),
+		Status:    status,
+	}
+}
+
+// extractTestamentSummaryFromArgs parses the testaments_json arg to
+// extract the first testament's summary for display.
+func extractTestamentSummaryFromArgs(args map[string]any) string {
+	raw := stringFromAnyMap(args, "testaments_json")
+	if raw == "" {
+		return ""
+	}
+	var testaments []map[string]any
+	if err := json.Unmarshal([]byte(raw), &testaments); err != nil || len(testaments) == 0 {
+		return ""
+	}
+	return firstNonEmptyInline(
+		stringFromAnyMap(testaments[0], "summary"),
+		stringFromAnyMap(testaments[0], "confidence"),
+	)
 }

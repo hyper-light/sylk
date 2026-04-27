@@ -3,6 +3,7 @@ package lenses
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -199,6 +200,19 @@ type AmbientQuery struct {
 
 	// MaxConsults caps inbound consults. Default 5.
 	MaxConsults int
+
+	// BoardSource, when non-nil, provides the claims board projection
+	// directly instead of reconstructing it from Fabric activities.
+	// This gives a precise digest rather than an approximation.
+	BoardSource BoardProjectionSource
+}
+
+// BoardProjectionSource provides claims board counts for the ambient
+// digest. The lenses package cannot import core/claims directly, so
+// this interface is satisfied by a thin adapter at the wiring layer.
+type BoardProjectionSource interface {
+	ClaimCounts() (accepted, total int)
+	Phase() string
 }
 
 func (q *AmbientQuery) normalize() {
@@ -263,6 +277,15 @@ type ClaimsBoardDigest struct {
 
 	// CompletedClaims shows recently accepted claims.
 	CompletedClaims []activity.AgentActivity
+
+	// RejectedClaims shows recently rejected claims.
+	RejectedClaims []activity.AgentActivity
+
+	// BoardPhase is the current board phase (from projection).
+	BoardPhase string
+
+	// ValidationProgress summarizes validation status, e.g. "5/8 passed".
+	ValidationProgress string
 
 	// BoardProgress is a compact summary string: "8/12 claims testified,
 	// 2 accepted, 1 rejected"
@@ -386,7 +409,9 @@ func (d ClaimsBoardDigest) isEmpty() bool {
 	return len(d.MyClaims) == 0 &&
 		len(d.PeerClaimsInProgress) == 0 &&
 		len(d.RecentTestaments) == 0 &&
-		len(d.CompletedClaims) == 0
+		len(d.CompletedClaims) == 0 &&
+		len(d.RejectedClaims) == 0 &&
+		d.BoardPhase == ""
 }
 
 func computeClaimsBoardDigest(ctx context.Context, src activity.Source, q AmbientQuery, since time.Time) (ClaimsBoardDigest, error) {
@@ -445,12 +470,36 @@ func computeClaimsBoardDigest(ctx context.Context, src activity.Source, q Ambien
 	}
 	d.CompletedClaims = completed
 
+	// Rejected claims. Best-effort — log failures but don't fail the digest.
+	rejected, rejErr := src.FilterActivities(ctx, activity.QueryFilter{
+		SessionID:   q.SessionID,
+		ActionKinds: []activity.ActionKind{activity.ActionClaimRejected},
+		Since:       since,
+		Limit:       3,
+	})
+	if rejErr != nil {
+		slog.Warn("ambient_rejected_claims_query_failed", "error", rejErr.Error())
+	} else {
+		d.RejectedClaims = rejected
+	}
+
 	// Board progress summary.
 	total := len(myClaims) + len(peerClaims)
 	testified := len(testaments)
 	accepted := len(completed)
-	if total > 0 || testified > 0 || accepted > 0 {
-		d.BoardProgress = fmt.Sprintf("%d claims visible, %d testaments, %d accepted", total, testified, accepted)
+	rejectedCount := len(d.RejectedClaims)
+	if total > 0 || testified > 0 || accepted > 0 || rejectedCount > 0 {
+		d.BoardProgress = fmt.Sprintf("%d claims visible, %d testaments, %d accepted, %d rejected",
+			total, testified, accepted, rejectedCount)
+	}
+
+	// Enrich from board projection when available.
+	if q.BoardSource != nil {
+		d.BoardPhase = q.BoardSource.Phase()
+		ac, tc := q.BoardSource.ClaimCounts()
+		if tc > 0 {
+			d.ValidationProgress = fmt.Sprintf("%d/%d accepted", ac, tc)
+		}
 	}
 
 	// Sort by recency.
@@ -458,6 +507,7 @@ func computeClaimsBoardDigest(ctx context.Context, src activity.Source, q Ambien
 	sortByRecencyDesc(d.PeerClaimsInProgress)
 	sortByRecencyDesc(d.RecentTestaments)
 	sortByRecencyDesc(d.CompletedClaims)
+	sortByRecencyDesc(d.RejectedClaims)
 
 	return d, nil
 }

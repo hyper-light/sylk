@@ -7,6 +7,18 @@ import (
 	"github.com/adalundhe/sylk/core/versioning"
 )
 
+// PipelineCommitter is the interface for committing or rolling back
+// pipeline VFS work. The inspector wires a SessionVFS-backed
+// implementation; tests use a noop stub.
+type PipelineCommitter interface {
+	// MergePipelineIntoGreen merges the pipeline's accumulated modifications
+	// into the session's global ("green") VFS.
+	MergePipelineIntoGreen(ctx context.Context, pipelineID string, cert versioning.PipelineInspectorCertificate) (versioning.MergePipelineResult, error)
+
+	// Rollback discards a pipeline draft without merging it. Idempotent.
+	Rollback(ctx context.Context, pipelineID string) error
+}
+
 // SessionVFSPipelineCommitterBackend is the structural subset of
 // *versioning.SessionVFS used by NewSessionVFSPipelineCommitter. Defined as
 // an interface so the committer can be unit-tested without a full session.

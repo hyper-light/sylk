@@ -21,11 +21,6 @@ func engineerVisibleSkillNames() []string {
 		"ask_user_clarification",
 		// Phase 2.K / GT-4 + GI-5: collapsed into dependency(action=…).
 		"dependency",
-		// challenge_agent / handoff_next / validate_work /
-		// process_validation collapsed into pipeline_protocol(action=…).
-		// The per-verb skills stay in the registry for internal state-
-		// machine + WAL callers but are no longer LLM-visible.
-		"pipeline_protocol",
 		"audit",
 		"bash",
 		"report_confidence",
@@ -46,10 +41,6 @@ func engineerMutatingSkillNames() []string {
 		"bash",
 		"dependency",
 		"format",
-		"challenge_agent",
-		"handoff_next",
-		"validate_work",
-		"process_validation",
 		"report_confidence",
 		"reroute_request",
 		// Claims skills: mutating operations need LocalWorker policy.

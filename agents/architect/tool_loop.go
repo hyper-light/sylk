@@ -112,7 +112,8 @@ func (a *Architect) executeToolLoop(
 		}
 
 		// ── STEERING CHECKPOINT ──
-		sc := shared.DrainAndCheckpoint(ledger, req, turn, stage, nil)
+		sc := shared.DrainAndCheckpoint(ledger, req, turn, stage, nil,
+			shared.WithBoardProvider(func() *claims.ClaimsBoard { return a.architectBoard() }, a.id))
 		if sc.Rollback != nil || sc.EditReplay != nil {
 			cp := sc.Rollback
 			if cp == nil {

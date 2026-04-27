@@ -14,7 +14,6 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/activity/activitystore"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/claims"
@@ -90,12 +89,8 @@ type Orchestrator struct {
 	journal        *OrchestratorJournal
 	bufferRegistry *BufferRegistry
 	dagBridge      *DAGBridge
-	coordination   *CoordinationService
-	// decisionManifest tracks cross-pipeline typed decisions (test framework
-	// choice, build backend, etc.) so parallel pipelines can see each other's
-	// in-flight commitments before producing incompatible work.
-	decisionManifest *DecisionManifestStore
-	scope            *concurrency.GoroutineScope
+	coordination *CoordinationService
+	scope        *concurrency.GoroutineScope
 	claimsInbox      *claims.ClaimsInbox
 
 	// Pipeline subscriptions
@@ -403,29 +398,6 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 	})
 	o.coordination = coordSvc
 
-	// Decision Manifest store reuses the orchestrator's BunSQLite handle so
-	// it inherits the WAL + busy_timeout + writeMu policy. Migration runs
-	// idempotently (CREATE TABLE IF NOT EXISTS) so re-init is safe.
-	manifestStore, err := NewDecisionManifestStore(store.db)
-	if err != nil {
-		journal.Close()
-		store.Close()
-		return fmt.Errorf("orchestrator: open decision manifest: %w", err)
-	}
-	if err := manifestStore.Migrate(); err != nil {
-		journal.Close()
-		store.Close()
-		return fmt.Errorf("orchestrator: migrate decision manifest: %w", err)
-	}
-	o.decisionManifest = manifestStore
-
-	// Phase 3 refactor: subscribe the manifest store to fabric-native
-	// ActionDecisionDeclared events. Pipeline agents' declare_decision
-	// skill now emits directly via AutoPublishDecision (no bus RPC);
-	// this subscriber persists the resulting activities into the
-	// canonical SQL table.
-	activitystore.SubscribeToDefault(NewDecisionManifestFabricSubscriber(manifestStore))
-
 	// DAG Bridge
 	o.dagBridge = NewDAGBridge(cfg.DAGConfig, DAGBridgeDeps{
 		Store:        store,
@@ -466,10 +438,14 @@ func (o *Orchestrator) SetProvider(provider OrchestratorProvider) {
 	if provider != nil && o.running && o.llmCtx == nil && o.eventCh != nil {
 		o.llmCtx, o.llmCancel = context.WithCancel(context.Background())
 		o.llmWg.Add(1)
-		go func() {
+		if err := o.scope.Go("orchestrator_llm_loop_deferred", 0, func(_ context.Context) error {
 			defer o.llmWg.Done()
 			o.runLLMLoop(o.llmCtx)
-		}()
+			return nil
+		}); err != nil {
+			o.llmWg.Done()
+			slog.Error("orchestrator_deferred_llm_loop_failed", "error", err.Error())
+		}
 		if o.bootGate != nil {
 			o.bootGate.SignalReady()
 		}
@@ -905,7 +881,7 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 		AgentID:      o.config.AgentID,
 		SessionID:    o.SessionID(),
 		Bus:          o.bus,
-		Board:        o.orchestratorBoard(),
+		Board:        o.orchestratorBoardOrNil(),
 		Scope:        o.scope,
 		ProcessEntry: o.processClaimsEntry,
 	}); inbox != nil {
@@ -1204,9 +1180,6 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 			if handled, err := o.handleCoordinationAction(o.runCtx, action); handled {
 				return err
 			}
-			if handled, err := o.handleDecisionManifestAction(o.runCtx, action); handled {
-				return err
-			}
 			o.steering.HandleAction(action)
 		}
 		return nil
@@ -1252,7 +1225,7 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	// TestamentAccumulator: collects per-request observations, flushed as one
 	// composite testament when handleBusRequest exits.
 	acc := claims.NewTestamentAccumulator("orchestrator", fwd.SessionID)
-	defer acc.Flush(ctx, o.orchestratorBoard(), o.orchestratorScope())
+	defer acc.Flush(ctx, o.orchestratorBoardOrNil(), o.orchestratorScope())
 	acc.Note("Request received from " + fwd.SourceAgentID)
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 
@@ -2631,7 +2604,7 @@ func (o *Orchestrator) handlePipelineUpdate(msg *guide.Message) error {
 	}
 	if update.TaskID != "" {
 		if status := pipelineTaskStateForUpdate(update.Status, stage); status != "" {
-			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", status, update.AgentType)
+			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", "", status, update.AgentType)
 		}
 	}
 

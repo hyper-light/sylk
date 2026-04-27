@@ -411,12 +411,18 @@ func parseForestFamilies(values []string) []forest.TreeFamily {
 	}
 	families := make([]forest.TreeFamily, 0, len(values))
 	for _, value := range values {
+		// Issue #11 Phase 3: accept both canonical (intent / constraint
+		// / evidence / outcome / antipattern) and legacy values from
+		// any caller that hasn't migrated. The forest's normalizeQuery
+		// boundary canonicalizes deprecated values into their merged
+		// targets so this parser doesn't have to translate.
 		switch forest.TreeFamily(value) {
 		case forest.TreeFamilyIntent,
 			forest.TreeFamilyConstraint,
 			forest.TreeFamilyEvidence,
-			forest.TreeFamilyDecision,
 			forest.TreeFamilyOutcome,
+			forest.TreeFamilyAntiPattern,
+			forest.TreeFamilyDecision,
 			forest.TreeFamilyPreference,
 			forest.TreeFamilyCapability,
 			forest.TreeFamilyOpportunity,
@@ -466,14 +472,15 @@ func resolveForestSkillHorizon(raw, sessionID, taskID string) (forest.CanopyHori
 }
 
 func recallRecentFamilies() []forest.TreeFamily {
+	// Post-Phase-3 canonical taxonomy: Intent absorbs Decision +
+	// Capability + Opportunity; Constraint absorbs Preference;
+	// AntiPattern absorbs Conflict.
 	return []forest.TreeFamily{
 		forest.TreeFamilyIntent,
-		forest.TreeFamilyDecision,
-		forest.TreeFamilyPreference,
 		forest.TreeFamilyConstraint,
 		forest.TreeFamilyEvidence,
 		forest.TreeFamilyOutcome,
-		forest.TreeFamilyConflict,
+		forest.TreeFamilyAntiPattern,
 	}
 }
 
@@ -570,22 +577,14 @@ func recallFamilyLabel(family forest.TreeFamily) string {
 	switch family {
 	case forest.TreeFamilyIntent:
 		return "Intent"
-	case forest.TreeFamilyDecision:
-		return "Decision"
-	case forest.TreeFamilyPreference:
-		return "Preference"
 	case forest.TreeFamilyConstraint:
 		return "Constraint"
 	case forest.TreeFamilyEvidence:
 		return "Evidence"
 	case forest.TreeFamilyOutcome:
 		return "Outcome"
-	case forest.TreeFamilyConflict:
-		return "Conflict"
-	case forest.TreeFamilyCapability:
-		return "Capability"
-	case forest.TreeFamilyOpportunity:
-		return "Opportunity"
+	case forest.TreeFamilyAntiPattern:
+		return "AntiPattern"
 	default:
 		return ""
 	}

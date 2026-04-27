@@ -61,7 +61,8 @@ func (e *Engineer) executeToolLoopWithSurface(
 		}
 
 		// ── STEERING CHECKPOINT ──
-		sc := shared.DrainAndCheckpoint(ledger, req, turn, "executing", nil)
+		sc := shared.DrainAndCheckpoint(ledger, req, turn, "executing", nil,
+			shared.WithBoardProvider(func() *claims.ClaimsBoard { return e.engineerBoard() }, e.id))
 		if sc.Rollback != nil || sc.EditReplay != nil {
 			cp := sc.Rollback
 			if cp == nil {
@@ -106,6 +107,7 @@ func (e *Engineer) executeToolLoopWithSurface(
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
 					&agentlog.ErrorPayload{Error: fmt.Sprintf("llm: %v", err)})
 			}
+			shared.PostCorrectiveClaimFromContext(ctx, e.id, "LLM completion failed", fmt.Sprintf("engineer llm: %v", err), nil)
 			return "", fmt.Errorf("engineer llm: %w", err)
 		}
 
@@ -116,20 +118,6 @@ func (e *Engineer) executeToolLoopWithSurface(
 		shared.PublishIntermediateToolTurn(e.bus, e.channels, ctx, e.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
-			if err := shared.ValidatePipelineProtocolCompletion(ctx, "engineer"); err != nil {
-				e.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
-				req.Messages = append(req.Messages, providers.Message{
-					Role:     providers.RoleAssistant,
-					Content:  strings.TrimSpace(resp.Content),
-					Metadata: resp.ProviderMetadata,
-				})
-				req.Messages = append(req.Messages, providers.Message{
-					Role: providers.RoleUser,
-					Content: err.Error() +
-						"\nIf you need clarification from Inspector or Tester, use challenge_agent or handoff_next explicitly instead of concluding silently.",
-				})
-				continue
-			}
 			if err := shared.ValidateTaskExecutionCompletion(ctx, "engineer"); err != nil {
 				e.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
 				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -193,6 +181,7 @@ func (e *Engineer) executeToolLoopWithSurface(
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
 					&agentlog.ErrorPayload{Error: fmt.Sprintf("tool calls failed %d consecutive turns", consecutiveErrors)})
 			}
+			shared.PostCorrectiveClaimFromContext(ctx, e.id, "Consecutive tool errors", fmt.Sprintf("engineer tool calls failed %d consecutive turns", consecutiveErrors), nil)
 			return "", fmt.Errorf("engineer tool calls failed %d consecutive turns", consecutiveErrors)
 		}
 	}

@@ -139,12 +139,7 @@ func TestPipelineTester_DeadEndsAfterFinalizeWithPendingChallenge(t *testing.T) 
 			Failed:     0,
 			StartedAt:  time.Now().Add(-time.Second),
 		})
-		// The contract gate on finalize_pipeline checks the
-		// protocol-state's tester suite id, not pt.lastSuiteResult.
-		// run_test_suite calls both; we mirror that here.
-		if state := agentshared.PipelineProtocolStateFromContext(ctx); state != nil {
-			state.RecordTesterSuiteID("suite-deadend-1")
-		}
+		// Protocol state recording removed (claims-board era).
 	}
 
 	cfg := testershared.PipelineTesterConfig{
@@ -183,21 +178,21 @@ func TestPipelineTester_DeadEndsAfterFinalizeWithPendingChallenge(t *testing.T) 
 		Context: map[string]any{
 			"session_dir":    sessionDir,
 			"pipeline_stage": "validate",
-			"pipeline_protocol": agentshared.PipelineProtocolSnapshotMap(&agentshared.PipelineProtocolSnapshot{
-				Roster: []agentshared.PipelineProtocolAgent{
-					{AgentType: agentshared.PipelineAgentInspector},
-					{AgentType: agentshared.PipelineAgentTester},
+			"pipeline_protocol": map[string]any{
+				"roster": []map[string]any{
+					{"agent_type": agentshared.PipelineAgentInspector},
+					{"agent_type": agentshared.PipelineAgentTester},
 				},
-				ActiveAgents: []string{agentshared.PipelineAgentTester},
-				PendingChallenge: &agentshared.PipelineProtocolChallenge{
-					ID:                "challenge-1",
-					RequestingAgent:   agentshared.PipelineAgentInspector,
-					RequestingAgentID: "inspector-pipeline",
-					TargetAgents:      []string{agentshared.PipelineAgentTester},
-					Reason:            "Audit the red-phase tests.",
-					Request:           "Confirm coverage and pass status.",
+				"active_agents": []string{agentshared.PipelineAgentTester},
+				"pending_challenge": map[string]any{
+					"id":                 "challenge-1",
+					"requesting_agent":   agentshared.PipelineAgentInspector,
+					"requesting_agent_id": "inspector-pipeline",
+					"target_agents":      []string{agentshared.PipelineAgentTester},
+					"reason":             "Audit the red-phase tests.",
+					"request":            "Confirm coverage and pass status.",
 				},
-			}),
+			},
 		},
 	}
 	taskJSON, err := json.Marshal(task)

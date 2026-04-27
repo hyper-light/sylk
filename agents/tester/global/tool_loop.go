@@ -9,8 +9,9 @@ import (
 	"time"
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -42,7 +43,8 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 		}
 
 		// ── STEERING CHECKPOINT ──
-		sc := agentshared.DrainAndCheckpoint(ledger, req, turn, "testing", nil)
+		sc := agentshared.DrainAndCheckpoint(ledger, req, turn, "testing", nil,
+			agentshared.WithBoardProvider(func() *claims.ClaimsBoard { return gt.globalTesterBoard() }, gt.id))
 		if sc.Rollback != nil || sc.EditReplay != nil {
 			cp := sc.Rollback
 			if cp == nil {

@@ -156,6 +156,12 @@ func ComposeClaimsEntryPrompt(entry *claims.GraphEntryPoint) string {
 			}
 		}
 
+		// When the parent claim is available, show its pending validations
+		// as explicit instructions for the agent to evaluate.
+		if node.Claim != nil {
+			composeValidationInstructions(&b, node.Claim)
+		}
+
 	case node.Validation != nil:
 		v := node.Validation
 		b.WriteString("### Validation Verdict\n\n")
@@ -190,6 +196,44 @@ func ComposeClaimsEntryPrompt(entry *claims.GraphEntryPoint) string {
 	b.WriteString("`evaluate_validation` to judge responses.\n")
 
 	return b.String()
+}
+
+// composeValidationInstructions renders the parent claim's pending
+// validations as explicit evaluation directives for the agent. Each
+// validation's Description and QualityBar tell the agent what to check
+// and what bar to meet. The agent uses its full skill surface to assess
+// the testament artifacts, then calls evaluate_validation for each one.
+func composeValidationInstructions(b *strings.Builder, claim *claims.Claim) {
+	var pending []*claims.Validation
+	for _, v := range claim.Validations {
+		if v != nil && v.Status == claims.ValidationStatusPending && v.Type != claims.ValidationTypeReceipt {
+			pending = append(pending, v)
+		}
+	}
+	if len(pending) == 0 {
+		return
+	}
+
+	b.WriteString("\n### Parent Claim: " + claim.Title + "\n\n")
+	if claim.Description != "" {
+		b.WriteString(claim.Description + "\n\n")
+	}
+
+	b.WriteString("**Pending validations — evaluate each using the testament artifacts above:**\n\n")
+	for _, v := range pending {
+		required := ""
+		if v.Required {
+			required = " **(required)**"
+		}
+		b.WriteString("- **" + v.Description + "**" + required + "\n")
+		if v.QualityBar != "" {
+			b.WriteString("  Quality bar: " + v.QualityBar + "\n")
+		}
+		b.WriteString("  Validation ID: `" + v.ID + "` | Claim ID: `" + claim.ID + "` | Type: " + string(v.Type) + "\n")
+	}
+
+	b.WriteString("\nFor each validation: use your skills to assess whether the artifacts satisfy the quality bar. ")
+	b.WriteString("Then call `evaluate_validation` with the claim_id, validation_id, and your verdict (passed/failed) with a reason.\n")
 }
 
 func truncatePromptString(s string, max int) string {

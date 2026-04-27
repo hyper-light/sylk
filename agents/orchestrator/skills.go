@@ -121,7 +121,7 @@ func (o *Orchestrator) registerFabricSkills() {
 	// Claims skills: orchestrator is a full claims participant — it
 	// coordinates pipeline execution, observes board state, and posts
 	// actions about execution lifecycle events.
-	boardProvider := func() *claims.ClaimsBoard { return o.orchestratorBoard() }
+	boardProvider := func() (*claims.ClaimsBoard, error) { return o.orchestratorBoard() }
 	inboxProvider := func() *claims.ClaimsInbox { return o.claimsInbox }
 	o.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	o.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))

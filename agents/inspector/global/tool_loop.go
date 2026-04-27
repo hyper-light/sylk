@@ -10,8 +10,9 @@ import (
 
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -35,7 +36,8 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		}
 
 		// ── STEERING CHECKPOINT ──
-		sc := agentShared.DrainAndCheckpoint(ledger, req, turn, "inspecting", nil)
+		sc := agentShared.DrainAndCheckpoint(ledger, req, turn, "inspecting", nil,
+			agentShared.WithBoardProvider(func() *claims.ClaimsBoard { return gi.globalInspectorBoardOrNil() }, gi.id))
 		if sc.Rollback != nil || sc.EditReplay != nil {
 			cp := sc.Rollback
 			if cp == nil {

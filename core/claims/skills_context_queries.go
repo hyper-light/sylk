@@ -346,9 +346,12 @@ func requireBoard(bp BoardProvider) (*ClaimsBoard, error) {
 	if bp == nil {
 		return nil, fmt.Errorf("claims board provider not configured")
 	}
-	board := bp()
+	board, err := bp()
+	if err != nil {
+		return nil, fmt.Errorf("claims board: %w", err)
+	}
 	if board == nil {
-		return nil, fmt.Errorf("claims board not available")
+		return nil, fmt.Errorf("claims board not available (no error returned)")
 	}
 	return board, nil
 }

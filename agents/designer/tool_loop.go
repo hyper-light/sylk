@@ -59,7 +59,8 @@ func (d *Designer) executeToolLoopWithSurface(
 		}
 
 		// ── STEERING CHECKPOINT ──
-		sc := shared.DrainAndCheckpoint(ledger, req, turn, "designing", nil)
+		sc := shared.DrainAndCheckpoint(ledger, req, turn, "designing", nil,
+			shared.WithBoardProvider(func() *claims.ClaimsBoard { return d.designerBoard() }, d.id))
 		if sc.Rollback != nil || sc.EditReplay != nil {
 			cp := sc.Rollback
 			if cp == nil {
@@ -109,6 +110,7 @@ func (d *Designer) executeToolLoopWithSurface(
 				acc.Record("error", fmt.Sprintf("llm: %v", err))
 				acc.Note("LLM completion failed")
 			}
+			shared.PostCorrectiveClaimFromContext(ctx, d.id, "LLM completion failed", fmt.Sprintf("designer llm: %v", err), nil)
 			return "", fmt.Errorf("designer llm: %w", err)
 		}
 
@@ -121,20 +123,6 @@ func (d *Designer) executeToolLoopWithSurface(
 		shared.PublishIntermediateToolTurn(d.bus, d.channels, ctx, d.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
-			if err := shared.ValidatePipelineProtocolCompletion(ctx, "designer"); err != nil {
-				d.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
-				req.Messages = append(req.Messages, providers.Message{
-					Role:     providers.RoleAssistant,
-					Content:  strings.TrimSpace(resp.Content),
-					Metadata: resp.ProviderMetadata,
-				})
-				req.Messages = append(req.Messages, providers.Message{
-					Role: providers.RoleUser,
-					Content: err.Error() +
-						"\nIf the design criteria or tests are unclear, use challenge_agent against Inspector or Tester before ending the turn.",
-				})
-				continue
-			}
 			if err := shared.ValidateTaskExecutionCompletion(ctx, "designer"); err != nil {
 				d.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
 				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -225,6 +213,7 @@ func (d *Designer) executeToolLoopWithSurface(
 				acc.Record("error", fmt.Sprintf("tool calls failed %d consecutive turns", consecutiveErrors))
 				acc.Note("Tool loop aborted: consecutive tool errors")
 			}
+			shared.PostCorrectiveClaimFromContext(ctx, d.id, "Consecutive tool errors", fmt.Sprintf("designer tool calls failed %d consecutive turns", consecutiveErrors), nil)
 			return "", fmt.Errorf("designer tool calls failed %d consecutive turns", consecutiveErrors)
 		}
 	}

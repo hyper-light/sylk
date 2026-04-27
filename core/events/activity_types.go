@@ -70,6 +70,13 @@ const (
 	// guardian approval-hold control message) into a fake conversational
 	// turn.
 	EventTypeSystemCoordination EventType = 24
+
+	// Claims lifecycle events — surfaced in the agent detail activity feed.
+	EventTypeClaimReceived      EventType = 25
+	EventTypeTestamentSubmitted EventType = 26
+	EventTypeValidationPassed   EventType = 27
+	EventTypeClaimAccepted      EventType = 28
+	EventTypeValidationFailed   EventType = 29
 )
 
 // ValidEventTypes returns all valid EventType values.
@@ -100,6 +107,11 @@ func ValidEventTypes() []EventType {
 		EventTypeSteeringCheckpoint,
 		EventTypeAgentRegistered,
 		EventTypeSystemCoordination,
+		EventTypeClaimReceived,
+		EventTypeTestamentSubmitted,
+		EventTypeValidationPassed,
+		EventTypeClaimAccepted,
+		EventTypeValidationFailed,
 	}
 }
 
@@ -165,6 +177,16 @@ func (et EventType) String() string {
 		return "agent_registered"
 	case EventTypeSystemCoordination:
 		return "system_coordination"
+	case EventTypeClaimReceived:
+		return "claim_received"
+	case EventTypeTestamentSubmitted:
+		return "testament_submitted"
+	case EventTypeValidationPassed:
+		return "validation_passed"
+	case EventTypeClaimAccepted:
+		return "claim_accepted"
+	case EventTypeValidationFailed:
+		return "validation_failed"
 	default:
 		return fmt.Sprintf("event_type(%d)", et)
 	}
@@ -222,6 +244,16 @@ func ParseEventType(value string) (EventType, bool) {
 		return EventTypeAgentRegistered, true
 	case "system_coordination":
 		return EventTypeSystemCoordination, true
+	case "claim_received":
+		return EventTypeClaimReceived, true
+	case "testament_submitted":
+		return EventTypeTestamentSubmitted, true
+	case "validation_passed":
+		return EventTypeValidationPassed, true
+	case "claim_accepted":
+		return EventTypeClaimAccepted, true
+	case "validation_failed":
+		return EventTypeValidationFailed, true
 	default:
 		return EventType(0), false
 	}
@@ -504,6 +536,12 @@ func defaultImportance(eventType EventType) float64 {
 		return 0.20
 	case EventTypeSystemCoordination:
 		return 0.25
+	case EventTypeClaimReceived, EventTypeClaimAccepted:
+		return 0.65
+	case EventTypeTestamentSubmitted:
+		return 0.60
+	case EventTypeValidationPassed, EventTypeValidationFailed:
+		return 0.70
 	default:
 		return 0.50
 	}

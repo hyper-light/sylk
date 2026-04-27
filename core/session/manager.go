@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 )
 
@@ -133,6 +134,21 @@ func (m *Manager) Create(ctx context.Context, cfg Config) (*Session, error) {
 	}
 
 	session := NewSession(cfg)
+
+	// Wire the session's root claims board with scope for async dispatch.
+	var boardScope claims.ScopeProvider
+	if m.scope != nil {
+		boardScope = &concurrency.ScopeAdapter{Scope: m.scope}
+	}
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "session-" + session.ID(),
+		SessionID: session.ID(),
+		TaskID:    "session",
+		Scope:     boardScope,
+	})
+	session.SetClaimsBoard(board)
+	claims.DefaultSessionBoardRegistry().Register(session.ID(), board)
+
 	shard := m.getShard(session.ID())
 
 	shard.mu.Lock()
@@ -499,6 +515,7 @@ func (m *Manager) Close(id string) error {
 	m.updateCompletionStats(session)
 	m.persistFinalState(session)
 	m.emitClosedEvent(id)
+	claims.DefaultSessionBoardRegistry().Remove(id)
 
 	return nil
 }
@@ -747,3 +764,4 @@ func (m *Manager) SetPersister(p Persister) {
 	defer m.mu.Unlock()
 	m.persister = p
 }
+

@@ -143,7 +143,7 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	// Claims skills: global inspector is a full claims participant —
 	// it audits merged work, posts validation actions, and inspects
 	// cross-pipeline claim conflicts.
-	boardProvider := func() *claims.ClaimsBoard { return gi.globalInspectorBoard() }
+	boardProvider := func() (*claims.ClaimsBoard, error) { return gi.globalInspectorBoard() }
 	inboxProvider := func() *claims.ClaimsInbox { return gi.claimsInbox }
 	gi.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	gi.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))

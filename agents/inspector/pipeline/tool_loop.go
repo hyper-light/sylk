@@ -10,8 +10,9 @@ import (
 
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -43,7 +44,8 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 		}
 
 		// ── STEERING CHECKPOINT ──
-		sc := agentShared.DrainAndCheckpoint(ledger, req, turn, "inspecting", nil)
+		sc := agentShared.DrainAndCheckpoint(ledger, req, turn, "inspecting", nil,
+			agentShared.WithBoardProvider(func() *claims.ClaimsBoard { return pi.inspectorBoard() }, pi.id))
 		if sc.Rollback != nil || sc.EditReplay != nil {
 			cp := sc.Rollback
 			if cp == nil {
@@ -99,21 +101,6 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 		agentShared.PublishIntermediateToolTurn(pi.bus, pi.channels, ctx, pi.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
-			if err := agentShared.ValidatePipelineProtocolCompletion(ctx, "inspector-pipeline"); err != nil {
-				pi.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
-				req.Messages = append(req.Messages, providers.Message{
-					Role:     providers.RoleAssistant,
-					Content:  strings.TrimSpace(resp.Content),
-					Metadata: resp.ProviderMetadata,
-				})
-				req.Messages = append(req.Messages, providers.Message{
-					Role: providers.RoleUser,
-					Content: err.Error() +
-						"\nUse the pipeline protocol now. If you are still evaluating a peer response, invoke `pipeline_protocol(action=process_validation)` first and then `pipeline_protocol(action=challenge|handoff|finalize)` or `handoff_to_ot`.",
-				})
-				requiredActionGraceTurns = agentShared.ExtendRequiredProtocolGrace(ctx, requiredActionGraceTurns)
-				continue
-			}
 			if err := agentShared.ValidateTaskExecutionCompletion(ctx, "inspector-pipeline"); err != nil {
 				pi.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
 				if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {

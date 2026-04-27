@@ -126,7 +126,7 @@ func (m *MemoryForest) loadViewBranchesWithScope(ctx context.Context, sessionID 
 		       intent_id, title, summary, confidence, salience, utility, success_rate,
 		       scope_risk, conflict_score, support_count, counter_count, success_count,
 		       failure_count, access_count, last_accessed_at, created_at, updated_at, metadata,
-		       last_applied_seq
+		       last_applied_seq, constraint_severity
 		FROM forest_branches
 		WHERE state != ?
 	`
@@ -279,18 +279,10 @@ func viewFamilyLabel(family TreeFamily) string {
 		return "Constraint Tree"
 	case TreeFamilyEvidence:
 		return "Evidence Tree"
-	case TreeFamilyDecision:
-		return "Decision Tree"
 	case TreeFamilyOutcome:
 		return "Outcome Tree"
-	case TreeFamilyPreference:
-		return "Preference Tree"
-	case TreeFamilyCapability:
-		return "Capability Tree"
-	case TreeFamilyOpportunity:
-		return "Opportunity Tree"
-	case TreeFamilyConflict:
-		return "Conflict Tree"
+	case TreeFamilyAntiPattern:
+		return "AntiPattern Tree"
 	default:
 		return "Memory Tree"
 	}

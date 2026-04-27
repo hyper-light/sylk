@@ -491,6 +491,7 @@ type AppModel struct {
 	guideBridge      *bridge.GuideBridge
 	lspBridge        *bridge.LSPBridge
 	pipelineBridge   *bridge.PipelineBridge
+	claimsBridge     *bridge.ClaimsBridge
 
 	// LSP
 	lspManager    *lsp.Manager
@@ -1150,6 +1151,18 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 		m.agentPanel = comp.(*agentpkg.Model)
 		m.markSlotDirty(compositor.SlotLeft)
 		return cmd
+	}),
+	reflect.TypeFor[msg.ClaimsProjectionMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.ClaimsProjectionMsg) tea.Cmd {
+		comp, cmd := m.agentPanel.Update(typed)
+		m.agentPanel = comp.(*agentpkg.Model)
+		m.markSlotDirty(compositor.SlotLeft)
+		return cmd
+	}),
+	reflect.TypeFor[msg.SessionEventMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.SessionEventMsg) tea.Cmd {
+		if m.claimsBridge != nil && typed.Event != nil {
+			m.claimsBridge.SwitchSession(typed.Event.SessionID)
+		}
+		return m.propagate(typed)
 	}),
 	reflect.TypeFor[msg.OpenEditorMsg]():  appMsgCmdRoute((*AppModel).handleOpenEditor),
 	reflect.TypeFor[msg.CloseEditorMsg](): appMsgCmdRoute(func(m *AppModel, _ msg.CloseEditorMsg) tea.Cmd { return m.handleCloseEditor() }),
@@ -2414,6 +2427,9 @@ func (m *AppModel) Shutdown() error {
 	}
 	if m.pipelineBridge != nil {
 		m.pipelineBridge.Stop()
+	}
+	if m.claimsBridge != nil {
+		m.claimsBridge.Stop()
 	}
 
 	var errs []error

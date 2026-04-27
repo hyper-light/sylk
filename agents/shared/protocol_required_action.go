@@ -11,11 +11,6 @@ const RequiredProtocolGraceTurns = 2
 // PendingRequiredProtocolAction reports whether the current turn has a forced
 // protocol follow-up that has not yet been satisfied by a terminal action.
 func PendingRequiredProtocolAction(ctx context.Context) bool {
-	if state := PipelineProtocolStateFromContext(ctx); state != nil {
-		if action, _ := state.RequiredAction(); action != "" && state.TerminalAction() == nil {
-			return true
-		}
-	}
 	if state := GlobalReviewStateFromContext(ctx); state != nil {
 		if action, _ := state.RequiredAction(); action != "" && state.TerminalAction() == nil {
 			return true

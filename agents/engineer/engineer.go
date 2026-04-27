@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -55,6 +56,10 @@ type Engineer struct {
 
 	// Claims board (nil for non-claims pipelines).
 	claimsBoard *claims.ClaimsBoard
+	// activeSessionID is the session ID from the most recent forwarded
+	// request. Set at request entry, read by the board provider closure.
+	// Pipeline agents don't know their session at construction time.
+	activeSessionID atomic.Value // string — set per-request from fwd.SessionID
 
 	// State management
 	state    *EngineerState
@@ -613,6 +618,7 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		return fmt.Errorf("invalid forward request payload")
 	}
 
+	e.activeSessionID.Store(fwd.SessionID)
 	e.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
 	shared.LogIncomingRequest(e.steering.EventLogger(), fwd, e.id)
 

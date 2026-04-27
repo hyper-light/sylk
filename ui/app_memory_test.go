@@ -43,13 +43,15 @@ func newMemoryTestApp(t *testing.T) *AppModel {
 	cfg := DefaultConfig()
 	cfg.ProjectRoot = t.TempDir()
 
+	// Issue #11 Phase 3: Decision is collapsed into Intent. Mock
+	// snapshot uses the canonical 5-family taxonomy.
 	snapshot := &forest.ViewSnapshot{
 		SessionID:        sess.ID(),
 		SelectedBranchID: "decision-2",
 		Trees: []forest.ViewTree{
 			{
-				Family: forest.TreeFamilyDecision,
-				Label:  "Decision Tree",
+				Family: forest.TreeFamilyIntent,
+				Label:  "Intent Tree",
 				Nodes: []forest.ViewNode{
 					{ID: "decision-1", Title: "Baseline"},
 					{ID: "decision-2", ParentID: "decision-1", Title: "Timeout Cap"},
@@ -94,7 +96,7 @@ func TestAltMTogglesMemoryMode(t *testing.T) {
 	if !strings.Contains(app.panelContent(component.FocusChat), "◈") {
 		t.Fatalf("memory canvas missing active node: %q", app.panelContent(component.FocusChat))
 	}
-	if !strings.Contains(app.renderLeftPanel(app.config.Theme()), "Decision Tree") {
+	if !strings.Contains(app.renderLeftPanel(app.config.Theme()), "Intent Tree") {
 		t.Fatalf("left panel missing tree header: %q", app.renderLeftPanel(app.config.Theme()))
 	}
 
@@ -135,7 +137,12 @@ func TestAltMIndexesChatHistoryIntoForest(t *testing.T) {
 		t.Fatalf("seed nodes table: %v", err)
 	}
 
-	forestSvc, err := forest.New(forest.Config{DB: db})
+	// SynchronousProjection makes AppendEvent → branch projection
+	// happen inline inside RecordContent, so the immediate Snapshot
+	// after toggling memory mode sees every just-ingested chat event.
+	// The async projector path is correct production behavior but
+	// races the test's expectations within a single tick.
+	forestSvc, err := forest.New(forest.Config{DB: db, SynchronousProjection: true})
 	if err != nil {
 		t.Fatalf("new forest: %v", err)
 	}
@@ -185,11 +192,11 @@ func TestAltMIndexesChatHistoryIntoForest(t *testing.T) {
 	}
 
 	left := app.renderLeftPanel(app.config.Theme())
+	// Issue #11 Phase 3: user prompts and architect-authored chat
+	// entries both route to the Intent tree (architect's prior
+	// Decision-family routing was collapsed into Intent).
 	if !strings.Contains(left, "Intent Tree") {
 		t.Fatalf("left panel missing intent tree: %q", left)
-	}
-	if !strings.Contains(left, "Decision Tree") {
-		t.Fatalf("left panel missing decision tree: %q", left)
 	}
 }
 
@@ -223,7 +230,12 @@ func TestAltMIndexesInterAgentConsultKnowledgeIntoForest(t *testing.T) {
 		t.Fatalf("seed nodes table: %v", err)
 	}
 
-	forestSvc, err := forest.New(forest.Config{DB: db})
+	// SynchronousProjection makes AppendEvent → branch projection
+	// happen inline inside RecordContent, so the immediate Snapshot
+	// after toggling memory mode sees every just-ingested chat event.
+	// The async projector path is correct production behavior but
+	// races the test's expectations within a single tick.
+	forestSvc, err := forest.New(forest.Config{DB: db, SynchronousProjection: true})
 	if err != nil {
 		t.Fatalf("new forest: %v", err)
 	}

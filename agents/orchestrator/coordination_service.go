@@ -151,13 +151,14 @@ func (s *CoordinationService) ClaimScope(
 		UpdatedAt:      now,
 		LeaseExpiresAt: now.Add(time.Duration(input.LeaseSeconds) * time.Second),
 	}
+	// SQLite is best-effort cache; claims board is authoritative.
 	if err := s.store.db.RunInWriteTx(ctx, func(ctx context.Context, tx bun.Tx) error {
 		if err := s.insertClaim(ctx, tx, claim); err != nil {
 			return err
 		}
 		return s.insertAction(ctx, tx, coordination.ActionClaimScope, claim.TaskID, claim.TaskName, actor, claim.IdempotencyKey, claim)
 	}); err != nil {
-		return nil, err
+		slog.Warn("coordination_claim_sqlite_cache_failed", "error", err.Error(), "task_id", claim.TaskID)
 	}
 	s.invalidateTask(claim.TaskID)
 	emitClaimAcquired(ctx, claim, actor)
@@ -188,6 +189,7 @@ func (s *CoordinationService) renewClaimLease(ctx context.Context, claim *coordi
 	now := time.Now().UTC()
 	claim.UpdatedAt = now
 	claim.LeaseExpiresAt = now.Add(time.Duration(leaseSeconds) * time.Second)
+	// SQLite is best-effort cache; claims board is authoritative.
 	if err := s.store.db.RunInWriteTx(ctx, func(ctx context.Context, tx bun.Tx) error {
 		_, err := tx.ExecContext(ctx,
 			`UPDATE coordination_claims SET updated_at = ?, lease_expires_at = ? WHERE id = ?`,
@@ -198,7 +200,7 @@ func (s *CoordinationService) renewClaimLease(ctx context.Context, claim *coordi
 		}
 		return nil
 	}); err != nil {
-		return nil, err
+		slog.Warn("coordination_renew_sqlite_cache_failed", "error", err.Error(), "claim_id", claim.ID)
 	}
 	return claim, nil
 }
@@ -211,16 +213,26 @@ func (s *CoordinationService) ReleaseScope(
 	if strings.TrimSpace(input.TaskID) == "" {
 		return nil, fmt.Errorf("task_id is required")
 	}
-	claim, err := s.lookupReleaseTarget(ctx, actor, input)
-	if err != nil {
-		return nil, err
-	}
-	if claim == nil {
-		return nil, fmt.Errorf("active claim not found")
-	}
+	claim, _ := s.lookupReleaseTarget(ctx, actor, input)
 	now := time.Now().UTC()
+	if claim == nil {
+		// SQLite had no record (or failed). Synthesize a lightweight
+		// claim so the testament and board posting still proceed.
+		claim = &coordination.Claim{
+			ID:           strings.TrimSpace(input.ClaimID),
+			TaskID:       strings.TrimSpace(input.TaskID),
+			ScopeKind:    input.ScopeKind,
+			ScopeKey:     strings.TrimSpace(input.ScopeKey),
+			OwnerAgentID: strings.TrimSpace(actor.AgentID),
+			OwnerType:    strings.TrimSpace(actor.AgentType),
+		}
+		if claim.ID == "" {
+			claim.ID = uuid.NewString()
+		}
+	}
 	claim.State = coordination.ClaimStateReleased
 	claim.UpdatedAt = now
+	// SQLite is best-effort cache; claims board is authoritative.
 	if err := s.store.db.RunInWriteTx(ctx, func(ctx context.Context, tx bun.Tx) error {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE coordination_claims SET state = ?, updated_at = ? WHERE id = ?`,
@@ -236,7 +248,7 @@ func (s *CoordinationService) ReleaseScope(
 			"released_at": now,
 		})
 	}); err != nil {
-		return nil, err
+		slog.Warn("coordination_release_sqlite_cache_failed", "error", err.Error(), "claim_id", claim.ID)
 	}
 	s.invalidateTask(claim.TaskID)
 	emitClaimReleased(ctx, claim, actor)
@@ -277,11 +289,10 @@ func (s *CoordinationService) PublishArtifact(
 		input.Status = coordination.ArtifactStatusPublished
 	}
 	now := time.Now().UTC()
-	var (
-		artifact *coordination.Artifact
-		created  bool
-	)
+	artifact := newCoordinationArtifact(actor, input, now)
+	created := true
 
+	// SQLite is best-effort cache; claims board is authoritative.
 	if err := s.store.db.RunInWriteTx(ctx, func(ctx context.Context, tx bun.Tx) error {
 		persisted, wasCreated, err := s.publishArtifactTx(ctx, tx, actor, input, now)
 		if err != nil {
@@ -291,7 +302,7 @@ func (s *CoordinationService) PublishArtifact(
 		created = wasCreated
 		return nil
 	}); err != nil {
-		return nil, err
+		slog.Warn("coordination_artifact_sqlite_cache_failed", "error", err.Error(), "task_id", artifact.TaskID)
 	}
 	if artifact == nil {
 		return nil, fmt.Errorf("publish coordination artifact: no artifact persisted")
@@ -348,10 +359,10 @@ func (s *CoordinationService) RequestReview(
 		return nil, fmt.Errorf("task_id, artifact_id, and reviewer_type are required")
 	}
 	now := time.Now().UTC()
-	var (
-		review  *coordination.Review
-		created bool
-	)
+	review := newCoordinationReview(actor, input, now)
+	created := true
+
+	// SQLite is best-effort cache; claims board is authoritative.
 	if err := s.store.db.RunInWriteTx(ctx, func(ctx context.Context, tx bun.Tx) error {
 		persisted, wasCreated, err := s.requestReviewTx(ctx, tx, actor, input, now)
 		if err != nil {
@@ -361,7 +372,7 @@ func (s *CoordinationService) RequestReview(
 		created = wasCreated
 		return nil
 	}); err != nil {
-		return nil, err
+		slog.Warn("coordination_review_sqlite_cache_failed", "error", err.Error(), "task_id", review.TaskID)
 	}
 	if review == nil {
 		return nil, fmt.Errorf("request coordination review: no review persisted")
@@ -405,6 +416,25 @@ func (s *CoordinationService) ResolveArtifact(
 	now := time.Now().UTC()
 	result := map[string]any{}
 
+	// Build the result map from input (claims board is authoritative).
+	if strings.TrimSpace(input.ArtifactID) != "" {
+		status := input.Status
+		if status == "" {
+			status = coordination.ArtifactStatusResolved
+		}
+		result["artifact_id"] = strings.TrimSpace(input.ArtifactID)
+		result["artifact_status"] = status
+	}
+	if strings.TrimSpace(input.ReviewID) != "" {
+		status := input.ReviewStatus
+		if status == "" {
+			status = coordination.ReviewStatusAccepted
+		}
+		result["review_id"] = strings.TrimSpace(input.ReviewID)
+		result["review_status"] = status
+	}
+
+	// SQLite is best-effort cache; claims board is authoritative.
 	if err := s.store.db.RunInWriteTx(ctx, func(ctx context.Context, tx bun.Tx) error {
 		if strings.TrimSpace(input.ArtifactID) != "" {
 			status := input.Status
@@ -417,8 +447,6 @@ func (s *CoordinationService) ResolveArtifact(
 			); err != nil {
 				return fmt.Errorf("resolve coordination artifact: %w", err)
 			}
-			result["artifact_id"] = strings.TrimSpace(input.ArtifactID)
-			result["artifact_status"] = status
 		}
 		if strings.TrimSpace(input.ReviewID) != "" {
 			status := input.ReviewStatus
@@ -439,8 +467,6 @@ func (s *CoordinationService) ResolveArtifact(
 			); err != nil {
 				return fmt.Errorf("resolve coordination review: %w", err)
 			}
-			result["review_id"] = strings.TrimSpace(input.ReviewID)
-			result["review_status"] = status
 		}
 		return s.insertAction(ctx, tx, coordination.ActionResolveArtifact, strings.TrimSpace(input.TaskID), "", actor, strings.TrimSpace(input.IdempotencyKey), map[string]any{
 			"artifact_id":        strings.TrimSpace(input.ArtifactID),
@@ -451,7 +477,7 @@ func (s *CoordinationService) ResolveArtifact(
 			"resolved_at":        now,
 		})
 	}); err != nil {
-		return nil, err
+		slog.Warn("coordination_resolve_sqlite_cache_failed", "error", err.Error(), "task_id", input.TaskID)
 	}
 	s.invalidateTask(strings.TrimSpace(input.TaskID))
 	if reviewID := strings.TrimSpace(input.ReviewID); reviewID != "" {
@@ -652,6 +678,7 @@ func (s *CoordinationService) ReleaseTaskClaims(ctx context.Context, taskID stri
 		return nil
 	}
 	now := time.Now().UTC()
+	// SQLite is best-effort cache; claims board is authoritative.
 	if err := s.store.db.RunInWriteTx(ctx, func(ctx context.Context, tx bun.Tx) error {
 		_, err := tx.ExecContext(ctx,
 			`UPDATE coordination_claims SET state = ?, updated_at = ? WHERE task_id = ? AND state = ?`,
@@ -665,7 +692,7 @@ func (s *CoordinationService) ReleaseTaskClaims(ctx context.Context, taskID stri
 		}
 		return nil
 	}); err != nil {
-		return err
+		slog.Warn("coordination_release_task_sqlite_cache_failed", "error", err.Error(), "task_id", taskID)
 	}
 	s.invalidateTask(taskID)
 	return nil
@@ -676,6 +703,8 @@ func (s *CoordinationService) findExistingClaim(
 	actor coordination.Actor,
 	input coordination.ClaimScopeInput,
 ) (*coordination.Claim, error) {
+	// SQLite is best-effort cache; return nil on failure so the claim
+	// proceeds via the claims board.
 	if strings.TrimSpace(input.IdempotencyKey) != "" {
 		row := s.store.db.QueryRowContext(ctx,
 			`SELECT id, task_id, COALESCE(task_name, ''), scope_kind, scope_key, COALESCE(purpose, ''), mode, state,
@@ -690,7 +719,8 @@ func (s *CoordinationService) findExistingClaim(
 			return claim, nil
 		}
 		if err != nil && err != sql.ErrNoRows {
-			return nil, fmt.Errorf("query existing claim: %w", err)
+			slog.Warn("coordination_find_existing_sqlite_cache_failed", "error", err.Error(), "task_id", input.TaskID)
+			return nil, nil
 		}
 	}
 
@@ -707,7 +737,8 @@ func (s *CoordinationService) findExistingClaim(
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("query matching claim: %w", err)
+		slog.Warn("coordination_find_matching_sqlite_cache_failed", "error", err.Error(), "task_id", input.TaskID)
+		return nil, nil
 	}
 	return claim, nil
 }
@@ -717,6 +748,8 @@ func (s *CoordinationService) listConflictingClaims(
 	actor coordination.Actor,
 	input coordination.ClaimScopeInput,
 ) ([]coordination.Claim, error) {
+	// SQLite is best-effort cache; return empty on failure so the claim
+	// proceeds via the claims board.
 	rows, err := s.store.db.QueryContext(ctx,
 		`SELECT id, task_id, COALESCE(task_name, ''), scope_kind, scope_key, COALESCE(purpose, ''), mode, state,
 		 owner_agent_id, owner_type, COALESCE(idempotency_key, ''), COALESCE(evidence_json, '[]'),
@@ -726,7 +759,8 @@ func (s *CoordinationService) listConflictingClaims(
 		strings.TrimSpace(input.TaskID), string(input.ScopeKind), string(coordination.ClaimStateActive), strings.TrimSpace(actor.AgentID),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("query conflicting claims: %w", err)
+		slog.Warn("coordination_list_conflicts_sqlite_cache_failed", "error", err.Error(), "task_id", input.TaskID)
+		return nil, nil
 	}
 	defer rows.Close()
 
@@ -734,7 +768,8 @@ func (s *CoordinationService) listConflictingClaims(
 	for rows.Next() {
 		claim, err := scanClaimRows(rows)
 		if err != nil {
-			return nil, err
+			slog.Warn("coordination_scan_conflict_sqlite_cache_failed", "error", err.Error())
+			return nil, nil
 		}
 		if !scopeKeysConflict(input.ScopeKind, input.ScopeKey, claim.ScopeKey) {
 			continue
@@ -800,6 +835,8 @@ func (s *CoordinationService) lookupReleaseTarget(
 	actor coordination.Actor,
 	input coordination.ReleaseScopeInput,
 ) (*coordination.Claim, error) {
+	// SQLite is best-effort cache; return nil on failure. The caller
+	// will synthesize a lightweight claim from input fields if needed.
 	var row *sql.Row
 	if strings.TrimSpace(input.ClaimID) != "" {
 		row = s.store.db.QueryRowContext(ctx,
@@ -825,7 +862,8 @@ func (s *CoordinationService) lookupReleaseTarget(
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("lookup release claim: %w", err)
+		slog.Warn("coordination_lookup_release_sqlite_cache_failed", "error", err.Error(), "task_id", input.TaskID)
+		return nil, nil
 	}
 	return claim, nil
 }
@@ -1028,6 +1066,7 @@ func (s *CoordinationService) findExistingReviewInTx(
 
 func (s *CoordinationService) expireClaims(ctx context.Context, taskID string) error {
 	now := time.Now().UTC()
+	// SQLite is best-effort cache; claims board is authoritative.
 	if err := s.store.db.RunInWriteTx(ctx, func(ctx context.Context, tx bun.Tx) error {
 		_, err := tx.ExecContext(ctx,
 			`UPDATE coordination_claims SET state = ?, updated_at = ?
@@ -1039,7 +1078,7 @@ func (s *CoordinationService) expireClaims(ctx context.Context, taskID string) e
 		}
 		return nil
 	}); err != nil {
-		return err
+		slog.Warn("coordination_expire_sqlite_cache_failed", "error", err.Error(), "task_id", taskID)
 	}
 	s.invalidateTask(taskID)
 	return nil
@@ -1211,6 +1250,7 @@ func buildCoordinationSummary(
 }
 
 func (s *CoordinationService) listClaims(ctx context.Context, taskID string) ([]coordination.Claim, error) {
+	// SQLite is best-effort cache; return empty on failure.
 	rows, err := s.store.db.QueryContext(ctx,
 		`SELECT id, task_id, COALESCE(task_name, ''), scope_kind, scope_key, COALESCE(purpose, ''), mode, state,
 		 owner_agent_id, owner_type, COALESCE(idempotency_key, ''), COALESCE(evidence_json, '[]'),
@@ -1221,7 +1261,8 @@ func (s *CoordinationService) listClaims(ctx context.Context, taskID string) ([]
 		strings.TrimSpace(taskID), string(coordination.ClaimStateActive),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("list coordination claims: %w", err)
+		slog.Warn("coordination_list_claims_sqlite_cache_failed", "error", err.Error(), "task_id", taskID)
+		return nil, nil
 	}
 	defer rows.Close()
 
@@ -1229,7 +1270,8 @@ func (s *CoordinationService) listClaims(ctx context.Context, taskID string) ([]
 	for rows.Next() {
 		claim, err := scanClaimRows(rows)
 		if err != nil {
-			return nil, err
+			slog.Warn("coordination_scan_claim_sqlite_cache_failed", "error", err.Error())
+			return claims, nil
 		}
 		claims = append(claims, *claim)
 	}
@@ -1237,6 +1279,7 @@ func (s *CoordinationService) listClaims(ctx context.Context, taskID string) ([]
 }
 
 func (s *CoordinationService) listArtifacts(ctx context.Context, taskID string, includeDrafts bool) ([]coordination.Artifact, error) {
+	// SQLite is best-effort cache; return empty on failure.
 	query := `SELECT id, task_id, COALESCE(task_name, ''), kind, COALESCE(title, ''), summary, COALESCE(scope_kind, ''), COALESCE(scope_key, ''),
 		 status, producer_agent_id, producer_type, COALESCE(idempotency_key, ''), COALESCE(payload_json, '{}'),
 		 COALESCE(evidence_json, '[]'), COALESCE(upstream_artifact_ids_json, '[]'), COALESCE(supersedes_artifact_id, ''), version, created_at, updated_at
@@ -1251,7 +1294,8 @@ func (s *CoordinationService) listArtifacts(ctx context.Context, taskID string, 
 
 	rows, err := s.store.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list coordination artifacts: %w", err)
+		slog.Warn("coordination_list_artifacts_sqlite_cache_failed", "error", err.Error(), "task_id", taskID)
+		return nil, nil
 	}
 	defer rows.Close()
 
@@ -1259,7 +1303,8 @@ func (s *CoordinationService) listArtifacts(ctx context.Context, taskID string, 
 	for rows.Next() {
 		artifact, err := scanArtifactRows(rows)
 		if err != nil {
-			return nil, err
+			slog.Warn("coordination_scan_artifact_sqlite_cache_failed", "error", err.Error())
+			return artifacts, nil
 		}
 		artifacts = append(artifacts, *artifact)
 	}
@@ -1267,6 +1312,7 @@ func (s *CoordinationService) listArtifacts(ctx context.Context, taskID string, 
 }
 
 func (s *CoordinationService) listReviews(ctx context.Context, taskID string) ([]coordination.Review, error) {
+	// SQLite is best-effort cache; return empty on failure.
 	rows, err := s.store.db.QueryContext(ctx,
 		`SELECT id, task_id, artifact_id, requester_agent_id, requester_type, reviewer_type, summary,
 		 COALESCE(criteria_json, '[]'), status, COALESCE(idempotency_key, ''), COALESCE(result_json, '{}'),
@@ -1277,7 +1323,8 @@ func (s *CoordinationService) listReviews(ctx context.Context, taskID string) ([
 		strings.TrimSpace(taskID),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("list coordination reviews: %w", err)
+		slog.Warn("coordination_list_reviews_sqlite_cache_failed", "error", err.Error(), "task_id", taskID)
+		return nil, nil
 	}
 	defer rows.Close()
 
@@ -1285,7 +1332,8 @@ func (s *CoordinationService) listReviews(ctx context.Context, taskID string) ([
 	for rows.Next() {
 		review, err := scanReviewRows(rows)
 		if err != nil {
-			return nil, err
+			slog.Warn("coordination_scan_review_sqlite_cache_failed", "error", err.Error())
+			return reviews, nil
 		}
 		reviews = append(reviews, *review)
 	}

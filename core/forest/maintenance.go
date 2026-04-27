@@ -22,6 +22,110 @@ const (
 	defaultForestSubstrateTimeout  = 5 * time.Second
 	defaultForestTrainingTimeout   = 30 * time.Second
 	defaultForestMaintenanceRetry  = 2 * time.Second
+
+	// Issue #3 selection-bias defaults.
+	defaultCounterfactualLabelWeight     = 0.3
+	defaultCounterfactualWindow          = 24 * time.Hour
+	defaultImplicitNegativeWeight        = 0.15
+	defaultImplicitNegativeHorizon       = 1 * time.Hour
+	defaultImplicitNegativeSweepInterval = 5 * time.Minute
+	defaultExplorationRate               = 0.05
+	defaultExplorationLabelWeight        = 1.5
+
+	// Issue #10 — storage growth + archival defaults.
+	//
+	// Default retention windows: 30d for archive cutoffs (forensic
+	// vs storage trade-off); 64 trace rows per branch (matches the
+	// inline warmth pruner so the background path doesn't fight it).
+	defaultTrainingExamplesRetention      = 30 * 24 * time.Hour
+	defaultTrainingExamplesPruneInterval  = 1 * time.Hour
+	defaultSubstrateStateRetention        = 30 * 24 * time.Hour
+	defaultSubstrateStatePruneInterval    = 6 * time.Hour
+	defaultEventArchiveAge                = 30 * 24 * time.Hour
+	defaultRetrievalEventArchiveAge       = 30 * 24 * time.Hour
+	defaultEventArchiveInterval           = 1 * time.Hour
+	defaultEventArchiveBatchSize          = 1000
+
+	// Issue #7 — substrate-mode A/B + replacement defaults.
+	//
+	// defaultSubstrateMode is the dominant substrate mode used when
+	// Config.SubstrateMode isn't set. Starts as Full so existing
+	// behavior is preserved until operators flip the default.
+	defaultSubstrateMode = SubstrateModeFull
+
+	// defaultSubstrateABRate is the per-retrieval probability of
+	// swapping to a non-default substrate mode for measurement. 0
+	// means "always run the dominant mode"; 0.1 = 10% A/B traffic.
+	defaultSubstrateABRate = 0.0
+
+	// Issue #8 — learned base scorer defaults.
+	//
+	// defaultBaseScoreTrainInterval is the cadence between training
+	// passes. 1h amortizes training cost while staying responsive
+	// enough that operators can iterate within a working day.
+	defaultBaseScoreTrainInterval = 1 * time.Hour
+
+	// defaultBaseScoreMinTrainingExamples is the minimum count of
+	// labeled examples in the training window before we'll promote
+	// a new model. Below this, accuracy estimates are too noisy.
+	defaultBaseScoreMinTrainingExamples = 1000
+
+	// defaultBaseScoreImprovementThreshold is the minimum accuracy
+	// gain (over current champion) for a freshly-trained model to
+	// be promoted. Prevents random-walk promotion from training-set
+	// noise.
+	defaultBaseScoreImprovementThreshold = 0.01
+
+	// defaultBaseScoreLearningRate controls SGD step size. Small
+	// enough that a single pass can't overshoot a stable optimum.
+	defaultBaseScoreLearningRate = 0.005
+
+	// defaultBaseScoreL1Reg / L2Reg regularization coefficients.
+	// L1 drives uninformative weights toward zero (component pruning
+	// signal); L2 prevents weight explosion.
+	defaultBaseScoreL1Reg = 0.001
+	defaultBaseScoreL2Reg = 0.01
+
+	// defaultBaseScoreEpochs is the number of SGD passes per training
+	// run. Bounded so a single training cycle is short.
+	defaultBaseScoreEpochs = 8
+
+	// defaultBaseScoreTrainBatch is the maximum number of training
+	// examples sampled per cycle. Larger batches give better gradient
+	// estimates but cost more time/memory.
+	defaultBaseScoreTrainBatch = 4096
+
+	// defaultBaseScoreABRate is the per-retrieval probability of
+	// routing through the challenger instead of the champion.
+	defaultBaseScoreABRate = 0.0
+
+	// defaultBaseScoreMaxWeight clamps each weight to ±this value
+	// after every SGD step, so a pathological training batch can't
+	// produce a model that overpowers other signals.
+	defaultBaseScoreMaxWeight = 5.0
+
+	// defaultBaseScorePruningThreshold is the |weight| below which a
+	// component is flagged as a pruning candidate. Operators decide
+	// whether to actually drop the component from the feature path.
+	defaultBaseScorePruningThreshold = 0.005
+
+	// Issue #4 — diversity + cooldown defaults.
+	//
+	// defaultDiversityLambda balances relevance against novelty in the
+	// MMR rerank: 1.0 = pure relevance (no diversity), 0.0 = pure
+	// diversity. 0.7 keeps relevance dominant but makes the second/
+	// third pick avoid near-duplicates of the first.
+	defaultDiversityLambda = 0.7
+
+	// defaultRetrievalCooldownWindow is how many recent retrievals (in
+	// the same session) we look back to compute the cooldown signal.
+	defaultRetrievalCooldownWindow = 32
+
+	// defaultRetrievalCooldownPenalty is the maximum score scale-down
+	// applied to a branch that appeared in every one of the last
+	// `cooldownWindow` retrievals: score := score * (1 - penalty).
+	// A branch that appeared in half of them gets score * (1 - 0.5*penalty).
+	defaultRetrievalCooldownPenalty = 0.3
 )
 
 type scheduledForestWork struct {
@@ -69,6 +173,270 @@ func resolveForestTrainingExamples(limit int) int {
 		return defaultForestTrainingExamples
 	}
 	return limit
+}
+
+func resolveCounterfactualLabelWeight(w float64) float64 {
+	if w <= 0 {
+		return defaultCounterfactualLabelWeight
+	}
+	return w
+}
+
+func resolveCounterfactualWindow(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultCounterfactualWindow
+	}
+	return d
+}
+
+func resolveImplicitNegativeWeight(w float64) float64 {
+	if w <= 0 {
+		return defaultImplicitNegativeWeight
+	}
+	return w
+}
+
+func resolveImplicitNegativeHorizon(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultImplicitNegativeHorizon
+	}
+	return d
+}
+
+func resolveImplicitNegativeSweepInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultImplicitNegativeSweepInterval
+	}
+	return d
+}
+
+// resolveExplorationRate clamps the rate into [0, 1]. Negative or
+// non-set defaults to defaultExplorationRate; >1 clamps to 1.0
+// (always explore — useful for tests).
+func resolveExplorationRate(rate float64) float64 {
+	if rate < 0 {
+		return defaultExplorationRate
+	}
+	if rate > 1 {
+		return 1
+	}
+	return rate
+}
+
+func resolveExplorationLabelWeight(w float64) float64 {
+	if w <= 0 {
+		return defaultExplorationLabelWeight
+	}
+	return w
+}
+
+// resolveBaseScoreTrainInterval / others — Issue #8 base scorer.
+// Negative or zero falls back to the documented default; positive
+// values pass through.
+func resolveBaseScoreTrainInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultBaseScoreTrainInterval
+	}
+	return d
+}
+
+func resolveBaseScoreMinTrainingExamples(n int) int {
+	if n <= 0 {
+		return defaultBaseScoreMinTrainingExamples
+	}
+	return n
+}
+
+// resolveBaseScoreImprovementThreshold clamps to [0,1]. 0 means
+// "promote any model that doesn't regress"; 1 means "never promote."
+func resolveBaseScoreImprovementThreshold(t float64) float64 {
+	if t < 0 {
+		return defaultBaseScoreImprovementThreshold
+	}
+	if t > 1 {
+		return 1
+	}
+	return t
+}
+
+// resolveBaseScoreLearningRate caps to a safe upper bound to prevent
+// training divergence on outlier batches.
+func resolveBaseScoreLearningRate(r float64) float64 {
+	if r <= 0 {
+		return defaultBaseScoreLearningRate
+	}
+	if r > 1 {
+		return 1
+	}
+	return r
+}
+
+func resolveBaseScoreL1Reg(r float64) float64 {
+	if r < 0 {
+		return defaultBaseScoreL1Reg
+	}
+	return r
+}
+
+func resolveBaseScoreL2Reg(r float64) float64 {
+	if r < 0 {
+		return defaultBaseScoreL2Reg
+	}
+	return r
+}
+
+func resolveBaseScoreEpochs(n int) int {
+	if n <= 0 {
+		return defaultBaseScoreEpochs
+	}
+	return n
+}
+
+func resolveBaseScoreTrainBatch(n int) int {
+	if n <= 0 {
+		return defaultBaseScoreTrainBatch
+	}
+	return n
+}
+
+// resolveBaseScoreABRate clamps to [0,1].
+func resolveBaseScoreABRate(r float64) float64 {
+	if r < 0 {
+		return defaultBaseScoreABRate
+	}
+	if r > 1 {
+		return 1
+	}
+	return r
+}
+
+func resolveBaseScoreMaxWeight(w float64) float64 {
+	if w <= 0 {
+		return defaultBaseScoreMaxWeight
+	}
+	return w
+}
+
+func resolveBaseScorePruningThreshold(t float64) float64 {
+	if t < 0 {
+		return defaultBaseScorePruningThreshold
+	}
+	return t
+}
+
+// Issue #10 resolvers — straight-line clamps for retention/interval
+// duration values. Negative or zero falls back to documented defaults.
+func resolveTrainingExamplesRetention(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultTrainingExamplesRetention
+	}
+	return d
+}
+
+func resolveTrainingExamplesPruneInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultTrainingExamplesPruneInterval
+	}
+	return d
+}
+
+func resolveSubstrateStateRetention(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultSubstrateStateRetention
+	}
+	return d
+}
+
+func resolveSubstrateStatePruneInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultSubstrateStatePruneInterval
+	}
+	return d
+}
+
+func resolveEventArchiveAge(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultEventArchiveAge
+	}
+	return d
+}
+
+func resolveRetrievalEventArchiveAge(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultRetrievalEventArchiveAge
+	}
+	return d
+}
+
+func resolveEventArchiveInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultEventArchiveInterval
+	}
+	return d
+}
+
+func resolveEventArchiveBatchSize(n int) int {
+	if n <= 0 {
+		return defaultEventArchiveBatchSize
+	}
+	return n
+}
+
+// resolveSubstrateMode validates the incoming mode against the
+// known set; an empty or unrecognized value falls back to
+// defaultSubstrateMode so a typo doesn't silently disable substrate.
+func resolveSubstrateMode(mode SubstrateMode) SubstrateMode {
+	switch mode {
+	case SubstrateModeFull, SubstrateModePageRank, SubstrateModeWarmthOnly:
+		return mode
+	}
+	return defaultSubstrateMode
+}
+
+// resolveSubstrateABRate clamps to [0,1]. 0 disables A/B sampling.
+func resolveSubstrateABRate(r float64) float64 {
+	if r < 0 {
+		return defaultSubstrateABRate
+	}
+	if r > 1 {
+		return 1
+	}
+	return r
+}
+
+// resolveDiversityLambda clamps to [0,1]. A negative or unset value
+// defaults to defaultDiversityLambda; a value > 1 clamps to 1
+// (effectively disables diversity reranking — the iterative pick
+// reduces to "always pick the highest-relevance candidate").
+func resolveDiversityLambda(l float64) float64 {
+	if l < 0 {
+		return defaultDiversityLambda
+	}
+	if l > 1 {
+		return 1
+	}
+	return l
+}
+
+func resolveRetrievalCooldownWindow(n int) int {
+	if n <= 0 {
+		return defaultRetrievalCooldownWindow
+	}
+	return n
+}
+
+// resolveRetrievalCooldownPenalty clamps to [0,1]. 0 disables the
+// cooldown entirely (no penalty applied). 1 means a branch that
+// appeared in every recent retrieval is fully de-ranked. Negative
+// inputs fall back to the default; > 1 clamps to 1.
+func resolveRetrievalCooldownPenalty(p float64) float64 {
+	if p < 0 {
+		return defaultRetrievalCooldownPenalty
+	}
+	if p > 1 {
+		return 1
+	}
+	return p
 }
 
 func (m *MemoryForest) startMaintenance() {

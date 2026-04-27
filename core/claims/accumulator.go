@@ -51,6 +51,22 @@ func NewTestamentAccumulator(agentID, sessionID string) *TestamentAccumulator {
 	}
 }
 
+// AgentID returns the accumulator's agent ID.
+func (a *TestamentAccumulator) AgentID() string {
+	if a == nil {
+		return ""
+	}
+	return a.agentID
+}
+
+// SessionID returns the accumulator's session ID.
+func (a *TestamentAccumulator) SessionID() string {
+	if a == nil {
+		return ""
+	}
+	return a.sessionID
+}
+
 // Record appends a single artifact observation. Thread-safe.
 // No board interaction — artifacts are buffered until Flush.
 func (a *TestamentAccumulator) Record(kind, reference string) {

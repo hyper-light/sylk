@@ -119,8 +119,16 @@ func (a *Architect) registerFabricSkills() {
 	// Claims skills: architect is a full claims participant — it can
 	// query board state for planning context, post actions about plan
 	// lifecycle events, and submit testaments about design decisions.
-	boardProvider := func() *claims.ClaimsBoard {
-		return claims.DefaultSessionBoardRegistry().Lookup(a.config.SessionID)
+	boardProvider := func() (*claims.ClaimsBoard, error) {
+		sid := a.config.SessionID
+		if sid == "" {
+			return nil, fmt.Errorf("architect: no session ID configured")
+		}
+		board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+		if board == nil {
+			return nil, fmt.Errorf("architect: session %q has no claims board registered", sid)
+		}
+		return board, nil
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return a.claimsInbox }
 	a.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))

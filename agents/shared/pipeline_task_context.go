@@ -9,6 +9,139 @@ import (
 	"github.com/adalundhe/sylk/core/versioning"
 )
 
+const (
+	PipelineAgentInspector = "inspector-pipeline"
+	PipelineAgentTester    = "tester-pipeline"
+	PipelineAgentEngineer  = "engineer"
+	PipelineAgentDesigner  = "designer"
+)
+
+const pipelineProtocolNamespace = "pipeline"
+
+// PipelineProtocolActionType categorizes the terminal action a pipeline
+// agent recorded at end-of-turn. Retained after the protocol-state
+// removal because the task router and tester still inspect the action
+// type to decide routing and status updates.
+type PipelineProtocolActionType string
+
+const (
+	PipelineProtocolActionHandoff  PipelineProtocolActionType = "handoff"
+	PipelineProtocolActionRefusal  PipelineProtocolActionType = "refusal"
+	PipelineProtocolActionValidate PipelineProtocolActionType = "validation"
+	PipelineProtocolActionOT       PipelineProtocolActionType = "handoff_to_ot"
+)
+
+// PipelineTurnAction records the terminal pipeline action for a turn.
+// Retained after the protocol-state removal for task router routing
+// and tester turn-response packaging.
+type PipelineTurnAction struct {
+	Type                 PipelineProtocolActionType
+	AgentType            string
+	AgentID              string
+	CreatesChallenge     bool
+	AuditLockPhase       string
+	TargetAgents         []string
+	Mode                 string
+	Reason               string
+	Request              string
+	RequiredOutput       []string
+	References           []string
+	ChallengeID          string
+	Summary              string
+	EvidenceRefs         []string
+	WorkspaceFingerprint string
+}
+
+// PipelineValidationProcessing records a validation that was processed
+// during a pipeline turn.
+type PipelineValidationProcessing struct {
+	ChallengeID string
+	Decision    string
+}
+
+// PipelineTurnResponse is the structured envelope pipeline agents return
+// from their tool-loop turns. The task router decodes this to determine
+// the next routing action.
+type PipelineTurnResponse struct {
+	Result    any                            `json:"result,omitempty"`
+	Action    *PipelineTurnAction            `json:"action,omitempty"`
+	Processed []PipelineValidationProcessing `json:"processed,omitempty"`
+}
+
+// DecodePipelineTurnResponse parses a turn response from raw data.
+// Accepts *PipelineTurnResponse, PipelineTurnResponse, or JSON-marshalable
+// data and returns the decoded response.
+func DecodePipelineTurnResponse(data any) (*PipelineTurnResponse, error) {
+	switch typed := data.(type) {
+	case nil:
+		return nil, fmt.Errorf("pipeline turn response is required")
+	case *PipelineTurnResponse:
+		return typed, nil
+	case PipelineTurnResponse:
+		copy := typed
+		return &copy, nil
+	default:
+		encoded, err := json.Marshal(data)
+		if err != nil {
+			return nil, err
+		}
+		var response PipelineTurnResponse
+		if err := json.Unmarshal(encoded, &response); err != nil {
+			return nil, err
+		}
+		return &response, nil
+	}
+}
+
+// BuildPipelineTurnResponse wraps a result into a PipelineTurnResponse.
+// In the post-protocol era, this simply wraps the result with no action
+// or processed validations (those came from the now-removed protocol state).
+func BuildPipelineTurnResponse(_ context.Context, result any) any {
+	return &PipelineTurnResponse{
+		Result: result,
+	}
+}
+
+// PipelineHandoffArtifactRef describes a verification artifact the tester
+// packages for a specific target agent during finalize_pipeline.
+type PipelineHandoffArtifactRef struct {
+	ArtifactID        string   `json:"artifact_id"`
+	Kind              string   `json:"kind,omitempty"`
+	Target            string   `json:"target"`
+	SuiteID           string   `json:"suite_id,omitempty"`
+	Summary           string   `json:"summary,omitempty"`
+	EvidenceRefs      []string `json:"evidence_refs,omitempty"`
+	FailureFocus      []string `json:"failure_focus,omitempty"`
+	QueuedAtIteration int      `json:"queued_at_iteration,omitempty"`
+}
+
+// PipelineTesterFinalizeTargetSpec is the per-target spec the LLM provides
+// when calling finalize_pipeline.
+type PipelineTesterFinalizeTargetSpec struct {
+	Target       string   `json:"target"`
+	Summary      string   `json:"summary"`
+	EvidenceRefs []string `json:"evidence_refs,omitempty"`
+	FailureFocus []string `json:"failure_focus,omitempty"`
+}
+
+// PipelineTesterFinalizeFn is the callback type for the tester's
+// finalize_pipeline publish step.
+type PipelineTesterFinalizeFn func(ctx context.Context, suiteID string, specs []PipelineTesterFinalizeTargetSpec) ([]PipelineHandoffArtifactRef, error)
+
+// PipelineTurnTerminalAction returns nil in the post-protocol era.
+// Retained for call-site compatibility in tool loops that check
+// whether a turn has been terminated by a protocol action.
+func PipelineTurnTerminalAction(_ context.Context) *PipelineTurnAction {
+	return nil
+}
+
+// PipelineTurnTerminated reports whether the current pipeline turn has
+// been terminated by a protocol action. Always false in the
+// post-protocol era (claims board does not use terminal actions).
+func PipelineTurnTerminated(ctx context.Context) bool {
+	return PipelineTurnTerminalAction(ctx) != nil
+}
+
 type pipelineTaskContextKey struct{}
 
 // PipelineTaskInput is the shared wire shape used by orchestrator pipeline
@@ -251,9 +384,12 @@ func PipelineCurrentRequest(task *PipelineTaskInput) string {
 	if task == nil {
 		return ""
 	}
-	if snapshot, err := PipelineProtocolSnapshotFromTask(task); err == nil && snapshot != nil {
-		if current := strings.TrimSpace(snapshot.CurrentRequest); current != "" {
-			return current
+	// Check the pipeline_protocol context map for a current_request field.
+	if task.Context != nil {
+		if protocol, _ := task.Context["pipeline_protocol"].(map[string]any); protocol != nil {
+			if current, _ := protocol["current_request"].(string); strings.TrimSpace(current) != "" {
+				return strings.TrimSpace(current)
+			}
 		}
 	}
 	return strings.TrimSpace(task.Prompt)
@@ -718,4 +854,116 @@ func summarizeCoordinationPrecedents(value any) []string {
 		}
 	}
 	return items
+}
+
+func containsNormalizedString(values []string, want string) bool {
+	want = strings.TrimSpace(want)
+	if want == "" {
+		return false
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func decodeProtocolPayload(data json.RawMessage, out any) error {
+	if len(data) == 0 {
+		return nil
+	}
+	return json.Unmarshal(data, out)
+}
+
+func mustMarshalRaw(v any) json.RawMessage {
+	if v == nil {
+		return nil
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+func cloneAnyMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func decodeMailboxPayload(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var out any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return string(raw)
+	}
+	return out
+}
+
+func streamCorrelationID(stream StreamContext) string {
+	return strings.TrimSpace(stream.CorrelationID)
+}
+
+func streamParentCorrelationID(stream StreamContext) string {
+	if len(stream.Metadata) == 0 {
+		return ""
+	}
+	if value, _ := stream.Metadata[streamMetadataParentCorrelation].(string); strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
+func pipelineTaskMetadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	switch value := metadata[key].(type) {
+	case string:
+		return strings.TrimSpace(value)
+	default:
+		return ""
+	}
+}
+
+// firstNonEmpty returns the first non-empty (after trimming) string from
+// the variadic values. Returns "" when all are blank.
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// normalizeStringList trims, deduplicates, and drops empty entries from
+// a string slice. Returns nil for empty input.
+func normalizeStringList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
 }

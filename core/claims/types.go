@@ -124,6 +124,19 @@ const (
 	ActionTypeArchival     ActionType = "archival"     // summarize, ingest, record
 	ActionTypePrompt       ActionType = "prompt"       // user prompt classification/decomposition
 	ActionTypeTestament    ActionType = "testament"    // agent testifying about work performed, findings, or failures
+	ActionTypeBoot         ActionType = "boot"         // boot pipeline phase execution
+	ActionTypeActivation   ActionType = "activation"   // agent container activation
+	ActionTypeShutdown     ActionType = "shutdown"      // graceful agent shutdown
+)
+
+// Artifact kind constants for lifecycle claims.
+const (
+	ArtifactKindTiming      = "timing"       // phase duration
+	ArtifactKindStats       = "stats"        // counts: files, nodes, edges, etc.
+	ArtifactKindReadiness   = "readiness"    // agent readiness status
+	ArtifactKindAgentID     = "agent_id"     // container/agent identifier
+	ArtifactKindShutdownAck = "shutdown_ack" // shutdown acknowledgment
+	ArtifactKindStateHash   = "state_hash"   // hash of persisted state
 )
 
 // ActionStatus tracks an action's aggregate lifecycle.
@@ -477,6 +490,11 @@ type ClaimsBoardConfig struct {
 	// NoopDeltaBus and bus publication is a silent no-op. Inboxes
 	// that want to subscribe need a real DeltaBus wired here.
 	DeltaBus DeltaBus
+
+	// ParentBoardID, when non-empty, establishes this board as a
+	// scoped child of the parent (e.g., pipeline board as child of
+	// session board). Stored as metadata on the board.
+	ParentBoardID string
 }
 
 // ScopeProvider launches tracked goroutines. Matches the signature of

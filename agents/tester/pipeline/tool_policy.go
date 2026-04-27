@@ -22,12 +22,6 @@ func pipelineTesterVisibleSkillNames() []string {
 		"write_test",
 		"run_test_suite",
 		"diagnose_failure",
-		// challenge_agent / handoff_next / validate_work /
-		// process_validation / finalize_pipeline collapsed into
-		// pipeline_protocol(action=…). The per-verb skills remain
-		// registered for internal callers but no longer surface to
-		// the LLM individually.
-		"pipeline_protocol",
 		"declare_decision",
 		"ask_user_clarification",
 		// Claims skills: read-only board introspection is Local (visible).
@@ -53,10 +47,6 @@ func pipelineTesterMutatingSkillNames() []string {
 		"bash",
 		"run_test_suite",
 		"finalize_pipeline",
-		"challenge_agent",
-		"handoff_next",
-		"validate_work",
-		"process_validation",
 		"declare_decision",
 		"reroute_request",
 		// Claims skills: mutating operations need LocalWorker policy.

@@ -54,6 +54,7 @@ var (
 		DomainTester,
 		DomainOrchestrator,
 		DomainGuide,
+		DomainClaims,
 	}
 	domainNames = map[Domain]string{
 		DomainCode:         "code",
@@ -66,6 +67,7 @@ var (
 		DomainTester:       "tester",
 		DomainOrchestrator: "orchestrator",
 		DomainGuide:        "guide",
+		DomainClaims:       "claims",
 	}
 	domainByName = buildEnumParseMap(domainNames)
 
@@ -74,6 +76,7 @@ var (
 		DomainHistory,
 		DomainAcademic,
 		DomainArchitect,
+		DomainClaims,
 	}
 	pipelineDomains = []Domain{
 		DomainEngineer,
@@ -132,6 +135,10 @@ var (
 		NodeTypeRoutingRule,
 		NodeTypeIntentPattern,
 		NodeTypeUserQuery,
+		NodeTypeClaim,
+		NodeTypeTestament,
+		NodeTypeArtifact,
+		NodeTypeValidation,
 	}
 	nodeTypeNames = map[NodeType]string{
 		NodeTypeFile:                 "file",
@@ -176,6 +183,10 @@ var (
 		NodeTypeRoutingRule:          "routing_rule",
 		NodeTypeIntentPattern:        "intent_pattern",
 		NodeTypeUserQuery:            "user_query",
+		NodeTypeClaim:                "claim",
+		NodeTypeTestament:            "testament",
+		NodeTypeArtifact:             "artifact",
+		NodeTypeValidation:           "validation",
 	}
 	nodeTypeByName    = buildEnumParseMap(nodeTypeNames)
 	nodeTypesByDomain = map[Domain][]NodeType{
@@ -241,6 +252,12 @@ var (
 			NodeTypeIntentPattern,
 			NodeTypeUserQuery,
 		},
+		DomainClaims: {
+			NodeTypeClaim,
+			NodeTypeTestament,
+			NodeTypeArtifact,
+			NodeTypeValidation,
+		},
 	}
 	validNodeTypeSet   = buildEnumSet(validNodeTypes)
 	nodeTypeDomainSets = buildNodeTypeDomainSets(nodeTypesByDomain)
@@ -275,6 +292,12 @@ var (
 		EdgeTypeImplementsPattern,
 		EdgeTypeCites,
 		EdgeTypeRelatedTo,
+		EdgeTypeDependsOn,
+		EdgeTypeCausedBy,
+		EdgeTypeRefines,
+		EdgeTypeConflictsWith,
+		EdgeTypeTestifies,
+		EdgeTypeProves,
 	}
 	structuralEdgeTypes = []EdgeType{
 		EdgeTypeCalls,
@@ -311,10 +334,19 @@ var (
 		EdgeTypeCites,
 		EdgeTypeRelatedTo,
 	}
+	claimsEdgeTypes = []EdgeType{
+		EdgeTypeDependsOn,
+		EdgeTypeCausedBy,
+		EdgeTypeRefines,
+		EdgeTypeConflictsWith,
+		EdgeTypeTestifies,
+		EdgeTypeProves,
+	}
 	validEdgeTypeSet       = buildEnumSet(validEdgeTypes)
 	structuralEdgeTypeSet  = buildEnumSet(structuralEdgeTypes)
 	temporalEdgeTypeSet    = buildEnumSet(temporalEdgeTypes)
 	crossDomainEdgeTypeSet = buildEnumSet(crossDomainEdgeTypes)
+	claimsEdgeTypeSet      = buildEnumSet(claimsEdgeTypes)
 	edgeTypeNames          = map[EdgeType]string{
 		EdgeTypeCalls:             "calls",
 		EdgeTypeCalledBy:          "called_by",
@@ -345,6 +377,12 @@ var (
 		EdgeTypeImplementsPattern: "implements_pattern",
 		EdgeTypeCites:             "cites",
 		EdgeTypeRelatedTo:         "related_to",
+		EdgeTypeDependsOn:         "depends_on",
+		EdgeTypeCausedBy:          "caused_by",
+		EdgeTypeRefines:           "refines",
+		EdgeTypeConflictsWith:     "conflicts_with",
+		EdgeTypeTestifies:         "testifies",
+		EdgeTypeProves:            "proves",
 	}
 	edgeTypeByName = buildEnumParseMap(edgeTypeNames)
 

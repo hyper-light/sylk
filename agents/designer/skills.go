@@ -76,22 +76,6 @@ func (d *Designer) registerCoreSkills() {
 		d.skills.Register(skill)
 	}
 
-	// ── Pipeline protocol skills (handoff_next, challenge_agent, etc.) ──
-	//
-	// Provides the full pipeline protocol surface: handoff_next,
-	// challenge_agent, validate_work, process_validation, finalize_pipeline.
-	// All handoff/challenge dispatches carry issuing-side claims via
-	// issuePipelineTurnSelection in pipeline_protocol.go.
-	for _, skill := range shared.PipelineProtocolSkills(shared.PipelineProtocolSkillConfig{
-		AgentType: func() string { return "designer" },
-		AgentID:   func() string { return d.id },
-		Route: shared.PipelineProtocolRouteConfig{
-			BusProvider: func() guide.EventBus { return d.bus },
-			SessionID:   func() string { return d.config.SessionID },
-		},
-	}) {
-		d.skills.Register(skill)
-	}
 	// Activity Fabric: uniform awareness skills + cross-pipeline primitives.
 	for _, skill := range fabric.AwarenessSkills(fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,
@@ -114,7 +98,23 @@ func (d *Designer) registerCoreSkills() {
 	// ── Claims skills (unconditional) ──────────────────────────────
 	//
 	// Every pipeline uses claims. No legacy protocol path.
-	boardProvider := func() *claims.ClaimsBoard { return d.claimsBoard }
+	boardProvider := func() (*claims.ClaimsBoard, error) {
+		if b := d.claimsBoard; b != nil {
+			return b, nil
+		}
+		sid, _ := d.activeSessionID.Load().(string)
+		if sid == "" {
+			sid = d.config.SessionID
+		}
+		if sid == "" {
+			return nil, fmt.Errorf("designer: no session ID configured")
+		}
+		board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+		if board == nil {
+			return nil, fmt.Errorf("designer: session %q has no claims board registered", sid)
+		}
+		return board, nil
+	}
 	d.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	inboxProvider := func() *claims.ClaimsInbox { return d.claimsInbox }
 	d.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))

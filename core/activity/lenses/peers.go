@@ -10,6 +10,8 @@ package lenses
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -336,4 +338,76 @@ func SessionIngestionContext(ctx context.Context, src activity.Source, sessionID
 		RecentDecisions: decisions,
 		OpenConflicts:   conflicts,
 	}, nil
+}
+
+// ClaimConflictsResult extends OpenConflictsResult with claims-aware
+// conflict signals from the board.
+type ClaimConflictsResult struct {
+	OpenConflictsResult
+
+	// RejectedClaims are claims that were rejected — conflicts with the
+	// original plan.
+	RejectedClaims []activity.AgentActivity
+
+	// ValidationFailures are claims with at least one failed validation.
+	ValidationFailures []activity.AgentActivity
+}
+
+// ClaimConflictsOpen extends ConflictsOpen with claims-specific conflict
+// detection: rejected claims and validation failures from the Fabric
+// activity stream. The existing ConflictsOpen result is embedded.
+func ClaimConflictsOpen(ctx context.Context, src activity.Source, q OpenConflictsQuery) (ClaimConflictsResult, error) {
+	base, err := ConflictsOpen(ctx, src, q)
+	if err != nil {
+		return ClaimConflictsResult{}, err
+	}
+	result := ClaimConflictsResult{OpenConflictsResult: base}
+	if src == nil {
+		return result, nil
+	}
+
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+
+	rejected, err := src.FilterActivities(ctx, activity.QueryFilter{
+		SessionID:   q.SessionID,
+		ActionKinds: []activity.ActionKind{activity.ActionClaimRejected},
+		Limit:       limit,
+	})
+	if err != nil {
+		slog.Warn("claim_conflicts_rejected_query_failed", "error", err.Error())
+	} else {
+		result.RejectedClaims = rejected
+	}
+
+	validations, err := src.FilterActivities(ctx, activity.QueryFilter{
+		SessionID:   q.SessionID,
+		ActionKinds: []activity.ActionKind{activity.ActionClaimValidated},
+		Limit:       limit,
+	})
+	if err != nil {
+		slog.Warn("claim_conflicts_validation_query_failed", "error", err.Error())
+	} else {
+		for _, v := range validations {
+			if isFailedValidationActivity(v) {
+				result.ValidationFailures = append(result.ValidationFailures, v)
+			}
+		}
+	}
+
+	return result, nil
+}
+
+func isFailedValidationActivity(a activity.AgentActivity) bool {
+	if len(a.Payload) == 0 {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(a.Payload, &payload); err != nil {
+		return false
+	}
+	status, _ := payload["status"].(string)
+	return status == "failed"
 }

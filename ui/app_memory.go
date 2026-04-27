@@ -446,7 +446,10 @@ func memoryTreeFamilyFromChat(entry chatpkg.ChatEntry) (forest.TreeFamily, bool)
 	case chatpkg.SourceUser:
 		return forest.TreeFamilyIntent, true
 	case chatpkg.SourceError:
-		return forest.TreeFamilyConflict, true
+		// Issue #11 Phase 3: errors land as anti-pattern evidence
+		// (formerly TreeFamilyConflict, now subsumed by AntiPattern
+		// per the audit's negative-precedent consolidation).
+		return forest.TreeFamilyAntiPattern, true
 	case chatpkg.SourceSystem:
 		return "", false
 	}
@@ -456,7 +459,7 @@ func memoryTreeFamilyFromChat(entry chatpkg.ChatEntry) (forest.TreeFamily, bool)
 
 func memoryTreeFamilyForAgentType(agentType string, failed bool) (forest.TreeFamily, bool) {
 	if failed {
-		return forest.TreeFamilyConflict, true
+		return forest.TreeFamilyAntiPattern, true
 	}
 	normalized := strings.ToLower(strings.TrimSpace(agentType))
 	switch {
@@ -464,12 +467,13 @@ func memoryTreeFamilyForAgentType(agentType string, failed bool) (forest.TreeFam
 		return forest.TreeFamilyEvidence, true
 	case normalized == "guardian":
 		return forest.TreeFamilyConstraint, true
-	case normalized == "designer":
+	case normalized == "designer", normalized == "engineer",
+		normalized == "architect", normalized == "orchestrator", normalized == "guide":
+		// Issue #11 Phase 3: Capability + Decision both collapsed into
+		// Intent. Designer/engineer/architect/orchestrator/guide all
+		// surface intent-shaped contributions (plans, decisions, agent
+		// affordances) and route to the unified Intent tree.
 		return forest.TreeFamilyIntent, true
-	case normalized == "engineer":
-		return forest.TreeFamilyCapability, true
-	case normalized == "architect", normalized == "orchestrator", normalized == "guide":
-		return forest.TreeFamilyDecision, true
 	case normalized == "archivalist", strings.Contains(normalized, "tester"), strings.Contains(normalized, "inspector"):
 		return forest.TreeFamilyOutcome, true
 	case normalized == "academic", normalized == "librarian":
@@ -488,20 +492,17 @@ func memoryContentTypeForSource(source chatpkg.ChatSource, family forest.TreeFam
 	if source == chatpkg.SourceError {
 		return ctxpkg.ContentTypeHypothesis, string(family)
 	}
+	// Family is the post-Phase-3 canonical taxonomy: only the five
+	// consolidated families plus AntiPattern can reach this switch
+	// (forest.canonicalizeFamily runs at every author boundary).
 	switch family {
 	case forest.TreeFamilyIntent:
 		return ctxpkg.ContentTypeIntentSnapshot, ""
 	case forest.TreeFamilyConstraint:
 		return ctxpkg.ContentTypeConstraint, ""
-	case forest.TreeFamilyDecision:
-		return ctxpkg.ContentTypeDecision, ""
 	case forest.TreeFamilyOutcome:
 		return ctxpkg.ContentTypeOutcome, ""
-	case forest.TreeFamilyPreference:
-		return ctxpkg.ContentTypePreference, ""
-	case forest.TreeFamilyCapability:
-		return ctxpkg.ContentTypeBranchSummary, string(family)
-	case forest.TreeFamilyOpportunity, forest.TreeFamilyConflict:
+	case forest.TreeFamilyAntiPattern:
 		return ctxpkg.ContentTypeHypothesis, string(family)
 	default:
 		return ctxpkg.ContentTypeEvidence, ""

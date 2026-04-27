@@ -9,8 +9,7 @@ import (
 )
 
 // GlobalReviewProjection is the authoritative, read-only view of a
-// global review protocol state. Mirrors PipelineProjection semantics for
-// the global-review tier: single store, consumers read typed fields,
+// global review protocol state. Single store, consumers read typed fields,
 // LLM introspects via query_global_review_state.
 type GlobalReviewProjection struct {
 	ReviewID             string                           `json:"review_id,omitempty"`

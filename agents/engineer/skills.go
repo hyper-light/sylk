@@ -116,7 +116,20 @@ func (e *Engineer) registerCoreSkills() {
 	// ── Claims skills (unconditional) ──────────────────────────────
 	//
 	// Every pipeline uses claims. No legacy protocol path.
-	boardProvider := func() *claims.ClaimsBoard { return e.claimsBoard }
+	boardProvider := func() (*claims.ClaimsBoard, error) {
+		if b := e.claimsBoard; b != nil {
+			return b, nil
+		}
+		sid, _ := e.activeSessionID.Load().(string)
+		if sid == "" {
+			return nil, fmt.Errorf("engineer: no active session ID — agent invoked before session binding")
+		}
+		board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+		if board == nil {
+			return nil, fmt.Errorf("engineer: session %q has no claims board registered", sid)
+		}
+		return board, nil
+	}
 	inboxProvider := func() *claims.ClaimsInbox { return e.claimsInbox }
 	e.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	e.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))

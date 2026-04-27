@@ -33,8 +33,8 @@ func TestDomainConstants(t *testing.T) {
 func TestValidDomains(t *testing.T) {
 	domains := ValidDomains()
 
-	if len(domains) != 10 {
-		t.Errorf("expected 10 domains, got %d", len(domains))
+	if len(domains) != 11 {
+		t.Errorf("expected 11 domains, got %d", len(domains))
 	}
 
 	expectedDomains := map[Domain]bool{
@@ -48,6 +48,7 @@ func TestValidDomains(t *testing.T) {
 		DomainTester:       false,
 		DomainOrchestrator: false,
 		DomainGuide:        false,
+		DomainClaims:       false,
 	}
 
 	for _, d := range domains {
@@ -82,7 +83,7 @@ func TestDomainIsValid(t *testing.T) {
 		{"valid guide domain", DomainGuide, true},
 		{"invalid empty domain", Domain(-1), false},
 		{"invalid arbitrary domain", Domain(99), false},
-		{"invalid out of range domain", Domain(10), false},
+		{"invalid out of range domain", Domain(11), false},
 	}
 
 	for _, tt := range tests {
@@ -175,8 +176,8 @@ func TestNodeTypeConstants(t *testing.T) {
 func TestValidNodeTypes(t *testing.T) {
 	nodeTypes := ValidNodeTypes()
 
-	if len(nodeTypes) != 42 {
-		t.Errorf("expected 42 node types, got %d", len(nodeTypes))
+	if len(nodeTypes) != 46 {
+		t.Errorf("expected 46 node types, got %d", len(nodeTypes))
 	}
 
 	for _, nt := range nodeTypes {
@@ -439,8 +440,8 @@ func TestEdgeTypeConstants(t *testing.T) {
 func TestValidEdgeTypes(t *testing.T) {
 	edgeTypes := ValidEdgeTypes()
 
-	if len(edgeTypes) != 29 {
-		t.Errorf("expected 29 edge types, got %d", len(edgeTypes))
+	if len(edgeTypes) != 35 {
+		t.Errorf("expected 35 edge types, got %d", len(edgeTypes))
 	}
 
 	expectedTypes := map[EdgeType]bool{
@@ -473,6 +474,12 @@ func TestValidEdgeTypes(t *testing.T) {
 		EdgeTypeImplementsPattern: false,
 		EdgeTypeCites:             false,
 		EdgeTypeRelatedTo:         false,
+		EdgeTypeDependsOn:         false,
+		EdgeTypeCausedBy:          false,
+		EdgeTypeRefines:           false,
+		EdgeTypeConflictsWith:     false,
+		EdgeTypeTestifies:         false,
+		EdgeTypeProves:            false,
 	}
 
 	for _, et := range edgeTypes {
@@ -772,6 +779,9 @@ func TestEdgeTypeCategoriesMutuallyExclusive(t *testing.T) {
 				categoriesCount++
 			}
 			if et.IsCrossDomain() {
+				categoriesCount++
+			}
+			if et.IsClaims() {
 				categoriesCount++
 			}
 
@@ -1261,12 +1271,18 @@ func TestEdgeTypeCategoriesCoverAllEdgeTypes(t *testing.T) {
 		crossDomain[et] = true
 	}
 
+	claimsDomain := make(map[EdgeType]bool)
+	for _, et := range ClaimsEdgeTypes() {
+		claimsDomain[et] = true
+	}
+
 	for _, et := range allEdgeTypes {
 		inStructural := structural[et]
 		inTemporal := temporal[et]
 		inCrossDomain := crossDomain[et]
+		inClaims := claimsDomain[et]
 
-		if !inStructural && !inTemporal && !inCrossDomain {
+		if !inStructural && !inTemporal && !inCrossDomain && !inClaims {
 			t.Errorf("EdgeType(%q) is not in any category", et)
 		}
 	}

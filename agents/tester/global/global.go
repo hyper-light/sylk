@@ -460,8 +460,16 @@ func (gt *GlobalTester) registerCoreSkills() {
 	// Claims skills: global tester is a full claims participant —
 	// it validates merged work, posts actions about test results,
 	// and inspects cross-pipeline claim conflicts.
-	boardProvider := func() *claims.ClaimsBoard {
-		return claims.DefaultSessionBoardRegistry().Lookup(gt.config.SessionID)
+	boardProvider := func() (*claims.ClaimsBoard, error) {
+		sid := gt.config.SessionID
+		if sid == "" {
+			return nil, fmt.Errorf("tester-global: no session ID configured")
+		}
+		board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+		if board == nil {
+			return nil, fmt.Errorf("tester-global: session %q has no claims board registered", sid)
+		}
+		return board, nil
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return gt.claimsInbox }
 	gt.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))

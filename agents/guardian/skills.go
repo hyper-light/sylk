@@ -86,8 +86,16 @@ func (g *Guardian) registerFabricSkills() {
 	// Board is resolved from activeSessionID, which is set per-request
 	// in handleForwardBusRequest under the requestSerializer (single-
 	// writer guarantee — no race).
-	boardProvider := func() *claims.ClaimsBoard {
-		return claims.DefaultSessionBoardRegistry().Lookup(g.activeSessionID)
+	boardProvider := func() (*claims.ClaimsBoard, error) {
+		sid := g.activeSessionID
+		if sid == "" {
+			return nil, fmt.Errorf("guardian: no session ID configured")
+		}
+		board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+		if board == nil {
+			return nil, fmt.Errorf("guardian: session %q has no claims board registered", sid)
+		}
+		return board, nil
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return g.claimsInbox }
 	g.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))

@@ -1,9 +1,13 @@
 package forest
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
+	"time"
 )
 
 func ensureSchema(db *sql.DB) error {
@@ -268,6 +272,100 @@ func ensureSchema(db *sql.DB) error {
 			ON forest_event_seq_log(event_id);
 
 		-- ─────────────────────────────────────────────────────────────────
+		-- Retrieval audit ledger — append-only record of every Retrieve
+		-- call. Captures full ranked candidate set (not just top-K) so
+		-- counterfactual training can label all candidates from outcome
+		-- events, plus operator drill-down + A/B tooling.
+		--
+		-- Sibling forest_retrieval_event_seq_log mirrors the events log
+		-- pattern: AUTOINCREMENT seq with UNIQUE event_id for idempotent
+		-- replay safety.
+		-- ─────────────────────────────────────────────────────────────────
+		CREATE TABLE IF NOT EXISTS forest_retrieval_events (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			task_id TEXT,
+			agent_id TEXT,
+			agent_type TEXT,
+			intent_id TEXT,
+			query TEXT NOT NULL,
+			horizon TEXT,
+			families_blob TEXT,
+			requested_limit INTEGER NOT NULL,
+			include_counter_evidence INTEGER NOT NULL,
+			requested_at INTEGER NOT NULL,
+			duration_micros INTEGER NOT NULL,
+			candidate_count INTEGER NOT NULL,
+			returned_count INTEGER NOT NULL,
+			model_key TEXT,
+			model_version INTEGER,
+			error_message TEXT,
+			branch_projection_seq INTEGER NOT NULL DEFAULT 0,
+			candidates_blob TEXT NOT NULL,
+			metadata_blob TEXT
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_forest_retrieval_session
+			ON forest_retrieval_events(session_id, requested_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_forest_retrieval_agent
+			ON forest_retrieval_events(agent_id, requested_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_forest_retrieval_intent
+			ON forest_retrieval_events(intent_id, requested_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_forest_retrieval_time
+			ON forest_retrieval_events(requested_at DESC);
+
+		CREATE TABLE IF NOT EXISTS forest_retrieval_event_seq_log (
+			seq INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_id TEXT NOT NULL UNIQUE,
+			appended_at INTEGER NOT NULL
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_forest_retrieval_seq_log_event
+			ON forest_retrieval_event_seq_log(event_id);
+
+		-- ─────────────────────────────────────────────────────────────────
+		-- Retrieval candidates projection — denormalized one-row-per-
+		-- (retrieval, branch) view of forest_retrieval_events.candidates_blob.
+		-- Maintained by the retrieval-candidates projector (CQRS) and used
+		-- by counterfactual labeling to find retrievals containing a
+		-- branch via a single indexed lookup instead of a JSON LIKE scan.
+		-- ─────────────────────────────────────────────────────────────────
+		CREATE TABLE IF NOT EXISTS forest_retrieval_candidates (
+			retrieval_event_id TEXT NOT NULL,
+			retrieval_seq INTEGER NOT NULL,
+			branch_id TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			rank_position INTEGER NOT NULL,
+			returned INTEGER NOT NULL,
+			base_score REAL NOT NULL,
+			final_score REAL NOT NULL,
+			predicted_utility REAL NOT NULL,
+			predicted_risk REAL NOT NULL,
+			exploration_mode INTEGER NOT NULL DEFAULT 0,
+			retrieval_at INTEGER NOT NULL,
+			PRIMARY KEY (retrieval_event_id, branch_id)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_forest_retrieval_candidates_branch
+			ON forest_retrieval_candidates(branch_id, retrieval_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_forest_retrieval_candidates_session_branch
+			ON forest_retrieval_candidates(session_id, branch_id, retrieval_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_forest_retrieval_candidates_seq
+			ON forest_retrieval_candidates(retrieval_seq);
+
+		-- Sibling table for the implicit-negative sweeper to record
+		-- which retrieval events have been processed. Lives outside
+		-- forest_retrieval_events because that table is append-only
+		-- via trigger; sweep state is mutable per-retrieval state.
+		CREATE TABLE IF NOT EXISTS forest_retrieval_sweep_state (
+			retrieval_event_id TEXT PRIMARY KEY,
+			swept_at INTEGER NOT NULL
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_forest_retrieval_sweep_at
+			ON forest_retrieval_sweep_state(swept_at DESC);
+
+		-- ─────────────────────────────────────────────────────────────────
 		-- Projector state — lease coordination + watermark per logical
 		-- projector. Multi-process safety relies on the atomic UPDATE
 		-- WHERE clause on leader_lease_until.
@@ -302,7 +400,17 @@ func ensureSchema(db *sql.DB) error {
 		return err
 	}
 
+	// Issue #10 — archive tables must exist before the append-only
+	// triggers reference them in their conditional WHEN clauses.
+	if err := ensureForestArchiveTables(db); err != nil {
+		return err
+	}
+
 	if err := ensureForestEventsAppendOnly(db); err != nil {
+		return err
+	}
+
+	if err := ensureForestRetrievalEventsAppendOnly(db); err != nil {
 		return err
 	}
 
@@ -314,12 +422,262 @@ func ensureSchema(db *sql.DB) error {
 		return err
 	}
 
+	if err := ensureForestConstraintSeverity(db); err != nil {
+		return err
+	}
+
+	if err := ensureForestFamilyMigration(db); err != nil {
+		return err
+	}
+
+	if err := recordSchemaVersionHash(db); err != nil {
+		return err
+	}
+
 	return nil
 }
 
+// ensureForestFamilyMigration is the Phase 3 of Issue #11 one-shot
+// data migration that rewrites legacy family values to the collapsed
+// taxonomy. Idempotent: every UPDATE is conditional on the row still
+// using the old value, so re-running on an already-migrated DB is a
+// no-op.
+//
+// Mapping (audit-driven; see types.go family invariants):
+//
+//   decision     → intent       (a decision is "intent + selected
+//                                branch"; selection denormalized via
+//                                metadata if needed)
+//   preference   → constraint   (already populated severity=soft via
+//                                ensureForestConstraintSeverity)
+//   capability   → intent       (an agent's affordance is "what it
+//                                can pursue"; lift to intent)
+//   opportunity  → intent       (a time-bound capability/intent
+//                                match; encode timing via metadata)
+//   conflict     → antipattern  (the durable negative-evidence
+//                                successor; live conflict already
+//                                encoded by RelayRelationContradicts)
+//
+// Only forest_branches (the projection) is rewritten — forest_events
+// is the append-only ledger (MEM-03) and rewriting it would violate
+// the append-only trigger. Old events keep their historical family
+// values; the projector applies canonicalizeFamily before writing
+// each event to the projection (see projectBranchTx) so a from-scratch
+// projection rebuild lands canonical families even when replaying
+// pre-migration ledger rows.
+//
+// Operations are wrapped in a single transaction so a partial failure
+// rolls back the entire migration.
+func ensureForestFamilyMigration(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin family migration tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	migrations := []struct {
+		oldFamily string
+		newFamily string
+	}{
+		{"decision", "intent"},
+		{"preference", "constraint"},
+		{"capability", "intent"},
+		{"opportunity", "intent"},
+		{"conflict", "antipattern"},
+	}
+	for _, m := range migrations {
+		if _, err := tx.Exec(
+			`UPDATE forest_branches SET family = ? WHERE family = ?`,
+			m.newFamily, m.oldFamily,
+		); err != nil {
+			return fmt.Errorf("migrate forest_branches family %s→%s: %w", m.oldFamily, m.newFamily, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit family migration: %w", err)
+	}
+	return nil
+}
+
+// ensureForestConstraintSeverity populates constraint_severity for
+// any branch with family='preference' (legacy TreeFamilyPreference).
+// Idempotent: only updates rows where severity is still empty so
+// re-running on an already-migrated DB is a no-op.
+//
+// Phase 1 of Issue #11 keeps the family value as 'preference' so
+// existing readers continue to work; Phase 3 rewrites the family
+// itself in a separate migration step.
+func ensureForestConstraintSeverity(db *sql.DB) error {
+	if _, err := db.Exec(`
+		UPDATE forest_branches
+		SET    constraint_severity = ?
+		WHERE  family = ?
+		  AND  constraint_severity = ''
+	`, string(ConstraintSeveritySoft), string(TreeFamilyPreference)); err != nil {
+		return fmt.Errorf("backfill preference severity: %w", err)
+	}
+	return nil
+}
+
+// recordSchemaVersionHash writes a row in forest_schema_versions
+// reflecting the current expected schema hash. Idempotent: if the
+// most recent row already matches the current hash, no new row is
+// written. A drift (DB row hash != current code hash) is the
+// detectable signal Health() reports.
+func recordSchemaVersionHash(db *sql.DB) error {
+	currentHash := expectedSchemaHash()
+	row := db.QueryRow(`
+		SELECT schema_hash
+		FROM   forest_schema_versions
+		ORDER BY version DESC
+		LIMIT  1
+	`)
+	var lastHash string
+	err := row.Scan(&lastHash)
+	if err == nil && lastHash == currentHash {
+		return nil
+	}
+	// Either no row yet (first migration) or the hash changed.
+	now := time.Now().UTC().Unix()
+	if _, insertErr := db.Exec(`
+		INSERT INTO forest_schema_versions (schema_hash, applied_at)
+		VALUES (?, ?)
+	`, currentHash, now); insertErr != nil {
+		return fmt.Errorf("record schema version: %w", insertErr)
+	}
+	return nil
+}
+
+// expectedSchemaHash returns a deterministic hash of the schema
+// expected by this build. Computed at runtime over a stable list of
+// table + trigger + index identifiers. Operators see drift when the
+// DB's recorded hash doesn't match this value — usually meaning the
+// process is running against a database migrated by a different
+// build.
+//
+// Hash inputs:
+//   - sorted list of table names this package creates
+//   - sorted list of trigger names (append-only enforcement)
+//   - sorted list of index names this package creates
+//
+// Bumping the schema (adding a column, table, trigger, or index)
+// mechanically changes this hash because the input lists differ.
+//
+// MAINTENANCE NOTE: every CREATE TABLE / CREATE INDEX / CREATE TRIGGER
+// in this package's schema files must appear in one of the lists
+// below. A name that exists in the schema but not in the list won't
+// affect the hash, weakening drift detection.
+func expectedSchemaHash() string {
+	tables := []string{
+		"forest_events",
+		"forest_branches",
+		"forest_relay_edges",
+		"forest_canopies",
+		"forest_event_seq_log",
+		"forest_branch_traces",
+		"forest_substrate_edges",
+		"forest_substrate_sessions",
+		"forest_substrate_state",
+		"forest_substrate_frontiers",
+		"forest_replay_queue",
+		"forest_training_examples",
+		"forest_models",
+		"forest_projector_state",
+		"forest_retrieval_events",
+		"forest_retrieval_event_seq_log",
+		"forest_retrieval_candidates",
+		"forest_retrieval_sweep_state",
+		"forest_base_score_models",
+		"forest_schema_versions",
+		"forest_events_archive",
+		"forest_events_archive_summary",
+		"forest_retrieval_events_archive",
+		"forest_retrieval_events_archive_summary",
+		"node_access_traces",
+		"decay_parameters",
+	}
+	triggers := []string{
+		"forest_events_no_update",
+		"forest_events_no_delete",
+		"forest_retrieval_events_no_update",
+		"forest_retrieval_events_no_delete",
+		"forest_events_archive_no_update",
+		"forest_events_archive_no_delete",
+		"forest_retrieval_events_archive_no_update",
+		"forest_retrieval_events_archive_no_delete",
+	}
+	indexes := []string{
+		"idx_forest_events_session_time",
+		"idx_forest_events_branch_time",
+		"idx_forest_events_root_time",
+		"idx_forest_events_family",
+		"idx_forest_events_content",
+		"idx_forest_events_task_time",
+		"idx_forest_branches_session",
+		"idx_forest_branches_root",
+		"idx_forest_branches_family",
+		"idx_forest_branches_state",
+		"idx_forest_branches_task",
+		"idx_forest_relays_source",
+		"idx_forest_relays_target",
+		"idx_forest_canopies_session",
+		"idx_forest_canopies_task",
+		"idx_forest_replay_ready",
+		"idx_forest_branch_traces_lookup",
+		"idx_forest_training_branch",
+		"idx_forest_training_labels",
+		"idx_forest_training_label_source",
+		"idx_forest_training_audit_event",
+		"idx_forest_models_active",
+		"idx_forest_substrate_edges_source",
+		"idx_forest_substrate_edges_target",
+		"idx_forest_substrate_sessions_dirty",
+		"idx_forest_substrate_state_lookup",
+		"idx_forest_substrate_frontiers_lookup",
+		"idx_forest_event_seq_log_event",
+		"idx_forest_retrieval_session",
+		"idx_forest_retrieval_agent",
+		"idx_forest_retrieval_intent",
+		"idx_forest_retrieval_time",
+		"idx_forest_retrieval_seq_log_event",
+		"idx_forest_retrieval_candidates_branch",
+		"idx_forest_retrieval_candidates_session_branch",
+		"idx_forest_retrieval_candidates_seq",
+		"idx_forest_retrieval_sweep_at",
+		"idx_forest_base_score_models_version",
+		"idx_forest_base_score_models_role",
+		"idx_forest_events_archive_branch",
+		"idx_forest_events_archive_session_time",
+		"idx_forest_retrieval_events_archive_session",
+		"idx_node_access_traces_lookup",
+	}
+	sort.Strings(tables)
+	sort.Strings(triggers)
+	sort.Strings(indexes)
+	hasher := sha256.New()
+	for _, t := range tables {
+		hasher.Write([]byte("table:"))
+		hasher.Write([]byte(t))
+		hasher.Write([]byte{0})
+	}
+	for _, t := range triggers {
+		hasher.Write([]byte("trigger:"))
+		hasher.Write([]byte(t))
+		hasher.Write([]byte{0})
+	}
+	for _, i := range indexes {
+		hasher.Write([]byte("index:"))
+		hasher.Write([]byte(i))
+		hasher.Write([]byte{0})
+	}
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
 // ensureForestProjectorColumns adds the last_applied_seq watermark
-// columns to projection tables. Idempotent — uses PRAGMA table_info
-// to introspect existing columns and skip ALTERs that already ran.
+// columns to projection tables, plus selection-bias-fix columns on
+// forest_retrieval_events and forest_training_examples. Idempotent —
+// uses PRAGMA table_info to introspect existing columns and skip
+// ALTERs that already ran.
 func ensureForestProjectorColumns(db *sql.DB) error {
 	additions := []struct {
 		table  string
@@ -330,11 +688,56 @@ func ensureForestProjectorColumns(db *sql.DB) error {
 		{"forest_relay_edges", "last_applied_seq", "INTEGER NOT NULL DEFAULT 0"},
 		{"forest_canopies", "last_applied_seq", "INTEGER NOT NULL DEFAULT 0"},
 		{"forest_substrate_sessions", "last_applied_seq", "INTEGER NOT NULL DEFAULT 0"},
+		// Issue #3 — selection-bias-fix columns.
+		// Note: swept_at lives on the sibling forest_retrieval_sweep_state
+		// table, NOT on forest_retrieval_events (which is append-only and
+		// would reject the UPDATE).
+		//
+		// label_source default is empty string ('') meaning "no outcome
+		// label yet" — distinct from the four LabelSource enum values
+		// which only apply once an outcome label is recorded.
+		// retrieval_mode is set at retrieval-example creation time to
+		// 'exploration' for ε-greedy retrievals, '' otherwise.
+		// audit_event_id links a training example back to the retrieval
+		// audit event that produced it; counterfactual labeling JOINs
+		// via this column to forest_retrieval_candidates.
+		{"forest_retrieval_events", "exploration_mode", "INTEGER NOT NULL DEFAULT 0"},
+		{"forest_training_examples", "label_source", "TEXT NOT NULL DEFAULT ''"},
+		{"forest_training_examples", "label_weight", "REAL NOT NULL DEFAULT 1.0"},
+		{"forest_training_examples", "retrieval_mode", "TEXT NOT NULL DEFAULT ''"},
+		{"forest_training_examples", "audit_event_id", "TEXT NOT NULL DEFAULT ''"},
+		// Issue #7 — substrate-mode A/B capture. Default empty so legacy
+		// rows back-fill as "unknown" and SubstrateModeStatsSince filters
+		// them out of comparisons.
+		{"forest_retrieval_events", "substrate_mode", "TEXT NOT NULL DEFAULT ''"},
+		// Issue #8 — learned base scorer A/B capture. Default 0 means
+		// "hardcoded defaults" (cold-start or pre-Issue #8). Non-zero
+		// values reference forest_base_score_models.version.
+		{"forest_retrieval_events", "base_score_version", "INTEGER NOT NULL DEFAULT 0"},
+		{"forest_retrieval_events", "base_score_variant", "TEXT NOT NULL DEFAULT ''"},
+		// Issue #11 Phase 1 — Constraint vs Preference distinction is
+		// now encoded by this column rather than two TreeFamily values.
+		// Empty string = not applicable (non-Constraint family); 'hard'
+		// or 'soft' for Constraint family rows.
+		{"forest_branches", "constraint_severity", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, a := range additions {
 		if err := addColumnIfMissing(db, a.table, a.column, a.decl); err != nil {
 			return fmt.Errorf("add %s.%s: %w", a.table, a.column, err)
 		}
+	}
+	if _, err := db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_forest_training_label_source
+			ON forest_training_examples(label_source, updated_at DESC)
+	`); err != nil {
+		return fmt.Errorf("create idx_forest_training_label_source: %w", err)
+	}
+	if _, err := db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_forest_training_audit_event
+			ON forest_training_examples(audit_event_id, branch_id)
+			WHERE audit_event_id != ''
+	`); err != nil {
+		return fmt.Errorf("create idx_forest_training_audit_event: %w", err)
 	}
 	return nil
 }
@@ -406,26 +809,74 @@ func ensureForestEventSeqBackfilled(db *sql.DB) error {
 // and compaction are handled by archival workflows that move rows to
 // cold storage, not by in-place mutation.
 //
-// The trigger definitions are idempotent via `CREATE TRIGGER IF NOT
-// EXISTS`; re-running ensureSchema on an existing DB is a no-op.
+// The no-update trigger preserves immutability of any row that
+// remains in forest_events. The no-delete trigger is conditional:
+// DELETE is only permitted for rows whose id has already been
+// inserted into forest_events_archive. Issue #10 archival worker
+// uses this contract — INSERT into archive first, THEN DELETE from
+// hot. The conditional preserves the append-only audit invariant
+// (a row never disappears without a durable archived copy) while
+// allowing storage reclamation.
+//
+// Idempotent via CREATE TRIGGER IF NOT EXISTS + DROP TRIGGER IF
+// EXISTS for the rewritten variant. Re-running ensureSchema on an
+// upgraded DB drops the legacy unconditional no-delete trigger and
+// installs the archive-conditional one.
 func ensureForestEventsAppendOnly(db *sql.DB) error {
-	triggers := []string{
+	statements := []string{
 		`CREATE TRIGGER IF NOT EXISTS forest_events_no_update
 			BEFORE UPDATE ON forest_events
 			BEGIN
 				SELECT RAISE(ABORT,
 					'forest_events is append-only (MEM-03); use supersedes/contradicts columns on a new row');
 			END;`,
+		// Replace any pre-existing legacy unconditional no-delete
+		// trigger before installing the archive-conditional variant.
+		`DROP TRIGGER IF EXISTS forest_events_no_delete`,
 		`CREATE TRIGGER IF NOT EXISTS forest_events_no_delete
 			BEFORE DELETE ON forest_events
+			WHEN NOT EXISTS (
+				SELECT 1 FROM forest_events_archive WHERE id = OLD.id
+			)
 			BEGIN
 				SELECT RAISE(ABORT,
-					'forest_events is append-only (MEM-03); archival must go through cold-storage migration, not DELETE');
+					'forest_events DELETE requires prior archival (Issue #10): row must exist in forest_events_archive before deletion');
 			END;`,
 	}
-	for _, stmt := range triggers {
+	for _, stmt := range statements {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("install forest_events append-only trigger: %w", err)
+		}
+	}
+	return nil
+}
+
+// ensureForestRetrievalEventsAppendOnly installs the SQLite triggers
+// that enforce append-only semantics on the retrieval audit ledger.
+// Mirrors forest_events: no-update is unconditional; no-delete
+// requires the row to exist in forest_retrieval_events_archive.
+func ensureForestRetrievalEventsAppendOnly(db *sql.DB) error {
+	statements := []string{
+		`CREATE TRIGGER IF NOT EXISTS forest_retrieval_events_no_update
+			BEFORE UPDATE ON forest_retrieval_events
+			BEGIN
+				SELECT RAISE(ABORT,
+					'forest_retrieval_events is append-only; an audit row records what was returned at a point in time and must not be rewritten');
+			END;`,
+		`DROP TRIGGER IF EXISTS forest_retrieval_events_no_delete`,
+		`CREATE TRIGGER IF NOT EXISTS forest_retrieval_events_no_delete
+			BEFORE DELETE ON forest_retrieval_events
+			WHEN NOT EXISTS (
+				SELECT 1 FROM forest_retrieval_events_archive WHERE id = OLD.id
+			)
+			BEGIN
+				SELECT RAISE(ABORT,
+					'forest_retrieval_events DELETE requires prior archival (Issue #10): row must exist in forest_retrieval_events_archive before deletion');
+			END;`,
+	}
+	for _, stmt := range statements {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("install forest_retrieval_events append-only trigger: %w", err)
 		}
 	}
 	return nil
@@ -451,10 +902,164 @@ func ensureForestSupportTables(db *sql.DB) error {
 			effective_samples REAL NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
+		// Issue #8 — learned base scorer model store. Each row is one
+		// trained version of the 13-component linear scorer. Role
+		// flags ('champion' / 'challenger' / '') determine which
+		// version is currently serving traffic. Append-only-by-
+		// convention: training writes new rows; promotion mutates
+		// only the role column.
+		`CREATE TABLE IF NOT EXISTS forest_base_score_models (
+			id            TEXT PRIMARY KEY,
+			version       INTEGER NOT NULL,
+			weights_blob  TEXT NOT NULL,
+			bias          REAL NOT NULL DEFAULT 0,
+			l1_norm       REAL NOT NULL DEFAULT 0,
+			accuracy      REAL NOT NULL DEFAULT 0,
+			training_size INTEGER NOT NULL DEFAULT 0,
+			trained_at    INTEGER NOT NULL,
+			role          TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_forest_base_score_models_version
+			ON forest_base_score_models(version)`,
+		`CREATE INDEX IF NOT EXISTS idx_forest_base_score_models_role
+			ON forest_base_score_models(role) WHERE role != ''`,
+		// Issue #9 — schema-version journal. Each successful migration
+		// run records its expected-schema hash so Health() can detect
+		// drift (DB at one version, code at another). Append-only by
+		// convention; the latest row is the active version.
+		`CREATE TABLE IF NOT EXISTS forest_schema_versions (
+			version      INTEGER PRIMARY KEY AUTOINCREMENT,
+			schema_hash  TEXT NOT NULL,
+			applied_at   INTEGER NOT NULL
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
 			return fmt.Errorf("create support table: %w", err)
+		}
+	}
+	return nil
+}
+
+// ensureForestArchiveTables creates the cold-storage tables for the
+// Issue #10 archival worker. Schema mirrors forest_events /
+// forest_retrieval_events except payload is stored compressed
+// (gzip) in a BLOB column. Append-only by convention; the worker
+// never UPDATEs archived rows. Summary tables hold per-branch /
+// per-session denormalized counts for fast operator queries
+// without scanning the archive.
+func ensureForestArchiveTables(db *sql.DB) error {
+	statements := []string{
+		// Compressed cold storage for forest_events. Same column
+		// shape so a JOIN UNION ALL across hot+archive returns a
+		// uniform result set (modulo payload_compressed vs payload).
+		`CREATE TABLE IF NOT EXISTS forest_events_archive (
+			id               TEXT PRIMARY KEY,
+			session_id       TEXT NOT NULL,
+			task_id          TEXT,
+			agent_id         TEXT,
+			agent_type       TEXT,
+			event_type       TEXT NOT NULL,
+			family           TEXT NOT NULL,
+			scope            TEXT NOT NULL,
+			root_id          TEXT NOT NULL,
+			branch_id        TEXT NOT NULL,
+			parent_branch_id TEXT,
+			intent_id        TEXT,
+			content_id       TEXT,
+			source_id        TEXT,
+			confidence       REAL NOT NULL,
+			salience         REAL NOT NULL,
+			timestamp        INTEGER NOT NULL,
+			title            TEXT,
+			summary          TEXT,
+			provenance_refs  TEXT,
+			supersedes       TEXT,
+			contradicts      TEXT,
+			related_branch_ids TEXT,
+			payload_compressed BLOB,
+			archived_at      INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_forest_events_archive_branch
+			ON forest_events_archive(branch_id, timestamp DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_forest_events_archive_session_time
+			ON forest_events_archive(session_id, timestamp DESC)`,
+		// Archive immutability: once archived, rows never change or
+		// disappear. Operators with a forensic need can always read
+		// the archive directly.
+		`CREATE TRIGGER IF NOT EXISTS forest_events_archive_no_update
+			BEFORE UPDATE ON forest_events_archive
+			BEGIN
+				SELECT RAISE(ABORT, 'forest_events_archive is immutable');
+			END;`,
+		`CREATE TRIGGER IF NOT EXISTS forest_events_archive_no_delete
+			BEFORE DELETE ON forest_events_archive
+			BEGIN
+				SELECT RAISE(ABORT, 'forest_events_archive is immutable');
+			END;`,
+		// Per-(branch, event_type) summary. UPSERTed by the archival
+		// worker so the operator-facing read surface ("how many
+		// decisions were archived for branch X") is one query.
+		`CREATE TABLE IF NOT EXISTS forest_events_archive_summary (
+			branch_id   TEXT NOT NULL,
+			event_type  TEXT NOT NULL,
+			count       INTEGER NOT NULL DEFAULT 0,
+			first_seen  INTEGER NOT NULL,
+			last_seen   INTEGER NOT NULL,
+			PRIMARY KEY (branch_id, event_type)
+		)`,
+		// Same archive shape for retrieval audit events.
+		`CREATE TABLE IF NOT EXISTS forest_retrieval_events_archive (
+			id                       TEXT PRIMARY KEY,
+			session_id               TEXT NOT NULL,
+			task_id                  TEXT,
+			agent_id                 TEXT,
+			agent_type               TEXT,
+			intent_id                TEXT,
+			query                    TEXT NOT NULL,
+			horizon                  TEXT,
+			families_blob            TEXT,
+			requested_limit          INTEGER NOT NULL,
+			include_counter_evidence INTEGER NOT NULL DEFAULT 0,
+			requested_at             INTEGER NOT NULL,
+			duration_micros          INTEGER NOT NULL DEFAULT 0,
+			candidate_count          INTEGER NOT NULL DEFAULT 0,
+			returned_count           INTEGER NOT NULL DEFAULT 0,
+			model_key                TEXT,
+			model_version            INTEGER NOT NULL DEFAULT 0,
+			error_message            TEXT,
+			branch_projection_seq    INTEGER NOT NULL DEFAULT 0,
+			candidates_compressed    BLOB,
+			metadata_compressed      BLOB,
+			exploration_mode         INTEGER NOT NULL DEFAULT 0,
+			substrate_mode           TEXT NOT NULL DEFAULT '',
+			base_score_version       INTEGER NOT NULL DEFAULT 0,
+			base_score_variant       TEXT NOT NULL DEFAULT '',
+			archived_at              INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_forest_retrieval_events_archive_session
+			ON forest_retrieval_events_archive(session_id, requested_at DESC)`,
+		`CREATE TRIGGER IF NOT EXISTS forest_retrieval_events_archive_no_update
+			BEFORE UPDATE ON forest_retrieval_events_archive
+			BEGIN
+				SELECT RAISE(ABORT, 'forest_retrieval_events_archive is immutable');
+			END;`,
+		`CREATE TRIGGER IF NOT EXISTS forest_retrieval_events_archive_no_delete
+			BEFORE DELETE ON forest_retrieval_events_archive
+			BEGIN
+				SELECT RAISE(ABORT, 'forest_retrieval_events_archive is immutable');
+			END;`,
+		// Per-session summary. Counts retrievals + earliest/latest.
+		`CREATE TABLE IF NOT EXISTS forest_retrieval_events_archive_summary (
+			session_id  TEXT PRIMARY KEY,
+			count       INTEGER NOT NULL DEFAULT 0,
+			first_seen  INTEGER NOT NULL,
+			last_seen   INTEGER NOT NULL
+		)`,
+	}
+	for _, stmt := range statements {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("install archive schema: %w", err)
 		}
 	}
 	return nil

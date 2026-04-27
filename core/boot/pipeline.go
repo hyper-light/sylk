@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/ingestion"
@@ -62,6 +63,10 @@ type PipelineResult struct {
 	// Hashes are only needed for next boot's change detection.
 	// The caller can Wait() to ensure hashes are persisted.
 	BackgroundHasher *BackgroundHasher
+
+	// BootBoardProjection captures the claims board state at boot completion.
+	// Nil when PipelineConfig.Scope is nil (tests, standalone).
+	BootBoardProjection *claims.ClaimsBoardProjection
 }
 
 // PhaseTiming records wall-clock duration of each boot phase.
@@ -143,16 +148,26 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 		IsIncr:      result.IsIncremental,
 	})
 
+	// Create ephemeral boot board for claims tracking (nil-safe when no scope).
+	var boardScope claims.ScopeProvider
+	if p.config.Scope != nil {
+		boardScope = &concurrency.ScopeAdapter{Scope: p.config.Scope}
+	}
+	board := newBootBoard(boardScope)
+
 	// Phase 1: Setup
+	setupClaimID := postBootPhaseClaim(board, "setup", 1)
 	setupStart := time.Now()
 	sd, gm, canonIdx, commitWAL, err := p.setupSylkDir(projectRoot)
 	if err != nil {
+		submitBootPhaseError(board, "setup", setupClaimID, err)
 		p.logBootEvent(agentlog.EventBootError, "error", &agentlog.BootPhasePayload{Phase: "setup", Err: err.Error()})
 		return nil, fmt.Errorf("setup: %w", err)
 	}
 	defer sd.Unlock()
 	defer commitWAL.Close()
 	result.Phases.Setup = time.Since(setupStart)
+	submitBootPhaseTestament(board, "setup", setupClaimID, result.Phases.Setup, nil)
 	p.logBootPhase(agentlog.EventBootSetup, "setup", result.Phases.Setup, nil)
 
 	if err := ctx.Err(); err != nil {
@@ -160,9 +175,11 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	}
 
 	// Phase 2: Change detection
+	detectClaimID := postBootPhaseClaim(board, "detect", 2)
 	detectStart := time.Now()
 	meta, changes, skip := p.detectChanges(ctx, projectRoot, isGitRepo)
 	result.Phases.Detect = time.Since(detectStart)
+	submitBootPhaseTestament(board, "detect", detectClaimID, result.Phases.Detect, nil)
 	p.logBootPhase(agentlog.EventBootDetect, "detect", result.Phases.Detect, nil)
 
 	if skip {
@@ -182,14 +199,17 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	p.reportProgress("setup", 1, 6)
 
 	// Phase 3: Allocate session + node IDs
+	allocClaimID := postBootPhaseClaim(board, "allocate", 3)
 	allocStart := time.Now()
 	sess, err := p.createSession(ctx, sd, gm, projectRoot, changes)
 	if err != nil {
+		submitBootPhaseError(board, "allocate", allocClaimID, err)
 		p.logBootEvent(agentlog.EventBootError, "error", &agentlog.BootPhasePayload{Phase: "allocate", Err: err.Error()})
 		return nil, fmt.Errorf("create session: %w", err)
 	}
 	defer sess.Close()
 	result.Phases.Allocate = time.Since(allocStart)
+	submitBootPhaseTestament(board, "allocate", allocClaimID, result.Phases.Allocate, nil)
 	p.logBootPhase(agentlog.EventBootAllocate, "allocate", result.Phases.Allocate, nil)
 
 	// Bind logger to session — drains staging into session-scoped log.
@@ -216,13 +236,16 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	}
 
 	// Phase 4: Ingest via SessionIngestion
+	ingestClaimID := postBootPhaseClaim(board, "ingest", 4)
 	ingestStart := time.Now()
 	ingestResult, err := p.ingest(ctx, sess, sd, projectRoot, changes)
 	if err != nil {
+		submitBootPhaseError(board, "ingest", ingestClaimID, err)
 		p.logBootEvent(agentlog.EventBootError, "error", &agentlog.BootPhasePayload{Phase: "ingest", Err: err.Error()})
 		return nil, fmt.Errorf("ingest: %w", err)
 	}
 	result.Phases.Ingest = time.Since(ingestStart)
+	submitBootPhaseTestament(board, "ingest", ingestClaimID, result.Phases.Ingest, nil)
 	p.logBootPhase(agentlog.EventBootIngest, "ingest", result.Phases.Ingest, nil)
 
 	p.reportProgress("ingest", 4, 6)
@@ -232,14 +255,17 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	}
 
 	// Phase 5: Commit to global
+	commitClaimID := postBootPhaseClaim(board, "commit", 5)
 	commitStart := time.Now()
 	commitResult, err := p.commitToGlobal(ctx, sess, sd, gm, canonIdx, commitWAL, projectRoot, changes)
 	if err != nil {
+		submitBootPhaseError(board, "commit", commitClaimID, err)
 		p.logBootEvent(agentlog.EventBootError, "error", &agentlog.BootPhasePayload{Phase: "commit", Err: err.Error()})
 		return nil, fmt.Errorf("commit: %w", err)
 	}
 	result.Phases.Commit = time.Since(commitStart)
 	result.BackgroundIndexer = commitResult.BackgroundIndexer
+	submitBootPhaseTestament(board, "commit", commitClaimID, result.Phases.Commit, nil)
 	p.logBootPhase(agentlog.EventBootCommit, "commit", result.Phases.Commit, nil)
 
 	p.reportProgress("commit", 5, 6)
@@ -249,13 +275,17 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	}
 
 	// Phase 6: Finalize meta
+	finalizeClaimID := postBootPhaseClaim(board, "finalize", 6)
 	finalizeStart := time.Now()
 	p.finalizeMeta(projectRoot, isGitRepo, meta, ingestResult, commitResult, result)
 	if err := meta.Save(projectRoot); err != nil {
+		submitBootPhaseError(board, "finalize", finalizeClaimID, err)
 		p.logBootEvent(agentlog.EventBootError, "error", &agentlog.BootPhasePayload{Phase: "finalize", Err: err.Error()})
 		return nil, fmt.Errorf("save meta: %w", err)
 	}
 	result.Phases.Finalize = time.Since(finalizeStart)
+	submitBootPhaseTestament(board, "finalize", finalizeClaimID, result.Phases.Finalize,
+		[]*claims.Artifact{phaseStatsArtifact(result)})
 	p.logBootPhase(agentlog.EventBootFinalize, "finalize", result.Phases.Finalize, nil)
 
 	// File hashing — runs synchronously under the caller's context.
@@ -273,6 +303,12 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 
 	result.BackgroundHasher = completedHasher()
 	result.Duration = time.Since(start)
+
+	// Accept all boot claims and capture the final projection.
+	acceptBootClaims(board)
+	if board != nil {
+		result.BootBoardProjection = board.Projection()
+	}
 
 	p.logBootEvent(agentlog.EventBootCompleted, "info", &agentlog.BootResultPayload{
 		Files:    result.FilesProcessed,
@@ -534,7 +570,7 @@ func (p *Pipeline) finalizeMeta(
 
 // populateFileHashes discovers all project files and records their content hashes
 // into Meta for change detection on subsequent boots. File hashing is parallel
-// across runtime.NumCPU() workers.
+// across runtime.NumCPU() workers, all tracked via GoroutineScope when available.
 func (p *Pipeline) populateFileHashes(ctx context.Context, meta *Meta, root string) {
 	meta.ClearFileHashes()
 	fileList, err := ingestion.DiscoverFiles(ctx, root, nil, nil)
@@ -542,7 +578,6 @@ func (p *Pipeline) populateFileHashes(ctx context.Context, meta *Meta, root stri
 		return
 	}
 
-	// Hash files in parallel, collect results into a local map, then merge.
 	type hashEntry struct {
 		rel  string
 		hash string
@@ -567,11 +602,12 @@ func (p *Pipeline) populateFileHashes(ctx context.Context, meta *Meta, root stri
 		}
 
 		wg.Add(1)
-		go func(idx int, batch []ingestion.FileInfo) {
+		idx, batch := w, fileList[lo:hi]
+		hashWorker := func(workerCtx context.Context) error {
 			defer wg.Done()
 			local := make([]hashEntry, 0, len(batch))
 			for _, f := range batch {
-				if ctx.Err() != nil {
+				if workerCtx.Err() != nil {
 					break
 				}
 				rel, _ := filepath.Rel(root, f.Path)
@@ -580,7 +616,17 @@ func (p *Pipeline) populateFileHashes(ctx context.Context, meta *Meta, root stri
 				}
 			}
 			results[idx] = local
-		}(w, fileList[lo:hi])
+			return nil
+		}
+
+		if p.config.Scope != nil {
+			if err := p.config.Scope.Go("boot_hash_worker", 0, concurrency.WorkFunc(hashWorker)); err != nil {
+				wg.Done()
+			}
+		} else {
+			_ = hashWorker(ctx)
+			// Synchronous when no scope — no untracked goroutines.
+		}
 	}
 	wg.Wait()
 

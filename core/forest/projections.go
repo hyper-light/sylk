@@ -192,9 +192,14 @@ func (m *MemoryForest) ProjectEvidence(ctx context.Context, input ProjectionInpu
 	return out, nil
 }
 
-// ProjectDecisions returns the Decision family view.
+// ProjectDecisions returns the Decision projection view.
+//
+// Issue #11 Phase 3: Decision was merged into Intent (a decision is
+// "intent + selected branch"). The DecisionProjection type is
+// retained as the operator-facing surface; the underlying query
+// targets TreeFamilyIntent.
 func (m *MemoryForest) ProjectDecisions(ctx context.Context, input ProjectionInput) (*DecisionProjection, error) {
-	packets, err := m.retrieveFamily(ctx, input, TreeFamilyDecision, true)
+	packets, err := m.retrieveFamily(ctx, input, TreeFamilyIntent, true)
 	if err != nil {
 		return nil, err
 	}
@@ -218,9 +223,14 @@ func (m *MemoryForest) ProjectOutcomes(ctx context.Context, input ProjectionInpu
 	return out, nil
 }
 
-// ProjectPreferences returns the Preference family view.
+// ProjectPreferences returns the Preference projection view.
+//
+// Issue #11 Phase 3: Preference was subsumed by Constraint with
+// ConstraintSeverity="soft". The PreferenceProjection type is
+// retained as the operator-facing surface; the query targets
+// TreeFamilyConstraint.
 func (m *MemoryForest) ProjectPreferences(ctx context.Context, input ProjectionInput) (*PreferenceProjection, error) {
-	packets, err := m.retrieveFamily(ctx, input, TreeFamilyPreference, false)
+	packets, err := m.retrieveFamily(ctx, input, TreeFamilyConstraint, false)
 	if err != nil {
 		return nil, err
 	}
@@ -231,9 +241,14 @@ func (m *MemoryForest) ProjectPreferences(ctx context.Context, input ProjectionI
 	return out, nil
 }
 
-// ProjectCapabilities returns the Capability family view.
+// ProjectCapabilities returns the Capability projection view.
+//
+// Issue #11 Phase 3: Capability was merged into Intent (an agent's
+// affordance is "what it can pursue"). The CapabilityProjection
+// type is retained as the operator-facing surface; the query
+// targets TreeFamilyIntent.
 func (m *MemoryForest) ProjectCapabilities(ctx context.Context, input ProjectionInput) (*CapabilityProjection, error) {
-	packets, err := m.retrieveFamily(ctx, input, TreeFamilyCapability, true)
+	packets, err := m.retrieveFamily(ctx, input, TreeFamilyIntent, true)
 	if err != nil {
 		return nil, err
 	}
@@ -244,9 +259,14 @@ func (m *MemoryForest) ProjectCapabilities(ctx context.Context, input Projection
 	return out, nil
 }
 
-// ProjectOpportunities returns the Opportunity family view.
+// ProjectOpportunities returns the Opportunity projection view.
+//
+// Issue #11 Phase 3: Opportunity was merged into Intent (a time-
+// bound capability/intent match becomes a time-bound Intent). The
+// OpportunityProjection type is retained as the operator-facing
+// surface; the query targets TreeFamilyIntent.
 func (m *MemoryForest) ProjectOpportunities(ctx context.Context, input ProjectionInput) (*OpportunityProjection, error) {
-	packets, err := m.retrieveFamily(ctx, input, TreeFamilyOpportunity, true)
+	packets, err := m.retrieveFamily(ctx, input, TreeFamilyIntent, true)
 	if err != nil {
 		return nil, err
 	}

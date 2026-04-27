@@ -80,7 +80,7 @@ func TestForestRecallSkill(t *testing.T) {
 		Forest: &mockForestService{
 			retrieve: func(_ context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
 				return []*forest.BranchPacket{
-					{Branch: &forest.Branch{ID: "branch-1", Family: forest.TreeFamilyDecision, Summary: query.Query}},
+					{Branch: &forest.Branch{ID: "branch-1", Family: forest.TreeFamilyIntent, Summary: query.Query}},
 				}, nil
 			},
 		},
@@ -149,7 +149,7 @@ func TestRecallRecentSkillRecoversSummaryAndFocus(t *testing.T) {
 					t.Fatal("expected include_counter_evidence to default true")
 				}
 				return []*forest.BranchPacket{
-					{Branch: &forest.Branch{ID: "decision-1", Family: forest.TreeFamilyDecision, Summary: "Use argparse from the stdlib"}},
+					{Branch: &forest.Branch{ID: "decision-1", Family: forest.TreeFamilyIntent, Summary: "Use argparse from the stdlib"}},
 					{Branch: &forest.Branch{ID: "outcome-1", Family: forest.TreeFamilyOutcome, Summary: "Preserve python -m hello entrypoint"}},
 				}, nil
 			},
@@ -171,8 +171,8 @@ func TestRecallRecentSkillRecoversSummaryAndFocus(t *testing.T) {
 	if len(output.Focus) < 2 {
 		t.Fatalf("focus len = %d, want at least 2", len(output.Focus))
 	}
-	if output.Focus[0] != "Decision: Use argparse from the stdlib" {
-		t.Fatalf("focus[0] = %q, want decision summary", output.Focus[0])
+	if output.Focus[0] != "Intent: Use argparse from the stdlib" {
+		t.Fatalf("focus[0] = %q, want intent summary", output.Focus[0])
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/container/pod"
@@ -103,8 +104,9 @@ type ActivationControllerConfig struct {
 	Pressure     PressureConfig  // Pressure evaluation tuning
 	ScanPeriod   int             // Idle scan period in ms (0 = derived)
 	Logger       *slog.Logger    // Structured logger (nil = slog.Default())
-	OnActivated  func(*container.Container)
-	OnRemoved    func(*container.Container)
+	OnActivated   func(*container.Container)
+	OnRemoved     func(*container.Container)
+	BoardProvider func() *claims.ClaimsBoard // session board lookup (nil-safe)
 }
 
 // PressureSource evaluates resource pressure and produces eviction candidates.
@@ -133,8 +135,11 @@ type ActivationController struct {
 	logger    *slog.Logger
 	closed    atomic.Bool
 
-	onActivated func(*container.Container)
-	onRemoved   func(*container.Container)
+	onActivated   func(*container.Container)
+	onRemoved     func(*container.Container)
+	boardProvider func() *claims.ClaimsBoard
+
+	shutdownProjection atomic.Pointer[claims.ClaimsBoardProjection]
 }
 
 // NewActivationController creates and initializes the controller.
@@ -169,8 +174,9 @@ func NewActivationController(cfg ActivationControllerConfig) (*ActivationControl
 		scope:       cfg.Scope,
 		metrics:     &ActivationMetrics{},
 		logger:      logger,
-		onActivated: cfg.OnActivated,
-		onRemoved:   cfg.OnRemoved,
+		onActivated:   cfg.OnActivated,
+		onRemoved:     cfg.OnRemoved,
+		boardProvider: cfg.BoardProvider,
 	}
 
 	for _, policy := range cfg.Policies {
@@ -265,6 +271,7 @@ func (ac *ActivationController) EnsureActive(ctx context.Context, agentType stri
 		"elapsed_ms", time.Since(activateStart).Milliseconds(),
 		"error", err)
 	if err != nil {
+		ac.postActivationError(agentType, err)
 		return nil, err
 	}
 
@@ -279,6 +286,9 @@ func (ac *ActivationController) EnsureActive(ctx context.Context, agentType stri
 	// Record for predictor and trigger pre-warming asynchronously.
 	ac.predictor.Record(agentType)
 	ac.preWarmAsync(ctx, agentType)
+
+	// Post activation claim (async, best-effort).
+	ac.postActivationSuccess(agentType, c)
 
 	return c, nil
 }
@@ -376,9 +386,14 @@ func (ac *ActivationController) Shutdown(ctx context.Context) error {
 	}
 	ac.mu.RUnlock()
 
+	board := newShutdownBoard()
+
 	var firstErr error
 	for _, entry := range entries {
+		claimID := postShutdownClaim(board, entry.AgentType)
+		tier := entry.LoadTier()
 		if err := ac.teardownEntry(ctx, entry); err != nil {
+			submitShutdownError(board, entry.AgentType, claimID, err)
 			ac.logger.Warn("teardown failed during shutdown",
 				"agent_type", entry.AgentType,
 				"error", err,
@@ -386,9 +401,21 @@ func (ac *ActivationController) Shutdown(ctx context.Context) error {
 			if firstErr == nil {
 				firstErr = err
 			}
+		} else {
+			submitShutdownTestament(board, entry.AgentType, claimID, tier)
 		}
 	}
+
+	acceptShutdownClaims(board)
+	ac.shutdownProjection.Store(board.Projection())
+
 	return firstErr
+}
+
+// ShutdownProjection returns the claims board projection captured during
+// shutdown. Nil before Shutdown is called.
+func (ac *ActivationController) ShutdownProjection() *claims.ClaimsBoardProjection {
+	return ac.shutdownProjection.Load()
 }
 
 // SetLifecycleCallbacks updates the activation lifecycle callbacks used to

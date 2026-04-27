@@ -30,10 +30,11 @@ const (
 type ClaimsBoard struct {
 	mu sync.RWMutex
 
-	boardID    string
-	pipelineID string
-	taskID     string
-	sessionID  string
+	boardID       string
+	pipelineID    string
+	taskID        string
+	sessionID     string
+	parentBoardID string
 
 	phase         BoardPhase
 	iteration     int
@@ -88,6 +89,7 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		pipelineID:    cfg.PipelineID,
 		taskID:        cfg.TaskID,
 		sessionID:     cfg.SessionID,
+		parentBoardID: cfg.ParentBoardID,
 		phase:         BoardPhaseImplementation,
 		maxIterations: maxIter,
 		actions:       make(map[string]*Action),
@@ -124,6 +126,11 @@ func (b *ClaimsBoard) SessionID() string {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.sessionID
+}
+
+// ParentBoardID returns the parent board's ID (empty for root boards).
+func (b *ClaimsBoard) ParentBoardID() string {
+	return b.parentBoardID
 }
 
 func (b *ClaimsBoard) Phase() BoardPhase {
@@ -453,7 +460,44 @@ func (b *ClaimsBoard) resolveClaimForTestamentLocked(t *Testament, now time.Time
 		c.Status = ClaimStatusTestified
 		c.Accessed = now
 	}
+
+	// Auto-pass receipt validations: the testament arriving IS the proof.
+	// This allows consultation and other receipt-gated claims to progress
+	// without an explicit EvaluateValidation call.
+	autoPassReceiptValidationsLocked(c, t.AgentID, now)
+	if c.AllValidationsPassed() && c.Status == ClaimStatusTestified {
+		c.StatusHistory = append(c.StatusHistory, StatusChange{
+			From:    string(c.Status),
+			To:      string(ClaimStatusAccepted),
+			Reason:  "all receipt validations auto-passed on testament",
+			AgentID: t.AgentID,
+			Changed: now,
+		})
+		c.Status = ClaimStatusAccepted
+		c.Accessed = now
+	}
+
 	return c
+}
+
+// autoPassReceiptValidationsLocked passes all pending receipt-type
+// validations on a claim. Receipt validations assert "testimony was
+// delivered" — the testament existing is sufficient proof.
+func autoPassReceiptValidationsLocked(c *Claim, agentID string, now time.Time) {
+	for _, v := range c.Validations {
+		if v == nil || v.Type != ValidationTypeReceipt || v.Status != ValidationStatusPending {
+			continue
+		}
+		v.StatusHistory = append(v.StatusHistory, StatusChange{
+			From:    string(v.Status),
+			To:      string(ValidationStatusPassed),
+			Reason:  "receipt auto-passed: testament submitted",
+			AgentID: agentID,
+			Changed: now,
+		})
+		v.Status = ValidationStatusPassed
+		v.Accessed = now
+	}
 }
 
 // ── EvaluateValidation ──────────────────────────────────────────────

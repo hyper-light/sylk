@@ -416,13 +416,6 @@ func runTestSuiteSkill(pt *PipelineTester) *skills.Skill {
 			}
 			suite := suiteResultFromExecution(result, start)
 			pt.setLastSuiteResult(suite)
-			// Record the suite id on the protocol state so the
-			// dispatcher's Produces check and the projection's
-			// TesterSuiteCaptured field observe the snapshot in a
-			// single authoritative location.
-			if state := agentshared.PipelineProtocolStateFromContext(ctx); state != nil && suite != nil {
-				state.RecordTesterSuiteID(suite.SuiteID)
-			}
 			// Phase 4 refactor: emit validation outcome so peers
 			// see the pass/fail verdict in ambient context.
 			failureCount := 0

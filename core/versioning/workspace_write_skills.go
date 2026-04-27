@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -388,6 +389,10 @@ func newWriteFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWrit
 			if path == "" {
 				return nil, fmt.Errorf("path is required")
 			}
+			// Claims scope validation.
+			if err := validateClaimScopeForWrite(ctx, path); err != nil {
+				return nil, err
+			}
 			fa, views, err := resolveWorkspaceWriteAccess(cfg)
 			if err != nil {
 				return nil, err
@@ -403,6 +408,7 @@ func newWriteFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWrit
 			if err := fa.WriteFile(ctx, path, []byte(params.Content)); err != nil {
 				return nil, fmt.Errorf("failed to write file: %w", err)
 			}
+			recordWriteDiffArtifact(ctx, path)
 			result := map[string]any{
 				"path":    path,
 				"scope":   scope,
@@ -442,6 +448,10 @@ func newEditFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWrite
 			if path == "" {
 				return nil, fmt.Errorf("path is required")
 			}
+			// Claims scope validation.
+			if err := validateClaimScopeForWrite(ctx, path); err != nil {
+				return nil, err
+			}
 			edits, err := normalizeFileEdits(params.Edits)
 			if err != nil {
 				return nil, err
@@ -460,6 +470,7 @@ func newEditFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWrite
 			if err := fa.EditFile(ctx, path, edits); err != nil {
 				return nil, err
 			}
+			recordWriteDiffArtifact(ctx, path)
 			result := map[string]any{
 				"path":          path,
 				"scope":         scope,
@@ -494,6 +505,10 @@ func newDeleteFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWri
 			if path == "" {
 				return nil, fmt.Errorf("path is required")
 			}
+			// Claims scope validation.
+			if err := validateClaimScopeForWrite(ctx, path); err != nil {
+				return nil, err
+			}
 			fa, views, err := resolveWorkspaceWriteAccess(cfg)
 			if err != nil {
 				return nil, err
@@ -508,6 +523,7 @@ func newDeleteFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWri
 			if err := fa.DeleteFile(ctx, path); err != nil {
 				return nil, err
 			}
+			recordWriteDiffArtifact(ctx, path)
 			result := map[string]any{
 				"path":    path,
 				"scope":   scope,
@@ -540,6 +556,10 @@ func newCreateDirectorySkill(name string, scope WorkspaceWriteScope, cfg Workspa
 			path := strings.TrimSpace(params.Path)
 			if path == "" {
 				return nil, fmt.Errorf("path is required")
+			}
+			// Claims scope validation.
+			if err := validateClaimScopeForWrite(ctx, path); err != nil {
+				return nil, err
 			}
 			fa, views, err := resolveWorkspaceWriteAccess(cfg)
 			if err != nil {
@@ -1645,4 +1665,38 @@ func changeContentHash(mod FileModification) string {
 		return ""
 	}
 	return mod.ContentHash.String()
+}
+
+// validateClaimScopeForWrite checks the claims board for scope
+// restrictions. Permissive: if no board or no file scope entries
+// exist, all writes pass.
+func validateClaimScopeForWrite(ctx context.Context, path string) error {
+	board := claims.BoardFromContext(ctx)
+	if board == nil {
+		return nil
+	}
+	acc := claims.AccumulatorFromContext(ctx)
+	agentID := ""
+	if acc != nil {
+		agentID = acc.AgentID()
+	}
+	if agentID == "" {
+		return nil // permissive when agent unknown
+	}
+	if !claims.IsPathInClaimScope(board, agentID, path) {
+		return fmt.Errorf("path %q is not in scope of any active claim", path)
+	}
+	return nil
+}
+
+// recordWriteDiffArtifact records a diff artifact on the testament
+// accumulator after a successful write.
+func recordWriteDiffArtifact(ctx context.Context, path string) {
+	board := claims.BoardFromContext(ctx)
+	if board == nil {
+		return
+	}
+	if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+		acc.Record("diff", path)
+	}
 }

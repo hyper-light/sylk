@@ -115,7 +115,23 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	// ── Claims skills (unconditional) ──────────────────────────────
 	//
 	// Every pipeline uses claims. No legacy protocol path.
-	boardProvider := func() *claims.ClaimsBoard { return pi.claimsBoard }
+	boardProvider := func() (*claims.ClaimsBoard, error) {
+		if b := pi.claimsBoard; b != nil {
+			return b, nil
+		}
+		sid, _ := pi.activeSessionID.Load().(string)
+		if sid == "" {
+			sid = pi.config.SessionID
+		}
+		if sid == "" {
+			return nil, fmt.Errorf("inspector-pipeline: no session ID configured")
+		}
+		board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+		if board == nil {
+			return nil, fmt.Errorf("inspector-pipeline: session %q has no claims board registered", sid)
+		}
+		return board, nil
+	}
 	inboxProvider := func() *claims.ClaimsInbox { return pi.claimsInbox }
 	pi.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	pi.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
@@ -130,14 +146,19 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	}
 
 
-	// Terminal commit skill: handoff_to_ot. Always registered — the
-	// handler validates the committer at invocation time. This ensures
-	// the skill is in the manifest and the safety hook allows it.
-	pi.skills.Register(agentShared.PipelineHandoffOTSkill(agentShared.PipelineProtocolSkillConfig{
+	// VFS lifecycle skills: handoff_to_ot, discard_pipeline,
+	// finalize_pipeline. Claims-based.
+	vfsCfg := agentShared.PipelineVFSSkillConfig{
 		AgentType: func() string { return "inspector-pipeline" },
 		AgentID:   func() string { return pi.id },
+		SessionID: func() string { return pi.config.SessionID },
+		Board:     func() *claims.ClaimsBoard { b, _ := boardProvider(); return b },
 		Committer: func() agentShared.PipelineCommitter { return pi.pipelineCommitter },
-	}))
+		Bus:       pi.bus,
+	}
+	pi.skills.Register(agentShared.PipelineHandoffOTVFSSkill(vfsCfg))
+	pi.skills.Register(agentShared.PipelineDiscardPipelineVFSSkill(vfsCfg))
+	pi.skills.Register(agentShared.PipelineFinalizePipelineVFSSkill(vfsCfg))
 
 	// Diagnostics
 	pi.skills.Register(agentShared.NewSelfDiagnosticSkill(&pipelineInspectorDiag{pi: pi}))

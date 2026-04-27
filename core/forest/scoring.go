@@ -38,12 +38,26 @@ var defaultScoreWeights = []float32{
 	0.03, // inhibition safety
 }
 
-func scoreBatch(inputs []scoreInput, now time.Time, branches []*Branch) []PacketScore {
+// scoreBatch aggregates the 13 component scores into a Base score
+// using the supplied weight vector + bias. Nil/zero-length weights
+// fall back to the hardcoded defaultScoreWeights so this function
+// can never produce a malformed result.
+//
+// The weight vector must have exactly BaseScoreComponentCount
+// entries; mismatches fall back to defaults. (Construction paths
+// guarantee this length, so the fallback is purely defensive — the
+// function still produces correct output if invariants slip.)
+func scoreBatch(inputs []scoreInput, now time.Time, branches []*Branch, weights []float32, bias float64) []PacketScore {
 	if len(inputs) == 0 {
 		return nil
 	}
+	activeWeights := weights
+	if len(activeWeights) != len(defaultScoreWeights) {
+		activeWeights = defaultScoreWeights
+		bias = 0
+	}
 
-	matrix := make([]float32, 0, len(inputs)*len(defaultScoreWeights))
+	matrix := make([]float32, 0, len(inputs)*len(activeWeights))
 	for _, input := range inputs {
 		matrix = append(matrix,
 			float32(clamp01(input.QueryMatch)),
@@ -63,10 +77,10 @@ func scoreBatch(inputs []scoreInput, now time.Time, branches []*Branch) []Packet
 	}
 
 	scores := make([]PacketScore, len(inputs))
-	width := len(defaultScoreWeights)
+	width := len(activeWeights)
 	for i := range inputs {
 		row := matrix[i*width : (i+1)*width]
-		base := float64(vek32.Dot(row, defaultScoreWeights))
+		base := float64(vek32.Dot(row, activeWeights)) + bias
 		scores[i] = PacketScore{
 			Total:            base,
 			Base:             base,

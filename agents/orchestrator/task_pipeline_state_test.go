@@ -44,15 +44,18 @@ func TestPublishTaskPipelineState(t *testing.T) {
 	}
 	defer sub.Unsubscribe()
 
-	publishTaskPipelineState(bus, "orchestrator", "task_auth_checkout", "auth-checkout", taskstate.StatusPending, "")
+	publishTaskPipelineState(bus, "orchestrator", "task_auth_checkout", "auth-checkout", "Checkout auth module", taskstate.StatusPending, "")
 
 	select {
 	case evt := <-gotCh:
 		if evt.PipelineID != "task_auth_checkout" {
 			t.Fatalf("PipelineID = %q, want task_auth_checkout", evt.PipelineID)
 		}
-		if evt.TaskLabel != "auth-checkout" {
-			t.Fatalf("TaskLabel = %q, want auth-checkout", evt.TaskLabel)
+		if evt.TaskSlug != "auth-checkout" {
+			t.Fatalf("TaskSlug = %q, want auth-checkout", evt.TaskSlug)
+		}
+		if evt.TaskLabel != "Checkout auth module" {
+			t.Fatalf("TaskLabel = %q, want Checkout auth module", evt.TaskLabel)
 		}
 		if evt.Status != taskstate.StatusPending {
 			t.Fatalf("Status = %q, want pending", evt.Status)
@@ -103,8 +106,8 @@ func TestPublishFailedTaskPipelineState(t *testing.T) {
 		if evt.PipelineID != "task_1" {
 			t.Fatalf("PipelineID = %q, want task_1", evt.PipelineID)
 		}
-		if evt.TaskLabel != "auth-checkout" {
-			t.Fatalf("TaskLabel = %q, want auth-checkout", evt.TaskLabel)
+		if evt.TaskSlug != "auth-checkout" {
+			t.Fatalf("TaskSlug = %q, want auth-checkout", evt.TaskSlug)
 		}
 		if evt.Status != taskstate.StatusFailed {
 			t.Fatalf("Status = %q, want failed", evt.Status)

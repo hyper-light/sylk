@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -72,7 +73,8 @@ func (s *toolLoopState) prepareTurn(turn int) (int, bool, error) {
 		return turn, false, err
 	}
 
-	sc := shared.DrainAndCheckpoint(s.ledger, s.req, turn, "searching", nil)
+	sc := shared.DrainAndCheckpoint(s.ledger, s.req, turn, "searching", nil,
+		shared.WithBoardProvider(func() *claims.ClaimsBoard { return s.librarian.librarianBoard() }, s.librarian.id))
 	if sc.Rollback != nil || sc.EditReplay != nil {
 		return s.applyCheckpoint(sc), true, nil
 	}

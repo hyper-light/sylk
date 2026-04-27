@@ -2,9 +2,11 @@ package steering
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/events"
 )
 
@@ -29,6 +31,9 @@ type SteeringLedger struct {
 
 	// Archivalist observation (nil-safe).
 	activityPub events.ActivityPublisher
+
+	// Claims board provider for steering → claims integration.
+	boardProvider func() *claims.ClaimsBoard
 }
 
 // NewSteeringLedger creates a new ledger for the given request.
@@ -56,6 +61,12 @@ func NewSteeringLedger(
 	return l
 }
 
+// SetBoardProvider configures the claims board provider for steering → claims
+// integration. When set, DepositCommand and RecordCheckpoint emit claims.
+func (l *SteeringLedger) SetBoardProvider(bp func() *claims.ClaimsBoard) {
+	l.boardProvider = bp
+}
+
 // DepositCommand adds a command to the mailbox, WAL-logs it, and signals
 // resume (unblocking any WaitForResume call).
 func (l *SteeringLedger) DepositCommand(cmd Command) {
@@ -76,6 +87,21 @@ func (l *SteeringLedger) depositCommand(cmd Command, signal bool) {
 		l.journal.LogCommand(cmd)
 	}
 
+	// Post task-relevant steering commands as claims on the board.
+	// Pace/resume are control signals, not task guidance — skip them.
+	if l.boardProvider != nil && cmd.Type != CommandPace && cmd.Type != CommandResume {
+		if board := l.boardProvider(); board != nil {
+			if err := claims.PostCorrectiveClaim(board, l.AgentID,
+				"Steering: "+cmd.Type.String(),
+				cmd.Text,
+				nil,
+			); err != nil {
+				slog.Warn("steering_corrective_claim_failed",
+					"agent_id", l.AgentID, "cmd", cmd.Type.String(), "error", err.Error())
+			}
+		}
+	}
+
 	if signal {
 		l.signalResume()
 	}
@@ -91,6 +117,23 @@ func (l *SteeringLedger) RecordCheckpoint(turn, msgCount int, phase string, snap
 	}
 
 	l.publishCheckpointEvent(cp)
+
+	// Submit checkpoint as testament on the claims board.
+	if l.boardProvider != nil {
+		if board := l.boardProvider(); board != nil {
+			action := claims.Action{AgentID: l.AgentID, Type: claims.ActionTypeTestament}
+			testament := claims.Testament{
+				AgentID:   l.AgentID,
+				SessionID: l.SessionID,
+				Summary:   fmt.Sprintf("Steering checkpoint: turn=%d phase=%s", turn, phase),
+			}
+			if err := board.SubmitTestaments(context.Background(), action, []claims.Testament{testament}); err != nil {
+				slog.Warn("steering_checkpoint_testament_failed",
+					"agent_id", l.AgentID, "turn", turn, "phase", phase, "error", err.Error())
+			}
+		}
+	}
+
 	return cp
 }
 

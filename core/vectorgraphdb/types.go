@@ -28,6 +28,7 @@ const (
 	DomainTester       Domain = 7
 	DomainOrchestrator Domain = 8
 	DomainGuide        Domain = 9
+	DomainClaims       Domain = 10
 )
 
 func ValidDomains() []Domain {
@@ -35,7 +36,7 @@ func ValidDomains() []Domain {
 }
 
 func (d Domain) IsValid() bool {
-	return d >= DomainCode && d <= DomainGuide
+	return d >= DomainCode && d <= DomainClaims
 }
 
 func (d Domain) String() string {
@@ -174,6 +175,13 @@ const (
 	NodeTypeUserQuery     NodeType = 902
 )
 
+const (
+	NodeTypeClaim      NodeType = 1000
+	NodeTypeTestament  NodeType = 1001
+	NodeTypeArtifact   NodeType = 1002
+	NodeTypeValidation NodeType = 1003
+)
+
 func ValidNodeTypes() []NodeType {
 	return cloneEnumSlice(validNodeTypes)
 }
@@ -282,6 +290,15 @@ const (
 	EdgeTypeRelatedTo EdgeType = 151
 )
 
+const (
+	EdgeTypeDependsOn     EdgeType = 160
+	EdgeTypeCausedBy      EdgeType = 161
+	EdgeTypeRefines       EdgeType = 162
+	EdgeTypeConflictsWith EdgeType = 163
+	EdgeTypeTestifies     EdgeType = 164 // testament → claim
+	EdgeTypeProves        EdgeType = 165 // artifact → claim via testament
+)
+
 // ValidEdgeTypes returns all valid EdgeType values.
 func ValidEdgeTypes() []EdgeType {
 	return cloneEnumSlice(validEdgeTypes)
@@ -320,6 +337,16 @@ func (et EdgeType) IsTemporal() bool {
 // IsCrossDomain returns true if this is a cross-domain edge type.
 func (et EdgeType) IsCrossDomain() bool {
 	return containsEnum(crossDomainEdgeTypeSet, et)
+}
+
+// ClaimsEdgeTypes returns edge types specific to claims-domain relationships.
+func ClaimsEdgeTypes() []EdgeType {
+	return cloneEnumSlice(claimsEdgeTypes)
+}
+
+// IsClaims returns true if this is a claims-domain edge type.
+func (et EdgeType) IsClaims() bool {
+	return containsEnum(claimsEdgeTypeSet, et)
 }
 
 // String returns the string representation of the edge type.

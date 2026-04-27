@@ -163,6 +163,18 @@ func (f *ForestSubscriber) electCandidate(a activity.AgentActivity) (string, boo
 		// precedent for subsequent outcomes; recording them lets the
 		// outcome harvester link consult → outcome.
 		return "forest consult emitted", true
+
+	// ── Category 6: claims board lifecycle ──
+	case activity.ActionClaimAccepted:
+		return "claim accepted — positive precedent", true
+	case activity.ActionClaimRejected:
+		return "claim rejected — anti-precedent", true
+	case activity.ActionTestamentSubmitted:
+		return "testament submitted — evidence precedent", true
+	case activity.ActionClaimValidated:
+		return "claim validated — validation outcome", true
+	case activity.ActionBoardComplete:
+		return "board completed — terminal lifecycle", true
 	}
 	return "", false
 }

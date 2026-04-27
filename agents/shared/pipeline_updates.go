@@ -12,16 +12,21 @@ import (
 )
 
 // PipelineTaskAttempt returns the current protocol iteration for a routed
-// pipeline task. Missing or malformed protocol state defaults to zero.
+// pipeline task. Reads the iteration from the task's pipeline_protocol
+// context map. Missing or malformed data defaults to zero.
 func PipelineTaskAttempt(task *PipelineTaskInput) int {
-	snapshot, err := PipelineProtocolSnapshotFromTask(task)
-	if err != nil || snapshot == nil {
+	if task == nil || len(task.Context) == 0 {
 		return 0
 	}
-	if snapshot.Iteration < 0 {
+	protocol, _ := task.Context["pipeline_protocol"].(map[string]any)
+	if protocol == nil {
 		return 0
 	}
-	return snapshot.Iteration
+	iteration, _ := protocol["iteration"].(float64)
+	if iteration < 0 {
+		return 0
+	}
+	return int(iteration)
 }
 
 // PublishPipelineTaskRunningUpdate publishes a non-terminal pipeline update for
@@ -184,6 +189,49 @@ func pipelineTaskTargetAgentID(task *PipelineTaskInput) string {
 		return targetAgentID
 	}
 	return pipelineProtocolTargetAgentID(task.TaskID, task.AgentType)
+}
+
+func normalizePipelineAgentType(agentType string) string {
+	switch strings.TrimSpace(strings.ToLower(agentType)) {
+	case "inspector", PipelineAgentInspector:
+		return PipelineAgentInspector
+	case "tester", PipelineAgentTester:
+		return PipelineAgentTester
+	case PipelineAgentEngineer:
+		return PipelineAgentEngineer
+	case PipelineAgentDesigner:
+		return PipelineAgentDesigner
+	default:
+		return strings.TrimSpace(agentType)
+	}
+}
+
+func pipelineProtocolTargetAgentID(taskID, agentType string) string {
+	taskID = strings.TrimSpace(taskID)
+	agentType = strings.TrimSpace(normalizePipelineAgentType(agentType))
+	return PipelineWorkerRoutingTarget(taskID, agentType)
+}
+
+func pipelineStageForAgents(agentTypes []string) string {
+	for _, agentType := range agentTypes {
+		switch normalizePipelineAgentType(agentType) {
+		case PipelineAgentInspector:
+			return "inspect"
+		case PipelineAgentTester:
+			return "test"
+		case PipelineAgentEngineer, PipelineAgentDesigner:
+			return "execute"
+		}
+	}
+	return "inspect"
+}
+
+func pipelineTaskContextString(ctx map[string]any, key string) string {
+	if ctx == nil {
+		return ""
+	}
+	value, _ := ctx[key].(string)
+	return strings.TrimSpace(value)
 }
 
 func pipelineTaskProgress(status string, stage string) float64 {

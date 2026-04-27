@@ -41,6 +41,7 @@ func publishTaskPipelineState(
 	bus guide.EventBus,
 	sourceAgentID string,
 	pipelineID string,
+	taskSlug string,
 	taskLabel string,
 	status taskstate.Status,
 	workerType string,
@@ -51,6 +52,7 @@ func publishTaskPipelineState(
 	evt := &taskstate.Event{
 		PipelineID: strings.TrimSpace(pipelineID),
 		TaskID:     strings.TrimSpace(pipelineID),
+		TaskSlug:   strings.TrimSpace(taskSlug),
 		TaskLabel:  strings.TrimSpace(taskLabel),
 		Status:     status,
 		WorkerType: strings.TrimSpace(workerType),

@@ -22,6 +22,25 @@ var installedFabricLogger atomic.Pointer[fabriclog.FabricLogger]
 // the underlying FabricLogger closes.
 var installedForestBridge atomic.Pointer[fabriclog.ForestFabricBridge]
 
+// forestHarvesterHolder wraps a HarvestFunc for safe storage in an
+// atomic.Pointer. Storing function values directly via atomic.Pointer
+// requires a heap-allocated wrapper to avoid dangling stack references.
+type forestHarvesterHolder struct {
+	fn activitystore.HarvestFunc
+}
+
+// installedForestHarvester holds the real harvest function. Initially nil
+// (harvest just logs). Set via SetForestHarvester once the Memory Forest
+// is constructed, avoiding a dependency cycle between fabric install and
+// forest construction.
+var installedForestHarvester atomic.Pointer[forestHarvesterHolder]
+
+// SetForestHarvester atomically registers a real harvest function. Once
+// set, forest candidates are dispatched to it instead of being logged.
+func SetForestHarvester(fn activitystore.HarvestFunc) {
+	installedForestHarvester.Store(&forestHarvesterHolder{fn: fn})
+}
+
 // installActivityFabric wires the Activity Fabric onto this
 // orchestrator's BunSQLite handle and installs the resulting sink +
 // source as process-wide defaults. Idempotent — safe to call multiple
@@ -66,10 +85,12 @@ func installActivityFabric(store *Store, sessionID string, sd *sylkdir.SylkDir) 
 		slog.Warn("fabric: bleve subscriber unavailable", "error", err)
 	}
 
-	// Forest subscriber: harvest candidates land in the orchestrator's
-	// log for now. Wiring into a real Memory Forest persistence path
-	// is the explicit Tier 11 follow-up.
+	// Forest subscriber: delegates to the real ClaimsHarvester when
+	// registered via SetForestHarvester, otherwise logs candidates.
 	harvestFn := func(_ context.Context, a activity.AgentActivity, reason string) error {
+		if h := installedForestHarvester.Load(); h != nil {
+			return h.fn(context.Background(), activitystore.ForestCandidate{Activity: a, Reason: reason})
+		}
 		slog.Info("fabric: forest candidate",
 			"session_id", string(a.SessionID),
 			"action_kind", string(a.Action),

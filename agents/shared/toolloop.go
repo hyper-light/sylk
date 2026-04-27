@@ -1,11 +1,13 @@
 package shared
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
@@ -502,6 +504,25 @@ func SkippedToolResultPayload(reason string) string {
 		return `{"error":"tool call skipped","error_kind":"tool_call_skipped","skipped":true}`
 	}
 	return string(payloadJSON)
+}
+
+// PostCorrectiveClaimFromContext posts a corrective claim from the
+// tool loop error path. Looks up the board from the session registry
+// via the accumulator's session ID. Nil-safe.
+func PostCorrectiveClaimFromContext(ctx context.Context, agentID, title, description string, scope []claims.ClaimScopeEntry) {
+	acc := claims.AccumulatorFromContext(ctx)
+	if acc == nil {
+		return
+	}
+	sessionID := acc.SessionID()
+	if sessionID == "" {
+		return
+	}
+	board := claims.DefaultSessionBoardRegistry().Lookup(sessionID)
+	if board == nil {
+		return
+	}
+	_ = claims.PostCorrectiveClaim(board, agentID, title, description, scope)
 }
 
 // AppendSkippedToolResults appends synthetic error tool results for any tool

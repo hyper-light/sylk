@@ -86,10 +86,9 @@ func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad
 	prefixPlain := pipelineHeaderPrefix(collapsed)
 	prefix := renderTreePrefix(prefixPlain, activeColor, th)
 
-	statusStyle := lipgloss.NewStyle().Foreground(th.Palette.Subtext)
 	bar := renderProgressBar(pl.Status, elapsed, grad, th)
 	loopStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	loopText := formatPipelineCounterLabel(pl.Status, pl.LoopCount, pl.MaxLoops)
+	loopText := formatPipelineCounterLabel(pl)
 	loopLabel := loopStyle.Render(loopText)
 	rightWidth := progressBarCells + 1 + lipgloss.Width(loopText) // bar + space + counter
 
@@ -98,15 +97,11 @@ func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad
 		available = 1
 	}
 
-	taskLabel, statusText := fitPipelineHeaderInline(pipelineDisplayLabel(pl), pl.Status, available)
+	taskLabel, _ := fitPipelineHeaderInline(pipelineDisplayLabel(pl), "", available)
 	name := renderPipelineTaskLabel(taskLabel, "", selected, activeColor, anim, th)
 
 	leftPlainWidth := lipgloss.Width(taskLabel)
 	left := prefix + name
-	if statusText != "" {
-		left += " " + statusStyle.Render(statusText)
-		leftPlainWidth += 1 + lipgloss.Width(statusText)
-	}
 
 	pad := width - lipgloss.Width(prefixPlain) - leftPlainWidth - rightWidth
 	if pad < 1 {
@@ -246,14 +241,21 @@ func activePipelineCells(status string) int {
 	return filled
 }
 
-func formatPipelineCounterLabel(status string, loopCount, maxLoops int) string {
-	if maxLoops > 0 {
+func formatPipelineCounterLabel(pl *PipelineState) string {
+	if pl == nil {
+		return "0/0"
+	}
+	if pl.ClaimsTotalCount > 0 {
+		return fmt.Sprintf("%d/%d", pl.ClaimsAccepted, pl.ClaimsTotalCount)
+	}
+	if pl.MaxLoops > 0 {
+		loopCount := pl.LoopCount
 		if loopCount < 0 {
 			loopCount = 0
 		}
-		return fmt.Sprintf("%d/%d", loopCount, maxLoops)
+		return fmt.Sprintf("%d/%d", loopCount, pl.MaxLoops)
 	}
-	return fmt.Sprintf("%d/%d", activePipelineCells(status), progressBarCells)
+	return fmt.Sprintf("%d/%d", activePipelineCells(pl.Status), progressBarCells)
 }
 
 func blendPipelineColor(base, target lipgloss.Color, targetWeight float64) lipgloss.Color {

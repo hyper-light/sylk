@@ -6,6 +6,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -89,6 +90,13 @@ type HandoffableAgent interface {
 type HandoffInjectable interface {
 	HandoffableAgent
 	InjectPreparedContext(pc *PreparedContext) error
+}
+
+// HandoffBoardInjectable extends HandoffInjectable for agents that can
+// hydrate their context from the claims board instead of PreparedContext.
+type HandoffBoardInjectable interface {
+	HandoffableAgent
+	InjectFromBoard(board *claims.ClaimsBoard, claimIDs []string) error
 }
 
 // ContextEvictable is implemented by knowledge agents that support

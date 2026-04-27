@@ -83,6 +83,8 @@ const (
 	InterAgentToolChallenge InterAgentToolKind = "challenge"
 	InterAgentToolApproval  InterAgentToolKind = "approval"
 	InterAgentToolStore     InterAgentToolKind = "store"
+	InterAgentToolClaim     InterAgentToolKind = "claim"
+	InterAgentToolTestament InterAgentToolKind = "testament"
 )
 
 type InterAgentToolStatus string

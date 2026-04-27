@@ -151,17 +151,17 @@ func TestHandle_AllowsGraceTurnForFinalizePipelineHandoffToOT(t *testing.T) {
 		Context: map[string]any{
 			"session_dir":    sessionDir,
 			"pipeline_stage": "execute",
-			"define_criteria": agentShared.PipelineProtocolSnapshotMap(&agentShared.PipelineProtocolSnapshot{
-				PendingValidation: &agentShared.PipelineValidationRecord{
-					ChallengeID:         "challenge-ready",
-					RequestingAgent:     agentShared.PipelineAgentInspector,
-					RespondingAgent:     agentShared.PipelineAgentTester,
-					Status:              string(agentShared.PipelineValidationPassed),
-					Summary:             "tester accepted the audit",
-					ChallengeReferences: []string{"finalize_pipeline_verification"},
-					EvidenceRefs:        []string{"artifact:tester"},
+			"define_criteria": map[string]any{
+				"pending_validation": map[string]any{
+					"challenge_id":         "challenge-ready",
+					"requesting_agent":     agentShared.PipelineAgentInspector,
+					"responding_agent":     agentShared.PipelineAgentTester,
+					"status":              "passed",
+					"summary":             "tester accepted the audit",
+					"challenge_references": []string{"finalize_pipeline_verification"},
+					"evidence_refs":        []string{"artifact:tester"},
 				},
-			}),
+			},
 		},
 		SessionID: "sess-1",
 	}
@@ -272,17 +272,17 @@ func TestHandle_UsesFinalizePipelineToolResultToDriveImmediateHandoffToOT(t *tes
 		Context: map[string]any{
 			"session_dir":    sessionDir,
 			"pipeline_stage": "execute",
-			"define_criteria": agentShared.PipelineProtocolSnapshotMap(&agentShared.PipelineProtocolSnapshot{
-				PendingValidation: &agentShared.PipelineValidationRecord{
-					ChallengeID:         "challenge-ready-2",
-					RequestingAgent:     agentShared.PipelineAgentInspector,
-					RespondingAgent:     agentShared.PipelineAgentTester,
-					Status:              string(agentShared.PipelineValidationPassed),
-					Summary:             "tester accepted the audit",
-					ChallengeReferences: []string{"finalize_pipeline_verification"},
-					EvidenceRefs:        []string{"artifact:tester"},
+			"define_criteria": map[string]any{
+				"pending_validation": map[string]any{
+					"challenge_id":         "challenge-ready-2",
+					"requesting_agent":     agentShared.PipelineAgentInspector,
+					"responding_agent":     agentShared.PipelineAgentTester,
+					"status":              "passed",
+					"summary":             "tester accepted the audit",
+					"challenge_references": []string{"finalize_pipeline_verification"},
+					"evidence_refs":        []string{"artifact:tester"},
 				},
-			}),
+			},
 		},
 		SessionID: "sess-2",
 	}
@@ -417,17 +417,17 @@ func TestHandle_PostValidationAuditContinuesFromToolResultsWithoutInjectedUserPr
 		Context: map[string]any{
 			"session_dir":    sessionDir,
 			"pipeline_stage": "execute",
-			"define_criteria": agentShared.PipelineProtocolSnapshotMap(&agentShared.PipelineProtocolSnapshot{
-				PendingValidation: &agentShared.PipelineValidationRecord{
-					ChallengeID:         "challenge-post-validation",
-					RequestingAgent:     agentShared.PipelineAgentInspector,
-					RespondingAgent:     agentShared.PipelineAgentTester,
-					Status:              string(agentShared.PipelineValidationPartial),
-					Summary:             "Tester accepted the audit, but canonical execution remained partially blocked by environmental caveats.",
-					ChallengeReferences: []string{"finalize_pipeline_verification"},
-					EvidenceRefs:        []string{"artifact:tester"},
+			"define_criteria": map[string]any{
+				"pending_validation": map[string]any{
+					"challenge_id":         "challenge-post-validation",
+					"requesting_agent":     agentShared.PipelineAgentInspector,
+					"responding_agent":     agentShared.PipelineAgentTester,
+					"status":              "partial",
+					"summary":             "Tester accepted the audit, but canonical execution remained partially blocked by environmental caveats.",
+					"challenge_references": []string{"finalize_pipeline_verification"},
+					"evidence_refs":        []string{"artifact:tester"},
 				},
-			}),
+			},
 		},
 		SessionID: "sess-3",
 	}

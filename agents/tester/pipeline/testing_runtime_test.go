@@ -320,10 +320,8 @@ func TestPipelineTesterVisibleSkills_IncludeHarnessAndReportingTools(t *testing.
 		"write_test",
 		"run_test_suite",
 		"bash",
-		// challenge_agent / handoff_next / validate_work /
-		// process_validation / finalize_pipeline collapsed into
-		// pipeline_protocol(action=…) on the LLM-visible list.
-		"pipeline_protocol",
+		// Claims skills: read-only board introspection is visible.
+		"query_claims_board",
 	} {
 		if !containsName(pipelineTesterVisibleSkillNames(), want) {
 			t.Fatalf("visible skills missing %q", want)

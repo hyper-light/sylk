@@ -1445,6 +1445,8 @@ func isUTF8Start(b byte) bool {
 // SummarizeToolArgs extracts a compact one-liner from JSON args.
 // Priority keys (path, pattern, query, command, etc.) are checked first.
 // Falls back to the first string value found. Truncated to maxArgsSummaryLen.
+// For verb-style tools (those with an "op" key), combines op with the first
+// priority key: "op=read path=some/file.go".
 func SummarizeToolArgs(toolName, rawJSON string) string {
 	rawJSON = strings.TrimSpace(rawJSON)
 	if rawJSON == "" || rawJSON == "{}" {
@@ -1456,13 +1458,30 @@ func SummarizeToolArgs(toolName, rawJSON string) string {
 		return ""
 	}
 
+	// For verb-style tools, prefix with op= and append the first priority key.
+	opPrefix := ""
+	if opVal, ok := parsed["op"]; ok {
+		if s := stringifyArgValue(opVal); s != "" {
+			opPrefix = "op=" + s
+		}
+	}
+
 	// Check priority keys first.
 	for _, key := range priorityArgKeys {
 		if val, ok := parsed[key]; ok {
 			if s := stringifyArgValue(val); s != "" {
-				return truncateArgSummary(key + "=" + s)
+				detail := key + "=" + s
+				if opPrefix != "" {
+					return truncateArgSummary(opPrefix + " " + detail)
+				}
+				return truncateArgSummary(detail)
 			}
 		}
+	}
+
+	// Op-only summary for verb tools with no priority key yet.
+	if opPrefix != "" {
+		return truncateArgSummary(opPrefix)
 	}
 
 	// Fallback: first string value.

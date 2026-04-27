@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -59,7 +60,8 @@ type PipelineTester struct {
 	pipelineName string
 
 	// Claims board (nil for non-claims pipelines).
-	claimsBoard *claims.ClaimsBoard
+	claimsBoard     *claims.ClaimsBoard
+	activeSessionID atomic.Value // string — set per-request from fwd.SessionID
 
 	// State.
 	currentPlan     *shared.TestPlan
@@ -354,7 +356,23 @@ func (pt *PipelineTester) registerCoreSkills() {
 	// ── Claims skills (unconditional) ──────────────────────────────
 	//
 	// Every pipeline uses claims. No legacy protocol path.
-	boardProvider := func() *claims.ClaimsBoard { return pt.claimsBoard }
+	boardProvider := func() (*claims.ClaimsBoard, error) {
+		if b := pt.claimsBoard; b != nil {
+			return b, nil
+		}
+		sid, _ := pt.activeSessionID.Load().(string)
+		if sid == "" {
+			sid = pt.config.SessionID
+		}
+		if sid == "" {
+			return nil, fmt.Errorf("tester-pipeline: no session ID configured")
+		}
+		board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+		if board == nil {
+			return nil, fmt.Errorf("tester-pipeline: session %q has no claims board registered", sid)
+		}
+		return board, nil
+	}
 	inboxProvider := func() *claims.ClaimsInbox { return pt.claimsInbox }
 	pt.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	pt.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
@@ -635,11 +653,9 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 	}
 	// Surface the active pipeline state BEFORE the LLM makes its first
 	// tool call. The tester's target-selection decision for
-	// finalize_pipeline depends on whether a challenge is pending, and
-	// the state lives in PipelineProtocolStateFromContext — not visible
-	// to the LLM unless we project it into the user message. Without
+	// finalize_pipeline depends on whether a challenge is pending. Without
 	// this, the LLM applies general-world reasoning ("tests about
-	// engineer's code → hand off to engineer") instead of protocol
+	// engineer's code -> hand off to engineer") instead of protocol
 	// reasoning ("answer the challenger"), producing challenge_target_
 	// mismatch on every inspector-initiated verification turn.
 	// Surface claims board state to the LLM so it knows what claims
@@ -722,6 +738,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	}
 
 	pt.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	pt.activeSessionID.Store(fwd.SessionID)
 	agentshared.LogIncomingRequest(pt.steering.EventLogger(), fwd, pt.id)
 
 	if taskID, _ := fwd.Metadata["task_id"].(string); taskID != "" {

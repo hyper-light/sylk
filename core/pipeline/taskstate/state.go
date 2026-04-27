@@ -22,6 +22,7 @@ const (
 type Event struct {
 	PipelineID string    `json:"pipeline_id"`
 	TaskID     string    `json:"task_id"`
+	TaskSlug   string    `json:"task_slug,omitempty"`
 	TaskLabel  string    `json:"task_label,omitempty"`
 	Status     Status    `json:"status"`
 	WorkerType string    `json:"worker_type,omitempty"`

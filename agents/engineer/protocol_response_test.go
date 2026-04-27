@@ -96,14 +96,14 @@ func TestHandleBusRequest_PipelineResponsePreservesRecordedAction(t *testing.T) 
 		SessionID: "sess-1",
 		Context: map[string]any{
 			"task_slug": "create-pyproject-and-package-init",
-			"pipeline_protocol": shared.PipelineProtocolSnapshotMap(&shared.PipelineProtocolSnapshot{
-				Roster: []shared.PipelineProtocolAgent{
-					{AgentType: shared.PipelineAgentInspector},
-					{AgentType: shared.PipelineAgentEngineer},
+			"pipeline_protocol": map[string]any{
+				"roster": []map[string]any{
+					{"agent_type": shared.PipelineAgentInspector},
+					{"agent_type": shared.PipelineAgentEngineer},
 				},
-				ActiveAgents:   []string{shared.PipelineAgentEngineer},
-				CurrentRequest: "Implement the requested production changes.",
-			}),
+				"active_agents":   []string{shared.PipelineAgentEngineer},
+				"current_request": "Implement the requested production changes.",
+			},
 		},
 	}
 	payload, err := json.Marshal(task)

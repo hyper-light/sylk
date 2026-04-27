@@ -20,10 +20,6 @@ func designerVisibleSkillNames() []string {
 		// Phase 2.K / GT-4 + GI-5: collapsed into dependency(action=…).
 		"dependency",
 		"ask_user_clarification",
-		// challenge_agent / handoff_next / validate_work /
-		// process_validation collapsed into pipeline_protocol(action=…).
-		// The per-verb skills stay registered for internal callers.
-		"pipeline_protocol",
 		// Claims skills: read-only board introspection is Local (visible).
 		"query_claims_board",
 		"inspect_claim_conflicts",
@@ -39,10 +35,6 @@ func designerMutatingSkillNames() []string {
 		"bash",
 		"dependency",
 		"ask_user_clarification",
-		"challenge_agent",
-		"handoff_next",
-		"validate_work",
-		"process_validation",
 		"reroute_request",
 		// Claims skills: mutating operations need LocalWorker policy.
 		"post_action",

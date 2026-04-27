@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -44,7 +45,8 @@ func (pt *PipelineTester) executeToolLoopWithSurface(
 		}
 
 		// ── STEERING CHECKPOINT ──
-		sc := shared.DrainAndCheckpoint(ledger, req, turn, "testing", nil)
+		sc := shared.DrainAndCheckpoint(ledger, req, turn, "testing", nil,
+			shared.WithBoardProvider(func() *claims.ClaimsBoard { return pt.testerBoard() }, pt.id))
 		if sc.Rollback != nil || sc.EditReplay != nil {
 			cp := sc.Rollback
 			if cp == nil {
@@ -100,25 +102,6 @@ func (pt *PipelineTester) executeToolLoopWithSurface(
 		logPipelineTesterTurn(ctx, turn, resp)
 
 		if len(resp.ToolCalls) == 0 {
-			if err := shared.ValidatePipelineProtocolCompletion(ctx, "tester-pipeline"); err != nil {
-				logPipelineTesterRetry(ctx, turn, "protocol_incomplete", err, resp)
-				pt.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
-				req.Messages = append(req.Messages, providers.Message{
-					Role:     providers.RoleAssistant,
-					Content:  strings.TrimSpace(resp.Content),
-					Metadata: resp.ProviderMetadata,
-				})
-				content := err.Error() +
-					"\nRespond to the active challenge with validate_work, or use challenge_agent or handoff_next explicitly."
-				if hint := pendingChallengeHint(ctx); hint != "" {
-					content += "\n" + hint
-				}
-				req.Messages = append(req.Messages, providers.Message{
-					Role:    providers.RoleUser,
-					Content: content,
-				})
-				continue
-			}
 			if err := shared.ValidateTaskExecutionCompletion(ctx, "tester-pipeline"); err != nil {
 				logPipelineTesterRetry(ctx, turn, "task_execution_incomplete", err, resp)
 				pt.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
@@ -528,23 +511,10 @@ func pipelineTesterToolNames(calls []providers.ToolCall) []string {
 
 // pendingChallengeHint returns a one-line hint with the active challenge_id
 // and requesting_agent so the tester's re-prompt carries the exact values
-// the LLM needs for validate_work, eliminating the loop where the model
-// fishes for the id via find_related_activity / inspect_open_conflicts.
-func pendingChallengeHint(ctx context.Context) string {
-	state := shared.PipelineProtocolStateFromContext(ctx)
-	if state == nil {
-		return ""
-	}
-	proj := state.Projection()
-	if proj == nil || proj.PendingChallenge == nil {
-		return ""
-	}
-	id := strings.TrimSpace(proj.PendingChallenge.ID)
-	requester := strings.TrimSpace(proj.PendingChallenge.RequestingAgent)
-	if id == "" || requester == "" {
-		return ""
-	}
-	return fmt.Sprintf("Active challenge: challenge_id=%q from %q. End the turn with validate_work(challenge_id=%q, requesting_agent=%q, status:\"...\", summary:\"...\").", id, requester, id, requester)
+// the LLM needs for validate_work. In the claims-board era, challenges are
+// surfaced through the claims board rather than protocol state projections.
+func pendingChallengeHint(_ context.Context) string {
+	return ""
 }
 
 func pipelineTesterPreview(text string) string {

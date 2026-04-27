@@ -41,14 +41,12 @@ func TraverseSkill(bp BoardProvider) *skills.Skill {
 			if nodeID == "" {
 				return nil, fmt.Errorf("node_id is required")
 			}
-			board := bp()
+			board, err := bp()
+			if err != nil {
+				return nil, fmt.Errorf("claims board: %w", err)
+			}
 			if board == nil {
-				return map[string]any{
-					"start_node": nodeID,
-					"nodes":      []GraphNode{},
-					"count":      0,
-					"error":      "claims board is not available",
-				}, nil
+				return nil, fmt.Errorf("claims board not available (no error returned)")
 			}
 			maxDepth := params.MaxDepth
 			if maxDepth <= 0 {

@@ -1338,7 +1338,7 @@ func (b *DAGBridge) publishCompletedTaskPipelineState(dagID, nodeID string) {
 	if !ok || strings.TrimSpace(ref.Stage) != string(StageExecute) {
 		return
 	}
-	publishTaskPipelineState(bus, b.agentID, ref.TaskID, ref.TaskLabel, taskstate.StatusCompleted, ref.AgentType)
+	publishTaskPipelineState(bus, b.agentID, ref.TaskID, ref.TaskLabel, "", taskstate.StatusCompleted, ref.AgentType)
 }
 
 func (b *DAGBridge) publishFailedTaskPipelineState(dagID, nodeID string) {
@@ -1354,7 +1354,7 @@ func (b *DAGBridge) publishFailedTaskPipelineState(dagID, nodeID string) {
 	if !ok || strings.TrimSpace(ref.TaskID) == "" {
 		return
 	}
-	publishTaskPipelineState(bus, b.agentID, ref.TaskID, ref.TaskLabel, taskstate.StatusFailed, ref.AgentType)
+	publishTaskPipelineState(bus, b.agentID, ref.TaskID, ref.TaskLabel, "", taskstate.StatusFailed, ref.AgentType)
 }
 
 func (b *DAGBridge) publishCancelledTaskPipelineStates(dagID string) {
@@ -1368,7 +1368,7 @@ func (b *DAGBridge) publishCancelledTaskPipelineStates(dagID string) {
 	bus := b.bus
 	b.mu.RUnlock()
 	for taskID, taskLabel := range meta.TaskLabels {
-		publishTaskPipelineState(bus, b.agentID, taskID, taskLabel, taskstate.StatusCancelled, "")
+		publishTaskPipelineState(bus, b.agentID, taskID, taskLabel, "", taskstate.StatusCancelled, "")
 	}
 }
 
@@ -1526,7 +1526,7 @@ func (b *DAGBridge) resetTaskPod(dagID, taskID string) error {
 	if oldPod != nil {
 		oldPod.Release()
 	}
-	publishTaskPipelineState(bus, b.agentID, taskID, taskLabel, taskstate.StatusPending, "")
+	publishTaskPipelineState(bus, b.agentID, taskID, taskLabel, "", taskstate.StatusPending, "")
 	return nil
 }
 

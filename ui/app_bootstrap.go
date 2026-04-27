@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/llm"
 	"github.com/adalundhe/sylk/core/lsp"
 	"github.com/adalundhe/sylk/core/search/git"
@@ -262,6 +263,7 @@ func (m *AppModel) initializePipelineBridge(deps Deps) {
 		return
 	}
 	m.pipelineBridge = bridge.NewPipelineBridge("tui.pipeline", deps.GuideBus, deps.VariantRegistry, deps.Scope)
+	m.claimsBridge = bridge.NewClaimsBridge("tui.claims", claims.DefaultSessionBoardRegistry(), deps.Scope)
 }
 
 var (

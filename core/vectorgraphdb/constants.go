@@ -58,6 +58,14 @@ var CrossDomainEdgeRules = []CrossDomainEdgeRule{
 	{EdgeTypeValidatedBy, DomainHistory, DomainAcademic},
 	{EdgeTypeUsesLibrary, DomainCode, DomainAcademic},
 	{EdgeTypeImplementsPattern, DomainCode, DomainAcademic},
+	// Claims cross-domain: claims reference code/history, validated by inspector/tester.
+	{EdgeTypeReferences, DomainClaims, DomainCode},
+	{EdgeTypeReferences, DomainClaims, DomainHistory},
+	{EdgeTypeReferences, DomainClaims, DomainEngineer},
+	{EdgeTypeReferences, DomainClaims, DomainArchitect},
+	{EdgeTypeValidatedBy, DomainClaims, DomainInspector},
+	{EdgeTypeValidatedBy, DomainClaims, DomainTester},
+	{EdgeTypeDocuments, DomainClaims, DomainAcademic},
 }
 
 func IsValidCrossDomainEdge(edgeType EdgeType, fromDomain, toDomain Domain) bool {

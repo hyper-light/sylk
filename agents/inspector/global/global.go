@@ -428,7 +428,7 @@ func (gi *GlobalInspector) Start(bus guide.EventBus) error {
 		AgentID:      gi.id,
 		SessionID:    gi.config.SessionID,
 		Bus:          bus,
-		Board:        gi.globalInspectorBoard(),
+		Board:        gi.globalInspectorBoardOrNil(),
 		Scope:        gi.scope,
 		ProcessEntry: gi.processClaimsEntry,
 	}); inbox != nil {

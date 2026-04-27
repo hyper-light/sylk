@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -55,7 +56,8 @@ type PipelineInspector struct {
 	pipelineName string
 
 	// Claims board (nil for non-claims pipelines).
-	claimsBoard *claims.ClaimsBoard
+	claimsBoard     *claims.ClaimsBoard
+	activeSessionID atomic.Value // string — set per-request from fwd.SessionID
 
 	// Tool runner for external analysis tools.
 	toolRunner      *shared.ToolRunner
@@ -102,10 +104,9 @@ type PipelineInspector struct {
 	workspaceViews versioning.WorkspaceViewAccess
 
 	// pipelineCommitter is the inspector-only VFS lifecycle authority.
-	// handoff_to_ot and discard_pipeline call into it; all other agents
-	// (engineer, designer, tester) leave their PipelineProtocolSkillConfig
-	// without one. See agents/shared/pipeline_committer.go for context on
-	// why this lives at the inspector rather than the orchestrator.
+	// handoff_to_ot and discard_pipeline call into it. See
+	// agents/shared/pipeline_committer.go for context on why this lives
+	// at the inspector rather than the orchestrator.
 	pipelineCommitter agentShared.PipelineCommitter
 
 	// Request lifecycle.
@@ -649,6 +650,7 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	}
 
 	pi.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	pi.activeSessionID.Store(fwd.SessionID)
 	agentShared.LogIncomingRequest(pi.steering.EventLogger(), fwd, pi.id)
 
 	if taskID, _ := fwd.Metadata["task_id"].(string); taskID != "" {

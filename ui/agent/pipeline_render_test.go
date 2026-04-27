@@ -26,24 +26,23 @@ func TestRenderProgressBar_UsesUniformAnimatedSquares(t *testing.T) {
 	}
 }
 
-func TestFormatPipelineCounterLabel_UsesLoopsOrPhaseFallback(t *testing.T) {
+func TestFormatPipelineCounterLabel_UsesClaimsOrLoopsOrPhaseFallback(t *testing.T) {
 	tests := []struct {
-		name      string
-		status    string
-		loopCount int
-		maxLoops  int
-		want      string
+		name string
+		pl   *PipelineState
+		want string
 	}{
-		{name: "known max", status: "executing", maxLoops: 5, want: "0/5"},
-		{name: "phase fallback executing", status: "executing", want: "3/4"},
-		{name: "phase fallback validating", status: "validating", want: "4/4"},
-		{name: "phase fallback pending", status: "pending", want: "0/4"},
+		{name: "claims count", pl: &PipelineState{ClaimsAccepted: 3, ClaimsTotalCount: 5, Status: "executing"}, want: "3/5"},
+		{name: "known max", pl: &PipelineState{Status: "executing", MaxLoops: 5}, want: "0/5"},
+		{name: "phase fallback executing", pl: &PipelineState{Status: "executing"}, want: "3/4"},
+		{name: "phase fallback validating", pl: &PipelineState{Status: "validating"}, want: "4/4"},
+		{name: "phase fallback pending", pl: &PipelineState{Status: "pending"}, want: "0/4"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := formatPipelineCounterLabel(tt.status, tt.loopCount, tt.maxLoops); got != tt.want {
-				t.Fatalf("formatPipelineCounterLabel(%q, %d, %d) = %q, want %q", tt.status, tt.loopCount, tt.maxLoops, got, tt.want)
+			if got := formatPipelineCounterLabel(tt.pl); got != tt.want {
+				t.Fatalf("formatPipelineCounterLabel() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -82,12 +81,13 @@ func TestRenderPipelineRow_KeepsProgressOnSingleLineWithRightAlignment(t *testin
 	}
 }
 
-func TestRenderPipelineRow_FitsTitleAndStatusWhenWidthAllows(t *testing.T) {
+func TestRenderPipelineRow_FitsTitleWhenWidthAllows(t *testing.T) {
 	th := theme.DefaultDark()
 	grad := th.Palette.PipelineGradient()
 	pl := &PipelineState{
 		ID:        "task_short",
-		TaskLabel: "short-task",
+		TaskSlug:  "short-task",
+		TaskLabel: "Add structure",
 		Status:    "executing",
 		LoopCount: 1,
 		MaxLoops:  4,
@@ -98,10 +98,7 @@ func TestRenderPipelineRow_FitsTitleAndStatusWhenWidthAllows(t *testing.T) {
 		t.Fatalf("expected single-line row, got %q", rendered)
 	}
 	if !strings.Contains(rendered, "short-task") {
-		t.Fatalf("expected full task label, got %q", rendered)
-	}
-	if !strings.Contains(rendered, "executing") {
-		t.Fatalf("expected full status, got %q", rendered)
+		t.Fatalf("expected task slug, got %q", rendered)
 	}
 	suffix := strings.Repeat(pipelineProgressGlyph, progressBarCells) + " 1/4"
 	if !strings.HasSuffix(rendered, suffix) {

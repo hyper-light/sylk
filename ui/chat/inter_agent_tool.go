@@ -637,6 +637,10 @@ func interAgentRowFromMetadata(meta *msg.InterAgentToolEventMsg) (*InterAgentToo
 		kind = InterAgentToolApproval
 	case "store":
 		kind = InterAgentToolStore
+	case "claim":
+		kind = InterAgentToolClaim
+	case "testament":
+		kind = InterAgentToolTestament
 	}
 	status := InterAgentToolPending
 	switch strings.TrimSpace(meta.Status) {

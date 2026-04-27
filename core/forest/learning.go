@@ -739,6 +739,29 @@ func (m *MemoryForest) recordRetrievalExamples(
 	packets []*BranchPacket,
 	featureByBranch map[string][]float32,
 ) error {
+	return m.recordRetrievalExamplesWithSource(ctx, query, packets, featureByBranch,
+		"" /* retrievalMode */, 1.0 /* weight */, "" /* auditEventID */)
+}
+
+// recordRetrievalExamplesWithSource is the source-aware variant
+// called by Retrieve. Exploration retrievals pass retrievalMode=
+// "exploration" + a higher weight so the trainer can up-weight
+// unbiased data. The auditEventID links each row back to the
+// retrieval audit event that produced it so counterfactual labeling
+// can JOIN via forest_retrieval_candidates.
+//
+// label_source is intentionally NOT set here — it represents the
+// outcome label source (explicit / counterfactual / implicit_negative)
+// and stays empty until an outcome event lands.
+func (m *MemoryForest) recordRetrievalExamplesWithSource(
+	ctx context.Context,
+	query Query,
+	packets []*BranchPacket,
+	featureByBranch map[string][]float32,
+	retrievalMode string,
+	weight float64,
+	auditEventID string,
+) error {
 	if len(packets) == 0 {
 		return nil
 	}
@@ -751,8 +774,9 @@ func (m *MemoryForest) recordRetrievalExamples(
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO forest_training_examples
 		(retrieval_id, branch_id, root_id, session_id, caller_agent_type, branch_agent_type,
-		 rank_position, base_score, predicted_utility, predicted_risk, features, metadata, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 rank_position, base_score, predicted_utility, predicted_risk, features, metadata, created_at, updated_at,
+		 label_weight, retrieval_mode, audit_event_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(retrieval_id, branch_id) DO UPDATE SET
 			rank_position = excluded.rank_position,
 			base_score = excluded.base_score,
@@ -760,7 +784,10 @@ func (m *MemoryForest) recordRetrievalExamples(
 			predicted_risk = excluded.predicted_risk,
 			features = excluded.features,
 			metadata = excluded.metadata,
-			updated_at = excluded.updated_at
+			updated_at = excluded.updated_at,
+			label_weight = excluded.label_weight,
+			retrieval_mode = excluded.retrieval_mode,
+			audit_event_id = excluded.audit_event_id
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare retrieval example insert: %w", err)
@@ -822,6 +849,9 @@ func (m *MemoryForest) recordRetrievalExamples(
 			marshalJSON(metadata),
 			now.Unix(),
 			now.Unix(),
+			weight,
+			retrievalMode,
+			auditEventID,
 		); err != nil {
 			return fmt.Errorf("insert retrieval example: %w", err)
 		}
@@ -865,6 +895,11 @@ func outcomeLabels(status OutcomeStatus) (float64, float64) {
 		return 1.0, 0.0
 	case OutcomeStatusFailed:
 		return 0.0, 1.0
+	case OutcomeStatusIgnored:
+		// Ignored is asymmetric soft-negative — bias toward low
+		// utility, slight risk bump, but never the confidence of an
+		// explicit failure.
+		return 0.25, 0.55
 	default:
 		return 0.5, 0.5
 	}

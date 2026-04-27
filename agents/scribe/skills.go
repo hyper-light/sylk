@@ -62,8 +62,16 @@ func (s *Scribe) newToolBundle(feed shared.ScribeFeed) (*scribeToolBundle, *scri
 	// Claims skills — the scribe is a full claims participant. It can
 	// query board state for context-aware narration, submit testaments
 	// about narration work, and post actions about precedent patterns.
-	boardProvider := func() *claims.ClaimsBoard {
-		return claims.DefaultSessionBoardRegistry().Lookup(s.sessionID)
+	boardProvider := func() (*claims.ClaimsBoard, error) {
+		sid := s.sessionID
+		if sid == "" {
+			return nil, fmt.Errorf("scribe: no session ID configured")
+		}
+		board := claims.DefaultSessionBoardRegistry().Lookup(sid)
+		if board == nil {
+			return nil, fmt.Errorf("scribe: session %q has no claims board registered", sid)
+		}
+		return board, nil
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return s.claimsInbox }
 	for _, skill := range []*skills.Skill{

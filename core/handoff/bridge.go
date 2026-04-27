@@ -311,7 +311,9 @@ func (b *HandoffBridge) RecordTurn(rec TurnRecord) {
 	gpObs := NewGPObservation(rec.ContextSize, rec.OutputTokens, rec.ToolCalls, quality)
 	b.gp.AddObservation(gpObs)
 
-	// Feed prepared context with a synthetic message.
+	// Feed prepared context with a synthetic message. PreparedContext
+	// is always maintained — it drives brief generation and GP quality
+	// predictions even when the board is the primary state transfer.
 	b.prepared.AddMessage(Message{
 		Role:       "turn",
 		Content:    turnSummary(turn, rec),
@@ -840,6 +842,23 @@ func (b *HandoffBridge) executeStandaloneHandoff(rec *HandoffRecommendation) {
 		return
 	}
 
+	// Attach board metadata so the new agent can use board-first injection.
+	b.mu.RLock()
+	transferSessionID := b.lastTrace.SessionID
+	transferBP := b.boardProvider
+	b.mu.RUnlock()
+	if transfer.Metadata == nil {
+		transfer.Metadata = make(map[string]string)
+	}
+	if transferSessionID != "" {
+		transfer.Metadata["session_id"] = transferSessionID
+	}
+	if transferBP != nil {
+		if board := transferBP(); board != nil {
+			transfer.Metadata["board_id"] = board.BoardID()
+		}
+	}
+
 	result := b.manager.GetExecutor().ExecuteHandoff(ctx, transfer)
 	if result == nil || !result.Success {
 		var execErr error
@@ -1098,6 +1117,21 @@ func (b *HandoffBridge) handleHandoffResult(result *HandoffResult) error {
 			handoffArtifact(sessionID, newAgent.AgentID(), "tokens_transferred", fmt.Sprintf("%d", result.Metrics.TokensTransferred)),
 		},
 	))
+
+	// Post continuation claim so the new agent picks up directed work.
+	if bp != nil {
+		if board := bp(); board != nil {
+			handoffPostClaim(bp, context.Background(),
+				claims.Action{AgentID: "handoff_bridge", Type: claims.ActionTypeTask},
+				handoffClaim(
+					"Continue work from handoff",
+					"Previous agent handed off. Resume directed claims.",
+					newAgent.AgentID(),
+					nil, nil,
+				),
+			)
+		}
+	}
 
 	b.emitHandoffTrace("handoff_execute_completed", "info", nil, map[string]any{
 		"new_agent_id": newAgent.AgentID(),
