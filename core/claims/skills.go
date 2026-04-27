@@ -155,7 +155,7 @@ func PostActionSkill(bp BoardProvider, ip ...InboxProvider) *skills.Skill {
 		Keywords("action", "claim", "issue", "challenge", "consult").
 		Priority(97).
 		StringParam("action_type", "Type: task, challenge, consultation, corrective, archival, prompt", true).
-		StringParam("claims_json", "JSON array of claims with title, description, subject, scope, and validations", true).
+		StringParam("claims_json", `JSON array of claim objects. Each claim: {"title": str, "description": str, "subject": "<agent_id>", "scope": [{"kind": "file"|"scope"|..., "key": str}], "validations": [{"description": str, "quality_bar": str, "type": "test"|"inspection"|"integration"|"contract"|"design"|"regression"|"receipt"}]}. validations MUST be an array of objects — never a string. Example: [{"title":"Add login","description":"...","subject":"engineer","scope":[{"kind":"file","key":"auth.go"}],"validations":[{"description":"unit tests pass","quality_bar":"100% pass","type":"test"}]}]`, true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			board, err := bp()
 			if err != nil {
@@ -172,7 +172,7 @@ func PostActionSkill(bp BoardProvider, ip ...InboxProvider) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
-			claimsRaw := unwrapStringEncodedJSON(params.ClaimsJSON)
+			claimsRaw := unwrapJSONArray(params.ClaimsJSON)
 			var claimInputs []claimInput
 			if err := json.Unmarshal(claimsRaw, &claimInputs); err != nil {
 				return nil, fmt.Errorf("invalid claims_json: %w", err)
@@ -313,7 +313,7 @@ func SubmitTestamentsSkill(bp BoardProvider) *skills.Skill {
 		Domain("claims").
 		Keywords("testament", "submit", "proof", "artifacts", "done", "error").
 		Priority(96).
-		StringParam("testaments_json", "JSON array of testaments. Each has claim_id, summary, confidence, and artifacts. Artifact kinds include 'code_reference', 'test_output', 'diff', 'error' (for failures), 'error_trace' (stack traces), 'error_diagnostic' (environmental failures).", true).
+		StringParam("testaments_json", `JSON array of testament objects. Each testament: {"claim_id": "<id>", "summary": str, "confidence": "low"|"medium"|"high", "artifacts": [{"kind": "code_reference"|"test_output"|"diff"|"error"|"error_trace"|"error_diagnostic", "reference": str, "metadata": {...}, "ephemeral": bool}]}. artifacts MUST be an array of objects — never a string. Example: [{"claim_id":"clm_123","summary":"Tests pass","confidence":"high","artifacts":[{"kind":"test_output","reference":"go test ./... — 42 passed"}]}]`, true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			board, err := bp()
 			if err != nil {
@@ -329,7 +329,7 @@ func SubmitTestamentsSkill(bp BoardProvider) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
-			testamentsRaw := unwrapStringEncodedJSON(params.TestamentsJSON)
+			testamentsRaw := unwrapJSONArray(params.TestamentsJSON)
 			var testamentInputs []testamentInput
 			if err := json.Unmarshal(testamentsRaw, &testamentInputs); err != nil {
 				return nil, fmt.Errorf("invalid testaments_json: %w", err)
@@ -437,7 +437,7 @@ func PostRemediationClaimsSkill(bp BoardProvider) *skills.Skill {
 		Priority(99).
 		StringParam("claim_id", "ID of the claim to reject", true).
 		StringParam("reason", "Why the claim is being rejected", true).
-		StringParam("replacements_json", "JSON array of replacement claims", true).
+		StringParam("replacements_json", `JSON array of replacement claim objects. Same shape as claims_json: each has {"title", "description", "subject", "scope": [{"kind","key"}], "validations": [{"description","quality_bar","type"}]}. validations MUST be an array of objects.`, true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			board, err := bp()
 			if err != nil {
@@ -455,7 +455,7 @@ func PostRemediationClaimsSkill(bp BoardProvider) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
-			replacementsRaw := unwrapStringEncodedJSON(params.ReplacementsJSON)
+			replacementsRaw := unwrapJSONArray(params.ReplacementsJSON)
 			var claimInputs []claimInput
 			if err := json.Unmarshal(replacementsRaw, &claimInputs); err != nil {
 				return nil, fmt.Errorf("invalid replacements_json: %w", err)
@@ -492,11 +492,11 @@ func PostRemediationClaimsSkill(bp BoardProvider) *skills.Skill {
 // ── Input types ─────────────────────────────────────────────────────
 
 type claimInput struct {
-	Title       string            `json:"title"`
-	Description string            `json:"description"`
-	Subject     string            `json:"subject"`
-	Scope       flexibleScope     `json:"scope,omitempty"`
-	Validations []validationInput `json:"validations,omitempty"`
+	Title       string              `json:"title"`
+	Description string              `json:"description"`
+	Subject     string              `json:"subject"`
+	Scope       flexibleScope       `json:"scope,omitempty"`
+	Validations flexibleValidations `json:"validations,omitempty"`
 }
 
 // flexibleScope handles LLM variability in how scope is provided:
@@ -547,11 +547,66 @@ type validationInput struct {
 	Type        string `json:"type"`
 }
 
+// flexibleValidations handles LLM variability in how validations are provided.
+// LLMs frequently emit a string, single object, or string array instead of the
+// declared []validationInput shape — this is the single most common source of
+// post_action JSON errors. Coerce to the canonical shape:
+//   - "ensure tests pass" → [{Description: "ensure tests pass"}]
+//   - {description, quality_bar, type} → [{...}]
+//   - ["a", "b"] → [{Description: "a"}, {Description: "b"}]
+//   - [{...}, {...}] → used directly
+type flexibleValidations []validationInput
+
+func (v *flexibleValidations) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || string(data) == "null" {
+		return nil
+	}
+
+	// Canonical shape: array of objects.
+	var entries []validationInput
+	if err := json.Unmarshal(data, &entries); err == nil {
+		*v = entries
+		return nil
+	}
+
+	// Single object: {description, quality_bar, type}.
+	var single validationInput
+	if err := json.Unmarshal(data, &single); err == nil && (single.Description != "" || single.QualityBar != "" || single.Type != "") {
+		*v = flexibleValidations{single}
+		return nil
+	}
+
+	// Array of strings: ["criterion a", "criterion b"].
+	var stringSlice []string
+	if err := json.Unmarshal(data, &stringSlice); err == nil {
+		out := make(flexibleValidations, 0, len(stringSlice))
+		for _, s := range stringSlice {
+			if trimmed := strings.TrimSpace(s); trimmed != "" {
+				out = append(out, validationInput{Description: trimmed})
+			}
+		}
+		*v = out
+		return nil
+	}
+
+	// Single string: "ensure tests pass".
+	var description string
+	if err := json.Unmarshal(data, &description); err == nil {
+		if trimmed := strings.TrimSpace(description); trimmed != "" {
+			*v = flexibleValidations{{Description: trimmed}}
+		}
+		return nil
+	}
+
+	return fmt.Errorf("validations must be a string, string array, [{description, quality_bar, type}] array, or single object")
+}
+
 type testamentInput struct {
-	ClaimID    string          `json:"claim_id"`
-	Summary    string          `json:"summary"`
-	Confidence string          `json:"confidence,omitempty"`
-	Artifacts  []artifactInput `json:"artifacts,omitempty"`
+	ClaimID    string            `json:"claim_id"`
+	Summary    string            `json:"summary"`
+	Confidence string            `json:"confidence,omitempty"`
+	Artifacts  flexibleArtifacts `json:"artifacts,omitempty"`
 }
 
 type artifactInput struct {
@@ -561,22 +616,85 @@ type artifactInput struct {
 	Ephemeral bool           `json:"ephemeral,omitempty"`
 }
 
-// unwrapStringEncodedJSON handles the common LLM behavior of double-encoding
-// JSON parameters: sending `"[{...}]"` (a JSON string containing JSON) instead
-// of `[{...}]` (raw JSON). When the input is a JSON string, it unquotes it
-// and returns the inner JSON. When the input is already raw JSON (array or
-// object), it returns it unchanged.
-func unwrapStringEncodedJSON(raw json.RawMessage) json.RawMessage {
+// flexibleArtifacts handles LLM variability in how testament artifacts are
+// provided. Same coercion contract as flexibleValidations:
+//   - "src/foo.go:42" → [{Reference: "src/foo.go:42"}]
+//   - {kind, reference, ...} → [{...}]
+//   - ["ref1", "ref2"] → [{Reference: "ref1"}, {Reference: "ref2"}]
+//   - [{...}, {...}] → used directly
+type flexibleArtifacts []artifactInput
+
+func (a *flexibleArtifacts) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || string(data) == "null" {
+		return nil
+	}
+
+	var entries []artifactInput
+	if err := json.Unmarshal(data, &entries); err == nil {
+		*a = entries
+		return nil
+	}
+
+	var single artifactInput
+	if err := json.Unmarshal(data, &single); err == nil && (single.Kind != "" || single.Reference != "" || len(single.Metadata) > 0) {
+		*a = flexibleArtifacts{single}
+		return nil
+	}
+
+	var stringSlice []string
+	if err := json.Unmarshal(data, &stringSlice); err == nil {
+		out := make(flexibleArtifacts, 0, len(stringSlice))
+		for _, s := range stringSlice {
+			if trimmed := strings.TrimSpace(s); trimmed != "" {
+				out = append(out, artifactInput{Reference: trimmed})
+			}
+		}
+		*a = out
+		return nil
+	}
+
+	var reference string
+	if err := json.Unmarshal(data, &reference); err == nil {
+		if trimmed := strings.TrimSpace(reference); trimmed != "" {
+			*a = flexibleArtifacts{{Reference: trimmed}}
+		}
+		return nil
+	}
+
+	return fmt.Errorf("artifacts must be a string, string array, [{kind, reference, ...}] array, or single object")
+}
+
+// unwrapJSONArray normalizes LLM-produced JSON for tool parameters that expect
+// an array. It handles three shape mistakes seen in the wild:
+//   - double-encoded JSON: `"[{...}]"` (JSON string of JSON) → `[{...}]`
+//   - single object instead of array: `{...}` → `[{...}]`
+//   - canonical array: `[{...}]` → unchanged
+//
+// Anything else passes through unchanged so the caller's strict unmarshal
+// produces a meaningful error message.
+func unwrapJSONArray(raw json.RawMessage) json.RawMessage {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
 		return raw
 	}
-	// If it starts with a quote, it's a JSON string — unquote to get the inner JSON.
+	// Unwrap double-encoded JSON string → inner JSON.
 	if trimmed[0] == '"' {
 		var inner string
 		if err := json.Unmarshal(trimmed, &inner); err == nil {
-			return json.RawMessage(inner)
+			trimmed = bytes.TrimSpace([]byte(inner))
 		}
 	}
-	return raw
+	if len(trimmed) == 0 {
+		return raw
+	}
+	// Promote single object → single-element array.
+	if trimmed[0] == '{' {
+		wrapped := make([]byte, 0, len(trimmed)+2)
+		wrapped = append(wrapped, '[')
+		wrapped = append(wrapped, trimmed...)
+		wrapped = append(wrapped, ']')
+		return wrapped
+	}
+	return trimmed
 }

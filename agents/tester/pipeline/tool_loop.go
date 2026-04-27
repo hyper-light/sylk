@@ -176,9 +176,6 @@ func (pt *PipelineTester) executeToolLoopWithSurface(
 			}
 			return "", controlErr
 		}
-		if shared.PipelineTurnTerminated(ctx) {
-			return "", nil
-		}
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= shared.MaxConsecutiveToolErrors {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -269,7 +266,7 @@ func (pt *PipelineTester) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
-		if controlErr != nil || shared.PipelineTurnTerminated(ctx) {
+		if controlErr != nil {
 			shared.AppendSkippedToolResults(req, resp.ToolCalls[idx+1:], "a previous tool call in this assistant turn already completed or redirected the pipeline decision")
 			break
 		}

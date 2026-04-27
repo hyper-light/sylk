@@ -1,6 +1,7 @@
 package knowledgeruntime
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -56,10 +57,21 @@ type sharedCommittedMetaStore struct {
 	refCount int
 }
 
-// committedMetaBucket is the single bbolt bucket all entries live in.
-// Single-character name keeps internal B+tree page overhead minimal
-// at scale (matches the EdgeShardStore convention).
-var committedMetaBucket = []byte("p")
+// committedMetaBucket holds path → committedPathMeta entries.
+// committedMetaNodeBucket holds nodeID(BE-uint32) → path entries —
+// the reverse index that lets incremental refresh resolve removed
+// nodes back to the path whose metadata they contributed to,
+// without scanning every path's NodeIDs list.
+// committedMetaInfoBucket holds index-level metadata (last-built
+// version, build time, schema marker). Single-character bucket
+// names keep the B+tree internal page overhead minimal at scale.
+var (
+	committedMetaBucket     = []byte("p")
+	committedMetaNodeBucket = []byte("n")
+	committedMetaInfoBucket = []byte("m")
+	infoBuiltVersion        = []byte("built_version")
+	infoBuiltTimestamp      = []byte("built_timestamp")
+)
 
 // committedMetaCacheSize bounds the LRU. Anchored to the typical
 // query fan-out of a single agent search request times concurrent
@@ -109,11 +121,15 @@ func newCommittedMetaStore(dbPath string) (*committedMetaStore, error) {
 		return nil, fmt.Errorf("committed meta: open bolt: %w", err)
 	}
 	if err := db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(committedMetaBucket)
-		return err
+		for _, name := range [][]byte{committedMetaBucket, committedMetaNodeBucket, committedMetaInfoBucket} {
+			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
+				return err
+			}
+		}
+		return nil
 	}); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("committed meta: create bucket: %w", err)
+		return nil, fmt.Errorf("committed meta: create buckets: %w", err)
 	}
 
 	cache, err := lru.New[string, *committedPathMeta](committedMetaCacheSize)
@@ -250,14 +266,167 @@ func (s *committedMetaStore) Lookup(path string) (*committedPathMeta, bool) {
 	return meta, true
 }
 
-// PersistAll replaces the entire bbolt bucket atomically with the
-// given path → meta entries. Called once per refresh to swap the
-// derived index into durable storage.
+// BuiltVersion returns the version recorded by the most recent
+// successful PersistAll/ApplyDelta, or "" + false if none has been
+// recorded.
+//
+// Callers use this to short-circuit refresh: if the live HEAD equals
+// BuiltVersion, the bbolt store already holds the correct derived
+// index and no rebuild is needed.
+func (s *committedMetaStore) BuiltVersion() (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	s.mu.RLock()
+	if s.closed || s.db == nil {
+		s.mu.RUnlock()
+		return "", false
+	}
+	db := s.db
+	s.mu.RUnlock()
+
+	var version string
+	if err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(committedMetaInfoBucket)
+		if b == nil {
+			return nil
+		}
+		val := b.Get(infoBuiltVersion)
+		if val == nil {
+			return nil
+		}
+		version = string(val)
+		return nil
+	}); err != nil {
+		return "", false
+	}
+	if version == "" {
+		return "", false
+	}
+	return version, true
+}
+
+// BuiltTimestamp returns the wall-clock UnixNano at which the last
+// successful build/incremental commit completed, or (0, false) if
+// none has been recorded.
+//
+// Used by incremental refresh to filter "edges added since last
+// build" via Edge.CreatedAt.
+func (s *committedMetaStore) BuiltTimestamp() (int64, bool) {
+	if s == nil {
+		return 0, false
+	}
+	s.mu.RLock()
+	if s.closed || s.db == nil {
+		s.mu.RUnlock()
+		return 0, false
+	}
+	db := s.db
+	s.mu.RUnlock()
+
+	var ts int64
+	var found bool
+	if err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(committedMetaInfoBucket)
+		if b == nil {
+			return nil
+		}
+		val := b.Get(infoBuiltTimestamp)
+		if len(val) != 8 {
+			return nil
+		}
+		ts = int64(binary.LittleEndian.Uint64(val))
+		found = true
+		return nil
+	}); err != nil {
+		return 0, false
+	}
+	return ts, found
+}
+
+// PathCount returns the number of paths currently persisted. O(1) —
+// reads bbolt's KeyN bucket statistic. Used by incremental refresh
+// to decide whether the affected-path set is small enough that
+// per-path re-aggregation beats a full streaming rebuild.
+func (s *committedMetaStore) PathCount() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	if s.closed || s.db == nil {
+		s.mu.RUnlock()
+		return 0
+	}
+	db := s.db
+	s.mu.RUnlock()
+
+	count := 0
+	_ = db.View(func(tx *bolt.Tx) error {
+		if b := tx.Bucket(committedMetaBucket); b != nil {
+			count = b.Stats().KeyN
+		}
+		return nil
+	})
+	return count
+}
+
+// LookupNodePath returns the path that nodeID was associated with at
+// the time of the last build/delta apply. Returns "" + false if the
+// node is unknown to this store. Used by incremental refresh to
+// resolve removed nodes back to the path whose meta they
+// contributed to.
+func (s *committedMetaStore) LookupNodePath(nodeID uint32) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	s.mu.RLock()
+	if s.closed || s.db == nil {
+		s.mu.RUnlock()
+		return "", false
+	}
+	db := s.db
+	s.mu.RUnlock()
+
+	var path string
+	if err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(committedMetaNodeBucket)
+		if b == nil {
+			return nil
+		}
+		val := b.Get(encodeNodeIDKey(nodeID))
+		if val == nil {
+			return nil
+		}
+		path = string(val)
+		return nil
+	}); err != nil {
+		return "", false
+	}
+	if path == "" {
+		return "", false
+	}
+	return path, true
+}
+
+// PersistAll replaces the entire derived index atomically with the
+// given path → meta entries and records the built version. Called
+// on full rebuild paths (cold start, divergent history, oversized
+// delta).
 //
 // All pathMeta.finalize() calls must have run before this — the
 // stored representation is the post-finalize sorted-slices form;
 // the build-time set fields are not serialized.
-func (s *committedMetaStore) PersistAll(byPath map[string]*committedPathMeta) error {
+//
+// Inside the single bolt write transaction:
+//   - bucket "p" is dropped and recreated, populated with the new
+//     path → committedPathMeta entries
+//   - bucket "n" is dropped and recreated, populated with the
+//     reverse nodeID → path entries derived from each meta.NodeIDs
+//   - bucket "m" records built_version + built_timestamp
+//
+// Concurrent readers in their own View tx see either the prior
+// snapshot or the new one — never partial state.
+func (s *committedMetaStore) PersistAll(byPath map[string]*committedPathMeta, builtVersion string) error {
 	if s == nil {
 		return fmt.Errorf("committed meta: store is nil")
 	}
@@ -270,18 +439,26 @@ func (s *committedMetaStore) PersistAll(byPath map[string]*committedPathMeta) er
 	cache := s.cache
 	s.mu.Unlock()
 
+	now := time.Now().UnixNano()
 	return db.Update(func(tx *bolt.Tx) error {
-		// Drop and recreate the bucket — atomic replace within the tx.
+		// Replace path bucket atomically.
 		if err := tx.DeleteBucket(committedMetaBucket); err != nil && err != bolt.ErrBucketNotFound {
-			return fmt.Errorf("delete prior bucket: %w", err)
+			return fmt.Errorf("delete path bucket: %w", err)
 		}
-		b, err := tx.CreateBucket(committedMetaBucket)
+		paths, err := tx.CreateBucket(committedMetaBucket)
 		if err != nil {
-			return fmt.Errorf("create bucket: %w", err)
+			return fmt.Errorf("create path bucket: %w", err)
 		}
 
-		// Pre-flush LRU so stale entries from a prior version don't
-		// bleed into queries against the new state.
+		// Replace node-id reverse bucket atomically.
+		if err := tx.DeleteBucket(committedMetaNodeBucket); err != nil && err != bolt.ErrBucketNotFound {
+			return fmt.Errorf("delete node bucket: %w", err)
+		}
+		nodes, err := tx.CreateBucket(committedMetaNodeBucket)
+		if err != nil {
+			return fmt.Errorf("create node bucket: %w", err)
+		}
+
 		if cache != nil {
 			cache.Purge()
 		}
@@ -294,17 +471,187 @@ func (s *committedMetaStore) PersistAll(byPath map[string]*committedPathMeta) er
 			if err != nil {
 				return fmt.Errorf("encode %q: %w", path, err)
 			}
-			if err := b.Put([]byte(path), raw); err != nil {
-				return fmt.Errorf("put %q: %w", path, err)
+			if err := paths.Put([]byte(path), raw); err != nil {
+				return fmt.Errorf("put path %q: %w", path, err)
+			}
+			pathBytes := []byte(path)
+			for _, id := range meta.NodeIDs {
+				if err := nodes.Put(encodeNodeIDKey(id), pathBytes); err != nil {
+					return fmt.Errorf("put node %d→%q: %w", id, path, err)
+				}
 			}
 		}
-		return nil
+
+		return writeBuiltStamp(tx, builtVersion, now)
 	})
+}
+
+// PathDelta describes one path-scoped change to apply atomically.
+// Set Meta to a non-nil committedPathMeta to insert/replace the
+// path's entry; leave Meta nil to delete the path entirely. NodeIDs
+// changes (additions and removals from the n bucket) are derived
+// from the difference between the existing on-disk NodeIDs and the
+// supplied Meta.NodeIDs.
+type PathDelta struct {
+	Path string
+	Meta *committedPathMeta // nil → delete path
+}
+
+// ApplyDelta applies a set of per-path updates and deletions inside
+// a single bolt transaction. The reverse n bucket is updated to
+// match: added nodeIDs gain entries pointing at their path; removed
+// nodeIDs (those present in the old meta but absent from the new)
+// have their entries deleted.
+//
+// builtVersion + a fresh UnixNano timestamp are written at commit
+// time so subsequent refreshes can observe the new state. Concurrent
+// readers see the prior snapshot until commit; afterwards, all reads
+// see the post-delta state.
+//
+// LRU entries for affected paths are evicted (not just purged
+// wholesale) so unaffected hot entries stay warm across the delta.
+func (s *committedMetaStore) ApplyDelta(deltas []PathDelta, builtVersion string) error {
+	if s == nil {
+		return fmt.Errorf("committed meta: store is nil")
+	}
+	if len(deltas) == 0 && builtVersion == "" {
+		return nil
+	}
+	s.mu.Lock()
+	if s.closed || s.db == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("committed meta: store is closed")
+	}
+	db := s.db
+	cache := s.cache
+	s.mu.Unlock()
+
+	now := time.Now().UnixNano()
+	return db.Update(func(tx *bolt.Tx) error {
+		paths := tx.Bucket(committedMetaBucket)
+		nodes := tx.Bucket(committedMetaNodeBucket)
+		if paths == nil || nodes == nil {
+			return fmt.Errorf("missing buckets — apply delta on uninitialized store")
+		}
+
+		for _, d := range deltas {
+			if d.Path == "" {
+				continue
+			}
+			pathBytes := []byte(d.Path)
+
+			// Read the prior persisted NodeIDs (if any) so we can
+			// compute the reverse-bucket diff.
+			var priorIDs []uint32
+			if existing := paths.Get(pathBytes); existing != nil {
+				if prior, err := decodeCommittedPathMeta(existing); err == nil {
+					priorIDs = prior.NodeIDs
+				}
+			}
+
+			if d.Meta == nil {
+				// Deletion path.
+				if err := paths.Delete(pathBytes); err != nil {
+					return fmt.Errorf("delete path %q: %w", d.Path, err)
+				}
+				for _, id := range priorIDs {
+					if err := nodes.Delete(encodeNodeIDKey(id)); err != nil {
+						return fmt.Errorf("delete node %d: %w", id, err)
+					}
+				}
+				if cache != nil {
+					cache.Remove(d.Path)
+				}
+				continue
+			}
+
+			// Update path.
+			raw, err := encodeCommittedPathMeta(d.Meta)
+			if err != nil {
+				return fmt.Errorf("encode %q: %w", d.Path, err)
+			}
+			if err := paths.Put(pathBytes, raw); err != nil {
+				return fmt.Errorf("put path %q: %w", d.Path, err)
+			}
+
+			// Reverse-bucket diff: remove ids that left the set,
+			// add ids that joined.
+			added, removed := diffSortedNodeIDs(priorIDs, d.Meta.NodeIDs)
+			for _, id := range removed {
+				if err := nodes.Delete(encodeNodeIDKey(id)); err != nil {
+					return fmt.Errorf("delete reverse %d: %w", id, err)
+				}
+			}
+			for _, id := range added {
+				if err := nodes.Put(encodeNodeIDKey(id), pathBytes); err != nil {
+					return fmt.Errorf("put reverse %d→%q: %w", id, d.Path, err)
+				}
+			}
+
+			if cache != nil {
+				cache.Remove(d.Path) // re-populate on next Lookup
+			}
+		}
+
+		return writeBuiltStamp(tx, builtVersion, now)
+	})
+}
+
+// writeBuiltStamp records the version + timestamp into bucket "m".
+// builtVersion="" leaves the version untouched (used when callers
+// only want to refresh the timestamp; not currently exercised but
+// kept for symmetry).
+func writeBuiltStamp(tx *bolt.Tx, builtVersion string, now int64) error {
+	info, err := tx.CreateBucketIfNotExists(committedMetaInfoBucket)
+	if err != nil {
+		return fmt.Errorf("ensure info bucket: %w", err)
+	}
+	if builtVersion != "" {
+		if err := info.Put(infoBuiltVersion, []byte(builtVersion)); err != nil {
+			return fmt.Errorf("write built_version: %w", err)
+		}
+	}
+	var tsBytes [8]byte
+	binary.LittleEndian.PutUint64(tsBytes[:], uint64(now))
+	if err := info.Put(infoBuiltTimestamp, tsBytes[:]); err != nil {
+		return fmt.Errorf("write built_timestamp: %w", err)
+	}
+	return nil
+}
+
+// diffSortedNodeIDs returns (added, removed) where added = next \ prev
+// and removed = prev \ next, computed in O(|prev|+|next|) over sorted
+// inputs. Both inputs must be ascending. Returns nil slices when
+// empty.
+func diffSortedNodeIDs(prev, next []uint32) (added, removed []uint32) {
+	i, j := 0, 0
+	for i < len(prev) && j < len(next) {
+		switch {
+		case prev[i] == next[j]:
+			i++
+			j++
+		case prev[i] < next[j]:
+			removed = append(removed, prev[i])
+			i++
+		default:
+			added = append(added, next[j])
+			j++
+		}
+	}
+	if i < len(prev) {
+		removed = append(removed, prev[i:]...)
+	}
+	if j < len(next) {
+		added = append(added, next[j:]...)
+	}
+	return added, removed
 }
 
 // committedPathMetaPersist is the on-disk shape — the public slices
 // of committedPathMeta minus the build-time dedup sets. Compact JSON
-// keys keep the bbolt value bytes small.
+// keys keep the bbolt value bytes small. NodeIDs is the reverse
+// index (path → contributing node IDs) that lets incremental refresh
+// re-aggregate a path without scanning the entire node store.
 type committedPathMetaPersist struct {
 	PrimaryNodeID   uint32   `json:"p,omitempty"`
 	PrimaryNodeType string   `json:"t,omitempty"`
@@ -314,6 +661,7 @@ type committedPathMetaPersist struct {
 	NodeKinds       []string `json:"nk,omitempty"`
 	RelatedPaths    []string `json:"rp,omitempty"`
 	RelatedSymbols  []string `json:"rs,omitempty"`
+	NodeIDs         []uint32 `json:"ni,omitempty"`
 }
 
 func encodeCommittedPathMeta(meta *committedPathMeta) ([]byte, error) {
@@ -326,6 +674,7 @@ func encodeCommittedPathMeta(meta *committedPathMeta) ([]byte, error) {
 		NodeKinds:       meta.NodeKinds,
 		RelatedPaths:    meta.RelatedPaths,
 		RelatedSymbols:  meta.RelatedSymbols,
+		NodeIDs:         meta.NodeIDs,
 	}
 	return json.Marshal(persist)
 }
@@ -344,6 +693,16 @@ func decodeCommittedPathMeta(raw []byte) (*committedPathMeta, error) {
 		NodeKinds:       persist.NodeKinds,
 		RelatedPaths:    persist.RelatedPaths,
 		RelatedSymbols:  persist.RelatedSymbols,
+		NodeIDs:         persist.NodeIDs,
 		// dedup sets intentionally nil — only used during build.
 	}, nil
+}
+
+// encodeNodeIDKey returns 4 BE bytes for a node ID — the bbolt key
+// format for the n bucket. Big-endian gives natural numeric order,
+// useful for any future range-scan over node IDs.
+func encodeNodeIDKey(id uint32) []byte {
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, id)
+	return buf
 }

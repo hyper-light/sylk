@@ -26,17 +26,19 @@ func TestRenderProgressBar_UsesUniformAnimatedSquares(t *testing.T) {
 	}
 }
 
-func TestFormatPipelineCounterLabel_UsesClaimsOrLoopsOrPhaseFallback(t *testing.T) {
+func TestFormatPipelineCounterLabel_RendersValidatedClaimsOverTotal(t *testing.T) {
 	tests := []struct {
 		name string
 		pl   *PipelineState
 		want string
 	}{
-		{name: "claims count", pl: &PipelineState{ClaimsAccepted: 3, ClaimsTotalCount: 5, Status: "executing"}, want: "3/5"},
-		{name: "known max", pl: &PipelineState{Status: "executing", MaxLoops: 5}, want: "0/5"},
-		{name: "phase fallback executing", pl: &PipelineState{Status: "executing"}, want: "3/4"},
-		{name: "phase fallback validating", pl: &PipelineState{Status: "validating"}, want: "4/4"},
-		{name: "phase fallback pending", pl: &PipelineState{Status: "pending"}, want: "0/4"},
+		{name: "nil pipeline", pl: nil, want: "0/0"},
+		{name: "no claims yet", pl: &PipelineState{Status: "defining_criteria"}, want: "0/0"},
+		{name: "no claims yet ignores loops", pl: &PipelineState{Status: "executing", LoopCount: 3, MaxLoops: 4}, want: "0/0"},
+		{name: "no claims yet ignores phase", pl: &PipelineState{Status: "validating"}, want: "0/0"},
+		{name: "partial validation", pl: &PipelineState{ClaimsAccepted: 3, ClaimsTotalCount: 5, Status: "executing"}, want: "3/5"},
+		{name: "all validated", pl: &PipelineState{ClaimsAccepted: 5, ClaimsTotalCount: 5, Status: "completed"}, want: "5/5"},
+		{name: "negative inputs clamp to zero", pl: &PipelineState{ClaimsAccepted: -1, ClaimsTotalCount: -1}, want: "0/0"},
 	}
 
 	for _, tt := range tests {
@@ -52,11 +54,13 @@ func TestRenderPipelineRow_KeepsProgressOnSingleLineWithRightAlignment(t *testin
 	th := theme.DefaultDark()
 	grad := th.Palette.PipelineGradient()
 	pl := &PipelineState{
-		ID:        "task_auth_checkout",
-		TaskLabel: "auth-checkout-extremely-long-title",
-		Status:    "executing",
-		LoopCount: 3,
-		MaxLoops:  12,
+		ID:               "task_auth_checkout",
+		TaskLabel:        "auth-checkout-extremely-long-title",
+		Status:           "executing",
+		LoopCount:        3,
+		MaxLoops:         12,
+		ClaimsAccepted:   3,
+		ClaimsTotalCount: 12,
 	}
 
 	width := 40
@@ -85,12 +89,14 @@ func TestRenderPipelineRow_FitsTitleWhenWidthAllows(t *testing.T) {
 	th := theme.DefaultDark()
 	grad := th.Palette.PipelineGradient()
 	pl := &PipelineState{
-		ID:        "task_short",
-		TaskSlug:  "short-task",
-		TaskLabel: "Add structure",
-		Status:    "executing",
-		LoopCount: 1,
-		MaxLoops:  4,
+		ID:               "task_short",
+		TaskSlug:         "short-task",
+		TaskLabel:        "Add structure",
+		Status:           "executing",
+		LoopCount:        1,
+		MaxLoops:         4,
+		ClaimsAccepted:   1,
+		ClaimsTotalCount: 4,
 	}
 
 	rendered := stripANSI(renderPipelineRow(pl, 80, 0, grad, th, false, "", AnimState{}, false))

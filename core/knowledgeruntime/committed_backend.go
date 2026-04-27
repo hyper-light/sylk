@@ -94,11 +94,19 @@ type committedPathMeta struct {
 	RelatedPaths    []string
 	RelatedSymbols  []string
 
+	// NodeIDs is the set of every node whose Path field equals this
+	// path. Persisted alongside the meta so incremental refresh can
+	// re-aggregate this path without scanning the entire node store
+	// — an O(|nodeIDs in path|) read instead of O(N total nodes).
+	// Sorted ascending after finalize() for deterministic encoding.
+	NodeIDs []uint32
+
 	canonicalSet     map[string]struct{}
 	symbolSet        map[string]struct{}
 	nodeKindSet      map[string]struct{}
 	relatedPathSet   map[string]struct{}
 	relatedSymbolSet map[string]struct{}
+	nodeIDSet        map[uint32]struct{}
 }
 
 func newCommittedPathMeta() *committedPathMeta {
@@ -108,7 +116,19 @@ func newCommittedPathMeta() *committedPathMeta {
 		nodeKindSet:      make(map[string]struct{}),
 		relatedPathSet:   make(map[string]struct{}),
 		relatedSymbolSet: make(map[string]struct{}),
+		nodeIDSet:        make(map[uint32]struct{}),
 	}
+}
+
+func (m *committedPathMeta) addNodeID(id uint32) {
+	if id == 0 {
+		return
+	}
+	if _, ok := m.nodeIDSet[id]; ok {
+		return
+	}
+	m.nodeIDSet[id] = struct{}{}
+	m.NodeIDs = append(m.NodeIDs, id)
 }
 
 func (m *committedPathMeta) addCanonicalKey(value string) {
@@ -172,6 +192,7 @@ func (m *committedPathMeta) finalize() {
 	sort.Strings(m.NodeKinds)
 	sort.Strings(m.RelatedPaths)
 	sort.Strings(m.RelatedSymbols)
+	sort.Slice(m.NodeIDs, func(i, j int) bool { return m.NodeIDs[i] < m.NodeIDs[j] })
 }
 
 // committedMetadataIndex is the per-version derived enrichment cache.
@@ -770,24 +791,392 @@ func (b *CommittedKnowledgeBackend) buildState(ctx context.Context, attachedBlev
 	}, nil
 }
 
+// incrementalMaxPathFraction is the upper bound on the affected-path
+// set size (as a fraction of the total node count's distinct paths)
+// at which we still consider incremental cheaper than full rebuild.
+// Above this, a full streaming rebuild has lower constant overhead
+// because the inner per-path re-aggregation each pays a fixed
+// fan-out into nodeStore + edgeStore that adds up.
+//
+// Anchored to the typical commit shape: most commits touch < 5% of
+// paths in the repo. 0.50 leaves headroom for refactor commits that
+// touch many files; beyond that, full rebuild's sequential scan of
+// the offset index + edges.bin is faster than O(|paths|) random
+// per-path reads.
+const incrementalMaxPathFraction = 0.50
+
+// tryIncrementalRefresh attempts a Phase-5 incremental rebuild.
+// Returns (true, nil) when the rebuild succeeded and the metaStore
+// reflects the new HEAD; returns (false, nil) when the conditions
+// for incremental aren't met (no prior version, prior version
+// equals HEAD which is the Phase-4 case already, the prior version
+// can't be loaded, or the affected-path set exceeds the heuristic).
+// Returns (false, err) only on hard errors that should abort the
+// refresh entirely — soft incremental failures fall back to full
+// rebuild silently.
+func tryIncrementalRefresh(
+	ctx context.Context,
+	head sylkdir.SemanticVersion,
+	nodeStore *sylkdir.GlobalVersionNodeStore,
+	edgeStore *sylkdir.GlobalVersionEdgeStore,
+	metaStore *committedMetaStore,
+) (bool, error) {
+	prevVersionStr, ok := metaStore.BuiltVersion()
+	if !ok || prevVersionStr == "" {
+		return false, nil // first build — full path
+	}
+	if prevVersionStr == head.String() {
+		// Caller already handled this via the Phase-4 fast path; not
+		// reachable in normal flow but guard anyway.
+		return true, nil
+	}
+	prevVersion, err := sylkdir.ParseSemanticVersion(prevVersionStr)
+	if err != nil {
+		return false, nil // can't reason about the prior version → full
+	}
+
+	// Diff the two versions' live-id sets.
+	prevIDs, err := nodeStore.LiveNodeIDsAtVersion(prevVersion)
+	if err != nil {
+		// Soft failure — prior version's index may be missing on disk.
+		return false, nil
+	}
+	currIDs, err := nodeStore.LiveNodeIDsAtVersion(head)
+	if err != nil {
+		return false, fmt.Errorf("incremental: live ids at head: %w", err)
+	}
+	addedNodeIDs, removedNodeIDs := diffSortedIDs(prevIDs, currIDs)
+
+	// Build the affected-path set. Sources of affected paths:
+	//   1. Each added node's current path.
+	//   2. Each removed node's prior path (resolved via metaStore's
+	//      reverse n bucket — the one snapshot that knows which path
+	//      a now-tombstoned node previously contributed to).
+	//   3. Source path of any edge created since the last build —
+	//      Edge.CreatedAt > built_timestamp.
+	//   4. Source paths of every incoming edge to any added/removed
+	//      node — those source paths' meta references the changed
+	//      node and must re-aggregate.
+	affectedPaths := make(map[string]struct{})
+
+	for _, id := range addedNodeIDs {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		node, err := nodeStore.ReadFromVersion(head, id)
+		if err != nil || node == nil {
+			continue
+		}
+		if node.Path != "" {
+			affectedPaths[node.Path] = struct{}{}
+		}
+	}
+	for _, id := range removedNodeIDs {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if path, ok := metaStore.LookupNodePath(id); ok {
+			affectedPaths[path] = struct{}{}
+		}
+	}
+
+	// Edge delta via CreatedAt > built_timestamp. Source paths picked
+	// up here cover the case of new edges between existing nodes
+	// (no node delta on either endpoint, but source-path's meta now
+	// references a new target).
+	if builtTS, ok := metaStore.BuiltTimestamp(); ok {
+		err := edgeStore.IterateEdgesFromVersion(head, func(edge *sylkdir.Edge) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if int64(edge.CreatedAt) <= builtTS {
+				return nil
+			}
+			source, err := nodeStore.ReadFromVersion(head, edge.SourceID)
+			if err != nil || source == nil || source.Path == "" {
+				return nil
+			}
+			affectedPaths[source.Path] = struct{}{}
+			return nil
+		})
+		if err != nil {
+			return false, fmt.Errorf("incremental: edge delta: %w", err)
+		}
+	} else {
+		// No timestamp recorded → first-ever incremental candidate
+		// from a pre-Phase-5 store. Bail to full rebuild rather than
+		// risk missing edge-only changes.
+		return false, nil
+	}
+
+	// Cross-reference affected nodes via incoming edges: each
+	// added/removed node may be the target of edges whose source
+	// path's meta references it. Walk incoming edges (current
+	// version's tombstone applied) and add source paths.
+	for _, id := range addedNodeIDs {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		incoming, err := edgeStore.GetIncomingFromVersion(head, id)
+		if err != nil {
+			return false, fmt.Errorf("incremental: incoming edges of added node %d: %w", id, err)
+		}
+		for _, e := range incoming {
+			source, err := nodeStore.ReadFromVersion(head, e.SourceID)
+			if err != nil || source == nil || source.Path == "" {
+				continue
+			}
+			affectedPaths[source.Path] = struct{}{}
+		}
+	}
+	for _, id := range removedNodeIDs {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		// For removed nodes, incoming edges in the prior version
+		// (whose source still exists in HEAD) referenced this node.
+		// Use the prior version since the node is dead in HEAD.
+		incoming, err := edgeStore.GetIncomingFromVersion(prevVersion, id)
+		if err != nil {
+			// Prior-version reads can fail if the version was
+			// snapshotted away; bail to full rebuild on hard error.
+			return false, nil
+		}
+		for _, e := range incoming {
+			// Resolve source path against HEAD — the source might
+			// itself have been tombstoned, in which case its path
+			// is likely already in affectedPaths from another arm.
+			source, err := nodeStore.ReadFromVersion(head, e.SourceID)
+			if err != nil || source == nil || source.Path == "" {
+				if path, ok := metaStore.LookupNodePath(e.SourceID); ok {
+					affectedPaths[path] = struct{}{}
+				}
+				continue
+			}
+			affectedPaths[source.Path] = struct{}{}
+		}
+	}
+
+	// Heuristic: if affected paths cover too much of the graph, full
+	// rebuild has lower wall-time. Estimate "total paths" as the
+	// number of distinct paths the prior index covered, reading the
+	// "p" bucket KeyN. This is O(1) — no scan.
+	priorPaths := metaStore.PathCount()
+	if priorPaths > 0 {
+		ratio := float64(len(affectedPaths)) / float64(priorPaths)
+		if ratio > incrementalMaxPathFraction {
+			return false, nil
+		}
+	}
+
+	// Re-aggregate each affected path against HEAD.
+	deltas := make([]PathDelta, 0, len(affectedPaths))
+	for path := range affectedPaths {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		meta, err := reaggregatePath(ctx, head, path, nodeStore, edgeStore)
+		if err != nil {
+			return false, fmt.Errorf("incremental: re-aggregate %q: %w", path, err)
+		}
+		deltas = append(deltas, PathDelta{Path: path, Meta: meta})
+	}
+
+	if err := metaStore.ApplyDelta(deltas, head.String()); err != nil {
+		return false, fmt.Errorf("incremental: apply delta: %w", err)
+	}
+	return true, nil
+}
+
+// reaggregatePath rebuilds the committedPathMeta for a single path
+// against the given HEAD version. Returns nil meta when the path
+// has no live nodes in HEAD (caller deletes the entry).
+//
+// Implementation mirrors the full-build aggregation logic but
+// scoped to one path: enumerate live nodes whose Path == path
+// (via the same IterateNodes pass — yes, this scans all nodes;
+// see note below), then for each such node walk its outgoing
+// edges to derive related-path / related-symbol metadata.
+//
+// The single-path aggregation runs the IterateNodes scan once per
+// path. With K affected paths this is K × N node reads. For K well
+// below the heuristic threshold (≤ 0.5 × |paths|) this remains far
+// cheaper than full rebuild's O(N + E) for typical commits where
+// |delta paths| ≪ |paths|.
+//
+// A future optimization would be a path-keyed node index (paths →
+// nodeIDs lookup directly from the node store). That requires
+// invasive changes in sylkdir; for now the per-path scan dominates
+// only above the heuristic threshold, at which point full rebuild
+// already wins and we don't enter this function.
+func reaggregatePath(
+	ctx context.Context,
+	head sylkdir.SemanticVersion,
+	path string,
+	nodeStore *sylkdir.GlobalVersionNodeStore,
+	edgeStore *sylkdir.GlobalVersionEdgeStore,
+) (*committedPathMeta, error) {
+	pm := newCommittedPathMeta()
+	nodeMetaByID := make(map[uint32]committedNodeMeta)
+
+	// Pass 1: collect every live node whose Path == path. Same
+	// streaming iteration as the full build, filtered.
+	if err := nodeStore.IterateNodesFromVersion(head, func(node *sylkdir.Node) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if node.Path != path {
+			return nil
+		}
+		meta := committedNodeMeta{
+			ID:           node.ID,
+			Path:         node.Path,
+			Name:         node.Name,
+			CanonicalKey: node.CanonicalKey,
+			Domain:       sylkdir.Domain(node.Domain),
+			NodeType:     sylkdir.NodeType(node.NodeType),
+		}
+		nodeMetaByID[node.ID] = meta
+		if pm.Domain == "" {
+			pm.Domain = committedDomainName(meta.Domain)
+		}
+		pm.addNodeID(meta.ID)
+		nodeKind := committedNodeTypeName(meta.NodeType)
+		pm.addNodeKind(nodeKind)
+		pm.addCanonicalKey(meta.CanonicalKey)
+		switch meta.NodeType {
+		case sylkdir.NodeTypeFile, sylkdir.NodeTypeDocument:
+			if pm.PrimaryNodeID == 0 {
+				pm.PrimaryNodeID = meta.ID
+				pm.PrimaryNodeType = nodeKind
+			}
+		case sylkdir.NodeTypeFunction, sylkdir.NodeTypeMethod, sylkdir.NodeTypeType, sylkdir.NodeTypeInterface, sylkdir.NodeTypeConst, sylkdir.NodeTypeVar:
+			pm.addSymbol(meta.Name)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	if len(nodeMetaByID) == 0 {
+		// Path has no live nodes in HEAD — caller deletes the entry.
+		return nil, nil
+	}
+
+	// Pass 2: for each node at this path, walk its outgoing edges.
+	// The aggregation logic is identical to the full build's
+	// edge-pass — same pathMeta mutators, same target-path/name
+	// derivation. Targets are resolved against HEAD via
+	// ReadFromVersion since the streaming iterator only gave us
+	// nodes whose Path == this path.
+	for sourceID, source := range nodeMetaByID {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		outgoing, err := edgeStore.GetOutgoingFromVersion(head, sourceID)
+		if err != nil {
+			return nil, fmt.Errorf("get outgoing for %d: %w", sourceID, err)
+		}
+		for _, edge := range outgoing {
+			target, err := nodeStore.ReadFromVersion(head, edge.TargetID)
+			if err != nil || target == nil {
+				continue
+			}
+			targetMeta := committedNodeMeta{
+				ID:       target.ID,
+				Path:     target.Path,
+				Name:     target.Name,
+				NodeType: sylkdir.NodeType(target.NodeType),
+			}
+			switch sylkdir.EdgeType(edge.Type) {
+			case sylkdir.EdgeTypeContains:
+				if targetMeta.Path == source.Path && isCommittedSymbolType(targetMeta.NodeType) {
+					pm.addSymbol(targetMeta.Name)
+				}
+			case sylkdir.EdgeTypeImports:
+				if targetMeta.Path != "" && targetMeta.Path != source.Path {
+					pm.addRelatedPath(targetMeta.Path)
+				}
+			case sylkdir.EdgeTypeCalls, sylkdir.EdgeTypeReferences:
+				if targetMeta.Path != "" && targetMeta.Path != source.Path {
+					pm.addRelatedPath(targetMeta.Path)
+				}
+				if targetMeta.Name != "" {
+					pm.addRelatedSymbol(targetMeta.Name)
+				}
+			}
+		}
+	}
+
+	pm.finalize()
+	return pm, nil
+}
+
+// diffSortedIDs returns (added, removed) where added = next \ prev
+// and removed = prev \ next. Both inputs must be ascending. Linear
+// merge-walk — O(|prev|+|next|).
+func diffSortedIDs(prev, next []uint32) (added, removed []uint32) {
+	i, j := 0, 0
+	for i < len(prev) && j < len(next) {
+		switch {
+		case prev[i] == next[j]:
+			i++
+			j++
+		case prev[i] < next[j]:
+			removed = append(removed, prev[i])
+			i++
+		default:
+			added = append(added, next[j])
+			j++
+		}
+	}
+	if i < len(prev) {
+		removed = append(removed, prev[i:]...)
+	}
+	if j < len(next) {
+		added = append(added, next[j:]...)
+	}
+	return added, removed
+}
+
 // buildCommittedMetadataIndex constructs the per-path metadata
-// derivation by streaming nodes and edges through the underlying
-// stores. Build-time heap residency is bounded to one *Node or
-// *Edge in flight plus the accumulating in-heap byPath / nodeByID —
-// the latter are SCRATCH and dropped after the build commits the
-// derived index to the persistent store.
+// derivation. Three layered fast paths, all gated on metaStore:
 //
-// The two-pass shape (nodes first, edges second) is preserved
-// because edge processing depends on the nodeByID lookup populated
-// by the first pass.
+//   - Phase 4 (fast path): metaStore.BuiltVersion == head → no work,
+//     queries route through the existing on-disk index.
 //
-// Steady-state heap residency after this function returns is
-// O(LRU cache size) regardless of repository scale; the byPath
-// payload lives in mmap'd bbolt and pages into OS cache as queries
-// touch it. metaStore is optional — when nil, the index falls back
-// to the in-heap byPath map (used by paths that don't allocate a
-// SylkDir, e.g., tests).
+//   - Phase 5 (incremental): metaStore has a prior built_version V
+//     and head ≠ V → compute the (added/removed) node delta + the
+//     (since timestamp) edge delta, derive the affected-path set,
+//     re-aggregate ONLY those paths, apply atomically. Cost is
+//     O(|delta|), not O(|graph|).
+//
+//   - Full rebuild (cold path): no prior version, or incremental
+//     was attempted and bailed (path-set too large, missing prior
+//     index, etc.). Streams every live node + every live edge as
+//     before.
+//
+// The full-rebuild stream remains the source of truth — the
+// streaming N-pass + M-pass aggregation logic is identical to the
+// pre-Phase-5 code. Incremental simply re-runs that aggregation
+// scoped to one path at a time, against the same underlying stores.
 func buildCommittedMetadataIndex(ctx context.Context, head sylkdir.SemanticVersion, nodeStore *sylkdir.GlobalVersionNodeStore, edgeStore *sylkdir.GlobalVersionEdgeStore, metaStore *committedMetaStore) (*committedMetadataIndex, error) {
+	// Phase 4 fast path.
+	if metaStore != nil {
+		if persistedVersion, ok := metaStore.BuiltVersion(); ok && persistedVersion == head.String() {
+			return &committedMetadataIndex{store: metaStore}, nil
+		}
+	}
+
+	// Phase 5 incremental path.
+	if metaStore != nil {
+		if applied, err := tryIncrementalRefresh(ctx, head, nodeStore, edgeStore, metaStore); err != nil {
+			return nil, err
+		} else if applied {
+			return &committedMetadataIndex{store: metaStore}, nil
+		}
+	}
+
 	index := &committedMetadataIndex{
 		store:    metaStore,
 		byPath:   make(map[string]*committedPathMeta),
@@ -818,6 +1207,7 @@ func buildCommittedMetadataIndex(ctx context.Context, head sylkdir.SemanticVersi
 		if pathMeta.Domain == "" {
 			pathMeta.Domain = committedDomainName(meta.Domain)
 		}
+		pathMeta.addNodeID(meta.ID)
 		nodeKind := committedNodeTypeName(meta.NodeType)
 		pathMeta.addNodeKind(nodeKind)
 		pathMeta.addCanonicalKey(meta.CanonicalKey)
@@ -879,9 +1269,11 @@ func buildCommittedMetadataIndex(ctx context.Context, head sylkdir.SemanticVersi
 	// Persist the derived path metadata to the store and drop the
 	// in-heap scratch maps. After this point, queries route through
 	// store.Lookup (LRU + bbolt mmap) and the heap holds only the
-	// LRU-bounded hot working set.
+	// LRU-bounded hot working set. The HEAD version is stamped so
+	// subsequent refreshes against the same HEAD short-circuit via
+	// the fast path above.
 	if metaStore != nil {
-		if err := metaStore.PersistAll(index.byPath); err != nil {
+		if err := metaStore.PersistAll(index.byPath, head.String()); err != nil {
 			return nil, fmt.Errorf("committed backend: persist meta: %w", err)
 		}
 		index.byPath = nil

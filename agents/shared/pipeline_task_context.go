@@ -26,7 +26,6 @@ type PipelineProtocolActionType string
 
 const (
 	PipelineProtocolActionHandoff  PipelineProtocolActionType = "handoff"
-	PipelineProtocolActionRefusal  PipelineProtocolActionType = "refusal"
 	PipelineProtocolActionValidate PipelineProtocolActionType = "validation"
 	PipelineProtocolActionOT       PipelineProtocolActionType = "handoff_to_ot"
 )
@@ -52,20 +51,12 @@ type PipelineTurnAction struct {
 	WorkspaceFingerprint string
 }
 
-// PipelineValidationProcessing records a validation that was processed
-// during a pipeline turn.
-type PipelineValidationProcessing struct {
-	ChallengeID string
-	Decision    string
-}
-
 // PipelineTurnResponse is the structured envelope pipeline agents return
 // from their tool-loop turns. The task router decodes this to determine
 // the next routing action.
 type PipelineTurnResponse struct {
-	Result    any                            `json:"result,omitempty"`
-	Action    *PipelineTurnAction            `json:"action,omitempty"`
-	Processed []PipelineValidationProcessing `json:"processed,omitempty"`
+	Result any                 `json:"result,omitempty"`
+	Action *PipelineTurnAction `json:"action,omitempty"`
 }
 
 // DecodePipelineTurnResponse parses a turn response from raw data.
@@ -95,7 +86,7 @@ func DecodePipelineTurnResponse(data any) (*PipelineTurnResponse, error) {
 
 // BuildPipelineTurnResponse wraps a result into a PipelineTurnResponse.
 // In the post-protocol era, this simply wraps the result with no action
-// or processed validations (those came from the now-removed protocol state).
+// (the protocol state machine that produced actions has been removed).
 func BuildPipelineTurnResponse(_ context.Context, result any) any {
 	return &PipelineTurnResponse{
 		Result: result,
@@ -127,20 +118,6 @@ type PipelineTesterFinalizeTargetSpec struct {
 // PipelineTesterFinalizeFn is the callback type for the tester's
 // finalize_pipeline publish step.
 type PipelineTesterFinalizeFn func(ctx context.Context, suiteID string, specs []PipelineTesterFinalizeTargetSpec) ([]PipelineHandoffArtifactRef, error)
-
-// PipelineTurnTerminalAction returns nil in the post-protocol era.
-// Retained for call-site compatibility in tool loops that check
-// whether a turn has been terminated by a protocol action.
-func PipelineTurnTerminalAction(_ context.Context) *PipelineTurnAction {
-	return nil
-}
-
-// PipelineTurnTerminated reports whether the current pipeline turn has
-// been terminated by a protocol action. Always false in the
-// post-protocol era (claims board does not use terminal actions).
-func PipelineTurnTerminated(ctx context.Context) bool {
-	return PipelineTurnTerminalAction(ctx) != nil
-}
 
 type pipelineTaskContextKey struct{}
 

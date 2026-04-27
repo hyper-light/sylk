@@ -150,9 +150,6 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 			}
 			return "", controlErr
 		}
-		if agentShared.PipelineTurnTerminated(ctx) {
-			return "", nil
-		}
 		requiredActionGraceTurns = agentShared.ExtendRequiredProtocolGrace(ctx, requiredActionGraceTurns)
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= 2 {
@@ -239,7 +236,7 @@ func (pi *PipelineInspector) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
-		if controlErr != nil || agentShared.PipelineTurnTerminated(ctx) {
+		if controlErr != nil {
 			agentShared.AppendSkippedToolResults(req, resp.ToolCalls[idx+1:], "a previous tool call in this assistant turn already completed or redirected the pipeline decision")
 			break
 		}

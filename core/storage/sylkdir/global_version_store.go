@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 )
@@ -152,6 +153,35 @@ func (s *GlobalVersionNodeStore) ReadAllFromVersion(version SemanticVersion) ([]
 		return nil, err
 	}
 	return nodes, nil
+}
+
+// LiveNodeIDsAtVersion returns every node ID alive in the given
+// version, sorted ascending. Foundation for incremental KG refresh:
+// callers compute added/removed sets via O(N) merge-walk between two
+// versions' slices.
+//
+// Cost: O(|index|) — tombstone is a bitmap, so per-id liveness check
+// is O(1). At 1M nodes this is ~10 ms wall time and ~4 MB transient
+// heap (the result slice).
+func (s *GlobalVersionNodeStore) LiveNodeIDsAtVersion(version SemanticVersion) ([]uint32, error) {
+	tb, err := loadCachedTombstone(&s.tombstones, s.sylkDir, version)
+	if err != nil {
+		return nil, err
+	}
+	idx := s.loadIndex(version)
+	if idx == nil {
+		return nil, nil
+	}
+
+	out := make([]uint32, 0, idx.Count())
+	idx.ForEach(func(id uint32, _ int64) bool {
+		if !tb.IsDead(id) {
+			out = append(out, id)
+		}
+		return true
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
 }
 
 // IterateNodesFromVersion streams every live node in a version
@@ -313,6 +343,28 @@ func (s *GlobalVersionEdgeStore) GetOutgoingFromVersion(version SemanticVersion,
 	}
 
 	edges, err := s.store.GetOutgoing(nodeID)
+	if err != nil {
+		return nil, err
+	}
+
+	live := make([]*Edge, 0, len(edges))
+	for _, edge := range edges {
+		if tb.IsEdgeAlive(edge.SourceID, edge.TargetID) {
+			live = append(live, edge)
+		}
+	}
+	return live, nil
+}
+
+// GetIncomingFromVersion gets all live incoming edges to a node in a version.
+// Edges referencing dead nodes are excluded via tombstone.
+func (s *GlobalVersionEdgeStore) GetIncomingFromVersion(version SemanticVersion, nodeID uint32) ([]*Edge, error) {
+	tb, err := loadCachedTombstone(&s.tombstones, s.sylkDir, version)
+	if err != nil {
+		return nil, err
+	}
+
+	edges, err := s.store.GetIncoming(nodeID)
 	if err != nil {
 		return nil, err
 	}

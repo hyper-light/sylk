@@ -1315,7 +1315,7 @@ func (r *TaskRouter) consumeProtocolTerminal(msg *guide.Message) bool {
 		}
 		return false
 	}
-	if turnResp.Action == nil && len(turnResp.Processed) == 0 {
+	if turnResp.Action == nil {
 		if task != nil {
 			r.publishProtocolMalformedTurnFailure(task, msg, "protocol pipeline turn ended without recording the next pipeline step")
 			return true
@@ -1344,9 +1344,6 @@ func (r *TaskRouter) consumeProtocolTerminal(msg *guide.Message) bool {
 			"source_agent_id": msg.SourceAgentID,
 			"action_type":     actionType,
 		}))
-	} else if turnResp.Action == nil && len(turnResp.Processed) > 0 && task != nil {
-		r.publishProtocolMalformedTurnFailure(task, msg, "protocol pipeline turn processed validation but did not record the next pipeline step")
-		return true
 	} else if turnResp.Action != nil && task != nil {
 		r.logTrace("task_router_protocol_terminal_acknowledged", "debug", agentlog.EventPipelineStateChange, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
 			"source_agent_id":   msg.SourceAgentID,

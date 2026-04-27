@@ -241,21 +241,24 @@ func activePipelineCells(status string) int {
 	return filled
 }
 
+// formatPipelineCounterLabel renders the pipeline header counter as
+// "<accepted>/<total>" claims for the pipeline. "Accepted" means every
+// required validation passed (see core/claims). When no claims have been
+// issued yet the counter is "0/0" — honest absence rather than a stale
+// state-machine signal.
 func formatPipelineCounterLabel(pl *PipelineState) string {
 	if pl == nil {
 		return "0/0"
 	}
-	if pl.ClaimsTotalCount > 0 {
-		return fmt.Sprintf("%d/%d", pl.ClaimsAccepted, pl.ClaimsTotalCount)
+	accepted := pl.ClaimsAccepted
+	if accepted < 0 {
+		accepted = 0
 	}
-	if pl.MaxLoops > 0 {
-		loopCount := pl.LoopCount
-		if loopCount < 0 {
-			loopCount = 0
-		}
-		return fmt.Sprintf("%d/%d", loopCount, pl.MaxLoops)
+	total := pl.ClaimsTotalCount
+	if total < 0 {
+		total = 0
 	}
-	return fmt.Sprintf("%d/%d", activePipelineCells(pl.Status), progressBarCells)
+	return fmt.Sprintf("%d/%d", accepted, total)
 }
 
 func blendPipelineColor(base, target lipgloss.Color, targetWeight float64) lipgloss.Color {
