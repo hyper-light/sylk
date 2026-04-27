@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -173,9 +174,41 @@ func (m *committedPathMeta) finalize() {
 	sort.Strings(m.RelatedSymbols)
 }
 
+// committedMetadataIndex is the per-version derived enrichment cache.
+//
+// After buildCommittedMetadataIndex completes, byPath and nodeByID
+// are nil — the byPath data has been persisted into store and is
+// queried via store.Lookup(path) (LRU + bbolt mmap). This bounds the
+// resident heap to the LRU regardless of repository scale; at JDK
+// scale the previous all-in-heap shape held ~250 MiB of derived
+// path metadata.
+//
+// Lookup is the only post-build accessor; it transparently routes
+// to the persistent store when present.
 type committedMetadataIndex struct {
-	byPath   map[string]*committedPathMeta
-	nodeByID map[uint32]committedNodeMeta
+	store    *committedMetaStore
+	byPath   map[string]*committedPathMeta // build-only scratch; nil after build
+	nodeByID map[uint32]committedNodeMeta  // build-only scratch; nil after build
+}
+
+// Lookup returns the metadata for path, or nil if no entry. Read
+// path: persistent store (LRU + bbolt) when populated; build-time
+// in-heap byPath as a fallback for callers that query an index
+// mid-build (e.g., tests).
+func (m *committedMetadataIndex) Lookup(path string) *committedPathMeta {
+	if m == nil {
+		return nil
+	}
+	if m.store != nil {
+		if meta, ok := m.store.Lookup(path); ok {
+			return meta
+		}
+		return nil
+	}
+	if m.byPath != nil {
+		return m.byPath[path]
+	}
+	return nil
 }
 
 type committedKnowledgeState struct {
@@ -184,6 +217,7 @@ type committedKnowledgeState struct {
 	nodeStore     *sylkdir.GlobalVersionNodeStore
 	edgeStore     *sylkdir.GlobalVersionEdgeStore
 	docStore      *sylkdir.GlobalVersionDocStore
+	metaStore     *committedMetaStore
 	externalBleve bool
 	index         *committedMetadataIndex
 }
@@ -207,6 +241,11 @@ func (s *committedKnowledgeState) Close() error {
 	}
 	if s.bleveStore != nil {
 		if err := s.bleveStore.CloseAll(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.metaStore != nil {
+		if err := s.metaStore.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -312,7 +351,7 @@ func (b *CommittedKnowledgeBackend) Search(ctx context.Context, req *search.Sear
 
 	hits := make([]CommittedSearchHit, 0, len(result.Documents))
 	for _, doc := range result.Documents {
-		hits = append(hits, enrichCommittedHit(doc, state.index.byPath[doc.Path]))
+		hits = append(hits, enrichCommittedHit(doc, state.index.Lookup(doc.Path)))
 	}
 
 	return &CommittedSearchResult{
@@ -692,11 +731,27 @@ func (b *CommittedKnowledgeBackend) buildState(ctx context.Context, attachedBlev
 	}
 	bleveStore.SetHead(head)
 
-	index, err := buildCommittedMetadataIndex(ctx, head, nodeStore, edgeStore)
+	// Open the persistent metadata store. Lives at
+	// {globalDataPath}/committed_metadata.bolt and is rewritten in
+	// full on each refresh — single file, mmap-backed, OS page-cached.
+	metaStorePath := filepath.Join(sd.GlobalDataPath(), "committed_metadata.bolt")
+	metaStore, err := newCommittedMetaStore(metaStorePath)
 	if err != nil {
 		_ = nodeStore.Close()
 		_ = edgeStore.Close()
 		_ = docStore.Close()
+		if attachedBleve == nil {
+			_ = bleveStore.CloseAll()
+		}
+		return nil, fmt.Errorf("committed backend: open meta store: %w", err)
+	}
+
+	index, err := buildCommittedMetadataIndex(ctx, head, nodeStore, edgeStore, metaStore)
+	if err != nil {
+		_ = nodeStore.Close()
+		_ = edgeStore.Close()
+		_ = docStore.Close()
+		_ = metaStore.Close()
 		if attachedBleve == nil {
 			_ = bleveStore.CloseAll()
 		}
@@ -709,29 +764,39 @@ func (b *CommittedKnowledgeBackend) buildState(ctx context.Context, attachedBlev
 		nodeStore:     nodeStore,
 		edgeStore:     edgeStore,
 		docStore:      docStore,
+		metaStore:     metaStore,
 		externalBleve: externalBleve,
 		index:         index,
 	}, nil
 }
 
-func buildCommittedMetadataIndex(ctx context.Context, head sylkdir.SemanticVersion, nodeStore *sylkdir.GlobalVersionNodeStore, edgeStore *sylkdir.GlobalVersionEdgeStore) (*committedMetadataIndex, error) {
-	nodes, err := nodeStore.ReadAllFromVersion(head)
-	if err != nil {
-		return nil, fmt.Errorf("committed backend: load nodes: %w", err)
-	}
-	edges, err := edgeStore.ReadAllFromVersion(head)
-	if err != nil {
-		return nil, fmt.Errorf("committed backend: load edges: %w", err)
-	}
-
+// buildCommittedMetadataIndex constructs the per-path metadata
+// derivation by streaming nodes and edges through the underlying
+// stores. Build-time heap residency is bounded to one *Node or
+// *Edge in flight plus the accumulating in-heap byPath / nodeByID —
+// the latter are SCRATCH and dropped after the build commits the
+// derived index to the persistent store.
+//
+// The two-pass shape (nodes first, edges second) is preserved
+// because edge processing depends on the nodeByID lookup populated
+// by the first pass.
+//
+// Steady-state heap residency after this function returns is
+// O(LRU cache size) regardless of repository scale; the byPath
+// payload lives in mmap'd bbolt and pages into OS cache as queries
+// touch it. metaStore is optional — when nil, the index falls back
+// to the in-heap byPath map (used by paths that don't allocate a
+// SylkDir, e.g., tests).
+func buildCommittedMetadataIndex(ctx context.Context, head sylkdir.SemanticVersion, nodeStore *sylkdir.GlobalVersionNodeStore, edgeStore *sylkdir.GlobalVersionEdgeStore, metaStore *committedMetaStore) (*committedMetadataIndex, error) {
 	index := &committedMetadataIndex{
+		store:    metaStore,
 		byPath:   make(map[string]*committedPathMeta),
-		nodeByID: make(map[uint32]committedNodeMeta, len(nodes)),
+		nodeByID: make(map[uint32]committedNodeMeta),
 	}
 
-	for _, node := range nodes {
+	if err := nodeStore.IterateNodesFromVersion(head, func(node *sylkdir.Node) error {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		meta := committedNodeMeta{
 			ID:           node.ID,
@@ -743,7 +808,7 @@ func buildCommittedMetadataIndex(ctx context.Context, head sylkdir.SemanticVersi
 		}
 		index.nodeByID[node.ID] = meta
 		if strings.TrimSpace(node.Path) == "" {
-			continue
+			return nil
 		}
 		pathMeta := index.byPath[node.Path]
 		if pathMeta == nil {
@@ -765,20 +830,23 @@ func buildCommittedMetadataIndex(ctx context.Context, head sylkdir.SemanticVersi
 		case sylkdir.NodeTypeFunction, sylkdir.NodeTypeMethod, sylkdir.NodeTypeType, sylkdir.NodeTypeInterface, sylkdir.NodeTypeConst, sylkdir.NodeTypeVar:
 			pathMeta.addSymbol(meta.Name)
 		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("committed backend: stream nodes: %w", err)
 	}
 
-	for _, edge := range edges {
+	if err := edgeStore.IterateEdgesFromVersion(head, func(edge *sylkdir.Edge) error {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		source, ok := index.nodeByID[edge.SourceID]
 		if !ok || strings.TrimSpace(source.Path) == "" {
-			continue
+			return nil
 		}
 		target, targetOK := index.nodeByID[edge.TargetID]
 		pathMeta := index.byPath[source.Path]
 		if pathMeta == nil {
-			continue
+			return nil
 		}
 		switch sylkdir.EdgeType(edge.Type) {
 		case sylkdir.EdgeTypeContains:
@@ -799,11 +867,27 @@ func buildCommittedMetadataIndex(ctx context.Context, head sylkdir.SemanticVersi
 				}
 			}
 		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("committed backend: stream edges: %w", err)
 	}
 
 	for _, meta := range index.byPath {
 		meta.finalize()
 	}
+
+	// Persist the derived path metadata to the store and drop the
+	// in-heap scratch maps. After this point, queries route through
+	// store.Lookup (LRU + bbolt mmap) and the heap holds only the
+	// LRU-bounded hot working set.
+	if metaStore != nil {
+		if err := metaStore.PersistAll(index.byPath); err != nil {
+			return nil, fmt.Errorf("committed backend: persist meta: %w", err)
+		}
+		index.byPath = nil
+	}
+	// nodeByID is build-time only — drop regardless of metaStore.
+	index.nodeByID = nil
 	return index, nil
 }
 

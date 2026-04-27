@@ -133,33 +133,62 @@ func (s *GlobalVersionNodeStore) ReadAll() ([]*Node, error) {
 
 // ReadAllFromVersion reads all live nodes from a specific version.
 // Dead nodes (tracked by the version's tombstone bitmap) are excluded.
+//
+// Materializes every node into a slice. For repos at Kubernetes/JDK
+// scale (10⁵–10⁶ nodes) this is the wrong tool — use
+// IterateNodesFromVersion instead and process one node at a time.
+// Retained for callers that genuinely need a full slice (most paths
+// don't).
 func (s *GlobalVersionNodeStore) ReadAllFromVersion(version SemanticVersion) ([]*Node, error) {
-	tb, err := loadCachedTombstone(&s.tombstones, s.sylkDir, version)
-	if err != nil {
-		return nil, err
-	}
-
 	idx := s.loadIndex(version)
 	if idx == nil {
 		return []*Node{}, nil
 	}
-
 	nodes := make([]*Node, 0, idx.Count())
-	var readErr error
+	if err := s.IterateNodesFromVersion(version, func(node *Node) error {
+		nodes = append(nodes, node)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return nodes, nil
+}
+
+// IterateNodesFromVersion streams every live node in a version
+// through visit. Heap residency is bounded to one *Node at a time
+// regardless of total node count — the foundation for KG operations
+// that scale to JDK-sized repositories. visit returning a non-nil
+// error stops iteration and propagates the error to the caller.
+//
+// Dead nodes (tombstoned in this version) are skipped without
+// reading them off disk.
+func (s *GlobalVersionNodeStore) IterateNodesFromVersion(version SemanticVersion, visit func(*Node) error) error {
+	tb, err := loadCachedTombstone(&s.tombstones, s.sylkDir, version)
+	if err != nil {
+		return err
+	}
+	idx := s.loadIndex(version)
+	if idx == nil {
+		return nil
+	}
+
+	var visitErr error
 	idx.ForEach(func(id uint32, offset int64) bool {
 		if tb.IsDead(id) {
 			return true
 		}
 		node, err := readNodeAtOffset(s.dataFile, offset)
 		if err != nil {
-			readErr = err
+			visitErr = err
 			return false
 		}
-		nodes = append(nodes, node)
+		if err := visit(node); err != nil {
+			visitErr = err
+			return false
+		}
 		return true
 	})
-
-	return nodes, readErr
+	return visitErr
 }
 
 // CountForVersion returns the number of entries in the offset index for a version.
@@ -304,6 +333,11 @@ func (s *GlobalVersionEdgeStore) ReadAll() ([]*Edge, error) {
 
 // ReadAllFromVersion reads all live edges from a specific version.
 // Edges referencing dead nodes (either endpoint) are excluded.
+//
+// Materializes every edge into a slice. For repos at scale
+// (10⁶–10⁷ edges) this materialization dominates heap usage; prefer
+// IterateEdgesFromVersion when the consumer can process one edge
+// at a time.
 func (s *GlobalVersionEdgeStore) ReadAllFromVersion(version SemanticVersion) ([]*Edge, error) {
 	tb, err := loadCachedTombstone(&s.tombstones, s.sylkDir, version)
 	if err != nil {
@@ -312,6 +346,25 @@ func (s *GlobalVersionEdgeStore) ReadAllFromVersion(version SemanticVersion) ([]
 
 	return s.store.ReadAllFiltered(func(sourceID, targetID uint32) bool {
 		return tb.IsEdgeAlive(sourceID, targetID)
+	})
+}
+
+// IterateEdgesFromVersion streams every live edge in a version
+// through visit. Heap residency is bounded to one *Edge at a time.
+// visit returning a non-nil error stops iteration.
+//
+// Dead-node tombstone filtering is applied in-loop so dropped edges
+// never reach the visitor.
+func (s *GlobalVersionEdgeStore) IterateEdgesFromVersion(version SemanticVersion, visit func(*Edge) error) error {
+	tb, err := loadCachedTombstone(&s.tombstones, s.sylkDir, version)
+	if err != nil {
+		return err
+	}
+	return s.store.IterateEdges(func(edge *Edge) error {
+		if !tb.IsEdgeAlive(edge.SourceID, edge.TargetID) {
+			return nil
+		}
+		return visit(edge)
 	})
 }
 

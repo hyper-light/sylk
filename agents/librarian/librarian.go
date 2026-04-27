@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -137,6 +138,11 @@ type Librarian struct {
 	scope *concurrency.GoroutineScope
 
 	claimsInbox *claims.ClaimsInbox
+
+	// activeSessionID is the session ID from the most recent forwarded
+	// request. Set at request entry, read by the claims board provider
+	// closure when config.SessionID is unset (multi-session scenarios).
+	activeSessionID atomic.Value // string — set per-request from fwd.SessionID
 }
 
 // SetScope injects the goroutine scope for async claims dispatch.
@@ -609,6 +615,9 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		return fmt.Errorf("invalid forward request payload")
 	}
 
+	if strings.TrimSpace(fwd.SessionID) != "" {
+		l.activeSessionID.Store(fwd.SessionID)
+	}
 	l.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
 	shared.LogIncomingRequest(l.steering.EventLogger(), fwd, l.id)
 

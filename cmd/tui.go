@@ -2065,6 +2065,7 @@ func registerLibrarianAgentCreator(deps onDemandAgentCreatorDeps) {
 
 		libCfg := librarian.Config{
 			ID:               librarianID,
+			SessionID:        deps.defaultSessionID(),
 			EnableLLM:        true,
 			Model:            model,
 			AnthropicAPIKey:  providers.ResolveAnthropicAPIKey(""),
@@ -2149,6 +2150,7 @@ func registerAcademicAgentCreator(deps onDemandAgentCreatorDeps) {
 		}
 		acaCfg := academic.Config{
 			ID:           academicID,
+			SessionID:    deps.defaultSessionID(),
 			Model:        model,
 			ActivityPub:  deps.actPub,
 			ContextQuota: deps.quota,

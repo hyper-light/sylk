@@ -147,7 +147,8 @@
       "Bash(sqlite3 /tmp/content.recovered.sqlite \"PRAGMA integrity_check;\")",
       "Bash(sqlite3 /tmp/content.recovered.sqlite \".tables\")",
       "Bash(sqlite3 /tmp/content.recovered.sqlite \"SELECT name, \\(SELECT COUNT\\(*\\) FROM sqlite_master m WHERE m.type='index' AND m.tbl_name=t.name\\) AS idx_cnt FROM sqlite_master t WHERE t.type='table' ORDER BY name;\")",
-      "Bash(sqlite3 *)"
+      "Bash(sqlite3 *)",
+      "Bash(/tmp/sylk-test --help)"
     ]
   }
 }

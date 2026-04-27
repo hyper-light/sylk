@@ -1448,6 +1448,18 @@ The board maintains secondary indexes over `Relations` — `(RelatedType, Relati
 
 **Why one tool instead of nine.** Named queries committed the board to fixed access patterns and required the LLM to know which query matched its intent. Traversal is the primitive — the agent starts at a known node and walks edges. The LLM's mental model is: "I have a node. I can see its neighbors. If I need more context, I follow an edge." No query taxonomy to learn. New relationship types don't require new skills.
 
+**Substrate alignment.** This entry-point + traverse pair is the *read-side* expression of the **progressive context disclosure** principle codified in `CLUSTER.md §26.10` and implemented as Phase 29 of the substrate plan. There, workflow handlers declare their effects and inputs explicitly; ambient context is never inherited; each handler receives only its declared input (mirroring Barnum's pattern — see `../barnum/libs/barnum/src/`). Here, agents register expectations and standing subscriptions; ambient board state is never inherited; each turn receives only the entry point its delta resolves. The two surfaces obey one law: **wider contexts are explicitly composed, never assumed**. Concretely:
+
+| Concern | Workflow side (CLUSTER §26.7–§26.10) | Claims side (this section) |
+|---|---|---|
+| Default scope | Each handler sees only its declared input | Each turn sees only the depth-1 entry point |
+| Widening mechanism | `withResource` / explicit composition / claim escalation | `traverse(node_id, edge_filter, max_depth)` |
+| Effect of "ambient" reads | Banned at admission | `query_claims_board` and the nine named queries deprecated |
+| Cross-scope reads | Federation `WriteToken` / `ObservedAfter` | Fabric lenses (§5.9) — cross-board only |
+| Determinism guarantee | Replay is bit-identical given bound handlers | Replay is bit-identical given the inbox cursor + delta sequence |
+
+`query_claims_board` and its nine sibling queries are retired by this principle: a delta delivers exactly one anchor, and the agent walks edges from there. The substrate side enforces the same discipline by binding effects at workflow admission and rejecting unbound effects before any execution begins.
+
 ### 5.9 Fabric Lens Context Queries
 
 Fabric lens queries serve cross-cutting context that crosses board, pipeline, or session boundaries. They are thin named wrappers over the existing `AmbientFor` / `WhatAreTheyDoing` / peer-oriented lenses.

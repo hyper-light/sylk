@@ -102,7 +102,12 @@ func (l *Librarian) registerCoreSkills() {
 }
 
 func (l *Librarian) registerFabricSkills() {
-	sessionID := func() string { return strings.TrimSpace(l.config.SessionID) }
+	sessionID := func() string {
+		if sid, _ := l.activeSessionID.Load().(string); sid != "" {
+			return sid
+		}
+		return strings.TrimSpace(l.config.SessionID)
+	}
 	agentID := func() string { return l.id }
 	agentType := func() string { return "librarian" }
 
@@ -126,7 +131,10 @@ func (l *Librarian) registerFabricSkills() {
 	// receive direct user prompts, issue consultation claims against
 	// peers, and respond with testaments containing artifacts.
 	boardProvider := func() (*claims.ClaimsBoard, error) {
-		sid := l.config.SessionID
+		sid, _ := l.activeSessionID.Load().(string)
+		if sid == "" {
+			sid = strings.TrimSpace(l.config.SessionID)
+		}
 		if sid == "" {
 			return nil, fmt.Errorf("librarian: no session ID configured")
 		}

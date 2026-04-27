@@ -36,7 +36,12 @@ func (a *Academic) registerCoreSkills() {
 }
 
 func (a *Academic) registerFabricSkills() {
-	sessionID := func() string { return strings.TrimSpace(a.config.SessionID) }
+	sessionID := func() string {
+		if sid, _ := a.activeSessionID.Load().(string); sid != "" {
+			return sid
+		}
+		return strings.TrimSpace(a.config.SessionID)
+	}
 	agentID := func() string {
 		if a.id != "" {
 			return a.id
@@ -63,7 +68,10 @@ func (a *Academic) registerFabricSkills() {
 	}
 	// Claims skills.
 	boardProvider := func() (*claims.ClaimsBoard, error) {
-		sid := a.config.SessionID
+		sid, _ := a.activeSessionID.Load().(string)
+		if sid == "" {
+			sid = strings.TrimSpace(a.config.SessionID)
+		}
 		if sid == "" {
 			return nil, fmt.Errorf("academic: no session ID configured")
 		}
