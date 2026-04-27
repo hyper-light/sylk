@@ -116,6 +116,7 @@ func (d *Designer) registerCoreSkills() {
 		return board, nil
 	}
 	d.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	d.skills.Register(claims.QueryBoardSkill(boardProvider, "designer"))
 	inboxProvider := func() *claims.ClaimsInbox { return d.claimsInbox }
 	d.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	d.skills.Register(claims.SubmitTestamentsSkill(boardProvider))

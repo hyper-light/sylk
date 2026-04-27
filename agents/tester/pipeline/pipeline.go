@@ -375,6 +375,7 @@ func (pt *PipelineTester) registerCoreSkills() {
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return pt.claimsInbox }
 	pt.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	pt.skills.Register(claims.QueryBoardSkill(boardProvider, "tester-pipeline"))
 	pt.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	pt.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	pt.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))

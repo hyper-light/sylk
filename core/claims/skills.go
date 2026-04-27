@@ -22,12 +22,14 @@ type InboxProvider func() *ClaimsInbox
 
 // ── Shared skills (all agents) ──────────────────────────────────────
 
+// QueryClaimsBoardSkill is DEPRECATED — use QueryBoardSkill instead.
+// Kept for backward compatibility; returns full projection (expensive).
 func QueryClaimsBoardSkill(bp BoardProvider) *skills.Skill {
 	return skills.NewSkill("query_claims_board").
-		Description("Read the current claims board state: all claims, testaments, validations, artifacts, phase, iteration, and computed summaries.").
+		Description("[DEPRECATED: use query_board instead] Read the full claims board state.").
 		Domain("claims").
 		Keywords("claims", "board", "status", "progress").
-		Priority(98).
+		Priority(50). // deprioritized so agents prefer query_board
 		Handler(func(ctx context.Context, _ json.RawMessage) (any, error) {
 			board, err := bp()
 			if err != nil {
@@ -39,6 +41,102 @@ func QueryClaimsBoardSkill(bp BoardProvider) *skills.Skill {
 			return board.Projection(), nil
 		}).
 		Build()
+}
+
+// QueryBoardSkill creates the composable query_board LLM-callable skill.
+// Each op returns ONLY the requested slice — no full board copy.
+func QueryBoardSkill(bp BoardProvider, defaultAgentID string) *skills.Skill {
+	return skills.NewSkill("query_board").
+		Description("Query the claims board. Use op to select what you need.\n\n"+
+			"Ops:\n"+
+			"- summary: Board status counts (phase, accepted/total, pending, etc.) — fastest\n"+
+			"- my_claims: Claims where you are the subject (your directed work)\n"+
+			"- my_evaluations: Testified claims where you are issuer/evaluator (awaiting your validation)\n"+
+			"- claim: Single claim by ID with its validations\n"+
+			"- testament: Single testament by ID with its artifacts\n"+
+			"- scope: Claims overlapping a scope entry (kind + key)\n"+
+			"- pending_validations: Pending validations on a specific claim\n"+
+			"- testaments: Testaments linked to a specific claim").
+		Domain("claims").
+		Keywords("claims", "board", "query", "status", "my_claims", "scope", "validations").
+		Priority(98).
+		EnumParam("op", "Query operation", []string{"summary", "my_claims", "my_evaluations", "claim", "testament", "scope", "pending_validations", "testaments"}, true).
+		StringParam("claim_id", "Claim ID (for claim, pending_validations, testaments ops)", false).
+		StringParam("testament_id", "Testament ID (for testament op)", false).
+		StringParam("agent_id", "Agent ID override (for my_claims, my_evaluations). Defaults to calling agent.", false).
+		StringParam("kind", "Scope kind (for scope op)", false).
+		StringParam("key", "Scope key (for scope op)", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			board, err := bp()
+			if err != nil {
+				return nil, fmt.Errorf("claims board: %w", err)
+			}
+			if board == nil {
+				return nil, fmt.Errorf("claims board not available (no error returned)")
+			}
+			var params struct {
+				Op          string `json:"op"`
+				ClaimID     string `json:"claim_id"`
+				TestamentID string `json:"testament_id"`
+				AgentID     string `json:"agent_id"`
+				Kind        string `json:"kind"`
+				Key         string `json:"key"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			agentID := strings.TrimSpace(params.AgentID)
+			if agentID == "" {
+				agentID = defaultAgentID
+			}
+			return dispatchBoardQuery(board, params.Op, agentID, params.ClaimID, params.TestamentID, params.Kind, params.Key)
+		}).
+		Build()
+}
+
+func dispatchBoardQuery(board *ClaimsBoard, op, agentID, claimID, testamentID, scopeKind, scopeKey string) (any, error) {
+	switch strings.TrimSpace(op) {
+	case "summary":
+		return board.Summary(), nil
+	case "my_claims":
+		return board.ClaimsForAgent(agentID, RelationshipSubject), nil
+	case "my_evaluations":
+		return board.ClaimsForAgentByStatus(agentID, RelationshipIssuer, ClaimStatusTestified), nil
+	case "claim":
+		c, ok := board.CloneClaim(strings.TrimSpace(claimID))
+		if !ok {
+			return nil, fmt.Errorf("claim %q not found", claimID)
+		}
+		return c, nil
+	case "testament":
+		t, ok := board.CloneTestament(strings.TrimSpace(testamentID))
+		if !ok {
+			return nil, fmt.Errorf("testament %q not found", testamentID)
+		}
+		return t, nil
+	case "scope":
+		ids := board.ClaimIDsWithScope(strings.TrimSpace(scopeKind), strings.TrimSpace(scopeKey))
+		result := make([]*Claim, 0, len(ids))
+		for _, id := range ids {
+			if c, ok := board.CloneClaim(id); ok {
+				result = append(result, c)
+			}
+		}
+		return result, nil
+	case "pending_validations":
+		return board.PendingValidationsForClaim(strings.TrimSpace(claimID)), nil
+	case "testaments":
+		nodes := Traverse(board, strings.TrimSpace(claimID), RelationshipTestament, 1)
+		var testaments []*Testament
+		for _, n := range nodes {
+			if n.Testament != nil {
+				testaments = append(testaments, n.Testament)
+			}
+		}
+		return testaments, nil
+	default:
+		return nil, fmt.Errorf("unknown query_board op: %q", op)
+	}
 }
 
 // PostActionSkill creates the post_action LLM-callable skill. The
@@ -397,8 +495,50 @@ type claimInput struct {
 	Title       string            `json:"title"`
 	Description string            `json:"description"`
 	Subject     string            `json:"subject"`
-	Scope       []ClaimScopeEntry `json:"scope,omitempty"`
+	Scope       flexibleScope     `json:"scope,omitempty"`
 	Validations []validationInput `json:"validations,omitempty"`
+}
+
+// flexibleScope handles LLM variability in how scope is provided:
+//   - string: "hello-cli" → [{Kind: "scope", Key: "hello-cli"}]
+//   - []string: ["hello-cli", "auth"] → [{Kind: "scope", Key: "hello-cli"}, ...]
+//   - []ClaimScopeEntry: [{kind: "file", key: "src/main.go"}] → used directly
+type flexibleScope []ClaimScopeEntry
+
+func (s *flexibleScope) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || string(data) == "null" {
+		return nil
+	}
+
+	// Try proper []ClaimScopeEntry first.
+	var entries []ClaimScopeEntry
+	if err := json.Unmarshal(data, &entries); err == nil {
+		*s = entries
+		return nil
+	}
+
+	// Try single string: "hello-cli"
+	var single string
+	if err := json.Unmarshal(data, &single); err == nil && single != "" {
+		*s = []ClaimScopeEntry{{Kind: "scope", Key: single}}
+		return nil
+	}
+
+	// Try []string: ["hello-cli", "auth"]
+	var strings []string
+	if err := json.Unmarshal(data, &strings); err == nil {
+		result := make([]ClaimScopeEntry, 0, len(strings))
+		for _, v := range strings {
+			if v != "" {
+				result = append(result, ClaimScopeEntry{Kind: "scope", Key: v})
+			}
+		}
+		*s = result
+		return nil
+	}
+
+	return fmt.Errorf("scope must be a string, string array, or [{kind, key}] array")
 }
 
 type validationInput struct {

@@ -27,6 +27,7 @@ func archivalistVisibleSkillNames() []string {
 		"knowledge_memory",
 		// Claims skills: read-only board introspection is Local (visible).
 		"query_claims_board",
+		"query_board",
 		"inspect_claim_conflicts",
 		"traverse",
 	}

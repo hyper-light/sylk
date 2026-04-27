@@ -77,6 +77,7 @@ func guideToolManifestForRegistry(registry *skills.Registry) *toolruntime.Policy
 	// mutation skills use local_worker execution mode.
 	policies = append(policies,
 		toolruntime.NewToolPolicy("query_claims_board", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("query_board", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("post_action", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("submit_testaments", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("update_claim_progress", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),

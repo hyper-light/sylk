@@ -42,6 +42,7 @@ type ClaimsBridge struct {
 	lastTestIDs      map[string]struct{}                 // seen testament IDs
 	lastAccepted     int
 	lastTotal        int
+	evictCounter     int                                 // evict every N projections
 
 	outbox  chan any // bounded buffer; drained by scope goroutine
 	dropped atomic.Int64
@@ -141,8 +142,8 @@ func (b *ClaimsBridge) SwitchSession(sessionID string) {
 		return
 	}
 
-	b.unsub = board.SubscribeProjection(func(proj *claims.ClaimsBoardProjection) error {
-		b.onProjection(proj)
+	b.unsub = board.SubscribeDelta(func(delta claims.BoardMutationDelta) error {
+		b.onDelta(delta)
 		return nil
 	})
 }
@@ -156,9 +157,48 @@ func (b *ClaimsBridge) resetDiffState() {
 	b.lastTotal = 0
 }
 
-// onProjection diffs the new projection against the last-seen state,
-// collects messages, and enqueues them to the outbox. Never blocks —
-// drops on backpressure. Runs under the board's scope dispatch.
+// onDelta processes a lightweight board mutation delta. No full
+// projection copy, no diffing, no eviction maps. The delta tells
+// us exactly what changed.
+func (b *ClaimsBridge) onDelta(delta claims.BoardMutationDelta) {
+	s := delta.Summary
+
+	// Counter update — always emit when counts change.
+	b.mu.Lock()
+	counterChanged := s.Accepted != b.lastAccepted || s.Total != b.lastTotal
+	b.lastAccepted = s.Accepted
+	b.lastTotal = s.Total
+	b.mu.Unlock()
+
+	if counterChanged {
+		b.enqueue(msg.ClaimsProjectionMsg{
+			SessionID:     "",
+			AcceptedCount: s.Accepted,
+			TotalClaims:   s.Total,
+		})
+	}
+
+	// Activity events for the agent detail feed.
+	switch delta.Kind {
+	case "claim_created":
+		b.enqueue(claimsActivityMsg(events.EventTypeClaimReceived, events.OutcomePending, delta.AgentID, delta.ClaimID))
+	case "claim_status_changed":
+		if delta.ToStatus == claims.ClaimStatusAccepted {
+			b.enqueue(claimsActivityMsg(events.EventTypeClaimAccepted, events.OutcomeSuccess, delta.AgentID, delta.ClaimID))
+		}
+	case "testament_submitted":
+		b.enqueue(claimsActivityMsg(events.EventTypeTestamentSubmitted, events.OutcomeSuccess, delta.AgentID, delta.TestamentID))
+	case "validation_evaluated":
+		if delta.ToStatus == claims.ClaimStatusAccepted {
+			b.enqueue(claimsActivityMsg(events.EventTypeValidationPassed, events.OutcomeSuccess, delta.AgentID, delta.ClaimID))
+		}
+	case "claim_rejected":
+		b.enqueue(claimsActivityMsg(events.EventTypeValidationFailed, events.OutcomeFailure, delta.AgentID, delta.ClaimID))
+	}
+}
+
+// onProjection is the DEPRECATED path — kept for backward compatibility
+// with SubscribeProjection callers. New code uses onDelta.
 func (b *ClaimsBridge) onProjection(proj *claims.ClaimsBoardProjection) {
 	if proj == nil {
 		return
@@ -168,7 +208,10 @@ func (b *ClaimsBridge) onProjection(proj *claims.ClaimsBoardProjection) {
 
 	b.mu.Lock()
 	pending = b.diffProjection(proj)
-	b.evictTerminalClaims(proj)
+	b.evictCounter++
+	if b.evictCounter%10 == 0 {
+		b.evictTerminalClaims(proj)
+	}
 	b.mu.Unlock()
 
 	for _, m := range pending {

@@ -83,6 +83,7 @@ func (g *Guide) registerCoreSkills() {
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return g.claimsInbox }
 	g.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	g.skills.Register(claims.QueryBoardSkill(boardProvider, "guide"))
 	g.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	g.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	g.skills.Register(claims.EvaluateValidationSkill(boardProvider))

@@ -76,6 +76,7 @@ func (s *Scribe) newToolBundle(feed shared.ScribeFeed) (*scribeToolBundle, *scri
 	inboxProvider := func() *claims.ClaimsInbox { return s.claimsInbox }
 	for _, skill := range []*skills.Skill{
 		claims.QueryClaimsBoardSkill(boardProvider),
+		claims.QueryBoardSkill(boardProvider, "scribe"),
 		claims.PostActionSkill(boardProvider, inboxProvider),
 		claims.SubmitTestamentsSkill(boardProvider),
 		claims.EvaluateValidationSkill(boardProvider),
@@ -373,6 +374,7 @@ func scribeVisibleSkillNames(agentType string) []string {
 		scribeStoreArchivalistSkillName,
 		// Claims skills: read-only board introspection is Local (visible).
 		"query_claims_board",
+		"query_board",
 		"inspect_claim_conflicts",
 		"traverse",
 		// Claims skills: mutating operations are also visible for the scribe.

@@ -473,6 +473,7 @@ func (gt *GlobalTester) registerCoreSkills() {
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return gt.claimsInbox }
 	gt.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	gt.skills.Register(claims.QueryBoardSkill(boardProvider, "tester"))
 	gt.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	gt.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	gt.skills.Register(claims.EvaluateValidationSkill(boardProvider))

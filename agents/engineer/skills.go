@@ -132,6 +132,7 @@ func (e *Engineer) registerCoreSkills() {
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return e.claimsInbox }
 	e.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	e.skills.Register(claims.QueryBoardSkill(boardProvider, "engineer"))
 	e.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	e.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	e.skills.Register(claims.EvaluateValidationSkill(boardProvider))

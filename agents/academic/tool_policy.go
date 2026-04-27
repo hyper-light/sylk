@@ -17,6 +17,7 @@ func academicVisibleSkillNames() []string {
 		"fetch_document",
 		// Claims skills: read-only board introspection is Local (visible).
 		"query_claims_board",
+		"query_board",
 		"inspect_claim_conflicts",
 		"traverse",
 	}

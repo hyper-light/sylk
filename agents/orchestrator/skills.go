@@ -124,6 +124,7 @@ func (o *Orchestrator) registerFabricSkills() {
 	boardProvider := func() (*claims.ClaimsBoard, error) { return o.orchestratorBoard() }
 	inboxProvider := func() *claims.ClaimsInbox { return o.claimsInbox }
 	o.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	o.skills.Register(claims.QueryBoardSkill(boardProvider, "orchestrator"))
 	o.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	o.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	o.skills.Register(claims.EvaluateValidationSkill(boardProvider))

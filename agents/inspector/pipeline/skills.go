@@ -134,6 +134,7 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return pi.claimsInbox }
 	pi.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	pi.skills.Register(claims.QueryBoardSkill(boardProvider, "inspector-pipeline"))
 	pi.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	pi.skills.Register(claims.EvaluateValidationSkill(boardProvider))
 	pi.skills.Register(claims.PostRemediationClaimsSkill(boardProvider))

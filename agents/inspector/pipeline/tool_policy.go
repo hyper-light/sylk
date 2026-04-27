@@ -24,6 +24,7 @@ func pipelineInspectorVisibleSkillNames() []string {
 		"handoff_to_ot",
 		// Claims skills: read-only board introspection is Local (visible).
 		"query_claims_board",
+		"query_board",
 		"inspect_claim_conflicts",
 		"traverse",
 	}, "inspector-pipeline")

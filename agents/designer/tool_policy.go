@@ -22,6 +22,7 @@ func designerVisibleSkillNames() []string {
 		"ask_user_clarification",
 		// Claims skills: read-only board introspection is Local (visible).
 		"query_claims_board",
+		"query_board",
 		"inspect_claim_conflicts",
 		"traverse",
 	}, "designer")

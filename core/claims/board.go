@@ -57,9 +57,25 @@ type ClaimsBoard struct {
 	amplifier *BoardAmplifier
 	scope     ScopeProvider // nil = synchronous (tests)
 
-	subscribersMu sync.Mutex
-	subscribers   []boardSubscription
-	subscriberSeq int64
+	// Cached projection: recomputed only when projectionDirty is set.
+	// Multiple readers share the same immutable pointer.
+	cachedProjection atomic.Pointer[ClaimsBoardProjection]
+	projectionDirty  atomic.Bool
+
+	subscribersMu      sync.Mutex
+	subscribers        []boardSubscription
+	subscriberSeq      int64
+	deltaSubscribers   []boardDeltaSubscription
+	deltaSubscriberSeq int64
+
+	// Atomic summary counters — updated inline on every mutation,
+	// readable without lock for the query_board op=summary path.
+	countTotal      atomic.Int64
+	countPending    atomic.Int64
+	countInProgress atomic.Int64
+	countTestified  atomic.Int64
+	countAccepted   atomic.Int64
+	countRejected   atomic.Int64
 
 	// notificationErrors accumulates subscriber notification + emission
 	// failures. Exposed in the projection so agents see them on the
@@ -72,6 +88,11 @@ type ClaimsBoard struct {
 type boardSubscription struct {
 	id int64
 	fn ClaimsBoardSubscriber
+}
+
+type boardDeltaSubscription struct {
+	id int64
+	fn BoardDeltaSubscriber
 }
 
 // NewClaimsBoard creates a new board. Amplifier, scope, and delta bus
@@ -192,6 +213,11 @@ func (b *ClaimsBoard) PostAction(_ context.Context, action Action, inputClaims [
 	for i := range inputClaims {
 		b.amplifier.EmitClaimIssued(ctx, &inputClaims[i])
 		b.amplifier.PublishInboxDeltas(ctx, &action, &inputClaims[i])
+		b.notifyDelta(BoardMutationDelta{
+			Kind:    "claim_created",
+			ClaimID: inputClaims[i].ID,
+			AgentID: SubjectAgentID(inputClaims[i].Relations),
+		})
 	}
 
 	b.notifySubscribers()
@@ -256,6 +282,8 @@ func (b *ClaimsBoard) stampClaimLocked(c *Claim, action *Action, now time.Time) 
 		AgentID: action.AgentID,
 		Changed: now,
 	})
+	b.countTotal.Add(1)
+	b.countPending.Add(1)
 	if !HasRelation(c.Relations, RelationshipClaimAction, action.ID) {
 		c.Relations = append(c.Relations, Relation{
 			Related:      action.ID,
@@ -317,6 +345,7 @@ func (b *ClaimsBoard) UpdateClaimProgress(_ context.Context, claimID string, _ C
 		})
 		c.Status = ClaimStatusInProgress
 		statusChanged = true
+		b.adjustStatusCounter(ClaimStatusPending, ClaimStatusInProgress)
 	}
 
 	b.mu.Unlock()
@@ -377,10 +406,23 @@ func (b *ClaimsBoard) SubmitTestaments(_ context.Context, action Action, testame
 		if claimRefs[i] != nil {
 			b.amplifier.PublishTestamentDelta(ctx, &testaments[i], claimRefs[i])
 		}
+		b.notifyDelta(BoardMutationDelta{
+			Kind:        "testament_submitted",
+			TestamentID: testaments[i].ID,
+			ClaimID:     claimIDFromTestament(&testaments[i]),
+			AgentID:     testaments[i].AgentID,
+		})
 	}
 
 	b.notifySubscribers()
 	return nil
+}
+
+func claimIDFromTestament(t *Testament) string {
+	if r := FindRelation(t.Relations, RelationshipClaim); r != nil {
+		return r.Related
+	}
+	return ""
 }
 
 func (b *ClaimsBoard) stampTestamentActionLocked(action *Action, now time.Time) {
@@ -450,6 +492,7 @@ func (b *ClaimsBoard) resolveClaimForTestamentLocked(t *Testament, now time.Time
 		return nil
 	}
 	if !c.Status.IsTerminal() && c.Status != ClaimStatusTestified {
+		prevStatus := c.Status
 		c.StatusHistory = append(c.StatusHistory, StatusChange{
 			From:    string(c.Status),
 			To:      string(ClaimStatusTestified),
@@ -459,6 +502,7 @@ func (b *ClaimsBoard) resolveClaimForTestamentLocked(t *Testament, now time.Time
 		})
 		c.Status = ClaimStatusTestified
 		c.Accessed = now
+		b.adjustStatusCounter(prevStatus, ClaimStatusTestified)
 	}
 
 	// Auto-pass receipt validations: the testament arriving IS the proof.
@@ -473,6 +517,7 @@ func (b *ClaimsBoard) resolveClaimForTestamentLocked(t *Testament, now time.Time
 			AgentID: t.AgentID,
 			Changed: now,
 		})
+		b.adjustStatusCounter(ClaimStatusTestified, ClaimStatusAccepted)
 		c.Status = ClaimStatusAccepted
 		c.Accessed = now
 	}
@@ -528,6 +573,7 @@ func (b *ClaimsBoard) EvaluateValidation(_ context.Context, claimID, validationI
 
 	accepted := c.AllValidationsPassed()
 	if accepted {
+		prevStatus := c.Status
 		c.StatusHistory = append(c.StatusHistory, StatusChange{
 			From:    string(c.Status),
 			To:      string(ClaimStatusAccepted),
@@ -537,6 +583,7 @@ func (b *ClaimsBoard) EvaluateValidation(_ context.Context, claimID, validationI
 		})
 		c.Status = ClaimStatusAccepted
 		c.Accessed = now
+		b.adjustStatusCounter(prevStatus, ClaimStatusAccepted)
 	}
 
 	validationDelta := b.buildValidationDeltaLocked(c, v, change, accepted, now)
@@ -549,6 +596,17 @@ func (b *ClaimsBoard) EvaluateValidation(_ context.Context, claimID, validationI
 		b.amplifier.EmitClaimAccepted(ctx, c)
 	}
 	b.amplifier.PublishValidationDelta(ctx, validationDelta)
+	toStatus := ClaimStatus(change.To)
+	if accepted {
+		toStatus = ClaimStatusAccepted
+	}
+	b.notifyDelta(BoardMutationDelta{
+		Kind:       "validation_evaluated",
+		ClaimID:    claimID,
+		FromStatus: ClaimStatus(change.From),
+		ToStatus:   toStatus,
+		AgentID:    change.AgentID,
+	})
 	b.notifySubscribers()
 	return nil
 }
@@ -616,6 +674,7 @@ func (b *ClaimsBoard) RejectClaim(_ context.Context, claimID string, change Stat
 	c.StatusHistory = append(c.StatusHistory, change)
 	c.Status = ClaimStatusRejected
 	c.Accessed = now
+	b.adjustStatusCounter(fromStatus, ClaimStatusRejected)
 
 	remediationIDs := b.applyRemediationLocked(claimID, replacements, replacementClaims, change.AgentID, now)
 
@@ -650,6 +709,13 @@ func (b *ClaimsBoard) RejectClaim(_ context.Context, claimID string, change Stat
 		}
 	}
 
+	b.notifyDelta(BoardMutationDelta{
+		Kind:       "claim_rejected",
+		ClaimID:    claimID,
+		FromStatus: fromStatus,
+		ToStatus:   ClaimStatusRejected,
+		AgentID:    change.AgentID,
+	})
 	b.notifySubscribers()
 	return nil
 }
@@ -883,23 +949,39 @@ func (b *ClaimsBoard) logPhaseTransitionLocked(from, to BoardPhase, reason, agen
 // ── Queries ─────────────────────────────────────────────────────────
 
 func (b *ClaimsBoard) Projection() *ClaimsBoardProjection {
+	// Fast path: return cached projection if not dirty.
+	if !b.projectionDirty.Load() {
+		if cached := b.cachedProjection.Load(); cached != nil {
+			return cached
+		}
+	}
+
+	// Slow path: recompute and cache.
 	b.mu.RLock()
 	hasErrors := len(b.notificationErrors) > 0
 	b.mu.RUnlock()
 
+	var p *ClaimsBoardProjection
 	if !hasErrors {
 		b.mu.RLock()
-		p := b.projectionLocked()
+		p = b.projectionLocked()
 		b.mu.RUnlock()
-		return p
+	} else {
+		b.mu.Lock()
+		p = b.projectionLocked()
+		b.notificationErrors = b.notificationErrors[:0]
+		b.mu.Unlock()
 	}
 
-	// Slow path: projection + drain atomically under write lock.
-	b.mu.Lock()
-	p := b.projectionLocked()
-	b.notificationErrors = b.notificationErrors[:0]
-	b.mu.Unlock()
+	b.cachedProjection.Store(p)
+	b.projectionDirty.Store(false)
 	return p
+}
+
+// invalidateProjectionCache marks the cached projection as stale.
+// Called by every mutation path so the next Projection() recomputes.
+func (b *ClaimsBoard) invalidateProjectionCache() {
+	b.projectionDirty.Store(true)
 }
 
 func (b *ClaimsBoard) projectionLocked() *ClaimsBoardProjection {
@@ -930,6 +1012,7 @@ func (b *ClaimsBoard) populateClaimsProjectionLocked(p *ClaimsBoardProjection) {
 			continue
 		}
 		clone := *c
+		clone.StatusHistory = capStatusHistory(clone.StatusHistory)
 		p.Claims = append(p.Claims, clone)
 		p.TotalClaims++
 		incrementClaimStatusCount(p, c.Status)
@@ -977,6 +1060,15 @@ func (b *ClaimsBoard) populateActionsProjectionLocked(p *ClaimsBoardProjection) 
 func (b *ClaimsBoard) populateTestamentsProjectionLocked(p *ClaimsBoardProjection) {
 	for _, t := range b.testaments {
 		clone := *t
+		// Truncate large artifact references in projection copies.
+		// Full content preserved in board's internal storage.
+		for i, a := range clone.Artifacts {
+			if a != nil && len(a.Reference) > maxArtifactReferenceLen {
+				truncated := *a
+				truncated.Reference = TruncateArtifactReference(a.Reference)
+				clone.Artifacts[i] = &truncated
+			}
+		}
 		p.Testaments = append(p.Testaments, clone)
 		p.TotalTestaments++
 		p.TotalArtifacts += len(t.Artifacts)
@@ -1119,6 +1211,52 @@ func (b *ClaimsBoard) SubscribeProjection(fn ClaimsBoardSubscriber) func() {
 	}
 }
 
+// SubscribeDelta registers a lightweight delta subscriber. Returns an
+// unsubscribe function. Delta subscribers receive BoardMutationDelta
+// (what changed + current summary counts) instead of full projections.
+func (b *ClaimsBoard) SubscribeDelta(fn BoardDeltaSubscriber) func() {
+	if b == nil || fn == nil {
+		return func() {}
+	}
+	b.subscribersMu.Lock()
+	b.deltaSubscriberSeq++
+	id := b.deltaSubscriberSeq
+	b.deltaSubscribers = append(b.deltaSubscribers, boardDeltaSubscription{id: id, fn: fn})
+	b.subscribersMu.Unlock()
+
+	return func() {
+		b.subscribersMu.Lock()
+		defer b.subscribersMu.Unlock()
+		for i, s := range b.deltaSubscribers {
+			if s.id == id {
+				b.deltaSubscribers = append(b.deltaSubscribers[:i], b.deltaSubscribers[i+1:]...)
+				return
+			}
+		}
+	}
+}
+
+// notifyDelta dispatches a lightweight mutation delta to all delta
+// subscribers. No projection copy — just the delta struct (what changed)
+// plus the current summary counters. Best-effort: subscriber errors
+// are logged but do not block the mutation.
+func (b *ClaimsBoard) notifyDelta(delta BoardMutationDelta) {
+	delta.Summary = b.Summary()
+
+	b.subscribersMu.Lock()
+	subs := make([]BoardDeltaSubscriber, len(b.deltaSubscribers))
+	for i, s := range b.deltaSubscribers {
+		subs[i] = s.fn
+	}
+	b.subscribersMu.Unlock()
+
+	for _, fn := range subs {
+		if err := fn(delta); err != nil {
+			b.RecordNotificationError("delta subscriber: " + err.Error())
+		}
+	}
+}
+
 // notifySubscribers computes the projection under read lock, then
 // notifies subscribers WITHOUT holding any board lock (prevents
 // deadlock if a subscriber reads the board).
@@ -1131,6 +1269,15 @@ func (b *ClaimsBoard) SubscribeProjection(fn ClaimsBoardSubscriber) func() {
 // surfaced in the next Projection() call. They do not block the
 // mutation. Panics are NOT recovered — they are bugs.
 func (b *ClaimsBoard) notifySubscribers() {
+	b.invalidateProjectionCache()
+
+	b.subscribersMu.Lock()
+	hasSubs := len(b.subscribers) > 0
+	b.subscribersMu.Unlock()
+	if !hasSubs {
+		return // skip projection computation when no legacy subscribers
+	}
+
 	b.mu.RLock()
 	proj := b.projectionLocked()
 	b.mu.RUnlock()
@@ -1221,6 +1368,119 @@ func (b *ClaimsBoard) ObjectIDsWithRelation(relatedType, relationship, relatedID
 // ClaimIDsWithScope returns claim IDs whose Scope matches.
 func (b *ClaimsBoard) ClaimIDsWithScope(scopeKind, key string) []string {
 	return b.relationsIdx.claimsWithScope(scopeKind, key)
+}
+
+// BoardSummary is the lightweight read of board state — counts only,
+// no entity copies. Readable without lock via atomic counters.
+type BoardSummary struct {
+	Phase       BoardPhase `json:"phase"`
+	Iteration   int        `json:"iteration"`
+	Total       int        `json:"total"`
+	Pending     int        `json:"pending"`
+	InProgress  int        `json:"in_progress"`
+	Testified   int        `json:"testified"`
+	Accepted    int        `json:"accepted"`
+	Rejected    int        `json:"rejected"`
+}
+
+// Summary returns the board's status counters without copying any
+// entities. Lock-free — reads atomic counters.
+func (b *ClaimsBoard) Summary() BoardSummary {
+	b.mu.RLock()
+	phase := b.phase
+	iteration := b.iteration
+	b.mu.RUnlock()
+	return BoardSummary{
+		Phase:      phase,
+		Iteration:  iteration,
+		Total:      int(b.countTotal.Load()),
+		Pending:    int(b.countPending.Load()),
+		InProgress: int(b.countInProgress.Load()),
+		Testified:  int(b.countTestified.Load()),
+		Accepted:   int(b.countAccepted.Load()),
+		Rejected:   int(b.countRejected.Load()),
+	}
+}
+
+// adjustStatusCounter decrements the old status counter and increments
+// the new one. Called under write lock during status transitions.
+func (b *ClaimsBoard) adjustStatusCounter(from, to ClaimStatus) {
+	b.decrementStatusCounter(from)
+	b.incrementStatusCounter(to)
+}
+
+func (b *ClaimsBoard) incrementStatusCounter(status ClaimStatus) {
+	switch status {
+	case ClaimStatusPending:
+		b.countPending.Add(1)
+	case ClaimStatusInProgress:
+		b.countInProgress.Add(1)
+	case ClaimStatusTestified:
+		b.countTestified.Add(1)
+	case ClaimStatusAccepted:
+		b.countAccepted.Add(1)
+	case ClaimStatusRejected:
+		b.countRejected.Add(1)
+	}
+}
+
+func (b *ClaimsBoard) decrementStatusCounter(status ClaimStatus) {
+	switch status {
+	case ClaimStatusPending:
+		b.countPending.Add(-1)
+	case ClaimStatusInProgress:
+		b.countInProgress.Add(-1)
+	case ClaimStatusTestified:
+		b.countTestified.Add(-1)
+	case ClaimStatusAccepted:
+		b.countAccepted.Add(-1)
+	case ClaimStatusRejected:
+		b.countRejected.Add(-1)
+	}
+}
+
+// ClaimsForAgent returns claims where the given agent has the specified
+// relationship (typically "subject" or "evaluator"). Index-backed O(1)
+// lookup + O(k) clones where k = matching claims.
+func (b *ClaimsBoard) ClaimsForAgent(agentID, relationship string) []*Claim {
+	ids := b.ObjectIDsWithRelation(RelatedTypeAgent, relationship, agentID)
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	result := make([]*Claim, 0, len(ids))
+	for _, id := range ids {
+		if c, ok := b.claims[id]; ok {
+			clone := *c
+			result = append(result, &clone)
+		}
+	}
+	return result
+}
+
+// ClaimsForAgentByStatus returns claims for the agent filtered by status.
+func (b *ClaimsBoard) ClaimsForAgentByStatus(agentID, relationship string, status ClaimStatus) []*Claim {
+	all := b.ClaimsForAgent(agentID, relationship)
+	filtered := make([]*Claim, 0, len(all))
+	for _, c := range all {
+		if c.Status == status {
+			filtered = append(filtered, c)
+		}
+	}
+	return filtered
+}
+
+// PendingValidationsForClaim returns pending non-receipt validations on a claim.
+func (b *ClaimsBoard) PendingValidationsForClaim(claimID string) []*Validation {
+	c, ok := b.CloneClaim(claimID)
+	if !ok {
+		return nil
+	}
+	var pending []*Validation
+	for _, v := range c.Validations {
+		if v != nil && v.Status == ValidationStatusPending && v.Type != ValidationTypeReceipt {
+			pending = append(pending, v)
+		}
+	}
+	return pending
 }
 
 // ── Internal helpers ────────────────────────────────────────────────

@@ -508,7 +508,27 @@ type ScopeProvider interface {
 // with the updated projection. Returns an error if the subscriber
 // encounters a problem — the error is logged but does not block the
 // mutation (which already completed). Never panic in a subscriber.
+// DEPRECATED: use BoardDeltaSubscriber for lightweight notifications.
 type ClaimsBoardSubscriber func(*ClaimsBoardProjection) error
+
+// BoardMutationDelta is the lightweight notification emitted on every
+// board mutation. Carries ONLY what changed — no full projection copy.
+// Subscribers use this to update counters, emit TUI events, or trigger
+// downstream processing without forcing a full board read.
+type BoardMutationDelta struct {
+	Kind        string      `json:"kind"`         // "claim_created", "claim_status_changed", "testament_submitted", "validation_evaluated", "claim_rejected", "phase_changed"
+	ClaimID     string      `json:"claim_id,omitempty"`
+	TestamentID string      `json:"testament_id,omitempty"`
+	FromStatus  ClaimStatus `json:"from_status,omitempty"`
+	ToStatus    ClaimStatus `json:"to_status,omitempty"`
+	AgentID     string      `json:"agent_id,omitempty"`
+	Summary     BoardSummary `json:"summary"` // always populated — current counts
+}
+
+// BoardDeltaSubscriber receives lightweight mutation deltas instead of
+// full projection copies. The delta tells the subscriber what changed;
+// the summary provides current counts.
+type BoardDeltaSubscriber func(BoardMutationDelta) error
 
 // ────────────────────────────────────────────────────────────────────
 // Relation helpers
@@ -575,4 +595,30 @@ func ClaimActionID(relations []Relation) string {
 		return ""
 	}
 	return r.Related
+}
+
+// maxStatusHistoryLen caps StatusHistory on claims and validations.
+// Older entries are preserved in the WAL for audit; the in-memory
+// board only keeps the most recent transitions.
+const maxStatusHistoryLen = 20
+
+// capStatusHistory trims a StatusHistory slice to the most recent
+// maxStatusHistoryLen entries.
+func capStatusHistory(history []StatusChange) []StatusChange {
+	if len(history) <= maxStatusHistoryLen {
+		return history
+	}
+	return history[len(history)-maxStatusHistoryLen:]
+}
+
+// maxArtifactReferenceLen caps artifact Reference fields in the
+// in-memory board. Full content is in the WAL/persistent store.
+const maxArtifactReferenceLen = 500
+
+// TruncateArtifactReference truncates a reference to maxArtifactReferenceLen.
+func TruncateArtifactReference(ref string) string {
+	if len(ref) <= maxArtifactReferenceLen {
+		return ref
+	}
+	return ref[:maxArtifactReferenceLen-1] + "\u2026"
 }

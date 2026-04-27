@@ -146,6 +146,7 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	boardProvider := func() (*claims.ClaimsBoard, error) { return gi.globalInspectorBoard() }
 	inboxProvider := func() *claims.ClaimsInbox { return gi.claimsInbox }
 	gi.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	gi.skills.Register(claims.QueryBoardSkill(boardProvider, "inspector"))
 	gi.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	gi.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	gi.skills.Register(claims.EvaluateValidationSkill(boardProvider))

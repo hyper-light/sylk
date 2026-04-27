@@ -132,6 +132,7 @@ func (a *Architect) registerFabricSkills() {
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return a.claimsInbox }
 	a.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
+	a.skills.Register(claims.QueryBoardSkill(boardProvider, "architect"))
 	a.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	a.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	a.skills.Register(claims.EvaluateValidationSkill(boardProvider))
