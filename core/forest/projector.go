@@ -29,12 +29,12 @@ const (
 
 	// projectorRenewInterval is how frequently the leader renews
 	// its lease — well within projectorLeaseDuration so a transient
-	// pause doesn't lose leadership.
+	// pause doesn't lose leadership. Doubles as the projector's
+	// safety-poll backstop: every renew tick the outer loop re-runs
+	// processBranchProjectorBatch, so a missed wake (e.g., a wake
+	// signal raced past a draining channel in a multi-process race)
+	// is recovered within at most one renewInterval.
 	projectorRenewInterval = 10 * time.Second
-
-	// projectorPollInterval bounds the lag between event append and
-	// projection visibility when no wake signal arrives.
-	projectorPollInterval = 250 * time.Millisecond
 
 	// projectorBatchSize is the maximum number of events processed
 	// per catch-up cycle. Larger batches amortize transaction
@@ -816,17 +816,28 @@ func (m *MemoryForest) sleepProjector(d time.Duration) bool {
 	}
 }
 
-// waitForProjectorWork blocks until: a wake signal arrives on the
-// supplied wake channel, the poll interval elapses, the lease is due
-// for renewal, or shutdown is requested. Each projector passes its
-// own wake channel so wakes aren't stolen by sibling projectors.
+// waitForProjectorWork blocks until a wake signal arrives, the lease
+// is due for renewal, or shutdown is requested. Pure event-driven —
+// no idle polling. Each projector passes its own wake channel so
+// wakes aren't stolen by sibling projectors.
+//
+// Correctness: notifyProjector() is called on every successful
+// AppendEvent commit (and the equivalent on retrieval-audit append
+// for the retrieval-candidates projector). Because the wake channel
+// is cap-1, multiple events between scans collapse to a single wake
+// — but the next process pass drains everything via
+// loadEventsAfterSeq's seq-ordered query, so no event is lost.
+//
+// Robustness: a wake CAN race past a draining channel in pathological
+// multi-process scenarios where two writers commit in tight
+// succession and the projector's drain happens between them. The
+// renewInterval (10s) tick is the backstop — every renew, the outer
+// loop re-runs processBranchProjectorBatch, recovering any missed
+// wake within at most one renewInterval. No additional safety timer
+// is needed.
 func (m *MemoryForest) waitForProjectorWork(renew *time.Ticker, state *projectorState, wake <-chan struct{}) error {
-	timer := time.NewTimer(projectorPollInterval)
-	defer timer.Stop()
 	select {
 	case <-wake:
-		return nil
-	case <-timer.C:
 		return nil
 	case <-renew.C:
 		return m.renewLease(state)

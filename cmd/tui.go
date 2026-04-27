@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof/* on http.DefaultServeMux when SYLK_PPROF is set
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -85,6 +87,22 @@ func init() {
 func runTUI(_ *cobra.Command, _ []string) error {
 	restoreStdLog := installTUIStdLogSink()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+
+	// Optional pprof endpoint for diagnosing memory/CPU at idle. Bind
+	// to localhost only so this never accidentally exposes profiling
+	// to the network. Profile heap with:
+	//   go tool pprof -http=: http://127.0.0.1:6060/debug/pprof/heap
+	if addr := strings.TrimSpace(os.Getenv("SYLK_PPROF")); addr != "" {
+		if addr == "1" || addr == "true" {
+			addr = "127.0.0.1:6060"
+		}
+		go func() {
+			slog.Info("pprof: listening", "addr", addr)
+			if err := http.ListenAndServe(addr, nil); err != nil {
+				slog.Warn("pprof: listen failed", "addr", addr, "error", err)
+			}
+		}()
+	}
 
 	// Resolve project root early so the parallel bootstrap can initialize
 	// git resources concurrently with agent container creation.

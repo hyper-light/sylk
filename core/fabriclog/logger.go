@@ -110,9 +110,18 @@ type FabricLoggerConfig struct {
 
 // Defaults chosen for a typical multi-agent session. Tuned so
 // instrumentation cost stays well under 1% of total throughput.
+//
+// defaultRecentCap derivation: cache exists to join publish→consume
+// records by ActivityID. Consume happens within milliseconds of
+// publish in the steady state (subscribers run on the dispatch
+// goroutine), so the meaningful in-flight window is small. 1024
+// entries covers worst-case spikes amply while bounding the
+// per-entry FullActivity copy (~1 KiB × 1024 = ~1 MiB resident vs.
+// the prior 16 MiB at 16384). Larger sessions that need longer
+// publish→consume joins can override via FabricLoggerConfig.
 const (
 	defaultBufferSize       = 4096
-	defaultRecentCap        = 16384
+	defaultRecentCap        = 1024
 	defaultDropReportEvery  = 1024
 	maxReturnedIDsPerRead   = 128
 	maxActivityPayloadBytes = 64 * 1024

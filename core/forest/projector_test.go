@@ -394,26 +394,18 @@ func TestProjector_AppendSeqUnsetOnCommitFailure(t *testing.T) {
 }
 
 // TestProjector_WaitForBranchSeqIsEventDriven asserts that
-// WaitForBranchSeq returns within a budget tighter than the legacy
-// 250ms poll interval — proving the wake is event-driven via the
-// seq notifier rather than wall-clock polling.
-//
-// The event is appended AFTER the wait starts. If the implementation
-// were polling, the wait would resolve at the next poll tick (>=
-// projectorPollInterval = 250ms). Event-driven, it should resolve
-// much faster — we use 100ms as a generous bound that's well under
-// the poll interval but loose enough to absorb scheduler jitter on
-// loaded test runners.
+// WaitForBranchSeq returns within a tight budget — proving the wake
+// is event-driven via the seq notifier rather than wall-clock
+// polling. The projector now has no idle poll timer at all (the
+// renew tick at 10s is the only wall-clock backstop), so 100ms is a
+// generous bound that proves event delivery rather than periodic
+// poll resolution.
 func TestProjector_WaitForBranchSeqIsEventDriven(t *testing.T) {
 	forest, _ := newAsyncTestForest(t)
 	ctx := context.Background()
 
 	const eventDispatchDelay = 30 * time.Millisecond
 	const tightBudget = 100 * time.Millisecond
-	if tightBudget >= projectorPollInterval {
-		t.Fatalf("budget %s is not tighter than poll %s — test cannot prove event-driven semantics",
-			tightBudget, projectorPollInterval)
-	}
 
 	// Append once to learn the next seq the new event will get.
 	primer := &Event{

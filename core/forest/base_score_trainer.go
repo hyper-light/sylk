@@ -46,10 +46,18 @@ func (m *MemoryForest) startBaseScoreTrainer() {
 	}()
 }
 
-// runBaseScoreTrainerLoop drives training under lease coordination.
-// Drain-then-sleep: a successful training cycle that wrote a model
-// re-loops immediately (in case more examples accumulated during
-// training); idle cycles sleep until next interval.
+// runBaseScoreTrainerLoop drives training under lease coordination
+// on a time-based cadence (m.baseScoreTrainInterval, default 1h).
+// Always sleeps the interval after a cycle — training is bounded by
+// wall-clock not queue depth, because training examples are read,
+// not consumed (a cycle that returns 606 examples will return the
+// same 606 next cycle, so a "drain" loop would spin forever).
+//
+// Newly-arrived examples are picked up on the next interval — there
+// is no value in re-training within seconds of the previous cycle:
+// the SGD result over the same data is deterministic up to the small
+// stochastic component, and the model store rejects non-improving
+// candidates anyway.
 func (m *MemoryForest) runBaseScoreTrainerLoop() {
 	for {
 		if m.shouldStopProjector() {
@@ -71,14 +79,10 @@ func (m *MemoryForest) runBaseScoreTrainerLoop() {
 			continue
 		}
 
-		processed, err := m.runBaseScoreTrainOnce(m.runCtx)
-		if err != nil {
+		if _, err := m.runBaseScoreTrainOnce(m.runCtx); err != nil {
 			slog.Warn("forest_base_score_trainer_failed",
 				"err", err.Error())
 			m.recordBaseScoreTrainerArtifact(err)
-		}
-		if processed > 0 {
-			continue
 		}
 		if !m.sleepProjector(m.baseScoreTrainInterval) {
 			return

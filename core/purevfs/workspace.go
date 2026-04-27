@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/benbjohnson/immutable"
 )
 
 var (
@@ -52,11 +54,24 @@ type JournalEntry struct {
 	Timestamp     time.Time
 }
 
+// Snapshot is one immutable point-in-time view of the workspace.
+//
+// Inodes is a persistent hash-array-mapped trie (HAMT) keyed by inode
+// ID. It is shared structurally across snapshots: a mutation
+// produces a new *immutable.Map that reuses every unchanged trie
+// node from the parent. With S retained snapshots and N inodes,
+// total memory is O(N + S × log N) — versus the O(N × S) cost of
+// the previous full-clone-per-mutation design that pinned hundreds
+// of MiB of duplicated inode tables in heap.
+//
+// All mutators MUST treat Inodes as immutable and reassign with
+// Set/Delete. Direct map-style writes are impossible (the type is
+// not a map) so the old `newInodes[id] = …` shape will not compile.
 type Snapshot struct {
 	ID        SnapshotID
 	Parent    SnapshotID
 	Root      *treeNode
-	Inodes    map[uint64]*Inode
+	Inodes    *immutable.Map[uint64, *Inode]
 	CreatedAt time.Time
 	Reason    string
 	JournalLo uint64
@@ -139,7 +154,7 @@ func NewWorkspace(store *ChunkStore, reader RealFileReader) *Workspace {
 	initial := &Snapshot{
 		ID:        1,
 		Root:      root,
-		Inodes:    map[uint64]*Inode{1: rootInode},
+		Inodes:    immutable.NewMap[uint64, *Inode](nil).Set(1, rootInode),
 		CreatedAt: now,
 		Reason:    "workspace init",
 	}
@@ -321,7 +336,7 @@ func (w *Workspace) ListDir(snapshot SnapshotID, dirPath string) ([]EntryInfo, e
 	root := cleanVFSPath(dirPath)
 	for _, name := range names {
 		child := node.Children[name]
-		childInode := snap.Inodes[child.Inode]
+		childInode, _ := snap.Inodes.Get(child.Inode)
 		out = append(out, buildEntryInfo(snapshot, path.Join(root, name), name, child, childInode))
 	}
 	return out, nil
@@ -355,17 +370,17 @@ func (w *Workspace) Mkdir(branch, dirPath string, mode fs.FileMode) (SnapshotID,
 
 		newInodeID := w.nextInodeLocked()
 		now := time.Now().UTC()
-		newInodes := cloneInodeTable(snap.Inodes)
-		newInodes[newInodeID] = &Inode{
-			ID:      newInodeID,
-			Kind:    EntryDir,
-			Mode:    (mode & fs.ModePerm) | fs.ModeDir,
-			ModTime: now,
-			Nlink:   1,
-		}
 		mutParent := parentInode.Clone()
 		mutParent.ModTime = now
-		newInodes[parentNode.Inode] = mutParent
+		newInodes := snap.Inodes.
+			Set(newInodeID, &Inode{
+				ID:      newInodeID,
+				Kind:    EntryDir,
+				Mode:    (mode & fs.ModePerm) | fs.ModeDir,
+				ModTime: now,
+				Nlink:   1,
+			}).
+			Set(parentNode.Inode, mutParent)
 
 		newRoot, clonedParent, err := clonePathTo(snap.Root, splitVFSPath(parentPath))
 		if err != nil {
@@ -445,7 +460,10 @@ func (w *Workspace) Delete(branch, filePath string) (SnapshotID, error) {
 		if !ok {
 			return nil, 0, ErrPathNotFound
 		}
-		childInode := snap.Inodes[child.Inode]
+		childInode, _ := snap.Inodes.Get(child.Inode)
+		if childInode == nil {
+			return nil, 0, ErrPathNotFound
+		}
 		if childInode.Kind == EntryDir && len(child.Children) > 0 {
 			return nil, 0, ErrDirectoryNotEmpty
 		}
@@ -457,18 +475,17 @@ func (w *Workspace) Delete(branch, filePath string) (SnapshotID, error) {
 		delete(clonedParent.Children, name)
 
 		now := time.Now().UTC()
-		newInodes := cloneInodeTable(snap.Inodes)
 		parentUpdated := parentInode.Clone()
 		parentUpdated.ModTime = now
-		newInodes[parentNode.Inode] = parentUpdated
+		newInodes := snap.Inodes.Set(parentNode.Inode, parentUpdated)
 
 		if childInode.Nlink <= 1 {
-			delete(newInodes, child.Inode)
+			newInodes = newInodes.Delete(child.Inode)
 		} else {
 			updated := childInode.Clone()
 			updated.Nlink--
 			updated.ModTime = now
-			newInodes[child.Inode] = updated
+			newInodes = newInodes.Set(child.Inode, updated)
 		}
 
 		return w.finalizeSnapshotLocked(snap, newRoot, newInodes, "delete "+target), child.Inode, nil
@@ -507,7 +524,10 @@ func (w *Workspace) Rename(branch, oldPath, newPath string) (SnapshotID, error) 
 	if !ok {
 		return 0, ErrPathNotFound
 	}
-	srcInode := snap.Inodes[srcNode.Inode]
+	srcInode, _ := snap.Inodes.Get(srcNode.Inode)
+	if srcInode == nil {
+		return 0, ErrPathNotFound
+	}
 
 	newParentNode, newParentInode, err := w.resolveLocked(snap, newParentPath)
 	if err != nil {
@@ -520,17 +540,16 @@ func (w *Workspace) Rename(branch, oldPath, newPath string) (SnapshotID, error) 
 		return 0, ErrInvalidPath
 	}
 
-	newInodes := cloneInodeTable(snap.Inodes)
 	now := time.Now().UTC()
 	parentUpdated := oldParentInode.Clone()
 	parentUpdated.ModTime = now
-	newInodes[oldParentNode.Inode] = parentUpdated
+	newInodes := snap.Inodes.Set(oldParentNode.Inode, parentUpdated)
 	if oldParentNode.Inode != newParentNode.Inode {
 		dstParent := newParentInode.Clone()
 		dstParent.ModTime = now
-		newInodes[newParentNode.Inode] = dstParent
+		newInodes = newInodes.Set(newParentNode.Inode, dstParent)
 	} else {
-		newInodes[newParentNode.Inode] = parentUpdated
+		newInodes = newInodes.Set(newParentNode.Inode, parentUpdated)
 	}
 
 	newRoot, clonedOldParent, err := clonePathTo(snap.Root, splitVFSPath(oldParentPath))
@@ -545,17 +564,20 @@ func (w *Workspace) Rename(branch, oldPath, newPath string) (SnapshotID, error) 
 	}
 
 	if existing, exists := newParentNode.Children[newName]; exists {
-		existingInode := snap.Inodes[existing.Inode]
+		existingInode, _ := snap.Inodes.Get(existing.Inode)
+		if existingInode == nil {
+			return 0, ErrPathNotFound
+		}
 		if existingInode.Kind == EntryDir && len(existing.Children) > 0 {
 			return 0, ErrDirectoryNotEmpty
 		}
 		if existingInode.Nlink <= 1 {
-			delete(newInodes, existing.Inode)
+			newInodes = newInodes.Delete(existing.Inode)
 		} else {
 			updated := existingInode.Clone()
 			updated.Nlink--
 			updated.ModTime = now
-			newInodes[existing.Inode] = updated
+			newInodes = newInodes.Set(existing.Inode, updated)
 		}
 	}
 
@@ -592,14 +614,14 @@ func (w *Workspace) Link(branch, existingPath, newPath string) (SnapshotID, erro
 		}
 
 		now := time.Now().UTC()
-		newInodes := cloneInodeTable(snap.Inodes)
 		updated := srcInode.Clone()
 		updated.Nlink++
 		updated.ModTime = now
-		newInodes[srcNode.Inode] = updated
 		parentUpdated := parentInode.Clone()
 		parentUpdated.ModTime = now
-		newInodes[parentNode.Inode] = parentUpdated
+		newInodes := snap.Inodes.
+			Set(srcNode.Inode, updated).
+			Set(parentNode.Inode, parentUpdated)
 
 		newRoot, clonedParent, err := clonePathTo(snap.Root, splitVFSPath(parentPath))
 		if err != nil {
@@ -624,18 +646,18 @@ func (w *Workspace) Symlink(branch, linkPath, target string, mode fs.FileMode) (
 		}
 		now := time.Now().UTC()
 		newInodeID := w.nextInodeLocked()
-		newInodes := cloneInodeTable(snap.Inodes)
-		newInodes[newInodeID] = &Inode{
-			ID:         newInodeID,
-			Kind:       EntrySymlink,
-			Mode:       (mode & fs.ModePerm) | fs.ModeSymlink,
-			ModTime:    now,
-			Nlink:      1,
-			LinkTarget: target,
-		}
 		parentUpdated := parentInode.Clone()
 		parentUpdated.ModTime = now
-		newInodes[parentNode.Inode] = parentUpdated
+		newInodes := snap.Inodes.
+			Set(newInodeID, &Inode{
+				ID:         newInodeID,
+				Kind:       EntrySymlink,
+				Mode:       (mode & fs.ModePerm) | fs.ModeSymlink,
+				ModTime:    now,
+				Nlink:      1,
+				LinkTarget: target,
+			}).
+			Set(parentNode.Inode, parentUpdated)
 
 		newRoot, clonedParent, err := clonePathTo(snap.Root, splitVFSPath(parentPath))
 		if err != nil {
@@ -852,13 +874,15 @@ func (w *Workspace) writeBodyOnSnapshotLocked(snap *Snapshot, filePath string, b
 		return nil, 0, ErrNotDirectory
 	}
 	now := time.Now().UTC()
-	newInodes := cloneInodeTable(snap.Inodes)
 	newRoot, clonedParent, err := clonePathTo(snap.Root, splitVFSPath(parentPath))
 	if err != nil {
 		return nil, 0, err
 	}
 	if existing, exists := parentNode.Children[name]; exists {
-		inode := snap.Inodes[existing.Inode]
+		inode, _ := snap.Inodes.Get(existing.Inode)
+		if inode == nil {
+			return nil, 0, ErrPathNotFound
+		}
 		if inode.Kind != EntryFile {
 			return nil, 0, ErrNotFile
 		}
@@ -866,29 +890,31 @@ func (w *Workspace) writeBodyOnSnapshotLocked(snap *Snapshot, filePath string, b
 		updated.Mode = mode & fs.ModePerm
 		updated.ModTime = now
 		updated.Body = body.Clone()
-		newInodes[existing.Inode] = updated
 		parentUpdated := parentInode.Clone()
 		parentUpdated.ModTime = now
-		newInodes[parentNode.Inode] = parentUpdated
+		newInodes := snap.Inodes.
+			Set(existing.Inode, updated).
+			Set(parentNode.Inode, parentUpdated)
 		return w.finalizeSnapshotLocked(snap, newRoot, newInodes, "write "+filePath), existing.Inode, nil
 	}
 	newInodeID := w.nextInodeLocked()
-	newInodes[newInodeID] = &Inode{
-		ID:      newInodeID,
-		Kind:    EntryFile,
-		Mode:    mode & fs.ModePerm,
-		ModTime: now,
-		Nlink:   1,
-		Body:    body.Clone(),
-	}
 	parentUpdated := parentInode.Clone()
 	parentUpdated.ModTime = now
-	newInodes[parentNode.Inode] = parentUpdated
+	newInodes := snap.Inodes.
+		Set(newInodeID, &Inode{
+			ID:      newInodeID,
+			Kind:    EntryFile,
+			Mode:    mode & fs.ModePerm,
+			ModTime: now,
+			Nlink:   1,
+			Body:    body.Clone(),
+		}).
+		Set(parentNode.Inode, parentUpdated)
 	clonedParent.Children[name] = &treeNode{Inode: newInodeID}
 	return w.finalizeSnapshotLocked(snap, newRoot, newInodes, "create "+filePath), newInodeID, nil
 }
 
-func (w *Workspace) finalizeSnapshotLocked(parent *Snapshot, root *treeNode, inodes map[uint64]*Inode, reason string) *Snapshot {
+func (w *Workspace) finalizeSnapshotLocked(parent *Snapshot, root *treeNode, inodes *immutable.Map[uint64, *Inode], reason string) *Snapshot {
 	w.nextSnapshot++
 	id := w.nextSnapshot
 	snap := &Snapshot{
@@ -957,7 +983,7 @@ func (w *Workspace) resolveLocked(snap *Snapshot, filePath string) (*treeNode, *
 	if err != nil {
 		return nil, nil, err
 	}
-	inode := snap.Inodes[node.Inode]
+	inode, _ := snap.Inodes.Get(node.Inode)
 	if inode == nil {
 		return nil, nil, ErrPathNotFound
 	}
@@ -989,14 +1015,6 @@ func buildEntryInfo(snapshot SnapshotID, filePath, name string, _ *treeNode, ino
 		Nlink:      inode.Nlink,
 		LinkTarget: inode.LinkTarget,
 	}
-}
-
-func cloneInodeTable(src map[uint64]*Inode) map[uint64]*Inode {
-	out := make(map[uint64]*Inode, len(src))
-	for id, inode := range src {
-		out[id] = inode
-	}
-	return out
 }
 
 func cloneTreeNode(node *treeNode) *treeNode {
@@ -1093,7 +1111,7 @@ func resolveForComparison(snap *Snapshot, filePath string) (*treeNode, *Inode, e
 	if err != nil {
 		return nil, nil, err
 	}
-	inode := snap.Inodes[node.Inode]
+	inode, _ := snap.Inodes.Get(node.Inode)
 	if inode == nil {
 		return nil, nil, ErrPathNotFound
 	}

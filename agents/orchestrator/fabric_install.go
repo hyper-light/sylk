@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"log/slog"
+	"path/filepath"
 	"sync/atomic"
 
 	"github.com/adalundhe/sylk/core/activity"
@@ -76,10 +77,16 @@ func installActivityFabric(store *Store, sessionID string, sd *sylkdir.SylkDir) 
 	}
 	sink := activitystore.NewSubscribingSink(dual)
 
-	// Bleve subscriber: in-memory by default. Disk-backed BleveSubscriber
-	// at a known path is a follow-up wiring tied to the existing Bleve
-	// index manager — left at in-memory for the first ship.
-	if bleve, err := activitystore.NewBleveSubscriber(); err == nil {
+	// Bleve subscriber: prefer disk-backed at a session-scoped path so
+	// the index is paged from disk instead of held entirely in heap.
+	// In-memory bleve grows monotonically with every Medium/Coarse
+	// activity (claims, testaments, validations, board phases) — at
+	// scale that's hundreds of MB of resident state for an
+	// observational index whose hot working set is small.
+	//
+	// Falls back to the in-memory variant only when sd is nil (test
+	// fixtures and bootstrap paths without a configured SylkDir).
+	if bleve, err := newFabricBleveSubscriber(sd, sessionID); err == nil {
 		sink.Subscribe(bleve)
 	} else {
 		slog.Warn("fabric: bleve subscriber unavailable", "error", err)
@@ -160,6 +167,19 @@ func installActivityFabric(store *Store, sessionID string, sd *sylkdir.SylkDir) 
 	activity.SetDefaultSink(finalSink)
 	activity.SetDefaultSource(finalSource)
 	slog.Info("fabric: installed", "session_id", sessionID)
+}
+
+// newFabricBleveSubscriber returns a disk-backed BleveSubscriber when
+// sd is configured, else falls back to the in-memory variant for
+// tests/bootstrap. Disk-backed indexes live alongside the fabric
+// observability log under .sylk/sessions/{sessionID}/fabric/bleve so
+// they share the session's lifecycle and cleanup.
+func newFabricBleveSubscriber(sd *sylkdir.SylkDir, sessionID string) (*activitystore.BleveSubscriber, error) {
+	if sd == nil {
+		return activitystore.NewBleveSubscriber()
+	}
+	path := filepath.Join(sd.SessionFabricPath(sessionID), "bleve")
+	return activitystore.NewBleveSubscriberAtPath(path)
 }
 
 // uninstallFabricObservability drains and closes the installed

@@ -67,6 +67,7 @@ require (
 	github.com/RoaringBitmap/roaring/v2 v2.4.5 // indirect
 	github.com/arnodel/strftime v0.1.6 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
+	github.com/benbjohnson/immutable v0.4.3 // indirect
 	github.com/bits-and-blooms/bitset v1.22.0 // indirect
 	github.com/blevesearch/bleve_index_api v1.2.11 // indirect
 	github.com/blevesearch/geo v0.2.4 // indirect
