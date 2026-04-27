@@ -2090,6 +2090,7 @@ func registerArchivalistAgentCreator(deps onDemandAgentCreatorDeps) {
 			return nil, err
 		}
 		a.SetProvider(wrapped)
+		a.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution))
 		a.SetKnowledgeStore(deps.knowledgeStore)
 		a.SetKnowledgeBackend(deps.knowledgeBackend)
 		if startErr := a.Start(deps.bus); startErr != nil {

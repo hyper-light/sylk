@@ -47,20 +47,39 @@ type DualTierSink struct {
 	ring *ringBuffer
 }
 
+// recentEntryCostBytes is the per-entry cost charged to the recent
+// cache. Set() in Append uses the same value, so MaxCost / this == max
+// items the cache will hold. AgentActivity is a heterogeneous struct
+// (8 strings averaging ~30B, time.Time, optional Payload/Evidence/
+// CausalChain) — empirical avg sits ~700–1100 B with skew toward larger
+// entries when Evidence/CausalChain are populated. A flat 1 KiB matches
+// the upper-typical and avoids per-Set marshalling.
+const recentEntryCostBytes = 1024
+
+// recentRingMultiplier sizes the recent cache as a multiple of
+// RingCapacity. The recent cache is the hit path for causal-trace
+// walks (Caused/Resolves chains). Walks predominantly stay within the
+// ring window (Atomic+Fine), but Medium/Coarse parents may live just
+// outside it. 2× covers cross-resolution walks without hoarding stale
+// IDs that TinyLFU would prefer to evict anyway.
+const recentRingMultiplier = 2
+
 // DualTierSinkConfig configures the dual-tier sink. Defaults are
-// reasonable for a single-user development workload; production tuning
-// belongs in cmd/tui.go.
+// derived from RingCapacity (the natural workload bound) — see
+// DefaultDualTierSinkConfig for the derivation chain.
 type DualTierSinkConfig struct {
 	// RecentCacheItems is the maximum number of activities held in
-	// the recent-by-ID cache. Defaults to 10000.
+	// the recent-by-ID cache. Default = RingCapacity × recentRingMultiplier.
 	RecentCacheItems int
 
 	// RecentCacheBytes bounds the cache by approximate memory size.
-	// Defaults to 32 MiB.
+	// Default = RecentCacheItems × recentEntryCostBytes.
 	RecentCacheBytes int64
 
 	// RingCapacity is the maximum number of Atomic + Fine activities
-	// retained in the rolling-window ring buffer. Defaults to 4096.
+	// retained in the rolling-window ring buffer. Defaults to 4096
+	// (covers ~5min @ ~13 activities/sec sustained, the upper-typical
+	// emission rate observed in single-session traces).
 	RingCapacity int
 
 	// RingMaxAge bounds how far back the ring buffer retains entries.
@@ -68,12 +87,16 @@ type DualTierSinkConfig struct {
 	RingMaxAge time.Duration
 }
 
-// DefaultDualTierSinkConfig returns conservative defaults.
+// DefaultDualTierSinkConfig returns derived defaults: every constant is
+// tied to a physical anchor (ring capacity, per-entry cost) so changing
+// one input propagates through the cache sizing without re-tuning.
 func DefaultDualTierSinkConfig() DualTierSinkConfig {
+	const defaultRingCapacity = 4096
+	items := defaultRingCapacity * recentRingMultiplier
 	return DualTierSinkConfig{
-		RecentCacheItems: 10000,
-		RecentCacheBytes: 32 * 1024 * 1024,
-		RingCapacity:     4096,
+		RecentCacheItems: items,
+		RecentCacheBytes: int64(items) * recentEntryCostBytes,
+		RingCapacity:     defaultRingCapacity,
 		RingMaxAge:       5 * time.Minute,
 	}
 }
@@ -100,17 +123,17 @@ func NewDualTierSink(durable *SQLiteStore, cfg DualTierSinkConfig) (*DualTierSin
 }
 
 func normalizeDualTierConfig(cfg DualTierSinkConfig) DualTierSinkConfig {
-	if cfg.RecentCacheItems <= 0 {
-		cfg.RecentCacheItems = 10000
-	}
-	if cfg.RecentCacheBytes <= 0 {
-		cfg.RecentCacheBytes = 32 * 1024 * 1024
-	}
 	if cfg.RingCapacity <= 0 {
 		cfg.RingCapacity = 4096
 	}
 	if cfg.RingMaxAge <= 0 {
 		cfg.RingMaxAge = 5 * time.Minute
+	}
+	if cfg.RecentCacheItems <= 0 {
+		cfg.RecentCacheItems = cfg.RingCapacity * recentRingMultiplier
+	}
+	if cfg.RecentCacheBytes <= 0 {
+		cfg.RecentCacheBytes = int64(cfg.RecentCacheItems) * recentEntryCostBytes
 	}
 	return cfg
 }
@@ -124,10 +147,10 @@ func (s *DualTierSink) Append(ctx context.Context, a AgentActivity) {
 	// walks see the activity even if it's still in the durable
 	// write-back pipeline.
 	if s.recent != nil {
-		// Cost is approximate — counted in bytes. A flat 1 KiB
-		// estimate is good enough for in-process bounding; precise
-		// per-activity sizing is not worth the marshalling cost.
-		s.recent.Set(string(a.ID), a, 1024)
+		// Cost matches the per-entry sizing constant used to derive
+		// MaxCost in DefaultDualTierSinkConfig — keep the two in sync
+		// so the cache holds exactly the items the bound advertises.
+		s.recent.Set(string(a.ID), a, recentEntryCostBytes)
 	}
 
 	// Atomic + Fine into the rolling ring buffer.

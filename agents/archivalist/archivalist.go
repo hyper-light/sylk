@@ -124,6 +124,11 @@ type Archivalist struct {
 	tools         *toolruntime.Runtime
 	toolDefsDirty bool
 
+	// Provider refresher for re-creating the gateway-wrapped LLM
+	// provider after credential refresh or HeavyweightReleasable
+	// rebuild. Wired by cmd/tui.go after construction.
+	refresher container.ProviderRefresher
+
 	defaultSessionID string
 	sessionStores    map[string]*SessionStore
 	crossSession     *CrossSessionIndex
@@ -3532,6 +3537,36 @@ func (a *Archivalist) SwapModel(_ context.Context, modelID string, provider prov
 	defer a.runMu.Unlock()
 	a.provider = provider
 	a.config.Model = modelID
+	return nil
+}
+
+// SetProviderRefresher stores a callback that creates a fresh provider
+// for the current model and auth method. Set by cmd/tui.go at bootstrap.
+func (a *Archivalist) SetProviderRefresher(fn container.ProviderRefresher) {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	a.refresher = fn
+}
+
+// ProviderType implements container.AuthRefreshable.
+func (a *Archivalist) ProviderType() string {
+	return string(container.ProviderForModel(a.CurrentModel()))
+}
+
+// RefreshProvider implements container.AuthRefreshable.
+func (a *Archivalist) RefreshProvider(ctx context.Context, authMethod string) error {
+	a.runMu.RLock()
+	fn := a.refresher
+	a.runMu.RUnlock()
+	if fn == nil {
+		return nil
+	}
+	p, err := fn(ctx, a.CurrentModel(), authMethod)
+	if err != nil {
+		return fmt.Errorf("archivalist refresh provider: %w", err)
+	}
+	a.SetProvider(p)
+	a.logger.Info("provider refreshed", "model", a.CurrentModel(), "auth_method", authMethod)
 	return nil
 }
 

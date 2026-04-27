@@ -290,6 +290,12 @@ func (ac *ActivationController) EnsureActive(ctx context.Context, agentType stri
 	// Post activation claim (async, best-effort).
 	ac.postActivationSuccess(agentType, c)
 
+	// Wake the idle monitor: a new entry is now Hot with a fresh
+	// short-threshold countdown the previous scan didn't account for.
+	if ac.idle != nil {
+		ac.idle.Signal()
+	}
+
 	return c, nil
 }
 
@@ -499,6 +505,28 @@ func (ac *ActivationController) promoteFromWarm(ctx context.Context, entry *Acti
 		return ac.promoteFromCold(ctx, entry)
 	}
 
+	// Rebuild heavyweight state if the agent opted into tiered memory.
+	// On rebuild failure the only safe recovery is a cold start: the
+	// agent's heavy allocations are in an indeterminate state and a
+	// resumed container can't be trusted to serve requests.
+	if r, ok := agentAsReleasable(c); ok {
+		if err := r.RebuildHeavyweight(ctx); err != nil {
+			ac.logger.Warn("heavyweight rebuild failed; falling back to cold start",
+				"agent_type", entry.AgentType,
+				"error", err,
+			)
+			if removeErr := ac.stopAndRemove(context.Background(), c); removeErr != nil {
+				ac.logger.Warn("warm container cleanup failed after rebuild error",
+					"agent_type", entry.AgentType,
+					"error", removeErr,
+				)
+			}
+			entry.Container.Store(nil)
+			entry.StoreTier(TierCold)
+			return ac.promoteFromCold(ctx, entry)
+		}
+	}
+
 	entry.Container.Store(c)
 	entry.StoreTier(TierHot)
 	ac.metrics.WarmStarts.Add(1)
@@ -640,6 +668,12 @@ func (ac *ActivationController) demoteHotToWarm(ctx context.Context, entry *Acti
 		return nil
 	}
 
+	// Release heavyweight state (LLM provider, tool runtime, skill
+	// registries) before pause. The agent's identity, conversation
+	// history, and session state are retained — only allocations the
+	// agent can deterministically rebuild on promotion are dropped.
+	releaseHeavyweightForDemote(ac.logger, entry.AgentType, c)
+
 	if err := ac.runtime.PauseContainer(ctx, c); err != nil {
 		return err
 	}
@@ -653,6 +687,37 @@ func (ac *ActivationController) demoteHotToWarm(ctx context.Context, entry *Acti
 		ac.teardownContainerAsync(ctx, evicted)
 	}
 	return nil
+}
+
+// releaseHeavyweightForDemote invokes ReleaseHeavyweight on agents
+// that opt into tiered memory. Errors are logged but not propagated:
+// a failed release falls through to a normal pause with state intact,
+// which is correct behaviour at higher memory cost.
+func releaseHeavyweightForDemote(logger *slog.Logger, agentType string, c *container.Container) {
+	r, ok := agentAsReleasable(c)
+	if !ok {
+		return
+	}
+	if err := r.ReleaseHeavyweight(); err != nil {
+		logger.Warn("heavyweight release failed; demoting with state intact",
+			"agent_type", agentType,
+			"error", err,
+		)
+	}
+}
+
+// agentAsReleasable returns the container's agent typed as
+// HeavyweightReleasable when it implements the interface.
+func agentAsReleasable(c *container.Container) (container.HeavyweightReleasable, bool) {
+	if c == nil {
+		return nil, false
+	}
+	agent := c.Agent()
+	if agent == nil {
+		return nil, false
+	}
+	r, ok := agent.(container.HeavyweightReleasable)
+	return r, ok
 }
 
 // AcquireRequestGuard increments the active-request counter for the given
@@ -842,6 +907,11 @@ func (ac *ActivationController) prepareWarmEntry(ctx context.Context, entry *Act
 		}
 		return err
 	}
+	// Pre-warmed agents go Create→Start→Pause without serving any
+	// request. Release heavyweight state between Start and Pause so
+	// the warm pool holds only identity + conversation memory until
+	// the agent is actually promoted.
+	releaseHeavyweightForDemote(ac.logger, entry.AgentType, c)
 	if err := ac.runtime.PauseContainer(ctx, c); err != nil {
 		if stopErr := ac.stopAndRemove(ctx, c); stopErr != nil {
 			ac.logger.Warn("warm preparation cleanup failed after pause error",
@@ -981,6 +1051,12 @@ func (ac *ActivationController) AdoptContainer(agentType string, c *container.Co
 	entry.StoreTier(TierHot)
 	entry.TouchActivity()
 	ac.notifyActivated(c)
+	// Adopted Hot entry needs the idle monitor to recompute its
+	// next-fire so the (now short-threshold) entry doesn't sit
+	// past its threshold waiting for the previous longer poll.
+	if ac.idle != nil {
+		ac.idle.Signal()
+	}
 	return c, nil
 }
 
@@ -998,8 +1074,6 @@ func (ac *ActivationController) allEntries() []*ActivationEntry {
 // RegisterPolicy adds or updates a policy for an agent type at runtime.
 func (ac *ActivationController) RegisterPolicy(policy *ActivationPolicy) {
 	ac.mu.Lock()
-	defer ac.mu.Unlock()
-
 	entry, ok := ac.entries[policy.AgentType]
 	if !ok {
 		entry = &ActivationEntry{
@@ -1008,9 +1082,20 @@ func (ac *ActivationController) RegisterPolicy(policy *ActivationPolicy) {
 			Policy:    policy,
 		}
 		ac.entries[policy.AgentType] = entry
+		ac.mu.Unlock()
+		// New entry — its threshold may be shorter than what the
+		// monitor's current timer is set for. Wake to recompute.
+		if ac.idle != nil {
+			ac.idle.Signal()
+		}
 		return
 	}
 	entry.Policy = policy
+	ac.mu.Unlock()
+	// Threshold may have shortened; recompute.
+	if ac.idle != nil {
+		ac.idle.Signal()
+	}
 }
 
 // specForAgent builds a ContainerSpec for the given agent type.

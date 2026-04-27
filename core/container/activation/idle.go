@@ -10,123 +10,180 @@ import (
 	"github.com/adalundhe/sylk/core/container/pod"
 )
 
-// IdleMonitor periodically scans activation entries and demotes idle
-// agents to lower tiers based on their policy thresholds.
+// idlePollMinDivisor is the recovery-floor divisor applied to
+// PolicyDefaults().IdleToWarm to bound the minimum interval between
+// scans. Derived from the canonical shortest threshold so that a
+// missed Signal() — possible only via a race between StoreTier and
+// the wake channel send — is recovered within at most one
+// (IdleToWarm / 6) window. Anchoring to PolicyDefaults keeps the
+// floor in sync if those defaults change.
+const idlePollMinDivisor = 6
+
+// IdleMonitor schedules tier demotion using adaptive polling: the
+// next timer fire is computed from each entry's remaining
+// time-to-threshold across registered policies. When no entries are
+// demotable the timer relaxes to the longest configured threshold;
+// when an entry is approaching its threshold the timer tightens to
+// that exact moment.
+//
+// Signal() lets controller state changes (EnsureActive promotion,
+// AdoptContainer, RegisterPolicy, Stop) collapse the timer
+// immediately rather than waiting for the previously-computed fire.
+// The wake channel is cap-1 (coalescing): multiple Signals between
+// scans collapse to one.
+//
+// The previous fixed-period (shortest/6) scanner ran ~12×/min even
+// when every entry was at MinTier and nothing could be demoted. The
+// adaptive design polls only when work is actually due: a fully-idle
+// system polls once per maxPoll (default IdleToCold = 30 min),
+// returning idle CPU to baseline.
 type IdleMonitor struct {
 	controller *ActivationController
 	scope      *concurrency.GoroutineScope
 	logger     *slog.Logger
-	scanPeriod time.Duration
+	minPoll    time.Duration
+	maxPoll    time.Duration
+	wake       chan struct{}
 	stopped    atomic.Bool
 }
 
-// NewIdleMonitor creates a monitor that will scan at the given period.
-// A zero scanPeriod defaults to 1/6 of the shortest non-zero idle
-// threshold across all policies, ensuring demotion latency is bounded
-// to at most ~17% of the configured threshold. Falls back to 5s if
-// no policies have idle thresholds set.
-func NewIdleMonitor(controller *ActivationController, scope *concurrency.GoroutineScope, scanPeriod time.Duration) *IdleMonitor {
-	if scanPeriod <= 0 {
-		scanPeriod = deriveScanPeriod(controller)
-	}
+// NewIdleMonitor constructs a monitor with adaptive polling bounds
+// derived from PolicyDefaults — minPoll = IdleToWarm / idlePollMinDivisor
+// (recovery floor for missed Signals), maxPoll = IdleToCold (longest
+// threshold; no eligible demotion can require attention later than
+// this when the system is fully idle).
+//
+// The scanPeriod parameter is retained for backward signature
+// compatibility but is now ignored; period is computed per scan from
+// observed entry state instead of being a fixed cadence.
+func NewIdleMonitor(controller *ActivationController, scope *concurrency.GoroutineScope, _ time.Duration) *IdleMonitor {
+	defaults := DefaultPolicyDefaults()
 	return &IdleMonitor{
 		controller: controller,
 		scope:      scope,
 		logger:     controller.logger,
-		scanPeriod: scanPeriod,
+		minPoll:    defaults.IdleToWarm / idlePollMinDivisor,
+		maxPoll:    defaults.IdleToCold,
+		wake:       make(chan struct{}, 1),
 	}
 }
 
-// deriveScanPeriod finds the shortest idle threshold across all
-// registered policies and returns 1/6 of it. This ensures we detect
-// idle entries within one scan period after they cross the threshold.
-func deriveScanPeriod(controller *ActivationController) time.Duration {
-	entries := controller.allEntries()
-	var shortest time.Duration
-	for _, entry := range entries {
-		for _, tier := range []ActivationTier{TierHot, TierWarm, TierCool} {
-			threshold := entry.Policy.IdleThreshold(tier)
-			if threshold > 0 && (shortest == 0 || threshold < shortest) {
-				shortest = threshold
-			}
-		}
+// Signal coalescingly nudges the loop to scan now. Safe from any
+// goroutine; never blocks (cap-1 channel + non-blocking send absorbs
+// concurrent signals between scans).
+func (im *IdleMonitor) Signal() {
+	if im == nil {
+		return
 	}
-	if shortest <= 0 {
-		return 5 * time.Second // fallback when no policies have idle thresholds
+	select {
+	case im.wake <- struct{}{}:
+	default:
 	}
-	// 1/6 of shortest threshold — scan 6× per threshold period.
-	derived := shortest / 6
-	if derived < time.Second {
-		return time.Second // floor at 1s to avoid CPU waste
-	}
-	return derived
 }
 
-// Start launches the idle scan loop as a tracked goroutine.
+// Start launches the loop as a tracked goroutine.
 func (im *IdleMonitor) Start() error {
 	return im.scope.Go("activation-idle-monitor", 0, im.loop)
 }
 
-// Stop signals the idle monitor to exit on the next iteration.
+// Stop signals the monitor to exit on the next iteration. The
+// accompanying Signal() unblocks the loop immediately so it observes
+// the stopped flag without waiting for the timer.
 func (im *IdleMonitor) Stop() {
 	im.stopped.Store(true)
+	im.Signal()
 }
 
 func (im *IdleMonitor) loop(ctx context.Context) error {
-	ticker := time.NewTicker(im.scanPeriod)
-	defer ticker.Stop()
+	timer := time.NewTimer(im.minPoll)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
-			if im.stopped.Load() {
-				return nil
-			}
-			im.scan(ctx)
+		case <-timer.C:
+		case <-im.wake:
+			drainTimer(timer)
 		}
+		if im.stopped.Load() {
+			return nil
+		}
+		next := im.scan(ctx)
+		timer.Reset(im.clampPoll(next))
 	}
 }
 
-func (im *IdleMonitor) scan(ctx context.Context) {
+// drainTimer halts a timer and discards any pending fire so it can
+// be Reset cleanly. Idiomatic guard for the "wake arrived before
+// timer.C" path.
+func drainTimer(t *time.Timer) {
+	if t.Stop() {
+		return
+	}
+	select {
+	case <-t.C:
+	default:
+	}
+}
+
+// scan walks all registered entries: demotes those past threshold
+// and returns the minimum time-to-next-demotion across the rest,
+// used to schedule the next timer fire.
+func (im *IdleMonitor) scan(ctx context.Context) time.Duration {
 	entries := im.controller.allEntries()
+	next := im.maxPoll
 	for _, entry := range entries {
 		if ctx.Err() != nil {
-			return
+			return im.maxPoll
 		}
-		im.evaluateEntry(ctx, entry)
+		remaining := im.evaluateEntry(ctx, entry)
+		if remaining > 0 && remaining < next {
+			next = remaining
+		}
 	}
+	return next
 }
 
-func (im *IdleMonitor) evaluateEntry(ctx context.Context, entry *ActivationEntry) {
+// evaluateEntry processes one entry: demotes when idle threshold has
+// crossed, otherwise returns how long until the entry would become
+// eligible for demotion. Returns maxPoll for entries not subject to
+// demotion (at MinTier, daemon, no threshold), so they don't pull
+// the next-scan target shorter.
+func (im *IdleMonitor) evaluateEntry(ctx context.Context, entry *ActivationEntry) time.Duration {
 	if entry.HasActiveRequests() {
 		entry.TouchActivity()
-		return
+		return im.maxPoll
 	}
 
 	tier := entry.LoadTier()
 	policy := entry.Policy
-
 	if tier <= policy.MinTier {
-		return
+		return im.maxPoll
 	}
 
 	threshold := policy.IdleThreshold(tier)
 	if threshold <= 0 {
-		return
+		return im.maxPoll
 	}
 
 	idle := entry.IdleDuration()
 	if idle < threshold {
-		return
+		return threshold - idle
 	}
 
+	return im.demoteEntry(ctx, entry, tier, policy)
+}
+
+// demoteEntry attempts a one-tier demotion and returns the next
+// recommended poll delay. minPoll on success enables fast cascade
+// re-evaluation; minPoll on error retries soon. maxPoll when the
+// policy disallows the target tier (entry is now stuck).
+func (im *IdleMonitor) demoteEntry(ctx context.Context, entry *ActivationEntry, tier ActivationTier, policy *ActivationPolicy) time.Duration {
 	targetTier := tier - 1
 	if !policy.CanDemoteTo(targetTier) {
-		return
+		return im.maxPoll
 	}
-
 	if err := im.controller.DemoteTo(ctx, entry.AgentType, targetTier); err != nil {
 		im.logger.Warn("idle demotion failed",
 			"agent_type", entry.AgentType,
@@ -134,5 +191,17 @@ func (im *IdleMonitor) evaluateEntry(ctx context.Context, entry *ActivationEntry
 			"target_tier", pod.TierString(targetTier),
 			"error", err,
 		)
+		return im.minPoll
 	}
+	return im.minPoll
+}
+
+func (im *IdleMonitor) clampPoll(d time.Duration) time.Duration {
+	if d < im.minPoll {
+		return im.minPoll
+	}
+	if d > im.maxPoll {
+		return im.maxPoll
+	}
+	return d
 }

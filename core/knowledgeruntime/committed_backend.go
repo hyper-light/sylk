@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/core/fetch"
@@ -19,6 +20,19 @@ import (
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/embedder"
 	bleve "github.com/blevesearch/bleve/v2"
 )
+
+// embedderIdleTTL is how long the loaded embedder model is kept after
+// the last use before being unloaded to recover memory. Anchored to
+// the canonical activation Warm→Cool transition window
+// (PolicyDefaults().IdleToCool = 5 minutes): the embedder is a
+// session-level warm body, and the same idle horizon that signals
+// "the user has stepped away" for agent containers applies here.
+// Reload cost (~100–500 ms model load) is negligible compared to
+// this window.
+//
+// Expressed locally to avoid an import cycle into core/container/activation;
+// keep in sync with PolicyDefaults().IdleToCool if those defaults change.
+const embedderIdleTTL = 5 * time.Minute
 
 // ErrCommittedBackendUnavailable is returned when committed-global retrieval
 // is requested before the committed backend has been initialized.
@@ -214,6 +228,14 @@ type CommittedKnowledgeBackend struct {
 
 	embedderMu sync.Mutex
 	embedder   embedder.Embedder
+	// Idle-unload state for the loaded embedder. embedderRefs counts
+	// in-flight borrows from ensureEmbedder so the timer never closes
+	// a model still in use; lastUsed (UnixNano) records the most
+	// recent borrow or release; idleTimer (guarded by embedderMu)
+	// fires unloadEmbedderIfIdle after embedderIdleTTL of no activity.
+	embedderRefs    atomic.Int32
+	embedderLastUse atomic.Int64
+	embedderIdle    *time.Timer
 }
 
 // NewCommittedKnowledgeBackend creates a committed-global backend rooted at
@@ -434,10 +456,12 @@ func (b *CommittedKnowledgeBackend) upsertJointDocument(ctx context.Context, req
 	_ = session.CloseBleve()
 	session.BleveStore = nil
 
-	ingestEmbedder, ingestErr := b.ensureEmbedder(ctx)
+	ingestEmbedder, releaseEmbedder, ingestErr := b.ensureEmbedder(ctx)
 	if ingestErr != nil {
 		b.logger.Warn("committed ingest: embedder unavailable, proceeding without vectors", "error", ingestErr)
 		ingestEmbedder = nil
+	} else {
+		defer releaseEmbedder()
 	}
 
 	if _, err := canon.Lookup(canonicalKey); err == nil {
@@ -498,6 +522,10 @@ func (b *CommittedKnowledgeBackend) Close() error {
 			}
 		}
 		b.embedderMu.Lock()
+		if b.embedderIdle != nil {
+			b.embedderIdle.Stop()
+			b.embedderIdle = nil
+		}
 		if closer, ok := b.embedder.(io.Closer); ok && closer != nil {
 			if err := closer.Close(); err != nil {
 				errs = append(errs, err)
@@ -516,18 +544,79 @@ func (b *CommittedKnowledgeBackend) currentState() *committedKnowledgeState {
 	return b.state
 }
 
-func (b *CommittedKnowledgeBackend) ensureEmbedder(ctx context.Context) (embedder.Embedder, error) {
+// ensureEmbedder lazily loads the embedder model on first use and
+// returns it along with a release function the caller MUST invoke
+// when done. The release function decrements the borrow count and
+// updates the last-use timestamp; while any borrow is outstanding the
+// idle-timer skips unloading. The returned release is idempotent.
+//
+// On error the returned embedder and release are nil — callers should
+// treat the embedder as unavailable and proceed without vectors.
+func (b *CommittedKnowledgeBackend) ensureEmbedder(ctx context.Context) (embedder.Embedder, func(), error) {
 	b.embedderMu.Lock()
 	defer b.embedderMu.Unlock()
-	if b.embedder != nil {
-		return b.embedder, nil
+
+	if b.embedder == nil {
+		result, err := embedder.NewEmbedder(ctx, embedder.FactoryConfig{})
+		if err != nil {
+			return nil, nil, err
+		}
+		b.embedder = result.Embedder
 	}
-	result, err := embedder.NewEmbedder(ctx, embedder.FactoryConfig{})
-	if err != nil {
-		return nil, err
+
+	b.embedderRefs.Add(1)
+	b.embedderLastUse.Store(time.Now().UnixNano())
+	if b.embedderIdle == nil {
+		b.embedderIdle = time.AfterFunc(embedderIdleTTL, b.unloadEmbedderIfIdle)
+	} else {
+		b.embedderIdle.Reset(embedderIdleTTL)
 	}
-	b.embedder = result.Embedder
-	return b.embedder, nil
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			b.embedderRefs.Add(-1)
+			b.embedderLastUse.Store(time.Now().UnixNano())
+		})
+	}
+	return b.embedder, release, nil
+}
+
+// unloadEmbedderIfIdle is the timer callback that frees the embedder
+// model when no borrows are outstanding and the idle TTL has truly
+// elapsed. Reschedules itself when a borrow is still active (so the
+// timer doesn't tear down an in-flight ingestion) or when the
+// timestamp moved more recently than expected (defensive against the
+// AfterFunc-vs-ensureEmbedder race).
+func (b *CommittedKnowledgeBackend) unloadEmbedderIfIdle() {
+	b.embedderMu.Lock()
+	defer b.embedderMu.Unlock()
+
+	if b.embedderIdle == nil || b.embedder == nil {
+		return
+	}
+	if b.embedderRefs.Load() > 0 {
+		b.embedderIdle.Reset(embedderIdleTTL)
+		return
+	}
+
+	last := b.embedderLastUse.Load()
+	if last > 0 {
+		elapsed := time.Since(time.Unix(0, last))
+		if elapsed < embedderIdleTTL {
+			b.embedderIdle.Reset(embedderIdleTTL - elapsed)
+			return
+		}
+	}
+
+	if closer, ok := b.embedder.(io.Closer); ok {
+		if err := closer.Close(); err != nil {
+			b.logger.Warn("embedder unload failed", "error", err)
+		}
+	}
+	b.embedder = nil
+	b.embedderIdle = nil
+	b.logger.Info("embedder unloaded after idle ttl", "ttl", embedderIdleTTL)
 }
 
 func (b *CommittedKnowledgeBackend) refresh(ctx context.Context, attachedBleve *sylkdir.GlobalVersionBleveStore, externalBleve bool, closeRetired bool) error {

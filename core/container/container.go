@@ -24,6 +24,29 @@ type ContainerAgent interface {
 	Terminate(ctx context.Context) error
 }
 
+// HeavyweightReleasable is an optional capability agents can implement
+// to participate in tiered memory management. When the activation
+// controller demotes a container Hot→Warm, it calls ReleaseHeavyweight
+// to drop large transient allocations (LLM provider, tool runtime,
+// skill registries) while the container is paused. On Warm→Hot
+// promotion, RebuildHeavyweight reinstates them before the container
+// resumes serving requests.
+//
+// Lightweight identity (AgentID, AgentType, conversation memory,
+// session ID) MUST be retained across release/rebuild — the agent is
+// the same agent, just hibernating. Only state that can be
+// reconstructed deterministically from config + identity should be
+// released.
+//
+// Both methods MUST be safe to call repeatedly (idempotent): a
+// release on already-released state is a no-op; a rebuild on
+// already-built state is a no-op. The controller falls back to a
+// full cold-start path if RebuildHeavyweight returns an error.
+type HeavyweightReleasable interface {
+	ReleaseHeavyweight() error
+	RebuildHeavyweight(ctx context.Context) error
+}
+
 // ContainerMetrics captures runtime metrics for a container.
 type ContainerMetrics struct {
 	StartTime      time.Time
