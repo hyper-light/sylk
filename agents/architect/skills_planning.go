@@ -617,10 +617,21 @@ func (a *Architect) findDeclaration(planID string, declarationID string) (*PreDe
 // Returns an empty string on nil plan or marshal failure — callers MUST
 // validate the result via isPlanHandoffPayloadValid before sending.
 func buildHandoffPayload(plan *DesignPlan, trigger string) string {
+	return buildPhasedHandoffPayload(plan, trigger, PlanHandoffPhaseLegacy)
+}
+
+// buildPhasedHandoffPayload mirrors buildHandoffPayload but stamps a
+// specific PlanHandoffPhase. Used by the two-phase ingest flow:
+//   - PlanHandoffPhasePrepare on plan-finalize
+//   - PlanHandoffPhaseExecutePrepared on user approval
+//   - PlanHandoffPhaseDiscardPrepared on user reject/modify
+// Legacy callers still use buildHandoffPayload (Phase=Legacy).
+func buildPhasedHandoffPayload(plan *DesignPlan, trigger string, phase PlanHandoffPhase) string {
 	if plan == nil {
 		return ""
 	}
 	handoff := buildPlanHandoff(plan, trigger)
+	handoff.Phase = phase
 	data, err := json.Marshal(handoff)
 	if err != nil {
 		return ""

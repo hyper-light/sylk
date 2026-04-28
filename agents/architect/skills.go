@@ -646,6 +646,27 @@ func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInpu
 	}
 	plan.Declarations = append(plan.Declarations, declaration)
 	a.publishDeclaration(ctx, declaration, plan.SessionID)
+
+	// Guardian preflight — REQUIRED before plan ships to user. Plans
+	// never reach the dialog without Guardian's verdict (canon: Guardian
+	// gates dispatch, user consents to a vetted plan). The verdict is
+	// folded into PlanHandoff.GuardianAttestation; the dialog renders
+	// findings inline so user consent is informed.
+	//
+	// On failure (timeout, transport error, blocking findings), fail
+	// the plan rather than ship un-vetted. Better to surface to the
+	// user than silently bypass the gate.
+	if a.bus != nil && a.running && a.knownAgentIDByType("guardian", "") != "" {
+		att, _, preflightErr := a.requestPlanPreflight(ctx, plan)
+		if preflightErr != nil || att == nil {
+			if preflightErr == nil {
+				preflightErr = fmt.Errorf("guardian preflight returned nil attestation")
+			}
+			return nil, fmt.Errorf("guardian preflight failed: %w", preflightErr)
+		}
+		plan.GuardianAttestation = att
+	}
+
 	if err := a.advancePlan(ctx, plan, PlanStatusReady, nil); err != nil {
 		return nil, err
 	}
@@ -653,6 +674,16 @@ func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInpu
 		lm.GrantReadyLease(plan)
 	}
 	a.publishPlanSnapshot(ctx, plan)
+
+	// Two-phase ingest: kick off orchestrator preparation IMMEDIATELY
+	// upon plan finalization — before the LLM's final-text-turn fires
+	// and before the user sees the approval dialog. The orchestrator
+	// runs FULL preparation (verify attestation, build DAG, write WAL,
+	// allocate task pods, pre-activate every pod member) overlapping
+	// with the user's review time. On approve, the only remaining work
+	// is scheduler.Submit. Fire-and-forget; failures degrade to legacy
+	// single-phase ingest at approval time.
+	a.publishPreparedHandoff(ctx, plan)
 	// Phase 4 refactor: emit plan_ratified so pipeline agents see the
 	// ratified plan in ambient context. Individual tasks are projected
 	// via the existing DAG dispatch flow; the plan-level activity is

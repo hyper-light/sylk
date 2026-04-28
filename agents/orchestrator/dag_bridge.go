@@ -330,14 +330,112 @@ func (b *DAGBridge) SetScribeFactory(f shared.ScribeFactory) {
 	b.scribeFactory = f
 }
 
-// Execute builds/receives a DAG from a plan, journals, persists, and submits to the scheduler.
+// Execute builds/receives a DAG from a plan, journals, persists, and
+// submits to the scheduler. Single-phase wrapper: equivalent to
+// Prepare(eager=true) + Submit. Most callers use this for backwards
+// compatibility; the two-phase ingest path (Phase=Prepare on plan
+// finalize, Phase=ExecutePrepared on user approve) calls Prepare and
+// Submit separately to overlap prep work with user review time.
 func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID string) (string, error) {
+	if err := b.Prepare(ctx, d, planID, sessionID); err != nil {
+		return "", err
+	}
+	return b.Submit(ctx, d.ID())
+}
+
+// Prepare does ALL setup for executing a DAG except scheduler.Submit:
+// WAL append, SQLite InsertDAGExecution, build dispatcher / decision
+// gate / active-DAG tracking / scheduler-event subscription / sub-node
+// registration, eagerly construct EVERY task pod (atomic with VFS
+// volume binding), pre-activate every pod member (containers start,
+// on-demand creators run, providers wrap, VFS mounts), post the
+// architect-authored task claims to the session board.
+//
+// After Prepare returns successfully, the DAG is in 'prepared' state.
+// All work that doesn't depend on scheduler.Submit is done. A
+// subsequent Submit(dagID) call only runs scheduler.Submit — tens
+// of ms instead of hundreds.
+//
+// Strict invariant: when Prepare returns nil, every task pod has its
+// VFS bound and all pipeline-agent member types activated and on the
+// bus. There is no observable state where a prepared DAG has unwarmed
+// pods.
+func (b *DAGBridge) Prepare(ctx context.Context, d *dag.DAG, planID, sessionID string) error {
+	if err := b.prepareInternal(ctx, d, planID, sessionID); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Submit transitions a prepared DAG to running and submits to the
+// scheduler. Returns the DAG ID. The caller paid the full prep cost
+// at Prepare time; Submit is the cheap "go" trigger.
+//
+// On a missing prepared DAG (caller skipped Prepare or it was
+// discarded), returns an error rather than silently re-preparing —
+// the caller should know the prepared state is gone and act
+// accordingly (e.g. fall back to Execute).
+func (b *DAGBridge) Submit(ctx context.Context, dagID string) (string, error) {
+	b.mu.RLock()
+	meta, ok := b.activeDAGs[dagID]
+	bus := b.bus
+	b.mu.RUnlock()
+	if !ok || meta == nil {
+		return "", fmt.Errorf("dag bridge: dag %s not prepared", dagID)
+	}
+	if bus == nil {
+		return "", fmt.Errorf("dag bridge: bus not set")
+	}
+	dispatcher := meta.Dispatcher
+	if dispatcher == nil {
+		return "", fmt.Errorf("dag bridge: dag %s has no dispatcher", dagID)
+	}
+
+	// Acquire the per-DAG context that Prepare staged. The DAG runs
+	// async in this context; the caller's ctx is only used for the
+	// Submit call itself.
+	dagCtx := context.WithoutCancel(ctx)
+	if meta.PreparedCtx != nil {
+		dagCtx = meta.PreparedCtx
+	}
+
+	d := meta.PreparedDAG
+	if d == nil {
+		return "", fmt.Errorf("dag bridge: dag %s missing prepared DAG payload", dagID)
+	}
+
+	b.logTrace("dag_submit_begin", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id": dagID,
+	})
+	if _, err := b.scheduler.Submit(dagCtx, d, dispatcher); err != nil {
+		if meta.CancelFunc != nil {
+			meta.CancelFunc()
+		}
+		b.cleanupDAG(dagID)
+		b.journal.LogDAGAbort(dagID, err.Error())
+		b.store.UpdateDAGState(dagID, "failed", err.Error())
+		b.logTrace("dag_submit_failed", agentlog.EventError, map[string]any{
+			"dag_id": dagID,
+			"error":  err.Error(),
+		})
+		return "", fmt.Errorf("dag bridge: submit: %w", err)
+	}
+	b.logTrace("dag_submit_ok", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id": dagID,
+	})
+	return dagID, nil
+}
+
+// prepareInternal is the original Execute body minus scheduler.Submit.
+// Reused by Execute (which then calls Submit inline) and by Prepare
+// (which exits after this returns; Submit is called later).
+func (b *DAGBridge) prepareInternal(ctx context.Context, d *dag.DAG, planID, sessionID string) error {
 	b.mu.Lock()
 	bus := b.bus
 	b.mu.Unlock()
 
 	if bus == nil {
-		return "", fmt.Errorf("dag bridge: bus not set")
+		return fmt.Errorf("dag bridge: bus not set")
 	}
 	b.logTrace("dag_execute_begin", agentlog.EventRegistryEvent, map[string]any{
 		"dag_id":       d.ID(),
@@ -361,10 +459,14 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		})
 	}
 
-	// 1. WAL: LogDAGStart
+	// 1. WAL: LogDAGPrepared (or LogDAGStart depending on phase).
+	// In the two-phase flow Prepare() writes "prepared", and Submit()
+	// later writes "started" when scheduler.Submit fires. The single
+	// Execute wrapper still emits "started" directly because there's
+	// no user-visible boundary between prep and submit.
 	dagJSON, _ := d.MarshalJSON()
 	if err := b.journal.LogDAGStart(d.ID(), string(dagJSON)); err != nil {
-		return "", fmt.Errorf("dag bridge: wal start: %w", err)
+		return fmt.Errorf("dag bridge: wal start: %w", err)
 	}
 	shared.LogAgentEvent(b.eventLogger, agentlog.EventDAGStarted,
 		b.agentID, sessionID, "", "info",
@@ -377,7 +479,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		string(policyJSON), string(dagJSON),
 		d.LayerCount(), d.NodeCount(),
 	); err != nil {
-		return "", fmt.Errorf("dag bridge: store insert: %w", err)
+		return fmt.Errorf("dag bridge: store insert: %w", err)
 	}
 	b.logTrace("dag_execute_store_inserted", agentlog.EventRegistryEvent, map[string]any{
 		"dag_id":       d.ID(),
@@ -516,7 +618,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 			errMsg := fmt.Sprintf("sub-node %s missing from expanded DAG", subNodeID)
 			b.journal.LogDAGAbort(d.ID(), errMsg)
 			b.store.UpdateDAGState(d.ID(), "failed", errMsg)
-			return "", fmt.Errorf("dag bridge: %s", errMsg)
+			return fmt.Errorf("dag bridge: %s", errMsg)
 		}
 		stage := string(StageFromSubNodeID(subNodeID))
 		taskID, _ := dispatchTaskIdentity(node)
@@ -572,27 +674,49 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		}
 	})
 
-	// 7. Submit to scheduler (async execution)
-	b.logTrace("dag_execute_submit_begin", agentlog.EventRegistryEvent, map[string]any{
-		"dag_id": d.ID(),
-	})
-	_, err := b.scheduler.Submit(dagCtx, d, dispatcher)
-	if err != nil {
-		dagCancel()
-		b.cleanupDAG(d.ID())
-		b.journal.LogDAGAbort(d.ID(), err.Error())
-		b.store.UpdateDAGState(d.ID(), "failed", err.Error())
-		b.logTrace("dag_execute_submit_failed", agentlog.EventError, map[string]any{
-			"dag_id": d.ID(),
-			"error":  err.Error(),
-		})
-		return "", fmt.Errorf("dag bridge: submit: %w", err)
+	// 7. Eager pod construction + pre-activation. With two-phase
+	// ingest the prep cost overlaps with user review, so we want
+	// EVERY pod warm by approve-click — not lazily built at first
+	// dispatch. ensureTaskPod's sync.Once gating means later
+	// dispatches still hit the cache; this just front-loads the
+	// per-pod buildTaskAgentPod + PreActivateStrict to prep time.
+	//
+	// Per-pod errors don't fail prep — they fail at dispatch time
+	// for that specific task (the existing failure path). The other
+	// pods stay warm and dispatchable.
+	prepPodStart := time.Now()
+	for _, taskDef := range taskPodDefs {
+		taskID := taskDef.TaskID
+		if taskID == "" {
+			continue
+		}
+		if _, err := b.ensureTaskPod(dagCtx, d.ID(), taskID); err != nil {
+			b.logTrace("dag_prepare_pod_ensure_failed", agentlog.EventError, map[string]any{
+				"dag_id":  d.ID(),
+				"task_id": taskID,
+				"error":   err.Error(),
+			})
+		}
 	}
-	b.logTrace("dag_execute_submit_ok", agentlog.EventRegistryEvent, map[string]any{
-		"dag_id": d.ID(),
+	b.logTrace("dag_prepare_pods_warm", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id":     d.ID(),
+		"pod_count":  len(taskPodDefs),
+		"elapsed_ms": time.Since(prepPodStart).Milliseconds(),
 	})
 
-	return d.ID(), nil
+	// 8. Stash the per-DAG ctx and DAG payload on meta so a later
+	// Submit() call has everything it needs.
+	b.mu.Lock()
+	if meta := b.activeDAGs[d.ID()]; meta != nil {
+		meta.PreparedCtx = dagCtx
+		meta.PreparedDAG = d
+		meta.PreparedAt = time.Now()
+	}
+	b.mu.Unlock()
+	b.logTrace("dag_prepared", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id": d.ID(),
+	})
+	return nil
 }
 
 func (b *DAGBridge) abortPreSubmitDAG(dagID string, err error) error {
