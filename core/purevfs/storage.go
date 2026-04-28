@@ -234,6 +234,28 @@ func (s *ChunkStore) ArenaMappedBytes() int64 {
 	return s.arena.MappedBytes()
 }
 
+// Close releases every mmap region the chunk arena holds. Callers must
+// invoke Close when the ChunkStore (and the Workspace that owns it) is
+// being torn down — without it, anonymous mmap regions stay mapped
+// until process exit, which leaks virtual memory across short-lived
+// stores (tests, transient workspace images).
+//
+// After Close, every operation on the store is undefined behavior; the
+// caller must guarantee no FileBody still holds extents that point at
+// chunks owned by this store.
+//
+// Close is idempotent. A finalizer on the underlying arena calls Close
+// as a safety net for callers that drop the store without explicit
+// teardown, but explicit Close is strongly preferred for deterministic
+// reclaim.
+func (s *ChunkStore) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.chunks = nil
+	s.bytes.Store(0)
+	s.arena.Close()
+}
+
 type ExtentKind uint8
 
 const (

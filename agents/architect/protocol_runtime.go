@@ -233,6 +233,48 @@ func (a *Architect) runDeterministicProtocol(
 	}
 	plan.Workflow = workflow
 
+	// 5b. Guardian preflight — batched, signed, before presentation.
+	// Replaces the orchestrator's post-approval N-sequential-RPC loop.
+	// Guardian remains the canonical gate; the architect just calls
+	// once per plan, folds findings into presentation, and ships the
+	// attestation with PlanHandoff.
+	//
+	// When the bus is unavailable (test/dev mode without a registered
+	// Guardian), skip preflight and proceed without attestation. The
+	// orchestrator's ingest path still gates dispatch — it falls back
+	// to its own RPC loop when no attestation is present, which
+	// surfaces an error if Guardian truly isn't reachable. So
+	// "architect skipped attestation" never silently un-gates: it
+	// just shifts the gate to dispatch time, where the orchestrator
+	// catches it.
+	if a.bus != nil && a.running && a.knownAgentIDByType("guardian", "") != "" {
+		completePreflight := a.architectStageClaim(ctx, plan.ID, "Guardian batched preflight", "Issue per-task verdicts in a single attestation that travels with the plan")
+		att, _, preflightErr := a.requestPlanPreflight(ctx, plan)
+		if preflightErr == nil && att != nil {
+			plan.GuardianAttestation = att
+			completePreflight(
+				fmt.Sprintf("Attestation: %d tasks, blocking=%v warnings=%v requires_approval=%v",
+					len(att.PerTask), att.HasBlockingFindings, att.HasWarnings, att.RequiresApproval),
+				[]*claims.Artifact{
+					a.architectArtifact("classifier_version", att.ClassifierVersion),
+					a.architectArtifact("plan_content_hash", att.PlanContentHash),
+					a.architectArtifact("blocking_findings", fmt.Sprintf("%v", att.HasBlockingFindings)),
+				},
+				nil,
+			)
+		} else {
+			// Guardian was reachable but the call failed — fail the
+			// plan rather than ship un-vetted. This is the canonical
+			// fail-fast path when Guardian is registered but
+			// produces an error.
+			completePreflight("Guardian preflight unavailable", nil, preflightErr)
+			if preflightErr == nil {
+				preflightErr = fmt.Errorf("guardian preflight returned nil attestation")
+			}
+			return a.failAndPersistPlan(plan, fmt.Errorf("guardian preflight failed: %w", preflightErr))
+		}
+	}
+
 	// 6. Ready
 	if err := transition(PlanStatusReady); err != nil {
 		return a.failAndPersistPlan(plan, err)

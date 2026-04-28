@@ -88,6 +88,14 @@ func runTUI(_ *cobra.Command, _ []string) error {
 	restoreStdLog := installTUIStdLogSink()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
+	// Kill watchdog: independent SIGINT/SIGTERM watcher that guarantees
+	// the user can always force-quit by pressing Ctrl+C a second time,
+	// even if cooperative shutdown is wedged in a blocking subsystem
+	// close. Stops cleanly on successful exit (defer below); fires
+	// os.Exit(130) on a second signal otherwise.
+	stopKillWatchdog := installKillWatchdog()
+	defer stopKillWatchdog()
+
 	// Optional pprof endpoint for diagnosing memory/CPU at idle. Bind
 	// to localhost only so this never accidentally exposes profiling
 	// to the network. Profile heap with:
@@ -154,6 +162,47 @@ const (
 // possible graceful stop (60s for max-context agents) + headroom.
 const shutdownTimeout = 90 * time.Second
 
+// closeBudget bounds a single subsystem Close()/Stop() call. Derived
+// from: well-behaved subsystems flush within sub-second; DB-backed
+// subsystems may need a few seconds for in-flight writes to land.
+// 5s gives DB closes ~5× their typical write latency without
+// allowing any one stuck subsystem to consume more than its share
+// of the overall shutdownTimeout (90s / 5s = up to 18 closes can
+// run sequentially within budget). Operators can tune via
+// SYLK_CLOSE_BUDGET_SECONDS for slow disks or large WAL backlogs.
+const closeBudget = 5 * time.Second
+
+// closeWithBudget runs fn under the smaller of the per-call closeBudget
+// and the parent ctx's remaining deadline. On timeout, the inner fn
+// goroutine is intentionally leaked — the program is in shutdown,
+// the kill watchdog (cmd/tui_kill_watchdog.go) provides the user-
+// triggered escape, and runtime exit will reclaim everything. Logs
+// the timeout via slog.Warn and returns a wrapped error so the
+// cleanup chain can collect it without halting the rest of the
+// teardown.
+//
+// fn must be a Close()/Stop() that returns error. For void Stop()
+// methods, wrap in a closure: closeWithBudget(ctx, "gateway", func() error { gw.Stop(); return nil }).
+func closeWithBudget(ctx context.Context, name string, fn func() error) error {
+	sub, cancel := context.WithTimeout(ctx, closeBudget)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- fn()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-sub.Done():
+		slog.Warn("shutdown: close timed out; moving on",
+			"subsystem", name,
+			"budget", closeBudget,
+			"reason", sub.Err().Error(),
+		)
+		return fmt.Errorf("close %q timed out after %s: %w", name, closeBudget, sub.Err())
+	}
+}
+
 // =============================================================================
 // Typed result structs for Phase 2 parallel bootstrap goroutines.
 // =============================================================================
@@ -201,18 +250,18 @@ type bootstrapPhase1 struct {
 	sessionMgr     *session.Manager
 	defaultSession *session.Session
 	descriptors    *handoff.DescriptorRegistry
-	budget        *concurrency.GoroutineBudget
-	containerReg  *container.ContainerRegistry
-	creatorReg    *container.AgentCreatorRegistry
-	serviceReg    *network.ServiceRegistry
-	specReg       *container.AgentSpecRegistry
-	quota         *container.ResourceQuota
-	hookMut       *lifecycleHookMutator
-	probeFact     *probeFactoryHolder
-	runtime       *container.DefaultRuntime
-	namespace     *network.NetworkNamespace
-	daemonCtrl    *daemon.DaemonSetController
-	daemonSpecMap map[string]container.ContainerSpec
+	budget         *concurrency.GoroutineBudget
+	containerReg   *container.ContainerRegistry
+	creatorReg     *container.AgentCreatorRegistry
+	serviceReg     *network.ServiceRegistry
+	specReg        *container.AgentSpecRegistry
+	quota          *container.ResourceQuota
+	hookMut        *lifecycleHookMutator
+	probeFact      *probeFactoryHolder
+	runtime        *container.DefaultRuntime
+	namespace      *network.NetworkNamespace
+	daemonCtrl     *daemon.DaemonSetController
+	daemonSpecMap  map[string]container.ContainerSpec
 
 	authRegistry *credentials.AuthRegistry
 	guideCfg     providers.GoogleConfig
@@ -1658,8 +1707,8 @@ func buildBootstrapCleanup(
 
 		var errs []error
 		if sup := phase4.supervisorRef.Load(); sup != nil {
-			if stopErr := sup.Stop(); stopErr != nil {
-				errs = append(errs, stopErr)
+			if err := closeWithBudget(shutdownCtx, "supervisor", sup.Stop); err != nil {
+				errs = append(errs, err)
 			}
 		}
 		if phase3.activationCtrl != nil {
@@ -1678,44 +1727,62 @@ func buildBootstrapCleanup(
 			}
 		}
 
-		phase1.namespace.Close()
-		phase1.runtime.Close()
-		phase1.planStore.Close()
+		_ = closeWithBudget(shutdownCtx, "namespace", func() error {
+			phase1.namespace.Close()
+			return nil
+		})
+		_ = closeWithBudget(shutdownCtx, "runtime", func() error {
+			phase1.runtime.Close()
+			return nil
+		})
+		_ = closeWithBudget(shutdownCtx, "plan_store", func() error {
+			phase1.planStore.Close()
+			return nil
+		})
 		if phase4.bootLogger != nil {
-			_ = phase4.bootLogger.Close()
+			_ = closeWithBudget(shutdownCtx, "boot_logger", phase4.bootLogger.Close)
 		}
 		if phase4.knowledgeSync != nil {
-			if err := phase4.knowledgeSync.Close(); err != nil {
+			if err := closeWithBudget(shutdownCtx, "knowledge_sync", phase4.knowledgeSync.Close); err != nil {
 				errs = append(errs, err)
 			}
 		}
-		if err := phase1.knowledgeStore.Close(); err != nil {
+		if err := closeWithBudget(shutdownCtx, "knowledge_store", phase1.knowledgeStore.Close); err != nil {
 			errs = append(errs, err)
 		}
 		if phase1.forest != nil {
-			if err := phase1.forest.Close(); err != nil {
+			if err := closeWithBudget(shutdownCtx, "forest", phase1.forest.Close); err != nil {
 				errs = append(errs, err)
 			}
 		}
 		if phase1.forestContent != nil {
-			if err := phase1.forestContent.Close(); err != nil {
+			if err := closeWithBudget(shutdownCtx, "forest_content", phase1.forestContent.Close); err != nil {
 				errs = append(errs, err)
 			}
 		}
 		if phase1.forestVectorDB != nil {
-			if err := phase1.forestVectorDB.Close(); err != nil {
+			if err := closeWithBudget(shutdownCtx, "forest_vector_db", phase1.forestVectorDB.Close); err != nil {
 				errs = append(errs, err)
 			}
 		}
 		if phase1.knowledgeBackend != nil {
-			if err := phase1.knowledgeBackend.Close(); err != nil {
+			if err := closeWithBudget(shutdownCtx, "knowledge_backend", phase1.knowledgeBackend.Close); err != nil {
 				errs = append(errs, err)
 			}
 		}
-		phase1.googleGateway.Stop()
-		phase1.anthropicGateway.Stop()
-		phase1.openaiGateway.Stop()
-		if err := phase1.guideBus.Close(); err != nil {
+		_ = closeWithBudget(shutdownCtx, "google_gateway", func() error {
+			phase1.googleGateway.Stop()
+			return nil
+		})
+		_ = closeWithBudget(shutdownCtx, "anthropic_gateway", func() error {
+			phase1.anthropicGateway.Stop()
+			return nil
+		})
+		_ = closeWithBudget(shutdownCtx, "openai_gateway", func() error {
+			phase1.openaiGateway.Stop()
+			return nil
+		})
+		if err := closeWithBudget(shutdownCtx, "guide_bus", phase1.guideBus.Close); err != nil {
 			errs = append(errs, err)
 		}
 		// Drain the scope LAST. Every long-running worker registered with
@@ -1945,6 +2012,25 @@ type onDemandAgentCreatorDeps struct {
 	quarantineRef    *atomic.Pointer[fetch.QuarantineBuffer]
 	quota            *container.ResourceQuota
 	factoryRef       *atomic.Pointer[identity.Factory]
+	// providerPool memoizes createSwapProvider results across agent
+	// creator calls so pipeline agent re-creation (engineer/designer/
+	// inspector-pipeline/tester-pipeline) doesn't repay provider
+	// construction cost. Plan-independent — survives plan revisions.
+	providerPool *providerWarmPool
+}
+
+// swapProvider returns a wrapped provider, preferring the warm pool
+// when available. Falls back to direct createSwapProvider for any
+// caller that hasn't been migrated.
+func (d onDemandAgentCreatorDeps) swapProvider(
+	ctx context.Context,
+	model string,
+	priority gateway.RequestPriority,
+) (providers.ProviderAdapter, error) {
+	if d.providerPool != nil {
+		return d.providerPool.Get(ctx, model, d.authRegistry, d.googleGw, d.anthropicGw, d.openaiGw, priority)
+	}
+	return createSwapProvider(ctx, model, d.authRegistry, d.googleGw, d.anthropicGw, d.openaiGw, priority)
 }
 
 // factory returns the session-scoped identity.Factory if it has been
@@ -2041,6 +2127,7 @@ func registerOnDemandAgentCreators(
 		orchRef:          orchRef,
 		quarantineRef:    quarantineRef,
 		quota:            quota,
+		providerPool:     newProviderWarmPool(),
 		factoryRef:       factoryRef,
 	}
 	registerOnDemandKnowledgeAgentCreators(deps)
@@ -2219,7 +2306,7 @@ func registerPipelineInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 	deps.reg.Register("inspector-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
 		agentID := pipelineWorkerAgentID(ctx, "inspector-pipeline")
 		model := deps.configuredModel("inspector-pipeline", "claude-opus-4-6")
-		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation)
+		wrapped, err := deps.swapProvider(ctx, model, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline inspector provider: %w", err)
 		}
@@ -2282,7 +2369,7 @@ func registerPipelineTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 	deps.reg.Register("tester-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
 		agentID := pipelineWorkerAgentID(ctx, "tester-pipeline")
 		model := deps.configuredModel("tester-pipeline", "gpt-5.4-pro")
-		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation)
+		wrapped, err := deps.swapProvider(ctx, model, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline tester provider: %w", err)
 		}
@@ -2308,7 +2395,7 @@ func registerEngineerAgentCreator(deps onDemandAgentCreatorDeps) {
 	deps.reg.Register("engineer", func(ctx context.Context) (container.ContainerAgent, error) {
 		agentID := taskScopedCreationAgentID(ctx, "engineer", engineerID)
 		model := deps.configuredModel("engineer", "gpt-5.4-pro")
-		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
+		wrapped, err := deps.swapProvider(ctx, model, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("engineer provider: %w", err)
 		}
@@ -2334,7 +2421,7 @@ func registerDesignerAgentCreator(deps onDemandAgentCreatorDeps) {
 	deps.reg.Register("designer", func(ctx context.Context) (container.ContainerAgent, error) {
 		agentID := taskScopedCreationAgentID(ctx, "designer", designerID)
 		model := deps.configuredModel("designer", string(providers.Gemini31Pro))
-		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
+		wrapped, err := deps.swapProvider(ctx, model, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("designer provider: %w", err)
 		}

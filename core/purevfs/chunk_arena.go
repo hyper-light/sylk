@@ -3,7 +3,9 @@ package purevfs
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
+	"sync/atomic"
 )
 
 // chunkArena is the off-heap, RAM-only backing store for ChunkStore bytes.
@@ -32,6 +34,7 @@ import (
 var (
 	errArenaSlotInvalid = errors.New("purevfs: arena slot is invalid")
 	errArenaSlotTooBig  = errors.New("purevfs: arena slot exceeds class capacity")
+	errArenaClosed      = errors.New("purevfs: arena is closed")
 )
 
 // arenaSizeClassCount is the number of size classes; matches the length
@@ -104,6 +107,7 @@ type chunkArena struct {
 	classes  [arenaSizeClassCount]*arenaSizeClass
 	oversize *oversizeArena
 	stats    arenaStats
+	closed   atomic.Bool
 }
 
 type arenaStats struct {
@@ -119,6 +123,14 @@ func newChunkArena() *chunkArena {
 	for i, slotSize := range arenaSizeClasses {
 		a.classes[i] = newArenaSizeClass(i, slotSize, slabSlotsPerClass)
 	}
+	// Finalizer is a safety net: if the owning ChunkStore is dropped
+	// without Close, the GC eventually reclaims the arena and we
+	// release the mmap regions then. Explicit Close is still strongly
+	// preferred for deterministic teardown — finalizers do not run on
+	// process exit and may not run for a long time on idle processes.
+	runtime.SetFinalizer(a, func(arena *chunkArena) {
+		arena.Close()
+	})
 	return a
 }
 
@@ -127,6 +139,9 @@ func newChunkArena() *chunkArena {
 // ChunkStore (which assumes ownership of the eventual Free) or call Free
 // directly to return the slot.
 func (a *chunkArena) Allocate(size int) (*chunkSlot, error) {
+	if a.closed.Load() {
+		return nil, errArenaClosed
+	}
 	if size <= 0 {
 		return &chunkSlot{class: -2, size: 0, bytes: nil}, nil
 	}
@@ -195,6 +210,28 @@ func (a *chunkArena) MappedBytes() int64 {
 	return a.stats.allocBytes + a.stats.oversize
 }
 
+// Close releases every mmap region held by the arena and marks it
+// closed. Subsequent Allocate calls return errArenaClosed. Close is
+// idempotent. After Close, any chunkSlot still held by a caller is
+// invalid; reading slot.Bytes() will reference unmapped memory and
+// crash the process. ChunkStore guarantees this can't happen because
+// it owns slot lifetimes — Close on the store implies the caller has
+// already discarded all FileBody references that depend on it.
+func (a *chunkArena) Close() {
+	if !a.closed.CompareAndSwap(false, true) {
+		return
+	}
+	for _, cls := range a.classes {
+		if cls == nil {
+			continue
+		}
+		cls.closeSlabs()
+	}
+	a.oversize.closeRegions()
+	a.stats.reset()
+	runtime.SetFinalizer(a, nil)
+}
+
 // pickClass returns the index of the smallest size class that fits size,
 // or -1 if size exceeds every class (caller falls back to oversize).
 func (a *chunkArena) pickClass(size int) int {
@@ -217,6 +254,7 @@ type arenaSizeClass struct {
 	mu      sync.Mutex
 	slabs   []arenaSlab
 	freeIdx []slotRef
+	closed  bool // guarded by mu; mirrors arena.closed for race safety
 }
 
 type arenaSlab struct {
@@ -247,6 +285,9 @@ func (c *arenaSizeClass) allocate(size int) (*chunkSlot, bool, error) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return nil, false, errArenaClosed
+	}
 	grew := false
 	if len(c.freeIdx) == 0 {
 		if err := c.growLocked(); err != nil {
@@ -277,6 +318,23 @@ func (c *arenaSizeClass) release(slot *chunkSlot) {
 	c.freeIdx = append(c.freeIdx, slotRef{slabIdx: slot.slabIdx, slotIdx: slot.slotIdx})
 }
 
+// closeSlabs unmaps every slab in the class and clears the slab list.
+// Called only from chunkArena.Close. Sets closed=true under the same
+// lock that allocate takes, so any Allocate that wins the race to the
+// lock observes the close and bails out rather than mapping a fresh
+// slab that would leak.
+func (c *arenaSizeClass) closeSlabs() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	for i := range c.slabs {
+		releaseSlabMemory(c.slabs[i].bytes, c.slabs[i].mapped)
+		c.slabs[i].bytes = nil
+	}
+	c.slabs = nil
+	c.freeIdx = nil
+}
+
 func (c *arenaSizeClass) growLocked() error {
 	cap := c.slabCapacity()
 	bytes, mapped, err := allocSlabMemory(cap)
@@ -300,6 +358,7 @@ type oversizeArena struct {
 	mu       sync.Mutex
 	regions  []*oversizeRegion
 	freeIdxs []int // free indexes in regions slice
+	closed   bool  // guarded by mu
 }
 
 type oversizeRegion struct {
@@ -320,6 +379,10 @@ func (o *oversizeArena) allocate(size int) (*oversizeRegion, error) {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.closed {
+		releaseSlabMemory(bytes, mapped)
+		return nil, errArenaClosed
+	}
 	region := &oversizeRegion{bytes: bytes, mapped: mapped, capacity: size}
 	if len(o.freeIdxs) > 0 {
 		idx := o.freeIdxs[len(o.freeIdxs)-1]
@@ -348,6 +411,23 @@ func (o *oversizeArena) release(idx int) {
 	releaseSlabMemory(region.bytes, region.mapped)
 }
 
+// closeRegions unmaps every still-live oversize region and clears the
+// region list. Called only from chunkArena.Close.
+func (o *oversizeArena) closeRegions() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.closed = true
+	for i, region := range o.regions {
+		if region == nil {
+			continue
+		}
+		releaseSlabMemory(region.bytes, region.mapped)
+		o.regions[i] = nil
+	}
+	o.regions = nil
+	o.freeIdxs = nil
+}
+
 func (s *arenaStats) recordAlloc(liveDelta int, mappedDelta int64, slabsAdded int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -368,6 +448,17 @@ func (s *arenaStats) recordOversize(delta int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.oversize += delta
+}
+
+// reset zeroes all counters. Called only from chunkArena.Close after
+// every slab and region has been released.
+func (s *arenaStats) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.allocBytes = 0
+	s.liveBytes = 0
+	s.slabCount = 0
+	s.oversize = 0
 }
 
 func boolToInt(b bool) int {

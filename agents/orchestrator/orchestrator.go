@@ -89,6 +89,13 @@ type Orchestrator struct {
 	journal        *OrchestratorJournal
 	bufferRegistry *BufferRegistry
 	dagBridge      *DAGBridge
+
+	// preparedDAGs holds DAGs that have been prepared (Guardian
+	// attestation verified, DAG built, WAL/SQLite rows written) but
+	// not yet submitted to the scheduler. Populated by
+	// Phase=Prepare ingest, drained by Phase=ExecutePrepared.
+	// Initialised in newOrchestrator.
+	preparedDAGs *preparedDAGRegistry
 	coordination *CoordinationService
 	scope        *concurrency.GoroutineScope
 	claimsInbox      *claims.ClaimsInbox
@@ -233,6 +240,7 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 		pendingBus:               make(map[string]*shared.PendingSyncWait),
 		pipelinePanelState:       make(map[string]pipelinePanelSnapshot),
 		pipelinePanelRegistered:  make(map[string]struct{}),
+		preparedDAGs:             newPreparedDAGRegistry(),
 	}
 
 	if provider != nil {

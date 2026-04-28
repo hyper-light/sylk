@@ -88,7 +88,11 @@ func NewHyperParameterFitter(db *sql.DB) *HyperParameterFitter {
 // only). The result is always non-nil; the boolean indicates
 // whether *any* field was successfully fitted (so the caller can
 // distinguish "fully placeholder" from "partially data-derived").
-func (f *HyperParameterFitter) FitFromLedger(ctx context.Context) (*HyperParameters, bool, error) {
+//
+// logger receives one info-level event per grid-search candidate
+// (validation MAE) plus one info-level event per fitted field
+// summarizing the choice. Pass nil to disable.
+func (f *HyperParameterFitter) FitFromLedger(ctx context.Context, logger fitLogger) (*HyperParameters, bool, error) {
 	if f == nil || f.db == nil {
 		return nil, false, fmt.Errorf("hyperparameter fitter: nil db")
 	}
@@ -135,8 +139,8 @@ func (f *HyperParameterFitter) FitFromLedger(ctx context.Context) (*HyperParamet
 	//    Placeholder until we add the cross-session retrieval-co-
 	//    occurrence query.
 
-	// 4. Learning weights — grid search.
-	if cWeight, samples, ok, err := f.fitCounterfactualWeight(ctx); err != nil {
+	// 4. Learning weights — grid search with held-out validation.
+	if cWeight, samples, ok, err := f.fitCounterfactualWeight(ctx, logger); err != nil {
 		return nil, false, fmt.Errorf("fit counterfactual weight: %w", err)
 	} else if ok {
 		hp.CounterfactualWeight = cWeight
@@ -145,7 +149,7 @@ func (f *HyperParameterFitter) FitFromLedger(ctx context.Context) (*HyperParamet
 		anyFitted = true
 	}
 
-	if iWeight, samples, ok, err := f.fitImplicitNegativeWeight(ctx); err != nil {
+	if iWeight, samples, ok, err := f.fitImplicitNegativeWeight(ctx, logger); err != nil {
 		return nil, false, fmt.Errorf("fit implicit-negative weight: %w", err)
 	} else if ok {
 		hp.ImplicitNegativeWeight = iWeight
@@ -317,76 +321,249 @@ func (f *HyperParameterFitter) fitImplicitNegativeHorizon(ctx context.Context) (
 }
 
 // fitCounterfactualWeight grid-searches over candidate weights and
-// picks the one that maximizes held-out training-set accuracy of
-// the base scorer. The grid is coarse — 0.1 .. 0.9 in 0.1 steps —
-// because finer granularity isn't supported by realistic sample
-// sizes (statistical power requires thousands of examples per
-// candidate).
+// picks the one that minimizes held-out validation MAE of the base
+// scorer trained with that weight applied to counterfactual rows.
+// The grid is coarse — 0.1 .. 0.9 in 0.1 steps — because finer
+// granularity isn't supported by realistic sample sizes
+// (statistical power requires thousands of examples per candidate).
 //
-// Implementation note: actual SGD-evaluation per candidate is
-// expensive; we approximate by computing the weighted accuracy of
-// the existing labels at each weight and picking the maximum.
-// This is a lower-fidelity proxy than full re-training but
-// matches the scale of the data we actually have at boot. The
-// runtime adaptive tuner refines via A/B once enough new outcomes
-// accumulate.
-func (f *HyperParameterFitter) fitCounterfactualWeight(ctx context.Context) (float64, int64, bool, error) {
-	return f.fitLabelWeight(ctx, "counterfactual")
+// Each candidate runs an SGD training pass with placeholder
+// hyperparameters (learning rate, L1/L2 reg, epochs from
+// PlaceholderHyperParameters) over the training split, then scores
+// against the held-out validation split using mean absolute error
+// of the predicted vs observed utility. Validation labels are
+// explicit-only — counterfactual / implicit-negative rows are
+// noisy estimates and the whole point of validation is to score
+// against ground truth.
+func (f *HyperParameterFitter) fitCounterfactualWeight(ctx context.Context, logger fitLogger) (float64, int64, bool, error) {
+	return f.fitLabelWeightByValidation(ctx, "counterfactual", logger)
 }
 
-func (f *HyperParameterFitter) fitImplicitNegativeWeight(ctx context.Context) (float64, int64, bool, error) {
-	return f.fitLabelWeight(ctx, "implicit_negative")
+func (f *HyperParameterFitter) fitImplicitNegativeWeight(ctx context.Context, logger fitLogger) (float64, int64, bool, error) {
+	return f.fitLabelWeightByValidation(ctx, "implicit_negative", logger)
 }
 
-// fitLabelWeight is the shared grid-search procedure for weight
-// hyperparameters whose effect is multiplicative on training
-// labels. Returns the best weight, sample count, and ok=true when
-// enough labels of the target source are present.
-func (f *HyperParameterFitter) fitLabelWeight(ctx context.Context, source string) (float64, int64, bool, error) {
-	// Verify enough samples first — count the candidate label
-	// source vs explicit labels in the same window.
-	var candidateN, explicitN int64
-	row := f.db.QueryRowContext(ctx, `
-		SELECT
-			SUM(CASE WHEN label_source = ? THEN 1 ELSE 0 END),
-			SUM(CASE WHEN label_source = 'explicit' THEN 1 ELSE 0 END)
-		FROM forest_training_examples
-		WHERE utility_label IS NOT NULL
-	`, source)
-	if err := row.Scan(&candidateN, &explicitN); err != nil {
-		// Table may not exist; soft fail.
+// fitLogger is the minimal logger interface the fitter needs. Lets
+// callers pass the forest's *slog.Logger or anything compatible
+// without coupling the fitter to slog directly.
+type fitLogger interface {
+	Info(msg string, args ...any)
+}
+
+type labeledTrainingRow struct {
+	example     baseScoreTrainingExample
+	labelSource string
+}
+
+// fitLabelWeightByValidation runs a real grid search: for each
+// candidate weight w, it trains a base-score SGD model over the 90%
+// training split with rows of label_source=`source` weighted at w
+// (explicit at 1.0; other sources at their stored weight), then
+// evaluates validation MAE on the 10% held-out split (explicit
+// labels only). Returns the w with lowest validation MAE.
+//
+// Validation set must contain at least valFloor explicit rows; if
+// not, we don't have enough ground truth to discriminate weights
+// and the function returns ok=false (caller falls back to placeholder).
+//
+// Logs each candidate's validation MAE at info so operators can
+// see why a weight was picked and whether the spread between
+// candidates is meaningful.
+func (f *HyperParameterFitter) fitLabelWeightByValidation(ctx context.Context, source string, logger fitLogger) (float64, int64, bool, error) {
+	// Pull every labeled row in one query (capped at fitTrainingPullCap
+	// to keep boot cost bounded).
+	const fitTrainingPullCap = 50000
+	const valFloor = 200          // need ≥ valFloor explicit rows for stable validation MAE
+	const valFraction = 0.1       // 90/10 train/val split
+	const splitSeed = uint64(1) // deterministic split per fit
+
+	rows, err := f.db.QueryContext(ctx, `
+		SELECT features, utility_label, label_weight, label_source
+		FROM   forest_training_examples
+		WHERE  utility_label IS NOT NULL
+		  AND  label_source IN (?, ?, ?)
+		ORDER BY updated_at DESC
+		LIMIT  ?
+	`, string(LabelSourceExplicit), string(LabelSourceCounterfactual), string(LabelSourceImplicitNegative), fitTrainingPullCap)
+	if err != nil {
 		return 0, 0, false, nil
+	}
+	defer rows.Close()
+
+	all := make([]labeledTrainingRow, 0, fitTrainingPullCap)
+	candidateN := int64(0)
+	explicitN := int64(0)
+	for rows.Next() {
+		var (
+			featuresBlob []byte
+			utility      sql.NullFloat64
+			weight       sql.NullFloat64
+			labelSrc     string
+		)
+		if err := rows.Scan(&featuresBlob, &utility, &weight, &labelSrc); err != nil {
+			return 0, 0, false, fmt.Errorf("scan training example: %w", err)
+		}
+		if !utility.Valid {
+			continue
+		}
+		components, ok := decodeFirstNFloat32sToFloat64(featuresBlob, BaseScoreComponentCount)
+		if !ok {
+			continue
+		}
+		w := 1.0
+		if weight.Valid && weight.Float64 > 0 {
+			w = weight.Float64
+		}
+		var arr [BaseScoreComponentCount]float64
+		for i := 0; i < BaseScoreComponentCount; i++ {
+			arr[i] = components[i]
+		}
+		all = append(all, labeledTrainingRow{
+			example: baseScoreTrainingExample{
+				components: arr,
+				label:      clamp01(utility.Float64),
+				weight:     w,
+			},
+			labelSource: labelSrc,
+		})
+		switch labelSrc {
+		case string(LabelSourceExplicit):
+			explicitN++
+		case source:
+			candidateN++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, false, fmt.Errorf("iterate training examples: %w", err)
 	}
 	if candidateN < minSamplesForFit || explicitN < minSamplesForFit {
 		return 0, 0, false, nil
 	}
 
-	// Grid search: for each candidate weight w, compute the
-	// weighted-label proxy = (candidate count × w + explicit count
-	// × 1) / (candidate count × w² + explicit count) — a heuristic
-	// that approximates the relative information content. Pick the
-	// w that's furthest from extremes (avoids 0 = ignore-counter,
-	// 1 = treat-as-explicit) while preserving the ratio of label
-	// sources observed.
-	//
-	// This is honestly a coarse proxy — it gets us a defensible
-	// starting point that the runtime A/B tuner can refine with
-	// real outcomes. The alternative (full SGD per candidate) is
-	// too expensive at boot.
+	// Deterministic 90/10 split. We split the explicit subset
+	// separately so the validation set is guaranteed explicit-only.
+	trainRows, valRows := splitForFitValidation(all, valFraction, splitSeed)
+	valExplicit := filterExplicit(valRows)
+	if int64(len(valExplicit)) < valFloor {
+		return 0, 0, false, nil
+	}
+
+	placeholder := PlaceholderHyperParameters()
 	bestW := 0.5
-	bestScore := -1.0
+	bestVal := math.Inf(1)
 	for w := 0.1; w <= 0.9+1e-9; w += 0.1 {
-		// Score: balance of effective label volume and weight
-		// being away from extremes.
-		eff := float64(candidateN)*w + float64(explicitN)
-		balance := 1 - math.Abs(w-0.5)*2 // peaks at w=0.5
-		score := math.Log1p(eff) * balance
-		if score > bestScore {
-			bestScore = score
+		examples := buildWeightedExamples(trainRows, source, w)
+		initWeights, initBias := initialTrainingWeights(nil)
+		model := trainBaseScoreSGD(
+			examples,
+			initWeights, initBias,
+			placeholder.BaseScoreEpochs,
+			placeholder.BaseScoreLearningRate,
+			placeholder.BaseScoreL1Reg,
+			placeholder.BaseScoreL2Reg,
+			placeholder.BaseScoreMaxWeight,
+		)
+		valMAE := validationMAE(valExplicit, model.weights, model.bias)
+		if logger != nil {
+			logger.Info("hyperparameter grid candidate evaluated",
+				"source", source,
+				"weight", fmt.Sprintf("%.2f", w),
+				"val_mae", valMAE,
+				"train_n", len(examples),
+				"val_n", len(valExplicit),
+			)
+		}
+		if valMAE < bestVal {
+			bestVal = valMAE
 			bestW = w
 		}
 	}
+	if logger != nil {
+		logger.Info("hyperparameter grid winner",
+			"source", source,
+			"weight", fmt.Sprintf("%.2f", bestW),
+			"val_mae", bestVal,
+			"train_n", len(trainRows),
+			"val_n", len(valExplicit),
+		)
+	}
 	return bestW, candidateN + explicitN, true, nil
+}
+
+// splitForFitValidation partitions rows deterministically into
+// train/val using a hash of the row index seeded with splitSeed.
+// Validation fraction is approximate (rows whose hashed index falls
+// below the threshold land in val).
+func splitForFitValidation(rows []labeledTrainingRow, valFraction float64, seed uint64) (train, val []labeledTrainingRow) {
+	if valFraction <= 0 || valFraction >= 1 {
+		return rows, nil
+	}
+	threshold := uint64(valFraction * float64(math.MaxUint64))
+	train = make([]labeledTrainingRow, 0, len(rows))
+	val = make([]labeledTrainingRow, 0, int(float64(len(rows))*valFraction)+1)
+	for i, r := range rows {
+		// Splitmix64 — fast, deterministic given (seed, index).
+		x := seed + uint64(i)*0x9E3779B97F4A7C15
+		x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9
+		x = (x ^ (x >> 27)) * 0x94D049BB133111EB
+		x = x ^ (x >> 31)
+		if x < threshold {
+			val = append(val, r)
+		} else {
+			train = append(train, r)
+		}
+	}
+	return train, val
+}
+
+// filterExplicit returns only rows whose label_source = explicit.
+func filterExplicit(rows []labeledTrainingRow) []baseScoreTrainingExample {
+	out := make([]baseScoreTrainingExample, 0, len(rows))
+	for _, r := range rows {
+		if r.labelSource == string(LabelSourceExplicit) {
+			out = append(out, r.example)
+		}
+	}
+	return out
+}
+
+// buildWeightedExamples copies rows into a baseScoreTrainingExample
+// slice, overriding the per-row weight to candidateWeight when the
+// row's label_source matches `source`. Other rows keep the weight
+// stored on the row (typically 1.0 for explicit, the configured
+// implicit_negative_weight or counterfactual_weight for the
+// observation-time write). This is what the SGD trainer consumes.
+func buildWeightedExamples(rows []labeledTrainingRow, source string, candidateWeight float64) []baseScoreTrainingExample {
+	out := make([]baseScoreTrainingExample, len(rows))
+	for i, r := range rows {
+		ex := r.example
+		if r.labelSource == source {
+			ex.weight = candidateWeight
+		}
+		out[i] = ex
+	}
+	return out
+}
+
+// validationMAE returns the mean absolute error between predicted
+// utility (sigmoid of the linear combination) and ground-truth
+// label across the validation set. Bounded to [0, 1] given that
+// both pred and label are.
+func validationMAE(examples []baseScoreTrainingExample, weights [BaseScoreComponentCount]float64, bias float64) float64 {
+	if len(examples) == 0 {
+		return math.Inf(1)
+	}
+	var sum float64
+	for k := range examples {
+		ex := &examples[k]
+		pred := baseScoreSigmoid(dotComponents(weights, ex.components) + bias)
+		d := pred - ex.label
+		if d < 0 {
+			d = -d
+		}
+		sum += d
+	}
+	return sum / float64(len(examples))
 }
 
 // fitExplorationRate fits the ε-greedy rate to observed retrieval

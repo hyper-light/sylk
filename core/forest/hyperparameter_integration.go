@@ -2,6 +2,7 @@ package forest
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -191,4 +192,106 @@ func (m *MemoryForest) RecordAdaptationObservation(ctx context.Context, calErr, 
 		SampleCount:      samples,
 		ObservedAt:       time.Now().UTC(),
 	}, againstProposed)
+}
+
+// recordAdaptationObservationsForOutcome computes per-retrieval
+// calibration + regret observations for every retrieval where
+// branchID was a candidate within the configured counterfactual
+// window, then feeds each into the tuner attributed to the
+// retrieval's pinned hyperparameter snapshot.
+//
+// Per-retrieval metrics:
+//
+//	CalibrationError = |observed_utility - candidate.predicted_utility|
+//	                   for the row where candidate.branch_id = branchID.
+//	RegretFrac       = 1.0 if the retrieval contained any non-returned
+//	                   candidate whose base_score exceeded the lowest
+//	                   returned candidate's base_score (ranking
+//	                   inversion), else 0.0.
+//
+// The tuner aggregates these into rolling per-arm windows (active
+// vs proposed) and decides whether to propose / promote / reject.
+//
+// Best-effort: any DB error logs at debug level and returns. The
+// labeling work this is paired with already succeeded; observations
+// are observational.
+func (m *MemoryForest) recordAdaptationObservationsForOutcome(ctx context.Context, branchID, sessionID string, status OutcomeStatus) {
+	if m == nil || m.tuner == nil || branchID == "" {
+		return
+	}
+	hp := m.hyperparams()
+	if hp == nil || hp.CounterfactualWindow <= 0 {
+		return
+	}
+	// Reuse the counterfactual window — the same retrievals it would
+	// label are the ones whose snapshots produced this outcome.
+	since := time.Now().UTC().Add(-hp.CounterfactualWindow).Unix()
+	obsUtility, _ := outcomeLabels(status)
+
+	// Single round-trip: per retrieval in window where branchID was a
+	// candidate, return the snapshot id, proposed flag, this branch's
+	// predicted utility, and the score-inversion bookends needed to
+	// compute regret.
+	rows, err := m.db.QueryContext(ctx, `
+		SELECT e.id,
+		       e.hyperparam_snapshot_id,
+		       e.proposed_hyperparams,
+		       rc_branch.predicted_utility,
+		       (SELECT MIN(rc2.base_score)
+		          FROM forest_retrieval_candidates rc2
+		         WHERE rc2.retrieval_event_id = e.id
+		           AND rc2.returned = 1) AS min_returned_base,
+		       (SELECT MAX(rc3.base_score)
+		          FROM forest_retrieval_candidates rc3
+		         WHERE rc3.retrieval_event_id = e.id
+		           AND rc3.returned = 0) AS max_unreturned_base
+		FROM   forest_retrieval_events e
+		JOIN   forest_retrieval_candidates rc_branch
+		         ON rc_branch.retrieval_event_id = e.id
+		WHERE  rc_branch.branch_id = ?
+		  AND  rc_branch.session_id = ?
+		  AND  e.requested_at >= ?
+	`, branchID, sessionID, since)
+	if err != nil {
+		if m.logger != nil {
+			m.logger.Debug("forest: adaptation observation query failed", "err", err.Error())
+		}
+		return
+	}
+	defer rows.Close()
+
+	now := time.Now().UTC()
+	for rows.Next() {
+		var (
+			eventID         string
+			snapshotID      int64
+			proposedInt     int64
+			predictedUtil   float64
+			minReturnedBase sql.NullFloat64
+			maxUnreturnedB  sql.NullFloat64
+		)
+		if err := rows.Scan(&eventID, &snapshotID, &proposedInt, &predictedUtil, &minReturnedBase, &maxUnreturnedB); err != nil {
+			if m.logger != nil {
+				m.logger.Debug("forest: adaptation observation scan failed", "err", err.Error())
+			}
+			continue
+		}
+		calErr := obsUtility - predictedUtil
+		if calErr < 0 {
+			calErr = -calErr
+		}
+		regret := 0.0
+		if maxUnreturnedB.Valid && minReturnedBase.Valid && maxUnreturnedB.Float64 > minReturnedBase.Float64 {
+			regret = 1.0
+		}
+		m.tuner.ObserveAndAdapt(ctx, AdaptationObservation{
+			CalibrationError: calErr,
+			RegretFrac:       regret,
+			SampleCount:      1,
+			ObservedAt:       now,
+		}, proposedInt != 0)
+	}
+	if err := rows.Err(); err != nil && m.logger != nil {
+		m.logger.Debug("forest: adaptation observation iterate failed", "err", err.Error())
+	}
 }

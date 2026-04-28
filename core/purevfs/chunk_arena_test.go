@@ -337,6 +337,76 @@ func TestChunkStore_ConcurrentPutGetReleaseUnderRace(t *testing.T) {
 	}
 }
 
+func TestChunkStore_CloseReleasesAllMappedBytes(t *testing.T) {
+	store := NewChunkStore(0)
+	for i := 0; i < 64; i++ {
+		content := bytes.Repeat([]byte{byte(i)}, 8192)
+		if _, _, err := store.Put(content); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if got := store.ArenaMappedBytes(); got == 0 {
+		t.Fatal("expected non-zero mapped bytes before close")
+	}
+	store.Close()
+	if got := store.ArenaMappedBytes(); got != 0 {
+		t.Fatalf("mapped bytes after close = %d, want 0", got)
+	}
+	// Close is idempotent.
+	store.Close()
+	if got := store.ArenaMappedBytes(); got != 0 {
+		t.Fatalf("mapped bytes after second close = %d, want 0", got)
+	}
+}
+
+func TestChunkStore_RepeatedCreateCloseDoesNotLeak(t *testing.T) {
+	// Anonymous mmap regions are invisible to the Go GC. Without a
+	// working Close path, repeated NewChunkStore + drop would
+	// monotonically grow process VSS until OS limits hit. This test
+	// pins the leak fix: 200 cycles must release every region.
+	const cycles = 200
+	for i := 0; i < cycles; i++ {
+		store := NewChunkStore(0)
+		content := bytes.Repeat([]byte{byte(i), byte(i >> 8)}, 4096)
+		if _, _, err := store.Put(content); err != nil {
+			t.Fatalf("cycle %d put: %v", i, err)
+		}
+		if store.ArenaMappedBytes() == 0 {
+			t.Fatalf("cycle %d: expected mapped bytes > 0", i)
+		}
+		store.Close()
+		if got := store.ArenaMappedBytes(); got != 0 {
+			t.Fatalf("cycle %d after close: mapped = %d", i, got)
+		}
+	}
+}
+
+func TestChunkStore_CloseReleasesOversizeRegions(t *testing.T) {
+	store := NewChunkStore(0)
+	// 2 MiB → exceeds top class → routed to oversize.
+	const size = 2 << 20
+	content := bytes.Repeat([]byte{0xAB}, size)
+	if _, _, err := store.Put(content); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if got := store.ArenaMappedBytes(); got < size {
+		t.Fatalf("mapped = %d, want >= %d", got, size)
+	}
+	store.Close()
+	if got := store.ArenaMappedBytes(); got != 0 {
+		t.Fatalf("mapped after close = %d, want 0", got)
+	}
+}
+
+func TestChunkStore_AllocateAfterCloseReturnsError(t *testing.T) {
+	store := NewChunkStore(0)
+	store.Close()
+	_, _, err := store.Put([]byte("late"))
+	if err == nil {
+		t.Fatal("expected error from Put after Close")
+	}
+}
+
 func TestChunkStore_MemoryLimitRejectsOversizedPut(t *testing.T) {
 	store := NewChunkStore(1024)
 	if _, _, err := store.Put(bytes.Repeat([]byte("x"), 512)); err != nil {

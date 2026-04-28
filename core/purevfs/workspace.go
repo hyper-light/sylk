@@ -176,6 +176,19 @@ func (w *Workspace) ChunkStore() *ChunkStore {
 	return w.store
 }
 
+// Close releases the workspace's underlying chunk arena. Call when the
+// workspace (and any FileBody it produced) is being permanently torn
+// down — without it, anonymous mmap regions stay mapped until process
+// exit. Idempotent and safe to call on a workspace whose store was
+// passed in by an external owner; the external owner must take care
+// not to call Close twice on the same store.
+func (w *Workspace) Close() {
+	if w == nil || w.store == nil {
+		return
+	}
+	w.store.Close()
+}
+
 func (w *Workspace) Head(branch string) (SnapshotID, error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()

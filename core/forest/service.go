@@ -588,6 +588,28 @@ func newExplorationRng(configSeed int64) *mathrand.Rand {
 // the event rather than enqueueing onto a channel whose drainer is
 // about to exit.
 func (m *MemoryForest) Close() error {
+	return m.CloseWithContext(context.Background())
+}
+
+// CloseWithContext is the context-aware close. Cancels the run
+// context and stop channel, then waits for tracked workers to drain
+// — but bounded by ctx. When ctx is canceled before drain completes,
+// returns ctx.Err() wrapped so the caller (typically a shutdown
+// orchestrator with a per-subsystem budget) can record the timeout
+// and proceed with the rest of the teardown rather than hanging
+// indefinitely on a stuck worker.
+//
+// The shutdown signal (runCancel + stopCh) is delivered exactly once
+// regardless of how many CloseWithContext calls race; the per-call
+// drain wait is independent and each caller observes its own ctx.
+//
+// On timeout the wg-monitor goroutine is intentionally left running.
+// It exits naturally when the workers eventually drain (or when the
+// process exits, which the kill watchdog guarantees within bounded
+// time). closeTuner is skipped on timeout because the tuner may be
+// one of the workers we're waiting for; any cleanup it owes is
+// reclaimed at process exit.
+func (m *MemoryForest) CloseWithContext(ctx context.Context) error {
 	m.stopOnce.Do(func() {
 		m.retrievalAuditClosed.Store(true)
 		if m.runCancel != nil {
@@ -595,9 +617,18 @@ func (m *MemoryForest) Close() error {
 		}
 		close(m.stopCh)
 	})
-	m.wg.Wait()
-	m.closeTuner()
-	return nil
+	waitDone := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+		m.closeTuner()
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("forest close: workers did not drain: %w", ctx.Err())
+	}
 }
 
 func normalizeLogger(logger *slog.Logger) *slog.Logger {

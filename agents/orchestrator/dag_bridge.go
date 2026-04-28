@@ -75,6 +75,45 @@ type ActiveDAGMeta struct {
 	TaskLabels             map[string]string
 	ResetPendingTaskPods   map[string]struct{}
 	ReleasePendingTaskPods map[string]struct{}
+
+	// taskPodSlots is a per-task creation gate (sync.Once) for lazy
+	// pod construction. Each call to ensureTaskPod resolves to exactly
+	// one buildTaskAgentPod invocation per task; concurrent dispatches
+	// to the same task share the result and the same atomic
+	// pod-with-VFS construction. Errors are sticky — a failed creation
+	// is not retried.
+	//
+	// Strict invariant: a pod is published into TaskPods only after
+	// buildTaskAgentPod returns successfully AND its sub-node
+	// registrations are applied. There is no observable state where a
+	// pod exists in TaskPods without VFS readiness (the volume manager
+	// is part of the atomic NewAgentPod call) or without its sub-node
+	// bookkeeping.
+	taskPodSlots map[string]*taskPodSlot
+	slotMu       sync.Mutex
+
+	// subNodesByTask is populated upfront during DAG ingest from the
+	// expanded sub-node map, then consumed inside ensureTaskPod so
+	// each pod is registered with its sub-nodes atomically with
+	// creation.
+	subNodesByTask map[string][]subNodeRegistration
+}
+
+// taskPodSlot holds the result of a single per-task pod construction
+// guarded by sync.Once. Errors are sticky.
+type taskPodSlot struct {
+	once sync.Once
+	pod  *shared.AgentPod
+	err  error
+}
+
+// subNodeRegistration is a deferred RegisterSubNode call applied to a
+// task's pod when it's lazily created.
+type subNodeRegistration struct {
+	subNodeID    string
+	parentNodeID string
+	stage        string
+	agentType    string
 }
 
 // DAGBridge wires the dag.Scheduler into the orchestrator's bus/WAL/store/buffers.
@@ -366,24 +405,17 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 
 	taskPodDefs := collectPipelineTaskPods(d)
 	taskPodDefsByID := indexPipelineTaskPodDefs(taskPodDefs)
-	b.logTrace("dag_execute_task_pods_build_begin", agentlog.EventRegistryEvent, map[string]any{
+	b.logTrace("dag_execute_task_pods_lazy_init", agentlog.EventRegistryEvent, map[string]any{
 		"dag_id":          d.ID(),
 		"task_pod_count":  len(taskPodDefs),
 		"task_pod_traces": tracePipelineTaskPodDefs(taskPodDefs),
 	})
-	taskPods, err := b.buildTaskPods(ctx, taskPodDefs, sessionID, runtime, specReg, registrar, logger, scribeFactory, sessionVFS)
-	if err != nil {
-		b.logTrace("dag_execute_task_pods_failed", agentlog.EventError, map[string]any{
-			"dag_id": d.ID(),
-			"error":  err.Error(),
-		})
-		return "", b.abortPreSubmitDAG(d.ID(), err)
-	}
-	b.logTrace("dag_execute_task_pods_built", agentlog.EventRegistryEvent, map[string]any{
-		"dag_id":          d.ID(),
-		"task_pod_count":  len(taskPods),
-		"task_pod_traces": tracePipelineTaskPodDefs(taskPodDefs),
-	})
+	// Lazy pod creation: TaskPods starts empty. Each pod is built
+	// atomically (buildTaskAgentPod, including VFS volume binding)
+	// at first dispatch via ensureTaskPod, gated by sync.Once for
+	// exactly-once construction per task. Tasks that never dispatch
+	// (e.g. failure-skipped layers) pay zero pod cost.
+	taskPods := make(map[string]*shared.AgentPod, len(taskPodDefs))
 
 	// 3b. Create BusNodeDispatcher with node-aware task-pod activation.
 	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, activator, nil)
@@ -393,14 +425,28 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	dispatcher.SetDispatchPermitWaiter(waitDispatchPermit)
 	dispatcher.SetExecutionHoldChecker(isExecutionHeld)
 	dispatcher.SetContextBudget(quota, specReg)
+	dagID := d.ID()
+	// Lazy-pod ensurer: dispatcher invokes this at the start of every
+	// node dispatch. First call per task atomically builds the pod and
+	// binds its VFS volume; subsequent calls hit the cache. Errors
+	// surface to Dispatch which fails the node before publishing work.
+	dispatcher.SetPodEnsurer(func(ctx context.Context, node *dag.Node) (*shared.AgentPod, error) {
+		if node == nil {
+			return nil, nil
+		}
+		taskID, _ := dispatchTaskIdentity(node)
+		return b.ensureTaskPod(ctx, dagID, taskID)
+	})
+	// Resolver remains as a synchronized cache-only lookup for code
+	// paths that should never trigger creation (e.g. callbacks running
+	// after a pod has already been ensured).
 	dispatcher.SetPodResolver(func(node *dag.Node) *shared.AgentPod {
 		if node == nil {
 			return nil
 		}
 		taskID, _ := dispatchTaskIdentity(node)
-		return taskPods[taskID]
+		return b.taskPodCacheLookup(dagID, taskID)
 	})
-	dagID := d.ID()
 	dispatcher.SetGuardReleasedCallback(func(string) {
 		b.releasePendingCompletedTaskPods(dagID)
 		b.maintainTaskPods(context.Background())
@@ -442,9 +488,11 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		StartedAt:              time.Now(),
 		SubNodeMap:             subNodeMap,
 		SubNodeTasks:           make(map[string]taskPipelineRef, len(subNodeMap)),
-		TaskLabels:             make(map[string]string, len(taskPods)),
+		TaskLabels:             make(map[string]string, len(taskPodDefs)),
 		ResetPendingTaskPods:   make(map[string]struct{}),
 		ReleasePendingTaskPods: make(map[string]struct{}),
+		taskPodSlots:           make(map[string]*taskPodSlot, len(taskPodDefs)),
+		subNodesByTask:         make(map[string][]subNodeRegistration),
 	}
 	b.mu.Unlock()
 
@@ -487,14 +535,28 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 			if taskID != "" && taskLabel != "" {
 				meta.TaskLabels[taskID] = taskLabel
 			}
+			// Defer pod.RegisterSubNode to ensureTaskPod — pods are now
+			// constructed lazily per task at dispatch time, atomically
+			// with their VFS volume. Sub-node bookkeeping is applied
+			// to the freshly-built pod inside the same atomic creation
+			// (see ensureTaskPod) so a pod is never observable in a
+			// state where its sub-node registry is incomplete.
+			if taskID != "" {
+				meta.subNodesByTask[taskID] = append(meta.subNodesByTask[taskID], subNodeRegistration{
+					subNodeID:    subNodeID,
+					parentNodeID: parentNodeID,
+					stage:        stage,
+					agentType:    node.AgentType(),
+				})
+			}
 		}
 		b.mu.Unlock()
-		if pod := taskPods[taskID]; pod != nil {
-			pod.RegisterSubNode(subNodeID, parentNodeID, stage, node.AgentType())
-		}
 	}
 
-	// 6b. Wire ACK callback now that the task pods are available.
+	// 6b. Wire ACK callback. By the time an ACK fires for a sub-node,
+	// the dispatcher has already ensured the pod via SetPodEnsurer
+	// (atomic with VFS binding). Pull from the synchronized cache —
+	// never triggers creation here.
 	dispatcher.SetACKCallback(func(nodeID string, ack *ACKResult) {
 		b.journal.LogNodeAcked(dagID, nodeID, ack.AgentID)
 		if _, isSub := subNodeMap[nodeID]; !isSub {
@@ -505,7 +567,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 			return
 		}
 		taskID, _ := dispatchTaskIdentity(node)
-		if pod := taskPods[taskID]; pod != nil {
+		if pod := b.taskPodCacheLookup(dagID, taskID); pod != nil {
 			pod.RecordSubNodeACK(nodeID, ack.AgentID, ack.AckedAt)
 		}
 	})
@@ -514,7 +576,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	b.logTrace("dag_execute_submit_begin", agentlog.EventRegistryEvent, map[string]any{
 		"dag_id": d.ID(),
 	})
-	_, err = b.scheduler.Submit(dagCtx, d, dispatcher)
+	_, err := b.scheduler.Submit(dagCtx, d, dispatcher)
 	if err != nil {
 		dagCancel()
 		b.cleanupDAG(d.ID())
@@ -542,47 +604,81 @@ func (b *DAGBridge) abortPreSubmitDAG(dagID string, err error) error {
 	return err
 }
 
-func (b *DAGBridge) buildTaskPods(
-	ctx context.Context,
-	taskDefs []pipelineTaskPodDef,
-	sessionID string,
-	runtime container.ContainerRuntime,
-	specReg *container.AgentSpecRegistry,
-	registrar PipelineRegistrar,
-	logger *slog.Logger,
-	scribeFactory shared.ScribeFactory,
-	sessionVFSLookup func(sessionID string) *versioning.SessionVFS,
-) (map[string]*shared.AgentPod, error) {
-	if len(taskDefs) == 0 {
+// ensureTaskPod returns a fully-ready pod for taskID in dagID. The
+// first call constructs the pod via TaskPodFactory (atomic with VFS
+// volume binding) and applies the deferred sub-node registrations.
+// Subsequent calls return the cached instance.
+//
+// Strict invariant: a pod published into ActiveDAGMeta.TaskPods has
+// (a) returned successfully from buildTaskAgentPod (so its VolumeManager
+// is fully configured) and (b) had every subNodeRegistration entry for
+// its task applied. Callers receiving a non-nil pod can dispatch to it
+// without further synchronization.
+//
+// Concurrency: the per-task creation is gated by sync.Once so concurrent
+// dispatches block on the same construction. Errors are sticky (a failed
+// creation is not retried — the DAG's existing failure paths handle it
+// just like any other dispatch error).
+func (b *DAGBridge) ensureTaskPod(_ context.Context, dagID, taskID string) (*shared.AgentPod, error) {
+	if taskID == "" {
 		return nil, nil
 	}
-	if runtime == nil || specReg == nil || sessionVFSLookup == nil {
-		return nil, fmt.Errorf("dag bridge: task pipeline infra not configured")
+	b.mu.RLock()
+	meta, ok := b.activeDAGs[dagID]
+	b.mu.RUnlock()
+	if !ok || meta == nil {
+		return nil, fmt.Errorf("dag bridge: dag %s not active", dagID)
+	}
+	factory := meta.TaskPodFactory
+	if factory == nil {
+		return nil, fmt.Errorf("dag bridge: dag %s has no task pod factory", dagID)
 	}
 
-	svfs := sessionVFSLookup(sessionID)
-	if svfs == nil {
-		return nil, fmt.Errorf("dag bridge: session VFS not configured for session %s", sessionID)
+	meta.slotMu.Lock()
+	slot, ok := meta.taskPodSlots[taskID]
+	if !ok {
+		slot = &taskPodSlot{}
+		meta.taskPodSlots[taskID] = slot
 	}
+	registrations := append([]subNodeRegistration(nil), meta.subNodesByTask[taskID]...)
+	meta.slotMu.Unlock()
 
-	taskPods := make(map[string]*shared.AgentPod, len(taskDefs))
-	for _, taskDef := range taskDefs {
-		b.logTrace("task_pod_build_begin", agentlog.EventRegistryEvent, tracePipelineTaskPodDef(taskDef))
-		taskPod, err := buildTaskAgentPod(taskDef, sessionID, runtime, specReg, registrar, logger, scribeFactory, svfs, b.eventLogger, b.activityPub, b.agentID)
+	slot.once.Do(func() {
+		pod, err := factory(taskID)
 		if err != nil {
-			b.logTrace("task_pod_build_failed", agentlog.EventError, mergeTraceMaps(tracePipelineTaskPodDef(taskDef), map[string]any{
-				"error": err.Error(),
-			}))
-			releaseTaskPods(taskPods)
-			return nil, err
+			slot.err = fmt.Errorf("dag bridge: build task pod %s: %w", taskID, err)
+			return
 		}
-		taskPods[taskDef.TaskID] = taskPod
-		b.logTrace("task_pod_build_ready", agentlog.EventRegistryEvent, mergeTraceMaps(tracePipelineTaskPodDef(taskDef), map[string]any{
-			"member_types": append([]string(nil), PipelineAgentTypes[:]...),
-		}))
-	}
+		// Apply deferred sub-node registrations BEFORE publishing the
+		// pod into TaskPods so any reader sees a fully-configured pod.
+		for _, reg := range registrations {
+			pod.RegisterSubNode(reg.subNodeID, reg.parentNodeID, reg.stage, reg.agentType)
+		}
+		meta.slotMu.Lock()
+		meta.TaskPods[taskID] = pod
+		meta.slotMu.Unlock()
+		slot.pod = pod
+	})
+	return slot.pod, slot.err
+}
 
-	return taskPods, nil
+// taskPodCacheLookup returns the cached pod for taskID, or nil if
+// ensureTaskPod hasn't yet constructed it. Synchronized read — safe
+// to call from any goroutine. Does NOT trigger creation; callers that
+// need creation must use ensureTaskPod.
+func (b *DAGBridge) taskPodCacheLookup(dagID, taskID string) *shared.AgentPod {
+	if taskID == "" {
+		return nil
+	}
+	b.mu.RLock()
+	meta, ok := b.activeDAGs[dagID]
+	b.mu.RUnlock()
+	if !ok || meta == nil {
+		return nil
+	}
+	meta.slotMu.Lock()
+	defer meta.slotMu.Unlock()
+	return meta.TaskPods[taskID]
 }
 
 type pipelineTaskPodDef struct {

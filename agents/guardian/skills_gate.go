@@ -6,12 +6,20 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 )
+
+// GuardianPreflightClassifierVersion identifies the active classifier
+// rule set. Bumped whenever classifyPreflightPath / classifyRiskFactor
+// or evaluateTaskPreflight semantics change. Orchestrator and architect
+// both witness this in the attestation; a stale verdict (older version)
+// is invalidated by the architect's plan freshness flow on regeneration.
+const GuardianPreflightClassifierVersion = "guardian-preflight-v1"
 
 // ---------------------------------------------------------------------------
 // review_gate — Domain: gate, Priority: 90
@@ -30,7 +38,34 @@ type reviewGateInput struct {
 	TestRequirements    []string `json:"test_requirements,omitempty"`
 	Guidelines          []string `json:"guidelines,omitempty"`
 	ImplementationGuide string   `json:"implementation_guide,omitempty"`
+
+	// Batched preflight (action=preflight_plan) — architect issues a
+	// single call covering every task in the plan, receives a unified
+	// attestation back. Replaces the previous per-task RPC loop the
+	// orchestrator ran post-approval.
+	PlanRevision    int                       `json:"plan_revision,omitempty"`
+	PlanContentHash string                    `json:"plan_content_hash,omitempty"`
+	Tasks           []preflightPlanTaskInput  `json:"tasks,omitempty"`
 }
+
+// preflightPlanTaskInput carries one task's preflight-relevant fields.
+// Mirrors the per-task fields of reviewGateInput so the same
+// classification logic applies unchanged.
+type preflightPlanTaskInput struct {
+	TaskID              string   `json:"task_id"`
+	AgentType           string   `json:"agent_type,omitempty"`
+	Complexity          string   `json:"complexity,omitempty"`
+	AffectedFiles       []string `json:"affected_files,omitempty"`
+	RiskFactors         []string `json:"risk_factors,omitempty"`
+	TestRequirements    []string `json:"test_requirements,omitempty"`
+	Guidelines          []string `json:"guidelines,omitempty"`
+	ImplementationGuide string   `json:"implementation_guide,omitempty"`
+}
+
+// PlanPreflightAttestation, PlanPreflightTaskVerdict types moved to
+// agents/shared/preflight_attestation.go so architect and orchestrator
+// can consume them without import cycles. Guardian is still the
+// canonical issuer; only the type definition migrated.
 
 func reviewGateSkill(g *Guardian) *skills.Skill {
 	type handler = func(context.Context, *reviewGateInput) (any, error)
@@ -98,6 +133,9 @@ func reviewGateSkill(g *Guardian) *skills.Skill {
 		"preflight_task": func(_ context.Context, p *reviewGateInput) (any, error) {
 			return evaluateTaskPreflight(p), nil
 		},
+		"preflight_plan": func(_ context.Context, p *reviewGateInput) (any, error) {
+			return evaluatePlanPreflight(g, p), nil
+		},
 	}
 
 	return skills.NewSkill("review_gate").
@@ -106,13 +144,14 @@ func reviewGateSkill(g *Guardian) *skills.Skill {
 			"- review_diff: Review a diff for suspicious patterns (params: diff_content [required])\n"+
 			"- pre_commit_check: Full pre-commit review including credential scan (params: diff_content [required], paths)\n"+
 			"- detect_anomaly: Detect operational anomalies across the system\n"+
-			"- preflight_task: Deterministically assess a planned task before mutation begins").
+			"- preflight_task: Deterministically assess a planned task before mutation begins\n"+
+			"- preflight_plan: Batched per-task preflight for an entire plan; returns a Guardian-issued PlanPreflightAttestation that the orchestrator verifies at ingest (replaces N sequential post-approval RPCs).").
 		Domain("gate").
 		Keywords("review", "diff", "pre-commit", "gate", "check", "anomaly").
 		Priority(90).
 		TokenEstimate(500).
 		EnumParam("action", "Gate action", []string{
-			"review_diff", "pre_commit_check", "detect_anomaly", "preflight_task",
+			"review_diff", "pre_commit_check", "detect_anomaly", "preflight_task", "preflight_plan",
 		}, true).
 		StringParam("diff_content", "Diff content to review (for review_diff, pre_commit_check)", false).
 		ArrayParam("paths", "Staged file paths (for pre_commit_check)", "string", false).
@@ -179,6 +218,100 @@ type taskPreflightResult struct {
 	Warnings         []string `json:"warnings,omitempty"`
 	BlockingFindings []string `json:"blocking_findings,omitempty"`
 	UserMessage      string   `json:"user_message"`
+}
+
+// evaluatePlanPreflight runs the deterministic classifier across every
+// task in the plan and assembles a single attestation. This is the
+// architect-facing batched entry point that replaces the orchestrator's
+// post-approval N-sequential-RPC loop.
+//
+// Strict pass-through of classifier results — same logic as
+// evaluateTaskPreflight, but applied once per task in a single call.
+// The architect attaches the attestation to PlanHandoff; the
+// orchestrator verifies (plan_content_hash, classifier_version,
+// per_task coverage) at ingest and does not re-run the classifier.
+func evaluatePlanPreflight(g *Guardian, input *reviewGateInput) *shared.PlanPreflightAttestation {
+	att := &shared.PlanPreflightAttestation{
+		PlanID:            strings.TrimSpace(input.PlanID),
+		PlanRevision:      input.PlanRevision,
+		PlanContentHash:   strings.TrimSpace(input.PlanContentHash),
+		ClassifierVersion: GuardianPreflightClassifierVersion,
+		IssuedAt:          time.Now().UTC(),
+		IssuerAgentID:     guardianIssuerID(g),
+		PerTask:           make(map[string]*shared.PlanPreflightTaskVerdict, len(input.Tasks)),
+	}
+	for _, task := range input.Tasks {
+		taskID := strings.TrimSpace(task.TaskID)
+		if taskID == "" {
+			continue
+		}
+		// Reuse the per-task classifier by adapting to its input shape.
+		taskInput := &reviewGateInput{
+			PlanID:              att.PlanID,
+			TaskID:              taskID,
+			AgentType:           task.AgentType,
+			Complexity:          task.Complexity,
+			AffectedFiles:       task.AffectedFiles,
+			RiskFactors:         task.RiskFactors,
+			TestRequirements:    task.TestRequirements,
+			Guidelines:          task.Guidelines,
+			ImplementationGuide: task.ImplementationGuide,
+		}
+		raw := evaluateTaskPreflight(taskInput)
+		verdict := taskVerdictFromRaw(taskID, task.AgentType, raw)
+		att.PerTask[taskID] = verdict
+		if len(verdict.BlockingFindings) > 0 {
+			att.HasBlockingFindings = true
+		}
+		if len(verdict.Warnings) > 0 {
+			att.HasWarnings = true
+		}
+		if verdict.RequiresApproval {
+			att.RequiresApproval = true
+		}
+	}
+	return att
+}
+
+// taskVerdictFromRaw decodes the map[string]any returned by
+// evaluateTaskPreflight into a typed PlanPreflightTaskVerdict. The
+// underlying classifier emits an untyped map; rather than restructure
+// it (and risk silently changing existing per-task callers), we
+// project into the typed verdict here.
+func taskVerdictFromRaw(taskID, agentType string, raw map[string]any) *shared.PlanPreflightTaskVerdict {
+	v := &shared.PlanPreflightTaskVerdict{
+		TaskID:    taskID,
+		AgentType: agentType,
+	}
+	if c, ok := raw["clean"].(bool); ok {
+		v.Clean = c
+	}
+	if r, ok := raw["requires_approval"].(bool); ok {
+		v.RequiresApproval = r
+	}
+	if w, ok := raw["warnings"].([]string); ok {
+		v.Warnings = w
+	}
+	if b, ok := raw["blocking_findings"].([]string); ok {
+		v.BlockingFindings = b
+	}
+	if msg, ok := raw["user_message"].(string); ok {
+		v.UserMessage = msg
+	}
+	return v
+}
+
+// guardianIssuerID returns the canonical agent ID for attestation
+// provenance. Falls back to the agent type when the runtime ID
+// hasn't been minted yet (test setups).
+func guardianIssuerID(g *Guardian) string {
+	if g == nil {
+		return "guardian"
+	}
+	if id := strings.TrimSpace(g.id); id != "" {
+		return id
+	}
+	return "guardian"
 }
 
 func evaluateTaskPreflight(input *reviewGateInput) map[string]any {

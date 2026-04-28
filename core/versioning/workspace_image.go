@@ -145,8 +145,13 @@ func (r *workspaceImageRegistry) Release(key string) {
 	if ref.refs > 0 {
 		return
 	}
-	if ref.image != nil && ref.image.memory != nil {
-		ref.image.memory.Release()
+	if ref.image != nil {
+		if ref.image.workspace != nil {
+			ref.image.workspace.Close()
+		}
+		if ref.image.memory != nil {
+			ref.image.memory.Release()
+		}
 	}
 	delete(r.images, key)
 }

@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/dag"
 	coreversioning "github.com/adalundhe/sylk/core/versioning"
 )
@@ -153,6 +154,14 @@ type DesignPlan struct {
 	LeaseExpiry time.Time            `json:"lease_expiry"`
 	LeaseHolder string               `json:"lease_holder,omitempty"`
 	PendingWork *PendingContinuation `json:"pending_work,omitempty"`
+
+	// GuardianAttestation, when non-nil, is the Guardian-issued
+	// preflight verdict for this plan revision. Populated during plan
+	// finalization (after generateAtomicTasks + createWorkflowDAG)
+	// and travels with PlanHandoff at dispatch. Invalidated on every
+	// plan revision (Modify path) so the next presentation gets a
+	// fresh verdict bound to the new task set's content hash.
+	GuardianAttestation *agentshared.PlanPreflightAttestation `json:"guardian_attestation,omitempty"`
 
 	// sm is not serialized; reconstructed on restore or creation.
 	sm *PlanStateMachine `json:"-"`
@@ -630,11 +639,43 @@ type ResearchProposal struct {
 // orchestrator when a plan is approved for execution. Contains everything
 // the orchestrator needs to build a DAG, create task records, and begin
 // execution without reading external files.
+// PlanHandoffPhase identifies which step of the two-phase orchestrator
+// ingest a particular handoff payload represents.
+//
+// Empty (default) preserves the legacy single-phase flow: the
+// orchestrator runs prepareExecution + submitExecution in one shot
+// when an ingest_plan handler receives the handoff. This is what
+// existing tests and any non-upgraded caller produces.
+//
+// "prepare" splits the work: the orchestrator does prepareExecution
+// only and stores a prepared DAG. The plan does NOT run yet.
+// Architect publishes this immediately after plan-finalization
+// (after Guardian preflight), so the orchestrator's prep cost
+// overlaps with the user's approval-dialog review time.
+//
+// "execute_prepared" looks up the prepared DAG for plan_id and
+// transitions it to running via scheduler.Submit. Architect
+// publishes this on approval. Tens-of-ms vs. the legacy path's
+// hundreds-of-ms because all the prep work has already finished.
+//
+// "discard_prepared" drops a prepared DAG without ever submitting.
+// Architect publishes this on user reject/modify so the orchestrator
+// frees its prep state cheaply.
+type PlanHandoffPhase string
+
+const (
+	PlanHandoffPhaseLegacy           PlanHandoffPhase = ""
+	PlanHandoffPhasePrepare          PlanHandoffPhase = "prepare"
+	PlanHandoffPhaseExecutePrepared  PlanHandoffPhase = "execute_prepared"
+	PlanHandoffPhaseDiscardPrepared  PlanHandoffPhase = "discard_prepared"
+)
+
 type PlanHandoff struct {
 	PlanID          string                `json:"plan_id"`
 	SessionID       string                `json:"session_id"`
 	Query           string                `json:"query"`
 	Revision        int                   `json:"revision"`
+	Phase           PlanHandoffPhase      `json:"phase,omitempty"`
 	Tasks           []*HandoffTask        `json:"tasks"`
 	ExecutionLayers [][]string            `json:"execution_layers"`
 	CriticalPath    []string              `json:"critical_path"`
@@ -647,6 +688,18 @@ type PlanHandoff struct {
 	Architecture    *SolutionArchitecture `json:"architecture,omitempty"`
 	Requirements    *Requirements         `json:"requirements,omitempty"`
 	Assumptions     []string              `json:"assumptions,omitempty"`
+
+	// GuardianAttestation is Guardian's batched preflight verdict for
+	// every task in this handoff. The architect requests it once
+	// during plan finalization and folds findings into the approval
+	// dialog — the user's approve click acts on a plan that Guardian
+	// has already gated. The orchestrator verifies the attestation
+	// at ingest (PlanContentHash recompute, ClassifierVersion check,
+	// PerTask coverage) and does NOT re-run the classifier.
+	//
+	// Guardian remains the canonical gate authority; this field just
+	// carries the gate's verdict alongside the plan it gated.
+	GuardianAttestation *agentshared.PlanPreflightAttestation `json:"guardian_attestation,omitempty"`
 }
 
 // HandoffTask is the wire format for a single task in PlanHandoff.

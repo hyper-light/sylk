@@ -252,10 +252,32 @@ func (o *Orchestrator) beginPlanHandoffReceiptForAttempt(
 }
 
 func (a *planHandoffIngestAttempt) ingest(ctx context.Context) error {
+	// Two-phase ingest dispatch:
+	//   - Phase=Prepare → prep only, store as prepared DAG.
+	//   - Phase=ExecutePrepared → look up prepared DAG, scheduler.Submit only.
+	//   - Phase=DiscardPrepared → drop prepared DAG, no submit.
+	//   - Phase=Legacy ("") → existing single-phase behavior.
+	switch a.handoff.Phase {
+	case architect.PlanHandoffPhaseExecutePrepared:
+		return a.executePrepared(ctx)
+	case architect.PlanHandoffPhaseDiscardPrepared:
+		return a.discardPrepared(ctx)
+	}
+
 	if err := a.prepareExecution(ctx); err != nil {
 		return err
 	}
 	a.publishReceiptSummary(ctx)
+
+	// Phase=Prepare splits here: register the prepared DAG so a later
+	// ExecutePrepared can submit it, but don't submit now.
+	if a.handoff.Phase == architect.PlanHandoffPhasePrepare {
+		a.orchestrator.registerPreparedDAG(a.handoff.PlanID, a)
+		a.publishIngestedEvent()
+		return nil
+	}
+
+	// Legacy single-phase: submit immediately after prep.
 	if err := a.submitExecution(ctx); err != nil {
 		return err
 	}
@@ -263,10 +285,83 @@ func (a *planHandoffIngestAttempt) ingest(ctx context.Context) error {
 	return nil
 }
 
+// executePrepared submits a previously-prepared DAG. Looks up the
+// prepared attempt by plan_id, transfers its built DAG to this
+// attempt, and runs scheduler.Submit. The prepared registry entry
+// is consumed (removed) on successful submit.
+//
+// On miss (no prepared DAG for plan_id), falls back to full ingest
+// — graceful degradation if the architect's pre-prepare publish
+// failed or was lost.
+func (a *planHandoffIngestAttempt) executePrepared(ctx context.Context) error {
+	prepared := a.orchestrator.takePreparedDAG(a.handoff.PlanID)
+	if prepared == nil {
+		// Graceful fallback: no prepared state found. Run a full
+		// ingest using THIS attempt's data (which carries the same
+		// payload as the original prepare publish).
+		a.orchestrator.logInfo("executePrepared: no prepared DAG; falling back to full ingest",
+			"plan_id", a.handoff.PlanID)
+		if err := a.prepareExecution(ctx); err != nil {
+			return err
+		}
+		a.publishReceiptSummary(ctx)
+		if err := a.submitExecution(ctx); err != nil {
+			return err
+		}
+		a.publishIngestedEvent()
+		return nil
+	}
+	// Adopt prepared state into this attempt so the existing submit
+	// path runs against the already-built DAG.
+	a.dag = prepared.dag
+	a.preflight = prepared.preflight
+	a.workflowID = prepared.workflowID
+	if err := a.submitExecution(ctx); err != nil {
+		return err
+	}
+	a.publishIngestedEvent()
+	return nil
+}
+
+// discardPrepared removes a prepared DAG entry without submitting.
+// No-op if no prepared state exists. Releases any per-task pod
+// state (in our design, none — pods are lazy and not constructed
+// during prepare; the only state is in-memory DAG + WAL/SQLite rows).
+func (a *planHandoffIngestAttempt) discardPrepared(_ context.Context) error {
+	prepared := a.orchestrator.takePreparedDAG(a.handoff.PlanID)
+	if prepared == nil {
+		// Already discarded or never prepared — idempotent no-op.
+		return nil
+	}
+	a.orchestrator.logInfo("discardPrepared: dropped prepared DAG",
+		"plan_id", a.handoff.PlanID,
+		"workflow_id", prepared.workflowID)
+	return nil
+}
+
 func (a *planHandoffIngestAttempt) prepareExecution(ctx context.Context) error {
-	preflight, err := a.orchestrator.guardianPreflightPlan(ctx, a.handoff)
-	if err != nil {
-		return a.fail("guardian_preflight", "guardian preflight failed", err)
+	// Fast path: Guardian-issued attestation travels with the plan.
+	// The architect has already gated this revision (Guardian still
+	// the canonical issuer; just consulted once at plan finalization
+	// rather than N times post-approval). Verify and adopt without
+	// re-running the classifier.
+	preflight, verifyErr := verifyAndAdoptAttestation(a.handoff)
+	if verifyErr != nil {
+		// Tampered or wrong-revision attestation — safer to fail than
+		// to silently re-derive (which would also mask whatever
+		// caused the mismatch).
+		return a.fail("guardian_attestation_invalid", "guardian attestation verification failed", verifyErr)
+	}
+	if preflight == nil {
+		// Legacy fallback: no attestation present. Run the original
+		// per-task RPC loop. Should be rare once the architect
+		// always issues attestations during plan finalization; kept
+		// here so any code path that hasn't been updated still gates.
+		fallback, err := a.orchestrator.guardianPreflightPlan(ctx, a.handoff)
+		if err != nil {
+			return a.fail("guardian_preflight", "guardian preflight failed", err)
+		}
+		preflight = fallback
 	}
 	a.preflight = preflight
 	a.orchestrator.createWorkflowAndTasks(a.handoff, a.workflowID, preflight)

@@ -457,6 +457,14 @@ func (m *MemoryForest) recordProjectorLabels(event *Event, branchID string) int6
 // counterfactual labels for co-candidates from recent retrievals.
 // Returns the total label count (explicit + counterfactual) for the
 // "schedule training" decision in runProjectorPostCommit.
+//
+// As a side-effect, also feeds calibration / regret observations for
+// every retrieval that contained this branch within the
+// counterfactual window into the runtime hyperparameter tuner. Each
+// observation is attributed to the snapshot (active vs proposed)
+// that scored the originating retrieval, captured on the audit row
+// at retrieve-time. Best-effort: failures here are observational and
+// don't affect labeling.
 func (m *MemoryForest) applyOutcomeLabel(branchID, sessionID string, status OutcomeStatus) int64 {
 	result, err := m.labelExamplesForOutcomeWithCounterfactuals(m.runCtx, branchID, sessionID, status)
 	if err != nil {
@@ -464,6 +472,7 @@ func (m *MemoryForest) applyOutcomeLabel(branchID, sessionID string, status Outc
 			"branch_id", branchID, "status", string(status), "err", err.Error())
 		return 0
 	}
+	m.recordAdaptationObservationsForOutcome(m.runCtx, branchID, sessionID, status)
 	return result.Explicit + result.Counterfactual
 }
 

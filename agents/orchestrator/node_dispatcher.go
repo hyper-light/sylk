@@ -47,6 +47,12 @@ type BusNodeDispatcher struct {
 	activator          guide.PodActivator // fallback when pod is nil
 	pod                *shared.AgentPod   // per-node guard lifecycle manager
 	podResolver        func(*dag.Node) *shared.AgentPod
+	// podEnsurer returns a fully-ready pod (atomic with VFS binding)
+	// for the given node. Called at dispatch entry; on error, the
+	// dispatch fails for that node and no work is published. Strict
+	// invariant: a pod returned by podEnsurer has its VFS volume
+	// configured and its sub-node bookkeeping applied.
+	podEnsurer func(ctx context.Context, node *dag.Node) (*shared.AgentPod, error)
 	ackTimeout         time.Duration
 	pending            sync.Map // nodeID → chan *dag.NodeResult
 	dispatchDone       sync.Map // nodeID → chan struct{}
@@ -139,6 +145,16 @@ func (d *BusNodeDispatcher) SetContextBudget(quota *container.ResourceQuota, spe
 	d.specRegistry = specRegistry
 }
 
+// SetPodEnsurer installs a node-aware pod ensurer that lazily
+// constructs the pod (atomically with its VFS binding) at dispatch
+// time. Errors propagate so dispatch fails before any work is sent.
+// Preferred over SetPodResolver for production wiring; the resolver
+// is left as a cache-only lookup for code paths that should not
+// trigger creation.
+func (d *BusNodeDispatcher) SetPodEnsurer(fn func(ctx context.Context, node *dag.Node) (*shared.AgentPod, error)) {
+	d.podEnsurer = fn
+}
+
 // SetPodResolver installs a node-aware pod resolver. When present, it
 // overrides the single-pod field for dispatch/guard lifecycle.
 func (d *BusNodeDispatcher) SetPodResolver(fn func(*dag.Node) *shared.AgentPod) {
@@ -161,6 +177,28 @@ func (d *BusNodeDispatcher) GetACKResult(nodeID string) *ACKResult {
 // Phase 2: Block on result channel for execution completion.
 func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parentResults map[string]*dag.NodeResult) (*dag.NodeResult, error) {
 	d.logNodeTrace(node, "dispatch_enter", agentlog.EventTaskDispatched, nil)
+	// Lazy-pod ensure: when an ensurer is installed, build the pod
+	// (atomically with its VFS volume) before any other dispatch
+	// setup. On failure the entire dispatch fails — no message is
+	// published, no claim is posted, no permit is acquired.
+	//
+	// Strict invariant: once Dispatch proceeds past this point with a
+	// non-nil pod, the pod is fully ready (VFS bound, sub-nodes
+	// registered). There is no race window where a pod is observable
+	// without VFS readiness.
+	if d.podEnsurer != nil {
+		pod, err := d.podEnsurer(ctx, node)
+		if err != nil {
+			d.logNodeTrace(node, "dispatch_pod_ensure_failed", agentlog.EventError, map[string]any{
+				"error": err.Error(),
+			})
+			return nil, fmt.Errorf("dispatch %s: ensure pod: %w", node.ID(), err)
+		}
+		if pod != nil {
+			d.nodePods.Store(node.ID(), pod)
+			defer d.nodePods.Delete(node.ID())
+		}
+	}
 	ch := make(chan *dag.NodeResult, 1)
 	done := make(chan struct{})
 	ackCh := make(chan *ACKResult, 1)
@@ -168,9 +206,14 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	d.pending.Store(node.ID(), ch)
 	d.dispatchDone.Store(node.ID(), done)
 	d.ackWaiters.Store(node.ID(), ackCh)
-	if pod := d.resolvePod(node); pod != nil {
-		d.nodePods.Store(node.ID(), pod)
-		defer d.nodePods.Delete(node.ID())
+	// When the ensurer is in use, nodePods was already populated above.
+	// Otherwise (legacy resolver-only setup, e.g. tests), fall back to
+	// the resolver path so existing behavior is unchanged.
+	if d.podEnsurer == nil {
+		if pod := d.resolvePod(node); pod != nil {
+			d.nodePods.Store(node.ID(), pod)
+			defer d.nodePods.Delete(node.ID())
+		}
 	}
 	defer d.pending.Delete(node.ID())
 	defer d.dispatchDone.Delete(node.ID())

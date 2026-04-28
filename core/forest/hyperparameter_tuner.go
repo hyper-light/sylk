@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"gonum.org/v1/gonum/stat/distuv"
 )
 
 // ─── HyperParameterTuner: orchestrator (combines options 1–4) ────────
@@ -169,7 +171,7 @@ func (t *HyperParameterTuner) bootstrapSnapshot(ctx context.Context) (*HyperPara
 	}
 
 	// 2. Workload-derived initialization from ledger.
-	hp, anyFitted, err := t.fitter.FitFromLedger(ctx)
+	hp, anyFitted, err := t.fitter.FitFromLedger(ctx, t.logger)
 	if err != nil {
 		t.logger.Warn("hyperparameter fitter failed; falling back to placeholder", "err", err)
 		return t.persistFresh(ctx, PlaceholderHyperParameters())
@@ -589,47 +591,79 @@ func meanCalibrationError(obs []AdaptationObservation) float64 {
 	return sum / float64(len(obs))
 }
 
-// welchSignificant returns true when the difference of means
-// between two unequal-variance samples is significant at the given
-// alpha level. Approximated via z-test on |Δμ|/se(Δ); for sample
-// sizes ≥ minSamplesForAdaptDecision (64) the t-distribution is
-// close enough to normal that this is acceptable.
+// welchSignificant returns true when the difference of CalibrationError
+// means between two unequal-variance samples is significant at the
+// given alpha level (two-sided) under Welch's t-test.
+//
+// Algorithm:
+//
+//	t  = (μ_A - μ_B) / √(s²_A/n_A + s²_B/n_B)
+//	df = (s²_A/n_A + s²_B/n_B)² / [(s²_A/n_A)²/(n_A-1) + (s²_B/n_B)²/(n_B-1)]
+//	    (Welch–Satterthwaite)
+//	p  = 2 · (1 − F_T(|t|; df))
+//
+// Returns p < alpha. Uses unbiased sample variance (n-1 denominator);
+// degrades to false when either sample has fewer than 2 observations
+// or when both samples are constant (zero combined variance).
+//
+// Critical-value lookup is via gonum's Student-t CDF rather than a
+// fixed z=1.96 approximation, so the test is correctly conservative
+// for small n (where the t-distribution has heavier tails than the
+// normal).
 func welchSignificant(a, b []AdaptationObservation, alpha float64) bool {
 	if len(a) < 2 || len(b) < 2 {
 		return false
 	}
-	var sumA, sumB, sqA, sqB float64
-	for _, o := range a {
-		sumA += o.CalibrationError
-		sqA += o.CalibrationError * o.CalibrationError
-	}
-	for _, o := range b {
-		sumB += o.CalibrationError
-		sqB += o.CalibrationError * o.CalibrationError
-	}
+	meanA, varA := sampleMeanVarUnbiased(a)
+	meanB, varB := sampleMeanVarUnbiased(b)
 	nA := float64(len(a))
 	nB := float64(len(b))
-	meanA := sumA / nA
-	meanB := sumB / nB
-	varA := sqA/nA - meanA*meanA
-	varB := sqB/nB - meanB*meanB
-	if varA < 0 {
-		varA = 0
-	}
-	if varB < 0 {
-		varB = 0
-	}
-	se := math.Sqrt(varA/nA + varB/nB)
-	if se <= 0 {
+	seSq := varA/nA + varB/nB
+	if seSq <= 0 {
 		return false
 	}
-	z := math.Abs(meanA-meanB) / se
-	// 2-sided z critical for α=0.05 ≈ 1.96; for α=0.01 ≈ 2.58.
-	zCritical := 1.96
-	if alpha <= 0.01 {
-		zCritical = 2.58
+	se := math.Sqrt(seSq)
+	tStat := math.Abs(meanA-meanB) / se
+
+	// Welch–Satterthwaite degrees of freedom.
+	num := seSq * seSq
+	denomA := (varA / nA) * (varA / nA) / (nA - 1)
+	denomB := (varB / nB) * (varB / nB) / (nB - 1)
+	if denomA+denomB <= 0 {
+		return false
 	}
-	return z > zCritical
+	df := num / (denomA + denomB)
+	if !(df > 0) || math.IsNaN(df) || math.IsInf(df, 0) {
+		return false
+	}
+	dist := distuv.StudentsT{Mu: 0, Sigma: 1, Nu: df}
+	pTwoSided := 2 * (1 - dist.CDF(tStat))
+	return pTwoSided < alpha
+}
+
+// sampleMeanVarUnbiased returns the sample mean + Bessel-corrected
+// (n-1 denominator) sample variance of CalibrationError values.
+// Returns (0,0) for n < 2 — caller is expected to guard upstream.
+func sampleMeanVarUnbiased(samples []AdaptationObservation) (mean, variance float64) {
+	n := len(samples)
+	if n < 2 {
+		return 0, 0
+	}
+	var sum float64
+	for _, o := range samples {
+		sum += o.CalibrationError
+	}
+	mean = sum / float64(n)
+	var ssd float64
+	for _, o := range samples {
+		d := o.CalibrationError - mean
+		ssd += d * d
+	}
+	variance = ssd / float64(n-1)
+	if variance < 0 {
+		variance = 0
+	}
+	return mean, variance
 }
 
 func appendBoundedObservation(buf []AdaptationObservation, obs AdaptationObservation, cap int) []AdaptationObservation {
