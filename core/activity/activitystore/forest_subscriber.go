@@ -2,7 +2,7 @@ package activitystore
 
 import (
 	"context"
-	"sync"
+	"log/slog"
 	"sync/atomic"
 
 	"github.com/adalundhe/sylk/core/activity"
@@ -15,6 +15,14 @@ import (
 // precedent emissions), and the high-signal operational primitives
 // (tool calls, LLM round-trips, forest consults) — and forwards them
 // to a caller-supplied harvest function.
+//
+// The harvest function MUST be non-blocking. The canonical wiring
+// pairs this subscriber with HarvestDispatcher (in this package)
+// which provides bounded queue + worker pool + activity-ID dedupe +
+// drop/error counters in front of the synchronous forest write. This
+// satisfies the substrate's "async by default" invariant — caller
+// goroutines emitting Fabric activities never block on a SQLite
+// ledger write.
 //
 // Harvesting is **decoupled from the activity's storage Resolution
 // tier**. The Resolution tier decides how long the fabric's own
@@ -32,8 +40,7 @@ type ForestSubscriber struct {
 	harvested  atomic.Uint64
 	skipped    atomic.Uint64
 	candidates atomic.Uint64
-
-	mu sync.Mutex
+	errors     atomic.Uint64
 }
 
 // HarvestFunc is invoked for each candidate activity. The
@@ -67,6 +74,14 @@ func (f *ForestSubscriber) Name() string { return "fabric.forest" }
 // the allowlist; there is no case in electCandidate that matches
 // them. Every other interesting operational event is either always
 // a candidate or conditional on the activity's Confidence / State.
+// Receive evaluates the activity for forest eligibility and, when
+// elected, dispatches it to the harvest function. The harvest call
+// MUST be non-blocking; pair this subscriber with HarvestDispatcher
+// in production so the call is queue-enqueue-only. Errors from the
+// harvest call increment the errors counter and are logged; per
+// CLAIMS.md §5.11 errors-as-artifacts, the dispatcher's error sink
+// is responsible for surfacing the failure as a kind=error_harvest_*
+// artifact on the in-flight testament.
 func (f *ForestSubscriber) Receive(ctx context.Context, a activity.AgentActivity) {
 	reason, ok := f.electCandidate(a)
 	if !ok {
@@ -77,11 +92,17 @@ func (f *ForestSubscriber) Receive(ctx context.Context, a activity.AgentActivity
 	if f.harvest == nil {
 		return
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if err := f.harvest(ctx, ForestCandidate{Activity: a, Reason: reason}); err == nil {
-		f.harvested.Add(1)
+	if err := f.harvest(ctx, ForestCandidate{Activity: a, Reason: reason}); err != nil {
+		f.errors.Add(1)
+		slog.Error("forest_subscriber_harvest_error",
+			"activity_id", string(a.ID),
+			"action_kind", string(a.Action),
+			"reason", reason,
+			"err", err.Error(),
+		)
+		return
 	}
+	f.harvested.Add(1)
 }
 
 // electCandidate is the single source of truth for forest
@@ -175,6 +196,10 @@ func (f *ForestSubscriber) electCandidate(a activity.AgentActivity) (string, boo
 		return "claim validated — validation outcome", true
 	case activity.ActionBoardComplete:
 		return "board completed — terminal lifecycle", true
+
+	// ── Category 7: claims-graph traversal precedent ──
+	case activity.ActionTraversalObserved:
+		return "traversal observed — graph walk precedent", true
 	}
 	return "", false
 }
@@ -190,5 +215,10 @@ func (f *ForestSubscriber) CandidateCount() uint64 { return f.candidates.Load() 
 // SkippedCount returns the running total of activities dropped without
 // harvest consideration.
 func (f *ForestSubscriber) SkippedCount() uint64 { return f.skipped.Load() }
+
+// ErrorCount returns the running total of harvest calls that returned
+// a non-nil error. Each was logged at slog.Error level; pair with the
+// dispatcher's error sink to surface them as testament artifacts.
+func (f *ForestSubscriber) ErrorCount() uint64 { return f.errors.Load() }
 
 var _ Subscriber = (*ForestSubscriber)(nil)

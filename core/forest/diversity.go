@@ -35,11 +35,26 @@ import (
 //
 // Best-effort: a query failure logs a warning and leaves scores
 // untouched. Cooldown is observational and shouldn't break retrieval.
+//
+// Reads tunables from m.hyperparams() — used by tests and other
+// callers that don't pin a per-call snapshot. The retrieval pipeline
+// invokes applyRetrievalCooldownPenaltyWithHP directly with its
+// pinned snapshot so the values agree across all helpers in one call.
 func (m *MemoryForest) applyRetrievalCooldownPenalty(ctx context.Context, sessionID string, packets []*BranchPacket) {
+	m.applyRetrievalCooldownPenaltyWithHP(ctx, nil, sessionID, packets)
+}
+
+// applyRetrievalCooldownPenaltyWithHP is the snapshot-pinned variant.
+// hp == nil falls back to m.hyperparams() so the public wrapper stays
+// a one-liner.
+func (m *MemoryForest) applyRetrievalCooldownPenaltyWithHP(ctx context.Context, hp *HyperParameters, sessionID string, packets []*BranchPacket) {
 	if m == nil || len(packets) == 0 {
 		return
 	}
-	if m.retrievalCooldownPenalty <= 0 || m.retrievalCooldownWindow <= 0 {
+	if hp == nil {
+		hp = m.hyperparams()
+	}
+	if hp.RetrievalCooldownPenalty <= 0 || hp.RetrievalCooldownWindow <= 0 {
 		return
 	}
 	if sessionID == "" {
@@ -55,7 +70,7 @@ func (m *MemoryForest) applyRetrievalCooldownPenalty(ctx context.Context, sessio
 	if len(branchIDs) == 0 {
 		return
 	}
-	recency, err := m.loadRecentRetrievalRecency(ctx, sessionID, branchIDs, m.retrievalCooldownWindow)
+	recency, err := m.loadRecentRetrievalRecency(ctx, sessionID, branchIDs, hp.RetrievalCooldownWindow)
 	if err != nil {
 		if m.logger != nil {
 			m.logger.Debug("forest: retrieval cooldown query failed", "err", err.Error())
@@ -65,7 +80,7 @@ func (m *MemoryForest) applyRetrievalCooldownPenalty(ctx context.Context, sessio
 	if len(recency) == 0 {
 		return
 	}
-	window := float64(m.retrievalCooldownWindow)
+	window := float64(hp.RetrievalCooldownWindow)
 	for _, p := range packets {
 		if p == nil || p.Branch == nil {
 			continue
@@ -78,7 +93,7 @@ func (m *MemoryForest) applyRetrievalCooldownPenalty(ctx context.Context, sessio
 		if ratio > 1 {
 			ratio = 1
 		}
-		scale := 1 - m.retrievalCooldownPenalty*ratio
+		scale := 1 - hp.RetrievalCooldownPenalty*ratio
 		if scale < 0 {
 			scale = 0
 		}
@@ -168,11 +183,25 @@ func buildBranchInArgs(sessionID string, branchIDs []string, window int) (string
 // degenerates to pure top-K (no diversity); λ=0 to "always avoid the
 // most-similar already-picked" — useful for tests but not what the
 // tunable defaults to.
+//
+// Reads DiversityLambda from m.hyperparams(); applyMMRRerankingWithHP
+// is the snapshot-pinned variant used by the retrieval pipeline.
 func (m *MemoryForest) applyMMRReranking(packets []*BranchPacket, featureByBranch map[string][]float32, limit int) []*BranchPacket {
+	return m.applyMMRRerankingWithHP(nil, packets, featureByBranch, limit)
+}
+
+// applyMMRRerankingWithHP is the snapshot-pinned variant. hp == nil
+// falls back to m.hyperparams() so the public wrapper stays a
+// one-liner.
+func (m *MemoryForest) applyMMRRerankingWithHP(hp *HyperParameters, packets []*BranchPacket, featureByBranch map[string][]float32, limit int) []*BranchPacket {
 	if m == nil || len(packets) == 0 || limit <= 0 {
 		return packets
 	}
-	if m.diversityLambda >= 1 {
+	if hp == nil {
+		hp = m.hyperparams()
+	}
+	lambda := hp.DiversityLambda
+	if lambda >= 1 {
 		return packets
 	}
 	if limit >= len(packets) {
@@ -187,8 +216,6 @@ func (m *MemoryForest) applyMMRReranking(packets []*BranchPacket, featureByBranc
 	}
 	out = append(out, packets[first])
 	used[first] = true
-
-	lambda := m.diversityLambda
 	for len(out) < limit {
 		next := bestMMRPick(packets, used, out, featureByBranch, lambda)
 		if next < 0 {

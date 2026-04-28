@@ -130,10 +130,11 @@ func TestSelectionBias_ExplorationDeterministicWithSeed(t *testing.T) {
 	seed := int64(12345)
 
 	collect := func() []bool {
-		forest := &MemoryForest{
-			explorationRate: 0.5,
-			explorationRng:  newExplorationRng(seed),
-		}
+		forest := newForestWithSnapshot(&HyperParameters{
+			ExplorationRate: 0.5,
+			Provenance:      allFieldsAs(SourcePlaceholder),
+		})
+		forest.explorationRng = newExplorationRng(seed)
 		out := make([]bool, trials)
 		for i := 0; i < trials; i++ {
 			out[i] = forest.shouldExplore()
@@ -273,7 +274,20 @@ func TestSelectionBias_ImplicitNegativeSweepLabelsAged(t *testing.T) {
 
 	// Force the cutoff into the future so the recently-emitted
 	// retrieval qualifies as "aged."
-	forest.implicitNegativeHorizon = -1 * time.Second
+	// Force the cutoff into the future via a tuner override that
+	// inverts the horizon. SetSnapshotForTest bypasses validation
+	// (the persistence path would reject negative durations); the
+	// in-process tuner read path accepts whatever we install.
+	if cur := forest.snapshot.Load(); cur != nil {
+		clone := cur.Clone()
+		clone.ImplicitNegativeHorizon = -1 * time.Second
+		forest.SetSnapshotForTest(clone)
+	} else {
+		forest.SetSnapshotForTest(&HyperParameters{
+			ImplicitNegativeHorizon: -1 * time.Second,
+			Provenance:              allFieldsAs(SourcePlaceholder),
+		})
+	}
 
 	if err := forest.runImplicitNegativeSweepOnce(ctx); err != nil {
 		t.Fatalf("sweep: %v", err)
@@ -313,7 +327,20 @@ func TestSelectionBias_SweepIdempotent(t *testing.T) {
 	_ = forest.WaitForRetrievalAuditDrain(ctx, 5*time.Second)
 	_ = waitForCandidatesProjection(forest, 5*time.Second)
 
-	forest.implicitNegativeHorizon = -1 * time.Second
+	// Force the cutoff into the future via a tuner override that
+	// inverts the horizon. SetSnapshotForTest bypasses validation
+	// (the persistence path would reject negative durations); the
+	// in-process tuner read path accepts whatever we install.
+	if cur := forest.snapshot.Load(); cur != nil {
+		clone := cur.Clone()
+		clone.ImplicitNegativeHorizon = -1 * time.Second
+		forest.SetSnapshotForTest(clone)
+	} else {
+		forest.SetSnapshotForTest(&HyperParameters{
+			ImplicitNegativeHorizon: -1 * time.Second,
+			Provenance:              allFieldsAs(SourcePlaceholder),
+		})
+	}
 
 	if err := forest.runImplicitNegativeSweepOnce(ctx); err != nil {
 		t.Fatal(err)

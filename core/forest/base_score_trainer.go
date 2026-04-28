@@ -173,16 +173,17 @@ func (m *MemoryForest) runBaseScoreTrainOnce(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("load champion for training baseline: %w", err)
 	}
 
+	hp := m.hyperparams()
 	initWeights, initBias := initialTrainingWeights(champion)
 	trained := trainBaseScoreSGD(
 		examples,
 		initWeights,
 		initBias,
-		m.baseScoreEpochs,
-		m.baseScoreLearningRate,
-		m.baseScoreL1Reg,
-		m.baseScoreL2Reg,
-		m.baseScoreMaxWeight,
+		hp.BaseScoreEpochs,
+		hp.BaseScoreLearningRate,
+		hp.BaseScoreL1Reg,
+		hp.BaseScoreL2Reg,
+		hp.BaseScoreMaxWeight,
 	)
 	accuracy := evaluateBaseScoreAccuracy(examples, trained.weights, trained.bias)
 
@@ -201,8 +202,8 @@ func (m *MemoryForest) runBaseScoreTrainOnce(ctx context.Context) (int, error) {
 		TrainedAt:    time.Now().UTC(),
 	}
 
-	enoughData := int64(len(examples)) >= int64(m.baseScoreMinTraining)
-	beatsChampion := champion == nil || accuracy >= champion.Accuracy+m.baseScoreImproveDelta
+	enoughData := int64(len(examples)) >= int64(hp.BaseScoreMinTrainingExamples)
+	beatsChampion := champion == nil || accuracy >= champion.Accuracy+hp.BaseScoreImprovementThreshold
 
 	if enoughData && beatsChampion {
 		model.Role = BaseScoreRoleChampion

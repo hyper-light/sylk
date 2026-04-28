@@ -748,6 +748,11 @@ func (a *Architect) handlePlanHandoffReceiptUpdate(
 }
 
 func (a *Architect) applyPlanHandoffReceiptUpdate(update *agentshared.PlanHandoffReceiptUpdate) {
+	// Project orchestrator state regardless of whether we still have
+	// a live DesignPlan for this update. The projection serves the
+	// approval hot path; if we drop the update because the plan is
+	// gone, we'd lose authoritative state.
+	a.orchestratorProjection.applyReceiptUpdate(update)
 	plan := a.planForPlanHandoffReceiptUpdate(update)
 	if plan == nil {
 		a.logTrace("architect_plan_handoff_receipt_update_plan_missing", "warn", updateSessionID(update), updateCorrelationID(update), agentlog.EventError, map[string]any{

@@ -37,7 +37,7 @@ func TestDiversity_ResolverDefaults(t *testing.T) {
 // similar candidates and one orthogonal candidate, MMR picks the
 // orthogonal one in second position rather than the next-similar.
 func TestDiversity_MMRPicksDiversePool(t *testing.T) {
-	forest := &MemoryForest{diversityLambda: 0.5}
+	forest := newForestWithSnapshot(&HyperParameters{DiversityLambda: 0.5, Provenance: allFieldsAs(SourcePlaceholder)})
 
 	clusterA := []float32{1, 0, 0, 0}
 	clusterAcopy := []float32{0.95, 0.05, 0, 0}
@@ -72,7 +72,7 @@ func TestDiversity_MMRPicksDiversePool(t *testing.T) {
 // degenerates to "always pick highest relevance" — i.e., diversity is
 // disabled.
 func TestDiversity_MMRLambdaOneIsTopK(t *testing.T) {
-	forest := &MemoryForest{diversityLambda: 1.0}
+	forest := newForestWithSnapshot(&HyperParameters{DiversityLambda: 1.0, Provenance: allFieldsAs(SourcePlaceholder)})
 	pool := []*BranchPacket{
 		{Branch: &Branch{ID: "a1"}, Score: PacketScore{Total: 0.9}},
 		{Branch: &Branch{ID: "a2"}, Score: PacketScore{Total: 0.8}},
@@ -95,7 +95,7 @@ func TestDiversity_MMRLambdaOneIsTopK(t *testing.T) {
 // TestDiversity_MMRSmallPoolNoOp verifies that when len(pool) <= limit
 // MMR is a no-op (no diversity choice to make).
 func TestDiversity_MMRSmallPoolNoOp(t *testing.T) {
-	forest := &MemoryForest{diversityLambda: 0.5}
+	forest := newForestWithSnapshot(&HyperParameters{DiversityLambda: 0.5, Provenance: allFieldsAs(SourcePlaceholder)})
 	pool := []*BranchPacket{
 		{Branch: &Branch{ID: "a"}, Score: PacketScore{Total: 0.9}},
 		{Branch: &Branch{ID: "b"}, Score: PacketScore{Total: 0.8}},
@@ -110,7 +110,7 @@ func TestDiversity_MMRSmallPoolNoOp(t *testing.T) {
 // candidates lack feature vectors, MMR falls through to relevance-
 // only ordering without crashing or producing nonsense.
 func TestDiversity_MMRZeroFeaturesProducesNoPenalty(t *testing.T) {
-	forest := &MemoryForest{diversityLambda: 0.5}
+	forest := newForestWithSnapshot(&HyperParameters{DiversityLambda: 0.5, Provenance: allFieldsAs(SourcePlaceholder)})
 	pool := []*BranchPacket{
 		{Branch: &Branch{ID: "a"}, Score: PacketScore{Total: 0.9}},
 		{Branch: &Branch{ID: "b"}, Score: PacketScore{Total: 0.8}},
@@ -208,7 +208,11 @@ func TestRetrievalCooldown_PenaltyAppliesProportionally(t *testing.T) {
 // TestRetrievalCooldown_DisabledByZeroPenalty verifies the penalty=0
 // short-circuit doesn't even hit the DB.
 func TestRetrievalCooldown_DisabledByZeroPenalty(t *testing.T) {
-	forest := &MemoryForest{retrievalCooldownPenalty: 0, retrievalCooldownWindow: 32}
+	forest := newForestWithSnapshot(&HyperParameters{
+		RetrievalCooldownPenalty: 0,
+		RetrievalCooldownWindow:  32,
+		Provenance:               allFieldsAs(SourcePlaceholder),
+	})
 	pkt := &BranchPacket{Branch: &Branch{ID: "any"}, Score: PacketScore{Total: 1.0}}
 	// Should not panic, should not modify scores, should not hit nil DB.
 	forest.applyRetrievalCooldownPenalty(context.Background(), "any", []*BranchPacket{pkt})
@@ -220,6 +224,10 @@ func TestRetrievalCooldown_DisabledByZeroPenalty(t *testing.T) {
 // TestRetrievalCooldown_EmptyPacketsNoOp verifies the empty-input
 // short-circuit doesn't crash on nil DB.
 func TestRetrievalCooldown_EmptyPacketsNoOp(t *testing.T) {
-	forest := &MemoryForest{retrievalCooldownPenalty: 0.5, retrievalCooldownWindow: 32}
+	forest := newForestWithSnapshot(&HyperParameters{
+		RetrievalCooldownPenalty: 0.5,
+		RetrievalCooldownWindow:  32,
+		Provenance:               allFieldsAs(SourcePlaceholder),
+	})
 	forest.applyRetrievalCooldownPenalty(context.Background(), "any", nil)
 }

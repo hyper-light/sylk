@@ -716,7 +716,8 @@ func (m *MemoryForest) scheduleReplayRetry(at time.Time) {
 }
 
 func (m *MemoryForest) scheduleSubstrateRefresh(sessionID string) {
-	m.scheduleSubstrateRefreshWithDelay(sessionID, m.substrateDebounce, defaultForestSubstrateMaxDelay)
+	hp := m.hyperparams()
+	m.scheduleSubstrateRefreshWithDelay(sessionID, hp.SubstrateDebounce, hp.MaxSubstrateDelay())
 }
 
 func (m *MemoryForest) scheduleImmediateSubstrateRefresh(sessionID string) {
@@ -746,7 +747,8 @@ func (m *MemoryForest) scheduleTraining() {
 	now := time.Now().UTC()
 	m.maintenanceMu.Lock()
 	m.trainingDirty = true
-	m.trainingWork = debounceForestWork(m.trainingWork, now, m.trainingDebounce, defaultForestTrainingMaxDelay)
+	hpTraining := m.hyperparams()
+	m.trainingWork = debounceForestWork(m.trainingWork, now, hpTraining.TrainingDebounce, hpTraining.MaxTrainingDelay())
 	m.maintenanceMu.Unlock()
 	m.wakeMaintenanceLoop()
 }

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -28,7 +30,7 @@ func TraverseSkill(bp BoardProvider) *skills.Skill {
 		StringParam("edge_filter", "Pipe-separated relationship types to follow (e.g. 'supersedes|amends|refines'). Empty = all edges. Use 'scope' to find claims with overlapping scope entries.", false).
 		IntParam("max_depth", "Maximum traversal hops. Default 1. Use 0 for the start node only (depth-0 read).", false).
 		Usage("Start from a known node ID (from a delta, a prior traversal, or a board query). Follow edges to discover ancestry (supersedes|amends|refines), causality (caused_by), siblings (claim_action), scope overlaps (scope), or testament lineage (testament). Each returned node includes its own edges so you can decide whether to traverse further.").
-		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				NodeID     string `json:"node_id"`
 				EdgeFilter string `json:"edge_filter"`
@@ -53,6 +55,7 @@ func TraverseSkill(bp BoardProvider) *skills.Skill {
 				maxDepth = 1
 			}
 			nodes := Traverse(board, nodeID, params.EdgeFilter, maxDepth)
+			emitTraversalObserved(ctx, board, nodeID, params.EdgeFilter, maxDepth, len(nodes))
 			return map[string]any{
 				"start_node": nodeID,
 				"nodes":      nodes,
@@ -60,4 +63,61 @@ func TraverseSkill(bp BoardProvider) *skills.Skill {
 			}, nil
 		}).
 		Build()
+}
+
+// emitTraversalObserved publishes an ActionTraversalObserved Fabric
+// activity capturing the (start_node, edge_filter, depth, count)
+// tuple. The forest claims-harvester consumes these as graph-walk
+// precedent — over time the forest can learn which traversals at
+// which start kinds yield useful downstream context. Best-effort:
+// activity.Append is non-blocking by design and emission failure
+// must not affect the returned traversal result.
+func emitTraversalObserved(ctx context.Context, board *ClaimsBoard, nodeID, edgeFilter string, depth, count int) {
+	if board == nil {
+		return
+	}
+	startKind := traversalStartKind(nodeID)
+	payload, err := json.Marshal(map[string]any{
+		"start_node":  nodeID,
+		"start_kind":  startKind,
+		"edge_filter": strings.TrimSpace(edgeFilter),
+		"depth":       depth,
+		"count":       count,
+	})
+	if err != nil {
+		return
+	}
+	act := activity.AgentActivity{
+		ID:         activity.NewActivityID(),
+		SessionID:  activity.SessionID(board.SessionID()),
+		Timestamp:  time.Now().UTC(),
+		Resolution: activity.ResolutionFor(activity.ActionTraversalObserved),
+		Action:     activity.ActionTraversalObserved,
+		Subject: activity.Subject{
+			TargetArtifact: nodeID,
+			Coordinates: map[string]string{
+				"task_id":  board.TaskID(),
+				"board_id": board.BoardID(),
+			},
+		},
+		Payload: payload,
+		State:   activity.StatePoint,
+	}
+	activity.Append(ctx, act)
+}
+
+// traversalStartKind returns the type prefix of a graph node ID. Node
+// IDs follow the convention "<kind>_<id>" (e.g. "claim_abc",
+// "testament_xyz"). When a node ID lacks a recognizable prefix, the
+// kind is reported as "unknown" — the forest still indexes the
+// traversal but groups unknown-kind walks together.
+func traversalStartKind(nodeID string) string {
+	trimmed := strings.TrimSpace(nodeID)
+	if trimmed == "" {
+		return "unknown"
+	}
+	if idx := strings.Index(trimmed, "_"); idx > 0 {
+		return strings.ToLower(trimmed[:idx])
+	}
+	return "unknown"
 }

@@ -720,6 +720,17 @@ func ensureForestProjectorColumns(db *sql.DB) error {
 		// Empty string = not applicable (non-Constraint family); 'hard'
 		// or 'soft' for Constraint family rows.
 		{"forest_branches", "constraint_severity", "TEXT NOT NULL DEFAULT ''"},
+		// Hyperparameter A/B capture — the snapshot id used to score
+		// this retrieval, plus a flag indicating it was the proposed
+		// (challenger) snapshot rather than the active one. Default 0
+		// / 0 means "snapshot id unknown" (legacy rows or pre-tuner
+		// retrievals); the audit-driven adapter uses these to attribute
+		// outcome metrics to the correct A/B arm. Mirrored on the
+		// archive table so the columns survive the cold-storage move.
+		{"forest_retrieval_events", "hyperparam_snapshot_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"forest_retrieval_events", "proposed_hyperparams", "INTEGER NOT NULL DEFAULT 0"},
+		{"forest_retrieval_events_archive", "hyperparam_snapshot_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"forest_retrieval_events_archive", "proposed_hyperparams", "INTEGER NOT NULL DEFAULT 0"},
 	}
 	for _, a := range additions {
 		if err := addColumnIfMissing(db, a.table, a.column, a.decl); err != nil {
@@ -1035,6 +1046,8 @@ func ensureForestArchiveTables(db *sql.DB) error {
 			substrate_mode           TEXT NOT NULL DEFAULT '',
 			base_score_version       INTEGER NOT NULL DEFAULT 0,
 			base_score_variant       TEXT NOT NULL DEFAULT '',
+			hyperparam_snapshot_id   INTEGER NOT NULL DEFAULT 0,
+			proposed_hyperparams     INTEGER NOT NULL DEFAULT 0,
 			archived_at              INTEGER NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_forest_retrieval_events_archive_session

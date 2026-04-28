@@ -205,6 +205,13 @@ func AutoPublishClaimReleased(ctx context.Context, in AutoPublishClaimInput, res
 // AutoPublishArtifactInput drives AutoPublishArtifactPublished. The
 // activity Subject.TargetArtifact carries the artifact ID; Payload
 // carries kind + summary + evidence for ambient rendering.
+//
+// ClaimID and TestamentID, when non-empty, correlate the artifact
+// with a specific claim and testament so the forest's claims-harvest
+// path can learn "artifacts of kind X used as evidence for claim type
+// Y typically pass at rate Z." Subject.Coordinates carries them so
+// the harvester surfaces them in provenance refs without parsing the
+// payload.
 type AutoPublishArtifactInput struct {
 	SessionID        string
 	AuthorAgentID    string
@@ -218,6 +225,16 @@ type AutoPublishArtifactInput struct {
 	Scope            string
 	Evidence         []string
 	Payload          map[string]any
+
+	// ClaimID, when non-empty, is the claim this artifact serves as
+	// evidence for. Surfaces in Subject.Coordinates["claim_id"] so
+	// the forest harvester correlates artifact precedent with claim
+	// outcome.
+	ClaimID string
+
+	// TestamentID, when non-empty, is the testament that carries this
+	// artifact. Surfaces in Subject.Coordinates["testament_id"].
+	TestamentID string
 }
 
 // AutoPublishArtifactPublished emits an ActionArtifactPublished
@@ -232,14 +249,22 @@ func AutoPublishArtifactPublished(ctx context.Context, in AutoPublishArtifactInp
 	if artifactID == "" {
 		artifactID = string(activity.NewActivityID())
 	}
-	payload := mustMarshal(map[string]any{
+	payloadFields := map[string]any{
 		"kind":          strings.TrimSpace(in.Kind),
 		"title":         strings.TrimSpace(in.Title),
 		"summary":       strings.TrimSpace(in.Summary),
 		"evidence":      in.Evidence,
 		"payload":       in.Payload,
 		"trigger_skill": in.TriggerSkill,
-	})
+	}
+	if claimID := strings.TrimSpace(in.ClaimID); claimID != "" {
+		payloadFields["claim_id"] = claimID
+	}
+	if testamentID := strings.TrimSpace(in.TestamentID); testamentID != "" {
+		payloadFields["testament_id"] = testamentID
+	}
+	payload := mustMarshal(payloadFields)
+	coordinates := buildArtifactCoordinates(in)
 	act := activity.AgentActivity{
 		ID:         activity.NewActivityID(),
 		SessionID:  activity.SessionID(in.SessionID),
@@ -254,12 +279,33 @@ func AutoPublishArtifactPublished(ctx context.Context, in AutoPublishArtifactInp
 		Subject: activity.Subject{
 			PathPrefix:     strings.TrimSpace(in.Scope),
 			TargetArtifact: artifactID,
+			Coordinates:    coordinates,
 		},
 		Payload: payload,
 		State:   activity.StatePoint,
 	}
 	activity.Append(ctx, act)
 	return act.ID
+}
+
+// buildArtifactCoordinates returns the Subject.Coordinates map keyed
+// with claim_id / testament_id when they're populated. Returns nil
+// when neither correlation is supplied so the activity payload stays
+// compact for the common no-correlation case.
+func buildArtifactCoordinates(in AutoPublishArtifactInput) map[string]string {
+	claimID := strings.TrimSpace(in.ClaimID)
+	testamentID := strings.TrimSpace(in.TestamentID)
+	if claimID == "" && testamentID == "" {
+		return nil
+	}
+	out := make(map[string]string, 2)
+	if claimID != "" {
+		out["claim_id"] = claimID
+	}
+	if testamentID != "" {
+		out["testament_id"] = testamentID
+	}
+	return out
 }
 
 // AutoPublishReviewInput drives AutoPublishReviewRequested /

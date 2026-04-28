@@ -1,41 +1,25 @@
-// Architect-side caller for the orchestrator's plan_state_query skill.
+// Architect-side resolver for orchestrator plan execution state.
 //
-// The freshness audit calls this synchronously to learn the
-// orchestrator's authoritative state for a plan: is it none / queued /
-// running / completed / failed / aborted / stalled? The response feeds
-// the dialog's OrchestratorStateHint so the user sees both file drift
-// AND execution state in the dialog body.
+// Originally a synchronous RPC (plan_state_query route request to the
+// orchestrator with a 3-second timeout). Now reads from the local
+// orchestratorProjection — built incrementally from the existing
+// PlanHandoffReceiptUpdate flow and the dag.status topic — so the
+// approval hot path doesn't pay a per-call round-trip.
 //
-// Read-only and best-effort. If the orchestrator is unreachable or the
-// query times out, the freshness audit proceeds without orchestrator
-// context — better to show the dialog with file-drift signals only
-// than to block on a missing orchestrator response.
+// Same correctness profile as before (eventually-consistent; "no
+// orchestrator context" returns nil and callers degrade gracefully)
+// with bounded staleness instead of bounded latency. The orchestrator
+// still registers the plan_state_query skill (skills_plan_state.go)
+// for ad-hoc external queries; the architect just no longer drives
+// it on the dialog dispatch path.
 package architect
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/adalundhe/sylk/agents/guide"
-	"github.com/adalundhe/sylk/core/claims"
-	"github.com/google/uuid"
 )
-
-// planStateQuerySkillName is the orchestrator skill the architect
-// invokes via bus to ask "what's the actual execution state of this
-// plan?" Kept as a const so architect's caller and orchestrator's
-// registration stay in lock-step.
-const planStateQuerySkillName = "plan_state_query"
-
-// planStateQueryTimeout bounds how long the architect waits for the
-// orchestrator's reply. Conservative — the query is a single indexed
-// SELECT plus a short classification, so 3 seconds is plenty even on
-// a busy orchestrator. If it expires we proceed without orchestrator
-// context rather than blocking the dialog.
-const planStateQueryTimeout = 3 * time.Second
 
 // orchestratorPlanState is the architect-side mirror of the
 // orchestrator's PlanExecutionState. Defined here as a separate type
@@ -62,122 +46,23 @@ type orchestratorPlanState struct {
 	HistoricalDAGCount int        `json:"historical_dag_count"`
 }
 
-// queryOrchestratorPlanState publishes a plan_state_query route
-// request to the orchestrator and decodes the reply. Returns nil
-// (no error) when the orchestrator is unreachable or the response is
-// not parseable — the freshness audit treats that as "no orchestrator
-// context available" and continues with whatever signals it does have.
-func (a *Architect) queryOrchestratorPlanState(ctx context.Context, planID string) *orchestratorPlanState {
-	if a == nil || a.bus == nil || !a.running {
+// queryOrchestratorPlanState resolves orchestrator plan state from
+// the architect's local projection. Returns nil when the projection
+// has no record for the plan, which the freshness audit and approval
+// routing both treat as "no orchestrator context" (same fallback as
+// the old timed-out RPC).
+//
+// The ctx parameter is retained for signature compatibility with
+// existing call sites; cancellation is moot for a local map lookup.
+func (a *Architect) queryOrchestratorPlanState(_ context.Context, planID string) *orchestratorPlanState {
+	if a == nil {
 		return nil
 	}
 	planID = strings.TrimSpace(planID)
 	if planID == "" {
 		return nil
 	}
-	orchID := a.knownAgentIDByType("orchestrator", "")
-	if orchID == "" {
-		return nil
-	}
-
-	queryCtx, cancel := context.WithTimeout(ctx, planStateQueryTimeout)
-	defer cancel()
-
-	payload, err := json.Marshal(map[string]string{"plan_id": planID})
-	if err != nil {
-		return nil
-	}
-
-	correlationID := "plan_state_" + uuid.NewString()
-	req := &guide.RouteRequest{
-		CorrelationID: correlationID,
-		Input:         string(payload),
-		TargetAgentID: orchID,
-		Metadata: map[string]any{
-			"direct_skill": planStateQuerySkillName,
-			"plan_id":      planID,
-		},
-	}
-	a.architectPostClaim(ctx,
-		architectClaimAction(claims.ActionTypeConsultation),
-		architectClaimWithSubject(
-			"Query orchestrator plan state: "+truncateArchitectString(planID, 40),
-			"Plan state query via orchestrator",
-			"orchestrator",
-			[]claims.ClaimScopeEntry{{Kind: "consultation", Key: "orchestrator"}},
-			claims.ActionTypeConsultation,
-			[]*claims.Validation{
-				architectValidation(claims.ValidationTypeReceipt, false, "Orchestrator returns plan state", "state != nil"),
-			},
-		),
-	)
-	resp, err := a.requestRouteSync(queryCtx, req)
-	if err != nil || resp == nil {
-		architectDebugLog().Info("queryOrchestratorPlanState: ROUTE_SYNC_FAILED",
-			"plan_id", planID,
-			"orchestrator_id", orchID,
-			"error", routeSyncErrorMessage(err))
-		return nil
-	}
-	state, err := decodeOrchestratorPlanState(resp)
-	if err != nil {
-		architectDebugLog().Info("queryOrchestratorPlanState: DECODE_FAILED",
-			"plan_id", planID,
-			"error", err.Error())
-		return nil
-	}
-	return state
-}
-
-// decodeOrchestratorPlanState unwraps the route response and decodes
-// the orchestratorPlanState payload. Tolerant of multiple delivery
-// shapes (RouteResponse.Data as map vs typed pointer) so different
-// transport paths produce identical results.
-func decodeOrchestratorPlanState(msg *guide.Message) (*orchestratorPlanState, error) {
-	resp, _, err := routeResponseFromMessage(msg)
-	if err != nil {
-		return nil, err
-	}
-	if !resp.Success {
-		return nil, fmt.Errorf("orchestrator plan_state_query failed: %s", resp.Error)
-	}
-	if resp.Data == nil {
-		return nil, fmt.Errorf("orchestrator plan_state_query returned nil data")
-	}
-	switch typed := resp.Data.(type) {
-	case *orchestratorPlanState:
-		return typed, nil
-	case orchestratorPlanState:
-		return &typed, nil
-	case map[string]any:
-		raw, err := json.Marshal(typed)
-		if err != nil {
-			return nil, err
-		}
-		var state orchestratorPlanState
-		if err := json.Unmarshal(raw, &state); err != nil {
-			return nil, err
-		}
-		return &state, nil
-	}
-	raw, err := json.Marshal(resp.Data)
-	if err != nil {
-		return nil, fmt.Errorf("encode plan_state_query data for fallback decode: %w", err)
-	}
-	var state orchestratorPlanState
-	if err := json.Unmarshal(raw, &state); err != nil {
-		return nil, fmt.Errorf("decode plan_state_query data: %w", err)
-	}
-	return &state, nil
-}
-
-// routeSyncErrorMessage returns "" for nil errors so log fields stay
-// clean. Trivial helper but avoids if-else clutter at call sites.
-func routeSyncErrorMessage(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
+	return a.orchestratorProjection.asOrchestratorPlanState(planID)
 }
 
 // orchestratorStateHint converts the structured plan state into a

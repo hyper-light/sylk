@@ -143,6 +143,31 @@ const (
 	EventTypeClaimAccepted      EventType = "claim_accepted"
 	EventTypeClaimRejected      EventType = "claim_rejected"
 	EventTypeTestamentRecorded  EventType = "testament_recorded"
+
+	// EventTypeClaimValidated records one validation outcome on a
+	// claim. Carries the validation Type, QualityBar, Description, and
+	// Verdict in Payload — strictly richer than the coord-era flat
+	// review_completed signal it replaces. Routes to TreeFamilyEvidence
+	// on accepted verdict and TreeFamilyAntiPattern on rejected verdict
+	// via payload-driven family routing in the harvester.
+	EventTypeClaimValidated EventType = "claim_validated"
+
+	// EventTypeRemediationResolved records the closure of an architect-
+	// authored corrective-action chain (claim_rejected → architect
+	// remediation testament → re-validation accepted). Carries the
+	// rejected-claim ID under Supersedes so the precedent links
+	// failure → fix. Family is TreeFamilyEvidence (positive precedent
+	// for "this kind of failure was fixed by this kind of remediation").
+	EventTypeRemediationResolved EventType = "remediation_resolved"
+
+	// EventTypeTraversalObserved records one claims-graph traversal call
+	// (start_node, edge_filter, depth) and is the substrate for traversal
+	// precedent — the forest can learn which graph walks at which start
+	// kinds yielded useful downstream context. Family is TreeFamilyEvidence
+	// when paired with a successful downstream outcome; the harvester
+	// derives status from the activity State and salience from observed
+	// downstream resolution rate.
+	EventTypeTraversalObserved EventType = "traversal_observed"
 )
 
 // RelayRelation captures why two branches reinforce one another.
@@ -426,6 +451,18 @@ type RetrievalAuditEvent struct {
 	// model identity) — BaseScoreVariant says which serving role
 	// the model was playing at retrieve-time.
 	BaseScoreVariant BaseScoreVariant `json:"base_score_variant,omitempty"`
+
+	// HyperparamSnapshotID is the SnapshotID of the HyperParameters
+	// instance pinned at retrieval entry. Stamps the audit row so
+	// outcome-driven adaptation can attribute observations to the
+	// snapshot they came from even after a snapshot replacement.
+	HyperparamSnapshotID int64 `json:"hyperparam_snapshot_id,omitempty"`
+
+	// ProposedHyperparams is true when the pinned snapshot was the
+	// A/B-trial proposed (challenger) snapshot rather than the
+	// active one. Read by ObserveAndAdapt to route the observation
+	// into the correct rolling window.
+	ProposedHyperparams bool `json:"proposed_hyperparams,omitempty"`
 
 	// Candidates is the full scored set, not just top-K. Each entry
 	// records its rank position (1..K for returned; 0 for considered

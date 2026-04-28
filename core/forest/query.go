@@ -19,21 +19,76 @@ import (
 // counterfactual training can label every candidate against later
 // outcome events. Audit emission is best-effort; failure logs but
 // never affects the retrieval result.
+//
+// At entry the per-call HyperParameters snapshot is pinned via the
+// tuner's A/B trial sampler — every helper invoked downstream reads
+// from this same snapshot, so a snapshot replacement mid-retrieval
+// can't produce a Frankenscore that mixes active + proposed values.
+// The pinned snapshot id and proposed-arm flag are stamped onto the
+// audit row so outcome-driven adaptation can attribute the
+// observation back to the correct A/B arm.
 func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPacket, error) {
 	start := time.Now()
 	auditQuery := query
-	packets, audit, err := m.retrieveWithAudit(ctx, query, start)
+	hp, isProposed := m.pinHyperparameterSnapshotForRetrieve()
+	packets, audit, err := m.retrieveWithAudit(ctx, query, start, hp, isProposed)
 	finalizeRetrievalAudit(audit, auditQuery, start, err)
 	m.emitRetrievalAudit(ctx, audit)
 	return packets, err
+}
+
+// pinHyperparameterSnapshotForRetrieve resolves the hyperparameter
+// snapshot for one Retrieve call. Routes through the tuner's
+// SnapshotForTrial when an A/B trial is active so a deterministic
+// 50/50 split sees the proposed snapshot; otherwise returns the
+// active snapshot. Nil-tuner path returns the live (placeholder or
+// captured) snapshot via m.hyperparams() for tests that bypass the
+// tuner.
+func (m *MemoryForest) pinHyperparameterSnapshotForRetrieve() (*HyperParameters, bool) {
+	if m == nil {
+		return PlaceholderHyperParameters(), false
+	}
+	if m.tuner == nil {
+		return m.hyperparams(), false
+	}
+	seed := m.retrievalTrialSeed()
+	hp, isProposed := m.tuner.SnapshotForTrial(seed)
+	if hp == nil {
+		return m.hyperparams(), false
+	}
+	return hp, isProposed
+}
+
+// retrievalTrialSeed produces a per-call seed for SnapshotForTrial.
+// Uses the per-forest exploration RNG (already mutex-guarded) so the
+// A/B split is deterministic-given-RNG-state and uniformly
+// distributed across calls.
+func (m *MemoryForest) retrievalTrialSeed() uint32 {
+	if m == nil || m.explorationRng == nil {
+		return uint32(time.Now().UnixNano())
+	}
+	m.explorationRngMu.Lock()
+	defer m.explorationRngMu.Unlock()
+	return m.explorationRng.Uint32()
 }
 
 // retrieveWithAudit runs the core retrieval pipeline and returns
 // (top-K packets, audit event in-progress, err). The audit event has
 // the full candidate set populated; finalizeRetrievalAudit fills in
 // the remaining operational fields once the caller has the response.
-func (m *MemoryForest) retrieveWithAudit(ctx context.Context, query Query, start time.Time) ([]*BranchPacket, *RetrievalAuditEvent, error) {
+//
+// hp is the pinned-for-this-call hyperparameter snapshot — every
+// downstream helper that depends on a tunable reads from this
+// snapshot rather than via m.hyperparams() so an in-flight snapshot
+// replacement can't tear scoring across helpers. isProposed is true
+// when the snapshot came from the tuner's A/B trial proposed arm.
+func (m *MemoryForest) retrieveWithAudit(ctx context.Context, query Query, start time.Time, hp *HyperParameters, isProposed bool) ([]*BranchPacket, *RetrievalAuditEvent, error) {
+	if hp == nil {
+		hp = m.hyperparams()
+	}
 	audit := newRetrievalAuditEvent(query, start, m.currentBranchProjectionSeq(ctx))
+	audit.HyperparamSnapshotID = int64(hp.SnapshotID)
+	audit.ProposedHyperparams = isProposed
 	// Issue #7: pick the substrate mode for this retrieval up-front so
 	// the same mode flows into staged loading + the audit row.
 	audit.SubstrateMode = m.resolveRetrieveSubstrateMode()
@@ -78,7 +133,7 @@ func (m *MemoryForest) retrieveWithAudit(ctx context.Context, query Query, start
 	// Issue #4 mechanism C: knock down branches that appeared in the
 	// last N retrievals for this session. Applied to base scores so
 	// the subsequent sort + MMR see the cooldown-adjusted ordering.
-	m.applyRetrievalCooldownPenalty(ctx, normalized.SessionID, scored.packets)
+	m.applyRetrievalCooldownPenaltyWithHP(ctx, hp, normalized.SessionID, scored.packets)
 
 	sortPackets(scored.packets)
 
@@ -86,12 +141,12 @@ func (m *MemoryForest) retrieveWithAudit(ctx context.Context, query Query, start
 	// example rows carry the correct retrieval_mode/label_weight
 	// (exploration outcomes are unbiased and trained higher) and so
 	// the audit event's exploration_mode is accurate.
-	exploring := m.shouldExplore()
+	exploring := m.shouldExploreWithHP(hp)
 	retrievalMode := ""
 	exampleWeight := 1.0
 	if exploring {
 		retrievalMode = string(RetrievalModeExploration)
-		exampleWeight = m.explorationLabelWeight
+		exampleWeight = hp.ExplorationLabelWeight
 	}
 	if recordErr := m.recordRetrievalExamplesWithSource(
 		ctx, normalized, scored.packets, scored.featuresByBranch,
@@ -115,7 +170,7 @@ func (m *MemoryForest) retrieveWithAudit(ctx context.Context, query Query, start
 		audit.ExplorationMode = true
 		scored.packets = m.explorationShuffleAndPick(scored.packets, normalized.Limit)
 	} else {
-		scored.packets = m.applyMMRReranking(scored.packets, scored.featuresByBranch, normalized.Limit)
+		scored.packets = m.applyMMRRerankingWithHP(hp, scored.packets, scored.featuresByBranch, normalized.Limit)
 		if len(scored.packets) > normalized.Limit {
 			scored.packets = scored.packets[:normalized.Limit]
 		}

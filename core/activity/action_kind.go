@@ -332,6 +332,14 @@ const (
 	// ActionBoardComplete is emitted when all claims are accepted and
 	// the board transitions to complete. Terminal event.
 	ActionBoardComplete ActionKind = "board_complete"
+
+	// ActionTraversalObserved is emitted by the claims-graph traverse
+	// skill on every successful walk. Carries the start_node ID and
+	// kind, the edge_filter, the depth, and the count of nodes
+	// returned. Read-side precedent — the forest can learn which
+	// graph walks at which start kinds yielded useful downstream
+	// context. Fine resolution (high frequency, low individual cost).
+	ActionTraversalObserved ActionKind = "traversal_observed"
 )
 
 // ResolutionFor returns the canonical Resolution for the given
@@ -342,7 +350,8 @@ func ResolutionFor(kind ActionKind) Resolution {
 	case ActionLLMChunkReceived,
 		ActionFileRead,
 		ActionCacheHit,
-		ActionCacheMiss:
+		ActionCacheMiss,
+		ActionTraversalObserved:
 		return ResolutionAtomic
 
 	case ActionStoreWriteCommitted,

@@ -274,12 +274,22 @@ type MemoryForest struct {
 	models       *learnedModelStore
 	booster      boosterConfig
 
+	// tuner is the integrated hyperparameter system (see
+	// hyperparameters.go). Single source of truth for every
+	// forest tunable. The tuner publishes its current snapshot
+	// here via Subscribe; readers go through snapshot.Load() so
+	// runtime adaptation promotions take effect on every existing
+	// hot-path read without explicit invalidation.
+	tuner    *HyperParameterTuner
+	snapshot atomic.Pointer[HyperParameters]
+	snapshotUnsubscribe func()
+
 	runCtx    context.Context
 	runCancel context.CancelFunc
 
-	replayDelay         time.Duration
-	substrateDebounce   time.Duration
-	trainingDebounce    time.Duration
+	// Tunables migrated to the tuner snapshot:
+	//   replayDelay, substrateDebounce, trainingDebounce →
+	//   m.hyperparams().{ReplayDelay,SubstrateDebounce,TrainingDebounce}
 	replayBatchSize     int
 	substrateLimit      int
 	trainingMaxExamples int
@@ -321,22 +331,11 @@ type MemoryForest struct {
 	retrievalAuditIdle     chan struct{} // signaled after each drain completes
 	retrievalAuditClosed   atomic.Bool   // set on Close; emits become no-ops
 
-	// Issue #3 selection-bias-fix configuration. All consumed by
-	// labelExamplesForOutcome (counterfactual), the implicit-negative
-	// sweeper, and Retrieve (ε-greedy exploration).
-	counterfactualLabelWeight     float64
-	counterfactualWindow          time.Duration
-	implicitNegativeWeight        float64
-	implicitNegativeHorizon       time.Duration
-	implicitNegativeSweepInterval time.Duration
-	explorationRate               float64
-	explorationLabelWeight        float64
-
-	// Issue #4 — diversity reranking + retrieval cooldown. Both run
-	// inside the synchronous Retrieve flow; no goroutines.
-	diversityLambda          float64
-	retrievalCooldownWindow  int
-	retrievalCooldownPenalty float64
+	// Issue #3 / #4 tunables migrated to the tuner snapshot:
+	//   counterfactual/implicit-negative weights, exploration rate,
+	//   diversity lambda, retrieval cooldown — all read via
+	//   m.hyperparams().X. Retained on the tuner so runtime
+	//   adaptation can promote new values without re-capturing here.
 
 	// Issue #6 — AntiPattern promotion. Periodic scanner promotes
 	// Failed-outcome branches to sibling AntiPattern projections.
@@ -370,21 +369,17 @@ type MemoryForest struct {
 	// (lease-coordinated, drain-then-sleep). baseScoreCache holds the
 	// active champion + challenger via atomic pointers so the hot
 	// scoring path never blocks behind a training write.
-	baseScoreStore           *baseScoreModelStore
-	baseScoreCache           *baseScoreCache
-	baseScoreTrainInterval   time.Duration
-	baseScoreMinTraining     int
-	baseScoreImproveDelta    float64
-	baseScoreLearningRate    float64
-	baseScoreL1Reg           float64
-	baseScoreL2Reg           float64
-	baseScoreEpochs          int
-	baseScoreTrainBatch      int
-	baseScoreABRate          float64
-	baseScoreMaxWeight       float64
-	baseScorePruningThresh   float64
-	baseScoreModeRng         *mathrand.Rand
-	baseScoreModeRngMu       sync.Mutex
+	// Base-scorer hyperparameters migrated to the tuner snapshot:
+	//   learning rate, L1/L2, epochs, improvement-threshold,
+	//   min-training-examples, max-weight, pruning-threshold —
+	//   all read via m.hyperparams().X.
+	baseScoreStore         *baseScoreModelStore
+	baseScoreCache         *baseScoreCache
+	baseScoreTrainInterval time.Duration
+	baseScoreTrainBatch    int
+	baseScoreABRate        float64
+	baseScoreModeRng       *mathrand.Rand
+	baseScoreModeRngMu     sync.Mutex
 
 	// Issue #9 — base-score calibration cache. Single atomic-pointer
 	// holder so the Retrieve hot path stamps a recent ECE-derived
@@ -437,19 +432,39 @@ func New(cfg Config) (*MemoryForest, error) {
 	}
 
 	runCtx, runCancel := context.WithCancel(context.Background())
+	logger := normalizeLogger(cfg.Logger)
+
+	// Build the tuner BEFORE per-field captures. The tuner
+	// resolves the layered priority chain (Config → workload-init
+	// → persisted → placeholder) and is the source of truth for
+	// every tunable below. The captures then pull from the tuner
+	// snapshot, ensuring "Config explicitly set" and "workload-init
+	// fitted from my ledger" values flow into the field reads
+	// existing code uses.
+	tuner, err := NewHyperParameterTuner(runCtx, cfg.DB, logger)
+	if err != nil {
+		runCancel()
+		return nil, fmt.Errorf("forest: hyperparameter tuner init: %w", err)
+	}
+	if err := applyConfigOverrides(runCtx, tuner, cfg); err != nil {
+		runCancel()
+		tuner.Stop()
+		return nil, fmt.Errorf("forest: hyperparameter overrides: %w", err)
+	}
+	hp := tuner.Get()
+	_ = hp // kept while migrating fields → snapshot.Load() reads
+
 	service := &MemoryForest{
 		db:                  cfg.DB,
 		contentStore:        cfg.ContentStore,
 		searcher:            cfg.Searcher,
-		logger:              normalizeLogger(cfg.Logger),
+		logger:              logger,
 		warmth:              newWarmthStore(cfg.DB, cfg.MaxTraces),
 		models:              models,
 		booster:             booster,
+		tuner:               tuner,
 		runCtx:              runCtx,
 		runCancel:           runCancel,
-		replayDelay:         resolveForestReplayDelay(cfg.ReplayDelay),
-		substrateDebounce:   resolveForestSubstrateDebounce(cfg.SubstrateDebounce),
-		trainingDebounce:    resolveForestTrainingDebounce(cfg.TrainingDebounce),
 		replayBatchSize:     resolveForestReplayBatchSize(cfg.ReplayBatchSize),
 		substrateLimit:      resolveForestSubstrateLimit(cfg.SubstrateLimit),
 		trainingMaxExamples: resolveForestTrainingExamples(cfg.TrainingMaxExamples),
@@ -461,17 +476,7 @@ func New(cfg Config) (*MemoryForest, error) {
 		synchronousProjection:         cfg.SynchronousProjection,
 		seqNotify:                     newSeqNotifier(),
 		retrievalAuditIdle:            make(chan struct{}, 1),
-		counterfactualLabelWeight:     resolveCounterfactualLabelWeight(cfg.CounterfactualLabelWeight),
-		counterfactualWindow:          resolveCounterfactualWindow(cfg.CounterfactualWindow),
-		implicitNegativeWeight:        resolveImplicitNegativeWeight(cfg.ImplicitNegativeWeight),
-		implicitNegativeHorizon:       resolveImplicitNegativeHorizon(cfg.ImplicitNegativeHorizon),
-		implicitNegativeSweepInterval: resolveImplicitNegativeSweepInterval(cfg.ImplicitNegativeSweepInterval),
-		explorationRate:               resolveExplorationRate(cfg.ExplorationRate),
-		explorationLabelWeight:        resolveExplorationLabelWeight(cfg.ExplorationLabelWeight),
 		explorationRng:                newExplorationRng(cfg.ExplorationSeed),
-		diversityLambda:               resolveDiversityLambda(cfg.DiversityLambda),
-		retrievalCooldownWindow:       resolveRetrievalCooldownWindow(cfg.RetrievalCooldownWindow),
-		retrievalCooldownPenalty:      resolveRetrievalCooldownPenalty(cfg.RetrievalCooldownPenalty),
 		antiPatternFailureThreshold:      resolveAntiPatternFailureThreshold(cfg.AntiPatternFailureThreshold),
 		antiPatternFailureRate:           resolveAntiPatternFailureRate(cfg.AntiPatternFailureRate),
 		antiPatternPromotionInterval:     resolveAntiPatternPromotionInterval(cfg.AntiPatternPromotionInterval),
@@ -483,16 +488,8 @@ func New(cfg Config) (*MemoryForest, error) {
 		pageRankIncrementalCache:         newPageRankIncrementalCache(pageRankCacheCapacity),
 		baseScoreCache:                   newBaseScoreCache(),
 		baseScoreTrainInterval:           resolveBaseScoreTrainInterval(cfg.BaseScoreTrainInterval),
-		baseScoreMinTraining:             resolveBaseScoreMinTrainingExamples(cfg.BaseScoreMinTrainingExamples),
-		baseScoreImproveDelta:            resolveBaseScoreImprovementThreshold(cfg.BaseScoreImprovementThreshold),
-		baseScoreLearningRate:            resolveBaseScoreLearningRate(cfg.BaseScoreLearningRate),
-		baseScoreL1Reg:                   resolveBaseScoreL1Reg(cfg.BaseScoreL1Reg),
-		baseScoreL2Reg:                   resolveBaseScoreL2Reg(cfg.BaseScoreL2Reg),
-		baseScoreEpochs:                  resolveBaseScoreEpochs(cfg.BaseScoreEpochs),
 		baseScoreTrainBatch:              resolveBaseScoreTrainBatch(cfg.BaseScoreTrainBatch),
 		baseScoreABRate:                  resolveBaseScoreABRate(cfg.BaseScoreABRate),
-		baseScoreMaxWeight:               resolveBaseScoreMaxWeight(cfg.BaseScoreMaxWeight),
-		baseScorePruningThresh:           resolveBaseScorePruningThreshold(cfg.BaseScorePruningThreshold),
 		baseScoreModeRng:                 newExplorationRng(cfg.BaseScoreSeed),
 		calibrationCache:                 newCalibrationCache(),
 		branchTraceRetentionPerBranch:    resolveBranchTraceRetentionPerBranch(cfg.BranchTraceRetentionPerBranch),
@@ -508,6 +505,15 @@ func New(cfg Config) (*MemoryForest, error) {
 		stopCh:                           make(chan struct{}),
 	}
 	service.baseScoreStore = newBaseScoreModelStore(service.db)
+
+	// Subscribe to tuner promotions so runtime adaptation
+	// updates the cached snapshot atomically. Subscribe fires
+	// once immediately with the current snapshot, ensuring the
+	// snapshot pointer is non-nil before any read path runs.
+	service.snapshotUnsubscribe = tuner.Subscribe(func(updated *HyperParameters) {
+		service.snapshot.Store(updated)
+	})
+
 	// Warn (not fail) if retention < attribution window: the
 	// SubstrateModeStatsSince diagnostic JOINs against
 	// forest_retrieval_candidates, which the background pruner trims.
@@ -590,6 +596,7 @@ func (m *MemoryForest) Close() error {
 		close(m.stopCh)
 	})
 	m.wg.Wait()
+	m.closeTuner()
 	return nil
 }
 
@@ -1566,7 +1573,7 @@ func (m *MemoryForest) enqueueReplayTx(ctx context.Context, tx *sql.Tx, branch *
 	if priority < 0.45 {
 		return time.Time{}, nil
 	}
-	availableAt := event.Timestamp.Add(m.replayDelay).UTC()
+	availableAt := event.Timestamp.Add(m.hyperparams().ReplayDelay).UTC()
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO forest_replay_queue
 		(branch_id, root_id, priority, reason, state, available_at, payload)

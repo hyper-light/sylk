@@ -211,8 +211,9 @@ func insertRetrievalAuditTx(ctx context.Context, tx *sql.Tx, event *RetrievalAud
 		 candidate_count, returned_count, model_key, model_version,
 		 error_message, branch_projection_seq, candidates_blob,
 		 metadata_blob, exploration_mode, substrate_mode,
-		 base_score_version, base_score_variant)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 base_score_version, base_score_variant,
+		 hyperparam_snapshot_id, proposed_hyperparams)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO NOTHING
 	`,
 		event.ID,
@@ -240,6 +241,8 @@ func insertRetrievalAuditTx(ctx context.Context, tx *sql.Tx, event *RetrievalAud
 		string(event.SubstrateMode),
 		event.BaseScoreVersion,
 		string(event.BaseScoreVariant),
+		event.HyperparamSnapshotID,
+		boolToInt(event.ProposedHyperparams),
 	)
 	if err != nil {
 		return false, fmt.Errorf("insert retrieval audit event: %w", err)
@@ -299,7 +302,8 @@ func (m *MemoryForest) queryRetrievalAuditRows(ctx context.Context, filter Retri
 		       e.model_key, e.model_version, e.error_message,
 		       e.branch_projection_seq, e.candidates_blob, e.metadata_blob,
 		       e.exploration_mode, e.substrate_mode,
-		       e.base_score_version, e.base_score_variant
+		       e.base_score_version, e.base_score_variant,
+		       e.hyperparam_snapshot_id, e.proposed_hyperparams
 		FROM   forest_retrieval_events e
 		JOIN   forest_retrieval_event_seq_log s ON s.event_id = e.id
 	`
@@ -349,25 +353,27 @@ func buildRetrievalAuditWhere(filter RetrievalAuditFilter) ([]string, []any) {
 
 func scanRetrievalAuditRow(rows *sql.Rows) (*RetrievalAuditEvent, error) {
 	var (
-		event              RetrievalAuditEvent
-		seq                int64
-		taskID             sql.NullString
-		agentID            sql.NullString
-		agentType          sql.NullString
-		intentID           sql.NullString
-		horizon            sql.NullString
-		familiesJSON       sql.NullString
-		includeCounterInt  int
-		requestedAtUnix    int64
-		durationMicros     int64
-		modelKey           sql.NullString
-		errorMessage       sql.NullString
-		candidatesJSON       string
-		metadataJSON         sql.NullString
-		explorationModeInt   int
-		substrateModeStr     sql.NullString
-		baseScoreVersion     int64
-		baseScoreVariantStr  sql.NullString
+		event                  RetrievalAuditEvent
+		seq                    int64
+		taskID                 sql.NullString
+		agentID                sql.NullString
+		agentType              sql.NullString
+		intentID               sql.NullString
+		horizon                sql.NullString
+		familiesJSON           sql.NullString
+		includeCounterInt      int
+		requestedAtUnix        int64
+		durationMicros         int64
+		modelKey               sql.NullString
+		errorMessage           sql.NullString
+		candidatesJSON         string
+		metadataJSON           sql.NullString
+		explorationModeInt     int
+		substrateModeStr       sql.NullString
+		baseScoreVersion       int64
+		baseScoreVariantStr    sql.NullString
+		hyperparamSnapshotID   int64
+		proposedHyperparamsInt int
 	)
 	err := rows.Scan(
 		&seq,
@@ -379,6 +385,7 @@ func scanRetrievalAuditRow(rows *sql.Rows) (*RetrievalAuditEvent, error) {
 		&event.BranchProjectionSeq, &candidatesJSON, &metadataJSON,
 		&explorationModeInt, &substrateModeStr,
 		&baseScoreVersion, &baseScoreVariantStr,
+		&hyperparamSnapshotID, &proposedHyperparamsInt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("scan audit row: %w", err)
@@ -398,6 +405,8 @@ func scanRetrievalAuditRow(rows *sql.Rows) (*RetrievalAuditEvent, error) {
 	event.SubstrateMode = SubstrateMode(substrateModeStr.String)
 	event.BaseScoreVersion = baseScoreVersion
 	event.BaseScoreVariant = BaseScoreVariant(baseScoreVariantStr.String)
+	event.HyperparamSnapshotID = hyperparamSnapshotID
+	event.ProposedHyperparams = proposedHyperparamsInt != 0
 
 	if err := decodeAuditFamilies(familiesJSON, &event); err != nil {
 		return nil, err

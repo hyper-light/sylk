@@ -133,10 +133,11 @@ func (m *MemoryForest) applyExplicitLabel(ctx context.Context, branchID, session
 // the retrieval that produced it, and forest_retrieval_candidates
 // is keyed by retrieval_event_id (same value).
 func (m *MemoryForest) applyCounterfactualLabels(ctx context.Context, branchID, sessionID string, status OutcomeStatus) (int64, error) {
-	if m.counterfactualLabelWeight <= 0 {
+	hp := m.hyperparams()
+	if hp.CounterfactualWeight <= 0 {
 		return 0, nil
 	}
-	since := time.Now().UTC().Add(-m.counterfactualWindow).Unix()
+	since := time.Now().UTC().Add(-hp.CounterfactualWindow).Unix()
 	utility, risk := outcomeLabels(invertOutcomeStatus(status))
 
 	res, err := m.db.ExecContext(ctx, `
@@ -161,7 +162,7 @@ func (m *MemoryForest) applyCounterfactualLabels(ctx context.Context, branchID, 
 	`,
 		utility, risk,
 		string(LabelSourceCounterfactual),
-		m.counterfactualLabelWeight,
+		hp.CounterfactualWeight,
 		time.Now().UTC().Unix(),
 		branchID, sessionID,
 		string(LabelSourceExplicit), string(LabelSourceCounterfactual),
@@ -199,16 +200,33 @@ func invertOutcomeStatus(status OutcomeStatus) OutcomeStatus {
 // shouldExplore samples the per-forest RNG to decide whether the
 // current Retrieve call should be an exploration sample. Mutex-
 // guarded because math/rand sources are not goroutine-safe.
+//
+// Reads ExplorationRate from m.hyperparams(); shouldExploreWithHP
+// is the snapshot-pinned variant used by the retrieval pipeline.
 func (m *MemoryForest) shouldExplore() bool {
-	if m == nil || m.explorationRate <= 0 {
+	return m.shouldExploreWithHP(nil)
+}
+
+// shouldExploreWithHP is the snapshot-pinned variant. hp == nil
+// falls back to m.hyperparams() so the public wrapper stays a
+// one-liner.
+func (m *MemoryForest) shouldExploreWithHP(hp *HyperParameters) bool {
+	if m == nil {
 		return false
 	}
-	if m.explorationRate >= 1 {
+	if hp == nil {
+		hp = m.hyperparams()
+	}
+	rate := hp.ExplorationRate
+	if rate <= 0 {
+		return false
+	}
+	if rate >= 1 {
 		return true
 	}
 	m.explorationRngMu.Lock()
 	defer m.explorationRngMu.Unlock()
-	return m.explorationRng.Float64() < m.explorationRate
+	return m.explorationRng.Float64() < rate
 }
 
 // explorationShuffleAndPick replaces the top-K with a random sample
@@ -283,7 +301,7 @@ func (m *MemoryForest) runImplicitNegativeSweeperLoop() {
 		if processed >= implicitNegativeSweepBatchSize {
 			continue
 		}
-		if !m.sleepProjector(m.implicitNegativeSweepInterval) {
+		if !m.sleepProjector(m.hyperparams().ImplicitNegativeSweepInterval()) {
 			return
 		}
 	}
@@ -302,7 +320,7 @@ func (m *MemoryForest) runImplicitNegativeSweepOnce(ctx context.Context) error {
 // sweeper loop uses to detect a saturated batch. Returns the number
 // of candidates processed (regardless of per-candidate success).
 func (m *MemoryForest) runImplicitNegativeSweepOnceCounted(ctx context.Context) (int, error) {
-	cutoff := time.Now().UTC().Add(-m.implicitNegativeHorizon).Unix()
+	cutoff := time.Now().UTC().Add(-m.hyperparams().ImplicitNegativeHorizon).Unix()
 	candidates, err := m.loadUnsweptRetrievals(ctx, cutoff, implicitNegativeSweepBatchSize)
 	if err != nil {
 		return 0, fmt.Errorf("load unswept retrievals: %w", err)
@@ -468,7 +486,7 @@ func (m *MemoryForest) applyImplicitNegativeTx(ctx context.Context, exec sqlExec
 	tail := []any{
 		utility, risk,
 		string(LabelSourceImplicitNegative),
-		m.implicitNegativeWeight,
+		m.hyperparams().ImplicitNegativeWeight,
 		time.Now().UTC().Unix(),
 	}
 	args = append(tail, args...)

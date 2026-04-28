@@ -246,7 +246,8 @@ func (m *MemoryForest) queryRetrievalAuditRowsAfterSeq(after int64, limit int) (
 		       e.model_key, e.model_version, e.error_message,
 		       e.branch_projection_seq, e.candidates_blob, e.metadata_blob,
 		       e.exploration_mode, e.substrate_mode,
-		       e.base_score_version, e.base_score_variant
+		       e.base_score_version, e.base_score_variant,
+		       e.hyperparam_snapshot_id, e.proposed_hyperparams
 		FROM   forest_retrieval_events e
 		JOIN   forest_retrieval_event_seq_log s ON s.event_id = e.id
 		WHERE  s.seq > ?

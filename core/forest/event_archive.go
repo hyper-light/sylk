@@ -345,6 +345,8 @@ type archivableRetrievalEvent struct {
 	substrateMode          string
 	baseScoreVersion       int64
 	baseScoreVariant       string
+	hyperparamSnapshotID   int64
+	proposedHyperparams    int64
 }
 
 func loadRetrievalEventArchiveCandidates(ctx context.Context, tx *sql.Tx, cutoff int64, limit int) ([]archivableRetrievalEvent, error) {
@@ -355,7 +357,8 @@ func loadRetrievalEventArchiveCandidates(ctx context.Context, tx *sql.Tx, cutoff
 		       candidate_count, returned_count, model_key, model_version,
 		       error_message, branch_projection_seq, candidates_blob,
 		       metadata_blob, exploration_mode, substrate_mode,
-		       base_score_version, base_score_variant
+		       base_score_version, base_score_variant,
+		       hyperparam_snapshot_id, proposed_hyperparams
 		FROM   forest_retrieval_events
 		WHERE  requested_at < ?
 		ORDER BY requested_at ASC
@@ -376,6 +379,7 @@ func loadRetrievalEventArchiveCandidates(ctx context.Context, tx *sql.Tx, cutoff
 			&r.errorMessage, &r.branchProjectionSeq, &r.candidatesBlob,
 			&r.metadataBlob, &r.explorationMode, &r.substrateMode,
 			&r.baseScoreVersion, &r.baseScoreVariant,
+			&r.hyperparamSnapshotID, &r.proposedHyperparams,
 		); err != nil {
 			return nil, fmt.Errorf("scan retrieval archive candidate: %w", err)
 		}
@@ -393,8 +397,9 @@ func insertRetrievalEventsToArchive(ctx context.Context, tx *sql.Tx, candidates 
 		 candidate_count, returned_count, model_key, model_version,
 		 error_message, branch_projection_seq, candidates_compressed,
 		 metadata_compressed, exploration_mode, substrate_mode,
-		 base_score_version, base_score_variant, archived_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 base_score_version, base_score_variant,
+		 hyperparam_snapshot_id, proposed_hyperparams, archived_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare retrieval archive insert: %w", err)
@@ -418,7 +423,8 @@ func insertRetrievalEventsToArchive(ctx context.Context, tx *sql.Tx, candidates 
 			r.candidateCount, r.returnedCount, r.modelKey, r.modelVersion,
 			r.errorMessage, r.branchProjectionSeq, compressedCands,
 			compressedMeta, r.explorationMode, r.substrateMode,
-			r.baseScoreVersion, r.baseScoreVariant, now,
+			r.baseScoreVersion, r.baseScoreVariant,
+			r.hyperparamSnapshotID, r.proposedHyperparams, now,
 		); err != nil {
 			return fmt.Errorf("insert retrieval archive row %s: %w", r.id, err)
 		}

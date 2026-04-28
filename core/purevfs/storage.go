@@ -57,10 +57,20 @@ type ChunkStoreStats struct {
 	RejectedPutCount int64
 }
 
+// chunkEntry is the per-chunk metadata held by ChunkStore. The bytes
+// themselves live in the arena slot; the entry only carries the slot
+// pointer and refcount. Keeping bytes off the Go heap is the primary
+// inuse_space win — the heap profile sees only this small struct per
+// chunk, not the chunk content.
+type chunkEntry struct {
+	slot *chunkSlot
+	refs int32
+}
+
 type ChunkStore struct {
 	mu          sync.RWMutex
-	chunks      map[Hash][]byte
-	refs        map[Hash]int32
+	chunks      map[Hash]*chunkEntry
+	arena       *chunkArena
 	memoryLimit int64
 	bytes       atomic.Int64
 	uniquePuts  atomic.Int64
@@ -70,8 +80,8 @@ type ChunkStore struct {
 
 func NewChunkStore(memoryLimit int64) *ChunkStore {
 	return &ChunkStore{
-		chunks:      make(map[Hash][]byte),
-		refs:        make(map[Hash]int32),
+		chunks:      make(map[Hash]*chunkEntry),
+		arena:       newChunkArena(),
 		memoryLimit: memoryLimit,
 	}
 }
@@ -82,8 +92,8 @@ func (s *ChunkStore) Put(content []byte) (Hash, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if refs, ok := s.refs[hash]; ok {
-		s.refs[hash] = refs + 1
+	if entry, ok := s.chunks[hash]; ok {
+		entry.refs++
 		s.dedupHits.Add(1)
 		return hash, true, nil
 	}
@@ -94,10 +104,12 @@ func (s *ChunkStore) Put(content []byte) (Hash, bool, error) {
 		return Hash{}, false, ErrMemoryPressure
 	}
 
-	cloned := make([]byte, len(content))
-	copy(cloned, content)
-	s.chunks[hash] = cloned
-	s.refs[hash] = 1
+	slot, err := s.arena.Allocate(len(content))
+	if err != nil {
+		return Hash{}, false, err
+	}
+	copy(slot.bytes, content)
+	s.chunks[hash] = &chunkEntry{slot: slot, refs: 1}
 	s.bytes.Store(nextBytes)
 	s.uniquePuts.Add(1)
 	return hash, false, nil
@@ -107,10 +119,11 @@ func (s *ChunkStore) Acquire(hash Hash) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.chunks[hash]; !ok {
+	entry, ok := s.chunks[hash]
+	if !ok {
 		return ErrChunkNotFound
 	}
-	s.refs[hash]++
+	entry.refs++
 	return nil
 }
 
@@ -118,31 +131,63 @@ func (s *ChunkStore) Release(hash Hash) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	refs, ok := s.refs[hash]
+	entry, ok := s.chunks[hash]
 	if !ok {
 		return ErrChunkNotFound
 	}
-	if refs <= 1 {
-		s.bytes.Add(-int64(len(s.chunks[hash])))
-		delete(s.refs, hash)
+	if entry.refs <= 1 {
+		s.bytes.Add(-int64(entry.slot.Size()))
 		delete(s.chunks, hash)
+		s.arena.Free(entry.slot)
 		return nil
 	}
-	s.refs[hash] = refs - 1
+	entry.refs--
 	return nil
 }
 
+// Get returns a heap-allocated copy of the chunk's bytes. Callers that
+// only need to copy bytes into their own buffer should prefer CopyInto,
+// which avoids the per-call allocation by writing directly into the
+// caller's destination slice.
 func (s *ChunkStore) Get(hash Hash) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	content, ok := s.chunks[hash]
+	entry, ok := s.chunks[hash]
 	if !ok {
 		return nil, ErrChunkNotFound
 	}
-	out := make([]byte, len(content))
-	copy(out, content)
+	out := make([]byte, entry.slot.Size())
+	copy(out, entry.slot.bytes)
 	return out, nil
+}
+
+// CopyInto writes the chunk's bytes [off:off+len(dst)] directly into
+// dst, without allocating an intermediate heap buffer. Returns the
+// number of bytes written. This is the preferred read API on the
+// VFS read hot path; FileBody.ReadAt uses it to drain a chunk into the
+// caller's destination buffer in one copy.
+func (s *ChunkStore) CopyInto(dst []byte, hash Hash, off int) (int, error) {
+	if len(dst) == 0 {
+		return 0, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	entry, ok := s.chunks[hash]
+	if !ok {
+		return 0, ErrChunkNotFound
+	}
+	if off < 0 || off > entry.slot.Size() {
+		return 0, ErrInvalidRange
+	}
+	avail := entry.slot.Size() - off
+	n := len(dst)
+	if n > avail {
+		n = avail
+	}
+	copy(dst[:n], entry.slot.bytes[off:off+n])
+	return n, nil
 }
 
 func (s *ChunkStore) Has(hash Hash) bool {
@@ -155,7 +200,10 @@ func (s *ChunkStore) Has(hash Hash) bool {
 func (s *ChunkStore) RefCount(hash Hash) int32 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.refs[hash]
+	if entry, ok := s.chunks[hash]; ok {
+		return entry.refs
+	}
+	return 0
 }
 
 func (s *ChunkStore) Stats() ChunkStoreStats {
@@ -163,8 +211,8 @@ func (s *ChunkStore) Stats() ChunkStoreStats {
 	defer s.mu.RUnlock()
 
 	var refs int64
-	for _, n := range s.refs {
-		refs += int64(n)
+	for _, entry := range s.chunks {
+		refs += int64(entry.refs)
 	}
 
 	return ChunkStoreStats{
@@ -176,6 +224,14 @@ func (s *ChunkStore) Stats() ChunkStoreStats {
 		DedupHitCount:    s.dedupHits.Load(),
 		RejectedPutCount: s.rejected.Load(),
 	}
+}
+
+// ArenaMappedBytes returns the total virtual memory currently mapped by
+// the chunk arena. Useful for telemetry: ArenaMappedBytes - Bytes is
+// the slack capacity (free slots in mapped slabs). Growth in this gap
+// indicates fragmentation across size classes.
+func (s *ChunkStore) ArenaMappedBytes() int64 {
+	return s.arena.MappedBytes()
 }
 
 type ExtentKind uint8
@@ -370,11 +426,13 @@ func (b *FileBody) ReadAt(p []byte, off int64, reader RealFileReader, store *Chu
 			if store == nil {
 				return int(written), ErrChunkNotFound
 			}
-			content, err := store.Get(ex.BlobHash)
+			n, err := store.CopyInto(dst, ex.BlobHash, int(ex.BlobOffset+extentOffset))
 			if err != nil {
 				return int(written), err
 			}
-			copy(dst, content[ex.BlobOffset+extentOffset:ex.BlobOffset+extentOffset+chunkLen])
+			if int64(n) != chunkLen {
+				return int(written) + n, ErrChunkNotFound
+			}
 		case ExtentRealFile:
 			if reader == nil {
 				return int(written), ErrMissingRealRead

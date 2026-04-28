@@ -242,7 +242,7 @@ func (m *MemoryForest) ScoreComponentStatsSince(ctx context.Context, since time.
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate candidates blobs: %w", err)
 	}
-	return contributions.snapshot(weights, m.baseScorePruningThresh), nil
+	return contributions.snapshot(weights, m.hyperparams().BaseScorePruningThreshold), nil
 }
 
 // activeBaseScoreWeights returns the current champion's weights as

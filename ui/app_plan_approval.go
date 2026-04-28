@@ -127,9 +127,11 @@ func planApprovalRejectIndex() int {
 
 // activatePlanApprovalOption is invoked from key/mouse handlers when
 // the user selects an option (Approve / Modify / Reject). Mirrors
-// activateCommandApprovalOption: marks selection visually then defers
-// the commit by ~75ms so the user sees the press feedback before the
-// dialog disappears.
+// activatePlanApprovalOption: marks selection visually, publishes the
+// verdict to the bus immediately, and defers ONLY the dialog dismissal
+// by ~75ms so the user still sees press feedback. The bus publish is
+// no longer blocked by the visual delay — the architect receives the
+// verdict at click time, not 75ms later.
 func (m *AppModel) activatePlanApprovalOption(index int) tea.Cmd {
 	if m.planApproval == nil || index < 0 || index >= len(planApprovalOptions) {
 		return nil
@@ -141,11 +143,9 @@ func (m *AppModel) activatePlanApprovalOption(index int) tea.Cmd {
 	option := planApprovalOptions[index]
 	proposal := m.planApproval.proposal
 	verdict := planapproval.Verdict(option.decision)
+	m.publishPlanApprovalVerdict(proposal, verdict)
 	return tea.Tick(75*time.Millisecond, func(time.Time) tea.Msg {
-		return msg.PlanApprovalCommitMsg{
-			Proposal: proposal,
-			Verdict:  verdict,
-		}
+		return msg.PlanApprovalResolvedMsg{}
 	})
 }
 
@@ -161,11 +161,9 @@ func (m *AppModel) activatePlanApprovalOption(index int) tea.Cmd {
 // are explicit non-approval decisions but still successful user
 // responses, not denials in the sense Guardian uses for command
 // approval; the architect's handler branches on `decision`).
-func (m *AppModel) commitPlanApproval(commit msg.PlanApprovalCommitMsg) tea.Cmd {
-	if commit.Proposal == nil || m.deps.GuideBus == nil {
-		return func() tea.Msg {
-			return msg.PlanApprovalResolvedMsg{}
-		}
+func (m *AppModel) publishPlanApprovalVerdict(proposal *planapproval.Proposal, verdict planapproval.Verdict) {
+	if proposal == nil || m.deps.GuideBus == nil {
+		return
 	}
 	// The guardian topic for responses is fixed by Guardian's own
 	// subscription pattern (TopicResponses("guardian", g.id)). The
@@ -176,13 +174,13 @@ func (m *AppModel) commitPlanApproval(commit msg.PlanApprovalCommitMsg) tea.Cmd 
 	// session-bound channels so we publish to the canonical
 	// guardian responses topic.
 	payload := map[string]any{
-		"decision": string(commit.Verdict),
-		"approved": commit.Verdict == planapproval.VerdictApprove,
+		"decision": string(verdict),
+		"approved": verdict == planapproval.VerdictApprove,
 	}
 	topic := guide.TopicResponses("guardian", "guardian")
 	if err := m.deps.GuideBus.Publish(topic, &guide.Message{
 		ID:            uuid.New().String(),
-		CorrelationID: commit.Proposal.CorrelationID,
+		CorrelationID: proposal.CorrelationID,
 		Type:          guide.MessageTypeResponse,
 		SourceAgentID: "tui",
 		Payload:       payload,
@@ -190,11 +188,19 @@ func (m *AppModel) commitPlanApproval(commit msg.PlanApprovalCommitMsg) tea.Cmd 
 	}); err != nil {
 		slog.Warn("ui_plan_approval_response_publish_failed",
 			"topic", topic,
-			"correlation_id", commit.Proposal.CorrelationID,
-			"verdict", string(commit.Verdict),
+			"correlation_id", proposal.CorrelationID,
+			"verdict", string(verdict),
 			"error", err.Error(),
 		)
 	}
+}
+
+// commitPlanApproval is retained for the legacy delivery path (a
+// PlanApprovalCommitMsg arrived without the verdict already published
+// by activatePlanApprovalOption). It republishes idempotently and
+// returns the resolved signal so the dialog dismisses.
+func (m *AppModel) commitPlanApproval(commit msg.PlanApprovalCommitMsg) tea.Cmd {
+	m.publishPlanApprovalVerdict(commit.Proposal, commit.Verdict)
 	return func() tea.Msg {
 		return msg.PlanApprovalResolvedMsg{}
 	}

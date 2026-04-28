@@ -145,6 +145,14 @@ type Architect struct {
 	// expire after planAuditCacheTTL.
 	planAuditCacheMu sync.Mutex
 	planAuditCache   map[string]*planAuditCacheEntry
+
+	// orchestratorProjection mirrors orchestrator plan state from
+	// existing receipt-update + dag.status events so the approval hot
+	// path doesn't pay a synchronous plan_state_query RPC. Empty
+	// projection = "no orchestrator context" (architect treats as
+	// fresh dispatch — same fallback as a timed-out RPC).
+	orchestratorProjection *orchestratorProjection
+	dagStatusSub           guide.Subscription
 }
 
 // planAuditCacheEntry holds a freshness audit cached for the duration
@@ -441,9 +449,10 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 		planModes:         make(map[string]*PlanModeState),
 		pendingBus:        make(map[string]*shared.PendingSyncWait),
 		inFlight:          make(map[string]context.CancelFunc),
-		forestTracker:     shared.NewMemoryForestTracker(),
-		steering:          shared.NewSteeringManager(),
-		requestSerializer: shared.NewRequestSerializer(),
+		forestTracker:          shared.NewMemoryForestTracker(),
+		steering:               shared.NewSteeringManager(),
+		requestSerializer:      shared.NewRequestSerializer(),
+		orchestratorProjection: newOrchestratorProjection(),
 	}
 
 	architect.factory = cfg.Factory
@@ -779,6 +788,12 @@ func (a *Architect) Start(bus guide.EventBus) error {
 	// Subscribe to heartbeat topic for executing plan lease renewal.
 	a.heartbeatSub, _ = bus.SubscribeAsync("plan.heartbeat", a.handlePlanHeartbeat)
 
+	// Subscribe to dag.status for terminal DAG transitions
+	// (succeeded / failed / aborted). Folds into the orchestrator
+	// projection so the approval hot path can resolve plan state
+	// without a synchronous query.
+	a.dagStatusSub, _ = bus.SubscribeAsync("dag.status", a.handleDAGStatusEvent)
+
 	// Audit-rejection bridge: direct AuditMergeResultTopic subscriber
 	// that translates Rejected verdicts into RemediationRequests and
 	// hands them to processRemediationRequest. Closes the §3.8 loop
@@ -864,6 +879,14 @@ func (a *Architect) Stop() error {
 			errs = append(errs, err)
 		}
 		a.heartbeatSub = nil
+	}
+
+	// Unsubscribe dag.status projection feed.
+	if a.dagStatusSub != nil {
+		if err := a.dagStatusSub.Unsubscribe(); err != nil {
+			errs = append(errs, err)
+		}
+		a.dagStatusSub = nil
 	}
 
 	// Stop the audit-rejection bridge.
