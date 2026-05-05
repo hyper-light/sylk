@@ -676,19 +676,33 @@ func (i *ClaimsInbox) matchesStandingSubscription(d Delta) bool {
 	}
 	switch delta := d.(type) {
 	case InboxDelta:
-		return role.Has(RoleSubject) &&
-			delta.AgentID == i.agentID &&
-			!IsSystemInternalAction(delta.ActionKind)
+		if IsSystemInternalAction(delta.ActionKind) {
+			return false
+		}
+		if role.Has(RoleObserver) {
+			return true
+		}
+		return role.Has(RoleSubject) && delta.AgentID == i.agentID
 	case *InboxDelta:
-		return role.Has(RoleSubject) &&
-			delta.AgentID == i.agentID &&
-			!IsSystemInternalAction(delta.ActionKind)
+		if delta == nil {
+			return false
+		}
+		if IsSystemInternalAction(delta.ActionKind) {
+			return false
+		}
+		if role.Has(RoleObserver) {
+			return true
+		}
+		return role.Has(RoleSubject) && delta.AgentID == i.agentID
 	case TestamentDelta:
 		if IsSystemInternalAction(delta.ActionKind) {
 			return false
 		}
 		return role.Has(RoleAuditor) || role.Has(RoleArchivist)
 	case *TestamentDelta:
+		if delta == nil {
+			return false
+		}
 		if IsSystemInternalAction(delta.ActionKind) {
 			return false
 		}
@@ -699,16 +713,23 @@ func (i *ClaimsInbox) matchesStandingSubscription(d Delta) bool {
 		}
 		return claimStatusMatchesRole(role, delta.ToStatus) || role.Has(RoleObserver)
 	case *ClaimStatusDelta:
+		if delta == nil {
+			return false
+		}
 		if IsSystemInternalAction(delta.ActionKind) {
 			return false
 		}
 		return claimStatusMatchesRole(role, delta.ToStatus) || role.Has(RoleObserver)
-	case ValidationDelta, *ValidationDelta:
-		// Issuer-side via Expect(); evaluator-side flows through
-		// RoleSubject's inbox.<self>.evaluator.* pattern (which
-		// carries an InboxDelta, not a ValidationDelta). No standing
-		// role currently subscribes to ValidationDelta directly.
-		return false
+	case ValidationDelta:
+		// Auto-acceptance is mirrored onto the claim-accepted topic as
+		// a ValidationDelta, so the rendering observer must accept it to
+		// close the cycle. Action-taking roles still use expectations.
+		return role.Has(RoleObserver) && delta.ClaimAutoAccepted
+	case *ValidationDelta:
+		if delta == nil {
+			return false
+		}
+		return role.Has(RoleObserver) && delta.ClaimAutoAccepted
 	case PhaseDelta, *PhaseDelta:
 		return role.Has(RolePhaseObserver) || role.Has(RoleObserver)
 	case ConsultResolvedDelta:

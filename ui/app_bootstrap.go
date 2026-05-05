@@ -104,12 +104,8 @@ func newAppModel(
 			llm.ValidateKeyFormat,
 			nil,
 		),
-		activityBridge:         bridge.NewActivityBridge("tui.activity", deps.GuideBus, deps.Scope),
-		tokenUsageBridge:       bridge.NewTokenUsageBridge("tui.token_usage", deps.GuideBus, deps.Scope),
 		accountantBridge:       bridge.NewAccountantBridge("tui.accountant", deps.Accountant),
 		sessionBridge:          bridge.NewSessionBridge(deps.SessionManager, deps.Scope),
-		streamBridge:           bridge.NewStreamBridge(deps.Scope),
-		guideBridge:            bridge.NewGuideBridge(deps.GuideBus, deps.Scope, "default"),
 		lspManager:             lsp.NewManager(deps.Scope),
 		lspInstalling:          make(map[lsp.ServerID]bool),
 		interruptHandler:       interrupt.NewHandlerWithThreshold(time.Duration(cfg.InterruptThresholdMs) * time.Millisecond),
@@ -127,12 +123,6 @@ func newAppModel(
 		agentContextTokens:     make(map[string]int),
 		agentRuntimeContexts:   make(map[string]runtimeContextState),
 		agentReplicaCounts:     make(map[string]int),
-		streamUsage:            make(map[string]streamUsageEntry),
-		streamedResponses:      make(map[string]streamedResponseState),
-		activeStreams:          make(map[string]*activeStreamEntry),
-		deferredStreams:        make(map[string]*activeStreamEntry),
-		nestedStreams:          make(map[string]*activeStreamEntry),
-		reroutedStreamCIDs:     make(map[string]time.Time),
 		oauthSessions:          newOAuthSessionManager(),
 		focusGradient:          th.Palette.IdleFocusRingGradient(),
 		idleFocusGradient:      th.Palette.IdleFocusRingGradient(),
@@ -263,7 +253,7 @@ func (m *AppModel) initializePipelineBridge(deps Deps) {
 		return
 	}
 	m.pipelineBridge = bridge.NewPipelineBridge("tui.pipeline", deps.GuideBus, deps.VariantRegistry, deps.Scope)
-	m.claimsBridge = bridge.NewClaimsBridge("tui.claims", claims.DefaultSessionBoardRegistry(), deps.Scope)
+	m.claimsBridge = bridge.NewClaimsBridge("tui.claims", claims.DefaultSessionBoardRegistry(), deps.Scope, deps.GuideBus)
 }
 
 var (

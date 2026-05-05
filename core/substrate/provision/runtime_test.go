@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -64,10 +65,9 @@ func TestProvision_EndToEnd_HTTPS(t *testing.T) {
 	files := map[string]string{"top/x": "content"}
 	archive := buildTarGz(t, files)
 
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newLocalTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(archive)
 	}))
-	defer server.Close()
 
 	cfg := fetcher.DefaultHTTPSConfig()
 	cfg.InsecureSkipVerify = true
@@ -108,6 +108,19 @@ func TestProvision_EndToEnd_HTTPS(t *testing.T) {
 	if result.ManifestID.IsZero() {
 		t.Fatal("expected non-zero ManifestID")
 	}
+}
+
+func newLocalTLSServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local TCP listener unavailable for HTTPS test: %v", err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = ln
+	server.StartTLS()
+	t.Cleanup(server.Close)
+	return server
 }
 
 func TestProvision_RejectsBuildRecipes(t *testing.T) {
@@ -274,9 +287,9 @@ func TestProvision_PlatformSubstitution(t *testing.T) {
 			{Source: "disk://" + dir + "/{os}/{arch}/fixture.tar.gz",
 				Hash: recipe.Hash{Algorithm: "sha256", Digest: sha256Sum(archive)}},
 		},
-		Verify:  recipe.VerifySpec{PolicyClass: recipe.VerifyStrict},
-		Extract: recipe.ExtractSpec{Format: recipe.ExtractFormatTarGz},
-		Output:  []recipe.OutputMapping{{SubstratePath: "/x", SourcePath: "/x"}},
+		Verify:   recipe.VerifySpec{PolicyClass: recipe.VerifyStrict},
+		Extract:  recipe.ExtractSpec{Format: recipe.ExtractFormatTarGz},
+		Output:   []recipe.OutputMapping{{SubstratePath: "/x", SourcePath: "/x"}},
 		Metadata: recipe.RecipeMetadata{Name: "subst", Version: "1", Ecosystem: "test"},
 	}
 

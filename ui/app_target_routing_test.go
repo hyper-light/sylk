@@ -2,9 +2,7 @@ package ui
 
 import (
 	"testing"
-	"time"
 
-	"github.com/adalundhe/sylk/core/events"
 	agentpkg "github.com/adalundhe/sylk/ui/agent"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
@@ -75,17 +73,10 @@ func pushAgentPanelActivity(panel *agentpkg.Model, agentID string) {
 	if panel == nil {
 		return
 	}
-	_, _ = panel.Update(msg.ActivityEventMsg{
-		Event: &events.ActivityEvent{
-			ID:        "evt_" + agentID,
-			EventType: events.EventTypeLLMRequest,
-			Timestamp: time.Now(),
-			AgentID:   agentID,
-			Content:   "active",
-			Data: map[string]any{
-				"agent_name": agentID,
-				"agent_type": agentID,
-			},
-		},
+	_, _ = panel.Update(msg.ClaimsAgentStatusMsg{
+		SessionID: "test",
+		AgentID:   agentID,
+		CycleID:   "cycle_" + agentID,
+		Active:    true,
 	})
 }

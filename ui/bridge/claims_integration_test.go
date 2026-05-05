@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/ui/msg"
 )
@@ -14,7 +15,7 @@ import (
 // integrationProgram captures every Send invocation so tests can assert
 // on the emitted message stream.
 type integrationProgram struct {
-	mu  sync.Mutex
+	mu   sync.Mutex
 	msgs []any
 }
 
@@ -36,24 +37,31 @@ func (p *integrationProgram) Snapshot() []any {
 // unconditionally so the bridge runs synchronously in tests.
 type stubScopeProvider struct{}
 
-func (stubScopeProvider) Go(string, time.Duration, func(context.Context) error) error {
-	return nil
+func (stubScopeProvider) Go(_ string, _ time.Duration, fn func(context.Context) error) error {
+	if fn == nil {
+		return nil
+	}
+	return fn(context.Background())
 }
 
 func setupBridgeOnSession(t *testing.T, sessionID string) (*ClaimsBridge, *claims.ClaimsBoard, *integrationProgram, func()) {
 	t.Helper()
 	registry := claims.DefaultSessionBoardRegistry()
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	deltaBus := guide.NewClaimsBusAdapter(bus)
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
 		BoardID:    "integration-board-" + sessionID,
 		PipelineID: "p",
 		TaskID:     "t",
 		SessionID:  sessionID,
+		DeltaBus:   deltaBus,
+		Scope:      stubScopeProvider{},
 	})
 	if err := registry.Register(sessionID, board); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	prog := &integrationProgram{}
-	br := NewClaimsBridge("test", registry, nil)
+	br := NewClaimsBridge("test", registry, nil, bus)
 	if err := br.Start(prog); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -61,6 +69,7 @@ func setupBridgeOnSession(t *testing.T, sessionID string) (*ClaimsBridge, *claim
 	br.SwitchSession(sessionID)
 	cleanup := func() {
 		br.Stop()
+		_ = bus.Close()
 		registry.Remove(sessionID)
 	}
 	return br, board, prog, cleanup
@@ -103,6 +112,49 @@ func TestBridgeIntegration_ClaimCreatedOpensCycle(t *testing.T) {
 	}
 	if openMsg.CycleID == "" {
 		t.Fatal("CycleID empty on open event")
+	}
+}
+
+func TestBridgeIntegration_InProgressStatusOpensObserverOnlyCycle(t *testing.T) {
+	_, board, prog, cleanup := setupBridgeOnSession(t, "ses-cycle-in-progress-open")
+	defer cleanup()
+
+	posted := []claims.Claim{{
+		Title: "classify route",
+		Relations: []claims.Relation{
+			{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+		},
+		Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+	}}
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "guide", Type: claims.ActionTypePrompt},
+		posted,
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	if len(posted) == 0 || posted[0].ID == "" {
+		t.Fatal("posted claim ID empty")
+	}
+	if err := board.UpdateClaimProgress(context.Background(), posted[0].ID, claims.ClaimProgressUpdate{
+		WorkSummary: "Classifying and routing request",
+	}, "guide"); err != nil {
+		t.Fatalf("UpdateClaimProgress: %v", err)
+	}
+
+	drainBridge(t, prog, "ClaimsAgentStatusMsg(open from in_progress)")
+
+	var openMsg *msg.ClaimsAgentStatusMsg
+	for _, m := range prog.Snapshot() {
+		if s, ok := m.(msg.ClaimsAgentStatusMsg); ok && s.Active && s.CycleID == posted[0].ID {
+			openMsg = &s
+			break
+		}
+	}
+	if openMsg == nil {
+		t.Fatal("expected ClaimsAgentStatusMsg{Active=true} from in_progress status delta")
+	}
+	if openMsg.AgentID != "guide" {
+		t.Fatalf("AgentID = %q, want guide", openMsg.AgentID)
 	}
 }
 
@@ -300,11 +352,11 @@ func TestBridgeIntegration_CrossClaimNestingViaParentRowID(t *testing.T) {
 	//    bridge must set ParentRowID = consultStartedID.
 	bToolStartedID := "tool-started-B"
 	br.OnArtifactAdded(consultClaimID, "engineer", "ses-nest", &claims.Artifact{
-		ID:      bToolStartedID,
-		AgentID: "engineer",
-		Kind:    "tool_started",
+		ID:        bToolStartedID,
+		AgentID:   "engineer",
+		Kind:      "tool_started",
 		Reference: "read_file",
-		Created: time.Now(),
+		Created:   time.Now(),
 	})
 
 	drainBridge(t, prog, "cross-claim nesting")

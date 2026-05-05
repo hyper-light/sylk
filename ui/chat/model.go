@@ -602,26 +602,6 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	case msg.DecorTickMsg:
 		m.handleDecorTick(typed.Time)
 		return m, nil
-	case msg.ActivityEventMsg:
-		return m, nil
-	case msg.StreamStartMsg:
-		return m, nil
-	case msg.StreamChunkMsg:
-		return m, nil
-	case msg.StreamProgressMsg:
-		return m, nil
-	case msg.StreamCompleteMsg:
-		return m, nil
-	case msg.StreamErrorMsg:
-		return m, nil
-	case msg.StreamRerouteMsg:
-		return m, nil
-	case msg.RetryStatusMsg:
-		return m, nil
-	case msg.ToolCallEventMsg:
-		return m, nil
-	case msg.AgentStateMsg:
-		return m, nil
 	case msg.ClaimsAgentStatusMsg:
 		m.viewDirty = true
 		return m, m.handleClaimsAgentStatus(typed)

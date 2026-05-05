@@ -12,7 +12,6 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/commandapproval"
-	"github.com/adalundhe/sylk/core/planapproval"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/detect"
@@ -21,6 +20,7 @@ import (
 	"github.com/adalundhe/sylk/core/llm/accounting"
 	"github.com/adalundhe/sylk/core/lsp"
 	"github.com/adalundhe/sylk/core/pipeline/variants"
+	"github.com/adalundhe/sylk/core/planapproval"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/session"
@@ -483,12 +483,8 @@ type AppModel struct {
 	overlay            overlayState
 
 	// Bridges
-	activityBridge   *bridge.ActivityBridge
-	tokenUsageBridge *bridge.TokenUsageBridge
 	accountantBridge *bridge.AccountantBridge
 	sessionBridge    *bridge.SessionBridge
-	streamBridge     *bridge.StreamBridge
-	guideBridge      *bridge.GuideBridge
 	lspBridge        *bridge.LSPBridge
 	pipelineBridge   *bridge.PipelineBridge
 	claimsBridge     *bridge.ClaimsBridge
@@ -743,47 +739,21 @@ type AppModel struct {
 	escGen     uint64
 
 	// Guide context usage estimate for agent panel rendering.
-	guideContextTokens      int
-	guideContextUsage       float64
-	agentContextTokens      map[string]int
-	agentContextModels      map[string]string
-	agentRuntimeContexts    map[string]runtimeContextState
-	agentReplicaCounts      map[string]int
-	streamUsage             map[string]streamUsageEntry
-	streamedResponses       map[string]streamedResponseState
-	activeStreams           map[string]*activeStreamEntry // key = correlationID
-	deferredStreams         map[string]*activeStreamEntry // key = correlationID; top-level parents awaiting child work after LLM completion
-	nestedStreams           map[string]*activeStreamEntry // key = correlationID; visible child consult/challenge streams only
-	delayedPrimaryBootstrap map[string][]tea.Msg          // key = correlationID; early top-level progress/tool events held until authoritative start metadata arrives
-	reroutedStreamCIDs      map[string]time.Time          // Recently rerouted source streams allowed to emit terminal cleanup events.
-	interruptedCorrelations map[string]struct{}           // Correlation IDs killed by interrupt.
-	engagedAgentID          string                        // Sticky agent the user is conversing with.
-	manualTargetAgent       string
+	guideContextTokens   int
+	guideContextUsage    float64
+	agentContextTokens   map[string]int
+	agentContextModels   map[string]string
+	agentRuntimeContexts map[string]runtimeContextState
+	agentReplicaCounts   map[string]int
+	engagedAgentID       string // Sticky agent the user is conversing with.
+	manualTargetAgent    string
 
-	// Prompt queue: stacks follow-up prompts while agents stream.
+	// Prompt queue: stacks follow-up prompts while the user pauses dispatch.
 	promptQueue   queue.Queue
 	queueGradient *theme.Gradient
 
-	// Cumulative token counters from stream telemetry. These are the visible
-	// totals for the status bar because they continue accumulating across
-	// follow-on streams, retries, and architect consultation substreams.
-	totalPromptTokens     int
-	totalCompletionTokens int
-	totalCacheReadTokens  int
-	totalCacheWriteTokens int
-	totalReasoningTokens  int
-
-	// Bus token counters that cannot be attributed to an active stream.
-	// These cover background or non-streamed LLM work without double-counting
-	// the streamed requests already folded into total* above.
-	backgroundPromptTokens     int
-	backgroundCompletionTokens int
-	backgroundCacheReadTokens  int
-	backgroundCacheWriteTokens int
-	backgroundReasoningTokens  int
-
-	// Bus-sourced token counters: accumulated from TokenUsageMsg which
-	// captures ALL agent LLM calls (guide, engineer, architect, etc.).
+	// Accountant-delta fallback counters. AccountingSnapshotMsg is canonical
+	// once live; these keep the status bar responsive before the first snapshot.
 	busInputTokens      int
 	busOutputTokens     int
 	busCacheReadTokens  int
@@ -809,47 +779,6 @@ type AppModel struct {
 	// Optional plain-text capture of rendered chat updates for UI debugging.
 	chatDebugCapture *uiChatDebugCapture
 }
-
-type streamUsageEntry struct {
-	AgentID           string
-	RuntimeAgentID    string
-	AgentType         string
-	AgentName         string
-	PipelineID        string
-	TaskID            string
-	TaskName          string
-	TaskSlug          string
-	Tokens            int // Estimated/real output tokens.
-	InputTokens       int // Real input tokens from the provider (context window occupancy).
-	StartedAt         time.Time
-	EarlyInputApplied bool // True if early input tokens were applied during streaming.
-}
-
-type streamedResponseState struct {
-	HadChunk  bool
-	Completed bool
-	Succeeded bool
-	SeenAt    time.Time
-	BranchRef *msg.InterAgentBranchRefMsg
-}
-
-type activeStreamEntry struct {
-	CorrelationID  string
-	AgentID        string
-	RuntimeAgentID string
-	AgentType      string
-	AgentName      string
-	PipelineID     string
-	TaskID         string
-	TaskName       string
-	TaskSlug       string
-	SteeringPace   string // "auto", "step", "paused" — tracks current pace for UI display.
-	BranchRef      *msg.InterAgentBranchRefMsg
-	StartedAt      time.Time
-}
-
-const streamedResponseStateTTL = 45 * time.Second
-const reroutedStreamCIDTTL = 2 * time.Minute
 
 type runtimeContextState struct {
 	PanelAgentID   string
@@ -1127,16 +1056,16 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 			m.agentPanel.SetOpenAIAuthMethod(method)
 		}
 	}),
-	reflect.TypeFor[msg.InterruptMsg]():    appMsgCmdRoute(func(m *AppModel, _ msg.InterruptMsg) tea.Cmd { return m.handleInterrupt() }),
-	reflect.TypeFor[msg.QuitConfirmMsg]():  appMsgCmdRoute(func(m *AppModel, _ msg.QuitConfirmMsg) tea.Cmd { return m.handleQuit() }),
-	reflect.TypeFor[msg.TickMsg]():              appMsgCmdRoute((*AppModel).handleTick),
-	reflect.TypeFor[msg.DecorTickMsg]():         appMsgCmdRoute((*AppModel).handleDecorTick),
+	reflect.TypeFor[msg.InterruptMsg]():        appMsgCmdRoute(func(m *AppModel, _ msg.InterruptMsg) tea.Cmd { return m.handleInterrupt() }),
+	reflect.TypeFor[msg.QuitConfirmMsg]():      appMsgCmdRoute(func(m *AppModel, _ msg.QuitConfirmMsg) tea.Cmd { return m.handleQuit() }),
+	reflect.TypeFor[msg.TickMsg]():             appMsgCmdRoute((*AppModel).handleTick),
+	reflect.TypeFor[msg.DecorTickMsg]():        appMsgCmdRoute((*AppModel).handleDecorTick),
 	reflect.TypeFor[msg.MemoryCanvasTickMsg](): appMsgCmdRoute((*AppModel).handleMemoryCanvasTick),
-	reflect.TypeFor[msg.BlinkMsg]():        appMsgCmdRoute((*AppModel).handleBlink),
-	reflect.TypeFor[msg.LSPFlushMsg]():     appMsgCmdRoute((*AppModel).handleLSPFlush),
-	reflect.TypeFor[msg.QueueAdvanceMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.QueueAdvanceMsg) tea.Cmd { return m.dispatchQueueEntries(typed.EntryIDs) }),
-	reflect.TypeFor[msg.FocusPanelMsg]():   appMsgCmdRoute((*AppModel).handleFocusPanel),
-	reflect.TypeFor[msg.PlanUpdateMsg]():   appMsgCmdRoute((*AppModel).handlePlanUpdate),
+	reflect.TypeFor[msg.BlinkMsg]():            appMsgCmdRoute((*AppModel).handleBlink),
+	reflect.TypeFor[msg.LSPFlushMsg]():         appMsgCmdRoute((*AppModel).handleLSPFlush),
+	reflect.TypeFor[msg.QueueAdvanceMsg]():     appMsgCmdRoute(func(m *AppModel, typed msg.QueueAdvanceMsg) tea.Cmd { return m.dispatchQueueEntries(typed.EntryIDs) }),
+	reflect.TypeFor[msg.FocusPanelMsg]():       appMsgCmdRoute((*AppModel).handleFocusPanel),
+	reflect.TypeFor[msg.PlanUpdateMsg]():       appMsgCmdRoute((*AppModel).handlePlanUpdate),
 	reflect.TypeFor[msg.PlanViewToggleMsg](): appMsgCmdRoute(func(m *AppModel, _ msg.PlanViewToggleMsg) tea.Cmd {
 		return m.handlePlanViewToggle()
 	}),
@@ -2075,13 +2004,6 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 	}),
 	reflect.TypeFor[msg.FileReplacedMsg]():         appMsgCmdRoute((*AppModel).handleFileReplaced),
 	reflect.TypeFor[msg.MultiFileReplaceDoneMsg](): appMsgCmdRoute((*AppModel).handleMultiFileReplaceDone),
-	reflect.TypeFor[msg.StreamStartMsg]():          appMsgCmdRoute((*AppModel).handleStreamStartTelemetry),
-	reflect.TypeFor[msg.StreamChunkMsg]():          appMsgCmdRoute((*AppModel).handleStreamChunkTelemetry),
-	reflect.TypeFor[msg.StreamProgressMsg]():       appMsgCmdRoute((*AppModel).handleStreamProgressTelemetry),
-	reflect.TypeFor[msg.StreamCompleteMsg]():       appMsgCmdRoute((*AppModel).handleStreamCompleteTelemetry),
-	reflect.TypeFor[msg.StreamErrorMsg]():          appMsgCmdRoute((*AppModel).handleStreamErrorTelemetry),
-	reflect.TypeFor[msg.StreamRerouteMsg]():        appMsgCmdRoute((*AppModel).handleStreamReroute),
-	reflect.TypeFor[msg.GuideResponseMsg]():        appMsgCmdRoute((*AppModel).handleGuideResponse),
 	reflect.TypeFor[msg.CommandApprovalRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.CommandApprovalRequestMsg) tea.Cmd {
 		m.handleCommandApprovalRequest(typed)
 		return nil
@@ -2115,31 +2037,6 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 		m.resolveLayerDecision()
 		return nil
 	}),
-	reflect.TypeFor[msg.RetryStatusMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.RetryStatusMsg) tea.Cmd {
-		if typed.CorrelationID != "" {
-			if _, interrupted := m.interruptedCorrelations[typed.CorrelationID]; interrupted {
-				return nil
-			}
-		}
-		return m.propagate(typed)
-	}),
-	reflect.TypeFor[msg.ToolCallEventMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.ToolCallEventMsg) tea.Cmd {
-		if typed.CorrelationID != "" {
-			if _, interrupted := m.interruptedCorrelations[typed.CorrelationID]; interrupted {
-				return nil
-			}
-		}
-		return m.handleToolCallTelemetry(typed)
-	}),
-	reflect.TypeFor[msg.ActivityEventMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.ActivityEventMsg) tea.Cmd {
-		if typed.Event != nil && typed.Event.CorrelationID != "" {
-			if _, interrupted := m.interruptedCorrelations[typed.Event.CorrelationID]; interrupted {
-				return nil
-			}
-		}
-		m.applyActivityTelemetry(typed)
-		return m.propagate(typed)
-	}),
 	reflect.TypeFor[msg.AccountingSnapshotMsg](): appMsgStateRoute(func(m *AppModel, typed msg.AccountingSnapshotMsg) {
 		// Item 52: status bar reads accountant-aggregated totals via
 		// accountant.Billable() snapshots published on each tick. These
@@ -2155,46 +2052,24 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 		m.updateTokenDisplay()
 	}),
 	reflect.TypeFor[msg.TokenDeltaMsg](): appMsgStateRoute(func(m *AppModel, typed msg.TokenDeltaMsg) {
-		// Typed-identity delta path (item 50). Consumers read
-		// Identity.UID() / Identity.Owner() directly; no
-		// "#replica-" string parsing.
-	}),
-	reflect.TypeFor[msg.TokenUsageMsg](): appMsgStateRoute(func(m *AppModel, typed msg.TokenUsageMsg) {
 		m.busInputTokens += typed.InputTokens
 		m.busOutputTokens += typed.OutputTokens
 		m.busCacheReadTokens += typed.CacheReadTokens
 		m.busCacheWriteTokens += typed.CacheWriteTokens
 		m.busReasoningTokens += typed.ReasoningTokens
-		canonicalID := canonicalStreamAgentID(
-			firstNonEmpty(typed.AgentID, typed.RuntimeAgentID),
-			typed.AgentType,
-			typed.PipelineID,
-			typed.TaskID,
-		)
-		runtimeAgentID := normalizeRuntimeAgentID(canonicalID, firstNonEmpty(typed.RuntimeAgentID, typed.AgentID))
-		if typed.CorrelationID != "" {
-			if state, ok := m.streamUsage[strings.TrimSpace(typed.CorrelationID)]; ok {
-				canonicalID = firstNonEmpty(state.AgentID, canonicalID)
-				runtimeAgentID = normalizeRuntimeAgentID(canonicalID, firstNonEmpty(state.RuntimeAgentID, runtimeAgentID))
-			} else if resolvedID, _, _, _ := m.streamIdentityForCorrelation(typed.CorrelationID); resolvedID != "" {
-				canonicalID = resolvedID
-			}
+
+		canonicalID := ""
+		runtimeAgentID := ""
+		if typed.Identity != nil {
+			canonicalID = normalizeAgentID(typed.Identity.Kind().String())
+			runtimeAgentID = strings.TrimSpace(typed.Identity.Panel())
 		}
+		runtimeAgentID = normalizeRuntimeAgentID(canonicalID, runtimeAgentID)
 		if typed.Model != "" && canonicalID != "" {
 			m.agentContextModels[canonicalID] = typed.Model
 		}
-		if !m.tokenUsageOverlapsActiveStream(typed.CorrelationID, canonicalID) {
-			m.backgroundPromptTokens += typed.InputTokens
-			m.backgroundCompletionTokens += typed.OutputTokens
-			m.backgroundCacheReadTokens += typed.CacheReadTokens
-			m.backgroundCacheWriteTokens += typed.CacheWriteTokens
-			m.backgroundReasoningTokens += typed.ReasoningTokens
-		}
-		if typed.InputTokens > 0 {
-			m.recordStreamInputTokens(typed.CorrelationID, canonicalID, typed.InputTokens)
-			if canonicalID != "" {
-				m.setAgentReplicaContextUsage(canonicalID, runtimeAgentID, typed.Model, typed.InputTokens)
-			}
+		if typed.InputTokens > 0 && canonicalID != "" {
+			m.setAgentReplicaContextUsage(canonicalID, runtimeAgentID, typed.Model, typed.InputTokens)
 		}
 		m.updateTokenDisplay()
 	}),
@@ -2415,12 +2290,8 @@ func (m *AppModel) applyCursorPhase(visible bool) {
 // Shutdown gracefully stops all bridges and waits for goroutine cleanup.
 func (m *AppModel) Shutdown() error {
 	m.cancel() // Cancel all in-flight Cmd contexts first.
-	m.activityBridge.Stop()
-	m.tokenUsageBridge.Stop()
 	m.accountantBridge.Stop()
 	m.sessionBridge.Stop()
-	m.streamBridge.Stop()
-	m.guideBridge.Stop()
 	m.lspBridge.Stop()
 	if m.gitBridge != nil {
 		m.gitBridge.Stop()
@@ -2748,12 +2619,6 @@ var appKeyDispatchRoutes = []appKeyDispatchRoute{
 				m.statusBar.SetFlash(fmt.Sprintf("Cancelled %d queued prompts", n))
 			}
 			return m, nil
-		},
-	),
-	keyPredicateRoute(
-		func(m *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "alt+;" && m.hasActiveStreams() },
-		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
-			return m, m.toggleSteeringPace()
 		},
 	),
 	keyPredicateRoute(

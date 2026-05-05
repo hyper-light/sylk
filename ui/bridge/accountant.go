@@ -18,9 +18,8 @@ const accountantBridgeName = "bridge.accountant"
 // totals without maintaining its own running counter.
 //
 // This is the canonical token-telemetry path (FIX_ID_AND_TOKENS.md
-// item 50, 52). The older TokenUsageBridge is retained for activity-
-// event-driven consumers that don't need typed identity — it reads
-// from the ChannelBus and carries back-compat fields.
+// item 50, 52). UI token telemetry is accountant-owned; no activity-bus
+// token bridge is started by the app.
 type AccountantBridge struct {
 	id        string
 	acc       *accounting.Accountant

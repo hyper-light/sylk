@@ -104,12 +104,6 @@ func (m *Model) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleDecorTick(v.Time)
 	case msg.SessionEventMsg:
 		return m.handleSessionEvent(v)
-	case msg.StreamStartMsg:
-		return m.handleStreamStart(v)
-	case msg.StreamCompleteMsg:
-		return m.handleStreamComplete()
-	case msg.StreamErrorMsg:
-		return m.handleStreamError(v)
 	case msg.EventsDroppedMsg:
 		return m.handleEventsDropped(v)
 	case msg.IndexProgressMsg:
@@ -262,23 +256,7 @@ func (m *Model) handleSessionEvent(_ msg.SessionEventMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) handleStreamStart(v msg.StreamStartMsg) (tea.Model, tea.Cmd) {
-	m.spinnerActive = true
-	m.spinner.Reset()
-	m.statusText = v.CorrelationID
-	m.viewDirty = true
-	return m, nil
-}
-
-func (m *Model) handleStreamComplete() (tea.Model, tea.Cmd) {
-	m.spinnerActive = false
-	m.statusText = ""
-	m.viewDirty = true
-	return m, nil
-}
-
 // StopSpinner deactivates the center spinner and clears status text.
-// Used as a safety net when stream completion wasn't propagated.
 func (m *Model) StopSpinner() {
 	if !m.spinnerActive {
 		return
@@ -286,16 +264,6 @@ func (m *Model) StopSpinner() {
 	m.spinnerActive = false
 	m.statusText = ""
 	m.viewDirty = true
-}
-
-func (m *Model) handleStreamError(v msg.StreamErrorMsg) (tea.Model, tea.Cmd) {
-	m.spinnerActive = false
-	m.statusText = ""
-	if v.Err != nil {
-		m.SetFlash(v.Err.Error())
-	}
-	m.viewDirty = true
-	return m, nil
 }
 
 func (m *Model) handleEventsDropped(v msg.EventsDroppedMsg) (tea.Model, tea.Cmd) {

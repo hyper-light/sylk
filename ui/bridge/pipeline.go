@@ -45,7 +45,7 @@ const (
 )
 
 // PipelineBridge converts core pipeline and variant events into Bubble Tea
-// messages. It follows the same drain-loop pattern as ActivityBridge.
+// messages.
 type PipelineBridge struct {
 	id              string
 	scope           *concurrency.GoroutineScope

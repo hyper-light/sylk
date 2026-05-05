@@ -3,6 +3,7 @@ package fetcher
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,10 +14,9 @@ import (
 
 func TestHTTPSFetcher_RoundTrip(t *testing.T) {
 	want := []byte("https fixture body")
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newLocalTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(want)
 	}))
-	defer server.Close()
 
 	cfg := DefaultHTTPSConfig()
 	cfg.InsecureSkipVerify = true // local self-signed test server
@@ -35,10 +35,9 @@ func TestHTTPSFetcher_RoundTrip(t *testing.T) {
 }
 
 func TestHTTPSFetcher_Non200IsError(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newLocalTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}))
-	defer server.Close()
 
 	cfg := DefaultHTTPSConfig()
 	cfg.InsecureSkipVerify = true
@@ -58,10 +57,9 @@ func TestHTTPSFetcher_RespectsByteCap(t *testing.T) {
 	for i := range body {
 		body[i] = byte(i % 256)
 	}
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newLocalTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(body)
 	}))
-	defer server.Close()
 
 	cfg := DefaultHTTPSConfig()
 	cfg.InsecureSkipVerify = true
@@ -79,12 +77,11 @@ func TestHTTPSFetcher_RespectsByteCap(t *testing.T) {
 func TestHTTPSFetcher_AppliesHeaders(t *testing.T) {
 	var capturedAuth string
 	var capturedUA string
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newLocalTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedAuth = r.Header.Get("Authorization")
 		capturedUA = r.Header.Get("User-Agent")
 		_, _ = w.Write([]byte("ok"))
 	}))
-	defer server.Close()
 
 	cfg := DefaultHTTPSConfig()
 	cfg.InsecureSkipVerify = true
@@ -109,11 +106,10 @@ func TestHTTPSFetcher_ExpandsEnvRefsInHeaders(t *testing.T) {
 	t.Setenv("FETCHER_TEST_TOKEN", "the-secret-token")
 
 	var captured string
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newLocalTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		captured = r.Header.Get("X-Token")
 		_, _ = w.Write([]byte("ok"))
 	}))
-	defer server.Close()
 
 	cfg := DefaultHTTPSConfig()
 	cfg.InsecureSkipVerify = true
@@ -129,6 +125,19 @@ func TestHTTPSFetcher_ExpandsEnvRefsInHeaders(t *testing.T) {
 	if captured != "the-secret-token" {
 		t.Errorf("env-expanded header = %q, want %q", captured, "the-secret-token")
 	}
+}
+
+func newLocalTLSServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local TCP listener unavailable for HTTPS fetcher test: %v", err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = ln
+	server.StartTLS()
+	t.Cleanup(server.Close)
+	return server
 }
 
 func TestHTTPSFetcher_LeavesUnresolvedEnvRefsLiteral(t *testing.T) {

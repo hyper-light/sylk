@@ -104,6 +104,10 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 		)
 		return nil
 	}
+	role := cfg.Role
+	if role == 0 {
+		role = claims.RoleSubject
+	}
 	// Identity stamping is required for any agent whose ProcessEntry
 	// invokes the LLM gateway — without it, gateway.RequireIdentity
 	// rejects the dispatch and the claim entry fails silently in a
@@ -115,7 +119,7 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 	// nil cannot dispatch anything, so a missing Identity there is
 	// harmless. That carve-out is for tests that wire only the inbox
 	// matching surface without a handler.
-	if cfg.ProcessEntry != nil && cfg.Identity == nil {
+	if cfg.ProcessEntry != nil && cfg.Identity == nil && !role.Has(claims.RoleObserver) {
 		slog.Error("claims_intake_missing_identity",
 			"agent_id", cfg.AgentID,
 			"session_id", cfg.SessionID,
@@ -132,7 +136,7 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 	//     `claims_intake_wiring scope_present=false` followed by
 	//     `accumulator_flush_scope_unwired` and dropped testaments.
 	// Refuse to wire without scope so the breakage is loud at startup.
-	if cfg.ProcessEntry != nil && cfg.Scope == nil {
+	if cfg.ProcessEntry != nil && cfg.Scope == nil && !role.Has(claims.RoleObserver) {
 		slog.Error("claims_intake_missing_scope",
 			"agent_id", cfg.AgentID,
 			"session_id", cfg.SessionID,
@@ -142,11 +146,6 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 	}
 
 	subscriber := &EventBusDeltaSubscriber{bus: cfg.Bus}
-
-	role := cfg.Role
-	if role == 0 {
-		role = claims.RoleSubject
-	}
 
 	slog.Info("claims_intake_wiring",
 		"agent_id", cfg.AgentID,

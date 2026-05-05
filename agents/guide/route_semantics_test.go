@@ -102,6 +102,68 @@ func TestShouldPostPromptClaim_NilRequestSafe(t *testing.T) {
 	}
 }
 
+func TestShouldOpenGuideClassificationClaim_TUITopLevelOnly(t *testing.T) {
+	req := &RouteRequest{
+		SourceAgentID: "tui",
+		Input:         "build a python CLI",
+	}
+	if !shouldOpenGuideClassificationClaim(req) {
+		t.Fatal("top-level TUI prompt should open a Guide classification claim while classification is in flight")
+	}
+}
+
+func TestShouldOpenGuideClassificationClaim_DirectAndNestedRoutesDoNotOpen(t *testing.T) {
+	cases := []struct {
+		name string
+		req  *RouteRequest
+	}{
+		{
+			name: "agent_originated",
+			req:  &RouteRequest{SourceAgentID: "architect", Input: "consult librarian"},
+		},
+		{
+			name: "existing_parent_claim",
+			req: &RouteRequest{
+				SourceAgentID: "tui",
+				Input:         "nested follow-up",
+				Metadata:      map[string]any{"parent_claim_id": "claim-parent"},
+			},
+		},
+		{
+			name: "control_plane",
+			req: &RouteRequest{
+				SourceAgentID: "tui",
+				Input:         "protocol route",
+				Metadata:      map[string]any{"control_plane_kind": "protocol"},
+			},
+		},
+		{
+			name: "explicit_target",
+			req: &RouteRequest{
+				SourceAgentID:  "tui",
+				Input:          "@architect plan",
+				TargetAgentID:  "architect",
+				ExplicitTarget: true,
+			},
+		},
+		{
+			name: "fire_and_forget",
+			req: &RouteRequest{
+				SourceAgentID: "tui",
+				Input:         "background",
+				FireAndForget: true,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if shouldOpenGuideClassificationClaim(tc.req) {
+				t.Fatal("nested/direct/protocol route opened a Guide classification claim")
+			}
+		})
+	}
+}
+
 func TestMetadataHasNonEmptyString_Cases(t *testing.T) {
 	cases := []struct {
 		name string

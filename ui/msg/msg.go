@@ -5,9 +5,9 @@ import (
 
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/commandapproval"
-	"github.com/adalundhe/sylk/core/planapproval"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/lsp"
+	"github.com/adalundhe/sylk/core/planapproval"
 	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/ui/component"
@@ -44,41 +44,11 @@ type SessionSwitchedMsg struct {
 }
 
 // ---------------------------------------------------------------------------
-// Token usage (all-agent accumulation from ChannelBus activity events)
+// Token usage (accountant-owned)
 // ---------------------------------------------------------------------------
 
-// TokenUsageMsg carries token deltas from an LLM response activity event.
-// Published by the TokenUsageBridge for every EventTypeLLMResponse on the bus.
-type TokenUsageMsg struct {
-	CorrelationID    string
-	InputTokens      int
-	OutputTokens     int
-	CacheReadTokens  int
-	CacheWriteTokens int
-	ReasoningTokens  int
-	Model            string
-	AgentID          string
-	RuntimeAgentID   string
-	AgentType        string
-	PipelineID       string
-	TaskID           string
-
-	// Typed identity surface populated from ActivityEvent when the
-	// provider emits typed Identity/Task refs (Step 3 MultiHook).
-	// Empty when not available. These fields let the status bar and
-	// agent panel key on stable per-replica UIDs instead of parsing
-	// the legacy "agent#replica-corr" string convention.
-	AgentUID       string
-	Generation     uint64
-	OwnerAgentUID  string
-	TaskUID        string
-	TaskCorrelation string
-}
-
-// TokenDeltaMsg is the typed-identity form of a token-usage delta
-// published by AccountantBridge. Unlike TokenUsageMsg (which is
-// derived from activity events and filters to Outcome=Success),
-// TokenDeltaMsg flows directly from accounting.Accountant.Subscribe()
+// TokenDeltaMsg is the typed-identity token-usage delta published by
+// AccountantBridge. It flows directly from accounting.Accountant.Subscribe()
 // and carries the full typed *AgentIdentity + *TaskRef pair used as
 // the aggregator's primary key. UI consumers that want per-replica,
 // per-generation, or per-task breakdown key on Identity/Task
@@ -867,7 +837,7 @@ type ClaimsAgentStatusMsg struct {
 	SessionID string
 	Active    bool   // true on cycle open; false on cycle close (drain or handoff)
 	CycleID   string // root claim ID anchoring this cycle (empty when Active=false from session reset)
-	OpenCount int   // count of open subject claims for the owner (debugging)
+	OpenCount int    // count of open subject claims for the owner (debugging)
 	Reason    string
 
 	// TerminalOutcome carries the cycle's verdict on close. Populated
@@ -985,11 +955,11 @@ type ClaimResponseTextMsg struct {
 // Relation{completes}. The chat panel matches by StartArtifactID and
 // flips the row to its terminal visual. UI_DESIGN.md §3.3.
 type ClaimArtifactCompletedMsg struct {
-	StartArtifactID string         // matches the ClaimArtifactAddedMsg.ArtifactID
-	CycleID         string         // same cycle as the started artifact (denormalized for routing convenience)
-	Outcome         string         // "success" | "failure" | "timeout" | "cancelled"
-	Duration        time.Duration  // wall-clock from started to completed
-	Summary         string         // one-line result summary (truncated tool output, child testament summary)
+	StartArtifactID string        // matches the ClaimArtifactAddedMsg.ArtifactID
+	CycleID         string        // same cycle as the started artifact (denormalized for routing convenience)
+	Outcome         string        // "success" | "failure" | "timeout" | "cancelled"
+	Duration        time.Duration // wall-clock from started to completed
+	Summary         string        // one-line result summary (truncated tool output, child testament summary)
 	Metadata        map[string]any
 	CompletedAt     time.Time
 }
@@ -1094,9 +1064,8 @@ type InterAgentBranchRefMsg struct {
 	Kind                string
 }
 
-// ToolCallEventMsg carries a tool call start or completion event for inline
-// display in the chat panel. Dispatched from the GuideBridge when it receives
-// a StreamEventToolCall stream event.
+// ToolCallEventMsg is the retired pre-claims tool-call shape. New UI surfaces
+// render tool, consult, challenge, and guardian rows from claim artifacts.
 type ToolCallEventMsg struct {
 	SessionID           string
 	CorrelationID       string

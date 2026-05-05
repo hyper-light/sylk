@@ -10,12 +10,7 @@ import (
 type agentLifecycleSource int
 
 const (
-	agentLifecycleSourceActivity agentLifecycleSource = iota
-	agentLifecycleSourceStreamStart
-	agentLifecycleSourceStreamProgress
-	agentLifecycleSourceStreamComplete
-	agentLifecycleSourceToolStart
-	agentLifecycleSourceToolComplete
+	agentLifecycleSourceClaims agentLifecycleSource = iota
 	agentLifecycleSourceDemotion
 )
 
@@ -50,16 +45,12 @@ func shouldApplyAgentLifecycleUpdate(agent *AgentState, update agentLifecycleUpd
 		return false
 	}
 	switch update.Source {
-	case agentLifecycleSourceActivity:
+	case agentLifecycleSourceClaims:
 		return true
-	case agentLifecycleSourceStreamStart, agentLifecycleSourceStreamProgress, agentLifecycleSourceToolStart:
-		return true
-	case agentLifecycleSourceStreamComplete, agentLifecycleSourceToolComplete:
-		return !isTerminalLifecycleState(agent)
 	case agentLifecycleSourceDemotion:
 		return isActiveStatus(agent.Status)
 	default:
-		return true
+		return false
 	}
 }
 
@@ -88,10 +79,8 @@ func isTerminalLifecycleState(agent *AgentState) bool {
 
 func isActiveLifecycleUpdate(update agentLifecycleUpdate) bool {
 	switch update.Source {
-	case agentLifecycleSourceActivity:
+	case agentLifecycleSourceClaims:
 		return isActiveStatus(update.Status)
-	case agentLifecycleSourceStreamStart, agentLifecycleSourceStreamProgress, agentLifecycleSourceToolStart:
-		return true
 	default:
 		return false
 	}
@@ -112,7 +101,7 @@ func shouldIgnoreClosedAgentCorrelation(agent *AgentState, update agentLifecycle
 		return false
 	}
 	switch update.Source {
-	case agentLifecycleSourceActivity:
+	case agentLifecycleSourceClaims:
 		return isActiveStatus(update.Status)
 	default:
 		return true

@@ -3,6 +3,7 @@ package claims
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -123,14 +124,14 @@ type TestamentDelta struct {
 	// artifacts.
 	Verdict string `json:"verdict"`
 
-	ArtifactCount   int      `json:"artifact_count"`
-	ArtifactKinds   []string `json:"artifact_kinds"`
-	SubjectAgentID  string   `json:"subject_agent_id"`
-	IssuerAgentID   string   `json:"issuer_agent_id,omitempty"`
-	EvaluatorAgent  string   `json:"evaluator_agent,omitempty"`
-	Summary         string   `json:"summary,omitempty"`
-	Confidence      string   `json:"confidence,omitempty"`
-	AutoAccepted    bool     `json:"auto_accepted"`
+	ArtifactCount  int      `json:"artifact_count"`
+	ArtifactKinds  []string `json:"artifact_kinds"`
+	SubjectAgentID string   `json:"subject_agent_id"`
+	IssuerAgentID  string   `json:"issuer_agent_id,omitempty"`
+	EvaluatorAgent string   `json:"evaluator_agent,omitempty"`
+	Summary        string   `json:"summary,omitempty"`
+	Confidence     string   `json:"confidence,omitempty"`
+	AutoAccepted   bool     `json:"auto_accepted"`
 }
 
 // Verdict constants for TestamentDelta.
@@ -153,12 +154,12 @@ func (d TestamentDelta) DeltaSessionID() string { return d.SessionID }
 // (passed / failed / skipped). Delivered to the claim's subject and
 // issuer.
 type ValidationDelta struct {
-	SessionID        string    `json:"session_id"`
-	BoardID          string    `json:"board_id"`
-	ClaimID          string    `json:"claim_id"`
-	ValidationID     string    `json:"validation_id"`
-	Sequence         uint64    `json:"sequence"`
-	EmittedAt        time.Time `json:"emitted_at"`
+	SessionID    string    `json:"session_id"`
+	BoardID      string    `json:"board_id"`
+	ClaimID      string    `json:"claim_id"`
+	ValidationID string    `json:"validation_id"`
+	Sequence     uint64    `json:"sequence"`
+	EmittedAt    time.Time `json:"emitted_at"`
 
 	Verdict             string   `json:"verdict"` // "passed" | "failed" | "skipped"
 	EvaluatorAgentID    string   `json:"evaluator_agent_id"`
@@ -187,11 +188,11 @@ func (d ValidationDelta) DeltaSessionID() string { return d.SessionID }
 // Auto-accept is NOT emitted here; it flows through
 // ValidationDelta.ClaimAutoAccepted.
 type ClaimStatusDelta struct {
-	SessionID  string    `json:"session_id"`
-	BoardID    string    `json:"board_id"`
-	ClaimID    string    `json:"claim_id"`
-	Sequence   uint64    `json:"sequence"`
-	EmittedAt  time.Time `json:"emitted_at"`
+	SessionID string    `json:"session_id"`
+	BoardID   string    `json:"board_id"`
+	ClaimID   string    `json:"claim_id"`
+	Sequence  uint64    `json:"sequence"`
+	EmittedAt time.Time `json:"emitted_at"`
 
 	// ActionKind is the parent claim's ActionType. Same purpose as
 	// TestamentDelta.ActionKind — lets subscribers filter system-
@@ -213,7 +214,7 @@ type ClaimStatusDelta struct {
 	SupersededBy string `json:"superseded_by,omitempty"`
 }
 
-func (d ClaimStatusDelta) DeltaKind() string      { return DeltaKindClaimStatus }
+func (d ClaimStatusDelta) DeltaKind() string { return DeltaKindClaimStatus }
 func (d ClaimStatusDelta) DeltaKey() string {
 	return DeltaKindClaimStatus + "|" + d.ClaimID + "|" + string(d.ToStatus)
 }
@@ -240,7 +241,7 @@ type PhaseDelta struct {
 	AgentID   string     `json:"agent_id,omitempty"`
 }
 
-func (d PhaseDelta) DeltaKind() string      { return DeltaKindPhase }
+func (d PhaseDelta) DeltaKind() string { return DeltaKindPhase }
 func (d PhaseDelta) DeltaKey() string {
 	return DeltaKindPhase + "|" + d.BoardID + "|" + string(d.ToPhase)
 }
@@ -492,8 +493,10 @@ type ClaimContextDelta struct {
 	IssuerAgentID  string `json:"issuer_agent_id,omitempty"`
 }
 
-func (d ClaimContextDelta) DeltaKind() string      { return DeltaKindClaimContext }
-func (d ClaimContextDelta) DeltaKey() string       { return DeltaKindClaimContext + "|" + d.ClaimID }
+func (d ClaimContextDelta) DeltaKind() string { return DeltaKindClaimContext }
+func (d ClaimContextDelta) DeltaKey() string {
+	return DeltaKindClaimContext + "|" + d.ClaimID + "|" + strconv.FormatInt(d.TransitionID, 10)
+}
 func (d ClaimContextDelta) DeltaSequence() uint64  { return d.Sequence }
 func (d ClaimContextDelta) DeltaSessionID() string { return d.SessionID }
 
@@ -535,10 +538,11 @@ type TestamentContextDelta struct {
 
 func (d TestamentContextDelta) DeltaKind() string { return DeltaKindTestamentContext }
 func (d TestamentContextDelta) DeltaKey() string {
+	suffix := strconv.FormatInt(d.TransitionID, 10)
 	if d.TestamentID != "" {
-		return DeltaKindTestamentContext + "|" + d.TestamentID
+		return DeltaKindTestamentContext + "|" + d.TestamentID + "|" + suffix
 	}
-	return DeltaKindTestamentContext + "|acc:" + d.AccumulatorID
+	return DeltaKindTestamentContext + "|acc:" + d.AccumulatorID + "|" + suffix
 }
 func (d TestamentContextDelta) DeltaSequence() uint64  { return d.Sequence }
 func (d TestamentContextDelta) DeltaSessionID() string { return d.SessionID }

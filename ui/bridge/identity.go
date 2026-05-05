@@ -3,20 +3,9 @@ package bridge
 import (
 	"strings"
 
-	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/ui/agentidentity"
 )
-
-func streamRuntimeAgentID(stream *guide.StreamResponse) string {
-	if stream == nil {
-		return ""
-	}
-	return agentidentity.RuntimeAgentID(
-		strings.TrimSpace(stream.RespondingAgentID),
-		streamMetadataString(stream, "runtime_agent_id"),
-	)
-}
 
 func normalizeActivityEventForUI(event *events.ActivityEvent) *events.ActivityEvent {
 	if event == nil {

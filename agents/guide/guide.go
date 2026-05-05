@@ -1031,12 +1031,18 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		return classification, targetAgentID, nil
 	}
 
+	var guideClassification *guideClassificationClaim
+	if g.router == nil || !g.router.IsDSL(request.Input) {
+		guideClassification = g.beginGuideClassificationClaim(context.Background(), request)
+	}
+
 	domainCtx := g.preclassifyDomain(ctx, request)
 	if request.SessionID != "" && g.sessionRouter != nil {
 		guideFileLog().Info("DEBUG: classify_session_start", "elapsed_ms", time.Since(classStart).Milliseconds())
 		classification, targetAgentID, err := g.classifyWithSingleflight(ctx, request, domainCtx, true)
 		guideFileLog().Info("DEBUG: classify_session_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds(), "error", err)
 		if err != nil {
+			g.completeGuideClassificationClaim(context.Background(), guideClassification, nil, "", err)
 			return nil, "", err
 		}
 		guideFileLog().Info("DEBUG: finalize_start", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
@@ -1049,6 +1055,7 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		guideFileLog().Info("DEBUG: finalize_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
 		classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
 		guideFileLog().Info("DEBUG: conversation_flow_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
+		g.completeGuideClassificationClaim(context.Background(), guideClassification, classification, targetAgentID, nil)
 		return classification, targetAgentID, nil
 	}
 
@@ -1071,6 +1078,7 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		}
 		classification, targetAgentID = g.applyExcludedTargetFallback(ctx, classification, targetAgentID)
 		classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
+		g.completeGuideClassificationClaim(context.Background(), guideClassification, classification, targetAgentID, nil)
 		return classification, targetAgentID, nil
 	}
 
@@ -1078,6 +1086,7 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 	classification, targetAgentID, err := g.classifyWithSingleflight(ctx, request, domainCtx, false)
 	guideFileLog().Info("DEBUG: classify_llm_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds(), "error", err)
 	if err != nil {
+		g.completeGuideClassificationClaim(context.Background(), guideClassification, nil, "", err)
 		return nil, "", err
 	}
 	guideFileLog().Info("DEBUG: finalize_start", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
@@ -1087,6 +1096,7 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 	guideFileLog().Info("DEBUG: finalize_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
 	classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
 	guideFileLog().Info("DEBUG: conversation_flow_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
+	g.completeGuideClassificationClaim(context.Background(), guideClassification, classification, targetAgentID, nil)
 	return classification, targetAgentID, nil
 }
 
@@ -1218,21 +1228,6 @@ func (g *Guide) augmentClassificationContext(ctx context.Context, request *Route
 		}
 	}
 	return withClassificationContext(ctx, cc)
-}
-
-// classificationProgressKey is a context key for emitting classification
-// progress messages (e.g. "Activating Architect...") back to the UI.
-type classificationProgressKey struct{}
-
-func withClassificationProgress(ctx context.Context, emit func(string)) context.Context {
-	return context.WithValue(ctx, classificationProgressKey{}, emit)
-}
-
-func emitClassificationProgress(ctx context.Context, message string) {
-	emit, _ := ctx.Value(classificationProgressKey{}).(func(string))
-	if emit != nil && strings.TrimSpace(message) != "" {
-		emit(message)
-	}
 }
 
 func (g *Guide) finalizeClassification(ctx context.Context, input string, classification *RouteResult, targetAgentID string) (*RouteResult, string) {
@@ -1681,7 +1676,6 @@ func (g *Guide) ensureClassifiedTargetReady(ctx context.Context, targetAgentID s
 	}
 	displayName := g.resolveAgentDisplayName(targetAgentID)
 	guideFileLog().Info("DEBUG: target_not_registered_activating", "target", targetAgentID, "display_name", displayName, "activation_type", g.resolveActivationType(targetAgentID))
-	emitClassificationProgress(ctx, "Activating "+displayName+"...")
 	activateStart := time.Now()
 	resolved, err := g.ensureExplicitTargetReady(ctx, targetAgentID)
 	guideFileLog().Info("DEBUG: activation_done", "target", targetAgentID, "resolved", resolved, "elapsed_ms", time.Since(activateStart).Milliseconds(), "error", err)
@@ -3475,16 +3469,6 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 
 	vis := classifyRequestVisibility(req)
 
-	// Wire classification progress only when the Guide actually performs
-	// classification. Explicit targets and deterministic DSL/protocol routes
-	// bypass the classifier entirely; emitting Guide-attributed progress here
-	// falsely implies there is unresolved classifier work.
-	if g.shouldPublishClassificationProgress(req) {
-		reqCtx = withClassificationProgress(reqCtx, func(message string) {
-			g.publishGuideStreamProgressState(correlationID, req.SourceAgentID, message, vis, events.AgentUIStateClassifying)
-		})
-	}
-
 	routeStart := time.Now()
 	guideFileLog().Info("DEBUG: route_start", "correlation_id", correlationID, "input_preview", truncateLogStr(req.Input, 80))
 	forwarded, err := g.routeWithRetry(reqCtx, req, correlationID, req.SourceAgentID, vis)
@@ -3638,9 +3622,6 @@ func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
 	reqCtx = withRerouteExcludeAgents(reqCtx, reroute.ExcludeAgents)
 
 	vis := classifyRequestVisibility(req)
-	reqCtx = withClassificationProgress(reqCtx, func(message string) {
-		g.publishGuideStreamProgressState(correlationID, req.SourceAgentID, message, vis, events.AgentUIStateClassifying)
-	})
 
 	forwarded, err := g.routeWithRetry(reqCtx, req, correlationID, req.SourceAgentID, vis)
 	if err != nil {
@@ -4312,22 +4293,9 @@ func (g *Guide) loadedGuideSkillNames() []string {
 	return names
 }
 
-func (g *Guide) routeWithRetry(ctx context.Context, req *RouteRequest, correlationID, sourceAgentID string, visibility events.EventVisibility) (*ForwardedRequest, error) {
-	if g.shouldPublishClassificationProgress(req) {
-		g.publishGuideStreamProgressState(correlationID, sourceAgentID, "Classifying request...", visibility, events.AgentUIStateClassifying)
-	}
+func (g *Guide) routeWithRetry(ctx context.Context, req *RouteRequest, _ string, _ string, _ events.EventVisibility) (*ForwardedRequest, error) {
 	result, err := g.Route(ctx, req)
 	return result, err
-}
-
-func (g *Guide) shouldPublishClassificationProgress(req *RouteRequest) bool {
-	if req == nil || req.ExplicitTarget {
-		return false
-	}
-	if g == nil || g.router == nil {
-		return true
-	}
-	return !g.router.IsDSL(req.Input)
 }
 
 func (g *Guide) publishRetryStatus(correlationID, sourceAgentID string, status RetryStatus) {

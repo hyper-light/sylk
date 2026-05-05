@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adalundhe/sylk/core/events"
 	agentpkg "github.com/adalundhe/sylk/ui/agent"
 	"github.com/adalundhe/sylk/ui/component"
 	inputpkg "github.com/adalundhe/sylk/ui/input"
@@ -28,7 +27,7 @@ func TestAppDecorDemandIdleForRestingShimmer(t *testing.T) {
 func TestAppDecorDemandActiveForAgentActivity(t *testing.T) {
 	th := theme.DefaultDark()
 	agentPanel := agentpkg.New(th)
-	pushDecorAgentActivity(agentPanel, events.EventTypeLLMRequest, "architect")
+	pushDecorAgentActivity(agentPanel, "architect")
 
 	app := &AppModel{
 		agentPanel:          agentPanel,
@@ -82,21 +81,14 @@ func TestFocusBorderFrameChangedCoalescesIdlePhase(t *testing.T) {
 	}
 }
 
-func pushDecorAgentActivity(panel *agentpkg.Model, eventType events.EventType, agentID string) {
+func pushDecorAgentActivity(panel *agentpkg.Model, agentID string) {
 	if panel == nil {
 		return
 	}
-	_, _ = panel.Update(msg.ActivityEventMsg{
-		Event: &events.ActivityEvent{
-			ID:        "evt_" + agentID,
-			EventType: eventType,
-			Timestamp: time.Now(),
-			AgentID:   agentID,
-			Content:   "activity",
-			Data: map[string]any{
-				"agent_name": agentID,
-				"agent_type": agentID,
-			},
-		},
+	_, _ = panel.Update(msg.ClaimsAgentStatusMsg{
+		SessionID: "test",
+		AgentID:   agentID,
+		CycleID:   "cycle_" + agentID,
+		Active:    true,
 	})
 }

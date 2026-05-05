@@ -10,6 +10,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/google/uuid"
 )
 
 // guideBoard resolves the claims board for the given session.
@@ -37,6 +38,225 @@ func (g *Guide) guidePostClaimAsync(sessionID string, action claims.Action, clai
 	if err := board.PostAction(context.Background(), action, []claims.Claim{claim}); err != nil {
 		slog.Error("guide_post_claim_failed", "session", sessionID, "error", err.Error())
 		board.RecordNotificationError("guide post claim: " + err.Error())
+	}
+}
+
+type guideClassificationClaim struct {
+	board        *claims.ClaimsBoard
+	sessionID    string
+	claimID      string
+	validationID string
+	started      time.Time
+}
+
+func shouldOpenGuideClassificationClaim(request *RouteRequest) bool {
+	if request == nil {
+		return false
+	}
+	if strings.TrimSpace(request.SourceAgentID) != sourceAgentTUI {
+		return false
+	}
+	if request.FireAndForget {
+		return false
+	}
+	if request.ExplicitTarget || strings.TrimSpace(request.TargetAgentID) != "" {
+		return false
+	}
+	if metadataHasNonEmptyString(request.Metadata, "parent_claim_id") {
+		return false
+	}
+	if metadataHasNonEmptyString(request.Metadata, "control_plane_kind") {
+		return false
+	}
+	return true
+}
+
+func (g *Guide) beginGuideClassificationClaim(ctx context.Context, request *RouteRequest) *guideClassificationClaim {
+	if g == nil || !shouldOpenGuideClassificationClaim(request) {
+		return nil
+	}
+	board := g.sessionClaimsBoard(request.SessionID)
+	if board == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	validationID := uuid.NewString()
+	claim := claims.Claim{
+		Title:       "Classify and route request",
+		Description: truncateForGuide(request.Input, 240),
+		ActionType:  claims.ActionTypePrompt,
+		Context:     "Classifying and routing request",
+		Scope: []claims.ClaimScopeEntry{
+			{Kind: "session", Key: request.SessionID},
+			{Kind: "correlation", Key: request.CorrelationID},
+		},
+		Relations: []claims.Relation{
+			{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+		},
+		Tags: streamCorrelationTagsFor(request),
+		Validations: []*claims.Validation{{
+			ID:          validationID,
+			Type:        claims.ValidationTypeInspection,
+			Required:    true,
+			Description: "Guide selected a target agent and recorded classification artifacts",
+			QualityBar:  "intent, domain, target, confidence, and method are recorded",
+		}},
+	}
+	action := claims.Action{AgentID: "guide", Type: claims.ActionTypePrompt}
+	posted := []claims.Claim{claim}
+	if err := board.PostAction(ctx, action, posted); err != nil {
+		slog.Error("guide_classification_claim_post_failed",
+			"session", request.SessionID,
+			"error", err.Error(),
+		)
+		board.RecordNotificationError("guide classification claim post: " + err.Error())
+		return nil
+	}
+	if len(posted) == 0 || strings.TrimSpace(posted[0].ID) == "" {
+		return nil
+	}
+	claimID := strings.TrimSpace(posted[0].ID)
+	if err := board.UpdateClaimProgress(ctx, claimID, claims.ClaimProgressUpdate{
+		WorkSummary: "Classifying and routing request",
+	}, "guide"); err != nil {
+		slog.Warn("guide_classification_claim_progress_failed",
+			"session", request.SessionID,
+			"claim_id", claimID,
+			"error", err.Error(),
+		)
+	}
+	if err := board.SetClaimContext(ctx, claimID, "Classifying and routing request"); err != nil {
+		slog.Warn("guide_classification_claim_context_failed",
+			"session", request.SessionID,
+			"claim_id", claimID,
+			"error", err.Error(),
+		)
+	}
+	return &guideClassificationClaim{
+		board:        board,
+		sessionID:    request.SessionID,
+		claimID:      claimID,
+		validationID: validationID,
+		started:      time.Now(),
+	}
+}
+
+func (g *Guide) completeGuideClassificationClaim(ctx context.Context, h *guideClassificationClaim, result *RouteResult, targetAgentID string, classifyErr error) {
+	if h == nil || h.board == nil || strings.TrimSpace(h.claimID) == "" {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if classifyErr != nil {
+		_ = h.board.SetClaimContext(ctx, h.claimID, "Classification failed")
+		testament := guideClassificationTestament(h, nil, "", classifyErr)
+		if err := h.board.SubmitTestaments(ctx, claims.Action{AgentID: "guide", Type: claims.ActionTypeTestament}, []claims.Testament{testament}); err != nil {
+			slog.Warn("guide_classification_failure_testament_failed",
+				"session", h.sessionID,
+				"claim_id", h.claimID,
+				"error", err.Error(),
+			)
+		}
+		if err := h.board.RejectClaim(ctx, h.claimID, claims.StatusChange{
+			AgentID: "guide",
+			Reason:  classifyErr.Error(),
+		}, nil, nil); err != nil {
+			slog.Warn("guide_classification_claim_reject_failed",
+				"session", h.sessionID,
+				"claim_id", h.claimID,
+				"error", err.Error(),
+			)
+		}
+		return
+	}
+
+	target := strings.TrimSpace(targetAgentID)
+	if target == "" && result != nil {
+		target = strings.TrimSpace(string(result.TargetAgent))
+	}
+	if target == "" {
+		target = "unknown"
+	}
+	_ = h.board.SetClaimContext(ctx, h.claimID, "Routing to "+target)
+	testament := guideClassificationTestament(h, result, target, nil)
+	if err := h.board.SubmitTestaments(ctx, claims.Action{AgentID: "guide", Type: claims.ActionTypeTestament}, []claims.Testament{testament}); err != nil {
+		slog.Warn("guide_classification_testament_failed",
+			"session", h.sessionID,
+			"claim_id", h.claimID,
+			"error", err.Error(),
+		)
+		_ = h.board.RejectClaim(ctx, h.claimID, claims.StatusChange{
+			AgentID: "guide",
+			Reason:  "classification testament failed: " + err.Error(),
+		}, nil, nil)
+		return
+	}
+	if err := h.board.EvaluateValidation(ctx, h.claimID, h.validationID, claims.StatusChange{
+		AgentID: "guide",
+		To:      string(claims.ValidationStatusPassed),
+		Reason:  "classification artifacts recorded",
+	}); err != nil {
+		slog.Warn("guide_classification_validation_failed",
+			"session", h.sessionID,
+			"claim_id", h.claimID,
+			"validation_id", h.validationID,
+			"error", err.Error(),
+		)
+		_ = h.board.RejectClaim(ctx, h.claimID, claims.StatusChange{
+			AgentID: "guide",
+			Reason:  "classification validation failed: " + err.Error(),
+		}, nil, nil)
+	}
+}
+
+func guideClassificationTestament(h *guideClassificationClaim, result *RouteResult, target string, classifyErr error) claims.Testament {
+	relations := []claims.Relation{
+		{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+		{Related: h.claimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
+	}
+	confidence := "committed"
+	summary := "Classified request: target=" + target
+	artifacts := []*claims.Artifact{
+		guideArtifact(h.sessionID, "duration_ms", fmt.Sprintf("%d", time.Since(h.started).Milliseconds())),
+	}
+	if classifyErr != nil {
+		confidence = "error"
+		summary = "Classification failed: " + classifyErr.Error()
+		artifacts = append(artifacts, guideArtifact(h.sessionID, claims.ArtifactKindError, classifyErr.Error()))
+		return claims.Testament{
+			AgentID:    "guide",
+			SessionID:  h.sessionID,
+			Summary:    truncateForGuide(summary, 240),
+			Confidence: confidence,
+			Relations:  relations,
+			Artifacts:  artifacts,
+		}
+	}
+	if result != nil {
+		summary = "Classified request: intent=" + string(result.Intent) + " target=" + target + " confidence=" + formatConfidence(result.Confidence)
+		artifacts = append(artifacts,
+			guideArtifact(h.sessionID, "intent", string(result.Intent)),
+			guideArtifact(h.sessionID, "domain", string(result.Domain)),
+			guideArtifact(h.sessionID, "target_agent", target),
+			guideArtifact(h.sessionID, "confidence", formatConfidence(result.Confidence)),
+			guideArtifact(h.sessionID, "method", result.ClassificationMethod),
+		)
+	}
+	if target != "" {
+		relations = append(relations, claims.Relation{
+			Related: target, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject,
+		})
+	}
+	return claims.Testament{
+		AgentID:    "guide",
+		SessionID:  h.sessionID,
+		Summary:    truncateForGuide(summary, 240),
+		Confidence: confidence,
+		Relations:  relations,
+		Artifacts:  artifacts,
 	}
 }
 

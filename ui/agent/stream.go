@@ -15,6 +15,7 @@ const streamCapacity = 100
 
 // AgentEvent represents a single event in an agent's event stream.
 type AgentEvent struct {
+	ID        string
 	Timestamp time.Time
 	EventType events.EventType
 	Content   string
@@ -49,6 +50,25 @@ func (s *AgentEventStream) Push(ev AgentEvent) {
 	if s.count < s.capacity {
 		s.count++
 	}
+}
+
+// UpdateByID mutates the newest event with the given ID in place.
+// Returns false when the event is no longer in the bounded stream.
+func (s *AgentEventStream) UpdateByID(id string, update func(*AgentEvent)) bool {
+	if s == nil || id == "" || update == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for logical := s.count - 1; logical >= 0; logical-- {
+		physical := s.logicalToPhysical(logical)
+		if s.events[physical].ID != id {
+			continue
+		}
+		update(&s.events[physical])
+		return true
+	}
+	return false
 }
 
 // Len returns the number of valid events in the stream.

@@ -27,12 +27,6 @@ func (m *AppModel) handleFocusPanel(fp msg.FocusPanelMsg) tea.Cmd {
 }
 
 func (m *AppModel) handlePlanUpdate(update msg.PlanUpdateMsg) tea.Cmd {
-	// Guard interrupted correlations — drop plan updates for dead requests.
-	if update.CorrelationID != "" {
-		if _, interrupted := m.interruptedCorrelations[update.CorrelationID]; interrupted {
-			return nil
-		}
-	}
 	m.chat.HandlePlanUpdate(update)
 	if m.planView != nil {
 		comp, cmd := m.planView.Update(update)

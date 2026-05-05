@@ -29,16 +29,6 @@ func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
 	submit.TargetAgent = targetAgent
 	submit.SessionID = m.resolveRouteSessionID(submit.SessionID)
 
-	// If the target agent is already streaming, steer it. Otherwise dispatch
-	// normally — multiple agents can run concurrently.
-	steerTarget := targetAgent
-	if steerTarget == "" {
-		steerTarget = m.engagedAgentID
-	}
-	if stream := m.activeStreamForAgent(steerTarget); stream != nil {
-		return m.publishSteerAction(submit.Text)
-	}
-
 	// Push a user entry to chat.
 	entry := &chat.ChatEntry{
 		ID:        uuid.New().String(),
@@ -50,7 +40,7 @@ func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
 	}
 	m.chat.PushEntry(entry)
 
-	// Push a system message before the thinking placeholder so it appears above the response.
+	// Push a system message before claims-owned agent cycles start arriving.
 	sysEntry := &chat.ChatEntry{
 		ID:        uuid.New().String(),
 		Timestamp: time.Now(),
@@ -60,9 +50,6 @@ func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
 		Height:    -1,
 	}
 	m.chat.PushEntry(sysEntry)
-
-	// Push a thinking placeholder so the spinner appears immediately.
-	m.chat.BeginThinking(thinkingAgentType(targetAgent))
 
 	// Route through Guide bus.
 	return m.publishRouteRequest(submit)

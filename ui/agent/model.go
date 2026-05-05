@@ -374,27 +374,6 @@ const initialAgentCapacity = 32
 // initialAgentOrderCapacity tracks insert-order for consistent display.
 const initialAgentOrderCapacity = initialAgentCapacity
 
-// eventTypeToStatus maps core EventType values to the AgentStatus they produce.
-// This table-driven dispatch replaces a switch cascade.
-var eventTypeToStatus = map[events.EventType]AgentStatus{
-	events.EventTypeAgentAction:        StatusActing,
-	events.EventTypeAgentDecision:      StatusThinking,
-	events.EventTypeAgentError:         StatusError,
-	events.EventTypeToolCall:           StatusActing,
-	events.EventTypeToolResult:         StatusIdle,
-	events.EventTypeToolTimeout:        StatusError,
-	events.EventTypeLLMRequest:         StatusThinking,
-	events.EventTypeLLMResponse:        StatusIdle,
-	events.EventTypeSuccess:            StatusSuccess,
-	events.EventTypeFailure:            StatusError,
-	events.EventTypeAgentRegistered:    StatusWaiting,
-	events.EventTypeClaimReceived:      StatusWaiting,
-	events.EventTypeTestamentSubmitted: StatusSuccess,
-	events.EventTypeValidationPassed:   StatusSuccess,
-	events.EventTypeClaimAccepted:      StatusSuccess,
-	events.EventTypeValidationFailed:   StatusError,
-}
-
 // viewState represents which view the agent panel is currently showing.
 type viewState int
 
@@ -501,6 +480,13 @@ type Model struct {
 	activeGroupGradient *theme.Gradient           // Active: full prismatic spectrum.
 	rippleGradient      *theme.Gradient           // Per-character ripple for active agent text.
 	idleDecorBucket     int64                     // Quantized idle shimmer phase to avoid redundant repaints.
+
+	claimArtifactEvents map[string][]claimArtifactEventRef
+}
+
+type claimArtifactEventRef struct {
+	AgentID string
+	EventID string
 }
 
 type pipelineViewportLayout struct {
@@ -526,6 +512,7 @@ func New(th *theme.Theme) *Model {
 		aliases:             make(map[string]string, initialAgentCapacity*2),
 		byUID:               make(map[identity.UID]string, initialAgentCapacity),
 		streams:             make(map[string]*AgentEventStream, initialAgentCapacity),
+		claimArtifactEvents: make(map[string][]claimArtifactEventRef),
 		order:               make([]string, 0, initialAgentOrderCapacity),
 		pipelines:           make(map[string]*PipelineState, initialPipelineCapacity),
 		variants:            make(map[string]*VariantState, initialPipelineCapacity*maxVariantsPerPipeline),
@@ -587,24 +574,10 @@ func (m *Model) Init() tea.Cmd {
 // Update processes incoming messages.
 func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	switch typed := incoming.(type) {
-	case msg.ActivityEventMsg:
-		// ClaimsAgentStatusMsg / ClaimContextMsg / ClaimArtifact*Msg are
-		// the only authoritative agent-panel activity inputs. Legacy
-		// activity events may still exist on the bus for non-UI consumers,
-		// but they must not create rows or mutate status here.
-		return m, nil
 	case msg.PipelineStateMsg:
 		return m, m.handlePipelineState(typed)
 	case msg.VariantStateMsg:
 		return m, m.handleVariantState(typed)
-	case msg.StreamStartMsg:
-		return m, nil
-	case msg.StreamProgressMsg:
-		return m, nil
-	case msg.StreamCompleteMsg:
-		return m, nil
-	case msg.ToolCallEventMsg:
-		return m, nil
 	case msg.ClaimsProjectionMsg:
 		return m, m.handleClaimsProjection(typed)
 	case msg.ClaimsAgentStatusMsg:
@@ -789,15 +762,7 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	if shouldIgnoreStaleAgentCorrelation(agent, progress.CorrelationID) {
 		return nil
 	}
-	next := *agent
-	next.Status = StatusThinking
-	next.ActivityState = inferUIStateFromStreamProgress(&next, progress)
-	applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
-		Source:        agentLifecycleSourceStreamProgress,
-		CorrelationID: progress.CorrelationID,
-		Status:        next.Status,
-		ActivityState: next.ActivityState,
-	})
+	agent.ActivityState = inferUIStateFromStreamProgress(agent, progress)
 	if raw := strings.TrimSpace(progress.Message); raw != "" {
 		if progress.Watchdog && strings.TrimSpace(agent.TaskSummary) != "" {
 			m.rowsDirty = true
@@ -815,8 +780,8 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	}
 	m.rowsDirty = true
 
-	// No auto-promotion for any visibility level.
-	// Status is already set to StatusThinking above — multiple agents can be active.
+	// No auto-promotion for any visibility level. Legacy stream progress can
+	// update animation/summary only; claims own lifecycle Status.
 	return nil
 }
 
@@ -846,19 +811,11 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 	if shouldIgnoreStaleAgentCorrelation(agent, start.CorrelationID) {
 		return nil
 	}
-	applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
-		Source:        agentLifecycleSourceStreamStart,
-		CorrelationID: start.CorrelationID,
-		Status:        StatusActing,
-		ActivityState: events.AgentUIStateResponding,
-	})
+	agent.ActivityState = events.AgentUIStateResponding
 	m.rowsDirty = true
 	return nil
 }
 
-// handleStreamComplete transitions the responding agent back to StatusIdle
-// when a stream finishes. This is the normal completion counterpart to
-// handleStreamProgress (which sets StatusThinking on progress events).
 func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 	if done.Visibility == events.VisibilitySystem {
 		return nil
@@ -880,12 +837,7 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 		m.rowsDirty = true
 		return nil
 	}
-	applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
-		Source:        agentLifecycleSourceStreamComplete,
-		CorrelationID: done.CorrelationID,
-		Status:        StatusIdle,
-		ActivityState: events.AgentUIStateNone,
-	})
+	agent.ActivityState = events.AgentUIStateNone
 	markAgentCorrelationTerminal(agent, done.CorrelationID)
 	m.rowsDirty = true
 	return nil
@@ -928,15 +880,7 @@ func (m *Model) handleToolCallEvent(event msg.ToolCallEventMsg) tea.Cmd {
 		if shouldIgnoreStaleAgentCorrelation(agent, event.CorrelationID) {
 			return nil
 		}
-		next := *agent
-		next.Status = StatusActing
-		next.ActivityState = inferUIStateFromToolStart(&next, event.ToolName, event.ArgsSummary)
-		applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
-			Source:        agentLifecycleSourceToolStart,
-			CorrelationID: event.CorrelationID,
-			Status:        next.Status,
-			ActivityState: next.ActivityState,
-		})
+		agent.ActivityState = inferUIStateFromToolStart(agent, event.ToolName, event.ArgsSummary)
 		if summary := summarizeAgentPanelToolEvent(event); summary != "" {
 			agent.TaskSummary = summary
 			agent.toolSummaryPinned = true
@@ -948,34 +892,12 @@ func (m *Model) handleToolCallEvent(event msg.ToolCallEventMsg) tea.Cmd {
 			agent.pinnedToolCallKey = ""
 		}
 		if !event.Success {
-			next := *agent
-			next.Status = StatusError
-			next.ActivityState = inferUIStateFromToolFailure(&next, event)
-			if !applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
-				Source:        agentLifecycleSourceToolComplete,
-				CorrelationID: event.CorrelationID,
-				Status:        next.Status,
-				ActivityState: next.ActivityState,
-			}) {
-				m.rowsDirty = true
-				return nil
-			}
+			agent.ActivityState = inferUIStateFromToolFailure(agent, event)
 			if text := summarizeAgentPanelToolEvent(event); text != "" {
 				agent.TaskSummary = text
 			}
 		} else {
-			next := *agent
-			next.Status = StatusThinking
-			next.ActivityState = fallbackUIStateAfterToolSuccess(&next)
-			if !applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
-				Source:        agentLifecycleSourceToolComplete,
-				CorrelationID: event.CorrelationID,
-				Status:        next.Status,
-				ActivityState: next.ActivityState,
-			}) {
-				m.rowsDirty = true
-				return nil
-			}
+			agent.ActivityState = fallbackUIStateAfterToolSuccess(agent)
 			if text := summarizeAgentPanelToolEvent(event); text != "" {
 				agent.TaskSummary = text
 			}
@@ -2067,35 +1989,26 @@ func (m *Model) ContextUsageOf(agentID string) float64 {
 	return 0
 }
 
-// updateAgentStatus applies the table-driven EventType->AgentStatus mapping.
+// updateAgentStatus is retained for legacy callers, but activity fabric
+// events are no longer authoritative for Status. ClaimsAgentStatusMsg is the
+// only path that flips Status; legacy events may still refresh non-status
+// metadata while claims migration tests exercise older helpers directly.
 func (m *Model) updateAgentStatus(agentID string, ev msg.ActivityEventMsg) {
 	agent, ok := m.agents[agentID]
 	if !ok {
 		return
 	}
 
-	next := *agent
-	if status, found := handoffActivityStatus(ev); found {
-		next.Status = status
-	} else if status, found := eventTypeToStatus[ev.Event.EventType]; found {
-		next.Status = status
-	}
-	next.ActivityState = inferUIStateFromActivity(&next, ev)
+	nextState := inferUIStateFromActivity(agent, ev)
 	if active, queued, ok := extractReplicaLoad(ev.Event.Data); ok && (active > 0 || queued > 0) {
-		next.Status = StatusThinking
-		if next.ActivityState == events.AgentUIStateNone {
-			next.ActivityState = events.AgentUIStateSearching
+		if nextState == events.AgentUIStateNone {
+			nextState = events.AgentUIStateSearching
 		}
 	}
-	if isActiveStatus(next.Status) && shouldIgnoreStaleAgentCorrelation(agent, ev.Event.CorrelationID) {
+	if isActiveStatus(agent.Status) && shouldIgnoreStaleAgentCorrelation(agent, ev.Event.CorrelationID) {
 		return
 	}
-	applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
-		Source:        agentLifecycleSourceActivity,
-		CorrelationID: ev.Event.CorrelationID,
-		Status:        next.Status,
-		ActivityState: next.ActivityState,
-	})
+	agent.ActivityState = nextState
 	trackAgentActivityCorrelation(agent, ev)
 	m.updateAgentMetadata(agent, ev)
 }
@@ -2165,6 +2078,7 @@ func (m *Model) pushAgentEvent(agentID string, ev msg.ActivityEventMsg) {
 	willEvict := stream.Full()
 
 	stream.Push(AgentEvent{
+		ID:        ev.Event.ID,
 		Timestamp: ev.Event.Timestamp,
 		EventType: ev.Event.EventType,
 		Content:   ev.Event.Content,
@@ -2260,8 +2174,12 @@ func (m *Model) handleClaimsAgentStatus(ev msg.ClaimsAgentStatusMsg) tea.Cmd {
 		return nil
 	}
 	if ev.Active {
-		agent.Status = StatusActing
-		agent.ActivityState = claimActionUIState(ev.ActionType)
+		applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
+			Source:        agentLifecycleSourceClaims,
+			CorrelationID: ev.CycleID,
+			Status:        StatusActing,
+			ActivityState: claimActionUIState(ev.ActionType),
+		})
 		if summary := compactAgentPanelString(ev.Reason); summary != "" {
 			agent.TaskSummary = summary
 			agent.toolSummaryPinned = false
@@ -2274,17 +2192,22 @@ func (m *Model) handleClaimsAgentStatus(ev msg.ClaimsAgentStatusMsg) tea.Cmd {
 		m.rowsDirty = true
 		return nil
 	}
+	status := StatusIdle
+	state := events.AgentUIStateNone
 	switch ev.TerminalOutcome {
 	case "success":
-		agent.Status = StatusSuccess
-		agent.ActivityState = events.AgentUIStatePassed
+		status = StatusSuccess
+		state = events.AgentUIStatePassed
 	case "failure", "timeout", "cancelled":
-		agent.Status = StatusError
-		agent.ActivityState = events.AgentUIStateFailed
-	default:
-		agent.Status = StatusIdle
-		agent.ActivityState = events.AgentUIStateNone
+		status = StatusError
+		state = events.AgentUIStateFailed
 	}
+	applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
+		Source:        agentLifecycleSourceClaims,
+		CorrelationID: ev.CycleID,
+		Status:        status,
+		ActivityState: state,
+	})
 	if cid := strings.TrimSpace(ev.CycleID); cid != "" {
 		markAgentCorrelationTerminal(agent, cid)
 	}
@@ -2307,9 +2230,6 @@ func (m *Model) handleClaimContext(ev msg.ClaimContextMsg) tea.Cmd {
 	if state := claimStateUIState(ev.State); state != events.AgentUIStateNone {
 		agent.ActivityState = state
 	}
-	if !isTerminalLifecycleState(agent) {
-		agent.Status = StatusActing
-	}
 	if cid := strings.TrimSpace(ev.CycleID); cid != "" {
 		agent.activeCorrelationID = cid
 	}
@@ -2318,35 +2238,49 @@ func (m *Model) handleClaimContext(ev msg.ClaimContextMsg) tea.Cmd {
 }
 
 func (m *Model) handleClaimArtifactAdded(ev msg.ClaimArtifactAddedMsg) tea.Cmd {
+	if m.claimArtifactEvents == nil {
+		m.claimArtifactEvents = make(map[string][]claimArtifactEventRef)
+	}
 	switch strings.TrimSpace(ev.Kind) {
 	case "tool_started":
 		agent := m.ensureClaimsAgent(firstNonBlankAgent(ev.AgentID, ev.OwnerAgentID))
 		if agent == nil {
 			return nil
 		}
-		agent.Status = StatusActing
 		agent.ActivityState = events.AgentUIStateRunning
-		if summary := compactAgentPanelString(firstNonBlankAgent(ev.Reference, ev.Kind)); summary != "" {
+		summary := compactAgentPanelString(firstNonBlankAgent(ev.Reference, claimArtifactMetadataString(ev.Metadata, "tool_name"), ev.Kind))
+		if summary != "" {
 			agent.TaskSummary = summary
 		}
+		m.pushClaimsAgentEvent(agent.ID, ev.ArtifactID, claimArtifactEventType(ev.Kind), summary, ev.CreatedAt, events.OutcomePending)
+		m.claimArtifactEvents[ev.ArtifactID] = []claimArtifactEventRef{{AgentID: agent.ID, EventID: ev.ArtifactID}}
 		m.rowsDirty = true
 	case "consult_started", "challenge_started", "guardian_check_started":
 		owner := m.ensureClaimsAgent(ev.OwnerAgentID)
-		targetID := firstNonBlankAgent(ev.TargetAgentID, ev.Reference)
+		targetID := firstNonBlankAgent(claimArtifactMetadataString(ev.Metadata, "target", "target_agent_id", "subject_agent_id"), ev.Reference, ev.TargetAgentID)
 		target := m.ensureClaimsAgent(targetID)
+		refs := make([]claimArtifactEventRef, 0, 2)
 		if owner != nil {
-			owner.Status = StatusActing
 			owner.ActivityState = interAgentUIState(ev.Kind)
+			summary := interAgentSummary(ev.Kind, targetID)
 			if targetID != "" {
-				owner.TaskSummary = interAgentSummary(ev.Kind, targetID)
+				owner.TaskSummary = summary
 			}
+			m.pushClaimsAgentEvent(owner.ID, ev.ArtifactID, claimArtifactEventType(ev.Kind), summary, ev.CreatedAt, events.OutcomePending)
+			refs = append(refs, claimArtifactEventRef{AgentID: owner.ID, EventID: ev.ArtifactID})
 		}
 		if target != nil {
-			target.Status = StatusActing
 			target.ActivityState = events.AgentUIStateThinking
+			targetEventID := ev.ArtifactID + ":target"
+			summary := "responding to " + ev.OwnerAgentID
 			if ev.OwnerAgentID != "" {
-				target.TaskSummary = "responding to " + ev.OwnerAgentID
+				target.TaskSummary = summary
 			}
+			m.pushClaimsAgentEvent(target.ID, targetEventID, claimArtifactEventType(ev.Kind), summary, ev.CreatedAt, events.OutcomePending)
+			refs = append(refs, claimArtifactEventRef{AgentID: target.ID, EventID: targetEventID})
+		}
+		if len(refs) > 0 {
+			m.claimArtifactEvents[ev.ArtifactID] = refs
 		}
 		m.rowsDirty = true
 	}
@@ -2354,7 +2288,70 @@ func (m *Model) handleClaimArtifactAdded(ev msg.ClaimArtifactAddedMsg) tea.Cmd {
 }
 
 func (m *Model) handleClaimArtifactCompleted(ev msg.ClaimArtifactCompletedMsg) tea.Cmd {
+	startID := strings.TrimSpace(ev.StartArtifactID)
+	if startID == "" {
+		return nil
+	}
+	refs := m.claimArtifactEvents[startID]
+	if len(refs) == 0 {
+		return nil
+	}
+	outcome := claimArtifactOutcome(ev.Outcome)
+	content := compactAgentPanelString(firstNonBlankAgent(ev.Summary, claimArtifactMetadataString(ev.Metadata, "summary", "output", "error"), ev.Outcome))
+	for _, ref := range refs {
+		if ref.AgentID == "" || ref.EventID == "" {
+			continue
+		}
+		m.updateClaimsAgentEvent(ref.AgentID, ref.EventID, claimArtifactCompletionEventType(outcome), content, ev.CompletedAt, outcome)
+	}
+	delete(m.claimArtifactEvents, startID)
+	m.rowsDirty = true
 	return nil
+}
+
+func (m *Model) pushClaimsAgentEvent(agentID, eventID string, eventType events.EventType, content string, ts time.Time, outcome events.EventOutcome) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return
+	}
+	stream := m.streams[agentID]
+	if stream == nil {
+		return
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	willEvict := stream.Full()
+	stream.Push(AgentEvent{
+		ID:        strings.TrimSpace(eventID),
+		Timestamp: ts,
+		EventType: eventType,
+		Content:   content,
+		Outcome:   outcome,
+	})
+	if agentID == m.expanded && willEvict && m.eventSel >= 0 {
+		m.eventSel = max(m.eventSel-1, 0)
+	}
+}
+
+func (m *Model) updateClaimsAgentEvent(agentID, eventID string, eventType events.EventType, content string, ts time.Time, outcome events.EventOutcome) {
+	stream := m.streams[strings.TrimSpace(agentID)]
+	if stream == nil {
+		return
+	}
+	updated := stream.UpdateByID(strings.TrimSpace(eventID), func(ev *AgentEvent) {
+		if !ts.IsZero() {
+			ev.Timestamp = ts
+		}
+		if content != "" {
+			ev.Content = content
+		}
+		ev.EventType = eventType
+		ev.Outcome = outcome
+	})
+	if !updated {
+		m.pushClaimsAgentEvent(agentID, eventID, eventType, content, ts, outcome)
+	}
 }
 
 func (m *Model) ensureClaimsAgent(agentID string) *AgentState {
@@ -2446,6 +2443,31 @@ func interAgentSummary(kind, target string) string {
 	}
 }
 
+func claimArtifactEventType(kind string) events.EventType {
+	switch strings.TrimSpace(kind) {
+	case "tool_started":
+		return events.EventTypeToolCall
+	default:
+		return events.EventTypeAgentAction
+	}
+}
+
+func claimArtifactCompletionEventType(outcome events.EventOutcome) events.EventType {
+	if outcome == events.OutcomeSuccess {
+		return events.EventTypeToolResult
+	}
+	return events.EventTypeFailure
+}
+
+func claimArtifactOutcome(outcome string) events.EventOutcome {
+	switch strings.TrimSpace(outcome) {
+	case "", "success", "ok", "passed", "complete", "completed":
+		return events.OutcomeSuccess
+	default:
+		return events.OutcomeFailure
+	}
+}
+
 func claimAgentDisplayName(agentID string) string {
 	agentID = strings.TrimSpace(agentID)
 	if agentID == "" {
@@ -2466,6 +2488,25 @@ func firstNonBlankAgent(values ...string) string {
 	for _, value := range values {
 		if trimmed := strings.TrimSpace(value); trimmed != "" {
 			return trimmed
+		}
+	}
+	return ""
+}
+
+func claimArtifactMetadataString(md map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if key == "" || md == nil {
+			continue
+		}
+		switch value := md[key].(type) {
+		case string:
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		case []byte:
+			if trimmed := strings.TrimSpace(string(value)); trimmed != "" {
+				return trimmed
+			}
 		}
 	}
 	return ""

@@ -2,7 +2,6 @@ package ui
 
 import (
 	"context"
-	"errors"
 	"os"
 	"slices"
 	"strings"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/boot"
-	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/ui/bridge"
 	"github.com/adalundhe/sylk/ui/component"
@@ -335,12 +333,8 @@ type bridgeReadyMsg struct{}
 // This must be called after tea.NewProgram is created.
 func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 	bridges := []bridge.Bridge{
-		m.activityBridge,
-		m.tokenUsageBridge,
 		m.accountantBridge,
 		m.sessionBridge,
-		m.streamBridge,
-		m.guideBridge,
 		m.lspBridge,
 	}
 	for _, b := range bridges {
@@ -492,18 +486,6 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 	routeTarget := m.resolveConcreteTargetAgent(targetAgent)
 	promptEstimate := estimateGuideTokens(submit.Text) + guideRouteOverheadTokens
 	m.bumpAgentContextUsage(guideAgentID, promptEstimate)
-	m.statusBar.SetTokenPhase(status.PhaseInput)
-	// Only attribute routing activity to the Guide when it will actually
-	// perform LLM classification. Explicit targets bypass the classifier —
-	// publishing Guide activity here falsely sets the Guide to
-	// StatusThinking in the agent panel.
-	if routeTarget == "" {
-		m.publishGuideActivity(
-			events.EventTypeLLMRequest,
-			events.OutcomePending,
-			"Classifying and routing request",
-		)
-	}
 
 	req := &guide.RouteRequest{
 		CorrelationID:  uuid.New().String(),
@@ -514,22 +496,10 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 		SessionID:      submit.SessionID,
 		Timestamp:      time.Now(),
 	}
-	m.registerStream(msg.StreamStartMsg{
-		SessionID:     submit.SessionID,
-		CorrelationID: req.CorrelationID,
-		AgentID:       thinkingAgentType(targetAgent),
-		AgentType:     thinkingAgentType(targetAgent),
-		AgentName:     thinkingAgentType(targetAgent),
-	})
 
 	if !m.guideRequestAvailable() {
-		return func() tea.Msg {
-			return msg.StreamErrorMsg{
-				SessionID:     submit.SessionID,
-				CorrelationID: req.CorrelationID,
-				Err:           errors.New("guide is not running; start with --mock or connect a guide backend"),
-			}
-		}
+		m.statusBar.SetFlash("Guide is not running")
+		return nil
 	}
 
 	busMsg := guide.NewRequestMessage("", req)
@@ -537,10 +507,8 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 	return func() tea.Msg {
 		err := m.deps.GuideBus.Publish(guide.TopicGuideRequests, busMsg)
 		if err != nil {
-			return msg.StreamErrorMsg{
-				SessionID:     submit.SessionID,
-				CorrelationID: req.CorrelationID,
-				Err:           err,
+			if m.walLogger != nil {
+				m.walLogger.Warn("route_publish_failed", "error", err.Error())
 			}
 		}
 		return nil
@@ -781,9 +749,8 @@ func (m *AppModel) pruneReplicaContextUsage(panelAgentID string, desired int) {
 		return
 	}
 	type candidate struct {
-		key    string
-		active bool
-		state  runtimeContextState
+		key   string
+		state runtimeContextState
 	}
 	var candidates []candidate
 	for key, state := range m.agentRuntimeContexts {
@@ -791,9 +758,8 @@ func (m *AppModel) pruneReplicaContextUsage(panelAgentID string, desired int) {
 			continue
 		}
 		candidates = append(candidates, candidate{
-			key:    key,
-			active: m.runtimeAgentHasActiveStream(panelAgentID, state.RuntimeAgentID),
-			state:  state,
+			key:   key,
+			state: state,
 		})
 	}
 	if len(candidates) <= desired {
@@ -801,10 +767,6 @@ func (m *AppModel) pruneReplicaContextUsage(panelAgentID string, desired int) {
 	}
 	slices.SortFunc(candidates, func(a, b candidate) int {
 		switch {
-		case a.active && !b.active:
-			return 1
-		case !a.active && b.active:
-			return -1
 		case a.state.UpdatedAt.Before(b.state.UpdatedAt):
 			return -1
 		case b.state.UpdatedAt.Before(a.state.UpdatedAt):
@@ -817,30 +779,6 @@ func (m *AppModel) pruneReplicaContextUsage(panelAgentID string, desired int) {
 		delete(m.agentRuntimeContexts, candidates[0].key)
 		candidates = candidates[1:]
 	}
-}
-
-func (m *AppModel) runtimeAgentHasActiveStream(panelAgentID, runtimeAgentID string) bool {
-	panelAgentID = normalizeAgentID(panelAgentID)
-	runtimeAgentID = normalizeRuntimeAgentID(panelAgentID, runtimeAgentID)
-	for _, entry := range m.activeStreams {
-		if entry == nil {
-			continue
-		}
-		if normalizeAgentID(entry.AgentID) == panelAgentID &&
-			normalizeRuntimeAgentID(panelAgentID, entry.RuntimeAgentID) == runtimeAgentID {
-			return true
-		}
-	}
-	for _, entry := range m.nestedStreams {
-		if entry == nil {
-			continue
-		}
-		if normalizeAgentID(entry.AgentID) == panelAgentID &&
-			normalizeRuntimeAgentID(panelAgentID, entry.RuntimeAgentID) == runtimeAgentID {
-			return true
-		}
-	}
-	return false
 }
 
 func (m *AppModel) recomputeDisplayedAgentContextUsage(panelAgentID string) float64 {
@@ -893,29 +831,6 @@ func estimateGuideTokens(text string) int {
 	}
 	chars := len([]rune(trimmed))
 	return max((chars+3)/4, 1)
-}
-
-func (m *AppModel) publishGuideActivity(
-	eventType events.EventType,
-	outcome events.EventOutcome,
-	content string,
-) {
-	if m.deps.ActivityPub == nil {
-		return
-	}
-	event := &events.ActivityEvent{
-		ID:        uuid.New().String(),
-		EventType: eventType,
-		Timestamp: time.Now(),
-		AgentID:   guideAgentID,
-		Content:   content,
-		Outcome:   outcome,
-		Data: map[string]any{
-			"agent_type": guideAgentType,
-			"agent_name": guideAgentName,
-		},
-	}
-	m.deps.ActivityPub.PublishActivity(event)
 }
 
 func (m *AppModel) guideRequestAvailable() bool {
