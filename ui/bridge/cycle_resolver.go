@@ -131,6 +131,10 @@ type claimCreatedOutcome struct {
 	// AttachedToCycle is the existing cycle the claim joined as a
 	// child via caused_by. Nil for top-level / handoff successor.
 	AttachedToCycle *cycleState
+	// PendingArtifacts are started artifacts that arrived before this
+	// claim was registered. The bridge emits them after the claim is
+	// known so no real-time artifact is lost to callback ordering.
+	PendingArtifacts []pendingArtifactFlush
 }
 
 // onClaimCreated registers a new claim with the resolver. The
@@ -169,7 +173,8 @@ func (r *cycleResolver) onClaimCreated(claimID, owner, subject, causedByParent, 
 			r.agentCycle[owner] = claimID
 		}
 		r.flushPendingChildrenLocked(claimID)
-		return claimCreatedOutcome{CycleOpened: st, PredecessorClosed: predecessorClosed}
+		pendingArtifacts := r.drainPendingArtifactsLocked(claimID)
+		return claimCreatedOutcome{CycleOpened: st, PredecessorClosed: predecessorClosed, PendingArtifacts: pendingArtifacts}
 
 	case causedByParent != "":
 		parentCycle, known := r.claimCycle[causedByParent]
@@ -191,12 +196,14 @@ func (r *cycleResolver) onClaimCreated(claimID, owner, subject, causedByParent, 
 			}
 			st.openClaims[claimID] = struct{}{}
 			r.flushPendingChildrenLocked(claimID)
-			return claimCreatedOutcome{CycleOpened: st}
+			pendingArtifacts := r.drainPendingArtifactsLocked(claimID)
+			return claimCreatedOutcome{CycleOpened: st, PendingArtifacts: pendingArtifacts}
 		}
 		st.openClaims[claimID] = struct{}{}
 		r.claimCycle[claimID] = parentCycle
 		r.flushPendingChildrenLocked(claimID)
-		return claimCreatedOutcome{AttachedToCycle: st}
+		pendingArtifacts := r.drainPendingArtifactsLocked(claimID)
+		return claimCreatedOutcome{AttachedToCycle: st, PendingArtifacts: pendingArtifacts}
 
 	default:
 		// Unparented top-level claim — opens a fresh cycle.
@@ -208,7 +215,8 @@ func (r *cycleResolver) onClaimCreated(claimID, owner, subject, causedByParent, 
 			r.agentCycle[owner] = claimID
 		}
 		r.flushPendingChildrenLocked(claimID)
-		return claimCreatedOutcome{CycleOpened: st}
+		pendingArtifacts := r.drainPendingArtifactsLocked(claimID)
+		return claimCreatedOutcome{CycleOpened: st, PendingArtifacts: pendingArtifacts}
 	}
 }
 
@@ -443,4 +451,18 @@ func (r *cycleResolver) CycleForArtifact(startedArtifactID string) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.startedArtifact[strings.TrimSpace(startedArtifactID)]
+}
+
+// OwnerForClaim returns the active cycle owner for claimID when known,
+// falling back to the claim's own registered owner.
+func (r *cycleResolver) OwnerForClaim(claimID string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	claimID = strings.TrimSpace(claimID)
+	if cycleID := r.claimCycle[claimID]; cycleID != "" {
+		if st := r.cycles[cycleID]; st != nil {
+			return st.OwnerAgentID
+		}
+	}
+	return r.claimOwner[claimID]
 }

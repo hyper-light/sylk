@@ -603,33 +603,25 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 		m.handleDecorTick(typed.Time)
 		return m, nil
 	case msg.ActivityEventMsg:
-		m.viewDirty = true
-		return m, m.handleActivity(typed)
+		return m, nil
 	case msg.StreamStartMsg:
-		m.viewDirty = true
-		return m, m.handleStreamStart(typed)
+		return m, nil
 	case msg.StreamChunkMsg:
-		return m, m.handleStreamChunk(typed)
+		return m, nil
 	case msg.StreamProgressMsg:
-		return m, m.handleStreamProgress(typed)
+		return m, nil
 	case msg.StreamCompleteMsg:
-		m.viewDirty = true
-		return m, m.handleStreamComplete(typed)
+		return m, nil
 	case msg.StreamErrorMsg:
-		m.viewDirty = true
-		return m, m.handleStreamError(typed)
+		return m, nil
 	case msg.StreamRerouteMsg:
-		m.viewDirty = true
-		return m, m.handleStreamReroute(typed)
+		return m, nil
 	case msg.RetryStatusMsg:
-		m.viewDirty = true
-		return m, m.handleRetryStatus(typed)
+		return m, nil
 	case msg.ToolCallEventMsg:
-		m.viewDirty = true
-		return m, m.handleToolCallEvent(typed)
+		return m, nil
 	case msg.AgentStateMsg:
-		m.viewDirty = true
-		return m, m.handleAgentState(typed)
+		return m, nil
 	case msg.ClaimsAgentStatusMsg:
 		m.viewDirty = true
 		return m, m.handleClaimsAgentStatus(typed)
@@ -5651,7 +5643,6 @@ func activityBoolData(ev msg.ActivityEventMsg, key string) bool {
 	return ok && typed
 }
 
-
 func (m *Model) handleClaimsAgentStatus(ev msg.ClaimsAgentStatusMsg) tea.Cmd {
 	if m.claimRows == nil {
 		m.claimRows = newClaimRowIndex()
@@ -5819,9 +5810,9 @@ func (m *Model) handleClaimArtifactAdded(ev msg.ClaimArtifactAddedMsg) tea.Cmd {
 	if !isVisibleArtifactKindForChat(ev.Kind) {
 		return nil
 	}
-	agentID := ev.OwnerAgentID
+	agentID := ev.AgentID
 	if agentID == "" {
-		agentID = ev.AgentID
+		agentID = ev.OwnerAgentID
 	}
 	row := &ArtifactRow{
 		ArtifactID:  ev.ArtifactID,
@@ -5832,7 +5823,7 @@ func (m *Model) handleClaimArtifactAdded(ev msg.ClaimArtifactAddedMsg) tea.Cmd {
 		Reference:   ev.Reference,
 		ArgsSummary: shortenArtifactSummary(ev),
 		AgentID:     agentID,
-		AgentType:   ev.OwnerAgentType,
+		AgentType:   firstNonEmptyString(agentID, ev.OwnerAgentType),
 		TargetAgent: ev.TargetAgentID,
 		Status:      ArtifactRowStatusInFlight,
 		StartedAt:   ev.CreatedAt,
@@ -5986,7 +5977,6 @@ func (m *Model) handleTestamentContext(ev msg.TestamentContextMsg) tea.Cmd {
 	)
 	return nil
 }
-
 
 func asString(v any) string {
 	if s, ok := v.(string); ok {

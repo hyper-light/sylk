@@ -62,32 +62,6 @@ func (g *Guide) guideSubmitTestamentAsync(sessionID string, testament claims.Tes
 	}
 }
 
-// guideHandoffClaim builds a handoff claim transferring top-level
-// cycle ownership from the guide to the target agent (UI_DESIGN.md
-// §2.2 + §5.2). Both the fast-path conversational continuity route
-// and the post-classification forward dispatch are structurally
-// handoffs: the guide's classification phase ends, the target agent's
-// cycle picks up ownership of the user's turn. Tagging this as
-// ActionTypeTask (the prior shape) hid those transitions behind plain
-// task semantics, broke the bridge's cycle resolver edge detection,
-// and produced the "self handoff" symptom whenever classification
-// resolved to the guide itself (since issuer==subject==guide collapsed
-// to an audit self-claim under the amplifier's filter).
-//
-// predecessorClaimID is empty for guide handoffs: the user prompt is
-// not a claim, so there's no predecessor cycle root to anchor.
-func guideHandoffClaim(title, description, targetAgent, sessionID, correlationID string, validations []*claims.Validation) claims.Claim {
-	return claims.BuildHandoffClaim(
-		title, description,
-		"guide", targetAgent, "",
-		[]claims.ClaimScopeEntry{
-			{Kind: "session", Key: sessionID},
-			{Kind: "correlation", Key: correlationID},
-		},
-		validations,
-	)
-}
-
 // guideCorrectiveClaim builds a corrective claim that supersedes a prior route.
 func guideCorrectiveClaim(title, description, newTarget, sessionID, correlationID string) claims.Claim {
 	return claims.Claim{

@@ -16,14 +16,6 @@ import (
 	uimsg "github.com/adalundhe/sylk/ui/msg"
 )
 
-type recordingProgram struct {
-	messages []any
-}
-
-func (r *recordingProgram) Send(m any) {
-	r.messages = append(r.messages, m)
-}
-
 type emptyResponseTextPayload struct{}
 
 func (emptyResponseTextPayload) ResponseText() string { return "" }

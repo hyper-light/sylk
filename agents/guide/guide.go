@@ -14,10 +14,10 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/claims"
-	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	corecontext "github.com/adalundhe/sylk/core/context"
 	contextskills "github.com/adalundhe/sylk/core/context/skills"
@@ -1126,21 +1126,6 @@ func (g *Guide) tryConversationFastPath(ctx context.Context, request *RouteReque
 	// must not boost its own ACT-R activation — otherwise each hit refreshes
 	// UpdatedAt and increments Turns, creating a self-reinforcing loop that
 	// prevents the score from ever decaying below threshold.
-
-	// Follow-up claim: conversational continuity is a cycle handoff
-	// from the guide to the active agent (the new turn's cycle root
-	// belongs to the target, not to the guide).
-	g.guidePostClaimAsync(request.SessionID,
-		claims.Action{AgentID: "guide", Type: claims.ActionTypeHandoff},
-		guideHandoffClaim(
-			"Continue with "+activeAgentID+" — follow-up detected",
-			"Conversation fast-path: ACT-R activation above threshold",
-			activeAgentID, request.SessionID, request.CorrelationID,
-			[]*claims.Validation{
-				guidePassedValidation(claims.ValidationTypeInspection, true, "ACT-R activation score above threshold", "score > ACTRThreshold"),
-			},
-		),
-	)
 
 	return result, activeAgentID, true
 }
@@ -3500,21 +3485,15 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 		})
 	}
 
-	// Only emit classification activity when the Guide actually classifies.
-	if g.shouldPublishClassificationProgress(req) {
-		g.publishActivity(events.EventTypeAgentDecision, vis, "Classifying request...")
-	}
 	routeStart := time.Now()
 	guideFileLog().Info("DEBUG: route_start", "correlation_id", correlationID, "input_preview", truncateLogStr(req.Input, 80))
 	forwarded, err := g.routeWithRetry(reqCtx, req, correlationID, req.SourceAgentID, vis)
 	guideFileLog().Info("DEBUG: route_done", "correlation_id", correlationID, "elapsed_ms", time.Since(routeStart).Milliseconds(), "error", err)
 	if err != nil {
 		if g.isInterruptError(err) {
-			g.publishActivity(events.EventTypeLLMResponse, vis, "Request interrupted")
 			guideFileLog().Info("DEBUG: route_interrupted", "correlation_id", correlationID, "error", err)
 			return nil
 		}
-		g.publishActivity(events.EventTypeAgentError, vis, "Routing failed")
 		guideFileLog().Info("DEBUG: route_error", "correlation_id", correlationID, "error", err)
 		return g.publishRouteError(correlationID, req.SourceAgentID, err)
 	}
@@ -3546,21 +3525,8 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 		}
 		return g.respondToGuideRequest(reqCtx, pending, req)
 	}
-	if !req.ExplicitTarget {
-		g.publishActivity(events.EventTypeAgentAction, vis, "Routing to "+resolvedTarget)
-	}
 	g.publishRouteHandoffProgress(forwarded.CorrelationID, resolvedSource, resolvedTarget, vis)
-	err = g.publishForwardedRequest(resolvedTarget, forwarded, msg.ReplyTo)
-
-	// Reset Guide status to idle after forwarding. The Guide's role is
-	// finished once the request is dispatched — the target agent takes over.
-	// Without this, the Guide stays stuck at StatusActing in the agent panel.
-	// For explicit targets, no activity was emitted — skip the reset too.
-	if !req.ExplicitTarget {
-		g.publishActivity(events.EventTypeLLMResponse, vis, "Request forwarded")
-	}
-
-	return err
+	return g.publishForwardedRequest(resolvedTarget, forwarded, msg.ReplyTo)
 }
 
 func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
@@ -5364,24 +5330,6 @@ func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *Forward
 		InputLen:    len(forwarded.Input),
 		Intent:      string(forwarded.Intent),
 	})
-
-	// Handoff claim: classification resolved → cycle ownership
-	// transfers to {agent}. The bridge's cycle resolver consumes the
-	// ActionTypeHandoff shape to draw the handoff edge (UI_DESIGN.md
-	// §5.2); under the prior ActionTypeTask shape the edge was
-	// invisible and routing to a non-guide peer never registered as a
-	// cycle transition.
-	g.guidePostClaimAsync(forwarded.SessionID,
-		claims.Action{AgentID: "guide", Type: claims.ActionTypeHandoff},
-		guideHandoffClaim(
-			"Route to "+resolvedTarget,
-			"Forward request: intent="+string(forwarded.Intent)+" domain="+string(forwarded.Domain),
-			resolvedTarget, forwarded.SessionID, forwarded.CorrelationID,
-			[]*claims.Validation{
-				guideValidation(claims.ValidationTypeReceipt, true, "Target agent processes request", "RouteResponse.Success == true"),
-			},
-		),
-	)
 
 	fwdMsg := g.forwardMessage(resolvedTarget, forwarded, replyTo)
 	return g.bus.Publish(g.agentRequestTopic(resolvedTarget), fwdMsg)

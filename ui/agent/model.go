@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agents/identity"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/ui/agentidentity"
@@ -376,16 +377,16 @@ const initialAgentOrderCapacity = initialAgentCapacity
 // eventTypeToStatus maps core EventType values to the AgentStatus they produce.
 // This table-driven dispatch replaces a switch cascade.
 var eventTypeToStatus = map[events.EventType]AgentStatus{
-	events.EventTypeAgentAction:     StatusActing,
-	events.EventTypeAgentDecision:   StatusThinking,
-	events.EventTypeAgentError:      StatusError,
-	events.EventTypeToolCall:        StatusActing,
-	events.EventTypeToolResult:      StatusIdle,
-	events.EventTypeToolTimeout:     StatusError,
-	events.EventTypeLLMRequest:      StatusThinking,
-	events.EventTypeLLMResponse:     StatusIdle,
-	events.EventTypeSuccess:         StatusSuccess,
-	events.EventTypeFailure:         StatusError,
+	events.EventTypeAgentAction:        StatusActing,
+	events.EventTypeAgentDecision:      StatusThinking,
+	events.EventTypeAgentError:         StatusError,
+	events.EventTypeToolCall:           StatusActing,
+	events.EventTypeToolResult:         StatusIdle,
+	events.EventTypeToolTimeout:        StatusError,
+	events.EventTypeLLMRequest:         StatusThinking,
+	events.EventTypeLLMResponse:        StatusIdle,
+	events.EventTypeSuccess:            StatusSuccess,
+	events.EventTypeFailure:            StatusError,
 	events.EventTypeAgentRegistered:    StatusWaiting,
 	events.EventTypeClaimReceived:      StatusWaiting,
 	events.EventTypeTestamentSubmitted: StatusSuccess,
@@ -453,8 +454,8 @@ func isActiveStatus(s AgentStatus) bool { return activeStatuses[s] }
 
 // Model is the Bubble Tea model for the agent dashboard panel.
 type Model struct {
-	agents    map[string]*AgentState
-	aliases   map[string]string // Runtime/ephemeral agent IDs → canonical panel row IDs.
+	agents  map[string]*AgentState
+	aliases map[string]string // Runtime/ephemeral agent IDs → canonical panel row IDs.
 	// byUID indexes the agents map by identity.UID once a row has
 	// been bound to a typed *AgentIdentity. Used to route ActivityEvents
 	// carrying event.Identity directly to their row, and to enforce
@@ -587,21 +588,33 @@ func (m *Model) Init() tea.Cmd {
 func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	switch typed := incoming.(type) {
 	case msg.ActivityEventMsg:
-		return m, m.handleActivity(typed)
+		// ClaimsAgentStatusMsg / ClaimContextMsg / ClaimArtifact*Msg are
+		// the only authoritative agent-panel activity inputs. Legacy
+		// activity events may still exist on the bus for non-UI consumers,
+		// but they must not create rows or mutate status here.
+		return m, nil
 	case msg.PipelineStateMsg:
 		return m, m.handlePipelineState(typed)
 	case msg.VariantStateMsg:
 		return m, m.handleVariantState(typed)
 	case msg.StreamStartMsg:
-		return m, m.handleStreamStart(typed)
+		return m, nil
 	case msg.StreamProgressMsg:
-		return m, m.handleStreamProgress(typed)
+		return m, nil
 	case msg.StreamCompleteMsg:
-		return m, m.handleStreamComplete(typed)
+		return m, nil
 	case msg.ToolCallEventMsg:
-		return m, m.handleToolCallEvent(typed)
+		return m, nil
 	case msg.ClaimsProjectionMsg:
 		return m, m.handleClaimsProjection(typed)
+	case msg.ClaimsAgentStatusMsg:
+		return m, m.handleClaimsAgentStatus(typed)
+	case msg.ClaimContextMsg:
+		return m, m.handleClaimContext(typed)
+	case msg.ClaimArtifactAddedMsg:
+		return m, m.handleClaimArtifactAdded(typed)
+	case msg.ClaimArtifactCompletedMsg:
+		return m, m.handleClaimArtifactCompleted(typed)
 	case tea.KeyMsg:
 		return m, m.handleKey(typed)
 	default:
@@ -2232,6 +2245,230 @@ func (m *Model) handleClaimsProjection(proj msg.ClaimsProjectionMsg) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+func (m *Model) handleClaimsAgentStatus(ev msg.ClaimsAgentStatusMsg) tea.Cmd {
+	agentID := strings.TrimSpace(ev.AgentID)
+	if agentID == "" {
+		return nil
+	}
+	if claims.IsSystemInternalAction(claims.ActionType(ev.ActionType)) {
+		return nil
+	}
+	agent := m.ensureClaimsAgent(agentID)
+	if agent == nil {
+		return nil
+	}
+	if ev.Active {
+		agent.Status = StatusActing
+		agent.ActivityState = claimActionUIState(ev.ActionType)
+		if summary := compactAgentPanelString(ev.Reason); summary != "" {
+			agent.TaskSummary = summary
+			agent.toolSummaryPinned = false
+			agent.pinnedToolCallKey = ""
+		}
+		if cid := strings.TrimSpace(ev.CycleID); cid != "" {
+			agent.activeCorrelationID = cid
+			agent.lastTerminalCorrelationID = ""
+		}
+		m.rowsDirty = true
+		return nil
+	}
+	switch ev.TerminalOutcome {
+	case "success":
+		agent.Status = StatusSuccess
+		agent.ActivityState = events.AgentUIStatePassed
+	case "failure", "timeout", "cancelled":
+		agent.Status = StatusError
+		agent.ActivityState = events.AgentUIStateFailed
+	default:
+		agent.Status = StatusIdle
+		agent.ActivityState = events.AgentUIStateNone
+	}
+	if cid := strings.TrimSpace(ev.CycleID); cid != "" {
+		markAgentCorrelationTerminal(agent, cid)
+	}
+	agent.toolSummaryPinned = false
+	agent.pinnedToolCallKey = ""
+	m.rowsDirty = true
+	return nil
+}
+
+func (m *Model) handleClaimContext(ev msg.ClaimContextMsg) tea.Cmd {
+	agent := m.ensureClaimsAgent(ev.OwnerAgentID)
+	if agent == nil {
+		return nil
+	}
+	if ctx := compactAgentPanelString(ev.Context); ctx != "" {
+		agent.TaskSummary = ctx
+		agent.toolSummaryPinned = false
+		agent.pinnedToolCallKey = ""
+	}
+	if state := claimStateUIState(ev.State); state != events.AgentUIStateNone {
+		agent.ActivityState = state
+	}
+	if !isTerminalLifecycleState(agent) {
+		agent.Status = StatusActing
+	}
+	if cid := strings.TrimSpace(ev.CycleID); cid != "" {
+		agent.activeCorrelationID = cid
+	}
+	m.rowsDirty = true
+	return nil
+}
+
+func (m *Model) handleClaimArtifactAdded(ev msg.ClaimArtifactAddedMsg) tea.Cmd {
+	switch strings.TrimSpace(ev.Kind) {
+	case "tool_started":
+		agent := m.ensureClaimsAgent(firstNonBlankAgent(ev.AgentID, ev.OwnerAgentID))
+		if agent == nil {
+			return nil
+		}
+		agent.Status = StatusActing
+		agent.ActivityState = events.AgentUIStateRunning
+		if summary := compactAgentPanelString(firstNonBlankAgent(ev.Reference, ev.Kind)); summary != "" {
+			agent.TaskSummary = summary
+		}
+		m.rowsDirty = true
+	case "consult_started", "challenge_started", "guardian_check_started":
+		owner := m.ensureClaimsAgent(ev.OwnerAgentID)
+		targetID := firstNonBlankAgent(ev.TargetAgentID, ev.Reference)
+		target := m.ensureClaimsAgent(targetID)
+		if owner != nil {
+			owner.Status = StatusActing
+			owner.ActivityState = interAgentUIState(ev.Kind)
+			if targetID != "" {
+				owner.TaskSummary = interAgentSummary(ev.Kind, targetID)
+			}
+		}
+		if target != nil {
+			target.Status = StatusActing
+			target.ActivityState = events.AgentUIStateThinking
+			if ev.OwnerAgentID != "" {
+				target.TaskSummary = "responding to " + ev.OwnerAgentID
+			}
+		}
+		m.rowsDirty = true
+	}
+	return nil
+}
+
+func (m *Model) handleClaimArtifactCompleted(ev msg.ClaimArtifactCompletedMsg) tea.Cmd {
+	return nil
+}
+
+func (m *Model) ensureClaimsAgent(agentID string) *AgentState {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" || isInternalSidecarAgent(agentID, agentID) {
+		return nil
+	}
+	if resolved := m.resolveAgentID(agentID); resolved != "" {
+		if agent := m.agents[resolved]; agent != nil {
+			return agent
+		}
+	}
+	if agent := m.findAgentByType(agentID); agent != nil {
+		return agent
+	}
+	name := claimAgentDisplayName(agentID)
+	m.SeedAgent(agentID, agentID, name, nil, "", "")
+	if agent := m.agents[agentID]; agent != nil {
+		return agent
+	}
+	agent := &AgentState{
+		ID:        agentID,
+		RoutingID: agentID,
+		Name:      name,
+		AgentType: agentID,
+		Category:  resolveAgentCategory(agentID, ""),
+		Status:    StatusIdle,
+		ModelID:   defaultModelForAgent(agentID),
+	}
+	agent.ProviderID = deriveProvider(agent.ModelID)
+	m.agents[agentID] = agent
+	m.streams[agentID] = NewAgentEventStream()
+	m.order = append(m.order, agentID)
+	m.rowsDirty = true
+	return agent
+}
+
+func claimActionUIState(actionType string) events.AgentUIState {
+	switch claims.ActionType(strings.TrimSpace(actionType)) {
+	case claims.ActionTypePrompt:
+		return events.AgentUIStatePlanning
+	case claims.ActionTypeHandoff:
+		return events.AgentUIStateRouting
+	case claims.ActionTypeConsultation, claims.ActionTypeChallenge, claims.ActionTypeGuardianCheck:
+		return events.AgentUIStateThinking
+	default:
+		return events.AgentUIStateThinking
+	}
+}
+
+func claimStateUIState(state string) events.AgentUIState {
+	switch strings.TrimSpace(state) {
+	case "reasoning":
+		return events.AgentUIStateThinking
+	case "tool_executing":
+		return events.AgentUIStateRunning
+	case "dispatching_to_peer", "consulting_peer", "challenging_peer":
+		return events.AgentUIStateRouting
+	case "awaiting_peer_response", "awaiting_guardian":
+		return events.AgentUIStateBlocked
+	case "receiving", "synthesizing":
+		return events.AgentUIStateResponding
+	case "complete":
+		return events.AgentUIStatePassed
+	case "errored":
+		return events.AgentUIStateFailed
+	default:
+		return events.NormalizeAgentUIState(events.AgentUIState(state))
+	}
+}
+
+func interAgentUIState(kind string) events.AgentUIState {
+	switch strings.TrimSpace(kind) {
+	case "guardian_check_started":
+		return events.AgentUIStateBlocked
+	default:
+		return events.AgentUIStateRouting
+	}
+}
+
+func interAgentSummary(kind, target string) string {
+	switch strings.TrimSpace(kind) {
+	case "challenge_started":
+		return "challenging " + target
+	case "guardian_check_started":
+		return "awaiting guardian"
+	default:
+		return "consulting " + target
+	}
+}
+
+func claimAgentDisplayName(agentID string) string {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return ""
+	}
+	return strings.ToUpper(agentID[:1]) + agentID[1:]
+}
+
+func compactAgentPanelString(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 80 {
+		return value
+	}
+	return value[:77] + "..."
+}
+
+func firstNonBlankAgent(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func (m *Model) rehomePipelineState(sourceID, targetID string) {
