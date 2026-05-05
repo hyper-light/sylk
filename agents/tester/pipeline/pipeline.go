@@ -536,6 +536,8 @@ func (pt *PipelineTester) Start(bus guide.EventBus) error {
 		Board:        pt.claimsBoard,
 		Scope:        pt.scope,
 		ProcessEntry: pt.processClaimsEntry,
+		Identity:     pt.identity,
+		Factory:      pt.factory,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("pipeline_tester_claims_inbox_start_failed", "error", err.Error())
@@ -688,13 +690,10 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 	agentshared.PrependHistoryMessages(req, fwd.ConversationHistory)
 
 	ledger := agentshared.SteeringLedgerFromContext(ctx)
-	result, err := agentshared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	result, err := agentshared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return pt.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {
-		if task != nil {
-			agentshared.PublishPipelineTaskTerminalErrorUpdate(pt.bus, pt.id, task, err, agentshared.PipelineTaskAttempt(task))
-		}
 		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
@@ -828,7 +827,6 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 		EventLogger:   pt.steering.EventLogger(),
 		Scribe:        pt.agentPod,
 	})
-	protocolTask := agentshared.DecodePipelineTaskInput(fwd.Input)
 	startTime := time.Now()
 	toolEmitter := agentshared.NewToolCallEmitter(pt.bus, pt.channels, pt.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
@@ -853,6 +851,15 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 			pp.Publish("Translating task and inspector criteria into executable tests and validating the current failure surface.")
 		}
 	}
+
+	// Cycle-aware accumulator. UI_DESIGN.md §4.7.3.
+	var flushAccumulator func()
+	var beginErr error
+	ctx, flushAccumulator, beginErr = agentshared.BeginForwardedRequestCycle(ctx, pt.id, fwd, pt.scope)
+	if beginErr != nil {
+		return beginErr
+	}
+	defer flushAccumulator()
 
 	result, err := pt.Handle(ctx, fwd)
 	agentshared.LogResponse(pt.steering.EventLogger(), fwd.CorrelationID, pt.id, fwd.SessionID, time.Since(startTime), err)
@@ -888,15 +895,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 		return pt.bus.Publish(pt.channels.Errors, errMsg)
 	}
 
-	respData := result
-	if protocolTask != nil {
-		respData = &TaskStageResult{
-			Plan:         pt.planSnapshot(),
-			CreatedFiles: pt.createdArtifacts(),
-			SuiteResult:  pt.lastSuiteSnapshot(),
-		}
-	}
-	resp.Data = agentshared.BuildPipelineTurnResponse(ctx, respData)
+	resp.Data = agentshared.BuildPipelineTurnResponse(ctx, result)
 	agentshared.PublishStreamComplete(pt.bus, pt.channels, ctx, pt.id, "", usageAcc.Total())
 	pt.publishActivity(ctx, events.EventTypeSuccess, "Validation task completed")
 

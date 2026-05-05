@@ -85,7 +85,8 @@ func (b *mockBus) SubscribeAsync(topic string, handler guide.MessageHandler) (gu
 	return b.Subscribe(topic, handler)
 }
 
-func (b *mockBus) Close() error { return nil }
+func (b *mockBus) Close() error                             { return nil }
+func (b *mockBus) CloseWithContext(_ context.Context) error { return nil }
 
 func (b *mockBus) publishCount() int {
 	b.mu.Lock()
@@ -313,29 +314,42 @@ func TestScribe_Feed_ProcessesAndForwards(t *testing.T) {
 	if msg == nil {
 		t.Fatal("expected published message")
 	}
-	route, ok := msg.GetRouteRequest()
-	if !ok || route == nil {
-		t.Fatalf("expected route request payload, got %#v", msg.Payload)
+	action, ok := msg.GetActionRequest()
+	if !ok || action == nil {
+		t.Fatalf("expected action request payload, got %#v", msg.Payload)
 	}
-	if route.SourceAgentID != s.id {
-		t.Fatalf("source_agent_id = %q, want %q", route.SourceAgentID, s.id)
+	if action.SourceAgentID != s.id {
+		t.Fatalf("source_agent_id = %q, want %q", action.SourceAgentID, s.id)
 	}
-	if !route.FireAndForget {
-		t.Fatal("expected archivalist store route to be fire-and-forget")
+	if action.TargetAgentID != "archivalist" {
+		t.Fatalf("target_agent_id = %q, want archivalist", action.TargetAgentID)
 	}
-	if route.CorrelationID == "corr-1" {
-		t.Fatal("scribe reused parent correlation ID for archival store route")
+	if action.Action != archivalistStoreCommentaryAction {
+		t.Fatalf("action = %q, want %q", action.Action, archivalistStoreCommentaryAction)
 	}
-	if route.ParentCorrelationID != "corr-1" {
-		t.Fatalf("parent_correlation_id = %q, want corr-1", route.ParentCorrelationID)
+	if !action.FireAndForget {
+		t.Fatal("expected archivalist store action to be fire-and-forget")
 	}
-	if !strings.HasPrefix(route.Input, "@archivalist:store:history") {
-		t.Fatalf("input = %q, want archivalist store DSL", route.Input)
+	if action.CorrelationID == "corr-1" {
+		t.Fatal("scribe reused parent correlation ID for archival store action")
 	}
-	if got, _ := route.Metadata["chat_nested_branch"].(bool); !got {
-		t.Fatalf("chat_nested_branch = %#v, want true", route.Metadata["chat_nested_branch"])
+	if action.ParentCorrelationID != "corr-1" {
+		t.Fatalf("parent_correlation_id = %q, want corr-1", action.ParentCorrelationID)
 	}
-	if got, _ := route.Metadata["chat_inter_agent_kind"].(string); got != shared.InterAgentToolEventKindStore {
+	data, ok := action.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("action data = %#v, want map[string]any", action.Data)
+	}
+	if content, _ := data["content"].(string); content == "" {
+		t.Fatalf("action data missing content: %#v", data)
+	}
+	if parent, _ := data["parent_agent"].(string); parent != "engineer" {
+		t.Fatalf("data.parent_agent = %q, want engineer", parent)
+	}
+	if got, _ := msg.Metadata["chat_nested_branch"].(bool); !got {
+		t.Fatalf("chat_nested_branch = %#v, want true", msg.Metadata["chat_nested_branch"])
+	}
+	if got, _ := msg.Metadata["chat_inter_agent_kind"].(string); got != shared.InterAgentToolEventKindStore {
 		t.Fatalf("chat_inter_agent_kind = %q, want %q", got, shared.InterAgentToolEventKindStore)
 	}
 }

@@ -188,7 +188,7 @@ func pipelineTaskTargetAgentID(task *PipelineTaskInput) string {
 	if targetAgentID != "" {
 		return targetAgentID
 	}
-	return pipelineProtocolTargetAgentID(task.TaskID, task.AgentType)
+	return pipelineProtocolTargetAgentID(task.SessionID, task.TaskID, task.AgentType)
 }
 
 func normalizePipelineAgentType(agentType string) string {
@@ -206,10 +206,16 @@ func normalizePipelineAgentType(agentType string) string {
 	}
 }
 
-func pipelineProtocolTargetAgentID(taskID, agentType string) string {
+// pipelineProtocolTargetAgentID returns the canonical internal agent ID of a
+// task-scoped pipeline worker. This UUID matches the worker's runtime e.id and
+// therefore matches the AgentID the worker uses to subscribe its ClaimsInbox
+// and direct-message channels. Use this for any internal addressing — never
+// the slug-form PipelineWorkerRoutingTarget, which is reserved for UI display
+// and container/pod spec.Name.
+func pipelineProtocolTargetAgentID(sessionID, taskID, agentType string) string {
 	taskID = strings.TrimSpace(taskID)
 	agentType = strings.TrimSpace(normalizePipelineAgentType(agentType))
-	return PipelineWorkerRoutingTarget(taskID, agentType)
+	return PipelineWorkerCanonicalID(sessionID, taskID, agentType)
 }
 
 func pipelineStageForAgents(agentTypes []string) string {

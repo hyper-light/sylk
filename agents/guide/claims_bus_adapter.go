@@ -7,8 +7,33 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/google/uuid"
 )
+
+// priorityForInboxClass maps the semantic inbox class of a delta to
+// the bus message priority used for queue ordering and overflow
+// eviction. Higher priority is inserted ahead in the per-subscription
+// queue and is the last to be dropped under DropOldest.
+//
+//   - ConsultResolved → Critical (a parked caller is waiting)
+//   - ConsultRequest  → High     (the agent owes a reply)
+//   - Directed        → Normal   (task / challenge / corrective)
+//   - Phase           → Low      (recoverable from board state)
+//   - Observation     → Background (sheds first under pressure)
+func priorityForInboxClass(class claims.InboxClass) messaging.Priority {
+	switch class {
+	case claims.InboxClassConsultResolved:
+		return messaging.PriorityCritical
+	case claims.InboxClassConsultRequest:
+		return messaging.PriorityHigh
+	case claims.InboxClassDirected:
+		return messaging.PriorityNormal
+	case claims.InboxClassPhase:
+		return messaging.PriorityLow
+	}
+	return messaging.PriorityBackground
+}
 
 // ClaimsBusAdapter bridges the guide ChannelBus to claims.DeltaBus so
 // the amplifier and ClaimsInbox can ride the existing transport.
@@ -48,6 +73,7 @@ func (a *ClaimsBusAdapter) PublishDelta(_ context.Context, topic string, delta c
 		Payload:       delta,
 		Timestamp:     time.Now().UTC(),
 		SourceAgentID: "claims_amplifier",
+		Priority:      priorityForInboxClass(claims.DeltaClass(delta)),
 	}
 	if err := a.bus.Publish(topic, msg); err != nil {
 		slog.Error("claims_delta_publish_failed",
@@ -131,4 +157,18 @@ func (s *claimsSubscriptionAdapter) Unsubscribe() error {
 		return nil
 	}
 	return s.inner.Unsubscribe()
+}
+
+// DroppedCount surfaces the bus-level overflow drop counter so the
+// claims inbox (via claims.DroppedCounter) can aggregate per-agent
+// coverage signals. Returns 0 when the underlying subscription does
+// not expose its drop counter.
+func (s *claimsSubscriptionAdapter) DroppedCount() uint64 {
+	if s == nil || s.inner == nil {
+		return 0
+	}
+	if dc, ok := s.inner.(interface{ DroppedCount() uint64 }); ok {
+		return dc.DroppedCount()
+	}
+	return 0
 }

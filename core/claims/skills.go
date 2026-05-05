@@ -172,10 +172,30 @@ func PostActionSkill(bp BoardProvider, ip ...InboxProvider) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
+			if strings.TrimSpace(params.ActionType) == "" {
+				return nil, fmt.Errorf(
+					"tool %q: required parameter %q is missing or empty. Expected: one of task|challenge|consultation|corrective|archival|prompt",
+					"post_action", "action_type",
+				)
+			}
+			const claimsShapeHint = `non-empty JSON array of claim objects, e.g. [{"title":"...","description":"...","subject":"<agent_id>","scope":[{"kind":"file","key":"path"}],"validations":[{"description":"...","quality_bar":"...","type":"test"}]}]`
+			if err := requireRawJSONParam("post_action", "claims_json", params.ClaimsJSON, claimsShapeHint); err != nil {
+				return nil, err
+			}
+
 			claimsRaw := unwrapJSONArray(params.ClaimsJSON)
+			if err := diagnoseJSONTruncation("post_action", "claims_json", claimsRaw); err != nil {
+				return nil, err
+			}
 			var claimInputs []claimInput
 			if err := json.Unmarshal(claimsRaw, &claimInputs); err != nil {
-				return nil, fmt.Errorf("invalid claims_json: %w", err)
+				return nil, fmt.Errorf("invalid claims_json: %w. Expected: %s", err, claimsShapeHint)
+			}
+			if len(claimInputs) == 0 {
+				return nil, fmt.Errorf(
+					"tool %q: %q parsed to zero claims. Expected: %s",
+					"post_action", "claims_json", claimsShapeHint,
+				)
 			}
 
 			actionType := ActionType(strings.TrimSpace(params.ActionType))
@@ -239,22 +259,32 @@ func PostActionSkill(bp BoardProvider, ip ...InboxProvider) *skills.Skill {
 // expectedDeltaForActionType returns the delta kind the issuer should
 // expect in response to an action of the given type.
 func expectedDeltaForActionType(t ActionType) string {
+	return ExpectedDeltaForActionType(t)
+}
+
+func expectedPriorityForActionType(t ActionType) WorkUnitPriority {
+	return ExpectedPriorityForActionType(t)
+}
+
+// ExpectedDeltaForActionType returns the delta kind the issuer of an
+// action of the given ActionType should expect as a peer's response.
+// Exported so dispatchers that bypass the post_action skill can
+// register their own expectations via RegisterPostActionExpectations.
+func ExpectedDeltaForActionType(t ActionType) string {
 	switch t {
-	case ActionTypeChallenge:
-		return DeltaKindTestament
-	case ActionTypeConsultation:
-		return DeltaKindTestament
-	case ActionTypeTask:
-		return DeltaKindTestament
-	case ActionTypeCorrective:
+	case ActionTypeChallenge,
+		ActionTypeConsultation,
+		ActionTypeTask,
+		ActionTypeCorrective,
+		ActionTypeHandoff:
 		return DeltaKindTestament
 	}
 	return DeltaKindTestament
 }
 
-// expectedPriorityForActionType returns the priority the issuer
+// ExpectedPriorityForActionType returns the priority the issuer
 // should assign to the response expectation.
-func expectedPriorityForActionType(t ActionType) WorkUnitPriority {
+func ExpectedPriorityForActionType(t ActionType) WorkUnitPriority {
 	switch t {
 	case ActionTypeChallenge:
 		return PriorityChallenge
@@ -262,10 +292,52 @@ func expectedPriorityForActionType(t ActionType) WorkUnitPriority {
 		return PriorityRemediation
 	case ActionTypeConsultation:
 		return PriorityResponse
-	case ActionTypeTask:
+	case ActionTypeTask, ActionTypeHandoff:
 		return PriorityResponse
 	}
 	return PriorityResponse
+}
+
+// RegisterPostActionExpectations is the canonical helper every
+// dispatcher uses after a successful PostAction to register
+// just-in-time response expectations on the issuing agent's inbox.
+// One call per directed claim — self-targeted claims (issuer ==
+// subject) and unaddressed claims are skipped because no peer
+// response is awaited.
+//
+// This is the event-driven dual of the standing-subscription path:
+// the issuer waits ONLY for the specific testament its own claim
+// produced, not the firehose. UI_DESIGN.md / CLAIMS.md §5 — every
+// directed claim's return path SHOULD flow through Expect, not
+// through standing subscriptions.
+//
+// Safe to call with nil inbox or empty claims (no-op). System-
+// internal action types are also skipped because the amplifier
+// never publishes their TestamentDelta anyway.
+func RegisterPostActionExpectations(inbox *ClaimsInbox, action Action, postedClaims []Claim) {
+	if inbox == nil || len(postedClaims) == 0 {
+		return
+	}
+	for i := range postedClaims {
+		c := &postedClaims[i]
+		if IsSystemInternalAction(c.ActionType) {
+			continue
+		}
+		subject := SubjectAgentID(c.Relations)
+		issuer := IssuerAgentID(c.Relations)
+		if subject == "" || subject == issuer {
+			// Self-targeted or unaddressed — no peer response will
+			// fire a TestamentDelta against this claim.
+			continue
+		}
+		inbox.Expect(&Expectation{
+			ClaimID:       c.ID,
+			ExpectedDelta: ExpectedDeltaForActionType(c.ActionType),
+			ActionID:      action.ID,
+			IssuedAt:      c.Created,
+			Priority:      ExpectedPriorityForActionType(c.ActionType),
+		})
+	}
 }
 
 func InspectClaimConflictsSkill(bp BoardProvider) *skills.Skill {
@@ -329,10 +401,24 @@ func SubmitTestamentsSkill(bp BoardProvider) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
+			const testamentsShapeHint = `non-empty JSON array of testament objects, e.g. [{"claim_id":"clm_...","summary":"...","confidence":"high","artifacts":[{"kind":"test_output","reference":"go test ./... — 42 passed"}]}]`
+			if err := requireRawJSONParam("submit_testaments", "testaments_json", params.TestamentsJSON, testamentsShapeHint); err != nil {
+				return nil, err
+			}
+
 			testamentsRaw := unwrapJSONArray(params.TestamentsJSON)
+			if err := diagnoseJSONTruncation("submit_testaments", "testaments_json", testamentsRaw); err != nil {
+				return nil, err
+			}
 			var testamentInputs []testamentInput
 			if err := json.Unmarshal(testamentsRaw, &testamentInputs); err != nil {
-				return nil, fmt.Errorf("invalid testaments_json: %w", err)
+				return nil, fmt.Errorf("invalid testaments_json: %w. Expected: %s", err, testamentsShapeHint)
+			}
+			if len(testamentInputs) == 0 {
+				return nil, fmt.Errorf(
+					"tool %q: %q parsed to zero testaments. Expected: %s",
+					"submit_testaments", "testaments_json", testamentsShapeHint,
+				)
 			}
 
 			var testaments []Testament
@@ -455,10 +541,36 @@ func PostRemediationClaimsSkill(bp BoardProvider) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
+			if strings.TrimSpace(params.ClaimID) == "" {
+				return nil, fmt.Errorf(
+					"tool %q: required parameter %q is missing or empty. Expected: ID of the claim being rejected",
+					"post_remediation_claims", "claim_id",
+				)
+			}
+			if strings.TrimSpace(params.Reason) == "" {
+				return nil, fmt.Errorf(
+					"tool %q: required parameter %q is missing or empty. Expected: explanation for why the claim is being rejected",
+					"post_remediation_claims", "reason",
+				)
+			}
+			const replacementsShapeHint = `non-empty JSON array of replacement claim objects, e.g. [{"title":"...","description":"...","subject":"<agent_id>","scope":[{"kind":"file","key":"path"}],"validations":[{"description":"...","quality_bar":"...","type":"test"}]}]`
+			if err := requireRawJSONParam("post_remediation_claims", "replacements_json", params.ReplacementsJSON, replacementsShapeHint); err != nil {
+				return nil, err
+			}
+
 			replacementsRaw := unwrapJSONArray(params.ReplacementsJSON)
+			if err := diagnoseJSONTruncation("post_remediation_claims", "replacements_json", replacementsRaw); err != nil {
+				return nil, err
+			}
 			var claimInputs []claimInput
 			if err := json.Unmarshal(replacementsRaw, &claimInputs); err != nil {
-				return nil, fmt.Errorf("invalid replacements_json: %w", err)
+				return nil, fmt.Errorf("invalid replacements_json: %w. Expected: %s", err, replacementsShapeHint)
+			}
+			if len(claimInputs) == 0 {
+				return nil, fmt.Errorf(
+					"tool %q: %q parsed to zero replacement claims. Expected: %s",
+					"post_remediation_claims", "replacements_json", replacementsShapeHint,
+				)
 			}
 
 			var claims []Claim
@@ -663,6 +775,83 @@ func (a *flexibleArtifacts) UnmarshalJSON(data []byte) error {
 	}
 
 	return fmt.Errorf("artifacts must be a string, string array, [{kind, reference, ...}] array, or single object")
+}
+
+// requireRawJSONParam validates that a required JSON-typed tool parameter is
+// present and non-empty. The schema's required-flag is descriptive only — the
+// runtime does not enforce it — so an LLM that omits the field reaches the
+// handler with `raw` set to nil bytes, which then fails json.Unmarshal with
+// the opaque "unexpected end of JSON input". This helper short-circuits with
+// an actionable error that echoes the canonical shape inline so the agent can
+// self-correct on retry without another round trip.
+func requireRawJSONParam(toolName, paramName string, raw json.RawMessage, shapeHint string) error {
+	switch string(bytes.TrimSpace(raw)) {
+	case "", "null", `""`, "[]", "{}":
+		return fmt.Errorf(
+			"tool %q: required parameter %q is missing or empty. Expected: %s",
+			toolName, paramName, shapeHint,
+		)
+	}
+	return nil
+}
+
+// diagnoseJSONTruncation returns a specific, actionable error when raw is
+// detected as truncated mid-structure. Counts brackets and braces while
+// respecting string literals (so `[` inside `"foo[bar"` doesn't mis-count).
+// When the structure is well-balanced returns nil and json.Unmarshal handles
+// the rest. When unbalanced, returns an error naming the missing closers so
+// the LLM's next turn can correct without guessing.
+//
+// The motivating failure: LLMs streaming long structured tool args
+// occasionally truncate before emitting trailing closers, producing payloads
+// like `[{"title":"...","validations":[{...}]}` (missing the outer `]`). A
+// generic "unexpected end of JSON input" gives the LLM no clue what to fix;
+// this diagnostic does.
+func diagnoseJSONTruncation(toolName, paramName string, raw json.RawMessage) error {
+	bracketDepth := 0
+	braceDepth := 0
+	inString := false
+	escaped := false
+	for _, b := range raw {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if b == '\\' && inString {
+			escaped = true
+			continue
+		}
+		if b == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch b {
+		case '[':
+			bracketDepth++
+		case ']':
+			bracketDepth--
+		case '{':
+			braceDepth++
+		case '}':
+			braceDepth--
+		}
+	}
+	if inString {
+		return fmt.Errorf(
+			"tool %q: %q appears truncated mid-string. Re-emit the full JSON, ensuring all string literals are closed.",
+			toolName, paramName,
+		)
+	}
+	if bracketDepth != 0 || braceDepth != 0 {
+		return fmt.Errorf(
+			"tool %q: %q appears truncated. Detected %d unclosed `[` and %d unclosed `{`. Re-emit the full JSON array, ensuring every opening bracket and brace has a matching closer.",
+			toolName, paramName, bracketDepth, braceDepth,
+		)
+	}
+	return nil
 }
 
 // unwrapJSONArray normalizes LLM-produced JSON for tool parameters that expect

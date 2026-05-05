@@ -112,6 +112,7 @@ func (a *Architect) registerFabricSkills() {
 				return a.channels.Responses
 			},
 		),
+		Inbox: func() *claims.ClaimsInbox { return a.claimsInbox },
 	}) {
 		a.skills.Register(skill)
 	}

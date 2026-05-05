@@ -205,8 +205,20 @@ func (a *Architect) composeUserFacingResponseWithTools(
 	a.injectForestPreload(ctx, req, request.UserQuery, request.SessionID)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	text, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
-		return a.executeToolLoop(ctx, req, stage, request.OnChunk, ledger)
+	// User-facing turn: the caller (Handle / executeConversation) is
+	// synchronously awaiting the architect's response. Do NOT stamp
+	// WithContinuationStore here — yielding would return an empty
+	// answer to the user while the resume runs in the background and
+	// has nowhere to deliver its result. Consult_peer falls back to
+	// the legacy synchronous wait (runLegacyConsultWait) which blocks
+	// inline until the librarian's testament arrives, the loop
+	// continues, and the final response reaches the user.
+	//
+	// Yield-resume is reserved for claim-inbox-driven paths
+	// (processClaimsEntry) where no synchronous caller is waiting.
+	loopCtx := ctx
+	text, err := shared.ExecuteTurnLoop(loopCtx, ledger, req, func() (string, error) {
+		return a.executeToolLoop(loopCtx, req, stage, request.OnChunk, ledger)
 	})
 	if err != nil {
 		a.logDebug("compose_with_tools: TOOL_LOOP_ERROR",

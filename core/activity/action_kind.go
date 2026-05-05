@@ -239,6 +239,14 @@ const (
 	// of a cross-pipeline challenge.
 	ActionEscalationRequested ActionKind = "escalation_requested"
 
+	// ActionHandoffEmitted is emitted on a clean transfer of top-level
+	// cycle ownership from one agent to another (UI_DESIGN.md §2.2).
+	// Subject.Coordinates carries "handoff_from_claim_id" pointing at
+	// the predecessor cycle's root claim. The Fabric publish-side
+	// guard (handoff_guard.go) verifies HandoffEligible before
+	// propagation; the activity is dropped on rejection.
+	ActionHandoffEmitted ActionKind = "handoff_emitted"
+
 	// ─── Knowledge agent kinds (Tier 8) ────────────────────────────
 
 	// ActionAdvisoryEmitted is emitted by knowledge agents on every

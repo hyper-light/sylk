@@ -90,7 +90,7 @@ func TestApplyToolCalls_AuditDepthGateRequiresDetermineFirst(t *testing.T) {
 		},
 	}
 
-	errCount, rerouted, delegated, delegatedMessage := gi.applyToolCalls(ctx, req, resp)
+	errCount, rerouted, delegated, delegatedMessage, _ := gi.applyToolCalls(ctx, req, resp)
 	if errCount != 1 {
 		t.Fatalf("errCount = %d, want 1", errCount)
 	}

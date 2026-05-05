@@ -20,46 +20,57 @@ package architect
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/google/uuid"
 )
 
-// publishPreparedHandoff sends a Phase=Prepare handoff to the
-// orchestrator so it can run prepareExecution (verify Guardian
-// attestation, build DAG, write WAL/SQLite rows) overlapping with
-// the user's approval-dialog review time. On approve, the
-// orchestrator's executePrepared just runs scheduler.Submit against
-// this prepared DAG.
+// publishPreparedHandoff submits the architect's plan-finalize
+// testament: a free-floating testament whose artifact carries the
+// full PlanHandoff JSON. This is *evidence*, not a dispatch — the
+// architect declares "I have finished planning, here is the plan."
 //
-// Best-effort. On any error (no orchestrator registered, bus down,
-// payload invalid) we log and return without failing the plan —
-// dispatch will fall back to full ingest at approval time.
+// The artifact's ID is pre-stamped (uuid.NewString) and recorded on
+// the plan struct as plan.HandoffPayloadArtifactID. The user-accept
+// dispatch claim (dispatchPlanExecution) carries a validation that
+// references this artifact ID, so the orchestrator's claim intake
+// can resolve the artifact and run ingestPlan deterministically —
+// no LLM tool loop, no parallel bus message, no race on the receipt.
+//
+// Best-effort on the testament submission itself: if the board is
+// unavailable the user-accept path can still re-submit a fresh
+// testament+artifact and reference that one. Failures are logged.
+//
+// Phase semantics live ENTIRELY on the testament/artifact side now.
+// The bus path that previously carried Phase=Prepare is gone — the
+// orchestrator's prefetch/preparation reaction is driven by
+// observing this testament via its plan-scoped subscription.
 func (a *Architect) publishPreparedHandoff(ctx context.Context, plan *DesignPlan) {
-	if a == nil || a.bus == nil || !a.running || plan == nil {
-		return
-	}
-	targetAgentID := a.knownAgentIDByType("orchestrator", "")
-	if strings.TrimSpace(targetAgentID) == "" {
+	if a == nil || plan == nil {
 		return
 	}
 	payload := buildPhasedHandoffPayload(plan, "plan-prepared", PlanHandoffPhasePrepare)
 	if !isPlanHandoffPayloadValid(payload) {
 		return
 	}
-	req := &guide.RouteRequest{
-		Input:               payload,
-		CorrelationID:       "prepare_" + uuid.NewString(),
-		ParentCorrelationID: originalCIDFromContext(ctx),
-		TargetAgentID:       targetAgentID,
-		SessionID:           plan.SessionID,
+	artifactID := uuid.NewString()
+	artifact := a.architectArtifact(claims.ArtifactKindPlanHandoffPayload, payload)
+	artifact.ID = artifactID
+	artifact.Metadata = map[string]any{
+		"plan_id":  plan.ID,
+		"revision": plan.Revision,
+		"phase":    string(PlanHandoffPhasePrepare),
 	}
-	if err := a.publishRouteRequest(req); err != nil {
-		a.logWarn("publishPreparedHandoff: publish failed",
-			"plan_id", plan.ID,
-			"error", err.Error())
-	}
+	testament := a.architectTestament(
+		fmt.Sprintf("Plan %s prepared: %d tasks, revision %d", plan.ID, len(plan.Tasks), plan.Revision),
+		"committed",
+		[]*claims.Artifact{artifact},
+	)
+	plan.HandoffPayloadArtifactID = artifactID
+	a.architectSubmitTestament(ctx, testament)
 }
 
 // publishDiscardPrepared tells the orchestrator to drop any prepared

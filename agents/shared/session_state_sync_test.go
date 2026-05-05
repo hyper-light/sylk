@@ -34,7 +34,8 @@ func (b *resyncBus) Subscribe(string, guide.MessageHandler) (guide.Subscription,
 func (b *resyncBus) SubscribeAsync(string, guide.MessageHandler) (guide.Subscription, error) {
 	return nil, nil
 }
-func (b *resyncBus) Close() error { return nil }
+func (b *resyncBus) Close() error                            { return nil }
+func (b *resyncBus) CloseWithContext(_ context.Context) error { return nil }
 
 func openResyncTestSession(t *testing.T, name string) *versioning.SessionVFS {
 	t.Helper()

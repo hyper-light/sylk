@@ -286,20 +286,18 @@ func (ks *KnowledgeStore) WaitForFull(ctx context.Context) error {
 	}
 }
 
-// Close releases all owned resources. Idempotent.
+// Close releases the store's own resources (the query coordinator's
+// metrics tracker). Idempotent.
+//
+// Note: the closeable registered by PromotePartial — typically the
+// CommittedKnowledgeBackend — is intentionally NOT closed here. The
+// caller is responsible for closing the backend directly so a single
+// resource has a single close path; otherwise both Store.Close and
+// Backend.Close would race through the backend's sync.Once and each
+// report their own timeout for the same underlying work.
 func (ks *KnowledgeStore) Close() error {
-	var err error
 	ks.closeOnce.Do(func() {
 		ks.coordinator.Close()
-
-		ks.mu.Lock()
-		defer ks.mu.Unlock()
-
-		if ks.closeable != nil {
-			if e := ks.closeable.Close(); e != nil {
-				err = e
-			}
-		}
 
 		if ks.bootLogger != nil {
 			ks.bootLogger.LogEvent(agentlog.JSONLEntry{
@@ -311,7 +309,7 @@ func (ks *KnowledgeStore) Close() error {
 			})
 		}
 	})
-	return err
+	return nil
 }
 
 func (ks *KnowledgeStore) publishEvent(level ReadinessLevel) {

@@ -341,12 +341,12 @@ func (r *TaskRouter) publishProtocolRoute(req *guide.RouteRequest) (bool, error)
 	return true, nil
 }
 
-func protocolSerializedRouteKeyFromMessage(msg *guide.Message) string {
-	task := protocolTaskFromResponseMetadata(msg)
+func (r *TaskRouter) protocolSerializedRouteKeyFromMessage(msg *guide.Message) string {
+	task := r.protocolTaskFromResponseMetadata(msg)
 	if task == nil {
 		return ""
 	}
-	return pipelineWorkerTargetAgentID(task.TaskID, task.AgentType)
+	return pipelineWorkerTargetAgentID(r.sessionID, task.TaskID, task.AgentType)
 }
 
 func (r *TaskRouter) clearProtocolRoute(msg *guide.Message) {
@@ -369,7 +369,7 @@ func (r *TaskRouter) clearProtocolRoute(msg *guide.Message) {
 		delete(r.protocolRouteCorr, correlationID)
 	}
 	if queueKey == "" {
-		queueKey = protocolSerializedRouteKeyFromMessage(msg)
+		queueKey = r.protocolSerializedRouteKeyFromMessage(msg)
 	}
 	if queueKey == "" {
 		return
@@ -749,7 +749,7 @@ func (r *TaskRouter) mirrorProtocolStreamToUser(msg *guide.Message) bool {
 	if !ok || stream == nil || stream.Event == nil {
 		return false
 	}
-	task := protocolTaskFromStreamMetadata(stream)
+	task := r.protocolTaskFromStreamMetadata(stream)
 	if task == nil {
 		return false
 	}
@@ -969,7 +969,7 @@ func messageMetadataString(msg *guide.Message, key string) string {
 	return metadataString(msg.Metadata, key)
 }
 
-func protocolTaskFromStreamMetadata(stream *guide.StreamResponse) *PipelineTask {
+func (r *TaskRouter) protocolTaskFromStreamMetadata(stream *guide.StreamResponse) *PipelineTask {
 	if stream == nil || !metadataBool(stream.Metadata, "pipeline_task") {
 		return nil
 	}
@@ -992,12 +992,12 @@ func protocolTaskFromStreamMetadata(stream *guide.StreamResponse) *PipelineTask 
 		DAGID:         dagID,
 		TaskID:        taskID,
 		AgentType:     agentType,
-		TargetAgentID: firstNonEmpty(strings.TrimSpace(stream.RespondingAgentID), pipelineWorkerTargetAgentID(taskID, agentType)),
+		TargetAgentID: firstNonEmpty(strings.TrimSpace(stream.RespondingAgentID), pipelineWorkerTargetAgentID(r.sessionID, taskID, agentType)),
 		Context:       ctx,
 	}
 }
 
-func protocolTaskFromResponseMetadata(msg *guide.Message) *PipelineTask {
+func (r *TaskRouter) protocolTaskFromResponseMetadata(msg *guide.Message) *PipelineTask {
 	if msg == nil || !metadataBool(msg.Metadata, "pipeline_task") {
 		return nil
 	}
@@ -1023,7 +1023,7 @@ func protocolTaskFromResponseMetadata(msg *guide.Message) *PipelineTask {
 		DAGID:         metadataString(msg.Metadata, "dag_id"),
 		TaskID:        taskID,
 		AgentType:     agentType,
-		TargetAgentID: pipelineWorkerTargetAgentID(taskID, agentType),
+		TargetAgentID: pipelineWorkerTargetAgentID(r.sessionID, taskID, agentType),
 		Context:       ctx,
 	}
 }
@@ -1279,7 +1279,7 @@ func (r *TaskRouter) consumeProtocolTerminal(msg *guide.Message) bool {
 	if !ok || resp == nil {
 		return false
 	}
-	task := protocolTaskFromResponseMetadata(msg)
+	task := r.protocolTaskFromResponseMetadata(msg)
 	if !resp.Success {
 		if task == nil {
 			return false

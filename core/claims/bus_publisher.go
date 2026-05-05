@@ -34,6 +34,14 @@ type DeltaSubscription interface {
 	Unsubscribe() error
 }
 
+// DroppedCounter is an optional capability on DeltaSubscription
+// implementations: when present, the inbox aggregates per-subscription
+// drop counters and exposes the total via Inbox.OverflowCount.
+// Subscriptions that don't implement this contribute zero.
+type DroppedCounter interface {
+	DroppedCount() uint64
+}
+
 // DeltaSubscriber subscribes DeltaHandlers to topic patterns. Pattern
 // semantics match the TopicRouter wildcard rules of the underlying
 // bus (typically glob-style with '*' matching a single segment).

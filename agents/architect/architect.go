@@ -137,6 +137,13 @@ type Architect struct {
 	// executes at a time, preventing cancel/new-request interleaving.
 	requestSerializer *shared.RequestSerializer
 
+	// continuationStore handles ConsultResolvedDelta deliveries when
+	// the LLM yields mid-turn via await_consults. Constructed in
+	// Start; passed to WireClaimsIntake so consult resolutions bypass
+	// processClaimsEntry (which would fire a fresh inference loop)
+	// and instead wake the parked continuation.
+	continuationStore *shared.ContinuationStore
+
 	// Plan presentation audit cache: keyed by plan.ID, holds the most
 	// recent freshness audit (with reconsult evidence already folded
 	// in). Both the dialog publish path and the conversation context
@@ -808,14 +815,40 @@ func (a *Architect) Start(bus guide.EventBus) error {
 		a.logger.Warn("audit rejection bridge start failed", "error", err.Error())
 	}
 
+	// ContinuationStore: must exist before WireClaimsIntake so the
+	// inbox routes ConsultResolvedDelta deliveries to it instead of
+	// firing fresh inference via processClaimsEntry. ResumeFn wakes
+	// a yielded LLM turn by reconstructing its TurnState and re-
+	// entering the agent's tool loop; see resumeContinuation.
+	a.continuationStore = shared.NewContinuationStore(shared.ContinuationStoreConfig{
+		AgentID:   a.id,
+		SessionID: a.config.SessionID,
+		Board:     a.architectBoard(),
+		Scope:     a.scope,
+		ResumeFn:  a.resumeContinuation,
+	})
+	// Restart recovery: re-attach any in-flight continuations
+	// persisted on the durable claims board before this process
+	// started. Already-resolved consults that landed during the
+	// downtime resume immediately; still-awaiting ones are tracked
+	// with their original deadline.
+	a.continuationStore.RecoverPendingContinuations(context.Background())
+
 	// Claims intake: event-driven delta processing.
+	// Architect carries RoleRemediator so it sees rejection deltas
+	// across the session — the architect is the canonical author of
+	// corrective actions on rejection.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:      a.id,
-		SessionID:    a.config.SessionID,
-		Bus:          bus,
-		Board:        a.architectBoard(),
-		Scope:        a.scope,
-		ProcessEntry: a.processClaimsEntry,
+		AgentID:           a.id,
+		SessionID:         a.config.SessionID,
+		Role:              claims.RoleSubject | claims.RoleRemediator,
+		Bus:               bus,
+		Board:             a.architectBoard(),
+		Scope:             a.scope,
+		ProcessEntry:      a.processClaimsEntry,
+		Identity:          a.identity,
+		Factory:           a.factory,
+		ContinuationStore: a.continuationStore,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("architect_claims_inbox_start_failed", "error", err.Error())
@@ -849,6 +882,10 @@ func (a *Architect) Stop() error {
 	if a.claimsInbox != nil {
 		_ = a.claimsInbox.Close()
 		a.claimsInbox = nil
+	}
+	if a.continuationStore != nil {
+		a.continuationStore.Stop("architect stopped")
+		a.continuationStore = nil
 	}
 
 	a.steering.CloseAll()
@@ -1130,6 +1167,22 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	a.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer a.clearInFlight(fwd.CorrelationID)
 	defer cancel()
+	// Bind a TestamentAccumulator to the issuer's parent claim via
+	// the cycle-aware helper. For top-level prompts that's the
+	// guide's route claim; for consult/challenge fulfillments it's
+	// the consultation/challenge claim that travels on the envelope
+	// metadata as parent_claim_id (UI_DESIGN.md §4.7.3). Tool calls
+	// + LLM dispatches inside the planning handlers record artifacts
+	// via AccumulatorFromContext lookup, fanning out to the chat
+	// panel as ClaimArtifactAddedMsg rows nested under the issuer's
+	// peer-interaction row.
+	var flushAccumulator func()
+	var beginErr error
+	reqCtx, flushAccumulator, beginErr = shared.BeginForwardedRequestCycle(reqCtx, a.id, fwd, a.scope)
+	if beginErr != nil {
+		return beginErr
+	}
+	defer flushAccumulator()
 	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
 	if publishStreamLifecycle {
 		a.publishPlanStreamStart(reqCtx)

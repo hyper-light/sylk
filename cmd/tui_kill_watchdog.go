@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -27,72 +28,84 @@ const (
 	killWatchdogChanBuffer = 4
 )
 
-// installKillWatchdog spawns a parallel signal watcher that
-// guarantees the user can always force-quit by pressing Ctrl+C a
-// second time, even when graceful shutdown is wedged in a blocking
-// subsystem close. Operates independently of signal.NotifyContext —
-// both subscribers receive each signal.
+// killWatchdog is a SIGINT/SIGTERM watcher that guarantees the user
+// can always force-quit by pressing Ctrl+C a second time, even when
+// graceful shutdown is wedged in a blocking subsystem close. Operates
+// independently of signal.NotifyContext — both subscribers receive
+// each signal.
 //
-// Behavior:
-//   - First SIGINT/SIGTERM: counted but no action. The
-//     signal.NotifyContext path receives the same signal and triggers
-//     cooperative shutdown.
-//   - Second signal: schedules os.Exit(130) after killWatchdogGrace.
-//     The brief delay lets terminal-restoration writes flush so the
-//     user's terminal isn't left in alt-screen / raw mode.
-//
-// Returns a stop function the caller invokes once normal shutdown
-// completes; stop() unsubscribes the watchdog cleanly so it never
-// fires after a successful exit.
-//
-// The watchdog's goroutines are intentionally untracked: they exist
-// precisely to recover from situations where the normal goroutine-
-// tracking infrastructure (GoroutineScope) is itself blocked in
-// shutdown. Tracking the kill switch through the system it's meant
-// to escape would defeat its purpose.
-func installKillWatchdog() func() {
-	ch := make(chan os.Signal, killWatchdogChanBuffer)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-	done := make(chan struct{})
-	stopped := make(chan struct{})
-	go runKillWatchdog(ch, done, stopped)
-	return func() {
-		select {
-		case <-done:
-			// Already stopped — idempotent.
-		default:
-			close(done)
-		}
-		<-stopped
-		signal.Stop(ch)
-	}
+// The single listener goroutine is tracked via wg (defer wg.Done in
+// run, wg.Wait in stop). On the second signal the listener itself
+// performs the grace-period sleep and the os.Exit call — there is
+// no spawned helper goroutine, so the watchdog satisfies the
+// project's "no untracked goroutines" invariant.
+type killWatchdog struct {
+	ch   chan os.Signal
+	done chan struct{}
+	wg   sync.WaitGroup
 }
 
-// runKillWatchdog drains the signal channel and counts presses until
-// either (a) the second signal arrives — triggering force-exit — or
-// (b) the done channel closes — indicating normal shutdown completed.
-// Closes stopped before returning so the installer's stop function
-// can synchronize on watchdog teardown.
-func runKillWatchdog(ch <-chan os.Signal, done <-chan struct{}, stopped chan<- struct{}) {
-	defer close(stopped)
+// installKillWatchdog spawns the watchdog and returns a stop function
+// the caller invokes once normal shutdown completes. Stop is
+// idempotent and synchronizes on the listener's exit so callers can
+// rely on no watchdog goroutine surviving the returned call.
+//
+// First SIGINT/SIGTERM: counted but no action — the
+// signal.NotifyContext path receives the same signal and triggers
+// cooperative shutdown.
+//
+// Second signal: schedules os.Exit(130) after killWatchdogGrace.
+// The brief delay lets terminal-restoration writes flush so the
+// user's terminal isn't left in alt-screen / raw mode.
+func installKillWatchdog() func() {
+	w := &killWatchdog{
+		ch:   make(chan os.Signal, killWatchdogChanBuffer),
+		done: make(chan struct{}),
+	}
+	signal.Notify(w.ch, syscall.SIGINT, syscall.SIGTERM)
+	w.wg.Add(1)
+	go w.run()
+	return w.stop
+}
+
+// stop unsubscribes the signal channel and waits for the listener to
+// exit. Safe to call multiple times — the done channel close is
+// guarded by a select so duplicate calls are no-ops.
+func (w *killWatchdog) stop() {
+	select {
+	case <-w.done:
+		// Already closed via prior stop call — nothing to do.
+	default:
+		close(w.done)
+	}
+	w.wg.Wait()
+	signal.Stop(w.ch)
+}
+
+// run is the listener loop. Exits cleanly on done close (normal
+// shutdown completed) or after firing os.Exit on second signal
+// (force-exit path, never returns from os.Exit).
+func (w *killWatchdog) run() {
+	defer w.wg.Done()
 	count := 0
 	for {
 		select {
-		case <-done:
+		case <-w.done:
 			return
-		case sig, ok := <-ch:
-			if shouldStop := handleKillSignal(sig, ok, &count); shouldStop {
+		case sig, ok := <-w.ch:
+			if exit := w.handleSignal(sig, ok, &count); exit {
 				return
 			}
 		}
 	}
 }
 
-// handleKillSignal updates the press counter and decides whether the
-// watchdog should exit. Returns true on the second press (force-exit
-// scheduled) or when the channel closed; false on the first press
-// (graceful shutdown remains in charge).
-func handleKillSignal(sig os.Signal, ok bool, count *int) bool {
+// handleSignal updates the press counter and decides whether the
+// listener should exit. Returns true on the second press (force-exit
+// scheduled and either fired or interrupted by stop) or when the
+// channel closed; false on the first press (graceful shutdown
+// remains in charge).
+func (w *killWatchdog) handleSignal(sig os.Signal, ok bool, count *int) bool {
 	if !ok {
 		return true
 	}
@@ -107,16 +120,24 @@ func handleKillSignal(sig os.Signal, ok bool, count *int) bool {
 		"signal", sig.String(),
 		"grace", killWatchdogGrace,
 	)
-	go forceExitAfter(killWatchdogGrace)
+	w.waitGraceOrExit()
 	return true
 }
 
-// forceExitAfter sleeps for grace then calls os.Exit(130). The
-// 130 exit code is the standard SIGINT-terminated convention
-// (128 + signal number). Run on a dedicated goroutine so the
-// watchdog's main loop returns first and the caller's stop()
-// synchronizes cleanly.
-func forceExitAfter(grace time.Duration) {
-	time.Sleep(grace)
-	os.Exit(130)
+// waitGraceOrExit sleeps for killWatchdogGrace then calls os.Exit(130),
+// or returns early if normal shutdown completed during the grace
+// window (done close beats the timer). The 130 exit code is the
+// standard SIGINT-terminated convention (128 + signal number).
+//
+// The sleep happens on the listener goroutine itself — no spawning —
+// so the watchdog has exactly one tracked goroutine for its entire
+// lifetime.
+func (w *killWatchdog) waitGraceOrExit() {
+	timer := time.NewTimer(killWatchdogGrace)
+	select {
+	case <-timer.C:
+		os.Exit(130)
+	case <-w.done:
+		timer.Stop()
+	}
 }

@@ -43,7 +43,8 @@ func (b *consultationTestBus) SubscribeAsync(string, guide.MessageHandler) (guid
 	return nil, nil
 }
 
-func (b *consultationTestBus) Close() error { return nil }
+func (b *consultationTestBus) Close() error                             { return nil }
+func (b *consultationTestBus) CloseWithContext(_ context.Context) error { return nil }
 
 func (b *consultationTestBus) publishCount() int {
 	b.mu.Lock()

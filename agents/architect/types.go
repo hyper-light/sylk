@@ -163,6 +163,16 @@ type DesignPlan struct {
 	// fresh verdict bound to the new task set's content hash.
 	GuardianAttestation *agentshared.PlanPreflightAttestation `json:"guardian_attestation,omitempty"`
 
+	// HandoffPayloadArtifactID is the ID of the plan_handoff_payload
+	// artifact submitted at plan-finalize. The payload artifact carries
+	// the full PlanHandoff JSON; the dispatch claim's validation
+	// references this ID so the orchestrator can resolve the artifact
+	// and run ingestPlan deterministically (no LLM tool loop, no
+	// parallel bus message). Updated on every plan revision (Modify
+	// path) so dispatch always references the current revision's
+	// artifact.
+	HandoffPayloadArtifactID string `json:"handoff_payload_artifact_id,omitempty"`
+
 	// sm is not serialized; reconstructed on restore or creation.
 	sm *PlanStateMachine `json:"-"`
 }

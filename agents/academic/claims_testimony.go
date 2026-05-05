@@ -19,24 +19,33 @@ func (a *Academic) academicBoard() *claims.ClaimsBoard {
 }
 
 // academicPostClaim posts a claim async via scope. Best-effort.
+// Registers a just-in-time response Expectation on the academic's
+// inbox after a successful PostAction (CLAIMS.md §5).
 func (a *Academic) academicPostClaim(ctx context.Context, action claims.Action, claim claims.Claim) {
 	board := a.academicBoard()
 	if board == nil {
 		return
 	}
+	posted := []claims.Claim{claim}
 	if a.scope != nil {
 		if err := a.scope.Go("academic_post_claim", 5*time.Second, func(gctx context.Context) error {
-			return board.PostAction(gctx, action, []claims.Claim{claim})
+			if err := board.PostAction(gctx, action, posted); err != nil {
+				return err
+			}
+			claims.RegisterPostActionExpectations(a.claimsInbox, action, posted)
+			return nil
 		}); err != nil {
 			slog.Error("academic_post_claim_dispatch_failed", "error", err.Error())
 			board.RecordNotificationError("academic post claim dispatch: " + err.Error())
 		}
 		return
 	}
-	if err := board.PostAction(ctx, action, []claims.Claim{claim}); err != nil {
+	if err := board.PostAction(ctx, action, posted); err != nil {
 		slog.Error("academic_post_claim_failed", "error", err.Error())
 		board.RecordNotificationError("academic post claim: " + err.Error())
+		return
 	}
+	claims.RegisterPostActionExpectations(a.claimsInbox, action, posted)
 }
 
 // academicSubmitTestament submits a testament async via scope. Best-effort.
@@ -178,10 +187,16 @@ func (a *Academic) processClaimsEntry(ctx context.Context, entry *claims.GraphEn
 		return fmt.Errorf("academic: LLM provider not configured")
 	}
 
-	acc := claims.NewTestamentAccumulator("academic", a.config.SessionID)
+	acc := shared.NewClaimsEntryAccumulator("academic", a.config.SessionID, entry)
+	acc.WithBoard(a.academicBoard())
 	defer acc.Flush(ctx, a.academicBoard(), nil)
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
+
+	if entry.Node.Claim != nil {
+		shared.RecordAgentState(ctx, a.academicBoard(), entry.Node.Claim.ID,
+			"Acknowledging request", shared.AgentStateReasoning, nil)
+	}
 
 	userMessage := shared.ComposeClaimsEntryPrompt(entry)
 	board := a.academicBoard()
@@ -202,7 +217,7 @@ func (a *Academic) processClaimsEntry(ctx context.Context, entry *claims.GraphEn
 	ledger := a.steering.Create(entry.Delta.DeltaKey(), a.id, a.config.SessionID, nil, nil)
 	defer a.steering.Close(entry.Delta.DeltaKey(), ctx.Err() != nil)
 
-	result, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return a.executeToolLoop(ctx, req, ledger, surface)
 	})
 	if err != nil {

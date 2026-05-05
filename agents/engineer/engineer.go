@@ -14,8 +14,8 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
-	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/escalation"
@@ -136,7 +136,8 @@ type Engineer struct {
 	// Tracked goroutine scope for async claims dispatch.
 	scope *concurrency.GoroutineScope
 
-	claimsInbox *claims.ClaimsInbox
+	claimsInbox       *claims.ClaimsInbox
+	continuationStore *shared.ContinuationStore
 }
 
 // SetScope injects the goroutine scope for async claims dispatch.
@@ -478,14 +479,30 @@ func (e *Engineer) Start(bus guide.EventBus) error {
 		return fmt.Errorf("failed to subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
+	// ContinuationStore for ticket-mode consult_peer + await_consults.
+	// Must be constructed before WireClaimsIntake so the inbox routes
+	// ConsultResolvedDelta deliveries to it instead of firing fresh
+	// inference via processClaimsEntry.
+	e.continuationStore = shared.NewContinuationStore(shared.ContinuationStoreConfig{
+		AgentID:   e.id,
+		SessionID: e.config.SessionID,
+		Board:     e.engineerBoard(),
+		Scope:     e.scope,
+		ResumeFn:  e.resumeContinuation,
+	})
+	e.continuationStore.RecoverPendingContinuations(context.Background())
+
 	// Claims intake: event-driven delta processing.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:      e.id,
-		SessionID:    e.config.SessionID,
-		Bus:          bus,
-		Board:        e.engineerBoard(),
-		Scope:        e.scope,
-		ProcessEntry: e.processClaimsEntry,
+		AgentID:           e.id,
+		SessionID:         e.config.SessionID,
+		Bus:               bus,
+		Board:             e.engineerBoard(),
+		Scope:             e.scope,
+		ProcessEntry:      e.processClaimsEntry,
+		Identity:          e.identity,
+		Factory:           e.factory,
+		ContinuationStore: e.continuationStore,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("engineer_claims_inbox_start_failed", "error", err.Error())
@@ -522,6 +539,10 @@ func (e *Engineer) Stop() error {
 	if e.claimsInbox != nil {
 		_ = e.claimsInbox.Close()
 		e.claimsInbox = nil
+	}
+	if e.continuationStore != nil {
+		e.continuationStore.Stop("engineer stopped")
+		e.continuationStore = nil
 	}
 
 	e.steering.CloseAll()
@@ -756,6 +777,18 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		}
 	}
 
+	// Cycle-aware accumulator: honors envelope parent_claim_id for
+	// consult/challenge fulfillments (binds to the consultation/
+	// challenge claim, not the guide's route claim). UI_DESIGN.md
+	// §4.7.3 — Layer 3 cycle-context propagation.
+	var flushAccumulator func()
+	var beginErr error
+	ctx, flushAccumulator, beginErr = shared.BeginForwardedRequestCycle(ctx, e.id, fwd, e.scope)
+	if beginErr != nil {
+		return beginErr
+	}
+	defer flushAccumulator()
+
 	result, err := e.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(e.steering.EventLogger(), fwd.CorrelationID, e.id, fwd.SessionID, time.Since(startTime), err)
 
@@ -872,36 +905,25 @@ func (e *Engineer) intentHandler(intent guide.Intent) (forwardedHandler, error) 
 	}
 }
 
-// handleImplement processes implementation requests (coding tasks)
+// handleImplement processes ForwardedRequest implementation prompts.
+// Pipeline-task dispatch no longer arrives through this path: the
+// orchestrator posts an action_type=task claim on the session's
+// claims board with the engineer as subject, and the engineer's
+// ClaimsInbox dispatches into processClaimsEntry on the engineer's
+// scope. This path remains for free-form ForwardedRequest prompts
+// (peer consultations, ad-hoc invocations) that haven't been
+// migrated to the claims board surface.
 func (e *Engineer) handleImplement(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	taskID := uuid.New().String()
-	prompt := fwd.Input
-	var pipelineTask *shared.PipelineTaskInput
-	if task := shared.DecodePipelineTaskInput(fwd.Input); task != nil {
-		pipelineTask = task
-		if strings.TrimSpace(task.TaskID) != "" {
-			taskID = task.TaskID
-		}
-		prompt = shared.ComposePipelineTaskUserPrompt(task)
-		if workspaceContext := shared.BuildTaskWorkspaceRuntimeContext(ctx, e.workspaceViews, task); workspaceContext != "" {
-			prompt += "\n\n" + workspaceContext
-		}
-	}
-
-	// Create task request
 	req := &EngineerRequest{
 		ID:                  uuid.New().String(),
 		Intent:              IntentComplete,
-		TaskID:              taskID,
-		Prompt:              prompt,
-		PipelineTask:        pipelineTask,
+		TaskID:              uuid.New().String(),
+		Prompt:              fwd.Input,
 		ConversationHistory: fwd.ConversationHistory,
 		EngineerID:          e.id,
 		SessionID:           e.config.SessionID,
 		Timestamp:           time.Now(),
 	}
-
-	// Handle the task using the composed engineer prompt and tool loop.
 	return e.Handle(ctx, req)
 }
 
@@ -999,10 +1021,14 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (_ *Enginee
 	// Prepend conversation history as multi-turn message pairs.
 	shared.PrependHistoryMessages(llmReq, req.ConversationHistory)
 
-	// Step 4: Execute tool loop
+	// Step 4: Execute tool loop. Synchronously-driven engineer turn —
+	// caller awaits the response. Don't stamp WithContinuationStore;
+	// consult_peer falls through to inline RouteSync so the loop
+	// completes before this function returns.
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return e.executeToolLoopWithSurface(ctx, llmReq, ledger, surface)
+	loopCtx := ctx
+	result, err := shared.ExecuteTurnLoop(loopCtx, ledger, llmReq, func() (string, error) {
+		return e.executeToolLoopWithSurface(loopCtx, llmReq, ledger, surface)
 	})
 	if err != nil {
 		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventError,

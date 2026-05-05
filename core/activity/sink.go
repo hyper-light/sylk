@@ -111,8 +111,27 @@ func SetDefaultSource(source Source) (previous Source) {
 // Append routes an activity to the default sink. Increments the
 // process-wide counter unconditionally so metrics reflect emission
 // intent even when sinks discard.
+//
+// Handoff guard (UI_DESIGN.md §4.7.1): for activities classified as a
+// handoff (Action == ActionHandoffEmitted, OR
+// Subject.Coordinates["handoff_from_claim_id"] non-empty), the
+// process-wide HandoffGuard is consulted. Refusal causes the activity
+// to be dropped before reaching any sink, matching the board's
+// PostAction guard for ActionTypeHandoff. The drop is silent at the
+// activity layer; the guard's implementation is responsible for
+// surfacing the rejection back to the publishing agent (typically as
+// a structured artifact on its testament accumulator).
 func Append(ctx context.Context, a AgentActivity) {
 	emissionsTot.Add(1)
+	if predecessor, ok := classifyHandoff(a); ok {
+		if guard := loadHandoffGuard(); guard != nil {
+			if err := guard.Verify(ctx, a.Actor.AgentID, string(a.SessionID), predecessor); err != nil {
+				// Drop the handoff activity. The guard implementation
+				// has already logged + surfaced the rejection.
+				return
+			}
+		}
+	}
 	DefaultSink().Append(ctx, a)
 }
 

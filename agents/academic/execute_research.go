@@ -1333,7 +1333,7 @@ func (a *Academic) runArchitectResearchProtocol(
 	}
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	text, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+	text, err := shared.ExecuteTurnLoop(ctx, ledger, llmReq, func() (string, error) {
 		return a.executeToolLoop(ctx, llmReq, ledger, surface)
 	})
 	if err != nil {

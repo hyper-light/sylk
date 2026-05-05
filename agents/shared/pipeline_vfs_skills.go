@@ -92,7 +92,7 @@ func vfsTerminalUpdateTask(ctx context.Context, cfg PipelineVFSSkillConfig) *Pip
 		DAGID:         pipelineTaskMetadataString(stream.Metadata, "dag_id"),
 		TaskID:        taskID,
 		AgentType:     agentType,
-		TargetAgentID: PipelineWorkerRoutingTarget(taskID, normalizePipelineAgentType(agentType)),
+		TargetAgentID: PipelineWorkerCanonicalID(sessionID, taskID, normalizePipelineAgentType(agentType)),
 		SessionID:     sessionID,
 		Context:       contextData,
 	}

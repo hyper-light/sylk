@@ -552,15 +552,41 @@ func (m *ConversationFlowManager) SessionClaimsBoard(sessionID string, scope cla
 		}
 	}
 	if state.claimsBoard == nil {
-		state.claimsBoard = claims.NewClaimsBoard(claims.ClaimsBoardConfig{
-			BoardID:   "session-" + trimmedSession,
-			SessionID: trimmedSession,
-			TaskID:    "session",
-			Scope:     scope,
-		})
-		// Register in the global registry so knowledge agents and
-		// other agents can resolve the board from their session ID.
-		claims.DefaultSessionBoardRegistry().Register(trimmedSession, state.claimsBoard)
+		// The session manager is the canonical owner of the session's
+		// root claims board: it constructs the board with the wired
+		// Scope (for tracked async amplifier emissions) and DeltaBus
+		// (for inbox topic projection onto the bus that pipeline
+		// workers subscribe to). The registry's Register is
+		// first-write-wins, so even if this lazy path raced ahead and
+		// constructed a board, calling Register a second time on the
+		// same session ID would surface ErrSessionBoardAlreadyRegistered
+		// rather than silently shadow the manager's wiring. We rely on
+		// that contract here: prefer the registered board, only fall
+		// back to constructing a fresh one when nothing has registered.
+		if existing := claims.DefaultSessionBoardRegistry().Lookup(trimmedSession); existing != nil {
+			state.claimsBoard = existing
+		} else {
+			fresh := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+				BoardID:   "session-" + trimmedSession,
+				SessionID: trimmedSession,
+				TaskID:    "session",
+				Scope:     scope,
+			})
+			if err := claims.DefaultSessionBoardRegistry().Register(trimmedSession, fresh); err != nil {
+				// Lost the race to a writer with proper wiring; adopt
+				// theirs. If even Lookup returns nil now (unlikely),
+				// the registry is in an inconsistent state — fall
+				// through to use the fresh board to keep the call site
+				// progressing rather than block on a nil board.
+				if existing := claims.DefaultSessionBoardRegistry().Lookup(trimmedSession); existing != nil {
+					state.claimsBoard = existing
+				} else {
+					state.claimsBoard = fresh
+				}
+			} else {
+				state.claimsBoard = fresh
+			}
+		}
 	}
 	m.sessions[trimmedSession] = state
 	return state.claimsBoard

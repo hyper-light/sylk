@@ -41,27 +41,39 @@ func TestPipelineInspectorSystemPromptForContract_IncludesValidationProtocolWith
 		PreImplementation: false,
 	})
 
+	// The implementation-validation protocol is claims-native (per
+	// CLAIMS.md §5.10): the historical `pipeline_protocol(action=...)`
+	// envelope and the `inspector_forest_consult(purpose=...)` skill
+	// are gone, replaced by post_action / evaluate_validation /
+	// submit_testaments / consult_peer. These assertions track what
+	// the prompt actually instructs today.
 	for _, want := range []string{
-		"Dispatch Tester first for initial red/spec tests before Engineer or Designer so tests shape implementation instead of trailing it",
-		"Use `pipeline_protocol(action=handoff)` for the normal top-level phase flow",
-		"Your first `pipeline_protocol(action=challenge)` call to Tester, Engineer, or Designer is allowed.",
-		"you may challenge that same target again only if that target has modified pipeline VFS state since your previous challenge to that target.",
-		"Use `pipeline_protocol(action=challenge)` only when returned peer work is unclear, off-spec, incomplete, or otherwise needs a targeted follow-up.",
-		"After Tester hands back the initial authored tests, audit those tests against your criteria.",
-		"After Engineer or Designer hand work back, audit the implementation against your criteria and the current tests.",
-		"Use `evaluate_validation` immediately when another agent answers one of your challenges.",
-		"If a challenge response resolves the current audit gap, continue from that evidence.",
-		"Push Engineer and Designer like a seasoned staff engineer reviewing senior-level code: audit correctness, robustness, performance, scope discipline, and production quality; penalize excess code, premature abstraction, verbosity, and agentic slop.",
-		"Push Tester to prove the test surface adds real value; penalize noisy, arbitrary, or low-quality tests that expand coverage surface without materially improving confidence.",
-		"`inspector_forest_consult(purpose=get_validation_targets, query=…)`",
-		"`inspector_forest_consult(purpose=get_regression_precedents, query=…)`",
-		"Use `finalize_pipeline` only after you have completed the current inspector audit and processed any challenge responses needed for that audit.",
-		"`finalize_pipeline` is the closure gate, not the default substitute for a targeted challenge.",
+		// TDD-first ordering: Tester gets the initial test-authoring
+		// turn before Engineer or Designer.
+		"Default to TDD: after criteria are clear, use `post_action(kind=task)` to send Tester the initial test-authoring turn unless the task is strictly inspection-only.",
+		// Audit-on-handback: tester tests, then engineer/designer work.
+		"When Tester hands back those initial tests with `post_action(kind=task)`, audit the test artifacts yourself.",
+		"When Engineer or Designer hand work back with `post_action(kind=task)`, audit the implementation against your criteria and the current tests before deciding the next step.",
+		// Challenge discipline: targeted, not broad re-loops.
+		"Use `post_action(kind=challenge)` only for targeted uncertainty in returned work.",
+		// Evaluation must precede next dispatch.
+		"When a peer responds to your challenge, call `evaluate_validation` before choosing the next handoff, challenge, or closure action.",
+		// VFS-state gate on repeat challenges.
+		"Before repeating a challenge to Tester, Engineer, or Designer, confirm that same target changed pipeline VFS state since your previous challenge to that target;",
+		// Quality bars on the implementer agents.
+		"Push Engineer and Designer on correctness, robustness, performance, scope discipline, and production quality; penalize excessive code, premature abstraction, verbosity, and agentic slop.",
+		"Push Tester to justify the value of the tests it added; penalize noisy or low-signal testing surface that does not materially increase confidence.",
+		// Knowledge-agent routing for factual gaps.
+		"consult_peer(target_agent_type=librarian|academic|archivalist, query=…)",
+		// Closure gate discipline.
 		"Use `validate_criteria` and `grade_task_quality` only when a specific unresolved gap remains that the current returned work, challenge response, or protocol state does not already answer.",
+		"Use `finalize_pipeline` only after the current inspector audit is complete and any challenge responses needed for that audit have been evaluated with `evaluate_validation`.",
+		"`finalize_pipeline` is the closure gate.",
 		"When `finalize_pipeline` requests the final tester-backed acceptance audit, Tester should answer with `submit_testaments`",
 		"If the `finalize_pipeline` audit passes and tester evidence confirms the required tests are implemented and passing, you must immediately invoke `handoff_to_ot` and stop looping.",
 		"If `finalize_pipeline` returns `ready_for_ot: true` or `must_handoff_to_ot: true`, your very next assistant action must be the `handoff_to_ot` tool call.",
 		"Use `handoff_to_ot` only when you are satisfied that the latest `finalize_pipeline` closure step passed and the pipeline should terminate successfully, and do not start another audit cycle once `finalize_pipeline` reports readiness for OT.",
+		// Workspace boundaries (composed by BuildWorkspaceViewContext).
 		"# Workspace Layers",
 		"Pipeline VFS: task-scoped unmerged in-progress work for the active pipeline.",
 		"The brokered `bash` execution tool runs against that same layered workspace view",
@@ -77,6 +89,12 @@ func TestPipelineInspectorSystemPromptForContract_IncludesValidationProtocolWith
 			t.Fatalf("implementation-validation prompt missing %q", want)
 		}
 	}
+	// Original regressions: workflow-leak skills the protocol rewrite
+	// excluded from the prompt's tool surface. The pipeline_protocol
+	// envelope is still referenced by system_skills.md (the skill
+	// surface itself remains while the protocol is migrated to
+	// claims-native primitives), so it is intentionally not in the
+	// blocked set yet — that comes when the skill is retired.
 	for _, blocked := range []string{"`detect_race_conditions`", "`check_coverage`"} {
 		if strings.Contains(prompt, blocked) {
 			t.Fatalf("implementation-validation prompt unexpectedly contains %q", blocked)

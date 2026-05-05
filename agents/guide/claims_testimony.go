@@ -62,22 +62,30 @@ func (g *Guide) guideSubmitTestamentAsync(sessionID string, testament claims.Tes
 	}
 }
 
-// guideRouteClaim builds a route claim issued by the guide against a target agent.
-func guideRouteClaim(title, description, targetAgent, sessionID, correlationID string, validations []*claims.Validation) claims.Claim {
-	return claims.Claim{
-		Title:       title,
-		Description: description,
-		Scope: []claims.ClaimScopeEntry{
+// guideHandoffClaim builds a handoff claim transferring top-level
+// cycle ownership from the guide to the target agent (UI_DESIGN.md
+// §2.2 + §5.2). Both the fast-path conversational continuity route
+// and the post-classification forward dispatch are structurally
+// handoffs: the guide's classification phase ends, the target agent's
+// cycle picks up ownership of the user's turn. Tagging this as
+// ActionTypeTask (the prior shape) hid those transitions behind plain
+// task semantics, broke the bridge's cycle resolver edge detection,
+// and produced the "self handoff" symptom whenever classification
+// resolved to the guide itself (since issuer==subject==guide collapsed
+// to an audit self-claim under the amplifier's filter).
+//
+// predecessorClaimID is empty for guide handoffs: the user prompt is
+// not a claim, so there's no predecessor cycle root to anchor.
+func guideHandoffClaim(title, description, targetAgent, sessionID, correlationID string, validations []*claims.Validation) claims.Claim {
+	return claims.BuildHandoffClaim(
+		title, description,
+		"guide", targetAgent, "",
+		[]claims.ClaimScopeEntry{
 			{Kind: "session", Key: sessionID},
 			{Kind: "correlation", Key: correlationID},
 		},
-		ActionType: claims.ActionTypeTask,
-		Relations: []claims.Relation{
-			{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
-			{Related: targetAgent, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
-		},
-		Validations: validations,
-	}
+		validations,
+	)
 }
 
 // guideCorrectiveClaim builds a corrective claim that supersedes a prior route.
@@ -292,7 +300,18 @@ func (g *Guide) processClaimsEntry(ctx context.Context, entry *claims.GraphEntry
 		return nil
 	}
 
+	// Bind to the entry's parent claim so any artifacts the guide
+	// emits during claim-driven processing nest under the issuer's
+	// peer-interaction row in the chat tree (UI_DESIGN.md §4.7.3).
+	// Inline rather than via shared.NewClaimsEntryAccumulator —
+	// agents/guide cannot import agents/shared (circular).
 	acc := claims.NewTestamentAccumulator("guide", g.sessionID)
+	acc.WithBoard(guideBoard(g.sessionID))
+	if entry != nil && entry.Node.Claim != nil {
+		if id := strings.TrimSpace(entry.Node.Claim.ID); id != "" {
+			acc.WithClaimID(id)
+		}
+	}
 	defer acc.Flush(ctx, guideBoard(g.sessionID), g.guideScope())
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())

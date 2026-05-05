@@ -26,6 +26,7 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/planapproval"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -100,7 +101,14 @@ func (g *Guardian) requestPlanApproval(ctx context.Context, req *planApprovalReq
 	}
 
 	// Post claim: architect asks guardian to present plan for user acceptance.
-	sessionID := g.activeSessionID
+	// Read session from ctx first (fast-path callers populate ctx with the
+	// request's session_id directly; serialized callers also have it via
+	// versioning.WithSessionID). Fall back to g.activeSessionID for the
+	// legacy serialized path that hasn't yet been migrated to ctx.
+	sessionID := strings.TrimSpace(string(versioning.SessionIDFromContext(ctx)))
+	if sessionID == "" {
+		sessionID = g.activeSessionID
+	}
 	planTitle := strings.TrimSpace(req.PlanName)
 	if planTitle == "" {
 		planTitle = req.PlanID

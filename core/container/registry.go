@@ -3,113 +3,114 @@ package container
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
+
+	"github.com/benbjohnson/immutable"
 )
 
 var (
-	ErrContainerNotFound  = errors.New("container not found")
-	ErrContainerExists    = errors.New("container already registered")
-	ErrPodNotFound = errors.New("pod not found")
+	ErrContainerNotFound = errors.New("container not found")
+	ErrContainerExists   = errors.New("container already registered")
+	ErrPodNotFound       = errors.New("pod not found")
 )
 
+// registrySnapshot is the immutable view of the registry. Reads load
+// the current snapshot pointer atomically and traverse it without any
+// lock; writers build a new snapshot off the current one (HAMT
+// structural sharing reuses every untouched subtree) and publish it
+// with a single atomic.Pointer.Store.
+//
+// All four indexes are immutable.Map: O(log N) Set/Delete, O(log N)
+// Get, no full-map clone on mutation. The byType and byPod indexes
+// hold inner immutable.Map[ContainerID, struct{}] sets so adding or
+// removing a container from a type/pod bucket also avoids cloning the
+// whole bucket.
+type registrySnapshot struct {
+	byID   *immutable.Map[ContainerID, *Container]
+	byType *immutable.Map[string, *immutable.Map[ContainerID, struct{}]]
+	byPod  *immutable.Map[PodID, *immutable.Map[ContainerID, struct{}]]
+	pods   *immutable.Map[PodID, struct{}]
+}
+
+func newEmptyRegistrySnapshot() *registrySnapshot {
+	return &registrySnapshot{
+		byID:   immutable.NewMap[ContainerID, *Container](nil),
+		byType: immutable.NewMap[string, *immutable.Map[ContainerID, struct{}]](nil),
+		byPod:  immutable.NewMap[PodID, *immutable.Map[ContainerID, struct{}]](nil),
+		pods:   immutable.NewMap[PodID, struct{}](nil),
+	}
+}
+
 // ContainerRegistry provides thread-safe lookup of active containers.
-// Containers are indexed by ID, agent type, and pod ID for efficient queries.
+// Reads (Get/ListByType/ListByPod/Count/All/HasPod/PodCount) are
+// lock-free: load the snapshot pointer once, traverse the immutable
+// index. Writes serialize on writeMu so only one mutator builds the
+// next snapshot at a time; concurrent readers that loaded the prior
+// snapshot continue to see a consistent view until they finish.
 type ContainerRegistry struct {
-	mu        sync.RWMutex
-	byID      map[ContainerID]*Container
-	byType    map[string]map[ContainerID]struct{} // agentType → set of IDs
-	byPod     map[PodID]map[ContainerID]struct{}  // podID → set of IDs
-	pods      map[PodID]struct{}
+	writeMu sync.Mutex
+	state   atomic.Pointer[registrySnapshot]
 }
 
 // NewContainerRegistry creates an empty registry.
 func NewContainerRegistry() *ContainerRegistry {
-	return &ContainerRegistry{
-		byID:   make(map[ContainerID]*Container),
-		byType: make(map[string]map[ContainerID]struct{}),
-		byPod:  make(map[PodID]map[ContainerID]struct{}),
-		pods:   make(map[PodID]struct{}),
-	}
+	r := &ContainerRegistry{}
+	r.state.Store(newEmptyRegistrySnapshot())
+	return r
 }
 
 // Register adds a container to the registry. Returns ErrContainerExists
 // if a container with the same ID is already registered.
 func (r *ContainerRegistry) Register(c *Container) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 
-	if _, exists := r.byID[c.id]; exists {
+	cur := r.state.Load()
+	if _, exists := cur.byID.Get(c.id); exists {
 		return ErrContainerExists
 	}
 
-	r.byID[c.id] = c
-	r.indexByType(c)
-	r.indexByPod(c)
+	next := &registrySnapshot{
+		byID:   cur.byID.Set(c.id, c),
+		byType: addToBucket(cur.byType, c.spec.AgentType, c.id),
+		byPod:  cur.byPod,
+		pods:   cur.pods,
+	}
+	if c.podID != "" {
+		next.byPod = addToBucket(cur.byPod, c.podID, c.id)
+	}
+	r.state.Store(next)
 	return nil
 }
 
-func (r *ContainerRegistry) indexByType(c *Container) {
-	agentType := c.spec.AgentType
-	if r.byType[agentType] == nil {
-		r.byType[agentType] = make(map[ContainerID]struct{})
-	}
-	r.byType[agentType][c.id] = struct{}{}
-}
-
-func (r *ContainerRegistry) indexByPod(c *Container) {
-	if c.podID == "" {
-		return
-	}
-	if r.byPod[c.podID] == nil {
-		r.byPod[c.podID] = make(map[ContainerID]struct{})
-	}
-	r.byPod[c.podID][c.id] = struct{}{}
-}
-
-// Unregister removes a container from the registry.
+// Unregister removes a container from the registry. No-op if the
+// container ID is not present.
 func (r *ContainerRegistry) Unregister(id ContainerID) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 
-	c, exists := r.byID[id]
+	cur := r.state.Load()
+	c, exists := cur.byID.Get(id)
 	if !exists {
 		return
 	}
 
-	delete(r.byID, id)
-	r.removeTypeIndex(c)
-	r.removePodIndex(c)
-}
-
-func (r *ContainerRegistry) removeTypeIndex(c *Container) {
-	typeSet := r.byType[c.spec.AgentType]
-	if typeSet == nil {
-		return
+	next := &registrySnapshot{
+		byID:   cur.byID.Delete(id),
+		byType: removeFromBucket(cur.byType, c.spec.AgentType, c.id),
+		byPod:  cur.byPod,
+		pods:   cur.pods,
 	}
-	delete(typeSet, c.id)
-	if len(typeSet) == 0 {
-		delete(r.byType, c.spec.AgentType)
+	if c.podID != "" {
+		next.byPod = removeFromBucket(cur.byPod, c.podID, c.id)
 	}
-}
-
-func (r *ContainerRegistry) removePodIndex(c *Container) {
-	if c.podID == "" {
-		return
-	}
-	podSet := r.byPod[c.podID]
-	if podSet == nil {
-		return
-	}
-	delete(podSet, c.id)
-	if len(podSet) == 0 {
-		delete(r.byPod, c.podID)
-	}
+	r.state.Store(next)
 }
 
 // Get returns the container with the given ID, or ErrContainerNotFound.
 func (r *ContainerRegistry) Get(id ContainerID) (*Container, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	c, ok := r.byID[id]
+	snap := r.state.Load()
+	c, ok := snap.byID.Get(id)
 	if !ok {
 		return nil, ErrContainerNotFound
 	}
@@ -118,77 +119,113 @@ func (r *ContainerRegistry) Get(id ContainerID) (*Container, error) {
 
 // ListByType returns all containers of the given agent type.
 func (r *ContainerRegistry) ListByType(agentType string) []*Container {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	ids := r.byType[agentType]
-	result := make([]*Container, 0, len(ids))
-	for id := range ids {
-		if c, ok := r.byID[id]; ok {
-			result = append(result, c)
-		}
+	snap := r.state.Load()
+	bucket, ok := snap.byType.Get(agentType)
+	if !ok {
+		return nil
 	}
-	return result
+	return collectFromBucket(snap, bucket)
 }
 
 // ListByPod returns all containers belonging to the given pod.
 func (r *ContainerRegistry) ListByPod(podID PodID) []*Container {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	ids := r.byPod[podID]
-	result := make([]*Container, 0, len(ids))
-	for id := range ids {
-		if c, ok := r.byID[id]; ok {
-			result = append(result, c)
-		}
+	snap := r.state.Load()
+	bucket, ok := snap.byPod.Get(podID)
+	if !ok {
+		return nil
 	}
-	return result
+	return collectFromBucket(snap, bucket)
 }
 
 // Count returns the total number of registered containers.
 func (r *ContainerRegistry) Count() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return len(r.byID)
+	return r.state.Load().byID.Len()
 }
 
 // All returns a snapshot of all registered containers.
 func (r *ContainerRegistry) All() []*Container {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	result := make([]*Container, 0, len(r.byID))
-	for _, c := range r.byID {
-		result = append(result, c)
+	snap := r.state.Load()
+	out := make([]*Container, 0, snap.byID.Len())
+	iter := snap.byID.Iterator()
+	for !iter.Done() {
+		_, c, _ := iter.Next()
+		out = append(out, c)
 	}
-	return result
+	return out
 }
 
 // RegisterPod records a pod ID in the registry.
 func (r *ContainerRegistry) RegisterPod(id PodID) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.pods[id] = struct{}{}
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	cur := r.state.Load()
+	next := *cur
+	next.pods = cur.pods.Set(id, struct{}{})
+	r.state.Store(&next)
 }
 
 // UnregisterPod removes a pod ID from the registry.
 func (r *ContainerRegistry) UnregisterPod(id PodID) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.pods, id)
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	cur := r.state.Load()
+	next := *cur
+	next.pods = cur.pods.Delete(id)
+	r.state.Store(&next)
 }
 
 // HasPod returns true if the pod ID is registered.
 func (r *ContainerRegistry) HasPod(id PodID) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	_, ok := r.pods[id]
+	_, ok := r.state.Load().pods.Get(id)
 	return ok
 }
 
 // PodCount returns the number of registered pods.
 func (r *ContainerRegistry) PodCount() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return len(r.pods)
+	return r.state.Load().pods.Len()
+}
+
+// addToBucket returns a new index map with id added to the bucket
+// keyed by k. The bucket is created (as an empty inner map) if it
+// does not yet exist. Both the outer and inner maps share structure
+// with their predecessors.
+func addToBucket[K comparable](idx *immutable.Map[K, *immutable.Map[ContainerID, struct{}]], k K, id ContainerID) *immutable.Map[K, *immutable.Map[ContainerID, struct{}]] {
+	bucket, ok := idx.Get(k)
+	if !ok {
+		bucket = immutable.NewMap[ContainerID, struct{}](nil)
+	}
+	bucket = bucket.Set(id, struct{}{})
+	return idx.Set(k, bucket)
+}
+
+// removeFromBucket returns a new index map with id removed from the
+// bucket keyed by k. If the bucket becomes empty after removal, the
+// bucket entry itself is deleted from the outer map so iteration over
+// agent types / pods stays cheap.
+func removeFromBucket[K comparable](idx *immutable.Map[K, *immutable.Map[ContainerID, struct{}]], k K, id ContainerID) *immutable.Map[K, *immutable.Map[ContainerID, struct{}]] {
+	bucket, ok := idx.Get(k)
+	if !ok {
+		return idx
+	}
+	bucket = bucket.Delete(id)
+	if bucket.Len() == 0 {
+		return idx.Delete(k)
+	}
+	return idx.Set(k, bucket)
+}
+
+// collectFromBucket reads container pointers out of the snapshot's
+// byID map for every entry in bucket. Reading from the same snapshot
+// that produced the bucket guarantees a consistent view: a container
+// observed in the bucket is also observable in byID.
+func collectFromBucket(snap *registrySnapshot, bucket *immutable.Map[ContainerID, struct{}]) []*Container {
+	out := make([]*Container, 0, bucket.Len())
+	iter := bucket.Iterator()
+	for !iter.Done() {
+		id, _, _ := iter.Next()
+		if c, ok := snap.byID.Get(id); ok {
+			out = append(out, c)
+		}
+	}
+	return out
 }

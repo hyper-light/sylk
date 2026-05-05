@@ -36,24 +36,33 @@ func (a *designerScopeAdapter) Go(desc string, timeout time.Duration, fn func(co
 }
 
 // designerPostClaim posts a claim async via scope. Best-effort.
+// Registers a just-in-time response Expectation on the designer's
+// inbox after a successful PostAction (CLAIMS.md §5).
 func (d *Designer) designerPostClaim(ctx context.Context, action claims.Action, claim claims.Claim) {
 	board := d.designerBoard()
 	if board == nil {
 		return
 	}
+	posted := []claims.Claim{claim}
 	if d.scope != nil {
 		if err := d.scope.Go("designer_post_claim", 5*time.Second, func(gctx context.Context) error {
-			return board.PostAction(gctx, action, []claims.Claim{claim})
+			if err := board.PostAction(gctx, action, posted); err != nil {
+				return err
+			}
+			claims.RegisterPostActionExpectations(d.claimsInbox, action, posted)
+			return nil
 		}); err != nil {
 			slog.Error("designer_post_claim_dispatch_failed", "error", err.Error())
 			board.RecordNotificationError("designer post claim dispatch: " + err.Error())
 		}
 		return
 	}
-	if err := board.PostAction(ctx, action, []claims.Claim{claim}); err != nil {
+	if err := board.PostAction(ctx, action, posted); err != nil {
 		slog.Error("designer_post_claim_failed", "error", err.Error())
 		board.RecordNotificationError("designer post claim: " + err.Error())
+		return
 	}
+	claims.RegisterPostActionExpectations(d.claimsInbox, action, posted)
 }
 
 // designerSubmitTestament submits a testament async via scope. Best-effort.
@@ -150,15 +159,37 @@ func (d *Designer) processClaimsEntry(ctx context.Context, entry *claims.GraphEn
 	if entry == nil {
 		return nil
 	}
+	claimID := ""
+	claimTitle := ""
+	if entry.Node.Claim != nil {
+		claimID = entry.Node.Claim.ID
+		claimTitle = entry.Node.Claim.Title
+	}
+	slog.Info("designer_process_claims_entry_begin",
+		"designer_id", d.id,
+		"session_id", d.config.SessionID,
+		"delta_kind", entry.Delta.DeltaKind(),
+		"delta_key", entry.Delta.DeltaKey(),
+		"claim_id", claimID,
+		"claim_title", claimTitle,
+		"board_present", d.designerBoard() != nil,
+	)
 	p := d.getProvider()
 	if p == nil {
+		slog.Error("designer_process_claims_entry_no_provider", "designer_id", d.id)
 		return fmt.Errorf("designer: LLM provider not configured")
 	}
 
-	acc := claims.NewTestamentAccumulator("designer", d.config.SessionID)
+	acc := shared.NewClaimsEntryAccumulator("designer", d.config.SessionID, entry)
+	acc.WithBoard(d.designerBoard())
 	defer acc.Flush(ctx, d.designerBoard(), d.designerScope())
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
+
+	if entry.Node.Claim != nil {
+		shared.RecordAgentState(ctx, d.designerBoard(), entry.Node.Claim.ID,
+			"Acknowledging request", shared.AgentStateReasoning, nil)
+	}
 
 	userMessage := shared.ComposeClaimsEntryPrompt(entry)
 	userMessage = claims.PrependBoardPreamble(userMessage, d.claimsBoard, "designer")
@@ -178,7 +209,15 @@ func (d *Designer) processClaimsEntry(ctx context.Context, entry *claims.GraphEn
 	ledger := d.steering.Create(entry.Delta.DeltaKey(), d.id, d.config.SessionID, nil, nil)
 	defer d.steering.Close(entry.Delta.DeltaKey(), ctx.Err() != nil)
 
-	result, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	ctx = shared.WithContinuationStore(ctx, d.continuationStore)
+	ctx = shared.WithTurnContext(ctx, &shared.TurnContext{
+		Request:       req,
+		CorrelationID: designerLedgerCorrelation(ledger, d.config.SessionID),
+		AgentID:       d.id,
+		SessionID:     d.config.SessionID,
+	})
+
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return d.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {

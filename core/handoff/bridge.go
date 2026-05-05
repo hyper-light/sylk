@@ -776,7 +776,7 @@ func (b *HandoffBridge) triggerHandoff(rec *HandoffRecommendation) {
 	b.mu.RUnlock()
 
 	handoffPostClaim(bp, context.Background(),
-		claims.Action{AgentID: "handoff_bridge", Type: claims.ActionTypeTask},
+		claims.Action{AgentID: "handoff_bridge", Type: claims.ActionTypeHandoff},
 		handoffClaim(
 			"Handoff "+agentID+" — "+rec.Trigger.String(),
 			rec.Reason,
@@ -1122,7 +1122,7 @@ func (b *HandoffBridge) handleHandoffResult(result *HandoffResult) error {
 	if bp != nil {
 		if board := bp(); board != nil {
 			handoffPostClaim(bp, context.Background(),
-				claims.Action{AgentID: "handoff_bridge", Type: claims.ActionTypeTask},
+				claims.Action{AgentID: "handoff_bridge", Type: claims.ActionTypeHandoff},
 				handoffClaim(
 					"Continue work from handoff",
 					"Previous agent handed off. Resume directed claims.",
@@ -1299,7 +1299,16 @@ func (b *HandoffBridge) emitHandoffActivity(
 	evt.CorrelationID = meta.CorrelationID
 	evt.AgentID = b.agent.AgentID()
 	evt.Outcome = outcome
-	evt.Visibility = events.VisibilityUser
+	// Context handoffs are an internal LLM-context-window-management
+	// mechanism — when an agent's context fills, it hands off to a
+	// fresh instance and transfers state. The user doesn't need (or
+	// want) to see this in the agent panel; it's housekeeping, not
+	// real agent work. Painting it as user-visible activity makes
+	// agents look like they're doing work during plan review when
+	// they're really just rotating their context. System visibility
+	// keeps the events for debugging/telemetry but suppresses them
+	// from the user-facing agent panel.
+	evt.Visibility = events.VisibilitySystem
 	evt.Data = payload
 	pub.PublishActivity(evt)
 }

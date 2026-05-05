@@ -149,7 +149,15 @@
       "Bash(sqlite3 /tmp/content.recovered.sqlite \"SELECT name, \\(SELECT COUNT\\(*\\) FROM sqlite_master m WHERE m.type='index' AND m.tbl_name=t.name\\) AS idx_cnt FROM sqlite_master t WHERE t.type='table' ORDER BY name;\")",
       "Bash(sqlite3 *)",
       "Bash(/tmp/sylk-test --help)",
-      "Bash(echo \"EXIT=$?\")"
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(patch -p1 --dry-run)",
+      "Bash(patch -p1 --merge=diff3)",
+      "Bash(patch -p1)",
+      "Bash(patch -p1 -N)",
+      "Bash(bash -n /Users/adalundhe/Projects/sylk/scripts/ci/build-release.sh)",
+      "Bash(/usr/bin/python3 -c ' *)",
+      "Bash(ruby -ryaml -e 'YAML.load_file\\(\"/Users/adalundhe/Projects/sylk/.github/workflows/build.yml\"\\); puts \"yaml:ok\"')",
+      "Bash(ugrep -rn \"func.*processClaimsEntry\\\\b\" --include='*.go' agents/)"
     ]
   }
 }

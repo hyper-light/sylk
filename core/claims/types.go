@@ -61,6 +61,13 @@ const (
 	RelationshipReviews      = "reviews"       // evaluates the related object
 	RelationshipAmends       = "amends"        // modifies but does not replace the related object
 	RelationshipDirectAddressed = "direct_addressed" // user directly addressed this agent
+
+	// Cycle / lifecycle relationships (UI_DESIGN.md §2.6). The bridge's
+	// cycle resolver reads these to compute parent/child attribution and
+	// to pair started/completed artifacts; nothing in the agent runtime
+	// or the UI walks them directly.
+	RelationshipHandoffFrom = "handoff_from" // successor cycle root → predecessor cycle root
+	RelationshipCompletes   = "completes"    // completion artifact → started artifact
 )
 
 // RelatedTypeXxx constants for Relation.RelatedType.
@@ -127,7 +134,78 @@ const (
 	ActionTypeBoot         ActionType = "boot"         // boot pipeline phase execution
 	ActionTypeActivation   ActionType = "activation"   // agent container activation
 	ActionTypeShutdown     ActionType = "shutdown"      // graceful agent shutdown
+	ActionTypeHandoff      ActionType = "handoff"       // clean transfer of top-level cycle ownership (UI_DESIGN.md §2.2)
+	ActionTypeCheckpoint   ActionType = "checkpoint"    // Guardian-issued safety checkpoint requiring user approval (e.g. periodic git safety snapshot)
+	// ActionTypeGuardianCheck is the structured claim posted by the
+	// tool runtime when an approval-gated tool needs guardian review.
+	// Subject = "guardian"; the responding testament carries the
+	// grant verdict (allow/deny). The bridge nests guardian's
+	// processing artifacts under the calling tool's
+	// guardian_check_started row via the structured claim ID stamped
+	// on the artifact's metadata. See docs/CLAIMS_UI.md §5.3.
+	ActionTypeGuardianCheck ActionType = "guardian_check"
+	// ActionTypeConsultContinuation is a claim type that captures the
+	// serialized LLM turn state of an agent that yielded mid-tool-loop
+	// to await peer consults. The agent posts one of these claims when
+	// the LLM calls await_consults; the artifact carries the snapshot
+	// (messages, tools, accumulator, ledger, awaited consult IDs).
+	// When the awaited consults all resolve, the agent's inbox
+	// dispatcher resumes the continuation: re-acquires a replica,
+	// restores the snapshot, and re-enters ExecuteTurnLoop.
+	//
+	// System-internal: the continuation is the agent's own bookkeeping
+	// (not a peer-to-self request) so it MUST NOT wake other agents
+	// via the inbox-delta path. IsSystemInternalAction returns true
+	// for this type and AgentActivationActionTypes excludes it.
+	ActionTypeConsultContinuation ActionType = "consult_continuation"
 )
+
+// IsSystemInternalAction reports whether an ActionType is system-
+// internal — i.e. a lifecycle / housekeeping action that exists for
+// the runtime's own bookkeeping and MUST NOT trigger agent inference
+// via the inbox-delta path. The amplifier skips InboxDelta emission
+// for these (BoardAmplifier.buildInboxDeltas), and the inbox's
+// standing-subscription matcher rejects them as defense-in-depth
+// (ClaimsInbox.matchesStandingSubscription).
+//
+// The split is deliberate and CLOSED:
+//   - Activation set (legitimate agent wakes): task, handoff,
+//     consultation, challenge, corrective, prompt.
+//   - System-internal (never agent wakes): boot, activation, shutdown,
+//     archival, testament, checkpoint.
+//
+// Testament is on the system list because TestamentAction posts go
+// via SubmitTestaments, not PostAction; if one ever leaked through
+// PostAction, treating it as system stops the storm.
+func IsSystemInternalAction(t ActionType) bool {
+	switch t {
+	case ActionTypeBoot,
+		ActionTypeActivation,
+		ActionTypeShutdown,
+		ActionTypeArchival,
+		ActionTypeTestament,
+		ActionTypeCheckpoint,
+		ActionTypeConsultContinuation:
+		return true
+	}
+	return false
+}
+
+// AgentActivationActionTypes returns the closed set of action types
+// that legitimately wake an agent via a standing inbox subscription.
+// Mirrors IsSystemInternalAction's complement; the lists must remain
+// disjoint (every defined ActionType is either activation-bearing or
+// system-internal — see TestActionType_PartitionedByVisibility).
+func AgentActivationActionTypes() []ActionType {
+	return []ActionType{
+		ActionTypeTask,
+		ActionTypeHandoff,
+		ActionTypeConsultation,
+		ActionTypeChallenge,
+		ActionTypeCorrective,
+		ActionTypePrompt,
+	}
+}
 
 // Artifact kind constants for lifecycle claims.
 const (
@@ -137,6 +215,41 @@ const (
 	ArtifactKindAgentID     = "agent_id"     // container/agent identifier
 	ArtifactKindShutdownAck = "shutdown_ack" // shutdown acknowledgment
 	ArtifactKindStateHash   = "state_hash"   // hash of persisted state
+)
+
+// Continuation artifact kinds carried by ActionTypeConsultContinuation
+// claims. The agent that yielded mid-tool-loop posts one
+// ContinuationContext artifact (the serialized TurnState JSON) plus
+// one ContinuationAwait artifact per consult it is awaiting.
+const (
+	ArtifactKindContinuationContext = "continuation_context" // serialized TurnState JSON
+	ArtifactKindContinuationAwait   = "continuation_await"   // one per awaited consult_id
+	ArtifactKindContinuationVersion = "continuation_version" // codec version, for binary-upgrade strandedness checks
+
+	// ArtifactKindPlanHandoffPayload is the architect's serialized
+	// PlanHandoff JSON, attached to the testament submitted at plan
+	// finalization. The architect's user-accept handoff claim
+	// (subject=orchestrator, ActionType=Handoff) carries a validation
+	// referencing this artifact's ID, so the orchestrator's claim
+	// intake can resolve the artifact directly and run ingestPlan
+	// deterministically — no LLM tool loop, no parallel bus message.
+	ArtifactKindPlanHandoffPayload = "plan_handoff_payload"
+
+	// ArtifactKindAgentState records an agent's state transition
+	// (Reasoning, ToolExecuting, DispatchingToPeer, etc.) on its
+	// in-flight testament. Reference is the human-readable detail.
+	// Metadata carries:
+	//   - "state":              categorical AgentActivityState string
+	//   - "peer_agent_type":    optional, when transition involves a peer
+	//   - "peer_correlation_id": optional, peer's request correlation
+	//   - "peer_claim_id":      optional, claim ID the peer is processing
+	//   - "at":                  RFC3339Nano timestamp
+	// Complements the entity's Context field (which holds the
+	// latest-only narrative). The artifact stream is the durable
+	// transition history — replayable, auditable, time-travelable.
+	// See docs/CLAIMS_UI.md "Why agent_state artifacts complement
+	// Context".
+	ArtifactKindAgentState = "agent_state"
 )
 
 // ActionStatus tracks an action's aggregate lifecycle.
@@ -273,6 +386,27 @@ type Claim struct {
 	Tags          []string         `json:"tags,omitempty"`
 	Iteration     int              `json:"iteration"`
 
+	// Context is the mutable narrative status describing what this
+	// claim's owner is currently doing. Distinct from Description
+	// (durable intent, set once at post time) and from Validations
+	// (quality gates). Updates throughout the claim's lifecycle as
+	// the work progresses — e.g., architect's planning claim Context
+	// goes "Mapping out dependencies" → "Awaiting librarian response"
+	// → "Generating tasks" → "Plan ready for review". Each mutation
+	// emits a ClaimContextDelta on the bus; the UI surfaces the
+	// update against the row representing this claim, replacing the
+	// row's prior status text in place rather than creating a new
+	// row. See docs/CLAIMS_UI.md.
+	//
+	// Sealed only on terminal status transition.
+	Context string `json:"context,omitempty"`
+
+	// ContextTransition is the monotonic counter for Context
+	// mutations on this claim. The amplifier increments it on every
+	// SetClaimContext call so the UI can order Context deltas
+	// deterministically under concurrent delivery.
+	ContextTransition int64 `json:"context_transition,omitempty"`
+
 	// Validations are the quality gates for this claim. Structural
 	// ownership — each Validation belongs to exactly one Claim.
 	Validations []*Validation `json:"validations"`
@@ -345,6 +479,20 @@ type Testament struct {
 	Summary    string        `json:"summary"`
 	Confidence string        `json:"confidence,omitempty"` // hint, tentative, committed, consensus
 	Duration   time.Duration `json:"duration,omitempty"`
+
+	// Context is the mutable narrative of the testament's developing
+	// synthesis. Distinct from Summary (durable conclusion text set on
+	// flush) and from Artifacts (immutable evidence). Updates while
+	// the testament is being built via the accumulator's SetContext;
+	// sealed onto Testament.Context on Flush. UI consumes
+	// TestamentContextDelta to render the developing-conclusion view
+	// of the in-flight testament row. See docs/CLAIMS_UI.md.
+	Context string `json:"context,omitempty"`
+
+	// ContextTransition is the monotonic counter for Context
+	// mutations. Mirrors Claim.ContextTransition for the same
+	// deterministic-ordering reason.
+	ContextTransition int64 `json:"context_transition,omitempty"`
 
 	// Artifacts are the proof attached to this testament. Structural
 	// ownership — each Artifact belongs to exactly one Testament.
@@ -516,13 +664,24 @@ type ClaimsBoardSubscriber func(*ClaimsBoardProjection) error
 // Subscribers use this to update counters, emit TUI events, or trigger
 // downstream processing without forcing a full board read.
 type BoardMutationDelta struct {
-	Kind        string      `json:"kind"`         // "claim_created", "claim_status_changed", "testament_submitted", "validation_evaluated", "claim_rejected", "phase_changed"
+	Kind        string      `json:"kind"`         // "claim_created", "claim_status_changed", "testament_submitted", "validation_evaluated", "claim_rejected", "phase_changed", "claim_context_changed", "testament_context_changed"
 	ClaimID     string      `json:"claim_id,omitempty"`
 	TestamentID string      `json:"testament_id,omitempty"`
 	FromStatus  ClaimStatus `json:"from_status,omitempty"`
 	ToStatus    ClaimStatus `json:"to_status,omitempty"`
 	AgentID     string      `json:"agent_id,omitempty"`
-	Summary     BoardSummary `json:"summary"` // always populated — current counts
+	// Context carries the new narrative value for claim_context_changed
+	// and testament_context_changed deltas. Empty for other Kinds.
+	Context           string `json:"context,omitempty"`
+	ContextTransition int64  `json:"context_transition,omitempty"`
+	// AccumulatorID is set on testament_context_changed deltas — it
+	// identifies the in-flight accumulator that owns the context
+	// narrative. Populated for both pre-flush deltas (TestamentID
+	// empty) and post-flush deltas (TestamentID set). UI uses
+	// AccumulatorID as the in-flight row anchor and TestamentID as
+	// the durable rebind anchor.
+	AccumulatorID string `json:"accumulator_id,omitempty"`
+	Summary       BoardSummary `json:"summary"` // always populated — current counts
 }
 
 // BoardDeltaSubscriber receives lightweight mutation deltas instead of
@@ -591,6 +750,40 @@ func SubjectAgentID(relations []Relation) string {
 // Relation, or empty string if none.
 func ClaimActionID(relations []Relation) string {
 	r := FindRelation(relations, RelationshipClaimAction)
+	if r == nil {
+		return ""
+	}
+	return r.Related
+}
+
+// ClaimIDFromRelations returns the Related ID of the first "claim"
+// Relation (RelationshipClaim) — i.e. the ID of the claim a
+// testament or artifact is responding to. Empty string when no such
+// relation is set.
+func ClaimIDFromRelations(relations []Relation) string {
+	r := FindRelation(relations, RelationshipClaim)
+	if r == nil {
+		return ""
+	}
+	return r.Related
+}
+
+// HandoffFromClaimID returns the Related ID of the first "handoff_from"
+// Relation, or empty string if none. The bridge's cycle resolver reads
+// this to detect handoff edges (UI_DESIGN.md §5.2).
+func HandoffFromClaimID(relations []Relation) string {
+	r := FindRelation(relations, RelationshipHandoffFrom)
+	if r == nil {
+		return ""
+	}
+	return r.Related
+}
+
+// CompletesArtifactID returns the Related ID of the first "completes"
+// Relation, or empty string if none. Used to pair completion artifacts
+// with their started counterparts (UI_DESIGN.md §2.4).
+func CompletesArtifactID(relations []Relation) string {
+	r := FindRelation(relations, RelationshipCompletes)
 	if r == nil {
 		return ""
 	}

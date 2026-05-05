@@ -85,10 +85,16 @@ func (gt *GlobalTester) processClaimsEntry(ctx context.Context, entry *claims.Gr
 		return fmt.Errorf("tester: LLM provider not configured")
 	}
 
-	acc := claims.NewTestamentAccumulator("tester", gt.config.SessionID)
+	acc := agentshared.NewClaimsEntryAccumulator("tester", gt.config.SessionID, entry)
+	acc.WithBoard(gt.globalTesterBoard())
 	defer acc.Flush(ctx, gt.globalTesterBoard(), gt.globalTesterScope())
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
+
+	if entry.Node.Claim != nil {
+		agentshared.RecordAgentState(ctx, gt.globalTesterBoard(), entry.Node.Claim.ID,
+			"Acknowledging request", agentshared.AgentStateReasoning, nil)
+	}
 
 	userMessage := agentshared.ComposeClaimsEntryPrompt(entry)
 	board := gt.globalTesterBoard()
@@ -108,7 +114,7 @@ func (gt *GlobalTester) processClaimsEntry(ctx context.Context, entry *claims.Gr
 	ledger := gt.steering.Create(entry.Delta.DeltaKey(), gt.id, gt.config.SessionID, nil, nil)
 	defer gt.steering.Close(entry.Delta.DeltaKey(), ctx.Err() != nil)
 
-	result, err := agentshared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	result, err := agentshared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return gt.executeToolLoop(ctx, req, ledger)
 	})
 	if err != nil {

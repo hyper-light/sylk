@@ -43,7 +43,8 @@ func (b *captureBus) Subscribe(string, guide.MessageHandler) (guide.Subscription
 func (b *captureBus) SubscribeAsync(string, guide.MessageHandler) (guide.Subscription, error) {
 	return nil, nil
 }
-func (b *captureBus) Close() error { return nil }
+func (b *captureBus) Close() error                            { return nil }
+func (b *captureBus) CloseWithContext(_ context.Context) error { return nil }
 
 func (b *captureBus) byTopic(topic string) []capturedPublish {
 	b.mu.Lock()

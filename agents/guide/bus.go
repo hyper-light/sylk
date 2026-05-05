@@ -1,6 +1,7 @@
 package guide
 
 import (
+	"context"
 	"time"
 
 	"github.com/adalundhe/sylk/core/events"
@@ -43,6 +44,11 @@ type EventBus interface {
 
 	// Close shuts down the bus and all subscriptions.
 	Close() error
+
+	// CloseWithContext shuts the bus down bounded by the caller's
+	// ctx. Returns when either every subscription drains or ctx is
+	// canceled. Stuck subscriptions remain running in the background.
+	CloseWithContext(ctx context.Context) error
 }
 
 // Subscription represents an active subscription to a topic

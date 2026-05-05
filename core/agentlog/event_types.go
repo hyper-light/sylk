@@ -296,6 +296,31 @@ const (
 	EventMailboxItemAcknowledged EventType = 0x0F11
 )
 
+// MCP capability-plane events (0x1000–0x10FF). Cross-cutting: any agent
+// may emit them when interacting with the MCP fabric. The journal here
+// is the source of truth for "what happened with MCP" — transports,
+// projections, and Guardian grants are derived from these.
+const (
+	EventMCPServerRegistered     EventType = 0x1000
+	EventMCPTransportConnected   EventType = 0x1001
+	EventMCPTransportDisconnected EventType = 0x1002
+	EventMCPCapabilitiesSynced   EventType = 0x1003
+	EventMCPCatalogInvalidated   EventType = 0x1004
+	EventMCPOpRequested          EventType = 0x1010
+	EventMCPApprovalRequested    EventType = 0x1011
+	EventMCPApprovalResolved     EventType = 0x1012
+	EventMCPElicitationRequested EventType = 0x1013
+	EventMCPElicitationResolved  EventType = 0x1014
+	EventMCPOpProgress           EventType = 0x1015
+	EventMCPBlobStored           EventType = 0x1016
+	EventMCPContentIndexed       EventType = 0x1017
+	EventMCPOpCompleted          EventType = 0x1018
+	EventMCPOpFailed             EventType = 0x1019
+	EventMCPOpCancelled          EventType = 0x101A
+	EventMCPServerExportCalled   EventType = 0x1020
+	EventMCPServerExportResolved EventType = 0x1021
+)
+
 // eventNames maps every defined EventType to its human-readable name.
 // Indexed by uint16 value for O(1) lookup.
 var eventNames [1 << 16]string
@@ -535,6 +560,26 @@ func init() {
 	eventNames[EventProtocolSnapshotSaved] = "ProtocolSnapshotSaved"
 	eventNames[EventMailboxItemEnqueued] = "MailboxItemEnqueued"
 	eventNames[EventMailboxItemAcknowledged] = "MailboxItemAcknowledged"
+
+	// MCP capability plane
+	eventNames[EventMCPServerRegistered] = "MCPServerRegistered"
+	eventNames[EventMCPTransportConnected] = "MCPTransportConnected"
+	eventNames[EventMCPTransportDisconnected] = "MCPTransportDisconnected"
+	eventNames[EventMCPCapabilitiesSynced] = "MCPCapabilitiesSynced"
+	eventNames[EventMCPCatalogInvalidated] = "MCPCatalogInvalidated"
+	eventNames[EventMCPOpRequested] = "MCPOpRequested"
+	eventNames[EventMCPApprovalRequested] = "MCPApprovalRequested"
+	eventNames[EventMCPApprovalResolved] = "MCPApprovalResolved"
+	eventNames[EventMCPElicitationRequested] = "MCPElicitationRequested"
+	eventNames[EventMCPElicitationResolved] = "MCPElicitationResolved"
+	eventNames[EventMCPOpProgress] = "MCPOpProgress"
+	eventNames[EventMCPBlobStored] = "MCPBlobStored"
+	eventNames[EventMCPContentIndexed] = "MCPContentIndexed"
+	eventNames[EventMCPOpCompleted] = "MCPOpCompleted"
+	eventNames[EventMCPOpFailed] = "MCPOpFailed"
+	eventNames[EventMCPOpCancelled] = "MCPOpCancelled"
+	eventNames[EventMCPServerExportCalled] = "MCPServerExportCalled"
+	eventNames[EventMCPServerExportResolved] = "MCPServerExportResolved"
 }
 
 // String returns the human-readable name for an EventType,
@@ -580,6 +625,8 @@ const (
 	rangeBootHi          EventType = 0x0EFF
 	rangeProtocolLo      EventType = 0x0F00
 	rangeProtocolHi      EventType = 0x0FFF
+	rangeMCPLo           EventType = 0x1000
+	rangeMCPHi           EventType = 0x10FF
 )
 
 // IsCommon returns true if the event type is in the common range.
@@ -632,6 +679,9 @@ func (e EventType) IsBoot() bool { return e >= rangeBootLo && e <= rangeBootHi }
 // IsProtocol returns true if the event type belongs to the durable protocol range.
 func (e EventType) IsProtocol() bool { return e >= rangeProtocolLo && e <= rangeProtocolHi }
 
+// IsMCP returns true if the event type belongs to the MCP capability-plane range.
+func (e EventType) IsMCP() bool { return e >= rangeMCPLo && e <= rangeMCPHi }
+
 // OwnerAgent returns the agent name that owns this event type range,
 // or "unknown" for unassigned ranges.
 func (e EventType) OwnerAgent() string {
@@ -668,6 +718,8 @@ func (e EventType) OwnerAgent() string {
 		return "boot"
 	case e.IsProtocol():
 		return "protocol"
+	case e.IsMCP():
+		return "mcp"
 	default:
 		return "unknown"
 	}

@@ -73,7 +73,7 @@ func (gi *GlobalInspector) AuditLayer(ctx context.Context, req *shared.LayerAudi
 	gi.applyLLMRuntimeProfile(llmReq, "audit")
 
 	ledger := agentShared.SteeringLedgerFromContext(auditCtx)
-	response, err := agentShared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+	response, err := agentShared.ExecuteTurnLoop(ctx, ledger, llmReq, func() (string, error) {
 		return gi.executeToolLoop(auditCtx, llmReq, ledger)
 	})
 	if err != nil {

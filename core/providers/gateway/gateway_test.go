@@ -145,11 +145,35 @@ func TestGatewayProvider_RequestTimeoutPassthrough(t *testing.T) {
 	}
 }
 
+// laneByValue is a fixed-key LaneKeyFn used by tests that want everything
+// in one lane (so legacy priority/aging assertions still hold).
+func laneByValue(key string) LaneKeyFn {
+	return func(context.Context) string { return key }
+}
+
+// laneByCtxValue extracts a string lane key from a context value. Tests
+// that want WFQ across distinct lanes thread the lane key through a
+// dedicated context key.
+type testLaneKey struct{}
+
+func laneByCtxValue() LaneKeyFn {
+	return func(ctx context.Context) string {
+		if v, ok := ctx.Value(testLaneKey{}).(string); ok {
+			return v
+		}
+		return ""
+	}
+}
+
+func withLane(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, testLaneKey{}, key)
+}
+
 func TestScheduler_EnqueueAndSignalNext(t *testing.T) {
-	s := NewScheduler(4, 2.0)
+	s := NewScheduler(2.0, laneByValue("a"))
 	defer s.Close()
 
-	ch, err := s.Enqueue(PriorityExecution)
+	ch, err := s.Enqueue(context.Background(), PriorityExecution)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,11 +199,12 @@ func TestScheduler_EnqueueAndSignalNext(t *testing.T) {
 }
 
 func TestScheduler_PriorityOrder(t *testing.T) {
-	s := NewScheduler(4, 0) // no aging, pure priority
+	// Single lane, no aging — priority alone decides order.
+	s := NewScheduler(0, laneByValue("a"))
 	defer s.Close()
 
-	chLow, _ := s.Enqueue(PriorityBackground)
-	chHigh, _ := s.Enqueue(PriorityUserInteractive)
+	chLow, _ := s.Enqueue(context.Background(), PriorityBackground)
+	chHigh, _ := s.Enqueue(context.Background(), PriorityUserInteractive)
 
 	// First signal should go to the higher priority waiter.
 	s.SignalNext()
@@ -204,18 +229,19 @@ func TestScheduler_PriorityOrder(t *testing.T) {
 }
 
 func TestScheduler_AgingPreventsStarvation(t *testing.T) {
-	// With agingRate=2000, a Background(20) request gains 2000 pts/sec.
-	// After 50ms it has effective priority 20 + 0.05*2000 = 120, beating
-	// a fresh UserInteractive(100).
-	s := NewScheduler(4, 2000)
+	// Single lane so this is a pure priority+aging test.
+	// With agingRate=2000 vt/sec, a Background waiter discounts its
+	// virtualFinish by ~120 over 60ms — enough to overtake a fresh
+	// UserInteractive (vt-increment 1.0).
+	s := NewScheduler(2000, laneByValue("a"))
 	defer s.Close()
 
-	chOld, _ := s.Enqueue(PriorityBackground)
-	time.Sleep(60 * time.Millisecond) // let old waiter age past 100 effective
+	chOld, _ := s.Enqueue(context.Background(), PriorityBackground)
+	time.Sleep(60 * time.Millisecond) // age the old waiter
 
-	chNew, _ := s.Enqueue(PriorityUserInteractive)
+	chNew, _ := s.Enqueue(context.Background(), PriorityUserInteractive)
 
-	// Despite lower base priority, the old waiter should win due to aging.
+	// Despite lower base priority, the aged waiter should win.
 	s.SignalNext()
 	select {
 	case <-chOld:
@@ -231,23 +257,105 @@ func TestScheduler_AgingPreventsStarvation(t *testing.T) {
 	}
 }
 
-func TestScheduler_Full(t *testing.T) {
-	s := NewScheduler(1, 0)
+// TestScheduler_NeverRejectsOnCount confirms the regression-pinning
+// invariant: Enqueue never returns a "queue full" error regardless of
+// how many waiters pile up. The only way for a waiter's wait to end in
+// failure is its own context deadline / WaitForSlot maxWait expiring.
+func TestScheduler_NeverRejectsOnCount(t *testing.T) {
+	s := NewScheduler(0, laneByValue("a"))
 	defer s.Close()
 
-	_, err := s.Enqueue(PriorityExecution)
-	if err != nil {
-		t.Fatal(err)
+	// Pile up far more waiters than the old hand-picked cap of 32.
+	for range 10000 {
+		if _, err := s.Enqueue(context.Background(), PriorityExecution); err != nil {
+			t.Fatalf("Enqueue must not reject on count, got %v", err)
+		}
 	}
-
-	_, err = s.Enqueue(PriorityExecution)
-	if !errors.Is(err, ErrSchedulerFull) {
-		t.Fatalf("expected ErrSchedulerFull, got %v", err)
+	if got, want := s.Len(), 10000; got != want {
+		t.Fatalf("Len() = %d, want %d", got, want)
 	}
 }
 
+// TestScheduler_WFQ_FairnessAcrossLanes confirms one greedy lane cannot
+// starve another. Two lanes ("greedy", "thin") each enqueue, but greedy
+// enqueues many in one burst. Across the first 2N dispatches, thin
+// should receive roughly half.
+func TestScheduler_WFQ_FairnessAcrossLanes(t *testing.T) {
+	s := NewScheduler(0, laneByCtxValue())
+	defer s.Close()
+
+	const burst = 100
+	greedyChs := make([]chan struct{}, 0, burst)
+	thinChs := make([]chan struct{}, 0, burst)
+
+	// Greedy lane fires its full burst first.
+	for range burst {
+		ch, err := s.Enqueue(withLane(context.Background(), "greedy"), PriorityExecution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		greedyChs = append(greedyChs, ch)
+	}
+	// Then thin lane fires the same burst.
+	for range burst {
+		ch, err := s.Enqueue(withLane(context.Background(), "thin"), PriorityExecution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		thinChs = append(thinChs, ch)
+	}
+
+	// Dispatch the first 2N items and count by lane.
+	greedyServed, thinServed := 0, 0
+	for i := 0; i < burst*2; i++ {
+		s.SignalNext()
+		// Check which channel got closed this round by polling
+		// each lane's pending list.
+		for j, ch := range greedyChs {
+			if ch == nil {
+				continue
+			}
+			select {
+			case <-ch:
+				greedyChs[j] = nil
+				greedyServed++
+			default:
+			}
+		}
+		for j, ch := range thinChs {
+			if ch == nil {
+				continue
+			}
+			select {
+			case <-ch:
+				thinChs[j] = nil
+				thinServed++
+			default:
+			}
+		}
+	}
+
+	if greedyServed+thinServed != burst*2 {
+		t.Fatalf("expected %d total dispatched, got greedy=%d thin=%d", burst*2, greedyServed, thinServed)
+	}
+	// Each lane should have received ~burst dispatches.
+	// Allow ±10% variance for the WFQ ordering of equal-weight lanes.
+	tol := burst / 10
+	if abs(thinServed-burst) > tol {
+		t.Fatalf("thin lane should get ~%d dispatches (±%d), got %d (greedy=%d)",
+			burst, tol, thinServed, greedyServed)
+	}
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
 func TestScheduler_WaitForSlot_Timeout(t *testing.T) {
-	s := NewScheduler(4, 0)
+	s := NewScheduler(0, laneByValue("a"))
 	defer s.Close()
 
 	ctx := context.Background()
@@ -258,7 +366,7 @@ func TestScheduler_WaitForSlot_Timeout(t *testing.T) {
 }
 
 func TestScheduler_WaitForSlot_ContextCancel(t *testing.T) {
-	s := NewScheduler(4, 0)
+	s := NewScheduler(0, laneByValue("a"))
 	defer s.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -279,10 +387,10 @@ func TestScheduler_WaitForSlot_ContextCancel(t *testing.T) {
 }
 
 func TestScheduler_Close_SignalsAll(t *testing.T) {
-	s := NewScheduler(4, 0)
+	s := NewScheduler(0, laneByValue("a"))
 
-	ch1, _ := s.Enqueue(PriorityExecution)
-	ch2, _ := s.Enqueue(PriorityValidation)
+	ch1, _ := s.Enqueue(context.Background(), PriorityExecution)
+	ch2, _ := s.Enqueue(context.Background(), PriorityValidation)
 
 	s.Close()
 
@@ -299,10 +407,10 @@ func TestScheduler_Close_SignalsAll(t *testing.T) {
 }
 
 func TestScheduler_Close_RejectsEnqueue(t *testing.T) {
-	s := NewScheduler(4, 0)
+	s := NewScheduler(0, laneByValue("a"))
 	s.Close()
 
-	_, err := s.Enqueue(PriorityExecution)
+	_, err := s.Enqueue(context.Background(), PriorityExecution)
 	if !errors.Is(err, ErrGatewayClosed) {
 		t.Fatalf("expected ErrGatewayClosed, got %v", err)
 	}

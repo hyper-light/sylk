@@ -99,6 +99,7 @@ type Orchestrator struct {
 	coordination *CoordinationService
 	scope        *concurrency.GoroutineScope
 	claimsInbox      *claims.ClaimsInbox
+	continuationStore *shared.ContinuationStore
 
 	// Pipeline subscriptions
 	pipelineSubs []guide.Subscription
@@ -884,14 +885,31 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 		// expiry — no reaper goroutine needed; cache eviction handles it.
 	}
 
+	// ContinuationStore for ticket-mode consult_peer + await_consults.
+	o.continuationStore = shared.NewContinuationStore(shared.ContinuationStoreConfig{
+		AgentID:   o.config.AgentID,
+		SessionID: o.SessionID(),
+		Board:     o.orchestratorBoardOrNil(),
+		Scope:     o.scope,
+		ResumeFn:  o.resumeContinuation,
+	})
+	o.continuationStore.RecoverPendingContinuations(context.Background())
+
 	// Claims intake: event-driven delta processing.
+	// Orchestrator carries RolePhaseObserver so it sees board phase
+	// transitions (CLAIMS.md §5.4 — orchestrator's pattern) on top of
+	// the directly-addressed inbox baseline.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:      o.config.AgentID,
-		SessionID:    o.SessionID(),
-		Bus:          o.bus,
-		Board:        o.orchestratorBoardOrNil(),
-		Scope:        o.scope,
-		ProcessEntry: o.processClaimsEntry,
+		AgentID:           o.config.AgentID,
+		SessionID:         o.SessionID(),
+		Role:              claims.RoleSubject | claims.RolePhaseObserver,
+		Bus:               o.bus,
+		Board:             o.orchestratorBoardOrNil(),
+		Scope:             o.scope,
+		ProcessEntry:      o.processClaimsEntry,
+		Identity:          o.identity,
+		Factory:           o.factory,
+		ContinuationStore: o.continuationStore,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("orchestrator_claims_inbox_start_failed", "error", err.Error())
@@ -961,6 +979,10 @@ func (o *Orchestrator) Stop() error {
 	if o.claimsInbox != nil {
 		_ = o.claimsInbox.Close()
 		o.claimsInbox = nil
+	}
+	if o.continuationStore != nil {
+		o.continuationStore.Stop("orchestrator stopped")
+		o.continuationStore = nil
 	}
 
 	// Submit stop testament before resources are torn down.
@@ -1330,6 +1352,15 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 		o.publishStreamStart(ctx)
 	}
 
+	// Cycle-aware accumulator. UI_DESIGN.md §4.7.3.
+	var flushAccumulator func()
+	var beginErr error
+	ctx, flushAccumulator, beginErr = shared.BeginForwardedRequestCycle(ctx, o.config.AgentID, fwd, o.scope)
+	if beginErr != nil {
+		return beginErr
+	}
+	defer flushAccumulator()
+
 	result, err := o.Handle(ctx, fwd)
 	shared.LogResponse(o.steering.EventLogger(), fwd.CorrelationID, o.config.AgentID, fwd.SessionID, time.Since(startTime), err)
 
@@ -1665,8 +1696,18 @@ func canonicalPipelineTaskIdentity(taskID, taskSlug string, nodeCtx map[string]a
 	return canonicalTaskID, canonicalTaskSlug
 }
 
-func pipelineWorkerTargetAgentID(taskID, agentType string) string {
-	return PipelineWorkerRoutingTarget(taskID, agentType)
+// pipelineWorkerTargetAgentID returns the canonical internal agent ID of a
+// task-scoped pipeline worker. This UUID matches the worker's runtime e.id
+// (sourced from the pod spec's "pipeline_worker_id" label which is itself
+// PipelineWorkerCanonicalID), and therefore matches the AgentID the worker
+// uses to subscribe its ClaimsInbox and direct-message channels. It must be
+// used wherever an internal routing target, claim subject, or
+// agent-id-as-identity is required.
+//
+// The slug-form PipelineWorkerRoutingTarget exists separately for UI display
+// and container/pod spec.Name; never use it for internal addressing.
+func pipelineWorkerTargetAgentID(sessionID, taskID, agentType string) string {
+	return shared.PipelineWorkerCanonicalID(sessionID, taskID, agentType)
 }
 
 func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
@@ -2420,40 +2461,16 @@ func (o *Orchestrator) onHealthCheckResult(result *HealthCheckResult) {
 		o.healthCache.SetAgent(ar.AgentID, ar)
 	}
 
-	// 2. Forward to Archivalist for history.
-	o.forwardHealthToArchivalist(result)
-
-	// 3. Auto-escalate critical transitions.
+	// 2. Auto-escalate critical transitions.
+	//
+	// Persistence to the archivalist intentionally has no call here.
+	// Per the claims-board-as-canonical-record contract, the
+	// orchestrator emits health summary testaments via
+	// HealthMonitor.postHealthClaims (gated on transitions); the
+	// archivalist subscribes via RoleArchivist and persists from
+	// the board. No fire-and-forget RouteRequest dispatch — the
+	// archivalist owns its persistence policy.
 	o.escalateCriticalHealth(result)
-}
-
-// forwardHealthToArchivalist sends the health check result to Archivalist for
-// historical storage. Fire-and-forget, same pattern as SubmitEventToArchivalist.
-func (o *Orchestrator) forwardHealthToArchivalist(result *HealthCheckResult) {
-	if o.bus == nil || !o.config.ArchivalistEnabled {
-		return
-	}
-	input, err := guide.ArchivalistStoreRouteInput("store health check result")
-	if err != nil {
-		return
-	}
-
-	req := &guide.RouteRequest{
-		Input:           input,
-		SourceAgentID:   o.config.AgentID,
-		SourceAgentName: "orchestrator",
-		FireAndForget:   true,
-		SessionID:       o.config.SessionID,
-		Timestamp:       time.Now(),
-	}
-
-	msg := guide.NewRequestMessage(generateMessageID(), req)
-	msg.Metadata = map[string]any{
-		"event_type": "health_check_result",
-		"event_data": result,
-	}
-
-	o.bus.Publish(guide.TopicGuideRequests, msg)
 }
 
 // escalateCriticalHealth deterministically escalates agents that transitioned

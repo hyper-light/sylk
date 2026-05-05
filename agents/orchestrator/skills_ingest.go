@@ -294,13 +294,49 @@ func (a *planHandoffIngestAttempt) ingest(ctx context.Context) error {
 // — graceful degradation if the architect's pre-prepare publish
 // failed or was lost.
 func (a *planHandoffIngestAttempt) executePrepared(ctx context.Context) error {
+	// Wait briefly for an in-flight Prepare to publish its DAG before
+	// falling back. This closes the prep/click race: a user who
+	// approves quickly may arrive while the architect's prepare
+	// publish is still being processed by the orchestrator. Without
+	// this wait, executePrepared would always fall back to full
+	// ingest and the entire two-phase optimization would be moot in
+	// the fast-click case.
+	const prepReadyTimeout = 750 * time.Millisecond
+	if waited := a.orchestrator.waitForPreparedDAG(ctx, a.handoff.PlanID, prepReadyTimeout); waited != nil {
+		// Ready (or signaled) — proceed with takePreparedDAG below
+		// to atomically remove and adopt.
+		_ = waited
+	}
 	prepared := a.orchestrator.takePreparedDAG(a.handoff.PlanID)
 	if prepared == nil {
-		// Graceful fallback: no prepared state found. Run a full
-		// ingest using THIS attempt's data (which carries the same
-		// payload as the original prepare publish).
+		// Graceful fallback: no prepared state found within the
+		// wait window. Run a full ingest using THIS attempt's
+		// data (carries the same payload as the original prepare).
 		a.orchestrator.logInfo("executePrepared: no prepared DAG; falling back to full ingest",
 			"plan_id", a.handoff.PlanID)
+		if err := a.prepareExecution(ctx); err != nil {
+			return err
+		}
+		a.publishReceiptSummary(ctx)
+		if err := a.submitExecution(ctx); err != nil {
+			return err
+		}
+		a.publishIngestedEvent()
+		return nil
+	}
+	// Revision check: if the user approved revision N but a higher
+	// revision was queued (Modify race), prefer the higher revision
+	// over what they clicked on. The architect's verdict pipeline
+	// generates a fresh revision on Modify, so a click on the older
+	// revision implicitly consents to whatever's current.
+	if a.handoff != nil && prepared.revision < a.handoff.Revision {
+		// The handoff carries a newer revision than what we
+		// prepared. Discard prepared and fall through to full
+		// ingest with the newer payload.
+		a.orchestrator.logInfo("executePrepared: prepared revision stale; falling back to full ingest",
+			"plan_id", a.handoff.PlanID,
+			"prepared_revision", prepared.revision,
+			"handoff_revision", a.handoff.Revision)
 		if err := a.prepareExecution(ctx); err != nil {
 			return err
 		}
@@ -386,6 +422,11 @@ func (a *planHandoffIngestAttempt) submitExecution(ctx context.Context) error {
 		"session_id", a.handoff.SessionID,
 		"task_count", len(a.handoff.Tasks),
 		"layer_count", len(a.handoff.ExecutionLayers))
+	// Register architect-authored task claims with the bridge BEFORE
+	// Execute. The bridge picks them up when constructing the
+	// per-DAG meta; ensureTaskPod consumes them and posts to the
+	// session claims board atomically with pod creation.
+	a.orchestrator.dagBridge.RegisterTaskClaims(a.dag.ID(), collectTaskClaimsFromHandoff(a.handoff))
 	dagID, err := a.orchestrator.dagBridge.Execute(ctx, a.dag, a.handoff.PlanID, a.handoff.SessionID)
 	if err != nil {
 		a.orchestrator.logWarnMsg("submitExecution: dagBridge.Execute failed",

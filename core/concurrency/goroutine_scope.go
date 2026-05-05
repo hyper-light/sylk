@@ -31,7 +31,8 @@ type GoroutineScope struct {
 	maxLifetime time.Duration
 
 	shutdownMu       sync.Mutex
-	shutdownStarted  bool
+	signaled         bool // ctx canceled, new Go calls rejected
+	shutdownStarted  bool // wait+drain machinery owned by exactly one Shutdown call
 	shutdownComplete chan struct{}
 
 	// Health monitoring (optional)
@@ -127,7 +128,7 @@ func (s *GoroutineScope) emitWorkerStarted(w *worker) {
 func (s *GoroutineScope) checkAndRegister(w *worker) error {
 	s.shutdownMu.Lock()
 	defer s.shutdownMu.Unlock()
-	if s.shutdownStarted {
+	if s.signaled {
 		return ErrScopeShutdown
 	}
 	s.registerWorkerLocked(w)
@@ -222,6 +223,22 @@ func (s *GoroutineScope) Shutdown(gracePeriod, hardDeadline time.Duration) error
 	return s.waitForShutdown(gracePeriod, hardDeadline)
 }
 
+// SignalShutdown cancels the scope's parent context AND refuses any
+// further Go calls (with ErrScopeShutdown) without waiting for workers
+// to drain. Use this at the very start of a graceful shutdown: every
+// already-tracked worker sees ctx.Done() immediately and starts to
+// wind down, and upstream publishers that try to spawn new tracked
+// work get a hard reject so they can't keep filling the scope with
+// goroutines that will then leak past the scope's drain window.
+// Idempotent and safe to call multiple times; the subsequent Shutdown
+// still performs the wait + force-shutdown semantics.
+func (s *GoroutineScope) SignalShutdown() {
+	s.shutdownMu.Lock()
+	s.signaled = true
+	s.shutdownMu.Unlock()
+	s.cancel()
+}
+
 func (s *GoroutineScope) beginShutdown() bool {
 	s.shutdownMu.Lock()
 	defer s.shutdownMu.Unlock()
@@ -229,6 +246,7 @@ func (s *GoroutineScope) beginShutdown() bool {
 		return false
 	}
 	s.shutdownStarted = true
+	s.signaled = true
 	return true
 }
 

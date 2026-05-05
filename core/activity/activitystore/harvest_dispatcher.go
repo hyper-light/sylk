@@ -33,12 +33,20 @@ type HarvestDispatcher struct {
 	queue       chan ForestCandidate
 	workTimeout time.Duration
 
-	// Activity-ID dedupe — bounded LRU. Re-deliveries (subscriber
-	// retry, replay) collapse to a single harvest call.
-	dedupMu    sync.Mutex
-	dedupSeen  map[activity.ActivityID]struct{}
-	dedupOrder []activity.ActivityID
-	dedupCap   int
+	// Activity-ID dedupe — bounded ring buffer. Re-deliveries
+	// (subscriber retry, replay) collapse to a single harvest call.
+	// dedupRing is allocated once at construction and never grows;
+	// dedupHead is the next-write slot (also the oldest entry when
+	// the ring is full); dedupSize tracks the count of live entries.
+	// Eviction overwrites in place rather than the slice-shift
+	// pattern that would leave evicted IDs reachable through the
+	// backing array between GC cycles.
+	dedupMu   sync.Mutex
+	dedupSeen map[activity.ActivityID]struct{}
+	dedupRing []activity.ActivityID
+	dedupHead int
+	dedupSize int
+	dedupCap  int
 
 	// Counters — observable via the *Count accessors.
 	submitted atomic.Uint64
@@ -144,7 +152,7 @@ func NewHarvestDispatcher(inner HarvestFunc, cfg HarvestDispatcherConfig) *Harve
 		queue:       make(chan ForestCandidate, cfg.QueueCapacity),
 		workTimeout: cfg.WorkTimeout,
 		dedupSeen:   make(map[activity.ActivityID]struct{}, cfg.DedupeCapacity),
-		dedupOrder:  make([]activity.ActivityID, 0, cfg.DedupeCapacity),
+		dedupRing:   make([]activity.ActivityID, cfg.DedupeCapacity),
 		dedupCap:    cfg.DedupeCapacity,
 		errorSink:   cfg.ErrorSink,
 		stopCh:      make(chan struct{}),
@@ -267,8 +275,11 @@ func (d *HarvestDispatcher) runOne(candidate ForestCandidate) {
 
 // checkAndMarkSeen returns true when the activity ID is new (caller
 // should proceed with enqueue) and false when it was already seen
-// inside the bounded dedupe window. Maintains a bounded LRU keyed by
-// insertion order.
+// inside the bounded dedupe window. Maintains a bounded ring buffer
+// keyed by insertion order: the ring is allocated once at
+// construction and never grows; eviction overwrites the oldest slot
+// in place. This avoids the slice-shift pattern that would leave
+// evicted IDs reachable through the backing array between GC cycles.
 func (d *HarvestDispatcher) checkAndMarkSeen(id activity.ActivityID) bool {
 	if id == "" {
 		return true
@@ -279,11 +290,16 @@ func (d *HarvestDispatcher) checkAndMarkSeen(id activity.ActivityID) bool {
 		return false
 	}
 	d.dedupSeen[id] = struct{}{}
-	d.dedupOrder = append(d.dedupOrder, id)
-	if len(d.dedupOrder) > d.dedupCap {
-		evict := d.dedupOrder[0]
-		d.dedupOrder = d.dedupOrder[1:]
+	if d.dedupSize == d.dedupCap {
+		// Ring full — overwrite the oldest slot at dedupHead and drop
+		// the evicted id from the seen-map so it can be observed
+		// again later.
+		evict := d.dedupRing[d.dedupHead]
 		delete(d.dedupSeen, evict)
+	} else {
+		d.dedupSize++
 	}
+	d.dedupRing[d.dedupHead] = id
+	d.dedupHead = (d.dedupHead + 1) % d.dedupCap
 	return true
 }

@@ -47,7 +47,7 @@ func (a *Architect) executeToolLoop(
 	loopStart := time.Now()
 	a.architectPostClaim(ctx,
 		architectClaimAction(claims.ActionTypeTask),
-		architectClaim(
+		architectSelfClaim(
 			"Execute architect tool loop (stage: "+stage+")",
 			"Multi-turn LLM reasoning with tool invocations",
 			[]claims.ClaimScopeEntry{{Kind: "session", Key: a.config.SessionID}},
@@ -304,7 +304,7 @@ func (a *Architect) executeToolLoop(
 		}
 
 		toolStart := time.Now()
-		errCount, rerouted, delegated, delegatedMessage := a.applyToolCalls(ctx, req, resp)
+		errCount, rerouted, delegated, delegatedMessage, yielded := a.applyToolCalls(ctx, req, resp)
 		toolCallCount += len(resp.ToolCalls)
 		toolErrors += errCount
 		a.logInfo("executeToolLoop: tool calls applied",
@@ -313,7 +313,15 @@ func (a *Architect) executeToolLoop(
 			"tool_elapsed", time.Since(toolStart).String(),
 			"err_count", errCount,
 			"rerouted", rerouted,
-			"delegated", delegated)
+			"delegated", delegated,
+			"yielded", yielded)
+		if yielded {
+			// Continuation persisted by await_consults; surface
+			// the sentinel to ExecuteTurnLoop / request handler so
+			// the lease releases cleanly. Resume comes via inbox
+			// when the awaited consults resolve.
+			return "", shared.ErrConsultYielded
+		}
 		a.logDebug("tool_loop: TOOLS_APPLIED",
 			"stage", stage,
 			"turn", turn,
@@ -354,17 +362,24 @@ func (a *Architect) executeToolLoop(
 // applyToolCalls appends the assistant message and tool results to the request.
 // When demand-paged skills are loaded during execution, sets toolDefsDirty
 // so the next LLM turn rebuilds tool definitions.
+//
+// Returns (errCount, rerouted, delegated, delegatedMessage, yielded). When
+// yielded is true the caller MUST exit the tool loop and propagate
+// shared.ErrConsultYielded upward — a consult_peer ticket was awaited
+// via await_consults and the continuation has been persisted to the
+// claims board.
 func (a *Architect) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
-) (int, bool, bool, string) {
+) (int, bool, bool, string, bool) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
 	rerouted := false
 	delegated := false
 	delegatedMessage := ""
+	yielded := false
 	for i, call := range resp.ToolCalls {
 		if ctx.Err() != nil {
 			a.logWarn("applyToolCalls: context cancelled mid-loop",
@@ -407,6 +422,18 @@ func (a *Architect) applyToolCalls(
 			"err", err)
 		isError := false
 		if err != nil {
+			if shared.IsConsultYielded(err) {
+				// LLM yielded mid-turn awaiting peer consults.
+				// The continuation is already persisted by the
+				// await_consults handler; the loop must exit
+				// without appending a tool result message and
+				// without firing further inference. Surface the
+				// yield error so the outer loop short-circuits.
+				yielded = true
+				a.logInfo("applyToolCalls: consult turn yielded — continuation persisted, exiting loop",
+					"tool_name", call.Name)
+				return errCount, rerouted, delegated, delegatedMessage, yielded
+			}
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
@@ -461,7 +488,7 @@ func (a *Architect) applyToolCalls(
 		}
 	}
 
-	return errCount, rerouted, delegated, delegatedMessage
+	return errCount, rerouted, delegated, delegatedMessage, yielded
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.

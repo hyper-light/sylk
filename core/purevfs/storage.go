@@ -62,86 +62,176 @@ type ChunkStoreStats struct {
 // pointer and refcount. Keeping bytes off the Go heap is the primary
 // inuse_space win — the heap profile sees only this small struct per
 // chunk, not the chunk content.
+//
+// refs is atomic so Acquire can increment under a shard read lock
+// (parallel with concurrent Get/CopyInto). Release takes the shard
+// write lock so the decrement and the slot.Free that follows
+// refs == 0 are observed as a single transition.
 type chunkEntry struct {
 	slot *chunkSlot
-	refs int32
+	refs atomic.Int32
+}
+
+// chunkShardBits picks the number of shards as a function of the SHA-256
+// hash's first byte: every distinct value of hash[0] gets its own shard,
+// so reads/writes for chunks with different hash[0] never contend.
+// 8 bits → 256 shards: the natural cardinality of the chosen index, not
+// a hand-picked constant.
+const chunkShardBits = 8
+const chunkShardCount = 1 << chunkShardBits
+
+// chunkShard owns the chunk metadata for one slice of the hash space.
+// Reads take RLock; mutations take Lock. The arena slot's bytes are
+// dereferenced by CopyInto/Get under RLock — Release cannot Free the
+// slot until every concurrent reader has released its read lock, so the
+// shard lock is also the use-after-free guard.
+//
+// Refcount mutations on existing entries (Acquire, dedup hits in Put)
+// run atomically under RLock so writers don't serialize on hot chunks.
+// Slot reclamation (refs → 0) runs under Lock, which excludes any
+// concurrent reader on the same shard.
+type chunkShard struct {
+	mu     sync.RWMutex
+	chunks map[Hash]*chunkEntry
 }
 
 type ChunkStore struct {
-	mu          sync.RWMutex
-	chunks      map[Hash]*chunkEntry
+	shards      [chunkShardCount]*chunkShard
 	arena       *chunkArena
 	memoryLimit int64
 	bytes       atomic.Int64
 	uniquePuts  atomic.Int64
 	dedupHits   atomic.Int64
 	rejected    atomic.Int64
+	closed      atomic.Bool
 }
 
 func NewChunkStore(memoryLimit int64) *ChunkStore {
-	return &ChunkStore{
-		chunks:      make(map[Hash]*chunkEntry),
+	s := &ChunkStore{
 		arena:       newChunkArena(),
 		memoryLimit: memoryLimit,
 	}
+	for i := range s.shards {
+		s.shards[i] = &chunkShard{chunks: make(map[Hash]*chunkEntry)}
+	}
+	return s
+}
+
+// shardFor selects the shard owning hash. The hash is uniformly random
+// (SHA-256 output), so hash[0] has uniform distribution across the
+// 256 shards — no skew correction needed.
+func (s *ChunkStore) shardFor(hash Hash) *chunkShard {
+	return s.shards[hash[0]]
+}
+
+// reserveBytes claims n bytes against the global memory budget atomically.
+// On rejection it rolls back and increments the rejected counter. On
+// success the caller owns those bytes until they call releaseBytes.
+// The claim happens before arena.Allocate so a failed allocation can
+// release the budget without holding any shard lock.
+func (s *ChunkStore) reserveBytes(n int64) error {
+	if s.memoryLimit <= 0 {
+		s.bytes.Add(n)
+		return nil
+	}
+	proposed := s.bytes.Add(n)
+	if proposed > s.memoryLimit {
+		s.bytes.Add(-n)
+		s.rejected.Add(1)
+		return ErrMemoryPressure
+	}
+	return nil
+}
+
+func (s *ChunkStore) releaseBytes(n int64) {
+	s.bytes.Add(-n)
 }
 
 func (s *ChunkStore) Put(content []byte) (Hash, bool, error) {
+	if s.closed.Load() {
+		return Hash{}, false, errArenaClosed
+	}
 	hash := SumHash(content)
+	shard := s.shardFor(hash)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if entry, ok := s.chunks[hash]; ok {
-		entry.refs++
+	// Fast path: dedup hit. Increment refs atomically while holding only
+	// the read lock so concurrent dedup hits on the same shard don't
+	// serialize.
+	shard.mu.RLock()
+	if entry, ok := shard.chunks[hash]; ok {
+		entry.refs.Add(1)
+		shard.mu.RUnlock()
 		s.dedupHits.Add(1)
 		return hash, true, nil
 	}
+	shard.mu.RUnlock()
 
-	nextBytes := s.bytes.Load() + int64(len(content))
-	if s.memoryLimit > 0 && nextBytes > s.memoryLimit {
-		s.rejected.Add(1)
-		return Hash{}, false, ErrMemoryPressure
+	// Slow path: reserve the budget, allocate the slot, then commit
+	// under the shard write lock. We allocate before taking the write
+	// lock so the (potentially slow) arena allocation does not extend
+	// the critical section.
+	if err := s.reserveBytes(int64(len(content))); err != nil {
+		return Hash{}, false, err
 	}
-
 	slot, err := s.arena.Allocate(len(content))
 	if err != nil {
+		s.releaseBytes(int64(len(content)))
 		return Hash{}, false, err
 	}
 	copy(slot.bytes, content)
-	s.chunks[hash] = &chunkEntry{slot: slot, refs: 1}
-	s.bytes.Store(nextBytes)
+
+	shard.mu.Lock()
+	if existing, ok := shard.chunks[hash]; ok {
+		// Concurrent inserter won the race. Drop our slot and adopt
+		// theirs. The Acquire-equivalent (refs += 1) happens under
+		// the write lock here; correctness is the same as the fast
+		// path above.
+		existing.refs.Add(1)
+		shard.mu.Unlock()
+		s.arena.Free(slot)
+		s.releaseBytes(int64(len(content)))
+		s.dedupHits.Add(1)
+		return hash, true, nil
+	}
+	entry := &chunkEntry{slot: slot}
+	entry.refs.Store(1)
+	shard.chunks[hash] = entry
+	shard.mu.Unlock()
 	s.uniquePuts.Add(1)
 	return hash, false, nil
 }
 
 func (s *ChunkStore) Acquire(hash Hash) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	entry, ok := s.chunks[hash]
+	shard := s.shardFor(hash)
+	shard.mu.RLock()
+	entry, ok := shard.chunks[hash]
 	if !ok {
+		shard.mu.RUnlock()
 		return ErrChunkNotFound
 	}
-	entry.refs++
+	entry.refs.Add(1)
+	shard.mu.RUnlock()
 	return nil
 }
 
 func (s *ChunkStore) Release(hash Hash) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	entry, ok := s.chunks[hash]
+	shard := s.shardFor(hash)
+	shard.mu.Lock()
+	entry, ok := shard.chunks[hash]
 	if !ok {
+		shard.mu.Unlock()
 		return ErrChunkNotFound
 	}
-	if entry.refs <= 1 {
-		s.bytes.Add(-int64(entry.slot.Size()))
-		delete(s.chunks, hash)
+	if entry.refs.Load() <= 1 {
+		size := int64(entry.slot.Size())
+		delete(shard.chunks, hash)
+		shard.mu.Unlock()
 		s.arena.Free(entry.slot)
+		s.releaseBytes(size)
 		return nil
 	}
-	entry.refs--
+	entry.refs.Add(-1)
+	shard.mu.Unlock()
 	return nil
 }
 
@@ -150,10 +240,11 @@ func (s *ChunkStore) Release(hash Hash) error {
 // which avoids the per-call allocation by writing directly into the
 // caller's destination slice.
 func (s *ChunkStore) Get(hash Hash) ([]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	shard := s.shardFor(hash)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
 
-	entry, ok := s.chunks[hash]
+	entry, ok := shard.chunks[hash]
 	if !ok {
 		return nil, ErrChunkNotFound
 	}
@@ -171,10 +262,11 @@ func (s *ChunkStore) CopyInto(dst []byte, hash Hash, off int) (int, error) {
 	if len(dst) == 0 {
 		return 0, nil
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	shard := s.shardFor(hash)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
 
-	entry, ok := s.chunks[hash]
+	entry, ok := shard.chunks[hash]
 	if !ok {
 		return 0, ErrChunkNotFound
 	}
@@ -191,32 +283,37 @@ func (s *ChunkStore) CopyInto(dst []byte, hash Hash, off int) (int, error) {
 }
 
 func (s *ChunkStore) Has(hash Hash) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	_, ok := s.chunks[hash]
+	shard := s.shardFor(hash)
+	shard.mu.RLock()
+	_, ok := shard.chunks[hash]
+	shard.mu.RUnlock()
 	return ok
 }
 
 func (s *ChunkStore) RefCount(hash Hash) int32 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if entry, ok := s.chunks[hash]; ok {
-		return entry.refs
+	shard := s.shardFor(hash)
+	shard.mu.RLock()
+	entry, ok := shard.chunks[hash]
+	shard.mu.RUnlock()
+	if !ok {
+		return 0
 	}
-	return 0
+	return entry.refs.Load()
 }
 
 func (s *ChunkStore) Stats() ChunkStoreStats {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+	var chunks int
 	var refs int64
-	for _, entry := range s.chunks {
-		refs += int64(entry.refs)
+	for _, shard := range s.shards {
+		shard.mu.RLock()
+		chunks += len(shard.chunks)
+		for _, entry := range shard.chunks {
+			refs += int64(entry.refs.Load())
+		}
+		shard.mu.RUnlock()
 	}
-
 	return ChunkStoreStats{
-		Chunks:           len(s.chunks),
+		Chunks:           chunks,
 		Bytes:            s.bytes.Load(),
 		MemoryLimit:      s.memoryLimit,
 		Refs:             refs,
@@ -249,9 +346,14 @@ func (s *ChunkStore) ArenaMappedBytes() int64 {
 // teardown, but explicit Close is strongly preferred for deterministic
 // reclaim.
 func (s *ChunkStore) Close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.chunks = nil
+	if !s.closed.CompareAndSwap(false, true) {
+		return
+	}
+	for _, shard := range s.shards {
+		shard.mu.Lock()
+		shard.chunks = nil
+		shard.mu.Unlock()
+	}
 	s.bytes.Store(0)
 	s.arena.Close()
 }

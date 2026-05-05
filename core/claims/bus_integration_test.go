@@ -118,6 +118,7 @@ func newBusBackedBoard(t *testing.T, bus DeltaBus) *ClaimsBoard {
 		PipelineID: "pipe",
 		TaskID:     "task",
 		DeltaBus:   bus,
+		Scope:      &testScope{},
 	})
 }
 

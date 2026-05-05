@@ -220,6 +220,11 @@ func (e *Engineer) applyToolCalls(
 		isError := false
 		if err != nil {
 			switch {
+			case shared.IsConsultYielded(err):
+				// LLM yielded mid-turn awaiting peer consults.
+				// Surface the sentinel so the outer loop exits
+				// without appending a tool result message.
+				return errCount, shared.ErrConsultYielded, delegatedMessage
 			case errors.Is(err, skills.ErrRerouteRequested):
 				controlErr = skills.ErrRerouteRequested
 				result = `{"rerouted": true}`

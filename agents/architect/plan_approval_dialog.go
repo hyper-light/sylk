@@ -252,7 +252,11 @@ func (a *Architect) handlePlanApprovalContinuation(
 		// Modify means the user wants the plan revised. The cached
 		// audit applies to the soon-to-be-stale plan; invalidate it
 		// so the next presentation re-runs against the revised plan.
+		// Also drop any prepared DAG the orchestrator was holding for
+		// this plan revision — the next plan generation will publish
+		// a fresh prepare against the revised payload.
 		a.invalidatePlanAuditCache(plan.ID)
+		a.publishDiscardPrepared(context.Background(), plan)
 		ask := "What would you like changed about the plan? Tell me which tasks to revise, what to add, or what to remove and I'll update it for you."
 		if reason != "" {
 			ask = ask + "\n\n" + reason
@@ -262,8 +266,10 @@ func (a *Architect) handlePlanApprovalContinuation(
 	case planapproval.VerdictReject:
 		// Reject is the cancel verb. The current plan is being scrapped;
 		// drop its cached audit so a fresh-direction follow-up doesn't
-		// reuse stale evidence.
+		// reuse stale evidence. Likewise, tell the orchestrator to
+		// drop its prepared DAG so prep state isn't leaked.
 		a.invalidatePlanAuditCache(plan.ID)
+		a.publishDiscardPrepared(context.Background(), plan)
 		ask := "Understood — the plan isn't right. What would you like to do instead? You can describe a different approach or tell me to start over from scratch."
 		if reason != "" {
 			ask = ask + "\n\n" + reason

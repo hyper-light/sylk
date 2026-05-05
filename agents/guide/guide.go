@@ -1127,10 +1127,12 @@ func (g *Guide) tryConversationFastPath(ctx context.Context, request *RouteReque
 	// UpdatedAt and increments Turns, creating a self-reinforcing loop that
 	// prevents the score from ever decaying below threshold.
 
-	// Follow-up claim: conversational continuity decision.
+	// Follow-up claim: conversational continuity is a cycle handoff
+	// from the guide to the active agent (the new turn's cycle root
+	// belongs to the target, not to the guide).
 	g.guidePostClaimAsync(request.SessionID,
-		claims.Action{AgentID: "guide", Type: claims.ActionTypeTask},
-		guideRouteClaim(
+		claims.Action{AgentID: "guide", Type: claims.ActionTypeHandoff},
+		guideHandoffClaim(
 			"Continue with "+activeAgentID+" — follow-up detected",
 			"Conversation fast-path: ACT-R activation above threshold",
 			activeAgentID, request.SessionID, request.CorrelationID,
@@ -2138,13 +2140,41 @@ func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *Rou
 		mergeForwardMetadata(classification.PhaseMetadata, request.Metadata),
 	)
 
-	// Post the user prompt on the session claims board and inject the
-	// board ID into metadata. Dispatched async via scope.
+	// Post the user prompt on the session claims board synchronously
+	// so we can stamp the resulting claim ID onto the forwarded
+	// envelope's metadata as parent_claim_id. Without this stamp the
+	// receiver's BeginForwardedRequestCycle falls back to
+	// correlationID-as-claim, the bridge resolver never sees that
+	// fake ID, and every artifact emitted under the prompt cycle is
+	// silently dropped from the UI plane. See docs/CLAIMS_UI.md
+	// "Forwarded-request claim binding". The metadata key matches
+	// shared.MetadataKeyParentClaimID — inlined here to avoid a
+	// guide → shared import cycle.
+	//
+	// Only TUI-originated user prompts mint a new ActionTypePrompt
+	// claim. Agent-originated routes (consult_peer, challenge_peer,
+	// direct protocol exchanges, archivalist briefs, fire-and-forget
+	// sub-requests, control-plane coordination) MUST NOT mint a
+	// prompt cycle: their parent claim is the agent's own
+	// in-progress work, already stamped on request.Metadata's
+	// parent_claim_id by the dispatching skill. Minting a fresh
+	// prompt claim here would (a) produce a phantom top-level user
+	// prompt cycle owned by the target agent and (b) overwrite the
+	// real parent_claim_id, severing the responder's testament
+	// from the originating consultation/challenge claim and breaking
+	// the bridge's nested-row attribution. See the diagnosis in
+	// docs/CLAIMS_UI.md "Guide route semantics".
 	if board := g.sessionClaimsBoard(request.SessionID); board != nil {
 		metadata = mergeForwardMetadata(metadata, map[string]any{
 			"session_board_id": board.BoardID(),
 		})
-		g.dispatchPromptAction(board, request, classification)
+		if shouldPostPromptClaim(request, metadata) {
+			if promptClaimID := g.dispatchPromptAction(board, request, classification); promptClaimID != "" {
+				metadata = mergeForwardMetadata(metadata, map[string]any{
+					"parent_claim_id": promptClaimID,
+				})
+			}
+		}
 	}
 
 	fwd := &ForwardedRequest{
@@ -2206,32 +2236,86 @@ func (g *Guide) sessionClaimsBoard(sessionID string) *claims.ClaimsBoard {
 	return g.conversation.SessionClaimsBoard(sessionID, adaptScope(g.scope))
 }
 
-// dispatchPromptAction posts the user prompt to the session board
-// asynchronously via the Guide's goroutine scope.
-func (g *Guide) dispatchPromptAction(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) {
-	reqCopy := *request
-	var classCopy *RouteResult
-	if classification != nil {
-		c := *classification
-		classCopy = &c
+// shouldPostPromptClaim reports whether buildForwardedRequest
+// should mint a fresh ActionTypePrompt claim for this route. Only
+// TUI-originated user prompts qualify:
+//
+//   - SourceAgentID == "tui": user typed it; the prompt cycle is
+//     the user's top-level intent.
+//   - request.Metadata has no parent_claim_id: the route is not
+//     already nested under another claim's cycle. Make this
+//     write-once — if a parent_claim_id is already there, the
+//     dispatching skill stamped it deliberately and Guide must not
+//     overwrite it.
+//   - !FireAndForget: fire-and-forget sub-requests are async work
+//     ordered by the dispatching agent, not user intent.
+//   - no control_plane_kind: control-plane coordination (plan
+//     handoff, command-approval hold/resolve, protocol
+//     reconciliation) is invisible system traffic that must never
+//     open a visible cycle.
+//
+// All other routes preserve their existing parent_claim_id (or
+// remain unstamped if the dispatcher chose not to stamp one).
+func shouldPostPromptClaim(request *RouteRequest, metadata map[string]any) bool {
+	if request == nil {
+		return false
 	}
+	if strings.TrimSpace(request.SourceAgentID) != sourceAgentTUI {
+		return false
+	}
+	if request.FireAndForget {
+		return false
+	}
+	if metadataHasNonEmptyString(metadata, "parent_claim_id") {
+		return false
+	}
+	if metadataHasNonEmptyString(metadata, "control_plane_kind") {
+		return false
+	}
+	return true
+}
 
-	if g.scope == nil {
-		// No goroutine scope (test fixtures). Run synchronously.
-		if err := postUserPromptAction(board, &reqCopy, classCopy); err != nil {
-			recordPromptActionFailure(context.Background(), board, request.SessionID, err)
-		}
-		return
+// metadataHasNonEmptyString returns true when metadata[key] is a
+// non-empty string. Tolerates nil maps, missing keys, and non-
+// string values (treats anything that isn't a populated string as
+// "not set").
+func metadataHasNonEmptyString(metadata map[string]any, key string) bool {
+	if len(metadata) == 0 {
+		return false
 	}
-	if err := g.scope.Go("guide_post_prompt_action", 5*time.Second, func(ctx context.Context) error {
-		if err := postUserPromptAction(board, &reqCopy, classCopy); err != nil {
-			recordPromptActionFailure(ctx, board, reqCopy.SessionID, err)
-			return err
-		}
-		return nil
-	}); err != nil {
+	value, ok := metadata[key]
+	if !ok {
+		return false
+	}
+	str, ok := value.(string)
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(str) != ""
+}
+
+// sourceAgentTUI mirrors the constant in ui/app.go so the guide
+// can identify TUI-originated requests without a UI import. The
+// canonical value is the same string ("tui"); the duplicated
+// constant exists only to break the import cycle.
+const sourceAgentTUI = "tui"
+
+// dispatchPromptAction posts the user prompt to the session board
+// SYNCHRONOUSLY and returns the resulting claim ID so the caller can
+// stamp it onto the outgoing forwarded-request envelope as
+// parent_claim_id. Posting inline (board.PostAction is fast) is the
+// only way to guarantee the receiver sees a real claim ID — the prior
+// async dispatch raced the envelope and the receiver fell back to
+// using correlationID as a fake claim anchor (UI artifacts then
+// stranded forever, never rendered). Returns "" if the post failed
+// or the input was empty; callers must tolerate empty by NOT stamping.
+func (g *Guide) dispatchPromptAction(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) string {
+	claimID, err := postUserPromptAction(board, request, classification)
+	if err != nil {
 		recordPromptActionFailure(context.Background(), board, request.SessionID, err)
+		return ""
 	}
+	return claimID
 }
 
 // recordPromptActionFailure submits a testament with an error artifact
@@ -2270,11 +2354,17 @@ func recordPromptActionFailure(ctx context.Context, board *claims.ClaimsBoard, s
 }
 
 // postUserPromptAction records the user's input on the session claims
-// board as a prompt action. Returns the error from the board write.
-func postUserPromptAction(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) error {
+// board as a prompt action. Returns the posted claim's ID and the
+// error from the board write. Callers stamp the returned ID onto the
+// outgoing ForwardedRequest's Metadata as parent_claim_id so the
+// receiver's BeginForwardedRequestCycle binds its accumulator to the
+// REAL claim — never to a synthetic correlation-as-claim fallback,
+// which the bridge resolver doesn't recognize and which strands every
+// downstream artifact.
+func postUserPromptAction(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) (string, error) {
 	input := strings.TrimSpace(request.Input)
 	if input == "" {
-		return nil
+		return "", nil
 	}
 
 	targetAgent := ""
@@ -2294,7 +2384,7 @@ func postUserPromptAction(board *claims.ClaimsBoard, request *RouteRequest, clas
 		Relations: []claims.Relation{
 			{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
 		},
-		Tags: []string{"user_prompt"},
+		Tags: streamCorrelationTagsFor(request),
 	}
 	if targetAgent != "" {
 		promptClaim.Relations = append(promptClaim.Relations, claims.Relation{
@@ -2312,7 +2402,14 @@ func postUserPromptAction(board *claims.ClaimsBoard, request *RouteRequest, clas
 		})
 	}
 
-	return board.PostAction(context.Background(), action, []claims.Claim{promptClaim})
+	posted := []claims.Claim{promptClaim}
+	if err := board.PostAction(context.Background(), action, posted); err != nil {
+		return "", err
+	}
+	if len(posted) > 0 {
+		return strings.TrimSpace(posted[0].ID), nil
+	}
+	return "", nil
 }
 
 func truncateForClaim(s string, max int) string {
@@ -2320,6 +2417,31 @@ func truncateForClaim(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
+}
+
+// streamCorrelationTagPrefix identifies the prompt claim's
+// route-level stream correlation ID. The bridge scans for this
+// prefix when a prompt cycle opens so it can stamp the chat panel's
+// cycle entry with the matching stream correlation, folding
+// StreamStartMsg/Chunk/Complete events onto the same row as claim
+// artifacts. See ui/bridge/claims.go promptStreamCorrelationFromClaim
+// and ui/chat/model.go ensureCycleChatEntry.
+const streamCorrelationTagPrefix = "stream_corr_id:"
+
+// streamCorrelationTagsFor returns the tag set for a user-prompt
+// claim. Always includes "user_prompt" for downstream filters; adds
+// the stream correlation tag when the route request carries one,
+// which is what links the guide's stream watcher to the cycle the
+// bridge will open.
+func streamCorrelationTagsFor(request *RouteRequest) []string {
+	tags := []string{"user_prompt"}
+	if request == nil {
+		return tags
+	}
+	if cid := strings.TrimSpace(request.CorrelationID); cid != "" {
+		tags = append(tags, streamCorrelationTagPrefix+cid)
+	}
+	return tags
 }
 
 func (g *Guide) attachEnrichment(
@@ -5243,10 +5365,15 @@ func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *Forward
 		Intent:      string(forwarded.Intent),
 	})
 
-	// Route claim: "this request should go to {agent}."
+	// Handoff claim: classification resolved → cycle ownership
+	// transfers to {agent}. The bridge's cycle resolver consumes the
+	// ActionTypeHandoff shape to draw the handoff edge (UI_DESIGN.md
+	// §5.2); under the prior ActionTypeTask shape the edge was
+	// invisible and routing to a non-guide peer never registered as a
+	// cycle transition.
 	g.guidePostClaimAsync(forwarded.SessionID,
-		claims.Action{AgentID: "guide", Type: claims.ActionTypeTask},
-		guideRouteClaim(
+		claims.Action{AgentID: "guide", Type: claims.ActionTypeHandoff},
+		guideHandoffClaim(
 			"Route to "+resolvedTarget,
 			"Forward request: intent="+string(forwarded.Intent)+" domain="+string(forwarded.Domain),
 			resolvedTarget, forwarded.SessionID, forwarded.CorrelationID,

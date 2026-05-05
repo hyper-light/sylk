@@ -184,7 +184,7 @@ func (gi *GlobalInspector) runAuditToolLoop(ctx context.Context, req *providers.
 		emittedFlag.Store(true)
 		inner(r)
 	})
-	_, err := agentShared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	_, err := agentShared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return gi.executeToolLoop(wrapCtx, req, ledger)
 	})
 	return emittedFlag.Load(), err

@@ -21,15 +21,20 @@ func (g *Guardian) guardianBoard() *claims.ClaimsBoard {
 // guardianPostClaim posts an action with a single claim to the session board.
 // Best-effort: board unavailability does not fail the caller. Returns the
 // posted claim ID (empty if board unavailable or post failed).
+//
+// Registers a just-in-time response Expectation on the guardian's
+// inbox after a successful PostAction (CLAIMS.md §5).
 func (g *Guardian) guardianPostClaim(ctx context.Context, action claims.Action, claim claims.Claim) string {
 	board := g.guardianBoard()
 	if board == nil {
 		return ""
 	}
-	if err := board.PostAction(ctx, action, []claims.Claim{claim}); err != nil {
+	posted := []claims.Claim{claim}
+	if err := board.PostAction(ctx, action, posted); err != nil {
 		board.RecordNotificationError("guardian post claim: " + err.Error())
 		return ""
 	}
+	claims.RegisterPostActionExpectations(g.claimsInbox, action, posted)
 	return claim.ID
 }
 
@@ -170,10 +175,16 @@ func (g *Guardian) processClaimsEntry(ctx context.Context, entry *claims.GraphEn
 		return fmt.Errorf("guardian: LLM provider not configured")
 	}
 
-	acc := claims.NewTestamentAccumulator("guardian", g.activeSessionID)
+	acc := shared.NewClaimsEntryAccumulator("guardian", g.activeSessionID, entry)
+	acc.WithBoard(g.guardianBoard())
 	defer acc.Flush(ctx, g.guardianBoard(), nil)
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
+
+	if entry.Node.Claim != nil {
+		shared.RecordAgentState(ctx, g.guardianBoard(), entry.Node.Claim.ID,
+			"Acknowledging request", shared.AgentStateReasoning, nil)
+	}
 
 	userMessage := shared.ComposeClaimsEntryPrompt(entry)
 	board := g.guardianBoard()
@@ -192,7 +203,15 @@ func (g *Guardian) processClaimsEntry(ctx context.Context, entry *claims.GraphEn
 	ledger := g.steering.Create(entry.Delta.DeltaKey(), g.id, g.activeSessionID, nil, nil)
 	defer g.steering.Close(entry.Delta.DeltaKey(), ctx.Err() != nil)
 
-	result, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	ctx = shared.WithContinuationStore(ctx, g.continuationStore)
+	ctx = shared.WithTurnContext(ctx, &shared.TurnContext{
+		Request:       req,
+		CorrelationID: guardianLedgerCorrelation(ledger, g.activeSessionID),
+		AgentID:       g.id,
+		SessionID:     g.activeSessionID,
+	})
+
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		content, _, loopErr := g.executeToolLoop(ctx, req, "claims_entry", nil, ledger)
 		return content, loopErr
 	})

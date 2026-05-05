@@ -105,7 +105,10 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 			return "", fmt.Errorf("orchestrator repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted, delegated, delegatedMessage := o.applyToolCalls(ctx, req, resp)
+		errCount, rerouted, delegated, delegatedMessage, yielded := o.applyToolCalls(ctx, req, resp)
+		if yielded {
+			return "", shared.ErrConsultYielded
+		}
 		o.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
@@ -123,18 +126,22 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 }
 
 // applyToolCalls appends the assistant message and tool results to the request.
-// Returns the error count and whether a reroute was requested.
+// Returns (errCount, rerouted, delegated, delegatedMessage, yielded). When
+// yielded is true, the caller MUST exit the tool loop and propagate
+// shared.ErrConsultYielded — a continuation is persisted and resume
+// will fire from the inbox when awaited consults resolve.
 func (o *Orchestrator) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
-) (int, bool, bool, string) {
+) (int, bool, bool, string, bool) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
 	rerouted := false
 	delegated := false
 	delegatedMessage := ""
+	yielded := false
 	for _, call := range resp.ToolCalls {
 		o.publishActivity(events.EventTypeToolResult, call.Name)
 		var execResult toolruntime.ExecutionResult
@@ -149,6 +156,10 @@ func (o *Orchestrator) applyToolCalls(
 		}
 		isError := false
 		if err != nil {
+			if shared.IsConsultYielded(err) {
+				yielded = true
+				return errCount, rerouted, delegated, delegatedMessage, yielded
+			}
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
@@ -184,7 +195,7 @@ func (o *Orchestrator) applyToolCalls(
 			break
 		}
 	}
-	return errCount, rerouted, delegated, delegatedMessage
+	return errCount, rerouted, delegated, delegatedMessage, yielded
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.

@@ -163,6 +163,20 @@ func (c *Container) Start(ctx context.Context) error {
 	return nil
 }
 
+// SignalShutdown cancels the container's scope's parent ctx without
+// waiting for workers to drain. Use at the very start of a graceful
+// shutdown so every tracked worker inside this container sees
+// cancellation as early as possible — they can wind down while the
+// caller is doing other work, instead of only learning about the
+// shutdown when Stop() runs and synchronously waits on
+// scope.Shutdown. Idempotent and safe to call before Stop().
+func (c *Container) SignalShutdown() {
+	if c == nil || c.scope == nil {
+		return
+	}
+	c.scope.SignalShutdown()
+}
+
 // Stop transitions the container through Stopping → Stopped. Runs pre-stop
 // hook, terminates the agent, shuts down the scope, then runs post-stop hook.
 func (c *Container) Stop(ctx context.Context) error {

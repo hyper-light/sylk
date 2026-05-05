@@ -14,8 +14,8 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
-	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
@@ -56,10 +56,11 @@ type Designer struct {
 	pipelineName  string
 	usageAccum    *designerUsageAccumulator
 
-	claimsBoard     *claims.ClaimsBoard
-	activeSessionID atomic.Value // string — set per-request from fwd.SessionID
-	scope           *concurrency.GoroutineScope
-	claimsInbox     *claims.ClaimsInbox
+	claimsBoard       *claims.ClaimsBoard
+	activeSessionID   atomic.Value // string — set per-request from fwd.SessionID
+	scope             *concurrency.GoroutineScope
+	claimsInbox       *claims.ClaimsInbox
+	continuationStore *shared.ContinuationStore
 
 	state    *DesignerState
 	stateMu  sync.RWMutex
@@ -392,14 +393,27 @@ func (d *Designer) Start(bus guide.EventBus) error {
 		return fmt.Errorf("failed to subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
+	// ContinuationStore for ticket-mode consult_peer + await_consults.
+	d.continuationStore = shared.NewContinuationStore(shared.ContinuationStoreConfig{
+		AgentID:   d.id,
+		SessionID: d.config.SessionID,
+		Board:     d.designerBoard(),
+		Scope:     d.scope,
+		ResumeFn:  d.resumeContinuation,
+	})
+	d.continuationStore.RecoverPendingContinuations(context.Background())
+
 	// Claims intake: event-driven delta processing.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:      d.id,
-		SessionID:    d.config.SessionID,
-		Bus:          bus,
-		Board:        d.designerBoard(),
-		Scope:        d.scope,
-		ProcessEntry: d.processClaimsEntry,
+		AgentID:           d.id,
+		SessionID:         d.config.SessionID,
+		Bus:               bus,
+		Board:             d.designerBoard(),
+		Scope:             d.scope,
+		ProcessEntry:      d.processClaimsEntry,
+		Identity:          d.identity,
+		Factory:           d.factory,
+		ContinuationStore: d.continuationStore,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("designer_claims_inbox_start_failed", "error", err.Error())
@@ -422,6 +436,10 @@ func (d *Designer) Stop() error {
 	if d.claimsInbox != nil {
 		_ = d.claimsInbox.Close()
 		d.claimsInbox = nil
+	}
+	if d.continuationStore != nil {
+		d.continuationStore.Stop("designer stopped")
+		d.continuationStore = nil
 	}
 
 	d.steering.CloseAll()
@@ -650,6 +668,16 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}
 	startTime := time.Now()
 
+	// Cycle-aware accumulator: honors envelope parent_claim_id for
+	// consult/challenge fulfillments. UI_DESIGN.md §4.7.3.
+	var flushAccumulator func()
+	var beginErr error
+	ctx, flushAccumulator, beginErr = shared.BeginForwardedRequestCycle(ctx, d.id, fwd, d.scope)
+	if beginErr != nil {
+		return beginErr
+	}
+	defer flushAccumulator()
+
 	result, err := d.handleDesign(ctx, fwd)
 	shared.LogResponse(d.steering.EventLogger(), fwd.CorrelationID, d.id, fwd.SessionID, time.Since(startTime), err)
 
@@ -781,24 +809,16 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 	acc.Note("Design task started")
 
 	userMessage := fwd.Input
-	task := shared.DecodePipelineTaskInput(fwd.Input)
 
-	// Claims-based execution context.
+	// Claims-based execution context. Pipeline-task dispatch arrives
+	// through processClaimsEntry on the inbox; this ForwardedRequest
+	// path is reserved for free-form prompts (peer consultations,
+	// ad-hoc invocations) and treats fwd.Input as raw user content.
 	ctx = withClaimsBoardContext(ctx, d.claimsBoard)
 
 	contract := (*shared.TaskExecutionContract)(nil)
-	if task != nil {
-		contract = shared.BuildTaskExecutionContract(task)
-		userMessage = shared.ComposePipelineTaskUserPrompt(task)
-		if workspaceContext := shared.BuildTaskWorkspaceRuntimeContext(ctx, d.workspaceViews, task); workspaceContext != "" {
-			userMessage += "\n\n" + workspaceContext
-		}
-	}
 	userMessage = claims.PrependBoardPreamble(userMessage, d.claimsBoard, "designer")
 	systemPrompt := d.systemPromptForContract(contract)
-	if task != nil {
-		systemPrompt = shared.AppendPipelineSystemContext(systemPrompt, task)
-	}
 
 	d.prepareSkillsForInput(userMessage)
 	surface := d.toolRuntime()
@@ -828,14 +848,16 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 			&agentlog.DesignPayload{Phase: "prompt_composed"})
 	}
 
+	// Synchronously-driven designer turn — caller awaits the response.
+	// Don't stamp WithContinuationStore; consult_peer falls through to
+	// inline RouteSync so the loop completes before this function
+	// returns.
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	result, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
-		return d.executeToolLoopWithSurface(ctx, req, ledger, surface)
+	loopCtx := ctx
+	result, err := shared.ExecuteTurnLoop(loopCtx, ledger, req, func() (string, error) {
+		return d.executeToolLoopWithSurface(loopCtx, req, ledger, surface)
 	})
 	if err != nil {
-		if task != nil {
-			shared.PublishPipelineTaskTerminalErrorUpdate(d.bus, d.id, task, err, shared.PipelineTaskAttempt(task))
-		}
 		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",

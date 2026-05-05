@@ -90,7 +90,7 @@ func (gt *GlobalTester) executeConversationLLM(ctx context.Context, cr testerCon
 	defer cancel()
 
 	ledger := agentshared.SteeringLedgerFromContext(llmCtx)
-	response, err := agentshared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+	response, err := agentshared.ExecuteTurnLoop(ctx, ledger, llmReq, func() (string, error) {
 		return gt.executeToolLoop(llmCtx, llmReq, ledger)
 	})
 	if err != nil {

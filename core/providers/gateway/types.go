@@ -23,21 +23,56 @@ const (
 	PriorityUserInteractive RequestPriority = 100
 )
 
-// Sentinel errors returned by gateway operations.
+// Sentinel errors returned by gateway operations. The scheduler never
+// rejects on count — admission only fails when a caller's wait budget
+// elapses (ErrGatewayTimeout / ctx.Err()) or the gateway is shutting
+// down (ErrGatewayClosed).
 var (
-	ErrSchedulerFull  = errors.New("gateway: scheduler queue is full")
 	ErrGatewayTimeout = errors.New("gateway: max wait time exceeded")
 	ErrGatewayClosed  = errors.New("gateway: closed")
 )
 
-// GatewayConfig configures a ProviderGateway instance.
+// GatewayConfig configures a ProviderGateway instance. The scheduler
+// itself is unbounded by count — admission only fails when a waiter's
+// MaxWaitTime / context deadline expires. MaxQueueSize is an advisory
+// value surfaced to autoscalers (the replica pool reads it via
+// CapacitySnapshot) describing how many waiters the gateway can
+// realistically drain within MaxWaitTime, derived from
+// MaxConcurrentRequests × (MaxWaitTime / TypicalServiceTime). It is
+// not enforced as a hard cap.
 type GatewayConfig struct {
 	Name                  string
 	MaxConcurrentRequests int
 	RateLimit             ratelimit.MultiLayerConfig
 	AgingRate             float64
 	MaxWaitTime           time.Duration
-	MaxQueueSize          int
+
+	// TypicalServiceTime anchors the derivation of the advisory queue
+	// depth (see MaxQueueSize). Use a conservative provider-specific
+	// p50 of stream-completion latency. Required if MaxQueueSize is
+	// zero — the constructor derives it.
+	TypicalServiceTime time.Duration
+
+	// MaxQueueSize is advisory. If zero, derived at NewProviderGateway
+	// from MaxConcurrentRequests, MaxWaitTime, and TypicalServiceTime.
+	// Setting a non-zero value overrides the derivation (for tests).
+	MaxQueueSize int
+}
+
+// DeriveQueueAdvisory returns the advisory queue depth a gateway can
+// drain within maxWait at the given concurrency and typical service
+// latency. Returns 0 when service time is non-positive (caller should
+// apply its own floor). Used at gateway construction and when callers
+// need to recompute the advisory after observing live service times.
+func DeriveQueueAdvisory(maxInflight int, maxWait, typicalService time.Duration) int {
+	if typicalService <= 0 || maxWait <= 0 || maxInflight <= 0 {
+		return 0
+	}
+	rounds := int(maxWait / typicalService)
+	if rounds < 1 {
+		rounds = 1
+	}
+	return maxInflight * rounds
 }
 
 // CapacitySnapshot captures the static concurrency and queueing limits for a
@@ -87,9 +122,21 @@ func (m *GatewayMetrics) Snapshot() MetricsSnapshot {
 	}
 }
 
+// Per-provider TypicalServiceTime anchors. Set to a conservative p50 of
+// observed end-to-end stream latency for each provider. The advisory
+// queue depth (MaxQueueSize) is derived from these via
+// DeriveQueueAdvisory(MaxConcurrentRequests, MaxWaitTime, anchor) and
+// is not hand-picked.
+const (
+	googleOAuthTypicalService = 8 * time.Second
+	googleAPIKeyTypicalService = 12 * time.Second
+	anthropicTypicalService   = 8 * time.Second
+	openaiTypicalService      = 6 * time.Second
+)
+
 // DefaultGoogleOAuthConfig returns gateway defaults for Google OAuth (60 RPM tier).
 func DefaultGoogleOAuthConfig() GatewayConfig {
-	return GatewayConfig{
+	cfg := GatewayConfig{
 		Name:                  "google-oauth",
 		MaxConcurrentRequests: 4,
 		RateLimit: ratelimit.MultiLayerConfig{
@@ -109,15 +156,17 @@ func DefaultGoogleOAuthConfig() GatewayConfig {
 				MaxLimit:     60,
 			},
 		},
-		AgingRate:    2.0,
-		MaxWaitTime:  90 * time.Second,
-		MaxQueueSize: 32,
+		AgingRate:          2.0,
+		MaxWaitTime:        90 * time.Second,
+		TypicalServiceTime: googleOAuthTypicalService,
 	}
+	cfg.MaxQueueSize = DeriveQueueAdvisory(cfg.MaxConcurrentRequests, cfg.MaxWaitTime, cfg.TypicalServiceTime)
+	return cfg
 }
 
 // DefaultGoogleAPIKeyConfig returns gateway defaults for Google API key (10 RPM tier).
 func DefaultGoogleAPIKeyConfig() GatewayConfig {
-	return GatewayConfig{
+	cfg := GatewayConfig{
 		Name:                  "google-apikey",
 		MaxConcurrentRequests: 2,
 		RateLimit: ratelimit.MultiLayerConfig{
@@ -137,15 +186,17 @@ func DefaultGoogleAPIKeyConfig() GatewayConfig {
 				MaxLimit:     10,
 			},
 		},
-		AgingRate:    5.0,
-		MaxWaitTime:  120 * time.Second,
-		MaxQueueSize: 16,
+		AgingRate:          5.0,
+		MaxWaitTime:        120 * time.Second,
+		TypicalServiceTime: googleAPIKeyTypicalService,
 	}
+	cfg.MaxQueueSize = DeriveQueueAdvisory(cfg.MaxConcurrentRequests, cfg.MaxWaitTime, cfg.TypicalServiceTime)
+	return cfg
 }
 
 // DefaultAnthropicConfig returns gateway defaults for Anthropic.
 func DefaultAnthropicConfig() GatewayConfig {
-	return GatewayConfig{
+	cfg := GatewayConfig{
 		Name:                  "anthropic",
 		MaxConcurrentRequests: 4,
 		RateLimit: ratelimit.MultiLayerConfig{
@@ -165,15 +216,17 @@ func DefaultAnthropicConfig() GatewayConfig {
 				MaxLimit:     200,
 			},
 		},
-		AgingRate:    2.0,
-		MaxWaitTime:  90 * time.Second,
-		MaxQueueSize: 32,
+		AgingRate:          2.0,
+		MaxWaitTime:        90 * time.Second,
+		TypicalServiceTime: anthropicTypicalService,
 	}
+	cfg.MaxQueueSize = DeriveQueueAdvisory(cfg.MaxConcurrentRequests, cfg.MaxWaitTime, cfg.TypicalServiceTime)
+	return cfg
 }
 
 // DefaultOpenAIConfig returns gateway defaults for OpenAI.
 func DefaultOpenAIConfig() GatewayConfig {
-	return GatewayConfig{
+	cfg := GatewayConfig{
 		Name:                  "openai",
 		MaxConcurrentRequests: 4,
 		RateLimit: ratelimit.MultiLayerConfig{
@@ -193,8 +246,10 @@ func DefaultOpenAIConfig() GatewayConfig {
 				MaxLimit:     200,
 			},
 		},
-		AgingRate:    2.0,
-		MaxWaitTime:  90 * time.Second,
-		MaxQueueSize: 32,
+		AgingRate:          2.0,
+		MaxWaitTime:        90 * time.Second,
+		TypicalServiceTime: openaiTypicalService,
 	}
+	cfg.MaxQueueSize = DeriveQueueAdvisory(cfg.MaxConcurrentRequests, cfg.MaxWaitTime, cfg.TypicalServiceTime)
+	return cfg
 }

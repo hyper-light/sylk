@@ -157,7 +157,7 @@ func (gt *GlobalTester) runAuditToolLoop(ctx context.Context, req *providers.Req
 		emittedFlag.Store(true)
 		inner(r)
 	})
-	_, err := agentshared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	_, err := agentshared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return gt.executeToolLoop(wrapCtx, req, ledger)
 	})
 	return emittedFlag.Load(), err

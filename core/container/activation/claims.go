@@ -19,18 +19,22 @@ const activationClaimsAgent = "system:activation"
 // ────────────────────────────────────────────────────────────────────
 
 // postActivationSuccess posts an activation claim and testament to the
-// session board. Async via scope.Go — never blocks the activation path.
+// session board. Async via scope.Go — never blocks the activation
+// path. The scope-provided ctx is threaded into board.PostAction and
+// board.SubmitTestaments so a SignalShutdown immediately aborts these
+// workers instead of leaving them blocked on board IO with a
+// never-cancellable context.Background.
 func (ac *ActivationController) postActivationSuccess(agentType string, c *container.Container) {
 	board := ac.loadBoard()
 	if board == nil {
 		return
 	}
 	ac.runAsync("activation_claim_"+agentType, func(ctx context.Context) error {
-		claimID := postActivationClaim(board, agentType)
+		claimID := postActivationClaim(ctx, board, agentType)
 		if claimID == "" {
 			return nil
 		}
-		submitActivationTestament(board, agentType, claimID, c)
+		submitActivationTestament(ctx, board, agentType, claimID, c)
 		return nil
 	})
 }
@@ -43,16 +47,16 @@ func (ac *ActivationController) postActivationError(agentType string, err error)
 		return
 	}
 	ac.runAsync("activation_error_"+agentType, func(ctx context.Context) error {
-		claimID := postActivationClaim(board, agentType)
+		claimID := postActivationClaim(ctx, board, agentType)
 		if claimID == "" {
 			return nil
 		}
-		submitActivationErrorTestament(board, agentType, claimID, err)
+		submitActivationErrorTestament(ctx, board, agentType, claimID, err)
 		return nil
 	})
 }
 
-func postActivationClaim(board *claims.ClaimsBoard, agentType string) string {
+func postActivationClaim(ctx context.Context, board *claims.ClaimsBoard, agentType string) string {
 	if board == nil {
 		return ""
 	}
@@ -76,7 +80,7 @@ func postActivationClaim(board *claims.ClaimsBoard, agentType string) string {
 		}},
 	}
 	posted := []claims.Claim{claim}
-	if err := board.PostAction(context.Background(), action, posted); err != nil {
+	if err := board.PostAction(ctx, action, posted); err != nil {
 		slog.Warn("activation_claim_post_failed", "agent_type", agentType, "error", err.Error())
 		return ""
 	}
@@ -86,7 +90,7 @@ func postActivationClaim(board *claims.ClaimsBoard, agentType string) string {
 	return ""
 }
 
-func submitActivationTestament(board *claims.ClaimsBoard, agentType, claimID string, c *container.Container) {
+func submitActivationTestament(ctx context.Context, board *claims.ClaimsBoard, agentType, claimID string, c *container.Container) {
 	if board == nil || claimID == "" {
 		return
 	}
@@ -107,12 +111,12 @@ func submitActivationTestament(board *claims.ClaimsBoard, agentType, claimID str
 		},
 		Relations: lifecycleClaimRelation(claimID),
 	}
-	if err := board.SubmitTestaments(context.Background(), action, []claims.Testament{testament}); err != nil {
+	if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
 		slog.Warn("activation_testament_failed", "agent_type", agentType, "error", err.Error())
 	}
 }
 
-func submitActivationErrorTestament(board *claims.ClaimsBoard, agentType, claimID string, activationErr error) {
+func submitActivationErrorTestament(ctx context.Context, board *claims.ClaimsBoard, agentType, claimID string, activationErr error) {
 	if board == nil || claimID == "" {
 		return
 	}
@@ -126,7 +130,7 @@ func submitActivationErrorTestament(board *claims.ClaimsBoard, agentType, claimI
 		},
 		Relations: lifecycleClaimRelation(claimID),
 	}
-	if err := board.SubmitTestaments(context.Background(), action, []claims.Testament{testament}); err != nil {
+	if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
 		slog.Warn("activation_error_testament_failed", "agent_type", agentType, "error", err.Error())
 	}
 }
@@ -142,7 +146,7 @@ func newShutdownBoard() *claims.ClaimsBoard {
 	})
 }
 
-func postShutdownClaim(board *claims.ClaimsBoard, agentType string) string {
+func postShutdownClaim(ctx context.Context, board *claims.ClaimsBoard, agentType string) string {
 	if board == nil {
 		return ""
 	}
@@ -166,7 +170,7 @@ func postShutdownClaim(board *claims.ClaimsBoard, agentType string) string {
 		}},
 	}
 	posted := []claims.Claim{claim}
-	if err := board.PostAction(context.Background(), action, posted); err != nil {
+	if err := board.PostAction(ctx, action, posted); err != nil {
 		slog.Warn("shutdown_claim_post_failed", "agent_type", agentType, "error", err.Error())
 		return ""
 	}
@@ -176,7 +180,7 @@ func postShutdownClaim(board *claims.ClaimsBoard, agentType string) string {
 	return ""
 }
 
-func submitShutdownTestament(board *claims.ClaimsBoard, agentType, claimID string, tier ActivationTier) {
+func submitShutdownTestament(ctx context.Context, board *claims.ClaimsBoard, agentType, claimID string, tier ActivationTier) {
 	if board == nil || claimID == "" {
 		return
 	}
@@ -191,12 +195,12 @@ func submitShutdownTestament(board *claims.ClaimsBoard, agentType, claimID strin
 		},
 		Relations: lifecycleClaimRelation(claimID),
 	}
-	if err := board.SubmitTestaments(context.Background(), action, []claims.Testament{testament}); err != nil {
+	if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
 		slog.Warn("shutdown_testament_failed", "agent_type", agentType, "error", err.Error())
 	}
 }
 
-func submitShutdownError(board *claims.ClaimsBoard, agentType, claimID string, shutdownErr error) {
+func submitShutdownError(ctx context.Context, board *claims.ClaimsBoard, agentType, claimID string, shutdownErr error) {
 	if board == nil || claimID == "" {
 		return
 	}
@@ -211,12 +215,12 @@ func submitShutdownError(board *claims.ClaimsBoard, agentType, claimID string, s
 		},
 		Relations: lifecycleClaimRelation(claimID),
 	}
-	if err := board.SubmitTestaments(context.Background(), action, []claims.Testament{testament}); err != nil {
+	if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
 		slog.Warn("shutdown_error_testament_failed", "agent_type", agentType, "error", err.Error())
 	}
 }
 
-func acceptShutdownClaims(board *claims.ClaimsBoard) {
+func acceptShutdownClaims(ctx context.Context, board *claims.ClaimsBoard) {
 	if board == nil {
 		return
 	}
@@ -229,7 +233,7 @@ func acceptShutdownClaims(board *claims.ClaimsBoard) {
 			if v == nil || v.Status != claims.ValidationStatusPending {
 				continue
 			}
-			_ = board.EvaluateValidation(context.Background(), c.ID, v.ID, claims.StatusChange{
+			_ = board.EvaluateValidation(ctx, c.ID, v.ID, claims.StatusChange{
 				To:      string(claims.ValidationStatusPassed),
 				Reason:  "shutdown testament received",
 				AgentID: activationClaimsAgent,

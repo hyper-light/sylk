@@ -123,8 +123,9 @@ type PipelineInspector struct {
 	requestSerializer *agentShared.RequestSerializer
 
 	// Tracked goroutine scope for async claims dispatch.
-	scope       *concurrency.GoroutineScope
-	claimsInbox *claims.ClaimsInbox
+	scope             *concurrency.GoroutineScope
+	claimsInbox       *claims.ClaimsInbox
+	continuationStore *agentShared.ContinuationStore
 }
 
 // SetScope injects the goroutine scope for async claims dispatch.
@@ -379,13 +380,30 @@ func (pi *PipelineInspector) Start(bus guide.EventBus) error {
 	}
 
 	// Claims intake: event-driven delta processing.
+	// ContinuationStore for ticket-mode consult_peer + await_consults.
+	pi.continuationStore = agentShared.NewContinuationStore(agentShared.ContinuationStoreConfig{
+		AgentID:   pi.id,
+		SessionID: pi.config.SessionID,
+		Board:     pi.claimsBoard,
+		Scope:     pi.scope,
+		ResumeFn:  pi.resumeContinuation,
+	})
+	pi.continuationStore.RecoverPendingContinuations(context.Background())
+
+	// Pipeline inspector carries RoleAuditor so it sees every
+	// testament submitted in the session (CLAIMS.md §5.4 —
+	// inspector evaluates testaments).
 	if inbox := agentShared.WireClaimsIntake(agentShared.ClaimsIntakeConfig{
-		AgentID:      pi.id,
-		SessionID:    pi.config.SessionID,
-		Bus:          bus,
-		Board:        pi.claimsBoard,
-		Scope:        pi.scope,
-		ProcessEntry: pi.processClaimsEntry,
+		AgentID:           pi.id,
+		SessionID:         pi.config.SessionID,
+		Role:              claims.RoleSubject | claims.RoleAuditor,
+		Bus:               bus,
+		Board:             pi.claimsBoard,
+		Scope:             pi.scope,
+		ProcessEntry:      pi.processClaimsEntry,
+		Identity:          pi.identity,
+		Factory:           pi.factory,
+		ContinuationStore: pi.continuationStore,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("pipeline_inspector_claims_inbox_start_failed", "error", err.Error())
@@ -420,6 +438,10 @@ func (pi *PipelineInspector) Stop() error {
 	if pi.claimsInbox != nil {
 		_ = pi.claimsInbox.Close()
 		pi.claimsInbox = nil
+	}
+	if pi.continuationStore != nil {
+		pi.continuationStore.Stop("pipeline inspector stopped")
+		pi.continuationStore = nil
 	}
 	pi.steering.CloseAll()
 	if pi.runCancel != nil {
@@ -603,9 +625,19 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 	agentShared.PrependHistoryMessages(req, fwd.ConversationHistory)
 
 	ledger := agentShared.SteeringLedgerFromContext(ctx)
-	result, err := agentShared.ExecuteTurnLoop(ledger, req, func() (string, error) {
-		return pi.executeToolLoopWithSurface(ctx, req, ledger, surface)
+	loopCtx := agentShared.WithContinuationStore(ctx, pi.continuationStore)
+	loopCtx = agentShared.WithTurnContext(loopCtx, &agentShared.TurnContext{
+		Request:       req,
+		CorrelationID: pipelineLedgerCorrelation(ledger, pi.config.SessionID),
+		AgentID:       pi.id,
+		SessionID:     pi.config.SessionID,
 	})
+	result, err := agentShared.ExecuteTurnLoop(loopCtx, ledger, req, func() (string, error) {
+		return pi.executeToolLoopWithSurface(loopCtx, req, ledger, surface)
+	})
+	if agentShared.IsConsultYielded(err) {
+		return nil, nil
+	}
 	if err != nil {
 		if task != nil {
 			agentShared.PublishPipelineTaskTerminalErrorUpdate(pi.bus, pi.id, task, err, agentShared.PipelineTaskAttempt(task))
@@ -769,6 +801,15 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 			pp.Publish("Inspecting the task contract, acceptance criteria, and workspace layers to derive concrete implementation failures.")
 		}
 	}
+
+	// Cycle-aware accumulator. UI_DESIGN.md §4.7.3.
+	var flushAccumulator func()
+	var beginErr error
+	ctx, flushAccumulator, beginErr = agentShared.BeginForwardedRequestCycle(ctx, pi.id, fwd, pi.scope)
+	if beginErr != nil {
+		return beginErr
+	}
+	defer flushAccumulator()
 
 	result, err := pi.Handle(ctx, fwd)
 	agentShared.LogResponse(pi.steering.EventLogger(), fwd.CorrelationID, pi.id, fwd.SessionID, time.Since(startTime), err)

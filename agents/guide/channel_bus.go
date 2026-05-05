@@ -1,8 +1,10 @@
 package guide
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -613,13 +615,28 @@ func (b *ChannelBus) registerWildcardSub(topic string, sub *channelSubscription)
 	}
 }
 
+// Close drains every subscription bounded by the bus's internal
+// closeTimeout. Use CloseWithContext when the caller has its own
+// shutdown budget — Close ignores ctx and waits up to closeTimeout
+// (5s default) which is too long for a sub-second shutdown phase.
 func (b *ChannelBus) Close() error {
+	return b.CloseWithContext(context.Background())
+}
+
+// CloseWithContext drains every subscription, returning when either
+// the drain completes or ctx is canceled. Stuck subscriptions remain
+// running in the background — they are reported in the returned
+// BusCloseTimeoutError so callers can decide what to do (typically:
+// log and rely on the kill watchdog at process exit). This is the
+// path the TUI shutdown takes so a 200ms parent budget bounds the
+// drain wait, not the bus's 5s internal timeout.
+func (b *ChannelBus) CloseWithContext(ctx context.Context) error {
 	if b.closed.Swap(true) {
 		return ErrBusClosed
 	}
 
 	pending := b.closeAllSubscriptions()
-	return b.awaitDrain(pending)
+	return b.awaitDrainCtx(ctx, pending)
 }
 
 // closeAllSubscriptions signals every subscription to drain and exit, and
@@ -656,12 +673,12 @@ func (b *ChannelBus) closeAllSubscriptions() []*channelSubscription {
 	return pending
 }
 
-// awaitDrain waits for all subscription goroutines to finish, bounded by
-// closeTimeout. Returns a *BusCloseTimeoutError wrapping ErrBusCloseTimeout
-// (with identified stuck subscriptions) if the timeout elapses. The waiter
-// goroutine is tracked via closerWG so callers can observe it post-timeout
-// via WaitForPendingClosers.
-func (b *ChannelBus) awaitDrain(pending []*channelSubscription) error {
+// awaitDrainCtx waits for all subscription goroutines to finish,
+// bounded by min(closeTimeout, ctx deadline). On caller cancellation
+// or internal timeout, returns *BusCloseTimeoutError listing stuck
+// subscriptions. The waiter goroutine is tracked via closerWG so
+// callers can observe it post-timeout via WaitForPendingClosers.
+func (b *ChannelBus) awaitDrainCtx(ctx context.Context, pending []*channelSubscription) error {
 	done := make(chan struct{})
 	b.closerWG.Add(1)
 	go func() {
@@ -670,11 +687,35 @@ func (b *ChannelBus) awaitDrain(pending []*channelSubscription) error {
 		close(done)
 	}()
 
+	timeout := time.NewTimer(b.closeTimeout)
+	defer timeout.Stop()
+
 	select {
 	case <-done:
 		b.closerWG.Wait()
 		return nil
-	case <-time.After(b.closeTimeout):
+	case <-ctx.Done():
+		// Caller's deadline — graceful degradation, not a fault.
+		// The stuck subscriptions are a diagnostic signal logged here
+		// for operator visibility, but we return nil so the caller's
+		// shutdown chain doesn't surface this as a process-exit error.
+		// The runtime reaps the still-running subscription handler
+		// goroutines on process exit.
+		stuck := collectStuckSubscriptions(pending)
+		if len(stuck) > 0 {
+			slog.Warn("channel_bus_drain_caller_deadline",
+				"stuck_count", len(stuck),
+				"first_topic", stuck[0].Topic,
+				"first_queued", stuck[0].Queued,
+				"reason", ctx.Err().Error(),
+			)
+		}
+		return nil
+	case <-timeout.C:
+		// Internal 5s timeout — this is a real fault: the bus's own
+		// patience is exhausted, indicating a handler that's been
+		// blocked for an unreasonably long time independent of the
+		// caller's budget. Return the structured error.
 		return &BusCloseTimeoutError{Stuck: collectStuckSubscriptions(pending)}
 	}
 }

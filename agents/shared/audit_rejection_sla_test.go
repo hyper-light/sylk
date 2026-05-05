@@ -62,7 +62,8 @@ func (b *slaCaptureBus) Subscribe(string, guide.MessageHandler) (guide.Subscript
 func (b *slaCaptureBus) SubscribeAsync(string, guide.MessageHandler) (guide.Subscription, error) {
 	return nil, nil
 }
-func (b *slaCaptureBus) Close() error { return nil }
+func (b *slaCaptureBus) Close() error                            { return nil }
+func (b *slaCaptureBus) CloseWithContext(_ context.Context) error { return nil }
 
 func (b *slaCaptureBus) count() int {
 	b.mu.Lock()

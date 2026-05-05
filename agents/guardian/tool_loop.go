@@ -136,8 +136,11 @@ func (g *Guardian) executeToolLoop(
 			return "", usageAcc.Total(), err
 		}
 
-		errCount, rerouted := g.applyToolCalls(ctx, req, resp)
+		errCount, rerouted, yielded := g.applyToolCalls(ctx, req, resp)
 		g.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		if yielded {
+			return "", usageAcc.Total(), shared.ErrConsultYielded
+		}
 		if rerouted {
 			return "", usageAcc.Total(), skills.ErrRerouteRequested
 		}
@@ -219,11 +222,12 @@ func (g *Guardian) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
-) (int, bool) {
+) (int, bool, bool) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
 	rerouted := false
+	yielded := false
 	for i, call := range resp.ToolCalls {
 		if ctx.Err() != nil {
 			break
@@ -246,6 +250,10 @@ func (g *Guardian) applyToolCalls(
 
 		isError := false
 		if err != nil {
+			if shared.IsConsultYielded(err) {
+				yielded = true
+				return errCount, rerouted, yielded
+			}
 			if isRerouteError(err) {
 				rerouted = true
 				result = `{"rerouted": true}`
@@ -289,7 +297,7 @@ func (g *Guardian) applyToolCalls(
 		}
 	}
 
-	return errCount, rerouted
+	return errCount, rerouted, yielded
 }
 
 func isRerouteError(err error) bool {

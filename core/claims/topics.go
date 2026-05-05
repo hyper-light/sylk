@@ -13,13 +13,16 @@ import "strings"
 // literal prefixes.
 
 const (
-	TopicNamespace        = "claims"
-	TopicSegmentInbox      = "inbox"
-	TopicSegmentClaim      = "claim"
-	TopicSegmentValidation = "validation"
-	TopicSegmentPhase      = "phase"
-	TopicWildcard          = "*"
-	topicSeparator         = "."
+	TopicNamespace             = "claims"
+	TopicSegmentInbox            = "inbox"
+	TopicSegmentClaim            = "claim"
+	TopicSegmentValidation       = "validation"
+	TopicSegmentPhase            = "phase"
+	TopicSegmentConsultResolved  = "consult_resolved"
+	TopicSegmentClaimContext     = "claim_context"
+	TopicSegmentTestamentContext = "testament_context"
+	TopicWildcard              = "*"
+	topicSeparator             = "."
 )
 
 // InboxTopic builds the canonical topic for an InboxDelta.
@@ -70,6 +73,51 @@ func PhaseTopic(sessionID string, phase BoardPhase) string {
 	)
 }
 
+// ClaimContextTopic builds the topic for a ClaimContextDelta. Routed
+// per-claim so observers can subscribe to a single claim or wildcard
+// across the session. UI subscribes via ClaimContextPattern("*","*")
+// in its RoleObserver inbox configuration.
+func ClaimContextTopic(sessionID, claimID string) string {
+	return joinTopic(
+		TopicNamespace,
+		normalizeTopicSegment(sessionID),
+		TopicSegmentClaimContext,
+		normalizeTopicSegment(claimID),
+	)
+}
+
+// TestamentContextTopic builds the topic for a TestamentContextDelta.
+// Anchored on AccumulatorID before flush (testament has no ID yet) and
+// on TestamentID after; the helper picks whichever is non-empty.
+func TestamentContextTopic(sessionID, testamentID, accumulatorID string) string {
+	anchor := strings.TrimSpace(testamentID)
+	if anchor == "" {
+		anchor = "acc:" + strings.TrimSpace(accumulatorID)
+	}
+	return joinTopic(
+		TopicNamespace,
+		normalizeTopicSegment(sessionID),
+		TopicSegmentTestamentContext,
+		normalizeTopicSegment(anchor),
+	)
+}
+
+// ConsultResolvedTopic builds the canonical topic for a
+// ConsultResolvedDelta. Routed to the originating agent's personal
+// consult-resolved channel so only the awaiter receives the
+// resolution; broadcast fan-out is avoided. The trailing consult_id
+// segment makes individual resolutions independently addressable for
+// targeted dedup and replay.
+func ConsultResolvedTopic(sessionID, originatorAgentID, consultID string) string {
+	return joinTopic(
+		TopicNamespace,
+		normalizeTopicSegment(sessionID),
+		TopicSegmentConsultResolved,
+		normalizeTopicSegment(originatorAgentID),
+		normalizeTopicSegment(consultID),
+	)
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Subscription pattern helpers
 // ────────────────────────────────────────────────────────────────────
@@ -99,6 +147,23 @@ func AgentInboxRelationshipPattern(sessionFilter, agentID, relationship string) 
 		normalizeTopicSegment(agentID),
 		normalizeTopicSegment(relationship),
 		TopicWildcard,
+	)
+}
+
+// AgentInboxActionPattern matches InboxDeltas directed at agentID
+// with a specific (relationship, ActionType) tuple. Used by
+// InboxPatternsFor to subscribe RoleSubject to the closed set of
+// activation-bearing action types only — system-internal types
+// (boot/activation/shutdown/archival/testament/checkpoint) never
+// match these patterns and therefore never wake an agent.
+func AgentInboxActionPattern(sessionFilter, agentID, relationship string, kind ActionType) string {
+	return joinTopic(
+		TopicNamespace,
+		wildcardOrSegment(sessionFilter),
+		TopicSegmentInbox,
+		normalizeTopicSegment(agentID),
+		normalizeTopicSegment(relationship),
+		normalizeTopicSegment(string(kind)),
 	)
 }
 
@@ -134,6 +199,44 @@ func PhasePattern(sessionFilter string) string {
 		wildcardOrSegment(sessionFilter),
 		TopicSegmentPhase,
 		TopicWildcard,
+	)
+}
+
+// ConsultResolvedPattern matches every ConsultResolvedDelta routed to
+// agentID in the given session. Each issuing agent subscribes to its
+// own pattern so only it sees the resolutions of consults it issued —
+// no broadcast fan-out across the session.
+func ConsultResolvedPattern(sessionFilter, agentID string) string {
+	return joinTopic(
+		TopicNamespace,
+		wildcardOrSegment(sessionFilter),
+		TopicSegmentConsultResolved,
+		normalizeTopicSegment(agentID),
+		TopicWildcard,
+	)
+}
+
+// ClaimContextPattern matches ClaimContextDeltas. Pass "*" for either
+// filter to wildcard. The UI's RoleObserver inbox uses
+// ClaimContextPattern("*", "*") to receive every claim's context
+// updates across the session.
+func ClaimContextPattern(sessionFilter, claimFilter string) string {
+	return joinTopic(
+		TopicNamespace,
+		wildcardOrSegment(sessionFilter),
+		TopicSegmentClaimContext,
+		wildcardOrSegment(claimFilter),
+	)
+}
+
+// TestamentContextPattern matches TestamentContextDeltas. Pass "*"
+// for either filter to wildcard.
+func TestamentContextPattern(sessionFilter, testamentFilter string) string {
+	return joinTopic(
+		TopicNamespace,
+		wildcardOrSegment(sessionFilter),
+		TopicSegmentTestamentContext,
+		wildcardOrSegment(testamentFilter),
 	)
 }
 

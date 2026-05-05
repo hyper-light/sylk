@@ -340,5 +340,6 @@ func (b *captureBusShared) Subscribe(string, guide.MessageHandler) (guide.Subscr
 func (b *captureBusShared) SubscribeAsync(string, guide.MessageHandler) (guide.Subscription, error) {
 	return nil, nil
 }
-func (b *captureBusShared) Close() error { return nil }
-func (b *captureBusShared) count() int   { return len(b.published) }
+func (b *captureBusShared) Close() error                            { return nil }
+func (b *captureBusShared) CloseWithContext(_ context.Context) error { return nil }
+func (b *captureBusShared) count() int                               { return len(b.published) }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -18,27 +19,69 @@ func (a *Architect) architectBoard() *claims.ClaimsBoard {
 	return claims.DefaultSessionBoardRegistry().Lookup(a.config.SessionID)
 }
 
+// architectScope adapts *concurrency.GoroutineScope to claims.ScopeProvider
+// so the testament accumulator's Flush can dispatch async via the
+// architect's tracked scope. Without this adapter, Flush gets passed
+// a nil scope and emits accumulator_flush_scope_unwired errors,
+// dropping every per-claim testament the architect would have
+// recorded.
+func (a *Architect) architectScope() claims.ScopeProvider {
+	if a.scope == nil {
+		return nil
+	}
+	return &architectScopeAdapter{scope: a.scope}
+}
+
+type architectScopeAdapter struct {
+	scope *concurrency.GoroutineScope
+}
+
+func (s *architectScopeAdapter) Go(desc string, timeout time.Duration, fn func(context.Context) error) error {
+	return s.scope.Go(desc, timeout, concurrency.WorkFunc(fn))
+}
+
 // architectPostClaim posts an action with a claim to the session board.
 // Async via scope when available. Best-effort.
+//
+// Stamps a caused_by relation when the context carries an enclosing
+// claim ID via claims.ParentClaimIDFromContext (UI_DESIGN.md §4.5).
+// The architect dispatching from inside an executing plan claim is
+// the canonical case; top-level architect actions (no parent) get no
+// relation and become cycle roots.
+//
+// Just-in-time response routing (CLAIMS.md §5): after a successful
+// PostAction, register a response Expectation on the architect's
+// inbox via claims.RegisterPostActionExpectations. The peer's
+// testament wakes the architect via expectation match (event-driven,
+// targeted), not via a standing subscription firehose.
 func (a *Architect) architectPostClaim(ctx context.Context, action claims.Action, claim claims.Claim) {
 	board := a.architectBoard()
 	if board == nil {
 		return
 	}
+	claim.Relations = shared.AttachCausedByFromContext(ctx, claim.Relations)
+	posted := []claims.Claim{claim}
 	if a.scope != nil {
 		if err := a.scope.Go("architect_post_claim", 5*time.Second, func(gctx context.Context) error {
-			return board.PostAction(gctx, action, []claims.Claim{claim})
+			if err := board.PostAction(gctx, action, posted); err != nil {
+				return err
+			}
+			claims.RegisterPostActionExpectations(a.claimsInbox, action, posted)
+			return nil
 		}); err != nil {
 			slog.Error("architect_post_claim_dispatch_failed", "error", err.Error())
 			board.RecordNotificationError("architect post claim dispatch: " + err.Error())
 		}
 		return
 	}
-	if err := board.PostAction(ctx, action, []claims.Claim{claim}); err != nil {
+	if err := board.PostAction(ctx, action, posted); err != nil {
 		slog.Error("architect_post_claim_failed", "error", err.Error())
 		board.RecordNotificationError("architect post claim: " + err.Error())
+		return
 	}
+	claims.RegisterPostActionExpectations(a.claimsInbox, action, posted)
 }
+
 
 // architectSubmitTestament submits a testament to the session board.
 // Async via scope when available. Best-effort.
@@ -68,8 +111,17 @@ func architectClaimAction(actionType claims.ActionType) claims.Action {
 	return claims.Action{AgentID: "architect", Type: actionType}
 }
 
-// architectClaim builds a claim issued by the architect against itself.
-func architectClaim(title, description string, scope []claims.ClaimScopeEntry, actionType claims.ActionType, validations []*claims.Validation) claims.Claim {
+// architectSelfClaim builds an audit-shaped claim where the architect
+// is BOTH issuer and subject — used to record the architect's own
+// work (tool loops, planning stages) on the board for traceability.
+// The amplifier filters self-claims out of the inbox-delivery path
+// (BoardAmplifier.buildInboxDeltas) so posting one does not wake the
+// architect's own request handler. Use architectClaimWithSubject for
+// directed work targeting a peer (handoff dispatch, consult,
+// challenge); confusing the two is the bug fixed at plan_execution.go
+// where a handoff record was incorrectly self-targeted, leaving its
+// "Orchestrator acknowledges plan receipt" validation unsatisfiable.
+func architectSelfClaim(title, description string, scope []claims.ClaimScopeEntry, actionType claims.ActionType, validations []*claims.Validation) claims.Claim {
 	return claims.Claim{
 		Title:       title,
 		Description: description,
@@ -168,7 +220,7 @@ func (a *Architect) architectStageClaim(ctx context.Context, planID, stageTitle,
 	start := time.Now()
 	a.architectPostClaim(ctx,
 		architectClaimAction(claims.ActionTypeTask),
-		architectClaim(stageTitle, stageDescription,
+		architectSelfClaim(stageTitle, stageDescription,
 			[]claims.ClaimScopeEntry{{Kind: "plan", Key: planID}},
 			claims.ActionTypeTask, nil),
 	)
@@ -193,10 +245,19 @@ func (a *Architect) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 		return fmt.Errorf("architect: LLM planner not configured")
 	}
 
-	acc := claims.NewTestamentAccumulator("architect", a.config.SessionID)
-	defer acc.Flush(ctx, a.architectBoard(), nil)
+	acc := shared.NewClaimsEntryAccumulator("architect", a.config.SessionID, entry)
+	acc.WithBoard(a.architectBoard())
+	defer acc.Flush(ctx, a.architectBoard(), a.architectScope())
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
+
+	// Push: narrate entry into the claim. Surfaces an immediate
+	// "Acknowledging request" status on the architect's row in the
+	// UI before the LLM tool loop produces any output.
+	if entry.Node.Claim != nil {
+		shared.RecordAgentState(ctx, a.architectBoard(), entry.Node.Claim.ID,
+			"Acknowledging request", shared.AgentStateReasoning, nil)
+	}
 
 	userMessage := shared.ComposeClaimsEntryPrompt(entry)
 	board := a.architectBoard()
@@ -215,7 +276,15 @@ func (a *Architect) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 	ledger := a.steering.Create(entry.Delta.DeltaKey(), a.id, a.config.SessionID, nil, nil)
 	defer a.steering.Close(entry.Delta.DeltaKey(), ctx.Err() != nil)
 
-	result, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	ctx = shared.WithContinuationStore(ctx, a.continuationStore)
+	ctx = shared.WithTurnContext(ctx, &shared.TurnContext{
+		Request:       req,
+		CorrelationID: ledgerCorrelationOrDefault(ledger, a.config.SessionID),
+		AgentID:       a.id,
+		SessionID:     a.config.SessionID,
+	})
+
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return a.executeToolLoop(ctx, req, "claims_entry", nil, ledger)
 	})
 	if err != nil {

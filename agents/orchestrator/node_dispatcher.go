@@ -175,25 +175,50 @@ func (d *BusNodeDispatcher) GetACKResult(nodeID string) *ACKResult {
 //
 // Phase 1: Publish task dispatch with ack_topic, wait for agent ACK.
 // Phase 2: Block on result channel for execution completion.
+// firstClaimID returns the first non-empty claim ID from a posted
+// claims slice, for log decoration only. Empty when no claims or all
+// IDs blank.
+func firstClaimID(posted []claims.Claim) string {
+	for _, c := range posted {
+		if c.ID != "" {
+			return c.ID
+		}
+	}
+	return ""
+}
+
 func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parentResults map[string]*dag.NodeResult) (*dag.NodeResult, error) {
-	d.logNodeTrace(node, "dispatch_enter", agentlog.EventTaskDispatched, nil)
+	dispatchStart := time.Now()
+	taskID, taskSlug := dispatchTaskIdentity(node)
+	d.logNodeTrace(node, "dispatch_enter", agentlog.EventTaskDispatched, map[string]any{
+		"task_id":    taskID,
+		"task_slug":  taskSlug,
+		"agent_type": node.AgentType(),
+		"co_agents":  node.CoAgents(),
+	})
 	// Lazy-pod ensure: when an ensurer is installed, build the pod
 	// (atomically with its VFS volume) before any other dispatch
 	// setup. On failure the entire dispatch fails — no message is
 	// published, no claim is posted, no permit is acquired.
-	//
-	// Strict invariant: once Dispatch proceeds past this point with a
-	// non-nil pod, the pod is fully ready (VFS bound, sub-nodes
-	// registered). There is no race window where a pod is observable
-	// without VFS readiness.
 	if d.podEnsurer != nil {
+		ensureStart := time.Now()
+		d.logNodeTrace(node, "dispatch_pod_ensure_begin", agentlog.EventTaskDispatched, map[string]any{
+			"task_id": taskID,
+		})
 		pod, err := d.podEnsurer(ctx, node)
 		if err != nil {
 			d.logNodeTrace(node, "dispatch_pod_ensure_failed", agentlog.EventError, map[string]any{
-				"error": err.Error(),
+				"task_id":     taskID,
+				"elapsed_ms":  time.Since(ensureStart).Milliseconds(),
+				"error":       err.Error(),
 			})
 			return nil, fmt.Errorf("dispatch %s: ensure pod: %w", node.ID(), err)
 		}
+		d.logNodeTrace(node, "dispatch_pod_ensure_done", agentlog.EventTaskDispatched, map[string]any{
+			"task_id":    taskID,
+			"elapsed_ms": time.Since(ensureStart).Milliseconds(),
+			"pod_nil":    pod == nil,
+		})
 		if pod != nil {
 			d.nodePods.Store(node.ID(), pod)
 			defer d.nodePods.Delete(node.ID())
@@ -206,9 +231,6 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	d.pending.Store(node.ID(), ch)
 	d.dispatchDone.Store(node.ID(), done)
 	d.ackWaiters.Store(node.ID(), ackCh)
-	// When the ensurer is in use, nodePods was already populated above.
-	// Otherwise (legacy resolver-only setup, e.g. tests), fall back to
-	// the resolver path so existing behavior is unchanged.
 	if d.podEnsurer == nil {
 		if pod := d.resolvePod(node); pod != nil {
 			d.nodePods.Store(node.ID(), pod)
@@ -222,36 +244,64 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	defer close(done)
 	defer d.releaseContextLease(node.ID())
 
+	leaseStart := time.Now()
+	d.logNodeTrace(node, "dispatch_context_lease_begin", agentlog.EventTaskDispatched, map[string]any{"task_id": taskID})
 	if err := d.acquireContextLease(ctx, node); err != nil {
 		d.logNodeTrace(node, "dispatch_context_lease_failed", agentlog.EventError, map[string]any{
-			"error": err.Error(),
+			"task_id":    taskID,
+			"elapsed_ms": time.Since(leaseStart).Milliseconds(),
+			"error":      err.Error(),
 		})
 		return nil, err
 	}
+	d.logNodeTrace(node, "dispatch_context_lease_ok", agentlog.EventTaskDispatched, map[string]any{
+		"task_id":    taskID,
+		"elapsed_ms": time.Since(leaseStart).Milliseconds(),
+	})
 
-	// Activate target agent if demoted/cold.
-	d.logNodeTrace(node, "dispatch_activate_begin", agentlog.EventTaskDispatched, nil)
+	// Activate target agent if demoted/cold. This is where
+	// pod.HoldForNode runs containers and triggers on-demand agent
+	// creators (slow first time per-agent-type if cold-start cost
+	// hasn't been amortized).
+	activateStart := time.Now()
+	d.logNodeTrace(node, "dispatch_activate_begin", agentlog.EventTaskDispatched, map[string]any{
+		"task_id":     taskID,
+		"agent_types": NodeAgentTypes(node),
+	})
 	if err := d.activateAgents(ctx, node); err != nil {
 		d.logNodeTrace(node, "dispatch_activate_failed", agentlog.EventError, map[string]any{
-			"error": err.Error(),
+			"task_id":    taskID,
+			"elapsed_ms": time.Since(activateStart).Milliseconds(),
+			"error":      err.Error(),
 		})
 		return nil, err
 	}
-	d.logNodeTrace(node, "dispatch_activate_ok", agentlog.EventTaskDispatched, nil)
+	d.logNodeTrace(node, "dispatch_activate_ok", agentlog.EventTaskDispatched, map[string]any{
+		"task_id":    taskID,
+		"elapsed_ms": time.Since(activateStart).Milliseconds(),
+	})
 
 	if d.waitDispatchPermit != nil {
-		d.logNodeTrace(node, "dispatch_permit_wait_begin", agentlog.EventTaskDispatched, nil)
+		permitStart := time.Now()
+		d.logNodeTrace(node, "dispatch_permit_wait_begin", agentlog.EventTaskDispatched, map[string]any{"task_id": taskID})
 		if err := d.waitDispatchPermit(ctx, d.sessionID, d.planID, d.dagID); err != nil {
 			d.logNodeTrace(node, "dispatch_permit_wait_failed", agentlog.EventError, map[string]any{
-				"error": err.Error(),
+				"task_id":    taskID,
+				"elapsed_ms": time.Since(permitStart).Milliseconds(),
+				"error":      err.Error(),
 			})
 			return nil, err
 		}
-		d.logNodeTrace(node, "dispatch_permit_wait_ok", agentlog.EventTaskDispatched, nil)
+		d.logNodeTrace(node, "dispatch_permit_wait_ok", agentlog.EventTaskDispatched, map[string]any{
+			"task_id":    taskID,
+			"elapsed_ms": time.Since(permitStart).Milliseconds(),
+		})
 	}
 
 	// Post Action+Claim on session claims board for this DAG node.
 	if board := claims.DefaultSessionBoardRegistry().Lookup(d.sessionID); board != nil {
+		boardStart := time.Now()
+		d.logNodeTrace(node, "dispatch_node_claim_post_begin", agentlog.EventTaskDispatched, map[string]any{"task_id": taskID})
 		action := claims.Action{
 			AgentID: d.agentID,
 			Type:    claims.ActionTypeTask,
@@ -264,10 +314,10 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 				{Kind: "dag_node", Key: node.ID()},
 				{Kind: "dag", Key: d.dagID},
 			},
-			Relations: []claims.Relation{
+			Relations: shared.AttachCausedByFromContext(ctx, []claims.Relation{
 				{Related: d.agentID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
 				{Related: node.AgentType(), RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
-			},
+			}),
 			Validations: []*claims.Validation{{
 				Type: claims.ValidationTypeReceipt, Required: true,
 				Description: "Node execution completed",
@@ -277,24 +327,59 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 		}
 		postedClaims := []claims.Claim{nodeClaim}
 		if err := board.PostAction(ctx, action, postedClaims); err != nil {
-			slog.Warn("node_dispatch_post_claim_failed", "node_id", node.ID(), "error", err.Error())
-		} else if len(postedClaims) > 0 {
-			d.nodeClaimIDs.Store(node.ID(), postedClaims[0].ID)
+			slog.Warn("node_dispatch_post_claim_failed", "node_id", node.ID(), "task_id", taskID, "error", err.Error())
+			d.logNodeTrace(node, "dispatch_node_claim_post_failed", agentlog.EventError, map[string]any{
+				"task_id":    taskID,
+				"elapsed_ms": time.Since(boardStart).Milliseconds(),
+				"error":      err.Error(),
+			})
+		} else {
+			if len(postedClaims) > 0 {
+				d.nodeClaimIDs.Store(node.ID(), postedClaims[0].ID)
+			}
+			d.logNodeTrace(node, "dispatch_node_claim_post_ok", agentlog.EventTaskDispatched, map[string]any{
+				"task_id":    taskID,
+				"elapsed_ms": time.Since(boardStart).Milliseconds(),
+				"claim_id":   firstClaimID(postedClaims),
+			})
 		}
+	} else {
+		d.logNodeTrace(node, "dispatch_node_claim_skipped_no_board", agentlog.EventTaskDispatched, map[string]any{
+			"task_id":    taskID,
+			"session_id": d.sessionID,
+		})
 	}
 
 	// Build and publish dispatch message with ACK topic.
 	ackTopic := d.ackTopicForNode(node.ID())
 	msg := d.buildDispatchMessage(node, parentResults, ackTopic)
+	d.logNodeTrace(node, "dispatch_message_built", agentlog.EventTaskDispatched, map[string]any{
+		"task_id":   taskID,
+		"ack_topic": ackTopic,
+	})
 
 	// Phase 1: Dispatch + ACK
+	publishStart := time.Now()
+	d.logNodeTrace(node, "dispatch_phase1_begin", agentlog.EventTaskDispatched, map[string]any{
+		"task_id":   taskID,
+		"ack_topic": ackTopic,
+	})
 	ack, err := d.dispatchAndWaitACK(ctx, node, msg, ackTopic, ackCh)
 	if err != nil {
 		d.logNodeTrace(node, "dispatch_ack_failed", agentlog.EventError, map[string]any{
-			"error": err.Error(),
+			"task_id":    taskID,
+			"elapsed_ms": time.Since(publishStart).Milliseconds(),
+			"total_ms":   time.Since(dispatchStart).Milliseconds(),
+			"error":      err.Error(),
 		})
 		return nil, err
 	}
+	d.logNodeTrace(node, "dispatch_phase1_done", agentlog.EventTaskDispatched, map[string]any{
+		"task_id":    taskID,
+		"agent_id":   ack.AgentID,
+		"elapsed_ms": time.Since(publishStart).Milliseconds(),
+		"total_ms":   time.Since(dispatchStart).Milliseconds(),
+	})
 
 	d.ackResults.Store(node.ID(), ack)
 	defer d.ackResults.Delete(node.ID())
@@ -311,14 +396,43 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 		d.onACK(node.ID(), ack)
 	}
 	d.logNodeTrace(node, "dispatch_acked", agentlog.EventNodeAcked, map[string]any{
+		"task_id":        taskID,
 		"ack_agent_id":   ack.AgentID,
 		"ack_agent_type": ack.AgentType,
 	})
 
-	// Phase 2: Wait for result while enforcing an inactivity lease. Pipeline
-	// activity keeps the node alive; silence expires it even when the context
-	// itself has no deadline.
-	return d.waitForNodeResult(ctx, ch, node, activityWindow)
+	// Phase 2: Wait for result while enforcing an inactivity lease.
+	phase2Start := time.Now()
+	d.logNodeTrace(node, "dispatch_phase2_begin", agentlog.EventTaskDispatched, map[string]any{
+		"task_id":            taskID,
+		"activity_window_ms": activityWindow.Milliseconds(),
+	})
+	result, resultErr := d.waitForNodeResult(ctx, ch, node, activityWindow)
+	if resultErr != nil {
+		d.logNodeTrace(node, "dispatch_phase2_failed", agentlog.EventError, map[string]any{
+			"task_id":    taskID,
+			"elapsed_ms": time.Since(phase2Start).Milliseconds(),
+			"total_ms":   time.Since(dispatchStart).Milliseconds(),
+			"error":      resultErr.Error(),
+		})
+		return result, resultErr
+	}
+	d.logNodeTrace(node, "dispatch_phase2_done", agentlog.EventTaskDispatched, map[string]any{
+		"task_id":    taskID,
+		"elapsed_ms": time.Since(phase2Start).Milliseconds(),
+		"total_ms":   time.Since(dispatchStart).Milliseconds(),
+		"state":      resultStateString(result),
+	})
+	return result, nil
+}
+
+// resultStateString returns the node result state name for log
+// decoration. Empty when the result is nil.
+func resultStateString(r *dag.NodeResult) string {
+	if r == nil {
+		return ""
+	}
+	return r.State.String()
 }
 
 func (d *BusNodeDispatcher) nodeActivityWindow(ctx context.Context) time.Duration {
@@ -776,7 +890,7 @@ func (d *BusNodeDispatcher) buildDispatchMessage(node *dag.Node, parentResults m
 	if taskSlug != "" {
 		payload["task_slug"] = taskSlug
 	}
-	if targetAgentID := pipelineWorkerTargetAgentID(taskID, node.AgentType()); targetAgentID != "" && targetAgentID != node.AgentType() {
+	if targetAgentID := pipelineWorkerTargetAgentID(d.sessionID, taskID, node.AgentType()); targetAgentID != "" && targetAgentID != node.AgentType() {
 		payload["target_agent_id"] = targetAgentID
 	}
 

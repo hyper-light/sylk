@@ -103,9 +103,19 @@ func (pi *PipelineInspector) runFeedbackLoop(
 		pi.applyLLMRuntimeProfile(req, "revalidation")
 
 		ledger := agentShared.SteeringLedgerFromContext(ctx)
-		_, err := agentShared.ExecuteTurnLoop(ledger, req, func() (string, error) {
-			return pi.executeToolLoop(ctx, req, ledger)
+		loopCtx := agentShared.WithContinuationStore(ctx, pi.continuationStore)
+		loopCtx = agentShared.WithTurnContext(loopCtx, &agentShared.TurnContext{
+			Request:       req,
+			CorrelationID: pipelineLedgerCorrelation(ledger, pi.config.SessionID),
+			AgentID:       pi.id,
+			SessionID:     pi.config.SessionID,
 		})
+		_, err := agentShared.ExecuteTurnLoop(loopCtx, ledger, req, func() (string, error) {
+			return pi.executeToolLoop(loopCtx, req, ledger)
+		})
+		if agentShared.IsConsultYielded(err) {
+			break
+		}
 		if err != nil {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,

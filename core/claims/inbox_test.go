@@ -77,7 +77,7 @@ func TestInbox_RequiresAgentAndSession(t *testing.T) {
 	}
 }
 
-func TestInbox_StartSubscribesDefaultPatterns(t *testing.T) {
+func TestInbox_StartSubscribesRolePatterns(t *testing.T) {
 	bus := newRecordingBus()
 	inbox, err := NewClaimsInbox(InboxConfig{
 		AgentID: "eng", SessionID: "sess", Subscriber: bus,
@@ -88,11 +88,90 @@ func TestInbox_StartSubscribesDefaultPatterns(t *testing.T) {
 	if err := inbox.Start(nil); err != nil {
 		t.Fatal(err)
 	}
-	patterns := DefaultInboxPatterns("sess", "eng")
+	// Default role (RoleSubject) → one narrow pattern per legitimate
+	// activation action type, plus the personal consult-resolved
+	// pattern. The broad AgentInboxPattern(*.*) is NOT used because
+	// it would match system-internal action types and trigger
+	// feedback loops.
+	patterns := InboxPatternsFor(RoleSubject, "sess", "eng")
+	activation := AgentActivationActionTypes()
+	wantCount := len(activation) + 1 // +1 for ConsultResolvedPattern
+	if len(patterns) != wantCount {
+		t.Fatalf("expected RoleSubject to derive %d patterns (activation + 1 consult_resolved), got %d (%v)", wantCount, len(patterns), patterns)
+	}
 	for _, p := range patterns {
 		if bus.SubscriptionCount(p) == 0 {
 			t.Errorf("no subscription on pattern %q", p)
 		}
+	}
+	// System-typed inbox patterns must NOT be subscribed.
+	systemBlocked := []string{
+		AgentInboxActionPattern("sess", "eng", RelationshipSubject, ActionTypeBoot),
+		AgentInboxActionPattern("sess", "eng", RelationshipSubject, ActionTypeActivation),
+		AgentInboxActionPattern("sess", "eng", RelationshipSubject, ActionTypeShutdown),
+	}
+	for _, p := range systemBlocked {
+		if bus.SubscriptionCount(p) != 0 {
+			t.Errorf("subject role unexpectedly subscribed to system pattern %q", p)
+		}
+	}
+	// The broad firehose patterns are NOT subscribed.
+	broad := []string{
+		"claims.sess.claim.*.*",
+		"claims.sess.validation.*.*",
+		"claims.sess.phase.*",
+	}
+	for _, p := range broad {
+		if bus.SubscriptionCount(p) != 0 {
+			t.Errorf("subject role unexpectedly subscribed to broad pattern %q", p)
+		}
+	}
+}
+
+func TestInbox_RolePatternsForRoleAuditor(t *testing.T) {
+	patterns := InboxPatternsFor(RoleSubject|RoleAuditor, "sess", "inspector")
+	// RoleSubject is now expressed as N narrow per-action-type
+	// patterns (storm-prevention) instead of the broad
+	// AgentInboxPattern(*.*). RoleAuditor adds the testified status
+	// pattern unchanged.
+	for _, ty := range AgentActivationActionTypes() {
+		want := AgentInboxActionPattern("sess", "inspector", RelationshipSubject, ty)
+		if !sliceContains(patterns, want) {
+			t.Errorf("RoleSubject|RoleAuditor missing subject pattern %q", want)
+		}
+	}
+	if !sliceContains(patterns, ClaimStatusPattern("sess", ClaimStatusTestified)) {
+		t.Errorf("RoleSubject|RoleAuditor missing testified status pattern")
+	}
+	// The broad firehose pattern must NOT be present.
+	if sliceContains(patterns, AgentInboxPattern("sess", "inspector")) {
+		t.Errorf("RoleSubject|RoleAuditor unexpectedly subscribed to broad AgentInboxPattern")
+	}
+}
+
+func TestInbox_RolePatternsForRolePhaseObserver(t *testing.T) {
+	patterns := InboxPatternsFor(RoleSubject|RolePhaseObserver, "sess", "orch")
+	var sawPhase bool
+	for _, p := range patterns {
+		if p == PhasePattern("sess") {
+			sawPhase = true
+		}
+	}
+	if !sawPhase {
+		t.Errorf("RolePhaseObserver missing phase pattern, got %v", patterns)
+	}
+}
+
+func TestInbox_RolePatternsForRoleRemediator(t *testing.T) {
+	patterns := InboxPatternsFor(RoleSubject|RoleRemediator, "sess", "architect")
+	var sawRejected bool
+	for _, p := range patterns {
+		if p == ClaimStatusPattern("sess", ClaimStatusRejected) {
+			sawRejected = true
+		}
+	}
+	if !sawRejected {
+		t.Errorf("RoleRemediator missing rejected pattern, got %v", patterns)
 	}
 }
 
@@ -145,23 +224,44 @@ func TestInbox_StandingSubscription_InboxDelta(t *testing.T) {
 	}
 }
 
-func TestInbox_StandingSubscription_PhaseDelta(t *testing.T) {
-	var called atomic.Bool
-	inbox, _ := NewClaimsInbox(InboxConfig{
+func TestInbox_PhaseDelta_RoleGated(t *testing.T) {
+	// PhaseDelta is delivered only to RolePhaseObserver inboxes.
+	var observerCalled, subjectCalled atomic.Bool
+
+	subject, _ := NewClaimsInbox(InboxConfig{
 		AgentID:   "eng",
 		SessionID: "sess",
+		Role:      RoleSubject,
 		OnResolved: func(_ *GraphEntryPoint) {
-			called.Store(true)
+			subjectCalled.Store(true)
 		},
 	})
-	inbox.Ingest(PhaseDelta{
+	subject.Ingest(PhaseDelta{
 		BoardID:   "board-1",
 		FromPhase: BoardPhaseImplementation,
 		ToPhase:   BoardPhaseValidation,
 		Sequence:  5,
 	})
-	if !called.Load() {
-		t.Fatal("expected OnResolved for phase delta")
+	if subjectCalled.Load() {
+		t.Fatal("RoleSubject inbox should not match PhaseDelta")
+	}
+
+	observer, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "orch",
+		SessionID: "sess",
+		Role:      RoleSubject | RolePhaseObserver,
+		OnResolved: func(_ *GraphEntryPoint) {
+			observerCalled.Store(true)
+		},
+	})
+	observer.Ingest(PhaseDelta{
+		BoardID:   "board-1",
+		FromPhase: BoardPhaseImplementation,
+		ToPhase:   BoardPhaseValidation,
+		Sequence:  5,
+	})
+	if !observerCalled.Load() {
+		t.Fatal("RolePhaseObserver inbox should match PhaseDelta")
 	}
 }
 
@@ -300,45 +400,115 @@ func TestInbox_CloseIdempotent(t *testing.T) {
 	}
 }
 
-func TestInbox_TestamentDelta_StandingSubscription_IssuerMatch(t *testing.T) {
-	var called atomic.Bool
-	inbox, _ := NewClaimsInbox(InboxConfig{
+func TestInbox_TestamentDelta_RoleGated(t *testing.T) {
+	// Issuer-side testament delivery flows through Expect(), not
+	// standing subscription. A subject-only inbox never matches a
+	// TestamentDelta via the standing gate.
+	var subjectCalled atomic.Bool
+	subject, _ := NewClaimsInbox(InboxConfig{
 		AgentID:   "eng",
 		SessionID: "sess",
+		Role:      RoleSubject,
 		OnResolved: func(_ *GraphEntryPoint) {
-			called.Store(true)
+			subjectCalled.Store(true)
 		},
 	})
-	inbox.Ingest(TestamentDelta{
+	subject.Ingest(TestamentDelta{
 		ClaimID:        "c1",
 		TestamentID:    "t1",
 		IssuerAgentID:  "eng",
 		SubjectAgentID: "designer",
 		Sequence:       1,
 	})
-	if !called.Load() {
-		t.Fatal("expected OnResolved for issuer match")
+	if subjectCalled.Load() {
+		t.Fatal("RoleSubject inbox should NOT match TestamentDelta via standing — issuer-side path is Expect()")
 	}
-}
 
-func TestInbox_TestamentDelta_NoMatch(t *testing.T) {
-	var called atomic.Bool
-	inbox, _ := NewClaimsInbox(InboxConfig{
-		AgentID:   "eng",
+	// RoleAuditor matches every testament regardless of identity.
+	var auditorCalled atomic.Bool
+	auditor, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "inspector",
 		SessionID: "sess",
+		Role:      RoleSubject | RoleAuditor,
 		OnResolved: func(_ *GraphEntryPoint) {
-			called.Store(true)
+			auditorCalled.Store(true)
 		},
 	})
-	inbox.Ingest(TestamentDelta{
+	auditor.Ingest(TestamentDelta{
 		ClaimID:        "c1",
 		TestamentID:    "t1",
 		IssuerAgentID:  "architect",
 		SubjectAgentID: "designer",
 		Sequence:       1,
 	})
-	if called.Load() {
-		t.Fatal("expected no match (neither issuer nor subject is eng)")
+	if !auditorCalled.Load() {
+		t.Fatal("RoleAuditor inbox should match every TestamentDelta")
+	}
+}
+
+func TestInbox_ClaimStatusDelta_RoleGated(t *testing.T) {
+	// Subject-only inbox does not match claim status deltas via
+	// standing — issuer/subject identity flows are Expect()-driven.
+	var subjectCalled atomic.Bool
+	subject, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "eng",
+		SessionID: "sess",
+		Role:      RoleSubject,
+		OnResolved: func(_ *GraphEntryPoint) {
+			subjectCalled.Store(true)
+		},
+	})
+	subject.Ingest(ClaimStatusDelta{
+		ClaimID:        "c1",
+		ToStatus:       ClaimStatusRejected,
+		IssuerAgentID:  "eng",
+		SubjectAgentID: "eng",
+		Sequence:       1,
+	})
+	if subjectCalled.Load() {
+		t.Fatal("RoleSubject inbox should NOT match ClaimStatusDelta via standing")
+	}
+
+	// RoleRemediator matches ClaimStatusRejected regardless of identity.
+	var remediatorCalled atomic.Bool
+	remediator, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "architect",
+		SessionID: "sess",
+		Role:      RoleSubject | RoleRemediator,
+		OnResolved: func(_ *GraphEntryPoint) {
+			remediatorCalled.Store(true)
+		},
+	})
+	remediator.Ingest(ClaimStatusDelta{
+		ClaimID:        "c1",
+		ToStatus:       ClaimStatusRejected,
+		IssuerAgentID:  "engineer",
+		SubjectAgentID: "designer",
+		Sequence:       1,
+	})
+	if !remediatorCalled.Load() {
+		t.Fatal("RoleRemediator inbox should match ClaimStatusRejected")
+	}
+
+	// RoleRemediator does NOT match ClaimStatusAccepted.
+	var acceptedCalled atomic.Bool
+	remediator2, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "architect2",
+		SessionID: "sess",
+		Role:      RoleSubject | RoleRemediator,
+		OnResolved: func(_ *GraphEntryPoint) {
+			acceptedCalled.Store(true)
+		},
+	})
+	remediator2.Ingest(ClaimStatusDelta{
+		ClaimID:        "c2",
+		ToStatus:       ClaimStatusAccepted,
+		IssuerAgentID:  "engineer",
+		SubjectAgentID: "designer",
+		Sequence:       1,
+	})
+	if acceptedCalled.Load() {
+		t.Fatal("RoleRemediator should not match ClaimStatusAccepted")
 	}
 }
 
@@ -352,6 +522,66 @@ func TestInbox_NilOnResolved_NoError(t *testing.T) {
 	})
 	if inbox.Len() != 1 {
 		t.Fatalf("expected 1 match, got %d", inbox.Len())
+	}
+}
+
+func TestDedupLRU_BoundsAndEviction(t *testing.T) {
+	l := newDedupLRU(3)
+	if !l.observe("a", 1) || !l.observe("b", 1) || !l.observe("c", 1) {
+		t.Fatal("first three observations should be new")
+	}
+	if l.Len() != 3 {
+		t.Fatalf("expected 3 entries, got %d", l.Len())
+	}
+	// Inserting a fourth evicts "a" (oldest).
+	if !l.observe("d", 1) {
+		t.Fatal("fourth observation should be new")
+	}
+	if l.Len() != 3 {
+		t.Fatalf("expected 3 entries after eviction, got %d", l.Len())
+	}
+	if _, ok := l.nodes["a"]; ok {
+		t.Fatal("expected 'a' to be evicted")
+	}
+	// Re-inserting "a" treats it as new (since it was evicted).
+	if !l.observe("a", 1) {
+		t.Fatal("re-inserting evicted key should be new")
+	}
+	// Same key with older sequence is a duplicate.
+	if l.observe("a", 1) {
+		t.Fatal("same (key, seq) should be duplicate")
+	}
+	// Same key with newer sequence is fresh.
+	if !l.observe("a", 2) {
+		t.Fatal("newer sequence on same key should match")
+	}
+}
+
+func TestDedupLRU_TouchKeepsRecentEntries(t *testing.T) {
+	l := newDedupLRU(3)
+	l.observe("a", 1)
+	l.observe("b", 1)
+	l.observe("c", 1)
+	// Touch "a" — bumps it to most-recent.
+	l.observe("a", 2)
+	// Inserting "d" should now evict "b" (oldest after touch).
+	l.observe("d", 1)
+	if _, ok := l.nodes["b"]; ok {
+		t.Fatal("expected 'b' to be evicted after 'a' was touched")
+	}
+	if _, ok := l.nodes["a"]; !ok {
+		t.Fatal("expected 'a' to be retained")
+	}
+}
+
+func TestInbox_Len_DoesNotMatchDuplicates(t *testing.T) {
+	inbox, _ := NewClaimsInbox(InboxConfig{AgentID: "eng", SessionID: "sess"})
+	d := InboxDelta{ClaimID: "c1", AgentID: "eng", Relationship: RelationshipSubject, Sequence: 1}
+	for i := 0; i < 100; i++ {
+		inbox.Ingest(d)
+	}
+	if inbox.Len() != 1 {
+		t.Fatalf("expected 1 match across 100 duplicate ingests, got %d", inbox.Len())
 	}
 }
 
@@ -377,5 +607,114 @@ func TestInbox_ChallengePriority(t *testing.T) {
 	}
 	if entry.Priority != PriorityChallenge {
 		t.Fatalf("expected PriorityChallenge (2), got %d", entry.Priority)
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────
+// InboxClass tagging + per-class accounting
+// ────────────────────────────────────────────────────────────────────
+
+func TestDeltaClass_Mapping(t *testing.T) {
+	cases := []struct {
+		name string
+		d    Delta
+		want InboxClass
+	}{
+		{"consult_request", InboxDelta{ActionKind: ActionTypeConsultation}, InboxClassConsultRequest},
+		{"directed_task", InboxDelta{ActionKind: ActionTypeTask}, InboxClassDirected},
+		{"directed_challenge", InboxDelta{ActionKind: ActionTypeChallenge}, InboxClassDirected},
+		{"directed_corrective", InboxDelta{ActionKind: ActionTypeCorrective}, InboxClassDirected},
+		{"observation_testament", TestamentDelta{}, InboxClassObservation},
+		{"observation_validation", ValidationDelta{}, InboxClassObservation},
+		{"directed_rejected", ClaimStatusDelta{ToStatus: ClaimStatusRejected}, InboxClassDirected},
+		{"observation_accepted", ClaimStatusDelta{ToStatus: ClaimStatusAccepted}, InboxClassObservation},
+		{"phase_transition", PhaseDelta{}, InboxClassPhase},
+		{"nil_delta", nil, InboxClassObservation},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DeltaClass(tc.d); got != tc.want {
+				t.Fatalf("DeltaClass(%T) = %s, want %s", tc.d, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestInbox_DeliveredByClass_IncrementsPerIngest(t *testing.T) {
+	inbox, _ := NewClaimsInbox(InboxConfig{
+		AgentID:    "eng",
+		SessionID:  "sess",
+		OnResolved: func(_ *GraphEntryPoint) {},
+	})
+	// Two consult requests, three observations, one directed.
+	inbox.Ingest(InboxDelta{ClaimID: "c1", AgentID: "eng", Relationship: RelationshipSubject, ActionKind: ActionTypeConsultation, Sequence: 1})
+	inbox.Ingest(InboxDelta{ClaimID: "c2", AgentID: "eng", Relationship: RelationshipSubject, ActionKind: ActionTypeConsultation, Sequence: 1})
+	inbox.Ingest(TestamentDelta{ClaimID: "c3", Sequence: 1})
+	inbox.Ingest(TestamentDelta{ClaimID: "c4", Sequence: 1})
+	inbox.Ingest(TestamentDelta{ClaimID: "c5", Sequence: 1})
+	inbox.Ingest(InboxDelta{ClaimID: "c6", AgentID: "eng", Relationship: RelationshipSubject, ActionKind: ActionTypeTask, Sequence: 1})
+
+	if got, want := inbox.DeliveredByClass(InboxClassConsultRequest), uint64(2); got != want {
+		t.Errorf("ConsultRequest delivered = %d, want %d", got, want)
+	}
+	if got, want := inbox.DeliveredByClass(InboxClassObservation), uint64(3); got != want {
+		t.Errorf("Observation delivered = %d, want %d", got, want)
+	}
+	if got, want := inbox.DeliveredByClass(InboxClassDirected), uint64(1); got != want {
+		t.Errorf("Directed delivered = %d, want %d", got, want)
+	}
+}
+
+// recordingSubWithDrops adds a configurable drop counter to recordingSub
+// so tests can verify Inbox.OverflowCount aggregates per-subscription
+// drops via the optional DroppedCounter contract.
+type recordingSubWithDrops struct {
+	*recordingSub
+	drops atomic.Uint64
+}
+
+func (s *recordingSubWithDrops) DroppedCount() uint64 { return s.drops.Load() }
+
+type droppingBus struct {
+	*recordingBus
+	subs []*recordingSubWithDrops
+}
+
+func (b *droppingBus) SubscribeDelta(pattern string, h DeltaHandler) (DeltaSubscription, error) {
+	inner, err := b.recordingBus.SubscribeDelta(pattern, h)
+	if err != nil {
+		return nil, err
+	}
+	wrapped := &recordingSubWithDrops{recordingSub: inner.(*recordingSub)}
+	b.subs = append(b.subs, wrapped)
+	return wrapped, nil
+}
+
+func TestInbox_OverflowCount_AggregatesAcrossSubscriptions(t *testing.T) {
+	bus := &droppingBus{recordingBus: newRecordingBus()}
+	inbox, _ := NewClaimsInbox(InboxConfig{
+		AgentID:    "ins",
+		SessionID:  "sess",
+		Role:       RoleSubject | RoleAuditor,
+		Subscriber: bus,
+		OnResolved: func(_ *GraphEntryPoint) {},
+	})
+	if err := inbox.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// No drops yet.
+	if got := inbox.OverflowCount(); got != 0 {
+		t.Fatalf("initial OverflowCount = %d, want 0", got)
+	}
+
+	// Inject drops on each subscription.
+	if len(bus.subs) < 2 {
+		t.Fatalf("expected at least 2 subscriptions, got %d", len(bus.subs))
+	}
+	bus.subs[0].drops.Store(7)
+	bus.subs[1].drops.Store(11)
+	if got, want := inbox.OverflowCount(), uint64(18); got != want {
+		t.Fatalf("OverflowCount = %d, want %d", got, want)
 	}
 }

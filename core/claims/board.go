@@ -178,9 +178,23 @@ func (b *ClaimsBoard) Amplifier() *BoardAmplifier {
 // PostAction issues a set of claims as a claim action. Validates all
 // claims for duplicate IDs BEFORE inserting any (no partial mutation).
 // Each claim's Validations carry the correct ClaimID after stamping.
-func (b *ClaimsBoard) PostAction(_ context.Context, action Action, inputClaims []Claim) error {
+//
+// ctx is honored: amplifier emissions (which publish to the delta
+// bus and may block on a slow consumer) propagate ctx so a caller's
+// cancellation aborts the publish chain instead of leaving the
+// caller's worker goroutine pinned in board IO. Pre-cancellation
+// returns ctx.Err() before any mutation; post-mutation cancellation
+// short-circuits the amplifier emissions but the in-memory claim
+// state is already committed (consistent with append-only semantics).
+func (b *ClaimsBoard) PostAction(ctx context.Context, action Action, inputClaims []Claim) error {
 	if len(inputClaims) == 0 {
 		return fmt.Errorf("action must contain at least one claim")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	b.mu.Lock()
@@ -190,6 +204,19 @@ func (b *ClaimsBoard) PostAction(_ context.Context, action Action, inputClaims [
 	if err := b.validatePostActionLocked(inputClaims); err != nil {
 		b.mu.Unlock()
 		return err
+	}
+
+	// Handoff precondition guard (UI_DESIGN.md §4.3 + §7 P2.3): when
+	// the action is a handoff, the issuing agent must have no open
+	// child work, must not currently be the subject of a peer's open
+	// claim, and must have no in-flight tool/peer-interaction
+	// artifacts. Belt-and-suspenders against an agent posting a
+	// handoff action that bypasses the skill-side check.
+	if action.Type == ActionTypeHandoff {
+		if err := b.handoffEligibleLocked(strings.TrimSpace(action.AgentID)); err != nil {
+			b.mu.Unlock()
+			return err
+		}
 	}
 
 	b.stampActionLocked(&action, now)
@@ -207,10 +234,13 @@ func (b *ClaimsBoard) PostAction(_ context.Context, action Action, inputClaims [
 	// Release lock BEFORE notifying subscribers (prevents deadlock).
 	b.mu.Unlock()
 
-	// Amplify: fabric + bus.
-	ctx := context.Background()
+	// Amplify: fabric + bus. Threaded ctx so cancellation aborts the
+	// emission chain rather than leaving callers blocked on bus IO.
 	b.amplifier.EmitActionPosted(ctx, &action)
 	for i := range inputClaims {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		b.amplifier.EmitClaimIssued(ctx, &inputClaims[i])
 		b.amplifier.PublishInboxDeltas(ctx, &action, &inputClaims[i])
 		b.notifyDelta(BoardMutationDelta{
@@ -318,7 +348,13 @@ func (b *ClaimsBoard) indexRelations(objID string, relations []Relation) {
 
 // ── UpdateClaimProgress ─────────────────────────────────────────────
 
-func (b *ClaimsBoard) UpdateClaimProgress(_ context.Context, claimID string, _ ClaimProgressUpdate, agentID string) error {
+func (b *ClaimsBoard) UpdateClaimProgress(ctx context.Context, claimID string, _ ClaimProgressUpdate, agentID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	b.mu.Lock()
 
 	c, ok := b.claims[claimID]
@@ -350,7 +386,6 @@ func (b *ClaimsBoard) UpdateClaimProgress(_ context.Context, claimID string, _ C
 
 	b.mu.Unlock()
 
-	ctx := context.Background()
 	b.amplifier.EmitClaimUpdated(ctx, c, agentID)
 	if statusChanged {
 		b.amplifier.PublishClaimStatusDelta(ctx, ClaimStatusDelta{
@@ -359,6 +394,7 @@ func (b *ClaimsBoard) UpdateClaimProgress(_ context.Context, claimID string, _ C
 			ClaimID:        c.ID,
 			Sequence:       b.seq.Load(),
 			EmittedAt:      now,
+			ActionKind:     c.ActionType,
 			FromStatus:     fromStatus,
 			ToStatus:       c.Status,
 			Reason:         "work started",
@@ -371,14 +407,160 @@ func (b *ClaimsBoard) UpdateClaimProgress(_ context.Context, claimID string, _ C
 	return nil
 }
 
+// ── SetClaimContext / SetTestamentContext ──────────────────────────
+
+// SetClaimContext updates a claim's mutable Context narrative — the
+// agent's current "what am I doing right now" status. Replaces the
+// prior value in place. Increments the claim's monotonic
+// ContextTransition counter for deterministic UI ordering. Emits a
+// ClaimContextDelta on the amplifier; the UI consumes this to refresh
+// the row's status text without creating a new row.
+//
+// Best-effort on terminal claims: if the claim is terminal,
+// SetClaimContext returns nil without mutating — the narrative is
+// sealed at terminal-status transition, and subsequent updates from
+// late-arriving emissions are dropped silently. See docs/CLAIMS_UI.md.
+func (b *ClaimsBoard) SetClaimContext(ctx context.Context, claimID, value string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	claimID = strings.TrimSpace(claimID)
+	if claimID == "" {
+		return fmt.Errorf("SetClaimContext: empty claimID")
+	}
+
+	b.mu.Lock()
+	c, ok := b.claims[claimID]
+	if !ok {
+		b.mu.Unlock()
+		return fmt.Errorf("SetClaimContext: claim %q not found", claimID)
+	}
+	if c.Status.IsTerminal() {
+		// Sealed. Drop silently — late narration emission is benign.
+		b.mu.Unlock()
+		return nil
+	}
+	now := time.Now().UTC()
+	c.Context = value
+	c.ContextTransition++
+	c.Accessed = now
+	transitionID := c.ContextTransition
+	actionKind := c.ActionType
+	owner := IssuerAgentID(c.Relations)
+	subject := SubjectAgentID(c.Relations)
+	b.invalidateProjectionCache()
+	b.mu.Unlock()
+
+	b.amplifier.PublishClaimContextDelta(ctx, ClaimContextDelta{
+		SessionID:      b.sessionID,
+		BoardID:        b.boardID,
+		ClaimID:        claimID,
+		Sequence:       b.seq.Load(),
+		EmittedAt:      now,
+		TransitionID:   transitionID,
+		Context:        value,
+		ActionKind:     actionKind,
+		OwnerAgentID:   owner,
+		SubjectAgentID: subject,
+		IssuerAgentID:  owner,
+	})
+
+	// Notify BoardMutationDelta subscribers (UI bridge) so the agent /
+	// chat panels can refresh row status text from Context. Skipped for
+	// system-internal action types — same filter the amplifier uses for
+	// its per-claim topic.
+	if !IsSystemInternalAction(actionKind) {
+		b.notifyDelta(BoardMutationDelta{
+			Kind:              "claim_context_changed",
+			ClaimID:           claimID,
+			AgentID:           owner,
+			Context:           value,
+			ContextTransition: transitionID,
+		})
+	}
+	return nil
+}
+
+// SetTestamentContext updates a submitted testament's Context. Used
+// rarely — the typical narration path is via the in-flight
+// accumulator's SetContext, which seals onto the testament at flush.
+// This method covers the corner case where a post-flush correction
+// or supersession needs to update the testament's recorded
+// conclusion.
+func (b *ClaimsBoard) SetTestamentContext(ctx context.Context, testamentID, value string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	testamentID = strings.TrimSpace(testamentID)
+	if testamentID == "" {
+		return fmt.Errorf("SetTestamentContext: empty testamentID")
+	}
+
+	b.mu.Lock()
+	t, ok := b.testaments[testamentID]
+	if !ok {
+		b.mu.Unlock()
+		return fmt.Errorf("SetTestamentContext: testament %q not found", testamentID)
+	}
+	now := time.Now().UTC()
+	t.Context = value
+	t.ContextTransition++
+	t.Accessed = now
+	transitionID := t.ContextTransition
+	agentID := t.AgentID
+	claimID := ClaimIDFromRelations(t.Relations)
+	b.invalidateProjectionCache()
+	b.mu.Unlock()
+
+	b.amplifier.PublishTestamentContextDelta(ctx, TestamentContextDelta{
+		SessionID:    b.sessionID,
+		BoardID:      b.boardID,
+		TestamentID:  testamentID,
+		Sequence:     b.seq.Load(),
+		EmittedAt:    now,
+		TransitionID: transitionID,
+		Context:      value,
+		AgentID:      agentID,
+		ClaimID:      claimID,
+	})
+
+	// Notify BoardMutationDelta subscribers (UI bridge) so the agent /
+	// chat panels can update an in-flight testament row's status text.
+	b.notifyDelta(BoardMutationDelta{
+		Kind:              "testament_context_changed",
+		ClaimID:           claimID,
+		TestamentID:       testamentID,
+		AgentID:           agentID,
+		Context:           value,
+		ContextTransition: transitionID,
+	})
+	return nil
+}
+
 // ── SubmitTestaments ────────────────────────────────────────────────
 
 // SubmitTestaments records testaments with their artifacts. Each
 // testament's Artifacts field carries the proof. Artifacts get stamped
 // with TestamentID. Claims transition to testified.
-func (b *ClaimsBoard) SubmitTestaments(_ context.Context, action Action, testaments []Testament) error {
+//
+// ctx is honored on the amplifier emission chain: a caller's
+// cancellation aborts the publish loop instead of leaving the worker
+// blocked on bus IO.
+func (b *ClaimsBoard) SubmitTestaments(ctx context.Context, action Action, testaments []Testament) error {
 	if len(testaments) == 0 {
 		return fmt.Errorf("testament action must contain at least one testament")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	b.mu.Lock()
@@ -396,9 +578,11 @@ func (b *ClaimsBoard) SubmitTestaments(_ context.Context, action Action, testame
 
 	b.mu.Unlock()
 
-	// Amplify.
-	ctx := context.Background()
+	// Amplify, threading ctx so cancellation aborts the chain.
 	for i := range testaments {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		b.amplifier.EmitTestamentSubmitted(ctx, &testaments[i])
 		for _, artifact := range testaments[i].Artifacts {
 			b.amplifier.EmitArtifactPublished(ctx, artifact)
@@ -549,7 +733,15 @@ func autoPassReceiptValidationsLocked(c *Claim, agentID string, now time.Time) {
 
 // EvaluateValidation transitions a validation on a specific claim. If
 // all required validations on the claim pass, the claim auto-accepts.
-func (b *ClaimsBoard) EvaluateValidation(_ context.Context, claimID, validationID string, change StatusChange) error {
+// ctx is threaded into amplifier emissions so cancellation aborts the
+// publish chain instead of pinning the caller on bus IO.
+func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validationID string, change StatusChange) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	b.mu.Lock()
 
 	c, ok := b.claims[claimID]
@@ -590,7 +782,6 @@ func (b *ClaimsBoard) EvaluateValidation(_ context.Context, claimID, validationI
 
 	b.mu.Unlock()
 
-	ctx := context.Background()
 	b.amplifier.EmitClaimValidated(ctx, v, change.AgentID)
 	if accepted {
 		b.amplifier.EmitClaimAccepted(ctx, c)
@@ -653,7 +844,13 @@ func countFailedValidations(c *Claim) int {
 
 // ── RejectClaim ─────────────────────────────────────────────────────
 
-func (b *ClaimsBoard) RejectClaim(_ context.Context, claimID string, change StatusChange, replacements *Action, replacementClaims []Claim) error {
+func (b *ClaimsBoard) RejectClaim(ctx context.Context, claimID string, change StatusChange, replacements *Action, replacementClaims []Claim) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	b.mu.Lock()
 
 	c, ok := b.claims[claimID]
@@ -684,6 +881,7 @@ func (b *ClaimsBoard) RejectClaim(_ context.Context, claimID string, change Stat
 		ClaimID:             c.ID,
 		Sequence:            c.Sequence,
 		EmittedAt:           now,
+		ActionKind:          c.ActionType,
 		FromStatus:          fromStatus,
 		ToStatus:            ClaimStatusRejected,
 		Reason:              change.Reason,
@@ -695,7 +893,6 @@ func (b *ClaimsBoard) RejectClaim(_ context.Context, claimID string, change Stat
 
 	b.mu.Unlock()
 
-	ctx := context.Background()
 	b.amplifier.EmitClaimRejected(ctx, c)
 	b.amplifier.PublishClaimStatusDelta(ctx, rejectedDelta)
 
@@ -799,7 +996,13 @@ func (b *ClaimsBoard) stampRemediationClaimLocked(rc *Claim, replacements *Actio
 
 // ── Phase Transitions ───────────────────────────────────────────────
 
-func (b *ClaimsBoard) TransitionToValidation(_ context.Context) error {
+func (b *ClaimsBoard) TransitionToValidation(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	if b.phase != BoardPhaseImplementation {
 		b.mu.Unlock()
@@ -815,7 +1018,6 @@ func (b *ClaimsBoard) TransitionToValidation(_ context.Context) error {
 	phase, iteration := b.phase, b.iteration
 	b.mu.Unlock()
 
-	ctx := context.Background()
 	b.amplifier.EmitBoardPhaseChanged(ctx, phase, iteration, "")
 	b.amplifier.PublishPhaseDelta(ctx, PhaseDelta{
 		SessionID: b.sessionID,
@@ -832,7 +1034,13 @@ func (b *ClaimsBoard) TransitionToValidation(_ context.Context) error {
 	return nil
 }
 
-func (b *ClaimsBoard) TransitionToImplementation(_ context.Context) error {
+func (b *ClaimsBoard) TransitionToImplementation(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	if b.phase != BoardPhaseValidation {
 		b.mu.Unlock()
@@ -853,7 +1061,6 @@ func (b *ClaimsBoard) TransitionToImplementation(_ context.Context) error {
 	phase, iteration := b.phase, b.iteration
 	b.mu.Unlock()
 
-	ctx := context.Background()
 	b.amplifier.EmitBoardPhaseChanged(ctx, phase, iteration, "")
 	b.amplifier.PublishPhaseDelta(ctx, PhaseDelta{
 		SessionID: b.sessionID,
@@ -870,7 +1077,13 @@ func (b *ClaimsBoard) TransitionToImplementation(_ context.Context) error {
 	return nil
 }
 
-func (b *ClaimsBoard) MarkComplete(_ context.Context) error {
+func (b *ClaimsBoard) MarkComplete(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	if b.phase != BoardPhaseValidation {
 		b.mu.Unlock()
@@ -886,7 +1099,6 @@ func (b *ClaimsBoard) MarkComplete(_ context.Context) error {
 	phase, iteration := b.phase, b.iteration
 	b.mu.Unlock()
 
-	ctx := context.Background()
 	b.amplifier.EmitBoardComplete(ctx, "")
 	b.amplifier.PublishPhaseDelta(ctx, PhaseDelta{
 		SessionID: b.sessionID,
@@ -1241,6 +1453,14 @@ func (b *ClaimsBoard) SubscribeDelta(fn BoardDeltaSubscriber) func() {
 // plus the current summary counters. Best-effort: subscriber errors
 // are logged but do not block the mutation.
 func (b *ClaimsBoard) notifyDelta(delta BoardMutationDelta) {
+	// Invalidate the projection cache BEFORE notifying delta
+	// subscribers so any subscriber that calls board.Projection()
+	// (e.g., the UI bridge looking up the freshly-created claim)
+	// sees the post-mutation state. notifySubscribers also
+	// invalidates, but it runs after the delta loop in PostAction —
+	// which would leave the bridge unable to look up the claim that
+	// just triggered the delta.
+	b.invalidateProjectionCache()
 	delta.Summary = b.Summary()
 
 	b.subscribersMu.Lock()

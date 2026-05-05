@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/claims"
@@ -287,18 +286,49 @@ func (a *Architect) dispatchPlanExecution(
 	_ *ArchitectRequest,
 	plan *DesignPlan,
 ) (*ConversationResult, bool) {
+	// Ensure the plan_handoff_payload artifact exists. publishPreparedHandoff
+	// (called at plan-finalize) submits the testament+artifact and stamps
+	// plan.HandoffPayloadArtifactID. If that path didn't run (rare —
+	// architect/board crash between finalize and accept), submit a fresh
+	// testament+artifact here so the dispatch claim has something to
+	// reference. Either way, by the time we post the dispatch claim
+	// below, the artifact is on the board.
+	if strings.TrimSpace(plan.HandoffPayloadArtifactID) == "" {
+		a.publishPreparedHandoff(ctx, plan)
+	}
+
 	// Post dispatch claim: architect handing off plan to orchestrator.
+	// This is a handoff in the cycle-ownership sense — once the plan
+	// is dispatched, the orchestrator owns the executing top-level
+	// cycle and the architect's planning cycle closes (UI_DESIGN.md
+	// §2.2).
+	//
+	// The claim carries a depends_on Relation pointing at the
+	// plan_handoff_payload artifact (submitted by publishPreparedHandoff
+	// at plan-finalize). The orchestrator's claim intake follows this
+	// relation, resolves the artifact off the board, and runs ingestPlan
+	// deterministically — no LLM tool loop, no parallel bus message.
+	// Single transport (the claim), single dispatch (deterministic).
+	handoffClaim := claims.BuildHandoffClaim(
+		"Dispatch plan "+plan.ID+" to orchestrator",
+		fmt.Sprintf("Plan with %d tasks ready for execution", len(plan.Tasks)),
+		"architect", "orchestrator",
+		claims.ParentClaimIDFromContext(ctx),
+		[]claims.ClaimScopeEntry{{Kind: "plan", Key: plan.ID}},
+		[]*claims.Validation{
+			architectValidation(claims.ValidationTypeReceipt, true, "Orchestrator acknowledges plan receipt", "PlanHandoffReceipt.Status >= Accepted"),
+		},
+	)
+	if artifactID := strings.TrimSpace(plan.HandoffPayloadArtifactID); artifactID != "" {
+		handoffClaim.Relations = append(handoffClaim.Relations, claims.Relation{
+			Related:      artifactID,
+			RelatedType:  claims.RelatedTypeArtifact,
+			Relationship: claims.RelationshipDependsOn,
+		})
+	}
 	a.architectPostClaim(ctx,
-		architectClaimAction(claims.ActionTypeTask),
-		architectClaim(
-			"Dispatch plan "+plan.ID+" to orchestrator",
-			fmt.Sprintf("Plan with %d tasks ready for execution", len(plan.Tasks)),
-			[]claims.ClaimScopeEntry{{Kind: "plan", Key: plan.ID}},
-			claims.ActionTypeTask,
-			[]*claims.Validation{
-				architectValidation(claims.ValidationTypeReceipt, true, "Orchestrator acknowledges plan receipt", "PlanHandoffReceipt.Status >= Accepted"),
-			},
-		),
+		architectClaimAction(claims.ActionTypeHandoff),
+		handoffClaim,
 	)
 
 	a.logInfo("dispatchPlanExecution: entry",
@@ -380,7 +410,14 @@ func (a *Architect) dispatchPlanExecution(
 		plan.PendingWork = nil
 	}
 
-	payload := buildHandoffPayload(plan, "user-approved execution")
+	// Two-phase ingest: tag the approval dispatch with
+	// Phase=ExecutePrepared. Orchestrator looks up prepared state
+	// (populated by an earlier publishPreparedHandoff fire-and-forget
+	// during plan-finalize) and just runs scheduler.Submit. If the
+	// prepared state is missing (architect/orchestrator crash, lost
+	// publish, etc.), executePrepared falls back to full ingest using
+	// the same payload — graceful degradation, no observable change.
+	payload := buildPhasedHandoffPayload(plan, "user-approved execution", PlanHandoffPhaseExecutePrepared)
 	if !isPlanHandoffPayloadValid(payload) {
 		a.logWarn("dispatchPlanExecution: invalid handoff payload",
 			"plan_id", plan.ID,
@@ -438,42 +475,16 @@ func (a *Architect) dispatchPlanExecution(
 	if _, ok := architectStreamMetadataFromContext(ctx); ok {
 		a.publishPlanSnapshot(ctx, plan)
 	}
-	request := &guide.RouteRequest{
-		Input:               payload,
-		CorrelationID:       orchCID,
-		ParentCorrelationID: originalCIDFromContext(ctx),
-		TargetAgentID:       targetAgentID,
-		SessionID:           plan.SessionID,
-	}
-	a.logTrace("architect_plan_handoff_publish_begin", "debug", plan.SessionID, orchCID, agentlog.EventTaskDispatched, map[string]any{
-		"plan_id":               plan.ID,
-		"target_agent_id":       request.TargetAgentID,
-		"parent_correlation_id": request.ParentCorrelationID,
-	})
-	if err := a.publishRouteRequest(request); err != nil {
-		a.logWarn("dispatchPlanExecution: async publish failed", "plan_id", plan.ID, "error", err)
-		a.logTrace("architect_plan_handoff_publish_failed", "error", plan.SessionID, orchCID, agentlog.EventError, map[string]any{
-			"plan_id":         plan.ID,
-			"target_agent_id": request.TargetAgentID,
-			"error":           err.Error(),
-		})
-		if plan.SM().State() == PlanStatusOrchestrating {
-			if transitionErr := plan.SM().TransitionTo(PlanStatusReady, plan); transitionErr == nil {
-				plan.Status = plan.SM().State()
-				plan.Epoch = plan.SM().Epoch()
-			}
-		}
-		a.clearPlanPendingContinuationBestEffort(plan, orchCID, "plan handoff publish failed")
-		a.completeContinuationBestEffort(record, continuationStatusFailed, "", err.Error(), "plan handoff publish failed")
-		a.persistPlanStateBestEffort(plan, orchCID, "plan handoff publish failed; reverting plan state")
-		return &ConversationResult{
-			Response: "I tried to dispatch the plan but hit an error: " + err.Error() + "\nWant me to try again?",
-			Intent:   IntentExecute,
-		}, true
-	}
-	a.logTrace("architect_plan_handoff_publish_ok", "debug", plan.SessionID, orchCID, agentlog.EventTaskDispatched, map[string]any{
+	// Dispatch transport: the handoff claim posted above (with depends_on
+	// → plan_handoff_payload artifact) IS the dispatch. The orchestrator's
+	// claim intake resolves the artifact and runs ingestPlan
+	// deterministically. No bus RouteRequest is published — it would race
+	// the claim path's deterministic dispatch and produce the dual-signal
+	// LLM tool loop bug observed at 2026-05-04.
+	a.logTrace("architect_plan_handoff_dispatched_via_claim", "debug", plan.SessionID, orchCID, agentlog.EventTaskDispatched, map[string]any{
 		"plan_id":         plan.ID,
-		"target_agent_id": request.TargetAgentID,
+		"target_agent_id": targetAgentID,
+		"artifact_id":     plan.HandoffPayloadArtifactID,
 	})
 
 	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventPlanLeased,

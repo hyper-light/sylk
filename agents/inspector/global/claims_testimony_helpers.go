@@ -35,24 +35,33 @@ func (gi *GlobalInspector) globalInspectorBoardOrNil() *claims.ClaimsBoard {
 }
 
 // globalInspectorPostClaim posts a claim async via scope. Best-effort.
+// Registers a just-in-time response Expectation on the global
+// inspector's inbox after a successful PostAction (CLAIMS.md §5).
 func (gi *GlobalInspector) globalInspectorPostClaim(ctx context.Context, action claims.Action, claim claims.Claim) {
 	board := gi.globalInspectorBoardOrNil()
 	if board == nil {
 		return
 	}
+	posted := []claims.Claim{claim}
 	if gi.scope != nil {
 		if err := gi.scope.Go("global_inspector_post_claim", 5*time.Second, func(gctx context.Context) error {
-			return board.PostAction(gctx, action, []claims.Claim{claim})
+			if err := board.PostAction(gctx, action, posted); err != nil {
+				return err
+			}
+			claims.RegisterPostActionExpectations(gi.claimsInbox, action, posted)
+			return nil
 		}); err != nil {
 			slog.Error("global_inspector_post_claim_dispatch_failed", "error", err.Error())
 			board.RecordNotificationError("global inspector post claim dispatch: " + err.Error())
 		}
 		return
 	}
-	if err := board.PostAction(ctx, action, []claims.Claim{claim}); err != nil {
+	if err := board.PostAction(ctx, action, posted); err != nil {
 		slog.Error("global_inspector_post_claim_failed", "error", err.Error())
 		board.RecordNotificationError("global inspector post claim: " + err.Error())
+		return
 	}
+	claims.RegisterPostActionExpectations(gi.claimsInbox, action, posted)
 }
 
 // globalInspectorConsultClaim builds a consultation claim against a peer.
@@ -163,10 +172,16 @@ func (gi *GlobalInspector) processClaimsEntry(ctx context.Context, entry *claims
 		return fmt.Errorf("inspector: LLM provider not configured")
 	}
 
-	acc := claims.NewTestamentAccumulator("inspector", gi.config.SessionID)
+	acc := agentShared.NewClaimsEntryAccumulator("inspector", gi.config.SessionID, entry)
+	acc.WithBoard(gi.globalInspectorBoardOrNil())
 	defer acc.Flush(ctx, gi.globalInspectorBoardOrNil(), nil)
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
+
+	if entry.Node.Claim != nil {
+		agentShared.RecordAgentState(ctx, gi.globalInspectorBoardOrNil(), entry.Node.Claim.ID,
+			"Acknowledging request", agentShared.AgentStateReasoning, nil)
+	}
 
 	userMessage := agentShared.ComposeClaimsEntryPrompt(entry)
 	board := gi.globalInspectorBoardOrNil()
@@ -186,9 +201,20 @@ func (gi *GlobalInspector) processClaimsEntry(ctx context.Context, entry *claims
 	ledger := gi.steering.Create(entry.Delta.DeltaKey(), gi.id, gi.config.SessionID, nil, nil)
 	defer gi.steering.Close(entry.Delta.DeltaKey(), ctx.Err() != nil)
 
-	result, err := agentShared.ExecuteTurnLoop(ledger, req, func() (string, error) {
-		return gi.executeToolLoop(ctx, req, ledger)
+	loopCtx := agentShared.WithContinuationStore(ctx, gi.continuationStore)
+	loopCtx = agentShared.WithTurnContext(loopCtx, &agentShared.TurnContext{
+		Request:       req,
+		CorrelationID: entry.Delta.DeltaKey(),
+		AgentID:       gi.id,
+		SessionID:     gi.config.SessionID,
 	})
+	result, err := agentShared.ExecuteTurnLoop(loopCtx, ledger, req, func() (string, error) {
+		return gi.executeToolLoop(loopCtx, req, ledger)
+	})
+	if agentShared.IsConsultYielded(err) {
+		acc.Note("Yielded mid-turn awaiting peer consults — continuation persisted")
+		return nil
+	}
 	if err != nil {
 		slog.Error("inspector_global_claims_entry_failed", "error", err.Error(), "delta_key", entry.Delta.DeltaKey())
 		acc.Record("error", err.Error())

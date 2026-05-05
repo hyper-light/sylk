@@ -394,25 +394,70 @@ func (ac *ActivationController) Shutdown(ctx context.Context) error {
 
 	board := newShutdownBoard()
 
+	// Per-entry teardowns are independent: each agent owns disjoint
+	// resources (its own container, scope-tracked workers, channel
+	// subscriptions). Sequential teardown made shutdown grow linearly
+	// with the number of activated agents and routinely exceeded the
+	// caller's 200ms budget. Parallel teardown caps wall time at
+	// max(per-entry latency).
+	type teardownResult struct {
+		entry   *ActivationEntry
+		claimID string
+		tier    ActivationTier
+		err     error
+	}
+	// Shutdown is split between two subsystems by design:
+	//   - shutdownContainers (in cmd) calls runtime.StopContainer +
+	//     runtime.RemoveContainer for every registered container, in
+	//     parallel under its own (longer) budget that accounts for
+	//     SIGTERM grace.
+	//   - this controller is responsible for the *state* update
+	//     (mark entries Cold, drop container references, persist the
+	//     shutdown projection on the claims board).
+	//
+	// Earlier this loop also called teardownEntry → stopAndRemove,
+	// which duplicated the container runtime calls. The duplicate
+	// work made activation_ctrl's close take as long as the slowest
+	// container stop, blowing past its budget every time. Now state
+	// teardown is the *only* work here, and the slow runtime calls
+	// happen exactly once via shutdownContainers.
+	results := make([]teardownResult, len(entries))
+	var wg sync.WaitGroup
+	wg.Add(len(entries))
+	for i, entry := range entries {
+		i, entry := i, entry
+		go func() {
+			defer wg.Done()
+			claimID := postShutdownClaim(ctx, board, entry.AgentType)
+			tier := entry.LoadTier()
+			entry.Container.Store(nil)
+			entry.StoreTier(TierCold)
+			results[i] = teardownResult{
+				entry:   entry,
+				claimID: claimID,
+				tier:    tier,
+			}
+		}()
+	}
+	wg.Wait()
+
 	var firstErr error
-	for _, entry := range entries {
-		claimID := postShutdownClaim(board, entry.AgentType)
-		tier := entry.LoadTier()
-		if err := ac.teardownEntry(ctx, entry); err != nil {
-			submitShutdownError(board, entry.AgentType, claimID, err)
+	for _, r := range results {
+		if r.err != nil {
+			submitShutdownError(ctx, board, r.entry.AgentType, r.claimID, r.err)
 			ac.logger.Warn("teardown failed during shutdown",
-				"agent_type", entry.AgentType,
-				"error", err,
+				"agent_type", r.entry.AgentType,
+				"error", r.err,
 			)
 			if firstErr == nil {
-				firstErr = err
+				firstErr = r.err
 			}
 		} else {
-			submitShutdownTestament(board, entry.AgentType, claimID, tier)
+			submitShutdownTestament(ctx, board, r.entry.AgentType, r.claimID, r.tier)
 		}
 	}
 
-	acceptShutdownClaims(board)
+	acceptShutdownClaims(ctx, board)
 	ac.shutdownProjection.Store(board.Projection())
 
 	return firstErr

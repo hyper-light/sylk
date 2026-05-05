@@ -87,24 +87,36 @@ func (e *Engineer) engineerJSONArtifact(kind string, value any) *claims.Artifact
 }
 
 // engineerPostClaim posts a claim async via scope. Best-effort.
+//
+// Registers a just-in-time response Expectation on the engineer's
+// inbox after a successful PostAction (CLAIMS.md §5) so the peer's
+// testament is delivered as a targeted entry point rather than
+// matched against a standing subscription.
 func (e *Engineer) engineerPostClaim(ctx context.Context, action claims.Action, claim claims.Claim) {
 	board := e.engineerBoard()
 	if board == nil {
 		return
 	}
+	posted := []claims.Claim{claim}
 	if e.scope != nil {
 		if err := e.scope.Go("engineer_post_claim", 5*time.Second, func(gctx context.Context) error {
-			return board.PostAction(gctx, action, []claims.Claim{claim})
+			if err := board.PostAction(gctx, action, posted); err != nil {
+				return err
+			}
+			claims.RegisterPostActionExpectations(e.claimsInbox, action, posted)
+			return nil
 		}); err != nil {
 			slog.Error("engineer_post_claim_dispatch_failed", "error", err.Error())
 			board.RecordNotificationError("engineer post claim dispatch: " + err.Error())
 		}
 		return
 	}
-	if err := board.PostAction(ctx, action, []claims.Claim{claim}); err != nil {
+	if err := board.PostAction(ctx, action, posted); err != nil {
 		slog.Error("engineer_post_claim_failed", "error", err.Error())
 		board.RecordNotificationError("engineer post claim: " + err.Error())
+		return
 	}
+	claims.RegisterPostActionExpectations(e.claimsInbox, action, posted)
 }
 
 // engineerConsultClaim builds a consultation claim against a peer.
@@ -155,15 +167,37 @@ func (e *Engineer) processClaimsEntry(ctx context.Context, entry *claims.GraphEn
 	if entry == nil {
 		return nil
 	}
+	claimID := ""
+	claimTitle := ""
+	if entry.Node.Claim != nil {
+		claimID = entry.Node.Claim.ID
+		claimTitle = entry.Node.Claim.Title
+	}
+	slog.Info("engineer_process_claims_entry_begin",
+		"engineer_id", e.id,
+		"session_id", e.config.SessionID,
+		"delta_kind", entry.Delta.DeltaKind(),
+		"delta_key", entry.Delta.DeltaKey(),
+		"claim_id", claimID,
+		"claim_title", claimTitle,
+		"board_present", e.engineerBoard() != nil,
+	)
 	p := e.getProvider()
 	if p == nil {
+		slog.Error("engineer_process_claims_entry_no_provider", "engineer_id", e.id)
 		return fmt.Errorf("engineer: LLM provider not configured")
 	}
 
-	acc := claims.NewTestamentAccumulator("engineer", e.config.SessionID)
+	acc := shared.NewClaimsEntryAccumulator("engineer", e.config.SessionID, entry)
+	acc.WithBoard(e.engineerBoard())
 	defer acc.Flush(ctx, e.engineerBoard(), e.engineerScope())
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
+
+	if entry.Node.Claim != nil {
+		shared.RecordAgentState(ctx, e.engineerBoard(), entry.Node.Claim.ID,
+			"Acknowledging request", shared.AgentStateReasoning, nil)
+	}
 
 	userMessage := shared.ComposeClaimsEntryPrompt(entry)
 	userMessage = claims.PrependBoardPreamble(userMessage, e.claimsBoard, "engineer")
@@ -183,7 +217,15 @@ func (e *Engineer) processClaimsEntry(ctx context.Context, entry *claims.GraphEn
 	ledger := e.steering.Create(entry.Delta.DeltaKey(), e.id, e.config.SessionID, nil, nil)
 	defer e.steering.Close(entry.Delta.DeltaKey(), ctx.Err() != nil)
 
-	result, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	ctx = shared.WithContinuationStore(ctx, e.continuationStore)
+	ctx = shared.WithTurnContext(ctx, &shared.TurnContext{
+		Request:       req,
+		CorrelationID: engineerLedgerCorrelation(ledger, e.config.SessionID),
+		AgentID:       e.id,
+		SessionID:     e.config.SessionID,
+	})
+
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return e.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {

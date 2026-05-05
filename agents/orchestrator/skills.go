@@ -114,6 +114,7 @@ func (o *Orchestrator) registerFabricSkills() {
 				return o.channels.Responses
 			},
 		),
+		Inbox: func() *claims.ClaimsInbox { return o.claimsInbox },
 	}) {
 		o.skills.Register(skill)
 	}

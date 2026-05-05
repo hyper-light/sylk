@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 
@@ -281,25 +282,48 @@ const MaxSteerReentries = 16
 //
 // Bounded by MaxSteerReentries. Nil-safe: when ledger is nil, calls
 // innerLoop exactly once.
+//
+// On every successful return path the final assistant message is
+// recorded as a response_text artifact on the active
+// TestamentAccumulator from ctx (when one is present). This is the
+// canonical capture point for the agent's actual answer — every
+// agent that calls into ExecuteTurnLoop benefits without having to
+// thread the recording call through its own handler. Callers that
+// don't want this capture (e.g. internal sub-turns whose output is
+// already represented as a parent response) simply pass a context
+// without an accumulator.
 func ExecuteTurnLoop(
+	ctx context.Context,
 	ledger *steering.SteeringLedger,
 	req *providers.Request,
 	innerLoop func() (string, error),
 ) (string, error) {
 	if ledger == nil {
-		return innerLoop()
+		content, err := innerLoop()
+		if err == nil {
+			recordTurnResponseOnContext(ctx, content)
+			recordTurnTerminalState(ctx, AgentStateComplete, "Complete")
+		} else if !IsConsultYielded(err) {
+			recordTurnTerminalState(ctx, AgentStateErrored, "Errored: "+err.Error())
+		}
+		return content, err
 	}
 
 	var lastContent string
 	for range MaxSteerReentries + 1 {
 		content, err := innerLoop()
 		if err != nil {
+			if !IsConsultYielded(err) {
+				recordTurnTerminalState(ctx, AgentStateErrored, "Errored: "+err.Error())
+			}
 			return content, err
 		}
 
 		lastContent = content
 
 		if !DrainFinalSteering(ledger, req, content) {
+			recordTurnResponseOnContext(ctx, content)
+			recordTurnTerminalState(ctx, AgentStateComplete, "Complete")
 			return content, nil
 		}
 		// DrainFinalSteering mutated req.Messages:
@@ -309,7 +333,79 @@ func ExecuteTurnLoop(
 	}
 
 	// Exhausted steering re-entries. Return last successful content.
+	recordTurnResponseOnContext(ctx, lastContent)
+	recordTurnTerminalState(ctx, AgentStateComplete, "Complete")
 	return lastContent, nil
+}
+
+// recordTurnResponseOnContext writes the turn's final assistant
+// message to the active TestamentAccumulator on ctx (when present).
+// No-op when ctx is nil, no accumulator is attached, or content is
+// blank — so this is safe to call unconditionally on every success
+// path through ExecuteTurnLoop.
+//
+// Pushes a Synthesizing transition on the parent claim and narrates
+// the testament's developing-conclusion Context with a short preview
+// of the final response. This is the canonical synthesis push (see
+// docs/CLAIMS_UI.md "Agent narration discipline").
+func recordTurnResponseOnContext(ctx context.Context, content string) {
+	if ctx == nil {
+		return
+	}
+	acc := claims.AccumulatorFromContext(ctx)
+	if acc == nil {
+		return
+	}
+	preview := synthesisContextPreview(content)
+	if preview != "" {
+		if board := acc.Board(); board != nil {
+			RecordAgentState(ctx, board, acc.ClaimID(),
+				"Composing response", AgentStateSynthesizing, nil)
+		}
+		acc.SetContext(ctx, preview)
+	}
+	acc.RecordResponseText(content)
+}
+
+// synthesisContextPreview produces a one-line summary of the LLM's
+// final response suitable for the testament's Context narrative.
+// Returns the trimmed first line (capped at 200 chars) so the UI
+// can render a compact developing-conclusion blurb.
+func synthesisContextPreview(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return ""
+	}
+	if i := strings.IndexByte(trimmed, '\n'); i >= 0 {
+		trimmed = strings.TrimSpace(trimmed[:i])
+	}
+	const max = 200
+	if len(trimmed) <= max {
+		return trimmed
+	}
+	return trimmed[:max] + "..."
+}
+
+// recordTurnTerminalState narrates a Complete/Errored transition on
+// the agent's parent claim at turn-loop exit. Best-effort — no-ops
+// when no accumulator/board/claim is on context. Skipped on
+// ErrConsultYielded because the agent is not terminal in that case;
+// it has parked awaiting a peer consult and the resume path will
+// continue narration. See docs/CLAIMS_UI.md "Agent narration
+// discipline" — terminal push.
+func recordTurnTerminalState(ctx context.Context, state AgentActivityState, detail string) {
+	if ctx == nil {
+		return
+	}
+	acc := claims.AccumulatorFromContext(ctx)
+	if acc == nil {
+		return
+	}
+	board := acc.Board()
+	if board == nil {
+		return
+	}
+	RecordAgentState(ctx, board, acc.ClaimID(), detail, state, nil)
 }
 
 func checkPace(ledger *steering.SteeringLedger) SteeringResult {

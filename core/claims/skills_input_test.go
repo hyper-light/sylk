@@ -3,6 +3,7 @@ package claims
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -219,6 +220,48 @@ func TestTestamentInput_AcceptsAllLenientShapesTogether(t *testing.T) {
 	}
 	if len(ti.Artifacts) != 1 || ti.Artifacts[0].Reference != "go test ./... — 42 passed" {
 		t.Fatalf("artifacts = %+v", ti.Artifacts)
+	}
+}
+
+// requireRawJSONParam is the schema-echoing pre-check that fires before
+// unwrapJSONArray + json.Unmarshal. The production failure these tests pin:
+// the LLM calls post_action with only action_type set (no claims_json), and
+// the handler responds with the opaque "unexpected end of JSON input"
+// instead of telling the agent the field is missing. After the fix, the
+// error names the field and shows the canonical shape inline so the agent
+// can self-correct on retry.
+func TestRequireRawJSONParam_DetectsMissingAndEmptyShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{"nil", nil},
+		{"empty bytes", json.RawMessage("")},
+		{"whitespace", json.RawMessage("   ")},
+		{"json null", json.RawMessage("null")},
+		{"empty string", json.RawMessage(`""`)},
+		{"empty array", json.RawMessage(`[]`)},
+		{"empty object", json.RawMessage(`{}`)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := requireRawJSONParam("post_action", "claims_json", tc.raw, "<shape>")
+			if err == nil {
+				t.Fatalf("expected error for %s; got nil", tc.name)
+			}
+			msg := err.Error()
+			for _, want := range []string{"post_action", "claims_json", "missing or empty", "<shape>"} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("error %q missing %q", msg, want)
+				}
+			}
+		})
+	}
+}
+
+func TestRequireRawJSONParam_AcceptsNonEmpty(t *testing.T) {
+	if err := requireRawJSONParam("post_action", "claims_json", json.RawMessage(`[{"title":"x"}]`), "<shape>"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

@@ -139,10 +139,16 @@ func (s *Scribe) processClaimsEntry(ctx context.Context, entry *claims.GraphEntr
 		return fmt.Errorf("scribe: LLM provider not configured")
 	}
 
-	acc := claims.NewTestamentAccumulator(s.scribeAgentID(), s.sessionID)
+	acc := shared.NewClaimsEntryAccumulator(s.scribeAgentID(), s.sessionID, entry)
+	acc.WithBoard(s.scribeBoard())
 	defer acc.Flush(ctx, s.scribeBoard(), nil)
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
+
+	if entry.Node.Claim != nil {
+		shared.RecordAgentState(ctx, s.scribeBoard(), entry.Node.Claim.ID,
+			"Acknowledging request", shared.AgentStateReasoning, nil)
+	}
 
 	userMessage := shared.ComposeClaimsEntryPrompt(entry)
 	board := s.scribeBoard()

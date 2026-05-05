@@ -9,9 +9,24 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/llm/ratelimit"
 	"github.com/adalundhe/sylk/core/providers"
 )
+
+// agentKindLaneKey is the WFQ lane-key extractor used by every gateway.
+// Keying by agent kind (rather than UID) means all replicas of one agent
+// type share a fairness lane: one Architect spawning 30 consults cannot
+// claim 30× the share that one Librarian replica gets, regardless of
+// replica counts. Untagged contexts (system tasks, tests) fall to the
+// shared default lane.
+func agentKindLaneKey(ctx context.Context) string {
+	id, ok := identity.IdentityFromContext(ctx)
+	if !ok {
+		return ""
+	}
+	return id.Kind().String()
+}
 
 // ProviderGateway is the central coordinator for egress rate limiting.
 // One gateway is created per credential set (e.g. one for Google OAuth,
@@ -36,14 +51,24 @@ type ProviderGateway struct {
 }
 
 // NewProviderGateway creates a gateway with the given configuration.
+// If MaxQueueSize is zero, it is derived from MaxConcurrentRequests,
+// MaxWaitTime, and TypicalServiceTime so callers cannot accidentally
+// surface a zero advisory to downstream autoscalers.
 func NewProviderGateway(config GatewayConfig, logger *slog.Logger) *ProviderGateway {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if config.MaxQueueSize <= 0 {
+		config.MaxQueueSize = DeriveQueueAdvisory(
+			config.MaxConcurrentRequests,
+			config.MaxWaitTime,
+			config.TypicalServiceTime,
+		)
+	}
 	return &ProviderGateway{
 		config:      config,
 		limiter:     ratelimit.NewMultiLayerRateLimiter(config.Name, config.RateLimit),
-		scheduler:   NewScheduler(config.MaxQueueSize, config.AgingRate),
+		scheduler:   NewScheduler(config.AgingRate, agentKindLaneKey),
 		maxInflight: config.MaxConcurrentRequests,
 		logger:      logger,
 	}

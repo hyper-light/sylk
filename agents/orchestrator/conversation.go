@@ -106,8 +106,14 @@ func (o *Orchestrator) executeConversationLLM(ctx context.Context, cr orchestrat
 	llmCtx = providers.WithRetryObserver(llmCtx, o.retryObserver())
 
 	ledger := shared.SteeringLedgerFromContext(llmCtx)
-	response, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return o.executeToolLoop(llmCtx, llmReq, ledger)
+	// User-facing conversation turn — caller awaits the response
+	// synchronously. Don't stamp WithContinuationStore: yielding would
+	// strand the user with an empty answer while the resume runs in
+	// the background. Consult_peer falls back to the inline RouteSync
+	// wait so the loop completes before we return.
+	loopCtx := llmCtx
+	response, err := shared.ExecuteTurnLoop(ctx, ledger, llmReq, func() (string, error) {
+		return o.executeToolLoop(loopCtx, llmReq, ledger)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator conversation: %w", err)

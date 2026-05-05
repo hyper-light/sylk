@@ -243,34 +243,106 @@ type committedKnowledgeState struct {
 	index         *committedMetadataIndex
 }
 
+// namedCloser pairs a sub-store close function with a label used for
+// per-closer diagnostic logging. The label surfaces in shutdown
+// timing logs so operators can see which store dominates the
+// committed-knowledge close latency.
+type namedCloser struct {
+	name  string
+	close func() error
+}
+
+// closeWarnThreshold is the per-closer wall-time over which the close
+// gets logged as slow. Sized at the default per-subsystem budget in
+// the TUI shutdown path (200ms): if a sub-store regularly exceeds
+// this, it's the bottleneck the caller's budget is fighting.
+const closeWarnThreshold = 200 * time.Millisecond
+
+// Close fans out the five owned sub-stores in parallel goroutines and
+// joins their errors. Each sub-store touches its own files/mmaps, so
+// they are mutually independent at close time. Sequential closure
+// would have to fit the sum of per-store latencies into the caller's
+// shutdown budget; parallel closure fits within max(per-store).
+//
+// Per-closer timing is logged so a slow sub-store is identifiable
+// from shutdown logs alone — no need to thread instrumentation
+// through every layer.
 func (s *committedKnowledgeState) Close() error {
-	var errs []error
+	closers := []namedCloser{}
 	if s.nodeStore != nil {
-		if err := s.nodeStore.Close(); err != nil {
-			errs = append(errs, err)
-		}
+		closers = append(closers, namedCloser{name: "node_store", close: s.nodeStore.Close})
 	}
 	if s.edgeStore != nil {
-		if err := s.edgeStore.Close(); err != nil {
-			errs = append(errs, err)
-		}
+		closers = append(closers, namedCloser{name: "edge_store", close: s.edgeStore.Close})
 	}
 	if s.docStore != nil {
-		if err := s.docStore.Close(); err != nil {
-			errs = append(errs, err)
-		}
+		closers = append(closers, namedCloser{name: "doc_store", close: s.docStore.Close})
 	}
 	if s.bleveStore != nil {
-		if err := s.bleveStore.CloseAll(); err != nil {
-			errs = append(errs, err)
-		}
+		closers = append(closers, namedCloser{name: "bleve_store", close: s.bleveStore.CloseAll})
 	}
 	if s.metaStore != nil {
-		if err := s.metaStore.Close(); err != nil {
+		closers = append(closers, namedCloser{name: "meta_store", close: s.metaStore.Close})
+	}
+	return runClosersInParallel(closers)
+}
+
+// runClosersInParallel invokes every closer in its own goroutine and
+// joins the resulting errors after all complete. Each closer's wall
+// time is logged at debug level; closers exceeding closeWarnThreshold
+// are logged at warn so a slow sub-store stands out without verbose
+// instrumentation. Empty and single-closer cases short-circuit.
+func runClosersInParallel(closers []namedCloser) error {
+	switch len(closers) {
+	case 0:
+		return nil
+	case 1:
+		return runOneCloser(closers[0])
+	}
+	errCh := make(chan error, len(closers))
+	var wg sync.WaitGroup
+	wg.Add(len(closers))
+	for _, c := range closers {
+		go func(closer namedCloser) {
+			defer wg.Done()
+			errCh <- runOneCloser(closer)
+		}(c)
+	}
+	wg.Wait()
+	close(errCh)
+	errs := make([]error, 0, len(closers))
+	for err := range errCh {
+		if err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func runOneCloser(c namedCloser) error {
+	start := time.Now()
+	err := c.close()
+	elapsed := time.Since(start)
+	// Log every closer at info so shutdown timing is visible from the
+	// default log level, not just under the warn-on-threshold gate.
+	// At shutdown the volume is small (one entry per closer), and the
+	// data is exactly what's needed to diagnose the bottleneck without
+	// re-instrumenting.
+	if elapsed >= closeWarnThreshold {
+		slog.Warn("committed_state_close_slow",
+			"closer", c.name,
+			"elapsed", elapsed,
+			"threshold", closeWarnThreshold,
+			"err", err,
+		)
+	} else {
+		slog.Info("committed_state_close",
+			"closer", c.name,
+			"elapsed", elapsed,
+			"err", err,
+		)
+	}
+	return err
 }
 
 // CommittedKnowledgeBackend provides committed-global search plus runtime fetch
@@ -557,6 +629,13 @@ func (b *CommittedKnowledgeBackend) upsertJointDocument(ctx context.Context, req
 }
 
 // Close releases all live and retired committed-global resources.
+// Live state, every retired state, and the embedder are closed in
+// parallel — they own disjoint resources, so serial closure would
+// just stack their shutdown latencies inside the caller's bounded
+// budget. The embedder idle-timer is stopped synchronously up front
+// because it manipulates the same embedder slot the parallel closer
+// will read; doing both under embedderMu would serialize back into
+// the caller's hot path.
 func (b *CommittedKnowledgeBackend) Close() error {
 	var closeErr error
 	b.closeOnce.Do(func() {
@@ -567,33 +646,30 @@ func (b *CommittedKnowledgeBackend) Close() error {
 		b.retired = nil
 		b.stateMu.Unlock()
 
-		var errs []error
-		if state != nil {
-			if err := state.Close(); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		for _, stale := range retired {
-			if stale == nil {
-				continue
-			}
-			if err := stale.Close(); err != nil {
-				errs = append(errs, err)
-			}
-		}
 		b.embedderMu.Lock()
 		if b.embedderIdle != nil {
 			b.embedderIdle.Stop()
 			b.embedderIdle = nil
 		}
-		if closer, ok := b.embedder.(io.Closer); ok && closer != nil {
-			if err := closer.Close(); err != nil {
-				errs = append(errs, err)
-			}
-		}
+		embedderCloser, _ := b.embedder.(io.Closer)
 		b.embedder = nil
 		b.embedderMu.Unlock()
-		closeErr = errors.Join(errs...)
+
+		closers := make([]namedCloser, 0, 2+len(retired))
+		if state != nil {
+			closers = append(closers, namedCloser{name: "state", close: state.Close})
+		}
+		for i, stale := range retired {
+			if stale == nil {
+				continue
+			}
+			name := fmt.Sprintf("retired[%d]", i)
+			closers = append(closers, namedCloser{name: name, close: stale.Close})
+		}
+		if embedderCloser != nil {
+			closers = append(closers, namedCloser{name: "embedder", close: embedderCloser.Close})
+		}
+		closeErr = runClosersInParallel(closers)
 	})
 	return closeErr
 }

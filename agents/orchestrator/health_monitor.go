@@ -105,10 +105,19 @@ func (m *HealthMonitor) checkHealthStatus() {
 	m.postHealthClaims(result)
 }
 
-// postHealthClaims posts consultation claims for degraded/unhealthy/critical agents
-// and submits an overall health summary testament.
+// postHealthClaims posts consultation claims for degraded/unhealthy/critical
+// agents and submits an overall health summary testament — but only when the
+// cycle carries new information (level transition or new alert). Steady-state
+// "everyone still healthy" cycles produce zero board activity, so the periodic
+// monitorLoop (10s default) doesn't degrade into a polling firehose against
+// the claims board. The gate is the claims-authoring point so every downstream
+// subscriber (archivalist persistence via testament inbox, TUI, audit) sees
+// the same event-driven stream.
 func (m *HealthMonitor) postHealthClaims(result *HealthCheckResult) {
 	if result == nil || m.sessionID == "" {
+		return
+	}
+	if !healthResultIsNoteworthy(result) {
 		return
 	}
 	board := claims.DefaultSessionBoardRegistry().Lookup(m.sessionID)
@@ -119,9 +128,18 @@ func (m *HealthMonitor) postHealthClaims(result *HealthCheckResult) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Post consultation claims for agents that are degraded/unhealthy/critical.
+	// Post consultation claims only for agents whose level transitioned to a
+	// non-healthy state on this cycle. Re-posting on every tick while an
+	// agent stays degraded would create one duplicate consultation claim per
+	// 10s × duration of the degradation — behavior the consultation skill is
+	// not designed to absorb. The first transition opens the consultation;
+	// subsequent ticks let the consultation claim run its lifecycle without
+	// being re-issued.
 	for _, ar := range result.AgentResults {
 		if ar.Level == HealthLevelHealthy || ar.Level == HealthLevelUnknown {
+			continue
+		}
+		if ar.Level == ar.PreviousLevel {
 			continue
 		}
 		consultClaim := orchestratorConsultClaim(
@@ -141,7 +159,7 @@ func (m *HealthMonitor) postHealthClaims(result *HealthCheckResult) {
 		}
 	}
 
-	// Submit overall health summary testament.
+	// Submit overall health summary testament — once per noteworthy cycle.
 	summary := result.Summary
 	confidence := "committed"
 	if summary.UnhealthyAgents > 0 {
@@ -164,6 +182,29 @@ func (m *HealthMonitor) postHealthClaims(result *HealthCheckResult) {
 		slog.Error("health_monitor_testament_failed", "error", err.Error())
 		board.RecordNotificationError("health monitor testament: " + err.Error())
 	}
+}
+
+// healthResultIsNoteworthy reports whether a HealthCheckResult carries new
+// information worth committing to the claims board — a per-agent level
+// transition or a newly-created alert. The monitor loop ticks every
+// HeartbeatInterval (10s default); without this gate every tick would
+// commit identical health-summary testaments and (worse) re-issue
+// consultation claims for agents that are still in their pre-existing
+// degraded state.
+func healthResultIsNoteworthy(result *HealthCheckResult) bool {
+	if result == nil {
+		return false
+	}
+	if len(result.NewAlerts) > 0 {
+		return true
+	}
+	for i := range result.AgentResults {
+		ar := &result.AgentResults[i]
+		if ar.Level != ar.PreviousLevel {
+			return true
+		}
+	}
+	return false
 }
 
 // runChecks performs all health checks under m.mu and produces a HealthCheckResult.

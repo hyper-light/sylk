@@ -2,8 +2,13 @@ package providers
 
 import (
 	"context"
+	"errors"
+	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/google/uuid"
 )
 
 // Instrument wraps any ProviderAdapter with Activity Fabric chokepoint
@@ -58,9 +63,12 @@ func (p *instrumentedProvider) Complete(ctx context.Context, req *CompletionRequ
 	span := p.beginSpan(ctx, req, "complete")
 	defer func() { span.End() }()
 
+	trace := recordLLMDispatchStart(ctx, p.wrapped.Name(), req, "complete")
+
 	resp, err := p.wrapped.Complete(span.Context(), req)
 	if err != nil {
 		span.EndWithError(err)
+		recordLLMDispatchEnd(ctx, p.wrapped.Name(), req, "complete", trace, nil, err)
 		return nil, err
 	}
 	if resp != nil {
@@ -74,16 +82,20 @@ func (p *instrumentedProvider) Complete(ctx context.Context, req *CompletionRequ
 		span.SetAttribute("cache_write_tokens", resp.Usage.CacheWriteTokens)
 		span.SetAttribute("tool_calls", len(resp.ToolCalls))
 	}
+	recordLLMDispatchEnd(ctx, p.wrapped.Name(), req, "complete", trace, resp, nil)
 	return resp, nil
 }
 
 func (p *instrumentedProvider) Stream(ctx context.Context, req *CompletionRequest) (<-chan *StreamChunk, error) {
 	span := p.beginSpan(ctx, req, "stream")
+	trace := recordLLMDispatchStart(ctx, p.wrapped.Name(), req, "stream")
+
 	in, err := p.wrapped.Stream(span.Context(), req)
 	if err != nil {
 		// End immediately on the synchronous setup failure so the
 		// failed setup is captured as a finished activity.
 		span.EndWithError(err)
+		recordLLMDispatchEnd(ctx, p.wrapped.Name(), req, "stream", trace, nil, err)
 		return nil, err
 	}
 	out := make(chan *StreamChunk, 16)
@@ -94,6 +106,8 @@ func (p *instrumentedProvider) Stream(ctx context.Context, req *CompletionReques
 			chunkCount int
 			usage      Usage
 			stop       StopReason
+			content    strings.Builder
+			streamErr  error
 		)
 		for chunk := range in {
 			chunkCount++
@@ -103,6 +117,12 @@ func (p *instrumentedProvider) Stream(ctx context.Context, req *CompletionReques
 				}
 				if chunk.StopReason != "" {
 					stop = chunk.StopReason
+				}
+				if chunk.Type == ChunkTypeError {
+					streamErr = errFromChunk(chunk)
+				}
+				if chunk.Type == ChunkTypeText && chunk.Text != "" && content.Len() < llmDispatchContentSummaryCap {
+					content.WriteString(chunk.Text)
 				}
 			}
 			out <- chunk
@@ -115,6 +135,15 @@ func (p *instrumentedProvider) Stream(ctx context.Context, req *CompletionReques
 		span.SetAttribute("reasoning_tokens", usage.ReasoningTokens)
 		span.SetAttribute("cache_read_tokens", usage.CacheReadTokens)
 		span.SetAttribute("cache_write_tokens", usage.CacheWriteTokens)
+		// Synthesize a CompletionResponse-shaped summary for the
+		// dispatch end artifact so the chat panel renders the same
+		// shape as Complete.
+		streamResp := &CompletionResponse{
+			Content:    truncateForDispatchSummary(content.String()),
+			StopReason: stop,
+			Usage:      usage,
+		}
+		recordLLMDispatchEnd(ctx, p.wrapped.Name(), req, "stream", trace, streamResp, streamErr)
 	}()
 	return out, nil
 }
@@ -188,15 +217,59 @@ func (p *instrumentedProvider) StreamWithHandler(ctx context.Context, req *Strea
 	defer func() { span.End() }()
 
 	if h, ok := p.wrapped.(StreamHandlerProvider); ok {
-		err := h.StreamWithHandler(span.Context(), req, handler)
+		trace := recordLLMDispatchStart(ctx, p.wrapped.Name(), req, "stream_with_handler")
+		// Wrap the handler so we can observe the final chunk's usage
+		// + stop reason + error and record the dispatch end with a
+		// faithful CompletionResponse shape.
+		var (
+			contentSummary strings.Builder
+			finalUsage     Usage
+			finalStop      StopReason
+			handlerErr     error
+		)
+		wrappedHandler := func(chunk *StreamChunk) error {
+			if chunk != nil {
+				if chunk.Usage != nil {
+					finalUsage = *chunk.Usage
+				}
+				if chunk.StopReason != "" {
+					finalStop = chunk.StopReason
+				}
+				if chunk.Type == ChunkTypeText && chunk.Text != "" && contentSummary.Len() < llmDispatchContentSummaryCap {
+					contentSummary.WriteString(chunk.Text)
+				}
+			}
+			if handler == nil {
+				return nil
+			}
+			if hErr := handler(chunk); hErr != nil {
+				handlerErr = hErr
+				return hErr
+			}
+			return nil
+		}
+		err := h.StreamWithHandler(span.Context(), req, wrappedHandler)
+		if err == nil && handlerErr != nil {
+			err = handlerErr
+		}
 		if err != nil {
 			span.EndWithError(err)
+		}
+		summaryResp := &CompletionResponse{
+			Content:    truncateForDispatchSummary(contentSummary.String()),
+			StopReason: finalStop,
+			Usage:      finalUsage,
+		}
+		recordLLMDispatchEnd(ctx, p.wrapped.Name(), req, "stream_with_handler", trace, summaryResp, err)
+		if err != nil {
 			return err
 		}
 		return nil
 	}
 	// Fall back to Stream-based delivery for providers that don't
-	// implement StreamWithHandler natively.
+	// implement StreamWithHandler natively. Note: p.Stream is the
+	// instrumented Stream above, which already records dispatch
+	// start/end — no second recording needed here.
 	out, err := p.Stream(span.Context(), req)
 	if err != nil {
 		span.EndWithError(err)
@@ -215,3 +288,159 @@ func (p *instrumentedProvider) StreamWithHandler(ctx context.Context, req *Strea
 }
 
 var _ ProviderAdapter = (*instrumentedProvider)(nil)
+
+// llmDispatchContentSummaryCap caps the per-dispatch streamed-content
+// snapshot recorded into the dispatch-end artifact. Stream chunks
+// themselves bypass the board (per-chunk artifacts would burn the
+// board lock — see CLAIMS.md slice on stream cardinality), but the
+// final summary on the end artifact gives the chat panel enough text
+// to render the row's preview without re-fetching from the testament.
+const llmDispatchContentSummaryCap = 8 * 1024
+
+// recordLLMDispatchStart appends an llm_dispatch:started artifact to
+// the claims TestamentAccumulator on ctx. Returns the dispatch ID +
+// start timestamp to thread into the matching :completed artifact.
+//
+// LLM dispatches are evidence of the agent's work on a parent claim —
+// they belong on the testament as artifacts. Each (start, end) pair
+// is keyed by dispatch_id so the chat panel can match them to update
+// a single row from "in flight" to "completed".
+// llmDispatchTrace bundles the IDs that pair the started artifact with
+// its eventual completed artifact. Returned by recordLLMDispatchStart
+// and passed verbatim to recordLLMDispatchEnd.
+type llmDispatchTrace struct {
+	startedArtifactID string
+	dispatchID        string
+	started           time.Time
+}
+
+func recordLLMDispatchStart(ctx context.Context, providerName string, req *Request, mode string) llmDispatchTrace {
+	acc := claims.AccumulatorFromContext(ctx)
+	if acc == nil {
+		return llmDispatchTrace{}
+	}
+	dispatchID := uuid.NewString()
+	startedID := uuid.NewString()
+	start := time.Now().UTC()
+	model := ""
+	messages := 0
+	tools := 0
+	maxTokens := 0
+	if req != nil {
+		model = strings.TrimSpace(req.Model)
+		messages = len(req.Messages)
+		tools = len(req.Tools)
+		maxTokens = req.MaxTokens
+	}
+	acc.RecordArtifact(&claims.Artifact{
+		ID:        startedID,
+		Kind:      "llm_started",
+		Reference: model,
+		Metadata: map[string]any{
+			"dispatch_id": dispatchID,
+			"provider":    providerName,
+			"model":       model,
+			"mode":        mode,
+			"messages":    messages,
+			"tools":       tools,
+			"max_tokens":  maxTokens,
+			"started_at":  start.Format(time.RFC3339Nano),
+		},
+		Ephemeral: true,
+	})
+	return llmDispatchTrace{startedArtifactID: startedID, dispatchID: dispatchID, started: start}
+}
+
+// recordLLMDispatchEnd appends an llm_completed artifact paired with
+// its matching llm_started via Relation{completes}. Carries Outcome
+// (success/failure/timeout/cancelled) plus token + response detail.
+func recordLLMDispatchEnd(ctx context.Context, providerName string, req *Request, mode string, trace llmDispatchTrace, resp *Response, dispatchErr error) {
+	acc := claims.AccumulatorFromContext(ctx)
+	if acc == nil || trace.dispatchID == "" {
+		return
+	}
+	now := time.Now().UTC()
+	outcome := "success"
+	switch {
+	case dispatchErr == nil:
+		outcome = "success"
+	case errors.Is(dispatchErr, context.Canceled):
+		outcome = "cancelled"
+	case errors.Is(dispatchErr, context.DeadlineExceeded):
+		outcome = "timeout"
+	default:
+		outcome = "failure"
+	}
+	model := ""
+	if req != nil {
+		model = strings.TrimSpace(req.Model)
+	}
+	metadata := map[string]any{
+		"outcome":     outcome,
+		"dispatch_id": trace.dispatchID,
+		"provider":    providerName,
+		"model":       model,
+		"mode":        mode,
+		"ended_at":    now.Format(time.RFC3339Nano),
+		"duration_ms": now.Sub(trace.started).Milliseconds(),
+	}
+	if dispatchErr != nil {
+		metadata["error"] = dispatchErr.Error()
+	}
+	if resp != nil {
+		metadata["response_summary"] = truncateForDispatchSummary(resp.Content)
+		metadata["stop_reason"] = string(resp.StopReason)
+		metadata["input_tokens"] = resp.Usage.InputTokens
+		metadata["output_tokens"] = resp.Usage.OutputTokens
+		metadata["total_tokens"] = resp.Usage.TotalTokens
+		metadata["reasoning_tokens"] = resp.Usage.ReasoningTokens
+		metadata["cache_read_tokens"] = resp.Usage.CacheReadTokens
+		metadata["cache_write_tokens"] = resp.Usage.CacheWriteTokens
+		metadata["tool_calls"] = len(resp.ToolCalls)
+	}
+	artifact := &claims.Artifact{
+		ID:        uuid.NewString(),
+		Kind:      "llm_completed",
+		Reference: model,
+		Metadata:  metadata,
+		Ephemeral: true,
+	}
+	if trace.startedArtifactID != "" {
+		artifact.Relations = []claims.Relation{
+			{
+				Related:      trace.startedArtifactID,
+				RelatedType:  claims.RelatedTypeArtifact,
+				Relationship: claims.RelationshipCompletes,
+			},
+		}
+	}
+	acc.RecordArtifact(artifact)
+}
+
+func truncateForDispatchSummary(s string) string {
+	if len(s) <= llmDispatchContentSummaryCap {
+		return s
+	}
+	return s[:llmDispatchContentSummaryCap] + "...(truncated)"
+}
+
+// errFromChunk extracts an error from a ChunkTypeError chunk. The
+// chunk's Text carries the error message; we wrap it as a real error
+// so the dispatch-end recorder sees phase=failed and the bridge
+// surfaces the failure on the row.
+func errFromChunk(chunk *StreamChunk) error {
+	if chunk == nil {
+		return nil
+	}
+	msg := strings.TrimSpace(chunk.Text)
+	if msg == "" {
+		msg = "stream error"
+	}
+	return &streamErrorWrapper{message: msg}
+}
+
+type streamErrorWrapper struct {
+	message string
+}
+
+func (e *streamErrorWrapper) Error() string { return e.message }

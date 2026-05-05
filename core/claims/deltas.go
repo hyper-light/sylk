@@ -40,11 +40,14 @@ type Delta interface {
 // DeltaKind constants. Used as the JSON discriminator and as part of
 // topic key construction.
 const (
-	DeltaKindInbox        = "inbox"
-	DeltaKindTestament    = "testament"
-	DeltaKindValidation   = "validation"
-	DeltaKindClaimStatus  = "claim_status"
-	DeltaKindPhase        = "phase"
+	DeltaKindInbox            = "inbox"
+	DeltaKindTestament        = "testament"
+	DeltaKindValidation       = "validation"
+	DeltaKindClaimStatus      = "claim_status"
+	DeltaKindPhase            = "phase"
+	DeltaKindConsultResolved  = "consult_resolved"
+	DeltaKindClaimContext     = "claim_context"
+	DeltaKindTestamentContext = "testament_context"
 )
 
 // ────────────────────────────────────────────────────────────────────
@@ -108,6 +111,11 @@ type TestamentDelta struct {
 	TestamentID string    `json:"testament_id"`
 	Sequence    uint64    `json:"sequence"`
 	EmittedAt   time.Time `json:"emitted_at"`
+
+	// ActionKind is the parent claim's ActionType. Carried so
+	// subscribers can filter system-internal action types
+	// (claims.IsSystemInternalAction) without re-reading the board.
+	ActionKind ActionType `json:"action_kind"`
 
 	// Verdict classifies the work outcome based on the artifact
 	// mixture. "error" means at least one artifact is an error kind;
@@ -185,6 +193,11 @@ type ClaimStatusDelta struct {
 	Sequence   uint64    `json:"sequence"`
 	EmittedAt  time.Time `json:"emitted_at"`
 
+	// ActionKind is the parent claim's ActionType. Same purpose as
+	// TestamentDelta.ActionKind — lets subscribers filter system-
+	// internal action types without an extra board lookup.
+	ActionKind ActionType `json:"action_kind"`
+
 	FromStatus     ClaimStatus `json:"from_status"`
 	ToStatus       ClaimStatus `json:"to_status"`
 	Reason         string      `json:"reason,omitempty"`
@@ -233,6 +246,86 @@ func (d PhaseDelta) DeltaKey() string {
 }
 func (d PhaseDelta) DeltaSequence() uint64  { return d.Sequence }
 func (d PhaseDelta) DeltaSessionID() string { return d.SessionID }
+
+// ────────────────────────────────────────────────────────────────────
+// ConsultResolvedDelta
+// ────────────────────────────────────────────────────────────────────
+
+// ConsultResolvedDelta is emitted when a peer consultation completes.
+// It is published on the originating agent's personal consult-resolved
+// topic so only the awaiter receives it; broadcast fan-out is avoided.
+//
+// The originating agent's ClaimsInbox subscribes to its own pattern
+// (ConsultResolvedPattern) and matches incoming ConsultResolvedDeltas
+// against pending ConsultContinuation claims by ConsultID. When the
+// last awaited consult resolves, the inbox dispatcher wakes the
+// continuation: re-acquire a replica lease, restore the serialized
+// LLM turn state from the continuation's artifact, and re-enter the
+// agent's tool loop with the resolved result populated for the
+// await_consults tool call.
+//
+// Status values: "completed" (peer returned a successful response),
+// "error" (peer returned an explicit failure), "timeout" (the
+// deadline elapsed before the peer responded), "cancelled" (the
+// originator or the peer aborted the consult).
+type ConsultResolvedDelta struct {
+	SessionID string    `json:"session_id"`
+	BoardID   string    `json:"board_id"`
+	Sequence  uint64    `json:"sequence"`
+	EmittedAt time.Time `json:"emitted_at"`
+
+	// ConsultID is the unique identifier the originator stamped on
+	// the consult_peer call. Matches ConsultContinuation artifacts'
+	// awaited_consult_id entries.
+	ConsultID string `json:"consult_id"`
+
+	// OriginatorAgentID is the agent that issued the consult — i.e.
+	// the recipient of this delta. The bus pattern routes the delta
+	// to that agent's inbox exclusively.
+	OriginatorAgentID string `json:"originator_agent_id"`
+
+	// ResponderAgentID is the agent that answered the consult, for
+	// causal-graph attribution. May be empty for system-emitted
+	// resolutions (timeout, cancellation).
+	ResponderAgentID string `json:"responder_agent_id,omitempty"`
+
+	// Status reports the resolution outcome. See ConsultStatus*
+	// constants.
+	Status string `json:"status"`
+
+	// ResponsePayload carries the peer's response for the originator
+	// to feed back into the LLM tool result. Encoded as raw JSON so
+	// the responder can shape it freely; the originator's
+	// await_consults handler propagates it verbatim into the tool
+	// result message.
+	ResponsePayload json.RawMessage `json:"response_payload,omitempty"`
+
+	// ResponseSummary is a short textual summary suitable for logs
+	// and UI rows; not authoritative — the LLM consumes
+	// ResponsePayload.
+	ResponseSummary string `json:"response_summary,omitempty"`
+
+	// ErrorMessage carries a human-readable failure description when
+	// Status is "error" / "timeout" / "cancelled". Empty otherwise.
+	ErrorMessage string `json:"error_message,omitempty"`
+}
+
+// ConsultStatus* enumerates the resolution outcomes carried by
+// ConsultResolvedDelta.Status. Stored as strings so the wire format
+// is human-debuggable and forward-compatible with new statuses.
+const (
+	ConsultStatusCompleted = "completed"
+	ConsultStatusError     = "error"
+	ConsultStatusTimeout   = "timeout"
+	ConsultStatusCancelled = "cancelled"
+)
+
+func (d ConsultResolvedDelta) DeltaKind() string { return DeltaKindConsultResolved }
+func (d ConsultResolvedDelta) DeltaKey() string {
+	return DeltaKindConsultResolved + "|" + d.ConsultID
+}
+func (d ConsultResolvedDelta) DeltaSequence() uint64  { return d.Sequence }
+func (d ConsultResolvedDelta) DeltaSessionID() string { return d.SessionID }
 
 // ────────────────────────────────────────────────────────────────────
 // JSON envelope
@@ -286,6 +379,9 @@ func decodeDeltaPayload(kind string, payload json.RawMessage) (Delta, error) {
 		return d, decodeInto(payload, &d)
 	case DeltaKindPhase:
 		var d PhaseDelta
+		return d, decodeInto(payload, &d)
+	case DeltaKindConsultResolved:
+		var d ConsultResolvedDelta
 		return d, decodeInto(payload, &d)
 	default:
 		return nil, fmt.Errorf("unknown delta kind %q", kind)
@@ -362,3 +458,87 @@ func CollectArtifactKinds(artifacts []*Artifact) []string {
 	}
 	return out
 }
+
+// ────────────────────────────────────────────────────────────────────
+// ClaimContextDelta
+// ────────────────────────────────────────────────────────────────────
+
+// ClaimContextDelta is emitted whenever a claim's Context field is
+// updated via SetClaimContext. The UI consumes this to refresh the
+// row's "thinking status" text in place — no new row created. Carries
+// owner/target/agent attribution so the UI can route the update
+// without re-reading the board. See docs/CLAIMS_UI.md.
+type ClaimContextDelta struct {
+	SessionID    string    `json:"session_id"`
+	BoardID      string    `json:"board_id"`
+	ClaimID      string    `json:"claim_id"`
+	Sequence     uint64    `json:"sequence"`
+	EmittedAt    time.Time `json:"emitted_at"`
+	TransitionID int64     `json:"transition_id"`
+
+	// Context is the new (post-mutation) narrative value.
+	Context string `json:"context"`
+
+	// ActionKind is the parent claim's ActionType. Lets subscribers
+	// filter system-internal action types without re-reading the
+	// board.
+	ActionKind ActionType `json:"action_kind"`
+
+	// Owner / target / subject attribution from the claim's relations
+	// at emission time. The UI uses these to route the update to the
+	// correct row + update the appropriate agent panel entry.
+	OwnerAgentID   string `json:"owner_agent_id,omitempty"`
+	SubjectAgentID string `json:"subject_agent_id,omitempty"`
+	IssuerAgentID  string `json:"issuer_agent_id,omitempty"`
+}
+
+func (d ClaimContextDelta) DeltaKind() string      { return DeltaKindClaimContext }
+func (d ClaimContextDelta) DeltaKey() string       { return DeltaKindClaimContext + "|" + d.ClaimID }
+func (d ClaimContextDelta) DeltaSequence() uint64  { return d.Sequence }
+func (d ClaimContextDelta) DeltaSessionID() string { return d.SessionID }
+
+// ────────────────────────────────────────────────────────────────────
+// TestamentContextDelta
+// ────────────────────────────────────────────────────────────────────
+
+// TestamentContextDelta is emitted whenever a testament's Context
+// (the developing-conclusion narrative) is updated. Used both:
+//
+//   - DURING accumulation, before the testament has been submitted to
+//     the board: TestamentID is empty, AccumulatorID identifies the
+//     in-flight testament. UI creates an in-flight row keyed by
+//     AccumulatorID and updates it on each subsequent delta.
+//
+//   - ON FLUSH and AFTER: TestamentID is set to the real testament
+//     ID, AccumulatorID still set so UI rebinds the in-flight row to
+//     the now-durable testament.
+type TestamentContextDelta struct {
+	SessionID     string    `json:"session_id"`
+	BoardID       string    `json:"board_id"`
+	TestamentID   string    `json:"testament_id,omitempty"`
+	AccumulatorID string    `json:"accumulator_id"`
+	Sequence      uint64    `json:"sequence"`
+	EmittedAt     time.Time `json:"emitted_at"`
+	TransitionID  int64     `json:"transition_id"`
+
+	// Context is the new (post-mutation) narrative value.
+	Context string `json:"context"`
+
+	// AgentID identifies the agent whose accumulator emitted this.
+	AgentID string `json:"agent_id"`
+
+	// ClaimID is the claim this testament is bound to (if any). Lets
+	// the UI route the update to the correct parent row in the chat
+	// tree without re-reading the board.
+	ClaimID string `json:"claim_id,omitempty"`
+}
+
+func (d TestamentContextDelta) DeltaKind() string { return DeltaKindTestamentContext }
+func (d TestamentContextDelta) DeltaKey() string {
+	if d.TestamentID != "" {
+		return DeltaKindTestamentContext + "|" + d.TestamentID
+	}
+	return DeltaKindTestamentContext + "|acc:" + d.AccumulatorID
+}
+func (d TestamentContextDelta) DeltaSequence() uint64  { return d.Sequence }
+func (d TestamentContextDelta) DeltaSessionID() string { return d.SessionID }

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/ui/component"
@@ -319,6 +320,13 @@ type Model struct {
 	// correlation; concurrent pipelines each own their own entry so their
 	// states remain independent.
 	agentStates map[string]*agentActivityState
+
+	// claimRows holds the claims-native row index (cycle, artifact,
+	// testament). The chat panel projects these into ChatEntry rows
+	// directly, replacing the legacy "convert ClaimArtifactAddedMsg to
+	// synthetic ToolCallEventMsg" path that bypassed bridge identity.
+	// docs/CLAIMS_UI.md.
+	claimRows *claimRowIndex
 }
 
 // agentActivityState captures the last observed state transition for a
@@ -575,6 +583,7 @@ func New(th *theme.Theme, historyCapacity int) *Model {
 		thinkingGradient:     th.Palette.ThinkingGradient(),
 		steeringGradient:     th.Palette.GroupGradient(),
 		agentStates:          make(map[string]*agentActivityState),
+		claimRows:            newClaimRowIndex(),
 	}
 }
 
@@ -621,6 +630,24 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	case msg.AgentStateMsg:
 		m.viewDirty = true
 		return m, m.handleAgentState(typed)
+	case msg.ClaimsAgentStatusMsg:
+		m.viewDirty = true
+		return m, m.handleClaimsAgentStatus(typed)
+	case msg.ClaimArtifactAddedMsg:
+		m.viewDirty = true
+		return m, m.handleClaimArtifactAdded(typed)
+	case msg.ClaimArtifactCompletedMsg:
+		m.viewDirty = true
+		return m, m.handleClaimArtifactCompleted(typed)
+	case msg.ClaimResponseTextMsg:
+		m.viewDirty = true
+		return m, m.handleClaimResponseText(typed)
+	case msg.ClaimContextMsg:
+		m.viewDirty = true
+		return m, m.handleClaimContext(typed)
+	case msg.TestamentContextMsg:
+		m.viewDirty = true
+		return m, m.handleTestamentContext(typed)
 	case tea.KeyMsg:
 		m.viewDirty = true
 		return m, m.handleKey(typed)
@@ -5622,4 +5649,355 @@ func activityBoolData(ev msg.ActivityEventMsg, key string) bool {
 	}
 	typed, ok := value.(bool)
 	return ok && typed
+}
+
+
+func (m *Model) handleClaimsAgentStatus(ev msg.ClaimsAgentStatusMsg) tea.Cmd {
+	if m.claimRows == nil {
+		m.claimRows = newClaimRowIndex()
+	}
+	cycleID := strings.TrimSpace(ev.CycleID)
+	if cycleID == "" {
+		return nil
+	}
+	// System-internal action types (boot/activation/shutdown/archival/
+	// testament/checkpoint/consult_continuation) are housekeeping
+	// cycles and MUST NOT open a chat row. The agent panel suppresses
+	// their TaskSummary updates with the same predicate; this guard
+	// is the chat-side equivalent that stops "System: Activation"
+	// rows from flooding the chat tree.
+	if claims.IsSystemInternalAction(claims.ActionType(ev.ActionType)) {
+		return nil
+	}
+	if ev.Active {
+		m.claimRows.openCycleRow(cycleID, ev.AgentID, ev.SessionID, ev.Reason, ev.ActionType)
+		// Render the cycle as a ChatEntry so the chat tree has a
+		// real row to attach artifacts to. Idempotent — a duplicate
+		// open does not create a duplicate entry.
+		m.ensureCycleChatEntry(cycleID, ev.AgentID, ev.SessionID, ev.StreamCorrelationID)
+	} else {
+		m.claimRows.closeCycleRow(cycleID, ev.TerminalOutcome)
+		m.finalizeClaimEntry(cycleID, time.Now())
+	}
+	return nil
+}
+
+// ensureCycleChatEntry creates the cycle-row ChatEntry if it doesn't
+// yet exist. Idempotent — re-opening with the same cycleID is a
+// no-op. Uses the cycle owner's identity (passed in from
+// ClaimsAgentStatusMsg.AgentID, which is the bridge's resolved cycle
+// owner — NOT the issuer).
+func (m *Model) ensureCycleChatEntry(cycleID, ownerAgentID, sessionID, streamCorrelationID string) {
+	if strings.TrimSpace(cycleID) == "" {
+		return
+	}
+	streamCID := strings.TrimSpace(streamCorrelationID)
+	// Look for an existing entry under EITHER the cycle ID or the
+	// route-level stream correlation. The stream bridge may have
+	// pushed a "thinking" row keyed by streamCID before the cycle
+	// opened (StreamStartMsg always lands first); folding the cycle
+	// into that pre-existing entry instead of pushing a sibling is
+	// what eliminates the split-row regression.
+	if idx := m.historyIndexForCorrelation(cycleID); idx >= 0 {
+		m.history.UpdateAt(idx, func(e *ChatEntry) {
+			adoptCycleAttribution(e, ownerAgentID, sessionID, streamCID)
+		})
+		return
+	}
+	if streamCID != "" {
+		if idx := m.historyIndexForCorrelation(streamCID); idx >= 0 {
+			m.history.UpdateAt(idx, func(e *ChatEntry) {
+				if e.CorrelationID != cycleID {
+					e.AdditionalCorrelationIDs = appendUniqueCorrelationID(e.AdditionalCorrelationIDs, cycleID)
+				}
+				adoptCycleAttribution(e, ownerAgentID, sessionID, streamCID)
+			})
+			return
+		}
+	}
+	entry := &ChatEntry{
+		ID:            uuid.NewString(),
+		Timestamp:     time.Now(),
+		CorrelationID: cycleID,
+		Source:        SourceAgent,
+		AgentID:       ownerAgentID,
+		AgentType:     ownerAgentID,
+		SessionID:     sessionID,
+		Streaming:     true,
+		Height:        -1,
+	}
+	if streamCID != "" {
+		entry.AdditionalCorrelationIDs = []string{streamCID}
+	}
+	m.history.Push(entry)
+	m.viewDirty = true
+}
+
+// adoptCycleAttribution fills missing attribution on a cycle entry
+// without overwriting existing values. The cycle's owner/session
+// identity is canonical (the bridge resolved it from the claim
+// graph) but pre-existing values from the stream layer remain
+// preferred so a transient empty-string in the cycle update does
+// not blow away accurate attribution.
+func adoptCycleAttribution(e *ChatEntry, ownerAgentID, sessionID, streamCID string) {
+	if e == nil {
+		return
+	}
+	if e.AgentID == "" && ownerAgentID != "" {
+		e.AgentID = ownerAgentID
+	}
+	if e.AgentType == "" && ownerAgentID != "" {
+		e.AgentType = ownerAgentID
+	}
+	if e.SessionID == "" && sessionID != "" {
+		e.SessionID = sessionID
+	}
+	if streamCID != "" && streamCID != e.CorrelationID {
+		e.AdditionalCorrelationIDs = appendUniqueCorrelationID(e.AdditionalCorrelationIDs, streamCID)
+	}
+	invalidateChatEntryRender(e)
+}
+
+// appendUniqueCorrelationID returns the slice with id added iff it
+// is not already present. Cap with the existing slice's underlying
+// array; the slice typically holds ≤2 entries (cycle + stream) so
+// the linear scan is trivial.
+func appendUniqueCorrelationID(existing []string, id string) []string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return existing
+	}
+	for _, v := range existing {
+		if v == id {
+			return existing
+		}
+	}
+	return append(existing, id)
+}
+
+// handleClaimArtifactAdded materializes a ClaimArtifactAddedMsg
+// directly into the claims-native row index AND projects it into the
+// chat history as a ToolCallRecord on the cycle's ChatEntry (creating
+// the entry on first artifact). Row identity is (ArtifactID,
+// ParentRowID, CycleID, ClaimID, OwnerAgentID) — none of it is
+// squashed through the legacy ToolCallEventMsg shape.
+//
+// agent_state artifacts are NOT rendered as their own rows: they are
+// the immutable trace of Context transitions, and the live UI signal
+// is the claim's Context field (delivered separately via
+// ClaimContextMsg). See docs/CLAIMS_UI.md.
+func (m *Model) handleClaimArtifactAdded(ev msg.ClaimArtifactAddedMsg) tea.Cmd {
+	if m.claimRows == nil {
+		m.claimRows = newClaimRowIndex()
+	}
+	if ev.Kind == claims.ArtifactKindAgentState {
+		// State trace: record on the cycle row's metadata if needed,
+		// but never render as a row — the Context field is the
+		// canonical surface for agent state.
+		return nil
+	}
+	// response_text is the agent's final answer, not evidence: it
+	// writes the cycle entry's Content. The bridge already routes
+	// these as ClaimResponseTextMsg, but tests + replay paths can
+	// also deliver them as a generic ClaimArtifactAddedMsg, so
+	// promote here to keep the contract uniform regardless of
+	// delivery path.
+	if ev.Kind == claims.ArtifactKindResponseText {
+		return m.handleClaimResponseText(msg.ClaimResponseTextMsg{
+			SessionID: "",
+			CycleID:   ev.CycleID,
+			ClaimID:   ev.ClaimID,
+			AgentID:   ev.AgentID,
+			Content:   ev.Reference,
+			CreatedAt: ev.CreatedAt,
+		})
+	}
+	// Defensive: the bridge already filters telemetry kinds out of
+	// the visible artifact stream (UI_DESIGN.md §2.4). If anything
+	// upstream regresses and these leak through anyway, never let
+	// them become rows here either.
+	if !isVisibleArtifactKindForChat(ev.Kind) {
+		return nil
+	}
+	agentID := ev.OwnerAgentID
+	if agentID == "" {
+		agentID = ev.AgentID
+	}
+	row := &ArtifactRow{
+		ArtifactID:  ev.ArtifactID,
+		ParentRowID: ev.ParentRowID,
+		CycleID:     ev.CycleID,
+		ClaimID:     ev.ClaimID,
+		Kind:        ev.Kind,
+		Reference:   ev.Reference,
+		ArgsSummary: shortenArtifactSummary(ev),
+		AgentID:     agentID,
+		AgentType:   ev.OwnerAgentType,
+		TargetAgent: ev.TargetAgentID,
+		Status:      ArtifactRowStatusInFlight,
+		StartedAt:   ev.CreatedAt,
+		Metadata:    ev.Metadata,
+	}
+	stored := m.claimRows.addArtifactRow(row)
+	if stored != nil {
+		m.projectClaimArtifactToHistory(stored)
+	}
+	// Stamp claim-row identity onto the cycle (auto-created if not
+	// yet seen) so the cycle row carries the agent/claim/title
+	// metadata even when the bridge's claim_created delta hasn't
+	// arrived yet.
+	if cycle := m.claimRows.ensureClaimRow(ev.CycleID); cycle != nil {
+		if cycle.OwnerAgentID == "" && ev.OwnerAgentID != "" {
+			cycle.OwnerAgentID = ev.OwnerAgentID
+		}
+		if cycle.OwnerAgentType == "" && ev.OwnerAgentType != "" {
+			cycle.OwnerAgentType = ev.OwnerAgentType
+		}
+		if cycle.TargetAgentID == "" && ev.TargetAgentID != "" {
+			cycle.TargetAgentID = ev.TargetAgentID
+		}
+		if cycle.ClaimID == "" && ev.ClaimID != "" {
+			cycle.ClaimID = ev.ClaimID
+		}
+	}
+	return nil
+}
+
+// handleClaimArtifactCompleted flips an in-flight artifact row to its
+// terminal state. The row is keyed by StartArtifactID — the same
+// ArtifactID that opened the row in handleClaimArtifactAdded.
+func (m *Model) handleClaimArtifactCompleted(ev msg.ClaimArtifactCompletedMsg) tea.Cmd {
+	if m.claimRows == nil {
+		m.claimRows = newClaimRowIndex()
+	}
+	status := ArtifactRowStatusSuccess
+	switch ev.Outcome {
+	case "success":
+		status = ArtifactRowStatusSuccess
+	case "failure":
+		status = ArtifactRowStatusFailure
+	case "timeout":
+		status = ArtifactRowStatusTimeout
+	case "cancelled":
+		status = ArtifactRowStatusCancelled
+	default:
+		// Unknown outcome — preserve the prior status semantically as
+		// "completed" by mapping to success; an explicit error on the
+		// metadata still flips it via the error field below.
+		status = ArtifactRowStatusSuccess
+	}
+	errMsg := asString(ev.Metadata["error"])
+	if errMsg != "" && status == ArtifactRowStatusSuccess {
+		status = ArtifactRowStatusFailure
+	}
+	completed := m.claimRows.completeArtifactRow(
+		ev.StartArtifactID,
+		status,
+		ev.CompletedAt,
+		ev.Duration,
+		ev.Summary,
+		errMsg,
+		ev.Metadata,
+	)
+	if completed != nil {
+		m.completeClaimArtifactInHistory(completed)
+	}
+	return nil
+}
+
+// handleClaimContext updates the cycle row's narrative status text
+// in place. ContextSequence guards against out-of-order delivery.
+// The narrative also threads through the projected ChatEntry's
+// ThinkingStatus so users see the live status under the agent's row.
+func (m *Model) handleClaimContext(ev msg.ClaimContextMsg) tea.Cmd {
+	if m.claimRows == nil {
+		m.claimRows = newClaimRowIndex()
+	}
+	r := m.claimRows.updateClaimContext(ev.CycleID, ev.Context, ev.ContextTransition)
+	if r != nil {
+		if r.OwnerAgentID == "" && ev.OwnerAgentID != "" {
+			r.OwnerAgentID = ev.OwnerAgentID
+		}
+		if r.ClaimID == "" && ev.ClaimID != "" {
+			r.ClaimID = ev.ClaimID
+		}
+		if r.SessionID == "" && ev.SessionID != "" {
+			r.SessionID = ev.SessionID
+		}
+		m.applyClaimContextToHistory(ev.CycleID, ev.Context)
+	}
+	return nil
+}
+
+// handleClaimResponseText writes the agent's final answer onto the
+// cycle's ChatEntry. response_text is the answer, not evidence —
+// the spec lists *_started / *_completed as the visible artifact
+// lifecycle and excludes response_text. Without this handler, the
+// answer either leaks as a fake "tool" row (when it falls back
+// through projectClaimArtifactToHistory) or is invisible entirely.
+func (m *Model) handleClaimResponseText(ev msg.ClaimResponseTextMsg) tea.Cmd {
+	cycleID := strings.TrimSpace(ev.CycleID)
+	content := strings.TrimSpace(ev.Content)
+	if cycleID == "" || content == "" {
+		return nil
+	}
+	idx := m.historyIndexForCorrelation(cycleID)
+	if idx < 0 {
+		return nil
+	}
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		e.Content = content
+		invalidateChatEntryRender(e)
+	})
+	m.viewDirty = true
+	return nil
+}
+
+// isVisibleArtifactKindForChat is the chat panel's defensive copy
+// of the bridge's visible-kind allowlist (ui/bridge/claims.go
+// isVisibleStartedArtifactKind / isVisibleCompletedArtifactKind).
+// Keeping a parallel filter here means a regression upstream that
+// emits llm_started or response_text as a regular artifact event
+// cannot revive the "fake claude-opus-4-6 tool row" bug class.
+func isVisibleArtifactKindForChat(kind string) bool {
+	switch kind {
+	case "tool_started", "consult_started", "challenge_started", "guardian_check_started",
+		"tool_completed", "consult_completed", "challenge_completed", "guardian_check_completed":
+		return true
+	}
+	return false
+}
+
+// handleTestamentContext updates an in-flight testament row's
+// developing-conclusion narrative. Resolves by AccumulatorID first
+// (in-flight anchor) then TestamentID (post-flush rebind).
+func (m *Model) handleTestamentContext(ev msg.TestamentContextMsg) tea.Cmd {
+	if m.claimRows == nil {
+		m.claimRows = newClaimRowIndex()
+	}
+	m.claimRows.updateTestamentContext(
+		ev.AccumulatorID,
+		ev.TestamentID,
+		ev.ClaimID,
+		ev.CycleID,
+		ev.AgentID,
+		ev.Context,
+		ev.ContextTransition,
+	)
+	return nil
+}
+
+
+func asString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func shortenArtifactSummary(ev msg.ClaimArtifactAddedMsg) string {
+	if ev.Reference != "" {
+		return ev.Reference
+	}
+	return ev.Kind
 }

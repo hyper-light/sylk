@@ -168,7 +168,7 @@ func (d *taskDispatchContext) pipelineTask(sessionID string) *PipelineTask {
 		DAGID:         d.dagID,
 		TaskID:        d.pipelineTaskID,
 		AgentType:     d.agentType,
-		TargetAgentID: firstNonEmpty(d.targetID, pipelineWorkerTargetAgentID(d.pipelineTaskID, d.agentType)),
+		TargetAgentID: firstNonEmpty(d.targetID, pipelineWorkerTargetAgentID(sessionID, d.pipelineTaskID, d.agentType)),
 		Prompt:        d.prompt,
 		Context:       contextData,
 		ParentResults: d.parentResults,
@@ -432,7 +432,7 @@ func (o *Orchestrator) routeTaskDispatch(router *TaskRouter, dispatch *taskDispa
 		"task_slug":       dispatch.pipelineTaskSlug,
 		"co_agents":       append([]string(nil), dispatch.coAgents...),
 		"ack_topic":       stringValue(dispatch.nodeCtx["ack_topic"]),
-		"target_agent_id": firstNonEmpty(dispatch.targetID, pipelineWorkerTargetAgentID(dispatch.pipelineTaskID, dispatch.agentType)),
+		"target_agent_id": firstNonEmpty(dispatch.targetID, pipelineWorkerTargetAgentID(o.SessionID(), dispatch.pipelineTaskID, dispatch.agentType)),
 	})
 	if err := o.routeDispatchedPipelineTask(router, dispatch, done); err != nil {
 		o.logTrace("task_dispatch_route_failed", agentlog.EventError, map[string]any{
@@ -456,12 +456,27 @@ func (o *Orchestrator) routeTaskDispatch(router *TaskRouter, dispatch *taskDispa
 		"task_id":         dispatch.taskID,
 		"agent_type":      dispatch.agentType,
 		"task_slug":       dispatch.pipelineTaskSlug,
-		"target_agent_id": firstNonEmpty(dispatch.targetID, pipelineWorkerTargetAgentID(dispatch.pipelineTaskID, dispatch.agentType)),
+		"target_agent_id": firstNonEmpty(dispatch.targetID, pipelineWorkerTargetAgentID(o.SessionID(), dispatch.pipelineTaskID, dispatch.agentType)),
 	})
 }
 
-func (o *Orchestrator) routeDispatchedPipelineTask(router *TaskRouter, dispatch *taskDispatchContext, done <-chan struct{}) error {
-	return router.RouteWithLifecycle(dispatch.pipelineTask(dispatch.effectiveSessionID(o.SessionID())), done)
+// routeDispatchedPipelineTask posts the dispatched task as a claim
+// on the session's claims board with the worker as the claim's
+// subject. The worker's already-subscribed ClaimsInbox receives the
+// resulting InboxDelta and OnResolved fires processClaimsEntry on
+// the worker's tracked scope. PostAction's WAL append is the only
+// synchronous step; downstream Fabric activity emission and bus
+// dispatch run on the board's tracked scope per the
+// "async by default, always tracked" invariant.
+//
+// The legacy router + done parameters are retained on the call
+// signature for API parity with surrounding orchestrator code that
+// still expects a done-channel hook; they are not used by the
+// claims-based dispatch.
+func (o *Orchestrator) routeDispatchedPipelineTask(_ *TaskRouter, dispatch *taskDispatchContext, _ <-chan struct{}) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dispatchClaimTimeout)
+	defer cancel()
+	return o.dispatchPipelineTaskAsClaim(ctx, dispatch)
 }
 
 func (o *Orchestrator) acknowledgeTaskDispatch(router *TaskRouter, dispatch *taskDispatchContext) {

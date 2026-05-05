@@ -3,14 +3,17 @@ package toolruntime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/google/uuid"
 )
 
 const (
@@ -349,13 +352,133 @@ func (r *Runtime) ExecuteRaw(ctx context.Context, inv Invocation) (RawExecutionR
 	return r.executeRaw(ctx, inv, nil, nil, false)
 }
 
+// recordToolCallStart appends a tool_call:started artifact to the
+// claims TestamentAccumulator on ctx (when one is present). Returns
+// the call-tracking ID to thread into the matching completion.
+//
+// Tool calls are EVIDENCE of the agent's processing of its parent
+// claim — they belong on the testament as artifacts. This recorder
+// is the source of truth for the chat panel's child-row rendering:
+// each artifact emitted here fans through the ArtifactProgressSink
+// to a child-row message under the parent claim.
+// toolCallTrace bundles the IDs that pair the started artifact with
+// its eventual completed artifact. Returned by recordToolCallStart and
+// passed verbatim to recordToolCallEnd. Empty when no accumulator is
+// available on ctx (in which case the wrap is a no-op).
+type toolCallTrace struct {
+	startedArtifactID string
+	callID            string
+}
+
+func recordToolCallStart(ctx context.Context, inv Invocation, agentID string) toolCallTrace {
+	acc := claims.AccumulatorFromContext(ctx)
+	if acc == nil {
+		return toolCallTrace{}
+	}
+	callID := strings.TrimSpace(inv.ToolCall.ID)
+	if callID == "" {
+		callID = uuid.NewString()
+	}
+	startedID := uuid.NewString()
+	acc.RecordArtifact(&claims.Artifact{
+		ID:        startedID,
+		AgentID:   agentID,
+		Kind:      "tool_started",
+		Reference: strings.TrimSpace(inv.ToolCall.Name),
+		Metadata: map[string]any{
+			"call_id":         callID,
+			"tool_name":       strings.TrimSpace(inv.ToolCall.Name),
+			"args":            inv.ToolCall.Arguments,
+			"correlation_id":  strings.TrimSpace(inv.CorrelationID),
+			"capability_scope": strings.TrimSpace(inv.CapabilityScope),
+			"started_at":      time.Now().UTC().Format(time.RFC3339Nano),
+		},
+		Ephemeral: true,
+	})
+	return toolCallTrace{startedArtifactID: startedID, callID: callID}
+}
+
+// recordToolCallEnd appends a tool_completed artifact paired with its
+// matching tool_started via Relation{completes}. The chat panel reads
+// only the relation (no fuzzy matching) to flip the in-progress row.
+func recordToolCallEnd(ctx context.Context, agentID string, trace toolCallTrace, toolName string, output any, execErr error, started time.Time) {
+	acc := claims.AccumulatorFromContext(ctx)
+	if acc == nil {
+		return
+	}
+	now := time.Now().UTC()
+	outcome := "success"
+	switch {
+	case execErr == nil:
+		outcome = "success"
+	case errors.Is(execErr, context.Canceled):
+		outcome = "cancelled"
+	case errors.Is(execErr, context.DeadlineExceeded):
+		outcome = "timeout"
+	default:
+		outcome = "failure"
+	}
+	metadata := map[string]any{
+		"outcome":     outcome,
+		"call_id":     trace.callID,
+		"tool_name":   strings.TrimSpace(toolName),
+		"started_at":  started.UTC().Format(time.RFC3339Nano),
+		"ended_at":    now.Format(time.RFC3339Nano),
+		"duration_ms": now.Sub(started).Milliseconds(),
+	}
+	if execErr != nil {
+		metadata["error"] = execErr.Error()
+	}
+	if output != nil {
+		// Render output to a compact summary for the artifact reference.
+		// Full output is in the testament's artifact metadata for audit;
+		// the reference is what the chat row renders.
+		switch v := output.(type) {
+		case string:
+			metadata["output"] = truncateForRef(v, 4096)
+		default:
+			if blob, err := json.Marshal(v); err == nil {
+				metadata["output"] = truncateForRef(string(blob), 4096)
+			}
+		}
+	}
+	artifact := &claims.Artifact{
+		ID:        uuid.NewString(),
+		AgentID:   agentID,
+		Kind:      "tool_completed",
+		Reference: strings.TrimSpace(toolName),
+		Metadata:  metadata,
+		Ephemeral: true,
+	}
+	if trace.startedArtifactID != "" {
+		artifact.Relations = []claims.Relation{
+			{
+				Related:      trace.startedArtifactID,
+				RelatedType:  claims.RelatedTypeArtifact,
+				Relationship: claims.RelationshipCompletes,
+			},
+		}
+	}
+	acc.RecordArtifact(artifact)
+}
+
+// truncateForRef caps a reference string at max bytes with an ellipsis
+// suffix. Used to keep the in-progress artifact reference small —
+// the full output remains available on the testament for audit.
+func truncateForRef(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "...(truncated)"
+}
+
 func (r *Runtime) executeRaw(
 	ctx context.Context,
 	inv Invocation,
 	approvedGrant *GuardianControlGrant,
 	transientActive map[string]struct{},
 	restricted bool,
-) (RawExecutionResult, error) {
+) (rawResult RawExecutionResult, retErr error) {
 	if r == nil {
 		return RawExecutionResult{}, fmt.Errorf("tool runtime is not configured")
 	}
@@ -369,10 +492,27 @@ func (r *Runtime) executeRaw(
 	if r.scope != nil {
 		ctx = concurrency.WithScope(ctx, r.scope)
 	}
+	// Tool-call evidence: record start now, end after the invocation
+	// returns (success or failure). The artifacts flow through the
+	// claims TestamentAccumulator on ctx into the chat panel as child
+	// rows under the parent claim. The deferred end-recorder reads the
+	// resolved tool name (which a pre-hook may have rewritten) so the
+	// completion artifact pairs correctly with the start.
+	toolCallStart := time.Now().UTC()
+	resolvedToolName := strings.TrimSpace(inv.ToolCall.Name)
+	toolCallTrace := recordToolCallStart(ctx, inv, inv.AgentID)
+	defer func() {
+		var output any
+		if rawResult.Data != nil {
+			output = rawResult.Data
+		}
+		recordToolCallEnd(ctx, inv.AgentID, toolCallTrace, resolvedToolName, output, retErr, toolCallStart)
+	}()
 	name, policy, err := r.validateInvocation(inv)
 	if err != nil {
 		return RawExecutionResult{}, err
 	}
+	resolvedToolName = name
 	if !r.isActive(name, transientActive, restricted) {
 		return RawExecutionResult{}, fmt.Errorf("tool %q is outside the active tool set for capability scope %q", name, r.manifest.CapabilityScope)
 	}
@@ -440,6 +580,10 @@ func (r *Runtime) executeRaw(
 		if !r.isActive(name, transientActive, restricted) {
 			return RawExecutionResult{}, fmt.Errorf("tool %q is outside the active tool set for capability scope %q", name, r.manifest.CapabilityScope)
 		}
+		// A pre-hook may have rewritten the tool name. Update the
+		// resolved name so the deferred end-recorder pairs the
+		// completion artifact under the actual tool that ran.
+		resolvedToolName = name
 	}
 
 	if name == SearchToolName {
@@ -640,7 +784,7 @@ func (r *Runtime) obtainGuardianGrant(
 	policy ToolPolicy,
 	raw string,
 	input map[string]any,
-) error {
+) (retErr error) {
 	if r.manifest != nil && r.manifest.AgentID == "guardian" {
 		return nil
 	}
@@ -648,11 +792,214 @@ func (r *Runtime) obtainGuardianGrant(
 		return fmt.Errorf("tool %q requires guardian-controlled execution but no guardian control plane is configured", inv.ToolCall.Name)
 	}
 	req := guardianControlRequest(inv, policy, raw, input, r.manifest)
+	// Per docs/CLAIMS_UI.md §5.3 step 1: post a guardian-check claim
+	// with subject=guardian and capture its ID. The bridge nests
+	// guardian's later artifacts (its own tool calls during
+	// assessment) under this claim so the chat tree shows the
+	// guardian's decision-making INSIDE the calling tool's row,
+	// matching the spec's hierarchy. The claim ID is also stamped
+	// onto the AwaitingGuardian agent_state artifact metadata so
+	// the bridge's resolver can attribute the wait correctly.
+	guardianClaimID := postGuardianCheckClaim(ctx, inv)
+	// Centralized guardian-check artifact pair (UI_DESIGN.md §4.1):
+	// every approval-gated tool emits a started artifact onto the
+	// caller's accumulator the moment the gate is invoked, and a
+	// matching completed artifact via Relation{completes} the moment
+	// the grant returns (any outcome). The chat panel renders these as
+	// a nested guardian row under the parent tool call.
+	guardianTrace := recordGuardianCheckStart(ctx, inv, guardianClaimID)
+	started := time.Now().UTC()
+	defer func() {
+		recordGuardianCheckEnd(ctx, inv, guardianTrace, started, retErr)
+	}()
+	// Push: narrate the wait on the caller's parent claim and record an
+	// agent_state artifact. The chat panel surfaces "Awaiting guardian
+	// grant" on the agent's row; the artifact stays on the testament for
+	// audit / replay. Best-effort — no-op when no accumulator/board/
+	// claim is on context. See docs/CLAIMS_UI.md "AwaitingGuardian".
+	recordGuardianWaitContext(ctx, inv, guardianClaimID)
 	grant, err := r.controlPlane.RequestGrant(ctx, req)
 	if err != nil {
 		return err
 	}
 	return grant.Validate(req)
+}
+
+// postGuardianCheckClaim posts a structured guardian-check claim with
+// subject=guardian, returning the claim ID. The claim represents
+// "agent <X> has invoked tool <T> and awaits guardian's decision";
+// guardian-side processing produces a testament that satisfies the
+// claim's Inspection validation. Best-effort — returns "" when no
+// session board / accumulator is reachable. See docs/CLAIMS_UI.md
+// §5.3.
+func postGuardianCheckClaim(ctx context.Context, inv Invocation) string {
+	acc := claims.AccumulatorFromContext(ctx)
+	if acc == nil {
+		return ""
+	}
+	board := acc.Board()
+	if board == nil {
+		return ""
+	}
+	callerAgentID := strings.TrimSpace(inv.AgentID)
+	if callerAgentID == "" {
+		callerAgentID = acc.AgentID()
+	}
+	toolName := strings.TrimSpace(inv.ToolCall.Name)
+	relations := []claims.Relation{
+		{Related: callerAgentID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+		{Related: "guardian", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+	}
+	if parent := strings.TrimSpace(acc.ClaimID()); parent != "" {
+		relations = append(relations, claims.Relation{
+			Related: parent, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipCausedBy,
+		})
+	}
+	claim := claims.Claim{
+		Title:       "Guardian review: " + toolName,
+		Description: "Approval gate for " + toolName + " requested by " + callerAgentID,
+		Scope:       []claims.ClaimScopeEntry{{Kind: "tool", Key: toolName}},
+		ActionType:  claims.ActionTypeGuardianCheck,
+		Relations:   relations,
+		Validations: []*claims.Validation{{
+			Type:        claims.ValidationTypeInspection,
+			Required:    true,
+			Description: "Guardian renders a grant verdict (allow / deny)",
+			QualityBar:  "verdict.received",
+			Status:      claims.ValidationStatusPending,
+		}},
+	}
+	posted := []claims.Claim{claim}
+	action := claims.Action{AgentID: callerAgentID, Type: claims.ActionTypeGuardianCheck}
+	if err := board.PostAction(ctx, action, posted); err != nil {
+		return ""
+	}
+	if len(posted) > 0 {
+		return strings.TrimSpace(posted[0].ID)
+	}
+	return ""
+}
+
+// recordGuardianWaitContext narrates the AwaitingGuardian transition
+// on the caller's claim and appends an agent_state artifact onto the
+// in-flight accumulator. Mirrors agents/shared.RecordAgentState but
+// runs inline because core/toolruntime cannot import agents/shared
+// without creating an import cycle. Best-effort everywhere.
+//
+// guardianClaimID identifies the structured guardian-check claim
+// posted just prior; it travels on the artifact metadata so the
+// bridge can attribute the wait to the right claim hierarchy.
+func recordGuardianWaitContext(ctx context.Context, inv Invocation, guardianClaimID string) {
+	acc := claims.AccumulatorFromContext(ctx)
+	if acc == nil {
+		return
+	}
+	detail := "Awaiting guardian grant for " + strings.TrimSpace(inv.ToolCall.Name)
+	if board := acc.Board(); board != nil {
+		_ = board.SetClaimContext(ctx, acc.ClaimID(), detail)
+	}
+	metadata := map[string]any{
+		"state":     "awaiting_guardian",
+		"tool_name": strings.TrimSpace(inv.ToolCall.Name),
+		"claim_id":  acc.ClaimID(),
+		"at":        time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if guardianClaimID != "" {
+		metadata["guardian_claim_id"] = guardianClaimID
+	}
+	acc.RecordArtifact(&claims.Artifact{
+		ID:        uuid.NewString(),
+		AgentID:   acc.AgentID(),
+		SessionID: acc.SessionID(),
+		Kind:      claims.ArtifactKindAgentState,
+		Reference: detail,
+		Metadata:  metadata,
+		Ephemeral: false,
+	})
+}
+
+// guardianCheckTrace bundles the IDs that pair the started guardian
+// artifact with its eventual completed artifact.
+type guardianCheckTrace struct {
+	startedArtifactID string
+}
+
+func recordGuardianCheckStart(ctx context.Context, inv Invocation, guardianClaimID string) guardianCheckTrace {
+	acc := claims.AccumulatorFromContext(ctx)
+	if acc == nil {
+		return guardianCheckTrace{}
+	}
+	startedID := uuid.NewString()
+	metadata := map[string]any{
+		"tool_name":      strings.TrimSpace(inv.ToolCall.Name),
+		"tool_call_id":   strings.TrimSpace(inv.ToolCall.ID),
+		"correlation_id": strings.TrimSpace(inv.CorrelationID),
+		"started_at":     time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if guardianClaimID != "" {
+		// Stamp the structured guardian-check claim ID so the bridge's
+		// claimToInvocationArtifact index nests guardian's processing
+		// artifacts under this artifact row when guardian's testament
+		// flushes. See docs/CLAIMS_UI.md §5.3.
+		metadata["claim_id"] = guardianClaimID
+	}
+	acc.RecordArtifact(&claims.Artifact{
+		ID:        startedID,
+		AgentID:   inv.AgentID,
+		Kind:      "guardian_check_started",
+		Reference: strings.TrimSpace(inv.ToolCall.Name),
+		Metadata:  metadata,
+		Ephemeral: true,
+	})
+	return guardianCheckTrace{startedArtifactID: startedID}
+}
+
+func recordGuardianCheckEnd(ctx context.Context, inv Invocation, trace guardianCheckTrace, started time.Time, grantErr error) {
+	acc := claims.AccumulatorFromContext(ctx)
+	if acc == nil {
+		return
+	}
+	now := time.Now().UTC()
+	outcome := "success"
+	switch {
+	case grantErr == nil:
+		outcome = "success"
+	case errors.Is(grantErr, context.Canceled):
+		outcome = "cancelled"
+	case errors.Is(grantErr, context.DeadlineExceeded):
+		outcome = "timeout"
+	default:
+		outcome = "failure"
+	}
+	metadata := map[string]any{
+		"outcome":     outcome,
+		"tool_name":   strings.TrimSpace(inv.ToolCall.Name),
+		"tool_call_id": strings.TrimSpace(inv.ToolCall.ID),
+		"started_at":  started.UTC().Format(time.RFC3339Nano),
+		"ended_at":    now.Format(time.RFC3339Nano),
+		"duration_ms": now.Sub(started).Milliseconds(),
+	}
+	if grantErr != nil {
+		metadata["error"] = grantErr.Error()
+	}
+	artifact := &claims.Artifact{
+		ID:        uuid.NewString(),
+		AgentID:   inv.AgentID,
+		Kind:      "guardian_check_completed",
+		Reference: strings.TrimSpace(inv.ToolCall.Name),
+		Metadata:  metadata,
+		Ephemeral: true,
+	}
+	if trace.startedArtifactID != "" {
+		artifact.Relations = []claims.Relation{
+			{
+				Related:      trace.startedArtifactID,
+				RelatedType:  claims.RelatedTypeArtifact,
+				Relationship: claims.RelationshipCompletes,
+			},
+		}
+	}
+	acc.RecordArtifact(artifact)
 }
 
 func (r *Runtime) executeSearch(input map[string]any, transientActive map[string]struct{}, restricted bool) (map[string]any, []string, error) {

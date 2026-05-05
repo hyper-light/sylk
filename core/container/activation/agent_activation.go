@@ -51,14 +51,28 @@ func AgentActivationPolicies(descriptors []handoff.AgentDescriptor) ([]*Activati
 	return policies, nil
 }
 
-// preWarmAgentTypes lists agent types that should be activated at startup.
-// Knowledge agents provide reduced-precision queries when cold-started;
-// pre-warming avoids that latency on first use.
+// preWarmAgentTypes lists agent types that should be activated at
+// startup. Two categories qualify:
+//   - Knowledge agents (architect / librarian / archivalist / academic)
+//     provide reduced-precision queries when cold-started; pre-warming
+//     avoids first-use latency.
+//   - Pipeline workers (engineer / designer / tester-pipeline /
+//     inspector-pipeline) must subscribe to their ClaimsInbox topics
+//     before the orchestrator dispatches work via PostAction. With
+//     lazy activation, the orchestrator's first claim post races the
+//     worker's inbox subscription. Eager activation guarantees the
+//     subscriber exists when InboxDelta fires, so dispatch latency is
+//     bus-send time (sub-ms) rather than container-cold-start time
+//     (seconds). See agents/orchestrator/task_dispatch_claims.go.
 var preWarmAgentTypes = map[string]bool{
-	"architect":   true,
-	"librarian":   true,
-	"archivalist": true,
-	"academic":    true,
+	"architect":          true,
+	"librarian":          true,
+	"archivalist":        true,
+	"academic":           true,
+	"engineer":           true,
+	"designer":           true,
+	"tester-pipeline":    true,
+	"inspector-pipeline": true,
 }
 
 // policyForDescriptor builds an activation policy for a single agent descriptor.

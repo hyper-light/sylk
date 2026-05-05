@@ -272,6 +272,13 @@ type GlobalReviewProtocolSkillConfig struct {
 	ResolveTarget  func(agentType string) string
 	Route          GlobalReviewRouteConfig
 	WorkspaceViews func() versioning.WorkspaceViewAccess
+
+	// Inbox returns the issuing agent's ClaimsInbox so handoff /
+	// challenge dispatchers can register a just-in-time response
+	// Expectation after a successful PostAction (CLAIMS.md §5).
+	// Optional — nil legacy callers fall through to standing-
+	// subscription delivery on the narrowed activation pattern set.
+	Inbox func() *claims.ClaimsInbox
 }
 
 type globalReviewStateKey struct{}
@@ -969,34 +976,58 @@ func issueGlobalReviewSelection(
 		action.ChallengeID = nextGlobalReviewChallengeID(snapshot)
 	}
 	// Issuing-side claim: the agent posts a challenge or handoff claim
-	// against the target agent.
+	// against the target agent. Handoffs use ActionTypeHandoff so the
+	// board's handoff precondition guard applies (UI_DESIGN.md §4.3),
+	// and carry a Relation{handoff_from} pointing at the predecessor
+	// cycle's root claim ID so the bridge's cycle resolver opens a
+	// fresh top-level cycle on the successor side (§5.2).
 	sessionID := safeCallString(cfg.Route.SessionID)
 	if sessionID != "" {
 		if board := claims.DefaultSessionBoardRegistry().Lookup(sessionID); board != nil {
-			claimAction := claims.ActionTypeChallenge
-			claimTitle := "Challenge " + action.TargetAgent + ": " + truncateSharedClaim(action.Reason, 60)
-			if action.Type == GlobalReviewActionHandoff {
-				claimAction = claims.ActionTypeTask
-				claimTitle = "Handoff to " + action.TargetAgent + ": " + truncateSharedClaim(action.Reason, 60)
-			}
 			agentType := normalizeGlobalReviewAgent(action.AgentType)
 			targetType := normalizeGlobalReviewAgent(action.TargetAgent)
-			if err := board.PostAction(ctx, claims.Action{AgentID: agentType, Type: claimAction}, []claims.Claim{{
+			isHandoff := action.Type == GlobalReviewActionHandoff
+			claimAction := claims.ActionTypeChallenge
+			claimTitle := "Challenge " + action.TargetAgent + ": " + truncateSharedClaim(action.Reason, 60)
+			if isHandoff {
+				claimAction = claims.ActionTypeHandoff
+				claimTitle = "Handoff to " + action.TargetAgent + ": " + truncateSharedClaim(action.Reason, 60)
+				// Skill-side preflight: surface a structured rejection
+				// before the board guard fires. Board guard runs again
+				// inside PostAction (belt-and-suspenders).
+				if err := claims.HandoffEligible(board, agentType); err != nil {
+					return nil, fmt.Errorf("global review handoff blocked: %w", err)
+				}
+			}
+			relations := []claims.Relation{
+				{Related: agentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: targetType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			}
+			if isHandoff {
+				relations = AttachHandoffFrom(relations, predecessorCycleRootClaimID(ctx))
+			} else {
+				relations = AttachCausedByFromContext(ctx, relations)
+			}
+			grAction := claims.Action{AgentID: agentType, Type: claimAction}
+			grClaims := []claims.Claim{{
 				Title:       claimTitle,
 				Description: "Global review " + string(action.Type) + ": " + action.Request,
 				Scope:       []claims.ClaimScopeEntry{{Kind: string(action.Type), Key: targetType}},
 				ActionType:  claimAction,
-				Relations: []claims.Relation{
-					{Related: agentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
-					{Related: targetType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
-				},
+				Relations:   relations,
 				Validations: []*claims.Validation{{
 					Type: claims.ValidationTypeReceipt, Required: true,
 					Description: "Target agent processes global review action", QualityBar: "response.received",
 					Status: claims.ValidationStatusPending,
 				}},
-			}}); err != nil {
+			}}
+			if err := board.PostAction(ctx, grAction, grClaims); err != nil {
 				slog.Error("global_review_issuing_claim_failed", "error", err.Error(), "action_type", string(action.Type))
+				if isHandoff {
+					return nil, fmt.Errorf("post handoff action: %w", err)
+				}
+			} else if cfg.Inbox != nil {
+				claims.RegisterPostActionExpectations(cfg.Inbox(), grAction, grClaims)
 			}
 		}
 	}

@@ -97,24 +97,33 @@ func (pi *PipelineInspector) inspectorJSONArtifact(kind string, value any) *clai
 }
 
 // inspectorPostClaim posts a claim async via scope. Best-effort.
+// Registers a just-in-time response Expectation on the inspector's
+// inbox after a successful PostAction (CLAIMS.md §5).
 func (pi *PipelineInspector) inspectorPostClaim(ctx context.Context, action claims.Action, claim claims.Claim) {
 	board := pi.inspectorBoard()
 	if board == nil {
 		return
 	}
+	posted := []claims.Claim{claim}
 	if pi.scope != nil {
 		if err := pi.scope.Go("inspector_post_claim", 5*time.Second, func(gctx context.Context) error {
-			return board.PostAction(gctx, action, []claims.Claim{claim})
+			if err := board.PostAction(gctx, action, posted); err != nil {
+				return err
+			}
+			claims.RegisterPostActionExpectations(pi.claimsInbox, action, posted)
+			return nil
 		}); err != nil {
 			slog.Error("inspector_post_claim_dispatch_failed", "error", err.Error())
 			board.RecordNotificationError("inspector post claim dispatch: " + err.Error())
 		}
 		return
 	}
-	if err := board.PostAction(ctx, action, []claims.Claim{claim}); err != nil {
+	if err := board.PostAction(ctx, action, posted); err != nil {
 		slog.Error("inspector_post_claim_failed", "error", err.Error())
 		board.RecordNotificationError("inspector post claim: " + err.Error())
+		return
 	}
+	claims.RegisterPostActionExpectations(pi.claimsInbox, action, posted)
 }
 
 // inspectorCorrectiveClaim builds a corrective claim against a peer.
@@ -161,15 +170,37 @@ func (pi *PipelineInspector) processClaimsEntry(ctx context.Context, entry *clai
 	if entry == nil {
 		return nil
 	}
+	claimID := ""
+	claimTitle := ""
+	if entry.Node.Claim != nil {
+		claimID = entry.Node.Claim.ID
+		claimTitle = entry.Node.Claim.Title
+	}
+	slog.Info("inspector_pipeline_process_claims_entry_begin",
+		"inspector_id", pi.id,
+		"session_id", pi.config.SessionID,
+		"delta_kind", entry.Delta.DeltaKind(),
+		"delta_key", entry.Delta.DeltaKey(),
+		"claim_id", claimID,
+		"claim_title", claimTitle,
+		"board_present", pi.inspectorBoard() != nil,
+	)
 	p := pi.getProvider()
 	if p == nil {
+		slog.Error("inspector_pipeline_process_claims_entry_no_provider", "inspector_id", pi.id)
 		return fmt.Errorf("inspector-pipeline: LLM provider not configured")
 	}
 
-	acc := claims.NewTestamentAccumulator("inspector-pipeline", pi.config.SessionID)
+	acc := agentShared.NewClaimsEntryAccumulator("inspector-pipeline", pi.config.SessionID, entry)
+	acc.WithBoard(pi.inspectorBoard())
 	defer acc.Flush(ctx, pi.inspectorBoard(), pi.inspectorScope())
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
+
+	if entry.Node.Claim != nil {
+		agentShared.RecordAgentState(ctx, pi.inspectorBoard(), entry.Node.Claim.ID,
+			"Acknowledging request", agentShared.AgentStateReasoning, nil)
+	}
 
 	userMessage := agentShared.ComposeClaimsEntryPrompt(entry)
 	userMessage = claims.PrependBoardPreamble(userMessage, pi.claimsBoard, "inspector-pipeline")
@@ -189,7 +220,7 @@ func (pi *PipelineInspector) processClaimsEntry(ctx context.Context, entry *clai
 	ledger := pi.steering.Create(entry.Delta.DeltaKey(), pi.id, pi.config.SessionID, nil, nil)
 	defer pi.steering.Close(entry.Delta.DeltaKey(), ctx.Err() != nil)
 
-	result, err := agentShared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	result, err := agentShared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return pi.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {

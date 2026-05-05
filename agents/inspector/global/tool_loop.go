@@ -145,7 +145,10 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 			return "", fmt.Errorf("global inspector repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted, delegated, delegatedMessage := gi.applyToolCalls(ctx, req, resp)
+		errCount, rerouted, delegated, delegatedMessage, yielded := gi.applyToolCalls(ctx, req, resp)
+		if yielded {
+			return "", agentShared.ErrConsultYielded
+		}
 		gi.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if agentShared.GlobalReviewTurnTerminated(ctx) {
 			return "", nil
@@ -194,7 +197,7 @@ func (gi *GlobalInspector) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
-) (int, bool, bool, string) {
+) (int, bool, bool, string, bool) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 	initialDepthRequired := auditDepthRequired(ctx)
 	if initialDepthRequired && len(resp.ToolCalls) > 0 && strings.TrimSpace(resp.ToolCalls[0].Name) != determineAuditDepthToolName {
@@ -207,13 +210,14 @@ func (gi *GlobalInspector) applyToolCalls(
 			IsError:    true,
 		})
 		agentShared.AppendSkippedToolResults(req, resp.ToolCalls[1:], "determine_audit_depth must run first on a new global audit branch")
-		return 1, false, false, ""
+		return 1, false, false, "", false
 	}
 
 	errCount := 0
 	rerouted := false
 	delegated := false
 	delegatedMessage := ""
+	yielded := false
 	for idx, call := range resp.ToolCalls {
 		var execResult toolruntime.ExecutionResult
 		var execErr error
@@ -227,6 +231,10 @@ func (gi *GlobalInspector) applyToolCalls(
 		}
 		isError := false
 		if err != nil {
+			if agentShared.IsConsultYielded(err) {
+				yielded = true
+				return errCount, rerouted, delegated, delegatedMessage, yielded
+			}
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
@@ -276,7 +284,7 @@ func (gi *GlobalInspector) applyToolCalls(
 			break
 		}
 	}
-	return errCount, rerouted, delegated, delegatedMessage
+	return errCount, rerouted, delegated, delegatedMessage, yielded
 }
 
 func (gi *GlobalInspector) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {

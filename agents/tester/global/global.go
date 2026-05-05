@@ -444,6 +444,7 @@ func (gt *GlobalTester) registerCoreSkills() {
 				return gt.channels.Responses
 			},
 		),
+		Inbox: func() *claims.ClaimsInbox { return gt.claimsInbox },
 	}) {
 		gt.skills.Register(skill)
 	}
@@ -588,6 +589,8 @@ func (gt *GlobalTester) Start(bus guide.EventBus) error {
 		Board:        claims.DefaultSessionBoardRegistry().Lookup(gt.config.SessionID),
 		Scope:        gt.scope,
 		ProcessEntry: gt.processClaimsEntry,
+		Identity:     gt.identity,
+		Factory:      gt.factory,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("global_tester_claims_inbox_start_failed", "error", err.Error())
@@ -723,7 +726,7 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 	agentshared.PrependHistoryMessages(req, fwd.ConversationHistory)
 
 	ledger := agentshared.SteeringLedgerFromContext(ctx)
-	result, err := agentshared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	result, err := agentshared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return gt.executeToolLoop(ctx, req, ledger)
 	})
 	if err != nil {
@@ -841,6 +844,15 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 		gt.publishStreamStart(ctx)
 	}
 	gt.publishChatActivity(fwd.SessionID, events.EventTypeAgentAction, "Processing validation request")
+
+	// Cycle-aware accumulator. UI_DESIGN.md §4.7.3.
+	var flushAccumulator func()
+	var beginErr error
+	ctx, flushAccumulator, beginErr = agentshared.BeginForwardedRequestCycle(ctx, gt.id, fwd, gt.scope)
+	if beginErr != nil {
+		return beginErr
+	}
+	defer flushAccumulator()
 
 	result, err := gt.Handle(ctx, fwd)
 	agentshared.LogResponse(gt.steering.EventLogger(), fwd.CorrelationID, gt.id, fwd.SessionID, time.Since(startTime), err)

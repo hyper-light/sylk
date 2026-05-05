@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/messaging"
@@ -409,6 +410,16 @@ func StartThinkingWatchdog(ctx context.Context, req *providers.Request, displayN
 
 // startThinkingTimer fires a "thinking deeply" event after threshold.
 // Returns a cancel function that stops the timer.
+//
+// Two narration sinks fire on every tick:
+//
+//  1. The legacy ProgressPublisher (guide bus) — kept for the
+//     UI bridge until Phase 6 retires it.
+//  2. The claims plane — when an in-flight TestamentAccumulator with
+//     a wired board and claim is on context, push a Reasoning state
+//     update with detail "<Name> is reasoning deeply…". This is the
+//     canonical claims-side surface that the new UI consumes
+//     (docs/CLAIMS_UI.md "Thinking watchdog").
 func startThinkingTimer(
 	ctx context.Context,
 	threshold time.Duration,
@@ -423,8 +434,17 @@ func startThinkingTimer(
 				Deliberation: deliberation,
 			})
 
+		detail := fmt.Sprintf("%s is reasoning deeply...", displayName)
+
 		if pp := ProgressPublisherFromContext(ctx); pp != nil {
-			pp.PublishWatchdog(fmt.Sprintf("%s is reasoning deeply...", displayName))
+			pp.PublishWatchdog(detail)
+		}
+
+		if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+			if board := acc.Board(); board != nil {
+				RecordAgentState(ctx, board, acc.ClaimID(),
+					detail, AgentStateReasoning, nil)
+			}
 		}
 	})
 	return func() { timer.Stop() }

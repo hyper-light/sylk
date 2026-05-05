@@ -856,6 +856,144 @@ type ClaimsProjectionMsg struct {
 	TotalClaims   int
 }
 
+// ClaimsAgentStatusMsg is the authoritative active/idle signal for an
+// agent. ClaimsBridge emits one per agent on each cycle edge
+// transition (cycle open / cycle close). Per UI_DESIGN.md §3.1 the
+// agent panel uses this as the SOLE authoritative source of
+// Status=Acting vs Status=Idle / Success / Error — no other code path
+// writes Status (UI_DESIGN.md §7 P7.1).
+type ClaimsAgentStatusMsg struct {
+	AgentID   string
+	SessionID string
+	Active    bool   // true on cycle open; false on cycle close (drain or handoff)
+	CycleID   string // root claim ID anchoring this cycle (empty when Active=false from session reset)
+	OpenCount int   // count of open subject claims for the owner (debugging)
+	Reason    string
+
+	// TerminalOutcome carries the cycle's verdict on close. Populated
+	// only when Active=false. Maps to the agent panel's terminal
+	// status visual: "success" → StatusSuccess, "failure" → StatusError,
+	// "" → StatusIdle (clean close with no explicit outcome).
+	TerminalOutcome string
+
+	// ActionType carries the originating claim's classification
+	// ("prompt", "handoff", "consultation", "task", "archival", ...).
+	// The agent panel uses this to filter which cycles drive
+	// user-visible TaskSummary updates: only user-or-truly-agent-driven
+	// work (prompt/handoff/consultation) writes to the left panel —
+	// background archival/boot/activation/testament/etc. cycles do not,
+	// so the panel never shows "Processing X request" for internal
+	// recordkeeping. The chat panel uses the same field to suppress
+	// system-internal cycles (claims.IsSystemInternalAction) so they
+	// never open a chat row. Empty when the bridge couldn't resolve
+	// the underlying claim (treated as non-allowlisted).
+	ActionType string
+
+	// StreamCorrelationID is the route-level stream correlation that
+	// the prompt/handoff was dispatched under, propagated from the
+	// originating claim's metadata. The chat panel folds this into
+	// the cycle ChatEntry's AdditionalCorrelationIDs so subsequent
+	// StreamStartMsg/StreamChunkMsg/StreamCompleteMsg events resolve
+	// onto the same row as claim artifacts. Empty when the cycle did
+	// not originate from a routed stream (e.g., system-internal
+	// cycles or peer-issued claims with no UI-side route).
+	StreamCorrelationID string
+}
+
+// ClaimContextMsg updates a claim's developing-narrative status text.
+// Emitted by the bridge whenever a "claim_context_changed" delta lands
+// on the active session's board (i.e. an agent called
+// board.SetClaimContext to narrate a state transition). The agent
+// panel keys by OwnerAgentID — the row's TaskSummary picks up the
+// new Context. The chat panel keys by ClaimID/CycleID — the row's
+// status line refreshes without creating a new row. See
+// docs/CLAIMS_UI.md.
+type ClaimContextMsg struct {
+	SessionID         string
+	ClaimID           string
+	OwnerAgentID      string
+	CycleID           string
+	Context           string
+	ContextTransition int64
+	// State is the categorical agent activity state (the canonical
+	// taxonomy from agents/shared.AgentActivityState — "tool_executing",
+	// "awaiting_peer_response", "challenging_peer", "awaiting_guardian",
+	// etc.). Populated by the bridge from the most recent agent_state
+	// artifact's Metadata["state"] for the cycle. The agent panel maps
+	// this to events.AgentUIState for the left-panel icon. Empty when
+	// no agent_state artifact has been observed for the cycle yet.
+	State string
+}
+
+// TestamentContextMsg updates an in-flight testament's developing-
+// conclusion narrative. Emitted by the bridge whenever a
+// "testament_context_changed" delta lands. The chat panel keys by
+// AccumulatorID before the testament is sealed (the in-flight anchor
+// the accumulator stamps onto every emission), then rebinds onto
+// TestamentID after the testament is submitted. Both IDs travel on
+// every delta so the chat can resolve a single row across the flush
+// boundary. See docs/CLAIMS_UI.md "Accumulator-anchored testament
+// context".
+type TestamentContextMsg struct {
+	SessionID         string
+	AccumulatorID     string
+	TestamentID       string
+	ClaimID           string
+	AgentID           string
+	CycleID           string
+	Context           string
+	ContextTransition int64
+}
+
+// ClaimArtifactAddedMsg opens a row in the chat tree. Emitted by the
+// bridge when a *_started artifact lands. Per UI_DESIGN.md §3.2 the
+// chat panel renders mechanically: top-level rows are keyed by
+// CycleID, nested rows are keyed by ParentRowID — no relation walking.
+type ClaimArtifactAddedMsg struct {
+	ArtifactID     string         // unique ID — the row key
+	CycleID        string         // which top-level cycle this row lives under
+	ParentRowID    string         // immediate parent within the cycle (artifact ID, or empty for cycle-root rows)
+	ClaimID        string         // claim this artifact's testament responds to
+	OwnerAgentID   string         // canonical owner of the parent claim
+	OwnerAgentType string         // type label rendered in child-agent blocks ("guardian", "tester-pipeline", ...)
+	TargetAgentID  string         // target of the parent claim (subject)
+	AgentID        string         // record-issuing agent (Artifact.AgentID — replica/instance)
+	Kind           string         // "tool_started" | "consult_started" | "challenge_started" | "guardian_check_started" | "llm_started" | "cycle_root"
+	Reference      string         // tool name, consult title, etc.
+	Metadata       map[string]any // kind-specific structured detail
+	CreatedAt      time.Time
+}
+
+// ClaimResponseTextMsg carries the agent's final assistant message
+// to the chat panel. Emitted by the bridge when a response_text
+// artifact lands. The chat panel writes Content onto the cycle's
+// ChatEntry rather than rendering as a tool row — response_text is
+// the answer, not evidence. UI_DESIGN.md treats *_started/_completed
+// as the visible artifact lifecycle; response_text falls outside
+// that lifecycle and needs its own delivery path.
+type ClaimResponseTextMsg struct {
+	SessionID string
+	CycleID   string
+	ClaimID   string
+	AgentID   string
+	Content   string
+	CreatedAt time.Time
+}
+
+// ClaimArtifactCompletedMsg closes a row in the chat tree. Emitted by
+// the bridge when a *_completed artifact lands carrying
+// Relation{completes}. The chat panel matches by StartArtifactID and
+// flips the row to its terminal visual. UI_DESIGN.md §3.3.
+type ClaimArtifactCompletedMsg struct {
+	StartArtifactID string         // matches the ClaimArtifactAddedMsg.ArtifactID
+	CycleID         string         // same cycle as the started artifact (denormalized for routing convenience)
+	Outcome         string         // "success" | "failure" | "timeout" | "cancelled"
+	Duration        time.Duration  // wall-clock from started to completed
+	Summary         string         // one-line result summary (truncated tool output, child testament summary)
+	Metadata        map[string]any
+	CompletedAt     time.Time
+}
+
 // VariantStateMsg carries a variant state update for the agent panel.
 type VariantStateMsg struct {
 	VariantID  string

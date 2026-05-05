@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -1015,6 +1016,16 @@ func TimedToolCall(
 	}
 	session := acquireToolCallSession(ctx, agentID, call)
 
+	// Narrate ToolExecuting on the agent's parent claim. Best-effort —
+	// no-ops when no accumulator/board/claim is on context. See
+	// docs/CLAIMS_UI.md "Agent narration discipline".
+	if acc := claims.AccumulatorFromContext(ctx); acc != nil {
+		if board := acc.Board(); board != nil {
+			RecordAgentState(ctx, board, acc.ClaimID(),
+				"Running "+call.Name, AgentStateToolExecuting, nil)
+		}
+	}
+
 	// Start is a no-op if a streaming preannounce already opened this session.
 	// When that happens consumePreannounced still drains the legacy timing
 	// map so older code paths that read it don't go stale; the session is
@@ -1041,6 +1052,17 @@ func TimedToolCall(
 	defer func() {
 		if !executeReturned && err == nil {
 			err = fmt.Errorf("tool %q unwound abnormally without returning", call.Name)
+		}
+		// ErrConsultYielded is a control-flow signal, not a tool
+		// failure — the agent has parked awaiting a peer consult /
+		// challenge / guardian-check. The session row stays open;
+		// when the resume path injects the consult response as this
+		// tool call's result, the matching emission completes the
+		// row with the real outcome. Surfacing the yield as a
+		// "tool failed" event here renders an alarming-but-bogus
+		// failure in the chat panel.
+		if IsConsultYielded(err) {
+			return
 		}
 		session.Complete(call, result, err)
 		emitToolCompleteRecord(ctx, agentID, call, result, err, time.Since(callStart))

@@ -142,7 +142,8 @@ type Guardian struct {
 	// Agent pod for Scribe feed.
 	agentPod *shared.AgentPod
 
-	claimsInbox *claims.ClaimsInbox
+	claimsInbox       *claims.ClaimsInbox
+	continuationStore *shared.ContinuationStore
 }
 
 // ---------------------------------------------------------------------------
@@ -623,14 +624,27 @@ func (g *Guardian) Start(bus guide.EventBus) error {
 		g.healthMon.Start(ctx)
 	}
 
+	// ContinuationStore for ticket-mode consult_peer + await_consults.
+	g.continuationStore = shared.NewContinuationStore(shared.ContinuationStoreConfig{
+		AgentID:   g.id,
+		SessionID: g.activeSessionID,
+		Board:     g.guardianBoard(),
+		Scope:     g.scope,
+		ResumeFn:  g.resumeContinuation,
+	})
+	g.continuationStore.RecoverPendingContinuations(context.Background())
+
 	// Claims intake: event-driven delta processing.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:      g.id,
-		SessionID:    g.activeSessionID,
-		Bus:          bus,
-		Board:        g.guardianBoard(),
-		Scope:        g.scope,
-		ProcessEntry: g.processClaimsEntry,
+		AgentID:           g.id,
+		SessionID:         g.activeSessionID,
+		Bus:               bus,
+		Board:             g.guardianBoard(),
+		Scope:             g.scope,
+		ProcessEntry:      g.processClaimsEntry,
+		Identity:          g.identity,
+		Factory:           g.factory,
+		ContinuationStore: g.continuationStore,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("guardian_claims_inbox_start_failed", "error", err.Error())
@@ -655,6 +669,10 @@ func (g *Guardian) Stop() error {
 	if g.claimsInbox != nil {
 		_ = g.claimsInbox.Close()
 		g.claimsInbox = nil
+	}
+	if g.continuationStore != nil {
+		g.continuationStore.Stop("guardian stopped")
+		g.continuationStore = nil
 	}
 
 	g.steering.CloseAll()
@@ -763,6 +781,19 @@ func (g *Guardian) dispatchBusRequest(ctx context.Context, msg *guide.Message) e
 }
 
 func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Message) error {
+	// Fast-path: direct-skill calls to read-only deterministic skills
+	// don't need the request serializer. Without this, an architect
+	// preflight RPC (or any other read-only gate query) queues behind
+	// a long-running plan_approval_gate that's awaiting the user's
+	// click — observable as minutes of latency on the architect's
+	// hot path. The fast-path skills mutate no Guardian state, run
+	// no LLM, and have no I/O, so concurrent execution is safe.
+	if fwd, ok := msg.GetForwardedRequest(); ok {
+		if guardianFastPathDirectSkill(fwd) {
+			return g.runFastPathDirectSkill(ctx, fwd)
+		}
+	}
+
 	if !g.requestSerializer.Acquire(ctx) {
 		return nil // parent context done, agent shutting down
 	}
@@ -869,6 +900,16 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 		g.publishStreamStart(reqCtx, fwd.CorrelationID)
 	}
 
+	// Cycle-aware accumulator: honors envelope parent_claim_id for
+	// consult/challenge fulfillments. UI_DESIGN.md §4.7.3.
+	var flushAccumulator func()
+	var beginErr error
+	reqCtx, flushAccumulator, beginErr = shared.BeginForwardedRequestCycle(reqCtx, g.id, fwd, g.scope)
+	if beginErr != nil {
+		return beginErr
+	}
+	defer flushAccumulator()
+
 	// Execute either a deterministic direct skill or the conversation loop.
 	var (
 		result     any
@@ -928,6 +969,83 @@ func guardianDirectSkillName(fwd *guide.ForwardedRequest) string {
 	}
 	name, _ := fwd.Metadata["direct_skill"].(string)
 	return strings.TrimSpace(name)
+}
+
+// guardianFastPathDirectSkill returns true when fwd is a direct-skill
+// call into a known read-only Guardian skill. Such calls bypass the
+// request serializer because they mutate no shared Guardian state and
+// run no LLM/IO — concurrent execution is safe.
+//
+// Allowlist:
+//   - review_gate (diff review, pre-commit, detect_anomaly,
+//     preflight_task, preflight_plan): pure deterministic classifiers,
+//     no state mutation.
+//   - plan_approval_gate: BLOCKS on the user's verdict for many
+//     minutes; running it under the request serializer queues every
+//     other Guardian forwarded request behind it. The skill posts a
+//     claim and publishes a proposal — both take ctx-bound session
+//     so they don't read shared activeSessionID. Concurrent execution
+//     of plan_approval_gate alongside other gate calls is safe.
+//
+// Adding new fast-path skills requires verifying they don't touch
+// activeSessionID, steering, or other serializer-guarded state — and
+// that they're either non-blocking or the blocking is on per-request
+// state (channels, contexts) rather than shared mutable state.
+func guardianFastPathDirectSkill(fwd *guide.ForwardedRequest) bool {
+	if fwd == nil {
+		return false
+	}
+	skill := guardianDirectSkillName(fwd)
+	switch skill {
+	case "review_gate", "plan_approval_gate":
+		return true
+	default:
+		return false
+	}
+}
+
+// runFastPathDirectSkill invokes a fast-path direct skill without
+// acquiring the request serializer. Builds a minimal ctx (no session
+// binding, no steering ledger, no context governor) so the skill can
+// run concurrently with whatever the serialized handler is doing.
+//
+// Publishes a route response on the bus so the architect's
+// requestRouteSync waiter unblocks just like it would for a normal
+// serialized response — the architect cannot tell the difference.
+func (g *Guardian) runFastPathDirectSkill(ctx context.Context, fwd *guide.ForwardedRequest) error {
+	if err := ctx.Err(); err != nil {
+		return nil
+	}
+	skillName := guardianDirectSkillName(fwd)
+	startTime := time.Now()
+
+	reqCtx := versioning.WithSessionID(ctx, fwd.SessionID)
+	reqCtx = shared.WithLogMeta(reqCtx, shared.LogMeta{
+		EventLogger: g.steering.EventLogger(),
+		CorrID:      fwd.CorrelationID,
+		AgentID:     g.id,
+		SessionID:   fwd.SessionID,
+	})
+
+	result, _, err := g.executeDirectSkill(reqCtx, skillName, fwd.Input)
+	shared.LogResponse(g.steering.EventLogger(), fwd.CorrelationID, g.id, fwd.SessionID, time.Since(startTime), err)
+
+	resp := &guide.RouteResponse{
+		CorrelationID:       fwd.CorrelationID,
+		Success:             err == nil,
+		RespondingAgentID:   g.id,
+		RespondingAgentName: "guardian",
+		ProcessingTime:      time.Since(startTime),
+	}
+	if err != nil {
+		resp.Error = err.Error()
+	} else {
+		resp.Data = result
+	}
+	if g.bus == nil || g.channels == nil {
+		return err
+	}
+	return g.bus.Publish(g.channels.Responses, newResponseMessage(fwd.CorrelationID, g.id, resp))
 }
 
 func (g *Guardian) executeDirectSkill(ctx context.Context, name string, input string) (any, string, error) {

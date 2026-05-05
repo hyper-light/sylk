@@ -31,7 +31,8 @@ func (b *testScribeBus) SubscribeAsync(topic string, handler guide.MessageHandle
 	return b.Subscribe(topic, handler)
 }
 
-func (b *testScribeBus) Close() error { return nil }
+func (b *testScribeBus) Close() error                         { return nil }
+func (b *testScribeBus) CloseWithContext(_ context.Context) error { return nil }
 
 type testScribeSub struct {
 	topic string

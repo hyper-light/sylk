@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/architect"
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
@@ -97,6 +98,30 @@ type ActiveDAGMeta struct {
 	// each pod is registered with its sub-nodes atomically with
 	// creation.
 	subNodesByTask map[string][]subNodeRegistration
+
+	// taskClaims holds the architect-authored claims for each task,
+	// indexed by task_id. Populated during DAG ingest from the
+	// PlanHandoff payload. ensureTaskPod posts these to the session's
+	// claims board atomically with pod creation, so a pod is never
+	// observable in a state where its task's authored claims aren't
+	// on the board.
+	taskClaims map[string][]architect.TaskClaim
+	// claimsPostedForTask tracks which task IDs have already had
+	// their authored claims posted to the board, so re-entrant
+	// ensureTaskPod calls (sync.Once is per-slot, but the registry
+	// is rebuilt across two-phase prepare/execute) don't double-post.
+	claimsPostedForTask map[string]struct{}
+
+	// PreparedCtx holds the per-DAG context Prepare staged for the
+	// scheduler. Submit() uses this rather than the caller's request
+	// ctx so the DAG outlives the request that triggered Submit.
+	PreparedCtx context.Context
+	// PreparedDAG is the DAG payload to feed to scheduler.Submit.
+	// Set inside Prepare; read inside Submit.
+	PreparedDAG *dag.DAG
+	// PreparedAt records when Prepare completed. Used for TTL reaping
+	// of prepared-but-never-submitted DAGs.
+	PreparedAt time.Time
 }
 
 // taskPodSlot holds the result of a single per-task pod construction
@@ -145,6 +170,47 @@ type DAGBridge struct {
 	gates              map[string]*dag.DecisionGate // per-DAG decision gates
 	scribeFactory      shared.ScribeFactory         // optional Scribe factory for pipeline pods
 	taskPodMonitorOnce sync.Once
+
+	// pendingTaskClaims holds architect-authored claims keyed by DAG
+	// ID, awaiting prepareInternal to wire them into the per-DAG meta
+	// so ensureTaskPod can post them on pod spin-up. Populated by
+	// submitExecution (or the prepare ingest path) from the
+	// PlanHandoff before it calls Prepare/Execute; consumed (and
+	// removed) when the meta is constructed.
+	pendingTaskClaims   map[string]map[string][]architect.TaskClaim // dagID → taskID → claims
+	pendingTaskClaimsMu sync.Mutex
+}
+
+// RegisterTaskClaims stages the architect-authored claims for each
+// task in a plan so dagBridge.Execute / Prepare can fold them into
+// the ActiveDAGMeta when constructing per-DAG bookkeeping. Called by
+// the orchestrator's ingest path right before Prepare/Execute.
+func (b *DAGBridge) RegisterTaskClaims(dagID string, claimsByTask map[string][]architect.TaskClaim) {
+	if b == nil || strings.TrimSpace(dagID) == "" || len(claimsByTask) == 0 {
+		return
+	}
+	b.pendingTaskClaimsMu.Lock()
+	defer b.pendingTaskClaimsMu.Unlock()
+	if b.pendingTaskClaims == nil {
+		b.pendingTaskClaims = make(map[string]map[string][]architect.TaskClaim)
+	}
+	b.pendingTaskClaims[dagID] = claimsByTask
+}
+
+// takePendingTaskClaims removes and returns the staged claims for a
+// DAG. Called once during prepareInternal's meta construction.
+func (b *DAGBridge) takePendingTaskClaims(dagID string) map[string][]architect.TaskClaim {
+	if b == nil {
+		return nil
+	}
+	b.pendingTaskClaimsMu.Lock()
+	defer b.pendingTaskClaimsMu.Unlock()
+	if b.pendingTaskClaims == nil {
+		return nil
+	}
+	claimsByTask := b.pendingTaskClaims[dagID]
+	delete(b.pendingTaskClaims, dagID)
+	return claimsByTask
 }
 
 // NewDAGBridge creates a bridge between the DAG scheduler and orchestrator subsystems.
@@ -407,6 +473,17 @@ func (b *DAGBridge) Submit(ctx context.Context, dagID string) (string, error) {
 	b.logTrace("dag_submit_begin", agentlog.EventRegistryEvent, map[string]any{
 		"dag_id": dagID,
 	})
+	// Transition WAL prepared → started. After this point the DAG
+	// is officially running. If scheduler.Submit fails, LogDAGAbort
+	// records the failure for recovery.
+	dagJSON, _ := d.MarshalJSON()
+	if err := b.journal.LogDAGStart(dagID, string(dagJSON)); err != nil {
+		b.logTrace("dag_submit_wal_start_failed", agentlog.EventError, map[string]any{
+			"dag_id": dagID,
+			"error":  err.Error(),
+		})
+		return "", fmt.Errorf("dag bridge: wal start: %w", err)
+	}
 	if _, err := b.scheduler.Submit(dagCtx, d, dispatcher); err != nil {
 		if meta.CancelFunc != nil {
 			meta.CancelFunc()
@@ -459,18 +536,19 @@ func (b *DAGBridge) prepareInternal(ctx context.Context, d *dag.DAG, planID, ses
 		})
 	}
 
-	// 1. WAL: LogDAGPrepared (or LogDAGStart depending on phase).
-	// In the two-phase flow Prepare() writes "prepared", and Submit()
-	// later writes "started" when scheduler.Submit fires. The single
-	// Execute wrapper still emits "started" directly because there's
-	// no user-visible boundary between prep and submit.
+	// 1. WAL: LogDAGPrepared. The DAG is staged but not yet running.
+	// Submit() will write LogDAGStart later when scheduler.Submit
+	// fires. On crash recovery, a "prepared" entry without a
+	// matching "started" indicates the user never approved (or
+	// approved but crashed before submit) — recovery either replays
+	// the start or marks the prepared DAG abandoned.
 	dagJSON, _ := d.MarshalJSON()
-	if err := b.journal.LogDAGStart(d.ID(), string(dagJSON)); err != nil {
-		return fmt.Errorf("dag bridge: wal start: %w", err)
+	if err := b.journal.LogDAGPrepared(d.ID(), string(dagJSON)); err != nil {
+		return fmt.Errorf("dag bridge: wal prepared: %w", err)
 	}
 	shared.LogAgentEvent(b.eventLogger, agentlog.EventDAGStarted,
 		b.agentID, sessionID, "", "info",
-		&agentlog.DAGPayload{DAGID: d.ID(), State: "started"})
+		&agentlog.DAGPayload{DAGID: d.ID(), State: "prepared"})
 
 	// 2. SQLite: InsertDAGExecution
 	policyJSON, _ := json.Marshal(d.Policy())
@@ -595,6 +673,8 @@ func (b *DAGBridge) prepareInternal(ctx context.Context, d *dag.DAG, planID, ses
 		ReleasePendingTaskPods: make(map[string]struct{}),
 		taskPodSlots:           make(map[string]*taskPodSlot, len(taskPodDefs)),
 		subNodesByTask:         make(map[string][]subNodeRegistration),
+		taskClaims:             b.takePendingTaskClaims(d.ID()),
+		claimsPostedForTask:    make(map[string]struct{}),
 	}
 	b.mu.Unlock()
 
@@ -674,35 +754,27 @@ func (b *DAGBridge) prepareInternal(ctx context.Context, d *dag.DAG, planID, ses
 		}
 	})
 
-	// 7. Eager pod construction + pre-activation. With two-phase
-	// ingest the prep cost overlaps with user review, so we want
-	// EVERY pod warm by approve-click — not lazily built at first
-	// dispatch. ensureTaskPod's sync.Once gating means later
-	// dispatches still hit the cache; this just front-loads the
-	// per-pod buildTaskAgentPod + PreActivateStrict to prep time.
+	// 7. Pre-warming intentionally NOT done here. Earlier revisions
+	// eagerly called ensureTaskPod (which runs PreActivateStrict +
+	// postTaskClaimsForPod) for every task during Prepare so pods
+	// would be warm by approve-click. That eagerness, however,
+	// produced a cascade of bus events (registrar emissions, claim
+	// posts → fabric awareness wake-ups) BEFORE the user even saw
+	// the approval dialog — visible in the UI as agents "lighting
+	// up" with transient activity that wasn't real work.
 	//
-	// Per-pod errors don't fail prep — they fail at dispatch time
-	// for that specific task (the existing failure path). The other
-	// pods stay warm and dispatchable.
-	prepPodStart := time.Now()
-	for _, taskDef := range taskPodDefs {
-		taskID := taskDef.TaskID
-		if taskID == "" {
-			continue
-		}
-		if _, err := b.ensureTaskPod(dagCtx, d.ID(), taskID); err != nil {
-			b.logTrace("dag_prepare_pod_ensure_failed", agentlog.EventError, map[string]any{
-				"dag_id":  d.ID(),
-				"task_id": taskID,
-				"error":   err.Error(),
-			})
-		}
-	}
-	b.logTrace("dag_prepare_pods_warm", agentlog.EventRegistryEvent, map[string]any{
-		"dag_id":     d.ID(),
-		"pod_count":  len(taskPodDefs),
-		"elapsed_ms": time.Since(prepPodStart).Milliseconds(),
-	})
+	// Trade decision: keep Prepare's user-invisible work (DAG
+	// construction, dispatcher/gate wiring, WAL/SQLite writes,
+	// sub-node registration in meta) and defer all bus-emitting
+	// per-pod work (pod activation, claim posting) to first
+	// dispatch via the existing lazy ensureTaskPod path. The user
+	// pays a small per-pod activation cost on approve-click, but
+	// the UI stays clean during review and only shows real work.
+	//
+	// ensureTaskPod's sync.Once still guarantees one creation per
+	// task and atomic pod-with-VFS construction. Sub-node
+	// registrations are populated in meta.subNodesByTask above and
+	// applied when the pod is constructed at first dispatch.
 
 	// 8. Stash the per-DAG ctx and DAG payload on meta so a later
 	// Submit() call has everything it needs.
@@ -743,47 +815,146 @@ func (b *DAGBridge) abortPreSubmitDAG(dagID string, err error) error {
 // dispatches block on the same construction. Errors are sticky (a failed
 // creation is not retried — the DAG's existing failure paths handle it
 // just like any other dispatch error).
-func (b *DAGBridge) ensureTaskPod(_ context.Context, dagID, taskID string) (*shared.AgentPod, error) {
+func (b *DAGBridge) ensureTaskPod(ctx context.Context, dagID, taskID string) (*shared.AgentPod, error) {
 	if taskID == "" {
 		return nil, nil
 	}
+	enterAt := time.Now()
 	b.mu.RLock()
 	meta, ok := b.activeDAGs[dagID]
 	b.mu.RUnlock()
 	if !ok || meta == nil {
+		b.logTrace("ensure_task_pod_dag_not_active", agentlog.EventError, map[string]any{
+			"dag_id":  dagID,
+			"task_id": taskID,
+		})
 		return nil, fmt.Errorf("dag bridge: dag %s not active", dagID)
 	}
 	factory := meta.TaskPodFactory
 	if factory == nil {
+		b.logTrace("ensure_task_pod_no_factory", agentlog.EventError, map[string]any{
+			"dag_id":  dagID,
+			"task_id": taskID,
+		})
 		return nil, fmt.Errorf("dag bridge: dag %s has no task pod factory", dagID)
 	}
 
 	meta.slotMu.Lock()
 	slot, ok := meta.taskPodSlots[taskID]
-	if !ok {
+	firstCall := !ok
+	if firstCall {
 		slot = &taskPodSlot{}
 		meta.taskPodSlots[taskID] = slot
 	}
 	registrations := append([]subNodeRegistration(nil), meta.subNodesByTask[taskID]...)
+	subNodeCount := len(registrations)
+	taskClaimCount := len(meta.taskClaims[taskID])
 	meta.slotMu.Unlock()
 
+	b.logTrace("ensure_task_pod_enter", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id":           dagID,
+		"task_id":          taskID,
+		"first_call":       firstCall,
+		"sub_node_count":   subNodeCount,
+		"task_claim_count": taskClaimCount,
+	})
+
 	slot.once.Do(func() {
+		factoryStart := time.Now()
+		b.logTrace("ensure_task_pod_factory_begin", agentlog.EventRegistryEvent, map[string]any{
+			"dag_id":  dagID,
+			"task_id": taskID,
+		})
 		pod, err := factory(taskID)
 		if err != nil {
 			slot.err = fmt.Errorf("dag bridge: build task pod %s: %w", taskID, err)
+			b.logTrace("ensure_task_pod_factory_failed", agentlog.EventError, map[string]any{
+				"dag_id":     dagID,
+				"task_id":    taskID,
+				"elapsed_ms": time.Since(factoryStart).Milliseconds(),
+				"error":      err.Error(),
+			})
 			return
 		}
+		b.logTrace("ensure_task_pod_factory_done", agentlog.EventRegistryEvent, map[string]any{
+			"dag_id":     dagID,
+			"task_id":    taskID,
+			"elapsed_ms": time.Since(factoryStart).Milliseconds(),
+		})
+
 		// Apply deferred sub-node registrations BEFORE publishing the
 		// pod into TaskPods so any reader sees a fully-configured pod.
+		subStart := time.Now()
 		for _, reg := range registrations {
 			pod.RegisterSubNode(reg.subNodeID, reg.parentNodeID, reg.stage, reg.agentType)
 		}
+		b.logTrace("ensure_task_pod_subnodes_registered", agentlog.EventRegistryEvent, map[string]any{
+			"dag_id":     dagID,
+			"task_id":    taskID,
+			"count":      subNodeCount,
+			"elapsed_ms": time.Since(subStart).Milliseconds(),
+		})
+
+		claimsStart := time.Now()
+		b.logTrace("ensure_task_pod_claims_post_begin", agentlog.EventRegistryEvent, map[string]any{
+			"dag_id":  dagID,
+			"task_id": taskID,
+			"count":   taskClaimCount,
+		})
+		if claimsErr := b.postTaskClaimsForPod(ctx, meta, taskID); claimsErr != nil {
+			b.logTrace("ensure_task_pod_claims_post_failed", agentlog.EventError, map[string]any{
+				"dag_id":     dagID,
+				"task_id":    taskID,
+				"elapsed_ms": time.Since(claimsStart).Milliseconds(),
+				"error":      claimsErr.Error(),
+			})
+		} else {
+			b.logTrace("ensure_task_pod_claims_post_done", agentlog.EventRegistryEvent, map[string]any{
+				"dag_id":     dagID,
+				"task_id":    taskID,
+				"elapsed_ms": time.Since(claimsStart).Milliseconds(),
+			})
+		}
+
+		// Pod ACTIVATION (containers start, registrar fires, providers
+		// wrap) intentionally deferred to dispatcher.activateAgents
+		// → pod.HoldForNode at first dispatch. Earlier revisions
+		// pre-activated every member here, but the registrar emissions
+		// and downstream activity events painted the UI as if work
+		// was in flight DURING user review — agents lit up when no
+		// real work was happening yet. HoldForNode on first dispatch
+		// activates only the members the dispatched node needs;
+		// later dispatches to other members in the same pod
+		// incrementally activate them. The pod struct is constructed
+		// here (cheap), but it goes idle until first node dispatch.
+
 		meta.slotMu.Lock()
 		meta.TaskPods[taskID] = pod
 		meta.slotMu.Unlock()
 		slot.pod = pod
+		b.logTrace("ensure_task_pod_published", agentlog.EventRegistryEvent, map[string]any{
+			"dag_id":     dagID,
+			"task_id":    taskID,
+			"total_ms":   time.Since(factoryStart).Milliseconds(),
+		})
+	})
+	b.logTrace("ensure_task_pod_exit", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id":     dagID,
+		"task_id":    taskID,
+		"elapsed_ms": time.Since(enterAt).Milliseconds(),
+		"err":        errString(slot.err),
+		"pod_nil":    slot.pod == nil,
 	})
 	return slot.pod, slot.err
+}
+
+// errString returns "" for nil errors so structured-log fields stay
+// clean.
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // taskPodCacheLookup returns the cached pod for taskID, or nil if

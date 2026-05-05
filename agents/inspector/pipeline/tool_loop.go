@@ -195,6 +195,8 @@ func (pi *PipelineInspector) applyToolCalls(
 		isError := false
 		if err != nil {
 			switch {
+			case agentShared.IsConsultYielded(err):
+				return errCount, agentShared.ErrConsultYielded, delegatedMessage
 			case errors.Is(err, skills.ErrRerouteRequested):
 				controlErr = skills.ErrRerouteRequested
 				result = `{"rerouted": true}`

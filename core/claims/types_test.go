@@ -288,3 +288,105 @@ func TestIssuerAgentIDEmpty(t *testing.T) {
 		t.Error("empty relations should return empty")
 	}
 }
+
+func TestHandoffFromClaimID_Empty(t *testing.T) {
+	if HandoffFromClaimID(nil) != "" {
+		t.Error("nil relations should return empty")
+	}
+	if HandoffFromClaimID([]Relation{}) != "" {
+		t.Error("empty relations should return empty")
+	}
+	if HandoffFromClaimID([]Relation{
+		{Related: "claim-x", RelatedType: RelatedTypeClaim, Relationship: RelationshipCausedBy},
+	}) != "" {
+		t.Error("relations without handoff_from should return empty")
+	}
+}
+
+func TestHandoffFromClaimID_Single(t *testing.T) {
+	got := HandoffFromClaimID([]Relation{
+		{Related: "predecessor-cycle-root", RelatedType: RelatedTypeClaim, Relationship: RelationshipHandoffFrom},
+	})
+	if got != "predecessor-cycle-root" {
+		t.Fatalf("HandoffFromClaimID = %q, want predecessor-cycle-root", got)
+	}
+}
+
+func TestHandoffFromClaimID_MultipleReturnsFirst(t *testing.T) {
+	got := HandoffFromClaimID([]Relation{
+		{Related: "first", RelatedType: RelatedTypeClaim, Relationship: RelationshipHandoffFrom},
+		{Related: "second", RelatedType: RelatedTypeClaim, Relationship: RelationshipHandoffFrom},
+	})
+	if got != "first" {
+		t.Fatalf("HandoffFromClaimID = %q, want first", got)
+	}
+}
+
+func TestCompletesArtifactID_Empty(t *testing.T) {
+	if CompletesArtifactID(nil) != "" {
+		t.Error("nil relations should return empty")
+	}
+	if CompletesArtifactID([]Relation{}) != "" {
+		t.Error("empty relations should return empty")
+	}
+	if CompletesArtifactID([]Relation{
+		{Related: "art-x", RelatedType: RelatedTypeArtifact, Relationship: RelationshipCausedBy},
+	}) != "" {
+		t.Error("relations without completes should return empty")
+	}
+}
+
+func TestCompletesArtifactID_Single(t *testing.T) {
+	got := CompletesArtifactID([]Relation{
+		{Related: "started-art-1", RelatedType: RelatedTypeArtifact, Relationship: RelationshipCompletes},
+	})
+	if got != "started-art-1" {
+		t.Fatalf("CompletesArtifactID = %q, want started-art-1", got)
+	}
+}
+
+func TestCompletesArtifactID_MultipleReturnsFirst(t *testing.T) {
+	got := CompletesArtifactID([]Relation{
+		{Related: "first-started", RelatedType: RelatedTypeArtifact, Relationship: RelationshipCompletes},
+		{Related: "second-started", RelatedType: RelatedTypeArtifact, Relationship: RelationshipCompletes},
+	})
+	if got != "first-started" {
+		t.Fatalf("CompletesArtifactID = %q, want first-started", got)
+	}
+}
+
+func TestActionTypeHandoff_StringMatches(t *testing.T) {
+	if string(ActionTypeHandoff) != "handoff" {
+		t.Fatalf("ActionTypeHandoff = %q, want handoff", string(ActionTypeHandoff))
+	}
+}
+
+// TestActionType_AllConstantsKnown asserts that the enumerated set of
+// ActionType constants is the full set considered authoritative by the
+// system. New ActionType constants must be added to this slice (and
+// then any switch over ActionType audited for handling).
+func TestActionType_AllConstantsKnown(t *testing.T) {
+	known := []ActionType{
+		ActionTypeTask,
+		ActionTypeChallenge,
+		ActionTypeConsultation,
+		ActionTypeCorrective,
+		ActionTypeArchival,
+		ActionTypePrompt,
+		ActionTypeTestament,
+		ActionTypeBoot,
+		ActionTypeActivation,
+		ActionTypeShutdown,
+		ActionTypeHandoff,
+	}
+	seen := make(map[ActionType]struct{}, len(known))
+	for _, k := range known {
+		if _, dup := seen[k]; dup {
+			t.Fatalf("duplicate ActionType in known set: %q", k)
+		}
+		if string(k) == "" {
+			t.Fatalf("ActionType has empty string value")
+		}
+		seen[k] = struct{}{}
+	}
+}

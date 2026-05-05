@@ -3,6 +3,7 @@ package claims
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -18,8 +19,8 @@ const amplifierEmitTimeout = 2 * time.Second
 
 // BoardAmplifier dual-emits every claims board mutation as:
 //
-//   (1) a Fabric AgentActivity via activity.Append, and
-//   (2) a structured Delta to a bus topic via DeltaPublisher.
+//	(1) a Fabric AgentActivity via activity.Append, and
+//	(2) a structured Delta to a bus topic via DeltaPublisher.
 //
 // Both emissions are best-effort and non-blocking from the board
 // mutation's perspective. Errors are logged via log/slog and recorded
@@ -262,9 +263,15 @@ func (a *BoardAmplifier) PublishInboxDeltas(ctx context.Context, action *Action,
 }
 
 // PublishTestamentDelta emits a TestamentDelta on the claim's
-// status-testified topic.
+// status-testified topic. System-internal action types
+// (claims.IsSystemInternalAction) short-circuit here — no agent role
+// (Auditor / Archivist / Subject) should wake on a system claim's
+// testament. Same chokepoint as buildInboxDeltas for the inbox path.
 func (a *BoardAmplifier) PublishTestamentDelta(ctx context.Context, testament *Testament, claim *Claim) {
 	if a == nil || testament == nil || claim == nil {
+		return
+	}
+	if IsSystemInternalAction(claim.ActionType) {
 		return
 	}
 	delta := a.buildTestamentDelta(testament, claim)
@@ -292,9 +299,15 @@ func (a *BoardAmplifier) PublishValidationDelta(ctx context.Context, delta Valid
 }
 
 // PublishClaimStatusDelta emits a ClaimStatusDelta on the
-// claim-status topic for the target status.
+// claim-status topic for the target status. System-internal action
+// types short-circuit — Remediator / Auditor / Archivist roles
+// would otherwise wake on every system claim's status transition,
+// reproducing the storm the inbox fix already closed.
 func (a *BoardAmplifier) PublishClaimStatusDelta(ctx context.Context, delta ClaimStatusDelta) {
 	if a == nil {
+		return
+	}
+	if IsSystemInternalAction(delta.ActionKind) {
 		return
 	}
 	topic := ClaimStatusTopic(a.sessionID, delta.ClaimID, delta.ToStatus)
@@ -310,11 +323,66 @@ func (a *BoardAmplifier) PublishPhaseDelta(ctx context.Context, delta PhaseDelta
 	a.dispatchSingle(ctx, topic, delta)
 }
 
+// PublishConsultResolvedDelta emits a ConsultResolvedDelta on the
+// originator's personal consult-resolved topic. The pattern is per-
+// agent so only the agent that issued the consult sees the
+// resolution; no broadcast fan-out across the session. Used by the
+// responding agent's tool loop (or by deadline / cancellation
+// emitters) to wake the originator's pending ConsultContinuation.
+func (a *BoardAmplifier) PublishConsultResolvedDelta(ctx context.Context, delta ConsultResolvedDelta) {
+	if a == nil {
+		return
+	}
+	topic := ConsultResolvedTopic(a.sessionID, delta.OriginatorAgentID, delta.ConsultID)
+	a.dispatchSingle(ctx, topic, delta)
+}
+
+// PublishClaimContextDelta emits a ClaimContextDelta on the per-claim
+// context topic. System-internal action types are filtered to keep
+// system claims' narrative updates out of agent-waking subscription
+// firehoses (consistent with the rest of the amplifier). UI's
+// RoleObserver inbox subscribes via wildcard ClaimContextPattern.
+func (a *BoardAmplifier) PublishClaimContextDelta(ctx context.Context, delta ClaimContextDelta) {
+	if a == nil {
+		return
+	}
+	if IsSystemInternalAction(delta.ActionKind) {
+		return
+	}
+	topic := ClaimContextTopic(a.sessionID, delta.ClaimID)
+	a.dispatchSingle(ctx, topic, delta)
+}
+
+// PublishTestamentContextDelta emits a TestamentContextDelta on the
+// testament-anchor topic (AccumulatorID before flush, TestamentID
+// after). UI's RoleObserver inbox subscribes via wildcard
+// TestamentContextPattern.
+func (a *BoardAmplifier) PublishTestamentContextDelta(ctx context.Context, delta TestamentContextDelta) {
+	if a == nil {
+		return
+	}
+	topic := TestamentContextTopic(a.sessionID, delta.TestamentID, delta.AccumulatorID)
+	a.dispatchSingle(ctx, topic, delta)
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Delta builders
 // ────────────────────────────────────────────────────────────────────
 
 func (a *BoardAmplifier) buildInboxDeltas(action *Action, claim *Claim) []inboxDispatch {
+	// System-internal action types never publish InboxDeltas. Without
+	// this guard, every Boot / Activation / Shutdown / Archival action
+	// posted with subject=<some-agent> would wake that agent's
+	// standing inbox subscription and trigger inference — producing
+	// the runaway feedback loop seen in real sessions where agents
+	// rack up token volume without any user prompt. The classifier
+	// (claims.IsSystemInternalAction) is the canonical authority.
+	if action != nil && IsSystemInternalAction(action.Type) {
+		return nil
+	}
+	if claim != nil && IsSystemInternalAction(claim.ActionType) {
+		return nil
+	}
 	issuerID := action.AgentID
 	if issuerID == "" {
 		issuerID = IssuerAgentID(claim.Relations)
@@ -326,6 +394,30 @@ func (a *BoardAmplifier) buildInboxDeltas(action *Action, claim *Claim) []inboxD
 			continue
 		}
 		if !isDirectedAgentRelationship(r.Relationship) {
+			continue
+		}
+		// Audit-shaped self-claims never wake the issuer via the inbox
+		// path. The issuer is already executing when it posts the
+		// claim — a directed delivery back to itself produces a
+		// feedback loop: the agent's standing subscription matches,
+		// the request handler activates, and posts another self-claim,
+		// repeating at the dispatch rate. Observed in live sessions as
+		// the architect issuing self-targeted task claims at ~50ms
+		// cadence (lifecycle.log + ui_events.log diagnostic,
+		// 2026-05-04). RegisterPostActionExpectations already skips
+		// self-claims for the issuer's response expectation; this is
+		// the corresponding inbox-side cut.
+		//
+		// Directed self-handoffs (scribe-driven context-exhaustion
+		// continuation, UI_DESIGN.md §2.2 + §5.2): the predecessor
+		// instance posts ActionTypeHandoff with subject=<same agent
+		// ID> and a handoff_from relation pointing at the predecessor
+		// cycle's root claim. The successor MUST receive the inbox
+		// delta or it never wakes. The handoff_from relation is the
+		// canonical signal that this self-targeted post is directed
+		// work, not audit. Same shape covers any future legitimate
+		// self-prompt path that threads a predecessor claim through.
+		if r.Related == issuerID && HandoffFromClaimID(claim.Relations) == "" {
 			continue
 		}
 		delta := InboxDelta{
@@ -370,6 +462,7 @@ func (a *BoardAmplifier) buildTestamentDelta(testament *Testament, claim *Claim)
 		TestamentID:    testament.ID,
 		Sequence:       testament.Sequence,
 		EmittedAt:      time.Now().UTC(),
+		ActionKind:     claim.ActionType,
 		Verdict:        verdict,
 		ArtifactCount:  len(testament.Artifacts),
 		ArtifactKinds:  kinds,
@@ -398,7 +491,16 @@ func (a *BoardAmplifier) publishInboxBatch(ctx context.Context, publisher DeltaP
 	for _, d := range deltas {
 		if err := publisher.PublishDelta(ctx, d.topic, d.delta); err != nil {
 			a.reportEmitError("inbox_publish_failed", d.topic, err)
+			continue
 		}
+		slog.Info("amplifier_inbox_delta_published",
+			"session_id", a.sessionID,
+			"board_id", a.boardID,
+			"topic", d.topic,
+			"agent_id", d.delta.AgentID,
+			"claim_id", d.delta.ClaimID,
+			"action_kind", string(d.delta.ActionKind),
+		)
 	}
 }
 
@@ -413,15 +515,16 @@ func (a *BoardAmplifier) dispatchSingle(ctx context.Context, topic string, delta
 	a.runTracked(ctx, "claims_amplifier_delta", emit)
 }
 
-// runTracked dispatches fn under scope (async, bounded) when a scope
-// is wired, or runs it synchronously otherwise. Never blocks the
-// caller for more than a goroutine launch.
-func (a *BoardAmplifier) runTracked(ctx context.Context, description string, fn func(context.Context) error) {
+// runTracked dispatches fn under scope as a tracked async goroutine.
+// Scope is mandatory; a nil scope is a programming error at
+// construction and the emission is dropped with a structured error
+// so the failure is observable rather than silently inlined onto the
+// caller's hot path. Per the substrate's "async by default, always
+// tracked" invariant, there is no sync fallback.
+func (a *BoardAmplifier) runTracked(_ context.Context, description string, fn func(context.Context) error) {
 	if a.scope == nil {
-		// Synchronous path — tests and standalone tools.
-		if err := fn(ctx); err != nil {
-			a.reportEmitError("sync_emit_failed", description, err)
-		}
+		a.reportEmitError("amplifier_scope_unwired", description,
+			fmt.Errorf("amplifier scope not configured; emission dropped"))
 		return
 	}
 	if err := a.scope.Go(description, amplifierEmitTimeout, fn); err != nil {

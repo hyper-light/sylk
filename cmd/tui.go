@@ -149,58 +149,210 @@ func resolveProjectRoot() string {
 }
 
 // shutdownGrace and shutdownHard bound the GoroutineScope drain at the
-// end of cleanup. Derived from: once parent ctx is cancelled, well-behaved
-// workers exit within milliseconds; we allow a grace period for
-// owners (e.g. KnowledgeSyncService.Close) to land their cooperative
-// cancellation, then force-cancel any laggards.
+// end of cleanup. Sized for sub-second total shutdown: once parent ctx
+// is cancelled, well-behaved workers exit in tens of milliseconds;
+// 100ms grace is the cooperative window, 200ms hard is the force-
+// cancel ceiling. Workers that don't drain within shutdownHard are
+// abandoned to runtime exit reclamation.
+// shutdownGrace and shutdownHard size the scope drain at the end of
+// cleanup. SignalShutdown is called at the very start of cleanup, so
+// every tracked worker has the entire parallel-close phase to wind
+// down by the time we get here. Sized tight: stragglers blocked on
+// non-cancellable external IO will exceed this window and get
+// reported as leaks (now logged, not fatal — see cleanup tail), so
+// no point waiting longer than the OS scheduler needs to deliver
+// the cancellation signal to the workers that *are* responsive.
 const (
-	shutdownGrace = 1 * time.Second
-	shutdownHard  = 2 * time.Second
+	shutdownGrace = 25 * time.Millisecond
+	shutdownHard  = 75 * time.Millisecond
 )
 
-// shutdownTimeout bounds total cleanup time. Derived from the longest
-// possible graceful stop (60s for max-context agents) + headroom.
-const shutdownTimeout = 90 * time.Second
+// shutdownTimeout is the overall ceiling on the cleanup function.
+// Derived from: 200ms supervisor + max(per-subsystem budget) for the
+// parallel-close phase (containers at 1500ms is the slowest; every
+// other subsystem fits the default 200ms once SignalShutdown has
+// propagated cancellation) + 50ms drain + shutdownHard scope drain
+// + headroom. Wall time is dominated by max(budget), not sum,
+// because every subsystem closes in its own goroutine.
+const shutdownTimeout = 2 * time.Second
 
-// closeBudget bounds a single subsystem Close()/Stop() call. Derived
-// from: well-behaved subsystems flush within sub-second; DB-backed
-// subsystems may need a few seconds for in-flight writes to land.
-// 5s gives DB closes ~5× their typical write latency without
-// allowing any one stuck subsystem to consume more than its share
-// of the overall shutdownTimeout (90s / 5s = up to 18 closes can
-// run sequentially within budget). Operators can tune via
-// SYLK_CLOSE_BUDGET_SECONDS for slow disks or large WAL backlogs.
-const closeBudget = 5 * time.Second
+// closeBudget bounds a single subsystem Close()/Stop() call. Sized
+// for sub-second total cleanup: a well-behaved Close completes in
+// tens-of-ms; 200ms covers DB flushes and channel drains without
+// inflating cumulative wait. Subsystems that miss the budget have
+// their fn-runner goroutine left running (tracked via wg, observable
+// via shutdown logs) — the cooperative path moves on, the kill
+// watchdog stays armed for the user's force-exit.
+const closeBudget = 200 * time.Millisecond
+
+// Per-subsystem budget for stopping containers. Sylk containers are
+// in-process — Container.Stop is essentially a wait for the
+// container's *own* scope to drain its tracked workers. The early
+// SignalShutdown propagation (cleanup signals every container's
+// scope at t=0) means those workers have already had the entire
+// parallel-close phase to wind down by the time Container.Stop
+// actually runs, so 200ms is enough for the agent's lifecycle
+// transitions plus any post-stop hooks.
+const closeBudgetContainers = 200 * time.Millisecond
+
+// closeDrainGrace bounds the post-cleanup wait for tracked-but-still-
+// running close goroutines to finish. Sized small: a Close that
+// hasn't returned by closeBudget+drainGrace is genuinely stuck, and
+// the kill watchdog (200ms after a second Ctrl+C) is the right
+// escape. 50ms is the natural tail for fast closes that finish a
+// hair after their budget elapses.
+const closeDrainGrace = 50 * time.Millisecond
 
 // closeWithBudget runs fn under the smaller of the per-call closeBudget
-// and the parent ctx's remaining deadline. On timeout, the inner fn
-// goroutine is intentionally leaked — the program is in shutdown,
-// the kill watchdog (cmd/tui_kill_watchdog.go) provides the user-
-// triggered escape, and runtime exit will reclaim everything. Logs
-// the timeout via slog.Warn and returns a wrapped error so the
-// cleanup chain can collect it without halting the rest of the
-// teardown.
+// and the parent ctx's remaining deadline, passing the bounded
+// sub-context to fn so ctx-aware closes can honor it directly. The
+// inner goroutine is tracked via wg so an operator inspecting
+// shutdown state can see how many close goroutines are still in
+// flight. On timeout, the inner fn goroutine is left running (it has
+// the wg.Done deferred so the tracker observes when it completes);
+// the kill watchdog provides the user-triggered escape and runtime
+// exit reclaims everything.
 //
-// fn must be a Close()/Stop() that returns error. For void Stop()
-// methods, wrap in a closure: closeWithBudget(ctx, "gateway", func() error { gw.Stop(); return nil }).
-func closeWithBudget(ctx context.Context, name string, fn func() error) error {
-	sub, cancel := context.WithTimeout(ctx, closeBudget)
+// fn signature is ctx-aware: closes that already accept context
+// (e.g. MemoryForest.CloseWithContext) plug in directly. For non-ctx
+// Close()/Stop() methods, use closeAware/closeAwareVoid below to
+// adapt — they ignore ctx but the surrounding closeWithBudget still
+// bounds the wait via its select.
+func closeWithBudget(ctx context.Context, wg *sync.WaitGroup, name string, fn func(context.Context) error) error {
+	return closeWithBudgetN(ctx, wg, name, closeBudget, fn)
+}
+
+// closeWithBudgetN is the per-budget variant of closeWithBudget.
+// Slow subsystems (containers, knowledge layers, activation) pass
+// their own budget so a single 200ms one-size-fits-all does not
+// truncate legitimate close work into a timeout error.
+func closeWithBudgetN(ctx context.Context, wg *sync.WaitGroup, name string, budget time.Duration, fn func(context.Context) error) error {
+	sub, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+	wg.Add(1)
 	done := make(chan error, 1)
 	go func() {
-		done <- fn()
+		defer wg.Done()
+		done <- fn(sub)
 	}()
 	select {
 	case err := <-done:
 		return err
 	case <-sub.Done():
-		slog.Warn("shutdown: close timed out; moving on",
+		// Two-stage handoff: when the budget elapses, give the inner
+		// fn a brief grace window to deliver an already-prepared error
+		// before declaring a timeout. ctx-aware closes (e.g. ChannelBus
+		// .CloseWithContext) detect ctx cancellation and return their
+		// own structured error within microseconds; without this
+		// grace, Go's randomized select between done and sub.Done()
+		// often returns the generic "timed out" message even though
+		// the inner error was already on its way.
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(closeBudgetHandoff):
+		}
+		// Timeout-after-grace is a soft failure: the goroutine is
+		// tracked via the shutdown wg, the kill watchdog stays armed
+		// for force-exit, and runtime exit reclaims everything. We
+		// log it but do NOT return it as an error so a slow
+		// (but non-faulty) close doesn't fail the whole cleanup. Real
+		// fn errors still propagate via the case err := <-done branch.
+		slog.Warn("shutdown: close exceeded budget; goroutine remains tracked via shutdown wg",
 			"subsystem", name,
-			"budget", closeBudget,
+			"budget", budget,
 			"reason", sub.Err().Error(),
 		)
-		return fmt.Errorf("close %q timed out after %s: %w", name, closeBudget, sub.Err())
+		return nil
 	}
+}
+
+// closeBudgetHandoff is the grace window between budget expiry and
+// declaring a timeout. Sized to comfortably absorb scheduler latency
+// for an inner ctx-aware close that has already started returning its
+// error: a Go channel send + select dispatch is sub-microsecond, so
+// 5ms is generous and still imperceptible to the user.
+const closeBudgetHandoff = 5 * time.Millisecond
+
+// closeAware adapts a non-ctx Close() to the ctx-aware shape
+// closeWithBudget expects. The returned function ignores ctx —
+// non-ctx closes don't observe cancellation by design — but the
+// surrounding closeWithBudget still bounds the wait via its select
+// and the wg-tracked goroutine remains observable.
+func closeAware(fn func() error) func(context.Context) error {
+	return func(_ context.Context) error {
+		return fn()
+	}
+}
+
+// closeAwareVoid adapts a void Stop() to the ctx-aware shape.
+func closeAwareVoid(fn func()) func(context.Context) error {
+	return func(_ context.Context) error {
+		fn()
+		return nil
+	}
+}
+
+// drainCloseGoroutines waits for all goroutines spawned by
+// closeWithBudget to finish, bounded by closeDrainGrace. After the
+// grace expires, any remaining goroutines are logged; they are
+// reclaimed when the process exits (immediate via the kill watchdog
+// or naturally on main return).
+//
+// The single observer goroutine spawned here is a one-shot: it
+// exits as soon as wg.Wait returns. It is not in the close wg
+// itself, but its lifecycle is bounded by the same wg's completion
+// — when all close-goroutines exit, the observer exits. When close-
+// goroutines never exit, the observer waits until process termination,
+// which is reclaimed as part of normal Go runtime teardown.
+func drainCloseGoroutines(wg *sync.WaitGroup) {
+	drainCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(drainCh)
+	}()
+	select {
+	case <-drainCh:
+	case <-time.After(closeDrainGrace):
+		slog.Warn("shutdown: close goroutines still in flight after grace; relying on watchdog or process exit",
+			"grace", closeDrainGrace,
+		)
+	}
+}
+
+// shutdownContainers stops + removes every container in parallel,
+// each container under its own bounded ctx. Per-container parallel
+// dispatch ensures the cumulative wait is max(per-container
+// stop+remove) instead of sum. Errors are joined; nothing fails
+// the cleanup as a whole.
+func shutdownContainers(ctx context.Context, rt container.ContainerRuntime, all []*container.Container) error {
+	if rt == nil || len(all) == 0 {
+		return nil
+	}
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var errs []error
+	for _, c := range all {
+		wg.Add(1)
+		c := c
+		go func() {
+			defer wg.Done()
+			if c.IsRunning() {
+				if err := rt.StopContainer(ctx, c); err != nil {
+					errMu.Lock()
+					errs = append(errs, err)
+					errMu.Unlock()
+				}
+			}
+			if err := rt.RemoveContainer(ctx, c); err != nil {
+				errMu.Lock()
+				errs = append(errs, err)
+				errMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // =============================================================================
@@ -520,7 +672,8 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	phase1.scope = concurrency.NewGoroutineScope(ctx, "tui", nil)
 	phase1.scope.SetMaxLifetime(24 * time.Hour)
 
-	phase1.guideBus = guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	guideChannelBus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	phase1.guideBus = guideChannelBus
 	phase1.activityPub = events.NewMetadataCachingPublisher(
 		guide.NewBusActivityPublisher(phase1.guideBus),
 		map[string]events.AgentIdentityMetadata{
@@ -540,7 +693,17 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		},
 	)
 	phase1.streamMgr = guide.NewStreamManager(guide.DefaultStreamConfig())
-	phase1.sessionMgr = session.NewManager(session.ManagerConfig{Scope: phase1.scope})
+	// Bridge the guide ChannelBus into the claims DeltaBus surface so
+	// every session board's amplifier publishes InboxDelta / TestamentDelta
+	// onto the same transport pipeline workers subscribe to via
+	// ClaimsInbox. Without this adapter, board emissions go to the
+	// default NoopDeltaBus and orchestrator-dispatched claims never
+	// reach worker inboxes.
+	claimsDeltaBus := guide.NewClaimsBusAdapter(guideChannelBus)
+	phase1.sessionMgr = session.NewManager(session.ManagerConfig{
+		Scope:    phase1.scope,
+		DeltaBus: claimsDeltaBus,
+	})
 	phase1.descriptors = handoff.NewDescriptorRegistry()
 
 	// Create the default session eagerly so the identity Factory can
@@ -685,6 +848,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		phase1.budget,
 		&phase1.identityFactory,
 		phase1.defaultSession.ID(),
+		phase1.scope,
 	)
 
 	slog.Info("bootstrap phase 1 complete", "elapsed", time.Since(start))
@@ -1700,91 +1864,112 @@ func buildBootstrapCleanup(
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer shutdownCancel()
 
+		// Signal scope cancellation up front, on every scope sylk
+		// owns: the TUI scope plus every container's own scope. Each
+		// tracked worker — claims amplifier, phase4 background tasks,
+		// activation helpers, in-container agent goroutines — sees
+		// ctx.Done() at t=0 instead of only when its owner's Close is
+		// called. By the time the parallel close phase runs, workers
+		// have had the entire close-phase wall-time to wind down, so
+		// Container.Stop's internal scope.Shutdown drains essentially
+		// instantly instead of being the dominant cost.
+		phase1.scope.SignalShutdown()
+		for _, c := range phase1.containerReg.All() {
+			c.SignalShutdown()
+		}
+
 		select {
 		case <-phase4.phase4Done:
 		default:
 		}
 
 		var errs []error
-		if sup := phase4.supervisorRef.Load(); sup != nil {
-			if err := closeWithBudget(shutdownCtx, "supervisor", sup.Stop); err != nil {
-				errs = append(errs, err)
+		var errMu sync.Mutex
+		addErr := func(err error) {
+			if err == nil {
+				return
 			}
-		}
-		if phase3.activationCtrl != nil {
-			if err := phase3.activationCtrl.Shutdown(shutdownCtx); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		for _, c := range phase1.containerReg.All() {
-			if c.IsRunning() {
-				if err := phase1.runtime.StopContainer(shutdownCtx, c); err != nil {
-					errs = append(errs, err)
-				}
-			}
-			if err := phase1.runtime.RemoveContainer(shutdownCtx, c); err != nil {
-				errs = append(errs, err)
-			}
+			errMu.Lock()
+			errs = append(errs, err)
+			errMu.Unlock()
 		}
 
-		_ = closeWithBudget(shutdownCtx, "namespace", func() error {
-			phase1.namespace.Close()
-			return nil
+		// closeWG tracks fn-runner goroutines spawned by closeWithBudget.
+		// dispatchWG tracks the outer parallel-dispatch wrappers.
+		var closeWG sync.WaitGroup
+		var dispatchWG sync.WaitGroup
+
+		closeAsync := func(name string, fn func(context.Context) error) {
+			dispatchWG.Add(1)
+			go func() {
+				defer dispatchWG.Done()
+				addErr(closeWithBudget(shutdownCtx, &closeWG, name, fn))
+			}()
+		}
+
+		closeAsyncBudget := func(name string, budget time.Duration, fn func(context.Context) error) {
+			dispatchWG.Add(1)
+			go func() {
+				defer dispatchWG.Done()
+				addErr(closeWithBudgetN(shutdownCtx, &closeWG, name, budget, fn))
+			}()
+		}
+
+		// Phase A: supervisor first. Sequential because all subsequent
+		// closes can run safely once the supervisor has signaled
+		// agents to stop. Bounded by closeBudget like every other
+		// close.
+		if sup := phase4.supervisorRef.Load(); sup != nil {
+			addErr(closeWithBudget(shutdownCtx, &closeWG, "supervisor", closeAware(sup.Stop)))
+		}
+
+		// Phase B: every remaining close runs in parallel — activation,
+		// containers, all storage layers, gateways, bus. Cumulative
+		// wait is max(closeBudget) instead of sum, keeping total
+		// shutdown sub-second.
+		if phase3.activationCtrl != nil {
+			closeAsync("activation_ctrl", func(ctx context.Context) error {
+				return phase3.activationCtrl.Shutdown(ctx)
+			})
+		}
+		closeAsyncBudget("containers", closeBudgetContainers, func(ctx context.Context) error {
+			return shutdownContainers(ctx, phase1.runtime, phase1.containerReg.All())
 		})
-		_ = closeWithBudget(shutdownCtx, "runtime", func() error {
-			phase1.runtime.Close()
-			return nil
-		})
-		_ = closeWithBudget(shutdownCtx, "plan_store", func() error {
-			phase1.planStore.Close()
-			return nil
-		})
+		closeAsync("namespace", closeAwareVoid(phase1.namespace.Close))
+		closeAsync("runtime", closeAwareVoid(phase1.runtime.Close))
+		closeAsync("plan_store", closeAwareVoid(phase1.planStore.Close))
 		if phase4.bootLogger != nil {
-			_ = closeWithBudget(shutdownCtx, "boot_logger", phase4.bootLogger.Close)
+			closeAsync("boot_logger", closeAware(phase4.bootLogger.Close))
 		}
 		if phase4.knowledgeSync != nil {
-			if err := closeWithBudget(shutdownCtx, "knowledge_sync", phase4.knowledgeSync.Close); err != nil {
-				errs = append(errs, err)
-			}
+			closeAsync("knowledge_sync", closeAware(phase4.knowledgeSync.Close))
 		}
-		if err := closeWithBudget(shutdownCtx, "knowledge_store", phase1.knowledgeStore.Close); err != nil {
-			errs = append(errs, err)
-		}
+		closeAsync("knowledge_store", closeAware(phase1.knowledgeStore.Close))
 		if phase1.forest != nil {
-			if err := closeWithBudget(shutdownCtx, "forest", phase1.forest.Close); err != nil {
-				errs = append(errs, err)
-			}
+			// Forest is ctx-aware: bounded sub-ctx propagates all the
+			// way to the wg.Wait inside the forest, so it returns at
+			// the budget boundary instead of waiting on stuck workers.
+			closeAsync("forest", phase1.forest.CloseWithContext)
 		}
 		if phase1.forestContent != nil {
-			if err := closeWithBudget(shutdownCtx, "forest_content", phase1.forestContent.Close); err != nil {
-				errs = append(errs, err)
-			}
+			closeAsync("forest_content", closeAware(phase1.forestContent.Close))
 		}
 		if phase1.forestVectorDB != nil {
-			if err := closeWithBudget(shutdownCtx, "forest_vector_db", phase1.forestVectorDB.Close); err != nil {
-				errs = append(errs, err)
-			}
+			closeAsync("forest_vector_db", closeAware(phase1.forestVectorDB.Close))
 		}
 		if phase1.knowledgeBackend != nil {
-			if err := closeWithBudget(shutdownCtx, "knowledge_backend", phase1.knowledgeBackend.Close); err != nil {
-				errs = append(errs, err)
-			}
+			closeAsync("knowledge_backend", closeAware(phase1.knowledgeBackend.Close))
 		}
-		_ = closeWithBudget(shutdownCtx, "google_gateway", func() error {
-			phase1.googleGateway.Stop()
-			return nil
-		})
-		_ = closeWithBudget(shutdownCtx, "anthropic_gateway", func() error {
-			phase1.anthropicGateway.Stop()
-			return nil
-		})
-		_ = closeWithBudget(shutdownCtx, "openai_gateway", func() error {
-			phase1.openaiGateway.Stop()
-			return nil
-		})
-		if err := closeWithBudget(shutdownCtx, "guide_bus", phase1.guideBus.Close); err != nil {
-			errs = append(errs, err)
-		}
+		closeAsync("google_gateway", closeAwareVoid(phase1.googleGateway.Stop))
+		closeAsync("anthropic_gateway", closeAwareVoid(phase1.anthropicGateway.Stop))
+		closeAsync("openai_gateway", closeAwareVoid(phase1.openaiGateway.Stop))
+		closeAsync("guide_bus", phase1.guideBus.CloseWithContext)
+
+		// Wait for all parallel dispatch wrappers (each ≤ closeBudget).
+		// dispatchWG.Wait completes in ~closeBudget regardless of
+		// how many closes are stuck.
+		dispatchWG.Wait()
+		drainCloseGoroutines(&closeWG)
 		// Drain the scope LAST. Every long-running worker registered with
 		// phase1.scope (librarian-knowledge-sync, phase4 background tasks,
 		// orchestrator/architect helpers) must be cancellable via the
@@ -1797,7 +1982,26 @@ func buildBootstrapCleanup(
 		// the scope to report leaks that aren't actually leaks — just
 		// not-yet-cancelled workers waiting on their owner's Close.
 		if err := phase1.scope.Shutdown(shutdownGrace, shutdownHard); err != nil {
-			errs = append(errs, err)
+			// Goroutine leaks at scope drain are diagnostic, not fatal.
+			// A leaked worker is one that was tracked correctly (the
+			// "no untracked goroutines" invariant is upheld) but didn't
+			// honor ctx cancellation within the scope's hard deadline —
+			// typically a worker stuck in a non-ctx-aware blocking call
+			// (LLM provider request, external SDK syscall). The
+			// log line names every leaked worker so the underlying
+			// blocking call can be located, while runtime exit reaps
+			// the leftover goroutines. Failing the cleanup function
+			// here would surface an exit-status-1 error for what is
+			// actually a graceful-degradation case.
+			var leakErr *concurrency.GoroutineLeakError
+			if errors.As(err, &leakErr) {
+				slog.Warn("shutdown: tracked goroutines did not drain within scope deadline; relying on process exit to reclaim",
+					"leaked_count", leakErr.LeakedCount,
+					"workers", leakErr.Workers,
+				)
+			} else {
+				errs = append(errs, err)
+			}
 		}
 		return errors.Join(errs...)
 	}
@@ -1929,6 +2133,7 @@ func registerAgentCreators(
 	budget *concurrency.GoroutineBudget,
 	factoryRef *atomic.Pointer[identity.Factory],
 	defaultSessionID string,
+	scope *concurrency.GoroutineScope,
 ) {
 	// Guide — Gemini with rule-based fallback.
 	// First call blocks on hydrateOnce; subsequent calls (daemon restart)
@@ -1938,7 +2143,7 @@ func registerAgentCreators(
 		if h == nil {
 			h = hydratedRef.Load()
 		}
-		return bootstrapLiveGuide(ctx, bus, actPub, h, googleGw, authRegistry, projectRoot, forest, func(sessionID string) *versioning.SessionVFS {
+		return bootstrapLiveGuide(ctx, bus, actPub, h, googleGw, authRegistry, projectRoot, forest, scope, func(sessionID string) *versioning.SessionVFS {
 			if orch := orchRef.Load(); orch != nil {
 				return orch.GetSessionVFS(sessionID)
 			}
@@ -1955,7 +2160,7 @@ func registerAgentCreators(
 				return orch.GetSessionVFS(sessionID)
 			}
 			return nil
-		}, factoryRef)
+		}, factoryRef, scope)
 	})
 
 	// Orchestrator — pipeline coordinator.
@@ -1965,7 +2170,7 @@ func registerAgentCreators(
 		if h == nil {
 			h = hydratedRef.Load()
 		}
-		return bootstrapOrchestrator(ctx, orchestratorID, bus, actPub, projectRoot, h, authRegistry, googleGw, forest, factoryRef.Load())
+		return bootstrapOrchestrator(ctx, orchestratorID, bus, actPub, projectRoot, h, authRegistry, googleGw, forest, factoryRef.Load(), scope)
 	})
 
 	// Guardian — safety sidecar daemon.
@@ -1977,7 +2182,7 @@ func registerAgentCreators(
 				return orch.GetSessionVFS(sessionID)
 			}
 			return nil
-		}, factoryRef.Load())
+		}, factoryRef.Load(), scope)
 		if err != nil {
 			return nil, err
 		}
@@ -1988,7 +2193,7 @@ func registerAgentCreators(
 	})
 
 	// On-demand agents — created lazily by the ActivationController.
-	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, authRegistry, actCtrlRef, knowledgeStore, knowledgeBackend, forest, guardianRef, orchRef, quarantineRef, quota, factoryRef)
+	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, authRegistry, actCtrlRef, knowledgeStore, knowledgeBackend, forest, guardianRef, orchRef, quarantineRef, quota, factoryRef, scope)
 }
 
 // registerOnDemandAgentCreators registers factories for knowledge and pipeline agents.
@@ -2012,6 +2217,14 @@ type onDemandAgentCreatorDeps struct {
 	quarantineRef    *atomic.Pointer[fetch.QuarantineBuffer]
 	quota            *container.ResourceQuota
 	factoryRef       *atomic.Pointer[identity.Factory]
+	// scope is the top-level tui scope. Every on-demand agent's
+	// SetScope is called with this before Start so claims-intake
+	// OnResolved dispatches and accumulator flushes go through a
+	// real tracked scope rather than falling into the sync fallback.
+	// Without this, claims_intake_wiring logs scope_present=false
+	// and every async amplifier emission / accumulator flush is
+	// dropped.
+	scope *concurrency.GoroutineScope
 	// providerPool memoizes createSwapProvider results across agent
 	// creator calls so pipeline agent re-creation (engineer/designer/
 	// inspector-pipeline/tester-pipeline) doesn't repay provider
@@ -2108,6 +2321,7 @@ func registerOnDemandAgentCreators(
 	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
 	quota *container.ResourceQuota,
 	factoryRef *atomic.Pointer[identity.Factory],
+	scope *concurrency.GoroutineScope,
 ) {
 	deps := onDemandAgentCreatorDeps{
 		reg:              reg,
@@ -2129,6 +2343,7 @@ func registerOnDemandAgentCreators(
 		quota:            quota,
 		providerPool:     newProviderWarmPool(),
 		factoryRef:       factoryRef,
+		scope:            scope,
 	}
 	registerOnDemandKnowledgeAgentCreators(deps)
 	registerOnDemandQualityAgentCreators(deps)
@@ -2173,6 +2388,7 @@ func registerLibrarianAgentCreator(deps onDemandAgentCreatorDeps) {
 		}
 		l.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution))
 		l.SetKnowledgeStore(deps.knowledgeStore)
+		l.SetScope(deps.scope)
 
 		if startErr := l.Start(deps.bus); startErr != nil {
 			return nil, startErr
@@ -2199,6 +2415,7 @@ func registerArchivalistAgentCreator(deps onDemandAgentCreatorDeps) {
 		a.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution))
 		a.SetKnowledgeStore(deps.knowledgeStore)
 		a.SetKnowledgeBackend(deps.knowledgeBackend)
+		a.SetScope(deps.scope)
 		if startErr := a.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
@@ -2255,6 +2472,7 @@ func registerAcademicAgentCreator(deps onDemandAgentCreatorDeps) {
 		a.SetKnowledgeStore(deps.knowledgeStore)
 		a.SetKnowledgeBackend(deps.knowledgeBackend)
 		a.SetFetchPipeline(buildAcademicFetchPipeline(deps.projectRoot, deps.guardianRef, deps.quarantineRef, deps.knowledgeBackend))
+		a.SetScope(deps.scope)
 		if startErr := a.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
@@ -2295,6 +2513,7 @@ func registerGlobalInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 		))
 		gi.SetWorkspaceViews(deps.workspaceViews(versioning.WorkspaceViewGlobal))
 		gi.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation))
+		gi.SetScope(deps.scope)
 		if startErr := gi.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
@@ -2304,28 +2523,41 @@ func registerGlobalInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 
 func registerPipelineInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 	deps.reg.Register("inspector-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
+		creatorStart := time.Now()
 		agentID := pipelineWorkerAgentID(ctx, "inspector-pipeline")
 		model := deps.configuredModel("inspector-pipeline", "claude-opus-4-6")
+		slog.Info("pipeline_creator_enter", "agent_type", "inspector-pipeline", "agent_id", agentID, "model", model)
+		providerStart := time.Now()
 		wrapped, err := deps.swapProvider(ctx, model, gateway.PriorityValidation)
 		if err != nil {
+			slog.Error("pipeline_creator_provider_failed", "agent_type", "inspector-pipeline", "agent_id", agentID, "elapsed_ms", time.Since(providerStart).Milliseconds(), "error", err.Error())
 			return nil, fmt.Errorf("pipeline inspector provider: %w", err)
 		}
+		slog.Info("pipeline_creator_provider_ok", "agent_type", "inspector-pipeline", "agent_id", agentID, "elapsed_ms", time.Since(providerStart).Milliseconds())
+		newStart := time.Now()
 		pi, err := inspectorPipeline.New(inspectorShared.PipelineInspectorConfig{AgentID: agentID, Forest: deps.forest, Factory: deps.factory()}, wrapped)
 		if err != nil {
+			slog.Error("pipeline_creator_new_failed", "agent_type", "inspector-pipeline", "agent_id", agentID, "elapsed_ms", time.Since(newStart).Milliseconds(), "error", err.Error())
 			return nil, err
 		}
+		slog.Info("pipeline_creator_new_ok", "agent_type", "inspector-pipeline", "agent_id", agentID, "elapsed_ms", time.Since(newStart).Milliseconds())
 		pi.SetActivityPublisher(deps.actPub)
-		// Inspector-owned pipeline VFS authority — handoff_to_ot and
-		// discard_pipeline call this committer instead of the orchestrator
-		// reacting to "succeeded" / "failed" pipeline broadcasts. The
-		// session is resolved per-call via ctx so a single inspector pod
-		// can correctly serve work from multiple session contexts.
+		if board := claims.DefaultSessionBoardRegistry().Lookup(deps.defaultSessionID()); board != nil {
+			pi.SetClaimsBoard(board)
+			slog.Info("pipeline_creator_board_attached", "agent_type", "inspector-pipeline", "agent_id", agentID, "session_id", deps.defaultSessionID(), "board_id", board.BoardID())
+		} else {
+			slog.Warn("pipeline_creator_board_missing", "agent_type", "inspector-pipeline", "agent_id", agentID, "session_id", deps.defaultSessionID(), "reason", "session board lookup returned nil; inbox will resolve deltas with empty Node")
+		}
 		pi.SetPipelineCommitter(agentShared.NewSessionVFSPipelineCommitter(func(sessionID string) agentShared.SessionVFSPipelineCommitterBackend {
 			return deps.sessionLookup(sessionID)
 		}))
+		pi.SetScope(deps.scope)
+		startStart := time.Now()
 		if startErr := pi.Start(deps.bus); startErr != nil {
+			slog.Error("pipeline_creator_start_failed", "agent_type", "inspector-pipeline", "agent_id", agentID, "elapsed_ms", time.Since(startStart).Milliseconds(), "error", startErr.Error())
 			return nil, startErr
 		}
+		slog.Info("pipeline_creator_start_ok", "agent_type", "inspector-pipeline", "agent_id", agentID, "elapsed_ms", time.Since(startStart).Milliseconds(), "total_ms", time.Since(creatorStart).Milliseconds())
 		return pi, nil
 	})
 }
@@ -2358,6 +2590,7 @@ func registerGlobalTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 		))
 		gt.SetWorkspaceViews(deps.workspaceViews(versioning.WorkspaceViewGlobal))
 		gt.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation))
+		gt.SetScope(deps.scope)
 		if startErr := gt.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
@@ -2367,20 +2600,38 @@ func registerGlobalTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 
 func registerPipelineTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 	deps.reg.Register("tester-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
+		creatorStart := time.Now()
 		agentID := pipelineWorkerAgentID(ctx, "tester-pipeline")
 		model := deps.configuredModel("tester-pipeline", "gpt-5.4-pro")
+		slog.Info("pipeline_creator_enter", "agent_type", "tester-pipeline", "agent_id", agentID, "model", model)
+		providerStart := time.Now()
 		wrapped, err := deps.swapProvider(ctx, model, gateway.PriorityValidation)
 		if err != nil {
+			slog.Error("pipeline_creator_provider_failed", "agent_type", "tester-pipeline", "agent_id", agentID, "elapsed_ms", time.Since(providerStart).Milliseconds(), "error", err.Error())
 			return nil, fmt.Errorf("pipeline tester provider: %w", err)
 		}
+		slog.Info("pipeline_creator_provider_ok", "agent_type", "tester-pipeline", "agent_id", agentID, "elapsed_ms", time.Since(providerStart).Milliseconds())
+		newStart := time.Now()
 		pt, err := pipelinetester.New(shared.PipelineTesterConfig{AgentID: agentID, Model: model, Forest: deps.forest, Factory: deps.factory()}, wrapped)
 		if err != nil {
+			slog.Error("pipeline_creator_new_failed", "agent_type", "tester-pipeline", "agent_id", agentID, "elapsed_ms", time.Since(newStart).Milliseconds(), "error", err.Error())
 			return nil, err
 		}
+		slog.Info("pipeline_creator_new_ok", "agent_type", "tester-pipeline", "agent_id", agentID, "elapsed_ms", time.Since(newStart).Milliseconds())
 		pt.SetActivityPublisher(deps.actPub)
+		if board := claims.DefaultSessionBoardRegistry().Lookup(deps.defaultSessionID()); board != nil {
+			pt.SetClaimsBoard(board)
+			slog.Info("pipeline_creator_board_attached", "agent_type", "tester-pipeline", "agent_id", agentID, "session_id", deps.defaultSessionID(), "board_id", board.BoardID())
+		} else {
+			slog.Warn("pipeline_creator_board_missing", "agent_type", "tester-pipeline", "agent_id", agentID, "session_id", deps.defaultSessionID(), "reason", "session board lookup returned nil; inbox will resolve deltas with empty Node")
+		}
+		pt.SetScope(deps.scope)
+		startStart := time.Now()
 		if startErr := pt.Start(deps.bus); startErr != nil {
+			slog.Error("pipeline_creator_start_failed", "agent_type", "tester-pipeline", "agent_id", agentID, "elapsed_ms", time.Since(startStart).Milliseconds(), "error", startErr.Error())
 			return nil, startErr
 		}
+		slog.Info("pipeline_creator_start_ok", "agent_type", "tester-pipeline", "agent_id", agentID, "elapsed_ms", time.Since(startStart).Milliseconds(), "total_ms", time.Since(creatorStart).Milliseconds())
 		return pt, nil
 	})
 }
@@ -2393,25 +2644,43 @@ func registerOnDemandImplementationAgentCreators(deps onDemandAgentCreatorDeps) 
 func registerEngineerAgentCreator(deps onDemandAgentCreatorDeps) {
 	engineerID, _ := deps.ids.Get("engineer")
 	deps.reg.Register("engineer", func(ctx context.Context) (container.ContainerAgent, error) {
+		creatorStart := time.Now()
 		agentID := taskScopedCreationAgentID(ctx, "engineer", engineerID)
 		model := deps.configuredModel("engineer", "gpt-5.4-pro")
+		slog.Info("pipeline_creator_enter", "agent_type", "engineer", "agent_id", agentID, "model", model)
+		providerStart := time.Now()
 		wrapped, err := deps.swapProvider(ctx, model, gateway.PriorityExecution)
 		if err != nil {
+			slog.Error("pipeline_creator_provider_failed", "agent_type", "engineer", "agent_id", agentID, "elapsed_ms", time.Since(providerStart).Milliseconds(), "error", err.Error())
 			return nil, fmt.Errorf("engineer provider: %w", err)
 		}
+		slog.Info("pipeline_creator_provider_ok", "agent_type", "engineer", "agent_id", agentID, "elapsed_ms", time.Since(providerStart).Milliseconds())
 		engCfg := engineer.Config{ID: agentID, ActivityPub: deps.actPub, Forest: deps.forest, Factory: deps.factory()}
 		engCfg.EngineerConfig.Model = model
 		if guard := deps.requestGuard("engineer"); guard != nil {
 			engCfg.RequestGuard = guard
 		}
+		newStart := time.Now()
 		e, err := engineer.New(engCfg, wrapped)
 		if err != nil {
+			slog.Error("pipeline_creator_new_failed", "agent_type", "engineer", "agent_id", agentID, "elapsed_ms", time.Since(newStart).Milliseconds(), "error", err.Error())
 			return nil, err
 		}
+		slog.Info("pipeline_creator_new_ok", "agent_type", "engineer", "agent_id", agentID, "elapsed_ms", time.Since(newStart).Milliseconds())
 		e.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution))
+		if board := claims.DefaultSessionBoardRegistry().Lookup(deps.defaultSessionID()); board != nil {
+			e.SetClaimsBoard(board)
+			slog.Info("pipeline_creator_board_attached", "agent_type", "engineer", "agent_id", agentID, "session_id", deps.defaultSessionID(), "board_id", board.BoardID())
+		} else {
+			slog.Warn("pipeline_creator_board_missing", "agent_type", "engineer", "agent_id", agentID, "session_id", deps.defaultSessionID(), "reason", "session board lookup returned nil; inbox will resolve deltas with empty Node")
+		}
+		e.SetScope(deps.scope)
+		startStart := time.Now()
 		if startErr := e.Start(deps.bus); startErr != nil {
+			slog.Error("pipeline_creator_start_failed", "agent_type", "engineer", "agent_id", agentID, "elapsed_ms", time.Since(startStart).Milliseconds(), "error", startErr.Error())
 			return nil, startErr
 		}
+		slog.Info("pipeline_creator_start_ok", "agent_type", "engineer", "agent_id", agentID, "elapsed_ms", time.Since(startStart).Milliseconds(), "total_ms", time.Since(creatorStart).Milliseconds())
 		return e, nil
 	})
 }
@@ -2419,24 +2688,42 @@ func registerEngineerAgentCreator(deps onDemandAgentCreatorDeps) {
 func registerDesignerAgentCreator(deps onDemandAgentCreatorDeps) {
 	designerID, _ := deps.ids.Get("designer")
 	deps.reg.Register("designer", func(ctx context.Context) (container.ContainerAgent, error) {
+		creatorStart := time.Now()
 		agentID := taskScopedCreationAgentID(ctx, "designer", designerID)
 		model := deps.configuredModel("designer", string(providers.Gemini31Pro))
+		slog.Info("pipeline_creator_enter", "agent_type", "designer", "agent_id", agentID, "model", model)
+		providerStart := time.Now()
 		wrapped, err := deps.swapProvider(ctx, model, gateway.PriorityExecution)
 		if err != nil {
+			slog.Error("pipeline_creator_provider_failed", "agent_type", "designer", "agent_id", agentID, "elapsed_ms", time.Since(providerStart).Milliseconds(), "error", err.Error())
 			return nil, fmt.Errorf("designer provider: %w", err)
 		}
+		slog.Info("pipeline_creator_provider_ok", "agent_type", "designer", "agent_id", agentID, "elapsed_ms", time.Since(providerStart).Milliseconds())
 		desCfg := designer.Config{ID: agentID, ActivityPub: deps.actPub, Forest: deps.forest, Factory: deps.factory()}
 		if guard := deps.requestGuard("designer"); guard != nil {
 			desCfg.RequestGuard = guard
 		}
+		newStart := time.Now()
 		d, err := designer.New(desCfg, wrapped)
 		if err != nil {
+			slog.Error("pipeline_creator_new_failed", "agent_type", "designer", "agent_id", agentID, "elapsed_ms", time.Since(newStart).Milliseconds(), "error", err.Error())
 			return nil, err
 		}
+		slog.Info("pipeline_creator_new_ok", "agent_type", "designer", "agent_id", agentID, "elapsed_ms", time.Since(newStart).Milliseconds())
 		d.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution))
+		if board := claims.DefaultSessionBoardRegistry().Lookup(deps.defaultSessionID()); board != nil {
+			d.SetClaimsBoard(board)
+			slog.Info("pipeline_creator_board_attached", "agent_type", "designer", "agent_id", agentID, "session_id", deps.defaultSessionID(), "board_id", board.BoardID())
+		} else {
+			slog.Warn("pipeline_creator_board_missing", "agent_type", "designer", "agent_id", agentID, "session_id", deps.defaultSessionID(), "reason", "session board lookup returned nil; inbox will resolve deltas with empty Node")
+		}
+		d.SetScope(deps.scope)
+		startStart := time.Now()
 		if startErr := d.Start(deps.bus); startErr != nil {
+			slog.Error("pipeline_creator_start_failed", "agent_type", "designer", "agent_id", agentID, "elapsed_ms", time.Since(startStart).Milliseconds(), "error", startErr.Error())
 			return nil, startErr
 		}
+		slog.Info("pipeline_creator_start_ok", "agent_type", "designer", "agent_id", agentID, "elapsed_ms", time.Since(startStart).Milliseconds(), "total_ms", time.Since(creatorStart).Milliseconds())
 		return d, nil
 	})
 }
@@ -2650,7 +2937,7 @@ func quotaFromSpecs(specReg *container.AgentSpecRegistry) container.ResourceQuot
 // When hydrated is non-nil, it reuses pre-resolved auth (skipping duplicate
 // OAuth + Code Assist setup). If provider auth is unavailable, it falls back
 // to a local rule-based classifier so the UI can launch without authorization.
-func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.ActivityPublisher, hydrated *providers.HydratedGoogleAuth, googleGw *gateway.ProviderGateway, authRegistry *credentials.AuthRegistry, projectRoot string, forest agentShared.MemoryForestService, sessionVFSLookup func(string) *versioning.SessionVFS, factory *identity.Factory) (*guide.Guide, error) {
+func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.ActivityPublisher, hydrated *providers.HydratedGoogleAuth, googleGw *gateway.ProviderGateway, authRegistry *credentials.AuthRegistry, projectRoot string, forest agentShared.MemoryForestService, scope *concurrency.GoroutineScope, sessionVFSLookup func(string) *versioning.SessionVFS, factory *identity.Factory) (*guide.Guide, error) {
 	if factory == nil {
 		return nil, fmt.Errorf("guide bootstrap: nil identity factory")
 	}
@@ -2682,11 +2969,12 @@ func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.A
 		provider, err = providers.NewGoogleProvider(ctx, googleCfg, promptSkills...)
 	}
 	if err == nil && provider != nil {
-		wrapped := googleGw.WrapProvider(provider, gateway.PriorityUserInteractive)
+		wrapped := googleGw.WrapProvider(providers.Instrument(provider), gateway.PriorityUserInteractive)
 		g, newErr := guide.NewWithProvider(wrapped, googleCfg.Model, cfg)
 		if newErr != nil {
 			return nil, newErr
 		}
+		g.SetScope(scope)
 		if startErr := g.Start(ctx); startErr != nil {
 			return nil, startErr
 		}
@@ -2697,13 +2985,14 @@ func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.A
 	if newErr != nil {
 		return nil, newErr
 	}
+	g.SetScope(scope)
 	if startErr := g.Start(ctx); startErr != nil {
 		return nil, startErr
 	}
 	return g, nil
 }
 
-func bootstrapArchitect(ctx context.Context, canonicalID string, sessionID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, anthropicGw *gateway.ProviderGateway, authRegistry *credentials.AuthRegistry, actCtrlRef *atomic.Pointer[activation.ActivationController], planStore *architect.PlanStore, forest agentShared.MemoryForestService, sessionVFSLookup func(string) *versioning.SessionVFS, factoryRef *atomic.Pointer[identity.Factory]) (*architect.Architect, error) {
+func bootstrapArchitect(ctx context.Context, canonicalID string, sessionID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, anthropicGw *gateway.ProviderGateway, authRegistry *credentials.AuthRegistry, actCtrlRef *atomic.Pointer[activation.ActivationController], planStore *architect.PlanStore, forest agentShared.MemoryForestService, sessionVFSLookup func(string) *versioning.SessionVFS, factoryRef *atomic.Pointer[identity.Factory], scope *concurrency.GoroutineScope) (*architect.Architect, error) {
 	bootstrapStart := time.Now()
 	deadline, hasDL := ctx.Deadline()
 	guide.DebugFileLog().Info("DEBUG: bootstrap_architect_start", "has_deadline", hasDL, "deadline", deadline)
@@ -2737,7 +3026,7 @@ func bootstrapArchitect(ctx context.Context, canonicalID string, sessionID strin
 		Forest:            forest,
 		Factory:           factory,
 		PlannerProviderWrapper: func(p *providers.AnthropicProvider) architect.PlannerStreamProvider {
-			return anthropicGw.WrapProvider(p, gateway.PriorityPlanning)
+			return anthropicGw.WrapProvider(providers.Instrument(p), gateway.PriorityPlanning)
 		},
 	}
 	if ac := actCtrlRef.Load(); ac != nil {
@@ -2752,6 +3041,7 @@ func bootstrapArchitect(ctx context.Context, canonicalID string, sessionID strin
 	if err != nil {
 		return nil, err
 	}
+	a.SetScope(scope)
 	startStart := time.Now()
 	guide.DebugFileLog().Info("DEBUG: bootstrap_architect_bus_start")
 	if err := a.Start(bus); err != nil {
@@ -2780,6 +3070,7 @@ func bootstrapGuardian(
 	forest agentShared.MemoryForestService,
 	sessionVFSLookup func(string) *versioning.SessionVFS,
 	factory *identity.Factory,
+	scope *concurrency.GoroutineScope,
 ) (*guardian.Guardian, error) {
 	if factory == nil {
 		return nil, fmt.Errorf("guardian bootstrap: nil identity factory")
@@ -2837,6 +3128,7 @@ func bootstrapGuardian(
 	if quarantineRef != nil {
 		quarantineRef.Store(q)
 	}
+	g.SetScope(scope)
 
 	if err := g.Start(bus); err != nil {
 		return nil, err
@@ -3362,7 +3654,7 @@ func createRefreshProvider(
 		if err != nil {
 			return nil, err
 		}
-		return anthropicGw.WrapProvider(raw, priority), nil
+		return anthropicGw.WrapProvider(providers.Instrument(raw), priority), nil
 	case container.ProviderGoogle:
 		cfg := providers.DefaultGoogleConfig()
 		cfg.Model = modelID
@@ -3376,7 +3668,7 @@ func createRefreshProvider(
 		if err != nil {
 			return nil, err
 		}
-		return googleGw.WrapProvider(raw, priority), nil
+		return googleGw.WrapProvider(providers.Instrument(raw), priority), nil
 	case container.ProviderOpenAI:
 		am := authMethod
 		if am == "" {
@@ -3393,7 +3685,7 @@ func createRefreshProvider(
 		if err != nil {
 			return nil, err
 		}
-		return openaiGw.WrapProvider(raw, priority), nil
+		return openaiGw.WrapProvider(providers.Instrument(raw), priority), nil
 	default:
 		return nil, fmt.Errorf("unknown provider for model %q", modelID)
 	}
@@ -3420,7 +3712,7 @@ func createSwapProvider(
 		if err != nil {
 			return nil, err
 		}
-		return anthropicGw.WrapProvider(raw, priority), nil
+		return anthropicGw.WrapProvider(providers.Instrument(raw), priority), nil
 	case container.ProviderGoogle:
 		cfg := providers.DefaultGoogleConfig()
 		cfg.Model = modelID
@@ -3430,7 +3722,7 @@ func createSwapProvider(
 		if err != nil {
 			return nil, err
 		}
-		return googleGw.WrapProvider(raw, priority), nil
+		return googleGw.WrapProvider(providers.Instrument(raw), priority), nil
 	case container.ProviderOpenAI:
 		authMode := registryAuthMethod(authRegistry, "openai", "api_key")
 		modelID = providers.ResolveOpenAIModelForAuth(modelID, authMode)
@@ -3444,7 +3736,7 @@ func createSwapProvider(
 		if err != nil {
 			return nil, err
 		}
-		return openaiGw.WrapProvider(raw, priority), nil
+		return openaiGw.WrapProvider(providers.Instrument(raw), priority), nil
 	default:
 		return nil, fmt.Errorf("unknown provider for model %q", modelID)
 	}
@@ -3569,7 +3861,7 @@ func defaultOrchestratorGoogleConfig(authRegistry *credentials.AuthRegistry) pro
 	return cfg
 }
 
-func bootstrapOrchestrator(ctx context.Context, agentID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, hydrated *providers.HydratedGoogleAuth, authRegistry *credentials.AuthRegistry, googleGw *gateway.ProviderGateway, forest agentShared.MemoryForestService, factory *identity.Factory) (*orchestrator.Orchestrator, error) {
+func bootstrapOrchestrator(ctx context.Context, agentID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, hydrated *providers.HydratedGoogleAuth, authRegistry *credentials.AuthRegistry, googleGw *gateway.ProviderGateway, forest agentShared.MemoryForestService, factory *identity.Factory, scope *concurrency.GoroutineScope) (*orchestrator.Orchestrator, error) {
 	if factory == nil {
 		return nil, fmt.Errorf("orchestrator bootstrap: nil identity factory")
 	}
@@ -3602,7 +3894,7 @@ func bootstrapOrchestrator(ctx context.Context, agentID string, bus guide.EventB
 
 	var orchProvider orchestrator.OrchestratorProvider
 	if provider != nil {
-		orchProvider = googleGw.WrapProvider(provider, gateway.PriorityUserInteractive)
+		orchProvider = googleGw.WrapProvider(providers.Instrument(provider), gateway.PriorityUserInteractive)
 	}
 	orch, err := orchestrator.New(cfg, orchProvider, actPub, sd)
 	if err != nil {
@@ -3680,7 +3972,7 @@ func refreshOrchestratorProvider(ctx context.Context, orch *orchestrator.Orchest
 		slog.Warn("orchestrator provider refresh failed", "error", err)
 		return
 	}
-	orch.SetProvider(googleGw.WrapProvider(provider, gateway.PriorityUserInteractive))
+	orch.SetProvider(googleGw.WrapProvider(providers.Instrument(provider), gateway.PriorityUserInteractive))
 }
 
 // =============================================================================

@@ -27,7 +27,8 @@ func (b *coordinationActionTestBus) SubscribeAsync(string, guide.MessageHandler)
 	return nil, nil
 }
 
-func (b *coordinationActionTestBus) Close() error { return nil }
+func (b *coordinationActionTestBus) Close() error                         { return nil }
+func (b *coordinationActionTestBus) CloseWithContext(_ context.Context) error { return nil }
 
 func TestPublishCoordinationSuccess_PublishesToSourceAgentResponseTopic(t *testing.T) {
 	bus := &coordinationActionTestBus{}

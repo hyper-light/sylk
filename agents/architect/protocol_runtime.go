@@ -234,19 +234,21 @@ func (a *Architect) runDeterministicProtocol(
 	plan.Workflow = workflow
 
 	// 5b. Guardian preflight — batched, signed, before presentation.
-	// Replaces the orchestrator's post-approval N-sequential-RPC loop.
-	// Guardian remains the canonical gate; the architect just calls
-	// once per plan, folds findings into presentation, and ships the
-	// attestation with PlanHandoff.
+	// REQUIRED when Guardian is registered. Plans never ship without
+	// Guardian's gate — that's the canonical authority. The user
+	// approves a vetted plan (Guardian's verdict folded into the
+	// dialog), not a plan we hope Guardian will gate later.
 	//
-	// When the bus is unavailable (test/dev mode without a registered
-	// Guardian), skip preflight and proceed without attestation. The
-	// orchestrator's ingest path still gates dispatch — it falls back
-	// to its own RPC loop when no attestation is present, which
-	// surfaces an error if Guardian truly isn't reachable. So
-	// "architect skipped attestation" never silently un-gates: it
-	// just shifts the gate to dispatch time, where the orchestrator
-	// catches it.
+	// Guardian's fast-path direct-skill handling (review_gate runs
+	// concurrently, bypassing the request serializer) ensures this
+	// RPC doesn't queue behind long-running gates like
+	// plan_approval_gate. Preflight should return in milliseconds
+	// even when Guardian is otherwise busy.
+	//
+	// If Guardian is registered but the call still fails (timeout,
+	// transport error), we fail the plan rather than ship un-vetted.
+	// Better to surface the bus/Guardian problem to the user than
+	// silently bypass the gate.
 	if a.bus != nil && a.running && a.knownAgentIDByType("guardian", "") != "" {
 		completePreflight := a.architectStageClaim(ctx, plan.ID, "Guardian batched preflight", "Issue per-task verdicts in a single attestation that travels with the plan")
 		att, _, preflightErr := a.requestPlanPreflight(ctx, plan)
@@ -263,10 +265,6 @@ func (a *Architect) runDeterministicProtocol(
 				nil,
 			)
 		} else {
-			// Guardian was reachable but the call failed — fail the
-			// plan rather than ship un-vetted. This is the canonical
-			// fail-fast path when Guardian is registered but
-			// produces an error.
 			completePreflight("Guardian preflight unavailable", nil, preflightErr)
 			if preflightErr == nil {
 				preflightErr = fmt.Errorf("guardian preflight returned nil attestation")
@@ -281,6 +279,16 @@ func (a *Architect) runDeterministicProtocol(
 	}
 	plan.LeaseExpiry = time.Now().Add(ReadyPlanMaxAge)
 	a.planStore.Upsert(plan)
+
+	// Two-phase ingest: kick off orchestrator prep in the background
+	// so its work overlaps with the user's approval-dialog review.
+	// At this point the plan carries a Guardian attestation (we just
+	// required it above), so the orchestrator's prepareExecution
+	// will fast-path through verifyAndAdoptAttestation rather than
+	// invoking its legacy per-task RPC loop. Fire-and-forget — a
+	// publish failure degrades to single-phase ingest at approval
+	// time without blocking plan finalization.
+	a.publishPreparedHandoff(ctx, plan)
 
 	elapsed := time.Since(protocolStart)
 	diag.log("deterministic protocol complete elapsed=%v tasks=%d", elapsed, len(tasks))
@@ -453,7 +461,14 @@ func (r *planningProtocolRunner) run() error {
 	r.architect.applyProtocolRuntimeProfile(req, r.plan.SessionID)
 
 	ledger := shared.SteeringLedgerFromContext(loopCtx)
-	text, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+
+	// Synchronously-driven planning protocol turn — caller awaits the
+	// architect's response. Don't stamp WithContinuationStore: yielding
+	// would strand the caller while the resume runs in the background
+	// with no synchronous reply path. Consult_peer falls through to
+	// inline RouteSync (runLegacyConsultWait) so the loop completes
+	// before this function returns.
+	text, err := shared.ExecuteTurnLoop(loopCtx, ledger, req, func() (string, error) {
 		return r.architect.executeToolLoop(
 			loopCtx, req, "planning_protocol",
 			func(chunk string) { r.architect.publishPlanStreamChunk(r.ctx, chunk) },

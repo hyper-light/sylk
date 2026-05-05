@@ -37,9 +37,17 @@ const (
 
 // guardianPreflightTimeout bounds the wait on Guardian's response.
 // Guardian's classifier is deterministic and in-memory (no LLM, no
-// I/O), so even on a busy bus the round-trip should be sub-second.
-// Conservative ceiling so a hung Guardian can't strand the architect.
-const guardianPreflightTimeout = 30 * time.Second
+// I/O) and the review_gate skill runs on Guardian's fast-path
+// (concurrent with serialized requests, see runFastPathDirectSkill),
+// so even when Guardian is busy with other gates the round-trip
+// should be milliseconds.
+//
+// 10s is a generous ceiling that catches real failures (bus dead,
+// Guardian crashed) without false-positiving on transient slowness.
+// On expiry we fail the plan rather than ship un-vetted: Guardian
+// is the canonical gate authority and bypassing it silently is
+// worse than surfacing the problem to the user.
+const guardianPreflightTimeout = 10 * time.Second
 
 // computePlanPreflightInput builds the request payload Guardian sees,
 // using the same fields the orchestrator's per-task preflight loop
@@ -174,6 +182,16 @@ func (a *Architect) requestPlanPreflight(ctx context.Context, plan *DesignPlan) 
 		return nil, contentHash, fmt.Errorf("architect: guardian preflight hash mismatch (got %q, expected %q)", att.PlanContentHash, contentHash)
 	}
 	return att, contentHash, nil
+}
+
+// preflightErrString returns "" for nil errors so log lines don't
+// carry literal "<nil>" markers when Guardian merely returned a nil
+// attestation without a transport error.
+func preflightErrString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // decodePlanPreflightAttestation extracts the typed attestation from

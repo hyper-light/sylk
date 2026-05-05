@@ -129,6 +129,12 @@ type Workspace struct {
 	nextInode    uint64
 	nextHandle   uint64
 	nextJournal  uint64
+
+	// branchGens tracks per-branch monotonic generations used by
+	// WriteSession to fence handoffs. Allocated lazily on first
+	// BeginWriteSession to keep workspaces that never use the seal
+	// API zero-cost.
+	branchGens *branchGenerations
 }
 
 func NewWorkspace(store *ChunkStore, reader RealFileReader) *Workspace {

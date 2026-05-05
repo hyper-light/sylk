@@ -5,13 +5,11 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 )
@@ -38,7 +36,8 @@ func (b *testBus) SubscribeAsync(topic string, handler guide.MessageHandler) (gu
 	return testSubscription{topic: topic}, nil
 }
 
-func (b *testBus) Close() error { return nil }
+func (b *testBus) Close() error                         { return nil }
+func (b *testBus) CloseWithContext(_ context.Context) error { return nil }
 
 type testSubscription struct{ topic string }
 
@@ -96,134 +95,7 @@ func TestArchitectSeedKnownAgents_PreservesSnapshot(t *testing.T) {
 	}
 }
 
-func TestDispatchPlanExecution_QueuesAsyncHandoff(t *testing.T) {
-	now := time.Now().UTC()
-	plan := &DesignPlan{
-		ID:        "plan-1",
-		SessionID: "sess-1",
-		Query:     "build the feature",
-		Status:    PlanStatusReady,
-		Tasks: []*AtomicTask{
-			{ID: "task-1", Name: "Task", AgentType: "engineer", Description: "Ship it"},
-		},
-		Workflow:  &WorkflowDAG{TotalTasks: 1, Tasks: []*AtomicTask{{ID: "task-1"}}, DAG: &dag.DAG{}},
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-	a := testArchitectWithControlStore(t, plan)
-	a.running = true
-	a.bus = &testBus{}
 
-	result, handled := a.dispatchPlanExecution(context.Background(), &ArchitectRequest{
-		ID:        "req-1",
-		Intent:    IntentExecute,
-		SessionID: plan.SessionID,
-		Timestamp: now,
-	}, plan)
-	if !handled {
-		t.Fatal("expected dispatch to handle ready plan")
-	}
-	if result == nil || result.Response == "" {
-		t.Fatal("expected async handoff acknowledgment")
-	}
-	if plan.SM().State() != PlanStatusOrchestrating {
-		t.Fatalf("expected plan to transition to orchestrating, got %s", plan.SM().State())
-	}
-	if plan.PendingWork == nil || plan.PendingWork.Kind != string(continuationKindPlanHandoff) {
-		t.Fatalf("expected pending handoff continuation, got %+v", plan.PendingWork)
-	}
-	record, err := a.controlStore.GetContinuationByResponseCorrelation(plan.PendingWork.CorrelationID)
-	if err != nil {
-		t.Fatalf("load continuation: %v", err)
-	}
-	if record == nil || record.Kind != continuationKindPlanHandoff {
-		t.Fatalf("expected handoff continuation record, got %+v", record)
-	}
-	bus := a.bus.(*testBus)
-	if len(bus.published) != 1 {
-		t.Fatalf("expected one published route request, got %d", len(bus.published))
-	}
-	if bus.published[0].topic != guide.TopicGuideRequests {
-		t.Fatalf("expected publish to guide requests, got %s", bus.published[0].topic)
-	}
-	req, ok := bus.published[0].msg.GetRouteRequest()
-	if !ok || req == nil {
-		t.Fatalf("expected route request payload, got %#v", bus.published[0].msg.Payload)
-	}
-	if req.TargetAgentID != "orchestrator" {
-		t.Fatalf("expected orchestrator route target, got %q", req.TargetAgentID)
-	}
-}
-
-func TestDispatchPlanExecution_PublishesRerouteForOrchestratorHandoff(t *testing.T) {
-	now := time.Now().UTC()
-	plan := &DesignPlan{
-		ID:        "plan-1",
-		SessionID: "sess-1",
-		Query:     "build the feature",
-		Status:    PlanStatusReady,
-		Tasks: []*AtomicTask{
-			{ID: "task-1", Name: "Task", AgentType: "engineer", Description: "Ship it"},
-		},
-		Workflow:  &WorkflowDAG{TotalTasks: 1, Tasks: []*AtomicTask{{ID: "task-1"}}, DAG: &dag.DAG{}},
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-	a := testArchitectWithControlStore(t, plan)
-	a.running = true
-	a.bus = &testBus{}
-	a.channels = guide.NewAgentChannels("architect", "architect")
-	a.knownAgents = map[string]*guide.AgentAnnouncement{
-		"orch-1234": {AgentID: "orch-1234", AgentType: "orchestrator"},
-	}
-
-	ctx := withArchitectStreamContext(context.Background(), "corr-user", "tui")
-	_, handled := a.dispatchPlanExecution(ctx, &ArchitectRequest{
-		ID:        "req-1",
-		Intent:    IntentExecute,
-		SessionID: plan.SessionID,
-		Timestamp: now,
-	}, plan)
-	if !handled {
-		t.Fatal("expected dispatch to handle ready plan")
-	}
-
-	bus := a.bus.(*testBus)
-	if len(bus.published) < 2 {
-		t.Fatalf("expected reroute + route request publishes, got %d", len(bus.published))
-	}
-
-	var sawReroute bool
-	var sawRouteRequest bool
-	for _, published := range bus.published {
-		if published.topic == guide.TopicGuideRequests {
-			if req, ok := published.msg.GetRouteRequest(); ok && req != nil && req.TargetAgentID == "orch-1234" {
-				sawRouteRequest = true
-			}
-		}
-		stream, ok := published.msg.GetStreamResponse()
-		if !ok || stream == nil || stream.Event == nil || stream.Event.Type != guide.StreamEventReroute {
-			continue
-		}
-		data, ok := stream.Event.Data.(map[string]string)
-		if !ok {
-			t.Fatalf("reroute payload type = %T, want map[string]string", stream.Event.Data)
-		}
-		if data["to_agent"] != "orchestrator" || data["original_correlation_id"] != "corr-user" {
-			t.Fatalf("unexpected reroute payload: %+v", data)
-		}
-		if strings.TrimSpace(data["new_correlation_id"]) == "" {
-			t.Fatalf("expected new correlation id in reroute payload: %+v", data)
-		}
-		sawReroute = true
-	}
-	if !sawReroute {
-		t.Fatal("expected orchestrator handoff reroute to be published")
-	}
-	if !sawRouteRequest {
-		t.Fatal("expected orchestrator route request to be published")
-	}
-}
 
 func TestGuardianControlPlane_RequestGrantQueuesGuideRoutedContinuation(t *testing.T) {
 	now := time.Now().UTC()

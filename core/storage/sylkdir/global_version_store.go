@@ -3,6 +3,7 @@ package sylkdir
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -460,23 +461,49 @@ func NewGlobalVersionDocStore(sd *SylkDir, head SemanticVersion) (*GlobalVersion
 	return s, nil
 }
 
-// Close persists offset indexes, saves the DocIDMap, and closes the shared data file.
+// Close persists offset indexes, saves the DocIDMap, and closes the
+// shared data file. SaveIndexes and docIDMap.Save each do their own
+// fsync — independently of each other and of the data file's close —
+// so all three run in parallel goroutines. Sequential close had to
+// fit the sum of their fsync latencies into the caller's shutdown
+// budget; parallel close fits within max(fsync), which is bounded by
+// the slowest individual disk flush instead of their cumulative cost.
 func (s *GlobalVersionDocStore) Close() error {
-	if err := s.SaveIndexes(); err != nil {
-		return fmt.Errorf("save global doc indexes on close: %w", err)
-	}
-	if s.docIDMap != nil {
-		if err := s.docIDMap.Save(); err != nil {
-			if s.dataFile != nil {
-				s.dataFile.Close()
-			}
-			return fmt.Errorf("save global doc id map: %w", err)
+	var (
+		wg          sync.WaitGroup
+		idxErr      error
+		idMapErr    error
+		dataFileErr error
+	)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := s.SaveIndexes(); err != nil {
+			idxErr = fmt.Errorf("save global doc indexes on close: %w", err)
 		}
+	}()
+
+	if s.docIDMap != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.docIDMap.Save(); err != nil {
+				idMapErr = fmt.Errorf("save global doc id map: %w", err)
+			}
+		}()
 	}
-	if s.dataFile == nil {
-		return nil
+
+	if s.dataFile != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dataFileErr = s.dataFile.Close()
+		}()
 	}
-	return s.dataFile.Close()
+
+	wg.Wait()
+	return errors.Join(idxErr, idMapErr, dataFileErr)
 }
 
 // DocIDMap returns the underlying DocIDMap for external callers (e.g., commit).
@@ -593,21 +620,34 @@ func (s *GlobalVersionDocStore) ReadAllFromVersion(version SemanticVersion) ([]*
 	return docs, readErr
 }
 
-// SaveIndexes saves all in-memory offset indexes to disk.
+// SaveIndexes saves all in-memory offset indexes to disk in parallel.
+// Each index has its own file and its own fsync; serializing them
+// stacks the fsync latencies, while parallel save bounds wall time
+// by max(per-index fsync). Errors are joined.
 func (s *GlobalVersionDocStore) SaveIndexes() error {
-	var saveErr error
+	var (
+		wg     sync.WaitGroup
+		errMu  sync.Mutex
+		errs   []error
+	)
 	s.indexes.Range(func(_, val any) bool {
 		idx, ok := val.(*OffsetIndex)
 		if !ok {
 			return true
 		}
-		if err := idx.Save(); err != nil {
-			saveErr = err
-			return false
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := idx.Save(); err != nil {
+				errMu.Lock()
+				errs = append(errs, err)
+				errMu.Unlock()
+			}
+		}()
 		return true
 	})
-	return saveErr
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // docIndexPath returns the path to the doc offset index for a version.

@@ -1,6 +1,7 @@
 package claims
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 )
@@ -25,11 +26,61 @@ func DefaultSessionBoardRegistry() *SessionBoardRegistry {
 	return defaultRegistry
 }
 
-// Register adds a session board to the registry.
-func (r *SessionBoardRegistry) Register(sessionID string, board *ClaimsBoard) {
+// ErrSessionBoardAlreadyRegistered is returned by Register when a
+// board is already present for the given session ID. Callers that
+// legitimately replace a board (e.g. replaying after a session
+// restart) must use ReplaceForReason with an explicit reason
+// string — silent overwrites previously masked a bug where the
+// Guide's lazy board-create path overwrote the session manager's
+// properly-wired board, dropping every InboxDelta on the floor.
+var ErrSessionBoardAlreadyRegistered = fmt.Errorf("claims: session board already registered for this session")
+
+// Register adds a session board to the registry. Returns
+// ErrSessionBoardAlreadyRegistered if a board already exists for the
+// given session ID — Register is strictly first-write-wins, and any
+// caller that wants to replace must go through ReplaceForReason. This
+// guard prevents the silent-overwrite class of bug where two
+// independent code paths construct boards with the same ID and the
+// later one shadows the earlier one's wiring.
+//
+// Empty session ID or nil board is a programming error and panics —
+// these inputs cannot produce a usable registration and silently
+// dropping them would mask the caller's mistake.
+func (r *SessionBoardRegistry) Register(sessionID string, board *ClaimsBoard) error {
 	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" || board == nil {
-		return
+	if sessionID == "" {
+		panic("claims.SessionBoardRegistry.Register: empty session ID")
+	}
+	if board == nil {
+		panic("claims.SessionBoardRegistry.Register: nil board")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.boards[sessionID]; exists {
+		return ErrSessionBoardAlreadyRegistered
+	}
+	r.boards[sessionID] = board
+	return nil
+}
+
+// ReplaceForReason atomically replaces an existing registration. The
+// reason argument is required and surfaced to telemetry — it documents
+// why a replacement is legitimate (e.g. session restart, manual
+// intervention) so silent overwrites stay impossible by construction.
+//
+// Empty session ID, nil board, or empty reason are all programming
+// errors and panic.
+func (r *SessionBoardRegistry) ReplaceForReason(sessionID string, board *ClaimsBoard, reason string) {
+	sessionID = strings.TrimSpace(sessionID)
+	reason = strings.TrimSpace(reason)
+	if sessionID == "" {
+		panic("claims.SessionBoardRegistry.ReplaceForReason: empty session ID")
+	}
+	if board == nil {
+		panic("claims.SessionBoardRegistry.ReplaceForReason: nil board")
+	}
+	if reason == "" {
+		panic("claims.SessionBoardRegistry.ReplaceForReason: empty reason")
 	}
 	r.mu.Lock()
 	r.boards[sessionID] = board

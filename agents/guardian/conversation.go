@@ -98,10 +98,16 @@ func (g *Guardian) composeUserFacingResponse(ctx context.Context, req *guardianC
 	g.applyConversationRuntimeProfile(llmReq, req.Intent, req.SessionID)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
+	// User-facing turn — caller is synchronously waiting for guardian's
+	// response. Don't stamp WithContinuationStore: yielding would
+	// return an empty response while the resume runs in the background
+	// with no synchronous reply path. Consult_peer falls back to the
+	// inline RouteSync wait so the loop runs to completion.
+	loopCtx := ctx
 	var usage *guide.StreamUsage
-	response, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		content, u, loopErr := g.executeToolLoop(ctx, llmReq, "conversation", func(chunk string) {
-			g.publishStreamChunk(ctx, shared.LogMetaFromContext(ctx).CorrID, chunk)
+	response, err := shared.ExecuteTurnLoop(loopCtx, ledger, llmReq, func() (string, error) {
+		content, u, loopErr := g.executeToolLoop(loopCtx, llmReq, "conversation", func(chunk string) {
+			g.publishStreamChunk(loopCtx, shared.LogMetaFromContext(loopCtx).CorrID, chunk)
 		}, ledger)
 		usage = u
 		return content, loopErr

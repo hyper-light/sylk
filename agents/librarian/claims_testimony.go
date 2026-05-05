@@ -20,24 +20,33 @@ func (l *Librarian) librarianBoard() *claims.ClaimsBoard {
 }
 
 // librarianPostClaim posts a claim async via scope. Best-effort.
+// Registers a just-in-time response Expectation on the librarian's
+// inbox after a successful PostAction (CLAIMS.md §5).
 func (l *Librarian) librarianPostClaim(ctx context.Context, action claims.Action, claim claims.Claim) {
 	board := l.librarianBoard()
 	if board == nil {
 		return
 	}
+	posted := []claims.Claim{claim}
 	if l.scope != nil {
 		if err := l.scope.Go("librarian_post_claim", 5*time.Second, func(gctx context.Context) error {
-			return board.PostAction(gctx, action, []claims.Claim{claim})
+			if err := board.PostAction(gctx, action, posted); err != nil {
+				return err
+			}
+			claims.RegisterPostActionExpectations(l.claimsInbox, action, posted)
+			return nil
 		}); err != nil {
 			slog.Error("librarian_post_claim_dispatch_failed", "error", err.Error())
 			board.RecordNotificationError("librarian post claim dispatch: " + err.Error())
 		}
 		return
 	}
-	if err := board.PostAction(ctx, action, []claims.Claim{claim}); err != nil {
+	if err := board.PostAction(ctx, action, posted); err != nil {
 		slog.Error("librarian_post_claim_failed", "error", err.Error())
 		board.RecordNotificationError("librarian post claim: " + err.Error())
+		return
 	}
+	claims.RegisterPostActionExpectations(l.claimsInbox, action, posted)
 }
 
 // librarianSubmitTestament submits a testament async via scope. Best-effort.
@@ -164,10 +173,16 @@ func (l *Librarian) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 		return fmt.Errorf("librarian: LLM provider not configured")
 	}
 
-	acc := claims.NewTestamentAccumulator("librarian", l.config.SessionID)
+	acc := shared.NewClaimsEntryAccumulator("librarian", l.config.SessionID, entry)
+	acc.WithBoard(l.librarianBoard())
 	defer acc.Flush(ctx, l.librarianBoard(), l.librarianScope())
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
+
+	if entry.Node.Claim != nil {
+		shared.RecordAgentState(ctx, l.librarianBoard(), entry.Node.Claim.ID,
+			"Acknowledging request", shared.AgentStateReasoning, nil)
+	}
 
 	userMessage := shared.ComposeClaimsEntryPrompt(entry)
 	board := l.librarianBoard()
@@ -187,7 +202,7 @@ func (l *Librarian) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 	ledger := l.steering.Create(entry.Delta.DeltaKey(), l.id, l.config.SessionID, nil, nil)
 	defer l.steering.Close(entry.Delta.DeltaKey(), ctx.Err() != nil)
 
-	result, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return l.executeToolLoop(ctx, req, ledger)
 	})
 	if err != nil {

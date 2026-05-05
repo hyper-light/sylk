@@ -33,9 +33,10 @@ type ResourceQuota struct {
 	containerSoftCapacity    atomic.Int64
 	containerBurstCapacity   atomic.Int64
 	containerHardCapacity    atomic.Int64
-	containerReleaseHalfLife time.Duration
-	containerReleaseCredit   float64
-	containerLastEvent       time.Time
+	containerReleaseHalfLife    time.Duration
+	containerReleaseCredit      float64
+	containerLastEvent          time.Time
+	lastContainerRecomputeNanos atomic.Int64
 
 	contextLeaseMin        time.Duration
 	contextReleaseHalfLife time.Duration
@@ -168,8 +169,28 @@ func (q *ResourceQuota) checkVFS(request int64) error {
 	return nil
 }
 
+// checkContainerCount admits one new container against the elastic
+// container cap. The cap (containerHardCapacity) is a cached atomic
+// snapshot of the time-decayed capacity; under burst load most checks
+// hit the lock-free fast path and only the first check after each
+// contextAdmissionTick interval pays the lock to recompute.
+//
+// Note: container counters (containerCount, goroutineUsed, vfsQuotaUsed)
+// are already atomic. The remaining lock guards the credit-decay state
+// machine (containerReleaseCredit / containerLastEvent), not counters.
+// Sharding the counters would be a no-op; gating the recompute removes
+// the actual contention point on the admission path.
 func (q *ResourceQuota) checkContainerCount(spec *ContainerSpec) error {
 	if q.containerLimit <= 0 {
+		return nil
+	}
+
+	if !q.containerCapacityNeedsRecompute() {
+		hard := q.containerHardCapacity.Load()
+		current := q.containerCount.Load()
+		if current+1 > hard {
+			return fmt.Errorf("%w: container count %d >= %d", ErrQuotaExceeded, current, hard)
+		}
 		return nil
 	}
 
@@ -181,12 +202,29 @@ func (q *ResourceQuota) checkContainerCount(spec *ContainerSpec) error {
 	q.containerSoftCapacity.Store(soft)
 	q.containerBurstCapacity.Store(burst)
 	q.containerHardCapacity.Store(hard)
+	q.lastContainerRecomputeNanos.Store(now.UnixNano())
 
 	current := q.containerCount.Load()
 	if current+1 > hard {
 		return fmt.Errorf("%w: container count %d >= %d", ErrQuotaExceeded, current, hard)
 	}
 	return nil
+}
+
+// containerCapacityNeedsRecompute returns true if the cached
+// containerHardCapacity is stale enough to warrant taking the lock.
+// Recompute cadence is contextAdmissionTick (already plumbed for the
+// context-window admission path) — same tick keeps both subsystems
+// aligned without adding a new config knob.
+func (q *ResourceQuota) containerCapacityNeedsRecompute() bool {
+	if q.contextAdmissionTick <= 0 {
+		return true
+	}
+	last := q.lastContainerRecomputeNanos.Load()
+	if last == 0 {
+		return true
+	}
+	return time.Since(time.Unix(0, last)) >= q.contextAdmissionTick
 }
 
 // Reserve consumes quota for a container's resources. Call Release when
@@ -197,11 +235,13 @@ func (q *ResourceQuota) Reserve(spec *ContainerSpec) {
 	q.containerCount.Add(1)
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.adjustContainerReleaseCreditLocked(time.Now(), -1.0)
-	soft, burst, hard := q.containerCapacitiesLocked(time.Now(), spec)
+	now := time.Now()
+	q.adjustContainerReleaseCreditLocked(now, -1.0)
+	soft, burst, hard := q.containerCapacitiesLocked(now, spec)
 	q.containerSoftCapacity.Store(soft)
 	q.containerBurstCapacity.Store(burst)
 	q.containerHardCapacity.Store(hard)
+	q.lastContainerRecomputeNanos.Store(now.UnixNano())
 }
 
 // Release returns quota consumed by a container.
@@ -211,11 +251,13 @@ func (q *ResourceQuota) Release(spec *ContainerSpec) {
 	q.containerCount.Add(-1)
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.adjustContainerReleaseCreditLocked(time.Now(), 1.0)
-	soft, burst, hard := q.containerCapacitiesLocked(time.Now(), nil)
+	now := time.Now()
+	q.adjustContainerReleaseCreditLocked(now, 1.0)
+	soft, burst, hard := q.containerCapacitiesLocked(now, nil)
 	q.containerSoftCapacity.Store(soft)
 	q.containerBurstCapacity.Store(burst)
 	q.containerHardCapacity.Store(hard)
+	q.lastContainerRecomputeNanos.Store(now.UnixNano())
 }
 
 // Usage returns current quota usage.

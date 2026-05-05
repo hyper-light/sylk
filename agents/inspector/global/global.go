@@ -123,7 +123,8 @@ type GlobalInspector struct {
 	// Tracked goroutine scope for async claims dispatch.
 	scope *concurrency.GoroutineScope
 
-	claimsInbox *claims.ClaimsInbox
+	claimsInbox       *claims.ClaimsInbox
+	continuationStore *agentShared.ContinuationStore
 }
 
 // New creates a new GlobalInspector instance. The provider must implement
@@ -423,14 +424,31 @@ func (gi *GlobalInspector) Start(bus guide.EventBus) error {
 	// pipeline-inspector → OT → replica-spawn chain is direct
 	// method calls and durable WAL records.
 
+	// ContinuationStore for ticket-mode consult_peer + await_consults.
+	gi.continuationStore = agentShared.NewContinuationStore(agentShared.ContinuationStoreConfig{
+		AgentID:   gi.id,
+		SessionID: gi.config.SessionID,
+		Board:     gi.globalInspectorBoardOrNil(),
+		Scope:     gi.scope,
+		ResumeFn:  gi.resumeContinuation,
+	})
+	gi.continuationStore.RecoverPendingContinuations(context.Background())
+
 	// Claims intake: event-driven delta processing.
+	// Global inspector carries RoleAuditor so it sees every testament
+	// submitted in the session (CLAIMS.md §5.4 — inspector evaluates
+	// testaments).
 	if inbox := agentShared.WireClaimsIntake(agentShared.ClaimsIntakeConfig{
-		AgentID:      gi.id,
-		SessionID:    gi.config.SessionID,
-		Bus:          bus,
-		Board:        gi.globalInspectorBoardOrNil(),
-		Scope:        gi.scope,
-		ProcessEntry: gi.processClaimsEntry,
+		AgentID:           gi.id,
+		SessionID:         gi.config.SessionID,
+		Role:              claims.RoleSubject | claims.RoleAuditor,
+		Bus:               bus,
+		Board:             gi.globalInspectorBoardOrNil(),
+		Scope:             gi.scope,
+		ProcessEntry:      gi.processClaimsEntry,
+		Identity:          gi.identity,
+		Factory:           gi.factory,
+		ContinuationStore: gi.continuationStore,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("global_inspector_claims_inbox_start_failed", "error", err.Error())
@@ -452,6 +470,10 @@ func (gi *GlobalInspector) Stop() error {
 	if gi.claimsInbox != nil {
 		_ = gi.claimsInbox.Close()
 		gi.claimsInbox = nil
+	}
+	if gi.continuationStore != nil {
+		gi.continuationStore.Stop("global inspector stopped")
+		gi.continuationStore = nil
 	}
 
 	gi.steering.CloseAll()
@@ -566,7 +588,7 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 	gi.applyLLMRuntimeProfile(req, "task")
 
 	ledger := agentShared.SteeringLedgerFromContext(ctx)
-	result, err := agentShared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	result, err := agentShared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return gi.executeToolLoop(ctx, req, ledger)
 	})
 	if err != nil {
@@ -697,6 +719,15 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 		shared.PublishStreamStart(gi.bus, gi.channels, ctx, gi.id)
 	}
 	gi.publishChatActivity(fwd.SessionID, events.EventTypeAgentAction, "Processing audit request")
+
+	// Cycle-aware accumulator. UI_DESIGN.md §4.7.3.
+	var flushAccumulator func()
+	var beginErr error
+	ctx, flushAccumulator, beginErr = agentShared.BeginForwardedRequestCycle(ctx, gi.id, fwd, gi.scope)
+	if beginErr != nil {
+		return beginErr
+	}
+	defer flushAccumulator()
 
 	result, err := gi.Handle(ctx, fwd)
 	agentShared.LogResponse(gi.steering.EventLogger(), fwd.CorrelationID, gi.id, fwd.SessionID, time.Since(startTime), err)

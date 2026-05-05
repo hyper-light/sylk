@@ -269,13 +269,13 @@ func (cm *CheckpointManager) postCheckpointClaim(ctx context.Context, seq, dirty
 		"Periodic dirty file threshold evaluation",
 		"guardian",
 		[]claims.ClaimScopeEntry{{Kind: "git", Key: "checkpoint"}},
-		claims.ActionTypeArchival,
+		claims.ActionTypeCheckpoint,
 		[]*claims.Validation{
 			guardianPassedValidation(claims.ValidationTypeInspection, true, "Dirty file count exceeds safety threshold", fmt.Sprintf("getDirtyFileCount() = %d >= %d", dirtyCount, cm.dirtyThreshold)),
 			guardianValidation(claims.ValidationTypeInspection, true, "User approves checkpoint creation", "User clicks Approve in checkpoint dialog"),
 		},
 	)
-	if err := board.PostAction(ctx, guardianClaimAction(claims.ActionTypeArchival), []claims.Claim{claim}); err != nil {
+	if err := board.PostAction(ctx, guardianClaimAction(claims.ActionTypeCheckpoint), []claims.Claim{claim}); err != nil {
 		board.RecordNotificationError("checkpoint claim: " + err.Error())
 	}
 }

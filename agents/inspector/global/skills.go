@@ -88,6 +88,7 @@ func (gi *GlobalInspector) registerCoreSkills() {
 			BusProvider: func() guide.EventBus { return gi.bus },
 			SessionID:   func() string { return gi.config.SessionID },
 		},
+		Inbox: func() *claims.ClaimsInbox { return gi.claimsInbox },
 	}) {
 		gi.skills.Register(skill)
 	}
@@ -119,6 +120,7 @@ func (gi *GlobalInspector) registerCoreSkills() {
 				return gi.channels.Responses
 			},
 		),
+		Inbox: func() *claims.ClaimsInbox { return gi.claimsInbox },
 	}) {
 		gi.skills.Register(skill)
 	}

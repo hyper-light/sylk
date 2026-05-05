@@ -81,6 +81,22 @@ func openJournalInDir(dir string) (*agentlog.AgentJournal, error) {
 
 // --- Public Log Methods ---
 
+// LogDAGPrepared records a DAG that has been fully staged (verified
+// attestation, built, pods constructed, claims posted) but not yet
+// submitted to the scheduler. Two-phase ingest writes this when the
+// architect's plan-finalize handoff arrives; the corresponding
+// LogDAGStart fires when the user approves and Submit runs. On crash
+// recovery, a "prepared" entry without a matching "started" can be
+// replayed or discarded.
+func (j *OrchestratorJournal) LogDAGPrepared(dagID, dagJSON string) error {
+	_, err := j.journal.AppendJSON(agentlog.EventDAGStarted, &dagWALPayload{
+		DAGID:   dagID,
+		State:   "prepared",
+		Payload: dagJSON,
+	})
+	return err
+}
+
 // LogDAGStart records the start of a DAG execution.
 func (j *OrchestratorJournal) LogDAGStart(dagID, dagJSON string) error {
 	_, err := j.journal.AppendJSON(agentlog.EventDAGStarted, &dagWALPayload{

@@ -42,17 +42,19 @@ type GoroutineBudget struct {
 	onBlocked BudgetCallback
 }
 
-// agentBudgetState holds per-agent budget state.
+// agentBudgetState holds per-agent budget state. Acquire/Release go
+// through a per-agent counting semaphore (sem) with FIFO waiters; this
+// replaces the prior cond.Broadcast pattern that woke every blocked
+// caller on each context-cancel and competed with Release for the
+// shared lock.
 type agentBudgetState struct {
 	agentID   string
 	agentType string
 	active    atomic.Int64
 	peak      atomic.Int64
-	softLimit int64
-	hardLimit int64
-	waiters   atomic.Int32
-	cond      *sync.Cond
-	mu        sync.Mutex
+	softLimit atomic.Int64
+	hardLimit atomic.Int64
+	sem       *agentSemaphore
 }
 
 // GoroutineBudgetConfig contains configuration for the budget.
@@ -126,8 +128,8 @@ func (b *GoroutineBudget) RegisterAgent(agentID, agentType string) {
 	state := &agentBudgetState{
 		agentID:   agentID,
 		agentType: agentType,
+		sem:       newAgentSemaphore(0),
 	}
-	state.cond = sync.NewCond(&state.mu)
 	b.agents[agentID] = state
 	b.recalculateLimitsLocked()
 }
@@ -141,14 +143,10 @@ func (b *GoroutineBudget) UnregisterAgent(agentID string) {
 	b.recalculateLimitsLocked()
 }
 
-// Acquire requests a goroutine slot, blocking if at hard limit.
+// Acquire requests a goroutine slot, blocking until one is available.
+// Equivalent to AcquireWithContext(context.Background(), agentID).
 func (b *GoroutineBudget) Acquire(agentID string) error {
-	state := b.getAgentState(agentID)
-	if state == nil {
-		return ErrAgentNotRegistered
-	}
-
-	return b.acquireSlot(state)
+	return b.AcquireWithContext(context.Background(), agentID)
 }
 
 func (b *GoroutineBudget) getAgentState(agentID string) *agentBudgetState {
@@ -157,30 +155,47 @@ func (b *GoroutineBudget) getAgentState(agentID string) *agentBudgetState {
 	return b.agents[agentID]
 }
 
-func (b *GoroutineBudget) acquireSlot(state *agentBudgetState) error {
-	state.cond.L.Lock()
-	defer state.cond.L.Unlock()
+// AcquireWithContext blocks until a permit is available or ctx is
+// cancelled. The semaphore wakes exactly one waiter per Release —
+// no thundering herd.
+func (b *GoroutineBudget) AcquireWithContext(ctx context.Context, agentID string) error {
+	state := b.getAgentState(agentID)
+	if state == nil {
+		return ErrAgentNotRegistered
+	}
 
-	b.waitForCapacity(state)
-	b.incrementCounters(state)
-	b.checkSoftLimit(state)
+	if state.sem.TryAcquire() {
+		b.afterAcquire(state)
+		return nil
+	}
 
+	b.notifyBlocked(state)
+	if err := state.sem.Acquire(ctx); err != nil {
+		return err
+	}
+	b.afterAcquire(state)
 	return nil
 }
 
-func (b *GoroutineBudget) waitForCapacity(state *agentBudgetState) {
-	for state.active.Load() >= state.hardLimit {
-		b.notifyBlocked(state)
-		state.waiters.Add(1)
-		state.cond.Wait()
-		state.waiters.Add(-1)
+// TryAcquire takes a slot without blocking. Returns ErrBudgetExhausted
+// if the agent is at its hard limit.
+func (b *GoroutineBudget) TryAcquire(agentID string) error {
+	state := b.getAgentState(agentID)
+	if state == nil {
+		return ErrAgentNotRegistered
 	}
+	if !state.sem.TryAcquire() {
+		return ErrBudgetExhausted
+	}
+	b.afterAcquire(state)
+	return nil
 }
 
-func (b *GoroutineBudget) incrementCounters(state *agentBudgetState) {
+func (b *GoroutineBudget) afterAcquire(state *agentBudgetState) {
 	newActive := state.active.Add(1)
 	b.totalActive.Add(1)
 	b.updatePeak(state, newActive)
+	b.checkSoftLimit(state)
 }
 
 func (b *GoroutineBudget) updatePeak(state *agentBudgetState, newActive int64) {
@@ -194,103 +209,26 @@ func (b *GoroutineBudget) updatePeak(state *agentBudgetState, newActive int64) {
 
 func (b *GoroutineBudget) notifyBlocked(state *agentBudgetState) {
 	if b.onBlocked != nil {
-		b.onBlocked(state.agentID, int(state.active.Load()), int(state.hardLimit))
+		b.onBlocked(state.agentID, int(state.active.Load()), int(state.hardLimit.Load()))
 	}
 }
 
 func (b *GoroutineBudget) checkSoftLimit(state *agentBudgetState) {
-	if state.active.Load() > state.softLimit && b.onWarning != nil {
-		b.onWarning(state.agentID, int(state.active.Load()), int(state.softLimit))
+	if state.active.Load() > state.softLimit.Load() && b.onWarning != nil {
+		b.onWarning(state.agentID, int(state.active.Load()), int(state.softLimit.Load()))
 	}
 }
 
-// AcquireWithContext attempts to acquire with context cancellation support.
-func (b *GoroutineBudget) AcquireWithContext(ctx context.Context, agentID string) error {
-	state := b.getAgentState(agentID)
-	if state == nil {
-		return ErrAgentNotRegistered
-	}
-
-	return b.acquireWithCtx(ctx, state)
-}
-
-func (b *GoroutineBudget) acquireWithCtx(ctx context.Context, state *agentBudgetState) error {
-	if state.active.Load() < state.hardLimit {
-		return b.tryAcquireNonBlocking(state)
-	}
-	return b.acquireBlocking(ctx, state)
-}
-
-func (b *GoroutineBudget) tryAcquireNonBlocking(state *agentBudgetState) error {
-	state.cond.L.Lock()
-	defer state.cond.L.Unlock()
-
-	if state.active.Load() >= state.hardLimit {
-		return ErrBudgetExhausted
-	}
-
-	b.incrementCounters(state)
-	b.checkSoftLimit(state)
-	return nil
-}
-
-func (b *GoroutineBudget) acquireBlocking(ctx context.Context, state *agentBudgetState) error {
-	done := make(chan struct{})
-	defer close(done)
-
-	go b.watchContextCancel(ctx, state, done)
-
-	state.cond.L.Lock()
-	defer state.cond.L.Unlock()
-
-	for state.active.Load() >= state.hardLimit {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		b.notifyBlocked(state)
-		state.waiters.Add(1)
-		state.cond.Wait()
-		state.waiters.Add(-1)
-	}
-
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-
-	b.incrementCounters(state)
-	b.checkSoftLimit(state)
-	return nil
-}
-
-func (b *GoroutineBudget) watchContextCancel(ctx context.Context, state *agentBudgetState, done <-chan struct{}) {
-	select {
-	case <-ctx.Done():
-		state.cond.L.Lock()
-		state.cond.Broadcast()
-		state.cond.L.Unlock()
-	case <-done:
-	}
-}
-
-// Release returns a goroutine slot to the budget.
+// Release returns a goroutine slot to the budget. Wakes at most one
+// queued waiter (FIFO).
 func (b *GoroutineBudget) Release(agentID string) {
 	state := b.getAgentState(agentID)
 	if state == nil {
 		return
 	}
-
-	b.releaseSlot(state)
-}
-
-func (b *GoroutineBudget) releaseSlot(state *agentBudgetState) {
 	state.active.Add(-1)
 	b.totalActive.Add(-1)
-
-	if state.waiters.Load() > 0 {
-		state.cond.L.Lock()
-		state.cond.Signal()
-		state.cond.L.Unlock()
-	}
+	state.sem.Release()
 }
 
 // OnPressureChange updates limits based on memory pressure.
@@ -350,8 +288,11 @@ func (b *GoroutineBudget) updateAgentLimits(state *agentBudgetState, totalWeight
 	baseBudget := float64(b.systemLimit) * (weight / totalWeight)
 	effectiveBudget := baseBudget * pressureMultiplier
 
-	state.softLimit = max(int64(effectiveBudget), 10)
-	state.hardLimit = max(int64(effectiveBudget*b.burstMultiplier), 15)
+	soft := max(int64(effectiveBudget), 10)
+	hard := max(int64(effectiveBudget*b.burstMultiplier), 15)
+	state.softLimit.Store(soft)
+	state.hardLimit.Store(hard)
+	state.sem.SetLimit(hard)
 }
 
 // GetStats returns statistics for an agent.
@@ -361,7 +302,7 @@ func (b *GoroutineBudget) GetStats(agentID string) (active, peak, softLimit, har
 		return 0, 0, 0, 0, false
 	}
 
-	return state.active.Load(), state.peak.Load(), state.softLimit, state.hardLimit, true
+	return state.active.Load(), state.peak.Load(), state.softLimit.Load(), state.hardLimit.Load(), true
 }
 
 // TotalActive returns the total active goroutines across all agents.

@@ -61,6 +61,10 @@ func (m *mockEventBus) Close() error {
 	return nil
 }
 
+func (m *mockEventBus) CloseWithContext(_ context.Context) error {
+	return m.Close()
+}
+
 type mockSubscription struct {
 	topic  string
 	active atomic.Bool

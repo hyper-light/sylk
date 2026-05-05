@@ -497,6 +497,8 @@ func (l *Librarian) Start(bus guide.EventBus) error {
 		Board:        l.librarianBoard(),
 		Scope:        l.scope,
 		ProcessEntry: l.processClaimsEntry,
+		Identity:     l.identity,
+		Factory:      l.factory,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("librarian_claims_inbox_start_failed", "error", err.Error())
@@ -791,6 +793,22 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		return err
 	}
 	defer bundle.Close()
+
+	// Bind to the issuer's parent claim. For consult / challenge
+	// fulfillments the dispatcher (consult_peer / challenge_peer)
+	// stamps parent_claim_id on the envelope so this binds to the
+	// consultation/challenge claim, not the guide's route claim.
+	// Bridge can then nest this agent's artifact tree under the
+	// issuer's consult_started/challenge_started row. UI_DESIGN.md
+	// §4.7.3 — Layer 3 cycle-context propagation.
+	var flushAccumulator func()
+	var beginErr error
+	ctx, flushAccumulator, beginErr = shared.BeginForwardedRequestCycle(ctx, l.id, fwd, l.scope)
+	if beginErr != nil {
+		lease.Release()
+		return beginErr
+	}
+	defer flushAccumulator()
 
 	result, err := l.processForwardedRequest(ctx, fwd, bundle)
 	snapshot := lease.ReleaseWithObservation(shared.RequestReplicaObservation{

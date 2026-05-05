@@ -86,6 +86,10 @@ func (o *Orchestrator) dispatchPipelineTaskAsClaim(
 			Relationship: claims.RelationshipEvaluator,
 		})
 	}
+	// Cycle attribution (UI_DESIGN.md §4.5): nest this dispatched task
+	// claim under the orchestrator's currently-executing claim so the
+	// bridge's cycle resolver renders it as a child of that cycle.
+	relations = agentshared.AttachCausedByFromContext(ctx, relations)
 
 	claim := claims.Claim{
 		Title:       title,

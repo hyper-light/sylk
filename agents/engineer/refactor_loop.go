@@ -185,10 +185,15 @@ func (rl *RefactorLoop) reimplementWithFeedback(
 	}
 	rl.engineer.applyLLMRuntimeProfile(req, "implementation")
 
+	// Synchronously-driven refactor turn. Don't stamp
+	// WithContinuationStore: consult_peer falls through to inline
+	// RouteSync so the loop completes before this function returns.
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	return shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
-		return rl.engineer.executeToolLoop(ctx, req, ledger)
+	loopCtx := ctx
+	text, err := shared.ExecuteTurnLoop(loopCtx, ledger, req, func() (string, error) {
+		return rl.engineer.executeToolLoop(loopCtx, req, ledger)
 	})
+	return text, err
 }
 
 func parseTesterFeedback(evidence *shared.ConsultationEvidence) (*shared.TestFeedback, error) {

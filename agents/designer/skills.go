@@ -72,6 +72,7 @@ func (d *Designer) registerCoreSkills() {
 				return d.channels.Responses
 			},
 		),
+		Inbox: func() *claims.ClaimsInbox { return d.claimsInbox },
 	}) {
 		d.skills.Register(skill)
 	}

@@ -579,6 +579,12 @@ func (s *EdgeShardStore) Close() error {
 
 // shutdown closes every open bbolt handle. Called by Close() when
 // the last reference departs.
+//
+// Each shard's bolt.Close() does its own fsync; closing N shards in
+// series stacks the per-shard fsync latencies into the caller's
+// shutdown budget. Closes run in parallel — the shards have disjoint
+// file handles, so concurrent Close is safe and bounded by
+// max(per-shard fsync) rather than sum.
 func (s *EdgeShardStore) shutdown() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -587,10 +593,31 @@ func (s *EdgeShardStore) shutdown() error {
 	}
 	s.closed = true
 
-	var firstErr error
+	if len(s.shardDBs) == 0 {
+		s.shardDBs = make(map[uint32]*bolt.DB)
+		return nil
+	}
+
+	type shardCloseResult struct {
+		shardNum uint32
+		err      error
+	}
+	results := make(chan shardCloseResult, len(s.shardDBs))
+	var wg sync.WaitGroup
 	for shardNum, db := range s.shardDBs {
-		if err := db.Close(); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("sylkdir: close shard %d bolt: %w", shardNum, err)
+		wg.Add(1)
+		go func(num uint32, handle *bolt.DB) {
+			defer wg.Done()
+			results <- shardCloseResult{shardNum: num, err: handle.Close()}
+		}(shardNum, db)
+	}
+	wg.Wait()
+	close(results)
+
+	var firstErr error
+	for r := range results {
+		if r.err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("sylkdir: close shard %d bolt: %w", r.shardNum, r.err)
 		}
 	}
 	s.shardDBs = make(map[uint32]*bolt.DB)

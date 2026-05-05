@@ -157,9 +157,19 @@ func (o *Orchestrator) processBatch(ctx context.Context, batch []*busEvent) {
 	llmCtx = providers.WithRetryObserver(llmCtx, o.retryObserver())
 
 	ledger := shared.SteeringLedgerFromContext(llmCtx)
-	_, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
-		return o.executeToolLoop(llmCtx, req, ledger)
+	loopCtx := shared.WithContinuationStore(llmCtx, o.continuationStore)
+	loopCtx = shared.WithTurnContext(loopCtx, &shared.TurnContext{
+		Request:       req,
+		CorrelationID: orchestratorLedgerCorrelation(ledger, o.SessionID()),
+		AgentID:       o.config.AgentID,
+		SessionID:     o.SessionID(),
 	})
+	_, err := shared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
+		return o.executeToolLoop(loopCtx, req, ledger)
+	})
+	if shared.IsConsultYielded(err) {
+		return
+	}
 	if err != nil {
 		if batchMaxSeverity(batch) >= severityCritical {
 			o.publishActivity(events.EventTypeAgentError, "LLM analysis failed, using fallback")

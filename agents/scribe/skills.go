@@ -307,13 +307,16 @@ func parseScribeCommentary(input json.RawMessage) (map[string]any, error) {
 	return payload, nil
 }
 
+// archivalistStoreCommentaryAction mirrors the constant the archivalist
+// dispatches on in handleActionMessage (see
+// agents/archivalist/scribe_commentary.go). Kept local to the scribe so
+// the scribe package does not import the archivalist package; the wire
+// contract is the action name string.
+const archivalistStoreCommentaryAction = "store_scribe_commentary"
+
 func (s *Scribe) storeCommentaryInArchivalist(ctx context.Context, commentary string, feed shared.ScribeFeed) error {
 	if s.bus == nil {
 		return fmt.Errorf("scribe bus is not configured")
-	}
-	input, err := guide.ArchivalistStoreRouteInput(commentary)
-	if err != nil {
-		return fmt.Errorf("encode archivalist store route: %w", err)
 	}
 
 	parentCorrelationID := strings.TrimSpace(feed.ParentCorrelationID)
@@ -342,23 +345,46 @@ func (s *Scribe) storeCommentaryInArchivalist(ctx context.Context, commentary st
 		"entry_id":           archivalEntryID,
 	})
 
-	req := &guide.RouteRequest{
+	// ActionRequest, not RouteRequest: scribe storage is high-volume
+	// deterministic system work with a fixed target (archivalist) and
+	// no peer response to await. The RouteRequest path triggers guide
+	// LLM classification + a route claim that opens a handoff cycle in
+	// the activity panel, lighting up Guide + Archivalist as if the
+	// user had asked them to do work. ActionRequest is the existing
+	// direct agent-to-agent protocol (see academic.publishActionRequest
+	// at agents/academic/research_paper.go:839): the guide's
+	// forwardActionMessage pure-republishes to the archivalist's
+	// request topic, no classification, no route claim, no cycle. The
+	// archivalist's handleActionMessage dispatches by action name to
+	// handleStoreScribeCommentaryAction which calls StoreEntry — and
+	// StoreEntry already submits its own testament on success, so the
+	// canonical board record is preserved.
+	action := &guide.ActionRequest{
 		CorrelationID:       "scribe_" + uuid.NewString(),
 		ParentCorrelationID: parentCorrelationID,
 		SourceAgentID:       s.id,
-		Input:               input,
-		FireAndForget:       true,
-		Timestamp:           time.Now(),
-		Metadata:            metadata,
+		SourceAgentName:     "scribe",
+		TargetAgentID:       "archivalist",
+		Action:              archivalistStoreCommentaryAction,
+		Data: map[string]any{
+			"content":            commentary,
+			"session_id":         s.sessionID,
+			"entry_id":           archivalEntryID,
+			"parent_agent":       s.parentAgentType,
+			"scribe_id":          s.id,
+			"replica_generation": s.replicaGeneration,
+		},
+		FireAndForget: true,
+		Timestamp:     time.Now(),
 	}
-	msg := guide.NewRequestMessage(
+	msg := guide.NewActionMessage(
 		fmt.Sprintf("scribe_%s_msg_%s", s.parentAgentType, uuid.New().String()[:8]),
-		req,
+		action,
 	)
 	msg.Metadata = metadata
 	if err := s.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
 		branch.Complete(branchCtx, "", "", err)
-		return fmt.Errorf("publish archivalist store request: %w", err)
+		return fmt.Errorf("publish archivalist store action: %w", err)
 	}
 	branch.Complete(branchCtx, "stored scribe commentary", "", nil)
 

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 )
@@ -19,6 +20,13 @@ type ClaimsIntakeConfig struct {
 
 	// SessionID scopes the inbox to one session's board.
 	SessionID string
+
+	// Role is the agent's claims-board role bitmask. Drives both the
+	// bus subscription pattern set (claims.InboxPatternsFor) and the
+	// receive-side standing-subscription gate. Zero defaults to
+	// claims.RoleSubject so the agent at minimum receives directly-
+	// addressed inbox deltas.
+	Role claims.ClaimsRole
 
 	// Bus is the agent's event bus. Used to subscribe to claims
 	// delta topics via EventBusDeltaSubscriber.
@@ -36,6 +44,50 @@ type ClaimsIntakeConfig struct {
 	// Called under scope.Go for each matched delta. The agent
 	// implements this to run its tool loop or handle the entry.
 	ProcessEntry func(ctx context.Context, entry *claims.GraphEntryPoint) error
+
+	// Identity is the agent's AgentIdentity. Stamped onto the
+	// per-claim context before ProcessEntry runs, so downstream LLM
+	// dispatches satisfy gateway.RequireIdentity. Required for any
+	// agent whose ProcessEntry invokes the LLM provider — without
+	// it, the gateway rejects the dispatch with
+	// "no AgentIdentity on ctx" and the claim entry fails silently.
+	Identity *identity.AgentIdentity
+
+	// Factory mints a TaskRef per-claim that is stamped alongside
+	// Identity, so the gateway also has a task on the context. The
+	// task's correlation is the delta key, giving each claim entry
+	// its own stable correlation in the gateway's accounting.
+	// Optional but recommended; without it the gateway's
+	// RequireDispatch fails on the missing task.
+	Factory *identity.Factory
+
+	// ContinuationStore handles ConsultResolvedDelta deliveries for
+	// this agent. When set, deltas of kind consult_resolved are
+	// routed to store.DeliverResolution INSTEAD of ProcessEntry —
+	// resolutions feed pending continuations (waking yielded LLM
+	// turns) rather than firing fresh inference.
+	//
+	// When nil, ConsultResolvedDeltas fall through to ProcessEntry
+	// and would trigger LLM inference per resolution — almost
+	// certainly wrong; agents that use ticket-mode consult_peer
+	// MUST wire a store.
+	ContinuationStore *ContinuationStore
+}
+
+// deltaConsultID extracts the ConsultID from a ConsultResolvedDelta
+// (value or pointer form) for diagnostic logging. Returns empty when
+// the delta is nil or not a ConsultResolvedDelta.
+func deltaConsultID(d claims.Delta) string {
+	switch v := d.(type) {
+	case claims.ConsultResolvedDelta:
+		return v.ConsultID
+	case *claims.ConsultResolvedDelta:
+		if v == nil {
+			return ""
+		}
+		return v.ConsultID
+	}
+	return ""
 }
 
 // WireClaimsIntake creates a ClaimsInbox with event-driven dispatch.
@@ -45,23 +97,123 @@ type ClaimsIntakeConfig struct {
 // and Close it) or nil if the config is insufficient.
 func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 	if cfg.AgentID == "" || cfg.SessionID == "" || cfg.Bus == nil {
+		slog.Warn("claims_intake_skipped_insufficient_config",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"bus_nil", cfg.Bus == nil,
+		)
+		return nil
+	}
+	// Identity stamping is required for any agent whose ProcessEntry
+	// invokes the LLM gateway — without it, gateway.RequireIdentity
+	// rejects the dispatch and the claim entry fails silently in a
+	// background goroutine. Refuse to wire the intake when this
+	// invariant cannot be satisfied so the breakage is loud at
+	// startup instead of opaque under load.
+	//
+	// The narrow exemption: an intake whose ProcessEntry is itself
+	// nil cannot dispatch anything, so a missing Identity there is
+	// harmless. That carve-out is for tests that wire only the inbox
+	// matching surface without a handler.
+	if cfg.ProcessEntry != nil && cfg.Identity == nil {
+		slog.Error("claims_intake_missing_identity",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"reason", "ProcessEntry will run without AgentIdentity on ctx; gateway.RequireIdentity will reject every LLM dispatch",
+		)
+		return nil
+	}
+	// A missing scope means OnResolved would fall back to running
+	// ProcessEntry inline on the bus subscriber's goroutine — which
+	// (a) blocks bus delivery for the duration of the LLM call,
+	// (b) prevents the accumulator from flushing testaments async
+	//     because Flush also needs scope.Go,
+	// (c) is exactly the symptom we just spent debugging:
+	//     `claims_intake_wiring scope_present=false` followed by
+	//     `accumulator_flush_scope_unwired` and dropped testaments.
+	// Refuse to wire without scope so the breakage is loud at startup.
+	if cfg.ProcessEntry != nil && cfg.Scope == nil {
+		slog.Error("claims_intake_missing_scope",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"reason", "ProcessEntry needs a scope to dispatch async; without it accumulator flushes drop and OnResolved blocks the bus",
+		)
 		return nil
 	}
 
 	subscriber := &EventBusDeltaSubscriber{bus: cfg.Bus}
 
+	role := cfg.Role
+	if role == 0 {
+		role = claims.RoleSubject
+	}
+
+	slog.Info("claims_intake_wiring",
+		"agent_id", cfg.AgentID,
+		"session_id", cfg.SessionID,
+		"role", role,
+		"board_present", cfg.Board != nil,
+		"scope_present", cfg.Scope != nil,
+		"patterns", claims.InboxPatternsFor(role, cfg.SessionID, cfg.AgentID),
+	)
+
 	inbox, err := claims.NewClaimsInbox(claims.InboxConfig{
 		AgentID:    cfg.AgentID,
 		SessionID:  cfg.SessionID,
+		Role:       role,
 		Subscriber: subscriber,
 		Board:      cfg.Board,
 		OnResolved: func(entry *claims.GraphEntryPoint) {
 			if entry == nil {
 				return
 			}
+			// Pre-empt: ConsultResolvedDelta entries route to the
+			// ContinuationStore (waking pending continuations or
+			// stashing as orphans) and MUST NOT fall through to
+			// ProcessEntry. The ProcessEntry path triggers LLM
+			// inference; firing inference on every resolution
+			// would loop the agent's own consults back into its
+			// own loop.
+			if delta := entry.Delta; delta != nil && delta.DeltaKind() == claims.DeltaKindConsultResolved {
+				if cfg.ContinuationStore == nil {
+					slog.Warn("consult_resolved_dropped_no_continuation_store",
+						"agent_id", cfg.AgentID,
+						"session_id", cfg.SessionID,
+						"consult_id", deltaConsultID(delta),
+					)
+					return
+				}
+				resolved, ok := delta.(claims.ConsultResolvedDelta)
+				if !ok {
+					if ptr, ok2 := delta.(*claims.ConsultResolvedDelta); ok2 && ptr != nil {
+						resolved = *ptr
+						ok = true
+					}
+				}
+				if !ok {
+					slog.Warn("consult_resolved_unexpected_payload_type",
+						"agent_id", cfg.AgentID,
+						"delta_kind", delta.DeltaKind(),
+					)
+					return
+				}
+				cfg.ContinuationStore.DeliverResolution(context.Background(), &resolved)
+				return
+			}
+			slog.Info("claims_intake_resolved",
+				"agent_id", cfg.AgentID,
+				"session_id", cfg.SessionID,
+				"delta_kind", entry.Delta.DeltaKind(),
+				"delta_key", entry.Delta.DeltaKey(),
+				"node_has_claim", entry.Node.Claim != nil,
+				"node_has_testament", entry.Node.Testament != nil,
+				"node_has_validation", entry.Node.Validation != nil,
+				"identity_present", cfg.Identity != nil,
+				"factory_present", cfg.Factory != nil,
+			)
 			if cfg.Scope != nil && cfg.ProcessEntry != nil {
 				if err := cfg.Scope.Go("process_claim", 0, func(ctx context.Context) error {
-					return cfg.ProcessEntry(ctx, entry)
+					return cfg.ProcessEntry(stampClaimsIntakeContext(ctx, cfg, entry), entry)
 				}); err != nil {
 					slog.Error("claims_intake_dispatch_failed",
 						"agent_id", cfg.AgentID,
@@ -71,7 +223,8 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 				return
 			}
 			if cfg.ProcessEntry != nil {
-				if err := cfg.ProcessEntry(context.Background(), entry); err != nil {
+				ctx := stampClaimsIntakeContext(context.Background(), cfg, entry)
+				if err := cfg.ProcessEntry(ctx, entry); err != nil {
 					slog.Error("claims_intake_process_failed",
 						"agent_id", cfg.AgentID,
 						"error", err.Error(),
@@ -87,7 +240,76 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 		)
 		return nil
 	}
+	// Register the inbox with the process-wide registry so peer
+	// publishers can read its ConsultBudget before issuing consults.
+	// Last-write-wins semantics handle agent re-wiring (credential
+	// refresh, etc.); the agent's own Close path should call
+	// DefaultSessionInboxRegistry().Remove(sessionID, agentID) to
+	// avoid stale entries surviving a restart.
+	claims.DefaultSessionInboxRegistry().Register(cfg.SessionID, cfg.AgentID, inbox)
 	return inbox
+}
+
+// stampClaimsIntakeContext attaches the agent's AgentIdentity, a
+// per-claim TaskRef, and a per-claim LogMeta to ctx so downstream
+// LLM dispatches pass gateway.RequireDispatch and tool invocations
+// pass toolruntime.validateInvocation's correlation_id check. The
+// task and LogMeta both use the delta key as correlation, giving
+// each claim entry a stable correlation across retries.
+//
+// LogMeta stamping is unconditional: every agent that resolves
+// shared.LogMetaFromContext(ctx).CorrID for tool invocation needs a
+// non-empty value, and the delta key is the natural per-entry
+// correlation. Without it the architect's tool runtime rejects
+// every tool call with "correlation_id is required for tool
+// invocation".
+//
+// When Identity is nil the identity stamping is skipped — the agent
+// is presumably fine with running without the gateway identity
+// check (e.g. test-mode agents). When Factory is nil only identity
+// is stamped; the task field stays absent and the gateway will
+// reject the dispatch on RequireTask. Both nil is still a partial
+// stamp because LogMeta runs first and unconditionally.
+func stampClaimsIntakeContext(ctx context.Context, cfg ClaimsIntakeConfig, entry *claims.GraphEntryPoint) context.Context {
+	correlation := ""
+	if entry != nil {
+		correlation = strings.TrimSpace(entry.Delta.DeltaKey())
+	}
+	if correlation == "" {
+		correlation = "claims_intake_" + cfg.AgentID
+	}
+	ctx = WithLogMeta(ctx, LogMeta{
+		CorrID:    correlation,
+		AgentID:   cfg.AgentID,
+		SessionID: cfg.SessionID,
+	})
+	// Stamp the parent claim ID so any TestamentAccumulator the agent
+	// creates during this dispatch automatically inherits it. Per
+	// CLAIMS.md §5.1, every artifact recorded during processing is
+	// evidence on this claim — the chat panel uses ClaimID to route
+	// child rows under the correct parent claim row.
+	if entry != nil && entry.Node.Claim != nil {
+		ctx = claims.WithParentClaimID(ctx, entry.Node.Claim.ID)
+	}
+	if cfg.Identity != nil {
+		ctx = identity.WithIdentity(ctx, cfg.Identity)
+	}
+	if cfg.Factory != nil && entry != nil {
+		task, taskErr := cfg.Factory.NewTask(identity.TaskOptions{
+			DisplayID:   correlation,
+			Correlation: identity.CorrelationID(correlation),
+		})
+		if taskErr != nil {
+			slog.Warn("claims_intake_mint_task_failed",
+				"agent_id", cfg.AgentID,
+				"delta_key", correlation,
+				"error", taskErr.Error(),
+			)
+			return ctx
+		}
+		ctx = identity.WithTask(ctx, task)
+	}
+	return ctx
 }
 
 // ComposeClaimsEntryPrompt builds a user-message prompt from a

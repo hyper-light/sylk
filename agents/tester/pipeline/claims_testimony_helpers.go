@@ -92,15 +92,37 @@ func (pt *PipelineTester) processClaimsEntry(ctx context.Context, entry *claims.
 	if entry == nil {
 		return nil
 	}
+	claimID := ""
+	claimTitle := ""
+	if entry.Node.Claim != nil {
+		claimID = entry.Node.Claim.ID
+		claimTitle = entry.Node.Claim.Title
+	}
+	slog.Info("tester_pipeline_process_claims_entry_begin",
+		"tester_id", pt.id,
+		"session_id", pt.config.SessionID,
+		"delta_kind", entry.Delta.DeltaKind(),
+		"delta_key", entry.Delta.DeltaKey(),
+		"claim_id", claimID,
+		"claim_title", claimTitle,
+		"board_present", pt.testerBoard() != nil,
+	)
 	p := pt.getProvider()
 	if p == nil {
+		slog.Error("tester_pipeline_process_claims_entry_no_provider", "tester_id", pt.id)
 		return fmt.Errorf("tester-pipeline: LLM provider not configured")
 	}
 
-	acc := claims.NewTestamentAccumulator("tester-pipeline", pt.config.SessionID)
+	acc := agentshared.NewClaimsEntryAccumulator("tester-pipeline", pt.config.SessionID, entry)
+	acc.WithBoard(pt.testerBoard())
 	defer acc.Flush(ctx, pt.testerBoard(), pt.testerScope())
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
+
+	if entry.Node.Claim != nil {
+		agentshared.RecordAgentState(ctx, pt.testerBoard(), entry.Node.Claim.ID,
+			"Acknowledging request", agentshared.AgentStateReasoning, nil)
+	}
 
 	userMessage := agentshared.ComposeClaimsEntryPrompt(entry)
 	userMessage = claims.PrependBoardPreamble(userMessage, pt.claimsBoard, "tester-pipeline")
@@ -120,7 +142,7 @@ func (pt *PipelineTester) processClaimsEntry(ctx context.Context, entry *claims.
 	ledger := pt.steering.Create(entry.Delta.DeltaKey(), pt.id, pt.config.SessionID, nil, nil)
 	defer pt.steering.Close(entry.Delta.DeltaKey(), ctx.Err() != nil)
 
-	result, err := agentshared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+	result, err := agentshared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return pt.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {

@@ -69,7 +69,8 @@ func (b *coordinationTestBus) SubscribeAsync(string, guide.MessageHandler) (guid
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (b *coordinationTestBus) Close() error { return nil }
+func (b *coordinationTestBus) Close() error                            { return nil }
+func (b *coordinationTestBus) CloseWithContext(_ context.Context) error { return nil }
 
 func TestCoordinationClient_UsesBusProviderAtRequestTime(t *testing.T) {
 	bus := &coordinationTestBus{pending: make(map[string]chan *guide.Message)}

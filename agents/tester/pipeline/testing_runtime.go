@@ -1635,6 +1635,7 @@ func (pt *PipelineTester) createTestsWithProvider(ctx context.Context, req *test
 	pt.applyLLMRuntimeProfile(providerReq, "creation")
 
 	_, err := agentshared.ExecuteTurnLoop(
+		ctx,
 		agentshared.SteeringLedgerFromContext(ctx),
 		providerReq,
 		func() (string, error) {

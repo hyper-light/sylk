@@ -587,13 +587,24 @@ func (a *Archivalist) Start(bus guide.EventBus) error {
 	a.knowledgeSub, _ = bus.SubscribeAsync(guide.TopicKnowledgeReady, a.handleKnowledgeReady)
 
 	// Claims intake: event-driven delta processing.
+	//
+	// Role = RoleSubject | RoleArchivist. The archivalist's
+	// distinguishing responsibility on the board is long-term
+	// persistence of testaments, so it subscribes to
+	// claim.*.testified across the session. Every other agent's
+	// final response (captured as a response_text artifact on the
+	// flushed testament) lands here for curation and persistence —
+	// no upstream RouteRequest dispatch required.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
 		AgentID:      a.id,
 		SessionID:    a.defaultSessionID,
+		Role:         claims.RoleSubject | claims.RoleArchivist,
 		Bus:          bus,
 		Board:        a.archivalistBoard(),
 		Scope:        a.scope,
 		ProcessEntry: a.processClaimsEntry,
+		Identity:     a.identity,
+		Factory:      a.factory,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("archivalist_claims_inbox_start_failed", "error", err.Error())
@@ -941,6 +952,16 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	}
 	defer bundle.Close()
 
+	// Cycle-aware accumulator. UI_DESIGN.md §4.7.3.
+	var flushAccumulator func()
+	var beginErr error
+	ctx, flushAccumulator, beginErr = shared.BeginForwardedRequestCycle(ctx, a.id, fwd, a.scope)
+	if beginErr != nil {
+		lease.Release()
+		return beginErr
+	}
+	defer flushAccumulator()
+
 	result, err := a.processForwardedRequestWithBundle(ctx, fwd, bundle)
 	snapshot := lease.ReleaseWithObservation(shared.RequestReplicaObservation{
 		Duration:    time.Since(startTime),
@@ -996,6 +1017,8 @@ func (a *Archivalist) handleActionMessage(msg *guide.Message) error {
 		a.cancelRequest(action.CorrelationID)
 	case archivalistStorePaperAction:
 		return a.handleStoreResearchPaperAction(action)
+	case archivalistStoreCommentaryAction:
+		return a.handleStoreScribeCommentaryAction(action)
 	}
 	return nil
 }
@@ -1222,7 +1245,7 @@ func (a *Archivalist) processViaLLM(ctx context.Context, fwd *guide.ForwardedReq
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, llmReq, func() (string, error) {
 		return a.executeToolLoopWithBundle(ctx, llmReq, ledger, bundle)
 	})
 	if err != nil {

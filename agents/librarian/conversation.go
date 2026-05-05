@@ -38,7 +38,7 @@ func (l *Librarian) processViaLLM(ctx context.Context, fwd *guide.ForwardedReque
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, llmReq, func() (string, error) {
 		return l.executeToolLoopWithBundle(ctx, llmReq, ledger, bundle)
 	})
 	if err != nil {

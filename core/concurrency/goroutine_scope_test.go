@@ -303,3 +303,47 @@ func TestGoroutineLeakError_Error(t *testing.T) {
 	assert.Contains(t, msg, "2 goroutines leaked")
 	assert.Contains(t, msg, "agent-1")
 }
+
+func TestGoroutineScope_SignalShutdownCancelsContextAndRejectsNewWork(t *testing.T) {
+	scope := NewGoroutineScope(context.Background(), "test-agent", nil)
+
+	workerSawCancel := make(chan struct{})
+	require.NoError(t, scope.Go("long-runner", time.Hour, func(ctx context.Context) error {
+		<-ctx.Done()
+		close(workerSawCancel)
+		return nil
+	}))
+
+	scope.SignalShutdown()
+
+	select {
+	case <-workerSawCancel:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not see ctx cancellation after SignalShutdown")
+	}
+
+	err := scope.Go("post-signal", time.Hour, func(ctx context.Context) error { return nil })
+	if !errors.Is(err, ErrScopeShutdown) {
+		t.Fatalf("Go after SignalShutdown returned %v, want ErrScopeShutdown", err)
+	}
+
+	if err := scope.Shutdown(100*time.Millisecond, 200*time.Millisecond); err != nil {
+		t.Fatalf("Shutdown after SignalShutdown: %v", err)
+	}
+}
+
+func TestGoroutineScope_SignalShutdownIsIdempotent(t *testing.T) {
+	scope := NewGoroutineScope(context.Background(), "test-agent", nil)
+	scope.SignalShutdown()
+	scope.SignalShutdown()
+	scope.SignalShutdown()
+
+	err := scope.Go("post-signal", time.Hour, func(ctx context.Context) error { return nil })
+	if !errors.Is(err, ErrScopeShutdown) {
+		t.Fatalf("Go after multi-signal returned %v, want ErrScopeShutdown", err)
+	}
+
+	if err := scope.Shutdown(100*time.Millisecond, 200*time.Millisecond); err != nil {
+		t.Fatalf("Shutdown after multi-signal: %v", err)
+	}
+}

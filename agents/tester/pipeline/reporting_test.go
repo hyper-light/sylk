@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -74,7 +75,8 @@ func (b *testerCoordinationBus) SubscribeAsync(string, guide.MessageHandler) (gu
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (b *testerCoordinationBus) Close() error { return nil }
+func (b *testerCoordinationBus) Close() error                            { return nil }
+func (b *testerCoordinationBus) CloseWithContext(_ context.Context) error { return nil }
 
 func TestPublishVerificationArtifact_PerRecipientPayload(t *testing.T) {
 	pt, ctx, _ := newGoPipelineTesterWithVFS(t)

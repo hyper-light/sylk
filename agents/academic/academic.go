@@ -524,6 +524,8 @@ func (a *Academic) Start(bus guide.EventBus) error {
 		Board:        a.academicBoard(),
 		Scope:        a.scope,
 		ProcessEntry: a.processClaimsEntry,
+		Identity:     a.identity,
+		Factory:      a.factory,
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("academic_claims_inbox_start_failed", "error", err.Error())
@@ -814,6 +816,18 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	stopProgressKeepalive := a.startChildProgressKeepalive(ctx, fwd)
 	defer stopProgressKeepalive()
 
+	// Bind to the issuer's parent claim via cycle-aware helper —
+	// honors envelope parent_claim_id (consult/challenge dispatch)
+	// and falls back to guide's route claim. UI_DESIGN.md §4.7.3.
+	var flushAccumulator func()
+	var beginErr error
+	ctx, flushAccumulator, beginErr = shared.BeginForwardedRequestCycle(ctx, "academic", fwd, a.scope)
+	if beginErr != nil {
+		lease.Release()
+		return beginErr
+	}
+	defer flushAccumulator()
+
 	result, err := a.processForwardedRequest(ctx, fwd)
 	snapshot := lease.ReleaseWithObservation(shared.RequestReplicaObservation{
 		Duration:    time.Since(startTime),
@@ -1047,7 +1061,7 @@ func (a *Academic) handleConversation(ctx context.Context, fwd *guide.ForwardedR
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, llmReq, func() (string, error) {
 		return a.executeToolLoop(ctx, llmReq, ledger, toolSurface)
 	})
 	if err != nil {
@@ -1093,7 +1107,7 @@ func (a *Academic) handleConsultation(ctx context.Context, fwd *guide.ForwardedR
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, llmReq, func() (string, error) {
 		return a.executeToolLoop(ctx, llmReq, ledger, toolSurface)
 	})
 	if err != nil {
@@ -1574,7 +1588,7 @@ func (a *Academic) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest)
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, llmReq, func() (string, error) {
 		return a.executeToolLoop(ctx, llmReq, ledger, surface)
 	})
 	if err != nil {
@@ -1610,7 +1624,7 @@ func (a *Academic) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, llmReq, func() (string, error) {
 		return a.executeToolLoop(ctx, llmReq, ledger, surface)
 	})
 	if err != nil {
@@ -1657,7 +1671,7 @@ func (a *Academic) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest)
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, llmReq, func() (string, error) {
 		return a.executeToolLoop(ctx, llmReq, ledger, surface)
 	})
 	if err != nil {
@@ -2088,7 +2102,7 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 	a.applyLLMRuntimeProfile(ctx, llmReq, "research")
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+	result, err := shared.ExecuteTurnLoop(ctx, ledger, llmReq, func() (string, error) {
 		return a.executeToolLoop(ctx, llmReq, ledger, a.toolRuntime())
 	})
 	if err != nil {

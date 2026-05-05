@@ -42,6 +42,11 @@ type Manager struct {
 
 	scope *concurrency.GoroutineScope
 
+	// deltaBus is wired into every session's root claims board so
+	// the board's amplifier can publish InboxDeltas to subscriber
+	// inboxes via the underlying event bus.
+	deltaBus claims.DeltaBus
+
 	// Statistics
 	totalCreated   int64
 	totalCompleted int64
@@ -66,6 +71,14 @@ type ManagerConfig struct {
 	Persister Persister
 
 	Scope *concurrency.GoroutineScope
+
+	// DeltaBus is wired into every session's root claims board so the
+	// board's amplifier can publish InboxDelta / TestamentDelta etc.
+	// to subscriber inboxes via the underlying event bus. When nil,
+	// the board falls back to NoopDeltaBus and inbox subscribers
+	// never receive InboxDeltas — orchestrator dispatch via
+	// PostAction silently drops on the bus side.
+	DeltaBus claims.DeltaBus
 }
 
 // DefaultManagerConfig returns default manager configuration
@@ -99,6 +112,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		persister:   cfg.Persister,
 		handlers:    make(map[uint64]EventHandler),
 		scope:       cfg.Scope,
+		deltaBus:    cfg.DeltaBus,
 	}
 }
 
@@ -145,9 +159,17 @@ func (m *Manager) Create(ctx context.Context, cfg Config) (*Session, error) {
 		SessionID: session.ID(),
 		TaskID:    "session",
 		Scope:     boardScope,
+		DeltaBus:  m.deltaBus,
 	})
 	session.SetClaimsBoard(board)
-	claims.DefaultSessionBoardRegistry().Register(session.ID(), board)
+	// The session manager is the canonical owner of a session's root
+	// claims board. Register is first-write-wins; if a prior board was
+	// somehow registered for this session ID (programming error,
+	// re-create after Remove), surface it loudly rather than silently
+	// shadow the previous wiring.
+	if err := claims.DefaultSessionBoardRegistry().Register(session.ID(), board); err != nil {
+		return nil, fmt.Errorf("session %q: register claims board: %w", session.ID(), err)
+	}
 
 	shard := m.getShard(session.ID())
 

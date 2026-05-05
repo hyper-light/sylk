@@ -1,0 +1,250 @@
+@@ -98,20 +97,6 @@
+ 	// each pod is registered with its sub-nodes atomically with
+ 	// creation.
+ 	subNodesByTask map[string][]subNodeRegistration
+-
+-	// taskClaims holds the architect-authored claims for each task,
+-	// indexed by task_id. Populated during DAG ingest from the
+-	// PlanHandoff payload. ensureTaskPod posts these to the session's
+-	// claims board atomically with pod creation, so a pod is never
+-	// observable in a state where its task's authored claims aren't
+-	// on the board. Required by the canon: each task's claims must
+-	// be deterministically ingested at pod spin-up.
+-	taskClaims map[string][]architect.TaskClaim
+-	// claimsPostedForTask tracks which task IDs have already had
+-	// their authored claims posted to the board, so re-entrant
+-	// ensureTaskPod calls (sync.Once is per-slot, but the registry
+-	// is rebuilt across two-phase prepare/execute) don't double-post.
+-	claimsPostedForTask map[string]struct{}
+ }
+ 
+ // taskPodSlot holds the result of a single per-task pod construction
+@@ -160,14 +145,6 @@
+ 	gates              map[string]*dag.DecisionGate // per-DAG decision gates
+ 	scribeFactory      shared.ScribeFactory         // optional Scribe factory for pipeline pods
+ 	taskPodMonitorOnce sync.Once
+-
+-	// pendingTaskClaims holds architect-authored claims keyed by DAG
+-	// ID, awaiting Execute() to wire them into the per-DAG meta so
+-	// ensureTaskPod can post them on pod spin-up. Populated by
+-	// submitExecution from the PlanHandoff before it calls Execute;
+-	// consumed (and removed) by Execute when constructing the meta.
+-	pendingTaskClaims   map[string]map[string][]architect.TaskClaim // dagID → taskID → claims
+-	pendingTaskClaimsMu sync.Mutex
+ }
+ 
+ // NewDAGBridge creates a bridge between the DAG scheduler and orchestrator subsystems.
+@@ -796,44 +771,6 @@
+ 	return err
+ }
+ 
+-// RegisterTaskClaims stages the architect-authored claims for each
+-// task in a plan so dagBridge.Execute can fold them into the
+-// ActiveDAGMeta when it constructs the per-DAG bookkeeping. Called by
+-// submitExecution right before Execute.
+-//
+-// Strict invariant: claims for a task must be registered before
+-// dagBridge.Execute completes its meta initialization, otherwise
+-// ensureTaskPod for that task will spin up a pod whose authored
+-// claims aren't on the board — violating the canon that each task's
+-// claims be deterministically ingested at pod spin-up.
+-func (b *DAGBridge) RegisterTaskClaims(dagID string, claimsByTask map[string][]architect.TaskClaim) {
+-	if b == nil || strings.TrimSpace(dagID) == "" || len(claimsByTask) == 0 {
+-		return
+-	}
+-	b.pendingTaskClaimsMu.Lock()
+-	defer b.pendingTaskClaimsMu.Unlock()
+-	if b.pendingTaskClaims == nil {
+-		b.pendingTaskClaims = make(map[string]map[string][]architect.TaskClaim)
+-	}
+-	b.pendingTaskClaims[dagID] = claimsByTask
+-}
+-
+-// takePendingTaskClaims removes and returns the staged claims for a
+-// DAG. Called once during Execute's meta construction.
+-func (b *DAGBridge) takePendingTaskClaims(dagID string) map[string][]architect.TaskClaim {
+-	if b == nil {
+-		return nil
+-	}
+-	b.pendingTaskClaimsMu.Lock()
+-	defer b.pendingTaskClaimsMu.Unlock()
+-	if b.pendingTaskClaims == nil {
+-		return nil
+-	}
+-	claimsByTask := b.pendingTaskClaims[dagID]
+-	delete(b.pendingTaskClaims, dagID)
+-	return claimsByTask
+-}
+-
+ // ensureTaskPod returns a fully-ready pod for taskID in dagID. The
+ // first call constructs the pod via TaskPodFactory (atomic with VFS
+ // volume binding) and applies the deferred sub-node registrations.
+@@ -849,166 +786,49 @@
+ // dispatches block on the same construction. Errors are sticky (a failed
+ // creation is not retried — the DAG's existing failure paths handle it
+ // just like any other dispatch error).
+-func (b *DAGBridge) ensureTaskPod(ctx context.Context, dagID, taskID string) (*shared.AgentPod, error) {
++func (b *DAGBridge) ensureTaskPod(_ context.Context, dagID, taskID string) (*shared.AgentPod, error) {
+ 	if taskID == "" {
+ 		return nil, nil
+ 	}
+-	enterAt := time.Now()
+ 	b.mu.RLock()
+ 	meta, ok := b.activeDAGs[dagID]
+ 	b.mu.RUnlock()
+ 	if !ok || meta == nil {
+-		b.logTrace("ensure_task_pod_dag_not_active", agentlog.EventError, map[string]any{
+-			"dag_id":  dagID,
+-			"task_id": taskID,
+-		})
+ 		return nil, fmt.Errorf("dag bridge: dag %s not active", dagID)
+ 	}
+ 	factory := meta.TaskPodFactory
+ 	if factory == nil {
+-		b.logTrace("ensure_task_pod_no_factory", agentlog.EventError, map[string]any{
+-			"dag_id":  dagID,
+-			"task_id": taskID,
+-		})
+ 		return nil, fmt.Errorf("dag bridge: dag %s has no task pod factory", dagID)
+ 	}
+ 
+ 	meta.slotMu.Lock()
+ 	slot, ok := meta.taskPodSlots[taskID]
+-	firstCall := !ok
+-	if firstCall {
++	if !ok {
+ 		slot = &taskPodSlot{}
+ 		meta.taskPodSlots[taskID] = slot
+ 	}
+ 	registrations := append([]subNodeRegistration(nil), meta.subNodesByTask[taskID]...)
+-	subNodeCount := len(registrations)
+-	taskClaimCount := len(meta.taskClaims[taskID])
+ 	meta.slotMu.Unlock()
+ 
+-	b.logTrace("ensure_task_pod_enter", agentlog.EventRegistryEvent, map[string]any{
+-		"dag_id":           dagID,
+-		"task_id":          taskID,
+-		"first_call":       firstCall,
+-		"sub_node_count":   subNodeCount,
+-		"task_claim_count": taskClaimCount,
+-	})
+-
+ 	slot.once.Do(func() {
+-		factoryStart := time.Now()
+-		b.logTrace("ensure_task_pod_factory_begin", agentlog.EventRegistryEvent, map[string]any{
+-			"dag_id":  dagID,
+-			"task_id": taskID,
+-		})
+ 		pod, err := factory(taskID)
+ 		if err != nil {
+ 			slot.err = fmt.Errorf("dag bridge: build task pod %s: %w", taskID, err)
+-			b.logTrace("ensure_task_pod_factory_failed", agentlog.EventError, map[string]any{
+-				"dag_id":     dagID,
+-				"task_id":    taskID,
+-				"elapsed_ms": time.Since(factoryStart).Milliseconds(),
+-				"error":      err.Error(),
+-			})
+ 			return
+ 		}
+-		b.logTrace("ensure_task_pod_factory_done", agentlog.EventRegistryEvent, map[string]any{
+-			"dag_id":     dagID,
+-			"task_id":    taskID,
+-			"elapsed_ms": time.Since(factoryStart).Milliseconds(),
+-		})
+-
+ 		// Apply deferred sub-node registrations BEFORE publishing the
+ 		// pod into TaskPods so any reader sees a fully-configured pod.
+-		subStart := time.Now()
+ 		for _, reg := range registrations {
+ 			pod.RegisterSubNode(reg.subNodeID, reg.parentNodeID, reg.stage, reg.agentType)
+ 		}
+-		b.logTrace("ensure_task_pod_subnodes_registered", agentlog.EventRegistryEvent, map[string]any{
+-			"dag_id":     dagID,
+-			"task_id":    taskID,
+-			"count":      subNodeCount,
+-			"elapsed_ms": time.Since(subStart).Milliseconds(),
+-		})
+-
+-		claimsStart := time.Now()
+-		b.logTrace("ensure_task_pod_claims_post_begin", agentlog.EventRegistryEvent, map[string]any{
+-			"dag_id":  dagID,
+-			"task_id": taskID,
+-			"count":   taskClaimCount,
+-		})
+-		if claimsErr := b.postTaskClaimsForPod(ctx, meta, taskID); claimsErr != nil {
+-			b.logTrace("ensure_task_pod_claims_post_failed", agentlog.EventError, map[string]any{
+-				"dag_id":     dagID,
+-				"task_id":    taskID,
+-				"elapsed_ms": time.Since(claimsStart).Milliseconds(),
+-				"error":      claimsErr.Error(),
+-			})
+-		} else {
+-			b.logTrace("ensure_task_pod_claims_post_done", agentlog.EventRegistryEvent, map[string]any{
+-				"dag_id":     dagID,
+-				"task_id":    taskID,
+-				"elapsed_ms": time.Since(claimsStart).Milliseconds(),
+-			})
+-		}
+-
+-		// Pre-activate ALL pod members up-front (engineer, designer,
+-		// inspector-pipeline, tester-pipeline). Without this, only the
+-		// agent types named in the FIRST dispatched node's
+-		// NodeAgentTypes get activated — leaving e.g.
+-		// inspector-pipeline cold until an inspector-targeted node
+-		// fires. The pipeline canon is that the pod is the unit of
+-		// pipeline execution, so all members should spin up together
+-		// when the pod is created. Best-effort: a per-member
+-		// activation failure is logged but doesn't fail pod creation
+-		// (the per-node activate path retries via HoldForNode).
+-		preActivateStart := time.Now()
+-		b.logTrace("ensure_task_pod_pre_activate_begin", agentlog.EventRegistryEvent, map[string]any{
+-			"dag_id":  dagID,
+-			"task_id": taskID,
+-		})
+-		if preErr := pod.PreActivateStrict(ctx); preErr != nil {
+-			b.logTrace("ensure_task_pod_pre_activate_failed", agentlog.EventError, map[string]any{
+-				"dag_id":     dagID,
+-				"task_id":    taskID,
+-				"elapsed_ms": time.Since(preActivateStart).Milliseconds(),
+-				"error":      preErr.Error(),
+-			})
+-		} else {
+-			b.logTrace("ensure_task_pod_pre_activate_done", agentlog.EventRegistryEvent, map[string]any{
+-				"dag_id":     dagID,
+-				"task_id":    taskID,
+-				"elapsed_ms": time.Since(preActivateStart).Milliseconds(),
+-			})
+-		}
+-
+ 		meta.slotMu.Lock()
+ 		meta.TaskPods[taskID] = pod
+ 		meta.slotMu.Unlock()
+ 		slot.pod = pod
+-		b.logTrace("ensure_task_pod_published", agentlog.EventRegistryEvent, map[string]any{
+-			"dag_id":     dagID,
+-			"task_id":    taskID,
+-			"total_ms":   time.Since(factoryStart).Milliseconds(),
+-		})
+-	})
+-	b.logTrace("ensure_task_pod_exit", agentlog.EventRegistryEvent, map[string]any{
+-		"dag_id":     dagID,
+-		"task_id":    taskID,
+-		"elapsed_ms": time.Since(enterAt).Milliseconds(),
+-		"err":        errString(slot.err),
+-		"pod_nil":    slot.pod == nil,
+ 	})
+ 	return slot.pod, slot.err
+ }
+ 
+-// errString returns "" for nil errors so structured-log fields stay
+-// clean.
+-func errString(err error) string {
+-	if err == nil {
+-		return ""
+-	}
+-	return err.Error()
+-}
+-
+ // taskPodCacheLookup returns the cached pod for taskID, or nil if
+ // ensureTaskPod hasn't yet constructed it. Synchronized read — safe
+ // to call from any goroutine. Does NOT trigger creation; callers that

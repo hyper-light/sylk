@@ -54,7 +54,7 @@ func (o *Orchestrator) publishReviewWakeBestEffort(ctx context.Context, review *
 		"review_id":       strings.TrimSpace(review.ID),
 		"artifact_id":     strings.TrimSpace(review.ArtifactID),
 		"reviewer_type":   strings.TrimSpace(review.ReviewerType),
-		"target_agent_id": pipelineWorkerTargetAgentID(review.TaskID, review.ReviewerType),
+		"target_agent_id": pipelineWorkerTargetAgentID(o.config.SessionID, review.TaskID, review.ReviewerType),
 	})
 }
 
@@ -144,7 +144,7 @@ func (o *Orchestrator) buildReviewWakePipelineTask(
 		DAGID:         coordinationReviewWakeDAGID,
 		TaskID:        strings.TrimSpace(review.TaskID),
 		AgentType:     strings.TrimSpace(review.ReviewerType),
-		TargetAgentID: pipelineWorkerTargetAgentID(review.TaskID, review.ReviewerType),
+		TargetAgentID: pipelineWorkerTargetAgentID(o.config.SessionID, review.TaskID, review.ReviewerType),
 		Prompt:        reviewWakePrompt(review, artifact),
 		Context:       contextData,
 		SessionID:     o.config.SessionID,

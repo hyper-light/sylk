@@ -48,13 +48,17 @@ func handoffSubmitTestament(bp BoardProvider, ctx context.Context, testament cla
 	}
 }
 
-// handoffClaim builds a claim from the handoff bridge.
+// handoffClaim builds a claim from the handoff bridge. Tagged with
+// ActionTypeHandoff so downstream consumers — left-panel filter, audit
+// readers, Forest outcome classifier — can distinguish a handoff from
+// ordinary task work. Mistagging this as ActionTypeTask hides cycle
+// ownership transfers behind plain task semantics.
 func handoffClaim(title, description, agentID string, scope []claims.ClaimScopeEntry, validations []*claims.Validation) claims.Claim {
 	return claims.Claim{
 		Title:       title,
 		Description: description,
 		Scope:       scope,
-		ActionType:  claims.ActionTypeTask,
+		ActionType:  claims.ActionTypeHandoff,
 		Relations: []claims.Relation{
 			{Related: "handoff_bridge", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
 			{Related: agentID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},

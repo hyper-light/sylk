@@ -35,7 +35,8 @@ func (s *stubBus) Subscribe(string, guide.MessageHandler) (guide.Subscription, e
 func (s *stubBus) SubscribeAsync(string, guide.MessageHandler) (guide.Subscription, error) {
 	return nil, errors.New("not implemented")
 }
-func (s *stubBus) Close() error { return nil }
+func (s *stubBus) Close() error                            { return nil }
+func (s *stubBus) CloseWithContext(_ context.Context) error { return nil }
 
 // TestAskUserClarificationSkill_PublishesClarificationRequest locks
 // the publish path: when an agent invokes ask_user_clarification, a
