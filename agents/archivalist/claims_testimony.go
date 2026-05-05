@@ -201,6 +201,10 @@ func (a *Archivalist) processClaimsEntry(ctx context.Context, entry *claims.Grap
 		return a.executeToolLoop(ctx, req, ledger)
 	})
 	if err != nil {
+		if shared.IsConsultYielded(err) {
+			slog.Info("archivalist_claims_entry_yielded", "delta_key", entry.Delta.DeltaKey())
+			return nil
+		}
 		slog.Error("archivalist_claims_entry_failed", "error", err.Error(), "delta_key", entry.Delta.DeltaKey())
 		acc.Record("error", err.Error())
 		return err
@@ -298,8 +302,8 @@ func (a *Archivalist) persistTestamentEntry(ctx context.Context, entry *claims.G
 		Source:    SourceModel(issuer),
 		SessionID: a.defaultSessionID,
 		Metadata: map[string]any{
-			"testament_id":  t.ID,
-			"confidence":    t.Confidence,
+			"testament_id":   t.ID,
+			"confidence":     t.Confidence,
 			"artifact_kinds": testamentArtifactKinds(t),
 		},
 	}

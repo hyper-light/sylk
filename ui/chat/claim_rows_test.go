@@ -375,6 +375,165 @@ func TestClaimsNative_CycleOwnerSetByStatusMsgWinsOverArtifact(t *testing.T) {
 	}
 }
 
+func TestClaimsNative_GuideClassificationDoesNotReserveRouteCorrelation(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "guide",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "cycle-guide-classify",
+		ActionType: "prompt",
+		Reason:     "Classifying request",
+		State:      "classifying",
+	})
+	m.Update(msg.ClaimContextMsg{
+		SessionID:    "ses-1",
+		ClaimID:      "claim-guide-classify",
+		OwnerAgentID: "guide",
+		CycleID:      "cycle-guide-classify",
+		Context:      "Request forwarded",
+		State:        "routing",
+	})
+
+	if m.history.Len() != 1 {
+		t.Fatalf("guide classification created %d chat entries, want 1", m.history.Len())
+	}
+	guideEntry := m.history.Get(0)
+	if guideEntry == nil {
+		t.Fatal("missing guide classification chat entry")
+	}
+	if guideEntry.AgentID != "guide" {
+		t.Fatalf("guide entry AgentID = %q, want guide", guideEntry.AgentID)
+	}
+	if guideEntry.CorrelationID != "cycle-guide-classify" {
+		t.Fatalf("guide entry CorrelationID = %q, want cycle-guide-classify", guideEntry.CorrelationID)
+	}
+	for _, id := range guideEntry.AdditionalCorrelationIDs {
+		if id == "route-123" {
+			t.Fatal("guide classification entry reserved route stream correlation")
+		}
+	}
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:             "architect",
+		SessionID:           "ses-1",
+		Active:              true,
+		CycleID:             "cycle-architect",
+		ActionType:          "prompt",
+		Reason:              "Build a python CLI",
+		StreamCorrelationID: "route-123",
+	})
+	if m.history.Len() != 2 {
+		t.Fatalf("architect cycle created %d chat entries, want 2", m.history.Len())
+	}
+	entry := m.history.Get(1)
+	if entry == nil {
+		t.Fatal("missing architect chat entry")
+	}
+	if entry.AgentID != "architect" {
+		t.Fatalf("entry.AgentID = %q, want architect", entry.AgentID)
+	}
+	if entry.CorrelationID != "cycle-architect" {
+		t.Fatalf("entry.CorrelationID = %q, want cycle-architect", entry.CorrelationID)
+	}
+}
+
+func TestClaimsNative_ChildResponseTextDoesNotBecomeCycleAnswer(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "architect",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "claim-architect",
+		ActionType: "prompt",
+		Reason:     "Plan the CLI",
+	})
+	m.Update(msg.ClaimArtifactAddedMsg{
+		ArtifactID:     "consult-start",
+		CycleID:        "claim-architect",
+		ClaimID:        "claim-architect",
+		OwnerAgentID:   "architect",
+		OwnerAgentType: "architect",
+		AgentID:        "architect",
+		Kind:           "consult_started",
+		Reference:      "librarian",
+		CreatedAt:      time.Now(),
+	})
+	m.Update(msg.ClaimArtifactAddedMsg{
+		ArtifactID:     "librarian-tool",
+		CycleID:        "claim-architect",
+		ParentRowID:    "consult-start",
+		ClaimID:        "claim-librarian",
+		OwnerAgentID:   "librarian",
+		OwnerAgentType: "librarian",
+		AgentID:        "librarian",
+		Kind:           "tool_started",
+		Reference:      "workspace_read",
+		CreatedAt:      time.Now(),
+	})
+
+	m.Update(msg.ClaimResponseTextMsg{
+		SessionID: "ses-1",
+		CycleID:   "claim-architect",
+		ClaimID:   "claim-librarian",
+		AgentID:   "librarian",
+		Content:   "Consultation response intended for the architect only.",
+		CreatedAt: time.Now(),
+	})
+
+	entry := m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing architect cycle entry")
+	}
+	if entry.Content != "" {
+		t.Fatalf("child response_text wrote cycle answer = %q", entry.Content)
+	}
+	if len(entry.ToolCalls) != 1 || entry.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("missing consult inter-agent row: %+v", entry.ToolCalls)
+	}
+	children := entry.ToolCalls[0].InterAgent.Children
+	if len(children) != 1 {
+		t.Fatalf("consult children = %d, want 1", len(children))
+	}
+	if !children[0].Completed {
+		t.Fatal("child response_text should mark nested child activity completed")
+	}
+	if children[0].ResultSummary != "Consultation response intended for the architect only." {
+		t.Fatalf("child ResultSummary = %q", children[0].ResultSummary)
+	}
+}
+
+func TestClaimsNative_RootResponseTextBecomesCycleAnswer(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "architect",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "claim-architect",
+		ActionType: "prompt",
+		Reason:     "Plan the CLI",
+	})
+	m.Update(msg.ClaimResponseTextMsg{
+		SessionID: "ses-1",
+		CycleID:   "claim-architect",
+		ClaimID:   "claim-architect",
+		AgentID:   "architect",
+		Content:   "Here is the final answer.",
+		CreatedAt: time.Now(),
+	})
+
+	entry := m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing architect cycle entry")
+	}
+	if entry.Content != "Here is the final answer." {
+		t.Fatalf("entry.Content = %q, want final answer", entry.Content)
+	}
+}
+
 // guardChainOK keeps the import set tight: the test file must compile
 // against core/claims even when an individual test doesn't reference
 // it directly, so the build catches drift early.

@@ -82,7 +82,6 @@ func (a *Architect) architectPostClaim(ctx context.Context, action claims.Action
 	claims.RegisterPostActionExpectations(a.claimsInbox, action, posted)
 }
 
-
 // architectSubmitTestament submits a testament to the session board.
 // Async via scope when available. Best-effort.
 func (a *Architect) architectSubmitTestament(ctx context.Context, testament claims.Testament) {
@@ -288,6 +287,10 @@ func (a *Architect) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 		return a.executeToolLoop(ctx, req, "claims_entry", nil, ledger)
 	})
 	if err != nil {
+		if shared.IsConsultYielded(err) {
+			slog.Info("architect_claims_entry_yielded", "delta_key", entry.Delta.DeltaKey())
+			return nil
+		}
 		slog.Error("architect_claims_entry_failed", "error", err.Error(), "delta_key", entry.Delta.DeltaKey())
 		acc.Record("error", err.Error())
 		return err

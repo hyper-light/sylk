@@ -83,7 +83,6 @@ func (o *Orchestrator) orchestratorPostClaim(ctx context.Context, action claims.
 	claims.RegisterPostActionExpectations(o.claimsInbox, action, posted)
 }
 
-
 // orchestratorSubmitTestament submits a testament async via scope. Best-effort.
 func (o *Orchestrator) orchestratorSubmitTestament(ctx context.Context, testament claims.Testament) {
 	board := o.orchestratorBoardOrNil()
@@ -262,6 +261,10 @@ func (o *Orchestrator) processClaimsEntry(ctx context.Context, entry *claims.Gra
 		return o.executeToolLoop(ctx, req, ledger)
 	})
 	if err != nil {
+		if shared.IsConsultYielded(err) {
+			slog.Info("orchestrator_claims_entry_yielded", "delta_key", entry.Delta.DeltaKey())
+			return nil
+		}
 		slog.Error("orchestrator_claims_entry_failed", "error", err.Error(), "delta_key", entry.Delta.DeltaKey())
 		acc.Record("error", err.Error())
 		return err

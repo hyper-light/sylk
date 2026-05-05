@@ -356,9 +356,28 @@ func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 		if err := m.claimsBridge.Start(program); err != nil {
 			return err
 		}
+		m.syncClaimsBridgeToActiveSession()
 	}
 	m.startIndexProgressObserver(program)
 	return nil
+}
+
+func (m *AppModel) syncClaimsBridgeToActiveSession() {
+	if m == nil || m.claimsBridge == nil || m.deps.SessionManager == nil {
+		return
+	}
+	active, ok := m.deps.SessionManager.GetActive()
+	if !ok || active == nil {
+		uiDebugFileLog().Info("CLAIMS_UI_DEBUG: claims_bridge_initial_session_missing")
+		return
+	}
+	sessionID := strings.TrimSpace(active.ID())
+	if sessionID == "" {
+		uiDebugFileLog().Info("CLAIMS_UI_DEBUG: claims_bridge_initial_session_empty")
+		return
+	}
+	uiDebugFileLog().Info("CLAIMS_UI_DEBUG: claims_bridge_initial_switch", "session_id", sessionID)
+	m.claimsBridge.SwitchSession(sessionID)
 }
 
 // pipelinePhaseMap maps boot pipeline phase strings to UI IndexPhase constants.
@@ -496,8 +515,21 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 		SessionID:      submit.SessionID,
 		Timestamp:      time.Now(),
 	}
+	uiDebugFileLog().Info("CLAIMS_UI_DEBUG: tui_publish_route_request",
+		"session_id", req.SessionID,
+		"correlation_id", req.CorrelationID,
+		"source_agent_id", req.SourceAgentID,
+		"target_agent_id", req.TargetAgentID,
+		"explicit_target", req.ExplicitTarget,
+		"input_preview", routeDebugPreview(req.Input, 120),
+		"guide_bus_present", m.deps.GuideBus != nil,
+	)
 
 	if !m.guideRequestAvailable() {
+		uiDebugFileLog().Info("CLAIMS_UI_DEBUG: tui_publish_route_request_unavailable",
+			"session_id", req.SessionID,
+			"correlation_id", req.CorrelationID,
+		)
 		m.statusBar.SetFlash("Guide is not running")
 		return nil
 	}
@@ -507,12 +539,34 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 	return func() tea.Msg {
 		err := m.deps.GuideBus.Publish(guide.TopicGuideRequests, busMsg)
 		if err != nil {
+			uiDebugFileLog().Info("CLAIMS_UI_DEBUG: tui_publish_route_request_failed",
+				"session_id", req.SessionID,
+				"correlation_id", req.CorrelationID,
+				"error", err.Error(),
+			)
 			if m.walLogger != nil {
 				m.walLogger.Warn("route_publish_failed", "error", err.Error())
 			}
+		} else {
+			uiDebugFileLog().Info("CLAIMS_UI_DEBUG: tui_publish_route_request_ok",
+				"session_id", req.SessionID,
+				"correlation_id", req.CorrelationID,
+			)
 		}
 		return nil
 	}
+}
+
+func routeDebugPreview(input string, maxRunes int) string {
+	trimmed := strings.TrimSpace(input)
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(trimmed)
+	if len(runes) <= maxRunes {
+		return trimmed
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 func (m *AppModel) bumpGuideContextUsage(addedTokens int) float64 {

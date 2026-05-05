@@ -216,6 +216,10 @@ func (g *Guardian) processClaimsEntry(ctx context.Context, entry *claims.GraphEn
 		return content, loopErr
 	})
 	if err != nil {
+		if shared.IsConsultYielded(err) {
+			slog.Info("guardian_claims_entry_yielded", "delta_key", entry.Delta.DeltaKey())
+			return nil
+		}
 		slog.Error("guardian_claims_entry_failed", "error", err.Error(), "delta_key", entry.Delta.DeltaKey())
 		acc.Record("error", err.Error())
 		return err

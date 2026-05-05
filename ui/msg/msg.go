@@ -840,6 +840,16 @@ type ClaimsAgentStatusMsg struct {
 	OpenCount int    // count of open subject claims for the owner (debugging)
 	Reason    string
 
+	// State is the categorical agent activity state to use for this
+	// cycle edge when the claim carries a UI-specific state that is
+	// more precise than ActionType (for example Guide classification).
+	State string
+
+	// SuppressChat means this claim is an agent-panel/status signal
+	// only. The chat panel must not open, update, or reserve a cycle
+	// entry for it; other panels may still consume it.
+	SuppressChat bool
+
 	// TerminalOutcome carries the cycle's verdict on close. Populated
 	// only when Active=false. Maps to the agent panel's terminal
 	// status visual: "success" → StatusSuccess, "failure" → StatusError,
@@ -885,6 +895,7 @@ type ClaimContextMsg struct {
 	CycleID           string
 	Context           string
 	ContextTransition int64
+	SuppressChat      bool
 	// State is the categorical agent activity state (the canonical
 	// taxonomy from agents/shared.AgentActivityState — "tool_executing",
 	// "awaiting_peer_response", "challenging_peer", "awaiting_guardian",
@@ -932,6 +943,7 @@ type ClaimArtifactAddedMsg struct {
 	Reference      string         // tool name, consult title, etc.
 	Metadata       map[string]any // kind-specific structured detail
 	CreatedAt      time.Time
+	SuppressChat   bool
 }
 
 // ClaimResponseTextMsg carries the agent's final assistant message
@@ -942,12 +954,13 @@ type ClaimArtifactAddedMsg struct {
 // as the visible artifact lifecycle; response_text falls outside
 // that lifecycle and needs its own delivery path.
 type ClaimResponseTextMsg struct {
-	SessionID string
-	CycleID   string
-	ClaimID   string
-	AgentID   string
-	Content   string
-	CreatedAt time.Time
+	SessionID    string
+	CycleID      string
+	ClaimID      string
+	AgentID      string
+	Content      string
+	CreatedAt    time.Time
+	SuppressChat bool
 }
 
 // ClaimArtifactCompletedMsg closes a row in the chat tree. Emitted by
@@ -962,6 +975,7 @@ type ClaimArtifactCompletedMsg struct {
 	Summary         string        // one-line result summary (truncated tool output, child testament summary)
 	Metadata        map[string]any
 	CompletedAt     time.Time
+	SuppressChat    bool
 }
 
 // VariantStateMsg carries a variant state update for the agent panel.

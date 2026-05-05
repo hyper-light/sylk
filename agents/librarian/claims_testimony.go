@@ -206,6 +206,10 @@ func (l *Librarian) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 		return l.executeToolLoop(ctx, req, ledger)
 	})
 	if err != nil {
+		if shared.IsConsultYielded(err) {
+			slog.Info("librarian_claims_entry_yielded", "delta_key", entry.Delta.DeltaKey())
+			return nil
+		}
 		slog.Error("librarian_claims_entry_failed", "error", err.Error(), "delta_key", entry.Delta.DeltaKey())
 		acc.Record("error", err.Error())
 		return err

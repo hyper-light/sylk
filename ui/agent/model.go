@@ -2174,11 +2174,15 @@ func (m *Model) handleClaimsAgentStatus(ev msg.ClaimsAgentStatusMsg) tea.Cmd {
 		return nil
 	}
 	if ev.Active {
+		activityState := claimStateUIState(ev.State)
+		if activityState == events.AgentUIStateNone {
+			activityState = claimActionUIState(ev.ActionType)
+		}
 		applyAgentLifecycleUpdate(agent, agentLifecycleUpdate{
 			Source:        agentLifecycleSourceClaims,
 			CorrelationID: ev.CycleID,
 			Status:        StatusActing,
-			ActivityState: claimActionUIState(ev.ActionType),
+			ActivityState: activityState,
 		})
 		if summary := compactAgentPanelString(ev.Reason); summary != "" {
 			agent.TaskSummary = summary

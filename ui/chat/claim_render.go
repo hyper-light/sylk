@@ -98,6 +98,83 @@ func (m *Model) completeClaimArtifactInHistory(art *ArtifactRow) {
 	m.viewDirty = true
 }
 
+// applyChildClaimResponseTextToHistory records a child claim's final
+// response on the nested inter-agent child activity that represents
+// that consultation/challenge branch. It deliberately does not write
+// the content onto the cycle's ChatEntry: only the cycle-root claim's
+// response_text is the user-visible answer.
+func (m *Model) applyChildClaimResponseTextToHistory(cycleID, claimID, agentID, content string) bool {
+	if m == nil {
+		return false
+	}
+	cycleID = strings.TrimSpace(cycleID)
+	claimID = strings.TrimSpace(claimID)
+	content = strings.TrimSpace(content)
+	if cycleID == "" || claimID == "" || content == "" {
+		return false
+	}
+	idx := m.historyIndexForCorrelation(cycleID)
+	if idx < 0 {
+		return false
+	}
+	changed := false
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		if applyChildClaimResponseTextInToolCalls(e.ToolCalls, claimID, agentID, content) {
+			invalidateChatEntryRender(e)
+			changed = true
+		}
+	})
+	return changed
+}
+
+func applyChildClaimResponseTextInToolCalls(calls []ToolCallRecord, claimID, agentID, content string) bool {
+	for i := range calls {
+		if calls[i].InterAgent == nil {
+			continue
+		}
+		if applyChildClaimResponseTextInInterAgent(calls[i].InterAgent, claimID, agentID, content) {
+			return true
+		}
+	}
+	return false
+}
+
+func applyChildClaimResponseTextInInterAgent(row *InterAgentTool, claimID, agentID, content string) bool {
+	if row == nil {
+		return false
+	}
+	for i := range row.Children {
+		child := &row.Children[i]
+		if childMatchesClaimResponse(child, claimID, agentID) {
+			child.ResultSummary = normalizeInlineText(content)
+			child.Completed = true
+			child.Failed = false
+			child.ThinkingText = ""
+			child.ThinkingStatus = ""
+			return true
+		}
+		if applyChildClaimResponseTextInToolCalls(child.ToolCalls, claimID, agentID, content) {
+			return true
+		}
+	}
+	return false
+}
+
+func childMatchesClaimResponse(child *InterAgentChildActivity, claimID, agentID string) bool {
+	if child == nil {
+		return false
+	}
+	claimID = strings.TrimSpace(claimID)
+	agentID = strings.TrimSpace(agentID)
+	if claimID != "" && strings.TrimSpace(child.CorrelationID) == claimID {
+		return true
+	}
+	if agentID == "" {
+		return false
+	}
+	return strings.TrimSpace(child.AgentID) == agentID || strings.TrimSpace(child.AgentType) == agentID
+}
+
 // applyClaimContextToHistory writes the cycle's narrative status text
 // into the projected ChatEntry's ThinkingStatus field so the renderer
 // shows it under the agent's row while work is in flight.

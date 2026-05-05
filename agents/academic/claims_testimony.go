@@ -221,6 +221,10 @@ func (a *Academic) processClaimsEntry(ctx context.Context, entry *claims.GraphEn
 		return a.executeToolLoop(ctx, req, ledger, surface)
 	})
 	if err != nil {
+		if shared.IsConsultYielded(err) {
+			slog.Info("academic_claims_entry_yielded", "delta_key", entry.Delta.DeltaKey())
+			return nil
+		}
 		slog.Error("academic_claims_entry_failed", "error", err.Error(), "delta_key", entry.Delta.DeltaKey())
 		acc.Record("error", err.Error())
 		return err

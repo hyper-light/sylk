@@ -582,6 +582,81 @@ func TestBridgeIntegration_PromptOpensCycleForSubject(t *testing.T) {
 	}
 }
 
+func TestBridgeIntegration_GuideClassificationIsVisibleButDoesNotClaimRouteStream(t *testing.T) {
+	_, board, prog, cleanup := setupBridgeOnSession(t, "sess-guide-classify-panel-only")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "guide", Type: claims.ActionTypePrompt},
+		[]claims.Claim{{
+			Title:      "Classifying request",
+			ActionType: claims.ActionTypePrompt,
+			Context:    "Classifying request",
+			Relations: []claims.Relation{
+				{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			},
+			Tags: []string{
+				claimTagGuideClassification,
+				"stream_corr_id:route-123",
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction classification: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	if err := board.UpdateClaimProgress(context.Background(), claimID, claims.ClaimProgressUpdate{
+		WorkSummary: "Classifying request",
+	}, "guide"); err != nil {
+		t.Fatalf("UpdateClaimProgress: %v", err)
+	}
+	drainBridge(t, prog, "guide classification open")
+
+	var openMsg *msg.ClaimsAgentStatusMsg
+	for _, m := range prog.Snapshot() {
+		s, ok := m.(msg.ClaimsAgentStatusMsg)
+		if ok && s.Active && s.CycleID == claimID {
+			openMsg = &s
+			break
+		}
+	}
+	if openMsg == nil {
+		t.Fatal("expected guide classification ClaimsAgentStatusMsg")
+	}
+	if openMsg.SuppressChat {
+		t.Fatal("guide classification claim must be visible in chat")
+	}
+	if openMsg.State != "classifying" {
+		t.Fatalf("State = %q, want classifying", openMsg.State)
+	}
+	if openMsg.StreamCorrelationID != "" {
+		t.Fatalf("StreamCorrelationID = %q, want empty so routed agent owns the route stream", openMsg.StreamCorrelationID)
+	}
+
+	if err := board.SetClaimContext(context.Background(), claimID, "Request forwarded"); err != nil {
+		t.Fatalf("SetClaimContext: %v", err)
+	}
+	drainBridge(t, prog, "guide classification forwarded context")
+
+	var contextMsg *msg.ClaimContextMsg
+	for _, m := range prog.Snapshot() {
+		c, ok := m.(msg.ClaimContextMsg)
+		if ok && c.ClaimID == claimID && c.Context == "Request forwarded" {
+			contextMsg = &c
+			break
+		}
+	}
+	if contextMsg == nil {
+		t.Fatal("expected guide classification ClaimContextMsg")
+	}
+	if contextMsg.SuppressChat {
+		t.Fatal("guide classification context must be visible in chat")
+	}
+	if contextMsg.State != "routing" {
+		t.Fatalf("context State = %q, want routing", contextMsg.State)
+	}
+}
+
 // TestBridgeIntegration_ClaimContextRoutesToUI exercises the Phase 3
 // context-delta path: SetClaimContext on the board → notifyDelta with
 // kind=claim_context_changed → bridge → msg.ClaimContextMsg with the

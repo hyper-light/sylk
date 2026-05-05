@@ -985,12 +985,25 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		(g.router == nil || !g.router.IsDSL(request.Input)) &&
 		g.conversation.PendingPlan(request.SessionID) == nil {
 		if result, target, ok := g.tryConversationFastPath(ctx, request); ok {
+			guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_not_started",
+				"reason", "conversation_fastpath",
+				"session_id", request.SessionID,
+				"correlation_id", request.CorrelationID,
+				"target", target,
+			)
 			guideFileLog().Info("DEBUG: resolve_classification_fastpath_hit", "target", target, "elapsed_ms", time.Since(classStart).Milliseconds())
 			return result, target, nil
 		}
 	}
 
 	if request.TargetAgentID != "" {
+		guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_not_started",
+			"reason", "direct_or_explicit_target",
+			"session_id", request.SessionID,
+			"correlation_id", request.CorrelationID,
+			"target_agent_id", request.TargetAgentID,
+			"explicit_target", request.ExplicitTarget,
+		)
 		resolvedTarget, err := g.ensureExplicitTargetReady(ctx, request.TargetAgentID)
 		if err != nil && request.ExplicitTarget {
 			return nil, "", fmt.Errorf("cannot route to @%s: %w", request.TargetAgentID, err)
@@ -1034,6 +1047,18 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 	var guideClassification *guideClassificationClaim
 	if g.router == nil || !g.router.IsDSL(request.Input) {
 		guideClassification = g.beginGuideClassificationClaim(context.Background(), request)
+		if guideClassification == nil {
+			guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_handle_nil",
+				"session_id", request.SessionID,
+				"correlation_id", request.CorrelationID,
+			)
+		}
+	} else {
+		guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_not_started",
+			"reason", "dsl_route",
+			"session_id", request.SessionID,
+			"correlation_id", request.CorrelationID,
+		)
 	}
 
 	domainCtx := g.preclassifyDomain(ctx, request)

@@ -2195,10 +2195,68 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 	if raw == nil {
 		return m, nil
 	}
+	logClaimsUIMessage(raw)
 	if handler, ok := appMsgDispatchRoutes[reflect.TypeOf(raw)]; ok {
 		return handler(m, raw)
 	}
 	return m, m.propagate(raw)
+}
+
+func logClaimsUIMessage(raw tea.Msg) {
+	switch typed := raw.(type) {
+	case msg.ClaimsAgentStatusMsg:
+		uiDebugFileLog().Info("CLAIMS_UI_DEBUG: app_received_claims_agent_status",
+			"agent_id", typed.AgentID,
+			"session_id", typed.SessionID,
+			"cycle_id", typed.CycleID,
+			"active", typed.Active,
+			"reason", typed.Reason,
+			"action_type", typed.ActionType,
+		)
+	case msg.ClaimContextMsg:
+		uiDebugFileLog().Info("CLAIMS_UI_DEBUG: app_received_claim_context",
+			"owner", typed.OwnerAgentID,
+			"session_id", typed.SessionID,
+			"claim_id", typed.ClaimID,
+			"cycle_id", typed.CycleID,
+			"context", typed.Context,
+			"transition", typed.ContextTransition,
+		)
+	case msg.ClaimArtifactAddedMsg:
+		uiDebugFileLog().Info("CLAIMS_UI_DEBUG: app_received_claim_artifact_added",
+			"agent_id", typed.AgentID,
+			"owner", typed.OwnerAgentID,
+			"claim_id", typed.ClaimID,
+			"cycle_id", typed.CycleID,
+			"artifact_id", typed.ArtifactID,
+			"kind", typed.Kind,
+			"parent_row_id", typed.ParentRowID,
+		)
+	case msg.ClaimArtifactCompletedMsg:
+		uiDebugFileLog().Info("CLAIMS_UI_DEBUG: app_received_claim_artifact_completed",
+			"cycle_id", typed.CycleID,
+			"start_artifact_id", typed.StartArtifactID,
+			"outcome", typed.Outcome,
+		)
+	case msg.ClaimResponseTextMsg:
+		uiDebugFileLog().Info("CLAIMS_UI_DEBUG: app_received_claim_response_text",
+			"agent_id", typed.AgentID,
+			"session_id", typed.SessionID,
+			"claim_id", typed.ClaimID,
+			"cycle_id", typed.CycleID,
+			"content_len", len(typed.Content),
+		)
+	case msg.TestamentContextMsg:
+		uiDebugFileLog().Info("CLAIMS_UI_DEBUG: app_received_testament_context",
+			"agent_id", typed.AgentID,
+			"session_id", typed.SessionID,
+			"claim_id", typed.ClaimID,
+			"cycle_id", typed.CycleID,
+			"testament_id", typed.TestamentID,
+			"context", typed.Context,
+			"transition", typed.ContextTransition,
+		)
+	}
 }
 
 // View renders the complete TUI layout using the frame compositor.

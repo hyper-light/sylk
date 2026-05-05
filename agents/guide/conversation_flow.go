@@ -537,6 +537,10 @@ func (m *ConversationFlowManager) SessionClaimsBoard(sessionID string, scope cla
 	if ok && state.claimsBoard != nil {
 		board := state.claimsBoard
 		m.mu.RUnlock()
+		guideFileLog().Info("SESSION_BOARD_DEBUG: existing_session_board",
+			"session_id", trimmedSession,
+			"board_id", board.BoardID(),
+		)
 		return board
 	}
 	m.mu.RUnlock()
@@ -565,6 +569,10 @@ func (m *ConversationFlowManager) SessionClaimsBoard(sessionID string, scope cla
 		// back to constructing a fresh one when nothing has registered.
 		if existing := claims.DefaultSessionBoardRegistry().Lookup(trimmedSession); existing != nil {
 			state.claimsBoard = existing
+			guideFileLog().Info("SESSION_BOARD_DEBUG: adopted_registry_board",
+				"session_id", trimmedSession,
+				"board_id", existing.BoardID(),
+			)
 		} else {
 			fresh := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
 				BoardID:   "session-" + trimmedSession,
@@ -572,6 +580,12 @@ func (m *ConversationFlowManager) SessionClaimsBoard(sessionID string, scope cla
 				TaskID:    "session",
 				Scope:     scope,
 			})
+			guideFileLog().Info("SESSION_BOARD_DEBUG: created_lazy_board",
+				"session_id", trimmedSession,
+				"board_id", fresh.BoardID(),
+				"scope_present", scope != nil,
+				"delta_bus_present", false,
+			)
 			if err := claims.DefaultSessionBoardRegistry().Register(trimmedSession, fresh); err != nil {
 				// Lost the race to a writer with proper wiring; adopt
 				// theirs. If even Lookup returns nil now (unlikely),
@@ -580,11 +594,25 @@ func (m *ConversationFlowManager) SessionClaimsBoard(sessionID string, scope cla
 				// progressing rather than block on a nil board.
 				if existing := claims.DefaultSessionBoardRegistry().Lookup(trimmedSession); existing != nil {
 					state.claimsBoard = existing
+					guideFileLog().Info("SESSION_BOARD_DEBUG: lazy_register_lost_adopted_registry_board",
+						"session_id", trimmedSession,
+						"board_id", existing.BoardID(),
+						"error", err.Error(),
+					)
 				} else {
 					state.claimsBoard = fresh
+					guideFileLog().Info("SESSION_BOARD_DEBUG: lazy_register_lost_using_fresh_board",
+						"session_id", trimmedSession,
+						"board_id", fresh.BoardID(),
+						"error", err.Error(),
+					)
 				}
 			} else {
 				state.claimsBoard = fresh
+				guideFileLog().Info("SESSION_BOARD_DEBUG: lazy_board_registered",
+					"session_id", trimmedSession,
+					"board_id", fresh.BoardID(),
+				)
 			}
 		}
 	}

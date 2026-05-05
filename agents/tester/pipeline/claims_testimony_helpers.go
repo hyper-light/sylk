@@ -146,6 +146,10 @@ func (pt *PipelineTester) processClaimsEntry(ctx context.Context, entry *claims.
 		return pt.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {
+		if agentshared.IsConsultYielded(err) {
+			slog.Info("tester_pipeline_claims_entry_yielded", "delta_key", entry.Delta.DeltaKey())
+			return nil
+		}
 		slog.Error("tester_pipeline_claims_entry_failed", "error", err.Error(), "delta_key", entry.Delta.DeltaKey())
 		acc.Record("error", err.Error())
 		return err

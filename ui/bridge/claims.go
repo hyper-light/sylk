@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -35,6 +36,8 @@ type claimMeta struct {
 	ActionType          string
 	Title               string
 	StreamCorrelationID string
+	SuppressChat        bool
+	UIState             string
 }
 
 type claimContextEvent struct {
@@ -118,6 +121,16 @@ func NewClaimsBridge(
 	}
 }
 
+func (b *ClaimsBridge) debug(event string, fields ...any) {
+	if b == nil {
+		return
+	}
+	args := make([]any, 0, len(fields)+2)
+	args = append(args, "bridge_id", b.id)
+	args = append(args, fields...)
+	guide.DebugFileLog().Info("CLAIMS_UI_DEBUG: "+event, args...)
+}
+
 func (b *ClaimsBridge) Start(program TeaProgram) error {
 	b.mu.Lock()
 	b.program = program
@@ -125,6 +138,12 @@ func (b *ClaimsBridge) Start(program TeaProgram) error {
 		b.prevArtifactSink = claims.SetArtifactProgressSink(b)
 		b.sinkRegistered = true
 	}
+	b.debug("start",
+		"program_present", program != nil,
+		"scope_present", b.scope != nil,
+		"registry_present", b.registry != nil,
+		"bus_present", b.bus != nil,
+	)
 	b.mu.Unlock()
 
 	if b.scope == nil {
@@ -179,6 +198,15 @@ func (b *ClaimsBridge) SwitchSession(sessionID string) {
 	if b.registry != nil && sessionID != "" {
 		board = b.registry.Lookup(sessionID)
 	}
+	boardID := ""
+	if board != nil {
+		boardID = board.BoardID()
+	}
+	b.debug("switch_session_lookup",
+		"session_id", sessionID,
+		"board_present", board != nil,
+		"board_id", boardID,
+	)
 
 	b.mu.Lock()
 	if b.inbox != nil {
@@ -193,6 +221,8 @@ func (b *ClaimsBridge) SwitchSession(sessionID string) {
 	if board != nil {
 		b.startClaimsIntake(sessionID, board)
 		b.replayProjection(sessionID, board.Projection())
+	} else {
+		b.debug("switch_session_no_board", "session_id", sessionID)
 	}
 }
 
@@ -211,8 +241,18 @@ func (b *ClaimsBridge) resetSessionStateLocked() {
 
 func (b *ClaimsBridge) startClaimsIntake(sessionID string, board *claims.ClaimsBoard) {
 	if b.bus == nil || board == nil || strings.TrimSpace(sessionID) == "" {
+		b.debug("intake_skipped",
+			"session_id", sessionID,
+			"bus_present", b.bus != nil,
+			"board_present", board != nil,
+		)
 		return
 	}
+	b.debug("intake_wiring",
+		"session_id", sessionID,
+		"board_id", board.BoardID(),
+		"scope_present", b.scope != nil,
+	)
 	inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
 		AgentID:      claimsBridgeAgentID,
 		SessionID:    sessionID,
@@ -225,11 +265,18 @@ func (b *ClaimsBridge) startClaimsIntake(sessionID string, board *claims.ClaimsB
 		Factory:      nil,
 	})
 	if inbox == nil {
+		b.debug("intake_nil", "session_id", sessionID, "board_id", board.BoardID())
 		return
 	}
 	b.mu.Lock()
 	if b.activeSession != sessionID || b.board != board {
+		activeSession := b.activeSession
 		b.mu.Unlock()
+		b.debug("intake_stale",
+			"session_id", sessionID,
+			"active_session", activeSession,
+			"board_id", board.BoardID(),
+		)
 		_ = inbox.Close()
 		return
 	}
@@ -241,6 +288,11 @@ func (b *ClaimsBridge) startClaimsIntake(sessionID string, board *claims.ClaimsB
 			"session_id", sessionID,
 			"error", err.Error(),
 		)
+		b.debug("intake_start_failed",
+			"session_id", sessionID,
+			"board_id", board.BoardID(),
+			"error", err.Error(),
+		)
 		b.mu.Lock()
 		if b.inbox == inbox {
 			b.inbox = nil
@@ -249,16 +301,39 @@ func (b *ClaimsBridge) startClaimsIntake(sessionID string, board *claims.ClaimsB
 		_ = inbox.Close()
 		return
 	}
+	b.debug("intake_started", "session_id", sessionID, "board_id", board.BoardID())
 }
 
 func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.GraphEntryPoint) error {
 	if entry == nil || entry.Delta == nil {
+		b.debug("entry_drop_nil")
 		return nil
 	}
 	board, sessionID := b.currentBoard()
 	if board == nil || sessionID == "" || entry.Delta.DeltaSessionID() != sessionID {
+		boardID := ""
+		if board != nil {
+			boardID = board.BoardID()
+		}
+		b.debug("entry_drop_session",
+			"delta_kind", entry.Delta.DeltaKind(),
+			"delta_key", entry.Delta.DeltaKey(),
+			"delta_session", entry.Delta.DeltaSessionID(),
+			"active_session", sessionID,
+			"board_present", board != nil,
+			"board_id", boardID,
+		)
 		return nil
 	}
+	b.debug("entry_received",
+		"delta_kind", entry.Delta.DeltaKind(),
+		"delta_key", entry.Delta.DeltaKey(),
+		"delta_session", entry.Delta.DeltaSessionID(),
+		"board_id", board.BoardID(),
+		"node_claim", entry.Node.Claim != nil,
+		"node_testament", entry.Node.Testament != nil,
+		"node_validation", entry.Node.Validation != nil,
+	)
 	b.emitCounterSnapshot(sessionID, board)
 
 	switch delta := entry.Delta.(type) {
@@ -396,6 +471,7 @@ func (b *ClaimsBridge) emitCounterSnapshot(sessionID string, board *claims.Claim
 
 func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 	if c == nil || strings.TrimSpace(c.ID) == "" {
+		b.debug("claim_created_drop_nil", "session_id", sessionID)
 		return
 	}
 
@@ -409,6 +485,12 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 	b.mu.Lock()
 	if existing := b.claimMeta[c.ID]; existing.ClaimID != "" && b.resolver.CycleForClaim(c.ID) != "" {
 		b.mu.Unlock()
+		b.debug("claim_created_duplicate",
+			"session_id", sessionID,
+			"claim_id", c.ID,
+			"cycle_id", existing.CycleID,
+			"owner", existing.OwnerAgentID,
+		)
 		return
 	}
 	outcome := b.resolver.onClaimCreated(c.ID, ownerForResolver, subject, causedBy, handoffFrom)
@@ -423,6 +505,9 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 	if cycleOwner == "" {
 		cycleOwner = ownerForResolver
 	}
+	suppressChat := claimSuppressChat(c)
+	uiState := claimInitialUIState(c)
+	panelReason := claimPanelReason(c)
 	meta := claimMeta{
 		ClaimID:             c.ID,
 		SessionID:           sessionID,
@@ -434,7 +519,9 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 		IssuerAgentID:       issuer,
 		ActionType:          string(c.ActionType),
 		Title:               strings.TrimSpace(c.Title),
-		StreamCorrelationID: claimStreamCorrelation(c),
+		StreamCorrelationID: claimUIStreamCorrelation(c),
+		SuppressChat:        suppressChat,
+		UIState:             uiState,
 	}
 	b.claimMeta[c.ID] = meta
 
@@ -442,13 +529,27 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 		toEmit = append(toEmit, claimsAgentClosedMsg(sessionID, outcome.PredecessorClosed, ""))
 	}
 	if outcome.CycleOpened != nil {
+		b.debug("claim_cycle_open",
+			"session_id", sessionID,
+			"claim_id", c.ID,
+			"cycle_id", outcome.CycleOpened.CycleID,
+			"owner", outcome.CycleOpened.OwnerAgentID,
+			"subject", subject,
+			"issuer", issuer,
+			"title", strings.TrimSpace(c.Title),
+			"action_type", string(c.ActionType),
+			"suppress_chat", suppressChat,
+			"ui_state", uiState,
+		)
 		toEmit = append(toEmit, msg.ClaimsAgentStatusMsg{
 			AgentID:             outcome.CycleOpened.OwnerAgentID,
 			SessionID:           sessionID,
 			Active:              true,
 			CycleID:             outcome.CycleOpened.CycleID,
 			OpenCount:           len(outcome.CycleOpened.openClaims),
-			Reason:              strings.TrimSpace(c.Title),
+			Reason:              panelReason,
+			State:               uiState,
+			SuppressChat:        suppressChat,
 			ActionType:          string(c.ActionType),
 			StreamCorrelationID: meta.StreamCorrelationID,
 		})
@@ -465,6 +566,17 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 	for _, m := range toEmit {
 		b.enqueue(m)
 	}
+	if len(toEmit) == 0 {
+		b.debug("claim_created_no_emit",
+			"session_id", sessionID,
+			"claim_id", c.ID,
+			"cycle_id", cycleID,
+			"owner", cycleOwner,
+			"subject", subject,
+			"caused_by", causedBy,
+			"handoff_from", handoffFrom,
+		)
+	}
 }
 
 func (b *ClaimsBridge) handleClaimClosed(claimID, outcome string) {
@@ -473,14 +585,31 @@ func (b *ClaimsBridge) handleClaimClosed(claimID, outcome string) {
 		return
 	}
 	var closeMsg *msg.ClaimsAgentStatusMsg
+	var suppressChat bool
+	var uiState string
 	b.mu.Lock()
+	if meta := b.claimMeta[claimID]; meta.ClaimID != "" {
+		suppressChat = meta.SuppressChat
+		uiState = meta.UIState
+	}
 	if st := b.resolver.onClaimClosed(claimID); st != nil {
 		m := claimsAgentClosedMsg(b.activeSession, st, outcome)
+		m.SuppressChat = suppressChat
+		m.State = uiState
 		closeMsg = &m
 	}
 	b.mu.Unlock()
 	if closeMsg != nil {
+		b.debug("claim_cycle_close",
+			"session_id", closeMsg.SessionID,
+			"claim_id", claimID,
+			"cycle_id", closeMsg.CycleID,
+			"owner", closeMsg.AgentID,
+			"outcome", outcome,
+		)
 		b.enqueue(*closeMsg)
+	} else {
+		b.debug("claim_close_no_cycle", "claim_id", claimID, "outcome", outcome)
 	}
 }
 
@@ -505,6 +634,7 @@ func (b *ClaimsBridge) handleClaimContext(sessionID string, event claimContextEv
 	b.mu.Lock()
 	meta := b.metaForClaimLocked(claimID)
 	if meta.CycleID != "" {
+		state := firstNonBlank(b.latestStateByClaim[claimID], claimContextUIState(meta, event.Context))
 		out = &msg.ClaimContextMsg{
 			SessionID:         sessionID,
 			ClaimID:           claimID,
@@ -512,12 +642,30 @@ func (b *ClaimsBridge) handleClaimContext(sessionID string, event claimContextEv
 			CycleID:           meta.CycleID,
 			Context:           event.Context,
 			ContextTransition: event.ContextTransition,
-			State:             b.latestStateByClaim[claimID],
+			SuppressChat:      meta.SuppressChat,
+			State:             state,
 		}
 	}
 	b.mu.Unlock()
 	if out != nil {
+		b.debug("claim_context_emit",
+			"session_id", sessionID,
+			"claim_id", claimID,
+			"cycle_id", out.CycleID,
+			"owner", out.OwnerAgentID,
+			"context", event.Context,
+			"transition", event.ContextTransition,
+			"suppress_chat", out.SuppressChat,
+			"state", out.State,
+		)
 		b.enqueue(*out)
+	} else {
+		b.debug("claim_context_drop_no_cycle",
+			"session_id", sessionID,
+			"claim_id", claimID,
+			"context", event.Context,
+			"transition", event.ContextTransition,
+		)
 	}
 }
 
@@ -674,6 +822,7 @@ func (b *ClaimsBridge) claimArtifactAddedMsgLocked(sessionID, claimID string, ar
 		Reference:      strings.TrimSpace(art.Reference),
 		Metadata:       cloneMetadata(art.Metadata),
 		CreatedAt:      art.Created,
+		SuppressChat:   meta.SuppressChat,
 	}
 }
 
@@ -694,6 +843,10 @@ func (b *ClaimsBridge) routeCompletedArtifactLocked(sessionID string, art *claim
 	} else {
 		cycleID = b.resolver.CycleForArtifact(startID)
 	}
+	suppressChat := false
+	if claimID := b.artifactClaim[startID]; claimID != "" {
+		suppressChat = b.metaForClaimLocked(claimID).SuppressChat
+	}
 	out := []any{msg.ClaimArtifactCompletedMsg{
 		StartArtifactID: startID,
 		CycleID:         cycleID,
@@ -702,6 +855,7 @@ func (b *ClaimsBridge) routeCompletedArtifactLocked(sessionID string, art *claim
 		Summary:         artifactSummary(art),
 		Metadata:        cloneMetadata(art.Metadata),
 		CompletedAt:     nonZeroTime(art.Created),
+		SuppressChat:    suppressChat,
 	}}
 	if drained && cycle != nil {
 		out = append(out, claimsAgentClosedMsg(sessionID, cycle, ""))
@@ -725,12 +879,14 @@ func (b *ClaimsBridge) completePeerInvocationForClaim(claimID, outcome, summary 
 			if cycle != nil {
 				cycleID = cycle.CycleID
 			}
+			suppressChat := b.metaForClaimLocked(claimID).SuppressChat
 			out = append(out, msg.ClaimArtifactCompletedMsg{
 				StartArtifactID: startID,
 				CycleID:         cycleID,
 				Outcome:         firstNonBlank(outcome, "success"),
 				Summary:         summary,
 				CompletedAt:     time.Now().UTC(),
+				SuppressChat:    suppressChat,
 			})
 			if drained && cycle != nil {
 				out = append(out, claimsAgentClosedMsg(b.activeSession, cycle, ""))
@@ -763,6 +919,7 @@ func (b *ClaimsBridge) handleAgentStateArtifactLocked(sessionID, claimID string,
 		CycleID:      meta.CycleID,
 		Context:      detail,
 		State:        state,
+		SuppressChat: meta.SuppressChat,
 	}}
 }
 
@@ -779,12 +936,13 @@ func (b *ClaimsBridge) claimResponseTextMsgLocked(sessionID, claimID string, art
 		return nil
 	}
 	return &msg.ClaimResponseTextMsg{
-		SessionID: sessionID,
-		CycleID:   meta.CycleID,
-		ClaimID:   claimID,
-		AgentID:   firstNonBlank(strings.TrimSpace(art.AgentID), meta.OwnerAgentID),
-		Content:   content,
-		CreatedAt: nonZeroTime(art.Created),
+		SessionID:    sessionID,
+		CycleID:      meta.CycleID,
+		ClaimID:      claimID,
+		AgentID:      firstNonBlank(strings.TrimSpace(art.AgentID), meta.OwnerAgentID),
+		Content:      content,
+		CreatedAt:    nonZeroTime(art.Created),
+		SuppressChat: meta.SuppressChat,
 	}
 }
 
@@ -806,8 +964,46 @@ func (b *ClaimsBridge) metaForClaimLocked(claimID string) claimMeta {
 	if meta.SessionID == "" {
 		meta.SessionID = b.activeSession
 	}
+	meta = b.enrichMetaFromProjectionLocked(claimID, meta)
 	if claimID != "" {
 		b.claimMeta[claimID] = meta
+	}
+	return meta
+}
+
+func (b *ClaimsBridge) enrichMetaFromProjectionLocked(claimID string, meta claimMeta) claimMeta {
+	if strings.TrimSpace(claimID) == "" || b.board == nil {
+		return meta
+	}
+	c := findClaim(b.board.Projection(), claimID)
+	if c == nil {
+		return meta
+	}
+	if meta.OwnerAgentID == "" {
+		meta.OwnerAgentID = cycleOwnerForClaim(c)
+		meta.OwnerAgentType = agentTypeFromID(meta.OwnerAgentID)
+	}
+	if meta.TargetAgentID == "" {
+		meta.TargetAgentID = strings.TrimSpace(claims.SubjectAgentID(c.Relations))
+		meta.TargetAgentType = agentTypeFromID(meta.TargetAgentID)
+	}
+	if meta.IssuerAgentID == "" {
+		meta.IssuerAgentID = strings.TrimSpace(claims.IssuerAgentID(c.Relations))
+	}
+	if meta.ActionType == "" {
+		meta.ActionType = string(c.ActionType)
+	}
+	if meta.Title == "" {
+		meta.Title = strings.TrimSpace(c.Title)
+	}
+	if meta.StreamCorrelationID == "" {
+		meta.StreamCorrelationID = claimUIStreamCorrelation(c)
+	}
+	if claimSuppressChat(c) {
+		meta.SuppressChat = true
+	}
+	if meta.UIState == "" {
+		meta.UIState = claimInitialUIState(c)
 	}
 	return meta
 }
@@ -1011,6 +1207,73 @@ func claimStreamCorrelation(c *claims.Claim) string {
 	return ""
 }
 
+func claimUIStreamCorrelation(c *claims.Claim) string {
+	if claimHasTag(c, claimTagGuideClassification) {
+		return ""
+	}
+	return claimStreamCorrelation(c)
+}
+
+const (
+	claimTagGuideClassification = "ui:guide_classification"
+	claimTagAgentPanelOnly      = "ui_surface:agent_panel"
+)
+
+func claimSuppressChat(c *claims.Claim) bool {
+	if c == nil {
+		return false
+	}
+	return claimHasTag(c, claimTagAgentPanelOnly)
+}
+
+func claimInitialUIState(c *claims.Claim) string {
+	if claimHasTag(c, claimTagGuideClassification) {
+		return "classifying"
+	}
+	return ""
+}
+
+func claimPanelReason(c *claims.Claim) string {
+	if c == nil {
+		return ""
+	}
+	if claimHasTag(c, claimTagGuideClassification) {
+		return firstNonBlank(strings.TrimSpace(c.Context), strings.TrimSpace(c.Title), "Classifying request")
+	}
+	return strings.TrimSpace(c.Title)
+}
+
+func claimContextUIState(meta claimMeta, context string) string {
+	if meta.OwnerAgentID != "guide" || meta.UIState != "classifying" {
+		return meta.UIState
+	}
+	lower := strings.ToLower(strings.TrimSpace(context))
+	switch {
+	case strings.Contains(lower, "request forwarded"), strings.Contains(lower, "routing to "):
+		return "routing"
+	case strings.Contains(lower, "failed"), strings.Contains(lower, "error"):
+		return "errored"
+	default:
+		return firstNonBlank(meta.UIState, "classifying")
+	}
+}
+
+func claimHasTag(c *claims.Claim, want string) bool {
+	if c == nil {
+		return false
+	}
+	want = strings.TrimSpace(want)
+	if want == "" {
+		return false
+	}
+	for _, tag := range c.Tags {
+		if strings.TrimSpace(tag) == want {
+			return true
+		}
+	}
+	return false
+}
+
 func isVisibleStartedArtifactKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
 	case "tool_started", "consult_started", "challenge_started", "guardian_check_started":
@@ -1164,10 +1427,12 @@ func firstNonBlank(values ...string) string {
 func (b *ClaimsBridge) enqueue(m any) {
 	select {
 	case b.outbox <- m:
+		b.debug("enqueue", "msg_type", fmt.Sprintf("%T", m))
 	default:
 		total := b.dropped.Add(1)
 		slog.Warn("claims bridge drop: outbox full",
 			"bridge_id", b.id,
 			"total_dropped", total)
+		b.debug("enqueue_drop", "msg_type", fmt.Sprintf("%T", m), "total_dropped", total)
 	}
 }

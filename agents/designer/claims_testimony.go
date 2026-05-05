@@ -221,6 +221,10 @@ func (d *Designer) processClaimsEntry(ctx context.Context, entry *claims.GraphEn
 		return d.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {
+		if shared.IsConsultYielded(err) {
+			slog.Info("designer_claims_entry_yielded", "delta_key", entry.Delta.DeltaKey())
+			return nil
+		}
 		slog.Error("designer_claims_entry_failed", "error", err.Error(), "delta_key", entry.Delta.DeltaKey())
 		acc.Record("error", err.Error())
 		return err

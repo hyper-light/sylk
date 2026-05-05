@@ -692,6 +692,29 @@ func TestTimedToolCall_Error(t *testing.T) {
 	}
 }
 
+func TestTimedToolCall_ConsultYieldDoesNotEmitFailureComplete(t *testing.T) {
+	var events []ToolCallEvent
+	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+
+	call := providers.ToolCall{ID: "consult-yield", Name: "consult_peer", Arguments: `{"target_agent_type":"librarian"}`}
+	_, err := TimedToolCall(ctx, "architect", call, func() (string, error) {
+		return "", ErrConsultYielded
+	})
+
+	if !errors.Is(err, ErrConsultYielded) {
+		t.Fatalf("expected ErrConsultYielded, got %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected only ToolCallStart for yielded consult, got %d events: %#v", len(events), events)
+	}
+	if events[0].Phase != ToolCallStart {
+		t.Fatalf("event phase = %v, want ToolCallStart", events[0].Phase)
+	}
+}
+
 func TestTimedToolCall_PipelineHandoffIsControlOutcome(t *testing.T) {
 	var events []ToolCallEvent
 	ctx := WithToolCallEmitter(context.Background(), func(ev ToolCallEvent) error { events = append(events, ev); return nil })

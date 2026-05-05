@@ -5627,6 +5627,9 @@ func (m *Model) handleClaimsAgentStatus(ev msg.ClaimsAgentStatusMsg) tea.Cmd {
 	if m.claimRows == nil {
 		m.claimRows = newClaimRowIndex()
 	}
+	if ev.SuppressChat {
+		return nil
+	}
 	cycleID := strings.TrimSpace(ev.CycleID)
 	if cycleID == "" {
 		return nil
@@ -5761,6 +5764,9 @@ func (m *Model) handleClaimArtifactAdded(ev msg.ClaimArtifactAddedMsg) tea.Cmd {
 	if m.claimRows == nil {
 		m.claimRows = newClaimRowIndex()
 	}
+	if ev.SuppressChat {
+		return nil
+	}
 	if ev.Kind == claims.ArtifactKindAgentState {
 		// State trace: record on the cycle row's metadata if needed,
 		// but never render as a row — the Context field is the
@@ -5775,12 +5781,13 @@ func (m *Model) handleClaimArtifactAdded(ev msg.ClaimArtifactAddedMsg) tea.Cmd {
 	// delivery path.
 	if ev.Kind == claims.ArtifactKindResponseText {
 		return m.handleClaimResponseText(msg.ClaimResponseTextMsg{
-			SessionID: "",
-			CycleID:   ev.CycleID,
-			ClaimID:   ev.ClaimID,
-			AgentID:   ev.AgentID,
-			Content:   ev.Reference,
-			CreatedAt: ev.CreatedAt,
+			SessionID:    "",
+			CycleID:      ev.CycleID,
+			ClaimID:      ev.ClaimID,
+			AgentID:      ev.AgentID,
+			Content:      ev.Reference,
+			CreatedAt:    ev.CreatedAt,
+			SuppressChat: ev.SuppressChat,
 		})
 	}
 	// Defensive: the bridge already filters telemetry kinds out of
@@ -5841,6 +5848,9 @@ func (m *Model) handleClaimArtifactCompleted(ev msg.ClaimArtifactCompletedMsg) t
 	if m.claimRows == nil {
 		m.claimRows = newClaimRowIndex()
 	}
+	if ev.SuppressChat {
+		return nil
+	}
 	status := ArtifactRowStatusSuccess
 	switch ev.Outcome {
 	case "success":
@@ -5884,6 +5894,9 @@ func (m *Model) handleClaimContext(ev msg.ClaimContextMsg) tea.Cmd {
 	if m.claimRows == nil {
 		m.claimRows = newClaimRowIndex()
 	}
+	if ev.SuppressChat {
+		return nil
+	}
 	r := m.claimRows.updateClaimContext(ev.CycleID, ev.Context, ev.ContextTransition)
 	if r != nil {
 		if r.OwnerAgentID == "" && ev.OwnerAgentID != "" {
@@ -5907,9 +5920,19 @@ func (m *Model) handleClaimContext(ev msg.ClaimContextMsg) tea.Cmd {
 // answer either leaks as a fake "tool" row (when it falls back
 // through projectClaimArtifactToHistory) or is invisible entirely.
 func (m *Model) handleClaimResponseText(ev msg.ClaimResponseTextMsg) tea.Cmd {
+	if ev.SuppressChat {
+		return nil
+	}
 	cycleID := strings.TrimSpace(ev.CycleID)
+	claimID := strings.TrimSpace(ev.ClaimID)
 	content := strings.TrimSpace(ev.Content)
 	if cycleID == "" || content == "" {
+		return nil
+	}
+	if claimID != "" && claimID != cycleID {
+		if m.applyChildClaimResponseTextToHistory(cycleID, claimID, ev.AgentID, content) {
+			m.viewDirty = true
+		}
 		return nil
 	}
 	idx := m.historyIndexForCorrelation(cycleID)
