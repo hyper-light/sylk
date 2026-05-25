@@ -117,8 +117,10 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme, cache *codeBlockC
 	}
 
 	// Phase 2: Collapsed summary (content arrived after thinking).
+	hasContent := strings.TrimSpace(entry.Content) != ""
+	terminalActivity := !entry.Streaming && hasContent && strings.EqualFold(strings.TrimSpace(entry.ThinkingStatus), "Complete")
 	var summaryLines []string
-	if entry.ThinkingElapsed > 0 {
+	if entry.ThinkingElapsed > 0 && !terminalActivity {
 		summaryStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted).Italic(true)
 		summaryText := fmt.Sprintf("%s thought for %.1fs", thinkingSummaryGlyph, entry.ThinkingElapsed.Seconds())
 		summaryLines = wrapLine(summaryText, width, summaryStyle)
@@ -153,13 +155,16 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme, cache *codeBlockC
 	// (parent-engineer bug: no animation, gray text, no timer while
 	// inter-agent children were still pending).
 	var trailingActivityLines []string
-	if entry.Streaming && strings.TrimSpace(entry.Content) != "" {
+	if hasContent && (entry.Streaming || terminalActivity) {
 		status := strings.TrimSpace(entry.ThinkingStatus)
 		spinnerAndTimer := strings.TrimSpace(entry.ThinkingText)
 		if status != "" || spinnerAndTimer != "" {
 			color := th.Palette.Info
 			if entry.ThinkingColor != "" {
 				color = lipgloss.Color(entry.ThinkingColor)
+			}
+			if terminalActivity {
+				color = th.Palette.Muted
 			}
 			activityStyle := lipgloss.NewStyle().Foreground(color).Italic(true)
 

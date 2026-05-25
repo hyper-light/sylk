@@ -25,7 +25,7 @@ For planning, design, or architecture discussions:
 - Gather requirements and clarify constraints through natural conversation.
 - On the first substantive planning, design, or implementation turn on a new problem, start by consulting the most relevant knowledge agent with the narrowest question that can materially reduce the next uncertainty.
 - Continue consulting as the conversation unfolds whenever the user adds material new information, constraints, preferences, scope changes, or technical direction.
-- Prefer repeated targeted consults over one broad consult that tries to answer the whole problem at once.
+- Prefer targeted consults over one broad consult, but do not repeat a fresh target/query unless new information creates a material gap.
 - Prefer consulting the knowledge agents over asking the user questions that you can resolve from codebase reality, historical precedent, or stronger architectural research.
 - Treat Librarian, Archivalist, and Academic as your standing discussion-time evidence network, but use only the subset that materially answers the current unresolved question.
 - Re-evaluate Academic research depth as the conversation sharpens. Start with `minimal` or `quick` for narrow validation, and escalate only when the remaining uncertainty or stakes justify broader corroboration.

@@ -210,8 +210,10 @@ func renderStreamingEntryFull(entry *ChatEntry, width int, th *theme.Theme, cach
 	timestamp := entry.Timestamp.Format(badgeTimestampFormat)
 	header := truncateVisible(badge+" "+lipgloss.NewStyle().Foreground(th.Palette.Muted).Render(timestamp), width)
 
+	hasContent := strings.TrimSpace(entry.Content) != ""
+	terminalActivity := !entry.Streaming && hasContent && strings.EqualFold(strings.TrimSpace(entry.ThinkingStatus), "Complete")
 	var summaryLines []string
-	if entry.ThinkingElapsed > 0 {
+	if entry.ThinkingElapsed > 0 && !terminalActivity {
 		summaryStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted).Italic(true)
 		summaryText := fmt.Sprintf("%s thought for %.1fs", thinkingSummaryGlyph, entry.ThinkingElapsed.Seconds())
 		summaryLines = wrapLine(summaryText, width, summaryStyle)
@@ -228,14 +230,20 @@ func renderStreamingEntryFull(entry *ChatEntry, width int, th *theme.Theme, cach
 	// (e.g. multi-turn planning protocol where no text chunks arrive for
 	// minutes while tools execute).
 	var statusLines []string
-	if entry.Streaming && entry.ThinkingText != "" {
+	if (entry.Streaming || terminalActivity) && (entry.ThinkingText != "" || entry.ThinkingStatus != "") {
 		color := th.Palette.Info
 		if entry.ThinkingColor != "" {
 			color = lipgloss.Color(entry.ThinkingColor)
 		}
+		if terminalActivity {
+			color = th.Palette.Muted
+		}
 		statusStyle := lipgloss.NewStyle().Foreground(color).Italic(true)
-		statusText := normalizeThinkingLine(entry.ThinkingText)
-		if status := normalizeThinkingLine(entry.ThinkingStatus); status != "" {
+		statusText := strings.TrimSpace(entry.ThinkingText)
+		if statusText == "" {
+			statusText = thinkingSummaryGlyph
+		}
+		if status := strings.TrimSpace(entry.ThinkingStatus); status != "" {
 			statusText += "  " + status
 		}
 		statusLines = append(statusLines, "")

@@ -264,6 +264,7 @@ type planInput struct {
 	Constraints      []string              `json:"constraints,omitempty"`
 	Requirements     *Requirements         `json:"requirements,omitempty"`
 	Patterns         []string              `json:"patterns,omitempty"`
+	Evidence         []*PlanEvidence        `json:"evidence,omitempty"`
 	Architecture     *SolutionArchitecture `json:"architecture,omitempty"`
 	MaxTasksPerAgent int                   `json:"max_tasks_per_agent,omitempty"`
 	AllowParallel    bool                  `json:"allow_parallel,omitempty"`
@@ -319,6 +320,7 @@ func planSkill(a *Architect) *skills.Skill {
 			"scope": {Type: "string", Description: "Scope of the design"},
 		}, false).
 		ArrayParam("patterns", "Existing patterns to incorporate (for design)", "string", false).
+		ArrayParam("evidence", "Normalized consultation evidence to carry into this planning phase", "object", false).
 		ObjectParam("architecture", "Architecture to generate tasks from (for generate_tasks)", map[string]*skills.Property{
 			"name":        {Type: "string", Description: "Architecture name"},
 			"description": {Type: "string", Description: "Architecture description"},
@@ -422,6 +424,7 @@ func handlePlanSkillStart(a *Architect, ctx context.Context, p *planInput) (any,
 	}
 	req = a.enrichPlanningRequest(req)
 	plan := newProtocolPlan(req, requestCorrelationID)
+	a.drainStagedEvidenceIntoPlan(plan)
 	if err := a.persistPlanState(plan); err != nil {
 		return nil, err
 	}
@@ -496,15 +499,18 @@ func handlePlanSkillAnalyze(a *Architect, ctx context.Context, p *planInput) (an
 	if strings.TrimSpace(p.Query) == "" {
 		return nil, fmt.Errorf("query is required for action=analyze")
 	}
-	if plan, ok := a.resolveProtocolPlan(p.PlanID); ok &&
-		hasReachedPlanPhase(plan.SM().State(), PlanStatusAnalyzing) &&
-		plan.Requirements != nil {
-		return map[string]any{
-			"requirements": plan.Requirements,
-			"analysis":     requirementsAnalysisSummary(plan.Requirements),
-			"plan_status":  plan.SM().State().String(),
-			"reused":       true,
-		}, nil
+	plan, hasPlan := a.resolveProtocolPlan(p.PlanID)
+	if hasPlan {
+		a.attachPlanInputEvidence(ctx, plan, p.Evidence)
+		if hasReachedPlanPhase(plan.SM().State(), PlanStatusAnalyzing) &&
+			plan.Requirements != nil {
+			return map[string]any{
+				"requirements": plan.Requirements,
+				"analysis":     requirementsAnalysisSummary(plan.Requirements),
+				"plan_status":  plan.SM().State().String(),
+				"reused":       true,
+			}, nil
+		}
 	}
 	reqParams := map[string]any{}
 	if p.Scope != "" {
@@ -516,15 +522,23 @@ func handlePlanSkillAnalyze(a *Architect, ctx context.Context, p *planInput) (an
 	if len(p.Constraints) > 0 {
 		reqParams["constraints"] = p.Constraints
 	}
+	if hasPlan {
+		if digest := planningEvidenceDigest(plan, p.Query); len(digest) > 0 {
+			reqParams["consultation_evidence"] = digest
+		}
+	}
 	requirements, err := a.analyzeRequirements(ctx, p.Query, reqParams)
 	if err != nil {
 		return nil, err
+	}
+	if hasPlan {
+		attachRequirementsEvidenceDigest(requirements, planningEvidenceDigest(plan, p.Query))
 	}
 	result := map[string]any{
 		"requirements": requirements,
 		"analysis":     requirementsAnalysisSummary(requirements),
 	}
-	if plan, ok := a.resolveProtocolPlan(p.PlanID); ok {
+	if hasPlan {
 		if err := a.advancePlan(ctx, plan, PlanStatusAnalyzing, func() {
 			plan.Requirements = requirements
 		}); err != nil {
@@ -540,6 +554,7 @@ func handlePlanSkillDesign(a *Architect, ctx context.Context, p *planInput) (any
 	requirements := p.Requirements
 	var codebasePatterns *CodebasePatterns
 	if hasPlan {
+		a.attachPlanInputEvidence(ctx, plan, p.Evidence)
 		if hasReachedPlanPhase(plan.SM().State(), PlanStatusDesigning) &&
 			plan.Architecture != nil {
 			return map[string]any{
@@ -551,9 +566,16 @@ func handlePlanSkillDesign(a *Architect, ctx context.Context, p *planInput) (any
 		}
 		requirements = plan.Requirements
 		codebasePatterns = plan.CodebasePatterns
+		if codebasePatterns == nil {
+			codebasePatterns = extractLibrarianPatterns(plan)
+			plan.CodebasePatterns = codebasePatterns
+		}
 	}
 	if requirements == nil {
 		return nil, fmt.Errorf("requirements is required for action=design")
+	}
+	if hasPlan {
+		attachRequirementsEvidenceDigest(requirements, planningEvidenceDigest(plan, requirements.Query))
 	}
 	if codebasePatterns == nil && len(p.Patterns) > 0 {
 		codebasePatterns = &CodebasePatterns{
@@ -563,10 +585,17 @@ func handlePlanSkillDesign(a *Architect, ctx context.Context, p *planInput) (any
 			codebasePatterns.Patterns[i] = PatternInfo{Name: pat}
 		}
 	}
-	architecture, err := a.designArchitecture(ctx, requirements, codebasePatterns)
-	if err != nil {
-		return nil, err
+	var architecture *SolutionArchitecture
+	var err error
+	if isMinimalPlanningPath(requirements) {
+		architecture = minimalArchitectureFromRequirements(requirements)
+	} else {
+		architecture, err = a.designArchitecture(ctx, requirements, codebasePatterns)
+		if err != nil {
+			return nil, err
+		}
 	}
+	attachArchitectureEvidenceDigest(architecture, evidenceDigestFromRequirements(requirements))
 	result := map[string]any{
 		"architecture": architecture,
 		"summary":      architectureSummary(architecture),
@@ -590,6 +619,7 @@ func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInpu
 		AllowParallel:    p.AllowParallel,
 	}
 	if hasPlan {
+		a.attachPlanInputEvidence(ctx, plan, p.Evidence)
 		if hasReachedPlanPhase(plan.SM().State(), PlanStatusGenerating) &&
 			len(plan.Tasks) > 0 && plan.Workflow != nil {
 			return map[string]any{
@@ -610,12 +640,21 @@ func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInpu
 	if architecture == nil {
 		return nil, fmt.Errorf("architecture is required for action=generate_tasks")
 	}
+	if hasPlan {
+		attachArchitectureEvidenceDigest(architecture, planningEvidenceDigest(plan, architecture.Description))
+	}
 	if constraints.MaxTasksPerAgent == 0 {
 		constraints.MaxTasksPerAgent = 5
 	}
-	tasks, err := a.generateAtomicTasks(ctx, architecture, constraints)
-	if err != nil {
-		return nil, err
+	var tasks []*AtomicTask
+	var err error
+	if isMinimalArchitecture(architecture) {
+		tasks = minimalTasksFromArchitecture(architecture)
+	} else {
+		tasks, err = a.generateAtomicTasks(ctx, architecture, constraints)
+		if err != nil {
+			return nil, err
+		}
 	}
 	result := map[string]any{
 		"tasks":   tasks,

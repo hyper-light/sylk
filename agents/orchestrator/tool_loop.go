@@ -154,12 +154,12 @@ func (o *Orchestrator) applyToolCalls(
 		if execResult.ToolDefsDirty {
 			o.toolDefsDirty = true
 		}
+		if execResult.Yielded() {
+			yielded = true
+			return errCount, rerouted, delegated, delegatedMessage, yielded
+		}
 		isError := false
 		if err != nil {
-			if shared.IsConsultYielded(err) {
-				yielded = true
-				return errCount, rerouted, delegated, delegatedMessage, yielded
-			}
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`

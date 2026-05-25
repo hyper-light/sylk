@@ -2219,6 +2219,7 @@ func logClaimsUIMessage(raw tea.Msg) {
 			"session_id", typed.SessionID,
 			"claim_id", typed.ClaimID,
 			"cycle_id", typed.CycleID,
+			"parent_row_id", typed.ParentRowID,
 			"context", typed.Context,
 			"transition", typed.ContextTransition,
 		)
@@ -2244,6 +2245,7 @@ func logClaimsUIMessage(raw tea.Msg) {
 			"session_id", typed.SessionID,
 			"claim_id", typed.ClaimID,
 			"cycle_id", typed.CycleID,
+			"parent_row_id", typed.ParentRowID,
 			"content_len", len(typed.Content),
 		)
 	case msg.TestamentContextMsg:

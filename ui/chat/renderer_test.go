@@ -2149,13 +2149,13 @@ func TestCapInterAgentChildRows_PinsFailedRowsToVisibleWindow(t *testing.T) {
 	failedRow := interAgentRenderedChildRow{lines: []string{"OLD-FAILED-CALL"}, failed: true}
 	successRow := interAgentRenderedChildRow{lines: []string{"plain"}}
 	rows := []interAgentRenderedChildRow{
-		successRow,        // 0 — old success, gets hidden
-		failedRow,         // 1 — old failure, MUST stay visible
-		successRow,        // 2 — old success, gets hidden
-		successRow,        // 3 — recent success
-		successRow,        // 4 — recent success
-		successRow,        // 5 — recent success
-		successRow,        // 6 — recent success
+		successRow, // 0 — old success, gets hidden
+		failedRow,  // 1 — old failure, MUST stay visible
+		successRow, // 2 — old success, gets hidden
+		successRow, // 3 — recent success
+		successRow, // 4 — recent success
+		successRow, // 5 — recent success
+		successRow, // 6 — recent success
 	}
 
 	out := capInterAgentChildRows(rows, 80, th, false, nil, nil)
@@ -2227,11 +2227,11 @@ func TestRenderInterAgentOverflowControlLabel_AnnotatesHiddenFailures(t *testing
 // through..." message), the Phase 2c trailing activity line must
 // render with:
 //
-//   1. An animated spinner frame (from entry.ThinkingText, which
-//      tickThinking updates each frame with spinner+elapsed).
-//   2. An elapsed timer (part of ThinkingText).
-//   3. The animated thinking color (entry.ThinkingColor), NOT the
-//      muted palette.
+//  1. An animated spinner frame (from entry.ThinkingText, which
+//     tickThinking updates each frame with spinner+elapsed).
+//  2. An elapsed timer (part of ThinkingText).
+//  3. The animated thinking color (entry.ThinkingColor), NOT the
+//     muted palette.
 //
 // Pre-fix behavior rendered the line as a static "<summary-glyph>
 // <status>" in the muted palette — the parent agent looked idle while
@@ -2340,5 +2340,32 @@ func TestRenderEntry_Phase2cTrailingActivity_HiddenWhenNotStreaming(t *testing.T
 		if strings.Contains(stripANSITest(line), "Working...") {
 			t.Fatalf("trailing activity line rendered on a non-streaming entry: %q", line)
 		}
+	}
+}
+
+func TestRenderEntry_TerminalClaimActivityRendersAfterFinalContent(t *testing.T) {
+	th := theme.DefaultDark()
+	entry := &ChatEntry{
+		ID:              "claim-terminal-1",
+		Timestamp:       time.Now(),
+		Source:          SourceAgent,
+		AgentType:       "architect",
+		Streaming:       false,
+		Content:         "Here is the final answer.",
+		ThinkingElapsed: 95*time.Second + 500*time.Millisecond,
+		ThinkingText:    "◉  1m35s",
+		ThinkingStatus:  "Complete",
+	}
+
+	lines, _ := RenderEntry(entry, 80, th, nil)
+	joined := stripANSITest(strings.Join(lines, "\n"))
+	if strings.Contains(joined, "thought for") {
+		t.Fatalf("terminal claim entry should not render stale top thinking summary: %q", joined)
+	}
+	if !strings.Contains(joined, "Here is the final answer.") {
+		t.Fatalf("terminal claim entry missing final content: %q", joined)
+	}
+	if !strings.Contains(joined, "1m35s  Complete") {
+		t.Fatalf("terminal claim entry missing final complete line: %q", joined)
 	}
 }

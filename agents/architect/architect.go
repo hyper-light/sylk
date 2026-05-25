@@ -91,6 +91,8 @@ type Architect struct {
 	planModesMu   sync.RWMutex
 	pendingMu     sync.Mutex
 	pendingBus    map[string]*shared.PendingSyncWait
+	evidenceMu    sync.Mutex
+	stagedEvidence map[string][]*PlanEvidence
 	inFlightMu    sync.Mutex
 	inFlight      map[string]context.CancelFunc
 
@@ -455,6 +457,7 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		planModes:         make(map[string]*PlanModeState),
 		pendingBus:        make(map[string]*shared.PendingSyncWait),
+		stagedEvidence:    make(map[string][]*PlanEvidence),
 		inFlight:          make(map[string]context.CancelFunc),
 		forestTracker:          shared.NewMemoryForestTracker(),
 		steering:               shared.NewSteeringManager(),
@@ -688,6 +691,7 @@ func (a *Architect) initSkills() error {
 	loaderCfg.AutoLoadDomains = nil
 	a.skillLoader = skills.NewLoader(a.skills, loaderCfg)
 	registerArchitectSafetyHook(a.hooks, a.skills, manifest.AllowedNames())
+	registerArchitectEvidenceCaptureHook(a)
 	tools, err := toolruntime.New(toolruntime.Config{
 		Registry:             a.skills,
 		Hooks:                a.hooks,

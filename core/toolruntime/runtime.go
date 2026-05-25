@@ -47,6 +47,8 @@ type ExecutionResult struct {
 	ToolName        string
 	ToolDefsDirty   bool
 	ActivatedSkills []string
+	Status          skills.ToolStatus
+	Continuation    *skills.YieldContinuation
 }
 
 type RawExecutionResult struct {
@@ -54,6 +56,16 @@ type RawExecutionResult struct {
 	ToolName        string
 	ToolDefsDirty   bool
 	ActivatedSkills []string
+	Status          skills.ToolStatus
+	Continuation    *skills.YieldContinuation
+}
+
+func (r ExecutionResult) Yielded() bool {
+	return r.Status == skills.ToolStatusYielded
+}
+
+func (r RawExecutionResult) Yielded() bool {
+	return r.Status == skills.ToolStatusYielded
 }
 
 type Runtime struct {
@@ -334,6 +346,8 @@ func (r *Runtime) Execute(ctx context.Context, inv Invocation) (ExecutionResult,
 		ToolName:        rawResult.ToolName,
 		ToolDefsDirty:   rawResult.ToolDefsDirty,
 		ActivatedSkills: append([]string(nil), rawResult.ActivatedSkills...),
+		Status:          rawResult.Status,
+		Continuation:    rawResult.Continuation,
 	}
 	if rawResult.Data != nil {
 		output, marshalErr := marshalOutput(rawResult.Data)
@@ -386,12 +400,12 @@ func recordToolCallStart(ctx context.Context, inv Invocation, agentID string) to
 		Kind:      "tool_started",
 		Reference: strings.TrimSpace(inv.ToolCall.Name),
 		Metadata: map[string]any{
-			"call_id":         callID,
-			"tool_name":       strings.TrimSpace(inv.ToolCall.Name),
-			"args":            inv.ToolCall.Arguments,
-			"correlation_id":  strings.TrimSpace(inv.CorrelationID),
+			"call_id":          callID,
+			"tool_name":        strings.TrimSpace(inv.ToolCall.Name),
+			"args":             inv.ToolCall.Arguments,
+			"correlation_id":   strings.TrimSpace(inv.CorrelationID),
 			"capability_scope": strings.TrimSpace(inv.CapabilityScope),
-			"started_at":      time.Now().UTC().Format(time.RFC3339Nano),
+			"started_at":       time.Now().UTC().Format(time.RFC3339Nano),
 		},
 		Ephemeral: true,
 	})
@@ -502,6 +516,9 @@ func (r *Runtime) executeRaw(
 	resolvedToolName := strings.TrimSpace(inv.ToolCall.Name)
 	toolCallTrace := recordToolCallStart(ctx, inv, inv.AgentID)
 	defer func() {
+		if rawResult.Status == skills.ToolStatusYielded {
+			return
+		}
 		var output any
 		if rawResult.Data != nil {
 			output = rawResult.Data
@@ -562,7 +579,7 @@ func (r *Runtime) executeRaw(
 			if postErr := r.runPostHooks(ctx, toolData, output, nil); postErr != nil {
 				return RawExecutionResult{}, postErr
 			}
-			return RawExecutionResult{Data: output, ToolName: toolData.ToolName}, nil
+			return RawExecutionResult{Data: output, ToolName: toolData.ToolName, Status: skills.ToolStatusCompleted}, nil
 		}
 		if !hookResult.Continue {
 			if hookResult.Error != nil {
@@ -599,6 +616,7 @@ func (r *Runtime) executeRaw(
 			ToolName:        name,
 			ToolDefsDirty:   len(activated) > 0,
 			ActivatedSkills: activated,
+			Status:          skills.ToolStatusCompleted,
 		}, nil
 	}
 
@@ -633,11 +651,24 @@ func (r *Runtime) executeRaw(
 	}
 
 	result, err := r.executePolicy(ctx, name, toolData.Input, policy)
+	if err != nil {
+		if postErr := r.runPostHooks(ctx, toolData, resultData(result), err); postErr != nil {
+			return RawExecutionResult{}, postErr
+		}
+		return RawExecutionResult{}, err
+	}
+	if result != nil && result.Outcome != nil && result.Outcome.Status == skills.ToolStatusYielded {
+		outcome := *result.Outcome
+		skills.SetToolOutcomeOnContext(ctx, outcome)
+		return RawExecutionResult{
+			Data:         outcome.Result,
+			ToolName:     name,
+			Status:       skills.ToolStatusYielded,
+			Continuation: outcome.Continuation,
+		}, nil
+	}
 	if postErr := r.runPostHooks(ctx, toolData, resultData(result), resultError(result)); postErr != nil {
 		return RawExecutionResult{}, postErr
-	}
-	if err != nil {
-		return RawExecutionResult{}, err
 	}
 	if result == nil {
 		return RawExecutionResult{}, fmt.Errorf("tool %q returned nil", name)
@@ -655,6 +686,7 @@ func (r *Runtime) executeRaw(
 	return RawExecutionResult{
 		Data:     result.Data,
 		ToolName: name,
+		Status:   skills.ToolStatusCompleted,
 	}, nil
 }
 
@@ -972,12 +1004,12 @@ func recordGuardianCheckEnd(ctx context.Context, inv Invocation, trace guardianC
 		outcome = "failure"
 	}
 	metadata := map[string]any{
-		"outcome":     outcome,
-		"tool_name":   strings.TrimSpace(inv.ToolCall.Name),
+		"outcome":      outcome,
+		"tool_name":    strings.TrimSpace(inv.ToolCall.Name),
 		"tool_call_id": strings.TrimSpace(inv.ToolCall.ID),
-		"started_at":  started.UTC().Format(time.RFC3339Nano),
-		"ended_at":    now.Format(time.RFC3339Nano),
-		"duration_ms": now.Sub(started).Milliseconds(),
+		"started_at":   started.UTC().Format(time.RFC3339Nano),
+		"ended_at":     now.Format(time.RFC3339Nano),
+		"duration_ms":  now.Sub(started).Milliseconds(),
 	}
 	if grantErr != nil {
 		metadata["error"] = grantErr.Error()

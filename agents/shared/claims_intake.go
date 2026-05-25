@@ -2,9 +2,11 @@ package shared
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/agents/identity"
@@ -86,6 +88,192 @@ func deltaConsultID(d claims.Delta) string {
 			return ""
 		}
 		return v.ConsultID
+	}
+	return ""
+}
+
+func deliverExpectedPeerTestamentToContinuation(cfg ClaimsIntakeConfig, entry *claims.GraphEntryPoint) bool {
+	if cfg.ContinuationStore == nil || entry == nil || entry.Expectation == nil || entry.Delta == nil {
+		return false
+	}
+	if entry.Delta.DeltaKind() != claims.DeltaKindTestament {
+		return false
+	}
+	actionKind := expectedPeerTestamentActionKind(entry)
+	if actionKind != claims.ActionTypeConsultation && actionKind != claims.ActionTypeChallenge {
+		return false
+	}
+
+	resolutionID := expectedPeerResolutionID(entry.Node.Claim, actionKind, entry.Expectation)
+	if strings.TrimSpace(resolutionID) == "" {
+		slog.Warn("claims_intake_expected_peer_testament_missing_resolution_id",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"claim_id", entry.Expectation.ClaimID,
+			"action_kind", actionKind,
+		)
+		return true
+	}
+
+	testamentDelta, _ := testamentDeltaFromEntry(entry)
+	testament := entry.Node.Testament
+	summary := strings.TrimSpace(testamentDelta.Summary)
+	if summary == "" && testament != nil {
+		summary = strings.TrimSpace(testament.Summary)
+	}
+	status := claims.ConsultStatusCompleted
+	errText := ""
+	if testamentDelta.Verdict == claims.TestamentVerdictError {
+		status = claims.ConsultStatusError
+		errText = firstNonEmptyIntakeString(summary, "peer testament reported an error")
+	}
+	payload := peerTestamentResponsePayload(entry, summary)
+	responder := strings.TrimSpace(testamentDelta.SubjectAgentID)
+	if testament != nil && strings.TrimSpace(testament.AgentID) != "" {
+		responder = strings.TrimSpace(testament.AgentID)
+	}
+	delta := claims.ConsultResolvedDelta{
+		SessionID:         firstNonEmptyIntakeString(testamentDelta.SessionID, cfg.SessionID),
+		BoardID:           testamentDelta.BoardID,
+		ConsultID:         strings.TrimSpace(resolutionID),
+		OriginatorAgentID: strings.TrimSpace(cfg.AgentID),
+		ResponderAgentID:  responder,
+		Status:            status,
+		ResponsePayload:   payload,
+		ResponseSummary:   truncatePromptString(summary, 240),
+		ErrorMessage:      errText,
+		EmittedAt:         time.Now().UTC(),
+	}
+	slog.Info("claims_intake_expected_peer_testament_delivered",
+		"agent_id", cfg.AgentID,
+		"session_id", cfg.SessionID,
+		"claim_id", entry.Expectation.ClaimID,
+		"testament_id", testamentDelta.TestamentID,
+		"resolution_id", delta.ConsultID,
+		"action_kind", actionKind,
+		"status", status,
+	)
+	cfg.ContinuationStore.DeliverResolution(context.Background(), &delta)
+	return true
+}
+
+func expectedPeerTestamentActionKind(entry *claims.GraphEntryPoint) claims.ActionType {
+	if entry == nil {
+		return ""
+	}
+	if entry.Node.Claim != nil && entry.Node.Claim.ActionType != "" {
+		return entry.Node.Claim.ActionType
+	}
+	if delta, ok := testamentDeltaFromEntry(entry); ok {
+		return delta.ActionKind
+	}
+	return ""
+}
+
+func expectedPeerResolutionID(c *claims.Claim, actionKind claims.ActionType, exp *claims.Expectation) string {
+	if c != nil {
+		switch actionKind {
+		case claims.ActionTypeConsultation:
+			if id := claimScopeValue(c.Scope, "consult_id"); id != "" {
+				return id
+			}
+		case claims.ActionTypeChallenge:
+			if id := claimScopeValue(c.Scope, "challenge_id"); id != "" {
+				return id
+			}
+		}
+		if id := claimScopeValue(c.Scope, "await_id"); id != "" {
+			return id
+		}
+	}
+	if exp != nil && strings.TrimSpace(exp.ActionID) != "" {
+		return strings.TrimSpace(exp.ActionID)
+	}
+	if c != nil {
+		return strings.TrimSpace(c.ID)
+	}
+	if exp != nil {
+		return strings.TrimSpace(exp.ClaimID)
+	}
+	return ""
+}
+
+func claimScopeValue(scope []claims.ClaimScopeEntry, kind string) string {
+	kind = strings.TrimSpace(kind)
+	for _, entry := range scope {
+		if strings.TrimSpace(entry.Kind) == kind {
+			return strings.TrimSpace(entry.Key)
+		}
+	}
+	return ""
+}
+
+func testamentDeltaFromEntry(entry *claims.GraphEntryPoint) (claims.TestamentDelta, bool) {
+	if entry == nil || entry.Delta == nil {
+		return claims.TestamentDelta{}, false
+	}
+	switch delta := entry.Delta.(type) {
+	case claims.TestamentDelta:
+		return delta, true
+	case *claims.TestamentDelta:
+		if delta != nil {
+			return *delta, true
+		}
+	}
+	return claims.TestamentDelta{}, false
+}
+
+func peerTestamentResponsePayload(entry *claims.GraphEntryPoint, summary string) json.RawMessage {
+	payload := map[string]any{
+		"response": summary,
+		"summary":  summary,
+	}
+	if entry != nil {
+		if c := entry.Node.Claim; c != nil {
+			payload["claim_id"] = strings.TrimSpace(c.ID)
+			payload["claim_title"] = strings.TrimSpace(c.Title)
+		}
+		if t := entry.Node.Testament; t != nil {
+			payload["testament_id"] = strings.TrimSpace(t.ID)
+			payload["agent_id"] = strings.TrimSpace(t.AgentID)
+			payload["confidence"] = strings.TrimSpace(t.Confidence)
+			if len(t.Artifacts) > 0 {
+				payload["artifact_count"] = len(t.Artifacts)
+				payload["artifacts"] = compactTestamentArtifacts(t.Artifacts)
+			}
+		}
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return json.RawMessage(`{"response":""}`)
+	}
+	return encoded
+}
+
+func compactTestamentArtifacts(artifacts []*claims.Artifact) []map[string]any {
+	out := make([]map[string]any, 0, len(artifacts))
+	for _, art := range artifacts {
+		if art == nil {
+			continue
+		}
+		item := map[string]any{
+			"id":        strings.TrimSpace(art.ID),
+			"kind":      strings.TrimSpace(art.Kind),
+			"reference": truncatePromptString(strings.TrimSpace(art.Reference), 800),
+		}
+		if len(art.Metadata) > 0 {
+			item["metadata"] = art.Metadata
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func firstNonEmptyIntakeString(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
 	}
 	return ""
 }
@@ -197,6 +385,9 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 					return
 				}
 				cfg.ContinuationStore.DeliverResolution(context.Background(), &resolved)
+				return
+			}
+			if deliverExpectedPeerTestamentToContinuation(cfg, entry) {
 				return
 			}
 			slog.Info("claims_intake_resolved",

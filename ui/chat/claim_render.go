@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -68,6 +69,7 @@ func (m *Model) projectClaimArtifactToHistory(art *ArtifactRow) {
 		e.ToolCalls = append(e.ToolCalls, buildClaimToolCallRecord(art))
 		invalidateChatEntryRender(e)
 	})
+	m.syncPendingInterAgentEntry(idx)
 	m.viewDirty = true
 }
 
@@ -95,6 +97,7 @@ func (m *Model) completeClaimArtifactInHistory(art *ArtifactRow) {
 			invalidateChatEntryRender(e)
 		}
 	})
+	m.syncPendingInterAgentEntry(idx)
 	m.viewDirty = true
 }
 
@@ -103,7 +106,7 @@ func (m *Model) completeClaimArtifactInHistory(art *ArtifactRow) {
 // that consultation/challenge branch. It deliberately does not write
 // the content onto the cycle's ChatEntry: only the cycle-root claim's
 // response_text is the user-visible answer.
-func (m *Model) applyChildClaimResponseTextToHistory(cycleID, claimID, agentID, content string) bool {
+func (m *Model) applyChildClaimResponseTextToHistory(cycleID, parentRowID, claimID, agentID, content string) bool {
 	if m == nil {
 		return false
 	}
@@ -119,15 +122,74 @@ func (m *Model) applyChildClaimResponseTextToHistory(cycleID, claimID, agentID, 
 	}
 	changed := false
 	m.history.UpdateAt(idx, func(e *ChatEntry) {
-		if applyChildClaimResponseTextInToolCalls(e.ToolCalls, claimID, agentID, content) {
+		if applyChildClaimResponseTextInToolCalls(e.ToolCalls, parentRowID, claimID, agentID, content) {
 			invalidateChatEntryRender(e)
 			changed = true
 		}
 	})
+	if changed {
+		m.syncPendingInterAgentEntry(idx)
+	}
 	return changed
 }
 
-func applyChildClaimResponseTextInToolCalls(calls []ToolCallRecord, claimID, agentID, content string) bool {
+func (m *Model) applyTestamentContextToHistory(row *TestamentRow) {
+	if m == nil || row == nil {
+		return
+	}
+	contextValue := sanitizeThinkingMessage(row.Context)
+	if contextValue == "" {
+		return
+	}
+	cycleID := strings.TrimSpace(row.CycleID)
+	claimID := strings.TrimSpace(row.ClaimID)
+	if cycleID == "" {
+		return
+	}
+	if strings.TrimSpace(row.ParentRowID) != "" {
+		if m.applyChildClaimThinkingStatusToHistory(cycleID, row.ParentRowID, claimID, row.AgentID, contextValue, row.Sealed || strings.TrimSpace(row.TestamentID) != "") {
+			m.viewDirty = true
+			return
+		}
+	}
+	m.applyClaimContextToHistory(cycleID, contextValue)
+}
+
+func (m *Model) applyChildClaimThinkingStatusToHistory(cycleID, parentRowID, claimID, agentID, status string, terminal bool) bool {
+	cycleID = strings.TrimSpace(cycleID)
+	claimID = strings.TrimSpace(claimID)
+	status = sanitizeThinkingMessage(status)
+	if cycleID == "" || claimID == "" || status == "" {
+		return false
+	}
+	idx := m.historyIndexForCorrelation(cycleID)
+	if idx < 0 {
+		return false
+	}
+	changed := false
+	now := time.Now()
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		if applyChildClaimThinkingStatusInToolCalls(e.ToolCalls, parentRowID, claimID, agentID, status, terminal, now) {
+			invalidateChatEntryRender(e)
+			changed = true
+		}
+	})
+	if changed {
+		m.syncPendingInterAgentEntry(idx)
+	}
+	return changed
+}
+
+func applyChildClaimResponseTextInToolCalls(calls []ToolCallRecord, parentRowID, claimID, agentID, content string) bool {
+	parentRowID = strings.TrimSpace(parentRowID)
+	if parentRowID != "" {
+		if applyChildClaimResponseTextInParentToolCall(calls, parentRowID, claimID, agentID, content) {
+			return true
+		}
+		if !hasSingleInterAgentTarget(calls, agentID) {
+			return false
+		}
+	}
 	for i := range calls {
 		if calls[i].InterAgent == nil {
 			continue
@@ -139,21 +201,210 @@ func applyChildClaimResponseTextInToolCalls(calls []ToolCallRecord, claimID, age
 	return false
 }
 
+func applyChildClaimThinkingStatusInToolCalls(calls []ToolCallRecord, parentRowID, claimID, agentID, status string, terminal bool, now time.Time) bool {
+	parentRowID = strings.TrimSpace(parentRowID)
+	if parentRowID != "" {
+		if applyChildClaimThinkingStatusInParentToolCall(calls, parentRowID, claimID, agentID, status, terminal, now) {
+			return true
+		}
+		if !hasSingleInterAgentTarget(calls, agentID) {
+			return false
+		}
+	}
+	for i := range calls {
+		if calls[i].InterAgent == nil {
+			continue
+		}
+		if applyChildClaimThinkingStatusInInterAgent(calls[i].InterAgent, claimID, agentID, status, terminal, now) {
+			return true
+		}
+	}
+	return false
+}
+
+func applyChildClaimResponseTextInParentToolCall(calls []ToolCallRecord, parentRowID, claimID, agentID, content string) bool {
+	parentRowID = strings.TrimSpace(parentRowID)
+	if parentRowID == "" {
+		return false
+	}
+	for i := range calls {
+		tc := &calls[i]
+		if strings.TrimSpace(tc.ToolCallKey) == parentRowID && tc.InterAgent != nil {
+			return applyChildClaimResponseTextInInterAgent(tc.InterAgent, claimID, agentID, content)
+		}
+		if tc.InterAgent == nil {
+			continue
+		}
+		for c := range tc.InterAgent.Children {
+			if applyChildClaimResponseTextInParentToolCall(tc.InterAgent.Children[c].ToolCalls, parentRowID, claimID, agentID, content) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func applyChildClaimThinkingStatusInParentToolCall(calls []ToolCallRecord, parentRowID, claimID, agentID, status string, terminal bool, now time.Time) bool {
+	parentRowID = strings.TrimSpace(parentRowID)
+	if parentRowID == "" {
+		return false
+	}
+	for i := range calls {
+		tc := &calls[i]
+		if strings.TrimSpace(tc.ToolCallKey) == parentRowID && tc.InterAgent != nil {
+			return applyChildClaimThinkingStatusInInterAgent(tc.InterAgent, claimID, agentID, status, terminal, now)
+		}
+		if tc.InterAgent == nil {
+			continue
+		}
+		for c := range tc.InterAgent.Children {
+			if applyChildClaimThinkingStatusInParentToolCall(tc.InterAgent.Children[c].ToolCalls, parentRowID, claimID, agentID, status, terminal, now) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasSingleInterAgentTarget(calls []ToolCallRecord, agentID string) bool {
+	return countInterAgentTargets(calls, strings.TrimSpace(agentID)) == 1
+}
+
+func countInterAgentTargets(calls []ToolCallRecord, agentID string) int {
+	count := 0
+	for i := range calls {
+		if calls[i].InterAgent != nil {
+			if interAgentRowTargetsAgent(calls[i].InterAgent, agentID) {
+				count++
+			}
+			for c := range calls[i].InterAgent.Children {
+				count += countInterAgentTargets(calls[i].InterAgent.Children[c].ToolCalls, agentID)
+			}
+		}
+	}
+	return count
+}
+
 func applyChildClaimResponseTextInInterAgent(row *InterAgentTool, claimID, agentID, content string) bool {
+	if row == nil {
+		return false
+	}
+	doneAt := time.Now()
+	for i := range row.Children {
+		child := &row.Children[i]
+		if childMatchesClaimResponse(child, claimID, agentID) {
+			completeInterAgentChild(child, content, doneAt)
+			return true
+		}
+		if applyChildClaimResponseTextInToolCalls(child.ToolCalls, "", claimID, agentID, content) {
+			return true
+		}
+	}
+	if idx, ok := ensureInterAgentChildForClaim(row, claimID, agentID, time.Now()); ok {
+		child := &row.Children[idx]
+		completeInterAgentChild(child, content, doneAt)
+		return true
+	}
+	return false
+}
+
+func applyChildClaimThinkingStatusInInterAgent(row *InterAgentTool, claimID, agentID, status string, terminal bool, now time.Time) bool {
 	if row == nil {
 		return false
 	}
 	for i := range row.Children {
 		child := &row.Children[i]
 		if childMatchesClaimResponse(child, claimID, agentID) {
-			child.ResultSummary = normalizeInlineText(content)
-			child.Completed = true
-			child.Failed = false
-			child.ThinkingText = ""
-			child.ThinkingStatus = ""
+			if terminal {
+				completeInterAgentChild(child, status, now)
+				return true
+			}
+			if child.ThinkingStartedAt.IsZero() {
+				child.ThinkingStartedAt = now
+			}
+			child.ThinkingStatus = status
 			return true
 		}
-		if applyChildClaimResponseTextInToolCalls(child.ToolCalls, claimID, agentID, content) {
+		if applyChildClaimThinkingStatusInToolCalls(child.ToolCalls, "", claimID, agentID, status, terminal, now) {
+			return true
+		}
+	}
+	if idx, ok := ensureInterAgentChildForClaim(row, claimID, agentID, now); ok {
+		child := &row.Children[idx]
+		if terminal {
+			completeInterAgentChild(child, status, now)
+			return true
+		}
+		child.ThinkingStatus = status
+		return true
+	}
+	return false
+}
+
+func completeInterAgentChild(child *InterAgentChildActivity, summary string, doneAt time.Time) {
+	if child == nil {
+		return
+	}
+	if doneAt.IsZero() {
+		doneAt = time.Now()
+	}
+	child.ResultSummary = normalizeInlineText(summary)
+	child.Completed = true
+	child.Failed = false
+	child.ThinkingText = ""
+	child.ThinkingStatus = ""
+	finalizeToolCallsSyntheticRecursive(child.ToolCalls, doneAt, true, "")
+}
+
+func finalizeToolCallsSyntheticRecursive(calls []ToolCallRecord, doneAt time.Time, success bool, errorMsg string) {
+	for i := range calls {
+		finalizeToolCallRecordSynthetic(&calls[i], doneAt, success, errorMsg)
+		if calls[i].InterAgent == nil {
+			continue
+		}
+		for c := range calls[i].InterAgent.Children {
+			finalizeToolCallsSyntheticRecursive(calls[i].InterAgent.Children[c].ToolCalls, doneAt, success, errorMsg)
+		}
+	}
+}
+
+func ensureInterAgentChildForClaim(row *InterAgentTool, claimID, agentID string, now time.Time) (int, bool) {
+	if row == nil {
+		return -1, false
+	}
+	claimID = strings.TrimSpace(claimID)
+	agentID = strings.TrimSpace(agentID)
+	if claimID == "" && agentID == "" {
+		return -1, false
+	}
+	if agentID != "" && !interAgentRowTargetsAgent(row, agentID) {
+		return -1, false
+	}
+	key := firstNonEmptyString(claimID, agentID)
+	for i := range row.Children {
+		if strings.TrimSpace(row.Children[i].CorrelationID) == key {
+			return i, true
+		}
+	}
+	row.Children = append(row.Children, InterAgentChildActivity{
+		CorrelationID:     key,
+		AgentID:           agentID,
+		AgentType:         agentID,
+		ThinkingStartedAt: now,
+	})
+	return len(row.Children) - 1, true
+}
+
+func interAgentRowTargetsAgent(row *InterAgentTool, agentID string) bool {
+	if row == nil {
+		return false
+	}
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return true
+	}
+	for _, candidate := range row.AgentTypes {
+		if strings.TrimSpace(candidate) == agentID {
 			return true
 		}
 	}
@@ -186,11 +437,21 @@ func (m *Model) applyClaimContextToHistory(cycleID, contextValue string) {
 	if idx < 0 {
 		return
 	}
+	changed := false
 	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		if strings.EqualFold(strings.TrimSpace(e.ThinkingStatus), "complete") && !claimContextTerminal("", contextValue) {
+			return
+		}
+		if e.ThinkingStatus == contextValue {
+			return
+		}
 		e.ThinkingStatus = contextValue
 		invalidateChatEntryRender(e)
+		changed = true
 	})
-	m.viewDirty = true
+	if changed {
+		m.viewDirty = true
+	}
 }
 
 // finalizeClaimEntry stops the streaming spinner on a cycle's entry
@@ -206,13 +467,31 @@ func (m *Model) finalizeClaimEntry(cycleID string, endedAt time.Time) {
 		return
 	}
 	m.history.UpdateAt(idx, func(e *ChatEntry) {
-		e.Streaming = false
-		if !endedAt.IsZero() {
-			e.ThinkingElapsed = endedAt.Sub(e.Timestamp)
-		}
+		m.finalizeClaimEntryFields(e, endedAt)
 		invalidateChatEntryRender(e)
 	})
 	m.viewDirty = true
+}
+
+func (m *Model) finalizeClaimEntryFields(e *ChatEntry, endedAt time.Time) {
+	if e == nil {
+		return
+	}
+	if endedAt.IsZero() {
+		endedAt = time.Now()
+	}
+	finalizeToolCallsSynthetic(e.ToolCalls, endedAt, true, "")
+	e.Streaming = false
+	elapsed := endedAt.Sub(e.Timestamp)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	if elapsed > 0 {
+		e.ThinkingElapsed = elapsed
+	}
+	e.ThinkingText = fmt.Sprintf("%s  %s", thinkingSummaryGlyph, formatToolDuration(elapsed))
+	e.ThinkingStatus = "Complete"
+	e.ThinkingColor = ""
 }
 
 // claimArtifactDisplayName picks the user-facing label for an
@@ -224,6 +503,9 @@ func claimArtifactDisplayName(art *ArtifactRow) string {
 	}
 	ref := strings.TrimSpace(art.Reference)
 	if ref != "" {
+		return ref
+	}
+	if ref := claimArtifactMetadataText(art.Metadata, "tool_name", "target", "name"); ref != "" {
 		return ref
 	}
 	return claimArtifactDisplayNameFallback(art.Kind)
@@ -267,6 +549,7 @@ func buildClaimToolCallRecord(art *ArtifactRow) ToolCallRecord {
 		ToolCallKey: art.ArtifactID,
 		ToolName:    claimArtifactDisplayName(art),
 		ArgsSummary: art.ArgsSummary,
+		FullArgs:    claimArtifactFullArgs(art.Metadata),
 		StartedAt:   art.StartedAt,
 	}
 	kind := interAgentKindForClaimArtifact(art.Kind)
@@ -439,6 +722,7 @@ func applyClaimArtifactCompletion(tc *ToolCallRecord, art *ArtifactRow) {
 	tc.Duration = art.Duration
 	tc.Success = art.Status == ArtifactRowStatusSuccess
 	tc.Completed = true
+	tc.SyntheticCompletion = false
 	if art.Output != "" {
 		tc.Output = art.Output
 	}

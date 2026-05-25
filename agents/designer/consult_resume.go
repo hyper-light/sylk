@@ -41,11 +41,13 @@ func (d *Designer) resumeContinuation(
 	shared.RecordResumeReceiving(ctx, d.designerBoard(), snapshot, results)
 
 	req := snapshot.Request
+	toolResult := formatDesignerAwaitResults(results)
+	shared.CompleteYieldedToolFromContinuation(ctx, snapshot, results, toolResult)
 	req.Messages = append(req.Messages, providers.Message{
 		Role:       providers.RoleTool,
 		ToolCallID: snapshot.AwaitToolCallID,
 		ToolName:   snapshot.AwaitToolName,
-		Content:    formatDesignerAwaitResults(results),
+		Content:    toolResult,
 	})
 
 	ctx = shared.WithContinuationStore(ctx, d.continuationStore)

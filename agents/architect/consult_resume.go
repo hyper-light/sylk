@@ -57,11 +57,14 @@ func (a *Architect) resumeContinuation(
 	// LLM's next inference reads "your await_consults call returned
 	// these results" and proceeds.
 	req := snapshot.Request
+	toolResult := formatAwaitResultsContent(results)
+	shared.CompleteYieldedToolFromContinuation(ctx, snapshot, results, toolResult)
+	a.runContinuationPostToolHooks(ctx, snapshot, toolResult)
 	req.Messages = append(req.Messages, providers.Message{
 		Role:       providers.RoleTool,
 		ToolCallID: snapshot.AwaitToolCallID,
 		ToolName:   snapshot.AwaitToolName,
-		Content:    formatAwaitResultsContent(results),
+		Content:    toolResult,
 	})
 
 	// Re-stamp ctx so any nested consult_peer in the resumed turn

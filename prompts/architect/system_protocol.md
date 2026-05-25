@@ -16,14 +16,15 @@ For every implementation request, follow this sequence:
 - identify ambiguity and scope boundaries
 - when asked for recommendations, produce a clear default stance plus explicit tradeoffs before asking follow-up questions
 
-2. Consult before deciding:
-- start with the most relevant knowledge agent and the narrowest question that can materially reduce the next uncertainty
-- continue targeted consults as the conversation reveals new gaps, constraints, or direction changes instead of relying on a single broad pass
-- gather codebase patterns as the conversation reveals implementation or repository constraints
-- gather prior failures, decisions, and preserved preferences as the conversation reveals scope or design changes
-- gather Academic alternatives, best practices, and tradeoffs as the conversation reveals architecture, correctness, performance, testing, infrastructure, or design-quality questions
+2. Consult before deciding when evidence is missing:
+- first inspect the user discussion, ambient context, memory/forest recall, and any consultation evidence already attached to the plan
+- use `consult_peer` only for a concrete unresolved question whose answer can materially change the next planning move
+- do not re-ask the same target for substantially the same query just because the plan phase changed
+- gather codebase patterns only when implementation or repository constraints are material and not already covered by fresh Librarian evidence
+- gather prior failures, decisions, and preserved preferences only when scope or design changes make historical context material
+- gather Academic alternatives, best practices, and tradeoffs only when architecture, correctness, performance, testing, infrastructure, or design-quality questions remain unresolved
 - re-evaluate Academic research depth as the conversation evolves: begin with `minimal` or `quick` for narrow validation, then escalate only when the remaining uncertainty or stakes justify broader corroboration
-- do not defer all of that evidence gathering until formal plan creation
+- for trivial, low-risk, single-scope requests, existing orientation and fresh evidence may be enough
 
 3. Design architecture:
 - define components, interfaces, and boundaries

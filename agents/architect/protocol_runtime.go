@@ -34,6 +34,7 @@ func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectReque
 
 	req = a.enrichPlanningRequest(req)
 	plan := newProtocolPlan(req, originalCIDFromContext(ctx))
+	a.drainStagedEvidenceIntoPlan(plan)
 	a.planStore.Upsert(plan)
 
 	corrID := correlationIDFromContext(ctx)
@@ -179,6 +180,7 @@ func (a *Architect) runDeterministicProtocol(
 		return a.failAndPersistPlan(plan, err)
 	}
 	plan.Requirements = requirements
+	attachRequirementsEvidenceDigest(plan.Requirements, planningEvidenceDigest(plan, req.Query))
 
 	// 2. Consult (skip — no bus in deterministic mode)
 	if err := transition(PlanStatusConsulting); err != nil {
@@ -190,7 +192,13 @@ func (a *Architect) runDeterministicProtocol(
 		return a.failAndPersistPlan(plan, err)
 	}
 	completeDesign := a.architectStageClaim(ctx, plan.ID, "Design solution architecture", "Produce components, interfaces, layers from requirements")
-	architecture, err := a.designArchitecture(ctx, requirements, nil)
+	codebasePatterns := plan.CodebasePatterns
+	if codebasePatterns == nil {
+		codebasePatterns = extractLibrarianPatterns(plan)
+		plan.CodebasePatterns = codebasePatterns
+	}
+	architecture, err := a.designArchitecture(ctx, requirements, codebasePatterns)
+	attachArchitectureEvidenceDigest(architecture, evidenceDigestFromRequirements(requirements))
 	completeDesign(fmt.Sprintf("Designed %d-component architecture", len(architecture.Components)),
 		[]*claims.Artifact{a.architectJSONArtifact("architecture", architecture)}, err)
 	if err != nil {
@@ -495,14 +503,14 @@ func (r *planningProtocolRunner) run() error {
 const protocolPhaseInstructions = `You drive the planning protocol by invoking skills. Execute these phases in order:
 
 1. **Analyze**: Invoke plan with action=analyze, plan_id, and the user's query.
-2. **Consult**: Invoke consult with mode=pre_planning and plan_id. This phase consolidates and refreshes the consultation evidence you should already have gathered during discussion; it is not the first moment to begin obvious evidence gathering.
+2. **Evidence review**: Inspect the plan(action=analyze) result and any consultation evidence already attached to the plan. Issue consult_peer only for a concrete missing, stale, contradicted, or too-broad evidence gap that can materially change design. Do not repeat a fresh target/query just because the phase changed.
 3. **Clarify** (conditional): Review the analysis results. If the request is still
    broadly vague or underspecified and needs exploratory clarification or
    requirements-shaping before you can plan responsibly, invoke
-   route_requirements_research and STOP. Use ask_user_question only for one or
+   academic_research(action=request) and STOP. Use ask_user_clarification only for one or
    two narrow, concrete decisions that the user can answer directly. If the
    blocker is codebase evidence or historical implementation context, use
-   consult with the Librarian or Archivalist instead of handing the user away. If the
+   consult_peer with the Librarian or Archivalist instead of handing the user away. If the
    blocker is architecture quality, correctness, performance, testing, infrastructure,
    deployment, or tradeoffs, consult the Academic instead of guessing.
    If requirements are clear, proceed to Design.
@@ -521,15 +529,15 @@ const protocolPhaseInstructions = `You drive the planning protocol by invoking s
    is already starting or that their reply will immediately start work in this turn.
    Avoid phrases like "kick it off", "start building", "start implementing",
    "get started", or "ship it".
-   Do NOT invoke route_plan_acceptance — wait for the user to respond.
+   Do NOT invoke plan_acceptance — wait for the user to respond.
 
-Always pass plan_id to plan and consult skills. Do not skip phases 1, 2, 4, or 5.
+Always pass plan_id to plan skills. Do not skip phases 1, 4, or 5; phase 2 is a review step and only calls consult_peer when a material evidence gap remains.
 During conversation before this protocol begins, you should already have used consultation
 skills to gather evidence as the user revealed new material constraints or direction.
 
 Exception — auto-approve (when approval_required is false):
 Skip the approval cue in step 6. Instead, after the brief assessment, invoke
-route_plan_acceptance with the plan_id and a brief user_response summary.
+plan_acceptance(action=route) with the plan_id and a brief user_response summary.
 After invoking it, STOP. The approval and orchestrator handoff continue
 asynchronously.`
 

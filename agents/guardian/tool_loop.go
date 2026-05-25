@@ -243,6 +243,10 @@ func (g *Guardian) applyToolCalls(
 		if execResult.ToolDefsDirty {
 			g.toolDefsDirty = true
 		}
+		if execResult.Yielded() {
+			yielded = true
+			return errCount, rerouted, yielded
+		}
 		g.logDebug("tool_apply: EXECUTE_DONE",
 			"tool_name", call.Name, "tool_index", i,
 			"elapsed", time.Since(callStart).String(),
@@ -250,10 +254,6 @@ func (g *Guardian) applyToolCalls(
 
 		isError := false
 		if err != nil {
-			if shared.IsConsultYielded(err) {
-				yielded = true
-				return errCount, rerouted, yielded
-			}
 			if isRerouteError(err) {
 				rerouted = true
 				result = `{"rerouted": true}`

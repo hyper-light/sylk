@@ -43,11 +43,13 @@ func (e *Engineer) resumeContinuation(
 	shared.RecordResumeReceiving(ctx, e.engineerBoard(), snapshot, results)
 
 	req := snapshot.Request
+	toolResult := formatEngineerAwaitResults(results)
+	shared.CompleteYieldedToolFromContinuation(ctx, snapshot, results, toolResult)
 	req.Messages = append(req.Messages, providers.Message{
 		Role:       providers.RoleTool,
 		ToolCallID: snapshot.AwaitToolCallID,
 		ToolName:   snapshot.AwaitToolName,
-		Content:    formatEngineerAwaitResults(results),
+		Content:    toolResult,
 	})
 
 	ctx = shared.WithContinuationStore(ctx, e.continuationStore)

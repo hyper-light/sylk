@@ -274,12 +274,68 @@ func TestBridgeIntegration_ArtifactSinkRoutesToChatPanel(t *testing.T) {
 	}
 }
 
+func TestBridgeIntegration_ArtifactSummaryPrefersCompletionMetadata(t *testing.T) {
+	got := artifactSummary(&claims.Artifact{
+		Kind:      "tool_completed",
+		Reference: "workspace_read",
+		Metadata: map[string]any{
+			"output": "read 3 files",
+		},
+	})
+	if got != "read 3 files" {
+		t.Fatalf("artifactSummary = %q, want metadata output", got)
+	}
+}
+
 // debugSnapshot prints message types — used during diagnosis only.
 func debugSnapshot(t *testing.T, prog *integrationProgram, label string) {
 	t.Helper()
 	for i, m := range prog.Snapshot() {
 		t.Logf("%s [%d]: %T %+v", label, i, m, m)
 	}
+}
+
+func postArchitectConsultClaim(t *testing.T, board *claims.ClaimsBoard) (parentClaimID, consultClaimID string) {
+	t.Helper()
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "architect plan",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction parent claim: %v", err)
+	}
+	parentClaimID = board.Projection().Claims[0].ID
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeConsultation},
+		[]claims.Claim{{
+			Title: "consult librarian",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "librarian", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+				{Related: parentClaimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipCausedBy},
+			},
+			ActionType:  claims.ActionTypeConsultation,
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction consult claim: %v", err)
+	}
+	for _, c := range board.Projection().Claims {
+		if c.Title == "consult librarian" {
+			consultClaimID = c.ID
+			break
+		}
+	}
+	if parentClaimID == "" || consultClaimID == "" {
+		t.Fatalf("missing test claims: parent=%q consult=%q", parentClaimID, consultClaimID)
+	}
+	return parentClaimID, consultClaimID
 }
 
 // Cross-claim nesting test (UI_DESIGN.md §3.4 ParentRowID). When
@@ -393,6 +449,109 @@ func TestBridgeIntegration_CrossClaimNestingViaParentRowID(t *testing.T) {
 	// Both must share the same cycle.
 	if consultRow.CycleID != toolRow.CycleID {
 		t.Fatalf("CycleID mismatch: consult=%q tool=%q", consultRow.CycleID, toolRow.CycleID)
+	}
+}
+
+func TestBridgeIntegration_ChildArtifactFallbackActorIsClaimSubject(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-nest-actor")
+	defer cleanup()
+
+	parentClaimID, consultClaimID := postArchitectConsultClaim(t, board)
+	consultStartedID := "consult-started-actor"
+	br.OnArtifactAdded(parentClaimID, "architect", "ses-nest-actor", &claims.Artifact{
+		ID:        consultStartedID,
+		AgentID:   "architect",
+		Kind:      "consult_started",
+		Reference: "librarian",
+		Metadata:  map[string]any{"claim_id": consultClaimID, "target": "librarian"},
+		Created:   time.Now(),
+	})
+	br.OnArtifactAdded(consultClaimID, "", "ses-nest-actor", &claims.Artifact{
+		ID:        "tool-started-without-agent",
+		Kind:      "tool_started",
+		Reference: "workspace_read",
+		Created:   time.Now(),
+	})
+	drainBridge(t, prog, "child artifact actor fallback")
+
+	var toolRow *msg.ClaimArtifactAddedMsg
+	for _, m := range prog.Snapshot() {
+		if a, ok := m.(msg.ClaimArtifactAddedMsg); ok && a.ArtifactID == "tool-started-without-agent" {
+			copy := a
+			toolRow = &copy
+			break
+		}
+	}
+	if toolRow == nil {
+		debugSnapshot(t, prog, "child artifact actor fallback")
+		t.Fatal("expected child tool row")
+	}
+	if toolRow.ParentRowID != consultStartedID {
+		t.Fatalf("ParentRowID = %q, want %q", toolRow.ParentRowID, consultStartedID)
+	}
+	if toolRow.AgentID != "librarian" {
+		t.Fatalf("AgentID = %q, want librarian fallback from consultation subject", toolRow.AgentID)
+	}
+}
+
+func TestBridgeIntegration_TestamentSummaryEmitsNestedChildResponse(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-nest-response")
+	defer cleanup()
+
+	parentClaimID, consultClaimID := postArchitectConsultClaim(t, board)
+	consultStartedID := "consult-started-response"
+	br.OnArtifactAdded(parentClaimID, "architect", "ses-nest-response", &claims.Artifact{
+		ID:        consultStartedID,
+		AgentID:   "architect",
+		Kind:      "consult_started",
+		Reference: "librarian",
+		Metadata:  map[string]any{"claim_id": consultClaimID, "target": "librarian"},
+		Created:   time.Now(),
+	})
+	if err := board.SubmitTestaments(context.Background(),
+		claims.Action{AgentID: "librarian", Type: claims.ActionTypeTestament},
+		[]claims.Testament{{
+			Summary: "Workspace inventory complete.",
+			Relations: []claims.Relation{
+				{Related: consultClaimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
+			},
+		}},
+	); err != nil {
+		t.Fatalf("SubmitTestaments: %v", err)
+	}
+	drainBridge(t, prog, "testament child response")
+
+	var response *msg.ClaimResponseTextMsg
+	var completed *msg.ClaimArtifactCompletedMsg
+	for _, m := range prog.Snapshot() {
+		switch typed := m.(type) {
+		case msg.ClaimResponseTextMsg:
+			if typed.ClaimID == consultClaimID {
+				copy := typed
+				response = &copy
+			}
+		case msg.ClaimArtifactCompletedMsg:
+			if typed.StartArtifactID == consultStartedID {
+				copy := typed
+				completed = &copy
+			}
+		}
+	}
+	if response == nil {
+		debugSnapshot(t, prog, "testament child response")
+		t.Fatal("expected child ClaimResponseTextMsg from testament summary")
+	}
+	if response.ParentRowID != consultStartedID {
+		t.Fatalf("response.ParentRowID = %q, want %q", response.ParentRowID, consultStartedID)
+	}
+	if response.AgentID != "librarian" {
+		t.Fatalf("response.AgentID = %q, want librarian", response.AgentID)
+	}
+	if response.Content != "Workspace inventory complete." {
+		t.Fatalf("response.Content = %q", response.Content)
+	}
+	if completed == nil {
+		t.Fatal("expected consult_started completion from testament submission")
 	}
 }
 

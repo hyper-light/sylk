@@ -41,11 +41,13 @@ func (gi *GlobalInspector) resumeContinuation(
 	agentShared.RecordResumeReceiving(ctx, gi.globalInspectorBoardOrNil(), snapshot, results)
 
 	req := snapshot.Request
+	toolResult := formatGlobalInspectorAwaitResults(results)
+	agentShared.CompleteYieldedToolFromContinuation(ctx, snapshot, results, toolResult)
 	req.Messages = append(req.Messages, providers.Message{
 		Role:       providers.RoleTool,
 		ToolCallID: snapshot.AwaitToolCallID,
 		ToolName:   snapshot.AwaitToolName,
-		Content:    formatGlobalInspectorAwaitResults(results),
+		Content:    toolResult,
 	})
 
 	ctx = agentShared.WithContinuationStore(ctx, gi.continuationStore)

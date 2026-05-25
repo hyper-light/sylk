@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
 // =============================================================================
@@ -125,6 +126,127 @@ type Property struct {
 // Handler executes a skill with the given input
 type Handler func(ctx context.Context, input json.RawMessage) (any, error)
 
+// ToolStatus is the structured control-flow status a skill handler can return
+// through ToolOutcome. It separates deliberate suspension from failures.
+type ToolStatus string
+
+const (
+	ToolStatusCompleted ToolStatus = "completed"
+	ToolStatusYielded   ToolStatus = "yielded"
+	ToolStatusCancelled ToolStatus = "cancelled"
+	ToolStatusFailed    ToolStatus = "failed"
+)
+
+// YieldContinuation carries diagnostic/routing metadata for a yielded tool.
+// The continuation store remains the source of truth; this payload lets the
+// runtime and telemetry distinguish yield from failure structurally.
+type YieldContinuation struct {
+	Kind        string         `json:"kind,omitempty"`
+	ID          string         `json:"id,omitempty"`
+	AwaitedIDs  []string       `json:"awaited_ids,omitempty"`
+	ToolCallID  string         `json:"tool_call_id,omitempty"`
+	ToolName    string         `json:"tool_name,omitempty"`
+	Deadline    time.Time      `json:"deadline,omitempty"`
+	Description string         `json:"description,omitempty"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
+}
+
+// ToolOutcome is the first-class return value for tool control flow.
+// Err is reserved for real failures; Yielded must return Err nil.
+type ToolOutcome struct {
+	Result       any                `json:"result,omitempty"`
+	Status       ToolStatus         `json:"status"`
+	Continuation *YieldContinuation `json:"continuation,omitempty"`
+	Err          error              `json:"-"`
+}
+
+func CompletedToolOutcome(result any) ToolOutcome {
+	return ToolOutcome{Result: result, Status: ToolStatusCompleted}
+}
+
+func YieldToolOutcome(continuation *YieldContinuation) ToolOutcome {
+	return ToolOutcome{Status: ToolStatusYielded, Continuation: continuation}
+}
+
+func FailedToolOutcome(err error) ToolOutcome {
+	return ToolOutcome{Status: ToolStatusFailed, Err: err}
+}
+
+func NormalizeToolOutcome(value any) (ToolOutcome, bool) {
+	switch typed := value.(type) {
+	case ToolOutcome:
+		return normalizeToolOutcome(typed), true
+	case *ToolOutcome:
+		if typed == nil {
+			return ToolOutcome{}, false
+		}
+		return normalizeToolOutcome(*typed), true
+	default:
+		return ToolOutcome{}, false
+	}
+}
+
+func normalizeToolOutcome(outcome ToolOutcome) ToolOutcome {
+	if outcome.Status == "" {
+		if outcome.Err != nil {
+			outcome.Status = ToolStatusFailed
+		} else {
+			outcome.Status = ToolStatusCompleted
+		}
+	}
+	return outcome
+}
+
+type toolOutcomeSinkKey struct{}
+
+type ToolOutcomeSink struct {
+	mu      sync.Mutex
+	outcome ToolOutcome
+	set     bool
+}
+
+func WithToolOutcomeSink(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Value(toolOutcomeSinkKey{}).(*ToolOutcomeSink); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, toolOutcomeSinkKey{}, &ToolOutcomeSink{})
+}
+
+func SetToolOutcomeOnContext(ctx context.Context, outcome ToolOutcome) {
+	sink, ok := toolOutcomeSinkFromContext(ctx)
+	if !ok {
+		return
+	}
+	sink.mu.Lock()
+	sink.outcome = normalizeToolOutcome(outcome)
+	sink.set = true
+	sink.mu.Unlock()
+}
+
+func ToolOutcomeFromContext(ctx context.Context) (ToolOutcome, bool) {
+	sink, ok := toolOutcomeSinkFromContext(ctx)
+	if !ok {
+		return ToolOutcome{}, false
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if !sink.set {
+		return ToolOutcome{}, false
+	}
+	return sink.outcome, true
+}
+
+func toolOutcomeSinkFromContext(ctx context.Context) (*ToolOutcomeSink, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	sink, ok := ctx.Value(toolOutcomeSinkKey{}).(*ToolOutcomeSink)
+	return sink, ok && sink != nil
+}
+
 type ProviderToolKind string
 
 const (
@@ -192,11 +314,12 @@ func (t ProviderTool) Clone() ProviderTool {
 
 // Result is the result of a skill invocation
 type Result struct {
-	SkillName string `json:"skill_name"`
-	Success   bool   `json:"success"`
-	Data      any    `json:"data,omitempty"`
-	Error     string `json:"error,omitempty"`
-	Err       error  `json:"-"` // typed error preserved for sentinel checks
+	SkillName string       `json:"skill_name"`
+	Success   bool         `json:"success"`
+	Data      any          `json:"data,omitempty"`
+	Error     string       `json:"error,omitempty"`
+	Err       error        `json:"-"` // typed error preserved for sentinel checks
+	Outcome   *ToolOutcome `json:"-"`
 }
 
 // =============================================================================
@@ -1104,6 +1227,29 @@ func (r *Registry) Invoke(ctx context.Context, name string, input json.RawMessag
 			Success:   false,
 			Error:     err.Error(),
 			Err:       err,
+		}
+	}
+	if outcome, ok := NormalizeToolOutcome(result); ok {
+		switch outcome.Status {
+		case ToolStatusFailed:
+			err := outcome.Err
+			if err == nil {
+				err = fmt.Errorf("tool outcome failed")
+			}
+			return &Result{
+				SkillName: name,
+				Success:   false,
+				Error:     err.Error(),
+				Err:       err,
+				Outcome:   &outcome,
+			}
+		default:
+			return &Result{
+				SkillName: name,
+				Success:   true,
+				Data:      outcome.Result,
+				Outcome:   &outcome,
+			}
 		}
 	}
 

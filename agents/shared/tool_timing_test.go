@@ -700,12 +700,19 @@ func TestTimedToolCall_ConsultYieldDoesNotEmitFailureComplete(t *testing.T) {
 	})
 
 	call := providers.ToolCall{ID: "consult-yield", Name: "consult_peer", Arguments: `{"target_agent_type":"librarian"}`}
+	ctx = WithActiveToolCall(ctx, call)
 	_, err := TimedToolCall(ctx, "architect", call, func() (string, error) {
-		return "", ErrConsultYielded
+		skills.SetToolOutcomeOnContext(ctx, skills.YieldToolOutcome(&skills.YieldContinuation{
+			Kind:       "consult",
+			AwaitedIDs: []string{"consult-yield"},
+			ToolCallID: "consult-yield",
+			ToolName:   "consult_peer",
+		}))
+		return "", nil
 	})
 
-	if !errors.Is(err, ErrConsultYielded) {
-		t.Fatalf("expected ErrConsultYielded, got %v", err)
+	if err != nil {
+		t.Fatalf("TimedToolCall returned error for yield outcome: %v", err)
 	}
 	if len(events) != 1 {
 		t.Fatalf("expected only ToolCallStart for yielded consult, got %d events: %#v", len(events), events)

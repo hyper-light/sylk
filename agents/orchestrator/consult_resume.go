@@ -43,11 +43,13 @@ func (o *Orchestrator) resumeContinuation(
 	shared.RecordResumeReceiving(ctx, o.orchestratorBoardOrNil(), snapshot, results)
 
 	req := snapshot.Request
+	toolResult := formatOrchestratorAwaitResults(results)
+	shared.CompleteYieldedToolFromContinuation(ctx, snapshot, results, toolResult)
 	req.Messages = append(req.Messages, providers.Message{
 		Role:       providers.RoleTool,
 		ToolCallID: snapshot.AwaitToolCallID,
 		ToolName:   snapshot.AwaitToolName,
-		Content:    formatOrchestratorAwaitResults(results),
+		Content:    toolResult,
 	})
 
 	ctx = shared.WithContinuationStore(ctx, o.continuationStore)

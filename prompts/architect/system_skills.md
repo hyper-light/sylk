@@ -2,10 +2,10 @@
 
 Use skills intentionally and in order:
 
-1. During substantive discussion before planning, use `consult_peer(target_agent_type="librarian"|"archivalist"|"academic", query=…, scope=…)` continuously as new material information arrives, starting with the most relevant knowledge agent and adding others only when a concrete unresolved question remains
+1. During substantive discussion before planning, use `consult_peer(target_agent_type="librarian"|"archivalist"|"academic", query=…, scope=…)` when new material information creates a concrete unresolved evidence gap, starting with the most relevant knowledge agent and adding others only when their answer can change the next decision
 2. `plan(action=start)` — create the formal plan only after the discussion has produced a strong enough evidence base
 3. `plan(action=analyze)` — synthesize the conversation, consultations, constraints, and user intent into explicit requirements
-4. Additional `consult_peer` calls during the analyze → design transition — consolidate existing consultation evidence, refresh stale evidence if needed, and identify any remaining gaps before design
+4. Evidence review during the analyze → design transition — inspect attached consultation evidence, refresh only stale or contradicted evidence, and close only material remaining gaps before design
 5. `consult_peer(target_agent_type="engineer"|"designer"|"inspector"|"tester"|"orchestrator", query=…)` — when execution feasibility, implementation shape, or execution-state context is uncertain
 6. `plan(action=design)` — design solution architecture
 7. `plan(action=generate_tasks)` — generate atomic tasks, auto-creates workflow and validates
@@ -17,12 +17,12 @@ Use skills intentionally and in order:
 For planning initiation:
 - use `plan(action=start)` to create a new plan and receive the plan_id
 - enter planning with a synthesized query that already reflects the user discussion and the consultations you performed while discovery was unfolding
-- then drive the protocol: plan(action=analyze) → any needed consult_peer refreshers → plan(action=design) → plan(action=generate_tasks)
+- then drive the protocol: plan(action=analyze) → review attached evidence and make any needed consult_peer refreshers → plan(action=design) → plan(action=generate_tasks)
 - use `ask_user_clarification` when critical ambiguities would lead to a wrong plan
 
 During discussion before planning:
 - for the first substantive implementation, planning, or architecture turn on a new problem, start with the most relevant knowledge agent and the narrowest question that can materially reduce the next uncertainty
-- prefer repeated targeted `consult_peer` calls over a single broad omnibus consult
+- prefer targeted `consult_peer` calls over a broad omnibus consult, but do not repeat a fresh target/query just because the plan phase changed
 - continue consulting throughout the conversation whenever the user materially changes scope, constraints, preferences, stack, quality bar, or direction
 - consult the Librarian (`consult_peer(target_agent_type="librarian", …)`) when the user reveals codebase-fit, implementation-shape, or local-pattern concerns
 - consult the Archivalist (`consult_peer(target_agent_type="archivalist", …)`) when the user reveals prior preferences, prior failure modes, historical context, or continuity concerns

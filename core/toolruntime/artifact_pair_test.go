@@ -2,12 +2,14 @@ package toolruntime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/skills"
 )
 
 // These tests exercise the centralized tool-call artifact pair
@@ -83,6 +85,40 @@ func TestRecordToolCallEnd_PairsViaCompletesRelation(t *testing.T) {
 	}
 	if got := completed.Metadata["outcome"]; got != "success" {
 		t.Fatalf("outcome = %v, want success", got)
+	}
+}
+
+func TestExecuteRaw_ToolOutcomeYieldedSkipsCompletedArtifact(t *testing.T) {
+	registry := skills.NewRegistry()
+	mustRegisterSkill(t, registry, skills.NewSkill("consult_peer").
+		Description("Consult a peer").
+		Handler(func(context.Context, json.RawMessage) (any, error) {
+			return skills.YieldToolOutcome(&skills.YieldContinuation{
+				Kind:       "consult",
+				AwaitedIDs: []string{"consult-1"},
+				ToolCallID: "call-1",
+				ToolName:   "consult_peer",
+			}), nil
+		}).
+		Build())
+	rt := mustNewRuntime(t, registry, NewManifest("tester-agent", "test",
+		NewToolPolicy("consult_peer", EffectReadOnly, DomainConsultation, ExecutionModeLocal, WithVisibleByDefault()),
+	))
+	ctx, acc := newAccumulatorOnContext(t)
+
+	result, err := rt.ExecuteRaw(ctx, toolInvocation("consult_peer"))
+	if err != nil {
+		t.Fatalf("ExecuteRaw returned error for yielded tool: %v", err)
+	}
+	if !result.Yielded() {
+		t.Fatalf("result status = %q, want yielded", result.Status)
+	}
+	arts := acc.Artifacts()
+	if len(arts) != 1 {
+		t.Fatalf("yielded tool should emit only tool_started, got %d artifacts: %#v", len(arts), arts)
+	}
+	if arts[0].Kind != "tool_started" {
+		t.Fatalf("artifact kind = %q, want tool_started", arts[0].Kind)
 	}
 }
 

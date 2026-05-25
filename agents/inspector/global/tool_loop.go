@@ -229,12 +229,12 @@ func (gi *GlobalInspector) applyToolCalls(
 		if execResult.ToolDefsDirty {
 			gi.toolDefsDirty = true
 		}
+		if execResult.Yielded() {
+			yielded = true
+			return errCount, rerouted, delegated, delegatedMessage, yielded
+		}
 		isError := false
 		if err != nil {
-			if agentShared.IsConsultYielded(err) {
-				yielded = true
-				return errCount, rerouted, delegated, delegatedMessage, yielded
-			}
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`

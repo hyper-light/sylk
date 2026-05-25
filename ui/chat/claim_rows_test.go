@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -73,6 +74,85 @@ func TestClaimsNative_ArtifactStartCreatesRowWithoutStream(t *testing.T) {
 	}
 	if len(cycle.Artifacts) != 1 || cycle.Artifacts[0] != "art-tool-1" {
 		t.Errorf("cycle.Artifacts = %v, want [art-tool-1]", cycle.Artifacts)
+	}
+}
+
+func TestClaimsNative_ToolArtifactUsesArgsMetadataForInputSummary(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimArtifactAddedMsg{
+		ArtifactID:     "art-tool-args",
+		CycleID:        "cycle-args",
+		ClaimID:        "claim-args",
+		OwnerAgentID:   "architect",
+		OwnerAgentType: "architect",
+		AgentID:        "architect",
+		Kind:           "tool_started",
+		Reference:      "workspace_read",
+		Metadata: map[string]any{
+			"args": `{"op":"read","path":"README.md","include_tool_output":true}`,
+		},
+		CreatedAt: time.Now(),
+	})
+
+	row := m.ArtifactRowByID("art-tool-args")
+	if row == nil {
+		t.Fatal("tool artifact row missing")
+	}
+	if row.ArgsSummary != "op=read path=README.md" {
+		t.Fatalf("row.ArgsSummary = %q, want op=read path=README.md", row.ArgsSummary)
+	}
+
+	entry := m.history.Get(0)
+	if entry == nil || len(entry.ToolCalls) != 1 {
+		t.Fatalf("missing projected tool call: %+v", entry)
+	}
+	call := entry.ToolCalls[0]
+	if call.ToolName != "workspace_read" {
+		t.Fatalf("ToolName = %q, want workspace_read", call.ToolName)
+	}
+	if call.ArgsSummary == call.ToolName {
+		t.Fatalf("ArgsSummary duplicated ToolName: %q", call.ArgsSummary)
+	}
+	if !strings.Contains(call.FullArgs, `"path": "README.md"`) {
+		t.Fatalf("FullArgs = %q, want pretty args with path", call.FullArgs)
+	}
+}
+
+func TestClaimsNative_ToolArtifactCompletionUsesOutputMetadata(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimArtifactAddedMsg{
+		ArtifactID:     "art-tool-output",
+		CycleID:        "cycle-output",
+		ClaimID:        "claim-output",
+		OwnerAgentID:   "architect",
+		OwnerAgentType: "architect",
+		AgentID:        "architect",
+		Kind:           "tool_started",
+		Reference:      "workspace_read",
+		Metadata:       map[string]any{"args": `{"path":"README.md"}`},
+		CreatedAt:      time.Now(),
+	})
+	m.Update(msg.ClaimArtifactCompletedMsg{
+		StartArtifactID: "art-tool-output",
+		CycleID:         "cycle-output",
+		Outcome:         "success",
+		Duration:        10 * time.Millisecond,
+		Metadata:        map[string]any{"output": "read 3 files"},
+		CompletedAt:     time.Now().Add(10 * time.Millisecond),
+	})
+
+	entry := m.history.Get(0)
+	if entry == nil || len(entry.ToolCalls) != 1 {
+		t.Fatalf("missing projected tool call: %+v", entry)
+	}
+	call := entry.ToolCalls[0]
+	if !call.Completed || !call.Success {
+		t.Fatalf("tool call terminal state = completed:%v success:%v", call.Completed, call.Success)
+	}
+	if call.Output != "read 3 files" {
+		t.Fatalf("call.Output = %q, want metadata output", call.Output)
 	}
 }
 
@@ -475,12 +555,13 @@ func TestClaimsNative_ChildResponseTextDoesNotBecomeCycleAnswer(t *testing.T) {
 	})
 
 	m.Update(msg.ClaimResponseTextMsg{
-		SessionID: "ses-1",
-		CycleID:   "claim-architect",
-		ClaimID:   "claim-librarian",
-		AgentID:   "librarian",
-		Content:   "Consultation response intended for the architect only.",
-		CreatedAt: time.Now(),
+		SessionID:   "ses-1",
+		CycleID:     "claim-architect",
+		ClaimID:     "claim-librarian",
+		ParentRowID: "consult-start",
+		AgentID:     "librarian",
+		Content:     "Consultation response intended for the architect only.",
+		CreatedAt:   time.Now(),
 	})
 
 	entry := m.history.Get(0)
@@ -516,6 +597,17 @@ func TestClaimsNative_RootResponseTextBecomesCycleAnswer(t *testing.T) {
 		ActionType: "prompt",
 		Reason:     "Plan the CLI",
 	})
+	m.Update(msg.ClaimArtifactAddedMsg{
+		ArtifactID:     "pending-tool",
+		CycleID:        "claim-architect",
+		ClaimID:        "claim-architect",
+		OwnerAgentID:   "architect",
+		OwnerAgentType: "architect",
+		AgentID:        "architect",
+		Kind:           "tool_started",
+		Reference:      "search_skills",
+		CreatedAt:      time.Now().Add(-2 * time.Second),
+	})
 	m.Update(msg.ClaimResponseTextMsg{
 		SessionID: "ses-1",
 		CycleID:   "claim-architect",
@@ -531,6 +623,462 @@ func TestClaimsNative_RootResponseTextBecomesCycleAnswer(t *testing.T) {
 	}
 	if entry.Content != "Here is the final answer." {
 		t.Fatalf("entry.Content = %q, want final answer", entry.Content)
+	}
+	if len(entry.ToolCalls) != 1 || !entry.ToolCalls[0].Completed || !entry.ToolCalls[0].SyntheticCompletion {
+		t.Fatalf("root response_text should terminalize pending tool rows: %+v", entry.ToolCalls)
+	}
+	if entry.Streaming {
+		t.Fatal("root response_text should stop the cycle entry streaming state")
+	}
+	if entry.ThinkingStatus != "Complete" || entry.ThinkingText == "" {
+		t.Fatalf("root response_text should leave a terminal thinking block, got text=%q status=%q", entry.ThinkingText, entry.ThinkingStatus)
+	}
+}
+
+func TestClaimsNative_ClaimCycleDrivesThinkingAnimation(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "architect",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "claim-architect",
+		ActionType: "prompt",
+		Reason:     "Acknowledging request",
+	})
+
+	if !m.HasActiveAnimation() {
+		t.Fatal("active claim cycle should keep the chat decor tick chain alive")
+	}
+	entry := m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing architect cycle entry")
+	}
+	if entry.ThinkingText == "" {
+		t.Fatal("claim cycle entry did not get placeholder thinking text")
+	}
+	if entry.ThinkingStatus != "Acknowledging request" {
+		t.Fatalf("ThinkingStatus = %q, want Acknowledging request", entry.ThinkingStatus)
+	}
+	first := entry.ThinkingText
+
+	started := m.claimCycleAnimations["claim-architect"].started
+	m.Update(msg.DecorTickMsg{Time: started.Add(250 * time.Millisecond)})
+	entry = m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing architect cycle entry after decor tick")
+	}
+	if entry.ThinkingText == first {
+		t.Fatalf("ThinkingText did not advance on decor tick: %q", entry.ThinkingText)
+	}
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:         "architect",
+		SessionID:       "ses-1",
+		Active:          false,
+		CycleID:         "claim-architect",
+		TerminalOutcome: "success",
+	})
+	entry = m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing architect cycle entry after close")
+	}
+	if entry.Streaming {
+		t.Fatal("claim close did not stop streaming state")
+	}
+	if entry.ThinkingStatus != "Complete" || entry.ThinkingText == "" {
+		t.Fatalf("claim close did not leave terminal thinking state: text=%q status=%q", entry.ThinkingText, entry.ThinkingStatus)
+	}
+}
+
+func TestClaimsNative_RootTerminalClaimContextFinalizesCycleEntry(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "guide",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "claim-guide",
+		ActionType: "prompt",
+		Reason:     "Classifying request",
+	})
+	started := m.claimCycleAnimations["claim-guide"].started
+	m.Update(msg.DecorTickMsg{Time: started.Add(250 * time.Millisecond)})
+
+	m.Update(msg.ClaimContextMsg{
+		SessionID:    "ses-1",
+		CycleID:      "claim-guide",
+		ClaimID:      "claim-guide",
+		OwnerAgentID: "guide",
+		Context:      "Complete",
+		State:        "complete",
+	})
+
+	entry := m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing guide cycle entry after terminal context")
+	}
+	if entry.Streaming {
+		t.Fatal("terminal root claim context did not stop streaming state")
+	}
+	if entry.ThinkingStatus != "Complete" || entry.ThinkingText == "" {
+		t.Fatalf("terminal root claim context did not leave terminal thinking state: text=%q status=%q", entry.ThinkingText, entry.ThinkingStatus)
+	}
+	if _, ok := m.claimCycleAnimations["claim-guide"]; ok {
+		t.Fatal("terminal root claim context did not stop claim-cycle animation")
+	}
+
+	terminalText := entry.ThinkingText
+	m.Update(msg.DecorTickMsg{Time: started.Add(time.Second)})
+	entry = m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing guide cycle entry after post-terminal tick")
+	}
+	if entry.ThinkingText != terminalText {
+		t.Fatalf("terminal thinking text changed after post-terminal tick: before=%q after=%q", terminalText, entry.ThinkingText)
+	}
+}
+
+func TestClaimsNative_TerminalThinkingStatusIgnoresLateInProgressContext(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "guide",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "claim-guide",
+		ActionType: "prompt",
+		Reason:     "Classifying request",
+	})
+	m.Update(msg.ClaimContextMsg{
+		SessionID:    "ses-1",
+		CycleID:      "claim-guide",
+		ClaimID:      "claim-guide",
+		OwnerAgentID: "guide",
+		Context:      "Complete",
+		State:        "complete",
+	})
+	m.Update(msg.ClaimContextMsg{
+		SessionID:    "ses-1",
+		CycleID:      "claim-guide",
+		ClaimID:      "claim-guide",
+		OwnerAgentID: "guide",
+		Context:      "Request forwarded",
+		State:        "routing",
+	})
+
+	entry := m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing guide cycle entry")
+	}
+	if entry.Streaming {
+		t.Fatal("late in-progress context restarted streaming state")
+	}
+	if entry.ThinkingStatus != "Complete" {
+		t.Fatalf("late in-progress context overwrote terminal status: %q", entry.ThinkingStatus)
+	}
+}
+
+func TestClaimsNative_DuplicateActiveStatusDoesNotRestartTerminalCycleEntry(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "guide",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "claim-guide",
+		ActionType: "prompt",
+		Reason:     "Classifying request",
+	})
+	m.Update(msg.ClaimContextMsg{
+		SessionID:    "ses-1",
+		CycleID:      "claim-guide",
+		ClaimID:      "claim-guide",
+		OwnerAgentID: "guide",
+		Context:      "Complete",
+		State:        "complete",
+	})
+	entry := m.history.Get(0)
+	if entry == nil || entry.Streaming {
+		t.Fatalf("terminal context did not finalize entry before duplicate active: %+v", entry)
+	}
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "guide",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "claim-guide",
+		ActionType: "prompt",
+		Reason:     "Classifying request",
+	})
+	m.Update(msg.DecorTickMsg{Time: time.Now().Add(time.Second)})
+
+	entry = m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing guide cycle entry")
+	}
+	if entry.Streaming {
+		t.Fatal("duplicate active status restarted terminal cycle entry")
+	}
+	if entry.ThinkingStatus != "Complete" {
+		t.Fatalf("duplicate active status changed terminal status: %q", entry.ThinkingStatus)
+	}
+	if _, ok := m.claimCycleAnimations["claim-guide"]; ok {
+		t.Fatal("duplicate active status restarted claim-cycle animation")
+	}
+}
+
+func TestClaimsNative_CompleteStatusInvariantStopsClaimCycleSpinner(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "guide",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "claim-guide",
+		ActionType: "prompt",
+		Reason:     "Classifying request",
+	})
+	m.applyClaimContextToHistory("claim-guide", "Complete")
+	entry := m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing guide cycle entry")
+	}
+	if !entry.Streaming {
+		t.Fatal("test setup expected a streaming entry with terminal status")
+	}
+
+	m.Update(msg.DecorTickMsg{Time: time.Now().Add(time.Second)})
+
+	entry = m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing guide cycle entry after decor tick")
+	}
+	if entry.Streaming {
+		t.Fatal("claim-cycle tick kept spinning after terminal Complete status")
+	}
+	if entry.ThinkingStatus != "Complete" {
+		t.Fatalf("terminal invariant changed status: %q", entry.ThinkingStatus)
+	}
+	if _, ok := m.claimCycleAnimations["claim-guide"]; ok {
+		t.Fatal("claim-cycle tick left animation active after terminal Complete status")
+	}
+}
+
+func TestClaimsNative_StaleTerminalClaimContextDoesNotFinalizeCycleEntry(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "architect",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "claim-architect",
+		ActionType: "prompt",
+		Reason:     "Planning",
+	})
+	m.Update(msg.ClaimContextMsg{
+		SessionID:         "ses-1",
+		CycleID:           "claim-architect",
+		ClaimID:           "claim-architect",
+		OwnerAgentID:      "architect",
+		Context:           "Writing answer",
+		State:             "synthesizing",
+		ContextTransition: 2,
+	})
+	m.Update(msg.ClaimContextMsg{
+		SessionID:         "ses-1",
+		CycleID:           "claim-architect",
+		ClaimID:           "claim-architect",
+		OwnerAgentID:      "architect",
+		Context:           "Complete",
+		State:             "complete",
+		ContextTransition: 1,
+	})
+
+	entry := m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing architect cycle entry")
+	}
+	if !entry.Streaming {
+		t.Fatal("stale terminal context finalized active cycle entry")
+	}
+	if entry.ThinkingStatus != "Writing answer" {
+		t.Fatalf("stale terminal context changed thinking status: %q", entry.ThinkingStatus)
+	}
+	if _, ok := m.claimCycleAnimations["claim-architect"]; !ok {
+		t.Fatal("stale terminal context stopped active claim-cycle animation")
+	}
+}
+
+func TestClaimsNative_ChildClaimContextTargetsExactParentRow(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "architect",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "claim-architect",
+		ActionType: "prompt",
+		Reason:     "Planning",
+	})
+	for _, artifactID := range []string{"consult-one", "consult-two"} {
+		m.Update(msg.ClaimArtifactAddedMsg{
+			ArtifactID:     artifactID,
+			CycleID:        "claim-architect",
+			ClaimID:        "claim-architect",
+			OwnerAgentID:   "architect",
+			OwnerAgentType: "architect",
+			AgentID:        "architect",
+			Kind:           "consult_started",
+			Reference:      "librarian",
+			TargetAgentID:  "librarian",
+			CreatedAt:      time.Now(),
+		})
+	}
+
+	m.Update(msg.ClaimContextMsg{
+		SessionID:    "ses-1",
+		CycleID:      "claim-architect",
+		ClaimID:      "claim-librarian-two",
+		ParentRowID:  "consult-two",
+		OwnerAgentID: "librarian",
+		Context:      "Running workspace_read",
+		State:        "tool_executing",
+	})
+
+	entry := m.history.Get(0)
+	if entry == nil || len(entry.ToolCalls) != 2 {
+		t.Fatalf("missing duplicated consult rows: %+v", entry)
+	}
+	firstChildren := entry.ToolCalls[0].InterAgent.Children
+	if len(firstChildren) != 0 {
+		t.Fatalf("first consult received child context meant for second: %+v", firstChildren)
+	}
+	secondChildren := entry.ToolCalls[1].InterAgent.Children
+	if len(secondChildren) != 1 {
+		t.Fatalf("second consult children = %d, want 1", len(secondChildren))
+	}
+	if secondChildren[0].ThinkingStatus != "Running workspace_read" {
+		t.Fatalf("second child ThinkingStatus = %q", secondChildren[0].ThinkingStatus)
+	}
+	if entry.ThinkingStatus != "Planning" {
+		t.Fatalf("child claim context leaked onto root ThinkingStatus = %q", entry.ThinkingStatus)
+	}
+}
+
+func TestClaimsNative_ChildResponseTextTargetsExactParentRow(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "architect",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "claim-architect",
+		ActionType: "prompt",
+		Reason:     "Planning",
+	})
+	for _, artifactID := range []string{"consult-one", "consult-two"} {
+		m.Update(msg.ClaimArtifactAddedMsg{
+			ArtifactID:     artifactID,
+			CycleID:        "claim-architect",
+			ClaimID:        "claim-architect",
+			OwnerAgentID:   "architect",
+			OwnerAgentType: "architect",
+			AgentID:        "architect",
+			Kind:           "consult_started",
+			Reference:      "librarian",
+			TargetAgentID:  "librarian",
+			CreatedAt:      time.Now(),
+		})
+	}
+
+	m.Update(msg.ClaimResponseTextMsg{
+		SessionID:   "ses-1",
+		CycleID:     "claim-architect",
+		ClaimID:     "claim-librarian-two",
+		ParentRowID: "consult-two",
+		AgentID:     "librarian",
+		Content:     "Second consult response.",
+		CreatedAt:   time.Now(),
+	})
+
+	entry := m.history.Get(0)
+	if entry == nil || len(entry.ToolCalls) != 2 {
+		t.Fatalf("missing duplicated consult rows: %+v", entry)
+	}
+	if len(entry.ToolCalls[0].InterAgent.Children) != 0 {
+		t.Fatalf("first consult received response meant for second: %+v", entry.ToolCalls[0].InterAgent.Children)
+	}
+	children := entry.ToolCalls[1].InterAgent.Children
+	if len(children) != 1 {
+		t.Fatalf("second consult children = %d, want 1", len(children))
+	}
+	if !children[0].Completed || children[0].ResultSummary != "Second consult response." {
+		t.Fatalf("second child response not completed correctly: %+v", children[0])
+	}
+	if entry.Content != "" {
+		t.Fatalf("child response_text leaked onto cycle answer = %q", entry.Content)
+	}
+}
+
+func TestClaimsNative_TestamentContextUpdatesNestedChildStatus(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:    "architect",
+		SessionID:  "ses-1",
+		Active:     true,
+		CycleID:    "claim-architect",
+		ActionType: "prompt",
+		Reason:     "Planning",
+	})
+	m.Update(msg.ClaimArtifactAddedMsg{
+		ArtifactID:     "consult-start",
+		CycleID:        "claim-architect",
+		ClaimID:        "claim-architect",
+		OwnerAgentID:   "architect",
+		OwnerAgentType: "architect",
+		AgentID:        "architect",
+		Kind:           "consult_started",
+		Reference:      "librarian",
+		CreatedAt:      time.Now(),
+	})
+	m.Update(msg.ClaimArtifactAddedMsg{
+		ArtifactID:     "librarian-tool",
+		CycleID:        "claim-architect",
+		ParentRowID:    "consult-start",
+		ClaimID:        "claim-librarian",
+		OwnerAgentID:   "librarian",
+		OwnerAgentType: "librarian",
+		AgentID:        "librarian",
+		Kind:           "tool_started",
+		Reference:      "workspace_read",
+		CreatedAt:      time.Now(),
+	})
+	m.Update(msg.TestamentContextMsg{
+		SessionID:         "ses-1",
+		AccumulatorID:     "acc-librarian",
+		ClaimID:           "claim-librarian",
+		AgentID:           "librarian",
+		CycleID:           "claim-architect",
+		ParentRowID:       "consult-start",
+		Context:           "Building repository inventory",
+		ContextTransition: 1,
+	})
+
+	entry := m.history.Get(0)
+	if entry == nil || len(entry.ToolCalls) != 1 || entry.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("missing consult row after testament context: %+v", entry)
+	}
+	children := entry.ToolCalls[0].InterAgent.Children
+	if len(children) != 1 {
+		t.Fatalf("consult children = %d, want 1", len(children))
+	}
+	if children[0].ThinkingStatus != "Building repository inventory" {
+		t.Fatalf("child ThinkingStatus = %q", children[0].ThinkingStatus)
+	}
+	if children[0].ThinkingStartedAt.IsZero() {
+		t.Fatal("child testament context should start nested thinking animation")
 	}
 }
 

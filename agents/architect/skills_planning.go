@@ -201,7 +201,7 @@ func consultSkill(a *Architect) *skills.Skill {
 		EnumParam("depth", "Research depth for Academic consultations", shared.ResearchDepthEnumValues(), false).
 		StringParam("session_id", "Session identifier", false).
 		StringParam("plan_id", "Plan identifier for protocol-driven consultation", false).
-		Usage("Use during conversation as new material information arrives, and again during planning to consolidate what you learned. Prefer repeated targeted consults over one broad consult. Do not defer obvious codebase, historical, or Academic evidence gathering until formal plan creation. `consult(mode=pre_planning)` should synthesize and refresh the evidence already gathered during discussion, not begin from zero.").
+		Usage("Use during conversation as new material information arrives, and during planning only when existing evidence is missing, stale, contradicted, or too broad. Prefer targeted consults over one broad consult, but do not repeat a fresh target/query just because the plan phase changed.").
 		BestPractice("On the first substantive turn for a new implementation, planning, or architecture problem, start with the most relevant knowledge agent and the narrowest question that can materially reduce the next uncertainty. Add other knowledge agents only as concrete unresolved questions remain.").
 		BestPractice("During live discussion, consult the Librarian when codebase-fit or local-pattern questions emerge, the Archivalist when historical decisions or preferences matter, and the Academic when architecture quality, correctness, performance, testing, infrastructure, or tradeoffs materially affect the outcome.").
 		BestPractice("Do not wait for literal keywords like 'research' or 'benchmark' to consult the Academic. Use it whenever the conversation materially needs stronger alternatives, best practices, or external grounding.").
@@ -1889,6 +1889,7 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 			}
 			req = a.enrichPlanningRequest(req)
 			plan := newProtocolPlan(req, requestCorrelationID)
+			a.drainStagedEvidenceIntoPlan(plan)
 			if err := a.persistPlanState(plan); err != nil {
 				return nil, err
 			}
@@ -1915,16 +1916,16 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 
 // startPlanningProtocolInstructions returns the protocol field for the
 // start_planning skill result. When auto-approve is enabled, the LLM is
-// instructed to invoke route_plan_acceptance after generate_tasks. When
+// instructed to invoke plan_acceptance(action=route) after generate_tasks. When
 // approval is required, the LLM must wait for the user's response.
 func startPlanningProtocolInstructions(autoApprove bool) string {
 	const base = "Drive the planning protocol using the plan_id above. " +
 		"Invoke these skills in order:\n" +
 		"1. plan(action=analyze, plan_id=<plan_id>, query=<the query>)\n" +
-		"2. consult(mode=pre_planning, plan_id=<plan_id>) — consolidate and refresh the consultation evidence already gathered during discussion.\n" +
-		"3. If the request is still broadly vague or underspecified, invoke route_requirements_research and STOP. " +
-		"Use ask_user_question only for one or two narrow decisions. If the blocker is codebase or history evidence, " +
-		"consult the Librarian or Archivalist instead. If the blocker is architectural quality, correctness, performance, testing, infrastructure, deployment, or tradeoffs, consult the Academic instead of guessing.\n" +
+		"2. Review attached consultation evidence. Invoke consult_peer only for a concrete missing, stale, contradicted, or too-broad evidence gap; do not repeat a fresh target/query just because the phase changed.\n" +
+		"3. If the request is still broadly vague or underspecified, invoke academic_research(action=request) and STOP. " +
+		"Use ask_user_clarification only for one or two narrow decisions. If the blocker is codebase or history evidence, " +
+		"consult_peer the Librarian or Archivalist instead. If the blocker is architectural quality, correctness, performance, testing, infrastructure, deployment, or tradeoffs, consult_peer the Academic instead of guessing.\n" +
 		"4. plan(action=design, plan_id=<plan_id>)\n" +
 		"5. plan(action=generate_tasks, plan_id=<plan_id>) — auto-creates workflow and validates.\n" +
 		"6. The system renders the plan structure separately in the UI — the user already sees it.\n" +
@@ -1933,8 +1934,8 @@ func startPlanningProtocolInstructions(autoApprove bool) string {
 
 	if autoApprove {
 		return base + "\n" +
-			"7. Invoke route_plan_acceptance with the plan_id and a brief summary as user_response.\n" +
-			"8. After invoking route_plan_acceptance, STOP. The approval and orchestrator handoff continue asynchronously."
+			"7. Invoke plan_acceptance(action=route) with the plan_id and a brief summary as user_response.\n" +
+			"8. After invoking plan_acceptance(action=route), STOP. The approval and orchestrator handoff continue asynchronously."
 	}
 	return base + "\n" +
 		"   Invite the user to approve or request changes — use natural phrasing, not a template.\n" +
@@ -1942,7 +1943,7 @@ func startPlanningProtocolInstructions(autoApprove bool) string {
 		"   is already starting or that their reply will immediately start work in this turn.\n" +
 		"   Avoid phrases like \"kick it off\", \"start building\", \"start implementing\",\n" +
 		"   \"get started\", or \"ship it\".\n" +
-		"   Do NOT invoke route_plan_acceptance — wait for the user's response."
+		"   Do NOT invoke plan_acceptance — wait for the user's response."
 }
 
 // ---------------------------------------------------------------------------

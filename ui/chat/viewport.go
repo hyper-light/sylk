@@ -506,14 +506,14 @@ const (
 )
 
 type toggleTarget struct {
-	entryID             string
-	entryIndex          int
-	kind                toggleTargetKind
-	toolCallIndex       int
-	childIndex          int
-	childToolCallIdx    int
-	childPath           []int
-	interAgentPath      []int
+	entryID           string
+	entryIndex        int
+	kind              toggleTargetKind
+	toolCallIndex     int
+	childIndex        int
+	childToolCallIdx  int
+	childPath         []int
+	interAgentPath    []int
 	toolCallKey       string
 	toolCallName      string
 	childID           string
@@ -1248,6 +1248,12 @@ func (vp *Viewport) resolveCopyTarget(entry *ChatEntry, entryHeight, lineInEntry
 // thinking summary occupies. This matches the renderer's Phase 2 logic:
 // one line for the "◉ thought for X.Xs" summary when ThinkingElapsed > 0.
 func thinkingSummaryLines(entry *ChatEntry) int {
+	if entry != nil &&
+		!entry.Streaming &&
+		strings.TrimSpace(entry.Content) != "" &&
+		strings.EqualFold(strings.TrimSpace(entry.ThinkingStatus), "Complete") {
+		return 0
+	}
 	if entry.ThinkingElapsed > 0 {
 		return 1
 	}

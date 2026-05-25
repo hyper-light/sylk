@@ -1279,6 +1279,8 @@ type requirementsPayload struct {
 	Recommendations         json.RawMessage `json:"provisional_recommendations"`
 	Tradeoffs               json.RawMessage `json:"tradeoffs"`
 	RecommendationNarrative string          `json:"recommendation_narrative"`
+	Complexity              string          `json:"complexity"`
+	RecommendedPath         string          `json:"recommended_path"`
 	Scope                   string          `json:"scope"`
 	Priority                string          `json:"priority"`
 }
@@ -1308,7 +1310,10 @@ func requirementsMetadataFromPayload(payload requirementsPayload) map[string]any
 	unknowns := parseStringList(payload.Unknowns)
 	recommendations := parseStringList(payload.Recommendations)
 	tradeoffs := parseStringList(payload.Tradeoffs)
-	if len(questions) == 0 && len(unknowns) == 0 && len(recommendations) == 0 && len(tradeoffs) == 0 {
+	complexity := strings.TrimSpace(payload.Complexity)
+	recommendedPath := strings.TrimSpace(payload.RecommendedPath)
+	if len(questions) == 0 && len(unknowns) == 0 && len(recommendations) == 0 && len(tradeoffs) == 0 &&
+		complexity == "" && recommendedPath == "" {
 		return nil
 	}
 	metadata := map[string]any{}
@@ -1326,6 +1331,12 @@ func requirementsMetadataFromPayload(payload requirementsPayload) map[string]any
 	}
 	if narrative := strings.TrimSpace(payload.RecommendationNarrative); narrative != "" {
 		metadata["recommendation_narrative"] = narrative
+	}
+	if complexity != "" {
+		metadata["complexity"] = complexity
+	}
+	if recommendedPath != "" {
+		metadata[metadataRecommendedPath] = recommendedPath
 	}
 	return metadata
 }
@@ -1957,6 +1968,8 @@ Return JSON only, exactly:
   "recommendation_narrative": "...",
   "clarification_questions": ["..."],
   "unknowns": ["..."],
+  "complexity": "low|medium|high|critical",
+  "recommended_path": "minimal|full",
   "scope": "project|module|file",
   "priority": "low|medium|high|critical"
 }
@@ -1969,12 +1982,14 @@ Hard limits:
 - Only include clarification_questions when the request has GENUINE ambiguity that would lead to fundamentally different implementations. For straightforward, well-understood, or single-scope requests, set clarification_questions to an empty array
 - If the user asks for recommendations or preferences, include opinionated provisional_recommendations plus concise tradeoffs
 - For recommendation questions, include at least 2 provisional_recommendations and 2 tradeoffs
+- Set recommended_path="minimal" only for trivial, single-scope, low-risk requests with no external dependencies; otherwise use "full"
 `
 }
 
 func buildDesignPrompt(requirements *Requirements, patterns *CodebasePatterns) string {
 	base := fmt.Sprintf(ArchitectureDesignPrompt, mustJSON(requirements), mustJSON(patterns))
-	return base + `
+	evidence := evidenceDigestFromRequirements(requirements)
+	return base + "\n\nConsultation Evidence:\n" + mustJSON(evidence) + `
 
 Return JSON only, exactly:
 {
@@ -2013,7 +2028,7 @@ Hard limits:
 
 func buildTaskPrompt(architecture *SolutionArchitecture, constraints *PlanConstraints) string {
 	base := fmt.Sprintf(TaskDecompositionPrompt, mustJSON(architecture))
-	return base + "\n\nConstraints:\n" + mustJSON(constraints) + `
+	return base + "\n\nConsultation Evidence:\n" + mustJSON(evidenceDigestFromArchitecture(architecture)) + "\n\nConstraints:\n" + mustJSON(constraints) + `
 
 Return JSON only, exactly:
 {

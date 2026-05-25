@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -262,6 +263,11 @@ type resumablePrimaryState struct {
 	children       map[string]struct{}
 }
 
+type claimCycleAnimation struct {
+	agentID string
+	started time.Time
+}
+
 // Model is the Bubble Tea model for the chat panel.
 // It displays a scrollable history of chat entries with virtual scrolling,
 // supports LLM streaming, and handles keyboard navigation.
@@ -297,6 +303,11 @@ type Model struct {
 	// Completed entries with pending inter-agent rows still need spinner ticks
 	// while a consultation/challenge is awaiting a later response.
 	pendingInterAgent map[int]struct{}
+
+	// Claims-native cycles are not backed by streamSlot, but still need the
+	// same decor cadence for placeholder thinking text, elapsed timers, and
+	// active tool rows.
+	claimCycleAnimations map[string]claimCycleAnimation
 
 	// Completed parent turns that are awaiting a same-agent continuation after
 	// nested consult/challenge work remain resumable without staying visually live.
@@ -578,6 +589,7 @@ func New(th *theme.Theme, historyCapacity int) *Model {
 		thinkingIdx:          -1,
 		planEntryIdx:         -1,
 		pendingInterAgent:    make(map[int]struct{}),
+		claimCycleAnimations: make(map[string]claimCycleAnimation),
 		resumablePrimaries:   make(map[string]resumablePrimaryState),
 		resumableChildOwners: make(map[string]string),
 		thinkingGradient:     th.Palette.ThinkingGradient(),
@@ -1730,8 +1742,8 @@ func (m *Model) historyIndexForCorrelation(correlationID string) int {
 // activeStreamingIndices returns the history indices of entries currently
 // receiving streaming content or tool-call activity.
 func (m *Model) activeStreamingIndices() []int {
-	seen := make(map[int]struct{}, len(m.streams)+len(m.pendingInterAgent)+1)
-	indices := make([]int, 0, len(m.streams)+len(m.pendingInterAgent)+1)
+	seen := make(map[int]struct{}, len(m.streams)+len(m.pendingInterAgent)+len(m.claimCycleAnimations)+1)
+	indices := make([]int, 0, len(m.streams)+len(m.pendingInterAgent)+len(m.claimCycleAnimations)+1)
 	for _, slot := range m.streams {
 		if slot.accumulator != nil {
 			idx := slot.accumulator.EntryIndex()
@@ -1741,6 +1753,17 @@ func (m *Model) activeStreamingIndices() []int {
 			seen[idx] = struct{}{}
 			indices = append(indices, idx)
 		}
+	}
+	for cycleID := range m.claimCycleAnimations {
+		idx := m.historyIndexForCorrelation(cycleID)
+		if idx < 0 {
+			continue
+		}
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		indices = append(indices, idx)
 	}
 	for idx := range m.pendingInterAgent {
 		if _, ok := seen[idx]; ok {
@@ -3668,6 +3691,7 @@ func (m *Model) HasActiveAnimation() bool {
 		len(m.streams) > 0 ||
 		len(m.nestedStreams) > 0 ||
 		len(m.pendingInterAgent) > 0 ||
+		len(m.claimCycleAnimations) > 0 ||
 		len(m.steeringPending) > 0 ||
 		!m.highlightUntil.IsZero() ||
 		m.viewport.HasEdgeFlash(now)
@@ -4192,12 +4216,55 @@ func (m *Model) tickThinking(now time.Time) {
 	if m.tickNestedStreamThinking(now) {
 		updated = true
 	}
+	if m.tickClaimCycleThinking(now) {
+		updated = true
+	}
 	if m.tickPendingInterAgentHistory(now) {
 		updated = true
 	}
 	if updated {
 		m.viewDirty = true
 	}
+}
+
+func (m *Model) tickClaimCycleThinking(now time.Time) bool {
+	if len(m.claimCycleAnimations) == 0 {
+		return false
+	}
+	updated := false
+	for cycleID, anim := range m.claimCycleAnimations {
+		idx := m.historyIndexForCorrelation(cycleID)
+		if idx < 0 {
+			delete(m.claimCycleAnimations, cycleID)
+			continue
+		}
+		entry := m.history.Get(idx)
+		if entry == nil || !entry.Streaming {
+			delete(m.claimCycleAnimations, cycleID)
+			continue
+		}
+		started := anim.started
+		if started.IsZero() {
+			started = entry.Timestamp
+			if started.IsZero() {
+				started = now
+			}
+			anim.started = started
+			m.claimCycleAnimations[cycleID] = anim
+		}
+		agentID := firstNonEmptyString(anim.agentID, entry.AgentID, entry.AgentType)
+		status := sanitizeThinkingMessage(entry.ThinkingStatus)
+		if claimContextTerminal("", status) {
+			delete(m.claimCycleAnimations, cycleID)
+			m.finalizeClaimEntry(cycleID, now)
+			updated = true
+			continue
+		}
+		if m.renderClaimCycleThinkingEntry(idx, agentID, status, started, now) {
+			updated = true
+		}
+	}
+	return updated
 }
 
 // ---------------------------------------------------------------------------
@@ -4935,6 +5002,19 @@ func (m *Model) renderThinkingEntry(idx int, agentID, retryText string, start, n
 	return m.writeThinkingEntry(idx, text, status, m.thinkingColorFor(elapsed))
 }
 
+func (m *Model) renderClaimCycleThinkingEntry(idx int, agentID, status string, start, now time.Time) bool {
+	if idx < 0 || start.IsZero() {
+		return false
+	}
+	elapsed := thinkingElapsed(start, now)
+	text := fmt.Sprintf("%s  %s", spinnerFrames[thinkingFrameAt(elapsed)], formatToolDuration(elapsed))
+	status = sanitizeThinkingMessage(status)
+	if status == "" {
+		status = thinkingStatusFor(agentID, "", elapsed)
+	}
+	return m.writeThinkingEntry(idx, text, status, m.thinkingColorFor(elapsed))
+}
+
 // agentStateDetailForEntry returns the current agent-state detail for the
 // entry at idx, or "" if no non-terminal state is attached. Looks up the
 // entry's correlation via the stream slot map and consults m.agentStates.
@@ -5648,9 +5728,11 @@ func (m *Model) handleClaimsAgentStatus(ev msg.ClaimsAgentStatusMsg) tea.Cmd {
 		// Render the cycle as a ChatEntry so the chat tree has a
 		// real row to attach artifacts to. Idempotent — a duplicate
 		// open does not create a duplicate entry.
-		m.ensureCycleChatEntry(cycleID, ev.AgentID, ev.SessionID, ev.StreamCorrelationID)
+		idx := m.ensureCycleChatEntry(cycleID, ev.AgentID, ev.SessionID, ev.StreamCorrelationID)
+		m.startClaimCycleAnimation(cycleID, ev.AgentID, ev.Reason, idx)
 	} else {
 		m.claimRows.closeCycleRow(cycleID, ev.TerminalOutcome)
+		delete(m.claimCycleAnimations, cycleID)
 		m.finalizeClaimEntry(cycleID, time.Now())
 	}
 	return nil
@@ -5661,9 +5743,9 @@ func (m *Model) handleClaimsAgentStatus(ev msg.ClaimsAgentStatusMsg) tea.Cmd {
 // no-op. Uses the cycle owner's identity (passed in from
 // ClaimsAgentStatusMsg.AgentID, which is the bridge's resolved cycle
 // owner — NOT the issuer).
-func (m *Model) ensureCycleChatEntry(cycleID, ownerAgentID, sessionID, streamCorrelationID string) {
+func (m *Model) ensureCycleChatEntry(cycleID, ownerAgentID, sessionID, streamCorrelationID string) int {
 	if strings.TrimSpace(cycleID) == "" {
-		return
+		return -1
 	}
 	streamCID := strings.TrimSpace(streamCorrelationID)
 	// Look for an existing entry under EITHER the cycle ID or the
@@ -5676,7 +5758,7 @@ func (m *Model) ensureCycleChatEntry(cycleID, ownerAgentID, sessionID, streamCor
 		m.history.UpdateAt(idx, func(e *ChatEntry) {
 			adoptCycleAttribution(e, ownerAgentID, sessionID, streamCID)
 		})
-		return
+		return idx
 	}
 	if streamCID != "" {
 		if idx := m.historyIndexForCorrelation(streamCID); idx >= 0 {
@@ -5686,7 +5768,7 @@ func (m *Model) ensureCycleChatEntry(cycleID, ownerAgentID, sessionID, streamCor
 				}
 				adoptCycleAttribution(e, ownerAgentID, sessionID, streamCID)
 			})
-			return
+			return idx
 		}
 	}
 	entry := &ChatEntry{
@@ -5703,8 +5785,67 @@ func (m *Model) ensureCycleChatEntry(cycleID, ownerAgentID, sessionID, streamCor
 	if streamCID != "" {
 		entry.AdditionalCorrelationIDs = []string{streamCID}
 	}
-	m.history.Push(entry)
+	m.PushEntry(entry)
+	return m.history.Len() - 1
+}
+
+func (m *Model) startClaimCycleAnimation(cycleID, agentID, status string, idx int) {
+	cycleID = strings.TrimSpace(cycleID)
+	if cycleID == "" || idx < 0 {
+		return
+	}
+	if m.historyEntryTerminalComplete(idx) {
+		delete(m.claimCycleAnimations, cycleID)
+		return
+	}
+	now := time.Now()
+	anim := m.claimCycleAnimations[cycleID]
+	if anim.started.IsZero() {
+		anim.started = now
+	}
+	if strings.TrimSpace(agentID) != "" {
+		anim.agentID = strings.TrimSpace(agentID)
+	}
+	m.claimCycleAnimations[cycleID] = anim
+	m.seedClaimCycleThinkingEntry(idx, anim.agentID, status, anim.started, now)
+}
+
+func (m *Model) seedClaimCycleThinkingEntry(idx int, agentID, status string, started, now time.Time) {
+	if idx < 0 {
+		return
+	}
+	status = sanitizeThinkingMessage(status)
+	if status == "" {
+		status = thinkingStatusFor(agentID, "", 0)
+	}
+	text := fmt.Sprintf("%s  %s", spinnerFrames[0], formatToolDuration(thinkingElapsed(started, now)))
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		if entryTerminalComplete(e) {
+			return
+		}
+		if e.ThinkingText == "" {
+			e.ThinkingText = text
+		}
+		if e.ThinkingStatus == "" {
+			e.ThinkingStatus = status
+		}
+		e.Streaming = true
+		invalidateChatEntryRender(e)
+	})
 	m.viewDirty = true
+}
+
+func (m *Model) historyEntryTerminalComplete(idx int) bool {
+	if m == nil || idx < 0 {
+		return false
+	}
+	return entryTerminalComplete(m.history.Get(idx))
+}
+
+func entryTerminalComplete(e *ChatEntry) bool {
+	return e != nil &&
+		!e.Streaming &&
+		strings.EqualFold(strings.TrimSpace(e.ThinkingStatus), "complete")
 }
 
 // adoptCycleAttribution fills missing attribution on a cycle entry
@@ -5784,6 +5925,7 @@ func (m *Model) handleClaimArtifactAdded(ev msg.ClaimArtifactAddedMsg) tea.Cmd {
 			SessionID:    "",
 			CycleID:      ev.CycleID,
 			ClaimID:      ev.ClaimID,
+			ParentRowID:  ev.ParentRowID,
 			AgentID:      ev.AgentID,
 			Content:      ev.Reference,
 			CreatedAt:    ev.CreatedAt,
@@ -5867,16 +6009,20 @@ func (m *Model) handleClaimArtifactCompleted(ev msg.ClaimArtifactCompletedMsg) t
 		// metadata still flips it via the error field below.
 		status = ArtifactRowStatusSuccess
 	}
-	errMsg := asString(ev.Metadata["error"])
+	errMsg := claimArtifactMetadataText(ev.Metadata, "error")
 	if errMsg != "" && status == ArtifactRowStatusSuccess {
 		status = ArtifactRowStatusFailure
+	}
+	summary := ev.Summary
+	if summary == "" {
+		summary = claimArtifactCompletionSummary(ev.Metadata)
 	}
 	completed := m.claimRows.completeArtifactRow(
 		ev.StartArtifactID,
 		status,
 		ev.CompletedAt,
 		ev.Duration,
-		ev.Summary,
+		summary,
 		errMsg,
 		ev.Metadata,
 	)
@@ -5897,7 +6043,16 @@ func (m *Model) handleClaimContext(ev msg.ClaimContextMsg) tea.Cmd {
 	if ev.SuppressChat {
 		return nil
 	}
-	r := m.claimRows.updateClaimContext(ev.CycleID, ev.Context, ev.ContextTransition)
+	claimID := strings.TrimSpace(ev.ClaimID)
+	cycleID := strings.TrimSpace(ev.CycleID)
+	terminal := claimContextTerminal(ev.State, ev.Context)
+	if strings.TrimSpace(ev.ParentRowID) != "" {
+		if m.applyChildClaimThinkingStatusToHistory(cycleID, ev.ParentRowID, claimID, ev.OwnerAgentID, ev.Context, terminal) {
+			m.viewDirty = true
+		}
+		return nil
+	}
+	r := m.claimRows.updateClaimContext(cycleID, ev.Context, ev.ContextTransition)
 	if r != nil {
 		if r.OwnerAgentID == "" && ev.OwnerAgentID != "" {
 			r.OwnerAgentID = ev.OwnerAgentID
@@ -5908,7 +6063,12 @@ func (m *Model) handleClaimContext(ev msg.ClaimContextMsg) tea.Cmd {
 		if r.SessionID == "" && ev.SessionID != "" {
 			r.SessionID = ev.SessionID
 		}
-		m.applyClaimContextToHistory(ev.CycleID, ev.Context)
+		if terminal {
+			delete(m.claimCycleAnimations, cycleID)
+			m.finalizeClaimEntry(cycleID, time.Now())
+		} else {
+			m.applyClaimContextToHistory(cycleID, ev.Context)
+		}
 	}
 	return nil
 }
@@ -5929,8 +6089,8 @@ func (m *Model) handleClaimResponseText(ev msg.ClaimResponseTextMsg) tea.Cmd {
 	if cycleID == "" || content == "" {
 		return nil
 	}
-	if claimID != "" && claimID != cycleID {
-		if m.applyChildClaimResponseTextToHistory(cycleID, claimID, ev.AgentID, content) {
+	if strings.TrimSpace(ev.ParentRowID) != "" {
+		if m.applyChildClaimResponseTextToHistory(cycleID, ev.ParentRowID, claimID, ev.AgentID, content) {
 			m.viewDirty = true
 		}
 		return nil
@@ -5941,10 +6101,31 @@ func (m *Model) handleClaimResponseText(ev msg.ClaimResponseTextMsg) tea.Cmd {
 	}
 	m.history.UpdateAt(idx, func(e *ChatEntry) {
 		e.Content = content
+		m.finalizeClaimEntryFields(e, nonZeroChatTime(ev.CreatedAt))
 		invalidateChatEntryRender(e)
 	})
 	m.viewDirty = true
 	return nil
+}
+
+func claimContextTerminal(state, contextValue string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "complete", "completed", "success", "passed", "errored", "error", "failed", "failure", "cancelled", "canceled", "timeout":
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(contextValue)) {
+	case "complete", "completed":
+		return true
+	default:
+		return false
+	}
+}
+
+func nonZeroChatTime(t time.Time) time.Time {
+	if t.IsZero() {
+		return time.Now()
+	}
+	return t
 }
 
 // isVisibleArtifactKindForChat is the chat panel's defensive copy
@@ -5969,15 +6150,19 @@ func (m *Model) handleTestamentContext(ev msg.TestamentContextMsg) tea.Cmd {
 	if m.claimRows == nil {
 		m.claimRows = newClaimRowIndex()
 	}
-	m.claimRows.updateTestamentContext(
+	row := m.claimRows.updateTestamentContext(
 		ev.AccumulatorID,
 		ev.TestamentID,
 		ev.ClaimID,
 		ev.CycleID,
+		ev.ParentRowID,
 		ev.AgentID,
 		ev.Context,
 		ev.ContextTransition,
 	)
+	if row != nil {
+		m.applyTestamentContextToHistory(row)
+	}
 	return nil
 }
 
@@ -5988,9 +6173,213 @@ func asString(v any) string {
 	return ""
 }
 
+const claimArtifactArgsSummaryMaxRunes = 60
+
+var claimArtifactPriorityArgKeys = [...]string{
+	"path", "file_path", "pattern", "query", "command", "script", "url",
+	"target", "target_agent", "target_agents", "request", "activity_id",
+	"target_activity_id", "claim_id", "name", "content", "message",
+}
+
 func shortenArtifactSummary(ev msg.ClaimArtifactAddedMsg) string {
-	if ev.Reference != "" {
-		return ev.Reference
+	if summary := claimArtifactMetadataText(ev.Metadata, "args_summary"); summary != "" {
+		return truncateClaimArtifactSummary(summary)
 	}
-	return ev.Kind
+	if summary := summarizeClaimArtifactArgs(ev.Reference, claimArtifactRawArgs(ev.Metadata)); summary != "" {
+		return summary
+	}
+	if summary := claimArtifactMetadataText(ev.Metadata, "summary"); summary != "" &&
+		!claimArtifactLabelDuplicate(summary, ev.Reference, ev.Kind) {
+		return truncateClaimArtifactSummary(summary)
+	}
+	return ""
+}
+
+func claimArtifactFullArgs(md map[string]any) string {
+	raw := claimArtifactRawArgs(md)
+	if raw == "" {
+		return ""
+	}
+	return prettyClaimArtifactJSON(raw)
+}
+
+func claimArtifactCompletionSummary(md map[string]any) string {
+	return claimArtifactMetadataText(md, "summary", "output", "error")
+}
+
+func claimArtifactRawArgs(md map[string]any) string {
+	if md == nil {
+		return ""
+	}
+	if raw := claimArtifactMetadataText(md, "full_args"); raw != "" {
+		return raw
+	}
+	v, ok := md["args"]
+	if !ok || v == nil {
+		return ""
+	}
+	switch typed := v.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case []byte:
+		return strings.TrimSpace(string(typed))
+	default:
+		blob, err := json.Marshal(typed)
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(blob))
+	}
+}
+
+func summarizeClaimArtifactArgs(_ string, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" {
+		return ""
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return truncateClaimArtifactSummary(raw)
+	}
+	args, ok := parsed.(map[string]any)
+	if !ok {
+		if s := stringifyClaimArtifactArgValue(parsed); s != "" {
+			return truncateClaimArtifactSummary(s)
+		}
+		return ""
+	}
+	if len(args) == 0 {
+		return ""
+	}
+
+	opPrefix := ""
+	if s := stringifyClaimArtifactArgValue(args["op"]); s != "" {
+		opPrefix = "op=" + s
+	}
+	for _, key := range claimArtifactPriorityArgKeys {
+		if key == "op" {
+			continue
+		}
+		if val, ok := args[key]; ok {
+			if s := stringifyClaimArtifactArgValue(val); s != "" {
+				detail := key + "=" + s
+				if opPrefix != "" {
+					return truncateClaimArtifactSummary(opPrefix + " " + detail)
+				}
+				return truncateClaimArtifactSummary(detail)
+			}
+		}
+	}
+	if opPrefix != "" {
+		return truncateClaimArtifactSummary(opPrefix)
+	}
+
+	keys := make([]string, 0, len(args))
+	for key := range args {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if s := stringifyClaimArtifactArgValue(args[key]); s != "" {
+			return truncateClaimArtifactSummary(key + "=" + s)
+		}
+	}
+	return ""
+}
+
+func stringifyClaimArtifactArgValue(v any) string {
+	switch typed := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return normalizeInlineText(typed)
+	case []byte:
+		return normalizeInlineText(string(typed))
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	case float64:
+		if typed == float64(int64(typed)) {
+			return fmt.Sprintf("%d", int64(typed))
+		}
+		return fmt.Sprintf("%g", typed)
+	case json.Number:
+		return typed.String()
+	default:
+		blob, err := json.Marshal(typed)
+		if err != nil {
+			return ""
+		}
+		return normalizeInlineText(string(blob))
+	}
+}
+
+func prettyClaimArtifactJSON(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return raw
+	}
+	blob, err := json.MarshalIndent(parsed, "", "  ")
+	if err != nil {
+		return raw
+	}
+	return string(blob)
+}
+
+func claimArtifactMetadataText(md map[string]any, keys ...string) string {
+	if md == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		v, ok := md[key]
+		if !ok || v == nil {
+			continue
+		}
+		switch typed := v.(type) {
+		case string:
+			if s := normalizeInlineText(typed); s != "" {
+				return s
+			}
+		case []byte:
+			if s := normalizeInlineText(string(typed)); s != "" {
+				return s
+			}
+		case fmt.Stringer:
+			if s := normalizeInlineText(typed.String()); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func claimArtifactLabelDuplicate(summary string, labels ...string) bool {
+	summary = normalizeInlineText(summary)
+	if summary == "" {
+		return false
+	}
+	for _, label := range labels {
+		if strings.EqualFold(summary, normalizeInlineText(label)) {
+			return true
+		}
+	}
+	return false
+}
+
+func truncateClaimArtifactSummary(s string) string {
+	s = normalizeInlineText(s)
+	runes := []rune(s)
+	if len(runes) <= claimArtifactArgsSummaryMaxRunes {
+		return s
+	}
+	return string(runes[:claimArtifactArgsSummaryMaxRunes-3]) + "..."
 }

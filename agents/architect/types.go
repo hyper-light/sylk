@@ -137,6 +137,7 @@ type DesignPlan struct {
 	Workflow               *WorkflowDAG
 	Constraints            *PlanConstraints
 	Consultations          map[string]*ConsultationEvidence
+	EvidenceTrail          []*PlanEvidence
 	Declarations           []*PreDelegationDeclaration
 	PlanFile               string
 	Todos                  []PlanTodo
@@ -601,6 +602,30 @@ type ConsultationEvidence struct {
 	Error       string
 	RequestedAt time.Time
 	ReceivedAt  time.Time
+}
+
+type EvidenceKind string
+
+const (
+	EvidenceKindConsult EvidenceKind = "consult"
+)
+
+type PlanEvidence struct {
+	ID               string
+	Kind             EvidenceKind
+	PlanID           string
+	Target           string
+	Query            string
+	Scope            string
+	Correlation      string
+	Success          bool
+	Data             any
+	Summary          string
+	Error            string
+	RequestedAt      time.Time
+	ReceivedAt       time.Time
+	SourceTool       string
+	SourceArtifactID string
 }
 
 type PreDelegationDeclaration struct {

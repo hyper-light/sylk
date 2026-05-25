@@ -92,6 +92,7 @@ type TestamentRow struct {
 	TestamentID     string
 	ClaimID         string
 	CycleID         string
+	ParentRowID     string
 	AgentID         string
 	Context         string // developing-conclusion narrative (acc.SetContext)
 	ContextSequence int64
@@ -117,10 +118,10 @@ type TestamentRow struct {
 type claimRowIndex struct {
 	mu sync.RWMutex
 
-	claimRows        map[string]*ClaimRow
-	artifactRows     map[string]*ArtifactRow
-	accumulatorRows  map[string]*TestamentRow
-	testamentRows    map[string]*TestamentRow
+	claimRows       map[string]*ClaimRow
+	artifactRows    map[string]*ArtifactRow
+	accumulatorRows map[string]*TestamentRow
+	testamentRows   map[string]*TestamentRow
 }
 
 func newClaimRowIndex() *claimRowIndex {
@@ -390,7 +391,7 @@ func (idx *claimRowIndex) getTestamentRowByAnyID(id string) *TestamentRow {
 // AccumulatorID and TestamentID, registers the row under both maps
 // so subsequent lookups by either ID find the same row.
 func (idx *claimRowIndex) updateTestamentContext(
-	accumulatorID, testamentID, claimID, cycleID, agentID, contextValue string,
+	accumulatorID, testamentID, claimID, cycleID, parentRowID, agentID, contextValue string,
 	sequence int64,
 ) *TestamentRow {
 	accumulatorID = strings.TrimSpace(accumulatorID)
@@ -400,7 +401,7 @@ func (idx *claimRowIndex) updateTestamentContext(
 	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	row := idx.resolveTestamentRowLocked(accumulatorID, testamentID, claimID, cycleID, agentID)
+	row := idx.resolveTestamentRowLocked(accumulatorID, testamentID, claimID, cycleID, parentRowID, agentID)
 	if sequence > 0 && sequence <= row.ContextSequence {
 		return nil
 	}
@@ -418,7 +419,7 @@ func (idx *claimRowIndex) updateTestamentContext(
 // Lookup precedence: accumulatorID (in-flight) → testamentID
 // (sealed). If neither lookup hits, a new row is created.
 func (idx *claimRowIndex) resolveTestamentRowLocked(
-	accumulatorID, testamentID, claimID, cycleID, agentID string,
+	accumulatorID, testamentID, claimID, cycleID, parentRowID, agentID string,
 ) *TestamentRow {
 	row := idx.lookupTestamentLocked(accumulatorID, testamentID)
 	if row == nil {
@@ -427,13 +428,14 @@ func (idx *claimRowIndex) resolveTestamentRowLocked(
 			TestamentID:   testamentID,
 			ClaimID:       strings.TrimSpace(claimID),
 			CycleID:       strings.TrimSpace(cycleID),
+			ParentRowID:   strings.TrimSpace(parentRowID),
 			AgentID:       strings.TrimSpace(agentID),
 			StartedAt:     time.Now(),
 		}
 		idx.registerTestamentLocked(row, accumulatorID, testamentID)
 		return row
 	}
-	idx.fillTestamentMetadataLocked(row, accumulatorID, testamentID, claimID, cycleID, agentID)
+	idx.fillTestamentMetadataLocked(row, accumulatorID, testamentID, claimID, cycleID, parentRowID, agentID)
 	return row
 }
 
@@ -462,7 +464,7 @@ func (idx *claimRowIndex) registerTestamentLocked(row *TestamentRow, accumulator
 
 func (idx *claimRowIndex) fillTestamentMetadataLocked(
 	row *TestamentRow,
-	accumulatorID, testamentID, claimID, cycleID, agentID string,
+	accumulatorID, testamentID, claimID, cycleID, parentRowID, agentID string,
 ) {
 	if accumulatorID != "" && row.AccumulatorID == "" {
 		row.AccumulatorID = accumulatorID
@@ -477,6 +479,9 @@ func (idx *claimRowIndex) fillTestamentMetadataLocked(
 	}
 	if cycleID != "" && row.CycleID == "" {
 		row.CycleID = strings.TrimSpace(cycleID)
+	}
+	if parentRowID != "" && row.ParentRowID == "" {
+		row.ParentRowID = strings.TrimSpace(parentRowID)
 	}
 	if agentID != "" && row.AgentID == "" {
 		row.AgentID = strings.TrimSpace(agentID)
@@ -510,7 +515,7 @@ func (idx *claimRowIndex) sealTestament(
 		}
 		idx.registerTestamentLocked(row, accumulatorID, testamentID)
 	} else {
-		idx.fillTestamentMetadataLocked(row, accumulatorID, testamentID, claimID, cycleID, agentID)
+		idx.fillTestamentMetadataLocked(row, accumulatorID, testamentID, claimID, cycleID, "", agentID)
 	}
 	row.Summary = summary
 	row.Sealed = true

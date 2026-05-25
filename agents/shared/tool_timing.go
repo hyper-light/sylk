@@ -294,6 +294,7 @@ func WithActiveToolCall(ctx context.Context, call providers.ToolCall) context.Co
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = skills.WithToolOutcomeSink(ctx)
 	fullArgs := PrettyPrintArgs(call.Arguments)
 	toolName := emittedToolCallNameForContext(ctx, call.Name, fullArgs, "")
 	key, err := toolCallEventKey(call)
@@ -1053,15 +1054,7 @@ func TimedToolCall(
 		if !executeReturned && err == nil {
 			err = fmt.Errorf("tool %q unwound abnormally without returning", call.Name)
 		}
-		// ErrConsultYielded is a control-flow signal, not a tool
-		// failure — the agent has parked awaiting a peer consult /
-		// challenge / guardian-check. The session row stays open;
-		// when the resume path injects the consult response as this
-		// tool call's result, the matching emission completes the
-		// row with the real outcome. Surfacing the yield as a
-		// "tool failed" event here renders an alarming-but-bogus
-		// failure in the chat panel.
-		if IsConsultYielded(err) {
+		if outcome, ok := skills.ToolOutcomeFromContext(ctx); ok && outcome.Status == skills.ToolStatusYielded {
 			return
 		}
 		session.Complete(call, result, err)

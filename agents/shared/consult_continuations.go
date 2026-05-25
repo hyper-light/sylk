@@ -56,10 +56,14 @@ import (
 // changes incompatibly.
 const turnSnapshotCodecVersion = 1
 
-// ErrConsultYielded is returned by tool handlers when the LLM turn
-// has yielded to await peer consults. The agent's tool dispatch loop
-// MUST recognize this sentinel, exit the loop without appending a
-// tool result message, and propagate it up through ExecuteTurnLoop.
+// ErrConsultYielded is the continuation-store's internal slow-path
+// signal when the LLM turn has yielded to await peer consults. Tool
+// handlers convert it to a structured ToolOutcome before crossing the
+// tool-runtime boundary.
+//
+// Some outer turn loops still use this sentinel to short-circuit
+// request handling after the tool runtime has already classified the
+// tool call as yielded.
 // The agent's request handler MUST recognize it after ExecuteTurnLoop
 // returns, skip the normal completion path (no testament flush, no
 // "completed" status update), release the replica lease, and exit.
@@ -153,12 +157,12 @@ type ResumeFn func(ctx context.Context, snapshot *TurnSnapshot, results map[stri
 
 // pendingContinuation tracks one in-flight yielded turn.
 type pendingContinuation struct {
-	id          string                                       // ConsultContinuation claim ID
-	snapshot    *TurnSnapshot                                // serialized turn state
-	awaiting    map[string]struct{}                          // consult_ids still pending
-	resolved    map[string]*claims.ConsultResolvedDelta      // consult_id → resolved delta
-	deadline    time.Time
-	deadlineFn  context.CancelFunc                           // cancels the deadline watcher
+	id         string                                  // ConsultContinuation claim ID
+	snapshot   *TurnSnapshot                           // serialized turn state
+	awaiting   map[string]struct{}                     // consult_ids still pending
+	resolved   map[string]*claims.ConsultResolvedDelta // consult_id → resolved delta
+	deadline   time.Time
+	deadlineFn context.CancelFunc // cancels the deadline watcher
 
 	// dispatched serializes resume invocation. Two concurrent
 	// completing consults (last-awaiting + last-awaiting due to
@@ -294,10 +298,9 @@ type AwaitOptions struct {
 //  3. Slow path: persists the TurnSnapshot to the board as a
 //     ConsultContinuation claim, registers the awaited consult_ids
 //     in the index, starts a deadline watcher, and returns
-//     (nil, true, ErrConsultYielded). The handler must propagate
-//     the error verbatim. The dispatch loop and ExecuteTurnLoop
-//     short-circuit on the error; the agent's request handler
-//     releases its lease and exits.
+//     (nil, true, ErrConsultYielded). The handler converts this to
+//     ToolOutcome{Status: yielded}; the dispatch loop short-circuits
+//     without treating the yielded tool as a failure.
 //
 // Resumption later flows through Store.deliverResolution → ResumeFn.
 func (s *ContinuationStore) AwaitConsultsOrYield(
@@ -656,9 +659,9 @@ func (s *ContinuationStore) persistContinuationLocked(
 	// board (PostAction only commits the claim shell — artifacts go
 	// via SubmitTestaments).
 	testament := claims.Testament{
-		AgentID:   s.agentID,
-		SessionID: s.sessionID,
-		Summary:   fmt.Sprintf("Continuation snapshot for %d consults", len(consultIDs)),
+		AgentID:    s.agentID,
+		SessionID:  s.sessionID,
+		Summary:    fmt.Sprintf("Continuation snapshot for %d consults", len(consultIDs)),
 		Confidence: "high",
 		Relations: []claims.Relation{
 			{Related: continuationID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},

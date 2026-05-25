@@ -16,6 +16,8 @@ func (r *Runtime) ExecuteApproved(
 		ToolName:        rawResult.ToolName,
 		ToolDefsDirty:   rawResult.ToolDefsDirty,
 		ActivatedSkills: append([]string(nil), rawResult.ActivatedSkills...),
+		Status:          rawResult.Status,
+		Continuation:    rawResult.Continuation,
 	}
 	if rawResult.Data != nil {
 		if output, marshalErr := marshalOutput(rawResult.Data); marshalErr == nil {

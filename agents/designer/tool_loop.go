@@ -253,11 +253,12 @@ func (d *Designer) applyToolCalls(
 		if execResult.ToolDefsDirty {
 			d.toolDefsDirty = true
 		}
+		if execResult.Yielded() {
+			return errCount, shared.ErrConsultYielded
+		}
 		isError := false
 		if err != nil {
 			switch {
-			case shared.IsConsultYielded(err):
-				return errCount, shared.ErrConsultYielded
 			case errors.Is(err, skills.ErrRerouteRequested):
 				controlErr = skills.ErrRerouteRequested
 				result = `{"rerouted": true}`

@@ -6,9 +6,12 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -203,12 +206,86 @@ func TestConsultPeerSkill_RouteSyncTransportErrorReturnsError(t *testing.T) {
 	}
 }
 
+func TestConsultPeerSkill_TicketModeUsesClaimInsteadOfRouteSync(t *testing.T) {
+	sessionID := "sess-ticket-mode-claim"
+	registry := claims.DefaultSessionBoardRegistry()
+	registry.Remove(sessionID)
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "board-ticket-mode-claim",
+		SessionID: sessionID,
+		TaskID:    "task-ticket-mode-claim",
+	})
+	if err := registry.Register(sessionID, board); err != nil {
+		t.Fatalf("register board: %v", err)
+	}
+	t.Cleanup(func() { registry.Remove(sessionID) })
+
+	routeCalled := false
+	store := NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   "agent-1",
+		SessionID: sessionID,
+		Board:     board,
+		ResumeFn: func(context.Context, *TurnSnapshot, map[string]*claims.ConsultResolvedDelta) error {
+			return nil
+		},
+	})
+	cfg := CrossPipelineSkillConfig{
+		SessionID:  func() string { return sessionID },
+		AgentID:    func() string { return "agent-1" },
+		AgentType:  func() string { return "engineer" },
+		PipelineID: func() string { return "" },
+		RouteSync: func(context.Context, *guide.RouteRequest) (*guide.Message, error) {
+			routeCalled = true
+			return nil, errors.New("legacy route should not run in claims ticket mode")
+		},
+	}
+	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
+	ctx := WithContinuationStore(context.Background(), store)
+	ctx = WithTurnContext(ctx, &TurnContext{
+		Request:       &providers.Request{},
+		CorrelationID: "corr-ticket-mode-claim",
+		AgentID:       "agent-1",
+		SessionID:     sessionID,
+	})
+
+	result, err := skill.Handler(ctx, json.RawMessage(`{"target_agent_type":"librarian","query":"Q","deadline_seconds":30}`))
+	if err != nil {
+		t.Fatalf("Handler returned error for yield outcome: %v", err)
+	}
+	outcome, ok := skills.NormalizeToolOutcome(result)
+	if !ok || outcome.Status != skills.ToolStatusYielded {
+		t.Fatalf("result = %#v, want yielded ToolOutcome", result)
+	}
+	if routeCalled {
+		t.Fatal("RouteSync was called; claims ticket mode must let the posted claim drive peer work")
+	}
+
+	store.mu.Lock()
+	var consultID string
+	for id := range store.consultIndex {
+		consultID = id
+		break
+	}
+	store.mu.Unlock()
+	if consultID == "" {
+		t.Fatal("consult_id was not registered with the continuation store")
+	}
+	store.DeliverResolution(context.Background(), &claims.ConsultResolvedDelta{
+		SessionID:         sessionID,
+		ConsultID:         consultID,
+		OriginatorAgentID: "agent-1",
+		ResponderAgentID:  "librarian",
+		Status:            claims.ConsultStatusCompleted,
+		EmittedAt:         time.Now().UTC(),
+	})
+}
+
 func TestConsultPeerSkill_EmitsConsultEmittedActivity(t *testing.T) {
 	// Audit-trail invariant: the consult_emitted activity is written
 	// regardless of which mode (sync vs. fire-and-forget) the caller
 	// is in, so post-hoc causal_trace and ambient recall still work.
 	collector := &activity.TestCollector{}
-	prev := activity.SetDefaultSource(nil)           // sink-only, no source
+	prev := activity.SetDefaultSource(nil) // sink-only, no source
 	prevSink := activity.SetDefaultSink(collector)
 	defer activity.SetDefaultSource(prev)
 	defer activity.SetDefaultSink(prevSink)

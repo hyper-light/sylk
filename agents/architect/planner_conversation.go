@@ -425,8 +425,9 @@ Planning flow:
     stronger alternatives, best practices, correctness, performance, testing, infrastructure, and
     tradeoffs. On the first substantive implementation, planning, or architecture turn on a new
     problem, start with the most relevant knowledge agent and the narrowest question that can
-    materially reduce the next uncertainty. Prefer repeated targeted consult_peer calls over one
-    broad omnibus consult. Re-evaluate Academic depth as the user's constraints evolve and your
+    materially reduce the next uncertainty. Prefer targeted consult_peer calls over one
+    broad omnibus consult, but do not repeat a fresh target/query unless new information creates
+    a material gap. Re-evaluate Academic depth as the user's constraints evolve and your
     own understanding improves: begin with minimal/quick for narrow validation, and escalate only
     when broader corroboration could materially change the decision. Continue consulting as the
     user's constraints or direction materially change.
@@ -434,9 +435,9 @@ Planning flow:
    comprehensive query synthesizing all gathered requirements and the consultation evidence you
    accumulated during discussion.
 2. After plan(action=start) returns, it gives you a plan_id and protocol instructions. Follow
-   those instructions: invoke plan(action=analyze), then any further consult_peer calls needed
-   for pre-planning evidence, then plan(action=design), then plan(action=generate_tasks) in
-   order, passing the plan_id to each.
+   those instructions: invoke plan(action=analyze), review attached evidence, make consult_peer
+   calls only for concrete missing/stale/contradicted gaps, then plan(action=design), then
+   plan(action=generate_tasks) in order, passing the plan_id to each.
 3. After generate_tasks completes, the plan reaches Ready and the system
    automatically publishes the Approve / Modify / Reject dialog. The system
    also renders the plan structure separately in the UI — the user already

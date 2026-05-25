@@ -41,11 +41,13 @@ func (pi *PipelineInspector) resumeContinuation(
 	agentShared.RecordResumeReceiving(ctx, pi.claimsBoard, snapshot, results)
 
 	req := snapshot.Request
+	toolResult := formatPipelineInspectorAwaitResults(results)
+	agentShared.CompleteYieldedToolFromContinuation(ctx, snapshot, results, toolResult)
 	req.Messages = append(req.Messages, providers.Message{
 		Role:       providers.RoleTool,
 		ToolCallID: snapshot.AwaitToolCallID,
 		ToolName:   snapshot.AwaitToolName,
-		Content:    formatPipelineInspectorAwaitResults(results),
+		Content:    toolResult,
 	})
 
 	ctx = agentShared.WithContinuationStore(ctx, pi.continuationStore)

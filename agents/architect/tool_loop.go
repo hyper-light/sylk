@@ -407,6 +407,12 @@ func (a *Architect) applyToolCalls(
 		if execResult.ToolDefsDirty {
 			a.toolDefsDirty = true
 		}
+		if execResult.Yielded() {
+			yielded = true
+			a.logInfo("applyToolCalls: consult turn yielded — continuation persisted, exiting loop",
+				"tool_name", call.Name)
+			return errCount, rerouted, delegated, delegatedMessage, yielded
+		}
 		a.logInfo("applyToolCalls: tool returned",
 			"tool_name", call.Name,
 			"tool_index", i,
@@ -422,18 +428,6 @@ func (a *Architect) applyToolCalls(
 			"err", err)
 		isError := false
 		if err != nil {
-			if shared.IsConsultYielded(err) {
-				// LLM yielded mid-turn awaiting peer consults.
-				// The continuation is already persisted by the
-				// await_consults handler; the loop must exit
-				// without appending a tool result message and
-				// without firing further inference. Surface the
-				// yield error so the outer loop short-circuits.
-				yielded = true
-				a.logInfo("applyToolCalls: consult turn yielded — continuation persisted, exiting loop",
-					"tool_name", call.Name)
-				return errCount, rerouted, delegated, delegatedMessage, yielded
-			}
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`

@@ -893,6 +893,7 @@ type ClaimContextMsg struct {
 	ClaimID           string
 	OwnerAgentID      string
 	CycleID           string
+	ParentRowID       string
 	Context           string
 	ContextTransition int64
 	SuppressChat      bool
@@ -922,6 +923,7 @@ type TestamentContextMsg struct {
 	ClaimID           string
 	AgentID           string
 	CycleID           string
+	ParentRowID       string
 	Context           string
 	ContextTransition int64
 }
@@ -957,6 +959,7 @@ type ClaimResponseTextMsg struct {
 	SessionID    string
 	CycleID      string
 	ClaimID      string
+	ParentRowID  string
 	AgentID      string
 	Content      string
 	CreatedAt    time.Time

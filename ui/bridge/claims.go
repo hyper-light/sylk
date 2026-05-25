@@ -618,9 +618,13 @@ func (b *ClaimsBridge) handleTestamentSubmitted(sessionID string, t *claims.Test
 		return
 	}
 	claimID := claims.ClaimIDFromRelations(t.Relations)
+	b.ensureClaimRegisteredFromProjection(sessionID, claimID)
 	for i := range t.Artifacts {
 		art := t.Artifacts[i]
 		b.OnArtifactAdded(claimID, t.AgentID, sessionID, art)
+	}
+	if m := b.claimTestamentResponseMsg(sessionID, claimID, t); m != nil {
+		b.enqueue(*m)
 	}
 	b.completePeerInvocationForClaim(claimID, "success", strings.TrimSpace(t.Summary))
 }
@@ -630,16 +634,20 @@ func (b *ClaimsBridge) handleClaimContext(sessionID string, event claimContextEv
 	if claimID == "" {
 		return
 	}
+	b.ensureClaimRegisteredFromProjection(sessionID, claimID)
 	var out *msg.ClaimContextMsg
 	b.mu.Lock()
 	meta := b.metaForClaimLocked(claimID)
 	if meta.CycleID != "" {
 		state := firstNonBlank(b.latestStateByClaim[claimID], claimContextUIState(meta, event.Context))
+		actor := claimContextActor(meta, event.AgentID)
+		parentRowID := b.claimToInvocationArtifact[claimID]
 		out = &msg.ClaimContextMsg{
 			SessionID:         sessionID,
 			ClaimID:           claimID,
-			OwnerAgentID:      meta.OwnerAgentID,
+			OwnerAgentID:      actor,
 			CycleID:           meta.CycleID,
+			ParentRowID:       parentRowID,
 			Context:           event.Context,
 			ContextTransition: event.ContextTransition,
 			SuppressChat:      meta.SuppressChat,
@@ -653,6 +661,7 @@ func (b *ClaimsBridge) handleClaimContext(sessionID string, event claimContextEv
 			"claim_id", claimID,
 			"cycle_id", out.CycleID,
 			"owner", out.OwnerAgentID,
+			"parent_row_id", out.ParentRowID,
 			"context", event.Context,
 			"transition", event.ContextTransition,
 			"suppress_chat", out.SuppressChat,
@@ -674,6 +683,7 @@ func (b *ClaimsBridge) handleTestamentContext(sessionID string, event testamentC
 	if claimID == "" {
 		return
 	}
+	b.ensureClaimRegisteredFromProjection(sessionID, claimID)
 	var out *msg.TestamentContextMsg
 	b.mu.Lock()
 	meta := b.metaForClaimLocked(claimID)
@@ -685,6 +695,7 @@ func (b *ClaimsBridge) handleTestamentContext(sessionID string, event testamentC
 			ClaimID:           claimID,
 			AgentID:           strings.TrimSpace(event.AgentID),
 			CycleID:           meta.CycleID,
+			ParentRowID:       b.claimToInvocationArtifact[claimID],
 			Context:           event.Context,
 			ContextTransition: event.ContextTransition,
 		}
@@ -703,15 +714,11 @@ func (b *ClaimsBridge) OnArtifactAdded(claimID, agentID, sessionID string, artif
 	claimID = strings.TrimSpace(claimID)
 	agentID = strings.TrimSpace(agentID)
 	sessionID = strings.TrimSpace(sessionID)
-	board, activeSession := b.currentBoard()
+	_, activeSession := b.currentBoard()
 	if sessionID == "" {
 		sessionID = activeSession
 	}
-	if claimID != "" && board != nil && activeSession != "" && sessionID == activeSession && !b.claimRegistered(claimID) {
-		if c := findClaim(board.Projection(), claimID); c != nil && !c.Status.IsTerminal() {
-			b.handleClaimCreated(sessionID, c)
-		}
-	}
+	b.ensureClaimRegisteredFromProjection(sessionID, claimID)
 
 	b.mu.Lock()
 	if sessionID == "" || sessionID != b.activeSession {
@@ -731,6 +738,9 @@ func (b *ClaimsBridge) OnArtifactAdded(claimID, agentID, sessionID string, artif
 	b.artifactByID[art.ID] = art
 	if claimID != "" {
 		b.artifactClaim[art.ID] = claimID
+	}
+	if isInvocationStartedArtifactKind(art.Kind) {
+		b.recordInvocationMappingLocked(art)
 	}
 
 	var out []any
@@ -769,6 +779,23 @@ func (b *ClaimsBridge) claimRegistered(claimID string) bool {
 	return resolver.CycleForClaim(claimID) != ""
 }
 
+func (b *ClaimsBridge) ensureClaimRegisteredFromProjection(sessionID, claimID string) {
+	claimID = strings.TrimSpace(claimID)
+	if b == nil || claimID == "" {
+		return
+	}
+	board, activeSession := b.currentBoard()
+	if sessionID == "" {
+		sessionID = activeSession
+	}
+	if board == nil || activeSession == "" || sessionID != activeSession || b.claimRegistered(claimID) {
+		return
+	}
+	if c := findClaim(board.Projection(), claimID); c != nil {
+		b.handleClaimCreated(sessionID, c)
+	}
+}
+
 func (b *ClaimsBridge) routeStartedArtifactLocked(sessionID, claimID string, art *claims.Artifact) *msg.ClaimArtifactAddedMsg {
 	artifactID := strings.TrimSpace(art.ID)
 	if artifactID == "" {
@@ -804,10 +831,7 @@ func (b *ClaimsBridge) claimArtifactAddedMsgLocked(sessionID, claimID string, ar
 		meta.OwnerAgentType = agentTypeFromID(cycle.OwnerAgentID)
 	}
 	parentRowID := b.claimToInvocationArtifact[claimID]
-	childClaimID := artifactChildClaimID(art)
-	if childClaimID != "" {
-		b.claimToInvocationArtifact[childClaimID] = artifactID
-	}
+	b.recordInvocationMappingLocked(art)
 	b.emittedStartedArtifacts[artifactID] = struct{}{}
 	return &msg.ClaimArtifactAddedMsg{
 		ArtifactID:     artifactID,
@@ -817,13 +841,31 @@ func (b *ClaimsBridge) claimArtifactAddedMsgLocked(sessionID, claimID string, ar
 		OwnerAgentID:   meta.OwnerAgentID,
 		OwnerAgentType: meta.OwnerAgentType,
 		TargetAgentID:  meta.TargetAgentID,
-		AgentID:        firstNonBlank(strings.TrimSpace(art.AgentID), meta.OwnerAgentID),
+		AgentID:        firstNonBlank(strings.TrimSpace(art.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
 		Kind:           strings.TrimSpace(art.Kind),
 		Reference:      strings.TrimSpace(art.Reference),
 		Metadata:       cloneMetadata(art.Metadata),
 		CreatedAt:      art.Created,
 		SuppressChat:   meta.SuppressChat,
 	}
+}
+
+func (b *ClaimsBridge) recordInvocationMappingLocked(art *claims.Artifact) {
+	if b == nil || art == nil {
+		return
+	}
+	if !isInvocationStartedArtifactKind(art.Kind) {
+		return
+	}
+	artifactID := strings.TrimSpace(art.ID)
+	if artifactID == "" {
+		return
+	}
+	childClaimID := artifactChildClaimID(art)
+	if childClaimID == "" {
+		return
+	}
+	b.claimToInvocationArtifact[childClaimID] = artifactID
 }
 
 func (b *ClaimsBridge) routeCompletedArtifactLocked(sessionID string, art *claims.Artifact) []any {
@@ -900,6 +942,9 @@ func (b *ClaimsBridge) completePeerInvocationForClaim(claimID, outcome, summary 
 }
 
 func (b *ClaimsBridge) handleAgentStateArtifactLocked(sessionID, claimID string, art *claims.Artifact) []any {
+	if artClaimID := claimMetadataString(art.Metadata, "claim_id"); artClaimID != "" {
+		claimID = artClaimID
+	}
 	state := claimMetadataString(art.Metadata, "state")
 	if state != "" {
 		b.latestStateByClaim[claimID] = state
@@ -912,11 +957,22 @@ func (b *ClaimsBridge) handleAgentStateArtifactLocked(sessionID, claimID string,
 	if meta.CycleID == "" {
 		return nil
 	}
+	agentID := strings.TrimSpace(art.AgentID)
+	if meta.UIState == "classifying" && meta.OwnerAgentID == "guide" && agentID != "" && agentID != "guide" {
+		b.debug("agent_state_ignored_foreign_guide_classification",
+			"session_id", sessionID,
+			"claim_id", claimID,
+			"artifact_id", strings.TrimSpace(art.ID),
+			"artifact_agent_id", agentID,
+		)
+		return nil
+	}
 	return []any{msg.ClaimContextMsg{
 		SessionID:    sessionID,
 		ClaimID:      claimID,
-		OwnerAgentID: meta.OwnerAgentID,
+		OwnerAgentID: claimContextActor(meta, agentID),
 		CycleID:      meta.CycleID,
+		ParentRowID:  b.claimToInvocationArtifact[claimID],
 		Context:      detail,
 		State:        state,
 		SuppressChat: meta.SuppressChat,
@@ -939,9 +995,38 @@ func (b *ClaimsBridge) claimResponseTextMsgLocked(sessionID, claimID string, art
 		SessionID:    sessionID,
 		CycleID:      meta.CycleID,
 		ClaimID:      claimID,
-		AgentID:      firstNonBlank(strings.TrimSpace(art.AgentID), meta.OwnerAgentID),
+		ParentRowID:  b.claimToInvocationArtifact[claimID],
+		AgentID:      firstNonBlank(strings.TrimSpace(art.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
 		Content:      content,
 		CreatedAt:    nonZeroTime(art.Created),
+		SuppressChat: meta.SuppressChat,
+	}
+}
+
+func (b *ClaimsBridge) claimTestamentResponseMsg(sessionID, claimID string, t *claims.Testament) *msg.ClaimResponseTextMsg {
+	claimID = strings.TrimSpace(claimID)
+	if t == nil || claimID == "" {
+		return nil
+	}
+	content := strings.TrimSpace(t.Summary)
+	if content == "" {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	meta := b.metaForClaimLocked(claimID)
+	parentRowID := b.claimToInvocationArtifact[claimID]
+	if meta.CycleID == "" || parentRowID == "" || meta.CycleID == claimID {
+		return nil
+	}
+	return &msg.ClaimResponseTextMsg{
+		SessionID:    sessionID,
+		CycleID:      meta.CycleID,
+		ClaimID:      claimID,
+		ParentRowID:  parentRowID,
+		AgentID:      firstNonBlank(strings.TrimSpace(t.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
+		Content:      content,
+		CreatedAt:    nonZeroTime(t.Created),
 		SuppressChat: meta.SuppressChat,
 	}
 }
@@ -1258,6 +1343,24 @@ func claimContextUIState(meta claimMeta, context string) string {
 	}
 }
 
+func claimContextActor(meta claimMeta, fallback string) string {
+	fallback = strings.TrimSpace(fallback)
+	switch claims.ActionType(strings.TrimSpace(meta.ActionType)) {
+	case claims.ActionTypePrompt, claims.ActionTypeHandoff:
+		return firstNonBlank(meta.OwnerAgentID, meta.TargetAgentID, fallback, meta.IssuerAgentID)
+	case claims.ActionTypeConsultation, claims.ActionTypeChallenge, claims.ActionTypeGuardianCheck:
+		if fallback != "" && fallback != meta.IssuerAgentID {
+			return fallback
+		}
+		return firstNonBlank(meta.TargetAgentID, fallback, meta.OwnerAgentID, meta.IssuerAgentID)
+	default:
+		if fallback != "" && fallback != meta.IssuerAgentID {
+			return fallback
+		}
+		return firstNonBlank(meta.OwnerAgentID, meta.TargetAgentID, fallback, meta.IssuerAgentID)
+	}
+}
+
 func claimHasTag(c *claims.Claim, want string) bool {
 	if c == nil {
 		return false
@@ -1277,6 +1380,15 @@ func claimHasTag(c *claims.Claim, want string) bool {
 func isVisibleStartedArtifactKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
 	case "tool_started", "consult_started", "challenge_started", "guardian_check_started":
+		return true
+	default:
+		return false
+	}
+}
+
+func isInvocationStartedArtifactKind(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case "consult_started", "challenge_started", "guardian_check_started":
 		return true
 	default:
 		return false
@@ -1344,8 +1456,8 @@ func artifactSummary(art *claims.Artifact) string {
 		return ""
 	}
 	return firstNonBlank(
-		strings.TrimSpace(art.Reference),
 		claimMetadataString(art.Metadata, "summary", "output", "error"),
+		strings.TrimSpace(art.Reference),
 	)
 }
 

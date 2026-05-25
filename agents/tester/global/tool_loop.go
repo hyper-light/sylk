@@ -157,8 +157,11 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 			return "", fmt.Errorf("global tester repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted, delegated, delegatedMessage := gt.applyToolCalls(ctx, req, resp)
+		errCount, rerouted, delegated, delegatedMessage, yielded := gt.applyToolCalls(ctx, req, resp)
 		gt.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		if yielded {
+			return "", agentshared.ErrConsultYielded
+		}
 		if agentshared.GlobalReviewTurnTerminated(ctx) {
 			return "", nil
 		}
@@ -205,7 +208,7 @@ func (gt *GlobalTester) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
-) (int, bool, bool, string) {
+) (int, bool, bool, string, bool) {
 	req.Messages = append(req.Messages, providers.ToolLoopAssistantMessage(resp))
 
 	errCount := 0
@@ -222,6 +225,9 @@ func (gt *GlobalTester) applyToolCalls(
 		})
 		if execResult.ToolDefsDirty {
 			gt.toolDefsDirty = true
+		}
+		if execResult.Yielded() {
+			return errCount, rerouted, delegated, delegatedMessage, true
 		}
 		isError := false
 		if err != nil {
@@ -270,7 +276,7 @@ func (gt *GlobalTester) applyToolCalls(
 			break
 		}
 	}
-	return errCount, rerouted, delegated, delegatedMessage
+	return errCount, rerouted, delegated, delegatedMessage, false
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.
