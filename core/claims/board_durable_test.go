@@ -70,6 +70,58 @@ func TestDurableBoardPersistAndRecover(t *testing.T) {
 	}
 }
 
+func TestDurableBoardPersistAndRecoverPresentation(t *testing.T) {
+	dir := t.TempDir()
+	sessionDir := filepath.Join(dir, "session")
+
+	cfg := ClaimsBoardConfig{
+		BoardID: "board-presentation", PipelineID: "pipe-1",
+		TaskID: "task-1", SessionID: "ses-1", SessionDir: sessionDir,
+	}
+	db, err := OpenDurableBoard(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := db.PostAction(ctx, Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("c1", "claim")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SubmitTestaments(ctx, Action{AgentID: "architect", Type: ActionTypeTestament}, []Testament{{
+		AgentID:      "architect",
+		Summary:      "Plan ready.",
+		Presentation: testUserChatPresentation(),
+		Relations: []Relation{
+			{Related: "c1", RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim},
+		},
+		Artifacts: []*Artifact{{
+			Kind:         ArtifactKindPlanMarkdown,
+			Reference:    "### Plan",
+			Presentation: testUserChatPresentation(),
+		}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	db2, err := OpenDurableBoard(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	proj := db2.Board().Projection()
+	if len(proj.Testaments) != 1 {
+		t.Fatalf("testaments = %d, want 1", len(proj.Testaments))
+	}
+	if proj.Testaments[0].Presentation == nil || proj.Testaments[0].Presentation.ReplaceKey != "plan:p1:review" {
+		t.Fatalf("testament presentation not recovered: %+v", proj.Testaments[0].Presentation)
+	}
+	if got := proj.Testaments[0].Artifacts[0].Presentation; got == nil || got.Format != PresentationFormatMarkdown {
+		t.Fatalf("artifact presentation not recovered: %+v", got)
+	}
+}
+
 func TestDurableBoardSnapshotRecovery(t *testing.T) {
 	dir := t.TempDir()
 	sessionDir := filepath.Join(dir, "session")

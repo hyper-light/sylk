@@ -10,6 +10,7 @@ package claims
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -47,19 +48,19 @@ const (
 
 	// Structural relationships (action/claim/testament/artifact grouping).
 	RelationshipClaimAction     = "claim_action"     // parent claim action
-	RelationshipTestamentAction = "testament_action"  // parent testament action
-	RelationshipClaim           = "claim"             // the claim this responds to
-	RelationshipTestament       = "testament"         // the testament this artifact belongs to
+	RelationshipTestamentAction = "testament_action" // parent testament action
+	RelationshipClaim           = "claim"            // the claim this responds to
+	RelationshipTestament       = "testament"        // the testament this artifact belongs to
 
 	// Causal and semantic relationships.
-	RelationshipSupersedes   = "supersedes"    // replaces the related object
-	RelationshipDependsOn    = "depends_on"    // cannot proceed until related is satisfied
-	RelationshipCausedBy     = "caused_by"     // created in response to the related object
-	RelationshipRefines      = "refines"       // narrows or clarifies the related object
-	RelationshipConflictsWith = "conflicts_with" // contradicts the related object
-	RelationshipDerivedFrom  = "derived_from"  // content derived from the related object
-	RelationshipReviews      = "reviews"       // evaluates the related object
-	RelationshipAmends       = "amends"        // modifies but does not replace the related object
+	RelationshipSupersedes      = "supersedes"       // replaces the related object
+	RelationshipDependsOn       = "depends_on"       // cannot proceed until related is satisfied
+	RelationshipCausedBy        = "caused_by"        // created in response to the related object
+	RelationshipRefines         = "refines"          // narrows or clarifies the related object
+	RelationshipConflictsWith   = "conflicts_with"   // contradicts the related object
+	RelationshipDerivedFrom     = "derived_from"     // content derived from the related object
+	RelationshipReviews         = "reviews"          // evaluates the related object
+	RelationshipAmends          = "amends"           // modifies but does not replace the related object
 	RelationshipDirectAddressed = "direct_addressed" // user directly addressed this agent
 
 	// Cycle / lifecycle relationships (UI_DESIGN.md §2.6). The bridge's
@@ -133,9 +134,9 @@ const (
 	ActionTypeTestament    ActionType = "testament"    // agent testifying about work performed, findings, or failures
 	ActionTypeBoot         ActionType = "boot"         // boot pipeline phase execution
 	ActionTypeActivation   ActionType = "activation"   // agent container activation
-	ActionTypeShutdown     ActionType = "shutdown"      // graceful agent shutdown
-	ActionTypeHandoff      ActionType = "handoff"       // clean transfer of top-level cycle ownership (UI_DESIGN.md §2.2)
-	ActionTypeCheckpoint   ActionType = "checkpoint"    // Guardian-issued safety checkpoint requiring user approval (e.g. periodic git safety snapshot)
+	ActionTypeShutdown     ActionType = "shutdown"     // graceful agent shutdown
+	ActionTypeHandoff      ActionType = "handoff"      // clean transfer of top-level cycle ownership (UI_DESIGN.md §2.2)
+	ActionTypeCheckpoint   ActionType = "checkpoint"   // Guardian-issued safety checkpoint requiring user approval (e.g. periodic git safety snapshot)
 	// ActionTypeGuardianCheck is the structured claim posted by the
 	// tool runtime when an approval-gated tool needs guardian review.
 	// Subject = "guardian"; the responding testament carries the
@@ -235,6 +236,12 @@ const (
 	// deterministically — no LLM tool loop, no parallel bus message.
 	ArtifactKindPlanHandoffPayload = "plan_handoff_payload"
 
+	// ArtifactKindPlanMarkdown is the architect's human-reviewable
+	// implementation plan. When presentable, this is the canonical
+	// source for chat and approval review surfaces; the handoff payload
+	// remains separate internal evidence for orchestration.
+	ArtifactKindPlanMarkdown = "plan_markdown"
+
 	// ArtifactKindAgentState records an agent's state transition
 	// (Reasoning, ToolExecuting, DispatchingToPeer, etc.) on its
 	// in-flight testament. Reference is the human-readable detail.
@@ -332,6 +339,65 @@ const (
 // IsTerminal reports whether this board phase is terminal.
 func (p BoardPhase) IsTerminal() bool { return p == BoardPhaseComplete }
 
+// PresentationAudience identifies who a presentation is intended for.
+// It is rendering intent, not access control; agents continue to query
+// the board for all evidence regardless of audience.
+type PresentationAudience string
+
+const (
+	PresentationAudienceUser      PresentationAudience = "user"
+	PresentationAudienceOperator  PresentationAudience = "operator"
+	PresentationAudienceDeveloper PresentationAudience = "developer"
+)
+
+// PresentationSurface identifies the UI surface that may render a
+// presentable testament or artifact.
+type PresentationSurface string
+
+const (
+	PresentationSurfaceChat        PresentationSurface = "chat"
+	PresentationSurfaceApproval    PresentationSurface = "approval"
+	PresentationSurfaceSidePanel   PresentationSurface = "side_panel"
+	PresentationSurfaceDiagnostics PresentationSurface = "diagnostics"
+)
+
+// PresentationFormat identifies how a renderer should interpret the
+// presentable content.
+type PresentationFormat string
+
+const (
+	PresentationFormatMarkdown PresentationFormat = "markdown"
+	PresentationFormatText     PresentationFormat = "text"
+	PresentationFormatJSON     PresentationFormat = "json"
+	PresentationFormatDiff     PresentationFormat = "diff"
+	PresentationFormatTable    PresentationFormat = "table"
+)
+
+// PresentationPlacement controls how a rendered entity attaches to a
+// chat or panel lifecycle.
+type PresentationPlacement string
+
+const (
+	PresentationPlacementBeforeResponse PresentationPlacement = "before_response"
+	PresentationPlacementAfterResponse  PresentationPlacement = "after_response"
+	PresentationPlacementInline         PresentationPlacement = "inline"
+	PresentationPlacementReplace        PresentationPlacement = "replace"
+	PresentationPlacementPanelOnly      PresentationPlacement = "panel_only"
+)
+
+// Presentation is optional rendering metadata for testaments and
+// artifacts. It never changes evidence accessibility or validation
+// semantics; omitted presentation means no automatic UI rendering.
+type Presentation struct {
+	Audiences  []PresentationAudience `json:"audiences,omitempty"`
+	Surfaces   []PresentationSurface  `json:"surfaces,omitempty"`
+	Format     PresentationFormat     `json:"format,omitempty"`
+	Title      string                 `json:"title,omitempty"`
+	Placement  PresentationPlacement  `json:"placement,omitempty"`
+	ReplaceKey string                 `json:"replace_key,omitempty"`
+	Priority   int                    `json:"priority,omitempty"`
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Entity types
 // ────────────────────────────────────────────────────────────────────
@@ -375,16 +441,16 @@ type Claim struct {
 	Accessed   time.Time  `json:"accessed"`
 
 	// ── Claim-specific ──
-	Title         string           `json:"title"`
-	Description   string           `json:"description"`
+	Title         string            `json:"title"`
+	Description   string            `json:"description"`
 	Scope         []ClaimScopeEntry `json:"scope"`
-	ActionType    ActionType       `json:"action_type"`
-	Status        ClaimStatus      `json:"status"`
-	StatusHistory []StatusChange   `json:"status_history"`
-	Priority      int              `json:"priority,omitempty"`
-	Deadline      time.Time        `json:"deadline,omitempty"`
-	Tags          []string         `json:"tags,omitempty"`
-	Iteration     int              `json:"iteration"`
+	ActionType    ActionType        `json:"action_type"`
+	Status        ClaimStatus       `json:"status"`
+	StatusHistory []StatusChange    `json:"status_history"`
+	Priority      int               `json:"priority,omitempty"`
+	Deadline      time.Time         `json:"deadline,omitempty"`
+	Tags          []string          `json:"tags,omitempty"`
+	Iteration     int               `json:"iteration"`
 
 	// Context is the mutable narrative status describing what this
 	// claim's owner is currently doing. Distinct from Description
@@ -494,6 +560,11 @@ type Testament struct {
 	// deterministic-ordering reason.
 	ContextTransition int64 `json:"context_transition,omitempty"`
 
+	// Presentation carries optional UI rendering intent for the
+	// testament Summary. It is presentation metadata only; the
+	// testament remains ordinary board evidence for all agents.
+	Presentation *Presentation `json:"presentation,omitempty"`
+
 	// Artifacts are the proof attached to this testament. Structural
 	// ownership — each Artifact belongs to exactly one Testament.
 	Artifacts []*Artifact `json:"artifacts"`
@@ -521,12 +592,16 @@ type Artifact struct {
 	Accessed   time.Time  `json:"accessed"`
 
 	// ── Artifact-specific ──
-	Kind        string         `json:"kind"`                  // free-form: "code_reference", "test_output", etc.
-	Reference   string         `json:"reference"`             // content or pointer
-	Metadata    map[string]any `json:"metadata,omitempty"`    // kind-specific structured data
+	Kind        string         `json:"kind"`                   // free-form: "code_reference", "test_output", etc.
+	Reference   string         `json:"reference"`              // content or pointer
+	Metadata    map[string]any `json:"metadata,omitempty"`     // kind-specific structured data
 	ContentHash string         `json:"content_hash,omitempty"` // SHA-256 for integrity/dedup
 	Size        int64          `json:"size,omitempty"`         // byte size
-	Ephemeral   bool           `json:"ephemeral,omitempty"`   // transient vs durable
+	Ephemeral   bool           `json:"ephemeral,omitempty"`    // transient vs durable
+	// Presentation carries optional UI rendering intent for the
+	// artifact Reference or dereferenced content. It never removes the
+	// artifact from normal board evidence queries.
+	Presentation *Presentation `json:"presentation,omitempty"`
 }
 
 // Validation is a single precise, atomic means of verifying a claim.
@@ -615,7 +690,7 @@ type ClaimsBoardProjection struct {
 // subjects report incremental work before submitting a testament.
 type ClaimProgressUpdate struct {
 	WorkSummary  string   `json:"work_summary,omitempty"`  // appends to existing
-	Evidence     []string `json:"evidence,omitempty"`       // appends evidence refs
+	Evidence     []string `json:"evidence,omitempty"`      // appends evidence refs
 	FilesChanged []string `json:"files_changed,omitempty"` // scope tracking
 }
 
@@ -664,7 +739,7 @@ type ClaimsBoardSubscriber func(*ClaimsBoardProjection) error
 // Subscribers use this to update counters, emit TUI events, or trigger
 // downstream processing without forcing a full board read.
 type BoardMutationDelta struct {
-	Kind        string      `json:"kind"`         // "claim_created", "claim_status_changed", "testament_submitted", "validation_evaluated", "claim_rejected", "phase_changed", "claim_context_changed", "testament_context_changed"
+	Kind        string      `json:"kind"` // "claim_created", "claim_status_changed", "testament_submitted", "validation_evaluated", "claim_rejected", "phase_changed", "claim_context_changed", "testament_context_changed"
 	ClaimID     string      `json:"claim_id,omitempty"`
 	TestamentID string      `json:"testament_id,omitempty"`
 	FromStatus  ClaimStatus `json:"from_status,omitempty"`
@@ -680,7 +755,7 @@ type BoardMutationDelta struct {
 	// empty) and post-flush deltas (TestamentID set). UI uses
 	// AccumulatorID as the in-flight row anchor and TestamentID as
 	// the durable rebind anchor.
-	AccumulatorID string `json:"accumulator_id,omitempty"`
+	AccumulatorID string       `json:"accumulator_id,omitempty"`
 	Summary       BoardSummary `json:"summary"` // always populated — current counts
 }
 
@@ -688,6 +763,287 @@ type BoardMutationDelta struct {
 // full projection copies. The delta tells the subscriber what changed;
 // the summary provides current counts.
 type BoardDeltaSubscriber func(BoardMutationDelta) error
+
+// ────────────────────────────────────────────────────────────────────
+// Presentation helpers
+// ────────────────────────────────────────────────────────────────────
+
+// ClonePresentation returns a defensive copy of presentation metadata.
+func ClonePresentation(p *Presentation) *Presentation {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	if len(p.Audiences) > 0 {
+		cp.Audiences = append([]PresentationAudience(nil), p.Audiences...)
+	}
+	if len(p.Surfaces) > 0 {
+		cp.Surfaces = append([]PresentationSurface(nil), p.Surfaces...)
+	}
+	return &cp
+}
+
+// NormalizePresentation trims strings and removes duplicate audiences
+// and surfaces. A nil or empty presentation normalizes to nil, matching
+// the default "not automatically rendered" contract.
+func NormalizePresentation(p *Presentation) *Presentation {
+	cp := ClonePresentation(p)
+	if cp == nil {
+		return nil
+	}
+	cp.Audiences = normalizePresentationAudiences(cp.Audiences)
+	cp.Surfaces = normalizePresentationSurfaces(cp.Surfaces)
+	cp.Format = PresentationFormat(strings.TrimSpace(string(cp.Format)))
+	cp.Title = strings.TrimSpace(cp.Title)
+	cp.Placement = PresentationPlacement(strings.TrimSpace(string(cp.Placement)))
+	cp.ReplaceKey = strings.TrimSpace(cp.ReplaceKey)
+	if len(cp.Audiences) == 0 &&
+		len(cp.Surfaces) == 0 &&
+		cp.Format == "" &&
+		cp.Title == "" &&
+		cp.Placement == "" &&
+		cp.ReplaceKey == "" &&
+		cp.Priority == 0 {
+		return nil
+	}
+	return cp
+}
+
+func normalizePresentationAudiences(in []PresentationAudience) []PresentationAudience {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[PresentationAudience]struct{}, len(in))
+	out := make([]PresentationAudience, 0, len(in))
+	for _, audience := range in {
+		audience = PresentationAudience(strings.TrimSpace(string(audience)))
+		if audience == "" {
+			continue
+		}
+		if _, ok := seen[audience]; ok {
+			continue
+		}
+		seen[audience] = struct{}{}
+		out = append(out, audience)
+	}
+	return out
+}
+
+func normalizePresentationSurfaces(in []PresentationSurface) []PresentationSurface {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[PresentationSurface]struct{}, len(in))
+	out := make([]PresentationSurface, 0, len(in))
+	for _, surface := range in {
+		surface = PresentationSurface(strings.TrimSpace(string(surface)))
+		if surface == "" {
+			continue
+		}
+		if _, ok := seen[surface]; ok {
+			continue
+		}
+		seen[surface] = struct{}{}
+		out = append(out, surface)
+	}
+	return out
+}
+
+// ValidatePresentation checks that presentation metadata uses the
+// canonical vocabulary. Nil and empty presentations are valid and simply
+// non-renderable.
+func ValidatePresentation(p *Presentation) error {
+	cp := NormalizePresentation(p)
+	if cp == nil {
+		return nil
+	}
+	for _, audience := range cp.Audiences {
+		if !validPresentationAudience(audience) {
+			return fmt.Errorf("unknown presentation audience %q", audience)
+		}
+	}
+	for _, surface := range cp.Surfaces {
+		if !validPresentationSurface(surface) {
+			return fmt.Errorf("unknown presentation surface %q", surface)
+		}
+	}
+	if cp.Format != "" && !validPresentationFormat(cp.Format) {
+		return fmt.Errorf("unknown presentation format %q", cp.Format)
+	}
+	if cp.Placement != "" && !validPresentationPlacement(cp.Placement) {
+		return fmt.Errorf("unknown presentation placement %q", cp.Placement)
+	}
+	return nil
+}
+
+func validPresentationAudience(audience PresentationAudience) bool {
+	switch audience {
+	case PresentationAudienceUser, PresentationAudienceOperator, PresentationAudienceDeveloper:
+		return true
+	default:
+		return false
+	}
+}
+
+func validPresentationSurface(surface PresentationSurface) bool {
+	switch surface {
+	case PresentationSurfaceChat, PresentationSurfaceApproval, PresentationSurfaceSidePanel, PresentationSurfaceDiagnostics:
+		return true
+	default:
+		return false
+	}
+}
+
+func validPresentationFormat(format PresentationFormat) bool {
+	switch format {
+	case PresentationFormatMarkdown, PresentationFormatText, PresentationFormatJSON, PresentationFormatDiff, PresentationFormatTable:
+		return true
+	default:
+		return false
+	}
+}
+
+func validPresentationPlacement(placement PresentationPlacement) bool {
+	switch placement {
+	case PresentationPlacementBeforeResponse, PresentationPlacementAfterResponse, PresentationPlacementInline, PresentationPlacementReplace, PresentationPlacementPanelOnly:
+		return true
+	default:
+		return false
+	}
+}
+
+// PresentationMatches reports whether p explicitly targets audience and
+// surface. Invalid presentation metadata is treated as non-renderable.
+func PresentationMatches(p *Presentation, audience, surface string) bool {
+	cp := NormalizePresentation(p)
+	if cp == nil || ValidatePresentation(cp) != nil {
+		return false
+	}
+	wantAudience := PresentationAudience(strings.TrimSpace(audience))
+	wantSurface := PresentationSurface(strings.TrimSpace(surface))
+	if wantAudience == "" || wantSurface == "" {
+		return false
+	}
+	if !presentationHasAudience(cp, wantAudience) {
+		return false
+	}
+	return presentationHasSurface(cp, wantSurface)
+}
+
+func presentationHasAudience(p *Presentation, want PresentationAudience) bool {
+	for _, audience := range p.Audiences {
+		if audience == want {
+			return true
+		}
+	}
+	return false
+}
+
+func presentationHasSurface(p *Presentation, want PresentationSurface) bool {
+	for _, surface := range p.Surfaces {
+		if surface == want {
+			return true
+		}
+	}
+	return false
+}
+
+// IsUserChatPresentation reports whether p is explicitly renderable to
+// the human chat surface.
+func IsUserChatPresentation(p *Presentation) bool {
+	return PresentationMatches(p, string(PresentationAudienceUser), string(PresentationSurfaceChat))
+}
+
+// IsPresentableToUserChat is a compatibility alias with the wording in
+// docs/CLAIMS_VISIBILITY.md.
+func IsPresentableToUserChat(p *Presentation) bool {
+	return IsUserChatPresentation(p)
+}
+
+// PresentableArtifacts returns testament artifacts that explicitly
+// target audience and surface. It is a convenience filter only; generic
+// board queries still return every artifact.
+func PresentableArtifacts(t *Testament, audience, surface string) []*Artifact {
+	if t == nil {
+		return nil
+	}
+	out := make([]*Artifact, 0, len(t.Artifacts))
+	for _, artifact := range t.Artifacts {
+		if artifact == nil || !PresentationMatches(artifact.Presentation, audience, surface) {
+			continue
+		}
+		out = append(out, CloneArtifact(artifact))
+	}
+	return out
+}
+
+// HasPresentableArtifact reports whether t contains at least one
+// artifact of kind that targets audience and surface.
+func HasPresentableArtifact(t *Testament, kind, audience, surface string) bool {
+	if t == nil {
+		return false
+	}
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		return false
+	}
+	for _, artifact := range t.Artifacts {
+		if artifact == nil || strings.TrimSpace(artifact.Kind) != kind {
+			continue
+		}
+		if PresentationMatches(artifact.Presentation, audience, surface) {
+			return true
+		}
+	}
+	return false
+}
+
+// CloneArtifact returns a defensive copy of an artifact, including
+// presentation metadata. Metadata values are copied shallowly because
+// they are arbitrary JSON-like values owned by artifact-kind protocols.
+func CloneArtifact(a *Artifact) *Artifact {
+	if a == nil {
+		return nil
+	}
+	cp := *a
+	if len(a.Relations) > 0 {
+		cp.Relations = append([]Relation(nil), a.Relations...)
+	}
+	cp.Metadata = cloneAnyMap(a.Metadata)
+	cp.Presentation = ClonePresentation(a.Presentation)
+	return &cp
+}
+
+// CloneTestamentEntity returns a defensive copy of a testament,
+// including presentation metadata and artifact copies.
+func CloneTestamentEntity(t *Testament) *Testament {
+	if t == nil {
+		return nil
+	}
+	cp := *t
+	if len(t.Relations) > 0 {
+		cp.Relations = append([]Relation(nil), t.Relations...)
+	}
+	cp.Presentation = ClonePresentation(t.Presentation)
+	if len(t.Artifacts) > 0 {
+		cp.Artifacts = make([]*Artifact, len(t.Artifacts))
+		for i, artifact := range t.Artifacts {
+			cp.Artifacts[i] = CloneArtifact(artifact)
+		}
+	}
+	return &cp
+}
+
+func cloneAnyMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
 
 // ────────────────────────────────────────────────────────────────────
 // Relation helpers

@@ -77,6 +77,7 @@ type ClaimsBridge struct {
 	artifactByID              map[string]*claims.Artifact
 	artifactClaim             map[string]string
 	emittedStartedArtifacts   map[string]struct{}
+	emittedPresentations      map[string]struct{}
 	completedStartedArtifacts map[string]struct{}
 	claimToInvocationArtifact map[string]string
 	latestStateByClaim        map[string]string
@@ -113,6 +114,7 @@ func NewClaimsBridge(
 		artifactByID:              make(map[string]*claims.Artifact),
 		artifactClaim:             make(map[string]string),
 		emittedStartedArtifacts:   make(map[string]struct{}),
+		emittedPresentations:      make(map[string]struct{}),
 		completedStartedArtifacts: make(map[string]struct{}),
 		claimToInvocationArtifact: make(map[string]string),
 		latestStateByClaim:        make(map[string]string),
@@ -232,6 +234,7 @@ func (b *ClaimsBridge) resetSessionStateLocked() {
 	b.artifactByID = make(map[string]*claims.Artifact)
 	b.artifactClaim = make(map[string]string)
 	b.emittedStartedArtifacts = make(map[string]struct{})
+	b.emittedPresentations = make(map[string]struct{})
 	b.completedStartedArtifacts = make(map[string]struct{})
 	b.claimToInvocationArtifact = make(map[string]string)
 	b.latestStateByClaim = make(map[string]string)
@@ -623,6 +626,9 @@ func (b *ClaimsBridge) handleTestamentSubmitted(sessionID string, t *claims.Test
 		art := t.Artifacts[i]
 		b.OnArtifactAdded(claimID, t.AgentID, sessionID, art)
 	}
+	if m := b.claimPresentationMsgForTestament(sessionID, claimID, t); m != nil {
+		b.enqueue(*m)
+	}
 	if m := b.claimTestamentResponseMsg(sessionID, claimID, t); m != nil {
 		b.enqueue(*m)
 	}
@@ -749,6 +755,10 @@ func (b *ClaimsBridge) OnArtifactAdded(claimID, agentID, sessionID string, artif
 		out = append(out, b.handleAgentStateArtifactLocked(sessionID, claimID, art)...)
 	case art.Kind == claims.ArtifactKindResponseText:
 		if m := b.claimResponseTextMsgLocked(sessionID, claimID, art); m != nil {
+			out = append(out, *m)
+		}
+	case claims.IsPresentableToUserChat(art.Presentation) && !isPresentationLifecycleArtifactKind(art.Kind):
+		if m := b.claimPresentationMsgLocked(sessionID, claimID, art); m != nil {
 			out = append(out, *m)
 		}
 	case isVisibleStartedArtifactKind(art.Kind):
@@ -1003,6 +1013,156 @@ func (b *ClaimsBridge) claimResponseTextMsgLocked(sessionID, claimID string, art
 	}
 }
 
+func (b *ClaimsBridge) claimPresentationMsgForTestament(sessionID, claimID string, t *claims.Testament) *msg.ClaimPresentationMsg {
+	if b == nil || t == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.claimPresentationMsgForTestamentLocked(sessionID, claimID, t)
+}
+
+func (b *ClaimsBridge) claimPresentationMsgForTestamentLocked(sessionID, claimID string, t *claims.Testament) *msg.ClaimPresentationMsg {
+	if t == nil || !claims.IsPresentableToUserChat(t.Presentation) {
+		return nil
+	}
+	sourceID := strings.TrimSpace(t.ID)
+	if sourceID == "" {
+		return nil
+	}
+	sourceKey := presentationSourceKey("testament", sourceID)
+	if _, emitted := b.emittedPresentations[sourceKey]; emitted {
+		return nil
+	}
+	content := strings.TrimSpace(t.Summary)
+	if content == "" {
+		return nil
+	}
+	claimID = strings.TrimSpace(claimID)
+	if claimID == "" {
+		claimID = claims.ClaimIDFromRelations(t.Relations)
+	}
+	meta := b.metaForClaimLocked(claimID)
+	if meta.SuppressChat {
+		return nil
+	}
+	p := claims.NormalizePresentation(t.Presentation)
+	b.emittedPresentations[sourceKey] = struct{}{}
+	return &msg.ClaimPresentationMsg{
+		SessionID:   sessionID,
+		CycleID:     firstNonBlank(meta.CycleID, claimID),
+		ClaimID:     claimID,
+		SourceType:  "testament",
+		SourceID:    sourceID,
+		TestamentID: sourceID,
+		AgentID:     firstNonBlank(strings.TrimSpace(t.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
+		Title:       presentationTitle(p, "Testament"),
+		Content:     content,
+		Format:      presentationFormat(p),
+		Placement:   presentationPlacement(p),
+		ReplaceKey:  presentationReplaceKey(p),
+		CreatedAt:   nonZeroTime(t.Created),
+		Sequence:    t.Sequence,
+	}
+}
+
+func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art *claims.Artifact) *msg.ClaimPresentationMsg {
+	if art == nil || !claims.IsPresentableToUserChat(art.Presentation) {
+		return nil
+	}
+	sourceID := strings.TrimSpace(art.ID)
+	if sourceID == "" {
+		return nil
+	}
+	sourceKey := presentationSourceKey("artifact", sourceID)
+	if _, emitted := b.emittedPresentations[sourceKey]; emitted {
+		return nil
+	}
+	content := strings.TrimSpace(art.Reference)
+	if content == "" {
+		content = claimMetadataString(art.Metadata, "content", "text", "markdown", "body")
+	}
+	if content == "" {
+		return nil
+	}
+	claimID = strings.TrimSpace(claimID)
+	if claimID == "" {
+		claimID = b.claimIDForArtifactLocked(art)
+	}
+	meta := b.metaForClaimLocked(claimID)
+	if meta.SuppressChat {
+		return nil
+	}
+	p := claims.NormalizePresentation(art.Presentation)
+	b.emittedPresentations[sourceKey] = struct{}{}
+	return &msg.ClaimPresentationMsg{
+		SessionID:   sessionID,
+		CycleID:     firstNonBlank(meta.CycleID, claimID),
+		ClaimID:     claimID,
+		SourceType:  "artifact",
+		SourceID:    sourceID,
+		TestamentID: strings.TrimSpace(art.TestamentID),
+		AgentID:     firstNonBlank(strings.TrimSpace(art.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
+		Title:       presentationTitle(p, strings.TrimSpace(art.Kind)),
+		Content:     content,
+		Format:      presentationFormat(p),
+		Placement:   presentationPlacement(p),
+		ReplaceKey:  presentationReplaceKey(p),
+		Metadata:    cloneMetadata(art.Metadata),
+		CreatedAt:   nonZeroTime(art.Created),
+		Sequence:    art.Sequence,
+	}
+}
+
+func (b *ClaimsBridge) claimIDForArtifactLocked(art *claims.Artifact) string {
+	if art == nil {
+		return ""
+	}
+	if claimID := b.artifactClaim[strings.TrimSpace(art.ID)]; claimID != "" {
+		return claimID
+	}
+	testamentID := strings.TrimSpace(art.TestamentID)
+	if testamentID == "" || b.board == nil {
+		return ""
+	}
+	if t := findTestament(b.board.Projection(), testamentID); t != nil {
+		return claims.ClaimIDFromRelations(t.Relations)
+	}
+	return ""
+}
+
+func presentationSourceKey(sourceType, sourceID string) string {
+	return strings.TrimSpace(sourceType) + "|" + strings.TrimSpace(sourceID)
+}
+
+func presentationTitle(p *claims.Presentation, fallback string) string {
+	if p != nil && strings.TrimSpace(p.Title) != "" {
+		return strings.TrimSpace(p.Title)
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func presentationFormat(p *claims.Presentation) string {
+	if p != nil && strings.TrimSpace(string(p.Format)) != "" {
+		return strings.TrimSpace(string(p.Format))
+	}
+	return string(claims.PresentationFormatText)
+}
+
+func presentationPlacement(p *claims.Presentation) string {
+	if p != nil && strings.TrimSpace(string(p.Placement)) != "" {
+		return strings.TrimSpace(string(p.Placement))
+	}
+	return string(claims.PresentationPlacementInline)
+}
+
+func presentationReplaceKey(p *claims.Presentation) string {
+	if p == nil {
+		return ""
+	}
+	return strings.TrimSpace(p.ReplaceKey)
+}
+
 func (b *ClaimsBridge) claimTestamentResponseMsg(sessionID, claimID string, t *claims.Testament) *msg.ClaimResponseTextMsg {
 	claimID = strings.TrimSpace(claimID)
 	if t == nil || claimID == "" {
@@ -1118,7 +1278,14 @@ func (b *ClaimsBridge) replayProjection(sessionID string, proj *claims.ClaimsBoa
 		claimID := claims.ClaimIDFromRelations(t.Relations)
 		for j := range t.Artifacts {
 			art := t.Artifacts[j]
-			if art == nil || !isVisibleStartedArtifactKind(art.Kind) {
+			if art == nil {
+				continue
+			}
+			if claims.IsPresentableToUserChat(art.Presentation) && !isPresentationLifecycleArtifactKind(art.Kind) {
+				b.OnArtifactAdded(claimID, t.AgentID, sessionID, art)
+				continue
+			}
+			if !isVisibleStartedArtifactKind(art.Kind) {
 				continue
 			}
 			if _, done := completed[strings.TrimSpace(art.ID)]; done {
@@ -1129,6 +1296,9 @@ func (b *ClaimsBridge) replayProjection(sessionID string, proj *claims.ClaimsBoa
 	}
 	for i := range proj.Testaments {
 		t := &proj.Testaments[i]
+		if m := b.claimPresentationMsgForTestament(sessionID, claims.ClaimIDFromRelations(t.Relations), t); m != nil {
+			b.enqueue(*m)
+		}
 		if strings.TrimSpace(t.Context) != "" {
 			b.handleTestamentContext(sessionID, testamentContextEvent{
 				ClaimID:           claims.ClaimIDFromRelations(t.Relations),
@@ -1404,6 +1574,13 @@ func isVisibleCompletedArtifactKind(kind string) bool {
 	}
 }
 
+func isPresentationLifecycleArtifactKind(kind string) bool {
+	return strings.TrimSpace(kind) == claims.ArtifactKindAgentState ||
+		strings.TrimSpace(kind) == claims.ArtifactKindResponseText ||
+		isVisibleStartedArtifactKind(kind) ||
+		isVisibleCompletedArtifactKind(kind)
+}
+
 func artifactOutcome(art *claims.Artifact) string {
 	if art == nil {
 		return "success"
@@ -1494,15 +1671,7 @@ type fmtStringer interface {
 }
 
 func cloneArtifact(art *claims.Artifact) *claims.Artifact {
-	if art == nil {
-		return nil
-	}
-	cp := *art
-	cp.Metadata = cloneMetadata(art.Metadata)
-	if len(art.Relations) > 0 {
-		cp.Relations = append([]claims.Relation(nil), art.Relations...)
-	}
-	return &cp
+	return claims.CloneArtifact(art)
 }
 
 func cloneMetadata(in map[string]any) map[string]any {

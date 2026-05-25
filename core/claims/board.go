@@ -636,6 +636,7 @@ func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now tim
 	t.Sequence = b.nextSeq()
 	t.Created = now
 	t.Accessed = now
+	t.Presentation = NormalizePresentation(t.Presentation)
 
 	if !HasRelation(t.Relations, RelationshipTestamentAction, action.ID) {
 		t.Relations = append(t.Relations, Relation{
@@ -656,6 +657,7 @@ func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now tim
 		artifact.Sequence = b.nextSeq()
 		artifact.Created = now
 		artifact.Accessed = now
+		artifact.Presentation = NormalizePresentation(artifact.Presentation)
 	}
 
 	b.testaments[t.ID] = t
@@ -1271,7 +1273,11 @@ func (b *ClaimsBoard) populateActionsProjectionLocked(p *ClaimsBoardProjection) 
 
 func (b *ClaimsBoard) populateTestamentsProjectionLocked(p *ClaimsBoardProjection) {
 	for _, t := range b.testaments {
-		clone := *t
+		clonePtr := CloneTestamentEntity(t)
+		if clonePtr == nil {
+			continue
+		}
+		clone := *clonePtr
 		// Truncate large artifact references in projection copies.
 		// Full content preserved in board's internal storage.
 		for i, a := range clone.Artifacts {
@@ -1364,8 +1370,7 @@ func (b *ClaimsBoard) TestamentsByClaim(claimID string) []*Testament {
 	var out []*Testament
 	for _, t := range b.testaments {
 		if HasRelation(t.Relations, RelationshipClaim, claimID) {
-			clone := *t
-			out = append(out, &clone)
+			out = append(out, CloneTestamentEntity(t))
 		}
 	}
 	return out
@@ -1574,8 +1579,7 @@ func (b *ClaimsBoard) CloneTestament(id string) (*Testament, bool) {
 	if !ok {
 		return nil, false
 	}
-	clone := *t
-	return &clone, true
+	return CloneTestamentEntity(t), true
 }
 
 // ObjectIDsWithRelation returns every object ID whose Relations

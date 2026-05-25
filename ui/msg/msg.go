@@ -966,6 +966,27 @@ type ClaimResponseTextMsg struct {
 	SuppressChat bool
 }
 
+// ClaimPresentationMsg carries user-facing content projected from a
+// claims-board testament or artifact. It is traceable back to the
+// source entity; the board remains the source of truth.
+type ClaimPresentationMsg struct {
+	SessionID   string
+	CycleID     string
+	ClaimID     string
+	SourceType  string // "testament" | "artifact"
+	SourceID    string
+	TestamentID string
+	AgentID     string
+	Title       string
+	Content     string
+	Format      string
+	Placement   string
+	ReplaceKey  string
+	Metadata    map[string]any
+	CreatedAt   time.Time
+	Sequence    uint64
+}
+
 // ClaimArtifactCompletedMsg closes a row in the chat tree. Emitted by
 // the bridge when a *_completed artifact lands carrying
 // Relation{completes}. The chat panel matches by StartArtifactID and

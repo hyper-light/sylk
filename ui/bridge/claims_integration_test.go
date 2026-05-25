@@ -287,6 +287,168 @@ func TestBridgeIntegration_ArtifactSummaryPrefersCompletionMetadata(t *testing.T
 	}
 }
 
+func TestBridgeIntegration_PresentableArtifactEmitsClaimPresentation(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-presentation-artifact")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "plan",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+
+	br.OnArtifactAdded(claimID, "architect", "ses-presentation-artifact", &claims.Artifact{
+		ID:        "artifact-plan",
+		AgentID:   "architect",
+		Kind:      claims.ArtifactKindPlanMarkdown,
+		Reference: "### Plan\n\nDo the work.",
+		Presentation: &claims.Presentation{
+			Audiences:  []claims.PresentationAudience{claims.PresentationAudienceUser},
+			Surfaces:   []claims.PresentationSurface{claims.PresentationSurfaceChat, claims.PresentationSurfaceApproval},
+			Format:     claims.PresentationFormatMarkdown,
+			Title:      "Plan",
+			Placement:  claims.PresentationPlacementBeforeResponse,
+			ReplaceKey: "plan:p1:review",
+		},
+		Metadata: map[string]any{"plan_id": "p1"},
+		Created:  time.Now(),
+		Sequence: 77,
+	})
+	br.OnArtifactAdded(claimID, "architect", "ses-presentation-artifact", &claims.Artifact{
+		ID:        "artifact-plan",
+		AgentID:   "architect",
+		Kind:      claims.ArtifactKindPlanMarkdown,
+		Reference: "duplicate",
+		Presentation: &claims.Presentation{
+			Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+			Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
+		},
+		Created: time.Now(),
+	})
+	drainBridge(t, prog, "presentable artifact")
+
+	var presentations []msg.ClaimPresentationMsg
+	for _, m := range prog.Snapshot() {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceID == "artifact-plan" {
+			presentations = append(presentations, p)
+		}
+	}
+	if len(presentations) != 1 {
+		debugSnapshot(t, prog, "presentable artifact")
+		t.Fatalf("presentations = %d, want 1", len(presentations))
+	}
+	got := presentations[0]
+	if got.SourceType != "artifact" || got.ClaimID != claimID || got.CycleID == "" {
+		t.Fatalf("unexpected presentation ids: %+v", got)
+	}
+	if got.Format != "markdown" || got.Placement != "before_response" || got.ReplaceKey != "plan:p1:review" {
+		t.Fatalf("unexpected presentation render fields: %+v", got)
+	}
+	if got.Metadata["plan_id"] != "p1" {
+		t.Fatalf("metadata not preserved: %+v", got.Metadata)
+	}
+}
+
+func TestBridgeIntegration_InternalArtifactDoesNotEmitPresentation(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-internal-artifact")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "plan",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	br.OnArtifactAdded(claimID, "architect", "ses-internal-artifact", &claims.Artifact{
+		ID:        "handoff",
+		AgentID:   "architect",
+		Kind:      claims.ArtifactKindPlanHandoffPayload,
+		Reference: `{"plan_id":"p1"}`,
+		Created:   time.Now(),
+	})
+	drainBridge(t, prog, "internal artifact")
+	for _, m := range prog.Snapshot() {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceID == "handoff" {
+			t.Fatalf("internal artifact emitted presentation: %+v", p)
+		}
+	}
+}
+
+func TestBridgeIntegration_PresentableTestamentEmitsClaimPresentation(t *testing.T) {
+	_, board, prog, cleanup := setupBridgeOnSession(t, "ses-presentation-testament")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "academic", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "research",
+			Relations: []claims.Relation{
+				{Related: "academic", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "academic", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	if err := board.SubmitTestaments(context.Background(),
+		claims.Action{AgentID: "academic", Type: claims.ActionTypeTestament},
+		[]claims.Testament{{
+			AgentID: "academic",
+			Summary: "Use argparse for a stdlib-only CLI.",
+			Presentation: &claims.Presentation{
+				Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+				Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
+				Format:    claims.PresentationFormatMarkdown,
+				Title:     "Academic recommendation",
+			},
+			Relations: []claims.Relation{
+				{Related: claimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
+			},
+		}},
+	); err != nil {
+		t.Fatalf("SubmitTestaments: %v", err)
+	}
+	drainBridge(t, prog, "presentable testament")
+
+	var got *msg.ClaimPresentationMsg
+	for _, m := range prog.Snapshot() {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceType == "testament" {
+			copy := p
+			got = &copy
+			break
+		}
+	}
+	if got == nil {
+		debugSnapshot(t, prog, "presentable testament")
+		t.Fatal("expected ClaimPresentationMsg for testament")
+	}
+	if got.Content != "Use argparse for a stdlib-only CLI." {
+		t.Fatalf("Content = %q", got.Content)
+	}
+	if got.Title != "Academic recommendation" || got.Format != "markdown" {
+		t.Fatalf("unexpected title/format: %+v", got)
+	}
+}
+
 // debugSnapshot prints message types — used during diagnosis only.
 func debugSnapshot(t *testing.T, prog *integrationProgram, label string) {
 	t.Helper()
