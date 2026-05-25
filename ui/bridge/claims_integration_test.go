@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -356,6 +357,163 @@ func TestBridgeIntegration_PresentableArtifactEmitsClaimPresentation(t *testing.
 	if got.Metadata["plan_id"] != "p1" {
 		t.Fatalf("metadata not preserved: %+v", got.Metadata)
 	}
+}
+
+func TestBridgeIntegration_PresentableArtifactPreservesReferenceContent(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-presentation-content")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "diff",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	reference := "\n```diff\n+ keep leading newline\n```\n"
+	br.OnArtifactAdded(claimID, "architect", "ses-presentation-content", &claims.Artifact{
+		ID:        "artifact-diff",
+		AgentID:   "architect",
+		Kind:      "diff",
+		Reference: reference,
+		Presentation: &claims.Presentation{
+			Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+			Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
+			Format:    claims.PresentationFormatDiff,
+		},
+		Created:  time.Now(),
+		Sequence: 7,
+	})
+	drainBridge(t, prog, "presentable artifact content")
+
+	for _, m := range prog.Snapshot() {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceID == "artifact-diff" {
+			if p.Content != reference {
+				t.Fatalf("presentation content was altered: %q", p.Content)
+			}
+			return
+		}
+	}
+	debugSnapshot(t, prog, "presentable artifact content")
+	t.Fatal("expected ClaimPresentationMsg for artifact-diff")
+}
+
+func TestBridgeIntegration_PresentationReplacementSuppressesOlderLateMessage(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-presentation-replace")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "plan",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	presentation := &claims.Presentation{
+		Audiences:  []claims.PresentationAudience{claims.PresentationAudienceUser},
+		Surfaces:   []claims.PresentationSurface{claims.PresentationSurfaceChat},
+		Format:     claims.PresentationFormatMarkdown,
+		ReplaceKey: "plan:p1:review",
+	}
+	br.OnArtifactAdded(claimID, "architect", "ses-presentation-replace", &claims.Artifact{
+		ID:           "artifact-new",
+		AgentID:      "architect",
+		Kind:         claims.ArtifactKindPlanMarkdown,
+		Reference:    "new",
+		Presentation: presentation,
+		Sequence:     20,
+		Created:      time.Now(),
+	})
+	br.OnArtifactAdded(claimID, "architect", "ses-presentation-replace", &claims.Artifact{
+		ID:           "artifact-old",
+		AgentID:      "architect",
+		Kind:         claims.ArtifactKindPlanMarkdown,
+		Reference:    "old",
+		Presentation: presentation,
+		Sequence:     10,
+		Created:      time.Now(),
+	})
+	drainBridge(t, prog, "presentable replacement")
+
+	var got []msg.ClaimPresentationMsg
+	for _, m := range prog.Snapshot() {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.ReplaceKey == "plan:p1:review" {
+			got = append(got, p)
+		}
+	}
+	if len(got) != 1 {
+		debugSnapshot(t, prog, "presentable replacement")
+		t.Fatalf("presentations = %d, want 1: %+v", len(got), got)
+	}
+	if got[0].SourceID != "artifact-new" || got[0].Content != "new" {
+		t.Fatalf("late older presentation should be suppressed, got %+v", got[0])
+	}
+}
+
+func TestBridgeIntegration_TruncatedPresentableArtifactEmitsDiagnostic(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-presentation-truncated")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "large report",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	br.OnArtifactAdded(claimID, "architect", "ses-presentation-truncated", &claims.Artifact{
+		ID:        "artifact-large",
+		AgentID:   "architect",
+		Kind:      "report",
+		Reference: "partial...",
+		Metadata: map[string]any{
+			claims.ArtifactMetadataContentTruncated: true,
+			claims.ArtifactMetadataContentSize:      1200,
+		},
+		Presentation: &claims.Presentation{
+			Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+			Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
+			Format:    claims.PresentationFormatMarkdown,
+		},
+		Sequence: 5,
+		Created:  time.Now(),
+	})
+	drainBridge(t, prog, "truncated presentation")
+
+	for _, m := range prog.Snapshot() {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceID == "artifact-large" {
+			if !strings.Contains(strings.ToLower(p.Content), "truncated") || strings.Contains(p.Content, "partial") {
+				t.Fatalf("truncated artifact should emit diagnostic, got %q", p.Content)
+			}
+			if p.Format != string(claims.PresentationFormatText) {
+				t.Fatalf("truncated diagnostic format = %q, want text", p.Format)
+			}
+			return
+		}
+	}
+	debugSnapshot(t, prog, "truncated presentation")
+	t.Fatal("expected ClaimPresentationMsg for truncated artifact")
 }
 
 func TestBridgeIntegration_InternalArtifactDoesNotEmitPresentation(t *testing.T) {

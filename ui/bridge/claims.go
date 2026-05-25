@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -77,7 +78,8 @@ type ClaimsBridge struct {
 	artifactByID              map[string]*claims.Artifact
 	artifactClaim             map[string]string
 	emittedStartedArtifacts   map[string]struct{}
-	emittedPresentations      map[string]struct{}
+	emittedPresentations      map[string]presentationEmissionState
+	presentationReplacements  map[string]presentationEmissionState
 	completedStartedArtifacts map[string]struct{}
 	claimToInvocationArtifact map[string]string
 	latestStateByClaim        map[string]string
@@ -92,6 +94,11 @@ type ClaimsBridge struct {
 
 	prevArtifactSink claims.ArtifactProgressSink
 	sinkRegistered   bool
+}
+
+type presentationEmissionState struct {
+	Sequence uint64
+	SourceID string
 }
 
 func NewClaimsBridge(
@@ -114,7 +121,8 @@ func NewClaimsBridge(
 		artifactByID:              make(map[string]*claims.Artifact),
 		artifactClaim:             make(map[string]string),
 		emittedStartedArtifacts:   make(map[string]struct{}),
-		emittedPresentations:      make(map[string]struct{}),
+		emittedPresentations:      make(map[string]presentationEmissionState),
+		presentationReplacements:  make(map[string]presentationEmissionState),
 		completedStartedArtifacts: make(map[string]struct{}),
 		claimToInvocationArtifact: make(map[string]string),
 		latestStateByClaim:        make(map[string]string),
@@ -234,7 +242,8 @@ func (b *ClaimsBridge) resetSessionStateLocked() {
 	b.artifactByID = make(map[string]*claims.Artifact)
 	b.artifactClaim = make(map[string]string)
 	b.emittedStartedArtifacts = make(map[string]struct{})
-	b.emittedPresentations = make(map[string]struct{})
+	b.emittedPresentations = make(map[string]presentationEmissionState)
+	b.presentationReplacements = make(map[string]presentationEmissionState)
 	b.completedStartedArtifacts = make(map[string]struct{})
 	b.claimToInvocationArtifact = make(map[string]string)
 	b.latestStateByClaim = make(map[string]string)
@@ -1030,12 +1039,9 @@ func (b *ClaimsBridge) claimPresentationMsgForTestamentLocked(sessionID, claimID
 	if sourceID == "" {
 		return nil
 	}
-	sourceKey := presentationSourceKey("testament", sourceID)
-	if _, emitted := b.emittedPresentations[sourceKey]; emitted {
-		return nil
-	}
 	content := strings.TrimSpace(t.Summary)
 	if content == "" {
+		b.debug("presentation_skip_empty_testament", "testament_id", sourceID)
 		return nil
 	}
 	claimID = strings.TrimSpace(claimID)
@@ -1047,7 +1053,9 @@ func (b *ClaimsBridge) claimPresentationMsgForTestamentLocked(sessionID, claimID
 		return nil
 	}
 	p := claims.NormalizePresentation(t.Presentation)
-	b.emittedPresentations[sourceKey] = struct{}{}
+	if !b.shouldEmitPresentationLocked("testament", sourceID, presentationReplaceKey(p), t.Sequence) {
+		return nil
+	}
 	return &msg.ClaimPresentationMsg{
 		SessionID:   sessionID,
 		CycleID:     firstNonBlank(meta.CycleID, claimID),
@@ -1074,15 +1082,12 @@ func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art
 	if sourceID == "" {
 		return nil
 	}
-	sourceKey := presentationSourceKey("artifact", sourceID)
-	if _, emitted := b.emittedPresentations[sourceKey]; emitted {
-		return nil
-	}
-	content := strings.TrimSpace(art.Reference)
-	if content == "" {
+	content, truncated := presentationArtifactContent(art)
+	if strings.TrimSpace(content) == "" {
 		content = claimMetadataString(art.Metadata, "content", "text", "markdown", "body")
 	}
-	if content == "" {
+	if strings.TrimSpace(content) == "" {
+		b.debug("presentation_skip_empty_artifact", "artifact_id", sourceID, "kind", art.Kind)
 		return nil
 	}
 	claimID = strings.TrimSpace(claimID)
@@ -1094,7 +1099,13 @@ func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art
 		return nil
 	}
 	p := claims.NormalizePresentation(art.Presentation)
-	b.emittedPresentations[sourceKey] = struct{}{}
+	if !b.shouldEmitPresentationLocked("artifact", sourceID, presentationReplaceKey(p), art.Sequence) {
+		return nil
+	}
+	format := presentationFormat(p)
+	if truncated {
+		format = string(claims.PresentationFormatText)
+	}
 	return &msg.ClaimPresentationMsg{
 		SessionID:   sessionID,
 		CycleID:     firstNonBlank(meta.CycleID, claimID),
@@ -1105,7 +1116,7 @@ func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art
 		AgentID:     firstNonBlank(strings.TrimSpace(art.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
 		Title:       presentationTitle(p, strings.TrimSpace(art.Kind)),
 		Content:     content,
-		Format:      presentationFormat(p),
+		Format:      format,
 		Placement:   presentationPlacement(p),
 		ReplaceKey:  presentationReplaceKey(p),
 		Metadata:    cloneMetadata(art.Metadata),
@@ -1133,6 +1144,49 @@ func (b *ClaimsBridge) claimIDForArtifactLocked(art *claims.Artifact) string {
 
 func presentationSourceKey(sourceType, sourceID string) string {
 	return strings.TrimSpace(sourceType) + "|" + strings.TrimSpace(sourceID)
+}
+
+func (b *ClaimsBridge) shouldEmitPresentationLocked(sourceType, sourceID, replaceKey string, sequence uint64) bool {
+	sourceType = strings.TrimSpace(sourceType)
+	sourceID = strings.TrimSpace(sourceID)
+	if sourceType == "" || sourceID == "" {
+		return false
+	}
+	sourceKey := presentationSourceKey(sourceType, sourceID)
+	if _, emitted := b.emittedPresentations[sourceKey]; emitted {
+		return false
+	}
+	state := presentationEmissionState{Sequence: sequence, SourceID: sourceID}
+	replaceKey = strings.TrimSpace(replaceKey)
+	if replaceKey != "" {
+		if prior, ok := b.presentationReplacements[replaceKey]; ok && !presentationStateNewer(state, prior) {
+			return false
+		}
+		b.presentationReplacements[replaceKey] = state
+	}
+	b.emittedPresentations[sourceKey] = state
+	return true
+}
+
+func presentationStateNewer(next, prior presentationEmissionState) bool {
+	if next.Sequence != prior.Sequence {
+		return next.Sequence > prior.Sequence
+	}
+	return strings.TrimSpace(next.SourceID) > strings.TrimSpace(prior.SourceID)
+}
+
+func presentationArtifactContent(art *claims.Artifact) (string, bool) {
+	if art == nil {
+		return "", false
+	}
+	if claimMetadataBool(art.Metadata, claims.ArtifactMetadataContentTruncated) {
+		size := claimMetadataInt(art.Metadata, claims.ArtifactMetadataContentSize)
+		if size > 0 {
+			return fmt.Sprintf("Artifact %s is user-visible, but its inline projection was truncated (%d bytes).", strings.TrimSpace(art.ID), size), true
+		}
+		return fmt.Sprintf("Artifact %s is user-visible, but its inline projection was truncated.", strings.TrimSpace(art.ID)), true
+	}
+	return art.Reference, false
 }
 
 func presentationTitle(p *claims.Presentation, fallback string) string {
@@ -1664,6 +1718,49 @@ func claimMetadataString(md map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func claimMetadataBool(md map[string]any, key string) bool {
+	if md == nil || strings.TrimSpace(key) == "" {
+		return false
+	}
+	switch typed := md[key].(type) {
+	case bool:
+		return typed
+	case string:
+		v := strings.TrimSpace(strings.ToLower(typed))
+		return v == "true" || v == "1" || v == "yes"
+	case int:
+		return typed != 0
+	case int64:
+		return typed != 0
+	case float64:
+		return typed != 0
+	default:
+		return false
+	}
+}
+
+func claimMetadataInt(md map[string]any, key string) int {
+	if md == nil || strings.TrimSpace(key) == "" {
+		return 0
+	}
+	switch typed := md[key].(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		n, _ := typed.Int64()
+		return int(n)
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(typed))
+		return n
+	default:
+		return 0
+	}
 }
 
 type fmtStringer interface {

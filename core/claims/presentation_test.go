@@ -75,6 +75,58 @@ func TestArtifactJSONRoundTrip_WithPresentation(t *testing.T) {
 	}
 }
 
+func TestNormalizePresentationDefaultsFormatAndPlacement(t *testing.T) {
+	normalized := NormalizePresentation(&Presentation{
+		Audiences: []PresentationAudience{" user ", PresentationAudienceUser},
+		Surfaces:  []PresentationSurface{" chat ", "future_surface", PresentationSurfaceChat},
+	})
+	if normalized == nil {
+		t.Fatal("presentation normalized to nil")
+	}
+	if normalized.Format != PresentationFormatText {
+		t.Fatalf("format = %q, want text", normalized.Format)
+	}
+	if normalized.Placement != PresentationPlacementInline {
+		t.Fatalf("placement = %q, want inline", normalized.Placement)
+	}
+	if len(normalized.Audiences) != 1 || normalized.Audiences[0] != PresentationAudienceUser {
+		t.Fatalf("audiences = %+v", normalized.Audiences)
+	}
+	if len(normalized.Surfaces) != 2 || normalized.Surfaces[0] != PresentationSurfaceChat || normalized.Surfaces[1] != "future_surface" {
+		t.Fatalf("surfaces = %+v", normalized.Surfaces)
+	}
+}
+
+func TestValidatePresentationAllowsFutureValuesButRequiresUserSurface(t *testing.T) {
+	if err := ValidatePresentation(&Presentation{
+		Audiences: []PresentationAudience{PresentationAudienceUser, "future_audience"},
+		Surfaces:  []PresentationSurface{PresentationSurfaceChat, "future_surface"},
+		Format:    PresentationFormat("future_format"),
+		Placement: PresentationPlacement("future_placement"),
+	}); err != nil {
+		t.Fatalf("future values should be preserved without validation failure: %v", err)
+	}
+	if err := ValidatePresentation(&Presentation{
+		Audiences: []PresentationAudience{PresentationAudienceUser},
+	}); err == nil {
+		t.Fatal("user audience without a surface should fail validation")
+	}
+}
+
+func TestPresentationMatchesKnownAudienceSurfaceWithFutureValues(t *testing.T) {
+	p := &Presentation{
+		Audiences: []PresentationAudience{PresentationAudienceUser, "future_audience"},
+		Surfaces:  []PresentationSurface{"future_surface", PresentationSurfaceChat},
+		Format:    PresentationFormat("future_format"),
+	}
+	if !PresentationMatches(p, string(PresentationAudienceUser), string(PresentationSurfaceChat)) {
+		t.Fatal("known user/chat target should match even when future values are present")
+	}
+	if PresentationMatches(p, "future_audience", "future_surface") {
+		t.Fatal("current helpers should not claim support for unknown audience/surface")
+	}
+}
+
 func TestCloneTestament_DeepCopiesPresentation(t *testing.T) {
 	original := &Testament{
 		ID:           "testament-1",
@@ -156,6 +208,39 @@ func TestArtifactProjection_TruncatesReferenceButPreservesPresentation(t *testin
 	}
 	if artifact.Presentation == nil || artifact.Presentation.Title != "Plan" {
 		t.Fatalf("presentation not preserved through truncation: %+v", artifact.Presentation)
+	}
+	if artifact.Metadata[ArtifactMetadataContentTruncated] != true {
+		t.Fatalf("truncated projection missing explicit metadata: %+v", artifact.Metadata)
+	}
+	if artifact.Metadata[ArtifactMetadataContentInline] != false {
+		t.Fatalf("truncated projection should mark content_inline=false: %+v", artifact.Metadata)
+	}
+	if artifact.Metadata[ArtifactMetadataContentSize] != len(longReference) {
+		t.Fatalf("content size metadata = %+v, want %d", artifact.Metadata[ArtifactMetadataContentSize], len(longReference))
+	}
+}
+
+func TestProjectionOrdersTestamentsAndArtifactsBySequence(t *testing.T) {
+	board := testBoard()
+	board.testaments["t3"] = &Testament{
+		ID:       "t3",
+		Sequence: 30,
+		Artifacts: []*Artifact{
+			{ID: "a3", Sequence: 3},
+			{ID: "a1", Sequence: 1},
+		},
+	}
+	board.testaments["t1"] = &Testament{ID: "t1", Sequence: 10}
+	board.testaments["t2"] = &Testament{ID: "t2", Sequence: 20}
+	board.invalidateProjectionCache()
+
+	proj := board.Projection()
+	if got := []string{proj.Testaments[0].ID, proj.Testaments[1].ID, proj.Testaments[2].ID}; !reflect.DeepEqual(got, []string{"t1", "t2", "t3"}) {
+		t.Fatalf("testament order = %+v", got)
+	}
+	artifacts := proj.Testaments[2].Artifacts
+	if got := []string{artifacts[0].ID, artifacts[1].ID}; !reflect.DeepEqual(got, []string{"a1", "a3"}) {
+		t.Fatalf("artifact order = %+v", got)
 	}
 }
 

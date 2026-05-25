@@ -242,6 +242,14 @@ const (
 	// remains separate internal evidence for orchestration.
 	ArtifactKindPlanMarkdown = "plan_markdown"
 
+	// ArtifactMetadataContentTruncated marks projection copies whose
+	// Reference has been shortened. The board retains the full artifact;
+	// user-facing projection consumers must not render the shortened
+	// Reference as complete content.
+	ArtifactMetadataContentTruncated = "content_truncated"
+	ArtifactMetadataContentSize      = "content_size"
+	ArtifactMetadataContentInline    = "content_inline"
+
 	// ArtifactKindAgentState records an agent's state transition
 	// (Reasoning, ToolExecuting, DispatchingToPeer, etc.) on its
 	// in-flight testament. Reference is the human-readable detail.
@@ -806,6 +814,12 @@ func NormalizePresentation(p *Presentation) *Presentation {
 		cp.Priority == 0 {
 		return nil
 	}
+	if cp.Format == "" {
+		cp.Format = PresentationFormatText
+	}
+	if cp.Placement == "" {
+		cp.Placement = PresentationPlacementInline
+	}
 	return cp
 }
 
@@ -849,29 +863,16 @@ func normalizePresentationSurfaces(in []PresentationSurface) []PresentationSurfa
 	return out
 }
 
-// ValidatePresentation checks that presentation metadata uses the
-// canonical vocabulary. Nil and empty presentations are valid and simply
-// non-renderable.
+// ValidatePresentation checks structural presentation requirements.
+// Unknown vocabulary values are preserved for forward compatibility and
+// treated as non-renderable by current surface matchers.
 func ValidatePresentation(p *Presentation) error {
 	cp := NormalizePresentation(p)
 	if cp == nil {
 		return nil
 	}
-	for _, audience := range cp.Audiences {
-		if !validPresentationAudience(audience) {
-			return fmt.Errorf("unknown presentation audience %q", audience)
-		}
-	}
-	for _, surface := range cp.Surfaces {
-		if !validPresentationSurface(surface) {
-			return fmt.Errorf("unknown presentation surface %q", surface)
-		}
-	}
-	if cp.Format != "" && !validPresentationFormat(cp.Format) {
-		return fmt.Errorf("unknown presentation format %q", cp.Format)
-	}
-	if cp.Placement != "" && !validPresentationPlacement(cp.Placement) {
-		return fmt.Errorf("unknown presentation placement %q", cp.Placement)
+	if presentationHasAudience(cp, PresentationAudienceUser) && len(cp.Surfaces) == 0 {
+		return fmt.Errorf("presentation audience %q requires at least one surface", PresentationAudienceUser)
 	}
 	return nil
 }
@@ -921,7 +922,9 @@ func PresentationMatches(p *Presentation, audience, surface string) bool {
 	}
 	wantAudience := PresentationAudience(strings.TrimSpace(audience))
 	wantSurface := PresentationSurface(strings.TrimSpace(surface))
-	if wantAudience == "" || wantSurface == "" {
+	if wantAudience == "" || wantSurface == "" ||
+		!validPresentationAudience(wantAudience) ||
+		!validPresentationSurface(wantSurface) {
 		return false
 	}
 	if !presentationHasAudience(cp, wantAudience) {

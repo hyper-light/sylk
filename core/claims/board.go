@@ -3,6 +3,7 @@ package claims
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1264,7 +1265,20 @@ func incrementValidationCounts(p *ClaimsBoardProjection, validations []*Validati
 }
 
 func (b *ClaimsBoard) populateActionsProjectionLocked(p *ClaimsBoardProjection) {
+	actions := make([]*Action, 0, len(b.actions))
 	for _, a := range b.actions {
+		if a == nil {
+			continue
+		}
+		actions = append(actions, a)
+	}
+	sort.SliceStable(actions, func(i, j int) bool {
+		if actions[i].Sequence != actions[j].Sequence {
+			return actions[i].Sequence < actions[j].Sequence
+		}
+		return actions[i].ID < actions[j].ID
+	})
+	for _, a := range actions {
 		clone := *a
 		p.Actions = append(p.Actions, clone)
 		p.TotalClaimActions++
@@ -1272,18 +1286,46 @@ func (b *ClaimsBoard) populateActionsProjectionLocked(p *ClaimsBoardProjection) 
 }
 
 func (b *ClaimsBoard) populateTestamentsProjectionLocked(p *ClaimsBoardProjection) {
+	testaments := make([]*Testament, 0, len(b.testaments))
 	for _, t := range b.testaments {
+		if t != nil {
+			testaments = append(testaments, t)
+		}
+	}
+	sort.SliceStable(testaments, func(i, j int) bool {
+		if testaments[i].Sequence != testaments[j].Sequence {
+			return testaments[i].Sequence < testaments[j].Sequence
+		}
+		return testaments[i].ID < testaments[j].ID
+	})
+	for _, t := range testaments {
 		clonePtr := CloneTestamentEntity(t)
 		if clonePtr == nil {
 			continue
 		}
 		clone := *clonePtr
+		sort.SliceStable(clone.Artifacts, func(i, j int) bool {
+			if clone.Artifacts[i] == nil || clone.Artifacts[j] == nil {
+				return clone.Artifacts[i] != nil
+			}
+			if clone.Artifacts[i].Sequence != clone.Artifacts[j].Sequence {
+				return clone.Artifacts[i].Sequence < clone.Artifacts[j].Sequence
+			}
+			return clone.Artifacts[i].ID < clone.Artifacts[j].ID
+		})
 		// Truncate large artifact references in projection copies.
 		// Full content preserved in board's internal storage.
 		for i, a := range clone.Artifacts {
 			if a != nil && len(a.Reference) > maxArtifactReferenceLen {
 				truncated := *a
 				truncated.Reference = TruncateArtifactReference(a.Reference)
+				truncated.Metadata = cloneAnyMap(a.Metadata)
+				if truncated.Metadata == nil {
+					truncated.Metadata = make(map[string]any, 3)
+				}
+				truncated.Metadata[ArtifactMetadataContentTruncated] = true
+				truncated.Metadata[ArtifactMetadataContentInline] = false
+				truncated.Metadata[ArtifactMetadataContentSize] = len(a.Reference)
 				clone.Artifacts[i] = &truncated
 			}
 		}

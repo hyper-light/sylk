@@ -1066,6 +1066,9 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 	reflect.TypeFor[msg.QueueAdvanceMsg]():     appMsgCmdRoute(func(m *AppModel, typed msg.QueueAdvanceMsg) tea.Cmd { return m.dispatchQueueEntries(typed.EntryIDs) }),
 	reflect.TypeFor[msg.FocusPanelMsg]():       appMsgCmdRoute((*AppModel).handleFocusPanel),
 	reflect.TypeFor[msg.PlanUpdateMsg]():       appMsgCmdRoute((*AppModel).handlePlanUpdate),
+	reflect.TypeFor[msg.ClaimPresentationMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.ClaimPresentationMsg) tea.Cmd {
+		return m.propagate(typed)
+	}),
 	reflect.TypeFor[msg.PlanViewToggleMsg](): appMsgCmdRoute(func(m *AppModel, _ msg.PlanViewToggleMsg) tea.Cmd {
 		return m.handlePlanViewToggle()
 	}),
