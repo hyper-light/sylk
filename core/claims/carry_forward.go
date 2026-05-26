@@ -130,6 +130,8 @@ type RecallForwardEnrichment struct {
 	GraphNodeType      string  `json:"graph_node_type,omitempty"`
 	AgenticNarrative   bool    `json:"agentic_narrative,omitempty"`
 	ArchivalistEntryID string  `json:"archivalist_entry_id,omitempty"`
+	Legacy             bool    `json:"legacy,omitempty"`
+	ExactClaimSources  bool    `json:"exact_claim_sources,omitempty"`
 }
 
 type RecallForwardResult struct {
@@ -151,18 +153,21 @@ type RecallForwardResult struct {
 }
 
 type ContinuityRecallItem struct {
-	SessionID       string          `json:"session_id"`
-	BoardID         string          `json:"board_id"`
-	ClaimID         string          `json:"claim_id,omitempty"`
-	TestamentID     string          `json:"testament_id"`
-	FromSequence    uint64          `json:"from_sequence"`
-	ThroughSequence uint64          `json:"through_sequence"`
-	Stale           bool            `json:"stale,omitempty"`
-	Contradicted    bool            `json:"contradicted,omitempty"`
-	WorkingContext  string          `json:"working_context,omitempty"`
-	EvidenceDigest  string          `json:"evidence_digest,omitempty"`
-	Sources         []ForwardSource `json:"sources,omitempty"`
-	Cursor          map[string]any  `json:"cursor,omitempty"`
+	SessionID            string          `json:"session_id"`
+	BoardID              string          `json:"board_id"`
+	ClaimID              string          `json:"claim_id,omitempty"`
+	TestamentID          string          `json:"testament_id"`
+	FromSequence         uint64          `json:"from_sequence"`
+	ThroughSequence      uint64          `json:"through_sequence"`
+	Stale                bool            `json:"stale,omitempty"`
+	Contradicted         bool            `json:"contradicted,omitempty"`
+	WorkingContext       string          `json:"working_context,omitempty"`
+	EvidenceDigest       string          `json:"evidence_digest,omitempty"`
+	Sources              []ForwardSource `json:"sources,omitempty"`
+	Cursor               map[string]any  `json:"cursor,omitempty"`
+	Reconstructed        bool            `json:"reconstructed,omitempty"`
+	ReconstructionSource string          `json:"reconstruction_source,omitempty"`
+	ExactClaimSources    bool            `json:"exact_claim_sources,omitempty"`
 }
 
 type ForwardSource struct {
@@ -421,6 +426,7 @@ func RecallForward(ctx context.Context, board *ClaimsBoard, opts RecallForwardOp
 		LookbackSessions: lookback,
 		IncludeSources:   include,
 	}
+	appendRolloutRecallDiagnostics(board, result)
 	appendProjectionDiagnostics(board, result)
 	current := board
 	remaining := lookback
@@ -432,11 +438,16 @@ func RecallForward(ctx context.Context, board *ClaimsBoard, opts RecallForwardOp
 			SessionID: board.SessionID(),
 			BoardID:   board.BoardID(),
 		})
+		synthesizeLegacyContinuity(board, result)
 		return result, nil
 	}
 	for {
 		chain := appendContinuityChain(ctx, current, rec, include, maxItems, result)
 		if len(result.Items) >= maxItems || remaining <= 0 {
+			break
+		}
+		if !board.RolloutConfig().RecallForwardCrossSession {
+			result.Diagnostics = append(result.Diagnostics, "cross-session recall disabled by "+EnvRecallForwardCrossSession+"; stopped at current session continuity")
 			break
 		}
 		sessionAnchor := rec
@@ -454,8 +465,12 @@ func RecallForward(ctx context.Context, board *ClaimsBoard, opts RecallForwardOp
 		}
 		nextBoard, closeFn, err := opts.OpenBoard(ctx, nextSession)
 		if err != nil {
-			result.Partial = true
-			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("open previous session %s: %v", nextSession, err))
+			if IsLegacySessionBoardError(err) {
+				result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("legacy previous session %s has no durable claims board WAL; using Archivalist/knowledge fallback only", nextSession))
+			} else {
+				result.Partial = true
+				result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("open previous session %s: %v", nextSession, err))
+			}
 			break
 		}
 		if closeFn != nil {
@@ -495,6 +510,7 @@ func RecallForward(ctx context.Context, board *ClaimsBoard, opts RecallForwardOp
 		SessionID: board.SessionID(),
 		BoardID:   board.BoardID(),
 	})
+	synthesizeLegacyContinuity(board, result)
 	return result, nil
 }
 
@@ -1295,16 +1311,27 @@ func appendProjectionDiagnostics(board *ClaimsBoard, result *RecallForwardResult
 	if board == nil || result == nil {
 		return
 	}
+	rollout := board.RolloutConfig()
 	health := board.ProjectionHealth()
-	for _, warning := range health.Warnings {
-		warning = strings.TrimSpace(warning)
-		if warning == "" {
-			continue
+	if rollout.ProjectionWarningsAuthoritative() {
+		for _, warning := range health.Warnings {
+			warning = strings.TrimSpace(warning)
+			if warning == "" {
+				continue
+			}
+			result.Diagnostics = append(result.Diagnostics, warning)
 		}
-		result.Diagnostics = append(result.Diagnostics, warning)
+		if health.QueueDepth > 0 {
+			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("projection backlog queue_depth=%d max_lag=%d retry_count=%d terminal_failures=%d", health.QueueDepth, health.MaxLag, health.RetryCount, health.TerminalFailures))
+		}
+	} else if health.QueueDepth > 0 || health.RetryCount > 0 || health.TerminalFailures > 0 || health.LeaseExpirations > 0 {
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("projection diagnostics shadowed by %s=%s queue_depth=%d max_lag=%d retry_count=%d terminal_failures=%d", EnvClaimsKnowledgeMirror, rollout.ClaimsKnowledgeMirror, health.QueueDepth, health.MaxLag, health.RetryCount, health.TerminalFailures))
 	}
-	if health.QueueDepth > 0 {
-		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("projection backlog queue_depth=%d max_lag=%d retry_count=%d terminal_failures=%d", health.QueueDepth, health.MaxLag, health.RetryCount, health.TerminalFailures))
+	for _, diff := range health.ShadowDiffs {
+		diff = strings.TrimSpace(diff)
+		if diff != "" {
+			result.Diagnostics = append(result.Diagnostics, diff)
+		}
 	}
 	p := board.Projection()
 	for _, msg := range p.NotificationErrors {
@@ -1340,6 +1367,110 @@ func appendProjectionDiagnostics(board *ClaimsBoard, result *RecallForwardResult
 			}
 		}
 	}
+}
+
+func appendRolloutRecallDiagnostics(board *ClaimsBoard, result *RecallForwardResult) {
+	if board == nil || result == nil {
+		return
+	}
+	rollout := board.RolloutConfig()
+	if !rollout.ClaimsOutbox {
+		result.Diagnostics = append(result.Diagnostics, "claims projection outbox disabled by "+EnvClaimsOutbox+"; canonical board recall remains available but derived projections will not catch up")
+	}
+	if !rollout.ClaimsKnowledgeMirrorEnabled() {
+		result.Diagnostics = append(result.Diagnostics, "claims knowledge mirror disabled by "+EnvClaimsKnowledgeMirror+"; Archivalist/knowledge enrichment is unavailable unless another provider is configured")
+	}
+	if board.LegacySessionNoWAL() {
+		result.Diagnostics = append(result.Diagnostics, "legacy session has no pre-existing durable claims board WAL; recall will use exact board continuity only for new work and Archivalist/knowledge fallback for pre-migration context")
+	}
+}
+
+func synthesizeLegacyContinuity(board *ClaimsBoard, result *RecallForwardResult) {
+	if result == nil || len(result.Items) > 0 || len(result.Enrichment) == 0 {
+		return
+	}
+	for _, hit := range result.Enrichment {
+		if !legacyReconstructionCandidate(hit) {
+			continue
+		}
+		exact := hit.ExactClaimSources || strings.TrimSpace(hit.ClaimID) != "" || strings.TrimSpace(hit.TestamentID) != "" || strings.TrimSpace(hit.ArtifactID) != ""
+		sessionID := firstNonBlankString(hit.SessionID)
+		boardID := firstNonBlankString(hit.BoardID)
+		if board != nil {
+			sessionID = firstNonBlankString(sessionID, board.SessionID())
+			boardID = firstNonBlankString(boardID, board.BoardID())
+		}
+		source := legacyReconstructionSource(hit)
+		cursor := map[string]any{
+			"reconstructed":       true,
+			"source":              source,
+			"exact_claim_sources": exact,
+		}
+		if hit.DocumentID != "" {
+			cursor["projection_document_id"] = hit.DocumentID
+		}
+		if hit.ArchivalistEntryID != "" {
+			cursor["archivalist_entry_id"] = hit.ArchivalistEntryID
+		}
+		item := ContinuityRecallItem{
+			SessionID:            sessionID,
+			BoardID:              boardID,
+			ClaimID:              idIfExact(hit.ClaimID, exact),
+			TestamentID:          idIfExact(hit.TestamentID, exact),
+			WorkingContext:       hit.Summary,
+			EvidenceDigest:       legacyEvidenceDigest(hit),
+			Cursor:               cursor,
+			Reconstructed:        true,
+			ReconstructionSource: source,
+			ExactClaimSources:    exact,
+		}
+		result.Items = append(result.Items, item)
+		if result.WorkingContext == "" {
+			result.WorkingContext = item.WorkingContext
+		}
+		if result.EvidenceDigest == "" {
+			result.EvidenceDigest = item.EvidenceDigest
+		}
+		if !exact {
+			result.Diagnostics = append(result.Diagnostics, "reconstructed legacy continuity from "+source+" has no exact claim/testament/artifact source IDs")
+		}
+		return
+	}
+}
+
+func legacyReconstructionCandidate(hit RecallForwardEnrichment) bool {
+	return hit.Legacy ||
+		hit.AgenticNarrative ||
+		strings.TrimSpace(hit.ArchivalistEntryID) != "" ||
+		strings.Contains(strings.ToLower(hit.Source), "legacy") ||
+		strings.Contains(strings.ToLower(hit.Path), "archivalist/")
+}
+
+func legacyReconstructionSource(hit RecallForwardEnrichment) string {
+	switch {
+	case strings.TrimSpace(hit.ArchivalistEntryID) != "":
+		return "archivalist_scribe_entries"
+	case strings.TrimSpace(hit.Source) != "":
+		return strings.TrimSpace(hit.Source)
+	default:
+		return "knowledge_fallback"
+	}
+}
+
+func legacyEvidenceDigest(hit RecallForwardEnrichment) string {
+	source := legacyReconstructionSource(hit)
+	summary := strings.TrimSpace(hit.Summary)
+	if summary == "" {
+		return "Reconstructed continuity candidate from " + source + "."
+	}
+	return "Reconstructed continuity candidate from " + source + ": " + summary
+}
+
+func idIfExact(value string, exact bool) string {
+	if !exact {
+		return ""
+	}
+	return strings.TrimSpace(value)
 }
 
 func isContinuityArtifactKind(kind string) bool {

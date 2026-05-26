@@ -97,3 +97,51 @@ func TestManager_CreateWiresConfiguredClaimsProjectors(t *testing.T) {
 		t.Fatal("configured projector was not invoked")
 	}
 }
+
+func TestFeatureFlags_ProjectorsDisabled(t *testing.T) {
+	root := t.TempDir()
+	projector := &countingProjector{}
+	rollout := claims.DefaultRolloutConfig()
+	rollout.ClaimsOutbox = false
+	mgr := session.NewManager(session.ManagerConfig{
+		ClaimsProjectors: []claims.ClaimsProjector{projector},
+		ClaimsRollout:    &rollout,
+	})
+	s, err := mgr.Create(context.Background(), session.Config{
+		ID:                 "board-only-session",
+		Name:               "board-only-session",
+		PersistenceEnabled: true,
+		PersistencePath:    root,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimsBoard().PostAction(context.Background(), claims.Action{AgentID: "guide", Type: claims.ActionTypeTask}, []claims.Claim{{
+		ID:          "claim-1",
+		AgentID:     "guide",
+		Title:       "Persist without projectors",
+		Description: "Board writes must survive with projectors disabled.",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	owner := s.DurableClaimsBoard()
+	if owner == nil {
+		t.Fatal("durable board owner missing")
+	}
+	if got := owner.DrainOutbox(context.Background(), 32); got != 0 {
+		t.Fatalf("drain outbox = %d, want 0 when outbox disabled", got)
+	}
+	if projector.count.Load() != 0 {
+		t.Fatal("projector invoked despite disabled outbox rollout")
+	}
+	health := owner.ProjectionHealth()
+	if health.FeatureFlags[claims.EnvClaimsOutbox] != "0" {
+		t.Fatalf("health flags = %+v, want outbox disabled", health.FeatureFlags)
+	}
+	if err := mgr.Close(s.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if !claims.DurableBoardWALExists(filepath.Join(root, "board-only-session"), "session-board-only-session") {
+		t.Fatal("claims WAL missing after disabling projectors")
+	}
+}

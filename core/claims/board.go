@@ -87,7 +87,9 @@ type ClaimsBoard struct {
 	notificationErrors []string
 	projectionErrors   map[string]string
 
-	durable *DurableBoard
+	legacySessionNoWAL bool
+	rollout            RolloutConfig
+	durable            *DurableBoard
 }
 
 type boardSubscription struct {
@@ -111,20 +113,22 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		maxIter = defaultMaxIterations
 	}
 	b := &ClaimsBoard{
-		boardID:          boardID,
-		pipelineID:       cfg.PipelineID,
-		taskID:           cfg.TaskID,
-		sessionID:        cfg.SessionID,
-		sessionDir:       cfg.SessionDir,
-		parentBoardID:    cfg.ParentBoardID,
-		phase:            BoardPhaseImplementation,
-		maxIterations:    maxIter,
-		actions:          make(map[string]*Action),
-		claims:           make(map[string]*Claim),
-		testaments:       make(map[string]*Testament),
-		relationsIdx:     newRelationsIndex(),
-		projectionErrors: make(map[string]string),
-		scope:            cfg.Scope,
+		boardID:            boardID,
+		pipelineID:         cfg.PipelineID,
+		taskID:             cfg.TaskID,
+		sessionID:          cfg.SessionID,
+		sessionDir:         cfg.SessionDir,
+		parentBoardID:      cfg.ParentBoardID,
+		phase:              BoardPhaseImplementation,
+		maxIterations:      maxIter,
+		actions:            make(map[string]*Action),
+		claims:             make(map[string]*Claim),
+		testaments:         make(map[string]*Testament),
+		relationsIdx:       newRelationsIndex(),
+		projectionErrors:   make(map[string]string),
+		scope:              cfg.Scope,
+		legacySessionNoWAL: cfg.LegacySessionNoWAL,
+		rollout:            boardRolloutConfig(cfg.Rollout),
 	}
 	if cfg.SessionID != "" {
 		amp := NewBoardAmplifier(cfg.SessionID, cfg.TaskID, boardID).
@@ -160,6 +164,25 @@ func (b *ClaimsBoard) SessionDir() string {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.sessionDir
+}
+
+func (b *ClaimsBoard) LegacySessionNoWAL() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.legacySessionNoWAL
+}
+
+func (b *ClaimsBoard) RolloutConfig() RolloutConfig {
+	if b == nil {
+		return CurrentRolloutConfig()
+	}
+	b.mu.RLock()
+	cfg := b.rollout
+	b.mu.RUnlock()
+	return cfg.Normalized()
 }
 
 // ParentBoardID returns the parent board's ID (empty for root boards).

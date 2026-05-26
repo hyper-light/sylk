@@ -49,6 +49,7 @@ type Manager struct {
 	deltaBus claims.DeltaBus
 
 	claimsProjectors []claims.ClaimsProjector
+	claimsRollout    claims.RolloutConfig
 
 	// Statistics
 	totalCreated   int64
@@ -87,6 +88,11 @@ type ManagerConfig struct {
 	// durable session root board in addition to the built-in Fabric
 	// projector. Production wires the committed knowledge mirror here.
 	ClaimsProjectors []claims.ClaimsProjector
+
+	// ClaimsRollout gates the durable claims board, projection outbox,
+	// claims knowledge mirror, cross-session recall, and scribe
+	// continuity narration. Nil uses claims.CurrentRolloutConfig().
+	ClaimsRollout *claims.RolloutConfig
 }
 
 // DefaultManagerConfig returns default manager configuration
@@ -113,6 +119,10 @@ func NewManager(cfg ManagerConfig) *Manager {
 		}
 	}
 
+	rollout := claims.CurrentRolloutConfig()
+	if cfg.ClaimsRollout != nil {
+		rollout = cfg.ClaimsRollout.Normalized()
+	}
 	return &Manager{
 		shards:           shards,
 		numShards:        cfg.NumShards,
@@ -122,6 +132,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		scope:            cfg.Scope,
 		deltaBus:         cfg.DeltaBus,
 		claimsProjectors: append([]claims.ClaimsProjector(nil), cfg.ClaimsProjectors...),
+		claimsRollout:    rollout,
 	}
 }
 
@@ -158,7 +169,7 @@ func (m *Manager) Create(ctx context.Context, cfg Config) (*Session, error) {
 
 	session := NewSession(cfg)
 
-	boardOwner, err := m.openSessionClaimsBoard(session)
+	boardOwner, err := m.openSessionClaimsBoard(session, false)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +206,7 @@ func (m *Manager) Create(ctx context.Context, cfg Config) (*Session, error) {
 	return session, nil
 }
 
-func (m *Manager) openSessionClaimsBoard(session *Session) (*claims.DurableBoard, error) {
+func (m *Manager) openSessionClaimsBoard(session *Session, legacySessionNoWAL bool) (*claims.DurableBoard, error) {
 	if session == nil {
 		return nil, fmt.Errorf("session claims board: nil session")
 	}
@@ -204,20 +215,43 @@ func (m *Manager) openSessionClaimsBoard(session *Session) (*claims.DurableBoard
 		boardScope = &concurrency.ScopeAdapter{Scope: m.scope}
 	}
 	cfg := session.Config()
-	sessionDir := sessionClaimsDir(cfg, session.ID())
+	sessionDir := ""
+	if m.claimsRollout.DurableSessionClaims {
+		sessionDir = sessionClaimsDir(cfg, session.ID())
+	}
 	board, err := claims.OpenDurableBoard(claims.ClaimsBoardConfig{
-		BoardID:    "session-" + session.ID(),
-		SessionID:  session.ID(),
-		TaskID:     "session",
-		SessionDir: sessionDir,
-		Scope:      boardScope,
-		DeltaBus:   m.deltaBus,
-		Projectors: append([]claims.ClaimsProjector(nil), m.claimsProjectors...),
+		BoardID:            "session-" + session.ID(),
+		SessionID:          session.ID(),
+		TaskID:             "session",
+		SessionDir:         sessionDir,
+		Scope:              boardScope,
+		DeltaBus:           m.deltaBus,
+		Projectors:         m.rolloutProjectors(),
+		DisableOutbox:      !m.claimsRollout.ClaimsOutbox,
+		LegacySessionNoWAL: legacySessionNoWAL,
+		Rollout:            m.claimsRollout,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("session %q: open durable claims board: %w", session.ID(), err)
 	}
 	return board, nil
+}
+
+func (m *Manager) rolloutProjectors() []claims.ClaimsProjector {
+	if !m.claimsRollout.ClaimsOutbox {
+		return nil
+	}
+	projectors := make([]claims.ClaimsProjector, 0, len(m.claimsProjectors))
+	for _, projector := range m.claimsProjectors {
+		if projector == nil {
+			continue
+		}
+		if projector.Name() == claims.ProjectorKnowledge && !m.claimsRollout.ClaimsKnowledgeMirrorEnabled() {
+			continue
+		}
+		projectors = append(projectors, projector)
+	}
+	return projectors
 }
 
 func sessionClaimsDir(cfg Config, sessionID string) string {
@@ -535,7 +569,10 @@ func (m *Manager) loadSession(id string) (*Session, error) {
 		return nil, ErrSessionNotFound
 	}
 
-	boardOwner, err := m.openSessionClaimsBoard(loaded)
+	cfg := loaded.Config()
+	boardID := "session-" + loaded.ID()
+	legacyNoWAL := m.claimsRollout.DurableSessionClaims && !claims.DurableBoardWALExists(sessionClaimsDir(cfg, loaded.ID()), boardID)
+	boardOwner, err := m.openSessionClaimsBoard(loaded, legacyNoWAL)
 	if err != nil {
 		if existing := claims.DefaultSessionBoardRegistry().Lookup(id); existing != nil {
 			loaded.SetClaimsBoard(existing)

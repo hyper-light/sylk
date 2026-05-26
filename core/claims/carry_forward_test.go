@@ -566,6 +566,48 @@ func TestRecallForwardCrossSessionBrokenExactLinkIsPartial(t *testing.T) {
 	}
 }
 
+func TestRecallForwardCrossSessionCanBeDisabledByRollout(t *testing.T) {
+	previous := carryForwardTestBoardWithIDs("prev-board", "prev-session")
+	submitCarrySource(t, previous, "librarian", "Previous durable context", []*Artifact{
+		{AgentID: "librarian", Kind: "workspace_read", Reference: "Previous board selected Cobra."},
+	})
+	prevCarry, err := CarryForward(context.Background(), previous, CarryForwardOptions{AgentID: "architect", Topic: "go cli plan"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollout := DefaultRolloutConfig()
+	rollout.RecallForwardCrossSession = false
+	current := NewClaimsBoard(ClaimsBoardConfig{BoardID: "current-board", SessionID: "current-session", TaskID: "session", Rollout: rollout})
+	submitCarrySource(t, current, "architect", "Current durable context", []*Artifact{
+		{AgentID: "architect", Kind: "decision", Reference: "Current board keeps Cobra."},
+	})
+	if _, err := CarryForward(context.Background(), current, CarryForwardOptions{
+		AgentID:                       "architect",
+		Topic:                         "go cli plan",
+		PreviousSessionID:             "prev-session",
+		PreviousContinuityTestamentID: prevCarry.TestamentID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recall, err := RecallForward(context.Background(), current, RecallForwardOptions{
+		AgentID:          "architect",
+		Topic:            "go cli plan",
+		LookbackSessions: 1,
+		OpenBoard: func(context.Context, string) (*ClaimsBoard, func(), error) {
+			return previous, nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recall.Items) != 1 {
+		t.Fatalf("recall items = %d, want current session only", len(recall.Items))
+	}
+	if !diagnosticsContain(recall.Diagnostics, EnvRecallForwardCrossSession) {
+		t.Fatalf("missing cross-session rollout diagnostic: %+v", recall.Diagnostics)
+	}
+}
+
 func TestDurableSessionBoardOpenerFromBoardHydratesPreviousSession(t *testing.T) {
 	base := t.TempDir()
 	prevDB, err := OpenDurableBoard(ClaimsBoardConfig{
@@ -629,6 +671,34 @@ func TestDurableSessionBoardOpenerFromBoardHydratesPreviousSession(t *testing.T)
 	}
 	if !strings.Contains(recall.WorkingContext, "Previous durable board selected Cobra") {
 		t.Fatalf("durable recall missing previous board context: %q", recall.WorkingContext)
+	}
+}
+
+func TestDurableSessionBoardOpenerFromBoardReportsLegacyMissingWAL(t *testing.T) {
+	base := t.TempDir()
+	currentDB, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "session-current-session",
+		SessionID:  "current-session",
+		TaskID:     "session",
+		SessionDir: filepath.Join(base, "current-session"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer currentDB.Close()
+	opener := DurableSessionBoardOpenerFromBoard(currentDB.Board())
+	if opener == nil {
+		t.Fatal("opener is nil")
+	}
+	board, closeFn, err := opener(context.Background(), "legacy-session")
+	if err == nil || !IsLegacySessionBoardError(err) {
+		t.Fatalf("opener err = %v, want legacy session board error", err)
+	}
+	if board != nil || closeFn != nil {
+		t.Fatalf("legacy opener returned board=%v closeFnSet=%v, want nils", board, closeFn != nil)
+	}
+	if DurableBoardWALExists(filepath.Join(base, "legacy-session"), "session-legacy-session") {
+		t.Fatal("legacy opener created a WAL while checking a missing legacy session")
 	}
 }
 
@@ -821,6 +891,97 @@ func TestRecallForwardEnrichmentErrorCreatesProjectionArtifact(t *testing.T) {
 	}
 }
 
+func TestLegacyRecall_NoDurableBoard(t *testing.T) {
+	board := claimsBoardWithLegacyNoWAL()
+	recall, err := RecallForward(context.Background(), board, RecallForwardOptions{
+		AgentID: "architect",
+		Topic:   "python cli plan",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recall.Partial {
+		t.Fatalf("legacy recall partial=%v diagnostics=%+v, want non-fatal empty recall", recall.Partial, recall.Diagnostics)
+	}
+	if len(recall.Items) != 0 {
+		t.Fatalf("legacy direct items = %d, want 0", len(recall.Items))
+	}
+	if !diagnosticsContain(recall.Diagnostics, "legacy session has no pre-existing durable claims board WAL") {
+		t.Fatalf("legacy diagnostic missing: %+v", recall.Diagnostics)
+	}
+}
+
+func TestLegacyRecall_ReconstructedContinuityMarked(t *testing.T) {
+	board := claimsBoardWithLegacyNoWAL()
+	provider := &fakeRecallEnrichmentProvider{hits: []RecallForwardEnrichment{{
+		Source:             "archivalist_legacy_entry",
+		DocumentID:         "legacy-doc-1",
+		Path:               "archivalist/scribe/architect/entry-1.md",
+		SessionID:          "session-1",
+		AgentID:            "architect",
+		Topic:              "python cli plan",
+		Summary:            "Previous planning selected Click and a pyproject console script.",
+		AgenticNarrative:   true,
+		ArchivalistEntryID: "entry-1",
+		Legacy:             true,
+	}}}
+	recall, err := RecallForward(context.Background(), board, RecallForwardOptions{
+		AgentID:            "architect",
+		Topic:              "python cli plan",
+		EnrichmentProvider: provider,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recall.Items) != 1 {
+		t.Fatalf("reconstructed items = %d, want 1: %+v", len(recall.Items), recall.Items)
+	}
+	item := recall.Items[0]
+	if !item.Reconstructed || item.ReconstructionSource != "archivalist_scribe_entries" {
+		t.Fatalf("reconstructed marker missing: %+v", item)
+	}
+	if reconstructed, _ := item.Cursor["reconstructed"].(bool); !reconstructed {
+		t.Fatalf("cursor missing reconstructed=true: %+v", item.Cursor)
+	}
+	if exact, _ := item.Cursor["exact_claim_sources"].(bool); exact {
+		t.Fatalf("legacy narrative unexpectedly marked exact: %+v", item.Cursor)
+	}
+	if !strings.Contains(recall.WorkingContext, "Click") {
+		t.Fatalf("working context not reconstructed from summary: %q", recall.WorkingContext)
+	}
+}
+
+func TestLegacyRecall_DoesNotFabricateSources(t *testing.T) {
+	board := claimsBoardWithLegacyNoWAL()
+	provider := &fakeRecallEnrichmentProvider{hits: []RecallForwardEnrichment{{
+		Source:             "archivalist_legacy_entry",
+		DocumentID:         "legacy-doc-2",
+		Path:               "archivalist/scribe/architect/entry-2.md",
+		Summary:            "Legacy planning note without board entity IDs.",
+		AgenticNarrative:   true,
+		ArchivalistEntryID: "entry-2",
+		Legacy:             true,
+	}}}
+	recall, err := RecallForward(context.Background(), board, RecallForwardOptions{
+		AgentID:            "architect",
+		Topic:              "python cli plan",
+		EnrichmentProvider: provider,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recall.Items) != 1 {
+		t.Fatalf("reconstructed items = %d, want 1", len(recall.Items))
+	}
+	item := recall.Items[0]
+	if item.ClaimID != "" || item.TestamentID != "" || item.ExactClaimSources {
+		t.Fatalf("legacy reconstruction fabricated exact sources: %+v", item)
+	}
+	if !diagnosticsContain(recall.Diagnostics, "no exact claim/testament/artifact source IDs") {
+		t.Fatalf("missing source-integrity diagnostic: %+v", recall.Diagnostics)
+	}
+}
+
 type fakeRecallEnrichmentProvider struct {
 	hits []RecallForwardEnrichment
 	err  error
@@ -837,6 +998,15 @@ func (f *fakeRecallEnrichmentProvider) LookupCarryForwardEnrichment(_ context.Co
 
 func carryForwardTestBoard() *ClaimsBoard {
 	return carryForwardTestBoardWithIDs("board-1", "session-1")
+}
+
+func claimsBoardWithLegacyNoWAL() *ClaimsBoard {
+	return NewClaimsBoard(ClaimsBoardConfig{
+		BoardID:            "legacy-board",
+		SessionID:          "legacy-session",
+		TaskID:             "session",
+		LegacySessionNoWAL: true,
+	})
 }
 
 func carryForwardTestBoardWithIDs(boardID, sessionID string) *ClaimsBoard {

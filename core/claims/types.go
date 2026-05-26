@@ -728,6 +728,21 @@ type ClaimsBoardConfig struct {
 	// making core/claims import those packages.
 	Projectors []ClaimsProjector
 
+	// DisableOutbox disables deterministic derived projections while
+	// leaving canonical board mutation/WAL behavior intact. This is a
+	// rollout/rollback gate; it must never delete existing WAL or
+	// projection files.
+	DisableOutbox bool
+
+	// LegacySessionNoWAL marks a restored pre-durability session. The
+	// board remains usable for new work, but recall reports that older
+	// continuity must come from Archivalist/knowledge fallback rather
+	// than an exact board spine.
+	LegacySessionNoWAL bool
+
+	// Rollout carries the feature-gate snapshot used by this board.
+	Rollout RolloutConfig
+
 	// ParentBoardID, when non-empty, establishes this board as a
 	// scoped child of the parent (e.g., pipeline board as child of
 	// session board). Stored as metadata on the board.

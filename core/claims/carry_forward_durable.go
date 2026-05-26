@@ -2,10 +2,44 @@ package claims
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
+
+type LegacySessionBoardError struct {
+	SessionID  string
+	SessionDir string
+	BoardID    string
+}
+
+func (e *LegacySessionBoardError) Error() string {
+	if e == nil {
+		return "legacy session has no durable claims board WAL"
+	}
+	return fmt.Sprintf("legacy session %s has no durable claims board WAL at %s", e.SessionID, e.SessionDir)
+}
+
+func IsLegacySessionBoardError(err error) bool {
+	var target *LegacySessionBoardError
+	return errors.As(err, &target)
+}
+
+func DurableBoardWALExists(sessionDir, boardID string) bool {
+	sessionDir = strings.TrimSpace(sessionDir)
+	boardID = strings.TrimSpace(boardID)
+	if sessionDir == "" || boardID == "" {
+		return false
+	}
+	info, err := os.Stat(DurableBoardWALPath(sessionDir, boardID))
+	return err == nil && !info.IsDir()
+}
+
+func DurableBoardWALPath(sessionDir, boardID string) string {
+	return filepath.Join(sessionDir, "protocols", walNamespace, boardID, "wal", "events.wal.jsonl")
+}
 
 // DurableSessionBoardOpenerFromBoard builds a recall opener from the
 // current session board's durable path. Session manager root boards live
@@ -33,11 +67,20 @@ func DurableSessionBoardOpenerFromBoard(board *ClaimsBoard) SessionBoardOpener {
 		if active := DefaultSessionBoardRegistry().Lookup(sessionID); active != nil {
 			return active, nil, nil
 		}
+		sessionDir := filepath.Join(baseDir, sessionID)
+		boardID := "session-" + sessionID
+		if !DurableBoardWALExists(sessionDir, boardID) {
+			return nil, nil, &LegacySessionBoardError{
+				SessionID:  sessionID,
+				SessionDir: sessionDir,
+				BoardID:    boardID,
+			}
+		}
 		db, err := OpenDurableBoard(ClaimsBoardConfig{
-			BoardID:    "session-" + sessionID,
+			BoardID:    boardID,
 			SessionID:  sessionID,
 			TaskID:     "session",
-			SessionDir: filepath.Join(baseDir, sessionID),
+			SessionDir: sessionDir,
 		})
 		if err != nil {
 			return nil, nil, err

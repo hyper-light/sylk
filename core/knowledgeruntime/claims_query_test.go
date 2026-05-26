@@ -20,6 +20,15 @@ func (f *fakeClaimsSearchBackend) Search(_ context.Context, req *search.SearchRe
 	if f.err != nil {
 		return nil, f.err
 	}
+	if f.result != nil && strings.TrimSpace(req.PathFilter) != "" {
+		filtered := &CommittedSearchResult{}
+		for _, hit := range f.result.Hits {
+			if strings.HasPrefix(hit.Document.Path, req.PathFilter) {
+				filtered.Hits = append(filtered.Hits, hit)
+			}
+		}
+		return filtered, nil
+	}
 	return f.result, nil
 }
 
@@ -201,11 +210,14 @@ func TestArchivalistClaimsQuery_NoLLMForMetadataLookup(t *testing.T) {
 	if len(hits) != 0 {
 		t.Fatalf("hits = %d, want 0", len(hits))
 	}
-	if len(backend.requests) != 1 {
-		t.Fatalf("search requests = %d, want 1 deterministic search call", len(backend.requests))
+	if len(backend.requests) != 2 {
+		t.Fatalf("search requests = %d, want claims + legacy deterministic search calls", len(backend.requests))
 	}
 	if got := backend.requests[0].PathFilter; got != "claims/" {
 		t.Fatalf("path filter = %q, want claims/", got)
+	}
+	if got := backend.requests[1].PathFilter; got != "archivalist/" {
+		t.Fatalf("legacy path filter = %q, want archivalist/", got)
 	}
 }
 
@@ -245,6 +257,43 @@ Scribe narrative digest.
 	}
 	if !hits[0].AgenticNarrative || hits[0].ArchivalistEntryID != "entry-1" {
 		t.Fatalf("narrative metadata not surfaced: %+v", hits[0])
+	}
+}
+
+func TestArchivalistClaimsQuery_LegacyArchivalistFallback(t *testing.T) {
+	backend := &fakeClaimsSearchBackend{
+		result: &CommittedSearchResult{Hits: []CommittedSearchHit{
+			claimsQueryHit("legacy-entry-1", "archivalist/scribe/architect/entry-1.md", `
+source_type: scribe
+narration_type: continuity
+parent_agent: architect
+session_id: legacy-session
+topic: python cli plan
+archivalist_entry_id: entry-1
+
+Previous planning selected Click and a pyproject console script.
+`, 0.8),
+		}},
+	}
+	index := NewClaimsKnowledgeQueryIndex(backend)
+
+	hits, err := index.LookupCarryForwardEnrichment(context.Background(), claims.RecallForwardEnrichmentQuery{
+		AgentID:   "architect",
+		Topic:     "python cli plan",
+		SessionID: "legacy-session",
+		MaxItems:  2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("hits = %d, want 1: %+v", len(hits), hits)
+	}
+	if !hits[0].Legacy || hits[0].Source != "archivalist_legacy_entry" || hits[0].ExactClaimSources {
+		t.Fatalf("legacy enrichment metadata wrong: %+v", hits[0])
+	}
+	if len(backend.requests) != 2 || backend.requests[1].PathFilter != "archivalist/" {
+		t.Fatalf("legacy fallback search requests = %+v", backend.requests)
 	}
 }
 

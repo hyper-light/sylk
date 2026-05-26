@@ -1,6 +1,7 @@
 package claims
 
 import (
+	"fmt"
 	"sort"
 	"time"
 )
@@ -23,6 +24,8 @@ type ProjectionHealthSnapshot struct {
 	AverageLatency    time.Duration               `json:"average_projection_latency,omitempty"`
 	Projectors        []ProjectionProjectorHealth `json:"projectors,omitempty"`
 	Warnings          []string                    `json:"warnings,omitempty"`
+	FeatureFlags      map[string]string           `json:"feature_flags,omitempty"`
+	ShadowDiffs       []string                    `json:"shadow_diffs,omitempty"`
 }
 
 type ProjectionProjectorHealth struct {
@@ -57,14 +60,17 @@ type ProjectionFailureSummary struct {
 
 func (b *ClaimsBoard) ProjectionHealth(now ...time.Time) ProjectionHealthSnapshot {
 	if b == nil {
-		return ProjectionHealthSnapshot{GeneratedAt: healthNow(now)}
+		cfg := CurrentRolloutConfig()
+		return ProjectionHealthSnapshot{GeneratedAt: healthNow(now), FeatureFlags: cfg.FeatureFlags()}
 	}
 	if b.durable == nil {
+		cfg := b.RolloutConfig()
 		return ProjectionHealthSnapshot{
 			BoardID:           b.BoardID(),
 			SessionID:         b.SessionID(),
 			GeneratedAt:       healthNow(now),
 			HighWaterSequence: b.HighWaterSequence(),
+			FeatureFlags:      cfg.FeatureFlags(),
 		}
 	}
 	return b.durable.ProjectionHealth(now...)
@@ -80,8 +86,10 @@ func (b *ClaimsBoard) ProjectionHealthHistory(limit int) []ProjectionHealthSnaps
 func (db *DurableBoard) ProjectionHealth(now ...time.Time) ProjectionHealthSnapshot {
 	t := healthNow(now)
 	if db == nil || db.board == nil {
-		return ProjectionHealthSnapshot{GeneratedAt: t}
+		cfg := CurrentRolloutConfig()
+		return ProjectionHealthSnapshot{GeneratedAt: t, FeatureFlags: cfg.FeatureFlags()}
 	}
+	rollout := db.board.RolloutConfig()
 	if db.outbox == nil {
 		return ProjectionHealthSnapshot{
 			BoardID:           db.board.BoardID(),
@@ -89,9 +97,14 @@ func (db *DurableBoard) ProjectionHealth(now ...time.Time) ProjectionHealthSnaps
 			GeneratedAt:       t,
 			HighWaterSequence: db.board.HighWaterSequence(),
 			Warnings:          []string{"claims durable board has no projection outbox"},
+			FeatureFlags:      rollout.FeatureFlags(),
 		}
 	}
 	snap := db.outbox.Health(db.board.BoardID(), db.board.SessionID(), db.board.HighWaterSequence(), t)
+	snap.FeatureFlags = rollout.FeatureFlags()
+	if rollout.ClaimsKnowledgeMirror == ProjectionRolloutShadow {
+		snap.ShadowDiffs = projectionShadowDiffs(snap)
+	}
 	db.recordProjectionHealthSnapshot(snap)
 	return snap
 }
@@ -269,5 +282,29 @@ func cloneProjectionHealthSnapshot(in ProjectionHealthSnapshot) ProjectionHealth
 		out.Projectors[i].TerminalFailureIDs = append([]ProjectionFailureSummary(nil), in.Projectors[i].TerminalFailureIDs...)
 	}
 	out.Warnings = append([]string(nil), in.Warnings...)
+	if in.FeatureFlags != nil {
+		out.FeatureFlags = make(map[string]string, len(in.FeatureFlags))
+		for k, v := range in.FeatureFlags {
+			out.FeatureFlags[k] = v
+		}
+	}
+	out.ShadowDiffs = append([]string(nil), in.ShadowDiffs...)
 	return out
+}
+
+func projectionShadowDiffs(snap ProjectionHealthSnapshot) []string {
+	hasKnowledge := false
+	for _, ph := range snap.Projectors {
+		if ph.Projector != ProjectorKnowledge {
+			continue
+		}
+		hasKnowledge = true
+		if ph.QueueDepth > 0 || ph.RetryableFailures > 0 || ph.TerminalFailures > 0 || ph.LeaseExpirations > 0 {
+			return []string{fmt.Sprintf("shadow projection diff projector=%s queue_depth=%d lag=%d retryable_failures=%d terminal_failures=%d lease_expirations=%d", ph.Projector, ph.QueueDepth, ph.Lag, ph.RetryableFailures, ph.TerminalFailures, ph.LeaseExpirations)}
+		}
+	}
+	if !hasKnowledge {
+		return []string{"shadow projection diff projector=knowledge status=not_configured"}
+	}
+	return nil
 }

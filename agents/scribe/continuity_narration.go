@@ -32,6 +32,9 @@ func (s *Scribe) maybeNarrateContinuityActivity(ctx context.Context, a activity.
 	if board == nil {
 		return false
 	}
+	if !board.RolloutConfig().ScribeContinuityNarration {
+		return false
+	}
 	t, ok := board.CloneTestament(testamentID)
 	if !ok || t == nil {
 		return false

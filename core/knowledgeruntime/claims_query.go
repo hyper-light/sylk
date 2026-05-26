@@ -29,30 +29,51 @@ func (q *ClaimsKnowledgeQueryIndex) LookupCarryForwardEnrichment(ctx context.Con
 	if limit <= 0 {
 		limit = 8
 	}
-	req := &search.SearchRequest{
-		Query:      claimsKnowledgeSearchText(query),
-		PathFilter: claimsKnowledgePathFilter(query),
-		Limit:      limit * 4,
-	}
-	if req.Limit < limit {
-		req.Limit = limit
-	}
-	result, err := q.backend.Search(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil || len(result.Hits) == 0 {
-		return nil, nil
+	scopes := []struct {
+		query      string
+		pathFilter string
+	}{
+		{query: claimsKnowledgeSearchText(query), pathFilter: claimsKnowledgePathFilter(query)},
+		{query: legacyKnowledgeSearchText(query), pathFilter: "archivalist/"},
 	}
 	out := make([]claims.RecallForwardEnrichment, 0, limit)
-	for _, hit := range result.Hits {
-		if !claimsKnowledgeHitMatches(hit, query) {
-			continue
-		}
-		enrichment := claimsKnowledgeEnrichment(hit, query)
-		out = append(out, enrichment)
+	seen := make(map[string]struct{})
+	for i, scope := range scopes {
 		if len(out) >= limit {
 			break
+		}
+		if i > 0 && len(out) > 0 {
+			break
+		}
+		req := &search.SearchRequest{
+			Query:      scope.query,
+			PathFilter: scope.pathFilter,
+			Limit:      limit * 4,
+		}
+		if req.Limit < limit {
+			req.Limit = limit
+		}
+		result, err := q.backend.Search(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if result == nil || len(result.Hits) == 0 {
+			continue
+		}
+		for _, hit := range result.Hits {
+			if !claimsKnowledgeHitMatches(hit, query) {
+				continue
+			}
+			key := hit.Document.ID + "\x1f" + hit.Document.Path
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			enrichment := claimsKnowledgeEnrichment(hit, query)
+			out = append(out, enrichment)
+			if len(out) >= limit {
+				break
+			}
 		}
 	}
 	return out, nil
@@ -69,6 +90,22 @@ func claimsKnowledgeSearchText(query claims.RecallForwardEnrichmentQuery) string
 		query.RelationType,
 		query.RelationRelationship,
 		query.RelatedID,
+	} {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			terms = append(terms, value)
+		}
+	}
+	return strings.Join(terms, " ")
+}
+
+func legacyKnowledgeSearchText(query claims.RecallForwardEnrichmentQuery) string {
+	terms := []string{"continuity", "scribe", "archivalist"}
+	for _, value := range []string{
+		query.Topic,
+		query.AgentID,
+		query.SessionID,
+		query.BoardID,
 	} {
 		value = strings.TrimSpace(value)
 		if value != "" {
@@ -107,7 +144,7 @@ func claimsKnowledgeHitMatches(hit CommittedSearchHit, query claims.RecallForwar
 	if value := strings.TrimSpace(query.EntityType); value != "" && strings.ToLower(strings.TrimSpace(meta["entity_type"])) != strings.ToLower(value) {
 		return false
 	}
-	if value := strings.TrimSpace(query.AgentID); value != "" && !fieldOrContentMatches(meta, content, path, "agent_id", value) && !fieldOrContentMatches(meta, content, path, "continuity_agent_id", value) {
+	if value := strings.TrimSpace(query.AgentID); value != "" && !fieldOrContentMatches(meta, content, path, "agent_id", value) && !fieldOrContentMatches(meta, content, path, "continuity_agent_id", value) && !fieldOrContentMatches(meta, content, path, "parent_agent", value) {
 		return false
 	}
 	if value := strings.TrimSpace(query.Topic); value != "" && !strings.Contains(content, strings.ToLower(value)) {
@@ -134,8 +171,14 @@ func claimsKnowledgeEnrichment(hit CommittedSearchHit, query claims.RecallForwar
 	meta := parseClaimsKnowledgeContentFields(hit.Document.Content)
 	entityType := firstNonEmptyString(meta["entity_type"], entityTypeFromClaimsPath(hit.Document.Path))
 	entityID := firstNonEmptyString(meta["entity_id"], meta[entityType+"_id"])
+	legacy := strings.HasPrefix(strings.ToLower(strings.TrimSpace(hit.Document.Path)), "archivalist/")
+	exact := firstNonEmptyString(meta["claim_id"], query.ClaimID) != "" || firstNonEmptyString(meta["testament_id"], query.TestamentID) != "" || meta["artifact_id"] != ""
+	source := "archivalist_claims_knowledge"
+	if legacy {
+		source = "archivalist_legacy_entry"
+	}
 	enrichment := claims.RecallForwardEnrichment{
-		Source:             "archivalist_claims_knowledge",
+		Source:             source,
 		DocumentID:         hit.Document.ID,
 		Path:               hit.Document.Path,
 		EntityType:         entityType,
@@ -154,6 +197,8 @@ func claimsKnowledgeEnrichment(hit CommittedSearchHit, query claims.RecallForwar
 		GraphNodeType:      hit.PrimaryNodeType,
 		AgenticNarrative:   strings.EqualFold(meta["source_type"], "scribe") || strings.TrimSpace(meta["narration_type"]) != "",
 		ArchivalistEntryID: meta["archivalist_entry_id"],
+		Legacy:             legacy,
+		ExactClaimSources:  exact,
 	}
 	if enrichment.GraphNodeID == "0" {
 		enrichment.GraphNodeID = ""

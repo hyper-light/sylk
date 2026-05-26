@@ -700,14 +700,23 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	// default NoopDeltaBus and orchestrator-dispatched claims never
 	// reach worker inboxes.
 	claimsDeltaBus := guide.NewClaimsBusAdapter(guideChannelBus)
+	claimsRollout := claims.RolloutConfigFromEnvironment()
+	claims.SetDefaultRolloutConfig(claimsRollout)
 	phase1.knowledgeBackend = knowledgeruntime.NewCommittedKnowledgeBackend(projectRoot, slog.Default())
-	claims.SetDefaultRecallForwardEnrichmentProvider(knowledgeruntime.NewClaimsKnowledgeQueryIndex(phase1.knowledgeBackend))
+	if claimsRollout.ClaimsKnowledgeMirrorEnabled() {
+		claims.SetDefaultRecallForwardEnrichmentProvider(knowledgeruntime.NewClaimsKnowledgeQueryIndex(phase1.knowledgeBackend))
+	} else {
+		claims.SetDefaultRecallForwardEnrichmentProvider(nil)
+	}
+	claimsProjectors := []claims.ClaimsProjector{}
+	if claimsRollout.ClaimsKnowledgeMirrorEnabled() {
+		claimsProjectors = append(claimsProjectors, knowledgeruntime.NewClaimsKnowledgeMirror(phase1.knowledgeBackend))
+	}
 	phase1.sessionMgr = session.NewManager(session.ManagerConfig{
-		Scope:    phase1.scope,
-		DeltaBus: claimsDeltaBus,
-		ClaimsProjectors: []claims.ClaimsProjector{
-			knowledgeruntime.NewClaimsKnowledgeMirror(phase1.knowledgeBackend),
-		},
+		Scope:            phase1.scope,
+		DeltaBus:         claimsDeltaBus,
+		ClaimsProjectors: claimsProjectors,
+		ClaimsRollout:    &claimsRollout,
 	})
 	phase1.descriptors = handoff.NewDescriptorRegistry()
 

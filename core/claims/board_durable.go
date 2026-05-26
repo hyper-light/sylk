@@ -92,11 +92,13 @@ func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
 			seen:  make(map[string]uint64),
 		}
 		db.projectors = durableProjectors(cfg)
-		outbox, err := OpenClaimsOutbox("", projectorNames(db.projectors))
-		if err != nil {
-			return nil, err
+		if !cfg.DisableOutbox {
+			outbox, err := OpenClaimsOutbox("", projectorNames(db.projectors))
+			if err != nil {
+				return nil, err
+			}
+			db.outbox = outbox
 		}
-		db.outbox = outbox
 		db.board.durable = db
 		return db, nil
 	}
@@ -131,13 +133,15 @@ func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
 	db.board.durable = db
 	db.seq = snapshotSeq
 
-	outboxDir := filepath.Join(filepath.Dir(walDir), "outbox")
-	outbox, err := OpenClaimsOutbox(outboxDir, projectorNames(db.projectors))
-	if err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("open claims outbox: %w", err)
+	if !cfg.DisableOutbox {
+		outboxDir := filepath.Join(filepath.Dir(walDir), "outbox")
+		outbox, err := OpenClaimsOutbox(outboxDir, projectorNames(db.projectors))
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("open claims outbox: %w", err)
+		}
+		db.outbox = outbox
 	}
-	db.outbox = outbox
 
 	if err := db.replayWAL(snapshotSeq); err != nil {
 		_ = f.Close()
@@ -163,7 +167,10 @@ func (db *DurableBoard) Close() error {
 	defer db.mu.Unlock()
 	unlockFile(db.walFile)
 	walErr := db.walFile.Close()
-	outboxErr := db.outbox.Close()
+	var outboxErr error
+	if db.outbox != nil {
+		outboxErr = db.outbox.Close()
+	}
 	if walErr != nil {
 		return walErr
 	}
@@ -770,6 +777,9 @@ func truncateForLog(s string, max int) string {
 }
 
 func durableProjectors(cfg ClaimsBoardConfig) []ClaimsProjector {
+	if cfg.DisableOutbox {
+		return nil
+	}
 	projectors := []ClaimsProjector{NewFabricProjector()}
 	projectors = append(projectors, cfg.Projectors...)
 	return projectors

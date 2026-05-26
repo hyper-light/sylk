@@ -110,6 +110,61 @@ func TestScribeContinuityNarrationLinksSourceAndStoresArchivalistMetadata(t *tes
 	}
 }
 
+func TestScribeContinuityNarrationCanBeDisabledByRollout(t *testing.T) {
+	sessionID := "scribe-continuity-disabled-" + time.Now().Format("150405.000000000")
+	rollout := claims.DefaultRolloutConfig()
+	rollout.ScribeContinuityNarration = false
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "board-" + sessionID,
+		SessionID: sessionID,
+		TaskID:    "task-1",
+		Rollout:   rollout,
+	})
+	if err := claims.DefaultSessionBoardRegistry().Register(sessionID, board); err != nil {
+		t.Fatal(err)
+	}
+	defer claims.DefaultSessionBoardRegistry().Remove(sessionID)
+	submitDisabledScribeSource(t, board)
+	carry, err := claims.CarryForward(context.Background(), board, claims.CarryForwardOptions{
+		AgentID: "architect",
+		Topic:   "python cli plan",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := newMockBus()
+	s := &Scribe{
+		id:              "scribe-architect-test",
+		parentAgentType: "architect",
+		sessionID:       sessionID,
+		bus:             bus,
+	}
+	s.running.Store(true)
+
+	s.Receive(context.Background(), activity.AgentActivity{
+		SessionID: activity.SessionID(sessionID),
+		Actor: activity.Actor{
+			AgentID:   "architect",
+			AgentType: "architect",
+		},
+		Action:     activity.ActionTestamentSubmitted,
+		Resolution: activity.ResolutionCoarse,
+		Subject: activity.Subject{Coordinates: map[string]string{
+			"testament_id": carry.TestamentID,
+		}},
+	})
+
+	if bus.publishCount() != 0 {
+		t.Fatalf("archivalist publish count = %d, want 0 when narration disabled", bus.publishCount())
+	}
+	for _, projected := range board.Projection().Testaments {
+		tst, ok := board.CloneTestament(projected.ID)
+		if ok && tst.AgentID == "scribe-architect" {
+			t.Fatalf("scribe testament emitted despite disabled rollout: %+v", tst)
+		}
+	}
+}
+
 func TestScribeContinuityNarrationRecordsArchivalistFailureAsArtifact(t *testing.T) {
 	sessionID := "scribe-continuity-fail-" + time.Now().Format("150405.000000000")
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "board-" + sessionID, SessionID: sessionID})
@@ -155,6 +210,36 @@ func TestScribeContinuityNarrationRecordsArchivalistFailureAsArtifact(t *testing
 		return
 	}
 	t.Fatalf("did not find scribe continuity narration derived from %s", carry.TestamentID)
+}
+
+func submitDisabledScribeSource(t *testing.T, board *claims.ClaimsBoard) {
+	t.Helper()
+	if err := board.PostAction(context.Background(), claims.Action{AgentID: "architect", Type: claims.ActionTypeTask}, []claims.Claim{{
+		ID:          "source-claim",
+		AgentID:     "architect",
+		Title:       "Plan CLI",
+		Description: "Collect reusable planning evidence.",
+		Relations: []claims.Relation{
+			{Related: "source-claim", RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.SubmitTestaments(context.Background(), claims.Action{AgentID: "architect", Type: claims.ActionTypeTestament}, []claims.Testament{{
+		AgentID:    "architect",
+		Summary:    "Planning evidence collected.",
+		Confidence: "high",
+		Relations: []claims.Relation{
+			{Related: "source-claim", RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
+		},
+		Artifacts: []*claims.Artifact{{
+			AgentID:   "architect",
+			Kind:      "workspace_read",
+			Reference: "pyproject.toml already exposes a console script entry point.",
+		}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func testamentHasArtifactKind(t *claims.Testament, kind string) bool {
