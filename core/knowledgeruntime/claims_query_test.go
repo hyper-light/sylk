@@ -209,6 +209,45 @@ func TestArchivalistClaimsQuery_NoLLMForMetadataLookup(t *testing.T) {
 	}
 }
 
+func TestArchivalistClaimsQuery_DistinguishesAgenticNarrative(t *testing.T) {
+	backend := &fakeClaimsSearchBackend{
+		result: &CommittedSearchResult{Hits: []CommittedSearchHit{
+			claimsQueryHit("doc-scribe", "claims/session-1/board-1/artifact/a-1.md", `
+entity_type: artifact
+entity_id: a-1
+artifact_id: a-1
+agent_id: scribe-architect
+session_id: session-1
+board_id: board-1
+topic: planning
+source_type: scribe
+narration_type: continuity
+archivalist_entry_id: entry-1
+
+Scribe narrative digest.
+`, 0.9),
+		}},
+	}
+	index := NewClaimsKnowledgeQueryIndex(backend)
+
+	hits, err := index.LookupCarryForwardEnrichment(context.Background(), claims.RecallForwardEnrichmentQuery{
+		AgentID:   "scribe-architect",
+		Topic:     "planning",
+		SessionID: "session-1",
+		BoardID:   "board-1",
+		MaxItems:  2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("hits = %d, want 1", len(hits))
+	}
+	if !hits[0].AgenticNarrative || hits[0].ArchivalistEntryID != "entry-1" {
+		t.Fatalf("narrative metadata not surfaced: %+v", hits[0])
+	}
+}
+
 func claimsQueryHit(id, path, content string, score float64) CommittedSearchHit {
 	return CommittedSearchHit{
 		ScoredDocument: search.ScoredDocument{

@@ -5,6 +5,11 @@ import (
 	"time"
 )
 
+const (
+	projectionHealthHistoryLimit = 64
+	projectionHealthFailureLimit = 32
+)
+
 type ProjectionHealthSnapshot struct {
 	BoardID           string                      `json:"board_id,omitempty"`
 	SessionID         string                      `json:"session_id,omitempty"`
@@ -15,24 +20,30 @@ type ProjectionHealthSnapshot struct {
 	RetryCount        int                         `json:"retry_count"`
 	TerminalFailures  int                         `json:"terminal_failures"`
 	LeaseExpirations  int                         `json:"lease_expirations"`
+	AverageLatency    time.Duration               `json:"average_projection_latency,omitempty"`
 	Projectors        []ProjectionProjectorHealth `json:"projectors,omitempty"`
 	Warnings          []string                    `json:"warnings,omitempty"`
 }
 
 type ProjectionProjectorHealth struct {
-	Projector          string                     `json:"projector"`
-	Pending            int                        `json:"pending"`
-	InProgress         int                        `json:"in_progress"`
-	Succeeded          int                        `json:"succeeded"`
-	RetryableFailures  int                        `json:"retryable_failures"`
-	TerminalFailures   int                        `json:"terminal_failures"`
-	LeaseExpirations   int                        `json:"lease_expirations"`
-	QueueDepth         int                        `json:"queue_depth"`
-	RetryCount         int                        `json:"retry_count"`
-	OldestPendingAge   time.Duration              `json:"oldest_pending_age,omitempty"`
-	OldestPendingSeq   uint64                     `json:"oldest_pending_sequence,omitempty"`
-	Lag                uint64                     `json:"lag"`
-	TerminalFailureIDs []ProjectionFailureSummary `json:"terminal_failure_ids,omitempty"`
+	Projector            string                     `json:"projector"`
+	Pending              int                        `json:"pending"`
+	InProgress           int                        `json:"in_progress"`
+	Succeeded            int                        `json:"succeeded"`
+	RetryableFailures    int                        `json:"retryable_failures"`
+	TerminalFailures     int                        `json:"terminal_failures"`
+	LeaseExpirations     int                        `json:"lease_expirations"`
+	QueueDepth           int                        `json:"queue_depth"`
+	RetryCount           int                        `json:"retry_count"`
+	OldestPendingAge     time.Duration              `json:"oldest_pending_age,omitempty"`
+	OldestPendingSeq     uint64                     `json:"oldest_pending_sequence,omitempty"`
+	AverageLatency       time.Duration              `json:"average_projection_latency,omitempty"`
+	Lag                  uint64                     `json:"lag"`
+	TerminalFailureCount int                        `json:"terminal_failure_count,omitempty"`
+	TerminalFailureIDs   []ProjectionFailureSummary `json:"terminal_failure_ids,omitempty"`
+
+	latencyTotal time.Duration
+	latencyCount int
 }
 
 type ProjectionFailureSummary struct {
@@ -59,6 +70,13 @@ func (b *ClaimsBoard) ProjectionHealth(now ...time.Time) ProjectionHealthSnapsho
 	return b.durable.ProjectionHealth(now...)
 }
 
+func (b *ClaimsBoard) ProjectionHealthHistory(limit int) []ProjectionHealthSnapshot {
+	if b == nil || b.durable == nil {
+		return nil
+	}
+	return b.durable.ProjectionHealthHistory(limit)
+}
+
 func (db *DurableBoard) ProjectionHealth(now ...time.Time) ProjectionHealthSnapshot {
 	t := healthNow(now)
 	if db == nil || db.board == nil {
@@ -73,7 +91,42 @@ func (db *DurableBoard) ProjectionHealth(now ...time.Time) ProjectionHealthSnaps
 			Warnings:          []string{"claims durable board has no projection outbox"},
 		}
 	}
-	return db.outbox.Health(db.board.BoardID(), db.board.SessionID(), db.board.HighWaterSequence(), t)
+	snap := db.outbox.Health(db.board.BoardID(), db.board.SessionID(), db.board.HighWaterSequence(), t)
+	db.recordProjectionHealthSnapshot(snap)
+	return snap
+}
+
+func (db *DurableBoard) ProjectionHealthHistory(limit int) []ProjectionHealthSnapshot {
+	if db == nil {
+		return nil
+	}
+	db.healthMu.Lock()
+	defer db.healthMu.Unlock()
+	if limit <= 0 || limit > len(db.healthHistory) {
+		limit = len(db.healthHistory)
+	}
+	if limit == 0 {
+		return nil
+	}
+	start := len(db.healthHistory) - limit
+	out := make([]ProjectionHealthSnapshot, 0, limit)
+	for _, snap := range db.healthHistory[start:] {
+		out = append(out, cloneProjectionHealthSnapshot(snap))
+	}
+	return out
+}
+
+func (db *DurableBoard) recordProjectionHealthSnapshot(snap ProjectionHealthSnapshot) {
+	if db == nil {
+		return
+	}
+	db.healthMu.Lock()
+	defer db.healthMu.Unlock()
+	db.healthHistory = append(db.healthHistory, cloneProjectionHealthSnapshot(snap))
+	if len(db.healthHistory) > projectionHealthHistoryLimit {
+		copy(db.healthHistory, db.healthHistory[len(db.healthHistory)-projectionHealthHistoryLimit:])
+		db.healthHistory = db.healthHistory[:projectionHealthHistoryLimit]
+	}
 }
 
 func (o *ClaimsOutbox) Health(boardID, sessionID string, highWater uint64, now time.Time) ProjectionHealthSnapshot {
@@ -107,8 +160,16 @@ func (o *ClaimsOutbox) Health(boardID, sessionID string, highWater uint64, now t
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	var latencyTotal time.Duration
+	var latencyCount int
 	for _, name := range names {
 		ph := *byProjector[name]
+		if ph.latencyCount > 0 {
+			ph.AverageLatency = ph.latencyTotal / time.Duration(ph.latencyCount)
+		}
+		latencyTotal += ph.latencyTotal
+		latencyCount += ph.latencyCount
+		ph.TerminalFailureCount = ph.TerminalFailures
 		snap.Projectors = append(snap.Projectors, ph)
 		snap.QueueDepth += ph.QueueDepth
 		snap.RetryCount += ph.RetryCount
@@ -127,6 +188,9 @@ func (o *ClaimsOutbox) Health(boardID, sessionID string, highWater uint64, now t
 			snap.Warnings = append(snap.Warnings, "projection projector "+ph.Projector+" has expired leases")
 		}
 	}
+	if latencyCount > 0 {
+		snap.AverageLatency = latencyTotal / time.Duration(latencyCount)
+	}
 	return snap
 }
 
@@ -138,6 +202,7 @@ func updateProjectorHealth(ph *ProjectionProjectorHealth, rec ClaimsOutboxRecord
 	switch slot.Status {
 	case OutboxStatusSucceeded:
 		ph.Succeeded++
+		recordProjectionLatency(ph, rec, slot)
 	case OutboxStatusInProgress:
 		ph.InProgress++
 		if !slot.LeaseUntil.IsZero() && now.After(slot.LeaseUntil) {
@@ -150,18 +215,28 @@ func updateProjectorHealth(ph *ProjectionProjectorHealth, rec ClaimsOutboxRecord
 	case OutboxStatusFailedTerminal:
 		ph.TerminalFailures++
 		recordUnresolved(ph, rec, highWater, now)
-		ph.TerminalFailureIDs = append(ph.TerminalFailureIDs, ProjectionFailureSummary{
-			RecordID:     rec.ID,
-			Sequence:     rec.Sequence,
-			EntityType:   rec.EntityType,
-			EntityID:     rec.EntityID,
-			MutationKind: rec.MutationKind,
-			LastError:    slot.LastError,
-		})
+		if len(ph.TerminalFailureIDs) < projectionHealthFailureLimit {
+			ph.TerminalFailureIDs = append(ph.TerminalFailureIDs, ProjectionFailureSummary{
+				RecordID:     rec.ID,
+				Sequence:     rec.Sequence,
+				EntityType:   rec.EntityType,
+				EntityID:     rec.EntityID,
+				MutationKind: rec.MutationKind,
+				LastError:    slot.LastError,
+			})
+		}
 	default:
 		ph.Pending++
 		recordUnresolved(ph, rec, highWater, now)
 	}
+}
+
+func recordProjectionLatency(ph *ProjectionProjectorHealth, rec ClaimsOutboxRecord, slot OutboxProjectorSlot) {
+	if ph == nil || rec.CreatedAt.IsZero() || slot.UpdatedAt.IsZero() || slot.UpdatedAt.Before(rec.CreatedAt) {
+		return
+	}
+	ph.latencyTotal += slot.UpdatedAt.Sub(rec.CreatedAt)
+	ph.latencyCount++
 }
 
 func recordUnresolved(ph *ProjectionProjectorHealth, rec ClaimsOutboxRecord, highWater uint64, now time.Time) {
@@ -185,4 +260,14 @@ func healthNow(values []time.Time) time.Time {
 		return values[0].UTC()
 	}
 	return time.Now().UTC()
+}
+
+func cloneProjectionHealthSnapshot(in ProjectionHealthSnapshot) ProjectionHealthSnapshot {
+	out := in
+	out.Projectors = append([]ProjectionProjectorHealth(nil), in.Projectors...)
+	for i := range out.Projectors {
+		out.Projectors[i].TerminalFailureIDs = append([]ProjectionFailureSummary(nil), in.Projectors[i].TerminalFailureIDs...)
+	}
+	out.Warnings = append([]string(nil), in.Warnings...)
+	return out
 }

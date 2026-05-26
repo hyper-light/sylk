@@ -77,6 +77,24 @@ type RecallForwardEnrichmentProvider interface {
 	LookupCarryForwardEnrichment(ctx context.Context, query RecallForwardEnrichmentQuery) ([]RecallForwardEnrichment, error)
 }
 
+var defaultRecallForwardEnrichment struct {
+	mu       sync.RWMutex
+	provider RecallForwardEnrichmentProvider
+}
+
+func SetDefaultRecallForwardEnrichmentProvider(provider RecallForwardEnrichmentProvider) {
+	defaultRecallForwardEnrichment.mu.Lock()
+	defaultRecallForwardEnrichment.provider = provider
+	defaultRecallForwardEnrichment.mu.Unlock()
+}
+
+func DefaultRecallForwardEnrichmentProvider() RecallForwardEnrichmentProvider {
+	defaultRecallForwardEnrichment.mu.RLock()
+	provider := defaultRecallForwardEnrichment.provider
+	defaultRecallForwardEnrichment.mu.RUnlock()
+	return provider
+}
+
 type RecallForwardEnrichmentQuery struct {
 	AgentID              string `json:"agent_id"`
 	Topic                string `json:"topic"`
@@ -93,23 +111,25 @@ type RecallForwardEnrichmentQuery struct {
 }
 
 type RecallForwardEnrichment struct {
-	Source        string  `json:"source"`
-	DocumentID    string  `json:"document_id,omitempty"`
-	Path          string  `json:"path,omitempty"`
-	EntityType    string  `json:"entity_type,omitempty"`
-	EntityID      string  `json:"entity_id,omitempty"`
-	ClaimID       string  `json:"claim_id,omitempty"`
-	TestamentID   string  `json:"testament_id,omitempty"`
-	ArtifactID    string  `json:"artifact_id,omitempty"`
-	SessionID     string  `json:"session_id,omitempty"`
-	BoardID       string  `json:"board_id,omitempty"`
-	AgentID       string  `json:"agent_id,omitempty"`
-	Topic         string  `json:"topic,omitempty"`
-	Score         float64 `json:"score,omitempty"`
-	Summary       string  `json:"summary,omitempty"`
-	EnrichedBy    string  `json:"enriched_by,omitempty"`
-	GraphNodeID   string  `json:"graph_node_id,omitempty"`
-	GraphNodeType string  `json:"graph_node_type,omitempty"`
+	Source             string  `json:"source"`
+	DocumentID         string  `json:"document_id,omitempty"`
+	Path               string  `json:"path,omitempty"`
+	EntityType         string  `json:"entity_type,omitempty"`
+	EntityID           string  `json:"entity_id,omitempty"`
+	ClaimID            string  `json:"claim_id,omitempty"`
+	TestamentID        string  `json:"testament_id,omitempty"`
+	ArtifactID         string  `json:"artifact_id,omitempty"`
+	SessionID          string  `json:"session_id,omitempty"`
+	BoardID            string  `json:"board_id,omitempty"`
+	AgentID            string  `json:"agent_id,omitempty"`
+	Topic              string  `json:"topic,omitempty"`
+	Score              float64 `json:"score,omitempty"`
+	Summary            string  `json:"summary,omitempty"`
+	EnrichedBy         string  `json:"enriched_by,omitempty"`
+	GraphNodeID        string  `json:"graph_node_id,omitempty"`
+	GraphNodeType      string  `json:"graph_node_type,omitempty"`
+	AgenticNarrative   bool    `json:"agentic_narrative,omitempty"`
+	ArchivalistEntryID string  `json:"archivalist_entry_id,omitempty"`
 }
 
 type RecallForwardResult struct {
@@ -406,6 +426,12 @@ func RecallForward(ctx context.Context, board *ClaimsBoard, opts RecallForwardOp
 	remaining := lookback
 	rec, ok := latestContinuityRecord(current, agentID, topic)
 	if !ok {
+		appendRecallEnrichment(ctx, board, opts.EnrichmentProvider, result, maxItems, RecallForwardEnrichmentQuery{
+			AgentID:   result.AgentID,
+			Topic:     result.Topic,
+			SessionID: board.SessionID(),
+			BoardID:   board.BoardID(),
+		})
 		return result, nil
 	}
 	for {
@@ -463,12 +489,20 @@ func RecallForward(ctx context.Context, board *ClaimsBoard, opts RecallForwardOp
 		}
 		remaining--
 	}
-	appendRecallEnrichment(ctx, opts.EnrichmentProvider, result, maxItems)
+	appendRecallEnrichment(ctx, board, opts.EnrichmentProvider, result, maxItems, RecallForwardEnrichmentQuery{
+		AgentID:   result.AgentID,
+		Topic:     result.Topic,
+		SessionID: board.SessionID(),
+		BoardID:   board.BoardID(),
+	})
 	return result, nil
 }
 
-func appendRecallEnrichment(ctx context.Context, provider RecallForwardEnrichmentProvider, result *RecallForwardResult, maxItems int) {
-	if provider == nil || result == nil || len(result.Items) == 0 {
+func appendRecallEnrichment(ctx context.Context, board *ClaimsBoard, provider RecallForwardEnrichmentProvider, result *RecallForwardResult, maxItems int, fallback RecallForwardEnrichmentQuery) {
+	if provider == nil {
+		provider = DefaultRecallForwardEnrichmentProvider()
+	}
+	if provider == nil || result == nil {
 		return
 	}
 	limit := maxItems
@@ -476,11 +510,17 @@ func appendRecallEnrichment(ctx context.Context, provider RecallForwardEnrichmen
 		limit = 8
 	}
 	seen := make(map[string]struct{})
+	if len(result.Items) == 0 {
+		fallback.MaxItems = limit
+		fallback.IncludeSource = result.IncludeSources
+		appendEnrichmentHits(ctx, board, provider, result, fallback, seen, limit)
+		return
+	}
 	for _, item := range result.Items {
 		if len(result.Enrichment) >= limit {
 			return
 		}
-		hits, err := provider.LookupCarryForwardEnrichment(ctx, RecallForwardEnrichmentQuery{
+		query := RecallForwardEnrichmentQuery{
 			AgentID:       result.AgentID,
 			Topic:         result.Topic,
 			SessionID:     item.SessionID,
@@ -489,24 +529,73 @@ func appendRecallEnrichment(ctx context.Context, provider RecallForwardEnrichmen
 			TestamentID:   item.TestamentID,
 			MaxItems:      limit - len(result.Enrichment),
 			IncludeSource: result.IncludeSources,
-		})
-		if err != nil {
-			result.Partial = true
-			result.Diagnostics = append(result.Diagnostics, "archivalist enrichment lookup: "+err.Error())
+		}
+		if appendEnrichmentHits(ctx, board, provider, result, query, seen, limit) {
 			return
 		}
-		for _, hit := range hits {
-			key := strings.Join([]string{hit.Source, hit.DocumentID, hit.EntityType, hit.EntityID, hit.Path}, "\x1f")
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			result.Enrichment = append(result.Enrichment, hit)
-			if len(result.Enrichment) >= limit {
-				return
-			}
+	}
+}
+
+func appendEnrichmentHits(ctx context.Context, board *ClaimsBoard, provider RecallForwardEnrichmentProvider, result *RecallForwardResult, query RecallForwardEnrichmentQuery, seen map[string]struct{}, limit int) bool {
+	hits, err := provider.LookupCarryForwardEnrichment(ctx, query)
+	if err != nil {
+		result.Partial = true
+		result.Diagnostics = append(result.Diagnostics, "archivalist enrichment lookup: "+err.Error())
+		recordRecallEnrichmentProjectionError(board, query, err)
+		return true
+	}
+	for _, hit := range hits {
+		key := strings.Join([]string{hit.Source, hit.DocumentID, hit.EntityType, hit.EntityID, hit.Path}, "\x1f")
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result.Enrichment = append(result.Enrichment, hit)
+		if len(result.Enrichment) >= limit {
+			return true
 		}
 	}
+	return false
+}
+
+func recordRecallEnrichmentProjectionError(board *ClaimsBoard, query RecallForwardEnrichmentQuery, err error) {
+	if board == nil || err == nil {
+		return
+	}
+	reference := fmt.Sprintf("projection_error projector=%s board=%s session=%s operation=recall_forward_enrichment topic=%q agent=%s: %s", ProjectorKnowledge, firstNonBlankString(query.BoardID, board.BoardID()), firstNonBlankString(query.SessionID, board.SessionID()), query.Topic, query.AgentID, err.Error())
+	artifact := &Artifact{
+		AgentID:   projectionDiagnosticsAgentID,
+		SessionID: board.SessionID(),
+		Kind:      ArtifactKindProjectionError,
+		Reference: reference,
+		Metadata: map[string]any{
+			"operation":  "recall_forward_enrichment",
+			"projector":  ProjectorKnowledge,
+			"board_id":   firstNonBlankString(query.BoardID, board.BoardID()),
+			"session_id": firstNonBlankString(query.SessionID, board.SessionID()),
+			"agent_id":   query.AgentID,
+			"topic":      query.Topic,
+			"error":      err.Error(),
+		},
+	}
+	if submitErr := board.SubmitTestaments(context.Background(), Action{AgentID: projectionDiagnosticsAgentID, Type: ActionTypeTestament}, []Testament{{
+		AgentID:    projectionDiagnosticsAgentID,
+		SessionID:  board.SessionID(),
+		Summary:    reference,
+		Confidence: "committed",
+		Artifacts:  []*Artifact{artifact},
+	}}); submitErr != nil {
+		board.RecordNotificationError("recall enrichment projection error artifact: " + submitErr.Error())
+	}
+}
+
+func firstNonBlankString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func latestContinuityRecord(board *ClaimsBoard, agentID, topic string) (continuityRecord, bool) {

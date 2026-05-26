@@ -2,6 +2,7 @@ package claims
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -97,6 +98,33 @@ func (r *SessionBoardRegistry) Lookup(sessionID string) *ClaimsBoard {
 	board := r.boards[sessionID]
 	r.mu.RUnlock()
 	return board
+}
+
+func (r *SessionBoardRegistry) Snapshot() map[string]*ClaimsBoard {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]*ClaimsBoard, len(r.boards))
+	for sessionID, board := range r.boards {
+		out[sessionID] = board
+	}
+	return out
+}
+
+func (r *SessionBoardRegistry) SessionIDs() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ids := make([]string, 0, len(r.boards))
+	for sessionID := range r.boards {
+		ids = append(ids, sessionID)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // Remove removes a session board from the registry.

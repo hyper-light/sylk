@@ -73,6 +73,9 @@ type DurableBoard struct {
 	outbox     *ClaimsOutbox
 	projectors []ClaimsProjector
 
+	healthMu      sync.Mutex
+	healthHistory []ProjectionHealthSnapshot
+
 	projectionScheduled atomic.Bool
 }
 

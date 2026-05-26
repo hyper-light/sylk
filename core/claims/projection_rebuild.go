@@ -39,6 +39,21 @@ type ProjectionRebuildResult struct {
 	ReportTestamentID string                          `json:"report_testament_id,omitempty"`
 }
 
+type ProjectionRebuildBatchResult struct {
+	Scope              string                    `json:"scope"`
+	RequestedSessionID string                    `json:"requested_session_id,omitempty"`
+	RequestedBoardID   string                    `json:"requested_board_id,omitempty"`
+	SelectedBoards     int                       `json:"selected_boards"`
+	SelectedRecords    int                       `json:"selected_records"`
+	Projected          int                       `json:"projected"`
+	Succeeded          int                       `json:"succeeded"`
+	Failed             int                       `json:"failed"`
+	Skipped            int                       `json:"skipped"`
+	Interrupted        bool                      `json:"interrupted,omitempty"`
+	Results            []ProjectionRebuildResult `json:"results,omitempty"`
+	Warnings           []string                  `json:"warnings,omitempty"`
+}
+
 type ProjectionRebuildProjectorRun struct {
 	Projector string `json:"projector"`
 	Selected  int    `json:"selected"`
@@ -67,6 +82,119 @@ func (b *ClaimsBoard) RebuildProjections(ctx context.Context, opts ProjectionReb
 		return nil, fmt.Errorf("claims board %s is not durable; projection rebuild requires durable outbox records", b.BoardID())
 	}
 	return b.durable.RebuildProjections(ctx, opts)
+}
+
+type ProjectionRebuildTargetOptions struct {
+	SessionID   string
+	BoardID     string
+	AllSessions bool
+	Rebuild     ProjectionRebuildOptions
+}
+
+func RebuildRegisteredProjections(ctx context.Context, registry *SessionBoardRegistry, current *ClaimsBoard, opts ProjectionRebuildTargetOptions) (*ProjectionRebuildBatchResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	batch := &ProjectionRebuildBatchResult{
+		RequestedSessionID: strings.TrimSpace(opts.SessionID),
+		RequestedBoardID:   strings.TrimSpace(opts.BoardID),
+	}
+	targets := rebuildTargets(registry, current, opts)
+	switch {
+	case opts.AllSessions:
+		batch.Scope = "all_sessions"
+	case batch.RequestedSessionID != "":
+		batch.Scope = "session"
+	case batch.RequestedBoardID != "":
+		batch.Scope = "board"
+	default:
+		batch.Scope = "current_board"
+	}
+	if len(targets) == 0 {
+		if batch.RequestedSessionID != "" {
+			batch.Warnings = append(batch.Warnings, "session "+batch.RequestedSessionID+" has no registered claims board")
+		} else if batch.RequestedBoardID != "" {
+			batch.Warnings = append(batch.Warnings, "board "+batch.RequestedBoardID+" is not registered")
+		} else {
+			batch.Warnings = append(batch.Warnings, "no claims boards selected for projection rebuild")
+		}
+		return batch, nil
+	}
+	for _, board := range targets {
+		if err := ctx.Err(); err != nil {
+			batch.Interrupted = true
+			batch.Warnings = append(batch.Warnings, "projection rebuild interrupted: "+err.Error())
+			break
+		}
+		if board == nil {
+			continue
+		}
+		result, err := board.RebuildProjections(ctx, opts.Rebuild)
+		if err != nil {
+			batch.Warnings = append(batch.Warnings, fmt.Sprintf("board=%s session=%s: %v", board.BoardID(), board.SessionID(), err))
+			continue
+		}
+		batch.SelectedBoards++
+		batch.SelectedRecords += result.SelectedRecords
+		batch.Projected += result.Projected
+		batch.Succeeded += result.Succeeded
+		batch.Failed += result.Failed
+		batch.Skipped += result.Skipped
+		batch.Interrupted = batch.Interrupted || result.Interrupted
+		batch.Warnings = append(batch.Warnings, result.Warnings...)
+		batch.Results = append(batch.Results, *result)
+		if result.Interrupted {
+			break
+		}
+	}
+	return batch, nil
+}
+
+func rebuildTargets(registry *SessionBoardRegistry, current *ClaimsBoard, opts ProjectionRebuildTargetOptions) []*ClaimsBoard {
+	sessionID := strings.TrimSpace(opts.SessionID)
+	boardID := strings.TrimSpace(opts.BoardID)
+	var candidates map[string]*ClaimsBoard
+	if opts.AllSessions || boardID != "" {
+		if registry == nil {
+			registry = DefaultSessionBoardRegistry()
+		}
+		candidates = registry.Snapshot()
+		if current != nil {
+			if candidates == nil {
+				candidates = make(map[string]*ClaimsBoard)
+			}
+			candidates[current.SessionID()] = current
+		}
+	} else if sessionID != "" {
+		if registry == nil {
+			registry = DefaultSessionBoardRegistry()
+		}
+		if board := registry.Lookup(sessionID); board != nil {
+			candidates = map[string]*ClaimsBoard{sessionID: board}
+		}
+	} else if current != nil {
+		candidates = map[string]*ClaimsBoard{current.SessionID(): current}
+	}
+	keys := make([]string, 0, len(candidates))
+	for key := range candidates {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	targets := make([]*ClaimsBoard, 0, len(keys))
+	for _, key := range keys {
+		board := candidates[key]
+		if board == nil {
+			continue
+		}
+		if sessionID != "" && board.SessionID() != sessionID {
+			continue
+		}
+		if boardID != "" && board.BoardID() != boardID {
+			continue
+		}
+		targets = append(targets, board)
+	}
+	return targets
 }
 
 func (db *DurableBoard) RebuildProjections(ctx context.Context, opts ProjectionRebuildOptions) (*ProjectionRebuildResult, error) {
@@ -140,6 +268,16 @@ func (db *DurableBoard) RebuildProjections(ctx context.Context, opts ProjectionR
 			run.Projected++
 			result.Projected++
 			err := projector.Project(ctx, &rec, db.board)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				result.Interrupted = true
+				result.ResumeSequence = rec.Sequence
+				result.Warnings = append(result.Warnings, "projection rebuild interrupted: "+ctxErr.Error())
+				result.Records = append(result.Records, rebuildRecordRun(rec, name, "interrupted", ctxErr))
+				if opts.EmitReport {
+					db.submitProjectionRebuildReport(context.Background(), result)
+				}
+				return result, nil
+			}
 			if err != nil {
 				run.Failed++
 				result.Failed++

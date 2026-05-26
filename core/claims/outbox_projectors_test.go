@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -315,6 +316,20 @@ func (p *countingProjector) Project(_ context.Context, record *ClaimsOutboxRecor
 	return nil
 }
 
+type cancelingProjector struct {
+	name   string
+	cancel context.CancelFunc
+}
+
+func (p *cancelingProjector) Name() string { return p.name }
+
+func (p *cancelingProjector) Project(ctx context.Context, _ *ClaimsOutboxRecord, _ *ClaimsBoard) error {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	return ctx.Err()
+}
+
 type goroutineScope struct{}
 
 func (goroutineScope) Go(_ string, _ time.Duration, fn func(context.Context) error) error {
@@ -588,6 +603,66 @@ func TestProjectionHealthReportsOutboxLagAndFailures(t *testing.T) {
 	}
 }
 
+func TestProjectionHealthReportsLatencyAndBoundedFailureDetails(t *testing.T) {
+	projector := &countingProjector{name: "counting"}
+	db, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(t.TempDir(), "session-1"),
+		Projectors: []ClaimsProjector{
+			projector,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")}); err != nil {
+		t.Fatal(err)
+	}
+	db.DrainOutbox(context.Background(), 32)
+	health := db.ProjectionHealth()
+	if health.AverageLatency <= 0 || len(health.Projectors) == 0 || health.Projectors[0].AverageLatency <= 0 {
+		t.Fatalf("health missing projection latency: %+v", health)
+	}
+	for i := 0; i < projectionHealthHistoryLimit+10; i++ {
+		_ = db.ProjectionHealth(time.Now().Add(time.Duration(i) * time.Millisecond))
+	}
+	if history := db.ProjectionHealthHistory(0); len(history) != projectionHealthHistoryLimit {
+		t.Fatalf("health history len = %d, want %d", len(history), projectionHealthHistoryLimit)
+	}
+
+	for i := 0; i < projectionHealthFailureLimit+8; i++ {
+		id := "claim-fail-" + strconv.Itoa(i)
+		if err := db.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim(id, "Plan work")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, rec := range db.outbox.Records() {
+		if rec.EntityID == "claim-1" {
+			continue
+		}
+		if err := db.outbox.MarkFailed(rec.ID, "counting", true, errors.New("terminal projection failure")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	health = db.ProjectionHealth()
+	var ph ProjectionProjectorHealth
+	for _, candidate := range health.Projectors {
+		if candidate.Projector == "counting" {
+			ph = candidate
+			break
+		}
+	}
+	if ph.TerminalFailureCount <= projectionHealthFailureLimit {
+		t.Fatalf("terminal failure count = %d, want more than bound", ph.TerminalFailureCount)
+	}
+	if len(ph.TerminalFailureIDs) != projectionHealthFailureLimit {
+		t.Fatalf("bounded terminal failure IDs = %d, want %d", len(ph.TerminalFailureIDs), projectionHealthFailureLimit)
+	}
+}
+
 func TestDurableBoard_RebuildProjectionsDryRunDoesNotCallProjector(t *testing.T) {
 	projector := &countingProjector{name: "counting"}
 	db, err := OpenDurableBoard(ClaimsBoardConfig{
@@ -664,6 +739,103 @@ func TestDurableBoard_RebuildProjectionsReplaysAndResumesIdempotently(t *testing
 	}
 	if second.Skipped == 0 {
 		t.Fatalf("resume did not report skipped succeeded records: %+v", second)
+	}
+}
+
+func TestDurableBoard_RebuildProjectionsReportsInterrupt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	projector := &cancelingProjector{name: "canceling", cancel: cancel}
+	db, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(t.TempDir(), "session-1"),
+		Projectors: []ClaimsProjector{
+			projector,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.RebuildProjections(ctx, ProjectionRebuildOptions{Projectors: []string{"canceling"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Interrupted || result.Failed != 0 {
+		t.Fatalf("interrupt result = %+v, want interrupted without projection failure", result)
+	}
+}
+
+func TestRebuildRegisteredProjectionsTargetsAllSessionsAndReportsMissing(t *testing.T) {
+	registry := &SessionBoardRegistry{boards: make(map[string]*ClaimsBoard)}
+	projectorOne := &countingProjector{name: "counting"}
+	dbOne, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(t.TempDir(), "session-1"),
+		Projectors: []ClaimsProjector{
+			projectorOne,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbOne.Close()
+	projectorTwo := &countingProjector{name: "counting"}
+	dbTwo, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-2",
+		SessionID:  "session-2",
+		TaskID:     "task-2",
+		SessionDir: filepath.Join(t.TempDir(), "session-2"),
+		Projectors: []ClaimsProjector{
+			projectorTwo,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbTwo.Close()
+	if err := registry.Register("session-1", dbOne.Board()); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register("session-2", dbTwo.Board()); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbOne.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbTwo.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-2", "Plan work")}); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := RebuildRegisteredProjections(context.Background(), registry, dbOne.Board(), ProjectionRebuildTargetOptions{
+		AllSessions: true,
+		Rebuild: ProjectionRebuildOptions{
+			Projectors: []string{"counting"},
+			DryRun:     true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.SelectedBoards != 2 || len(batch.Results) != 2 || batch.SelectedRecords == 0 {
+		t.Fatalf("batch all-session rebuild = %+v, want two boards with records", batch)
+	}
+	missing, err := RebuildRegisteredProjections(context.Background(), registry, dbOne.Board(), ProjectionRebuildTargetOptions{
+		SessionID: "missing-session",
+		Rebuild: ProjectionRebuildOptions{
+			DryRun: true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing.Warnings) == 0 || !strings.Contains(missing.Warnings[0], "missing-session") {
+		t.Fatalf("missing session warnings = %+v", missing.Warnings)
 	}
 }
 

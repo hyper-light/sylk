@@ -701,6 +701,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	// reach worker inboxes.
 	claimsDeltaBus := guide.NewClaimsBusAdapter(guideChannelBus)
 	phase1.knowledgeBackend = knowledgeruntime.NewCommittedKnowledgeBackend(projectRoot, slog.Default())
+	claims.SetDefaultRecallForwardEnrichmentProvider(knowledgeruntime.NewClaimsKnowledgeQueryIndex(phase1.knowledgeBackend))
 	phase1.sessionMgr = session.NewManager(session.ManagerConfig{
 		Scope:    phase1.scope,
 		DeltaBus: claimsDeltaBus,

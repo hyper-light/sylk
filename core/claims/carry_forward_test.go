@@ -3,6 +3,7 @@ package claims
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -742,6 +743,96 @@ func TestCarryForwardAndRecallForwardSkillsInvoke(t *testing.T) {
 	if len(recallResult.Sources) != 1 {
 		t.Fatalf("recall skill sources = %+v, want one", recallResult.Sources)
 	}
+}
+
+func TestRecallForwardUsesEnrichmentWithoutDirectContinuity(t *testing.T) {
+	board := carryForwardTestBoard()
+	provider := &fakeRecallEnrichmentProvider{hits: []RecallForwardEnrichment{{
+		Source:     "archivalist_claims_knowledge",
+		DocumentID: "doc-1",
+		EntityType: "testament",
+		EntityID:   "testament-1",
+		AgentID:    "architect",
+		Topic:      "python cli plan",
+		EnrichedBy: "claims_knowledge_query",
+	}}}
+	recall, err := RecallForward(context.Background(), board, RecallForwardOptions{
+		AgentID:            "architect",
+		Topic:              "python cli plan",
+		EnrichmentProvider: provider,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recall.Items) != 0 {
+		t.Fatalf("direct continuity items = %d, want 0", len(recall.Items))
+	}
+	if len(recall.Enrichment) != 1 {
+		t.Fatalf("enrichment = %+v, want one deterministic hit", recall.Enrichment)
+	}
+	if provider.last.SessionID != board.SessionID() || provider.last.BoardID != board.BoardID() {
+		t.Fatalf("fallback enrichment query = %+v, want board/session scoped", provider.last)
+	}
+}
+
+func TestRecallForwardSkillUsesDefaultEnrichmentProvider(t *testing.T) {
+	board := carryForwardTestBoard()
+	provider := &fakeRecallEnrichmentProvider{hits: []RecallForwardEnrichment{{
+		Source:     "archivalist_claims_knowledge",
+		DocumentID: "doc-default",
+		EntityType: "testament",
+		EntityID:   "testament-default",
+	}}}
+	old := DefaultRecallForwardEnrichmentProvider()
+	SetDefaultRecallForwardEnrichmentProvider(provider)
+	t.Cleanup(func() { SetDefaultRecallForwardEnrichmentProvider(old) })
+
+	recall := RecallForwardSkill(func() (*ClaimsBoard, error) { return board, nil }, "architect")
+	input, _ := json.Marshal(map[string]any{"topic": "python cli plan"})
+	out, err := recall.Handler(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := out.(*RecallForwardResult)
+	if !ok {
+		t.Fatalf("result type = %T, want *RecallForwardResult", out)
+	}
+	if len(result.Enrichment) != 1 || result.Enrichment[0].DocumentID != "doc-default" {
+		t.Fatalf("default enrichment not used: %+v", result.Enrichment)
+	}
+}
+
+func TestRecallForwardEnrichmentErrorCreatesProjectionArtifact(t *testing.T) {
+	board := carryForwardTestBoard()
+	provider := &fakeRecallEnrichmentProvider{err: errors.New("committed knowledge unavailable")}
+	recall, err := RecallForward(context.Background(), board, RecallForwardOptions{
+		AgentID:            "architect",
+		Topic:              "python cli plan",
+		EnrichmentProvider: provider,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recall.Partial || !diagnosticsContain(recall.Diagnostics, "archivalist enrichment lookup") {
+		t.Fatalf("recall diagnostics = %+v, want partial enrichment warning", recall.Diagnostics)
+	}
+	if !projectionArtifactExists(board, ArtifactKindProjectionError) {
+		t.Fatal("recall enrichment failure did not create projection_error artifact")
+	}
+}
+
+type fakeRecallEnrichmentProvider struct {
+	hits []RecallForwardEnrichment
+	err  error
+	last RecallForwardEnrichmentQuery
+}
+
+func (f *fakeRecallEnrichmentProvider) LookupCarryForwardEnrichment(_ context.Context, query RecallForwardEnrichmentQuery) ([]RecallForwardEnrichment, error) {
+	f.last = query
+	if f.err != nil {
+		return nil, f.err
+	}
+	return append([]RecallForwardEnrichment(nil), f.hits...), nil
 }
 
 func carryForwardTestBoard() *ClaimsBoard {

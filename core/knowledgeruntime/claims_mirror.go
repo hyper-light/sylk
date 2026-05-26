@@ -317,7 +317,7 @@ func addArtifactMetadata(metadata map[string]string, artifactMetadata map[string
 	if metadata == nil || len(artifactMetadata) == 0 {
 		return
 	}
-	for _, key := range []string{"topic", "agent_id", "board_id", "session_id", "claim_id", "testament_id", "continuity_topic", "continuity_agent_id"} {
+	for _, key := range []string{"topic", "agent_id", "board_id", "session_id", "claim_id", "testament_id", "continuity_topic", "continuity_agent_id", "source_type", "narration_type", "archivalist_entry_id", "joinable_source_entity_id"} {
 		if value := metadataAnyString(artifactMetadata[key]); value != "" {
 			metadata[key] = value
 		}

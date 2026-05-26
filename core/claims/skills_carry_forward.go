@@ -120,6 +120,10 @@ func RecallForwardSkillWithEnrichment(bp BoardProvider, defaultAgentID string, e
 			if resolvedOpener == nil {
 				resolvedOpener = DurableSessionBoardOpenerFromBoard(board)
 			}
+			resolvedEnrichment := enrichment
+			if resolvedEnrichment == nil {
+				resolvedEnrichment = DefaultRecallForwardEnrichmentProvider()
+			}
 			return RecallForward(ctx, board, RecallForwardOptions{
 				AgentID:            agentID,
 				Topic:              params.Topic,
@@ -127,7 +131,7 @@ func RecallForwardSkillWithEnrichment(bp BoardProvider, defaultAgentID string, e
 				MaxItems:           params.MaxItems,
 				IncludeSources:     params.IncludeSources,
 				OpenBoard:          resolvedOpener,
-				EnrichmentProvider: enrichment,
+				EnrichmentProvider: resolvedEnrichment,
 			})
 		}).
 		Build()
@@ -155,11 +159,18 @@ func parseCarryForwardDuration(raw string) (time.Duration, error) {
 }
 
 func RebuildClaimsProjectionsSkill(bp BoardProvider) *skills.Skill {
+	return RebuildClaimsProjectionsSkillWithRegistry(bp, DefaultSessionBoardRegistry())
+}
+
+func RebuildClaimsProjectionsSkillWithRegistry(bp BoardProvider, registry *SessionBoardRegistry) *skills.Skill {
 	return skills.NewSkill("rebuild_claims_projections").
-		Description("Repair or replay the deterministic claims projection outbox for the current durable session board. Replays existing outbox records through existing projectors such as fabric and knowledge; it does not mutate canonical claims except when emit_report=true records a rebuild report testament. Use dry_run=true first.").
+		Description("Repair or replay deterministic claims projection outboxes for the current board, a selected board/session, or all registered sessions. Replays existing outbox records through existing projectors such as fabric and knowledge; it does not mutate canonical claims except when emit_report=true records a rebuild report testament. Use dry_run=true first.").
 		Domain("claims").
 		Keywords("claims", "projection", "outbox", "repair", "rebuild", "knowledge", "fabric").
 		Priority(30).
+		StringParam("session_id", "Optional registered session ID to rebuild. Empty means current session unless all_sessions=true or board_id selects a board.", false).
+		StringParam("board_id", "Optional claims board ID to rebuild. Can be combined with session_id or used across registered sessions.", false).
+		BoolParam("all_sessions", "When true, rebuild every registered session board, optionally filtered by board_id.", false).
 		StringParam("projectors", "Optional comma-separated projector names, e.g. fabric,knowledge. Empty means all registered projectors.", false).
 		IntParam("from_sequence", "Optional inclusive starting board sequence.", false).
 		IntParam("to_sequence", "Optional inclusive ending board sequence.", false).
@@ -174,6 +185,9 @@ func RebuildClaimsProjectionsSkill(bp BoardProvider) *skills.Skill {
 				return nil, fmt.Errorf("claims board: %w", err)
 			}
 			var params struct {
+				SessionID             string `json:"session_id"`
+				BoardID               string `json:"board_id"`
+				AllSessions           bool   `json:"all_sessions"`
 				Projectors            string `json:"projectors"`
 				FromSequence          int    `json:"from_sequence"`
 				ToSequence            int    `json:"to_sequence"`
@@ -185,7 +199,7 @@ func RebuildClaimsProjectionsSkill(bp BoardProvider) *skills.Skill {
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			return board.RebuildProjections(ctx, ProjectionRebuildOptions{
+			rebuild := ProjectionRebuildOptions{
 				Projectors:            splitProjectorParam(params.Projectors),
 				FromSequence:          positiveIntToUint64(params.FromSequence),
 				ToSequence:            positiveIntToUint64(params.ToSequence),
@@ -193,6 +207,15 @@ func RebuildClaimsProjectionsSkill(bp BoardProvider) *skills.Skill {
 				DryRun:                params.DryRun,
 				ResumeFromLastSuccess: params.ResumeFromLastSuccess,
 				EmitReport:            params.EmitReport,
+			}
+			if !params.AllSessions && strings.TrimSpace(params.SessionID) == "" && strings.TrimSpace(params.BoardID) == "" {
+				return board.RebuildProjections(ctx, rebuild)
+			}
+			return RebuildRegisteredProjections(ctx, registry, board, ProjectionRebuildTargetOptions{
+				SessionID:   params.SessionID,
+				BoardID:     params.BoardID,
+				AllSessions: params.AllSessions,
+				Rebuild:     rebuild,
 			})
 		}).
 		Build()
@@ -200,16 +223,34 @@ func RebuildClaimsProjectionsSkill(bp BoardProvider) *skills.Skill {
 
 func ProjectionHealthSkill(bp BoardProvider) *skills.Skill {
 	return skills.NewSkill("claims_projection_health").
-		Description("Inspect deterministic claims projection health: outbox lag, queue depth, retry counts, terminal failures, expired leases, and per-projector backlog.").
+		Description("Inspect deterministic claims projection health: outbox lag, queue depth, retry counts, terminal failures, expired leases, average projection latency, and per-projector backlog.").
 		Domain("claims").
 		Keywords("claims", "projection", "health", "outbox", "lag", "retries").
 		Priority(60).
+		BoolParam("include_history", "When true, include recent bounded health snapshots for trend/debug views.", false).
+		IntParam("history_limit", "Maximum recent health snapshots to return when include_history=true. Default/all capped internally.", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			board, err := requireBoard(bp)
 			if err != nil {
 				return nil, fmt.Errorf("claims board: %w", err)
 			}
-			return board.ProjectionHealth(), nil
+			var params struct {
+				IncludeHistory bool `json:"include_history"`
+				HistoryLimit   int  `json:"history_limit"`
+			}
+			if len(input) > 0 {
+				if err := json.Unmarshal(input, &params); err != nil {
+					return nil, fmt.Errorf("invalid parameters: %w", err)
+				}
+			}
+			current := board.ProjectionHealth()
+			if !params.IncludeHistory {
+				return current, nil
+			}
+			return map[string]any{
+				"current": current,
+				"history": board.ProjectionHealthHistory(params.HistoryLimit),
+			}, nil
 		}).
 		Build()
 }
