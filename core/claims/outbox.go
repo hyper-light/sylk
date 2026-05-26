@@ -155,6 +155,27 @@ func (o *ClaimsOutbox) Pending(projector string, limit int, now time.Time) []Cla
 	return out
 }
 
+func (o *ClaimsOutbox) HasPending(projectors []string, now time.Time) bool {
+	if o == nil || len(projectors) == 0 {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, id := range o.order {
+		rec := o.records[id]
+		if rec == nil {
+			continue
+		}
+		for _, projector := range projectors {
+			slot, ok := rec.Projectors[projector]
+			if ok && slotClaimable(slot, now) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (o *ClaimsOutbox) Claim(recordID, projector, worker string, leaseUntil time.Time) (bool, error) {
 	if o == nil {
 		return false, nil
@@ -227,10 +248,11 @@ func (o *ClaimsOutbox) Records() []ClaimsOutboxRecord {
 	return out
 }
 
-func (o *ClaimsOutbox) ProjectPending(ctx context.Context, board *ClaimsBoard, projectors []ClaimsProjector, limit int) {
+func (o *ClaimsOutbox) ProjectPending(ctx context.Context, board *ClaimsBoard, projectors []ClaimsProjector, limit int) int {
 	if o == nil || board == nil || len(projectors) == 0 {
-		return
+		return 0
 	}
+	projected := 0
 	for _, projector := range projectors {
 		if projector == nil {
 			continue
@@ -239,7 +261,7 @@ func (o *ClaimsOutbox) ProjectPending(ctx context.Context, board *ClaimsBoard, p
 		records := o.Pending(name, limit, time.Now().UTC())
 		for _, rec := range records {
 			if err := ctx.Err(); err != nil {
-				return
+				return projected
 			}
 			ok, err := o.Claim(rec.ID, name, "claims-board", time.Now().UTC().Add(defaultOutboxLease))
 			if err != nil {
@@ -254,9 +276,15 @@ func (o *ClaimsOutbox) ProjectPending(ctx context.Context, board *ClaimsBoard, p
 				board.RecordProjectionError(rec, name, err)
 				continue
 			}
-			_ = o.MarkSucceeded(rec.ID, name)
+			if err := o.MarkSucceeded(rec.ID, name); err != nil {
+				board.RecordProjectionError(rec, name, err)
+				continue
+			}
+			board.RecordProjectionSuccess(rec, name)
+			projected++
 		}
 	}
+	return projected
 }
 
 func (o *ClaimsOutbox) insertLocked(record ClaimsOutboxRecord, appendEvent bool) error {

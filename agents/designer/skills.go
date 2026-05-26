@@ -118,6 +118,7 @@ func (d *Designer) registerCoreSkills() {
 	}
 	d.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	d.skills.Register(claims.QueryBoardSkill(boardProvider, "designer"))
+	d.skills.Register(claims.RecallForwardSkill(boardProvider, "designer"))
 	inboxProvider := func() *claims.ClaimsInbox { return d.claimsInbox }
 	d.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	d.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
@@ -125,6 +126,7 @@ func (d *Designer) registerCoreSkills() {
 	d.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
 	d.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
 	d.skills.Register(claims.TraverseSkill(boardProvider))
+	d.skills.Register(claims.CarryForwardSkill(boardProvider, "designer"))
 
 	fabricCfg := fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,

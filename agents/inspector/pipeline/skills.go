@@ -135,11 +135,13 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	inboxProvider := func() *claims.ClaimsInbox { return pi.claimsInbox }
 	pi.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	pi.skills.Register(claims.QueryBoardSkill(boardProvider, "inspector-pipeline"))
+	pi.skills.Register(claims.RecallForwardSkill(boardProvider, "inspector-pipeline"))
 	pi.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	pi.skills.Register(claims.EvaluateValidationSkill(boardProvider))
 	pi.skills.Register(claims.PostRemediationClaimsSkill(boardProvider))
 	pi.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
 	pi.skills.Register(claims.TraverseSkill(boardProvider))
+	pi.skills.Register(claims.CarryForwardSkill(boardProvider, "inspector-pipeline"))
 
 	// Fabric claims awareness skills (cross-pipeline visibility).
 	for _, skill := range fabric.ClaimsAwarenessSkills(fabricCfg) {
@@ -603,4 +605,3 @@ func requestOverrideSkill(pi *PipelineInspector) *skills.Skill {
 		}).
 		Build()
 }
-

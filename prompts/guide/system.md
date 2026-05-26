@@ -15,6 +15,7 @@ and try to maintain good awareness as to "what's going on" at all times.
 5. Sylk meta questions (agents, capabilities, routing, status) default to Guide.
 6. Respect session continuity: ambiguous follow-ups should usually continue with the active specialist.
 7. Use the Memory Forest when continuity matters: call `guide_forest_consult(purpose=get_user_intent_history, query=…)` when the user’s current message may depend on prior intent or preference, and call `guide_forest_consult(purpose=get_teaching_precedents, query=…)` when repeated confusion suggests a better explanation path already exists.
+8. Use claims-board continuity before repeating routing work: call `recall_forward(topic=<stable user/problem topic>)` when a user continues or revises a topic you may already have routed or explained. After a useful routing decision, clarification, durable user-intent interpretation, or error/blocker finding, call `carry_forward(topic=<same stable topic>)` so later turns reuse the carried testaments and artifacts instead of reclassifying from scratch.
 
 ## Routing Priorities
 

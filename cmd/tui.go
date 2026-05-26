@@ -700,9 +700,13 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	// default NoopDeltaBus and orchestrator-dispatched claims never
 	// reach worker inboxes.
 	claimsDeltaBus := guide.NewClaimsBusAdapter(guideChannelBus)
+	phase1.knowledgeBackend = knowledgeruntime.NewCommittedKnowledgeBackend(projectRoot, slog.Default())
 	phase1.sessionMgr = session.NewManager(session.ManagerConfig{
 		Scope:    phase1.scope,
 		DeltaBus: claimsDeltaBus,
+		ClaimsProjectors: []claims.ClaimsProjector{
+			knowledgeruntime.NewClaimsKnowledgeMirror(phase1.knowledgeBackend),
+		},
 	})
 	phase1.descriptors = handoff.NewDescriptorRegistry()
 
@@ -812,7 +816,6 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		&busReadinessPublisher{bus: phase1.guideBus},
 		slog.Default(),
 	)
-	phase1.knowledgeBackend = knowledgeruntime.NewCommittedKnowledgeBackend(projectRoot, slog.Default())
 	forest, forestContent, forestVectorDB, err := buildMemoryForest(projectRoot, phase1.budget)
 	if err != nil {
 		return phase1, fmt.Errorf("bootstrap memory forest: %w", err)

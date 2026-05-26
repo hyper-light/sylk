@@ -25,8 +25,10 @@ func pipelineInspectorVisibleSkillNames() []string {
 		// Claims skills: read-only board introspection is Local (visible).
 		"query_claims_board",
 		"query_board",
+		"recall_forward",
 		"inspect_claim_conflicts",
 		"traverse",
+		"carry_forward",
 	}, "inspector-pipeline")
 	// Inspector gets BOTH the awareness skills AND the audit-time
 	// inspect_open_activity. The audit skill is what makes the
@@ -51,6 +53,7 @@ func pipelineInspectorMutatingSkillNames() []string {
 		"submit_testaments",
 		"evaluate_validation",
 		"update_claim_progress",
+		"carry_forward",
 	})
 }
 

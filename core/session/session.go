@@ -137,6 +137,12 @@ func (s *Session) ClaimsBoard() *claims.ClaimsBoard {
 	return s.claimsBoard
 }
 
+// DurableClaimsBoard returns the session's durable claims board owner,
+// when the session was opened with claims-board persistence.
+func (s *Session) DurableClaimsBoard() *claims.DurableBoard {
+	return s.durableClaimsBoard
+}
+
 // SetClaimsBoard sets the session's root claims board. Called during
 // session creation when the board is wired.
 func (s *Session) SetClaimsBoard(board *claims.ClaimsBoard) {

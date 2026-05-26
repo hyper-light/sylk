@@ -31,45 +31,39 @@ func (m *ClaimsKnowledgeMirror) Project(ctx context.Context, record *claims.Clai
 	if m == nil || m.writer == nil || record == nil || board == nil {
 		return nil
 	}
-	doc, ok := claimsKnowledgeDocumentForRecord(record, board.Projection())
+	doc, ok := claimsKnowledgeDocumentForRecord(record, board)
 	if !ok {
 		return nil
 	}
 	return m.writer.UpsertTextDocument(ctx, doc)
 }
 
-func claimsKnowledgeDocumentForRecord(record *claims.ClaimsOutboxRecord, proj *claims.ClaimsBoardProjection) (*TextDocumentIngestRequest, bool) {
-	if record == nil || proj == nil {
+func claimsKnowledgeDocumentForRecord(record *claims.ClaimsOutboxRecord, board *claims.ClaimsBoard) (*TextDocumentIngestRequest, bool) {
+	if record == nil || board == nil {
 		return nil, false
 	}
 	switch record.EntityType {
 	case "claim":
-		for i := range proj.Claims {
-			if proj.Claims[i].ID == record.EntityID {
-				return claimKnowledgeDocument(record, &proj.Claims[i]), true
-			}
+		if c, ok := board.CloneClaim(record.EntityID); ok {
+			return claimKnowledgeDocument(record, c), true
 		}
 	case "testament":
-		for i := range proj.Testaments {
-			if proj.Testaments[i].ID == record.EntityID {
-				return testamentKnowledgeDocument(record, &proj.Testaments[i]), true
+		if t, ok := board.CloneTestament(record.EntityID); ok {
+			if claims.IsProjectionDiagnosticTestament(t) {
+				return nil, false
 			}
+			return testamentKnowledgeDocument(record, t), true
 		}
 	case "artifact":
-		for i := range proj.Testaments {
-			for _, a := range proj.Testaments[i].Artifacts {
-				if a != nil && a.ID == record.EntityID && !a.Ephemeral {
-					return artifactKnowledgeDocument(record, a), true
-				}
+		if a, ok := board.CloneArtifact(record.EntityID); ok && !a.Ephemeral {
+			if a.Kind == claims.ArtifactKindProjectionError || a.Kind == claims.ArtifactKindProjectionReceipt {
+				return nil, false
 			}
+			return artifactKnowledgeDocument(record, a), true
 		}
 	case "validation":
-		for i := range proj.Claims {
-			for _, v := range proj.Claims[i].Validations {
-				if v != nil && v.ID == record.EntityID {
-					return validationKnowledgeDocument(record, v, &proj.Claims[i]), true
-				}
-			}
+		if v, c, ok := board.CloneValidation(record.EntityID); ok {
+			return validationKnowledgeDocument(record, v, c), true
 		}
 	}
 	return nil, false

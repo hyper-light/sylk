@@ -147,12 +147,14 @@ func (l *Librarian) registerFabricSkills() {
 	inboxProvider := func() *claims.ClaimsInbox { return l.claimsInbox }
 	l.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	l.skills.Register(claims.QueryBoardSkill(boardProvider, "librarian"))
+	l.skills.Register(claims.RecallForwardSkill(boardProvider, "librarian"))
 	l.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	l.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	l.skills.Register(claims.EvaluateValidationSkill(boardProvider))
 	l.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
 	l.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
 	l.skills.Register(claims.TraverseSkill(boardProvider))
+	l.skills.Register(claims.CarryForwardSkill(boardProvider, "librarian"))
 
 	// Fabric claims awareness for cross-pipeline visibility.
 	fabricCfg := fabric.AwarenessSkillConfig{

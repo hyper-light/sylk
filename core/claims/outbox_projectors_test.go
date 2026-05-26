@@ -3,7 +3,9 @@ package claims
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,6 +44,40 @@ func TestClaimsOutbox_InsertIdempotent(t *testing.T) {
 	}
 }
 
+func TestClaimsOutbox_ReplayDoesNotDuplicate(t *testing.T) {
+	dir := t.TempDir()
+	record := ClaimsOutboxRecord{
+		BoardID:      "board-1",
+		SessionID:    "session-1",
+		Sequence:     7,
+		EntityType:   "claim",
+		EntityID:     "claim-1",
+		MutationKind: "claim_issued",
+	}
+	outbox, err := OpenClaimsOutbox(dir, []string{ProjectorFabric})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.Insert(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenClaimsOutbox(dir, []string{ProjectorFabric})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.Insert(record); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(reopened.Records()); got != 1 {
+		t.Fatalf("records after replay duplicate insert = %d, want 1", got)
+	}
+}
+
 func TestClaimsOutbox_ProjectorStatusTransitions(t *testing.T) {
 	outbox, err := OpenClaimsOutbox(t.TempDir(), []string{ProjectorFabric})
 	if err != nil {
@@ -76,6 +112,43 @@ func TestClaimsOutbox_ProjectorStatusTransitions(t *testing.T) {
 	}
 	if got := outbox.Pending(ProjectorFabric, 10, time.Now().UTC()); len(got) != 0 {
 		t.Fatalf("pending after success = %d, want 0", len(got))
+	}
+}
+
+func TestClaimsOutbox_LeaseExpires(t *testing.T) {
+	outbox, err := OpenClaimsOutbox(t.TempDir(), []string{ProjectorFabric})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	record := ClaimsOutboxRecord{
+		BoardID:      "board-1",
+		SessionID:    "session-1",
+		Sequence:     7,
+		EntityType:   "claim",
+		EntityID:     "claim-1",
+		MutationKind: "claim_issued",
+	}
+	if err := outbox.Insert(record); err != nil {
+		t.Fatal(err)
+	}
+	pending := outbox.Pending(ProjectorFabric, 10, time.Now().UTC())
+	if len(pending) != 1 {
+		t.Fatalf("pending = %d, want 1", len(pending))
+	}
+	leaseUntil := time.Now().UTC().Add(time.Minute)
+	ok, err := outbox.Claim(pending[0].ID, ProjectorFabric, "worker-1", leaseUntil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("claim returned false")
+	}
+	if got := outbox.Pending(ProjectorFabric, 10, time.Now().UTC()); len(got) != 0 {
+		t.Fatalf("pending before lease expiry = %d, want 0", len(got))
+	}
+	if got := outbox.Pending(ProjectorFabric, 10, leaseUntil.Add(time.Second)); len(got) != 1 {
+		t.Fatalf("pending after lease expiry = %d, want 1", len(got))
 	}
 }
 
@@ -125,6 +198,53 @@ func TestFabricProjector_ClaimIssuedPayload(t *testing.T) {
 	}
 }
 
+type failingProjector struct {
+	name     string
+	failOnce bool
+	failed   bool
+}
+
+func (p *failingProjector) Name() string { return p.name }
+
+func (p *failingProjector) Project(_ context.Context, record *ClaimsOutboxRecord, _ *ClaimsBoard) error {
+	if record == nil || record.EntityType != "claim" {
+		return nil
+	}
+	if p.failOnce && p.failed {
+		return nil
+	}
+	p.failed = true
+	return errors.New("projection backend unavailable")
+}
+
+type blockingProjector struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingProjector) Name() string { return "blocking" }
+
+func (p *blockingProjector) Project(ctx context.Context, _ *ClaimsOutboxRecord, _ *ClaimsBoard) error {
+	select {
+	case <-p.started:
+	default:
+		close(p.started)
+	}
+	select {
+	case <-p.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type goroutineScope struct{}
+
+func (goroutineScope) Go(_ string, _ time.Duration, fn func(context.Context) error) error {
+	go func() { _ = fn(context.Background()) }()
+	return nil
+}
+
 func TestDurableBoard_BoardMethodsWriteWALAndOutbox(t *testing.T) {
 	dir := t.TempDir()
 	db, err := OpenDurableBoard(ClaimsBoardConfig{
@@ -168,4 +288,201 @@ func TestDurableBoard_BoardMethodsWriteWALAndOutbox(t *testing.T) {
 	if got := db2.Board().HighWaterSequence(); got != high {
 		t.Fatalf("replayed high-water = %d, want %d", got, high)
 	}
+}
+
+func TestDurableBoard_WALAppendFailureDoesNotAdvanceHighWater(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(dir, "session-1"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := db.Board().HighWaterSequence()
+	if err := db.walFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err = db.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")})
+	if err == nil {
+		t.Fatal("PostAction succeeded after WAL file was closed")
+	}
+	if got := db.Board().HighWaterSequence(); got != before {
+		t.Fatalf("high-water after failed WAL append = %d, want %d", got, before)
+	}
+	if got := db.Board().Projection().TotalClaims; got != 0 {
+		t.Fatalf("claims after failed WAL append = %d, want 0", got)
+	}
+}
+
+func TestDurableBoard_OutboxUsesMutationSequenceForRepeatedUpdates(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(dir, "session-1"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	board := db.Board()
+	if err := board.PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.SetClaimContext(context.Background(), "claim-1", "first update"); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.SetClaimContext(context.Background(), "claim-1", "second update"); err != nil {
+		t.Fatal(err)
+	}
+	sequences := map[uint64]struct{}{}
+	for _, record := range db.outbox.Records() {
+		if record.EntityID == "claim-1" && record.MutationKind == walEventClaimUpdated {
+			sequences[record.Sequence] = struct{}{}
+		}
+	}
+	if len(sequences) != 2 {
+		t.Fatalf("claim update outbox mutation sequences = %v, want 2 distinct records", sequences)
+	}
+}
+
+func TestDurableBoard_ReopenPreservesPendingOutbox(t *testing.T) {
+	dir := t.TempDir()
+	cfg := ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(dir, "session-1"),
+	}
+	db, err := OpenDurableBoard(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")}); err != nil {
+		t.Fatal(err)
+	}
+	before := len(db.outbox.Pending(ProjectorFabric, 16, time.Now().UTC()))
+	if before == 0 {
+		t.Fatal("expected pending fabric projection before close")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenDurableBoard(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	after := len(reopened.outbox.Pending(ProjectorFabric, 16, time.Now().UTC()))
+	if after != before {
+		t.Fatalf("pending records after reopen = %d, want %d", after, before)
+	}
+}
+
+func TestDurableBoard_ProjectionWorkerDoesNotBlockMutation(t *testing.T) {
+	projector := &blockingProjector{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	defer close(projector.release)
+	db, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(t.TempDir(), "session-1"),
+		Scope:      goroutineScope{},
+		Projectors: []ClaimsProjector{
+			projector,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- db.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("PostAction blocked on projector")
+	}
+	select {
+	case <-projector.started:
+	case <-time.After(time.Second):
+		t.Fatal("projector worker did not start")
+	}
+}
+
+func TestDurableBoard_ProjectionFailureCreatesErrorArtifact(t *testing.T) {
+	projector := &failingProjector{name: "failing"}
+	db, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(t.TempDir(), "session-1"),
+		Projectors: []ClaimsProjector{
+			projector,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")}); err != nil {
+		t.Fatal(err)
+	}
+	db.DrainOutbox(context.Background(), 32)
+	if !projectionArtifactExists(db.Board(), ArtifactKindProjectionError) {
+		t.Fatal("projection failure did not create projection_error artifact")
+	}
+}
+
+func TestDurableBoard_ProjectionSuccessAfterFailureCreatesReceiptArtifact(t *testing.T) {
+	projector := &failingProjector{name: "flaky", failOnce: true}
+	db, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(t.TempDir(), "session-1"),
+		Projectors: []ClaimsProjector{
+			projector,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")}); err != nil {
+		t.Fatal(err)
+	}
+	db.DrainOutbox(context.Background(), 32)
+	db.DrainOutbox(context.Background(), 32)
+	if !projectionArtifactExists(db.Board(), ArtifactKindProjectionReceipt) {
+		t.Fatal("projection success after failure did not create projection_receipt artifact")
+	}
+	for _, msg := range db.Board().Projection().NotificationErrors {
+		if strings.Contains(msg, "projection_error projector=flaky") {
+			t.Fatalf("projection warning state not cleared after success: %v", msg)
+		}
+	}
+}
+
+func projectionArtifactExists(board *ClaimsBoard, kind string) bool {
+	for _, t := range board.Projection().Testaments {
+		for _, artifact := range t.Artifacts {
+			if artifact != nil && artifact.Kind == kind {
+				return true
+			}
+		}
+	}
+	return false
 }

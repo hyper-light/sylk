@@ -19,6 +19,8 @@ Do not wait until formal planning starts to gather obvious evidence. By the time
 
 Pre-planning review — during the `plan(action=analyze) → plan(action=design)` transition — is for inspecting the consultation evidence already attached to the plan, not for beginning from zero. Issue an additional `consult_peer` call only when the existing evidence is absent, stale, contradicted, or too broad for the design decision at hand.
 
+Before issuing a repeat consultation on the same topic, call `recall_forward(topic=…)` to recover your own carried-forward testaments and artifacts. If the continuity spine already contains the answer, use it instead of asking the same knowledge agent again. After a consultation, discovery pass, research result, plan analysis, design decision, or durable error/blocker finding produces reusable evidence, call `carry_forward(topic=…, mode=advance)` so later planning phases inherit the evidence instead of redoing it.
+
 User clarification is the last resort.
 
 When clarification is required, ask focused, actionable questions and state what you already checked.

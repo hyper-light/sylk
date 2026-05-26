@@ -48,6 +48,8 @@ type Manager struct {
 	// inboxes via the underlying event bus.
 	deltaBus claims.DeltaBus
 
+	claimsProjectors []claims.ClaimsProjector
+
 	// Statistics
 	totalCreated   int64
 	totalCompleted int64
@@ -80,6 +82,11 @@ type ManagerConfig struct {
 	// never receive InboxDeltas — orchestrator dispatch via
 	// PostAction silently drops on the bus side.
 	DeltaBus claims.DeltaBus
+
+	// ClaimsProjectors are deterministic projections attached to every
+	// durable session root board in addition to the built-in Fabric
+	// projector. Production wires the committed knowledge mirror here.
+	ClaimsProjectors []claims.ClaimsProjector
 }
 
 // DefaultManagerConfig returns default manager configuration
@@ -107,13 +114,14 @@ func NewManager(cfg ManagerConfig) *Manager {
 	}
 
 	return &Manager{
-		shards:      shards,
-		numShards:   cfg.NumShards,
-		maxSessions: cfg.MaxSessions,
-		persister:   cfg.Persister,
-		handlers:    make(map[uint64]EventHandler),
-		scope:       cfg.Scope,
-		deltaBus:    cfg.DeltaBus,
+		shards:           shards,
+		numShards:        cfg.NumShards,
+		maxSessions:      cfg.MaxSessions,
+		persister:        cfg.Persister,
+		handlers:         make(map[uint64]EventHandler),
+		scope:            cfg.Scope,
+		deltaBus:         cfg.DeltaBus,
+		claimsProjectors: append([]claims.ClaimsProjector(nil), cfg.ClaimsProjectors...),
 	}
 }
 
@@ -204,6 +212,7 @@ func (m *Manager) openSessionClaimsBoard(session *Session) (*claims.DurableBoard
 		SessionDir: sessionDir,
 		Scope:      boardScope,
 		DeltaBus:   m.deltaBus,
+		Projectors: append([]claims.ClaimsProjector(nil), m.claimsProjectors...),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("session %q: open durable claims board: %w", session.ID(), err)

@@ -100,12 +100,14 @@ func (g *Guardian) registerFabricSkills() {
 	inboxProvider := func() *claims.ClaimsInbox { return g.claimsInbox }
 	g.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	g.skills.Register(claims.QueryBoardSkill(boardProvider, "guardian"))
+	g.skills.Register(claims.RecallForwardSkill(boardProvider, "guardian"))
 	g.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	g.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	g.skills.Register(claims.EvaluateValidationSkill(boardProvider))
 	g.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
 	g.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
 	g.skills.Register(claims.TraverseSkill(boardProvider))
+	g.skills.Register(claims.CarryForwardSkill(boardProvider, "guardian"))
 
 	fabricCfg := fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,

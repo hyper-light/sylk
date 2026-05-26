@@ -27,8 +27,10 @@ func pipelineTesterVisibleSkillNames() []string {
 		// Claims skills: read-only board introspection is Local (visible).
 		"query_claims_board",
 		"query_board",
+		"recall_forward",
 		"inspect_claim_conflicts",
 		"traverse",
+		"carry_forward",
 	}, "tester-pipeline")
 	// Activity Fabric: awareness + cross-pipeline + recall must be
 	// in the LLM's default tool catalog so the ambient model is
@@ -55,6 +57,7 @@ func pipelineTesterMutatingSkillNames() []string {
 		"submit_testaments",
 		"evaluate_validation",
 		"update_claim_progress",
+		"carry_forward",
 	})
 }
 

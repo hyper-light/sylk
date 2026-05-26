@@ -376,6 +376,7 @@ func (pt *PipelineTester) registerCoreSkills() {
 	inboxProvider := func() *claims.ClaimsInbox { return pt.claimsInbox }
 	pt.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	pt.skills.Register(claims.QueryBoardSkill(boardProvider, "tester-pipeline"))
+	pt.skills.Register(claims.RecallForwardSkill(boardProvider, "tester-pipeline"))
 	pt.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	pt.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	pt.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
@@ -383,6 +384,7 @@ func (pt *PipelineTester) registerCoreSkills() {
 	pt.skills.Register(claims.PostRemediationClaimsSkill(boardProvider))
 	pt.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
 	pt.skills.Register(claims.TraverseSkill(boardProvider))
+	pt.skills.Register(claims.CarryForwardSkill(boardProvider, "tester-pipeline"))
 
 	// Fabric claims awareness skills.
 	for _, skill := range fabric.ClaimsAwarenessSkills(awareCfg) {

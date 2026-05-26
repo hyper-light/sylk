@@ -77,12 +77,14 @@ func (s *Scribe) newToolBundle(feed shared.ScribeFeed) (*scribeToolBundle, *scri
 	for _, skill := range []*skills.Skill{
 		claims.QueryClaimsBoardSkill(boardProvider),
 		claims.QueryBoardSkill(boardProvider, "scribe"),
+		claims.RecallForwardSkill(boardProvider, "scribe"),
 		claims.PostActionSkill(boardProvider, inboxProvider),
 		claims.SubmitTestamentsSkill(boardProvider),
 		claims.EvaluateValidationSkill(boardProvider),
 		claims.UpdateClaimProgressSkill(boardProvider),
 		claims.InspectClaimConflictsSkill(boardProvider),
 		claims.TraverseSkill(boardProvider),
+		claims.CarryForwardSkill(boardProvider, "scribe"),
 	} {
 		if err := registry.Register(skill); err != nil {
 			return nil, nil, fmt.Errorf("register scribe claims skill %q: %w", skill.Name, err)
@@ -401,6 +403,7 @@ func scribeVisibleSkillNames(agentType string) []string {
 		// Claims skills: read-only board introspection is Local (visible).
 		"query_claims_board",
 		"query_board",
+		"recall_forward",
 		"inspect_claim_conflicts",
 		"traverse",
 		// Claims skills: mutating operations are also visible for the scribe.
@@ -408,6 +411,7 @@ func scribeVisibleSkillNames(agentType string) []string {
 		"submit_testaments",
 		"evaluate_validation",
 		"update_claim_progress",
+		"carry_forward",
 	}, agentType)
 }
 
@@ -490,6 +494,7 @@ func scribeMutatingSkillNames(agentType string) []string {
 		"submit_testaments",
 		"evaluate_validation",
 		"update_claim_progress",
+		"carry_forward",
 	})
 }
 

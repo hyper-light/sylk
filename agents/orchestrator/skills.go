@@ -126,12 +126,14 @@ func (o *Orchestrator) registerFabricSkills() {
 	inboxProvider := func() *claims.ClaimsInbox { return o.claimsInbox }
 	o.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	o.skills.Register(claims.QueryBoardSkill(boardProvider, "orchestrator"))
+	o.skills.Register(claims.RecallForwardSkill(boardProvider, "orchestrator"))
 	o.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	o.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	o.skills.Register(claims.EvaluateValidationSkill(boardProvider))
 	o.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
 	o.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
 	o.skills.Register(claims.TraverseSkill(boardProvider))
+	o.skills.Register(claims.CarryForwardSkill(boardProvider, "orchestrator"))
 }
 
 // orchestratorPinnedSkillNames returns the minimal set of skills always loaded

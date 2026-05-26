@@ -406,6 +406,9 @@ const (
 	ArtifactKindError           = "error"
 	ArtifactKindErrorTrace      = "error_trace"
 	ArtifactKindErrorDiagnostic = "error_diagnostic"
+	ArtifactKindProjectionError = "projection_error"
+
+	ArtifactKindProjectionReceipt = "projection_receipt"
 )
 
 // DeriveTestamentVerdict classifies a testament's artifact mixture
@@ -436,7 +439,8 @@ func DeriveTestamentVerdict(artifacts []*Artifact) string {
 func isErrorArtifactKind(kind string) bool {
 	return kind == ArtifactKindError ||
 		kind == ArtifactKindErrorTrace ||
-		kind == ArtifactKindErrorDiagnostic
+		kind == ArtifactKindErrorDiagnostic ||
+		kind == ArtifactKindProjectionError
 }
 
 // CollectArtifactKinds returns the unique artifact kinds in

@@ -35,6 +35,7 @@ type ClaimsBoard struct {
 	pipelineID    string
 	taskID        string
 	sessionID     string
+	sessionDir    string
 	parentBoardID string
 
 	phase         BoardPhase
@@ -114,6 +115,7 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		pipelineID:       cfg.PipelineID,
 		taskID:           cfg.TaskID,
 		sessionID:        cfg.SessionID,
+		sessionDir:       cfg.SessionDir,
 		parentBoardID:    cfg.ParentBoardID,
 		phase:            BoardPhaseImplementation,
 		maxIterations:    maxIter,
@@ -152,6 +154,12 @@ func (b *ClaimsBoard) SessionID() string {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.sessionID
+}
+
+func (b *ClaimsBoard) SessionDir() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.sessionDir
 }
 
 // ParentBoardID returns the parent board's ID (empty for root boards).
@@ -233,6 +241,7 @@ func (b *ClaimsBoard) PostAction(ctx context.Context, action Action, inputClaims
 		}
 	}
 
+	prevSeq := b.seq.Load()
 	b.stampActionLocked(&action, now)
 
 	for i := range inputClaims {
@@ -244,6 +253,7 @@ func (b *ClaimsBoard) PostAction(ctx context.Context, action Action, inputClaims
 	if err := b.appendDurableEventLocked(walEventActionPosted, action.AgentID, map[string]any{
 		"action": action, "claims": inputClaims,
 	}, outboxRecords); err != nil {
+		b.seq.Store(prevSeq)
 		b.mu.Unlock()
 		return err
 	}
@@ -625,6 +635,7 @@ func (b *ClaimsBoard) SubmitTestaments(ctx context.Context, action Action, testa
 
 	b.mu.Lock()
 	now := time.Now().UTC()
+	prevSeq := b.seq.Load()
 	b.stampTestamentActionLocked(&action, now)
 
 	// Capture post-stamp claim snapshots so the amplifier gets
@@ -639,6 +650,7 @@ func (b *ClaimsBoard) SubmitTestaments(ctx context.Context, action Action, testa
 	if err := b.appendDurableEventLocked(walEventTestamentSubmitted, action.AgentID, map[string]any{
 		"action": action, "testaments": testaments,
 	}, outboxRecords); err != nil {
+		b.seq.Store(prevSeq)
 		b.mu.Unlock()
 		return err
 	}
@@ -962,6 +974,7 @@ func (b *ClaimsBoard) RejectClaim(ctx context.Context, claimID string, change St
 	change.From = string(c.Status)
 	change.To = string(ClaimStatusRejected)
 	change.Changed = now
+	prevSeq := b.seq.Load()
 	remediationIDs := b.prepareRemediationLocked(claimID, replacements, replacementClaims, change.AgentID, now)
 	outboxRecords := []ClaimsOutboxRecord{
 		b.outboxRecordLocked(c.Sequence, "claim", c.ID, walEventClaimRejected, now),
@@ -975,6 +988,7 @@ func (b *ClaimsBoard) RejectClaim(ctx context.Context, claimID string, change St
 	if err := b.appendDurableEventLocked(walEventClaimRejected, change.AgentID, map[string]any{
 		"claim_id": claimID, "change": change, "action": replacements, "claims": replacementClaims,
 	}, outboxRecords); err != nil {
+		b.seq.Store(prevSeq)
 		b.mu.Unlock()
 		return err
 	}
@@ -1142,10 +1156,12 @@ func (b *ClaimsBoard) TransitionToValidation(ctx context.Context) error {
 		return err
 	}
 	fromPhase := b.phase
+	prevSeq := b.seq.Load()
 	eventSeq := b.nextSeq()
 	if err := b.appendDurableEventLocked(walEventPhaseTransition, "", map[string]any{
 		"phase": string(BoardPhaseValidation), "iteration": b.iteration, "sequence": eventSeq,
 	}, []ClaimsOutboxRecord{b.outboxRecordLocked(eventSeq, "board", b.boardID, walEventPhaseTransition, time.Now().UTC())}); err != nil {
+		b.seq.Store(prevSeq)
 		b.mu.Unlock()
 		return err
 	}
@@ -1195,10 +1211,12 @@ func (b *ClaimsBoard) TransitionToImplementation(ctx context.Context) error {
 		return fmt.Errorf("max iterations (%d) reached, cannot re-enter implementation", b.maxIterations)
 	}
 	fromPhase := b.phase
+	prevSeq := b.seq.Load()
 	eventSeq := b.nextSeq()
 	if err := b.appendDurableEventLocked(walEventPhaseTransition, "", map[string]any{
 		"phase": string(BoardPhaseImplementation), "iteration": b.iteration + 1, "sequence": eventSeq,
 	}, []ClaimsOutboxRecord{b.outboxRecordLocked(eventSeq, "board", b.boardID, walEventPhaseTransition, time.Now().UTC())}); err != nil {
+		b.seq.Store(prevSeq)
 		b.mu.Unlock()
 		return err
 	}
@@ -1245,10 +1263,12 @@ func (b *ClaimsBoard) MarkComplete(ctx context.Context) error {
 		return err
 	}
 	fromPhase := b.phase
+	prevSeq := b.seq.Load()
 	eventSeq := b.nextSeq()
 	if err := b.appendDurableEventLocked(walEventBoardComplete, "", map[string]any{
 		"sequence": eventSeq,
 	}, []ClaimsOutboxRecord{b.outboxRecordLocked(eventSeq, "board", b.boardID, walEventBoardComplete, time.Now().UTC())}); err != nil {
+		b.seq.Store(prevSeq)
 		b.mu.Unlock()
 		return err
 	}
@@ -1757,15 +1777,9 @@ func (b *ClaimsBoard) RecordProjectionError(record ClaimsOutboxRecord, projector
 	if b == nil || err == nil {
 		return
 	}
-	key := strings.Join([]string{
-		record.BoardID,
-		fmt.Sprint(record.Sequence),
-		record.EntityType,
-		record.EntityID,
-		projector,
-	}, "\x1f")
-	msg := fmt.Sprintf("projection_error projector=%s board=%s sequence=%d entity=%s/%s: %s",
-		projector, record.BoardID, record.Sequence, record.EntityType, record.EntityID, err.Error())
+	key := projectionDiagnosticKey(record, projector)
+	msg := projectionDiagnosticMessage(record, projector, err)
+	shouldSubmit := false
 	b.mu.Lock()
 	if b.projectionErrors == nil {
 		b.projectionErrors = make(map[string]string)
@@ -1774,8 +1788,32 @@ func (b *ClaimsBoard) RecordProjectionError(record ClaimsOutboxRecord, projector
 		b.projectionErrors[key] = msg
 		b.notificationErrors = append(b.notificationErrors, msg)
 		b.invalidateProjectionCache()
+		shouldSubmit = true
 	}
 	b.mu.Unlock()
+	if shouldSubmit {
+		b.submitProjectionDiagnostic(context.Background(), record, projector, ArtifactKindProjectionError, msg, err.Error())
+	}
+}
+
+func (b *ClaimsBoard) RecordProjectionSuccess(record ClaimsOutboxRecord, projector string) {
+	if b == nil {
+		return
+	}
+	key := projectionDiagnosticKey(record, projector)
+	b.mu.Lock()
+	oldMessage, hadError := b.projectionErrors[key]
+	if hadError {
+		delete(b.projectionErrors, key)
+		b.notificationErrors = removeNotificationError(b.notificationErrors, oldMessage)
+		b.invalidateProjectionCache()
+	}
+	b.mu.Unlock()
+	if hadError {
+		msg := fmt.Sprintf("projection_receipt projector=%s board=%s sequence=%d entity=%s/%s",
+			projector, record.BoardID, record.Sequence, record.EntityType, record.EntityID)
+		b.submitProjectionDiagnostic(context.Background(), record, projector, ArtifactKindProjectionReceipt, msg, "")
+	}
 }
 
 // ── Read-path accessors used by pull_work / context queries ─────────
@@ -1809,6 +1847,11 @@ func (b *ClaimsBoard) CloneTestament(id string) (*Testament, bool) {
 	return CloneTestamentEntity(t), true
 }
 
+// CloneArtifact returns a defensive copy of the artifact by id.
+func (b *ClaimsBoard) CloneArtifact(id string) (*Artifact, bool) {
+	return b.cloneArtifact(id)
+}
+
 func (b *ClaimsBoard) cloneArtifact(id string) (*Artifact, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -1831,6 +1874,11 @@ func (b *ClaimsBoard) cloneArtifact(id string) (*Artifact, bool) {
 		}
 	}
 	return nil, false
+}
+
+// CloneValidation returns a defensive copy of the validation and its parent claim.
+func (b *ClaimsBoard) CloneValidation(id string) (*Validation, *Claim, bool) {
+	return b.cloneValidation(id)
 }
 
 func (b *ClaimsBoard) cloneValidation(id string) (*Validation, *Claim, bool) {

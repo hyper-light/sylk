@@ -4,11 +4,23 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/session"
 )
+
+type countingProjector struct {
+	count atomic.Int64
+}
+
+func (p *countingProjector) Name() string { return "counting" }
+
+func (p *countingProjector) Project(_ context.Context, _ *claims.ClaimsOutboxRecord, _ *claims.ClaimsBoard) error {
+	p.count.Add(1)
+	return nil
+}
 
 func TestManager_CreateWiresDurableSessionBoard(t *testing.T) {
 	root := t.TempDir()
@@ -50,5 +62,38 @@ func TestManager_CreateWiresDurableSessionBoard(t *testing.T) {
 	}
 	if len(data) == 0 {
 		t.Fatal("claims WAL is empty")
+	}
+}
+
+func TestManager_CreateWiresConfiguredClaimsProjectors(t *testing.T) {
+	projector := &countingProjector{}
+	mgr := session.NewManager(session.ManagerConfig{
+		ClaimsProjectors: []claims.ClaimsProjector{projector},
+	})
+	s, err := mgr.Create(context.Background(), session.Config{
+		ID:                 "projected-session",
+		Name:               "projected-session",
+		PersistenceEnabled: true,
+		PersistencePath:    t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close(s.ID())
+	if err := s.ClaimsBoard().PostAction(context.Background(), claims.Action{AgentID: "guide", Type: claims.ActionTypeTask}, []claims.Claim{{
+		ID:          "claim-1",
+		AgentID:     "guide",
+		Title:       "Project root claim",
+		Description: "Verify configured projectors are attached.",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	owner := s.DurableClaimsBoard()
+	if owner == nil {
+		t.Fatal("durable board owner missing")
+	}
+	owner.DrainOutbox(context.Background(), 32)
+	if got := projector.count.Load(); got == 0 {
+		t.Fatal("configured projector was not invoked")
 	}
 }

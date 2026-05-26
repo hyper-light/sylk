@@ -475,12 +475,14 @@ func (gt *GlobalTester) registerCoreSkills() {
 	inboxProvider := func() *claims.ClaimsInbox { return gt.claimsInbox }
 	gt.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	gt.skills.Register(claims.QueryBoardSkill(boardProvider, "tester"))
+	gt.skills.Register(claims.RecallForwardSkill(boardProvider, "tester"))
 	gt.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	gt.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	gt.skills.Register(claims.EvaluateValidationSkill(boardProvider))
 	gt.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
 	gt.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
 	gt.skills.Register(claims.TraverseSkill(boardProvider))
+	gt.skills.Register(claims.CarryForwardSkill(boardProvider, "tester"))
 
 	// Per-merge audit skills (docs/PARALLEL_GLOBAL_VFS.md §6.4):
 	// emit_audit_decision is the terminal tool the tester calls at

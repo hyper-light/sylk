@@ -28,8 +28,10 @@ func archivalistVisibleSkillNames() []string {
 		// Claims skills: read-only board introspection is Local (visible).
 		"query_claims_board",
 		"query_board",
+		"recall_forward",
 		"inspect_claim_conflicts",
 		"traverse",
+		"carry_forward",
 	}
 }
 
@@ -55,6 +57,7 @@ func archivalistMutatingSkillNames() []string {
 		"submit_testaments",
 		"evaluate_validation",
 		"update_claim_progress",
+		"carry_forward",
 	})
 }
 

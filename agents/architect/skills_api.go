@@ -57,6 +57,7 @@ func architectToolManifestForRegistry(registry *skills.Registry) *toolruntime.Po
 		// Claims skills: read-only board introspection is Local (visible).
 		toolruntime.NewToolPolicy("query_claims_board", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("query_board", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("recall_forward", toolruntime.EffectReadOnly, toolruntime.DomainMemory, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("inspect_claim_conflicts", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("traverse", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		// Claims skills: mutating operations need LocalWorker policy.
@@ -64,6 +65,7 @@ func architectToolManifestForRegistry(registry *skills.Registry) *toolruntime.Po
 		toolruntime.NewToolPolicy("submit_testaments", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("evaluate_validation", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("update_claim_progress", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("carry_forward", toolruntime.EffectMutating, toolruntime.DomainMemory, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 	}
 	policies = shared.AppendMemoryForestToolPolicies(policies, registry, "architect")
 	policies = fabric.AppendFabricAwarenessToolPolicies(policies, registry)
