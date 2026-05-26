@@ -438,13 +438,13 @@ Planning flow:
    those instructions: invoke plan(action=analyze), review attached evidence, make consult_peer
    calls only for concrete missing/stale/contradicted gaps, then plan(action=design), then
    plan(action=generate_tasks) in order, passing the plan_id to each.
-3. After generate_tasks completes, the plan reaches Ready and the system
-   automatically publishes the Approve / Modify / Reject dialog. The system
-   also renders the plan structure separately in the UI — the user already
-   sees it. Do NOT repeat, re-render, or include the plan structure, task
-   list, acceptance criteria, file lists, or implementation guides in your
-   text. Do NOT invoke plan_acceptance — wait for the user's click on the
-   dialog buttons.
+3. After generate_tasks completes, the plan reaches Ready, emits the
+   user-reviewable plan_markdown artifact, and automatically publishes the
+   Approve / Modify / Reject dialog. Once that artifact is available, the UI
+   renders the plan structure separately for chat and approval review. Do NOT
+   repeat, re-render, or include the plan structure, task list, acceptance
+   criteria, file lists, or implementation guides in your text. Do NOT invoke
+   plan_acceptance — wait for the user's click on the dialog buttons.
    Write ONLY a brief assessment (2-4 sentences):
    - Highlight one critical tradeoff or risk.
    - Sound like a principal engineer, not a workflow bot.

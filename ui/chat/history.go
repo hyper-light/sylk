@@ -141,6 +141,17 @@ type ToolCallRegion struct {
 	Subregions []ToolCallSubregion
 }
 
+// PresentationSourceRef preserves the claims-board entity that produced
+// user-visible rendered content in a chat entry.
+type PresentationSourceRef struct {
+	SourceType  string
+	SourceID    string
+	TestamentID string
+	ReplaceKey  string
+	Format      string
+	Sequence    uint64
+}
+
 // ChatEntry represents a single message in the chat history.
 type ChatEntry struct {
 	ID        string
@@ -164,17 +175,17 @@ type ChatEntry struct {
 	// singleton. The resumable-primary matcher requires RuntimeAgentID
 	// equality so two concurrent replicas of the same parent agent
 	// never consolidate onto the same chat row.
-	RuntimeAgentID           string
-	TaskID                   string
-	TaskName                 string
-	TaskSlug                 string
-	SessionID                string
-	Content       string       // Raw content (markdown).
-	RenderedLines []string     // Cached rendered output lines (lazily computed).
-	CodeRegions   []CodeRegion // Cached code block positions (lazily computed).
-	Height        int          // Cached line count (-1 means not yet computed).
-	Streaming     bool         // True while still receiving chunks.
-	Importance    float64
+	RuntimeAgentID string
+	TaskID         string
+	TaskName       string
+	TaskSlug       string
+	SessionID      string
+	Content        string       // Raw content (markdown).
+	RenderedLines  []string     // Cached rendered output lines (lazily computed).
+	CodeRegions    []CodeRegion // Cached code block positions (lazily computed).
+	Height         int          // Cached line count (-1 means not yet computed).
+	Streaming      bool         // True while still receiving chunks.
+	Importance     float64
 
 	// Tool call visualization.
 	ToolCalls       []ToolCallRecord // Inline tool call records (bounded by agent MaxToolRuns).
@@ -188,6 +199,16 @@ type ChatEntry struct {
 
 	// Steering state.
 	SteeringPending bool // True while steering text awaits agent acknowledgment (renders holographic).
+
+	// Claims presentation provenance. These fields are populated when a
+	// ClaimPresentationMsg renders this entry or embeds content into it.
+	PresentationSourceType  string
+	PresentationSourceID    string
+	PresentationTestamentID string
+	PresentationReplaceKey  string
+	PresentationFormat      string
+	PresentationSequence    uint64
+	PresentationSources     []PresentationSourceRef
 }
 
 // History is a bounded ring buffer of chat entries.

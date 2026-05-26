@@ -65,7 +65,9 @@ func (v Verdict) IsValid() bool {
 // Content:
 //   - PlanName is the human-readable name shown in the dialog header.
 //   - PlanSummary is a short one-paragraph synopsis (architect-derived).
-//   - PlanText is the full plan markdown the user reviews.
+//   - PlanArtifactID / PlanArtifactReplaceKey point at the canonical
+//     user-reviewable claims artifact when available.
+//   - PlanText is the full plan markdown fallback during migration.
 //
 // Context (Phase 2 fields, optional in Phase 1):
 //   - FreshnessSummary describes what was re-checked when the plan was
@@ -84,6 +86,9 @@ type Proposal struct {
 	PlanSummary string `json:"plan_summary,omitempty"`
 	PlanText    string `json:"plan_text"`
 
+	PlanArtifactID         string `json:"plan_artifact_id,omitempty"`
+	PlanArtifactReplaceKey string `json:"plan_artifact_replace_key,omitempty"`
+
 	FreshnessSummary      string         `json:"freshness_summary,omitempty"`
 	DriftSignals          []DriftSignal  `json:"drift_signals,omitempty"`
 	OrchestratorStateHint string         `json:"orchestrator_state_hint,omitempty"`
@@ -96,9 +101,9 @@ type Proposal struct {
 // drafted and when it's being re-presented. Visible to the user in the
 // dialog so the click is informed. Empty for fresh plans.
 type DriftSignal struct {
-	Kind        string `json:"kind"`             // "codebase" | "knowledge" | "consultation_age" | "pipeline" | ...
-	Description string `json:"description"`      // human-readable, displayed in dialog
-	Severity    string `json:"severity"`         // "info" | "advisory" | "warning"
+	Kind        string `json:"kind"`        // "codebase" | "knowledge" | "consultation_age" | "pipeline" | ...
+	Description string `json:"description"` // human-readable, displayed in dialog
+	Severity    string `json:"severity"`    // "info" | "advisory" | "warning"
 	SourcePath  string `json:"source_path,omitempty"`
 }
 
@@ -111,8 +116,8 @@ type DriftSignal struct {
 // rejection reason. Those are handled by an architect follow-up turn
 // after the verdict is processed, not inline in the dialog response.
 type Decision struct {
-	PlanID        string  `json:"plan_id"`
-	CorrelationID string  `json:"correlation_id"`
-	Verdict       Verdict `json:"verdict"`
+	PlanID        string    `json:"plan_id"`
+	CorrelationID string    `json:"correlation_id"`
+	Verdict       Verdict   `json:"verdict"`
 	Timestamp     time.Time `json:"timestamp"`
 }

@@ -105,6 +105,25 @@ func (a *Architect) architectSubmitTestament(ctx context.Context, testament clai
 	}
 }
 
+// architectSubmitTestamentSync submits a testament and reports the board
+// error to callers that must not claim visibility before evidence is durable.
+func (a *Architect) architectSubmitTestamentSync(ctx context.Context, testament claims.Testament) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	board := a.architectBoard()
+	if board == nil {
+		return fmt.Errorf("architect claims board unavailable")
+	}
+	action := claims.Action{AgentID: "architect", Type: claims.ActionTypeTestament}
+	if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
+		slog.Error("architect_submit_testament_failed", "error", err.Error())
+		board.RecordNotificationError("architect testament: " + err.Error())
+		return err
+	}
+	return nil
+}
+
 // architectClaimAction builds a claim action for the architect.
 func architectClaimAction(actionType claims.ActionType) claims.Action {
 	return claims.Action{AgentID: "architect", Type: actionType}

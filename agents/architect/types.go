@@ -174,6 +174,15 @@ type DesignPlan struct {
 	// artifact.
 	HandoffPayloadArtifactID string `json:"handoff_payload_artifact_id,omitempty"`
 
+	// PlanMarkdownArtifactID is the current user-reviewable
+	// plan_markdown artifact for this plan revision. The artifact is
+	// canonical for chat and approval presentation; PlanText copies are
+	// migration fallbacks only.
+	PlanMarkdownArtifactID    string `json:"plan_markdown_artifact_id,omitempty"`
+	PlanMarkdownReplaceKey    string `json:"plan_markdown_replace_key,omitempty"`
+	PlanMarkdownContentHash   string `json:"plan_markdown_content_hash,omitempty"`
+	PlanMarkdownArtifactEpoch uint64 `json:"plan_markdown_artifact_epoch,omitempty"`
+
 	// sm is not serialized; reconstructed on restore or creation.
 	sm *PlanStateMachine `json:"-"`
 }
@@ -420,7 +429,7 @@ type TaskClaim struct {
 	ID          string                `json:"id"`
 	Title       string                `json:"title"`
 	Description string                `json:"description"`
-	Subject     string                `json:"subject"`  // agent type: "engineer", "designer", "tester-pipeline"
+	Subject     string                `json:"subject"` // agent type: "engineer", "designer", "tester-pipeline"
 	Scope       []TaskClaimScope      `json:"scope,omitempty"`
 	Validations []TaskClaimValidation `json:"validations"`
 	DependsOn   []string              `json:"depends_on,omitempty"` // other claim IDs
@@ -699,10 +708,10 @@ type ResearchProposal struct {
 type PlanHandoffPhase string
 
 const (
-	PlanHandoffPhaseLegacy           PlanHandoffPhase = ""
-	PlanHandoffPhasePrepare          PlanHandoffPhase = "prepare"
-	PlanHandoffPhaseExecutePrepared  PlanHandoffPhase = "execute_prepared"
-	PlanHandoffPhaseDiscardPrepared  PlanHandoffPhase = "discard_prepared"
+	PlanHandoffPhaseLegacy          PlanHandoffPhase = ""
+	PlanHandoffPhasePrepare         PlanHandoffPhase = "prepare"
+	PlanHandoffPhaseExecutePrepared PlanHandoffPhase = "execute_prepared"
+	PlanHandoffPhaseDiscardPrepared PlanHandoffPhase = "discard_prepared"
 )
 
 type PlanHandoff struct {

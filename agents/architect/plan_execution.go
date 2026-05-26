@@ -294,7 +294,11 @@ func (a *Architect) dispatchPlanExecution(
 	// reference. Either way, by the time we post the dispatch claim
 	// below, the artifact is on the board.
 	if strings.TrimSpace(plan.HandoffPayloadArtifactID) == "" {
-		a.publishPreparedHandoff(ctx, plan)
+		if err := a.publishPreparedHandoff(ctx, plan); err != nil {
+			a.logWarn("dispatchPlanExecution: failed to publish prepared handoff",
+				"plan_id", plan.ID,
+				"error", err.Error())
+		}
 	}
 
 	// Post dispatch claim: architect handing off plan to orchestrator.

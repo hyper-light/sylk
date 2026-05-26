@@ -33,44 +33,85 @@ import (
 // full PlanHandoff JSON. This is *evidence*, not a dispatch — the
 // architect declares "I have finished planning, here is the plan."
 //
-// The artifact's ID is pre-stamped (uuid.NewString) and recorded on
-// the plan struct as plan.HandoffPayloadArtifactID. The user-accept
+// The handoff artifact's ID is pre-stamped (uuid.NewString) and
+// recorded on the plan struct as plan.HandoffPayloadArtifactID. The
+// same testament also carries the user-presentable plan_markdown
+// artifact recorded as plan.PlanMarkdownArtifactID. The user-accept
 // dispatch claim (dispatchPlanExecution) carries a validation that
-// references this artifact ID, so the orchestrator's claim intake
-// can resolve the artifact and run ingestPlan deterministically —
-// no LLM tool loop, no parallel bus message, no race on the receipt.
+// references the handoff artifact ID, so the orchestrator's claim
+// intake can resolve the artifact and run ingestPlan deterministically
+// — no LLM tool loop, no parallel bus message, no race on the receipt.
 //
-// Best-effort on the testament submission itself: if the board is
-// unavailable the user-accept path can still re-submit a fresh
-// testament+artifact and reference that one. Failures are logged.
+// The ready-plan path treats this submission as required evidence:
+// callers that are about to ask for user review must check the returned
+// error and avoid misleading final prose if the board is unavailable.
 //
 // Phase semantics live ENTIRELY on the testament/artifact side now.
 // The bus path that previously carried Phase=Prepare is gone — the
 // orchestrator's prefetch/preparation reaction is driven by
 // observing this testament via its plan-scoped subscription.
-func (a *Architect) publishPreparedHandoff(ctx context.Context, plan *DesignPlan) {
+func (a *Architect) publishPreparedHandoff(ctx context.Context, plan *DesignPlan) error {
 	if a == nil || plan == nil {
-		return
+		return nil
 	}
 	payload := buildPhasedHandoffPayload(plan, "plan-prepared", PlanHandoffPhasePrepare)
 	if !isPlanHandoffPayloadValid(payload) {
-		return
+		return fmt.Errorf("invalid plan handoff payload for plan %s", plan.ID)
 	}
-	artifactID := uuid.NewString()
-	artifact := a.architectArtifact(claims.ArtifactKindPlanHandoffPayload, payload)
-	artifact.ID = artifactID
-	artifact.Metadata = map[string]any{
+	if planHasCurrentMarkdownArtifact(plan) && strings.TrimSpace(plan.HandoffPayloadArtifactID) != "" {
+		return nil
+	}
+	priorPlanArtifactID := ""
+	if strings.TrimSpace(plan.PlanMarkdownArtifactID) != "" && !planHasCurrentMarkdownArtifact(plan) {
+		priorPlanArtifactID = plan.PlanMarkdownArtifactID
+	}
+	var planArtifact *claims.Artifact
+	replaceKey := plan.PlanMarkdownReplaceKey
+	contentHash := plan.PlanMarkdownContentHash
+	artifactEpoch := plan.PlanMarkdownArtifactEpoch
+	if !planHasCurrentMarkdownArtifact(plan) {
+		var err error
+		planArtifact, replaceKey, contentHash, artifactEpoch, err = a.buildPlanMarkdownArtifact(plan, priorPlanArtifactID)
+		if err != nil {
+			return err
+		}
+	}
+	handoffArtifactID := uuid.NewString()
+	handoffArtifact := a.architectArtifact(claims.ArtifactKindPlanHandoffPayload, payload)
+	handoffArtifact.ID = handoffArtifactID
+	handoffArtifact.Metadata = map[string]any{
 		"plan_id":  plan.ID,
+		"epoch":    planMarkdownArtifactEpoch(plan),
 		"revision": plan.Revision,
 		"phase":    string(PlanHandoffPhasePrepare),
 	}
+	artifacts := []*claims.Artifact{handoffArtifact}
+	if planArtifact != nil {
+		artifacts = append([]*claims.Artifact{planArtifact}, artifacts...)
+	}
 	testament := a.architectTestament(
-		fmt.Sprintf("Plan %s prepared: %d tasks, revision %d", plan.ID, len(plan.Tasks), plan.Revision),
+		fmt.Sprintf("Plan %s ready for review: %d tasks, revision %d", plan.ID, len(plan.Tasks), plan.Revision),
 		"committed",
-		[]*claims.Artifact{artifact},
+		artifacts,
 	)
-	plan.HandoffPayloadArtifactID = artifactID
-	a.architectSubmitTestament(ctx, testament)
+	if err := a.architectSubmitTestamentSync(ctx, testament); err != nil {
+		return err
+	}
+	plan.HandoffPayloadArtifactID = handoffArtifactID
+	if planArtifact != nil {
+		plan.PlanMarkdownArtifactID = planArtifact.ID
+		plan.PlanMarkdownReplaceKey = replaceKey
+		plan.PlanMarkdownContentHash = contentHash
+		plan.PlanMarkdownArtifactEpoch = artifactEpoch
+	}
+	if a.planStore != nil {
+		if err := a.planStore.Upsert(plan); err != nil {
+			a.logWarn("publishPreparedHandoff: failed to persist plan artifact metadata",
+				"plan_id", plan.ID,
+				"error", err.Error())
+		}
+	}
+	return nil
 }
 
 // publishDiscardPrepared tells the orchestrator to drop any prepared

@@ -41,24 +41,26 @@ const planApprovalControlTimeout = 10 * time.Minute
 // this skill. Carries the full plan text + identity so Guardian can
 // build the proposal without round-tripping back to the architect.
 type planApprovalRequest struct {
-	PlanID                string                     `json:"plan_id"`
-	SessionID             string                     `json:"session_id,omitempty"`
-	PlanName              string                     `json:"plan_name,omitempty"`
-	PlanSummary           string                     `json:"plan_summary,omitempty"`
-	PlanText              string                     `json:"plan_text"`
-	FreshnessSummary      string                     `json:"freshness_summary,omitempty"`
-	DriftSignals          []planapproval.DriftSignal `json:"drift_signals,omitempty"`
-	OrchestratorStateHint string                     `json:"orchestrator_state_hint,omitempty"`
-	Metadata              map[string]any             `json:"metadata,omitempty"`
+	PlanID                 string                     `json:"plan_id"`
+	SessionID              string                     `json:"session_id,omitempty"`
+	PlanName               string                     `json:"plan_name,omitempty"`
+	PlanSummary            string                     `json:"plan_summary,omitempty"`
+	PlanText               string                     `json:"plan_text"`
+	PlanArtifactID         string                     `json:"plan_artifact_id,omitempty"`
+	PlanArtifactReplaceKey string                     `json:"plan_artifact_replace_key,omitempty"`
+	FreshnessSummary       string                     `json:"freshness_summary,omitempty"`
+	DriftSignals           []planapproval.DriftSignal `json:"drift_signals,omitempty"`
+	OrchestratorStateHint  string                     `json:"orchestrator_state_hint,omitempty"`
+	Metadata               map[string]any             `json:"metadata,omitempty"`
 }
 
 // planApprovalResult is the structured response Guardian returns to the
 // architect after the user clicks a verdict. The architect's verdict
 // handler branches on Verdict.
 type planApprovalResult struct {
-	PlanID  string             `json:"plan_id"`
+	PlanID  string               `json:"plan_id"`
 	Verdict planapproval.Verdict `json:"verdict"`
-	Reason  string             `json:"reason,omitempty"`
+	Reason  string               `json:"reason,omitempty"`
 }
 
 // planApprovalGateSkill is the bus-callable entry point. The architect
@@ -162,17 +164,19 @@ func (g *Guardian) requestPlanApproval(ctx context.Context, req *planApprovalReq
 
 	correlationID := uuid.New().String()
 	proposal := &planapproval.Proposal{
-		PlanID:                req.PlanID,
-		CorrelationID:         correlationID,
-		SessionID:             req.SessionID,
-		PlanName:              req.PlanName,
-		PlanSummary:           req.PlanSummary,
-		PlanText:              req.PlanText,
-		FreshnessSummary:      req.FreshnessSummary,
-		DriftSignals:          append([]planapproval.DriftSignal(nil), req.DriftSignals...),
-		OrchestratorStateHint: req.OrchestratorStateHint,
-		Metadata:              req.Metadata,
-		Timestamp:             time.Now(),
+		PlanID:                 req.PlanID,
+		CorrelationID:          correlationID,
+		SessionID:              req.SessionID,
+		PlanName:               req.PlanName,
+		PlanSummary:            req.PlanSummary,
+		PlanText:               req.PlanText,
+		PlanArtifactID:         req.PlanArtifactID,
+		PlanArtifactReplaceKey: req.PlanArtifactReplaceKey,
+		FreshnessSummary:       req.FreshnessSummary,
+		DriftSignals:           append([]planapproval.DriftSignal(nil), req.DriftSignals...),
+		OrchestratorStateHint:  req.OrchestratorStateHint,
+		Metadata:               req.Metadata,
+		Timestamp:              time.Now(),
 	}
 
 	// Pending channel keyed by correlationID. handleBusResponse already

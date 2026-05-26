@@ -230,10 +230,48 @@ type streamSlot struct {
 	planID          string             // Plan ID embedded in this stream, if any.
 	planMarkdown    string             // Rendered plan markdown for this stream.
 	planOffset      int                // Accumulator content length when plan was injected.
-	deferCompletion bool               // Parent stream finished, but child inter-agent work still owns the row.
+	planAfter       bool               // Plan presentation should render after final accumulated prose.
+	presentations   []streamPresentation
+	deferCompletion bool // Parent stream finished, but child inter-agent work still owns the row.
 }
 
 const deferredParentCompletionStatus = "Waiting for child work to finish..."
+
+type streamPresentation struct {
+	SourceType  string
+	SourceID    string
+	TestamentID string
+	ReplaceKey  string
+	Format      string
+	Content     string
+	Offset      int
+	After       bool
+	Order       int
+	Sequence    uint64
+}
+
+type cyclePresentationBlock struct {
+	SourceType  string
+	SourceID    string
+	TestamentID string
+	ReplaceKey  string
+	Format      string
+	Content     string
+	Placement   string
+	Order       int
+	Sequence    uint64
+}
+
+type presentationDisplayState struct {
+	EntryID    string
+	EntryIndex int
+	Sequence   uint64
+	SourceType string
+	SourceID   string
+	ReplaceKey string
+	CycleID    string
+	Embedded   bool
+}
 
 // nestedStreamSlot tracks a child agent stream that belongs to an inter-agent
 // consult/challenge branch owned by a parent chat entry.
@@ -295,6 +333,13 @@ type Model struct {
 	// Inline plan tracking: the plan renders as a chat entry updated in place.
 	planEntryIdx int    // History index of the plan ChatEntry (-1 = no plan entry).
 	planID       string // Correlates updates to the correct entry.
+
+	// Presentation tracking for claims-board user-visible artifacts/testaments.
+	presentationSources      map[string]presentationDisplayState
+	presentationReplacements map[string]presentationDisplayState
+	presentationOrder        int
+	cyclePresentations       map[string][]cyclePresentationBlock
+	cycleResponseContent     map[string]string
 
 	// Render throttle: chunks buffer at full speed, but the history entry
 	// is only synced (and viewDirty set) on DecorTick or StreamComplete.
@@ -581,21 +626,25 @@ func New(th *theme.Theme, historyCapacity int) *Model {
 	h := NewHistory(historyCapacity)
 	vp := NewViewport(h, th)
 	return &Model{
-		history:              h,
-		viewport:             vp,
-		streams:              make(map[string]*streamSlot),
-		nestedStreams:        make(map[string]*nestedStreamSlot),
-		theme:                th,
-		thinkingIdx:          -1,
-		planEntryIdx:         -1,
-		pendingInterAgent:    make(map[int]struct{}),
-		claimCycleAnimations: make(map[string]claimCycleAnimation),
-		resumablePrimaries:   make(map[string]resumablePrimaryState),
-		resumableChildOwners: make(map[string]string),
-		thinkingGradient:     th.Palette.ThinkingGradient(),
-		steeringGradient:     th.Palette.GroupGradient(),
-		agentStates:          make(map[string]*agentActivityState),
-		claimRows:            newClaimRowIndex(),
+		history:                  h,
+		viewport:                 vp,
+		streams:                  make(map[string]*streamSlot),
+		nestedStreams:            make(map[string]*nestedStreamSlot),
+		theme:                    th,
+		thinkingIdx:              -1,
+		planEntryIdx:             -1,
+		presentationSources:      make(map[string]presentationDisplayState),
+		presentationReplacements: make(map[string]presentationDisplayState),
+		cyclePresentations:       make(map[string][]cyclePresentationBlock),
+		cycleResponseContent:     make(map[string]string),
+		pendingInterAgent:        make(map[int]struct{}),
+		claimCycleAnimations:     make(map[string]claimCycleAnimation),
+		resumablePrimaries:       make(map[string]resumablePrimaryState),
+		resumableChildOwners:     make(map[string]string),
+		thinkingGradient:         th.Palette.ThinkingGradient(),
+		steeringGradient:         th.Palette.GroupGradient(),
+		agentStates:              make(map[string]*agentActivityState),
+		claimRows:                newClaimRowIndex(),
 	}
 }
 
@@ -626,6 +675,9 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	case msg.ClaimResponseTextMsg:
 		m.viewDirty = true
 		return m, m.handleClaimResponseText(typed)
+	case msg.ClaimPresentationMsg:
+		m.viewDirty = true
+		return m, m.handleClaimPresentation(typed)
 	case msg.ClaimContextMsg:
 		m.viewDirty = true
 		return m, m.handleClaimContext(typed)
@@ -989,6 +1041,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		m.viewport.AdjustSelectionForEviction()
 		m.adjustSteeringIndices()
 		m.adjustStreamSlotIndices()
+		m.adjustPresentationIndices()
 	}
 	idx := m.history.Len() - 1
 	slot := &streamSlot{
@@ -1952,8 +2005,31 @@ func (m *Model) PushEntry(entry *ChatEntry) {
 			}
 		}
 		m.adjustSteeringIndices()
+		m.adjustPresentationIndices()
 	}
 	m.viewDirty = true
+}
+
+func (m *Model) adjustPresentationIndices() {
+	if m == nil {
+		return
+	}
+	for key, state := range m.presentationSources {
+		state.EntryIndex--
+		if state.EntryIndex < 0 {
+			delete(m.presentationSources, key)
+			continue
+		}
+		m.presentationSources[key] = state
+	}
+	for key, state := range m.presentationReplacements {
+		state.EntryIndex--
+		if state.EntryIndex < 0 {
+			delete(m.presentationReplacements, key)
+			continue
+		}
+		m.presentationReplacements[key] = state
+	}
 }
 
 func (m *Model) handleInterAgentToolCallEvent(idx int, currentAgentType string, ev msg.ToolCallEventMsg) bool {
@@ -4292,6 +4368,7 @@ func (m *Model) BeginThinking(agentType string) {
 	if willEvict {
 		m.viewport.AdjustSelectionForEviction()
 		m.adjustSteeringIndices()
+		m.adjustPresentationIndices()
 	}
 	idx := m.history.Len() - 1
 	m.startThinkingAnimation(now, idx)
@@ -4510,6 +4587,7 @@ func (m *Model) PushSteeringEntry(text, correlationID string) {
 			}
 		}
 		m.adjustSteeringIndices()
+		m.adjustPresentationIndices()
 	}
 	idx := m.history.Len() - 1
 	if len(m.steeringPending) == 0 {
@@ -5191,17 +5269,80 @@ func entryVisibleAgentID(entry *ChatEntry) string {
 }
 
 // composeSlotContent returns the full entry content for a stream slot by
-// splicing the embedded plan markdown (if any) into the accumulated LLM text.
+// splicing embedded presentation content into the accumulated LLM text.
 func composeSlotContent(slot *streamSlot) string {
 	content := slot.accumulator.Content()
-	if slot.planMarkdown == "" {
+	inserts := make([]streamPresentation, 0, len(slot.presentations)+1)
+	if slot.planMarkdown != "" {
+		inserts = append(inserts, streamPresentation{
+			ReplaceKey: "plan:" + strings.TrimSpace(slot.planID) + ":review",
+			Content:    slot.planMarkdown,
+			Offset:     slot.planOffset,
+			After:      slot.planAfter,
+			Order:      -1,
+		})
+	}
+	inserts = append(inserts, slot.presentations...)
+	if len(inserts) == 0 {
 		return content
 	}
-	offset := slot.planOffset
-	if offset > len(content) {
-		offset = len(content)
+	sort.SliceStable(inserts, func(i, j int) bool {
+		left := presentationInsertOffset(inserts[i], len(content))
+		right := presentationInsertOffset(inserts[j], len(content))
+		if left != right {
+			return left < right
+		}
+		return inserts[i].Order < inserts[j].Order
+	})
+	var b strings.Builder
+	pos := 0
+	for _, insert := range inserts {
+		if strings.TrimSpace(insert.Content) == "" {
+			continue
+		}
+		offset := presentationInsertOffset(insert, len(content))
+		if offset < pos {
+			offset = pos
+		}
+		if offset > len(content) {
+			offset = len(content)
+		}
+		b.WriteString(content[pos:offset])
+		writePresentationSpacing(&b)
+		b.WriteString(insert.Content)
+		writePresentationSpacing(&b)
+		pos = offset
 	}
-	return content[:offset] + "\n\n" + slot.planMarkdown + "\n\n" + content[offset:]
+	b.WriteString(content[pos:])
+	return b.String()
+}
+
+func presentationInsertOffset(insert streamPresentation, contentLen int) int {
+	if insert.After {
+		return contentLen
+	}
+	if insert.Offset < 0 {
+		return 0
+	}
+	if insert.Offset > contentLen {
+		return contentLen
+	}
+	return insert.Offset
+}
+
+func writePresentationSpacing(b *strings.Builder) {
+	if b.Len() == 0 {
+		return
+	}
+	s := b.String()
+	if strings.HasSuffix(s, "\n\n") {
+		return
+	}
+	if strings.HasSuffix(s, "\n") {
+		b.WriteString("\n")
+		return
+	}
+	b.WriteString("\n\n")
 }
 
 // syncSlotToEntry writes the slot's accumulated content back into the
@@ -5218,6 +5359,8 @@ func (m *Model) syncSlotToEntry(slot *streamSlot) {
 	}
 	physical := m.history.logicalToPhysical(idx)
 	m.history.entries[physical].Content = content
+	m.history.entries[physical].RenderedLines = nil
+	m.history.entries[physical].CodeRegions = nil
 	m.history.entries[physical].Height = -1
 }
 
@@ -5890,6 +6033,524 @@ func appendUniqueCorrelationID(existing []string, id string) []string {
 	return append(existing, id)
 }
 
+func (m *Model) handleClaimPresentation(ev msg.ClaimPresentationMsg) tea.Cmd {
+	content := renderClaimPresentationContent(ev)
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	sourceKey := claimPresentationSourceKey(ev.SourceType, ev.SourceID)
+	if sourceKey == "" {
+		return nil
+	}
+	next := presentationDisplayState{
+		Sequence:   ev.Sequence,
+		SourceType: strings.TrimSpace(ev.SourceType),
+		SourceID:   strings.TrimSpace(ev.SourceID),
+		ReplaceKey: strings.TrimSpace(ev.ReplaceKey),
+		CycleID:    firstNonEmptyString(strings.TrimSpace(ev.CycleID), strings.TrimSpace(ev.ClaimID)),
+	}
+	if _, seen := m.presentationSources[sourceKey]; seen {
+		return nil
+	}
+	replaceKey := strings.TrimSpace(ev.ReplaceKey)
+	if replaceKey != "" {
+		if prior, ok := m.presentationReplacements[replaceKey]; ok && !presentationDisplayStateNewer(next, prior) {
+			m.presentationSources[sourceKey] = next
+			return nil
+		}
+	}
+	if m.applyPresentationToActiveStream(ev, content, next) {
+		return nil
+	}
+	if m.applyPresentationToCycleEntry(ev, content, next) {
+		return nil
+	}
+	m.applyStandalonePresentation(ev, content, next)
+	return nil
+}
+
+func claimPresentationSourceKey(sourceType, sourceID string) string {
+	sourceType = strings.TrimSpace(sourceType)
+	sourceID = strings.TrimSpace(sourceID)
+	if sourceType == "" || sourceID == "" {
+		return ""
+	}
+	return sourceType + "|" + sourceID
+}
+
+func presentationDisplayStateNewer(next, prior presentationDisplayState) bool {
+	if next.Sequence != prior.Sequence {
+		return next.Sequence > prior.Sequence
+	}
+	return strings.TrimSpace(next.SourceID) > strings.TrimSpace(prior.SourceID)
+}
+
+func renderClaimPresentationContent(ev msg.ClaimPresentationMsg) string {
+	content := strings.TrimSpace(ev.Content)
+	if content == "" {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(ev.Format)) {
+	case "", string(claims.PresentationFormatText):
+		return escapeMarkdownPlainText(content)
+	case string(claims.PresentationFormatMarkdown), string(claims.PresentationFormatTable):
+		return content
+	case string(claims.PresentationFormatJSON):
+		var decoded any
+		if err := json.Unmarshal([]byte(content), &decoded); err == nil {
+			if pretty, err := json.MarshalIndent(decoded, "", "  "); err == nil {
+				content = string(pretty)
+			}
+		}
+		return fencedPresentationContent("json", content)
+	case string(claims.PresentationFormatDiff):
+		return fencedPresentationContent("diff", content)
+	default:
+		return escapeMarkdownPlainText(content)
+	}
+}
+
+func escapeMarkdownPlainText(content string) string {
+	var b strings.Builder
+	b.Grow(len(content))
+	for _, r := range content {
+		switch r {
+		case '\\', '`', '*', '_', '{', '}', '[', ']', '(', ')', '#', '+', '-', '.', '!':
+			b.WriteRune('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func fencedPresentationContent(language, content string) string {
+	content = strings.TrimSpace(content)
+	if strings.HasPrefix(content, "```") {
+		return content
+	}
+	return "```" + language + "\n" + content + "\n```"
+}
+
+func (m *Model) applyPresentationToActiveStream(ev msg.ClaimPresentationMsg, content string, state presentationDisplayState) bool {
+	correlationID, slot := m.presentationStreamSlot(ev)
+	if slot == nil || slot.accumulator == nil {
+		return false
+	}
+	placement := normalizePresentationPlacement(ev.Placement)
+	if placement == string(claims.PresentationPlacementPanelOnly) {
+		m.presentationSources[claimPresentationSourceKey(ev.SourceType, ev.SourceID)] = state
+		return true
+	}
+	idx := slot.accumulator.EntryIndex()
+	state.EntryIndex = idx
+	state.Embedded = true
+	state.EntryID = entryIDAt(m, idx)
+	state.CycleID = firstNonEmptyString(strings.TrimSpace(ev.CycleID), strings.TrimSpace(ev.ClaimID), correlationID)
+
+	if planID := presentationPlanID(ev); planID != "" {
+		offset, after := presentationStreamOffset(slot, placement, ev.ReplaceKey)
+		slot.planID = planID
+		slot.planMarkdown = content
+		slot.planOffset = offset
+		slot.planAfter = after
+		m.planID = planID
+	} else {
+		m.upsertStreamPresentation(slot, ev, content, placement)
+	}
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		attachPresentationSource(e, ev)
+	})
+	m.presentationSources[claimPresentationSourceKey(ev.SourceType, ev.SourceID)] = state
+	if state.ReplaceKey != "" {
+		m.presentationReplacements[state.ReplaceKey] = state
+	}
+	m.syncSlotToEntry(slot)
+	m.viewDirty = true
+	return true
+}
+
+func (m *Model) presentationStreamSlot(ev msg.ClaimPresentationMsg) (string, *streamSlot) {
+	candidates := []string{
+		strings.TrimSpace(ev.CycleID),
+		strings.TrimSpace(ev.ClaimID),
+		metadataString(ev.Metadata, "stream_correlation_id", "correlation_id"),
+	}
+	for _, id := range candidates {
+		if id == "" {
+			continue
+		}
+		if slot, ok := m.streams[id]; ok && slot != nil && slot.accumulator != nil {
+			return id, slot
+		}
+	}
+	for correlationID, slot := range m.streams {
+		if slot == nil || slot.accumulator == nil {
+			continue
+		}
+		entry := m.history.Get(slot.accumulator.EntryIndex())
+		for _, id := range candidates {
+			if id != "" && entryHasCorrelation(entry, id) {
+				return correlationID, slot
+			}
+		}
+	}
+	if len(m.streams) == 1 {
+		for correlationID, slot := range m.streams {
+			if slot == nil || slot.accumulator == nil {
+				continue
+			}
+			entry := m.history.Get(slot.accumulator.EntryIndex())
+			if presentationAgentMatches(entry, ev.AgentID) {
+				return correlationID, slot
+			}
+		}
+	}
+	return "", nil
+}
+
+func entryHasCorrelation(entry *ChatEntry, correlationID string) bool {
+	if entry == nil {
+		return false
+	}
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return false
+	}
+	if strings.TrimSpace(entry.CorrelationID) == correlationID {
+		return true
+	}
+	for _, alt := range entry.AdditionalCorrelationIDs {
+		if strings.TrimSpace(alt) == correlationID {
+			return true
+		}
+	}
+	return false
+}
+
+func presentationAgentMatches(entry *ChatEntry, agentID string) bool {
+	if entry == nil {
+		return false
+	}
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return true
+	}
+	return strings.TrimSpace(entry.AgentID) == agentID ||
+		strings.TrimSpace(entry.AgentType) == agentID ||
+		strings.HasPrefix(agentID, strings.TrimSpace(entry.AgentType))
+}
+
+func normalizePresentationPlacement(placement string) string {
+	placement = strings.TrimSpace(placement)
+	if placement == "" {
+		return string(claims.PresentationPlacementInline)
+	}
+	switch placement {
+	case string(claims.PresentationPlacementBeforeResponse),
+		string(claims.PresentationPlacementAfterResponse),
+		string(claims.PresentationPlacementInline),
+		string(claims.PresentationPlacementReplace),
+		string(claims.PresentationPlacementPanelOnly):
+		return placement
+	default:
+		return string(claims.PresentationPlacementInline)
+	}
+}
+
+func presentationStreamOffset(slot *streamSlot, placement, replaceKey string) (int, bool) {
+	if slot == nil || slot.accumulator == nil {
+		return 0, false
+	}
+	switch placement {
+	case string(claims.PresentationPlacementBeforeResponse):
+		return 0, false
+	case string(claims.PresentationPlacementAfterResponse):
+		return len(slot.accumulator.Content()), true
+	case string(claims.PresentationPlacementReplace):
+		if strings.TrimSpace(replaceKey) != "" {
+			for _, existing := range slot.presentations {
+				if strings.TrimSpace(existing.ReplaceKey) == strings.TrimSpace(replaceKey) {
+					return existing.Offset, existing.After
+				}
+			}
+		}
+		if slot.planMarkdown != "" {
+			return slot.planOffset, slot.planAfter
+		}
+		return 0, false
+	default:
+		return len(slot.accumulator.Content()), false
+	}
+}
+
+func (m *Model) upsertStreamPresentation(slot *streamSlot, ev msg.ClaimPresentationMsg, content, placement string) {
+	replaceKey := strings.TrimSpace(ev.ReplaceKey)
+	offset, after := presentationStreamOffset(slot, placement, replaceKey)
+	if replaceKey != "" {
+		for i := range slot.presentations {
+			if strings.TrimSpace(slot.presentations[i].ReplaceKey) == replaceKey {
+				slot.presentations[i].SourceType = strings.TrimSpace(ev.SourceType)
+				slot.presentations[i].SourceID = strings.TrimSpace(ev.SourceID)
+				slot.presentations[i].TestamentID = strings.TrimSpace(ev.TestamentID)
+				slot.presentations[i].Format = strings.TrimSpace(ev.Format)
+				slot.presentations[i].Content = content
+				slot.presentations[i].Offset = offset
+				slot.presentations[i].After = after
+				slot.presentations[i].Sequence = ev.Sequence
+				return
+			}
+		}
+	}
+	m.presentationOrder++
+	slot.presentations = append(slot.presentations, streamPresentation{
+		SourceType:  strings.TrimSpace(ev.SourceType),
+		SourceID:    strings.TrimSpace(ev.SourceID),
+		TestamentID: strings.TrimSpace(ev.TestamentID),
+		ReplaceKey:  replaceKey,
+		Format:      strings.TrimSpace(ev.Format),
+		Content:     content,
+		Offset:      offset,
+		After:       after,
+		Order:       m.presentationOrder,
+		Sequence:    ev.Sequence,
+	})
+}
+
+func (m *Model) applyPresentationToCycleEntry(ev msg.ClaimPresentationMsg, content string, state presentationDisplayState) bool {
+	cycleID := firstNonEmptyString(strings.TrimSpace(ev.CycleID), strings.TrimSpace(ev.ClaimID))
+	if cycleID == "" {
+		return false
+	}
+	idx := m.historyIndexForCorrelation(cycleID)
+	if idx < 0 {
+		return false
+	}
+	placement := normalizePresentationPlacement(ev.Placement)
+	if placement == string(claims.PresentationPlacementPanelOnly) {
+		m.presentationSources[claimPresentationSourceKey(ev.SourceType, ev.SourceID)] = state
+		return true
+	}
+	if placement == string(claims.PresentationPlacementInline) {
+		return false
+	}
+	state.EntryIndex = idx
+	state.EntryID = entryIDAt(m, idx)
+	state.Embedded = true
+	state.CycleID = cycleID
+	m.upsertCyclePresentation(cycleID, ev, content, placement)
+	base := m.cycleResponseContent[cycleID]
+	if strings.TrimSpace(base) == "" {
+		if entry := m.history.Get(idx); entry != nil && len(m.cyclePresentations[cycleID]) == 1 {
+			base = entry.Content
+		}
+	}
+	composed := composeCyclePresentationContent(base, m.cyclePresentations[cycleID])
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		e.Content = composed
+		attachPresentationSource(e, ev)
+		invalidateChatEntryRender(e)
+	})
+	m.presentationSources[claimPresentationSourceKey(ev.SourceType, ev.SourceID)] = state
+	if state.ReplaceKey != "" {
+		m.presentationReplacements[state.ReplaceKey] = state
+	}
+	m.viewDirty = true
+	return true
+}
+
+func (m *Model) upsertCyclePresentation(cycleID string, ev msg.ClaimPresentationMsg, content, placement string) {
+	replaceKey := strings.TrimSpace(ev.ReplaceKey)
+	blocks := m.cyclePresentations[cycleID]
+	if replaceKey != "" {
+		for i := range blocks {
+			if strings.TrimSpace(blocks[i].ReplaceKey) == replaceKey {
+				blocks[i].SourceType = strings.TrimSpace(ev.SourceType)
+				blocks[i].SourceID = strings.TrimSpace(ev.SourceID)
+				blocks[i].TestamentID = strings.TrimSpace(ev.TestamentID)
+				blocks[i].Format = strings.TrimSpace(ev.Format)
+				blocks[i].Content = content
+				blocks[i].Placement = placement
+				blocks[i].Sequence = ev.Sequence
+				m.cyclePresentations[cycleID] = blocks
+				return
+			}
+		}
+	}
+	m.presentationOrder++
+	blocks = append(blocks, cyclePresentationBlock{
+		SourceType:  strings.TrimSpace(ev.SourceType),
+		SourceID:    strings.TrimSpace(ev.SourceID),
+		TestamentID: strings.TrimSpace(ev.TestamentID),
+		ReplaceKey:  replaceKey,
+		Format:      strings.TrimSpace(ev.Format),
+		Content:     content,
+		Placement:   placement,
+		Order:       m.presentationOrder,
+		Sequence:    ev.Sequence,
+	})
+	m.cyclePresentations[cycleID] = blocks
+}
+
+func composeCyclePresentationContent(base string, blocks []cyclePresentationBlock) string {
+	if len(blocks) == 0 {
+		return base
+	}
+	before := make([]cyclePresentationBlock, 0, len(blocks))
+	after := make([]cyclePresentationBlock, 0, len(blocks))
+	for _, block := range blocks {
+		switch block.Placement {
+		case string(claims.PresentationPlacementAfterResponse):
+			after = append(after, block)
+		default:
+			before = append(before, block)
+		}
+	}
+	sort.SliceStable(before, func(i, j int) bool { return before[i].Order < before[j].Order })
+	sort.SliceStable(after, func(i, j int) bool { return after[i].Order < after[j].Order })
+	var b strings.Builder
+	for _, block := range before {
+		if strings.TrimSpace(block.Content) == "" {
+			continue
+		}
+		writePresentationSpacing(&b)
+		b.WriteString(block.Content)
+	}
+	if strings.TrimSpace(base) != "" {
+		writePresentationSpacing(&b)
+		b.WriteString(strings.TrimSpace(base))
+	}
+	for _, block := range after {
+		if strings.TrimSpace(block.Content) == "" {
+			continue
+		}
+		writePresentationSpacing(&b)
+		b.WriteString(block.Content)
+	}
+	return b.String()
+}
+
+func (m *Model) applyStandalonePresentation(ev msg.ClaimPresentationMsg, content string, state presentationDisplayState) {
+	entryID := "presentation-" + strings.TrimSpace(ev.SourceType) + "-" + strings.TrimSpace(ev.SourceID)
+	if strings.TrimSpace(ev.ReplaceKey) != "" {
+		entryID = "presentation-" + strings.TrimSpace(ev.ReplaceKey)
+		if prior, ok := m.presentationReplacements[strings.TrimSpace(ev.ReplaceKey)]; ok {
+			matched := false
+			m.history.UpdateAt(prior.EntryIndex, func(e *ChatEntry) {
+				if e.ID != prior.EntryID {
+					return
+				}
+				matched = true
+				e.ID = entryID
+				e.Content = content
+				e.Timestamp = nonZeroChatTime(ev.CreatedAt)
+				e.CorrelationID = firstNonEmptyString(strings.TrimSpace(ev.CycleID), strings.TrimSpace(ev.ClaimID), e.CorrelationID)
+				e.AgentID = firstNonEmptyString(strings.TrimSpace(ev.AgentID), e.AgentID)
+				e.AgentType = firstNonEmptyString(strings.TrimSpace(ev.AgentID), e.AgentType)
+				e.SessionID = firstNonEmptyString(strings.TrimSpace(ev.SessionID), e.SessionID)
+				attachPresentationSource(e, ev)
+				invalidateChatEntryRender(e)
+			})
+			if matched {
+				state.EntryID = entryID
+				state.EntryIndex = prior.EntryIndex
+				m.presentationSources[claimPresentationSourceKey(ev.SourceType, ev.SourceID)] = state
+				m.presentationReplacements[strings.TrimSpace(ev.ReplaceKey)] = state
+				m.viewDirty = true
+				return
+			}
+		}
+	}
+	entry := &ChatEntry{
+		ID:            entryID,
+		Timestamp:     nonZeroChatTime(ev.CreatedAt),
+		CorrelationID: firstNonEmptyString(strings.TrimSpace(ev.CycleID), strings.TrimSpace(ev.ClaimID)),
+		Source:        SourceAgent,
+		AgentType:     firstNonEmptyString(strings.TrimSpace(ev.AgentID), "agent"),
+		AgentID:       strings.TrimSpace(ev.AgentID),
+		SessionID:     strings.TrimSpace(ev.SessionID),
+		Content:       content,
+		Height:        -1,
+	}
+	attachPresentationSource(entry, ev)
+	m.PushEntry(entry)
+	state.EntryID = entry.ID
+	state.EntryIndex = m.history.Len() - 1
+	m.presentationSources[claimPresentationSourceKey(ev.SourceType, ev.SourceID)] = state
+	if state.ReplaceKey != "" {
+		m.presentationReplacements[state.ReplaceKey] = state
+	}
+}
+
+func attachPresentationSource(e *ChatEntry, ev msg.ClaimPresentationMsg) {
+	if e == nil {
+		return
+	}
+	ref := PresentationSourceRef{
+		SourceType:  strings.TrimSpace(ev.SourceType),
+		SourceID:    strings.TrimSpace(ev.SourceID),
+		TestamentID: strings.TrimSpace(ev.TestamentID),
+		ReplaceKey:  strings.TrimSpace(ev.ReplaceKey),
+		Format:      strings.TrimSpace(ev.Format),
+		Sequence:    ev.Sequence,
+	}
+	e.PresentationSourceType = ref.SourceType
+	e.PresentationSourceID = ref.SourceID
+	e.PresentationTestamentID = ref.TestamentID
+	e.PresentationReplaceKey = ref.ReplaceKey
+	e.PresentationFormat = ref.Format
+	e.PresentationSequence = ref.Sequence
+	for i := range e.PresentationSources {
+		if e.PresentationSources[i].SourceType == ref.SourceType && e.PresentationSources[i].SourceID == ref.SourceID {
+			e.PresentationSources[i] = ref
+			return
+		}
+	}
+	e.PresentationSources = append(e.PresentationSources, ref)
+}
+
+func entryIDAt(m *Model, idx int) string {
+	if m == nil || idx < 0 {
+		return ""
+	}
+	if entry := m.history.Get(idx); entry != nil {
+		return entry.ID
+	}
+	return ""
+}
+
+func metadataString(metadata map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if metadata == nil {
+			return ""
+		}
+		switch value := metadata[key].(type) {
+		case string:
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		case fmt.Stringer:
+			if trimmed := strings.TrimSpace(value.String()); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
+func presentationPlanID(ev msg.ClaimPresentationMsg) string {
+	if planID := metadataString(ev.Metadata, "plan_id"); planID != "" {
+		return planID
+	}
+	replaceKey := strings.TrimSpace(ev.ReplaceKey)
+	if strings.HasPrefix(replaceKey, "plan:") {
+		rest := strings.TrimPrefix(replaceKey, "plan:")
+		if idx := strings.Index(rest, ":"); idx > 0 {
+			return strings.TrimSpace(rest[:idx])
+		}
+	}
+	return ""
+}
+
 // handleClaimArtifactAdded materializes a ClaimArtifactAddedMsg
 // directly into the claims-native row index AND projects it into the
 // chat history as a ToolCallRecord on the cycle's ChatEntry (creating
@@ -6098,6 +6759,10 @@ func (m *Model) handleClaimResponseText(ev msg.ClaimResponseTextMsg) tea.Cmd {
 	idx := m.historyIndexForCorrelation(cycleID)
 	if idx < 0 {
 		return nil
+	}
+	m.cycleResponseContent[cycleID] = content
+	if blocks := m.cyclePresentations[cycleID]; len(blocks) > 0 {
+		content = composeCyclePresentationContent(content, blocks)
 	}
 	m.history.UpdateAt(idx, func(e *ChatEntry) {
 		e.Content = content

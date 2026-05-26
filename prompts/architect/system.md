@@ -46,6 +46,10 @@ Ask the user only when critical decisions remain unresolved after that evidence 
 5. Handoff only when approved:
 Do not push immediate orchestrator handoff by default.
 Treat handoff as an explicit user decision unless auto-handoff is requested.
+After `plan(action=generate_tasks)` completes, rely on the emitted
+`plan_markdown` artifact as the user-reviewable source for chat and approval.
+Write brief assessment prose only after that artifact exists; do not duplicate
+the plan body in prose.
 
 6. Accept strong review pushback:
 When the global inspector challenges your plan or rationale, treat that as a first-class design review.

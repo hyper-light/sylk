@@ -45,10 +45,12 @@ func TestPlanApprovalGate_PublishesProposalToTUI(t *testing.T) {
 	defer cancel()
 
 	req := &planApprovalRequest{
-		PlanID:    "plan-test-123",
-		SessionID: "ses-test",
-		PlanName:  "Build hello CLI",
-		PlanText:  "1. Project config\n2. Package init\n3. CLI logic",
+		PlanID:                 "plan-test-123",
+		SessionID:              "ses-test",
+		PlanName:               "Build hello CLI",
+		PlanText:               "1. Project config\n2. Package init\n3. CLI logic",
+		PlanArtifactID:         "artifact-plan-md",
+		PlanArtifactReplaceKey: "plan:plan-test-123:review",
 	}
 
 	resultCh := make(chan struct{}, 1)
@@ -73,6 +75,12 @@ func TestPlanApprovalGate_PublishesProposalToTUI(t *testing.T) {
 		}
 		if proposal.PlanText != req.PlanText {
 			t.Fatalf("proposal.PlanText mismatch")
+		}
+		if proposal.PlanArtifactID != req.PlanArtifactID {
+			t.Fatalf("proposal.PlanArtifactID = %q, want %q", proposal.PlanArtifactID, req.PlanArtifactID)
+		}
+		if proposal.PlanArtifactReplaceKey != req.PlanArtifactReplaceKey {
+			t.Fatalf("proposal.PlanArtifactReplaceKey = %q, want %q", proposal.PlanArtifactReplaceKey, req.PlanArtifactReplaceKey)
 		}
 		if proposal.CorrelationID == "" {
 			t.Fatal("proposal.CorrelationID must be set so the dialog response can route back")

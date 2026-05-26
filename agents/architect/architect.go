@@ -1844,7 +1844,7 @@ func (a *Architect) handlePlanFeedback(ctx context.Context, fwd *guide.Forwarded
 		return &ConversationResult{
 			Response:  "I couldn't process your feedback right now. Could you rephrase?",
 			Intent:    IntentConverse,
-			Directive: a.feedbackReadyDirective(plan),
+			Directive: a.feedbackReadyDirectiveWithContext(ctx, plan),
 		}, nil
 	}
 
@@ -1874,12 +1874,12 @@ func (a *Architect) handlePlanFeedback(ctx context.Context, fwd *guide.Forwarded
 	architectDebugLog().Info("handoff: RETURNING_CONVERSATION_RESULT",
 		"plan_id", plan.ID,
 		"plan_state", planStateAfter,
-		"has_directive", a.feedbackReadyDirective(plan) != nil)
+		"has_directive", plan.ReadyDirective() != nil)
 
 	return &ConversationResult{
 		Response:  response,
 		Intent:    IntentConverse,
-		Directive: a.feedbackReadyDirective(plan),
+		Directive: a.feedbackReadyDirectiveWithContext(ctx, plan),
 	}, nil
 }
 
@@ -1950,15 +1950,46 @@ var approvalDisqualifiers = []string{
 // forget so even if Guardian is momentarily unreachable we still return the
 // directive to keep the conversation flowing.
 func (a *Architect) feedbackReadyDirective(plan *DesignPlan) *guide.ResponseDirective {
+	return a.feedbackReadyDirectiveWithContext(context.Background(), plan)
+}
+
+func (a *Architect) feedbackReadyDirectiveWithContext(ctx context.Context, plan *DesignPlan) *guide.ResponseDirective {
 	if plan == nil {
 		return nil
 	}
+	// Preserve request metadata (notably the original correlation ID)
+	// without tying artifact/dialog publication to a cancelled request
+	// context; Guardian owns the approval timeout.
+	if ctx == nil {
+		ctx = context.Background()
+	} else {
+		ctx = context.WithoutCancel(ctx)
+	}
+	if !planHasCurrentMarkdownArtifact(plan) {
+		if err := a.ensurePlanMarkdownArtifact(ctx, plan); err != nil {
+			a.logWarn("feedbackReadyDirective: review artifact unavailable",
+				"plan_id", plan.ID,
+				"error", err.Error())
+			return nil
+		}
+	}
 	directive := plan.ReadyDirective()
 	if directive != nil {
-		// Best-effort dialog publish. Uses background context so a
-		// cancelled request doesn't strand the dialog; the dialog has
-		// its own 10-minute Guardian-side timeout.
-		a.presentPlanApprovalDialogBestEffort(context.Background(), plan)
+		// Best-effort dialog publish. The directive remains useful as a
+		// typed-text fallback if the dialog transport is unavailable.
+		if directive.Metadata == nil {
+			directive.Metadata = map[string]any{}
+		}
+		if strings.TrimSpace(plan.PlanMarkdownArtifactID) != "" {
+			directive.Metadata["plan_artifact_id"] = strings.TrimSpace(plan.PlanMarkdownArtifactID)
+		}
+		if strings.TrimSpace(plan.PlanMarkdownReplaceKey) != "" {
+			directive.Metadata["plan_artifact_replace_key"] = strings.TrimSpace(plan.PlanMarkdownReplaceKey)
+		}
+		if strings.TrimSpace(plan.PlanMarkdownContentHash) != "" {
+			directive.Metadata["plan_artifact_content_hash"] = strings.TrimSpace(plan.PlanMarkdownContentHash)
+		}
+		a.presentPlanApprovalDialogBestEffort(ctx, plan)
 	}
 	return directive
 }
@@ -2031,7 +2062,7 @@ func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedReque
 			return &ConversationResult{
 				Response:  "The plan has been updated since you last reviewed it. Please review the updated plan and approve again.",
 				Intent:    IntentConverse,
-				Directive: plan.ReadyDirective(),
+				Directive: a.feedbackReadyDirectiveWithContext(ctx, plan),
 			}, nil
 		}
 	}
@@ -2931,6 +2962,10 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 		a.logInfo("executeConversation: LLM compose succeeded",
 			"response_len", len(response))
 
+		if plan := a.latestReadyPlan(req.SessionID); plan != nil {
+			response = a.guardPlanReviewResponse(ctx, response, plan)
+		}
+
 		// Conversation response testament.
 		a.architectSubmitTestament(ctx, a.architectTestamentWithSubject(
 			"Architect responded: intent="+string(req.Intent),
@@ -2957,20 +2992,24 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 		// users who type a response in chat instead of clicking the
 		// dialog still get classified routing.
 		if plan := a.latestReadyPlan(req.SessionID); plan != nil {
-			result.Directive = a.feedbackReadyDirective(plan)
-			architectDebugLog().Info("executeConversation: DIRECTIVE_SET",
-				"plan_id", plan.ID,
-				"session_id", req.SessionID,
-				"phase", string(result.Directive.Phase))
-			a.presentPlanApprovalDialogBestEffort(ctx, plan)
+			if directive := a.feedbackReadyDirectiveWithContext(ctx, plan); directive != nil {
+				result.Directive = directive
+				architectDebugLog().Info("executeConversation: DIRECTIVE_SET",
+					"plan_id", plan.ID,
+					"session_id", req.SessionID,
+					"phase", string(directive.Phase))
+			} else {
+				architectDebugLog().Warn("executeConversation: DIRECTIVE_SKIPPED_REVIEW_ARTIFACT_UNAVAILABLE",
+					"plan_id", plan.ID,
+					"session_id", req.SessionID)
+			}
 		} else if stalled := a.latestStalledPlanForRequest(req.SessionID, requestCorrelationID); stalled != nil {
 			// The tool loop started a plan (via start_planning) but
 			// couldn't complete it — e.g. API overloaded mid-protocol.
 			// Recover via deterministic protocol so the plan reaches Ready.
 			a.recoverStalledPlan(ctx, stalled)
 			if plan := a.latestReadyPlan(req.SessionID); plan != nil {
-				result.Directive = a.feedbackReadyDirective(plan)
-				a.presentPlanApprovalDialogBestEffort(ctx, plan)
+				result.Directive = a.feedbackReadyDirectiveWithContext(ctx, plan)
 			}
 		} else {
 			architectDebugLog().Info("executeConversation: NO_READY_PLAN",
@@ -2994,7 +3033,7 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 		return &ConversationResult{
 			Response:  userResp,
 			Intent:    req.Intent,
-			Directive: a.feedbackReadyDirective(plan),
+			Directive: a.feedbackReadyDirectiveWithContext(ctx, plan),
 		}, nil
 	}
 	// Check for stalled plans before falling back to conversationFallback.
@@ -3005,7 +3044,7 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 			return &ConversationResult{
 				Response:  userResp,
 				Intent:    req.Intent,
-				Directive: a.feedbackReadyDirective(plan),
+				Directive: a.feedbackReadyDirectiveWithContext(ctx, plan),
 			}, nil
 		}
 	}

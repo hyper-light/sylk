@@ -691,15 +691,6 @@ func stringFromAny(value any) string {
 	}
 }
 
-func firstNonEmptyString(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
-}
-
 func truncatePlannerEvidenceString(value string, max int) string {
 	value = strings.TrimSpace(value)
 	if max <= 0 || len(value) <= max {

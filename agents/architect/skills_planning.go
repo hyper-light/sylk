@@ -800,9 +800,16 @@ func (a *Architect) applyPlanRevision(plan *DesignPlan, reason string, updates m
 	current.UpdatedAt = time.Now()
 	current.RiskSummary = append(current.RiskSummary, reason)
 	applyPlanUpdateFields(current, updates)
+	current.GuardianAttestation = nil
+	current.HandoffPayloadArtifactID = ""
 	a.syncPlanModePlanFile(current.SessionID, priorPlanFile, nextPlanFile)
 	if err := a.planStore.Upsert(current); err != nil {
 		a.logger.Warn("failed to persist revised plan snapshot", "plan_id", current.ID, "error", err)
+	}
+	if current.SM().State() == PlanStatusReady {
+		if err := a.publishPreparedHandoff(context.Background(), current); err != nil {
+			a.logger.Warn("failed to publish revised plan review artifact", "plan_id", current.ID, "error", err)
+		}
 	}
 
 	// Plan revision testament.
@@ -1927,8 +1934,8 @@ func startPlanningProtocolInstructions(autoApprove bool) string {
 		"Use ask_user_clarification only for one or two narrow decisions. If the blocker is codebase or history evidence, " +
 		"consult_peer the Librarian or Archivalist instead. If the blocker is architectural quality, correctness, performance, testing, infrastructure, deployment, or tradeoffs, consult_peer the Academic instead of guessing.\n" +
 		"4. plan(action=design, plan_id=<plan_id>)\n" +
-		"5. plan(action=generate_tasks, plan_id=<plan_id>) — auto-creates workflow and validates.\n" +
-		"6. The system renders the plan structure separately in the UI — the user already sees it.\n" +
+		"5. plan(action=generate_tasks, plan_id=<plan_id>) — auto-creates workflow, validates, and emits the user-reviewable plan_markdown artifact.\n" +
+		"6. Once that artifact is available, the UI renders the plan structure separately for chat and approval review.\n" +
 		"   Do NOT repeat, re-render, or include plan structure, tasks, criteria, or guides in your text.\n" +
 		"   Write ONLY a brief assessment — highlight the key tradeoff and risk."
 

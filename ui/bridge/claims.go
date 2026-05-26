@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -631,12 +632,12 @@ func (b *ClaimsBridge) handleTestamentSubmitted(sessionID string, t *claims.Test
 	}
 	claimID := claims.ClaimIDFromRelations(t.Relations)
 	b.ensureClaimRegisteredFromProjection(sessionID, claimID)
+	if m := b.claimPresentationMsgForTestament(sessionID, claimID, t); m != nil {
+		b.enqueue(*m)
+	}
 	for i := range t.Artifacts {
 		art := t.Artifacts[i]
 		b.OnArtifactAdded(claimID, t.AgentID, sessionID, art)
-	}
-	if m := b.claimPresentationMsgForTestament(sessionID, claimID, t); m != nil {
-		b.enqueue(*m)
 	}
 	if m := b.claimTestamentResponseMsg(sessionID, claimID, t); m != nil {
 		b.enqueue(*m)
@@ -1327,11 +1328,22 @@ func (b *ClaimsBridge) replayProjection(sessionID string, proj *claims.ClaimsBoa
 		}
 	}
 	completed := completedStartedArtifactsInProjection(proj)
-	for i := range proj.Testaments {
-		t := &proj.Testaments[i]
+	testaments := testamentsBySequence(proj.Testaments)
+	for _, t := range testaments {
+		if m := b.claimPresentationMsgForTestament(sessionID, claims.ClaimIDFromRelations(t.Relations), t); m != nil {
+			b.enqueue(*m)
+		}
+		if strings.TrimSpace(t.Context) != "" {
+			b.handleTestamentContext(sessionID, testamentContextEvent{
+				ClaimID:           claims.ClaimIDFromRelations(t.Relations),
+				TestamentID:       t.ID,
+				AgentID:           t.AgentID,
+				Context:           t.Context,
+				ContextTransition: t.ContextTransition,
+			})
+		}
 		claimID := claims.ClaimIDFromRelations(t.Relations)
-		for j := range t.Artifacts {
-			art := t.Artifacts[j]
+		for _, art := range artifactsBySequence(t.Artifacts) {
 			if art == nil {
 				continue
 			}
@@ -1348,21 +1360,34 @@ func (b *ClaimsBridge) replayProjection(sessionID string, proj *claims.ClaimsBoa
 			b.OnArtifactAdded(claimID, t.AgentID, sessionID, art)
 		}
 	}
-	for i := range proj.Testaments {
-		t := &proj.Testaments[i]
-		if m := b.claimPresentationMsgForTestament(sessionID, claims.ClaimIDFromRelations(t.Relations), t); m != nil {
-			b.enqueue(*m)
-		}
-		if strings.TrimSpace(t.Context) != "" {
-			b.handleTestamentContext(sessionID, testamentContextEvent{
-				ClaimID:           claims.ClaimIDFromRelations(t.Relations),
-				TestamentID:       t.ID,
-				AgentID:           t.AgentID,
-				Context:           t.Context,
-				ContextTransition: t.ContextTransition,
-			})
-		}
+}
+
+func testamentsBySequence(in []claims.Testament) []*claims.Testament {
+	out := make([]*claims.Testament, 0, len(in))
+	for i := range in {
+		out = append(out, &in[i])
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Sequence != out[j].Sequence {
+			return out[i].Sequence < out[j].Sequence
+		}
+		return strings.TrimSpace(out[i].ID) < strings.TrimSpace(out[j].ID)
+	})
+	return out
+}
+
+func artifactsBySequence(in []*claims.Artifact) []*claims.Artifact {
+	out := append([]*claims.Artifact(nil), in...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i] == nil || out[j] == nil {
+			return out[j] != nil
+		}
+		if out[i].Sequence != out[j].Sequence {
+			return out[i].Sequence < out[j].Sequence
+		}
+		return strings.TrimSpace(out[i].ID) < strings.TrimSpace(out[j].ID)
+	})
+	return out
 }
 
 func completedStartedArtifactsInProjection(proj *claims.ClaimsBoardProjection) map[string]struct{} {

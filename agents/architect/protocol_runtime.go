@@ -516,9 +516,10 @@ const protocolPhaseInstructions = `You drive the planning protocol by invoking s
    If requirements are clear, proceed to Design.
 4. **Design**: Invoke plan with action=design and plan_id.
 5. **Generate**: Invoke plan with action=generate_tasks and plan_id.
-   This automatically creates the workflow and validates the plan.
-6. **Present and ask for approval**: The system renders the structured plan separately
-   in the UI — the user already sees it. Do NOT repeat, re-render, or include the plan
+   This automatically creates the workflow, validates the plan, and emits the
+   user-reviewable plan_markdown artifact.
+6. **Present and ask for approval**: Once that artifact is available, the UI renders
+   the structured plan separately for chat and approval review. Do NOT repeat, re-render, or include the plan
    structure, task list, acceptance criteria, file lists, or implementation guides in
    your text. Write ONLY a brief assessment (2-4 sentences): highlight the key
    architectural tradeoff, the primary risk, and why this decomposition is a good default.

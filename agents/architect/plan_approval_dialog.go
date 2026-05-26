@@ -9,12 +9,12 @@
 //
 //   - Approve → existing actOnAccept → dispatchPlanExecution
 //   - Modify  → publish "what would you like changed?" stream message
-//               and clear the pending continuation. The user's next
-//               normal-routed message goes through architect's planning
-//               intent and triggers a fresh plan revision.
+//     and clear the pending continuation. The user's next
+//     normal-routed message goes through architect's planning
+//     intent and triggers a fresh plan revision.
 //   - Reject  → publish "what would you like to do instead?" stream
-//               message and clear the pending continuation. The user's
-//               next message can take the conversation in any direction.
+//     message and clear the pending continuation. The user's
+//     next message can take the conversation in any direction.
 //
 // This replaces the prior "free-form text → Guide classifier → verdict"
 // pipeline for the primary acceptance path. The dialog is the canonical
@@ -44,15 +44,17 @@ const planApprovalGateSkillName = "plan_approval_gate"
 // here as a separate type to avoid a guardian import cycle; the Guardian
 // skill unmarshals into its own type from the same JSON shape.
 type planApprovalGateRequest struct {
-	PlanID                string                     `json:"plan_id"`
-	SessionID             string                     `json:"session_id,omitempty"`
-	PlanName              string                     `json:"plan_name,omitempty"`
-	PlanSummary           string                     `json:"plan_summary,omitempty"`
-	PlanText              string                     `json:"plan_text"`
-	FreshnessSummary      string                     `json:"freshness_summary,omitempty"`
-	DriftSignals          []planapproval.DriftSignal `json:"drift_signals,omitempty"`
-	OrchestratorStateHint string                     `json:"orchestrator_state_hint,omitempty"`
-	Metadata              map[string]any             `json:"metadata,omitempty"`
+	PlanID                 string                     `json:"plan_id"`
+	SessionID              string                     `json:"session_id,omitempty"`
+	PlanName               string                     `json:"plan_name,omitempty"`
+	PlanSummary            string                     `json:"plan_summary,omitempty"`
+	PlanText               string                     `json:"plan_text"`
+	PlanArtifactID         string                     `json:"plan_artifact_id,omitempty"`
+	PlanArtifactReplaceKey string                     `json:"plan_artifact_replace_key,omitempty"`
+	FreshnessSummary       string                     `json:"freshness_summary,omitempty"`
+	DriftSignals           []planapproval.DriftSignal `json:"drift_signals,omitempty"`
+	OrchestratorStateHint  string                     `json:"orchestrator_state_hint,omitempty"`
+	Metadata               map[string]any             `json:"metadata,omitempty"`
 }
 
 // planApprovalGateResult mirrors guardian.planApprovalResult.
@@ -115,13 +117,30 @@ func (a *Architect) requestPlanApprovalDialog(ctx context.Context, plan *DesignP
 	if strings.TrimSpace(guardianID) == "" {
 		return fmt.Errorf("no registered guardian to gate plan approval")
 	}
+	if err := a.ensurePlanMarkdownArtifact(ctx, plan); err != nil {
+		return fmt.Errorf("plan review artifact unavailable: %w", err)
+	}
+	planText := strings.TrimSpace(formatPlanForChat(plan))
+	if planText == "" {
+		return fmt.Errorf("plan %s has no reviewable markdown", plan.ID)
+	}
 
 	req := planApprovalGateRequest{
-		PlanID:      plan.ID,
-		SessionID:   strings.TrimSpace(plan.SessionID),
-		PlanName:    derivePlanName(plan),
-		PlanSummary: planAcceptanceSummary(plan),
-		PlanText:    formatPlanForChat(plan),
+		PlanID:                 plan.ID,
+		SessionID:              strings.TrimSpace(plan.SessionID),
+		PlanName:               derivePlanName(plan),
+		PlanSummary:            planAcceptanceSummary(plan),
+		PlanText:               planText,
+		PlanArtifactID:         strings.TrimSpace(plan.PlanMarkdownArtifactID),
+		PlanArtifactReplaceKey: strings.TrimSpace(plan.PlanMarkdownReplaceKey),
+		Metadata: map[string]any{
+			"plan_id":                    plan.ID,
+			"epoch":                      planMarkdownArtifactEpoch(plan),
+			"plan_artifact_id":           strings.TrimSpace(plan.PlanMarkdownArtifactID),
+			"plan_artifact_replace_key":  strings.TrimSpace(plan.PlanMarkdownReplaceKey),
+			"plan_artifact_content_hash": strings.TrimSpace(plan.PlanMarkdownContentHash),
+			"task_count":                 len(plan.Tasks),
+		},
 	}
 	// Reuse the audit cached by the conversation enrichment path
 	// (preparePlanPresentationAudit). The dialog publish runs AFTER

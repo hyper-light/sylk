@@ -9,7 +9,7 @@ import (
 // when a plan is ready but the LLM compose step failed (e.g. context cancelled).
 func fallbackReadyUserResponse(_ *Requirements, plan *DesignPlan) string {
 	if plan == nil || len(plan.Tasks) == 0 {
-		return "I've prepared a plan, but couldn't generate a summary. Please review the plan details above."
+		return planReviewArtifactUnavailableResponse(plan)
 	}
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("I've prepared a plan with %d tasks", len(plan.Tasks)))
@@ -17,8 +17,11 @@ func fallbackReadyUserResponse(_ *Requirements, plan *DesignPlan) string {
 	if layers > 1 {
 		b.WriteString(fmt.Sprintf(" across %d execution layers", layers))
 	}
-	b.WriteString(".\n\n")
-	b.WriteString(formatPlanForChat(plan))
+	if planHasCurrentMarkdownArtifact(plan) {
+		b.WriteString(". The review artifact is available in the transcript for approval or changes.")
+	} else {
+		b.WriteString(", but I could not publish the review artifact yet, so I cannot ask you to approve it until that is fixed.")
+	}
 	return b.String()
 }
 

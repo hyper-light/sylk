@@ -93,7 +93,7 @@ func TestArchitectConversationPrompt_UsesContinuousTargetedConsultation(t *testi
 	for _, want := range []string{
 		"start by consulting the most relevant knowledge agent with the narrowest question that can materially reduce the next uncertainty.",
 		"Continue consulting as the conversation unfolds whenever the user adds material new information, constraints, preferences, scope changes, or technical direction.",
-		"Prefer repeated targeted consults over one broad consult that tries to answer the whole problem at once.",
+		"Prefer targeted consults over one broad consult, but do not repeat a fresh target/query unless new information creates a material gap.",
 		"Re-evaluate Academic research depth as the conversation sharpens.",
 		"Prefer consulting the knowledge agents over asking the user questions that you can resolve from codebase reality, historical precedent, or stronger architectural research.",
 	} {
@@ -107,7 +107,7 @@ func TestPlannerConversationModeConverse_InsistsOnDiscussionTimeConsultation(t *
 	text := compactPromptWhitespace(plannerConversationModeInstructions(plannerConversationModeConverse))
 	for _, want := range []string{
 		"start with the most relevant knowledge agent and the narrowest question that can materially reduce the next uncertainty.",
-		"Prefer repeated targeted consult_peer calls over one broad omnibus consult.",
+		"Prefer targeted consult_peer calls over one broad omnibus consult, but do not repeat a fresh target/query unless new information creates a material gap.",
 		"Re-evaluate Academic depth as the user's constraints evolve and your own understanding improves:",
 		"invoke recall_recent before claiming the earlier discussion is unavailable",
 		"recent_context_summary or recent_context_focus are present",
@@ -232,7 +232,8 @@ func TestPlannerConversationModeConverse_ToolSurfaceMatchesProtocolInstructions(
 	// start_planning → plan(action=start).
 	text := compactPromptWhitespace(plannerConversationModeInstructions(plannerConversationModeConverse))
 	for _, want := range []string{
-		"invoke plan(action=analyze), then any further consult_peer calls needed for pre-planning evidence, then plan(action=design), then plan(action=generate_tasks)",
+		"invoke plan(action=analyze), review attached evidence, make consult_peer calls only for concrete missing/stale/contradicted gaps, then plan(action=design), then plan(action=generate_tasks)",
+		"emits the user-reviewable plan_markdown artifact",
 		"Do NOT invoke plan_acceptance — wait for the user's next message.",
 		"Frame it as plan review, not execution kickoff.",
 		"Avoid phrases like \"kick it off\", \"start building\", \"start implementing\", \"get started\", or \"ship it\".",
@@ -257,6 +258,7 @@ func TestPlannerConversationModeConverse_ToolSurfaceMatchesProtocolInstructions(
 func TestGenerateTasksNextAction_UsesPlanReviewNotExecutionKickoff(t *testing.T) {
 	text := compactPromptWhitespace(generateTasksNextAction(false))
 	for _, want := range []string{
+		"persisted the user-reviewable plan_markdown artifact before this final text.",
 		"Frame it as plan review, not execution kickoff.",
 		"Avoid phrases like \"kick it off\", \"start building\", \"start implementing\", \"get started\", or \"ship it\".",
 		"Do NOT invoke plan_acceptance — wait for the user's response.",

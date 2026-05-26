@@ -710,6 +710,9 @@ func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInpu
 	if err := a.advancePlan(ctx, plan, PlanStatusReady, nil); err != nil {
 		return nil, err
 	}
+	if err := a.publishPreparedHandoff(ctx, plan); err != nil {
+		return nil, fmt.Errorf("publish ready plan artifacts: %w", err)
+	}
 	if lm := a.planStore.LeaseManager(); lm != nil {
 		lm.GrantReadyLease(plan)
 	}
@@ -723,7 +726,6 @@ func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInpu
 	// with the user's review time. On approve, the only remaining work
 	// is scheduler.Submit. Fire-and-forget; failures degrade to legacy
 	// single-phase ingest at approval time.
-	a.publishPreparedHandoff(ctx, plan)
 	// Phase 4 refactor: emit plan_ratified so pipeline agents see the
 	// ratified plan in ambient context. Individual tasks are projected
 	// via the existing DAG dispatch flow; the plan-level activity is
@@ -982,8 +984,9 @@ func estimateTaskComplexity(description string, context map[string]any) *Complex
 // enabled, the LLM must invoke plan_acceptance(action=route) immediately.
 // When approval is required, it must wait for the user's response.
 func generateTasksNextAction(autoApprove bool) string {
-	const base = "PROTOCOL COMPLETE. The plan is ready. The system renders " +
-		"the plan structure separately in the UI — the user already sees it. " +
+	const base = "PROTOCOL COMPLETE. The plan is ready. Sylk has emitted and " +
+		"persisted the user-reviewable plan_markdown artifact before this final text. " +
+		"The UI renders that artifact separately for chat and approval review. " +
 		"Do NOT repeat, re-render, or include the plan structure, task list, " +
 		"acceptance criteria, file lists, or implementation guides in your text. " +
 		"Write ONLY a brief assessment (2-4 sentences): highlight the key " +

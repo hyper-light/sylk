@@ -2,13 +2,13 @@
 //
 // Matches the guardian command-approval dialog's layout pattern:
 //
-//   1. A short fixed prompt line ("Approve, modify, or reject this
-//      plan:") — never contains variable content, so never truncates.
-//   2. A markdown-rendered, height-budgeted, scrollable body showing
-//      the plan name (and, when space permits, the plan summary).
-//      Word-wrapping is handled by the same RenderMarkdown path
-//      command approval uses for its code block.
-//   3. The three Approve / Modify / Reject option buttons.
+//  1. A short fixed prompt line ("Approve, modify, or reject this
+//     plan:") — never contains variable content, so never truncates.
+//  2. A markdown-rendered, height-budgeted, scrollable body showing
+//     the plan name (and, when space permits, the plan summary).
+//     Word-wrapping is handled by the same RenderMarkdown path
+//     command approval uses for its code block.
+//  3. The three Approve / Modify / Reject option buttons.
 //
 // Previously the dialog concatenated the plan name directly into the
 // prompt header and relied on hard truncation to fit a single line.
@@ -33,11 +33,13 @@
 package ui
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 
 	"github.com/adalundhe/sylk/core/planapproval"
-	markdownpkg "github.com/adalundhe/sylk/ui/markdown"
 	"github.com/adalundhe/sylk/ui/component"
+	markdownpkg "github.com/adalundhe/sylk/ui/markdown"
 	"github.com/adalundhe/sylk/ui/theme"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -155,16 +157,9 @@ func planApprovalPromptLine() string {
 // so word wrapping is consistent with the rest of the chat UI, and
 // returns a proper []string whose length equals the visual row count.
 //
-// Body content (in priority order, joined by blank lines when the
-// budget permits):
-//
-//   1. The plan name (collapsed to single-line whitespace so any
-//      embedded newlines from a multi-line user query don't survive
-//      into the rendered form). Emitted as a bold heading.
-//   2. The plan summary, when non-empty.
-//
-// Empty body (no name, no summary) returns nil so the dialog degrades
-// gracefully to prompt + buttons.
+// Body content comes from the canonical plan markdown carried by the
+// proposal (artifact-backed when PlanArtifactID is present). Plan name
+// and summary are only fallbacks for older proposals with no body.
 func renderPlanApprovalBody(proposal *planapproval.Proposal, width int, th *theme.Theme) []string {
 	markdown := buildPlanApprovalMarkdown(proposal)
 	if markdown == "" {
@@ -175,9 +170,24 @@ func renderPlanApprovalBody(proposal *planapproval.Proposal, width int, th *them
 }
 
 func buildPlanApprovalMarkdown(proposal *planapproval.Proposal) string {
+	if proposal == nil {
+		return ""
+	}
+	planText := strings.TrimSpace(proposal.PlanText)
+	if planText != "" {
+		parts := []string{}
+		if warning := planApprovalArtifactWarning(proposal, planText); warning != "" {
+			parts = append(parts, warning)
+		}
+		parts = append(parts, planText)
+		return strings.Join(parts, "\n\n")
+	}
 	name := collapseWhitespace(proposal.PlanName)
 	summary := collapseWhitespace(proposal.PlanSummary)
 	parts := []string{}
+	if warning := planApprovalArtifactWarning(proposal, planText); warning != "" {
+		parts = append(parts, warning)
+	}
 	if name != "" {
 		parts = append(parts, "**"+name+"**")
 	}
@@ -185,6 +195,43 @@ func buildPlanApprovalMarkdown(proposal *planapproval.Proposal) string {
 		parts = append(parts, summary)
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+func planApprovalArtifactWarning(proposal *planapproval.Proposal, body string) string {
+	if proposal == nil || strings.TrimSpace(proposal.PlanArtifactID) == "" {
+		return ""
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "> Plan artifact is unavailable; showing fallback plan metadata."
+	}
+	expected := strings.TrimSpace(planApprovalMetadataString(proposal.Metadata, "plan_artifact_content_hash", "content_hash"))
+	if expected == "" {
+		return ""
+	}
+	if expected != planApprovalMarkdownHash(body) {
+		return "> Plan artifact hash mismatch; showing fallback plan text."
+	}
+	return ""
+}
+
+func planApprovalMetadataString(metadata map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if metadata == nil {
+			return ""
+		}
+		if value, ok := metadata[key].(string); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
+func planApprovalMarkdownHash(body string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(body)))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // collapseWhitespace replaces any run of whitespace (including
