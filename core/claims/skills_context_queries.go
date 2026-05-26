@@ -301,14 +301,8 @@ func RecallArtifactSkill(bp BoardProvider) *skills.Skill {
 }
 
 func findArtifactByID(board *ClaimsBoard, artifactID string) *Artifact {
-	proj := board.Projection()
-	for i := range proj.Testaments {
-		for _, a := range proj.Testaments[i].Artifacts {
-			if a != nil && a.ID == artifactID {
-				clone := *a
-				return &clone
-			}
-		}
+	if artifact, ok := board.CloneArtifact(strings.TrimSpace(artifactID)); ok {
+		return artifact
 	}
 	return nil
 }

@@ -198,6 +198,67 @@ func TestFabricProjector_ClaimIssuedPayload(t *testing.T) {
 	}
 }
 
+func TestFabricProjector_ArtifactPayloadIncludesPresentationAwareness(t *testing.T) {
+	collector := activity.NewTestCollector()
+	prev := activity.SetDefaultSink(collector)
+	defer activity.SetDefaultSink(prev)
+
+	board := NewClaimsBoard(ClaimsBoardConfig{BoardID: "board-1", SessionID: "session-1", TaskID: "task-1"})
+	if err := board.PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.SubmitTestaments(context.Background(), Action{AgentID: "architect", Type: ActionTypeTestament}, []Testament{{
+		AgentID: "architect",
+		Summary: "Plan ready.",
+		Relations: []Relation{
+			{Related: "claim-1", RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim},
+		},
+		Artifacts: []*Artifact{{
+			Kind:      ArtifactKindPlanMarkdown,
+			Reference: "### Plan",
+			Presentation: &Presentation{
+				Audiences: []PresentationAudience{PresentationAudienceUser},
+				Surfaces:  []PresentationSurface{PresentationSurfaceChat},
+				Format:    PresentationFormatMarkdown,
+				Title:     "Plan",
+			},
+		}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	artifact := board.Projection().Testaments[0].Artifacts[0]
+	record := ClaimsOutboxRecord{
+		BoardID:      "board-1",
+		SessionID:    "session-1",
+		TaskID:       "task-1",
+		Sequence:     artifact.Sequence,
+		EntityType:   "artifact",
+		EntityID:     artifact.ID,
+		MutationKind: "artifact_published",
+	}
+
+	if err := NewFabricProjector().Project(context.Background(), &record, board); err != nil {
+		t.Fatal(err)
+	}
+	acts := collector.Snapshot()
+	if len(acts) == 0 {
+		t.Fatal("expected fabric activity")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(acts[len(acts)-1].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["kind"] != ArtifactKindPlanMarkdown {
+		t.Fatalf("payload kind = %v", payload["kind"])
+	}
+	if payload["artifact_title"] != "Plan" || payload["presentation_title"] != "Plan" {
+		t.Fatalf("payload missing presentation title awareness: %+v", payload)
+	}
+	if payload["presentation"] == nil {
+		t.Fatalf("payload missing presentation object: %+v", payload)
+	}
+}
+
 type failingProjector struct {
 	name     string
 	failOnce bool

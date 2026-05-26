@@ -54,15 +54,17 @@ func QueryBoardSkill(bp BoardProvider, defaultAgentID string) *skills.Skill {
 			"- my_evaluations: Testified claims where you are issuer/evaluator (awaiting your validation)\n"+
 			"- claim: Single claim by ID with its validations\n"+
 			"- testament: Single testament by ID with its artifacts\n"+
+			"- artifact: Single artifact by ID with reference, metadata, and presentation\n"+
 			"- scope: Claims overlapping a scope entry (kind + key)\n"+
 			"- pending_validations: Pending validations on a specific claim\n"+
 			"- testaments: Testaments linked to a specific claim").
 		Domain("claims").
 		Keywords("claims", "board", "query", "status", "my_claims", "scope", "validations").
 		Priority(98).
-		EnumParam("op", "Query operation", []string{"summary", "my_claims", "my_evaluations", "claim", "testament", "scope", "pending_validations", "testaments"}, true).
+		EnumParam("op", "Query operation", []string{"summary", "my_claims", "my_evaluations", "claim", "testament", "artifact", "scope", "pending_validations", "testaments"}, true).
 		StringParam("claim_id", "Claim ID (for claim, pending_validations, testaments ops)", false).
 		StringParam("testament_id", "Testament ID (for testament op)", false).
+		StringParam("artifact_id", "Artifact ID (for artifact op)", false).
 		StringParam("agent_id", "Agent ID override (for my_claims, my_evaluations). Defaults to calling agent.", false).
 		StringParam("kind", "Scope kind (for scope op)", false).
 		StringParam("key", "Scope key (for scope op)", false).
@@ -78,6 +80,7 @@ func QueryBoardSkill(bp BoardProvider, defaultAgentID string) *skills.Skill {
 				Op          string `json:"op"`
 				ClaimID     string `json:"claim_id"`
 				TestamentID string `json:"testament_id"`
+				ArtifactID  string `json:"artifact_id"`
 				AgentID     string `json:"agent_id"`
 				Kind        string `json:"kind"`
 				Key         string `json:"key"`
@@ -89,12 +92,12 @@ func QueryBoardSkill(bp BoardProvider, defaultAgentID string) *skills.Skill {
 			if agentID == "" {
 				agentID = defaultAgentID
 			}
-			return dispatchBoardQuery(board, params.Op, agentID, params.ClaimID, params.TestamentID, params.Kind, params.Key)
+			return dispatchBoardQuery(board, params.Op, agentID, params.ClaimID, params.TestamentID, params.ArtifactID, params.Kind, params.Key)
 		}).
 		Build()
 }
 
-func dispatchBoardQuery(board *ClaimsBoard, op, agentID, claimID, testamentID, scopeKind, scopeKey string) (any, error) {
+func dispatchBoardQuery(board *ClaimsBoard, op, agentID, claimID, testamentID, artifactID, scopeKind, scopeKey string) (any, error) {
 	switch strings.TrimSpace(op) {
 	case "summary":
 		return board.Summary(), nil
@@ -114,6 +117,12 @@ func dispatchBoardQuery(board *ClaimsBoard, op, agentID, claimID, testamentID, s
 			return nil, fmt.Errorf("testament %q not found", testamentID)
 		}
 		return t, nil
+	case "artifact":
+		a, ok := board.CloneArtifact(strings.TrimSpace(artifactID))
+		if !ok {
+			return nil, fmt.Errorf("artifact %q not found", artifactID)
+		}
+		return a, nil
 	case "scope":
 		ids := board.ClaimIDsWithScope(strings.TrimSpace(scopeKind), strings.TrimSpace(scopeKey))
 		result := make([]*Claim, 0, len(ids))

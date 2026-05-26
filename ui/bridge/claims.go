@@ -442,6 +442,43 @@ func (b *ClaimsBridge) currentBoard() (*claims.ClaimsBoard, string) {
 	return b.board, b.activeSession
 }
 
+// ResolveArtifact returns a defensive copy of an artifact from the active
+// session's claims board. It first checks the bridge's live artifact index,
+// then falls back to the immutable board projection so callers do not depend
+// on presentation messages having drained before they resolve source content.
+func (b *ClaimsBridge) ResolveArtifact(sessionID, artifactID string) (*claims.Artifact, bool) {
+	if b == nil {
+		return nil, false
+	}
+	artifactID = strings.TrimSpace(artifactID)
+	if artifactID == "" {
+		return nil, false
+	}
+	b.mu.Lock()
+	activeSession := b.activeSession
+	if strings.TrimSpace(sessionID) == "" {
+		sessionID = activeSession
+	}
+	if sessionID != activeSession {
+		b.mu.Unlock()
+		return nil, false
+	}
+	if art := b.artifactByID[artifactID]; art != nil {
+		cp := cloneArtifact(art)
+		b.mu.Unlock()
+		return cp, true
+	}
+	board := b.board
+	b.mu.Unlock()
+	if board == nil {
+		return nil, false
+	}
+	if art := findArtifact(board.Projection(), artifactID); art != nil {
+		return cloneArtifact(art), true
+	}
+	return nil, false
+}
+
 func (b *ClaimsBridge) handleEntryClaim(sessionID string, board *claims.ClaimsBoard, entry *claims.GraphEntryPoint, claimID string) {
 	if entry != nil && entry.Node.Claim != nil {
 		b.handleClaimCreated(sessionID, entry.Node.Claim)
@@ -1343,8 +1380,16 @@ func (b *ClaimsBridge) replayProjection(sessionID string, proj *claims.ClaimsBoa
 			})
 		}
 		claimID := claims.ClaimIDFromRelations(t.Relations)
+		hasPlanMarkdown := false
 		for _, art := range artifactsBySequence(t.Artifacts) {
 			if art == nil {
+				continue
+			}
+			if strings.TrimSpace(art.Kind) == claims.ArtifactKindPlanMarkdown {
+				hasPlanMarkdown = true
+			}
+			if strings.TrimSpace(art.Kind) == claims.ArtifactKindResponseText {
+				b.OnArtifactAdded(claimID, t.AgentID, sessionID, art)
 				continue
 			}
 			if claims.IsPresentableToUserChat(art.Presentation) && !isPresentationLifecycleArtifactKind(art.Kind) {
@@ -1359,7 +1404,69 @@ func (b *ClaimsBridge) replayProjection(sessionID string, proj *claims.ClaimsBoa
 			}
 			b.OnArtifactAdded(claimID, t.AgentID, sessionID, art)
 		}
+		if !hasPlanMarkdown {
+			if m := b.syntheticLegacyPlanPresentationMsg(sessionID, claimID, t); m != nil {
+				b.enqueue(*m)
+			}
+		}
 	}
+}
+
+func (b *ClaimsBridge) syntheticLegacyPlanPresentationMsg(sessionID, claimID string, t *claims.Testament) *msg.ClaimPresentationMsg {
+	if b == nil || t == nil {
+		return nil
+	}
+	for _, artifact := range artifactsBySequence(t.Artifacts) {
+		markdown, metadata, ok := claims.LegacyPlanMarkdownFromHandoffArtifact(artifact)
+		if !ok {
+			continue
+		}
+		claimID = strings.TrimSpace(claimID)
+		if claimID == "" {
+			claimID = claims.ClaimIDFromRelations(t.Relations)
+		}
+		planID := claimMetadataString(metadata, "plan_id")
+		presentation := claims.NormalizePresentation(claims.DefaultPlanMarkdownPresentation(planID))
+		sourceID := "synthetic-plan:" + strings.TrimSpace(t.ID)
+		if sourceID == "synthetic-plan:" {
+			sourceID = "synthetic-plan:" + strings.TrimSpace(artifact.ID)
+		}
+		metadata = cloneMetadata(metadata)
+		if metadata == nil {
+			metadata = make(map[string]any, 4)
+		}
+		metadata["synthetic"] = true
+		metadata["source_artifact_id"] = strings.TrimSpace(artifact.ID)
+		metadata["source_artifact_kind"] = strings.TrimSpace(artifact.Kind)
+		metadata["source_testament_id"] = strings.TrimSpace(t.ID)
+
+		b.mu.Lock()
+		meta := b.metaForClaimLocked(claimID)
+		if meta.SuppressChat || !b.shouldEmitPresentationLocked("synthetic", sourceID, presentationReplaceKey(presentation), artifact.Sequence) {
+			b.mu.Unlock()
+			return nil
+		}
+		out := &msg.ClaimPresentationMsg{
+			SessionID:   sessionID,
+			CycleID:     firstNonBlank(meta.CycleID, claimID),
+			ClaimID:     claimID,
+			SourceType:  "synthetic",
+			SourceID:    sourceID,
+			TestamentID: strings.TrimSpace(t.ID),
+			AgentID:     firstNonBlank(strings.TrimSpace(t.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
+			Title:       presentationTitle(presentation, "Plan"),
+			Content:     markdown,
+			Format:      presentationFormat(presentation),
+			Placement:   presentationPlacement(presentation),
+			ReplaceKey:  presentationReplaceKey(presentation),
+			Metadata:    metadata,
+			CreatedAt:   nonZeroTime(t.Created),
+			Sequence:    artifact.Sequence,
+		}
+		b.mu.Unlock()
+		return out
+	}
+	return nil
 }
 
 func testamentsBySequence(in []claims.Testament) []*claims.Testament {
@@ -1475,6 +1582,27 @@ func findTestament(proj *claims.ClaimsBoardProjection, testamentID string) *clai
 	for i := range proj.Testaments {
 		if proj.Testaments[i].ID == testamentID {
 			return &proj.Testaments[i]
+		}
+	}
+	return nil
+}
+
+func findArtifact(proj *claims.ClaimsBoardProjection, artifactID string) *claims.Artifact {
+	if proj == nil {
+		return nil
+	}
+	artifactID = strings.TrimSpace(artifactID)
+	if artifactID == "" {
+		return nil
+	}
+	for i := range proj.Testaments {
+		for _, artifact := range proj.Testaments[i].Artifacts {
+			if artifact == nil {
+				continue
+			}
+			if strings.TrimSpace(artifact.ID) == artifactID {
+				return artifact
+			}
 		}
 	}
 	return nil

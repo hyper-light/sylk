@@ -735,6 +735,9 @@ type AuthStatusMsg struct {
 // ---------------------------------------------------------------------------
 
 // PlanUpdateMsg carries an updated plan snapshot for the plan viewer.
+// Deprecated fallback during claims-presentation migration; canonical
+// review content is a presentable plan_markdown artifact. Removal ref:
+// CLAIMS_VISIBILITY Phase 6.2 / claims-plan-sidechannels.
 type PlanUpdateMsg struct {
 	PlanID          string
 	CorrelationID   string // Correlation of the request that owns this plan.
@@ -967,13 +970,15 @@ type ClaimResponseTextMsg struct {
 }
 
 // ClaimPresentationMsg carries user-facing content projected from a
-// claims-board testament or artifact. It is traceable back to the
-// source entity; the board remains the source of truth.
+// claims-board testament or artifact. During legacy replay, SourceType
+// may be "synthetic" for a transient row derived from stored board
+// state; Metadata["synthetic"] marks that case. The board remains the
+// source of truth.
 type ClaimPresentationMsg struct {
 	SessionID   string
 	CycleID     string
 	ClaimID     string
-	SourceType  string // "testament" | "artifact"
+	SourceType  string // "testament" | "artifact" | "synthetic"
 	SourceID    string
 	TestamentID string
 	AgentID     string

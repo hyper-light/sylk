@@ -158,6 +158,7 @@ func activityIndexMapping() mapping.IndexMapping {
 		"validation_description",
 		"quality_bar",
 		"artifact_reference",
+		"artifact_title",
 	} {
 		f := bleve.NewTextFieldMapping()
 		doc.AddFieldMappingsAt(name, f)
@@ -191,6 +192,8 @@ func enrichClaimsFields(doc map[string]any, a activity.AgentActivity) {
 	setIfPresent(doc, payload, "action_type", "claim_action_type")
 	setIfPresent(doc, payload, "kind", "artifact_kind")
 	setIfPresent(doc, payload, "reference", "artifact_reference")
+	setIfPresent(doc, payload, "artifact_title", "artifact_title")
+	setIfPresent(doc, payload, "presentation_title", "artifact_title")
 	setIfPresent(doc, payload, "type", "validation_type")
 	setIfPresent(doc, payload, "phase", "board_phase")
 	setIfPresent(doc, payload, "status", "validation_description")

@@ -61,9 +61,20 @@ func resolveClaimNode(board *ClaimsBoard, claimID string) GraphNode {
 	if !ok {
 		return GraphNode{}
 	}
+	edges := edgesFromRelations(c.Relations)
+	for _, t := range board.TestamentsByClaim(c.ID) {
+		if t == nil || strings.TrimSpace(t.ID) == "" {
+			continue
+		}
+		edges = appendGraphEdge(edges, GraphEdge{
+			TargetID:     t.ID,
+			TargetType:   RelatedTypeTestament,
+			Relationship: RelationshipTestament,
+		})
+	}
 	return GraphNode{
 		Claim: c,
-		Edges: edgesFromRelations(c.Relations),
+		Edges: edges,
 	}
 }
 
@@ -76,6 +87,16 @@ func resolveTestamentNode(board *ClaimsBoard, testamentID string) GraphNode {
 		Testament: t,
 		Edges:     edgesFromRelations(t.Relations),
 	}
+	for _, artifact := range t.Artifacts {
+		if artifact == nil || strings.TrimSpace(artifact.ID) == "" {
+			continue
+		}
+		node.Edges = appendGraphEdge(node.Edges, GraphEdge{
+			TargetID:     artifact.ID,
+			TargetType:   RelatedTypeArtifact,
+			Relationship: RelationshipTestament,
+		})
+	}
 	// Populate the parent claim so the agent sees its validations
 	// alongside the testament artifacts. The testament's Relations
 	// carry a RelationshipClaim edge to the parent claim ID.
@@ -85,6 +106,22 @@ func resolveTestamentNode(board *ClaimsBoard, testamentID string) GraphNode {
 		}
 	}
 	return node
+}
+
+func resolveArtifactNode(board *ClaimsBoard, artifactID string) GraphNode {
+	a, ok := board.CloneArtifact(artifactID)
+	if !ok {
+		return GraphNode{}
+	}
+	edges := edgesFromRelations(a.Relations)
+	if testamentID := strings.TrimSpace(a.TestamentID); testamentID != "" {
+		edges = appendGraphEdge(edges, GraphEdge{
+			TargetID:     testamentID,
+			TargetType:   RelatedTypeTestament,
+			Relationship: RelationshipTestament,
+		})
+	}
+	return GraphNode{Artifact: a, Edges: edges}
 }
 
 func resolveValidationNode(board *ClaimsBoard, claimID, validationID string) GraphNode {
@@ -122,6 +159,23 @@ func edgesFromRelations(relations []Relation) []GraphEdge {
 		}
 	}
 	return edges
+}
+
+func appendGraphEdge(edges []GraphEdge, edge GraphEdge) []GraphEdge {
+	edge.TargetID = strings.TrimSpace(edge.TargetID)
+	edge.TargetType = strings.TrimSpace(edge.TargetType)
+	edge.Relationship = strings.TrimSpace(edge.Relationship)
+	if edge.TargetID == "" || edge.TargetType == "" || edge.Relationship == "" {
+		return edges
+	}
+	for _, existing := range edges {
+		if strings.TrimSpace(existing.TargetID) == edge.TargetID &&
+			strings.TrimSpace(existing.TargetType) == edge.TargetType &&
+			strings.TrimSpace(existing.Relationship) == edge.Relationship {
+			return edges
+		}
+	}
+	return append(edges, edge)
 }
 
 // Traverse performs breadth-first traversal from nodeID, following
@@ -189,13 +243,35 @@ func Traverse(board *ClaimsBoard, nodeID string, edgeFilter string, maxDepth int
 // testament, or artifact — in that order. Returns the first hit.
 func resolveNodeByID(board *ClaimsBoard, id string) GraphNode {
 	if c, ok := board.CloneClaim(id); ok {
-		return GraphNode{Claim: c, Edges: edgesFromRelations(c.Relations)}
+		return resolveClaimNode(board, c.ID)
 	}
 	if a, ok := board.CloneAction(id); ok {
-		return GraphNode{Action: a, Edges: edgesFromRelations(a.Relations)}
+		edges := edgesFromRelations(a.Relations)
+		for _, objectID := range board.ObjectIDsWithRelation(RelatedTypeAction, RelationshipClaimAction, a.ID) {
+			if _, ok := board.CloneClaim(objectID); ok {
+				edges = appendGraphEdge(edges, GraphEdge{
+					TargetID:     objectID,
+					TargetType:   RelatedTypeClaim,
+					Relationship: RelationshipClaimAction,
+				})
+			}
+		}
+		for _, objectID := range board.ObjectIDsWithRelation(RelatedTypeAction, RelationshipTestamentAction, a.ID) {
+			if _, ok := board.CloneTestament(objectID); ok {
+				edges = appendGraphEdge(edges, GraphEdge{
+					TargetID:     objectID,
+					TargetType:   RelatedTypeTestament,
+					Relationship: RelationshipTestamentAction,
+				})
+			}
+		}
+		return GraphNode{Action: a, Edges: edges}
 	}
 	if t, ok := board.CloneTestament(id); ok {
-		return GraphNode{Testament: t, Edges: edgesFromRelations(t.Relations)}
+		return resolveTestamentNode(board, t.ID)
+	}
+	if a, ok := board.CloneArtifact(id); ok {
+		return resolveArtifactNode(board, a.ID)
 	}
 	return GraphNode{}
 }

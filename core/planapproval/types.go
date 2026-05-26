@@ -67,7 +67,9 @@ func (v Verdict) IsValid() bool {
 //   - PlanSummary is a short one-paragraph synopsis (architect-derived).
 //   - PlanArtifactID / PlanArtifactReplaceKey point at the canonical
 //     user-reviewable claims artifact when available.
-//   - PlanText is the full plan markdown fallback during migration.
+//   - PlanText is the full plan markdown fallback during migration
+//     (deprecated fallback; removal ref: CLAIMS_VISIBILITY Phase 6.2 /
+//     claims-plan-sidechannels).
 //
 // Context (Phase 2 fields, optional in Phase 1):
 //   - FreshnessSummary describes what was re-checked when the plan was

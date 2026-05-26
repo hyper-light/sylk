@@ -181,6 +181,7 @@ func (b *ClaimsBoard) fabricPayload(record *ClaimsOutboxRecord) (map[string]any,
 			payload["reference"] = a.Reference
 			payload["ephemeral"] = a.Ephemeral
 			payload["metadata"] = a.Metadata
+			addPresentationPayload(payload, a.Presentation)
 			coords["artifact_id"] = a.ID
 			coords["testament_id"] = a.TestamentID
 		}
@@ -202,4 +203,34 @@ func (b *ClaimsBoard) fabricPayload(record *ClaimsOutboxRecord) (map[string]any,
 		payload["phase"] = string(b.Phase())
 	}
 	return payload, actor, coords, target
+}
+
+func addPresentationPayload(payload map[string]any, presentation *Presentation) {
+	if payload == nil {
+		return
+	}
+	p := NormalizePresentation(presentation)
+	if p == nil {
+		return
+	}
+	payload["presentation"] = p
+	if title := strings.TrimSpace(p.Title); title != "" {
+		payload["presentation_title"] = title
+		payload["artifact_title"] = title
+	}
+	if len(p.Audiences) > 0 {
+		payload["presentation_audiences"] = p.Audiences
+	}
+	if len(p.Surfaces) > 0 {
+		payload["presentation_surfaces"] = p.Surfaces
+	}
+	if p.Format != "" {
+		payload["presentation_format"] = string(p.Format)
+	}
+	if p.Placement != "" {
+		payload["presentation_placement"] = string(p.Placement)
+	}
+	if strings.TrimSpace(p.ReplaceKey) != "" {
+		payload["presentation_replace_key"] = strings.TrimSpace(p.ReplaceKey)
+	}
 }

@@ -607,6 +607,113 @@ func TestBridgeIntegration_PresentableTestamentEmitsClaimPresentation(t *testing
 	}
 }
 
+func TestBridgeIntegration_ReplayLegacyResponseTextWithoutPresentation(t *testing.T) {
+	br, _, prog, cleanup := setupBridgeOnSession(t, "ses-legacy-response-replay")
+	defer cleanup()
+
+	proj := &claims.ClaimsBoardProjection{
+		Claims: []claims.Claim{{
+			ID:         "legacy-claim",
+			Title:      "answer user",
+			Status:     claims.ClaimStatusTestified,
+			ActionType: claims.ActionTypeTask,
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+		}},
+		Testaments: []claims.Testament{{
+			ID:      "legacy-testament",
+			AgentID: "architect",
+			Relations: []claims.Relation{
+				{Related: "legacy-claim", RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
+			},
+			Artifacts: []*claims.Artifact{{
+				ID:        "legacy-response",
+				Kind:      claims.ArtifactKindResponseText,
+				Reference: "legacy answer",
+			}},
+		}},
+	}
+	before := len(prog.Snapshot())
+	br.replayProjection("ses-legacy-response-replay", proj)
+	drainBridge(t, prog, "legacy response replay")
+
+	var responses, presentations int
+	for _, m := range prog.Snapshot()[before:] {
+		switch typed := m.(type) {
+		case msg.ClaimResponseTextMsg:
+			if typed.Content == "legacy answer" {
+				responses++
+			}
+		case msg.ClaimPresentationMsg:
+			if typed.SourceID == "legacy-response" {
+				presentations++
+			}
+		}
+	}
+	if responses != 1 || presentations != 0 {
+		debugSnapshot(t, prog, "legacy response replay")
+		t.Fatalf("legacy response replay responses=%d presentations=%d, want 1/0", responses, presentations)
+	}
+}
+
+func TestBridgeIntegration_ReplayLegacyPlanHandoffSynthesizesTransientPresentation(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-legacy-plan-replay")
+	defer cleanup()
+
+	proj := &claims.ClaimsBoardProjection{
+		Claims: []claims.Claim{{
+			ID:         "legacy-plan-claim",
+			Title:      "plan",
+			Status:     claims.ClaimStatusTestified,
+			ActionType: claims.ActionTypeTask,
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+		}},
+		Testaments: []claims.Testament{{
+			ID:      "legacy-plan-testament",
+			AgentID: "architect",
+			Relations: []claims.Relation{
+				{Related: "legacy-plan-claim", RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
+			},
+			Artifacts: []*claims.Artifact{{
+				ID:   "legacy-handoff",
+				Kind: claims.ArtifactKindPlanHandoffPayload,
+				Metadata: map[string]any{
+					"plan_id":       "legacy-p1",
+					"epoch":         2,
+					"plan_markdown": "### Plan\n\n- Legacy task",
+				},
+			}},
+		}},
+	}
+	before := len(prog.Snapshot())
+	br.replayProjection("ses-legacy-plan-replay", proj)
+	drainBridge(t, prog, "legacy plan replay")
+
+	var got *msg.ClaimPresentationMsg
+	for _, m := range prog.Snapshot()[before:] {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceType == "synthetic" {
+			copy := p
+			got = &copy
+			break
+		}
+	}
+	if got == nil {
+		debugSnapshot(t, prog, "legacy plan replay")
+		t.Fatal("expected synthetic presentation")
+	}
+	if got.Content != "### Plan\n\n- Legacy task" || got.Metadata["synthetic"] != true {
+		t.Fatalf("unexpected synthetic presentation: %+v", got)
+	}
+	if _, ok := board.CloneArtifact(got.SourceID); ok {
+		t.Fatalf("synthetic source %q must not be a durable artifact", got.SourceID)
+	}
+}
+
 // debugSnapshot prints message types — used during diagnosis only.
 func debugSnapshot(t *testing.T, prog *integrationProgram, label string) {
 	t.Helper()

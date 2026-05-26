@@ -143,11 +143,13 @@ func (a *BoardAmplifier) EmitArtifactPublished(ctx context.Context, artifact *Ar
 	if a == nil || artifact == nil {
 		return
 	}
-	a.emit(ctx, activity.ActionClaimArtifactPublished, artifact.AgentID, artifact.ID, map[string]any{
+	payload := map[string]any{
 		"kind":      artifact.Kind,
 		"reference": artifact.Reference,
 		"ephemeral": artifact.Ephemeral,
-	})
+	}
+	addPresentationPayload(payload, artifact.Presentation)
+	a.emit(ctx, activity.ActionClaimArtifactPublished, artifact.AgentID, artifact.ID, payload)
 }
 
 // EmitClaimValidated emits a Fabric activity for a validation evaluation.

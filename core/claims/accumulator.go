@@ -417,6 +417,30 @@ func (a *TestamentAccumulator) Record(kind, reference string) {
 // so every agent benefits without per-site wiring.
 const ArtifactKindResponseText = "response_text"
 
+// DefaultResponseTextPresentation returns the migration-default
+// presentation contract for final assistant text. Response text remains
+// ordinary evidence; this only describes the default user-facing route.
+func DefaultResponseTextPresentation() *Presentation {
+	return &Presentation{
+		Audiences: []PresentationAudience{PresentationAudienceUser},
+		Surfaces:  []PresentationSurface{PresentationSurfaceChat},
+		Format:    PresentationFormatMarkdown,
+		Placement: PresentationPlacementAfterResponse,
+	}
+}
+
+// ApplyDefaultArtifactPresentation attaches kind-specific presentation
+// defaults without overriding an explicit contract supplied by the caller.
+func ApplyDefaultArtifactPresentation(artifact *Artifact) {
+	if artifact == nil || artifact.Presentation != nil {
+		return
+	}
+	switch strings.TrimSpace(artifact.Kind) {
+	case ArtifactKindResponseText:
+		artifact.Presentation = DefaultResponseTextPresentation()
+	}
+}
+
 // responseTextSummaryMax bounds the size of the testament Summary
 // derived from a response_text artifact. The full text remains in
 // the artifact's Reference; only the headline is capped. Set off the
@@ -443,10 +467,11 @@ func (a *TestamentAccumulator) RecordResponseText(content string) {
 		return
 	}
 	a.RecordArtifact(&Artifact{
-		AgentID:   a.agentID,
-		SessionID: a.sessionID,
-		Kind:      ArtifactKindResponseText,
-		Reference: trimmed,
+		AgentID:      a.agentID,
+		SessionID:    a.sessionID,
+		Kind:         ArtifactKindResponseText,
+		Reference:    trimmed,
+		Presentation: DefaultResponseTextPresentation(),
 	})
 }
 
@@ -475,6 +500,8 @@ func (a *TestamentAccumulator) RecordArtifact(artifact *Artifact) {
 	if artifact.Accessed.IsZero() {
 		artifact.Accessed = artifact.Created
 	}
+	ApplyDefaultArtifactPresentation(artifact)
+	artifact.Presentation = NormalizePresentation(artifact.Presentation)
 	a.artifacts = append(a.artifacts, artifact)
 	claimID := a.claimID
 	agentID := a.agentID
@@ -602,6 +629,129 @@ func RestoreAccumulator(agentID, sessionID, claimID string, started time.Time, a
 	}
 }
 
+type accumulatorFlushPayload struct {
+	agentID           string
+	sessionID         string
+	claimID           string
+	contextValue      string
+	contextTransition int64
+	accID             string
+	started           time.Time
+	artifacts         []*Artifact
+	notes             []string
+}
+
+func (a *TestamentAccumulator) beginFlush() *accumulatorFlushPayload {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	if a.flushed {
+		a.mu.Unlock()
+		return nil
+	}
+	a.flushed = true
+	artifacts := make([]*Artifact, len(a.artifacts))
+	copy(artifacts, a.artifacts)
+	notes := make([]string, len(a.notes))
+	copy(notes, a.notes)
+	payload := &accumulatorFlushPayload{
+		agentID:           a.agentID,
+		sessionID:         a.sessionID,
+		claimID:           a.claimID,
+		contextValue:      a.context,
+		contextTransition: a.contextTransition,
+		accID:             a.id,
+		started:           a.started,
+		artifacts:         artifacts,
+		notes:             notes,
+	}
+	a.mu.Unlock()
+	return payload
+}
+
+func (p *accumulatorFlushPayload) closeLifecycle() {
+	if p == nil {
+		return
+	}
+	if sink := loadAccumulatorLifecycleSink(); sink != nil {
+		fireOnAccumulatorClosed(sink, p.agentID, p.sessionID)
+	}
+}
+
+func submitAccumulatorFlush(ctx context.Context, board *ClaimsBoard, p *accumulatorFlushPayload) error {
+	if board == nil || p == nil || len(p.artifacts) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	artifacts := make([]*Artifact, 0, len(p.artifacts)+1)
+	artifacts = append(artifacts, p.artifacts...)
+	artifacts = append(artifacts, &Artifact{
+		AgentID:   p.agentID,
+		SessionID: p.sessionID,
+		Kind:      "request_duration_ms",
+		Reference: fmt.Sprintf("%d", time.Since(p.started).Milliseconds()),
+	})
+
+	summary := deriveTestamentSummary(artifacts, p.notes)
+	// claimID is informational on the accumulator (used by the
+	// artifact-progress sink for chat-row routing); intentionally
+	// not added as a Relation here — see Flush doc comment.
+	claimID := p.claimID
+
+	// Pre-stamp the testament ID so the post-submit final
+	// TestamentContextDelta can carry it. The board's
+	// stampTestamentLocked preserves a non-empty ID.
+	testamentID := uuid.NewString()
+	testament := Testament{
+		ID:         testamentID,
+		AgentID:    p.agentID,
+		SessionID:  p.sessionID,
+		Summary:    summary,
+		Confidence: "committed",
+		// Seal the accumulator's developing-conclusion narrative onto
+		// the durable Testament. After submission the value is
+		// queryable via the board projection; mid-flight updates
+		// arrived as TestamentContextDeltas keyed by AccumulatorID.
+		Context:           p.contextValue,
+		ContextTransition: p.contextTransition,
+		Relations: []Relation{
+			{Related: p.agentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+		},
+		Artifacts: artifacts,
+	}
+	action := Action{AgentID: p.agentID, Type: ActionTypeTestament}
+	if err := board.SubmitTestaments(ctx, action, []Testament{testament}); err != nil {
+		return err
+	}
+	// Final TestamentContextDelta carrying BOTH AccumulatorID and
+	// the now-real TestamentID. The UI rebinds its in-flight
+	// testament row from the synthetic accumulator anchor to the
+	// durable testament ID. Skipped when no Context was ever
+	// recorded — saves an empty delta on the firehose.
+	if amp := board.Amplifier(); amp != nil && (p.contextValue != "" || p.contextTransition > 0) {
+		amp.PublishTestamentContextDelta(ctx, TestamentContextDelta{
+			SessionID:     p.sessionID,
+			BoardID:       board.BoardID(),
+			TestamentID:   testamentID,
+			AccumulatorID: p.accID,
+			Sequence:      board.seq.Load(),
+			EmittedAt:     time.Now().UTC(),
+			TransitionID:  p.contextTransition,
+			Context:       p.contextValue,
+			AgentID:       p.agentID,
+			ClaimID:       claimID,
+		})
+	}
+	return nil
+}
+
 // Flush submits the accumulated artifacts as a single composite
 // testament to the board. No-op if empty or already flushed.
 // Best-effort — board unavailability does not fail the caller.
@@ -629,132 +779,61 @@ func RestoreAccumulator(agentID, sessionID, claimID string, started time.Time, a
 // claim-board emission path that has its own per-call routing
 // semantics.
 func (a *TestamentAccumulator) Flush(ctx context.Context, board *ClaimsBoard, scope ScopeProvider) {
-	if a == nil {
+	payload := a.beginFlush()
+	if payload == nil {
 		return
 	}
-	a.mu.Lock()
-	if a.flushed {
-		a.mu.Unlock()
-		return
-	}
-	if len(a.artifacts) == 0 {
-		a.flushed = true
-		agentID := a.agentID
-		sessionID := a.sessionID
-		a.mu.Unlock()
-		// Empty-flush still closes the lifecycle window so the
-		// activity indicator returns to idle when an agent's
-		// processing path opened an accumulator but never recorded
-		// anything (e.g. an early-return error path).
-		if sink := loadAccumulatorLifecycleSink(); sink != nil {
-			fireOnAccumulatorClosed(sink, agentID, sessionID)
-		}
-		return
-	}
-	a.flushed = true
-	artifacts := make([]*Artifact, len(a.artifacts))
-	copy(artifacts, a.artifacts)
-	notes := make([]string, len(a.notes))
-	copy(notes, a.notes)
-	claimID := a.claimID
-	contextValue := a.context
-	contextTransition := a.contextTransition
-	accID := a.id
-	a.mu.Unlock()
 
 	// Lifecycle close fires regardless of whether the flush ultimately
 	// commits — the agent's processing path is done either way and
 	// the activity indicator must release.
-	defer func() {
-		if sink := loadAccumulatorLifecycleSink(); sink != nil {
-			fireOnAccumulatorClosed(sink, a.agentID, a.sessionID)
-		}
-	}()
+	defer payload.closeLifecycle()
 
-	if board == nil {
+	if board == nil || len(payload.artifacts) == 0 {
 		return
-	}
-
-	// Duration artifact.
-	elapsed := time.Since(a.started)
-	artifacts = append(artifacts, &Artifact{
-		AgentID:   a.agentID,
-		SessionID: a.sessionID,
-		Kind:      "request_duration_ms",
-		Reference: fmt.Sprintf("%d", elapsed.Milliseconds()),
-	})
-
-	summary := deriveTestamentSummary(artifacts, notes)
-	_ = claimID // claimID is informational on the accumulator (used by
-	// the artifact-progress sink for chat-row routing); intentionally
-	// not added as a Relation here — see Flush doc comment.
-
-	// Pre-stamp the testament ID so the post-submit final
-	// TestamentContextDelta can carry it. The board's
-	// stampTestamentLocked preserves a non-empty ID.
-	testamentID := uuid.NewString()
-	testament := Testament{
-		ID:        testamentID,
-		AgentID:   a.agentID,
-		SessionID: a.sessionID,
-		Summary:   summary,
-		Confidence: "committed",
-		// Seal the accumulator's developing-conclusion narrative onto
-		// the durable Testament. After submission the value is
-		// queryable via the board projection; mid-flight updates
-		// arrived as TestamentContextDeltas keyed by AccumulatorID.
-		Context:           contextValue,
-		ContextTransition: contextTransition,
-		Relations: []Relation{
-			{Related: a.agentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
-		},
-		Artifacts: artifacts,
-	}
-	action := Action{AgentID: a.agentID, Type: ActionTypeTestament}
-
-	submit := func(sctx context.Context) error {
-		err := board.SubmitTestaments(sctx, action, []Testament{testament})
-		if err != nil {
-			return err
-		}
-		// Final TestamentContextDelta carrying BOTH AccumulatorID and
-		// the now-real TestamentID. The UI rebinds its in-flight
-		// testament row from the synthetic accumulator anchor to the
-		// durable testament ID. Skipped when no Context was ever
-		// recorded — saves an empty delta on the firehose.
-		if amp := board.Amplifier(); amp != nil && (contextValue != "" || contextTransition > 0) {
-			amp.PublishTestamentContextDelta(sctx, TestamentContextDelta{
-				SessionID:     a.sessionID,
-				BoardID:       board.BoardID(),
-				TestamentID:   testamentID,
-				AccumulatorID: accID,
-				Sequence:      board.seq.Load(),
-				EmittedAt:     time.Now().UTC(),
-				TransitionID:  contextTransition,
-				Context:       contextValue,
-				AgentID:       a.agentID,
-				ClaimID:       claimID,
-			})
-		}
-		return nil
 	}
 
 	if scope == nil {
 		slog.Error("accumulator_flush_scope_unwired",
-			"agent", a.agentID, "artifacts", len(artifacts),
+			"agent", payload.agentID, "artifacts", len(payload.artifacts)+1,
 			"reason", "scope required for tracked async dispatch; flush dropped")
 		board.RecordNotificationError(fmt.Sprintf(
 			"accumulator flush dropped: scope unwired (agent %s, %d artifacts)",
-			a.agentID, len(artifacts)))
+			payload.agentID, len(payload.artifacts)+1))
 		return
 	}
 	if err := scope.Go("accumulator_flush", 5*time.Second, func(gctx context.Context) error {
-		return submit(gctx)
+		return submitAccumulatorFlush(gctx, board, payload)
 	}); err != nil {
 		slog.Error("accumulator_flush_dispatch_failed",
-			"agent", a.agentID, "artifacts", len(artifacts), "error", err.Error())
+			"agent", payload.agentID, "artifacts", len(payload.artifacts)+1, "error", err.Error())
 		board.RecordNotificationError("accumulator flush dispatch: " + err.Error())
 	}
+}
+
+// FlushBlocking submits the accumulated artifacts synchronously before
+// returning. Forwarded-request handlers use this before publishing
+// stream completion or route responses so the board/UI sees all tool
+// and child-agent evidence before the user-facing final text.
+func (a *TestamentAccumulator) FlushBlocking(ctx context.Context, board *ClaimsBoard) error {
+	payload := a.beginFlush()
+	if payload == nil {
+		return nil
+	}
+	defer payload.closeLifecycle()
+	if board == nil || len(payload.artifacts) == 0 {
+		return nil
+	}
+	if err := submitAccumulatorFlush(ctx, board, payload); err != nil {
+		slog.Error("accumulator_flush_blocking_failed",
+			"agent", payload.agentID,
+			"artifacts", len(payload.artifacts)+1,
+			"error", err.Error(),
+		)
+		board.RecordNotificationError("accumulator flush blocking: " + err.Error())
+		return err
+	}
+	return nil
 }
 
 // deriveTestamentSummary picks the testament Summary from the

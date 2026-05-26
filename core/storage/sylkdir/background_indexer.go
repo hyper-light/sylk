@@ -275,11 +275,14 @@ func (bi *BackgroundIndexer) Wait() {
 	bi.wg.Wait()
 }
 
-// Close cancels the background worker and waits for it to finish.
-// Safe to call multiple times.
+// Close cancels the background worker, waits for it to finish, and closes
+// the owned global Bleve store. Safe to call multiple times.
 func (bi *BackgroundIndexer) Close() {
 	bi.cancel()
 	bi.wg.Wait()
+	if bi.store != nil {
+		_ = bi.store.CloseAll()
+	}
 }
 
 // BleveStore returns the already-open GlobalVersionBleveStore used by this

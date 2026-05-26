@@ -660,6 +660,11 @@ func (b *ClaimsBoard) SubmitTestaments(ctx context.Context, action Action, testa
 	for i := range testaments {
 		b.testaments[testaments[i].ID] = &testaments[i]
 		b.indexRelations(testaments[i].ID, testaments[i].Relations)
+		for _, artifact := range testaments[i].Artifacts {
+			if artifact != nil {
+				b.indexRelations(artifact.ID, artifact.Relations)
+			}
+		}
 		claimRefs[i] = b.resolveClaimForTestamentLocked(&testaments[i], now)
 	}
 
@@ -747,6 +752,7 @@ func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now tim
 		artifact.Sequence = b.nextSeq()
 		artifact.Created = now
 		artifact.Accessed = now
+		ApplyDefaultArtifactPresentation(artifact)
 		artifact.Presentation = NormalizePresentation(artifact.Presentation)
 	}
 }
@@ -1860,17 +1866,7 @@ func (b *ClaimsBoard) cloneArtifact(id string) (*Artifact, bool) {
 			if a == nil || a.ID != id {
 				continue
 			}
-			clone := *a
-			if a.Metadata != nil {
-				clone.Metadata = make(map[string]any, len(a.Metadata))
-				for k, v := range a.Metadata {
-					clone.Metadata[k] = v
-				}
-			}
-			if a.Relations != nil {
-				clone.Relations = append([]Relation(nil), a.Relations...)
-			}
-			return &clone, true
+			return CloneArtifact(a), true
 		}
 	}
 	return nil, false
@@ -2046,6 +2042,9 @@ func (b *ClaimsBoard) rebuildDerivedState() {
 			high = t.Sequence
 		}
 		for _, a := range t.Artifacts {
+			if a != nil {
+				b.indexRelations(a.ID, a.Relations)
+			}
 			if a != nil && a.Sequence > high {
 				high = a.Sequence
 			}
