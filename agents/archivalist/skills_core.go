@@ -8,10 +8,11 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
+	"github.com/adalundhe/sylk/core/knowledgeruntime"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -107,9 +108,13 @@ func (a *Archivalist) registerFabricSkills() {
 		return board, nil
 	}
 	inboxProvider := func() *claims.ClaimsInbox { return a.claimsInbox }
+	enrichmentProvider := claims.RecallForwardEnrichmentProvider(nil)
+	if a.knowledgeBackend != nil {
+		enrichmentProvider = knowledgeruntime.NewClaimsKnowledgeQueryIndex(a.knowledgeBackend)
+	}
 	a.skills.Register(claims.QueryClaimsBoardSkill(boardProvider))
 	a.skills.Register(claims.QueryBoardSkill(boardProvider, "archivalist"))
-	a.skills.Register(claims.RecallForwardSkill(boardProvider, "archivalist"))
+	a.skills.Register(claims.RecallForwardSkillWithEnrichment(boardProvider, "archivalist", enrichmentProvider))
 	a.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
 	a.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	a.skills.Register(claims.EvaluateValidationSkill(boardProvider))
@@ -117,6 +122,8 @@ func (a *Archivalist) registerFabricSkills() {
 	a.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
 	a.skills.Register(claims.TraverseSkill(boardProvider))
 	a.skills.Register(claims.CarryForwardSkill(boardProvider, "archivalist"))
+	a.skills.Register(claims.ProjectionHealthSkill(boardProvider))
+	a.skills.Register(claims.RebuildClaimsProjectionsSkill(boardProvider))
 
 	fabricCfg := fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,

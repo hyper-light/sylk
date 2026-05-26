@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -82,7 +83,7 @@ func TestCarryForwardAdvanceWritesContinuityAndRecallReadsIt(t *testing.T) {
 		ArtifactKindContinuityCursor,
 		ArtifactKindSessionCursor,
 	} {
-		if !testamentHasArtifactKind(continuity, kind) {
+		if !carryForwardTestamentHasArtifactKind(continuity, kind) {
 			t.Fatalf("continuity testament missing artifact kind %q: %+v", kind, continuity.Artifacts)
 		}
 	}
@@ -159,6 +160,185 @@ func TestCarryForwardIdempotentWithoutNewSourcesAndSupersedesPriorWhenRequested(
 	}
 }
 
+func TestRecallForwardAmendsChainReturnsCumulativeContinuity(t *testing.T) {
+	board := carryForwardTestBoard()
+	firstSource := submitCarrySource(t, board, "librarian", "Initial repository context", []*Artifact{
+		{AgentID: "librarian", Kind: "workspace_read", Reference: "Initial CLI context used Click."},
+	})
+	first, err := CarryForward(context.Background(), board, CarryForwardOptions{AgentID: "architect", Topic: "python cli plan"})
+	if err != nil {
+		t.Fatalf("first carry failed: %v", err)
+	}
+	secondSource := submitCarrySource(t, board, "tester", "Test evidence", []*Artifact{
+		{AgentID: "tester", Kind: "test_output", Reference: "pytest validates the Click command output."},
+	})
+	second, err := CarryForward(context.Background(), board, CarryForwardOptions{AgentID: "architect", Topic: "python cli plan"})
+	if err != nil {
+		t.Fatalf("second carry failed: %v", err)
+	}
+	if second.TestamentID == first.TestamentID {
+		t.Fatalf("second carry reused first testament: first=%+v second=%+v", first, second)
+	}
+
+	recall, err := RecallForward(context.Background(), board, RecallForwardOptions{
+		AgentID:        "architect",
+		Topic:          "python cli plan",
+		IncludeSources: "source_index",
+	})
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if recall.Partial {
+		t.Fatalf("recall unexpectedly partial: %+v", recall.Diagnostics)
+	}
+	if len(recall.Items) != 2 {
+		t.Fatalf("recall items = %d, want latest + amended prior: %+v", len(recall.Items), recall.Items)
+	}
+	if recall.Items[0].TestamentID != second.TestamentID || recall.Items[1].TestamentID != first.TestamentID {
+		t.Fatalf("recall order = %+v, want newest-to-oldest %s then %s", recall.Items, second.TestamentID, first.TestamentID)
+	}
+	if !hasForwardSourceArtifact(recall.Sources, firstSource.Artifacts[0].ID) ||
+		!hasForwardSourceArtifact(recall.Sources, secondSource.Artifacts[0].ID) {
+		t.Fatalf("recall sources missing amended chain sources: %+v", recall.Sources)
+	}
+	if !strings.Contains(recall.WorkingContext, "Initial CLI context") ||
+		!strings.Contains(recall.WorkingContext, "pytest validates") {
+		t.Fatalf("working context is not cumulative: %q", recall.WorkingContext)
+	}
+}
+
+func TestRecallForwardUnknownTopicReturnsEmptySuccess(t *testing.T) {
+	board := carryForwardTestBoard()
+	submitCarrySource(t, board, "librarian", "Unrelated context", []*Artifact{
+		{AgentID: "librarian", Kind: "workspace_read", Reference: "Unrelated evidence."},
+	})
+	recall, err := RecallForward(context.Background(), board, RecallForwardOptions{
+		AgentID: "architect",
+		Topic:   "missing topic",
+	})
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if recall.Partial || len(recall.Items) != 0 || len(recall.Sources) != 0 {
+		t.Fatalf("unknown topic recall = partial=%v items=%d sources=%d diagnostics=%+v", recall.Partial, len(recall.Items), len(recall.Sources), recall.Diagnostics)
+	}
+}
+
+func TestCarryForwardConcurrentSameTopicProducesSingleContinuityNode(t *testing.T) {
+	board := carryForwardTestBoard()
+	submitCarrySource(t, board, "librarian", "Concurrent context", []*Artifact{
+		{AgentID: "librarian", Kind: "workspace_read", Reference: "One durable source for concurrent carry."},
+	})
+	const workers = 8
+	var wg sync.WaitGroup
+	results := make(chan *CarryForwardResult, workers)
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := CarryForward(context.Background(), board, CarryForwardOptions{
+				AgentID: "architect",
+				Topic:   "python cli plan",
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- res
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent carry failed: %v", err)
+	}
+	mutated := 0
+	for res := range results {
+		if res.Mutated {
+			mutated++
+		}
+	}
+	if mutated != 1 {
+		t.Fatalf("mutated carries = %d, want 1", mutated)
+	}
+	recall, err := RecallForward(context.Background(), board, RecallForwardOptions{AgentID: "architect", Topic: "python cli plan"})
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if len(recall.Items) != 1 {
+		t.Fatalf("continuity nodes = %d, want 1: %+v", len(recall.Items), recall.Items)
+	}
+}
+
+func TestCarryForwardSourceSelectionHonorsMaxSources(t *testing.T) {
+	board := carryForwardTestBoard()
+	for _, ref := range []string{
+		"Workspace fact one for Python CLI planning.",
+		"Workspace fact two for Python CLI planning.",
+		"Workspace fact three for Python CLI planning.",
+	} {
+		submitCarrySource(t, board, "librarian", ref, []*Artifact{
+			{AgentID: "librarian", Kind: "workspace_read", Reference: ref},
+		})
+	}
+	result, err := CarryForward(context.Background(), board, CarryForwardOptions{
+		AgentID:    "architect",
+		Topic:      "python cli planning",
+		Mode:       "preview",
+		MaxSources: 2,
+	})
+	if err != nil {
+		t.Fatalf("carry preview failed: %v", err)
+	}
+	if result.SourceCount != 2 || len(result.Sources) != 2 {
+		t.Fatalf("selected sources = count %d len %d, want 2: %+v", result.SourceCount, len(result.Sources), result.Sources)
+	}
+}
+
+func TestCarryForwardSkipsAlreadyIncorporatedDigestUnlessRevalidated(t *testing.T) {
+	board := carryForwardTestBoard()
+	submitCarrySource(t, board, "librarian", "Initial duplicate digest source", []*Artifact{
+		{AgentID: "librarian", Kind: "workspace_read", Reference: "The CLI should keep the existing Click command shape."},
+	})
+	first, err := CarryForward(context.Background(), board, CarryForwardOptions{
+		AgentID: "architect",
+		Topic:   "python cli planning",
+	})
+	if err != nil {
+		t.Fatalf("first carry failed: %v", err)
+	}
+
+	submitCarrySource(t, board, "librarian", "Duplicate duplicate digest source", []*Artifact{
+		{AgentID: "librarian", Kind: "workspace_read", Reference: "The CLI should keep the existing Click command shape."},
+	})
+	duplicate, err := CarryForward(context.Background(), board, CarryForwardOptions{
+		AgentID: "architect",
+		Topic:   "python cli planning",
+	})
+	if err != nil {
+		t.Fatalf("duplicate carry failed: %v", err)
+	}
+	if duplicate.Mutated {
+		t.Fatalf("duplicate digest carried again: first=%+v duplicate=%+v", first, duplicate)
+	}
+
+	submitCarrySource(t, board, "librarian", "Revalidated duplicate digest source", []*Artifact{
+		{AgentID: "librarian", Kind: "workspace_read", Reference: "The CLI should keep the existing Click command shape.", Metadata: map[string]any{"status": "revalidated"}},
+	})
+	revalidated, err := CarryForward(context.Background(), board, CarryForwardOptions{
+		AgentID: "architect",
+		Topic:   "python cli planning",
+	})
+	if err != nil {
+		t.Fatalf("revalidated carry failed: %v", err)
+	}
+	if !revalidated.Mutated || revalidated.TestamentID == first.TestamentID {
+		t.Fatalf("revalidated duplicate was not carried as a new source: first=%+v revalidated=%+v", first, revalidated)
+	}
+}
+
 func TestRecallForwardCrossSessionUsesSessionCursorAndReportsPartialWithoutOpener(t *testing.T) {
 	previous := carryForwardTestBoardWithIDs("prev-board", "prev-session")
 	submitCarrySource(t, previous, "librarian", "Previous session context", []*Artifact{
@@ -225,6 +405,166 @@ func TestRecallForwardCrossSessionUsesSessionCursorAndReportsPartialWithoutOpene
 	}
 }
 
+func TestRecallForwardCrossSessionUsesExactPreviousContinuityTestament(t *testing.T) {
+	previous := carryForwardTestBoardWithIDs("prev-board", "prev-session")
+	submitCarrySource(t, previous, "librarian", "Old previous context", []*Artifact{
+		{AgentID: "librarian", Kind: "workspace_read", Reference: "Old previous session selected argparse."},
+	})
+	oldPrev, err := CarryForward(context.Background(), previous, CarryForwardOptions{AgentID: "architect", Topic: "python cli plan"})
+	if err != nil {
+		t.Fatalf("old previous carry failed: %v", err)
+	}
+	submitCarrySource(t, previous, "librarian", "New previous context", []*Artifact{
+		{AgentID: "librarian", Kind: "workspace_read", Reference: "New previous session selected Click."},
+	})
+	newPrev, err := CarryForward(context.Background(), previous, CarryForwardOptions{AgentID: "architect", Topic: "python cli plan"})
+	if err != nil {
+		t.Fatalf("new previous carry failed: %v", err)
+	}
+	if oldPrev.TestamentID == newPrev.TestamentID {
+		t.Fatalf("expected separate previous continuity nodes")
+	}
+
+	current := carryForwardTestBoardWithIDs("current-board", "current-session")
+	submitCarrySource(t, current, "architect", "Current exact context", []*Artifact{
+		{AgentID: "architect", Kind: "decision", Reference: "Current session deliberately links to old previous context."},
+	})
+	if _, err := CarryForward(context.Background(), current, CarryForwardOptions{
+		AgentID:                       "architect",
+		Topic:                         "python cli plan",
+		PreviousSessionID:             "prev-session",
+		PreviousContinuityTestamentID: oldPrev.TestamentID,
+	}); err != nil {
+		t.Fatalf("current carry failed: %v", err)
+	}
+	recall, err := RecallForward(context.Background(), current, RecallForwardOptions{
+		AgentID:          "architect",
+		Topic:            "python cli plan",
+		LookbackSessions: 1,
+		OpenBoard: func(_ context.Context, sessionID string) (*ClaimsBoard, func(), error) {
+			if sessionID != "prev-session" {
+				t.Fatalf("opened session %q, want prev-session", sessionID)
+			}
+			return previous, nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if recall.Partial {
+		t.Fatalf("recall unexpectedly partial: %+v", recall.Diagnostics)
+	}
+	if !strings.Contains(recall.WorkingContext, "Old previous session selected argparse") {
+		t.Fatalf("recall did not hydrate exact previous testament: %q", recall.WorkingContext)
+	}
+	if strings.Contains(recall.WorkingContext, "New previous session selected Click") {
+		t.Fatalf("recall used latest previous session node instead of exact cursor: %q", recall.WorkingContext)
+	}
+}
+
+func TestRecallForwardCrossSessionFollowsOldestCurrentAmendsNodeToPreviousSession(t *testing.T) {
+	previous := carryForwardTestBoardWithIDs("prev-board", "prev-session")
+	submitCarrySource(t, previous, "librarian", "Previous session context", []*Artifact{
+		{AgentID: "librarian", Kind: "workspace_read", Reference: "Previous session selected Click."},
+	})
+	prevCarry, err := CarryForward(context.Background(), previous, CarryForwardOptions{
+		AgentID: "architect",
+		Topic:   "python cli plan",
+	})
+	if err != nil {
+		t.Fatalf("previous carry failed: %v", err)
+	}
+
+	current := carryForwardTestBoardWithIDs("current-board", "current-session")
+	submitCarrySource(t, current, "architect", "Current first context", []*Artifact{
+		{AgentID: "architect", Kind: "decision", Reference: "Current session linked to previous Click evidence."},
+	})
+	firstCurrent, err := CarryForward(context.Background(), current, CarryForwardOptions{
+		AgentID:                       "architect",
+		Topic:                         "python cli plan",
+		PreviousSessionID:             "prev-session",
+		PreviousContinuityTestamentID: prevCarry.TestamentID,
+	})
+	if err != nil {
+		t.Fatalf("first current carry failed: %v", err)
+	}
+	submitCarrySource(t, current, "tester", "Current second context", []*Artifact{
+		{AgentID: "tester", Kind: "test_output", Reference: "Current session test evidence keeps Click viable."},
+	})
+	secondCurrent, err := CarryForward(context.Background(), current, CarryForwardOptions{
+		AgentID: "architect",
+		Topic:   "python cli plan",
+	})
+	if err != nil {
+		t.Fatalf("second current carry failed: %v", err)
+	}
+	if secondCurrent.TestamentID == firstCurrent.TestamentID {
+		t.Fatalf("expected second current carry to amend first: first=%+v second=%+v", firstCurrent, secondCurrent)
+	}
+
+	recall, err := RecallForward(context.Background(), current, RecallForwardOptions{
+		AgentID:          "architect",
+		Topic:            "python cli plan",
+		LookbackSessions: 1,
+		OpenBoard: func(_ context.Context, sessionID string) (*ClaimsBoard, func(), error) {
+			if sessionID != "prev-session" {
+				t.Fatalf("opened session %q, want prev-session", sessionID)
+			}
+			return previous, nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if recall.Partial {
+		t.Fatalf("recall unexpectedly partial: %+v", recall.Diagnostics)
+	}
+	if len(recall.Items) != 3 {
+		t.Fatalf("recall items = %d, want current latest + current amended + previous: %+v", len(recall.Items), recall.Items)
+	}
+	if recall.Items[0].TestamentID != secondCurrent.TestamentID ||
+		recall.Items[1].TestamentID != firstCurrent.TestamentID ||
+		recall.Items[2].TestamentID != prevCarry.TestamentID {
+		t.Fatalf("recall order = %+v, want second current, first current, previous", recall.Items)
+	}
+	if !strings.Contains(recall.WorkingContext, "Previous session selected Click") {
+		t.Fatalf("recall did not cross the session boundary from the amended current node: %q", recall.WorkingContext)
+	}
+}
+
+func TestRecallForwardCrossSessionBrokenExactLinkIsPartial(t *testing.T) {
+	previous := carryForwardTestBoardWithIDs("prev-board", "prev-session")
+	current := carryForwardTestBoardWithIDs("current-board", "current-session")
+	submitCarrySource(t, current, "architect", "Current context", []*Artifact{
+		{AgentID: "architect", Kind: "decision", Reference: "Current session has a broken previous cursor."},
+	})
+	if _, err := CarryForward(context.Background(), current, CarryForwardOptions{
+		AgentID:                       "architect",
+		Topic:                         "python cli plan",
+		PreviousSessionID:             "prev-session",
+		PreviousContinuityTestamentID: "missing-continuity-testament",
+	}); err != nil {
+		t.Fatalf("current carry failed: %v", err)
+	}
+	recall, err := RecallForward(context.Background(), current, RecallForwardOptions{
+		AgentID:          "architect",
+		Topic:            "python cli plan",
+		LookbackSessions: 1,
+		OpenBoard: func(_ context.Context, sessionID string) (*ClaimsBoard, func(), error) {
+			return previous, nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if !recall.Partial || len(recall.Items) != 1 {
+		t.Fatalf("broken link recall = partial=%v items=%d diagnostics=%+v", recall.Partial, len(recall.Items), recall.Diagnostics)
+	}
+	if !diagnosticsContain(recall.Diagnostics, "broken continuity spine") {
+		t.Fatalf("missing broken-spine diagnostic: %+v", recall.Diagnostics)
+	}
+}
+
 func TestDurableSessionBoardOpenerFromBoardHydratesPreviousSession(t *testing.T) {
 	base := t.TempDir()
 	prevDB, err := OpenDurableBoard(ClaimsBoardConfig{
@@ -288,6 +628,77 @@ func TestDurableSessionBoardOpenerFromBoardHydratesPreviousSession(t *testing.T)
 	}
 	if !strings.Contains(recall.WorkingContext, "Previous durable board selected Cobra") {
 		t.Fatalf("durable recall missing previous board context: %q", recall.WorkingContext)
+	}
+}
+
+func TestRecallForwardReportsStaleContradictedAndProjectionDiagnostics(t *testing.T) {
+	board := carryForwardTestBoard()
+	if err := board.SubmitTestaments(context.Background(), Action{AgentID: "claims-board", Type: ActionTypeTestament}, []Testament{{
+		AgentID:    "claims-board",
+		Summary:    "projection failed",
+		Confidence: "committed",
+		Artifacts: []*Artifact{{
+			Kind:      ArtifactKindProjectionError,
+			Reference: "projection_error projector=knowledge board=board-1 sequence=7 entity=artifact/a1: unavailable",
+		}},
+	}}); err != nil {
+		t.Fatalf("submit projection diagnostic: %v", err)
+	}
+	if err := board.SubmitTestaments(context.Background(), Action{AgentID: "architect", Type: ActionTypeTestament}, []Testament{{
+		AgentID:    "architect",
+		Summary:    "stale continuity",
+		Confidence: "committed",
+		Artifacts: []*Artifact{
+			{Kind: ArtifactKindWorkingContext, Reference: "Old context", Metadata: map[string]any{"stale": true}},
+			{Kind: ArtifactKindEvidenceDigest, Reference: "Old digest", Metadata: map[string]any{"contradicted": true}},
+			{Kind: ArtifactKindSourceIndex, Reference: "0 source(s)", Metadata: map[string]any{"sources": []ForwardSource{}, "topic": "python cli plan", "agent_id": "architect"}},
+			{Kind: ArtifactKindContinuityCursor, Reference: "0..1", Metadata: map[string]any{"topic": "python cli plan", "agent_id": "architect", "from_sequence": 0, "through_sequence": 1}},
+			{Kind: ArtifactKindSessionCursor, Reference: "session=session-1 board=board-1 through=1", Metadata: map[string]any{"topic": "python cli plan", "agent_id": "architect", "session_id": "session-1", "board_id": "board-1", "through_sequence": 1}},
+		},
+	}}); err != nil {
+		t.Fatalf("submit stale continuity: %v", err)
+	}
+	recall, err := RecallForward(context.Background(), board, RecallForwardOptions{AgentID: "architect", Topic: "python cli plan"})
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if !recall.Stale || !recall.Contradicted {
+		t.Fatalf("recall stale=%v contradicted=%v, want both true", recall.Stale, recall.Contradicted)
+	}
+	if !diagnosticsContain(recall.Diagnostics, "projection_error projector=knowledge") {
+		t.Fatalf("projection diagnostic missing: %+v", recall.Diagnostics)
+	}
+}
+
+func TestCarryForwardEvidenceDigestUsesStructuredSourceFindings(t *testing.T) {
+	board := carryForwardTestBoard()
+	source := submitCarrySource(t, board, "librarian", "Projected source", []*Artifact{
+		{AgentID: "librarian", Kind: "workspace_read", Reference: "Projected workspace evidence.", Metadata: map[string]any{"projection_document_id": "claims_board_artifact_a1"}},
+	})
+	result, err := CarryForward(context.Background(), board, CarryForwardOptions{AgentID: "architect", Topic: "python cli plan"})
+	if err != nil {
+		t.Fatalf("carry failed: %v", err)
+	}
+	continuity, ok := board.CloneTestament(result.TestamentID)
+	if !ok {
+		t.Fatalf("continuity testament not found")
+	}
+	digest := artifactByKind(continuity, ArtifactKindEvidenceDigest)
+	if digest == nil {
+		t.Fatal("evidence_digest artifact missing")
+	}
+	findings, ok := digest.Metadata["findings"].([]map[string]any)
+	if !ok || len(findings) != 1 {
+		t.Fatalf("findings metadata = %#v, want one structured finding", digest.Metadata["findings"])
+	}
+	if findings[0]["source_artifact_id"] != source.Artifacts[0].ID ||
+		findings[0]["source_testament_id"] != source.ID ||
+		findings[0]["selected_by"] == "" {
+		t.Fatalf("structured finding missing source metadata: %#v", findings[0])
+	}
+	docs, ok := findings[0]["projection_document_ids"].([]string)
+	if !ok || len(docs) != 1 || docs[0] != "claims_board_artifact_a1" {
+		t.Fatalf("projection document IDs = %#v", findings[0]["projection_document_ids"])
 	}
 }
 
@@ -372,7 +783,34 @@ func hasForwardSourceKind(sources []ForwardSource, kind string) bool {
 	return false
 }
 
-func testamentHasArtifactKind(t *Testament, kind string) bool {
+func hasForwardSourceArtifact(sources []ForwardSource, artifactID string) bool {
+	for _, source := range sources {
+		if source.ArtifactID == artifactID {
+			return true
+		}
+	}
+	return false
+}
+
+func diagnosticsContain(diagnostics []string, needle string) bool {
+	for _, msg := range diagnostics {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func artifactByKind(t *Testament, kind string) *Artifact {
+	for _, artifact := range t.Artifacts {
+		if artifact != nil && artifact.Kind == kind {
+			return artifact
+		}
+	}
+	return nil
+}
+
+func carryForwardTestamentHasArtifactKind(t *Testament, kind string) bool {
 	for _, artifact := range t.Artifacts {
 		if artifact != nil && artifact.Kind == kind {
 			return true

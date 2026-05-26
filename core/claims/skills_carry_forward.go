@@ -77,6 +77,10 @@ func CarryForwardSkill(bp BoardProvider, defaultAgentID string) *skills.Skill {
 }
 
 func RecallForwardSkill(bp BoardProvider, defaultAgentID string, openers ...SessionBoardOpener) *skills.Skill {
+	return RecallForwardSkillWithEnrichment(bp, defaultAgentID, nil, openers...)
+}
+
+func RecallForwardSkillWithEnrichment(bp BoardProvider, defaultAgentID string, enrichment RecallForwardEnrichmentProvider, openers ...SessionBoardOpener) *skills.Skill {
 	var opener SessionBoardOpener
 	if len(openers) > 0 {
 		opener = openers[0]
@@ -117,12 +121,13 @@ func RecallForwardSkill(bp BoardProvider, defaultAgentID string, openers ...Sess
 				resolvedOpener = DurableSessionBoardOpenerFromBoard(board)
 			}
 			return RecallForward(ctx, board, RecallForwardOptions{
-				AgentID:          agentID,
-				Topic:            params.Topic,
-				LookbackSessions: params.LookbackSessions,
-				MaxItems:         params.MaxItems,
-				IncludeSources:   params.IncludeSources,
-				OpenBoard:        resolvedOpener,
+				AgentID:            agentID,
+				Topic:              params.Topic,
+				LookbackSessions:   params.LookbackSessions,
+				MaxItems:           params.MaxItems,
+				IncludeSources:     params.IncludeSources,
+				OpenBoard:          resolvedOpener,
+				EnrichmentProvider: enrichment,
 			})
 		}).
 		Build()
@@ -147,4 +152,87 @@ func parseCarryForwardDuration(raw string) (time.Duration, error) {
 		return 0, fmt.Errorf("freshness_horizon must not be negative")
 	}
 	return d, nil
+}
+
+func RebuildClaimsProjectionsSkill(bp BoardProvider) *skills.Skill {
+	return skills.NewSkill("rebuild_claims_projections").
+		Description("Repair or replay the deterministic claims projection outbox for the current durable session board. Replays existing outbox records through existing projectors such as fabric and knowledge; it does not mutate canonical claims except when emit_report=true records a rebuild report testament. Use dry_run=true first.").
+		Domain("claims").
+		Keywords("claims", "projection", "outbox", "repair", "rebuild", "knowledge", "fabric").
+		Priority(30).
+		StringParam("projectors", "Optional comma-separated projector names, e.g. fabric,knowledge. Empty means all registered projectors.", false).
+		IntParam("from_sequence", "Optional inclusive starting board sequence.", false).
+		IntParam("to_sequence", "Optional inclusive ending board sequence.", false).
+		IntParam("limit", "Optional maximum number of outbox records to inspect.", false).
+		BoolParam("dry_run", "When true, report what would be replayed without calling projectors or changing outbox state.", false).
+		BoolParam("resume_from_last_success", "When true, skip records already marked succeeded for each selected projector.", false).
+		BoolParam("emit_report", "When true, submit a projection_rebuild_report testament to the board.", false).
+		Usage("Use for operational repair when projection health shows lag, retryable failures, or missing deterministic knowledge/fabric projection. Prefer dry_run=true before replaying.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			board, err := requireBoard(bp)
+			if err != nil {
+				return nil, fmt.Errorf("claims board: %w", err)
+			}
+			var params struct {
+				Projectors            string `json:"projectors"`
+				FromSequence          int    `json:"from_sequence"`
+				ToSequence            int    `json:"to_sequence"`
+				Limit                 int    `json:"limit"`
+				DryRun                bool   `json:"dry_run"`
+				ResumeFromLastSuccess bool   `json:"resume_from_last_success"`
+				EmitReport            bool   `json:"emit_report"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			return board.RebuildProjections(ctx, ProjectionRebuildOptions{
+				Projectors:            splitProjectorParam(params.Projectors),
+				FromSequence:          positiveIntToUint64(params.FromSequence),
+				ToSequence:            positiveIntToUint64(params.ToSequence),
+				Limit:                 params.Limit,
+				DryRun:                params.DryRun,
+				ResumeFromLastSuccess: params.ResumeFromLastSuccess,
+				EmitReport:            params.EmitReport,
+			})
+		}).
+		Build()
+}
+
+func ProjectionHealthSkill(bp BoardProvider) *skills.Skill {
+	return skills.NewSkill("claims_projection_health").
+		Description("Inspect deterministic claims projection health: outbox lag, queue depth, retry counts, terminal failures, expired leases, and per-projector backlog.").
+		Domain("claims").
+		Keywords("claims", "projection", "health", "outbox", "lag", "retries").
+		Priority(60).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			board, err := requireBoard(bp)
+			if err != nil {
+				return nil, fmt.Errorf("claims board: %w", err)
+			}
+			return board.ProjectionHealth(), nil
+		}).
+		Build()
+}
+
+func splitProjectorParam(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func positiveIntToUint64(value int) uint64 {
+	if value <= 0 {
+		return 0
+	}
+	return uint64(value)
 }

@@ -39,6 +39,9 @@ func (s *Scribe) Receive(ctx context.Context, a activity.AgentActivity) {
 	if !s.passesProfileFilters(a, profile) {
 		return
 	}
+	if s.maybeNarrateContinuityActivity(ctx, a) {
+		return
+	}
 	s.batchAdmit(a)
 	s.evaluateBatchTrigger(ctx, a, profile, false)
 }
@@ -375,11 +378,11 @@ func buildBatchUserRequest(parentAgentType, trigger string, batch []activity.Age
 // chronological prose in UserRequest.
 func buildBatchAgentResponse(batch []activity.AgentActivity) string {
 	type entry struct {
-		ID         activity.ActivityID `json:"id"`
-		Action     activity.ActionKind `json:"action"`
+		ID         activity.ActivityID    `json:"id"`
+		Action     activity.ActionKind    `json:"action"`
 		State      activity.ActivityState `json:"state"`
-		Confidence activity.Confidence `json:"confidence,omitempty"`
-		Subject    activity.Subject `json:"subject"`
+		Confidence activity.Confidence    `json:"confidence,omitempty"`
+		Subject    activity.Subject       `json:"subject"`
 	}
 	out := make([]entry, 0, len(batch))
 	for _, a := range batch {

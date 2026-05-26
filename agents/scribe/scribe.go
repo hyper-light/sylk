@@ -120,6 +120,11 @@ type Scribe struct {
 	// fabricUnsubscribe releases this scribe's Subscriber registration
 	// against the SubscribingSink. Set by Start; called by Stop.
 	fabricUnsubscribe func()
+
+	// continuityNarrated deduplicates deterministic narration of
+	// carry-forward continuity testaments observed through claims fabric
+	// projection. Keyed by source continuity testament ID.
+	continuityNarrated sync.Map
 }
 
 type scribeWorkstream struct {

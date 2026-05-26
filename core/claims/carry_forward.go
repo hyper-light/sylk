@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -61,29 +62,72 @@ type CarryForwardResult struct {
 }
 
 type RecallForwardOptions struct {
-	AgentID          string
-	Topic            string
-	LookbackSessions int
-	MaxItems         int
-	IncludeSources   string
-	OpenBoard        SessionBoardOpener
+	AgentID            string
+	Topic              string
+	LookbackSessions   int
+	MaxItems           int
+	IncludeSources     string
+	OpenBoard          SessionBoardOpener
+	EnrichmentProvider RecallForwardEnrichmentProvider
 }
 
 type SessionBoardOpener func(ctx context.Context, sessionID string) (*ClaimsBoard, func(), error)
 
+type RecallForwardEnrichmentProvider interface {
+	LookupCarryForwardEnrichment(ctx context.Context, query RecallForwardEnrichmentQuery) ([]RecallForwardEnrichment, error)
+}
+
+type RecallForwardEnrichmentQuery struct {
+	AgentID              string `json:"agent_id"`
+	Topic                string `json:"topic"`
+	SessionID            string `json:"session_id,omitempty"`
+	BoardID              string `json:"board_id,omitempty"`
+	ClaimID              string `json:"claim_id,omitempty"`
+	TestamentID          string `json:"testament_id,omitempty"`
+	EntityType           string `json:"entity_type,omitempty"`
+	RelationType         string `json:"relation_type,omitempty"`
+	RelationRelationship string `json:"relation_relationship,omitempty"`
+	RelatedID            string `json:"related_id,omitempty"`
+	MaxItems             int    `json:"max_items,omitempty"`
+	IncludeSource        string `json:"include_source,omitempty"`
+}
+
+type RecallForwardEnrichment struct {
+	Source        string  `json:"source"`
+	DocumentID    string  `json:"document_id,omitempty"`
+	Path          string  `json:"path,omitempty"`
+	EntityType    string  `json:"entity_type,omitempty"`
+	EntityID      string  `json:"entity_id,omitempty"`
+	ClaimID       string  `json:"claim_id,omitempty"`
+	TestamentID   string  `json:"testament_id,omitempty"`
+	ArtifactID    string  `json:"artifact_id,omitempty"`
+	SessionID     string  `json:"session_id,omitempty"`
+	BoardID       string  `json:"board_id,omitempty"`
+	AgentID       string  `json:"agent_id,omitempty"`
+	Topic         string  `json:"topic,omitempty"`
+	Score         float64 `json:"score,omitempty"`
+	Summary       string  `json:"summary,omitempty"`
+	EnrichedBy    string  `json:"enriched_by,omitempty"`
+	GraphNodeID   string  `json:"graph_node_id,omitempty"`
+	GraphNodeType string  `json:"graph_node_type,omitempty"`
+}
+
 type RecallForwardResult struct {
-	AgentID          string                 `json:"agent_id"`
-	Topic            string                 `json:"topic"`
-	LookbackSessions int                    `json:"lookback_sessions"`
-	IncludeSources   string                 `json:"include_sources"`
-	Partial          bool                   `json:"partial"`
-	Diagnostics      []string               `json:"diagnostics,omitempty"`
-	Items            []ContinuityRecallItem `json:"items"`
-	WorkingContext   string                 `json:"working_context,omitempty"`
-	EvidenceDigest   string                 `json:"evidence_digest,omitempty"`
-	Sources          []ForwardSource        `json:"sources,omitempty"`
-	FullTestaments   []*Testament           `json:"full_testaments,omitempty"`
-	FullArtifacts    []*Artifact            `json:"full_artifacts,omitempty"`
+	AgentID          string                    `json:"agent_id"`
+	Topic            string                    `json:"topic"`
+	LookbackSessions int                       `json:"lookback_sessions"`
+	IncludeSources   string                    `json:"include_sources"`
+	Partial          bool                      `json:"partial"`
+	Stale            bool                      `json:"stale,omitempty"`
+	Contradicted     bool                      `json:"contradicted,omitempty"`
+	Diagnostics      []string                  `json:"diagnostics,omitempty"`
+	Items            []ContinuityRecallItem    `json:"items"`
+	WorkingContext   string                    `json:"working_context,omitempty"`
+	EvidenceDigest   string                    `json:"evidence_digest,omitempty"`
+	Sources          []ForwardSource           `json:"sources,omitempty"`
+	FullTestaments   []*Testament              `json:"full_testaments,omitempty"`
+	FullArtifacts    []*Artifact               `json:"full_artifacts,omitempty"`
+	Enrichment       []RecallForwardEnrichment `json:"enrichment,omitempty"`
 }
 
 type ContinuityRecallItem struct {
@@ -93,6 +137,8 @@ type ContinuityRecallItem struct {
 	TestamentID     string          `json:"testament_id"`
 	FromSequence    uint64          `json:"from_sequence"`
 	ThroughSequence uint64          `json:"through_sequence"`
+	Stale           bool            `json:"stale,omitempty"`
+	Contradicted    bool            `json:"contradicted,omitempty"`
 	WorkingContext  string          `json:"working_context,omitempty"`
 	EvidenceDigest  string          `json:"evidence_digest,omitempty"`
 	Sources         []ForwardSource `json:"sources,omitempty"`
@@ -100,13 +146,34 @@ type ContinuityRecallItem struct {
 }
 
 type ForwardSource struct {
-	TestamentID string `json:"testament_id,omitempty"`
-	ArtifactID  string `json:"artifact_id,omitempty"`
-	AgentID     string `json:"agent_id,omitempty"`
-	Kind        string `json:"kind,omitempty"`
-	Sequence    uint64 `json:"sequence,omitempty"`
-	Reason      string `json:"reason,omitempty"`
-	Digest      string `json:"digest,omitempty"`
+	TestamentID           string   `json:"testament_id,omitempty"`
+	ArtifactID            string   `json:"artifact_id,omitempty"`
+	AgentID               string   `json:"agent_id,omitempty"`
+	Kind                  string   `json:"kind,omitempty"`
+	Sequence              uint64   `json:"sequence,omitempty"`
+	Reason                string   `json:"reason,omitempty"`
+	SelectedBy            string   `json:"selected_by,omitempty"`
+	Score                 int      `json:"score,omitempty"`
+	Digest                string   `json:"digest,omitempty"`
+	ProjectionDocumentIDs []string `json:"projection_document_ids,omitempty"`
+}
+
+type ContinuityDetails struct {
+	AgentID         string          `json:"agent_id"`
+	Topic           string          `json:"topic"`
+	SessionID       string          `json:"session_id"`
+	BoardID         string          `json:"board_id"`
+	ClaimID         string          `json:"claim_id,omitempty"`
+	TestamentID     string          `json:"testament_id"`
+	FromSequence    uint64          `json:"from_sequence"`
+	ThroughSequence uint64          `json:"through_sequence"`
+	WorkingContext  string          `json:"working_context,omitempty"`
+	EvidenceDigest  string          `json:"evidence_digest,omitempty"`
+	Sources         []ForwardSource `json:"sources,omitempty"`
+	Stale           bool            `json:"stale,omitempty"`
+	Contradicted    bool            `json:"contradicted,omitempty"`
+	Cursor          map[string]any  `json:"cursor,omitempty"`
+	SessionCursor   map[string]any  `json:"session_cursor,omitempty"`
 }
 
 type continuityRecord struct {
@@ -117,13 +184,70 @@ type continuityRecord struct {
 	WorkingContext  string
 	EvidenceDigest  string
 	Sources         []ForwardSource
+	Stale           bool
+	Contradicted    bool
 	Cursor          map[string]any
 	SessionCursor   map[string]any
+}
+
+func IsContinuityTestament(t *Testament) bool {
+	return isContinuityTestament(t)
+}
+
+func ContinuityDetailsForTestament(t *Testament) (*ContinuityDetails, bool) {
+	if t == nil {
+		return nil, false
+	}
+	for _, artifact := range t.Artifacts {
+		if artifact == nil || artifact.Kind != ArtifactKindContinuityCursor {
+			continue
+		}
+		agentID := strings.TrimSpace(metadataString(artifact.Metadata, "agent_id"))
+		topic := normalizeContinuityTopic(metadataString(artifact.Metadata, "topic"))
+		if agentID == "" || topic == "" {
+			return nil, false
+		}
+		rec, ok := continuityFromTestament(t, agentID, topic)
+		if !ok {
+			return nil, false
+		}
+		return &ContinuityDetails{
+			AgentID:         agentID,
+			Topic:           topic,
+			SessionID:       t.SessionID,
+			BoardID:         metadataString(rec.Cursor, "board_id"),
+			ClaimID:         rec.ClaimID,
+			TestamentID:     t.ID,
+			FromSequence:    rec.FromSequence,
+			ThroughSequence: rec.ThroughSequence,
+			WorkingContext:  rec.WorkingContext,
+			EvidenceDigest:  rec.EvidenceDigest,
+			Sources:         rec.Sources,
+			Stale:           rec.Stale,
+			Contradicted:    rec.Contradicted,
+			Cursor:          cloneAnyMap(rec.Cursor),
+			SessionCursor:   cloneAnyMap(rec.SessionCursor),
+		}, true
+	}
+	return nil, false
 }
 
 type scoredForwardSource struct {
 	source ForwardSource
 	score  int
+}
+
+var carryForwardLocks sync.Map
+
+func carryForwardLock(board *ClaimsBoard, agentID, topic string) *sync.Mutex {
+	key := strings.Join([]string{
+		board.BoardID(),
+		board.SessionID(),
+		strings.TrimSpace(agentID),
+		normalizeContinuityTopic(topic),
+	}, "\x1f")
+	actual, _ := carryForwardLocks.LoadOrStore(key, &sync.Mutex{})
+	return actual.(*sync.Mutex)
 }
 
 func CarryForward(ctx context.Context, board *ClaimsBoard, opts CarryForwardOptions) (*CarryForwardResult, error) {
@@ -160,6 +284,10 @@ func CarryForward(ctx context.Context, board *ClaimsBoard, opts CarryForwardOpti
 		now = time.Now().UTC()
 	}
 
+	lock := carryForwardLock(board, agentID, topic)
+	lock.Lock()
+	defer lock.Unlock()
+
 	prior, hasPrior := latestContinuityRecord(board, agentID, topic)
 	fromSeq := uint64(0)
 	priorID := ""
@@ -183,7 +311,7 @@ func CarryForward(ctx context.Context, board *ClaimsBoard, opts CarryForwardOpti
 		return result, nil
 	}
 
-	sources := selectForwardSources(board, agentID, topic, fromSeq, throughSeq, maxSources, opts.FreshnessHorizon, now)
+	sources := selectForwardSources(board, agentID, topic, fromSeq, throughSeq, maxSources, opts.FreshnessHorizon, now, incorporatedSourcesForRecord(board, prior, agentID, topic))
 	result.Sources = make([]ForwardSource, len(sources))
 	for i := range sources {
 		result.Sources[i] = sources[i].source
@@ -209,6 +337,13 @@ func CarryForward(ctx context.Context, board *ClaimsBoard, opts CarryForwardOpti
 	}
 	result.ClaimID = claim.ID
 	result.ContinuityClaimReused = reused
+	if latest, ok := latestContinuityRecord(board, agentID, topic); ok && latest.ThroughSequence >= throughSeq && latest.Testament.ID != priorID {
+		result.Mutated = false
+		result.NoopReason = "continuity cursor already advanced by another carry_forward call"
+		result.TestamentID = latest.Testament.ID
+		result.PriorTestamentID = priorID
+		return result, nil
+	}
 
 	t := Testament{
 		AgentID:    agentID,
@@ -266,29 +401,23 @@ func RecallForward(ctx context.Context, board *ClaimsBoard, opts RecallForwardOp
 		LookbackSessions: lookback,
 		IncludeSources:   include,
 	}
+	appendProjectionDiagnostics(board, result)
 	current := board
 	remaining := lookback
+	rec, ok := latestContinuityRecord(current, agentID, topic)
+	if !ok {
+		return result, nil
+	}
 	for {
-		rec, ok := latestContinuityRecord(current, agentID, topic)
-		if !ok {
-			result.Partial = true
-			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("no continuity testament for agent=%s topic=%q session=%s", agentID, topic, current.SessionID()))
-			break
-		}
-		item := continuityRecallItem(current, rec, include)
-		result.Items = append(result.Items, item)
-		result.WorkingContext = appendContextBlock(result.WorkingContext, item.WorkingContext)
-		result.EvidenceDigest = appendContextBlock(result.EvidenceDigest, item.EvidenceDigest)
-		if include == "source_index" || include == "full" {
-			result.Sources = appendBoundedSources(result.Sources, item.Sources, maxItems)
-		}
-		if include == "full" {
-			appendFullSources(current, item.Sources, &result.FullTestaments, &result.FullArtifacts, maxItems)
-		}
+		chain := appendContinuityChain(ctx, current, rec, include, maxItems, result)
 		if len(result.Items) >= maxItems || remaining <= 0 {
 			break
 		}
-		nextSession := metadataString(rec.SessionCursor, "previous_session_id")
+		sessionAnchor := rec
+		if chain.HasLast {
+			sessionAnchor = chain.Last
+		}
+		nextSession := metadataString(sessionAnchor.SessionCursor, "previous_session_id")
 		if nextSession == "" {
 			break
 		}
@@ -311,29 +440,84 @@ func RecallForward(ctx context.Context, board *ClaimsBoard, opts RecallForwardOp
 			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("previous session %s opened nil board", nextSession))
 			break
 		}
+		appendProjectionDiagnostics(nextBoard, result)
 		current = nextBoard
+		nextID := metadataString(sessionAnchor.SessionCursor, "previous_continuity_testament_id")
+		if nextID != "" {
+			nextRec, ok := continuityRecordByID(current, nextID, agentID, topic)
+			if !ok {
+				result.Partial = true
+				result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("broken continuity spine from testament=%s session=%s: previous_continuity_testament_id %s not found for agent=%s topic=%q", sessionAnchor.Testament.ID, nextSession, nextID, agentID, topic))
+				break
+			}
+			rec = nextRec
+		} else {
+			nextRec, ok := latestContinuityRecord(current, agentID, topic)
+			if !ok {
+				result.Partial = true
+				result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("continuity spine ended at session=%s: no continuity testament for agent=%s topic=%q", nextSession, agentID, topic))
+				break
+			}
+			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("session %s did not provide previous_continuity_testament_id; used latest matching continuity testament %s", nextSession, nextRec.Testament.ID))
+			rec = nextRec
+		}
 		remaining--
 	}
+	appendRecallEnrichment(ctx, opts.EnrichmentProvider, result, maxItems)
 	return result, nil
 }
 
-func latestContinuityRecord(board *ClaimsBoard, agentID, topic string) (continuityRecord, bool) {
-	p := board.Projection()
-	superseded := make(map[string]struct{})
-	records := make([]continuityRecord, 0)
-	for i := range p.Testaments {
-		t, ok := board.CloneTestament(p.Testaments[i].ID)
-		if !ok || t == nil {
-			continue
+func appendRecallEnrichment(ctx context.Context, provider RecallForwardEnrichmentProvider, result *RecallForwardResult, maxItems int) {
+	if provider == nil || result == nil || len(result.Items) == 0 {
+		return
+	}
+	limit := maxItems
+	if limit <= 0 {
+		limit = 8
+	}
+	seen := make(map[string]struct{})
+	for _, item := range result.Items {
+		if len(result.Enrichment) >= limit {
+			return
 		}
+		hits, err := provider.LookupCarryForwardEnrichment(ctx, RecallForwardEnrichmentQuery{
+			AgentID:       result.AgentID,
+			Topic:         result.Topic,
+			SessionID:     item.SessionID,
+			BoardID:       item.BoardID,
+			ClaimID:       item.ClaimID,
+			TestamentID:   item.TestamentID,
+			MaxItems:      limit - len(result.Enrichment),
+			IncludeSource: result.IncludeSources,
+		})
+		if err != nil {
+			result.Partial = true
+			result.Diagnostics = append(result.Diagnostics, "archivalist enrichment lookup: "+err.Error())
+			return
+		}
+		for _, hit := range hits {
+			key := strings.Join([]string{hit.Source, hit.DocumentID, hit.EntityType, hit.EntityID, hit.Path}, "\x1f")
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			result.Enrichment = append(result.Enrichment, hit)
+			if len(result.Enrichment) >= limit {
+				return
+			}
+		}
+	}
+}
+
+func latestContinuityRecord(board *ClaimsBoard, agentID, topic string) (continuityRecord, bool) {
+	superseded := make(map[string]struct{})
+	records := continuityRecordsFor(board, agentID, topic)
+	for _, rec := range records {
+		t := rec.Testament
 		for _, rel := range t.Relations {
 			if rel.RelatedType == RelatedTypeTestament && rel.Relationship == RelationshipSupersedes {
 				superseded[rel.Related] = struct{}{}
 			}
-		}
-		rec, ok := continuityFromTestament(t, agentID, topic)
-		if ok {
-			records = append(records, rec)
 		}
 	}
 	if len(records) == 0 {
@@ -349,6 +533,61 @@ func latestContinuityRecord(board *ClaimsBoard, agentID, topic string) (continui
 		return rec, true
 	}
 	return records[0], true
+}
+
+func continuityRecordsFor(board *ClaimsBoard, agentID, topic string) []continuityRecord {
+	if board == nil {
+		return nil
+	}
+	claimIDs := board.ClaimIDsWithScope(carryForwardTopicScopeKind, topic)
+	records := make([]continuityRecord, 0)
+	seen := make(map[string]struct{})
+	for _, claimID := range claimIDs {
+		c, ok := board.CloneClaim(claimID)
+		if !ok || c == nil {
+			continue
+		}
+		if !claimHasScope(c.Scope, carryForwardScopeKind, carryForwardScopeKey) ||
+			!claimHasScope(c.Scope, carryForwardAgentScopeKind, agentID) {
+			continue
+		}
+		for _, id := range board.ObjectIDsWithRelation(RelatedTypeClaim, RelationshipClaim, claimID) {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			rec, ok := continuityRecordByID(board, id, agentID, topic)
+			if ok {
+				records = append(records, rec)
+			}
+		}
+	}
+	if len(records) > 0 {
+		return records
+	}
+	// Legacy fallback for continuity testaments written before the
+	// continuity claim/scope index existed. Normal recall stays bounded by
+	// claim scope and relation indexes.
+	p := board.Projection()
+	for i := range p.Testaments {
+		id := p.Testaments[i].ID
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		rec, ok := continuityRecordByID(board, id, agentID, topic)
+		if ok {
+			records = append(records, rec)
+		}
+	}
+	return records
+}
+
+func continuityRecordByID(board *ClaimsBoard, testamentID, agentID, topic string) (continuityRecord, bool) {
+	t, ok := board.CloneTestament(strings.TrimSpace(testamentID))
+	if !ok || t == nil {
+		return continuityRecord{}, false
+	}
+	return continuityFromTestament(t, agentID, topic)
 }
 
 func continuityFromTestament(t *Testament, agentID, topic string) (continuityRecord, bool) {
@@ -385,6 +624,9 @@ func continuityFromTestament(t *Testament, agentID, topic string) (continuityRec
 		case ArtifactKindSessionCursor:
 			rec.SessionCursor = cloneAnyMap(artifact.Metadata)
 		}
+		stale, contradicted := continuityArtifactStatus(artifact)
+		rec.Stale = rec.Stale || stale
+		rec.Contradicted = rec.Contradicted || contradicted
 	}
 	if rec.Cursor == nil {
 		return continuityRecord{}, false
@@ -447,10 +689,11 @@ func ensureContinuityClaim(ctx context.Context, board *ClaimsBoard, agentID, top
 	return nil, false, fmt.Errorf("continuity claim for agent=%s topic=%q was not found after post", agentID, topic)
 }
 
-func selectForwardSources(board *ClaimsBoard, agentID, topic string, fromSeq, throughSeq uint64, maxSources int, horizon time.Duration, now time.Time) []scoredForwardSource {
+func selectForwardSources(board *ClaimsBoard, agentID, topic string, fromSeq, throughSeq uint64, maxSources int, horizon time.Duration, now time.Time, incorporated []ForwardSource) []scoredForwardSource {
 	p := board.Projection()
 	out := make([]scoredForwardSource, 0, maxSources)
 	seen := make(map[string]struct{})
+	prior := incorporatedSourceIndex(incorporated)
 	for i := range p.Testaments {
 		t, ok := board.CloneTestament(p.Testaments[i].ID)
 		if !ok || t == nil || t.Sequence <= fromSeq || t.Sequence > throughSeq {
@@ -477,17 +720,24 @@ func selectForwardSources(board *ClaimsBoard, agentID, topic string, fromSeq, th
 			if _, ok := seen[key]; ok {
 				continue
 			}
+			digest := sourceDigest(t, artifact)
+			if prior.containsArtifact(artifact.ID) || (prior.containsDigest(artifact.Kind, digest) && !artifactCarriesRefreshStatus(artifact)) {
+				continue
+			}
 			seen[key] = struct{}{}
 			out = append(out, scoredForwardSource{
 				score: score,
 				source: ForwardSource{
-					TestamentID: t.ID,
-					ArtifactID:  artifact.ID,
-					AgentID:     firstNonEmpty(artifact.AgentID, t.AgentID, agentID),
-					Kind:        artifact.Kind,
-					Sequence:    artifact.Sequence,
-					Reason:      reason,
-					Digest:      sourceDigest(t, artifact),
+					TestamentID:           t.ID,
+					ArtifactID:            artifact.ID,
+					AgentID:               firstNonEmpty(artifact.AgentID, t.AgentID, agentID),
+					Kind:                  artifact.Kind,
+					Sequence:              artifact.Sequence,
+					Reason:                reason,
+					SelectedBy:            selectorNameForArtifact(artifact.Kind),
+					Score:                 score,
+					Digest:                digest,
+					ProjectionDocumentIDs: projectionDocumentIDsFromMetadata(artifact.Metadata),
 				},
 			})
 		}
@@ -500,6 +750,10 @@ func selectForwardSources(board *ClaimsBoard, agentID, topic string, fromSeq, th
 			if _, ok := seen[key]; ok {
 				continue
 			}
+			digest := truncateForDigest(t.Summary, 240)
+			if prior.containsTestament(t.ID) || prior.containsDigest("testament", digest) {
+				continue
+			}
 			seen[key] = struct{}{}
 			out = append(out, scoredForwardSource{
 				score: score,
@@ -509,7 +763,9 @@ func selectForwardSources(board *ClaimsBoard, agentID, topic string, fromSeq, th
 					Kind:        "testament",
 					Sequence:    t.Sequence,
 					Reason:      reason,
-					Digest:      truncateForDigest(t.Summary, 240),
+					SelectedBy:  "testament_summary_policy",
+					Score:       score,
+					Digest:      digest,
 				},
 			})
 		}
@@ -587,6 +843,84 @@ func scoreForwardTestament(t *Testament, topic string) (int, string) {
 	return score, reason
 }
 
+type incorporatedSourceSet struct {
+	testaments map[string]struct{}
+	artifacts  map[string]struct{}
+	digests    map[string]struct{}
+}
+
+func incorporatedSourceIndex(sources []ForwardSource) incorporatedSourceSet {
+	set := incorporatedSourceSet{
+		testaments: make(map[string]struct{}, len(sources)),
+		artifacts:  make(map[string]struct{}, len(sources)),
+		digests:    make(map[string]struct{}, len(sources)),
+	}
+	for _, source := range sources {
+		if source.TestamentID != "" {
+			set.testaments[source.TestamentID] = struct{}{}
+		}
+		if source.ArtifactID != "" {
+			set.artifacts[source.ArtifactID] = struct{}{}
+		}
+		if source.Digest != "" {
+			set.digests[sourceDigestKey(source.Kind, source.Digest)] = struct{}{}
+		}
+	}
+	return set
+}
+
+func (s incorporatedSourceSet) containsTestament(id string) bool {
+	_, ok := s.testaments[strings.TrimSpace(id)]
+	return ok
+}
+
+func (s incorporatedSourceSet) containsArtifact(id string) bool {
+	_, ok := s.artifacts[strings.TrimSpace(id)]
+	return ok
+}
+
+func (s incorporatedSourceSet) containsDigest(kind, digest string) bool {
+	_, ok := s.digests[sourceDigestKey(kind, digest)]
+	return ok
+}
+
+func sourceDigestKey(kind, digest string) string {
+	return strings.TrimSpace(strings.ToLower(kind)) + "\x00" + strings.TrimSpace(digest)
+}
+
+func artifactCarriesRefreshStatus(a *Artifact) bool {
+	if a == nil || len(a.Metadata) == 0 {
+		return false
+	}
+	return metadataBool(a.Metadata, "revalidated") ||
+		metadataBool(a.Metadata, "refresh") ||
+		metadataBool(a.Metadata, "stale") ||
+		metadataBool(a.Metadata, "contradicted") ||
+		strings.EqualFold(metadataString(a.Metadata, "status"), "revalidated") ||
+		strings.EqualFold(metadataString(a.Metadata, "status"), "stale") ||
+		strings.EqualFold(metadataString(a.Metadata, "status"), "contradicted")
+}
+
+func selectorNameForArtifact(kind string) string {
+	kind = strings.TrimSpace(strings.ToLower(kind))
+	switch {
+	case isCarryForwardErrorArtifactKind(kind):
+		return "error_blocker_policy"
+	case kind == ArtifactKindResponseText || kind == "consult_response" || kind == "challenge_response":
+		return "peer_answer_policy"
+	case strings.Contains(kind, "test") || strings.Contains(kind, "verification"):
+		return "test_verification_policy"
+	case strings.Contains(kind, "workspace") || strings.Contains(kind, "code") || strings.Contains(kind, "diff") || strings.Contains(kind, "file"):
+		return "workspace_discovery_policy"
+	case strings.Contains(kind, "decision") || strings.Contains(kind, "plan") || strings.Contains(kind, "design"):
+		return "decision_design_policy"
+	case strings.Contains(kind, "research") || strings.Contains(kind, "source") || strings.Contains(kind, "citation"):
+		return "research_evidence_policy"
+	default:
+		return "durable_artifact_policy"
+	}
+}
+
 func continuityRelations(claimID, priorID string, sources []ForwardSource, supersede bool) []Relation {
 	relations := []Relation{
 		{Related: claimID, RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim},
@@ -656,7 +990,7 @@ func continuityArtifacts(agentID, topic string, board *ClaimsBoard, fromSeq, thr
 	}
 	if prev := strings.TrimSpace(opts.PreviousContinuityTestamentID); prev != "" {
 		sessionCursor["previous_continuity_testament_id"] = prev
-	} else if priorID != "" {
+	} else if strings.TrimSpace(opts.PreviousSessionID) == "" && priorID != "" {
 		sessionCursor["previous_continuity_testament_id"] = priorID
 	}
 	return []*Artifact{
@@ -676,6 +1010,8 @@ func continuityRecallItem(board *ClaimsBoard, rec continuityRecord, include stri
 		TestamentID:     rec.Testament.ID,
 		FromSequence:    rec.FromSequence,
 		ThroughSequence: rec.ThroughSequence,
+		Stale:           rec.Stale,
+		Contradicted:    rec.Contradicted,
 		WorkingContext:  rec.WorkingContext,
 		EvidenceDigest:  rec.EvidenceDigest,
 		Cursor:          cloneAnyMap(rec.Cursor),
@@ -686,9 +1022,126 @@ func continuityRecallItem(board *ClaimsBoard, rec continuityRecord, include stri
 	return item
 }
 
+type continuityChainAppendResult struct {
+	Last    continuityRecord
+	HasLast bool
+}
+
+func appendContinuityChain(ctx context.Context, board *ClaimsBoard, start continuityRecord, include string, maxItems int, result *RecallForwardResult) continuityChainAppendResult {
+	var chain continuityChainAppendResult
+	if board == nil || result == nil {
+		return chain
+	}
+	seen := make(map[string]struct{})
+	current := start
+	for {
+		if err := ctx.Err(); err != nil {
+			result.Partial = true
+			result.Diagnostics = append(result.Diagnostics, "recall cancelled while traversing continuity chain: "+err.Error())
+			return chain
+		}
+		if _, ok := seen[current.Testament.ID]; ok {
+			result.Partial = true
+			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("cycle in continuity amends chain at testament=%s session=%s", current.Testament.ID, board.SessionID()))
+			return chain
+		}
+		seen[current.Testament.ID] = struct{}{}
+		if maxItems > 0 && len(result.Items) >= maxItems {
+			return chain
+		}
+		item := continuityRecallItem(board, current, include)
+		result.Items = append(result.Items, item)
+		chain.Last = current
+		chain.HasLast = true
+		result.WorkingContext = appendContextBlock(result.WorkingContext, item.WorkingContext)
+		result.EvidenceDigest = appendContextBlock(result.EvidenceDigest, item.EvidenceDigest)
+		result.Stale = result.Stale || item.Stale
+		result.Contradicted = result.Contradicted || item.Contradicted
+		if item.Stale {
+			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("continuity testament %s is marked stale", item.TestamentID))
+		}
+		if item.Contradicted {
+			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("continuity testament %s is marked contradicted", item.TestamentID))
+		}
+		if include == "source_index" || include == "full" {
+			result.Sources = appendBoundedSources(result.Sources, item.Sources, maxItems)
+		}
+		if include == "full" {
+			appendFullSources(board, item.Sources, &result.FullTestaments, &result.FullArtifacts, maxItems)
+		}
+
+		nextID := amendedContinuityTestamentID(current.Testament)
+		if nextID == "" {
+			return chain
+		}
+		next, ok := continuityRecordByID(board, nextID, current.Testament.AgentID, normalizeContinuityTopic(metadataString(current.Cursor, "topic")))
+		if !ok {
+			result.Partial = true
+			result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("broken continuity amends link from testament=%s to testament=%s session=%s", current.Testament.ID, nextID, board.SessionID()))
+			return chain
+		}
+		current = next
+	}
+}
+
+func amendedContinuityTestamentID(t *Testament) string {
+	if t == nil {
+		return ""
+	}
+	for _, rel := range t.Relations {
+		if rel.RelatedType == RelatedTypeTestament && rel.Relationship == RelationshipAmends {
+			return strings.TrimSpace(rel.Related)
+		}
+	}
+	return ""
+}
+
+func incorporatedSourcesForRecord(board *ClaimsBoard, start continuityRecord, agentID, topic string) []ForwardSource {
+	if board == nil || start.Testament == nil {
+		return nil
+	}
+	var out []ForwardSource
+	seen := make(map[string]struct{})
+	seenRecords := make(map[string]struct{})
+	current := start
+	for {
+		if _, ok := seenRecords[current.Testament.ID]; ok {
+			return out
+		}
+		seenRecords[current.Testament.ID] = struct{}{}
+		for _, source := range current.Sources {
+			key := source.TestamentID + "\x00" + source.ArtifactID + "\x00" + sourceDigestKey(source.Kind, source.Digest)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, source)
+		}
+		nextID := amendedContinuityTestamentID(current.Testament)
+		if nextID == "" {
+			return out
+		}
+		next, ok := continuityRecordByID(board, nextID, agentID, topic)
+		if !ok {
+			return out
+		}
+		current = next
+	}
+}
+
 func appendFullSources(board *ClaimsBoard, sources []ForwardSource, testaments *[]*Testament, artifacts *[]*Artifact, maxItems int) {
-	seenT := make(map[string]struct{})
-	seenA := make(map[string]struct{})
+	seenT := make(map[string]struct{}, len(*testaments))
+	seenA := make(map[string]struct{}, len(*artifacts))
+	for _, t := range *testaments {
+		if t != nil {
+			seenT[t.ID] = struct{}{}
+		}
+	}
+	for _, a := range *artifacts {
+		if a != nil {
+			seenA[a.ID] = struct{}{}
+		}
+	}
 	for _, source := range sources {
 		if maxItems > 0 && len(*testaments)+len(*artifacts) >= maxItems {
 			return
@@ -731,6 +1184,73 @@ func isProjectionDiagnosticTestament(t *Testament) bool {
 		}
 	}
 	return false
+}
+
+func continuityArtifactStatus(a *Artifact) (stale bool, contradicted bool) {
+	if a == nil || len(a.Metadata) == 0 {
+		return false, false
+	}
+	stale = metadataBool(a.Metadata, "stale") ||
+		metadataBool(a.Metadata, "is_stale") ||
+		strings.EqualFold(metadataString(a.Metadata, "status"), "stale") ||
+		strings.EqualFold(metadataString(a.Metadata, "freshness"), "stale") ||
+		strings.EqualFold(metadataString(a.Metadata, "freshness_status"), "stale")
+	contradicted = metadataBool(a.Metadata, "contradicted") ||
+		metadataBool(a.Metadata, "is_contradicted") ||
+		strings.EqualFold(metadataString(a.Metadata, "status"), "contradicted") ||
+		strings.EqualFold(metadataString(a.Metadata, "verdict"), "contradicted")
+	return stale, contradicted
+}
+
+func appendProjectionDiagnostics(board *ClaimsBoard, result *RecallForwardResult) {
+	if board == nil || result == nil {
+		return
+	}
+	health := board.ProjectionHealth()
+	for _, warning := range health.Warnings {
+		warning = strings.TrimSpace(warning)
+		if warning == "" {
+			continue
+		}
+		result.Diagnostics = append(result.Diagnostics, warning)
+	}
+	if health.QueueDepth > 0 {
+		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf("projection backlog queue_depth=%d max_lag=%d retry_count=%d terminal_failures=%d", health.QueueDepth, health.MaxLag, health.RetryCount, health.TerminalFailures))
+	}
+	p := board.Projection()
+	for _, msg := range p.NotificationErrors {
+		msg = strings.TrimSpace(msg)
+		if msg == "" {
+			continue
+		}
+		if strings.Contains(strings.ToLower(msg), "projection") {
+			result.Diagnostics = append(result.Diagnostics, msg)
+		}
+	}
+	count := 0
+	for i := range p.Testaments {
+		if count >= 8 {
+			break
+		}
+		t, ok := board.CloneTestament(p.Testaments[i].ID)
+		if !ok || t == nil {
+			continue
+		}
+		for _, artifact := range t.Artifacts {
+			if artifact == nil || artifact.Kind != ArtifactKindProjectionError {
+				continue
+			}
+			msg := strings.TrimSpace(artifact.Reference)
+			if msg == "" {
+				msg = "projection_error artifact " + artifact.ID
+			}
+			result.Diagnostics = append(result.Diagnostics, msg)
+			count++
+			if count >= 8 {
+				break
+			}
+		}
+	}
 }
 
 func isContinuityArtifactKind(kind string) bool {
@@ -820,10 +1340,21 @@ func buildEvidenceDigest(sources []ForwardSource) string {
 	return strings.TrimSpace(b.String())
 }
 
-func sourceDigests(sources []ForwardSource) []string {
-	out := make([]string, 0, len(sources))
+func sourceDigests(sources []ForwardSource) []map[string]any {
+	out := make([]map[string]any, 0, len(sources))
 	for _, source := range sources {
-		out = append(out, source.Digest)
+		finding := map[string]any{
+			"summary":             source.Digest,
+			"reason":              source.Reason,
+			"selected_by":         source.SelectedBy,
+			"kind":                source.Kind,
+			"source_testament_id": source.TestamentID,
+			"source_artifact_id":  source.ArtifactID,
+		}
+		if len(source.ProjectionDocumentIDs) > 0 {
+			finding["projection_document_ids"] = source.ProjectionDocumentIDs
+		}
+		out = append(out, finding)
 	}
 	return out
 }
@@ -854,6 +1385,31 @@ func metadataString(md map[string]any, key string) string {
 		return strings.TrimSpace(v.String())
 	default:
 		return ""
+	}
+}
+
+func metadataBool(md map[string]any, key string) bool {
+	if len(md) == 0 {
+		return false
+	}
+	switch v := md[key].(type) {
+	case bool:
+		return v
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "yes", "1", "stale", "contradicted", "revalidated":
+			return true
+		default:
+			return false
+		}
+	case int:
+		return v != 0
+	case int64:
+		return v != 0
+	case float64:
+		return v != 0
+	default:
+		return false
 	}
 }
 
@@ -890,6 +1446,43 @@ func metadataUint64(md map[string]any, key string) uint64 {
 	default:
 		return 0
 	}
+}
+
+func projectionDocumentIDsFromMetadata(md map[string]any) []string {
+	if len(md) == 0 {
+		return nil
+	}
+	out := make([]string, 0, 2)
+	appendOne := func(raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		for _, existing := range out {
+			if existing == raw {
+				return
+			}
+		}
+		out = append(out, raw)
+	}
+	for _, key := range []string{"projection_document_id", "document_id", "claims_document_id"} {
+		appendOne(metadataString(md, key))
+	}
+	for _, key := range []string{"projection_document_ids", "document_ids", "claims_document_ids"} {
+		switch v := md[key].(type) {
+		case []string:
+			for _, item := range v {
+				appendOne(item)
+			}
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					appendOne(s)
+				}
+			}
+		}
+	}
+	return out
 }
 
 func normalizeContinuityTopic(topic string) string {

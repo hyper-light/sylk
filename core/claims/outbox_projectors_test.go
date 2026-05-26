@@ -299,6 +299,22 @@ func (p *blockingProjector) Project(ctx context.Context, _ *ClaimsOutboxRecord, 
 	}
 }
 
+type countingProjector struct {
+	name  string
+	count int
+	seen  []ClaimsOutboxRecord
+}
+
+func (p *countingProjector) Name() string { return p.name }
+
+func (p *countingProjector) Project(_ context.Context, record *ClaimsOutboxRecord, _ *ClaimsBoard) error {
+	p.count++
+	if record != nil {
+		p.seen = append(p.seen, *record)
+	}
+	return nil
+}
+
 type goroutineScope struct{}
 
 func (goroutineScope) Go(_ string, _ time.Duration, fn func(context.Context) error) error {
@@ -534,6 +550,120 @@ func TestDurableBoard_ProjectionSuccessAfterFailureCreatesReceiptArtifact(t *tes
 		if strings.Contains(msg, "projection_error projector=flaky") {
 			t.Fatalf("projection warning state not cleared after success: %v", msg)
 		}
+	}
+}
+
+func TestProjectionHealthReportsOutboxLagAndFailures(t *testing.T) {
+	projector := &failingProjector{name: "laggy"}
+	db, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(t.TempDir(), "session-1"),
+		Projectors: []ClaimsProjector{
+			projector,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")}); err != nil {
+		t.Fatal(err)
+	}
+	health := db.ProjectionHealth()
+	if health.QueueDepth == 0 || health.MaxLag == 0 {
+		t.Fatalf("health did not report pending projection lag: %+v", health)
+	}
+	if len(health.Projectors) == 0 {
+		t.Fatalf("health missing per-projector data: %+v", health)
+	}
+	db.DrainOutbox(context.Background(), 32)
+	health = db.ProjectionHealth()
+	if health.RetryCount == 0 {
+		t.Fatalf("health did not count retryable projection failure: %+v", health)
+	}
+	if len(health.Warnings) == 0 {
+		t.Fatalf("health missing projection warnings: %+v", health)
+	}
+}
+
+func TestDurableBoard_RebuildProjectionsDryRunDoesNotCallProjector(t *testing.T) {
+	projector := &countingProjector{name: "counting"}
+	db, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(t.TempDir(), "session-1"),
+		Projectors: []ClaimsProjector{
+			projector,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.RebuildProjections(context.Background(), ProjectionRebuildOptions{
+		Projectors: []string{"counting"},
+		DryRun:     true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projector.count != 0 {
+		t.Fatalf("dry run called projector %d time(s)", projector.count)
+	}
+	if result.SelectedRecords == 0 || len(result.Records) == 0 {
+		t.Fatalf("dry run did not report selected records: %+v", result)
+	}
+	if result.Projected != 0 || result.Succeeded != 0 {
+		t.Fatalf("dry run mutated projection result counters: %+v", result)
+	}
+}
+
+func TestDurableBoard_RebuildProjectionsReplaysAndResumesIdempotently(t *testing.T) {
+	projector := &countingProjector{name: "counting"}
+	db, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(t.TempDir(), "session-1"),
+		Projectors: []ClaimsProjector{
+			projector,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := db.RebuildProjections(context.Background(), ProjectionRebuildOptions{
+		Projectors: []string{"counting"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Succeeded == 0 || projector.count == 0 {
+		t.Fatalf("rebuild did not replay records: result=%+v count=%d", first, projector.count)
+	}
+	countAfterFirst := projector.count
+	second, err := db.RebuildProjections(context.Background(), ProjectionRebuildOptions{
+		Projectors:            []string{"counting"},
+		ResumeFromLastSuccess: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projector.count != countAfterFirst {
+		t.Fatalf("resume replayed already-succeeded records: before=%d after=%d result=%+v", countAfterFirst, projector.count, second)
+	}
+	if second.Skipped == 0 {
+		t.Fatalf("resume did not report skipped succeeded records: %+v", second)
 	}
 }
 

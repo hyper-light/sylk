@@ -31,12 +31,13 @@ const archivalistStoreCommentaryAction = "store_scribe_commentary"
 // Mirrors the metadata previously attached to the RouteRequest path so
 // every traceability field is preserved on the persisted Entry.
 type storeScribeCommentaryParams struct {
-	Content           string `json:"content"`
-	SessionID         string `json:"session_id,omitempty"`
-	EntryID           string `json:"entry_id,omitempty"`
-	ParentAgent       string `json:"parent_agent,omitempty"`
-	ScribeID          string `json:"scribe_id,omitempty"`
-	ReplicaGeneration int    `json:"replica_generation,omitempty"`
+	Content           string         `json:"content"`
+	SessionID         string         `json:"session_id,omitempty"`
+	EntryID           string         `json:"entry_id,omitempty"`
+	ParentAgent       string         `json:"parent_agent,omitempty"`
+	ScribeID          string         `json:"scribe_id,omitempty"`
+	ReplicaGeneration int            `json:"replica_generation,omitempty"`
+	Metadata          map[string]any `json:"metadata,omitempty"`
 }
 
 func (a *Archivalist) handleStoreScribeCommentaryAction(req *guide.ActionRequest) error {
@@ -57,6 +58,9 @@ func (a *Archivalist) handleStoreScribeCommentaryAction(req *guide.ActionRequest
 	}
 	metadata := map[string]any{
 		"source_type": "scribe",
+	}
+	for k, v := range params.Metadata {
+		metadata[k] = v
 	}
 	if params.ParentAgent != "" {
 		metadata["parent_agent"] = params.ParentAgent

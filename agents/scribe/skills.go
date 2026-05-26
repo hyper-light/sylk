@@ -317,6 +317,14 @@ func parseScribeCommentary(input json.RawMessage) (map[string]any, error) {
 const archivalistStoreCommentaryAction = "store_scribe_commentary"
 
 func (s *Scribe) storeCommentaryInArchivalist(ctx context.Context, commentary string, feed shared.ScribeFeed) error {
+	archivalEntryID := fmt.Sprintf(
+		"scribe_%s_rep%d_%d",
+		s.parentAgentType, s.replicaGeneration, time.Now().UnixNano(),
+	)
+	return s.storeCommentaryInArchivalistWithEntryID(ctx, commentary, feed, archivalEntryID, nil)
+}
+
+func (s *Scribe) storeCommentaryInArchivalistWithEntryID(ctx context.Context, commentary string, feed shared.ScribeFeed, archivalEntryID string, extraMetadata map[string]any) error {
 	if s.bus == nil {
 		return fmt.Errorf("scribe bus is not configured")
 	}
@@ -330,22 +338,26 @@ func (s *Scribe) storeCommentaryInArchivalist(ctx context.Context, commentary st
 		"parent_agent": s.parentAgentType,
 	})
 
-	// Deterministic archivalist entry ID per SCRIBE_FABRIC.md §9.4
-	// Option B. Lets us reference the entry from the fabric activity
-	// without a synchronous round-trip to the archivalist.
-	archivalEntryID := fmt.Sprintf(
-		"scribe_%s_rep%d_%d",
-		s.parentAgentType, s.replicaGeneration, time.Now().UnixNano(),
-	)
+	archivalEntryID = strings.TrimSpace(archivalEntryID)
+	if archivalEntryID == "" {
+		archivalEntryID = fmt.Sprintf(
+			"scribe_%s_rep%d_%d",
+			s.parentAgentType, s.replicaGeneration, time.Now().UnixNano(),
+		)
+	}
 
-	metadata := branch.ApplyMetadata(branchCtx, map[string]any{
+	baseMetadata := map[string]any{
 		"source_type":        "scribe",
 		"parent_agent":       s.parentAgentType,
 		"scribe_id":          s.id,
 		"replica_generation": s.replicaGeneration,
 		"session_id":         s.sessionID,
 		"entry_id":           archivalEntryID,
-	})
+	}
+	for k, v := range extraMetadata {
+		baseMetadata[k] = v
+	}
+	metadata := branch.ApplyMetadata(branchCtx, baseMetadata)
 
 	// ActionRequest, not RouteRequest: scribe storage is high-volume
 	// deterministic system work with a fixed target (archivalist) and
@@ -375,6 +387,7 @@ func (s *Scribe) storeCommentaryInArchivalist(ctx context.Context, commentary st
 			"parent_agent":       s.parentAgentType,
 			"scribe_id":          s.id,
 			"replica_generation": s.replicaGeneration,
+			"metadata":           baseMetadata,
 		},
 		FireAndForget: true,
 		Timestamp:     time.Now(),

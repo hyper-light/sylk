@@ -227,6 +227,7 @@ func (a *BoardAmplifier) emit(_ context.Context, kind activity.ActionKind, agent
 		Resolution: activity.ResolutionFor(kind),
 		Actor: activity.Actor{
 			AgentID:    agentID,
+			AgentType:  claimsActivityActorType(agentID),
 			PipelineID: a.boardID,
 		},
 		Action: kind,

@@ -123,4 +123,7 @@ func TestClaimsKnowledgeMirror_ProjectsClaimDocument(t *testing.T) {
 	if found.Metadata["source"] != "claims_board" {
 		t.Fatalf("source metadata = %q, want claims_board", found.Metadata["source"])
 	}
+	if !strings.Contains(found.Content, "## Metadata") || !strings.Contains(found.Content, "relation_agent_issuer: architect") {
+		t.Fatalf("claim document content did not include queryable metadata fields:\n%s", found.Content)
+	}
 }

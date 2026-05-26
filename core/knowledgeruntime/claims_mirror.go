@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -70,6 +71,14 @@ func claimsKnowledgeDocumentForRecord(record *claims.ClaimsOutboxRecord, board *
 }
 
 func claimKnowledgeDocument(record *claims.ClaimsOutboxRecord, c *claims.Claim) *TextDocumentIngestRequest {
+	metadata := map[string]string{
+		"claim_id":    c.ID,
+		"entity_type": "claim",
+		"status":      string(c.Status),
+		"agent_id":    c.AgentID,
+	}
+	addRelationMetadata(metadata, c.Relations)
+	addScopeMetadata(metadata, c.Scope)
 	content := linesToMarkdown(
 		"# Claim "+c.ID,
 		"",
@@ -96,16 +105,21 @@ func claimKnowledgeDocument(record *claims.ClaimsOutboxRecord, c *claims.Claim) 
 		"",
 		jsonOneLine(c.Validations),
 	)
-	return claimsTextDocument(record, "claim", c.ID, c.AgentID, content, map[string]string{
-		"claim_id":    c.ID,
-		"entity_type": "claim",
-		"status":      string(c.Status),
-		"agent_id":    c.AgentID,
-	})
+	return claimsTextDocument(record, "claim", c.ID, c.AgentID, content, metadata)
 }
 
 func testamentKnowledgeDocument(record *claims.ClaimsOutboxRecord, t *claims.Testament) *TextDocumentIngestRequest {
 	claimID := claims.ClaimIDFromRelations(t.Relations)
+	metadata := map[string]string{
+		"claim_id":     claimID,
+		"testament_id": t.ID,
+		"entity_type":  "testament",
+		"agent_id":     t.AgentID,
+	}
+	addRelationMetadata(metadata, t.Relations)
+	if details, ok := claims.ContinuityDetailsForTestament(t); ok {
+		addContinuityMetadata(metadata, details)
+	}
 	content := linesToMarkdown(
 		"# Testament "+t.ID,
 		"",
@@ -132,15 +146,19 @@ func testamentKnowledgeDocument(record *claims.ClaimsOutboxRecord, t *claims.Tes
 		"",
 		jsonOneLine(t.Artifacts),
 	)
-	return claimsTextDocument(record, "testament", t.ID, t.AgentID, content, map[string]string{
-		"claim_id":     claimID,
-		"testament_id": t.ID,
-		"entity_type":  "testament",
-		"agent_id":     t.AgentID,
-	})
+	return claimsTextDocument(record, "testament", t.ID, t.AgentID, content, metadata)
 }
 
 func artifactKnowledgeDocument(record *claims.ClaimsOutboxRecord, a *claims.Artifact) *TextDocumentIngestRequest {
+	metadata := map[string]string{
+		"artifact_id":   a.ID,
+		"testament_id":  a.TestamentID,
+		"entity_type":   "artifact",
+		"artifact_kind": a.Kind,
+		"agent_id":      a.AgentID,
+	}
+	addRelationMetadata(metadata, a.Relations)
+	addArtifactMetadata(metadata, a.Metadata)
 	content := linesToMarkdown(
 		"# Artifact "+a.ID,
 		"",
@@ -162,13 +180,7 @@ func artifactKnowledgeDocument(record *claims.ClaimsOutboxRecord, a *claims.Arti
 		"",
 		a.Reference,
 	)
-	return claimsTextDocument(record, "artifact", a.ID, a.AgentID, content, map[string]string{
-		"artifact_id":   a.ID,
-		"testament_id":  a.TestamentID,
-		"entity_type":   "artifact",
-		"artifact_kind": a.Kind,
-		"agent_id":      a.AgentID,
-	})
+	return claimsTextDocument(record, "artifact", a.ID, a.AgentID, content, metadata)
 }
 
 func validationKnowledgeDocument(record *claims.ClaimsOutboxRecord, v *claims.Validation, c *claims.Claim) *TextDocumentIngestRequest {
@@ -176,6 +188,14 @@ func validationKnowledgeDocument(record *claims.ClaimsOutboxRecord, v *claims.Va
 	if agentID == "" && c != nil {
 		agentID = c.AgentID
 	}
+	metadata := map[string]string{
+		"claim_id":      v.ClaimID,
+		"validation_id": v.ID,
+		"entity_type":   "validation",
+		"status":        string(v.Status),
+		"agent_id":      agentID,
+	}
+	addRelationMetadata(metadata, v.Relations)
 	content := linesToMarkdown(
 		"# Validation "+v.ID,
 		"",
@@ -200,13 +220,7 @@ func validationKnowledgeDocument(record *claims.ClaimsOutboxRecord, v *claims.Va
 		"",
 		v.QualityBar,
 	)
-	return claimsTextDocument(record, "validation", v.ID, agentID, content, map[string]string{
-		"claim_id":      v.ClaimID,
-		"validation_id": v.ID,
-		"entity_type":   "validation",
-		"status":        string(v.Status),
-		"agent_id":      agentID,
-	})
+	return claimsTextDocument(record, "validation", v.ID, agentID, content, metadata)
 }
 
 func claimsTextDocument(record *claims.ClaimsOutboxRecord, entityType, entityID, agentID, content string, metadata map[string]string) *TextDocumentIngestRequest {
@@ -223,6 +237,7 @@ func claimsTextDocument(record *claims.ClaimsOutboxRecord, entityType, entityID,
 	if agentID != "" {
 		metadata["agent_id"] = agentID
 	}
+	content = appendClaimsMetadataContent(content, metadata)
 	docID := "claims_" + sanitizeClaimsKnowledgeSegment(record.BoardID) + "_" + sanitizeClaimsKnowledgeSegment(entityType) + "_" + sanitizeClaimsKnowledgeSegment(entityID)
 	docPath := path.Join("claims", sanitizeClaimsKnowledgeSegment(record.SessionID), sanitizeClaimsKnowledgeSegment(record.BoardID), sanitizeClaimsKnowledgeSegment(entityType), sanitizeClaimsKnowledgeSegment(entityID)+".md")
 	return &TextDocumentIngestRequest{
@@ -233,6 +248,131 @@ func claimsTextDocument(record *claims.ClaimsOutboxRecord, entityType, entityID,
 		Language:   "markdown",
 		Domain:     sylkdir.DomainDoc,
 		Metadata:   metadata,
+	}
+}
+
+func appendClaimsMetadataContent(content string, metadata map[string]string) string {
+	if len(metadata) == 0 {
+		return content
+	}
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		if strings.TrimSpace(key) != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	lines := []string{strings.TrimRight(content, "\n"), "", "## Metadata", ""}
+	for _, key := range keys {
+		value := strings.TrimSpace(metadata[key])
+		if value == "" {
+			continue
+		}
+		lines = append(lines, key+": "+value)
+	}
+	return linesToMarkdown(lines...)
+}
+
+func addRelationMetadata(metadata map[string]string, relations []claims.Relation) {
+	if metadata == nil || len(relations) == 0 {
+		return
+	}
+	var parts []string
+	for _, rel := range relations {
+		if strings.TrimSpace(rel.Related) == "" {
+			continue
+		}
+		parts = append(parts, rel.RelatedType+":"+rel.Relationship+":"+rel.Related)
+		key := "relation_" + sanitizeClaimsKnowledgeSegment(rel.RelatedType) + "_" + sanitizeClaimsKnowledgeSegment(rel.Relationship)
+		if existing := strings.TrimSpace(metadata[key]); existing != "" {
+			metadata[key] = existing + "," + rel.Related
+		} else {
+			metadata[key] = rel.Related
+		}
+	}
+	if len(parts) > 0 {
+		metadata["relations_index"] = strings.Join(parts, ",")
+	}
+}
+
+func addScopeMetadata(metadata map[string]string, scope []claims.ClaimScopeEntry) {
+	if metadata == nil || len(scope) == 0 {
+		return
+	}
+	parts := make([]string, 0, len(scope))
+	for _, entry := range scope {
+		kind := strings.TrimSpace(entry.Kind)
+		key := strings.TrimSpace(entry.Key)
+		if kind == "" || key == "" {
+			continue
+		}
+		parts = append(parts, kind+":"+key)
+	}
+	if len(parts) > 0 {
+		metadata["scope_index"] = strings.Join(parts, ",")
+	}
+}
+
+func addArtifactMetadata(metadata map[string]string, artifactMetadata map[string]any) {
+	if metadata == nil || len(artifactMetadata) == 0 {
+		return
+	}
+	for _, key := range []string{"topic", "agent_id", "board_id", "session_id", "claim_id", "testament_id", "continuity_topic", "continuity_agent_id"} {
+		if value := metadataAnyString(artifactMetadata[key]); value != "" {
+			metadata[key] = value
+		}
+	}
+}
+
+func addContinuityMetadata(metadata map[string]string, details *claims.ContinuityDetails) {
+	if metadata == nil || details == nil {
+		return
+	}
+	metadata["continuity"] = "true"
+	metadata["continuity_topic"] = details.Topic
+	metadata["topic"] = details.Topic
+	metadata["continuity_agent_id"] = details.AgentID
+	metadata["carry_forward_agent_id"] = details.AgentID
+	metadata["through_sequence"] = strconv.FormatUint(details.ThroughSequence, 10)
+	var sourceTestaments []string
+	var sourceArtifacts []string
+	for _, source := range details.Sources {
+		if source.TestamentID != "" {
+			sourceTestaments = append(sourceTestaments, source.TestamentID)
+		}
+		if source.ArtifactID != "" {
+			sourceArtifacts = append(sourceArtifacts, source.ArtifactID)
+		}
+	}
+	if len(sourceTestaments) > 0 {
+		metadata["source_testament_ids"] = strings.Join(sourceTestaments, ",")
+	}
+	if len(sourceArtifacts) > 0 {
+		metadata["source_artifact_ids"] = strings.Join(sourceArtifacts, ",")
+	}
+}
+
+func metadataAnyString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case fmt.Stringer:
+		return strings.TrimSpace(v.String())
+	case json.Number:
+		return strings.TrimSpace(v.String())
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case uint64:
+		return strconv.FormatUint(v, 10)
+	case float64:
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		return ""
 	}
 }
 

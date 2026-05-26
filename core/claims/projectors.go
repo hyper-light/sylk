@@ -64,6 +64,7 @@ func fabricActivityForRecord(record *ClaimsOutboxRecord, board *ClaimsBoard) (ac
 		Resolution: activity.ResolutionFor(kind),
 		Actor: activity.Actor{
 			AgentID:    actor,
+			AgentType:  claimsActivityActorType(actor),
 			PipelineID: record.BoardID,
 		},
 		Action: kind,
@@ -76,6 +77,20 @@ func fabricActivityForRecord(record *ClaimsOutboxRecord, board *ClaimsBoard) (ac
 		SourceTable: "claims_board",
 		SourceID:    record.EntityID,
 	}, true
+}
+
+func claimsActivityActorType(agentID string) string {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return ""
+	}
+	if strings.HasPrefix(agentID, "scribe-") {
+		return agentID
+	}
+	if idx := strings.LastIndex(agentID, ":"); idx >= 0 && idx+1 < len(agentID) {
+		return agentID[idx+1:]
+	}
+	return agentID
 }
 
 func stableClaimsActivityID(record *ClaimsOutboxRecord) activity.ActivityID {
