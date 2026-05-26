@@ -35,6 +35,25 @@ func (p *integrationProgram) Snapshot() []any {
 	return out
 }
 
+type recordingPresentationMetricSink struct {
+	mu      sync.Mutex
+	metrics []PresentationMetric
+}
+
+func (s *recordingPresentationMetricSink) ObservePresentationMetric(metric PresentationMetric) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.metrics = append(s.metrics, metric)
+}
+
+func (s *recordingPresentationMetricSink) Snapshot() []PresentationMetric {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]PresentationMetric, len(s.metrics))
+	copy(out, s.metrics)
+	return out
+}
+
 // stubScope minimal for the bridge's drain goroutine. Returns nil
 // unconditionally so the bridge runs synchronously in tests.
 type stubScopeProvider struct{}
@@ -510,6 +529,17 @@ func TestBridgeIntegration_TruncatedPresentableArtifactEmitsDiagnostic(t *testin
 			if p.Format != string(claims.PresentationFormatText) {
 				t.Fatalf("truncated diagnostic format = %q, want text", p.Format)
 			}
+			diagnosticID := "presentation-diagnostic-artifact-large-content_truncated"
+			diagnostic, ok := board.CloneArtifact(diagnosticID)
+			if !ok {
+				t.Fatalf("expected durable truncation diagnostic artifact %q", diagnosticID)
+			}
+			if diagnostic.Metadata["reason"] != "content_truncated" {
+				t.Fatalf("diagnostic metadata reason = %v, want content_truncated", diagnostic.Metadata["reason"])
+			}
+			if !claims.HasRelation(diagnostic.Relations, claims.RelationshipDerivedFrom, "artifact-large") {
+				t.Fatalf("diagnostic missing derived_from relation: %+v", diagnostic.Relations)
+			}
 			return
 		}
 	}
@@ -710,6 +740,8 @@ func TestBridgeIntegration_ResponseTextWithPresentationRendersOnce(t *testing.T)
 func TestBridgeIntegration_InvalidPresentationIncrementsInvalidMetric(t *testing.T) {
 	br, board, _, cleanup := setupBridgeOnSession(t, "ses-presentation-invalid")
 	defer cleanup()
+	sink := &recordingPresentationMetricSink{}
+	br.SetPresentationMetricSink(sink)
 
 	if err := board.PostAction(context.Background(),
 		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
@@ -743,6 +775,9 @@ func TestBridgeIntegration_InvalidPresentationIncrementsInvalidMetric(t *testing
 	}
 	if got := presentationMetricCount(br.PresentationMetricsSnapshot(), claimsPresentationMessagesDropped, "invalid_presentation"); got != 1 {
 		t.Fatalf("dropped invalid metric = %d, want 1: %+v", got, br.PresentationMetricsSnapshot())
+	}
+	if got := presentationMetricCount(sink.Snapshot(), claimsPresentationInvalid, "invalid_presentation"); got != 1 {
+		t.Fatalf("sink invalid metric = %d, want 1: %+v", got, sink.Snapshot())
 	}
 }
 
@@ -938,6 +973,93 @@ func TestBridgeIntegration_UnsupportedPresentationFormatRecordsDiagnosticArtifac
 	if diagnostic.Metadata["source_artifact_id"] != "bad-format" || diagnostic.Metadata["reason"] != "unsupported_format" {
 		t.Fatalf("diagnostic metadata malformed: %+v", diagnostic.Metadata)
 	}
+
+	br.OnArtifactAdded(claimID, "architect", "ses-presentation-diagnostic", &claims.Artifact{
+		ID:        "bad-format",
+		AgentID:   "architect",
+		Kind:      claims.ArtifactKindPlanMarkdown,
+		Reference: "### Plan\n\n- Task A",
+		Presentation: &claims.Presentation{
+			Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+			Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
+			Format:    claims.PresentationFormat("video"),
+		},
+		Created: time.Now(),
+	})
+	drainBridge(t, prog, "unsupported presentation duplicate")
+	var fallbackCount int
+	for _, m := range prog.Snapshot()[before:] {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceID == fallback.SourceID {
+			fallbackCount++
+		}
+	}
+	if fallbackCount != 1 {
+		t.Fatalf("diagnostic fallback count = %d, want 1", fallbackCount)
+	}
+}
+
+func TestBridgeIntegration_UnsupportedTestamentPresentationRecordsDiagnosticArtifact(t *testing.T) {
+	_, board, prog, cleanup := setupBridgeOnSession(t, "ses-presentation-testament-diagnostic")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "academic", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "research",
+			Relations: []claims.Relation{
+				{Related: "academic", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "academic", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	before := len(prog.Snapshot())
+
+	if err := board.SubmitTestaments(context.Background(),
+		claims.Action{AgentID: "academic", Type: claims.ActionTypeTestament},
+		[]claims.Testament{{
+			ID:      "testament-bad-format",
+			AgentID: "academic",
+			Summary: "Research summary.",
+			Presentation: &claims.Presentation{
+				Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+				Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
+				Format:    claims.PresentationFormat("video"),
+			},
+			Relations: []claims.Relation{
+				{Related: claimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
+			},
+		}},
+	); err != nil {
+		t.Fatalf("SubmitTestaments: %v", err)
+	}
+	drainBridge(t, prog, "unsupported testament presentation")
+
+	var fallback *msg.ClaimPresentationMsg
+	for _, m := range prog.Snapshot()[before:] {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && strings.Contains(p.SourceID, "presentation-diagnostic-testament") {
+			copy := p
+			fallback = &copy
+			break
+		}
+	}
+	if fallback == nil {
+		debugSnapshot(t, prog, "unsupported testament presentation")
+		t.Fatal("expected fallback presentation diagnostic message")
+	}
+	diagnostic, ok := board.CloneArtifact(fallback.SourceID)
+	if !ok {
+		t.Fatalf("diagnostic artifact %q not recorded", fallback.SourceID)
+	}
+	if !claims.HasRelation(diagnostic.Relations, claims.RelationshipDerivedFrom, "testament-bad-format") {
+		t.Fatalf("diagnostic missing testament derived_from relation: %+v", diagnostic.Relations)
+	}
+	if diagnostic.Metadata["source_testament_id"] != "testament-bad-format" || diagnostic.Metadata["source_type"] != claims.RelatedTypeTestament {
+		t.Fatalf("diagnostic metadata malformed: %+v", diagnostic.Metadata)
+	}
 }
 
 func TestBridgeIntegration_PresentationContentIsRedactedSanitizedAndBounded(t *testing.T) {
@@ -969,16 +1091,16 @@ func TestBridgeIntegration_PresentationContentIsRedactedSanitizedAndBounded(t *t
 		{
 			id:         "json-secret",
 			format:     claims.PresentationFormatJSON,
-			reference:  `{"token":"tok_live","nested":{"api_key":"key_live","password":"pw"}}`,
+			reference:  `{"token":"tok_live","nested":{"api_key":"key_live","password":"pw","authorization":"Bearer auth_live","private_key":"key_private"}}`,
 			want:       "[REDACTED]",
-			mustAbsent: []string{"tok_live", "key_live", "pw"},
+			mustAbsent: []string{"tok_live", "key_live", "pw", "auth_live", "key_private"},
 		},
 		{
 			id:         "markdown-script",
 			format:     claims.PresentationFormatMarkdown,
-			reference:  "### Report\n\n<script>alert(1)</script>",
+			reference:  "### Report\n\n<script>alert(1)</script>\nAuthorization: Bearer auth_live",
 			want:       "&lt;script&gt;",
-			mustAbsent: []string{"<script>"},
+			mustAbsent: []string{"<script>", "auth_live"},
 		},
 		{
 			id:         "binary-diff",
@@ -1007,6 +1129,12 @@ func TestBridgeIntegration_PresentationContentIsRedactedSanitizedAndBounded(t *t
 				Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
 				Format:    tc.format,
 			},
+			Metadata: map[string]any{
+				"client_secret": "client_secret_live",
+				"nested": map[string]any{
+					"refresh_token": "refresh_live",
+				},
+			},
 			Created: time.Now(),
 		})
 		drainBridge(t, prog, "presentation safety "+tc.id)
@@ -1031,6 +1159,9 @@ func TestBridgeIntegration_PresentationContentIsRedactedSanitizedAndBounded(t *t
 				t.Fatalf("%s: content leaked %q: %q", tc.id, absent, got.Content)
 			}
 		}
+		if metadataContainsString(got.Metadata, "client_secret_live") || metadataContainsString(got.Metadata, "refresh_live") {
+			t.Fatalf("%s: metadata leaked secrets: %+v", tc.id, got.Metadata)
+		}
 		if tc.id == "huge-markdown" && len(got.Content) > presentationMaxContent+128 {
 			t.Fatalf("huge content length = %d, want bounded near %d", len(got.Content), presentationMaxContent)
 		}
@@ -1049,6 +1180,26 @@ func presentationMetricCount(metrics []PresentationMetric, name, reason string) 
 		total += metric.Count
 	}
 	return total
+}
+
+func metadataContainsString(value any, needle string) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for _, v := range typed {
+			if metadataContainsString(v, needle) {
+				return true
+			}
+		}
+	case []any:
+		for _, v := range typed {
+			if metadataContainsString(v, needle) {
+				return true
+			}
+		}
+	case string:
+		return strings.Contains(typed, needle)
+	}
+	return false
 }
 
 func TestBridgeIntegration_ReplayLegacyPlanHandoffSynthesizesTransientPresentation(t *testing.T) {

@@ -43,10 +43,20 @@ type PresentationMetric struct {
 	Count   int64
 }
 
+// PresentationMetricSink receives every presentation counter increment.
+// Implementations must be fast and concurrency-safe; the bridge also keeps
+// an in-memory snapshot for local inspection.
+type PresentationMetricSink interface {
+	ObservePresentationMetric(PresentationMetric)
+}
+
 type presentationDiagnosticRecord struct {
 	SessionID            string
 	ClaimID              string
 	AgentID              string
+	SourceID             string
+	SourceType           string
+	SourceKind           string
 	SourceArtifactID     string
 	SourceArtifactKind   string
 	DiagnosticArtifactID string
@@ -55,6 +65,17 @@ type presentationDiagnosticRecord struct {
 	Reason               string
 	Reference            string
 	CreatedAt            time.Time
+}
+
+// SetPresentationMetricSink attaches an optional sink that receives one
+// counter sample per bridge observation.
+func (b *ClaimsBridge) SetPresentationMetricSink(sink PresentationMetricSink) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.presentationMetricSink = sink
+	b.mu.Unlock()
 }
 
 // PresentationMetricsSnapshot returns the bridge's per-session presentation
@@ -107,6 +128,15 @@ func (b *ClaimsBridge) observePresentationMetricLocked(name, surface, format, re
 		return
 	}
 	b.presentationMetrics[key]++
+	if b.presentationMetricSink != nil {
+		b.presentationMetricSink.ObservePresentationMetric(PresentationMetric{
+			Name:    key.Name,
+			Surface: key.Surface,
+			Format:  key.Format,
+			Reason:  key.Reason,
+			Count:   1,
+		})
+	}
 }
 
 func (b *ClaimsBridge) recordPresentationDropLocked(sourceType, sourceID string, presentation *claims.Presentation, reason string) {
@@ -201,6 +231,9 @@ func (b *ClaimsBridge) presentationDiagnosticForArtifactLocked(sessionID, claimI
 		SessionID:            sessionID,
 		ClaimID:              claimID,
 		AgentID:              firstNonBlank(strings.TrimSpace(art.AgentID), claimContextActor(meta, ""), claimsBridgeAgentID),
+		SourceID:             sourceID,
+		SourceType:           claims.RelatedTypeArtifact,
+		SourceKind:           strings.TrimSpace(art.Kind),
 		SourceArtifactID:     sourceID,
 		SourceArtifactKind:   strings.TrimSpace(art.Kind),
 		DiagnosticArtifactID: diagnosticID,
@@ -239,6 +272,72 @@ func (b *ClaimsBridge) presentationDiagnosticForArtifactLocked(sessionID, claimI
 	return record, fallback
 }
 
+func (b *ClaimsBridge) presentationDiagnosticForTestamentLocked(sessionID, claimID string, t *claims.Testament, reason, detail string) (*presentationDiagnosticRecord, *msg.ClaimPresentationMsg) {
+	if b == nil || t == nil {
+		return nil, nil
+	}
+	sourceID := strings.TrimSpace(t.ID)
+	if sourceID == "" {
+		return nil, nil
+	}
+	key := claims.RelatedTypeTestament + "|" + sourceID + "|" + strings.TrimSpace(reason)
+	if b.presentationDiagnostics == nil {
+		b.presentationDiagnostics = make(map[string]struct{})
+	}
+	if _, exists := b.presentationDiagnostics[key]; exists {
+		return nil, nil
+	}
+	b.presentationDiagnostics[key] = struct{}{}
+	surface, format := presentationMetricLabels(t.Presentation)
+	diagnosticID := "presentation-diagnostic-testament-" + sanitizePresentationID(sourceID) + "-" + sanitizePresentationID(reason)
+	reference := fmt.Sprintf("Could not render testament %s: %s", sourceID, firstNonBlank(trimLogValue(detail, 240), reason))
+	reference = safeClaimPresentationContent(diagnosticID, reference, string(claims.PresentationFormatText))
+	claimID = firstNonBlank(strings.TrimSpace(claimID), claims.ClaimIDFromRelations(t.Relations))
+	meta := b.metaForClaimLocked(claimID)
+	cycleID := firstNonBlank(meta.CycleID, claimID)
+	record := &presentationDiagnosticRecord{
+		SessionID:            sessionID,
+		ClaimID:              claimID,
+		AgentID:              firstNonBlank(strings.TrimSpace(t.AgentID), claimContextActor(meta, ""), claimsBridgeAgentID),
+		SourceID:             sourceID,
+		SourceType:           claims.RelatedTypeTestament,
+		SourceKind:           "testament",
+		DiagnosticArtifactID: diagnosticID,
+		Surface:              surface,
+		Format:               format,
+		Reason:               strings.TrimSpace(reason),
+		Reference:            reference,
+		CreatedAt:            nonZeroTime(t.Created),
+	}
+	if cycleID == "" {
+		return record, nil
+	}
+	fallback := &msg.ClaimPresentationMsg{
+		SessionID:   sessionID,
+		CycleID:     cycleID,
+		ClaimID:     claimID,
+		SourceType:  "artifact",
+		SourceID:    diagnosticID,
+		TestamentID: sourceID,
+		AgentID:     record.AgentID,
+		Title:       "Presentation diagnostic",
+		Content:     reference,
+		Format:      string(claims.PresentationFormatText),
+		Placement:   string(claims.PresentationPlacementInline),
+		Metadata: map[string]any{
+			"diagnostic":          true,
+			"source_testament_id": sourceID,
+			"surface":             surface,
+			"format":              format,
+			"reason":              strings.TrimSpace(reason),
+		},
+		CreatedAt: record.CreatedAt,
+		Sequence:  t.Sequence,
+	}
+	b.observePresentationMetricLocked(claimsPresentationMessagesEmitted, surface, string(claims.PresentationFormatText), "fallback")
+	return record, fallback
+}
+
 func (b *ClaimsBridge) recordPresentationDiagnostics(records []presentationDiagnosticRecord) {
 	if b == nil || len(records) == 0 {
 		return
@@ -248,21 +347,35 @@ func (b *ClaimsBridge) recordPresentationDiagnostics(records []presentationDiagn
 		return
 	}
 	for _, record := range records {
-		if strings.TrimSpace(record.DiagnosticArtifactID) == "" || strings.TrimSpace(record.SourceArtifactID) == "" {
+		sourceID := firstNonBlank(record.SourceID, record.SourceArtifactID)
+		sourceType := firstNonBlank(record.SourceType, claims.RelatedTypeArtifact)
+		sourceKind := firstNonBlank(record.SourceKind, record.SourceArtifactKind)
+		if strings.TrimSpace(record.DiagnosticArtifactID) == "" || strings.TrimSpace(sourceID) == "" {
+			continue
+		}
+		if _, exists := board.CloneArtifact(record.DiagnosticArtifactID); exists {
 			continue
 		}
 		relation := claims.Relation{
-			Related:      record.SourceArtifactID,
-			RelatedType:  claims.RelatedTypeArtifact,
+			Related:      sourceID,
+			RelatedType:  sourceType,
 			Relationship: claims.RelationshipDerivedFrom,
 		}
 		metadata := map[string]any{
-			"diagnostic_type":      "presentation_failure",
-			"source_artifact_id":   record.SourceArtifactID,
-			"source_artifact_kind": record.SourceArtifactKind,
-			"surface":              record.Surface,
-			"format":               record.Format,
-			"reason":               record.Reason,
+			"diagnostic_type": "presentation_failure",
+			"source_id":       sourceID,
+			"source_type":     sourceType,
+			"source_kind":     sourceKind,
+			"surface":         record.Surface,
+			"format":          record.Format,
+			"reason":          record.Reason,
+		}
+		if sourceType == claims.RelatedTypeArtifact {
+			metadata["source_artifact_id"] = sourceID
+			metadata["source_artifact_kind"] = sourceKind
+		}
+		if sourceType == claims.RelatedTypeTestament {
+			metadata["source_testament_id"] = sourceID
 		}
 		if record.ClaimID != "" {
 			metadata["claim_id"] = record.ClaimID
@@ -283,7 +396,8 @@ func (b *ClaimsBridge) recordPresentationDiagnostics(records []presentationDiagn
 		}
 		if err := board.SubmitTestaments(context.Background(), claims.Action{AgentID: claimsBridgeAgentID, Type: claims.ActionTypeTestament}, []claims.Testament{testament}); err != nil {
 			b.debug("presentation_diagnostic_record_failed",
-				"source_artifact_id", record.SourceArtifactID,
+				"source_id", sourceID,
+				"source_type", sourceType,
 				"diagnostic_artifact_id", record.DiagnosticArtifactID,
 				"reason", record.Reason,
 				"error", trimLogValue(err.Error(), 240),
@@ -294,6 +408,7 @@ func (b *ClaimsBridge) recordPresentationDiagnostics(records []presentationDiagn
 
 func safeClaimPresentationContent(sourceID, content, format string) string {
 	content = stripUnsafePresentationControls(content)
+	content = preboundPresentationContent(content)
 	switch strings.ToLower(strings.TrimSpace(format)) {
 	case string(claims.PresentationFormatJSON):
 		content = safePresentationJSON(content)
@@ -307,6 +422,13 @@ func safeClaimPresentationContent(sourceID, content, format string) string {
 		content = sanitizePresentationMarkdown(redactPresentationSecretsText(content))
 	default:
 		content = redactPresentationSecretsText(content)
+	}
+	return boundPresentationContent(content)
+}
+
+func preboundPresentationContent(content string) string {
+	if len(content) <= presentationMaxContent {
+		return content
 	}
 	return boundPresentationContent(content)
 }
@@ -348,7 +470,20 @@ func redactPresentationJSON(value any) any {
 func isSecretPresentationKey(key string) bool {
 	key = strings.ToLower(strings.TrimSpace(key))
 	key = strings.ReplaceAll(key, "-", "_")
-	for _, marker := range []string{"token", "api_key", "password", "secret"} {
+	for _, marker := range []string{
+		"token",
+		"api_key",
+		"apikey",
+		"password",
+		"secret",
+		"authorization",
+		"bearer",
+		"private_key",
+		"access_key",
+		"refresh_token",
+		"client_secret",
+		"credential",
+	} {
 		if strings.Contains(key, marker) {
 			return true
 		}
@@ -356,10 +491,32 @@ func isSecretPresentationKey(key string) bool {
 	return false
 }
 
-var presentationSecretPattern = regexp.MustCompile(`(?i)\b(token|api[_-]?key|password|secret)(\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s,;&]+)`)
+var presentationAuthorizationPattern = regexp.MustCompile(`(?i)\b(authorization)(\s*[:=]\s*)(?:bearer\s+)?[^\n\r,;&]+`)
+
+var presentationSecretPattern = regexp.MustCompile(`(?i)\b(token|api[_-]?key|apikey|password|secret|bearer|private[_-]?key|access[_-]?key|refresh[_-]?token|client[_-]?secret|credential)(\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s,;&]+)`)
 
 func redactPresentationSecretsText(content string) string {
+	content = presentationAuthorizationPattern.ReplaceAllString(content, `$1$2[REDACTED]`)
 	return presentationSecretPattern.ReplaceAllString(content, `$1$2[REDACTED]`)
+}
+
+func safePresentationMetadata(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	redacted, ok := redactPresentationJSON(in).(map[string]any)
+	if !ok {
+		return cloneMetadata(in)
+	}
+	out := make(map[string]any, len(redacted))
+	for k, v := range redacted {
+		if s, ok := v.(string); ok {
+			out[k] = boundPresentationContent(redactPresentationSecretsText(stripUnsafePresentationControls(s)))
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 func sanitizePresentationMarkdown(content string) string {

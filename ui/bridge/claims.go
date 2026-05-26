@@ -82,6 +82,7 @@ type ClaimsBridge struct {
 	emittedPresentations      map[string]presentationEmissionState
 	presentationReplacements  map[string]presentationEmissionState
 	presentationMetrics       map[presentationMetricKey]int64
+	presentationMetricSink    PresentationMetricSink
 	presentationDiagnostics   map[string]struct{}
 	completedStartedArtifacts map[string]struct{}
 	claimToInvocationArtifact map[string]string
@@ -836,7 +837,8 @@ func (b *ClaimsBridge) OnArtifactAdded(claimID, agentID, sessionID string, artif
 			}
 			break
 		}
-		if m := b.claimPresentationMsgLocked(sessionID, claimID, art); m != nil {
+		if m, msgDiagnostics := b.claimPresentationMsgLocked(sessionID, claimID, art); m != nil {
+			diagnostics = append(diagnostics, msgDiagnostics...)
 			out = append(out, *m)
 		}
 	case isVisibleStartedArtifactKind(art.Kind):
@@ -1097,37 +1099,48 @@ func (b *ClaimsBridge) claimPresentationMsgForTestament(sessionID, claimID strin
 		return nil
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.claimPresentationMsgForTestamentLocked(sessionID, claimID, t)
+	out, diagnostics := b.claimPresentationMsgForTestamentLocked(sessionID, claimID, t)
+	b.mu.Unlock()
+	b.recordPresentationDiagnostics(diagnostics)
+	return out
 }
 
-func (b *ClaimsBridge) claimPresentationMsgForTestamentLocked(sessionID, claimID string, t *claims.Testament) *msg.ClaimPresentationMsg {
+func (b *ClaimsBridge) claimPresentationMsgForTestamentLocked(sessionID, claimID string, t *claims.Testament) (*msg.ClaimPresentationMsg, []presentationDiagnosticRecord) {
 	if t == nil {
-		return nil
+		return nil, nil
 	}
+	var diagnostics []presentationDiagnosticRecord
 	if t.Presentation != nil {
 		if err := claims.ValidatePresentation(t.Presentation); err != nil {
 			b.recordPresentationInvalidLocked("testament", strings.TrimSpace(t.ID), t.Presentation, "invalid_presentation", err.Error())
-			return nil
+			if diagnostic, fallback := b.presentationDiagnosticForTestamentLocked(sessionID, claimID, t, "invalid_presentation", err.Error()); diagnostic != nil {
+				diagnostics = append(diagnostics, *diagnostic)
+				return fallback, diagnostics
+			}
+			return nil, diagnostics
 		}
 	}
 	if !claims.IsPresentableToUserChat(t.Presentation) {
-		return nil
+		return nil, nil
 	}
 	sourceID := strings.TrimSpace(t.ID)
 	if sourceID == "" {
 		b.recordPresentationDropLocked("testament", "", t.Presentation, "missing_source_id")
-		return nil
+		return nil, nil
 	}
 	if err := validateBridgeRenderablePresentation(t.Presentation); err != nil {
 		b.recordPresentationInvalidLocked("testament", sourceID, t.Presentation, "unsupported_format", err.Error())
-		return nil
+		if diagnostic, fallback := b.presentationDiagnosticForTestamentLocked(sessionID, claimID, t, "unsupported_format", err.Error()); diagnostic != nil {
+			diagnostics = append(diagnostics, *diagnostic)
+			return fallback, diagnostics
+		}
+		return nil, diagnostics
 	}
 	content := strings.TrimSpace(t.Summary)
 	if content == "" {
 		b.recordPresentationDropLocked("testament", sourceID, t.Presentation, "empty_content")
 		b.debug("presentation_skip_empty_testament", "testament_id", sourceID)
-		return nil
+		return nil, nil
 	}
 	content = safeClaimPresentationContent(sourceID, content, presentationFormat(claims.NormalizePresentation(t.Presentation)))
 	claimID = strings.TrimSpace(claimID)
@@ -1137,16 +1150,16 @@ func (b *ClaimsBridge) claimPresentationMsgForTestamentLocked(sessionID, claimID
 	meta := b.metaForClaimLocked(claimID)
 	if meta.SuppressChat {
 		b.recordPresentationDropLocked("testament", sourceID, t.Presentation, "suppressed_chat")
-		return nil
+		return nil, nil
 	}
 	p := claims.NormalizePresentation(t.Presentation)
 	cycleID := firstNonBlank(meta.CycleID, claimID)
 	if cycleID == "" {
 		b.recordPresentationDropLocked("testament", sourceID, p, "missing_cycle")
-		return nil
+		return nil, nil
 	}
 	if !b.shouldEmitPresentationLocked("testament", sourceID, presentationReplaceKey(p), t.Sequence, p) {
-		return nil
+		return nil, nil
 	}
 	b.observePresentationMetricLocked(claimsPresentationMessagesEmitted, string(claims.PresentationSurfaceChat), presentationFormat(p), "")
 	return &msg.ClaimPresentationMsg{
@@ -1164,17 +1177,18 @@ func (b *ClaimsBridge) claimPresentationMsgForTestamentLocked(sessionID, claimID
 		ReplaceKey:  presentationReplaceKey(p),
 		CreatedAt:   nonZeroTime(t.Created),
 		Sequence:    t.Sequence,
-	}
+	}, nil
 }
 
-func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art *claims.Artifact) *msg.ClaimPresentationMsg {
+func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art *claims.Artifact) (*msg.ClaimPresentationMsg, []presentationDiagnosticRecord) {
 	if art == nil || !claims.IsPresentableToUserChat(art.Presentation) {
-		return nil
+		return nil, nil
 	}
+	var diagnostics []presentationDiagnosticRecord
 	sourceID := strings.TrimSpace(art.ID)
 	if sourceID == "" {
 		b.recordPresentationDropLocked("artifact", "", art.Presentation, "missing_source_id")
-		return nil
+		return nil, nil
 	}
 	content, truncated := presentationArtifactContent(art)
 	if strings.TrimSpace(content) == "" {
@@ -1183,7 +1197,7 @@ func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art
 	if strings.TrimSpace(content) == "" {
 		b.recordPresentationDropLocked("artifact", sourceID, art.Presentation, "empty_content")
 		b.debug("presentation_skip_empty_artifact", "artifact_id", sourceID, "kind", art.Kind)
-		return nil
+		return nil, nil
 	}
 	claimID = strings.TrimSpace(claimID)
 	if claimID == "" {
@@ -1192,21 +1206,24 @@ func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art
 	meta := b.metaForClaimLocked(claimID)
 	if meta.SuppressChat {
 		b.recordPresentationDropLocked("artifact", sourceID, art.Presentation, "suppressed_chat")
-		return nil
+		return nil, nil
 	}
 	p := claims.NormalizePresentation(art.Presentation)
 	cycleID := firstNonBlank(meta.CycleID, claimID)
 	if cycleID == "" {
 		b.recordPresentationDropLocked("artifact", sourceID, p, "missing_cycle")
-		return nil
+		return nil, nil
 	}
 	if !b.shouldEmitPresentationLocked("artifact", sourceID, presentationReplaceKey(p), art.Sequence, p) {
-		return nil
+		return nil, nil
 	}
 	format := presentationFormat(p)
 	if truncated {
 		format = string(claims.PresentationFormatText)
 		b.observePresentationMetricLocked(claimsPresentationDereferenceFailures, string(claims.PresentationSurfaceChat), format, "content_truncated")
+		if diagnostic, _ := b.presentationDiagnosticForArtifactLocked(sessionID, claimID, art, "content_truncated", content); diagnostic != nil {
+			diagnostics = append(diagnostics, *diagnostic)
+		}
 	}
 	content = safeClaimPresentationContent(sourceID, content, format)
 	b.observePresentationMetricLocked(claimsPresentationMessagesEmitted, string(claims.PresentationSurfaceChat), format, "")
@@ -1223,10 +1240,10 @@ func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art
 		Format:      format,
 		Placement:   presentationPlacement(p),
 		ReplaceKey:  presentationReplaceKey(p),
-		Metadata:    cloneMetadata(art.Metadata),
+		Metadata:    safePresentationMetadata(art.Metadata),
 		CreatedAt:   nonZeroTime(art.Created),
 		Sequence:    art.Sequence,
-	}
+	}, diagnostics
 }
 
 func (b *ClaimsBridge) claimIDForArtifactLocked(art *claims.Artifact) string {
@@ -1545,7 +1562,7 @@ func (b *ClaimsBridge) syntheticLegacyPlanPresentationMsg(sessionID, claimID str
 			Format:      presentationFormat(presentation),
 			Placement:   presentationPlacement(presentation),
 			ReplaceKey:  presentationReplaceKey(presentation),
-			Metadata:    metadata,
+			Metadata:    safePresentationMetadata(metadata),
 			CreatedAt:   nonZeroTime(t.Created),
 			Sequence:    artifact.Sequence,
 		}
