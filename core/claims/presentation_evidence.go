@@ -77,6 +77,38 @@ type PlanMarkdownEvidenceResult struct {
 	TestamentID string    `json:"testament_id,omitempty"`
 }
 
+// PlanMarkdownEvidenceRemediationRequest validates a canonical plan_markdown
+// artifact and, on failure, routes remediation through the normal claim
+// rejection/replacement path.
+type PlanMarkdownEvidenceRemediationRequest struct {
+	ClaimID          string
+	ValidationID     string
+	EvaluatorAgentID string
+	Check            PlanMarkdownEvidenceCheck
+
+	RemediationTitle                 string
+	RemediationDescription           string
+	RemediationValidationDescription string
+	RemediationValidationQualityBar  string
+}
+
+// PlanMarkdownEvidenceRemediationResult reports the complete outcome of a
+// validator-facing plan_markdown evidence check.
+type PlanMarkdownEvidenceRemediationResult struct {
+	Evidence            PlanMarkdownEvidenceResult `json:"evidence"`
+	ValidationEvaluated bool                       `json:"validation_evaluated,omitempty"`
+	ValidationStatus    ValidationStatus           `json:"validation_status,omitempty"`
+	RemediationPosted   bool                       `json:"remediation_posted,omitempty"`
+	RemediationActionID string                     `json:"remediation_action_id,omitempty"`
+	RemediationClaimIDs []string                   `json:"remediation_claim_ids,omitempty"`
+	ExistingRemediation bool                       `json:"existing_remediation,omitempty"`
+}
+
+const (
+	claimTagEvidenceRemediation     = "claims_visibility:evidence_remediation"
+	claimTagPlanMarkdownRemediation = "claims_visibility:plan_markdown"
+)
+
 // ValidatePlanMarkdownEvidence finds the latest matching plan_markdown
 // artifact via the board projection and validates it as normal evidence.
 func ValidatePlanMarkdownEvidence(board *ClaimsBoard, check PlanMarkdownEvidenceCheck) PlanMarkdownEvidenceResult {
@@ -136,6 +168,231 @@ func ValidatePlanMarkdownEvidence(board *ClaimsBoard, check PlanMarkdownEvidence
 	}
 	result.Passed = len(result.Reasons) == 0
 	return result
+}
+
+// ValidatePlanMarkdownEvidenceAndMaybeRemediate lets validator code use the
+// board as its evidence source and, when the evidence check fails, emits real
+// remediation claims through RejectClaim. If ValidationID is supplied, the
+// helper records the validation verdict before applying remediation.
+func ValidatePlanMarkdownEvidenceAndMaybeRemediate(ctx context.Context, board *ClaimsBoard, req PlanMarkdownEvidenceRemediationRequest) (*PlanMarkdownEvidenceRemediationResult, error) {
+	if board == nil {
+		return nil, fmt.Errorf("claims board is nil")
+	}
+	claimID := strings.TrimSpace(req.ClaimID)
+	if claimID == "" {
+		return nil, fmt.Errorf("claim_id is required")
+	}
+	claim, ok := board.CloneClaim(claimID)
+	if !ok {
+		return nil, fmt.Errorf("claim %q not found", claimID)
+	}
+
+	evaluator := firstNonEmpty(req.EvaluatorAgentID, IssuerAgentID(claim.Relations), "claims-validator")
+	result := &PlanMarkdownEvidenceRemediationResult{
+		Evidence: ValidatePlanMarkdownEvidence(board, req.Check),
+	}
+
+	if req.ValidationID != "" {
+		status, evaluated, err := evaluatePlanMarkdownEvidenceValidation(ctx, board, claim, req.ValidationID, evaluator, result.Evidence)
+		if err != nil {
+			return result, err
+		}
+		result.ValidationStatus = status
+		result.ValidationEvaluated = evaluated
+	}
+
+	if result.Evidence.Passed {
+		return result, nil
+	}
+
+	if ids := existingEvidenceRemediationClaimIDs(board, claimID); len(ids) > 0 {
+		result.ExistingRemediation = true
+		result.RemediationClaimIDs = ids
+		return result, nil
+	}
+
+	claim, ok = board.CloneClaim(claimID)
+	if !ok {
+		return result, fmt.Errorf("claim %q not found", claimID)
+	}
+	if claim.Status.IsTerminal() {
+		return result, fmt.Errorf("claim %q already terminal (%s); cannot post evidence remediation", claimID, claim.Status)
+	}
+
+	replacementAction := &Action{
+		AgentID: evaluator,
+		Type:    ActionTypeCorrective,
+		Relations: []Relation{
+			{Related: evaluator, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+			{Related: claimID, RelatedType: RelatedTypeClaim, Relationship: RelationshipCausedBy},
+		},
+	}
+	replacementClaims := []Claim{buildPlanMarkdownEvidenceRemediationClaim(claim, evaluator, req, result.Evidence)}
+	reason := "plan_markdown evidence validation failed: " + evidenceReasonsText(result.Evidence.Reasons)
+	if err := board.RejectClaim(ctx, claimID, StatusChange{
+		Reason:  reason,
+		AgentID: evaluator,
+	}, replacementAction, replacementClaims); err != nil {
+		return result, err
+	}
+
+	result.RemediationPosted = true
+	result.RemediationActionID = replacementAction.ID
+	for i := range replacementClaims {
+		if id := strings.TrimSpace(replacementClaims[i].ID); id != "" {
+			result.RemediationClaimIDs = append(result.RemediationClaimIDs, id)
+		}
+	}
+	return result, nil
+}
+
+func evaluatePlanMarkdownEvidenceValidation(ctx context.Context, board *ClaimsBoard, claim *Claim, validationID, evaluator string, evidence PlanMarkdownEvidenceResult) (ValidationStatus, bool, error) {
+	validationID = strings.TrimSpace(validationID)
+	if validationID == "" {
+		return "", false, nil
+	}
+	var validation *Validation
+	for _, candidate := range claim.Validations {
+		if candidate != nil && candidate.ID == validationID {
+			validation = candidate
+			break
+		}
+	}
+	if validation == nil {
+		return "", false, fmt.Errorf("validation %q not found on claim %q", validationID, claim.ID)
+	}
+	nextStatus := ValidationStatusPassed
+	reason := "plan_markdown evidence passed"
+	if !evidence.Passed {
+		nextStatus = ValidationStatusFailed
+		reason = "plan_markdown evidence failed: " + evidenceReasonsText(evidence.Reasons)
+	}
+	if validation.Status.IsTerminal() {
+		if validation.Status == nextStatus {
+			return validation.Status, false, nil
+		}
+		return validation.Status, false, fmt.Errorf("validation %q already terminal (%s), cannot record %s", validationID, validation.Status, nextStatus)
+	}
+	if err := board.EvaluateValidation(ctx, claim.ID, validationID, StatusChange{
+		To:      string(nextStatus),
+		Reason:  reason,
+		AgentID: evaluator,
+	}); err != nil {
+		return "", false, err
+	}
+	return nextStatus, true, nil
+}
+
+func buildPlanMarkdownEvidenceRemediationClaim(original *Claim, evaluator string, req PlanMarkdownEvidenceRemediationRequest, evidence PlanMarkdownEvidenceResult) Claim {
+	subject := firstNonEmpty(SubjectAgentID(original.Relations), strings.TrimSpace(original.AgentID), evaluator)
+	reasons := evidenceReasonsText(evidence.Reasons)
+	title := firstNonEmpty(req.RemediationTitle, "Remediate plan presentation evidence")
+	description := firstNonEmpty(req.RemediationDescription,
+		"The plan_markdown artifact for claim "+strings.TrimSpace(original.ID)+" failed evidence validation: "+reasons+". Submit a replacement plan_markdown artifact as ordinary board evidence with the required metadata, content, and user-facing presentation contract.")
+	validationDescription := firstNonEmpty(req.RemediationValidationDescription,
+		"Submit a replacement plan_markdown artifact that satisfies the validator evidence check.")
+	validationQualityBar := firstNonEmpty(req.RemediationValidationQualityBar,
+		"The replacement artifact is kind plan_markdown, contains a recognizable plan heading and required task text, preserves the expected plan metadata, and targets user/chat when required. Prior failure reasons: "+reasons)
+
+	return Claim{
+		AgentID:     evaluator,
+		Title:       title,
+		Description: description,
+		Scope:       cloneClaimScope(original.Scope),
+		Tags:        appendEvidenceRemediationTags(original.Tags),
+		Relations: []Relation{
+			{Related: evaluator, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+			{Related: subject, RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+			{Related: strings.TrimSpace(original.ID), RelatedType: RelatedTypeClaim, Relationship: RelationshipCausedBy},
+		},
+		Validations: []*Validation{{
+			Description: validationDescription,
+			QualityBar:  validationQualityBar,
+			Type:        ValidationTypeInspection,
+			Required:    true,
+		}},
+	}
+}
+
+func existingEvidenceRemediationClaimIDs(board *ClaimsBoard, claimID string) []string {
+	if board == nil {
+		return nil
+	}
+	proj := board.Projection()
+	var ids []string
+	for i := range proj.Claims {
+		c := &proj.Claims[i]
+		if !HasRelation(c.Relations, RelationshipSupersedes, claimID) {
+			continue
+		}
+		if !claimHasTag(c.Tags, claimTagEvidenceRemediation) {
+			continue
+		}
+		if id := strings.TrimSpace(c.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func cloneClaimScope(scope []ClaimScopeEntry) []ClaimScopeEntry {
+	if len(scope) == 0 {
+		return nil
+	}
+	out := make([]ClaimScopeEntry, len(scope))
+	copy(out, scope)
+	return out
+}
+
+func appendEvidenceRemediationTags(tags []string) []string {
+	out := append([]string(nil), tags...)
+	out = appendUniqueClaimTag(out, claimTagEvidenceRemediation)
+	out = appendUniqueClaimTag(out, claimTagPlanMarkdownRemediation)
+	return out
+}
+
+func appendUniqueClaimTag(tags []string, tag string) []string {
+	tag = strings.TrimSpace(tag)
+	if tag == "" || claimHasTag(tags, tag) {
+		return tags
+	}
+	return append(tags, tag)
+}
+
+func claimHasTag(tags []string, tag string) bool {
+	tag = strings.TrimSpace(tag)
+	for _, existing := range tags {
+		if strings.TrimSpace(existing) == tag {
+			return true
+		}
+	}
+	return false
+}
+
+func evidenceReasonsText(reasons []string) string {
+	unique := make([]string, 0, len(reasons))
+	seen := make(map[string]struct{}, len(reasons))
+	for _, reason := range reasons {
+		reason = strings.TrimSpace(reason)
+		if reason == "" {
+			continue
+		}
+		if _, ok := seen[reason]; ok {
+			continue
+		}
+		seen[reason] = struct{}{}
+		unique = append(unique, reason)
+	}
+	if len(unique) == 0 {
+		return "evidence validation failed"
+	}
+	text := strings.Join(unique, "; ")
+	const maxReasonText = 1800
+	if len(text) > maxReasonText {
+		return text[:maxReasonText] + "..."
+	}
+	return text
 }
 
 func latestPlanMarkdownArtifact(proj *ClaimsBoardProjection, planID string) (*Artifact, string) {

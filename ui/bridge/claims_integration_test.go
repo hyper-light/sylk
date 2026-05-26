@@ -658,6 +658,54 @@ func TestBridgeIntegration_ReplayLegacyResponseTextWithoutPresentation(t *testin
 	}
 }
 
+func TestBridgeIntegration_ResponseTextWithPresentationRendersOnce(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-response-presentation")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "answer user",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+
+	br.OnArtifactAdded(claimID, "architect", "ses-response-presentation", &claims.Artifact{
+		ID:           "response-new",
+		AgentID:      "architect",
+		Kind:         claims.ArtifactKindResponseText,
+		Reference:    "new answer",
+		Presentation: claims.DefaultResponseTextPresentation(),
+		Created:      time.Now(),
+	})
+	drainBridge(t, prog, "response_text with presentation")
+
+	var responses, presentations int
+	for _, m := range prog.Snapshot() {
+		switch typed := m.(type) {
+		case msg.ClaimResponseTextMsg:
+			if typed.Content == "new answer" {
+				responses++
+			}
+		case msg.ClaimPresentationMsg:
+			if typed.SourceID == "response-new" {
+				presentations++
+			}
+		}
+	}
+	if responses != 1 || presentations != 0 {
+		debugSnapshot(t, prog, "response_text with presentation")
+		t.Fatalf("response_text responses=%d presentations=%d, want 1/0", responses, presentations)
+	}
+}
+
 func TestBridgeIntegration_ReplayLegacyPlanHandoffSynthesizesTransientPresentation(t *testing.T) {
 	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-legacy-plan-replay")
 	defer cleanup()
