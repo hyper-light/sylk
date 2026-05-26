@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -704,6 +705,350 @@ func TestBridgeIntegration_ResponseTextWithPresentationRendersOnce(t *testing.T)
 		debugSnapshot(t, prog, "response_text with presentation")
 		t.Fatalf("response_text responses=%d presentations=%d, want 1/0", responses, presentations)
 	}
+}
+
+func TestBridgeIntegration_InvalidPresentationIncrementsInvalidMetric(t *testing.T) {
+	br, board, _, cleanup := setupBridgeOnSession(t, "ses-presentation-invalid")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "plan",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+
+	br.OnArtifactAdded(claimID, "architect", "ses-presentation-invalid", &claims.Artifact{
+		ID:        "invalid-presentation",
+		AgentID:   "architect",
+		Kind:      claims.ArtifactKindPlanMarkdown,
+		Reference: "### Plan\n\n- Task A",
+		Presentation: &claims.Presentation{
+			Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+			Format:    claims.PresentationFormatMarkdown,
+		},
+		Created: time.Now(),
+	})
+
+	if got := presentationMetricCount(br.PresentationMetricsSnapshot(), claimsPresentationInvalid, "invalid_presentation"); got != 1 {
+		t.Fatalf("invalid metric = %d, want 1: %+v", got, br.PresentationMetricsSnapshot())
+	}
+	if got := presentationMetricCount(br.PresentationMetricsSnapshot(), claimsPresentationMessagesDropped, "invalid_presentation"); got != 1 {
+		t.Fatalf("dropped invalid metric = %d, want 1: %+v", got, br.PresentationMetricsSnapshot())
+	}
+}
+
+func TestBridgeIntegration_PresentationDropWithoutCycleIncrementsMetric(t *testing.T) {
+	br, _, prog, cleanup := setupBridgeOnSession(t, "ses-presentation-drop")
+	defer cleanup()
+
+	before := len(prog.Snapshot())
+	br.OnArtifactAdded("", "architect", "ses-presentation-drop", &claims.Artifact{
+		ID:        "orphan-presentation",
+		AgentID:   "architect",
+		Kind:      "report",
+		Reference: "Visible but not cycle-routable.",
+		Presentation: &claims.Presentation{
+			Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+			Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
+			Format:    claims.PresentationFormatMarkdown,
+		},
+		Created: time.Now(),
+	})
+	drainBridge(t, prog, "orphan presentation")
+
+	for _, m := range prog.Snapshot()[before:] {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceID == "orphan-presentation" {
+			t.Fatalf("orphan presentation should be dropped, got %+v", p)
+		}
+	}
+	if got := presentationMetricCount(br.PresentationMetricsSnapshot(), claimsPresentationMessagesDropped, "missing_cycle"); got != 1 {
+		t.Fatalf("missing_cycle dropped metric = %d, want 1: %+v", got, br.PresentationMetricsSnapshot())
+	}
+}
+
+func TestBridgeIntegration_PresentationReplacementIncrementsMetric(t *testing.T) {
+	br, board, _, cleanup := setupBridgeOnSession(t, "ses-presentation-replacement-metric")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "plan",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	presentation := &claims.Presentation{
+		Audiences:  []claims.PresentationAudience{claims.PresentationAudienceUser},
+		Surfaces:   []claims.PresentationSurface{claims.PresentationSurfaceChat},
+		Format:     claims.PresentationFormatMarkdown,
+		ReplaceKey: "plan:p1:review",
+	}
+	br.OnArtifactAdded(claimID, "architect", "ses-presentation-replacement-metric", &claims.Artifact{
+		ID:           "plan-v1",
+		AgentID:      "architect",
+		Kind:         claims.ArtifactKindPlanMarkdown,
+		Reference:    "### Plan\n\n- v1",
+		Presentation: presentation,
+		Sequence:     1,
+		Created:      time.Now(),
+	})
+	br.OnArtifactAdded(claimID, "architect", "ses-presentation-replacement-metric", &claims.Artifact{
+		ID:           "plan-v2",
+		AgentID:      "architect",
+		Kind:         claims.ArtifactKindPlanMarkdown,
+		Reference:    "### Plan\n\n- v2",
+		Presentation: presentation,
+		Sequence:     2,
+		Created:      time.Now(),
+	})
+
+	if got := presentationMetricCount(br.PresentationMetricsSnapshot(), claimsPresentationReplacements, ""); got != 1 {
+		t.Fatalf("replacement metric = %d, want 1: %+v", got, br.PresentationMetricsSnapshot())
+	}
+}
+
+func TestBridgeIntegration_ConcurrentPresentationReplacementsConverge(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-presentation-concurrent-replace")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "plan",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	presentation := &claims.Presentation{
+		Audiences:  []claims.PresentationAudience{claims.PresentationAudienceUser},
+		Surfaces:   []claims.PresentationSurface{claims.PresentationSurfaceChat},
+		Format:     claims.PresentationFormatMarkdown,
+		ReplaceKey: "plan:p1:review",
+	}
+
+	var wg sync.WaitGroup
+	for i := 1; i <= 32; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			br.OnArtifactAdded(claimID, "architect", "ses-presentation-concurrent-replace", &claims.Artifact{
+				ID:           "plan-concurrent-" + strconv.Itoa(i),
+				AgentID:      "architect",
+				Kind:         claims.ArtifactKindPlanMarkdown,
+				Reference:    "### Plan\n\n- v" + strconv.Itoa(i),
+				Presentation: presentation,
+				Sequence:     uint64(i),
+				Created:      time.Now(),
+			})
+		}()
+	}
+	wg.Wait()
+	drainBridge(t, prog, "concurrent replacements")
+
+	br.mu.Lock()
+	state := br.presentationReplacements["plan:p1:review"]
+	br.mu.Unlock()
+	if state.SourceID != "plan-concurrent-32" || state.Sequence != 32 {
+		t.Fatalf("replacement state = %+v, want latest sequence/source", state)
+	}
+}
+
+func TestBridgeIntegration_UnsupportedPresentationFormatRecordsDiagnosticArtifact(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-presentation-diagnostic")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "plan",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	before := len(prog.Snapshot())
+
+	br.OnArtifactAdded(claimID, "architect", "ses-presentation-diagnostic", &claims.Artifact{
+		ID:        "bad-format",
+		AgentID:   "architect",
+		Kind:      claims.ArtifactKindPlanMarkdown,
+		Reference: "### Plan\n\n- Task A",
+		Presentation: &claims.Presentation{
+			Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+			Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
+			Format:    claims.PresentationFormat("video"),
+		},
+		Created: time.Now(),
+	})
+	drainBridge(t, prog, "unsupported presentation format")
+
+	var fallback *msg.ClaimPresentationMsg
+	for _, m := range prog.Snapshot()[before:] {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && strings.Contains(p.SourceID, "presentation-diagnostic") {
+			copy := p
+			fallback = &copy
+			break
+		}
+	}
+	if fallback == nil {
+		debugSnapshot(t, prog, "unsupported presentation format")
+		t.Fatal("expected fallback presentation diagnostic message")
+	}
+	if !strings.Contains(fallback.Content, "Could not render") || fallback.Format != string(claims.PresentationFormatText) {
+		t.Fatalf("unexpected fallback: %+v", fallback)
+	}
+	diagnostic, ok := board.CloneArtifact(fallback.SourceID)
+	if !ok {
+		t.Fatalf("diagnostic artifact %q not recorded", fallback.SourceID)
+	}
+	if diagnostic.Kind != claims.ArtifactKindErrorDiagnostic {
+		t.Fatalf("diagnostic kind = %q, want error_diagnostic", diagnostic.Kind)
+	}
+	if !claims.HasRelation(diagnostic.Relations, claims.RelationshipDerivedFrom, "bad-format") {
+		t.Fatalf("diagnostic missing derived_from relation: %+v", diagnostic.Relations)
+	}
+	if diagnostic.Metadata["source_artifact_id"] != "bad-format" || diagnostic.Metadata["reason"] != "unsupported_format" {
+		t.Fatalf("diagnostic metadata malformed: %+v", diagnostic.Metadata)
+	}
+}
+
+func TestBridgeIntegration_PresentationContentIsRedactedSanitizedAndBounded(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-presentation-safety")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "report",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+
+	cases := []struct {
+		id         string
+		format     claims.PresentationFormat
+		reference  string
+		want       string
+		mustAbsent []string
+	}{
+		{
+			id:         "json-secret",
+			format:     claims.PresentationFormatJSON,
+			reference:  `{"token":"tok_live","nested":{"api_key":"key_live","password":"pw"}}`,
+			want:       "[REDACTED]",
+			mustAbsent: []string{"tok_live", "key_live", "pw"},
+		},
+		{
+			id:         "markdown-script",
+			format:     claims.PresentationFormatMarkdown,
+			reference:  "### Report\n\n<script>alert(1)</script>",
+			want:       "&lt;script&gt;",
+			mustAbsent: []string{"<script>"},
+		},
+		{
+			id:         "binary-diff",
+			format:     claims.PresentationFormatDiff,
+			reference:  "GIT binary patch\nliteral 4\nAAAA\n",
+			want:       "Binary diff omitted",
+			mustAbsent: []string{"literal 4"},
+		},
+		{
+			id:         "huge-markdown",
+			format:     claims.PresentationFormatMarkdown,
+			reference:  strings.Repeat("A", presentationMaxContent+128),
+			want:       "[Presentation content truncated]",
+			mustAbsent: nil,
+		},
+	}
+	for _, tc := range cases {
+		before := len(prog.Snapshot())
+		br.OnArtifactAdded(claimID, "architect", "ses-presentation-safety", &claims.Artifact{
+			ID:        tc.id,
+			AgentID:   "architect",
+			Kind:      "report",
+			Reference: tc.reference,
+			Presentation: &claims.Presentation{
+				Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+				Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
+				Format:    tc.format,
+			},
+			Created: time.Now(),
+		})
+		drainBridge(t, prog, "presentation safety "+tc.id)
+
+		var got *msg.ClaimPresentationMsg
+		for _, m := range prog.Snapshot()[before:] {
+			if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceID == tc.id {
+				copy := p
+				got = &copy
+				break
+			}
+		}
+		if got == nil {
+			debugSnapshot(t, prog, "presentation safety "+tc.id)
+			t.Fatalf("%s: expected presentation message", tc.id)
+		}
+		if !strings.Contains(got.Content, tc.want) {
+			t.Fatalf("%s: content missing %q: %q", tc.id, tc.want, got.Content)
+		}
+		for _, absent := range tc.mustAbsent {
+			if strings.Contains(got.Content, absent) {
+				t.Fatalf("%s: content leaked %q: %q", tc.id, absent, got.Content)
+			}
+		}
+		if tc.id == "huge-markdown" && len(got.Content) > presentationMaxContent+128 {
+			t.Fatalf("huge content length = %d, want bounded near %d", len(got.Content), presentationMaxContent)
+		}
+	}
+}
+
+func presentationMetricCount(metrics []PresentationMetric, name, reason string) int64 {
+	var total int64
+	for _, metric := range metrics {
+		if metric.Name != name {
+			continue
+		}
+		if reason != "" && metric.Reason != reason {
+			continue
+		}
+		total += metric.Count
+	}
+	return total
 }
 
 func TestBridgeIntegration_ReplayLegacyPlanHandoffSynthesizesTransientPresentation(t *testing.T) {
