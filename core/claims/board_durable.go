@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,6 +22,8 @@ const (
 
 	walEventActionPosted        = "action_posted"
 	walEventClaimUpdated        = "claim_updated"
+	walEventClaimContextSet     = "claim_context_set"
+	walEventTestamentContextSet = "testament_context_set"
 	walEventTestamentSubmitted  = "testament_submitted"
 	walEventValidationEvaluated = "validation_evaluated"
 	walEventClaimAccepted       = "claim_accepted"
@@ -40,18 +42,18 @@ type walEvent struct {
 }
 
 type walCheckpoint struct {
-	BoardID    string             `json:"board_id"`
-	PipelineID string            `json:"pipeline_id"`
-	TaskID     string             `json:"task_id"`
-	SessionID  string             `json:"session_id"`
-	Phase      BoardPhase         `json:"phase"`
-	Iteration  int                `json:"iteration"`
-	Actions    map[string]*Action `json:"actions"`
-	Claims     map[string]*Claim  `json:"claims"`
-	ClaimOrder []string           `json:"claim_order"`
+	BoardID    string                `json:"board_id"`
+	PipelineID string                `json:"pipeline_id"`
+	TaskID     string                `json:"task_id"`
+	SessionID  string                `json:"session_id"`
+	Phase      BoardPhase            `json:"phase"`
+	Iteration  int                   `json:"iteration"`
+	Actions    map[string]*Action    `json:"actions"`
+	Claims     map[string]*Claim     `json:"claims"`
+	ClaimOrder []string              `json:"claim_order"`
 	Testaments map[string]*Testament `json:"testaments"`
-	Seq        uint64             `json:"seq"`
-	UpdatedAt  time.Time          `json:"updated_at"`
+	Seq        uint64                `json:"seq"`
+	UpdatedAt  time.Time             `json:"updated_at"`
 }
 
 // DurableBoard wraps a ClaimsBoard with WAL persistence.
@@ -61,11 +63,13 @@ type walCheckpoint struct {
 type DurableBoard struct {
 	board *ClaimsBoard
 
-	mu      sync.Mutex
-	walDir  string
-	walFile *os.File
-	seq     uint64
-	seen    map[string]uint64
+	mu         sync.Mutex
+	walDir     string
+	walFile    *os.File
+	seq        uint64
+	seen       map[string]uint64
+	outbox     *ClaimsOutbox
+	projectors []ClaimsProjector
 }
 
 func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
@@ -76,10 +80,18 @@ func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
 		cfg.BoardID = boardID
 	}
 	if sessionDir == "" {
-		return &DurableBoard{
+		db := &DurableBoard{
 			board: NewClaimsBoard(cfg),
 			seen:  make(map[string]uint64),
-		}, nil
+		}
+		db.projectors = durableProjectors(cfg)
+		outbox, err := OpenClaimsOutbox("", projectorNames(db.projectors))
+		if err != nil {
+			return nil, err
+		}
+		db.outbox = outbox
+		db.board.durable = db
+		return db, nil
 	}
 
 	walDir := filepath.Join(sessionDir, "protocols", walNamespace, boardID, "wal")
@@ -88,6 +100,7 @@ func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
 	}
 
 	db := &DurableBoard{walDir: walDir, seen: make(map[string]uint64)}
+	db.projectors = durableProjectors(cfg)
 
 	walPath := filepath.Join(walDir, "events.wal.jsonl")
 	f, err := os.OpenFile(walPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
@@ -108,7 +121,16 @@ func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
 		return nil, fmt.Errorf("load claims snapshot: %w", err)
 	}
 	db.board = board
+	db.board.durable = db
 	db.seq = snapshotSeq
+
+	outboxDir := filepath.Join(filepath.Dir(walDir), "outbox")
+	outbox, err := OpenClaimsOutbox(outboxDir, projectorNames(db.projectors))
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("open claims outbox: %w", err)
+	}
+	db.outbox = outbox
 
 	if err := db.replayWAL(snapshotSeq); err != nil {
 		_ = f.Close()
@@ -132,16 +154,18 @@ func (db *DurableBoard) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	unlockFile(db.walFile)
-	return db.walFile.Close()
+	walErr := db.walFile.Close()
+	outboxErr := db.outbox.Close()
+	if walErr != nil {
+		return walErr
+	}
+	return outboxErr
 }
 
 func (db *DurableBoard) SaveSnapshot() error {
 	if db == nil || db.board == nil {
 		return nil
 	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	b := db.board
 	b.mu.RLock()
 	checkpoint := walCheckpoint{
@@ -170,6 +194,8 @@ func (db *DurableBoard) SaveSnapshot() error {
 	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
 		return fmt.Errorf("write claims snapshot: %w", err)
 	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	return os.Rename(tmpPath, snapshotPath)
 }
 
@@ -221,70 +247,71 @@ func (db *DurableBoard) appendEvent(kind, agentID string, payload any) (uint64, 
 		return 0, fmt.Errorf("write WAL event: %w", err)
 	}
 
-	db.seen[eventID] = db.seq
+	db.seen[fingerprint] = db.seq
 	return db.seq, nil
+}
+
+func (db *DurableBoard) appendCommittedEvent(kind, agentID string, payload any, outboxRecords []ClaimsOutboxRecord) error {
+	if db == nil {
+		return nil
+	}
+	if _, err := db.appendEvent(kind, agentID, payload); err != nil {
+		return err
+	}
+	if db.outbox != nil && len(outboxRecords) > 0 {
+		if err := db.outbox.InsertMany(outboxRecords); err != nil && db.board != nil {
+			db.board.RecordNotificationError("claims outbox: " + err.Error())
+		}
+	}
+	return nil
+}
+
+func (db *DurableBoard) projectOutbox(ctx context.Context) {
+	if db == nil || db.outbox == nil || len(db.projectors) == 0 || db.board == nil {
+		return
+	}
+	db.outbox.ProjectPending(ctx, db.board, db.projectors, 128)
+}
+
+func (db *DurableBoard) hasProjector(name string) bool {
+	if db == nil {
+		return false
+	}
+	for _, p := range db.projectors {
+		if p != nil && p.Name() == name {
+			return true
+		}
+	}
+	return false
 }
 
 // ── Durable wrappers (WAL first, then mutate) ───────────────────────
 
 func (db *DurableBoard) PostAction(ctx context.Context, action Action, claims []Claim) error {
-	if _, err := db.appendEvent(walEventActionPosted, action.AgentID, map[string]any{
-		"action": action, "claims": claims,
-	}); err != nil {
-		return err
-	}
 	return db.board.PostAction(ctx, action, claims)
 }
 
 func (db *DurableBoard) SubmitTestaments(ctx context.Context, action Action, testaments []Testament) error {
-	if _, err := db.appendEvent(walEventTestamentSubmitted, action.AgentID, map[string]any{
-		"action": action, "testaments": testaments,
-	}); err != nil {
-		return err
-	}
 	return db.board.SubmitTestaments(ctx, action, testaments)
 }
 
 func (db *DurableBoard) EvaluateValidation(ctx context.Context, claimID, validationID string, change StatusChange) error {
-	if _, err := db.appendEvent(walEventValidationEvaluated, change.AgentID, map[string]any{
-		"claim_id": claimID, "validation_id": validationID, "status": change.To,
-	}); err != nil {
-		return err
-	}
 	return db.board.EvaluateValidation(ctx, claimID, validationID, change)
 }
 
 func (db *DurableBoard) RejectClaim(ctx context.Context, claimID string, change StatusChange, replacements *Action, replacementClaims []Claim) error {
-	if _, err := db.appendEvent(walEventClaimRejected, change.AgentID, map[string]any{
-		"claim_id": claimID, "action": replacements, "claims": replacementClaims,
-	}); err != nil {
-		return err
-	}
 	return db.board.RejectClaim(ctx, claimID, change, replacements, replacementClaims)
 }
 
 func (db *DurableBoard) TransitionToValidation(ctx context.Context) error {
-	if _, err := db.appendEvent(walEventPhaseTransition, "", map[string]any{
-		"phase": string(BoardPhaseValidation), "iteration": db.board.iteration,
-	}); err != nil {
-		return err
-	}
 	return db.board.TransitionToValidation(ctx)
 }
 
 func (db *DurableBoard) TransitionToImplementation(ctx context.Context) error {
-	if _, err := db.appendEvent(walEventPhaseTransition, "", map[string]any{
-		"phase": string(BoardPhaseImplementation), "iteration": db.board.iteration + 1,
-	}); err != nil {
-		return err
-	}
 	return db.board.TransitionToImplementation(ctx)
 }
 
 func (db *DurableBoard) MarkComplete(ctx context.Context) error {
-	if _, err := db.appendEvent(walEventBoardComplete, "", nil); err != nil {
-		return err
-	}
 	return db.board.MarkComplete(ctx)
 }
 
@@ -377,6 +404,9 @@ func (db *DurableBoard) replayWAL(afterSeq uint64) error {
 		db.board.notificationErrors = append(db.board.notificationErrors, corruptEntries...)
 		db.board.mu.Unlock()
 	}
+	if db.board != nil {
+		db.board.rebuildDerivedState()
+	}
 	return nil
 }
 
@@ -387,6 +417,12 @@ func (db *DurableBoard) applyEvent(event *walEvent) error {
 	switch event.Kind {
 	case walEventActionPosted:
 		return db.applyActionPosted(event)
+	case walEventClaimUpdated:
+		return db.applyClaimUpdated(event)
+	case walEventClaimContextSet:
+		return db.applyClaimContextSet(event)
+	case walEventTestamentContextSet:
+		return db.applyTestamentContextSet(event)
 	case walEventTestamentSubmitted:
 		return db.applyTestamentSubmitted(event)
 	case walEventValidationEvaluated:
@@ -396,7 +432,20 @@ func (db *DurableBoard) applyEvent(event *walEvent) error {
 	case walEventPhaseTransition:
 		return db.applyPhaseTransition(event)
 	case walEventBoardComplete:
+		seq := db.board.seq.Load() + 1
+		var payload struct {
+			Sequence uint64 `json:"sequence"`
+		}
+		if len(event.Payload) > 0 {
+			_ = json.Unmarshal(event.Payload, &payload)
+			if payload.Sequence != 0 {
+				seq = payload.Sequence
+			}
+		}
 		db.board.phase = BoardPhaseComplete
+		db.insertReplayOutbox([]ClaimsOutboxRecord{
+			db.board.outboxRecordLocked(seq, "board", db.board.boardID, walEventBoardComplete, event.CreatedAt),
+		})
 		return nil
 	default:
 		return nil
@@ -425,6 +474,88 @@ func (db *DurableBoard) applyActionPosted(event *walEvent) error {
 		b.claims[c.ID] = c
 		b.claimOrder = append(b.claimOrder, c.ID)
 	}
+	db.insertReplayOutbox(b.outboxRecordsForPostActionLocked(payload.Action, payload.Claims, event.CreatedAt))
+	return nil
+}
+
+func (db *DurableBoard) applyClaimUpdated(event *walEvent) error {
+	var payload struct {
+		ClaimID    string      `json:"claim_id"`
+		AgentID    string      `json:"agent_id"`
+		FromStatus ClaimStatus `json:"from_status"`
+		Accessed   time.Time   `json:"accessed"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return err
+	}
+	c, ok := db.board.claims[payload.ClaimID]
+	if !ok {
+		return nil
+	}
+	now := payload.Accessed
+	if now.IsZero() {
+		now = event.CreatedAt
+	}
+	if c.Status == ClaimStatusPending {
+		c.StatusHistory = append(c.StatusHistory, StatusChange{
+			From:    string(ClaimStatusPending),
+			To:      string(ClaimStatusInProgress),
+			Reason:  "work started",
+			AgentID: payload.AgentID,
+			Changed: now,
+		})
+		c.Status = ClaimStatusInProgress
+	}
+	c.Accessed = now
+	db.insertReplayOutbox([]ClaimsOutboxRecord{
+		db.board.outboxRecordLocked(c.Sequence, "claim", c.ID, walEventClaimUpdated, event.CreatedAt),
+	})
+	return nil
+}
+
+func (db *DurableBoard) applyClaimContextSet(event *walEvent) error {
+	var payload struct {
+		ClaimID      string    `json:"claim_id"`
+		Context      string    `json:"context"`
+		TransitionID int64     `json:"transition_id"`
+		Accessed     time.Time `json:"accessed"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return err
+	}
+	c, ok := db.board.claims[payload.ClaimID]
+	if !ok {
+		return nil
+	}
+	c.Context = payload.Context
+	c.ContextTransition = payload.TransitionID
+	c.Accessed = firstNonZeroTime(payload.Accessed, event.CreatedAt)
+	db.insertReplayOutbox([]ClaimsOutboxRecord{
+		db.board.outboxRecordLocked(c.Sequence, "claim", c.ID, walEventClaimUpdated, event.CreatedAt),
+	})
+	return nil
+}
+
+func (db *DurableBoard) applyTestamentContextSet(event *walEvent) error {
+	var payload struct {
+		TestamentID  string    `json:"testament_id"`
+		Context      string    `json:"context"`
+		TransitionID int64     `json:"transition_id"`
+		Accessed     time.Time `json:"accessed"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return err
+	}
+	t, ok := db.board.testaments[payload.TestamentID]
+	if !ok {
+		return nil
+	}
+	t.Context = payload.Context
+	t.ContextTransition = payload.TransitionID
+	t.Accessed = firstNonZeroTime(payload.Accessed, event.CreatedAt)
+	db.insertReplayOutbox([]ClaimsOutboxRecord{
+		db.board.outboxRecordLocked(t.Sequence, "testament", t.ID, walEventTestamentSubmitted, event.CreatedAt),
+	})
 	return nil
 }
 
@@ -445,17 +576,23 @@ func (db *DurableBoard) applyTestamentSubmitted(event *walEvent) error {
 		if claimRel != nil {
 			if c, ok := b.claims[claimRel.Related]; ok && !c.Status.IsTerminal() {
 				c.Status = ClaimStatusTestified
+				autoPassReceiptValidationsLocked(c, t.AgentID, event.CreatedAt)
+				if c.AllValidationsPassed() {
+					c.Status = ClaimStatusAccepted
+				}
 			}
 		}
 	}
+	db.insertReplayOutbox(b.outboxRecordsForSubmitTestamentsLocked(payload.Action, payload.Testaments, event.CreatedAt))
 	return nil
 }
 
 func (db *DurableBoard) applyValidationEvaluated(event *walEvent) error {
 	var payload struct {
-		ClaimID      string `json:"claim_id"`
-		ValidationID string `json:"validation_id"`
-		Status       string `json:"status"`
+		ClaimID      string       `json:"claim_id"`
+		ValidationID string       `json:"validation_id"`
+		Status       string       `json:"status"`
+		Change       StatusChange `json:"change"`
 	}
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return err
@@ -466,25 +603,45 @@ func (db *DurableBoard) applyValidationEvaluated(event *walEvent) error {
 	}
 	for _, v := range c.Validations {
 		if v.ID == payload.ValidationID {
-			v.Status = ValidationStatus(payload.Status)
+			change := payload.Change
+			if change.To == "" {
+				change = StatusChange{From: string(v.Status), To: payload.Status, Changed: event.CreatedAt, AgentID: event.AgentID}
+			}
+			v.StatusHistory = append(v.StatusHistory, change)
+			v.Status = ValidationStatus(change.To)
 			v.Accessed = event.CreatedAt
 			break
 		}
 	}
+	if c.AllValidationsPassed() && c.Status != ClaimStatusAccepted {
+		c.Status = ClaimStatusAccepted
+		c.Accessed = event.CreatedAt
+	}
+	records := []ClaimsOutboxRecord{
+		db.board.outboxRecordLocked(validationSequence(c, payload.ValidationID), "validation", payload.ValidationID, walEventValidationEvaluated, event.CreatedAt),
+	}
+	if c.Status == ClaimStatusAccepted {
+		records = append(records, db.board.outboxRecordLocked(c.Sequence, "claim", c.ID, walEventClaimAccepted, event.CreatedAt))
+	}
+	db.insertReplayOutbox(records)
 	return nil
 }
 
 func (db *DurableBoard) applyClaimRejected(event *walEvent) error {
 	var payload struct {
-		ClaimID string   `json:"claim_id"`
-		Action  *Action  `json:"action,omitempty"`
-		Claims  []Claim  `json:"claims,omitempty"`
+		ClaimID string       `json:"claim_id"`
+		Change  StatusChange `json:"change"`
+		Action  *Action      `json:"action,omitempty"`
+		Claims  []Claim      `json:"claims,omitempty"`
 	}
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return err
 	}
 	b := db.board
 	if c, ok := b.claims[payload.ClaimID]; ok {
+		if payload.Change.To != "" {
+			c.StatusHistory = append(c.StatusHistory, payload.Change)
+		}
 		c.Status = ClaimStatusRejected
 	}
 	if payload.Action != nil {
@@ -495,6 +652,17 @@ func (db *DurableBoard) applyClaimRejected(event *walEvent) error {
 		b.claims[rc.ID] = rc
 		b.claimOrder = append(b.claimOrder, rc.ID)
 	}
+	records := []ClaimsOutboxRecord{}
+	if c, ok := b.claims[payload.ClaimID]; ok {
+		records = append(records, b.outboxRecordLocked(c.Sequence, "claim", c.ID, walEventClaimRejected, event.CreatedAt))
+	}
+	if payload.Action != nil {
+		records = append(records, b.outboxRecordLocked(payload.Action.Sequence, "action", payload.Action.ID, walEventActionPosted, event.CreatedAt))
+	}
+	for i := range payload.Claims {
+		records = append(records, b.outboxRecordLocked(payload.Claims[i].Sequence, "claim", payload.Claims[i].ID, "claim_issued", event.CreatedAt))
+	}
+	db.insertReplayOutbox(records)
 	return nil
 }
 
@@ -502,12 +670,20 @@ func (db *DurableBoard) applyPhaseTransition(event *walEvent) error {
 	var payload struct {
 		Phase     BoardPhase `json:"phase"`
 		Iteration int        `json:"iteration"`
+		Sequence  uint64     `json:"sequence"`
 	}
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return err
 	}
 	db.board.phase = payload.Phase
 	db.board.iteration = payload.Iteration
+	seq := payload.Sequence
+	if seq == 0 {
+		seq = db.board.seq.Load() + 1
+	}
+	db.insertReplayOutbox([]ClaimsOutboxRecord{
+		db.board.outboxRecordLocked(seq, "board", db.board.boardID, walEventPhaseTransition, event.CreatedAt),
+	})
 	return nil
 }
 
@@ -537,4 +713,51 @@ func truncateForLog(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
+}
+
+func durableProjectors(cfg ClaimsBoardConfig) []ClaimsProjector {
+	projectors := []ClaimsProjector{NewFabricProjector()}
+	projectors = append(projectors, cfg.Projectors...)
+	return projectors
+}
+
+func projectorNames(projectors []ClaimsProjector) []string {
+	names := make([]string, 0, len(projectors))
+	for _, p := range projectors {
+		if p == nil {
+			continue
+		}
+		names = append(names, p.Name())
+	}
+	return names
+}
+
+func (db *DurableBoard) insertReplayOutbox(records []ClaimsOutboxRecord) {
+	if db == nil || db.outbox == nil || len(records) == 0 {
+		return
+	}
+	if err := db.outbox.InsertMany(records); err != nil && db.board != nil {
+		db.board.RecordNotificationError("claims outbox replay: " + err.Error())
+	}
+}
+
+func firstNonZeroTime(values ...time.Time) time.Time {
+	for _, value := range values {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Now().UTC()
+}
+
+func validationSequence(c *Claim, validationID string) uint64 {
+	if c == nil {
+		return 0
+	}
+	for _, v := range c.Validations {
+		if v != nil && v.ID == validationID {
+			return v.Sequence
+		}
+	}
+	return c.Sequence
 }

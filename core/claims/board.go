@@ -84,6 +84,9 @@ type ClaimsBoard struct {
 	// artifacts. Drained on read (projection) to prevent unbounded
 	// growth.
 	notificationErrors []string
+	projectionErrors   map[string]string
+
+	durable *DurableBoard
 }
 
 type boardSubscription struct {
@@ -107,18 +110,19 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		maxIter = defaultMaxIterations
 	}
 	b := &ClaimsBoard{
-		boardID:       boardID,
-		pipelineID:    cfg.PipelineID,
-		taskID:        cfg.TaskID,
-		sessionID:     cfg.SessionID,
-		parentBoardID: cfg.ParentBoardID,
-		phase:         BoardPhaseImplementation,
-		maxIterations: maxIter,
-		actions:       make(map[string]*Action),
-		claims:        make(map[string]*Claim),
-		testaments:    make(map[string]*Testament),
-		relationsIdx:  newRelationsIndex(),
-		scope:         cfg.Scope,
+		boardID:          boardID,
+		pipelineID:       cfg.PipelineID,
+		taskID:           cfg.TaskID,
+		sessionID:        cfg.SessionID,
+		parentBoardID:    cfg.ParentBoardID,
+		phase:            BoardPhaseImplementation,
+		maxIterations:    maxIter,
+		actions:          make(map[string]*Action),
+		claims:           make(map[string]*Claim),
+		testaments:       make(map[string]*Testament),
+		relationsIdx:     newRelationsIndex(),
+		projectionErrors: make(map[string]string),
+		scope:            cfg.Scope,
 	}
 	if cfg.SessionID != "" {
 		amp := NewBoardAmplifier(cfg.SessionID, cfg.TaskID, boardID).
@@ -165,6 +169,15 @@ func (b *ClaimsBoard) Iteration() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.iteration
+}
+
+// HighWaterSequence returns the latest committed board sequence. It is
+// the deterministic scan boundary used by carry-forward cursors.
+func (b *ClaimsBoard) HighWaterSequence() uint64 {
+	if b == nil {
+		return 0
+	}
+	return b.seq.Load()
 }
 
 // Amplifier exposes the board's amplifier for callers that need to
@@ -221,28 +234,49 @@ func (b *ClaimsBoard) PostAction(ctx context.Context, action Action, inputClaims
 	}
 
 	b.stampActionLocked(&action, now)
-	b.indexRelations(action.ID, action.Relations)
 
 	for i := range inputClaims {
 		c := &inputClaims[i]
 		b.stampClaimLocked(c, &action, now)
+	}
+
+	outboxRecords := b.outboxRecordsForPostActionLocked(action, inputClaims, now)
+	if err := b.appendDurableEventLocked(walEventActionPosted, action.AgentID, map[string]any{
+		"action": action, "claims": inputClaims,
+	}, outboxRecords); err != nil {
+		b.mu.Unlock()
+		return err
+	}
+
+	b.actions[action.ID] = &action
+	b.indexRelations(action.ID, action.Relations)
+	for i := range inputClaims {
+		c := &inputClaims[i]
 		b.claims[c.ID] = c
 		b.claimOrder = append(b.claimOrder, c.ID)
 		b.indexRelations(c.ID, c.Relations)
 		b.relationsIdx.addScope(c.ID, c.Scope)
+		b.countTotal.Add(1)
+		b.countPending.Add(1)
 	}
 
 	// Release lock BEFORE notifying subscribers (prevents deadlock).
 	b.mu.Unlock()
 
+	b.projectDurableOutbox(ctx)
+
 	// Amplify: fabric + bus. Threaded ctx so cancellation aborts the
 	// emission chain rather than leaving callers blocked on bus IO.
-	b.amplifier.EmitActionPosted(ctx, &action)
+	if b.shouldEmitFabricDirect() {
+		b.amplifier.EmitActionPosted(ctx, &action)
+	}
 	for i := range inputClaims {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		b.amplifier.EmitClaimIssued(ctx, &inputClaims[i])
+		if b.shouldEmitFabricDirect() {
+			b.amplifier.EmitClaimIssued(ctx, &inputClaims[i])
+		}
 		b.amplifier.PublishInboxDeltas(ctx, &action, &inputClaims[i])
 		b.notifyDelta(BoardMutationDelta{
 			Kind:    "claim_created",
@@ -292,7 +326,6 @@ func (b *ClaimsBoard) stampActionLocked(action *Action, now time.Time) {
 		AgentID: action.AgentID,
 		Changed: now,
 	})
-	b.actions[action.ID] = action
 }
 
 func (b *ClaimsBoard) stampClaimLocked(c *Claim, action *Action, now time.Time) {
@@ -313,8 +346,6 @@ func (b *ClaimsBoard) stampClaimLocked(c *Claim, action *Action, now time.Time) 
 		AgentID: action.AgentID,
 		Changed: now,
 	})
-	b.countTotal.Add(1)
-	b.countPending.Add(1)
 	if !HasRelation(c.Relations, RelationshipClaimAction, action.ID) {
 		c.Relations = append(c.Relations, Relation{
 			Related:      action.ID,
@@ -371,6 +402,14 @@ func (b *ClaimsBoard) UpdateClaimProgress(ctx context.Context, claimID string, _
 	now := time.Now().UTC()
 	fromStatus := c.Status
 	statusChanged := false
+	outboxRecords := []ClaimsOutboxRecord{b.outboxRecordLocked(c.Sequence, "claim", c.ID, walEventClaimUpdated, now)}
+	if err := b.appendDurableEventLocked(walEventClaimUpdated, agentID, map[string]any{
+		"claim_id": claimID, "agent_id": agentID, "accessed": now,
+		"from_status": fromStatus,
+	}, outboxRecords); err != nil {
+		b.mu.Unlock()
+		return err
+	}
 	c.Accessed = now
 	if c.Status == ClaimStatusPending {
 		c.StatusHistory = append(c.StatusHistory, StatusChange{
@@ -387,7 +426,11 @@ func (b *ClaimsBoard) UpdateClaimProgress(ctx context.Context, claimID string, _
 
 	b.mu.Unlock()
 
-	b.amplifier.EmitClaimUpdated(ctx, c, agentID)
+	b.projectDurableOutbox(ctx)
+
+	if b.shouldEmitFabricDirect() {
+		b.amplifier.EmitClaimUpdated(ctx, c, agentID)
+	}
 	if statusChanged {
 		b.amplifier.PublishClaimStatusDelta(ctx, ClaimStatusDelta{
 			SessionID:      b.sessionID,
@@ -445,15 +488,23 @@ func (b *ClaimsBoard) SetClaimContext(ctx context.Context, claimID, value string
 		return nil
 	}
 	now := time.Now().UTC()
+	transitionID := c.ContextTransition + 1
+	if err := b.appendDurableEventLocked(walEventClaimContextSet, IssuerAgentID(c.Relations), map[string]any{
+		"claim_id": claimID, "context": value, "transition_id": transitionID, "accessed": now,
+	}, []ClaimsOutboxRecord{b.outboxRecordLocked(c.Sequence, "claim", c.ID, walEventClaimUpdated, now)}); err != nil {
+		b.mu.Unlock()
+		return err
+	}
 	c.Context = value
-	c.ContextTransition++
+	c.ContextTransition = transitionID
 	c.Accessed = now
-	transitionID := c.ContextTransition
 	actionKind := c.ActionType
 	owner := IssuerAgentID(c.Relations)
 	subject := SubjectAgentID(c.Relations)
 	b.invalidateProjectionCache()
 	b.mu.Unlock()
+
+	b.projectDurableOutbox(ctx)
 
 	b.amplifier.PublishClaimContextDelta(ctx, ClaimContextDelta{
 		SessionID:      b.sessionID,
@@ -510,14 +561,22 @@ func (b *ClaimsBoard) SetTestamentContext(ctx context.Context, testamentID, valu
 		return fmt.Errorf("SetTestamentContext: testament %q not found", testamentID)
 	}
 	now := time.Now().UTC()
+	transitionID := t.ContextTransition + 1
+	if err := b.appendDurableEventLocked(walEventTestamentContextSet, t.AgentID, map[string]any{
+		"testament_id": testamentID, "context": value, "transition_id": transitionID, "accessed": now,
+	}, []ClaimsOutboxRecord{b.outboxRecordLocked(t.Sequence, "testament", t.ID, walEventTestamentSubmitted, now)}); err != nil {
+		b.mu.Unlock()
+		return err
+	}
 	t.Context = value
-	t.ContextTransition++
+	t.ContextTransition = transitionID
 	t.Accessed = now
-	transitionID := t.ContextTransition
 	agentID := t.AgentID
 	claimID := ClaimIDFromRelations(t.Relations)
 	b.invalidateProjectionCache()
 	b.mu.Unlock()
+
+	b.projectDurableOutbox(ctx)
 
 	b.amplifier.PublishTestamentContextDelta(ctx, TestamentContextDelta{
 		SessionID:    b.sessionID,
@@ -574,19 +633,39 @@ func (b *ClaimsBoard) SubmitTestaments(ctx context.Context, action Action, testa
 	claimRefs := make([]*Claim, len(testaments))
 	for i := range testaments {
 		b.stampTestamentLocked(&testaments[i], &action, now)
+	}
+
+	outboxRecords := b.outboxRecordsForSubmitTestamentsLocked(action, testaments, now)
+	if err := b.appendDurableEventLocked(walEventTestamentSubmitted, action.AgentID, map[string]any{
+		"action": action, "testaments": testaments,
+	}, outboxRecords); err != nil {
+		b.mu.Unlock()
+		return err
+	}
+
+	b.actions[action.ID] = &action
+	b.indexRelations(action.ID, action.Relations)
+	for i := range testaments {
+		b.testaments[testaments[i].ID] = &testaments[i]
+		b.indexRelations(testaments[i].ID, testaments[i].Relations)
 		claimRefs[i] = b.resolveClaimForTestamentLocked(&testaments[i], now)
 	}
 
+	b.invalidateProjectionCache()
 	b.mu.Unlock()
+
+	b.projectDurableOutbox(ctx)
 
 	// Amplify, threading ctx so cancellation aborts the chain.
 	for i := range testaments {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		b.amplifier.EmitTestamentSubmitted(ctx, &testaments[i])
-		for _, artifact := range testaments[i].Artifacts {
-			b.amplifier.EmitArtifactPublished(ctx, artifact)
+		if b.shouldEmitFabricDirect() {
+			b.amplifier.EmitTestamentSubmitted(ctx, &testaments[i])
+			for _, artifact := range testaments[i].Artifacts {
+				b.amplifier.EmitArtifactPublished(ctx, artifact)
+			}
 		}
 		if claimRefs[i] != nil {
 			b.amplifier.PublishTestamentDelta(ctx, &testaments[i], claimRefs[i])
@@ -623,8 +702,6 @@ func (b *ClaimsBoard) stampTestamentActionLocked(action *Action, now time.Time) 
 	if action.Status == "" {
 		action.Status = ActionStatusComplete
 	}
-	b.actions[action.ID] = action
-	b.indexRelations(action.ID, action.Relations)
 }
 
 func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now time.Time) {
@@ -660,9 +737,6 @@ func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now tim
 		artifact.Accessed = now
 		artifact.Presentation = NormalizePresentation(artifact.Presentation)
 	}
-
-	b.testaments[t.ID] = t
-	b.indexRelations(t.ID, t.Relations)
 }
 
 // resolveClaimForTestamentLocked returns the Claim referenced by the
@@ -762,11 +836,24 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 	now := time.Now().UTC()
 	change.Changed = now
 	change.From = string(v.Status)
+	toStatus := ValidationStatus(change.To)
+	accepted := claimAcceptedAfterValidation(c, validationID, toStatus)
+	outboxRecords := []ClaimsOutboxRecord{
+		b.outboxRecordLocked(v.Sequence, "validation", v.ID, walEventValidationEvaluated, now),
+	}
+	if accepted {
+		outboxRecords = append(outboxRecords, b.outboxRecordLocked(c.Sequence, "claim", c.ID, walEventClaimAccepted, now))
+	}
+	if err := b.appendDurableEventLocked(walEventValidationEvaluated, change.AgentID, map[string]any{
+		"claim_id": claimID, "validation_id": validationID, "status": change.To, "change": change,
+	}, outboxRecords); err != nil {
+		b.mu.Unlock()
+		return err
+	}
 	v.StatusHistory = append(v.StatusHistory, change)
-	v.Status = ValidationStatus(change.To)
+	v.Status = toStatus
 	v.Accessed = now
 
-	accepted := c.AllValidationsPassed()
 	if accepted {
 		prevStatus := c.Status
 		c.StatusHistory = append(c.StatusHistory, StatusChange{
@@ -785,20 +872,24 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 
 	b.mu.Unlock()
 
-	b.amplifier.EmitClaimValidated(ctx, v, change.AgentID)
-	if accepted {
-		b.amplifier.EmitClaimAccepted(ctx, c)
+	b.projectDurableOutbox(ctx)
+
+	if b.shouldEmitFabricDirect() {
+		b.amplifier.EmitClaimValidated(ctx, v, change.AgentID)
+		if accepted {
+			b.amplifier.EmitClaimAccepted(ctx, c)
+		}
 	}
 	b.amplifier.PublishValidationDelta(ctx, validationDelta)
-	toStatus := ClaimStatus(change.To)
+	claimToStatus := ClaimStatus(change.To)
 	if accepted {
-		toStatus = ClaimStatusAccepted
+		claimToStatus = ClaimStatusAccepted
 	}
 	b.notifyDelta(BoardMutationDelta{
 		Kind:       "validation_evaluated",
 		ClaimID:    claimID,
 		FromStatus: ClaimStatus(change.From),
-		ToStatus:   toStatus,
+		ToStatus:   claimToStatus,
 		AgentID:    change.AgentID,
 	})
 	b.notifySubscribers()
@@ -871,12 +962,28 @@ func (b *ClaimsBoard) RejectClaim(ctx context.Context, claimID string, change St
 	change.From = string(c.Status)
 	change.To = string(ClaimStatusRejected)
 	change.Changed = now
+	remediationIDs := b.prepareRemediationLocked(claimID, replacements, replacementClaims, change.AgentID, now)
+	outboxRecords := []ClaimsOutboxRecord{
+		b.outboxRecordLocked(c.Sequence, "claim", c.ID, walEventClaimRejected, now),
+	}
+	if replacements != nil && len(replacementClaims) > 0 {
+		outboxRecords = append(outboxRecords, b.outboxRecordLocked(replacements.Sequence, "action", replacements.ID, walEventActionPosted, now))
+		for i := range replacementClaims {
+			outboxRecords = append(outboxRecords, b.outboxRecordLocked(replacementClaims[i].Sequence, "claim", replacementClaims[i].ID, "claim_issued", now))
+		}
+	}
+	if err := b.appendDurableEventLocked(walEventClaimRejected, change.AgentID, map[string]any{
+		"claim_id": claimID, "change": change, "action": replacements, "claims": replacementClaims,
+	}, outboxRecords); err != nil {
+		b.mu.Unlock()
+		return err
+	}
 	c.StatusHistory = append(c.StatusHistory, change)
 	c.Status = ClaimStatusRejected
 	c.Accessed = now
 	b.adjustStatusCounter(fromStatus, ClaimStatusRejected)
 
-	remediationIDs := b.applyRemediationLocked(claimID, replacements, replacementClaims, change.AgentID, now)
+	b.applyPreparedRemediationLocked(replacements, replacementClaims)
 
 	rejectedDelta := ClaimStatusDelta{
 		SessionID:           b.sessionID,
@@ -896,15 +1003,23 @@ func (b *ClaimsBoard) RejectClaim(ctx context.Context, claimID string, change St
 
 	b.mu.Unlock()
 
-	b.amplifier.EmitClaimRejected(ctx, c)
+	b.projectDurableOutbox(ctx)
+
+	if b.shouldEmitFabricDirect() {
+		b.amplifier.EmitClaimRejected(ctx, c)
+	}
 	b.amplifier.PublishClaimStatusDelta(ctx, rejectedDelta)
 
 	// Emit InboxDeltas for each replacement claim so their subjects
 	// see the remediation.
 	if replacements != nil && len(replacementClaims) > 0 {
-		b.amplifier.EmitCorrectiveIssued(ctx, replacements)
+		if b.shouldEmitFabricDirect() {
+			b.amplifier.EmitCorrectiveIssued(ctx, replacements)
+		}
 		for i := range replacementClaims {
-			b.amplifier.EmitClaimIssued(ctx, &replacementClaims[i])
+			if b.shouldEmitFabricDirect() {
+				b.amplifier.EmitClaimIssued(ctx, &replacementClaims[i])
+			}
 			b.amplifier.PublishInboxDeltas(ctx, replacements, &replacementClaims[i])
 		}
 	}
@@ -920,7 +1035,7 @@ func (b *ClaimsBoard) RejectClaim(ctx context.Context, claimID string, change St
 	return nil
 }
 
-func (b *ClaimsBoard) applyRemediationLocked(rejectedClaimID string, replacements *Action, replacementClaims []Claim, agentID string, now time.Time) []string {
+func (b *ClaimsBoard) prepareRemediationLocked(rejectedClaimID string, replacements *Action, replacementClaims []Claim, agentID string, now time.Time) []string {
 	if replacements == nil || len(replacementClaims) == 0 {
 		return nil
 	}
@@ -929,13 +1044,26 @@ func (b *ClaimsBoard) applyRemediationLocked(rejectedClaimID string, replacement
 	for i := range replacementClaims {
 		rc := &replacementClaims[i]
 		b.stampRemediationClaimLocked(rc, replacements, rejectedClaimID, agentID, now)
+		ids = append(ids, rc.ID)
+	}
+	return ids
+}
+
+func (b *ClaimsBoard) applyPreparedRemediationLocked(replacements *Action, replacementClaims []Claim) {
+	if replacements == nil || len(replacementClaims) == 0 {
+		return
+	}
+	b.actions[replacements.ID] = replacements
+	b.indexRelations(replacements.ID, replacements.Relations)
+	for i := range replacementClaims {
+		rc := &replacementClaims[i]
 		b.claims[rc.ID] = rc
 		b.claimOrder = append(b.claimOrder, rc.ID)
 		b.indexRelations(rc.ID, rc.Relations)
 		b.relationsIdx.addScope(rc.ID, rc.Scope)
-		ids = append(ids, rc.ID)
+		b.countTotal.Add(1)
+		b.countPending.Add(1)
 	}
-	return ids
 }
 
 func (b *ClaimsBoard) stampRemediationActionLocked(action *Action, rejectedID, agentID string, now time.Time) {
@@ -957,8 +1085,6 @@ func (b *ClaimsBoard) stampRemediationActionLocked(action *Action, rejectedID, a
 		AgentID: agentID,
 		Changed: now,
 	})
-	b.actions[action.ID] = action
-	b.indexRelations(action.ID, action.Relations)
 }
 
 func (b *ClaimsBoard) stampRemediationClaimLocked(rc *Claim, replacements *Action, rejectedID, agentID string, now time.Time) {
@@ -1016,12 +1142,23 @@ func (b *ClaimsBoard) TransitionToValidation(ctx context.Context) error {
 		return err
 	}
 	fromPhase := b.phase
+	eventSeq := b.nextSeq()
+	if err := b.appendDurableEventLocked(walEventPhaseTransition, "", map[string]any{
+		"phase": string(BoardPhaseValidation), "iteration": b.iteration, "sequence": eventSeq,
+	}, []ClaimsOutboxRecord{b.outboxRecordLocked(eventSeq, "board", b.boardID, walEventPhaseTransition, time.Now().UTC())}); err != nil {
+		b.mu.Unlock()
+		return err
+	}
 	b.phase = BoardPhaseValidation
 	b.logPhaseTransitionLocked(fromPhase, b.phase, "all claims testified", "")
 	phase, iteration := b.phase, b.iteration
 	b.mu.Unlock()
 
-	b.amplifier.EmitBoardPhaseChanged(ctx, phase, iteration, "")
+	b.projectDurableOutbox(ctx)
+
+	if b.shouldEmitFabricDirect() {
+		b.amplifier.EmitBoardPhaseChanged(ctx, phase, iteration, "")
+	}
 	b.amplifier.PublishPhaseDelta(ctx, PhaseDelta{
 		SessionID: b.sessionID,
 		BoardID:   b.boardID,
@@ -1058,13 +1195,24 @@ func (b *ClaimsBoard) TransitionToImplementation(ctx context.Context) error {
 		return fmt.Errorf("max iterations (%d) reached, cannot re-enter implementation", b.maxIterations)
 	}
 	fromPhase := b.phase
+	eventSeq := b.nextSeq()
+	if err := b.appendDurableEventLocked(walEventPhaseTransition, "", map[string]any{
+		"phase": string(BoardPhaseImplementation), "iteration": b.iteration + 1, "sequence": eventSeq,
+	}, []ClaimsOutboxRecord{b.outboxRecordLocked(eventSeq, "board", b.boardID, walEventPhaseTransition, time.Now().UTC())}); err != nil {
+		b.mu.Unlock()
+		return err
+	}
 	b.iteration++
 	b.phase = BoardPhaseImplementation
 	b.logPhaseTransitionLocked(fromPhase, b.phase, "remediation re-entry", "")
 	phase, iteration := b.phase, b.iteration
 	b.mu.Unlock()
 
-	b.amplifier.EmitBoardPhaseChanged(ctx, phase, iteration, "")
+	b.projectDurableOutbox(ctx)
+
+	if b.shouldEmitFabricDirect() {
+		b.amplifier.EmitBoardPhaseChanged(ctx, phase, iteration, "")
+	}
 	b.amplifier.PublishPhaseDelta(ctx, PhaseDelta{
 		SessionID: b.sessionID,
 		BoardID:   b.boardID,
@@ -1097,12 +1245,23 @@ func (b *ClaimsBoard) MarkComplete(ctx context.Context) error {
 		return err
 	}
 	fromPhase := b.phase
+	eventSeq := b.nextSeq()
+	if err := b.appendDurableEventLocked(walEventBoardComplete, "", map[string]any{
+		"sequence": eventSeq,
+	}, []ClaimsOutboxRecord{b.outboxRecordLocked(eventSeq, "board", b.boardID, walEventBoardComplete, time.Now().UTC())}); err != nil {
+		b.mu.Unlock()
+		return err
+	}
 	b.phase = BoardPhaseComplete
 	b.logPhaseTransitionLocked(fromPhase, b.phase, "all claims accepted", "")
 	phase, iteration := b.phase, b.iteration
 	b.mu.Unlock()
 
-	b.amplifier.EmitBoardComplete(ctx, "")
+	b.projectDurableOutbox(ctx)
+
+	if b.shouldEmitFabricDirect() {
+		b.amplifier.EmitBoardComplete(ctx, "")
+	}
 	b.amplifier.PublishPhaseDelta(ctx, PhaseDelta{
 		SessionID: b.sessionID,
 		BoardID:   b.boardID,
@@ -1590,6 +1749,32 @@ func (b *ClaimsBoard) dispatchSubscriber(fn ClaimsBoardSubscriber, proj *ClaimsB
 func (b *ClaimsBoard) RecordNotificationError(msg string) {
 	b.mu.Lock()
 	b.notificationErrors = append(b.notificationErrors, msg)
+	b.invalidateProjectionCache()
+	b.mu.Unlock()
+}
+
+func (b *ClaimsBoard) RecordProjectionError(record ClaimsOutboxRecord, projector string, err error) {
+	if b == nil || err == nil {
+		return
+	}
+	key := strings.Join([]string{
+		record.BoardID,
+		fmt.Sprint(record.Sequence),
+		record.EntityType,
+		record.EntityID,
+		projector,
+	}, "\x1f")
+	msg := fmt.Sprintf("projection_error projector=%s board=%s sequence=%d entity=%s/%s: %s",
+		projector, record.BoardID, record.Sequence, record.EntityType, record.EntityID, err.Error())
+	b.mu.Lock()
+	if b.projectionErrors == nil {
+		b.projectionErrors = make(map[string]string)
+	}
+	if b.projectionErrors[key] != msg {
+		b.projectionErrors[key] = msg
+		b.notificationErrors = append(b.notificationErrors, msg)
+		b.invalidateProjectionCache()
+	}
 	b.mu.Unlock()
 }
 
@@ -1624,6 +1809,52 @@ func (b *ClaimsBoard) CloneTestament(id string) (*Testament, bool) {
 	return CloneTestamentEntity(t), true
 }
 
+func (b *ClaimsBoard) cloneArtifact(id string) (*Artifact, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, t := range b.testaments {
+		for _, a := range t.Artifacts {
+			if a == nil || a.ID != id {
+				continue
+			}
+			clone := *a
+			if a.Metadata != nil {
+				clone.Metadata = make(map[string]any, len(a.Metadata))
+				for k, v := range a.Metadata {
+					clone.Metadata[k] = v
+				}
+			}
+			if a.Relations != nil {
+				clone.Relations = append([]Relation(nil), a.Relations...)
+			}
+			return &clone, true
+		}
+	}
+	return nil, false
+}
+
+func (b *ClaimsBoard) cloneValidation(id string) (*Validation, *Claim, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, c := range b.claims {
+		for _, v := range c.Validations {
+			if v == nil || v.ID != id {
+				continue
+			}
+			vClone := *v
+			if v.Relations != nil {
+				vClone.Relations = append([]Relation(nil), v.Relations...)
+			}
+			if v.StatusHistory != nil {
+				vClone.StatusHistory = append([]StatusChange(nil), v.StatusHistory...)
+			}
+			cClone := *c
+			return &vClone, &cClone, true
+		}
+	}
+	return nil, nil, false
+}
+
 // ObjectIDsWithRelation returns every object ID whose Relations
 // contain the queried (RelatedType, Relationship, RelatedID) triple.
 // Backed by the relationsIdx so the query is O(1) + hits in index.
@@ -1639,14 +1870,14 @@ func (b *ClaimsBoard) ClaimIDsWithScope(scopeKind, key string) []string {
 // BoardSummary is the lightweight read of board state — counts only,
 // no entity copies. Readable without lock via atomic counters.
 type BoardSummary struct {
-	Phase       BoardPhase `json:"phase"`
-	Iteration   int        `json:"iteration"`
-	Total       int        `json:"total"`
-	Pending     int        `json:"pending"`
-	InProgress  int        `json:"in_progress"`
-	Testified   int        `json:"testified"`
-	Accepted    int        `json:"accepted"`
-	Rejected    int        `json:"rejected"`
+	Phase      BoardPhase `json:"phase"`
+	Iteration  int        `json:"iteration"`
+	Total      int        `json:"total"`
+	Pending    int        `json:"pending"`
+	InProgress int        `json:"in_progress"`
+	Testified  int        `json:"testified"`
+	Accepted   int        `json:"accepted"`
+	Rejected   int        `json:"rejected"`
 }
 
 // Summary returns the board's status counters without copying any
@@ -1705,6 +1936,79 @@ func (b *ClaimsBoard) decrementStatusCounter(status ClaimStatus) {
 	}
 }
 
+func (b *ClaimsBoard) rebuildDerivedState() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.relationsIdx = newRelationsIndex()
+	b.countTotal.Store(0)
+	b.countPending.Store(0)
+	b.countInProgress.Store(0)
+	b.countTestified.Store(0)
+	b.countAccepted.Store(0)
+	b.countRejected.Store(0)
+	b.claimOrder = b.claimOrder[:0]
+	var high uint64
+	for _, a := range b.actions {
+		if a == nil {
+			continue
+		}
+		b.indexRelations(a.ID, a.Relations)
+		if a.Sequence > high {
+			high = a.Sequence
+		}
+	}
+	for id, c := range b.claims {
+		if c == nil {
+			continue
+		}
+		b.claimOrder = append(b.claimOrder, id)
+		b.indexRelations(c.ID, c.Relations)
+		b.relationsIdx.addScope(c.ID, c.Scope)
+		b.countTotal.Add(1)
+		b.incrementStatusCounter(c.Status)
+		if c.Sequence > high {
+			high = c.Sequence
+		}
+		for _, v := range c.Validations {
+			if v != nil && v.Sequence > high {
+				high = v.Sequence
+			}
+		}
+	}
+	sort.SliceStable(b.claimOrder, func(i, j int) bool {
+		ci := b.claims[b.claimOrder[i]]
+		cj := b.claims[b.claimOrder[j]]
+		if ci == nil || cj == nil {
+			return b.claimOrder[i] < b.claimOrder[j]
+		}
+		if ci.Sequence != cj.Sequence {
+			return ci.Sequence < cj.Sequence
+		}
+		return ci.ID < cj.ID
+	})
+	for _, t := range b.testaments {
+		if t == nil {
+			continue
+		}
+		b.indexRelations(t.ID, t.Relations)
+		if t.Sequence > high {
+			high = t.Sequence
+		}
+		for _, a := range t.Artifacts {
+			if a != nil && a.Sequence > high {
+				high = a.Sequence
+			}
+		}
+	}
+	if b.seq.Load() < high {
+		b.seq.Store(high)
+	}
+	b.invalidateProjectionCache()
+}
+
 // ClaimsForAgent returns claims where the given agent has the specified
 // relationship (typically "subject" or "evaluator"). Index-backed O(1)
 // lookup + O(k) clones where k = matching claims.
@@ -1753,6 +2057,87 @@ func (b *ClaimsBoard) PendingValidationsForClaim(claimID string) []*Validation {
 
 func (b *ClaimsBoard) nextSeq() uint64 {
 	return b.seq.Add(1)
+}
+
+func (b *ClaimsBoard) appendDurableEventLocked(kind, agentID string, payload any, outboxRecords []ClaimsOutboxRecord) error {
+	if b == nil || b.durable == nil {
+		return nil
+	}
+	if err := b.durable.appendCommittedEvent(kind, agentID, payload, outboxRecords); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (b *ClaimsBoard) projectDurableOutbox(ctx context.Context) {
+	if b == nil || b.durable == nil {
+		return
+	}
+	b.durable.projectOutbox(ctx)
+}
+
+func (b *ClaimsBoard) shouldEmitFabricDirect() bool {
+	if b == nil || b.durable == nil {
+		return true
+	}
+	return !b.durable.hasProjector(ProjectorFabric)
+}
+
+func (b *ClaimsBoard) outboxRecordLocked(sequence uint64, entityType, entityID, mutationKind string, createdAt time.Time) ClaimsOutboxRecord {
+	return ClaimsOutboxRecord{
+		BoardID:      b.boardID,
+		SessionID:    b.sessionID,
+		TaskID:       b.taskID,
+		Sequence:     sequence,
+		EntityType:   entityType,
+		EntityID:     entityID,
+		MutationKind: mutationKind,
+		CreatedAt:    createdAt,
+	}
+}
+
+func (b *ClaimsBoard) outboxRecordsForPostActionLocked(action Action, claims []Claim, now time.Time) []ClaimsOutboxRecord {
+	records := make([]ClaimsOutboxRecord, 0, 1+len(claims))
+	records = append(records, b.outboxRecordLocked(action.Sequence, "action", action.ID, walEventActionPosted, now))
+	for i := range claims {
+		records = append(records, b.outboxRecordLocked(claims[i].Sequence, "claim", claims[i].ID, "claim_issued", now))
+	}
+	return records
+}
+
+func (b *ClaimsBoard) outboxRecordsForSubmitTestamentsLocked(action Action, testaments []Testament, now time.Time) []ClaimsOutboxRecord {
+	records := make([]ClaimsOutboxRecord, 0, 1+len(testaments)*2)
+	records = append(records, b.outboxRecordLocked(action.Sequence, "action", action.ID, walEventActionPosted, now))
+	for i := range testaments {
+		t := testaments[i]
+		records = append(records, b.outboxRecordLocked(t.Sequence, "testament", t.ID, walEventTestamentSubmitted, now))
+		for _, a := range t.Artifacts {
+			if a == nil {
+				continue
+			}
+			records = append(records, b.outboxRecordLocked(a.Sequence, "artifact", a.ID, "artifact_published", now))
+		}
+	}
+	return records
+}
+
+func claimAcceptedAfterValidation(c *Claim, validationID string, next ValidationStatus) bool {
+	if c == nil || len(c.Validations) == 0 {
+		return false
+	}
+	for _, v := range c.Validations {
+		if v == nil || !v.Required {
+			continue
+		}
+		status := v.Status
+		if v.ID == validationID {
+			status = next
+		}
+		if status != ValidationStatusPassed {
+			return false
+		}
+	}
+	return true
 }
 
 func firstNonEmpty(values ...string) string {

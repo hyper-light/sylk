@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,9 +34,9 @@ type Manager struct {
 	persister Persister
 
 	// Event handlers - using map with unique IDs for safe unsubscription (W12.30)
-	handlersMu      sync.RWMutex
-	handlers        map[uint64]EventHandler
-	nextHandlerID   atomic.Uint64
+	handlersMu    sync.RWMutex
+	handlers      map[uint64]EventHandler
+	nextHandlerID atomic.Uint64
 
 	// State
 	closed atomic.Bool
@@ -149,19 +150,12 @@ func (m *Manager) Create(ctx context.Context, cfg Config) (*Session, error) {
 
 	session := NewSession(cfg)
 
-	// Wire the session's root claims board with scope for async dispatch.
-	var boardScope claims.ScopeProvider
-	if m.scope != nil {
-		boardScope = &concurrency.ScopeAdapter{Scope: m.scope}
+	boardOwner, err := m.openSessionClaimsBoard(session)
+	if err != nil {
+		return nil, err
 	}
-	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
-		BoardID:   "session-" + session.ID(),
-		SessionID: session.ID(),
-		TaskID:    "session",
-		Scope:     boardScope,
-		DeltaBus:  m.deltaBus,
-	})
-	session.SetClaimsBoard(board)
+	board := boardOwner.Board()
+	session.SetDurableClaimsBoard(boardOwner)
 	// The session manager is the canonical owner of a session's root
 	// claims board. Register is first-write-wins; if a prior board was
 	// somehow registered for this session ID (programming error,
@@ -191,6 +185,38 @@ func (m *Manager) Create(ctx context.Context, cfg Config) (*Session, error) {
 	})
 
 	return session, nil
+}
+
+func (m *Manager) openSessionClaimsBoard(session *Session) (*claims.DurableBoard, error) {
+	if session == nil {
+		return nil, fmt.Errorf("session claims board: nil session")
+	}
+	var boardScope claims.ScopeProvider
+	if m.scope != nil {
+		boardScope = &concurrency.ScopeAdapter{Scope: m.scope}
+	}
+	cfg := session.Config()
+	sessionDir := sessionClaimsDir(cfg, session.ID())
+	board, err := claims.OpenDurableBoard(claims.ClaimsBoardConfig{
+		BoardID:    "session-" + session.ID(),
+		SessionID:  session.ID(),
+		TaskID:     "session",
+		SessionDir: sessionDir,
+		Scope:      boardScope,
+		DeltaBus:   m.deltaBus,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("session %q: open durable claims board: %w", session.ID(), err)
+	}
+	return board, nil
+}
+
+func sessionClaimsDir(cfg Config, sessionID string) string {
+	base := cfg.PersistencePath
+	if base == "" {
+		base = DefaultConfig().PersistencePath
+	}
+	return filepath.Join(base, sessionID)
 }
 
 // Get retrieves a session by ID
@@ -500,6 +526,18 @@ func (m *Manager) loadSession(id string) (*Session, error) {
 		return nil, ErrSessionNotFound
 	}
 
+	boardOwner, err := m.openSessionClaimsBoard(loaded)
+	if err != nil {
+		if existing := claims.DefaultSessionBoardRegistry().Lookup(id); existing != nil {
+			loaded.SetClaimsBoard(existing)
+			m.addSession(id, loaded)
+			return loaded, nil
+		}
+		return nil, err
+	}
+	loaded.SetDurableClaimsBoard(boardOwner)
+	claims.DefaultSessionBoardRegistry().ReplaceForReason(id, boardOwner.Board(), "session restore")
+
 	m.addSession(id, loaded)
 	return loaded, nil
 }
@@ -656,6 +694,7 @@ func (m *Manager) closeSessions(sessions []*Session) error {
 		if err := session.Close(); err != nil && err != ErrSessionClosed {
 			lastErr = err
 		}
+		claims.DefaultSessionBoardRegistry().Remove(session.ID())
 		m.emitClosedEvent(session.ID())
 	}
 	return lastErr
@@ -786,4 +825,3 @@ func (m *Manager) SetPersister(p Persister) {
 	defer m.mu.Unlock()
 	m.persister = p
 }
-

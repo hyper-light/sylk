@@ -57,7 +57,8 @@ type Session struct {
 	// Claims board — the session's root board. All user prompts,
 	// agent responses, and cross-agent interactions are actions and
 	// testaments on this board.
-	claimsBoard *claims.ClaimsBoard
+	claimsBoard        *claims.ClaimsBoard
+	durableClaimsBoard *claims.DurableBoard
 
 	// Closed flag
 	closed atomic.Bool
@@ -140,6 +141,15 @@ func (s *Session) ClaimsBoard() *claims.ClaimsBoard {
 // session creation when the board is wired.
 func (s *Session) SetClaimsBoard(board *claims.ClaimsBoard) {
 	s.claimsBoard = board
+}
+
+// SetDurableClaimsBoard sets the session's durable claims board owner
+// and exposes its board view through ClaimsBoard().
+func (s *Session) SetDurableClaimsBoard(board *claims.DurableBoard) {
+	s.durableClaimsBoard = board
+	if board != nil {
+		s.claimsBoard = board.Board()
+	}
 }
 
 // Name returns the human-readable name
@@ -298,6 +308,9 @@ func (s *Session) Close() error {
 	}
 
 	s.updatedAt = time.Now()
+	if s.durableClaimsBoard != nil {
+		return s.durableClaimsBoard.Close()
+	}
 	return nil
 }
 

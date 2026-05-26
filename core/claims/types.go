@@ -722,6 +722,12 @@ type ClaimsBoardConfig struct {
 	// that want to subscribe need a real DeltaBus wired here.
 	DeltaBus DeltaBus
 
+	// Projectors are additional deterministic outbox projectors. The
+	// durable board always installs the Fabric projector; callers may
+	// add package-specific projectors such as a knowledge mirror without
+	// making core/claims import those packages.
+	Projectors []ClaimsProjector
+
 	// ParentBoardID, when non-empty, establishes this board as a
 	// scoped child of the parent (e.g., pipeline board as child of
 	// session board). Stored as metadata on the board.
